@@ -197,6 +197,74 @@ impl IoBridge {
         }
     }
 
+    /// Send `tiles` as CDF 5/3: forward-transform them on the GPU in one round
+    /// trip, encode the passes, and commit each through the same path the
+    /// frame's own Cdf53 tiles take. See the caller for which tiles come here.
+    ///
+    /// Software encoding is not a runtime option. With no GPU processor
+    /// (which the GPU policy cannot reach in production) the tiles are left
+    /// uncommitted and an error is logged; unit-test builds use the CPU
+    /// forward as scaffolding so the routing can be tested without a GPU.
+    fn commit_cdf53_fallback(
+        &mut self,
+        tiles: &[(u32, u32)],
+        grid: &crate::tile::TileGrid,
+        pixels: &[u8],
+        stride: u32,
+    ) -> Vec<(u32, u32)> {
+        let tile_bgra: Vec<Vec<u8>> = tiles
+            .iter()
+            .map(|&(x, y)| grid.extract_tile(pixels, stride, x, y))
+            .collect();
+        let refs: Vec<&[u8]> = tile_bgra.iter().map(|t| t.as_slice()).collect();
+        let n = crate::encoder::cdf53::CDF53_TOTAL_COEFFS;
+        let coeffs: Vec<i16> = match self.frame_backend.as_mut() {
+            Some(backend) => match backend.forward_cdf53_tiles(&refs) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(target: LOG_TARGET, error = %e, tiles = tiles.len(),
+                        "cdf53 fallback forward failed; tiles not sent this frame");
+                    // Report the whole GPU baseline as stale so the next frame
+                    // marks these tiles dirty again and they are retried.
+                    backend.apply(super::frame_backend::Control::InvalidateBaseline(1));
+                    return tiles.to_vec();
+                }
+            },
+            #[cfg(test)]
+            None => refs
+                .iter()
+                .flat_map(|t| crate::encoder::cdf53::forward(t))
+                .collect(),
+            #[cfg(not(test))]
+            None => {
+                tracing::error!(target: LOG_TARGET, tiles = tiles.len(),
+                    "cdf53 fallback needs the frame backend; tiles not sent this frame");
+                return tiles.to_vec();
+            }
+        };
+        for (i, &(x, y)) in tiles.iter().enumerate() {
+            // Supersede what the tile had in flight the way the dirty loop
+            // does: the plain bump in the Cdf53 commit settles nothing, so a
+            // PalRle emission still queued would keep its palette reference
+            // and carry count for good, and a full table is what sends tiles
+            // here.
+            self.reliable_emitter.cancel_for_tile(x as u8, y as u8);
+            let (_, superseded) = self.scheduler.bump_generation_collecting(x as u8, y as u8);
+            self.fragment_coverage.drop_cdf53_for_tile(x as u8, y as u8);
+            self.settle_superseded_palettes(x as u8, y as u8, &superseded);
+            let (present, passes) =
+                crate::encoder::cdf53::encode_passes_sparse(&coeffs[i * n..(i + 1) * n]);
+            self.commit_tile_to_cdf53(
+                x as u8,
+                y as u8,
+                present,
+                passes,
+                super::frame::Cdf53Source::Dirty,
+            );
+        }
+        Vec::new()
+    }
+
     /// Shared scheduler dispatch: grid-sync → RTT update → bump+encode+enqueue
     /// per dirty tile → tick → fragment+send. Called by both `process_frame_cpu`
     /// and `process_frame_gpu`'s `FrameMode::TileCodec` branch.
@@ -226,7 +294,44 @@ impl IoBridge {
 
         use crate::transport::scheduler::{TileWork, WorkState};
 
+        // GPU policy: a dirty tile the tile encoders cannot carry goes out as
+        // CDF 5/3 (lossless once every pass lands) rather than as 4 KB of Raw.
+        // That is every tile whose state has no tile-local encoder (Skip,
+        // H264, PixelPerfect) and a PalRle tile whose payload never got made
+        // (palette table full, frame-palette overflow). The frame's own
+        // compact pass lists only dirty tiles with more than 16 colours, so
+        // these tiles have no coefficients yet: one extra GPU forward for
+        // exactly this set, and nothing when the set is empty. Committing
+        // sets each tile's state to Cdf53, so the loop below skips it like
+        // any other Cdf53 tile.
+        let mut failed_fallback: Vec<(u32, u32)> = Vec::new();
+        if matches!(policy, SchedulerEmissionPolicy::GpuClassifierDriven) {
+            use crate::tile::CodecState;
+            let has_payload =
+                |palrle: &Option<&mut std::collections::HashMap<(u32, u32), Vec<u8>>>,
+                 xy: (u32, u32)| {
+                    palrle.as_ref().is_some_and(|m| m.contains_key(&xy))
+                };
+            let fallback: Vec<(u32, u32)> = dirty
+                .iter()
+                .copied()
+                .filter(|&(x, y)| match self.metrics_tracker.get(x, y).codec_state {
+                    CodecState::Cdf53 { .. } | CodecState::Solid => false,
+                    CodecState::PalRle { .. } => !has_payload(&palrle_payloads, (x, y)),
+                    CodecState::H264 { .. } | CodecState::PixelPerfect | CodecState::Skip => true,
+                })
+                .collect();
+            if !fallback.is_empty() {
+                failed_fallback = self.commit_cdf53_fallback(&fallback, grid, pixels, stride);
+            }
+        }
+
         for &(tile_x, tile_y) in dirty {
+            // A fallback tile whose forward failed is retried next frame
+            // (the baseline was invalidated); nothing else can carry it.
+            if failed_fallback.contains(&(tile_x, tile_y)) {
+                continue;
+            }
             // For GpuClassifierDriven, check whether this tile is handled by
             // Path B (Cdf53 refinement queue, enqueued above by Phase B) BEFORE
             // calling bump_generation_collecting. bump_generation supersedes all
@@ -300,7 +405,15 @@ impl IoBridge {
                             };
                             match payload {
                                 Some(p) => (Codec::PalRle, p),
-                                None => (Codec::Raw, extract_tile()), // table-full fallback or no GPU prep
+                                // Unreachable: the fallback pass above sent this tile
+                                // as CDF 5/3. Raw goes with the codec (next PR).
+                                None => {
+                                    debug_assert!(
+                                        false,
+                                        "PalRle tile without payload reached the Raw arm"
+                                    );
+                                    (Codec::Raw, extract_tile())
+                                }
                             }
                         }
                         // Raw is the encoder of last resort: these states
@@ -313,7 +426,12 @@ impl IoBridge {
                         CodecState::H264 { .. }
                         | CodecState::Cdf53 { .. }
                         | CodecState::PixelPerfect
-                        | CodecState::Skip => (Codec::Raw, extract_tile()),
+                        | CodecState::Skip => {
+                            // Unreachable: the fallback pass above sent these
+                            // as CDF 5/3 (Cdf53 never gets this far).
+                            debug_assert!(false, "{codec_state:?} tile reached the Raw arm");
+                            (Codec::Raw, extract_tile())
+                        }
                     }
                 }
             };

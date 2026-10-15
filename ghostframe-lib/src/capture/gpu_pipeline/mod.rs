@@ -345,9 +345,10 @@ pub struct GpuFrameProcessor {
     pub cdf53_escalation_coefficients_ptr: *const i32,
 
     // CDF 5/3 fallback forward (`forward_cdf53_tiles`): tiles the CPU rejected
-    // for PalRle after Phase A. Separate from the escalation buffers because
-    // the fallback runs between the frame's fence and the escalation Phase B
-    // read, and must not overwrite the coefficients that read still needs.
+    // for PalRle after Phase A. Separate from the escalation buffers so the
+    // call never aliases a frame's escalation output, which matters as soon as
+    // a backend pipelines frames (today `finish_tile` has already copied the
+    // escalation coefficients out before the fallback runs).
     cdf53_fallback_list: HostBuffer<u32>,
     cdf53_fallback_coefficients: HostBuffer<i32>,
 
