@@ -2219,3 +2219,7 @@ mod write_batched_tests {
         assert!(rec.writes.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "io_bridge/cdf53_fallback_tests.rs"]
+mod cdf53_fallback_tests;

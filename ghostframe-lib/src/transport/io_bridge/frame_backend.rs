@@ -27,9 +27,9 @@
 //! outputs (`FrameAnalysis`, the processor's coefficient pointers) are valid
 //! only until the next `analyse`, which is why they never cross the seam.
 //!
-//! A future GPU call that must run between a frame's fence and its tile
-//! commit (C4's `forward_cdf53_tiles`, for tiles the tile encoders cannot
-//! carry) belongs here as one more method, not as a reach into the processor.
+//! A GPU call that must run between a frame's fence and its tile commit
+//! (`forward_cdf53_tiles`, for tiles the tile encoders cannot carry) is one
+//! more method here, not a reach into the processor.
 //!
 //! The backend must stamp nothing protocol-visible: no `now_std()`. Time on the
 //! loop is tokio's clock; a worker thread would read a different one under the
@@ -194,6 +194,14 @@ pub trait FrameBackend: Send {
 
     /// The loop will not use this frame's outputs.
     fn finish_discard(&mut self);
+
+    /// CDF 5/3 forward transform of the given 32x32 BGRA tiles (4096 bytes
+    /// each), `CDF53_TOTAL_COEFFS` coefficients per tile, in order. For tiles
+    /// the frame's own compact pass did not list and no tile encoder can
+    /// carry (see `dispatch_dirty_tiles_via_scheduler`). Independent of any
+    /// frame in flight: it reads the tiles it is given, not the GPU's
+    /// outputs. One GPU round trip per 512 tiles.
+    fn forward_cdf53_tiles(&mut self, tiles: &[&[u8]]) -> Result<Vec<i16>, String>;
 }
 
 /// The production backend: a Vulkan `GpuFrameProcessor` and, lazily, a
@@ -227,6 +235,16 @@ impl GpuBackend {
 }
 
 impl FrameBackend for GpuBackend {
+    fn forward_cdf53_tiles(&mut self, tiles: &[&[u8]]) -> Result<Vec<i16>, String> {
+        debug_assert!(
+            self.held.is_none(),
+            "forward_cdf53_tiles during a frame in flight"
+        );
+        self.processor
+            .forward_cdf53_tiles(tiles)
+            .map_err(|e| e.to_string())
+    }
+
     fn apply(&mut self, control: Control) {
         match control {
             Control::InvalidateBaseline(n) => self.processor.invalidate_baseline(n),

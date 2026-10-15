@@ -937,6 +937,8 @@ async fn iobridge_holds_scheduler_zero_sized_on_construction() {
 struct RecordingBackend {
     log: Arc<std::sync::Mutex<Vec<String>>>,
     h264: Option<(Vec<u8>, bool)>,
+    /// `forward_cdf53_tiles` fails, as a lost device or a failed submit would.
+    fail_forward: bool,
 }
 
 impl FrameBackend for RecordingBackend {
@@ -975,6 +977,20 @@ impl FrameBackend for RecordingBackend {
     fn finish_discard(&mut self) {
         self.log.lock().unwrap().push("finish_discard".into());
     }
+    fn forward_cdf53_tiles(&mut self, tiles: &[&[u8]]) -> Result<Vec<i16>, String> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("forward_cdf53_tiles {}", tiles.len()));
+        if self.fail_forward {
+            return Err("injected".into());
+        }
+        // Test scaffolding: the CPU transform stands in for the GPU one.
+        Ok(tiles
+            .iter()
+            .flat_map(|t| crate::encoder::cdf53::forward(t))
+            .collect())
+    }
 }
 
 fn recording_bridge(
@@ -1001,6 +1017,119 @@ fn recording_bridge(
     let log = backend.log.clone();
     bridge.set_frame_backend(Box::new(backend));
     (bridge, tokio::net::UnixStream::from_std(peer).unwrap(), log)
+}
+
+/// The CDF 5/3 fallback reaches the GPU through the backend seam, once per
+/// batch, with every tile of the batch: not through the processor.
+#[tokio::test]
+async fn the_cdf53_fallback_forwards_its_tiles_through_the_backend_in_one_call() {
+    use crate::tile::CodecState;
+    let (mut bridge, _peer, log) = recording_bridge(None);
+    bridge.scheduler.resize(4, 4);
+    bridge.metrics_tracker.resize(4, 4);
+    bridge.metrics_tracker.get_mut(0, 0).codec_state = CodecState::Skip;
+    bridge.metrics_tracker.get_mut(1, 0).codec_state = CodecState::H264 { frames_in_h264: 1 };
+    bridge.metrics_tracker.get_mut(2, 0).codec_state = CodecState::Solid;
+    let pixels = vec![0x40u8; 128 * 128 * 4];
+    let grid = crate::tile::TileGrid::new(128, 128);
+    let _ = bridge.dispatch_dirty_tiles_via_scheduler(
+        &[(0, 0), (1, 0), (2, 0)],
+        &grid,
+        TileDispatchFrame {
+            pixels: &pixels,
+            stride: 128 * 4,
+            seq: 1,
+            timestamp_us: 0,
+        },
+        1200,
+        SchedulerEmissionPolicy::GpuClassifierDriven,
+        None,
+    );
+    let calls: Vec<String> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.starts_with("forward_cdf53_tiles"))
+        .cloned()
+        .collect();
+    assert_eq!(calls, vec!["forward_cdf53_tiles 2".to_string()]);
+}
+
+fn fallback_dispatch(bridge: &mut IoBridge, dirty: &[(u32, u32)]) {
+    let pixels = vec![0x40u8; 128 * 128 * 4];
+    let grid = crate::tile::TileGrid::new(128, 128);
+    let _ = bridge.dispatch_dirty_tiles_via_scheduler(
+        dirty,
+        &grid,
+        TileDispatchFrame {
+            pixels: &pixels,
+            stride: 128 * 4,
+            seq: 1,
+            timestamp_us: 0,
+        },
+        1200,
+        SchedulerEmissionPolicy::GpuClassifierDriven,
+        None,
+    );
+}
+
+/// A tile that falls back while its PalRle work is still queued must give the
+/// palette reference and carry count back: the fallback is entered exactly
+/// when the palette table is under pressure, so a leak here feeds itself.
+#[tokio::test]
+async fn a_tile_falling_back_from_queued_palrle_releases_its_palette() {
+    use crate::tile::CodecState;
+    use crate::transport::protocol::Codec;
+    use crate::transport::scheduler::{TileWork, WorkState};
+    let (mut bridge, _peer, _log) = recording_bridge(None);
+    bridge.scheduler.resize(4, 4);
+    bridge.metrics_tracker.resize(4, 4);
+    bridge.palette_table.ref_count[9] = 1;
+    bridge.palette_table.in_flight_carrying[9] = 1;
+    bridge.palette_table.slot_state[9] = crate::encoder::pal_rle::SlotState::Held;
+    bridge.scheduler.enqueue_at(
+        TileWork {
+            tile_x: 0,
+            tile_y: 0,
+            generation: 0,
+            pass_idx: 0,
+            total_passes: 1,
+            codec: Codec::PalRle,
+            payload: vec![1, 9, 0, 0],
+            queued_at: now_std(),
+            last_sent_at: None,
+            state: WorkState::Pending,
+        },
+        now_std(),
+    );
+    // Phase A downgraded the tile (table full): no PalRle state, no payload.
+    bridge.metrics_tracker.get_mut(0, 0).codec_state = CodecState::Skip;
+    fallback_dispatch(&mut bridge, &[(0, 0)]);
+    assert_eq!(bridge.palette_table.in_flight_carrying[9], 0);
+    assert_eq!(bridge.palette_table.ref_count[9], 0);
+}
+
+/// A failed forward must not panic or send Raw, and must arrange a retry.
+#[tokio::test]
+async fn a_failed_cdf53_forward_sends_nothing_and_requests_a_retry() {
+    use crate::tile::CodecState;
+    let (mut bridge, _peer, log) = recording_bridge(None);
+    bridge.set_frame_backend(Box::new(RecordingBackend {
+        log: log.clone(),
+        fail_forward: true,
+        ..Default::default()
+    }));
+    bridge.scheduler.resize(4, 4);
+    bridge.metrics_tracker.resize(4, 4);
+    bridge.metrics_tracker.get_mut(1, 1).codec_state = CodecState::Skip;
+    fallback_dispatch(&mut bridge, &[(1, 1)]);
+    assert!(bridge.scheduler.peek_for_test().is_empty(), "no Raw");
+    assert!(bridge.scheduler.refinement_peek_for_test().is_empty());
+    assert!(log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l == "apply InvalidateBaseline(1)"));
 }
 
 fn tiny_frame() -> FrameSubmission {
