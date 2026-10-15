@@ -69,12 +69,20 @@ pub fn pq_provider() -> rustls::crypto::CryptoProvider {
 
 #[derive(Debug)]
 pub struct PinnedCertVerifier {
-    expected: [u8; 32],
+    /// Any one of these hashes is accepted: the server advertises its
+    /// current and next certificate, so a client that fetched just before a
+    /// rotation still connects.
+    expected: Vec<[u8; 32]>,
     provider: rustls::crypto::CryptoProvider,
 }
 
 impl PinnedCertVerifier {
     pub fn new(expected: [u8; 32]) -> Self {
+        Self::with_hashes(vec![expected])
+    }
+
+    /// Accept a certificate matching any of `expected`.
+    pub fn with_hashes(expected: Vec<[u8; 32]>) -> Self {
         Self {
             expected,
             provider: pq_provider(),
@@ -94,7 +102,7 @@ impl ServerCertVerifier for PinnedCertVerifier {
         let mut hasher = Sha256::new();
         hasher.update(end_entity.as_ref());
         let actual: [u8; 32] = hasher.finalize().into();
-        if actual != self.expected {
+        if !self.expected.contains(&actual) {
             return Err(TlsError::General("server certificate hash mismatch".into()));
         }
         let (_, cert) = x509_parser::parse_x509_certificate(end_entity.as_ref()).map_err(|e| {
