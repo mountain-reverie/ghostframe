@@ -200,12 +200,12 @@ fn datagram_send_buffer_bytes() -> usize {
 pub type CertClock = Arc<dyn Fn() -> time::OffsetDateTime + Send + Sync>;
 
 /// Maximum span the W3C spec allows for a pinned cert is 14 days; stay under.
-pub const CERT_VALIDITY: time::Duration = time::Duration::days(13);
+pub(crate) const CERT_VALIDITY: time::Duration = time::Duration::days(13);
 /// How far `notBefore` precedes the moment a cert starts being served, so a
 /// client whose clock runs behind does not see a not-yet-valid cert.
-pub const CERT_BACKDATE: time::Duration = time::Duration::hours(1);
+pub(crate) const CERT_BACKDATE: time::Duration = time::Duration::hours(1);
 /// How long one certificate is served before the successor takes over.
-pub const CERT_SERVE_PERIOD: time::Duration = time::Duration::days(7);
+pub(crate) const CERT_SERVE_PERIOD: time::Duration = time::Duration::days(7);
 
 fn system_clock() -> CertClock {
     Arc::new(time::OffsetDateTime::now_utc)
@@ -227,6 +227,9 @@ struct ScheduleState {
 /// Two-cert rotation state; doubles as the rustls certificate resolver.
 pub struct CertSchedule {
     clock: CertClock,
+    /// Bumped on every rotation, so a publisher wakes at once instead of
+    /// polling (a monotonic sleep does not advance across a suspend).
+    rotated: tokio::sync::watch::Sender<u64>,
     state: std::sync::Mutex<ScheduleState>,
 }
 
@@ -245,6 +248,7 @@ impl CertSchedule {
         let next = Self::make_slot(now + CERT_SERVE_PERIOD)?;
         Ok(Self {
             clock,
+            rotated: tokio::sync::watch::channel(0).0,
             state: std::sync::Mutex::new(ScheduleState { current, next }),
         })
     }
@@ -288,12 +292,14 @@ impl CertSchedule {
     /// Roll forward to `now`. Cheap when nothing is due.
     fn advance_locked(&self, st: &mut ScheduleState) {
         let now = (self.clock)();
-        if now < st.next.serve_from {
+        let stepped_back = now < st.current.not_before;
+        if now < st.next.serve_from && !stepped_back {
             return;
         }
-        // Asleep for more than a whole period (suspend, clock step): the
-        // successor is itself near expiry, so start over from now.
-        let rebuilt = if now >= st.next.serve_from + CERT_SERVE_PERIOD {
+        // Asleep for more than a whole period (suspend, clock step forward),
+        // or the clock stepped back before the served cert's notBefore (it
+        // would be rejected as not yet valid): start over from now.
+        let rebuilt = if stepped_back || now >= st.next.serve_from + CERT_SERVE_PERIOD {
             Self::make_slot(now).and_then(|c| Ok((c, Self::make_slot(now + CERT_SERVE_PERIOD)?)))
         } else {
             Self::make_slot(st.next.serve_from + CERT_SERVE_PERIOD).map(|n| {
@@ -318,6 +324,7 @@ impl CertSchedule {
                 );
                 st.current = current;
                 st.next = next;
+                self.rotated.send_modify(|g| *g += 1);
             }
             // Keep serving what we have; the next handshake retries.
             Err(e) => tracing::error!(error = %e, "TLS certificate rotation failed"),
@@ -336,6 +343,18 @@ impl CertSchedule {
         let mut st = self.lock();
         self.advance_locked(&mut st);
         vec![st.current.hex.clone(), st.next.hex.clone()]
+    }
+
+    /// Subscribe to rotation notifications.
+    pub fn subscribe_rotations(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.rotated.subscribe()
+    }
+
+    /// DER of the leaf `resolve` would present right now.
+    pub fn serving_cert_der(&self) -> Vec<u8> {
+        let mut st = self.lock();
+        self.advance_locked(&mut st);
+        st.current.certified.cert[0].as_ref().to_vec()
     }
 
     /// `(notBefore, notAfter)` of the cert being served now.
@@ -365,7 +384,7 @@ impl rustls::server::ResolvesServerCert for CertSchedule {
     }
 }
 
-/// The schedule of the most recently built production-clock `QuicServer`.
+/// The schedule of the most recently built `QuicServer` (the daemon has one).
 /// The daemon has one; `GhostframeServer` reads it to publish the hash list
 /// without reaching into `IoBridge`.
 static ACTIVE_SCHEDULE: std::sync::Mutex<Option<Arc<CertSchedule>>> = std::sync::Mutex::new(None);
@@ -798,6 +817,43 @@ mod tests {
         off.store(8 * DAY, Ordering::SeqCst);
         let after = server.cert_info().schedule.hashes_hex();
         assert_eq!(after[0], before[1], "next became current");
+    }
+
+    #[test]
+    fn presented_leaf_follows_rotation_and_matches_published_hash() {
+        use sha2::{Digest, Sha256};
+        use std::sync::atomic::Ordering;
+        let (clock, off) = manual_clock();
+        let sched = CertSchedule::new(clock).unwrap();
+        for day in [0, 8, 16, 45] {
+            off.store(day * DAY, Ordering::SeqCst);
+            let der = sched.serving_cert_der();
+            assert_eq!(hex::encode(Sha256::digest(&der)), sched.hashes_hex()[0]);
+        }
+    }
+
+    #[test]
+    fn backward_clock_step_does_not_leave_a_not_yet_valid_cert() {
+        use std::sync::atomic::Ordering;
+        let (clock, off) = manual_clock();
+        let sched = CertSchedule::new(clock.clone()).unwrap();
+        off.store(9 * DAY, Ordering::SeqCst);
+        sched.current_hex();
+        off.store(2 * DAY, Ordering::SeqCst);
+        let (nb, na) = sched.current_validity();
+        assert!(nb <= clock() && clock() <= na);
+    }
+
+    #[test]
+    fn rotation_notifies_subscribers() {
+        use std::sync::atomic::Ordering;
+        let (clock, off) = manual_clock();
+        let sched = CertSchedule::new(clock).unwrap();
+        let rx = sched.subscribe_rotations();
+        assert_eq!(*rx.borrow(), 0);
+        off.store(8 * DAY, Ordering::SeqCst);
+        sched.current_hex();
+        assert_eq!(*rx.borrow(), 1);
     }
 
     #[test]
