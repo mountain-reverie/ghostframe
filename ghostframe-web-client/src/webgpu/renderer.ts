@@ -6,12 +6,18 @@ import { PalRlePipeline, type PalRleTile } from './palrle.js';
 import { Cdf53Pipeline, type PrevalidatedCdf53 } from './cdf53.js';
 import { shouldSkipEncodePresent } from './idle_skip.js';
 import { protocol } from '../protocol_constants.js';
+import { planPaint } from './paint_order.js';
 
 export interface RawQueued {
   tileX: number;
   tileY: number;
+  /** `frame_seq` of the server frame this tile came from. */
+  frameSeq: number;
   bgra: Uint8Array;
 }
+
+/** A prevalidated CDF53 pass tagged with the server frame it came from. */
+export type QueuedCdf53 = PrevalidatedCdf53 & { frameSeq: number };
 
 export class WebGpuRenderer {
   framebuffer: Framebuffer;
@@ -37,7 +43,9 @@ export class WebGpuRenderer {
   solidQueue: SolidTile[] = [];
   rawQueue: RawQueued[] = [];
   h264Queue: VideoFrame[] = [];
-  cdf53Queue: PrevalidatedCdf53[] = [];
+  /** `frame_seq` of each `h264Queue` entry, index-aligned. */
+  h264Seqs: number[] = [];
+  cdf53Queue: QueuedCdf53[] = [];
 
   // Bug B: idle-skip. Set true whenever the renderer mutates state that
   // affects the next presented frame (queue uploads, raw tile writes,
@@ -211,6 +219,7 @@ export class WebGpuRenderer {
       try { f.close(); } catch { /* already closed — safe to swallow */ }
     }
     this.h264Queue.length = 0;
+    this.h264Seqs.length = 0;
 
     const zeros = new Uint8Array(16 * 1024);
     this.device.queue.writeBuffer(this.palrlePipeline.paletteAtlas, 0, zeros);
@@ -236,13 +245,14 @@ export class WebGpuRenderer {
     this.framebufferDirty = true;
   }
 
-  pushCdf53(entry: PrevalidatedCdf53): void {
+  pushCdf53(entry: QueuedCdf53): void {
     this.cdf53Queue.push(entry);
     this.framebufferDirty = true;
   }
 
-  pushH264(frame: VideoFrame): void {
+  pushH264(frame: VideoFrame, frameSeq: number): void {
     this.h264Queue.push(frame);
+    this.h264Seqs.push(frameSeq);
     this.framebufferDirty = true;
   }
 
@@ -280,60 +290,108 @@ export class WebGpuRenderer {
     ) {
       return { palrle: 0, solid: 0, raw: 0, h264: 0, cdf53: 0 };
     }
-    // ---- Steps 1-2: move the prevalidated PalRle batch into the frame ----
+    // ---- Steps 1-4: resolve each tile by the newest frame_seq ----
     // The core prevalidates in wire order and emits `Event::PaletteUpdated`
     // ahead of the `TilePayload` it belongs to; `main.ts` applies each
     // upsert on arrival, strictly before this drain. No re-validation and
-    // no palette upsert happen here anymore — see the design doc's "Why
+    // no palette upsert happen here anymore -- see the design doc's "Why
     // the drain-time ordering constraint dissolves".
-    const palRleEntries: PalRleTile[] = this.palRleQueue;
+    //
+    // Paint order is no longer fixed by codec: `planPaint` drops every
+    // stateless entry a newer frame supersedes and fixes where the CDF53
+    // lift and the H.264 draw sit relative to each other. See paint_order.ts.
+    const plan = planPaint({
+      raw: this.rawQueue,
+      solid: this.solidQueue,
+      palRle: this.palRleQueue,
+      cdf53: this.cdf53Queue,
+      h264Seqs: this.h264Seqs,
+    });
     this.palRleQueue = [];
+    this.rawQueue.length = 0;
+    this.h264Seqs.length = 0;
 
-    // ---- Step 3: pack Solid instances ----
-    const solidCount = this.solidPipeline.packAndUpload(this.solidQueue);
+    const solidCount = this.solidPipeline.packAndUpload(plan.solid);
     this.solidQueue.length = 0;
 
-    // ---- Step 4: direct Raw uploads (pre-encoder) ----
-    for (const r of this.rawQueue) {
-      this.writeRawTile(r.tileX, r.tileY, r.bgra);
-    }
-    const rawCount = this.rawQueue.length;
-    this.rawQueue.length = 0;
+    const palRleCount = this.palrlePipeline.uploadBatch(plan.palRle);
 
-    // ---- Step 5: upload PalRle batched buffers ----
-    const palRleCount = this.palrlePipeline.uploadBatch(palRleEntries);
-
-    // ---- Step 6: encoder ----
-    const encoder = this.device.createCommandEncoder();
-
-    // ---- Step 7: PalRle compute pass ----
-    this.palrlePipeline.encodeDispatch(encoder, palRleCount);
-
-    // ---- Step 7.5: upload Cdf53 batch + integrate + inverse ----
-    // The queue is cleared even if uploadBatch throws (capacity overflow after
-    // a long hidden-tab period): otherwise it keeps growing and every later
-    // tick throws again.
+    // Upload the Cdf53 batch. The queue is cleared even if uploadBatch throws
+    // (capacity overflow after a long hidden-tab period): otherwise it keeps
+    // growing and every later tick throws again.
     let cdf53Count = 0;
     try {
       cdf53Count = this.cdf53Pipeline.uploadBatch(this.cdf53Queue);
-      this.cdf53Pipeline.encodeIntegrate(encoder, cdf53Count);
-      this.cdf53Pipeline.encodeInverse(encoder);
     } finally {
       this.cdf53Queue.length = 0;
     }
 
-    // ---- Step 8: Solid + H264 render pass on framebuffer ----
+    let encoder = this.device.createCommandEncoder();
+
     // Drop queued H.264 frames if the browser doesn't support the
     // h264_blit shader (probed at startup). Warn once so the operator
     // sees why the stream looks frozen on Firefox.
     const drawH264 = this.h264Pipeline !== null;
     if (!drawH264 && this.h264Queue.length > 0 && !this.h264DropWarned) {
       console.warn(
-        `[renderer] dropping ${this.h264Queue.length} H.264 frame(s) — pipeline unsupported on this browser`,
+        `[renderer] dropping ${this.h264Queue.length} H.264 frame(s) -- pipeline unsupported on this browser`,
       );
       this.h264DropWarned = true;
     }
-    if (solidCount > 0 || (drawH264 && this.h264Queue.length > 0)) {
+    const drawH264Frames = (): void => {
+      if (!drawH264 || this.h264Queue.length === 0) return;
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: this.framebuffer.view,
+          loadOp: 'load',
+          storeOp: 'store',
+        }],
+      });
+      for (const frame of this.h264Queue) {
+        this.h264Pipeline!.drawFullFrame(pass, frame, this.framebuffer.width, this.framebuffer.height);
+      }
+      pass.end();
+    };
+    const liftCdf53 = (): void => {
+      this.cdf53Pipeline.encodeIntegrate(encoder, cdf53Count);
+      this.cdf53Pipeline.encodeInverse(encoder);
+    };
+
+    // ---- Step 5: whole-frame / wavelet work (the layers tiles sit on) ----
+    if (plan.h264BeforeCdf53) {
+      drawH264Frames();
+      liftCdf53();
+    } else {
+      liftCdf53();
+      drawH264Frames();
+    }
+    const h264Count = drawH264 ? this.h264Queue.length : 0;
+    // Stage the VideoFrames for next-tick cleanup; the importExternalTexture
+    // references are scoped to this submit. (Still need to close dropped
+    // frames so they don't leak GPU memory in the WebCodecs decoder.)
+    this.videoFramesToClose.push(...this.h264Queue);
+    this.h264Queue.length = 0;
+
+    // ---- Step 6: direct Raw uploads ----
+    // `writeTexture` executes at the front of the next submit, i.e. BEFORE
+    // everything encoded above. When there is lower-layer work and a Raw
+    // tile to put over it, submit that work first so the Raw write lands
+    // after it. Otherwise the Raw write stays in the single submit below.
+    const rawCount = plan.raw.length;
+    if (rawCount > 0 && (cdf53Count > 0 || h264Count > 0)) {
+      this.device.queue.submit([encoder.finish()]);
+      this.submitCount++;
+      encoder = this.device.createCommandEncoder();
+    }
+    for (const r of plan.raw) {
+      this.writeRawTile(r.tileX, r.tileY, r.bgra);
+    }
+
+    // ---- Step 7: PalRle compute pass ----
+    this.palrlePipeline.encodeDispatch(encoder, palRleCount);
+
+    // ---- Step 8: Solid render pass on framebuffer ----
+    if (solidCount > 0) {
       const pass = encoder.beginRenderPass({
         colorAttachments: [{
           view: this.framebuffer.view,
@@ -342,19 +400,8 @@ export class WebGpuRenderer {
         }],
       });
       this.solidPipeline.draw(pass, solidCount);
-      if (drawH264) {
-        for (const frame of this.h264Queue) {
-          this.h264Pipeline!.drawFullFrame(pass, frame, this.framebuffer.width, this.framebuffer.height);
-        }
-      }
       pass.end();
     }
-    const h264Count = drawH264 ? this.h264Queue.length : 0;
-    // Stage the VideoFrames for next-tick cleanup; the importExternalTexture
-    // references are scoped to this submit. (Still need to close dropped
-    // frames so they don't leak GPU memory in the WebCodecs decoder.)
-    this.videoFramesToClose.push(...this.h264Queue);
-    this.h264Queue.length = 0;
 
     // ---- Step 9: present blit ----
     const swapTex = this.context.getCurrentTexture();
