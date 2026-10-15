@@ -458,6 +458,20 @@ mod tests {
         assert!(msg.contains("bytes"), "{msg}");
     }
 
+    /// The server now also sends `certHashes`; the native client must keep
+    /// reading the current hash from `certHash`, not trip over the longer key
+    /// that shares its prefix.
+    #[test]
+    fn parses_current_hash_when_certhashes_list_is_present() {
+        let other = "ab".repeat(32);
+        let body = format!(r#"{{"certHash":"{HASH}","certHashes":["{HASH}","{other}"]}}"#);
+        let h = parse_cert_hash(&body).expect("parse");
+        assert_eq!(h[0], 0x00);
+        // Even with the list ahead of the scalar key.
+        let body = format!(r#"{{"certHashes":["{other}"],"certHash":"{HASH}"}}"#);
+        assert_eq!(parse_cert_hash(&body).expect("parse")[0], 0x00);
+    }
+
     #[test]
     fn parses_cert_hash_from_config_json() {
         let h = parse_cert_hash(&format!(r#"{{"certHash":"{HASH}"}}"#)).expect("parse");

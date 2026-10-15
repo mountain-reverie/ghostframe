@@ -75,6 +75,8 @@ pub struct GhostframeServer {
     /// [`wait_for_client`]: GhostframeServer::wait_for_client
     connected_session_count: watch::Receiver<usize>,
     _io_task: tokio::task::JoinHandle<()>,
+    /// Republishes the cert hash list as the certificate rotates.
+    _cert_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl GhostframeServer {
@@ -114,8 +116,23 @@ impl GhostframeServer {
         //
         // `ghostbridge()` returns None only on the test-only IoBridge path
         // (no real tsnet node); production callers always have a handle.
+        let mut cert_task = None;
         if let Some(bridge_handle) = bridge.ghostbridge() {
-            bridge_handle.start_web_server(&cert_hash)?;
+            // Publish every hash a client may need to pin (current + next),
+            // and keep the list fresh as the certificate rotates.
+            let schedule = crate::transport::quic::active_cert_schedule();
+            let initial = schedule
+                .as_ref()
+                .map(|s| s.hashes_hex())
+                .unwrap_or_else(|| vec![cert_hash.clone()]);
+            bridge_handle.start_web_server(&initial.join(","))?;
+            if let Some(schedule) = schedule {
+                cert_task = Some(tokio::spawn(publish_cert_hashes(
+                    schedule,
+                    bridge_handle.cert_hash_publisher(),
+                    initial,
+                )));
+            }
             // Stable readiness signal: emitted only after the :80 + :443
             // listeners are bound on tsnet. The e2e harness greps for this
             // line; production operators see it as confirmation the daemon
@@ -134,6 +151,7 @@ impl GhostframeServer {
             cert_hash,
             connected_session_count,
             _io_task: io_task,
+            _cert_task: cert_task,
         })
     }
 
@@ -183,6 +201,39 @@ impl GhostframeServer {
     /// value.
     pub fn cert_hash(&self) -> &str {
         &self.cert_hash
+    }
+}
+
+/// Keep the web server's `/config.json` hash list in step with the QUIC
+/// server's certificate rotation. Sleeps until the next rotation is due
+/// (never longer than an hour, so a clock step cannot strand it), then
+/// republishes if the list changed. Ends when the bridge handle is gone.
+async fn publish_cert_hashes(
+    schedule: Arc<crate::transport::quic::CertSchedule>,
+    publisher: crate::transport::ghostbridge::CertHashPublisher,
+    mut last: Vec<String>,
+) {
+    use std::time::Duration;
+    loop {
+        let wait = schedule
+            .until_next_rotation()
+            .saturating_add(Duration::from_secs(1))
+            .clamp(Duration::from_secs(1), Duration::from_secs(3600));
+        tokio::time::sleep(wait).await;
+        let now = schedule.hashes_hex();
+        if now == last {
+            continue;
+        }
+        match publisher.publish(&now) {
+            Ok(()) => {
+                tracing::info!(current = %now[0], next = %now[1], "published rotated cert hashes");
+                last = now;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not publish rotated cert hashes; stopping");
+                return;
+            }
+        }
     }
 }
 

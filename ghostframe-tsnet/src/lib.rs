@@ -41,6 +41,7 @@ extern "C" {
     fn gbridge_close(sd: c_int) -> c_int;
     fn gbridge_getips(sd: c_int, buf: *mut c_char, buf_len: usize) -> c_int;
     fn gbridge_start_web_server(sd: c_int, cert_hash_hex: *const c_char) -> c_int;
+    fn gbridge_set_cert_hashes(sd: c_int, cert_hashes_csv: *const c_char) -> c_int;
     fn gbridge_dial_tcp(sd: c_int, remote_addr: *const c_char, fd_out: *mut c_int) -> c_int;
     fn gbridge_login_url(sd: c_int, buf: *mut c_char, buf_len: usize) -> c_int;
     fn gbridge_logout(sd: c_int) -> c_int;
@@ -233,9 +234,11 @@ impl GhostbridgeHandle {
     /// Start the embedded HTTPS web server on tsnet `:443` plus a `:80`
     /// → `:443` redirect listener.
     ///
-    /// `cert_hash_hex` must be the lowercase-hex SHA-256 of the
-    /// WebTransport server cert; it is exposed at `/config.json` so the
-    /// browser can construct `new WebTransport(..., {serverCertificateHashes})`.
+    /// `cert_hash_hex` is the lowercase-hex SHA-256 of the WebTransport
+    /// server cert, or several joined by commas (current first); it is
+    /// exposed at `/config.json` so the browser can construct
+    /// `new WebTransport(..., {serverCertificateHashes})`. The list changes
+    /// when the server rotates its cert: see [`Self::cert_hash_publisher`].
     ///
     /// Returns a typed error for the two cases callers must surface to
     /// the user differently:
@@ -252,6 +255,37 @@ impl GhostbridgeHandle {
             WEB_STATUS_INVALID_ARG => Err(WebServerError::InvalidArg),
             other => Err(WebServerError::Other(other)),
         }
+    }
+}
+
+/// Pushes a new certificate hash list to the running web server.
+///
+/// Holds only the Go-side handle id, so it can outlive a borrow of the
+/// [`GhostbridgeHandle`] (the publisher task runs while the handle is owned
+/// by the I/O bridge). If the handle has been closed the id no longer
+/// resolves and `publish` reports an error rather than touching anything.
+#[derive(Debug, Clone, Copy)]
+pub struct CertHashPublisher {
+    sd: c_int,
+}
+
+impl CertHashPublisher {
+    /// Replace the published hashes (current first, each 64 hex chars).
+    pub fn publish(&self, hashes_hex: &[String]) -> Result<(), WebServerError> {
+        let csv = hashes_hex.join(",");
+        let c = CString::new(csv).map_err(|_| WebServerError::InvalidArg)?;
+        match unsafe { gbridge_set_cert_hashes(self.sd, c.as_ptr()) } {
+            WEB_STATUS_OK => Ok(()),
+            WEB_STATUS_INVALID_ARG => Err(WebServerError::InvalidArg),
+            other => Err(WebServerError::Other(other)),
+        }
+    }
+}
+
+impl GhostbridgeHandle {
+    /// A detached publisher for the web server's cert hash list.
+    pub fn cert_hash_publisher(&self) -> CertHashPublisher {
+        CertHashPublisher { sd: self.sd }
     }
 }
 

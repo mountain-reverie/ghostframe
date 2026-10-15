@@ -77,6 +77,8 @@ var (
 
 type serverHandle struct {
 	server *tsnet.Server
+	// certHashes is what /config.json publishes; Rust updates it on rotation.
+	certHashes *certHashStore
 }
 
 // setNonblock sets O_NONBLOCK on a raw fd. The Rust side wraps this fd in
@@ -111,7 +113,7 @@ func gbridge_new(cHostname, cAuthkey, cStateDir, cControlURL *C.char, sdOut *C.i
 	serversMu.Lock()
 	id := nextHandle
 	nextHandle++
-	servers[id] = &serverHandle{server: s}
+	servers[id] = &serverHandle{server: s, certHashes: newCertHashStore()}
 	serversMu.Unlock()
 
 	*sdOut = C.int32_t(id)
@@ -453,17 +455,37 @@ const (
 	gbridgeWebStatusListenFailed       = -22
 )
 
+// gbridge_set_cert_hashes replaces the hashes published at /config.json with
+// a comma-separated list (current first). Called whenever the server rotates
+// its certificate.
+//
+//export gbridge_set_cert_hashes
+func gbridge_set_cert_hashes(sd C.int32_t, cCertHashes *C.char) C.gbridge_status {
+	h := lookup(int32(sd))
+	if h == nil {
+		return gbridgeWebStatusInvalidHandle
+	}
+	hashList, err := parseCertHashList(C.GoString(cCertHashes))
+	if err != nil {
+		log.Printf("ghostbridge: gbridge_set_cert_hashes: %v", err)
+		return gbridgeWebStatusInvalidArg
+	}
+	h.certHashes.set(hashList)
+	return gbridgeWebStatusOK
+}
+
 //export gbridge_start_web_server
 func gbridge_start_web_server(sd C.int32_t, cCertHashHex *C.char) C.gbridge_status {
 	h := lookup(int32(sd))
 	if h == nil {
 		return gbridgeWebStatusInvalidHandle
 	}
-	certHash := C.GoString(cCertHashHex)
-	if len(certHash) != 64 {
-		log.Printf("ghostbridge: gbridge_start_web_server: certHash length %d, want 64", len(certHash))
+	hashList, err := parseCertHashList(C.GoString(cCertHashHex))
+	if err != nil {
+		log.Printf("ghostbridge: gbridge_start_web_server: %v", err)
 		return gbridgeWebStatusInvalidArg
 	}
+	h.certHashes.set(hashList)
 
 	staticCert, err := loadStaticCertFromEnv()
 	if err != nil {
@@ -486,7 +508,7 @@ func gbridge_start_web_server(sd C.int32_t, cCertHashHex *C.char) C.gbridge_stat
 		log.Printf("ghostbridge: HTTPS-eligible cert domains: %v", domains)
 	}
 
-	if err := startWebListeners(context.Background(), h.server, certHash, staticCert); err != nil {
+	if err := startWebListeners(context.Background(), h.server, h.certHashes, staticCert); err != nil {
 		log.Printf("ghostbridge: gbridge_start_web_server: listener bind failed: %v", err)
 		return gbridgeWebStatusListenFailed
 	}

@@ -21,7 +21,7 @@ const webDistEmbedded = false
 // newWebMux is unreachable in a noweb build (startWebListeners returns
 // before constructing it). Defined so main.go compiles under both tags,
 // and it answers 501 rather than nil-panicking if that guard ever moves.
-func newWebMux(certHashHex string) http.Handler {
+func newWebMux(hashes *certHashStore) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w,
 			"ghostbridge was built with -tags noweb: no embedded web client",
