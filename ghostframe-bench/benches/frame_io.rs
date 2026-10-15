@@ -20,6 +20,7 @@ use ghostframe_lib::transport::ghostbridge::{
 
 const PKTS: usize = 8975;
 const PKT_LEN: usize = 1200;
+const CHUNKS: &[usize] = &[8 * 1024, 16 * 1024, 32 * 1024, 64 * 1024];
 
 fn median(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -63,7 +64,7 @@ fn main() {
 
     let mut per_packet = vec![];
     let mut reused = vec![];
-    let mut batched = vec![];
+    let mut batched: Vec<Vec<f64>> = vec![];
     for round in 0..iters + 2 {
         let a = run(&mut tx, &mut |tx| {
             for _ in 0..PKTS {
@@ -78,26 +79,32 @@ fn main() {
                 tx.write_all(&f).unwrap();
             }
         });
-        let c = run(&mut tx, &mut |tx| {
-            let mut batch = Vec::with_capacity(64 * 1024 + 2048);
-            for _ in 0..PKTS {
-                encode_frame_append(&mut batch, &payload, &addr);
-                if batch.len() >= 64 * 1024 {
-                    tx.write_all(&batch).unwrap();
-                    batch.clear();
+        let mut cs = vec![];
+        for &chunk in CHUNKS {
+            cs.push(run(&mut tx, &mut |tx| {
+                let mut batch = Vec::with_capacity(chunk + 2048);
+                for _ in 0..PKTS {
+                    encode_frame_append(&mut batch, &payload, &addr);
+                    if batch.len() >= chunk {
+                        tx.write_all(&batch).unwrap();
+                        batch.clear();
+                    }
                 }
-            }
-            tx.write_all(&batch).unwrap();
-        });
+                tx.write_all(&batch).unwrap();
+            }));
+        }
         if round >= 2 {
             per_packet.push(a);
             reused.push(b);
-            batched.push(c);
+            batched.push(cs);
         }
     }
     stats("outbound: encode_frame + write", per_packet);
     stats("outbound: encode_frame_into + write", reused);
-    stats("outbound: batched 64 KiB writes", batched);
+    for (i, &chunk) in CHUNKS.iter().enumerate() {
+        let v: Vec<f64> = batched.iter().map(|r| r[i]).collect();
+        stats(&format!("outbound: batched {} KiB writes", chunk / 1024), v);
+    }
 
     // Inbound: the parse half only (the read syscalls are the socket's).
     let frame = encode_frame(&payload[..80], &addr);
