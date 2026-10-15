@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Stage 1: Build ghostframe binaries inside the container so shared libraries
 # match the runtime environment exactly.
 FROM ubuntu:24.04 AS builder
@@ -23,7 +24,12 @@ RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# Download to a file, then run it: `curl | sh` reports sh's status, so a failed
+# download (DNS down) yielded an empty script, a "successful" layer without
+# cargo, and that layer was then served from the BuildKit cache.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && sh /tmp/rustup-init.sh -y \
+    && rm /tmp/rustup-init.sh
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN cargo install cbindgen
 
@@ -95,18 +101,17 @@ COPY ghostframe-web-client/dist/ ghostframe-web-client/dist/
 RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install -y --allow-unauthenticated --no-install-recommends rsync \
     && rm -rf /var/lib/apt/lists/*
 
-# Parallelism for the in-container release build. Default 2 -- unchanged,
-# so CI runners (small, and sharing a host) behave exactly as before.
-# Override on a workstation where the build otherwise outruns the patience
-# of whoever is waiting:
+# Parallelism for the in-container release build. Default 6, which suits a
+# 12-core workstation that other jobs share; CI runners (small, and sharing a
+# host) can pass a smaller number. Override with:
 #
-#   docker build --build-arg CARGO_JOBS=6 -t ghostframe/test-server \
+#   docker build --build-arg CARGO_JOBS=2 -t ghostframe/test-server \
 #     -f tests/containers/test-server/Dockerfile .
 #
 # Each rustc job carries the 16 MiB stack set below and ffmpeg-next's
 # codegen is memory-hungry, so scale this against available RAM, not just
 # core count.
-ARG CARGO_JOBS=2
+ARG CARGO_JOBS=6
 ENV CARGO_BUILD_JOBS=${CARGO_JOBS}
 # ffmpeg-next overflows rustc's default 8 MiB stack on this codebase; bump
 # to 16 MiB (the value rustc itself suggests when it crashes).
@@ -117,8 +122,19 @@ ENV RUST_MIN_STACK=16777216
 # cdf53 forward diff log (GHOSTFRAME_CDF53_DIFF_TILE=X,Y) and the
 # GHOSTFRAME_CDF53_SKIP_L2_L3 / SKIP_L3 stage gates. Production builds
 # (separate Dockerfile or release pipeline) do NOT enable these features.
-RUN cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern \
-    --features ghostframe-lib/test-loss-injection,ghostframe-lib/cdf53-diag
+#
+# The registry, git checkouts and target/ live in BuildKit cache mounts, so an
+# edit to one source file recompiles only what it touches instead of the whole
+# workspace. A cache mount is not part of the layer, so the two binaries are
+# copied out to /out inside the same RUN; the runtime stage takes them from
+# there. Prune the cache with `docker builder prune --filter type=exec.cachemount`.
+RUN --mount=type=cache,id=ghostframe-cargo-registry,target=/root/.cargo/registry \
+    --mount=type=cache,id=ghostframe-cargo-git,target=/root/.cargo/git \
+    --mount=type=cache,id=ghostframe-target,target=/build/target \
+    cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern \
+        --features ghostframe-lib/test-loss-injection,ghostframe-lib/cdf53-diag \
+    && mkdir -p /out \
+    && cp target/release/ghostframe-xdaemon target/release/ghostframe-test-pattern /out/
 
 # Stage 2: Runtime image
 FROM ubuntu:24.04
@@ -145,8 +161,8 @@ RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install
     libx264-164 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/ghostframe-xdaemon /usr/local/bin/ghostframe-xdaemon
-COPY --from=builder /build/target/release/ghostframe-test-pattern /usr/local/bin/ghostframe-test-pattern
+COPY --from=builder /out/ghostframe-xdaemon /usr/local/bin/ghostframe-xdaemon
+COPY --from=builder /out/ghostframe-test-pattern /usr/local/bin/ghostframe-test-pattern
 COPY tests/containers/test-server/entrypoint.sh /entrypoint.sh
 COPY tests/containers/test-server/xorg.conf /etc/X11/xorg.conf
 COPY tests/containers/test-server/xorg-odd.conf /etc/X11/xorg-odd.conf

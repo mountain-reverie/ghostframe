@@ -168,8 +168,14 @@ test-e2e-isolated: containers-build
         cargo test --test e2e -- "$t" --exact --test-threads=1
     done
 
+# Builds both e2e images. The server binaries are compiled inside the image
+# (matching the Ubuntu runtime's glibc/ffmpeg), so no host cargo build is
+# needed. The Rust target dir and cargo registry live in BuildKit cache mounts
+# (ids ghostframe-target, ghostframe-cargo-registry, ghostframe-cargo-git), so
+# rebuilds are incremental. The cache is not bounded: reclaim it with
+#   docker builder prune --filter type=exec.cachemount
+# (add `--all` to drop image layers too). Parallelism: --build-arg CARGO_JOBS=N.
 containers-build:
-    cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern
     docker build -t ghostframe/test-server -f tests/containers/test-server/Dockerfile .
     docker build -t ghostframe/test-headscale -f tests/containers/headscale/Dockerfile tests/containers/headscale/
 
