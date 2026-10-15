@@ -201,11 +201,6 @@ pub struct TransportConfig {
     /// Overrides `sample_all_path_stats`'s `bytes_per_us`. From
     /// `GHOSTFRAME_TEST_FORCE_BYTES_PER_US`; accepts any value `> 0.0`.
     pub test_force_bytes_per_us: Option<f32>,
-    /// FEC parity group size. From `GHOSTFRAME_FEC_K`; `None` ⇒ `IoBridge`
-    /// defaults to `0` (disabled) at the consumption site, exactly as
-    /// today. Forces FEC on for e2e testing — production toggles it
-    /// automatically from receiver feedback loss rate instead.
-    pub fec_k: Option<usize>,
 }
 
 impl TransportConfig {
@@ -214,15 +209,11 @@ impl TransportConfig {
     /// state. Keeping the parsing here means the crate reads the process
     /// environment in exactly one place.
     ///
-    /// This function itself is **not** gated behind
-    /// `cfg(any(test, feature = "test-loss-injection"))`: `fec_k`
-    /// (`GHOSTFRAME_FEC_K`) is honoured by production builds, and gating the
-    /// whole function would silently stop that. Instead, the `#[cfg]` sits on the
-    /// individual field initialisers below — the two `LossInjector` fields
-    /// (whose type only exists under the feature) and the four others that
-    /// were gated at their old `io_bridge` sites, mirroring the shape of
-    /// `IoBridge`'s own struct literal. `fec_k` is the only field that
-    /// parses unconditionally.
+    /// The `#[cfg(any(test, feature = "test-loss-injection"))]` sits on the
+    /// individual field initialisers below rather than on the function: the
+    /// two `LossInjector` fields (whose type only exists under the feature)
+    /// and the others that were gated at their old `io_bridge` sites, mirroring
+    /// the shape of `IoBridge`'s own struct literal.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
         Self {
             #[cfg(any(test, feature = "test-loss-injection"))]
@@ -252,7 +243,6 @@ impl TransportConfig {
                 .filter(|v| *v > 0.0),
             #[cfg(not(any(test, feature = "test-loss-injection")))]
             test_force_bytes_per_us: None,
-            fec_k: get("GHOSTFRAME_FEC_K").and_then(|v| v.parse::<usize>().ok()),
         }
     }
 
@@ -680,7 +670,6 @@ mod tests {
         assert!(cfg.transport.oob_inject_at.is_none());
         assert!(!cfg.transport.skip_palette_session_reset);
         assert!(cfg.transport.test_force_bytes_per_us.is_none());
-        assert!(cfg.transport.fec_k.is_none());
         assert!(!cfg.diagnostics.diagnose_tiles);
         assert!(!cfg.diagnostics.diagnose_gpu_pipeline);
         assert!(!cfg.diagnostics.diagnose_color_hist);
@@ -1021,15 +1010,6 @@ mod tests {
     }
 
     #[test]
-    fn transport_config_parses_fec_k() {
-        assert_eq!(
-            TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_FEC_K", "4")])).fec_k,
-            Some(4)
-        );
-        assert_eq!(TransportConfig::from_lookup(lookup(&[])).fec_k, None);
-    }
-
-    #[test]
     fn transport_config_parses_outbound_bandwidth_cap_bps() {
         assert_eq!(
             TransportConfig::from_lookup(lookup(&[(
@@ -1122,9 +1102,12 @@ mod tests {
     #[test]
     fn transport_config_from_env_reads_the_real_environment() {
         let _env = lock_env();
-        std::env::set_var("GHOSTFRAME_FEC_K", "7");
-        assert_eq!(TransportConfig::from_env().fec_k, Some(7));
-        std::env::remove_var("GHOSTFRAME_FEC_K");
+        std::env::set_var("GHOSTFRAME_TEST_FORCE_BYTES_PER_US", "7.5");
+        assert_eq!(
+            TransportConfig::from_env().test_force_bytes_per_us,
+            Some(7.5)
+        );
+        std::env::remove_var("GHOSTFRAME_TEST_FORCE_BYTES_PER_US");
     }
 
     // -----------------------------------------------------------------
