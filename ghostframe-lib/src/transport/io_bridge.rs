@@ -1184,6 +1184,11 @@ impl IoBridge {
         &self.server.cert_info().sha256_hex
     }
 
+    /// The live certificate rotation state, for publishing the hash list.
+    pub fn cert_schedule(&self) -> std::sync::Arc<crate::transport::quic::CertSchedule> {
+        self.server.cert_info().schedule.clone()
+    }
+
     /// Hand out a receiver on the connected-session counter so the capture
     /// loop (running on a different task) can skip the GetImage/DRM scrape when
     /// no consumer is attached, and park until one attaches. Updated by

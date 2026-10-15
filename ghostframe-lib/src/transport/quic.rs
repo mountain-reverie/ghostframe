@@ -384,19 +384,6 @@ impl rustls::server::ResolvesServerCert for CertSchedule {
     }
 }
 
-/// The schedule of the most recently built `QuicServer` (the daemon has one).
-/// The daemon has one; `GhostframeServer` reads it to publish the hash list
-/// without reaching into `IoBridge`.
-static ACTIVE_SCHEDULE: std::sync::Mutex<Option<Arc<CertSchedule>>> = std::sync::Mutex::new(None);
-
-/// See [`ACTIVE_SCHEDULE`].
-pub fn active_cert_schedule() -> Option<Arc<CertSchedule>> {
-    ACTIVE_SCHEDULE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-}
-
 impl QuicServer {
     /// Construct a new `QuicServer` with a freshly-generated self-signed cert.
     ///
@@ -487,8 +474,6 @@ impl QuicServer {
             /* allow_mtud */ true,
             rng_seed,
         );
-
-        *ACTIVE_SCHEDULE.lock().unwrap_or_else(|e| e.into_inner()) = Some(schedule.clone());
 
         Ok(Self {
             endpoint,
