@@ -399,11 +399,40 @@ pub fn encode_frame(payload: &[u8], addr: &SocketAddr) -> Vec<u8> {
 /// Like [`encode_frame`], but encodes into `frame` (cleared first) so a hot
 /// send loop can reuse one allocation across packets.
 pub fn encode_frame_into(frame: &mut Vec<u8>, payload: &[u8], addr: &SocketAddr) {
-    let host = addr.ip().to_string();
-    let host_bytes = host.as_bytes();
+    frame.clear();
+    encode_frame_append(frame, payload, addr);
+}
+
+/// Like [`encode_frame_into`], but appends to `frame` without clearing it, so
+/// several packets can be framed into one buffer and written with a single
+/// syscall. The bytes appended are exactly those [`encode_frame`] returns.
+pub fn encode_frame_append(frame: &mut Vec<u8>, payload: &[u8], addr: &SocketAddr) {
+    use std::fmt::Write;
+    // The longest IP literal is a 45-byte IPv6 with an embedded IPv4 tail;
+    // formatting into the stack avoids a `String` per packet.
+    struct Host {
+        buf: [u8; 48],
+        len: usize,
+    }
+    impl Write for Host {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            let end = self.len + s.len();
+            self.buf
+                .get_mut(self.len..end)
+                .ok_or(std::fmt::Error)?
+                .copy_from_slice(s.as_bytes());
+            self.len = end;
+            Ok(())
+        }
+    }
+    let mut host = Host {
+        buf: [0; 48],
+        len: 0,
+    };
+    write!(host, "{}", addr.ip()).expect("an IP literal fits in 48 bytes");
+    let host_bytes = &host.buf[..host.len];
     let total_len = (4 + 4 + payload.len() + 2 + host_bytes.len() + 1) as u32;
 
-    frame.clear();
     frame.reserve(total_len as usize);
     frame.extend_from_slice(&total_len.to_be_bytes());
     frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -458,6 +487,33 @@ mod tests {
         assert_eq!(buf, encode_frame(&[7u8; 64], &a));
         encode_frame_into(&mut buf, &[1, 2, 3], &b);
         assert_eq!(buf, encode_frame(&[1, 2, 3], &b));
+    }
+
+    #[test]
+    fn encode_frame_append_concatenates_exactly_the_individual_frames() {
+        let addrs: [SocketAddr; 3] = [
+            "100.64.0.1:443".parse().unwrap(),
+            "[fd7a:115c:a1e0:ab12:4843:cd96:6258:1a2b]:9"
+                .parse()
+                .unwrap(),
+            "[::ffff:255.255.255.255]:65535".parse().unwrap(),
+        ];
+        let mut batch = Vec::new();
+        let mut want = Vec::new();
+        for (i, a) in addrs.iter().enumerate() {
+            let payload = vec![i as u8; 5 + i * 700];
+            encode_frame_append(&mut batch, &payload, a);
+            // Reference: the original `String`-allocating encoding.
+            let host = a.ip().to_string();
+            let total = (4 + 4 + payload.len() + 2 + host.len() + 1) as u32;
+            want.extend_from_slice(&total.to_be_bytes());
+            want.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            want.extend_from_slice(&payload);
+            want.extend_from_slice(&a.port().to_be_bytes());
+            want.extend_from_slice(host.as_bytes());
+            want.push(0);
+        }
+        assert_eq!(batch, want);
     }
 
     #[test]

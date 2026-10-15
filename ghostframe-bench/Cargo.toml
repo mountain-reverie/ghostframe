@@ -64,6 +64,10 @@ harness = false
 name = "send_path"
 harness = false
 
+[[bench]]
+name = "frame_io"
+harness = false
+
 [[bin]]
 name = "codec_report"
 path = "src/bin/codec_report/main.rs"
