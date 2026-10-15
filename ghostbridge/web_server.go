@@ -57,6 +57,13 @@ func parseCertHashList(csv string) ([]string, error) {
 		if len(p) != 64 {
 			return nil, fmt.Errorf("certHash length %d, want 64", len(p))
 		}
+		// Lowercase hex only: a non-hex element would make every browser's
+		// hexToBytes throw, so reject it here where the cause is nameable.
+		for _, c := range p {
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				return nil, fmt.Errorf("certHash has non-hex character %q", c)
+			}
+		}
 	}
 	return parts, nil
 }

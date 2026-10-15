@@ -28,13 +28,15 @@ export async function bootstrap(): Promise<BootstrapResult> {
   const cfg = await resp.json();
   // `certHashes` is the full pin list (current + next). Older servers only
   // send `certHash`.
+  const valid = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+  const listed: unknown = cfg.certHashes;
   const hashes: string[] =
-    Array.isArray(cfg.certHashes) && cfg.certHashes.length > 0
-      ? cfg.certHashes
-      : typeof cfg.certHash === 'string' && cfg.certHash.length > 0
+    Array.isArray(listed) && listed.length > 0 && listed.every(valid)
+      ? listed
+      : valid(cfg.certHash)
         ? [cfg.certHash]
         : [];
-  if (hashes.length === 0 || !hashes.every((h) => typeof h === 'string' && h.length > 0)) {
+  if (hashes.length === 0) {
     throw new Error('bootstrap: /config.json missing certHash');
   }
   const url = `https://${location.host}/`;
