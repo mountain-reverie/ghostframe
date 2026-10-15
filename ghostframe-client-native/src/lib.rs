@@ -330,8 +330,9 @@ impl Client {
 
         // Current first, then the successor cert: a fetch just before a
         // rotation must still connect.
-        let mut cert_hashes = bootstrap::fetch_cert_hashes(&bridge, host)?;
-        let cert_hash = cert_hashes.remove(0);
+        let (cert_hash, cert_hashes) =
+            bootstrap::split_pins(bootstrap::fetch_cert_hashes(&bridge, host)?)
+                .ok_or_else(|| ClientError::Bootstrap("config.json carries no cert hash".into()))?;
 
         let udp_fd = bridge.dial_udp(&format!("{host}:{port}"))?.into_raw_fd();
         // SAFETY: `into_raw_fd` just handed us sole ownership of a freshly

@@ -90,7 +90,7 @@ describe('bootstrap', () => {
     const a = 'aa'.repeat(32);
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,
-      json: () => Promise.resolve({ certHash: a, certHashes: [''] }),
+      json: () => Promise.resolve({ certHash: a, certHashes: ['zz'.repeat(32)] }),
     }));
     const ctorSpy = vi.fn();
     vi.stubGlobal('WebTransport', class { constructor(...args: unknown[]) { ctorSpy(...args); } });

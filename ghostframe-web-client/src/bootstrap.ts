@@ -28,7 +28,8 @@ export async function bootstrap(): Promise<BootstrapResult> {
   const cfg = await resp.json();
   // `certHashes` is the full pin list (current + next). Older servers only
   // send `certHash`.
-  const valid = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+  const valid = (v: unknown): v is string =>
+    typeof v === 'string' && /^[0-9a-f]+$/i.test(v) && v.length % 2 === 0;
   const listed: unknown = cfg.certHashes;
   const hashes: string[] =
     Array.isArray(listed) && listed.length > 0 && listed.every(valid)

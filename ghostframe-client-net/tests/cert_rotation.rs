@@ -77,3 +77,18 @@ fn a_client_fetched_before_rotation_still_connects_after_it() {
     assert!(connects(&mut server, vec![b]), "the TLS layer presents B");
     assert!(!connects(&mut server, vec![a]), "A is no longer presented");
 }
+
+#[test]
+fn extra_pins_reach_the_verifier_set() {
+    let cfg = ClientNetConfig {
+        server_name: "localhost".into(),
+        server_cert_sha256: [1; 32],
+        indices_raw_enabled: true,
+        supports_h264: false,
+        display: None,
+    };
+    let client = ClientNet::new(cfg, 0)
+        .expect("ClientNet::new")
+        .with_extra_cert_pins(vec![[2; 32]]);
+    assert_eq!(client.cert_pins(), vec![[1; 32], [2; 32]]);
+}
