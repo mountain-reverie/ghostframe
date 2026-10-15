@@ -42,6 +42,12 @@ export async function bootstrap(): Promise<BootstrapResult> {
   }
   const url = `https://${location.host}/`;
   const transport = new WebTransport(url, {
+    // A hint to the browser's own congestion controller (its sending
+    // direction: input, ACKs, NACKs): favour latency over throughput. A
+    // browser that does not know the member ignores it (WebIDL dictionaries
+    // drop unknown keys); one that knows it and cannot honour it falls back
+    // to the default.
+    congestionControl: 'low-latency',
     serverCertificateHashes: hashes.map((h) => ({
       algorithm: 'sha-256',
       value: hexToBytes(h).buffer as ArrayBuffer,
