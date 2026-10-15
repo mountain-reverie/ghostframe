@@ -840,6 +840,24 @@ impl GpuFrameProcessor {
         )?;
         let cdf53_escalation_coefficients_ptr = cdf53_escalation_coefficients_ptr_mut as *const i32;
 
+        // --- CDF 5/3 fallback buffers (see `forward_cdf53_tiles`): same sizes
+        // as the escalation pair, MAX_ESCALATION_PER_FRAME tiles per chunk.
+        let (fb_list_buffer, fb_list_memory, fb_list_ptr) = alloc_host_buffer_mapped::<u32>(
+            &device,
+            &mem_props,
+            cdf53_escalation_list_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            "cdf53 fallback list buffer",
+        )?;
+        let (fb_coeff_buffer, fb_coeff_memory, fb_coeff_ptr) =
+            alloc_host_readback_buffer_mapped::<i32>(
+                &device,
+                &mem_props,
+                cdf53_escalation_coefficients_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                "cdf53 fallback coefficients buffer",
+            )?;
+
         // Persistent per-frame command buffer + fence (see begin_frame_cmd).
         let frame_cmd = device.allocate_command_buffers(
             &vk::CommandBufferAllocateInfo::default()
@@ -933,6 +951,16 @@ impl GpuFrameProcessor {
             cdf53_escalation_coefficients_buffer,
             cdf53_escalation_coefficients_memory,
             cdf53_escalation_coefficients_ptr,
+            cdf53_fallback_list: HostBuffer {
+                buffer: fb_list_buffer,
+                memory: fb_list_memory,
+                ptr: fb_list_ptr,
+            },
+            cdf53_fallback_coefficients: HostBuffer {
+                buffer: fb_coeff_buffer,
+                memory: fb_coeff_memory,
+                ptr: fb_coeff_ptr,
+            },
             cdf53_forward_l1: ComputeStage {
                 module: cdf53_forward_l1_shader_module,
                 pipeline: cdf53_forward_l1_pipeline,

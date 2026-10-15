@@ -344,6 +344,13 @@ pub struct GpuFrameProcessor {
     /// CPU reads escalation forward coefficients via this pointer post-fence.
     pub cdf53_escalation_coefficients_ptr: *const i32,
 
+    // CDF 5/3 fallback forward (`forward_cdf53_tiles`): tiles the CPU rejected
+    // for PalRle after Phase A. Separate from the escalation buffers because
+    // the fallback runs between the frame's fence and the escalation Phase B
+    // read, and must not overwrite the coefficients that read still needs.
+    cdf53_fallback_list: HostBuffer<u32>,
+    cdf53_fallback_coefficients: HostBuffer<i32>,
+
     // Cdf53 forward L1 pipeline (Stage 4c-L1, added M3.3a Task 7)
     cdf53_forward_l1: ComputeStage,
 
@@ -802,6 +809,8 @@ impl Drop for GpuFrameProcessor {
 
             // M3.3c escalation buffers
             self.cdf53_escalation_list.destroy(&self.device);
+            self.cdf53_fallback_list.destroy(&self.device);
+            self.cdf53_fallback_coefficients.destroy(&self.device);
 
             self.device
                 .unmap_memory(self.cdf53_escalation_coefficients_memory);
@@ -868,3 +877,6 @@ mod tests;
 
 #[cfg(test)]
 mod readback_bench;
+
+#[cfg(test)]
+mod fallback_tests;

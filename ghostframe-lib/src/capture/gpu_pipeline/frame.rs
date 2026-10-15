@@ -2122,6 +2122,7 @@ impl GpuFrameProcessor {
     ///     before the subsequent submit, so this happens naturally).
     ///   - Holds three `ScopedDescriptorSets` until after `wait_for_fences`.
     ///   - If `count == 0`, returns an error (callers should skip this entirely).
+    #[allow(clippy::too_many_arguments)]
     unsafe fn run_cdf53_forward_escalation_stages<'a>(
         &'a self,
         cmd: vk::CommandBuffer,
@@ -2129,6 +2130,8 @@ impl GpuFrameProcessor {
         cols: u32,
         rows: u32,
         count: u32,
+        list_buffer: vk::Buffer,
+        coeff_buffer: vk::Buffer,
     ) -> Result<
         (
             ScopedDescriptorSets<'a>,
@@ -2150,8 +2153,8 @@ impl GpuFrameProcessor {
             &self.cdf53_forward_l1,
             &[
                 StageBinding::Image(current_view),
-                StageBinding::Buffer(self.cdf53_escalation_list.buffer),
-                StageBinding::Buffer(self.cdf53_escalation_coefficients_buffer),
+                StageBinding::Buffer(list_buffer),
+                StageBinding::Buffer(coeff_buffer),
             ],
             &[cols, rows],
             StageDispatch::Direct(count, 1, 1),
@@ -2164,7 +2167,7 @@ impl GpuFrameProcessor {
             .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_escalation_coefficients_buffer)
+            .buffer(coeff_buffer)
             .offset(0)
             .size(vk::WHOLE_SIZE);
         self.device.cmd_pipeline_barrier(
@@ -2184,8 +2187,8 @@ impl GpuFrameProcessor {
             cmd,
             &self.cdf53_forward_l2,
             &[
-                StageBinding::Buffer(self.cdf53_escalation_list.buffer),
-                StageBinding::Buffer(self.cdf53_escalation_coefficients_buffer),
+                StageBinding::Buffer(list_buffer),
+                StageBinding::Buffer(coeff_buffer),
             ],
             &[cols, rows],
             StageDispatch::Direct(count, 1, 1),
@@ -2198,7 +2201,7 @@ impl GpuFrameProcessor {
             .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_escalation_coefficients_buffer)
+            .buffer(coeff_buffer)
             .offset(0)
             .size(vk::WHOLE_SIZE);
         self.device.cmd_pipeline_barrier(
@@ -2218,8 +2221,8 @@ impl GpuFrameProcessor {
             cmd,
             &self.cdf53_forward_l3,
             &[
-                StageBinding::Buffer(self.cdf53_escalation_list.buffer),
-                StageBinding::Buffer(self.cdf53_escalation_coefficients_buffer),
+                StageBinding::Buffer(list_buffer),
+                StageBinding::Buffer(coeff_buffer),
             ],
             &[cols, rows],
             StageDispatch::Direct(count, 1, 1),
@@ -2679,6 +2682,8 @@ impl GpuFrameProcessor {
                 cols,
                 rows,
                 escalation_count,
+                self.cdf53_escalation_list.buffer,
+                self.cdf53_escalation_coefficients_buffer,
             )?;
             // L3 → HOST_READ barrier so Phase B can read after fence.
             let buf_barrier_esc_host = buf_barrier(
@@ -3065,4 +3070,137 @@ fn dmabuf_frame_bytes(
         return Err(format!("dma-buf: stride {stride} < width*4 {row}").into());
     }
     Ok(u64::from(height - 1) * u64::from(stride) + row)
+}
+
+impl GpuFrameProcessor {
+    /// Run the CDF 5/3 forward transform on the GPU for tiles the CPU has
+    /// already decided to send as CDF 5/3 but that the frame's own compact
+    /// pass did not list (it only lists dirty tiles with more than 16
+    /// colours): PalRle fell through (table full, palette overflow) or the
+    /// tile was classified H.264 in a tile-codec frame.
+    ///
+    /// `tiles` are 32x32 BGRA tiles, 4096 bytes each, in the order the
+    /// caller wants the coefficients back. They are laid out in a small
+    /// transient image so the existing forward shaders run unchanged with an
+    /// identity tile list; nothing here depends on the frame's own image,
+    /// which is gone once `process_frame` returns. One GPU round trip (one
+    /// submit and fence wait) per chunk of `MAX_ESCALATION_PER_FRAME` tiles.
+    ///
+    /// Returns `3 * 1024` coefficients per tile (`CDF53_TOTAL_COEFFS`), in
+    /// the layout `cdf53::encode_passes_sparse` takes. Must not be called
+    /// while a frame is in flight; the fallback buffers are separate from the
+    /// escalation ones so the frame's escalation readback is unaffected.
+    pub fn forward_cdf53_tiles(
+        &mut self,
+        tiles: &[&[u8]],
+    ) -> Result<Vec<i16>, Box<dyn std::error::Error>> {
+        use crate::encoder::cdf53::CDF53_TOTAL_COEFFS;
+        const TILE_BYTES: usize = 32 * 32 * 4;
+        if let Some(i) = tiles.iter().position(|t| t.len() != TILE_BYTES) {
+            return Err(format!("forward_cdf53_tiles: tile {i} is not {TILE_BYTES} bytes").into());
+        }
+        let mut out: Vec<i16> = Vec::with_capacity(tiles.len() * CDF53_TOTAL_COEFFS);
+        for chunk in tiles.chunks(MAX_ESCALATION_PER_FRAME) {
+            // SAFETY: the chunk is validated above; the unsafe block records
+            // and submits one command buffer and waits for its fence before
+            // reading the mapped coefficients, then frees every object it made.
+            unsafe { self.forward_cdf53_chunk(chunk, &mut out)? };
+        }
+        Ok(out)
+    }
+
+    unsafe fn forward_cdf53_chunk(
+        &mut self,
+        chunk: &[&[u8]],
+        out: &mut Vec<i16>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(test)]
+        let _gpu = crate::gpu_test_lock::lock();
+        use crate::encoder::cdf53::CDF53_TOTAL_COEFFS;
+        let n = chunk.len();
+        let cols = (n as u32).min(32);
+        let rows = (n as u32).div_ceil(cols);
+        let (w, h) = (cols * 32, rows * 32);
+        let stride = w * 4;
+        let mut pixels = vec![0u8; (stride * h) as usize];
+        for (i, t) in chunk.iter().enumerate() {
+            let (tx, ty) = (i as u32 % cols, i as u32 / cols);
+            for row in 0..32usize {
+                let dst = ((ty * 32 + row as u32) * stride + tx * 128) as usize;
+                pixels[dst..dst + 128].copy_from_slice(&t[row * 128..row * 128 + 128]);
+            }
+        }
+        for i in 0..n {
+            *self.cdf53_fallback_list.ptr.add(i) = i as u32;
+        }
+        let current = self.import_pixels(&pixels, w, h, stride)?;
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let cmd = self.begin_frame_cmd()?;
+            self.device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            let barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::PREINITIALIZED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(current.image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&barrier),
+            );
+            let guards = self.run_cdf53_forward_escalation_stages(
+                cmd,
+                current.view,
+                cols,
+                rows,
+                n as u32,
+                self.cdf53_fallback_list.buffer,
+                self.cdf53_fallback_coefficients.buffer,
+            )?;
+            let host_barrier = buf_barrier(
+                self.cdf53_fallback_coefficients.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            );
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                std::slice::from_ref(&host_barrier),
+                &[],
+            );
+            self.device.end_command_buffer(cmd)?;
+            self.submit_frame_cmd_and_wait(cmd)?;
+            let coeffs = std::slice::from_raw_parts(
+                self.cdf53_fallback_coefficients.ptr as *const i32,
+                n * CDF53_TOTAL_COEFFS,
+            );
+            out.extend(coeffs.iter().map(|&v| v as i16));
+            // The descriptor sets were in use until the wait above.
+            drop(guards);
+            Ok(())
+        })();
+        self.destroy_prev_frame(current);
+        result
+    }
 }
