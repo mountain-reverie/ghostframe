@@ -872,6 +872,44 @@ mod tests {
 
     /// The cache and the emission queue must share the one allocation: that is
     /// the whole point of dropping the per-datagram copies.
+    /// A uniquely-owned source is stamped where it lies: the cached fragment
+    /// is the caller's own allocation, not a copy of it.
+    #[test]
+    fn a_uniquely_owned_source_is_stamped_in_place() {
+        let now = Instant::now();
+        let mut e = ReliableTileEmitter::new(now);
+        let key = EmitKey::new(1, 0, 0, 0);
+        let src = fake_source(1, 0, 0xAA);
+        let src_ptr = src.as_ptr();
+        e.submit_one(key, src, now, None, now);
+        assert_eq!(e.cache.get(&key).unwrap().fragments[0].as_ptr(), src_ptr);
+    }
+
+    /// A shared source must be copied, never stamped through the other handle.
+    #[test]
+    fn a_shared_source_is_copied_and_the_callers_handle_is_untouched() {
+        let now = Instant::now();
+        let mut e = ReliableTileEmitter::new(now);
+        let key = EmitKey::new(1, 0, 0, 0);
+        let src = fake_source(1, 0, 0xAA);
+        let keep = src.clone();
+        let before = keep.to_vec();
+        // Burn wire_seqs so the stamp would differ from the zeros in `src`.
+        for _ in 0..3 {
+            e.alloc.allocate();
+        }
+        e.submit_one(key, src, now, None, now);
+        assert_eq!(&keep[..], &before[..]);
+        assert_ne!(
+            e.cache.get(&key).unwrap().fragments[0].as_ptr(),
+            keep.as_ptr()
+        );
+        assert_eq!(
+            &e.cache.get(&key).unwrap().fragments[0][8..12],
+            &3u32.to_be_bytes()
+        );
+    }
+
     #[test]
     fn cache_and_queue_share_one_allocation() {
         let now = Instant::now();
@@ -883,6 +921,11 @@ mod tests {
             panic!("expected the source emission");
         };
         assert_eq!(queued.as_ptr(), cached_ptr, "queue holds its own copy");
+        assert_eq!(
+            e.group.sources[0].as_ptr(),
+            cached_ptr,
+            "the FEC group holds its own copy"
+        );
     }
 
     #[test]

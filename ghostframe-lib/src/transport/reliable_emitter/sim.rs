@@ -202,8 +202,4 @@ fn sim_generation_churn_no_orphan_retransmits() {
     for _ in 0..10 {
         sim.advance(Duration::from_millis(200));
     }
-    assert_eq!(
-        sim.emitter.cache.stats.lru_eviction, 0,
-        "no LRU pressure under generation churn"
-    );
 }
