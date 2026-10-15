@@ -2,12 +2,10 @@
 //! re-emission on RTO / NACK. Unbounded — entries live until ACKed,
 //! superseded via `cancel_for_tile`, or the session ends via `clear`.
 
-use crate::transport::reliable_emitter::{EmitKey, CACHE_CAPACITY};
+use crate::transport::reliable_emitter::EmitKey;
 use bytes::Bytes;
-use lru::LruCache;
 use smallvec::SmallVec;
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 /// Probe cluster a tile-pass was tagged for at emit time (BWE Stage 2.4).
@@ -59,7 +57,6 @@ pub struct CacheEntry {
 
 pub struct RetransmitCache {
     entries: HashMap<EmitKey, CacheEntry>,
-    lru: LruCache<EmitKey, ()>,
     /// `(tile_x, tile_y, pass_idx) -> most recently emitted EmitKey`.
     ///
     /// A NACK cannot name a transmission. An ACK echoes the `frame_seq` of a
@@ -96,6 +93,10 @@ pub struct RetransmitCache {
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CacheStats {
+    /// Always 0: the cache never evicts by capacity (entries leave only on
+    /// ACK, supersession, age retirement or `clear`). Kept because the
+    /// per-frame diagnostics still print it, as the tripwire for a
+    /// capacity bound being reintroduced.
     pub lru_eviction: u64,
 }
 
@@ -109,7 +110,6 @@ impl RetransmitCache {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
-            lru: LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap()),
             by_content: HashMap::new(),
             by_tile: HashMap::new(),
             bytes: 0,
@@ -143,7 +143,6 @@ impl RetransmitCache {
     fn evict(&mut self, key: &EmitKey) -> Option<CacheEntry> {
         let entry = self.entries.remove(key)?;
         self.bytes -= Self::entry_bytes(&entry);
-        self.lru.pop(key);
         self.forget_content(key);
         let tile = (key.tile_x, key.tile_y);
         if let Some(keys) = self.by_tile.get_mut(&tile) {
@@ -170,10 +169,6 @@ impl RetransmitCache {
     /// conditions, up to ~50 K (~25 MB at 500 B per pass) during a
     /// 1920×1080 first-paint burst over a high-RTT link.
     pub fn insert(&mut self, key: EmitKey, entry: CacheEntry) {
-        // LRU is retained for compatibility with the public `stats.lru_eviction`
-        // field (still useful for spotting genuine ACK-failure cliffs in
-        // the future) but never triggers eviction now.
-        self.lru.put(key, ());
         self.by_content
             .insert((key.tile_x, key.tile_y, key.pass_idx), key);
         self.bytes += Self::entry_bytes(&entry);
@@ -217,8 +212,6 @@ impl RetransmitCache {
     }
 
     pub fn get_mut(&mut self, key: &EmitKey) -> Option<&mut CacheEntry> {
-        // Touch LRU so accessed entries don't evict.
-        let _ = self.lru.get(key);
         self.entries.get_mut(key)
     }
 
@@ -239,7 +232,6 @@ impl RetransmitCache {
             if let Some(entry) = self.entries.remove(k) {
                 self.bytes -= Self::entry_bytes(&entry);
             }
-            self.lru.pop(k);
             self.forget_content(k);
         }
     }
@@ -281,8 +273,6 @@ impl RetransmitCache {
         self.by_tile.clear();
         self.bytes = 0;
         self.entries.clear();
-        // LruCache has no clear(); rebuild it.
-        self.lru = LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap());
     }
 
     /// Returns true iff at least one cache entry matches `(tile_x, tile_y)`
@@ -296,6 +286,7 @@ impl RetransmitCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::reliable_emitter::CACHE_CAPACITY;
     use smallvec::smallvec;
 
     fn mk_entry(now: Instant) -> CacheEntry {
