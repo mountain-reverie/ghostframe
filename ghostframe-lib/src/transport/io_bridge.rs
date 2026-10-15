@@ -2064,3 +2064,7 @@ fn parse_listen_port(listen_addr: &str) -> io::Result<u16> {
 #[cfg(test)]
 #[path = "io_bridge/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "io_bridge/coverage_pin_tests.rs"]
+mod coverage_pin_tests;
