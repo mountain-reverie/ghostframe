@@ -84,4 +84,20 @@ describe('bootstrap', () => {
     }
     expect(new Uint8Array(ctorSpy.mock.calls[1][1].serverCertificateHashes[0].value)[0]).toBe(0x22);
   });
+
+  it('falls back to certHash when certHashes is present but malformed', async () => {
+    vi.stubGlobal('location', { origin: 'https://example.ts.net', host: 'example.ts.net' });
+    const a = 'aa'.repeat(32);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ certHash: a, certHashes: [''] }),
+    }));
+    const ctorSpy = vi.fn();
+    vi.stubGlobal('WebTransport', class { constructor(...args: unknown[]) { ctorSpy(...args); } });
+
+    const res = await bootstrap();
+
+    expect(res.certHashes).toEqual([a]);
+    expect(ctorSpy.mock.calls[0][1].serverCertificateHashes).toHaveLength(1);
+  });
 });

@@ -174,7 +174,7 @@ func TestParseCertHashList(t *testing.T) {
 	if got, err := parseCertHashList(a + "," + a); err != nil || len(got) != 2 {
 		t.Fatalf("two hashes: %v %v", got, err)
 	}
-	for _, bad := range []string{"", "abc", a + ",", a + ",short"} {
+	for _, bad := range []string{"", "abc", a + ",", a + ",short", strings.Repeat("g", 64), strings.Repeat("A", 64)} {
 		if _, err := parseCertHashList(bad); err == nil {
 			t.Fatalf("%q accepted", bad)
 		}
