@@ -20,6 +20,7 @@ describe('bootstrap', () => {
     expect(ctorSpy).toHaveBeenCalledTimes(1);
     const [url, opts] = ctorSpy.mock.calls[0];
     expect(url).toBe('https://example.ts.net/');
+    expect(opts.congestionControl).toBe('low-latency');
     expect(opts.serverCertificateHashes).toHaveLength(1);
     expect(opts.serverCertificateHashes[0].algorithm).toBe('sha-256');
     const bytes = new Uint8Array(opts.serverCertificateHashes[0].value);
