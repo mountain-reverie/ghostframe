@@ -169,6 +169,7 @@ Wave C started 2026-10-15 with C1 (`perf/server-copy-chain`), C2 (`perf/event-lo
 
 Owner decisions and items added 2026-10-15:
 - C2 runs before WS-D1: D1's baselines are taken on the loop structure that ships.
+- C2 scope is the move only (GPU wait and encode on one dedicated worker thread); whether Phase B, logging, dispatch or pipelining follow is decided from measurements after the move. One process-wide lock on the hardware encoder; bounded 1–2 s join on shutdown; a worker panic is fatal; `invalidate_baseline` becomes max-of instead of last-wins (own PR).
 - C6: certificates are backdated by 1 day (validity 13 days from notBefore, served 7).
 - C7 also fixes the H.264 decoder that stayed dead for the session after one async decode error, and carries the H.264 `frame_seq` through `EncodedVideoChunk.timestamp` instead of a side FIFO.
 - New stream after C7 merges: the native client (`ghostframe-client-gpu`) has the same paint-order fault, worse (Raw uploaded on arrival, CDF53 lifted last, H.264 blitted immediately, no `frame_seq` anywhere).
