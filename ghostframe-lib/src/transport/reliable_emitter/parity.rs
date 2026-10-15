@@ -1,6 +1,8 @@
 //! XOR parity primitive for FEC. Left-pads shorter source slices with
 //! zeros so XOR is defined over a group of sources with varying lengths.
 
+use bytes::Bytes;
+
 /// Result of accumulating the K-th source — the parity datagram to emit
 /// and the group metadata the wire envelope needs.
 #[derive(Debug, Clone)]
@@ -24,7 +26,7 @@ pub struct GroupBuilder {
     first_wire_seq: Option<u32>,
     last_wire_seq: Option<u32>,
     source_lens: Vec<u16>,
-    sources: Vec<Vec<u8>>,
+    sources: Vec<Bytes>,
 }
 
 impl GroupBuilder {
@@ -38,7 +40,7 @@ impl GroupBuilder {
         }
     }
 
-    pub fn add(&mut self, wire_seq: u32, source_bytes: &[u8]) -> Option<GroupResult> {
+    pub fn add(&mut self, wire_seq: u32, source_bytes: Bytes) -> Option<GroupResult> {
         // The decoder reconstructs membership as `group_first + 0..k`, so a
         // group must be contiguous in `wire_seq` or its length table lines up
         // against the wrong sources. A gap means some allocated `wire_seq`
@@ -53,13 +55,13 @@ impl GroupBuilder {
             self.first_wire_seq = Some(wire_seq);
         }
         self.source_lens.push(source_bytes.len() as u16);
-        self.sources.push(source_bytes.to_vec());
+        self.sources.push(source_bytes);
         self.last_wire_seq = Some(wire_seq);
         if self.sources.len() < self.target_k {
             return None;
         }
         // Group full — compute parity and reset.
-        let refs: Vec<&[u8]> = self.sources.iter().map(|v| v.as_slice()).collect();
+        let refs: Vec<&[u8]> = self.sources.iter().map(|v| v.as_ref()).collect();
         let parity = xor_payloads(&refs);
         let result = GroupResult {
             group_first_wire_seq: self.first_wire_seq.unwrap(),
@@ -143,9 +145,13 @@ mod group_tests {
     fn group_builder_fires_after_k_sources() {
         let mut g = GroupBuilder::new(FEC_GROUP_SIZE_K);
         for i in 0..FEC_GROUP_SIZE_K - 1 {
-            assert!(g.add(i as u32, &[i as u8]).is_none(), "no fire before K");
+            assert!(
+                g.add(i as u32, Bytes::copy_from_slice(&[i as u8]))
+                    .is_none(),
+                "no fire before K"
+            );
         }
-        let result = g.add((FEC_GROUP_SIZE_K - 1) as u32, &[99]);
+        let result = g.add((FEC_GROUP_SIZE_K - 1) as u32, Bytes::copy_from_slice(&[99]));
         let Some(GroupResult {
             group_first_wire_seq,
             k,
@@ -161,25 +167,25 @@ mod group_tests {
         assert_eq!(source_lens[0], 1);
         assert!(!parity.is_empty());
         // After fire, the builder resets — first add returns None again
-        assert!(g.add(0, &[1]).is_none());
+        assert!(g.add(0, Bytes::copy_from_slice(&[1])).is_none());
     }
 
     #[test]
     fn group_builder_tracks_first_wire_seq() {
         let mut g = GroupBuilder::new(3);
-        assert!(g.add(100, &[1]).is_none());
-        assert!(g.add(101, &[2]).is_none());
-        let r = g.add(102, &[3]).unwrap();
+        assert!(g.add(100, Bytes::copy_from_slice(&[1])).is_none());
+        assert!(g.add(101, Bytes::copy_from_slice(&[2])).is_none());
+        let r = g.add(102, Bytes::copy_from_slice(&[3])).unwrap();
         assert_eq!(r.group_first_wire_seq, 100);
     }
 
     #[test]
     fn group_result_carries_every_source_length() {
         let mut g = GroupBuilder::new(3);
-        assert!(g.add(0, &[0u8; 20]).is_none());
-        assert!(g.add(1, &[0u8; 4]).is_none());
+        assert!(g.add(0, Bytes::copy_from_slice(&[0u8; 20])).is_none());
+        assert!(g.add(1, Bytes::copy_from_slice(&[0u8; 4])).is_none());
         let r = g
-            .add(2, &[0u8; 17])
+            .add(2, Bytes::copy_from_slice(&[0u8; 17]))
             .expect("third source completes the group");
         assert_eq!(r.source_lens, vec![20, 4, 17]);
         assert_eq!(r.group_first_wire_seq, 0);
@@ -190,12 +196,14 @@ mod group_tests {
         // The decoder maps index i to `group_first + i`, so a gap would make
         // every length line up against the wrong source.
         let mut g = GroupBuilder::new(3);
-        assert!(g.add(0, &[0u8; 8]).is_none());
-        assert!(g.add(1, &[0u8; 8]).is_none());
+        assert!(g.add(0, Bytes::copy_from_slice(&[0u8; 8])).is_none());
+        assert!(g.add(1, Bytes::copy_from_slice(&[0u8; 8])).is_none());
         // 5 is not 2: the group so far is abandoned and 5 becomes the new first.
-        assert!(g.add(5, &[0u8; 8]).is_none());
-        assert!(g.add(6, &[0u8; 8]).is_none());
-        let r = g.add(7, &[0u8; 8]).expect("the fresh group completes");
+        assert!(g.add(5, Bytes::copy_from_slice(&[0u8; 8])).is_none());
+        assert!(g.add(6, Bytes::copy_from_slice(&[0u8; 8])).is_none());
+        let r = g
+            .add(7, Bytes::copy_from_slice(&[0u8; 8]))
+            .expect("the fresh group completes");
         assert_eq!(
             r.group_first_wire_seq, 5,
             "the abandoned group must not be reported"

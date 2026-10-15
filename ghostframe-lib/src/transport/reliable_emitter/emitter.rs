@@ -9,7 +9,7 @@ use crate::transport::reliable_emitter::rto::{rto_for_attempt, RtoTimerWheel};
 use crate::transport::reliable_emitter::traits::{DatagramSender, SendOutcome};
 use crate::transport::reliable_emitter::wire_seq::WireSeqAllocator;
 use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K, PARITY_INTERLEAVE_OFFSET};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use smallvec::smallvec;
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -173,7 +173,12 @@ impl ReliableTileEmitter {
         now: Instant,
     ) {
         let wire_seq = self.alloc.allocate();
-        let mut bytes = source_datagram_bytes.to_vec();
+        // Stamp in place when this handle is the only owner (the production
+        // path hands over a freshly built `Vec`); copy only when it is shared.
+        let mut bytes = match source_datagram_bytes.try_into_mut() {
+            Ok(m) => m,
+            Err(shared) => BytesMut::from(&shared[..]),
+        };
         if bytes.len() >= 12 {
             bytes[8..12].copy_from_slice(&wire_seq.to_be_bytes());
         }
@@ -188,6 +193,9 @@ impl ReliableTileEmitter {
             stamped_emit_us = emit_us;
             bytes[12..16].copy_from_slice(&(emit_us as u32).to_be_bytes());
         }
+        // One allocation from here on: the cache, the FEC group and the
+        // emission queue share it by reference count.
+        let bytes: Bytes = bytes.freeze();
         self.transmissions.push(EmittedDatagram {
             wire_seq,
             emit_us: stamped_emit_us,
@@ -196,7 +204,7 @@ impl ReliableTileEmitter {
         });
         // Cache & RTO.
         let entry = CacheEntry {
-            fragments: smallvec![Bytes::from(bytes.clone())],
+            fragments: smallvec![bytes.clone()],
             wire_seqs: smallvec![wire_seq],
             queued_at,
             first_sent_at: now,
@@ -209,7 +217,7 @@ impl ReliableTileEmitter {
         self.rto
             .schedule(key, now + rto_for_attempt(self.ack_deadline, 0));
         // Feed group builder; on K-th source build & schedule parity envelope.
-        self.feed_group(wire_seq, &bytes);
+        self.feed_group(wire_seq, bytes.clone());
         self.note_emission_queue_depth();
         // Enqueue the source itself.
         self.queue.push_source(bytes);
@@ -230,7 +238,7 @@ impl ReliableTileEmitter {
     /// `wire_seq`s that never joined a group), the decoder would treat a
     /// `wire_seq` that was never a source as a missing one and fabricate
     /// a datagram that was never sent.
-    fn feed_group(&mut self, wire_seq: u32, bytes: &[u8]) {
+    fn feed_group(&mut self, wire_seq: u32, bytes: Bytes) {
         if let Some(result) = self.group.add(wire_seq, bytes) {
             let envelope = TileParityEnvelope {
                 group_first_wire_seq: result.group_first_wire_seq,
@@ -364,6 +372,7 @@ impl ReliableTileEmitter {
             if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
                 bytes[12..16].copy_from_slice(&(emit_us_now as u32).to_be_bytes());
             }
+            let bytes = Bytes::from(bytes);
             entry.attempts = entry.attempts.saturating_add(1);
             entry.last_sent_at = now;
             entry.probe = None;
@@ -377,7 +386,7 @@ impl ReliableTileEmitter {
             // join the FEC group exactly as a first transmission does (see
             // `feed_group`'s doc comment).
             if bytes.len() >= 12 {
-                self.feed_group(ws, &bytes);
+                self.feed_group(ws, bytes.clone());
             }
             spent += bytes.len();
             self.queue.push_source(bytes);
@@ -484,6 +493,7 @@ impl ReliableTileEmitter {
                     stamped = self.emit_us64(now);
                     bytes[12..16].copy_from_slice(&(stamped as u32).to_be_bytes());
                 }
+                let bytes = Bytes::from(bytes);
                 self.transmissions.push(EmittedDatagram {
                     wire_seq: ws,
                     emit_us: stamped,
@@ -496,7 +506,7 @@ impl ReliableTileEmitter {
                 // membership range no longer matches what was actually put
                 // on the wire.
                 if bytes.len() >= 12 {
-                    self.feed_group(ws, &bytes);
+                    self.feed_group(ws, bytes.clone());
                 }
                 spent += bytes.len();
                 self.queue.push_source(bytes);
@@ -809,6 +819,70 @@ mod tests {
         v[20..24].copy_from_slice(&1u32.to_be_bytes()); // payload_len
         v[24] = payload;
         Bytes::from(v)
+    }
+
+    /// The stamp is applied in place, so the bytes on the wire must equal what
+    /// the old copy-then-stamp implementation produced, for every length the
+    /// header branches distinguish (<12, 12..16, >=16 with and without the
+    /// tile flag), whether the caller's handle is unique or shared.
+    #[test]
+    fn stamped_bytes_equal_the_copy_then_stamp_reference() {
+        let now = Instant::now();
+        let later = now + Duration::from_micros(1234);
+        for (len, flag) in [
+            (5usize, true),
+            (12, true),
+            (15, true),
+            (16, false),
+            (16, true),
+            (200, true),
+        ] {
+            for shared in [false, true] {
+                let mut src = vec![0xA5u8; len];
+                if len > 0 {
+                    src[0] = if flag { 0x80 } else { 0x00 };
+                }
+                let mut e = ReliableTileEmitter::new(now);
+                let key = EmitKey::new(1, 0, 0, 0);
+                let source = Bytes::from(src.clone());
+                let keep = if shared { Some(source.clone()) } else { None };
+                e.submit_one(key, source, now, None, later);
+                // Reference: the pre-change algorithm.
+                let mut want = src.clone();
+                if want.len() >= 12 {
+                    want[8..12].copy_from_slice(&0u32.to_be_bytes());
+                }
+                if want.len() >= 16 && (want[0] & 0x80) != 0 {
+                    want[12..16].copy_from_slice(&1234u32.to_be_bytes());
+                }
+                let mut sender = CollectSender::default();
+                e.drain(&mut sender, later);
+                assert_eq!(
+                    sender.sent,
+                    vec![want.clone()],
+                    "len={len} flag={flag} shared={shared}"
+                );
+                assert_eq!(e.cache.get(&key).unwrap().fragments[0][..], want[..]);
+                if let Some(k) = keep {
+                    assert_eq!(&k[..], &src[..], "the caller's shared handle was mutated");
+                }
+            }
+        }
+    }
+
+    /// The cache and the emission queue must share the one allocation: that is
+    /// the whole point of dropping the per-datagram copies.
+    #[test]
+    fn cache_and_queue_share_one_allocation() {
+        let now = Instant::now();
+        let mut e = ReliableTileEmitter::new(now);
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0xAA), now, None, now);
+        let cached_ptr = e.cache.get(&key).unwrap().fragments[0].as_ptr();
+        let Some(Emission::Source(queued)) = e.next_emission(now) else {
+            panic!("expected the source emission");
+        };
+        assert_eq!(queued.as_ptr(), cached_ptr, "queue holds its own copy");
     }
 
     #[test]
