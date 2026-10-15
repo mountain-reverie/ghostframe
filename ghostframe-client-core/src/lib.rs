@@ -29,8 +29,10 @@ pub mod pal_rle_decode;
 pub mod palette_shadow;
 pub mod parity_decoder;
 mod reassembly;
+pub mod wire_loss;
 pub use cdf53_coverage::CoverageEntry;
 pub use event::{DecodeErrorCode, Event, PollOutput, TileData, TileKey};
+pub use wire_loss::WireLossStats;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -253,6 +255,7 @@ pub struct ClientCore {
     /// are validated against the grid it implies.
     pub(crate) frame_dims: Option<(u32, u32)>,
     pub(crate) parity_decoder: ParityDecoder,
+    pub(crate) wire_loss: wire_loss::WireLossTracker,
     pub(crate) fragment_parity: FragmentParity,
     pub(crate) ack_batcher: AckBatcher,
     pub(crate) nack_batcher: NackBatcher,
@@ -304,6 +307,7 @@ impl ClientCore {
             assembly_bytes: 0,
             frame_dims: None,
             parity_decoder: ParityDecoder::new(PARITY_WINDOW),
+            wire_loss: wire_loss::WireLossTracker::new(),
             fragment_parity: FragmentParity::new(),
             ack_batcher: AckBatcher::new(),
             nack_batcher: NackBatcher::new(),
@@ -392,6 +396,12 @@ impl ClientCore {
     /// H.264 fragments rebuilt from XOR parity since the core was created.
     pub fn h264_fragments_recovered(&self) -> u64 {
         self.h264_fragments_recovered
+    }
+
+    /// Pre-FEC loss, loss-run lengths and FEC recoveries measured from
+    /// `wire_seq` gaps. Measurement only.
+    pub fn wire_loss_stats(&self) -> WireLossStats {
+        self.wire_loss.stats()
     }
 
     /// Reassembly occupancy, for diagnostics and tests.

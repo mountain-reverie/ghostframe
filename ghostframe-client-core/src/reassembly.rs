@@ -218,6 +218,20 @@ impl ClientCore {
                 .on_datagram_sent_at(now_us, dh.timestamp_us);
         }
 
+        // Wire-level loss accounting (measurement only). A rebuilt datagram
+        // that had really been lost is what `datagrams_recovered_fec` in the
+        // receiver feedback has always promised and never counted on this path.
+        if !is_sentinel {
+            match provenance {
+                Provenance::Received => self.wire_loss.on_received(dh.wire_seq),
+                Provenance::Rebuilt => {
+                    if self.wire_loss.on_rebuilt(dh.wire_seq) {
+                        self.loss_tracker.on_fec_recovery();
+                    }
+                }
+            }
+        }
+
         // Validate what the wire claims before it can size anything. These
         // drop before the ACK on purpose: a tile refused here (for example
         // one from a larger frame whose dimensions datagram has not arrived

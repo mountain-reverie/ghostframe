@@ -630,38 +630,10 @@ fn parity_group_recovers_without_retransmit() {
         );
     }
 
-    // Trigger periodic feedback and inspect datagrams_recovered_fec.
-    //
-    // SEMANTIC NOTE (read `ghostframe-client-core/src/reassembly.rs` and
-    // `parity_decoder.rs` before touching this assertion): there are TWO
-    // distinct FEC recovery paths in this port, and only ONE of them bumps
-    // `LossTracker::recovered_fec` (the `datagrams_recovered_fec` feedback
-    // counter):
-    //   1. Legacy fragment-level parity (`FragmentParity::try_recover`,
-    //      triggered when `dh.frag_idx >= dh.frag_total`, i.e. an
-    //      in-band parity fragment appended to the SAME tile-assembly's
-    //      fragment list). Its recovery call sites in
-    //      `reassembly.rs::handle_source_tile` DO call
-    //      `self.loss_tracker.on_fec_recovery()`.
-    //   2. Wire-sequence-level FEC via `TileParityEnvelope`
-    //      (`ParityDecoder::receive_parity` / `record_source`, routed from
-    //      `ClientCore::handle_datagram`'s `TILE_PARITY_ENVELOPE` branch).
-    //      Its recovery path in `reassembly.rs::handle_datagram` calls
-    //      `self.handle_source_tile(&recovered, ...)` directly — this
-    //      re-enters the normal single-fragment tile-complete path (which
-    //      itself calls `finish_assembly`), but NEVER calls
-    //      `self.loss_tracker.on_fec_recovery()`. Grep confirms
-    //      `on_fec_recovery()` has exactly two call sites in
-    //      `reassembly.rs`, both inside the `frag_idx >= frag_total` /
-    //      `received + 1 == total` fragment-parity branches — neither is
-    //      reachable from the `TileParityEnvelope` path exercised by this
-    //      test.
-    //
-    // This test uses `TileParityEnvelope` (wire-seq-level FEC), so the
-    // ACTUAL, currently-implemented behavior is `datagrams_recovered_fec
-    // == 0` even though all 10 tiles perfectly recover. We assert the real
-    // behavior here rather than the brief's aspirational `== 1`, to avoid
-    // encoding a false requirement into the test suite.
+    // Trigger periodic feedback and inspect datagrams_recovered_fec. Both
+    // recovery paths count: a datagram rebuilt from a wire-seq
+    // `TileParityEnvelope` that had really not arrived bumps it (this path
+    // used to be uncounted, which left the field zero on the wire).
     if let Some(deadline) = core.poll_timeout() {
         t = t.max(deadline).max(100_000);
         core.on_timeout(t);
@@ -684,9 +656,8 @@ fn parity_group_recovers_without_retransmit() {
     // recompute directly from the encoder instead of hardcoding offsets.)
     let recovered_fec = u32::from_be_bytes([fb[17], fb[18], fb[19], fb[20]]);
     assert_eq!(
-        recovered_fec, 0,
-        "wire-seq-level TileParityEnvelope recovery does not bump \
-         datagrams_recovered_fec in this port (see comment above); got {recovered_fec}"
+        recovered_fec, 1,
+        "exactly one datagram was lost and rebuilt from parity; got {recovered_fec}"
     );
 }
 
