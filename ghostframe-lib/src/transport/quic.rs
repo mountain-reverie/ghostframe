@@ -13,8 +13,10 @@ use std::time::Instant;
 use bytes::BytesMut;
 use quinn_proto::{
     Connection, ConnectionHandle, DatagramEvent, EcnCodepoint, Endpoint, EndpointConfig, Event,
-    ServerConfig, Transmit, TransportConfig,
+    Incoming, ServerConfig, Transmit, TransportConfig,
 };
+
+use crate::transport::peer_auth::{GateCheck, PeerGate, PeerIdentitySource, PeerLookup};
 
 /// SHA-256 fingerprint of the self-signed certificate.
 ///
@@ -78,7 +80,31 @@ pub struct QuicServer {
     newly_accepted: Vec<ConnectionHandle>,
     /// Initials refused because the connection table was full.
     refused_connections: u64,
+    /// Who may connect at all (see `transport::peer_auth`). Starts as
+    /// [`PeerGate::deny_all`]: a server nobody has given an identity source
+    /// admits no one.
+    peer_gate: PeerGate,
+    /// Initials held while their peer's identity is looked up, by peer IP.
+    /// quinn-proto buffers any further packets for a held `Incoming` itself
+    /// (bounded by `INCOMING_BUFFER_*` below).
+    held_incoming: HashMap<IpAddr, Vec<Incoming>>,
+    /// Initials dropped because too many were already held.
+    held_overflow: u64,
 }
+
+/// Initials held across all peers while identity lookups are outstanding.
+/// Past it a new Initial is dropped silently; the client retransmits it.
+pub(crate) const MAX_HELD_INCOMING: usize = 32;
+/// Initials held for one peer IP. A real client opens one connection.
+pub(crate) const MAX_HELD_INCOMING_PER_PEER: usize = 4;
+/// Bytes quinn-proto buffers for one held `Incoming`, and for all of them.
+/// An Initial flight is a few KiB, even with a post-quantum key share.
+/// quinn's defaults (10 MiB / 100 MiB) assume a server that holds Incomings
+/// on purpose for a long time; this one holds them only for an identity
+/// lookup, from peers it has not admitted yet. Nothing else uses these
+/// buffers: before the gate, every Incoming was decided in the same call.
+const INCOMING_BUFFER_PER_CONNECTION: u64 = 64 * 1024;
+const INCOMING_BUFFER_TOTAL: u64 = 1024 * 1024;
 
 /// Connections the table holds before new Initials are refused outright.
 /// One client is live at a time (M4a); the slack covers a reconnect that
@@ -466,6 +492,9 @@ impl QuicServer {
         // --- 6. ServerConfig ---
         let mut server_config = ServerConfig::with_crypto(Arc::new(quic_tls));
         server_config.transport = Arc::new(transport_config);
+        server_config
+            .incoming_buffer_size(INCOMING_BUFFER_PER_CONNECTION)
+            .incoming_buffer_size_total(INCOMING_BUFFER_TOTAL);
 
         // --- 7. Endpoint ---
         let endpoint = Endpoint::new(
@@ -485,7 +514,136 @@ impl QuicServer {
             unknown_conn_events: 0,
             newly_accepted: Vec::new(),
             refused_connections: 0,
+            peer_gate: PeerGate::deny_all(),
+            held_incoming: HashMap::new(),
+            held_overflow: 0,
         })
+    }
+
+    /// Install who may connect. Until this is called the server refuses
+    /// every new connection. `IoBridge::new` installs the tsnet WhoIs gate.
+    pub fn set_peer_gate(&mut self, gate: PeerGate) {
+        self.peer_gate = gate;
+    }
+
+    pub fn peer_gate(&self) -> &PeerGate {
+        &self.peer_gate
+    }
+
+    /// Identity lookups the caller should start, with the source to run them
+    /// against. Each IP is returned once until [`Self::resolve_peer`] is
+    /// called for it.
+    pub fn take_peer_lookups(&mut self) -> Vec<(IpAddr, Arc<dyn PeerIdentitySource>)> {
+        let ips = self.peer_gate.take_requests();
+        match self.peer_gate.source() {
+            Some(src) => ips.into_iter().map(|ip| (ip, src.clone())).collect(),
+            // Unreachable: the gate only defers when it has a source.
+            None => Vec::new(),
+        }
+    }
+
+    /// Initials currently held awaiting a lookup.
+    pub fn held_incoming_count(&self) -> usize {
+        self.held_incoming.values().map(Vec::len).sum()
+    }
+
+    /// Apply a finished identity lookup for `ip`: admit or refuse every
+    /// Initial held for it. Returns the datagrams to send (refusals, and
+    /// any immediate accept-failure response) as `(destination, bytes)`.
+    pub fn resolve_peer(
+        &mut self,
+        ip: IpAddr,
+        lookup: &PeerLookup,
+        now: Instant,
+    ) -> Vec<(SocketAddr, Vec<u8>)> {
+        let allowed = self.peer_gate.resolve(ip, lookup, now);
+        let mut out = Vec::new();
+        for incoming in self.held_incoming.remove(&ip).unwrap_or_default() {
+            let mut buf = Vec::new();
+            let transmit = if allowed {
+                self.admit(incoming, now, &mut buf)
+            } else {
+                Some(self.endpoint.refuse(incoming, &mut buf))
+            };
+            if let Some(t) = transmit {
+                buf.truncate(t.size);
+                out.push((t.destination, buf));
+            }
+        }
+        out
+    }
+
+    /// Hold an Initial until its peer's lookup resolves, within bounds.
+    fn hold(&mut self, ip: IpAddr, incoming: Incoming) {
+        let total = self.held_incoming_count();
+        let for_peer = self.held_incoming.get(&ip).map_or(0, Vec::len);
+        if total >= MAX_HELD_INCOMING || for_peer >= MAX_HELD_INCOMING_PER_PEER {
+            self.held_overflow = self.held_overflow.saturating_add(1);
+            if self.held_overflow == 1 || self.held_overflow.is_multiple_of(64) {
+                tracing::warn!(
+                    peer = %ip,
+                    held = total,
+                    total = self.held_overflow,
+                    "too many connections awaiting an identity lookup; dropping (rate-limited)"
+                );
+            }
+            self.endpoint.ignore(incoming);
+            return;
+        }
+        self.held_incoming.entry(ip).or_default().push(incoming);
+    }
+
+    /// Table-size admission, then accept. The peer is already admitted.
+    fn admit(&mut self, incoming: Incoming, now: Instant, buf: &mut Vec<u8>) -> Option<Transmit> {
+        let remote = incoming.remote_address();
+        // Admission control. A spoofed-source Initial flood otherwise
+        // allocates a full `Connection` (TLS state, buffers) per
+        // packet, and a second ghostframe client is served by
+        // eviction, not by room for many.
+        match admission(
+            self.connections.len(),
+            incoming.remote_address_validated(),
+            incoming.may_retry(),
+        ) {
+            Admission::Refuse => {
+                self.refused_connections = self.refused_connections.saturating_add(1);
+                if self.refused_connections == 1 || self.refused_connections.is_multiple_of(64) {
+                    tracing::warn!(
+                        %remote,
+                        live = self.connections.len(),
+                        total = self.refused_connections,
+                        "connection table full; refusing (rate-limited)"
+                    );
+                }
+                return Some(self.endpoint.refuse(incoming, buf));
+            }
+            Admission::Retry => match self.endpoint.retry(incoming, buf) {
+                Ok(transmit) => return Some(transmit),
+                // `may_retry` was checked by `admission`; nothing to
+                // do but drop the packet.
+                Err(e) => {
+                    self.endpoint.ignore(e.into_incoming());
+                    return None;
+                }
+            },
+            Admission::Accept => {}
+        }
+        match self.endpoint.accept(incoming, now, buf, None) {
+            Ok((handle, conn)) => {
+                // INFO (not debug) so connection attempts are visible at
+                // the default tracing filter — without this, a failed
+                // browser handshake (cert SAN mismatch, ALPN denial,
+                // etc.) is silent from the operator's perspective.
+                tracing::info!(?handle, %remote, "new QUIC connection accepted");
+                self.connections.insert(handle, conn);
+                self.newly_accepted.push(handle);
+                None
+            }
+            Err(err) => {
+                tracing::warn!(%remote, cause=%err.cause, "connection accept failed");
+                err.response
+            }
+        }
     }
 
     /// Return the certificate fingerprint for browser pinning.
@@ -500,8 +658,10 @@ impl QuicServer {
     /// Feed an inbound UDP datagram into the endpoint state machine.
     ///
     /// Handles all three `DatagramEvent` variants internally:
-    /// - `NewConnection(Incoming)` — auto-accepted; new `Connection` inserted
-    ///   into `self.connections`.
+    /// - `NewConnection(Incoming)` — checked against the peer gate first:
+    ///   refused, held for an identity lookup (see [`Self::resolve_peer`]),
+    ///   or admitted, in which case a new `Connection` is inserted into
+    ///   `self.connections`.
     /// - `ConnectionEvent(handle, event)` — dispatched to the right connection.
     /// - `Response(Transmit)` — returned to the caller so the I/O bridge can
     ///   write the response bytes (already in `buf`) back to ghostbridge.
@@ -518,54 +678,16 @@ impl QuicServer {
             None => None,
 
             Some(DatagramEvent::NewConnection(incoming)) => {
-                // Admission control. A spoofed-source Initial flood otherwise
-                // allocates a full `Connection` (TLS state, buffers) per
-                // packet, and a second ghostframe client is served by
-                // eviction, not by room for many.
-                match admission(
-                    self.connections.len(),
-                    incoming.remote_address_validated(),
-                    incoming.may_retry(),
-                ) {
-                    Admission::Refuse => {
-                        self.refused_connections = self.refused_connections.saturating_add(1);
-                        if self.refused_connections == 1
-                            || self.refused_connections.is_multiple_of(64)
-                        {
-                            tracing::warn!(
-                                %remote,
-                                live = self.connections.len(),
-                                total = self.refused_connections,
-                                "connection table full; refusing (rate-limited)"
-                            );
-                        }
-                        return Some(self.endpoint.refuse(incoming, buf));
-                    }
-                    Admission::Retry => match self.endpoint.retry(incoming, buf) {
-                        Ok(transmit) => return Some(transmit),
-                        // `may_retry` was checked by `admission`; nothing to
-                        // do but drop the packet.
-                        Err(e) => {
-                            self.endpoint.ignore(e.into_incoming());
-                            return None;
-                        }
-                    },
-                    Admission::Accept => {}
-                }
-                match self.endpoint.accept(incoming, now, buf, None) {
-                    Ok((handle, conn)) => {
-                        // INFO (not debug) so connection attempts are visible at
-                        // the default tracing filter — without this, a failed
-                        // browser handshake (cert SAN mismatch, ALPN denial,
-                        // etc.) is silent from the operator's perspective.
-                        tracing::info!(?handle, %remote, "new QUIC connection accepted");
-                        self.connections.insert(handle, conn);
-                        self.newly_accepted.push(handle);
+                // Who may connect at all, before anything is allocated for
+                // the connection and long before it could send HELLO. A
+                // refused peer never gets a `Connection`.
+                let ip = incoming.remote_address().ip();
+                match self.peer_gate.check(ip, now) {
+                    GateCheck::Allow => self.admit(incoming, now, buf),
+                    GateCheck::Deny => Some(self.endpoint.refuse(incoming, buf)),
+                    GateCheck::Pending => {
+                        self.hold(ip, incoming);
                         None
-                    }
-                    Err(err) => {
-                        tracing::warn!(%remote, cause=%err.cause, "connection accept failed");
-                        err.response
                     }
                 }
             }

@@ -48,6 +48,11 @@ impl IoBridge {
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
         let local_addr = "0.0.0.0:443".parse().unwrap();
+        // No tailnet here, so no WhoIs. The gate still runs the real rule,
+        // against an in-memory source that reports every peer as this
+        // node's owner. Only these test constructors install it.
+        let mut server = server;
+        server.set_peer_gate(crate::transport::peer_auth::PeerGate::single_owner_for_tests());
         Self::base(
             stream,
             server,
@@ -58,6 +63,13 @@ impl IoBridge {
                 gpu_frame_processor: None,
             },
         )
+    }
+
+    /// Replace the QUIC peer gate, for a test that needs a specific policy
+    /// or a background identity source.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn set_peer_gate_for_test(&mut self, gate: crate::transport::peer_auth::PeerGate) {
+        self.server.set_peer_gate(gate);
     }
 
     /// WS-C2 MEASUREMENT ONLY: install a real GPU frame processor on a test

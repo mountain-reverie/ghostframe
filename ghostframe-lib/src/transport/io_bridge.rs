@@ -41,6 +41,9 @@ use crate::transport::ghostbridge::{
     encode_frame, encode_frame_append, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle,
     MAX_FRAME_LEN,
 };
+use crate::transport::peer_auth::{
+    AccessPolicy, DenialLog, PeerGate, PeerLookup, TsnetWhoIs, WhoIsError,
+};
 use crate::transport::protocol::{
     build_frame_parity_datagram, fragment_frame, fragment_tile, max_fec_frame_fragment_payload,
     max_fragment_payload, Codec, TileFragmentInputs, FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD,
@@ -49,6 +52,7 @@ use crate::transport::protocol::{
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
 use ghostframe_protocol::eviction::{build_eviction_datagram, EvictionReason};
+use std::sync::Arc;
 
 /// Tracing target the moved-out code keeps logging under: the child modules
 /// would otherwise report `module_path!()` of the child.
@@ -276,6 +280,7 @@ pub struct InjectedFrame {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoopArm {
     Timeout,
+    PeerLookup,
     Inbound,
     Frame,
     Injected,
@@ -829,7 +834,21 @@ pub struct IoBridge {
     /// every build — see `DiagnosticsConfig::from_lookup`'s doc comment for
     /// why these are live production toggles rather than test-only knobs.
     diagnostics: crate::config::DiagnosticsConfig,
+    /// Finished peer identity lookups, sent by the tasks
+    /// `spawn_peer_lookups` starts and applied by the `run` loop. Both ends
+    /// live here, so the channel never closes.
+    peer_lookup_tx: mpsc::UnboundedSender<(std::net::IpAddr, PeerLookup)>,
+    peer_lookup_rx: mpsc::UnboundedReceiver<(std::net::IpAddr, PeerLookup)>,
+    /// The access policy and denial log the QUIC gate uses, kept so the
+    /// web server can be given the same ones (`GhostframeServer::new`).
+    peer_access: Option<(Arc<AccessPolicy>, Arc<DenialLog>)>,
 }
+
+/// Upper bound on one identity lookup, including its wait for a blocking
+/// thread. Ghostbridge bounds the LocalAPI call itself at 2 s; this catches
+/// a lookup that never returns at all, so a held connection is always
+/// resolved -- as a refusal -- rather than left waiting.
+const PEER_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Per-cumulative-log bump counters. Reset on log emission.
 #[derive(Default, Clone, Copy)]
@@ -986,6 +1005,7 @@ impl IoBridge {
         lib_config: crate::config::LibConfig,
         diffs: BaseDiffs,
     ) -> Self {
+        let (peer_lookup_tx, peer_lookup_rx) = mpsc::unbounded_channel();
         Self {
             _handle: diffs.handle,
             stream,
@@ -1145,6 +1165,9 @@ impl IoBridge {
             bytes_emitted_snapshot: (0, 0),
             bwe_log_last_at: None,
             diagnostics: lib_config.diagnostics,
+            peer_lookup_tx,
+            peer_lookup_rx,
+            peer_access: None,
         }
     }
 
@@ -1167,6 +1190,18 @@ impl IoBridge {
         handle.up()?;
         let ips = handle.get_ips()?;
         tracing::info!(?ips, "ghostbridge node joined tailnet");
+
+        // Who may connect. Fail closed: a node that cannot say who owns it
+        // refuses to start rather than guessing.
+        let self_identity = handle.self_identity().map_err(|e| {
+            io::Error::other(format!(
+                "cannot determine this node's tailnet identity ({e}); refusing to start \
+                 without an access policy"
+            ))
+        })?;
+        let policy = Arc::new(AccessPolicy::new(&self_identity, &lib_config.access));
+        policy.log_startup(&self_identity, &lib_config.access);
+        let denials = Arc::new(DenialLog::new());
 
         // tsnet.ListenPacket rejects a bare ":port" address with "address
         // must be a valid IP". Bind instead to our first IPv4 tailnet IP on
@@ -1194,7 +1229,12 @@ impl IoBridge {
         std_stream.set_nonblocking(true)?;
         let stream = TokioUnixStream::from_std(std_stream)?;
 
-        let server = QuicServer::new()?;
+        let mut server = QuicServer::new()?;
+        server.set_peer_gate(PeerGate::new(
+            policy.clone(),
+            Arc::new(TsnetWhoIs(handle.whois_client())),
+            denials.clone(),
+        ));
         tracing::info!(cert_sha256 = %server.cert_info().sha256_hex, "QUIC server ready");
 
         // local_addr is the tailnet-rooted socket we bound; quinn-proto uses
@@ -1210,7 +1250,7 @@ impl IoBridge {
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
-        let bridge = Self::base(
+        let mut bridge = Self::base(
             stream,
             server,
             lib_config,
@@ -1220,6 +1260,7 @@ impl IoBridge {
                 gpu_frame_processor,
             },
         );
+        bridge.peer_access = Some((policy, denials));
         Ok(bridge)
     }
 
@@ -1264,6 +1305,49 @@ impl IoBridge {
     /// connection.
     pub fn ghostbridge(&self) -> Option<&crate::transport::ghostbridge::GhostbridgeHandle> {
         self._handle.as_ref()
+    }
+
+    /// The access policy and denial log the QUIC listener enforces, for the
+    /// web server to enforce too. `None` on the test-only constructors,
+    /// which have no web server.
+    pub fn peer_access(&self) -> Option<(Arc<AccessPolicy>, Arc<DenialLog>)> {
+        self.peer_access.clone()
+    }
+
+    /// Start a background lookup for every peer the QUIC gate is holding a
+    /// connection for. Each result comes back on `peer_lookup_rx`.
+    fn spawn_peer_lookups(&mut self) {
+        for (ip, source) in self.server.take_peer_lookups() {
+            let tx = self.peer_lookup_tx.clone();
+            tokio::spawn(async move {
+                let lookup = tokio::time::timeout(
+                    PEER_LOOKUP_TIMEOUT,
+                    tokio::task::spawn_blocking(move || source.lookup(ip)),
+                )
+                .await;
+                let lookup = match lookup {
+                    Ok(Ok(found)) => found,
+                    Ok(Err(_join)) => Err(WhoIsError::Failed("lookup task failed".into())),
+                    Err(_elapsed) => Err(WhoIsError::Failed("lookup timed out".into())),
+                };
+                // The receiver lives as long as the bridge; if the bridge is
+                // gone there is nobody left to admit.
+                let _ = tx.send((ip, lookup));
+            });
+        }
+    }
+
+    /// Apply a finished lookup: admit or refuse the connections held for
+    /// `ip`, and send whatever that produced.
+    async fn apply_peer_lookup(
+        &mut self,
+        ip: std::net::IpAddr,
+        lookup: PeerLookup,
+    ) -> io::Result<()> {
+        for (dst, bytes) in self.server.resolve_peer(ip, &lookup, now_std()) {
+            self.stream.write_all(&encode_frame(&bytes, &dst)).await?;
+        }
+        Ok(())
     }
 
     /// Maximum bytes for the WebTransport VarInt session-ID prefix.
@@ -1588,6 +1672,18 @@ impl IoBridge {
                     let reaped = self.server.handle_timeout(now_std());
                     for handle in reaped {
                         self.on_connection_gone(handle, "reaped after drain");
+                    }
+                }
+
+                // 1b. A peer identity lookup finished: admit or refuse the
+                // connections held for it. Rare (once per new peer per
+                // cache TTL) and cheap, so it is not part of the
+                // inbound/frame fairness below.
+                looked_up = self.peer_lookup_rx.recv() => {
+                    #[cfg(test)]
+                    self.loop_arm_trace.push(LoopArm::PeerLookup);
+                    if let Some((ip, lookup)) = looked_up {
+                        self.apply_peer_lookup(ip, lookup).await?;
                     }
                 }
 
@@ -1942,6 +2038,7 @@ impl IoBridge {
             let frame = encode_frame(payload, &transmit.destination);
             self.stream.write_all(&frame).await?;
         }
+        self.spawn_peer_lookups();
 
         Ok(())
     }

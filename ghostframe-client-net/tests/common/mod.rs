@@ -11,11 +11,62 @@
 
 use bytes::BytesMut;
 use ghostframe_client_net::{ClientNet, ClientNetConfig, ClientNetEvent};
+use ghostframe_lib::config::AccessConfig;
+use ghostframe_lib::transport::peer_auth::{
+    AccessPolicy, DenialLog, PeerGate, PeerIdentity, PeerIdentitySource, PeerLookup,
+};
 use ghostframe_lib::transport::quic::QuicServer;
 use ghostframe_lib::transport::webtransport::WebTransportServer;
 use quinn_proto::{Event, StreamEvent};
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// The identity every in-memory test client has: a user who owns the
+/// server. `shuttle` sends from `[::1]:5000`.
+pub fn owner_identity() -> PeerIdentity {
+    PeerIdentity {
+        user_id: 1,
+        login_name: "owner@test".into(),
+        node_name: "client".into(),
+        tags: vec![],
+    }
+}
+
+/// The client address `shuttle` uses.
+#[allow(dead_code)] // not every test binary asks
+pub fn client_ip() -> IpAddr {
+    Ipv6Addr::LOCALHOST.into()
+}
+
+/// Admit `shuttle`'s client as the server owner's peer. A bare
+/// `QuicServer::new()` admits nobody: production installs a tsnet WhoIs
+/// gate, and these in-memory tests install the same rule over a fixed
+/// identity table. `answer` is what the table says about the client.
+pub fn install_gate(server: &mut QuicServer, answer: PeerLookup, immediate: bool) {
+    struct Fixed(PeerLookup, bool);
+    impl PeerIdentitySource for Fixed {
+        fn lookup(&self, _: IpAddr) -> PeerLookup {
+            self.0.clone()
+        }
+        fn is_immediate(&self) -> bool {
+            self.1
+        }
+    }
+    let policy = AccessPolicy::new(&owner_identity(), &AccessConfig::default());
+    server.set_peer_gate(PeerGate::new(
+        Arc::new(policy),
+        Arc::new(Fixed(answer, immediate)),
+        Arc::new(DenialLog::new()),
+    ));
+}
+
+/// A server that admits `shuttle`'s client.
+pub fn admitting_server() -> QuicServer {
+    let mut server = QuicServer::new().expect("QuicServer::new");
+    install_gate(&mut server, Ok(owner_identity()), true);
+    server
+}
 
 /// The server's cert hash, as the client pins it.
 pub fn pinned_hash(server: &QuicServer) -> [u8; 32] {
@@ -161,7 +212,7 @@ pub fn pump_with_wt(
 /// `solid_tile_datagram_becomes_tile_ready` in `datagram.rs` don't each
 /// reimplement session setup.
 pub fn connected_session() -> (ClientNet, QuicServer, WebTransportServer, u64, Instant) {
-    let mut server = QuicServer::new().expect("QuicServer::new");
+    let mut server = admitting_server();
     let mut wt = WebTransportServer::new();
     let cfg = ClientNetConfig {
         server_name: "localhost".into(),
