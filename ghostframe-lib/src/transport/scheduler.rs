@@ -79,6 +79,70 @@ impl TileWork {
     }
 }
 
+/// Incremental count of the tiles that have refinement work queued, so
+/// `Scheduler::refinement_deficit_tiles` is O(1) instead of a walk over the
+/// whole refinement queue (about 114k entries after a 4K full-screen change).
+///
+/// `per_tile[t]` is the number of `refinement_order` entries for tile `t`
+/// whose work is still live, and `tiles` the number of tiles with a non-zero
+/// count. The invariant it relies on: an entry is in `refinement_order` from
+/// the `enqueue_refinement*` push until the drain removes it, and in that span
+/// its state is `Pending` or `Superseded` (the drain pops a handle at the
+/// moment it makes it `InFlight`, so `mark_acked` never sees one). Both states
+/// counted by the old recomputation, so it is exactly "entries in the queue" for tiles inside the grid. A tile outside the grid (only a caller error: a test bridge whose scheduler was never sized) is not counted, where the old recomputation counted it.
+/// Every push goes through `push`, every removal through `pop`, and
+/// `resize`/`clear` through `reset`.
+#[derive(Default)]
+struct RefinementDeficit {
+    cols: u32,
+    per_tile: Vec<u32>,
+    tiles: u32,
+}
+
+impl RefinementDeficit {
+    fn new(cols: u32, rows: u32) -> Self {
+        Self {
+            cols,
+            per_tile: vec![0; (cols as usize) * (rows as usize)],
+            tiles: 0,
+        }
+    }
+
+    fn reset(&mut self, cols: u32, rows: u32) {
+        *self = Self::new(cols, rows);
+    }
+
+    fn index(&self, tile_x: u8, tile_y: u8) -> Option<usize> {
+        if (tile_x as u32) >= self.cols {
+            return None;
+        }
+        let i = tile_y as usize * self.cols as usize + tile_x as usize;
+        (i < self.per_tile.len()).then_some(i)
+    }
+
+    fn push(&mut self, tile_x: u8, tile_y: u8) {
+        if let Some(i) = self.index(tile_x, tile_y) {
+            if self.per_tile[i] == 0 {
+                self.tiles += 1;
+            }
+            self.per_tile[i] += 1;
+        }
+    }
+
+    fn pop(&mut self, tile_x: u8, tile_y: u8) {
+        if let Some(i) = self.index(tile_x, tile_y) {
+            debug_assert!(self.per_tile[i] > 0, "refinement deficit underflow");
+            if self.per_tile[i] == 0 {
+                return;
+            }
+            self.per_tile[i] -= 1;
+            if self.per_tile[i] == 0 {
+                self.tiles = self.tiles.saturating_sub(1);
+            }
+        }
+    }
+}
+
 pub struct Scheduler {
     cols: u32,
     rows: u32,
@@ -94,6 +158,8 @@ pub struct Scheduler {
     /// (`drain_refinement_pass_major`) is a walk over buckets rather than a
     /// repeated `min()` over the whole queue.
     refinement_order: [VecDeque<Handle>; PASS_SLOTS],
+    /// Tiles with queued refinement work; see `RefinementDeficit`.
+    refinement_deficit: RefinementDeficit,
     /// How long an `InFlight` priority item waits for its acknowledgement
     /// before `drain_priority_queue` sends it again. See `set_retry_after`.
     retry_after: Duration,
@@ -146,6 +212,7 @@ impl Scheduler {
             work: Slab::new(),
             priority_order: VecDeque::new(),
             refinement_order: std::array::from_fn(|_| VecDeque::new()),
+            refinement_deficit: RefinementDeficit::new(cols, rows),
             retry_after: Duration::from_millis(40),
             refinement_bandwidth_fraction: 0.2,
             last_refinement_budget: 0,
@@ -169,6 +236,7 @@ impl Scheduler {
         for q in self.refinement_order.iter_mut() {
             q.clear();
         }
+        self.refinement_deficit.reset(cols, rows);
         self.slots.resize(cols, rows);
     }
 
@@ -182,6 +250,7 @@ impl Scheduler {
         for q in self.refinement_order.iter_mut() {
             q.clear();
         }
+        self.refinement_deficit.reset(self.cols, self.rows);
         // Only queued handles are dropped; generations and ACK state are
         // kept for the same reason they always were — a late ACK on a
         // stale (tile, gen) is a safe no-op, and the mask is harmless
@@ -223,10 +292,19 @@ impl Scheduler {
     }
 
     /// Count of unique (tile_x, tile_y) coordinates with outstanding
-    /// refinement work — i.e. entries in `refinement_order` whose state
-    /// is not `WorkState::Acked`. Consumed by M3.6b's classifier
-    /// refinement-deficit bias (see `tile/classifier.rs::REFINEMENT_BIAS_PER_TILE_US`).
+    /// refinement work -- tiles that have an entry in `refinement_order`.
+    /// Consumed by M3.6b's classifier refinement-deficit bias (see
+    /// `tile/classifier.rs::REFINEMENT_BIAS_PER_TILE_US`). O(1): kept
+    /// incrementally (see `RefinementDeficit`); this runs once per frame.
     pub fn refinement_deficit_tiles(&self) -> u32 {
+        self.refinement_deficit.tiles
+    }
+
+    /// The full recomputation `refinement_deficit_tiles` replaced, kept as the
+    /// oracle for the property test: unique tiles with a queued entry whose
+    /// state is not `Acked`.
+    #[cfg(test)]
+    pub(crate) fn refinement_deficit_tiles_recomputed(&self) -> u32 {
         let mut seen: std::collections::HashSet<(u8, u8)> = std::collections::HashSet::new();
         for h in self.refinement_order.iter().flatten() {
             if let Some(w) = self.work.get(*h) {
@@ -334,6 +412,7 @@ impl Scheduler {
         let h = self.work.insert(work);
         self.slots.set_handle(tx, ty, pass, Some(h));
         self.refinement_order[(pass as usize).min(PASS_SLOTS - 1)].push_back(h);
+        self.refinement_deficit.push(tx, ty);
     }
 
     #[cfg(any(test, feature = "browserless-harness"))]
@@ -761,6 +840,7 @@ impl Scheduler {
         Self::drain_refinement_pass_major(
             &mut self.work,
             &mut self.refinement_order,
+            &mut self.refinement_deficit,
             refinement_budget,
             now,
             &mut emitted,
@@ -835,6 +915,7 @@ impl Scheduler {
     fn drain_refinement_pass_major(
         work: &mut Slab<TileWork>,
         order: &mut [VecDeque<Handle>; PASS_SLOTS],
+        deficit: &mut RefinementDeficit,
         budget: usize,
         now: Instant,
         out: &mut Vec<TileWork>,
@@ -848,11 +929,15 @@ impl Scheduler {
         for bucket in order.iter_mut() {
             bucket.retain(|&h| match work.get(h) {
                 Some(w) if matches!(w.state, WorkState::Superseded | WorkState::Acked) => {
+                    deficit.pop(w.tile_x, w.tile_y);
                     work.remove(h);
                     false
                 }
                 Some(_) => true,
-                None => false,
+                None => {
+                    debug_assert!(false, "orphaned refinement handle: deficit would drift");
+                    false
+                }
             });
         }
 
@@ -863,6 +948,7 @@ impl Scheduler {
                     Some(w) => w.payload.len(),
                     None => {
                         // Orphaned handle (shouldn't happen); drop and move on.
+                        debug_assert!(false, "orphaned refinement handle: deficit would drift");
                         bucket.pop_front();
                         continue;
                     }
@@ -872,6 +958,7 @@ impl Scheduler {
                 }
                 bucket.pop_front();
                 if let Some(mut w) = work.remove(h) {
+                    deficit.pop(w.tile_x, w.tile_y);
                     w.last_sent_at = Some(now);
                     w.state = WorkState::InFlight;
                     spent += cost;
@@ -974,6 +1061,7 @@ impl Scheduler {
             let h = self.work.insert(w);
             self.slots.set_handle(tile_x, tile_y, pass_idx, Some(h));
             self.refinement_order[(pass_idx as usize).min(PASS_SLOTS - 1)].push_back(h);
+            self.refinement_deficit.push(tile_x, tile_y);
         }
     }
 
@@ -1045,6 +1133,7 @@ impl Scheduler {
             let h = self.work.insert(w);
             self.slots.set_handle(tile_x, tile_y, pass_idx, Some(h));
             self.refinement_order[(pass_idx as usize).min(PASS_SLOTS - 1)].push_back(h);
+            self.refinement_deficit.push(tile_x, tile_y);
         }
     }
 }
@@ -1790,19 +1879,97 @@ mod tests {
         s.enqueue_refinement_at(1, 2, 0, vec![Vec::new()], now);
         assert_eq!(s.refinement_deficit_tiles(), 2);
 
-        // Marking one of (0,0)'s passes as Acked must not change the count
-        // (the other pass on (0,0) is still pending). Poked directly via
-        // the slot index/slab rather than `mark_acked`, which requires
-        // InFlight state -- this test is about `refinement_deficit_tiles`'s
-        // counting, not the Ack transition itself.
-        let h = s.slots.handle(0, 0, 0).expect("(0,0) pass 0 was enqueued");
-        s.work.get_mut(h).unwrap().state = WorkState::Acked;
-        assert_eq!(s.refinement_deficit_tiles(), 2);
+        // Draining sends (0,0)'s passes and (1,2)'s pass and empties the queue.
+        let _ = s.tick_at(usize::MAX, now);
+        assert_eq!(s.refinement_deficit_tiles(), 0);
+        assert_eq!(s.refinement_deficit_tiles_recomputed(), 0);
 
-        // Marking BOTH (0,0) passes as Acked ⇒ only (1,2) outstanding ⇒ 1.
-        let h = s.slots.handle(0, 0, 1).expect("(0,0) pass 1 was enqueued");
-        s.work.get_mut(h).unwrap().state = WorkState::Acked;
-        assert_eq!(s.refinement_deficit_tiles(), 1);
+        // A superseded pass still counts until the next tick drops it.
+        s.enqueue_refinement_at(0, 0, 0, vec![vec![1]], now);
+        s.enqueue_refinement_at(1, 2, 0, vec![vec![1]], now);
+        let _ = s.bump_generation(0, 0);
+        assert_eq!(s.refinement_deficit_tiles(), 2);
+        assert_eq!(s.refinement_deficit_tiles_recomputed(), 2);
+        // A zero budget still drops terminal entries but sends nothing.
+        let _ = s.tick_at(0, now);
+        assert_eq!(s.refinement_deficit_tiles(), 1, "only (1,2) is outstanding");
+    }
+
+    #[derive(Debug, Clone)]
+    enum DeficitOp {
+        Refinement { x: u8, y: u8, passes: u8 },
+        Subset { x: u8, y: u8, mask: u16 },
+        InjectedWork { x: u8, y: u8, pass: u8 },
+        Priority { x: u8, y: u8 },
+        Bump { x: u8, y: u8 },
+        BumpCollecting { x: u8, y: u8 },
+        Supersede { x: u8, y: u8 },
+        Tick { budget: u16 },
+        MarkAcked { x: u8, y: u8, gen: u8, pass: u8 },
+        Clear,
+        Resize { cols: u8, rows: u8 },
+    }
+
+    fn deficit_op() -> impl proptest::strategy::Strategy<Value = DeficitOp> {
+        use proptest::prelude::*;
+        prop_oneof![
+            4 => (any::<u8>(), any::<u8>(), 1u8..15).prop_map(|(x, y, passes)| DeficitOp::Refinement { x, y, passes }),
+            3 => (any::<u8>(), any::<u8>(), any::<u16>()).prop_map(|(x, y, mask)| DeficitOp::Subset { x, y, mask: mask & 0x3fff }),
+            2 => (any::<u8>(), any::<u8>(), 0u8..14).prop_map(|(x, y, pass)| DeficitOp::InjectedWork { x, y, pass }),
+            2 => (any::<u8>(), any::<u8>()).prop_map(|(x, y)| DeficitOp::Priority { x, y }),
+            3 => (any::<u8>(), any::<u8>()).prop_map(|(x, y)| DeficitOp::Bump { x, y }),
+            2 => (any::<u8>(), any::<u8>()).prop_map(|(x, y)| DeficitOp::BumpCollecting { x, y }),
+            2 => (any::<u8>(), any::<u8>()).prop_map(|(x, y)| DeficitOp::Supersede { x, y }),
+            4 => any::<u16>().prop_map(|budget| DeficitOp::Tick { budget }),
+            3 => (any::<u8>(), any::<u8>(), 0u8..16, 0u8..14).prop_map(|(x, y, gen, pass)| DeficitOp::MarkAcked { x, y, gen, pass }),
+            1 => Just(DeficitOp::Clear),
+            1 => (1u8..6, 1u8..6).prop_map(|(cols, rows)| DeficitOp::Resize { cols, rows }),
+        ]
+    }
+
+    proptest::proptest! {
+        /// The incremental deficit equals the full recomputation it replaced
+        /// after every operation, across every path that adds, drains,
+        /// supersedes, acks or clears queued work.
+        #[test]
+        fn incremental_refinement_deficit_equals_full_recomputation(
+            ops in proptest::collection::vec(deficit_op(), 1..80)
+        ) {
+            let mut s = Scheduler::new(4, 4);
+            let now = Instant::now();
+            for op in ops {
+                let (cols, rows) = (s.cols() as u8, s.rows() as u8);
+                match op {
+                    DeficitOp::Refinement { x, y, passes } => {
+                        let p: Vec<Vec<u8>> = (0..passes).map(|i| vec![i; 4]).collect();
+                        s.enqueue_refinement_at(x % cols, y % rows, 0, p, now);
+                    }
+                    DeficitOp::Subset { x, y, mask } => {
+                        let n = mask.count_ones() as usize;
+                        s.enqueue_refinement_subset_at(x % cols, y % rows, 0, mask, vec![vec![1u8; 4]; n], now);
+                    }
+                    DeficitOp::InjectedWork { x, y, pass } => {
+                        let mut w = TileWork::raw_for_test(x % cols, y % rows, 0, vec![1u8; 4]);
+                        w.pass_idx = pass;
+                        s.enqueue_refinement_work_at(w, now);
+                    }
+                    DeficitOp::Priority { x, y } => {
+                        s.enqueue_at(TileWork::raw_for_test(x % cols, y % rows, 0, vec![1u8; 4]), now);
+                    }
+                    DeficitOp::Bump { x, y } => { let _ = s.bump_generation(x % cols, y % rows); }
+                    DeficitOp::BumpCollecting { x, y } => { let _ = s.bump_generation_collecting(x % cols, y % rows); }
+                    DeficitOp::Supersede { x, y } => s.supersede_pending_for_tile(x % cols, y % rows),
+                    DeficitOp::Tick { budget } => { let _ = s.tick_at(budget as usize, now); }
+                    DeficitOp::MarkAcked { x, y, gen, pass } => s.mark_acked(x % cols, y % rows, gen, pass),
+                    DeficitOp::Clear => s.clear(),
+                    DeficitOp::Resize { cols, rows } => s.resize(cols as u32, rows as u32),
+                }
+                proptest::prop_assert_eq!(
+                    s.refinement_deficit_tiles(),
+                    s.refinement_deficit_tiles_recomputed()
+                );
+            }
+        }
     }
 
     #[cfg(feature = "cdf53-diag")]

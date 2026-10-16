@@ -4770,10 +4770,11 @@ async fn enqueue_cdf53_generation_source_selects_counter_and_log_label() {
 }
 
 /// `ack_batch_received` fires once per ACK batch, which is every few
-/// milliseconds on a busy session. The production default filter is
-/// `ghostframe=debug,info`, which lets INFO *and* DEBUG through for this
-/// target and feeds journald's rate limit, so it is TRACE: invisible at
-/// DEBUG, present at the TRACE filter the e2e containers run under.
+/// milliseconds on a busy session. The daemon's default filter is
+/// `ghostframe=info` (ghostframe-xdaemon main.rs); an operator who sets
+/// `RUST_LOG=ghostframe=debug` lets DEBUG through for this target and feeds
+/// journald's rate limit, so it is TRACE: invisible at DEBUG, present at the
+/// TRACE filter the e2e containers run under.
 #[tokio::test]
 async fn ack_batch_received_is_a_trace_event() {
     use std::sync::{Arc, Mutex};
