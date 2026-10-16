@@ -123,3 +123,88 @@ fn readback_report() {
         }
     }
 }
+
+/// How many distinct palettes would a screen put on the 256-slot PalRle table?
+/// Counts, per synthetic 4K screen, the tiles with 16 or fewer colours and the
+/// distinct colour sets among them (the table's demand before the GPU folds
+/// subsets into supersets). A screen with more than 256 distinct sets in use
+/// at once is what makes `phase_a` fall back (to CDF 5/3 now). Synthetic, so
+/// it bounds the question; it does not replace a trace of a real desktop.
+#[test]
+#[ignore]
+fn palette_demand_report() {
+    let (w, h) = (3840u32, 2160u32);
+    let mut gpu =
+        GpuFrameProcessor::new((w / 32) * h.div_ceil(32) + 8).expect("needs a Vulkan GPU");
+    type Screen = (&'static str, Box<dyn Fn(u32, u32) -> [u8; 4]>);
+    let screens: Vec<Screen> = vec![
+        (
+            "editor, bitmap font, 8 syntax colours (no antialiasing)",
+            Box::new(|x, y| {
+                let (cx, cy) = (x / 9, y / 18);
+                let ink = ((x % 9) < 5) && ((y % 18) < 12) && ((cx * 7 + cy * 13) % 3 != 0);
+                if ink {
+                    let c = ((cx / 6 + cy) % 8) as u8;
+                    [40 + c * 25, 200 - c * 20, 90 + c * 15, 255]
+                } else {
+                    [30, 30, 30, 255]
+                }
+            }),
+        ),
+        (
+            "text with antialiasing (grey ramp edges)",
+            Box::new(|x, y| {
+                let (cx, cy) = (x / 9, y / 18);
+                let e = ((x % 9) * 40 + (y % 18) * 9 + cx * 3 + cy) % 256;
+                if (cx * 7 + cy * 13) % 3 != 0 {
+                    [e as u8, e as u8, e as u8, 255]
+                } else {
+                    [255, 255, 255, 255]
+                }
+            }),
+        ),
+        (
+            "flat dashboard: 64 colours, 4 per cell, 24 px cells",
+            Box::new(|x, y| {
+                let (cx, cy) = (x / 24, y / 24);
+                let sub = (x % 24) / 12 + 2 * ((y % 24) / 12);
+                let k = (cx * 31 + cy * 17 + sub * 7) % 64;
+                [
+                    (k * 4) as u8,
+                    (255 - k * 3) as u8,
+                    (k * 11 % 256) as u8,
+                    255,
+                ]
+            }),
+        ),
+    ];
+    for (name, f) in screens {
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                px.extend_from_slice(&f(x, y));
+            }
+        }
+        // Two frames so the second has a baseline and everything is dirty.
+        let other: Vec<u8> = px.iter().map(|b| b.wrapping_add(1)).collect();
+        unsafe { gpu.process_frame_inner_from_pixels(&other, w, h, w * 4) }.unwrap();
+        let a = unsafe { gpu.process_frame_inner_from_pixels(&px, w, h, w * 4) }.unwrap();
+        let mut sets = std::collections::HashSet::new();
+        let mut small = 0usize;
+        for i in 0..a.tile_analysis_len as usize {
+            let t = unsafe { &*a.tile_analysis.add(i) };
+            if (1..=16).contains(&t.count) {
+                small += 1;
+                let mut cs: Vec<u32> = t.colors[..t.count as usize].to_vec();
+                cs.sort_unstable();
+                sets.insert(cs);
+            }
+        }
+        println!(
+            "PALDEMAND {name}: tiles={} le16_colours={} distinct_palettes={} (table holds 256)",
+            a.tile_analysis_len,
+            small,
+            sets.len()
+        );
+    }
+}
