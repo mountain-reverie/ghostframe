@@ -2,7 +2,10 @@ build: build-web
     cargo build
 
 build-release: build-web
-    cargo build --release
+    # The daemon only: a workspace-wide build unifies ghostframe-e2e's test
+    # features into the shipped binary (see ci/check-release-features.sh).
+    cargo build --release -p ghostframe-xdaemon
+    ci/check-release-features.sh
 
 # --bins is not redundant: it is the only thing that runs the tests in binary
 # crates (ghostframe-xdaemon, codec_report). `--lib` skips them silently.
@@ -208,6 +211,8 @@ ci-local:
     ci/check-env-reads.sh
     @echo "=== no home-directory paths in tracked files ==="
     ci/check-local-paths.sh
+    @echo "=== release daemon has no test-only features ==="
+    ci/check-release-features.sh
     @echo "=== clippy ==="
     cargo clippy --workspace --all-targets -- -D warnings
     cargo clippy -p ghostframe-lib --all-targets --features cdf53-diag -- -D warnings
