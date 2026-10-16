@@ -390,6 +390,24 @@ pub struct BrowserlessResult {
     /// was ever dropped. Distinct from `bytes_dropped`, which counts *netsim*
     /// drops across both directions and cannot separate the two causes.
     pub drops_fired: Vec<u32>,
+    /// Of `retransmit_attempts_total`, those a NACK asked for.
+    pub retransmit_by_nack: u64,
+    /// RTO fires whose pass was then acknowledged by a transmission sent
+    /// before the first retransmission (the timer fired for data still on its
+    /// way). `rto_fired - rto_spurious - rto_useful` fired for passes not
+    /// acknowledged by the end of the scene.
+    pub rto_spurious: u64,
+    /// RTO fires whose pass was repaired by the retransmission.
+    pub rto_useful: u64,
+    /// quinn path stats, send-queue depth and the client's feedback totals,
+    /// from `IoBridge::transport_probe_publish_handle()`. `transport.samples
+    /// == 0` means the probe never read a live connection.
+    pub transport: ghostframe_lib::transport::io_bridge::TransportProbe,
+    /// The client's own pre-FEC loss, loss-run histogram and recoveries.
+    pub client_wire_loss: ghostframe_client_core::WireLossStats,
+    /// `(datagram frames quinn received, frames read by the application)` on
+    /// the client; the difference is receive-buffer drops.
+    pub client_rx_datagrams: Option<(u64, u64)>,
 }
 
 impl BrowserlessResult {
@@ -591,6 +609,7 @@ async fn run_inner(
     // Stage 2.4) — see `probe_stats_publish`'s doc comment in
     // `io_bridge.rs`.
     let probe_stats_cell = bridge.probe_stats_publish_handle();
+    let transport_probe_cell = bridge.transport_probe_publish_handle();
     let send_errs_cell = bridge.send_errs_publish_handle();
     // Same ownership problem, opposite direction: this `Arc` originates
     // here (it already holds `scene.drops`'s rules), and `set_drop_plan`
@@ -664,6 +683,7 @@ async fn run_inner(
         bytes_delivered_c2s,
         datagrams_delivered_s2c,
         bytes_dropped,
+        client_probe,
     ) = outcome?;
 
     let stale_generation_tiles = framebuffer.stale_frame_tiles();
@@ -677,6 +697,9 @@ async fn run_inner(
     let (queued_critical_latency, queued_refinement_latency) = *queued_latency_stats_cell
         .lock()
         .expect("queued_latency_stats_publish mutex poisoned");
+    let transport = *transport_probe_cell
+        .lock()
+        .expect("transport_probe_publish mutex poisoned");
     let send_datagram_errs = *send_errs_cell.lock().expect("send_errs mutex poisoned");
     let (probes_completed, probes_abandoned) = *probe_stats_cell
         .lock()
@@ -746,6 +769,12 @@ async fn run_inner(
         implausible_rtt_samples: bwe_snapshot.implausible_rtt_samples,
         bwe_samples_seen: bwe_snapshot.samples_seen,
         retransmit_attempts_total: emitter_stats.retransmit_attempts_total,
+        retransmit_by_nack: emitter_stats.retransmit_by_nack,
+        rto_spurious: emitter_stats.rto_spurious,
+        rto_useful: emitter_stats.rto_useful,
+        transport,
+        client_wire_loss: client_probe.wire_loss,
+        client_rx_datagrams: client_probe.rx_datagrams,
         nack_hit: emitter_stats.nack_hit,
         nack_miss: emitter_stats.nack_miss,
         rto_fired: emitter_stats.rto_fired,
@@ -804,7 +833,7 @@ async fn drive_session(
     links: &LinkOverrides,
     s2c_loss: &mut S2cLoss,
     opts: RunOptions,
-) -> anyhow::Result<(Vec<ClientNetEvent>, u64, u64, u64, u64, u64)> {
+) -> anyhow::Result<(Vec<ClientNetEvent>, u64, u64, u64, u64, u64, ClientProbe)> {
     let seed = scene.seed;
 
     // Pin the client endpoint's RNG to the scene seed. Left to entropy,
@@ -1266,6 +1295,10 @@ async fn drive_session(
         }
     }
 
+    let client_probe = ClientProbe {
+        wire_loss: client.wire_loss_stats(),
+        rx_datagrams: client.datagram_rx_counts(),
+    };
     Ok((
         events,
         bytes_delivered,
@@ -1273,7 +1306,19 @@ async fn drive_session(
         bytes_delivered_c2s,
         datagrams_delivered_s2c,
         bytes_dropped,
+        client_probe,
     ))
+}
+
+/// What the client measured about its own receive path, read when the scene
+/// ends. Measurement only.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClientProbe {
+    /// Pre-FEC loss, loss-run histogram and FEC recoveries from `wire_seq` gaps.
+    pub wire_loss: ghostframe_client_core::WireLossStats,
+    /// `(datagram frames quinn received, frames read by the application)`.
+    /// The difference is what quinn's receive buffer dropped.
+    pub rx_datagrams: Option<(u64, u64)>,
 }
 
 /// Encode and inject one `FrameScript`'s tiles as an `InjectedFrame`.

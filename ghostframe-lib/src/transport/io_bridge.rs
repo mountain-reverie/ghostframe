@@ -109,7 +109,9 @@ pub use frame_backend::{
 
 #[path = "io_bridge/frame_worker.rs"]
 mod frame_worker;
+mod transport_probe;
 use frame_worker::{FinishAction, FramePipeline, FromWorker, ToWorker};
+pub use transport_probe::TransportProbe;
 
 #[path = "io_bridge/frame.rs"]
 mod frame;
@@ -665,6 +667,12 @@ pub struct IoBridge {
     /// and the delta since. Zero delta means the link was idle over that
     /// interval, which is when `cwnd / rtt` stops meaning anything.
     path_sent_packets_last: u64,
+    /// Transport measurements (see `transport_probe`). Measurement only.
+    transport_probe: TransportProbe,
+    /// Harness read-back of `transport_probe`, same pattern as the other
+    /// `*_publish` cells.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    transport_probe_publish: std::sync::Arc<std::sync::Mutex<TransportProbe>>,
     /// Losses awaiting a feedback report with at least one acknowledgement to
     /// travel in. See the drain site.
     pending_losses: Vec<PendingLoss>,
@@ -1141,6 +1149,11 @@ impl IoBridge {
             scheduler_continuation: None,
             capacity_hint_window: std::collections::VecDeque::new(),
             path_sent_packets_last: 0,
+            transport_probe: TransportProbe::default(),
+            #[cfg(any(test, feature = "browserless-harness"))]
+            transport_probe_publish: std::sync::Arc::new(std::sync::Mutex::new(
+                TransportProbe::default(),
+            )),
             pending_losses: Vec::new(),
             late_acked: std::collections::HashSet::new(),
             pending_losses_retracted: 0,
@@ -2114,6 +2127,7 @@ impl IoBridge {
                 self.queued_critical_latency_stats,
                 self.queued_refinement_latency_stats,
             );
+            *self.transport_probe_publish.lock().unwrap() = self.transport_probe;
             *self.probe_stats_publish.lock().unwrap() =
                 (self.probes_completed, self.probes_abandoned);
         }

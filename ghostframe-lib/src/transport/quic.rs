@@ -65,6 +65,9 @@ pub struct QuicServer {
     pub(crate) endpoint: Endpoint,
     /// Active connections keyed by their handle.
     pub connections: HashMap<ConnectionHandle, Connection>,
+    /// The datagram send buffer size this endpoint was configured with, so a
+    /// reading of `send_buffer_space()` can be turned into queued bytes.
+    datagram_send_buffer: usize,
     /// Certificate fingerprint for browser pinning.
     pub(crate) cert_info: CertInfo,
     /// Stray `ConnectionEvent`s for handles we no longer hold, counted rather
@@ -512,6 +515,7 @@ impl QuicServer {
         Ok(Self {
             endpoint,
             connections: HashMap::new(),
+            datagram_send_buffer,
             cert_info: CertInfo {
                 sha256_hex,
                 schedule,
@@ -664,6 +668,11 @@ impl QuicServer {
                 err.response
             }
         }
+    }
+
+    /// The configured datagram send buffer size, bytes.
+    pub fn datagram_send_buffer(&self) -> usize {
+        self.datagram_send_buffer
     }
 
     /// Return the certificate fingerprint for browser pinning.
