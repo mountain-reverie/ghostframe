@@ -158,10 +158,12 @@ impl IoBridge {
                 use crate::transport::transmission_ledger::Resolution;
                 let r = match self.transmission_ledger.resolve(e.wire_seq) {
                     Some(Resolution::Live(tx)) => {
+                        self.reliable_emitter.note_ack_origin(tx.key, e.wire_seq);
                         self.loss_window.record(tx.emit_us as u32, false);
                         Some((tx.key, tx, e.arrival_time_ms_lo16, false))
                     }
                     Some(Resolution::Late(tx)) => {
+                        self.reliable_emitter.note_ack_origin(tx.key, e.wire_seq);
                         self.loss_window.retract(tx.emit_us as u32);
                         // Withdrawn from `pending_losses` once per turn (see
                         // `retract_late_acked_losses`); only worth noting when

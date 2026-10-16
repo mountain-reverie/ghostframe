@@ -409,6 +409,7 @@ impl IoBridge {
         &mut self,
         fb: crate::transport::feedback::ReceiverFeedback,
     ) {
+        self.note_client_feedback(&fb);
         let suspended = fb.suspension_detected;
         self.recent_suspension_flags = [self.recent_suspension_flags[1], suspended];
         self.adaptation_context.suspended =
@@ -666,5 +667,6 @@ impl IoBridge {
             }
             self.apply_path_stats_snapshot(cwnd, rtt_us);
         }
+        self.update_transport_probe();
     }
 }

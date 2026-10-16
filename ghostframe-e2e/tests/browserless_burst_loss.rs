@@ -77,7 +77,9 @@ fn report(name: &str, r: &BrowserlessResult) {
         "BURSTREPORT {name}: offered={} dropped={} realised_loss={:.4} loss_runs={} \
          mean_run={:.3} max_run={} retransmit_attempts_total={} nack_hit={} nack_miss={} \
          rto_fired={} retx_per_drop={:.3} tiles_present={}/{} stale={} \
-         s2c_bytes={} s2c_dg={} total_bytes={}",
+         s2c_bytes={} s2c_dg={} total_bytes={} retx_nack={} rto_spurious={} rto_useful={} \
+         quinn_cwnd={} quinn_cong={} quinn_lost_pk={} queue_max_B={} client_lost_pre_fec={} \
+         client_run_hist={:?} client_recovered={} client_dup_rebuilt={} client_rx={:?}",
         r.s2c_datagrams_offered,
         r.s2c_datagrams_dropped,
         r.s2c_datagrams_dropped as f64 / r.s2c_datagrams_offered.max(1) as f64,
@@ -95,6 +97,18 @@ fn report(name: &str, r: &BrowserlessResult) {
         r.bytes_delivered_s2c,
         r.datagrams_delivered_s2c,
         r.bytes_delivered,
+        r.retransmit_by_nack,
+        r.rto_spurious,
+        r.rto_useful,
+        r.transport.cwnd,
+        r.transport.congestion_events,
+        r.transport.lost_packets,
+        r.transport.max_queue_bytes,
+        r.client_wire_loss.lost_pre_fec,
+        r.client_wire_loss.run_hist,
+        r.client_wire_loss.recovered,
+        r.client_wire_loss.dup_rebuilt,
+        r.client_rx_datagrams,
     );
 }
 
@@ -129,6 +143,76 @@ async fn iid_versus_burst_loss_at_equal_average_rate() {
 
     for (n, r) in [("clean", &clean), ("iid", &iid), ("burst", &burst)] {
         assert_established(n, r);
+    }
+    // The transport counters must have been exercised, not merely printed: a
+    // counter that is never incremented reads as a clean link.
+    for (n, r) in [("clean", &clean), ("iid", &iid), ("burst", &burst)] {
+        assert!(
+            r.transport.samples > 0,
+            "{n}: the transport probe never read a connection"
+        );
+        assert!(
+            r.transport.sent_packets > 0,
+            "{n}: no quinn packets counted"
+        );
+        assert!(
+            r.client_wire_loss.received > 0,
+            "{n}: client counted no datagrams"
+        );
+        assert_eq!(
+            r.retransmit_by_nack + r.rto_fired,
+            r.retransmit_attempts_total,
+            "{n}: every retransmission is a NACK's or the RTO's"
+        );
+        let (frames_rx, app_reads) = r.client_rx_datagrams.expect("client connection");
+        assert!(
+            frames_rx >= app_reads && app_reads > 0,
+            "{n}: rx counts {frames_rx}/{app_reads}"
+        );
+    }
+    // Deliberately no zero-assertions on the clean run: the frame worker is a
+    // real thread, so on a loaded host virtual time can jump while the loop
+    // waits for it and an RTO or a quinn loss-detection event can fire with
+    // nothing dropped. The lossy runs below must exceed it by construction.
+    for (n, r) in [("iid", &iid), ("burst", &burst)] {
+        assert!(
+            r.client_wire_loss.lost_pre_fec > 0,
+            "{n}: client saw no gaps under loss"
+        );
+        assert!(
+            r.client_wire_loss.run_hist.iter().sum::<u64>() > 0,
+            "{n}: no loss run recorded"
+        );
+        assert!(
+            r.transport.congestion_events > 0,
+            "{n}: loss must have cut the window"
+        );
+        assert!(
+            r.transport.max_queue_bytes > 0,
+            "{n}: queue depth never measured"
+        );
+        assert!(
+            r.rto_fired > 0,
+            "{n}: premise: the RTO fires under loss in this scene"
+        );
+        assert!(
+            r.rto_spurious > 0,
+            "{n}: {} RTO fires, none spurious",
+            r.rto_fired
+        );
+        assert!(
+            r.rto_useful > 0,
+            "{n}: {} RTO fires, none useful",
+            r.rto_fired
+        );
+        assert!(
+            r.rto_spurious + r.rto_useful <= r.rto_fired,
+            "{n}: more fires attributed than fired"
+        );
+        assert!(
+            r.transport.client_received > 0,
+            "{n}: no client feedback totals"
+        );
     }
     assert_eq!(
         clean.s2c_datagrams_dropped, 0,

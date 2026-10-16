@@ -2146,6 +2146,7 @@ impl IoBridge {
             self.last_cumulative_emit_log_frame = seq;
             let c = self.cumulative_datagrams_emitted;
             let es = self.reliable_emitter.stats;
+            let tp = self.transport_probe;
             tracing::info!(
                 target: LOG_TARGET,
                 frame_seq = seq,
@@ -2190,6 +2191,28 @@ impl IoBridge {
                 // surfaced before, and it is the difference between
                 // "we never sent it" and "we sent it and it was lost".
                 send_rejected = es.send_rejected,
+                // Retransmission cause and the RTO's hit rate. Of
+                // `retransmit_attempts_total`, `retx_nack` were asked for by
+                // the client and `rto_fired` were the timer's. A fire whose
+                // pass was then acknowledged by an earlier transmission is
+                // `rto_spurious`; one repaired by its retransmission is
+                // `rto_useful`.
+                retx_nack = es.retransmit_by_nack,
+                rto_spurious = es.rto_spurious,
+                rto_useful = es.rto_useful,
+                // quinn's view of the path and the depth of its datagram
+                // send queue. A queue that only grows while `quinn_cwnd`
+                // stays cut is the standing queue behind the RTO cascade.
+                quinn_cwnd = tp.cwnd,
+                quinn_lost_packets = tp.lost_packets,
+                quinn_sent_packets = tp.sent_packets,
+                quinn_congestion_events = tp.congestion_events,
+                quinn_queue_bytes = tp.queue_bytes,
+                quinn_queue_bytes_max = tp.max_queue_bytes,
+                // The client's own counts (summed `ReceiverFeedback`).
+                client_received = tp.client_received,
+                client_lost = tp.client_lost,
+                client_recovered_fec = tp.client_recovered,
                 // `emitter_` prefix so `e2e_ack_telemetry_no_waste`'s
                 // `ack_miss` log-line filter doesn't false-match this
                 // structured field — the test counts per-ACK debug

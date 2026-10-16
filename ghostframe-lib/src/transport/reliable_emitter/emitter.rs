@@ -11,7 +11,7 @@ use crate::transport::reliable_emitter::wire_seq::WireSeqAllocator;
 use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K, PARITY_INTERLEAVE_OFFSET};
 use bytes::{Bytes, BytesMut};
 use smallvec::smallvec;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 pub struct ReliableTileEmitter {
@@ -20,6 +20,10 @@ pub struct ReliableTileEmitter {
     pub(crate) queue: EmissionQueue,
     pub(crate) group: GroupBuilder,
     pub(crate) rto: RtoTimerWheel,
+    /// Per pass that RTO'd and is not acknowledged yet: the first
+    /// retransmission's `wire_seq` and how many times it fired. Resolved by
+    /// [`Self::note_ack_origin`]. Measurement only.
+    rto_origin: HashMap<EmitKey, RtoOrigin>,
     /// Latest measured ACK-latency p95, fed from `IoBridge` via
     /// `set_ack_deadline` once per BWE-sample drain. `rto_for_attempt`
     /// derives the actual first-attempt RTO deadline from this (doubling,
@@ -115,7 +119,39 @@ pub struct EmitterStats {
     /// its share of the link, which is the precondition for the storm this
     /// budget exists to prevent.
     pub retransmit_budget_deferrals: u64,
+    /// Of `retransmit_attempts_total`, those a NACK asked for (the rest are
+    /// RTO fires: `rto_fired`). Measurement only.
+    pub retransmit_by_nack: u64,
+    /// RTO fires whose pass was then acknowledged by a transmission sent
+    /// BEFORE the first retransmission: the timer fired for data that was
+    /// still on its way. Measurement only.
+    pub rto_spurious: u64,
+    /// RTO fires whose pass was acknowledged by a retransmission: the timer
+    /// earned its keep. `rto_fired - rto_spurious - rto_useful` fired for
+    /// passes not acknowledged yet. Measurement only.
+    pub rto_useful: u64,
+    /// Times the RTO bookkeeping hit its cap and was dropped; fires made
+    /// before a reset and not yet acknowledged are never attributed.
+    pub rto_origin_resets: u64,
 }
+
+/// What is known about a pass that RTO'd: the first retransmission's
+/// `wire_seq`, how many times it fired, and whether those fires are already
+/// counted as spurious (an older transmission was acknowledged) so a later
+/// acknowledgement of a retransmission can move them to useful.
+#[derive(Clone, Copy)]
+struct RtoOrigin {
+    first_retx_ws: u32,
+    fires: u32,
+    counted_spurious: bool,
+}
+
+/// Most passes whose RTO history is tracked at once. Measurement only: a
+/// pass that fires and is never acknowledged (cancelled, retired, or every
+/// copy lost) would otherwise sit here forever. At the cap the whole table is
+/// dropped and `rto_origin_resets` counts it, so the newest fires stay
+/// attributed and a reader can see that older ones were forgotten.
+const RTO_ORIGIN_CAP: usize = 16_384;
 
 impl ReliableTileEmitter {
     /// `now` becomes `time_base` — the reference instant every subsequent
@@ -130,6 +166,7 @@ impl ReliableTileEmitter {
             queue: EmissionQueue::new(),
             group: GroupBuilder::new(FEC_GROUP_SIZE_K),
             rto: RtoTimerWheel::new(),
+            rto_origin: HashMap::new(),
             ack_deadline: None,
             time_base: now,
             transmissions: Vec::new(),
@@ -266,6 +303,58 @@ impl ReliableTileEmitter {
         }
     }
 
+    fn note_rto_fire(&mut self, key: EmitKey, first_ws: Option<u32>) {
+        let Some(ws) = first_ws else { return };
+        if let Some(e) = self.rto_origin.get_mut(&key) {
+            e.fires += 1;
+            if e.counted_spurious {
+                self.stats.rto_spurious += 1;
+            }
+            return;
+        }
+        if self.rto_origin.len() >= RTO_ORIGIN_CAP {
+            self.rto_origin.clear();
+            self.stats.rto_origin_resets += 1;
+        }
+        self.rto_origin.insert(
+            key,
+            RtoOrigin {
+                first_retx_ws: ws,
+                fires: 1,
+                counted_spurious: false,
+            },
+        );
+    }
+
+    /// An acknowledgement named `wire_seq` for pass `key`. If that pass had
+    /// RTO'd: an acknowledgement for a transmission sent BEFORE the first
+    /// retransmission counts its fires as spurious (the timer fired for data
+    /// still on its way); one for the retransmission or later counts them as
+    /// useful and overrides an earlier spurious verdict, because a
+    /// multi-fragment pass is acknowledged fragment by fragment and the
+    /// first entry may be a fragment that was never lost. Measurement only:
+    /// changes no state the emitter acts on. A NACK retransmission is
+    /// indistinguishable from the RTO's here, so a pass both fired and
+    /// NACKed is attributed by whichever transmission was acknowledged.
+    pub fn note_ack_origin(&mut self, key: EmitKey, wire_seq: u32) {
+        let Some(e) = self.rto_origin.get_mut(&key) else {
+            return;
+        };
+        let fires = u64::from(e.fires);
+        if (wire_seq.wrapping_sub(e.first_retx_ws) as i32) < 0 {
+            if !e.counted_spurious {
+                e.counted_spurious = true;
+                self.stats.rto_spurious += fires;
+            }
+        } else {
+            if e.counted_spurious {
+                self.stats.rto_spurious -= fires;
+            }
+            self.stats.rto_useful += fires;
+            self.rto_origin.remove(&key);
+        }
+    }
+
     /// Ingest a batch of ACKs from the client. For each key, remove the
     /// corresponding cache entry. A hit (entry was live) bumps `ack_hit`; a
     /// miss (already evicted/cancelled) bumps `ack_miss`. Idempotent: late
@@ -391,6 +480,7 @@ impl ReliableTileEmitter {
             spent += bytes.len();
             self.queue.push_source(bytes);
             self.stats.retransmit_attempts_total += 1;
+            self.stats.retransmit_by_nack += 1;
             count += 1;
         }
         while count < max_retransmits && spent < max_bytes {
@@ -469,6 +559,7 @@ impl ReliableTileEmitter {
                     "[H3-SRV] retransmit"
                 );
             }
+            let mut first_ws: Option<u32> = None;
             for mut bytes in frags {
                 // Re-stamp emit time on retransmit so the BWE consumer sees
                 // the actual on-wire moment, not the original send. Tile
@@ -486,6 +577,7 @@ impl ReliableTileEmitter {
                 let mut ws = 0u32;
                 if bytes.len() >= 12 {
                     ws = self.alloc.allocate();
+                    first_ws.get_or_insert(ws);
                     bytes[8..12].copy_from_slice(&ws.to_be_bytes());
                 }
                 let mut stamped = 0u64;
@@ -513,6 +605,7 @@ impl ReliableTileEmitter {
             }
             self.rto.schedule(key, now + new_rto);
             self.stats.rto_fired += 1;
+            self.note_rto_fire(key, first_ws);
             self.stats.retransmit_attempts_total += 1;
             count += 1;
         }
@@ -536,6 +629,9 @@ impl ReliableTileEmitter {
     pub fn retire_stuck(&mut self, now: Instant, older_than: Duration) -> Vec<EmitKey> {
         let retired = self.cache.retire_older_than(now, older_than);
         self.stats.stuck_entries_retired += retired.len() as u64;
+        for k in &retired {
+            self.rto_origin.remove(k);
+        }
         retired
     }
 
@@ -630,6 +726,7 @@ impl ReliableTileEmitter {
     /// — see `RetransmitCache::clear` doc.
     pub fn clear_cache(&mut self) {
         self.cache.clear();
+        self.rto_origin.clear();
         // RTO heap entries will validate against the empty cache on pop
         // and silently skip; no need to flush the heap.
     }
@@ -1136,6 +1233,124 @@ mod tests {
         assert!(entry.last_sent_at > entry_first_sent);
         assert_eq!(e.stats.rto_fired, 1);
         assert_eq!(e.stats.retransmit_attempts_total, 1);
+    }
+
+    /// Fire the RTO once for a single pass sent as wire_seq 0 (the retransmit
+    /// is wire_seq 1).
+    fn rto_fired_once() -> (ReliableTileEmitter, EmitKey) {
+        let mut e = ReliableTileEmitter::new(Instant::now());
+        let mut sender = CollectSender::default();
+        let t0 = Instant::now();
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        e.drain(&mut sender, t0);
+        let t1 = t0 + Duration::from_millis(1_100);
+        e.tick(t1, usize::MAX);
+        e.drain(&mut sender, t1);
+        assert_eq!(e.stats.rto_fired, 1, "premise: the RTO fired");
+        (e, key)
+    }
+
+    #[test]
+    fn an_ack_for_the_original_after_an_rto_is_a_spurious_fire() {
+        let (mut e, key) = rto_fired_once();
+        e.note_ack_origin(key, 0);
+        assert_eq!((e.stats.rto_spurious, e.stats.rto_useful), (1, 0));
+    }
+
+    #[test]
+    fn an_ack_for_the_retransmission_is_a_useful_fire() {
+        let (mut e, key) = rto_fired_once();
+        e.note_ack_origin(key, 1);
+        assert_eq!((e.stats.rto_spurious, e.stats.rto_useful), (0, 1));
+    }
+
+    #[test]
+    fn a_later_ack_for_the_retransmission_overrides_an_earlier_spurious_verdict() {
+        // A multi-fragment pass is acknowledged fragment by fragment: fragment
+        // 0's original may be acknowledged first although fragment 1 was lost
+        // and only the retransmission delivered it.
+        let (mut e, key) = rto_fired_once();
+        e.note_ack_origin(key, 0);
+        assert_eq!((e.stats.rto_spurious, e.stats.rto_useful), (1, 0));
+        e.note_ack_origin(key, 1);
+        assert_eq!((e.stats.rto_spurious, e.stats.rto_useful), (0, 1));
+        e.note_ack_origin(key, 1);
+        assert_eq!(
+            (e.stats.rto_spurious, e.stats.rto_useful),
+            (0, 1),
+            "counted once"
+        );
+    }
+
+    #[test]
+    fn a_fire_after_a_spurious_verdict_is_counted_too_and_wrap_is_handled() {
+        let mut e = ReliableTileEmitter::new(Instant::now());
+        let key = EmitKey::new(1, 0, 0, 0);
+        // First retransmission at wire_seq 2; the original (u32::MAX - 1, i.e.
+        // 4 earlier across the wrap) is acknowledged.
+        e.note_rto_fire(key, Some(2));
+        e.note_ack_origin(key, u32::MAX - 1);
+        assert_eq!(e.stats.rto_spurious, 1, "pre-wrap original is older");
+        e.note_rto_fire(key, Some(9));
+        assert_eq!(e.stats.rto_spurious, 2);
+    }
+
+    #[test]
+    fn the_rto_bookkeeping_is_bounded_and_counts_its_resets() {
+        let mut e = ReliableTileEmitter::new(Instant::now());
+        for i in 0..(RTO_ORIGIN_CAP as u32 + 5) {
+            e.note_rto_fire(EmitKey::new(i, 0, 0, 0), Some(i));
+        }
+        assert!(e.rto_origin.len() <= RTO_ORIGIN_CAP);
+        assert_eq!(e.stats.rto_origin_resets, 1);
+        // The newest fire is still attributable after the reset.
+        let newest = EmitKey::new(RTO_ORIGIN_CAP as u32 + 4, 0, 0, 0);
+        e.note_ack_origin(newest, RTO_ORIGIN_CAP as u32 + 4);
+        assert_eq!(e.stats.rto_useful, 1);
+    }
+
+    #[test]
+    fn clear_cache_forgets_rto_history() {
+        let (mut e, key) = rto_fired_once();
+        e.clear_cache();
+        e.note_ack_origin(key, 0);
+        assert_eq!((e.stats.rto_spurious, e.stats.rto_useful), (0, 0));
+    }
+
+    #[test]
+    fn an_ack_for_a_pass_that_never_fired_counts_neither() {
+        let (mut e, _) = rto_fired_once();
+        e.note_ack_origin(EmitKey::new(9, 0, 0, 0), 0);
+        assert_eq!((e.stats.rto_spurious, e.stats.rto_useful), (0, 0));
+    }
+
+    #[test]
+    fn retransmissions_are_split_by_cause() {
+        let (e, _) = rto_fired_once();
+        assert_eq!(
+            (
+                e.stats.retransmit_attempts_total,
+                e.stats.retransmit_by_nack
+            ),
+            (1, 0)
+        );
+        let mut e = ReliableTileEmitter::new(Instant::now());
+        let mut sender = CollectSender::default();
+        let t0 = Instant::now();
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        e.drain(&mut sender, t0);
+        e.on_nack(&[(key, 0u8)], t0);
+        e.tick(t0, usize::MAX);
+        assert_eq!(
+            (
+                e.stats.retransmit_attempts_total,
+                e.stats.retransmit_by_nack,
+                e.stats.rto_fired
+            ),
+            (1, 1, 0)
+        );
     }
 
     /// The [H3-SRV] retransmit line needs an FNV pass over the first

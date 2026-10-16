@@ -197,6 +197,16 @@ impl IoBridge {
         self.inbound_read_log = Some(log);
     }
 
+    /// Clone of the `Arc` behind `transport_probe_publish`: quinn path stats,
+    /// send-queue depth and the client's feedback totals. Same pattern as
+    /// `emitter_stats_publish_handle`.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn transport_probe_publish_handle(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<super::TransportProbe>> {
+        self.transport_probe_publish.clone()
+    }
+
     /// Clone of the `Arc` behind `emitter_stats_publish`, for a caller that
     /// is about to move `self` into a `spawn_local`'d task and needs a way
     /// to read the reliable-emitter counters back out afterwards. See
