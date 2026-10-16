@@ -88,9 +88,13 @@ options amdgpu virtual_display=<PCI_ID>,1
 Find `<PCI_ID>` with `lspci -D | grep VGA` (use the form `0000:03:00.0`).
 Reboot after creating this file.
 
-A Tailscale account with a reusable pre-auth key
+A Tailscale account with a pre-auth key
 (https://login.tailscale.com/admin/settings/keys) is required to register
-the host on your tailnet. The install script will prompt for it.
+the host on your tailnet. The install script will prompt for it. Prefer a
+**one-off** key: the user who created the key becomes the node's owner, and
+every device of that user may connect (see
+[Who can connect](#who-can-connect)), so a reusable key that is still valid
+lets anyone holding it register a device that will be admitted.
 
 ## Install
 
@@ -158,9 +162,11 @@ operator's own desktop: their files, browser sessions, saved passwords, and
 sudo privileges. There is no sandbox or separation from the local account.
 
 Single-client eviction still applies — only one remote client can attach at a
-time — but the tailnet is the only access boundary. **If you are choosing attach
-mode, you should understand that anyone with tailnet access to the ghostframe
-endpoint gets full access to that account's session.**
+time. Access is limited to the tailnet user who owns the ghostframe node, plus
+anyone you add to `GHOSTFRAME_ALLOWED_USERS` (see
+[Who can connect](#who-can-connect)). **Everyone admitted that way gets full
+access to that account's session**, so keep the list short, and restrict the
+node in your tailnet ACLs as well.
 
 ### Max Resolution
 
@@ -273,6 +279,93 @@ page uses a Tailscale-issued Let's Encrypt certificate — make sure
 **HTTPS Certificates** are enabled at
 <https://login.tailscale.com/admin/dns> before connecting for the
 first time.
+
+## Who can connect
+
+Being on the tailnet is not enough. By default the daemon admits only
+devices owned by **the tailnet user who owns the ghostframe node**: the
+user who logged it in, or the user who created the auth key it was
+registered with. That is every device of that user — including any node
+someone else registers with a key that user created, so do not leave a
+reusable key lying around. Every other peer is refused, both by the QUIC listener (before any
+session exists) and by the web server, which answers `403` and never hands
+out the certificate hash. Refusals are logged at INFO, once a minute per
+peer, with the peer's address, login name and the reason:
+
+```bash
+journalctl _UID=$(id -u <user>) --no-pager | grep 'refused tailnet peer'
+```
+
+The owner is matched by Tailscale's stable user ID, not by name.
+
+The check is made when a connection opens. A session already connected is
+not re-checked, and the owner is read once at startup: after changing who
+owns or tags the node, or `GHOSTFRAME_ALLOWED_USERS`, restart the daemon.
+
+### Adding users
+
+`GHOSTFRAME_ALLOWED_USERS` adds users and tags to the owner — it never
+replaces the owner, and there is no value that admits everyone. It is a
+comma-separated list of tailnet login names and ACL tags:
+
+```
+GHOSTFRAME_ALLOWED_USERS=alice@example.com,bob@github,tag:ops
+```
+
+Login names are matched exactly, as the refusal log prints them. A tag
+admits devices carrying it; a tagged device is identified by its tags only,
+never by the user behind it. Set it with a drop-in for the daemon's
+**user** unit (`<user>` is the account `install.sh` was run for; a drop-in
+under `/etc/systemd/system/` has no effect on a user unit), then restart
+the daemon:
+
+```bash
+sudo mkdir -p ~<user>/.config/systemd/user/ghostframe-xdaemon.service.d
+sudo tee ~<user>/.config/systemd/user/ghostframe-xdaemon.service.d/allowed-users.conf <<'CONF'
+[Service]
+Environment=GHOSTFRAME_ALLOWED_USERS=alice@example.com,tag:ops
+CONF
+sudo chown -R <user>: ~<user>/.config/systemd/user/ghostframe-xdaemon.service.d
+sudo machinectl shell <user>@ /usr/bin/systemctl --user daemon-reload
+sudo machinectl shell <user>@ /usr/bin/systemctl --user restart ghostframe-xdaemon.service
+```
+
+The startup log names the owner and the list in effect. A malformed entry
+is ignored with a warning.
+
+### Tagged nodes have no owner
+
+If the node was registered with a **tagged** auth key, Tailscale gives it
+no owning user. The daemon then admits only what `GHOSTFRAME_ALLOWED_USERS`
+lists — with an empty list, nobody — and says so with a warning at
+startup. Either register the node with an untagged key, or list the users
+and tags that may connect. For several ghostframe hosts this is the
+tighter setup: register them with one tagged key and list yourself, so a
+leaked key admits nothing.
+
+### Restrict the node in your tailnet policy too
+
+The daemon's check is the access boundary, but nothing else on the tailnet
+needs to reach the node at all. A policy grant limiting it to its users and
+its three ports keeps everyone else from even probing it (`ghostframe` here
+is a [host alias](https://tailscale.com/kb/1337/acl-syntax#hosts) for the
+node's tailnet IP):
+
+```json
+{
+  "hosts": { "ghostframe": "100.101.102.103" },
+  "grants": [
+    {
+      "src": ["alice@example.com"],
+      "dst": ["ghostframe"],
+      "ip":  ["udp:443", "tcp:443", "tcp:80"]
+    }
+  ]
+}
+```
+
+UDP 443 carries the session (QUIC); TCP 443 serves the browser client and
+TCP 80 redirects to it and serves `/config.json` to the native client.
 
 ## Native client
 
