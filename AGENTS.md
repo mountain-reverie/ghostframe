@@ -93,7 +93,10 @@ because per-crate test runs never touch it.
 
 ## Reading a live session
 
-The daemon logs to the journal; its default filter is `ghostframe=debug,info`.
+The daemon logs to the journal; its default filter is `ghostframe=info`
+(`ghostframe-xdaemon/src/main.rs`). `RUST_LOG=ghostframe=debug` turns DEBUG on;
+the e2e harness runs at `ghostframe=trace,debug`, so a DEBUG-only cost shows up
+in e2e and not in a stock deploy.
 
 ```bash
 journalctl _UID=$(id -u <user>) --since "-10min" --no-pager
