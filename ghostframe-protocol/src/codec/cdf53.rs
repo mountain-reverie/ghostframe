@@ -1257,6 +1257,12 @@ mod tests_passes {
     }
 }
 
+/// The most bytes one CDF 5/3 pass payload can take, whatever the pixels: three
+/// channels of `[u16 len][RLE plane]`, an RLE plane at most twice its 128 bytes
+/// (a literal `0x7F` or `0x80..=0xFF` costs a 2-byte escape), plus the 2-byte
+/// `present_passes` prefix on pass 0. Reached exactly by an all-ones plane.
+pub const MAX_PASS_PAYLOAD: usize = 3 * (2 + 2 * (CDF53_COEFFS_PER_CHANNEL / 8)) + 2;
+
 /// How large can one pass payload get? This decides whether a tile datagram
 /// can ever need fragmenting once the Raw codec (4096 B) is gone.
 ///
@@ -1268,9 +1274,6 @@ mod tests_passes {
 #[cfg(test)]
 mod tests_pass_size_bound {
     use super::*;
-
-    /// The proven ceiling on one pass payload, in bytes.
-    const MAX_PASS_PAYLOAD: usize = 3 * (2 + 2 * BIT_PLANE_BYTES_PER_CHANNEL) + 2;
 
     /// The smallest tile fragment payload the server can be handed: a 1200 B
     /// QUIC datagram less the 2 B WebTransport varint and the 24 B tile

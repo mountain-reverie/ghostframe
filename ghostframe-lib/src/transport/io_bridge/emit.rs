@@ -633,7 +633,21 @@ impl IoBridge {
             Option<crate::transport::reliable_emitter::cache::ProbeTag>,
         )> = Vec::with_capacity(drained.len());
         for work in drained {
-            let datagrams = fragment_tile(
+            // A tile pass is one datagram: no payload exceeds `MAX_TILE_PAYLOAD`
+            // and frame dispatch refuses a path too small for that, so this
+            // check is a backstop for a caller that skipped it.
+            if work.payload.len() > max_frag {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    payload = work.payload.len(),
+                    max_frag,
+                    tile_x = work.tile_x,
+                    tile_y = work.tile_y,
+                    "tile payload does not fit one datagram; tile not sent"
+                );
+                continue;
+            }
+            let datagrams = vec![encode_tile_datagram(
                 &TileFragmentInputs {
                     frame_seq: frame_seq_with_flag,
                     tile_x: work.tile_x,
@@ -644,8 +658,7 @@ impl IoBridge {
                     timestamp_us,
                 },
                 &work.payload,
-                max_frag,
-            );
+            )];
             // Record fragment coverage: one record per tile-pass (not per
             // fragment), keyed (frame_seq, tile, pass). It is kept
             // alongside the retransmit cache on purpose, not as a

@@ -123,6 +123,14 @@
 #define CDF53_TOTAL_COEFFS (CDF53_CHANNELS * CDF53_COEFFS_PER_CHANNEL)
 
 /**
+ * The most bytes one CDF 5/3 pass payload can take, whatever the pixels: three
+ * channels of `[u16 len][RLE plane]`, an RLE plane at most twice its 128 bytes
+ * (a literal `0x7F` or `0x80..=0xFF` costs a 2-byte escape), plus the 2-byte
+ * `present_passes` prefix on pass 0. Reached exactly by an all-ones plane.
+ */
+#define MAX_PASS_PAYLOAD ((3 * (2 + (2 * (CDF53_COEFFS_PER_CHANNEL / 8)))) + 2)
+
+/**
  * Maximum colors in a PalRLE palette. Tiles with more unique colors fall
  * through the classifier to Cdf53.
  */
@@ -132,6 +140,16 @@
  * Persistent palette table capacity.
  */
 #define PALETTE_TABLE_SLOTS 256
+
+/**
+ * The most bytes one PalRle payload can take, whatever the tile: flags and
+ * palette id (2), the bundled palette's count byte (1) and `MAX_PALETTE_COUNT`
+ * BGRA colours, and the nibble-RLE of the 1024 indices at its worst, one byte
+ * per pixel when no two neighbours match. (The `indices_raw` variant is 514
+ * bytes, so the RLE form is the larger.) Reached exactly by a tile whose
+ * indices alternate every pixel.
+ */
+#define MAX_PAL_RLE_PAYLOAD (((2 + 1) + (MAX_PALETTE_COUNT * 4)) + 1024)
 
 /**
  * Sentinel tile coordinates marking an eviction notice. Distinct from
