@@ -48,8 +48,9 @@ Metric definitions are in the module docs of
 ```bash
 export CARGO_BUILD_JOBS=4 TMPDIR=$PWD/target/tmp
 # The container image bundles the test pattern: rebuild after changing it, and
-# hold the host lock for build AND run together (image/container names are global).
-flock /home/cedric/work/.gf-heavy.lock bash -c '
+# hold a host-wide lock for build AND run together (image/container names are
+# global). GF_HEAVY_LOCK is any lock file every checkout on the host shares.
+flock "$GF_HEAVY_LOCK" bash -c '
   just containers-build &&
   cargo run --release -p ghostframe-e2e --example scroll_scene -- \
      run --label scroll_10 --mbps 10 --rows 3 --n 3 --out /tmp/scroll.jsonl &&

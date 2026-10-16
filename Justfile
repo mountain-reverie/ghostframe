@@ -111,6 +111,8 @@ ci-client: build-client
     just fmt-check
     @echo "=== env reads only in config.rs ==="
     ci/check-env-reads.sh
+    @echo "=== no home-directory paths in tracked files ==="
+    ci/check-local-paths.sh
     @echo "=== clippy + unit tests (native client) ==="
     just test-client
     @echo "=== cbindgen header up-to-date ==="
@@ -204,6 +206,8 @@ ci-local:
     just fmt-check
     @echo "=== env reads only in config.rs ==="
     ci/check-env-reads.sh
+    @echo "=== no home-directory paths in tracked files ==="
+    ci/check-local-paths.sh
     @echo "=== clippy ==="
     cargo clippy --workspace --all-targets -- -D warnings
     cargo clippy -p ghostframe-lib --all-targets --features cdf53-diag -- -D warnings
