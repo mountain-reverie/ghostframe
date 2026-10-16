@@ -208,6 +208,55 @@ any `ghostframe-client-*` crate reads `std::env` anywhere else. Other crates
 (xdaemon, test-pattern, the Go bridge) have not been converted yet and read
 their variables at the point of use.
 
+## Tailnet peer access
+
+Who may connect is decided in one place, `ghostframe-lib/src/transport/peer_auth.rs`
+(`AccessPolicy::decide`, a pure function). The user-facing behaviour is in the
+README's [Who can connect](README.md#who-can-connect). The split:
+
+- **ghostbridge (Go) only identifies.** `gbridge_whois` and
+  `gbridge_self_identity` wrap tsnet's `LocalClient().WhoIs` and
+  `StatusWithoutPeers`; `ghostframe-tsnet` exposes them typed. The web
+  server's middleware asks a Rust callback (`gbridge_set_peer_authorizer`)
+  for every request, so there is no Go copy of the rule. With no callback
+  registered, it refuses everyone.
+- **QUIC** is checked at quinn's `Incoming`, before any `Connection` exists.
+  A cache miss holds the Initial while WhoIs runs on a blocking thread, then
+  admits or refuses it from the `IoBridge` loop. Decisions are cached per
+  peer IP (allow 30 s, deny 5 s).
+- **Fail closed.** `QuicServer::new()` refuses everyone until a gate is
+  installed. `IoBridge::new` installs the WhoIs gate, and refuses to start if
+  the node cannot report its own identity. There is no switch to disable the
+  check, in any build: note that `just build-release` builds the whole
+  workspace, so features such as `browserless-harness` are compiled into a
+  release daemon through feature unification. A test-only feature is not a
+  safe place for a bypass.
+- **Tests without a tailnet** (unit tests, the browserless harness,
+  `ghostframe-client-net`'s handshake tests) still go through the gate and
+  `decide()`, over an in-memory identity table that reports every peer as
+  the owner (`PeerGate::single_owner_for_tests`, or `PeerGate::new` with a
+  fixed `PeerIdentitySource`). That is admit-all in effect, so be precise
+  about what holds: no environment variable, flag or config value reaches
+  it, and only the test constructors install it. The library API itself
+  (`QuicServer::set_peer_gate`, `PeerIdentitySource`) is public, so an
+  embedder that supplies its own identity source owns that decision.
+- **Bounds.** Held Initials: 32 in total, 4 per peer IP. Lookups in flight:
+  64. Decision cache: 4096 entries. Refusal log: one line per peer per
+  minute and at most 32 lines a minute overall, with a summary of the rest.
+  A peer that can send from many addresses (an approved subnet router)
+  therefore costs bounded work.
+- **Not re-checked.** The decision is made when a connection opens; a live
+  session is not re-evaluated when its cache entry expires, and the owner
+  is read once at startup. Cache entries are keyed by IP, so a node deleted
+  and its IP reassigned within the 30 s allow TTL would inherit the entry.
+- **e2e.** The server and the test client both register under the headscale
+  user `ghostframe` (`SERVER_HEADSCALE_USER`), so the owner rule admits every
+  existing test. `setup_e2e_server_as` registers the client under another
+  user; the `e2e_tailnet_*` tests use it to check refusal, admission, and
+  `GHOSTFRAME_ALLOWED_USERS`. A new e2e helper that creates its own preauth
+  key for the client must use the server's user, or the server will refuse
+  it.
+
 ## Lint and format
 
 ```bash
