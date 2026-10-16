@@ -299,6 +299,14 @@ pub fn encode_pal_rle_indices(packed_indices: &[u8; 512]) -> Vec<u8> {
     out
 }
 
+/// The most bytes one PalRle payload can take, whatever the tile: flags and
+/// palette id (2), the bundled palette's count byte (1) and `MAX_PALETTE_COUNT`
+/// BGRA colours, and the nibble-RLE of the 1024 indices at its worst, one byte
+/// per pixel when no two neighbours match. (The `indices_raw` variant is 514
+/// bytes, so the RLE form is the larger.) Reached exactly by a tile whose
+/// indices alternate every pixel.
+pub const MAX_PAL_RLE_PAYLOAD: usize = 2 + 1 + MAX_PALETTE_COUNT * 4 + 1024;
+
 /// Build the full PalRle wire payload: flags + palette_id +
 /// optional bundled palette block + nibble-packed RLE bytes.
 pub fn encode_pal_rle_payload(
@@ -512,3 +520,56 @@ pub enum PalRleDecodeError {
 #[cfg(test)]
 #[path = "pal_rle_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod tests_payload_size_bound {
+    use super::*;
+
+    fn palette16() -> PaletteEntry {
+        let mut colors = [[0u8; 4]; MAX_PALETTE_COUNT];
+        for (i, c) in colors.iter_mut().enumerate() {
+            *c = [i as u8, 0x10 + i as u8, 0x20 + i as u8, 255];
+        }
+        PaletteEntry {
+            count: MAX_PALETTE_COUNT as u8,
+            colors,
+        }
+    }
+
+    /// Indices alternate 0,1,0,1...: no two neighbours match, so every pixel
+    /// is its own RLE byte, the form's worst case.
+    fn alternating() -> [u8; 512] {
+        [0x10; 512]
+    }
+
+    #[test]
+    fn the_worst_bundled_tile_reaches_the_ceiling_exactly() {
+        let p = encode_pal_rle_payload(&alternating(), &palette16(), 3, true);
+        assert_eq!(p.len(), MAX_PAL_RLE_PAYLOAD);
+    }
+
+    #[test]
+    fn thin_and_indices_raw_forms_are_smaller() {
+        assert!(
+            encode_pal_rle_payload(&alternating(), &palette16(), 3, false).len()
+                < MAX_PAL_RLE_PAYLOAD
+        );
+        assert!(encode_pal_rle_payload_indices_raw(&alternating(), 3).len() < MAX_PAL_RLE_PAYLOAD);
+    }
+
+    #[test]
+    fn no_tile_exceeds_the_ceiling() {
+        use proptest::prelude::*;
+        proptest!(ProptestConfig::with_cases(500), |(
+            idx in proptest::collection::vec(any::<u8>(), 512),
+            count in 1usize..=MAX_PALETTE_COUNT,
+        )| {
+            let mut packed = [0u8; 512];
+            packed.copy_from_slice(&idx);
+            let mut pal = palette16();
+            pal.count = count as u8;
+            let p = encode_pal_rle_payload(&packed, &pal, 7, true);
+            prop_assert!(p.len() <= MAX_PAL_RLE_PAYLOAD);
+        });
+    }
+}

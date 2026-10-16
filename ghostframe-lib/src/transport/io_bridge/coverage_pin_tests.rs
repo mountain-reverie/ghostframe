@@ -162,30 +162,41 @@ fn refs(b: &IoBridge) -> u32 {
 
 // ---- a live acknowledgement ----
 
-/// A Cdf53 pass spans several datagrams; each is acknowledged under its own
-/// `wire_seq`. The pass is delivered once, however many of its datagrams
-/// come back, and the first one is the one that counts.
+/// A tile pass is one datagram. A payload that does not fit the path's datagram
+/// size is not split: it is not sent at all (frame dispatch refuses such a path
+/// first; this is the backstop), and one that fits goes out as exactly one.
 #[tokio::test(start_paused = true)]
-async fn a_multi_datagram_cdf53_pass_is_acknowledged_once() {
+async fn a_tile_payload_larger_than_the_datagram_room_is_not_sent_and_one_that_fits_is_one_datagram(
+) {
     let mut b = bridge();
-    let (gen, sent) = emit_cdf53(&mut b, 10, 3000);
-    assert!(sent.len() >= 3, "precondition: the pass spans datagrams");
-    let all: Vec<u32> = sent.iter().map(|(w, _)| *w).collect();
-    let window_before = b.scheduler.delivery_window_acked_for_test();
-
-    ack(&mut b, &all);
-
-    assert_eq!(b.scheduler.cdf53_passes_acked_for_test(TX, TY, gen), 1);
-    assert_eq!(
-        b.scheduler.delivery_window_acked_for_test(),
-        window_before + 1,
-        "one pass, one delivery-window credit"
+    let gen = b.scheduler.bump_generation(TX, TY);
+    b.scheduler.enqueue_refinement_subset_at(
+        TX,
+        TY,
+        gen,
+        0b1,
+        vec![vec![0xCD; 200]],
+        super::now_std(),
     );
-    assert_eq!(b.reliable_emitter.stats.ack_hit, 1);
+    assert!(
+        drain(&mut b, 10, 100).is_empty(),
+        "200 bytes into 100: not sent"
+    );
+    assert!(!b.reliable_emitter.has_cache_entries_for_tile(TX, TY));
+
+    let gen = b.scheduler.bump_generation(TX, TY);
+    b.scheduler.enqueue_refinement_subset_at(
+        TX,
+        TY,
+        gen,
+        0b1,
+        vec![vec![0xCD; 200]],
+        super::now_std(),
+    );
     assert_eq!(
-        b.reliable_emitter.stats.ack_miss as usize,
-        all.len() - 1,
-        "the other datagrams find nothing left to release"
+        drain(&mut b, 11, 200).len(),
+        1,
+        "200 bytes into 200: one datagram"
     );
 }
 

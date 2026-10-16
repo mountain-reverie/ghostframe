@@ -8,9 +8,8 @@
 //! emitted events), so removing the guard it names makes it fail.
 
 use ghostframe_client_core::{
-    AssemblyStats, ClientConfig, ClientCore, Event, PollOutput, MAX_ASSEMBLY_BYTES,
-    MAX_FRAME_DIMENSION, MAX_FRAME_FRAGMENTS, MAX_H264_ACCESS_UNIT_BYTES, MAX_LIVE_ASSEMBLIES,
-    MAX_TILE_FRAGMENTS,
+    AssemblyStats, ClientConfig, ClientCore, Event, PollOutput, MAX_FRAME_DIMENSION,
+    MAX_FRAME_FRAGMENTS, MAX_H264_ACCESS_UNIT_BYTES,
 };
 use ghostframe_protocol::protocol::{
     build_frame_dimensions_datagram, fragment_frame, fragment_tile, Codec, TileFragmentInputs,
@@ -65,25 +64,45 @@ fn stats(core: &ClientCore) -> AssemblyStats {
 // P0-3: frag_total
 // ---------------------------------------------------------------------------
 
-#[test]
-fn tile_frag_total_above_cap_allocates_nothing() {
-    let mut core = test_core();
-    let mut dg = tile_dgs(1, 0, 0, 0, &[7u8; 64], 64).remove(0);
-    forge_frag_total(&mut dg, u16::MAX);
-    core.handle_datagram(&dg, 0);
-    assert_eq!(stats(&core).tile_assemblies, 0);
-    assert_eq!(stats(&core).tile_assembly_bytes, 0);
+/// A single Solid tile datagram that is complete on arrival.
+fn solid_dg(frame_seq: u32, x: u8, y: u8) -> Vec<u8> {
+    tile_dgs(frame_seq, x, y, 0, &[1, 2, 3, 255], 64).remove(0)
+}
 
-    forge_frag_total(&mut dg, MAX_TILE_FRAGMENTS + 1);
-    core.handle_datagram(&dg, 0);
-    assert_eq!(stats(&core).tile_assemblies, 0);
+fn tile_ready_count(evs: &[Event]) -> usize {
+    evs.iter()
+        .filter(|e| matches!(e, Event::TileReady { .. }))
+        .count()
 }
 
 #[test]
-fn tile_frag_total_fan_out_with_pinned_frame_seq_is_bounded() {
-    // The reported attack: pin frame_seq, vary the key, claim 65535 frags.
+fn a_tile_claiming_other_than_one_fragment_is_dropped_and_stores_nothing() {
+    // A tile pass is one datagram (no payload exceeds MAX_TILE_PAYLOAD), so any
+    // other fragment count is hostile or from a server that no longer exists.
     let mut core = test_core();
-    let base = tile_dgs(1, 0, 0, 0, &[7u8; 64], 64).remove(0);
+    // Positive control: the same datagram with frag_total 1 completes.
+    assert_eq!(
+        tile_ready_count(&core.handle_datagram(&solid_dg(1, 0, 0), 0)),
+        1
+    );
+    for total in [0u16, 2, 3, 64, 65, u16::MAX] {
+        let mut dg = solid_dg(2, 0, 0);
+        forge_frag_total(&mut dg, total);
+        let evs = core.handle_datagram(&dg, 0);
+        assert!(
+            evs.is_empty(),
+            "frag_total {total} must be dropped: {evs:?}"
+        );
+        assert_eq!(stats(&core).tile_assemblies, 0, "frag_total {total}");
+        assert_eq!(stats(&core).tile_assembly_bytes, 0, "frag_total {total}");
+    }
+}
+
+#[test]
+fn a_fan_out_of_multi_fragment_claims_with_a_pinned_frame_seq_stores_nothing() {
+    // Pin frame_seq, vary the key, claim 65535 fragments.
+    let mut core = test_core();
+    let base = solid_dg(1, 0, 0);
     for i in 0..5000u32 {
         let mut dg = base.clone();
         dg[16] = (i % 200) as u8; // tile_x
@@ -95,23 +114,23 @@ fn tile_frag_total_fan_out_with_pinned_frame_seq_is_bounded() {
 }
 
 #[test]
-fn tile_with_the_maximum_fragment_count_still_assembles() {
+fn the_largest_cdf53_pass_is_one_datagram_and_completes() {
+    // MAX_PASS_PAYLOAD (776 bytes): every plane byte is 0xFF, so each costs the
+    // 2-byte escape; pass 0 also carries the 2-byte present_passes prefix.
     let mut core = test_core();
-    // A valid CDF 5/3 pass 0 payload cut into exactly MAX_TILE_FRAGMENTS
-    // fragments. Each channel's plane is 17 escaped literals (2 bytes each)
-    // plus 111 plain ones, so the payload is 2 + 3 * (2 + 145) = 443 bytes
-    // and 7-byte fragments make exactly 64.
-    let mut payload = vec![0x00, 0x01]; // present_passes = pass 0 only
+    let mut payload = vec![0x00, 0x01];
     for _ in 0..3 {
         let mut plane = Vec::new();
-        for _ in 0..17 {
+        for _ in 0..128 {
             plane.extend_from_slice(&[0x7F, 0xFF]);
         }
-        plane.extend(std::iter::repeat_n(0x01u8, 111));
         payload.extend_from_slice(&(plane.len() as u16).to_be_bytes());
         payload.extend_from_slice(&plane);
     }
-    assert_eq!(payload.len(), 443);
+    assert_eq!(
+        payload.len(),
+        ghostframe_protocol::codec::cdf53::MAX_PASS_PAYLOAD
+    );
     let dgs = fragment_tile(
         &TileFragmentInputs {
             frame_seq: 1 | TILE_DATAGRAM_FLAG,
@@ -123,13 +142,10 @@ fn tile_with_the_maximum_fragment_count_still_assembles() {
             timestamp_us: 0,
         },
         &payload,
-        7,
+        ghostframe_protocol::protocol::MAX_TILE_PAYLOAD,
     );
-    assert_eq!(dgs.len(), MAX_TILE_FRAGMENTS as usize);
-    let mut evs = Vec::new();
-    for dg in &dgs {
-        evs.extend(core.handle_datagram(dg, 0));
-    }
+    assert_eq!(dgs.len(), 1, "it must not need fragmenting");
+    let evs = core.handle_datagram(&dgs[0], 0);
     assert!(
         evs.iter().any(|e| matches!(
             e,
@@ -139,48 +155,8 @@ fn tile_with_the_maximum_fragment_count_still_assembles() {
                 ..
             }
         )),
-        "a legitimate 64-fragment tile must complete: {evs:?}"
+        "the largest pass must complete: {evs:?}"
     );
-    assert_eq!(stats(&core).tile_assemblies, 0);
-}
-
-#[test]
-fn assembly_budget_bounds_a_valid_looking_fan_out() {
-    // Every datagram is individually legal (frag_total at the cap); only the
-    // sum is the attack. Pinned frame_seq, so the stale sweep never helps.
-    let mut core = test_core();
-    let base = tile_dgs(1, 0, 0, 0, &[7u8; 64], 64).remove(0);
-    let mut sent = 0u32;
-    'outer: for y in 0..=253u8 {
-        for x in 0..=253u8 {
-            for pass in 0..16u8 {
-                let mut dg = base.clone();
-                dg[16] = x;
-                dg[17] = y;
-                dg[19] = (dg[19] & 0xF0) | pass; // pass in the low nibble
-                forge_frag_total(&mut dg, MAX_TILE_FRAGMENTS);
-                core.handle_datagram(&dg, 0);
-                sent += 1;
-                if sent >= 80_000 {
-                    break 'outer;
-                }
-            }
-        }
-    }
-    let s = stats(&core);
-    assert!(s.tile_assemblies > 1000, "test must actually fill: {s:?}");
-    assert!(
-        s.tile_assembly_bytes <= MAX_ASSEMBLY_BYTES,
-        "budget exceeded: {s:?}"
-    );
-    assert!(
-        s.tile_assemblies < sent as usize,
-        "some datagrams must have been refused: {s:?}"
-    );
-    // Independent of the counter the guard compares: no fan-out of
-    // frag_total=64 assemblies can exceed what the budget could pay for.
-    assert!(s.tile_assemblies <= MAX_ASSEMBLY_BYTES / (512 + 64 * 40));
-    assert!(s.tile_assemblies <= MAX_LIVE_ASSEMBLIES);
 }
 
 /// True if the core queues any ACK datagram after `handle_datagram` calls.
@@ -202,117 +178,18 @@ fn accepted_tile_is_acked_but_refused_ones_are_not() {
     core.handle_datagram(&tile_dgs(1, 0, 0, 0, &[1u8; 64], 64)[0], 0);
     assert!(acked(&mut core), "control: an accepted tile must be ACKed");
 
-    // Over the fragment cap, off the grid: refused before the ACK, so the
+    // More than one fragment, off the grid: refused before the ACK, so the
     // server retransmits instead of counting them delivered.
     let mut core = test_core();
     let mut dg = tile_dgs(1, 0, 0, 0, &[1u8; 64], 64).remove(0);
-    forge_frag_total(&mut dg, MAX_TILE_FRAGMENTS + 1);
+    forge_frag_total(&mut dg, 2);
     core.handle_datagram(&dg, 0);
-    assert!(!acked(&mut core), "over-cap fragment ACKed");
+    assert!(!acked(&mut core), "multi-fragment tile ACKed");
 
     let mut core = test_core();
     dims_events(&mut core, 640, 480);
     core.handle_datagram(&tile_dgs(1, 30, 0, 0, &[1u8; 64], 64)[0], 0);
     assert!(!acked(&mut core), "off-grid tile ACKed");
-}
-
-#[test]
-fn a_fragment_refused_for_budget_is_not_acked() {
-    let mut core = test_core();
-    let base = tile_dgs(1, 0, 0, 0, &[7u8; 64], 64).remove(0);
-    let mut sent = 0u32;
-    'outer: for y in 0..=253u8 {
-        for x in 0..=253u8 {
-            let mut dg = base.clone();
-            dg[16] = x;
-            dg[17] = y;
-            forge_frag_total(&mut dg, MAX_TILE_FRAGMENTS);
-            core.handle_datagram(&dg, 0);
-            sent += 1;
-            if core.assembly_stats().tile_assemblies >= MAX_LIVE_ASSEMBLIES || sent > 200_000 {
-                break 'outer;
-            }
-        }
-    }
-    acked(&mut core); // drain
-                      // Full to the count cap (or the byte cap): a new key is refused, unACKed.
-    let s = stats(&core);
-    assert!(s.tile_assemblies > 1000, "must be full: {s:?}");
-    let mut dg = base.clone();
-    dg[16] = 253;
-    dg[17] = 253;
-    dg[19] |= 0x0F; // a pass nobody used yet
-    forge_frag_total(&mut dg, MAX_TILE_FRAGMENTS);
-    let before = stats(&core);
-    core.handle_datagram(&dg, 0);
-    assert_eq!(
-        stats(&core).tile_assemblies,
-        before.tile_assemblies,
-        "a full core must refuse a new assembly"
-    );
-    assert!(!acked(&mut core), "refused fragment was ACKed");
-}
-
-#[test]
-fn budget_returns_to_zero_on_completion_and_on_stale_sweep() {
-    let mut core = test_core();
-    // Completion.
-    for dg in tile_dgs(1, 2, 2, 0, &[5u8; 4096], 1176) {
-        core.handle_datagram(&dg, 0);
-    }
-    assert_eq!(stats(&core).tile_assembly_bytes, 0);
-    assert_eq!(stats(&core).tile_assemblies, 0);
-
-    // Strand some, then let the frame window move past them.
-    for i in 0..10u8 {
-        let dgs = tile_dgs(2, i, 0, 0, &[5u8; 4096], 1176);
-        core.handle_datagram(&dgs[0], 0);
-    }
-    assert!(stats(&core).tile_assembly_bytes > 0);
-    core.handle_datagram(&tile_dgs(20, 0, 5, 0, &[5u8; 64], 64)[0], 0);
-    let s = stats(&core);
-    assert_eq!(s.tile_assemblies, 0, "{s:?}");
-    assert_eq!(s.tile_assembly_bytes, 0, "{s:?}");
-}
-
-/// The stale sweep only runs when the threshold moves or something stale was
-/// stored. A fragment of an already-stale frame arriving after the window has
-/// settled must still be reclaimed by the next datagram, not linger.
-#[test]
-fn a_late_fragment_of_a_stale_frame_is_swept_without_the_window_moving() {
-    let mut core = test_core();
-    core.handle_datagram(&tile_dgs(20, 0, 5, 0, &[5u8; 64], 64)[0], 0);
-    // Window has settled at frame 20; frame 2 is stale. It is stored...
-    let late = tile_dgs(2, 1, 1, 0, &[5u8; 4096], 1176);
-    core.handle_datagram(&late[0], 0);
-    assert_eq!(stats(&core).tile_assemblies, 1, "{:?}", stats(&core));
-    // ...and the next datagram, same frame as the settled window, sweeps it.
-    core.handle_datagram(&tile_dgs(20, 0, 6, 0, &[5u8; 64], 64)[0], 0);
-    let s = stats(&core);
-    assert_eq!(s.tile_assemblies, 0, "{s:?}");
-    assert_eq!(s.tile_assembly_bytes, 0, "{s:?}");
-}
-
-#[test]
-fn a_full_4k_dual_screen_frame_of_one_short_tiles_fits_the_budget() {
-    // Largest legitimate in-flight load: every tile of a 2 x 3840x2160
-    // frame (~16k tiles) has 3 of its 4 fragments and is waiting on the 4th.
-    let mut core = test_core();
-    dims_events(&mut core, 7680, 2160);
-    let (gw, gh) = (240u32, 68u32); // 7680x2160 side by side
-    let payload = vec![9u8; 4096];
-    let mut live = 0;
-    for ty in 0..gh {
-        for tx in 0..gw {
-            let dgs = tile_dgs(5, tx as u8, ty as u8, 0, &payload, 1176);
-            assert_eq!(dgs.len(), 4);
-            for dg in &dgs[..3] {
-                core.handle_datagram(dg, 0);
-            }
-            live += 1;
-        }
-    }
-    assert_eq!(stats(&core).tile_assemblies, live);
 }
 
 #[test]
@@ -445,38 +322,14 @@ fn tiles_outside_the_grid_are_refused_and_edge_tiles_are_not() {
     assert_eq!(dims_events(&mut core, 650, 490).len(), 1);
 
     for (x, y) in [(21u8, 0u8), (0, 16), (200, 200), (253, 253)] {
-        let dgs = tile_dgs(2, x, y, 0, &[1u8; 128], 64);
-        core.handle_datagram(&dgs[0], 0);
-        assert_eq!(stats(&core).tile_assemblies, 0, "({x},{y}) is off the grid");
+        let evs = core.handle_datagram(&solid_dg(2, x, y), 0);
+        assert_eq!(tile_ready_count(&evs), 0, "({x},{y}) is off the grid");
     }
     // The last row/column are partial tiles but legitimate.
     for (x, y) in [(20u8, 15u8), (0, 0), (20, 0), (0, 15)] {
-        let dgs = tile_dgs(2, x, y, 0, &[1u8; 128], 64);
-        core.handle_datagram(&dgs[0], 0);
-        assert_eq!(stats(&core).tile_assemblies, 1, "({x},{y}) is on the grid");
-        for dg in &dgs[1..] {
-            core.handle_datagram(dg, 0);
-        }
-        assert_eq!(stats(&core).tile_assemblies, 0, "({x},{y}) completes");
+        let evs = core.handle_datagram(&solid_dg(2, x, y), 0);
+        assert_eq!(tile_ready_count(&evs), 1, "({x},{y}) is on the grid");
     }
-}
-
-#[test]
-fn a_tile_that_falls_off_a_shrunk_grid_mid_assembly_is_not_delivered() {
-    let mut core = test_core();
-    dims_events(&mut core, 1280, 720);
-    let dgs = tile_dgs(2, 30, 10, 0, &[1u8; 128], 64);
-    assert_eq!(dgs.len(), 2);
-    core.handle_datagram(&dgs[0], 0);
-    dims_events(&mut core, 640, 480); // 20x15: tile (30,10) is gone
-                                      // The stranded assembly is purged at once, with its budget.
-    assert_eq!(stats(&core).tile_assemblies, 0);
-    assert_eq!(stats(&core).tile_assembly_bytes, 0);
-    let evs = core.handle_datagram(&dgs[1], 0);
-    assert!(
-        !evs.iter().any(|e| matches!(e, Event::TileReady { .. })),
-        "tile outside the new grid must not reach a renderer: {evs:?}"
-    );
 }
 
 #[test]
@@ -484,35 +337,6 @@ fn before_any_dimensions_tiles_are_not_refused() {
     // The dimensions datagram is unreliable; tiles that beat it must not be
     // treated as hostile.
     let mut core = test_core();
-    let dgs = tile_dgs(2, 100, 60, 0, &[1u8; 128], 64);
-    core.handle_datagram(&dgs[0], 0);
-    assert_eq!(stats(&core).tile_assemblies, 1);
-}
-
-// ---------------------------------------------------------------------------
-// Legacy fragment parity store
-// ---------------------------------------------------------------------------
-
-#[test]
-fn fragment_parity_keys_are_bounded_and_swept_with_the_window() {
-    let mut core = test_core();
-    let base = tile_dgs(10, 0, 0, 0, &[7u8; 64], 64).remove(0);
-    // A parity datagram (frag_idx >= frag_total) with a valid 3-byte header.
-    let mut parity = base.clone();
-    forge_frag_total(&mut parity, 4);
-    forge_frag_idx(&mut parity, 4);
-    for i in 0..9000u32 {
-        let mut dg = parity.clone();
-        dg[16] = (i % 200) as u8;
-        dg[17] = ((i / 200) % 200) as u8;
-        core.handle_datagram(&dg, 0);
-    }
-    let n = stats(&core).fragment_parity_keys;
-    assert!(n > 100, "test must actually store parity: {n}");
-    assert!(n <= ghostframe_client_core::fragment_parity::MAX_PARITY_KEYS);
-
-    // Advancing the frame window sweeps parity that has no assembly.
-    let newer = tile_dgs(50, 1, 1, 0, &[7u8; 64], 64).remove(0);
-    core.handle_datagram(&newer, 0);
-    assert_eq!(stats(&core).fragment_parity_keys, 0);
+    let evs = core.handle_datagram(&solid_dg(2, 100, 60), 0);
+    assert_eq!(tile_ready_count(&evs), 1);
 }

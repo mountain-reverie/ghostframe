@@ -1061,7 +1061,19 @@ impl IoBridge {
             }
             FrameMode::TileCodec => {
                 let max_frag = max_fragment_payload(max_dg_size);
-                if max_frag == 0 {
+                if max_frag < MAX_TILE_PAYLOAD {
+                    // A tile pass is one datagram, so the path has to carry the
+                    // largest tile payload. QUIC's floor does (1136 bytes of
+                    // payload against 1091), so this is an error, not a mode.
+                    // The GPU baseline has moved on, so ask for the frame's
+                    // dirty tiles again once the path allows it.
+                    tracing::error!(
+                        target: LOG_TARGET,
+                        max_frag,
+                        needed = MAX_TILE_PAYLOAD,
+                        "path datagram size is below the tile payload ceiling; tile frame dropped"
+                    );
+                    self.ensure_baseline_invalidated();
                     self.emit_frame_dimensions(seq, meta.timestamp_us, meta.width, meta.height);
                     self.send_finish(
                         inflight,
