@@ -464,6 +464,51 @@ impl DiagnosticsConfig {
     }
 }
 
+/// Who, besides this node's owner, may connect. From
+/// `GHOSTFRAME_ALLOWED_USERS`, a comma-separated list of tailnet login names
+/// (`alice@example.com`) and ACL tags (`tag:ops`).
+///
+/// The list only ever ADDS: the user who owns this node is always admitted
+/// (see `transport::peer_auth`), and an empty or unset list means "the owner
+/// only". There is deliberately no value that admits everyone.
+///
+/// **Wired.** `IoBridge::new` builds the `AccessPolicy` from it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccessConfig {
+    /// Login names, matched exactly (case-sensitive) against the peer
+    /// node's owning user. Never consulted for a tagged peer.
+    pub allowed_logins: Vec<String>,
+    /// ACL tags, each including its `tag:` prefix, matched exactly.
+    pub allowed_tags: Vec<String>,
+    /// Entries that were not valid and were dropped. Kept so startup can
+    /// name them: a typo here silently locks a user out otherwise.
+    pub rejected: Vec<String>,
+}
+
+impl AccessConfig {
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let mut cfg = Self::default();
+        let Some(raw) = get("GHOSTFRAME_ALLOWED_USERS") else {
+            return cfg;
+        };
+        for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let well_formed = !entry.chars().any(|c| c.is_whitespace() || c.is_control());
+            match entry.strip_prefix("tag:") {
+                Some(name) if well_formed && !name.is_empty() => {
+                    cfg.allowed_tags.push(entry.to_owned());
+                }
+                None if well_formed => cfg.allowed_logins.push(entry.to_owned()),
+                _ => cfg.rejected.push(entry.to_owned()),
+            }
+        }
+        cfg
+    }
+
+    pub fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+}
+
 /// Not `Clone`: `transport` carries `TransportConfig`, which is not `Clone`
 /// (see its doc comment).
 #[derive(Debug, Default)]
@@ -471,6 +516,7 @@ pub struct LibConfig {
     pub classifier: ClassifierConfig,
     pub transport: TransportConfig,
     pub diagnostics: DiagnosticsConfig,
+    pub access: AccessConfig,
 }
 
 impl LibConfig {
@@ -483,6 +529,7 @@ impl LibConfig {
             classifier: ClassifierConfig::from_env(),
             transport: TransportConfig::from_env(),
             diagnostics: DiagnosticsConfig::from_env(),
+            access: AccessConfig::from_env(),
         }
     }
 }
@@ -696,6 +743,53 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    // -----------------------------------------------------------------
+    // AccessConfig (GHOSTFRAME_ALLOWED_USERS)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn allowed_users_unset_means_owner_only() {
+        assert_eq!(
+            AccessConfig::from_lookup(lookup(&[])),
+            AccessConfig::default()
+        );
+        assert_eq!(
+            AccessConfig::from_lookup(lookup(&[("GHOSTFRAME_ALLOWED_USERS", " , ,")])),
+            AccessConfig::default()
+        );
+    }
+
+    #[test]
+    fn allowed_users_splits_logins_from_tags() {
+        let c = AccessConfig::from_lookup(lookup(&[(
+            "GHOSTFRAME_ALLOWED_USERS",
+            "alice@example.com, tag:ops ,bob@github",
+        )]));
+        assert_eq!(c.allowed_logins, vec!["alice@example.com", "bob@github"]);
+        assert_eq!(c.allowed_tags, vec!["tag:ops"]);
+        assert!(c.rejected.is_empty());
+    }
+
+    #[test]
+    fn allowed_users_rejects_malformed_entries_by_name() {
+        let c = AccessConfig::from_lookup(lookup(&[(
+            "GHOSTFRAME_ALLOWED_USERS",
+            "tag:,al ice@example.com,ok@example.com,tag:a b",
+        )]));
+        assert_eq!(c.allowed_logins, vec!["ok@example.com"]);
+        assert!(c.allowed_tags.is_empty());
+        assert_eq!(c.rejected, vec!["tag:", "al ice@example.com", "tag:a b"]);
+    }
+
+    // There is no spelling that admits everyone: `*` is just a login name
+    // no user has.
+    #[test]
+    fn allowed_users_has_no_wildcard() {
+        let c = AccessConfig::from_lookup(lookup(&[("GHOSTFRAME_ALLOWED_USERS", "*,tag:*")]));
+        assert_eq!(c.allowed_logins, vec!["*"]);
+        assert_eq!(c.allowed_tags, vec!["tag:*"]);
     }
 
     // -----------------------------------------------------------------
