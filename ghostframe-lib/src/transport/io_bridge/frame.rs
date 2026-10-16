@@ -104,20 +104,32 @@ pub(crate) fn populate_gpu_metrics(
 /// Real-clock lap timer for the per-stage cost trace (`frame.stages`). It
 /// measures what the frame cost the thread, so it must not follow tokio's
 /// possibly paused clock; hence `std::time::Instant`, not `now_std()`.
-struct Lap(std::time::Instant);
+struct Lap(Option<std::time::Instant>);
 
 impl Lap {
-    fn new() -> Self {
-        Self(std::time::Instant::now())
+    /// `enabled == false` makes every lap a no-op returning 0, so a frame with
+    /// the trace off pays no clock reads.
+    fn new(enabled: bool) -> Self {
+        Self(enabled.then(std::time::Instant::now))
     }
 
-    /// Microseconds since the previous lap (or construction); restarts the lap.
-    fn lap(&mut self) -> u64 {
+    /// Nanoseconds since the previous lap (or construction); restarts the lap.
+    fn lap_ns(&mut self) -> u64 {
+        let Some(prev) = self.0 else { return 0 };
         let now = std::time::Instant::now();
-        let us = now.duration_since(self.0).as_micros() as u64;
-        self.0 = now;
-        us
+        self.0 = Some(now);
+        now.duration_since(prev).as_nanos() as u64
     }
+
+    /// Microseconds since the previous lap.
+    fn lap(&mut self) -> u64 {
+        self.lap_ns() / 1000
+    }
+}
+
+/// Whether the per-stage trace is wanted at all.
+fn stage_trace_enabled() -> bool {
+    tracing::enabled!(target: "ghostframe::io_bridge::diag", tracing::Level::TRACE)
 }
 
 /// Per-tile staging produced by Phase A, consumed by Phase B.
@@ -685,7 +697,7 @@ impl IoBridge {
         // (`process_frame`) enforces that invariant.
         let raw_fd = frame.dmabuf_fd.as_ref().map(|fd| fd.as_raw_fd());
 
-        let mut lap = Lap::new();
+        let mut lap = Lap::new(stage_trace_enabled());
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let seq = self.frame_seq;
 
@@ -1303,7 +1315,8 @@ impl IoBridge {
         seq: u32,
         max_frag: usize,
     ) {
-        let mut lap = Lap::new();
+        let trace_on = stage_trace_enabled();
+        let mut lap = Lap::new(trace_on);
         let grid = TileGrid::new(frame.width, frame.height);
 
         // Phase A — serial palette-table allocation per dirty PalRle-feasible tile.
@@ -1327,9 +1340,9 @@ impl IoBridge {
             .unwrap_or(false);
         let mut palrle_payloads =
             IoBridge::phase_b_encode_payloads_with_caps(&preps, &caps, inject);
-        let phase_b_us = lap.lap();
-        let (mut coef_read_us, mut coef_encode_us) = (0u64, 0u64);
-        let mut coef_lap = Lap::new();
+        let palrle_phase_b_us = lap.lap();
+        let (mut coef_read_ns, mut coef_encode_ns) = (0u64, 0u64);
+        let mut coef_lap = Lap::new(trace_on);
         #[cfg(any(test, feature = "test-loss-injection"))]
         if inject_will_fire {
             self.oob_inject_at = None;
@@ -1383,9 +1396,9 @@ impl IoBridge {
                             crate::encoder::cdf53::CDF53_TOTAL_COEFFS,
                         )
                     };
-                    coef_lap.lap();
+                    coef_lap.lap_ns();
                     let coeffs_i16: Vec<i16> = coeffs_i32.iter().map(|&v| v as i16).collect();
-                    coef_read_us += coef_lap.lap();
+                    coef_read_ns += coef_lap.lap_ns();
                     // M3.3b diagnostic: when GHOSTFRAME_CDF53_DIFF_TILE=X,Y is
                     // set, log a one-shot side-by-side comparison of GPU vs
                     // CPU `cdf53::forward(tile_bgra)` for that tile. Gated
@@ -1506,7 +1519,7 @@ impl IoBridge {
                     }
                     let (present_passes, passes) =
                         crate::encoder::cdf53::encode_passes_sparse(&coeffs_i16);
-                    coef_encode_us += coef_lap.lap();
+                    coef_encode_ns += coef_lap.lap_ns();
                     self.commit_tile_to_cdf53(
                         tile_x,
                         tile_y,
@@ -1569,12 +1582,12 @@ impl IoBridge {
                         crate::encoder::cdf53::CDF53_TOTAL_COEFFS,
                     )
                 };
-                coef_lap.lap();
+                coef_lap.lap_ns();
                 let coeffs_i16: Vec<i16> = coeffs_i32.iter().map(|&v| v as i16).collect();
-                coef_read_us += coef_lap.lap();
+                coef_read_ns += coef_lap.lap_ns();
                 let (present_passes, passes) =
                     crate::encoder::cdf53::encode_passes_sparse(&coeffs_i16);
-                coef_encode_us += coef_lap.lap();
+                coef_encode_ns += coef_lap.lap_ns();
                 if is_stranded {
                     self.stranded_reenqueue(tile_x, tile_y, codec_state, present_passes, passes);
                     continue;
@@ -1626,6 +1639,7 @@ impl IoBridge {
         // aggregate a reader actually wants -- codec counts and wire
         // bytes -- is on the `cumulative emit` line, which stays INFO
         // and fires once every 30 frames.
+        let cdf53_total_us = lap.lap();
         tracing::debug!(
             target: LOG_TARGET,
             frame_seq = seq,
@@ -1640,7 +1654,6 @@ impl IoBridge {
         // the frame cost the encode thread, which a paused tokio
         // clock would report as zero.
         let dispatch_started = std::time::Instant::now();
-        let cdf53_total_us = lap.lap();
         let stats = self.dispatch_dirty_tiles_via_scheduler(
             dirty_xy,
             &grid,
@@ -1659,12 +1672,14 @@ impl IoBridge {
         // RTO deadline has elapsed, then drain the resulting
         // queue (source + parity) to the wire. Cheap when nothing
         // is due (no cache hits, no parity ready).
-        let dispatch_us = lap.lap();
+        let sched_dispatch_us = lap.lap();
         self.sweep_rto_retransmits();
         let rto_us = lap.lap();
         tracing::trace!(
             target: "ghostframe::io_bridge::diag",
-            seq, phase_a_us, phase_b_us, cdf53_total_us, coef_read_us, coef_encode_us, dispatch_us, rto_us,
+            seq, phase_a_us, palrle_phase_b_us, cdf53_total_us,
+            coef_read_us = coef_read_ns / 1000, coef_encode_us = coef_encode_ns / 1000,
+            sched_dispatch_us, rto_us,
             "[BRIDGE] frame.tile_stages"
         );
 

@@ -1,16 +1,25 @@
 //! WS-C2 MEASUREMENT ONLY (not a gate): how long does `IoBridge::process_frame`
 //! hold the event loop, and how late is an inbound packet handled meanwhile?
 //!
-//! Real clock, real GPU (Vulkan compute; VA-API is NOT touched, so H.264
-//! frames bail at encoder init -- the NV12 conversion still runs). Run only
-//! through the GPU guard:
-//!   gf-gpu-run cargo test -p ghostframe-e2e \
-//!     --test c2_loop_stall_measure -- --ignored --nocapture --test-threads=1
+//! Real clock, real GPU (Vulkan compute). The client advertises no H.264, so
+//! the classifier stays in TileCodec and the VA-API encoder is never reached
+//! (H.264 encode cost is NOT measured here). Frames are CPU pixels
+//! (`process_frame_from_pixels`), so `gpu_us` includes a host->staging upload
+//! and `readback_us` is ~0; production's DMA-BUF path is the reverse. Built at
+//! the test profile (opt-level 1), so absolute CPU stages are pessimistic.
 //!
-//! Probe: a 1200-byte unsupported-version long-header packet from an unknown address makes
-//! quinn answer with Version Negotiation; the time from write to the reply is the
-//! loop's inbound turnaround. Probes are tagged "during encode" when they
-//! overlap a process_frame ENTER..EXIT window (from the diag trace events).
+//! One scene per process (global tracing subscriber). Run only through the GPU
+//! guard, by test name:
+//!   gf-gpu-run timeout 150 cargo test -p ghostframe-e2e \
+//!     --test c2_loop_stall_measure -- --ignored --nocapture c2_stall_1080p_small_dirty
+//!
+//! Probe: a 1200-byte unsupported-version long-header packet from an unknown
+//! address makes quinn answer with Version Negotiation whose SCID echoes the
+//! probe's DCID; the time from write to that reply is the loop's inbound
+//! turnaround. Probes are tagged "during encode" when they overlap a
+//! process_frame ENTER..EXIT window (from the diag trace events). Stage fields
+//! overlap (coef_* are inside cdf53_total; tile_stages is inside emit), do not
+//! sum across them.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -22,7 +31,9 @@ use ghostframe_lib::capture::gpu_pipeline::GpuFrameProcessor;
 use ghostframe_lib::transport::io_bridge::IoBridge;
 use ghostframe_lib::transport::quic::QuicServer;
 use ghostframe_lib::FrameSubmission;
+use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::Layer;
 
 type StageEvent = (String, Vec<(&'static str, u64)>);
 
@@ -110,7 +121,20 @@ fn make_frame(w: u32, h: u32, n: u32, dirty_frac: f64) -> Vec<u8> {
 
 async fn scenario(name: &str, w: u32, h: u32, dirty_frac: f64) {
     let windows = Arc::new(Windows::default());
-    let sub = tracing_subscriber::registry().with(Rec(windows.clone()));
+    assert_eq!(
+        std::env::var("GHOSTFRAME_VAAPI_DEVICE").as_deref(),
+        Ok("/dev/null/no-vaapi"),
+        "run through the GPU guard (gf-gpu-run: GPU lock + VA-API off)"
+    );
+    // A hung fence would hold the GPU lock forever (the wait is u64::MAX).
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(100));
+        eprintln!("c2 measurement watchdog: aborting");
+        std::process::abort();
+    });
+    let sub = tracing_subscriber::registry().with(Rec(windows.clone()).with_filter(
+        Targets::new().with_target("ghostframe::io_bridge::diag", tracing::Level::TRACE),
+    ));
     // Global, not thread-local: the bridge runs on another runtime worker.
     // One scenario per process, so run each test by name.
     tracing::subscriber::set_global_default(sub).expect("one scenario per process");
@@ -161,17 +185,25 @@ async fn scenario(name: &str, w: u32, h: u32, dirty_frac: f64) {
         }
     });
 
+    // Pre-generated so the driver does not stall itself (and the ACKs it
+    // owes) on pixel synthesis; the first frame is always full-screen.
+    let ring: Vec<Vec<u8>> = (0..4)
+        .map(|i| make_frame(w, h, i + 2, dirty_frac))
+        .collect();
+    let first = make_frame(w, h, 1, 1.0);
     let frame_period = Duration::from_millis(33);
     let end = Instant::now() + Duration::from_secs(12);
     let mut next_frame = Instant::now() + Duration::from_secs(2);
     let mut next_probe = Instant::now() + Duration::from_secs(2);
     let mut frames = 0u32;
     let mut ready = false;
-    let mut probe_sent: Option<Instant> = None;
+    // id -> send time of probes not yet answered; a late reply is still
+    // credited to its own probe (matched by the reply's SCID), never censored.
+    let mut in_flight: std::collections::HashMap<u64, Instant> = Default::default();
+    let mut probe_id = 0u64;
+    let mut last_probe_sent: Option<Instant> = None;
     // (send, reply) per probe
     let mut probes: Vec<(Instant, Instant)> = Vec::new();
-    let mut probe_unanswered = 0u32;
-    let mut seed = 7u32;
 
     while Instant::now() < end {
         while let Some(o) = client.poll_transmit() {
@@ -186,7 +218,11 @@ async fn scenario(name: &str, w: u32, h: u32, dirty_frac: f64) {
         let server_live = *live.borrow() > 0;
         if ready && server_live && now >= next_frame && ftx.capacity() > 0 {
             frames += 1;
-            let px = make_frame(w, h, frames, if frames == 1 { 1.0 } else { dirty_frac });
+            let px = if frames == 1 {
+                first.clone()
+            } else {
+                ring[frames as usize % 4].clone()
+            };
             let _ = ftx.try_send(FrameSubmission {
                 width: w,
                 height: h,
@@ -199,21 +235,26 @@ async fn scenario(name: &str, w: u32, h: u32, dirty_frac: f64) {
             });
             next_frame = Instant::now() + frame_period;
         }
-        if ready && server_live && probe_sent.is_none() && Instant::now() >= next_probe {
+        if ready
+            && server_live
+            && last_probe_sent.is_none_or(|t| {
+                Instant::now().duration_since(t) > Duration::from_millis(500)
+                    || in_flight.is_empty()
+            })
+            && Instant::now() >= next_probe
+        {
             // Long header, unsupported version, 1200 bytes: quinn answers
             // with a Version Negotiation packet, deterministically.
             let mut p = [0u8; 1200];
             p[0] = 0xC0;
             p[1..5].copy_from_slice(&0xbabababau32.to_be_bytes());
             p[5] = 8; // DCID len
-            for b in p[6..14].iter_mut() {
-                seed ^= seed << 13;
-                seed ^= seed >> 17;
-                seed ^= seed << 5;
-                *b = seed as u8;
-            }
+            probe_id += 1;
+            p[6..14].copy_from_slice(&probe_id.to_be_bytes());
             p[14] = 0; // SCID len
-            probe_sent = Some(Instant::now());
+            let sent = Instant::now();
+            in_flight.insert(probe_id, sent);
+            last_probe_sent = Some(sent);
             pump.send(&p, &probe_src).await.unwrap();
             next_probe = Instant::now() + Duration::from_millis(7);
         }
@@ -226,15 +267,17 @@ async fn scenario(name: &str, w: u32, h: u32, dirty_frac: f64) {
             r = prx.recv() => {
                 let (pk, at) = r.unwrap();
                 if pk.addr == probe_src {
-                    if let Some(s) = probe_sent.take() { probes.push((s, at)); }
+                    // Version Negotiation: version 0, DCID len 0, SCID len 8 = our DCID.
+                    let d = &pk.payload;
+                    assert!(d.len() >= 15 && d[1..5] == [0; 4] && d[5] == 0 && d[6] == 8, "probe reply is not Version Negotiation: {d:02x?}");
+                    let id = u64::from_be_bytes(d[7..15].try_into().unwrap());
+                    if let Some(s) = in_flight.remove(&id) { probes.push((s, at)); }
                 } else {
                     client.handle_udp(&pk.payload, srv, us(()));
                 }
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {
                 client.on_timeout(us(()));
-                // An unanswered probe older than 500 ms is counted and dropped.
-                if let Some(s) = probe_sent { if Instant::now().duration_since(s) > Duration::from_millis(500) { probe_unanswered += 1; probe_sent = None; } }
             }
         }
     }
@@ -273,7 +316,7 @@ async fn scenario(name: &str, w: u32, h: u32, dirty_frac: f64) {
     println!(
         "METRIC {name} probes total={} unanswered={} during_encode={} idle={}",
         probes.len(),
-        probe_unanswered,
+        in_flight.len(),
         during.len(),
         idle.len()
     );
@@ -310,7 +353,24 @@ async fn scenario(name: &str, w: u32, h: u32, dirty_frac: f64) {
     }
     // Non-zero premises: the encode ran and probes landed in both classes.
     assert!(!spans.is_empty(), "no process_frame window observed");
-    assert!(!probes.is_empty(), "no probe was answered");
+    assert!(
+        !during.is_empty() && !idle.is_empty(),
+        "need probes in both classes (during={}, idle={})",
+        during.len(),
+        idle.len()
+    );
+    let n_tile = windows
+        .stages
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(k, _)| k == "tile_stages")
+        .count();
+    assert!(
+        n_tile > 0 && n_tile * 2 >= spans.len(),
+        "frames did not take the GPU tile path ({n_tile} tile_stages for {} windows)",
+        spans.len()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
