@@ -84,6 +84,7 @@ pub(super) fn monotonic_now_ns() -> u64 {
 /// falls outside `tile_analysis`, that tile is silently skipped — this is
 /// what makes the first-frame path safe to call with an empty slice.
 /// Caller must ensure every `(tx, ty)` in `dirty` is within the tracker grid.
+#[cfg(test)]
 pub(crate) fn populate_gpu_metrics(
     tracker: &mut crate::tile::MetricsTracker,
     dirty: &[(u32, u32)],
@@ -92,29 +93,40 @@ pub(crate) fn populate_gpu_metrics(
 ) {
     for &(tx, ty) in dirty {
         let idx = (ty as usize) * (cols as usize) + (tx as usize);
-        let Some(entry) = tile_analysis.get(idx) else {
-            continue;
-        };
-        let m = tracker.get_mut(tx, ty);
-        m.unique_colors = entry.count.min(u16::MAX as u32) as u16;
-        m.edge_density = entry.edge_density_thou as f32 / 1000.0;
+        apply_gpu_metrics(tracker, tx, ty, tile_analysis.get(idx));
     }
+}
+
+/// Write one tile's GPU-derived metrics; `None` (no analysis entry) leaves the
+/// tile untouched.
+pub(crate) fn apply_gpu_metrics(
+    tracker: &mut crate::tile::MetricsTracker,
+    tx: u32,
+    ty: u32,
+    entry: Option<&crate::capture::gpu_pipeline::TileAnalysis>,
+) {
+    let Some(entry) = entry else {
+        return;
+    };
+    let m = tracker.get_mut(tx, ty);
+    m.unique_colors = entry.count.min(u16::MAX as u32) as u16;
+    m.edge_density = entry.edge_density_thou as f32 / 1000.0;
 }
 
 /// Real-clock lap timer for the per-stage cost trace (`frame.stages`). It
 /// measures what the frame cost the thread, so it must not follow tokio's
 /// possibly paused clock; hence `std::time::Instant`, not `now_std()`.
-struct Lap(Option<std::time::Instant>);
+pub(super) struct Lap(Option<std::time::Instant>);
 
 impl Lap {
     /// `enabled == false` makes every lap a no-op returning 0, so a frame with
     /// the trace off pays no clock reads.
-    fn new(enabled: bool) -> Self {
+    pub(super) fn new(enabled: bool) -> Self {
         Self(enabled.then(std::time::Instant::now))
     }
 
     /// Nanoseconds since the previous lap (or construction); restarts the lap.
-    fn lap_ns(&mut self) -> u64 {
+    pub(super) fn lap_ns(&mut self) -> u64 {
         let Some(prev) = self.0 else { return 0 };
         let now = std::time::Instant::now();
         self.0 = Some(now);
@@ -128,8 +140,21 @@ impl Lap {
 }
 
 /// Whether the per-stage trace is wanted at all.
-fn stage_trace_enabled() -> bool {
+pub(super) fn stage_trace_enabled() -> bool {
     tracing::enabled!(target: "ghostframe::io_bridge::diag", tracing::Level::TRACE)
+}
+
+/// What the frame backend hands the loop for a tile-path frame, minus the
+/// pixels: owned, so nothing here points into GPU memory.
+pub(super) struct TileResults {
+    pub(super) palrle: OwnedPalRle,
+    pub(super) cdf53_dirty: Vec<Cdf53Tile>,
+    pub(super) cdf53_escalation: Vec<Option<Cdf53Encoded>>,
+    pub(super) escalation_candidates: Vec<u32>,
+    pub(super) stranded_count: usize,
+    pub(super) timings: TileTimings,
+    /// High-water mark of the GPU's frame palette set, for the emit log.
+    pub(super) frame_palette_set_count: u32,
 }
 
 /// Per-tile staging produced by Phase A, consumed by Phase B.
@@ -160,7 +185,7 @@ impl IoBridge {
         // Without this, CPU-pixel frames hit `process_frame_cpu` which emits
         // every tile as `Codec::Raw` and never exercises the wavelet path.
         let has_gpu_input = frame.dmabuf_fd.is_some() || !frame.pixels.is_empty();
-        let path = if has_gpu_input && self.gpu_frame_processor.is_some() {
+        let path = if has_gpu_input && self.frame_backend.is_some() {
             "gpu"
         } else {
             "cpu"
@@ -181,7 +206,7 @@ impl IoBridge {
             path,
             "[BRIDGE] process_frame ENTER"
         );
-        if has_gpu_input && self.gpu_frame_processor.is_some() {
+        if has_gpu_input && self.frame_backend.is_some() {
             self.process_frame_gpu(frame);
         } else {
             self.process_frame_cpu(frame);
@@ -357,32 +382,6 @@ impl IoBridge {
             codec_h264 = stats.codec_histogram.h264,
             "frame.last_send"
         );
-    }
-
-    /// Phase A over this frame's GPU-written PalRle compact list.
-    pub(super) fn palrle_phase_a(
-        &mut self,
-        analysis: &crate::capture::gpu_pipeline::FrameAnalysis,
-        grid: &TileGrid,
-    ) -> Vec<PalRleTileWorkPrep> {
-        let cols = grid.cols;
-        let tiles = (grid.cols * grid.rows) as usize;
-        // GPU-written, so clamp it to the list's capacity (one slot per
-        // tile) before it sizes a slice, as the Cdf53 count is below.
-        let palrle_compact_count = clamp_gpu_tile_count(
-            analysis.palrle_compact_count,
-            (grid.cols * grid.rows) as usize,
-        );
-        let compact_list = analysis.palrle_compact_list_slice();
-        let palette_ids = analysis.per_tile_frame_palette_id_slice();
-        self.phase_a_palette_allocation(
-            cols,
-            &compact_list[..palrle_compact_count.min(compact_list.len())],
-            &palette_ids[..palrle_compact_count.min(palette_ids.len())],
-            analysis.folded_into_slice(),
-            analysis.frame_palette_set_slice(),
-            palrle_index_slice(analysis, tiles),
-        )
     }
 
     /// Commit a tile to Cdf53: start a new generation
@@ -695,8 +694,6 @@ impl IoBridge {
         // Either a DMA-BUF fd (zero-copy import) or CPU pixels (upload via
         // HOST_VISIBLE staging image) must be present — the public dispatcher
         // (`process_frame`) enforces that invariant.
-        let raw_fd = frame.dmabuf_fd.as_ref().map(|fd| fd.as_raw_fd());
-
         let mut lap = Lap::new(stage_trace_enabled());
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let seq = self.frame_seq;
@@ -724,24 +721,17 @@ impl IoBridge {
         // very first frame the tracker has cols=0, rows=0 (constructed via
         // MetricsTracker::new(0, 0)), so detect_escalation_candidates iterates
         // 0 tiles and returns empty — safe.
-        self.collect_escalation_candidates();
+        let candidates = self.collect_escalation_candidates();
         let pre_us = lap.lap();
 
         // GPU pipeline: Vulkan SAD dirty detection + NV12 conversion.
         // Dispatch to the DMA-BUF path if a fd was provided; otherwise upload
         // the CPU pixel buffer via the HOST_VISIBLE staging-image variant.
-        let processor = self.gpu_frame_processor.as_mut().unwrap();
-        let processor_result = match raw_fd {
-            Some(fd) => processor.process_frame(fd, frame.width, frame.height, frame.stride),
-            None => processor.process_frame_from_pixels(
-                &frame.pixels,
-                frame.width,
-                frame.height,
-                frame.stride,
-            ),
-        };
+        let want_diag = self.diagnostics.diagnose_gpu_pipeline;
+        let backend = self.frame_backend.as_mut().unwrap();
+        let analysed = backend.analyse(&frame, &candidates, want_diag);
         let gpu_us = lap.lap();
-        let analysis = match processor_result {
+        let analysis = match analysed {
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!(target: LOG_TARGET, "GPU process_frame failed: {e}, falling back to CPU path");
@@ -760,24 +750,17 @@ impl IoBridge {
         // GPU pipeline diagnostic: one line per frame showing the state of
         // every output buffer FrameAnalysis exposes. Drives W1 root-cause
         // investigation when unique_colors stays at UNIQUE_COLORS_UNKNOWN.
-        if self.diagnostics.diagnose_gpu_pipeline {
-            let ta_slice = analysis.tile_analysis_slice();
-            let first_nonzero = ta_slice
-                .iter()
-                .take(2048)
-                .enumerate()
-                .find(|(_, t)| t.count != 0)
-                .map(|(i, t)| (i, t.count, t.edge_density_thou));
+        if let Some(d) = analysis.diag.as_ref() {
             tracing::info!(
                 target: "ghostframe::diagnose",
                 seq,
                 dirty_count = analysis.dirty_tiles.len(),
-                tile_analysis_is_null = analysis.tile_analysis.is_null(),
-                tile_analysis_len = analysis.tile_analysis_len,
-                tile_analysis_slice_len = ta_slice.len(),
-                first_nonzero_idx = first_nonzero.map(|(i, _, _)| i),
-                first_nonzero_count = first_nonzero.map(|(_, c, _)| c),
-                first_nonzero_edge_thou = first_nonzero.map(|(_, _, e)| e),
+                tile_analysis_is_null = d.tile_analysis_is_null,
+                tile_analysis_len = d.tile_analysis_len,
+                tile_analysis_slice_len = d.tile_analysis_slice_len,
+                first_nonzero_idx = d.first_nonzero.map(|(i, _, _)| i),
+                first_nonzero_count = d.first_nonzero.map(|(_, c, _)| c),
+                first_nonzero_edge_thou = d.first_nonzero.map(|(_, _, e)| e),
                 palrle_compact_count = analysis.palrle_compact_count,
                 frame_palette_set_count = analysis.frame_palette_set_count,
                 "gpu-pipeline"
@@ -818,7 +801,7 @@ impl IoBridge {
         //    queue stagnates and the wizard never finishes refining.
         match new_mode {
             FrameMode::H264 => {
-                self.emit_h264_frame(&dirty_xy, &frame, &analysis, prev_mode, seq, max_dg_size);
+                self.emit_h264_frame(&dirty_xy, &frame, prev_mode, seq, max_dg_size);
                 let emit_us = lap.lap();
                 tracing::trace!(
                     target: "ghostframe::io_bridge::diag",
@@ -829,51 +812,84 @@ impl IoBridge {
             FrameMode::TileCodec => {
                 let max_frag = max_fragment_payload(max_dg_size);
                 if max_frag == 0 {
+                    if let Some(b) = self.frame_backend.as_mut() {
+                        b.finish_discard();
+                    }
                     return;
                 }
 
-                // Source for tile pixel extraction. CPU path populates
-                // `frame.pixels`; GPU/DMA-BUF leaves it empty.
-                let pixels_owned;
-                let pixels: &[u8] = if frame.pixels.is_empty() {
-                    match frame.dmabuf_fd.as_ref() {
-                        Some(fd) => match crate::capture::dmabuf::readback_dmabuf(
-                            fd.as_raw_fd(),
-                            frame.width,
-                            frame.height,
-                            frame.stride,
-                        ) {
-                            Ok(p) => {
-                                pixels_owned = p;
-                                &pixels_owned
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: LOG_TARGET,
-                                    "DMA-BUF readback failed in TileCodec mode: {e}; \
-                                     skipping frame to avoid emitting zero-filled tiles",
-                                );
-                                return;
-                            }
-                        },
-                        None => {
-                            tracing::warn!(
-                                target: LOG_TARGET,
-                                "TileCodec mode but no pixels and no DMA-BUF fd; skipping frame",
-                            );
-                            return;
-                        }
+                // The escalation candidates this frame, with what the loop
+                // knows about each tile; the backend encodes their passes.
+                let escalation_candidates =
+                    std::mem::take(&mut self.cdf53_escalation_candidates_this_frame);
+                let stranded_count =
+                    std::mem::take(&mut self.cdf53_stranded_candidates_this_frame).len();
+                let slots: Vec<EscalationSlot> = escalation_candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &tile_idx)| EscalationSlot {
+                        tile_idx,
+                        stranded: slot < stranded_count,
+                        tile_is_cdf53: matches!(
+                            self.metrics_tracker
+                                .get(tile_idx % cols, tile_idx / cols)
+                                .codec_state,
+                            crate::tile::CodecState::Cdf53 { .. }
+                        ),
+                    })
+                    .collect();
+                let backend = self.frame_backend.as_mut().unwrap();
+                let tile_out = backend.finish_tile(
+                    &frame,
+                    &TileRequest {
+                        cols,
+                        rows,
+                        escalation: &slots,
+                    },
+                );
+                let TileOut {
+                    pixels,
+                    palrle,
+                    cdf53_dirty,
+                    cdf53_escalation,
+                    timings,
+                } = tile_out;
+                let readback = match pixels {
+                    Ok(src) => src,
+                    Err(msg) => {
+                        tracing::warn!(target: LOG_TARGET, "{msg}");
+                        return;
                     }
-                } else {
-                    &frame.pixels
+                };
+                let pixels: &[u8] = match &readback {
+                    PixelSource::Frame => &frame.pixels,
+                    PixelSource::Readback(rb) => rb,
                 };
 
-                let readback_us = lap.lap();
-                self.emit_tile_codec_frame(&dirty_xy, &frame, pixels, &analysis, seq, max_frag);
+                // The backend's whole tile stage: readback, PalRle copies, and the
+                // CDF 5/3 coefficient reads and pass encodes (broken out in
+                // `frame.tile_stages` as coef_read_us / coef_encode_us).
+                let backend_tile_us = lap.lap();
+                self.emit_tile_codec_frame(
+                    &dirty_xy,
+                    &frame,
+                    pixels,
+                    TileResults {
+                        palrle,
+                        cdf53_dirty,
+                        cdf53_escalation,
+                        escalation_candidates,
+                        stranded_count,
+                        timings,
+                        frame_palette_set_count: analysis.frame_palette_set_count,
+                    },
+                    seq,
+                    max_frag,
+                );
                 let emit_us = lap.lap();
                 tracing::trace!(
                     target: "ghostframe::io_bridge::diag",
-                    seq, mode = "tile", pre_us, gpu_us, classify_us, readback_us, emit_us,
+                    seq, mode = "tile", pre_us, gpu_us, classify_us, backend_tile_us, emit_us,
                     "[BRIDGE] frame.stages"
                 );
             }
@@ -882,7 +898,7 @@ impl IoBridge {
 
     /// Per-frame idle-escalation sweep and stranded-tile detection; stores the
     /// merged candidate list on the bridge and hands it to the GPU processor.
-    fn collect_escalation_candidates(&mut self) {
+    fn collect_escalation_candidates(&mut self) -> Vec<u32> {
         // Gate on self.frame_mode (the PREVIOUS frame's mode). Skipping
         // escalation while the previous frame was H264 avoids ~5 ms of
         // wasted GPU forward + 6 MB of HOST_COHERENT writes per frame:
@@ -926,17 +942,16 @@ impl IoBridge {
         candidates.extend(&stranded_candidates);
         candidates.extend(&h264_candidates);
         candidates.truncate(crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME);
-        let processor = self.gpu_frame_processor.as_mut().unwrap();
-        processor.set_escalation_candidates(&candidates);
-        self.cdf53_escalation_candidates_this_frame = candidates;
+        self.cdf53_escalation_candidates_this_frame = candidates.clone();
         self.cdf53_stranded_candidates_this_frame = stranded_candidates;
+        candidates
     }
 
     /// Dirty-tile bookkeeping, per-tile classification and frame-mode decision
     /// for one GPU frame. Returns `(dirty_xy, prev_mode, new_mode)`.
     fn classify_dirty_tiles(
         &mut self,
-        analysis: &crate::capture::gpu_pipeline::FrameAnalysis,
+        analysis: &Analysed,
         frame: &FrameSubmission,
         cols: u32,
         rows: u32,
@@ -966,12 +981,9 @@ impl IoBridge {
         // Populate GPU-derived metrics (unique_colors, edge_density) for the dirty
         // tiles from the tile_analysis buffer. The classifier rule for PalRLE
         // (and Solid, post-M3.1) reads these.
-        populate_gpu_metrics(
-            &mut self.metrics_tracker,
-            &dirty_xy,
-            cols,
-            analysis.tile_analysis_slice(),
-        );
+        for (&(tx, ty), entry) in dirty_xy.iter().zip(analysis.dirty_analysis.iter()) {
+            apply_gpu_metrics(&mut self.metrics_tracker, tx, ty, entry.as_ref());
+        }
 
         // Classify each dirty tile. Empty dirty_xy → empty tentative — that's
         // the no-motion signal the classifier needs to exit H264 after exit_sustain.
@@ -1085,8 +1097,8 @@ impl IoBridge {
             // the time exit_sustain elapses; ACK-based retries handle
             // individual datagram drops on the lossless tiles.
             if prev_mode == FrameMode::H264 && new_mode == FrameMode::TileCodec {
-                if let Some(p) = self.gpu_frame_processor.as_mut() {
-                    p.invalidate_baseline(1);
+                if let Some(b) = self.frame_backend.as_mut() {
+                    b.apply(Control::InvalidateBaseline(1));
                     tracing::info!(
                         target: LOG_TARGET,
                         seq,
@@ -1184,61 +1196,25 @@ impl IoBridge {
     /// H.264 arm of `process_frame_gpu`: encode the GPU-produced NV12 frame,
     /// fragment it, send it with FEC parity and keep fragments for NACK. Its
     /// `return`s are tail returns of the whole frame (nothing follows the arm).
-    fn emit_h264_frame(
+    pub(super) fn emit_h264_frame(
         &mut self,
         dirty_xy: &[(u32, u32)],
         frame: &FrameSubmission,
-        analysis: &crate::capture::gpu_pipeline::FrameAnalysis,
         prev_mode: crate::tile::FrameMode,
         seq: u32,
         max_dg_size: usize,
     ) {
         use crate::tile::FrameMode;
+        let Some(backend) = self.frame_backend.as_mut() else {
+            return;
+        };
         if dirty_xy.is_empty() {
+            backend.finish_discard();
             return;
         }
-        // Lazily initialize full-frame encoder
-        let needs_init = match &self.full_frame_encoder {
-            Some(enc) => enc.width() != frame.width || enc.height() != frame.height,
-            None => true,
-        };
-        if needs_init {
-            match FullFrameEncoder::new(frame.width, frame.height) {
-                Ok(enc) => {
-                    self.full_frame_encoder = Some(enc);
-                }
-                Err(e) => {
-                    tracing::warn!(target: LOG_TARGET, "Full-frame encoder init failed: {e}");
-                    return;
-                }
-            }
-        }
-
-        // Re-entry into H264: force IDR for a fresh client anchor.
-        if prev_mode == FrameMode::TileCodec {
-            if let Some(enc) = self.full_frame_encoder.as_mut() {
-                enc.request_keyframe();
-            }
-        }
-
-        // Encode from the GPU-computed NV12 HOST_VISIBLE buffer
-        let encoder = self.full_frame_encoder.as_mut().unwrap();
-        let encoded = match encoder.encode_nv12_buffer(
-            analysis.nv12_data,
-            analysis.nv12_width,
-            analysis.nv12_height,
-            analysis.nv12_y_stride,
-            analysis.nv12_uv_stride,
-            analysis.nv12_uv_offset,
-        ) {
-            Ok(Some(enc)) => enc,
-            Ok(None) => {
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(target: LOG_TARGET, "NV12 encode failed: {e}");
-                return;
-            }
+        // Re-entry into H264 forces an IDR for a fresh client anchor.
+        let Some(encoded) = backend.finish_h264(frame, prev_mode == FrameMode::TileCodec) else {
+            return;
         };
 
         // Fragment and send. `fragment_frame` chunks the payload at the
@@ -1306,22 +1282,38 @@ impl IoBridge {
     /// PalRle phases A/B, Cdf53 passes for dirty and escalated tiles, scheduler
     /// dispatch, RTO sweep and the per-frame logs. The early returns (no
     /// fragment room, no pixel source) stay in the caller.
-    fn emit_tile_codec_frame(
+    pub(super) fn emit_tile_codec_frame(
         &mut self,
         dirty_xy: &[(u32, u32)],
         frame: &FrameSubmission,
         pixels: &[u8],
-        analysis: &crate::capture::gpu_pipeline::FrameAnalysis,
+        tile: TileResults,
         seq: u32,
         max_frag: usize,
     ) {
+        let TileResults {
+            palrle,
+            cdf53_dirty,
+            cdf53_escalation,
+            escalation_candidates,
+            stranded_count,
+            timings,
+            frame_palette_set_count,
+        } = tile;
         let trace_on = stage_trace_enabled();
         let mut lap = Lap::new(trace_on);
         let grid = TileGrid::new(frame.width, frame.height);
 
         // Phase A — serial palette-table allocation per dirty PalRle-feasible tile.
         let cols = grid.cols;
-        let preps = self.palrle_phase_a(analysis, &grid);
+        let preps = self.phase_a_palette_allocation(
+            cols,
+            &palrle.compact_list,
+            &palrle.palette_ids,
+            &palrle.folded_into,
+            &palrle.palette_set,
+            &palrle.index,
+        );
         let phase_a_us = lap.lap();
 
         // Phase B — rayon parallel encode.
@@ -1341,202 +1333,147 @@ impl IoBridge {
         let mut palrle_payloads =
             IoBridge::phase_b_encode_payloads_with_caps(&preps, &caps, inject);
         let palrle_phase_b_us = lap.lap();
-        let (mut coef_read_ns, mut coef_encode_ns) = (0u64, 0u64);
-        let mut coef_lap = Lap::new(trace_on);
+        let (coef_read_ns, coef_encode_ns) = (timings.coef_read_ns, timings.coef_encode_ns);
         #[cfg(any(test, feature = "test-loss-injection"))]
         if inject_will_fire {
             self.oob_inject_at = None;
         }
 
-        // Phase B — Cdf53 encode bit-plane passes for high-color tiles,
-        // enqueue into the scheduler's refinement queue.
-        {
-            // Extract raw pointers from the GPU processor up-front so that
-            // the immutable borrow of self.gpu_frame_processor ends before
-            // the mutable borrows of self.scheduler below.
-            // SAFETY: cdf53_compact_count_ptr, cdf53_compact_list_ptr, and
-            // cdf53_coefficients_ptr are HOST_VISIBLE | HOST_COHERENT mapped
-            // GPU memory, valid until the next process_frame call. This block
-            // runs inside the current process_frame_gpu invocation, before
-            // any subsequent call.
-            let (cdf53_compact_count_ptr, cdf53_compact_list_ptr, cdf53_coefficients_ptr) = {
-                let gpu = self.gpu_frame_processor.as_ref().unwrap();
-                (
-                    gpu.cdf53_compact_count_ptr,
-                    gpu.cdf53_compact_list_ptr,
-                    gpu.cdf53_coefficients_ptr,
-                )
-            };
-            // The count is written by the GPU; clamp it to the list's
-            // capacity (one slot per tile) before it sizes a slice.
-            let cdf53_count = clamp_gpu_tile_count(
-                unsafe { *cdf53_compact_count_ptr },
-                (grid.cols * grid.rows) as usize,
-            );
-            if cdf53_count > 0 {
-                let cdf53_list =
-                    unsafe { std::slice::from_raw_parts(cdf53_compact_list_ptr, cdf53_count) };
-                for (slot, &flat_tile_idx) in cdf53_list.iter().enumerate() {
-                    // Also GPU-written: an index off the grid would
-                    // wrap in the u8 casts below and address the
-                    // wrong tile.
-                    if flat_tile_idx >= grid.cols * grid.rows {
-                        continue;
-                    }
-                    let tile_x = (flat_tile_idx % cols) as u8;
-                    let tile_y = (flat_tile_idx / cols) as u8;
-                    // Read 3 * 1024 = 3072 i32 values from the compact-slot
-                    // indexed coefficient buffer. The GPU writes i32-wide
-                    // values; CPU casts to i16 (actual coefficient bit-width;
-                    // high bits are sign-extension).
-                    let coeffs_i32 = unsafe {
-                        std::slice::from_raw_parts(
-                            cdf53_coefficients_ptr
-                                .add(slot * crate::encoder::cdf53::CDF53_TOTAL_COEFFS),
-                            crate::encoder::cdf53::CDF53_TOTAL_COEFFS,
-                        )
+        // Phase B — Cdf53 bit-plane passes for high-color tiles, enqueued into
+        // the scheduler's refinement queue. The passes were encoded by the
+        // frame backend from the GPU's compact list; this commits them.
+        for tile in cdf53_dirty {
+            let (tile_x, tile_y) = (tile.tile_x, tile.tile_y);
+            #[cfg(feature = "cdf53-diag")]
+            let coeffs_i16 = &tile.coeffs_i16;
+            // M3.3b diagnostic: when GHOSTFRAME_CDF53_DIFF_TILE=X,Y is
+            // set, log a one-shot side-by-side comparison of GPU vs
+            // CPU `cdf53::forward(tile_bgra)` for that tile. Gated
+            // behind the `cdf53-diag` cargo feature so production
+            // builds skip the config check entirely.
+            #[cfg(feature = "cdf53-diag")]
+            if let Some((target_x, target_y)) = self.diagnostics.cdf53_diff_tile {
+                if tile_x as u32 == target_x && tile_y as u32 == target_y {
+                    let tile_bgra =
+                        grid.extract_tile(pixels, frame.stride, tile_x as u32, tile_y as u32);
+                    // Pick CPU reference based on which dispatches were skipped:
+                    // SKIP_L2_L3 → L1-only; SKIP_L3 → L2-only; otherwise full.
+                    let skip_l2_l3 = self.diagnostics.cdf53_skip_l2_l3;
+                    let skip_l3 = self.diagnostics.cdf53_skip_l3;
+                    let cpu_coeffs = if skip_l2_l3 {
+                        crate::encoder::cdf53::forward_level1_only(&tile_bgra)
+                    } else if skip_l3 {
+                        crate::encoder::cdf53::forward_level2_only(&tile_bgra)
+                    } else {
+                        crate::encoder::cdf53::forward(&tile_bgra)
                     };
-                    coef_lap.lap_ns();
-                    let coeffs_i16: Vec<i16> = coeffs_i32.iter().map(|&v| v as i16).collect();
-                    coef_read_ns += coef_lap.lap_ns();
-                    // M3.3b diagnostic: when GHOSTFRAME_CDF53_DIFF_TILE=X,Y is
-                    // set, log a one-shot side-by-side comparison of GPU vs
-                    // CPU `cdf53::forward(tile_bgra)` for that tile. Gated
-                    // behind the `cdf53-diag` cargo feature so production
-                    // builds skip the config check entirely.
-                    #[cfg(feature = "cdf53-diag")]
-                    if let Some((target_x, target_y)) = self.diagnostics.cdf53_diff_tile {
-                        if tile_x as u32 == target_x && tile_y as u32 == target_y {
-                            let tile_bgra = grid.extract_tile(
-                                pixels,
-                                frame.stride,
-                                tile_x as u32,
-                                tile_y as u32,
-                            );
-                            // Pick CPU reference based on which dispatches were skipped:
-                            // SKIP_L2_L3 → L1-only; SKIP_L3 → L2-only; otherwise full.
-                            let skip_l2_l3 = self.diagnostics.cdf53_skip_l2_l3;
-                            let skip_l3 = self.diagnostics.cdf53_skip_l3;
-                            let cpu_coeffs = if skip_l2_l3 {
-                                crate::encoder::cdf53::forward_level1_only(&tile_bgra)
-                            } else if skip_l3 {
-                                crate::encoder::cdf53::forward_level2_only(&tile_bgra)
-                            } else {
-                                crate::encoder::cdf53::forward(&tile_bgra)
-                            };
-                            // B↔R swap hypothesis: build a fake tile where B and R are
-                            // swapped in the BGRA buffer, then CPU-forward it. If the GPU
-                            // result matches THIS, the shader's rgba8/bgra8 mismatch is
-                            // swapping channel 0 (B) with channel 2 (R).
-                            let mut tile_swapped = tile_bgra.clone();
-                            for px in tile_swapped.chunks_exact_mut(4) {
-                                px.swap(0, 2); // swap B and R bytes
+                    // B↔R swap hypothesis: build a fake tile where B and R are
+                    // swapped in the BGRA buffer, then CPU-forward it. If the GPU
+                    // result matches THIS, the shader's rgba8/bgra8 mismatch is
+                    // swapping channel 0 (B) with channel 2 (R).
+                    let mut tile_swapped = tile_bgra.clone();
+                    for px in tile_swapped.chunks_exact_mut(4) {
+                        px.swap(0, 2); // swap B and R bytes
+                    }
+                    let cpu_coeffs_swapped = crate::encoder::cdf53::forward(&tile_swapped);
+                    // Sample tile pixels (first 8 BGRA px).
+                    let bgra_head: Vec<u8> = tile_bgra.iter().take(32).copied().collect();
+                    tracing::info!(
+                        target: "ghostframe::cdf53::diff",
+                        tile_x = tile_x,
+                        tile_y = tile_y,
+                        "cdf53.diff.tile_bgra_head_32 = {:?}",
+                        bgra_head
+                    );
+                    let mut n_diff_per_ch = [0usize; 3];
+                    let mut n_match_swapped_per_ch = [0usize; 3];
+                    let mut shown = 0usize;
+                    for i in 0..crate::encoder::cdf53::CDF53_TOTAL_COEFFS {
+                        let ch = i / 1024;
+                        if coeffs_i16[i] != cpu_coeffs[i] {
+                            n_diff_per_ch[ch] += 1;
+                            if shown < 100 {
+                                tracing::info!(
+                                    target: "ghostframe::cdf53::diff",
+                                    tile_x = tile_x,
+                                    tile_y = tile_y,
+                                    "cdf53.diff coef[{i}] ch={} idx={} gpu={} cpu={} diff={} cpu_swap={}",
+                                    ch,
+                                    i % 1024,
+                                    coeffs_i16[i],
+                                    cpu_coeffs[i],
+                                    coeffs_i16[i] as i32 - cpu_coeffs[i] as i32,
+                                    cpu_coeffs_swapped[i],
+                                );
+                                shown += 1;
                             }
-                            let cpu_coeffs_swapped = crate::encoder::cdf53::forward(&tile_swapped);
-                            // Sample tile pixels (first 8 BGRA px).
-                            let bgra_head: Vec<u8> = tile_bgra.iter().take(32).copied().collect();
-                            tracing::info!(
-                                target: "ghostframe::cdf53::diff",
-                                tile_x = tile_x,
-                                tile_y = tile_y,
-                                "cdf53.diff.tile_bgra_head_32 = {:?}",
-                                bgra_head
-                            );
-                            let mut n_diff_per_ch = [0usize; 3];
-                            let mut n_match_swapped_per_ch = [0usize; 3];
-                            let mut shown = 0usize;
-                            for i in 0..crate::encoder::cdf53::CDF53_TOTAL_COEFFS {
-                                let ch = i / 1024;
-                                if coeffs_i16[i] != cpu_coeffs[i] {
-                                    n_diff_per_ch[ch] += 1;
-                                    if shown < 100 {
-                                        tracing::info!(
-                                            target: "ghostframe::cdf53::diff",
-                                            tile_x = tile_x,
-                                            tile_y = tile_y,
-                                            "cdf53.diff coef[{i}] ch={} idx={} gpu={} cpu={} diff={} cpu_swap={}",
-                                            ch,
-                                            i % 1024,
-                                            coeffs_i16[i],
-                                            cpu_coeffs[i],
-                                            coeffs_i16[i] as i32 - cpu_coeffs[i] as i32,
-                                            cpu_coeffs_swapped[i],
-                                        );
-                                        shown += 1;
-                                    }
-                                }
-                                if coeffs_i16[i] == cpu_coeffs_swapped[i] {
-                                    n_match_swapped_per_ch[ch] += 1;
-                                }
-                            }
-                            let n_diff = n_diff_per_ch.iter().sum::<usize>();
-                            // Per-subband mismatches (channel 0 / B only — quickest signal).
-                            // Subband ranges in per-channel layout:
-                            //   [0..16] LL3, [16..32] HL3, [32..48] LH3, [48..64] HH3,
-                            //   [64..128] HL2, [128..192] LH2, [192..256] HH2,
-                            //   [256..512] HL1, [512..768] LH1, [768..1024] HH1.
-                            // Per-channel per-subband breakdown. Subband boundaries
-                            // are within each channel's 1024-coefficient block.
-                            let mut sb_diff = [[0usize; 10]; 3];
-                            let band_ranges = [
-                                (0, 16),
-                                (16, 32),
-                                (32, 48),
-                                (48, 64),
-                                (64, 128),
-                                (128, 192),
-                                (192, 256),
-                                (256, 512),
-                                (512, 768),
-                                (768, 1024),
-                            ];
-                            for (ch, ch_diff) in sb_diff.iter_mut().enumerate() {
-                                let base = ch * 1024;
-                                for (b, (lo, hi)) in band_ranges.iter().enumerate() {
-                                    for i in *lo..*hi {
-                                        if coeffs_i16[base + i] != cpu_coeffs[base + i] {
-                                            ch_diff[b] += 1;
-                                        }
-                                    }
-                                }
-                            }
-                            tracing::info!(
-                                target: "ghostframe::cdf53::diff",
-                                tile_x = tile_x,
-                                tile_y = tile_y,
-                                "cdf53.diff.summary total_diffs={n_diff}/3072 per_ch_diff={:?} per_ch_match_swapped={:?}",
-                                n_diff_per_ch,
-                                n_match_swapped_per_ch,
-                            );
-                            tracing::info!(
-                                target: "ghostframe::cdf53::diff",
-                                tile_x = tile_x,
-                                tile_y = tile_y,
-                                "cdf53.diff.subbands (LL3 HL3 LH3 HH3 HL2 LH2 HH2 HL1 LH1 HH1): ch0={:?} ch1={:?} ch2={:?}",
-                                sb_diff[0], sb_diff[1], sb_diff[2],
-                            );
+                        }
+                        if coeffs_i16[i] == cpu_coeffs_swapped[i] {
+                            n_match_swapped_per_ch[ch] += 1;
                         }
                     }
-                    let (present_passes, passes) =
-                        crate::encoder::cdf53::encode_passes_sparse(&coeffs_i16);
-                    coef_encode_ns += coef_lap.lap_ns();
-                    self.commit_tile_to_cdf53(
-                        tile_x,
-                        tile_y,
-                        present_passes,
-                        passes,
-                        Cdf53Source::Dirty,
+                    let n_diff = n_diff_per_ch.iter().sum::<usize>();
+                    // Per-subband mismatches (channel 0 / B only — quickest signal).
+                    // Subband ranges in per-channel layout:
+                    //   [0..16] LL3, [16..32] HL3, [32..48] LH3, [48..64] HH3,
+                    //   [64..128] HL2, [128..192] LH2, [192..256] HH2,
+                    //   [256..512] HL1, [512..768] LH1, [768..1024] HH1.
+                    // Per-channel per-subband breakdown. Subband boundaries
+                    // are within each channel's 1024-coefficient block.
+                    let mut sb_diff = [[0usize; 10]; 3];
+                    let band_ranges = [
+                        (0, 16),
+                        (16, 32),
+                        (32, 48),
+                        (48, 64),
+                        (64, 128),
+                        (128, 192),
+                        (192, 256),
+                        (256, 512),
+                        (512, 768),
+                        (768, 1024),
+                    ];
+                    for (ch, ch_diff) in sb_diff.iter_mut().enumerate() {
+                        let base = ch * 1024;
+                        for (b, (lo, hi)) in band_ranges.iter().enumerate() {
+                            for i in *lo..*hi {
+                                if coeffs_i16[base + i] != cpu_coeffs[base + i] {
+                                    ch_diff[b] += 1;
+                                }
+                            }
+                        }
+                    }
+                    tracing::info!(
+                        target: "ghostframe::cdf53::diff",
+                        tile_x = tile_x,
+                        tile_y = tile_y,
+                        "cdf53.diff.summary total_diffs={n_diff}/3072 per_ch_diff={:?} per_ch_match_swapped={:?}",
+                        n_diff_per_ch,
+                        n_match_swapped_per_ch,
+                    );
+                    tracing::info!(
+                        target: "ghostframe::cdf53::diff",
+                        tile_x = tile_x,
+                        tile_y = tile_y,
+                        "cdf53.diff.subbands (LL3 HL3 LH3 HH3 HL2 LH2 HH2 HL1 LH1 HH1): ch0={:?} ch1={:?} ch2={:?}",
+                        sb_diff[0], sb_diff[1], sb_diff[2],
                     );
                 }
             }
+            self.commit_tile_to_cdf53(
+                tile_x,
+                tile_y,
+                tile.encoded.present_passes,
+                tile.encoded.passes,
+                Cdf53Source::Dirty,
+            );
         }
 
         // ---- M3.3c + Phase 1.5-B: post-fence Phase B for escalation candidates ----
-        // Runs after the GPU fence (the existing fence covers all
-        // compute work in this command buffer, including the
-        // escalation forward dispatches recorded above). Reads
-        // escalation coefficients per-slot, encodes 14 passes,
-        // enqueues into the scheduler.
+        // The backend encoded the escalation slots' passes after the GPU
+        // fence (the existing fence covers all compute work in this command
+        // buffer, including the escalation forward dispatches). Here they are
+        // enqueued into the scheduler.
         //
         // Two flavors live in the same merged list (stranded first,
         // then H264):
@@ -1548,59 +1485,57 @@ impl IoBridge {
         //    passes don't get discarded by a fresh-gen reset.
         //  - H264 (M3.3c): tiles in H264 state being promoted to
         //    Cdf53 for the first time on this generation.
-        let escalation_candidates =
-            std::mem::take(&mut self.cdf53_escalation_candidates_this_frame);
-        let stranded_candidates = std::mem::take(&mut self.cdf53_stranded_candidates_this_frame);
-        let stranded_count = stranded_candidates.len();
-        if !escalation_candidates.is_empty() {
-            let gpu_coeffs_ptr = {
-                let gpu = self.gpu_frame_processor.as_ref().unwrap();
-                gpu.cdf53_escalation_coefficients_ptr
-            };
-            for (slot, &flat_tile_idx) in escalation_candidates.iter().enumerate() {
-                let tile_x = (flat_tile_idx % cols) as u8;
-                let tile_y = (flat_tile_idx / cols) as u8;
-                let is_stranded = slot < stranded_count;
-                let codec_state = self
-                    .metrics_tracker
-                    .get(tile_x as u32, tile_y as u32)
-                    .codec_state;
-                if !is_stranded {
-                    // H264-escalation slot: skip if the dirty path
-                    // already promoted this tile to Cdf53 in this
-                    // SAME frame. Re-firing would bump again,
-                    // supersede the just-enqueued passes, emit 14
-                    // duplicate cdf53.emit lines, and waste a GPU
-                    // forward dispatch with the same coefficients.
-                    if matches!(codec_state, crate::tile::CodecState::Cdf53 { .. }) {
-                        continue;
-                    }
-                }
-                let coeffs_i32 = unsafe {
-                    std::slice::from_raw_parts(
-                        gpu_coeffs_ptr.add(slot * crate::encoder::cdf53::CDF53_TOTAL_COEFFS),
-                        crate::encoder::cdf53::CDF53_TOTAL_COEFFS,
-                    )
-                };
-                coef_lap.lap_ns();
-                let coeffs_i16: Vec<i16> = coeffs_i32.iter().map(|&v| v as i16).collect();
-                coef_read_ns += coef_lap.lap_ns();
-                let (present_passes, passes) =
-                    crate::encoder::cdf53::encode_passes_sparse(&coeffs_i16);
-                coef_encode_ns += coef_lap.lap_ns();
-                if is_stranded {
-                    self.stranded_reenqueue(tile_x, tile_y, codec_state, present_passes, passes);
+        debug_assert_eq!(
+            escalation_candidates.len(),
+            cdf53_escalation.len(),
+            "a backend returns one escalation result per candidate"
+        );
+        for (slot, (&flat_tile_idx, encoded)) in escalation_candidates
+            .iter()
+            .zip(cdf53_escalation)
+            .enumerate()
+        {
+            let tile_x = (flat_tile_idx % cols) as u8;
+            let tile_y = (flat_tile_idx / cols) as u8;
+            let is_stranded = slot < stranded_count;
+            let codec_state = self
+                .metrics_tracker
+                .get(tile_x as u32, tile_y as u32)
+                .codec_state;
+            if !is_stranded {
+                // H264-escalation slot: skip if the dirty path
+                // already promoted this tile to Cdf53 in this
+                // SAME frame. Re-firing would bump again,
+                // supersede the just-enqueued passes, emit 14
+                // duplicate cdf53.emit lines, and waste a GPU
+                // forward dispatch with the same coefficients. The
+                // backend skips encoding these; this is the same
+                // check against the state after the dirty commits.
+                if matches!(codec_state, crate::tile::CodecState::Cdf53 { .. }) {
                     continue;
                 }
-                // H264 escalation path (existing).
-                self.commit_tile_to_cdf53(
+            }
+            let Some(encoded) = encoded else {
+                continue;
+            };
+            if is_stranded {
+                self.stranded_reenqueue(
                     tile_x,
                     tile_y,
-                    present_passes,
-                    passes,
-                    Cdf53Source::Escalation,
+                    codec_state,
+                    encoded.present_passes,
+                    encoded.passes,
                 );
+                continue;
             }
+            // H264 escalation path (existing).
+            self.commit_tile_to_cdf53(
+                tile_x,
+                tile_y,
+                encoded.present_passes,
+                encoded.passes,
+                Cdf53Source::Escalation,
+            );
         }
 
         #[cfg(feature = "cdf53-diag")]
@@ -1786,7 +1721,7 @@ impl IoBridge {
             target: "palrle.frame",
             reused_or_allocated = self.palette_table.stats_frame.reused_or_allocated,
             fell_back_to_raw = self.palette_table.stats_frame.fell_back_to_raw,
-            unique_frame_palettes = analysis.frame_palette_set_count,
+            unique_frame_palettes = frame_palette_set_count,
             "palrle frame stats"
         );
         self.palette_table.stats_frame = Default::default();

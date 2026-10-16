@@ -178,14 +178,14 @@ impl IoBridge {
         // no-snapshot first-frame path for N frames.
         //
         // Both are set unconditionally. On the CPU-only path,
-        // `gpu_frame_processor` is None so the `if let` is a no-op.
+        // `frame_backend` is None so the `if let` is a no-op.
         // On the GPU path, `force_dirty_frames` is normally ignored
         // by `process_frame_gpu` — but IS consumed if the Vulkan
         // call errors and the frame falls back to `process_frame_cpu`,
         // which is exactly the correct behaviour on that error path.
         self.force_dirty_frames = 20;
-        if let Some(p) = self.gpu_frame_processor.as_mut() {
-            p.invalidate_baseline(20);
+        if let Some(b) = self.frame_backend.as_mut() {
+            b.apply(Control::InvalidateBaseline(20));
         }
         // Force IDR on the existing encoder so the new client
         // gets a fresh anchor. Without this, a client connecting
@@ -194,8 +194,8 @@ impl IoBridge {
         // natural keyframe (~10 frames later at GOP=11). The
         // first-time-only escape (lazy `FullFrameEncoder::new`
         // with pts=0 → IDR) only covers cold start.
-        if let Some(enc) = self.full_frame_encoder.as_mut() {
-            enc.request_keyframe();
+        if let Some(b) = self.frame_backend.as_mut() {
+            b.apply(Control::RequestKeyframe);
         }
         // info, not debug: this is the line that says a reconnecting client is
         // getting a clean slate rather than resuming, and at debug it was

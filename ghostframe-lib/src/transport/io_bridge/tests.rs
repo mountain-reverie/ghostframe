@@ -931,41 +931,163 @@ async fn iobridge_holds_scheduler_zero_sized_on_construction() {
     assert_eq!(bridge.scheduler.queue_len(), 0);
 }
 
-/// Coverage for C1: when a new session reconnects, the existing
-/// `FullFrameEncoder` (lazy-inited from the prior session) must be told to
-/// emit an IDR so the new client gets a fresh decoding anchor instead of a
-/// P-frame referencing a GOP they never received. Drives `request_keyframe`
-/// directly because spinning up a real WebTransport handshake is too heavy.
-/// Verifies via `keyframe_pending()` that the call site flips the flag.
-#[tokio::test]
-async fn session_reconnect_requests_keyframe_on_existing_encoder() {
-    // Opening a real encoder drives the GPU: never beside other GPU tests.
-    let _gpu = crate::gpu_test_lock::lock();
-    let (our_end, _peer) = UnixStream::pair().expect("pair");
+/// A recording stand-in for the GPU backend: what the loop asked of it, in
+/// order, and a canned H.264 result.
+#[derive(Default)]
+struct RecordingBackend {
+    log: Arc<std::sync::Mutex<Vec<String>>>,
+    h264: Option<(Vec<u8>, bool)>,
+}
+
+impl FrameBackend for RecordingBackend {
+    fn apply(&mut self, control: Control) {
+        self.log.lock().unwrap().push(format!("apply {control:?}"));
+    }
+    fn analyse(
+        &mut self,
+        _frame: &FrameSubmission,
+        _escalation: &[u32],
+        _want_diag: bool,
+    ) -> Result<Analysed, String> {
+        self.log.lock().unwrap().push("analyse".into());
+        Ok(Analysed::default())
+    }
+    fn finish_h264(&mut self, _frame: &FrameSubmission, force_keyframe: bool) -> Option<H264Out> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("finish_h264 force_keyframe={force_keyframe}"));
+        self.h264.clone().map(|(payload, is_keyframe)| H264Out {
+            payload,
+            is_keyframe,
+        })
+    }
+    fn finish_tile(&mut self, _frame: &FrameSubmission, _req: &TileRequest<'_>) -> TileOut {
+        self.log.lock().unwrap().push("finish_tile".into());
+        TileOut {
+            pixels: Err("recording backend".into()),
+            palrle: OwnedPalRle::default(),
+            cdf53_dirty: Vec::new(),
+            cdf53_escalation: Vec::new(),
+            timings: TileTimings::default(),
+        }
+    }
+    fn finish_discard(&mut self) {
+        self.log.lock().unwrap().push("finish_discard".into());
+    }
+}
+
+fn recording_bridge(
+    h264: Option<(Vec<u8>, bool)>,
+) -> (
+    IoBridge,
+    tokio::net::UnixStream,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let (our_end, peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+    our_end.set_nonblocking(true).unwrap();
+    peer.set_nonblocking(true).unwrap();
     let server = QuicServer::new().expect("server");
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
-    let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+    let mut bridge = IoBridge::new_with_frames_for_test(
+        tokio::net::UnixStream::from_std(our_end).unwrap(),
+        server,
+        rx,
+    );
+    let backend = RecordingBackend {
+        h264,
+        ..Default::default()
+    };
+    let log = backend.log.clone();
+    bridge.set_frame_backend(Box::new(backend));
+    (bridge, tokio::net::UnixStream::from_std(peer).unwrap(), log)
+}
 
-    // Inject a fake encoder so the reconnect path's request_keyframe call
-    // has something to act on. Skip silently if no codec is available on
-    // the test machine — matches the existing pattern.
-    if let Ok(enc) = crate::encoder::h264_vaapi::FullFrameEncoder::new(640, 480) {
-        bridge.full_frame_encoder = Some(enc);
-        // Simulate the side-effect of the session-connect path.
-        bridge
-            .full_frame_encoder
-            .as_mut()
-            .unwrap()
-            .request_keyframe();
-        assert!(
-            bridge
-                .full_frame_encoder
-                .as_ref()
-                .unwrap()
-                .keyframe_pending(),
-            "encoder must have keyframe_pending after session reconnect"
-        );
+fn tiny_frame() -> FrameSubmission {
+    FrameSubmission {
+        width: 64,
+        height: 64,
+        stride: 64 * 4,
+        pixels: vec![0u8; 64 * 64 * 4],
+        dmabuf_fd: None,
+        timestamp_us: 0,
+        damage_tiles: None,
+        capture_done_ns: 0,
     }
+}
+
+/// A reconnecting client must get a clean slate from the GPU side too: the
+/// SAD baseline is dropped for 20 frames and the encoder is told to emit an
+/// IDR, in that order, through the backend. (This replaces a test that only
+/// poked the encoder directly and never ran the reset path.)
+#[tokio::test]
+async fn session_reset_tells_the_backend_to_invalidate_then_keyframe() {
+    let (mut bridge, _peer, log) = recording_bridge(None);
+    bridge.fire_session_reset(ConnectionHandle(0));
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![
+            "apply InvalidateBaseline(20)".to_string(),
+            "apply RequestKeyframe".to_string()
+        ]
+    );
+}
+
+/// Re-entering H.264 from the tile path forces an IDR (a fresh anchor for the
+/// client); staying in H.264 does not. An empty dirty set encodes nothing and
+/// releases the frame's GPU outputs.
+#[tokio::test]
+async fn the_h264_arm_asks_for_a_keyframe_only_on_re_entry_and_discards_when_idle() {
+    use crate::tile::FrameMode;
+    let (mut bridge, _peer, log) = recording_bridge(Some((vec![1, 2, 3], true)));
+    let frame = tiny_frame();
+    bridge.emit_h264_frame(&[(0, 0)], &frame, FrameMode::TileCodec, 1, 1200);
+    bridge.emit_h264_frame(&[(0, 0)], &frame, FrameMode::H264, 2, 1200);
+    bridge.emit_h264_frame(&[], &frame, FrameMode::H264, 3, 1200);
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![
+            "finish_h264 force_keyframe=true".to_string(),
+            "finish_h264 force_keyframe=false".to_string(),
+            "finish_discard".to_string(),
+        ]
+    );
+}
+
+/// `apply_gpu_metrics` writes one tile's colour count and edge density, and
+/// leaves a tile with no analysis entry untouched.
+#[test]
+fn gpu_metrics_are_written_per_tile_and_a_missing_entry_is_a_no_op() {
+    let mut t = crate::tile::MetricsTracker::new(2, 1);
+    let entry = crate::capture::gpu_pipeline::TileAnalysis {
+        count: 5,
+        edge_density_thou: 250,
+        ..Default::default()
+    };
+    apply_gpu_metrics(&mut t, 1, 0, Some(&entry));
+    assert_eq!(t.get(1, 0).unique_colors, 5);
+    assert!((t.get(1, 0).edge_density - 0.25).abs() < 1e-6);
+    let before = t.get(0, 0).unique_colors;
+    apply_gpu_metrics(&mut t, 0, 0, None);
+    assert_eq!(t.get(0, 0).unique_colors, before);
+}
+
+/// The real backend's `RequestKeyframe` reaches its encoder. Needs a GPU and a
+/// codec; skips silently without one, as the test it replaces did.
+#[tokio::test]
+async fn gpu_backend_request_keyframe_reaches_its_encoder() {
+    // Opening a real encoder drives the GPU: never beside other GPU tests.
+    let _gpu = crate::gpu_test_lock::lock();
+    let Ok(processor) = crate::capture::gpu_pipeline::GpuFrameProcessor::new(256) else {
+        return;
+    };
+    let Ok(enc) = crate::encoder::h264_vaapi::FullFrameEncoder::new(640, 480) else {
+        return;
+    };
+    let mut backend = GpuBackend::new(processor);
+    backend.set_encoder_for_test(enc);
+    backend.apply(Control::RequestKeyframe);
+    assert_eq!(backend.encoder_keyframe_pending(), Some(true));
 }
 
 /// An inbound ACK_BATCH datagram with a recorded coverage entry should
@@ -5444,4 +5566,60 @@ async fn superseding_a_thin_emission_leaves_the_carry_count_alone() {
     }];
     bridge.settle_superseded_palettes(2, 3, &thin);
     assert_eq!(bridge.palette_table.in_flight_carrying[9], 1);
+}
+
+/// The tile arm's commit step: the backend's dirty CDF 5/3 tiles are enqueued
+/// for refinement, an escalation slot with encoded passes is enqueued, and a
+/// slot the backend skipped is not.
+#[tokio::test]
+async fn the_tile_arm_commits_the_backends_cdf53_results_and_skips_what_it_skipped() {
+    const W: u32 = 128;
+    let (mut bridge, _peer, _log) = recording_bridge(None);
+    bridge.scheduler.resize(4, 4);
+    bridge.metrics_tracker.resize(4, 4);
+    let frame = FrameSubmission {
+        width: W,
+        height: W,
+        stride: W * 4,
+        pixels: vec![0u8; (W * W * 4) as usize],
+        dmabuf_fd: None,
+        timestamp_us: 0,
+        damage_tiles: None,
+        capture_done_ns: 0,
+    };
+    let enc = |p: u16| Cdf53Encoded {
+        present_passes: 1,
+        passes: vec![(0, vec![p as u8; 8])],
+    };
+    // Tiles (1,1), (2,2), (3,3) are flat indices 5, 10, 15 on a 4-wide grid.
+    let results = frame::TileResults {
+        palrle: OwnedPalRle::default(),
+        cdf53_dirty: vec![Cdf53Tile {
+            tile_x: 1,
+            tile_y: 1,
+            encoded: enc(1),
+            #[cfg(feature = "cdf53-diag")]
+            coeffs_i16: Vec::new(),
+        }],
+        cdf53_escalation: vec![Some(enc(2)), None],
+        escalation_candidates: vec![10, 15],
+        stranded_count: 0,
+        timings: TileTimings::default(),
+        frame_palette_set_count: 0,
+    };
+    bridge.emit_tile_codec_frame(&[(1, 1)], &frame, &frame.pixels, results, 1, 1000);
+    assert!(
+        bridge.scheduler.refinement_queue_holds_tile(1, 1)
+            || bridge.scheduler.generation_for(1, 1) > 0,
+        "the dirty CDF 5/3 tile was committed"
+    );
+    assert!(
+        bridge.scheduler.generation_for(2, 2) > 0,
+        "the encoded escalation slot started a new generation"
+    );
+    assert_eq!(
+        bridge.scheduler.generation_for(3, 3),
+        0,
+        "the slot the backend skipped was not committed"
+    );
 }

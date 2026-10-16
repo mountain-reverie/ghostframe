@@ -31,7 +31,6 @@ use rayon::prelude::*;
 use smallvec::smallvec;
 
 use crate::capture::gpu_pipeline::GpuFrameProcessor;
-use crate::encoder::h264_vaapi::FullFrameEncoder;
 use crate::server::FrameSubmission;
 use crate::tile::{DirtyTracker, TileGrid};
 use crate::transport::fec;
@@ -97,12 +96,22 @@ use pacing::{
 #[path = "io_bridge/emit.rs"]
 mod emit;
 
+#[path = "io_bridge/frame_backend.rs"]
+mod frame_backend;
+pub use frame_backend::{
+    Analysed, Cdf53Encoded, Cdf53Tile, Control, EscalationSlot, FrameBackend, GpuBackend, GpuDiag,
+    H264Out, OwnedPalRle, PixelSource, TileOut, TileRequest, TileTimings,
+};
+
 #[path = "io_bridge/frame.rs"]
 mod frame;
 #[cfg(test)]
 use frame::palrle_index_slice;
 #[cfg(test)]
-use frame::{clamp_gpu_tile_count, monotonic_now_ns, populate_gpu_metrics, PalRleTileWorkPrep};
+use frame::{
+    apply_gpu_metrics, clamp_gpu_tile_count, monotonic_now_ns, populate_gpu_metrics,
+    PalRleTileWorkPrep,
+};
 
 #[path = "io_bridge/harness.rs"]
 mod harness;
@@ -475,10 +484,10 @@ pub struct IoBridge {
     /// the EXISTING generation — no `bump_generation`, no
     /// `cancel_for_tile`).
     cdf53_stranded_candidates_this_frame: Vec<u32>,
-    /// GPU-accelerated dirty tracker (Vulkan compute SAD).
-    gpu_frame_processor: Option<GpuFrameProcessor>,
-    /// Full-frame H.264 encoder (VA-API zero-copy).
-    full_frame_encoder: Option<FullFrameEncoder>,
+    /// The GPU and encoder work of a frame (Vulkan dirty detection and
+    /// analysis, VA-API H.264, CDF 5/3 pass encoding). `None` without a GPU,
+    /// in which case frames take the CPU path. See `frame_backend`.
+    frame_backend: Option<Box<dyn FrameBackend>>,
     /// Per-tile-pass coverage map: (frame_seq, tile_x, tile_y, pass_idx) ->
     /// tile metadata for a work item. Populated at emit time; consumed by
     /// dispatch_ack_datagram on incoming ACKs. LRU-bounded by
@@ -967,7 +976,7 @@ fn validate_frame_header(total_len: usize, payload_len: usize) -> io::Result<usi
 struct BaseDiffs {
     handle: Option<GhostbridgeHandle>,
     local_addr: SocketAddr,
-    gpu_frame_processor: Option<GpuFrameProcessor>,
+    frame_backend: Option<Box<dyn FrameBackend>>,
 }
 
 impl IoBridge {
@@ -1044,8 +1053,7 @@ impl IoBridge {
             recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
             cdf53_stranded_candidates_this_frame: Vec::new(),
-            gpu_frame_processor: diffs.gpu_frame_processor,
-            full_frame_encoder: None,
+            frame_backend: diffs.frame_backend,
             fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap::new(
                 crate::transport::fragment_coverage::FRAGMENT_COVERAGE_CAPACITY,
             ),
@@ -1201,8 +1209,10 @@ impl IoBridge {
         // its IP as the `local_ip` hint for inbound packets.
         let local_addr = SocketAddr::new(bind_ip, port);
 
-        let gpu_frame_processor = GpuFrameProcessor::new(2048 * 2).ok();
-        if gpu_frame_processor.is_some() {
+        let frame_backend = GpuFrameProcessor::new(2048 * 2)
+            .ok()
+            .map(|p| Box::new(GpuBackend::new(p)) as Box<dyn FrameBackend>);
+        if frame_backend.is_some() {
             tracing::info!("GPU dirty tracker initialized (Vulkan compute SAD)");
         }
 
@@ -1217,7 +1227,7 @@ impl IoBridge {
             BaseDiffs {
                 handle: Some(handle),
                 local_addr,
-                gpu_frame_processor,
+                frame_backend,
             },
         );
         Ok(bridge)
