@@ -247,6 +247,10 @@ pub(crate) struct FrameSendStats {
 /// is 0.05^10 ≈ 9.7e-14.
 const FRAME_DIMENSIONS_RETRANSMITS: u8 = 10;
 
+/// Shared log of `(start, end)` tokio-clock instants; see `IoBridge::hold_log`.
+#[cfg(any(test, feature = "browserless-harness"))]
+pub type HoldLog = std::sync::Arc<std::sync::Mutex<Vec<(std::time::Instant, std::time::Instant)>>>;
+
 /// One scene frame's worth of pre-encoded tile work, injected by the
 /// browserless harness in place of capture + classification.
 ///
@@ -258,6 +262,13 @@ pub struct InjectedFrame {
     pub seq: u32,
     pub timestamp_us: u32,
     pub work: Vec<crate::transport::scheduler::TileWork>,
+    /// Harness only: how long this frame holds the event loop, on tokio's
+    /// clock. The loop awaits it inline before applying the frame, which is
+    /// what `process_frame` does to the real loop for the time it runs. A real
+    /// frame's cost is CPU time, which a paused clock cannot see, so without
+    /// this the browserless scenes cannot show the stall at all. `None`
+    /// (every existing scene) costs nothing.
+    pub cost: Option<std::time::Duration>,
 }
 
 /// An arm of the `select!` in `IoBridge::run`. See `IoBridge::loop_arm_trace`.
@@ -387,6 +398,18 @@ pub struct IoBridge {
     #[cfg(any(test, feature = "test-loss-injection"))]
     pub(crate) drop_plan:
         Option<std::sync::Arc<std::sync::Mutex<crate::transport::drop_plan::DropPlan>>>,
+
+    /// Harness only: the tokio-clock instant at which the inbound arm took
+    /// each packet off the socket, in order. Paired by position with the
+    /// instants the harness wrote them, it gives the loop's inbound service
+    /// delay. `Arc<Mutex<_>>` for the same reason as `drop_plan`.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub(crate) inbound_read_log: Option<std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>>,
+    /// Harness only: `(start, end)` on tokio's clock of every `cost` hold the
+    /// injected arm actually performed, so a scene reports when the loop was
+    /// really held rather than when the driver submitted the frame.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub(crate) hold_log: Option<HoldLog>,
 
     /// Lower bound applied to `base_budget_bytes`; `None` derives it from the
     /// live MTU (`tick_budget_floor`).
@@ -1001,6 +1024,10 @@ impl IoBridge {
             skip_palette_session_reset: lib_config.transport.skip_palette_session_reset,
             #[cfg(any(test, feature = "test-loss-injection"))]
             drop_plan: None,
+            #[cfg(any(test, feature = "browserless-harness"))]
+            inbound_read_log: None,
+            #[cfg(any(test, feature = "browserless-harness"))]
+            hold_log: None,
             tick_budget_floor_bytes: None,
             last_max_datagram_size: None,
             force_dirty_frames: 0,
@@ -1590,6 +1617,12 @@ impl IoBridge {
                     self.loop_arm_trace.push(LoopArm::Inbound);
                     match read_res {
                         Ok(_) => {
+                            #[cfg(any(test, feature = "browserless-harness"))]
+                            if let Some(log) = self.inbound_read_log.as_ref() {
+                                log.lock()
+                                    .expect("inbound_read_log mutex poisoned")
+                                    .push(now_std());
+                            }
                             if let Err(e) = self.process_inbound(&header).await {
                                 tracing::warn!("inbound frame error: {e}");
                             }
@@ -1636,6 +1669,17 @@ impl IoBridge {
                     self.loop_arm_trace.push(LoopArm::Injected);
                     match injected {
                         Some(inj) => {
+                            if let Some(cost) = inj.cost {
+                                #[cfg(any(test, feature = "browserless-harness"))]
+                                let started = now_std();
+                                tokio::time::sleep(cost).await;
+                                #[cfg(any(test, feature = "browserless-harness"))]
+                                if let Some(log) = self.hold_log.as_ref() {
+                                    log.lock()
+                                        .expect("hold_log mutex poisoned")
+                                        .push((started, now_std()));
+                                }
+                            }
                             self.apply_injected_frame(inj);
                         }
                         None => {

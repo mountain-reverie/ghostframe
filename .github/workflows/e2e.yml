@@ -31,6 +31,7 @@ jobs:
   browserless:
     name: browserless
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/workflows/_setup-system-deps
@@ -121,6 +122,7 @@ jobs:
       - run: cargo test --test browserless_determinism -- --test-threads=1
       - run: cargo test --test browserless_queue_latency -- --test-threads=1
       - run: cargo test --test browserless_blocked_path -- --test-threads=1
+      - run: cargo test --test browserless_loop_stall -- --test-threads=1
       # Report-only instrument (asserts premises, not timing); the scenes run
       # over-driven load on a constrained link and can hit the harness's
       # load-dependent stall bail, so they must not gate merges.

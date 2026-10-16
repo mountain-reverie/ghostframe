@@ -173,8 +173,39 @@ pub struct BrowserlessScene {
     pub grid_rows: u32,
 }
 
+/// Optional measurement knobs for [`run_browserless_with_options`]. The
+/// default changes nothing, so every existing scene is bit-identical.
+#[derive(Clone, Copy, Default)]
+pub struct RunOptions {
+    /// Hold the server's event loop this long (virtual time) for every real
+    /// scene frame, inline, before it is applied. Models `process_frame`
+    /// running on the loop: see `InjectedFrame::cost`.
+    ///
+    /// The hold is applied in `IoBridge::run`'s injected arm, not inside
+    /// `process_frame`: a later change that moves `process_frame` off the loop
+    /// does not move this sleep by itself, so a test that merely stops
+    /// applying it proves nothing about production.
+    ///
+    /// Keep it well below the scene's cadence. With the hold longer than the
+    /// frame interval the bounded inject channel (8) fills, the driver blocks
+    /// in `inject_tx.send(..).await` outside any select, the bridge blocks
+    /// writing server -> client datagrams nobody is reading, and nothing is
+    /// left to advance the paused clock. `inject_frame` now bounds that send
+    /// so it fails instead of hanging.
+    pub frame_cost: Option<Duration>,
+}
+
 /// Outcome of one `run_browserless` call.
 pub struct BrowserlessResult {
+    /// `(virtual_us_written, delay_us)` for every client -> server packet:
+    /// the time between the harness writing it to the socketpair and the
+    /// server's inbound arm taking it off. Near zero while the loop is idle;
+    /// a frame that holds the loop makes it at least the remaining hold.
+    pub inbound_service_delays: Vec<(u64, u64)>,
+    /// `(start_us, end_us)` virtual-time windows during which the server's
+    /// loop actually sat in an injected frame's `cost` hold, logged by the
+    /// bridge itself. Empty without a cost.
+    pub frame_cost_windows: Vec<(u64, u64)>,
     pub framebuffer: FrameBuffer,
     pub events: Vec<ClientNetEvent>,
     pub bytes_delivered: u64,
@@ -480,13 +511,23 @@ pub async fn run_browserless_with_links(
     scene: BrowserlessScene,
     links: LinkOverrides,
 ) -> anyhow::Result<BrowserlessResult> {
+    run_browserless_with_options(scene, links, RunOptions::default()).await
+}
+
+/// [`run_browserless_with_links`] with measurement options.
+pub async fn run_browserless_with_options(
+    scene: BrowserlessScene,
+    links: LinkOverrides,
+    opts: RunOptions,
+) -> anyhow::Result<BrowserlessResult> {
     let local = LocalSet::new();
-    local.run_until(run_inner(scene, links)).await
+    local.run_until(run_inner(scene, links, opts)).await
 }
 
 async fn run_inner(
     mut scene: BrowserlessScene,
     links: LinkOverrides,
+    opts: RunOptions,
 ) -> anyhow::Result<BrowserlessResult> {
     let seed = scene.seed;
 
@@ -564,13 +605,18 @@ async fn run_inner(
     if let Some(floor) = scene.tick_budget_floor_bytes {
         bridge.set_tick_budget_floor_bytes(floor);
     }
+    let read_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    bridge.set_inbound_read_log(read_log.clone());
+    let hold_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    bridge.set_hold_log(hold_log.clone());
     // `IoBridge::run` is an infinite event loop that only returns on EOF or
     // error; it must be aborted explicitly (see below) rather than awaited.
     let bridge_handle = tokio::task::spawn_local(async move {
         let _ = bridge.run().await;
     });
 
-    let mut pump = SocketPairPump::new(peer);
+    let write_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut pump = SocketPairPump::new(peer).with_send_log(write_log.clone());
     let base = TokioInstant::now();
     let client_addr = client_addr();
     let server_addr = server_addr();
@@ -600,6 +646,7 @@ async fn run_inner(
         &server_live_rx,
         &links,
         &mut s2c_loss,
+        opts,
     )
     .await;
 
@@ -640,7 +687,44 @@ async fn run_inner(
         .drops()
         .to_vec();
 
+    // Pair each write with the read of the same packet by position: the
+    // socketpair is a FIFO and the inbound arm takes one packet per turn.
+    let writes = write_log.lock().expect("write_log poisoned").clone();
+    let reads = read_log.lock().expect("read_log poisoned").clone();
+    // Packets written but not yet read when the scene ended are the tail;
+    // a read without a logged write, or a long unread run, would mean the
+    // positional pairing has drifted, which must be loud, not a shifted series.
+    anyhow::ensure!(
+        reads.len() <= writes.len() && writes.len() - reads.len() <= 64,
+        "seed {seed}: inbound pairing drifted: {} writes vs {} reads",
+        writes.len(),
+        reads.len()
+    );
+    let frame_cost_windows: Vec<(u64, u64)> = hold_log
+        .lock()
+        .expect("hold_log poisoned")
+        .iter()
+        .map(|(a, b)| {
+            (
+                a.saturating_duration_since(base.into_std()).as_micros() as u64,
+                b.saturating_duration_since(base.into_std()).as_micros() as u64,
+            )
+        })
+        .collect();
+    let inbound_service_delays: Vec<(u64, u64)> = writes
+        .iter()
+        .zip(reads.iter())
+        .map(|(w, r)| {
+            (
+                w.saturating_duration_since(base.into_std()).as_micros() as u64,
+                r.saturating_duration_since(*w).as_micros() as u64,
+            )
+        })
+        .collect();
+
     Ok(BrowserlessResult {
+        inbound_service_delays,
+        frame_cost_windows,
         send_datagram_errs,
         emission_queue_peak: emitter_stats.emission_queue_peak,
         framebuffer,
@@ -719,6 +803,7 @@ async fn drive_session(
     server_live_rx: &tokio::sync::watch::Receiver<usize>,
     links: &LinkOverrides,
     s2c_loss: &mut S2cLoss,
+    opts: RunOptions,
 ) -> anyhow::Result<(Vec<ClientNetEvent>, u64, u64, u64, u64, u64)> {
     let seed = scene.seed;
 
@@ -1039,6 +1124,7 @@ async fn drive_session(
                             cadence_us,
                             &mut generations,
                             inject_tx,
+                            opts.frame_cost,
                         )
                         .await
                         .map_err(|e| {
@@ -1213,6 +1299,7 @@ async fn inject_frame(
     cadence_us: u64,
     generations: &mut HashMap<(u8, u8), u8>,
     inject_tx: &mpsc::Sender<InjectedFrame>,
+    cost: Option<Duration>,
 ) -> anyhow::Result<()> {
     let seed = scene.seed;
     let mut work = Vec::new();
@@ -1246,11 +1333,20 @@ async fn inject_frame(
         // harness's own unbounded "drain everything" budget that sat in
         // front of both.
         work,
+        cost,
     };
 
-    inject_tx
-        .send(frame)
+    // Bounded: a send that cannot complete (the bridge is not draining the
+    // channel) must fail the scene, not park the paused runtime forever.
+    tokio::time::timeout(Duration::from_secs(30), inject_tx.send(frame))
         .await
+        .map_err(|_| {
+            anyhow!(
+                "seed {seed}: inject_tx send blocked 30 s at frame {frame_idx}: the injection \
+                 channel is full and the bridge is not draining it (frame cost longer than the \
+                 cadence?)"
+            )
+        })?
         .map_err(|e| anyhow!("seed {seed}: inject_tx send failed at frame {frame_idx}: {e}"))
 }
 
@@ -1278,6 +1374,7 @@ async fn inject_heartbeat(
         seq,
         timestamp_us: (seq as u64 * cadence_us) as u32,
         work: Vec::new(),
+        cost: None,
     };
     inject_tx
         .send(frame)
