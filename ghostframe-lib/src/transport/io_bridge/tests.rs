@@ -1262,18 +1262,261 @@ async fn a_failed_gpu_stage_returns_the_frame_and_clears_the_flight() {
     assert!(bridge.fatal.is_none());
 }
 
-/// A panic in the worker is fatal: the result channel closes (and `run`
-/// returns an error from the arm that sees it) rather than the stream
-/// carrying on with a dead backend.
+/// A panic in the worker is fatal and says why: the result channel closes
+/// with the panic message recorded, and `run` returns an error carrying it,
+/// rather than the stream carrying on with a dead backend.
 #[tokio::test]
-async fn a_worker_panic_closes_the_result_channel() {
+async fn a_worker_panic_ends_run_with_an_error_naming_it() {
     let backend = RecordingBackend {
         panic_in_analyse: true,
         ..Default::default()
     };
     let (mut bridge, _peer) = bridge_with_backend(backend);
     bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
-    assert!(next_worker_message(&mut bridge).await.is_none());
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), bridge.run())
+        .await
+        .expect("run noticed the dead worker within 5 s");
+    let err = outcome.expect_err("run returns an error when the worker dies");
+    let text = err.to_string();
+    assert!(
+        text.contains("told to panic"),
+        "the error should carry the panic message: {text}"
+    );
+}
+
+/// What to tell the worker for a frame the classifier put in H.264 mode: nothing
+/// when no tile changed, else an encode that forces an IDR only on re-entry
+/// from the tile path.
+#[test]
+fn the_h264_finish_action_forces_a_keyframe_only_on_re_entry_and_discards_when_idle() {
+    use crate::tile::FrameMode;
+    let action = |empty, prev| frame::h264_finish_action(empty, prev);
+    assert!(matches!(
+        action(false, FrameMode::TileCodec),
+        FinishAction::H264 {
+            force_keyframe: true
+        }
+    ));
+    assert!(matches!(
+        action(false, FrameMode::H264),
+        FinishAction::H264 {
+            force_keyframe: false
+        }
+    ));
+    assert!(matches!(
+        action(true, FrameMode::H264),
+        FinishAction::Discard
+    ));
+    assert!(matches!(
+        action(true, FrameMode::TileCodec),
+        FinishAction::Discard
+    ));
+}
+
+fn stale_inflight(stage: frame::InFlightStage) -> frame::InFlight {
+    frame::InFlight {
+        seq: 1,
+        epoch: 0,
+        meta: frame::FrameMeta::of(&tiny_frame()),
+        max_dg_size: 1200,
+        stage,
+    }
+}
+
+/// An H.264 result for a session that has ended is dropped, and the encoder is
+/// told to start the next frame with an IDR: its reference chain advanced past
+/// a frame the client never got.
+#[tokio::test]
+async fn a_stale_h264_result_is_dropped_and_asks_for_a_keyframe() {
+    let (mut bridge, _peer, _log) = recording_bridge();
+    bridge.test_commit_dg_size = Some(1200);
+    bridge.session_epoch = 1;
+    bridge.on_h264_done(
+        stale_inflight(frame::InFlightStage::FinishingH264 {
+            trace: Default::default(),
+        }),
+        Some(H264Out {
+            payload: vec![1, 2, 3],
+            is_keyframe: false,
+        }),
+        0,
+    );
+    assert_eq!(bridge.pending_controls, vec![Control::RequestKeyframe]);
+}
+
+/// A tile result for a session that has ended is dropped, and the GPU baseline
+/// (which the frame advanced) is invalidated so the next frame repaints.
+#[tokio::test]
+async fn a_stale_tile_result_is_dropped_and_invalidates_the_baseline() {
+    let (mut bridge, _peer, _log) = recording_bridge();
+    bridge.test_commit_dg_size = Some(1200);
+    bridge.session_epoch = 1;
+    let out = TileOut {
+        pixels: Ok(PixelSource::Frame),
+        palrle: OwnedPalRle::default(),
+        cdf53_dirty: Vec::new(),
+        cdf53_escalation: Vec::new(),
+        timings: TileTimings::default(),
+    };
+    bridge.on_tile_done(
+        stale_inflight(frame::InFlightStage::FinishingTile {
+            dirty_xy: vec![(0, 0)],
+            max_frag: 1000,
+            escalation_candidates: Vec::new(),
+            stranded_count: 0,
+            frame_palette_set_count: 0,
+            trace: Default::default(),
+        }),
+        out,
+        Vec::new(),
+        0,
+    );
+    assert_eq!(
+        bridge.pending_controls,
+        vec![Control::InvalidateBaseline(1)]
+    );
+}
+
+fn empty_tile_out() -> TileOut {
+    TileOut {
+        pixels: Ok(PixelSource::Frame),
+        palrle: OwnedPalRle::default(),
+        cdf53_dirty: Vec::new(),
+        cdf53_escalation: Vec::new(),
+        timings: TileTimings::default(),
+    }
+}
+
+fn tile_inflight() -> frame::InFlight {
+    stale_inflight(frame::InFlightStage::FinishingTile {
+        dirty_xy: vec![(0, 0)],
+        max_frag: 1000,
+        escalation_candidates: Vec::new(),
+        stranded_count: 0,
+        frame_palette_set_count: 0,
+        trace: Default::default(),
+    })
+}
+
+/// With the same epoch but no live session left to size datagrams for, the
+/// result is dropped like a stale one.
+#[tokio::test]
+async fn a_tile_result_with_no_live_session_left_is_dropped() {
+    let (mut bridge, _peer, _log) = recording_bridge();
+    bridge.on_tile_done(tile_inflight(), empty_tile_out(), Vec::new(), 0);
+    assert_eq!(
+        bridge.pending_controls,
+        vec![Control::InvalidateBaseline(1)]
+    );
+}
+
+/// The path MTU can shrink while the worker runs: the tile frame is
+/// fragmented for the smaller size, and one that no longer fits a fragment is
+/// dropped with a repaint rather than sent in oversize datagrams.
+#[tokio::test]
+async fn a_path_mtu_that_shrank_below_a_fragment_drops_the_tile_frame() {
+    let (mut bridge, _peer, _log) = recording_bridge();
+    bridge.test_commit_dg_size = Some(10);
+    bridge.on_tile_done(tile_inflight(), empty_tile_out(), Vec::new(), 0);
+    assert_eq!(
+        bridge.pending_controls,
+        vec![Control::InvalidateBaseline(1)]
+    );
+}
+
+/// The frame's dimensions are announced when its results are committed, not
+/// when its analysis is accepted: on a resolution change the client resizes its
+/// canvas on them, and the finish can take a second.
+#[tokio::test]
+async fn a_frame_with_dirty_tiles_does_not_announce_its_dimensions_at_analysis() {
+    struct Dirty(RecordingBackend);
+    impl FrameBackend for Dirty {
+        fn apply(&mut self, c: Control) {
+            self.0.apply(c)
+        }
+        fn analyse(&mut self, f: &FrameSubmission, e: &[u32], d: bool) -> Result<Analysed, String> {
+            let mut a = self.0.analyse(f, e, d)?;
+            a.dirty_tiles = vec![0];
+            a.dirty_analysis = vec![None];
+            Ok(a)
+        }
+        fn finish_h264(&mut self, f: &FrameSubmission, k: bool) -> Option<H264Out> {
+            self.0.finish_h264(f, k)
+        }
+        fn finish_tile(&mut self, f: &FrameSubmission, r: &TileRequest<'_>) -> TileOut {
+            self.0.finish_tile(f, r)
+        }
+        fn finish_discard(&mut self) {
+            self.0.finish_discard()
+        }
+        fn forward_cdf53_tiles(&mut self, t: &[&[u8]]) -> Result<Vec<i16>, String> {
+            self.0.forward_cdf53_tiles(t)
+        }
+    }
+    let (mut bridge, _peer) = {
+        let (our_end, peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        our_end.set_nonblocking(true).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(
+            tokio::net::UnixStream::from_std(our_end).unwrap(),
+            server,
+            rx,
+        );
+        bridge.set_frame_backend(Box::new(Dirty(RecordingBackend::default())));
+        (bridge, tokio::net::UnixStream::from_std(peer).unwrap())
+    };
+    bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    let analysed = next_worker_message(&mut bridge).await.unwrap();
+    bridge.on_frame_worker_message(analysed);
+    assert!(bridge.in_flight.is_some(), "the frame is being finished");
+    assert_eq!(
+        bridge.last_emitted_dimensions, None,
+        "dimensions wait for the commit"
+    );
+}
+
+/// A client decode error that names a tile of the frame being committed waits
+/// for the commit: until then the tile's codec state is tentative.
+#[tokio::test]
+async fn a_decode_error_for_a_tile_in_flight_waits_for_the_commit() {
+    use crate::tile::CodecState;
+    use crate::transport::decode_error::{DecodeErrorMsg, ERR_THIN_UNCACHED_PALETTE};
+    let (mut bridge, _peer, _log) = recording_bridge();
+    bridge.metrics_tracker.resize(2, 2);
+    bridge.metrics_tracker.get_mut(1, 1).codec_state = CodecState::PalRle { palette_id: 5 };
+    bridge.palette_table.delivered.insert(5);
+    bridge.in_flight = Some(stale_inflight(frame::InFlightStage::FinishingTile {
+        dirty_xy: vec![(1, 1)],
+        max_frag: 1000,
+        escalation_candidates: Vec::new(),
+        stranded_count: 0,
+        frame_palette_set_count: 0,
+        trace: Default::default(),
+    }));
+    bridge.handle_decode_error(DecodeErrorMsg {
+        codec: 2,
+        tile_x: 1,
+        tile_y: 1,
+        error_code: ERR_THIN_UNCACHED_PALETTE,
+    });
+    assert!(
+        bridge.palette_table.delivered.contains(5),
+        "not handled while the tile's frame is in flight"
+    );
+    assert_eq!(bridge.deferred_decode_errors.len(), 1);
+
+    // The frame ends (here a discard): the error is handled against the
+    // committed state.
+    let (mut b, _p, _l) = (bridge, _peer, _log);
+    b.in_flight = Some(stale_inflight(frame::InFlightStage::FinishingDiscard));
+    b.on_frame_worker_message(FromWorker::Discarded { seq: 1 });
+    assert!(b.deferred_decode_errors.is_empty());
+    assert!(
+        !b.palette_table.delivered.contains(5),
+        "handled once the frame is done"
+    );
 }
 
 /// Dropping the bridge stops waiting for a stuck worker after the bound, not

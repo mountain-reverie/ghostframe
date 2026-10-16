@@ -368,6 +368,10 @@ impl IoBridge {
     /// a session must go through here: quinn reuses handles from a slab, so
     /// a forgotten entry can alias a future connection.
     pub(super) fn forget_session(&mut self, handle: ConnectionHandle) {
+        if self.last_hello_from == Some(handle) {
+            // The live session is going; a frame in flight is its.
+            self.session_epoch += 1;
+        }
         self.wt_sessions.remove(&handle);
         self.feedback_recv_bufs.remove(&handle);
         self.close_deadlines.remove(&handle);
