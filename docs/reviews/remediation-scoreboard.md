@@ -213,7 +213,7 @@ Schedule:
 
 Owner decisions 2026-10-16:
 - Nothing is in production: wire changes need no backward compatibility. This supersedes the FEC v2 design's "legacy path kept two releases"; the HELLO bit is optional.
-- Raw tiles are dropped. CDF 5/3 (lossless after all passes) is the GPU-path fallback, done first through a second small GPU forward dispatch for the tiles PalRle cannot take; then Raw leaves protocol, server and all clients. The server is GPU-first and software paths are avoided. Still open: whether a host without a usable GPU refuses to start (proposed: yes, with a test-only CPU CDF 5/3 route).
+- Raw tiles are dropped. CDF 5/3 (lossless after all passes) is the GPU-path fallback, done first through a second small GPU forward dispatch for the tiles PalRle cannot take; then Raw leaves protocol, server and all clients. The server is GPU-first and software paths are avoided. A host without a usable GPU refuses to start; unit tests keep a `#[cfg(test)]`-only CPU CDF 5/3 route. A software server path, if ever, is a separate explicit decision.
 - The Raw per-fragment ACK fix is abandoned. Once Raw is gone a CDF 5/3 pass is at most 776 B (proven by test), so every tile datagram is single-fragment and tile fragmentation can be deleted later.
 - The Go-side ghostbridge per-packet work (2 reads and one `ResolveUDPAddr` per packet) is not optimised: the owner is considering the Rust Tailscale implementation instead.
 
