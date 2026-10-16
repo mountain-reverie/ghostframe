@@ -86,59 +86,6 @@ fn drain_stream(core: &mut ClientCore) -> Vec<Vec<u8>> {
 }
 
 #[test]
-fn assembly_timeout_nacks_missing_fragments_once() {
-    let mut core = test_core();
-    let dgs = tile_datagrams(1, 0, 0, Codec::Solid, 0, &vec![7u8; 4096], 1200); // 4 frags
-    assert_eq!(dgs.len(), 4);
-    core.handle_datagram(&dgs[0], 0);
-
-    // Advance past the 30ms scan deadline.
-    let deadline = core.poll_timeout().unwrap();
-    core.on_timeout(deadline.max(31_000));
-    let nack = drain_datagrams(&mut core)
-        .into_iter()
-        .find(|d| d[0] == 0x05)
-        .expect("nack sent");
-    // NACK envelope: [0]=0x05, [1]=entry count.
-    assert_eq!(nack[1], 3); // frags 1,2,3 missing
-
-    // Second scan: no duplicate NACKs (dedup via nacked_frag_idxs).
-    core.on_timeout(70_000);
-    assert!(drain_datagrams(&mut core).into_iter().all(|d| d[0] != 0x05));
-}
-
-#[test]
-fn assembly_timeout_scan_deadline_retires_once_fully_nacked() {
-    let mut core = test_core();
-    let dgs = tile_datagrams(1, 0, 0, Codec::Solid, 0, &vec![7u8; 4096], 1200); // 4 frags
-    assert_eq!(dgs.len(), 4);
-    core.handle_datagram(&dgs[0], 0);
-
-    // Advance past the 30ms scan deadline: the scan NACKs all 3 missing
-    // fragments, so every entry in `nacked_frag_idxs` now covers every
-    // still-missing fragment index.
-    let deadline = core.poll_timeout().unwrap();
-    let now = deadline.max(31_000);
-    core.on_timeout(now);
-    let nack = drain_datagrams(&mut core)
-        .into_iter()
-        .find(|d| d[0] == 0x05)
-        .expect("nack sent");
-    assert_eq!(nack[1], 3);
-
-    // Regression: a fully-NACKed assembly must stop arming the assembly
-    // scan deadline in `poll_timeout`. Before the fix, `partial_since_us +
-    // 30ms` (already in the past relative to `now`) stayed the min-fold
-    // forever, so a "sleep until poll_timeout" driver would busy-loop.
-    let next = core.poll_timeout().unwrap();
-    assert!(
-        next > now,
-        "poll_timeout must not return a deadline <= now once every missing \
-         fragment has been NACKed (got {next}, now was {now})"
-    );
-}
-
-#[test]
 fn on_timeout_clamps_feedback_burst_after_large_clock_gap() {
     let mut core = test_core();
     // Simulate a huge clock gap: on_timeout is next called 10s late, i.e.

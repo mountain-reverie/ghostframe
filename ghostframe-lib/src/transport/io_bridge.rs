@@ -44,9 +44,9 @@ use crate::transport::peer_auth::{
     AccessPolicy, DenialLog, PeerGate, PeerLookup, TsnetWhoIs, WhoIsError,
 };
 use crate::transport::protocol::{
-    build_frame_parity_datagram, fragment_frame, fragment_tile, max_fec_frame_fragment_payload,
-    max_fragment_payload, Codec, TileFragmentInputs, FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD,
-    TILE_DATAGRAM_FLAG,
+    build_frame_parity_datagram, encode_tile_datagram, fragment_frame,
+    max_fec_frame_fragment_payload, max_fragment_payload, Codec, TileFragmentInputs,
+    FRAME_HEADER_SIZE, MAX_TILE_PAYLOAD, PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;

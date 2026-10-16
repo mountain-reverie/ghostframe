@@ -23,7 +23,7 @@ use crate::event::{Event, PollOutput, TileData, TileKey};
 use crate::pal_rle_decode::{decode_pal_rle_tile, prevalidate_pal_rle};
 use crate::{
     Assembly, ClientCore, TileDelivery, MAX_ASSEMBLY_BYTES, MAX_FRAME_DIMENSION,
-    MAX_LIVE_ASSEMBLIES, MAX_TILE_FRAGMENTS,
+    MAX_LIVE_ASSEMBLIES,
 };
 use ghostframe_protocol::tile::TILE_SIZE;
 
@@ -236,9 +236,11 @@ impl ClientCore {
         // drop before the ACK on purpose: a tile refused here (for example
         // one from a larger frame whose dimensions datagram has not arrived
         // yet) is then retransmitted rather than counted delivered.
-        if !is_sentinel
-            && (dh.frag_total > MAX_TILE_FRAGMENTS || !self.tile_in_grid(th.tile_x, th.tile_y))
-        {
+        //
+        // A tile pass is one datagram (no payload exceeds `MAX_TILE_PAYLOAD`),
+        // so a tile claiming any other fragment count is hostile or from a
+        // server that no longer exists: refused, never stored.
+        if !is_sentinel && (dh.frag_total != 1 || !self.tile_in_grid(th.tile_x, th.tile_y)) {
             return;
         }
 

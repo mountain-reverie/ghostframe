@@ -361,6 +361,31 @@ pub fn build_parity_datagrams(
 }
 
 // ---------------------------------------------------------------------------
+// One datagram per tile pass
+// ---------------------------------------------------------------------------
+
+/// The most payload bytes any tile datagram carries: the larger of a CDF 5/3
+/// pass and a bundled PalRle tile at its worst (Solid is 4). With Raw gone no
+/// tile payload exceeds this, so a tile is always one datagram and the client
+/// treats `frag_total > 1` on a tile as hostile.
+pub const MAX_TILE_PAYLOAD: usize = {
+    let a = crate::codec::cdf53::MAX_PASS_PAYLOAD;
+    let b = crate::codec::pal_rle::MAX_PAL_RLE_PAYLOAD;
+    if a > b {
+        a
+    } else {
+        b
+    }
+};
+
+/// Encode one tile pass as a single datagram (`frag_idx` 0 of 1). The caller
+/// has checked `payload.len() <= max_fragment_payload(path datagram size)`;
+/// that a payload fits is the caller's invariant, not split here.
+pub fn encode_tile_datagram(inputs: &TileFragmentInputs, payload: &[u8]) -> Vec<u8> {
+    fragment_tile(inputs, payload, payload.len().max(1)).remove(0)
+}
+
+// ---------------------------------------------------------------------------
 // max_fragment_payload
 // ---------------------------------------------------------------------------
 
@@ -1707,5 +1732,30 @@ mod tests {
                  covers it"
             );
         }
+    }
+
+    /// A tile is one datagram on any QUIC path: the largest tile payload fits
+    /// the payload room measured at the 1200-byte QUIC floor (1136 bytes), and
+    /// the encoder yields exactly one datagram for it.
+    #[test]
+    fn the_largest_tile_payload_is_one_datagram_at_the_quic_floor() {
+        const FLOOR_PAYLOAD: usize = 1136;
+        assert_eq!(MAX_TILE_PAYLOAD, crate::codec::pal_rle::MAX_PAL_RLE_PAYLOAD);
+        const { assert!(MAX_TILE_PAYLOAD <= FLOOR_PAYLOAD) };
+        let payload = vec![0xA5u8; MAX_TILE_PAYLOAD];
+        let inputs = TileFragmentInputs {
+            frame_seq: 1,
+            tile_x: 0,
+            tile_y: 0,
+            codec: Codec::PalRle,
+            generation: 0,
+            pass: 0,
+            timestamp_us: 0,
+        };
+        let dg = encode_tile_datagram(&inputs, &payload);
+        let (dh, _th, body) = decode_tile_datagram(&dg).unwrap();
+        assert_eq!((dh.frag_idx, dh.frag_total), (0, 1));
+        assert_eq!(body, payload.as_slice());
+        assert_eq!(fragment_tile(&inputs, &payload, FLOOR_PAYLOAD).len(), 1);
     }
 }

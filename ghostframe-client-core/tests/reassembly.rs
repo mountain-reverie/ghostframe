@@ -82,66 +82,23 @@ fn solid_tile_roundtrip_single_fragment() {
 }
 
 #[test]
-fn multi_fragment_tile_completes_out_of_order() {
+fn a_tile_split_over_several_datagrams_is_refused() {
     let mut core = test_core();
-    // A valid CDF 5/3 pass 0 payload cut into three tiny fragments, so the
-    // out-of-order assembly is real: an invalid payload would not complete
-    // into a tile.
+    // A valid CDF 5/3 pass 0 payload cut into three tiny fragments. A tile is one
+    // datagram now: none of the fragments is stored, and none completes a tile.
     let payload = valid_cdf53_payload();
     let dgs = tile_datagrams(5, 1, 2, Codec::Cdf53, 0, &payload, 4);
     assert_eq!(dgs.len(), 3);
-
-    // Deliver out of order: 2, 0, 1.
-    assert!(core.handle_datagram(&dgs[2], 100).is_empty());
-    assert!(core.handle_datagram(&dgs[0], 101).is_empty());
-    let evs = core.handle_datagram(&dgs[1], 102);
-
-    assert!(
-        evs.iter().any(|e| matches!(
-            e,
-            Event::TileReady {
-                frame_seq: 5,
-                tile_x: 1,
-                tile_y: 2,
-                rgba,
-            } if rgba.len() == 4096
-        )),
-        "the last fragment must complete the tile: {evs:?}"
-    );
-}
-
-#[test]
-fn stale_assembly_evicted_at_threshold_2() {
-    let mut core = test_core();
-    // Frame 1: a 2-fragment tile, deliver only fragment 0 (incomplete).
-    let payload = valid_cdf53_payload();
-    let f1 = tile_datagrams(1, 0, 0, Codec::Cdf53, 0, &payload, 6);
-    assert_eq!(f1.len(), 2);
-    assert!(core.handle_datagram(&f1[0], 10).is_empty());
-
-    // Frames 2, 3, 4: complete single-fragment solid tiles advance
-    // latest_frame_seq. At frame 4, threshold = 4 - 2 = 2, so frame 1's
-    // incomplete assembly (1 < 2) is evicted.
-    for seq in 2..=4u32 {
-        let d = tile_datagrams(seq, 9, 9, Codec::Solid, 0, &[1, 2, 3, 255], 1200);
-        let _ = core.handle_datagram(&d[0], 10 + seq as u64);
+    for dg in dgs.iter().rev() {
+        assert!(core.handle_datagram(dg, 100).is_empty());
     }
-
-    // Now deliver frame 1's missing fragment late: the bucket is gone, so
-    // no TileReady is produced.
-    let evs = core.handle_datagram(&f1[1], 100);
-    assert!(
-        !evs.iter()
-            .any(|e| matches!(e, Event::TileReady { frame_seq: 1, .. })),
-        "evicted frame-1 assembly must not complete: {evs:?}"
-    );
-
-    // Feedback lost counter grew (2 expected fragments, 1 received -> 1 lost).
-    let fb = core.encode_feedback(200);
-    // ReceiverFeedback layout: [0]=0x06? we only assert datagrams_lost > 0.
-    // datagrams_lost is at bytes [12..16] BE (after 8-byte ts + 4-byte recv).
-    let lost = u32::from_be_bytes([fb[12], fb[13], fb[14], fb[15]]);
-    assert!(lost >= 1, "expected lost >= 1, got {lost} (fb={fb:?})");
+    // The same payload as one datagram completes.
+    let one = tile_datagrams(5, 1, 2, Codec::Cdf53, 0, &payload, 1200);
+    assert_eq!(one.len(), 1);
+    assert!(core
+        .handle_datagram(&one[0], 101)
+        .iter()
+        .any(|e| matches!(e, Event::TileReady { frame_seq: 5, .. })));
 }
 
 #[test]

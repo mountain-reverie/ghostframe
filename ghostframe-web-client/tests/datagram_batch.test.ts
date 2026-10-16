@@ -22,9 +22,7 @@ function scene(): Uint8Array[] {
     const lit = 1 + t * 13;
     const payload = new Uint8Array(12);
     for (let ch = 0; ch < 3; ch++) payload.set([0, 2, lit, 0xfe], ch * 4);
-    // Tiny fragments so each tile needs several datagrams, in
-    // sequence across the batch.
-    out.push(...fragmentTile(1 + t, t, 2, cdf53, 1, 1, payload, 4));
+    out.push(...fragmentTile(1 + t, t, 2, cdf53, 1, 1, payload, 1200));
   }
   // Interleave: round-robin over the per-tile fragment lists is enough to
   // vary arrival order versus generation order.
