@@ -22,6 +22,7 @@ pub mod pixels;
 pub mod scene;
 pub mod scene_tiles;
 pub mod scroll_scene;
+pub mod tailnet_probe;
 pub mod transport;
 pub mod weston;
 
@@ -33,7 +34,10 @@ pub use browser::{
 };
 pub use cleanup::{cleanup_stale_xvfb_sockets, read_server_logs_stripped};
 pub use containers::{create_preauth_key, docker_run_in_container, TestNode, NETWORK_NAME};
-pub use e2e_setup::{setup_e2e_server, wait_for_frames, E2eServerSetup, E2eServerSpec};
+pub use e2e_setup::{
+    setup_e2e_server, setup_e2e_server_as, wait_for_frames, E2eServerSetup, E2eServerSpec,
+    SERVER_HEADSCALE_USER,
+};
 pub use pixels::{assert_ssim_against_golden, decode_screenshot};
 pub use scene::{
     run_scene, ClientDiagnosticRecord, CodecHistogram, FrameMode, ProcSample, SceneResult,
