@@ -101,6 +101,25 @@ pub(crate) fn populate_gpu_metrics(
     }
 }
 
+/// Real-clock lap timer for the per-stage cost trace (`frame.stages`). It
+/// measures what the frame cost the thread, so it must not follow tokio's
+/// possibly paused clock; hence `std::time::Instant`, not `now_std()`.
+struct Lap(std::time::Instant);
+
+impl Lap {
+    fn new() -> Self {
+        Self(std::time::Instant::now())
+    }
+
+    /// Microseconds since the previous lap (or construction); restarts the lap.
+    fn lap(&mut self) -> u64 {
+        let now = std::time::Instant::now();
+        let us = now.duration_since(self.0).as_micros() as u64;
+        self.0 = now;
+        us
+    }
+}
+
 /// Per-tile staging produced by Phase A, consumed by Phase B.
 #[derive(Debug, Clone)]
 pub(crate) struct PalRleTileWorkPrep {
@@ -666,6 +685,7 @@ impl IoBridge {
         // (`process_frame`) enforces that invariant.
         let raw_fd = frame.dmabuf_fd.as_ref().map(|fd| fd.as_raw_fd());
 
+        let mut lap = Lap::new();
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let seq = self.frame_seq;
 
@@ -693,6 +713,7 @@ impl IoBridge {
         // MetricsTracker::new(0, 0)), so detect_escalation_candidates iterates
         // 0 tiles and returns empty — safe.
         self.collect_escalation_candidates();
+        let pre_us = lap.lap();
 
         // GPU pipeline: Vulkan SAD dirty detection + NV12 conversion.
         // Dispatch to the DMA-BUF path if a fd was provided; otherwise upload
@@ -707,6 +728,7 @@ impl IoBridge {
                 frame.stride,
             ),
         };
+        let gpu_us = lap.lap();
         let analysis = match processor_result {
             Ok(a) => a,
             Err(e) => {
@@ -771,6 +793,7 @@ impl IoBridge {
         // accumulate before tile_fully_acked returns true — so running the sweep
         // here (before Phase B) vs. after Phase B yields no difference in practice.
         self.pixelperfect_sweep(cols, rows, seq);
+        let classify_us = lap.lap();
 
         // Early-return on empty dirty is mode-specific:
         //  - H264: no new frame to encode, nothing to emit. Bail.
@@ -784,6 +807,12 @@ impl IoBridge {
         match new_mode {
             FrameMode::H264 => {
                 self.emit_h264_frame(&dirty_xy, &frame, &analysis, prev_mode, seq, max_dg_size);
+                let emit_us = lap.lap();
+                tracing::trace!(
+                    target: "ghostframe::io_bridge::diag",
+                    seq, mode = "h264", pre_us, gpu_us, classify_us, emit_us,
+                    "[BRIDGE] frame.stages"
+                );
             }
             FrameMode::TileCodec => {
                 let max_frag = max_fragment_payload(max_dg_size);
@@ -827,7 +856,14 @@ impl IoBridge {
                     &frame.pixels
                 };
 
+                let readback_us = lap.lap();
                 self.emit_tile_codec_frame(&dirty_xy, &frame, pixels, &analysis, seq, max_frag);
+                let emit_us = lap.lap();
+                tracing::trace!(
+                    target: "ghostframe::io_bridge::diag",
+                    seq, mode = "tile", pre_us, gpu_us, classify_us, readback_us, emit_us,
+                    "[BRIDGE] frame.stages"
+                );
             }
         }
     }
@@ -1267,11 +1303,13 @@ impl IoBridge {
         seq: u32,
         max_frag: usize,
     ) {
+        let mut lap = Lap::new();
         let grid = TileGrid::new(frame.width, frame.height);
 
         // Phase A — serial palette-table allocation per dirty PalRle-feasible tile.
         let cols = grid.cols;
         let preps = self.palrle_phase_a(analysis, &grid);
+        let phase_a_us = lap.lap();
 
         // Phase B — rayon parallel encode.
         let caps = self.client_caps;
@@ -1289,6 +1327,9 @@ impl IoBridge {
             .unwrap_or(false);
         let mut palrle_payloads =
             IoBridge::phase_b_encode_payloads_with_caps(&preps, &caps, inject);
+        let phase_b_us = lap.lap();
+        let (mut coef_read_us, mut coef_encode_us) = (0u64, 0u64);
+        let mut coef_lap = Lap::new();
         #[cfg(any(test, feature = "test-loss-injection"))]
         if inject_will_fire {
             self.oob_inject_at = None;
@@ -1342,7 +1383,9 @@ impl IoBridge {
                             crate::encoder::cdf53::CDF53_TOTAL_COEFFS,
                         )
                     };
+                    coef_lap.lap();
                     let coeffs_i16: Vec<i16> = coeffs_i32.iter().map(|&v| v as i16).collect();
+                    coef_read_us += coef_lap.lap();
                     // M3.3b diagnostic: when GHOSTFRAME_CDF53_DIFF_TILE=X,Y is
                     // set, log a one-shot side-by-side comparison of GPU vs
                     // CPU `cdf53::forward(tile_bgra)` for that tile. Gated
@@ -1463,6 +1506,7 @@ impl IoBridge {
                     }
                     let (present_passes, passes) =
                         crate::encoder::cdf53::encode_passes_sparse(&coeffs_i16);
+                    coef_encode_us += coef_lap.lap();
                     self.commit_tile_to_cdf53(
                         tile_x,
                         tile_y,
@@ -1525,9 +1569,12 @@ impl IoBridge {
                         crate::encoder::cdf53::CDF53_TOTAL_COEFFS,
                     )
                 };
+                coef_lap.lap();
                 let coeffs_i16: Vec<i16> = coeffs_i32.iter().map(|&v| v as i16).collect();
+                coef_read_us += coef_lap.lap();
                 let (present_passes, passes) =
                     crate::encoder::cdf53::encode_passes_sparse(&coeffs_i16);
+                coef_encode_us += coef_lap.lap();
                 if is_stranded {
                     self.stranded_reenqueue(tile_x, tile_y, codec_state, present_passes, passes);
                     continue;
@@ -1593,6 +1640,7 @@ impl IoBridge {
         // the frame cost the encode thread, which a paused tokio
         // clock would report as zero.
         let dispatch_started = std::time::Instant::now();
+        let cdf53_total_us = lap.lap();
         let stats = self.dispatch_dirty_tiles_via_scheduler(
             dirty_xy,
             &grid,
@@ -1611,7 +1659,14 @@ impl IoBridge {
         // RTO deadline has elapsed, then drain the resulting
         // queue (source + parity) to the wire. Cheap when nothing
         // is due (no cache hits, no parity ready).
+        let dispatch_us = lap.lap();
         self.sweep_rto_retransmits();
+        let rto_us = lap.lap();
+        tracing::trace!(
+            target: "ghostframe::io_bridge::diag",
+            seq, phase_a_us, phase_b_us, cdf53_total_us, coef_read_us, coef_encode_us, dispatch_us, rto_us,
+            "[BRIDGE] frame.tile_stages"
+        );
 
         // Diagnostic: post-dispatch summary. If THIS fires but
         // frame.last_send below does not, something in the palrle
