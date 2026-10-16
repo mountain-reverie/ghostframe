@@ -455,63 +455,30 @@ impl ClientCore {
             return;
         }
 
-        // Payload mode stops here for the codecs whose decode is purely pixel
-        // expansion. Raw and Solid carry no protocol state, so there is
-        // nothing to update before handing the bytes up. PalRle and Cdf53 do
-        // (palette upserts, pass coverage and ACKs), so they are handled
-        // inside the match instead.
-        if self.tile_delivery == TileDelivery::Payload
-            && matches!(asm.codec, Codec::Raw | Codec::Solid)
-        {
-            let data = match asm.codec {
-                Codec::Raw => TileData::Raw(payload),
-                Codec::Solid => match payload.try_into() {
-                    Ok(quad) => TileData::Solid(quad),
-                    Err(_) => {
-                        // Wire-derived: a malformed Solid payload must not
-                        // panic. main.ts only ever painted Solid when the
-                        // payload was exactly 4 bytes; mirror that by
-                        // dropping the tile silently rather than crashing.
-                        return;
-                    }
-                },
-                // The `matches!` guard above admits only Raw and Solid.
-                // Listed rather than `_` so that widening that guard to a new
-                // codec fails to compile here instead of hitting an
-                // `unreachable!` at runtime on real wire data.
-                Codec::Skip | Codec::H264 | Codec::PalRle | Codec::Cdf53 => {
-                    unreachable!("matches! above restricts to Raw | Solid")
-                }
+        // Payload mode stops here for the codec whose decode is purely pixel
+        // expansion. Solid carries no protocol state, so there is nothing to
+        // update before handing the bytes up. PalRle and Cdf53 do (palette
+        // upserts, pass coverage and ACKs), so they are handled inside the
+        // match instead.
+        if self.tile_delivery == TileDelivery::Payload && asm.codec == Codec::Solid {
+            let Ok(quad) = payload.try_into() else {
+                // Wire-derived: a malformed Solid payload must not panic.
+                // main.ts only ever painted Solid when the payload was
+                // exactly 4 bytes; mirror that by dropping the tile silently
+                // rather than crashing.
+                return;
             };
             events.push(Event::TilePayload {
                 frame_seq,
                 tile_x: tx,
                 tile_y: ty,
                 generation: asm.generation,
-                data,
+                data: TileData::Solid(quad),
             });
             return;
         }
 
         match asm.codec {
-            Codec::Raw => {
-                // Payload is BGRA; swizzle to RGBA (preserving alpha).
-                let px = payload.len() / 4;
-                let mut rgba = vec![0u8; px * 4];
-                for i in 0..px {
-                    let o = i * 4;
-                    rgba[o] = payload[o + 2]; // R
-                    rgba[o + 1] = payload[o + 1]; // G
-                    rgba[o + 2] = payload[o]; // B
-                    rgba[o + 3] = payload[o + 3]; // A
-                }
-                events.push(Event::TileReady {
-                    frame_seq,
-                    tile_x: tx,
-                    tile_y: ty,
-                    rgba,
-                });
-            }
             Codec::Solid => {
                 // main.ts only paints Solid when the payload is exactly 4B.
                 if payload.len() == 4 {

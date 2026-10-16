@@ -45,7 +45,6 @@ export interface Codecs {
   readonly H264: number;
   readonly PalRle: number;
   readonly Solid: number;
-  readonly Raw: number;
   readonly Cdf53: number;
 }
 

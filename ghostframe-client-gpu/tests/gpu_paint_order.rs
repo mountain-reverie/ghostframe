@@ -29,16 +29,6 @@ fn payload(frame_seq: u32, data: TileData) -> Event {
     }
 }
 
-fn raw(frame_seq: u32, bgra: [u8; 4]) -> Event {
-    let px: Vec<u8> = bgra
-        .iter()
-        .copied()
-        .cycle()
-        .take((TILE_SIZE * TILE_SIZE * 4) as usize)
-        .collect();
-    payload(frame_seq, TileData::Raw(px))
-}
-
 fn solid(frame_seq: u32, bgra: [u8; 4]) -> Event {
     payload(frame_seq, TileData::Solid(bgra))
 }
@@ -75,21 +65,6 @@ const RED: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF]; // BGRA
 const BLUE: [u8; 4] = [0xFF, 0x00, 0x00, 0xFF]; // BGRA
 
 #[test]
-fn a_newer_raw_tile_is_not_overwritten_by_an_older_solid_one() {
-    let newer_raw_alone = centre(vec![raw(6, RED)]);
-    let older_solid_alone = centre(vec![solid(5, BLUE)]);
-    assert_ne!(
-        newer_raw_alone, older_solid_alone,
-        "fixture must discriminate"
-    );
-
-    // Raw is uploaded at once and Solid is batched, so on arrival order alone
-    // the older Solid is drawn last.
-    let got = centre(vec![raw(6, RED), solid(5, BLUE)]);
-    assert_eq!(got, newer_raw_alone);
-}
-
-#[test]
 fn a_newer_solid_tile_is_not_overwritten_by_an_older_tile_ready() {
     let newer = centre(vec![solid(6, RED)]);
     let older = centre(vec![tile_ready(5, [0, 0, 0xFF, 0xFF])]);
@@ -104,8 +79,8 @@ fn a_newer_solid_tile_is_not_overwritten_by_an_older_tile_ready() {
 fn arrival_order_does_not_matter_and_equal_seq_is_not_dropped() {
     let newer = centre(vec![solid(6, RED)]);
     assert_eq!(
-        centre(vec![solid(5, BLUE), raw(6, RED)]),
-        centre(vec![raw(6, RED)])
+        centre(vec![solid(6, RED), solid(5, BLUE)]),
+        centre(vec![solid(6, RED)])
     );
     assert_eq!(
         centre(vec![tile_ready(5, [0, 0, 0xFF, 0xFF]), solid(6, RED)]),

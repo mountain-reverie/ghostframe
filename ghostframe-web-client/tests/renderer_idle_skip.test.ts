@@ -5,7 +5,6 @@ describe('shouldSkipEncodePresent', () => {
   test('skips when every queue is empty and framebuffer not dirty', () => {
     expect(
       shouldSkipEncodePresent({
-        rawQueueLen: 0,
         solidQueueLen: 0,
         palRleQueueLen: 0,
         cdf53QueueLen: 0,
@@ -18,14 +17,12 @@ describe('shouldSkipEncodePresent', () => {
 
   test('does NOT skip when any queue is non-empty', () => {
     for (const k of [
-      'rawQueueLen',
       'solidQueueLen',
       'palRleQueueLen',
       'cdf53QueueLen',
       'h264QueueLen',
     ] as const) {
       const base = {
-        rawQueueLen: 0,
         solidQueueLen: 0,
         palRleQueueLen: 0,
         cdf53QueueLen: 0,
@@ -41,7 +38,6 @@ describe('shouldSkipEncodePresent', () => {
   test('does NOT skip when framebuffer is dirty even if queues empty', () => {
     expect(
       shouldSkipEncodePresent({
-        rawQueueLen: 0,
         solidQueueLen: 0,
         palRleQueueLen: 0,
         cdf53QueueLen: 0,
@@ -55,7 +51,6 @@ describe('shouldSkipEncodePresent', () => {
   test('does NOT skip while a palrle errors readback is in flight', () => {
     expect(
       shouldSkipEncodePresent({
-        rawQueueLen: 0,
         solidQueueLen: 0,
         palRleQueueLen: 0,
         cdf53QueueLen: 0,

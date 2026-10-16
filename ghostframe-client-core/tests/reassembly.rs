@@ -82,44 +82,40 @@ fn solid_tile_roundtrip_single_fragment() {
 }
 
 #[test]
-fn multi_fragment_raw_tile_completes_out_of_order() {
+fn multi_fragment_tile_completes_out_of_order() {
     let mut core = test_core();
-    // 4096-byte raw BGRA payload, distinct per byte so we can verify the
-    // exact concatenation + swizzle.
-    let payload: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
-    let dgs = tile_datagrams(5, 1, 2, Codec::Raw, 0, &payload, 1200);
-    assert_eq!(dgs.len(), 4); // 4096 / 1200 -> 4 fragments
+    // A valid CDF 5/3 pass 0 payload cut into three tiny fragments, so the
+    // out-of-order assembly is real: an invalid payload would not complete
+    // into a tile.
+    let payload = valid_cdf53_payload();
+    let dgs = tile_datagrams(5, 1, 2, Codec::Cdf53, 0, &payload, 4);
+    assert_eq!(dgs.len(), 3);
 
-    // Deliver out of order: 3, 0, 2, 1.
-    assert!(core.handle_datagram(&dgs[3], 100).is_empty());
+    // Deliver out of order: 2, 0, 1.
+    assert!(core.handle_datagram(&dgs[2], 100).is_empty());
     assert!(core.handle_datagram(&dgs[0], 101).is_empty());
-    assert!(core.handle_datagram(&dgs[2], 102).is_empty());
-    let evs = core.handle_datagram(&dgs[1], 103);
+    let evs = core.handle_datagram(&dgs[1], 102);
 
-    match &evs[..] {
-        [Event::TileReady {
-            frame_seq: 5,
-            tile_x: 1,
-            tile_y: 2,
-            rgba,
-        }] => {
-            assert_eq!(rgba.len(), 4096);
-            // Verify swizzle for the first pixel: payload BGRA
-            // [0,1,2,3] -> RGBA [2,1,0,3].
-            assert_eq!(&rgba[..4], &[2, 1, 0, 3]);
-            // Spot-check pixel 10: payload bytes 40..44 = [40,41,42,43].
-            assert_eq!(&rgba[40..44], &[42, 41, 40, 43]);
-        }
-        other => panic!("unexpected events: {other:?}"),
-    }
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            Event::TileReady {
+                frame_seq: 5,
+                tile_x: 1,
+                tile_y: 2,
+                rgba,
+            } if rgba.len() == 4096
+        )),
+        "the last fragment must complete the tile: {evs:?}"
+    );
 }
 
 #[test]
 fn stale_assembly_evicted_at_threshold_2() {
     let mut core = test_core();
-    // Frame 1: a 2-fragment raw tile, deliver only fragment 0 (incomplete).
-    let payload: Vec<u8> = (0..2400).map(|i| (i % 256) as u8).collect();
-    let f1 = tile_datagrams(1, 0, 0, Codec::Raw, 0, &payload, 1200);
+    // Frame 1: a 2-fragment tile, deliver only fragment 0 (incomplete).
+    let payload = valid_cdf53_payload();
+    let f1 = tile_datagrams(1, 0, 0, Codec::Cdf53, 0, &payload, 6);
     assert_eq!(f1.len(), 2);
     assert!(core.handle_datagram(&f1[0], 10).is_empty());
 

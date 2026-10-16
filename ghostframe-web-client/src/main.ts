@@ -289,7 +289,6 @@ async function main() {
   // `PalRle` and `Cdf53` arrive prevalidated — the core already computed the
   // GPU-ready product, so there is no second prevalidation call here.
   type WasmTileData =
-    | { codec: 'Raw'; bytes: Uint8Array }
     | { codec: 'Solid'; bytes: Uint8Array }
     | {
         codec: 'PalRle';
@@ -356,10 +355,6 @@ async function main() {
         const d = ev.data;
         let sampleBytes: Uint8Array;
         switch (d.codec) {
-          case 'Raw':
-            renderer.pushRaw({ tileX: ev.tile_x, tileY: ev.tile_y, frameSeq: ev.frame_seq, bgra: d.bytes });
-            sampleBytes = d.bytes;
-            break;
           case 'Solid':
             renderer.pushSolid({ tileX: ev.tile_x, tileY: ev.tile_y, frameSeq: ev.frame_seq, bgra: d.bytes });
             sampleBytes = d.bytes;
@@ -613,7 +608,6 @@ async function main() {
     // Snapshot queue depths BEFORE drain so we can log how much each rAF
     // actually consumed.
     const beforeDrain = {
-      raw: renderer.rawQueue.length,
       solid: renderer.solidQueue.length,
       palrle: renderer.palRleQueue.length,
       cdf53: renderer.cdf53Queue.length,

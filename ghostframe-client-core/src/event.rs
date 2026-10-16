@@ -25,16 +25,13 @@ pub enum DecodeErrorCode {
 
 /// What a completed tile actually hands the GPU.
 ///
-/// The four codecs produce genuinely different things, so this is an enum
+/// The three codecs produce genuinely different things, so this is an enum
 /// rather than a byte slice plus a codec tag the consumer has to interpret.
 /// `PalRle` and `Cdf53` arrive prevalidated: `reassembly.rs` computes these
 /// products anyway, to drive palette state and pass coverage, and emitting
 /// the raw wire bytes instead forced every consumer to redo that work.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TileData {
-    /// BGRA wire bytes, unswizzled. Length is payload-proportional
-    /// (<= 4096, a multiple of 4).
-    Raw(Vec<u8>),
     /// One BGRA quad, expanded to the full tile by the shader.
     Solid([u8; 4]),
     /// `indices` is 512 bytes: two 4-bit palette indices per byte, low
@@ -72,9 +69,7 @@ pub enum TileData {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// Fully decoded 32x32 RGBA tile, RGBA byte order. For
-    /// `Codec::Solid`/`PalRle`/`Cdf53` this is always 4096 bytes (32*32*4);
-    /// for `Codec::Raw` the length is payload-proportional (<= 4096, a
-    /// multiple of 4), mirroring the TS renderer contract.
+    /// `Codec::Solid`/`PalRle`/`Cdf53` this is always 4096 bytes (32*32*4).
     TileReady {
         frame_seq: u32,
         tile_x: u8,

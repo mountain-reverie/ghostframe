@@ -2,7 +2,7 @@
 //!
 //! [`Renderer::flush`](crate::renderer::Renderer::flush) draws a batch in a
 //! fixed codec order, whatever server frame each entry came from. When two
-//! frames land in one batch, an older stateless draw (Raw, Solid, PalRle,
+//! frames land in one batch, an older stateless draw (Solid, PalRle,
 //! `TileReady`) could sit over a newer one from another codec. The ledger
 //! records the newest `frame_seq` seen per tile; a stateless entry strictly
 //! older than that is superseded and dropped, which loses nothing because it

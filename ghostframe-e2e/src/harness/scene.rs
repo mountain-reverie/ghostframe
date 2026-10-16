@@ -51,7 +51,6 @@ pub struct CodecHistogram {
     pub solid: u16,
     pub palrle: u16,
     pub cdf53: u16,
-    pub raw: u16,
     pub h264: u8,
 }
 
@@ -739,10 +738,6 @@ pub(crate) fn parse_server_telemetry(
                         .unwrap_or(0) as u16,
                     cdf53: v
                         .pointer("/fields/codec_cdf53")
-                        .and_then(|s| s.as_u64())
-                        .unwrap_or(0) as u16,
-                    raw: v
-                        .pointer("/fields/codec_raw")
                         .and_then(|s| s.as_u64())
                         .unwrap_or(0) as u16,
                     h264: v

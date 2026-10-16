@@ -91,25 +91,13 @@ proptest! {
         let evs = core.handle_datagram(&dg, 0);
         for e in &evs {
             if let ghostframe_client_core::Event::TileReady { rgba, .. } = e {
-                // Flipping a bit inside the TileHeader's packed
-                // codec/lz4 byte (offset 18) can change the decoded codec
-                // — e.g. Cdf53 (5) -> Raw (4) via a single bit flip in this
-                // fixture, since `packed = (codec << 1) | lz4`. Codec::Raw's
-                // RGBA output size is `payload.len() / 4 * 4` (whatever
-                // fits in the surviving, possibly-truncated payload), NOT a
-                // fixed 4096, so a strict `== 4096` assertion is too strong
-                // for arbitrary single-bit flips and was a genuine test bug
-                // (not a `src/` bug) caught by this proptest's minimal
-                // failing case `pos = 18, bit = 1`.
-                //
-                // For Solid/PalRle/Cdf53 the decoder always emits exactly
-                // 4096 bytes (32x32x4) by construction; Raw is the only
-                // codec whose output size tracks payload length. The
-                // invariant that must hold for ALL codecs, including
-                // adversarial reinterpretation via bit flips, is: the
-                // buffer is a well-formed whole-pixel RGBA buffer that
-                // never exceeds one full 32x32 tile (4096 bytes) — no
-                // partial pixels, no over-sized allocation.
+                // Flipping a bit inside the TileHeader's packed codec/lz4 byte
+                // (offset 18) can change the decoded codec, so the decoder
+                // must hold up under adversarial reinterpretation. The
+                // invariant for every codec: the buffer is a well-formed
+                // whole-pixel RGBA buffer that never exceeds one full 32x32
+                // tile (4096 bytes): no partial pixels, no over-sized
+                // allocation.
                 prop_assert_eq!(rgba.len() % 4, 0, "RGBA buffer must hold whole pixels");
                 prop_assert!(rgba.len() <= 4096, "RGBA buffer must never exceed one full 32x32 tile");
             }

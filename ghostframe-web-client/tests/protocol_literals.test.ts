@@ -84,8 +84,8 @@ export function scan(source: string): Hit[] {
     }
     // 2. enum Codec { ... } / const enum Codec.
     if (/\benum\s+Codec\b/.test(line)) push('retyped Codec enum');
-    // Codec table as an object literal, e.g. `{ Raw: 4, Solid: 3 }`.
-    if (/\b(?:Skip|H264|PalRle|Solid|Raw|Cdf53)\s*:\s*\d/.test(line)) push('retyped Codec table');
+    // Codec table as an object literal, e.g. `{ Cdf53: 5, Solid: 3 }`.
+    if (/\b(?:Skip|H264|PalRle|Solid|Cdf53)\s*:\s*\d/.test(line)) push('retyped Codec table');
     // A codec discriminant or message type passed/stored as a bare number.
     if (/\bonDecodeError\(\s*\d/.test(line) || /\[0\]\s*=\s*(?:0[xX][0-9a-fA-F]+|\d)\b/.test(line)) {
       push('wire discriminant written as a literal');
@@ -125,7 +125,7 @@ describe('TypeScript sources do not retype protocol constants', () => {
       ['const EVICTION_REASON_DISPLACED = 1;', 'retyped constant EVICTION_REASON_DISPLACED'],
       ['export const FRAME_HEADER_SIZE = 14;', 'retyped constant FRAME_HEADER_SIZE'],
       ['export const enum Codec { Skip = 0 }', 'retyped Codec enum'],
-      ['const T = { Raw: 4, Solid: 3 };', 'retyped Codec table'],
+      ['const T = { Cdf53: 5, Solid: 3 };', 'retyped Codec table'],
       ['onDecodeError(2, 0xFF, 0xFF, c);', 'wire discriminant written as a literal'],
       ['buf[0] = 0x05;', 'wire discriminant written as a literal'],
       ['const dstX = tileX * 32;', 'tile edge 32 used as a literal'],

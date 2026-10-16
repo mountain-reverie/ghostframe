@@ -28,7 +28,9 @@ fn bridge() -> IoBridge {
     let (ours, _peer) = UnixStream::pair().expect("pair");
     let server = QuicServer::new().expect("server");
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
-    IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4)
+    let mut b = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
+    b.metrics_tracker.resize(4, 4);
+    b
 }
 
 fn work(codec: Codec, generation: u8, pass_idx: u8, payload: Vec<u8>) -> TileWork {

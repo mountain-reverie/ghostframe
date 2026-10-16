@@ -130,26 +130,6 @@ fn empty_solid_draw_is_a_no_op() {
 }
 
 #[test]
-fn raw_tile_shorter_than_a_full_tile_uploads_only_its_rows() {
-    let ctx = WgpuContext::new().expect("wgpu context");
-    let mut fb = Framebuffer::new(&ctx.device, 64, 64);
-    fb.debug_fill(&ctx.device, &ctx.queue, [0, 0, 0, 0xFF]);
-
-    // Two rows' worth of BGRA: 2 * 32 * 4 = 256 bytes.
-    let bgra = [0x10u8, 0x20, 0x30, 0xFF].repeat(64);
-    ghostframe_client_gpu::pipelines::raw::upload_raw_tile(&ctx.queue, &fb, 0, 0, &bgra);
-    ctx.device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .expect("poll");
-
-    let b = fb.debug_read(&ctx.device, &ctx.queue);
-    assert_eq!(px(&b, 64, 0, 0), [0x30, 0x20, 0x10, 0xFF]);
-    assert_eq!(px(&b, 64, 31, 1), [0x30, 0x20, 0x10, 0xFF]);
-    // Row 2 was not covered by the payload and must be untouched.
-    assert_eq!(px(&b, 64, 0, 2), [0, 0, 0, 0xFF], "wrote past the payload");
-}
-
-#[test]
 fn palrle_decodes_low_nibble_first_against_the_palette() {
     let ctx = WgpuContext::new().expect("wgpu context");
     let mut fb = Framebuffer::new(&ctx.device, 64, 64);

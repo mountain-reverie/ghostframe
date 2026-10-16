@@ -34,7 +34,7 @@ describe('M3.5 bench instrumentation', () => {
       seq: 7,
       tileX: 1,
       tileY: 2,
-      codec: 4,
+      codec: 5,
       payloadLen: 4,
       fbWidth: 64,
       fbHeight: 64,

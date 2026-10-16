@@ -8,14 +8,6 @@ import { shouldSkipEncodePresent } from './idle_skip.js';
 import { protocol } from '../protocol_constants.js';
 import { planPaint } from './paint_order.js';
 
-export interface RawQueued {
-  tileX: number;
-  tileY: number;
-  /** `frame_seq` of the server frame this tile came from. */
-  frameSeq: number;
-  bgra: Uint8Array;
-}
-
 /** A prevalidated CDF53 pass tagged with the server frame it came from. */
 export type QueuedCdf53 = PrevalidatedCdf53 & { frameSeq: number };
 
@@ -41,7 +33,6 @@ export class WebGpuRenderer {
 
   palRleQueue: PalRleTile[] = [];
   solidQueue: SolidTile[] = [];
-  rawQueue: RawQueued[] = [];
   h264Queue: VideoFrame[] = [];
   /** `frame_seq` of each `h264Queue` entry, index-aligned. */
   h264Seqs: number[] = [];
@@ -87,7 +78,7 @@ export class WebGpuRenderer {
    * is caught and reported without poisoning the rest of the device's
    * error scope. If the probe fails, h264Pipeline stays null and the
    * draw path silently skips H.264 frames — the rest of the codec suite
-   * (solid / palrle / cdf53 / raw / present_blit) is unaffected.
+   * (solid / palrle / cdf53 / present_blit) is unaffected.
    */
   private async probeH264(): Promise<void> {
     this.gpu.device.pushErrorScope('validation');
@@ -152,49 +143,6 @@ export class WebGpuRenderer {
   }
 
   /**
-   * Upload a Raw tile's BGRA payload directly into the framebuffer's
-   * 32×32 region. Swaps BGRA→RGBA on CPU before upload (framebuffer
-   * format is rgba8unorm per Design D12).
-   */
-  writeRawTile(tileX: number, tileY: number, bgra: Uint8Array): void {
-    const ts = protocol().tileSize;
-    if (bgra.length !== protocol().tileBytes) {
-      throw new Error(`writeRawTile: payload length ${bgra.length} != ${protocol().tileBytes}`);
-    }
-    // Clip the destination extent to the framebuffer bounds — partial edge
-    // tiles at non-32-aligned resolutions (e.g. 700×500 in e2e_edge_tiles)
-    // would otherwise trip a WebGPU validation error
-    // ("origin + size > texture.size") and silently drop the entire tile.
-    const fbW = this.framebuffer.width;
-    const fbH = this.framebuffer.height;
-    const dstX = tileX * ts;
-    const dstY = tileY * ts;
-    if (dstX >= fbW || dstY >= fbH) return; // tile entirely outside framebuffer
-    const copyW = Math.min(ts, fbW - dstX);
-    const copyH = Math.min(ts, fbH - dstY);
-
-    // BGRA→RGBA swap, only for the bytes we'll actually upload. Pack tightly
-    // (bytesPerRow = copyW * 4) so writeTexture sees a contiguous source.
-    const rgba = new Uint8Array(copyW * copyH * 4);
-    for (let row = 0; row < copyH; row++) {
-      for (let col = 0; col < copyW; col++) {
-        const srcOff = (row * ts + col) * 4;
-        const dstOff = (row * copyW + col) * 4;
-        rgba[dstOff + 0] = bgra[srcOff + 2]; // R from B-slot
-        rgba[dstOff + 1] = bgra[srcOff + 1]; // G
-        rgba[dstOff + 2] = bgra[srcOff + 0]; // B from R-slot
-        rgba[dstOff + 3] = bgra[srcOff + 3] === 0 ? 255 : bgra[srcOff + 3]; // force alpha (BGRX quirk)
-      }
-    }
-    this.device.queue.writeTexture(
-      { texture: this.framebuffer.texture, origin: { x: dstX, y: dstY } },
-      rgba,
-      { bytesPerRow: copyW * 4, rowsPerImage: copyH },
-      { width: copyW, height: copyH },
-    );
-  }
-
-  /**
    * Zero the palette atlas + CPU shadow on session reset (transport.closed).
    * Framebuffer texture is left in place; next session paints over.
    *
@@ -240,11 +188,6 @@ export class WebGpuRenderer {
     this.framebufferDirty = true;
   }
 
-  pushRaw(entry: RawQueued): void {
-    this.rawQueue.push(entry);
-    this.framebufferDirty = true;
-  }
-
   pushCdf53(entry: QueuedCdf53): void {
     this.cdf53Queue.push(entry);
     this.framebufferDirty = true;
@@ -263,11 +206,11 @@ export class WebGpuRenderer {
    */
   encodeAndPresentFrame(
     onDecodeError: (codec: number, tileX: number, tileY: number, code: number) => void,
-  ): { palrle: number; solid: number; raw: number; h264: number; cdf53: number } {
+  ): { palrle: number; solid: number; h264: number; cdf53: number } {
     // Guard: if the framebuffer hasn't been sized yet (resize(w,h) with w,h>0 not
     // called), skip the GPU work — no texture targets are valid yet.
     if (!this.framebuffer.texture) {
-      return { palrle: 0, solid: 0, raw: 0, h264: 0, cdf53: 0 };
+      return { palrle: 0, solid: 0, h264: 0, cdf53: 0 };
     }
     // Expose framebuffer for test instrumentation (__readPixel / __readPixelRect).
     window.__ghostframeRenderer = { device: this.gpu.device, texture: this.framebuffer.texture };
@@ -279,7 +222,6 @@ export class WebGpuRenderer {
     // sessions.
     if (
       shouldSkipEncodePresent({
-        rawQueueLen: this.rawQueue.length,
         solidQueueLen: this.solidQueue.length,
         palRleQueueLen: this.palRleQueue.length,
         cdf53QueueLen: this.cdf53Queue.length,
@@ -288,7 +230,7 @@ export class WebGpuRenderer {
         errorsReadbackInFlight: this.errorsReadbackInFlight,
       })
     ) {
-      return { palrle: 0, solid: 0, raw: 0, h264: 0, cdf53: 0 };
+      return { palrle: 0, solid: 0, h264: 0, cdf53: 0 };
     }
     // ---- Steps 1-4: resolve each tile by the newest frame_seq ----
     // The core prevalidates in wire order and emits `Event::PaletteUpdated`
@@ -304,7 +246,6 @@ export class WebGpuRenderer {
     // never drawn must not make planPaint drop tiles they would not cover.
     const drawH264 = this.h264Pipeline !== null;
     const plan = planPaint({
-      raw: this.rawQueue,
       solid: this.solidQueue,
       palRle: this.palRleQueue,
       cdf53: this.cdf53Queue,
@@ -321,7 +262,6 @@ export class WebGpuRenderer {
     } finally {
       this.cdf53Queue.length = 0;
       this.palRleQueue = [];
-      this.rawQueue.length = 0;
       this.solidQueue.length = 0;
     }
 
@@ -373,21 +313,6 @@ export class WebGpuRenderer {
     this.videoFramesToClose.push(...this.h264Queue);
     this.h264Queue.length = 0;
     this.h264Seqs.length = 0;
-
-    // ---- Step 6: direct Raw uploads ----
-    // `writeTexture` executes at the front of the next submit, i.e. BEFORE
-    // everything encoded above. When there is lower-layer work and a Raw
-    // tile to put over it, submit that work first so the Raw write lands
-    // after it. Otherwise the Raw write stays in the single submit below.
-    const rawCount = plan.raw.length;
-    if (rawCount > 0 && (cdf53Count > 0 || h264Count > 0)) {
-      this.device.queue.submit([encoder.finish()]);
-      this.submitCount++;
-      encoder = this.device.createCommandEncoder();
-    }
-    for (const r of plan.raw) {
-      this.writeRawTile(r.tileX, r.tileY, r.bgra);
-    }
 
     // ---- Step 7: PalRle compute pass ----
     this.palrlePipeline.encodeDispatch(encoder, palRleCount);
@@ -456,6 +381,6 @@ export class WebGpuRenderer {
     for (const f of this.videoFramesToClose) f.close();
     this.videoFramesToClose.length = 0;
 
-    return { palrle: palRleCount, solid: solidCount, raw: rawCount, h264: h264Count, cdf53: cdf53Count };
+    return { palrle: palRleCount, solid: solidCount, h264: h264Count, cdf53: cdf53Count };
   }
 }

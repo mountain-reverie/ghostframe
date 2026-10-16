@@ -30,14 +30,14 @@ fn test_core() -> ClientCore {
     core
 }
 
-/// Fragments of a Raw tile pass at `(x, y)`, `pass`, cut to `mtu_payload`.
+/// Fragments of a tile pass at `(x, y)`, `pass`, cut to `mtu_payload`.
 fn tile_dgs(frame_seq: u32, x: u8, y: u8, pass: u8, payload: &[u8], mtu: usize) -> Vec<Vec<u8>> {
     fragment_tile(
         &TileFragmentInputs {
             frame_seq: frame_seq | TILE_DATAGRAM_FLAG,
             tile_x: x,
             tile_y: y,
-            codec: Codec::Raw,
+            codec: Codec::Solid,
             generation: 1,
             pass,
             timestamp_us: 0,
@@ -97,9 +97,34 @@ fn tile_frag_total_fan_out_with_pinned_frame_seq_is_bounded() {
 #[test]
 fn tile_with_the_maximum_fragment_count_still_assembles() {
     let mut core = test_core();
-    // A 4096-byte Raw tile cut into exactly MAX_TILE_FRAGMENTS fragments.
-    let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
-    let dgs = tile_dgs(1, 3, 4, 0, &payload, 64);
+    // A valid CDF 5/3 pass 0 payload cut into exactly MAX_TILE_FRAGMENTS
+    // fragments. Each channel's plane is 17 escaped literals (2 bytes each)
+    // plus 111 plain ones, so the payload is 2 + 3 * (2 + 145) = 443 bytes
+    // and 7-byte fragments make exactly 64.
+    let mut payload = vec![0x00, 0x01]; // present_passes = pass 0 only
+    for _ in 0..3 {
+        let mut plane = Vec::new();
+        for _ in 0..17 {
+            plane.extend_from_slice(&[0x7F, 0xFF]);
+        }
+        plane.extend(std::iter::repeat_n(0x01u8, 111));
+        payload.extend_from_slice(&(plane.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&plane);
+    }
+    assert_eq!(payload.len(), 443);
+    let dgs = fragment_tile(
+        &TileFragmentInputs {
+            frame_seq: 1 | TILE_DATAGRAM_FLAG,
+            tile_x: 3,
+            tile_y: 4,
+            codec: Codec::Cdf53,
+            generation: 1,
+            pass: 0,
+            timestamp_us: 0,
+        },
+        &payload,
+        7,
+    );
     assert_eq!(dgs.len(), MAX_TILE_FRAGMENTS as usize);
     let mut evs = Vec::new();
     for dg in &dgs {

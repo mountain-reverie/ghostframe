@@ -227,27 +227,6 @@ fn solid_in_decoded_mode_is_unchanged() {
     assert_eq!(&ready[0][0..4], &[30, 20, 10, 255]);
 }
 
-/// Raw is a straight BGRA->RGBA swizzle under Decoded; under Payload the
-/// swizzle is the GPU's job and the bytes pass through untouched.
-#[test]
-fn raw_in_payload_mode_passes_bytes_through() {
-    let bgra: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
-    let events = drive_one_tile(TileDelivery::Payload, Codec::Raw, &bgra);
-    let got: Vec<_> = events
-        .iter()
-        .filter_map(|e| match e {
-            Event::TilePayload {
-                data: TileData::Raw(bytes),
-                ..
-            } => Some(bytes.clone()),
-            Event::TilePayload { data, .. } => panic!("expected TileData::Raw, got {data:?}"),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(got.len(), 1, "got {events:?}");
-    assert_eq!(got[0], bgra, "payload must be the wire bytes, unswizzled");
-}
-
 /// Payload mode must still apply the bundled palette upsert — protocol state,
 /// not decoding — and must surface it so the GPU can upload the table.
 /// Dropping the upsert leaves the shader decoding against a stale palette,

@@ -114,8 +114,8 @@ fn assert_exact_cdf53(b: &IoBridge, pixels: &[u8], tx: u8, ty: u8) {
         b.scheduler
             .peek_for_test()
             .iter()
-            .all(|w| w.codec != Codec::Raw),
-        "no Raw work may be queued"
+            .all(|w| matches!(w.codec, Codec::Solid | Codec::PalRle)),
+        "only Solid or PalRle tile work may sit in the priority queue"
     );
 }
 

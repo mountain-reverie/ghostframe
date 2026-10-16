@@ -8,18 +8,23 @@ import { fragmentTile } from './helpers/wasm.js';
 import { protocol } from '../src/protocol_constants';
 
 function newCore() {
-  // Decoded delivery: Raw tiles complete as TileReady events.
+  // Decoded delivery: CDF 5/3 tiles complete as TileReady events (the point
+  // here is event identity and order, not pixel content).
   return new wasm.WasmClientCore(false, false, false, 0n);
 }
 
 function scene(): Uint8Array[] {
   const out: Uint8Array[] = [];
-  const raw = protocol().codec.Raw;
+  const cdf53 = protocol().codec.Cdf53;
   for (let t = 0; t < 5; t++) {
-    const payload = new Uint8Array(64).map((_, i) => (i * 7 + t * 13) & 0xff);
-    // Small fragments so each tile needs several datagrams, in
+    // A valid pass 1 payload: three channels of `[len=2][literal][zero run]`.
+    // Each tile's literal differs, so the tiles are distinguishable.
+    const lit = 1 + t * 13;
+    const payload = new Uint8Array(12);
+    for (let ch = 0; ch < 3; ch++) payload.set([0, 2, lit, 0xfe], ch * 4);
+    // Tiny fragments so each tile needs several datagrams, in
     // sequence across the batch.
-    out.push(...fragmentTile(1 + t, t, 2, raw, 1, 0, payload, 24));
+    out.push(...fragmentTile(1 + t, t, 2, cdf53, 1, 1, payload, 4));
   }
   // Interleave: round-robin over the per-tile fragment lists is enough to
   // vary arrival order versus generation order.
