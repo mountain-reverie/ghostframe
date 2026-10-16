@@ -172,10 +172,9 @@ impl FrameBuffer {
         payload: &[u8],
     ) -> Result<(), DecodeErrorCode> {
         // Out-of-scope codecs: accepted, but never create/update a tile
-        // entry. Skip carries no pixel data by definition; H264 and Raw
-        // decode paths are not implemented by this harness module (H264
-        // needs a real decoder, Raw is unused by netsim scenes so far).
-        if matches!(codec, Codec::Skip | Codec::H264 | Codec::Raw) {
+        // entry. Skip carries no pixel data by definition; H264 decode is not
+        // implemented by this harness module (it needs a real decoder).
+        if matches!(codec, Codec::Skip | Codec::H264) {
             return Ok(());
         }
 
@@ -218,7 +217,7 @@ impl FrameBuffer {
                 &mut self.palettes,
             )?),
             Codec::Cdf53 => Decoded::Cdf53Pass(prevalidate_cdf53(payload, generation, pass_idx)?),
-            Codec::Skip | Codec::H264 | Codec::Raw => unreachable!("handled above"),
+            Codec::Skip | Codec::H264 => unreachable!("handled above"),
         };
 
         let rgba = match decoded {

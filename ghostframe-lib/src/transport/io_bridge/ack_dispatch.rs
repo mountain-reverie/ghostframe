@@ -382,7 +382,7 @@ impl IoBridge {
                     // and a new codec needing release/refcount work
                     // here would otherwise get none, silently -- the
                     // shape of the PalRle palette-leak bug.
-                    Codec::Solid | Codec::Raw | Codec::H264 | Codec::Skip => {}
+                    Codec::Solid | Codec::H264 | Codec::Skip => {}
                 }
             }
         }

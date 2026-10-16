@@ -254,7 +254,7 @@ export_const!(
     EvictionReason::DisplacedByNewSession.to_byte()
 );
 
-/// The `Codec` discriminants (Skip=0 .. Cdf53=5), keyed by name.
+/// The `Codec` discriminants (Skip=0 .. Cdf53=5; 4 is unassigned), keyed by name.
 #[derive(Serialize)]
 #[allow(non_snake_case)]
 struct Codecs {
@@ -262,7 +262,6 @@ struct Codecs {
     H264: u8,
     PalRle: u8,
     Solid: u8,
-    Raw: u8,
     Cdf53: u8,
 }
 
@@ -273,7 +272,6 @@ pub fn codecs() -> Result<JsValue, JsValue> {
         H264: Codec::H264 as u8,
         PalRle: Codec::PalRle as u8,
         Solid: Codec::Solid as u8,
-        Raw: Codec::Raw as u8,
         Cdf53: Codec::Cdf53 as u8,
     };
     serde_wasm_bindgen::to_value(&c).map_err(|e| JsValue::from_str(&e.to_string()))

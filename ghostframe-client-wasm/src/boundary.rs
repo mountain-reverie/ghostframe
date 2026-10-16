@@ -81,10 +81,6 @@ pub enum WasmEvent {
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(tag = "codec")]
 pub enum WasmTileData {
-    Raw {
-        #[serde(with = "serde_bytes")]
-        bytes: Vec<u8>,
-    },
     Solid {
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
@@ -117,7 +113,6 @@ impl From<TileData> for WasmTileData {
     /// JS `Uint8Array` needs, the first was pure overhead.
     fn from(data: TileData) -> Self {
         match data {
-            TileData::Raw(bytes) => WasmTileData::Raw { bytes },
             TileData::Solid(quad) => WasmTileData::Solid {
                 bytes: quad.to_vec(),
             },

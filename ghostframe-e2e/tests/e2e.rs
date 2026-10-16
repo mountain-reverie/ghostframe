@@ -701,8 +701,8 @@ async fn e2e_solid_color_body<B: helpers::BrowserSession>(browser: &mut B) -> Re
 /// Pre-M3.2: GPU `tile_analysis.comp` now populates real `unique_colors`
 /// from live content on the GPU path, so the classifier's Solid rule
 /// (`unique_colors == 1`) fires end-to-end without `force_codec_state_for_test`.
-/// The CPU path still emits `Codec::Raw` since `process_frame_cpu` keeps the
-/// sentinel (no GPU compute available there).
+/// The CPU path has no classifier and sends every tile as CDF 5/3 (no GPU
+/// compute available there).
 #[tokio::test]
 async fn e2e_solid_color_chromium() -> Result<()> {
     let mut setup = setup_e2e_webgpu("--solid-red").await?;
@@ -864,8 +864,8 @@ async fn e2e_solid_color_5pct_loss() -> Result<()> {
 /// Drop 5% of bundled PalRle datagrams and verify the text-grid still
 /// renders correctly via 2×RTT retransmissions. Generic over any
 /// `BrowserSession` impl so the same logic runs in both browser paths.
-// M3.2c: Xorg-on-VKMS + modesetting-FB capture emits Codec::Raw for text
-// content; classifier never sees PalRle-feasible unique_colors. Defective
+// M3.2c: Xorg-on-VKMS + modesetting-FB capture sends text content as
+// CDF 5/3; the classifier never sees PalRle-feasible unique_colors. Defective
 // from inception (gpu=false original setup) and not fixed by the gpu=true
 // migration. Re-enable once M3.2c repairs the test-pattern capture path.
 async fn e2e_palrle_5pct_loss_body<B: helpers::BrowserSession>(browser: &mut B) -> Result<()> {

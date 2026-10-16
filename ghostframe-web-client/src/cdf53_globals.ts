@@ -22,7 +22,6 @@ import { protocol } from './protocol_constants.js';
  * `Cdf53` carry the core's prevalidated product, not the raw wire bytes —
  * see `TileData` in `event.rs`. */
 export type ProtocolTileData =
-  | { codec: 'Raw'; bytes: Uint8Array }
   | { codec: 'Solid'; bytes: Uint8Array }
   | { codec: 'PalRle'; palette_id: number; count: number; indices: Uint8Array }
   | { codec: 'Cdf53'; pass_idx: number; bit_planes: Uint8Array; present_passes?: number | null };

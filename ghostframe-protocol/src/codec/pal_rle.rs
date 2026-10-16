@@ -264,7 +264,7 @@ impl PaletteTable {
             self.acquire(id);
             return Some(id);
         }
-        // 4. fail (caller falls back to Codec::Raw for the tile)
+        // 4. fail (caller falls back to CDF 5/3 for the tile)
         None
     }
 }

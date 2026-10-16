@@ -101,8 +101,7 @@ impl ReportState {
         let mut codec_bytes: BTreeMap<String, u64> = BTreeMap::new();
         for st in &r.server_telemetry {
             let hist = &st.codec_histogram;
-            let tile_total =
-                (hist.solid + hist.palrle + hist.cdf53 + hist.raw) as u64 + hist.h264 as u64;
+            let tile_total = (hist.solid + hist.palrle + hist.cdf53) as u64 + hist.h264 as u64;
             if tile_total == 0 {
                 continue;
             }
@@ -113,7 +112,6 @@ impl ReportState {
                 bytes * hist.palrle as u64 / tile_total;
             *codec_bytes.entry("cdf53".into()).or_default() +=
                 bytes * hist.cdf53 as u64 / tile_total;
-            *codec_bytes.entry("raw".into()).or_default() += bytes * hist.raw as u64 / tile_total;
             *codec_bytes.entry("h264".into()).or_default() += bytes * hist.h264 as u64 / tile_total;
         }
 

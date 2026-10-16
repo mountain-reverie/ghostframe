@@ -1851,12 +1851,12 @@ async fn the_classifiers_loss_rate_is_the_ledgers_verdict() {
 /// right codec/state for the CPU policy, even without a connected
 /// session. This is the "Gap 3" fix from the final M3.1 review.
 #[tokio::test]
-async fn dispatch_via_scheduler_cpu_policy_enqueues_raw_tiles() {
-    use crate::transport::scheduler::WorkState;
+async fn dispatch_via_scheduler_cpu_policy_enqueues_cdf53_tiles() {
     let (our_end, _peer) = UnixStream::pair().expect("pair");
     let server = QuicServer::new().expect("server");
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
     let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+    bridge.metrics_tracker.resize(2, 2);
 
     let pixels = vec![0xAAu8; 64 * 64 * 4];
     let grid = crate::tile::TileGrid::new(64, 64);
@@ -1876,13 +1876,18 @@ async fn dispatch_via_scheduler_cpu_policy_enqueues_raw_tiles() {
         None,
     );
 
-    let queued = bridge.scheduler.peek_for_test();
-    assert_eq!(queued.len(), 2, "scheduler must hold both dirty tiles");
-    for w in &queued {
-        assert_eq!(w.state, WorkState::InFlight, "tick should have promoted");
-        assert_eq!(w.codec, Codec::Raw, "CPU policy emits Raw only");
-        assert_eq!(w.pass_idx, 0);
+    // CDF 5/3 passes leave the refinement queue as they are sent, so the
+    // evidence is what the emitter now holds for each tile.
+    for (x, y) in [(0u8, 0u8), (1, 1)] {
+        assert!(
+            bridge.reliable_emitter.has_cache_entries_for_tile(x, y),
+            "tile ({x},{y}) must have been sent"
+        );
     }
+    assert!(
+        bridge.scheduler.peek_for_test().is_empty(),
+        "no tile-codec work: the CPU policy has no tile encoders"
+    );
 }
 
 // Former home of `loss_injector_from_env_parses_probability_and_predicate`,
@@ -2893,6 +2898,7 @@ async fn frame_last_send_event_format() {
     let server = QuicServer::new().expect("server");
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
     let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+    bridge.metrics_tracker.resize(1, 1);
 
     // Non-zero, non-uniform pixels: a 32×32 frame = 1 tile.
     let mut pixels = vec![0u8; 32 * 32 * 4];
@@ -2923,7 +2929,7 @@ async fn frame_last_send_event_format() {
         None,
     );
 
-    // Stats should reflect 1 Raw tile dispatched.
+    // Stats should reflect 1 CDF 5/3 tile dispatched.
     assert_eq!(
         stats.tile_count, 1,
         "expected 1 tile in stats; got {}",
@@ -2935,8 +2941,8 @@ async fn frame_last_send_event_format() {
         stats.total_wire_bytes
     );
     assert_eq!(
-        stats.codec_histogram.raw, 1,
-        "expected codec_raw=1 for CpuRawOnly policy"
+        stats.codec_histogram.cdf53, 1,
+        "expected codec_cdf53=1 for CpuRawOnly policy"
     );
 
     // Emit the frame.last_send event exactly as the production path does.
@@ -2949,7 +2955,6 @@ async fn frame_last_send_event_format() {
         codec_solid = stats.codec_histogram.solid,
         codec_palrle = stats.codec_histogram.palrle,
         codec_cdf53 = stats.codec_histogram.cdf53,
-        codec_raw = stats.codec_histogram.raw,
         codec_h264 = stats.codec_histogram.h264,
         "frame.last_send"
     );

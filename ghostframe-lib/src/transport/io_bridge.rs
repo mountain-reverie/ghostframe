@@ -246,7 +246,6 @@ struct CodecHistogram {
     solid: u16,
     palrle: u16,
     cdf53: u16,
-    raw: u16,
     h264: u8,
 }
 
@@ -922,7 +921,6 @@ struct BumpCountAccumulator {
 /// total so we can correlate with the per-codec client `rx` counters.
 #[derive(Default, Clone, Copy)]
 struct CumulativeEmitCounters {
-    raw: u64,
     solid: u64,
     palrle: u64,
     cdf53: u64,
@@ -988,11 +986,12 @@ pub(crate) struct TileDispatchFrame<'a> {
 
 /// Selects how `dispatch_dirty_tiles_via_scheduler` picks a codec per tile.
 pub(crate) enum SchedulerEmissionPolicy {
-    /// CPU path: every tile emits `Codec::Raw` regardless of classifier state.
-    /// M3.1 D1 keeps the classifier sentinel-gated; this is the actual behavior.
+    /// CPU path: no classifier, so every dirty tile is sent as CDF 5/3. (The
+    /// name is from when this emitted Raw; the next change removes the policy.)
     CpuRawOnly,
-    /// GPU path: per-tile `CodecState` drives codec choice. `CodecState::Solid`
-    /// → `encode_solid`; everything else → `Codec::Raw`.
+    /// GPU path: per-tile `CodecState` drives codec choice. `Solid` →
+    /// `encode_solid`, `PalRle` → its prepared payload, everything else →
+    /// CDF 5/3.
     GpuClassifierDriven,
 }
 

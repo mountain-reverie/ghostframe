@@ -1,14 +1,14 @@
 // Per-tile paint ordering for one rAF tick.
 //
-// The renderer used to paint in a fixed codec order (Raw, PalRle, Cdf53,
+// The renderer used to paint in a fixed codec order (PalRle, Cdf53,
 // Solid, H.264) whatever the server frame each entry came from. When two
 // server frames land in one tick, an older Solid or H.264 draw could then sit
-// over a newer CDF53 tile, and an older PalRle over a newer Raw one. Every
+// over a newer CDF53 tile, and an older PalRle over a newer Solid one. Every
 // queue entry now carries the `frame_seq` of the frame it came from, and
 // this module decides, per tile, which entries may still be painted.
 //
 // Rules (all comparisons are serial-number arithmetic, so a u32 wrap is safe):
-//  - Stateless entries (Raw, Solid, PalRle) are dropped when any entry for the
+//  - Stateless entries (Solid, PalRle) are dropped when any entry for the
 //    same tile from a newer frame exists in the tick. They only overwrite
 //    pixels, so dropping one loses nothing.
 //  - CDF53 entries are never dropped: they integrate into per-tile coefficient
@@ -54,8 +54,7 @@ function newestByTile(into: Map<number, number>, entries: readonly SeqTile[]): v
   }
 }
 
-export interface PaintPlanInput<R extends SeqTile, S extends SeqTile, P extends SeqTile> {
-  raw: readonly R[];
+export interface PaintPlanInput<S extends SeqTile, P extends SeqTile> {
   solid: readonly S[];
   palRle: readonly P[];
   cdf53: readonly SeqTile[];
@@ -63,19 +62,17 @@ export interface PaintPlanInput<R extends SeqTile, S extends SeqTile, P extends 
   h264Seqs: readonly number[];
 }
 
-export interface PaintPlan<R, S, P> {
-  raw: R[];
+export interface PaintPlan<S, P> {
   solid: S[];
   palRle: P[];
   /** Draw the H.264 frames before the CDF53 lift instead of after it. */
   h264BeforeCdf53: boolean;
 }
 
-export function planPaint<R extends SeqTile, S extends SeqTile, P extends SeqTile>(
-  input: PaintPlanInput<R, S, P>,
-): PaintPlan<R, S, P> {
+export function planPaint<S extends SeqTile, P extends SeqTile>(
+  input: PaintPlanInput<S, P>,
+): PaintPlan<S, P> {
   const stateless = new Map<number, number>();
-  newestByTile(stateless, input.raw);
   newestByTile(stateless, input.solid);
   newestByTile(stateless, input.palRle);
   const cdf53 = new Map<number, number>();
@@ -107,7 +104,6 @@ export function planPaint<R extends SeqTile, S extends SeqTile, P extends SeqTil
   }
 
   return {
-    raw: input.raw.filter(keep),
     solid: input.solid.filter(keep),
     palRle: input.palRle.filter(keep),
     h264BeforeCdf53,

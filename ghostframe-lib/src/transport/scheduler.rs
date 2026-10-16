@@ -70,7 +70,7 @@ impl TileWork {
             generation,
             pass_idx: 0,
             total_passes: 1,
-            codec: Codec::Raw,
+            codec: Codec::Solid,
             payload,
             queued_at: Instant::now(),
             last_sent_at: None,
@@ -1212,7 +1212,7 @@ mod tests {
             generation: 0,
             pass_idx: 0,
             total_passes: 1,
-            codec: Codec::Raw,
+            codec: Codec::Solid,
             payload: vec![1, 2, 3],
             queued_at: stale_instant,
             last_sent_at: Some(stale_instant),
@@ -1363,7 +1363,7 @@ mod tests {
     #[test]
     fn mark_acked_stops_retry_for_non_cdf53_tile() {
         // Regression for the M3.3d on_ack deletion: without a queue-state
-        // flip on ACK, Solid/Raw/PalRle items in priority_queue stay
+        // flip on ACK, Solid/PalRle items in priority_queue stay
         // InFlight and retry every 2×RTT forever.
         let mut s = Scheduler::new(4, 4);
         s.set_retry_after(Duration::from_millis(10));

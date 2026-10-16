@@ -60,7 +60,8 @@ pub enum Codec {
     H264 = 1,
     PalRle = 2,
     Solid = 3,
-    Raw = 4,
+    // 4 was Raw, removed: nothing was deployed, so there is no compatibility
+    // to keep. The value stays unassigned and decodes as `UnknownCodec`.
     Cdf53 = 5,
 }
 
@@ -71,7 +72,6 @@ impl Codec {
             1 => Ok(Codec::H264),
             2 => Ok(Codec::PalRle),
             3 => Ok(Codec::Solid),
-            4 => Ok(Codec::Raw),
             5 => Ok(Codec::Cdf53),
             other => Err(ProtocolError::UnknownCodec(other)),
         }
@@ -991,11 +991,11 @@ mod tests {
 
     #[test]
     fn tile_header_codec_lz4_packing() {
-        // Raw=4, lz4=true → packed byte = (4 << 1) | 1 = 9
+        // Cdf53=5, lz4=true → packed byte = (5 << 1) | 1 = 11
         let th = TileHeader {
             tile_x: 0,
             tile_y: 0,
-            codec: Codec::Raw,
+            codec: Codec::Cdf53,
             lz4: true,
             generation: 0,
             pass: 0,
@@ -1003,11 +1003,23 @@ mod tests {
         };
         let mut buf = Vec::new();
         th.encode(&mut buf);
-        assert_eq!(buf[2], 9u8);
+        assert_eq!(buf[2], 11u8);
 
         let decoded = TileHeader::decode(&buf).unwrap();
-        assert_eq!(decoded.codec, Codec::Raw);
+        assert_eq!(decoded.codec, Codec::Cdf53);
         assert!(decoded.lz4);
+    }
+
+    /// Raw was removed. A tile header naming the old value must not decode.
+    #[test]
+    fn the_removed_raw_codec_value_is_a_decode_error() {
+        assert!(matches!(
+            Codec::from_u8(4),
+            Err(ProtocolError::UnknownCodec(4))
+        ));
+        // (4 << 1) | 0 in the packed byte of a tile header.
+        let buf = vec![0, 0, 8, 0, 0, 0, 0, 0];
+        assert!(TileHeader::decode(&buf).is_err());
     }
 
     #[test]
@@ -1046,7 +1058,7 @@ mod tests {
         let h = TileHeader {
             tile_x: 0,
             tile_y: 0,
-            codec: Codec::Raw,
+            codec: Codec::Solid,
             lz4: false,
             generation: 0x1F,
             pass: 0x1F,
@@ -1077,7 +1089,7 @@ mod tests {
                 frame_seq: 1,
                 tile_x: 2,
                 tile_y: 3,
-                codec: Codec::Raw,
+                codec: Codec::Solid,
                 generation: 0,
                 pass: 0,
                 timestamp_us: 5000,
@@ -1097,7 +1109,7 @@ mod tests {
 
         assert_eq!(th.tile_x, 2);
         assert_eq!(th.tile_y, 3);
-        assert_eq!(th.codec, Codec::Raw);
+        assert_eq!(th.codec, Codec::Solid);
         assert_eq!(th.payload_len, 100);
 
         assert_eq!(frag_payload, payload.as_slice());

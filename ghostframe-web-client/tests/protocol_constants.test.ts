@@ -36,7 +36,7 @@ describe('protocol constants', () => {
     expect(p.frameDimensionsSentinelX).toBe(0xff);
     expect(p.evictionSentinelX).toBe(0xfe);
     expect(p.evictionReasonDisplaced).toBe(1);
-    expect(p.codec).toEqual({ Skip: 0, H264: 1, PalRle: 2, Solid: 3, Raw: 4, Cdf53: 5 });
+    expect(p.codec).toEqual({ Skip: 0, H264: 1, PalRle: 2, Solid: 3, Cdf53: 5 });
   });
 
   it('feedback-stream message types are distinct', () => {

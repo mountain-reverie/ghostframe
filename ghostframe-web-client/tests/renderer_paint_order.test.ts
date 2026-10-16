@@ -1,6 +1,6 @@
 // When two server frames land in one rAF tick, the NEWER one must be what is
 // on screen for a tile, whatever codec each used. The renderer used to paint
-// in a fixed codec order (Raw, PalRle, Cdf53, Solid, H.264), so an older Solid
+// in a fixed codec order (PalRle, Cdf53, Solid, H.264), so an older Solid
 // or H.264 draw could sit over a newer CDF53 tile.
 //
 // No GPU under vitest: the renderer runs against fakes that record, on a
@@ -45,14 +45,14 @@ function makeRenderer(tl: Timeline) {
     queue: {
       submit: (bufs: Array<{ ops: Op[] }>) => { for (const b of bufs) tl.ops.push(...b.ops); },
       writeTexture: (_d: unknown, data: Uint8Array, _l: unknown, _s: unknown) => {
-        // Raw uploads carry their frame_seq in every byte; see rawTile().
-        tl.ops.push({ kind: 'raw', seq: data[0], tile: [0, 0] });
+        // Direct uploads carry their frame_seq in every byte.
+        tl.ops.push({ kind: 'write', seq: data[0], tile: [0, 0] });
       },
     },
   };
   const r = Object.create(WebGpuRenderer.prototype) as any;
   Object.assign(r, {
-    rawQueue: [], solidQueue: [], palRleQueue: [], cdf53Queue: [], h264Queue: [], h264Seqs: [],
+    solidQueue: [], palRleQueue: [], cdf53Queue: [], h264Queue: [], h264Seqs: [],
     videoFramesToClose: [], framebufferDirty: false, submitCount: 0, errorsReadbackInFlight: false,
     h264DropWarned: false,
     gpu: { device, context: { getCurrentTexture: () => ({ createView: () => ({}) }) } },
@@ -70,6 +70,12 @@ function makeRenderer(tl: Timeline) {
       },
       encodeErrorsReadback() {},
       zeroErrors() {},
+      // A drained PalRle batch starts an errors readback; it never resolves here.
+      errorsStaging: {
+        mapAsync: () => new Promise<void>(() => {}),
+        getMappedRange: () => new ArrayBuffer(0),
+        unmap() {},
+      },
     },
     cdf53Pipeline: {
       uploadBatch: (t: typeof pendingCdf) => { pendingCdf = [...t]; return t.length; },
@@ -90,16 +96,13 @@ function makeRenderer(tl: Timeline) {
 const solid = (seq: number) => ({ tileX: 0, tileY: 0, frameSeq: seq, bgra: new Uint8Array([seq, seq, seq, 255]) });
 const cdf = (seq: number) => ({ tileX: 0, tileY: 0, frameSeq: seq, gen: 0, passIdx: 0, bitPlanes: new Uint8Array(384) });
 const pal = (seq: number) => ({ tileX: 0, tileY: 0, frameSeq: seq, paletteId: 0, count: 1, indices: new Uint8Array(512) });
-const raw = (seq: number) => ({
-  tileX: 0, tileY: 0, frameSeq: seq,
-  bgra: new Uint8Array(protocol().tileBytes).fill(seq),
-});
 const h264 = (seq: number) => ({ seq, close() {} }) as unknown as VideoFrame;
 
 let tl: Timeline;
 let r: WebGpuRenderer;
 beforeEach(() => {
   (globalThis as any).window = globalThis;
+  (globalThis as any).GPUMapMode = { READ: 1 };
   tl = new Timeline();
   r = makeRenderer(tl);
 });
@@ -142,33 +145,23 @@ describe('newest frame_seq wins a tile within one tick', () => {
     present();
     expect(tl.screen(0, 0)).toBe(6);
   });
-  it('older PalRle does not cover a newer Raw', () => {
+  it('older Solid does not cover a newer PalRle', () => {
+    // The renderer draws PalRle before Solid, so only planPaint's stateless
+    // rule can stop the older Solid from landing on top.
+    r.pushSolid(solid(5));
+    r.pushPalRle(pal(6));
+    present();
+    expect(tl.screen(0, 0)).toBe(6);
+  });
+  it('older PalRle does not cover a newer Solid', () => {
     r.pushPalRle(pal(5));
-    r.pushRaw(raw(6));
-    present();
-    expect(tl.screen(0, 0)).toBe(6);
-  });
-  it('newer Raw lands after an older CDF53 lift', () => {
-    r.pushCdf53(cdf(5));
-    r.pushRaw(raw(6));
-    present();
-    expect(tl.screen(0, 0)).toBe(6);
-  });
-  it('older Raw does not cover a newer CDF53 lift', () => {
-    r.pushRaw(raw(5));
-    r.pushCdf53(cdf(6));
+    r.pushSolid(solid(6));
     present();
     expect(tl.screen(0, 0)).toBe(6);
   });
   it('older Solid does not survive under a newer H.264 frame, and does not cover it', () => {
     r.pushSolid(solid(5));
     r.pushH264(h264(6), 6);
-    present();
-    expect(tl.screen(0, 0)).toBe(6);
-  });
-  it('newer Raw lands after an older H.264 frame', () => {
-    r.pushH264(h264(5), 5);
-    r.pushRaw(raw(6));
     present();
     expect(tl.screen(0, 0)).toBe(6);
   });
@@ -206,15 +199,25 @@ describe('planPaint', () => {
   });
   it('drops a pre-wrap stateless entry under a post-wrap CDF53 entry', () => {
     const p = planPaint({
-      raw: [], palRle: [], h264Seqs: [],
+      palRle: [], h264Seqs: [],
       solid: [{ tileX: 0, tileY: 0, frameSeq: 0xffffffff }],
       cdf53: [{ tileX: 0, tileY: 0, frameSeq: 1 }],
     });
     expect(p.solid).toHaveLength(0);
   });
+  it('drops an older Solid under a newer PalRle on the same tile', () => {
+    const plan = planPaint({
+      palRle: [{ tileX: 0, tileY: 0, frameSeq: 6 }],
+      h264Seqs: [],
+      solid: [{ tileX: 0, tileY: 0, frameSeq: 5 }],
+      cdf53: [],
+    });
+    expect(plan.solid).toHaveLength(0);
+    expect(plan.palRle).toHaveLength(1);
+  });
   it('keeps entries of other tiles', () => {
     const p = planPaint({
-      raw: [], palRle: [], h264Seqs: [],
+      palRle: [], h264Seqs: [],
       solid: [{ tileX: 1, tileY: 0, frameSeq: 3 }],
       cdf53: [{ tileX: 0, tileY: 0, frameSeq: 9 }],
     });

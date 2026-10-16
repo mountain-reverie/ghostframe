@@ -13,7 +13,6 @@ use crate::framebuffer::Framebuffer;
 use crate::paint_order::SeqLedger;
 use crate::pipelines::cdf53::{Cdf53PassEntry, Cdf53Pipeline};
 use crate::pipelines::palrle::PalRlePipeline;
-use crate::pipelines::raw;
 use crate::pipelines::solid::SolidPipeline;
 use crate::ring::{ExportRing, PublishedFrame};
 use crate::wgpu_ctx::WgpuContext;
@@ -95,7 +94,6 @@ pub struct Renderer {
     /// Every pending stateless entry carries the `frame_seq` it came from
     /// (first field); `batch_seq` holds the newest per tile. See
     /// [`crate::paint_order`].
-    pending_raw: Vec<(u32, u8, u8, Vec<u8>)>,
     pending_solid: Vec<(u32, u8, u8, [u8; 4])>,
     pending_palrle: Vec<(u32, u8, u8, u8, u8, Vec<u8>)>,
     pending_cdf53: Vec<Cdf53PassEntry>,
@@ -262,7 +260,6 @@ impl Renderer {
             solid,
             palrle,
             cdf53,
-            pending_raw: Vec::new(),
             pending_solid: Vec::new(),
             pending_palrle: Vec::new(),
             pending_cdf53: Vec::new(),
@@ -322,12 +319,6 @@ impl Renderer {
                 // CDF 5/3 included: see `crate::paint_order`.
                 self.batch_seq.note(tile_x, tile_y, frame_seq);
                 match data {
-                    TileData::Raw(bgra) => {
-                        // Batched, not uploaded here: an immediate write
-                        // would land before everything `flush` draws, and
-                        // an older Solid would then cover it.
-                        self.pending_raw.push((frame_seq, tile_x, tile_y, bgra));
-                    }
                     TileData::Solid(bgra) => {
                         self.pending_solid.push((frame_seq, tile_x, tile_y, bgra));
                     }
@@ -468,10 +459,6 @@ impl Renderer {
             .collect();
         self.pending_rgba
             .retain(|&(seq, tx, ty, _)| !ledger.superseded(tx, ty, seq));
-        let raw_tiles: Vec<_> = std::mem::take(&mut self.pending_raw)
-            .into_iter()
-            .filter(|&(seq, tx, ty, _)| !ledger.superseded(tx, ty, seq))
-            .collect();
         self.batch_seq.clear();
 
         if !solid.is_empty() {
@@ -507,9 +494,6 @@ impl Renderer {
             }
         }
         self.upload_pending_rgba(ctx);
-        for (_, tx, ty, bgra) in &raw_tiles {
-            raw::upload_raw_tile(&ctx.queue, &self.fb, *tx, *ty, bgra);
-        }
 
         self.flushes = self.flushes.saturating_add(1);
         self.maybe_dump_framebuffer(ctx);
@@ -1166,9 +1150,9 @@ fn log_decode_error(codec: Codec, tile_x: u8, tile_y: u8, code: DecodeErrorCode)
 /// Upload an already-RGBA tile (`Event::TileReady`'s payload) directly into
 /// `fb` at tile coordinates `(tile_x, tile_y)`.
 ///
-/// Mirrors [`raw::upload_raw_tile`]'s partial-row and edge-clamping
-/// handling, but performs no BGRA -> RGBA swizzle: `TileReady::rgba` is
-/// already RGBA.
+/// Handles a partial last row and a framebuffer edge narrower than a tile by
+/// clamping. Performs no BGRA -> RGBA swizzle: `TileReady::rgba` is already
+/// RGBA.
 fn upload_rgba_tile(queue: &wgpu::Queue, fb: &Framebuffer, tile_x: u8, tile_y: u8, rgba: &[u8]) {
     let row_bytes = (TILE_SIZE * 4) as usize;
     let full_rows = (rgba.len() / row_bytes).min(TILE_SIZE as usize);
@@ -1184,8 +1168,8 @@ fn upload_rgba_tile(queue: &wgpu::Queue, fb: &Framebuffer, tile_x: u8, tile_y: u
         return;
     }
 
-    // Clip to `w` columns per row, matching `upload_raw_tile`'s handling of
-    // a framebuffer edge narrower than a full tile.
+    // Clip to `w` columns per row, so a framebuffer edge narrower than a
+    // full tile is handled.
     let mut tight = Vec::with_capacity(w as usize * h as usize * 4);
     for row in 0..h as usize {
         let row_start = row * row_bytes;

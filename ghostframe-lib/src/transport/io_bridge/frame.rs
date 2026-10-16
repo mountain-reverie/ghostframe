@@ -259,8 +259,8 @@ impl IoBridge {
         // Route to the GPU classifier whenever a processor is available and
         // we have *either* a DMA-BUF fd (zero-copy path) *or* CPU pixels
         // (modesetting-FB fallback uploads them into a HOST_VISIBLE VkImage).
-        // Without this, CPU-pixel frames hit `process_frame_cpu` which emits
-        // every tile as `Codec::Raw` and never exercises the wavelet path.
+        // Without this, CPU-pixel frames hit `process_frame_cpu`, which
+        // has no classifier and sends every tile as CDF 5/3.
         let has_gpu_input = frame.dmabuf_fd.is_some() || !frame.pixels.is_empty();
         let path = if has_gpu_input && self.frame_pipeline.is_some() {
             "gpu"
@@ -430,8 +430,8 @@ impl IoBridge {
             self.metrics_tracker.resize(grid.cols, grid.rows);
         }
 
-        // Route through the shared scheduler-dispatch helper. CPU path emits
-        // Codec::Raw per M3.1 D1 (classifier sentinel-gated).
+        // Route through the shared scheduler-dispatch helper. CPU path sends
+        // every tile as CDF 5/3 (no classifier).
         let stats = self.dispatch_dirty_tiles_via_scheduler(
             &dirty_tiles,
             &grid,
@@ -456,7 +456,6 @@ impl IoBridge {
             codec_solid = stats.codec_histogram.solid,
             codec_palrle = stats.codec_histogram.palrle,
             codec_cdf53 = stats.codec_histogram.cdf53,
-            codec_raw = stats.codec_histogram.raw,
             codec_h264 = stats.codec_histogram.h264,
             "frame.last_send"
         );
@@ -1667,7 +1666,6 @@ impl IoBridge {
             codec_solid = 0u16,
             codec_palrle = 0u16,
             codec_cdf53 = 0u16,
-            codec_raw = 0u16,
             codec_h264 = 1u8,
             "frame.last_send"
         );
@@ -2034,7 +2032,6 @@ impl IoBridge {
             codec_solid = stats.codec_histogram.solid,
             codec_palrle = stats.codec_histogram.palrle,
             codec_cdf53 = stats.codec_histogram.cdf53,
-            codec_raw = stats.codec_histogram.raw,
             codec_h264 = stats.codec_histogram.h264,
             refinement_deficit_after = self.scheduler.refinement_deficit_tiles(),
             send_datagram_errs_total = self.datagram_send_errs,
@@ -2131,7 +2128,6 @@ impl IoBridge {
             codec_solid = stats.codec_histogram.solid,
             codec_palrle = stats.codec_histogram.palrle,
             codec_cdf53 = stats.codec_histogram.cdf53,
-            codec_raw = stats.codec_histogram.raw,
             codec_h264 = stats.codec_histogram.h264,
             "frame.last_send"
         );
@@ -2153,7 +2149,6 @@ impl IoBridge {
                 emitted_solid = c.solid,
                 emitted_palrle = c.palrle,
                 emitted_cdf53 = c.cdf53,
-                emitted_raw = c.raw,
                 emitted_h264 = c.h264,
                 send_datagram_errs_total = self.datagram_send_errs,
                 fec_parity_emitted = es.parity_emitted,

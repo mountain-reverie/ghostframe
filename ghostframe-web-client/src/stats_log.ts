@@ -31,7 +31,6 @@ export interface StatsLoggerDeps {
 }
 
 export interface QueueDepths {
-  raw: number;
   solid: number;
   palrle: number;
   cdf53: number;
@@ -41,7 +40,7 @@ export interface QueueDepths {
 const STATS_INTERVAL_MS = 2000;
 
 export function createStatsLogger({ renderer, core, log, getNackSent }: StatsLoggerDeps) {
-  const drainTotals: QueueDepths = { raw: 0, solid: 0, palrle: 0, cdf53: 0, h264: 0 };
+  const drainTotals: QueueDepths = { solid: 0, palrle: 0, cdf53: 0, h264: 0 };
   let lastDrain: QueueDepths = { ...drainTotals };
   let lastStatsMs = 0;
   let lastLineKey = '';
@@ -50,7 +49,6 @@ export function createStatsLogger({ renderer, core, log, getNackSent }: StatsLog
     /** Call once per rAF, after the frame was encoded. `beforeDrain` is the
      * queue depths sampled BEFORE `encodeAndPresentFrame` consumed them. */
     onTick(beforeDrain: QueueDepths, rafTicks: number): void {
-      drainTotals.raw += beforeDrain.raw;
       drainTotals.solid += beforeDrain.solid;
       drainTotals.palrle += beforeDrain.palrle;
       drainTotals.cdf53 += beforeDrain.cdf53;
@@ -66,7 +64,6 @@ export function createStatsLogger({ renderer, core, log, getNackSent }: StatsLog
         __readPixel?: (x: number, y: number) => Promise<number[]>;
       };
       const drainDelta: QueueDepths = {
-        raw: drainTotals.raw - lastDrain.raw,
         solid: drainTotals.solid - lastDrain.solid,
         palrle: drainTotals.palrle - lastDrain.palrle,
         cdf53: drainTotals.cdf53 - lastDrain.cdf53,
@@ -79,7 +76,7 @@ export function createStatsLogger({ renderer, core, log, getNackSent }: StatsLog
       const nackSent = getNackSent();
 
       const statsLine =
-        `stats: Δdrain{r:${drainDelta.raw} s:${drainDelta.solid} p:${drainDelta.palrle} ` +
+        `stats: Δdrain{s:${drainDelta.solid} p:${drainDelta.palrle} ` +
         `c:${drainDelta.cdf53} h:${drainDelta.h264}} ` +
         `fb:${fb.width}x${fb.height} ` +
         `cdf53fails:${cdf53Fails}(last=${cdf53Last}) ` +
@@ -126,7 +123,7 @@ export function createStatsLogger({ renderer, core, log, getNackSent }: StatsLog
       // Dedup key: excludes `raf:` (always changes) and bookkeeping that
       // creeps; suppress only when nothing the reader cares about moved.
       const lineKey =
-        `drain:${drainDelta.raw}/${drainDelta.solid}/${drainDelta.palrle}/` +
+        `drain:${drainDelta.solid}/${drainDelta.palrle}/` +
         `${drainDelta.cdf53}/${drainDelta.h264}|` +
         `fb:${fb.width}x${fb.height}|fails:${cdf53Fails}|nack:${nackSent}`;
       const statsChanged = lineKey !== lastLineKey;

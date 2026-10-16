@@ -386,7 +386,7 @@ impl GpuFrameProcessor {
         // tile_analysis runs on the first frame because it only reads the
         // current frame's pixels (no dependency on prev_image). Without it,
         // every tile's `unique_colors` stays at UNIQUE_COLORS_UNKNOWN, which
-        // forces the classifier into Codec::Raw for static content where the
+        // keeps the classifier from seeing real colour counts for static content where the
         // first frame is the only frame with dirty tiles. See
         // docs/superpowers/specs/2026-05-15-m3.2c-verification-design.md.
         //

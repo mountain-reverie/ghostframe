@@ -9,7 +9,7 @@ import * as wasm from '../pkg-node/ghostframe_client_wasm.js';
 import { fragmentTile, buildEvictionDatagram } from './helpers/wasm.js';
 
 const EVICTION_REASON_DISPLACED = 1; // EvictionReason::DisplacedByNewSession::to_byte()
-const RAW_CODEC = 4; // ghostframe_protocol::protocol::Codec::Raw
+const SOLID_CODEC = 3; // ghostframe_protocol::protocol::Codec::Solid
 
 function newCore(): InstanceType<typeof wasm.WasmClientCore> {
   return new wasm.WasmClientCore(false, false, false, 0n);
@@ -28,7 +28,7 @@ describe('eviction notice', () => {
     // Sentinel coordinates are what route this. A busy screen must not
     // disconnect the client.
     const core = newCore();
-    for (const f of fragmentTile(7, 3, 4, RAW_CODEC, 1, 0, new Uint8Array(8), 8)) {
+    for (const f of fragmentTile(7, 3, 4, SOLID_CODEC, 1, 0, new Uint8Array(4), 8)) {
       expect((core.handleDatagram(f, 0n) as any[]).filter((e) => e.kind === 'Evicted')).toHaveLength(0);
     }
   });

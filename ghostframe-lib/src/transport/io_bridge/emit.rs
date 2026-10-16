@@ -334,9 +334,10 @@ impl IoBridge {
 
         use crate::transport::scheduler::{TileWork, WorkState};
 
-        // GPU policy: a dirty tile the tile encoders cannot carry goes out as
-        // CDF 5/3 (lossless once every pass lands) rather than as 4 KB of Raw.
-        // That is every tile whose state has no tile-local encoder (Skip,
+        // A dirty tile the tile encoders cannot carry goes out as CDF 5/3
+        // (lossless once every pass lands). The CPU policy has no tile
+        // encoders at all: every dirty tile is such a tile. On the GPU policy
+        // it is every tile whose state has no tile-local encoder (Skip,
         // H264, PixelPerfect) and a PalRle tile whose payload never got made
         // (palette table full, frame-palette overflow). The frame's own
         // compact pass lists only dirty tiles with more than 16 colours, so
@@ -345,22 +346,27 @@ impl IoBridge {
         // sets each tile's state to Cdf53, so the loop below skips it like
         // any other Cdf53 tile.
         let mut failed_fallback: Vec<(u32, u32)> = Vec::new();
-        if matches!(policy, SchedulerEmissionPolicy::GpuClassifierDriven) {
+        {
             use crate::tile::CodecState;
             let has_payload =
                 |palrle: &Option<&mut std::collections::HashMap<(u32, u32), Vec<u8>>>,
                  xy: (u32, u32)| {
                     palrle.as_ref().is_some_and(|m| m.contains_key(&xy))
                 };
-            let fallback: Vec<(u32, u32)> = dirty
-                .iter()
-                .copied()
-                .filter(|&(x, y)| match self.metrics_tracker.get(x, y).codec_state {
-                    CodecState::Cdf53 { .. } | CodecState::Solid => false,
-                    CodecState::PalRle { .. } => !has_payload(&palrle_payloads, (x, y)),
-                    CodecState::H264 { .. } | CodecState::PixelPerfect | CodecState::Skip => true,
-                })
-                .collect();
+            let fallback: Vec<(u32, u32)> = match policy {
+                SchedulerEmissionPolicy::CpuRawOnly => dirty.to_vec(),
+                SchedulerEmissionPolicy::GpuClassifierDriven => dirty
+                    .iter()
+                    .copied()
+                    .filter(|&(x, y)| match self.metrics_tracker.get(x, y).codec_state {
+                        CodecState::Cdf53 { .. } | CodecState::Solid => false,
+                        CodecState::PalRle { .. } => !has_payload(&palrle_payloads, (x, y)),
+                        CodecState::H264 { .. } | CodecState::PixelPerfect | CodecState::Skip => {
+                            true
+                        }
+                    })
+                    .collect(),
+            };
             if !fallback.is_empty() {
                 failed_fallback = self.commit_cdf53_fallback(&fallback, grid, pixels, stride);
             }
@@ -370,6 +376,10 @@ impl IoBridge {
             // A fallback tile whose forward failed is retried next frame
             // (the baseline was invalidated); nothing else can carry it.
             if failed_fallback.contains(&(tile_x, tile_y)) {
+                continue;
+            }
+            // The CPU policy sent every dirty tile through the fallback above.
+            if matches!(policy, SchedulerEmissionPolicy::CpuRawOnly) {
                 continue;
             }
             // For GpuClassifierDriven, check whether this tile is handled by
@@ -412,67 +422,45 @@ impl IoBridge {
                 .drop_cdf53_for_tile(tile_x as u8, tile_y as u8);
             // New generation: tile is eligible for re-escalation.
             // Guard with a bounds check to stay safe when metrics_tracker has
-            // not yet been sized (e.g. CpuRawOnly unit test path).
+            // not yet been sized (e.g. a unit-test bridge).
             if tile_x < self.metrics_tracker.cols() && tile_y < self.metrics_tracker.rows() {
                 self.metrics_tracker
                     .get_mut(tile_x, tile_y)
                     .already_escalated_this_gen = false;
             }
             self.settle_superseded_palettes(tile_x as u8, tile_y as u8, &superseded);
-            // Copied out only by the arms that send the pixels. Solid needs
-            // one pixel and PalRle arrives already encoded, and on a
-            // full-screen change this 4 KB copy per tile was most of what
-            // the loop cost once the bookkeeping above stopped scanning.
-            let extract_tile = || grid.extract_tile(pixels, stride, tile_x, tile_y);
-
-            let (codec, payload) = match policy {
-                SchedulerEmissionPolicy::CpuRawOnly => (Codec::Raw, extract_tile()),
-                SchedulerEmissionPolicy::GpuClassifierDriven => {
-                    use crate::tile::CodecState;
-                    // Cdf53 tiles were already skipped above (before bump_generation);
-                    // only non-Cdf53 tiles reach this point.
-                    let codec_state = self.metrics_tracker.get(tile_x, tile_y).codec_state;
-                    match codec_state {
-                        CodecState::Solid => {
-                            let solid = grid.first_pixel(pixels, stride, tile_x, tile_y);
-                            (Codec::Solid, solid.to_vec())
-                        }
-                        CodecState::PalRle { .. } => {
-                            let payload = if let Some(m) = palrle_payloads.as_mut() {
-                                m.remove(&(tile_x, tile_y))
-                            } else {
-                                None
-                            };
-                            match payload {
-                                Some(p) => (Codec::PalRle, p),
-                                // Unreachable: the fallback pass above sent this tile
-                                // as CDF 5/3. Raw goes with the codec (next PR).
-                                None => {
-                                    debug_assert!(
-                                        false,
-                                        "PalRle tile without payload reached the Raw arm"
-                                    );
-                                    (Codec::Raw, extract_tile())
-                                }
-                            }
-                        }
-                        // Raw is the encoder of last resort: these states
-                        // either have no tile-local encoding of their own
-                        // (H264 is a whole-frame path, Skip emits nothing)
-                        // or are handled before this match. Listed so a new
-                        // CodecState must choose its encoder rather than
-                        // silently inheriting Raw, which is the most
-                        // expensive option on the wire.
-                        CodecState::H264 { .. }
-                        | CodecState::Cdf53 { .. }
-                        | CodecState::PixelPerfect
-                        | CodecState::Skip => {
-                            // Unreachable: the fallback pass above sent these
-                            // as CDF 5/3 (Cdf53 never gets this far).
-                            debug_assert!(false, "{codec_state:?} tile reached the Raw arm");
-                            (Codec::Raw, extract_tile())
+            // Only a Solid tile (one pixel) or a PalRle tile (already
+            // encoded) is sent here. Everything else went through the CDF 5/3
+            // fallback above, so reaching this point with another state means
+            // the pre-pass and this match disagree.
+            use crate::tile::CodecState;
+            let codec_state = self.metrics_tracker.get(tile_x, tile_y).codec_state;
+            let (codec, payload) = match codec_state {
+                CodecState::Solid => {
+                    let solid = grid.first_pixel(pixels, stride, tile_x, tile_y);
+                    (Codec::Solid, solid.to_vec())
+                }
+                CodecState::PalRle { .. } => {
+                    match palrle_payloads
+                        .as_mut()
+                        .and_then(|m| m.remove(&(tile_x, tile_y)))
+                    {
+                        Some(p) => (Codec::PalRle, p),
+                        None => {
+                            debug_assert!(
+                                false,
+                                "PalRle tile without payload was not sent as CDF 5/3"
+                            );
+                            continue;
                         }
                     }
+                }
+                CodecState::H264 { .. }
+                | CodecState::Cdf53 { .. }
+                | CodecState::PixelPerfect
+                | CodecState::Skip => {
+                    debug_assert!(false, "{codec_state:?} tile was not sent as CDF 5/3");
+                    continue;
                 }
             };
 
@@ -709,9 +697,6 @@ impl IoBridge {
                             stats.codec_histogram.cdf53 =
                                 stats.codec_histogram.cdf53.saturating_add(1);
                         }
-                        Codec::Raw => {
-                            stats.codec_histogram.raw = stats.codec_histogram.raw.saturating_add(1);
-                        }
                         // No histogram bucket: H264 is counted on the
                         // whole-frame path, Skip emits no datagram. Listed so
                         // a new codec cannot go uncounted without someone
@@ -764,10 +749,6 @@ impl IoBridge {
                                 .saturating_add(bytes_this_tile);
                         }
                     }
-                }
-                Codec::Raw => {
-                    self.cumulative_datagrams_emitted.raw =
-                        self.cumulative_datagrams_emitted.raw.saturating_add(n_dg);
                 }
                 // Same reasoning as the histogram above: no per-codec
                 // datagram counter for these, stated rather than defaulted.

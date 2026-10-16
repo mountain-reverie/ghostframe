@@ -74,9 +74,9 @@ impl Default for TileMetrics {
 
 /// Per-tile codec assignment chosen by the classifier. Variant set is fixed
 /// by the source spec. In M3.0 the classifier may return any of these values,
-/// but the io_bridge emission layer maps every non-Skip variant to
-/// `Codec::Raw` on the wire because no real per-tile encoders exist until
-/// M3.1+.
+/// and the emission layer sends each as its codec: Solid, PalRle or CDF 5/3.
+/// A state with no tile encoder of its own (Skip, H264, PixelPerfect on a
+/// dirty tile) goes out as CDF 5/3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecState {
     Skip,

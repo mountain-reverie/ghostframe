@@ -88,7 +88,7 @@ fn drain_stream(core: &mut ClientCore) -> Vec<Vec<u8>> {
 #[test]
 fn assembly_timeout_nacks_missing_fragments_once() {
     let mut core = test_core();
-    let dgs = tile_datagrams(1, 0, 0, Codec::Raw, 0, &vec![7u8; 4096], 1200); // 4 frags
+    let dgs = tile_datagrams(1, 0, 0, Codec::Solid, 0, &vec![7u8; 4096], 1200); // 4 frags
     assert_eq!(dgs.len(), 4);
     core.handle_datagram(&dgs[0], 0);
 
@@ -110,7 +110,7 @@ fn assembly_timeout_nacks_missing_fragments_once() {
 #[test]
 fn assembly_timeout_scan_deadline_retires_once_fully_nacked() {
     let mut core = test_core();
-    let dgs = tile_datagrams(1, 0, 0, Codec::Raw, 0, &vec![7u8; 4096], 1200); // 4 frags
+    let dgs = tile_datagrams(1, 0, 0, Codec::Solid, 0, &vec![7u8; 4096], 1200); // 4 frags
     assert_eq!(dgs.len(), 4);
     core.handle_datagram(&dgs[0], 0);
 

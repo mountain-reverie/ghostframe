@@ -100,7 +100,7 @@ fn one_frame(cols: u32, rows: u32, payload_len: usize) -> Stage {
                     generation: 1,
                     pass_idx: 0,
                     total_passes: 1,
-                    codec: Codec::Raw,
+                    codec: Codec::Cdf53,
                     payload: payload.clone(),
                     queued_at: now,
                     last_sent_at: None,

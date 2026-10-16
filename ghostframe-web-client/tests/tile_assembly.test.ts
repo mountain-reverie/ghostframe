@@ -24,106 +24,101 @@ import { describe, it, expect } from 'vitest';
 import * as wasm from '../pkg-node/ghostframe_client_wasm.js';
 import { fragmentTile } from './helpers/wasm.js';
 
-const RAW_CODEC = 4; // ghostframe_protocol::protocol::Codec::Raw
+const CDF53_CODEC = 5; // ghostframe_protocol::protocol::Codec::Cdf53
 
-/** BGRA payload -> the RGBA bytes `Codec::Raw` decode produces (swizzle,
- * alpha passed through), matching `finish_assembly`'s `Codec::Raw` arm. */
-function bgraToRgba(bgra: Uint8Array): Uint8Array {
-  const rgba = new Uint8Array(bgra.length);
-  for (let i = 0; i < bgra.length; i += 4) {
-    rgba[i] = bgra[i + 2];
-    rgba[i + 1] = bgra[i + 1];
-    rgba[i + 2] = bgra[i];
-    rgba[i + 3] = bgra[i + 3];
-  }
-  return rgba;
+/** A valid CDF 5/3 pass payload body: three channels (B, G, R) of
+ * `[len=2][literal][zero run]`, each with its own literal so a swapped,
+ * spliced or reordered assembly changes the bytes. */
+function channels(lits: [number, number, number]): Uint8Array {
+  const p = new Uint8Array(12);
+  lits.forEach((lit, ch) => p.set([0, 2, lit, 0xfe], ch * 4));
+  return p;
 }
 
-/** Fresh core in `TileDelivery::Decoded` mode, so `Codec::Raw` tiles
- * complete as `TileReady` events straight out of `handleDatagram`. */
+/** The 384 bit-plane bytes the core hands up for `channels(lits)`: each
+ * channel's 128-byte plane has its literal first and zeros after. */
+function planes(lits: [number, number, number]): Uint8Array {
+  const out = new Uint8Array(384);
+  lits.forEach((lit, ch) => (out[ch * 128] = lit));
+  return out;
+}
+
+/** Fresh core in `TileDelivery::Payload` mode: a completed tile surfaces as a
+ * `TilePayload` whose `bit_planes` mirror the payload bytes directly, so the
+ * assertions below compare real content, not a decode that could be constant. */
 function newCore(): InstanceType<typeof wasm.WasmClientCore> {
-  return new wasm.WasmClientCore(false, false, false, 0n);
+  return new wasm.WasmClientCore(false, false, true, 0n);
 }
 
-function tileReadyEvents(core: InstanceType<typeof wasm.WasmClientCore>, dg: Uint8Array): any[] {
-  return (core.handleDatagram(dg, 0n) as any[]).filter((e) => e.kind === 'TileReady');
+function payloadEvents(core: InstanceType<typeof wasm.WasmClientCore>, dg: Uint8Array): any[] {
+  return (core.handleDatagram(dg, 0n) as any[]).filter((e) => e.kind === 'TilePayload');
 }
 
 describe('tile assembly bucket isolation (cross-pass collision regression)', () => {
   it('fragments of the same (frameSeq, tileX, tileY, passIdx) assemble into one tile', () => {
-    // Equivalent to the old `tileKey(7,3,4,9) === tileKey(7,3,4,9)`: the
-    // same tuple must route both fragments into the same assembly bucket.
+    // The same tuple must route both fragments into the same assembly bucket.
     const core = newCore();
-    const payload = new Uint8Array([0x01, 0x02, 0x03, 0xff, 0x04, 0x05, 0x06, 0xff]); // 2 BGRA px
-    const frags = fragmentTile(7, 3, 4, RAW_CODEC, /*gen*/ 1, /*pass*/ 9, payload, 4);
+    const lits: [number, number, number] = [0x05, 0x06, 0x07];
+    const frags = fragmentTile(7, 3, 4, CDF53_CODEC, /*gen*/ 1, /*pass*/ 9, channels(lits), 8);
     expect(frags.length).toBe(2);
 
-    expect(tileReadyEvents(core, frags[0])).toEqual([]);
-    const ready = tileReadyEvents(core, frags[1]);
+    expect(payloadEvents(core, frags[0])).toEqual([]);
+    const ready = payloadEvents(core, frags[1]);
     expect(ready.length).toBe(1);
     expect(ready[0].frame_seq).toBe(7);
     expect(ready[0].tile_x).toBe(3);
     expect(ready[0].tile_y).toBe(4);
-    expect(new Uint8Array(ready[0].rgba)).toEqual(bgraToRgba(payload));
+    expect(ready[0].data.pass_idx).toBe(9);
+    expect(new Uint8Array(ready[0].data.bit_planes)).toEqual(planes(lits));
   });
 
   it('two passes of the same tile in the same frameSeq own separate assemblies', () => {
-    // Models the exact scenario the production bug exposed: pass 0 and
-    // pass 1 of the same tile both have multi-fragment payloads, and pass
-    // 1's first fragment arrives before pass 0's second fragment has
-    // landed — the production interleaving that triggered the collision.
-    // Before the fix (no pass_idx in the key), pass 1's frag 0 would have
-    // been silently dropped (its bucket slot already filled by pass 0's
-    // frag 0), and the eventual completion would have spliced pass 0's
-    // frag 0 together with pass 1's frag 1 into one Frankenstein tile.
+    // Pass 0 and pass 1 of the same tile both have multi-fragment payloads, and
+    // pass 1's first fragment arrives before pass 0's second fragment has
+    // landed. Before pass_idx was in the key, pass 1's frag 0 was silently
+    // dropped and the completion spliced pass 0's frag 0 with pass 1's frag 1.
     const core = newCore();
-    const frameSeq = 0x1234;
-    const tileX = 10;
-    const tileY = 30;
-
-    const pass0Payload = new Uint8Array([0x01, 0x02, 0x03, 0xff, 0x04, 0x05, 0x06, 0xff]);
-    const pass1Payload = new Uint8Array([0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0xff]);
-    const pass0 = fragmentTile(frameSeq, tileX, tileY, RAW_CODEC, 1, 0, pass0Payload, 4);
-    const pass1 = fragmentTile(frameSeq, tileX, tileY, RAW_CODEC, 1, 1, pass1Payload, 4);
+    const lits0: [number, number, number] = [0x01, 0x02, 0x03];
+    const lits1: [number, number, number] = [0x40, 0x41, 0x42];
+    // Pass 0 carries the 2-byte `present_passes` prefix naming passes 0 and 1.
+    const pass0Payload = new Uint8Array([0x00, 0x03, ...channels(lits0)]);
+    const pass0 = fragmentTile(0x1234, 10, 30, CDF53_CODEC, 1, 0, pass0Payload, 8);
+    const pass1 = fragmentTile(0x1234, 10, 30, CDF53_CODEC, 1, 1, channels(lits1), 8);
     expect(pass0.length).toBe(2);
     expect(pass1.length).toBe(2);
 
     // Interleave: pass0 frag0, pass1 frag0, pass1 frag1 (completes pass1),
     // pass0 frag1 (completes pass0).
-    expect(tileReadyEvents(core, pass0[0])).toEqual([]);
-    expect(tileReadyEvents(core, pass1[0])).toEqual([]);
-
-    const readyPass1 = tileReadyEvents(core, pass1[1]);
-    const readyPass0 = tileReadyEvents(core, pass0[1]);
+    expect(payloadEvents(core, pass0[0])).toEqual([]);
+    expect(payloadEvents(core, pass1[0])).toEqual([]);
+    const readyPass1 = payloadEvents(core, pass1[1]);
+    const readyPass0 = payloadEvents(core, pass0[1]);
 
     expect(readyPass1.length).toBe(1);
     expect(readyPass0.length).toBe(1);
-    expect(new Uint8Array(readyPass1[0].rgba)).toEqual(bgraToRgba(pass1Payload));
-    expect(new Uint8Array(readyPass0[0].rgba)).toEqual(bgraToRgba(pass0Payload));
+    expect(readyPass1[0].data.pass_idx).toBe(1);
+    expect(readyPass0[0].data.pass_idx).toBe(0);
+    expect(new Uint8Array(readyPass1[0].data.bit_planes)).toEqual(planes(lits1));
+    expect(new Uint8Array(readyPass0[0].data.bit_planes)).toEqual(planes(lits0));
   });
 
   it('same tile coordinates under different frameSeq occupy separate assemblies', () => {
     const core = newCore();
-    const tileX = 2;
-    const tileY = 3;
+    const litsA: [number, number, number] = [0x11, 0x12, 0x13];
+    const litsB: [number, number, number] = [0x44, 0x45, 0x46];
+    const seqA = fragmentTile(100, 2, 3, CDF53_CODEC, 1, 4, channels(litsA), 8);
+    const seqB = fragmentTile(101, 2, 3, CDF53_CODEC, 1, 4, channels(litsB), 8);
 
-    const seqAPayload = new Uint8Array([0xaa, 0xbb, 0xcc, 0xff, 0xdd, 0xee, 0xff, 0xff]);
-    const seqBPayload = new Uint8Array([0x11, 0x22, 0x33, 0xff, 0x44, 0x55, 0x66, 0xff]);
-    const seqA = fragmentTile(100, tileX, tileY, RAW_CODEC, 1, 4, seqAPayload, 4);
-    const seqB = fragmentTile(101, tileX, tileY, RAW_CODEC, 1, 4, seqBPayload, 4);
-
-    expect(tileReadyEvents(core, seqA[0])).toEqual([]);
-    expect(tileReadyEvents(core, seqB[0])).toEqual([]);
-
-    const readyB = tileReadyEvents(core, seqB[1]);
-    const readyA = tileReadyEvents(core, seqA[1]);
+    expect(payloadEvents(core, seqA[0])).toEqual([]);
+    expect(payloadEvents(core, seqB[0])).toEqual([]);
+    const readyB = payloadEvents(core, seqB[1]);
+    const readyA = payloadEvents(core, seqA[1]);
 
     expect(readyB.length).toBe(1);
     expect(readyB[0].frame_seq).toBe(101);
-    expect(new Uint8Array(readyB[0].rgba)).toEqual(bgraToRgba(seqBPayload));
-
+    expect(new Uint8Array(readyB[0].data.bit_planes)).toEqual(planes(litsB));
     expect(readyA.length).toBe(1);
     expect(readyA[0].frame_seq).toBe(100);
-    expect(new Uint8Array(readyA[0].rgba)).toEqual(bgraToRgba(seqAPayload));
+    expect(new Uint8Array(readyA[0].data.bit_planes)).toEqual(planes(litsA));
   });
 });
