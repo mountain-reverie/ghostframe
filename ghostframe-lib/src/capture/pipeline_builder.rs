@@ -195,6 +195,23 @@ pub unsafe fn alloc_host_buffer(
     usage: vk::BufferUsageFlags,
     label: &str,
 ) -> Result<(vk::Buffer, vk::DeviceMemory), Box<dyn std::error::Error>> {
+    alloc_host_buffer_inner(device, mem_props, size, usage, label, false)
+}
+
+/// [`alloc_host_buffer`], preferring a `HOST_CACHED` memory type when
+/// `prefer_cached` is set (and one that is also `HOST_COHERENT` exists).
+///
+/// The first host-visible coherent type is often write-combined on a discrete
+/// GPU: fast for the CPU to write, but a CPU *read* is uncached and runs near
+/// 30 MB/s. A buffer the CPU reads back wants the cached type.
+unsafe fn alloc_host_buffer_inner(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+    label: &str,
+    prefer_cached: bool,
+) -> Result<(vk::Buffer, vk::DeviceMemory), Box<dyn std::error::Error>> {
     let buf_ci = vk::BufferCreateInfo::default()
         .size(size)
         .usage(usage)
@@ -202,12 +219,8 @@ pub unsafe fn alloc_host_buffer(
     let buffer = device.create_buffer(&buf_ci, None)?;
     let buffer_guard = Defer::new(|| device.destroy_buffer(buffer, None));
     let reqs = device.get_buffer_memory_requirements(buffer);
-    let mem_type = find_memory_type(
-        mem_props,
-        reqs.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    )
-    .ok_or_else(|| format!("no host-visible memory type for {label}"))?;
+    let mem_type = choose_host_memory_type(mem_props, reqs.memory_type_bits, prefer_cached)
+        .ok_or_else(|| format!("no host-visible memory type for {label}"))?;
     let alloc_ci = vk::MemoryAllocateInfo::default()
         .allocation_size(reqs.size)
         .memory_type_index(mem_type);
@@ -250,6 +263,50 @@ pub unsafe fn alloc_host_buffer_mapped<T>(
     Ok((buffer, memory, ptr))
 }
 
+/// [`alloc_host_buffer_mapped`] for a buffer the CPU reads back in bulk:
+/// prefers a cached memory type. See [`alloc_host_buffer_inner`].
+///
+/// # Safety
+///
+/// Same as [`alloc_host_buffer_mapped`].
+pub unsafe fn alloc_host_readback_buffer_mapped<T>(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+    label: &str,
+) -> Result<(vk::Buffer, vk::DeviceMemory, *mut T), Box<dyn std::error::Error>> {
+    let (buffer, memory) = alloc_host_buffer_inner(device, mem_props, size, usage, label, true)?;
+    let buffer_guard = Defer::new(|| device.destroy_buffer(buffer, None));
+    let memory_guard = Defer::new(|| device.free_memory(memory, None));
+    let ptr = device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())? as *mut T;
+    buffer_guard.disarm();
+    memory_guard.disarm();
+    Ok((buffer, memory, ptr))
+}
+
+/// The memory type for a host-visible coherent buffer: a `HOST_CACHED` one
+/// first when `prefer_cached`, otherwise (or when the device has none that is
+/// also coherent) the first host-visible coherent type. Coherent either way,
+/// so no explicit flush or invalidate is ever needed.
+pub(super) fn choose_host_memory_type(
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    type_filter: u32,
+    prefer_cached: bool,
+) -> Option<u32> {
+    let base = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    if prefer_cached {
+        if let Some(t) = find_memory_type(
+            mem_props,
+            type_filter,
+            base | vk::MemoryPropertyFlags::HOST_CACHED,
+        ) {
+            return Some(t);
+        }
+    }
+    find_memory_type(mem_props, type_filter, base)
+}
+
 pub(super) fn find_memory_type(
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     type_filter: u32,
@@ -262,4 +319,56 @@ pub(super) fn find_memory_type(
             .contains(required_flags);
         suitable && has_flags
     })
+}
+
+#[cfg(test)]
+mod memory_type_tests {
+    use super::*;
+
+    fn props(types: &[vk::MemoryPropertyFlags]) -> vk::PhysicalDeviceMemoryProperties {
+        let mut p = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: types.len() as u32,
+            ..Default::default()
+        };
+        for (i, f) in types.iter().enumerate() {
+            p.memory_types[i].property_flags = *f;
+        }
+        p
+    }
+
+    const HV: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::HOST_VISIBLE;
+    const HC: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::HOST_COHERENT;
+    const CACHED: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::HOST_CACHED;
+
+    /// The layout of the dGPU this was measured on: a write-combined coherent
+    /// type comes first, a cached coherent one later.
+    fn dgpu() -> vk::PhysicalDeviceMemoryProperties {
+        props(&[
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            HV | HC,
+            HV | HC | CACHED,
+        ])
+    }
+
+    #[test]
+    fn a_readback_buffer_takes_the_cached_type_over_the_first_coherent_one() {
+        assert_eq!(choose_host_memory_type(&dgpu(), !0, true), Some(2));
+    }
+
+    #[test]
+    fn an_upload_buffer_keeps_the_first_coherent_type() {
+        assert_eq!(choose_host_memory_type(&dgpu(), !0, false), Some(1));
+    }
+
+    #[test]
+    fn without_a_cached_coherent_type_the_first_coherent_one_is_used() {
+        let p = props(&[HV | HC, HV | CACHED]);
+        assert_eq!(choose_host_memory_type(&p, !0, true), Some(0));
+    }
+
+    #[test]
+    fn the_buffers_own_type_mask_is_respected() {
+        assert_eq!(choose_host_memory_type(&dgpu(), 0b010, true), Some(1));
+        assert_eq!(choose_host_memory_type(&dgpu(), 0b001, true), None);
+    }
 }

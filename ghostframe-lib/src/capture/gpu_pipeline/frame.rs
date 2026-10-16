@@ -12,7 +12,7 @@ use ash::vk;
 use std::io;
 
 use super::super::pipeline_builder::{
-    alloc_host_buffer_mapped, fail_point, find_memory_type, note_released, Defer,
+    alloc_host_readback_buffer_mapped, fail_point, find_memory_type, note_released, Defer,
 };
 use super::*;
 
@@ -186,7 +186,7 @@ impl GpuFrameProcessor {
         let mem_props = self
             .instance
             .get_physical_device_memory_properties(self.physical_device);
-        let (buffer, memory, ptr) = alloc_host_buffer_mapped::<u8>(
+        let (buffer, memory, ptr) = alloc_host_readback_buffer_mapped::<u8>(
             &self.device,
             &mem_props,
             total,
