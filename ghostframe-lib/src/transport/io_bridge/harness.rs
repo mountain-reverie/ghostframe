@@ -76,14 +76,45 @@ impl IoBridge {
     /// bridge so `process_frame` takes the production GPU path.
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn set_gpu_frame_processor_for_measurement(&mut self, p: GpuFrameProcessor) {
-        self.frame_backend = Some(Box::new(GpuBackend::new(p)));
+        self.frame_pipeline = Some(FramePipeline::new(Box::new(GpuBackend::new(p))));
     }
 
     /// Install a frame backend (a fake with controllable latency, or a
     /// recording one) in place of the GPU one.
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn set_frame_backend(&mut self, backend: Box<dyn FrameBackend>) {
-        self.frame_backend = Some(backend);
+        self.frame_pipeline = Some(FramePipeline::new(backend));
+    }
+
+    /// Hold an injected frame for its `cost` on a task, off the loop, and hand
+    /// it back through `held_rx`. Stands in for the worker thread's GPU and
+    /// encode time in browserless scenes, where CPU time is invisible to a
+    /// paused clock. Unreachable in production (`inject_rx` is `None`).
+    pub(super) fn hold_injected_frame(&mut self, inj: InjectedFrame, cost: std::time::Duration) {
+        let tx = match self.held_tx.clone() {
+            Some(tx) => tx,
+            None => {
+                let (tx, rx) = mpsc::channel(1);
+                self.held_tx = Some(tx.clone());
+                self.held_rx = Some(rx);
+                tx
+            }
+        };
+        self.injected_held = true;
+        #[cfg(any(test, feature = "browserless-harness"))]
+        let log = self.hold_log.clone();
+        tokio::spawn(async move {
+            #[cfg(any(test, feature = "browserless-harness"))]
+            let started = now_std();
+            tokio::time::sleep(cost).await;
+            #[cfg(any(test, feature = "browserless-harness"))]
+            if let Some(log) = log {
+                log.lock()
+                    .expect("hold_log mutex poisoned")
+                    .push((started, now_std()));
+            }
+            let _ = tx.send(inj).await;
+        });
     }
 
     /// Frame-carrying variant of the test constructor, accepting a pre-built

@@ -218,18 +218,21 @@ impl IoBridge {
             .collect();
         let refs: Vec<&[u8]> = tile_bgra.iter().map(|t| t.as_slice()).collect();
         let n = crate::encoder::cdf53::CDF53_TOTAL_COEFFS;
-        let coeffs: Vec<i16> = match self.frame_backend.as_mut() {
-            Some(backend) => match backend.forward_cdf53_tiles(&refs) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(target: LOG_TARGET, error = %e, tiles = tiles.len(),
-                        "cdf53 fallback forward failed; tiles not sent this frame");
-                    // Report the whole GPU baseline as stale so the next frame
-                    // marks these tiles dirty again and they are retried.
-                    backend.apply(super::frame_backend::Control::InvalidateBaseline(1));
-                    return tiles.to_vec();
-                }
-            },
+        // A round trip to the frame worker, which owns the GPU.
+        let forwarded = self
+            .frame_pipeline
+            .as_ref()
+            .map(|p| p.forward_cdf53_tiles(&refs));
+        let coeffs: Vec<i16> = match forwarded {
+            Some(Ok(c)) => c,
+            Some(Err(e)) => {
+                tracing::error!(target: LOG_TARGET, error = %e, tiles = tiles.len(),
+                    "cdf53 fallback forward failed; tiles not sent this frame");
+                // Report the whole GPU baseline as stale so the next frame
+                // marks these tiles dirty again and they are retried.
+                self.backend_apply(super::frame_backend::Control::InvalidateBaseline(1));
+                return tiles.to_vec();
+            }
             #[cfg(test)]
             None => refs
                 .iter()
