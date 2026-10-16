@@ -10,7 +10,8 @@ command.
 ## Build, install, deploy
 
 ```bash
-just build-release      # build-web THEN cargo build --release -- the order matters
+just build-release      # build-web THEN cargo build --release -p ghostframe-xdaemon
+                        # -- the order matters; daemon only, see below
 just ci-local           # the real gate: fmt, env-read guard, clippy --workspace --all-targets,
                         # unit tests, web build, tsc, release build,
                         # cbindgen header diff, go vet
@@ -42,6 +43,16 @@ Then **hard-reload the browser tab** (Ctrl+Shift+R). The wasm bundle is cached
 and a soft reload keeps the old one.
 
 ## Traps
+
+**A workspace-wide release build ships test code.** Cargo unifies features
+over every package in one build, and `ghostframe-bench` depends on
+`ghostframe-e2e`, which turns on ghostframe-lib's `test-loss-injection` and
+`browserless-harness`. So `cargo build --release` at the root (and even
+`--workspace --exclude ghostframe-e2e`) compiles the daemon with them.
+`just build-release` builds `-p ghostframe-xdaemon` only and runs
+`ci/check-release-features.sh`, which fails if the daemon's resolved feature
+set contains a test-only feature. Build a daemon you will install with that
+recipe, not by hand.
 
 **`cargo build` does not rebuild the web client, and the client is embedded at
 compile time.** `ghostbridge/web_server.go` does `//go:embed all:dist`, so the

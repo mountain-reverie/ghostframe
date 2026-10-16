@@ -93,6 +93,8 @@ jobs:
         run: ci/check-env-reads.sh
       - name: no home-directory paths in tracked files
         run: ci/check-local-paths.sh
+      - name: release daemon has no test-only features
+        run: ci/check-release-features.sh
 
   unit:
     name: unit
