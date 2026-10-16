@@ -25,12 +25,28 @@ use tokio::net::UnixStream;
 /// (`process_inbound`, ghostframe-lib `src/transport/io_bridge.rs`).
 pub struct SocketPairPump {
     stream: UnixStream,
+    /// When set, the tokio-clock instant of every `send` is appended here
+    /// just before the write, so a caller can pair it with the reader's
+    /// instant for the same packet (the inbound-service-delay metric).
+    send_log: Option<std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>>,
 }
 
 impl SocketPairPump {
     /// Wrap an already-connected `UnixStream` half of a socketpair.
     pub fn new(stream: UnixStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            send_log: None,
+        }
+    }
+
+    /// Record the tokio-clock instant of every `send` into `log`.
+    pub fn with_send_log(
+        mut self,
+        log: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    ) -> Self {
+        self.send_log = Some(log);
+        self
     }
 
     /// Read one framed datagram off the stream.
@@ -89,6 +105,11 @@ impl SocketPairPump {
     /// paths use.
     pub async fn send(&mut self, payload: &[u8], addr: &SocketAddr) -> io::Result<()> {
         let frame = encode_frame(payload, addr);
+        if let Some(log) = self.send_log.as_ref() {
+            log.lock()
+                .expect("send_log mutex poisoned")
+                .push(tokio::time::Instant::now().into_std());
+        }
         self.stream.write_all(&frame).await
     }
 }

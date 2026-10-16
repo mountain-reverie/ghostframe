@@ -702,6 +702,7 @@ async fn injected_frame_supersedes_prior_work_for_the_same_tile() {
         seq,
         timestamp_us: seq * 16_000,
         work: vec![work],
+        cost: None,
     };
 
     // No session is connected, so the drain budget clamps to zero and
@@ -2895,6 +2896,7 @@ async fn inbound_is_read_before_a_waiting_frame() {
             seq,
             timestamp_us: 0,
             work: Vec::new(),
+            cost: None,
         })
         .await
         .expect("inject");
@@ -2949,6 +2951,7 @@ async fn a_flood_of_inbound_still_lets_a_frame_through() {
         seq: 0,
         timestamp_us: 0,
         work: Vec::new(),
+        cost: None,
     })
     .await
     .expect("inject");
@@ -3451,6 +3454,7 @@ async fn injected_work_is_enqueued_and_drain_is_attempted() {
             last_sent_at: None,
             state: WorkState::Pending,
         }],
+        cost: None,
     })
     .await
     .expect("send injection");
@@ -3524,6 +3528,7 @@ async fn injected_cdf53_work_lands_in_refinement_queue_not_priority_queue() {
                 state: WorkState::Pending,
             },
         ],
+        cost: None,
     })
     .await
     .expect("send injection");
@@ -3623,6 +3628,7 @@ async fn second_injected_frame_does_not_clear_first_frames_queued_work() {
         seq: 1,
         timestamp_us: 0,
         work: vec![make_work(0, 0)],
+        cost: None,
     })
     .await
     .expect("send injection 1");
@@ -3634,6 +3640,7 @@ async fn second_injected_frame_does_not_clear_first_frames_queued_work() {
         seq: 2,
         timestamp_us: 0,
         work: vec![make_work(3, 3)],
+        cost: None,
     })
     .await
     .expect("send injection 2");
@@ -3685,6 +3692,7 @@ async fn out_of_grid_tile_is_skipped_not_enqueued() {
             last_sent_at: None,
             state: WorkState::Pending,
         }],
+        cost: None,
     })
     .await
     .expect("send injection");
@@ -3734,6 +3742,7 @@ async fn drain_injection_for_test_returns_enqueued_not_submitted_count() {
         seq: 1,
         timestamp_us: 0,
         work: vec![make_work(0, 0), make_work(5, 5)],
+        cost: None,
     })
     .await
     .expect("send injection");

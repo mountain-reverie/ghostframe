@@ -127,6 +127,23 @@ impl IoBridge {
         self.drop_plan = Some(plan);
     }
 
+    /// Record the `(start, end)` of every injected-frame `cost` hold. See
+    /// `hold_log`.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn set_hold_log(&mut self, log: HoldLog) {
+        self.hold_log = Some(log);
+    }
+
+    /// Record, in `log`, the tokio-clock instant at which the inbound arm
+    /// takes each packet off the socket. See `inbound_read_log`.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn set_inbound_read_log(
+        &mut self,
+        log: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    ) {
+        self.inbound_read_log = Some(log);
+    }
+
     /// Clone of the `Arc` behind `emitter_stats_publish`, for a caller that
     /// is about to move `self` into a `spawn_local`'d task and needs a way
     /// to read the reliable-emitter counters back out afterwards. See
