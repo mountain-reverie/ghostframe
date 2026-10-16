@@ -280,12 +280,12 @@ pub struct InjectedFrame {
     pub seq: u32,
     pub timestamp_us: u32,
     pub work: Vec<crate::transport::scheduler::TileWork>,
-    /// Harness only: how long this frame holds the event loop, on tokio's
-    /// clock. The loop awaits it inline before applying the frame, which is
-    /// what `process_frame` does to the real loop for the time it runs. A real
-    /// frame's cost is CPU time, which a paused clock cannot see, so without
-    /// this the browserless scenes cannot show the stall at all. `None`
-    /// (every existing scene) costs nothing.
+    /// Harness only: how long this frame's stand-in for the GPU and encode
+    /// work takes, on tokio's clock. A task holds the frame for that long and
+    /// hands it back, off the loop, the way the frame worker thread does for a
+    /// real frame. A real frame's cost is CPU time, which a paused clock cannot
+    /// see, so without this the browserless scenes could not model it at all.
+    /// `None` (every existing scene) costs nothing.
     pub cost: Option<std::time::Duration>,
 }
 
@@ -518,6 +518,11 @@ pub struct IoBridge {
     session_epoch: u64,
     /// A failure `run` must stop on (the frame worker died).
     fatal: Option<String>,
+    #[cfg(test)]
+    test_commit_dg_size: Option<usize>,
+    /// Client decode errors that named a tile of the frame being committed;
+    /// handled once it is.
+    deferred_decode_errors: Vec<crate::transport::decode_error::DecodeErrorMsg>,
     /// Per-tile-pass coverage map: (frame_seq, tile_x, tile_y, pass_idx) ->
     /// tile metadata for a work item. Populated at emit time; consumed by
     /// dispatch_ack_datagram on incoming ACKs. LRU-bounded by
@@ -1106,6 +1111,9 @@ impl IoBridge {
             pending_controls: Vec::new(),
             session_epoch: 0,
             fatal: None,
+            #[cfg(test)]
+            test_commit_dg_size: None,
+            deferred_decode_errors: Vec::new(),
             fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap::new(
                 crate::transport::fragment_coverage::FRAGMENT_COVERAGE_CAPACITY,
             ),
@@ -1649,7 +1657,6 @@ impl IoBridge {
         &mut self,
         msg: crate::transport::decode_error::DecodeErrorMsg,
     ) {
-        use crate::tile::CodecState;
         use crate::transport::decode_error::ERR_THIN_UNCACHED_PALETTE;
 
         tracing::warn!(
@@ -1662,18 +1669,30 @@ impl IoBridge {
         );
 
         if msg.error_code == ERR_THIN_UNCACHED_PALETTE {
-            // Recover which palette_id was last emitted for this tile by
-            // consulting metrics_tracker.codec_state.
-            let m = self
-                .metrics_tracker
-                .get(msg.tile_x as u32, msg.tile_y as u32);
-            if let CodecState::PalRle { palette_id } = m.codec_state {
-                self.palette_table.force_rebundle(palette_id);
-                tracing::info!(
-                    palette_id,
-                    "force_rebundle: next emission for palette will include bundled palette block"
-                );
+            // While the frame carrying this tile is being finished its codec
+            // state is tentative (the real palette id is assigned at commit),
+            // so wait for the commit.
+            if self.tile_is_in_flight(msg.tile_x, msg.tile_y) {
+                self.deferred_decode_errors.push(msg);
+                return;
             }
+            self.recover_from_decode_error(msg);
+        }
+    }
+
+    /// Recover which palette_id was last emitted for the tile by consulting
+    /// `metrics_tracker.codec_state`, and rebundle it.
+    fn recover_from_decode_error(&mut self, msg: crate::transport::decode_error::DecodeErrorMsg) {
+        use crate::tile::CodecState;
+        let m = self
+            .metrics_tracker
+            .get(msg.tile_x as u32, msg.tile_y as u32);
+        if let CodecState::PalRle { palette_id } = m.codec_state {
+            self.palette_table.force_rebundle(palette_id);
+            tracing::info!(
+                palette_id,
+                "force_rebundle: next emission for palette will include bundled palette block"
+            );
         }
     }
 
@@ -1789,7 +1808,12 @@ impl IoBridge {
                     match result {
                         Some(msg) => self.on_frame_worker_message(msg),
                         None => {
-                            self.fatal = Some("the frame worker stopped".into());
+                            let why = self
+                                .frame_pipeline
+                                .as_ref()
+                                .and_then(|p| p.failure())
+                                .unwrap_or_else(|| "no panic recorded".into());
+                            self.fatal = Some(format!("the frame worker stopped: {why}"));
                         }
                     }
                 }

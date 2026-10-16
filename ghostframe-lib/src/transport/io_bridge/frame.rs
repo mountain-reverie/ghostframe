@@ -169,11 +169,27 @@ impl FrameMeta {
 
 /// Loop-side durations of the stages before the worker's finish, carried to
 /// the `frame.stages` trace line.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(super) struct StageTrace {
     pre_us: u64,
     gpu_us: u64,
     classify_us: u64,
+}
+
+/// What to tell the worker for a frame the classifier put in H.264 mode: nothing
+/// when no tile changed, otherwise encode, forcing an IDR when the previous
+/// frame was on the tile path (a fresh anchor for the client).
+pub(super) fn h264_finish_action(
+    dirty_is_empty: bool,
+    prev_mode: crate::tile::FrameMode,
+) -> FinishAction {
+    if dirty_is_empty {
+        FinishAction::Discard
+    } else {
+        FinishAction::H264 {
+            force_keyframe: prev_mode == crate::tile::FrameMode::TileCodec,
+        }
+    }
 }
 
 /// The frame the worker holds, and what the loop needs to finish it.
@@ -252,8 +268,9 @@ impl IoBridge {
             "cpu"
         };
         // Deliberately the real wall clock, not `now_std()`: this measures
-        // how long the CPU actually spent inside `process_frame` (encode
-        // work), not protocol/deadline time. A virtual-clock timestamp would
+        // how long the loop actually spent inside `process_frame` (for a GPU
+        // frame that is only `begin_gpu_frame`: the GPU and encode work runs on
+        // the frame worker), not protocol/deadline time. A virtual-clock timestamp would
         // not advance while the CPU is busy, so it would report ~0us under
         // the paused-clock browserless harness just like the bug this
         // replaces did.
@@ -870,6 +887,27 @@ impl IoBridge {
 
     /// A message from the frame worker, for the frame in flight.
     pub(super) fn on_frame_worker_message(&mut self, msg: FromWorker) {
+        self.handle_frame_worker_message(msg);
+        // Decode errors that named a tile of the frame that was being committed
+        // wait for the commit, so they see the tile's real codec state.
+        if self.in_flight.is_none() && !self.deferred_decode_errors.is_empty() {
+            for err in std::mem::take(&mut self.deferred_decode_errors) {
+                self.recover_from_decode_error(err);
+            }
+        }
+    }
+
+    /// Whether `(x, y)` is a tile of the tile frame currently in flight, whose
+    /// codec states are tentative until it is committed.
+    pub(super) fn tile_is_in_flight(&self, x: u8, y: u8) -> bool {
+        matches!(
+            self.in_flight.as_ref().map(|f| &f.stage),
+            Some(InFlightStage::FinishingTile { dirty_xy, .. })
+                if dirty_xy.contains(&(x as u32, y as u32))
+        )
+    }
+
+    fn handle_frame_worker_message(&mut self, msg: FromWorker) {
         let Some(inflight) = self.in_flight.take() else {
             self.fatal = Some("the frame worker answered with no frame in flight".into());
             return;
@@ -952,13 +990,6 @@ impl IoBridge {
         }
         let mut lap = Lap::new(stage_trace_enabled());
 
-        // Emit frame-dimensions datagram on first frame, on dimension change,
-        // and N more times after any change to absorb datagram loss. Here, not
-        // before the GPU stage: this is also where the scheduler is resized to
-        // the new grid (`classify_dirty_tiles`), so no old-grid work can leave
-        // after the new dimensions have been announced.
-        self.emit_frame_dimensions(seq, meta.timestamp_us, meta.width, meta.height);
-
         tracing::debug!(
             target: LOG_TARGET,
             seq,
@@ -1023,26 +1054,20 @@ impl IoBridge {
         //    queue stagnates and the wizard never finishes refining.
         match new_mode {
             FrameMode::H264 => {
-                if dirty_xy.is_empty() {
-                    self.send_finish(
-                        inflight,
-                        FinishAction::Discard,
-                        InFlightStage::FinishingDiscard,
-                    );
+                let action = h264_finish_action(dirty_xy.is_empty(), prev_mode);
+                if matches!(action, FinishAction::Discard) {
+                    // Nothing will be committed for this frame, so its
+                    // dimensions go out now.
+                    self.emit_frame_dimensions(seq, meta.timestamp_us, meta.width, meta.height);
+                    self.send_finish(inflight, action, InFlightStage::FinishingDiscard);
                 } else {
-                    // Re-entry into H264 forces an IDR for a fresh client anchor.
-                    self.send_finish(
-                        inflight,
-                        FinishAction::H264 {
-                            force_keyframe: prev_mode == FrameMode::TileCodec,
-                        },
-                        InFlightStage::FinishingH264 { trace },
-                    );
+                    self.send_finish(inflight, action, InFlightStage::FinishingH264 { trace });
                 }
             }
             FrameMode::TileCodec => {
                 let max_frag = max_fragment_payload(max_dg_size);
                 if max_frag == 0 {
+                    self.emit_frame_dimensions(seq, meta.timestamp_us, meta.width, meta.height);
                     self.send_finish(
                         inflight,
                         FinishAction::Discard,
@@ -1087,23 +1112,50 @@ impl IoBridge {
         }
     }
 
+    /// The datagram size to commit a finished frame with, or `None` when the
+    /// frame is stale: its session ended or was reset while the worker ran, or
+    /// no live session remains. Re-read here because the path MTU can shrink
+    /// while the worker runs; the smaller value wins.
+    fn commit_max_datagram_size(&mut self, inflight: &InFlight) -> Option<usize> {
+        if inflight.epoch != self.session_epoch {
+            return None;
+        }
+        // A test bridge has no live quinn connection to size datagrams from.
+        #[cfg(test)]
+        if let Some(n) = self.test_commit_dg_size {
+            return Some(n.min(inflight.max_dg_size));
+        }
+        self.compute_max_datagram_size()
+            .map(|now| now.min(inflight.max_dg_size))
+    }
+
     /// Step 3 for an H.264 frame: fragment and send what the worker encoded.
-    fn on_h264_done(&mut self, inflight: InFlight, out: Option<H264Out>, worker_us: u64) {
+    pub(super) fn on_h264_done(
+        &mut self,
+        inflight: InFlight,
+        out: Option<H264Out>,
+        worker_us: u64,
+    ) {
         // The session changed while the encode ran. The encoder's reference
         // chain advanced past this frame, so the next one must be an IDR or the
         // client decodes garbage until the next GOP.
-        if inflight.epoch != self.session_epoch {
+        let Some(max_dg_size) = self.commit_max_datagram_size(&inflight) else {
             self.backend_apply(Control::RequestKeyframe);
             return;
-        }
+        };
         let InFlightStage::FinishingH264 { trace } = inflight.stage else {
             return;
         };
+        // The frame's dimensions go out with the frame, not before the worker
+        // has finished it: on a resolution change the client resizes its canvas
+        // on them, and the finish can take a second.
+        let m = inflight.meta;
+        self.emit_frame_dimensions(inflight.seq, m.timestamp_us, m.width, m.height);
         let Some(encoded) = out else {
             return;
         };
         let mut lap = Lap::new(stage_trace_enabled());
-        self.send_h264_frame(encoded, &inflight.meta, inflight.seq, inflight.max_dg_size);
+        self.send_h264_frame(encoded, &inflight.meta, inflight.seq, max_dg_size);
         let emit_us = lap.lap();
         tracing::trace!(
             target: "ghostframe::io_bridge::diag",
@@ -1115,7 +1167,7 @@ impl IoBridge {
     }
 
     /// Step 3 for a tile frame: commit what the worker produced.
-    fn on_tile_done(
+    pub(super) fn on_tile_done(
         &mut self,
         inflight: InFlight,
         out: TileOut,
@@ -1125,10 +1177,10 @@ impl IoBridge {
         // The session changed while the tiles were encoded. The GPU baseline
         // advanced past this frame, so its dirty tiles would never be sent
         // again: repaint everything.
-        if inflight.epoch != self.session_epoch {
+        let Some(max_dg_size) = self.commit_max_datagram_size(&inflight) else {
             self.ensure_baseline_invalidated();
             return;
-        }
+        };
         let InFlightStage::FinishingTile {
             dirty_xy,
             max_frag,
@@ -1147,6 +1199,16 @@ impl IoBridge {
             cdf53_escalation,
             timings,
         } = out;
+        // The frame's dimensions go out with the frame (see `on_h264_done`).
+        let m = inflight.meta;
+        self.emit_frame_dimensions(inflight.seq, m.timestamp_us, m.width, m.height);
+        // The path MTU can shrink while the worker runs; fragment for the
+        // smaller of the two.
+        let max_frag = max_frag.min(max_fragment_payload(max_dg_size));
+        if max_frag == 0 {
+            self.ensure_baseline_invalidated();
+            return;
+        }
         let source = match pixels {
             Ok(src) => src,
             Err(msg) => {
