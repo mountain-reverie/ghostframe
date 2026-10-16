@@ -79,6 +79,10 @@ type serverHandle struct {
 	server *tsnet.Server
 	// certHashes is what /config.json publishes; Rust updates it on rotation.
 	certHashes *certHashStore
+	// authz is the peer access check the web server applies to every
+	// request; Rust registers it via gbridge_set_peer_authorizer. Empty
+	// means refuse everyone.
+	authz authorizerSlot
 }
 
 // setNonblock sets O_NONBLOCK on a raw fd. The Rust side wraps this fd in
