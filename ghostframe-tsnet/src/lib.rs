@@ -27,6 +27,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 
+mod identity;
+pub use identity::{PeerAuthorizerFn, PeerIdentity, WhoIsClient, WhoIsError};
+
 extern "C" {
     fn gbridge_new(
         hostname: *const c_char,

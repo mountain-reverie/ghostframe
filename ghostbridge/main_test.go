@@ -15,10 +15,18 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"tailscale.com/client/local"
+	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/views"
 )
 
 // A login URL cannot be produced for a session that was never created.
@@ -96,5 +104,172 @@ func TestLoginURLTimesOutDistinctly(t *testing.T) {
 	_, err := loginURL(f, 300*time.Millisecond)
 	if !errors.Is(err, errLoginTimeout) {
 		t.Fatalf("err = %v, want errLoginTimeout", err)
+	}
+}
+
+// ---- Peer identity lookups (identity.go) ----
+//
+// The access rule lives in Rust; what is tested here is that Go reports
+// identities faithfully and that the web middleware fails closed.
+
+type fakeWhoiser struct {
+	resp  *apitype.WhoIsResponse
+	err   error
+	calls []string
+}
+
+func (f *fakeWhoiser) WhoIs(ctx context.Context, addr string) (*apitype.WhoIsResponse, error) {
+	f.calls = append(f.calls, addr)
+	return f.resp, f.err
+}
+
+func TestEncodeIdentityRecord(t *testing.T) {
+	got, err := encodeIdentity(peerIdentity{
+		userID: 42, loginName: "alice@example.com", nodeName: "laptop.tail.ts.net.",
+		tags: []string{"tag:a", "tag:b"},
+	})
+	if err != nil {
+		t.Fatalf("encodeIdentity: %v", err)
+	}
+	if want := "42\nalice@example.com\nlaptop.tail.ts.net.\ntag:a,tag:b"; got != want {
+		t.Fatalf("record = %q, want %q", got, want)
+	}
+}
+
+// A value that would shift the record's fields must refuse, not be carried:
+// Rust would otherwise read a login name out of a node name.
+func TestEncodeIdentityRejectsSeparators(t *testing.T) {
+	for _, id := range []peerIdentity{
+		{loginName: "a\nb"},
+		{nodeName: "n\x00"},
+		{tags: []string{"tag:a,tag:b"}},
+		{tags: []string{""}},
+	} {
+		if _, err := encodeIdentity(id); err == nil {
+			t.Errorf("encodeIdentity(%+v) accepted a separator", id)
+		}
+	}
+}
+
+func TestIdentityFromWhoIsCarriesUserAndTags(t *testing.T) {
+	resp := &apitype.WhoIsResponse{
+		Node:        &tailcfg.Node{User: 7, Name: "box.ts.net.", Tags: []string{"tag:ops"}},
+		UserProfile: &tailcfg.UserProfile{ID: 7, LoginName: "bob@example.com"},
+	}
+	id, err := identityFromWhoIs(resp)
+	if err != nil {
+		t.Fatalf("identityFromWhoIs: %v", err)
+	}
+	if id.userID != 7 || id.loginName != "bob@example.com" || id.nodeName != "box.ts.net." ||
+		len(id.tags) != 1 || id.tags[0] != "tag:ops" {
+		t.Fatalf("identity = %+v", id)
+	}
+	if _, err := identityFromWhoIs(&apitype.WhoIsResponse{}); err == nil {
+		t.Fatal("a response with no node must be an error")
+	}
+}
+
+func TestIdentityFromStatusReportsSelfTags(t *testing.T) {
+	tags := views.SliceOf([]string{"tag:server"})
+	st := &ipnstate.Status{
+		Self: &ipnstate.PeerStatus{UserID: 9, DNSName: "gf.ts.net.", Tags: &tags},
+		User: map[tailcfg.UserID]tailcfg.UserProfile{9: {ID: 9, LoginName: "owner@example.com"}},
+	}
+	id, err := identityFromStatus(st)
+	if err != nil {
+		t.Fatalf("identityFromStatus: %v", err)
+	}
+	if id.userID != 9 || id.loginName != "owner@example.com" || len(id.tags) != 1 {
+		t.Fatalf("identity = %+v", id)
+	}
+	if _, err := identityFromStatus(&ipnstate.Status{}); err == nil {
+		t.Fatal("a status with no self must be an error")
+	}
+}
+
+func TestLookupPeerMapsOutcomesToStatus(t *testing.T) {
+	ok := &fakeWhoiser{resp: &apitype.WhoIsResponse{
+		Node: &tailcfg.Node{User: 1}, UserProfile: &tailcfg.UserProfile{LoginName: "a@b"},
+	}}
+	if id, st := lookupPeer(ok, "100.64.0.2"); st != gbridgeIdentityStatusOK || id.loginName != "a@b" {
+		t.Fatalf("found peer: status %d id %+v", st, id)
+	}
+	if _, st := lookupPeer(&fakeWhoiser{err: local.ErrPeerNotFound}, "x"); st != gbridgeWhoisStatusNotFound {
+		t.Fatalf("not-found peer: status %d", st)
+	}
+	if _, st := lookupPeer(&fakeWhoiser{err: errors.New("boom")}, "x"); st != gbridgeWhoisStatusFailed {
+		t.Fatalf("failed lookup: status %d", st)
+	}
+	if _, st := lookupPeer(&fakeWhoiser{resp: &apitype.WhoIsResponse{}}, "x"); st != gbridgeWhoisStatusFailed {
+		t.Fatalf("node-less response: status %d", st)
+	}
+}
+
+type recordingAuthorizer struct {
+	verdict bool
+	peers   []string
+	status  []int32
+}
+
+func (r *recordingAuthorizer) allow(peer string, status int32, _ peerIdentity) bool {
+	r.peers = append(r.peers, peer)
+	r.status = append(r.status, status)
+	return r.verdict
+}
+
+const testHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+func serveConfig(t *testing.T, h http.Handler) (int, string) {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/config.json")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(body)
+}
+
+// No authorizer registered means nobody is served -- not everybody.
+func TestMiddlewareRefusesWhenNoAuthorizerRegistered(t *testing.T) {
+	who := &fakeWhoiser{resp: &apitype.WhoIsResponse{Node: &tailcfg.Node{User: 1}}}
+	h := requireAuthorizedPeer(newRedirectHandler(newCertHashStore(testHash)), who, &authorizerSlot{})
+	code, body := serveConfig(t, h)
+	if code != http.StatusForbidden {
+		t.Fatalf("status %d, want 403", code)
+	}
+	if strings.Contains(body, testHash) {
+		t.Fatal("a refused peer was sent the cert hash")
+	}
+}
+
+func TestMiddlewareRefusedPeerGetsNoConfig(t *testing.T) {
+	who := &fakeWhoiser{err: local.ErrPeerNotFound}
+	slot := &authorizerSlot{}
+	az := &recordingAuthorizer{verdict: false}
+	slot.set(az)
+	code, body := serveConfig(t, requireAuthorizedPeer(newRedirectHandler(newCertHashStore(testHash)), who, slot))
+	if code != http.StatusForbidden || strings.Contains(body, testHash) {
+		t.Fatalf("status %d body %q, want a bare 403", code, body)
+	}
+	// The authorizer saw the lookup failure, and the lookup was made for the
+	// connection's own remote address.
+	if len(az.status) != 1 || az.status[0] != gbridgeWhoisStatusNotFound {
+		t.Fatalf("authorizer saw statuses %v", az.status)
+	}
+	if len(who.calls) != 1 || who.calls[0] != az.peers[0] {
+		t.Fatalf("WhoIs was asked about %v, authorizer about %v", who.calls, az.peers)
+	}
+}
+
+func TestMiddlewareAdmittedPeerIsServed(t *testing.T) {
+	who := &fakeWhoiser{resp: &apitype.WhoIsResponse{Node: &tailcfg.Node{User: 1}}}
+	slot := &authorizerSlot{}
+	slot.set(&recordingAuthorizer{verdict: true})
+	code, body := serveConfig(t, requireAuthorizedPeer(newRedirectHandler(newCertHashStore(testHash)), who, slot))
+	if code != http.StatusOK || !strings.Contains(body, testHash) {
+		t.Fatalf("status %d body %q, want 200 with the hash", code, body)
 	}
 }
