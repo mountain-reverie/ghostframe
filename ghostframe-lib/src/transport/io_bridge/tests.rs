@@ -931,14 +931,20 @@ async fn iobridge_holds_scheduler_zero_sized_on_construction() {
     assert_eq!(bridge.scheduler.queue_len(), 0);
 }
 
-/// A recording stand-in for the GPU backend: what the loop asked of it, in
-/// order, and a canned H.264 result.
+/// A recording stand-in for the GPU backend: what the worker was asked, in
+/// order, with knobs to make it fail, panic, or take its time.
 #[derive(Default)]
 struct RecordingBackend {
     log: Arc<std::sync::Mutex<Vec<String>>>,
     h264: Option<(Vec<u8>, bool)>,
     /// `forward_cdf53_tiles` fails, as a lost device or a failed submit would.
     fail_forward: bool,
+    analyse_err: Option<String>,
+    panic_in_analyse: bool,
+    analyse_sleep: std::time::Duration,
+    /// Shared by backends that must not overlap: how many are inside a call.
+    inside: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    max_inside: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl FrameBackend for RecordingBackend {
@@ -951,8 +957,23 @@ impl FrameBackend for RecordingBackend {
         _escalation: &[u32],
         _want_diag: bool,
     ) -> Result<Analysed, String> {
+        use std::sync::atomic::Ordering::SeqCst;
         self.log.lock().unwrap().push("analyse".into());
-        Ok(Analysed::default())
+        if self.panic_in_analyse {
+            panic!("recording backend: told to panic");
+        }
+        if let (Some(inside), Some(max)) = (&self.inside, &self.max_inside) {
+            let now = inside.fetch_add(1, SeqCst) + 1;
+            max.fetch_max(now, SeqCst);
+        }
+        std::thread::sleep(self.analyse_sleep);
+        if let Some(inside) = &self.inside {
+            inside.fetch_sub(1, SeqCst);
+        }
+        match &self.analyse_err {
+            Some(e) => Err(e.clone()),
+            None => Ok(Analysed::default()),
+        }
     }
     fn finish_h264(&mut self, _frame: &FrameSubmission, force_keyframe: bool) -> Option<H264Out> {
         self.log
@@ -993,13 +1014,7 @@ impl FrameBackend for RecordingBackend {
     }
 }
 
-fn recording_bridge(
-    h264: Option<(Vec<u8>, bool)>,
-) -> (
-    IoBridge,
-    tokio::net::UnixStream,
-    Arc<std::sync::Mutex<Vec<String>>>,
-) {
+fn bridge_with_backend(backend: RecordingBackend) -> (IoBridge, tokio::net::UnixStream) {
     let (our_end, peer) = std::os::unix::net::UnixStream::pair().expect("pair");
     our_end.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
@@ -1010,13 +1025,19 @@ fn recording_bridge(
         server,
         rx,
     );
-    let backend = RecordingBackend {
-        h264,
-        ..Default::default()
-    };
-    let log = backend.log.clone();
     bridge.set_frame_backend(Box::new(backend));
-    (bridge, tokio::net::UnixStream::from_std(peer).unwrap(), log)
+    (bridge, tokio::net::UnixStream::from_std(peer).unwrap())
+}
+
+fn recording_bridge() -> (
+    IoBridge,
+    tokio::net::UnixStream,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let backend = RecordingBackend::default();
+    let log = backend.log.clone();
+    let (bridge, peer) = bridge_with_backend(backend);
+    (bridge, peer, log)
 }
 
 /// The CDF 5/3 fallback reaches the GPU through the backend seam, once per
@@ -1024,7 +1045,7 @@ fn recording_bridge(
 #[tokio::test]
 async fn the_cdf53_fallback_forwards_its_tiles_through_the_backend_in_one_call() {
     use crate::tile::CodecState;
-    let (mut bridge, _peer, log) = recording_bridge(None);
+    let (mut bridge, _peer, log) = recording_bridge();
     bridge.scheduler.resize(4, 4);
     bridge.metrics_tracker.resize(4, 4);
     bridge.metrics_tracker.get_mut(0, 0).codec_state = CodecState::Skip;
@@ -1081,7 +1102,7 @@ async fn a_tile_falling_back_from_queued_palrle_releases_its_palette() {
     use crate::tile::CodecState;
     use crate::transport::protocol::Codec;
     use crate::transport::scheduler::{TileWork, WorkState};
-    let (mut bridge, _peer, _log) = recording_bridge(None);
+    let (mut bridge, _peer, _log) = recording_bridge();
     bridge.scheduler.resize(4, 4);
     bridge.metrics_tracker.resize(4, 4);
     bridge.palette_table.ref_count[9] = 1;
@@ -1113,23 +1134,27 @@ async fn a_tile_falling_back_from_queued_palrle_releases_its_palette() {
 #[tokio::test]
 async fn a_failed_cdf53_forward_sends_nothing_and_requests_a_retry() {
     use crate::tile::CodecState;
-    let (mut bridge, _peer, log) = recording_bridge(None);
-    bridge.set_frame_backend(Box::new(RecordingBackend {
-        log: log.clone(),
+    let backend = RecordingBackend {
         fail_forward: true,
         ..Default::default()
-    }));
+    };
+    let log = backend.log.clone();
+    let (mut bridge, _peer) = bridge_with_backend(backend);
     bridge.scheduler.resize(4, 4);
     bridge.metrics_tracker.resize(4, 4);
     bridge.metrics_tracker.get_mut(1, 1).codec_state = CodecState::Skip;
     fallback_dispatch(&mut bridge, &[(1, 1)]);
     assert!(bridge.scheduler.peek_for_test().is_empty(), "no Raw");
     assert!(bridge.scheduler.refinement_peek_for_test().is_empty());
-    assert!(log
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|l| l == "apply InvalidateBaseline(1)"));
+    // The retry control is queued for the worker, behind the failed request.
+    assert!(
+        bridge
+            .pending_controls
+            .contains(&Control::InvalidateBaseline(1)),
+        "{:?} / {:?}",
+        bridge.pending_controls,
+        log.lock().unwrap()
+    );
 }
 
 fn tiny_frame() -> FrameSubmission {
@@ -1145,41 +1170,155 @@ fn tiny_frame() -> FrameSubmission {
     }
 }
 
+/// Wait for the worker's next message (it runs on its own thread).
+async fn next_worker_message(bridge: &mut IoBridge) -> Option<FromWorker> {
+    let rx = &mut bridge.frame_pipeline.as_mut().unwrap().rx;
+    tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the worker answered within 5 s")
+}
+
 /// A reconnecting client must get a clean slate from the GPU side too: the
 /// SAD baseline is dropped for 20 frames and the encoder is told to emit an
-/// IDR, in that order, through the backend. (This replaces a test that only
-/// poked the encoder directly and never ran the reset path.)
+/// IDR, in that order, and a frame the worker is still on is marked as
+/// belonging to the old session. (This replaces a test that only poked the
+/// encoder directly and never ran the reset path.)
 #[tokio::test]
-async fn session_reset_tells_the_backend_to_invalidate_then_keyframe() {
-    let (mut bridge, _peer, log) = recording_bridge(None);
+async fn session_reset_queues_invalidate_then_keyframe_and_ends_the_epoch() {
+    let (mut bridge, _peer, _log) = recording_bridge();
+    let before = bridge.session_epoch;
     bridge.fire_session_reset(ConnectionHandle(0));
+    assert_eq!(
+        bridge.pending_controls,
+        vec![Control::InvalidateBaseline(20), Control::RequestKeyframe]
+    );
+    assert_eq!(bridge.session_epoch, before + 1);
+}
+
+/// A frame whose session ended while the worker held it is not committed: the
+/// worker is told to discard it, and the GPU baseline, which the frame already
+/// advanced, is invalidated so the next frame repaints.
+#[tokio::test]
+async fn a_frame_whose_session_ended_in_flight_is_discarded_and_the_baseline_invalidated() {
+    let (mut bridge, _peer, log) = recording_bridge();
+    bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    assert!(bridge.in_flight.is_some());
+    let analysed = next_worker_message(&mut bridge).await.expect("analysed");
+    assert!(matches!(analysed, FromWorker::Analysed { .. }));
+
+    bridge.session_epoch += 1; // the session ended while the GPU worked
+    bridge.on_frame_worker_message(analysed);
+    assert!(bridge.in_flight.is_some(), "the discard is still in flight");
+    let discarded = next_worker_message(&mut bridge).await.expect("discarded");
+    assert!(matches!(discarded, FromWorker::Discarded { .. }));
+    bridge.on_frame_worker_message(discarded);
+    assert!(bridge.in_flight.is_none());
+
     assert_eq!(
         *log.lock().unwrap(),
         vec![
-            "apply InvalidateBaseline(20)".to_string(),
-            "apply RequestKeyframe".to_string()
+            "analyse".to_string(),
+            "apply InvalidateBaseline(1)".to_string(),
+            "finish_discard".to_string(),
         ]
     );
 }
 
-/// Re-entering H.264 from the tile path forces an IDR (a fresh anchor for the
-/// client); staying in H.264 does not. An empty dirty set encodes nothing and
-/// releases the frame's GPU outputs.
+/// A reset's 20-frame cushion must not be shortened to 1 by a discard queued
+/// after it.
 #[tokio::test]
-async fn the_h264_arm_asks_for_a_keyframe_only_on_re_entry_and_discards_when_idle() {
-    use crate::tile::FrameMode;
-    let (mut bridge, _peer, log) = recording_bridge(Some((vec![1, 2, 3], true)));
-    let frame = tiny_frame();
-    bridge.emit_h264_frame(&[(0, 0)], &frame, FrameMode::TileCodec, 1, 1200);
-    bridge.emit_h264_frame(&[(0, 0)], &frame, FrameMode::H264, 2, 1200);
-    bridge.emit_h264_frame(&[], &frame, FrameMode::H264, 3, 1200);
+async fn a_discard_does_not_shorten_a_resets_baseline_cushion() {
+    let (mut bridge, _peer, log) = recording_bridge();
+    bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    let analysed = next_worker_message(&mut bridge).await.unwrap();
+    bridge.fire_session_reset(ConnectionHandle(0));
+    bridge.on_frame_worker_message(analysed);
+    let discarded = next_worker_message(&mut bridge).await.unwrap();
+    bridge.on_frame_worker_message(discarded);
+    let log = log.lock().unwrap();
+    assert!(
+        log.contains(&"apply InvalidateBaseline(20)".to_string()),
+        "{log:?}"
+    );
+    assert!(
+        !log.contains(&"apply InvalidateBaseline(1)".to_string()),
+        "{log:?}"
+    );
+}
+
+/// A failed GPU stage hands the frame back and the CPU pipeline takes it.
+#[tokio::test]
+async fn a_failed_gpu_stage_returns_the_frame_and_clears_the_flight() {
+    let backend = RecordingBackend {
+        analyse_err: Some("device lost".into()),
+        ..Default::default()
+    };
+    let (mut bridge, _peer) = bridge_with_backend(backend);
+    bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    let msg = next_worker_message(&mut bridge).await.unwrap();
+    assert!(matches!(msg, FromWorker::AnalyseFailed { .. }));
+    bridge.on_frame_worker_message(msg);
+    assert!(bridge.in_flight.is_none());
+    assert!(bridge.fatal.is_none());
+}
+
+/// A panic in the worker is fatal: the result channel closes (and `run`
+/// returns an error from the arm that sees it) rather than the stream
+/// carrying on with a dead backend.
+#[tokio::test]
+async fn a_worker_panic_closes_the_result_channel() {
+    let backend = RecordingBackend {
+        panic_in_analyse: true,
+        ..Default::default()
+    };
+    let (mut bridge, _peer) = bridge_with_backend(backend);
+    bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    assert!(next_worker_message(&mut bridge).await.is_none());
+}
+
+/// Dropping the bridge stops waiting for a stuck worker after the bound, not
+/// when the stuck call returns.
+#[tokio::test]
+async fn shutdown_waits_for_the_worker_only_for_the_bound() {
+    let backend = RecordingBackend {
+        // Holds the process-wide hardware lock while it sleeps, so keep it short
+        // enough not to starve the other worker tests past their 5 s wait.
+        analyse_sleep: std::time::Duration::from_secs(3),
+        ..Default::default()
+    };
+    let (mut bridge, _peer) = bridge_with_backend(backend);
+    bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    let t0 = std::time::Instant::now();
+    drop(bridge);
+    let waited = std::time::Instant::now().duration_since(t0);
+    assert!(
+        waited >= frame_worker::SHUTDOWN_JOIN && waited < frame_worker::SHUTDOWN_JOIN * 3,
+        "waited {waited:?}"
+    );
+}
+
+/// Two bridges in one process never run their backends at once.
+#[tokio::test]
+async fn two_bridges_never_use_the_hardware_at_the_same_time() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let inside = Arc::new(AtomicUsize::new(0));
+    let max = Arc::new(AtomicUsize::new(0));
+    let mk = || RecordingBackend {
+        analyse_sleep: std::time::Duration::from_millis(150),
+        inside: Some(inside.clone()),
+        max_inside: Some(max.clone()),
+        ..Default::default()
+    };
+    let (mut a, _pa) = bridge_with_backend(mk());
+    let (mut b, _pb) = bridge_with_backend(mk());
+    a.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    b.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    let _ = next_worker_message(&mut a).await;
+    let _ = next_worker_message(&mut b).await;
     assert_eq!(
-        *log.lock().unwrap(),
-        vec![
-            "finish_h264 force_keyframe=true".to_string(),
-            "finish_h264 force_keyframe=false".to_string(),
-            "finish_discard".to_string(),
-        ]
+        max.load(SeqCst),
+        1,
+        "both backends were inside a call at once"
     );
 }
 
@@ -5147,7 +5286,7 @@ async fn gpu_failure_on_a_dmabuf_only_frame_does_not_enter_the_cpu_pipeline() {
     let mut bridge = make_bridge_for_test().await;
     bridge.frame_seq = 7;
 
-    bridge.fall_back_to_cpu_after_gpu_error(frame_for_fallback(Vec::new(), true), 7);
+    bridge.fall_back_to_cpu_after_gpu_error(frame_for_fallback(Vec::new(), true), 7, false);
 
     assert!(
         !cap.text().contains("frame.captured"),
@@ -5169,7 +5308,11 @@ async fn gpu_failure_fallback_reuses_the_sequence_number_and_dimensions() {
     // What process_frame_gpu has done by the time its processor fails.
     bridge.frame_seq = 7;
 
-    bridge.fall_back_to_cpu_after_gpu_error(frame_for_fallback(vec![0x55; 64 * 64 * 4], false), 7);
+    bridge.fall_back_to_cpu_after_gpu_error(
+        frame_for_fallback(vec![0x55; 64 * 64 * 4], false),
+        7,
+        false,
+    );
 
     let logs = cap.text();
     assert!(
@@ -5703,7 +5846,7 @@ async fn superseding_a_thin_emission_leaves_the_carry_count_alone() {
 #[tokio::test]
 async fn the_tile_arm_commits_the_backends_cdf53_results_and_skips_what_it_skipped() {
     const W: u32 = 128;
-    let (mut bridge, _peer, _log) = recording_bridge(None);
+    let (mut bridge, _peer, _log) = recording_bridge();
     bridge.scheduler.resize(4, 4);
     bridge.metrics_tracker.resize(4, 4);
     let frame = FrameSubmission {
@@ -5736,7 +5879,14 @@ async fn the_tile_arm_commits_the_backends_cdf53_results_and_skips_what_it_skipp
         timings: TileTimings::default(),
         frame_palette_set_count: 0,
     };
-    bridge.emit_tile_codec_frame(&[(1, 1)], &frame, &frame.pixels, results, 1, 1000);
+    bridge.emit_tile_codec_frame(
+        &[(1, 1)],
+        &frame::FrameMeta::of(&frame),
+        &frame.pixels,
+        results,
+        1,
+        1000,
+    );
     assert!(
         bridge.scheduler.refinement_queue_holds_tile(1, 1)
             || bridge.scheduler.generation_for(1, 1) > 0,

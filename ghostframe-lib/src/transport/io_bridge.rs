@@ -107,10 +107,15 @@ pub use frame_backend::{
     H264Out, OwnedPalRle, PixelSource, TileOut, TileRequest, TileTimings,
 };
 
+#[path = "io_bridge/frame_worker.rs"]
+mod frame_worker;
+use frame_worker::{FinishAction, FramePipeline, FromWorker, ToWorker};
+
 #[path = "io_bridge/frame.rs"]
 mod frame;
 #[cfg(test)]
 use frame::palrle_index_slice;
+use frame::InFlight;
 #[cfg(test)]
 use frame::{
     apply_gpu_metrics, clamp_gpu_tile_count, monotonic_now_ns, populate_gpu_metrics,
@@ -292,7 +297,9 @@ enum LoopArm {
     PeerLookup,
     Inbound,
     Frame,
+    FrameResult,
     Injected,
+    InjectedHeld,
 }
 
 pub struct IoBridge {
@@ -344,6 +351,11 @@ pub struct IoBridge {
     /// Pre-encoded tile work injected by the browserless harness, bypassing
     /// capture and classification. `None` in production.
     inject_rx: Option<mpsc::Receiver<InjectedFrame>>,
+    /// Harness only: injected frames that carry a `cost` are held off the
+    /// loop by a task and come back here; one at a time, in order.
+    held_rx: Option<mpsc::Receiver<InjectedFrame>>,
+    held_tx: Option<mpsc::Sender<InjectedFrame>>,
+    injected_held: bool,
     /// Monotonically increasing frame sequence number (wrapping).
     frame_seq: u32,
     /// Per-tile dirty detection.
@@ -491,8 +503,21 @@ pub struct IoBridge {
     cdf53_stranded_candidates_this_frame: Vec<u32>,
     /// The GPU and encoder work of a frame (Vulkan dirty detection and
     /// analysis, VA-API H.264, CDF 5/3 pass encoding). `None` without a GPU,
-    /// in which case frames take the CPU path. See `frame_backend`.
-    frame_backend: Option<Box<dyn FrameBackend>>,
+    /// in which case frames take the CPU path. See `frame_backend` and
+    /// `frame_worker`.
+    frame_pipeline: Option<FramePipeline>,
+    /// The frame the worker holds, if any. At most one: the frame arm of
+    /// `run` is off until it has been committed.
+    in_flight: Option<InFlight>,
+    /// Hardware controls (`invalidate_baseline`, `request_keyframe`) waiting
+    /// to ride along with the next message to the worker, in issue order.
+    pending_controls: Vec<Control>,
+    /// Bumped when the live session ends or is reset. A frame in flight
+    /// started under an older epoch belongs to a client that is gone, and its
+    /// results are discarded.
+    session_epoch: u64,
+    /// A failure `run` must stop on (the frame worker died).
+    fatal: Option<String>,
     /// Per-tile-pass coverage map: (frame_seq, tile_x, tile_y, pass_idx) ->
     /// tile metadata for a work item. Populated at emit time; consumed by
     /// dispatch_ack_datagram on incoming ACKs. LRU-bounded by
@@ -1028,6 +1053,9 @@ impl IoBridge {
             has_seen_prior_session: false,
             frame_rx: None,
             inject_rx: None,
+            held_rx: None,
+            held_tx: None,
+            injected_held: false,
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
             metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
@@ -1073,7 +1101,11 @@ impl IoBridge {
             recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
             cdf53_stranded_candidates_this_frame: Vec::new(),
-            frame_backend: diffs.frame_backend,
+            frame_pipeline: diffs.frame_backend.map(FramePipeline::new),
+            in_flight: None,
+            pending_controls: Vec::new(),
+            session_epoch: 0,
+            fatal: None,
             fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap::new(
                 crate::transport::fragment_coverage::FRAGMENT_COVERAGE_CAPACITY,
             ),
@@ -1741,13 +1773,36 @@ impl IoBridge {
                     }
                 }
 
-                // 3. Frame submission from capture thread.
+                // 3a. The frame worker finished a step of the frame in flight.
+                // Ahead of the frame arm so the frame is committed before a
+                // new one is taken (the frame arm is off while one is in
+                // flight, so they never compete; the order is for the reader).
+                result = async {
+                    match (self.frame_pipeline.as_mut(), self.in_flight.is_some()) {
+                        (Some(p), true) => p.rx.recv().await,
+                        _ => std::future::pending().await,
+                    }
+                } => {
+                    inbound_streak = 0;
+                    #[cfg(test)]
+                    self.loop_arm_trace.push(LoopArm::FrameResult);
+                    match result {
+                        Some(msg) => self.on_frame_worker_message(msg),
+                        None => {
+                            self.fatal = Some("the frame worker stopped".into());
+                        }
+                    }
+                }
+
+                // 3. Frame submission from capture thread. Off while a frame
+                // is in flight: capture backs up behind its bounded channel
+                // exactly as it did when `process_frame` blocked the loop.
                 frame = async {
                     match self.frame_rx.as_mut() {
                         Some(rx) => rx.recv().await,
                         None => std::future::pending().await,
                     }
-                } => {
+                }, if self.in_flight.is_none() => {
                     diag_frame_arm += 1;
                     inbound_streak = 0;
                     #[cfg(test)]
@@ -1764,33 +1819,47 @@ impl IoBridge {
                 // production (the field is always present so this branch
                 // needs no `cfg`; a `None` receiver just costs a pending
                 // future).
+                //
+                // A frame with a `cost` stands for a real frame's GPU and
+                // encode work, which no longer runs on this loop: a task holds
+                // it for the cost and hands it back through `held_rx` (3c),
+                // and the loop keeps serving the network meanwhile. One
+                // held at a time, so frames still apply in order.
                 injected = async {
                     match self.inject_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if !self.injected_held => {
+                    inbound_streak = 0;
+                    #[cfg(test)]
+                    self.loop_arm_trace.push(LoopArm::Injected);
+                    match injected {
+                        Some(inj) => match inj.cost {
+                            Some(cost) => self.hold_injected_frame(inj, cost),
+                            None => {
+                                self.apply_injected_frame(inj);
+                            }
+                        },
+                        None => {
+                            self.inject_rx = None;
+                        }
+                    }
+                }
+
+                // 3c. An injected frame's hold is over.
+                held = async {
+                    match self.held_rx.as_mut() {
                         Some(rx) => rx.recv().await,
                         None => std::future::pending().await,
                     }
                 } => {
                     inbound_streak = 0;
                     #[cfg(test)]
-                    self.loop_arm_trace.push(LoopArm::Injected);
-                    match injected {
-                        Some(inj) => {
-                            if let Some(cost) = inj.cost {
-                                #[cfg(any(test, feature = "browserless-harness"))]
-                                let started = now_std();
-                                tokio::time::sleep(cost).await;
-                                #[cfg(any(test, feature = "browserless-harness"))]
-                                if let Some(log) = self.hold_log.as_ref() {
-                                    log.lock()
-                                        .expect("hold_log mutex poisoned")
-                                        .push((started, now_std()));
-                                }
-                            }
-                            self.apply_injected_frame(inj);
-                        }
-                        None => {
-                            self.inject_rx = None;
-                        }
+                    self.loop_arm_trace.push(LoopArm::InjectedHeld);
+                    self.injected_held = false;
+                    if let Some(inj) = held {
+                        self.apply_injected_frame(inj);
                     }
                 }
 
@@ -1803,6 +1872,9 @@ impl IoBridge {
                 }
             }
 
+            if let Some(e) = self.fatal.take() {
+                return Err(e.into());
+            }
             self.post_turn().await?;
 
             // [BRIDGE-DIAG] heartbeat every 2s of virtual time (tokio's

@@ -406,9 +406,7 @@ impl IoBridge {
                      retiring content the normal way — check ledger_unknown_acks."
                 );
                 self.force_dirty_frames = self.force_dirty_frames.max(2);
-                if let Some(b) = self.frame_backend.as_mut() {
-                    b.apply(Control::InvalidateBaseline(2));
-                }
+                self.backend_apply(Control::InvalidateBaseline(2));
             }
         }
         // Retransmission draws on the same link estimate the scheduler

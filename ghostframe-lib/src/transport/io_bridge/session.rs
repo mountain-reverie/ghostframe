@@ -146,6 +146,8 @@ impl IoBridge {
         // QUIC slow-start would mostly drop. Classifier exits
         // back to TileCodec naturally after exit_sustain frames
         // of empty dirty (Task 17).
+        // A frame the worker is still on belongs to the session being reset.
+        self.session_epoch += 1;
         self.dirty_tracker.reset();
         self.metrics_tracker.reset();
         self.classifier.reset();
@@ -184,9 +186,7 @@ impl IoBridge {
         // call errors and the frame falls back to `process_frame_cpu`,
         // which is exactly the correct behaviour on that error path.
         self.force_dirty_frames = 20;
-        if let Some(b) = self.frame_backend.as_mut() {
-            b.apply(Control::InvalidateBaseline(20));
-        }
+        self.backend_apply(Control::InvalidateBaseline(20));
         // Force IDR on the existing encoder so the new client
         // gets a fresh anchor. Without this, a client connecting
         // mid-stream may receive P-frames referencing GOPs from
@@ -194,9 +194,7 @@ impl IoBridge {
         // natural keyframe (~10 frames later at GOP=11). The
         // first-time-only escape (lazy `FullFrameEncoder::new`
         // with pts=0 → IDR) only covers cold start.
-        if let Some(b) = self.frame_backend.as_mut() {
-            b.apply(Control::RequestKeyframe);
-        }
+        self.backend_apply(Control::RequestKeyframe);
         // info, not debug: this is the line that says a reconnecting client is
         // getting a clean slate rather than resuming, and at debug it was
         // invisible in exactly the production logs where that matters.
@@ -354,6 +352,7 @@ impl IoBridge {
         );
         self.forget_session(handle);
         if was_live {
+            self.session_epoch += 1;
             self.session_started_at = None;
             self.last_disconnect_at = Some(now);
             // Delivery-guarantee invariant: when the session ends,
@@ -465,6 +464,7 @@ impl IoBridge {
     pub(super) fn evict_session(&mut self, handle: ConnectionHandle, reason: EvictionReason) {
         // A guess, not a measurement -- see this method's doc comment.
         const EVICTION_REPEATS: usize = 3;
+        self.session_epoch += 1;
 
         let datagram = build_eviction_datagram(reason);
         let mut notices_sent = 0usize;

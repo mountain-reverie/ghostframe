@@ -17,7 +17,7 @@
 //! address makes quinn answer with Version Negotiation whose SCID echoes the
 //! probe's DCID; the time from write to that reply is the loop's inbound
 //! turnaround. Probes are tagged "during encode" when they overlap a
-//! process_frame ENTER..EXIT window (from the diag trace events). Stage fields
+//! worker-call ENTER..EXIT window (the frame worker; before it existed this was process_frame on the loop). Stage fields
 //! overlap (coef_* are inside cdf53_total; tile_stages is inside emit), do not
 //! sum across them.
 
@@ -39,7 +39,7 @@ type StageEvent = (String, Vec<(&'static str, u64)>);
 
 #[derive(Default)]
 struct Windows {
-    /// (when, is_enter, dt_us) for process_frame ENTER/EXIT.
+    /// (when, is_enter, dt_us) for the frame worker's calls.
     spans: Mutex<Vec<(Instant, bool, u64)>>,
     /// frame.stages / frame.tile_stages events: (message, [(field, us)]).
     stages: Mutex<Vec<StageEvent>>,
@@ -69,9 +69,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Rec {
         }
         let mut v = V::default();
         e.record(&mut v);
-        if v.msg.contains("process_frame ENTER") {
+        if v.msg.contains("worker call ENTER") {
             self.0.spans.lock().unwrap().push((Instant::now(), true, 0));
-        } else if v.msg.contains("process_frame EXIT") {
+        } else if v.msg.contains("worker call EXIT") {
             let dt = v.u.iter().find(|(n, _)| *n == "dt_us").map_or(0, |x| x.1);
             self.0
                 .spans
@@ -308,7 +308,7 @@ async fn scenario(name: &str, w: u32, h: u32, dirty_frac: f64) {
         dts.len()
     );
     println!(
-        "METRIC {name} process_frame_ms p50={:.2} p95={:.2} max={:.2}",
+        "METRIC {name} worker_call_ms p50={:.2} p95={:.2} max={:.2}",
         pct(&mut dts.clone(), 0.5),
         pct(&mut dts.clone(), 0.95),
         pct(&mut dts, 1.0)
