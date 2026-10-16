@@ -198,3 +198,27 @@ Schedule:
 - C4: per-fragment retransmit cache and ACKs for Raw.
 - WS-D1: RTO/ledger fixes plus a per-class timer and ledger-timeout hook (no behaviour change).
 - New stream D3 "fec-v2" after D1: formats and codec, client (recovery window, repair request), server bundling, FEC emission with the last-resort timer, RTT-dependent adaptation table, delete the legacy path. H.264 per-frame RS needs only the codec PR and can pair with C5.
+
+### Wave C progress (2026-10-16)
+
+| Stream | Outcome | PR |
+|---|---|---|
+| C1 | fixed: stamp in place, shared `Bytes`, dead LRU removed; outbound writes batched in 32 KiB chunks (one 4K frame's 8975 packets: 12.4–18.2 ms → 2.3–2.7 ms). measured-no-gain: varint prefix reserve, inbound buffer reuse. closed-already-fixed: `bytes_outstanding` (fddb711), fingerprint (a5ca496). Deferred: Phase B scratch (C2's file), housekeeping cadence (D1), `TileWork: Bytes` | #161, #166 |
+| C3 | fixed: parity decoder no longer rebuilds datagrams that already arrived (0.7 % duplicates on a clean link); the client rebuilds a lost H.264 fragment from the existing XOR parity (40-fragment frame lost at 2 % iid: 59.1 % → 5.6 %; bursts of 4: 21.4 % → 16.4 %); web client asks for `congestionControl: "low-latency"`. C3-M (loss counters) in progress; tile FEC off by default waits for the Raw removal | #167, #169, #171 |
+| C4 | Q-M3: coverage stays (owner's option a); docs corrected | #162, #168 |
+| C4 | fixed: CPU-read GPU buffers come from cached host memory. CDF 5/3 coefficient read 733 → 3.5 ms at 1080p, 2928 → 12 ms at 4K; NV12 copy 68 → 1.1 ms at 4K | #172 |
+| C6 | fixed: certificate rotation | #160 |
+| C7 | fixed: web client paints by newest `frame_seq`; H.264 seq carried through the decoder; dead decoder rebuilt on the next keyframe | #164 |
+| C7n | fixed: native client paints by newest `frame_seq` within a flush batch. Deferred: an out-of-order stale H.264 access unit is caught only as a seq gap | #170 |
+
+Owner decisions 2026-10-16:
+- Nothing is in production: wire changes need no backward compatibility. This supersedes the FEC v2 design's "legacy path kept two releases"; the HELLO bit is optional.
+- Raw tiles are dropped. CDF 5/3 (lossless after all passes) is the GPU-path fallback, done first through a second small GPU forward dispatch for the tiles PalRle cannot take; then Raw leaves protocol, server and all clients. The server is GPU-first and software paths are avoided. Still open: whether a host without a usable GPU refuses to start (proposed: yes, with a test-only CPU CDF 5/3 route).
+- The Raw per-fragment ACK fix is abandoned. Once Raw is gone a CDF 5/3 pass is at most 776 B (proven by test), so every tile datagram is single-fragment and tile fragmentation can be deleted later.
+- The Go-side ghostbridge per-packet work (2 reads and one `ResolveUDPAddr` per packet) is not optimised: the owner is considering the Rust Tailscale implementation instead.
+
+WS-D1 entry evidence added:
+- C3-M cascade measurement (burst-loss scene, 1 % iid, 3 seeds): 68–75 % of ~19k RTO fires are spurious; quinn's send queue grows to 2.6 MB and never drains while cwnd collapses from 177–310 KB to 7–38 KB. With `GHOSTFRAME_NO_RTO=1` retransmissions fall 43x to about one per lost datagram, but the queue and cwnd collapse remain: the RTO amplifies, the cause is Cubic's cut with a pacer that does not follow it down. Client receive-buffer drops are 0; loss runs of 9–16 datagrams confirm coalescing.
+- C2 baseline before #172: `process_frame` p50 74 ms at 1080p with 5 % dirty, 1.1 s full dirty, 4.5 s at 4K full dirty, and the event loop answers nothing for the whole of it. Re-measured with per-stage timers after #172.
+
+Flake: `e2e_palrle_exact_pixels` fails about 1 run in 5 on master (pixel (160,320) read as [0,0,0,0]); not investigated.
