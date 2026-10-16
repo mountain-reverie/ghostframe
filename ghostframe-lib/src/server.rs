@@ -122,6 +122,23 @@ impl GhostframeServer {
             // and keep the list fresh as the certificate rotates.
             let schedule = bridge.cert_schedule();
             let initial = schedule.hashes_hex();
+            // The web server applies the same access rule as the QUIC
+            // listener, and must have it before it binds: until a check is
+            // installed ghostbridge refuses every request. A production
+            // bridge always has a policy; one without is a wiring bug, and
+            // starting the web server anyway would serve nobody.
+            let (policy, denials) = bridge.peer_access().ok_or_else(|| {
+                std::io::Error::other("IoBridge has a tsnet handle but no access policy")
+            })?;
+            bridge_handle.set_peer_authorizer(Box::new(move |peer, lookup| {
+                crate::transport::peer_auth::authorize_web(
+                    &policy,
+                    &denials,
+                    std::time::Instant::now(),
+                    peer,
+                    lookup,
+                )
+            }))?;
             bridge_handle.start_web_server(&initial.join(","))?;
             cert_task = Some(tokio::spawn(publish_cert_hashes(
                 schedule,
