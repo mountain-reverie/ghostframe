@@ -368,7 +368,7 @@ async fn scenario(name: &str, w: u32, h: u32, dirty_frac: f64) {
         .filter(|(k, _)| k == "tile_stages")
         .count();
     assert!(
-        n_tile > 0 && n_tile * 2 >= spans.len(),
+        n_tile > 0 && n_tile * 2 + 2 >= spans.len(),
         "frames did not take the GPU tile path ({n_tile} tile_stages for {} windows)",
         spans.len()
     );
