@@ -161,6 +161,14 @@ func (l *loggingListener) Accept() (net.Conn, error) {
 	return c, nil
 }
 
+// newWebHandlers returns the :443 and :80 handlers, each behind the peer
+// access check. One constructor for both, so a test can hold the pair to
+// the same rule.
+func newWebHandlers(hashes *certHashStore, who whoiser, authz *authorizerSlot) (tlsHandler, redirHandler http.Handler) {
+	return requireAuthorizedPeer(newWebMux(hashes), who, authz),
+		requireAuthorizedPeer(newRedirectHandler(hashes), who, authz)
+}
+
 // startWebListeners brings up the :80 (redirect) and :443 (TLS) listeners
 // on the given tsnet.Server. In production mode (staticCert == nil) it
 // uses tsnet's LE-backed ListenTLS; in e2e mode it uses a plain Listen
@@ -228,8 +236,9 @@ func startWebListeners(
 	// of a cert-provisioning failure) into our journal with a prefix so
 	// it's easy to spot when triaging connection failures.
 	tlsErrLog := log.New(log.Writer(), "ghostbridge: :443 http: ", log.LstdFlags)
+	tlsHandler, redirHandler := newWebHandlers(hashes, who, authz)
 	tlsServer := &http.Server{
-		Handler:           requireAuthorizedPeer(newWebMux(hashes), who, authz),
+		Handler:           tlsHandler,
 		ErrorLog:          tlsErrLog,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
@@ -237,7 +246,7 @@ func startWebListeners(
 		IdleTimeout:       60 * time.Second,
 	}
 	redirServer := &http.Server{
-		Handler:           requireAuthorizedPeer(newRedirectHandler(hashes), who, authz),
+		Handler:           redirHandler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

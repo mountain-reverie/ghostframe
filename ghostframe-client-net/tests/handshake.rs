@@ -223,3 +223,20 @@ fn a_held_connection_is_refused_when_its_lookup_fails() {
     assert!(refused(&events), "expected a refusal, got {events:?}");
     assert!(server.connections.is_empty());
 }
+
+// While lookups are outstanding, held Initials are bounded: more clients
+// from one peer than may be held are dropped, not queued.
+#[test]
+fn held_connections_are_bounded_per_peer() {
+    let mut server = QuicServer::new().expect("QuicServer::new");
+    install_gate(&mut server, Err(WhoIsError::Failed("unused".into())), false);
+    let mut clients: Vec<_> = (0..10).map(|_| client_for(&server)).collect();
+    for (client, base, now_us) in clients.iter_mut() {
+        pump(client, &mut server, *base, now_us, 4);
+    }
+    let held = server.held_incoming_count();
+    assert!(held > 0 && held < 10, "held {held} of 10");
+    assert!(server.held_overflow() > 0, "the rest were dropped");
+    assert_eq!(server.take_peer_lookups().len(), 1, "still one lookup");
+    assert!(server.connections.is_empty());
+}

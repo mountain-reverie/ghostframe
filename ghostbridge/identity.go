@@ -42,8 +42,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
 	"tailscale.com/client/local"
@@ -87,18 +89,30 @@ var errIdentityField = errors.New("ghostbridge: identity field contains a separa
 // legitimately contain one, and a refusal is the safe reading of a value
 // that does.
 func encodeIdentity(id peerIdentity) (string, error) {
-	for _, f := range []string{id.loginName, id.nodeName} {
-		if strings.ContainsAny(f, "\n\x00") {
-			return "", errIdentityField
-		}
-	}
-	for _, t := range id.tags {
-		if t == "" || strings.ContainsAny(t, "\n\x00,") {
-			return "", errIdentityField
-		}
+	if err := validateIdentity(id); err != nil {
+		return "", err
 	}
 	return strconv.FormatInt(id.userID, 10) + "\n" + id.loginName + "\n" +
 		id.nodeName + "\n" + strings.Join(id.tags, ","), nil
+}
+
+// validateIdentity rejects any field that could not be carried intact,
+// either in the record above or as a C string to the web authorizer: a NUL
+// would truncate a login name, a comma would split a tag. Both enforcement
+// points go through lookupPeer, which applies it, so they see the same
+// identities.
+func validateIdentity(id peerIdentity) error {
+	for _, f := range []string{id.loginName, id.nodeName} {
+		if strings.ContainsAny(f, "\n\x00") || !utf8.ValidString(f) {
+			return errIdentityField
+		}
+	}
+	for _, t := range id.tags {
+		if t == "" || strings.ContainsAny(t, "\n\x00,") || !utf8.ValidString(t) {
+			return errIdentityField
+		}
+	}
+	return nil
 }
 
 // identityFromWhoIs extracts the identity from a WhoIs response. The user is
@@ -152,15 +166,46 @@ func lookupPeer(lc whoiser, addr string) (peerIdentity, int32) {
 		if errors.Is(err, local.ErrPeerNotFound) {
 			return peerIdentity{}, gbridgeWhoisStatusNotFound
 		}
-		log.Printf("ghostbridge: WhoIs(%q): %v", addr, err)
+		lookupFailureLog.printf("ghostbridge: WhoIs(%q): %v", addr, err)
 		return peerIdentity{}, gbridgeWhoisStatusFailed
 	}
 	id, err := identityFromWhoIs(resp)
+	if err == nil {
+		err = validateIdentity(id)
+	}
 	if err != nil {
-		log.Printf("ghostbridge: WhoIs(%q): %v", addr, err)
+		lookupFailureLog.printf("ghostbridge: WhoIs(%q): %v", addr, err)
 		return peerIdentity{}, gbridgeWhoisStatusFailed
 	}
 	return id, gbridgeIdentityStatusOK
+}
+
+// rateLimitedLog prints at most one line per interval and counts the rest.
+// A wedged LocalAPI with a browser retrying would otherwise write a line
+// per request.
+type rateLimitedLog struct {
+	mu         sync.Mutex
+	interval   time.Duration
+	last       time.Time
+	suppressed int
+}
+
+var lookupFailureLog = &rateLimitedLog{interval: 10 * time.Second}
+
+func (l *rateLimitedLog) printf(format string, args ...any) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	if !l.last.IsZero() && now.Sub(l.last) < l.interval {
+		l.suppressed++
+		return false
+	}
+	if l.suppressed > 0 {
+		format += fmt.Sprintf(" (%d similar suppressed)", l.suppressed)
+	}
+	l.last, l.suppressed = now, 0
+	log.Printf(format, args...)
+	return true
 }
 
 // copyToCBuf writes s plus a NUL into the caller's buffer.

@@ -152,11 +152,14 @@ impl WhoIsClient {
 pub type PeerAuthorizerFn =
     dyn Fn(&str, Result<PeerIdentity, WhoIsError>) -> bool + Send + Sync + 'static;
 
-unsafe fn c_str_or_empty<'a>(p: *const c_char) -> &'a str {
+/// A C string field, or `None` if it is missing or not UTF-8. A field that
+/// cannot be read is never treated as empty: an unreadable tag list read as
+/// "no tags" would turn a tagged peer into an untagged one.
+unsafe fn c_field<'a>(p: *const c_char) -> Option<&'a str> {
     if p.is_null() {
-        ""
+        None
     } else {
-        CStr::from_ptr(p).to_str().unwrap_or("")
+        CStr::from_ptr(p).to_str().ok()
     }
 }
 
@@ -183,17 +186,19 @@ unsafe extern "C" fn peer_authorizer_trampoline(
         };
         let lookup = match lookup_status {
             IDENTITY_STATUS_OK => {
-                let tags = c_str_or_empty(tags_csv);
-                Ok(PeerIdentity {
-                    user_id,
-                    login_name: c_str_or_empty(login_name).to_owned(),
-                    node_name: c_str_or_empty(node_name).to_owned(),
-                    tags: if tags.is_empty() {
-                        Vec::new()
-                    } else {
-                        tags.split(',').map(str::to_owned).collect()
-                    },
-                })
+                match (c_field(login_name), c_field(node_name), c_field(tags_csv)) {
+                    (Some(login), Some(node), Some(tags)) => Ok(PeerIdentity {
+                        user_id,
+                        login_name: login.to_owned(),
+                        node_name: node.to_owned(),
+                        tags: if tags.is_empty() {
+                            Vec::new()
+                        } else {
+                            tags.split(',').map(str::to_owned).collect()
+                        },
+                    }),
+                    _ => Err(WhoIsError::Failed("unreadable identity field".into())),
+                }
             }
             WHOIS_STATUS_NOT_FOUND => Err(WhoIsError::NotFound),
             other => Err(WhoIsError::Failed(format!("rc={other}"))),
@@ -377,6 +382,33 @@ mod tests {
         let (rc, ctx) = call(Box::new(|_, _| panic!("boom")), IDENTITY_STATUS_OK, "a", "");
         drop(unsafe { Box::from_raw(ctx) });
         assert_eq!(rc, 0);
+    }
+
+    // An unreadable tag list must reach the rule as a failed lookup, not as
+    // "untagged": that would let a tagged device match its user.
+    #[test]
+    fn trampoline_reports_an_unreadable_field_as_a_failed_lookup() {
+        let ctx = Box::into_raw(Box::new(Box::new(
+            |_: &str, lookup: Result<PeerIdentity, WhoIsError>| {
+                matches!(lookup, Err(WhoIsError::Failed(_)))
+            },
+        ) as Box<PeerAuthorizerFn>));
+        let peer = CString::new("100.64.0.9:5000").unwrap();
+        let login = CString::new("a").unwrap();
+        let bad_tags = CString::new(vec![b't', 0xff]).unwrap();
+        let rc = unsafe {
+            peer_authorizer_trampoline(
+                ctx as *mut c_void,
+                peer.as_ptr(),
+                IDENTITY_STATUS_OK,
+                1,
+                login.as_ptr(),
+                login.as_ptr(),
+                bad_tags.as_ptr(),
+            )
+        };
+        drop(unsafe { Box::from_raw(ctx) });
+        assert_eq!(rc, 1, "the closure must have seen Failed");
     }
 
     #[test]
