@@ -512,7 +512,12 @@ func gbridge_start_web_server(sd C.int32_t, cCertHashHex *C.char) C.gbridge_stat
 		log.Printf("ghostbridge: HTTPS-eligible cert domains: %v", domains)
 	}
 
-	if err := startWebListeners(context.Background(), h.server, h.certHashes, staticCert); err != nil {
+	lc, err := h.server.LocalClient()
+	if err != nil {
+		log.Printf("ghostbridge: gbridge_start_web_server: LocalClient: %v", err)
+		return gbridgeWebStatusListenFailed
+	}
+	if err := startWebListeners(context.Background(), h.server, h.certHashes, staticCert, lc, &h.authz); err != nil {
 		log.Printf("ghostbridge: gbridge_start_web_server: listener bind failed: %v", err)
 		return gbridgeWebStatusListenFailed
 	}

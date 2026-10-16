@@ -168,11 +168,17 @@ func (l *loggingListener) Accept() (net.Conn, error) {
 //
 // Returns immediately after the listeners are bound; the http.Serve
 // goroutines run for the lifetime of the process.
+//
+// Every request on both listeners goes through requireAuthorizedPeer first:
+// a peer the access policy refuses gets a bare 403 -- no SPA, no
+// /config.json, no redirect.
 func startWebListeners(
 	ctx context.Context,
 	srv *tsnet.Server,
 	hashes *certHashStore,
 	staticCert *tls.Certificate,
+	who whoiser,
+	authz *authorizerSlot,
 ) error {
 	// A noweb archive has no SPA to serve. Fail the bind instead of coming
 	// up and answering 404 for every asset: the second failure mode is
@@ -223,7 +229,7 @@ func startWebListeners(
 	// it's easy to spot when triaging connection failures.
 	tlsErrLog := log.New(log.Writer(), "ghostbridge: :443 http: ", log.LstdFlags)
 	tlsServer := &http.Server{
-		Handler:           newWebMux(hashes),
+		Handler:           requireAuthorizedPeer(newWebMux(hashes), who, authz),
 		ErrorLog:          tlsErrLog,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
@@ -231,7 +237,7 @@ func startWebListeners(
 		IdleTimeout:       60 * time.Second,
 	}
 	redirServer := &http.Server{
-		Handler:           newRedirectHandler(hashes),
+		Handler:           requireAuthorizedPeer(newRedirectHandler(hashes), who, authz),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
