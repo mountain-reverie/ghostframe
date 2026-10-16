@@ -222,3 +222,27 @@ WS-D1 entry evidence added:
 - C2 baseline before #172: `process_frame` p50 74 ms at 1080p with 5 % dirty, 1.1 s full dirty, 4.5 s at 4K full dirty, and the event loop answers nothing for the whole of it. Re-measured with per-stage timers after #172.
 
 Flake: `e2e_palrle_exact_pixels` fails about 1 run in 5 on master (pixel (160,320) read as [0,0,0,0]); not investigated.
+
+### C2 measurement after #172 (2026-10-16, release, p50)
+
+| Scene | process_frame | CDF53 pass encode (CPU) | GPU | coefficient read |
+|---|---|---|---|---|
+| 1080p, 5 % dirty | 24 ms | 16 ms | 7 ms | 0.1 ms |
+| 1080p, full | 300 ms | 273 ms | 18.5 ms | 1.7 ms |
+| 4K, 5 % dirty | 93 ms | 63 ms | 27 ms | 0.4 ms |
+| 4K, full | ~1.25 s | ~1.15 s | 71.5 ms | 7 ms |
+
+- The coefficient read is solved (#172). The CDF53 pass encode (`encode_passes_sparse`, ~134 µs per tile, pure CPU) is now the dominant stage; release is only ~20 % faster than the test profile. PalRLE phases, the RTO sweep and scheduler dispatch are small.
+- The move (C2 PR-2) puts the pass encode on the worker; it unblocks the loop but does not make frames faster. Meeting the full-screen tile frame target needs the pass encode itself to get faster or move to the GPU: proposed as a Wave D candidate, not yet decided.
+- The classifier calls `refinement_deficit_tiles()` every frame, an O(queue) rebuild costing 2.5 ms at a 4K full-screen queue (114k entries). C2 replaces it with an incremental per-tile counter in `Scheduler` (own PR).
+- H.264 encode is not measured (VA-API off for agents); owed in the owner-present solo run.
+
+## Closing workstream: project documentation (owner decision 2026-10-16)
+
+After the last wave:
+1. Write the project documentation from the durable parts of the plans and reviews: architecture (capture, GPU pipeline, transport, clients), wire protocol, codecs (PalRLE, CDF 5/3 progressive refinement, H.264, FEC and repair), congestion control and bandwidth estimation.
+2. Repoint every reference to `docs/superpowers/` outside it (35 at last count, in 34 files, mostly code comments) at the new documents.
+3. Delete `docs/superpowers/` and add it to `.gitignore`, so agents' working plans stay local.
+4. Fold or remove the rest of the campaign's working notes under `docs/` in the same pass.
+
+Related, already enforced: no tracked file outside `docs/` may name a home directory (`ci/check-local-paths.sh`, #175).
