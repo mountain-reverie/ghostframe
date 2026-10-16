@@ -54,6 +54,7 @@ fn a_client_fetched_before_rotation_still_connects_after_it() {
         time::OffsetDateTime::from_unix_timestamp(base + o.load(Ordering::SeqCst)).unwrap()
     });
     let mut server = QuicServer::new_with_cert_clock(clock).expect("server");
+    common::install_gate(&mut server, Ok(common::owner_identity()), true);
 
     // The client fetched [current, next] now.
     let fetched = server.cert_info().schedule.hashes_hex();
