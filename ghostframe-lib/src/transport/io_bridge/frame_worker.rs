@@ -143,6 +143,9 @@ pub(super) struct FramePipeline {
     pub(super) rx: mpsc::Receiver<FromWorker>,
     exited: std_mpsc::Receiver<()>,
     handle: Option<std::thread::JoinHandle<()>>,
+    /// The panic message, if the worker died of one. Set before the result
+    /// channel closes.
+    failure: std::sync::Arc<Mutex<Option<String>>>,
 }
 
 impl FramePipeline {
@@ -150,10 +153,24 @@ impl FramePipeline {
         let (tx, worker_rx) = std_mpsc::channel::<ToWorker>();
         let (result_tx, rx) = mpsc::channel::<FromWorker>(2);
         let (exited_tx, exited) = std_mpsc::channel::<()>();
+        let failure = std::sync::Arc::new(Mutex::new(None));
+        let worker_failure = failure.clone();
         let handle = std::thread::Builder::new()
             .name("gf-frame-worker".into())
             .spawn(move || {
-                run_worker(backend, worker_rx, result_tx);
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_worker(backend, worker_rx, &result_tx)
+                }));
+                if let Err(payload) = ran {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".into());
+                    *worker_failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+                }
+                // The result channel closes here, after the failure is recorded.
+                drop(result_tx);
                 let _ = exited_tx.send(());
             })
             .expect("spawn the frame worker thread");
@@ -162,7 +179,16 @@ impl FramePipeline {
             rx,
             exited,
             handle: Some(handle),
+            failure,
         }
+    }
+
+    /// Why the worker died, if it panicked.
+    pub(super) fn failure(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// `false` when the worker has gone (it panicked or was told to stop).
@@ -222,10 +248,40 @@ impl Drop for FramePipeline {
     }
 }
 
+/// How long to wait for the hardware lock before saying so. A backend call
+/// stuck inside the driver (a fence wait with no timeout) holds the lock
+/// forever, and a replacement bridge in the same process would otherwise go
+/// silent behind it.
+const LOCK_WARN_EVERY: Duration = Duration::from_secs(5);
+
 fn locked<T>(f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let mut next_warning = LOCK_WARN_EVERY;
     // A panic while holding the lock poisons it; the worker that panicked is
     // already fatal, and another bridge's worker must still be able to run.
-    let _guard = FRAME_HW_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = loop {
+        match FRAME_HW_LOCK.try_lock() {
+            Ok(g) => break g,
+            Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(2));
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "real time spent waiting on a lock, for a log line"
+                )]
+                let waited = started.elapsed();
+                if waited >= next_warning {
+                    tracing::warn!(
+                        target: "ghostframe_lib::transport::io_bridge",
+                        waited_s = waited.as_secs(),
+                        "frame worker is waiting for the process-wide hardware lock; \
+                         another frame worker's GPU or encoder call has not returned"
+                    );
+                    next_warning += LOCK_WARN_EVERY;
+                }
+            }
+        }
+    };
     // The window the loop is NOT held for, for the measurement scenes.
     tracing::trace!(target: "ghostframe::io_bridge::diag", "[BRIDGE] worker call ENTER");
     let t0 = std::time::Instant::now();
@@ -251,7 +307,7 @@ fn elapsed_us(t0: std::time::Instant) -> u64 {
 fn run_worker(
     mut backend: Box<dyn FrameBackend>,
     rx: std_mpsc::Receiver<ToWorker>,
-    tx: mpsc::Sender<FromWorker>,
+    tx: &mpsc::Sender<FromWorker>,
 ) {
     // The frame of the call in flight, kept between `Analyse` and `Finish`.
     let mut held: Option<FrameSubmission> = None;

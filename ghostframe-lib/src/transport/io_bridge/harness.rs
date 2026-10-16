@@ -5,7 +5,10 @@
 //!
 //! Every item here keeps its own `#[cfg(any(test, feature =
 //! "browserless-harness"))]` attribute; the module itself is not gated, so
-//! the file compiles to an empty `impl` in a production build. The
+//! the file compiles to an empty `impl` in a production build. The one
+//! exception is `hold_injected_frame`, which `IoBridge::run`'s injected arm
+//! calls unconditionally (that arm is compiled in every build, and dead in
+//! production, where `inject_rx` is `None`). The
 //! bandwidth-estimator accessors (`bwe_snapshot`, `bwe_publish_handle`, ...)
 //! live in `bwe_glue.rs` and the `set_tick_budget_floor_bytes` setter in
 //! `pacing.rs`.
