@@ -9,7 +9,8 @@ use ash::vk;
 use std::ffi::CStr;
 
 use super::super::pipeline_builder::{
-    self, alloc_host_buffer, alloc_host_buffer_mapped, BindingSpec,
+    self, alloc_host_buffer, alloc_host_buffer_mapped, alloc_host_readback_buffer_mapped,
+    BindingSpec,
 };
 use super::*;
 
@@ -488,7 +489,7 @@ impl GpuFrameProcessor {
         // --- SAD output buffer ---
         let sad_buf_size = (max_tiles * 4) as vk::DeviceSize;
         let mem_props = instance.get_physical_device_memory_properties(physical_device);
-        let (sad_buffer, sad_memory, sad_ptr) = alloc_host_buffer_mapped::<u32>(
+        let (sad_buffer, sad_memory, sad_ptr) = alloc_host_readback_buffer_mapped::<u32>(
             &device,
             &mem_props,
             sad_buf_size,
@@ -500,7 +501,7 @@ impl GpuFrameProcessor {
         let analysis_entry_bytes = std::mem::size_of::<TileAnalysis>() as vk::DeviceSize;
         let analysis_buf_size = (max_tiles as vk::DeviceSize) * analysis_entry_bytes;
         let (analysis_buffer, analysis_memory, analysis_ptr) =
-            alloc_host_buffer_mapped::<TileAnalysis>(
+            alloc_host_readback_buffer_mapped::<TileAnalysis>(
                 &device,
                 &mem_props,
                 analysis_buf_size,
@@ -512,7 +513,7 @@ impl GpuFrameProcessor {
         // One u32 per tile slot. HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER.
         let palrle_compact_list_size = (max_tiles * 4) as vk::DeviceSize;
         let (palrle_compact_list_buffer, palrle_compact_list_memory, palrle_compact_list_ptr) =
-            alloc_host_buffer_mapped::<u32>(
+            alloc_host_readback_buffer_mapped::<u32>(
                 &device,
                 &mem_props,
                 palrle_compact_list_size,
@@ -524,7 +525,7 @@ impl GpuFrameProcessor {
         // 4 bytes (one u32). HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER | TRANSFER_DST.
         let palrle_compact_count_size = 4_u64;
         let (palrle_compact_count_buffer, palrle_compact_count_memory, palrle_compact_count_ptr) =
-            alloc_host_buffer_mapped::<u32>(
+            alloc_host_readback_buffer_mapped::<u32>(
                 &device,
                 &mem_props,
                 palrle_compact_count_size,
@@ -536,7 +537,7 @@ impl GpuFrameProcessor {
         // One u32 per tile slot. HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER.
         let cdf53_compact_list_size = (max_tiles * 4) as vk::DeviceSize;
         let (cdf53_compact_list_buffer, cdf53_compact_list_memory, cdf53_compact_list_ptr) =
-            alloc_host_buffer_mapped::<u32>(
+            alloc_host_readback_buffer_mapped::<u32>(
                 &device,
                 &mem_props,
                 cdf53_compact_list_size,
@@ -548,7 +549,7 @@ impl GpuFrameProcessor {
         // 4 bytes (one u32). HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER | TRANSFER_DST.
         let cdf53_compact_count_size = 4_u64;
         let (cdf53_compact_count_buffer, cdf53_compact_count_memory, cdf53_compact_count_ptr) =
-            alloc_host_buffer_mapped::<u32>(
+            alloc_host_readback_buffer_mapped::<u32>(
                 &device,
                 &mem_props,
                 cdf53_compact_count_size,
@@ -658,7 +659,7 @@ impl GpuFrameProcessor {
         // TRANSFER_DST allows Task 12b to zero-fill between frames via
         // cmd_fill_buffer so Stage 2b can safely check count == 0 per slot.
         let (frame_palette_set_buffer, frame_palette_set_memory, frame_palette_set_ptr) =
-            alloc_host_buffer_mapped::<FramePaletteEntryRaw>(
+            alloc_host_readback_buffer_mapped::<FramePaletteEntryRaw>(
                 &device,
                 &mem_props,
                 FRAME_PALETTE_SET_BYTES,
@@ -670,7 +671,7 @@ impl GpuFrameProcessor {
         // 4 bytes. HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST (for cmd_fill_buffer zero between frames).
         let frame_palette_count_size = 4_u64;
         let (frame_palette_count_buffer, frame_palette_count_memory, frame_palette_count_ptr) =
-            alloc_host_buffer_mapped::<u32>(
+            alloc_host_readback_buffer_mapped::<u32>(
                 &device,
                 &mem_props,
                 frame_palette_count_size,
@@ -697,7 +698,7 @@ impl GpuFrameProcessor {
             per_tile_frame_palette_id_buffer,
             per_tile_frame_palette_id_memory,
             per_tile_frame_palette_id_ptr,
-        ) = alloc_host_buffer_mapped::<u8>(
+        ) = alloc_host_readback_buffer_mapped::<u8>(
             &device,
             &mem_props,
             per_tile_id_size,
@@ -763,7 +764,7 @@ impl GpuFrameProcessor {
         // 256 slots × 4 bytes = 1024 bytes. HOST_VISIBLE | HOST_COHERENT,
         // persistently mapped for CPU readback (Task 12b+).
         let (folded_into_buffer, folded_into_memory, folded_into_ptr) =
-            alloc_host_buffer_mapped::<u32>(
+            alloc_host_readback_buffer_mapped::<u32>(
                 &device,
                 &mem_props,
                 PALETTE_SLOT_U32_BYTES,
@@ -776,13 +777,14 @@ impl GpuFrameProcessor {
         // HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER, persistently mapped.
         let index_buffer_size =
             ((max_tiles as vk::DeviceSize) * PER_TILE_INDEX_BYTES).max(PER_TILE_INDEX_BYTES);
-        let (index_buffer, index_buffer_memory, index_buffer_ptr) = alloc_host_buffer_mapped::<u8>(
-            &device,
-            &mem_props,
-            index_buffer_size,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            "index buffer",
-        )?;
+        let (index_buffer, index_buffer_memory, index_buffer_ptr) =
+            alloc_host_readback_buffer_mapped::<u8>(
+                &device,
+                &mem_props,
+                index_buffer_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                "index buffer",
+            )?;
 
         // --- Cdf53 coefficient buffer (Stage 4c) ---
         // max_tiles * 3 channels * 1024 i32 = max_tiles * 12 KiB.
@@ -794,7 +796,7 @@ impl GpuFrameProcessor {
         let cdf53_coefficients_size =
             ((max_tiles as vk::DeviceSize) * 3 * 1024 * 4).max(3 * 1024 * 4);
         let (cdf53_coefficients_buffer, cdf53_coefficients_memory, cdf53_coefficients_ptr_mut) =
-            alloc_host_buffer_mapped::<i32>(
+            alloc_host_readback_buffer_mapped::<i32>(
                 &device,
                 &mem_props,
                 cdf53_coefficients_size,
@@ -829,7 +831,7 @@ impl GpuFrameProcessor {
             cdf53_escalation_coefficients_buffer,
             cdf53_escalation_coefficients_memory,
             cdf53_escalation_coefficients_ptr_mut,
-        ) = alloc_host_buffer_mapped::<i32>(
+        ) = alloc_host_readback_buffer_mapped::<i32>(
             &device,
             &mem_props,
             cdf53_escalation_coefficients_size,

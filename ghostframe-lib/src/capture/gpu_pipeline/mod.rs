@@ -865,3 +865,6 @@ mod ingest_tests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod readback_bench;
