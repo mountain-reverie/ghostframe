@@ -123,7 +123,7 @@ jobs:
       # `gpu_pipeline::fallback_tests` drive the CDF 5/3 fallback forward on a
       # real Vulkan device and fail rather than skip without one; exempted
       # here for the same reason as `dmabuf_real_*`.
-      - run: cargo test --workspace --lib -- --skip dmabuf_real_ --skip gpu_pipeline::fallback_tests::
+      - run: "cargo test --workspace --lib -- --skip dmabuf_real_ --skip gpu_pipeline::fallback_tests::"
       # --lib skips binary crates entirely, so ghostframe-xdaemon's tests (the
       # display clamp, the capture resize logic) and codec_report's ran nowhere
       # in CI. No hardware needed.
