@@ -40,15 +40,26 @@ pub use crate::transport::ghostbridge::{PeerIdentity, WhoIsError};
 pub type PeerLookup = Result<PeerIdentity, WhoIsError>;
 
 /// How long an admission is remembered for a peer IP.
-pub const ALLOW_TTL: Duration = Duration::from_secs(30);
+pub(crate) const ALLOW_TTL: Duration = Duration::from_secs(30);
 /// How long a refusal is remembered. Short, so a peer that has just been
 /// added to the list is not kept out for long; non-zero, so a refused peer
 /// retrying in a loop does not cost a lookup per packet.
-pub const DENY_TTL: Duration = Duration::from_secs(5);
+pub(crate) const DENY_TTL: Duration = Duration::from_secs(5);
 /// Minimum gap between two denial log lines for the same peer IP.
-pub const DENIAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
-/// Peers the denial log remembers before it forgets the oldest.
+pub(crate) const DENIAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// Peers the denial log tracks for its per-peer rate limit. A peer arriving
+/// when it is full is not tracked, and falls under the global budget only.
 const DENIAL_LOG_CAPACITY: usize = 256;
+/// Refusal lines per [`DENIAL_LOG_INTERVAL`] across all peers. A peer that
+/// can send from many addresses (a subnet router) would otherwise get one
+/// line per address; past the budget refusals are counted and summarised.
+const DENIAL_LOG_GLOBAL_BUDGET: u32 = 32;
+/// Decisions the cache holds. Past it (after dropping expired entries) a
+/// decision is simply not cached; the next attempt looks the peer up again.
+const DECISION_CACHE_CAPACITY: usize = 4096;
+/// Identity lookups outstanding at once. Past it a new peer's Initial is
+/// dropped without a lookup, and its client retransmits.
+pub(crate) const MAX_LOOKUPS_IN_FLIGHT: usize = 64;
 
 /// This node's owning user.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,7 +265,17 @@ impl AccessPolicy {
 /// unrelated lines down with it.
 #[derive(Debug, Default)]
 pub struct DenialLog {
-    seen: Mutex<HashMap<IpAddr, (Instant, u64)>>,
+    state: Mutex<DenialLogState>,
+}
+
+#[derive(Debug, Default)]
+struct DenialLogState {
+    /// Per peer: when it was last logged, and refusals since.
+    seen: HashMap<IpAddr, (Instant, u64)>,
+    window_start: Option<Instant>,
+    lines_in_window: u32,
+    /// Refusals not logged because the global budget was spent.
+    over_budget: u64,
 }
 
 impl DenialLog {
@@ -271,8 +292,8 @@ impl DenialLog {
         lookup: Option<&PeerLookup>,
         reason: &DenyReason,
     ) -> bool {
-        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-        let suppressed = match seen.get_mut(&ip) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let suppressed = match st.seen.get_mut(&ip) {
             Some((last, n)) if now.saturating_duration_since(*last) < DENIAL_LOG_INTERVAL => {
                 *n += 1;
                 return false;
@@ -280,14 +301,34 @@ impl DenialLog {
             Some((_, n)) => std::mem::take(n),
             None => 0,
         };
-        if seen.len() >= DENIAL_LOG_CAPACITY && !seen.contains_key(&ip) {
-            seen.retain(|_, (last, _)| now.saturating_duration_since(*last) < DENIAL_LOG_INTERVAL);
-            if seen.len() >= DENIAL_LOG_CAPACITY {
-                seen.clear();
+        // Global budget, per interval.
+        let window_over = st
+            .window_start
+            .is_none_or(|w| now.saturating_duration_since(w) >= DENIAL_LOG_INTERVAL);
+        if window_over {
+            if st.over_budget > 0 {
+                tracing::info!(
+                    refusals = st.over_budget,
+                    "refused tailnet peers not logged individually (denial log budget spent)"
+                );
             }
+            st.window_start = Some(now);
+            st.lines_in_window = 0;
+            st.over_budget = 0;
         }
-        seen.insert(ip, (now, 0));
-        drop(seen);
+        if st.lines_in_window >= DENIAL_LOG_GLOBAL_BUDGET {
+            st.over_budget += 1;
+            return false;
+        }
+        st.lines_in_window += 1;
+        if st.seen.len() >= DENIAL_LOG_CAPACITY && !st.seen.contains_key(&ip) {
+            st.seen
+                .retain(|_, (last, _)| now.saturating_duration_since(*last) < DENIAL_LOG_INTERVAL);
+        }
+        if st.seen.len() < DENIAL_LOG_CAPACITY || st.seen.contains_key(&ip) {
+            st.seen.insert(ip, (now, 0));
+        }
+        drop(st);
         let (login, node, tags) = match lookup {
             Some(Ok(p)) => (
                 p.login_name.as_str(),
@@ -356,29 +397,41 @@ impl PeerIdentitySource for StaticIdentities {
 /// Decisions remembered per peer IP.
 #[derive(Debug, Default)]
 pub struct DecisionCache {
-    entries: HashMap<IpAddr, (Decision, Instant)>,
+    /// The decision, the lookup it came from (so a cached refusal can still
+    /// be logged with the peer's login), and its expiry.
+    entries: HashMap<IpAddr, (Decision, Option<PeerLookup>, Instant)>,
 }
 
 impl DecisionCache {
-    /// The cached decision for `ip`, if it has not expired at `now`.
-    pub fn get(&mut self, ip: IpAddr, now: Instant) -> Option<&Decision> {
-        if self.entries.get(&ip).is_some_and(|(_, exp)| now >= *exp) {
+    /// The cached decision for `ip`, and the lookup behind it, if it has
+    /// not expired at `now`.
+    pub fn get(&mut self, ip: IpAddr, now: Instant) -> Option<(&Decision, Option<&PeerLookup>)> {
+        if self.entries.get(&ip).is_some_and(|(_, _, exp)| now >= *exp) {
             self.entries.remove(&ip);
         }
-        self.entries.get(&ip).map(|(d, _)| d)
+        self.entries.get(&ip).map(|(d, l, _)| (d, l.as_ref()))
     }
 
     /// Remember `decision` for its TTL. Uncacheable decisions are dropped,
-    /// and replace nothing.
-    pub fn insert(&mut self, ip: IpAddr, decision: Decision, now: Instant) {
-        if let Some(ttl) = decision.ttl() {
-            // Expired entries are only dropped on lookup; sweep them here so
-            // a stream of one-off peers cannot grow the map without bound.
-            if self.entries.len() >= 1024 {
-                self.entries.retain(|_, (_, exp)| now < *exp);
+    /// and replace nothing. So is any decision once the cache is full of
+    /// live entries: not caching is always safe, it only costs a lookup.
+    pub fn insert(
+        &mut self,
+        ip: IpAddr,
+        decision: Decision,
+        lookup: Option<PeerLookup>,
+        now: Instant,
+    ) {
+        let Some(ttl) = decision.ttl() else {
+            return;
+        };
+        if self.entries.len() >= DECISION_CACHE_CAPACITY && !self.entries.contains_key(&ip) {
+            self.entries.retain(|_, (_, _, exp)| now < *exp);
+            if self.entries.len() >= DECISION_CACHE_CAPACITY {
+                return;
             }
-            self.entries.insert(ip, (decision, now + ttl));
         }
+        self.entries.insert(ip, (decision, lookup, now + ttl));
     }
 
     pub fn len(&self) -> usize {
@@ -398,6 +451,10 @@ pub enum GateCheck {
     /// A lookup is outstanding; the caller holds the connection until
     /// [`PeerGate::resolve`] is called for this IP.
     Pending,
+    /// A lookup is needed but there is no room for it (or for holding the
+    /// connection). The caller drops the Initial silently; nothing is
+    /// cached and the client retransmits.
+    Busy,
 }
 
 /// Admission state for the QUIC listener: the policy, an identity source,
@@ -480,13 +537,18 @@ impl PeerGate {
     }
 
     /// Decide about a new connection from `ip`.
-    pub fn check(&mut self, ip: IpAddr, now: Instant) -> GateCheck {
-        if let Some(d) = self.cache.get(ip, now) {
+    ///
+    /// `can_hold` says whether the caller has room to hold one more
+    /// connection for `ip` while a lookup runs. Without it, a peer that
+    /// must be looked up is `Busy` and no lookup is queued.
+    pub fn check(&mut self, ip: IpAddr, now: Instant, can_hold: bool) -> GateCheck {
+        if let Some((d, lookup)) = self.cache.get(ip, now) {
             return match d {
                 Decision::Allow(_) => GateCheck::Allow,
                 Decision::Deny(reason) => {
-                    let reason = reason.clone();
-                    self.denials.record(now, ip, "quic", None, &reason);
+                    let (reason, lookup) = (reason.clone(), lookup.cloned());
+                    self.denials
+                        .record(now, ip, "quic", lookup.as_ref(), &reason);
                     GateCheck::Deny
                 }
             };
@@ -504,9 +566,17 @@ impl PeerGate {
                 GateCheck::Deny
             };
         }
-        if self.in_flight.insert(ip) {
-            self.requested.push(ip);
+        if !can_hold {
+            return GateCheck::Busy;
         }
+        if self.in_flight.contains(&ip) {
+            return GateCheck::Pending;
+        }
+        if self.in_flight.len() >= MAX_LOOKUPS_IN_FLIGHT {
+            return GateCheck::Busy;
+        }
+        self.in_flight.insert(ip);
+        self.requested.push(ip);
         GateCheck::Pending
     }
 
@@ -529,7 +599,7 @@ impl PeerGate {
             self.denials.record(now, ip, "quic", Some(lookup), reason);
         }
         let allowed = decision.is_allowed();
-        self.cache.insert(ip, decision, now);
+        self.cache.insert(ip, decision, Some(lookup.clone()), now);
         allowed
     }
 }
@@ -731,8 +801,8 @@ mod tests {
         let ip: IpAddr = "100.64.0.2".parse().unwrap();
         let ip2: IpAddr = "100.64.0.3".parse().unwrap();
         let mut c = DecisionCache::default();
-        c.insert(ip, Decision::Allow(AllowReason::Owner), t0);
-        c.insert(ip2, Decision::Deny(DenyReason::UserNotAllowed), t0);
+        c.insert(ip, Decision::Allow(AllowReason::Owner), None, t0);
+        c.insert(ip2, Decision::Deny(DenyReason::UserNotAllowed), None, t0);
         assert!(c
             .get(ip, t0 + ALLOW_TTL - Duration::from_millis(1))
             .is_some());
@@ -749,7 +819,12 @@ mod tests {
         let t0 = Instant::now();
         let ip: IpAddr = "100.64.0.2".parse().unwrap();
         let mut c = DecisionCache::default();
-        c.insert(ip, Decision::Deny(DenyReason::LookupFailed("x".into())), t0);
+        c.insert(
+            ip,
+            Decision::Deny(DenyReason::LookupFailed("x".into())),
+            None,
+            t0,
+        );
         assert!(c.get(ip, t0).is_none());
     }
 
@@ -789,16 +864,19 @@ mod tests {
         let t0 = Instant::now();
         let ip: IpAddr = "100.64.0.2".parse().unwrap();
         let (mut g, _src) = gate(Ok(user(OWNER_ID, "o")), false);
-        assert_eq!(g.check(ip, t0), GateCheck::Pending);
-        assert_eq!(g.check(ip, t0), GateCheck::Pending);
+        assert_eq!(g.check(ip, t0, true), GateCheck::Pending);
+        assert_eq!(g.check(ip, t0, true), GateCheck::Pending);
         assert_eq!(g.take_requests(), vec![ip], "one lookup per IP in flight");
         assert!(g.take_requests().is_empty());
         assert!(g.is_pending(ip));
         assert!(g.resolve(ip, &Ok(user(OWNER_ID, "o")), t0));
         assert!(!g.is_pending(ip));
-        assert_eq!(g.check(ip, t0 + Duration::from_secs(1)), GateCheck::Allow);
+        assert_eq!(
+            g.check(ip, t0 + Duration::from_secs(1), true),
+            GateCheck::Allow
+        );
         // After the TTL it asks again.
-        assert_eq!(g.check(ip, t0 + ALLOW_TTL), GateCheck::Pending);
+        assert_eq!(g.check(ip, t0 + ALLOW_TTL, true), GateCheck::Pending);
     }
 
     #[test]
@@ -806,10 +884,13 @@ mod tests {
         let t0 = Instant::now();
         let ip: IpAddr = "100.64.0.9".parse().unwrap();
         let (mut g, _src) = gate(Ok(user(7, "m")), false);
-        assert_eq!(g.check(ip, t0), GateCheck::Pending);
+        assert_eq!(g.check(ip, t0, true), GateCheck::Pending);
         assert!(!g.resolve(ip, &Ok(user(7, "m")), t0));
-        assert_eq!(g.check(ip, t0 + Duration::from_secs(1)), GateCheck::Deny);
-        assert_eq!(g.check(ip, t0 + DENY_TTL), GateCheck::Pending);
+        assert_eq!(
+            g.check(ip, t0 + Duration::from_secs(1), true),
+            GateCheck::Deny
+        );
+        assert_eq!(g.check(ip, t0 + DENY_TTL, true), GateCheck::Pending);
     }
 
     #[test]
@@ -817,10 +898,10 @@ mod tests {
         let t0 = Instant::now();
         let ip: IpAddr = "100.64.0.9".parse().unwrap();
         let (mut g, _src) = gate(Err(WhoIsError::Failed("x".into())), false);
-        assert_eq!(g.check(ip, t0), GateCheck::Pending);
+        assert_eq!(g.check(ip, t0, true), GateCheck::Pending);
         g.take_requests();
         assert!(!g.resolve(ip, &Err(WhoIsError::Failed("x".into())), t0));
-        assert_eq!(g.check(ip, t0), GateCheck::Pending);
+        assert_eq!(g.check(ip, t0, true), GateCheck::Pending);
         assert_eq!(g.take_requests(), vec![ip]);
     }
 
@@ -829,8 +910,8 @@ mod tests {
         let t0 = Instant::now();
         let ip: IpAddr = "100.64.0.2".parse().unwrap();
         let (mut g, src) = gate(Ok(user(OWNER_ID, "o")), true);
-        assert_eq!(g.check(ip, t0), GateCheck::Allow);
-        assert_eq!(g.check(ip, t0), GateCheck::Allow);
+        assert_eq!(g.check(ip, t0, true), GateCheck::Allow);
+        assert_eq!(g.check(ip, t0, true), GateCheck::Allow);
         assert_eq!(
             *src.calls.lock().unwrap(),
             1,
@@ -839,14 +920,14 @@ mod tests {
         assert!(g.take_requests().is_empty());
 
         let (mut g, _) = gate(Err(WhoIsError::NotFound), true);
-        assert_eq!(g.check(ip, t0), GateCheck::Deny);
+        assert_eq!(g.check(ip, t0, true), GateCheck::Deny);
     }
 
     #[test]
     fn deny_all_gate_refuses_everyone() {
         let mut g = PeerGate::deny_all();
         assert_eq!(
-            g.check("100.64.0.2".parse().unwrap(), Instant::now()),
+            g.check("100.64.0.2".parse().unwrap(), Instant::now(), true),
             GateCheck::Deny
         );
         assert!(g.take_requests().is_empty());
@@ -856,7 +937,7 @@ mod tests {
     fn test_gate_admits_through_the_real_rule() {
         let mut g = PeerGate::single_owner_for_tests();
         assert_eq!(
-            g.check("127.0.0.1".parse().unwrap(), Instant::now()),
+            g.check("127.0.0.1".parse().unwrap(), Instant::now(), true),
             GateCheck::Allow
         );
         assert_eq!(
@@ -892,7 +973,98 @@ mod tests {
             let ip = IpAddr::from(std::net::Ipv4Addr::from(0x6440_0000 + i));
             log.record(t0, ip, "quic", None, &DenyReason::UnknownPeer);
         }
-        assert!(log.seen.lock().unwrap().len() <= DENIAL_LOG_CAPACITY);
+        assert!(log.state.lock().unwrap().seen.len() <= DENIAL_LOG_CAPACITY);
+    }
+
+    #[test]
+    fn a_gate_with_no_room_to_hold_queues_no_lookup() {
+        let t0 = Instant::now();
+        let ip: IpAddr = "100.64.0.2".parse().unwrap();
+        let (mut g, _) = gate(Ok(user(OWNER_ID, "o")), false);
+        assert_eq!(g.check(ip, t0, false), GateCheck::Busy);
+        assert!(g.take_requests().is_empty());
+        assert!(!g.is_pending(ip));
+        // A cached decision needs no room.
+        g.resolve(ip, &Ok(user(OWNER_ID, "o")), t0);
+        assert_eq!(g.check(ip, t0, false), GateCheck::Allow);
+    }
+
+    // A peer sending from many addresses (a subnet router) cannot start
+    // unbounded lookups.
+    #[test]
+    fn lookups_in_flight_are_capped() {
+        let t0 = Instant::now();
+        let (mut g, _) = gate(Ok(user(OWNER_ID, "o")), false);
+        let ip = |i: u32| IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+        for i in 0..MAX_LOOKUPS_IN_FLIGHT as u32 {
+            assert_eq!(g.check(ip(i), t0, true), GateCheck::Pending);
+        }
+        assert_eq!(g.check(ip(9999), t0, true), GateCheck::Busy);
+        assert_eq!(g.take_requests().len(), MAX_LOOKUPS_IN_FLIGHT);
+        // An IP already in flight is still Pending, not Busy.
+        assert_eq!(g.check(ip(0), t0, true), GateCheck::Pending);
+        // Resolving one frees a slot.
+        g.resolve(ip(0), &Err(WhoIsError::NotFound), t0);
+        assert_eq!(g.check(ip(9999), t0, true), GateCheck::Pending);
+    }
+
+    #[test]
+    fn decision_cache_is_bounded() {
+        let t0 = Instant::now();
+        let mut c = DecisionCache::default();
+        for i in 0..(DECISION_CACHE_CAPACITY as u32 + 100) {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+            c.insert(ip, Decision::Deny(DenyReason::UnknownPeer), None, t0);
+        }
+        assert_eq!(c.len(), DECISION_CACHE_CAPACITY);
+        // Once entries expire, room is made again.
+        let late: IpAddr = "100.64.9.9".parse().unwrap();
+        c.insert(
+            late,
+            Decision::Allow(AllowReason::Owner),
+            None,
+            t0 + DENY_TTL,
+        );
+        assert!(c.get(late, t0 + DENY_TTL).is_some());
+    }
+
+    // A cached refusal is still logged with who the peer was.
+    #[test]
+    fn cached_refusal_keeps_the_lookup() {
+        let t0 = Instant::now();
+        let ip: IpAddr = "100.64.0.9".parse().unwrap();
+        let (mut g, _) = gate(Ok(user(7, "m")), false);
+        g.check(ip, t0, true);
+        g.resolve(ip, &Ok(user(7, "mallory@example.com")), t0);
+        let (_, lookup) = g.cache.get(ip, t0).expect("cached");
+        assert_eq!(
+            lookup.unwrap().as_ref().unwrap().login_name,
+            "mallory@example.com"
+        );
+    }
+
+    #[test]
+    fn denial_log_has_a_global_budget() {
+        let t0 = Instant::now();
+        let log = DenialLog::new();
+        let logged = (0..(DENIAL_LOG_GLOBAL_BUDGET + 50))
+            .filter(|i| {
+                let ip = IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+                log.record(t0, ip, "quic", None, &DenyReason::UnknownPeer)
+            })
+            .count();
+        assert_eq!(logged, DENIAL_LOG_GLOBAL_BUDGET as usize);
+        assert_eq!(log.state.lock().unwrap().over_budget, 50);
+        // The next interval logs again (and summarises the overflow).
+        let ip = IpAddr::from(std::net::Ipv4Addr::from(0x0b00_0000));
+        assert!(log.record(
+            t0 + DENIAL_LOG_INTERVAL,
+            ip,
+            "quic",
+            None,
+            &DenyReason::UnknownPeer
+        ));
+        assert_eq!(log.state.lock().unwrap().over_budget, 0);
     }
 
     // ---- web ----

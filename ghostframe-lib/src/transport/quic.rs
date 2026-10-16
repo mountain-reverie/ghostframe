@@ -494,7 +494,12 @@ impl QuicServer {
         server_config.transport = Arc::new(transport_config);
         server_config
             .incoming_buffer_size(INCOMING_BUFFER_PER_CONNECTION)
-            .incoming_buffer_size_total(INCOMING_BUFFER_TOTAL);
+            .incoming_buffer_size_total(INCOMING_BUFFER_TOTAL)
+            // A connection is admitted for the peer at its source address
+            // (see `transport::peer_auth`), so it stays on that address. A
+            // tailnet peer's address does not change under a live session:
+            // WireGuard absorbs the underlying network moving.
+            .migration(false);
 
         // --- 7. Endpoint ---
         let endpoint = Endpoint::new(
@@ -573,20 +578,35 @@ impl QuicServer {
         out
     }
 
-    /// Hold an Initial until its peer's lookup resolves, within bounds.
-    fn hold(&mut self, ip: IpAddr, incoming: Incoming) {
-        let total = self.held_incoming_count();
+    /// Whether one more Initial from `ip` may be held for a lookup.
+    fn can_hold(&self, ip: IpAddr) -> bool {
         let for_peer = self.held_incoming.get(&ip).map_or(0, Vec::len);
-        if total >= MAX_HELD_INCOMING || for_peer >= MAX_HELD_INCOMING_PER_PEER {
-            self.held_overflow = self.held_overflow.saturating_add(1);
-            if self.held_overflow == 1 || self.held_overflow.is_multiple_of(64) {
-                tracing::warn!(
-                    peer = %ip,
-                    held = total,
-                    total = self.held_overflow,
-                    "too many connections awaiting an identity lookup; dropping (rate-limited)"
-                );
-            }
+        self.held_incoming_count() < MAX_HELD_INCOMING && for_peer < MAX_HELD_INCOMING_PER_PEER
+    }
+
+    fn note_held_overflow(&mut self, ip: IpAddr) {
+        self.held_overflow = self.held_overflow.saturating_add(1);
+        if self.held_overflow == 1 || self.held_overflow.is_multiple_of(64) {
+            tracing::warn!(
+                peer = %ip,
+                held = self.held_incoming_count(),
+                total = self.held_overflow,
+                "too many connections awaiting an identity lookup; dropping (rate-limited)"
+            );
+        }
+    }
+
+    /// Initials dropped because no more could be held for a lookup.
+    pub fn held_overflow(&self) -> u64 {
+        self.held_overflow
+    }
+
+    /// Hold an Initial until its peer's lookup resolves. The gate only says
+    /// `Pending` when [`Self::can_hold`] was true; the check is repeated so
+    /// the bound holds even if that ever changes.
+    fn hold(&mut self, ip: IpAddr, incoming: Incoming) {
+        if !self.can_hold(ip) {
+            self.note_held_overflow(ip);
             self.endpoint.ignore(incoming);
             return;
         }
@@ -682,11 +702,17 @@ impl QuicServer {
                 // the connection and long before it could send HELLO. A
                 // refused peer never gets a `Connection`.
                 let ip = incoming.remote_address().ip();
-                match self.peer_gate.check(ip, now) {
+                let can_hold = self.can_hold(ip);
+                match self.peer_gate.check(ip, now, can_hold) {
                     GateCheck::Allow => self.admit(incoming, now, buf),
                     GateCheck::Deny => Some(self.endpoint.refuse(incoming, buf)),
                     GateCheck::Pending => {
                         self.hold(ip, incoming);
+                        None
+                    }
+                    GateCheck::Busy => {
+                        self.note_held_overflow(ip);
+                        self.endpoint.ignore(incoming);
                         None
                     }
                 }

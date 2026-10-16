@@ -273,3 +273,57 @@ func TestMiddlewareAdmittedPeerIsServed(t *testing.T) {
 		t.Fatalf("status %d body %q, want 200 with the hash", code, body)
 	}
 }
+
+// Both listeners -- the SPA and /config.json on :443, the redirect and
+// /config.json on :80 -- refuse a peer the authorizer refuses, and every
+// peer when none is registered. Holds under both build tags.
+func TestBothWebListenersRefuseDisallowedPeers(t *testing.T) {
+	who := &fakeWhoiser{resp: &apitype.WhoIsResponse{Node: &tailcfg.Node{User: 1}}}
+	denying := &authorizerSlot{}
+	denying.set(&recordingAuthorizer{verdict: false})
+	for name, slot := range map[string]*authorizerSlot{"none registered": {}, "denied": denying} {
+		tlsH, redirH := newWebHandlers(newCertHashStore(testHash), who, slot)
+		for label, h := range map[string]http.Handler{":443": tlsH, ":80": redirH} {
+			for _, path := range []string{"/config.json", "/", "/index.html"} {
+				srv := httptest.NewServer(h)
+				resp, err := http.Get(srv.URL + path)
+				if err != nil {
+					t.Fatalf("GET: %v", err)
+				}
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				srv.Close()
+				if resp.StatusCode != http.StatusForbidden || strings.Contains(string(body), testHash) {
+					t.Errorf("%s, %s %s: status %d, want a bare 403", name, label, path, resp.StatusCode)
+				}
+			}
+		}
+	}
+}
+
+// An identity field that cannot cross to Rust intact fails the lookup on
+// the web path too, not only in the record gbridge_whois writes.
+func TestLookupPeerRejectsFieldsThatCannotCrossIntact(t *testing.T) {
+	for _, resp := range []*apitype.WhoIsResponse{
+		{Node: &tailcfg.Node{User: 1}, UserProfile: &tailcfg.UserProfile{LoginName: "alice@x\x00evil"}},
+		{Node: &tailcfg.Node{User: 1, Tags: []string{"tag:a,tag:b"}}},
+		{Node: &tailcfg.Node{User: 1, Tags: []string{"tag:\xff"}}},
+	} {
+		if _, st := lookupPeer(&fakeWhoiser{resp: resp}, "x"); st != gbridgeWhoisStatusFailed {
+			t.Errorf("%+v: status %d, want failed", resp.Node, st)
+		}
+	}
+}
+
+func TestRateLimitedLogSuppressesWithinInterval(t *testing.T) {
+	l := &rateLimitedLog{interval: time.Hour}
+	if !l.printf("first") {
+		t.Fatal("first line must print")
+	}
+	if l.printf("second") || l.printf("third") {
+		t.Fatal("lines within the interval must be suppressed")
+	}
+	if l.suppressed != 2 {
+		t.Fatalf("suppressed = %d, want 2", l.suppressed)
+	}
+}
