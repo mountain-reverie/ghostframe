@@ -406,8 +406,8 @@ impl IoBridge {
                      retiring content the normal way — check ledger_unknown_acks."
                 );
                 self.force_dirty_frames = self.force_dirty_frames.max(2);
-                if let Some(p) = self.gpu_frame_processor.as_mut() {
-                    p.invalidate_baseline(2);
+                if let Some(b) = self.frame_backend.as_mut() {
+                    b.apply(Control::InvalidateBaseline(2));
                 }
             }
         }

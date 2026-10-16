@@ -55,7 +55,7 @@ impl IoBridge {
             BaseDiffs {
                 handle: None,
                 local_addr,
-                gpu_frame_processor: None,
+                frame_backend: None,
             },
         )
     }
@@ -64,7 +64,14 @@ impl IoBridge {
     /// bridge so `process_frame` takes the production GPU path.
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn set_gpu_frame_processor_for_measurement(&mut self, p: GpuFrameProcessor) {
-        self.gpu_frame_processor = Some(p);
+        self.frame_backend = Some(Box::new(GpuBackend::new(p)));
+    }
+
+    /// Install a frame backend (a fake with controllable latency, or a
+    /// recording one) in place of the GPU one.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn set_frame_backend(&mut self, backend: Box<dyn FrameBackend>) {
+        self.frame_backend = Some(backend);
     }
 
     /// Frame-carrying variant of the test constructor, accepting a pre-built
