@@ -60,6 +60,13 @@ impl IoBridge {
         )
     }
 
+    /// WS-C2 MEASUREMENT ONLY: install a real GPU frame processor on a test
+    /// bridge so `process_frame` takes the production GPU path.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn set_gpu_frame_processor_for_measurement(&mut self, p: GpuFrameProcessor) {
+        self.gpu_frame_processor = Some(p);
+    }
+
     /// Frame-carrying variant of the test constructor, accepting a pre-built
     /// stream, server, and frame channel. Delegates to `new_with_stream_for_test`
     /// and adds frame injection support.
