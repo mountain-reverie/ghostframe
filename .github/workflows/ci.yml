@@ -91,6 +91,8 @@ jobs:
       # job cannot drift apart. The rule and its exemptions are documented there.
       - name: crates read env only in config.rs
         run: ci/check-env-reads.sh
+      - name: no home-directory paths in tracked files
+        run: ci/check-local-paths.sh
 
   unit:
     name: unit
