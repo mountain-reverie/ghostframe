@@ -5738,3 +5738,129 @@ fn e2e_cdf53_real_capture_roundtrip_exact() {
         first_failures.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tailnet peer access (transport::peer_auth)
+//
+// Being on the tailnet is not enough: by default only peers of the user who
+// owns the server node may connect. These tests need no browser. They look at
+// the two doors a peer can knock on -- the web server (which hands out the
+// certificate hash) and the QUIC listener -- from a test node of the owner's
+// user and from one of another user.
+// ---------------------------------------------------------------------------
+
+/// What one test node saw at both doors.
+struct PeerAccessProbe {
+    config_status: u16,
+    config_body: String,
+    spa_status: u16,
+    quic: helpers::tailnet_probe::QuicOutcome,
+    server_logs: String,
+}
+
+async fn probe_peer_access(
+    client_user: &str,
+    extra_env: &[(&str, &str)],
+) -> Result<PeerAccessProbe> {
+    use helpers::tailnet_probe::{cert_hash_from_config, http_get, quic_handshake};
+
+    let setup = helpers::setup_e2e_server_as(
+        helpers::E2eServerSpec {
+            test_pattern_args: "--solid-red",
+            extra_env,
+            gpu: false,
+            webgpu: false,
+            url_query_extra: "",
+        },
+        client_user,
+    )
+    .await?;
+    let node = setup._test_node.clone();
+    let host = setup.server_container_name.clone();
+    let (config_status, config_body, spa_status, quic) =
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            let (config_status, config_body) = http_get(&node, &host, "/config.json")?;
+            let (spa_status, _) = http_get(&node, &host, "/")?;
+            // An admitted peer pins the real hash. A refused one has none to
+            // pin, and does not need one: the refusal precedes TLS.
+            let pin = if config_status == 200 {
+                cert_hash_from_config(&config_body)?
+            } else {
+                [0u8; 32]
+            };
+            let quic = quic_handshake(&node, &host, pin, Duration::from_secs(30))?;
+            Ok((config_status, config_body, spa_status, quic))
+        })
+        .await??;
+    let server_logs = helpers::read_server_logs_stripped(&setup.server_container_name);
+    Ok(PeerAccessProbe {
+        config_status,
+        config_body,
+        spa_status,
+        quic,
+        server_logs,
+    })
+}
+
+#[tokio::test]
+async fn e2e_tailnet_peer_of_the_owner_is_admitted() -> Result<()> {
+    use helpers::tailnet_probe::QuicOutcome;
+    let p = probe_peer_access(helpers::SERVER_HEADSCALE_USER, &[]).await?;
+    assert_eq!(p.config_status, 200, "body: {}", p.config_body);
+    assert!(p.config_body.contains("certHash"));
+    // :80 redirects everything but /config.json; a redirect is "served".
+    assert_eq!(p.spa_status, 301);
+    assert_eq!(p.quic, QuicOutcome::Connected);
+    assert!(
+        p.server_logs
+            .contains("admitting peers of this node's owner"),
+        "startup must name the policy"
+    );
+    assert!(!p.server_logs.contains("refused tailnet peer"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn e2e_tailnet_peer_of_another_user_is_refused() -> Result<()> {
+    use helpers::tailnet_probe::QuicOutcome;
+    let p = probe_peer_access("e2e-intruder", &[]).await?;
+    assert_eq!(p.config_status, 403, "body: {}", p.config_body);
+    assert!(
+        !p.config_body.contains("certHash"),
+        "a refused peer must not get the cert hash"
+    );
+    assert_eq!(p.spa_status, 403);
+    match &p.quic {
+        QuicOutcome::Lost(reason) => assert!(
+            reason.contains("refused"),
+            "QUIC must be refused, not fail some other way: {reason}"
+        ),
+        other => panic!("QUIC must be refused, got {other:?}"),
+    }
+    assert!(
+        p.server_logs.contains("refused tailnet peer"),
+        "the refusal must be logged"
+    );
+    assert!(
+        !p.server_logs.contains("new QUIC connection accepted"),
+        "no connection may exist for a refused peer"
+    );
+    Ok(())
+}
+
+/// The headscale login name of a CLI-created user, as WhoIs reports it.
+const E2E_GUEST_LOGIN: &str = "e2e-guest";
+
+#[tokio::test]
+async fn e2e_tailnet_listed_user_is_admitted() -> Result<()> {
+    use helpers::tailnet_probe::QuicOutcome;
+    let p = probe_peer_access(
+        E2E_GUEST_LOGIN,
+        &[("GHOSTFRAME_ALLOWED_USERS", E2E_GUEST_LOGIN)],
+    )
+    .await?;
+    assert_eq!(p.config_status, 200, "body: {}", p.config_body);
+    assert_eq!(p.quic, QuicOutcome::Connected);
+    assert!(!p.server_logs.contains("refused tailnet peer"));
+    Ok(())
+}

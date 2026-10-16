@@ -118,6 +118,21 @@ pub struct E2eServerSpec<'a> {
 /// compositor with XWayland. Returns the assembled `E2eServerSetup` plus
 /// the chosen `page_url`. Does NOT launch a browser.
 pub async fn setup_e2e_server(spec: E2eServerSpec<'_>) -> Result<E2eServerSetup> {
+    setup_e2e_server_as(spec, SERVER_HEADSCALE_USER).await
+}
+
+/// The headscale user the server registers under. It owns the server node,
+/// so by default only test nodes of this same user are admitted (see
+/// `ghostframe_lib::transport::peer_auth`).
+pub const SERVER_HEADSCALE_USER: &str = "ghostframe";
+
+/// [`setup_e2e_server`], with the test client node registered under
+/// `client_user` instead of the server's own user. A different user is a
+/// different tailnet identity, which is what the peer-access tests need.
+pub async fn setup_e2e_server_as(
+    spec: E2eServerSpec<'_>,
+    client_user: &str,
+) -> Result<E2eServerSetup> {
     crate::harness::cleanup::cleanup_stale_xvfb_sockets();
     let hs_server_url = format!("http://{DOCKER_HOST_IP}:{HEADSCALE_HOST_PORT}");
 
@@ -135,8 +150,8 @@ pub async fn setup_e2e_server(spec: E2eServerSpec<'_>) -> Result<E2eServerSetup>
             .await
             .context("start headscale container")?;
 
-    let server_key = create_preauth_key("headscale", "ghostframe").await?;
-    let client_key = create_preauth_key("headscale", "ghostframe").await?;
+    let server_key = create_preauth_key("headscale", SERVER_HEADSCALE_USER).await?;
+    let client_key = create_preauth_key("headscale", client_user).await?;
 
     let e2e_cert = generate_cert(&["localhost", "127.0.0.1"])?;
 
