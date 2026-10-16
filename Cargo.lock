@@ -1906,7 +1906,6 @@ dependencies = [
  "goog_cc",
  "hex",
  "libc",
- "lz4_flex",
  "proptest",
  "quinn-proto",
  "rayon",
@@ -1928,7 +1927,6 @@ dependencies = [
 name = "ghostframe-protocol"
 version = "0.1.0"
 dependencies = [
- "lz4_flex",
  "proptest",
  "smallvec",
  "thiserror 2.0.18",
