@@ -170,7 +170,10 @@ impl GpuFrameProcessor {
             ash::ext::external_memory_dma_buf::NAME,
         ];
 
-        let mut chosen = None;
+        // Describe each device, then choose with `choose_device`, which holds
+        // the policy: DMA-BUF import is required, and a software rasteriser
+        // (llvmpipe, SwiftShader: `PhysicalDeviceType::CPU`) is not a GPU.
+        let mut candidates = Vec::with_capacity(phys_devices.len());
         for &pdev in &phys_devices {
             let supported = instance.enumerate_device_extension_properties(pdev)?;
             let has_all = required_device_exts.iter().all(|req| {
@@ -178,14 +181,22 @@ impl GpuFrameProcessor {
                     .iter()
                     .any(|ext| CStr::from_ptr(ext.extension_name.as_ptr()) == *req)
             });
-            if has_all {
-                chosen = Some(pdev);
-                break;
-            }
+            let props = instance.get_physical_device_properties(pdev);
+            candidates.push(DeviceCandidate {
+                name: CStr::from_ptr(props.device_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned(),
+                device_type: props.device_type,
+                has_dmabuf_import: has_all,
+            });
         }
-
-        let physical_device =
-            chosen.ok_or("no Vulkan device supports DMA-BUF import extensions")?;
+        let chosen_idx = choose_device(&candidates)?;
+        let physical_device = phys_devices[chosen_idx];
+        tracing::info!(
+            device = %candidates[chosen_idx].name,
+            device_type = ?candidates[chosen_idx].device_type,
+            "selected Vulkan device"
+        );
 
         // --- Queue family: prefer COMPUTE-only, fall back to GRAPHICS|COMPUTE ---
         let queue_families = instance.get_physical_device_queue_family_properties(physical_device);
@@ -1076,5 +1087,124 @@ mod pool_tests {
         assert!(POOL_STORAGE_IMAGES >= POOL_NEED.0);
         assert!(POOL_STORAGE_BUFFERS >= POOL_NEED.1);
         assert!(POOL_MAX_SETS >= POOL_NEED.2);
+    }
+}
+
+/// What the device-selection policy needs to know about one Vulkan device.
+#[derive(Debug, Clone)]
+pub(super) struct DeviceCandidate {
+    pub name: String,
+    pub device_type: vk::PhysicalDeviceType,
+    /// Has `VK_KHR_external_memory_fd` and `VK_EXT_external_memory_dma_buf`.
+    pub has_dmabuf_import: bool,
+}
+
+/// Pick the device to run on, or say why there is none.
+///
+/// The first device that can import DMA-BUFs and is not a software
+/// rasteriser. A `PhysicalDeviceType::CPU` device (llvmpipe, SwiftShader) is
+/// refused even if it advertises the extensions: the server has no software
+/// path by decision, and a CPU Vulkan device would be one at runtime, silently.
+/// The error names what was found, so a host with only llvmpipe says so.
+pub(super) fn choose_device(candidates: &[DeviceCandidate]) -> Result<usize, String> {
+    if let Some(i) = candidates
+        .iter()
+        .position(|c| c.has_dmabuf_import && c.device_type != vk::PhysicalDeviceType::CPU)
+    {
+        return Ok(i);
+    }
+    // Test builds only: a software device is the last resort when there is no
+    // real GPU. The literal below is what ci-local greps the release binary for
+    // (it must not be there) and the test-server image build greps for (it must).
+    #[cfg(feature = "allow-software-vulkan")]
+    if let Some(i) = candidates
+        .iter()
+        .position(|c| c.has_dmabuf_import && c.device_type == vk::PhysicalDeviceType::CPU)
+    {
+        tracing::warn!(
+            device = %candidates[i].name,
+            "software Vulkan permitted (test build)"
+        );
+        return Ok(i);
+    }
+    let software: Vec<&str> = candidates
+        .iter()
+        .filter(|c| c.device_type == vk::PhysicalDeviceType::CPU)
+        .map(|c| c.name.as_str())
+        .collect();
+    if !software.is_empty() {
+        return Err(format!(
+            "only a software Vulkan device was found ({}); a real GPU is required",
+            software.join(", ")
+        ));
+    }
+    let found: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+    Err(format!(
+        "no Vulkan device supports DMA-BUF import (found: {})",
+        found.join(", ")
+    ))
+}
+
+#[cfg(test)]
+mod choose_device_tests {
+    use super::*;
+
+    fn dev(name: &str, ty: vk::PhysicalDeviceType, dmabuf: bool) -> DeviceCandidate {
+        DeviceCandidate {
+            name: name.into(),
+            device_type: ty,
+            has_dmabuf_import: dmabuf,
+        }
+    }
+    const GPU: vk::PhysicalDeviceType = vk::PhysicalDeviceType::DISCRETE_GPU;
+    const CPU: vk::PhysicalDeviceType = vk::PhysicalDeviceType::CPU;
+
+    #[test]
+    fn a_real_gpu_with_dmabuf_import_is_chosen() {
+        assert_eq!(choose_device(&[dev("RX 480", GPU, true)]), Ok(0));
+    }
+
+    /// The case that mattered: llvmpipe advertises the DMA-BUF extensions, so
+    /// without a type check it would be taken as the GPU.
+    #[cfg(not(feature = "allow-software-vulkan"))]
+    #[test]
+    fn llvmpipe_is_refused_even_though_it_has_the_extensions() {
+        let err = choose_device(&[dev("llvmpipe (LLVM 20.1.2, 256 bits)", CPU, true)])
+            .expect_err("a CPU device must not be chosen");
+        assert!(err.contains("software"), "{err}");
+        assert!(
+            err.contains("llvmpipe"),
+            "the error names the device: {err}"
+        );
+    }
+
+    /// With the test-build feature a software device is the last resort, and a
+    /// real GPU is still preferred.
+    #[cfg(feature = "allow-software-vulkan")]
+    #[test]
+    fn llvmpipe_is_accepted_only_as_a_last_resort() {
+        assert_eq!(
+            choose_device(&[dev("llvmpipe (LLVM 20.1.2, 256 bits)", CPU, true)]),
+            Ok(0)
+        );
+        assert_eq!(
+            choose_device(&[dev("llvmpipe", CPU, true), dev("RX 480", GPU, true)]),
+            Ok(1)
+        );
+        // Still needs the DMA-BUF extensions.
+        assert!(choose_device(&[dev("llvmpipe", CPU, false)]).is_err());
+    }
+
+    #[test]
+    fn a_real_gpu_is_preferred_over_an_earlier_software_device() {
+        let c = [dev("llvmpipe", CPU, true), dev("RX 480", GPU, true)];
+        assert_eq!(choose_device(&c), Ok(1));
+    }
+
+    #[test]
+    fn a_gpu_without_dmabuf_import_is_not_chosen() {
+        let err = choose_device(&[dev("old gpu", GPU, false)]).expect_err("no import");
+        assert!(err.contains("DMA-BUF"), "{err}");
+        assert!(err.contains("old gpu"), "{err}");
     }
 }

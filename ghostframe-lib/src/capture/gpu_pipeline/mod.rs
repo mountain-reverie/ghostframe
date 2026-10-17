@@ -62,8 +62,9 @@ pub(crate) const MAX_ESCALATION_PER_FRAME: usize = 512;
 /// The most tiles one frame may have, which sizes the processor's buffers
 /// (about 13 KB of host memory per tile, 200 MB at this value). It must cover
 /// the largest screen the server is asked to serve: one 4K screen is 8160
-/// tiles and two side by side 16320. A frame above it fails every time, so this
-/// is a ceiling to raise deliberately, not a default to forget.
+/// tiles and two side by side 16320. A frame above it fails every time, and
+/// with no software path a failing frame is a frozen screen, so this is a
+/// ceiling to raise deliberately, not a default to forget.
 pub(crate) const MAX_FRAME_TILES: u32 = 16_384;
 
 // ---------------------------------------------------------------------------

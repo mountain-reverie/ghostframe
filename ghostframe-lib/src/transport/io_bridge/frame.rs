@@ -3,7 +3,7 @@
 //!
 //! Owns, as logic over `IoBridge` fields that stay in `io_bridge.rs`:
 //! - the entry point `process_frame` and its two pipelines, the CPU tile path
-//!   (`process_frame_cpu`) and the GPU path (`process_frame_gpu`, kept whole);
+//!   (test-only `process_frame_cpu`) and the GPU path (`process_frame_gpu`, kept whole);
 //! - the stranded-tile re-enqueue helpers (`stranded_reenqueue`,
 //!   `detect_stranded_cdf53_tiles`);
 //! - the PalRle phases (`phase_a_palette_allocation`, `phase_b_encode_payloads`,
@@ -39,6 +39,13 @@ impl Cdf53Source {
 /// Clamp a GPU-written compact-list count to the number of tiles on the grid,
 /// the most entries the list can legitimately hold. A buggy shader or a
 /// device fault must not turn the count into an out-of-bounds slice length.
+/// Whether to log the `n`th consecutive GPU failure: the first, then each
+/// power of two, so a failure that repeats every frame logs about once per
+/// doubling instead of at frame rate.
+pub(crate) fn log_gpu_failure(n: u32) -> bool {
+    n.is_power_of_two()
+}
+
 pub(crate) fn clamp_gpu_tile_count(raw: u32, tiles: usize) -> usize {
     (raw as usize).min(tiles)
 }
@@ -264,8 +271,10 @@ impl IoBridge {
         let has_gpu_input = frame.dmabuf_fd.is_some() || !frame.pixels.is_empty();
         let path = if has_gpu_input && self.frame_pipeline.is_some() {
             "gpu"
+        } else if cfg!(test) {
+            "test-cpu"
         } else {
-            "cpu"
+            "none"
         };
         // Deliberately the real wall clock, not `now_std()`: this measures
         // how long the loop actually spent inside `process_frame` (for a GPU
@@ -287,7 +296,16 @@ impl IoBridge {
         if has_gpu_input && self.frame_pipeline.is_some() {
             self.begin_gpu_frame(frame);
         } else {
+            // No GPU backend: the server refuses to start without one, so this
+            // is unreachable in production. Unit tests build bridges without a
+            // backend and drive the CDF 5/3 route below.
+            #[cfg(test)]
             self.process_frame_cpu(frame);
+            #[cfg(not(test))]
+            tracing::error!(
+                target: LOG_TARGET,
+                "frame dropped: no GPU frame backend (startup requires one)"
+            );
         }
         #[allow(
             clippy::disallowed_methods,
@@ -311,7 +329,9 @@ impl IoBridge {
         self.diagnostics.dump_frame_path.take()
     }
 
-    /// CPU-side tile-based pipeline (original implementation).
+    /// Test-only CDF 5/3 route for bridges built without a GPU backend. Not a
+    /// runtime path: production has no software encoder.
+    #[cfg(test)]
     fn process_frame_cpu(&mut self, frame: FrameSubmission) {
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let seq = self.frame_seq;
@@ -319,8 +339,8 @@ impl IoBridge {
     }
 
     /// The CPU pipeline for a frame whose sequence number is already
-    /// assigned. `emit_dimensions` is false when the caller (the GPU path
-    /// falling back) has already announced this frame's dimensions.
+    /// assigned.
+    #[cfg(test)]
     fn process_frame_cpu_at(&mut self, frame: FrameSubmission, seq: u32, emit_dimensions: bool) {
         let grid = TileGrid::new(frame.width, frame.height);
 
@@ -442,7 +462,7 @@ impl IoBridge {
                 timestamp_us: frame.timestamp_us,
             },
             max_frag,
-            SchedulerEmissionPolicy::CpuRawOnly,
+            SchedulerEmissionPolicy::TestCdf53All,
             None,
         );
 
@@ -725,48 +745,6 @@ impl IoBridge {
         out
     }
 
-    /// Hand a frame to the CPU pipeline after the GPU processor failed on it.
-    ///
-    /// `seq` is the number `begin_gpu_frame` already assigned. The frame's
-    /// dimensions are announced only once its analysis has been accepted, so a
-    /// failed analysis has not announced them: pass `emit_dimensions`. A frame that
-    /// arrived as a DMA-BUF alone has no CPU pixels, and the CPU pipeline would
-    /// read an empty buffer as black and send black tiles for the whole
-    /// screen. Such a frame is read back from the DMA-BUF first (the same
-    /// readback the tile-codec path uses), so a failure that repeats every
-    /// frame degrades to the CPU pipeline instead of freezing the stream. If
-    /// the readback fails too, the frame is dropped rather than sent black.
-    pub(super) fn fall_back_to_cpu_after_gpu_error(
-        &mut self,
-        mut frame: FrameSubmission,
-        seq: u32,
-        emit_dimensions: bool,
-    ) {
-        if frame.pixels.is_empty() {
-            let readback = frame.dmabuf_fd.as_ref().map(|fd| {
-                crate::capture::dmabuf::readback_dmabuf(
-                    fd.as_raw_fd(),
-                    frame.width,
-                    frame.height,
-                    frame.stride,
-                )
-            });
-            match readback {
-                Some(Ok(pixels)) => frame.pixels = pixels.to_vec(),
-                _ => {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        seq,
-                        "GPU process_frame failed and the DMA-BUF could not be read back; \
-                         skipping the frame to avoid emitting zero-filled tiles",
-                    );
-                    return;
-                }
-            }
-        }
-        self.process_frame_cpu_at(frame, seq, emit_dimensions);
-    }
-
     /// GPU-accelerated full-frame pipeline: Vulkan compute dirty detection +
     /// VA-API VPP BGRA→NV12 conversion + H.264 encoding (true zero-copy).
     ///
@@ -935,13 +913,26 @@ impl IoBridge {
                 analysed,
                 worker_us,
                 ..
-            } => self.on_analysed(inflight, *analysed, worker_us),
-            FromWorker::AnalyseFailed { error, frame, .. } => {
+            } => {
+                self.gpu_analyse_failures = 0;
+                self.on_analysed(inflight, *analysed, worker_us)
+            }
+            FromWorker::AnalyseFailed { error, .. } => {
                 if inflight.epoch != self.session_epoch {
                     return;
                 }
-                tracing::warn!(target: LOG_TARGET, "GPU process_frame failed: {error}, falling back to CPU path");
-                self.fall_back_to_cpu_after_gpu_error(*frame, inflight.seq, true);
+                // No software path: a frame the GPU cannot analyse is dropped.
+                // The next frame re-reports its dirty tiles against the same
+                // baseline, so nothing is lost for good.
+                self.gpu_analyse_failures = self.gpu_analyse_failures.saturating_add(1);
+                if log_gpu_failure(self.gpu_analyse_failures) {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        seq,
+                        consecutive = self.gpu_analyse_failures,
+                        "GPU process_frame failed, frame skipped: {error}"
+                    );
+                }
             }
             FromWorker::H264Done { out, worker_us, .. } => {
                 self.on_h264_done(inflight, out, worker_us)

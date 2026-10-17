@@ -15,7 +15,7 @@
 use std::future::{pending, Future};
 use std::io;
 use std::net::SocketAddr;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::FromRawFd;
 use std::pin::Pin;
 
 use bytes::BytesMut;
@@ -456,6 +456,9 @@ pub struct IoBridge {
     /// QUIC slow-start can only deliver a fraction of tiles in the first burst;
     /// forcing dirty for several frames lets the congestion window open.
     force_dirty_frames: u32,
+    /// Consecutive frames the GPU backend failed to analyse; reset on success.
+    /// Only used to keep the warning from flooding the journal.
+    gpu_analyse_failures: u32,
     /// Ticks since startup, for `STUCK_SWEEP_EVERY_TICKS`.
     stuck_sweep_counter: u32,
     /// Byte allowance for RTO and NACK replay. See `retransmit_pacer`.
@@ -984,15 +987,51 @@ pub(crate) struct TileDispatchFrame<'a> {
     pub timestamp_us: u32,
 }
 
+/// Turn the GPU processor's init result into the production backend, or a
+/// startup error. The server has no software tile path (the owner's decision:
+/// a software path would be an explicit future project), so a host without a
+/// usable Vulkan compute device cannot run it, and it says so here rather than
+/// starting up and dropping every frame.
+fn require_gpu_backend<E: std::fmt::Display>(
+    init: Result<GpuFrameProcessor, E>,
+) -> Result<Box<dyn FrameBackend>, io::Error> {
+    match init {
+        Ok(p) => Ok(Box::new(GpuBackend::new(p))),
+        Err(e) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "no usable GPU: the server needs a Vulkan compute device and has no \
+                 software path ({e})"
+            ),
+        )),
+    }
+}
+
 /// Selects how `dispatch_dirty_tiles_via_scheduler` picks a codec per tile.
 pub(crate) enum SchedulerEmissionPolicy {
-    /// CPU path: no classifier, so every dirty tile is sent as CDF 5/3. (The
-    /// name is from when this emitted Raw; the next change removes the policy.)
-    CpuRawOnly,
+    /// Test scaffolding, absent from production builds: no classifier, so every
+    /// dirty tile is sent as CDF 5/3 (the CPU transform stands in for the GPU
+    /// one). There is no software path at runtime.
+    #[cfg(test)]
+    TestCdf53All,
     /// GPU path: per-tile `CodecState` drives codec choice. `Solid` →
     /// `encode_solid`, `PalRle` → its prepared payload, everything else →
     /// CDF 5/3.
     GpuClassifierDriven,
+}
+
+impl SchedulerEmissionPolicy {
+    /// The test-only route, which bypasses budgeting and sends everything.
+    fn is_test_route(&self) -> bool {
+        #[cfg(test)]
+        {
+            matches!(self, Self::TestCdf53All)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
 }
 
 /// Validate a frame header and return how many bytes follow it.
@@ -1103,6 +1142,7 @@ impl IoBridge {
             tick_budget_floor_bytes: None,
             last_max_datagram_size: None,
             force_dirty_frames: 0,
+            gpu_analyse_failures: 0,
             stuck_sweep_counter: 0,
             retransmit_pacer: crate::transport::retransmit_pacer::RetransmitPacer::new(),
             #[cfg(test)]
@@ -1250,6 +1290,12 @@ impl IoBridge {
         listen_addr: &str,
         lib_config: crate::config::LibConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // First, before the tailnet join: a host with no usable GPU must not
+        // register a node, log "ready", and then exit.
+        let frame_backend = Some(require_gpu_backend(GpuFrameProcessor::new(
+            crate::capture::gpu_pipeline::MAX_FRAME_TILES,
+        ))?);
+        tracing::info!("GPU frame processor initialized (Vulkan compute)");
         let handle = GhostbridgeHandle::connect(ghostbridge_config)?;
         handle.up()?;
         let ips = handle.get_ips()?;
@@ -1304,13 +1350,6 @@ impl IoBridge {
         // local_addr is the tailnet-rooted socket we bound; quinn-proto uses
         // its IP as the `local_ip` hint for inbound packets.
         let local_addr = SocketAddr::new(bind_ip, port);
-
-        let frame_backend = GpuFrameProcessor::new(crate::capture::gpu_pipeline::MAX_FRAME_TILES)
-            .ok()
-            .map(|p| Box::new(GpuBackend::new(p)) as Box<dyn FrameBackend>);
-        if frame_backend.is_some() {
-            tracing::info!("GPU dirty tracker initialized (Vulkan compute SAD)");
-        }
 
         // Warm rayon's global thread pool so the first PalRLE-heavy frame
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).

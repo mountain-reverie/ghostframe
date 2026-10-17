@@ -122,6 +122,10 @@ ENV RUST_MIN_STACK=16777216
 # cdf53 forward diff log (GHOSTFRAME_CDF53_DIFF_TILE=X,Y) and the
 # GHOSTFRAME_CDF53_SKIP_L2_L3 / SKIP_L3 stage gates. Production builds
 # (separate Dockerfile or release pipeline) do NOT enable these features.
+# `allow-software-vulkan` is the same kind of flag: this image has no /dev/dri,
+# so its daemon runs on llvmpipe, which production refuses. The grep below
+# proves the feature really reached this binary; ci/check-test-features.sh and
+# ci-local prove it reached no other.
 #
 # The registry, git checkouts and target/ live in BuildKit cache mounts, so an
 # edit to one source file recompiles only what it touches instead of the whole
@@ -132,7 +136,8 @@ RUN --mount=type=cache,id=ghostframe-cargo-registry,target=/root/.cargo/registry
     --mount=type=cache,id=ghostframe-cargo-git,target=/root/.cargo/git \
     --mount=type=cache,id=ghostframe-target,target=/build/target \
     cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern \
-        --features ghostframe-lib/test-loss-injection,ghostframe-lib/cdf53-diag \
+        --features ghostframe-lib/test-loss-injection,ghostframe-lib/cdf53-diag,ghostframe-lib/allow-software-vulkan \
+    && grep -aq 'software Vulkan permitted (test build)' target/release/ghostframe-xdaemon \
     && mkdir -p /out \
     && cp target/release/ghostframe-xdaemon target/release/ghostframe-test-pattern /out/
 

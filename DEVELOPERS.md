@@ -305,12 +305,14 @@ EndSection
 
 This has not been tested against ghostframe; PRs welcome.
 
-### Xorg + dummy driver (no GPU)
+### Xorg + dummy driver (no display GPU)
 
-For machines without a supported GPU, `xf86-video-dummy` provides a CPU-only
-Xorg with no DRM device. `ghostframe-xdaemon` will detect the absence of DRM
-and fall back to its X11 capture path. Hardware encoding is not available
-in this configuration.
+When the machine has no display GPU, `xf86-video-dummy` provides an Xorg with
+no DRM device. `ghostframe-xdaemon` will detect the absence of DRM and fall
+back to its X11 capture path. Hardware encoding is not available in this
+configuration. The server itself still needs a usable Vulkan compute device
+to analyse and encode frames: it has no software path and refuses to start
+without one (a software server may come later, as an explicit decision).
 
 ```
 Section "Device"

@@ -1872,7 +1872,7 @@ async fn dispatch_via_scheduler_cpu_policy_enqueues_cdf53_tiles() {
             timestamp_us: 0,
         },
         /* max_frag */ 1200,
-        SchedulerEmissionPolicy::CpuRawOnly,
+        SchedulerEmissionPolicy::TestCdf53All,
         None,
     );
 
@@ -2925,7 +2925,7 @@ async fn frame_last_send_event_format() {
         },
         // A realistic max_frag: 1200 byte payload limit.
         1200,
-        SchedulerEmissionPolicy::CpuRawOnly,
+        SchedulerEmissionPolicy::TestCdf53All,
         None,
     );
 
@@ -2942,7 +2942,7 @@ async fn frame_last_send_event_format() {
     );
     assert_eq!(
         stats.codec_histogram.cdf53, 1,
-        "expected codec_cdf53=1 for CpuRawOnly policy"
+        "expected codec_cdf53=1 for TestCdf53All policy"
     );
 
     // Emit the frame.last_send event exactly as the production path does.
@@ -5483,103 +5483,38 @@ async fn ack_batch_received_is_a_trace_event() {
 
 // ---- GPU-failure fallback (T1, T2), PalRle count clamp (T3), escalation flag (T11) ----
 
-/// A `ghostframe::bench` log capture for the next lines of one test. The CPU
-/// pipeline logs `frame.captured` before it looks for a connected session, so
-/// whether that line appears says whether the CPU pipeline was entered, and
-/// with which `frame_seq`, even on a bridge with no session.
-#[derive(Default, Clone)]
-struct BenchLogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
-impl std::io::Write for BenchLogCapture {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BenchLogCapture {
-    type Writer = BenchLogCapture;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-impl BenchLogCapture {
-    fn install(&self) -> tracing::subscriber::DefaultGuard {
-        use tracing_subscriber::util::SubscriberInitExt;
-        tracing_subscriber::fmt()
-            .json()
-            .with_writer(self.clone())
-            .with_target(true)
-            .with_env_filter("ghostframe::bench=info")
-            .set_default()
-    }
-    fn text(&self) -> String {
-        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-    }
-}
-
-fn frame_for_fallback(pixels: Vec<u8>, dmabuf: bool) -> crate::server::FrameSubmission {
-    crate::server::FrameSubmission {
-        width: 64,
-        height: 64,
-        stride: 64 * 4,
-        pixels,
-        // Any fd will do: the fallback only looks at whether one is present.
-        dmabuf_fd: dmabuf
-            .then(|| std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").unwrap())),
-        timestamp_us: 0,
-        damage_tiles: None,
-        capture_done_ns: 0,
-    }
-}
-
-/// T1. A DMA-BUF-only frame has no CPU pixels. When the GPU processor fails
-/// on it and the DMA-BUF cannot be read back either (here the fd is
-/// /dev/null), the CPU pipeline must not run: it would read the empty buffer
-/// as black and send black tiles for the whole screen. Does not drive
-/// `process_frame_gpu`'s error arm itself: that needs a failing Vulkan device.
-#[tokio::test]
-async fn gpu_failure_on_a_dmabuf_only_frame_does_not_enter_the_cpu_pipeline() {
-    let cap = BenchLogCapture::default();
-    let _g = cap.install();
-    let mut bridge = make_bridge_for_test().await;
-    bridge.frame_seq = 7;
-
-    bridge.fall_back_to_cpu_after_gpu_error(frame_for_fallback(Vec::new(), true), 7, false);
-
+/// The server needs a GPU: with no usable Vulkan compute device, startup must
+/// fail with an error that says so and carries the cause. There is no software
+/// path to fall back to, and a server that started anyway would drop every
+/// frame.
+#[test]
+fn startup_without_a_usable_gpu_fails_with_a_clear_error() {
+    let init: Result<crate::capture::gpu_pipeline::GpuFrameProcessor, String> =
+        Err("no Vulkan device found".into());
+    let err = match require_gpu_backend(init) {
+        Ok(_) => panic!("startup must fail without a GPU"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
     assert!(
-        !cap.text().contains("frame.captured"),
-        "the CPU pipeline ran on an empty pixel buffer: {}",
-        cap.text()
+        msg.contains("GPU"),
+        "the error must name the missing GPU: {msg}"
     );
+    assert!(
+        msg.contains("no Vulkan device found"),
+        "the error must carry the cause: {msg}"
+    );
+    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
 }
 
-/// T2. A frame that does carry pixels falls back to the CPU pipeline under the
-/// sequence number `process_frame_gpu` already assigned and announced: no second
-/// `frame_seq` increment. (The "no second frame-dimensions datagram" half is
-/// structural: it is the `emit_dimensions = false` argument, which a bridge
-/// without a connected session returns before reaching, so it is not asserted.)
-#[tokio::test]
-async fn gpu_failure_fallback_reuses_the_sequence_number_and_dimensions() {
-    let cap = BenchLogCapture::default();
-    let _g = cap.install();
-    let mut bridge = make_bridge_for_test().await;
-    // What process_frame_gpu has done by the time its processor fails.
-    bridge.frame_seq = 7;
-
-    bridge.fall_back_to_cpu_after_gpu_error(
-        frame_for_fallback(vec![0x55; 64 * 64 * 4], false),
-        7,
-        false,
-    );
-
-    let logs = cap.text();
-    assert!(
-        logs.contains("\"frame_seq\":7"),
-        "the CPU pipeline must run under the GPU path's seq: {logs}"
-    );
-    assert_eq!(bridge.frame_seq, 7, "frame_seq must not advance again");
+/// A GPU failure that repeats every frame logs once per doubling, not at
+/// frame rate.
+#[test]
+fn a_repeating_gpu_failure_logs_once_per_doubling() {
+    let logged: Vec<u32> = (1..=40u32)
+        .filter(|&n| super::frame::log_gpu_failure(n))
+        .collect();
+    assert_eq!(logged, vec![1, 2, 4, 8, 16, 32]);
 }
 
 /// T3. A PalRle compact count the GPU wrote past the grid must not size the

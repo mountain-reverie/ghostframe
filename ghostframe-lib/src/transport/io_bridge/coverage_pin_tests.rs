@@ -146,7 +146,7 @@ fn dirty_the_tile(b: &mut IoBridge, seq: u32) {
             timestamp_us: 0,
         },
         1200,
-        SchedulerEmissionPolicy::CpuRawOnly,
+        SchedulerEmissionPolicy::TestCdf53All,
         None,
     );
     record_transmissions(b);

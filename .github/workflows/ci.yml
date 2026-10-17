@@ -91,6 +91,8 @@ jobs:
       # job cannot drift apart. The rule and its exemptions are documented there.
       - name: crates read env only in config.rs
         run: ci/check-env-reads.sh
+      - name: test-only features are named nowhere they could unify into a build
+        run: ci/check-test-features.sh
       - name: no home-directory paths in tracked files
         run: ci/check-local-paths.sh
       - name: release daemon has no test-only features

@@ -36,6 +36,15 @@ browserless-harness = ["test-loss-injection", "tokio/test-util"]
 # Off by default — production builds never pay the runtime env-var checks
 # or extra CPU forward overhead. Test-server Dockerfile flips this on.
 cdf53-diag = ["ghostframe-protocol/cdf53-diag"]
+# TEST BUILDS ONLY. Lets device selection fall back to a software Vulkan
+# device (llvmpipe, SwiftShader) when no real GPU is present, so the e2e
+# test-server image, which has no /dev/dri, can run the real daemon. Production
+# refuses a CPU device. It is passed only by tests/containers/test-server/
+# Dockerfile's own `cargo build --features`, and must never be named by a
+# workspace member's Cargo.toml (feature unification would carry it into a
+# release build): ci/check-test-features.sh enforces that, and ci-local checks
+# the release binary does not contain its log literal.
+allow-software-vulkan = []
 
 [dependencies]
 ghostframe-protocol = { path = "../ghostframe-protocol" }

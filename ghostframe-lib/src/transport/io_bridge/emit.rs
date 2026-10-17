@@ -354,7 +354,8 @@ impl IoBridge {
                     palrle.as_ref().is_some_and(|m| m.contains_key(&xy))
                 };
             let fallback: Vec<(u32, u32)> = match policy {
-                SchedulerEmissionPolicy::CpuRawOnly => dirty.to_vec(),
+                #[cfg(test)]
+                SchedulerEmissionPolicy::TestCdf53All => dirty.to_vec(),
                 SchedulerEmissionPolicy::GpuClassifierDriven => dirty
                     .iter()
                     .copied()
@@ -379,7 +380,7 @@ impl IoBridge {
                 continue;
             }
             // The CPU policy sent every dirty tile through the fallback above.
-            if matches!(policy, SchedulerEmissionPolicy::CpuRawOnly) {
+            if policy.is_test_route() {
                 continue;
             }
             // For GpuClassifierDriven, check whether this tile is handled by
@@ -495,7 +496,7 @@ impl IoBridge {
         // bytes_per_us estimate is too generous for quinn's actual drain)
         // and ramps back up on every error-free dispatch. Classic AIMD.
         //
-        // CpuRawOnly tests bypass this with `usize::MAX` so unit fixtures
+        // The test route bypasses this with `usize::MAX` so unit fixtures
         // that pre-seed tiles still drain in one tick.
         let pre_dispatch_send_errs = self.datagram_send_errs;
         let base_budget_bytes = self.base_budget_bytes();
@@ -519,10 +520,11 @@ impl IoBridge {
         // all live in `emit_via_scheduler`, shared with `apply_injected_
         // frame` — see its doc comment.
         //
-        // CpuRawOnly bypasses all of that with `usize::MAX` so unit
+        // The test route bypasses all of that with `usize::MAX` so unit
         // fixtures that pre-seed tiles still drain in one tick.
         let (stats, drained_bytes, drained_count) = match policy {
-            SchedulerEmissionPolicy::CpuRawOnly => {
+            #[cfg(test)]
+            SchedulerEmissionPolicy::TestCdf53All => {
                 self.drain_scheduler_into_quinn(seq, timestamp_us, max_frag, usize::MAX)
             }
             SchedulerEmissionPolicy::GpuClassifierDriven => {
@@ -532,10 +534,10 @@ impl IoBridge {
             }
         };
         // ---- AIMD feedback: shrink the multiplier on any send error,
-        //      ramp back up on a clean dispatch. CpuRawOnly bypasses the
+        //      ramp back up on a clean dispatch. The test route bypasses the
         //      tracking — it ran with unbudgeted `usize::MAX` and unit
         //      fixtures don't go through real QUIC paths anyway.
-        if !matches!(policy, SchedulerEmissionPolicy::CpuRawOnly) {
+        if !policy.is_test_route() {
             let errs_this_dispatch = self
                 .datagram_send_errs
                 .saturating_sub(pre_dispatch_send_errs);
