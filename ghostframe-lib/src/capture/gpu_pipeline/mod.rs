@@ -704,6 +704,8 @@ impl GpuFrameProcessor {
     /// burst) naturally re-surface as dirty until the cushion exhausts and
     /// the next frame becomes the first real snapshot.
     ///
+    /// The cushion is the longer of what is already running and `force_frames`.
+    ///
     /// Call sites:
     /// - `fire_session_reset` calls with `force_frames = 20` to cover QUIC
     ///   slow-start datagram loss after a new session connects.
@@ -720,7 +722,10 @@ impl GpuFrameProcessor {
                 self.destroy_prev_frame(prev);
             }
         }
-        self.force_all_dirty_remaining = force_frames;
+        // Never shorten a cushion already running: a session reset's 20 frames
+        // must survive the 1- or 2-frame repaints the mode handoff and the
+        // stuck-entry retire ask for right after it.
+        self.force_all_dirty_remaining = self.force_all_dirty_remaining.max(force_frames);
     }
 }
 
