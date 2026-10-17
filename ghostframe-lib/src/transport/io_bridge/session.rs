@@ -179,12 +179,8 @@ impl IoBridge {
         // GPU's `invalidate_baseline` drops prev_image and runs the
         // no-snapshot first-frame path for N frames.
         //
-        // Both are set unconditionally. On the CPU-only path,
-        // `frame_backend` is None so the `if let` is a no-op.
-        // On the GPU path, `force_dirty_frames` is normally ignored
-        // by `process_frame_gpu` — but IS consumed if the Vulkan
-        // call errors and the frame falls back to `process_frame_cpu`,
-        // which is exactly the correct behaviour on that error path.
+        // Both are set unconditionally. Without a frame worker (unit tests
+        // only) the backend control is a no-op.
         self.force_dirty_frames = 20;
         self.backend_apply(Control::InvalidateBaseline(20));
         // Force IDR on the existing encoder so the new client
