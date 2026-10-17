@@ -1760,6 +1760,153 @@ async fn e2e_static_mixed_codecs_converge_on_a_shaped_link() -> Result<()> {
     Ok(())
 }
 
+/// A 4K screen runs on the GPU tile path and converges.
+///
+/// The frame processor was once built for 4096 tiles, and a 4K screen has 8160
+/// (VKMS's 4096x2160 has 8704). Every frame of such a screen was refused with
+/// "tile_count ... exceeds max_tiles" and silently redone on the CPU path as
+/// Raw, so every other scene here, all at 1920x1080 or less, passed while a 4K
+/// screen never used the GPU pipeline.
+///
+/// This scene is the one that would have said so. It asserts:
+///
+/// 1. **The GPU tile path ran.** The server logged `dispatch returned` from
+///    `process_frame_gpu`, and never `exceeds max_tiles` or the
+///    `GPU process_frame failed` warning.
+/// 2. **It is really a 4K grid.** The client holds more than 4096 tiles, and
+///    every one of them is accounted for.
+/// 3. **It converges.** Every Cdf53 tile reaches its full pass set, nothing
+///    gives up, and the pass and tile counts are non-zero.
+/// 4. **The pixels are right**: the solid quadrant is red.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_a_4k_screen_runs_on_the_gpu_path_and_converges() -> Result<()> {
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--mixed-static",
+        &[
+            ("GHOSTFRAME_ENABLE_CDF53", "1"),
+            ("GHOSTFRAME_FORCE_TILECODEC", "1"),
+            // 4096x2160: 128 x 68 = 8704 tiles, over the old 4096 ceiling.
+            // VKMS advertises this mode; the pattern is painted in the corner
+            // and the rest of the screen is flat.
+            ("GHOSTFRAME_DRM_MODE", "4096x2160"),
+        ],
+    )
+    .await?;
+    let container = setup.server.server_container_name.clone();
+
+    let mut last_cov = serde_json::Value::Null;
+    let mut settled = false;
+    for _ in 0..1_500 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let cov: serde_json::Value = setup
+            .page()
+            .evaluate("window.__cdf53CoverageSummary()")
+            .await?
+            .into_value()?;
+        let s = &cov["summary"];
+        let tiles = s["tiles"].as_u64().unwrap_or(0);
+        let complete = s["complete"].as_u64().unwrap_or(0);
+        last_cov = cov;
+        if tiles > 0 && complete == tiles {
+            settled = true;
+            break;
+        }
+    }
+    eprintln!("final coverage: {last_cov}");
+
+    // (1) The GPU tile path ran, and never refused the frame.
+    let logs = helpers::read_server_logs_stripped(&container);
+    for l in logs
+        .lines()
+        .filter(|l| l.contains("max_tiles") || l.contains("GPU process_frame failed"))
+        .take(3)
+    {
+        eprintln!("server: {l}");
+    }
+    let dispatched = logs
+        .lines()
+        .filter(|l| l.contains("process_frame_gpu: dispatch returned"))
+        .count();
+    // The screen really is 4K-class: the GPU analysed a frame with more dirty
+    // tiles than the old ceiling could hold. (The web client's framebuffer is
+    // a fixed 1920x1080 and says nothing about the server's screen.) Without
+    // this, a mode that was not applied would leave the scene at 1024x768 and
+    // prove nothing.
+    let max_dirty = logs
+        .lines()
+        .filter(|l| l.contains("dirty tile detection complete"))
+        .filter_map(|l| {
+            let rest = l.split("dirty_count=").nth(1)?;
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0);
+    eprintln!("largest GPU dirty-tile set: {max_dirty}");
+    assert!(
+        max_dirty > 4096,
+        "the GPU analysed at most {max_dirty} dirty tiles in a frame: the screen \
+         was not above the old 4096-tile ceiling (or the GPU never analysed it), \
+         so this scene would not catch the ceiling bug"
+    );
+    assert!(
+        dispatched > 0,
+        "the server never completed a process_frame_gpu dispatch, so a 4K \
+         screen did not use the GPU tile path"
+    );
+    let refused: Vec<&str> = logs
+        .lines()
+        .filter(|l| l.contains("exceeds max_tiles") || l.contains("GPU process_frame failed"))
+        .take(3)
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "the GPU refused a 4K frame (tile ceiling) and the server fell back: {refused:?}"
+    );
+
+    // (2)+(3) A real 4K grid, converged, with something actually counted.
+    let summary = &last_cov["summary"];
+    let tiles = summary["tiles"].as_u64().unwrap_or(0);
+    let complete = summary["complete"].as_u64().unwrap_or(0);
+    let gave_up = summary["gave_up"].as_u64().unwrap_or(0);
+    assert!(
+        settled,
+        "a static 4K screen never reached full Cdf53 coverage: {complete} of \
+         {tiles} tiles complete, {gave_up} gave up. Outstanding: {}",
+        last_cov["incomplete"]
+    );
+    assert!(
+        tiles > 0 && complete == tiles,
+        "tiles={tiles} complete={complete}"
+    );
+    assert_eq!(gave_up, 0, "stuck: {}", last_cov["incomplete"]);
+    let codecs: Vec<u8> = setup
+        .page()
+        .evaluate("window.__ghostframeRecordedCodecs || []")
+        .await?
+        .into_value()?;
+    assert!(
+        codecs.contains(&(Codec::Cdf53 as u8)),
+        "no Cdf53 pass reached the client: the scene did not exercise the GPU transform"
+    );
+    eprintln!("4K: {dispatched} dispatches, {complete}/{tiles} cdf53 tiles complete");
+
+    // (4) The pixels: the solid quadrant is red after convergence.
+    let solid_px: Vec<u8> = setup
+        .page()
+        .evaluate("window.__readPixelRect(160, 120, 1, 1)")
+        .await?
+        .into_value()?;
+    assert!(
+        solid_px.len() >= 3 && solid_px[0] > 200 && solid_px[1] < 60 && solid_px[2] < 60,
+        "the solid quadrant should be red, read {:?}",
+        &solid_px[..3.min(solid_px.len())]
+    );
+    Ok(())
+}
+
 /// Production scale, production capture rate, 1% loss: it converges.
 ///
 ///   tiles=2040 complete=2040 partial=0 gave_up=0 pass-hist{10:2040}
