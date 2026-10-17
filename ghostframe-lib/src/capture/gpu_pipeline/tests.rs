@@ -2598,3 +2598,26 @@ fn frame_analysis_slices_clamp_an_oversized_gpu_count() {
     assert_eq!(clamp_gpu_count(u32::MAX, 4), 4);
     assert_eq!(clamp_gpu_count(3, 4), 3);
 }
+
+/// A running cushion is never shortened by a later, smaller request: a session
+/// reset asks for 20 frames of repaint and the mode handoff (1) or the
+/// stuck-entry retire (2) right after it must not cut that to 1 or 2. Needs a
+/// GPU; fails rather than skips without one.
+#[test]
+fn invalidate_baseline_keeps_the_longer_cushion() {
+    let mut processor = GpuFrameProcessor::new(256).expect(NEEDS_GPU);
+    processor.invalidate_baseline(20);
+    processor.invalidate_baseline(2);
+    assert_eq!(
+        processor.force_all_dirty_remaining, 20,
+        "a smaller request must not shorten the running cushion"
+    );
+    processor.invalidate_baseline(1);
+    assert_eq!(processor.force_all_dirty_remaining, 20);
+    // A larger request extends it, and an exhausted one starts fresh.
+    processor.invalidate_baseline(30);
+    assert_eq!(processor.force_all_dirty_remaining, 30);
+    processor.force_all_dirty_remaining = 0;
+    processor.invalidate_baseline(1);
+    assert_eq!(processor.force_all_dirty_remaining, 1);
+}
