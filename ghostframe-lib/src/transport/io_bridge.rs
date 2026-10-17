@@ -1249,7 +1249,7 @@ impl IoBridge {
         // its IP as the `local_ip` hint for inbound packets.
         let local_addr = SocketAddr::new(bind_ip, port);
 
-        let frame_backend = GpuFrameProcessor::new(2048 * 2)
+        let frame_backend = GpuFrameProcessor::new(crate::capture::gpu_pipeline::MAX_FRAME_TILES)
             .ok()
             .map(|p| Box::new(GpuBackend::new(p)) as Box<dyn FrameBackend>);
         if frame_backend.is_some() {

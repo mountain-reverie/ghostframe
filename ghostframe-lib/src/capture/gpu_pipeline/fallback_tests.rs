@@ -113,3 +113,34 @@ fn fallback_round_trip_cost() {
         );
     }
 }
+
+/// The production tile ceiling must actually allocate on the host GPU: it sets
+/// ~200 MB of host-visible buffers, and a failure here is a startup failure.
+#[test]
+fn the_production_tile_ceiling_allocates() {
+    let p = GpuFrameProcessor::new(MAX_FRAME_TILES).expect(NEEDS_GPU);
+    assert!(p.max_tiles >= 8160 * 2, "must hold two 4K screens");
+}
+
+/// The finding behind the ceiling: the processor used to be built for 4096
+/// tiles, but a 4K screen is 8160, so every 4K frame was refused with
+/// "exceeds max_tiles". Nothing noticed, because the CPU path then sent the
+/// frame instead. A 4K frame must be accepted at the production ceiling and was
+/// refused at the old one.
+#[test]
+fn a_4k_frame_was_refused_at_the_old_ceiling_and_is_accepted_now() {
+    let (w, h) = (3840u32, 2160u32);
+    let px = vec![0x80u8; (w * h * 4) as usize];
+    let mut old = GpuFrameProcessor::new(2048 * 2).expect(NEEDS_GPU);
+    let err = unsafe { old.process_frame_inner_from_pixels(&px, w, h, w * 4) }
+        .err()
+        .expect("8160 tiles must not fit 4096")
+        .to_string();
+    assert!(err.contains("exceeds max_tiles"), "{err}");
+    drop(old);
+    let mut now = GpuFrameProcessor::new(MAX_FRAME_TILES).expect(NEEDS_GPU);
+    let a = unsafe { now.process_frame_inner_from_pixels(&px, w, h, w * 4) }
+        .map_err(|e| e.to_string())
+        .expect("a 4K frame must be accepted");
+    assert_eq!(a.tile_analysis_len, 8160);
+}
