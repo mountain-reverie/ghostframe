@@ -115,11 +115,11 @@ pub(super) enum FromWorker {
         analysed: Box<Analysed>,
         worker_us: u64,
     },
-    /// The GPU stage failed; the frame comes back for the CPU fallback.
+    /// The GPU stage failed. There is no software path, so the loop drops the
+    /// frame.
     AnalyseFailed {
         seq: u32,
         error: String,
-        frame: Box<FrameSubmission>,
     },
     H264Done {
         seq: u32,
@@ -353,11 +353,7 @@ fn run_worker(
                             worker_us: elapsed_us(t0),
                         }
                     }
-                    Err(error) => FromWorker::AnalyseFailed {
-                        seq,
-                        error,
-                        frame: Box::new(frame),
-                    },
+                    Err(error) => FromWorker::AnalyseFailed { seq, error },
                 };
                 if tx.blocking_send(reply).is_err() {
                     return;

@@ -563,7 +563,7 @@ impl IoBridge {
     /// this function ever needs to know who called it, the extraction has
     /// failed and the split has been rebuilt one level down.
     ///
-    /// `SchedulerEmissionPolicy::CpuRawOnly` does not call this at all — it
+    /// `SchedulerEmissionPolicy::TestCdf53All` does not call this at all — it
     /// bypasses probe override, pacing combine, the quinn clamp, AND
     /// continuation bookkeeping outright with a direct `usize::MAX` drain
     /// (see the `match policy` in `dispatch_dirty_tiles_via_scheduler`).

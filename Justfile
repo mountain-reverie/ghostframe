@@ -114,6 +114,8 @@ ci-client: build-client
     just fmt-check
     @echo "=== env reads only in config.rs ==="
     ci/check-env-reads.sh
+    @echo "=== test-only features named nowhere they could unify into a build ==="
+    ci/check-test-features.sh
     @echo "=== no home-directory paths in tracked files ==="
     ci/check-local-paths.sh
     @echo "=== clippy + unit tests (native client) ==="
@@ -209,6 +211,8 @@ ci-local:
     just fmt-check
     @echo "=== env reads only in config.rs ==="
     ci/check-env-reads.sh
+    @echo "=== test-only features named nowhere they could unify into a build ==="
+    ci/check-test-features.sh
     @echo "=== no home-directory paths in tracked files ==="
     ci/check-local-paths.sh
     @echo "=== release daemon has no test-only features ==="
@@ -226,6 +230,8 @@ ci-local:
     cd ghostframe-web-client && npx tsc --noEmit
     @echo "=== release build ==="
     cargo build --workspace --release --exclude ghostframe-e2e
+    @echo "=== release daemon carries no test-only feature ==="
+    if grep -aq 'software Vulkan permitted (test build)' target/release/ghostframe-xdaemon; then echo "release ghostframe-xdaemon contains the software-Vulkan test-build literal: a test-only feature leaked into a release build" >&2; exit 1; fi
     @echo "=== cbindgen headers up-to-date ==="
     cargo check -p ghostframe-lib
     git diff --exit-code ghostframe-lib/include/ghostframe.h
