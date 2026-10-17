@@ -58,6 +58,12 @@ e2e_production_scale_with_loss_converges
 e2e_production_shaped_session_strands_no_tiles
 e2e_static_mixed_codecs_converge_on_a_shaped_link
 
+# A 4K screen (VKMS 4096x2160, 8704 tiles) on the GPU tile path. Same reason as
+# the group above: `setup_e2e_webgpu_gpu_with_env` and a DRM mode need the
+# host's VKMS and /dev/dri, which a GitHub runner does not have. It runs for
+# every developer locally; it is the only scene above the old 4096-tile ceiling.
+e2e_a_4k_screen_runs_on_the_gpu_path_and_converges
+
 # --- Category 2: software-H.264-decode-too-slow-on-2-vCPU-runners ----------
 # Tests whose assertions assume the WebCodecs H.264 decoder keeps up with a
 # 30fps live stream within ~2s. GitHub-hosted ubuntu-24.04 runners have 2
