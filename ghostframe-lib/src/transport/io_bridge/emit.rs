@@ -212,40 +212,79 @@ impl IoBridge {
         pixels: &[u8],
         stride: u32,
     ) -> Vec<(u32, u32)> {
-        let tile_bgra: Vec<Vec<u8>> = tiles
-            .iter()
-            .map(|&(x, y)| grid.extract_tile(pixels, stride, x, y))
-            .collect();
-        let refs: Vec<&[u8]> = tile_bgra.iter().map(|t| t.as_slice()).collect();
-        let n = crate::encoder::cdf53::CDF53_TOTAL_COEFFS;
-        // A round trip to the frame worker, which owns the GPU.
-        let forwarded = self
-            .frame_pipeline
-            .as_ref()
-            .map(|p| p.forward_cdf53_tiles(&refs));
-        let coeffs: Vec<i16> = match forwarded {
-            Some(Ok(c)) => c,
-            Some(Err(e)) => {
-                tracing::error!(target: LOG_TARGET, error = %e, tiles = tiles.len(),
-                    "cdf53 fallback forward failed; tiles not sent this frame");
-                // Report the whole GPU baseline as stale so the next frame
-                // marks these tiles dirty again and they are retried.
-                self.backend_apply(super::frame_backend::Control::InvalidateBaseline(1));
-                return tiles.to_vec();
+        // Tiles the frame worker already transformed and encoded in the frame's
+        // own finish; the rest (a PalRle tile that lost its palette at commit)
+        // still need the GPU, which is a round trip to the worker.
+        let mut encoded: std::collections::HashMap<(u32, u32), super::frame_backend::Cdf53Encoded> =
+            std::collections::HashMap::new();
+        let mut missing: Vec<(u32, u32)> = Vec::new();
+        for &xy in tiles {
+            match self.precomputed_fallback.remove(&xy) {
+                Some(e) => {
+                    encoded.insert(xy, e);
+                }
+                None => missing.push(xy),
             }
-            #[cfg(test)]
-            None => refs
+        }
+        let mut failed: Vec<(u32, u32)> = Vec::new();
+        if !missing.is_empty() {
+            let tile_bgra: Vec<Vec<u8>> = missing
                 .iter()
-                .flat_map(|t| crate::encoder::cdf53::forward(t))
-                .collect(),
-            #[cfg(not(test))]
-            None => {
-                tracing::error!(target: LOG_TARGET, tiles = tiles.len(),
-                    "cdf53 fallback needs the frame backend; tiles not sent this frame");
-                return tiles.to_vec();
+                .map(|&(x, y)| grid.extract_tile(pixels, stride, x, y))
+                .collect();
+            let refs: Vec<&[u8]> = tile_bgra.iter().map(|t| t.as_slice()).collect();
+            let n = crate::encoder::cdf53::CDF53_TOTAL_COEFFS;
+            // A round trip to the frame worker, which owns the GPU. The loop
+            // waits for it (see `FramePipeline::forward_cdf53_tiles`).
+            let forwarded = self
+                .frame_pipeline
+                .as_ref()
+                .map(|p| p.forward_cdf53_tiles(&refs));
+            let coeffs: Option<Vec<i16>> = match forwarded {
+                Some(Ok(c)) => Some(c),
+                Some(Err(e)) => {
+                    tracing::error!(target: LOG_TARGET, error = %e, tiles = missing.len(),
+                        "cdf53 fallback forward failed; tiles not sent this frame");
+                    // Report the whole GPU baseline as stale so the next frame
+                    // marks these tiles dirty again and they are retried.
+                    self.backend_apply(super::frame_backend::Control::InvalidateBaseline(1));
+                    None
+                }
+                #[cfg(test)]
+                None => Some(
+                    refs.iter()
+                        .flat_map(|t| crate::encoder::cdf53::forward(t))
+                        .collect(),
+                ),
+                #[cfg(not(test))]
+                None => {
+                    tracing::error!(target: LOG_TARGET, tiles = missing.len(),
+                        "cdf53 fallback needs the frame backend; tiles not sent this frame");
+                    None
+                }
+            };
+            match coeffs {
+                Some(coeffs) => {
+                    for (i, &xy) in missing.iter().enumerate() {
+                        let (present_passes, passes) = crate::encoder::cdf53::encode_passes_sparse(
+                            &coeffs[i * n..(i + 1) * n],
+                        );
+                        encoded.insert(
+                            xy,
+                            super::frame_backend::Cdf53Encoded {
+                                present_passes,
+                                passes,
+                            },
+                        );
+                    }
+                }
+                None => failed = missing,
             }
-        };
-        for (i, &(x, y)) in tiles.iter().enumerate() {
+        }
+        for &(x, y) in tiles {
+            let Some(e) = encoded.remove(&(x, y)) else {
+                continue;
+            };
             // Supersede what the tile had in flight the way the dirty loop
             // does: the plain bump in the Cdf53 commit settles nothing, so a
             // PalRle emission still queued would keep its palette reference
@@ -255,17 +294,15 @@ impl IoBridge {
             let (_, superseded) = self.scheduler.bump_generation_collecting(x as u8, y as u8);
             self.fragment_coverage.drop_cdf53_for_tile(x as u8, y as u8);
             self.settle_superseded_palettes(x as u8, y as u8, &superseded);
-            let (present, passes) =
-                crate::encoder::cdf53::encode_passes_sparse(&coeffs[i * n..(i + 1) * n]);
             self.commit_tile_to_cdf53(
                 x as u8,
                 y as u8,
-                present,
-                passes,
+                e.present_passes,
+                e.passes,
                 super::frame::Cdf53Source::Dirty,
             );
         }
-        Vec::new()
+        failed
     }
 
     /// Shared scheduler dispatch: grid-sync → RTT update → bump+encode+enqueue
