@@ -868,7 +868,12 @@ impl IoBridge {
         }
     }
 
-    fn send_finish(&mut self, mut inflight: InFlight, action: FinishAction, stage: InFlightStage) {
+    pub(super) fn send_finish(
+        &mut self,
+        mut inflight: InFlight,
+        action: FinishAction,
+        stage: InFlightStage,
+    ) {
         let controls = std::mem::take(&mut self.pending_controls);
         let sent = self.frame_pipeline.as_ref().is_some_and(|p| {
             p.send(ToWorker::Finish {
@@ -1076,29 +1081,11 @@ impl IoBridge {
                     return;
                 }
 
-                // The escalation candidates this frame, with what the loop
-                // knows about each tile; the worker encodes their passes.
-                let escalation_candidates =
-                    std::mem::take(&mut self.cdf53_escalation_candidates_this_frame);
-                let stranded_count =
-                    std::mem::take(&mut self.cdf53_stranded_candidates_this_frame).len();
-                let slots: Vec<EscalationSlot> = escalation_candidates
-                    .iter()
-                    .enumerate()
-                    .map(|(slot, &tile_idx)| EscalationSlot {
-                        tile_idx,
-                        stranded: slot < stranded_count,
-                        tile_is_cdf53: matches!(
-                            self.metrics_tracker
-                                .get(tile_idx % cols, tile_idx / cols)
-                                .codec_state,
-                            crate::tile::CodecState::Cdf53 { .. }
-                        ),
-                    })
-                    .collect();
+                let (action, escalation_candidates, stranded_count) =
+                    self.tile_finish_action(cols, rows, &dirty_xy);
                 self.send_finish(
                     inflight,
-                    FinishAction::Tile { cols, rows, slots },
+                    action,
                     InFlightStage::FinishingTile {
                         dirty_xy,
                         max_frag,
@@ -1127,6 +1114,67 @@ impl IoBridge {
         }
         self.compute_max_datagram_size()
             .map(|now| now.min(inflight.max_dg_size))
+    }
+
+    /// What to ask the worker for a tile frame: the escalation candidates this
+    /// frame with what the loop knows about each tile (the worker encodes their
+    /// passes), and the dirty tiles no tile encoder will carry. Also returns
+    /// the candidates and how many of them are stranded-recovery slots.
+    pub(super) fn tile_finish_action(
+        &mut self,
+        cols: u32,
+        rows: u32,
+        dirty_xy: &[(u32, u32)],
+    ) -> (FinishAction, Vec<u32>, usize) {
+        let escalation_candidates =
+            std::mem::take(&mut self.cdf53_escalation_candidates_this_frame);
+        let stranded_count = std::mem::take(&mut self.cdf53_stranded_candidates_this_frame).len();
+        let slots: Vec<EscalationSlot> = escalation_candidates
+            .iter()
+            .enumerate()
+            .map(|(slot, &tile_idx)| EscalationSlot {
+                tile_idx,
+                stranded: slot < stranded_count,
+                tile_is_cdf53: matches!(
+                    self.metrics_tracker
+                        .get(tile_idx % cols, tile_idx / cols)
+                        .codec_state,
+                    crate::tile::CodecState::Cdf53 { .. }
+                ),
+            })
+            .collect();
+        // Dirty tiles no tile encoder will carry; the worker encodes them as
+        // CDF 5/3 in the same call (see `TileRequest`).
+        let fallback = self.worker_fallback_tiles(dirty_xy);
+        (
+            FinishAction::Tile {
+                cols,
+                rows,
+                slots,
+                fallback,
+            },
+            escalation_candidates,
+            stranded_count,
+        )
+    }
+
+    /// The dirty tiles no tile encoder will carry, whose CDF 5/3 the worker
+    /// encodes with the frame's own finish: their codec state is Skip, H264 or
+    /// PixelPerfect. A PalRle tile that loses its palette at commit joins them
+    /// later and is encoded on request.
+    pub(super) fn worker_fallback_tiles(&self, dirty_xy: &[(u32, u32)]) -> Vec<(u32, u32)> {
+        dirty_xy
+            .iter()
+            .copied()
+            .filter(|&(x, y)| {
+                matches!(
+                    self.metrics_tracker.get(x, y).codec_state,
+                    crate::tile::CodecState::Skip
+                        | crate::tile::CodecState::H264 { .. }
+                        | crate::tile::CodecState::PixelPerfect
+                )
+            })
+            .collect()
     }
 
     /// Step 3 for an H.264 frame: fragment and send what the worker encoded.
@@ -1197,6 +1245,7 @@ impl IoBridge {
             palrle,
             cdf53_dirty,
             cdf53_escalation,
+            cdf53_fallback,
             timings,
         } = out;
         // The frame's dimensions go out with the frame (see `on_h264_done`).
@@ -1221,6 +1270,10 @@ impl IoBridge {
             PixelSource::Readback(rb) => rb,
         };
         let mut lap = Lap::new(stage_trace_enabled());
+        // Hand the worker's pre-encoded fallback tiles to the dispatch below,
+        // which takes the ones it needs and asks the worker for the rest.
+        self.precomputed_fallback.clear();
+        self.precomputed_fallback.extend(cdf53_fallback);
         self.emit_tile_codec_frame(
             &dirty_xy,
             &inflight.meta,
@@ -1237,12 +1290,17 @@ impl IoBridge {
             inflight.seq,
             max_frag,
         );
+        self.precomputed_fallback.clear();
         let emit_us = lap.lap();
         tracing::trace!(
             target: "ghostframe::io_bridge::diag",
             seq = inflight.seq, mode = "tile",
             pre_us = trace.pre_us, gpu_us = trace.gpu_us, classify_us = trace.classify_us,
             worker_finish_us = worker_us, emit_us,
+            blocking_forwards_total = self
+                .frame_pipeline
+                .as_ref()
+                .map_or(0, |p| p.forward_requests()),
             "[BRIDGE] frame.stages"
         );
     }
