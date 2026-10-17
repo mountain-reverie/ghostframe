@@ -81,6 +81,7 @@ pub(super) enum FinishAction {
         cols: u32,
         rows: u32,
         slots: Vec<EscalationSlot>,
+        fallback: Vec<(u32, u32)>,
     },
     Discard,
 }
@@ -146,6 +147,10 @@ pub(super) struct FramePipeline {
     /// The panic message, if the worker died of one. Set before the result
     /// channel closes.
     failure: std::sync::Arc<Mutex<Option<String>>>,
+    /// Blocking `Forward` requests made, for the trace and the tests: with
+    /// the worker pre-encoding the fallback tiles it can know about, the common
+    /// full-screen case makes none.
+    forward_requests: std::sync::atomic::AtomicU64,
 }
 
 impl FramePipeline {
@@ -180,7 +185,14 @@ impl FramePipeline {
             exited,
             handle: Some(handle),
             failure,
+            forward_requests: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// How many blocking `Forward` requests the loop has made.
+    pub(super) fn forward_requests(&self) -> u64 {
+        self.forward_requests
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Why the worker died, if it panicked.
@@ -198,14 +210,18 @@ impl FramePipeline {
 
     /// Forward-transform `tiles` on the worker and wait for the coefficients.
     ///
-    /// Called from the loop while it commits a frame (the CDF 5/3 fallback for
-    /// tiles no tile encoder can carry). The loop waits: the worker is idle
+    /// Called from the loop while it commits a frame, for the CDF 5/3 fallback
+    /// tiles the worker did not already encode with the frame's finish (a PalRle
+    /// tile that lost its palette at commit; the always-fallback states are
+    /// encoded by the worker in `FinishAction::Tile`, with no wait). The loop waits: the worker is idle
     /// then (the frame's own finish has returned and no other step can be
     /// outstanding), the call is one GPU round trip, and the commit cannot
     /// proceed without the result. No session event can be handled meanwhile,
     /// so a frame's epoch cannot change under it. Bounded, so a stuck GPU
     /// fails the batch (its tiles are retried) instead of freezing the loop.
     pub(super) fn forward_cdf53_tiles(&self, tiles: &[&[u8]]) -> Result<Vec<i16>, String> {
+        self.forward_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (reply, answer) = std_mpsc::channel();
         let sent = self.send(ToWorker::Forward {
             tiles: tiles.iter().map(|t| t.to_vec()).collect(),
@@ -372,13 +388,19 @@ fn run_worker(
                             out: backend.finish_h264(&frame, force_keyframe),
                             worker_us: elapsed_us(t0),
                         },
-                        FinishAction::Tile { cols, rows, slots } => {
+                        FinishAction::Tile {
+                            cols,
+                            rows,
+                            slots,
+                            fallback,
+                        } => {
                             let out = backend.finish_tile(
                                 &frame,
                                 &TileRequest {
                                     cols,
                                     rows,
                                     escalation: &slots,
+                                    fallback: &fallback,
                                 },
                             );
                             let frame_pixels = if matches!(out.pixels, Ok(PixelSource::Frame)) {

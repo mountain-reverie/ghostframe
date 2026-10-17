@@ -940,6 +940,8 @@ struct RecordingBackend {
     /// `forward_cdf53_tiles` fails, as a lost device or a failed submit would.
     fail_forward: bool,
     analyse_err: Option<String>,
+    /// Tiles `analyse` reports dirty.
+    dirty_tiles: Vec<u32>,
     panic_in_analyse: bool,
     analyse_sleep: std::time::Duration,
     /// Shared by backends that must not overlap: how many are inside a call.
@@ -972,7 +974,11 @@ impl FrameBackend for RecordingBackend {
         }
         match &self.analyse_err {
             Some(e) => Err(e.clone()),
-            None => Ok(Analysed::default()),
+            None => Ok(Analysed {
+                dirty_analysis: vec![None; self.dirty_tiles.len()],
+                dirty_tiles: self.dirty_tiles.clone(),
+                ..Default::default()
+            }),
         }
     }
     fn finish_h264(&mut self, _frame: &FrameSubmission, force_keyframe: bool) -> Option<H264Out> {
@@ -985,13 +991,17 @@ impl FrameBackend for RecordingBackend {
             is_keyframe,
         })
     }
-    fn finish_tile(&mut self, _frame: &FrameSubmission, _req: &TileRequest<'_>) -> TileOut {
-        self.log.lock().unwrap().push("finish_tile".into());
+    fn finish_tile(&mut self, _frame: &FrameSubmission, req: &TileRequest<'_>) -> TileOut {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("finish_tile fallback={:?}", req.fallback));
         TileOut {
             pixels: Err("recording backend".into()),
             palrle: OwnedPalRle::default(),
             cdf53_dirty: Vec::new(),
             cdf53_escalation: Vec::new(),
+            cdf53_fallback: Vec::new(),
             timings: TileTimings::default(),
         }
     }
@@ -1356,6 +1366,7 @@ async fn a_stale_tile_result_is_dropped_and_invalidates_the_baseline() {
         palrle: OwnedPalRle::default(),
         cdf53_dirty: Vec::new(),
         cdf53_escalation: Vec::new(),
+        cdf53_fallback: Vec::new(),
         timings: TileTimings::default(),
     };
     bridge.on_tile_done(
@@ -1383,6 +1394,7 @@ fn empty_tile_out() -> TileOut {
         palrle: OwnedPalRle::default(),
         cdf53_dirty: Vec::new(),
         cdf53_escalation: Vec::new(),
+        cdf53_fallback: Vec::new(),
         timings: TileTimings::default(),
     }
 }
@@ -6144,4 +6156,234 @@ async fn the_tile_arm_commits_the_backends_cdf53_results_and_skips_what_it_skipp
         0,
         "the slot the backend skipped was not committed"
     );
+}
+
+/// The tiles the worker pre-encodes are those no tile encoder will carry.
+#[tokio::test]
+async fn the_worker_pre_encodes_exactly_the_tiles_no_tile_encoder_carries() {
+    use crate::tile::CodecState;
+    let (mut bridge, _peer, _log) = recording_bridge();
+    bridge.metrics_tracker.resize(3, 2);
+    let set = |b: &mut IoBridge, x, y, s| b.metrics_tracker.get_mut(x, y).codec_state = s;
+    set(&mut bridge, 0, 0, CodecState::Skip);
+    set(&mut bridge, 1, 0, CodecState::H264 { frames_in_h264: 3 });
+    set(&mut bridge, 2, 0, CodecState::PixelPerfect);
+    set(&mut bridge, 0, 1, CodecState::Solid);
+    set(&mut bridge, 1, 1, CodecState::PalRle { palette_id: 2 });
+    let all: Vec<(u32, u32)> = (0..2).flat_map(|y| (0..3).map(move |x| (x, y))).collect();
+    set(
+        &mut bridge,
+        2,
+        1,
+        CodecState::Cdf53 {
+            passes_sent: 0,
+            present_passes: 1,
+        },
+    );
+    assert_eq!(
+        bridge.worker_fallback_tiles(&all),
+        vec![(0, 0), (1, 0), (2, 0)]
+    );
+}
+
+/// After an H.264 exit the first tile frame has every dirty tile in the H264
+/// state, so every one of them takes the CDF 5/3 fallback. The worker encodes
+/// them in the frame's own finish, so committing the frame makes no blocking
+/// request of the worker (a full-screen round trip is 20 ms at 1080p, 86 ms at
+/// 4K, on the loop).
+#[tokio::test]
+async fn a_full_screen_tile_frame_after_an_h264_exit_makes_no_blocking_forward() {
+    use crate::tile::CodecState;
+    const W: u32 = 128;
+    let (mut bridge, _peer, log) = recording_bridge();
+    bridge.test_commit_dg_size = Some(1200);
+    bridge.scheduler.resize(4, 4);
+    bridge.metrics_tracker.resize(4, 4);
+    let all: Vec<(u32, u32)> = (0..4).flat_map(|y| (0..4).map(move |x| (x, y))).collect();
+    for &(x, y) in &all {
+        bridge.metrics_tracker.get_mut(x, y).codec_state = CodecState::H264 { frames_in_h264: 9 };
+    }
+    // What the worker returns for them: every tile, already encoded.
+    let enc = |v: u8| Cdf53Encoded {
+        present_passes: 1,
+        passes: vec![(0, vec![v; 8])],
+    };
+    let out = TileOut {
+        pixels: Ok(PixelSource::Frame),
+        palrle: OwnedPalRle::default(),
+        cdf53_dirty: Vec::new(),
+        cdf53_escalation: Vec::new(),
+        cdf53_fallback: all.iter().map(|&xy| (xy, enc(1))).collect(),
+        timings: TileTimings::default(),
+    };
+    let inflight = stale_inflight(frame::InFlightStage::FinishingTile {
+        dirty_xy: all.clone(),
+        max_frag: 1000,
+        escalation_candidates: Vec::new(),
+        stranded_count: 0,
+        frame_palette_set_count: 0,
+        trace: Default::default(),
+    });
+    let inflight = frame::InFlight {
+        meta: frame::FrameMeta {
+            width: W,
+            height: W,
+            stride: W * 4,
+            timestamp_us: 0,
+            capture_done_ns: 0,
+        },
+        ..inflight
+    };
+    bridge.on_tile_done(inflight, out, vec![0x40; (W * W * 4) as usize], 0);
+
+    assert_eq!(
+        bridge.frame_pipeline.as_ref().unwrap().forward_requests(),
+        0,
+        "no blocking Forward request"
+    );
+    assert!(
+        !log.lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("forward_cdf53_tiles")),
+        "the worker was never asked to forward"
+    );
+    for &(x, y) in &all {
+        assert!(
+            bridge.scheduler.generation_for(x as u8, y as u8) > 0,
+            "tile ({x},{y}) was committed as CDF 5/3"
+        );
+    }
+}
+
+/// A tile the GPU's own compact list already covers is not transformed a
+/// second time for the fallback.
+#[test]
+fn fallback_tiles_already_in_the_compact_list_are_not_forwarded_twice() {
+    let in_list: std::collections::HashSet<u32> = [5u32, 10].into_iter().collect();
+    // 4 columns: flat 5 = (1,1), flat 10 = (2,2).
+    let got = super::frame_backend::fallback_not_in_compact_list(
+        &[(0, 0), (1, 1), (2, 2), (3, 3)],
+        4,
+        &in_list,
+    );
+    assert_eq!(got, vec![(0, 0), (3, 3)]);
+}
+
+/// The finish request the loop builds lists the dirty tiles in a state no tile
+/// encoder carries (and the worker passes the list on to the backend).
+#[tokio::test]
+async fn the_finish_request_lists_the_tiles_the_loop_classified_as_fallback() {
+    use crate::tile::CodecState;
+    let backend = RecordingBackend::default();
+    let log = backend.log.clone();
+    let (mut bridge, _peer) = bridge_with_backend(backend);
+    bridge.metrics_tracker.resize(4, 4);
+    let set = |b: &mut IoBridge, x, y, s| b.metrics_tracker.get_mut(x, y).codec_state = s;
+    set(&mut bridge, 0, 0, CodecState::Skip);
+    set(&mut bridge, 1, 0, CodecState::H264 { frames_in_h264: 2 });
+    set(&mut bridge, 2, 0, CodecState::Solid);
+    set(&mut bridge, 3, 0, CodecState::PixelPerfect);
+    let dirty = [(0, 0), (1, 0), (2, 0), (3, 0)];
+    let (action, _, _) = bridge.tile_finish_action(4, 4, &dirty);
+    let FinishAction::Tile { fallback, .. } = &action else {
+        panic!("a tile frame is finished with FinishAction::Tile");
+    };
+    assert_eq!(fallback, &vec![(0, 0), (1, 0), (3, 0)]);
+
+    // And the worker hands it to the backend as the request's fallback list.
+    bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    let analysed = next_worker_message(&mut bridge).await.unwrap();
+    let inflight = bridge.in_flight.take().unwrap();
+    drop(analysed);
+    bridge.send_finish(inflight, action, frame::InFlightStage::FinishingDiscard);
+    let _done = next_worker_message(&mut bridge).await.unwrap();
+    assert!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .any(|l| l == "finish_tile fallback=[(0, 0), (1, 0), (3, 0)]"),
+        "{:?}",
+        log.lock().unwrap()
+    );
+}
+
+/// A fallback tile the worker did not pre-encode (a PalRle tile that lost its
+/// palette at commit) is the one case that still asks the worker.
+#[tokio::test]
+async fn a_fallback_tile_the_worker_did_not_encode_still_asks_for_it() {
+    use crate::tile::CodecState;
+    let (mut bridge, _peer, log) = recording_bridge();
+    bridge.scheduler.resize(4, 4);
+    bridge.metrics_tracker.resize(4, 4);
+    bridge.metrics_tracker.get_mut(1, 1).codec_state = CodecState::Skip;
+    fallback_dispatch(&mut bridge, &[(1, 1)]);
+    assert_eq!(
+        bridge.frame_pipeline.as_ref().unwrap().forward_requests(),
+        1
+    );
+    assert!(log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l == "forward_cdf53_tiles 1"));
+}
+
+/// The real backend's fallback pre-encode is the CPU transform of the same
+/// tiles, byte for byte: the worker path changes where the work runs, not what
+/// it produces. Needs a GPU; skips without one.
+#[tokio::test]
+async fn gpu_backend_pre_encodes_fallback_tiles_exactly_as_the_cpu_transform() {
+    // Not a multiple of 32 in either direction, and a padded stride, so the
+    // right and bottom edge tiles and the stride are exercised.
+    const W: u32 = 100;
+    const H: u32 = 70;
+    const STRIDE: u32 = W * 4 + 16;
+    let _gpu = crate::gpu_test_lock::lock();
+    let processor = crate::capture::gpu_pipeline::GpuFrameProcessor::new(256)
+        .expect("this test needs a Vulkan GPU and must not skip");
+    let mut backend = GpuBackend::new(processor);
+    // Three flat colours in diagonal bands: every tile has few colours, so none
+    // is in the GPU's own CDF 5/3 compact list (which is what the fallback
+    // covers), yet every tile has edges, so the transform is not trivial.
+    let colours: [[u8; 4]; 3] = [[10, 20, 30, 255], [200, 100, 50, 255], [90, 220, 140, 255]];
+    let pixels: Vec<u8> = (0..STRIDE * H)
+        .map(|i| {
+            let (row, col) = (i / STRIDE, i % STRIDE);
+            let px = (col / 4) as usize;
+            colours[(px / 7 + row as usize / 5) % 3][(col % 4) as usize]
+        })
+        .collect();
+    let frame = FrameSubmission {
+        width: W,
+        height: H,
+        stride: STRIDE,
+        pixels: pixels.clone(),
+        dmabuf_fd: None,
+        timestamp_us: 0,
+        damage_tiles: None,
+        capture_done_ns: 0,
+    };
+    backend.analyse(&frame, &[], false).expect("analyse");
+    // (3, 2) is the bottom-right edge tile, (3, 0) a right edge tile.
+    let fallback = [(1u32, 0u32), (0, 2), (3, 2), (3, 0)];
+    let out = backend.finish_tile(
+        &frame,
+        &TileRequest {
+            cols: 4,
+            rows: 3,
+            escalation: &[],
+            fallback: &fallback,
+        },
+    );
+    assert_eq!(out.cdf53_fallback.len(), fallback.len());
+    let grid = crate::tile::TileGrid::new(W, H);
+    for (&(tx, ty), (got_xy, got)) in fallback.iter().zip(out.cdf53_fallback.iter()) {
+        assert_eq!((tx, ty), *got_xy);
+        let tile = grid.extract_tile(&pixels, STRIDE, tx, ty);
+        let (present, passes) =
+            crate::encoder::cdf53::encode_passes_sparse(&crate::encoder::cdf53::forward(&tile));
+        assert_eq!(got.present_passes, present, "tile ({tx},{ty}) pass mask");
+        assert_eq!(got.passes, passes, "tile ({tx},{ty}) pass bytes");
+    }
 }

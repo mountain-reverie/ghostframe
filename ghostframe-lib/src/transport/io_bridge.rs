@@ -518,6 +518,9 @@ pub struct IoBridge {
     session_epoch: u64,
     /// A failure `run` must stop on (the frame worker died).
     fatal: Option<String>,
+    /// CDF 5/3 fallback tiles the worker already encoded for the frame being
+    /// committed; consumed by `commit_cdf53_fallback`.
+    precomputed_fallback: std::collections::HashMap<(u32, u32), Cdf53Encoded>,
     #[cfg(test)]
     test_commit_dg_size: Option<usize>,
     /// Client decode errors that named a tile of the frame being committed;
@@ -1111,6 +1114,7 @@ impl IoBridge {
             pending_controls: Vec::new(),
             session_epoch: 0,
             fatal: None,
+            precomputed_fallback: std::collections::HashMap::new(),
             #[cfg(test)]
             test_commit_dg_size: None,
             deferred_decode_errors: Vec::new(),

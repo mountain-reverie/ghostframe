@@ -81,6 +81,7 @@ impl FrameBackend for SleepyBackend {
             palrle: OwnedPalRle::default(),
             cdf53_dirty: Vec::new(),
             cdf53_escalation: Vec::<Option<Cdf53Encoded>>::new(),
+            cdf53_fallback: Vec::new(),
             timings: TileTimings::default(),
         }
     }
