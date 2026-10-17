@@ -59,6 +59,13 @@ const UNIQUE_COLORS_UNKNOWN_SENTINEL: u32 = u16::MAX as u32;
 /// dedicated escalation_coefficients_buffer (K × 3072 × 4 = 6 MB at K=512).
 pub(crate) const MAX_ESCALATION_PER_FRAME: usize = 512;
 
+/// The most tiles one frame may have, which sizes the processor's buffers
+/// (about 13 KB of host memory per tile, 200 MB at this value). It must cover
+/// the largest screen the server is asked to serve: one 4K screen is 8160
+/// tiles and two side by side 16320. A frame above it fails every time, so this
+/// is a ceiling to raise deliberately, not a default to forget.
+pub(crate) const MAX_FRAME_TILES: u32 = 16_384;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
