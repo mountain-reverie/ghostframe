@@ -931,14 +931,22 @@ async fn iobridge_holds_scheduler_zero_sized_on_construction() {
     assert_eq!(bridge.scheduler.queue_len(), 0);
 }
 
-/// A recording stand-in for the GPU backend: what the loop asked of it, in
-/// order, and a canned H.264 result.
+/// A recording stand-in for the GPU backend: what the worker was asked, in
+/// order, with knobs to make it fail, panic, or take its time.
 #[derive(Default)]
 struct RecordingBackend {
     log: Arc<std::sync::Mutex<Vec<String>>>,
     h264: Option<(Vec<u8>, bool)>,
     /// `forward_cdf53_tiles` fails, as a lost device or a failed submit would.
     fail_forward: bool,
+    analyse_err: Option<String>,
+    /// Tiles `analyse` reports dirty.
+    dirty_tiles: Vec<u32>,
+    panic_in_analyse: bool,
+    analyse_sleep: std::time::Duration,
+    /// Shared by backends that must not overlap: how many are inside a call.
+    inside: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    max_inside: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl FrameBackend for RecordingBackend {
@@ -951,8 +959,27 @@ impl FrameBackend for RecordingBackend {
         _escalation: &[u32],
         _want_diag: bool,
     ) -> Result<Analysed, String> {
+        use std::sync::atomic::Ordering::SeqCst;
         self.log.lock().unwrap().push("analyse".into());
-        Ok(Analysed::default())
+        if self.panic_in_analyse {
+            panic!("recording backend: told to panic");
+        }
+        if let (Some(inside), Some(max)) = (&self.inside, &self.max_inside) {
+            let now = inside.fetch_add(1, SeqCst) + 1;
+            max.fetch_max(now, SeqCst);
+        }
+        std::thread::sleep(self.analyse_sleep);
+        if let Some(inside) = &self.inside {
+            inside.fetch_sub(1, SeqCst);
+        }
+        match &self.analyse_err {
+            Some(e) => Err(e.clone()),
+            None => Ok(Analysed {
+                dirty_analysis: vec![None; self.dirty_tiles.len()],
+                dirty_tiles: self.dirty_tiles.clone(),
+                ..Default::default()
+            }),
+        }
     }
     fn finish_h264(&mut self, _frame: &FrameSubmission, force_keyframe: bool) -> Option<H264Out> {
         self.log
@@ -964,13 +991,17 @@ impl FrameBackend for RecordingBackend {
             is_keyframe,
         })
     }
-    fn finish_tile(&mut self, _frame: &FrameSubmission, _req: &TileRequest<'_>) -> TileOut {
-        self.log.lock().unwrap().push("finish_tile".into());
+    fn finish_tile(&mut self, _frame: &FrameSubmission, req: &TileRequest<'_>) -> TileOut {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("finish_tile fallback={:?}", req.fallback));
         TileOut {
             pixels: Err("recording backend".into()),
             palrle: OwnedPalRle::default(),
             cdf53_dirty: Vec::new(),
             cdf53_escalation: Vec::new(),
+            cdf53_fallback: Vec::new(),
             timings: TileTimings::default(),
         }
     }
@@ -993,13 +1024,7 @@ impl FrameBackend for RecordingBackend {
     }
 }
 
-fn recording_bridge(
-    h264: Option<(Vec<u8>, bool)>,
-) -> (
-    IoBridge,
-    tokio::net::UnixStream,
-    Arc<std::sync::Mutex<Vec<String>>>,
-) {
+fn bridge_with_backend(backend: RecordingBackend) -> (IoBridge, tokio::net::UnixStream) {
     let (our_end, peer) = std::os::unix::net::UnixStream::pair().expect("pair");
     our_end.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
@@ -1010,13 +1035,19 @@ fn recording_bridge(
         server,
         rx,
     );
-    let backend = RecordingBackend {
-        h264,
-        ..Default::default()
-    };
-    let log = backend.log.clone();
     bridge.set_frame_backend(Box::new(backend));
-    (bridge, tokio::net::UnixStream::from_std(peer).unwrap(), log)
+    (bridge, tokio::net::UnixStream::from_std(peer).unwrap())
+}
+
+fn recording_bridge() -> (
+    IoBridge,
+    tokio::net::UnixStream,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let backend = RecordingBackend::default();
+    let log = backend.log.clone();
+    let (bridge, peer) = bridge_with_backend(backend);
+    (bridge, peer, log)
 }
 
 /// The CDF 5/3 fallback reaches the GPU through the backend seam, once per
@@ -1024,7 +1055,7 @@ fn recording_bridge(
 #[tokio::test]
 async fn the_cdf53_fallback_forwards_its_tiles_through_the_backend_in_one_call() {
     use crate::tile::CodecState;
-    let (mut bridge, _peer, log) = recording_bridge(None);
+    let (mut bridge, _peer, log) = recording_bridge();
     bridge.scheduler.resize(4, 4);
     bridge.metrics_tracker.resize(4, 4);
     bridge.metrics_tracker.get_mut(0, 0).codec_state = CodecState::Skip;
@@ -1081,7 +1112,7 @@ async fn a_tile_falling_back_from_queued_palrle_releases_its_palette() {
     use crate::tile::CodecState;
     use crate::transport::protocol::Codec;
     use crate::transport::scheduler::{TileWork, WorkState};
-    let (mut bridge, _peer, _log) = recording_bridge(None);
+    let (mut bridge, _peer, _log) = recording_bridge();
     bridge.scheduler.resize(4, 4);
     bridge.metrics_tracker.resize(4, 4);
     bridge.palette_table.ref_count[9] = 1;
@@ -1113,23 +1144,27 @@ async fn a_tile_falling_back_from_queued_palrle_releases_its_palette() {
 #[tokio::test]
 async fn a_failed_cdf53_forward_sends_nothing_and_requests_a_retry() {
     use crate::tile::CodecState;
-    let (mut bridge, _peer, log) = recording_bridge(None);
-    bridge.set_frame_backend(Box::new(RecordingBackend {
-        log: log.clone(),
+    let backend = RecordingBackend {
         fail_forward: true,
         ..Default::default()
-    }));
+    };
+    let log = backend.log.clone();
+    let (mut bridge, _peer) = bridge_with_backend(backend);
     bridge.scheduler.resize(4, 4);
     bridge.metrics_tracker.resize(4, 4);
     bridge.metrics_tracker.get_mut(1, 1).codec_state = CodecState::Skip;
     fallback_dispatch(&mut bridge, &[(1, 1)]);
     assert!(bridge.scheduler.peek_for_test().is_empty(), "no Raw");
     assert!(bridge.scheduler.refinement_peek_for_test().is_empty());
-    assert!(log
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|l| l == "apply InvalidateBaseline(1)"));
+    // The retry control is queued for the worker, behind the failed request.
+    assert!(
+        bridge
+            .pending_controls
+            .contains(&Control::InvalidateBaseline(1)),
+        "{:?} / {:?}",
+        bridge.pending_controls,
+        log.lock().unwrap()
+    );
 }
 
 fn tiny_frame() -> FrameSubmission {
@@ -1145,41 +1180,400 @@ fn tiny_frame() -> FrameSubmission {
     }
 }
 
+/// Wait for the worker's next message (it runs on its own thread).
+async fn next_worker_message(bridge: &mut IoBridge) -> Option<FromWorker> {
+    let rx = &mut bridge.frame_pipeline.as_mut().unwrap().rx;
+    tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the worker answered within 5 s")
+}
+
 /// A reconnecting client must get a clean slate from the GPU side too: the
 /// SAD baseline is dropped for 20 frames and the encoder is told to emit an
-/// IDR, in that order, through the backend. (This replaces a test that only
-/// poked the encoder directly and never ran the reset path.)
+/// IDR, in that order, and a frame the worker is still on is marked as
+/// belonging to the old session. (This replaces a test that only poked the
+/// encoder directly and never ran the reset path.)
 #[tokio::test]
-async fn session_reset_tells_the_backend_to_invalidate_then_keyframe() {
-    let (mut bridge, _peer, log) = recording_bridge(None);
+async fn session_reset_queues_invalidate_then_keyframe_and_ends_the_epoch() {
+    let (mut bridge, _peer, _log) = recording_bridge();
+    let before = bridge.session_epoch;
     bridge.fire_session_reset(ConnectionHandle(0));
+    assert_eq!(
+        bridge.pending_controls,
+        vec![Control::InvalidateBaseline(20), Control::RequestKeyframe]
+    );
+    assert_eq!(bridge.session_epoch, before + 1);
+}
+
+/// A frame whose session ended while the worker held it is not committed: the
+/// worker is told to discard it, and the GPU baseline, which the frame already
+/// advanced, is invalidated so the next frame repaints.
+#[tokio::test]
+async fn a_frame_whose_session_ended_in_flight_is_discarded_and_the_baseline_invalidated() {
+    let (mut bridge, _peer, log) = recording_bridge();
+    bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    assert!(bridge.in_flight.is_some());
+    let analysed = next_worker_message(&mut bridge).await.expect("analysed");
+    assert!(matches!(analysed, FromWorker::Analysed { .. }));
+
+    bridge.session_epoch += 1; // the session ended while the GPU worked
+    bridge.on_frame_worker_message(analysed);
+    assert!(bridge.in_flight.is_some(), "the discard is still in flight");
+    let discarded = next_worker_message(&mut bridge).await.expect("discarded");
+    assert!(matches!(discarded, FromWorker::Discarded { .. }));
+    bridge.on_frame_worker_message(discarded);
+    assert!(bridge.in_flight.is_none());
+
     assert_eq!(
         *log.lock().unwrap(),
         vec![
-            "apply InvalidateBaseline(20)".to_string(),
-            "apply RequestKeyframe".to_string()
+            "analyse".to_string(),
+            "apply InvalidateBaseline(1)".to_string(),
+            "finish_discard".to_string(),
         ]
     );
 }
 
-/// Re-entering H.264 from the tile path forces an IDR (a fresh anchor for the
-/// client); staying in H.264 does not. An empty dirty set encodes nothing and
-/// releases the frame's GPU outputs.
+/// A reset's 20-frame cushion must not be shortened to 1 by a discard queued
+/// after it.
 #[tokio::test]
-async fn the_h264_arm_asks_for_a_keyframe_only_on_re_entry_and_discards_when_idle() {
+async fn a_discard_does_not_shorten_a_resets_baseline_cushion() {
+    let (mut bridge, _peer, log) = recording_bridge();
+    bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    let analysed = next_worker_message(&mut bridge).await.unwrap();
+    bridge.fire_session_reset(ConnectionHandle(0));
+    bridge.on_frame_worker_message(analysed);
+    let discarded = next_worker_message(&mut bridge).await.unwrap();
+    bridge.on_frame_worker_message(discarded);
+    let log = log.lock().unwrap();
+    assert!(
+        log.contains(&"apply InvalidateBaseline(20)".to_string()),
+        "{log:?}"
+    );
+    assert!(
+        !log.contains(&"apply InvalidateBaseline(1)".to_string()),
+        "{log:?}"
+    );
+}
+
+/// A failed GPU stage hands the frame back and the CPU pipeline takes it.
+#[tokio::test]
+async fn a_failed_gpu_stage_returns_the_frame_and_clears_the_flight() {
+    let backend = RecordingBackend {
+        analyse_err: Some("device lost".into()),
+        ..Default::default()
+    };
+    let (mut bridge, _peer) = bridge_with_backend(backend);
+    bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    let msg = next_worker_message(&mut bridge).await.unwrap();
+    assert!(matches!(msg, FromWorker::AnalyseFailed { .. }));
+    bridge.on_frame_worker_message(msg);
+    assert!(bridge.in_flight.is_none());
+    assert!(bridge.fatal.is_none());
+}
+
+/// A panic in the worker is fatal and says why: the result channel closes
+/// with the panic message recorded, and `run` returns an error carrying it,
+/// rather than the stream carrying on with a dead backend.
+#[tokio::test]
+async fn a_worker_panic_ends_run_with_an_error_naming_it() {
+    let backend = RecordingBackend {
+        panic_in_analyse: true,
+        ..Default::default()
+    };
+    let (mut bridge, _peer) = bridge_with_backend(backend);
+    bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), bridge.run())
+        .await
+        .expect("run noticed the dead worker within 5 s");
+    let err = outcome.expect_err("run returns an error when the worker dies");
+    let text = err.to_string();
+    assert!(
+        text.contains("told to panic"),
+        "the error should carry the panic message: {text}"
+    );
+}
+
+/// What to tell the worker for a frame the classifier put in H.264 mode: nothing
+/// when no tile changed, else an encode that forces an IDR only on re-entry
+/// from the tile path.
+#[test]
+fn the_h264_finish_action_forces_a_keyframe_only_on_re_entry_and_discards_when_idle() {
     use crate::tile::FrameMode;
-    let (mut bridge, _peer, log) = recording_bridge(Some((vec![1, 2, 3], true)));
-    let frame = tiny_frame();
-    bridge.emit_h264_frame(&[(0, 0)], &frame, FrameMode::TileCodec, 1, 1200);
-    bridge.emit_h264_frame(&[(0, 0)], &frame, FrameMode::H264, 2, 1200);
-    bridge.emit_h264_frame(&[], &frame, FrameMode::H264, 3, 1200);
+    let action = |empty, prev| frame::h264_finish_action(empty, prev);
+    assert!(matches!(
+        action(false, FrameMode::TileCodec),
+        FinishAction::H264 {
+            force_keyframe: true
+        }
+    ));
+    assert!(matches!(
+        action(false, FrameMode::H264),
+        FinishAction::H264 {
+            force_keyframe: false
+        }
+    ));
+    assert!(matches!(
+        action(true, FrameMode::H264),
+        FinishAction::Discard
+    ));
+    assert!(matches!(
+        action(true, FrameMode::TileCodec),
+        FinishAction::Discard
+    ));
+}
+
+fn stale_inflight(stage: frame::InFlightStage) -> frame::InFlight {
+    frame::InFlight {
+        seq: 1,
+        epoch: 0,
+        meta: frame::FrameMeta::of(&tiny_frame()),
+        max_dg_size: 1200,
+        stage,
+    }
+}
+
+/// An H.264 result for a session that has ended is dropped, and the encoder is
+/// told to start the next frame with an IDR: its reference chain advanced past
+/// a frame the client never got.
+#[tokio::test]
+async fn a_stale_h264_result_is_dropped_and_asks_for_a_keyframe() {
+    let (mut bridge, _peer, _log) = recording_bridge();
+    bridge.test_commit_dg_size = Some(1200);
+    bridge.session_epoch = 1;
+    bridge.on_h264_done(
+        stale_inflight(frame::InFlightStage::FinishingH264 {
+            trace: Default::default(),
+        }),
+        Some(H264Out {
+            payload: vec![1, 2, 3],
+            is_keyframe: false,
+        }),
+        0,
+    );
+    assert_eq!(bridge.pending_controls, vec![Control::RequestKeyframe]);
+}
+
+/// A tile result for a session that has ended is dropped, and the GPU baseline
+/// (which the frame advanced) is invalidated so the next frame repaints.
+#[tokio::test]
+async fn a_stale_tile_result_is_dropped_and_invalidates_the_baseline() {
+    let (mut bridge, _peer, _log) = recording_bridge();
+    bridge.test_commit_dg_size = Some(1200);
+    bridge.session_epoch = 1;
+    let out = TileOut {
+        pixels: Ok(PixelSource::Frame),
+        palrle: OwnedPalRle::default(),
+        cdf53_dirty: Vec::new(),
+        cdf53_escalation: Vec::new(),
+        cdf53_fallback: Vec::new(),
+        timings: TileTimings::default(),
+    };
+    bridge.on_tile_done(
+        stale_inflight(frame::InFlightStage::FinishingTile {
+            dirty_xy: vec![(0, 0)],
+            max_frag: 1000,
+            escalation_candidates: Vec::new(),
+            stranded_count: 0,
+            frame_palette_set_count: 0,
+            trace: Default::default(),
+        }),
+        out,
+        Vec::new(),
+        0,
+    );
     assert_eq!(
-        *log.lock().unwrap(),
-        vec![
-            "finish_h264 force_keyframe=true".to_string(),
-            "finish_h264 force_keyframe=false".to_string(),
-            "finish_discard".to_string(),
-        ]
+        bridge.pending_controls,
+        vec![Control::InvalidateBaseline(1)]
+    );
+}
+
+fn empty_tile_out() -> TileOut {
+    TileOut {
+        pixels: Ok(PixelSource::Frame),
+        palrle: OwnedPalRle::default(),
+        cdf53_dirty: Vec::new(),
+        cdf53_escalation: Vec::new(),
+        cdf53_fallback: Vec::new(),
+        timings: TileTimings::default(),
+    }
+}
+
+fn tile_inflight() -> frame::InFlight {
+    stale_inflight(frame::InFlightStage::FinishingTile {
+        dirty_xy: vec![(0, 0)],
+        max_frag: 1000,
+        escalation_candidates: Vec::new(),
+        stranded_count: 0,
+        frame_palette_set_count: 0,
+        trace: Default::default(),
+    })
+}
+
+/// With the same epoch but no live session left to size datagrams for, the
+/// result is dropped like a stale one.
+#[tokio::test]
+async fn a_tile_result_with_no_live_session_left_is_dropped() {
+    let (mut bridge, _peer, _log) = recording_bridge();
+    bridge.on_tile_done(tile_inflight(), empty_tile_out(), Vec::new(), 0);
+    assert_eq!(
+        bridge.pending_controls,
+        vec![Control::InvalidateBaseline(1)]
+    );
+}
+
+/// The path MTU can shrink while the worker runs: the tile frame is
+/// fragmented for the smaller size, and one that no longer fits a fragment is
+/// dropped with a repaint rather than sent in oversize datagrams.
+#[tokio::test]
+async fn a_path_mtu_that_shrank_below_a_fragment_drops_the_tile_frame() {
+    let (mut bridge, _peer, _log) = recording_bridge();
+    bridge.test_commit_dg_size = Some(10);
+    bridge.on_tile_done(tile_inflight(), empty_tile_out(), Vec::new(), 0);
+    assert_eq!(
+        bridge.pending_controls,
+        vec![Control::InvalidateBaseline(1)]
+    );
+}
+
+/// The frame's dimensions are announced when its results are committed, not
+/// when its analysis is accepted: on a resolution change the client resizes its
+/// canvas on them, and the finish can take a second.
+#[tokio::test]
+async fn a_frame_with_dirty_tiles_does_not_announce_its_dimensions_at_analysis() {
+    struct Dirty(RecordingBackend);
+    impl FrameBackend for Dirty {
+        fn apply(&mut self, c: Control) {
+            self.0.apply(c)
+        }
+        fn analyse(&mut self, f: &FrameSubmission, e: &[u32], d: bool) -> Result<Analysed, String> {
+            let mut a = self.0.analyse(f, e, d)?;
+            a.dirty_tiles = vec![0];
+            a.dirty_analysis = vec![None];
+            Ok(a)
+        }
+        fn finish_h264(&mut self, f: &FrameSubmission, k: bool) -> Option<H264Out> {
+            self.0.finish_h264(f, k)
+        }
+        fn finish_tile(&mut self, f: &FrameSubmission, r: &TileRequest<'_>) -> TileOut {
+            self.0.finish_tile(f, r)
+        }
+        fn finish_discard(&mut self) {
+            self.0.finish_discard()
+        }
+        fn forward_cdf53_tiles(&mut self, t: &[&[u8]]) -> Result<Vec<i16>, String> {
+            self.0.forward_cdf53_tiles(t)
+        }
+    }
+    let (mut bridge, _peer) = {
+        let (our_end, peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        our_end.set_nonblocking(true).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(
+            tokio::net::UnixStream::from_std(our_end).unwrap(),
+            server,
+            rx,
+        );
+        bridge.set_frame_backend(Box::new(Dirty(RecordingBackend::default())));
+        (bridge, tokio::net::UnixStream::from_std(peer).unwrap())
+    };
+    bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    let analysed = next_worker_message(&mut bridge).await.unwrap();
+    bridge.on_frame_worker_message(analysed);
+    assert!(bridge.in_flight.is_some(), "the frame is being finished");
+    assert_eq!(
+        bridge.last_emitted_dimensions, None,
+        "dimensions wait for the commit"
+    );
+}
+
+/// A client decode error that names a tile of the frame being committed waits
+/// for the commit: until then the tile's codec state is tentative.
+#[tokio::test]
+async fn a_decode_error_for_a_tile_in_flight_waits_for_the_commit() {
+    use crate::tile::CodecState;
+    use crate::transport::decode_error::{DecodeErrorMsg, ERR_THIN_UNCACHED_PALETTE};
+    let (mut bridge, _peer, _log) = recording_bridge();
+    bridge.metrics_tracker.resize(2, 2);
+    bridge.metrics_tracker.get_mut(1, 1).codec_state = CodecState::PalRle { palette_id: 5 };
+    bridge.palette_table.delivered.insert(5);
+    bridge.in_flight = Some(stale_inflight(frame::InFlightStage::FinishingTile {
+        dirty_xy: vec![(1, 1)],
+        max_frag: 1000,
+        escalation_candidates: Vec::new(),
+        stranded_count: 0,
+        frame_palette_set_count: 0,
+        trace: Default::default(),
+    }));
+    bridge.handle_decode_error(DecodeErrorMsg {
+        codec: 2,
+        tile_x: 1,
+        tile_y: 1,
+        error_code: ERR_THIN_UNCACHED_PALETTE,
+    });
+    assert!(
+        bridge.palette_table.delivered.contains(5),
+        "not handled while the tile's frame is in flight"
+    );
+    assert_eq!(bridge.deferred_decode_errors.len(), 1);
+
+    // The frame ends (here a discard): the error is handled against the
+    // committed state.
+    let (mut b, _p, _l) = (bridge, _peer, _log);
+    b.in_flight = Some(stale_inflight(frame::InFlightStage::FinishingDiscard));
+    b.on_frame_worker_message(FromWorker::Discarded { seq: 1 });
+    assert!(b.deferred_decode_errors.is_empty());
+    assert!(
+        !b.palette_table.delivered.contains(5),
+        "handled once the frame is done"
+    );
+}
+
+/// Dropping the bridge stops waiting for a stuck worker after the bound, not
+/// when the stuck call returns.
+#[tokio::test]
+async fn shutdown_waits_for_the_worker_only_for_the_bound() {
+    let backend = RecordingBackend {
+        // Holds the process-wide hardware lock while it sleeps, so keep it short
+        // enough not to starve the other worker tests past their 5 s wait.
+        analyse_sleep: std::time::Duration::from_secs(3),
+        ..Default::default()
+    };
+    let (mut bridge, _peer) = bridge_with_backend(backend);
+    bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    let t0 = std::time::Instant::now();
+    drop(bridge);
+    let waited = std::time::Instant::now().duration_since(t0);
+    assert!(
+        waited >= frame_worker::SHUTDOWN_JOIN && waited < frame_worker::SHUTDOWN_JOIN * 3,
+        "waited {waited:?}"
+    );
+}
+
+/// Two bridges in one process never run their backends at once.
+#[tokio::test]
+async fn two_bridges_never_use_the_hardware_at_the_same_time() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let inside = Arc::new(AtomicUsize::new(0));
+    let max = Arc::new(AtomicUsize::new(0));
+    let mk = || RecordingBackend {
+        analyse_sleep: std::time::Duration::from_millis(150),
+        inside: Some(inside.clone()),
+        max_inside: Some(max.clone()),
+        ..Default::default()
+    };
+    let (mut a, _pa) = bridge_with_backend(mk());
+    let (mut b, _pb) = bridge_with_backend(mk());
+    a.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    b.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    let _ = next_worker_message(&mut a).await;
+    let _ = next_worker_message(&mut b).await;
+    assert_eq!(
+        max.load(SeqCst),
+        1,
+        "both backends were inside a call at once"
     );
 }
 
@@ -5147,7 +5541,7 @@ async fn gpu_failure_on_a_dmabuf_only_frame_does_not_enter_the_cpu_pipeline() {
     let mut bridge = make_bridge_for_test().await;
     bridge.frame_seq = 7;
 
-    bridge.fall_back_to_cpu_after_gpu_error(frame_for_fallback(Vec::new(), true), 7);
+    bridge.fall_back_to_cpu_after_gpu_error(frame_for_fallback(Vec::new(), true), 7, false);
 
     assert!(
         !cap.text().contains("frame.captured"),
@@ -5169,7 +5563,11 @@ async fn gpu_failure_fallback_reuses_the_sequence_number_and_dimensions() {
     // What process_frame_gpu has done by the time its processor fails.
     bridge.frame_seq = 7;
 
-    bridge.fall_back_to_cpu_after_gpu_error(frame_for_fallback(vec![0x55; 64 * 64 * 4], false), 7);
+    bridge.fall_back_to_cpu_after_gpu_error(
+        frame_for_fallback(vec![0x55; 64 * 64 * 4], false),
+        7,
+        false,
+    );
 
     let logs = cap.text();
     assert!(
@@ -5703,7 +6101,7 @@ async fn superseding_a_thin_emission_leaves_the_carry_count_alone() {
 #[tokio::test]
 async fn the_tile_arm_commits_the_backends_cdf53_results_and_skips_what_it_skipped() {
     const W: u32 = 128;
-    let (mut bridge, _peer, _log) = recording_bridge(None);
+    let (mut bridge, _peer, _log) = recording_bridge();
     bridge.scheduler.resize(4, 4);
     bridge.metrics_tracker.resize(4, 4);
     let frame = FrameSubmission {
@@ -5736,7 +6134,14 @@ async fn the_tile_arm_commits_the_backends_cdf53_results_and_skips_what_it_skipp
         timings: TileTimings::default(),
         frame_palette_set_count: 0,
     };
-    bridge.emit_tile_codec_frame(&[(1, 1)], &frame, &frame.pixels, results, 1, 1000);
+    bridge.emit_tile_codec_frame(
+        &[(1, 1)],
+        &frame::FrameMeta::of(&frame),
+        &frame.pixels,
+        results,
+        1,
+        1000,
+    );
     assert!(
         bridge.scheduler.refinement_queue_holds_tile(1, 1)
             || bridge.scheduler.generation_for(1, 1) > 0,
@@ -5751,4 +6156,234 @@ async fn the_tile_arm_commits_the_backends_cdf53_results_and_skips_what_it_skipp
         0,
         "the slot the backend skipped was not committed"
     );
+}
+
+/// The tiles the worker pre-encodes are those no tile encoder will carry.
+#[tokio::test]
+async fn the_worker_pre_encodes_exactly_the_tiles_no_tile_encoder_carries() {
+    use crate::tile::CodecState;
+    let (mut bridge, _peer, _log) = recording_bridge();
+    bridge.metrics_tracker.resize(3, 2);
+    let set = |b: &mut IoBridge, x, y, s| b.metrics_tracker.get_mut(x, y).codec_state = s;
+    set(&mut bridge, 0, 0, CodecState::Skip);
+    set(&mut bridge, 1, 0, CodecState::H264 { frames_in_h264: 3 });
+    set(&mut bridge, 2, 0, CodecState::PixelPerfect);
+    set(&mut bridge, 0, 1, CodecState::Solid);
+    set(&mut bridge, 1, 1, CodecState::PalRle { palette_id: 2 });
+    let all: Vec<(u32, u32)> = (0..2).flat_map(|y| (0..3).map(move |x| (x, y))).collect();
+    set(
+        &mut bridge,
+        2,
+        1,
+        CodecState::Cdf53 {
+            passes_sent: 0,
+            present_passes: 1,
+        },
+    );
+    assert_eq!(
+        bridge.worker_fallback_tiles(&all),
+        vec![(0, 0), (1, 0), (2, 0)]
+    );
+}
+
+/// After an H.264 exit the first tile frame has every dirty tile in the H264
+/// state, so every one of them takes the CDF 5/3 fallback. The worker encodes
+/// them in the frame's own finish, so committing the frame makes no blocking
+/// request of the worker (a full-screen round trip is 20 ms at 1080p, 86 ms at
+/// 4K, on the loop).
+#[tokio::test]
+async fn a_full_screen_tile_frame_after_an_h264_exit_makes_no_blocking_forward() {
+    use crate::tile::CodecState;
+    const W: u32 = 128;
+    let (mut bridge, _peer, log) = recording_bridge();
+    bridge.test_commit_dg_size = Some(1200);
+    bridge.scheduler.resize(4, 4);
+    bridge.metrics_tracker.resize(4, 4);
+    let all: Vec<(u32, u32)> = (0..4).flat_map(|y| (0..4).map(move |x| (x, y))).collect();
+    for &(x, y) in &all {
+        bridge.metrics_tracker.get_mut(x, y).codec_state = CodecState::H264 { frames_in_h264: 9 };
+    }
+    // What the worker returns for them: every tile, already encoded.
+    let enc = |v: u8| Cdf53Encoded {
+        present_passes: 1,
+        passes: vec![(0, vec![v; 8])],
+    };
+    let out = TileOut {
+        pixels: Ok(PixelSource::Frame),
+        palrle: OwnedPalRle::default(),
+        cdf53_dirty: Vec::new(),
+        cdf53_escalation: Vec::new(),
+        cdf53_fallback: all.iter().map(|&xy| (xy, enc(1))).collect(),
+        timings: TileTimings::default(),
+    };
+    let inflight = stale_inflight(frame::InFlightStage::FinishingTile {
+        dirty_xy: all.clone(),
+        max_frag: 1000,
+        escalation_candidates: Vec::new(),
+        stranded_count: 0,
+        frame_palette_set_count: 0,
+        trace: Default::default(),
+    });
+    let inflight = frame::InFlight {
+        meta: frame::FrameMeta {
+            width: W,
+            height: W,
+            stride: W * 4,
+            timestamp_us: 0,
+            capture_done_ns: 0,
+        },
+        ..inflight
+    };
+    bridge.on_tile_done(inflight, out, vec![0x40; (W * W * 4) as usize], 0);
+
+    assert_eq!(
+        bridge.frame_pipeline.as_ref().unwrap().forward_requests(),
+        0,
+        "no blocking Forward request"
+    );
+    assert!(
+        !log.lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("forward_cdf53_tiles")),
+        "the worker was never asked to forward"
+    );
+    for &(x, y) in &all {
+        assert!(
+            bridge.scheduler.generation_for(x as u8, y as u8) > 0,
+            "tile ({x},{y}) was committed as CDF 5/3"
+        );
+    }
+}
+
+/// A tile the GPU's own compact list already covers is not transformed a
+/// second time for the fallback.
+#[test]
+fn fallback_tiles_already_in_the_compact_list_are_not_forwarded_twice() {
+    let in_list: std::collections::HashSet<u32> = [5u32, 10].into_iter().collect();
+    // 4 columns: flat 5 = (1,1), flat 10 = (2,2).
+    let got = super::frame_backend::fallback_not_in_compact_list(
+        &[(0, 0), (1, 1), (2, 2), (3, 3)],
+        4,
+        &in_list,
+    );
+    assert_eq!(got, vec![(0, 0), (3, 3)]);
+}
+
+/// The finish request the loop builds lists the dirty tiles in a state no tile
+/// encoder carries (and the worker passes the list on to the backend).
+#[tokio::test]
+async fn the_finish_request_lists_the_tiles_the_loop_classified_as_fallback() {
+    use crate::tile::CodecState;
+    let backend = RecordingBackend::default();
+    let log = backend.log.clone();
+    let (mut bridge, _peer) = bridge_with_backend(backend);
+    bridge.metrics_tracker.resize(4, 4);
+    let set = |b: &mut IoBridge, x, y, s| b.metrics_tracker.get_mut(x, y).codec_state = s;
+    set(&mut bridge, 0, 0, CodecState::Skip);
+    set(&mut bridge, 1, 0, CodecState::H264 { frames_in_h264: 2 });
+    set(&mut bridge, 2, 0, CodecState::Solid);
+    set(&mut bridge, 3, 0, CodecState::PixelPerfect);
+    let dirty = [(0, 0), (1, 0), (2, 0), (3, 0)];
+    let (action, _, _) = bridge.tile_finish_action(4, 4, &dirty);
+    let FinishAction::Tile { fallback, .. } = &action else {
+        panic!("a tile frame is finished with FinishAction::Tile");
+    };
+    assert_eq!(fallback, &vec![(0, 0), (1, 0), (3, 0)]);
+
+    // And the worker hands it to the backend as the request's fallback list.
+    bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+    let analysed = next_worker_message(&mut bridge).await.unwrap();
+    let inflight = bridge.in_flight.take().unwrap();
+    drop(analysed);
+    bridge.send_finish(inflight, action, frame::InFlightStage::FinishingDiscard);
+    let _done = next_worker_message(&mut bridge).await.unwrap();
+    assert!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .any(|l| l == "finish_tile fallback=[(0, 0), (1, 0), (3, 0)]"),
+        "{:?}",
+        log.lock().unwrap()
+    );
+}
+
+/// A fallback tile the worker did not pre-encode (a PalRle tile that lost its
+/// palette at commit) is the one case that still asks the worker.
+#[tokio::test]
+async fn a_fallback_tile_the_worker_did_not_encode_still_asks_for_it() {
+    use crate::tile::CodecState;
+    let (mut bridge, _peer, log) = recording_bridge();
+    bridge.scheduler.resize(4, 4);
+    bridge.metrics_tracker.resize(4, 4);
+    bridge.metrics_tracker.get_mut(1, 1).codec_state = CodecState::Skip;
+    fallback_dispatch(&mut bridge, &[(1, 1)]);
+    assert_eq!(
+        bridge.frame_pipeline.as_ref().unwrap().forward_requests(),
+        1
+    );
+    assert!(log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l == "forward_cdf53_tiles 1"));
+}
+
+/// The real backend's fallback pre-encode is the CPU transform of the same
+/// tiles, byte for byte: the worker path changes where the work runs, not what
+/// it produces. Needs a GPU; skips without one.
+#[tokio::test]
+async fn gpu_backend_pre_encodes_fallback_tiles_exactly_as_the_cpu_transform() {
+    // Not a multiple of 32 in either direction, and a padded stride, so the
+    // right and bottom edge tiles and the stride are exercised.
+    const W: u32 = 100;
+    const H: u32 = 70;
+    const STRIDE: u32 = W * 4 + 16;
+    let _gpu = crate::gpu_test_lock::lock();
+    let processor = crate::capture::gpu_pipeline::GpuFrameProcessor::new(256)
+        .expect("this test needs a Vulkan GPU and must not skip");
+    let mut backend = GpuBackend::new(processor);
+    // Three flat colours in diagonal bands: every tile has few colours, so none
+    // is in the GPU's own CDF 5/3 compact list (which is what the fallback
+    // covers), yet every tile has edges, so the transform is not trivial.
+    let colours: [[u8; 4]; 3] = [[10, 20, 30, 255], [200, 100, 50, 255], [90, 220, 140, 255]];
+    let pixels: Vec<u8> = (0..STRIDE * H)
+        .map(|i| {
+            let (row, col) = (i / STRIDE, i % STRIDE);
+            let px = (col / 4) as usize;
+            colours[(px / 7 + row as usize / 5) % 3][(col % 4) as usize]
+        })
+        .collect();
+    let frame = FrameSubmission {
+        width: W,
+        height: H,
+        stride: STRIDE,
+        pixels: pixels.clone(),
+        dmabuf_fd: None,
+        timestamp_us: 0,
+        damage_tiles: None,
+        capture_done_ns: 0,
+    };
+    backend.analyse(&frame, &[], false).expect("analyse");
+    // (3, 2) is the bottom-right edge tile, (3, 0) a right edge tile.
+    let fallback = [(1u32, 0u32), (0, 2), (3, 2), (3, 0)];
+    let out = backend.finish_tile(
+        &frame,
+        &TileRequest {
+            cols: 4,
+            rows: 3,
+            escalation: &[],
+            fallback: &fallback,
+        },
+    );
+    assert_eq!(out.cdf53_fallback.len(), fallback.len());
+    let grid = crate::tile::TileGrid::new(W, H);
+    for (&(tx, ty), (got_xy, got)) in fallback.iter().zip(out.cdf53_fallback.iter()) {
+        assert_eq!((tx, ty), *got_xy);
+        let tile = grid.extract_tile(&pixels, STRIDE, tx, ty);
+        let (present, passes) =
+            crate::encoder::cdf53::encode_passes_sparse(&crate::encoder::cdf53::forward(&tile));
+        assert_eq!(got.present_passes, present, "tile ({tx},{ty}) pass mask");
+        assert_eq!(got.passes, passes, "tile ({tx},{ty}) pass bytes");
+    }
 }

@@ -144,6 +144,83 @@ pub(super) fn stage_trace_enabled() -> bool {
     tracing::enabled!(target: "ghostframe::io_bridge::diag", tracing::Level::TRACE)
 }
 
+/// The parts of a [`FrameSubmission`] the loop still needs after the frame
+/// itself has gone to the worker.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FrameMeta {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub timestamp_us: u32,
+    pub capture_done_ns: u64,
+}
+
+impl FrameMeta {
+    pub(crate) fn of(f: &FrameSubmission) -> Self {
+        Self {
+            width: f.width,
+            height: f.height,
+            stride: f.stride,
+            timestamp_us: f.timestamp_us,
+            capture_done_ns: f.capture_done_ns,
+        }
+    }
+}
+
+/// Loop-side durations of the stages before the worker's finish, carried to
+/// the `frame.stages` trace line.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct StageTrace {
+    pre_us: u64,
+    gpu_us: u64,
+    classify_us: u64,
+}
+
+/// What to tell the worker for a frame the classifier put in H.264 mode: nothing
+/// when no tile changed, otherwise encode, forcing an IDR when the previous
+/// frame was on the tile path (a fresh anchor for the client).
+pub(super) fn h264_finish_action(
+    dirty_is_empty: bool,
+    prev_mode: crate::tile::FrameMode,
+) -> FinishAction {
+    if dirty_is_empty {
+        FinishAction::Discard
+    } else {
+        FinishAction::H264 {
+            force_keyframe: prev_mode == crate::tile::FrameMode::TileCodec,
+        }
+    }
+}
+
+/// The frame the worker holds, and what the loop needs to finish it.
+pub(super) struct InFlight {
+    pub(super) seq: u32,
+    /// `session_epoch` when the frame started; a result for an older epoch is
+    /// discarded.
+    pub(super) epoch: u64,
+    pub(super) meta: FrameMeta,
+    pub(super) max_dg_size: usize,
+    pub(super) stage: InFlightStage,
+}
+
+pub(super) enum InFlightStage {
+    Analysing {
+        pre_us: u64,
+    },
+    FinishingH264 {
+        trace: StageTrace,
+    },
+    FinishingTile {
+        dirty_xy: Vec<(u32, u32)>,
+        max_frag: usize,
+        escalation_candidates: Vec<u32>,
+        stranded_count: usize,
+        frame_palette_set_count: u32,
+        trace: StageTrace,
+    },
+    FinishingDiscard,
+}
+
 /// What the frame backend hands the loop for a tile-path frame, minus the
 /// pixels: owned, so nothing here points into GPU memory.
 pub(super) struct TileResults {
@@ -185,14 +262,15 @@ impl IoBridge {
         // Without this, CPU-pixel frames hit `process_frame_cpu` which emits
         // every tile as `Codec::Raw` and never exercises the wavelet path.
         let has_gpu_input = frame.dmabuf_fd.is_some() || !frame.pixels.is_empty();
-        let path = if has_gpu_input && self.frame_backend.is_some() {
+        let path = if has_gpu_input && self.frame_pipeline.is_some() {
             "gpu"
         } else {
             "cpu"
         };
         // Deliberately the real wall clock, not `now_std()`: this measures
-        // how long the CPU actually spent inside `process_frame` (encode
-        // work), not protocol/deadline time. A virtual-clock timestamp would
+        // how long the loop actually spent inside `process_frame` (for a GPU
+        // frame that is only `begin_gpu_frame`: the GPU and encode work runs on
+        // the frame worker), not protocol/deadline time. A virtual-clock timestamp would
         // not advance while the CPU is busy, so it would report ~0us under
         // the paused-clock browserless harness just like the bug this
         // replaces did.
@@ -206,8 +284,8 @@ impl IoBridge {
             path,
             "[BRIDGE] process_frame ENTER"
         );
-        if has_gpu_input && self.frame_backend.is_some() {
-            self.process_frame_gpu(frame);
+        if has_gpu_input && self.frame_pipeline.is_some() {
+            self.begin_gpu_frame(frame);
         } else {
             self.process_frame_cpu(frame);
         }
@@ -650,8 +728,9 @@ impl IoBridge {
 
     /// Hand a frame to the CPU pipeline after the GPU processor failed on it.
     ///
-    /// `seq` is the number `process_frame_gpu` already assigned and announced
-    /// (frame dimensions included), so neither is repeated here. A frame that
+    /// `seq` is the number `begin_gpu_frame` already assigned. The frame's
+    /// dimensions are announced only once its analysis has been accepted, so a
+    /// failed analysis has not announced them: pass `emit_dimensions`. A frame that
     /// arrived as a DMA-BUF alone has no CPU pixels, and the CPU pipeline would
     /// read an empty buffer as black and send black tiles for the whole
     /// screen. Such a frame is read back from the DMA-BUF first (the same
@@ -662,6 +741,7 @@ impl IoBridge {
         &mut self,
         mut frame: FrameSubmission,
         seq: u32,
+        emit_dimensions: bool,
     ) {
         if frame.pixels.is_empty() {
             let readback = frame.dmabuf_fd.as_ref().map(|fd| {
@@ -685,15 +765,27 @@ impl IoBridge {
                 }
             }
         }
-        self.process_frame_cpu_at(frame, seq, false);
+        self.process_frame_cpu_at(frame, seq, emit_dimensions);
     }
 
     /// GPU-accelerated full-frame pipeline: Vulkan compute dirty detection +
     /// VA-API VPP BGRA→NV12 conversion + H.264 encoding (true zero-copy).
-    fn process_frame_gpu(&mut self, frame: FrameSubmission) {
-        // Either a DMA-BUF fd (zero-copy import) or CPU pixels (upload via
-        // HOST_VISIBLE staging image) must be present — the public dispatcher
-        // (`process_frame`) enforces that invariant.
+    ///
+    /// The frame is processed in loop-sized steps around a worker thread that
+    /// owns the GPU and the encoder (see `frame_worker`), one frame in flight:
+    ///
+    /// 1. here: sequence number, session gate, escalation candidates, then the
+    ///    frame goes to the worker for its GPU stage;
+    /// 2. [`Self::on_analysed`] when the worker answers: dimensions, the
+    ///    classifier, the sweep and the mode decision (all loop state), then the
+    ///    worker is told what to finish with;
+    /// 3. [`Self::on_h264_done`] / [`Self::on_tile_done`]: commit the results to
+    ///    the scheduler, palette table and wire.
+    ///
+    /// Between the steps the loop serves the network, timers and everything
+    /// else; the frame arm of `IoBridge::run` stays off until step 3 is done.
+    fn begin_gpu_frame(&mut self, frame: FrameSubmission) {
+        debug_assert!(self.in_flight.is_none(), "one frame in flight at a time");
         let mut lap = Lap::new(stage_trace_enabled());
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let seq = self.frame_seq;
@@ -706,39 +798,202 @@ impl IoBridge {
             }
         };
 
-        // Emit frame-dimensions datagram on first frame, on dimension change,
-        // and N more times after any change to absorb datagram loss.
-        self.emit_frame_dimensions(seq, frame.timestamp_us, frame.width, frame.height);
-
         // Per-frame idle-escalation sweep. Computes the candidate list against
         // the previous frame's tile metrics (the current frame's metrics are
         // updated after the GPU work returns), then hands the list to the
-        // GpuFrameProcessor which records the forward dispatch in the same
+        // GPU processor, which records the forward dispatch in the same
         // command buffer as the dirty-Cdf53 forward stages.
         //
-        // Note: metrics_tracker.resize() happens after process_frame returns
-        // (below, around `self.metrics_tracker.resize(cols, rows)`). On the
-        // very first frame the tracker has cols=0, rows=0 (constructed via
-        // MetricsTracker::new(0, 0)), so detect_escalation_candidates iterates
-        // 0 tiles and returns empty — safe.
+        // Note: metrics_tracker.resize() happens when the analysis is
+        // accepted (`on_analysed`). On the very first frame the tracker has
+        // cols=0, rows=0 (constructed via MetricsTracker::new(0, 0)), so
+        // detect_escalation_candidates iterates 0 tiles and returns empty.
         let candidates = self.collect_escalation_candidates();
         let pre_us = lap.lap();
+        self.start_analysis(frame, seq, max_dg_size, candidates, pre_us);
+    }
 
-        // GPU pipeline: Vulkan SAD dirty detection + NV12 conversion.
-        // Dispatch to the DMA-BUF path if a fd was provided; otherwise upload
-        // the CPU pixel buffer via the HOST_VISIBLE staging-image variant.
+    /// Send a frame to the worker for its GPU stage and mark it in flight.
+    pub(super) fn start_analysis(
+        &mut self,
+        frame: FrameSubmission,
+        seq: u32,
+        max_dg_size: usize,
+        candidates: Vec<u32>,
+        pre_us: u64,
+    ) {
+        let meta = FrameMeta::of(&frame);
+        let controls = std::mem::take(&mut self.pending_controls);
         let want_diag = self.diagnostics.diagnose_gpu_pipeline;
-        let backend = self.frame_backend.as_mut().unwrap();
-        let analysed = backend.analyse(&frame, &candidates, want_diag);
-        let gpu_us = lap.lap();
-        let analysis = match analysed {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!(target: LOG_TARGET, "GPU process_frame failed: {e}, falling back to CPU path");
-                self.fall_back_to_cpu_after_gpu_error(frame, seq);
-                return;
+        let sent = self.frame_pipeline.as_ref().is_some_and(|p| {
+            p.send(ToWorker::Analyse {
+                seq,
+                frame,
+                escalation: candidates,
+                want_diag,
+                controls,
+            })
+        });
+        if !sent {
+            self.fatal = Some("the frame worker has stopped".into());
+            return;
+        }
+        self.in_flight = Some(InFlight {
+            seq,
+            epoch: self.session_epoch,
+            meta,
+            max_dg_size,
+            stage: InFlightStage::Analysing { pre_us },
+        });
+    }
+
+    /// Queue a hardware control for the worker; it is applied, in order, before
+    /// the next message runs. No-op without a frame worker.
+    pub(super) fn backend_apply(&mut self, control: Control) {
+        if self.frame_pipeline.is_some() {
+            self.pending_controls.push(control);
+        }
+    }
+
+    /// Queue an `InvalidateBaseline` unless one is already waiting: a reset's
+    /// 20-frame cushion must not be shortened to 1 by a discard queued after it
+    /// (the processor keeps the last value it is given).
+    fn ensure_baseline_invalidated(&mut self) {
+        if !self
+            .pending_controls
+            .iter()
+            .any(|c| matches!(c, Control::InvalidateBaseline(_)))
+        {
+            self.backend_apply(Control::InvalidateBaseline(1));
+        }
+    }
+
+    pub(super) fn send_finish(
+        &mut self,
+        mut inflight: InFlight,
+        action: FinishAction,
+        stage: InFlightStage,
+    ) {
+        let controls = std::mem::take(&mut self.pending_controls);
+        let sent = self.frame_pipeline.as_ref().is_some_and(|p| {
+            p.send(ToWorker::Finish {
+                seq: inflight.seq,
+                action,
+                controls,
+            })
+        });
+        if !sent {
+            self.fatal = Some("the frame worker has stopped".into());
+            return;
+        }
+        inflight.stage = stage;
+        self.in_flight = Some(inflight);
+    }
+
+    /// A message from the frame worker, for the frame in flight.
+    pub(super) fn on_frame_worker_message(&mut self, msg: FromWorker) {
+        self.handle_frame_worker_message(msg);
+        // Decode errors that named a tile of the frame that was being committed
+        // wait for the commit, so they see the tile's real codec state.
+        if self.in_flight.is_none() && !self.deferred_decode_errors.is_empty() {
+            for err in std::mem::take(&mut self.deferred_decode_errors) {
+                self.recover_from_decode_error(err);
             }
+        }
+    }
+
+    /// Whether `(x, y)` is a tile of the tile frame currently in flight, whose
+    /// codec states are tentative until it is committed.
+    pub(super) fn tile_is_in_flight(&self, x: u8, y: u8) -> bool {
+        matches!(
+            self.in_flight.as_ref().map(|f| &f.stage),
+            Some(InFlightStage::FinishingTile { dirty_xy, .. })
+                if dirty_xy.contains(&(x as u32, y as u32))
+        )
+    }
+
+    fn handle_frame_worker_message(&mut self, msg: FromWorker) {
+        let Some(inflight) = self.in_flight.take() else {
+            self.fatal = Some("the frame worker answered with no frame in flight".into());
+            return;
         };
+        let seq = match &msg {
+            FromWorker::Analysed { seq, .. }
+            | FromWorker::AnalyseFailed { seq, .. }
+            | FromWorker::H264Done { seq, .. }
+            | FromWorker::TileDone { seq, .. }
+            | FromWorker::Discarded { seq } => *seq,
+        };
+        if seq != inflight.seq {
+            self.fatal = Some(format!(
+                "the frame worker answered for frame {seq}, expected {}",
+                inflight.seq
+            ));
+            return;
+        }
+        match msg {
+            FromWorker::Analysed {
+                analysed,
+                worker_us,
+                ..
+            } => self.on_analysed(inflight, *analysed, worker_us),
+            FromWorker::AnalyseFailed { error, frame, .. } => {
+                if inflight.epoch != self.session_epoch {
+                    return;
+                }
+                tracing::warn!(target: LOG_TARGET, "GPU process_frame failed: {error}, falling back to CPU path");
+                self.fall_back_to_cpu_after_gpu_error(*frame, inflight.seq, true);
+            }
+            FromWorker::H264Done { out, worker_us, .. } => {
+                self.on_h264_done(inflight, out, worker_us)
+            }
+            FromWorker::TileDone {
+                out,
+                frame_pixels,
+                worker_us,
+                ..
+            } => self.on_tile_done(inflight, *out, frame_pixels, worker_us),
+            FromWorker::Discarded { .. } => {}
+        }
+    }
+
+    /// Step 2: the worker's GPU stage is done. Everything here reads and
+    /// writes loop state, so it runs on the loop.
+    fn on_analysed(&mut self, inflight: InFlight, analysis: Analysed, gpu_us: u64) {
+        use crate::tile::FrameMode;
+        let InFlight {
+            seq,
+            epoch,
+            meta,
+            max_dg_size,
+            ..
+        } = inflight;
+        let pre_us = match inflight.stage {
+            InFlightStage::Analysing { pre_us } => pre_us,
+            InFlightStage::FinishingH264 { .. }
+            | InFlightStage::FinishingTile { .. }
+            | InFlightStage::FinishingDiscard => 0,
+        };
+        let inflight = InFlight {
+            seq,
+            epoch,
+            meta,
+            max_dg_size,
+            stage: InFlightStage::FinishingDiscard,
+        };
+        // The session ended or was reset while the GPU worked: the frame's
+        // dirty tiles belong to a client that is gone. Its baseline advanced
+        // already, so make the next frame repaint everything.
+        if epoch != self.session_epoch {
+            self.ensure_baseline_invalidated();
+            self.send_finish(
+                inflight,
+                FinishAction::Discard,
+                InFlightStage::FinishingDiscard,
+            );
+            return;
+        }
+        let mut lap = Lap::new(stage_trace_enabled());
 
         tracing::debug!(
             target: LOG_TARGET,
@@ -769,11 +1024,10 @@ impl IoBridge {
 
         // Convert flat tile indices (Vec<u32>) into (tile_x, tile_y) pairs
         // matching the row-major layout used by MetricsTracker / TileGrid.
-        let cols = frame.width.div_ceil(crate::tile::TILE_SIZE);
-        let rows = frame.height.div_ceil(crate::tile::TILE_SIZE);
+        let cols = meta.width.div_ceil(crate::tile::TILE_SIZE);
+        let rows = meta.height.div_ceil(crate::tile::TILE_SIZE);
         let (dirty_xy, prev_mode, new_mode) =
-            self.classify_dirty_tiles(&analysis, &frame, cols, rows, seq);
-        use crate::tile::FrameMode;
+            self.classify_dirty_tiles(&analysis, &meta, cols, rows, seq);
 
         // ---- M3.3c: PixelPerfect transition sweep ----
         // Runs every frame, unconditionally, before the dirty-tile early return.
@@ -781,14 +1035,18 @@ impl IoBridge {
         // empty and the function would otherwise return immediately) still drive
         // the Cdf53 → PixelPerfect transition.
         //
-        // Phase B (enqueue_refinement) runs inside the FrameMode::TileCodec arm
-        // BELOW, so on dirty frames the sweep runs before new Cdf53 work is
-        // enqueued. This is correct: after Phase B bumps the generation and clears
-        // the ACK counter, the new generation needs subsequent frames' ACKs to
-        // accumulate before tile_fully_acked returns true — so running the sweep
-        // here (before Phase B) vs. after Phase B yields no difference in practice.
+        // Phase B (enqueue_refinement) runs when the tile results are committed
+        // (`on_tile_done`), so on dirty frames the sweep runs before new Cdf53
+        // work is enqueued. This is correct: after Phase B bumps the generation
+        // and clears the ACK counter, the new generation needs subsequent
+        // frames' ACKs to accumulate before tile_fully_acked returns true.
         self.pixelperfect_sweep(cols, rows, seq);
         let classify_us = lap.lap();
+        let trace = StageTrace {
+            pre_us,
+            gpu_us,
+            classify_us,
+        };
 
         // Early-return on empty dirty is mode-specific:
         //  - H264: no new frame to encode, nothing to emit. Bail.
@@ -801,99 +1059,250 @@ impl IoBridge {
         //    queue stagnates and the wizard never finishes refining.
         match new_mode {
             FrameMode::H264 => {
-                self.emit_h264_frame(&dirty_xy, &frame, prev_mode, seq, max_dg_size);
-                let emit_us = lap.lap();
-                tracing::trace!(
-                    target: "ghostframe::io_bridge::diag",
-                    seq, mode = "h264", pre_us, gpu_us, classify_us, emit_us,
-                    "[BRIDGE] frame.stages"
-                );
+                let action = h264_finish_action(dirty_xy.is_empty(), prev_mode);
+                if matches!(action, FinishAction::Discard) {
+                    // Nothing will be committed for this frame, so its
+                    // dimensions go out now.
+                    self.emit_frame_dimensions(seq, meta.timestamp_us, meta.width, meta.height);
+                    self.send_finish(inflight, action, InFlightStage::FinishingDiscard);
+                } else {
+                    self.send_finish(inflight, action, InFlightStage::FinishingH264 { trace });
+                }
             }
             FrameMode::TileCodec => {
                 let max_frag = max_fragment_payload(max_dg_size);
                 if max_frag == 0 {
-                    if let Some(b) = self.frame_backend.as_mut() {
-                        b.finish_discard();
-                    }
+                    self.emit_frame_dimensions(seq, meta.timestamp_us, meta.width, meta.height);
+                    self.send_finish(
+                        inflight,
+                        FinishAction::Discard,
+                        InFlightStage::FinishingDiscard,
+                    );
                     return;
                 }
 
-                // The escalation candidates this frame, with what the loop
-                // knows about each tile; the backend encodes their passes.
-                let escalation_candidates =
-                    std::mem::take(&mut self.cdf53_escalation_candidates_this_frame);
-                let stranded_count =
-                    std::mem::take(&mut self.cdf53_stranded_candidates_this_frame).len();
-                let slots: Vec<EscalationSlot> = escalation_candidates
-                    .iter()
-                    .enumerate()
-                    .map(|(slot, &tile_idx)| EscalationSlot {
-                        tile_idx,
-                        stranded: slot < stranded_count,
-                        tile_is_cdf53: matches!(
-                            self.metrics_tracker
-                                .get(tile_idx % cols, tile_idx / cols)
-                                .codec_state,
-                            crate::tile::CodecState::Cdf53 { .. }
-                        ),
-                    })
-                    .collect();
-                let backend = self.frame_backend.as_mut().unwrap();
-                let tile_out = backend.finish_tile(
-                    &frame,
-                    &TileRequest {
-                        cols,
-                        rows,
-                        escalation: &slots,
-                    },
-                );
-                let TileOut {
-                    pixels,
-                    palrle,
-                    cdf53_dirty,
-                    cdf53_escalation,
-                    timings,
-                } = tile_out;
-                let readback = match pixels {
-                    Ok(src) => src,
-                    Err(msg) => {
-                        tracing::warn!(target: LOG_TARGET, "{msg}");
-                        return;
-                    }
-                };
-                let pixels: &[u8] = match &readback {
-                    PixelSource::Frame => &frame.pixels,
-                    PixelSource::Readback(rb) => rb,
-                };
-
-                // The backend's whole tile stage: readback, PalRle copies, and the
-                // CDF 5/3 coefficient reads and pass encodes (broken out in
-                // `frame.tile_stages` as coef_read_us / coef_encode_us).
-                let backend_tile_us = lap.lap();
-                self.emit_tile_codec_frame(
-                    &dirty_xy,
-                    &frame,
-                    pixels,
-                    TileResults {
-                        palrle,
-                        cdf53_dirty,
-                        cdf53_escalation,
+                let (action, escalation_candidates, stranded_count) =
+                    self.tile_finish_action(cols, rows, &dirty_xy);
+                self.send_finish(
+                    inflight,
+                    action,
+                    InFlightStage::FinishingTile {
+                        dirty_xy,
+                        max_frag,
                         escalation_candidates,
                         stranded_count,
-                        timings,
                         frame_palette_set_count: analysis.frame_palette_set_count,
+                        trace,
                     },
-                    seq,
-                    max_frag,
-                );
-                let emit_us = lap.lap();
-                tracing::trace!(
-                    target: "ghostframe::io_bridge::diag",
-                    seq, mode = "tile", pre_us, gpu_us, classify_us, backend_tile_us, emit_us,
-                    "[BRIDGE] frame.stages"
                 );
             }
         }
+    }
+
+    /// The datagram size to commit a finished frame with, or `None` when the
+    /// frame is stale: its session ended or was reset while the worker ran, or
+    /// no live session remains. Re-read here because the path MTU can shrink
+    /// while the worker runs; the smaller value wins.
+    fn commit_max_datagram_size(&mut self, inflight: &InFlight) -> Option<usize> {
+        if inflight.epoch != self.session_epoch {
+            return None;
+        }
+        // A test bridge has no live quinn connection to size datagrams from.
+        #[cfg(test)]
+        if let Some(n) = self.test_commit_dg_size {
+            return Some(n.min(inflight.max_dg_size));
+        }
+        self.compute_max_datagram_size()
+            .map(|now| now.min(inflight.max_dg_size))
+    }
+
+    /// What to ask the worker for a tile frame: the escalation candidates this
+    /// frame with what the loop knows about each tile (the worker encodes their
+    /// passes), and the dirty tiles no tile encoder will carry. Also returns
+    /// the candidates and how many of them are stranded-recovery slots.
+    pub(super) fn tile_finish_action(
+        &mut self,
+        cols: u32,
+        rows: u32,
+        dirty_xy: &[(u32, u32)],
+    ) -> (FinishAction, Vec<u32>, usize) {
+        let escalation_candidates =
+            std::mem::take(&mut self.cdf53_escalation_candidates_this_frame);
+        let stranded_count = std::mem::take(&mut self.cdf53_stranded_candidates_this_frame).len();
+        let slots: Vec<EscalationSlot> = escalation_candidates
+            .iter()
+            .enumerate()
+            .map(|(slot, &tile_idx)| EscalationSlot {
+                tile_idx,
+                stranded: slot < stranded_count,
+                tile_is_cdf53: matches!(
+                    self.metrics_tracker
+                        .get(tile_idx % cols, tile_idx / cols)
+                        .codec_state,
+                    crate::tile::CodecState::Cdf53 { .. }
+                ),
+            })
+            .collect();
+        // Dirty tiles no tile encoder will carry; the worker encodes them as
+        // CDF 5/3 in the same call (see `TileRequest`).
+        let fallback = self.worker_fallback_tiles(dirty_xy);
+        (
+            FinishAction::Tile {
+                cols,
+                rows,
+                slots,
+                fallback,
+            },
+            escalation_candidates,
+            stranded_count,
+        )
+    }
+
+    /// The dirty tiles no tile encoder will carry, whose CDF 5/3 the worker
+    /// encodes with the frame's own finish: their codec state is Skip, H264 or
+    /// PixelPerfect. A PalRle tile that loses its palette at commit joins them
+    /// later and is encoded on request.
+    pub(super) fn worker_fallback_tiles(&self, dirty_xy: &[(u32, u32)]) -> Vec<(u32, u32)> {
+        dirty_xy
+            .iter()
+            .copied()
+            .filter(|&(x, y)| {
+                matches!(
+                    self.metrics_tracker.get(x, y).codec_state,
+                    crate::tile::CodecState::Skip
+                        | crate::tile::CodecState::H264 { .. }
+                        | crate::tile::CodecState::PixelPerfect
+                )
+            })
+            .collect()
+    }
+
+    /// Step 3 for an H.264 frame: fragment and send what the worker encoded.
+    pub(super) fn on_h264_done(
+        &mut self,
+        inflight: InFlight,
+        out: Option<H264Out>,
+        worker_us: u64,
+    ) {
+        // The session changed while the encode ran. The encoder's reference
+        // chain advanced past this frame, so the next one must be an IDR or the
+        // client decodes garbage until the next GOP.
+        let Some(max_dg_size) = self.commit_max_datagram_size(&inflight) else {
+            self.backend_apply(Control::RequestKeyframe);
+            return;
+        };
+        let InFlightStage::FinishingH264 { trace } = inflight.stage else {
+            return;
+        };
+        // The frame's dimensions go out with the frame, not before the worker
+        // has finished it: on a resolution change the client resizes its canvas
+        // on them, and the finish can take a second.
+        let m = inflight.meta;
+        self.emit_frame_dimensions(inflight.seq, m.timestamp_us, m.width, m.height);
+        let Some(encoded) = out else {
+            return;
+        };
+        let mut lap = Lap::new(stage_trace_enabled());
+        self.send_h264_frame(encoded, &inflight.meta, inflight.seq, max_dg_size);
+        let emit_us = lap.lap();
+        tracing::trace!(
+            target: "ghostframe::io_bridge::diag",
+            seq = inflight.seq, mode = "h264",
+            pre_us = trace.pre_us, gpu_us = trace.gpu_us, classify_us = trace.classify_us,
+            worker_finish_us = worker_us, emit_us,
+            "[BRIDGE] frame.stages"
+        );
+    }
+
+    /// Step 3 for a tile frame: commit what the worker produced.
+    pub(super) fn on_tile_done(
+        &mut self,
+        inflight: InFlight,
+        out: TileOut,
+        frame_pixels: Vec<u8>,
+        worker_us: u64,
+    ) {
+        // The session changed while the tiles were encoded. The GPU baseline
+        // advanced past this frame, so its dirty tiles would never be sent
+        // again: repaint everything.
+        let Some(max_dg_size) = self.commit_max_datagram_size(&inflight) else {
+            self.ensure_baseline_invalidated();
+            return;
+        };
+        let InFlightStage::FinishingTile {
+            dirty_xy,
+            max_frag,
+            escalation_candidates,
+            stranded_count,
+            frame_palette_set_count,
+            trace,
+        } = inflight.stage
+        else {
+            return;
+        };
+        let TileOut {
+            pixels,
+            palrle,
+            cdf53_dirty,
+            cdf53_escalation,
+            cdf53_fallback,
+            timings,
+        } = out;
+        // The frame's dimensions go out with the frame (see `on_h264_done`).
+        let m = inflight.meta;
+        self.emit_frame_dimensions(inflight.seq, m.timestamp_us, m.width, m.height);
+        // The path MTU can shrink while the worker runs; fragment for the
+        // smaller of the two.
+        let max_frag = max_frag.min(max_fragment_payload(max_dg_size));
+        if max_frag == 0 {
+            self.ensure_baseline_invalidated();
+            return;
+        }
+        let source = match pixels {
+            Ok(src) => src,
+            Err(msg) => {
+                tracing::warn!(target: LOG_TARGET, "{msg}");
+                return;
+            }
+        };
+        let pixels: &[u8] = match &source {
+            PixelSource::Frame => &frame_pixels,
+            PixelSource::Readback(rb) => rb,
+        };
+        let mut lap = Lap::new(stage_trace_enabled());
+        // Hand the worker's pre-encoded fallback tiles to the dispatch below,
+        // which takes the ones it needs and asks the worker for the rest.
+        self.precomputed_fallback.clear();
+        self.precomputed_fallback.extend(cdf53_fallback);
+        self.emit_tile_codec_frame(
+            &dirty_xy,
+            &inflight.meta,
+            pixels,
+            TileResults {
+                palrle,
+                cdf53_dirty,
+                cdf53_escalation,
+                escalation_candidates,
+                stranded_count,
+                timings,
+                frame_palette_set_count,
+            },
+            inflight.seq,
+            max_frag,
+        );
+        self.precomputed_fallback.clear();
+        let emit_us = lap.lap();
+        tracing::trace!(
+            target: "ghostframe::io_bridge::diag",
+            seq = inflight.seq, mode = "tile",
+            pre_us = trace.pre_us, gpu_us = trace.gpu_us, classify_us = trace.classify_us,
+            worker_finish_us = worker_us, emit_us,
+            blocking_forwards_total = self
+                .frame_pipeline
+                .as_ref()
+                .map_or(0, |p| p.forward_requests()),
+            "[BRIDGE] frame.stages"
+        );
     }
 
     /// Per-frame idle-escalation sweep and stranded-tile detection; stores the
@@ -952,7 +1361,7 @@ impl IoBridge {
     fn classify_dirty_tiles(
         &mut self,
         analysis: &Analysed,
-        frame: &FrameSubmission,
+        frame: &FrameMeta,
         cols: u32,
         rows: u32,
         seq: u32,
@@ -1096,15 +1505,16 @@ impl IoBridge {
             // force_frames = 1 (not 20) because we're past QUIC slow-start by
             // the time exit_sustain elapses; ACK-based retries handle
             // individual datagram drops on the lossless tiles.
-            if prev_mode == FrameMode::H264 && new_mode == FrameMode::TileCodec {
-                if let Some(b) = self.frame_backend.as_mut() {
-                    b.apply(Control::InvalidateBaseline(1));
-                    tracing::info!(
-                        target: LOG_TARGET,
-                        seq,
-                        "H264→TileCodec handoff: invalidate_baseline(1) — lossless repaint"
-                    );
-                }
+            if prev_mode == FrameMode::H264
+                && new_mode == FrameMode::TileCodec
+                && self.frame_pipeline.is_some()
+            {
+                self.backend_apply(Control::InvalidateBaseline(1));
+                tracing::info!(
+                    target: LOG_TARGET,
+                    seq,
+                    "H264→TileCodec handoff: invalidate_baseline(1) — lossless repaint"
+                );
             }
         }
 
@@ -1193,30 +1603,15 @@ impl IoBridge {
         }
     }
 
-    /// H.264 arm of `process_frame_gpu`: encode the GPU-produced NV12 frame,
-    /// fragment it, send it with FEC parity and keep fragments for NACK. Its
-    /// `return`s are tail returns of the whole frame (nothing follows the arm).
-    pub(super) fn emit_h264_frame(
+    /// H.264 arm: fragment the frame the worker encoded from the GPU's NV12
+    /// output, send it with FEC parity and keep fragments for NACK.
+    pub(super) fn send_h264_frame(
         &mut self,
-        dirty_xy: &[(u32, u32)],
-        frame: &FrameSubmission,
-        prev_mode: crate::tile::FrameMode,
+        encoded: H264Out,
+        frame: &FrameMeta,
         seq: u32,
         max_dg_size: usize,
     ) {
-        use crate::tile::FrameMode;
-        let Some(backend) = self.frame_backend.as_mut() else {
-            return;
-        };
-        if dirty_xy.is_empty() {
-            backend.finish_discard();
-            return;
-        }
-        // Re-entry into H264 forces an IDR for a fresh client anchor.
-        let Some(encoded) = backend.finish_h264(frame, prev_mode == FrameMode::TileCodec) else {
-            return;
-        };
-
         // Fragment and send. `fragment_frame` chunks the payload at the
         // per-fragment payload limit (datagram size minus the frame
         // header), not the raw datagram size — otherwise the on-wire
@@ -1285,7 +1680,7 @@ impl IoBridge {
     pub(super) fn emit_tile_codec_frame(
         &mut self,
         dirty_xy: &[(u32, u32)],
-        frame: &FrameSubmission,
+        frame: &FrameMeta,
         pixels: &[u8],
         tile: TileResults,
         seq: u32,

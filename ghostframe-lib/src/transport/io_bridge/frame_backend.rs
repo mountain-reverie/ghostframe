@@ -122,6 +122,11 @@ pub struct TileRequest<'a> {
     pub rows: u32,
     /// Same order and length as the candidates handed to `analyse`.
     pub escalation: &'a [EscalationSlot],
+    /// Dirty tiles that no tile encoder will carry (their codec state is
+    /// Skip, H264 or PixelPerfect), which the loop will send as CDF 5/3. The
+    /// backend forward-transforms and encodes them here, in the same call,
+    /// so the loop does not have to wait for the GPU when it commits.
+    pub fallback: &'a [(u32, u32)],
 }
 
 /// Where the tile path reads pixels from.
@@ -160,6 +165,9 @@ pub struct TileOut {
     pub cdf53_dirty: Vec<Cdf53Tile>,
     /// Same length as `TileRequest::escalation`; `None` where a slot was skipped.
     pub cdf53_escalation: Vec<Option<Cdf53Encoded>>,
+    /// `TileRequest::fallback` tiles, encoded. A tile whose forward failed is
+    /// simply absent; the loop then asks for it again when it commits.
+    pub cdf53_fallback: Vec<((u32, u32), Cdf53Encoded)>,
     pub timings: TileTimings,
 }
 
@@ -168,6 +176,20 @@ pub struct TileOut {
 pub struct H264Out {
     pub payload: Vec<u8>,
     pub is_keyframe: bool,
+}
+
+/// The `fallback` tiles the GPU's own CDF 5/3 compact list does not already
+/// cover. `in_compact_list` holds the flat indices of that list.
+pub(super) fn fallback_not_in_compact_list(
+    fallback: &[(u32, u32)],
+    cols: u32,
+    in_compact_list: &std::collections::HashSet<u32>,
+) -> Vec<(u32, u32)> {
+    fallback
+        .iter()
+        .copied()
+        .filter(|&(x, y)| !in_compact_list.contains(&(y * cols + x)))
+        .collect()
 }
 
 /// See the module docs.
@@ -358,6 +380,7 @@ impl FrameBackend for GpuBackend {
             palrle: OwnedPalRle::default(),
             cdf53_dirty: Vec::new(),
             cdf53_escalation: Vec::new(),
+            cdf53_fallback: Vec::new(),
             timings: TileTimings::default(),
         };
 
@@ -492,11 +515,56 @@ impl FrameBackend for GpuBackend {
             }
         }
 
+        // Tiles no tile encoder will carry: forward them on the GPU in one
+        // round trip and encode their passes, here, off the loop.
+        let mut cdf53_fallback = Vec::new();
+        // Tiles already in the GPU's compact list are encoded above and become
+        // CDF 5/3 when the loop commits them; transforming them again would be
+        // a wasted full-screen GPU round trip after an H.264 exit.
+        let fallback = fallback_not_in_compact_list(req.fallback, req.cols, &in_dirty_list);
+        if !fallback.is_empty() {
+            let source_pixels: &[u8] = match &pixels {
+                Ok(PixelSource::Frame) => &frame.pixels,
+                Ok(PixelSource::Readback(rb)) => rb,
+                Err(_) => &[],
+            };
+            let grid = crate::tile::TileGrid::new(frame.width, frame.height);
+            let tiles: Vec<Vec<u8>> = fallback
+                .iter()
+                .map(|&(x, y)| grid.extract_tile(source_pixels, frame.stride, x, y))
+                .collect();
+            let refs: Vec<&[u8]> = tiles.iter().map(|t| t.as_slice()).collect();
+            lap.lap_ns();
+            match self.processor.forward_cdf53_tiles(&refs) {
+                Ok(coeffs) => {
+                    let n = crate::encoder::cdf53::CDF53_TOTAL_COEFFS;
+                    for (i, &xy) in fallback.iter().enumerate() {
+                        let (present_passes, passes) = crate::encoder::cdf53::encode_passes_sparse(
+                            &coeffs[i * n..(i + 1) * n],
+                        );
+                        cdf53_fallback.push((
+                            xy,
+                            Cdf53Encoded {
+                                present_passes,
+                                passes,
+                            },
+                        ));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(target: LOG_TARGET, error = %e, tiles = fallback.len(),
+                        "cdf53 fallback forward failed in the frame's finish; the commit retries");
+                }
+            }
+            timings.coef_encode_ns += lap.lap_ns();
+        }
+
         TileOut {
             pixels,
             palrle,
             cdf53_dirty,
             cdf53_escalation,
+            cdf53_fallback,
             timings,
         }
     }
