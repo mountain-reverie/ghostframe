@@ -14,6 +14,7 @@ import {
   codecDiscriminant,
   type Cdf53ErrorCodes,
 } from './cdf53_globals.js';
+import { health, installConsoleRing } from './health.js';
 import * as wasmExports from '../pkg-web/ghostframe_client_wasm.js';
 import init, {
   WasmClientCore,
@@ -39,6 +40,7 @@ function log(msg: string) {
 }
 
 async function main() {
+  installConsoleRing();
   // wasm-bindgen `--target web`: the module must be initialized before any
   // WasmClientCore construction. Awaited here rather than at module scope —
   // a top-level await fails the vite build for the configured target.
@@ -66,6 +68,9 @@ async function main() {
   let renderer: WebGpuRenderer;
   try {
     renderer = await WebGpuRenderer.create(canvasEl);
+    // Test/diagnostic hooks: swallowed-exception counts and renderer state.
+    window.__ghostframeHealth = () => health.snapshot();
+    window.__ghostframeRendererState = () => renderer.debugState();
   } catch (e) {
     if (e instanceof WebGpuUnavailableError) {
       statusEl.textContent = 'WebGPU not available in this browser.';
@@ -523,6 +528,7 @@ async function main() {
     try {
       handleEvent(ev);
     } catch (e) {
+      health.record(`handleEvent:${ev.kind}`, e);
       console.error('handleEvent failed; continuing', ev.kind, e);
     }
   }
@@ -588,6 +594,7 @@ async function main() {
     try {
       flushDatagrams();
     } catch (e) {
+      health.record('tick:flushDatagrams', e);
       console.error('tick(): flushDatagrams failed; continuing', e);
     }
     try {
@@ -627,6 +634,7 @@ async function main() {
         reportDecodeError(codec, tx, ty, code);
       });
     } catch (e) {
+      health.record('encodeAndPresentFrame', e);
       console.error('encodeAndPresentFrame failed; continuing', e);
     }
 
@@ -741,6 +749,7 @@ async function main() {
       try {
         flushDatagrams();
       } catch (e) {
+        health.record('flushDatagrams', e);
         console.error('flushDatagrams failed; continuing', e);
       }
     } else if (flushTimer === undefined) {
