@@ -11,6 +11,10 @@ declare module '*.wgsl?raw' {
 // `e2e_polled_globals_are_live` guards that each stays non-trivial).
 
 interface Window {
+  /** Swallowed-exception counts + console ring (health.ts). */
+  __ghostframeHealth?: () => import('./health.js').HealthSnapshot;
+  /** Renderer queue lengths, submit count, sizes (renderer.ts debugState). */
+  __ghostframeRendererState?: () => unknown;
   // ----- stats counters (set at startup, re-published from the core) -----
   /** Datagram counts re-published from the wasm core each loop iteration. */
   __ghostframeStats: { tileDatagrams: number; frameDatagrams: number } | undefined;
