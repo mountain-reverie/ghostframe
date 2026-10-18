@@ -6,6 +6,7 @@ import { PalRlePipeline, type PalRleTile } from './palrle.js';
 import { Cdf53Pipeline, type PrevalidatedCdf53 } from './cdf53.js';
 import { shouldSkipEncodePresent } from './idle_skip.js';
 import { protocol } from '../protocol_constants.js';
+import { health } from '../health.js';
 import { planPaint } from './paint_order.js';
 
 /** A prevalidated CDF53 pass tagged with the server frame it came from. */
@@ -183,6 +184,23 @@ export class WebGpuRenderer {
     this.framebufferDirty = true;
   }
 
+  /** Snapshot for failure diagnostics; cheap and side-effect free. */
+  debugState(): Record<string, unknown> {
+    return {
+      submitCount: this.submitCount,
+      solidQueue: this.solidQueue.length,
+      palRleQueue: this.palRleQueue.length,
+      cdf53Queue: this.cdf53Queue.length,
+      h264Queue: this.h264Queue.length,
+      framebufferDirty: this.framebufferDirty,
+      fbWidth: this.framebuffer.width,
+      fbHeight: this.framebuffer.height,
+      hasTexture: !!this.framebuffer.texture,
+      canvasWidth: this.canvas.width,
+      canvasHeight: this.canvas.height,
+    };
+  }
+
   pushSolid(entry: SolidTile): void {
     this.solidQueue.push(entry);
     this.framebufferDirty = true;
@@ -259,6 +277,9 @@ export class WebGpuRenderer {
     let cdf53Count = 0;
     try {
       cdf53Count = this.cdf53Pipeline.uploadBatch(this.cdf53Queue);
+    } catch (e) {
+      health.record('cdf53.uploadBatch', e);
+      throw e;
     } finally {
       this.cdf53Queue.length = 0;
       this.palRleQueue = [];

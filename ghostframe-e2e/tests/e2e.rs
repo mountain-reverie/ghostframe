@@ -1749,8 +1749,17 @@ async fn e2e_static_mixed_codecs_converge_on_a_shaped_link() -> Result<()> {
         "pixel readback returned {} bytes for the solid region",
         solid_px.len()
     );
+    let solid_ok = solid_px[0] > 200 && solid_px[1] < 60 && solid_px[2] < 60;
+    if !solid_ok {
+        ghostframe_e2e::harness::failure_dump::dump_failure_artifacts(
+            setup.page(),
+            &container,
+            "e2e_static_mixed_codecs_converge_on_a_shaped_link",
+        )
+        .await;
+    }
     assert!(
-        solid_px[0] > 200 && solid_px[1] < 60 && solid_px[2] < 60,
+        solid_ok,
         "the solid quadrant should be red after convergence, read {:?}",
         &solid_px[..3.min(solid_px.len())]
     );
@@ -5712,6 +5721,12 @@ async fn e2e_lossless_golden_png() -> Result<()> {
                 HEIGHT,
                 image::ColorType::Rgba8,
             );
+            ghostframe_e2e::harness::failure_dump::dump_failure_artifacts(
+                setup.page(),
+                &setup.server.server_container_name,
+                "e2e_lossless_golden_png",
+            )
+            .await;
             return Err(anyhow!(
                 "e2e_lossless_golden_png: did not converge within 30 s after {iters} polls. \
                  last: {last_summary}. \
