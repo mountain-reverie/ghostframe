@@ -429,28 +429,36 @@ export class WebGpuRenderer {
       this.errorsReadbackInFlight = true;
       const batch = palRleCount;
       const staging = this.palrlePipeline.errorsStaging;
+      // Whatever happens below, `staging` must end unmapped and the flag
+      // cleared: a buffer left mapped gets every later submit rejected.
+      const release = () => {
+        if (staging.mapState === 'mapped') staging.unmap();
+        this.errorsReadbackInFlight = false;
+      };
       staging.mapAsync(GPUMapMode.READ, 0, batch * 4).then(() => {
-        const view = new Uint32Array(staging.getMappedRange(0, batch * 4));
-        for (let i = 0; i < batch; i++) {
-          if (view[i] !== 0) {
-            // Map back to (tileX, tileY) via the same order palRleEntries had
-            // — but we've already consumed palRleEntries. For M3.2b, we report
-            // the in-shader error with batch-relative coordinates that the
-            // caller can resolve from a saved index→tile map.
-            // SIMPLIFICATION: emit a generic per-batch error without tile coords.
-            // The DecodeErrorBatcher's per-key rate-limit still bounds spam.
-            onDecodeError(protocol().codec.PalRle, 0xFF, 0xFF, view[i]); // 0xFF placeholder tile coords
+        try {
+          const view = new Uint32Array(staging.getMappedRange(0, batch * 4));
+          for (let i = 0; i < batch; i++) {
+            if (view[i] !== 0) {
+              // Map back to (tileX, tileY) via the same order palRleEntries had
+              // — but we've already consumed palRleEntries. For M3.2b, we report
+              // the in-shader error with batch-relative coordinates that the
+              // caller can resolve from a saved index→tile map.
+              // SIMPLIFICATION: emit a generic per-batch error without tile coords.
+              // The DecodeErrorBatcher's per-key rate-limit still bounds spam.
+              onDecodeError(protocol().codec.PalRle, 0xFF, 0xFF, view[i]); // 0xFF placeholder tile coords
+            }
           }
+        } finally {
+          release();
         }
-        staging.unmap();
-        this.errorsReadbackInFlight = false;
       }).catch((err) => {
-        // mapAsync rejects on device loss, OOM, or validation failure.
-        // Without this log, a silently-broken errors readback path is
-        // nearly impossible to diagnose — the lib looks alive but stops
-        // reporting decode errors.
-        console.warn('palrle errors mapAsync failed:', err);
-        this.errorsReadbackInFlight = false;
+        // mapAsync rejects on device loss, OOM, or validation failure; the
+        // readback body above can throw too. Without this log, a
+        // silently-broken errors readback path is nearly impossible to
+        // diagnose — the lib looks alive but stops reporting decode errors.
+        console.warn('palrle errors readback failed:', err);
+        release();
       });
     }
 
