@@ -15,6 +15,8 @@ interface Window {
   __ghostframeHealth?: () => import('./health.js').HealthSnapshot;
   /** Renderer queue lengths, submit count, sizes (renderer.ts debugState). */
   __ghostframeRendererState?: () => unknown;
+  /** What the renderer last did to one tile (renderer.ts debugTile). */
+  __ghostframeTile?: (tileX: number, tileY: number) => unknown;
   // ----- stats counters (set at startup, re-published from the core) -----
   /** Datagram counts re-published from the wasm core each loop iteration. */
   __ghostframeStats: { tileDatagrams: number; frameDatagrams: number } | undefined;

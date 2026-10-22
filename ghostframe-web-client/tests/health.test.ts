@@ -23,6 +23,8 @@ describe('Health', () => {
     expect(s.recent.length).toBeLessThanOrEqual(20);
     expect(s.console.length).toBeLessThanOrEqual(300);
     expect(s.console[s.console.length - 1]).toBe('l999');
+    expect(s.consoleHead.length).toBe(100);
+    expect(s.consoleHead[0]).toBe('l0');
   });
 
   it('mirrors console.error and console.warn into the ring', () => {

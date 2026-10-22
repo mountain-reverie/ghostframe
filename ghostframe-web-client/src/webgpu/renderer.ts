@@ -53,6 +53,18 @@ export class WebGpuRenderer {
   public submitCount: number = 0;
 
   private errorsReadbackInFlight = false;
+
+  // Failure diagnostics: per tile, the codec last handed to the GPU
+  // (1 solid, 2 palrle, 3 cdf53), its frame_seq, and the paint tick
+  // it went out in. A tick is one non-skipped encodeAndPresentFrame. Uncaptured
+  // GPU errors are reported with the current tick (see main.ts); a per-tick
+  // error scope would be more exact, but its popErrorScope round trip makes
+  // the device process callbacks sooner and changes the timing under test.
+  paintTick = 0;
+  private tileCols = 0;
+  private tileCodec = new Uint8Array(0);
+  private tileSeq = new Uint32Array(0);
+  private tileTick = new Uint32Array(0);
   // Held until next tick so they aren't closed before drawing.
   private videoFramesToClose: VideoFrame[] = [];
 
@@ -141,6 +153,12 @@ export class WebGpuRenderer {
     this.palrlePipeline.resize(maxTiles, this.framebuffer.view);
     const cols = Math.ceil(width / ts);
     this.cdf53Pipeline.resize(maxTiles, this.framebuffer.view, cols);
+    if (this.tileCodec.length !== maxTiles || this.tileCols !== cols) {
+      this.tileCols = cols;
+      this.tileCodec = new Uint8Array(maxTiles);
+      this.tileSeq = new Uint32Array(maxTiles);
+      this.tileTick = new Uint32Array(maxTiles);
+    }
   }
 
   /**
@@ -198,7 +216,34 @@ export class WebGpuRenderer {
       hasTexture: !!this.framebuffer.texture,
       canvasWidth: this.canvas.width,
       canvasHeight: this.canvas.height,
+      paintTick: this.paintTick,
+      errorsReadbackInFlight: this.errorsReadbackInFlight,
     };
+  }
+
+  /** What the renderer last did to tile (x, y), for failure diagnostics. */
+  debugTile(tileX: number, tileY: number): Record<string, unknown> | null {
+    const i = tileY * this.tileCols + tileX;
+    if (tileX >= this.tileCols || i < 0 || i >= this.tileCodec.length) return null;
+    const codec = ['none', 'solid', 'palrle', 'cdf53'][this.tileCodec[i]] ?? '?';
+    return {
+      codec,
+      frameSeq: this.tileSeq[i],
+      tick: this.tileTick[i],
+      cdf53: this.cdf53Pipeline.debugTile(i),
+    };
+  }
+
+  private notePainted(entries: readonly { tileX: number; tileY: number; frameSeq: number }[], codec: number): void {
+    const cols = this.tileCols;
+    const n = this.tileCodec.length;
+    for (const e of entries) {
+      const i = e.tileY * cols + e.tileX;
+      if (e.tileX >= cols || i >= n) continue;
+      this.tileCodec[i] = codec;
+      this.tileSeq[i] = e.frameSeq >>> 0;
+      this.tileTick[i] = this.paintTick;
+    }
   }
 
   pushSolid(entry: SolidTile): void {
@@ -250,6 +295,7 @@ export class WebGpuRenderer {
     ) {
       return { palrle: 0, solid: 0, h264: 0, cdf53: 0 };
     }
+    this.paintTick++;
     // ---- Steps 1-4: resolve each tile by the newest frame_seq ----
     // The core prevalidates in wire order and emits `Event::PaletteUpdated`
     // ahead of the `TilePayload` it belongs to; `main.ts` applies each
@@ -274,6 +320,9 @@ export class WebGpuRenderer {
     // uploadBatch throws (capacity overflow after a long hidden-tab period):
     // otherwise they keep growing and every later tick throws again. The
     // H.264 queue and its seqs are left alone here so they stay index-aligned.
+    this.notePainted(this.cdf53Queue, 3);
+    this.notePainted(plan.palRle, 2);
+    this.notePainted(plan.solid, 1);
     let cdf53Count = 0;
     try {
       cdf53Count = this.cdf53Pipeline.uploadBatch(this.cdf53Queue);

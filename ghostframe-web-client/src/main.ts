@@ -71,6 +71,12 @@ async function main() {
     // Test/diagnostic hooks: swallowed-exception counts and renderer state.
     window.__ghostframeHealth = () => health.snapshot();
     window.__ghostframeRendererState = () => renderer.debugState();
+    window.__ghostframeTile = (x: number, y: number) => renderer.debugTile(x, y);
+    renderer.device.addEventListener('uncapturederror', (ev) => {
+      const msg = (ev as GPUUncapturedErrorEvent).error.message;
+      health.record('gpu.uncaptured', `tick ${renderer.paintTick}: ${msg}`);
+      health.tally(`gpu:${msg.slice(0, 80)}`);
+    });
   } catch (e) {
     if (e instanceof WebGpuUnavailableError) {
       statusEl.textContent = 'WebGPU not available in this browser.';
@@ -363,6 +369,8 @@ async function main() {
           case 'Solid':
             renderer.pushSolid({ tileX: ev.tile_x, tileY: ev.tile_y, frameSeq: ev.frame_seq, bgra: d.bytes });
             sampleBytes = d.bytes;
+            if (d.bytes[2] > 0x80) health.mark(ev.tile_x, ev.tile_y, ev.frame_seq, 'solid-red');
+            health.tally(`solid:${Array.from(d.bytes).map((b) => b.toString(16).padStart(2, '0')).join('')}`);
             break;
           case 'PalRle':
             renderer.pushPalRle({
