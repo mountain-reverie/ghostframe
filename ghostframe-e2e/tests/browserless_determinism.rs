@@ -393,6 +393,7 @@ async fn an_impaired_scene_with_frame_cost_is_reproducible_from_its_seed() {
     };
     let opts = RunOptions {
         frame_cost: Some(Duration::from_millis(7)),
+        ..Default::default()
     };
     let go = || async {
         run_browserless_with_options(impaired_scene(), LinkOverrides::default(), opts)
