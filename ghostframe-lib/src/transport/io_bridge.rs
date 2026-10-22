@@ -149,6 +149,19 @@ enum BridgeStream {
     Mem(MemStream),
 }
 
+#[cfg(test)]
+impl BridgeStream {
+    /// Readiness of the underlying socket, for the unit tests that wait on
+    /// the bridge's socketpair. Only the socket variant has a reactor to wait
+    /// on; the pipe is readable exactly when it holds bytes.
+    async fn readable(&self) -> io::Result<()> {
+        match self {
+            Self::Unix(s) => s.readable().await,
+            Self::Mem(_) => Ok(()),
+        }
+    }
+}
+
 #[cfg(any(test, feature = "browserless-harness"))]
 impl From<TokioUnixStream> for BridgeStream {
     fn from(s: TokioUnixStream) -> Self {
