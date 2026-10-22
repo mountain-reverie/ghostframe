@@ -10,6 +10,13 @@
 //! `BrowserlessResult::inbound_service_delays` reports how long each
 //! client -> server packet then waits for the loop to take it.
 //!
+//! These scenes run in `HarnessMode::Concurrent`: starvation of the loop is a
+//! concurrency effect, and the default stepped harness writes and reads at one
+//! virtual instant, so every delay it reports is 0 by construction and the
+//! assertions below could not fail. The tests assert the delays are non-zero
+//! as a premise, and a mutation (holding the frame inline in the injected arm)
+//! was checked to fail them.
+//!
 //! Two properties. An idle loop serves packets within the harness floor. And a
 //! frame's hold does not delay them: the injected arm hands a frame with a
 //! `cost` to a task, like the real frame work now runs on a worker thread, so
@@ -21,8 +28,8 @@
 //! production code.
 
 use ghostframe_e2e::harness::browserless::{
-    run_browserless_with_options, BrowserlessResult, BrowserlessScene, LinkOverrides, RunOptions,
-    SceneLoad,
+    run_browserless_with_options, BrowserlessResult, BrowserlessScene, HarnessMode, LinkOverrides,
+    RunOptions, SceneLoad,
 };
 use ghostframe_e2e::harness::load_profile::{Churn, LoadProfile, PRODUCTION_CADENCE_US};
 use ghostframe_e2e::netsim::NetProfile;
@@ -55,7 +62,13 @@ async fn run(cost: Option<Duration>) -> BrowserlessResult {
     run_browserless_with_options(
         scene,
         LinkOverrides::default(),
-        RunOptions { frame_cost: cost },
+        RunOptions {
+            frame_cost: cost,
+            // Event-loop starvation is a concurrency effect: stepped, the
+            // harness writes and the bridge reads at the same virtual
+            // instant and every delay is 0 by construction.
+            mode: HarnessMode::Concurrent,
+        },
     )
     .await
     .expect("scene ran")
@@ -102,6 +115,14 @@ async fn an_idle_loop_takes_inbound_packets_within_the_harness_floor() {
         d.len()
     );
     assert!(r.frame_cost_windows.is_empty());
+    // Non-vacuity: under the stepped harness every delay is exactly 0 (the
+    // write and the read share one virtual instant), so the bound below could
+    // not fail. A concurrent run measures real scheduling gaps.
+    assert!(
+        percentile(d.clone(), 1.0) > 0,
+        "premise: the delays are measured, not zero by construction ({})",
+        describe(&d)
+    );
     let p99 = percentile(d.clone(), 0.99);
     assert!(p99 < 15_000, "idle p99 {p99} us is above the harness floor");
 }
@@ -128,6 +149,10 @@ async fn a_frame_held_off_the_loop_does_not_delay_the_packets_that_arrive_meanwh
         d.len() > 500,
         "premise: packets while frames were held ({})",
         d.len()
+    );
+    assert!(
+        percentile(d.clone(), 1.0) > 0 && percentile(idle_d.clone(), 1.0) > 0,
+        "premise: the delays are measured, not zero by construction"
     );
     let slack_us = 3_000;
     for (name, p) in [("p50", 0.5), ("p90", 0.9), ("p99", 0.99)] {
