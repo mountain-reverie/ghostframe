@@ -21,6 +21,8 @@ fn unique_tmp(label: &str) -> PathBuf {
             .as_nanos()
     ));
     std::fs::create_dir_all(&p).unwrap();
+    // The daemon refuses a state dir that is group- or world-accessible.
+    std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
     p
 }
 
@@ -58,5 +60,22 @@ fn errors_when_init_flag_set_but_no_authkey() {
         stderr.contains("--init requires TS_AUTHKEY"),
         "stderr should mention --init + TS_AUTHKEY: {stderr}"
     );
+    std::fs::remove_dir_all(&state).ok();
+}
+
+#[test]
+fn refuses_world_accessible_state_dir() {
+    let state = unique_tmp("loose-state");
+    std::fs::set_permissions(&state, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let out = Command::new(binary_path())
+        .env_clear()
+        .env("TS_STATE_DIR", &state)
+        .env("TS_AUTHKEY", "tskey-auth-not-used")
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .output()
+        .expect("spawn xdaemon");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr was: {stderr}");
+    assert!(stderr.contains("chmod 700"), "stderr was: {stderr}");
     std::fs::remove_dir_all(&state).ok();
 }

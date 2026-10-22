@@ -95,8 +95,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let init_mode = std::env::args().any(|a| a == "--init");
 
     let hostname = cfg.ts_hostname.clone();
-    let state_dir = cfg.ts_state_dir.clone();
-    let state_dir_path = std::path::PathBuf::from(&state_dir);
+    let state_dir_path = match cfg.state_dir().and_then(|p| {
+        util::ensure_private_dir(&p)?;
+        Ok(p)
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+    let state_dir = state_dir_path.to_string_lossy().into_owned();
     let seeded = state_dir_seeded(&state_dir_path);
 
     let authkey = match (init_mode, cfg.ts_authkey.clone(), seeded) {

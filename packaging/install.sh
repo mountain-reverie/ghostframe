@@ -583,9 +583,14 @@ fi
 fi # mode == headless (steps 3/4)
 
 # 5. State dir.
-state_dir="$user_home/.local/share/ghostframe/ts-state"
+# Matches the unit files' %S/ghostframe (XDG_STATE_HOME, default ~/.local/state).
+state_dir="$user_home/.local/state/ghostframe"
 if [[ ! -d "$state_dir" ]]; then
   info "create: $state_dir"
+  # Parents only if absent: `install -d` on an existing dir would chmod it.
+  for parent in "$user_home/.local" "$user_home/.local/state"; do
+    [[ -d "$parent" ]] || install -d -m 0755 -o "$user_uid" -g "$user_gid" "$parent"
+  done
   install -d -m 0700 -o "$user_uid" -g "$user_gid" "$state_dir"
 fi
 
@@ -708,7 +713,7 @@ elif [[ -t 0 ]]; then
   info "  $state_dir"
   info "so this will register a NEW tailnet node named $(hostname)-ghostframe."
   info "If you moved an existing state dir here, stop and check that path first."
-  info "(A nested ts-state/ts-state/ is the usual cause: 'mv src dst' puts src"
+  info "(A nested ghostframe/ghostframe/ is the usual cause: 'mv src dst' puts src"
   info " INSIDE dst when dst already exists.)"
   info ""
   info "Paste your Tailscale auth key (input hidden; tskey-auth-... format):"

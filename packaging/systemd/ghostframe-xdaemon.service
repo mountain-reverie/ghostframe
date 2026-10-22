@@ -12,7 +12,7 @@ StartLimitBurst=3
 Type=simple
 Environment=DISPLAY=:1
 Environment=TS_HOSTNAME=%H-ghostframe
-Environment=TS_STATE_DIR=%h/.local/share/ghostframe/ts-state
+Environment=TS_STATE_DIR=%S/ghostframe
 # Guest-mode install: skip DRM probe. The DRM modesetting-FB fallback
 # inside drm_capture::capture() reads /dev/dri/card0's active scanout
 # (= host's real display) instead of the guest Xorg on DISPLAY=:1, so
