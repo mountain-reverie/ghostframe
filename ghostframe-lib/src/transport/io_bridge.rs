@@ -127,6 +127,81 @@ use frame::{
 #[path = "io_bridge/harness.rs"]
 mod harness;
 
+#[cfg(any(test, feature = "browserless-harness"))]
+#[path = "io_bridge/mem_stream.rs"]
+mod mem_stream;
+#[cfg(any(test, feature = "browserless-harness"))]
+pub use mem_stream::{mem_stream_pair, MemStream};
+
+/// What the bridge reads packets from and writes them to.
+///
+/// In a production build this *is* the ghostbridge `UnixStream`: the alias
+/// adds no indirection. Under `cfg(test)` / `browserless-harness` it is an
+/// enum that can also be an in-memory pipe, which is what lets the harness
+/// step the loop without a kernel socket and a reactor between it and the
+/// bridge (see `IoBridge::step_until_idle`).
+#[cfg(not(any(test, feature = "browserless-harness")))]
+type BridgeStream = TokioUnixStream;
+
+#[cfg(any(test, feature = "browserless-harness"))]
+enum BridgeStream {
+    Unix(TokioUnixStream),
+    Mem(MemStream),
+}
+
+#[cfg(any(test, feature = "browserless-harness"))]
+impl From<TokioUnixStream> for BridgeStream {
+    fn from(s: TokioUnixStream) -> Self {
+        Self::Unix(s)
+    }
+}
+
+#[cfg(any(test, feature = "browserless-harness"))]
+impl tokio::io::AsyncRead for BridgeStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Unix(s) => tokio::io::AsyncRead::poll_read(Pin::new(s), cx, buf),
+            Self::Mem(s) => tokio::io::AsyncRead::poll_read(Pin::new(s), cx, buf),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "browserless-harness"))]
+impl tokio::io::AsyncWrite for BridgeStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Unix(s) => tokio::io::AsyncWrite::poll_write(Pin::new(s), cx, buf),
+            Self::Mem(s) => tokio::io::AsyncWrite::poll_write(Pin::new(s), cx, buf),
+        }
+    }
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Unix(s) => tokio::io::AsyncWrite::poll_flush(Pin::new(s), cx),
+            Self::Mem(s) => tokio::io::AsyncWrite::poll_flush(Pin::new(s), cx),
+        }
+    }
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Unix(s) => tokio::io::AsyncWrite::poll_shutdown(Pin::new(s), cx),
+            Self::Mem(s) => tokio::io::AsyncWrite::poll_shutdown(Pin::new(s), cx),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Clock discipline
 // ---------------------------------------------------------------------------
@@ -303,12 +378,46 @@ enum LoopArm {
     InjectedHeld,
 }
 
+/// An injected frame waiting out its `cost`. See `IoBridge::held`.
+struct HeldFrame {
+    started: std::time::Instant,
+    until: std::time::Instant,
+    frame: InjectedFrame,
+}
+
+/// What survives from one pass of the event loop to the next.
+///
+/// Lives on the bridge, not on `run()`'s stack, so a caller that drives the
+/// loop one turn at a time (the browserless harness) and `run()` itself see
+/// the same state.
+struct LoopState {
+    /// Scratch for the 8-byte frame header the inbound arm reads.
+    header: [u8; 8],
+    /// [BRIDGE-DIAG] per-select-arm counters so a periodic heartbeat shows
+    /// whether the loop is alive and which arm dominates.
+    diag_iters: u64,
+    diag_timeout_arm: u64,
+    diag_frame_arm: u64,
+    diag_inbound_arm: u64,
+    diag_last_heartbeat: std::time::Instant,
+    /// Consecutive inbound packets taken without a frame arm running.
+    inbound_streak: u32,
+}
+
+/// How a turn of the event loop ended.
+enum TurnEnd {
+    /// Turn again.
+    Continue,
+    /// The ghostbridge stream reached EOF: the loop is over.
+    Eof,
+}
+
 pub struct IoBridge {
     /// Keep the ghostbridge handle alive so the socketpair fd stays open.
     /// `None` only in the test-only constructor, which builds directly from a
     /// `UnixStream::pair()` and has no tsnet node to own.
     _handle: Option<GhostbridgeHandle>,
-    stream: TokioUnixStream,
+    stream: BridgeStream,
     server: QuicServer,
     /// The local address of the UDP listener; passed as `local_ip` to
     /// quinn-proto.  M0: we only bind a single port so this is constant.
@@ -357,11 +466,14 @@ pub struct IoBridge {
     /// Pre-encoded tile work injected by the browserless harness, bypassing
     /// capture and classification. `None` in production.
     inject_rx: Option<mpsc::Receiver<InjectedFrame>>,
-    /// Harness only: injected frames that carry a `cost` are held off the
-    /// loop by a task and come back here; one at a time, in order.
-    held_rx: Option<mpsc::Receiver<InjectedFrame>>,
-    held_tx: Option<mpsc::Sender<InjectedFrame>>,
-    injected_held: bool,
+    /// State carried between turns of the event loop; see [`LoopState`].
+    loop_state: LoopState,
+    /// Harness only: an injected frame that carries a `cost` waits here for
+    /// its deadline, off the critical path, while the loop keeps serving the
+    /// network; one at a time, in order. A deadline on the loop's own select
+    /// rather than a spawned task, so it fires at a virtual instant the
+    /// harness can name (see `next_wake_deadline`).
+    held: Option<HeldFrame>,
     /// Monotonically increasing frame sequence number (wrapping).
     frame_seq: u32,
     /// Per-tile dirty detection.
@@ -895,6 +1007,9 @@ pub struct IoBridge {
     /// `spawn_peer_lookups` starts and applied by the `run` loop. Both ends
     /// live here, so the channel never closes.
     peer_lookup_tx: mpsc::UnboundedSender<(std::net::IpAddr, u64, PeerLookup)>,
+    /// Harness only: answer peer lookups in place instead of on a task.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    inline_peer_lookups: bool,
     peer_lookup_rx: mpsc::UnboundedReceiver<(std::net::IpAddr, u64, PeerLookup)>,
     /// The access policy and denial log the QUIC gate uses, kept so the
     /// web server can be given the same ones (`GhostframeServer::new`).
@@ -1093,7 +1208,7 @@ impl IoBridge {
     /// [`BaseDiffs`]: the tsnet handle, the bound address, and the GPU frame
     /// processor. Everything else is identical by construction.
     fn base(
-        stream: TokioUnixStream,
+        stream: BridgeStream,
         server: QuicServer,
         lib_config: crate::config::LibConfig,
         diffs: BaseDiffs,
@@ -1111,11 +1226,18 @@ impl IoBridge {
             non_live_feedback_drops: 0,
             non_live_datagram_drops: 0,
             has_seen_prior_session: false,
+            loop_state: LoopState {
+                header: [0u8; 8],
+                diag_iters: 0,
+                diag_timeout_arm: 0,
+                diag_frame_arm: 0,
+                diag_inbound_arm: 0,
+                diag_last_heartbeat: now_std(),
+                inbound_streak: 0,
+            },
             frame_rx: None,
             inject_rx: None,
-            held_rx: None,
-            held_tx: None,
-            injected_held: false,
+            held: None,
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
             metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
@@ -1276,6 +1398,8 @@ impl IoBridge {
             bwe_log_last_at: None,
             diagnostics: lib_config.diagnostics,
             peer_lookup_tx,
+            #[cfg(any(test, feature = "browserless-harness"))]
+            inline_peer_lookups: false,
             peer_lookup_rx,
             peer_access: None,
         }
@@ -1362,7 +1486,7 @@ impl IoBridge {
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
         let mut bridge = Self::base(
-            stream,
+            stream.into(),
             server,
             lib_config,
             BaseDiffs {
@@ -1430,6 +1554,15 @@ impl IoBridge {
     fn spawn_peer_lookups(&mut self) {
         for (ip, stamp, source) in self.server.take_peer_lookups() {
             let tx = self.peer_lookup_tx.clone();
+            // A stepped bridge cannot wait on a spawned task and a blocking
+            // thread: when the answer lands would depend on the OS scheduler.
+            // The test sources answer from memory, so ask in place; the
+            // answer still comes back through the same channel and arm.
+            #[cfg(any(test, feature = "browserless-harness"))]
+            if self.inline_peer_lookups {
+                let _ = tx.send((ip, stamp, source.lookup(ip)));
+                continue;
+            }
             tokio::spawn(async move {
                 let lookup = tokio::time::timeout(
                     PEER_LOOKUP_TIMEOUT,
@@ -1772,19 +1905,22 @@ impl IoBridge {
     }
 
     /// Run the event loop until the ghostbridge fd is closed (EOF).
+    ///
+    /// Nothing but [`turn`](Self::turn) in a loop: production and the
+    /// browserless harness, which calls `turn` itself once per step of
+    /// virtual time, run the same body.
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut header = [0u8; 8];
-        // [BRIDGE-DIAG] per-select-arm counters so a periodic heartbeat
-        // shows whether the loop is alive and which arm dominates.
-        let mut diag_iters: u64 = 0;
-        let mut diag_timeout_arm: u64 = 0;
-        let mut diag_frame_arm: u64 = 0;
-        let mut diag_inbound_arm: u64 = 0;
-        let mut diag_last_heartbeat = now_std();
-        // Consecutive inbound packets taken without a frame arm running.
-        let mut inbound_streak: u32 = 0;
-
         loop {
+            if let TurnEnd::Eof = self.turn().await? {
+                return Ok(());
+            }
+        }
+    }
+
+    /// One pass of the event loop: wait for the first of the sources below,
+    /// handle it, then do the per-turn housekeeping.
+    async fn turn(&mut self) -> Result<TurnEnd, Box<dyn std::error::Error + Send + Sync>> {
+        {
             // Build a timer future that fires at the earliest QUIC timeout, or
             // a never-completing future if there are no active connections.
             let sleep_fut: Pin<Box<dyn Future<Output = ()> + Send>> =
@@ -1795,14 +1931,14 @@ impl IoBridge {
 
             // After `INBOUND_STREAK_LIMIT` packets in a row the inbound arm
             // sits one round out, so a frame that has been waiting is taken.
-            let frames_turn = inbound_streak >= INBOUND_STREAK_LIMIT;
+            let frames_turn = self.loop_state.inbound_streak >= INBOUND_STREAK_LIMIT;
 
             tokio::select! {
                 biased;
 
                 // 1. Earliest QUIC timeout fired.
                 _ = sleep_fut => {
-                    diag_timeout_arm += 1;
+                    self.loop_state.diag_timeout_arm += 1;
                     #[cfg(test)]
                     self.loop_arm_trace.push(LoopArm::Timeout);
                     let reaped = self.server.handle_timeout(now_std());
@@ -1842,13 +1978,14 @@ impl IoBridge {
                 // already sent make progress; encoding another frame is
                 // expensive and, with the network unread, produces work that
                 // cannot leave. So the cheap thing that unblocks goes first.
-                read_res = self.stream.read_exact(&mut header), if !frames_turn => {
-                    diag_inbound_arm += 1;
-                    inbound_streak += 1;
+                read_res = self.stream.read_exact(&mut self.loop_state.header), if !frames_turn => {
+                    self.loop_state.diag_inbound_arm += 1;
+                    self.loop_state.inbound_streak += 1;
                     #[cfg(test)]
                     self.loop_arm_trace.push(LoopArm::Inbound);
                     match read_res {
                         Ok(_) => {
+                            let header = self.loop_state.header;
                             #[cfg(any(test, feature = "browserless-harness"))]
                             if let Some(log) = self.inbound_read_log.as_ref() {
                                 log.lock()
@@ -1861,7 +1998,7 @@ impl IoBridge {
                         }
                         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                             tracing::info!("ghostbridge fd closed — shutting down");
-                            return Ok(());
+                            return Ok(TurnEnd::Eof);
                         }
                         Err(e) => return Err(e.into()),
                     }
@@ -1877,7 +2014,7 @@ impl IoBridge {
                         _ => std::future::pending().await,
                     }
                 } => {
-                    inbound_streak = 0;
+                    self.loop_state.inbound_streak = 0;
                     #[cfg(test)]
                     self.loop_arm_trace.push(LoopArm::FrameResult);
                     match result {
@@ -1902,8 +2039,8 @@ impl IoBridge {
                         None => std::future::pending().await,
                     }
                 }, if self.in_flight.is_none() => {
-                    diag_frame_arm += 1;
-                    inbound_streak = 0;
+                    self.loop_state.diag_frame_arm += 1;
+                    self.loop_state.inbound_streak = 0;
                     #[cfg(test)]
                     self.loop_arm_trace.push(LoopArm::Frame);
                     if let Some(frame) = frame {
@@ -1929,8 +2066,8 @@ impl IoBridge {
                         Some(rx) => rx.recv().await,
                         None => std::future::pending().await,
                     }
-                }, if !self.injected_held => {
-                    inbound_streak = 0;
+                }, if self.held.is_none() => {
+                    self.loop_state.inbound_streak = 0;
                     #[cfg(test)]
                     self.loop_arm_trace.push(LoopArm::Injected);
                     match injected {
@@ -1947,18 +2084,23 @@ impl IoBridge {
                 }
 
                 // 3c. An injected frame's hold is over.
-                held = async {
-                    match self.held_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
+                _ = async {
+                    match self.held.as_ref() {
+                        Some(h) => sleep_until(TokioInstant::from_std(h.until)).await,
+                        None => pending::<()>().await,
                     }
                 } => {
-                    inbound_streak = 0;
+                    self.loop_state.inbound_streak = 0;
                     #[cfg(test)]
                     self.loop_arm_trace.push(LoopArm::InjectedHeld);
-                    self.injected_held = false;
-                    if let Some(inj) = held {
-                        self.apply_injected_frame(inj);
+                    if let Some(held) = self.held.take() {
+                        #[cfg(any(test, feature = "browserless-harness"))]
+                        if let Some(log) = self.hold_log.as_ref() {
+                            log.lock()
+                                .expect("hold_log mutex poisoned")
+                                .push((held.started, now_std()));
+                        }
+                        self.apply_injected_frame(held.frame);
                     }
                 }
 
@@ -1967,7 +2109,7 @@ impl IoBridge {
                 // a round with inbound switched off and no frame pending
                 // would wait on a frame that may not be coming.
                 _ = std::future::ready(()), if frames_turn => {
-                    inbound_streak = 0;
+                    self.loop_state.inbound_streak = 0;
                 }
             }
 
@@ -1986,19 +2128,22 @@ impl IoBridge {
             // wall clock internally, so under a paused runtime it would
             // never see the stamp catch up and this heartbeat would go
             // silent forever.
-            diag_iters += 1;
-            if now_std().duration_since(diag_last_heartbeat) >= std::time::Duration::from_secs(2) {
+            self.loop_state.diag_iters += 1;
+            if now_std().duration_since(self.loop_state.diag_last_heartbeat)
+                >= std::time::Duration::from_secs(2)
+            {
                 tracing::trace!(
                     target: "ghostframe::io_bridge::diag",
-                    iters = diag_iters,
-                    timeout = diag_timeout_arm,
-                    frame = diag_frame_arm,
-                    inbound = diag_inbound_arm,
+                    iters = self.loop_state.diag_iters,
+                    timeout = self.loop_state.diag_timeout_arm,
+                    frame = self.loop_state.diag_frame_arm,
+                    inbound = self.loop_state.diag_inbound_arm,
                     "[BRIDGE-HB] select-arm counts (since start)"
                 );
-                diag_last_heartbeat = now_std();
+                self.loop_state.diag_last_heartbeat = now_std();
             }
         }
+        Ok(TurnEnd::Continue)
     }
 
     /// Housekeeping run once per `run` loop turn, after the `select!`.

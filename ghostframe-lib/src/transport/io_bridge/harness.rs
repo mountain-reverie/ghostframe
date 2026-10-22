@@ -18,6 +18,11 @@
 
 use super::*;
 
+/// Upper bound on the turns one `step_until_idle` may take. A busy scene
+/// needs tens; this only exists to turn a livelock into an error.
+#[cfg(any(test, feature = "browserless-harness"))]
+const MAX_TURNS_PER_STEP: usize = 1_000_000;
+
 impl IoBridge {
     /// Test-only constructor that accepts a pre-built stream and server,
     /// bypassing the real ghostbridge connection. No tsnet node is held, so
@@ -57,7 +62,7 @@ impl IoBridge {
         let mut server = server;
         server.set_peer_gate(crate::transport::peer_auth::PeerGate::single_owner_for_tests());
         Self::base(
-            stream,
+            stream.into(),
             server,
             lib_config,
             BaseDiffs {
@@ -89,34 +94,17 @@ impl IoBridge {
         self.frame_pipeline = Some(FramePipeline::new(backend));
     }
 
-    /// Hold an injected frame for its `cost` on a task, off the loop, and hand
-    /// it back through `held_rx`. Stands in for the worker thread's GPU and
-    /// encode time in browserless scenes, where CPU time is invisible to a
-    /// paused clock. Unreachable in production (`inject_rx` is `None`).
+    /// Hold an injected frame for its `cost`: it is applied when the loop's
+    /// select reaches the deadline (arm 3c), and the loop serves the network
+    /// meanwhile. Stands in for the worker thread's GPU and encode time in
+    /// browserless scenes, where CPU time is invisible to a paused clock.
+    /// Unreachable in production (`inject_rx` is `None`).
     pub(super) fn hold_injected_frame(&mut self, inj: InjectedFrame, cost: std::time::Duration) {
-        let tx = match self.held_tx.clone() {
-            Some(tx) => tx,
-            None => {
-                let (tx, rx) = mpsc::channel(1);
-                self.held_tx = Some(tx.clone());
-                self.held_rx = Some(rx);
-                tx
-            }
-        };
-        self.injected_held = true;
-        #[cfg(any(test, feature = "browserless-harness"))]
-        let log = self.hold_log.clone();
-        tokio::spawn(async move {
-            #[cfg(any(test, feature = "browserless-harness"))]
-            let started = now_std();
-            tokio::time::sleep(cost).await;
-            #[cfg(any(test, feature = "browserless-harness"))]
-            if let Some(log) = log {
-                log.lock()
-                    .expect("hold_log mutex poisoned")
-                    .push((started, now_std()));
-            }
-            let _ = tx.send(inj).await;
+        let started = now_std();
+        self.held = Some(HeldFrame {
+            started,
+            until: started + cost,
+            frame: inj,
         });
     }
 
@@ -158,6 +146,101 @@ impl IoBridge {
         bridge.scheduler.resize(grid_cols, grid_rows);
         bridge.inject_rx = Some(inject_rx);
         bridge
+    }
+
+    /// Constructor for a bridge the caller steps by hand: injection channel
+    /// as `new_with_injection_for_test`, but reading and writing an in-memory
+    /// pipe instead of a socketpair, and answering peer lookups in place.
+    /// Drive it with [`step_until_idle`](Self::step_until_idle), never `run`.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn new_stepped_for_test(
+        stream: MemStream,
+        server: QuicServer,
+        inject_rx: mpsc::Receiver<InjectedFrame>,
+        grid_cols: u32,
+        grid_rows: u32,
+    ) -> Self {
+        // `new_with_lib_config_for_test` wants a socket; build on a throwaway
+        // pair and swap the real stream in before anything is read.
+        let (dummy, _peer) = TokioUnixStream::pair().expect("socketpair for a placeholder stream");
+        let mut bridge =
+            Self::new_with_injection_for_test(dummy, server, inject_rx, grid_cols, grid_rows);
+        bridge.stream = BridgeStream::Mem(stream);
+        bridge.inline_peer_lookups = true;
+        bridge
+    }
+
+    /// Turn the event loop until it has nothing ready, then return.
+    ///
+    /// This is `run()`'s own body ([`turn`](Self::turn)), polled by hand
+    /// instead of by a spawned task: when it returns, every source the loop
+    /// selects over (inbound bytes, injected frames, a held frame, the next
+    /// QUIC timer) is not ready *at the current instant*, and the caller owns
+    /// the clock. Nothing here awaits anything that can complete later, so
+    /// the number and order of turns is a function of the inputs alone.
+    ///
+    /// The dropped, pending turn is safe to drop: with whole frames pushed
+    /// into the pipe the inbound `read_exact` either completes in one poll or
+    /// has consumed nothing, and every other arm is rebuilt each turn.
+    ///
+    /// Returns the number of turns that completed, or an error from the loop.
+    /// A [`TurnEnd::Eof`] ends the stepping early.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn step_until_idle(&mut self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll, Wake};
+
+        struct Flag(AtomicBool);
+        impl Wake for Flag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let flag = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = std::task::Waker::from(flag.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut turns = 0usize;
+        loop {
+            // A loop that never goes idle (a timer that stays due, say) would
+            // otherwise hang the caller's thread; production would spin too,
+            // but a harness must say so.
+            if turns >= MAX_TURNS_PER_STEP {
+                return Err(format!(
+                    "the bridge took {MAX_TURNS_PER_STEP} turns without going idle"
+                )
+                .into());
+            }
+            flag.0.store(false, Ordering::SeqCst);
+            // Unconstrained: tokio's cooperative budget would make a long
+            // enough run of ready channel reads report Pending, which here
+            // would end the step early for no reason related to the scene.
+            let mut fut = Box::pin(tokio::task::unconstrained(self.turn()));
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(Ok(TurnEnd::Continue)) => turns += 1,
+                Poll::Ready(Ok(TurnEnd::Eof)) => return Ok(turns),
+                Poll::Ready(Err(e)) => return Err(e),
+                // Woken while polled means "poll me again" (a yield), not
+                // "waiting on something external".
+                Poll::Pending if flag.0.load(Ordering::SeqCst) => {}
+                Poll::Pending => return Ok(turns),
+            }
+        }
+    }
+
+    /// The earliest instant at which the loop has something to do without any
+    /// new input: the QUIC timer, a display-mode debounce, a close deadline or
+    /// a held frame. The stepping caller sleeps its clock to the minimum of
+    /// this and its own deadlines.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn next_wake_for_harness(&mut self) -> Option<std::time::Instant> {
+        // Not part of `next_wake_deadline`: that feeds the loop's timer arm,
+        // which sits ahead of the held-frame arm and would starve it.
+        let held = self.held.as_ref().map(|h| h.until);
+        [self.next_wake_deadline(), held]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Install a deterministic drop plan, for a caller that is about to move
