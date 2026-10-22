@@ -1755,6 +1755,7 @@ async fn e2e_static_mixed_codecs_converge_on_a_shaped_link() -> Result<()> {
             setup.page(),
             &container,
             "e2e_static_mixed_codecs_converge_on_a_shaped_link",
+            &[(160 / 32, 120 / 32)],
         )
         .await;
     }
@@ -5651,7 +5652,7 @@ async fn e2e_lossless_golden_png() -> Result<()> {
             ("GHOSTFRAME_DRM_MODE", &drm_mode),
             ("CAPTURE_FPS_DRM_DIRECT", "2"),
         ],
-        "&e2e=lossless",
+        "&e2e=lossless&debug",
     )
     .await?;
 
@@ -5701,6 +5702,8 @@ async fn e2e_lossless_golden_png() -> Result<()> {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut last_summary = String::from("(no screenshot yet)");
+    // Up to 24 tiles that mismatched in the latest capture, for the dump.
+    let mut bad_tiles: Vec<(u32, u32)> = Vec::new();
     let mut iters = 0u32;
     let artifacts_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
@@ -5725,6 +5728,7 @@ async fn e2e_lossless_golden_png() -> Result<()> {
                 setup.page(),
                 &setup.server.server_container_name,
                 "e2e_lossless_golden_png",
+                &bad_tiles,
             )
             .await;
             return Err(anyhow!(
@@ -5764,6 +5768,7 @@ async fn e2e_lossless_golden_png() -> Result<()> {
         // alpha=0xFF while ghostframe paints 0x00.
         let mut mismatch_count: u64 = 0;
         let mut first: Option<(u32, u32, [u8; 3], [u8; 3])> = None;
+        bad_tiles.clear();
         for y in 0..HEIGHT {
             let src_off = (y as usize) * row_bytes;
             let dst_off = (y * WIDTH * 4) as usize;
@@ -5774,6 +5779,10 @@ async fn e2e_lossless_golden_png() -> Result<()> {
                 let want = [expected[dx], expected[dx + 1], expected[dx + 2]];
                 if got != want {
                     mismatch_count += 3;
+                    let t = (x / 32, y / 32);
+                    if bad_tiles.len() < 24 && !bad_tiles.contains(&t) {
+                        bad_tiles.push(t);
+                    }
                     if first.is_none() {
                         first = Some((x, y, got, want));
                     }

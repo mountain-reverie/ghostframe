@@ -10,6 +10,8 @@
 
 const MAX_RECENT = 20;
 const MAX_CONSOLE = 300;
+/** The first lines are kept apart, so a long run cannot rotate them out. */
+const MAX_CONSOLE_HEAD = 100;
 
 export interface HealthSnapshot {
   swallowed: number;
@@ -17,6 +19,9 @@ export interface HealthSnapshot {
   first: string;
   recent: string[];
   console: string[];
+  consoleHead: string[];
+  tallies: Record<string, number>;
+  marks: Array<{ tileX: number; tileY: number; frameSeq: number; what: string }>;
 }
 
 export class Health {
@@ -25,6 +30,20 @@ export class Health {
   first = '';
   recent: string[] = [];
   consoleRing: string[] = [];
+  consoleHead: string[] = [];
+  tallies: Record<string, number> = {};
+  marks: Array<{ tileX: number; tileY: number; frameSeq: number; what: string }> = [];
+
+  /** Remember a few interesting tiles (bounded), for pixel read-back on failure. */
+  mark(tileX: number, tileY: number, frameSeq: number, what: string): void {
+    if (this.marks.length < 12) this.marks.push({ tileX, tileY, frameSeq, what });
+  }
+
+  /** Count an observation (bounded: at most 64 distinct keys). */
+  tally(key: string): void {
+    if (!(key in this.tallies) && Object.keys(this.tallies).length >= 64) return;
+    this.tallies[key] = (this.tallies[key] ?? 0) + 1;
+  }
 
   record(site: string, err: unknown): void {
     this.swallowed++;
@@ -36,6 +55,7 @@ export class Health {
   }
 
   note(line: string): void {
+    if (this.consoleHead.length < MAX_CONSOLE_HEAD) this.consoleHead.push(line);
     this.consoleRing.push(line);
     if (this.consoleRing.length > MAX_CONSOLE) this.consoleRing.shift();
   }
@@ -47,15 +67,19 @@ export class Health {
       first: this.first,
       recent: [...this.recent],
       console: [...this.consoleRing],
+      consoleHead: [...this.consoleHead],
+      tallies: { ...this.tallies },
+      marks: [...this.marks],
     };
   }
 }
 
 export const health = new Health();
 
-/** Mirror console.warn/error into the ring (still printing as before). */
+/** Mirror the console into the ring (still printing as before). */
 export function installConsoleRing(target: Console = console): void {
-  for (const level of ['warn', 'error'] as const) {
+  for (const level of ['log', 'info', 'warn', 'error'] as const) {
+    if (typeof target[level] !== 'function') continue;
     const orig = target[level].bind(target);
     target[level] = (...args: unknown[]) => {
       try {

@@ -55,6 +55,7 @@ function makeRenderer(tl: Timeline) {
     rawQueue: [], solidQueue: [], palRleQueue: [], cdf53Queue: [], h264Queue: [], h264Seqs: [],
     videoFramesToClose: [], framebufferDirty: false, submitCount: 0, errorsReadbackInFlight: false,
     h264DropWarned: false,
+    paintTick: 0, tileCols: 0, tileCodec: new Uint8Array(0), tileSeq: new Uint32Array(0), tileTick: new Uint32Array(0),
     gpu: { device, context: { getCurrentTexture: () => ({ createView: () => ({}) }) } },
     framebuffer: { texture: {}, view: {}, width: 64, height: 64, encodePresentBlit() {} },
     solidPipeline: {
