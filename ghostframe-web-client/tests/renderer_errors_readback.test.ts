@@ -38,6 +38,8 @@ class FakeGpu {
   ran: Op[] = [];
   rejected: string[] = [];
   buffers: FakeBuffer[] = [];
+  /** Value every mapped word reads as; non-zero makes the readback report an error. */
+  mappedFill = 0;
 
   device = {
     queue: {
@@ -71,7 +73,11 @@ class FakeGpu {
             };
           });
         },
-        getMappedRange: (_o?: number, size?: number) => new ArrayBuffer(size ?? d.size),
+        getMappedRange: (_o?: number, size?: number) => {
+          const u = new Uint32Array((size ?? d.size) / 4);
+          u.fill(this.mappedFill);
+          return u.buffer;
+        },
         unmap() { b.mapState = 'unmapped'; },
         destroy() {},
       };
@@ -204,5 +210,29 @@ describe('PalRLE errors readback', () => {
     expect(gpu.rejected).toEqual([]);
     expect(gpu.ran.filter((o) => o.kind === 'errors-copy')).toHaveLength(2);
     await gpu.drainMaps();
+  });
+
+  it('unmaps the buffer and accepts the next tick when reporting a decode error throws', async () => {
+    gpu.mappedFill = 7;
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+      r.pushPalRle(pal(1, 1));
+      r.encodeAndPresentFrame(() => {
+        throw new Error('boom');
+      });
+      await gpu.drainMaps();
+      // The readback threw part-way; the staging buffer must not stay mapped.
+      expect(gpu.buffers.every((b) => b.mapState === 'unmapped')).toBe(true);
+
+      r.pushSolid(solid(0, 2));
+      r.pushPalRle(pal(1, 2));
+      present();
+      expect(gpu.rejected).toEqual([]);
+      expect(gpu.ran.some((o) => o.kind === 'solid' && o.tile![0] === 0)).toBe(true);
+      await gpu.drainMaps();
+    } finally {
+      console.warn = warn;
+    }
   });
 });
