@@ -171,7 +171,9 @@ pub struct ClientCore {
     pub(crate) h264_fragments_recovered: u64,
     /// Coverage NACKs awaiting the debounce window before being handed to
     /// `nack_batcher` (main.ts `pendingNacks` / `queuePassNack`).
-    pub(crate) pending_nacks: HashMap<(u8, u8, u8), PendingNack>,
+    /// Keyed `(pass_idx, tile_y, tile_x)`, so iteration order IS send order:
+    /// pass-major, then by position. See `flush_pending_nacks`.
+    pub(crate) pending_nacks: std::collections::BTreeMap<(u8, u8, u8), PendingNack>,
     pub(crate) pending_nack_deadline_us: Option<u64>,
     /// Next `now_us` at which the tail sweep runs (always armed).
     pub(crate) next_tail_sweep_us: u64,
@@ -210,7 +212,7 @@ impl ClientCore {
             frame_assemblies: HashMap::new(),
             latest_full_frame_seq: 0,
             h264_fragments_recovered: 0,
-            pending_nacks: HashMap::new(),
+            pending_nacks: std::collections::BTreeMap::new(),
             pending_nack_deadline_us: None,
             next_tail_sweep_us: now_us + TAIL_SWEEP_INTERVAL_US,
             next_feedback_us: now_us + FEEDBACK_INTERVAL_US,
@@ -307,7 +309,7 @@ impl ClientCore {
         pass_idx: u8,
         now_us: u64,
     ) {
-        let key = (tile_x, tile_y, pass_idx);
+        let key = (pass_idx, tile_y, tile_x);
         if self.pending_nacks.contains_key(&key) {
             return;
         }
@@ -334,11 +336,17 @@ impl ClientCore {
         if self.pending_nacks.is_empty() {
             return;
         }
-        let mut pending: Vec<PendingNack> = self.pending_nacks.drain().map(|(_, v)| v).collect();
-        // `HashMap` drains in an order that differs between runs of the same
-        // input. The order decides which NACKs share a datagram, so it would
-        // make a session's wire traffic unreproducible.
-        pending.sort_unstable_by_key(|p| (p.tile_y, p.tile_x, p.pass_idx));
+        // Pass-major: every pass 0 goes before any pass 1, and so on. The
+        // server queues NACKs FIFO and drains them under its retransmit
+        // budget, so the order sent here is the order recovered. Position
+        // order (tile_y, tile_x, pass) would spend the budget on every pass
+        // of the top-left tiles before pass 0 of the lower rows, the inverse
+        // of the pass-major order refinement is emitted in. A `BTreeMap`
+        // also makes the order independent of hashing, which decides which
+        // NACKs share a datagram and so would make wire traffic unreproducible.
+        let pending: Vec<PendingNack> = std::mem::take(&mut self.pending_nacks)
+            .into_values()
+            .collect();
         let mut queued = false;
         for p in pending {
             if let Some(cov) = self.cdf53_coverage.get(&(p.tile_x, p.tile_y)) {
@@ -545,5 +553,69 @@ impl ClientCore {
     /// loss counters.
     pub fn encode_feedback(&mut self, now_us: u64) -> Vec<u8> {
         self.loss_tracker.encode_feedback(now_us)
+    }
+}
+
+#[cfg(test)]
+mod nack_order_tests {
+    use super::*;
+
+    /// Entries of every NACK datagram in the outbox, in send order.
+    fn sent_nacks(core: &mut ClientCore) -> Vec<(u8, u8, u8)> {
+        let mut out = Vec::new();
+        while let Some(o) = core.poll_transmit(0) {
+            if let PollOutput::Datagram(d) = o {
+                if d.first() != Some(&0x05) {
+                    continue;
+                }
+                for e in d[2..].chunks_exact(8) {
+                    // (pass_idx, tile_y, tile_x)
+                    out.push((e[6], e[5], e[4]));
+                }
+            }
+        }
+        out
+    }
+
+    /// The server drains NACKs FIFO under a retransmit budget. With a budget
+    /// smaller than the set, whatever is sent first is what gets recovered,
+    /// so every pass-0 NACK must precede any pass-1 NACK however the NACKs
+    /// were queued, and the order must not depend on insertion order.
+    #[test]
+    fn nacks_go_out_pass_major_so_a_small_budget_recovers_pass_zero_first() {
+        let mut core = ClientCore::new(ClientConfig::default(), 0);
+        while core.poll_transmit(0).is_some() {}
+        // 4x3 tiles, 3 passes each, queued in an order that is neither
+        // pass-major nor position order.
+        let mut all = Vec::new();
+        for y in 0..3u8 {
+            for x in 0..4u8 {
+                for p in 0..3u8 {
+                    all.push((x, y, p));
+                }
+            }
+        }
+        all.reverse();
+        all.rotate_left(5);
+        for (x, y, p) in all {
+            core.queue_pass_nack(1, x, y, p, 0);
+        }
+        core.on_timeout(NACK_DEBOUNCE_US);
+        let sent = sent_nacks(&mut core);
+        assert_eq!(sent.len(), 36, "premise: every queued NACK was sent");
+        let first_pass1 = sent.iter().position(|e| e.0 == 1).expect("a pass-1 NACK");
+        let last_pass0 = sent.iter().rposition(|e| e.0 == 0).expect("a pass-0 NACK");
+        assert!(
+            last_pass0 < first_pass1,
+            "a pass-1 NACK was sent before the last pass-0 NACK: {sent:?}"
+        );
+        // A budget smaller than the set (12 pass-0 NACKs of 36) recovers all
+        // of pass 0 and nothing of pass 1 or 2.
+        let budgeted = &sent[..12];
+        assert!(budgeted.iter().all(|e| e.0 == 0), "{budgeted:?}");
+        // The whole order is the sorted one: deterministic, pass-major.
+        let mut sorted = sent.clone();
+        sorted.sort_unstable();
+        assert_eq!(sent, sorted);
     }
 }
