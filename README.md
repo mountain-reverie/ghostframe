@@ -359,6 +359,22 @@ and tags that may connect. For several ghostframe hosts this is the
 tighter setup: register them with one tagged key and list yourself, so a
 leaked key admits nothing.
 
+### Browser pages: the Origin check
+
+Who may connect is decided per machine, so by itself it cannot tell the
+ghostframe web client from any other page open in an allowed user's
+browser. The daemon therefore also checks the `Origin` of every WebTransport
+session request and answers `403` unless it is `https://<this node's MagicDNS
+name>` (port 443). `null`, other hosts, `http://` and other ports are refused.
+A request with **no** `Origin` is accepted: browsers always send one and a
+page cannot remove it, while the native client is not a browser and sends none.
+That case is covered by the access policy above, not by this check.
+
+To serve the client under another name, list the extra origins in
+`GHOSTFRAME_WEB_ORIGINS` (comma-separated `scheme://host[:port]`, port `*`
+for any). Malformed entries are ignored with a warning; nothing admits every
+origin.
+
 ### Restrict the node in your tailnet policy too
 
 The daemon's check is the access boundary, but nothing else on the tailnet

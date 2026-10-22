@@ -899,6 +899,9 @@ pub struct IoBridge {
     /// The access policy and denial log the QUIC gate uses, kept so the
     /// web server can be given the same ones (`GhostframeServer::new`).
     peer_access: Option<(Arc<AccessPolicy>, Arc<DenialLog>)>,
+    /// Which `Origin` a WebTransport CONNECT may carry; handed to every new
+    /// `WebTransportServer`. The default admits no browser origin.
+    origin_policy: Arc<crate::transport::origin::OriginPolicy>,
 }
 
 /// Upper bound on one identity lookup, including its wait for a blocking
@@ -1278,6 +1281,7 @@ impl IoBridge {
             peer_lookup_tx,
             peer_lookup_rx,
             peer_access: None,
+            origin_policy: Arc::new(Default::default()),
         }
     }
 
@@ -1361,6 +1365,20 @@ impl IoBridge {
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
+        let (origins, rejected) = crate::transport::origin::OriginPolicy::new(
+            &self_identity.node_name,
+            &lib_config.access.web_origins,
+        );
+        if !rejected.is_empty() {
+            tracing::warn!(
+                ?rejected,
+                "GHOSTFRAME_WEB_ORIGINS: ignoring malformed entries"
+            );
+        }
+        tracing::info!(
+            allowed = ?origins.describe(),
+            "WebTransport CONNECT admits these browser origins (and none-sending native clients)"
+        );
         let mut bridge = Self::base(
             stream,
             server,
@@ -1372,6 +1390,8 @@ impl IoBridge {
             },
         );
         bridge.peer_access = Some((policy, denials));
+
+        bridge.origin_policy = Arc::new(origins);
         Ok(bridge)
     }
 
