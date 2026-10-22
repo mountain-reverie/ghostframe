@@ -9,6 +9,7 @@ import { initDiagnostics } from './diagnostics.js';
 import { bootstrap } from './bootstrap.js';
 import { initProtocol, protocol } from './protocol_constants.js';
 import { showDisconnectedOverlay } from './disconnect_overlay.js';
+import { closeOverlayMessage } from './close_message.js';
 import {
   recordProtocolEvent,
   codecDiscriminant,
@@ -129,6 +130,8 @@ async function main() {
     (info) => {
       log(`Transport closed: code=${info.closeCode} reason=${info.reason}`);
       onSessionReset();
+      const msg = closeOverlayMessage(info);
+      if (msg) showDisconnectedOverlay(msg);
     },
     (err) => {
       log(`Transport closed with error: ${err}`);
