@@ -10,7 +10,6 @@ use crate::transport::reliable_emitter::traits::{DatagramSender, SendOutcome};
 use crate::transport::reliable_emitter::wire_seq::WireSeqAllocator;
 use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K, PARITY_INTERLEAVE_OFFSET};
 use bytes::{Bytes, BytesMut};
-use smallvec::smallvec;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -44,16 +43,16 @@ pub struct ReliableTileEmitter {
     /// allocated; the caller cannot otherwise know which value a datagram
     /// carried.
     transmissions: Vec<EmittedDatagram>,
-    /// Fragments the client has asked for again, waiting for retransmit
+    /// Passes the client has asked for again, waiting for retransmit
     /// budget. Served oldest first by `tick_budgeted`, ahead of the RTO.
     ///
     /// A queue rather than an immediate send because a NACK arrives when the
     /// client decides to send it, which has nothing to do with whether the
     /// link has room. See `on_nack`.
-    pending_nacks: VecDeque<(EmitKey, u8)>,
+    pending_nacks: VecDeque<EmitKey>,
     /// Membership of `pending_nacks`, so a request repeated while the first
     /// is still waiting does not become a second retransmission.
-    pending_nack_set: HashSet<(EmitKey, u8)>,
+    pending_nack_set: HashSet<EmitKey>,
     pub stats: EmitterStats,
 }
 
@@ -241,8 +240,7 @@ impl ReliableTileEmitter {
         });
         // Cache & RTO.
         let entry = CacheEntry {
-            fragments: smallvec![bytes.clone()],
-            wire_seqs: smallvec![wire_seq],
+            datagram: bytes.clone(),
             queued_at,
             first_sent_at: now,
             last_sent_at: now,
@@ -430,18 +428,15 @@ impl ReliableTileEmitter {
         let mut spent = 0usize;
         let emit_us_now = self.emit_us64(now);
         while count < max_retransmits && spent < max_bytes {
-            let Some((key, frag_idx)) = self.pending_nacks.pop_front() else {
+            let Some(key) = self.pending_nacks.pop_front() else {
                 break;
             };
-            self.pending_nack_set.remove(&(key, frag_idx));
+            self.pending_nack_set.remove(&key);
             // Acknowledged or superseded while it waited: nothing to resend.
             let Some(entry) = self.cache.get_mut(&key) else {
                 continue;
             };
-            let Some(frag) = entry.fragments.get(frag_idx as usize) else {
-                continue;
-            };
-            let mut bytes = frag.to_vec();
+            let mut bytes = entry.datagram.to_vec();
             // A NACK is the client stating outright that this fragment did
             // not arrive — ground truth, unlike RTO, which fires on delay as
             // readily as on loss and never fires at all for a tile that gets
@@ -495,9 +490,9 @@ impl ReliableTileEmitter {
             // when its timer fired, and what deadline was it given?
             if crate::transport::reliable_emitter::rto_probe_enabled() {
                 let probe_codec = entry
-                    .fragments
-                    .first()
-                    .and_then(|f| f.get(18).copied())
+                    .datagram
+                    .get(18)
+                    .copied()
                     .map(|b| b >> 1)
                     .unwrap_or(255);
                 eprintln!(
@@ -510,7 +505,7 @@ impl ReliableTileEmitter {
                     rto_for_attempt(self.ack_deadline, entry.attempts).as_micros(),
                 );
             }
-            // Bump attempts, re-enqueue every cached fragment, reschedule RTO.
+            // Bump attempts, re-enqueue the cached datagram, reschedule RTO.
             entry.attempts += 1;
             entry.last_sent_at = now;
             // A probe cluster measures one burst: goog_cc divides the
@@ -533,7 +528,7 @@ impl ReliableTileEmitter {
             entry.probe = None;
             let new_rto = rto_for_attempt(self.ack_deadline, entry.attempts);
             entry.rto_deadline = now + new_rto;
-            let frags: Vec<Vec<u8>> = entry.fragments.iter().map(|b| b.to_vec()).collect();
+            let mut bytes = entry.datagram.to_vec();
             // [H3-DIAG] log every actual retransmit. Captures the EmitKey
             // routing tuple + a fingerprint of the first fragment so a
             // stale-bundle replay (e.g. a PalRle bundled payload whose slot
@@ -541,9 +536,8 @@ impl ReliableTileEmitter {
             // up as: same (tile_x, tile_y) replayed across many frame_seqs
             // with the same fingerprint, while the live palette has moved on.
             let attempts = entry.attempts;
-            let frag_count = frags.len();
             if tracing::enabled!(target: "emitter.h3", tracing::Level::TRACE) {
-                let (fp, codec_byte, palette_id_byte, flags_byte) = first_fragment_fp(&frags);
+                let (fp, codec_byte, palette_id_byte, flags_byte) = datagram_fp(&bytes);
                 tracing::trace!(
                     target: "emitter.h3",
                     frame_seq = key.frame_seq,
@@ -551,7 +545,6 @@ impl ReliableTileEmitter {
                     tile_y = key.tile_y,
                     pass_idx = key.pass_idx,
                     attempts = attempts,
-                    frag_count = frag_count,
                     codec = codec_byte,
                     palrle_flags = flags_byte,
                     palette_id = palette_id_byte,
@@ -559,50 +552,44 @@ impl ReliableTileEmitter {
                     "[H3-SRV] retransmit"
                 );
             }
+            // Re-stamp emit time on retransmit so the BWE consumer sees
+            // the actual on-wire moment, not the original send. Tile
+            // datagrams only (top bit of byte 0 set).
+            // A retransmission is a *new transmission* and gets its own
+            // `wire_seq`. Reusing the original's — which both retransmit
+            // paths did — is what made an acknowledgement ambiguous
+            // about which send it referred to, and that ambiguity is the
+            // reason a Karn-style filter had to discard 99% of timing
+            // samples on a congested link before being reverted.
+            let mut ws = 0u32;
             let mut first_ws: Option<u32> = None;
-            for mut bytes in frags {
-                // Re-stamp emit time on retransmit so the BWE consumer sees
-                // the actual on-wire moment, not the original send. Tile
-                // datagrams only (top bit of byte 0 set).
-                // A retransmission is a *new transmission* and gets its own
-                // `wire_seq`. Reusing the original's — which both retransmit
-                // paths did — is what made an acknowledgement ambiguous
-                // about which send it referred to, and that ambiguity is the
-                // reason a Karn-style filter had to discard 99% of timing
-                // samples on a congested link before being reverted.
-                //
-                // Fragments of a pass each carry their own `wire_seq`, so
-                // this allocates per fragment exactly as the original
-                // submission did.
-                let mut ws = 0u32;
-                if bytes.len() >= 12 {
-                    ws = self.alloc.allocate();
-                    first_ws.get_or_insert(ws);
-                    bytes[8..12].copy_from_slice(&ws.to_be_bytes());
-                }
-                let mut stamped = 0u64;
-                if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
-                    stamped = self.emit_us64(now);
-                    bytes[12..16].copy_from_slice(&(stamped as u32).to_be_bytes());
-                }
-                let bytes = Bytes::from(bytes);
-                self.transmissions.push(EmittedDatagram {
-                    wire_seq: ws,
-                    emit_us: stamped,
-                    wire_bytes: bytes.len(),
-                    key,
-                });
-                // A retransmit allocates its own `wire_seq` above; it must
-                // join the FEC group exactly as a first transmission does
-                // (see `feed_group`'s doc comment), or the group builder's
-                // membership range no longer matches what was actually put
-                // on the wire.
-                if bytes.len() >= 12 {
-                    self.feed_group(ws, bytes.clone());
-                }
-                spent += bytes.len();
-                self.queue.push_source(bytes);
+            if bytes.len() >= 12 {
+                ws = self.alloc.allocate();
+                first_ws = Some(ws);
+                bytes[8..12].copy_from_slice(&ws.to_be_bytes());
             }
+            let mut stamped = 0u64;
+            if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
+                stamped = self.emit_us64(now);
+                bytes[12..16].copy_from_slice(&(stamped as u32).to_be_bytes());
+            }
+            let bytes = Bytes::from(bytes);
+            self.transmissions.push(EmittedDatagram {
+                wire_seq: ws,
+                emit_us: stamped,
+                wire_bytes: bytes.len(),
+                key,
+            });
+            // A retransmit allocates its own `wire_seq` above; it must
+            // join the FEC group exactly as a first transmission does
+            // (see `feed_group`'s doc comment), or the group builder's
+            // membership range no longer matches what was actually put
+            // on the wire.
+            if bytes.len() >= 12 {
+                self.feed_group(ws, bytes.clone());
+            }
+            spent += bytes.len();
+            self.queue.push_source(bytes);
             self.rto.schedule(key, now + new_rto);
             self.stats.rto_fired += 1;
             self.note_rto_fire(key, first_ws);
@@ -645,11 +632,10 @@ impl ReliableTileEmitter {
         self.cache.bytes_outstanding()
     }
 
-    /// Ingest a batch of NACKs from the client. For each (key, frag_idx):
+    /// Ingest a batch of NACKs from the client. For each pass key:
     /// - Cache miss → bump `nack_miss` and continue.
-    /// - Out-of-range frag_idx → silently skip.
     /// - Already waiting for budget → bump `nack_deduped` and continue.
-    /// - Otherwise queue that one fragment for `tick_budgeted` and bump
+    /// - Otherwise queue the pass's datagram for `tick_budgeted` and bump
     ///   `nack_hit`.
     ///
     /// Nothing is sent from here. This used to push the fragment straight
@@ -659,23 +645,22 @@ impl ReliableTileEmitter {
     /// knew what the link could carry. See `tick_budgeted`.
     ///
     /// The RTO heap entry for this key stays in place; `tick_budgeted` bumps
-    /// `attempts` when the fragment actually goes out, and the RTO re-fires
+    /// `attempts` when the datagram actually goes out, and the RTO re-fires
     /// with the capped backoff from there. No heap removal is required.
     ///
     /// `_now` is unused now that the send is deferred, and kept so callers
     /// continue to pass the clock they use for `submit_one` / `tick`.
-    pub fn on_nack(&mut self, entries: &[(EmitKey, u8)], _now: Instant) {
-        for &(nacked_key, frag_idx) in entries {
-            // Exact first: a NACK naming the transmission hits directly. The
-            // client no longer sends one, since a pass is a single datagram
-            // and a lost one leaves it no frame_seq to name.
+    pub fn on_nack(&mut self, entries: &[EmitKey], _now: Instant) {
+        for &nacked_key in entries {
+            // Exact first: a NACK whose `frame_seq` happens to be the one the
+            // pass was cached under hits directly.
             //
-            // Content second: a coverage NACK for a wholly missing pass
-            // cannot. The client has no frame_seq for a datagram it never
-            // got, so it sends the tile's last-known one, and refinement
-            // passes for one tile are emitted across different frames. That
-            // mismatch is why `nack_hit` read exactly 0 in the field rather
-            // than merely low -- every coverage NACK missed, the pass was
+            // Content second, and the usual case: the client never received
+            // the datagram, so it has no `frame_seq` for it and sends the
+            // tile's last-known one, while refinement passes for one tile
+            // are emitted across different frames. Looked up by exact key
+            // alone that missed every time, which is why `nack_hit` read
+            // exactly 0 in the field rather than merely low -- the pass was
             // never resent, and the client gave up on it after
             // MAX_TAIL_SWEEP_ATTEMPTS, stranding the tile short of its
             // finest bit-planes for the rest of the session.
@@ -694,24 +679,21 @@ impl ReliableTileEmitter {
                     None => nacked_key,
                 }
             };
-            let Some(entry) = self.cache.get(&key) else {
+            if self.cache.get(&key).is_none() {
                 self.stats.nack_miss += 1;
                 if crate::transport::reliable_emitter::rto_probe_enabled() {
                     eprintln!("RTOPROBE nack_miss");
                 }
                 continue;
-            };
+            }
             if crate::transport::reliable_emitter::rto_probe_enabled() {
                 eprintln!("RTOPROBE nack_hit");
             }
-            if entry.fragments.get(frag_idx as usize).is_none() {
-                continue;
-            }
-            if !self.pending_nack_set.insert((key, frag_idx)) {
+            if !self.pending_nack_set.insert(key) {
                 self.stats.nack_deduped += 1;
                 continue;
             }
-            self.pending_nacks.push_back((key, frag_idx));
+            self.pending_nacks.push_back(key);
             self.stats.nack_hit += 1;
         }
     }
@@ -863,19 +845,16 @@ thread_local! {
     static FP_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// [H3-DIAG] FNV-1a fingerprint of the first fragment's bytes, plus the
+/// [H3-DIAG] FNV-1a fingerprint of the datagram's bytes, plus the
 /// peeked codec / palrle-flags / palette_id bytes from a tile datagram
 /// layout: 16-byte DatagramHeader + 8-byte TileHeader + payload.
 ///
 /// Returns (fp, codec_byte, palette_id_byte, palrle_flags_byte). For
 /// non-PalRle codecs the palette_id / flags bytes are meaningless but
 /// still surfaced to keep the log shape stable.
-fn first_fragment_fp(frags: &[Vec<u8>]) -> (u32, u8, u8, u8) {
+fn datagram_fp(f: &[u8]) -> (u32, u8, u8, u8) {
     #[cfg(test)]
     FP_COMPUTED.with(|c| c.set(c.get() + 1));
-    let Some(f) = frags.first() else {
-        return (0, 0xFF, 0xFF, 0xFF);
-    };
     // FNV-1a over the whole fragment except the timestamp field at [12..16]
     // (which the io_bridge stamps lazily and we don't want to compare).
     let mut h: u32 = 0x811c_9dc5;
@@ -959,7 +938,7 @@ mod tests {
                     vec![want.clone()],
                     "len={len} flag={flag} shared={shared}"
                 );
-                assert_eq!(e.cache.get(&key).unwrap().fragments[0][..], want[..]);
+                assert_eq!(e.cache.get(&key).unwrap().datagram[..], want[..]);
                 if let Some(k) = keep {
                     assert_eq!(&k[..], &src[..], "the caller's shared handle was mutated");
                 }
@@ -979,7 +958,7 @@ mod tests {
         let src = fake_source(1, 0, 0xAA);
         let src_ptr = src.as_ptr();
         e.submit_one(key, src, now, None, now);
-        assert_eq!(e.cache.get(&key).unwrap().fragments[0].as_ptr(), src_ptr);
+        assert_eq!(e.cache.get(&key).unwrap().datagram.as_ptr(), src_ptr);
     }
 
     /// A shared source must be copied, never stamped through the other handle.
@@ -997,12 +976,9 @@ mod tests {
         }
         e.submit_one(key, src, now, None, now);
         assert_eq!(&keep[..], &before[..]);
-        assert_ne!(
-            e.cache.get(&key).unwrap().fragments[0].as_ptr(),
-            keep.as_ptr()
-        );
+        assert_ne!(e.cache.get(&key).unwrap().datagram.as_ptr(), keep.as_ptr());
         assert_eq!(
-            &e.cache.get(&key).unwrap().fragments[0][8..12],
+            &e.cache.get(&key).unwrap().datagram[8..12],
             &3u32.to_be_bytes()
         );
     }
@@ -1013,7 +989,7 @@ mod tests {
         let mut e = ReliableTileEmitter::new(now);
         let key = EmitKey::new(1, 0, 0, 0);
         e.submit_one(key, fake_source(1, 0, 0xAA), now, None, now);
-        let cached_ptr = e.cache.get(&key).unwrap().fragments[0].as_ptr();
+        let cached_ptr = e.cache.get(&key).unwrap().datagram.as_ptr();
         let Some(Emission::Source(queued)) = e.next_emission(now) else {
             panic!("expected the source emission");
         };
@@ -1341,7 +1317,7 @@ mod tests {
         let key = EmitKey::new(1, 0, 0, 0);
         e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
         e.drain(&mut sender, t0);
-        e.on_nack(&[(key, 0u8)], t0);
+        e.on_nack(&[key], t0);
         e.tick(t0, usize::MAX);
         assert_eq!(
             (
@@ -1444,7 +1420,7 @@ mod tests {
 
         // NACK retransmit.
         let t2 = t1 + Duration::from_millis(10);
-        e.on_nack(&[(key, 0)], t2);
+        e.on_nack(&[key], t2);
         e.tick(t2, usize::MAX);
         e.drain(&mut sender, t2);
         assert_eq!(sender.sent.len(), 3);
@@ -1536,7 +1512,7 @@ mod tests {
     }
 
     #[test]
-    fn on_nack_reemits_specific_fragment_only() {
+    fn on_nack_reemits_the_pass() {
         let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
@@ -1544,8 +1520,7 @@ mod tests {
         e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
         e.drain(&mut sender, t0);
         assert_eq!(sender.sent.len(), 1);
-        // NACK for frag_idx=0 (the only one)
-        e.on_nack(&[(key, 0u8)], t0);
+        e.on_nack(&[key], t0);
         e.tick(t0, usize::MAX);
         e.drain(&mut sender, t0);
         assert_eq!(sender.sent.len(), 2);
@@ -1666,7 +1641,7 @@ mod tests {
     #[test]
     fn on_nack_for_unknown_key_bumps_nack_miss() {
         let mut e = ReliableTileEmitter::new(Instant::now());
-        e.on_nack(&[(EmitKey::new(99, 0, 0, 0), 0u8)], Instant::now());
+        e.on_nack(&[EmitKey::new(99, 0, 0, 0)], Instant::now());
         assert_eq!(e.stats.nack_miss, 1);
     }
 
@@ -1705,7 +1680,7 @@ mod tests {
              pass is cached under -- without that there is nothing to fix"
         );
 
-        e.on_nack(&[(as_the_client_names_it, 0u8)], t0);
+        e.on_nack(&[as_the_client_names_it], t0);
 
         assert_eq!(
             e.stats.nack_miss, 0,
@@ -1743,9 +1718,9 @@ mod tests {
         e.drain(&mut sender, t0);
 
         // Same tile, a pass that was never emitted.
-        e.on_nack(&[(EmitKey::new(40, 7, 9, 13), 0u8)], t0);
+        e.on_nack(&[EmitKey::new(40, 7, 9, 13)], t0);
         // A tile that does not exist at all.
-        e.on_nack(&[(EmitKey::new(40, 3, 3, 0), 0u8)], t0);
+        e.on_nack(&[EmitKey::new(40, 3, 3, 0)], t0);
 
         assert_eq!(e.stats.nack_miss, 2);
         assert_eq!(e.stats.nack_hit, 0);
@@ -1781,7 +1756,7 @@ mod tests {
         );
 
         // A coverage NACK still cannot name either frame.
-        e.on_nack(&[(EmitKey::new(40, 7, 9, 11), 0u8)], t0);
+        e.on_nack(&[EmitKey::new(40, 7, 9, 11)], t0);
 
         assert_eq!(
             e.stats.nack_miss, 0,
@@ -1867,7 +1842,7 @@ mod tests {
         e.drain(&mut sender, t0);
         assert_eq!(sender.sent.len(), 1);
 
-        e.on_nack(&[(key, 0u8)], t0);
+        e.on_nack(&[key], t0);
         e.drain(&mut sender, t0);
         assert_eq!(
             sender.sent.len(),
@@ -1899,7 +1874,7 @@ mod tests {
         e.drain(&mut sender, t0);
 
         for _ in 0..10 {
-            e.on_nack(&[(key, 0u8)], t0);
+            e.on_nack(&[key], t0);
         }
         e.tick_budgeted(t0, usize::MAX, usize::MAX);
         e.drain(&mut sender, t0);
@@ -1911,7 +1886,7 @@ mod tests {
 
         // Once it has gone out the request is spent; asking again is a new
         // request and is honoured.
-        e.on_nack(&[(key, 0u8)], t0);
+        e.on_nack(&[key], t0);
         e.tick_budgeted(t0, usize::MAX, usize::MAX);
         e.drain(&mut sender, t0);
         assert_eq!(sender.sent.len(), 3);
@@ -1928,7 +1903,7 @@ mod tests {
         e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
         e.drain(&mut sender, t0);
 
-        e.on_nack(&[(key, 0u8)], t0);
+        e.on_nack(&[key], t0);
         e.on_ack(&[key]);
         assert_eq!(e.tick_budgeted(t0, usize::MAX, usize::MAX), 0);
         e.drain(&mut sender, t0);
@@ -1981,7 +1956,7 @@ mod tests {
         e.drain(&mut sender, t_late);
 
         let t1 = t0 + Duration::from_secs(1);
-        e.on_nack(&[(nacked, 0u8)], t1);
+        e.on_nack(&[nacked], t1);
         // Room for exactly one.
         e.tick_budgeted(t1, usize::MAX, one);
         assert_eq!(e.stats.rto_fired, 0, "the timer waits its turn");
@@ -2244,7 +2219,7 @@ mod tests {
         e.submit_one(key, fake_source(1, 0, 0), now, None, now);
         e.drain(&mut sender, now);
         let later = now + Duration::from_millis(2); // 1.5 ms past the wrap
-        e.on_nack(&[(key, 0u8)], later);
+        e.on_nack(&[key], later);
         e.tick(later, usize::MAX);
         e.drain(&mut sender, later);
         let sent = e.take_transmissions();
@@ -2292,7 +2267,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(300)).await;
 
         let now1 = crate::transport::io_bridge::now_std();
-        e.on_nack(&[(key, 0u8)], now1);
+        e.on_nack(&[key], now1);
         // The resend, and with it the stamp, now happens when budget allows
         // rather than inside `on_nack`. One retransmission only, so it is
         // the NACK branch that stamps and not the RTO behind it.

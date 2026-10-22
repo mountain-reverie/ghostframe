@@ -379,7 +379,6 @@ pub struct WasmNackEntry {
     pub tile_x: u8,
     pub tile_y: u8,
     pub pass_idx: u8,
-    pub frag_idx: u8,
 }
 
 impl From<&TileNackEntry> for WasmNackEntry {
@@ -389,7 +388,6 @@ impl From<&TileNackEntry> for WasmNackEntry {
             tile_x: e.tile_x,
             tile_y: e.tile_y,
             pass_idx: e.pass_idx,
-            frag_idx: e.frag_idx,
         }
     }
 }

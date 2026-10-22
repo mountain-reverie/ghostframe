@@ -275,11 +275,6 @@
 #define FRAME_HEADER_SIZE 14
 
 /**
- * NACK message size: frame_seq (4) + frag_idx (2) = 6 bytes.
- */
-#define NACK_SIZE 6
-
-/**
  * Envelope discriminator byte for the tile-FEC parity datagram.
  */
 #define TILE_PARITY_ENVELOPE 4
@@ -291,7 +286,7 @@
 #define TILE_PARITY_HEADER_SIZE (((1 + 4) + 1) + 1)
 
 /**
- * Envelope discriminator byte for the per-fragment NACK datagram
+ * Envelope discriminator byte for the per-pass NACK datagram
  * (client → server).
  */
 #define TILE_NACK_ENVELOPE 5
@@ -299,7 +294,7 @@
 /**
  * Size on the wire of a single NACK entry.
  */
-#define TILE_NACK_ENTRY_SIZE 8
+#define TILE_NACK_ENTRY_SIZE 7
 
 /**
  * Maximum number of NACK entries per datagram. Mirrors the ACK envelope's

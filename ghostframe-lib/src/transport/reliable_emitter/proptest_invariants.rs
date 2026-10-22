@@ -6,7 +6,6 @@ use super::wire_seq::WireSeqAllocator;
 use super::EmitKey;
 use bytes::Bytes;
 use proptest::prelude::*;
-use smallvec::smallvec;
 use std::time::Instant;
 
 proptest! {
@@ -51,8 +50,7 @@ proptest! {
             c.insert(
                 EmitKey::new(*fs, *x, *y, 0),
                 CacheEntry {
-                    fragments: smallvec![Bytes::from(vec![0u8])],
-                    wire_seqs: smallvec![0],
+                    datagram: Bytes::from(vec![0u8]),
                     queued_at: now,
                     first_sent_at: now, last_sent_at: now,
                     attempts: 0, rto_deadline: now,

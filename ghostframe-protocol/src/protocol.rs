@@ -649,38 +649,6 @@ pub fn build_frame_parity_datagram(
 }
 
 // ---------------------------------------------------------------------------
-// NACK message (sent by client on bidi stream)
-// ---------------------------------------------------------------------------
-
-/// NACK message size: frame_seq (4) + frag_idx (2) = 6 bytes.
-pub const NACK_SIZE: usize = 6;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NackMessage {
-    pub frame_seq: u32,
-    pub frag_idx: u16,
-}
-
-impl NackMessage {
-    pub fn encode(&self) -> [u8; NACK_SIZE] {
-        let mut buf = [0u8; NACK_SIZE];
-        buf[0..4].copy_from_slice(&self.frame_seq.to_be_bytes());
-        buf[4..6].copy_from_slice(&self.frag_idx.to_be_bytes());
-        buf
-    }
-
-    pub fn decode(data: &[u8]) -> Option<Self> {
-        if data.len() < NACK_SIZE {
-            return None;
-        }
-        Some(NackMessage {
-            frame_seq: u32::from_be_bytes(data[0..4].try_into().unwrap()),
-            frag_idx: u16::from_be_bytes(data[4..6].try_into().unwrap()),
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
 // TILE_PARITY envelope (0x04)
 //
 // Wire format (spec §5.2):
@@ -776,26 +744,30 @@ impl TileParityEnvelope {
 // Wire format (spec §5.3):
 //   [0]       discriminator: u8  (= TILE_NACK_ENVELOPE = 0x05)
 //   [1]       count:         u8  (number of entries, ≤ TILE_NACK_MAX_ENTRIES)
-//   [2..]     count × NackEntry, each 8 bytes:
+//   [2..]     count × NackEntry, each 7 bytes:
 //             [0..4] frame_seq u32 LE | [4] tile_x | [5] tile_y |
-//             [6] pass_idx | [7] frag_idx
+//             [6] pass_idx
+//
+// A tile pass is exactly one datagram, so an entry names a pass and there is
+// no fragment to select. (H.264 frames still fragment, but they are never
+// NACKed: they travel under their own frame header and recover through FEC.)
 //
 // `frame_seq` is LE on the wire to match the ACK envelope's existing
 // convention.
 // ---------------------------------------------------------------------------
 
-/// Envelope discriminator byte for the per-fragment NACK datagram
+/// Envelope discriminator byte for the per-pass NACK datagram
 /// (client → server).
 pub const TILE_NACK_ENVELOPE: u8 = 0x05;
 
 /// Size on the wire of a single NACK entry.
-pub const TILE_NACK_ENTRY_SIZE: usize = 8;
+pub const TILE_NACK_ENTRY_SIZE: usize = 7;
 
 /// Maximum number of NACK entries per datagram. Mirrors the ACK envelope's
 /// cap so a NackBatcher can use the same chunking pattern.
 pub const TILE_NACK_MAX_ENTRIES: usize = 64;
 
-/// One missing fragment reported by the client.
+/// One missing tile pass reported by the client.
 ///
 /// `frame_seq` is encoded LE on the wire to match the ACK envelope's
 /// existing convention.
@@ -805,7 +777,6 @@ pub struct TileNackEntry {
     pub tile_x: u8,
     pub tile_y: u8,
     pub pass_idx: u8,
-    pub frag_idx: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -837,7 +808,6 @@ impl TileNackEnvelope {
             buf.push(e.tile_x);
             buf.push(e.tile_y);
             buf.push(e.pass_idx);
-            buf.push(e.frag_idx);
         }
     }
 
@@ -870,7 +840,6 @@ impl TileNackEnvelope {
                 tile_x: data[off + 4],
                 tile_y: data[off + 5],
                 pass_idx: data[off + 6],
-                frag_idx: data[off + 7],
             });
         }
         Ok(Self { entries })
@@ -1411,24 +1380,6 @@ mod tests {
     }
 
     #[test]
-    fn nack_message_roundtrip() {
-        let nack = NackMessage {
-            frame_seq: 42,
-            frag_idx: 3,
-        };
-        let encoded = nack.encode();
-        assert_eq!(encoded.len(), NACK_SIZE);
-        let decoded = NackMessage::decode(&encoded).unwrap();
-        assert_eq!(decoded, nack);
-    }
-
-    #[test]
-    fn nack_message_short_input() {
-        assert!(NackMessage::decode(&[0u8; 5]).is_none());
-        assert!(NackMessage::decode(&[0u8; 6]).is_some());
-    }
-
-    #[test]
     fn datagram_header_includes_wire_seq() {
         // Header must be 16 bytes (was 12 before wire_seq was added). This
         // assert catches accidental shrinkage just as well as growth.
@@ -1594,14 +1545,12 @@ mod tests {
                 tile_x: 5,
                 tile_y: 7,
                 pass_idx: 3,
-                frag_idx: 1,
             },
             TileNackEntry {
                 frame_seq: 100,
                 tile_x: 5,
                 tile_y: 7,
                 pass_idx: 4,
-                frag_idx: 0,
             },
         ];
         let env = TileNackEnvelope {
@@ -1611,6 +1560,13 @@ mod tests {
         env.encode(&mut buf);
         assert_eq!(buf[0], TILE_NACK_ENVELOPE);
         assert_eq!(buf[1], 2);
+        // Pinned, not derived: the entry is frame_seq(4) + tile_x + tile_y +
+        // pass_idx, and a pass is one datagram so there is no fragment byte.
+        assert_eq!(TILE_NACK_ENTRY_SIZE, 7);
+        assert_eq!(buf.len(), 2 + 2 * 7);
+        assert_eq!(&buf[2..9], &[100, 0, 0, 0, 5, 7, 3]);
+        // A buffer one byte short of its declared count is refused.
+        assert!(TileNackEnvelope::decode(&buf[..buf.len() - 1]).is_err());
         let parsed = TileNackEnvelope::decode(&buf).expect("decode");
         assert_eq!(parsed.entries, entries);
     }
@@ -1623,7 +1579,6 @@ mod tests {
                 tile_x: 0,
                 tile_y: 0,
                 pass_idx: 0,
-                frag_idx: 0,
             })
             .collect();
         let env = TileNackEnvelope { entries };

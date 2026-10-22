@@ -440,7 +440,7 @@ fn loss_with_nack_replay_converges() {
     // Drive timers forward until NACKs are emitted (assembly-timeout scan /
     // coverage tail sweep), collecting TileNackEnvelope datagrams from
     // poll_transmit.
-    let mut nack_entries: Vec<(u32, u8, u8, u8, u8)> = Vec::new();
+    let mut nack_entries: Vec<(u32, u8, u8, u8)> = Vec::new();
     for _ in 0..50 {
         if let Some(deadline) = core.poll_timeout() {
             t = t.max(deadline);
@@ -456,7 +456,6 @@ fn loss_with_nack_replay_converges() {
                                 e.tile_x,
                                 e.tile_y,
                                 e.pass_idx,
-                                e.frag_idx,
                             ));
                         }
                     }
@@ -471,8 +470,9 @@ fn loss_with_nack_replay_converges() {
     // Re-deliver exactly the NACKed fragments (looked up from the original
     // fragment set by their wire coordinates).
     let mut replayed = 0usize;
-    for (fs, tx, ty, pass_idx, frag_idx) in &nack_entries {
-        if let Some(dg) = by_key.get(&(*fs, *tx, *ty, *pass_idx, *frag_idx as u16)) {
+    for (fs, tx, ty, pass_idx) in &nack_entries {
+        // A pass is one datagram: fragment 0 of 1.
+        if let Some(dg) = by_key.get(&(*fs, *tx, *ty, *pass_idx, 0u16)) {
             let evs = core.handle_datagram(dg, t);
             for e in evs {
                 if let Event::TileReady {

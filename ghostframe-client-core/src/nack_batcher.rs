@@ -1,4 +1,4 @@
-//! Batched-NACK datagram sender. Buffers per-fragment NACK entries; flushes
+//! Batched-NACK datagram sender. Buffers per-pass NACK entries; flushes
 //! on either >= 64 entries OR 5ms since the first queued entry. Ports
 //! `ghostframe-web-client/src/nack.ts`, but time is injected (`now_us: u64`)
 //! instead of using `setTimeout`/wall clock, so the caller (ClientCore) drives
@@ -19,7 +19,6 @@ pub struct NackEntry {
     pub tile_x: u8,
     pub tile_y: u8,
     pub pass_idx: u8,
-    pub frag_idx: u8,
 }
 
 pub struct NackBatcher {
@@ -76,7 +75,6 @@ impl NackBatcher {
                 tile_x: e.tile_x,
                 tile_y: e.tile_y,
                 pass_idx: e.pass_idx,
-                frag_idx: e.frag_idx,
             })
             .collect();
 

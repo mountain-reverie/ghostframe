@@ -1,7 +1,7 @@
 use ghostframe_client_core::nack_batcher::{NackBatcher, NackEntry};
 
 #[test]
-fn encodes_8_byte_entries_with_0x05_envelope() {
+fn encodes_7_byte_entries_with_0x05_envelope() {
     let mut b = NackBatcher::new();
     b.add(
         NackEntry {
@@ -9,7 +9,6 @@ fn encodes_8_byte_entries_with_0x05_envelope() {
             tile_x: 5,
             tile_y: 6,
             pass_idx: 7,
-            frag_idx: 9,
         },
         0,
     );
@@ -20,7 +19,7 @@ fn encodes_8_byte_entries_with_0x05_envelope() {
     assert_eq!(d[6], 5);
     assert_eq!(d[7], 6);
     assert_eq!(d[8], 7);
-    assert_eq!(d[9], 9);
+    assert_eq!(d.len(), 2 + 7);
 }
 
 #[test]
@@ -34,7 +33,6 @@ fn flushes_at_max_entries_without_timer() {
                 tile_x: 0,
                 tile_y: 0,
                 pass_idx: 0,
-                frag_idx: 0,
             },
             0,
         ) {
@@ -43,7 +41,7 @@ fn flushes_at_max_entries_without_timer() {
     }
     let d = sent.expect("64th add flushes");
     assert_eq!(d[1], 64);
-    assert_eq!(d.len(), 2 + 64 * 8);
+    assert_eq!(d.len(), 2 + 64 * 7);
 }
 
 #[test]
@@ -55,7 +53,6 @@ fn timer_flush_after_5ms() {
             tile_x: 0,
             tile_y: 0,
             pass_idx: 0,
-            frag_idx: 0,
         },
         0,
     );
