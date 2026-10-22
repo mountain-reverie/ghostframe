@@ -641,20 +641,20 @@ fn parity_group_recovers_without_retransmit() {
     let mut fb: Option<Vec<u8>> = None;
     while let Some(out) = core.poll_transmit(t) {
         if let PollOutput::Stream(b) = out {
-            if b.first() == Some(&0x01) && b.len() == 22 {
+            if b.first() == Some(&0x01) && b.len() == 18 {
                 fb = Some(b);
             }
         }
     }
     let fb = fb.expect("expected a ReceiverFeedback stream message");
     // ReceiverFeedback layout: [0]=type, [1..9]=timestamp_ns,
-    // [9..13]=datagrams_received, [13..17]=datagrams_lost (always 0),
-    // [17..21]=datagrams_recovered_fec, [21]=suspension_detected.
+    // [9..13]=datagrams_received, [13..17]=datagrams_recovered_fec,
+    // [17]=suspension_detected.
     // (Matches the byte layout asserted in tests/reassembly.rs, shifted by
     // the leading type byte relative to that test's fb[12..16] offsets
     // which start counting after an 8-byte timestamp with no type byte —
     // recompute directly from the encoder instead of hardcoding offsets.)
-    let recovered_fec = u32::from_be_bytes([fb[17], fb[18], fb[19], fb[20]]);
+    let recovered_fec = u32::from_be_bytes([fb[13], fb[14], fb[15], fb[16]]);
     assert_eq!(
         recovered_fec, 1,
         "exactly one datagram was lost and rebuilt from parity; got {recovered_fec}"

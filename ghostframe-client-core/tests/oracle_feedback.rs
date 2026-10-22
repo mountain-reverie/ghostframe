@@ -32,7 +32,7 @@ fn loss_tracker_round_trip() {
     t.on_fec_recovery();
 
     let buf = t.encode_feedback(5_000_000);
-    assert_eq!(buf.len(), 22);
+    assert_eq!(buf.len(), 18);
 
     let fb = ReceiverFeedback::decode(&buf).expect("decode failed");
     assert_eq!(fb.timestamp_ns, 5_000_000_000);

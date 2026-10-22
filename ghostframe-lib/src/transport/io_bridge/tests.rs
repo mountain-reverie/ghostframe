@@ -815,7 +815,6 @@ async fn dispatch_feedback_updates_adaptation_context() {
     let fb = crate::transport::feedback::ReceiverFeedback {
         timestamp_ns: 1_000_000,
         datagrams_received: 800,
-        datagrams_lost: 0,
         datagrams_recovered_fec: 0,
         suspension_detected: true,
     };
@@ -2602,7 +2601,7 @@ async fn feedback_stream_parses_hello_then_feedback_then_decode_error() {
     bridge.metrics_tracker.get_mut(3, 4).codec_state =
         crate::tile::CodecState::PalRle { palette_id: 7 };
 
-    // Concatenated stream: HELLO (2 B) + FEEDBACK (22 B) + DECODE_ERROR (5 B) = 29 bytes
+    // Concatenated stream: HELLO (2 B) + FEEDBACK (18 B) + DECODE_ERROR (5 B) = 25 bytes
     let hello = HelloMsg {
         caps: ClientCapabilities {
             indices_raw_enabled: true,
@@ -2612,7 +2611,6 @@ async fn feedback_stream_parses_hello_then_feedback_then_decode_error() {
     let fb = ReceiverFeedback {
         timestamp_ns: 0,
         datagrams_received: 0,
-        datagrams_lost: 0,
         datagrams_recovered_fec: 0,
         suspension_detected: false,
     };
@@ -2627,7 +2625,7 @@ async fn feedback_stream_parses_hello_then_feedback_then_decode_error() {
     hello.encode(&mut buf);
     fb.encode(&mut buf);
     err.encode(&mut buf);
-    assert_eq!(buf.len(), 2 + 22 + 5);
+    assert_eq!(buf.len(), 2 + 18 + 5);
 
     bridge.dispatch_feedback_bytes(ConnectionHandle(0), &buf);
 
@@ -4771,7 +4769,6 @@ async fn gate_feedback_only_from_the_live_session() {
     let fb = crate::transport::feedback::ReceiverFeedback {
         timestamp_ns: 1,
         datagrams_received: 10,
-        datagrams_lost: 0,
         datagrams_recovered_fec: 0,
         suspension_detected: true,
     };

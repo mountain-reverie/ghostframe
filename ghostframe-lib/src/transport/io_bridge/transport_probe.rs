@@ -32,8 +32,7 @@ pub struct TransportProbe {
     /// Number of readings taken; zero means nothing below was ever measured.
     pub samples: u64,
     /// Sums of the client's `ReceiverFeedback` (cumulative). `client_recovered`
-    /// is the datagrams it rebuilt from FEC parity. (`datagrams_lost` is
-    /// not summed: it is always 0.)
+    /// is the datagrams it rebuilt from FEC parity.
     pub client_received: u64,
     pub client_recovered: u64,
 }
