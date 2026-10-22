@@ -317,6 +317,13 @@ pub struct BrowserlessResult {
     /// ([`BrowserlessResult::s2c_mean_loss_run`]). Runs are over the order
     /// the netsim decided, which is the order the server transmitted.
     pub s2c_loss_runs: u64,
+    /// Hash of every datagram the netsim ruled on, both directions, in order:
+    /// direction, offer instant, length, and the verdict's arrival instants
+    /// and lengths. Stepped mode makes it a function of the seed.
+    pub wire_digest: u64,
+    /// Datagrams hashed into `wire_digest`; a premise that it is not hashing
+    /// nothing.
+    pub wire_datagrams: u64,
     pub s2c_loss_run_max: u64,
     /// Read from `FrameBuffer::stale_frame_tiles()` — a scene run only
     /// ever ingests via `FrameBuffer::apply_tile_ready` (real decoded
@@ -489,11 +496,54 @@ impl BrowserlessResult {
 /// Running tally of server -> client netsim verdicts.
 #[derive(Default)]
 struct S2cLoss {
+    /// Digest of every datagram the netsim ruled on, in both directions. See
+    /// [`WireDigest`]. Lives here only because this struct is already
+    /// threaded through the scene loop.
+    wire: WireDigest,
     offered: u64,
     dropped: u64,
     runs: u64,
     run_max: u64,
     cur_run: u64,
+}
+
+/// Running hash of the scene's wire traffic: for every datagram offered to the
+/// netsim, its direction, the instant it was offered, its length, and what the
+/// netsim did with it (the `at_us` and length of each copy, or a drop marker).
+/// Two same-seed runs that agree on every counter can still differ in which
+/// datagram went out when and how big; this is what catches that.
+///
+/// Lengths, not bytes: the QUIC payloads are encrypted under keys that rustls
+/// draws from the OS (the TLS ephemeral keys and the server's certificate are
+/// not seedable), so the ciphertext differs run to run by construction while
+/// everything the endpoints decide stays identical. Hashing the bytes was
+/// tried first and diverged on every run for exactly that reason.
+#[derive(Default)]
+struct WireDigest {
+    hasher: std::collections::hash_map::DefaultHasher,
+    datagrams: u64,
+}
+
+impl WireDigest {
+    fn offered(&mut self, dir: Direction, now_us: u64, payload: &[u8]) {
+        use std::hash::Hasher;
+        self.datagrams += 1;
+        self.hasher.write_u8(dir as u8);
+        self.hasher.write_u64(now_us);
+        self.hasher.write_usize(payload.len());
+    }
+    fn ruled(&mut self, items: &[InFlight]) {
+        use std::hash::Hasher;
+        self.hasher.write_usize(items.len());
+        for i in items {
+            self.hasher.write_u64(i.at_us);
+            self.hasher.write_usize(i.payload.len());
+        }
+    }
+    fn finish(&self) -> u64 {
+        use std::hash::Hasher;
+        self.hasher.finish()
+    }
 }
 
 impl S2cLoss {
@@ -859,6 +909,8 @@ async fn run_inner(
         s2c_datagrams_offered: s2c_loss.offered,
         s2c_datagrams_dropped: s2c_loss.dropped,
         s2c_loss_runs: s2c_loss.runs,
+        wire_digest: s2c_loss.wire.finish(),
+        wire_datagrams: s2c_loss.wire.datagrams,
         s2c_loss_run_max: s2c_loss.run_max,
         stale_generation_tiles,
         seed,
@@ -1064,6 +1116,7 @@ async fn drive_session(
                 pkt.payload,
                 t,
                 &mut bytes_dropped,
+                &mut s2c_loss.wire,
             );
             // `rule` returns nothing exactly for `Verdict::Drop`.
             s2c_loss.record(items.is_empty());
@@ -1171,6 +1224,7 @@ async fn drive_session(
                 out.payload.to_vec(),
                 t,
                 &mut bytes_dropped,
+                &mut s2c_loss.wire,
             ) {
                 if item.at_us <= t {
                     // Due now: hand it to the bridge's pipe. Nothing awaits
@@ -1635,6 +1689,20 @@ impl PartialOrd for InFlight {
 /// the full 10. Keeping the due path free of the queue keeps a zero-delay
 /// scene behaving exactly as it did before propagation delay was modelled.
 fn rule(
+    sim: &mut NetSim,
+    dir: Direction,
+    payload: Vec<u8>,
+    now_us_at_send: u64,
+    bytes_dropped: &mut u64,
+    wire: &mut WireDigest,
+) -> Vec<InFlight> {
+    wire.offered(dir, now_us_at_send, &payload);
+    let items = rule_inner(sim, dir, payload, now_us_at_send, bytes_dropped);
+    wire.ruled(&items);
+    items
+}
+
+fn rule_inner(
     sim: &mut NetSim,
     dir: Direction,
     payload: Vec<u8>,
