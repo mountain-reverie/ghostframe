@@ -1,7 +1,7 @@
 //! Task 15a/15b: browserless netsim scene runner.
 //!
 //! Wires together a real `IoBridge` and a real `ghostframe_client_net::ClientNet`
-//! across a `tokio::net::UnixStream` socketpair, with every datagram routed
+//! across an in-memory pipe, with every datagram routed
 //! through a [`crate::netsim::NetSim`] in each direction, under tokio's
 //! virtual (paused) clock. This proves the WebTransport session can
 //! establish over that whole path — the same wire framing, the same
@@ -21,9 +21,21 @@
 //! ## Wiring
 //!
 //! ```text
-//! ClientNet <-> SocketPairPump <-> UnixStream::pair() <-> IoBridge <-> QuicServer
+//! ClientNet <-> BridgeLink <-> mem_stream_pair() <-> IoBridge <-> QuicServer
 //!              (netsim in both directions)
 //! ```
+//!
+//! ## Reproducibility
+//!
+//! A scene is a pure function of its seed. `IoBridge` is not spawned: the
+//! scene loop puts bytes in the pipe, calls `IoBridge::step_until_idle` (the
+//! production `run()` body, `turn`, polled by hand until nothing is ready),
+//! reads what came out, and only then lets the paused clock move, to the
+//! earliest of the client's timer, the next datagram in flight, the next
+//! injection and the bridge's own next deadline. No kernel socket, reactor,
+//! blocking thread or task scheduler sits between the two halves, so nothing
+//! outside the seed decides what happens next; `browserless_determinism`
+//! holds that to exact equality.
 //!
 //! `IoBridge` owns the WebTransport layer itself
 //! (`wt_sessions: HashMap<ConnectionHandle, WebTransportServer>`), so this
@@ -50,12 +62,14 @@ use tokio::time::Instant as TokioInstant;
 
 use ghostframe_client_core::Event as CoreEvent;
 use ghostframe_client_net::{ClientNet, ClientNetConfig, ClientNetEvent};
-use ghostframe_lib::transport::io_bridge::{InjectedFrame, IoBridge};
+use ghostframe_lib::transport::ghostbridge::encode_frame;
+use ghostframe_lib::transport::io_bridge::{mem_stream_pair, InjectedFrame, IoBridge, MemStream};
 use ghostframe_lib::transport::quic::QuicServer;
 
 use crate::harness::framebuffer::FrameBuffer;
 use crate::harness::scene_tiles::{encode_tile, TileSpec};
-use crate::netsim::{NetProfile, NetSim, SocketPairPump, Verdict};
+use crate::netsim::pump::parse_frames;
+use crate::netsim::{NetProfile, NetSim, Verdict};
 
 /// Default spacing between injected frames.
 ///
@@ -549,8 +563,7 @@ async fn run_inner(
 ) -> anyhow::Result<BrowserlessResult> {
     let seed = scene.seed;
 
-    let (ours, peer) = tokio::net::UnixStream::pair()
-        .map_err(|e| anyhow!("seed {seed}: UnixStream::pair failed: {e}"))?;
+    let (ours, peer) = mem_stream_pair();
 
     // Pin the server endpoint's RNG from the scene seed, as `drive_session`
     // does for the client. The client seed uses the low bytes, this one a
@@ -574,13 +587,8 @@ async fn run_inner(
     // `IoBridge`, once the session is ready — see `drive_session`.
     let (inject_tx, inject_rx) = mpsc::channel::<InjectedFrame>(8);
 
-    let mut bridge = IoBridge::new_with_injection_for_test(
-        ours,
-        server,
-        inject_rx,
-        scene.grid_cols,
-        scene.grid_rows,
-    );
+    let mut bridge =
+        IoBridge::new_stepped_for_test(ours, server, inject_rx, scene.grid_cols, scene.grid_rows);
     // `bridge` is moved wholesale into the spawned task below, so a plain
     // `&self` accessor on it (`IoBridge::bwe_snapshot`) is unreachable from
     // this function afterwards — there is no way to call back into a value
@@ -628,14 +636,11 @@ async fn run_inner(
     bridge.set_inbound_read_log(read_log.clone());
     let hold_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     bridge.set_hold_log(hold_log.clone());
-    // `IoBridge::run` is an infinite event loop that only returns on EOF or
-    // error; it must be aborted explicitly (see below) rather than awaited.
-    let bridge_handle = tokio::task::spawn_local(async move {
-        let _ = bridge.run().await;
-    });
-
     let write_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut pump = SocketPairPump::new(peer).with_send_log(write_log.clone());
+    let mut link = BridgeLink {
+        end: peer,
+        send_log: write_log.clone(),
+    };
     let base = TokioInstant::now();
     let client_addr = client_addr();
     let server_addr = server_addr();
@@ -653,7 +658,8 @@ async fn run_inner(
     let mut bwe_estimate_samples: Vec<(u64, u64)> = Vec::new();
     let outcome = drive_session(
         cfg,
-        &mut pump,
+        &mut bridge,
+        &mut link,
         client_addr,
         server_addr,
         base,
@@ -669,12 +675,9 @@ async fn run_inner(
     )
     .await;
 
-    // Always abort, on every exit path — the bridge task must not outlive
-    // this function, and `outcome` may be an `Err`. The last snapshot
-    // `run()`'s loop published into `bwe_cell` before this abort is
-    // therefore a final snapshot, not a live running read — there is no
-    // point after the abort where `run()` could publish again.
-    bridge_handle.abort();
+    // The bridge is stepped by `drive_session`, never spawned, so there is
+    // no task to stop: what it published on its last turn is the final
+    // snapshot.
 
     let (
         events,
@@ -820,7 +823,8 @@ async fn run_inner(
 #[allow(clippy::too_many_arguments)]
 async fn drive_session(
     cfg: ClientNetConfig,
-    pump: &mut SocketPairPump,
+    bridge: &mut IoBridge,
+    link: &mut BridgeLink,
     client_addr: SocketAddr,
     server_addr: SocketAddr,
     base: TokioInstant,
@@ -946,31 +950,6 @@ async fn drive_session(
     // the clock moving at all, so that is what this counts.
     const MAX_ITERS_WITHOUT_PROGRESS: usize = 5_000;
 
-    /// Consecutive iterations the loop may serve an already-readable pump before
-    /// it must let the paused clock advance instead.
-    ///
-    /// `tokio::select!` below is `biased`, so a readable `pump.recv()` always
-    /// wins over `sleep_until`. That is the right priority — inbound data should
-    /// be drained promptly — but it means a pump with a standing backlog starves
-    /// the timer arm completely, and only the timer arm advances virtual time.
-    /// The loop then turns indefinitely doing real work while the clock stands
-    /// still, which is indistinguishable from a hang and trips
-    /// `MAX_ITERS_WITHOUT_PROGRESS`.
-    ///
-    /// Observed on CI as `probe_windows_are_opened_on_a_busy_link` stalling at
-    /// ~470 ms of a 10 s scene having processed 6803 events across 5586
-    /// iterations — roughly one datagram per iteration, i.e. a loop that was
-    /// never idle and therefore never let time move. Probe bursts make a
-    /// standing backlog far more likely, which is why this surfaced alongside
-    /// the probing work.
-    ///
-    /// 512 sits above the deepest run observed on a healthy local sweep (192),
-    /// so ordinary bursts still drain in one pass and scene timing is unchanged;
-    /// it is far below the 5000 non-advancing iterations that trip the progress
-    /// guard, so the pathological case is capped long before it looks like a
-    /// hang. Hitting the cap is not a compromise — sleeping to `wake_at` is what
-    /// the loop would do anyway once the pump ran dry.
-    const MAX_CONSECUTIVE_PUMP_SERVES: usize = 512;
     let overall_deadline = base + scene.duration;
     let mut iter: usize = 0;
 
@@ -981,9 +960,6 @@ async fn drive_session(
     // iterations have turned since.
     let mut last_progress_vt: u64 = 0;
     let mut iters_without_progress: usize = 0;
-    // Consecutive iterations whose `select!` was won by the pump. See
-    // `MAX_CONSECUTIVE_PUMP_SERVES`.
-    let mut consecutive_pump_serves: usize = 0;
 
     loop {
         iter += 1;
@@ -1042,9 +1018,15 @@ async fn drive_session(
             );
         }
 
+        // Set whenever something happened that can enable more work at this
+        // same instant (a datagram moved, a timer fired, a frame went in): the
+        // loop then goes round again before it lets the clock move.
+        let mut moved = false;
+
         // Drain everything ClientNet currently has queued to transmit,
         // routing each datagram through the client->server NetSim.
         while let Some(out) = client.poll_transmit() {
+            moved = true;
             let t = now_us(base);
             for item in rule(
                 &mut net_c2s,
@@ -1054,15 +1036,10 @@ async fn drive_session(
                 &mut bytes_dropped,
             ) {
                 if item.at_us <= t {
-                    // Due now: send it here, inside the drain loop, so each
-                    // send yields to the runtime exactly where it did before
-                    // arrivals could be queued at all. Batching these and
-                    // flushing them together changes where the runtime goes
-                    // idle, and under `start_paused` that changes when the
-                    // virtual clock advances.
-                    pump.send(&item.payload, &client_addr).await.map_err(|e| {
-                        anyhow!("seed {seed}: pump send failed at iteration {iter}: {e}")
-                    })?;
+                    // Due now: hand it to the bridge's pipe. Nothing awaits
+                    // here, so where the clock may move is decided in one
+                    // place, at the bottom of this loop.
+                    link.send(&item.payload, &client_addr);
                     bytes_delivered += item.payload.len() as u64;
                     bytes_delivered_c2s += item.payload.len() as u64;
                 } else {
@@ -1077,10 +1054,10 @@ async fn drive_session(
 
         // The single point where datagrams actually arrive, in both
         // directions, once their scheduled time has come.
-        flush_due(
+        moved |= flush_due(
             &mut in_flight,
             now_us(base),
-            pump,
+            link,
             &mut client,
             client_addr,
             server_addr,
@@ -1088,9 +1065,7 @@ async fn drive_session(
             &mut bytes_delivered_s2c,
             &mut bytes_delivered_c2s,
             &mut datagrams_delivered_s2c,
-        )
-        .await
-        .map_err(|e| anyhow!("seed {seed}: pump send failed at iteration {iter}: {e}"))?;
+        );
 
         let new_events = client.take_events();
         for ev in &new_events {
@@ -1122,16 +1097,16 @@ async fn drive_session(
         // session: injecting earlier would have `apply_injected_frame` see
         // no live session and drop the frame.
         //
-        // The watch is written by the bridge task, which the real-socket pump
-        // schedules independently of this loop, so the iteration at which
-        // this loop first SEES the count is not deterministic. Using the
-        // moment of observation as the injection time made two same-seed runs
-        // inject at different virtual instants (`browserless_determinism`
-        // caught it as a differing BWE estimate). So the injection instant is
-        // fixed at `SessionReady + HELLO_GRACE_US`, and the watch only gates
-        // whether that instant has been reached in a state where injection
-        // can succeed. On a link where the HELLO lands within the grace the
-        // observation time no longer matters.
+        // The watch is written by the bridge when it processes the HELLO. It
+        // used to run on its own task, so the iteration at which this loop
+        // first SAW the count was not deterministic, and using the moment of
+        // observation as the injection time made two same-seed runs inject at
+        // different virtual instants. The bridge is stepped from this loop
+        // now, so the observation point is reproducible, but the injection
+        // instant stays fixed at `SessionReady + HELLO_GRACE_US` and the watch
+        // only gates whether that instant has been reached in a state where
+        // injection can succeed: the scene's timing does not depend on how
+        // many turns the HELLO took.
         const HELLO_GRACE_US: u64 = 50_000;
         if session_ready
             && next_inject_at_us.is_none()
@@ -1204,95 +1179,87 @@ async fn drive_session(
                         spacing_us = HEARTBEAT_SPACING_US;
                     }
                     next_inject_at_us = Some(due_at + spacing_us);
+                    moved = true;
                 }
             }
         }
 
-        // Fire an already-due ClientNet timeout without waiting on
-        // anything, then re-check events/transmits from the top.
-        if let Some(deadline_us) = client.poll_timeout() {
-            if now_us(base) >= deadline_us {
-                client.on_timeout(now_us(base));
-                continue;
+        // One turn of the server's loop for everything now in its pipe and its
+        // channel, run to the point where it has nothing ready. This is the
+        // production loop body, stepped here rather than spawned, so what it
+        // does at this instant is a function of what was put in front of it.
+        bridge
+            .step_until_idle()
+            .map_err(|e| anyhow!("seed {seed}: bridge failed at iteration {iter}: {e}"))?;
+
+        // Everything the bridge wrote, through the server->client netsim.
+        for pkt in link.recv_all().map_err(|e| {
+            anyhow!("seed {seed}: bridge output unreadable at iteration {iter}: {e}")
+        })? {
+            moved = true;
+            let t = now_us(base);
+            let items = rule(
+                &mut net_s2c,
+                Direction::S2c,
+                pkt.payload,
+                t,
+                &mut bytes_dropped,
+            );
+            // `rule` returns nothing exactly for `Verdict::Drop`.
+            s2c_loss.record(items.is_empty());
+            for item in items {
+                if item.at_us <= t {
+                    // Its own arrival instant, for the same reason as in
+                    // `flush_due`. Equal to `t` at zero delay, earlier than it
+                    // whenever the link models any.
+                    client.handle_udp(&item.payload, server_addr, item.at_us);
+                    bytes_delivered += item.payload.len() as u64;
+                    bytes_delivered_s2c += item.payload.len() as u64;
+                    datagrams_delivered_s2c += 1;
+                } else {
+                    in_flight.push(InFlight {
+                        seq: next_in_flight_seq,
+                        ..item
+                    });
+                    next_in_flight_seq += 1;
+                }
             }
         }
 
-        // Wait for the next inbound frame from IoBridge, the earliest
-        // deadline (ClientNet's own timer or the next scheduled
-        // injection), or the scene's overall deadline — whichever comes
-        // first. Capping by `overall_deadline` guarantees this select
-        // cannot itself hang past the scene's budget even if nothing else
-        // ever wakes it.
+        // Fire an already-due ClientNet timeout, then look again from the top.
+        if let Some(deadline_us) = client.poll_timeout() {
+            if now_us(base) >= deadline_us {
+                client.on_timeout(now_us(base));
+                moved = true;
+            }
+        }
+        if moved {
+            continue;
+        }
+
+        // Nothing can happen at this instant. Sleep the clock to the earliest
+        // moment anything in the scene needs attention: ClientNet's timer, the
+        // next datagram in flight, the next scheduled injection, the bridge's
+        // own next deadline (QUIC timer, frame hold), or the scene's end.
         let mut wake_at = overall_deadline;
         if let Some(d) = client.poll_timeout() {
             wake_at = wake_at.min(base + Duration::from_micros(d));
         }
-        // A datagram in flight is its own wake-up reason: nothing else
-        // necessarily fires at the moment it lands.
         if let Some(next) = in_flight.peek() {
             wake_at = wake_at.min(base + Duration::from_micros(next.at_us));
         }
         if session_ready {
-            // Unconditional once `session_ready`: unlike the injection
-            // branch above, waking up for the next due time applies
-            // whether that next injection is a real scene frame or a
-            // heartbeat (see above) — heartbeats keep being scheduled for
-            // the rest of `scene.duration`, not just until the frame list
-            // runs out.
+            // Unconditional once `session_ready`: heartbeats keep being
+            // scheduled for the rest of `scene.duration`, not just until the
+            // frame list runs out.
             if let Some(due_at) = next_inject_at_us {
                 wake_at = wake_at.min(base + Duration::from_micros(due_at));
             }
         }
-
-        // Let the clock move before serving the pump again. Without this the
-        // biased `select!` below never reaches its timer arm while the pump
-        // has a backlog — see `MAX_CONSECUTIVE_PUMP_SERVES`. Sleeping to the
-        // already-computed `wake_at` is safe: it is the next instant anything
-        // in this scene needs attention, and the backlog is still there
-        // afterwards.
-        if consecutive_pump_serves >= MAX_CONSECUTIVE_PUMP_SERVES {
-            consecutive_pump_serves = 0;
-            tokio::time::sleep_until(wake_at).await;
-            continue;
+        if let Some(at) = bridge.next_wake_for_harness() {
+            wake_at = wake_at.min(TokioInstant::from_std(at));
         }
-
-        tokio::select! {
-            biased;
-            recv_res = pump.recv() => {
-                consecutive_pump_serves += 1;
-                let pkt = recv_res.map_err(|e| anyhow!(
-                    "seed {seed}: socketpair pump recv failed at iteration {iter} \
-                     (last events observed: {events:?}): {e}"
-                ))?;
-                let t = now_us(base);
-                let items = rule(&mut net_s2c, Direction::S2c, pkt.payload, t, &mut bytes_dropped);
-                // `rule` returns nothing exactly for `Verdict::Drop`.
-                s2c_loss.record(items.is_empty());
-                for item in items {
-                    if item.at_us <= t {
-                        // Its own arrival instant, for the same reason as
-                        // in `flush_due`. Equal to `t` at zero delay, earlier
-                        // than it whenever the link models any.
-                        client.handle_udp(&item.payload, server_addr, item.at_us);
-                        bytes_delivered += item.payload.len() as u64;
-                        bytes_delivered_s2c += item.payload.len() as u64;
-                        datagrams_delivered_s2c += 1;
-                    } else {
-                        in_flight.push(InFlight {
-                            seq: next_in_flight_seq,
-                            ..item
-                        });
-                        next_in_flight_seq += 1;
-                    }
-                }
-            }
-            _ = tokio::time::sleep_until(wake_at) => {
-                consecutive_pump_serves = 0;
-                if now_us(base) >= client.poll_timeout().unwrap_or(u64::MAX) {
-                    client.on_timeout(now_us(base));
-                }
-            }
-        }
+        tokio::time::sleep_until(wake_at).await;
     }
 
     let client_probe = ClientProbe {
@@ -1545,10 +1512,10 @@ fn rule(
 /// stamping them all with `now` would erase the arrival spread the
 /// bottleneck model exists to produce.
 #[allow(clippy::too_many_arguments)]
-async fn flush_due(
+fn flush_due(
     in_flight: &mut BinaryHeap<InFlight>,
     now: u64,
-    pump: &mut SocketPairPump,
+    link: &mut BridgeLink,
     client: &mut ClientNet,
     client_addr: SocketAddr,
     server_addr: SocketAddr,
@@ -1556,11 +1523,13 @@ async fn flush_due(
     bytes_delivered_s2c: &mut u64,
     bytes_delivered_c2s: &mut u64,
     datagrams_delivered_s2c: &mut u64,
-) -> std::io::Result<()> {
+) -> bool {
+    let mut any = false;
     while in_flight.peek().is_some_and(|f| f.at_us <= now) {
+        any = true;
         let f = in_flight.pop().expect("peek just confirmed a due datagram");
         match f.dir {
-            Direction::C2s => pump.send(&f.payload, &client_addr).await?,
+            Direction::C2s => link.send(&f.payload, &client_addr),
             // Stamp each datagram with *its own* arrival time, not the
             // loop's. `flush_due` drains everything already due in one pass,
             // so using `now` collapsed a whole batch's arrival spread to a
@@ -1581,5 +1550,35 @@ async fn flush_due(
             }
         }
     }
-    Ok(())
+    any
+}
+
+/// The harness's end of the bridge's in-memory pipe, speaking ghostbridge's
+/// real framing (`encode_frame` / `parse_frame_rest`) so the bridge's reader
+/// sees exactly the bytes it would from a socket.
+struct BridgeLink {
+    end: MemStream,
+    /// Tokio-clock instant of every packet handed to the bridge; paired with
+    /// the bridge's own read log for the inbound-service-delay metric.
+    send_log: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+}
+
+impl BridgeLink {
+    /// Frame `payload` and make it readable by the bridge's next turn. One
+    /// whole frame per push, so the bridge never sees half of one.
+    fn send(&mut self, payload: &[u8], addr: &SocketAddr) {
+        let frame = encode_frame(payload, addr);
+        self.send_log
+            .lock()
+            .expect("send_log mutex poisoned")
+            .push(TokioInstant::now().into_std());
+        self.end.push(&frame);
+    }
+
+    /// Everything the bridge has written since the last call, parsed.
+    fn recv_all(
+        &mut self,
+    ) -> std::io::Result<Vec<ghostframe_lib::transport::ghostbridge::UdpPacket>> {
+        parse_frames(&self.end.take_all())
+    }
 }
