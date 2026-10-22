@@ -547,10 +547,13 @@ impl QuicServer {
     /// Identity lookups the caller should start, with the source to run them
     /// against. Each IP is returned once until [`Self::resolve_peer`] is
     /// called for it.
-    pub fn take_peer_lookups(&mut self) -> Vec<(IpAddr, Arc<dyn PeerIdentitySource>)> {
-        let ips = self.peer_gate.take_requests();
+    pub fn take_peer_lookups(&mut self) -> Vec<(IpAddr, u64, Arc<dyn PeerIdentitySource>)> {
+        let ips = self.peer_gate.take_stamped_requests();
         match self.peer_gate.source() {
-            Some(src) => ips.into_iter().map(|ip| (ip, src.clone())).collect(),
+            Some(src) => ips
+                .into_iter()
+                .map(|(ip, stamp)| (ip, stamp, src.clone()))
+                .collect(),
             // Unreachable: the gate only defers when it has a source.
             None => Vec::new(),
         }

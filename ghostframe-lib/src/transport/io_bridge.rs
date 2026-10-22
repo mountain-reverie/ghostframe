@@ -894,8 +894,8 @@ pub struct IoBridge {
     /// Finished peer identity lookups, sent by the tasks
     /// `spawn_peer_lookups` starts and applied by the `run` loop. Both ends
     /// live here, so the channel never closes.
-    peer_lookup_tx: mpsc::UnboundedSender<(std::net::IpAddr, PeerLookup)>,
-    peer_lookup_rx: mpsc::UnboundedReceiver<(std::net::IpAddr, PeerLookup)>,
+    peer_lookup_tx: mpsc::UnboundedSender<(std::net::IpAddr, u64, PeerLookup)>,
+    peer_lookup_rx: mpsc::UnboundedReceiver<(std::net::IpAddr, u64, PeerLookup)>,
     /// The access policy and denial log the QUIC gate uses, kept so the
     /// web server can be given the same ones (`GhostframeServer::new`).
     peer_access: Option<(Arc<AccessPolicy>, Arc<DenialLog>)>,
@@ -1428,7 +1428,7 @@ impl IoBridge {
     /// Start a background lookup for every peer the QUIC gate is holding a
     /// connection for. Each result comes back on `peer_lookup_rx`.
     fn spawn_peer_lookups(&mut self) {
-        for (ip, source) in self.server.take_peer_lookups() {
+        for (ip, stamp, source) in self.server.take_peer_lookups() {
             let tx = self.peer_lookup_tx.clone();
             tokio::spawn(async move {
                 let lookup = tokio::time::timeout(
@@ -1443,7 +1443,7 @@ impl IoBridge {
                 };
                 // The receiver lives as long as the bridge; if the bridge is
                 // gone there is nobody left to admit.
-                let _ = tx.send((ip, lookup));
+                let _ = tx.send((ip, stamp, lookup));
             });
         }
     }
@@ -1453,9 +1453,16 @@ impl IoBridge {
     async fn apply_peer_lookup(
         &mut self,
         ip: std::net::IpAddr,
+        stamp: u64,
         lookup: PeerLookup,
     ) -> io::Result<()> {
         let now = now_std();
+        // A lookup that began before the latest re-check of this address may
+        // hold a pre-revocation answer. The re-check queued a fresh lookup,
+        // which resolves anything held; this one is dropped unseen.
+        if self.server.peer_gate().is_stale(ip, stamp) {
+            return Ok(());
+        }
         // The same pure rule `resolve_peer` is about to apply (and cache),
         // read once more for the sessions already connected from `ip`: the
         // answer to a re-check arrives here, as does any new connection's.
@@ -1811,8 +1818,8 @@ impl IoBridge {
                 looked_up = self.peer_lookup_rx.recv() => {
                     #[cfg(test)]
                     self.loop_arm_trace.push(LoopArm::PeerLookup);
-                    if let Some((ip, lookup)) = looked_up {
-                        self.apply_peer_lookup(ip, lookup).await?;
+                    if let Some((ip, stamp, lookup)) = looked_up {
+                        self.apply_peer_lookup(ip, stamp, lookup).await?;
                     }
                 }
 

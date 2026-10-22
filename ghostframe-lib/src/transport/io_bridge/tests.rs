@@ -6327,3 +6327,91 @@ async fn gpu_backend_pre_encodes_fallback_tiles_exactly_as_the_cpu_transform() {
         assert_eq!(got.passes, passes, "tile ({tx},{ty}) pass bytes");
     }
 }
+
+// ── Access re-check: which lookup answers ────────────────────────────────
+
+mod recheck_answers {
+    use super::*;
+    use crate::config::AccessConfig;
+    use crate::transport::peer_auth::{
+        AccessPolicy, DenialLog, PeerGate, PeerIdentity, PeerIdentitySource, PeerLookup,
+    };
+
+    fn who(id: i64) -> PeerIdentity {
+        PeerIdentity {
+            user_id: id,
+            login_name: format!("u{id}@test"),
+            node_name: "peer".into(),
+            tags: vec![],
+        }
+    }
+
+    struct Background;
+    impl PeerIdentitySource for Background {
+        fn lookup(&self, _: std::net::IpAddr) -> PeerLookup {
+            Ok(who(1))
+        }
+        fn is_immediate(&self) -> bool {
+            false
+        }
+    }
+
+    async fn tracked_bridge(
+        h: ConnectionHandle,
+        ip: std::net::IpAddr,
+        t0: std::time::Instant,
+    ) -> IoBridge {
+        let mut bridge = test_bridge_with_sessions(&[h]).await;
+        let owner = who(1);
+        bridge.set_peer_gate_for_test(PeerGate::new(
+            Arc::new(AccessPolicy::new(&owner, &AccessConfig::default())),
+            Arc::new(Background),
+            Arc::new(DenialLog::new()),
+        ));
+        bridge.rechecker.track(h, ip, t0);
+        bridge
+    }
+
+    // A lookup that began before the re-check may carry a pre-revocation
+    // "allowed". It must neither extend the session nor close it; the
+    // re-check's own lookup answers.
+    #[tokio::test]
+    async fn a_lookup_older_than_the_recheck_does_not_answer_it() {
+        let h = ConnectionHandle(41);
+        let ip: std::net::IpAddr = "100.64.0.2".parse().unwrap();
+        let t0 = now_std() - std::time::Duration::from_secs(30);
+        let mut bridge = tracked_bridge(h, ip, t0).await;
+        let due = bridge.rechecker.next_due().unwrap();
+
+        // A new-connection lookup is running when the re-check comes due.
+        let gate = bridge.server.peer_gate_mut();
+        gate.check(ip, now_std(), true);
+        let old = gate.take_stamped_requests();
+        assert_eq!(old.len(), 1);
+        let _ = bridge.rechecker.run_due(bridge.server.peer_gate_mut(), due);
+        let fresh = bridge.server.peer_gate_mut().take_stamped_requests();
+        assert_eq!(fresh.len(), 1, "the re-check starts its own lookup");
+
+        // The old lookup returns "allowed": dropped, nothing changes.
+        bridge
+            .apply_peer_lookup(ip, old[0].1, Ok(who(1)))
+            .await
+            .unwrap();
+        assert_eq!(
+            bridge.rechecker.next_due(),
+            Some(due + crate::transport::peer_auth::DEFAULT_RECHECK_INTERVAL),
+            "a stale answer must not move the schedule"
+        );
+        assert!(!bridge.close_deadlines.contains_key(&h));
+
+        // The fresh lookup says the peer is a stranger: closed.
+        bridge
+            .apply_peer_lookup(ip, fresh[0].1, Ok(who(7)))
+            .await
+            .unwrap();
+        assert_eq!(
+            bridge.close_deadlines.get(&h).map(|d| d.code),
+            Some(crate::transport::io_bridge::session::CLOSE_CODE_ACCESS_REVOKED)
+        );
+    }
+}
