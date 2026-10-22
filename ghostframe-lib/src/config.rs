@@ -478,7 +478,7 @@ impl DiagnosticsConfig {
 /// only". There is deliberately no value that admits everyone.
 ///
 /// **Wired.** `IoBridge::new` builds the `AccessPolicy` from it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccessConfig {
     /// Login names, matched exactly (case-sensitive) against the peer
     /// node's owning user. Never consulted for a tagged peer.
@@ -488,11 +488,40 @@ pub struct AccessConfig {
     /// Entries that were not valid and were dropped. Kept so startup can
     /// name them: a typo here silently locks a user out otherwise.
     pub rejected: Vec<String>,
+    /// `GHOSTFRAME_ACCESS_RECHECK_SECS` (default 60): how often a connected
+    /// session's peer is checked against the access rule again, and closed
+    /// if it no longer passes. Whole seconds in
+    /// `MIN_RECHECK_SECS..=MAX_RECHECK_SECS`. Zero, non-numeric or
+    /// out-of-range values are rejected (named in `rejected`) and the default
+    /// applies: re-checking is never switched off by a bad value.
+    pub recheck_interval: std::time::Duration,
+}
+
+impl Default for AccessConfig {
+    fn default() -> Self {
+        Self {
+            allowed_logins: Vec::new(),
+            allowed_tags: Vec::new(),
+            rejected: Vec::new(),
+            recheck_interval: crate::transport::peer_auth::DEFAULT_RECHECK_INTERVAL,
+        }
+    }
 }
 
 impl AccessConfig {
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        use crate::transport::peer_auth::{MAX_RECHECK_SECS, MIN_RECHECK_SECS};
         let mut cfg = Self::default();
+        if let Some(raw) = get("GHOSTFRAME_ACCESS_RECHECK_SECS") {
+            match raw.trim().parse::<u64>() {
+                Ok(n) if (MIN_RECHECK_SECS..=MAX_RECHECK_SECS).contains(&n) => {
+                    cfg.recheck_interval = std::time::Duration::from_secs(n);
+                }
+                _ => cfg
+                    .rejected
+                    .push(format!("GHOSTFRAME_ACCESS_RECHECK_SECS={raw}")),
+            }
+        }
         let Some(raw) = get("GHOSTFRAME_ALLOWED_USERS") else {
             return cfg;
         };
@@ -791,6 +820,43 @@ mod tests {
             AccessConfig::from_lookup(lookup(&[("GHOSTFRAME_ALLOWED_USERS", " , ,")])),
             AccessConfig::default()
         );
+    }
+
+    #[test]
+    fn recheck_interval_defaults_to_sixty_seconds() {
+        let c = AccessConfig::from_lookup(lookup(&[]));
+        assert_eq!(c.recheck_interval, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn recheck_interval_is_configurable() {
+        let c = AccessConfig::from_lookup(lookup(&[("GHOSTFRAME_ACCESS_RECHECK_SECS", " 15 ")]));
+        assert_eq!(c.recheck_interval, std::time::Duration::from_secs(15));
+        assert!(c.rejected.is_empty());
+    }
+
+    // A bad value must not switch re-checking off (0 would mean "never" or
+    // "spin"), so it is reported and the default stays in force.
+    #[test]
+    fn recheck_interval_rejects_nonsense_and_keeps_the_default() {
+        for bad in [
+            "0",
+            "-5",
+            "abc",
+            "",
+            "1.5",
+            "60s",
+            "86401",
+            "99999999999999999999",
+        ] {
+            let c = AccessConfig::from_lookup(lookup(&[("GHOSTFRAME_ACCESS_RECHECK_SECS", bad)]));
+            assert_eq!(
+                c.recheck_interval,
+                std::time::Duration::from_secs(60),
+                "{bad:?}"
+            );
+            assert_eq!(c.rejected.len(), 1, "{bad:?} must be named");
+        }
     }
 
     #[test]

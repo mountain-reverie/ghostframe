@@ -301,9 +301,22 @@ journalctl _UID=$(id -u <user>) --no-pager | grep 'refused tailnet peer'
 
 The owner is matched by Tailscale's stable user ID, not by name.
 
-The check is made when a connection opens. A session already connected is
-not re-checked, and the owner is read once at startup: after changing who
-owns or tags the node, or `GHOSTFRAME_ALLOWED_USERS`, restart the daemon.
+The check is made when a connection opens, and **repeated for every
+connected session** every 60 seconds. A peer that no longer passes (its
+device was removed or expired, re-tagged, or moved to another user) has its
+session closed with the reason `access revoked`; the same rule and the same
+lookup are used as at connect time. Set the interval, in whole seconds from 1
+to 86400, with `GHOSTFRAME_ACCESS_RECHECK_SECS`; `0` or any other value is
+rejected with a startup warning and the 60 seconds apply, so a typo never
+switches re-checking off. A session can therefore outlive a revocation by up
+to one interval, plus up to one short retry (5 s) if the tailnet did not
+answer. Fail closed: a peer the tailnet no longer knows is closed at once, and
+a lookup that fails twice in a row also closes the session; one failure alone
+does not.
+
+What is *not* re-read while running: the node's own owner and
+`GHOSTFRAME_ALLOWED_USERS` are read once at startup. After changing who owns
+or tags the node, or the list, restart the daemon.
 
 ### Adding users
 
