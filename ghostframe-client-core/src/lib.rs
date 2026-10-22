@@ -548,7 +548,7 @@ impl ClientCore {
     }
 
     /// Encode + queue-worthy `ReceiverFeedback` (used by the host to send
-    /// periodic feedback). Returns the 22-byte wire message and resets the
+    /// periodic feedback). Returns the 18-byte wire message and resets the
     /// loss counters.
     pub fn encode_feedback(&mut self, now_us: u64) -> Vec<u8> {
         self.loss_tracker.encode_feedback(now_us)

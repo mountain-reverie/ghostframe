@@ -104,16 +104,12 @@ impl LossTracker {
         self.recovered_fec += 1;
     }
 
-    /// Encode a 22-byte, big-endian `ReceiverFeedback` message and reset
+    /// Encode a 18-byte, big-endian `ReceiverFeedback` message and reset
     /// counters. `timestamp_ns = now_us * 1000`.
     pub fn encode_feedback(&mut self, now_us: u64) -> Vec<u8> {
         let fb = ReceiverFeedback {
             timestamp_ns: now_us * 1000,
             datagrams_received: self.received,
-            // The receiver no longer counts loss: it was only ever the
-            // fragments of an abandoned tile assembly, and tile passes are
-            // single datagrams now. Loss is measured at the sender.
-            datagrams_lost: 0,
             datagrams_recovered_fec: self.recovered_fec,
             suspension_detected: self.suspension,
         };

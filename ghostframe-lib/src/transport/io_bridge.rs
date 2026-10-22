@@ -1656,7 +1656,7 @@ impl IoBridge {
 
     /// Parse a concatenated FEEDBACK-stream byte buffer, dispatching by
     /// message-type byte. Supports:
-    /// - `0x01` FEEDBACK_MSG_TYPE  (22 bytes)  — `ReceiverFeedback`
+    /// - `0x01` FEEDBACK_MSG_TYPE  (18 bytes)  — `ReceiverFeedback`
     /// - `0x03` HELLO_MSG_TYPE     (2 bytes)   — capability advertisement
     /// - `0x04` DECODE_ERROR_MSG_TYPE (5 bytes) — per-tile decode failure
     /// - `0x05` INPUT_MSG_TYPE     (variable) — pointer/wheel/key event

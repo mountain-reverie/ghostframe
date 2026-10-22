@@ -98,7 +98,7 @@ fn on_timeout_clamps_feedback_burst_after_large_clock_gap() {
         1,
         "expected exactly one feedback message, not a burst of missed intervals"
     );
-    assert_eq!(feedback_msgs[0].len(), 22);
+    assert_eq!(feedback_msgs[0].len(), 18);
 }
 
 #[test]
@@ -108,13 +108,13 @@ fn feedback_emitted_every_100ms() {
     let msgs = drain_stream(&mut core);
     assert_eq!(msgs.len(), 1, "expected one feedback message at 100ms");
     assert_eq!(msgs[0][0], 0x01);
-    assert_eq!(msgs[0].len(), 22);
+    assert_eq!(msgs[0].len(), 18);
 
     core.on_timeout(200_000);
     let msgs = drain_stream(&mut core);
     assert_eq!(msgs.len(), 1, "expected one feedback message at 200ms");
     assert_eq!(msgs[0][0], 0x01);
-    assert_eq!(msgs[0].len(), 22);
+    assert_eq!(msgs[0].len(), 18);
 }
 
 #[test]

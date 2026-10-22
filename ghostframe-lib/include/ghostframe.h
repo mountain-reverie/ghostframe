@@ -167,7 +167,7 @@
  */
 #define PARITY_HEADER_SIZE 3
 
-#define FEEDBACK_SIZE 22
+#define FEEDBACK_SIZE 18
 
 /**
  * Receiver loss/suspension report (see [`crate::feedback::ReceiverFeedback`]).
