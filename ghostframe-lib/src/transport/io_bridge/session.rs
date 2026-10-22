@@ -432,6 +432,9 @@ impl IoBridge {
         if let Some(d) = armed {
             self.close_deadlines.insert(handle, d);
         }
+        // `forget_session` also dropped the connection's re-check clock that
+        // `sweep_close_deadlines` started at accept; start it again.
+        self.track_recheck(handle, now_std());
         let wt = self.wt_sessions.entry(handle).or_default();
         if let Some(conn) = self.server.connections.get_mut(&handle) {
             wt.on_new_connection(conn);
@@ -544,6 +547,13 @@ impl IoBridge {
     /// ones are queued for `spawn_peer_lookups` (a blocking WhoIs on a worker
     /// thread, never on this loop) and answered through `apply_peer_lookup`.
     pub(super) fn sweep_rechecks(&mut self, now: std::time::Instant) {
+        // Sessions are added when accepted and dropped by `forget_session`;
+        // the full reconciliation below catches any that left without one
+        // (a drained connection reaped by the server) and is only worth its
+        // cost, a map over every connection, when something is due.
+        if self.rechecker.next_due().is_none_or(|due| due > now) {
+            return;
+        }
         self.rechecker.sync(
             self.server
                 .connections
@@ -556,6 +566,14 @@ impl IoBridge {
         );
         for handle in self.rechecker.run_due(self.server.peer_gate_mut(), now) {
             self.revoke_session(handle, now);
+        }
+    }
+
+    /// Start the re-check clock of a live connection (a no-op for one that
+    /// is gone or already tracked at the same address).
+    fn track_recheck(&mut self, handle: ConnectionHandle, now: std::time::Instant) {
+        if let Some(c) = self.server.connections.get(&handle) {
+            self.rechecker.track(handle, c.remote_address().ip(), now);
         }
     }
 
@@ -600,6 +618,9 @@ impl IoBridge {
     pub(super) fn sweep_close_deadlines(&mut self, now: std::time::Instant) {
         for handle in self.server.take_accepted() {
             self.arm_hello_deadline(handle, now);
+            // Its re-check clock starts here, so `sweep_rechecks` need not
+            // rescan every connection on every turn to find new ones.
+            self.track_recheck(handle, now);
         }
         let due: Vec<(ConnectionHandle, CloseDeadline)> = self
             .close_deadlines
