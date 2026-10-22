@@ -337,14 +337,30 @@ fn full_digest(r: &BrowserlessResult) -> Vec<(&'static str, u64)> {
 ///
 /// The child is this binary re-run with the test's own name and
 /// `GF_DETERMINISM_CHILD` set, which turns off the re-exec.
-fn assert_same_digest_in_a_fresh_process(test: &str, name: &str, digest: u64) {
+fn assert_same_digest_in_a_fresh_process(
+    test: &str,
+    name: &str,
+    digest: u64,
+    trace: &ghostframe_e2e::harness::browserless::WireTrace,
+) {
     const CHILD: &str = "GF_DETERMINISM_CHILD";
+    // The child leaves its wire records here so the parent can name the first
+    // divergent datagram instead of just saying the digests differ.
+    let trace_path = std::env::temp_dir().join(format!(
+        "gf-determinism-{name}-{}.trace",
+        std::process::id()
+    ));
+    if let Some(p) = std::env::var_os("GF_DETERMINISM_TRACE_FILE") {
+        std::fs::write(p, trace.to_text()).expect("write the wire trace");
+        return;
+    }
     if std::env::var_os(CHILD).is_some() {
         return;
     }
     let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .env(CHILD, "1")
+        .env("GF_DETERMINISM_TRACE_FILE", &trace_path)
         .output()
         .expect("spawn the test binary again");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -358,11 +374,16 @@ fn assert_same_digest_in_a_fresh_process(test: &str, name: &str, digest: u64) {
         .lines()
         .find_map(|l| l.find(&prefix).map(|i| &l[i + prefix.len()..]))
         .unwrap_or_else(|| panic!("the child printed no `{prefix}` line:\n{stdout}"));
-    assert_eq!(
-        theirs.trim(),
-        format!("{digest:016x}"),
-        "a fresh process produced a different scene from the same seed"
-    );
+    let theirs_trace = std::fs::read_to_string(&trace_path)
+        .map(|t| ghostframe_e2e::harness::browserless::WireTrace::from_text(&t));
+    let _ = std::fs::remove_file(&trace_path);
+    if theirs.trim() != format!("{digest:016x}") {
+        let report = theirs_trace
+            .ok()
+            .and_then(|t| trace.first_divergence(&t))
+            .unwrap_or_else(|| "wire traces agree: the divergence is not in the wire".into());
+        panic!("a fresh process produced a different scene from the same seed\n{report}");
+    }
 }
 
 fn diff(a: &[(&'static str, u64)], b: &[(&'static str, u64)]) -> Vec<String> {
@@ -433,8 +454,11 @@ async fn a_rich_scene_is_reproducible_from_its_seed() {
     let diffs = diff(&da, &db);
     assert!(
         diffs.is_empty(),
-        "the same seed produced two different scenes:\n{}",
-        diffs.join("\n")
+        "the same seed produced two different scenes:\n{}\n{}",
+        diffs.join("\n"),
+        a.wire_trace
+            .first_divergence(&b.wire_trace)
+            .unwrap_or_else(|| "wire traces agree".into())
     );
     assert!(
         a.wire_datagrams > 1000 && a.framebuffer.digest() != 0,
@@ -445,6 +469,7 @@ async fn a_rich_scene_is_reproducible_from_its_seed() {
         "a_rich_scene_is_reproducible_from_its_seed",
         "rich",
         hash_of(&da),
+        &a.wire_trace,
     );
 }
 
@@ -475,12 +500,16 @@ async fn an_impaired_scene_with_frame_cost_is_reproducible_from_its_seed() {
     let diffs = diff(&da, &db);
     assert!(
         diffs.is_empty(),
-        "the same seed produced two different scenes:\n{}",
-        diffs.join("\n")
+        "the same seed produced two different scenes:\n{}\n{}",
+        diffs.join("\n"),
+        a.wire_trace
+            .first_divergence(&b.wire_trace)
+            .unwrap_or_else(|| "wire traces agree".into())
     );
     assert_same_digest_in_a_fresh_process(
         "an_impaired_scene_with_frame_cost_is_reproducible_from_its_seed",
         "impaired",
         hash_of(&da),
+        &a.wire_trace,
     );
 }
