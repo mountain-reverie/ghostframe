@@ -127,11 +127,17 @@ ENV RUST_MIN_STACK=16777216
 # edit to one source file recompiles only what it touches instead of the whole
 # workspace. A cache mount is not part of the layer, so the two binaries are
 # copied out to /out inside the same RUN; the runtime stage takes them from
-# there. Prune the cache with `docker builder prune --filter type=exec.cachemount`.
+# there. The touch makes every workspace source newer than anything in the
+# cache: target/ is shared by every worktree on the host and cargo's freshness
+# check is mtime-based, so without it a tree whose sources are older than
+# another tree's artifacts silently links that tree's crates. Registry
+# dependencies are unaffected and stay cached.
+# Prune the cache with `docker builder prune --filter type=exec.cachemount`.
 RUN --mount=type=cache,id=ghostframe-cargo-registry,target=/root/.cargo/registry \
     --mount=type=cache,id=ghostframe-cargo-git,target=/root/.cargo/git \
     --mount=type=cache,id=ghostframe-target,target=/build/target \
-    cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern \
+    find /build -path /build/target -prune -o -type f -print0 | xargs -0 touch \
+    && cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern \
         --features ghostframe-lib/test-loss-injection,ghostframe-lib/cdf53-diag \
     && mkdir -p /out \
     && cp target/release/ghostframe-xdaemon target/release/ghostframe-test-pattern /out/
