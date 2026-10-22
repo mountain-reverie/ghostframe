@@ -93,6 +93,8 @@ pub struct QuicServer {
     held_incoming: HashMap<IpAddr, Vec<Incoming>>,
     /// Initials dropped because too many were already held.
     held_overflow: u64,
+    /// Initials refused because their source IP was at its connection cap.
+    refused_per_source: u64,
 }
 
 /// Initials held across all peers while identity lookups are outstanding.
@@ -113,6 +115,15 @@ const INCOMING_BUFFER_TOTAL: u64 = 1024 * 1024;
 /// One client is live at a time (M4a); the slack covers a reconnect that
 /// overlaps its predecessor's drain, and an operator probing.
 pub(crate) const MAX_CONNECTIONS: usize = 16;
+/// Live connections one source IP may hold. One client is live at a time
+/// (M4a); the slack covers a reconnect overlapping its predecessor's drain
+/// and a second tab. Without it one peer fills the whole table
+/// ([`MAX_CONNECTIONS`]) and locks every other peer out. The count is derived
+/// from the connection table, so a connection that closes (or is reaped)
+/// frees its slot with no per-handle state to forget or alias when quinn
+/// reuses the handle.
+pub(crate) const MAX_CONNECTIONS_PER_SOURCE: usize = 4;
+
 /// Past this many connections, an Initial must prove its source address with
 /// a Retry round trip before a `Connection` is allocated for it. Below it the
 /// handshake stays one round trip faster.
@@ -135,6 +146,16 @@ pub(crate) fn admission(live: usize, validated: bool, may_retry: bool) -> Admiss
     } else {
         Admission::Accept
     }
+}
+
+/// Whether a source holding `live_from_source` connections may open another.
+pub(crate) fn source_may_connect(live_from_source: usize) -> bool {
+    live_from_source < MAX_CONNECTIONS_PER_SOURCE
+}
+
+/// Connections among `remotes` that come from `ip`.
+pub(crate) fn count_from_source(remotes: impl Iterator<Item = SocketAddr>, ip: IpAddr) -> usize {
+    remotes.filter(|a| a.ip() == ip).count()
 }
 
 /// Bytes of un-ACKed datagrams quinn will hold before `send_datagram`
@@ -526,6 +547,7 @@ impl QuicServer {
             peer_gate: PeerGate::deny_all(),
             held_incoming: HashMap::new(),
             held_overflow: 0,
+            refused_per_source: 0,
         })
     }
 
@@ -582,6 +604,30 @@ impl QuicServer {
         out
     }
 
+    /// Live connections currently held from `ip`.
+    fn connections_from(&self, ip: IpAddr) -> usize {
+        count_from_source(self.connections.values().map(|c| c.remote_address()), ip)
+    }
+
+    /// Refuse an Initial from a source that is at its connection cap.
+    fn refuse_source_at_cap(&mut self, incoming: Incoming, buf: &mut Vec<u8>) -> Transmit {
+        self.refused_per_source = self.refused_per_source.saturating_add(1);
+        if self.refused_per_source == 1 || self.refused_per_source.is_multiple_of(64) {
+            tracing::warn!(
+                peer = %incoming.remote_address().ip(),
+                limit = MAX_CONNECTIONS_PER_SOURCE,
+                total = self.refused_per_source,
+                "source at its connection cap; refusing (rate-limited)"
+            );
+        }
+        self.endpoint.refuse(incoming, buf)
+    }
+
+    /// Initials refused because their source was at its connection cap.
+    pub fn refused_per_source(&self) -> u64 {
+        self.refused_per_source
+    }
+
     /// Whether one more Initial from `ip` may be held for a lookup.
     fn can_hold(&self, ip: IpAddr) -> bool {
         let for_peer = self.held_incoming.get(&ip).map_or(0, Vec::len);
@@ -620,6 +666,11 @@ impl QuicServer {
     /// Table-size admission, then accept. The peer is already admitted.
     fn admit(&mut self, incoming: Incoming, now: Instant, buf: &mut Vec<u8>) -> Option<Transmit> {
         let remote = incoming.remote_address();
+        // Authoritative per-source cap: Initials held for a lookup were
+        // counted when they arrived, before their siblings were admitted.
+        if !source_may_connect(self.connections_from(remote.ip())) {
+            return Some(self.refuse_source_at_cap(incoming, buf));
+        }
         // Admission control. A spoofed-source Initial flood otherwise
         // allocates a full `Connection` (TLS state, buffers) per
         // packet, and a second ghostframe client is served by
@@ -711,6 +762,11 @@ impl QuicServer {
                 // the connection and long before it could send HELLO. A
                 // refused peer never gets a `Connection`.
                 let ip = incoming.remote_address().ip();
+                // Cheapest check first: a source already at its cap gets no
+                // identity lookup and no held Initial either.
+                if !source_may_connect(self.connections_from(ip)) {
+                    return Some(self.refuse_source_at_cap(incoming, buf));
+                }
                 let can_hold = self.can_hold(ip);
                 match self.peer_gate.check(ip, now, can_hold) {
                     GateCheck::Allow => self.admit(incoming, now, buf),
@@ -1065,6 +1121,36 @@ mod tests {
         assert_eq!(admission(RETRY_THRESHOLD, true, true), Admission::Accept);
         // Cannot be retried (already retried once): accepted, not looped.
         assert_eq!(admission(RETRY_THRESHOLD, false, false), Admission::Accept);
+    }
+
+    #[test]
+    fn source_cap_counts_only_that_source_and_a_closed_connection_frees_its_slot() {
+        let a: IpAddr = "100.64.0.1".parse().unwrap();
+        let b: IpAddr = "100.64.0.2".parse().unwrap();
+        let mut table: Vec<SocketAddr> = (0..MAX_CONNECTIONS_PER_SOURCE as u16)
+            .map(|i| SocketAddr::new(a, 40000 + i))
+            .collect();
+        table.push(SocketAddr::new(b, 40000));
+        let n = count_from_source(table.iter().copied(), a);
+        assert_eq!(n, MAX_CONNECTIONS_PER_SOURCE);
+        assert!(!source_may_connect(n), "at the cap");
+        // Another source is unaffected by it.
+        assert!(source_may_connect(count_from_source(
+            table.iter().copied(),
+            b
+        )));
+        // A connection leaving the table (closed or reaped) frees a slot.
+        table.remove(0);
+        assert!(source_may_connect(count_from_source(
+            table.iter().copied(),
+            a
+        )));
+    }
+
+    #[test]
+    fn source_cap_is_below_the_table_cap() {
+        const { assert!(MAX_CONNECTIONS_PER_SOURCE < MAX_CONNECTIONS) };
+        const { assert!(MAX_CONNECTIONS_PER_SOURCE >= 2) }; // reconnect overlap
     }
 
     #[test]
