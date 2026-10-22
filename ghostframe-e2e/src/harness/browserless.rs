@@ -25,6 +25,13 @@
 //!              (netsim in both directions)
 //! ```
 //!
+//! ## Two modes
+//!
+//! Stepped (default) and concurrent (opt-in through
+//! `RunOptions::mode`) see different failure classes; the doc comment on
+//! [`HarnessMode`] lists what each can and cannot see. Everything below
+//! describes the stepped mode unless it says otherwise.
+//!
 //! ## Reproducibility
 //!
 //! A scene is a pure function of its seed. `IoBridge` is not spawned: the
@@ -69,7 +76,7 @@ use ghostframe_lib::transport::quic::QuicServer;
 use crate::harness::framebuffer::FrameBuffer;
 use crate::harness::scene_tiles::{encode_tile, TileSpec};
 use crate::netsim::pump::parse_frames;
-use crate::netsim::{NetProfile, NetSim, Verdict};
+use crate::netsim::{NetProfile, NetSim, SocketPairPump, Verdict};
 
 /// Default spacing between injected frames.
 ///
@@ -207,6 +214,50 @@ pub struct RunOptions {
     /// left to advance the paused clock. `inject_frame` now bounds that send
     /// so it fails instead of hanging.
     pub frame_cost: Option<Duration>,
+    /// How the server's event loop is driven. See [`HarnessMode`].
+    pub mode: HarnessMode,
+}
+
+/// How a scene drives the server's `IoBridge`.
+///
+/// Two modes exist because they see different failure classes, and neither
+/// sees the other's.
+///
+/// * [`Stepped`](Self::Stepped), the default. The bridge is never spawned:
+///   the scene loop pushes bytes into an in-memory pipe, steps
+///   `IoBridge::step_until_idle` (the production loop body, polled by hand)
+///   to idle, reads what came out, and only then moves the paused clock.
+///   A scene is a pure function of its seed (`browserless_determinism`), so
+///   a counter that moves between two runs is a code change, not noise.
+///   It CAN see: logic in the loop body (scheduling, pacing, recovery,
+///   congestion control, codec selection) and every counter derived from it.
+///   It CANNOT see: anything that needs the client and the server to run at
+///   the same time. The harness writes and the bridge reads at the same
+///   virtual instant, so inbound service delay is 0 by construction; the pipe
+///   has no capacity, so there is no backpressure on either side; and the
+///   bridge always runs to idle before the client moves, so a long blocking
+///   section in the loop delays nothing the scene can observe. Event-loop
+///   starvation, head-of-line blocking in a handler and reactor wake-up
+///   behaviour are all invisible.
+/// * [`Concurrent`](Self::Concurrent), opt-in. `IoBridge::run` is spawned over
+///   a real socketpair and the scene talks to it through
+///   [`crate::netsim::SocketPairPump`], the pre-stepping harness path. Real reactor, real
+///   socket buffers, the bridge and the client interleave as tasks.
+///   It CAN see: starvation of one arm of the select by another, a handler
+///   that holds the loop (inline sleep, a blocking section), socket
+///   backpressure, and anything measured by `inbound_service_delays`.
+///   It CANNOT give: seed reproducibility. The task schedule and the reactor
+///   decide what happens next, so same-seed runs differ by a few percent in
+///   byte totals and the BWE trace, and a pass or fail is only a statement
+///   about thresholds with slack.
+///
+/// Use `Stepped` for everything that asserts on what the server decides, and
+/// `Concurrent` only for a test whose subject is the loop's own concurrency.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub enum HarnessMode {
+    #[default]
+    Stepped,
+    Concurrent,
 }
 
 /// Outcome of one `run_browserless` call.
@@ -563,8 +614,7 @@ async fn run_inner(
 ) -> anyhow::Result<BrowserlessResult> {
     let seed = scene.seed;
 
-    let (ours, peer) = mem_stream_pair();
-
+    let stepped = opts.mode == HarnessMode::Stepped;
     // Pin the server endpoint's RNG from the scene seed, as `drive_session`
     // does for the client. The client seed uses the low bytes, this one a
     // distinct pattern so the two endpoints do not share a stream.
@@ -587,8 +637,34 @@ async fn run_inner(
     // `IoBridge`, once the session is ready — see `drive_session`.
     let (inject_tx, inject_rx) = mpsc::channel::<InjectedFrame>(8);
 
-    let mut bridge =
-        IoBridge::new_stepped_for_test(ours, server, inject_rx, scene.grid_cols, scene.grid_rows);
+    // Stepped: an in-memory pipe the scene loop steps. Concurrent: a real
+    // socketpair and a spawned `run()`.
+    let (mut bridge, link_end) = if stepped {
+        let (ours, peer) = mem_stream_pair();
+        (
+            IoBridge::new_stepped_for_test(
+                ours,
+                server,
+                inject_rx,
+                scene.grid_cols,
+                scene.grid_rows,
+            ),
+            LinkEnd::Mem(peer),
+        )
+    } else {
+        let (ours, peer) = tokio::net::UnixStream::pair()
+            .map_err(|e| anyhow!("seed {seed}: UnixStream::pair failed: {e}"))?;
+        (
+            IoBridge::new_with_injection_for_test(
+                ours,
+                server,
+                inject_rx,
+                scene.grid_cols,
+                scene.grid_rows,
+            ),
+            LinkEnd::Pump(SocketPairPump::new(peer)),
+        )
+    };
     // `bridge` is moved wholesale into the spawned task below, so a plain
     // `&self` accessor on it (`IoBridge::bwe_snapshot`) is unreachable from
     // this function afterwards — there is no way to call back into a value
@@ -637,10 +713,26 @@ async fn run_inner(
     let hold_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     bridge.set_hold_log(hold_log.clone());
     let write_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let link_end = match link_end {
+        LinkEnd::Pump(p) => LinkEnd::Pump(p.with_send_log(write_log.clone())),
+        mem => mem,
+    };
     let mut link = BridgeLink {
-        end: peer,
+        end: link_end,
         send_log: write_log.clone(),
     };
+    // Concurrent mode: `IoBridge::run` is an infinite loop that only returns
+    // on EOF or error, so it is aborted explicitly below rather than awaited.
+    // Stepped mode keeps the bridge here and lends it to `drive_session`.
+    let mut bridge_slot = None;
+    let mut bridge_handle = None;
+    if stepped {
+        bridge_slot = Some(bridge);
+    } else {
+        bridge_handle = Some(tokio::task::spawn_local(async move {
+            let _ = bridge.run().await;
+        }));
+    }
     let base = TokioInstant::now();
     let client_addr = client_addr();
     let server_addr = server_addr();
@@ -658,7 +750,7 @@ async fn run_inner(
     let mut bwe_estimate_samples: Vec<(u64, u64)> = Vec::new();
     let outcome = drive_session(
         cfg,
-        &mut bridge,
+        bridge_slot.as_mut(),
         &mut link,
         client_addr,
         server_addr,
@@ -675,9 +767,13 @@ async fn run_inner(
     )
     .await;
 
-    // The bridge is stepped by `drive_session`, never spawned, so there is
-    // no task to stop: what it published on its last turn is the final
-    // snapshot.
+    // Always abort a spawned bridge, on every exit path: the task must not
+    // outlive this function, and `outcome` may be an `Err`. A stepped bridge
+    // has no task to stop; either way what it published on its last turn is
+    // the final snapshot.
+    if let Some(h) = bridge_handle {
+        h.abort();
+    }
 
     let (
         events,
@@ -823,7 +919,7 @@ async fn run_inner(
 #[allow(clippy::too_many_arguments)]
 async fn drive_session(
     cfg: ClientNetConfig,
-    bridge: &mut IoBridge,
+    mut bridge: Option<&mut IoBridge>,
     link: &mut BridgeLink,
     client_addr: SocketAddr,
     server_addr: SocketAddr,
@@ -950,6 +1046,47 @@ async fn drive_session(
     // the clock moving at all, so that is what this counts.
     const MAX_ITERS_WITHOUT_PROGRESS: usize = 5_000;
 
+    let stepped = bridge.is_some();
+    // Consecutive concurrent-mode iterations whose `select!` was won by the
+    // pump; see `MAX_CONSECUTIVE_PUMP_SERVES`.
+    let mut consecutive_pump_serves: usize = 0;
+
+    // One server -> client packet through the netsim to the client (or into
+    // the in-flight heap). A macro because it touches a dozen locals and is
+    // called from both modes' receive paths.
+    macro_rules! handle_s2c {
+        ($pkt:expr) => {{
+            let pkt = $pkt;
+            let t = now_us(base);
+            let items = rule(
+                &mut net_s2c,
+                Direction::S2c,
+                pkt.payload,
+                t,
+                &mut bytes_dropped,
+            );
+            // `rule` returns nothing exactly for `Verdict::Drop`.
+            s2c_loss.record(items.is_empty());
+            for item in items {
+                if item.at_us <= t {
+                    // Its own arrival instant, for the same reason as in
+                    // `flush_due`. Equal to `t` at zero delay, earlier than it
+                    // whenever the link models any.
+                    client.handle_udp(&item.payload, server_addr, item.at_us);
+                    bytes_delivered += item.payload.len() as u64;
+                    bytes_delivered_s2c += item.payload.len() as u64;
+                    datagrams_delivered_s2c += 1;
+                } else {
+                    in_flight.push(InFlight {
+                        seq: next_in_flight_seq,
+                        ..item
+                    });
+                    next_in_flight_seq += 1;
+                }
+            }
+        }};
+    }
+
     let overall_deadline = base + scene.duration;
     let mut iter: usize = 0;
 
@@ -1039,7 +1176,9 @@ async fn drive_session(
                     // Due now: hand it to the bridge's pipe. Nothing awaits
                     // here, so where the clock may move is decided in one
                     // place, at the bottom of this loop.
-                    link.send(&item.payload, &client_addr);
+                    link.send(&item.payload, &client_addr).await.map_err(|e| {
+                        anyhow!("seed {seed}: bridge send failed at iteration {iter}: {e}")
+                    })?;
                     bytes_delivered += item.payload.len() as u64;
                     bytes_delivered_c2s += item.payload.len() as u64;
                 } else {
@@ -1065,7 +1204,9 @@ async fn drive_session(
             &mut bytes_delivered_s2c,
             &mut bytes_delivered_c2s,
             &mut datagrams_delivered_s2c,
-        );
+        )
+        .await
+        .map_err(|e| anyhow!("seed {seed}: bridge send failed at iteration {iter}: {e}"))?;
 
         let new_events = client.take_events();
         for ev in &new_events {
@@ -1184,56 +1325,45 @@ async fn drive_session(
             }
         }
 
-        // One turn of the server's loop for everything now in its pipe and its
-        // channel, run to the point where it has nothing ready. This is the
-        // production loop body, stepped here rather than spawned, so what it
-        // does at this instant is a function of what was put in front of it.
-        bridge
-            .step_until_idle()
-            .map_err(|e| anyhow!("seed {seed}: bridge failed at iteration {iter}: {e}"))?;
+        // Stepped: one turn of the server's loop for everything now in its
+        // pipe and its channel, run to the point where it has nothing ready.
+        // This is the production loop body, stepped here rather than spawned,
+        // so what it does at this instant is a function of what was put in
+        // front of it. Concurrent: the bridge is its own task and has been
+        // running since it was spawned; there is nothing to step.
+        if let Some(bridge) = bridge.as_deref_mut() {
+            bridge
+                .step_until_idle()
+                .map_err(|e| anyhow!("seed {seed}: bridge failed at iteration {iter}: {e}"))?;
+        }
 
         // Everything the bridge wrote, through the server->client netsim.
-        for pkt in link.recv_all().map_err(|e| {
-            anyhow!("seed {seed}: bridge output unreadable at iteration {iter}: {e}")
-        })? {
+        let stepped_out = if stepped {
+            link.recv_all().map_err(|e| {
+                anyhow!("seed {seed}: bridge output unreadable at iteration {iter}: {e}")
+            })?
+        } else {
+            Vec::new()
+        };
+        for pkt in stepped_out {
             moved = true;
-            let t = now_us(base);
-            let items = rule(
-                &mut net_s2c,
-                Direction::S2c,
-                pkt.payload,
-                t,
-                &mut bytes_dropped,
-            );
-            // `rule` returns nothing exactly for `Verdict::Drop`.
-            s2c_loss.record(items.is_empty());
-            for item in items {
-                if item.at_us <= t {
-                    // Its own arrival instant, for the same reason as in
-                    // `flush_due`. Equal to `t` at zero delay, earlier than it
-                    // whenever the link models any.
-                    client.handle_udp(&item.payload, server_addr, item.at_us);
-                    bytes_delivered += item.payload.len() as u64;
-                    bytes_delivered_s2c += item.payload.len() as u64;
-                    datagrams_delivered_s2c += 1;
-                } else {
-                    in_flight.push(InFlight {
-                        seq: next_in_flight_seq,
-                        ..item
-                    });
-                    next_in_flight_seq += 1;
-                }
-            }
+            handle_s2c!(pkt);
         }
 
         // Fire an already-due ClientNet timeout, then look again from the top.
+        let mut timer_fired = false;
         if let Some(deadline_us) = client.poll_timeout() {
             if now_us(base) >= deadline_us {
                 client.on_timeout(now_us(base));
                 moved = true;
+                timer_fired = true;
             }
         }
-        if moved {
+        // Concurrent mode keeps the pre-stepping loop shape exactly: only a
+        // fired timer restarts the iteration, because every other path goes
+        // through the select below, which is where the runtime gets to run
+        // the bridge task.
+        if (stepped && moved) || timer_fired {
             continue;
         }
 
@@ -1256,10 +1386,47 @@ async fn drive_session(
                 wake_at = wake_at.min(base + Duration::from_micros(due_at));
             }
         }
-        if let Some(at) = bridge.next_wake_for_harness() {
-            wake_at = wake_at.min(TokioInstant::from_std(at));
+        if let Some(bridge) = bridge.as_deref_mut() {
+            if let Some(at) = bridge.next_wake_for_harness() {
+                wake_at = wake_at.min(TokioInstant::from_std(at));
+            }
+            tokio::time::sleep_until(wake_at).await;
+            continue;
         }
-        tokio::time::sleep_until(wake_at).await;
+
+        // Concurrent mode from here: wait for the bridge task's next packet
+        // or the clock, whichever is first.
+        //
+        // Let the clock move before serving the pump again. The `select!`
+        // below is biased, so a pump with a standing backlog would starve its
+        // timer arm, and only the timer arm advances virtual time.
+        // `MAX_CONSECUTIVE_PUMP_SERVES` bounds that: 512 sits above the
+        // deepest run observed on a healthy sweep (192), far below the 5000
+        // non-advancing iterations that trip the progress guard. Sleeping to
+        // `wake_at` is what the loop would do anyway once the pump ran dry.
+        const MAX_CONSECUTIVE_PUMP_SERVES: usize = 512;
+        if consecutive_pump_serves >= MAX_CONSECUTIVE_PUMP_SERVES {
+            consecutive_pump_serves = 0;
+            tokio::time::sleep_until(wake_at).await;
+            continue;
+        }
+        tokio::select! {
+            biased;
+            recv_res = link.recv_one() => {
+                consecutive_pump_serves += 1;
+                let pkt = recv_res.map_err(|e| anyhow!(
+                    "seed {seed}: socketpair pump recv failed at iteration {iter} \
+                     (last events observed: {events:?}): {e}"
+                ))?;
+                handle_s2c!(pkt);
+            }
+            _ = tokio::time::sleep_until(wake_at) => {
+                consecutive_pump_serves = 0;
+                if now_us(base) >= client.poll_timeout().unwrap_or(u64::MAX) {
+                    client.on_timeout(now_us(base));
+                }
+            }
+        }
     }
 
     let client_probe = ClientProbe {
@@ -1512,7 +1679,7 @@ fn rule(
 /// stamping them all with `now` would erase the arrival spread the
 /// bottleneck model exists to produce.
 #[allow(clippy::too_many_arguments)]
-fn flush_due(
+async fn flush_due(
     in_flight: &mut BinaryHeap<InFlight>,
     now: u64,
     link: &mut BridgeLink,
@@ -1523,13 +1690,13 @@ fn flush_due(
     bytes_delivered_s2c: &mut u64,
     bytes_delivered_c2s: &mut u64,
     datagrams_delivered_s2c: &mut u64,
-) -> bool {
+) -> std::io::Result<bool> {
     let mut any = false;
     while in_flight.peek().is_some_and(|f| f.at_us <= now) {
         any = true;
         let f = in_flight.pop().expect("peek just confirmed a due datagram");
         match f.dir {
-            Direction::C2s => link.send(&f.payload, &client_addr),
+            Direction::C2s => link.send(&f.payload, &client_addr).await?,
             // Stamp each datagram with *its own* arrival time, not the
             // loop's. `flush_due` drains everything already due in one pass,
             // so using `now` collapsed a whole batch's arrival spread to a
@@ -1550,35 +1717,63 @@ fn flush_due(
             }
         }
     }
-    any
+    Ok(any)
 }
 
-/// The harness's end of the bridge's in-memory pipe, speaking ghostbridge's
-/// real framing (`encode_frame` / `parse_frame_rest`) so the bridge's reader
-/// sees exactly the bytes it would from a socket.
+/// The harness's end of the link to the bridge. Either the in-memory pipe the
+/// stepped harness uses, or the real socketpair of the concurrent one; both
+/// speak ghostbridge's real framing so the bridge's reader sees exactly the
+/// bytes it would from a socket.
+enum LinkEnd {
+    Mem(MemStream),
+    Pump(SocketPairPump),
+}
+
 struct BridgeLink {
-    end: MemStream,
+    end: LinkEnd,
     /// Tokio-clock instant of every packet handed to the bridge; paired with
     /// the bridge's own read log for the inbound-service-delay metric.
     send_log: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
 }
 
 impl BridgeLink {
-    /// Frame `payload` and make it readable by the bridge's next turn. One
-    /// whole frame per push, so the bridge never sees half of one.
-    fn send(&mut self, payload: &[u8], addr: &SocketAddr) {
-        let frame = encode_frame(payload, addr);
-        self.send_log
-            .lock()
-            .expect("send_log mutex poisoned")
-            .push(TokioInstant::now().into_std());
-        self.end.push(&frame);
+    /// Frame `payload` and hand it to the bridge. In stepped mode one whole
+    /// frame is pushed and nothing awaits, so the bridge never sees half of
+    /// one and the clock cannot move here; in concurrent mode this is a
+    /// socket write that can yield.
+    async fn send(&mut self, payload: &[u8], addr: &SocketAddr) -> std::io::Result<()> {
+        match &mut self.end {
+            LinkEnd::Mem(m) => {
+                self.send_log
+                    .lock()
+                    .expect("send_log mutex poisoned")
+                    .push(TokioInstant::now().into_std());
+                m.push(&encode_frame(payload, addr));
+                Ok(())
+            }
+            // The pump logs its own writes (`with_send_log`).
+            LinkEnd::Pump(p) => p.send(payload, addr).await,
+        }
     }
 
     /// Everything the bridge has written since the last call, parsed.
+    /// Stepped mode only.
     fn recv_all(
         &mut self,
     ) -> std::io::Result<Vec<ghostframe_lib::transport::ghostbridge::UdpPacket>> {
-        parse_frames(&self.end.take_all())
+        match &mut self.end {
+            LinkEnd::Mem(m) => parse_frames(&m.take_all()),
+            LinkEnd::Pump(_) => unreachable!("recv_all is stepped-mode only"),
+        }
+    }
+
+    /// The next packet the bridge task writes. Concurrent mode only.
+    async fn recv_one(
+        &mut self,
+    ) -> std::io::Result<ghostframe_lib::transport::ghostbridge::UdpPacket> {
+        match &mut self.end {
+            LinkEnd::Pump(p) => p.recv().await,
+            LinkEnd::Mem(_) => unreachable!("recv_one is concurrent-mode only"),
+        }
     }
 }
