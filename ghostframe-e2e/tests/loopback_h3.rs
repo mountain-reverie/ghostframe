@@ -25,6 +25,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use web_transport_proto::{ConnectRequest, Settings};
 
+use ghostframe_lib::transport::origin::OriginPolicy;
 use ghostframe_lib::transport::webtransport::WebTransportServer;
 
 // ---------------------------------------------------------------------------
@@ -308,8 +309,10 @@ impl Pair {
 // The test
 // ---------------------------------------------------------------------------
 
-#[test]
-fn loopback_h3_handshake() {
+/// Run a full QUIC + HTTP/3 + CONNECT exchange in memory, with the CONNECT
+/// carrying `origin` (or none), against a server using `policy`. Returns
+/// whether the server ended up with an established WebTransport session.
+fn run_handshake(origin: Option<&str>, policy: OriginPolicy) -> bool {
     // -- 1. Generate self-signed cert --
     let mut params =
         rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
@@ -421,7 +424,7 @@ fn loopback_h3_handshake() {
     assert!(server_connected, "server must fire Event::Connected");
 
     // -- 4. Initialize WebTransportServer: server sends its own SETTINGS --
-    let mut wt = WebTransportServer::new();
+    let mut wt = WebTransportServer::with_origin_policy(Arc::new(policy));
     {
         let conn = pair.server.connections.get_mut(&server_ch).unwrap();
         wt.on_new_connection(conn);
@@ -454,9 +457,14 @@ fn loopback_h3_handshake() {
             .streams()
             .open(Dir::Bi)
             .expect("open bidi stream");
-        let connect = ConnectRequest::new(
+        let mut connect = ConnectRequest::new(
             url::Url::parse("https://localhost/.well-known/webtransport").unwrap(),
         );
+        if let Some(o) = origin {
+            connect
+                .headers
+                .insert("origin", o.parse().expect("origin header value"));
+        }
         let mut connect_buf = BytesMut::new();
         connect.encode(&mut connect_buf).expect("encode CONNECT");
         let written = client_conn
@@ -494,9 +502,52 @@ fn loopback_h3_handshake() {
         }
     }
 
-    // -- 8. Assertions --
+    wt.is_connected()
+}
+
+// ---------------------------------------------------------------------------
+// The tests
+// ---------------------------------------------------------------------------
+
+const SERVED: &str = "https://box.tail1234.ts.net";
+
+fn served_policy() -> OriginPolicy {
+    OriginPolicy::new("box.tail1234.ts.net.", &[]).0
+}
+
+#[test]
+fn loopback_h3_handshake() {
+    // The native client sends no Origin header (it is not a browser).
     assert!(
-        wt.is_connected(),
+        run_handshake(None, served_policy()),
         "WebTransportServer must complete the handshake (SETTINGS + CONNECT -> 200)"
     );
+    // The default policy (what `new()` uses) admits a CONNECT with none too.
+    assert!(run_handshake(None, OriginPolicy::default()));
+}
+
+#[test]
+fn connect_from_the_served_origin_is_accepted() {
+    assert!(run_handshake(Some(SERVED), served_policy()));
+    assert!(run_handshake(
+        Some("https://box.tail1234.ts.net:443"),
+        served_policy()
+    ));
+}
+
+#[test]
+fn connect_from_any_other_origin_is_refused() {
+    for bad in [
+        "https://evil.example",
+        "null",
+        "http://box.tail1234.ts.net",
+        "https://box.tail1234.ts.net:8443",
+    ] {
+        assert!(
+            !run_handshake(Some(bad), served_policy()),
+            "Origin {bad:?} must not get a session"
+        );
+    }
+    // No policy entry at all: no browser origin gets in.
+    assert!(!run_handshake(Some(SERVED), OriginPolicy::default()));
 }

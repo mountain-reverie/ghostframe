@@ -424,7 +424,11 @@ impl IoBridge {
         if let Some(d) = armed {
             self.close_deadlines.insert(handle, d);
         }
-        let wt = self.wt_sessions.entry(handle).or_default();
+        let origin_policy = self.origin_policy.clone();
+        let wt = self
+            .wt_sessions
+            .entry(handle)
+            .or_insert_with(|| WebTransportServer::with_origin_policy(origin_policy));
         if let Some(conn) = self.server.connections.get_mut(&handle) {
             wt.on_new_connection(conn);
         }

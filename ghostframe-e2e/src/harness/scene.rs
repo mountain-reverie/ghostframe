@@ -222,6 +222,10 @@ pub(crate) async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioSt
         // also skips the CertDomains() fail-fast when these are set.
         .with_env_var("GHOSTFRAME_WEB_TLS_CERT_PEM", &e2e_cert.cert_pem)
         .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem)
+        // The browser reaches the server through a local forwarder on a random
+        // port, so its page Origin is https://127.0.0.1:<port>; the CONNECT
+        // Origin check admits only the node's own FQDN otherwise.
+        .with_env_var("GHOSTFRAME_WEB_ORIGINS", "https://127.0.0.1:*")
         .with_mount(Mount::bind_mount("/dev/dri", "/dev/dri"))
         .with_privileged(true)
         // Readiness probe: emitted by io_bridge after QuicServer::new.

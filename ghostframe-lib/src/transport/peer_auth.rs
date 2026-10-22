@@ -658,6 +658,7 @@ mod tests {
             allowed_logins: logins.iter().map(|s| s.to_string()).collect(),
             allowed_tags: tags.iter().map(|s| s.to_string()).collect(),
             rejected: vec![],
+            web_origins: vec![],
         }
     }
 

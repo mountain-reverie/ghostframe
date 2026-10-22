@@ -23,10 +23,13 @@
 //! `quarter_id = session_stream_id / 4`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use quinn_proto::{Connection, Dir, SendDatagramError, StreamId};
 use web_transport_proto::{ConnectRequest, ConnectResponse, Settings, VarInt};
+
+use crate::transport::origin::OriginPolicy;
 
 // ─── per-stream read buffer ───────────────────────────────────────────────────
 
@@ -83,6 +86,8 @@ pub struct WebTransportServer {
     /// bytes are read (to keep flow control moving) and discarded, rather than
     /// starting a fresh buffer that would mis-parse as a new message.
     abandoned_streams: std::collections::HashSet<StreamId>,
+    /// Which `Origin` a CONNECT may carry. See [`OriginPolicy`].
+    origin_policy: Arc<OriginPolicy>,
 }
 
 impl WebTransportServer {
@@ -99,6 +104,32 @@ impl WebTransportServer {
             pending_bidi_streams: Vec::new(),
             feedback_queue: Vec::new(),
             abandoned_streams: std::collections::HashSet::new(),
+            origin_policy: Arc::new(OriginPolicy::default()),
+        }
+    }
+
+    /// A session handler that admits the origins `policy` allows. `new()`
+    /// uses the empty policy: no browser origin, only a CONNECT without one.
+    pub fn with_origin_policy(origin_policy: Arc<OriginPolicy>) -> Self {
+        Self {
+            origin_policy,
+            ..Self::new()
+        }
+    }
+
+    /// The response to a decoded CONNECT: 200, or 403 when its `Origin` is
+    /// not one this server serves its client from.
+    fn connect_response(&self, req: &ConnectRequest) -> ConnectResponse {
+        let origins: Vec<&[u8]> = req
+            .headers
+            .get_all(web_transport_proto::http::header::ORIGIN)
+            .iter()
+            .map(|v| v.as_bytes())
+            .collect();
+        if self.origin_policy.permits(&origins) {
+            ConnectResponse::OK
+        } else {
+            ConnectResponse::new(web_transport_proto::http::StatusCode::FORBIDDEN)
         }
     }
 
@@ -429,8 +460,16 @@ impl WebTransportServer {
                     "WebTransport CONNECT request received"
                 );
 
-                // Send 200 OK response.
-                let response = ConnectResponse::OK;
+                // 200, or 403 for an Origin we do not serve the client from.
+                let response = self.connect_response(&req);
+                let refused = !response.status.is_success();
+                if refused {
+                    tracing::warn!(
+                        stream_id = ?sid,
+                        origin = ?req.headers.get_all(web_transport_proto::http::header::ORIGIN),
+                        "WebTransport CONNECT refused: Origin not allowed"
+                    );
+                }
                 let mut resp_buf = BytesMut::new();
                 if let Err(e) = response.encode(&mut resp_buf) {
                     tracing::warn!(stream_id = ?sid, error = ?e, "ConnectResponse encode failed");
@@ -458,6 +497,15 @@ impl WebTransportServer {
                         tracing::warn!(stream_id = ?sid, error = ?e, "failed to write CONNECT response");
                         return;
                     }
+                }
+
+                if refused {
+                    // The 403 is out; the session never becomes connected, so
+                    // its datagrams are ignored. End our side of the stream.
+                    let _ = conn.send_stream(sid).finish();
+                    self.pending_bidi_streams.retain(|&s| s != sid);
+                    self.stream_bufs.remove(&sid);
+                    return;
                 }
 
                 self.session_stream = Some(sid);
