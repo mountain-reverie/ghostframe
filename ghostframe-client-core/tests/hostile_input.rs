@@ -76,7 +76,7 @@ fn tile_ready_count(evs: &[Event]) -> usize {
 }
 
 #[test]
-fn a_tile_claiming_other_than_one_fragment_is_dropped_and_stores_nothing() {
+fn a_tile_claiming_other_than_one_fragment_is_dropped() {
     // A tile pass is one datagram (no payload exceeds MAX_TILE_PAYLOAD), so any
     // other fragment count is hostile or from a server that no longer exists.
     let mut core = test_core();
@@ -93,24 +93,28 @@ fn a_tile_claiming_other_than_one_fragment_is_dropped_and_stores_nothing() {
             evs.is_empty(),
             "frag_total {total} must be dropped: {evs:?}"
         );
-        assert_eq!(stats(&core).tile_assemblies, 0, "frag_total {total}");
-        assert_eq!(stats(&core).tile_assembly_bytes, 0, "frag_total {total}");
     }
 }
 
 #[test]
-fn a_fan_out_of_multi_fragment_claims_with_a_pinned_frame_seq_stores_nothing() {
-    // Pin frame_seq, vary the key, claim 65535 fragments.
+fn a_tile_claiming_a_fragment_index_other_than_zero_is_dropped() {
+    // frag_total 1 with a nonzero index is the old tile-level parity shape
+    // (`frag_idx >= frag_total`) or plain nonsense. Either way there is
+    // nothing to assemble, so it must neither decode nor be ACKed.
     let mut core = test_core();
-    let base = solid_dg(1, 0, 0);
-    for i in 0..5000u32 {
-        let mut dg = base.clone();
-        dg[16] = (i % 200) as u8; // tile_x
-        dg[17] = ((i / 200) % 200) as u8; // tile_y
-        forge_frag_total(&mut dg, u16::MAX);
-        core.handle_datagram(&dg, 0);
+    for idx in [1u16, 2, 64, u16::MAX] {
+        let mut dg = solid_dg(2, 0, 0);
+        forge_frag_idx(&mut dg, idx);
+        let evs = core.handle_datagram(&dg, 0);
+        assert!(evs.is_empty(), "frag_idx {idx} must be dropped: {evs:?}");
     }
-    assert_eq!(stats(&core).tile_assemblies, 0);
+    assert!(!acked(&mut core), "a refused tile must not be ACKed");
+    // Positive control: the same tile with index 0 decodes and is ACKed.
+    assert_eq!(
+        tile_ready_count(&core.handle_datagram(&solid_dg(2, 0, 0), 0)),
+        1
+    );
+    assert!(acked(&mut core), "control: an accepted tile must be ACKed");
 }
 
 #[test]
@@ -306,9 +310,7 @@ fn a_dropped_dimensions_message_does_not_change_the_grid() {
     assert_eq!(dims_events(&mut core, 640, 480).len(), 1);
     assert!(dims_events(&mut core, u32::MAX, u32::MAX).is_empty());
     // Grid is still 20x15: a tile at x=30 is refused.
-    let dgs = tile_dgs(2, 30, 0, 0, &[1u8; 128], 64);
-    core.handle_datagram(&dgs[0], 0);
-    assert_eq!(stats(&core).tile_assemblies, 0);
+    assert!(core.handle_datagram(&solid_dg(2, 30, 0), 0).is_empty());
 }
 
 // ---------------------------------------------------------------------------

@@ -14,7 +14,6 @@
 //! a browserless scene a crash found here reproduces exactly from its input.
 
 use ghostframe_client_core::cdf53_prevalidate::prevalidate_cdf53;
-use ghostframe_client_core::fragment_parity::decode_parity_payload;
 use ghostframe_client_core::pal_rle_decode::{decode_pal_rle_tile, prevalidate_pal_rle};
 use ghostframe_client_core::palette_shadow::PaletteShadow;
 use ghostframe_protocol::codec::solid::decode_solid;
@@ -33,7 +32,6 @@ fuzz_target!(|data: &[u8]| {
     // None of these may panic on any input.
     let _ = decode_solid(payload);
     let _ = prevalidate_cdf53(payload, generation, pass_idx);
-    let _ = decode_parity_payload(payload);
 
     let shadow = PaletteShadow::new();
     let _ = prevalidate_pal_rle(payload, &shadow);

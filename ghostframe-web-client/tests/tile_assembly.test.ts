@@ -9,8 +9,8 @@
 // side with the struct directly.
 //
 // What's left to prove here is that the same isolation holds *across the
-// wasm boundary* — that reassembly.rs actually keys its assembly map this
-// way, not just that the struct hashes correctly in isolation. So these
+// wasm boundary* — that reassembly.rs actually keys tiles this way, not
+// just that the struct hashes correctly in isolation. So these
 // cases now drive `WasmClientCore.handleDatagram` with real tile-datagram
 // bytes and assert on the resulting `TileReady` events, instead of calling
 // a key-construction function directly.

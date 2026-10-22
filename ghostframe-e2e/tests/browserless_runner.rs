@@ -1273,7 +1273,7 @@ fn gradient_tile() -> Vec<u8> {
 
 /// The BGRA -> RGBA swizzle every codec's decode path applies, alpha forced
 /// to 255 — matches `ghostframe-client-core/src/reassembly.rs`'s
-/// `finish_assembly` (the Raw-codec arm) and, for Cdf53 specifically,
+/// `deliver_tile` (the Raw-codec arm) and, for Cdf53 specifically,
 /// `Cdf53TileState::integrate`'s BGR -> RGB conversion plus forced alpha.
 fn expected_rgba(bgra: &[u8]) -> Vec<u8> {
     let mut rgba = vec![0u8; bgra.len()];

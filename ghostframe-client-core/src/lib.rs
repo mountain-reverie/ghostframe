@@ -19,7 +19,6 @@ pub mod cdf53_prevalidate;
 pub mod cdf53_tile_state;
 pub mod decode_error_batcher;
 mod event;
-pub mod fragment_parity;
 mod frame_assembly;
 pub mod input;
 pub mod loss_tracker;
@@ -34,14 +33,11 @@ pub use cdf53_coverage::CoverageEntry;
 pub use event::{DecodeErrorCode, Event, PollOutput, TileData, TileKey};
 pub use wire_loss::WireLossStats;
 
-use std::collections::{HashMap, HashSet, VecDeque};
-
-use ghostframe_protocol::protocol::TileHeader;
+use std::collections::{HashMap, VecDeque};
 
 use ack_batcher::AckBatcher;
 use cdf53_tile_state::Cdf53TileState;
 use decode_error_batcher::DecodeErrorBatcher;
-use fragment_parity::FragmentParity;
 use frame_assembly::FrameAssembly;
 use loss_tracker::LossTracker;
 use nack_batcher::{NackBatcher, NackEntry};
@@ -50,10 +46,6 @@ use parity_decoder::ParityDecoder;
 
 /// Wire-sequence FEC window size (mirrors `new ParityDecoder(40)` in main.ts).
 const PARITY_WINDOW: usize = 40;
-
-/// Reliable-tile-emitter: NACK any fragment still missing this long after
-/// the assembly's first fragment arrived (main.ts:756, `ASSEMBLY_TIMEOUT_MS`).
-const ASSEMBLY_TIMEOUT_US: u64 = 30_000;
 
 /// Coverage-NACK debounce window (main.ts:806, `NACK_DEBOUNCE_MS`).
 const NACK_DEBOUNCE_US: u64 = 50_000;
@@ -86,14 +78,6 @@ const FEEDBACK_INTERVAL_US: u64 = 100_000;
 /// clamp against this same value as belt and braces.
 pub const MAX_FRAME_DIMENSION: u32 = 8192;
 
-/// Most source fragments one tile pass may claim (`frag_total`).
-///
-/// A 32x32 tile pass is at most a few KiB and a datagram carries ~1.1 KiB, so
-/// real passes fragment into single digits; the per-tile NACK entry also
-/// names a fragment in one byte. 64 is generous without being an allocation
-/// lever (`frag_total` is an attacker-chosen `u16`).
-pub const MAX_TILE_FRAGMENTS: u16 = 64;
-
 /// Most source fragments one H.264 access unit may claim.
 ///
 /// [`MAX_H264_ACCESS_UNIT_BYTES`] at the smallest fragment worth sending
@@ -104,37 +88,10 @@ pub const MAX_FRAME_FRAGMENTS: u16 = 16_384;
 /// Most payload bytes one H.264 access unit may buffer before it is dropped.
 pub const MAX_H264_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
 
-/// Byte budget for all live (incomplete) tile assemblies together.
-///
-/// Each assembly is charged [`ASSEMBLY_BASE_COST`], a slot cost per claimed
-/// fragment and the payload bytes buffered so far, so the budget bounds
-/// both the number of assemblies and the memory behind them. Sized so that
-/// a full 4K dual-screen frame (~16k tiles) with every tile one fragment
-/// short still fits; a hostile server that fans out keys hits it long before
-/// memory matters.
-pub const MAX_ASSEMBLY_BYTES: usize = 128 * 1024 * 1024;
-
-/// Most live tile assemblies, whatever their byte cost. Every datagram and
-/// timer pass scans the assembly map, so the count is bounded on its own.
-pub const MAX_LIVE_ASSEMBLIES: usize = 65_536;
-
-const _: () = assert!(
-    MAX_TILE_FRAGMENTS <= 256,
-    "NACK entries name a fragment in one byte"
-);
-
-/// Fixed cost charged per live assembly (struct, map slot, bookkeeping).
-const ASSEMBLY_BASE_COST: usize = 512;
-/// Cost charged per claimed fragment slot (`Option<Vec<u8>>` + `Option<u32>`).
-const ASSEMBLY_SLOT_COST: usize = 40;
-
 /// Snapshot of reassembly occupancy, for diagnostics and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AssemblyStats {
-    pub tile_assemblies: usize,
-    pub tile_assembly_bytes: usize,
     pub frame_assemblies: usize,
-    pub fragment_parity_keys: usize,
 }
 
 /// One coverage NACK awaiting the debounce window (main.ts:815, `PendingNack`).
@@ -190,73 +147,13 @@ pub struct ClientDisplay {
     pub mm_height: u16,
 }
 
-/// One in-progress tile-pass assembly (fragments keyed by `TileKey`).
-pub(crate) struct Assembly {
-    pub tile_x: u8,
-    pub tile_y: u8,
-    pub codec: ghostframe_protocol::protocol::Codec,
-    pub generation: u8,
-    pub pass: u8,
-    pub frame_seq: u32,
-    pub fragments: Vec<Option<Vec<u8>>>,
-    pub received: usize,
-    /// `now_us` at which this assembly was created (first fragment
-    /// arrival); the assembly-timeout scan measures elapsed time from here.
-    pub partial_since_us: u64,
-    /// Fragment indices already NACKed by the assembly-timeout scan, so a
-    /// missing fragment is only ever NACKed once per assembly.
-    pub nacked_frag_idxs: HashSet<usize>,
-    /// The `wire_seq` each fragment arrived on, parallel to `fragments`.
-    ///
-    /// Kept separately because `fragments` holds stripped *payload*, so the
-    /// transmission identity would otherwise be discarded at reassembly. The
-    /// deferred Cdf53 acknowledgement needs it: a pass is acknowledged after
-    /// prevalidation, by which point the datagrams it arrived on are gone,
-    /// and naming transmissions means each must be acknowledged individually
-    /// or the unmentioned ones would be counted lost.
-    ///
-    /// A FEC-recovered fragment stays `None`: no transmission of it arrived,
-    /// so there is nothing to acknowledge.
-    pub wire_seqs: Vec<Option<u32>>,
-    /// Budget charged for this assembly so far (see [`MAX_ASSEMBLY_BYTES`]).
-    pub cost: usize,
-}
-
-impl Assembly {
-    /// Cost of an empty assembly claiming `frag_total` slots.
-    pub(crate) fn base_cost(frag_total: u16) -> usize {
-        ASSEMBLY_BASE_COST + frag_total as usize * ASSEMBLY_SLOT_COST
-    }
-
-    fn new(header: &TileHeader, frame_seq: u32, frag_total: u16, now_us: u64) -> Self {
-        Assembly {
-            tile_x: header.tile_x,
-            tile_y: header.tile_y,
-            codec: header.codec,
-            generation: header.generation,
-            pass: header.pass,
-            frame_seq,
-            fragments: vec![None; frag_total as usize],
-            wire_seqs: vec![None; frag_total as usize],
-            received: 0,
-            partial_since_us: now_us,
-            nacked_frag_idxs: HashSet::new(),
-            cost: Self::base_cost(frag_total),
-        }
-    }
-}
-
 pub struct ClientCore {
     pub(crate) outbox: VecDeque<PollOutput>,
-    pub(crate) assemblies: HashMap<TileKey, Assembly>,
-    /// Sum of `Assembly::cost` over `assemblies`.
-    pub(crate) assembly_bytes: usize,
     /// Frame size last accepted from the server, if any. Tile coordinates
     /// are validated against the grid it implies.
     pub(crate) frame_dims: Option<(u32, u32)>,
     pub(crate) parity_decoder: ParityDecoder,
     pub(crate) wire_loss: wire_loss::WireLossTracker,
-    pub(crate) fragment_parity: FragmentParity,
     pub(crate) ack_batcher: AckBatcher,
     pub(crate) nack_batcher: NackBatcher,
     pub(crate) decode_error_batcher: DecodeErrorBatcher,
@@ -267,11 +164,6 @@ pub struct ClientCore {
     pub(crate) cdf53_coverage: HashMap<(u8, u8), CoverageEntry>,
     pub(crate) cdf53_tile_state: Cdf53TileState,
     pub(crate) latest_frame_seq: u32,
-    /// Stale-frame threshold the last sweep ran at.
-    pub(crate) swept_threshold: u32,
-    /// Set when an assembly or parity entry was stored below the current
-    /// threshold, so the next datagram still sweeps it as it always did.
-    pub(crate) stale_pending: bool,
     /// H.264 frame-level reassembly state (keyed by `frame_seq`).
     pub(crate) frame_assemblies: HashMap<u32, FrameAssembly>,
     pub(crate) latest_full_frame_seq: u32,
@@ -303,12 +195,9 @@ impl ClientCore {
     pub fn new(config: ClientConfig, now_us: u64) -> Self {
         let mut core = ClientCore {
             outbox: VecDeque::new(),
-            assemblies: HashMap::new(),
-            assembly_bytes: 0,
             frame_dims: None,
             parity_decoder: ParityDecoder::new(PARITY_WINDOW),
             wire_loss: wire_loss::WireLossTracker::new(),
-            fragment_parity: FragmentParity::new(),
             ack_batcher: AckBatcher::new(),
             nack_batcher: NackBatcher::new(),
             decode_error_batcher: DecodeErrorBatcher::new(),
@@ -318,8 +207,6 @@ impl ClientCore {
             cdf53_coverage: HashMap::new(),
             cdf53_tile_state: Cdf53TileState::new(),
             latest_frame_seq: 0,
-            swept_threshold: 0,
-            stale_pending: false,
             frame_assemblies: HashMap::new(),
             latest_full_frame_seq: 0,
             h264_fragments_recovered: 0,
@@ -372,7 +259,7 @@ impl ClientCore {
     /// Earliest deadline (µs) at which `on_timeout` must be called.
     ///
     /// = min(ack batcher, nack batcher, coverage-NACK debounce, next
-    /// assembly-timeout scan, next tail sweep, next feedback emit). The
+    /// tail sweep, next feedback emit). The
     /// tail sweep and feedback deadlines are always armed (mirroring
     /// main.ts's always-running rAF loop / 100ms `setInterval`), so this
     /// is never `None` once the core has been constructed.
@@ -386,9 +273,6 @@ impl ClientCore {
         }
         if let Some(d) = self.pending_nack_deadline_us {
             deadline = deadline.min(d);
-        }
-        if let Some(s) = self.next_assembly_scan_us() {
-            deadline = deadline.min(s);
         }
         Some(deadline)
     }
@@ -407,39 +291,8 @@ impl ClientCore {
     /// Reassembly occupancy, for diagnostics and tests.
     pub fn assembly_stats(&self) -> AssemblyStats {
         AssemblyStats {
-            tile_assemblies: self.assemblies.len(),
-            tile_assembly_bytes: self.assembly_bytes,
             frame_assemblies: self.frame_assemblies.len(),
-            fragment_parity_keys: self.fragment_parity.len(),
         }
-    }
-
-    /// Remove a tile assembly, returning its budget.
-    pub(crate) fn remove_assembly(&mut self, key: &TileKey) -> Option<Assembly> {
-        let asm = self.assemblies.remove(key)?;
-        self.assembly_bytes = self.assembly_bytes.saturating_sub(asm.cost);
-        Some(asm)
-    }
-
-    /// Earliest `partial_since_us + ASSEMBLY_TIMEOUT_US` across incomplete
-    /// assemblies, if any are pending.
-    fn next_assembly_scan_us(&self) -> Option<u64> {
-        self.assemblies
-            .values()
-            .filter(|a| a.received < a.fragments.len())
-            .filter(|a| {
-                // If every still-missing fragment has already been NACKed by
-                // a prior scan, this assembly has nothing left to contribute
-                // to the scan deadline; leaving it in the min-fold would pin
-                // poll_timeout at a perpetually-past instant (a host "sleep
-                // until poll_timeout" driver would busy-loop).
-                a.fragments
-                    .iter()
-                    .enumerate()
-                    .any(|(i, f)| f.is_none() && !a.nacked_frag_idxs.contains(&i))
-            })
-            .map(|a| a.partial_since_us + ASSEMBLY_TIMEOUT_US)
-            .min()
     }
 
     /// Queue a coverage NACK for debounced dispatch (`queuePassNack`,
@@ -507,67 +360,6 @@ impl ClientCore {
         // batcher merely queued (didn't hit its own entry cap) must be
         // flushed immediately rather than waiting on its separate 5ms
         // flush timer — the debounce already provided the delay.
-        if queued {
-            if let Some(dg) = self.nack_batcher.flush() {
-                self.outbox.push_back(PollOutput::Datagram(dg));
-            }
-        }
-    }
-
-    /// Assembly-timeout scan (`scanForAssemblyTimeouts`, main.ts:756-769):
-    /// any assembly whose first fragment arrived `>= ASSEMBLY_TIMEOUT_US`
-    /// ago gets every still-missing fragment NACKed once (deduped per
-    /// assembly via `nacked_frag_idxs`).
-    fn scan_assembly_timeouts(&mut self, now_us: u64) {
-        let keys: Vec<TileKey> = self.assemblies.keys().copied().collect();
-        let mut queued = false;
-        for key in keys {
-            let (frame_seq, tile_x, tile_y, pass_idx, missing): (u32, u8, u8, u8, Vec<usize>) = {
-                let asm = match self.assemblies.get(&key) {
-                    Some(a) => a,
-                    None => continue,
-                };
-                if asm.received >= asm.fragments.len() {
-                    continue;
-                }
-                if now_us.saturating_sub(asm.partial_since_us) < ASSEMBLY_TIMEOUT_US {
-                    continue;
-                }
-                let missing: Vec<usize> = asm
-                    .fragments
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, f)| f.is_none() && !asm.nacked_frag_idxs.contains(i))
-                    .map(|(i, _)| i)
-                    .collect();
-                (asm.frame_seq, asm.tile_x, asm.tile_y, key.pass_idx, missing)
-            };
-            if missing.is_empty() {
-                continue;
-            }
-            use ghostframe_protocol::protocol::TILE_DATAGRAM_FLAG;
-            for frag_idx in &missing {
-                let entry = NackEntry {
-                    frame_seq: frame_seq | TILE_DATAGRAM_FLAG,
-                    tile_x,
-                    tile_y,
-                    pass_idx,
-                    frag_idx: *frag_idx as u8,
-                };
-                if let Some(dg) = self.nack_batcher.add(entry, now_us) {
-                    self.outbox.push_back(PollOutput::Datagram(dg));
-                } else {
-                    queued = true;
-                }
-            }
-            if let Some(asm) = self.assemblies.get_mut(&key) {
-                for frag_idx in missing {
-                    asm.nacked_frag_idxs.insert(frag_idx);
-                }
-            }
-        }
-        // The assembly has already sat past ASSEMBLY_TIMEOUT_US, so flush
-        // immediately rather than waiting on the batcher's own 5ms timer.
         if queued {
             if let Some(dg) = self.nack_batcher.flush() {
                 self.outbox.push_back(PollOutput::Datagram(dg));
@@ -732,7 +524,6 @@ impl ClientCore {
                 self.flush_pending_nacks(now_us);
             }
         }
-        self.scan_assembly_timeouts(now_us);
         self.tail_sweep(now_us);
         if now_us >= self.next_feedback_us {
             let msg = self.loss_tracker.encode_feedback(now_us);

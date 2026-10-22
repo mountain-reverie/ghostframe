@@ -21,7 +21,6 @@ pub use ghostframe_protocol::feedback_stream::HELLO_SIZE;
 
 pub struct LossTracker {
     received: u32,
-    lost: u32,
     recovered_fec: u32,
     /// `(arrival, sender stamp)` of the newest timed datagram seen: the
     /// baseline the next one's spacing is judged against.
@@ -33,7 +32,6 @@ impl LossTracker {
     pub fn new() -> Self {
         LossTracker {
             received: 0,
-            lost: 0,
             recovered_fec: 0,
             last_timed: None,
             suspension: false,
@@ -101,13 +99,6 @@ impl LossTracker {
         self.last_timed = Some((now_us, sent_us));
     }
 
-    /// Call when a stale assembly is evicted with missing fragments.
-    pub fn on_stale_tile(&mut self, expected: usize, received: usize) {
-        if expected > received {
-            self.lost += (expected - received) as u32;
-        }
-    }
-
     /// Call when a fragment is recovered via FEC.
     pub fn on_fec_recovery(&mut self) {
         self.recovered_fec += 1;
@@ -119,7 +110,10 @@ impl LossTracker {
         let fb = ReceiverFeedback {
             timestamp_ns: now_us * 1000,
             datagrams_received: self.received,
-            datagrams_lost: self.lost,
+            // The receiver no longer counts loss: it was only ever the
+            // fragments of an abandoned tile assembly, and tile passes are
+            // single datagrams now. Loss is measured at the sender.
+            datagrams_lost: 0,
             datagrams_recovered_fec: self.recovered_fec,
             suspension_detected: self.suspension,
         };
@@ -127,7 +121,6 @@ impl LossTracker {
         fb.encode(&mut buf);
 
         self.received = 0;
-        self.lost = 0;
         self.recovered_fec = 0;
         self.suspension = false;
 

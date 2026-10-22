@@ -330,11 +330,6 @@ impl WasmLossTracker {
         self.inner.on_datagram(now_us)
     }
 
-    #[wasm_bindgen(js_name = onStaleTile)]
-    pub fn on_stale_tile(&mut self, expected: usize, received: usize) {
-        self.inner.on_stale_tile(expected, received)
-    }
-
     #[wasm_bindgen(js_name = onFecRecovery)]
     pub fn on_fec_recovery(&mut self) {
         self.inner.on_fec_recovery()
