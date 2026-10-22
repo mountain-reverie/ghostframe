@@ -488,6 +488,11 @@ pub struct AccessConfig {
     /// Entries that were not valid and were dropped. Kept so startup can
     /// name them: a typo here silently locks a user out otherwise.
     pub rejected: Vec<String>,
+    /// `GHOSTFRAME_WEB_ORIGINS`: extra browser origins whose pages may open a
+    /// session, beyond this node's own `https://<FQDN>` (see
+    /// `transport::origin`). Validated where the policy is built, which
+    /// reports the malformed ones.
+    pub web_origins: Vec<String>,
     /// `GHOSTFRAME_ACCESS_RECHECK_SECS` (default 60): how often a connected
     /// session's peer is checked against the access rule again, and closed
     /// if it no longer passes. Whole seconds in
@@ -504,6 +509,7 @@ impl Default for AccessConfig {
             allowed_logins: Vec::new(),
             allowed_tags: Vec::new(),
             rejected: Vec::new(),
+            web_origins: Vec::new(),
             recheck_interval: crate::transport::peer_auth::DEFAULT_RECHECK_INTERVAL,
         }
     }
@@ -534,6 +540,14 @@ impl AccessConfig {
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         use crate::transport::peer_auth::{MAX_RECHECK_SECS, MIN_RECHECK_SECS};
         let mut cfg = Self::default();
+        if let Some(raw) = get("GHOSTFRAME_WEB_ORIGINS") {
+            cfg.web_origins = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
         if let Some(raw) = get("GHOSTFRAME_ACCESS_RECHECK_SECS") {
             match raw.trim().parse::<u64>() {
                 Ok(n) if (MIN_RECHECK_SECS..=MAX_RECHECK_SECS).contains(&n) => {
@@ -838,6 +852,21 @@ mod tests {
     // -----------------------------------------------------------------
     // AccessConfig (GHOSTFRAME_ALLOWED_USERS)
     // -----------------------------------------------------------------
+
+    #[test]
+    fn web_origins_split_and_trim() {
+        assert!(AccessConfig::from_lookup(lookup(&[]))
+            .unwrap()
+            .web_origins
+            .is_empty());
+        let c = AccessConfig::from_lookup(lookup(&[(
+            "GHOSTFRAME_WEB_ORIGINS",
+            " https://a.example , ,https://127.0.0.1:* ",
+        )]))
+        .unwrap();
+        assert_eq!(c.web_origins, ["https://a.example", "https://127.0.0.1:*"]);
+        assert!(c.allowed_logins.is_empty());
+    }
 
     #[test]
     fn allowed_users_unset_means_owner_only() {

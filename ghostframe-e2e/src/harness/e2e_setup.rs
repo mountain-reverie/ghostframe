@@ -164,7 +164,11 @@ pub async fn setup_e2e_server_as(
         .with_env_var("RUST_LOG", "ghostframe=trace,debug")
         .with_env_var("TEST_PATTERN", spec.test_pattern_args)
         .with_env_var("GHOSTFRAME_WEB_TLS_CERT_PEM", &e2e_cert.cert_pem)
-        .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem);
+        .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem)
+        // The browser reaches the server through a local forwarder on a random
+        // port, so its page Origin is https://127.0.0.1:<port>; the CONNECT
+        // Origin check admits only the node's own FQDN otherwise.
+        .with_env_var("GHOSTFRAME_WEB_ORIGINS", "https://127.0.0.1:*");
     if spec.gpu {
         server_image = server_image.with_env_var("XORG_CONF", "/etc/X11/xorg-vkms.conf");
         server_image = server_image.with_mount(Mount::bind_mount("/dev/dri", "/dev/dri"));
