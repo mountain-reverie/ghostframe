@@ -6,6 +6,7 @@ build-release: build-web
     # features into the shipped binary (see ci/check-release-features.sh).
     cargo build --release -p ghostframe-xdaemon
     ci/check-release-features.sh
+    ci/check-release-binary.sh
 
 # --bins is not redundant: it is the only thing that runs the tests in binary
 # crates (ghostframe-xdaemon, codec_report). `--lib` skips them silently.
@@ -232,6 +233,7 @@ ci-local:
     cargo build --workspace --release --exclude ghostframe-e2e
     @echo "=== release daemon carries no test-only feature ==="
     if grep -aq 'software Vulkan permitted (test build)' target/release/ghostframe-xdaemon; then echo "release ghostframe-xdaemon contains the software-Vulkan test-build literal: a test-only feature leaked into a release build" >&2; exit 1; fi
+    ci/check-release-binary.sh
     @echo "=== cbindgen headers up-to-date ==="
     cargo check -p ghostframe-lib
     git diff --exit-code ghostframe-lib/include/ghostframe.h
