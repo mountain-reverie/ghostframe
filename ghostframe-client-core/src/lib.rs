@@ -456,10 +456,9 @@ impl ClientCore {
         }
         self.next_tail_sweep_us = now_us + TAIL_SWEEP_INTERVAL_US;
 
-        let mut keys: Vec<(u8, u8)> = self.cdf53_coverage.keys().copied().collect();
-        // Fixed order, not `HashMap`'s per-run one: it decides the order the
-        // NACKs go out in.
-        keys.sort_unstable_by_key(|&(x, y)| (y, x));
+        // No sort: `queue_pass_nack` inserts into a BTreeMap keyed
+        // (pass, y, x), which fixes the order the NACKs go out in.
+        let keys: Vec<(u8, u8)> = self.cdf53_coverage.keys().copied().collect();
         for key in keys {
             let (frame_seq, missing) = {
                 let entry = match self.cdf53_coverage.get(&key) {
