@@ -250,6 +250,20 @@ pub struct RunOptions {
 ///   decide what happens next, so same-seed runs differ by a few percent in
 ///   byte totals and the BWE trace, and a pass or fail is only a statement
 ///   about thresholds with slack.
+///   It also adds latency production does not have. A datagram crossing the
+///   socketpair wakes its reader through the reactor, and a reactor wake
+///   does not stop tokio's paused clock from auto-advancing to the next
+///   timer before the woken task runs (only a remote `unpark` does). So a
+///   hop can cost a jump of virtual time: on the 5 s rich scene of
+///   `browserless_determinism` (10 ms link) the server reads a client
+///   datagram a mean 5 ms late, p90 10 ms, up to ~50 ms; the handshake's
+///   first reply leaves at 100 ms instead of 10 ms; emit-to-ACK latency is
+///   45 ms against Stepped's 27.5 ms. The inflated RTT shrinks what the
+///   scene carries: about 1200 server datagrams against Stepped's 2091, and
+///   Stepped over a 15 ms link lands back near 1400. Read Concurrent's
+///   volumes as biased low and its latencies as biased high. Stepped serves
+///   a datagram at the instant it arrives, as the production loop does when
+///   idle, and is the reference for those numbers.
 ///
 /// Use `Stepped` for everything that asserts on what the server decides, and
 /// `Concurrent` only for a test whose subject is the loop's own concurrency.
