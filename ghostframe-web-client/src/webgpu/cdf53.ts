@@ -446,6 +446,17 @@ export class Cdf53Pipeline {
     return this.maxTiles;
   }
 
+  /** Host-side state of one tile, for failure diagnostics. */
+  debugTile(tileIdx: number): { gen: number; receivedMask: number; presentPasses: number; passesProcessed: number } | null {
+    if (tileIdx < 0 || tileIdx >= this.maxTiles) return null;
+    return {
+      gen: this.lastSeenGen[tileIdx],
+      receivedMask: this.receivedMaskCpu[tileIdx],
+      presentPasses: this.presentPassesCpu[tileIdx],
+      passesProcessed: this.passesProcessedCpu[tileIdx],
+    };
+  }
+
   // ---- Stubs filled by later tasks ----
   uploadBatch(entriesIn: readonly PrevalidatedCdf53[]): number {
     let entries = entriesIn;
