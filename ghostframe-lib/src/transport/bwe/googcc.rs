@@ -835,4 +835,49 @@ mod tests {
         );
         assert_eq!(snap.samples_seen, 1);
     }
+
+    /// Drive a long, application-limited stream (one 1200 B packet per 20 ms
+    /// of virtual time, far under the estimate) and log every probe request
+    /// with the virtual time at which it surfaced. Optionally stall the real
+    /// clock between steps.
+    fn alr_probe_log(stall: bool) -> Vec<(u64, i32, u64)> {
+        let t0 = Instant::now();
+        let mut d = GoogCcDriver::new(4_000_000, t0);
+        let mut log = Vec::new();
+        for step in 0..1_500u64 {
+            if stall && step % 100 == 0 {
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            let emit_us = step * 20_000;
+            let rec = AckArrival {
+                server_emit_us: emit_us,
+                client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
+                size_bytes: 1200,
+                probe: None,
+            };
+            d.update(&[rec], &[], t0 + Duration::from_millis(20 * step), 1200);
+            while let Some(p) = d.take_probe_request() {
+                log.push((20 * step, p.id, p.target_rate_bps));
+            }
+        }
+        log
+    }
+
+    /// goog_cc stamped the start of an application-limited region with the
+    /// wall clock and compared it with the caller's (virtual) time, so a
+    /// real-time stall moved the periodic ALR probes. The probe schedule must
+    /// be a function of the fed timestamps alone.
+    #[test]
+    fn alr_probing_is_independent_of_the_wall_clock() {
+        let quiet = alr_probe_log(false);
+        let stalled = alr_probe_log(true);
+        // Non-vacuous: the startup ladder alone is a few requests; periodic
+        // ALR probing (every few virtual seconds) adds requests well after.
+        assert!(
+            quiet.iter().any(|&(t_ms, _, _)| t_ms > 6_000),
+            "no ALR probe surfaced after startup, so the scenario never reached \
+             periodic ALR probing: {quiet:?}"
+        );
+        assert_eq!(quiet, stalled);
+    }
 }
