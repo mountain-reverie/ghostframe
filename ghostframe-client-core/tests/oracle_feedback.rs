@@ -37,7 +37,6 @@ fn loss_tracker_round_trip() {
     let fb = ReceiverFeedback::decode(&buf).expect("decode failed");
     assert_eq!(fb.timestamp_ns, 5_000_000_000);
     assert_eq!(fb.datagrams_received, 3);
-    assert_eq!(fb.datagrams_lost, 0);
     assert_eq!(fb.datagrams_recovered_fec, 1);
     assert!(!fb.suspension_detected);
 
@@ -45,7 +44,6 @@ fn loss_tracker_round_trip() {
     let buf2 = t.encode_feedback(6_000_000);
     let fb2 = ReceiverFeedback::decode(&buf2).expect("decode failed");
     assert_eq!(fb2.datagrams_received, 0);
-    assert_eq!(fb2.datagrams_lost, 0);
     assert_eq!(fb2.datagrams_recovered_fec, 0);
     assert!(!fb2.suspension_detected);
 }

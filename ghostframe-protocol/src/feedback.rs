@@ -14,6 +14,8 @@ pub const FEEDBACK_SIZE: usize = 22;
 pub struct ReceiverFeedback {
     pub timestamp_ns: u64,
     pub datagrams_received: u32,
+    /// Unused, always 0 since client tile reassembly was removed; loss is
+    /// measured at the sender. Kept on the wire pending its removal.
     pub datagrams_lost: u32,
     pub datagrams_recovered_fec: u32,
     pub suspension_detected: bool,

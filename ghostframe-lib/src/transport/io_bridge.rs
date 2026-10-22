@@ -1524,9 +1524,7 @@ impl IoBridge {
                     if let Some(fb) = ReceiverFeedback::decode(&buf[offset..]) {
                         tracing::debug!(
                             received = fb.datagrams_received,
-                            lost = fb.datagrams_lost,
                             recovered_fec = fb.datagrams_recovered_fec,
-                            loss_rate = %format!("{:.2}%", fb.loss_rate() * 100.0),
                             "receiver feedback"
                         );
                         self.ingest_feedback_for_adaptation(fb);

@@ -2209,7 +2209,6 @@ impl IoBridge {
                 quinn_queue_bytes_max = tp.max_queue_bytes,
                 // The client's own counts (summed `ReceiverFeedback`).
                 client_received = tp.client_received,
-                client_lost = tp.client_lost,
                 client_recovered_fec = tp.client_recovered,
                 // `emitter_` prefix so `e2e_ack_telemetry_no_waste`'s
                 // `ack_miss` log-line filter doesn't false-match this
