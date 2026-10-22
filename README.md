@@ -460,8 +460,10 @@ after `git clone`.
 # 1. Join the tailnet. Prints a URL to authorise the node in your browser.
 ghostframe login
 
-#    Or non-interactively, with a pre-auth key:
-ghostframe login --authkey tskey-auth-...
+#    Or non-interactively, with a pre-auth key read from stdin (never argv,
+#    where other local users can see it in /proc) or from a 0600 file:
+ghostframe login --authkey-stdin < key.txt
+ghostframe login --authkey-file ~/.config/ghostframe/authkey
 
 # 2. Connect to a ghostframe server by its tailnet hostname.
 ghostframe connect <hostname>-ghostframe

@@ -26,10 +26,16 @@ fn run() -> Result<(), CommandError> {
     let cli = Cli::parse();
     match cli.cmd {
         Command::Login {
-            authkey,
+            authkey_stdin,
+            authkey_file,
             login_server,
             hostname,
-        } => commands::login(authkey, login_server, hostname),
+        } => {
+            let authkey =
+                ghostframe_cli::cli::resolve_authkey(authkey_stdin, authkey_file.as_deref())
+                    .map_err(CommandError::Message)?;
+            commands::login(authkey, login_server, hostname)
+        }
         Command::Logout => commands::logout(),
         Command::Connect {
             host,
