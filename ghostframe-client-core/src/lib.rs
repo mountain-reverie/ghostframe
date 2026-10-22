@@ -334,7 +334,11 @@ impl ClientCore {
         if self.pending_nacks.is_empty() {
             return;
         }
-        let pending: Vec<PendingNack> = self.pending_nacks.drain().map(|(_, v)| v).collect();
+        let mut pending: Vec<PendingNack> = self.pending_nacks.drain().map(|(_, v)| v).collect();
+        // `HashMap` drains in an order that differs between runs of the same
+        // input. The order decides which NACKs share a datagram, so it would
+        // make a session's wire traffic unreproducible.
+        pending.sort_unstable_by_key(|p| (p.tile_y, p.tile_x, p.pass_idx));
         let mut queued = false;
         for p in pending {
             if let Some(cov) = self.cdf53_coverage.get(&(p.tile_x, p.tile_y)) {
@@ -444,7 +448,10 @@ impl ClientCore {
         }
         self.next_tail_sweep_us = now_us + TAIL_SWEEP_INTERVAL_US;
 
-        let keys: Vec<(u8, u8)> = self.cdf53_coverage.keys().copied().collect();
+        let mut keys: Vec<(u8, u8)> = self.cdf53_coverage.keys().copied().collect();
+        // Fixed order, not `HashMap`'s per-run one: it decides the order the
+        // NACKs go out in.
+        keys.sort_unstable_by_key(|&(x, y)| (y, x));
         for key in keys {
             let (frame_seq, missing) = {
                 let entry = match self.cdf53_coverage.get(&key) {
