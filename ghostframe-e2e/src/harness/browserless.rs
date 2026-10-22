@@ -264,6 +264,18 @@ pub struct RunOptions {
 ///   volumes as biased low and its latencies as biased high. Stepped serves
 ///   a datagram at the instant it arrives, as the production loop does when
 ///   idle, and is the reference for those numbers.
+///   In short: Concurrent adds about 5 ms per socket hop. tokio's paused
+///   clock auto-advances to the next timer on an I/O wake (tokio 1.52,
+///   `runtime/time/mod.rs` ~263-275), so it inflates RTT, and numbers
+///   recorded on master with the concurrent harness are inflated by it.
+///
+/// Stepped has its own, smaller bias. It makes per-turn CPU cost free (the
+/// virtual clock does not move while the bridge computes, unless
+/// `RunOptions::frame_cost` charges for it), it does not model the
+/// ghostbridge/WireGuard userspace hop, and it drains a big backlog
+/// instantly. In production the idle service delay is microseconds, so the
+/// bias is small, but it hides CPU-bound behaviour unless `frame_cost` is set.
+/// Re-baseline thresholds on Stepped (D1 PR-0).
 ///
 /// Use `Stepped` for everything that asserts on what the server decides, and
 /// `Concurrent` only for a test whose subject is the loop's own concurrency.
@@ -338,6 +350,9 @@ pub struct BrowserlessResult {
     /// Datagrams hashed into `wire_digest`; a premise that it is not hashing
     /// nothing.
     pub wire_datagrams: u64,
+    /// Bounded record of the datagrams behind `wire_digest`, for locating a
+    /// divergence between two runs.
+    pub wire_trace: WireTrace,
     pub s2c_loss_run_max: u64,
     /// Read from `FrameBuffer::stale_frame_tiles()` — a scene run only
     /// ever ingests via `FrameBuffer::apply_tile_ready` (real decoded
@@ -536,6 +551,114 @@ struct S2cLoss {
 struct WireDigest {
     hasher: std::collections::hash_map::DefaultHasher,
     datagrams: u64,
+    trace: WireTrace,
+    /// Verdict hash of the datagram being ruled (set by `offered`, folded
+    /// into its record by `ruled`).
+    window: std::collections::hash_map::DefaultHasher,
+}
+
+/// Datagrams whose raw record is kept for debugging a digest mismatch.
+pub const WIRE_TRACE_RECORDS: usize = 4096;
+/// Datagrams per window hash; the window hashes cover the whole run.
+pub const WIRE_TRACE_WINDOW: usize = 64;
+/// Cap on window hashes kept (64 * 65536 = 4M datagrams, 512 KiB).
+const WIRE_TRACE_MAX_WINDOWS: usize = 65536;
+
+/// One datagram offered to the netsim: direction (0 = c2s, 1 = s2c), offer
+/// instant, length, and a hash of the verdict (arrival instants and lengths).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WireRecord {
+    pub dir: u8,
+    pub t_us: u64,
+    pub len: usize,
+    pub verdict: u64,
+}
+
+/// Bounded evidence behind `wire_digest`: the first [`WIRE_TRACE_RECORDS`]
+/// records raw, plus a hash per [`WIRE_TRACE_WINDOW`] datagrams for the rest.
+/// Memory is bounded (~100 KiB of records, at most 512 KiB of windows).
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct WireTrace {
+    pub records: Vec<WireRecord>,
+    pub windows: Vec<u64>,
+}
+
+impl WireTrace {
+    /// Text form, one line per record then one per window, for a child
+    /// process to hand to its parent.
+    pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        for r in &self.records {
+            out.push_str(&format!("R {} {} {} {}\n", r.dir, r.t_us, r.len, r.verdict));
+        }
+        for w in &self.windows {
+            out.push_str(&format!("W {w}\n"));
+        }
+        out
+    }
+
+    pub fn from_text(text: &str) -> Self {
+        let mut t = WireTrace::default();
+        for l in text.lines() {
+            let f: Vec<&str> = l.split(' ').collect();
+            match f.as_slice() {
+                ["R", d, at, len, v] => t.records.push(WireRecord {
+                    dir: d.parse().unwrap(),
+                    t_us: at.parse().unwrap(),
+                    len: len.parse().unwrap(),
+                    verdict: v.parse().unwrap(),
+                }),
+                ["W", w] => t.windows.push(w.parse().unwrap()),
+                _ => {}
+            }
+        }
+        t
+    }
+
+    /// Describe the first divergence between two traces, with the records
+    /// around it; `None` if they agree on everything kept.
+    pub fn first_divergence(&self, other: &WireTrace) -> Option<String> {
+        let fmt = |r: Option<&WireRecord>| match r {
+            Some(r) => format!(
+                "{} t={}us len={} verdict={:016x}",
+                if r.dir == 0 { "c2s" } else { "s2c" },
+                r.t_us,
+                r.len,
+                r.verdict
+            ),
+            None => "<none>".to_string(),
+        };
+        let n = self.records.len().max(other.records.len());
+        let idx = (0..n).find(|&i| self.records.get(i) != other.records.get(i));
+        if let Some(i) = idx {
+            let lo = i.saturating_sub(3);
+            let mut out = format!(
+                "first divergent datagram: index {i}, a = [{}], b = [{}]\nrecords around it (a | b):\n",
+                fmt(self.records.get(i)),
+                fmt(other.records.get(i))
+            );
+            for j in lo..(i + 4).min(n) {
+                out.push_str(&format!(
+                    "  #{j}{} {} | {}\n",
+                    if j == i { " <--" } else { "" },
+                    fmt(self.records.get(j)),
+                    fmt(other.records.get(j))
+                ));
+            }
+            return Some(out);
+        }
+        let w = self.windows.len().max(other.windows.len());
+        (0..w)
+            .find(|&i| self.windows.get(i) != other.windows.get(i))
+            .map(|i| {
+                format!(
+                    "first divergent window: datagrams {}..{} (past the {} raw records kept)",
+                    i * WIRE_TRACE_WINDOW,
+                    (i + 1) * WIRE_TRACE_WINDOW,
+                    WIRE_TRACE_RECORDS
+                )
+            })
+    }
 }
 
 impl WireDigest {
@@ -545,18 +668,56 @@ impl WireDigest {
         self.hasher.write_u8(dir as u8);
         self.hasher.write_u64(now_us);
         self.hasher.write_usize(payload.len());
+        if self.trace.records.len() < WIRE_TRACE_RECORDS {
+            self.trace.records.push(WireRecord {
+                dir: dir as u8,
+                t_us: now_us,
+                len: payload.len(),
+                verdict: 0,
+            });
+        }
+        self.window.write_u8(dir as u8);
+        self.window.write_u64(now_us);
+        self.window.write_usize(payload.len());
     }
     fn ruled(&mut self, items: &[InFlight]) {
         use std::hash::Hasher;
         self.hasher.write_usize(items.len());
+        let mut v = std::collections::hash_map::DefaultHasher::new();
+        v.write_usize(items.len());
         for i in items {
             self.hasher.write_u64(i.at_us);
             self.hasher.write_usize(i.payload.len());
+            v.write_u64(i.at_us);
+            v.write_usize(i.payload.len());
         }
+        let v = v.finish();
+        let idx = self.datagrams as usize - 1;
+        if let Some(r) = self.trace.records.get_mut(idx) {
+            r.verdict = v;
+        }
+        self.window.write_u64(v);
+        if (self.datagrams as usize).is_multiple_of(WIRE_TRACE_WINDOW) {
+            self.close_window();
+        }
+    }
+    fn close_window(&mut self) {
+        use std::hash::Hasher;
+        if self.trace.windows.len() < WIRE_TRACE_MAX_WINDOWS {
+            self.trace.windows.push(self.window.finish());
+        }
+        self.window = Default::default();
     }
     fn finish(&self) -> u64 {
         use std::hash::Hasher;
         self.hasher.finish()
+    }
+    /// The trace, with the final partial window closed.
+    fn into_trace(mut self) -> WireTrace {
+        if !(self.datagrams as usize).is_multiple_of(WIRE_TRACE_WINDOW) {
+            self.close_window();
+        }
+        self.trace
     }
 }
 
@@ -925,6 +1086,7 @@ async fn run_inner(
         s2c_loss_runs: s2c_loss.runs,
         wire_digest: s2c_loss.wire.finish(),
         wire_datagrams: s2c_loss.wire.datagrams,
+        wire_trace: std::mem::take(&mut s2c_loss.wire).into_trace(),
         s2c_loss_run_max: s2c_loss.run_max,
         stale_generation_tiles,
         seed,
@@ -1857,5 +2019,60 @@ impl BridgeLink {
             LinkEnd::Pump(p) => p.recv().await,
             LinkEnd::Mem(_) => unreachable!("recv_one is concurrent-mode only"),
         }
+    }
+}
+
+#[cfg(test)]
+mod wire_trace_tests {
+    use super::*;
+
+    fn trace(n: usize, perturb: Option<(usize, usize)>) -> WireTrace {
+        let mut w = WireDigest::default();
+        for i in 0..n {
+            let len = match perturb {
+                Some((at, to)) if at == i => to,
+                _ => 100 + i % 7,
+            };
+            let dir = if i % 3 == 0 {
+                Direction::C2s
+            } else {
+                Direction::S2c
+            };
+            w.offered(dir, i as u64 * 1000, &vec![0u8; len]);
+            w.ruled(&[]);
+        }
+        w.into_trace()
+    }
+
+    #[test]
+    fn a_perturbed_datagram_is_named_by_index() {
+        let a = trace(300, None);
+        assert!(a.first_divergence(&trace(300, None)).is_none());
+        let b = trace(300, Some((137, 999)));
+        let report = a.first_divergence(&b).expect("must diverge");
+        assert!(report.contains("index 137"), "{report}");
+        assert!(report.contains("t=137000us"), "{report}");
+        assert!(report.contains("len=999"), "{report}");
+        // Survives the file round trip the child process uses.
+        let b2 = WireTrace::from_text(&b.to_text());
+        assert_eq!(b2, b);
+    }
+
+    #[test]
+    fn a_divergence_past_the_raw_records_names_its_window() {
+        let n = WIRE_TRACE_RECORDS + 500;
+        let at = WIRE_TRACE_RECORDS + 130;
+        let report = trace(n, None)
+            .first_divergence(&trace(n, Some((at, 5))))
+            .expect("must diverge");
+        let w = at / WIRE_TRACE_WINDOW * WIRE_TRACE_WINDOW;
+        assert!(report.contains(&format!("datagrams {w}..")), "{report}");
+    }
+
+    #[test]
+    fn memory_stays_bounded() {
+        let t = trace(WIRE_TRACE_RECORDS * 3, None);
+        assert_eq!(t.records.len(), WIRE_TRACE_RECORDS);
+        assert_eq!(t.windows.len(), WIRE_TRACE_RECORDS * 3 / WIRE_TRACE_WINDOW);
     }
 }
