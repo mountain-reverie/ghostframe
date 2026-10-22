@@ -40,7 +40,10 @@ function log(msg: string) {
 }
 
 async function main() {
-  installConsoleRing();
+  // Diagnostics that cost per-call work (console mirroring, per-tile tallies)
+  // run only for the e2e suite (`?e2e` on the page URL).
+  const diagnostics = new URL(window.location.href).searchParams.has('e2e');
+  if (diagnostics) installConsoleRing();
   // wasm-bindgen `--target web`: the module must be initialized before any
   // WasmClientCore construction. Awaited here rather than at module scope —
   // a top-level await fails the vite build for the configured target.
@@ -370,7 +373,9 @@ async function main() {
             renderer.pushSolid({ tileX: ev.tile_x, tileY: ev.tile_y, frameSeq: ev.frame_seq, bgra: d.bytes });
             sampleBytes = d.bytes;
             if (d.bytes[2] > 0x80) health.mark(ev.tile_x, ev.tile_y, ev.frame_seq, 'solid-red');
-            health.tally(`solid:${Array.from(d.bytes).map((b) => b.toString(16).padStart(2, '0')).join('')}`);
+            if (diagnostics) {
+              health.tally(`solid:${Array.from(d.bytes).map((b) => b.toString(16).padStart(2, '0')).join('')}`);
+            }
             break;
           case 'PalRle':
             renderer.pushPalRle({
