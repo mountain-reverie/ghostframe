@@ -5652,7 +5652,7 @@ async fn e2e_lossless_golden_png() -> Result<()> {
             ("GHOSTFRAME_DRM_MODE", &drm_mode),
             ("CAPTURE_FPS_DRM_DIRECT", "2"),
         ],
-        "&e2e=lossless&debug",
+        "&e2e=lossless",
     )
     .await?;
 
