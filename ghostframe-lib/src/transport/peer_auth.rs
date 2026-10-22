@@ -464,8 +464,6 @@ pub enum Recheck {
     LookupFailed,
     /// A background lookup was queued; the answer arrives later.
     Pending,
-    /// No room for a lookup right now; try again shortly.
-    Busy,
 }
 
 impl Recheck {
@@ -489,8 +487,6 @@ pub(crate) const MIN_RECHECK_SECS: u64 = 1;
 pub(crate) const MAX_RECHECK_SECS: u64 = 24 * 60 * 60;
 /// After a failed lookup, when to ask once more before giving up on a session.
 pub(crate) const RECHECK_RETRY_DELAY: Duration = Duration::from_secs(5);
-/// After [`Recheck::Busy`], when to try again.
-pub(crate) const RECHECK_BUSY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 struct RecheckEntry {
@@ -537,17 +533,23 @@ impl<K: Copy + Eq + std::hash::Hash> SessionRechecker<K> {
         let live: HashMap<K, IpAddr> = live.into_iter().collect();
         self.entries.retain(|k, _| live.contains_key(k));
         for (k, ip) in live {
-            // A key whose address changed is a different session that reused
-            // the key (quinn recycles connection handles): start it afresh.
-            if self.entries.get(&k).is_some_and(|e| e.ip != ip) {
-                self.entries.remove(&k);
-            }
-            self.entries.entry(k).or_insert(RecheckEntry {
-                ip,
-                next_at: now + self.interval,
-                failed_once: false,
-            });
+            self.track(k, ip, now);
         }
+    }
+
+    /// Start tracking one session, its first re-check one interval from
+    /// `now`. A key already tracked for the same address keeps its schedule.
+    pub fn track(&mut self, k: K, ip: IpAddr, now: Instant) {
+        // A key whose address changed is a different session that reused
+        // the key (quinn recycles connection handles): start it afresh.
+        if self.entries.get(&k).is_some_and(|e| e.ip != ip) {
+            self.entries.remove(&k);
+        }
+        self.entries.entry(k).or_insert(RecheckEntry {
+            ip,
+            next_at: now + self.interval,
+            failed_once: false,
+        });
     }
 
     pub fn forget(&mut self, k: &K) {
@@ -586,7 +588,6 @@ impl<K: Copy + Eq + std::hash::Hash> SessionRechecker<K> {
                     // ask again; if it never does, ask again next interval.
                     self.set_next(&k, now + self.interval);
                 }
-                Recheck::Busy => self.set_next(&k, now + RECHECK_BUSY_DELAY),
                 outcome @ (Recheck::Allowed | Recheck::Revoked | Recheck::LookupFailed) => {
                     if self.apply_outcome(&k, outcome, now) {
                         close.push(k);
@@ -639,7 +640,7 @@ impl<K: Copy + Eq + std::hash::Hash> SessionRechecker<K> {
                 true
             }
             // Not answers; callers never pass them.
-            Recheck::Pending | Recheck::Busy => false,
+            Recheck::Pending => false,
         }
     }
 }
@@ -667,7 +668,17 @@ pub struct PeerGate {
     cache: DecisionCache,
     in_flight: HashSet<IpAddr>,
     requested: Vec<IpAddr>,
+    /// Counts lookup starts and re-check invalidations, to order them.
+    clock: u64,
+    /// Per address, the `clock` value of its latest re-check. A lookup
+    /// stamped at or before it began before the re-check invalidated the
+    /// address, and cannot answer it. Entries expire after
+    /// [`RECHECK_FLOOR_KEEP`], by when any such lookup has timed out.
+    recheck_floor: HashMap<IpAddr, (u64, Instant)>,
 }
+
+/// How long a re-check's floor is remembered; longer than a lookup can run.
+const RECHECK_FLOOR_KEEP: Duration = Duration::from_secs(30);
 
 impl std::fmt::Debug for PeerGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -691,6 +702,8 @@ impl PeerGate {
             cache: DecisionCache::default(),
             in_flight: HashSet::new(),
             requested: Vec::new(),
+            clock: 0,
+            recheck_floor: HashMap::new(),
         }
     }
 
@@ -706,6 +719,8 @@ impl PeerGate {
             cache: DecisionCache::default(),
             in_flight: HashSet::new(),
             requested: Vec::new(),
+            clock: 0,
+            recheck_floor: HashMap::new(),
         }
     }
 
@@ -783,7 +798,31 @@ impl PeerGate {
 
     /// Lookups to start, oldest first. Each IP appears once until resolved.
     pub fn take_requests(&mut self) -> Vec<IpAddr> {
+        self.take_stamped_requests()
+            .into_iter()
+            .map(|(ip, _)| ip)
+            .collect()
+    }
+
+    /// [`Self::take_requests`], each with the stamp of its start. Hand the
+    /// stamp back to [`Self::is_stale`] with the answer.
+    pub fn take_stamped_requests(&mut self) -> Vec<(IpAddr, u64)> {
         std::mem::take(&mut self.requested)
+            .into_iter()
+            .map(|ip| {
+                self.clock += 1;
+                (ip, self.clock)
+            })
+            .collect()
+    }
+
+    /// Whether an answer for `ip` from the lookup stamped `stamp` began
+    /// before the latest re-check of `ip` and so must be discarded: it may
+    /// predate a revocation. A fresh lookup is already on its way.
+    pub fn is_stale(&self, ip: IpAddr, stamp: u64) -> bool {
+        self.recheck_floor
+            .get(&ip)
+            .is_some_and(|(floor, _)| stamp <= *floor)
     }
 
     /// Whether a lookup for `ip` is outstanding.
@@ -830,13 +869,21 @@ impl PeerGate {
             let lookup = source.lookup(ip);
             return Recheck::from_decision(&self.resolve_decision(ip, &lookup, now));
         }
-        // Nothing is held for a re-check, so there is always room to hold.
-        match self.check(ip, now, true) {
-            GateCheck::Allow => Recheck::Allowed,
-            GateCheck::Deny => Recheck::Revoked,
-            GateCheck::Pending => Recheck::Pending,
-            GateCheck::Busy => Recheck::Busy,
+        // A re-check lookup is queued whatever the new-connection queue holds:
+        // it is bounded by the live sessions, and a revocation must not be
+        // starved by other peers filling `MAX_LOOKUPS_IN_FLIGHT`.
+        self.clock += 1;
+        self.recheck_floor
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) < RECHECK_FLOOR_KEEP);
+        self.recheck_floor.insert(ip, (self.clock, now));
+        // A lookup already in flight began before this invalidation (one
+        // still waiting in `requested` has not begun and is fresh), so it
+        // cannot answer; start another.
+        if !self.requested.contains(&ip) {
+            self.in_flight.insert(ip);
+            self.requested.push(ip);
         }
+        Recheck::Pending
     }
 }
 
@@ -1546,6 +1593,111 @@ mod tests {
         let t1 = t0 + Duration::from_secs(50);
         r.sync([(1u32, other)], t1);
         assert_eq!(r.next_due(), Some(t1 + IV));
+    }
+
+    // A revoked session must not wait for the new-connection queue to drain:
+    // other peers keeping it full used to leave the re-check `Busy` forever.
+    #[test]
+    fn recheck_is_queued_even_when_new_connection_lookups_are_saturated() {
+        let t0 = Instant::now();
+        let (mut gate, src) = switch_gate(false);
+        let mut r = SessionRechecker::new(IV);
+        r.sync([(1u32, peer_ip())], t0);
+        for i in 0..MAX_LOOKUPS_IN_FLIGHT as u32 {
+            let ip = IpAddr::from([100, 65, 0, i as u8 + 1]);
+            assert_eq!(gate.check(ip, t0, true), GateCheck::Pending);
+        }
+        assert_eq!(
+            gate.check("100.65.1.1".parse().unwrap(), t0, true),
+            GateCheck::Busy,
+            "the new-connection queue is full"
+        );
+        gate.take_requests();
+
+        let due = t0 + IV;
+        assert!(r.run_due(&mut gate, due).is_empty());
+        let reqs = gate.take_stamped_requests();
+        assert_eq!(reqs.len(), 1, "the re-check got its lookup");
+        assert_eq!(reqs[0].0, peer_ip());
+        assert_eq!(r.next_due(), Some(due + IV), "not retried in a second loop");
+
+        src.set(stranger());
+        assert!(!gate.is_stale(peer_ip(), reqs[0].1));
+        let d = gate.resolve_decision(peer_ip(), &src.lookup(peer_ip()), due);
+        assert_eq!(r.apply(peer_ip(), &d, due), vec![1]);
+    }
+
+    // The re-check queues are bounded by the sessions being checked.
+    #[test]
+    fn rechecks_queue_at_most_one_lookup_per_address() {
+        let t0 = Instant::now();
+        let (mut gate, _src) = switch_gate(false);
+        for _ in 0..50 {
+            assert_eq!(gate.recheck(peer_ip(), t0), Recheck::Pending);
+        }
+        assert_eq!(gate.take_requests(), vec![peer_ip()]);
+    }
+
+    // A lookup that was already running when access was revoked can answer
+    // "allowed" from before the revocation. It must not extend the session.
+    #[test]
+    fn a_lookup_started_before_the_recheck_cannot_answer_it() {
+        let t0 = Instant::now();
+        let (mut gate, src) = switch_gate(false);
+        // A new connection's lookup starts and is running.
+        assert_eq!(gate.check(peer_ip(), t0, true), GateCheck::Pending);
+        let old = gate.take_stamped_requests();
+        assert_eq!(old.len(), 1);
+
+        // The re-check comes due meanwhile: it must start its own lookup.
+        assert_eq!(
+            gate.recheck(peer_ip(), t0 + Duration::from_secs(1)),
+            Recheck::Pending
+        );
+        let fresh = gate.take_stamped_requests();
+        assert_eq!(fresh.len(), 1, "a fresh lookup is issued");
+        assert!(gate.is_stale(peer_ip(), old[0].1), "the old one is stale");
+        assert!(!gate.is_stale(peer_ip(), fresh[0].1));
+        let _ = src;
+    }
+
+    // A lookup still waiting in the queue has not begun, so it is fresh.
+    #[test]
+    fn a_lookup_not_yet_started_answers_the_recheck() {
+        let t0 = Instant::now();
+        let (mut gate, _src) = switch_gate(false);
+        assert_eq!(gate.check(peer_ip(), t0, true), GateCheck::Pending);
+        assert_eq!(gate.recheck(peer_ip(), t0), Recheck::Pending);
+        let reqs = gate.take_stamped_requests();
+        assert_eq!(reqs.len(), 1);
+        assert!(!gate.is_stale(peer_ip(), reqs[0].1));
+    }
+
+    #[test]
+    fn recheck_floors_expire() {
+        let t0 = Instant::now();
+        let (mut gate, _src) = switch_gate(false);
+        gate.recheck(peer_ip(), t0);
+        let other: IpAddr = "100.64.0.9".parse().unwrap();
+        gate.recheck(other, t0 + RECHECK_FLOOR_KEEP + Duration::from_secs(1));
+        assert_eq!(gate.recheck_floor.len(), 1, "the old floor was pruned");
+    }
+
+    #[test]
+    fn track_keeps_a_schedule_and_restarts_a_reused_key() {
+        let t0 = Instant::now();
+        let other: IpAddr = "100.64.0.3".parse().unwrap();
+        let mut r = SessionRechecker::new(IV);
+        r.track(1u32, peer_ip(), t0);
+        assert_eq!(r.next_due(), Some(t0 + IV));
+        // Tracked again at the same address: the schedule stays.
+        r.track(1u32, peer_ip(), t0 + Duration::from_secs(10));
+        assert_eq!(r.next_due(), Some(t0 + IV));
+        // The key now names another address: a different session.
+        let t1 = t0 + Duration::from_secs(20);
+        r.track(1u32, other, t1);
+        assert_eq!(r.next_due(), Some(t1 + IV));
+        assert_eq!(r.len(), 1);
     }
 
     #[test]
