@@ -32,9 +32,9 @@ pub struct TransportProbe {
     /// Number of readings taken; zero means nothing below was ever measured.
     pub samples: u64,
     /// Sums of the client's `ReceiverFeedback` (cumulative). `client_recovered`
-    /// is the datagrams it rebuilt from FEC parity.
+    /// is the datagrams it rebuilt from FEC parity. (`datagrams_lost` is
+    /// not summed: it is always 0.)
     pub client_received: u64,
-    pub client_lost: u64,
     pub client_recovered: u64,
 }
 
@@ -67,7 +67,6 @@ impl IoBridge {
     ) {
         let p = &mut self.transport_probe;
         p.client_received += u64::from(fb.datagrams_received);
-        p.client_lost += u64::from(fb.datagrams_lost);
         p.client_recovered += u64::from(fb.datagrams_recovered_fec);
     }
 }

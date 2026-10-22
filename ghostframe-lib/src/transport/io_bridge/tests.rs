@@ -815,7 +815,7 @@ async fn dispatch_feedback_updates_adaptation_context() {
     let fb = crate::transport::feedback::ReceiverFeedback {
         timestamp_ns: 1_000_000,
         datagrams_received: 800,
-        datagrams_lost: 200,
+        datagrams_lost: 0,
         datagrams_recovered_fec: 0,
         suspension_detected: true,
     };
