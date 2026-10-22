@@ -226,9 +226,7 @@ impl AccessPolicy {
             tracing::warn!(
                 entry = %bad,
                 "ignoring malformed access setting (GHOSTFRAME_ALLOWED_USERS takes login \
-                 names like alice@example.com and tags like tag:ops; \
-                 GHOSTFRAME_ACCESS_RECHECK_SECS takes whole seconds, 1 to 86400, and the \
-                 default applies)"
+                 names like alice@example.com and tags like tag:ops)"
             );
         }
         tracing::info!(
