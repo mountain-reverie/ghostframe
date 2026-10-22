@@ -1777,17 +1777,16 @@ async fn e2e_static_mixed_codecs_converge_on_a_shaped_link() -> Result<()> {
 ///    every one of them is accounted for.
 /// 3. **It converges.** Every Cdf53 tile reaches its full pass set, nothing
 ///    gives up, and the pass and tile counts are non-zero.
-/// 4. **The pixels are right**: the solid quadrant is red.
+/// 4. **The pixels are right**: a gradient pixel matches its formula.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_a_4k_screen_runs_on_the_gpu_path_and_converges() -> Result<()> {
     let setup = setup_e2e_webgpu_gpu_with_env(
-        "--mixed-static",
+        "--gradient --drm-direct",
         &[
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
             ("GHOSTFRAME_FORCE_TILECODEC", "1"),
             // 4096x2160: 128 x 68 = 8704 tiles, over the old 4096 ceiling.
-            // VKMS advertises this mode; the pattern is painted in the corner
-            // and the rest of the screen is flat.
+            // VKMS advertises this mode; the gradient fills the whole screen.
             ("GHOSTFRAME_DRM_MODE", "4096x2160"),
         ],
     )
@@ -1893,16 +1892,24 @@ async fn e2e_a_4k_screen_runs_on_the_gpu_path_and_converges() -> Result<()> {
     );
     eprintln!("4K: {dispatched} dispatches, {complete}/{tiles} cdf53 tiles complete");
 
-    // (4) The pixels: the solid quadrant is red after convergence.
-    let solid_px: Vec<u8> = setup
+    // (4) The pixels: the gradient is r = 2(x+y), g = 3y, b = 3x (mod 256),
+    // and the web client's framebuffer maps 1:1 at the origin. After
+    // convergence a pixel off the origin must match it.
+    let (x, y) = (160u32, 120u32);
+    let expected = [
+        ((x + y) * 2 % 256) as i32,
+        (y * 3 % 256) as i32,
+        (x * 3 % 256) as i32,
+    ];
+    let px: Vec<u8> = setup
         .page()
-        .evaluate("window.__readPixelRect(160, 120, 1, 1)")
+        .evaluate(format!("window.__readPixelRect({x}, {y}, 1, 1)"))
         .await?
         .into_value()?;
     assert!(
-        solid_px.len() >= 3 && solid_px[0] > 200 && solid_px[1] < 60 && solid_px[2] < 60,
-        "the solid quadrant should be red, read {:?}",
-        &solid_px[..3.min(solid_px.len())]
+        px.len() >= 3 && (0..3).all(|i| (px[i] as i32 - expected[i]).abs() <= 2),
+        "gradient pixel ({x},{y}) should be {expected:?}, read {:?}",
+        &px[..3.min(px.len())]
     );
     Ok(())
 }
