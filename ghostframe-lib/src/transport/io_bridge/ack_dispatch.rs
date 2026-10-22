@@ -222,8 +222,7 @@ impl IoBridge {
                     .reliable_emitter
                     .cache
                     .get(k)
-                    .and_then(|e| e.fragments.first())
-                    .and_then(|f| f.get(18).copied())
+                    .and_then(|e| e.datagram.get(18).copied())
                     .map(|b| b >> 1)
                     .unwrap_or(255);
                 eprintln!(
@@ -390,10 +389,8 @@ impl IoBridge {
 
     /// Route an inbound TILE_NACK envelope (discriminator `0x05`) into the
     /// reliable-tile emitter's `on_nack`. The wire-level NACK entry carries
-    /// `(frame_seq, tile_x, tile_y, pass_idx, frag_idx)`; the first four
-    /// reconstruct the `EmitKey` that uniquely identifies the cached
-    /// fragment(s) for one tile-pass, and `frag_idx` selects which fragment
-    /// inside that key to re-emit. Malformed envelopes are silently dropped
+    /// `(frame_seq, tile_x, tile_y, pass_idx)`, which is the `EmitKey` of the
+    /// cached datagram for one tile-pass (a pass is exactly one datagram). Malformed envelopes are silently dropped
     /// (forward-compatible, mirrors `dispatch_ack_datagram`).
     pub(crate) fn dispatch_tile_nack_datagram(&mut self, data: &[u8]) {
         #[cfg(any(test, feature = "test-loss-injection"))]
@@ -406,18 +403,15 @@ impl IoBridge {
         let Ok(env) = TileNackEnvelope::decode(data) else {
             return;
         };
-        let entries: Vec<(crate::transport::reliable_emitter::EmitKey, u8)> = env
+        let entries: Vec<crate::transport::reliable_emitter::EmitKey> = env
             .entries
             .into_iter()
             .map(|e| {
-                (
-                    crate::transport::reliable_emitter::EmitKey::new(
-                        e.frame_seq,
-                        e.tile_x,
-                        e.tile_y,
-                        e.pass_idx,
-                    ),
-                    e.frag_idx,
+                crate::transport::reliable_emitter::EmitKey::new(
+                    e.frame_seq,
+                    e.tile_x,
+                    e.tile_y,
+                    e.pass_idx,
                 )
             })
             .collect();

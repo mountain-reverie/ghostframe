@@ -1723,7 +1723,6 @@ async fn tile_nack_routes_to_emitter() {
             tile_x: 0,
             tile_y: 0,
             pass_idx: 0,
-            frag_idx: 0,
         }],
     };
     let mut buf = Vec::new();
@@ -5035,7 +5034,6 @@ async fn gate_nack_datagram_only_from_the_live_session() {
             tile_x: 0,
             tile_y: 0,
             pass_idx: 0,
-            frag_idx: 0,
         }],
     }
     .encode(&mut dg);

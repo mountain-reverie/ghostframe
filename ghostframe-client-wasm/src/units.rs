@@ -147,7 +147,6 @@ impl WasmNackBatcher {
         tile_x: u8,
         tile_y: u8,
         pass_idx: u8,
-        frag_idx: u8,
         now_us: u64,
     ) -> Option<Vec<u8>> {
         self.inner.add(
@@ -156,7 +155,6 @@ impl WasmNackBatcher {
                 tile_x,
                 tile_y,
                 pass_idx,
-                frag_idx,
             },
             now_us,
         )

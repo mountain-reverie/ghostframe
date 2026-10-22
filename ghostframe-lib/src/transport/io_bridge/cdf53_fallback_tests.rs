@@ -74,8 +74,7 @@ fn decode_from_scheduler(b: &IoBridge, tx: u8, ty: u8) -> Vec<u8> {
     for p in 0..cdf53::CDF53_PASS_COUNT as u8 {
         let key = EmitKey::new(1 | TILE_DATAGRAM_FLAG, tx, ty, p);
         if let Some(e) = b.reliable_emitter.cache.get(&key) {
-            assert_eq!(e.fragments.len(), 1, "a pass fits one datagram");
-            sent.push((p, e.fragments[0][24..].to_vec()));
+            sent.push((p, e.datagram[24..].to_vec()));
         }
     }
     assert!(!sent.is_empty(), "no Cdf53 pass was sent for ({tx},{ty})");

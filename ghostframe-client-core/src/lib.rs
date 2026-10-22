@@ -360,7 +360,6 @@ impl ClientCore {
                 tile_x: p.tile_x,
                 tile_y: p.tile_y,
                 pass_idx: p.pass_idx,
-                frag_idx: 0,
             };
             if let Some(dg) = self.nack_batcher.add(entry, now_us) {
                 self.outbox.push_back(PollOutput::Datagram(dg));
@@ -567,7 +566,7 @@ mod nack_order_tests {
                 if d.first() != Some(&0x05) {
                     continue;
                 }
-                for e in d[2..].chunks_exact(8) {
+                for e in d[2..].chunks_exact(ghostframe_protocol::protocol::TILE_NACK_ENTRY_SIZE) {
                     // (pass_idx, tile_y, tile_x)
                     out.push((e[6], e[5], e[4]));
                 }

@@ -1,4 +1,4 @@
-//! Per-session retransmit cache. Holds emitted fragments by EmitKey for
+//! Per-session retransmit cache. Holds the emitted datagram of each tile pass by EmitKey for
 //! re-emission on RTO / NACK. Unbounded — entries live until ACKed,
 //! superseded via `cancel_for_tile`, or the session ends via `clear`.
 
@@ -38,8 +38,9 @@ pub struct ProbeTag {
 
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
-    pub fragments: SmallVec<[Bytes; 2]>,
-    pub wire_seqs: SmallVec<[u32; 2]>,
+    /// The pass's one datagram, as first emitted (stamps are rewritten on
+    /// retransmit).
+    pub datagram: Bytes,
     /// When the underlying `TileWork` became available to the scheduler
     /// (`TileWork::queued_at`), copied through unchanged across
     /// retransmits (unlike `last_sent_at`) — it's the start point for
@@ -126,7 +127,7 @@ impl RetransmitCache {
     /// Total wire bytes held across all unACKed entries.
     ///
     /// This is the session's in-flight data: an entry lives here from the
-    /// moment its fragments go out until the ACK arrives (or the tile is
+    /// moment its datagram goes out until the ACK arrives (or the tile is
     /// cancelled/superseded). goog_cc's congestion-window pushback reads the
     /// equivalent number as `TransportPacketsFeedback::data_in_flight`, and
     /// fed zero it has nothing to push back against.
@@ -135,7 +136,7 @@ impl RetransmitCache {
     }
 
     fn entry_bytes(entry: &CacheEntry) -> usize {
-        entry.fragments.iter().map(|f| f.len()).sum()
+        entry.datagram.len()
     }
 
     /// Take `key` out of every index and return its entry. The one place an
@@ -287,12 +288,10 @@ impl RetransmitCache {
 mod tests {
     use super::*;
     use crate::transport::reliable_emitter::CACHE_CAPACITY;
-    use smallvec::smallvec;
 
     fn mk_entry(now: Instant) -> CacheEntry {
         CacheEntry {
-            fragments: smallvec![Bytes::from(vec![1, 2, 3])],
-            wire_seqs: smallvec![0],
+            datagram: Bytes::from(vec![1, 2, 3]),
             queued_at: now,
             first_sent_at: now,
             last_sent_at: now,
@@ -308,7 +307,7 @@ mod tests {
     /// hardcoded — leaves the controller's congestion-window pushback with
     /// nothing to act on, so it silently never engages.
     #[test]
-    fn bytes_outstanding_counts_unacked_fragments_and_drains_on_ack() {
+    fn bytes_outstanding_counts_unacked_datagrams_and_drains_on_ack() {
         let mut c = RetransmitCache::new();
         let now = Instant::now();
         assert_eq!(c.bytes_outstanding(), 0, "an empty cache holds nothing");
@@ -320,16 +319,15 @@ mod tests {
         assert_eq!(
             c.bytes_outstanding(),
             6,
-            "both entries' fragments are in flight"
+            "both entries' datagrams are in flight"
         );
 
-        // A multi-fragment entry must count every fragment, not just the first.
+        // A larger datagram counts in full.
         let k3 = EmitKey::new(2, 0, 0, 0);
         c.insert(
             k3,
             CacheEntry {
-                fragments: smallvec![Bytes::from(vec![0; 10]), Bytes::from(vec![0; 5])],
-                wire_seqs: smallvec![1, 2],
+                datagram: Bytes::from(vec![0; 15]),
                 ..mk_entry(now)
             },
         );
