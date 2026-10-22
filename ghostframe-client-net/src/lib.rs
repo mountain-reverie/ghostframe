@@ -91,7 +91,7 @@ pub struct ClientNet {
     feedback_stream: Option<StreamId>,
     endpoint: ClientEndpoint,
     handshake: WebTransportHandshake,
-    /// Sans-IO tile reassembly/decode state machine. Datagram payloads
+    /// Sans-IO tile decode / H.264 frame reassembly state machine. Datagram payloads
     /// (quarter-stream-id prefix already stripped) go in via
     /// `handle_datagram`; `TileReady`/`DecodeError`/... come back out as
     /// `ClientNetEvent::Core`. See `drain_connection_events` for the wiring.
@@ -121,8 +121,8 @@ impl ClientNet {
         self
     }
 
-    /// `now_us` seeds `ClientCore`'s internal deadlines (assembly timeout,
-    /// tail sweep, feedback cadence — see `ClientCore::new`); it is
+    /// `now_us` seeds `ClientCore`'s internal deadlines (tail sweep,
+    /// feedback cadence — see `ClientCore::new`); it is
     /// otherwise unused here (there is nothing else to schedule before
     /// `connect`), but is accepted for symmetry with the rest of this
     /// crate's injected-time API and so a future revision can seed other

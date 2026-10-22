@@ -29,10 +29,6 @@ impl<K: PartialEq, V> OrderedMap<K, V> {
         Self::default()
     }
 
-    pub fn get(&self, key: &K) -> Option<&V> {
-        self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
-    }
-
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         self.entries
             .iter_mut()

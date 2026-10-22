@@ -12,19 +12,16 @@
 
 use ghostframe_protocol::ack::AckEntry;
 use ghostframe_protocol::protocol::{
-    decode_tile_datagram, is_tile_datagram, Codec, TileParityEnvelope, DATAGRAM_HEADER_SIZE,
-    FRAME_DIMENSIONS_SENTINEL_X, FRAME_DIMENSIONS_SENTINEL_Y, TILE_DATAGRAM_FLAG, TILE_HEADER_SIZE,
-    TILE_PARITY_ENVELOPE,
+    decode_tile_datagram, is_tile_datagram, Codec, TileHeader, TileParityEnvelope,
+    DATAGRAM_HEADER_SIZE, FRAME_DIMENSIONS_SENTINEL_X, FRAME_DIMENSIONS_SENTINEL_Y,
+    TILE_DATAGRAM_FLAG, TILE_HEADER_SIZE, TILE_PARITY_ENVELOPE,
 };
 
 use crate::cdf53_coverage::apply_cdf53_arrival;
 use crate::cdf53_prevalidate::prevalidate_cdf53;
-use crate::event::{Event, PollOutput, TileData, TileKey};
+use crate::event::{Event, PollOutput, TileData};
 use crate::pal_rle_decode::{decode_pal_rle_tile, prevalidate_pal_rle};
-use crate::{
-    Assembly, ClientCore, TileDelivery, MAX_ASSEMBLY_BYTES, MAX_FRAME_DIMENSION,
-    MAX_LIVE_ASSEMBLIES,
-};
+use crate::{ClientCore, TileDelivery, MAX_FRAME_DIMENSION};
 use ghostframe_protocol::tile::TILE_SIZE;
 
 /// Minimum bytes that carry a full tile header stack.
@@ -53,43 +50,8 @@ impl ClientCore {
         }
     }
 
-    /// Whether storing this fragment fits the shared assembly budget.
-    ///
-    /// A new assembly pays its fixed and per-slot cost up front and counts
-    /// against `MAX_LIVE_ASSEMBLIES`; every stored fragment pays for its
-    /// bytes. Over budget the datagram is refused, not an older assembly: a
-    /// server that pins `frame_seq` and fans out keys must not be able to push
-    /// out real work, and the stale-frame sweep reclaims anything legitimate.
-    fn budget_admits(&self, key: &TileKey, frag_idx: u16, frag_total: u16, len: usize) -> bool {
-        match self.assemblies.get(key) {
-            None => {
-                self.assemblies.len() < MAX_LIVE_ASSEMBLIES
-                    && self.assembly_bytes + Assembly::base_cost(frag_total) + len
-                        <= MAX_ASSEMBLY_BYTES
-            }
-            Some(a) => {
-                let free = a
-                    .fragments
-                    .get(frag_idx as usize)
-                    .map(|f| f.is_none())
-                    .unwrap_or(false);
-                !free || self.assembly_bytes + len <= MAX_ASSEMBLY_BYTES
-            }
-        }
-    }
-
     /// Drop everything keyed to tiles that a new grid no longer contains.
     fn purge_outside_grid(&mut self) {
-        let off: Vec<TileKey> = self
-            .assemblies
-            .keys()
-            .filter(|k| !self.tile_in_grid(k.tile_x, k.tile_y))
-            .copied()
-            .collect();
-        for k in off {
-            self.remove_assembly(&k);
-            self.fragment_parity.remove(&k);
-        }
         let dims = self.frame_dims;
         let inside = |x: u8, y: u8| match dims {
             Some((w, h)) => {
@@ -238,26 +200,11 @@ impl ClientCore {
         // yet) is then retransmitted rather than counted delivered.
         //
         // A tile pass is one datagram (no payload exceeds `MAX_TILE_PAYLOAD`),
-        // so a tile claiming any other fragment count is hostile or from a
-        // server that no longer exists: refused, never stored.
-        if !is_sentinel && (dh.frag_total != 1 || !self.tile_in_grid(th.tile_x, th.tile_y)) {
-            return;
-        }
-
-        let key = TileKey {
-            frame_seq,
-            tile_x: th.tile_x,
-            tile_y: th.tile_y,
-            pass_idx: th.pass,
-        };
-
-        // Budget check, also before the ACK and for the same reason: a
-        // fragment dropped for lack of budget must be retransmitted, not
-        // reported delivered. Applies only to fragments that would be stored.
+        // so a tile claiming any other fragment count, or any index but the
+        // first, is hostile or from a server that no longer exists: refused,
+        // never stored.
         if !is_sentinel
-            && dh.frag_idx < dh.frag_total
-            && th.codec != Codec::Skip
-            && !self.budget_admits(&key, dh.frag_idx, dh.frag_total, payload.len())
+            && (dh.frag_total != 1 || dh.frag_idx != 0 || !self.tile_in_grid(th.tile_x, th.tile_y))
         {
             return;
         }
@@ -291,71 +238,9 @@ impl ClientCore {
             self.latest_frame_seq = frame_seq;
         }
 
-        // Evict stale assemblies: frame_seq < latest_frame_seq - 2
-        // (saturating to avoid underflow when latest < 2). main.ts:1160-1177.
-        let threshold = self.latest_frame_seq.saturating_sub(2);
-        //
-        // Only when something can be stale: the threshold moved, or an entry
-        // was stored below it last datagram. Otherwise every key already
-        // satisfies `frame_seq >= threshold` and the scan finds nothing; it
-        // used to run, O(live assemblies), on every datagram.
-        if threshold != self.swept_threshold || self.stale_pending {
-            self.swept_threshold = threshold;
-            self.stale_pending = false;
-            let stale: Vec<TileKey> = self
-                .assemblies
-                .keys()
-                .filter(|k| k.frame_seq < threshold)
-                .copied()
-                .collect();
-            self.fragment_parity.evict_older_than(threshold);
-            for k in stale {
-                if let Some(asm) = self.remove_assembly(&k) {
-                    if asm.received < asm.fragments.len() {
-                        self.loss_tracker
-                            .on_stale_tile(asm.fragments.len(), asm.received);
-                    }
-                }
-                self.fragment_parity.remove(&k);
-            }
-        }
-        // Anything stored from here on that is already below the threshold
-        // must be swept by the next datagram, as the unconditional sweep did.
-        if frame_seq < threshold {
-            self.stale_pending = true;
-        }
-
-        // Legacy fragment-level parity (frag_idx >= frag_total). main.ts:1181-1209.
-        if !is_sentinel && dh.frag_idx >= dh.frag_total {
-            self.fragment_parity.store(key, payload);
-            let want_recover = self
-                .assemblies
-                .get(&key)
-                .map(|asm| !asm.fragments.is_empty() && asm.received + 1 == asm.fragments.len())
-                .unwrap_or(false);
-            if want_recover {
-                let frags = &self.assemblies[&key].fragments;
-                if let Some((idx, recovered)) = self.fragment_parity.try_recover(key, frags) {
-                    if let Some(asm) = self.assemblies.get_mut(&key) {
-                        if asm.fragments.get(idx).map(|f| f.is_none()).unwrap_or(false) {
-                            asm.cost += recovered.len();
-                            self.assembly_bytes += recovered.len();
-                            asm.fragments[idx] = Some(recovered);
-                            asm.received += 1;
-                            self.loss_tracker.on_fec_recovery();
-                            self.finish_assembly(key, now_us, events);
-                        }
-                    }
-                }
-            }
-            return;
-        }
-
         // Frame-dimensions sentinel (0xFF, 0xFF) with >= 8-byte payload, and
-        // eviction sentinel (0xFE, 0xFE) with a 1-byte payload. main.ts:
-        // 1211-1222 for the frame-dimensions half. Both are always
-        // single-fragment, so they are handled inline here and never reach
-        // the assembly/finish path.
+        // eviction sentinel (0xFE, 0xFE) with a 1-byte payload. Both are
+        // always single-datagram and handled inline.
         if is_sentinel {
             if is_frame_dims_sentinel {
                 self.accept_frame_dimensions(payload, events);
@@ -373,97 +258,29 @@ impl ClientCore {
             return;
         }
 
-        // Insert fragment (ignore duplicates). main.ts:1232-1255.
-        // The budget was already checked, before the ACK, by `budget_admits`.
-        let is_new = !self.assemblies.contains_key(&key);
-        let asm = self
-            .assemblies
-            .entry(key)
-            .or_insert_with(|| Assembly::new(&th, frame_seq, dh.frag_total, now_us));
-        if is_new {
-            self.assembly_bytes += asm.cost;
-        }
-        let fi = dh.frag_idx as usize;
-        if fi < asm.fragments.len() && asm.fragments[fi].is_none() {
-            asm.fragments[fi] = Some(payload.to_vec());
-            if fi < asm.wire_seqs.len() {
-                asm.wire_seqs[fi] = Some(dh.wire_seq);
-            }
-            asm.received += 1;
-            asm.cost += payload.len();
-            self.assembly_bytes += payload.len();
-        }
-        let received = asm.received;
-        let total = asm.fragments.len();
-
-        // received == total - 1 -> attempt fragment-parity recovery.
-        // main.ts:1257-1271.
-        if total > 0 && received + 1 == total {
-            let frags = &self.assemblies[&key].fragments;
-            if let Some((idx, recovered)) = self.fragment_parity.try_recover(key, frags) {
-                if let Some(asm) = self.assemblies.get_mut(&key) {
-                    if asm.fragments.get(idx).map(|f| f.is_none()).unwrap_or(false) {
-                        asm.cost += recovered.len();
-                        self.assembly_bytes += recovered.len();
-                        asm.fragments[idx] = Some(recovered);
-                        asm.received += 1;
-                        self.loss_tracker.on_fec_recovery();
-                    }
-                }
-            }
-        }
-
-        // received == total -> finish. main.ts:1273-1275.
-        let complete = self
-            .assemblies
-            .get(&key)
-            .map(|a| !a.fragments.is_empty() && a.received == a.fragments.len())
-            .unwrap_or(false);
-        if complete {
-            self.finish_assembly(key, now_us, events);
-        }
+        self.deliver_tile(frame_seq, &th, dh.wire_seq, payload, now_us, events);
     }
 
-    /// Concatenate a completed assembly's fragments and dispatch by codec
-    /// (`finishAssembly`).
-    fn finish_assembly(&mut self, key: TileKey, now_us: u64, events: &mut Vec<Event>) {
-        let asm = match self.remove_assembly(&key) {
-            Some(a) => a,
-            None => return,
-        };
-        self.fragment_parity.remove(&key);
-
-        let mut asm = asm;
-        let mut fragments = std::mem::take(&mut asm.fragments);
-        let payload = if fragments.len() == 1 {
-            // Single fragment: take it, no copy.
-            fragments.pop().flatten().unwrap_or_default()
-        } else {
-            let mut p = Vec::with_capacity(fragments.iter().flatten().map(Vec::len).sum());
-            for b in fragments.iter().flatten() {
-                p.extend_from_slice(b);
-            }
-            p
-        };
-
-        let tx = asm.tile_x;
-        let ty = asm.tile_y;
-        let frame_seq = asm.frame_seq;
-
-        // Sentinel guard (main.ts:497). In practice sentinels never reach
-        // here (single-fragment, handled inline), but mirror the reference.
-        if tx == FRAME_DIMENSIONS_SENTINEL_X && ty == FRAME_DIMENSIONS_SENTINEL_Y {
-            self.accept_frame_dimensions(&payload, events);
-            return;
-        }
+    /// Decode one tile pass and hand it up, dispatching by codec.
+    fn deliver_tile(
+        &mut self,
+        frame_seq: u32,
+        th: &TileHeader,
+        wire_seq: u32,
+        payload: &[u8],
+        now_us: u64,
+        events: &mut Vec<Event>,
+    ) {
+        let tx = th.tile_x;
+        let ty = th.tile_y;
 
         // Payload mode stops here for the codec whose decode is purely pixel
         // expansion. Solid carries no protocol state, so there is nothing to
         // update before handing the bytes up. PalRle and Cdf53 do (palette
         // upserts, pass coverage and ACKs), so they are handled inside the
         // match instead.
-        if self.tile_delivery == TileDelivery::Payload && asm.codec == Codec::Solid {
-            let Ok(quad) = payload.try_into() else {
+        if self.tile_delivery == TileDelivery::Payload && th.codec == Codec::Solid {
+            let Ok(quad) = <[u8; 4]>::try_from(payload) else {
                 // Wire-derived: a malformed Solid payload must not panic.
                 // main.ts only ever painted Solid when the payload was
                 // exactly 4 bytes; mirror that by dropping the tile silently
@@ -474,13 +291,13 @@ impl ClientCore {
                 frame_seq,
                 tile_x: tx,
                 tile_y: ty,
-                generation: asm.generation,
+                generation: th.generation,
                 data: TileData::Solid(quad),
             });
             return;
         }
 
-        match asm.codec {
+        match th.codec {
             Codec::Solid => {
                 // main.ts only paints Solid when the payload is exactly 4B.
                 if payload.len() == 4 {
@@ -503,7 +320,7 @@ impl ClientCore {
                 }
             }
             Codec::PalRle if self.tile_delivery == TileDelivery::Payload => {
-                match prevalidate_pal_rle(&payload, &self.palette_shadow) {
+                match prevalidate_pal_rle(payload, &self.palette_shadow) {
                     Ok(validated) => {
                         // Apply the upsert exactly as decode_pal_rle_tile does.
                         // It is protocol state, and palrle_decode.wgsl decodes
@@ -539,7 +356,7 @@ impl ClientCore {
                             frame_seq,
                             tile_x: tx,
                             tile_y: ty,
-                            generation: asm.generation,
+                            generation: th.generation,
                             data: TileData::PalRle {
                                 palette_id: validated.palette_id,
                                 count: validated.count,
@@ -565,7 +382,7 @@ impl ClientCore {
                 }
             }
             Codec::PalRle => {
-                match decode_pal_rle_tile(&payload, &mut self.palette_shadow, &mut self.palettes) {
+                match decode_pal_rle_tile(payload, &mut self.palette_shadow, &mut self.palettes) {
                     Ok(rgba) => events.push(Event::TileReady {
                         frame_seq,
                         tile_x: tx,
@@ -604,9 +421,9 @@ impl ClientCore {
                 // spurious NACKs and left the pixels wrong.
                 let prev = self.cdf53_coverage.get(&(tx, ty)).copied();
                 if let Some(entry) = prev {
-                    if entry.generation != asm.generation
+                    if entry.generation != th.generation
                         && !crate::cdf53_coverage::generation_is_newer(
-                            asm.generation,
+                            th.generation,
                             entry.generation,
                         )
                     {
@@ -614,13 +431,13 @@ impl ClientCore {
                     }
                 }
 
-                let result = prevalidate_cdf53(&payload, asm.generation, asm.pass);
+                let result = prevalidate_cdf53(payload, th.generation, th.pass);
                 let ok = result.is_ok();
                 let present_passes = result.as_ref().ok().and_then(|p| p.present_passes);
                 let outcome = apply_cdf53_arrival(
                     prev,
-                    asm.generation,
-                    asm.pass,
+                    th.generation,
+                    th.pass,
                     frame_seq,
                     now_us,
                     ok,
@@ -658,7 +475,7 @@ impl ClientCore {
                                     frame_seq,
                                     tile_x: tx,
                                     tile_y: ty,
-                                    generation: asm.generation,
+                                    generation: th.generation,
                                     data: TileData::Cdf53 {
                                         pass_idx: pre.pass_idx,
                                         bit_planes: pre.bit_planes,
@@ -671,25 +488,16 @@ impl ClientCore {
                         // Deliberately outside the match: it is protocol, not
                         // decoding, and must happen in both modes.
                         //
-                        // One entry per *fragment*, since each was its own
-                        // transmission with its own `wire_seq`. A tile-pass
-                        // acknowledgement covered all of them at once when
-                        // entries named content; naming transmissions means
-                        // the pass's fragments have to be named individually
-                        // or the ones not mentioned would be counted lost.
-                        let arrival = ((now_us / 1000) & 0xFFFF) as u16;
-                        // A FEC-recovered fragment has no `wire_seq` of its
-                        // own — no transmission of it arrived — so it is
-                        // absent here and correctly goes unacknowledged.
-                        let wire_seqs: Vec<u32> = asm.wire_seqs.iter().flatten().copied().collect();
-                        for ws in wire_seqs {
-                            let entry = AckEntry {
-                                wire_seq: ws,
-                                arrival_time_ms_lo16: arrival,
-                            };
-                            if let Some(dg) = self.ack_batcher.add(entry, now_us) {
-                                self.outbox.push_back(PollOutput::Datagram(dg));
-                            }
+                        // The pass is one datagram, so one entry names the
+                        // transmission it arrived on. A pass rebuilt from
+                        // FEC parity carries the original `wire_seq`; see the
+                        // note on the ACK-on-receipt path above.
+                        let entry = AckEntry {
+                            wire_seq,
+                            arrival_time_ms_lo16: ((now_us / 1000) & 0xFFFF) as u16,
+                        };
+                        if let Some(dg) = self.ack_batcher.add(entry, now_us) {
+                            self.outbox.push_back(PollOutput::Datagram(dg));
                         }
                     }
                     Err(code) => {

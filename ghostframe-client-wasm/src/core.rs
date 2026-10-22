@@ -101,7 +101,7 @@ impl WasmClientCore {
         to_js(&mirrored)
     }
 
-    /// Fire due timers (ACK/NACK flush, assembly timeout, tail sweep,
+    /// Fire due timers (ACK/NACK flush, tail sweep,
     /// periodic feedback); returns the resulting events.
     #[wasm_bindgen(js_name = onTimeout)]
     pub fn on_timeout(&mut self, now_us: u64) -> Result<JsValue, JsValue> {

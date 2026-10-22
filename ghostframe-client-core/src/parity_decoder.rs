@@ -409,7 +409,7 @@ mod tests {
             "the aged-out group must be dropped, leaving only the new parity"
         );
         assert!(
-            d.pending_parities.get(&0).is_none(),
+            !d.pending_parities.iter().any(|(k, _)| *k == 0),
             "the aged-out group's own entry must be the one dropped"
         );
     }
