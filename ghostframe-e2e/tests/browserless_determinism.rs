@@ -308,7 +308,6 @@ fn full_digest(r: &BrowserlessResult) -> Vec<(&'static str, u64)> {
         ),
         ("transport_samples", r.transport.samples),
         ("transport_client_received", r.transport.client_received),
-        ("transport_client_lost", r.transport.client_lost),
         ("transport_client_recovered", r.transport.client_recovered),
         ("client_lost_pre_fec", r.client_wire_loss.lost_pre_fec),
         ("events_hash", hash_of(&format!("{:?}", r.events))),
