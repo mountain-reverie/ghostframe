@@ -21,9 +21,9 @@
 //! | `CAPTURE_FPS` | capture rate; invalid or 0 falls back | 30 |
 //! | `GHOSTFRAME_NO_X11_WAIT` | skip the X11 readiness wait (DRM-direct e2e) | off |
 //! | `GHOSTFRAME_X11_CAPTURE_ONLY` | skip the DRM probe | off |
-//! | `GHOSTFRAME_CAPTURE_DUMP_DIR` | write each frame as PNG here | off |
+//! | `GHOSTFRAME_CAPTURE_DUMP_DIR` | write each frame as PNG here (test builds only) | off |
 //! | `GHOSTFRAME_CAPTURE_HEARTBEAT_EVERY` | trace heartbeat every N frames | 5 |
-//! | `GHOSTFRAME_DUMP_FIRST_FRAME` | dump first raw frame to this path | off |
+//! | `GHOSTFRAME_DUMP_FIRST_FRAME` | dump first raw frame to this path (test builds only) | off |
 //! | `GHOSTFRAME_FORCE_ROOT_GET_IMAGE` | bypass compositor probe | off |
 //! | `GHOSTFRAME_ATTACH_MAX_RESOLUTION` | `WxH` ceiling in attach mode | none |
 
@@ -60,7 +60,19 @@ impl XdaemonConfig {
 
     /// Build from an arbitrary lookup, so tests need no process-global state.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
-        let nonempty = |k: &str| get(k).filter(|s| !s.is_empty());
+        // The two dump knobs write captured screen contents to a path the
+        // environment names. They are honoured only in a test build; the
+        // release daemon ignores them. xdaemon has no cargo features of its
+        // own, so it follows the lib's `test-loss-injection`, which the e2e
+        // image enables and `ci/check-release-features.sh` forbids in a
+        // release build.
+        let knob = |k: &str| {
+            if ghostframe_lib::config::test_knobs_compiled() {
+                get(k)
+            } else {
+                None
+            }
+        };
         Self {
             display: get("DISPLAY"),
             log_json: get("GHOSTFRAME_LOG_FORMAT").as_deref() == Some("json"),
@@ -71,13 +83,15 @@ impl XdaemonConfig {
             capture_fps: parse_positive("CAPTURE_FPS", get("CAPTURE_FPS"), DEFAULT_CAPTURE_FPS),
             no_x11_wait: env_flag(get("GHOSTFRAME_NO_X11_WAIT").as_deref()),
             x11_capture_only: env_flag(get("GHOSTFRAME_X11_CAPTURE_ONLY").as_deref()),
-            capture_dump_dir: nonempty("GHOSTFRAME_CAPTURE_DUMP_DIR").map(Into::into),
+            capture_dump_dir: knob("GHOSTFRAME_CAPTURE_DUMP_DIR")
+                .filter(|s| !s.is_empty())
+                .map(Into::into),
             heartbeat_every: parse_positive(
                 "GHOSTFRAME_CAPTURE_HEARTBEAT_EVERY",
                 get("GHOSTFRAME_CAPTURE_HEARTBEAT_EVERY"),
                 DEFAULT_HEARTBEAT_EVERY,
             ),
-            dump_first_frame: get("GHOSTFRAME_DUMP_FIRST_FRAME"),
+            dump_first_frame: knob("GHOSTFRAME_DUMP_FIRST_FRAME"),
             force_root_get_image: env_flag(get("GHOSTFRAME_FORCE_ROOT_GET_IMAGE").as_deref()),
             attach_max_resolution: get("GHOSTFRAME_ATTACH_MAX_RESOLUTION"),
         }
@@ -155,5 +169,21 @@ mod tests {
         assert!(c.x11_capture_only && c.log_json);
         assert!(!c.no_x11_wait);
         assert!(c.capture_dump_dir.is_none());
+    }
+
+    /// The dump knobs write screen contents to disk, so a release build must
+    /// ignore them. In this crate's own test run the lib is built without
+    /// `test-loss-injection`, so this exercises the ignored branch; under the
+    /// e2e image's feature set it exercises the honoured one. Either way the
+    /// result must follow `test_knobs_compiled()`.
+    #[test]
+    fn dump_knobs_follow_the_test_knob_switch() {
+        let c = cfg(&[
+            ("GHOSTFRAME_CAPTURE_DUMP_DIR", "/var/dump"),
+            ("GHOSTFRAME_DUMP_FIRST_FRAME", "/var/first"),
+        ]);
+        let on = ghostframe_lib::config::test_knobs_compiled();
+        assert_eq!(c.capture_dump_dir.is_some(), on);
+        assert_eq!(c.dump_first_frame.is_some(), on);
     }
 }
