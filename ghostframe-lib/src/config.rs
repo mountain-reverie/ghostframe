@@ -492,8 +492,9 @@ pub struct AccessConfig {
     /// session's peer is checked against the access rule again, and closed
     /// if it no longer passes. Whole seconds in
     /// `MIN_RECHECK_SECS..=MAX_RECHECK_SECS`. Zero, non-numeric or
-    /// out-of-range values are rejected (named in `rejected`) and the default
-    /// applies: re-checking is never switched off by a bad value.
+    /// out-of-range values are a startup error ([`ConfigError`]), never a
+    /// silent fallback: the operator asked for something, and quietly running
+    /// with another interval is not what they asked for.
     pub recheck_interval: std::time::Duration,
 }
 
@@ -508,8 +509,29 @@ impl Default for AccessConfig {
     }
 }
 
+/// A setting that is present but unusable. Startup is refused with it: the
+/// process must not run with a configuration other than the one requested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigError {
+    pub variable: &'static str,
+    pub value: String,
+    pub expected: &'static str,
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid {}={:?}: expected {}",
+            self.variable, self.value, self.expected
+        )
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
 impl AccessConfig {
-    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         use crate::transport::peer_auth::{MAX_RECHECK_SECS, MIN_RECHECK_SECS};
         let mut cfg = Self::default();
         if let Some(raw) = get("GHOSTFRAME_ACCESS_RECHECK_SECS") {
@@ -517,13 +539,17 @@ impl AccessConfig {
                 Ok(n) if (MIN_RECHECK_SECS..=MAX_RECHECK_SECS).contains(&n) => {
                     cfg.recheck_interval = std::time::Duration::from_secs(n);
                 }
-                _ => cfg
-                    .rejected
-                    .push(format!("GHOSTFRAME_ACCESS_RECHECK_SECS={raw}")),
+                _ => {
+                    return Err(ConfigError {
+                        variable: "GHOSTFRAME_ACCESS_RECHECK_SECS",
+                        value: raw,
+                        expected: "whole seconds from 1 to 86400",
+                    })
+                }
             }
         }
         let Some(raw) = get("GHOSTFRAME_ALLOWED_USERS") else {
-            return cfg;
+            return Ok(cfg);
         };
         for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
             let well_formed = !entry.chars().any(|c| c.is_whitespace() || c.is_control());
@@ -535,10 +561,10 @@ impl AccessConfig {
                 _ => cfg.rejected.push(entry.to_owned()),
             }
         }
-        cfg
+        Ok(cfg)
     }
 
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|k| std::env::var(k).ok())
     }
 }
@@ -558,13 +584,16 @@ impl LibConfig {
     /// use at the executable boundary only (e.g. `GhostframeServer::new`'s
     /// callers) — everything downstream of that should take a `LibConfig`
     /// by value rather than calling this again.
-    pub fn from_env() -> Self {
-        Self {
+    ///
+    /// Fails on a setting that is present but unusable (see [`ConfigError`]);
+    /// the caller refuses to start.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Ok(Self {
             classifier: ClassifierConfig::from_env(),
             transport: TransportConfig::from_env(),
             diagnostics: DiagnosticsConfig::from_env(),
-            access: AccessConfig::from_env(),
-        }
+            access: AccessConfig::from_env()?,
+        })
     }
 }
 
@@ -813,49 +842,61 @@ mod tests {
     #[test]
     fn allowed_users_unset_means_owner_only() {
         assert_eq!(
-            AccessConfig::from_lookup(lookup(&[])),
+            AccessConfig::from_lookup(lookup(&[])).unwrap(),
             AccessConfig::default()
         );
         assert_eq!(
-            AccessConfig::from_lookup(lookup(&[("GHOSTFRAME_ALLOWED_USERS", " , ,")])),
+            AccessConfig::from_lookup(lookup(&[("GHOSTFRAME_ALLOWED_USERS", " , ,")])).unwrap(),
             AccessConfig::default()
         );
     }
 
     #[test]
     fn recheck_interval_defaults_to_sixty_seconds() {
-        let c = AccessConfig::from_lookup(lookup(&[]));
+        let c = AccessConfig::from_lookup(lookup(&[])).unwrap();
         assert_eq!(c.recheck_interval, std::time::Duration::from_secs(60));
     }
 
     #[test]
     fn recheck_interval_is_configurable() {
-        let c = AccessConfig::from_lookup(lookup(&[("GHOSTFRAME_ACCESS_RECHECK_SECS", " 15 ")]));
+        let c = AccessConfig::from_lookup(lookup(&[("GHOSTFRAME_ACCESS_RECHECK_SECS", " 15 ")]))
+            .unwrap();
         assert_eq!(c.recheck_interval, std::time::Duration::from_secs(15));
         assert!(c.rejected.is_empty());
     }
 
-    // A bad value must not switch re-checking off (0 would mean "never" or
-    // "spin"), so it is reported and the default stays in force.
+    // A bad value refuses startup, naming the variable and the value; it
+    // neither switches re-checking off (0 would mean "never" or "spin") nor
+    // quietly runs with a default the operator did not ask for.
     #[test]
-    fn recheck_interval_rejects_nonsense_and_keeps_the_default() {
+    fn recheck_interval_rejects_nonsense_at_startup() {
         for bad in [
             "0",
             "-5",
             "abc",
             "",
             "1.5",
+            "5m",
             "60s",
             "86401",
             "99999999999999999999",
         ] {
-            let c = AccessConfig::from_lookup(lookup(&[("GHOSTFRAME_ACCESS_RECHECK_SECS", bad)]));
-            assert_eq!(
-                c.recheck_interval,
-                std::time::Duration::from_secs(60),
-                "{bad:?}"
-            );
-            assert_eq!(c.rejected.len(), 1, "{bad:?} must be named");
+            let e = AccessConfig::from_lookup(lookup(&[("GHOSTFRAME_ACCESS_RECHECK_SECS", bad)]))
+                .expect_err(bad);
+            assert_eq!(e.variable, "GHOSTFRAME_ACCESS_RECHECK_SECS");
+            assert_eq!(e.value, bad);
+            let shown = e.to_string();
+            assert!(shown.contains("GHOSTFRAME_ACCESS_RECHECK_SECS"), "{shown}");
+            assert!(shown.contains(&format!("{bad:?}")), "{shown}");
+        }
+    }
+
+    #[test]
+    fn recheck_interval_bounds_are_accepted() {
+        for (v, secs) in [("1", 1), ("86400", 86400)] {
+            let c = AccessConfig::from_lookup(lookup(&[("GHOSTFRAME_ACCESS_RECHECK_SECS", v)]))
+                .unwrap();
+            assert_eq!(c.recheck_interval, std::time::Duration::from_secs(secs));
         }
     }
 
@@ -864,7 +905,8 @@ mod tests {
         let c = AccessConfig::from_lookup(lookup(&[(
             "GHOSTFRAME_ALLOWED_USERS",
             "alice@example.com, tag:ops ,bob@github",
-        )]));
+        )]))
+        .unwrap();
         assert_eq!(c.allowed_logins, vec!["alice@example.com", "bob@github"]);
         assert_eq!(c.allowed_tags, vec!["tag:ops"]);
         assert!(c.rejected.is_empty());
@@ -875,7 +917,8 @@ mod tests {
         let c = AccessConfig::from_lookup(lookup(&[(
             "GHOSTFRAME_ALLOWED_USERS",
             "tag:,al ice@example.com,ok@example.com,tag:a b",
-        )]));
+        )]))
+        .unwrap();
         assert_eq!(c.allowed_logins, vec!["ok@example.com"]);
         assert!(c.allowed_tags.is_empty());
         assert_eq!(c.rejected, vec!["tag:", "al ice@example.com", "tag:a b"]);
@@ -885,7 +928,8 @@ mod tests {
     // no user has.
     #[test]
     fn allowed_users_has_no_wildcard() {
-        let c = AccessConfig::from_lookup(lookup(&[("GHOSTFRAME_ALLOWED_USERS", "*,tag:*")]));
+        let c =
+            AccessConfig::from_lookup(lookup(&[("GHOSTFRAME_ALLOWED_USERS", "*,tag:*")])).unwrap();
         assert_eq!(c.allowed_logins, vec!["*"]);
         assert_eq!(c.allowed_tags, vec!["tag:*"]);
     }

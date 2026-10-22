@@ -59,7 +59,13 @@ pub unsafe extern "C" fn gf_server_new(
             Err(_) => return std::ptr::null_mut(),
         };
 
-        let lib_config = crate::config::LibConfig::from_env();
+        let lib_config = match crate::config::LibConfig::from_env() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("gf_server_new failed: {e}");
+                return std::ptr::null_mut();
+            }
+        };
         match rt.block_on(GhostframeServer::new(
             config, ":443", lib_config, None, None,
         )) {

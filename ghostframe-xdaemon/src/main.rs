@@ -219,7 +219,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
-    let lib_config = ghostframe_lib::config::LibConfig::from_env();
+    let lib_config = match ghostframe_lib::config::LibConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("{e}; refusing to start");
+            std::process::exit(2);
+        }
+    };
     tracing::info!(?lib_config, "effective LibConfig");
 
     tracing::info!("Connecting to Tailscale...");

@@ -306,9 +306,9 @@ connected session** every 60 seconds. A peer that no longer passes (its
 device was removed or expired, re-tagged, or moved to another user) has its
 session closed with the reason `access revoked`; the same rule and the same
 lookup are used as at connect time. Set the interval, in whole seconds from 1
-to 86400, with `GHOSTFRAME_ACCESS_RECHECK_SECS`; `0` or any other value is
-rejected with a startup warning and the 60 seconds apply, so a typo never
-switches re-checking off. A session can therefore outlive a revocation by up
+to 86400, with `GHOSTFRAME_ACCESS_RECHECK_SECS`; `0` or any other value
+(`5m`, say) refuses startup with an error naming the variable and the value,
+so a typo never switches re-checking off nor quietly runs another interval. A session can therefore outlive a revocation by up
 to one interval, plus up to one short retry (5 s) if the tailnet did not
 answer. Fail closed: a peer the tailnet no longer knows is closed at once, and
 a lookup that fails twice in a row also closes the session; one failure alone
