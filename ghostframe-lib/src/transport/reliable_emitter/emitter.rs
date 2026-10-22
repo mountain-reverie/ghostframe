@@ -666,9 +666,9 @@ impl ReliableTileEmitter {
     /// continue to pass the clock they use for `submit_one` / `tick`.
     pub fn on_nack(&mut self, entries: &[(EmitKey, u8)], _now: Instant) {
         for &(nacked_key, frag_idx) in entries {
-            // Exact first: a NACK for a fragment of a pass the client partly
-            // received *can* name the transmission, because it has the
-            // frame_seq from the fragments that did arrive.
+            // Exact first: a NACK naming the transmission hits directly. The
+            // client no longer sends one, since a pass is a single datagram
+            // and a lost one leaves it no frame_seq to name.
             //
             // Content second: a coverage NACK for a wholly missing pass
             // cannot. The client has no frame_seq for a datagram it never

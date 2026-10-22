@@ -130,7 +130,8 @@ pub struct AdaptationContext {
     pub bytes_per_us: f32,
     /// Smoothed one-way RTT, µs. Sourced from QUIC `path_stats.rtt`.
     pub smoothed_rtt_us: f32,
-    /// Smoothed datagram loss rate over the last 5 `ReceiverFeedback` windows.
+    /// Datagram loss rate measured at the sender, from the transmission
+    /// ledger.
     pub loss_rate: f32,
     /// Last `ReceiverFeedback`'s suspension flag, OR'd across the last 2
     /// windows to debounce single-window flaps.

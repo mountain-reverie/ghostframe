@@ -108,13 +108,19 @@ fn a_tile_claiming_a_fragment_index_other_than_zero_is_dropped() {
         let evs = core.handle_datagram(&dg, 0);
         assert!(evs.is_empty(), "frag_idx {idx} must be dropped: {evs:?}");
     }
-    assert!(!acked(&mut core), "a refused tile must not be ACKed");
+    assert!(
+        !queued_datagram(&mut core),
+        "a refused tile must not be ACKed"
+    );
     // Positive control: the same tile with index 0 decodes and is ACKed.
     assert_eq!(
         tile_ready_count(&core.handle_datagram(&solid_dg(2, 0, 0), 0)),
         1
     );
-    assert!(acked(&mut core), "control: an accepted tile must be ACKed");
+    assert!(
+        queued_datagram(&mut core),
+        "control: an accepted tile must be ACKed"
+    );
 }
 
 #[test]
@@ -163,8 +169,9 @@ fn the_largest_cdf53_pass_is_one_datagram_and_completes() {
     );
 }
 
-/// True if the core queues any ACK datagram after `handle_datagram` calls.
-fn acked(core: &mut ClientCore) -> bool {
+/// True if the core queues any outgoing datagram (ACK or NACK) after
+/// `handle_datagram` calls.
+fn queued_datagram(core: &mut ClientCore) -> bool {
     core.on_timeout(10_000_000);
     let mut any = false;
     while let Some(out) = core.poll_transmit(10_000_000) {
@@ -180,7 +187,10 @@ fn accepted_tile_is_acked_but_refused_ones_are_not() {
     // Positive control first, or "no ACK" below proves nothing.
     let mut core = test_core();
     core.handle_datagram(&tile_dgs(1, 0, 0, 0, &[1u8; 64], 64)[0], 0);
-    assert!(acked(&mut core), "control: an accepted tile must be ACKed");
+    assert!(
+        queued_datagram(&mut core),
+        "control: an accepted tile must be ACKed"
+    );
 
     // More than one fragment, off the grid: refused before the ACK, so the
     // server retransmits instead of counting them delivered.
@@ -188,12 +198,12 @@ fn accepted_tile_is_acked_but_refused_ones_are_not() {
     let mut dg = tile_dgs(1, 0, 0, 0, &[1u8; 64], 64).remove(0);
     forge_frag_total(&mut dg, 2);
     core.handle_datagram(&dg, 0);
-    assert!(!acked(&mut core), "multi-fragment tile ACKed");
+    assert!(!queued_datagram(&mut core), "multi-fragment tile ACKed");
 
     let mut core = test_core();
     dims_events(&mut core, 640, 480);
     core.handle_datagram(&tile_dgs(1, 30, 0, 0, &[1u8; 64], 64)[0], 0);
-    assert!(!acked(&mut core), "off-grid tile ACKed");
+    assert!(!queued_datagram(&mut core), "off-grid tile ACKed");
 }
 
 #[test]
