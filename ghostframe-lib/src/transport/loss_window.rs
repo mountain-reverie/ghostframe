@@ -2,11 +2,12 @@
 //! sender.
 //!
 //! It used to come from the client's `ReceiverFeedback`, whose
-//! `datagrams_lost` counts fragments missing from a tile the client saw
+//! `datagrams_lost` counted fragments missing from a tile the client saw
 //! *part* of. A tile that fits in one datagram has no part to see: when it
 //! is lost the client never learns it existed. Measured: 15% injected loss
 //! on a screen of single-datagram tiles reported `lost = 0`, and the
-//! override it was meant to trip never fired once.
+//! override it was meant to trip never fired once. That field is now
+//! always 0.
 //!
 //! The transmission ledger already knows the fate of every datagram the
 //! emitter sent, one verdict each -- acknowledged, or outstanding past the

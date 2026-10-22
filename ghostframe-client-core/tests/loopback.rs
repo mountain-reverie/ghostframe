@@ -648,7 +648,7 @@ fn parity_group_recovers_without_retransmit() {
     }
     let fb = fb.expect("expected a ReceiverFeedback stream message");
     // ReceiverFeedback layout: [0]=type, [1..9]=timestamp_ns,
-    // [9..13]=datagrams_received, [13..17]=datagrams_lost,
+    // [9..13]=datagrams_received, [13..17]=datagrams_lost (always 0),
     // [17..21]=datagrams_recovered_fec, [21]=suspension_detected.
     // (Matches the byte layout asserted in tests/reassembly.rs, shifted by
     // the leading type byte relative to that test's fb[12..16] offsets
