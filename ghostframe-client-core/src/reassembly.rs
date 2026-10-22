@@ -60,7 +60,7 @@ impl ClientCore {
             None => true,
         };
         self.cdf53_coverage.retain(|&(x, y), _| inside(x, y));
-        self.pending_nacks.retain(|&(x, y, _), _| inside(x, y));
+        self.pending_nacks.retain(|&(_, y, x), _| inside(x, y));
         self.cdf53_tile_state.retain_tiles(inside);
     }
 
