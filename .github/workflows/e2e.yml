@@ -105,13 +105,12 @@ jobs:
       # parallel runs failed afterwards, guarded by
       # `injected_frame_supersedes_prior_work_for_the_same_tile`).
       #
-      # Serial execution stays because these scenes each spawn a tokio
-      # runtime, a LocalSet and an IoBridge task. What varies run to run is
-      # now measured rather than assumed: `browserless_determinism` pins the
-      # protocol-visible behaviour as reproducible for a given seed, and
-      # documents that delivered bytes and datagram counts are not (QUIC
-      # framing shifts with task-scheduling order). Running these serially
-      # keeps that variance from compounding across nine concurrent scenes.
+      # Serial execution stays because these scenes each build a tokio
+      # runtime and a LocalSet and run for tens of virtual seconds; running
+      # them one at a time keeps wall-clock load from compounding. It no
+      # longer affects what a scene computes: the bridge is stepped by the
+      # harness over an in-memory pipe, so a scene's counters are a function of
+      # its seed alone, and `browserless_determinism` pins that exactly.
       - run: cargo test --test netsim --test netsim_pump --test netsim_burst --test fec_burst_analysis --test scene_tiles --test framebuffer
       - run: cargo test --test browserless_runner -- --test-threads=1
       # Split out of browserless_runner: two 20s bottleneck scenes that both

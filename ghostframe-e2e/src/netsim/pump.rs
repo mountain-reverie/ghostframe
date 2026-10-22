@@ -113,3 +113,44 @@ impl SocketPairPump {
         self.stream.write_all(&frame).await
     }
 }
+
+/// Parse a buffer holding zero or more whole ghostbridge frames, in order.
+///
+/// The same validation as [`SocketPairPump::recv`], over bytes already in
+/// hand: for the stepped harness, which takes everything the bridge wrote in
+/// one go. A trailing partial frame is an error, because the in-memory pipe
+/// is only ever written whole frames at a time.
+pub fn parse_frames(mut buf: &[u8]) -> io::Result<Vec<UdpPacket>> {
+    let mut out = Vec::new();
+    while !buf.is_empty() {
+        if buf.len() < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "partial frame header",
+            ));
+        }
+        let total_len = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
+        let payload_len = u32::from_be_bytes(buf[4..8].try_into().unwrap()) as usize;
+        if total_len < 8 + payload_len + 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame too short",
+            ));
+        }
+        if total_len > MAX_FRAME_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame total_len exceeds maximum",
+            ));
+        }
+        if buf.len() < total_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "partial frame body",
+            ));
+        }
+        out.push(parse_frame_rest(&buf[8..total_len], payload_len)?);
+        buf = &buf[total_len..];
+    }
+    Ok(out)
+}
