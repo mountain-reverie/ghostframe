@@ -11,7 +11,10 @@
 //! bridge is stepped by the harness over an in-memory pipe (see the
 //! `browserless` module docs), so two same-seed runs, in one process or in
 //! two, produce identical results. The tests print
-//! `DETERMINISM-DIGEST <name> <hash>`; the hash is the same in every process.
+//! `DETERMINISM-DIGEST <name> <hash>`; the hash is the same in every process,
+//! and the two whole-scene tests re-run themselves in a child process and
+//! compare it. The digest covers every datagram (offer instant, direction,
+//! length, verdict) and the final framebuffer as well as the counters.
 //!
 //! This file used to say the opposite -- behaviour reproducible, byte volume
 //! not, about 16% apart on a busy lossy scene -- when the bridge ran as a
@@ -309,8 +312,58 @@ fn full_digest(r: &BrowserlessResult) -> Vec<(&'static str, u64)> {
         ("transport_client_recovered", r.transport.client_recovered),
         ("client_lost_pre_fec", r.client_wire_loss.lost_pre_fec),
         ("events_hash", hash_of(&format!("{:?}", r.events))),
+        // Every datagram, both directions: offer instant, length, and what
+        // the netsim made of it. Counters can agree while a datagram went
+        // out at another instant or at another size; this cannot. Lengths,
+        // not bytes: the ciphertext depends on OS-drawn TLS keys.
+        ("wire_digest", r.wire_digest),
+        ("wire_datagrams", r.wire_datagrams),
+        // The picture the client ended up with.
+        ("framebuffer_digest", r.framebuffer.digest()),
     ]);
     d
+}
+
+/// Run this same test again in a child process and require the same digest.
+///
+/// Two runs in one process share the allocator, the `HashMap` key source
+/// (`RandomState` keys are per-thread, advancing per map) and the thread
+/// state; a source of nondeterminism that is constant within a process, such
+/// as a hash seed or an address-dependent order, passes the in-process pair
+/// and is only caught by a fresh process. The alternative, a digest constant
+/// pinned in the source, would catch it too but breaks on every legitimate
+/// change to the codec, the scheduler or the wire format and so teaches people
+/// to regenerate it blindly, and `DefaultHasher`'s algorithm is not promised
+/// stable across Rust releases. The child needs no maintenance and cannot rot.
+///
+/// The child is this binary re-run with the test's own name and
+/// `GF_DETERMINISM_CHILD` set, which turns off the re-exec.
+fn assert_same_digest_in_a_fresh_process(test: &str, name: &str, digest: u64) {
+    const CHILD: &str = "GF_DETERMINISM_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return;
+    }
+    let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .expect("spawn the test binary again");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the child process failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let prefix = format!("DETERMINISM-DIGEST {name} ");
+    let theirs = stdout
+        .lines()
+        .find_map(|l| l.find(&prefix).map(|i| &l[i + prefix.len()..]))
+        .unwrap_or_else(|| panic!("the child printed no `{prefix}` line:\n{stdout}"));
+    assert_eq!(
+        theirs.trim(),
+        format!("{digest:016x}"),
+        "a fresh process produced a different scene from the same seed"
+    );
 }
 
 fn diff(a: &[(&'static str, u64)], b: &[(&'static str, u64)]) -> Vec<String> {
@@ -384,6 +437,16 @@ async fn a_rich_scene_is_reproducible_from_its_seed() {
         "the same seed produced two different scenes:\n{}",
         diffs.join("\n")
     );
+    assert!(
+        a.wire_datagrams > 1000 && a.framebuffer.digest() != 0,
+        "premise: the wire digest covers a real run ({} datagrams)",
+        a.wire_datagrams
+    );
+    assert_same_digest_in_a_fresh_process(
+        "a_rich_scene_is_reproducible_from_its_seed",
+        "rich",
+        hash_of(&da),
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -415,5 +478,10 @@ async fn an_impaired_scene_with_frame_cost_is_reproducible_from_its_seed() {
         diffs.is_empty(),
         "the same seed produced two different scenes:\n{}",
         diffs.join("\n")
+    );
+    assert_same_digest_in_a_fresh_process(
+        "an_impaired_scene_with_frame_cost_is_reproducible_from_its_seed",
+        "impaired",
+        hash_of(&da),
     );
 }

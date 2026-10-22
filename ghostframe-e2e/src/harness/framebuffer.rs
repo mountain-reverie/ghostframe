@@ -284,6 +284,22 @@ impl FrameBuffer {
         self.tiles.get(&(tile_x, tile_y)).map(|e| e.rgba.as_slice())
     }
 
+    /// Hash of every tile's coordinates and pixels, in coordinate order, so
+    /// two runs can be compared for the same final picture. Stable across
+    /// processes (`DefaultHasher::new` has fixed keys).
+    pub fn digest(&self) -> u64 {
+        use std::hash::Hasher;
+        let mut keys: Vec<&(u8, u8)> = self.tiles.keys().collect();
+        keys.sort_unstable();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for k in keys {
+            h.write_u8(k.0);
+            h.write_u8(k.1);
+            h.write(&self.tiles[k].rgba);
+        }
+        h.finish()
+    }
+
     pub fn stale_generation_tiles(&self) -> u32 {
         self.stale_generation_tiles
     }
