@@ -405,7 +405,14 @@ export class WebGpuRenderer {
     this.framebuffer.encodePresentBlit(encoder, swapTex.createView());
 
     // ---- Step 10: errors copy ----
-    this.palrlePipeline.encodeErrorsReadback(encoder, palRleCount);
+    // Only when this tick starts a readback. While the previous one is still
+    // mapping (or mapped and not yet unmapped), `errorsStaging` cannot be
+    // used in a submit: WebGPU rejects the WHOLE submit, so this tick's
+    // Solid, PalRle, CDF53 integrate/lift and present would all be lost,
+    // for tiles the core has already acknowledged. That tick's PalRle
+    // errors go unreported instead; the errors buffer is zeroed below.
+    const readErrors = palRleCount > 0 && !this.errorsReadbackInFlight;
+    if (readErrors) this.palrlePipeline.encodeErrorsReadback(encoder, palRleCount);
 
     // ---- Step 11: submit ----
     this.device.queue.submit([encoder.finish()]);
@@ -418,7 +425,7 @@ export class WebGpuRenderer {
     }
 
     // ---- Step 13: async errors readback (one rAF latency) ----
-    if (palRleCount > 0 && !this.errorsReadbackInFlight) {
+    if (readErrors) {
       this.errorsReadbackInFlight = true;
       const batch = palRleCount;
       const staging = this.palrlePipeline.errorsStaging;
