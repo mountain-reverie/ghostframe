@@ -41,7 +41,7 @@ use crate::transport::ghostbridge::{
     MAX_FRAME_LEN,
 };
 use crate::transport::peer_auth::{
-    AccessPolicy, DenialLog, PeerGate, PeerLookup, TsnetWhoIs, WhoIsError,
+    AccessPolicy, DenialLog, PeerGate, PeerLookup, SessionRechecker, TsnetWhoIs, WhoIsError,
 };
 use crate::transport::protocol::{
     build_frame_parity_datagram, encode_tile_datagram, fragment_frame,
@@ -326,6 +326,11 @@ pub struct IoBridge {
     /// Swept by `sweep_close_deadlines`. Cleared per handle by
     /// `forget_session` (eviction re-inserts its entry afterwards).
     close_deadlines: HashMap<ConnectionHandle, CloseDeadline>,
+    /// When each connected peer is next checked against the access rule
+    /// again (`GHOSTFRAME_ACCESS_RECHECK_SECS`). Pruned to the live
+    /// connections by `sweep_rechecks` and cleared per handle by
+    /// `forget_session`.
+    rechecker: SessionRechecker<ConnectionHandle>,
     /// Feedback-stream buffers discarded because the sender had not been
     /// HELLO'd (lifetime count; rate-limited warn).
     non_live_feedback_drops: u64,
@@ -1102,6 +1107,7 @@ impl IoBridge {
             wt_sessions: HashMap::new(),
             last_hello_from: None,
             close_deadlines: HashMap::new(),
+            rechecker: SessionRechecker::new(lib_config.access.recheck_interval),
             non_live_feedback_drops: 0,
             non_live_datagram_drops: 0,
             has_seen_prior_session: false,
@@ -1449,8 +1455,16 @@ impl IoBridge {
         ip: std::net::IpAddr,
         lookup: PeerLookup,
     ) -> io::Result<()> {
-        for (dst, bytes) in self.server.resolve_peer(ip, &lookup, now_std()) {
+        let now = now_std();
+        // The same pure rule `resolve_peer` is about to apply (and cache),
+        // read once more for the sessions already connected from `ip`: the
+        // answer to a re-check arrives here, as does any new connection's.
+        let decision = self.server.peer_gate().policy().decide(&lookup);
+        for (dst, bytes) in self.server.resolve_peer(ip, &lookup, now) {
             self.stream.write_all(&encode_frame(&bytes, &dst)).await?;
+        }
+        for handle in self.rechecker.apply(ip, &decision, now) {
+            self.revoke_session(handle, now);
         }
         Ok(())
     }
@@ -1699,7 +1713,8 @@ impl IoBridge {
             .as_ref()
             .map(|p| self.epoch + std::time::Duration::from_micros(p.deadline_us));
         let close = self.close_deadlines.values().map(|d| d.at).min();
-        [quic, display, close].into_iter().flatten().min()
+        let recheck = self.rechecker.next_due();
+        [quic, display, close, recheck].into_iter().flatten().min()
     }
 
     /// React to a client-reported decode error. Most error codes are
@@ -1983,6 +1998,10 @@ impl IoBridge {
     async fn post_turn(&mut self) -> io::Result<()> {
         // Arm/enforce close deadlines first, so a CONNECTION_CLOSE queued
         // here leaves in the drain_outbound just below.
+        self.sweep_rechecks(now_std());
+        // Lookups a re-check queued run on worker threads, like a new
+        // connection's; started here because no inbound packet triggers them.
+        self.spawn_peer_lookups();
         self.sweep_close_deadlines(now_std());
 
         // Always drain after either branch.

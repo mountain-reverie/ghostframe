@@ -46,6 +46,13 @@ pub(super) const CLOSE_CODE_NO_HELLO: u32 = 0x6702;
 
 pub(super) const CLOSE_CODE_TAKEOVER_RATE_LIMITED: u32 = 0x6703;
 
+/// The peer no longer passes the access rule (see `transport::peer_auth`).
+pub(super) const CLOSE_CODE_ACCESS_REVOKED: u32 = 0x6704;
+
+/// Grace before the QUIC close of a revoked session: none. Unlike an
+/// eviction there is no notice to flush to a peer that is no longer allowed.
+const REVOKE_CLOSE_GRACE: std::time::Duration = std::time::Duration::ZERO;
+
 /// Minimum time between one HELLO displacing a live session and the next.
 /// Each takeover evicts the incumbent and runs the session reset (palette,
 /// classifier, scheduler, an all-tiles-dirty burst and an IDR), so two
@@ -371,6 +378,7 @@ impl IoBridge {
         self.wt_sessions.remove(&handle);
         self.feedback_recv_bufs.remove(&handle);
         self.close_deadlines.remove(&handle);
+        self.rechecker.forget(&handle);
         if self.last_hello_from == Some(handle) {
             self.last_hello_from = None;
         }
@@ -531,6 +539,45 @@ impl IoBridge {
             .is_some_and(|t| now.saturating_duration_since(t) < TAKEOVER_MIN_INTERVAL)
     }
 
+    /// Re-check connected peers that are due, and close those that no longer
+    /// pass. The lookup is the gate's: immediate sources answer inline, real
+    /// ones are queued for `spawn_peer_lookups` (a blocking WhoIs on a worker
+    /// thread, never on this loop) and answered through `apply_peer_lookup`.
+    pub(super) fn sweep_rechecks(&mut self, now: std::time::Instant) {
+        self.rechecker.sync(
+            self.server
+                .connections
+                .iter()
+                // A connection already closing (revoked, evicted) is not a
+                // session to keep checking.
+                .filter(|(_, c)| !c.is_closed())
+                .map(|(h, c)| (*h, c.remote_address().ip())),
+            now,
+        );
+        for handle in self.rechecker.run_due(self.server.peer_gate_mut(), now) {
+            self.revoke_session(handle, now);
+        }
+    }
+
+    /// Close a connected session whose peer no longer passes the access rule.
+    pub(super) fn revoke_session(&mut self, handle: ConnectionHandle, now: std::time::Instant) {
+        tracing::warn!(
+            target: LOG_TARGET,
+            ?handle,
+            "peer no longer passes the access rule; closing its session"
+        );
+        // Server-wide cleanup for the live session, then the close itself.
+        // Inserted AFTER forget_session, which clears the handle's entry.
+        self.on_connection_gone(handle, "access revoked");
+        self.close_deadlines.insert(
+            handle,
+            CloseDeadline {
+                at: now + REVOKE_CLOSE_GRACE,
+                code: CLOSE_CODE_ACCESS_REVOKED,
+            },
+        );
+    }
+
     /// Arm the never-HELLO deadline for a freshly accepted connection.
     pub(super) fn arm_hello_deadline(&mut self, handle: ConnectionHandle, now: std::time::Instant) {
         self.close_deadlines.insert(
@@ -567,6 +614,7 @@ impl IoBridge {
                     CLOSE_CODE_EVICTED => b"evicted",
                     CLOSE_CODE_NO_HELLO => b"no HELLO before deadline",
                     CLOSE_CODE_TAKEOVER_RATE_LIMITED => b"session takeover rate limit",
+                    CLOSE_CODE_ACCESS_REVOKED => b"access revoked",
                     _ => b"closed",
                 };
                 tracing::info!(target: LOG_TARGET, ?handle, code = d.code, "closing connection at deadline");

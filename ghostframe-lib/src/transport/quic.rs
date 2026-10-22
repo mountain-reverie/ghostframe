@@ -539,6 +539,11 @@ impl QuicServer {
         &self.peer_gate
     }
 
+    /// The gate, for re-checking connected peers through it.
+    pub fn peer_gate_mut(&mut self) -> &mut PeerGate {
+        &mut self.peer_gate
+    }
+
     /// Identity lookups the caller should start, with the source to run them
     /// against. Each IP is returned once until [`Self::resolve_peer`] is
     /// called for it.

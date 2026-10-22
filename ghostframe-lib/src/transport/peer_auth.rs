@@ -225,10 +225,16 @@ impl AccessPolicy {
         for bad in &access.rejected {
             tracing::warn!(
                 entry = %bad,
-                "GHOSTFRAME_ALLOWED_USERS: ignoring malformed entry (expected a login \
-                 name like alice@example.com or a tag like tag:ops)"
+                "ignoring malformed access setting (GHOSTFRAME_ALLOWED_USERS takes login \
+                 names like alice@example.com and tags like tag:ops; \
+                 GHOSTFRAME_ACCESS_RECHECK_SECS takes whole seconds, 1 to 86400, and the \
+                 default applies)"
             );
         }
+        tracing::info!(
+            recheck_secs = access.recheck_interval.as_secs(),
+            "tailnet access: connected sessions are re-checked at this interval"
+        );
         let logins: Vec<&str> = self.allowed_logins().collect();
         let tags: Vec<&str> = self.allowed_tags().collect();
         match &self.owner {
@@ -434,12 +440,209 @@ impl DecisionCache {
         self.entries.insert(ip, (decision, lookup, now + ttl));
     }
 
+    /// Forget what is remembered for `ip`, so the next decision looks the
+    /// peer up again.
+    pub fn invalidate(&mut self, ip: IpAddr) {
+        self.entries.remove(&ip);
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+/// What a re-check of a live session's peer found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recheck {
+    Allowed,
+    /// The rule no longer admits the peer. The session is closed.
+    Revoked,
+    /// The lookup itself failed, which says nothing about the peer.
+    /// [`SessionRechecker`] allows one retry before closing.
+    LookupFailed,
+    /// A background lookup was queued; the answer arrives later.
+    Pending,
+    /// No room for a lookup right now; try again shortly.
+    Busy,
+}
+
+impl Recheck {
+    /// Map a decision of [`AccessPolicy::decide`]. A peer that cannot be
+    /// identified for lack of any identity source is revoked, not retried.
+    pub fn from_decision(d: &Decision) -> Self {
+        match d {
+            Decision::Allow(_) => Self::Allowed,
+            Decision::Deny(DenyReason::LookupFailed(_)) => Self::LookupFailed,
+            Decision::Deny(_) => Self::Revoked,
+        }
+    }
+}
+
+/// How often a live session's peer is checked again unless configured
+/// otherwise (`GHOSTFRAME_ACCESS_RECHECK_SECS`).
+pub(crate) const DEFAULT_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// Smallest and largest accepted re-check interval, in seconds. Zero would
+/// mean a lookup per loop turn; beyond a day is indistinguishable from never.
+pub(crate) const MIN_RECHECK_SECS: u64 = 1;
+pub(crate) const MAX_RECHECK_SECS: u64 = 24 * 60 * 60;
+/// After a failed lookup, when to ask once more before giving up on a session.
+pub(crate) const RECHECK_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// After [`Recheck::Busy`], when to try again.
+pub(crate) const RECHECK_BUSY_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Debug)]
+struct RecheckEntry {
+    ip: IpAddr,
+    next_at: Instant,
+    /// The previous lookup failed (transport error, not a refusal).
+    failed_once: bool,
+}
+
+/// When each live session's peer is next re-checked, and what to do with the
+/// answer. Holds no policy of its own: every question goes to
+/// [`PeerGate::recheck`], so the access rule and its cache are the ones the
+/// listener uses for new connections.
+///
+/// `K` identifies a session (a `ConnectionHandle` in the bridge). Entries are
+/// dropped by [`Self::sync`] when their session leaves the live set, and by
+/// [`Self::forget`].
+///
+/// # Lookup errors
+///
+/// A refusal closes the session at once. A *failed lookup* (the tailnet
+/// daemon did not answer) is not a refusal, and closing a working session on
+/// one blip would be its own outage; but it is not an admission either. The
+/// rule: the first failure schedules one retry after [`RECHECK_RETRY_DELAY`],
+/// a second consecutive failure closes the session (fail closed), and any
+/// answer in between resets the count.
+#[derive(Debug)]
+pub struct SessionRechecker<K> {
+    interval: Duration,
+    entries: HashMap<K, RecheckEntry>,
+}
+
+impl<K: Copy + Eq + std::hash::Hash> SessionRechecker<K> {
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Make the tracked set equal `live`: new sessions get their first
+    /// re-check one interval from `now`, sessions no longer live are dropped.
+    pub fn sync(&mut self, live: impl IntoIterator<Item = (K, IpAddr)>, now: Instant) {
+        let live: HashMap<K, IpAddr> = live.into_iter().collect();
+        self.entries.retain(|k, _| live.contains_key(k));
+        for (k, ip) in live {
+            // A key whose address changed is a different session that reused
+            // the key (quinn recycles connection handles): start it afresh.
+            if self.entries.get(&k).is_some_and(|e| e.ip != ip) {
+                self.entries.remove(&k);
+            }
+            self.entries.entry(k).or_insert(RecheckEntry {
+                ip,
+                next_at: now + self.interval,
+                failed_once: false,
+            });
+        }
+    }
+
+    pub fn forget(&mut self, k: &K) {
+        self.entries.remove(k);
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The earliest moment anything is due, for the event loop's wakeup.
+    pub fn next_due(&self) -> Option<Instant> {
+        self.entries.values().map(|e| e.next_at).min()
+    }
+
+    /// Re-check every session that is due. Returns the sessions to close.
+    pub fn run_due(&mut self, gate: &mut PeerGate, now: Instant) -> Vec<K> {
+        let due: Vec<K> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.next_at <= now)
+            .map(|(k, _)| *k)
+            .collect();
+        let mut close = Vec::new();
+        for k in due {
+            let Some(ip) = self.entries.get(&k).map(|e| e.ip) else {
+                continue;
+            };
+            match gate.recheck(ip, now) {
+                Recheck::Pending => {
+                    // The answer arrives through `apply`. Until then, do not
+                    // ask again; if it never does, ask again next interval.
+                    self.set_next(&k, now + self.interval);
+                }
+                Recheck::Busy => self.set_next(&k, now + RECHECK_BUSY_DELAY),
+                outcome @ (Recheck::Allowed | Recheck::Revoked | Recheck::LookupFailed) => {
+                    if self.apply_outcome(&k, outcome, now) {
+                        close.push(k);
+                    }
+                }
+            }
+        }
+        close
+    }
+
+    /// A background lookup for `ip` finished with `decision`. Applies to
+    /// every tracked session at that address. Returns the sessions to close.
+    pub fn apply(&mut self, ip: IpAddr, decision: &Decision, now: Instant) -> Vec<K> {
+        let outcome = Recheck::from_decision(decision);
+        let keys: Vec<K> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.ip == ip)
+            .map(|(k, _)| *k)
+            .collect();
+        keys.into_iter()
+            .filter(|k| self.apply_outcome(k, outcome, now))
+            .collect()
+    }
+
+    fn set_next(&mut self, k: &K, at: Instant) {
+        if let Some(e) = self.entries.get_mut(k) {
+            e.next_at = at;
+        }
+    }
+
+    /// Returns true when the session must be closed (and stops tracking it).
+    fn apply_outcome(&mut self, k: &K, outcome: Recheck, now: Instant) -> bool {
+        let Some(e) = self.entries.get_mut(k) else {
+            return false;
+        };
+        match outcome {
+            Recheck::Allowed => {
+                e.failed_once = false;
+                e.next_at = now + self.interval;
+                false
+            }
+            Recheck::LookupFailed if !e.failed_once => {
+                e.failed_once = true;
+                e.next_at = now + RECHECK_RETRY_DELAY;
+                false
+            }
+            Recheck::LookupFailed | Recheck::Revoked => {
+                self.entries.remove(k);
+                true
+            }
+            // Not answers; callers never pass them.
+            Recheck::Pending | Recheck::Busy => false,
+        }
     }
 }
 
@@ -593,14 +796,49 @@ impl PeerGate {
     /// Apply a finished lookup: decide, cache, log a refusal. Returns
     /// whether `ip` is admitted.
     pub fn resolve(&mut self, ip: IpAddr, lookup: &PeerLookup, now: Instant) -> bool {
+        self.resolve_decision(ip, lookup, now).is_allowed()
+    }
+
+    /// [`Self::resolve`], returning the decision itself.
+    pub fn resolve_decision(&mut self, ip: IpAddr, lookup: &PeerLookup, now: Instant) -> Decision {
         self.in_flight.remove(&ip);
         let decision = self.policy.decide(lookup);
         if let Decision::Deny(reason) = &decision {
             self.denials.record(now, ip, "quic", Some(lookup), reason);
         }
-        let allowed = decision.is_allowed();
-        self.cache.insert(ip, decision, Some(lookup.clone()), now);
-        allowed
+        self.cache
+            .insert(ip, decision.clone(), Some(lookup.clone()), now);
+        decision
+    }
+
+    /// Ask again whether an already-admitted peer at `ip` may stay.
+    ///
+    /// The same rule ([`AccessPolicy::decide`]) and the same cache as
+    /// [`Self::check`]; the one difference is that the remembered decision for
+    /// `ip` is dropped first, because a re-check that is answered from a
+    /// 30 s-old admission would only measure the cache. A lookup that must run
+    /// in the background is queued exactly like a new connection's
+    /// ([`Self::take_requests`]) and its answer comes back through
+    /// [`Self::resolve_decision`].
+    pub fn recheck(&mut self, ip: IpAddr, now: Instant) -> Recheck {
+        self.cache.invalidate(ip);
+        let Some(source) = self.source.clone() else {
+            // Nothing can say who this is any more: fail closed.
+            self.denials
+                .record(now, ip, "quic", None, &DenyReason::NoIdentitySource);
+            return Recheck::Revoked;
+        };
+        if source.is_immediate() {
+            let lookup = source.lookup(ip);
+            return Recheck::from_decision(&self.resolve_decision(ip, &lookup, now));
+        }
+        // Nothing is held for a re-check, so there is always room to hold.
+        match self.check(ip, now, true) {
+            GateCheck::Allow => Recheck::Allowed,
+            GateCheck::Deny => Recheck::Revoked,
+            GateCheck::Pending => Recheck::Pending,
+            GateCheck::Busy => Recheck::Busy,
+        }
     }
 }
 
@@ -658,6 +896,7 @@ mod tests {
             allowed_logins: logins.iter().map(|s| s.to_string()).collect(),
             allowed_tags: tags.iter().map(|s| s.to_string()).collect(),
             rejected: vec![],
+            ..AccessConfig::default()
         }
     }
 
@@ -1103,5 +1342,218 @@ mod tests {
             "garbage",
             Ok(user(OWNER_ID, "o"))
         ));
+    }
+    // ── Re-checking live sessions ─────────────────────────────────────────
+
+    /// A source whose answer the test changes between re-checks.
+    struct Switch {
+        answer: Mutex<PeerLookup>,
+        immediate: bool,
+    }
+
+    impl Switch {
+        fn set(&self, a: PeerLookup) {
+            *self.answer.lock().unwrap() = a;
+        }
+    }
+
+    impl PeerIdentitySource for Switch {
+        fn lookup(&self, _: IpAddr) -> PeerLookup {
+            self.answer.lock().unwrap().clone()
+        }
+        fn is_immediate(&self) -> bool {
+            self.immediate
+        }
+    }
+
+    const IV: Duration = Duration::from_secs(60);
+
+    fn switch_gate(immediate: bool) -> (PeerGate, Arc<Switch>) {
+        let src = Arc::new(Switch {
+            answer: Mutex::new(Ok(user(OWNER_ID, "owner@example.com"))),
+            immediate,
+        });
+        let g = PeerGate::new(
+            Arc::new(owned_policy(&[], &[])),
+            src.clone(),
+            Arc::new(DenialLog::new()),
+        );
+        (g, src)
+    }
+
+    fn peer_ip() -> IpAddr {
+        "100.64.0.2".parse().unwrap()
+    }
+
+    fn stranger() -> PeerLookup {
+        Ok(user(7, "stranger@example.com"))
+    }
+
+    fn failed() -> PeerLookup {
+        Err(WhoIsError::Failed("tailscaled unreachable".into()))
+    }
+
+    #[test]
+    fn allowed_then_revoked_is_closed_within_one_interval() {
+        let t0 = Instant::now();
+        let (mut gate, src) = switch_gate(true);
+        let mut r = SessionRechecker::new(IV);
+        r.sync([(1u32, peer_ip())], t0);
+        assert_eq!(r.next_due(), Some(t0 + IV));
+
+        // Not due yet: nothing asked, nothing closed.
+        assert!(r
+            .run_due(&mut gate, t0 + IV - Duration::from_secs(1))
+            .is_empty());
+        // Due, and still allowed.
+        assert!(r.run_due(&mut gate, t0 + IV).is_empty());
+        assert_eq!(r.len(), 1);
+
+        // Access is revoked. The cache still holds the admission just made,
+        // which the re-check must not be answered from.
+        let next = r.next_due().unwrap();
+        assert_eq!(next, t0 + IV + IV);
+        let cached_at = next - Duration::from_secs(5);
+        assert!(gate.check(peer_ip(), cached_at, true) == GateCheck::Allow);
+        assert!(
+            cached_at + ALLOW_TTL > next,
+            "the admission is still cached"
+        );
+        src.set(stranger());
+        assert!(r
+            .run_due(&mut gate, next - Duration::from_secs(1))
+            .is_empty());
+        assert_eq!(r.run_due(&mut gate, next), vec![1]);
+        assert!(r.is_empty(), "a closed session is no longer tracked");
+    }
+
+    #[test]
+    fn still_allowed_stays_open_across_many_intervals() {
+        let t0 = Instant::now();
+        let (mut gate, _src) = switch_gate(true);
+        let mut r = SessionRechecker::new(IV);
+        r.sync([(1u32, peer_ip())], t0);
+        for i in 1..=20u32 {
+            assert!(r.run_due(&mut gate, t0 + IV * i).is_empty(), "interval {i}");
+        }
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn unknown_peer_at_recheck_is_closed_at_once() {
+        let t0 = Instant::now();
+        let (mut gate, src) = switch_gate(true);
+        src.set(Err(WhoIsError::NotFound));
+        let mut r = SessionRechecker::new(IV);
+        r.sync([(1u32, peer_ip())], t0);
+        assert_eq!(r.run_due(&mut gate, t0 + IV), vec![1]);
+    }
+
+    // A failed lookup is not a refusal: one retry, then fail closed.
+    #[test]
+    fn one_failed_lookup_is_retried_and_two_in_a_row_close() {
+        let t0 = Instant::now();
+        let (mut gate, src) = switch_gate(true);
+        src.set(failed());
+        let mut r = SessionRechecker::new(IV);
+        r.sync([(1u32, peer_ip())], t0);
+
+        assert!(
+            r.run_due(&mut gate, t0 + IV).is_empty(),
+            "first failure spares it"
+        );
+        assert_eq!(r.next_due(), Some(t0 + IV + RECHECK_RETRY_DELAY));
+        assert_eq!(r.run_due(&mut gate, t0 + IV + RECHECK_RETRY_DELAY), vec![1]);
+    }
+
+    #[test]
+    fn a_failure_followed_by_an_answer_starts_the_count_again() {
+        let t0 = Instant::now();
+        let (mut gate, src) = switch_gate(true);
+        let mut r = SessionRechecker::new(IV);
+        r.sync([(1u32, peer_ip())], t0);
+
+        src.set(failed());
+        assert!(r.run_due(&mut gate, t0 + IV).is_empty());
+        src.set(Ok(user(OWNER_ID, "owner@example.com")));
+        let t1 = t0 + IV + RECHECK_RETRY_DELAY;
+        assert!(r.run_due(&mut gate, t1).is_empty());
+        assert_eq!(r.next_due(), Some(t1 + IV), "back on the normal cadence");
+        // A new failure is a first failure again, not a second.
+        src.set(failed());
+        assert!(r.run_due(&mut gate, t1 + IV).is_empty());
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn background_lookup_is_queued_then_applied() {
+        let t0 = Instant::now();
+        let (mut gate, src) = switch_gate(false);
+        let mut r = SessionRechecker::new(IV);
+        r.sync([(1u32, peer_ip())], t0);
+
+        // Due: the lookup is queued for a worker, nobody is closed, and the
+        // loop is not asked to block.
+        assert!(r.run_due(&mut gate, t0 + IV).is_empty());
+        assert_eq!(gate.take_requests(), vec![peer_ip()]);
+        assert!(gate.is_pending(peer_ip()));
+        // Not asked again while the answer is outstanding.
+        assert!(r
+            .run_due(&mut gate, t0 + IV + Duration::from_secs(1))
+            .is_empty());
+        assert!(gate.take_requests().is_empty());
+
+        // The answer: still allowed.
+        let d = gate.resolve_decision(peer_ip(), &src.lookup(peer_ip()), t0 + IV);
+        assert!(r.apply(peer_ip(), &d, t0 + IV).is_empty());
+
+        // Next interval it is revoked.
+        let t1 = t0 + IV + IV;
+        assert!(r.run_due(&mut gate, t1).is_empty());
+        assert_eq!(gate.take_requests(), vec![peer_ip()]);
+        src.set(stranger());
+        let d = gate.resolve_decision(peer_ip(), &src.lookup(peer_ip()), t1);
+        assert_eq!(r.apply(peer_ip(), &d, t1), vec![1]);
+    }
+
+    #[test]
+    fn an_answer_for_one_address_does_not_touch_another() {
+        let t0 = Instant::now();
+        let other: IpAddr = "100.64.0.3".parse().unwrap();
+        let (mut gate, _src) = switch_gate(false);
+        let mut r = SessionRechecker::new(IV);
+        r.sync([(1u32, peer_ip()), (2u32, other)], t0);
+        let d = gate.resolve_decision(peer_ip(), &stranger(), t0);
+        assert_eq!(r.apply(peer_ip(), &d, t0), vec![1]);
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn sync_drops_sessions_that_are_gone_and_keeps_schedules() {
+        let t0 = Instant::now();
+        let mut r = SessionRechecker::new(IV);
+        r.sync([(1u32, peer_ip()), (2u32, peer_ip())], t0);
+        r.sync([(2u32, peer_ip())], t0 + Duration::from_secs(10));
+        assert_eq!(r.len(), 1);
+        // Session 2 keeps its original deadline, not a fresh one.
+        assert_eq!(r.next_due(), Some(t0 + IV));
+    }
+
+    #[test]
+    fn a_reused_key_for_another_address_starts_afresh() {
+        let t0 = Instant::now();
+        let other: IpAddr = "100.64.0.3".parse().unwrap();
+        let mut r = SessionRechecker::new(IV);
+        r.sync([(1u32, peer_ip())], t0);
+        let t1 = t0 + Duration::from_secs(50);
+        r.sync([(1u32, other)], t1);
+        assert_eq!(r.next_due(), Some(t1 + IV));
+    }
+
+    #[test]
+    fn no_identity_source_revokes_rather_than_trusting_the_cache() {
+        let t0 = Instant::now();
+        let mut gate = PeerGate::deny_all();
+        assert_eq!(gate.recheck(peer_ip(), t0), Recheck::Revoked);
     }
 }
