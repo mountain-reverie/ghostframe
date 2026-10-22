@@ -216,10 +216,26 @@ impl IoBridge {
             // enough run of ready channel reads report Pending, which here
             // would end the step early for no reason related to the scene.
             let mut fut = Box::pin(tokio::task::unconstrained(self.turn()));
-            match fut.as_mut().poll(&mut cx) {
+            let polled = fut.as_mut().poll(&mut cx);
+            drop(fut);
+            match polled {
                 Poll::Ready(Ok(TurnEnd::Continue)) => turns += 1,
                 Poll::Ready(Ok(TurnEnd::Eof)) => return Ok(turns),
                 Poll::Ready(Err(e)) => return Err(e),
+                // Pending after the select picked an arm means a handler (or
+                // `post_turn`) awaited something that was not ready. Dropping
+                // the turn here, as the arms below do, would silently throw
+                // away the rest of that handler: a half-read frame body, a
+                // half-applied step. Say so instead.
+                Poll::Pending if self.arm_picked => {
+                    return Err(
+                        "the bridge's turn went Pending inside a handler (after its \
+                                select! picked an arm): stepping would drop the rest of the \
+                                handler. A handler must not await anything that is not \
+                                ready, or this harness cannot step it"
+                            .into(),
+                    );
+                }
                 // Woken while polled means "poll me again" (a yield), not
                 // "waiting on something external".
                 Poll::Pending if flag.0.load(Ordering::SeqCst) => {}
@@ -406,5 +422,52 @@ impl IoBridge {
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn scheduler_refinement_peek_for_test(&self) -> Vec<crate::transport::scheduler::TileWork> {
         self.scheduler.refinement_peek_for_test()
+    }
+}
+
+#[cfg(test)]
+mod stepping_tests {
+    use super::*;
+    use crate::transport::ghostbridge::encode_frame;
+    use crate::transport::io_bridge::mem_stream_pair;
+
+    fn stepped() -> (IoBridge, MemStream) {
+        let (ours, theirs) = mem_stream_pair();
+        let (_tx, rx) = mpsc::channel(1);
+        let server = QuicServer::new().expect("server");
+        (
+            IoBridge::new_stepped_for_test(ours, server, rx, 4, 4),
+            theirs,
+        )
+    }
+
+    /// A handler that awaits something not ready must be an error: the
+    /// stepper drops a pending turn, which throws away the rest of the
+    /// handler. Here the frame header is in the pipe and its body is not, so
+    /// `process_inbound`'s body `read_exact` goes Pending after the select
+    /// picked the inbound arm.
+    #[tokio::test]
+    async fn a_handler_that_goes_pending_mid_turn_is_an_error_not_a_dropped_half_turn() {
+        let (mut bridge, theirs) = stepped();
+        let frame = encode_frame(&[1, 2, 3], &"127.0.0.1:9".parse().unwrap());
+        theirs.push(&frame[..8]);
+        let err = bridge
+            .step_until_idle()
+            .expect_err("a Pending inside a handler must not be swallowed");
+        assert!(
+            err.to_string().contains("Pending inside a handler"),
+            "{err}"
+        );
+    }
+
+    /// Control, so the test above cannot pass by erroring on anything: the
+    /// same frame, whole, steps cleanly, and so does an empty pipe.
+    #[tokio::test]
+    async fn a_whole_frame_and_an_idle_pipe_step_cleanly() {
+        let (mut bridge, theirs) = stepped();
+        assert!(bridge.step_until_idle().is_ok(), "idle pipe");
+        theirs.push(&encode_frame(&[1, 2, 3], &"127.0.0.1:9".parse().unwrap()));
+        let turns = bridge.step_until_idle().expect("whole frame");
+        assert!(turns >= 1, "premise: the frame was taken ({turns} turns)");
     }
 }

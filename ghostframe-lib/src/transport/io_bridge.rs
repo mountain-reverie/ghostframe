@@ -567,6 +567,12 @@ pub struct IoBridge {
     /// really held rather than when the driver submitted the frame.
     #[cfg(any(test, feature = "browserless-harness"))]
     pub(crate) hold_log: Option<HoldLog>,
+    /// Harness only: set once a turn's `select!` has picked an arm, cleared at
+    /// the start of the next turn. A stepping caller that finds the turn
+    /// pending while this is set would drop the rest of the handler on the
+    /// floor; see `step_until_idle`.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub(crate) arm_picked: bool,
 
     /// Lower bound applied to `base_budget_bytes`; `None` derives it from the
     /// live MTU (`tick_budget_floor`).
@@ -1280,6 +1286,8 @@ impl IoBridge {
             inbound_read_log: None,
             #[cfg(any(test, feature = "browserless-harness"))]
             hold_log: None,
+            #[cfg(any(test, feature = "browserless-harness"))]
+            arm_picked: false,
             tick_budget_floor_bytes: None,
             last_max_datagram_size: None,
             force_dirty_frames: 0,
@@ -1930,10 +1938,24 @@ impl IoBridge {
         }
     }
 
+    /// Record that the turn's `select!` has picked an arm and the handler is
+    /// running. Nothing in production.
+    #[inline(always)]
+    fn mark_arm_picked(&mut self) {
+        #[cfg(any(test, feature = "browserless-harness"))]
+        {
+            self.arm_picked = true;
+        }
+    }
+
     /// One pass of the event loop: wait for the first of the sources below,
     /// handle it, then do the per-turn housekeeping.
     async fn turn(&mut self) -> Result<TurnEnd, Box<dyn std::error::Error + Send + Sync>> {
         {
+            #[cfg(any(test, feature = "browserless-harness"))]
+            {
+                self.arm_picked = false;
+            }
             // Build a timer future that fires at the earliest QUIC timeout, or
             // a never-completing future if there are no active connections.
             let sleep_fut: Pin<Box<dyn Future<Output = ()> + Send>> =
@@ -1952,6 +1974,7 @@ impl IoBridge {
                 // 1. Earliest QUIC timeout fired.
                 _ = sleep_fut => {
                     self.loop_state.diag_timeout_arm += 1;
+                    self.mark_arm_picked();
                     #[cfg(test)]
                     self.loop_arm_trace.push(LoopArm::Timeout);
                     let reaped = self.server.handle_timeout(now_std());
@@ -1965,6 +1988,7 @@ impl IoBridge {
                 // cache TTL) and cheap, so it is not part of the
                 // inbound/frame fairness below.
                 looked_up = self.peer_lookup_rx.recv() => {
+                    self.mark_arm_picked();
                     #[cfg(test)]
                     self.loop_arm_trace.push(LoopArm::PeerLookup);
                     if let Some((ip, stamp, lookup)) = looked_up {
@@ -1994,6 +2018,7 @@ impl IoBridge {
                 read_res = self.stream.read_exact(&mut self.loop_state.header), if !frames_turn => {
                     self.loop_state.diag_inbound_arm += 1;
                     self.loop_state.inbound_streak += 1;
+                    self.mark_arm_picked();
                     #[cfg(test)]
                     self.loop_arm_trace.push(LoopArm::Inbound);
                     match read_res {
@@ -2028,6 +2053,7 @@ impl IoBridge {
                     }
                 } => {
                     self.loop_state.inbound_streak = 0;
+                    self.mark_arm_picked();
                     #[cfg(test)]
                     self.loop_arm_trace.push(LoopArm::FrameResult);
                     match result {
@@ -2054,6 +2080,7 @@ impl IoBridge {
                 }, if self.in_flight.is_none() => {
                     self.loop_state.diag_frame_arm += 1;
                     self.loop_state.inbound_streak = 0;
+                    self.mark_arm_picked();
                     #[cfg(test)]
                     self.loop_arm_trace.push(LoopArm::Frame);
                     if let Some(frame) = frame {
@@ -2081,6 +2108,7 @@ impl IoBridge {
                     }
                 }, if self.held.is_none() => {
                     self.loop_state.inbound_streak = 0;
+                    self.mark_arm_picked();
                     #[cfg(test)]
                     self.loop_arm_trace.push(LoopArm::Injected);
                     match injected {
@@ -2104,6 +2132,7 @@ impl IoBridge {
                     }
                 } => {
                     self.loop_state.inbound_streak = 0;
+                    self.mark_arm_picked();
                     #[cfg(test)]
                     self.loop_arm_trace.push(LoopArm::InjectedHeld);
                     if let Some(held) = self.held.take() {
@@ -2122,6 +2151,7 @@ impl IoBridge {
                 // a round with inbound switched off and no frame pending
                 // would wait on a frame that may not be coming.
                 _ = std::future::ready(()), if frames_turn => {
+                    self.mark_arm_picked();
                     self.loop_state.inbound_streak = 0;
                 }
             }
