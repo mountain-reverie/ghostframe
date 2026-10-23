@@ -89,6 +89,9 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
             .with_env_var("RUST_LOG", "ghostframe=trace,debug")
             .with_env_var("GHOSTFRAME_WEB_TLS_CERT_PEM", &e2e_cert.cert_pem)
             .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem)
+            // The page is loaded through the host forwarder, so its Origin is
+            // https://127.0.0.1:<port>, not the node's FQDN.
+            .with_env_var("GHOSTFRAME_WEB_ORIGINS", "https://127.0.0.1:*")
             .with_ready_conditions(vec![WaitFor::message_on_stdout("QUIC server ready")])
             .with_startup_timeout(Duration::from_secs(120))
             .start()
@@ -420,6 +423,9 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
             .with_env_var("RUST_LOG", "ghostframe=trace,debug")
             .with_env_var("GHOSTFRAME_WEB_TLS_CERT_PEM", &e2e_cert.cert_pem)
             .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem)
+            // The page is loaded through the host forwarder, so its Origin is
+            // https://127.0.0.1:<port>, not the node's FQDN.
+            .with_env_var("GHOSTFRAME_WEB_ORIGINS", "https://127.0.0.1:*")
             .with_ready_conditions(vec![WaitFor::message_on_stdout("QUIC server ready")])
             .with_startup_timeout(Duration::from_secs(120))
             .start()

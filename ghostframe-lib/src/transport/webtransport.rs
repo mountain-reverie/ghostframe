@@ -23,6 +23,7 @@
 //! `quarter_id = session_stream_id / 4`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
@@ -463,10 +464,13 @@ impl WebTransportServer {
                 // 200, or 403 for an Origin we do not serve the client from.
                 let response = self.connect_response(&req);
                 let refused = !response.status.is_success();
-                if refused {
+                // At most one warning per second: a page retrying in a loop
+                // must not flood the journal.
+                if refused && refusal_log_due() {
                     tracing::warn!(
                         stream_id = ?sid,
                         origin = ?req.headers.get_all(web_transport_proto::http::header::ORIGIN),
+                        allowed = ?self.origin_policy.describe(),
                         "WebTransport CONNECT refused: Origin not allowed"
                     );
                 }
@@ -577,6 +581,16 @@ fn drain_stream(conn: &mut Connection, sid: StreamId) -> Result<Vec<u8>, DrainEr
 }
 
 // ─── unit tests ──────────────────────────────────────────────────────────────
+
+/// True at most once per second, process-wide (rate limit for the refused-
+/// Origin warning).
+fn refusal_log_due() -> bool {
+    static LAST_SECS: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    LAST_SECS.swap(now, Ordering::Relaxed) != now
+}
 
 #[cfg(test)]
 mod tests {
