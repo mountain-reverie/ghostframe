@@ -118,13 +118,13 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
     use ghostframe_lib::transport::reliable_emitter::emission_queue::WireClass as W;
     println!(
         "D1INSTR {name}: window_ms={} fifo_samples={} fifo_max_B={} fifo_peak_at_enqueue_B={} \
-         fifo_mean_B={} fifo_slope_last_quarter_Bps={} cwnd_limited_fraction={:.3} \
-         offered_Bps[crit={:.0} refine={:.0} nack={:.0} rto={:.0} parity={:.0} h264={:.0} \
+         fifo_mean_B={} fifo_slope_last_quarter_Bps={} quinn_limited[turns={:.3} time={:.3}] \
+         offered_Bps[crit={:.0} refine={:.0} nack={:.0} rto={:.0} sched_retry={:.0} parity={:.0} h264={:.0} \
          control={:.0} overhead={:.0}] offered_total_B={} quinn_enqueued_B={} \
          quinn_departed_Bps={:.0} lag_us[n={} p50={} p95={} max={}] mirror_len={} \
-         mirror_overflowed={} budget_ticks[cwnd={} pacer={} floor={} probe={} sendbuf_clamped={}] \
+         mirror_overflowed={} budget_ticks[cwnd={} pacer={} floor={} probe={} aimd={} sendbuf_clamped={} giveback_ticks={} giveback_B={}] \
          ledger[declared={} flushed={} overflowed={} late_before_flush={} late_after_flush={} \
-         late_unreported={}] \
+         late_unreported={} unknown_acks={} tombstone_evictions={}] \
          ecn[ect0={} unmarked={} last_marked={}] rto_fired={} rto_spurious={} rto_useful={}",
         i.window_us / 1000,
         i.fifo_samples,
@@ -132,11 +132,13 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
         i.fifo_depth_peak_at_enqueue,
         i.fifo_depth_mean,
         i.fifo_depth_slope_last_quarter_bps,
-        i.cwnd_limited_fraction(),
+        i.quinn_limited_turn_fraction(),
+        i.quinn_limited_time_fraction(),
         i.per_second(i.offered.of(W::Critical)),
         i.per_second(i.offered.of(W::Refinement)),
         i.per_second(i.offered.of(W::NackRepair)),
         i.per_second(i.offered.of(W::RtoRetransmit)),
+        i.per_second(i.offered.of(W::SchedulerRetry)),
         i.per_second(i.offered.of(W::Parity)),
         i.per_second(i.offered.of(W::H264)),
         i.per_second(i.offered.of(W::Control)),
@@ -154,13 +156,18 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
         i.budget.pacer,
         i.budget.floor,
         i.budget.probe,
+        i.budget.aimd,
         i.budget.sendbuf_clamped,
+        i.budget.giveback_ticks,
+        i.budget.giveback_bytes,
         i.ledger_losses_declared,
         i.ledger_losses_flushed,
         i.ledger_losses_overflowed,
         i.late_acked_before_flush,
         i.late_acked_after_flush,
         i.late_acked_unreported,
+        i.ledger_unknown_acks,
+        i.ledger_tombstone_evictions,
         i.ecn.ect0_tx,
         i.ecn.unmarked_tx,
         i.ecn.last_marked,
@@ -205,8 +212,14 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
         i.fifo_depth_slope_last_quarter_bps != 0,
         "{n}: slope is zero"
     );
-    assert!(i.cwnd_limited_turns > 0, "{n}: no cwnd-limited turn");
-    assert!(i.cwnd_limited_turns <= i.fifo_samples);
+    assert!(i.quinn_limited_turns > 0, "{n}: no quinn-limited turn");
+    assert!(i.quinn_limited_turns <= i.fifo_samples);
+    assert!(
+        i.quinn_limited_us > 0 && i.quinn_limited_us <= i.window_us,
+        "{n}: quinn-limited time {} of {} us",
+        i.quinn_limited_us,
+        i.window_us
+    );
     // Offered load against quinn: every byte billed, none twice.
     for c in [W::Critical, W::Refinement, W::Parity, W::Control] {
         assert!(i.offered.of(c) > 0, "{n}: {c:?} never billed");
@@ -259,6 +272,18 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
             assert!(i.offered.of(c) > 0, "{n}: {c:?} never billed under loss");
         }
         assert!(i.ledger_losses_declared > 0, "{n}: no ledger loss");
+        assert!(
+            i.ledger_losses_overflowed > 0,
+            "{n}: the pending cap never dropped a loss"
+        );
+        assert!(
+            i.ledger_tombstone_evictions > 0 && i.ledger_unknown_acks > 0,
+            "{n}: the tombstone ring never evicted / no late ack went unresolved"
+        );
+        assert!(
+            i.budget.giveback_ticks > 0 && i.budget.giveback_bytes > 0,
+            "{n}: retransmission never came out of the scheduler budget"
+        );
         assert!(i.ledger_losses_flushed > 0, "{n}: no loss reached goog_cc");
         assert!(
             i.ledger_losses_flushed + i.ledger_losses_overflowed <= i.ledger_losses_declared,
@@ -406,9 +431,11 @@ async fn iid_versus_burst_loss_at_equal_average_rate() {
     );
 }
 
-/// With the floor pinned far above the bandwidth term, the floor is what sets
-/// the budget: the binding-term counter must say so, and the bandwidth term
-/// must not.
+/// With the floor pinned far above the bandwidth term, the bandwidth term can
+/// never be what binds, and the floor is counted on the ticks where nothing
+/// ranks above it. It is NOT the term that sets most budgets: once the pacer
+/// is trusted (150 samples) the pacer's min ranks first and takes the rest of
+/// the ticks (floor=2, pacer=115 in the recorded run).
 #[tokio::test(start_paused = true)]
 async fn the_budget_floor_term_is_counted_when_it_binds() {
     let mut sc = scene(0xB0_B057, 4);
@@ -420,8 +447,49 @@ async fn the_budget_floor_term_is_counted_when_it_binds() {
     let b = r.transport.instr.budget;
     println!("D1INSTR floor_pinned: budget={b:?}");
     assert!(b.floor > 0, "floor never bound with the floor pinned high");
+    assert_eq!(
+        b.cwnd, 0,
+        "the bandwidth term cannot bind below a pinned floor"
+    );
+}
+
+/// A send buffer far below the offered load makes quinn's send-buffer clamp
+/// cut the budget (`sendbuf_clamped`). Neither it nor the blocked sends happen
+/// with the production 16 MiB buffer, which is the point of measuring them:
+/// F1 deletes the mechanism.
+///
+/// `budget.aimd` stays zero here by construction, not for want of blocked
+/// sends (`send_errs` is non-zero): the harness injects frames through
+/// `apply_injected_frame`, which never applies the AIMD multiplier (design
+/// §2.5, `emit.rs`). The `Aimd` term is pinned by
+/// `classify_prefers_probe_then_pacer_then_floor` in ghostframe-lib. Likewise
+/// `offered_scheduler_retry` and `offered_h264` are zero in every browserless
+/// scene (the scheduler's fallback retry needs the emitter to have lost a
+/// cache entry; the harness load is tile frames, never H.264); the retry label
+/// is pinned by `a_scheduler_retry_is_labelled_apart_from_a_first_send`.
+#[tokio::test(start_paused = true)]
+async fn the_send_buffer_clamp_and_aimd_backoff_are_counted_when_they_bind() {
+    let mut sc = scene(0xB0_B057, 6);
+    sc.datagram_send_buffer_bytes = Some(32 * 1024);
+    let r = run_browserless_with_links(sc, LinkOverrides::default())
+        .await
+        .expect("scene ran");
+    assert_established("small_buffer", &r);
+    let b = r.transport.instr.budget;
+    println!(
+        "D1INSTR small_buffer: budget={b:?} send_errs={}",
+        r.send_datagram_errs
+    );
     assert!(
-        b.floor > b.cwnd,
-        "bandwidth term bound more often than a pinned floor"
+        b.sendbuf_clamped > 0,
+        "the send-buffer clamp never cut a budget"
+    );
+    assert!(
+        r.send_datagram_errs > 0,
+        "premise: the small buffer rejected sends"
+    );
+    assert_eq!(
+        r.transport.instr.offered.total(),
+        r.transport.instr.quinn_bytes_enqueued
     );
 }
