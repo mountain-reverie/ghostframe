@@ -116,9 +116,10 @@ could link, for an SPA it never serves. `ghostframe-tsnet` now has a
 | on | `make archive` | yes | `ghostframe-lib`, and everything above it |
 
 `ghostframe-tsnet/build.rs` picks the target from `CARGO_FEATURE_WEB_EMBED`.
-Both targets write the same `libghostbridge.a`; switching between a client
-build and a server build is safe because Cargo re-runs the build script
-when the feature set changes.
+`build.rs` has make write the archive into Cargo's `OUT_DIR` (`make ... OUT=...`),
+so each feature set gets its own `libghostbridge.a` and nothing is written into
+the watched `ghostbridge/` directory. A manual `make archive` still writes
+`ghostbridge/libghostbridge.a`.
 
 Cargo features are additive, so anything whose dependency graph includes
 `ghostframe-lib` gets `web-embed` — `cargo build --workspace` and `just

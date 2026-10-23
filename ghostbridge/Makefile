@@ -3,6 +3,12 @@
 WEB_SRC = ../ghostframe-web-client/dist
 WEB_LOCAL = dist
 
+# Where the c-archive (and its .h, which go writes beside it) lands.
+# ghostframe-tsnet/build.rs points this at Cargo's OUT_DIR so the two
+# archive flavours never share a file and the build never writes into the
+# directory Cargo watches. A manual `make archive` keeps the local default.
+OUT ?= libghostbridge.a
+
 check-dist:
 	@test -f $(WEB_SRC)/index.html || ( \
 	  echo "error: ghostframe-web-client/dist not built" >&2; \
@@ -20,7 +26,7 @@ sync-dist: check-dist
 
 # The server archive: embeds the SPA, so it needs dist/ built first.
 archive: sync-dist
-	go build -buildmode=c-archive -o libghostbridge.a .
+	go build -buildmode=c-archive -o $(OUT) .
 	# This also generates libghostbridge.h
 
 # The native-client archive. Same tsnet surface, no //go:embed, so no npm
@@ -28,12 +34,10 @@ archive: sync-dist
 # used to require a web client build it never serves a byte of. Selected by
 # ghostframe-tsnet/build.rs when the `web-embed` feature is off.
 #
-# Writes the same libghostbridge.a as `archive`. That is safe because Cargo
-# re-runs the build script when the feature set changes, so switching
-# between a client build and a server build regenerates the archive rather
-# than linking the other one's.
+# build.rs gives each feature set its own OUT, so this and `archive` never
+# overwrite each other's archive.
 archive-noweb:
-	go build -tags noweb -buildmode=c-archive -o libghostbridge.a .
+	go build -tags noweb -buildmode=c-archive -o $(OUT) .
 
 clean:
 	rm -f libghostbridge.a libghostbridge.h
