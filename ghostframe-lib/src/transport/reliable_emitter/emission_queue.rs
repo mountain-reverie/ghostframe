@@ -25,6 +25,10 @@ pub enum WireClass {
     NackRepair,
     /// A retransmission the emitter's RTO timer fired.
     RtoRetransmit,
+    /// The scheduler re-sent a pass it had in flight and nothing else was
+    /// holding (`Scheduler::drain_priority_queue`'s fallback retry). It goes
+    /// through `submit_one` like a first send, so it is labelled here.
+    SchedulerRetry,
     /// FEC parity (tile groups and H.264 frames).
     Parity,
     /// H.264 frame fragments.
@@ -34,13 +38,14 @@ pub enum WireClass {
 }
 
 impl WireClass {
-    pub(crate) const COUNT: usize = 7;
+    pub(crate) const COUNT: usize = 8;
     #[cfg(test)]
     pub(crate) const ALL: [WireClass; Self::COUNT] = [
         WireClass::Critical,
         WireClass::Refinement,
         WireClass::NackRepair,
         WireClass::RtoRetransmit,
+        WireClass::SchedulerRetry,
         WireClass::Parity,
         WireClass::H264,
         WireClass::Control,

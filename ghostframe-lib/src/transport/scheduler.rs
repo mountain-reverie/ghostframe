@@ -173,6 +173,9 @@ pub struct Scheduler {
     /// spent its share and stopped, or stopped early with budget to spare.
     /// Those have different causes and different fixes.
     last_refinement_budget: usize,
+    /// Positions in the last tick's output that were re-sends of a pass
+    /// already in flight (the priority fallback retry). Measurement only.
+    last_tick_retries: Vec<usize>,
     /// Count of work items emitted in the current delivery window.
     delivery_window_emitted: u32,
     /// Count of ACKed items in the current delivery window.
@@ -216,6 +219,7 @@ impl Scheduler {
             retry_after: Duration::from_millis(40),
             refinement_bandwidth_fraction: 0.2,
             last_refinement_budget: 0,
+            last_tick_retries: Vec::new(),
             delivery_window_emitted: 0,
             delivery_window_acked: 0,
             low_delivery_rounds: 0,
@@ -828,6 +832,7 @@ impl Scheduler {
 
         let mut emitted = Vec::new();
         let retry_after = self.retry_after;
+        self.last_tick_retries.clear();
         Self::drain_priority_queue(
             &mut self.work,
             &mut self.priority_order,
@@ -836,6 +841,7 @@ impl Scheduler {
             now,
             recovery_owned,
             &mut emitted,
+            &mut self.last_tick_retries,
         );
         Self::drain_refinement_pass_major(
             &mut self.work,
@@ -854,6 +860,9 @@ impl Scheduler {
         emitted
     }
 
+    // `retries` is an observability out-parameter; bundling it with `out` would
+    // only move the argument count into a type used once.
+    #[allow(clippy::too_many_arguments)]
     fn drain_priority_queue(
         work: &mut Slab<TileWork>,
         order: &mut VecDeque<Handle>,
@@ -862,6 +871,7 @@ impl Scheduler {
         now: Instant,
         recovery_owned: &dyn Fn(u8, u8, u8) -> bool,
         out: &mut Vec<TileWork>,
+        retries: &mut Vec<usize>,
     ) {
         // Drop terminal-state entries first, freeing their slab slot.
         order.retain(|&h| match work.get(h) {
@@ -900,6 +910,9 @@ impl Scheduler {
             }
             if spent >= budget {
                 break;
+            }
+            if w.state == WorkState::InFlight {
+                retries.push(out.len());
             }
             w.state = WorkState::InFlight;
             w.last_sent_at = Some(now);
@@ -1011,6 +1024,12 @@ impl Scheduler {
 
     /// Diagnostic accessor: current refinement-bandwidth fraction.
     /// Refinement budget handed to the most recent `tick_at`.
+    /// Positions, in the last tick's output, of re-sends of a pass that was
+    /// already in flight. Observability only.
+    pub fn last_tick_retries(&self) -> &[usize] {
+        &self.last_tick_retries
+    }
+
     pub fn last_refinement_budget(&self) -> usize {
         self.last_refinement_budget
     }
@@ -1259,6 +1278,7 @@ mod tests {
         s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![1]));
         let first = s.tick(usize::MAX);
         assert_eq!(first.len(), 1);
+        assert!(s.last_tick_retries().is_empty(), "a first send is no retry");
 
         // Immediately ticking again — within 2×RTT, no retry.
         let second = s.tick(usize::MAX);
@@ -1267,6 +1287,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(15));
         let third = s.tick(usize::MAX);
         assert_eq!(third.len(), 1, "InFlight work should retry after 2×RTT");
+        assert_eq!(s.last_tick_retries(), &[0], "and it is reported as a retry");
     }
 
     /// The retry gate is the caller's ACK deadline, not a multiple of the

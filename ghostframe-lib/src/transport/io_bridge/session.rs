@@ -261,6 +261,7 @@ impl IoBridge {
         // (or the first ever). Per-session state of whoever came before
         // must not leak into the new session.
         if incumbent != Some(from) {
+            self.reset_session_instruments(from);
             let now = std::time::Instant::now();
             tracing::info!(
                 target: LOG_TARGET,
@@ -374,6 +375,11 @@ impl IoBridge {
         if self.last_hello_from == Some(handle) {
             // The live session is going; a frame in flight is its.
             self.session_epoch += 1;
+        }
+        // The session-scoped instruments describe this connection; quinn
+        // reuses handles, so a stale mirror would alias the next one.
+        if self.last_hello_from == Some(handle) || self.instr.mirror_handle() == Some(handle) {
+            self.instr.reset_session_scope(0);
         }
         self.wt_sessions.remove(&handle);
         self.feedback_recv_bufs.remove(&handle);
@@ -498,11 +504,15 @@ impl IoBridge {
                     // overwhelmingly `Blocked`).
                     if wt.send_datagram(conn, &datagram).is_ok() {
                         notices_sent += 1;
-                        self.instr.offered.bill(
-                            WireClass::Control,
-                            datagram.len(),
-                            wt.datagram_framing_len(),
-                        );
+                        // Only the live session's sends are billed: the
+                        // notice usually goes to a session that is no longer it.
+                        if self.last_hello_from == Some(handle) {
+                            self.instr.offered.bill(
+                                WireClass::Control,
+                                datagram.len(),
+                                wt.datagram_framing_len(),
+                            );
+                        }
                     }
                 }
             }

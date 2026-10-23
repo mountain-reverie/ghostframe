@@ -204,7 +204,9 @@ impl DepartureMirror {
             self.q.pop_front();
             self.lag.record(now.saturating_duration_since(enq));
             #[cfg(test)]
-            self.stamped.push((enq, now));
+            if self.stamped.len() < 4096 {
+                self.stamped.push((enq, now));
+            }
         }
     }
 }
@@ -241,6 +243,8 @@ pub struct FifoSeries {
     last: Option<(Instant, u64)>,
     samples: u64,
     nonempty: u64,
+    /// Microseconds the FIFO stood non-empty, each reading held until the next.
+    nonempty_us: u128,
     max: u64,
     weighted_byte_us: u128,
     width_us: u64,
@@ -254,6 +258,7 @@ impl Default for FifoSeries {
             last: None,
             samples: 0,
             nonempty: 0,
+            nonempty_us: 0,
             max: 0,
             weighted_byte_us: 0,
             width_us: 1_000,
@@ -266,7 +271,11 @@ impl FifoSeries {
     pub fn record(&mut self, now: Instant, depth: u64) {
         let t0 = *self.t0.get_or_insert(now);
         if let Some((tp, dp)) = self.last {
-            self.weighted_byte_us += dp as u128 * now.saturating_duration_since(tp).as_micros();
+            let dt = now.saturating_duration_since(tp).as_micros();
+            self.weighted_byte_us += dp as u128 * dt;
+            if dp > 0 {
+                self.nonempty_us += dt;
+            }
         }
         self.last = Some((now, depth));
         self.samples += 1;
@@ -327,9 +336,19 @@ impl FifoSeries {
         self.samples
     }
 
-    /// Readings with a non-empty FIFO: the turns that ended cwnd-limited.
+    /// Readings with a non-empty FIFO: turns that ended quinn-limited. That
+    /// is cwnd-limited OR held back by quinn's own pacer: both leave datagrams
+    /// queued (`connection/mod.rs:608` and `:617-625` both set
+    /// `congestion_blocked`), and this cannot tell them apart.
     pub fn nonempty(&self) -> u64 {
         self.nonempty
+    }
+
+    /// Microseconds the FIFO stood non-empty (the time-weighted counterpart
+    /// of [`Self::nonempty`], with the same reading-held-until-next rule as
+    /// the mean).
+    pub fn nonempty_us(&self) -> u64 {
+        self.nonempty_us.min(u64::MAX as u128) as u64
     }
 
     pub fn max(&self) -> u64 {
@@ -437,6 +456,9 @@ pub enum BudgetTerm {
     Cwnd,
     /// goog_cc's pacer rate was the smaller of the two.
     Pacer,
+    /// The AIMD multiplier (`tick_budget_multiplier` < 1, backed off by send
+    /// errors) cut the budget below the unscaled base.
+    Aimd,
     /// The one-datagram floor beat the bandwidth term.
     Floor,
     /// A probe window's target exceeded the paced budget.
@@ -452,12 +474,23 @@ pub struct BudgetBinding {
     pub pacer: u64,
     pub floor: u64,
     pub probe: u64,
+    pub aimd: u64,
     pub sendbuf_clamped: u64,
+    /// Ticks where retransmission replayed since the last tick was
+    /// subtracted from the budget (`RETRANSMIT_BUDGET_SHARE` give-back), and
+    /// the bytes subtracted.
+    pub giveback_ticks: u64,
+    pub giveback_bytes: u64,
 }
 
 impl BudgetBinding {
-    pub fn note(&mut self, term: BudgetTerm, clamped: bool) {
+    pub fn note(&mut self, term: BudgetTerm, clamped: bool, give_back: usize) {
+        if give_back > 0 {
+            self.giveback_ticks += 1;
+            self.giveback_bytes += give_back as u64;
+        }
         match term {
+            BudgetTerm::Aimd => self.aimd += 1,
             BudgetTerm::Cwnd => self.cwnd += 1,
             BudgetTerm::Pacer => self.pacer += 1,
             BudgetTerm::Floor => self.floor += 1,
@@ -469,7 +502,7 @@ impl BudgetBinding {
     }
 
     pub fn ticks(&self) -> u64 {
-        self.cwnd + self.pacer + self.floor + self.probe
+        self.cwnd + self.pacer + self.floor + self.probe + self.aimd
     }
 }
 
@@ -478,12 +511,15 @@ impl BudgetBinding {
 ///
 /// - `probe_binds`: a probe window was open and its budget beat the paced one.
 /// - `pacer_budget`: the pacer's per-tick bytes when the pacer is trusted.
-/// - `aimd_budget`: the budget before the pacer min.
+/// - `aimd_budget`: the budget before the pacer min, i.e. the unscaled base
+///   times the AIMD multiplier.
+/// - `unscaled_base`: `base_budget_bytes()` before the multiplier.
 /// - `cwnd_term` / `floor`: the two operands of `base_budget_bytes`'s `max`.
 pub fn classify_budget_term(
     probe_binds: bool,
     pacer_budget: Option<usize>,
     aimd_budget: usize,
+    unscaled_base: usize,
     cwnd_term: usize,
     floor: usize,
 ) -> BudgetTerm {
@@ -491,6 +527,8 @@ pub fn classify_budget_term(
         BudgetTerm::Probe
     } else if pacer_budget.is_some_and(|p| p < aimd_budget) {
         BudgetTerm::Pacer
+    } else if aimd_budget < unscaled_base {
+        BudgetTerm::Aimd
     } else if cwnd_term <= floor {
         BudgetTerm::Floor
     } else {
@@ -502,7 +540,13 @@ pub fn classify_budget_term(
 // ECN
 // ---------------------------------------------------------------------------
 
-/// What quinn put on its transmits. quinn-proto 0.11.14 keeps its ECN
+/// What quinn put on its transmits, across ALL connections (the count is taken
+/// in `drain_outbound`, which polls every connection; production runs one).
+/// quinn abandoning ECN is fixed by construction here, not a finding about the
+/// path: inbound ECN is hard-wired to `None` (`handle_datagram(.., None, ..)`)
+/// and `encode_frame_append` carries no ECN codepoint either way, so the peer
+/// can never echo counts and the first ACK without them disables ECN.
+/// quinn-proto 0.11.14 keeps its ECN
 /// validation state in `PathData::sending_ecn` (`connection/paths.rs:20`),
 /// which is `pub(super)`; the only accessor, `Connection::using_ecn`
 /// (`connection/mod.rs:3632`), is `#[cfg(test)] pub(crate)`. Nothing public
@@ -554,10 +598,14 @@ pub struct InstrumentSummary {
     pub fifo_depth_mean: u64,
     /// Least-squares slope over the last quarter of the window, bytes/s.
     pub fifo_depth_slope_last_quarter_bps: i64,
-    /// Turns that ended with a non-empty FIFO.
-    pub cwnd_limited_turns: u64,
+    /// Turns that ended with a non-empty FIFO: quinn-limited, meaning
+    /// cwnd-limited OR held by quinn's pacer (not distinguishable).
+    pub quinn_limited_turns: u64,
+    /// Microseconds the FIFO stood non-empty (time-weighted counterpart).
+    pub quinn_limited_us: u64,
     pub offered: OfferedBytes,
-    /// Bytes quinn accepted into its datagram queue (session counter).
+    /// Bytes quinn accepted into its datagram queue since the live session
+    /// began (the session counter minus its value at HELLO).
     pub quinn_bytes_enqueued: u64,
     /// `quinn_bytes_enqueued` minus what was still queued at the last reading.
     pub quinn_bytes_departed: u64,
@@ -585,7 +633,16 @@ pub struct InstrumentSummary {
     /// Late acknowledgements of losses that were neither retracted nor found
     /// among the reported ones (dropped by the pending cap, or reported so
     /// long ago the record aged out). goog_cc never heard of the former.
+    /// A LOWER BOUND: the ledger keeps declared-lost entries in a ring of
+    /// 16 384 tombstones, and a late acknowledgement for an evicted one
+    /// resolves to nothing, so it appears only in `ledger_unknown_acks`.
     pub late_acked_unreported: u64,
+    /// Acknowledgements naming a `wire_seq` the ledger knows nothing of
+    /// (duplicates, or declared lost and since evicted from the tombstones).
+    pub ledger_unknown_acks: u64,
+    /// Tombstones evicted by newer ones; each is a loss whose late
+    /// acknowledgement can no longer be classified.
+    pub ledger_tombstone_evictions: u64,
     pub ecn: EcnObservation,
 }
 
@@ -599,12 +656,21 @@ impl InstrumentSummary {
         }
     }
 
-    /// Fraction of turns that ended with queued datagrams.
-    pub fn cwnd_limited_fraction(&self) -> f64 {
+    /// Fraction of turns that ended with queued datagrams (quinn-limited).
+    pub fn quinn_limited_turn_fraction(&self) -> f64 {
         if self.fifo_samples == 0 {
             0.0
         } else {
-            self.cwnd_limited_turns as f64 / self.fifo_samples as f64
+            self.quinn_limited_turns as f64 / self.fifo_samples as f64
+        }
+    }
+
+    /// Fraction of the window the FIFO stood non-empty.
+    pub fn quinn_limited_time_fraction(&self) -> f64 {
+        if self.window_us == 0 {
+            0.0
+        } else {
+            self.quinn_limited_us as f64 / self.window_us as f64
         }
     }
 }
@@ -716,11 +782,23 @@ mod tests {
     #[test]
     fn classify_prefers_probe_then_pacer_then_floor() {
         use BudgetTerm::*;
-        assert_eq!(classify_budget_term(true, Some(1), 100, 100, 10), Probe);
-        assert_eq!(classify_budget_term(false, Some(50), 100, 100, 10), Pacer);
-        assert_eq!(classify_budget_term(false, Some(150), 100, 100, 10), Cwnd);
-        assert_eq!(classify_budget_term(false, None, 10, 5, 10), Floor);
-        assert_eq!(classify_budget_term(false, None, 100, 100, 10), Cwnd);
+        assert_eq!(
+            classify_budget_term(true, Some(1), 100, 100, 100, 10),
+            Probe
+        );
+        assert_eq!(
+            classify_budget_term(false, Some(50), 100, 100, 100, 10),
+            Pacer
+        );
+        assert_eq!(
+            classify_budget_term(false, Some(150), 100, 100, 100, 10),
+            Cwnd
+        );
+        // The multiplier cut a base that the bandwidth term had set.
+        assert_eq!(classify_budget_term(false, None, 50, 100, 100, 10), Aimd);
+        // Floor wins when the unscaled base is the floor.
+        assert_eq!(classify_budget_term(false, None, 10, 10, 5, 10), Floor);
+        assert_eq!(classify_budget_term(false, None, 100, 100, 100, 10), Cwnd);
     }
 
     #[test]
@@ -745,6 +823,10 @@ mod tests {
         for (i, c) in WireClass::ALL.iter().enumerate() {
             o.bill(*c, 100 + i, 2);
         }
-        assert_eq!(o.total(), (0..7).map(|i| 100 + i).sum::<u64>() + 14);
+        assert_eq!(
+            o.total(),
+            (0..WireClass::COUNT as u64).map(|i| 100 + i).sum::<u64>()
+                + 2 * WireClass::COUNT as u64
+        );
     }
 }
