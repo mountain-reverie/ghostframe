@@ -3,7 +3,10 @@
 # match the runtime environment exactly.
 FROM ubuntu:24.04 AS builder
 
-RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install -y --allow-unauthenticated --no-install-recommends \
+# rsync is required by ghostbridge/Makefile's sync-dist target. It sits in
+# this first apt layer, not in a RUN after the source COPYs: down there it was
+# re-run (apt-get update and a mirror round trip) on every source change.
+RUN apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::Retries=3 && apt-get install -o Acquire::Retries=3 -y --allow-unauthenticated --no-install-recommends \
     build-essential \
     ca-certificates \
     curl \
@@ -21,23 +24,33 @@ RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install
     libxext-dev \
     libxdamage-dev \
     libdrm-dev \
+    rsync \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust
 # Download to a file, then run it: `curl | sh` reports sh's status, so a failed
 # download (DNS down) yielded an empty script, a "successful" layer without
 # cargo, and that layer was then served from the BuildKit cache.
+#
+# `--default-toolchain none`: the only toolchain this image needs is the one
+# rust-toolchain.toml pins, installed in its own layer just below. Installing
+# rustup's default (current stable, ~485 MB with docs) and then letting the
+# pinned one auto-install inside the build RUN meant a second toolchain
+# download on every build and a layer nothing used.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh \
-    && sh /tmp/rustup-init.sh -y \
+    && sh /tmp/rustup-init.sh -y --default-toolchain none --profile minimal \
     && rm /tmp/rustup-init.sh
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN cargo install cbindgen
 
 WORKDIR /build
-# Copy workspace files for dependency caching
 # rust-toolchain.toml pins the compiler; copy it before any cargo invocation
-# so the image builds with the same rustc as CI and local dev.
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+# so the image builds with the same rustc as CI and local dev, and install it
+# here so the download is a cached layer rather than part of the build RUN.
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install
+
+# Copy workspace files for dependency caching
+COPY Cargo.toml Cargo.lock ./
 COPY ghostframe-lib/Cargo.toml ghostframe-lib/Cargo.toml
 COPY ghostframe-xdaemon/Cargo.toml ghostframe-xdaemon/Cargo.toml
 COPY ghostframe-test-pattern/Cargo.toml ghostframe-test-pattern/Cargo.toml
@@ -96,10 +109,6 @@ COPY ghostframe-test-pattern/ ghostframe-test-pattern/
 # must be prebuilt on the host (CI's web-client job or `npm run build`);
 # this Dockerfile does not install Node.
 COPY ghostframe-web-client/dist/ ghostframe-web-client/dist/
-
-# rsync is required by ghostbridge/Makefile's sync-dist target.
-RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install -y --allow-unauthenticated --no-install-recommends rsync \
-    && rm -rf /var/lib/apt/lists/*
 
 # Parallelism for the in-container release build. Default 6, which suits a
 # 12-core workstation that other jobs share; CI runners (small, and sharing a
