@@ -3,7 +3,7 @@
 
 use crate::transport::protocol::TileParityEnvelope;
 use crate::transport::reliable_emitter::cache::{CacheEntry, ProbeTag, RetransmitCache};
-use crate::transport::reliable_emitter::emission_queue::{Emission, EmissionQueue};
+use crate::transport::reliable_emitter::emission_queue::{Emission, EmissionQueue, WireClass};
 use crate::transport::reliable_emitter::parity::GroupBuilder;
 use crate::transport::reliable_emitter::rto::{rto_for_attempt, RtoTimerWheel};
 use crate::transport::reliable_emitter::traits::{DatagramSender, SendOutcome};
@@ -255,7 +255,8 @@ impl ReliableTileEmitter {
         self.feed_group(wire_seq, bytes.clone());
         self.note_emission_queue_depth();
         // Enqueue the source itself.
-        self.queue.push_source(bytes);
+        self.queue
+            .push_source(bytes, WireClass::for_first_send(key.pass_idx));
         self.stats.source_emitted += 1;
     }
 
@@ -473,7 +474,7 @@ impl ReliableTileEmitter {
                 self.feed_group(ws, bytes.clone());
             }
             spent += bytes.len();
-            self.queue.push_source(bytes);
+            self.queue.push_source(bytes, WireClass::NackRepair);
             self.stats.retransmit_attempts_total += 1;
             self.stats.retransmit_by_nack += 1;
             count += 1;
@@ -589,7 +590,7 @@ impl ReliableTileEmitter {
                 self.feed_group(ws, bytes.clone());
             }
             spent += bytes.len();
-            self.queue.push_source(bytes);
+            self.queue.push_source(bytes, WireClass::RtoRetransmit);
             self.rto.schedule(key, now + new_rto);
             self.stats.rto_fired += 1;
             self.note_rto_fire(key, first_ws);
@@ -794,7 +795,7 @@ impl ReliableTileEmitter {
     pub fn drain<S: DatagramSender>(&mut self, sender: &mut S, now: Instant) {
         while let Some(emission) = self.next_emission(now) {
             let outcome = match &emission {
-                Emission::Source(bytes) => sender.send(bytes),
+                Emission::Source(bytes, _) => sender.send(bytes),
                 Emission::Parity(bytes) => sender.send(bytes),
             };
             if !self.settle_emission(emission, outcome) {
@@ -990,7 +991,7 @@ mod tests {
         let key = EmitKey::new(1, 0, 0, 0);
         e.submit_one(key, fake_source(1, 0, 0xAA), now, None, now);
         let cached_ptr = e.cache.get(&key).unwrap().datagram.as_ptr();
-        let Some(Emission::Source(queued)) = e.next_emission(now) else {
+        let Some(Emission::Source(queued, _)) = e.next_emission(now) else {
             panic!("expected the source emission");
         };
         assert_eq!(queued.as_ptr(), cached_ptr, "queue holds its own copy");
@@ -1326,6 +1327,82 @@ mod tests {
                 e.stats.rto_fired
             ),
             (1, 1, 0)
+        );
+    }
+
+    /// Offered-load accounting: every datagram handed to the transport is
+    /// billed to exactly one class, so the classes (plus framing) sum to the
+    /// bytes handed over. A scripted run that exercises all five emitter
+    /// classes; the premise asserts each is non-zero, so a class the emitter
+    /// stopped labelling (or an unbilled one) cannot hide behind a sum that
+    /// still balances.
+    #[test]
+    fn offered_bytes_by_class_sum_to_the_bytes_handed_to_the_transport() {
+        use crate::transport::instruments::OfferedBytes;
+        use crate::transport::reliable_emitter::FEC_GROUP_SIZE_K;
+
+        let mut e = ReliableTileEmitter::new(Instant::now());
+        let mut offered = OfferedBytes::default();
+        let mut handed = 0u64;
+        let t0 = Instant::now();
+        let mut hand_over = |e: &mut ReliableTileEmitter, now: Instant| {
+            while let Some(em) = e.next_emission(now) {
+                let class = em.class();
+                let len = match &em {
+                    Emission::Source(b, _) | Emission::Parity(b) => b.len(),
+                };
+                // A 2-byte framing prefix per datagram, as the WebTransport
+                // layer adds a varint.
+                offered.bill(class, len, 2);
+                handed += (len + 2) as u64;
+                assert!(e.settle_emission(em, SendOutcome::Sent));
+            }
+        };
+
+        // First sends: critical (pass 0) and refinement (pass 5), enough of
+        // them to complete FEC groups and release parity.
+        let n = FEC_GROUP_SIZE_K as u32 * 2 + 1;
+        for i in 0..n {
+            let pass = if i % 3 == 0 { 5 } else { 0 };
+            e.submit_one(
+                EmitKey::new(i, 0, 0, pass),
+                fake_source(i, 0, 0),
+                t0,
+                None,
+                t0,
+            );
+        }
+        hand_over(&mut e, t0);
+        // A NACK for one pass.
+        e.on_nack(&[EmitKey::new(1, 0, 0, 0)], t0);
+        e.tick_budgeted(t0, usize::MAX, usize::MAX);
+        hand_over(&mut e, t0);
+        // Long enough that the RTO fires for everything still unacknowledged.
+        let t1 = t0 + Duration::from_secs(10);
+        e.tick_budgeted(t1, 4, usize::MAX);
+        hand_over(&mut e, t1);
+
+        for class in [
+            WireClass::Critical,
+            WireClass::Refinement,
+            WireClass::NackRepair,
+            WireClass::RtoRetransmit,
+            WireClass::Parity,
+        ] {
+            assert!(offered.of(class) > 0, "{class:?} never billed");
+        }
+        assert!(e.stats.rto_fired > 0 && e.stats.retransmit_by_nack > 0);
+        assert!(e.stats.parity_emitted > 0);
+        assert_eq!(
+            offered.total(),
+            handed,
+            "classes + framing must account for every byte handed over"
+        );
+        // And per datagram, not just in aggregate.
+        let datagrams: u64 = offered.datagrams.iter().sum();
+        assert_eq!(
+            datagrams,
+            e.stats.source_emitted + e.stats.retransmit_attempts_total + e.stats.parity_emitted
         );
     }
 

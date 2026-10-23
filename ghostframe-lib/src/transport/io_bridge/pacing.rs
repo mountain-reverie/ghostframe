@@ -36,6 +36,7 @@
 //! hint, or decide session lifetime.
 
 use super::*;
+use crate::transport::instruments::classify_budget_term;
 
 // ---------------------------------------------------------------------------
 // Scheduler tick budgeting (A + B-light)
@@ -509,10 +510,15 @@ impl IoBridge {
         // now one datagram at the live MTU, so this term can bind.) Reverted
         // rather than kept, because unvalidated arithmetic in the
         // send path is a liability.
-        (((self.adaptation_context.bytes_per_us as f64)
+        self.bandwidth_budget_term().max(self.tick_budget_floor())
+    }
+
+    /// The bandwidth operand of `base_budget_bytes`: measured QUIC bandwidth
+    /// x the tick interval x the headroom fraction, before the floor.
+    fn bandwidth_budget_term(&self) -> usize {
+        ((self.adaptation_context.bytes_per_us as f64)
             * SCHEDULER_TICK_INTERVAL_US
-            * SCHEDULER_TICK_BUDGET_FRACTION) as usize)
-            .max(self.tick_budget_floor())
+            * SCHEDULER_TICK_BUDGET_FRACTION) as usize
     }
 
     /// How long the scheduler waits for a priority tile's acknowledgement
@@ -599,6 +605,9 @@ impl IoBridge {
         // capacity` still runs last (below) and still wins: a probe is not
         // worth dropping tiles for, and that clamp exists because
         // `scheduler.tick` is destructive.
+        // Which term set this tick's budget. Observation only: derived from
+        // the values the decision below already uses, never fed back.
+        let mut probe_binds = false;
         let pre_clamp_budget = match &self.active_probe {
             Some(probe) => {
                 // A probe must send at *least* its target rate, but must
@@ -623,6 +632,7 @@ impl IoBridge {
                     bwe_snap.pacer_rate_bps,
                     SCHEDULER_TICK_INTERVAL_US,
                 );
+                probe_binds = probe_budget > paced_budget;
                 probe_budget.max(paced_budget)
             }
             None => combine_pacing_budget(
@@ -649,6 +659,21 @@ impl IoBridge {
         // right now — see `clamp_to_quinn_capacity`'s doc comment for why
         // this is mandatory rather than defensive.
         let budget_bytes = self.clamp_to_quinn_capacity(pre_clamp_budget);
+        let term = classify_budget_term(
+            probe_binds,
+            match (pacing_mode, bwe_snap.pacer_rate_bps) {
+                (PacingMode::Paced, Some(bps)) => {
+                    Some(pacer_tick_budget_bytes(bps, SCHEDULER_TICK_INTERVAL_US))
+                }
+                _ => None,
+            },
+            base_budget_bytes,
+            self.bandwidth_budget_term(),
+            self.tick_budget_floor(),
+        );
+        self.instr
+            .budget
+            .note(term, budget_bytes < pre_clamp_budget);
         let (stats, drained_bytes, drained_count) =
             self.drain_scheduler_into_quinn(seq, timestamp_us, max_frag, budget_bytes);
         // Cache the continuation context so `Event::DatagramsUnblocked` ->

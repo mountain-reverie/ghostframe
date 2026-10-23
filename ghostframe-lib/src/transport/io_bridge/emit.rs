@@ -23,9 +23,8 @@ impl IoBridge {
         use crate::transport::reliable_emitter::emission_queue::Emission;
         while let Some(emission) = self.reliable_emitter.next_emission(now) {
             let outcome = match &emission {
-                Emission::Source(bytes) | Emission::Parity(bytes) => {
-                    self.send_to_all_sessions(bytes)
-                }
+                Emission::Source(bytes, class) => self.send_to_all_sessions(bytes, *class),
+                Emission::Parity(bytes) => self.send_to_all_sessions(bytes, WireClass::Parity),
             };
             if !self.reliable_emitter.settle_emission(emission, outcome) {
                 return;
@@ -96,9 +95,13 @@ impl IoBridge {
     }
 
     /// Send a datagram to all connected WebTransport sessions.
+    ///
+    /// `class` says what the datagram is for; it only labels the bytes in the
+    /// offered-load accounting.
     pub(super) fn send_to_all_sessions(
         &mut self,
         dg: &[u8],
+        class: WireClass,
     ) -> crate::transport::reliable_emitter::traits::SendOutcome {
         use crate::transport::reliable_emitter::traits::SendOutcome;
         #[cfg(any(test, feature = "test-loss-injection"))]
@@ -132,14 +135,25 @@ impl IoBridge {
         // corruption -- the client dedups on wire_seq and tile reassembly is
         // idempotent per frag_idx. Production runs a single session.
         let mut rejected = false;
+        // (cum bytes accepted, framing, FIFO depth) after quinn took it.
+        let mut accepted: Option<(u64, usize, u64)> = None;
+        let send_capacity = self.server.datagram_send_buffer();
         // Only the HELLO'd session receives stream data.
-        if let Some(handle) = self.live_send_handle() {
-            let handle = &handle;
+        let live = self.live_send_handle();
+        if let Some(handle) = live.as_ref() {
             if let (Some(wt), Some(conn)) = (
                 self.wt_sessions.get_mut(handle),
                 self.server.connections.get_mut(handle),
             ) {
-                if let Err(e) = wt.send_datagram(conn, dg) {
+                let sent = wt.send_datagram(conn, dg);
+                if sent.is_ok() {
+                    accepted = Some((
+                        wt.datagram_bytes_enqueued(),
+                        wt.datagram_framing_len(),
+                        send_capacity.saturating_sub(conn.datagrams().send_buffer_space()) as u64,
+                    ));
+                }
+                if let Err(e) = sent {
                     rejected = true;
                     self.datagram_send_errs = self.datagram_send_errs.saturating_add(1);
                     if !self.datagram_send_err_first_logged {
@@ -158,6 +172,10 @@ impl IoBridge {
                     }
                 }
             }
+        }
+
+        if let (Some(handle), Some((cum, framing, queued))) = (live, accepted) {
+            self.note_enqueued(handle, class, dg.len(), framing, cum, queued);
         }
 
         // No connected session counts as sent, not rejected: re-queueing a
@@ -192,7 +210,7 @@ impl IoBridge {
                 width,
                 height,
             );
-            self.send_to_all_sessions(&dg);
+            self.send_to_all_sessions(&dg, WireClass::Control);
             self.dimensions_retransmits_left -= 1;
         }
     }

@@ -165,6 +165,10 @@ impl IoBridge {
                     Some(Resolution::Late(tx)) => {
                         self.reliable_emitter.note_ack_origin(tx.key, e.wire_seq);
                         self.loss_window.retract(tx.emit_us as u32);
+                        // Observability: was goog_cc already told this was lost?
+                        if self.instr.flushed.take(e.wire_seq) {
+                            self.instr.late_acked_after_flush += 1;
+                        }
                         // Withdrawn from `pending_losses` once per turn (see
                         // `retract_late_acked_losses`); only worth noting when
                         // something is waiting there.

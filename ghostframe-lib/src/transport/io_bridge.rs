@@ -49,6 +49,7 @@ use crate::transport::protocol::{
     FRAME_HEADER_SIZE, MAX_TILE_PAYLOAD, PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
 };
 use crate::transport::quic::QuicServer;
+use crate::transport::reliable_emitter::emission_queue::WireClass;
 use crate::transport::webtransport::WebTransportServer;
 use ghostframe_protocol::eviction::{build_eviction_datagram, EvictionReason};
 use std::sync::Arc;
@@ -807,6 +808,9 @@ pub struct IoBridge {
     path_sent_packets_last: u64,
     /// Transport measurements (see `transport_probe`). Measurement only.
     transport_probe: TransportProbe,
+    /// D1 instruments (offered bytes by class, FIFO series, departure mirror,
+    /// budget-binding counts, ECN). Measurement only, never read by a decision.
+    instr: transport_probe::Instruments,
     /// Harness read-back of `transport_probe`, same pattern as the other
     /// `*_publish` cells.
     #[cfg(any(test, feature = "browserless-harness"))]
@@ -1341,6 +1345,7 @@ impl IoBridge {
             capacity_hint_window: std::collections::VecDeque::new(),
             path_sent_packets_last: 0,
             transport_probe: TransportProbe::default(),
+            instr: Default::default(),
             #[cfg(any(test, feature = "browserless-harness"))]
             transport_probe_publish: std::sync::Arc::new(std::sync::Mutex::new(
                 TransportProbe::default(),
@@ -2288,6 +2293,7 @@ impl IoBridge {
         let overflow = self.pending_losses.len().saturating_sub(MAX_PENDING_LOSSES);
         if overflow > 0 {
             self.pending_losses.drain(..overflow);
+            self.instr.losses_overflowed += overflow as u64;
         }
         if !self.bwe_samples_buffer.is_empty() {
             use crate::transport::bwe::AckArrival;
@@ -2372,7 +2378,12 @@ impl IoBridge {
             // on. Read before `update` so it reflects the state the
             // feedback describes.
             let in_flight = self.reliable_emitter.bytes_in_flight();
-            let losses: Vec<(u64, usize)> = std::mem::take(&mut self.pending_losses)
+            let reported = std::mem::take(&mut self.pending_losses);
+            self.instr.losses_flushed += reported.len() as u64;
+            for l in &reported {
+                self.instr.flushed.insert(l.wire_seq);
+            }
+            let losses: Vec<(u64, usize)> = reported
                 .into_iter()
                 .map(|l| (l.emit_us, l.wire_bytes))
                 .collect();
@@ -2397,7 +2408,10 @@ impl IoBridge {
                 self.queued_critical_latency_stats,
                 self.queued_refinement_latency_stats,
             );
-            *self.transport_probe_publish.lock().unwrap() = self.transport_probe;
+            *self.transport_probe_publish.lock().unwrap() = TransportProbe {
+                instr: self.instrument_summary(),
+                ..self.transport_probe
+            };
             *self.probe_stats_publish.lock().unwrap() =
                 (self.probes_completed, self.probes_abandoned);
         }
@@ -2447,15 +2461,21 @@ impl IoBridge {
         let now = now_std();
         let mut buf: Vec<u8> = Vec::with_capacity(QUIC_SCRATCH);
         let server = &mut self.server;
-        write_batched(&mut self.stream, OUTBOUND_BATCH_BYTES, |batch| {
+        let ecn = &mut self.instr.ecn;
+        let written = write_batched(&mut self.stream, OUTBOUND_BATCH_BYTES, |batch| {
             buf.clear();
             let transmit = server.poll_transmit(now, 1, &mut buf)?;
             let payload = &buf[..transmit.size];
             tracing::trace!(size = transmit.size, dst = %transmit.destination, "outbound transmit");
+            ecn.note(transmit.ecn.is_some());
             encode_frame_append(batch, payload, &transmit.destination);
             Some(())
         })
-        .await
+        .await;
+        // The datagrams quinn wrote into packets above left its FIFO at `now`,
+        // the instant given to `poll_transmit`. Observability only.
+        self.poll_departures(now);
+        written
     }
 
     /// Drain all pending application-level QUIC events and drive the
@@ -2505,8 +2525,15 @@ impl IoBridge {
                             while let Some(payload) = wt.recv_datagram(conn) {
                                 if let Some(response) = handle_datagram_payload(&payload) {
                                     tracing::trace!(?handle, "ping received, sending pong");
-                                    if let Err(e) = wt.send_datagram(conn, response) {
-                                        tracing::warn!(?handle, error = ?e, "failed to send pong");
+                                    match wt.send_datagram(conn, response) {
+                                        Ok(()) => self.instr.offered.bill(
+                                            WireClass::Control,
+                                            response.len(),
+                                            wt.datagram_framing_len(),
+                                        ),
+                                        Err(e) => {
+                                            tracing::warn!(?handle, error = ?e, "failed to send pong");
+                                        }
                                     }
                                 } else {
                                     to_dispatch.push(payload);

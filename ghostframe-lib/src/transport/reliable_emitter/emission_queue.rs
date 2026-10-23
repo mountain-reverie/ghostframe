@@ -9,10 +9,71 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 use std::time::{Duration, Instant};
 
+/// Highest `pass_idx` of the critical tier (passes 0-3); everything above is
+/// refinement. The single definition behind `pass_tier` and [`WireClass`].
+pub(crate) const CRITICAL_PASS_MAX: u8 = 3;
+
+/// What a datagram handed to the transport is for. Measurement only: it
+/// labels bytes for the offered-load accounting and decides nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WireClass {
+    /// A first transmission of a critical-tier tile pass (passes 0-3).
+    Critical,
+    /// A first transmission of a refinement-tier tile pass (passes 4-13).
+    Refinement,
+    /// A retransmission the client asked for.
+    NackRepair,
+    /// A retransmission the emitter's RTO timer fired.
+    RtoRetransmit,
+    /// FEC parity (tile groups and H.264 frames).
+    Parity,
+    /// H.264 frame fragments.
+    H264,
+    /// Datagrams that are no tile pass: frame dimensions, pongs, eviction.
+    Control,
+}
+
+impl WireClass {
+    pub(crate) const COUNT: usize = 7;
+    #[cfg(test)]
+    pub(crate) const ALL: [WireClass; Self::COUNT] = [
+        WireClass::Critical,
+        WireClass::Refinement,
+        WireClass::NackRepair,
+        WireClass::RtoRetransmit,
+        WireClass::Parity,
+        WireClass::H264,
+        WireClass::Control,
+    ];
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The class of a pass's first transmission.
+    pub fn for_first_send(pass_idx: u8) -> Self {
+        if pass_idx <= CRITICAL_PASS_MAX {
+            WireClass::Critical
+        } else {
+            WireClass::Refinement
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Emission {
-    Source(Bytes),
+    /// A source datagram and the reason it is on the wire.
+    Source(Bytes, WireClass),
     Parity(Bytes),
+}
+
+impl Emission {
+    pub fn class(&self) -> WireClass {
+        match self {
+            Emission::Source(_, c) => *c,
+            Emission::Parity(_) => WireClass::Parity,
+        }
+    }
 }
 
 pub struct EmissionQueue {
@@ -66,8 +127,8 @@ impl EmissionQueue {
         self.end_of_stream_idle_since = None;
     }
 
-    pub fn push_source(&mut self, bytes: Bytes) {
-        self.queue.push_back(Emission::Source(bytes));
+    pub fn push_source(&mut self, bytes: Bytes, class: WireClass) {
+        self.queue.push_back(Emission::Source(bytes, class));
         self.end_of_stream_idle_since = None;
     }
 
@@ -133,10 +194,10 @@ mod tests {
     fn source_only_pops_in_order() {
         let mut q = EmissionQueue::new();
         let t = epoch();
-        q.push_source(Bytes::from_static(&[1]));
-        q.push_source(Bytes::from_static(&[2]));
-        assert!(matches!(q.pop(2, t), Some(Emission::Source(_))));
-        assert!(matches!(q.pop(2, t), Some(Emission::Source(_))));
+        q.push_source(Bytes::from_static(&[1]), WireClass::Critical);
+        q.push_source(Bytes::from_static(&[2]), WireClass::Critical);
+        assert!(matches!(q.pop(2, t), Some(Emission::Source(..))));
+        assert!(matches!(q.pop(2, t), Some(Emission::Source(..))));
         assert!(q.pop(2, t).is_none());
     }
 
@@ -144,11 +205,11 @@ mod tests {
     fn parity_emits_after_offset_wire_seq() {
         let mut q = EmissionQueue::new();
         let t = epoch();
-        q.push_source(Bytes::from_static(&[0])); // wire_seq 0
+        q.push_source(Bytes::from_static(&[0]), WireClass::Critical); // wire_seq 0
         q.schedule_parity(PARITY_INTERLEAVE_OFFSET, vec![0xAA]); // emit after wire_seq 20
                                                                  // next_wire_seq = 1 (allocator about to hand out 1): parity not yet
         let e = q.pop(1, t).unwrap();
-        assert!(matches!(e, Emission::Source(_)));
+        assert!(matches!(e, Emission::Source(..)));
         // Still no parity at next=5 — queue is now empty (source already popped above)
         assert!(q.pop(5, t).is_none());
         // At next=20 the parity becomes ready

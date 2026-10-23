@@ -498,6 +498,11 @@ impl IoBridge {
                     // overwhelmingly `Blocked`).
                     if wt.send_datagram(conn, &datagram).is_ok() {
                         notices_sent += 1;
+                        self.instr.offered.bill(
+                            WireClass::Control,
+                            datagram.len(),
+                            wt.datagram_framing_len(),
+                        );
                     }
                 }
             }

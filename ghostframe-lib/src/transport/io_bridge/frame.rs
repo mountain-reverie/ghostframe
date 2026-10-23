@@ -1635,7 +1635,7 @@ impl IoBridge {
             .saturating_add(datagrams.len() as u64);
 
         for dg in &datagrams {
-            self.send_to_all_sessions(dg);
+            self.send_to_all_sessions(dg, WireClass::H264);
         }
 
         // FEC parity
@@ -1654,7 +1654,7 @@ impl IoBridge {
                     datagrams.len() as u16,
                     parity_payload,
                 );
-                self.send_to_all_sessions(&parity_dg);
+                self.send_to_all_sessions(&parity_dg, WireClass::Parity);
             }
         }
 
@@ -2146,6 +2146,7 @@ impl IoBridge {
             let c = self.cumulative_datagrams_emitted;
             let es = self.reliable_emitter.stats;
             let tp = self.transport_probe;
+            let ins = self.instrument_summary();
             tracing::info!(
                 target: LOG_TARGET,
                 frame_seq = seq,
@@ -2334,6 +2335,49 @@ impl IoBridge {
                 bytes_per_us = self.adaptation_context.bytes_per_us,
                 smoothed_rtt_us = self.adaptation_context.smoothed_rtt_us,
                 pending_losses_retracted = self.pending_losses_retracted,
+                // D1 instruments (measurement only; see `transport::instruments`).
+                // Offered bytes are wire bytes handed to quinn, by class;
+                // divide by `instr_window_ms` for a rate. `offered_total_B`
+                // equals `quinn_bytes_enqueued`, and `quinn_bytes_departed`
+                // is what has left quinn's FIFO into packets.
+                instr_window_ms = ins.window_us / 1000,
+                fifo_samples = ins.fifo_samples,
+                fifo_depth_max_B = ins.fifo_depth_max,
+                fifo_depth_peak_at_enqueue_B = ins.fifo_depth_peak_at_enqueue,
+                fifo_depth_mean_B = ins.fifo_depth_mean,
+                fifo_depth_slope_last_quarter_Bps = ins.fifo_depth_slope_last_quarter_bps,
+                cwnd_limited_turns = ins.cwnd_limited_turns,
+                offered_critical_B = ins.offered.of(WireClass::Critical),
+                offered_refinement_B = ins.offered.of(WireClass::Refinement),
+                offered_nack_repair_B = ins.offered.of(WireClass::NackRepair),
+                offered_rto_retransmit_B = ins.offered.of(WireClass::RtoRetransmit),
+                offered_parity_B = ins.offered.of(WireClass::Parity),
+                offered_h264_B = ins.offered.of(WireClass::H264),
+                offered_control_B = ins.offered.of(WireClass::Control),
+                offered_overhead_B = ins.offered.overhead,
+                offered_total_B = ins.offered.total(),
+                quinn_bytes_enqueued = ins.quinn_bytes_enqueued,
+                quinn_bytes_departed = ins.quinn_bytes_departed,
+                depart_lag_samples = ins.lag_samples,
+                depart_lag_p50_us = ins.lag_p50_us,
+                depart_lag_p95_us = ins.lag_p95_us,
+                depart_lag_max_us = ins.lag_max_us,
+                depart_mirror_len = ins.mirror_len,
+                depart_mirror_overflowed = ins.mirror_overflowed,
+                budget_term_cwnd = ins.budget.cwnd,
+                budget_term_pacer = ins.budget.pacer,
+                budget_term_floor = ins.budget.floor,
+                budget_term_probe = ins.budget.probe,
+                budget_sendbuf_clamped = ins.budget.sendbuf_clamped,
+                ledger_losses_declared = ins.ledger_losses_declared,
+                ledger_losses_flushed = ins.ledger_losses_flushed,
+                ledger_losses_overflowed = ins.ledger_losses_overflowed,
+                late_acked_before_flush = ins.late_acked_before_flush,
+                late_acked_after_flush = ins.late_acked_after_flush,
+                late_acked_unreported = ins.late_acked_unreported,
+                ecn_ect0_tx = ins.ecn.ect0_tx,
+                ecn_unmarked_tx = ins.ecn.unmarked_tx,
+                ecn_last_tx_marked = ins.ecn.last_marked,
                 "cumulative emit (datagrams handed to quinn since startup, per codec)"
             );
 
