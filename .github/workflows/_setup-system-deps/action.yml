@@ -23,71 +23,43 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: apt-get update
+    - name: apt cache key
+      id: key
       shell: bash
       run: |
-        # Retries cover transient proxy and network hiccups.
-        #
-        # The fallback covers a third-party repo serving a broken index. The
-        # runner image ships Google's Chrome apt source, which nothing here
-        # installs from, and on 2026-09-09 it served a "Hash Sum mismatch"
-        # that failed clippy, unit, build-release and cbindgen-check on
-        # master before a single package was installed or a test ran.
-        #
-        # Continuing is safe because every package this action installs comes
-        # from the Ubuntu archive, and `apt-get install` below is the real
-        # gate: if an index we actually need is missing, it fails loudly and
-        # names the package. Swallowing update errors cannot turn a missing
-        # dependency into a silent pass.
-        sudo apt-get update -qq -o Acquire::Retries=3 || \
-          echo "::warning::apt-get update reported errors; continuing (apt-get install will fail if a needed index is missing)"
+        # ImageOS/ImageVersion are set by GitHub-hosted runners. The version
+        # is part of the key because the cached lists and .debs were resolved
+        # against that image's installed packages (the install upgrades
+        # systemd, glib, ...). Without it (self-hosted), fall back to a weekly
+        # key rather than an unversioned one.
+        image="${ImageOS:-unknown}-${ImageVersion:-week$(date -u +%G-%V)}"
+        echo "image=$image" >> "$GITHUB_OUTPUT"
+        echo "stage=${RUNNER_TEMP}/apt-cache" >> "$GITHUB_OUTPUT"
 
-    - name: install build deps
-      shell: bash
-      run: |
-        # libgstreamer*-dev are here so CI can COMPILE-CHECK the ARM client's
-        # decode backend, which no runner can run. That check was impossible
-        # with the previous cros-codecs backend -- it did not build off aarch64
-        # at all -- so this is the gate that replaced "verified by hand on the
-        # reference machine". Headers only; no GStreamer plugins are installed
-        # and nothing here executes a pipeline.
-        #
-        # libxkbcommon-dev is a hard build-time gate, not a convenience:
-        # smithay-client-toolkit's build.rs does an unconditional
-        # `pkg_config::find("xkbcommon").unwrap()` under the `xkbcommon`
-        # feature, so without it every job that compiles the workspace dies
-        # in a build script before a single test runs. libxkbcommon-x11-dev
-        # is needed at link time instead -- the `xkbcommon` crate's `x11`
-        # feature carries `#[link(name = "xkbcommon-x11")]`, and only the
-        # -dev package ships the unversioned .so the linker resolves.
-        sudo apt-get install -y --no-install-recommends \
-          build-essential \
-          pkg-config \
-          clang \
-          libclang-dev \
-          libavcodec-dev \
-          libavformat-dev \
-          libavutil-dev \
-          libswscale-dev \
-          libavdevice-dev \
-          libx264-dev \
-          libx11-dev \
-          libxext-dev \
-          libxdamage-dev \
-          libdrm-dev \
-          libxkbcommon-dev \
-          libxkbcommon-x11-dev \
-          libgstreamer1.0-dev \
-          libgstreamer-plugins-base1.0-dev \
-          xvfb
+    # Separate restore/save (rather than one actions/cache step) so the entry
+    # is saved right after the install, not in a post step that a cancelled or
+    # failed job never reaches. The e2e-runtime input is in the key because it
+    # changes the package set. Saving when another job already holds the key
+    # logs a warning and does not fail the step.
+    - name: restore apt cache
+      id: cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ steps.key.outputs.stage }}
+        key: apt-v1-e2e${{ inputs.e2e-runtime }}-${{ steps.key.outputs.image }}-${{ hashFiles('.github/workflows/_setup-system-deps/**') }}
 
-    - name: install e2e-harness runtime deps
-      if: ${{ inputs.e2e-runtime == 'true' }}
+    - name: install apt packages
+      id: install
       shell: bash
-      run: |
-        sudo apt-get install -y --no-install-recommends \
-          weston \
-          xwayland \
-          libgl1-mesa-dri \
-          mesa-vulkan-drivers \
-          libegl1
+      env:
+        E2E_RUNTIME: ${{ inputs.e2e-runtime }}
+        CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        STAGE: ${{ steps.key.outputs.stage }}
+      run: bash "$GITHUB_ACTION_PATH/install.sh"
+
+    - name: save apt cache
+      if: ${{ steps.cache.outputs.cache-hit != 'true' && steps.install.outputs.stage-ready == 'true' }}
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ steps.key.outputs.stage }}
+        key: apt-v1-e2e${{ inputs.e2e-runtime }}-${{ steps.key.outputs.image }}-${{ hashFiles('.github/workflows/_setup-system-deps/**') }}
