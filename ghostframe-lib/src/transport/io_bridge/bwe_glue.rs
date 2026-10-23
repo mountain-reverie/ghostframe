@@ -117,7 +117,7 @@ pub(super) enum PassTier {
 }
 
 pub(super) fn pass_tier(pass_idx: u8) -> PassTier {
-    if pass_idx <= 3 {
+    if pass_idx <= crate::transport::reliable_emitter::emission_queue::CRITICAL_PASS_MAX {
         PassTier::Critical
     } else {
         PassTier::Refinement
@@ -460,6 +460,7 @@ impl IoBridge {
                 horizon.as_micros()
             );
         }
+        self.instr.losses_declared += expired.len() as u64;
         for (wire_seq, tx) in expired {
             self.pending_losses.push(PendingLoss {
                 wire_seq,

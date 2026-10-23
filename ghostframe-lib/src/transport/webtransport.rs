@@ -93,6 +93,10 @@ pub struct WebTransportServer {
     abandoned_streams: std::collections::HashSet<StreamId>,
     /// Which `Origin` a CONNECT may carry. See [`OriginPolicy`].
     origin_policy: Arc<OriginPolicy>,
+    /// Bytes quinn's datagram queue has accepted through `send_datagram`,
+    /// framing included. Measurement only: with `outgoing_total` it gives the
+    /// cumulative bytes that have left the queue.
+    datagram_bytes_enqueued: u64,
 }
 
 impl WebTransportServer {
@@ -110,6 +114,7 @@ impl WebTransportServer {
             feedback_queue: Vec::new(),
             abandoned_streams: std::collections::HashSet::new(),
             origin_policy: Arc::new(OriginPolicy::default()),
+            datagram_bytes_enqueued: 0,
         }
     }
 
@@ -416,7 +421,26 @@ impl WebTransportServer {
         // `false`, the caller (`send_to_all_sessions`) sees Err(Blocked),
         // counts it, and surfaces it via the per-frame
         // `dispatch returned` log.
-        conn.datagrams().send(Bytes::from(buf), false)
+        let wire_len = buf.len() as u64;
+        let sent = conn.datagrams().send(Bytes::from(buf), false);
+        if sent.is_ok() {
+            self.datagram_bytes_enqueued += wire_len;
+        }
+        sent
+    }
+
+    /// Cumulative bytes (framing included) quinn's datagram queue has
+    /// accepted from this session. Measurement only.
+    pub fn datagram_bytes_enqueued(&self) -> u64 {
+        self.datagram_bytes_enqueued
+    }
+
+    /// Bytes `send_datagram` adds in front of a payload: the quarter-stream-id
+    /// varint. Zero before the session is connected.
+    pub fn datagram_framing_len(&self) -> usize {
+        self.session_stream
+            .and_then(|s| VarInt::from_u64(u64::from(s) / 4).ok())
+            .map_or(0, |v| v.size())
     }
 
     /// Drain all queued feedback data received on non-session bidi streams.

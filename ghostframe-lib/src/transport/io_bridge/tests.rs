@@ -5113,7 +5113,7 @@ async fn only_the_live_connected_session_is_a_send_target() {
     assert_eq!(bridge.live_send_handle(), None);
     // With no live session, send_to_all_sessions consumes, as before.
     bridge.forget_session(live);
-    let out = bridge.send_to_all_sessions(&[1, 2, 3]);
+    let out = bridge.send_to_all_sessions(&[1, 2, 3], WireClass::Control);
     assert!(matches!(
         out,
         crate::transport::reliable_emitter::traits::SendOutcome::Sent
@@ -5720,6 +5720,60 @@ async fn post_turn_withdraws_the_loss_of_a_late_acked_transmission() {
     let left: Vec<u32> = bridge.pending_losses.iter().map(|l| l.wire_seq).collect();
     assert_eq!(left, vec![42]);
     assert_eq!(bridge.pending_losses_retracted, 1);
+}
+
+/// Instrument: a loss is "late-acked after the flush" only if goog_cc was
+/// already told about it, and "before the flush" only if it was withdrawn
+/// while pending. The burst-loss scene cannot show the former (it reports a
+/// legitimate zero there), so it is pinned here through the production turn:
+/// expire, flush on a live acknowledgement, then acknowledge the "lost" one.
+#[tokio::test]
+async fn a_late_ack_after_the_flush_is_counted_apart_from_one_before_it() {
+    use crate::transport::ack::{AckBatch, AckEntry};
+    let ack = |ws: u32| {
+        AckBatch {
+            entries: vec![AckEntry {
+                wire_seq: ws,
+                arrival_time_ms_lo16: 7,
+            }],
+        }
+        .encode()
+    };
+    let mut bridge = make_bridge_for_test().await;
+    let long_ago = super::now_std()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .expect("monotonic clock has 60 s of history");
+    for ws in [1, 2] {
+        bridge
+            .transmission_ledger
+            .record(ws, long_ago, ledger_tx(1_000 * ws as u64, 1_200, ws));
+    }
+    bridge.post_turn().await.expect("post_turn");
+    assert_eq!(bridge.pending_losses.len(), 2, "declared, not yet reported");
+    assert_eq!(bridge.instr.losses_declared, 2);
+    assert_eq!(bridge.instr.losses_flushed, 0);
+
+    // A live acknowledgement gives goog_cc a report to carry the losses.
+    bridge
+        .transmission_ledger
+        .record(3, super::now_std(), ledger_tx(3_000, 1_200, 3));
+    bridge.dispatch_ack_datagram(&ack(3));
+    bridge.post_turn().await.expect("post_turn");
+    assert!(bridge.pending_losses.is_empty(), "flushed to goog_cc");
+    assert_eq!(bridge.instr.losses_flushed, 2);
+
+    // Now the first "lost" transmission turns out to have arrived.
+    bridge.dispatch_ack_datagram(&ack(1));
+    bridge.post_turn().await.expect("post_turn");
+    let s = bridge.instrument_summary();
+    assert_eq!(
+        (
+            s.late_acked_after_flush,
+            s.late_acked_before_flush,
+            s.late_acked_unreported
+        ),
+        (1, 0, 0)
+    );
 }
 
 // ---- T5: the sample's send time must survive the 32-bit emit clock wrapping ----

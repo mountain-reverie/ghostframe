@@ -8,7 +8,11 @@
 //! Everything is read on the loop side (`sample_all_path_stats` already holds
 //! the live connection); the frame worker never touches it.
 
-use super::IoBridge;
+use super::{IoBridge, WireClass};
+use crate::transport::instruments::{
+    BudgetBinding, DepartureMirror, EcnObservation, FifoSeries, InstrumentSummary, OfferedBytes,
+};
+use quinn_proto::ConnectionHandle;
 
 /// Cumulative and latest transport readings for the live session.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -35,20 +39,58 @@ pub struct TransportProbe {
     /// is the datagrams it rebuilt from FEC parity.
     pub client_received: u64,
     pub client_recovered: u64,
+    /// The D1 instruments (see [`crate::transport::instruments`]). Filled when
+    /// the probe is published to the harness; zero in the live copy.
+    pub instr: InstrumentSummary,
+}
+
+/// The mutable state behind [`InstrumentSummary`]. Measurement only: nothing
+/// in the bridge reads any field of this to decide anything.
+#[derive(Debug, Default)]
+pub(super) struct Instruments {
+    pub(super) offered: OfferedBytes,
+    pub(super) mirror: DepartureMirror,
+    /// The session the mirror describes; a new session starts it afresh.
+    mirror_handle: Option<ConnectionHandle>,
+    pub(super) fifo: FifoSeries,
+    /// Largest FIFO depth seen right after a datagram was accepted.
+    pub(super) fifo_peak_at_enqueue: u64,
+    pub(super) budget: BudgetBinding,
+    pub(super) ecn: EcnObservation,
+    /// Session counter and queue depth at the last post-drain reading.
+    quinn_bytes_enqueued: u64,
+    quinn_bytes_queued: u64,
+    /// Ledger expiries (declared lost) and how many were handed to goog_cc.
+    pub(super) losses_declared: u64,
+    pub(super) losses_flushed: u64,
+    /// Declared lost but dropped from the pending list by its cap.
+    pub(super) losses_overflowed: u64,
+    pub(super) flushed: crate::transport::instruments::FlushedLosses,
+    /// Late acknowledgements of losses goog_cc had already been told about.
+    pub(super) late_acked_after_flush: u64,
 }
 
 impl IoBridge {
     /// Read the live session's quinn stats and send-queue depth.
     pub(super) fn update_transport_probe(&mut self) {
         let capacity = self.server.datagram_send_buffer();
-        let Some(conn) = self
-            .last_hello_from
-            .and_then(|h| self.server.connections.get_mut(&h))
-        else {
+        let Some(handle) = self.last_hello_from else {
+            return;
+        };
+        let Some(conn) = self.server.connections.get_mut(&handle) else {
             return;
         };
         let stats = conn.stats();
         let space = conn.datagrams().send_buffer_space();
+        let queued = capacity.saturating_sub(space) as u64;
+        let enqueued = self
+            .wt_sessions
+            .get(&handle)
+            .map_or(0, |wt| wt.datagram_bytes_enqueued());
+        let now = super::now_std();
+        self.instr.fifo.record(now, queued);
+        self.instr.quinn_bytes_enqueued = enqueued;
+        self.instr.quinn_bytes_queued = queued;
         let p = &mut self.transport_probe;
         p.cwnd = stats.path.cwnd;
         p.lost_packets = stats.path.lost_packets;
@@ -57,6 +99,91 @@ impl IoBridge {
         p.queue_bytes = capacity.saturating_sub(space);
         p.max_queue_bytes = p.max_queue_bytes.max(p.queue_bytes);
         p.samples += 1;
+    }
+
+    /// Note a datagram quinn just accepted: bill its class and wire bytes,
+    /// put it in the departure mirror and track the FIFO's peak depth.
+    ///
+    /// `dg_len` is the datagram as handed to the WebTransport layer;
+    /// `framing_len` is what that layer added. `cum_enqueued` is the session's
+    /// cumulative accepted bytes including this one, `queued` quinn's queued
+    /// bytes after it.
+    pub(super) fn note_enqueued(
+        &mut self,
+        handle: ConnectionHandle,
+        class: WireClass,
+        dg_len: usize,
+        framing_len: usize,
+        cum_enqueued: u64,
+        queued: u64,
+    ) {
+        let i = &mut self.instr;
+        i.offered.bill(class, dg_len, framing_len);
+        i.fifo_peak_at_enqueue = i.fifo_peak_at_enqueue.max(queued);
+        if i.mirror_handle != Some(handle) {
+            i.mirror.clear();
+            i.mirror_handle = Some(handle);
+        }
+        i.mirror.on_enqueue(cum_enqueued, super::now_std());
+    }
+
+    /// After a `poll_transmit` batch, stamp the datagrams that left quinn's
+    /// FIFO. Does nothing while the mirror is empty.
+    pub(super) fn poll_departures(&mut self, now: std::time::Instant) {
+        let Some(handle) = self.instr.mirror_handle else {
+            return;
+        };
+        if self.instr.mirror.is_empty() {
+            return;
+        }
+        let capacity = self.server.datagram_send_buffer();
+        let (Some(conn), Some(wt)) = (
+            self.server.connections.get_mut(&handle),
+            self.wt_sessions.get(&handle),
+        ) else {
+            return;
+        };
+        let queued = capacity.saturating_sub(conn.datagrams().send_buffer_space()) as u64;
+        self.instr
+            .mirror
+            .on_poll(wt.datagram_bytes_enqueued(), queued, now);
+    }
+
+    /// Snapshot every instrument.
+    pub(super) fn instrument_summary(&self) -> InstrumentSummary {
+        let i = &self.instr;
+        // Mirror the session counter against what was still queued at the
+        // last reading; both are as of the last `update_transport_probe`.
+        let lag = &i.mirror.lag;
+        let late_total = self.transmission_ledger.stats().acked_after_declared_lost;
+        InstrumentSummary {
+            window_us: i.fifo.window_us(),
+            fifo_samples: i.fifo.samples(),
+            fifo_depth_max: i.fifo.max(),
+            fifo_depth_peak_at_enqueue: i.fifo_peak_at_enqueue,
+            fifo_depth_mean: i.fifo.time_weighted_mean().round() as u64,
+            fifo_depth_slope_last_quarter_bps: i.fifo.slope_last_quarter().round() as i64,
+            cwnd_limited_turns: i.fifo.nonempty(),
+            offered: i.offered,
+            quinn_bytes_enqueued: i.quinn_bytes_enqueued,
+            quinn_bytes_departed: i.quinn_bytes_enqueued.saturating_sub(i.quinn_bytes_queued),
+            lag_samples: lag.count(),
+            lag_p50_us: lag.quantile_us(0.5),
+            lag_p95_us: lag.quantile_us(0.95),
+            lag_max_us: lag.max_us(),
+            mirror_len: i.mirror.len() as u64,
+            mirror_overflowed: i.mirror.overflowed,
+            budget: i.budget,
+            ledger_losses_declared: i.losses_declared,
+            ledger_losses_flushed: i.losses_flushed,
+            ledger_losses_overflowed: i.losses_overflowed,
+            late_acked_before_flush: self.pending_losses_retracted,
+            late_acked_after_flush: i.late_acked_after_flush,
+            late_acked_unreported: late_total
+                .saturating_sub(self.pending_losses_retracted)
+                .saturating_sub(i.late_acked_after_flush),
+            ecn: i.ecn,
+        }
     }
 
     /// Add one `ReceiverFeedback` to the client-side totals.
