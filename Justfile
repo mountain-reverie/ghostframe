@@ -232,6 +232,8 @@ ci-local:
     @echo "=== release build ==="
     cargo build --workspace --release --exclude ghostframe-e2e
     @echo "=== release daemon carries no test-only feature ==="
+    # The workspace build above unifies ghostframe-e2e's test features (via ghostframe-bench) into the daemon, so rebuild it alone (ghostframe-lib is recompiled without them) and check that one.
+    cargo build --release -p ghostframe-xdaemon
     if grep -aq 'software Vulkan permitted (test build)' target/release/ghostframe-xdaemon; then echo "release ghostframe-xdaemon contains the software-Vulkan test-build literal: a test-only feature leaked into a release build" >&2; exit 1; fi
     ci/check-release-binary.sh
     @echo "=== cbindgen headers up-to-date ==="
