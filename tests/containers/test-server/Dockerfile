@@ -1,7 +1,6 @@
 # syntax=docker/dockerfile:1
-# Stage 1: Build ghostframe binaries inside the container so shared libraries
-# match the runtime environment exactly.
-FROM ubuntu:24.04 AS builder
+# Stage 1a: toolchain base shared by the planner and builder stages.
+FROM ubuntu:24.04 AS base
 
 # rsync is required by ghostbridge/Makefile's sync-dist target. It sits in
 # this first apt layer, not in a RUN after the source COPYs: down there it was
@@ -48,6 +47,84 @@ WORKDIR /build
 # here so the download is a cached layer rather than part of the build RUN.
 COPY rust-toolchain.toml ./
 RUN rustup toolchain install
+
+# cargo-chef splits "compile the dependencies" from "compile the workspace".
+# Pinned exactly (and installed with --locked) so the layer is only rebuilt when
+# this line changes. It is installed here, in the shared base, so the planner
+# and builder stages below both start from the same cached layer.
+RUN cargo install cargo-chef --version 0.1.78 --locked
+
+# Stage 1b: the recipe. Copies the whole workspace (the context excludes
+# target/, docs/, *.md) and reduces it to recipe.json: the manifests, the
+# lockfile and the target layout, with no source code. This stage reruns on
+# every source change, but what the builder takes from it is only recipe.json,
+# whose content (and so whose cache key) changes only when a manifest,
+# Cargo.lock or a target list does.
+FROM base AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Stage 1c: build ghostframe binaries inside the container so shared libraries
+# match the runtime environment exactly.
+FROM base AS builder
+# Parallelism for the in-container release build. Default 6, which suits a
+# 12-core workstation that other jobs share; CI runners (small, and sharing a
+# host) can pass a smaller number. Override with:
+#
+#   docker build --build-arg CARGO_JOBS=2 -t ghostframe/test-server \
+#     -f tests/containers/test-server/Dockerfile .
+#
+# Each rustc job carries the 16 MiB stack set below and ffmpeg-next's
+# codegen is memory-hungry, so scale this against available RAM, not just
+# core count.
+ARG CARGO_JOBS=6
+ENV CARGO_BUILD_JOBS=${CARGO_JOBS}
+# ffmpeg-next overflows rustc's default 8 MiB stack on this codebase; bump
+# to 16 MiB (the value rustc itself suggests when it crashes).
+ENV RUST_MIN_STACK=16777216
+# Enable the lib's `test-loss-injection` feature so e2e tests can drive
+# deterministic packet/ACK drops via GHOSTFRAME_{OUTBOUND,INBOUND}_LOSS_*
+# env vars. Also enable `cdf53-diag` so e2e tests can drive the GPU vs CPU
+# cdf53 forward diff log (GHOSTFRAME_CDF53_DIFF_TILE=X,Y) and the
+# GHOSTFRAME_CDF53_SKIP_L2_L3 / SKIP_L3 stage gates. Production builds
+# (separate Dockerfile or release pipeline) do NOT enable these features.
+# `allow-software-vulkan` is the same kind of flag: this image has no /dev/dri,
+# so its daemon runs on llvmpipe, which production refuses. The grep below
+# proves the feature really reached this binary; ci/check-test-features.sh and
+# ci-local prove it reached no other.
+#
+# Dependencies first. `cargo chef cook` builds every third-party crate of this
+# exact package and feature selection (so feature unification, and with it the
+# set of dependency artifacts, matches the final build below) against stub
+# workspace crates. The result is an ordinary image layer, which is the point:
+# BuildKit never exports cache *mounts* to a remote cache, so the old
+# mount-based target/ was invisible to CI's type=gha cache and every source
+# change recompiled the whole dependency graph there (about 320 s of a 600 s
+# build). A layer is exported, and is rebuilt only when recipe.json, the
+# toolchain or the settings above change.
+#
+# Neither this step nor the final one mounts anything over /build/target, which
+# would shadow the layer's artifacts. The registry and git checkouts therefore
+# stay in the layer as well: cargo needs their sources to resolve the graph.
+# `cargo fetch` completes the registry for every platform: ghostframe-lib's
+# build.rs runs cbindgen, which runs `cargo metadata`, which downloads (and
+# extracts) all of it, windows-only crates included, in the final step.
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json \
+        -p ghostframe-xdaemon -p ghostframe-test-pattern \
+        --features ghostframe-lib/test-loss-injection,ghostframe-lib/cdf53-diag,ghostframe-lib/allow-software-vulkan \
+    && cargo fetch --locked
+
+# Warm Go's module and build caches for ghostbridge in a layer of their own.
+# ghostframe-tsnet's build.rs (a stub during cook) runs `go build` on it in the
+# step below; without this, that step downloads the module graph (~500 MB,
+# tailscale and friends) and recompiles it on every source change, and the
+# result lands in the layer that changes every time. `-tags noweb` skips the
+# //go:embed (so no dist/ is needed) and shares every dependency package with
+# the real archive build. This layer is rebuilt only when ghostbridge/ changes.
+COPY ghostbridge/ ghostbridge/
+RUN cd ghostbridge && go build -tags noweb -buildmode=c-archive -o /tmp/warm.a . \
+    && rm -f /tmp/warm.a /tmp/warm.h
 
 # Copy workspace files for dependency caching
 COPY Cargo.toml Cargo.lock ./
@@ -96,7 +173,6 @@ COPY ghostframe-bench/src/ ghostframe-bench/src/
 # Cargo.toml declares [[bench]] targets; the .rs files must exist for the
 # manifest to parse, even though they aren't compiled by `-p ghostframe-xdaemon`.
 COPY ghostframe-bench/benches/ ghostframe-bench/benches/
-COPY ghostbridge/ ghostbridge/
 
 # Copy full source
 COPY ghostframe-lib/ ghostframe-lib/
@@ -110,51 +186,23 @@ COPY ghostframe-test-pattern/ ghostframe-test-pattern/
 # this Dockerfile does not install Node.
 COPY ghostframe-web-client/dist/ ghostframe-web-client/dist/
 
-# Parallelism for the in-container release build. Default 6, which suits a
-# 12-core workstation that other jobs share; CI runners (small, and sharing a
-# host) can pass a smaller number. Override with:
+# The workspace crates, on top of the cooked dependencies.
 #
-#   docker build --build-arg CARGO_JOBS=2 -t ghostframe/test-server \
-#     -f tests/containers/test-server/Dockerfile .
+# The touch is still needed, for a different reason than it used to be: COPY
+# preserves the context files' mtimes, which can be older than the stub crates
+# that `cook` just compiled, and cargo's freshness check is mtime-based, so
+# without it an old checkout would link the stubs. Touching every workspace
+# file (not target/, not the registry) makes the real sources newer, so exactly
+# the workspace crates rebuild and the registry dependencies do not.
 #
-# Each rustc job carries the 16 MiB stack set below and ffmpeg-next's
-# codegen is memory-hungry, so scale this against available RAM, not just
-# core count.
-ARG CARGO_JOBS=6
-ENV CARGO_BUILD_JOBS=${CARGO_JOBS}
-# ffmpeg-next overflows rustc's default 8 MiB stack on this codebase; bump
-# to 16 MiB (the value rustc itself suggests when it crashes).
-ENV RUST_MIN_STACK=16777216
-# Enable the lib's `test-loss-injection` feature so e2e tests can drive
-# deterministic packet/ACK drops via GHOSTFRAME_{OUTBOUND,INBOUND}_LOSS_*
-# env vars. Also enable `cdf53-diag` so e2e tests can drive the GPU vs CPU
-# cdf53 forward diff log (GHOSTFRAME_CDF53_DIFF_TILE=X,Y) and the
-# GHOSTFRAME_CDF53_SKIP_L2_L3 / SKIP_L3 stage gates. Production builds
-# (separate Dockerfile or release pipeline) do NOT enable these features.
-# `allow-software-vulkan` is the same kind of flag: this image has no /dev/dri,
-# so its daemon runs on llvmpipe, which production refuses. The grep below
-# proves the feature really reached this binary; ci/check-test-features.sh and
-# ci-local prove it reached no other.
-#
-# The registry, git checkouts and target/ live in BuildKit cache mounts, so an
-# edit to one source file recompiles only what it touches instead of the whole
-# workspace. A cache mount is not part of the layer, so the two binaries are
-# copied out to /out inside the same RUN; the runtime stage takes them from
-# there. The touch makes every workspace source newer than anything in the
-# cache: target/ is shared by every worktree on the host and cargo's freshness
-# check is mtime-based, so without it a tree whose sources are older than
-# another tree's artifacts silently links that tree's crates. Registry
-# dependencies are unaffected and stay cached.
-# Prune the cache with `docker builder prune --filter type=exec.cachemount`.
-RUN --mount=type=cache,id=ghostframe-cargo-registry,target=/root/.cargo/registry \
-    --mount=type=cache,id=ghostframe-cargo-git,target=/root/.cargo/git \
-    --mount=type=cache,id=ghostframe-target,target=/build/target \
-    find /build -path /build/target -prune -o -type f -print0 | xargs -0 touch \
+# Same package and feature selection as the cook above, and the grep proves the
+# `allow-software-vulkan` feature really reached this binary;
+# ci/check-test-features.sh and ci-local prove it reached no other. The
+# binaries stay in /build/target for the runtime stage to COPY.
+RUN find /build -path /build/target -prune -o -type f -print0 | xargs -0 touch \
     && cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern \
         --features ghostframe-lib/test-loss-injection,ghostframe-lib/cdf53-diag,ghostframe-lib/allow-software-vulkan \
-    && grep -aq 'software Vulkan permitted (test build)' target/release/ghostframe-xdaemon \
-    && mkdir -p /out \
-    && cp target/release/ghostframe-xdaemon target/release/ghostframe-test-pattern /out/
+    && grep -aq 'software Vulkan permitted (test build)' target/release/ghostframe-xdaemon
 
 # Stage 2: Runtime image
 FROM ubuntu:24.04
@@ -181,8 +229,8 @@ RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install
     libx264-164 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /out/ghostframe-xdaemon /usr/local/bin/ghostframe-xdaemon
-COPY --from=builder /out/ghostframe-test-pattern /usr/local/bin/ghostframe-test-pattern
+COPY --from=builder /build/target/release/ghostframe-xdaemon /usr/local/bin/ghostframe-xdaemon
+COPY --from=builder /build/target/release/ghostframe-test-pattern /usr/local/bin/ghostframe-test-pattern
 COPY tests/containers/test-server/entrypoint.sh /entrypoint.sh
 COPY tests/containers/test-server/xorg.conf /etc/X11/xorg.conf
 COPY tests/containers/test-server/xorg-odd.conf /etc/X11/xorg-odd.conf
