@@ -222,12 +222,6 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4
 
-      - name: Build host-side release binaries (for containers-build)
-        run: |
-          cargo build --release \
-            -p ghostframe-xdaemon \
-            -p ghostframe-test-pattern
-
       - name: Build test-headscale image
         uses: docker/build-push-action@v7
         with:

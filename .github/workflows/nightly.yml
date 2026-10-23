@@ -55,12 +55,6 @@ jobs:
           npm ci
           npm run build
 
-      - name: Build host-side release binaries
-        run: |
-          cargo build --release \
-            -p ghostframe-xdaemon \
-            -p ghostframe-test-pattern
-
       - name: Build test-headscale image
         run: |
           docker build \
