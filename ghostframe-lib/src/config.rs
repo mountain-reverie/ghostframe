@@ -409,9 +409,10 @@ impl DiagnosticsConfig {
     /// as the other two configs would silently stop honouring these
     /// variables in production — so it doesn't.
     ///
-    /// `dump_frame_path` parses unconditionally: the former `io_bridge.rs`
-    /// site (`GHOSTFRAME_DUMP_FRAME`) was ungated, a live production
-    /// one-shot dump, not a test-only knob. `cdf53_diff_tile` /
+    /// `dump_frame_path` (`GHOSTFRAME_DUMP_FRAME`) parses only under
+    /// `cfg(any(test, feature = "test-loss-injection"))`: it writes raw screen
+    /// contents to a path the environment names, which a release daemon must
+    /// never do. `cdf53_diff_tile` /
     /// `cdf53_dump_pending` / `cdf53_skip_l2_l3` / `cdf53_skip_l3` only
     /// parse under the `cdf53-diag` feature, mirroring the `#[cfg]` that
     /// gates their `io_bridge.rs` call sites; a build without the feature
@@ -430,7 +431,11 @@ impl DiagnosticsConfig {
                 get("GHOSTFRAME_DIAGNOSE_COLOR_HIST").as_deref(),
                 Some("1") | Some("true")
             ),
+            // Writes screen contents to a caller-chosen path: test builds only.
+            #[cfg(any(test, feature = "test-loss-injection"))]
             dump_frame_path: get("GHOSTFRAME_DUMP_FRAME"),
+            #[cfg(not(any(test, feature = "test-loss-injection")))]
+            dump_frame_path: None,
             #[cfg(feature = "cdf53-diag")]
             cdf53_diff_tile: cdf53_diff_tile_from_lookup(&get),
             #[cfg(not(feature = "cdf53-diag"))]
@@ -663,13 +668,23 @@ fn vaapi_device_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<Stri
 ///
 /// Deliberately **not** cached: the tests below set the variable and expect
 /// the next call to observe it.
+///
+/// The override exists only under `cfg(any(test, feature =
+/// "test-loss-injection"))`; a release daemon always uses the default.
 pub fn datagram_send_buffer_bytes() -> usize {
     const DEFAULT: usize = 16 * 1024 * 1024;
-    std::env::var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT)
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    fn override_bytes() -> Option<usize> {
+        std::env::var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+    }
+    #[cfg(not(any(test, feature = "test-loss-injection")))]
+    fn override_bytes() -> Option<usize> {
+        None
+    }
+    override_bytes().unwrap_or(DEFAULT)
 }
 
 /// `GHOSTFRAME_ACK_ORDER_PROBE=1` — emit one line per ACK batch for offline
@@ -693,9 +708,26 @@ pub(crate) fn rto_probe_enabled() -> bool {
 /// runs on every scheduler tick; it previously read the environment on each
 /// call, which is both a guard violation and a syscall-shaped cost in a hot
 /// path.
+///
+/// Test builds only (`cfg(any(test, feature = "test-loss-injection"))`): a
+/// release daemon must not let its environment turn off loss recovery.
+#[cfg(any(test, feature = "test-loss-injection"))]
 pub(crate) fn no_rto() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("GHOSTFRAME_NO_RTO").is_ok_and(|v| v == "1"))
+}
+
+#[cfg(not(any(test, feature = "test-loss-injection")))]
+pub(crate) fn no_rto() -> bool {
+    false
+}
+
+/// Whether this build of `ghostframe-lib` was compiled with its test knobs
+/// (`test-loss-injection`). Lets `ghostframe-xdaemon`, which has no features
+/// of its own, gate its dump env vars on the same switch. A function rather
+/// than a `pub const` so it stays out of the generated C header.
+pub fn test_knobs_compiled() -> bool {
+    cfg!(feature = "test-loss-injection")
 }
 
 #[cfg(test)]

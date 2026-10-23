@@ -56,6 +56,10 @@ pub(crate) const MAX_HELD_STREAM_BYTES: usize = 16 * 1024;
 /// Total bytes held across every undecoded stream of one connection. The
 /// per-stream cap alone lets a peer open many streams and park 16 KiB on each.
 pub(crate) const MAX_HELD_TOTAL_BYTES: usize = 64 * 1024;
+/// Peer-opened bidirectional streams one connection may have pending at once.
+/// The handshake needs one (the CONNECT); a few more cover feedback streams.
+/// Streams that end are forgotten, so this bounds only live ones.
+pub(crate) const MAX_PENDING_BIDI_STREAMS: usize = 16;
 
 // ─── main struct ─────────────────────────────────────────────────────────────
 
@@ -222,8 +226,11 @@ impl WebTransportServer {
         let mut new_streams = Vec::new();
         while let Some(sid) = conn.streams().accept(dir) {
             tracing::debug!(stream_id = ?sid, ?dir, "peer opened stream");
-            if dir == Dir::Bi {
-                self.pending_bidi_streams.push(sid);
+            if dir == Dir::Bi && !self.track_pending_bidi(sid) {
+                tracing::warn!(stream_id = ?sid, limit = MAX_PENDING_BIDI_STREAMS,
+                    "too many pending bidi streams; refusing this one");
+                let _ = conn.recv_stream(sid).stop(quinn_proto::VarInt::from_u32(0));
+                continue;
             }
             new_streams.push(sid);
         }
@@ -236,30 +243,53 @@ impl WebTransportServer {
         }
     }
 
+    /// Start tracking a peer-opened bidi stream. `false` when the connection
+    /// already has [`MAX_PENDING_BIDI_STREAMS`] pending.
+    fn track_pending_bidi(&mut self, sid: StreamId) -> bool {
+        if self.pending_bidi_streams.len() >= MAX_PENDING_BIDI_STREAMS {
+            return false;
+        }
+        self.pending_bidi_streams.push(sid);
+        true
+    }
+
+    /// The peer finished or reset `sid`: drop every per-stream record of it,
+    /// or a peer that opens and closes streams grows these without bound.
+    /// The session CONNECT stream and the peer control stream are kept; they
+    /// are tracked in their own fields and outlive any read.
+    fn stream_ended(&mut self, sid: StreamId) {
+        self.pending_bidi_streams.retain(|&s| s != sid);
+        self.stream_bufs.remove(&sid);
+        self.abandoned_streams.remove(&sid);
+    }
+
     /// Called when quinn-proto reports `StreamEvent::Readable { id }`.
     ///
     /// Drains available bytes, then tries to decode the appropriate HTTP/3
     /// message depending on what we know about the stream.
     pub fn on_stream_readable(&mut self, conn: &mut Connection, sid: StreamId) {
         // Drain all available bytes from this stream.
-        let bytes = match drain_stream(conn, sid) {
-            Ok(b) => b,
-            Err(DrainError::Read(quinn_proto::ReadError::Blocked)) => {
-                tracing::debug!(stream_id = ?sid, "stream read: blocked (no data yet)");
-                return;
-            }
+        let (bytes, fin) = match drain_stream(conn, sid) {
+            Ok(r) => r,
             Err(DrainError::Readable(ref e)) => {
+                // Closed or unknown stream: nothing more will arrive.
                 tracing::warn!(stream_id = ?sid, error = ?e, "stream read: readable error");
+                self.stream_ended(sid);
                 return;
             }
             Err(e) => {
+                // Reset by the peer.
                 tracing::warn!(stream_id = ?sid, error = %e, "stream read error");
+                self.stream_ended(sid);
                 return;
             }
         };
 
         if bytes.is_empty() {
             tracing::trace!(stream_id = ?sid, "stream read: 0 bytes");
+            if fin && !self.is_long_lived(sid) {
+                self.stream_ended(sid);
+            }
             return;
         }
 
@@ -300,6 +330,14 @@ impl WebTransportServer {
         }
 
         self.bound_held_stream(sid);
+        if fin && !self.is_long_lived(sid) {
+            self.stream_ended(sid);
+        }
+    }
+
+    /// Streams that stay in use after the peer stops sending on them.
+    fn is_long_lived(&self, sid: StreamId) -> bool {
+        self.peer_control_stream == Some(sid) || self.session_stream == Some(sid)
     }
 
     /// Whatever the decoders could not consume is still held for `sid`.
@@ -558,9 +596,11 @@ impl std::fmt::Display for DrainError {
 
 /// Drain all currently available bytes from a recv stream into a Vec.
 ///
-/// Returns an empty Vec if there is no data yet (not an error).
-fn drain_stream(conn: &mut Connection, sid: StreamId) -> Result<Vec<u8>, DrainError> {
+/// Returns an empty Vec if there is no data yet (not an error). The flag is
+/// true once the peer's FIN has been read.
+fn drain_stream(conn: &mut Connection, sid: StreamId) -> Result<(Vec<u8>, bool), DrainError> {
     let mut out = Vec::new();
+    let mut fin = false;
     let mut recv = conn.recv_stream(sid);
     let mut chunks = recv.read(true).map_err(DrainError::Readable)?;
     loop {
@@ -568,7 +608,10 @@ fn drain_stream(conn: &mut Connection, sid: StreamId) -> Result<Vec<u8>, DrainEr
             Ok(Some(chunk)) => {
                 out.extend_from_slice(&chunk.bytes);
             }
-            Ok(None) => break,                             // FIN reached
+            Ok(None) => {
+                fin = true; // FIN reached
+                break;
+            }
             Err(quinn_proto::ReadError::Blocked) => break, // no more data yet
             Err(e) => {
                 let _ = chunks.finalize();
@@ -577,7 +620,7 @@ fn drain_stream(conn: &mut Connection, sid: StreamId) -> Result<Vec<u8>, DrainEr
         }
     }
     let _ = chunks.finalize();
-    Ok(out)
+    Ok((out, fin))
 }
 
 // ─── unit tests ──────────────────────────────────────────────────────────────
@@ -645,6 +688,34 @@ mod tests {
         wt.bound_held_stream(s);
         assert!(wt.stream_bufs.contains_key(&s));
         assert!(wt.abandoned_streams.is_empty());
+    }
+
+    #[test]
+    fn opened_then_ended_streams_leave_nothing_behind() {
+        let mut wt = WebTransportServer::new();
+        for i in 0..1000u64 {
+            let s = sid(4 * i);
+            assert!(wt.track_pending_bidi(s));
+            wt.stream_bufs.entry(s).or_default().extend(&[1, 2, 3]);
+            wt.abandoned_streams.insert(s);
+            wt.stream_ended(s);
+        }
+        assert!(wt.pending_bidi_streams.is_empty());
+        assert!(wt.stream_bufs.is_empty());
+        assert!(wt.abandoned_streams.is_empty());
+    }
+
+    #[test]
+    fn pending_bidi_streams_are_capped() {
+        let mut wt = WebTransportServer::new();
+        for i in 0..MAX_PENDING_BIDI_STREAMS as u64 {
+            assert!(wt.track_pending_bidi(sid(4 * i)));
+        }
+        assert!(!wt.track_pending_bidi(sid(4 * 99)));
+        assert_eq!(wt.pending_bidi_streams.len(), MAX_PENDING_BIDI_STREAMS);
+        // Ending one frees a slot.
+        wt.stream_ended(sid(0));
+        assert!(wt.track_pending_bidi(sid(4 * 99)));
     }
 
     // ── Construction ─────────────────────────────────────────────────────────

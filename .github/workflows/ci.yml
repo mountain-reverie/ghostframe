@@ -167,6 +167,14 @@ jobs:
         with:
           shared-key: ci-release
       - run: cargo build --workspace --release --exclude ghostframe-e2e
+      # The workspace build unifies ghostframe-e2e's test features (via
+      # ghostframe-bench) into the daemon, so rebuild it alone, as
+      # `just build-release` does, and check that one. Mirrors `just ci-local`.
+      - run: cargo build --release -p ghostframe-xdaemon
+      - name: release daemon carries no test-only feature
+        run: |
+          if grep -aq 'software Vulkan permitted (test build)' target/release/ghostframe-xdaemon; then echo "::error::release ghostframe-xdaemon contains the software-Vulkan test-build literal"; exit 1; fi
+          ci/check-release-binary.sh
 
   web-client:
     name: web-client

@@ -174,3 +174,11 @@ opt-level = 1
 
 [profile.test.package."*"]
 opt-level = 3
+
+# goog_cc 0.1.4 stamped the start of an application-limited region with the wall
+# clock and compared it with the caller's timestamps (probe_controller), so
+# periodic ALR probing depended on real time. The fork commit stamps it from
+# the send time instead; it is 0.1.4 plus that one change. Drop this patch if
+# upstream (kixelated/goog_cc) takes the fix.
+[patch.crates-io]
+goog_cc = { git = "https://github.com/Bluebugs/goog_cc", rev = "1835cfa00f9d4e427a4908fd421bf2386594692d" }

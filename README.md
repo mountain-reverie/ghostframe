@@ -242,6 +242,9 @@ To pick up a new version, rebuild from source and re-run the installer
 with `--force` so the binary and Xorg config are overwritten in place.
 The tsnet state dir is preserved (step 6 of `install.sh` self-skips when
 it's already seeded), so you do not need to re-paste your auth key.
+The state dir is `${XDG_STATE_HOME:-~/.local/state}/ghostframe`, mode 0700; the
+daemon refuses to start if it is group- or world-accessible or owned by another
+user. `TS_STATE_DIR` overrides it and is held to the same check.
 
 ```bash
 # 1. Pull and rebuild.
@@ -476,8 +479,10 @@ after `git clone`.
 # 1. Join the tailnet. Prints a URL to authorise the node in your browser.
 ghostframe login
 
-#    Or non-interactively, with a pre-auth key:
-ghostframe login --authkey tskey-auth-...
+#    Or non-interactively, with a pre-auth key read from stdin (never argv,
+#    where other local users can see it in /proc) or from a 0600 file:
+ghostframe login --authkey-stdin < key.txt
+ghostframe login --authkey-file ~/.config/ghostframe/authkey
 
 # 2. Connect to a ghostframe server by its tailnet hostname.
 ghostframe connect <hostname>-ghostframe
