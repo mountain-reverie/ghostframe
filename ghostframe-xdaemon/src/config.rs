@@ -95,6 +95,7 @@ impl XdaemonConfig {
         // own, so it follows the lib's `test-loss-injection`, which the e2e
         // image enables and `ci/check-release-features.sh` forbids in a
         // release build.
+        let nonempty = |k: &str| get(k).filter(|s| !s.is_empty());
         let knob = |k: &str| {
             if ghostframe_lib::config::test_knobs_compiled() {
                 get(k)
