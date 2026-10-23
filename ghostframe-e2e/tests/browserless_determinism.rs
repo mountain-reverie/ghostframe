@@ -307,6 +307,15 @@ fn full_digest(r: &BrowserlessResult) -> Vec<(&'static str, u64)> {
             r.transport.max_queue_bytes as u64,
         ),
         ("transport_samples", r.transport.samples),
+        // The D1 instruments are measurements of a reproducible scene, so
+        // they must reproduce too; a reading that varies run to run would
+        // not be a baseline.
+        ("instr_offered_total", r.transport.instr.offered.total()),
+        ("instr_lag_samples", r.transport.instr.lag_samples),
+        (
+            "instr_summary_hash",
+            hash_of(&format!("{:?}", r.transport.instr)),
+        ),
         ("transport_client_received", r.transport.client_received),
         ("transport_client_recovered", r.transport.client_recovered),
         ("client_lost_pre_fec", r.client_wire_loss.lost_pre_fec),
