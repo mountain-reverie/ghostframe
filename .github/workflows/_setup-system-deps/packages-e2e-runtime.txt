@@ -1,0 +1,13 @@
+# Extra packages installed only when the action's `e2e-runtime` input is
+# true, AFTER packages-build.txt in a separate apt transaction (as before the
+# lists moved out of action.yml). One per line; `#` starts a comment.
+#
+# The Vulkan ICDs (mesa-vulkan-drivers) are deliberately NOT in
+# packages-build.txt: llvmpipe is not a faithful substitute for the real GPU
+# in the gpu_pipeline lib tests, which rely on adapter-construction failure to
+# self-skip, and a software ICD silently flips that skip off.
+weston
+xwayland
+libgl1-mesa-dri
+mesa-vulkan-drivers
+libegl1
