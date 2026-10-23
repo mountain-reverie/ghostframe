@@ -659,6 +659,7 @@ impl IoBridge {
         // right now — see `clamp_to_quinn_capacity`'s doc comment for why
         // this is mandatory rather than defensive.
         let budget_bytes = self.clamp_to_quinn_capacity(pre_clamp_budget);
+        let unscaled_base = self.base_budget_bytes();
         let term = classify_budget_term(
             probe_binds,
             match (pacing_mode, bwe_snap.pacer_rate_bps) {
@@ -668,12 +669,13 @@ impl IoBridge {
                 _ => None,
             },
             base_budget_bytes,
+            unscaled_base,
             self.bandwidth_budget_term(),
             self.tick_budget_floor(),
         );
         self.instr
             .budget
-            .note(term, budget_bytes < pre_clamp_budget);
+            .note(term, budget_bytes < pre_clamp_budget, give_back);
         let (stats, drained_bytes, drained_count) =
             self.drain_scheduler_into_quinn(seq, timestamp_us, max_frag, budget_bytes);
         // Cache the continuation context so `Event::DatagramsUnblocked` ->

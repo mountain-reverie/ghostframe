@@ -5776,6 +5776,33 @@ async fn a_late_ack_after_the_flush_is_counted_apart_from_one_before_it() {
     );
 }
 
+/// quinn reuses connection handles. The session-scoped instruments must not
+/// carry one connection's departure mirror (or its billing) into the next one
+/// that is given the same handle, or its first lags are stamped against
+/// byte counts that belong to a connection that no longer exists.
+#[tokio::test]
+async fn a_forgotten_session_does_not_leak_its_mirror_into_a_reused_handle() {
+    let h = ConnectionHandle(7);
+    let mut bridge = test_bridge_with_sessions(&[h]).await;
+    bridge.note_enqueued(h, WireClass::Critical, 100, 2, 102, 102);
+    bridge.note_enqueued(h, WireClass::Critical, 100, 2, 204, 204);
+    assert_eq!(bridge.instr.mirror.len(), 2);
+    assert_eq!(bridge.instr.offered.total(), 204);
+
+    bridge.forget_session(h);
+    assert!(bridge.instr.mirror.is_empty(), "forgotten session's mirror");
+    assert_eq!(bridge.instr.offered.total(), 0);
+    assert_eq!(bridge.instr.mirror_handle(), None);
+
+    // The same handle, a new connection whose counter starts again.
+    bridge.note_enqueued(h, WireClass::Critical, 100, 2, 102, 102);
+    assert_eq!(
+        bridge.instr.mirror.len(),
+        1,
+        "no stale entry from the old one"
+    );
+}
+
 // ---- T5: the sample's send time must survive the 32-bit emit clock wrapping ----
 
 /// The datagram header carries the emit stamp as a `u32` of microseconds, which

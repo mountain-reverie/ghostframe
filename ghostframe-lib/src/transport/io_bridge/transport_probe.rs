@@ -46,6 +46,13 @@ pub struct TransportProbe {
 
 /// The mutable state behind [`InstrumentSummary`]. Measurement only: nothing
 /// in the bridge reads any field of this to decide anything.
+///
+/// Scope. The offered-load accounting, the FIFO series, the departure mirror
+/// and the quinn byte counters describe the LIVE session only: they are
+/// reset when a different connection becomes live (`apply_hello`) and when a
+/// session is forgotten, and only sends to the live session are billed.
+/// The budget, ECN, and ledger counters belong to the bridge and run for its
+/// whole life (the ledger is not per session).
 #[derive(Debug, Default)]
 pub(super) struct Instruments {
     pub(super) offered: OfferedBytes,
@@ -60,6 +67,9 @@ pub(super) struct Instruments {
     /// Session counter and queue depth at the last post-drain reading.
     quinn_bytes_enqueued: u64,
     quinn_bytes_queued: u64,
+    /// The live session's accepted-byte counter when it became live, so the
+    /// counters compared with `offered` cover the same sends.
+    session_bytes_base: u64,
     /// Ledger expiries (declared lost) and how many were handed to goog_cc.
     pub(super) losses_declared: u64,
     pub(super) losses_flushed: u64,
@@ -70,7 +80,35 @@ pub(super) struct Instruments {
     pub(super) late_acked_after_flush: u64,
 }
 
+impl Instruments {
+    pub(super) fn mirror_handle(&self) -> Option<ConnectionHandle> {
+        self.mirror_handle
+    }
+
+    /// Start the session-scoped instruments afresh. `bytes_base` is the new
+    /// live session's accepted-byte counter at this moment.
+    pub(super) fn reset_session_scope(&mut self, bytes_base: u64) {
+        self.offered = OfferedBytes::default();
+        self.mirror = DepartureMirror::default();
+        self.mirror_handle = None;
+        self.fifo = FifoSeries::default();
+        self.fifo_peak_at_enqueue = 0;
+        self.quinn_bytes_enqueued = 0;
+        self.quinn_bytes_queued = 0;
+        self.session_bytes_base = bytes_base;
+    }
+}
+
 impl IoBridge {
+    /// A different connection just became the live session.
+    pub(super) fn reset_session_instruments(&mut self, handle: ConnectionHandle) {
+        let base = self
+            .wt_sessions
+            .get(&handle)
+            .map_or(0, |wt| wt.datagram_bytes_enqueued());
+        self.instr.reset_session_scope(base);
+    }
+
     /// Read the live session's quinn stats and send-queue depth.
     pub(super) fn update_transport_probe(&mut self) {
         let capacity = self.server.datagram_send_buffer();
@@ -89,7 +127,7 @@ impl IoBridge {
             .map_or(0, |wt| wt.datagram_bytes_enqueued());
         let now = super::now_std();
         self.instr.fifo.record(now, queued);
-        self.instr.quinn_bytes_enqueued = enqueued;
+        self.instr.quinn_bytes_enqueued = enqueued.saturating_sub(self.instr.session_bytes_base);
         self.instr.quinn_bytes_queued = queued;
         let p = &mut self.transport_probe;
         p.cwnd = stats.path.cwnd;
@@ -163,7 +201,10 @@ impl IoBridge {
             fifo_depth_peak_at_enqueue: i.fifo_peak_at_enqueue,
             fifo_depth_mean: i.fifo.time_weighted_mean().round() as u64,
             fifo_depth_slope_last_quarter_bps: i.fifo.slope_last_quarter().round() as i64,
-            cwnd_limited_turns: i.fifo.nonempty(),
+            quinn_limited_turns: i.fifo.nonempty(),
+            quinn_limited_us: i.fifo.nonempty_us(),
+            ledger_unknown_acks: self.transmission_ledger.stats().unknown_acks,
+            ledger_tombstone_evictions: self.transmission_ledger.stats().tombstone_evictions,
             offered: i.offered,
             quinn_bytes_enqueued: i.quinn_bytes_enqueued,
             quinn_bytes_departed: i.quinn_bytes_enqueued.saturating_sub(i.quinn_bytes_queued),

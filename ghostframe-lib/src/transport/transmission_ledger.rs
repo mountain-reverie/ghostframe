@@ -64,6 +64,10 @@ pub struct LedgerStats {
     /// reproduction this read 1458 per 8-second scene, every one of which
     /// stranded a cache entry.
     pub acked_after_declared_lost: u64,
+    /// Tombstones pushed out of the ring by newer ones. A late acknowledgement
+    /// for an evicted one resolves to nothing (counted in `unknown_acks`), so
+    /// `acked_after_declared_lost` is blind to it. Measurement only.
+    pub tombstone_evictions: u64,
 }
 
 pub struct TransmissionLedger {
@@ -192,7 +196,9 @@ impl TransmissionLedger {
                         self.tombstone_order.push_back(front);
                         while self.tombstones.len() > self.capacity {
                             if let Some(oldest) = self.tombstone_order.pop_front() {
-                                self.tombstones.remove(&oldest);
+                                if self.tombstones.remove(&oldest).is_some() {
+                                    self.stats.tombstone_evictions += 1;
+                                }
                             } else {
                                 break;
                             }

@@ -2526,11 +2526,15 @@ impl IoBridge {
                                 if let Some(response) = handle_datagram_payload(&payload) {
                                     tracing::trace!(?handle, "ping received, sending pong");
                                     match wt.send_datagram(conn, response) {
-                                        Ok(()) => self.instr.offered.bill(
-                                            WireClass::Control,
-                                            response.len(),
-                                            wt.datagram_framing_len(),
-                                        ),
+                                        // Only the live session's sends are billed.
+                                        Ok(()) if self.last_hello_from == Some(handle) => {
+                                            self.instr.offered.bill(
+                                                WireClass::Control,
+                                                response.len(),
+                                                wt.datagram_framing_len(),
+                                            )
+                                        }
+                                        Ok(()) => {}
                                         Err(e) => {
                                             tracing::warn!(?handle, error = ?e, "failed to send pong");
                                         }

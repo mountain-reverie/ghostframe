@@ -636,6 +636,8 @@ impl IoBridge {
             .scheduler
             .tick_at_with(budget_bytes, now, &|x, y, p| emitter.holds_pass(x, y, p));
         let drained_count = drained.len();
+        // Which of `drained` are scheduler re-sends (offered-load label only).
+        let retry_positions: Vec<usize> = self.scheduler.last_tick_retries().to_vec();
         let mut stats = FrameSendStats::default();
         let mut total_wire_bytes_sent: usize = 0;
         // Build per-fragment (EmitKey, Bytes) items for the reliable
@@ -650,7 +652,13 @@ impl IoBridge {
             std::time::Instant,
             Option<crate::transport::reliable_emitter::cache::ProbeTag>,
         )> = Vec::with_capacity(drained.len());
-        for work in drained {
+        let mut retry_flags: Vec<bool> = Vec::with_capacity(drained.len());
+        let mut next_retry = 0usize;
+        for (pos, work) in drained.into_iter().enumerate() {
+            let is_retry = retry_positions.get(next_retry) == Some(&pos);
+            if is_retry {
+                next_retry += 1;
+            }
             // A tile pass is one datagram: no payload exceeds `MAX_TILE_PAYLOAD`
             // and frame dispatch refuses a path too small for that, so this
             // check is a backstop for a caller that skipped it.
@@ -825,10 +833,12 @@ impl IoBridge {
                     tag
                 });
                 items.push((key, bytes::Bytes::from(dg), work.queued_at, probe_tag));
+                retry_flags.push(is_retry);
             }
         }
         // Submit the batch (stamps wire_seq, caches, schedules RTO + parity).
-        self.reliable_emitter.submit_batch(items, now);
+        self.reliable_emitter
+            .submit_batch_marking_retries(items, &retry_flags, now);
         self.drain_reliable_emitter(now);
         (stats, total_wire_bytes_sent, drained_count)
     }

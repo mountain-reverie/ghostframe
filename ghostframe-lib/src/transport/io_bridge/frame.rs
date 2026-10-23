@@ -2336,21 +2336,30 @@ impl IoBridge {
                 smoothed_rtt_us = self.adaptation_context.smoothed_rtt_us,
                 pending_losses_retracted = self.pending_losses_retracted,
                 // D1 instruments (measurement only; see `transport::instruments`).
-                // Offered bytes are wire bytes handed to quinn, by class;
-                // divide by `instr_window_ms` for a rate. `offered_total_B`
-                // equals `quinn_bytes_enqueued`, and `quinn_bytes_departed`
-                // is what has left quinn's FIFO into packets.
+                // The offered-load, FIFO, departure-lag and quinn byte fields
+                // cover the LIVE SESSION only (reset when another connection
+                // becomes live); the budget, ECN and ledger fields run for the
+                // bridge's life. Offered bytes are wire bytes handed to quinn
+                // by that session, by class; divide by `instr_window_ms` for a
+                // rate. `offered_total_B` equals `quinn_bytes_enqueued`, and
+                // `quinn_bytes_departed` is what has left quinn's FIFO into
+                // packets.
                 instr_window_ms = ins.window_us / 1000,
                 fifo_samples = ins.fifo_samples,
                 fifo_depth_max_B = ins.fifo_depth_max,
                 fifo_depth_peak_at_enqueue_B = ins.fifo_depth_peak_at_enqueue,
                 fifo_depth_mean_B = ins.fifo_depth_mean,
                 fifo_depth_slope_last_quarter_Bps = ins.fifo_depth_slope_last_quarter_bps,
-                cwnd_limited_turns = ins.cwnd_limited_turns,
+                // Non-empty FIFO at the end of a turn: cwnd-limited OR held by
+                // quinn's own pacer (indistinguishable). The `_us` form is the
+                // time the FIFO stood non-empty.
+                quinn_limited_turns = ins.quinn_limited_turns,
+                quinn_limited_us = ins.quinn_limited_us,
                 offered_critical_B = ins.offered.of(WireClass::Critical),
                 offered_refinement_B = ins.offered.of(WireClass::Refinement),
                 offered_nack_repair_B = ins.offered.of(WireClass::NackRepair),
                 offered_rto_retransmit_B = ins.offered.of(WireClass::RtoRetransmit),
+                offered_scheduler_retry_B = ins.offered.of(WireClass::SchedulerRetry),
                 offered_parity_B = ins.offered.of(WireClass::Parity),
                 offered_h264_B = ins.offered.of(WireClass::H264),
                 offered_control_B = ins.offered.of(WireClass::Control),
@@ -2368,13 +2377,20 @@ impl IoBridge {
                 budget_term_pacer = ins.budget.pacer,
                 budget_term_floor = ins.budget.floor,
                 budget_term_probe = ins.budget.probe,
+                budget_term_aimd = ins.budget.aimd,
+                budget_giveback_ticks = ins.budget.giveback_ticks,
+                budget_giveback_bytes = ins.budget.giveback_bytes,
                 budget_sendbuf_clamped = ins.budget.sendbuf_clamped,
                 ledger_losses_declared = ins.ledger_losses_declared,
                 ledger_losses_flushed = ins.ledger_losses_flushed,
                 ledger_losses_overflowed = ins.ledger_losses_overflowed,
                 late_acked_before_flush = ins.late_acked_before_flush,
                 late_acked_after_flush = ins.late_acked_after_flush,
+                // Lower bound: a late ack for a tombstone the ring has since
+                // evicted lands in `ledger_unknown_acks` instead.
                 late_acked_unreported = ins.late_acked_unreported,
+                ledger_unknown_acks = ins.ledger_unknown_acks,
+                ledger_tombstone_evictions = ins.ledger_tombstone_evictions,
                 ecn_ect0_tx = ins.ecn.ect0_tx,
                 ecn_unmarked_tx = ins.ecn.unmarked_tx,
                 ecn_last_tx_marked = ins.ecn.last_marked,

@@ -208,6 +208,20 @@ impl ReliableTileEmitter {
         probe: Option<ProbeTag>,
         now: Instant,
     ) {
+        self.submit_one_as(key, source_datagram_bytes, queued_at, probe, now, false);
+    }
+
+    /// [`Self::submit_one`], saying whether this is the scheduler re-sending a
+    /// pass rather than a first send. Only the offered-load label differs.
+    pub fn submit_one_as(
+        &mut self,
+        key: EmitKey,
+        source_datagram_bytes: Bytes,
+        queued_at: Instant,
+        probe: Option<ProbeTag>,
+        now: Instant,
+        scheduler_retry: bool,
+    ) {
         let wire_seq = self.alloc.allocate();
         // Stamp in place when this handle is the only owner (the production
         // path hands over a freshly built `Vec`); copy only when it is shared.
@@ -255,8 +269,12 @@ impl ReliableTileEmitter {
         self.feed_group(wire_seq, bytes.clone());
         self.note_emission_queue_depth();
         // Enqueue the source itself.
-        self.queue
-            .push_source(bytes, WireClass::for_first_send(key.pass_idx));
+        let class = if scheduler_retry {
+            WireClass::SchedulerRetry
+        } else {
+            WireClass::for_first_send(key.pass_idx)
+        };
+        self.queue.push_source(bytes, class);
         self.stats.source_emitted += 1;
     }
 
@@ -289,6 +307,20 @@ impl ReliableTileEmitter {
                 .group_first_wire_seq
                 .wrapping_add(PARITY_INTERLEAVE_OFFSET);
             self.queue.schedule_parity(emit_after, env_bytes);
+        }
+    }
+
+    /// [`Self::submit_batch`], with `retry[i]` true where item `i` is a
+    /// scheduler re-send (see [`Self::submit_one_as`]).
+    pub fn submit_batch_marking_retries(
+        &mut self,
+        items: Vec<(EmitKey, Bytes, Instant, Option<ProbeTag>)>,
+        retry: &[bool],
+        now: Instant,
+    ) {
+        for (i, (key, bytes, queued_at, probe)) in items.into_iter().enumerate() {
+            let r = retry.get(i).copied().unwrap_or(false);
+            self.submit_one_as(key, bytes, queued_at, probe, now, r);
         }
     }
 
@@ -1398,11 +1430,54 @@ mod tests {
             handed,
             "classes + framing must account for every byte handed over"
         );
+        // Labels, checked against sizes known independently of the billing:
+        // every source datagram here is 25 bytes and the parity envelope is
+        // recognised by its first byte, not by its class.
+        let src = 25u64;
+        let crit_sends = (0..n).filter(|i| i % 3 != 0).count() as u64;
+        let refine_sends = (0..n).filter(|i| i % 3 == 0).count() as u64;
+        assert_eq!(offered.of(WireClass::Critical), crit_sends * src);
+        assert_eq!(offered.of(WireClass::Refinement), refine_sends * src);
+        assert_eq!(
+            offered.of(WireClass::NackRepair),
+            e.stats.retransmit_by_nack * src
+        );
+        assert_eq!(
+            offered.of(WireClass::RtoRetransmit),
+            e.stats.rto_fired * src
+        );
+        assert_eq!(
+            offered.datagrams[WireClass::Parity.index()],
+            e.stats.parity_emitted
+        );
         // And per datagram, not just in aggregate.
         let datagrams: u64 = offered.datagrams.iter().sum();
         assert_eq!(
             datagrams,
             e.stats.source_emitted + e.stats.retransmit_attempts_total + e.stats.parity_emitted
+        );
+    }
+
+    /// A scheduler re-send enters through `submit_one` like a first send but
+    /// is labelled apart, so it is not billed as new critical content.
+    #[test]
+    fn a_scheduler_retry_is_labelled_apart_from_a_first_send() {
+        let mut e = ReliableTileEmitter::new(Instant::now());
+        let t0 = Instant::now();
+        let item = |i| (EmitKey::new(i, 0, 0, 0), fake_source(i, 0, 0), t0, None);
+        e.submit_batch_marking_retries(vec![item(1), item(2), item(3)], &[false, true, false], t0);
+        let mut classes = Vec::new();
+        while let Some(em) = e.next_emission(t0) {
+            classes.push(em.class());
+            assert!(e.settle_emission(em, SendOutcome::Sent));
+        }
+        assert_eq!(
+            classes,
+            vec![
+                WireClass::Critical,
+                WireClass::SchedulerRetry,
+                WireClass::Critical
+            ]
         );
     }
 
