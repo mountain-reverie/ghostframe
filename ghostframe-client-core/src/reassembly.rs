@@ -421,12 +421,12 @@ impl ClientCore {
                 // spurious NACKs and left the pixels wrong.
                 let prev = self.cdf53_coverage.get(&(tx, ty)).copied();
                 if let Some(entry) = prev {
-                    if entry.generation != th.generation
-                        && !crate::cdf53_coverage::generation_is_newer(
-                            th.generation,
-                            entry.generation,
-                        )
-                    {
+                    if crate::cdf53_coverage::arrival_is_stale(
+                        entry.generation,
+                        entry.frame_seq,
+                        th.generation,
+                        frame_seq,
+                    ) {
                         return;
                     }
                 }

@@ -231,7 +231,8 @@ fn a_pass_from_an_older_generation_is_ignored() {
         last_change_us: 500,
         sweep_attempts: 0,
     };
-    let out = apply_cdf53_arrival(Some(current), 0, 12, 11, 900, true, None);
+    // Labelled 3: the server labels an older generation with an older frame.
+    let out = apply_cdf53_arrival(Some(current), 0, 12, 3, 900, true, None);
     assert_eq!(
         out.entry, current,
         "a stale generation-0 pass must not touch a generation-1 entry"
@@ -580,4 +581,50 @@ fn incomplete_tiles_is_empty_when_every_present_pass_arrived() {
         summary.to_log_line()
     );
     assert!(core.cdf53_incomplete_tiles(8).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Ordering by `frame_seq`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn arrival_order_follows_the_label_not_the_four_bit_generation() {
+    use ghostframe_client_core::cdf53_coverage::arrival_is_stale;
+    // Held generation 0 (label 10). A generation-9 pass labelled 5 is an old
+    // pass: 9 is 9 ahead of 0 and the 4-bit compare calls it "newer".
+    assert!(arrival_is_stale(0, 10, 9, 5));
+    // Held generation 9 (label 50), gen 0 labelled 10 is older too, though 0
+    // is 7 "ahead" of 9.
+    assert!(arrival_is_stale(9, 50, 0, 10));
+    // A newer label wins whatever the 4 bits say.
+    assert!(!arrival_is_stale(9, 50, 0, 60));
+    // The same generation is never stale, whatever its label.
+    assert!(!arrival_is_stale(4, 50, 4, 10));
+    // Same label, different generation: the 4-bit compare decides.
+    assert!(!arrival_is_stale(4, 50, 5, 50));
+    assert!(arrival_is_stale(5, 50, 4, 50));
+}
+
+#[test]
+fn labels_compare_across_the_31_bit_wrap() {
+    use ghostframe_client_core::cdf53_coverage::{arrival_is_stale, frame_seq_is_newer};
+    assert!(frame_seq_is_newer(0, 0x7FFF_FFFF));
+    assert!(!frame_seq_is_newer(0x7FFF_FFFF, 0));
+    assert!(!frame_seq_is_newer(5, 5));
+    // The flag bit is not part of the label.
+    assert!(arrival_is_stale(1, 0x7FFF_FFF0, 2, 0x7FFF_FFE0));
+    assert!(!arrival_is_stale(1, 0x7FFF_FFF0, 2, 3));
+}
+
+#[test]
+fn a_late_retransmission_does_not_move_the_label_back() {
+    let held = CoverageEntry {
+        generation: 4,
+        frame_seq: 50,
+        pass_mask: 1,
+        ..Default::default()
+    };
+    let out = apply_cdf53_arrival(Some(held), 4, 2, 40, 10, true, None);
+    assert_eq!(out.entry.frame_seq, 50);
+    assert_eq!(out.entry.pass_mask, 0b101, "and the pass is accepted");
 }
