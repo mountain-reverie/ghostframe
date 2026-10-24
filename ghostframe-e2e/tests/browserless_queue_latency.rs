@@ -13,12 +13,14 @@
 //! Cdf53 passes -- and the whole burst is enqueued at once, so the tail of it
 //! waits for the queue ahead of it to drain.
 //!
-//! The drain is pull-driven: `Event::DatagramsUnblocked` ->
-//! `resume_scheduler_continuation`, "scheduler.tick runs when quinn signals
-//! it has room, not when the next frame arrives" (`io_bridge.rs`). Each
-//! resume is clamped to quinn's `datagram_send_buffer` capacity, which is
-//! deliberate -- an unclamped `tick(usize::MAX)` against a first-frame burst
-//! once overran that buffer and lost datagrams outright.
+//! The drain is paced by the admission bucket (`transport::admission`): each
+//! pass admits what the rate allows while quinn's queue holds less than
+//! about 10 ms of it, and runs again after every drain so quinn is not left
+//! idle. Work that cannot be admitted waits in the scheduler, which is the
+//! queueing these scenes measure. (It used to be pull-driven by
+//! `Event::DatagramsUnblocked`, clamped to quinn's buffer capacity: an
+//! unclamped `tick(usize::MAX)` against a first-frame burst once overran
+//! that buffer and lost datagrams outright.)
 //!
 //! That makes the *event rate*, not the bandwidth budget, the binding
 //! constraint on how fast a backlog clears. Measured in production at ~580

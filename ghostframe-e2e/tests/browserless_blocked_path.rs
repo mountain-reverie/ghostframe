@@ -409,12 +409,13 @@ fn fast_link_scene(cols: u8, rows: u8, send_buffer: Option<usize>) -> Browserles
 /// capacity. If offered load never exceeds what the link can carry, a
 /// throughput ceiling is invisible.
 ///
-/// It matters because the scheduler clamps each drain to
-/// `QUINN_SEND_BUFFER_SAFETY_FRACTION * send_buffer_space()`, so throughput
-/// is bounded by roughly `drains_per_second * 0.8 * buffer_size`. At 32 KiB
-/// and ~30 drains/s that is ~780 KB/s -- about 6 Mbit, which would cap a
-/// 50 Mbit path. This scene offers far more work than the link can carry so
-/// the ceiling, if there is one, shows up as delivered bytes.
+/// It mattered because the scheduler used to clamp each drain to
+/// `QUINN_SEND_BUFFER_SAFETY_FRACTION * send_buffer_space()` (since deleted),
+/// so throughput was bounded by roughly `drains_per_second * 0.8 *
+/// buffer_size`. At 32 KiB and ~30 drains/s that is ~780 KB/s -- about 6
+/// Mbit, which would cap a 50 Mbit path. This scene offers far more work than
+/// the link can carry so a ceiling, if there is one, shows up as delivered
+/// bytes.
 fn saturating_fast_scene(cols: u8, rows: u8, send_buffer: Option<usize>) -> BrowserlessScene {
     let frames: Vec<FrameScript> = (0..40).map(|_| full_grid_frame(cols, rows)).collect();
     let mut scene = fast_link_scene(cols, rows, send_buffer);
