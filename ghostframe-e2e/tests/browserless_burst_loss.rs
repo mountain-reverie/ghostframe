@@ -579,6 +579,16 @@ async fn burst_loss_report_over_three_seeds() {
             let name = format!("{n}@{seed:#x}");
             report(&name, r);
             report_instruments(&name, r);
+            let b = &r.transport.instr.bwe;
+            println!(
+                "LIFTS {name}: down={} up={} up_checked={} up_undone_next_feedback={} up_blocked_by_queue={} down_skipped_gap={}",
+                b.ceiling_reseeds_down,
+                b.ceiling_reseeds_up,
+                b.ceiling_lifts_checked,
+                b.ceiling_lifts_undone,
+                b.ceiling_lifts_blocked_queue,
+                b.ceiling_reseeds_skipped_gap
+            );
             let (ready, distinct, refinements) = content_delivered(r);
             println!(
                 "CONTENT {name}: tile_ready={ready} distinct_tile_frames={distinct} refinement_updates={refinements} s2c_bytes={} bytes_per_distinct_tile_frame={:.0}",
