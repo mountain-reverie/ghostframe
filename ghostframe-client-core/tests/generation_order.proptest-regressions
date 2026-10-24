@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a0ea311db065557a81ed4c0a32abc6b6e495bf9190c72b889020f2fdc41b9e3e # shrinks to gens = [0, 7, 2, 9, 10, 8, 1, 4, 6, 12, 3, 13, 14, 5, 15, 11], count = 3, label_steps = [1, 1, 1, 1, 1, 1], older = [(1, 0)], newest_order = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], slots = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 22, 29, 44, 0, 11, 26], dup_picks = [15, 10, 25, 33, 63, 20, 52, 39]
