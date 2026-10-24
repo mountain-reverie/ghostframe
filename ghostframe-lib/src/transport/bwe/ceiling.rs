@@ -53,9 +53,9 @@
 //! The reading also carries the **payload fraction**, countable bytes per
 //! token spent: admission bills parity, framing and control datagrams that no
 //! acknowledgement names, so a sender paced at the estimate offers goog_cc
-//! `fraction x` it (0.84 measured). Admission divides the estimate by it. The
+//! `fraction x` it (0.82 to 0.86 measured). Admission divides the estimate by it. The
 //! units matter for the ceiling too: without the division `K x A` fell under
-//! the estimate by the overhead (`K x 0.84 < 1`), and a sender paced at its
+//! the estimate whenever the fraction was under 0.85 (`K x fraction < 1`), and a sender paced at its
 //! ceiling shrank it on every window.
 //!
 //! All state is cumulative series sampled at event times; every figure is a
@@ -73,6 +73,12 @@ pub(crate) const HEADROOM: f64 = 1.0 / AIMD_BACKOFF;
 /// Share of the granted tokens the sender must have spent for the
 /// acknowledged rate to count as the path's answer.
 pub(crate) const SATURATION: f64 = 0.9;
+
+// A sender that spent at least `SATURATION` of its grant and had everything
+// acknowledged has a ceiling `K x A = K x spent share x grant` at or above its
+// grant exactly when the share is at least `AIMD_BACKOFF`. Below that, the
+// ceiling would cut a path-limited-by-nothing sender under its own grant.
+const _: () = assert!(SATURATION > AIMD_BACKOFF);
 
 /// Spend over the window below which the payload fraction is not measured:
 /// a handful of datagrams is all rounding.
@@ -105,9 +111,17 @@ struct Series {
 
 impl Series {
     fn push(&mut self, at_us: u64, cumulative: f64) {
+        // The counters are monotone, but one of them is a net figure: tokens
+        // spent less the refunds of sends quinn refused, which can step down.
+        // A step down is not a negative spend over the window, so the series
+        // holds its value instead of falling.
+        let cumulative = self
+            .points
+            .back()
+            .map_or(cumulative, |last| cumulative.max(last.1));
         // Keep a single point per instant: the last one wins.
         match self.points.back_mut() {
-            Some(last) if last.0 >= at_us => last.1 = cumulative.max(last.1),
+            Some(last) if last.0 >= at_us => last.1 = cumulative,
             _ => self.points.push_back((at_us, cumulative)),
         }
     }
@@ -184,6 +198,21 @@ impl EstimateCeiling {
     /// The window the rate is taken over for a smoothed round trip.
     pub(crate) fn window_us(srtt_us: u64) -> u64 {
         (WINDOW_SRTTS * srtt_us).max(WINDOW_FLOOR_US)
+    }
+
+    /// The longest stretch without an acknowledgement inside the window that
+    /// ends at `now_us` (the quiet before `now_us` counts). A stall or a
+    /// blackout reads as a long gap; a path carrying less reads as small
+    /// gaps with little in them.
+    pub(crate) fn ack_gap_us(&self, now_us: u64, srtt_us: u64) -> u64 {
+        let from = now_us.saturating_sub(Self::window_us(srtt_us));
+        let mut prev = from;
+        let mut gap = 0;
+        for &(t, _) in self.acked.points.iter().filter(|p| p.0 > from) {
+            gap = gap.max(t.saturating_sub(prev));
+            prev = t;
+        }
+        gap.max(now_us.saturating_sub(prev))
     }
 
     /// The ceiling at `now_us`. `None` until there is a full window of
@@ -384,5 +413,65 @@ mod tests {
         let r = c.read(3_000 * MS, 20 * MS).unwrap();
         assert!(r.acked_bps < 1e5, "{r:?}");
         assert!(r.ceiling_bps.unwrap() < 1e5);
+    }
+}
+
+#[cfg(test)]
+mod invariant_tests {
+    use super::*;
+
+    const MS: u64 = 1_000;
+
+    /// At every spend share a saturated sender can have (`SATURATION` up to
+    /// 1) with everything it offered acknowledged, the ceiling expressed as a
+    /// token rate (the estimate over the payload fraction) is at or above the
+    /// grant: the ceiling never cuts a sender that is delivering under its own
+    /// grant. Below `AIMD_BACKOFF` of spend it would, which is why
+    /// `SATURATION` is above it (and asserted to be, at compile time).
+    #[test]
+    fn a_saturated_sender_that_is_fully_acknowledged_is_never_cut_under_its_grant() {
+        const FRACTION: f64 = 0.82;
+        const GRANT_BPS: f64 = 12e6;
+        for share in [0.90, 0.92, 0.95, 0.98, 1.0] {
+            let mut c = EstimateCeiling::default();
+            let (mut granted, mut spent, mut acked) = (0.0, 0.0, 0.0);
+            for step in 1..=3_000u64 {
+                let t = step * MS;
+                granted += GRANT_BPS / 8000.0;
+                spent += GRANT_BPS / 8000.0 * share;
+                acked += GRANT_BPS / 8000.0 * share * FRACTION;
+                c.note_admission(t, granted, spent);
+                c.note_offered(t, acked);
+                c.note_acked(t, acked);
+            }
+            let r = c.read(3_000 * MS, 20 * MS).expect("history");
+            let ceiling = r.ceiling_bps.expect("saturated");
+            assert!(
+                ceiling / r.payload_fraction >= GRANT_BPS * 0.99,
+                "share {share}: ceiling {ceiling} over fraction {} is under the grant",
+                r.payload_fraction
+            );
+        }
+    }
+
+    #[test]
+    fn a_stall_inside_the_window_reads_as_a_long_gap() {
+        let mut c = EstimateCeiling::default();
+        let mut cum = 0.0;
+        for step in 1..=1_000u64 {
+            cum += 1500.0;
+            c.note_acked(step * MS, cum);
+        }
+        assert!(c.ack_gap_us(1_000 * MS, 20 * MS) <= 2 * MS);
+        // 100 ms of silence, then the window is read.
+        assert!(c.ack_gap_us(1_100 * MS, 20 * MS) >= 99 * MS);
+    }
+
+    #[test]
+    fn a_refund_does_not_make_the_spend_series_fall() {
+        let mut s = Series::default();
+        s.push(1, 100.0);
+        s.push(2, 90.0);
+        assert_eq!(s.at(2), Some(100.0));
     }
 }
