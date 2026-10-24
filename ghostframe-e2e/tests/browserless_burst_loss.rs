@@ -127,7 +127,8 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
          charged_B={} soft_charged_B={} ungated_at_depth={}] \
          ledger[declared={} flushed={} overflowed={} late_before_flush={} late_after_flush={} \
          late_unreported={} unknown_acks={} tombstone_evictions={}] \
-         ecn[ect0={} unmarked={} last_marked={}] rto_fired={} rto_spurious={} rto_useful={}",
+         ecn[ect0={} unmarked={} last_marked={}] rto_fired={} rto_spurious={} rto_useful={} \
+         generation_replacements={} rto_fired_superseded={}",
         i.window_us / 1000,
         i.fifo_samples,
         i.fifo_depth_max,
@@ -184,6 +185,8 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
         r.rto_fired,
         r.rto_spurious,
         r.rto_useful,
+        i.generation_replacements,
+        i.rto_fired_superseded,
     );
 }
 
@@ -369,6 +372,30 @@ async fn iid_versus_burst_loss_at_equal_average_rate() {
         assert!(
             frames_rx >= app_reads && app_reads > 0,
             "{n}: rx counts {frames_rx}/{app_reads}"
+        );
+    }
+    // Superseded content must not be retransmitted. The browserless
+    // harness's stand-in for capture (`apply_injected_frame`) once
+    // superseded the scheduler's queue but not the retransmit cache, so every
+    // earlier generation of a tile stayed cached and RTO re-sent it for up to
+    // 30 s. The client drops a stale-generation pass without acknowledging
+    // it, so those retransmits were never settled, and at an age of 8-9
+    // generations the client's 4-bit compare reads them as newer and
+    // poisons the tile. Measured with the cancel missing: iid
+    // `stale_generation_tiles` 800-1400, RTO fires ~9,000; with it, 0 and ~350.
+    for (n, r) in [("clean", &clean), ("iid", &iid), ("burst", &burst)] {
+        let i = &r.transport.instr;
+        assert!(
+            i.generation_replacements > 0,
+            "{n}: premise: no tile changed generation, so the checks below prove nothing"
+        );
+        assert_eq!(
+            i.rto_fired_superseded, 0,
+            "{n}: the RTO re-sent a pass of a generation its tile had moved past"
+        );
+        assert_eq!(
+            r.stale_generation_tiles, 0,
+            "{n}: the client received passes of superseded generations"
         );
     }
     assert_instruments("clean", &clean, false);
