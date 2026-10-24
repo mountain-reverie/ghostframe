@@ -121,13 +121,19 @@ jobs:
       # binary. Named explicitly because this workflow lists targets one by
       # one -- a tests/*.rs that nothing names simply never runs.
       # The capacity step-up scene is skipped HERE and nowhere else, so it still
-      # fails on a developer machine. Admission (D1 PR-2) holds quinn's queue
-      # to ~10 ms of the rate, so a probe can no longer exceed Cubic's window by
-      # queueing in quinn: the probes in that scene fill 10-65 % of their
-      # bytes (100 % and more before) and the estimate stalls at 3-4 of
-      # 16 Mbit instead of reaching 10. Lifting that is the rate-source
-      # decoupling (D1 PR-6, where this scene is gated again as P6b). Remove the
-      # --skip there.
+      # fails on a developer machine. goog_cc's estimate is capped by
+      # `link_capacity_upper`, the minimum of the last 16 cwnd/srtt samples
+      # (bwe_glue.rs, googcc.rs). Before admission (D1 PR-2) a standing
+      # 0.9-2 MB queue kept quinn cwnd-limited, so Cubic kept growing and that
+      # hint tracked the link. With the queue held to ~10 ms of the rate,
+      # admission at 0.9 x cwnd/srtt can leave quinn app-limited, Cubic's
+      # on_ack returns early, the window stops growing, and the hint caps the
+      # estimate near the pre-step rate (3-4 of 16 Mbit instead of 10).
+      # Suspected, not proven: raising the admission headroom to 1.25 did not
+      # recover the scene (see the PR description). The fix is D1 PR-6 (feed
+      # the hint only from cwnd-limited intervals, take the rate from goog_cc's
+      # target), where this scene is gated again as P6b. Remove the --skip
+      # there.
       - run: cargo test --test browserless_bwe_capacity -- --test-threads=1 --skip the_estimate_follows_a_mid_scene_capacity_step_up
       - run: cargo test --test browserless_determinism -- --test-threads=1
       - run: cargo test --test browserless_queue_latency -- --test-threads=1
