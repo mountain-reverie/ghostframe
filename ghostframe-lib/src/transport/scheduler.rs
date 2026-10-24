@@ -163,6 +163,12 @@ pub struct Scheduler {
     /// How long an `InFlight` priority item waits for its acknowledgement
     /// before `drain_priority_queue` sends it again. See `set_retry_after`.
     retry_after: Duration,
+    /// Wire bytes each item costs beyond its payload (datagram and tile
+    /// headers, the WebTransport framing). Zero unless the caller sets it,
+    /// which makes the tick budget payload bytes; the admission bucket sets
+    /// it so the budget is wire bytes, the unit it is billed in. A 4-byte
+    /// solid tile is ~30 bytes on the wire, so the difference is not small.
+    item_overhead: usize,
     /// Fraction of tick budget allocated to refinement passes (default 0.2).
     /// Adjusted adaptively by `maybe_adjust_refinement_fraction`.
     refinement_bandwidth_fraction: f32,
@@ -217,6 +223,7 @@ impl Scheduler {
             refinement_order: std::array::from_fn(|_| VecDeque::new()),
             refinement_deficit: RefinementDeficit::new(cols, rows),
             retry_after: Duration::from_millis(40),
+            item_overhead: 0,
             refinement_bandwidth_fraction: 0.2,
             last_refinement_budget: 0,
             last_tick_retries: Vec::new(),
@@ -285,6 +292,12 @@ impl Scheduler {
         self.retry_after = retry_after;
     }
 
+    /// Charge every item `bytes` more than its payload against the tick
+    /// budget. See `item_overhead`.
+    pub fn set_item_overhead(&mut self, bytes: usize) {
+        self.item_overhead = bytes;
+    }
+
     pub fn cols(&self) -> u32 {
         self.cols
     }
@@ -293,6 +306,20 @@ impl Scheduler {
     }
     pub fn queue_len(&self) -> usize {
         self.priority_order.len()
+    }
+
+    /// Whether the next tick would have something to send that is not a
+    /// retry: a priority item still `Pending`, or anything in the refinement
+    /// queue. `queue_len` cannot say, because it counts items in flight and
+    /// waiting for an acknowledgement. Scans the priority queue, so it is for
+    /// the caller that asks once per loop turn, not per tile.
+    pub fn has_pending_work(&self) -> bool {
+        self.refinement_queue_len() > 0
+            || self.priority_order.iter().any(|&h| {
+                self.work
+                    .get(h)
+                    .is_some_and(|w| w.state == WorkState::Pending)
+            })
     }
 
     /// Count of unique (tile_x, tile_y) coordinates with outstanding
@@ -328,6 +355,13 @@ impl Scheduler {
     /// resulting queue".
     pub fn refinement_queue_len(&self) -> usize {
         self.refinement_order.iter().map(|q| q.len()).sum()
+    }
+
+    /// The frame identity to stamp a datagram of this tile's current
+    /// generation with: the `seq` it was first sent under. See
+    /// `SlotMap::label_or_assign`.
+    pub fn frame_label(&mut self, tile_x: u8, tile_y: u8, seq: u32) -> u32 {
+        self.slots.label_or_assign(tile_x, tile_y, seq)
     }
 
     pub fn generation_for(&self, tile_x: u8, tile_y: u8) -> u8 {
@@ -453,6 +487,7 @@ impl Scheduler {
     /// `bump_generation` does this as part of the capture path; the injected
     /// path calls it directly, since it supplies its own generations.
     pub fn supersede_pending_for_tile(&mut self, tile_x: u8, tile_y: u8) {
+        self.slots.clear_label(tile_x, tile_y);
         for p in 0..PASS_SLOTS as u8 {
             if let Some(h) = self.slots.handle(tile_x, tile_y, p) {
                 if let Some(w) = self.work.get_mut(h) {
@@ -840,6 +875,7 @@ impl Scheduler {
             retry_after,
             now,
             recovery_owned,
+            self.item_overhead,
             &mut emitted,
             &mut self.last_tick_retries,
         );
@@ -849,6 +885,7 @@ impl Scheduler {
             &mut self.refinement_deficit,
             refinement_budget,
             now,
+            self.item_overhead,
             &mut emitted,
         );
 
@@ -870,6 +907,7 @@ impl Scheduler {
         retry_after: Duration,
         now: Instant,
         recovery_owned: &dyn Fn(u8, u8, u8) -> bool,
+        item_overhead: usize,
         out: &mut Vec<TileWork>,
         retries: &mut Vec<usize>,
     ) {
@@ -916,7 +954,7 @@ impl Scheduler {
             }
             w.state = WorkState::InFlight;
             w.last_sent_at = Some(now);
-            spent = spent.saturating_add(w.payload.len());
+            spent = spent.saturating_add(w.payload.len() + item_overhead);
             out.push(w.clone());
         }
     }
@@ -931,6 +969,7 @@ impl Scheduler {
         deficit: &mut RefinementDeficit,
         budget: usize,
         now: Instant,
+        item_overhead: usize,
         out: &mut Vec<TileWork>,
     ) {
         // Drop terminal-state entries first, freeing their slab slot.
@@ -958,7 +997,7 @@ impl Scheduler {
         for bucket in order.iter_mut() {
             while let Some(&h) = bucket.front() {
                 let cost = match work.get(h) {
-                    Some(w) => w.payload.len(),
+                    Some(w) => w.payload.len() + item_overhead,
                     None => {
                         // Orphaned handle (shouldn't happen); drop and move on.
                         debug_assert!(false, "orphaned refinement handle: deficit would drift");
@@ -966,7 +1005,11 @@ impl Scheduler {
                         continue;
                     }
                 };
-                if spent + cost > budget {
+                // Soft for the first item, like the priority queue: a budget
+                // smaller than one item (a share of a share, when the caller
+                // admits a few hundred bytes at a time) would otherwise never
+                // let this pass go, however many times it was asked.
+                if budget == 0 || (spent > 0 && spent + cost > budget) {
                     return;
                 }
                 bucket.pop_front();
@@ -1511,6 +1554,55 @@ mod tests {
             3,
             "all three are still queued; tick doesn't drop InFlight until ACK or supersede"
         );
+    }
+
+    /// The tick budget is in the unit the caller bills: with an item overhead
+    /// set, every item costs its payload plus that overhead, so a 4-byte
+    /// solid tile is not mistaken for a 4-byte datagram.
+    #[test]
+    fn an_item_overhead_is_charged_against_the_budget() {
+        let mut s = Scheduler::new(4, 4);
+        s.set_item_overhead(26);
+        for x in 0..4 {
+            s.enqueue(TileWork::raw_for_test(x, 0, 0, vec![0; 4]));
+        }
+        // 30 B each on the wire: a 70 B budget admits the two that bring the
+        // total to 60 and the third that crosses it.
+        assert_eq!(s.tick(70).len(), 3);
+        let mut plain = Scheduler::new(4, 4);
+        for x in 0..4 {
+            plain.enqueue(TileWork::raw_for_test(x, 0, 0, vec![0; 4]));
+        }
+        assert_eq!(plain.tick(70).len(), 4, "payload-only: 4 B each fits all");
+    }
+
+    /// A refinement budget smaller than one item still lets one item out, or
+    /// a caller admitting a few hundred bytes at a time would never send a
+    /// pass larger than that. Zero stays zero.
+    #[test]
+    fn the_refinement_queue_admits_one_item_whatever_the_budget() {
+        let mut s = Scheduler::new(4, 4);
+        s.enqueue_refinement(0, 0, 0, vec![vec![0u8; 500], vec![0u8; 500]]);
+        assert!(
+            s.tick_at(0, Instant::now()).is_empty(),
+            "a zero budget sends nothing"
+        );
+        let out = s.tick_at(100, Instant::now());
+        assert_eq!(out.len(), 1, "one item crosses a budget it does not fit");
+        assert_eq!(s.refinement_queue_len(), 1);
+    }
+
+    #[test]
+    fn pending_work_is_work_not_yet_sent() {
+        let mut s = Scheduler::new(4, 4);
+        assert!(!s.has_pending_work());
+        s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![0; 10]));
+        assert!(s.has_pending_work());
+        s.tick(usize::MAX);
+        assert_eq!(s.queue_len(), 1, "sent, awaiting its acknowledgement");
+        assert!(!s.has_pending_work(), "in flight is not pending");
+        s.enqueue_refinement(1, 1, 0, vec![vec![0u8; 10]]);
+        assert!(s.has_pending_work());
     }
 
     #[test]
