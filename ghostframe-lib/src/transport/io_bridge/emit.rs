@@ -4,10 +4,9 @@
 //! Owns, as logic over `IoBridge` fields that stay in `io_bridge.rs`:
 //! - `send_to_all_sessions`, the single fan-out point to the live WebTransport
 //!   sessions, and `drain_reliable_emitter`, which feeds the reliable
-//!   emitter's queue into it;
-//! - `drain_scheduler_into_quinn` (including the AIMD multiplier update) and
-//!   `dispatch_dirty_tiles_via_scheduler`, which feed scheduler output through
-//!   the emitter;
+//!   emitter's queue into it through the admission gate;
+//! - `drain_scheduler_into_quinn` and `dispatch_dirty_tiles_via_scheduler`,
+//!   which feed scheduler output through the emitter;
 //! - `emit_frame_dimensions` and `compute_max_datagram_size`;
 //! - `apply_injected_frame`, the browserless harness' stand-in for capture.
 //!
@@ -15,21 +14,74 @@
 use super::*;
 
 impl IoBridge {
-    /// Put everything the reliable emitter has queued (source and parity) on
-    /// the wire through `send_to_all_sessions`, stopping at the first datagram
-    /// quinn refuses. No borrow of the emitter is held across a send: the
-    /// emission is taken out first and its outcome handed back afterwards.
-    pub(super) fn drain_reliable_emitter(&mut self, now: std::time::Instant) {
+    /// Put what the reliable emitter has queued (source and parity) on the
+    /// wire, through the admission gate: a datagram goes only while quinn's
+    /// FIFO holds less than `D_target` and the bucket can afford its wire
+    /// bytes, parity included. The first one that cannot go is put back at
+    /// the head, untouched, and the drain stops; it is sent by a later pass.
+    /// No borrow of the emitter is held across a send: the emission is taken
+    /// out first and its outcome handed back afterwards.
+    ///
+    /// Without a live session, or before the first admission pass has set the
+    /// gate, nothing is held back: a bridge driven directly sends as it
+    /// always did.
+    pub(super) fn drain_reliable_emitter(&mut self, now: std::time::Instant) -> pacing::Stop {
+        use crate::transport::admission::{admit_one, Admit, AdmitClass};
         use crate::transport::reliable_emitter::emission_queue::Emission;
         while let Some(emission) = self.reliable_emitter.next_emission(now) {
-            let outcome = match &emission {
-                Emission::Source(bytes, class) => self.send_to_all_sessions(bytes, *class),
-                Emission::Parity(bytes) => self.send_to_all_sessions(bytes, WireClass::Parity),
+            let (bytes, class) = match &emission {
+                Emission::Source(bytes, class) => (bytes.clone(), *class),
+                Emission::Parity(bytes) => (bytes.clone(), WireClass::Parity),
             };
+            let mut charged = 0usize;
+            if let Some(gate) = self.gate {
+                if let Some(depth) = self.live_fifo_depth() {
+                    let wire = bytes.len() + self.live_framing_len();
+                    let admit_class = match class {
+                        WireClass::NackRepair => AdmitClass::NackRepair,
+                        WireClass::RtoRetransmit => AdmitClass::Retransmit,
+                        WireClass::Parity => AdmitClass::Parity,
+                        WireClass::Refinement => AdmitClass::Refinement,
+                        // First sends and the scheduler's own retry are the
+                        // scheduler's critical tier as far as the bucket is
+                        // concerned; H.264 and control datagrams never come
+                        // through the emitter.
+                        WireClass::Critical
+                        | WireClass::SchedulerRetry
+                        | WireClass::H264
+                        | WireClass::Control => AdmitClass::Critical,
+                    };
+                    match admit_one(&mut self.admission, admit_class, wire, depth, gate.d_target) {
+                        Admit::Go => {
+                            charged = wire;
+                            self.instr.admission.charged_bytes += wire as u64;
+                        }
+                        Admit::Depth => {
+                            self.reliable_emitter.hold_emission(emission);
+                            return pacing::Stop::Depth;
+                        }
+                        Admit::Tokens => {
+                            self.reliable_emitter.hold_emission(emission);
+                            return pacing::Stop::Tokens;
+                        }
+                    }
+                }
+            }
+            let outcome = self.send_counted(&bytes, class, true);
+            if matches!(
+                outcome,
+                crate::transport::reliable_emitter::traits::SendOutcome::Rejected
+            ) && charged > 0
+            {
+                // Refused by quinn: nothing was sent, so nothing is owed.
+                self.admission.refund(charged);
+                self.instr.admission.charged_bytes -= charged as u64;
+            }
             if !self.reliable_emitter.settle_emission(emission, outcome) {
-                return;
+                return pacing::Stop::Rejected;
             }
         }
+        pacing::Stop::Empty
     }
 
     /// Give back what superseded PalRle work was holding on its palette.
@@ -103,6 +155,19 @@ impl IoBridge {
         dg: &[u8],
         class: WireClass,
     ) -> crate::transport::reliable_emitter::traits::SendOutcome {
+        self.send_counted(dg, class, false)
+    }
+
+    /// [`Self::send_to_all_sessions`], saying whether the datagram came
+    /// through the admission gate (`gated`: it was charged to the bucket
+    /// before it got here) or bypassed it (an H.264 frame or a control
+    /// datagram, billed to the bucket afterwards).
+    pub(super) fn send_counted(
+        &mut self,
+        dg: &[u8],
+        class: WireClass,
+        gated: bool,
+    ) -> crate::transport::reliable_emitter::traits::SendOutcome {
         use crate::transport::reliable_emitter::traits::SendOutcome;
         #[cfg(any(test, feature = "test-loss-injection"))]
         if let Some(cap) = self.outbound_bandwidth_cap.as_mut() {
@@ -175,7 +240,17 @@ impl IoBridge {
         }
 
         if let (Some(handle), Some((cum, framing, queued))) = (live, accepted) {
-            self.note_enqueued(handle, class, dg.len(), framing, cum, queued);
+            self.note_enqueued(
+                handle,
+                Enqueued {
+                    class,
+                    gated,
+                    dg_len: dg.len(),
+                    framing_len: framing,
+                    cum_enqueued: cum,
+                    queued,
+                },
+            );
         }
 
         // No connected session counts as sent, not rejected: re-queueing a
@@ -204,14 +279,23 @@ impl IoBridge {
             self.last_emitted_dimensions = Some((width, height));
         }
         if self.dimensions_retransmits_left > 0 {
-            let dg = crate::transport::protocol::build_frame_dimensions_datagram(
-                seq,
-                timestamp_us,
-                width,
-                height,
-            );
-            self.send_to_all_sessions(&dg, WireClass::Control);
-            self.dimensions_retransmits_left -= 1;
+            // Behind the depth gate like every other datagram, so the queue
+            // bound has no exception to carry. A repeat that finds the FIFO
+            // at `D_target` is not spent: the next frame sends it.
+            let over = match (self.gate, self.live_fifo_depth()) {
+                (Some(g), Some(depth)) => depth >= g.d_target,
+                _ => false,
+            };
+            if !over {
+                let dg = crate::transport::protocol::build_frame_dimensions_datagram(
+                    seq,
+                    timestamp_us,
+                    width,
+                    height,
+                );
+                self.send_to_all_sessions(&dg, WireClass::Control);
+                self.dimensions_retransmits_left -= 1;
+            }
         }
     }
 
@@ -501,99 +585,26 @@ impl IoBridge {
             );
         }
 
-        // ---- A + B-light: feedback-modulated rate pacing ----
+        // ---- Admission ----
         //
-        // (A, feedforward) Per-tick budget = measured QUIC bandwidth
-        // (bytes/µs from path stats) × 33 ms frame interval × headroom.
-        // The scheduler retains un-drained work in its queues, so a
-        // 14 MB first-frame burst naturally spreads across ~70 frames
-        // at typical tailnet speeds rather than dumping in one go.
-        //
-        // (B-light, feedback) `tick_budget_multiplier` shrinks on every
-        // dispatch that observes a send_datagram Err (proof our
-        // bytes_per_us estimate is too generous for quinn's actual drain)
-        // and ramps back up on every error-free dispatch. Classic AIMD.
+        // Per-tick rate = measured QUIC bandwidth (bytes/us from path stats)
+        // x headroom, billed by elapsed time into the one bucket every byte
+        // class draws on, and held behind the depth gate on quinn's FIFO. The
+        // scheduler retains what is not admitted, so a 14 MB first-frame
+        // burst spreads over as many turns as the rate needs rather than
+        // being dumped on quinn in one go. See `pump_admission`.
         //
         // The test route bypasses this with `usize::MAX` so unit fixtures
         // that pre-seed tiles still drain in one tick.
-        let pre_dispatch_send_errs = self.datagram_send_errs;
-        let base_budget_bytes = self.base_budget_bytes();
-        // Clamp the AIMD-derived budget to what `quinn-proto` can actually
-        // accept right now. `scheduler.tick` is destructive on the
-        // refinement queue (popped work is removed, not marked `InFlight`),
-        // and `send_datagram` returning `Err(Blocked)` discards the
-        // already-popped TileWork irrecoverably. Pre-checking
-        // `send_buffer_space()` — the only thing that triggers quinn's
-        // Blocked (`outgoing_total + data.len() > datagram_send_buffer_size`
-        // in quinn-proto/datagrams.rs) — prevents the scheduler from
-        // popping more than quinn can absorb in this tick. Anything left
-        // over stays in `refinement_queue` for the next `DatagramsUnblocked`
-        // continuation or the next 33 ms capture tick.
-        //
-        // The 80 % safety fraction (`QUINN_SEND_BUFFER_SAFETY_FRACTION`)
-        // leaves headroom for per-fragment wire overhead (WT quarter-
-        // stream-id VarInt + tile-fragment header, ~30–60 B per datagram)
-        // that `scheduler.tick` accounts as payload bytes only. That clamp,
-        // the pacing combine, the drain, and the continuation bookkeeping
-        // all live in `emit_via_scheduler`, shared with `apply_injected_
-        // frame` — see its doc comment.
-        //
-        // The test route bypasses all of that with `usize::MAX` so unit
-        // fixtures that pre-seed tiles still drain in one tick.
-        let (stats, drained_bytes, drained_count) = match policy {
+        let (stats, _drained_bytes, _drained_count) = match policy {
             #[cfg(test)]
             SchedulerEmissionPolicy::TestCdf53All => {
                 self.drain_scheduler_into_quinn(seq, timestamp_us, max_frag, usize::MAX)
             }
             SchedulerEmissionPolicy::GpuClassifierDriven => {
-                let aimd_budget =
-                    ((base_budget_bytes as f64) * self.tick_budget_multiplier) as usize;
-                self.emit_via_scheduler(seq, timestamp_us, max_frag, aimd_budget)
+                self.emit_via_scheduler(seq, timestamp_us, max_frag)
             }
         };
-        // ---- AIMD feedback: shrink the multiplier on any send error,
-        //      ramp back up on a clean dispatch. The test route bypasses the
-        //      tracking — it ran with unbudgeted `usize::MAX` and unit
-        //      fixtures don't go through real QUIC paths anyway.
-        if !policy.is_test_route() {
-            let errs_this_dispatch = self
-                .datagram_send_errs
-                .saturating_sub(pre_dispatch_send_errs);
-            let mult_before = self.tick_budget_multiplier;
-            if errs_this_dispatch > 0 {
-                self.tick_budget_multiplier = (self.tick_budget_multiplier
-                    * SCHEDULER_BUDGET_BACKOFF)
-                    .max(SCHEDULER_BUDGET_MULT_MIN);
-            } else {
-                self.tick_budget_multiplier = (self.tick_budget_multiplier * SCHEDULER_BUDGET_RAMP)
-                    .min(SCHEDULER_BUDGET_MULT_MAX);
-            }
-            let quinn_space_diag = self.min_session_send_buffer_space();
-            // `refinement_fraction` and the two queue depths are here
-            // because their absence made a real defect unreadable: a drain
-            // moving 5 KB against a 256 KB base budget looks like the budget
-            // is irrelevant, when in fact refinement only ever gets
-            // `base * refinement_fraction`, and that fraction halves toward
-            // a 0.05 floor whenever delivery drops below 50%. Without these
-            // fields the log shows the symptom (tiny drains) and hides both
-            // the cause (the fraction) and the consequence (the backlog).
-            tracing::debug!(
-                target: LOG_TARGET,
-                quinn_send_buffer_space = quinn_space_diag,
-                refinement_fraction = self.scheduler.current_refinement_fraction(),
-                refinement_budget_bytes = self.scheduler.last_refinement_budget(),
-                refinement_queue_len = self.scheduler.refinement_queue_len(),
-                priority_queue_len = self.scheduler.queue_len(),
-                drained_count = drained_count,
-                drained_bytes = drained_bytes,
-                base_budget_bytes = base_budget_bytes,
-                bytes_per_us = self.adaptation_context.bytes_per_us,
-                errs_this_dispatch = errs_this_dispatch,
-                multiplier_before = mult_before,
-                multiplier_after = self.tick_budget_multiplier,
-                "scheduler.tick AIMD"
-            );
-        }
 
         stats
     }
@@ -645,7 +656,6 @@ impl IoBridge {
         // for retransmit, schedules RTO, and queues parity per FEC group.
         // The actual wire write happens in `drain_reliable_emitter(now)`
         // below.
-        let frame_seq_with_flag = seq | TILE_DATAGRAM_FLAG;
         let mut items: Vec<(
             crate::transport::reliable_emitter::EmitKey,
             bytes::Bytes,
@@ -659,6 +669,10 @@ impl IoBridge {
             if is_retry {
                 next_retry += 1;
             }
+            // The identity this tile's generation was first sent under, not
+            // this frame's: see `SlotMap::label_or_assign`.
+            let frame_seq_with_flag =
+                self.scheduler.frame_label(work.tile_x, work.tile_y, seq) | TILE_DATAGRAM_FLAG;
             // A tile pass is one datagram: no payload exceeds `MAX_TILE_PAYLOAD`
             // and frame dispatch refuses a path too small for that, so this
             // check is a backstop for a caller that skipped it.
@@ -994,45 +1008,13 @@ impl IoBridge {
                 rows * crate::tile::TILE_SIZE,
             );
 
-            // BWE Stage 2.2/2.4 pacing, the quinn-capacity clamp, the drain
-            // itself, and the post-drain continuation bookkeeping are all
-            // shared with `dispatch_dirty_tiles_via_scheduler` via
-            // `emit_via_scheduler` — see its doc comment.
-            //
-            // The base budget is `base_budget_bytes()` — the same
-            // bytes_per_us-derived, floor-clamped number the capture path
-            // starts from — rather than a harness-private constant.
-            // `InjectedFrame` used to carry its own `budget_bytes` (always
-            // `usize::MAX` in practice, i.e. "drain the whole queue every
-            // injection"), which was deleted along with the field: an
-            // always-unbounded budget meant the harness never queued the
-            // way production does, which in turn meant a probe window
-            // could never open against a non-empty queue. See
-            // docs/superpowers/specs/2026-09-13-unified-emission-path-design.md.
-            //
-            // Deliberately *not* scaled by `tick_budget_multiplier`. That
-            // AIMD ramp/backoff is adjusted at the dispatch call site from a
-            // pre/post delta of `self.datagram_send_errs` computed around
-            // that specific call (see `dispatch_dirty_tiles_via_scheduler`).
-            // `send_datagram` errors are in fact recorded regardless of
-            // which path triggered them, but nothing here tracks a
-            // comparable delta for injected frames, and the AIMD loop is
-            // calibrated for a roughly-periodic 33 ms real capture cadence —
-            // the harness submits frames on whatever cadence a scene
-            // script chooses, under virtual (`start_paused`) time, which is
-            // not that cadence. Wiring the same ramp/backoff bookkeeping
-            // into this call site would duplicate the AIMD accounting the
-            // Task 1 extraction exists to avoid duplicating, in exchange for
-            // a control loop whose tuning assumptions this path doesn't
-            // meet. If a future scene needs to exercise AIMD backoff
-            // specifically, that is a reason to add tracking here
-            // deliberately, not a reason to have inherited it by accident.
-            let base_budget_bytes = self.base_budget_bytes();
-            self.emit_via_scheduler(inj.seq, inj.timestamp_us, max_frag, base_budget_bytes);
+            // The admission pass -- rate, depth gate, drain -- is shared with
+            // `dispatch_dirty_tiles_via_scheduler` via `emit_via_scheduler`.
+            // See its doc comment.
+            self.emit_via_scheduler(inj.seq, inj.timestamp_us, max_frag);
         }
-        // Mirror the frame path's post-dispatch RTO sweep so injected
-        // scenes exercise retransmission the same way real frames do.
-        self.sweep_rto_retransmits();
+        // Mirror the frame path's post-dispatch sweep of stuck entries.
+        self.sweep_stuck_entries();
         enqueued_count
     }
 }

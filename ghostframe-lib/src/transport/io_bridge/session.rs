@@ -507,11 +507,15 @@ impl IoBridge {
                         // Only the live session's sends are billed: the
                         // notice usually goes to a session that is no longer it.
                         if self.last_hello_from == Some(handle) {
-                            self.instr.offered.bill(
-                                WireClass::Control,
-                                datagram.len(),
-                                wt.datagram_framing_len(),
-                            );
+                            let framing = wt.datagram_framing_len();
+                            self.instr
+                                .offered
+                                .bill(WireClass::Control, datagram.len(), framing);
+                            // Billed to the bucket after the fact, like every
+                            // datagram that does not wait in a queue.
+                            self.admission.charge(datagram.len() + framing);
+                            self.instr.admission.soft_charged_bytes +=
+                                (datagram.len() + framing) as u64;
                         }
                     }
                 }

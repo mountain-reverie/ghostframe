@@ -89,14 +89,10 @@ use bwe_glue::{select_live_rtt, LOSS_HORIZON_CEIL, LOSS_HORIZON_FLOOR, LOSS_HORI
 
 #[path = "io_bridge/pacing.rs"]
 mod pacing;
+#[cfg(test)]
+use pacing::BWE_PACED_MODE_SAMPLE_THRESHOLD;
 pub(crate) use pacing::SCHEDULER_TICK_INTERVAL_US;
 pub use pacing::{combine_pacing_budget, pacer_tick_budget_bytes, select_pacing_mode, PacingMode};
-#[cfg(test)]
-use pacing::{BWE_PACED_MODE_SAMPLE_THRESHOLD, QUINN_SEND_BUFFER_SAFETY_FRACTION};
-use pacing::{
-    SCHEDULER_BUDGET_BACKOFF, SCHEDULER_BUDGET_MULT_MAX, SCHEDULER_BUDGET_MULT_MIN,
-    SCHEDULER_BUDGET_RAMP,
-};
 
 #[path = "io_bridge/emit.rs"]
 mod emit;
@@ -112,6 +108,7 @@ pub use frame_backend::{
 mod frame_worker;
 mod transport_probe;
 use frame_worker::{FinishAction, FramePipeline, FromWorker, ToWorker};
+use transport_probe::Enqueued;
 pub use transport_probe::TransportProbe;
 
 #[path = "io_bridge/frame.rs"]
@@ -346,6 +343,19 @@ pub(crate) struct FrameSendStats {
     total_wire_bytes: u32,
     tile_count: u16,
     codec_histogram: CodecHistogram,
+}
+
+impl FrameSendStats {
+    /// Fold the stats of a later admission pass for the same frame in.
+    fn accumulate(&mut self, other: &FrameSendStats) {
+        self.total_wire_bytes = self.total_wire_bytes.saturating_add(other.total_wire_bytes);
+        self.tile_count = self.tile_count.saturating_add(other.tile_count);
+        let (a, b) = (&mut self.codec_histogram, &other.codec_histogram);
+        a.solid = a.solid.saturating_add(b.solid);
+        a.palrle = a.palrle.saturating_add(b.palrle);
+        a.cdf53 = a.cdf53.saturating_add(b.cdf53);
+        a.h264 = a.h264.saturating_add(b.h264);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -598,8 +608,17 @@ pub struct IoBridge {
     gpu_analyse_failures: u32,
     /// Ticks since startup, for `STUCK_SWEEP_EVERY_TICKS`.
     stuck_sweep_counter: u32,
-    /// Byte allowance for RTO and NACK replay. See `retransmit_pacer`.
-    retransmit_pacer: crate::transport::retransmit_pacer::RetransmitPacer,
+    /// The one admission bucket every byte class is billed against. See
+    /// `transport::admission`.
+    admission: crate::transport::admission::AdmissionBucket,
+    /// The depth gate's parameters, set by each admission pass. `None` until
+    /// the first pass, which leaves the gate open (a bridge driven directly,
+    /// without a pass, sends as it always did).
+    gate: Option<pacing::GateParams>,
+    /// When admission next has something it can do without any new input:
+    /// the instant the bucket affords the datagram it is holding back. The
+    /// loop's timer arm sleeps to the earliest of this and the QUIC timer.
+    admission_wake: Option<std::time::Instant>,
     /// Which `select!` arm each `run()` iteration took, in order. The arm
     /// *order* is the behaviour under test and leaves no other trace: with
     /// every source ready the loop drains them all inside one poll.
@@ -674,14 +693,6 @@ pub struct IoBridge {
     /// which can be longer than the emitter's cache entry for the same key: see
     /// the `fragment_coverage` module doc for the five cases.
     fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap,
-    /// Times `resume_scheduler_continuation` actually drained work, and the
-    /// bytes it moved.
-    ///
-    /// Separate from the per-frame `scheduler.tick` line, which counts only
-    /// frame-driven drains. Without these the continuation path is
-    /// unobservable: it was dead for the whole life of the code (its only
-    /// trigger, `Event::DatagramsUnblocked`, cannot fire while the capacity
-    /// clamp prevents `Blocked`) and nothing showed that.
     /// Republished copy of `datagram_send_errs`, for a harness that needs to
     /// read it back after the bridge has moved into a spawned task.
     ///
@@ -692,8 +703,6 @@ pub struct IoBridge {
     /// actually happened, or it passes on a scene that never provoked it.
     #[cfg(any(test, feature = "browserless-harness"))]
     send_errs_publish: std::sync::Arc<std::sync::Mutex<u64>>,
-    continuation_resumes: u64,
-    continuation_drained_bytes: u64,
     /// Inbound datagrams whose `InboundKind` has no route on this path.
     ///
     /// The routing match that feeds this used to end in `_ =>
@@ -777,28 +786,6 @@ pub struct IoBridge {
     /// counter but log at `debug` to avoid 30 Hz warn-spam under
     /// sustained backpressure.
     datagram_send_err_first_logged: bool,
-    /// AIMD multiplier on the per-tick scheduler budget. Initialised to
-    /// 1.0; halved (down to `BUDGET_MIN_MULTIPLIER`) whenever a dispatch
-    /// pass observes ≥1 `send_datagram` error (proof our budget exceeded
-    /// quinn's actual drain); ramped back up by `BUDGET_RAMP_FACTOR` on
-    /// every error-free dispatch (capped at 1.0). Classic TCP-style
-    /// additive-increase / multiplicative-decrease, but applied to the
-    /// scheduler budget rather than the cwnd. Lives on the bridge so it
-    /// survives across `process_frame_gpu` invocations.
-    tick_budget_multiplier: f64,
-    /// Continuation state for the in-flight frame's scheduler tick.
-    /// Populated at the end of `dispatch_dirty_tiles_via_scheduler` and
-    /// consumed by the `Event::DatagramsUnblocked` handler so that as
-    /// soon as quinn drains its send buffer we top it back up from the
-    /// scheduler queues — without waiting for the next 33 ms capture
-    /// tick. This is the "pull-driven" pacing piece on top of A+B-light:
-    /// rather than running the full per-frame budget in one shot at
-    /// frame-receive time, we hand quinn one chunk and let its
-    /// completion event tell us when there's room for more. The
-    /// `remaining_budget_bytes` field is the per-frame budget minus what
-    /// we've already drained, so we never overshoot the AIMD-adjusted
-    /// frame budget across all continuation invocations.
-    scheduler_continuation: Option<SchedulerContinuation>,
     /// Recent `cwnd / smoothed_rtt` samples; the BWE capacity hint is their
     /// minimum. See `apply_path_stats_snapshot`.
     capacity_hint_window: std::collections::VecDeque<f32>,
@@ -834,8 +821,7 @@ pub struct IoBridge {
     /// `apply_path_stats_snapshot`.
     path_last_sent_at: Option<std::time::Instant>,
     /// Frame identity from the most recent `drain_scheduler_into_quinn`
-    /// call, from any of its three call sites. Unlike
-    /// `scheduler_continuation`, never cleared once set — it exists purely
+    /// call, from any caller. Never cleared once set — it exists purely
     /// so BWE Stage 2.4b's probe-window-open drain
     /// (see `open_probe_window_for_burst`) has a valid `seq` /
     /// `timestamp_us` / `max_frag` to tag its datagrams with. `None` until
@@ -1089,12 +1075,11 @@ struct UniqueColorHistogram {
 }
 
 /// Frame identity (`seq` / `timestamp_us` / `max_frag`) captured from the
-/// most recent `drain_scheduler_into_quinn` call, regardless of which of
-/// its three call sites triggered it (per-frame dispatch, continuation
-/// resume, or injected-scene drain). Independent of `SchedulerContinuation`
-/// below, which additionally tracks the *remaining budget* of one specific
-/// in-flight drain and is cleared once that budget is exhausted — this
-/// field is never cleared; it always holds the last valid identity.
+/// most recent `drain_scheduler_into_quinn` call, regardless of which
+/// caller triggered it (per-frame dispatch, an admission pass, or
+/// injected-scene drain). Never cleared: it always holds the last
+/// valid identity, which is what an admission pass with no frame of its own
+/// tags the work it pulls with.
 ///
 /// BWE probe-window bookkeeping (see `open_probe_window_for_burst`)
 /// reuses this: `drain_scheduler_into_quinn` stamps `seq |
@@ -1106,19 +1091,6 @@ struct DrainFrameContext {
     seq: u32,
     timestamp_us: u32,
     max_frag: usize,
-}
-
-/// State the `Event::DatagramsUnblocked` handler needs to resume the
-/// in-flight frame's scheduler drain. `seq` / `timestamp_us` /
-/// `max_frag` come from the most recent `dispatch_dirty_tiles_via_scheduler`
-/// call; re-emitted refinement work gets tagged with the current frame's
-/// identity even though the underlying TileWork was queued earlier.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct SchedulerContinuation {
-    seq: u32,
-    timestamp_us: u32,
-    max_frag: usize,
-    remaining_budget_bytes: usize,
 }
 
 /// Per-frame inputs passed into `dispatch_dirty_tiles_via_scheduler`.
@@ -1300,7 +1272,9 @@ impl IoBridge {
             force_dirty_frames: 0,
             gpu_analyse_failures: 0,
             stuck_sweep_counter: 0,
-            retransmit_pacer: crate::transport::retransmit_pacer::RetransmitPacer::new(),
+            admission: crate::transport::admission::AdmissionBucket::new(),
+            admission_wake: None,
+            gate: None,
             #[cfg(test)]
             loop_arm_trace: Vec::new(),
             session_started_at: None,
@@ -1327,8 +1301,6 @@ impl IoBridge {
             unroutable_inbound_datagrams: 0,
             #[cfg(any(test, feature = "browserless-harness"))]
             send_errs_publish: std::sync::Arc::new(std::sync::Mutex::new(0)),
-            continuation_resumes: 0,
-            continuation_drained_bytes: 0,
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
             connected_session_count: watch::Sender::new(0),
@@ -1340,8 +1312,6 @@ impl IoBridge {
             feedback_recv_bufs: HashMap::new(),
             datagram_send_errs: 0,
             datagram_send_err_first_logged: false,
-            tick_budget_multiplier: 1.0,
-            scheduler_continuation: None,
             capacity_hint_window: std::collections::VecDeque::new(),
             path_sent_packets_last: 0,
             transport_probe: TransportProbe::default(),
@@ -1900,7 +1870,11 @@ impl IoBridge {
             .map(|p| self.epoch + std::time::Duration::from_micros(p.deadline_us));
         let close = self.close_deadlines.values().map(|d| d.at).min();
         let recheck = self.rechecker.next_due();
-        [quic, display, close, recheck].into_iter().flatten().min()
+        let admission = self.admission_wake;
+        [quic, display, close, recheck, admission]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// React to a client-reported decode error. Most error codes are
@@ -2238,6 +2212,10 @@ impl IoBridge {
         self.drain_app_events();
         self.server.drain_endpoint_events();
         self.drain_outbound().await?;
+        // quinn has just emptied what it could of its FIFO; feed it again
+        // (and drain again) while the bucket and the gate allow, so it is not
+        // left idle until the next turn.
+        self.refill_after_drain().await?;
 
         // M3.6a: sample QUIC path stats once per tick so the classifier's
         // bandwidth estimate stays current. No-op when no connections.
@@ -2520,19 +2498,45 @@ impl IoBridge {
                     // wt+conn borrows). Defer ACK/etc. dispatch to a second pass
                     // because dispatch_ack_datagram takes `&mut self`.
                     let mut to_dispatch: Vec<Vec<u8>> = Vec::new();
+                    let send_capacity = self.server.datagram_send_buffer();
+                    let gate = self.gate;
                     if let Some(wt) = self.wt_sessions.get_mut(&handle) {
                         if let Some(conn) = self.server.connections.get_mut(&handle) {
                             while let Some(payload) = wt.recv_datagram(conn) {
                                 if let Some(response) = handle_datagram_payload(&payload) {
+                                    // Behind the depth gate like every datagram
+                                    // of the live session: with the FIFO at its
+                                    // bound the pong is withheld, and the next
+                                    // ping is answered instead.
+                                    let live = self.last_hello_from == Some(handle);
+                                    if live
+                                        && gate.is_some_and(|g| {
+                                            send_capacity.saturating_sub(
+                                                conn.datagrams().send_buffer_space(),
+                                            ) >= g.d_target
+                                        })
+                                    {
+                                        tracing::trace!(
+                                            ?handle,
+                                            "ping received, FIFO at its bound; pong withheld"
+                                        );
+                                        continue;
+                                    }
                                     tracing::trace!(?handle, "ping received, sending pong");
                                     match wt.send_datagram(conn, response) {
                                         // Only the live session's sends are billed.
-                                        Ok(()) if self.last_hello_from == Some(handle) => {
+                                        Ok(()) if live => {
+                                            let framing = wt.datagram_framing_len();
                                             self.instr.offered.bill(
                                                 WireClass::Control,
                                                 response.len(),
-                                                wt.datagram_framing_len(),
-                                            )
+                                                framing,
+                                            );
+                                            // No queue to hold it back, so it is billed
+                                            // to the bucket after the fact.
+                                            self.admission.charge(response.len() + framing);
+                                            self.instr.admission.soft_charged_bytes +=
+                                                (response.len() + framing) as u64;
                                         }
                                         Ok(()) => {}
                                         Err(e) => {
@@ -2582,30 +2586,14 @@ impl IoBridge {
                     }
                 }
 
-                Event::DatagramsUnblocked => {
-                    // quinn just drained its send buffer to the wire —
-                    // top it back up from the scheduler queues without
-                    // waiting for the next 33 ms capture tick. This is
-                    // the pull-driven pacing piece: scheduler.tick runs
-                    // when quinn signals it has room, not when the
-                    // next frame arrives.
-                    self.resume_scheduler_continuation();
-                    // Also fire the next batch of RTO-due retransmits.
-                    // tick() is rate-limited to RTO_RETRANSMITS_PER_TICK
-                    // entries so quinn's just-freed buffer absorbs them
-                    // without re-Blocking. drain() flushes the resulting
-                    // emission queue (source + parity) to the wire.
-                    // Without this, the emitter would have to wait for
-                    // the next 33 ms capture tick to push pending
-                    // retransmits, adding up to ~33 ms latency to every
-                    // recovered pass under sustained load.
-                    self.sweep_rto_retransmits();
-                }
-
-                _ => {
-                    // Everything else (DatagramsReceived handled above,
-                    // etc.) — no action needed.
-                }
+                // `Event::DatagramsUnblocked` is deliberately not handled. It
+                // is quinn's answer to a `Blocked` send, and nothing here is
+                // refused any more: admission feeds the FIFO only to
+                // `D_target`, far below its capacity, and tops it up after
+                // every drain (`refill_after_drain`), so there is no
+                // pull-on-unblock left to do. The stream events not handled
+                // above need no action either.
+                Event::Stream(_) | Event::DatagramsUnblocked => {}
             }
         }
 

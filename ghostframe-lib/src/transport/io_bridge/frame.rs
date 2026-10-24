@@ -1999,12 +1999,12 @@ impl IoBridge {
             Some(&mut palrle_payloads),
         );
 
-        // Per-frame RTO sweep: fire any cached retransmits whose
-        // RTO deadline has elapsed, then drain the resulting
-        // queue (source + parity) to the wire. Cheap when nothing
-        // is due (no cache hits, no parity ready).
+        // Per-frame sweep of entries retransmitting for longer than
+        // anything in flight plausibly is. Cheap: it scans the cache only
+        // every `STUCK_SWEEP_EVERY_TICKS` calls. Retransmission itself is
+        // served by the admission pass, not here.
         let sched_dispatch_us = lap.lap();
-        self.sweep_rto_retransmits();
+        self.sweep_stuck_entries();
         let rto_us = lap.lap();
         tracing::trace!(
             target: "ghostframe::io_bridge::diag",
@@ -2217,8 +2217,6 @@ impl IoBridge {
                 // events, not the aggregate counter.
                 emitter_ack_hits = es.ack_hit,
                 emitter_ack_misses = es.ack_miss,
-                continuation_resumes = self.continuation_resumes,
-                continuation_drained_bytes = self.continuation_drained_bytes,
                 cache_lru_eviction = self.reliable_emitter.cache.stats.lru_eviction,
                 retransmit_attempts_total = es.retransmit_attempts_total,
                 // Per-window snapshot of un-ACKed tile-passes still in
@@ -2377,10 +2375,17 @@ impl IoBridge {
                 budget_term_pacer = ins.budget.pacer,
                 budget_term_floor = ins.budget.floor,
                 budget_term_probe = ins.budget.probe,
-                budget_term_aimd = ins.budget.aimd,
-                budget_giveback_ticks = ins.budget.giveback_ticks,
-                budget_giveback_bytes = ins.budget.giveback_bytes,
-                budget_sendbuf_clamped = ins.budget.sendbuf_clamped,
+                budget_gate_depth = ins.budget.gate_depth,
+                budget_gate_tokens = ins.budget.gate_tokens,
+                budget_gate_rejected = ins.budget.gate_rejected,
+                admit_pumps = ins.admission.pumps,
+                admit_datagrams = ins.admission.datagrams_admitted,
+                admit_d_target_max = ins.admission.d_target_max,
+                admit_depth_violations = ins.admission.depth_violations,
+                admit_backlog_turns = ins.admission.backlog_turns,
+                admit_starved_turns = ins.admission.starved_turns,
+                admit_charged_bytes = ins.admission.charged_bytes,
+                admit_soft_charged_bytes = ins.admission.soft_charged_bytes,
                 ledger_losses_declared = ins.ledger_losses_declared,
                 ledger_losses_flushed = ins.ledger_losses_flushed,
                 ledger_losses_overflowed = ins.ledger_losses_overflowed,

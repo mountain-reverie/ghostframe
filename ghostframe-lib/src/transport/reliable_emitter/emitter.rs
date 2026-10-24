@@ -101,9 +101,9 @@ pub struct EmitterStats {
     /// growth is a defect, not a tuning matter.
     pub stuck_entries_retired: u64,
     /// Datagrams the transport refused, each of which was re-queued rather
-    /// than dropped. Non-zero means `Blocked` is being exercised, which is
-    /// the condition `DatagramsUnblocked` and the whole continuation path
-    /// depend on.
+    /// than dropped. Non-zero means quinn's buffer filled despite the
+    /// admission gate: a bug signal, since the gate holds the queue far
+    /// below it.
     pub send_rejected: u64,
     /// High-water mark of the emission queue's depth.
     ///
@@ -467,9 +467,10 @@ impl ReliableTileEmitter {
     /// 15,808 NACK), ~1.7 MB/s offered to a link moving 1 MB/s, while the
     /// scheduler -- which *is* budgeted -- was offering 0.6 MB/s of passes
     /// the client did not have yet. The excess sat in quinn's 16 MB datagram
-    /// buffer until it was full, at which point `clamp_to_quinn_capacity`
-    /// gave the scheduler nothing and emission stopped for good, with every
-    /// acknowledgement arriving 16 seconds stale behind its own retransmits.
+    /// buffer until it was full, at which point the quinn-capacity clamp
+    /// (since replaced by the admission gate) gave the scheduler nothing and
+    /// emission stopped for good, with every acknowledgement arriving 16
+    /// seconds stale behind its own retransmits.
     ///
     /// Requests from the client go first: a NACK is the receiver saying a
     /// datagram did not arrive, where the RTO is a timer guessing, and under

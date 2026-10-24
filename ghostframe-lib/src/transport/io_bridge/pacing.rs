@@ -1,140 +1,95 @@
-//! Per-tick send budgeting and the emission tail that spends it.
+//! The admission rate, the depth gate's inputs, and the pass that feeds quinn.
 //!
 //! Owns, as logic over `IoBridge` fields that stay in `io_bridge.rs`:
-//! - the budget derivation: `base_budget_bytes` (`adaptation_context.bytes_per_us`
-//!   x `SCHEDULER_TICK_INTERVAL_US` x `SCHEDULER_TICK_BUDGET_FRACTION`, bounded
-//!   below by `tick_budget_floor` / `tick_budget_floor_bytes`),
-//!   `paced_tick_budget_bytes`, and the goog_cc combination
-//!   (`PacingMode`, `select_pacing_mode`, `combine_pacing_budget`,
-//!   `pacer_tick_budget_bytes`, `BWE_PACED_MODE_SAMPLE_THRESHOLD`);
-//! - the quinn send-buffer clamp (`min_session_send_buffer_space`,
-//!   `clamp_to_quinn_capacity`, `QUINN_SEND_BUFFER_SAFETY_FRACTION`);
-//! - the emission tail `emit_via_scheduler` and the budget carry-over it leaves
-//!   behind (`scheduler_continuation`, `scheduler_continuation_after_drain`,
-//!   `resume_scheduler_continuation`);
-//! - the retransmit sweep and its budget share (`sweep_rto_retransmits`,
-//!   `retransmit_pacer`, `RTO_RETRANSMITS_PER_TICK`, `STUCK_ENTRY_AGE`,
-//!   `STUCK_SWEEP_EVERY_TICKS`, `RETRANSMIT_BUDGET_SHARE`);
-//! - `priority_retry_after` and the harness setter `set_tick_budget_floor_bytes`;
-//! - the scheduler tick constants, including the AIMD constants
-//!   (`SCHEDULER_BUDGET_BACKOFF`, `_RAMP`, `_MULT_MIN`, `_MULT_MAX`) whose
-//!   only use is the AIMD block inside `drain_scheduler_into_quinn`.
-//!
-//! Not here: `drain_scheduler_into_quinn` (and the AIMD multiplier update in
-//! it), `dispatch_dirty_tiles_via_scheduler` and `apply_injected_frame`, which
-//! take the AIMD-scaled budget from `base_budget_bytes` and hand it to
-//! `emit_via_scheduler`; all of these stay in `io_bridge.rs`.
+//! - the rate: `base_budget_bytes` (`adaptation_context.bytes_per_us` x one
+//!   tick x `SCHEDULER_TICK_BUDGET_FRACTION`, bounded below by
+//!   `tick_budget_floor`), the goog_cc combination (`PacingMode`,
+//!   `select_pacing_mode`, `combine_pacing_budget`, `pacer_tick_budget_bytes`,
+//!   `BWE_PACED_MODE_SAMPLE_THRESHOLD`) and the probe override, folded into
+//!   one bytes-per-second figure by `admission_rate`;
+//! - the admission pass `pump_admission`, which refills the bucket from that
+//!   rate, serves the byte classes in strict priority against it and stops at
+//!   the depth gate (the arithmetic is in `transport::admission`);
+//! - `refill_after_drain`, which runs the pass again after quinn has emptied
+//!   its queue, so that quinn is not left idle between turns;
+//! - `emit_via_scheduler`, the frame-time entry into the pass;
+//! - the stuck-entry sweep (`sweep_stuck_entries`, `STUCK_ENTRY_AGE`,
+//!   `STUCK_SWEEP_EVERY_TICKS`);
+//! - `priority_retry_after` and the harness setter `set_tick_budget_floor_bytes`.
 //!
 //! Boundary with `bwe_glue.rs`: this file consumes the estimator (the
 //! `bwe.snapshot()` samples count and `pacer_rate_bps`) and the probe window
-//! (`active_probe.target_rate_bps` replaces the budget while a window is open)
-//! but does not feed the estimator or manage the window. `emit_via_scheduler`
-//! straddles the two (it reads the snapshot, applies the probe override and
-//! calls `open_probe_window_for_burst`) and is left here whole.
+//! (`active_probe.target_rate_bps` replaces the rate while a window is open)
+//! but does not feed the estimator or manage the window.
+//! `emit_via_scheduler` straddles the two (it calls
+//! `open_probe_window_for_burst`) and is left here whole.
 //!
 //! Must not: decode ACKs or feedback, update the loss signal or the capacity
 //! hint, or decide session lifetime.
 
 use super::*;
-use crate::transport::instruments::classify_budget_term;
+use crate::transport::admission::{depth_target, pull_in_priority, source_budget, AdmitClass};
+use crate::transport::instruments::{classify_rate_term, BudgetTerm};
 
 // ---------------------------------------------------------------------------
-// Scheduler tick budgeting (A + B-light)
+// The admission rate
 // ---------------------------------------------------------------------------
-// `dispatch_dirty_tiles_via_scheduler` used to call `scheduler.tick(usize::MAX)`,
-// asking the scheduler to drain *everything* and handing the entire dirty
-// burst to QUIC in one go. With a first-frame cdf53 emission that runs
-// ~14 MB (2040 tiles × 14 progressive passes × ~500 B mean), this
-// catastrophically overran the datagram_send_buffer, with quinn either
-// silently overwriting older queued datagrams (drop=true, pre-81e4954) or
-// returning Blocked errors that dropped tiles on the floor (drop=false,
-// post-81e4954).
-//
-// The scheduler already accepts a per-tick byte budget and explicitly
-// keeps un-drained work in its queues for the next tick (see
-// `drain_priority_queue` / `drain_refinement_pass_major`). We just have
-// to use it. The budget tracks the measured QUIC bandwidth — feed-forward
-// (A) — and modulates down on observed send errors — feedback (B-light).
-//
-// Frame interval: hard-coded for 30 FPS capture (the daemon default).
-// At higher capture rates we'd budget conservatively (cap each tick to
-// the 30-FPS slice), which is fine — un-drained work carries across.
+// The rate was a budget per scheduler tick, spent once per call, with a
+// fixed 33 ms slice whatever the call interval, a multiplier that backed off
+// when quinn refused a datagram (it never does: the send buffer is 16 MiB),
+// and a give-back that billed retransmission at half price. It is now a
+// rate: bytes per second, refilled by elapsed time into one bucket that every
+// byte class is billed against. The numbers it is built from are unchanged.
+
+/// The tick the rate is expressed over. The scheduler's own cadence is a 30 fps
+/// capture; the rate is `per-tick bytes / tick`.
 pub(crate) const SCHEDULER_TICK_INTERVAL_US: f64 = 33_333.0;
 
-// Leave 10 % headroom in the budget so we don't push right up to quinn's
-// drain rate every tick (ACKs, feedback, NACK retransmits still need
-// wire). Cheap enough.
+// Leave 10 % headroom in the rate so we don't push right up to quinn's
+// drain rate (ACKs, feedback, NACK retransmits still need wire).
 const SCHEDULER_TICK_BUDGET_FRACTION: f64 = 0.90;
 
-// Safety floor for the first frames before `adaptation_context.bytes_per_us`
-// has been populated from path stats. 256 KB × 30 FPS = 7.5 MB/s — well
-// under any realistic tailnet path so we won't hammer a slow link, but
-// big enough that the visible-content first frame still lands quickly.
-/// Budget floor, in datagrams rather than bytes.
+/// Rate floor, in datagrams per tick rather than bytes.
 ///
 /// This was a flat 256 KiB, which is 7.86 MB/s at a 33.3 ms tick. With
 /// `SCHEDULER_TICK_BUDGET_FRACTION` that meant the bandwidth-derived term in
 /// `base_budget_bytes` only overtook the floor above ~70 Mbit/s -- above every
-/// link this system serves. The budget was therefore a constant, and slow
+/// link this system serves. The rate was therefore a constant, and slow
 /// links were overdriven by up to ~12x. Measured cost of that on a saturating
 /// 60x34 scene: 511,473 retransmit attempts and an emitter queue 389,053 deep
 /// at 5 Mbit, and 1,213,785 retransmits on a 5 -> 50 Mbit step-up.
 ///
-/// The floor's only legitimate job is to keep the budget above a single
-/// datagram, so a tile can always make progress even when the estimate is
-/// pessimistic or not yet established. Everything above that belongs to the
-/// bandwidth term. See `docs/specs/blocked-path-redesign.md`.
+/// The floor's only legitimate job is to keep the rate above a single
+/// datagram per tick, so a tile can always make progress even when the
+/// estimate is pessimistic or not yet established. Everything above that
+/// belongs to the bandwidth term. See `docs/specs/blocked-path-redesign.md`.
 const SCHEDULER_TICK_BUDGET_FLOOR_DATAGRAMS: usize = 1;
 
 /// Datagram size assumed when no session is connected yet, so the floor is
 /// defined before `compute_max_datagram_size` has a live connection to read.
 const SCHEDULER_TICK_BUDGET_FLOOR_FALLBACK_BYTES: usize = 1_200;
 
-// AIMD constants. Halving on error is conservative; 10 % ramp-up
-// per clean frame recovers a 16× drop in ~30 frames (1 second at 30 FPS).
-// Floor at 5 % so a sustained-loss link can't pin us to "send nothing".
-pub(super) const SCHEDULER_BUDGET_BACKOFF: f64 = 0.5;
+/// Fewest tokens an admission pass will start pulling new work with: about a
+/// quarter of a datagram. A pass that pulled with less would only build a
+/// datagram it could not yet afford and hold it, with its timer running.
+const MIN_PULL_BYTES: usize = 300;
 
-pub(super) const SCHEDULER_BUDGET_RAMP: f64 = 1.1;
+/// The fixed part of a tile datagram's wire size beyond its payload: the
+/// datagram header and the tile header. The WebTransport framing is added on
+/// top, per session.
+const TILE_DATAGRAM_HEADERS: usize =
+    crate::transport::protocol::DATAGRAM_HEADER_SIZE + crate::transport::protocol::TILE_HEADER_SIZE;
 
-pub(super) const SCHEDULER_BUDGET_MULT_MIN: f64 = 0.05;
+/// Most passes one `pump_admission` call makes before it stops. Each pass
+/// admits up to `D_target` and the bucket holds a few passes' worth, so this
+/// is a backstop against a livelock, not a limit anything reaches.
+const MAX_PASSES_PER_PUMP: usize = 64;
 
-pub(super) const SCHEDULER_BUDGET_MULT_MAX: f64 = 1.0;
+/// Most pump/drain rounds `refill_after_drain` makes in one turn. A round
+/// spends tokens, and the bucket never holds more than a burst.
+const MAX_REFILL_ROUNDS: usize = 256;
 
-// Fraction of quinn's reported `send_buffer_space()` we're willing to
-// commit per tick. The remaining 20 % is headroom for per-fragment
-// wire overhead (WT quarter-stream-id VarInt + tile-fragment header,
-// 30–60 B per datagram) that the scheduler's payload-bytes budget
-// can't see, so the actual on-wire footprint always exceeds the
-// scheduler's accounting. Without this margin a tick that just fits
-// in the payload budget still risks `SendDatagramError::Blocked` on
-// the overhead bytes — and Blocked silently drops refinement work
-// the scheduler already popped from its queue.
-pub(super) const QUINN_SEND_BUFFER_SAFETY_FRACTION: f64 = 0.80;
-
-// Maximum number of RTO-driven retransmits the ReliableTileEmitter is
-// allowed to fire per `tick()` call. Sized to comfortably fit in quinn's
-// `datagram_send_buffer` so a tick never overruns it. When more entries
-// are due than this cap, the un-popped ones stay in the RTO heap and
-// are picked up either by the next per-frame tick or by the
-// `Event::DatagramsUnblocked` continuation — quinn signals available
-// buffer space, we pop the next batch. Without this cap, sustained
-// loss fills the cache with thousands of pending passes; one `tick()`
-// floods quinn with retransmits, most are rejected with
-// `SendDatagramError::Blocked`, the cache never drains, and the link
-// settles into a self-sustained storm (~1.4 M retransmits / 3 minutes
-// observed in production with no cap).
-//
-// Bounds *retransmissions*, not datagrams. Since every allocated `wire_seq`
-// now joins an FEC group, a full sweep of 64 contiguous retransmits completes
-// floor(64/10) = 6 groups, each scheduling a parity that the same drain may
-// promote. So a sweep can hand quinn up to ~70 datagrams, not 64. That
-// headroom is deliberate: the cap is a safety valve against a self-sustained
-// storm, not a precise shaper, and tightening it to a datagram count would
-// change what `max_retransmits` means without changing its name.
-const RTO_RETRANSMITS_PER_TICK: usize = 64;
-
-/// How long a cache entry may keep retransmitting before it is retired and its
+/// How long an entry may keep retransmitting before it is retired and its
 /// content re-sent fresh instead.
 ///
 /// The retransmit cache is unbounded and 0aa97de deliberately removed the
@@ -157,34 +112,15 @@ const RTO_RETRANSMITS_PER_TICK: usize = 64;
 /// retransmitting it.
 const STUCK_ENTRY_AGE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Share of the link estimate retransmission may use while the scheduler
-/// still has work queued. With nothing queued it may use all of it.
-///
-/// Half, because neither side can be shown to deserve more. A retransmission
-/// repairs a pass the client is known or suspected to lack, and until it
-/// lands the tile cannot finish; new work is what the user is waiting to
-/// see, and under queueing delay most "lost" passes are merely late, so the
-/// retransmission is waste. Starving either one stalls convergence -- the
-/// first by never completing tiles, the second, as measured before this
-/// existed, by never emitting them.
-///
-/// Not a tuned value. What matters is that the sum is bounded by the
-/// estimate at all; see `retransmit_pacer`.
-const RETRANSMIT_BUDGET_SHARE: f64 = 0.5;
-
 /// Ticks between stuck-entry sweeps. The sweep scans the whole cache, which is
 /// large exactly when it matters, so it does not belong on every tick.
 const STUCK_SWEEP_EVERY_TICKS: u32 = 30;
 
 // ── BWE Stage 2.2: PacingMode ────────────────────────────────────────────
 //
-// The estimate takes charge of the per-tick emission budget. Two call
-// sites derive a starting budget before handing it to
-// `clamp_to_quinn_capacity` — `dispatch_dirty_tiles_via_scheduler`'s
-// AIMD-scaled `aimd_budget` and `apply_injected_frame`'s unscaled
-// `base_budget_bytes()` — and both route through `combine_pacing_budget` so
-// the two don't independently re-derive the same "should goog_cc bind
-// here?" decision and drift apart.
+// The estimate takes charge of the admission rate. `admission_rate` routes
+// the quinn-path-stats rate through `combine_pacing_budget`, so the
+// "should goog_cc bind here?" decision is made in one place.
 
 /// Minimum `BweSnapshot::samples_seen` before `PacingMode::Paced` is
 /// trusted over `PacingMode::PathStats`. Below this, `GoogCcDriver` is
@@ -207,15 +143,13 @@ const STUCK_SWEEP_EVERY_TICKS: u32 = 30;
 /// Deliberately not `pub`: it would otherwise leak into `ghostframe.h`
 /// (cbindgen scrapes every `pub const` in this crate for the C FFI surface)
 /// alongside genuinely wire-relevant constants like `FEC_GROUP_SIZE_K` —
-/// this is an internal tuning knob, matching every other AIMD/budget
-/// constant in this file (`SCHEDULER_BUDGET_BACKOFF` and friends, none of
-/// which are `pub` either).
+/// this is an internal tuning knob.
 pub(super) const BWE_PACED_MODE_SAMPLE_THRESHOLD: u64 = 150;
 
-/// Which source governs the per-tick emission budget.
+/// Which source governs the admission rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacingMode {
-    /// Quinn path stats with AIMD — today's behaviour. The startup mode,
+    /// Quinn path stats alone. The startup mode,
     /// and the fallback while the estimator has too few samples to trust
     /// (see `BWE_PACED_MODE_SAMPLE_THRESHOLD`).
     PathStats,
@@ -246,7 +180,7 @@ pub fn pacer_tick_budget_bytes(pacer_rate_bps: u64, tick_interval_us: f64) -> us
     (((pacer_rate_bps as f64) / 8.0) * tick_interval_us / 1_000_000.0) as usize
 }
 
-/// Combine the quinn-path-stats/AIMD-derived budget with goog_cc's
+/// Combine the quinn-path-stats-derived budget with goog_cc's
 /// pacer-derived budget for the same tick, by taking the smaller —
 /// `min`, not a replacement. They constrain different things: quinn's send
 /// buffer is a hard local limit whose violation drops popped work; goog_cc's
@@ -255,222 +189,373 @@ pub fn pacer_tick_budget_bytes(pacer_rate_bps: u64, tick_interval_us: f64) -> us
 ///
 /// `PacingMode::PathStats`, or `Paced` before the estimator has ever
 /// produced a `pacer_config` (`pacer_rate_bps: None`), returns
-/// `aimd_budget_bytes` unchanged — there is nothing from goog_cc to combine
+/// `path_budget_bytes` unchanged — there is nothing from goog_cc to combine
 /// with yet.
 ///
-/// Callers must still pass the result through `clamp_to_quinn_capacity`
-/// afterwards, last — this function has no knowledge of quinn's live
-/// send-buffer state, and that clamp exists to prevent the scheduler
-/// over-popping into quinn regardless of which mode produced the budget.
+/// This function has no knowledge of quinn's live queue; the depth gate in
+/// `admission` is what bounds that, whichever mode produced the rate.
 pub fn combine_pacing_budget(
     mode: PacingMode,
-    aimd_budget_bytes: usize,
+    path_budget_bytes: usize,
     pacer_rate_bps: Option<u64>,
     tick_interval_us: f64,
 ) -> usize {
     match (mode, pacer_rate_bps) {
         (PacingMode::Paced, Some(bps)) => {
-            aimd_budget_bytes.min(pacer_tick_budget_bytes(bps, tick_interval_us))
+            path_budget_bytes.min(pacer_tick_budget_bytes(bps, tick_interval_us))
         }
-        _ => aimd_budget_bytes,
+        _ => path_budget_bytes,
     }
 }
 
+/// Why a drain of the emission queue stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Stop {
+    /// Everything built has been handed to quinn.
+    Empty,
+    /// quinn's FIFO already holds `D_target`.
+    Depth,
+    /// The bucket cannot afford the next datagram.
+    Tokens,
+    /// quinn refused a datagram: its buffer is full.
+    Rejected,
+}
+
+/// What the depth gate is checked against, set by each admission pass.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct GateParams {
+    /// `D_target`, bytes.
+    pub(super) d_target: usize,
+}
+
+/// The rate admission runs at and the term that set it.
+struct AdmissionRate {
+    bytes_per_sec: f64,
+    term: BudgetTerm,
+}
+
+/// What one admission pass did.
+#[derive(Default)]
+pub(super) struct PumpOutcome {
+    pub(super) stats: FrameSendStats,
+    /// Wire bytes and tile count the scheduler gave this pass.
+    pub(super) scheduler_bytes: usize,
+    pub(super) scheduler_count: usize,
+    /// Datagrams quinn accepted during the pass, whatever their class.
+    pub(super) admitted: usize,
+}
+
 impl IoBridge {
-    /// Minimum `send_buffer_space()` across every currently-connected
-    /// WebTransport session, or `usize::MAX` if no session is connected.
+    /// Bytes quinn's datagram queue holds for the live session, or `None`
+    /// with no live session. One subtraction (quinn `datagrams.rs`).
+    pub(super) fn live_fifo_depth(&mut self) -> Option<usize> {
+        let capacity = self.server.datagram_send_buffer();
+        let handle = self.live_send_handle()?;
+        let conn = self.server.connections.get_mut(&handle)?;
+        Some(capacity.saturating_sub(conn.datagrams().send_buffer_space()))
+    }
+
+    /// The WebTransport framing the live session adds to every datagram.
+    pub(super) fn live_framing_len(&self) -> usize {
+        self.live_send_handle()
+            .and_then(|h| self.wt_sessions.get(&h))
+            .map_or(1, |wt| wt.datagram_framing_len())
+    }
+
+    /// One datagram on the wire, framing included: the floor of `D_target`
+    /// and the size the bucket is sized for.
+    fn wire_mtu(&self) -> usize {
+        self.last_max_datagram_size
+            .unwrap_or(SCHEDULER_TICK_BUDGET_FLOOR_FALLBACK_BYTES)
+            + Self::WT_VARINT_OVERHEAD
+    }
+
+    /// The rate admission runs at, bytes per second, and which input set it.
     ///
-    /// Every datagram we emit goes to **every** connected client, so
-    /// the slowest queue determines how much we can drain without
-    /// `quinn-proto` returning `SendDatagramError::Blocked` —
-    /// at which point the work has already been popped from
-    /// `scheduler.refinement_queue` and is irrecoverably lost.
+    /// `0.9 x cwnd / srtt` (floored at one datagram per tick), then the
+    /// minimum with goog_cc's pacer once that is trusted, then the maximum
+    /// with a probe window's target while one is open: the same arithmetic as
+    /// the per-tick budget, divided by the tick.
+    fn admission_rate(&self) -> AdmissionRate {
+        let tick_s = SCHEDULER_TICK_INTERVAL_US / 1_000_000.0;
+        let snap = self.bwe.snapshot();
+        let mode = select_pacing_mode(snap.samples_seen);
+        let paced = combine_pacing_budget(
+            mode,
+            self.base_budget_bytes(),
+            snap.pacer_rate_bps,
+            SCHEDULER_TICK_INTERVAL_US,
+        );
+        // A probe must send at *least* its target rate, but never less than
+        // we otherwise would: overriding outright throttled emission whenever
+        // the target sat below the pacer rate (the pacer runs at 2.5x the
+        // estimate, an early ladder rung is only 2x). Measured on the
+        // propagation-delay scene: delivered bytes fell 23 % (747 kB -> 577 kB).
+        let (per_tick, probe_binds) = match &self.active_probe {
+            Some(probe) => {
+                let probe_budget =
+                    pacer_tick_budget_bytes(probe.target_rate_bps, SCHEDULER_TICK_INTERVAL_US);
+                (probe_budget.max(paced), probe_budget > paced)
+            }
+            None => (paced, false),
+        };
+        let pacer_rate = match (mode, snap.pacer_rate_bps) {
+            (PacingMode::Paced, Some(bps)) => Some(bps as f64 / 8.0),
+            _ => None,
+        };
+        let term = classify_rate_term(
+            probe_binds,
+            pacer_rate,
+            self.bandwidth_budget_term() as f64 / tick_s,
+            self.tick_budget_floor() as f64 / tick_s,
+        );
+        AdmissionRate {
+            bytes_per_sec: per_tick as f64 / tick_s,
+            term,
+        }
+    }
+
+    /// Whether admission is holding work it has not been able to send: a
+    /// datagram built and waiting, a client request or a timer due, or tiles
+    /// in the scheduler. A scheduler with no frame identity to tag its work
+    /// with has nothing it can send.
+    fn admission_backlog(&self, now: std::time::Instant) -> bool {
+        self.reliable_emitter.emission_queue_len() > 0
+            || self.reliable_emitter.pending_nack_count() > 0
+            || self.reliable_emitter.has_due_rto(now)
+            || (self.last_drain_frame_context.is_some() && self.scheduler.has_pending_work())
+    }
+
+    /// One admission pass: refill the bucket, then serve the classes in
+    /// strict priority until the depth gate, the bucket or the work runs out.
     ///
-    /// The no-connected-session fallback is `usize::MAX` (uncapped)
-    /// rather than `0`. Production never reaches this code with zero
-    /// connected sessions — `process_frame_gpu` early-returns when
-    /// `compute_max_datagram_size` returns `None`. Unit tests that
-    /// drive `dispatch_dirty_tiles_via_scheduler` directly without a
-    /// live quinn connection rely on the unlimited path so the
-    /// scheduler's `tick` still runs.
+    /// The order inside a pass is the priority order: NACK repair, then the
+    /// timer's retransmissions, then the scheduler (critical tier before
+    /// refinement), each against what the ones before left. Parity is not
+    /// pulled; it is built by the emitter as sources are sent and is charged
+    /// when it is emitted, so `source_budget` leaves it a share.
     ///
-    /// Called from `dispatch_dirty_tiles_via_scheduler` to clamp the
-    /// per-tick AIMD budget down to what quinn can actually accept.
-    pub(super) fn min_session_send_buffer_space(&mut self) -> usize {
-        let mut min_space: Option<usize> = None;
-        let handles: Vec<quinn_proto::ConnectionHandle> =
-            self.live_send_handle().into_iter().collect();
-        for handle in handles {
-            if let Some(conn) = self.server.connections.get_mut(&handle) {
-                let space = conn.datagrams().send_buffer_space();
-                min_space = Some(match min_space {
-                    Some(m) => m.min(space),
-                    None => space,
-                });
+    /// Work that cannot be admitted stays where it was built: in the
+    /// scheduler (where a newer frame supersedes it), in the NACK list or in
+    /// the timer wheel. Nothing is built that cannot be sent in the same
+    /// pass, bar the datagram that crosses the bound, because a built
+    /// datagram has a wire_seq and a running timer.
+    pub(super) fn pump_admission(&mut self) -> PumpOutcome {
+        let now = now_std();
+        let mut out = PumpOutcome::default();
+        let rate = self.admission_rate();
+        let mtu = self.wire_mtu();
+        let framing = self.live_framing_len();
+        self.admission.refill(now, rate.bytes_per_sec, mtu);
+        let d_target = depth_target(rate.bytes_per_sec, mtu);
+        self.gate = Some(GateParams { d_target });
+        {
+            let a = &mut self.instr.admission;
+            a.pumps += 1;
+            a.d_target_last = d_target as u64;
+            a.mtu = mtu as u64;
+            a.d_target_max = a.d_target_max.max(d_target as u64);
+        }
+        self.instr.budget.note_rate(rate.term);
+        self.scheduler
+            .set_item_overhead(TILE_DATAGRAM_HEADERS + framing);
+        self.reliable_emitter.set_wire_overhead(framing);
+
+        let admitted_before = self.instr.admission.datagrams_admitted;
+        // What an earlier pass built and could not send goes first.
+        let mut stop = self.drain_reliable_emitter(now);
+        let mut passes = 0;
+        while stop == Stop::Empty && passes < MAX_PASSES_PER_PUMP {
+            passes += 1;
+            let depth = self.live_fifo_depth().unwrap_or(0);
+            if depth >= d_target {
+                stop = Stop::Depth;
+                break;
+            }
+            let tokens = self.admission.available();
+            if tokens < MIN_PULL_BYTES {
+                stop = Stop::Tokens;
+                break;
+            }
+            // Room under the gate, at least one datagram so a refinement pass
+            // (which the scheduler admits whole) is never starved by a small
+            // remainder; tokens, less the parity the sources will owe, but
+            // never less than a datagram when a datagram is affordable.
+            let room = (d_target - depth).max(mtu);
+            let budget = source_budget(tokens).max(tokens.min(mtu)).min(room);
+            let pulled =
+                pull_in_priority(
+                    budget,
+                    &AdmitClass::PRIORITY,
+                    |class, remaining| match class {
+                        AdmitClass::NackRepair => {
+                            let mut n = 0;
+                            self.reliable_emitter.tick_nacks_budgeted(
+                                now,
+                                usize::MAX,
+                                remaining,
+                                &mut n,
+                            )
+                        }
+                        AdmitClass::Retransmit => {
+                            let mut n = 0;
+                            self.reliable_emitter.tick_rto_budgeted(
+                                now,
+                                usize::MAX,
+                                remaining,
+                                &mut n,
+                            )
+                        }
+                        // The scheduler serves its critical tier before its
+                        // refinement tier inside one call, so the two classes are
+                        // one pull and `Refinement` has nothing of its own.
+                        AdmitClass::Critical => match self.last_drain_frame_context {
+                            Some(ctx) => {
+                                let (stats, bytes, count) = self.drain_scheduler_into_quinn(
+                                    ctx.seq,
+                                    ctx.timestamp_us,
+                                    ctx.max_frag,
+                                    remaining,
+                                );
+                                out.stats.accumulate(&stats);
+                                out.scheduler_bytes += bytes;
+                                out.scheduler_count += count;
+                                bytes + count * framing
+                            }
+                            None => 0,
+                        },
+                        AdmitClass::Refinement | AdmitClass::Parity => 0,
+                    },
+                );
+            stop = self.drain_reliable_emitter(now);
+            if pulled == 0 && stop == Stop::Empty {
+                break;
             }
         }
-        min_space.unwrap_or(usize::MAX)
+        out.admitted = (self.instr.admission.datagrams_admitted - admitted_before) as usize;
+
+        // What held the rest back, and when to look again.
+        self.admission_wake = None;
+        // Only a pass that stopped early has anything to account for.
+        if stop != Stop::Empty && self.admission_backlog(now) {
+            match stop {
+                Stop::Depth => self.instr.budget.gate_depth += 1,
+                Stop::Rejected => self.instr.budget.gate_rejected += 1,
+                Stop::Tokens => {
+                    self.instr.budget.gate_tokens += 1;
+                    // The bucket refills by time alone; nothing else will
+                    // wake the loop for it.
+                    let need = if self.reliable_emitter.emission_queue_len() > 0 {
+                        mtu
+                    } else {
+                        MIN_PULL_BYTES
+                    };
+                    let wait = self
+                        .admission
+                        .time_until(need, rate.bytes_per_sec)
+                        .unwrap_or(std::time::Duration::from_millis(33))
+                        .max(std::time::Duration::from_micros(500));
+                    self.admission_wake = Some(now + wait);
+                }
+                Stop::Empty => {}
+            }
+        }
+        out
     }
 
-    /// Clamp a drain budget to what quinn can actually absorb right now:
-    /// `min_session_send_buffer_space()` scaled by
-    /// `QUINN_SEND_BUFFER_SAFETY_FRACTION`, then `.min()`-ed against the
-    /// caller-supplied budget. This one computation backs all three of the
-    /// module's scheduler-drain budget sites — `dispatch_dirty_tiles_via_scheduler`'s
-    /// AIMD-derived `tick_budget_bytes` (see the long comment on that
-    /// variable, and the module-level history at `:145-152`),
-    /// `resume_scheduler_continuation`'s per-continuation `effective_budget`,
-    /// and `apply_injected_frame`'s injected-scene budget — because a
-    /// `scheduler.tick(usize::MAX)` drain against a large first-frame CDF53
-    /// burst once catastrophically overran `datagram_send_buffer`, with
-    /// quinn either silently overwriting queued datagrams or returning
-    /// `Blocked` and dropping the already-popped `TileWork` on the floor.
-    /// `drain_refinement_pass_major` uses `queue.remove(idx)` (not
-    /// `InFlight` retention), so an over-popped refinement pass has no
-    /// scheduler-side retry — only the emitter's bounded RTO.
+    /// Run the admission pass again after quinn has written packets, and
+    /// again after each of those drains, until it admits nothing.
     ///
-    /// `apply_injected_frame`'s only caller (the browserless harness) passes
-    /// `budget: usize::MAX` — wave 1 relies entirely on the netsim's token
-    /// bucket for pacing, and that bucket is consumed inside
-    /// `send_to_all_sessions`, i.e. *below* quinn's `datagram_send_buffer`.
-    /// It shapes what reaches the socket but cannot stop the scheduler from
-    /// over-popping into quinn. Without this clamp, the injected path would
-    /// reproduce the `:145-152` bug on every drain.
-    ///
-    /// Callers remain responsible for anything beyond the raw quinn-capacity
-    /// clamp: `dispatch_dirty_tiles_via_scheduler` applies
-    /// `tick_budget_multiplier` (AIMD) to its budget *before* calling this,
-    /// and `apply_injected_frame` deliberately does not — that feedback loop
-    /// (which reacts to *this bridge's own* `send_datagram` errors) is not
-    /// exercised on the injected path. BWE Stage 2.2's `combine_pacing_budget`
-    /// (goog_cc's pacer, an independent network estimate) is a different
-    /// axis and both sites *do* apply it before calling this, so that the
-    /// browserless harness — which only ever exercises the injected path —
-    /// can actually observe `PacingMode::Paced`.
-    ///
-    /// A plain method (rather than inlined at each site) so unit tests can
-    /// pin this arithmetic directly: `apply_injected_frame`'s own call site
-    /// sits behind `compute_max_datagram_size()`, which requires a live,
-    /// post-handshake `quinn_proto::Connection` to ever return `Some` —
-    /// exactly the machinery the browserless harness (Task 15) exists to
-    /// provide, and out of scope to fabricate here (see the doc comment on
-    /// `injected_work_is_enqueued_and_drain_is_attempted` below for the same
-    /// call).
-    pub(super) fn clamp_to_quinn_capacity(&mut self, budget: usize) -> usize {
-        let quinn_space = self.min_session_send_buffer_space();
-        let quinn_cap = ((quinn_space as f64) * QUINN_SEND_BUFFER_SAFETY_FRACTION) as usize;
-        budget.min(quinn_cap)
+    /// quinn empties its FIFO inside `drain_outbound`. A pass made only
+    /// before that drain leaves quinn idle until the next turn, however much
+    /// the bucket holds: the FIFO stands at `D_target` (10 ms of the rate)
+    /// and one drain can write all of it. So the pass follows every drain.
+    pub(super) async fn refill_after_drain(&mut self) -> io::Result<()> {
+        for _ in 0..MAX_REFILL_ROUNDS {
+            if self.pump_admission().admitted == 0 {
+                break;
+            }
+            self.drain_outbound().await?;
+        }
+        self.note_turn_end_admission();
+        Ok(())
     }
 
-    /// Fire any cached retransmits whose RTO deadline has elapsed, then
-    /// drain the resulting emission queue (source + parity) to the wire.
-    /// `tick()` is rate-limited to `RTO_RETRANSMITS_PER_TICK` entries per
-    /// call so a burst of due retransmits can't re-Block quinn's just-freed
-    /// buffer; `drain()` flushes whatever that produced. Cheap when nothing
-    /// is due (no cache hits, no parity ready), so it is safe to call
-    /// unconditionally from every place a drain just happened or quinn
-    /// signaled room: the post-dispatch path in `process_frame_gpu`, the
-    /// `Event::DatagramsUnblocked` handler, and `apply_injected_frame`'s
-    /// post-drain mirror of the same behavior for injected scenes.
-    ///
-    /// The drain goes through [`IoBridge::drain_reliable_emitter`], which holds
-    /// no borrow of the emitter across a send. (It used to hand the emitter a
-    /// raw `*mut IoBridge`; see the commit that removed it.)
-    pub(super) fn sweep_rto_retransmits(&mut self) {
+    /// Count the turn as backlogged, and as starved if quinn was left with
+    /// nothing, when admission ended the turn holding work and the tokens to
+    /// send it. `starved_turns` is the number refill-after-drain exists to
+    /// keep at zero.
+    fn note_turn_end_admission(&mut self) {
+        let Some(depth) = self.live_fifo_depth() else {
+            return;
+        };
+        if self.admission.available() < self.wire_mtu() {
+            return;
+        }
+        if !self.admission_backlog(now_std()) {
+            return;
+        }
+        self.instr.admission.backlog_turns += 1;
+        if depth == 0 {
+            self.instr.admission.starved_turns += 1;
+        }
+    }
+
+    /// Retire cache entries that have been retransmitting for longer than
+    /// anything in flight plausibly is, and re-dirty their tiles. A sweep of
+    /// the whole cache, so every `STUCK_SWEEP_EVERY_TICKS` calls.
+    pub(super) fn sweep_stuck_entries(&mut self) {
         let tick_now = now_std();
         self.stuck_sweep_counter = self.stuck_sweep_counter.wrapping_add(1);
-        if self
+        if !self
             .stuck_sweep_counter
             .is_multiple_of(STUCK_SWEEP_EVERY_TICKS)
         {
-            let retired = self
-                .reliable_emitter
-                .retire_stuck(tick_now, STUCK_ENTRY_AGE);
-            if !retired.is_empty() {
-                // Not a drop. Forcing the tiles dirty re-encodes them at a
-                // current frame_seq and sends them again, so the client ends up
-                // with newer content than the retired payload carried. This is
-                // the same mechanism a screen change uses; we are only
-                // asserting that a tile stuck this long counts as changed.
-                //
-                // Deliberately the existing whole-frame force rather than a
-                // per-tile one: there is no per-tile re-dirty hook, and a
-                // cache in this state is not a one-tile problem.
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    retired = retired.len(),
-                    pending_after = self.reliable_emitter.pending_cache_entries(),
-                    age_s = STUCK_ENTRY_AGE.as_secs(),
-                    "retired stuck retransmit entries and forced a re-dirty; \
-                     each was costing a retransmit every RTO_BACKOFF_MAX forever. \
-                     Sustained non-zero here means acknowledgements are not \
-                     retiring content the normal way — check ledger_unknown_acks."
-                );
-                self.force_dirty_frames = self.force_dirty_frames.max(2);
-                self.backend_apply(Control::InvalidateBaseline(2));
-            }
+            return;
         }
-        // Retransmission draws on the same link estimate the scheduler
-        // does. This is called per frame and per `DatagramsUnblocked`, so a
-        // per-call bound alone is a bound per *event*; the pacer turns it
-        // into one per unit of time.
-        let share = if self.scheduler.queue_len() == 0 && self.scheduler.refinement_queue_len() == 0
-        {
-            1.0
-        } else {
-            RETRANSMIT_BUDGET_SHARE
-        };
-        self.retransmit_pacer.refill(
-            tick_now,
-            self.paced_tick_budget_bytes(),
-            SCHEDULER_TICK_INTERVAL_US,
-            share,
-        );
-        // And on quinn's room, for the scheduler's reason: a datagram quinn
-        // refuses is re-queued, not lost, but queueing replay behind a full
-        // buffer only adds to the standing delay that is making timers fire.
-        let allowance = self.clamp_to_quinn_capacity(self.retransmit_pacer.available());
-        let spent =
-            self.reliable_emitter
-                .tick_budgeted(tick_now, RTO_RETRANSMITS_PER_TICK, allowance);
-        self.retransmit_pacer.spend(spent);
-        self.drain_reliable_emitter(tick_now);
+        let retired = self
+            .reliable_emitter
+            .retire_stuck(tick_now, STUCK_ENTRY_AGE);
+        if !retired.is_empty() {
+            // Not a drop. Forcing the tiles dirty re-encodes them at a
+            // current frame_seq and sends them again, so the client ends up
+            // with newer content than the retired payload carried. This is
+            // the same mechanism a screen change uses; we are only
+            // asserting that a tile stuck this long counts as changed.
+            //
+            // Deliberately the existing whole-frame force rather than a
+            // per-tile one: there is no per-tile re-dirty hook, and a
+            // cache in this state is not a one-tile problem.
+            tracing::warn!(
+                target: LOG_TARGET,
+                retired = retired.len(),
+                pending_after = self.reliable_emitter.pending_cache_entries(),
+                age_s = STUCK_ENTRY_AGE.as_secs(),
+                "retired stuck retransmit entries and forced a re-dirty; \
+                 each was costing a retransmit every RTO_BACKOFF_MAX forever. \
+                 Sustained non-zero here means acknowledgements are not \
+                 retiring content the normal way — check ledger_unknown_acks."
+            );
+            self.force_dirty_frames = self.force_dirty_frames.max(2);
+            self.backend_apply(Control::InvalidateBaseline(2));
+        }
     }
 
-    /// Build the continuation a scheduler drain should leave behind, given
-    /// the (already-clamped) budget it drained against and how many bytes
-    /// actually went out. `None` once the budget is fully spent, otherwise
-    /// `Some` carrying the frame's own identity (`seq`/`timestamp_us`/
-    /// `max_frag`) and the leftover budget, so
-    /// `Event::DatagramsUnblocked` -> `resume_scheduler_continuation` can
-    /// top the drain back up without waiting for the next capture tick or
-    /// injected frame.
-    ///
-    /// Used by `emit_via_scheduler`, shared by both the capture and
-    /// injected-harness paths.
-    ///
-    /// A free function (no `&self`) so it is directly unit-testable: unlike
-    /// its callers (behind `compute_max_datagram_size()`, which needs a
-    /// live post-handshake session), this is pure arithmetic over its
-    /// arguments.
-    pub(super) fn scheduler_continuation_after_drain(
-        seq: u32,
-        timestamp_us: u32,
-        max_frag: usize,
-        budget_bytes: usize,
-        drained_bytes: usize,
-    ) -> Option<SchedulerContinuation> {
-        let remaining = budget_bytes.saturating_sub(drained_bytes);
-        if remaining > 0 {
-            Some(SchedulerContinuation {
-                seq,
-                timestamp_us,
-                max_frag,
-                remaining_budget_bytes: remaining,
-            })
-        } else {
-            None
-        }
+    /// Per-tick bytes at the measured rate: measured QUIC bandwidth
+    /// (`adaptation_context.bytes_per_us`) x the tick interval x a fixed
+    /// headroom fraction, floored by `tick_budget_floor` so the first frames
+    /// of a session (before `bytes_per_us` is populated from path stats)
+    /// still emit promptly. The admission rate is this over the tick.
+    pub(super) fn base_budget_bytes(&self) -> usize {
+        self.bandwidth_budget_term().max(self.tick_budget_floor())
+    }
+
+    /// The bandwidth operand of `base_budget_bytes`: measured QUIC bandwidth
+    /// x the tick interval x the headroom fraction, before the floor.
+    fn bandwidth_budget_term(&self) -> usize {
+        ((self.adaptation_context.bytes_per_us as f64)
+            * SCHEDULER_TICK_INTERVAL_US
+            * SCHEDULER_TICK_BUDGET_FRACTION) as usize
     }
 
     /// Lower bound for `base_budget_bytes`: one datagram at the live MTU,
@@ -486,41 +571,6 @@ impl IoBridge {
             .saturating_mul(SCHEDULER_TICK_BUDGET_FLOOR_DATAGRAMS)
     }
 
-    /// Per-tick emission budget before any pacing override or AIMD
-    /// modulation: measured QUIC bandwidth (`adaptation_context.bytes_per_us`)
-    /// × the capture tick interval × a fixed headroom fraction, floored by
-    /// `tick_budget_floor` so the first frames of a session (before
-    /// `bytes_per_us` is populated from path stats) still emit promptly.
-    ///
-    /// Shared by `dispatch_dirty_tiles_via_scheduler` (which further scales
-    /// this by `tick_budget_multiplier`, the AIMD ramp/backoff fed by
-    /// observed `send_datagram` errors) and `apply_injected_frame` (which
-    /// does not — see that call site's comment for why). Both callers must
-    /// derive from the same production numbers rather than each computing
-    /// their own idea of "the budget", which is exactly the split that
-    /// generated Stage 2's defects.
-    pub(super) fn base_budget_bytes(&self) -> usize {
-        // Billing a fixed 33 ms slice per call looks wrong -- ticks are
-        // frame-driven, so at 5 fps this grants 5 x 33 ms of bandwidth per
-        // second of wall clock. Replacing it with elapsed-time billing was
-        // implemented and measured, and changed nothing: the floor
-        // (`tick_budget_floor`, then a flat 256 KB) dominated at every
-        // realistic interval (33 ms computes ~30 KB, 250 ms ~225 KB), so this
-        // expression's first term never decided the budget. (The floor is
-        // now one datagram at the live MTU, so this term can bind.) Reverted
-        // rather than kept, because unvalidated arithmetic in the
-        // send path is a liability.
-        self.bandwidth_budget_term().max(self.tick_budget_floor())
-    }
-
-    /// The bandwidth operand of `base_budget_bytes`: measured QUIC bandwidth
-    /// x the tick interval x the headroom fraction, before the floor.
-    fn bandwidth_budget_term(&self) -> usize {
-        ((self.adaptation_context.bytes_per_us as f64)
-            * SCHEDULER_TICK_INTERVAL_US
-            * SCHEDULER_TICK_BUDGET_FRACTION) as usize
-    }
-
     /// How long the scheduler waits for a priority tile's acknowledgement
     /// before sending it again: the reliable emitter's first-attempt
     /// deadline, so the two retry mechanisms race the same clock.
@@ -533,243 +583,39 @@ impl IoBridge {
         )
     }
 
-    /// The per-tick emission budget as the scheduler computes it outside a
-    /// probe window: `base_budget_bytes` scaled by the AIMD multiplier, then
-    /// bounded by goog_cc's pacer once that is trusted.
-    ///
-    /// For callers that are not a frame dispatch -- retransmission -- and so
-    /// have no `aimd_budget` in hand, but must draw on the same estimate.
-    /// Probe windows are deliberately not consulted: a probe exists to send
-    /// *new* content above the estimate, and replaying old passes into it
-    /// would spend the measurement on bytes the client may already hold.
-    fn paced_tick_budget_bytes(&self) -> usize {
-        let aimd_budget =
-            ((self.base_budget_bytes() as f64) * self.tick_budget_multiplier) as usize;
-        let bwe_snap = self.bwe.snapshot();
-        combine_pacing_budget(
-            select_pacing_mode(bwe_snap.samples_seen),
-            aimd_budget,
-            bwe_snap.pacer_rate_bps,
-            SCHEDULER_TICK_INTERVAL_US,
-        )
-    }
-
-    /// The one emission tail: probe override -> pacing combine -> quinn
-    /// clamp -> drain -> continuation bookkeeping.
+    /// The frame-time entry into the admission pass: tell it which frame the
+    /// work it pulls belongs to, then run it.
     ///
     /// Both the capture path (`dispatch_dirty_tiles_via_scheduler`) and the
     /// harness injection path (`apply_injected_frame`) call this, so they
-    /// cannot drift — four BWE Stage 2 defects came from feeding what were
-    /// once two independent copies of this logic different inputs. Anything
-    /// that must differ between the two callers belongs *before* this call,
-    /// in how their work is produced and enqueued, never in how it is
-    /// emitted.
+    /// cannot drift. Anything that must differ between the two callers
+    /// belongs *before* this call, in how their work is produced and
+    /// enqueued, never in how it is emitted.
     ///
-    /// Takes `base_budget_bytes` and nothing that identifies the caller. If
-    /// this function ever needs to know who called it, the extraction has
-    /// failed and the split has been rebuilt one level down.
-    ///
-    /// `SchedulerEmissionPolicy::TestCdf53All` does not call this at all — it
-    /// bypasses probe override, pacing combine, the quinn clamp, AND
-    /// continuation bookkeeping outright with a direct `usize::MAX` drain
-    /// (see the `match policy` in `dispatch_dirty_tiles_via_scheduler`).
-    /// That is a bigger bypass than any budget value this function could be
-    /// handed would produce, so it stays a caller-side branch rather than a
-    /// parameter here.
-    ///
-    /// The AIMD `tick_budget_multiplier` is likewise applied by the caller,
-    /// before this is called: it is fed by `send_datagram` errors observed
-    /// on the dispatch path only, and the injected path has no equivalent
-    /// feedback signal.
+    /// BWE burst discovery: a pending probe window is claimed *here*, at the
+    /// one moment we know datagrams are about to be emitted. See
+    /// `open_probe_window_for_burst`. While a window is open the rate is the
+    /// probe's (see `admission_rate`).
     pub(super) fn emit_via_scheduler(
         &mut self,
         seq: u32,
         timestamp_us: u32,
         max_frag: usize,
-        base_budget_bytes: usize,
     ) -> (FrameSendStats, usize, usize) {
-        // BWE Stage 2.2: goog_cc's pacer additionally bounds the budget
-        // once the estimator has enough samples to trust (`PacingMode`) —
-        // `min(base_budget_bytes, googcc_budget)`, not a replacement.
-        // BWE burst discovery: claim a pending probe window *here*, at the
-        // one moment we know datagrams are about to be emitted. See
-        // `open_probe_window_for_burst`.
         self.open_probe_window_for_burst(now_std());
-
-        let bwe_snap = self.bwe.snapshot();
-        let pacing_mode = select_pacing_mode(bwe_snap.samples_seen);
-        // BWE Stage 2.4: a probe window overrides the pacing budget
-        // outright rather than going through `combine_pacing_budget` —
-        // probing exists to send *above* goog_cc's own current estimate,
-        // so `min(base, googcc)` would defeat the point. `clamp_to_quinn_
-        // capacity` still runs last (below) and still wins: a probe is not
-        // worth dropping tiles for, and that clamp exists because
-        // `scheduler.tick` is destructive.
-        // Which term set this tick's budget. Observation only: derived from
-        // the values the decision below already uses, never fed back.
-        let mut probe_binds = false;
-        let pre_clamp_budget = match &self.active_probe {
-            Some(probe) => {
-                // A probe must send at *least* its target rate, but must
-                // never send *less* than we otherwise would. Overriding the
-                // pacing budget outright throttles emission whenever the
-                // probe target sits below the current pacer rate — the pacer
-                // runs at 2.5x the estimate while an early ladder rung is
-                // only 2x, so that window is real. Measured on the
-                // propagation-delay scene: delivered bytes fell 23% (747 kB
-                // -> 577 kB) once network-state probing made windows
-                // frequent enough for it to matter.
-                //
-                // Taking the max keeps the cluster's floor at the target
-                // while leaving throughput alone. goog_cc computes a
-                // cluster's send rate from what was actually sent, not from
-                // what was requested, so exceeding the target costs nothing.
-                let probe_budget =
-                    pacer_tick_budget_bytes(probe.target_rate_bps, SCHEDULER_TICK_INTERVAL_US);
-                let paced_budget = combine_pacing_budget(
-                    pacing_mode,
-                    base_budget_bytes,
-                    bwe_snap.pacer_rate_bps,
-                    SCHEDULER_TICK_INTERVAL_US,
-                );
-                probe_binds = probe_budget > paced_budget;
-                probe_budget.max(paced_budget)
-            }
-            None => combine_pacing_budget(
-                pacing_mode,
-                base_budget_bytes,
-                bwe_snap.pacer_rate_bps,
-                SCHEDULER_TICK_INTERVAL_US,
-            ),
-        };
         // The scheduler re-sends an un-acknowledged priority tile once this
         // has elapsed. Set here, on the path every emission shares, so the
         // capture and injected paths cannot disagree about it.
         self.scheduler.set_retry_after(self.priority_retry_after());
-        // Retransmission since the last tick came out of the same link, so
-        // it comes out of this budget: the estimate bounds the sum, not each
-        // sender separately. Bounded by retransmission's own share so that a
-        // capture slower than the tick rate -- where several ticks' worth of
-        // replay legitimately fits between two frames -- cannot zero the
-        // scheduler out.
-        let replayed = self.retransmit_pacer.take_spent_since_tick();
-        let give_back = replayed.min((pre_clamp_budget as f64 * RETRANSMIT_BUDGET_SHARE) as usize);
-        let pre_clamp_budget = pre_clamp_budget - give_back;
-        // Never pop more from the scheduler than quinn can actually absorb
-        // right now — see `clamp_to_quinn_capacity`'s doc comment for why
-        // this is mandatory rather than defensive.
-        let budget_bytes = self.clamp_to_quinn_capacity(pre_clamp_budget);
-        let unscaled_base = self.base_budget_bytes();
-        let term = classify_budget_term(
-            probe_binds,
-            match (pacing_mode, bwe_snap.pacer_rate_bps) {
-                (PacingMode::Paced, Some(bps)) => {
-                    Some(pacer_tick_budget_bytes(bps, SCHEDULER_TICK_INTERVAL_US))
-                }
-                _ => None,
-            },
-            base_budget_bytes,
-            unscaled_base,
-            self.bandwidth_budget_term(),
-            self.tick_budget_floor(),
-        );
-        self.instr
-            .budget
-            .note(term, budget_bytes < pre_clamp_budget, give_back);
-        let (stats, drained_bytes, drained_count) =
-            self.drain_scheduler_into_quinn(seq, timestamp_us, max_frag, budget_bytes);
-        // Cache the continuation context so `Event::DatagramsUnblocked` ->
-        // `resume_scheduler_continuation` can resume draining the same
-        // logical frame without waiting for the next capture tick / next
-        // injected frame.
-        self.scheduler_continuation = Self::scheduler_continuation_after_drain(
+        // Later passes, with no frame of their own, tag the work they pull
+        // with this one's identity.
+        self.last_drain_frame_context = Some(DrainFrameContext {
             seq,
             timestamp_us,
             max_frag,
-            budget_bytes,
-            drained_bytes,
-        );
-        (stats, drained_bytes, drained_count)
-    }
-
-    /// Resume the in-flight frame's scheduler drain. Called from the
-    /// `Event::DatagramsUnblocked` event handler — quinn just transmitted
-    /// the datagrams it had buffered and there's room for more. Pulls
-    /// from the scheduler queues up to whatever's left of the current
-    /// frame's AIMD-adjusted budget, fragments and sends, then either
-    /// keeps the continuation alive with the new remaining budget or
-    /// clears it once the per-frame budget is fully spent.
-    ///
-    /// AIMD is deliberately NOT adjusted here. A burst of Unblocked
-    /// events at session start (slow-start cwnd ramp) used to collapse
-    /// the multiplier to its floor (0.05) within one frame because each
-    /// continuation halved on its own observed errors. With AIMD pinned
-    /// to the per-frame dispatch boundary, the multiplier reflects the
-    /// frame's *cumulative* error rate (direct drain + every continuation
-    /// triggered before the next frame) via the
-    /// `pre_dispatch_send_errs → datagram_send_errs` delta — exactly
-    /// once per frame instead of once per quinn event.
-    ///
-    /// Cheap when nothing is queued (scheduler.tick returns empty), so
-    /// no harm in firing it on every Unblocked event regardless of
-    /// what was just unblocked.
-    pub(super) fn resume_scheduler_continuation(&mut self) {
-        let ctx = match self.scheduler_continuation {
-            Some(c) => c,
-            None => return,
-        };
-        if ctx.remaining_budget_bytes == 0 {
-            self.scheduler_continuation = None;
-            return;
-        }
-        // Mirror the dispatch-side clamp: never pop more from the
-        // scheduler than quinn can absorb (see the long comment in
-        // `dispatch_dirty_tiles_via_scheduler` for the Blocked-drops-
-        // refinement-work rationale).
-        let effective_budget = self.clamp_to_quinn_capacity(ctx.remaining_budget_bytes);
-        if effective_budget == 0 {
-            // Quinn is still full. Keep the continuation alive so the
-            // next `DatagramsUnblocked` event fires this path again.
-            return;
-        }
-        let (_stats, drained_bytes, drained_count) = self.drain_scheduler_into_quinn(
-            ctx.seq,
-            ctx.timestamp_us,
-            ctx.max_frag,
-            effective_budget,
-        );
-        let new_remaining = ctx.remaining_budget_bytes.saturating_sub(drained_bytes);
-        if drained_count > 0 {
-            self.continuation_resumes = self.continuation_resumes.saturating_add(1);
-            self.continuation_drained_bytes = self
-                .continuation_drained_bytes
-                .saturating_add(drained_bytes as u64);
-        }
-        tracing::debug!(
-            target: LOG_TARGET,
-            seq = ctx.seq,
-            drained_count = drained_count,
-            drained_bytes = drained_bytes,
-            remaining_before = ctx.remaining_budget_bytes,
-            remaining_after = new_remaining,
-            "scheduler continuation resumed"
-        );
-        // Clear the continuation when the budget is exhausted. We also
-        // clear when drained_count == 0 AND drained_bytes == 0 (the
-        // scheduler genuinely had nothing more to drain); a subsequent
-        // dispatch will repopulate with fresh state. Don't clear on
-        // drained_count==0 alone — a refinement-queue item whose payload
-        // exceeds the remaining budget makes scheduler.tick return
-        // empty even though work remains, and clearing would lose the
-        // continuation hook for that next Unblocked event.
-        self.scheduler_continuation = if new_remaining > 0 && drained_bytes > 0 {
-            Some(SchedulerContinuation {
-                remaining_budget_bytes: new_remaining,
-                ..ctx
-            })
-        } else {
-            None
-        };
+        });
+        let out = self.pump_admission();
+        (out.stats, out.scheduler_bytes, out.scheduler_count)
     }
 
     /// Override the `base_budget_bytes` floor. See `tick_budget_floor_bytes`

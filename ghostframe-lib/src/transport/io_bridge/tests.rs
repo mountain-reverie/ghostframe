@@ -3633,59 +3633,6 @@ async fn a_flood_of_inbound_still_lets_a_frame_through() {
     );
 }
 
-/// Regression test for the injected-path over-pop bug: `apply_injected_frame`
-/// must clamp its drain budget to what quinn can absorb, the same way
-/// `dispatch_dirty_tiles_via_scheduler` clamps its AIMD budget (see the
-/// `:145-152` module history and `clamp_to_quinn_capacity`'s doc comment).
-///
-/// This exercises the real `clamp_to_quinn_capacity` method directly
-/// rather than through `apply_injected_frame`/`drain_injection_for_test`:
-/// that call site sits behind `compute_max_datagram_size()`, which only
-/// returns `Some` once a real, post-handshake `quinn_proto::Connection`
-/// exists — precisely the machinery the browserless harness (Task 15) is
-/// responsible for providing (see `injected_work_is_enqueued_and_drain_is_attempted`
-/// just below for the same constraint on the enqueue/drain path).
-/// Building a bespoke in-process QUIC+WebTransport handshake fixture
-/// here would be scope creep well beyond these three divergence fixes.
-///
-/// What this DOES prove: with zero connected sessions,
-/// `min_session_send_buffer_space()` — the only thing
-/// `clamp_to_quinn_capacity` consults — falls back to `usize::MAX`
-/// (documented, existing behavior), and the clamp still strictly bounds
-/// a `usize::MAX` caller-supplied budget rather than passing it through
-/// unchanged. If `clamp_to_quinn_capacity` ever degenerated into a no-op
-/// (e.g. someone "simplifies" away the `.min()`), this test catches it
-/// even though no live session is involved. It also guards the three-way
-/// merge of the (formerly triplicated) `quinn_cap` computation: any of
-/// the three call sites regressing back to its own inline copy would
-/// still pass here, but a real behavior change to the shared method
-/// would be caught by every one of its callers at once.
-#[tokio::test(start_paused = true)]
-async fn clamp_to_quinn_capacity_bounds_a_usize_max_request() {
-    let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
-    let server = QuicServer::new().expect("QuicServer::new");
-    let (_tx, rx) = mpsc::channel(8);
-    let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
-
-    // No connected sessions -> min_session_send_buffer_space() falls
-    // back to usize::MAX (see its doc comment).
-    let quinn_space = bridge.min_session_send_buffer_space();
-    assert_eq!(quinn_space, usize::MAX);
-
-    let clamped = bridge.clamp_to_quinn_capacity(usize::MAX);
-    assert!(
-        clamped < usize::MAX,
-        "clamp_to_quinn_capacity(usize::MAX) must strictly bound the \
-         request even in the no-sessions fallback case; got {clamped}, \
-         which means the harness's usize::MAX budget would reach \
-         drain_scheduler_into_quinn unclamped exactly like the \
-         historical bug at :145-152"
-    );
-    // Pin the exact formula: quinn_space scaled by the safety fraction.
-    let expected = ((quinn_space as f64) * QUINN_SEND_BUFFER_SAFETY_FRACTION) as usize;
-    assert_eq!(clamped, expected);
-}
-
 /// Regression test for the missing-dimensions divergence: a browserless
 /// client driven purely by injected scenes must still learn the
 /// canvas/tile-grid size, or every tile datagram it receives is for a
@@ -3698,10 +3645,9 @@ async fn clamp_to_quinn_capacity_bounds_a_usize_max_request() {
 /// `crate::tile::TILE_SIZE`. It does not drive `apply_injected_frame`
 /// itself: that call site sits behind `compute_max_datagram_size()`,
 /// which requires a live, post-handshake `quinn_proto::Connection` —
-/// Task 15's browserless-harness responsibility (see the doc comment on
-/// `clamp_to_quinn_capacity_bounds_a_usize_max_request` above for the same
-/// constraint). `last_emitted_dimensions` is the only place this is
-/// observable without one.
+/// Task 15's browserless-harness responsibility.
+/// `last_emitted_dimensions` is the only place this is observable without
+/// one.
 #[tokio::test(start_paused = true)]
 async fn injected_frame_dimensions_derive_from_the_fixed_grid() {
     let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
@@ -3731,64 +3677,17 @@ async fn injected_frame_dimensions_derive_from_the_fixed_grid() {
     );
 }
 
-/// Pins `scheduler_continuation_after_drain`'s arithmetic: a drain that
-/// didn't spend the whole clamped budget must leave a continuation
-/// behind carrying exactly the leftover.
-#[test]
-fn scheduler_continuation_after_drain_carries_the_remaining_budget() {
-    let cont = IoBridge::scheduler_continuation_after_drain(7, 123, 1200, 5000, 2000);
-    assert_eq!(
-        cont,
-        Some(SchedulerContinuation {
-            seq: 7,
-            timestamp_us: 123,
-            max_frag: 1200,
-            remaining_budget_bytes: 3000,
-        })
-    );
-}
-
-/// A drain that spent the entire clamped budget (or, defensively, more
-/// than it — `saturating_sub` must not wrap) must clear the
-/// continuation rather than leave a zero/garbage entry behind.
-#[test]
-fn scheduler_continuation_after_drain_clears_once_the_budget_is_spent() {
-    assert_eq!(
-        IoBridge::scheduler_continuation_after_drain(7, 123, 1200, 5000, 5000),
-        None
-    );
-    assert_eq!(
-        IoBridge::scheduler_continuation_after_drain(7, 123, 1200, 5000, 6000),
-        None,
-        "drained_bytes > budget_bytes must saturate, not wrap/panic"
-    );
-}
-
-/// Regression test for the stranded-continuation divergence: once
-/// Commit 1's clamp makes budget-limited injected drains the normal
-/// case rather than the exception, work that survives a clamped drain
-/// must resume on the next `Event::DatagramsUnblocked` instead of
-/// waiting for the *next injected frame* — which may never arrive once
-/// a scene has finished injecting.
+/// Work that an injected frame enqueued and a budget-limited pass did not
+/// reach must be sent by a later admission pass, not wait for the *next
+/// injected frame* -- which may never arrive once a scene has finished
+/// injecting. The pass is what `post_turn` runs after every turn, with the
+/// frame identity the last frame left behind.
 ///
-/// This drives the real, unmodified `resume_scheduler_continuation`
-/// consumer (`:1774`, wired from `Event::DatagramsUnblocked` at
-/// `:4139`) against a continuation shaped exactly like the one
-/// `emit_via_scheduler` now builds via `scheduler_continuation_after_drain`
-/// (pinned separately above) — proving the two ends are wired together
-/// correctly. It does not drive `apply_injected_frame`'s own
-/// continuation-setting call site directly: that sits behind
-/// `compute_max_datagram_size()`, which requires a live,
-/// post-handshake `quinn_proto::Connection` (Task 15's
-/// browserless-harness responsibility — see the doc comment on
-/// `clamp_to_quinn_capacity_bounds_a_usize_max_request` above for the
-/// same constraint). `resume_scheduler_continuation` itself has no such
-/// gate — it only consults `min_session_send_buffer_space()`, which
-/// gracefully falls back to `usize::MAX` with no sessions connected —
-/// so unlike the other two divergences, this half IS reachable without
-/// a live session.
+/// Drives the real `pump_admission` against work queued directly. No live
+/// session is needed: with none, the gate has no queue to read and the
+/// bucket alone governs.
 #[tokio::test(start_paused = true)]
-async fn resume_scheduler_continuation_drains_stranded_injected_work() {
+async fn an_admission_pass_drains_stranded_injected_work() {
     use crate::transport::protocol::Codec;
     use crate::transport::scheduler::{TileWork, WorkState};
 
@@ -3798,7 +3697,7 @@ async fn resume_scheduler_continuation_drains_stranded_injected_work() {
     let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
 
     // Queue work directly, simulating tile work an injected frame
-    // enqueued but a budget-limited drain did not reach.
+    // enqueued but a budget-limited pass did not reach.
     for (tile_x, tile_y) in [(0u8, 0u8), (1, 0)] {
         bridge.scheduler.enqueue(TileWork {
             tile_x,
@@ -3819,27 +3718,24 @@ async fn resume_scheduler_continuation_drains_stranded_injected_work() {
         "both tiles queued"
     );
 
-    // A continuation shaped exactly like the one apply_injected_frame's
-    // Commit 3 code builds: plenty of remaining budget, as if the prior
-    // drain had been clamped to 0 bytes.
-    bridge.scheduler_continuation =
-        IoBridge::scheduler_continuation_after_drain(7, 123, 1200, 1_000_000, 0);
-    assert!(
-        bridge.scheduler_continuation.is_some(),
-        "a fully-unconsumed budget must leave a continuation behind"
-    );
+    // Before any frame has left its identity the pass has nothing to tag the
+    // work with, and sends none.
+    bridge.pump_admission();
+    for (_, _, state) in bridge.scheduler.queue_states_for_test() {
+        assert_eq!(state, WorkState::Pending);
+    }
 
-    bridge.resume_scheduler_continuation();
+    bridge.last_drain_frame_context = Some(DrainFrameContext {
+        seq: 7,
+        timestamp_us: 123,
+        max_frag: 1200,
+    });
+    bridge.pump_admission();
 
     // `drain_priority_queue` marks popped work `InFlight` and retains it
-    // in the queue (for potential RTO retry) rather than removing it —
+    // in the queue (for potential RTO retry) rather than removing it --
     // so "drained" is observed as a state transition, not queue
-    // shrinkage. Both tiles must have flipped from `Pending` to
-    // `InFlight`, proving `scheduler.tick` actually ran inside
-    // `resume_scheduler_continuation`'s call to
-    // `drain_scheduler_into_quinn` -- no live session needed, since
-    // `min_session_send_buffer_space()` falls back to `usize::MAX` with
-    // none connected.
+    // shrinkage.
     let states = bridge.scheduler.queue_states_for_test();
     assert_eq!(states.len(), 2, "both tiles remain in the priority queue");
     for (tile_x, tile_y, state) in &states {
@@ -5784,8 +5680,28 @@ async fn a_late_ack_after_the_flush_is_counted_apart_from_one_before_it() {
 async fn a_forgotten_session_does_not_leak_its_mirror_into_a_reused_handle() {
     let h = ConnectionHandle(7);
     let mut bridge = test_bridge_with_sessions(&[h]).await;
-    bridge.note_enqueued(h, WireClass::Critical, 100, 2, 102, 102);
-    bridge.note_enqueued(h, WireClass::Critical, 100, 2, 204, 204);
+    bridge.note_enqueued(
+        h,
+        Enqueued {
+            class: WireClass::Critical,
+            gated: true,
+            dg_len: 100,
+            framing_len: 2,
+            cum_enqueued: 102,
+            queued: 102,
+        },
+    );
+    bridge.note_enqueued(
+        h,
+        Enqueued {
+            class: WireClass::Critical,
+            gated: true,
+            dg_len: 100,
+            framing_len: 2,
+            cum_enqueued: 204,
+            queued: 204,
+        },
+    );
     assert_eq!(bridge.instr.mirror.len(), 2);
     assert_eq!(bridge.instr.offered.total(), 204);
 
@@ -5795,7 +5711,17 @@ async fn a_forgotten_session_does_not_leak_its_mirror_into_a_reused_handle() {
     assert_eq!(bridge.instr.mirror_handle(), None);
 
     // The same handle, a new connection whose counter starts again.
-    bridge.note_enqueued(h, WireClass::Critical, 100, 2, 102, 102);
+    bridge.note_enqueued(
+        h,
+        Enqueued {
+            class: WireClass::Critical,
+            gated: true,
+            dg_len: 100,
+            framing_len: 2,
+            cum_enqueued: 102,
+            queued: 102,
+        },
+    );
     assert_eq!(
         bridge.instr.mirror.len(),
         1,

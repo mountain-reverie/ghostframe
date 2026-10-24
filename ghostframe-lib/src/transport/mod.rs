@@ -19,8 +19,8 @@ pub mod quic;
 /// without the server. Re-exported at the old path so in-crate callers and
 /// the C API keep working.
 pub use ghostframe_tsnet as ghostbridge;
+pub(crate) mod admission;
 pub mod reliable_emitter;
-pub(crate) mod retransmit_pacer;
 pub mod scheduler;
 pub mod transmission_ledger;
 pub mod webtransport;

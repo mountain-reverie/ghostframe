@@ -10,7 +10,8 @@
 
 use super::{IoBridge, WireClass};
 use crate::transport::instruments::{
-    BudgetBinding, DepartureMirror, EcnObservation, FifoSeries, InstrumentSummary, OfferedBytes,
+    AdmissionCounters, BudgetBinding, DepartureMirror, EcnObservation, FifoSeries,
+    InstrumentSummary, OfferedBytes,
 };
 use quinn_proto::ConnectionHandle;
 
@@ -44,6 +45,23 @@ pub struct TransportProbe {
     pub instr: InstrumentSummary,
 }
 
+/// A datagram quinn just accepted, as `note_enqueued` is told of it.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Enqueued {
+    pub(super) class: WireClass,
+    /// It passed the admission gate (and was charged to the bucket before
+    /// it got here) rather than bypassing it.
+    pub(super) gated: bool,
+    /// The datagram as handed to the WebTransport layer.
+    pub(super) dg_len: usize,
+    /// What that layer added.
+    pub(super) framing_len: usize,
+    /// The session's cumulative accepted bytes including this one.
+    pub(super) cum_enqueued: u64,
+    /// quinn's queued bytes after it.
+    pub(super) queued: u64,
+}
+
 /// The mutable state behind [`InstrumentSummary`]. Measurement only: nothing
 /// in the bridge reads any field of this to decide anything.
 ///
@@ -63,6 +81,7 @@ pub(super) struct Instruments {
     /// Largest FIFO depth seen right after a datagram was accepted.
     pub(super) fifo_peak_at_enqueue: u64,
     pub(super) budget: BudgetBinding,
+    pub(super) admission: AdmissionCounters,
     pub(super) ecn: EcnObservation,
     /// Session counter and queue depth at the last post-drain reading.
     quinn_bytes_enqueued: u64,
@@ -141,20 +160,33 @@ impl IoBridge {
 
     /// Note a datagram quinn just accepted: bill its class and wire bytes,
     /// put it in the departure mirror and track the FIFO's peak depth.
-    ///
-    /// `dg_len` is the datagram as handed to the WebTransport layer;
-    /// `framing_len` is what that layer added. `cum_enqueued` is the session's
-    /// cumulative accepted bytes including this one, `queued` quinn's queued
-    /// bytes after it.
-    pub(super) fn note_enqueued(
-        &mut self,
-        handle: ConnectionHandle,
-        class: WireClass,
-        dg_len: usize,
-        framing_len: usize,
-        cum_enqueued: u64,
-        queued: u64,
-    ) {
+    pub(super) fn note_enqueued(&mut self, handle: ConnectionHandle, e: Enqueued) {
+        let Enqueued {
+            class,
+            gated,
+            dg_len,
+            framing_len,
+            cum_enqueued,
+            queued,
+        } = e;
+        let wire = dg_len + framing_len;
+        if gated {
+            // Read off quinn's own queue, not the gate's bookkeeping: a
+            // datagram accepted while the FIFO already stood at `D_target`
+            // means something bypassed the gate.
+            if let Some(g) = self.gate {
+                if queued.saturating_sub(wire as u64) >= g.d_target as u64 {
+                    self.instr.admission.depth_violations += 1;
+                }
+            }
+            self.instr.admission.datagrams_admitted += 1;
+        } else {
+            // H.264 frames and control datagrams have no queue to hold them
+            // back, so they are billed to the bucket after the fact and the
+            // classes that can wait pay for them.
+            self.admission.charge(wire);
+            self.instr.admission.soft_charged_bytes += wire as u64;
+        }
         let i = &mut self.instr;
         i.offered.bill(class, dg_len, framing_len);
         i.fifo_peak_at_enqueue = i.fifo_peak_at_enqueue.max(queued);
@@ -215,6 +247,7 @@ impl IoBridge {
             mirror_len: i.mirror.len() as u64,
             mirror_overflowed: i.mirror.overflowed,
             budget: i.budget,
+            admission: i.admission,
             ledger_losses_declared: i.losses_declared,
             ledger_losses_flushed: i.losses_flushed,
             ledger_losses_overflowed: i.losses_overflowed,
