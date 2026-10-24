@@ -99,7 +99,7 @@ pub(super) struct Instruments {
     /// Capacity-hint feeds, and how many came before any feedback.
     pub(super) hint_feeds: u64,
     pub(super) hint_feeds_before_feedback: u64,
-    pub(super) hint_withdrawals: u64,
+    pub(super) hint_unbounded: u64,
 }
 
 impl Instruments {
@@ -146,7 +146,10 @@ impl IoBridge {
     /// as departed, so this runs ahead of every departure poll as well as at
     /// the end of the turn.
     pub(super) fn record_emitted_transmissions(&mut self, now: std::time::Instant) {
+        let mut recorded = false;
         for e in self.reliable_emitter.take_transmissions() {
+            self.offered_wire_bytes += e.wire_bytes as f64;
+            recorded = true;
             self.transmission_ledger.record(
                 e.wire_seq,
                 now,
@@ -157,6 +160,9 @@ impl IoBridge {
                     depart_us: None,
                 },
             );
+        }
+        if recorded {
+            self.bwe.note_offered(now, self.offered_wire_bytes);
         }
     }
 
@@ -371,7 +377,7 @@ impl IoBridge {
             rto_fired_superseded: self.reliable_emitter.stats.rto_fired_superseded,
             hint_feeds: i.hint_feeds,
             hint_feeds_before_feedback: i.hint_feeds_before_feedback,
-            hint_withdrawals: i.hint_withdrawals,
+            hint_unbounded: i.hint_unbounded,
             bwe: self.bwe.snapshot().stats,
         }
     }

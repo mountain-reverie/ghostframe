@@ -369,7 +369,7 @@ impl FlushedLosses {
 /// Which input set the admission rate `R`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetTerm {
-    /// The `0.9 x cwnd / srtt` bandwidth term.
+    /// The `cwnd / srtt` bandwidth term.
     Cwnd,
     /// goog_cc's pacer rate was the smaller of the two.
     Pacer,
@@ -615,8 +615,9 @@ pub struct InstrumentSummary {
     /// the startup probe ladder; before the first feedback it is a reading of
     /// a window nothing has used yet.
     pub hint_feeds_before_feedback: u64,
-    /// Times a hint that no longer described a busy path was withdrawn.
-    pub hint_withdrawals: u64,
+    /// Times the estimator was told the capacity is bounded only by its
+    /// configured maximum, because no reading described a busy path.
+    pub hint_unbounded: u64,
     /// The estimator wrapper's own counters.
     pub bwe: crate::transport::bwe::BweStats,
 }
