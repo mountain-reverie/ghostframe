@@ -413,7 +413,11 @@ fn impaired_scene() -> BrowserlessScene {
         delay_us: 20_000,
         jitter_us: 4_000,
         reorder_us: 3_000,
-        loss: 0.02,
+        // 5 %, not 2 %: with the estimate binding the admission rate nothing
+        // queues on this path, the retransmission timer no longer fires on
+        // queueing delay, and at 2 % every drop of the 4 s was repaired by
+        // parity (`retransmit_attempts_total` was 0 against 32 before).
+        loss: 0.05,
         duplicate: 0.01,
         corrupt: 0.005,
         ..NetProfile::perfect()
