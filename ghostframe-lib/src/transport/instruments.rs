@@ -446,94 +446,118 @@ impl FlushedLosses {
 }
 
 // ---------------------------------------------------------------------------
-// Budget-binding term
+// Admission: which rate, and what stopped it
 // ---------------------------------------------------------------------------
 
-/// Which input set the scheduler's per-tick budget.
+/// Which input set the admission rate `R`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetTerm {
-    /// The `cwnd / srtt` bandwidth term.
+    /// The `0.9 x cwnd / srtt` bandwidth term.
     Cwnd,
     /// goog_cc's pacer rate was the smaller of the two.
     Pacer,
-    /// The AIMD multiplier (`tick_budget_multiplier` < 1, backed off by send
-    /// errors) cut the budget below the unscaled base.
-    Aimd,
-    /// The one-datagram floor beat the bandwidth term.
+    /// The one-datagram-per-tick floor beat the bandwidth term.
     Floor,
-    /// A probe window's target exceeded the paced budget.
+    /// A probe window's target exceeded the paced rate.
     Probe,
 }
 
-/// Ticks counted by binding term, plus how many were then cut by quinn's
-/// send-buffer clamp (a separate, later stage; the clamp can bind on top of
-/// any of the four).
+/// Admission passes ("pumps") counted twice over: by the term that set the
+/// rate, and, for the passes that ended with work still waiting, by what held
+/// the rest back.
+///
+/// The second family is the question the per-tick budget could not answer.
+/// `gate_depth` says quinn's FIFO already held `D_target` (the rate is not
+/// the limit: quinn is); `gate_tokens` says the bucket was empty (the rate
+/// is); `gate_rejected` says quinn refused a datagram outright (its buffer is
+/// full, which the gate exists to make impossible).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetBinding {
     pub cwnd: u64,
     pub pacer: u64,
     pub floor: u64,
     pub probe: u64,
-    pub aimd: u64,
-    pub sendbuf_clamped: u64,
-    /// Ticks where retransmission replayed since the last tick was
-    /// subtracted from the budget (`RETRANSMIT_BUDGET_SHARE` give-back), and
-    /// the bytes subtracted.
-    pub giveback_ticks: u64,
-    pub giveback_bytes: u64,
+    /// Passes that ended with work waiting because the FIFO stood at `D_target`.
+    pub gate_depth: u64,
+    /// Passes that ended with work waiting because the bucket was empty.
+    pub gate_tokens: u64,
+    /// Passes that ended because quinn refused a datagram.
+    pub gate_rejected: u64,
 }
 
 impl BudgetBinding {
-    pub fn note(&mut self, term: BudgetTerm, clamped: bool, give_back: usize) {
-        if give_back > 0 {
-            self.giveback_ticks += 1;
-            self.giveback_bytes += give_back as u64;
-        }
+    pub fn note_rate(&mut self, term: BudgetTerm) {
         match term {
-            BudgetTerm::Aimd => self.aimd += 1,
             BudgetTerm::Cwnd => self.cwnd += 1,
             BudgetTerm::Pacer => self.pacer += 1,
             BudgetTerm::Floor => self.floor += 1,
             BudgetTerm::Probe => self.probe += 1,
         }
-        if clamped {
-            self.sendbuf_clamped += 1;
-        }
     }
 
+    /// Passes counted, by rate term.
     pub fn ticks(&self) -> u64 {
-        self.cwnd + self.pacer + self.floor + self.probe + self.aimd
+        self.cwnd + self.pacer + self.floor + self.probe
     }
 }
 
-/// Classify a tick. Pure; the arguments are values the caller already
-/// computed to make its decision.
+/// Classify an admission pass by the term that set its rate. Pure; the
+/// arguments are values the caller already computed.
 ///
-/// - `probe_binds`: a probe window was open and its budget beat the paced one.
-/// - `pacer_budget`: the pacer's per-tick bytes when the pacer is trusted.
-/// - `aimd_budget`: the budget before the pacer min, i.e. the unscaled base
-///   times the AIMD multiplier.
-/// - `unscaled_base`: `base_budget_bytes()` before the multiplier.
-/// - `cwnd_term` / `floor`: the two operands of `base_budget_bytes`'s `max`.
-pub fn classify_budget_term(
+/// - `probe_binds`: a probe window was open and its rate beat the paced one.
+/// - `pacer_rate`: goog_cc's pacer rate when it is trusted, bytes/s.
+/// - `bandwidth_rate` / `floor_rate`: the two operands of the base rate's
+///   `max`, bytes/s.
+pub fn classify_rate_term(
     probe_binds: bool,
-    pacer_budget: Option<usize>,
-    aimd_budget: usize,
-    unscaled_base: usize,
-    cwnd_term: usize,
-    floor: usize,
+    pacer_rate: Option<f64>,
+    bandwidth_rate: f64,
+    floor_rate: f64,
 ) -> BudgetTerm {
+    let base = bandwidth_rate.max(floor_rate);
     if probe_binds {
         BudgetTerm::Probe
-    } else if pacer_budget.is_some_and(|p| p < aimd_budget) {
+    } else if pacer_rate.is_some_and(|p| p < base) {
         BudgetTerm::Pacer
-    } else if aimd_budget < unscaled_base {
-        BudgetTerm::Aimd
-    } else if cwnd_term <= floor {
+    } else if bandwidth_rate <= floor_rate {
         BudgetTerm::Floor
     } else {
         BudgetTerm::Cwnd
     }
+}
+
+/// What the admission gate did, in numbers a scene can hold it to.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionCounters {
+    /// Admission passes run.
+    pub pumps: u64,
+    /// Datagrams of the gated classes handed to quinn and accepted.
+    pub datagrams_admitted: u64,
+    /// Largest `D_target` any pass used, bytes. The bound the FIFO is held to
+    /// is this plus one datagram.
+    pub d_target_max: u64,
+    /// `D_target` at the last pass.
+    pub d_target_last: u64,
+    /// One datagram on the wire, framing included, as the last pass sized
+    /// the gate: the "plus one datagram" the FIFO bound allows.
+    pub mtu: u64,
+    /// Datagrams of the gated classes accepted by quinn while its FIFO
+    /// already held `D_target` or more. Zero by construction: the check
+    /// precedes every send. Counted at the send, from quinn's own reading,
+    /// not from the gate's, so a gate that is bypassed shows here.
+    pub depth_violations: u64,
+    /// Turns that ended with work admission could have sent: the scheduler
+    /// or the retransmit queue had some, and the bucket held a datagram.
+    pub backlog_turns: u64,
+    /// Of those, turns that ended with quinn's FIFO empty: quinn was idle
+    /// while admission held work and the tokens to send it. Zero when the
+    /// FIFO is refilled after every drain.
+    pub starved_turns: u64,
+    /// Wire bytes charged to the bucket by the gate (every gated datagram,
+    /// parity included).
+    pub charged_bytes: u64,
+    /// Wire bytes charged without being asked (H.264 frames).
+    pub soft_charged_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +641,7 @@ pub struct InstrumentSummary {
     pub mirror_len: u64,
     pub mirror_overflowed: u64,
     pub budget: BudgetBinding,
+    pub admission: AdmissionCounters,
     /// Ledger losses (declared lost, reported to goog_cc or retracted).
     pub ledger_losses_declared: u64,
     /// Of those, handed to goog_cc.
@@ -782,23 +807,30 @@ mod tests {
     #[test]
     fn classify_prefers_probe_then_pacer_then_floor() {
         use BudgetTerm::*;
-        assert_eq!(
-            classify_budget_term(true, Some(1), 100, 100, 100, 10),
-            Probe
-        );
-        assert_eq!(
-            classify_budget_term(false, Some(50), 100, 100, 100, 10),
-            Pacer
-        );
-        assert_eq!(
-            classify_budget_term(false, Some(150), 100, 100, 100, 10),
-            Cwnd
-        );
-        // The multiplier cut a base that the bandwidth term had set.
-        assert_eq!(classify_budget_term(false, None, 50, 100, 100, 10), Aimd);
-        // Floor wins when the unscaled base is the floor.
-        assert_eq!(classify_budget_term(false, None, 10, 10, 5, 10), Floor);
-        assert_eq!(classify_budget_term(false, None, 100, 100, 100, 10), Cwnd);
+        assert_eq!(classify_rate_term(true, Some(1.0), 100.0, 10.0), Probe);
+        assert_eq!(classify_rate_term(false, Some(50.0), 100.0, 10.0), Pacer);
+        assert_eq!(classify_rate_term(false, Some(150.0), 100.0, 10.0), Cwnd);
+        // The floor wins when the bandwidth term is below it...
+        assert_eq!(classify_rate_term(false, None, 5.0, 10.0), Floor);
+        assert_eq!(classify_rate_term(false, None, 100.0, 10.0), Cwnd);
+        // ...and a pacer below the floor still counts as the pacer.
+        assert_eq!(classify_rate_term(false, Some(4.0), 5.0, 10.0), Pacer);
+    }
+
+    #[test]
+    fn every_pass_lands_in_exactly_one_rate_term() {
+        let mut b = BudgetBinding::default();
+        for t in [
+            BudgetTerm::Cwnd,
+            BudgetTerm::Pacer,
+            BudgetTerm::Floor,
+            BudgetTerm::Probe,
+            BudgetTerm::Cwnd,
+        ] {
+            b.note_rate(t);
+        }
+        assert_eq!(b.ticks(), 5);
+        assert_eq!((b.cwnd, b.pacer, b.floor, b.probe), (2, 1, 1, 1));
     }
 
     #[test]

@@ -221,6 +221,16 @@ pub(crate) fn count_from_source(remotes: impl Iterator<Item = SocketAddr>, ip: I
 /// that path clamped first; until then the large buffer is the safer
 /// behaviour, and this stays a knob rather than a regression.
 ///
+/// # Since admission (D1 F1)
+///
+/// The clamp and `RTO_RETRANSMITS_PER_TICK` above are gone. Every datagram,
+/// retransmissions and parity included, is billed to one bucket and admitted
+/// only while quinn's queue holds less than about 10 ms of the sending rate
+/// (`transport::admission`), so the queue stays far below this size and the
+/// unclamped retransmit path this paragraph blamed no longer exists. The
+/// size is now only an overflow guard; shrinking it to a few MB is the next
+/// step (D1 Q3), and a `Blocked` is a bug signal.
+///
 /// `GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES` overrides it, so the experiment
 /// above can be repeated without a rebuild.
 fn datagram_send_buffer_bytes() -> usize {
