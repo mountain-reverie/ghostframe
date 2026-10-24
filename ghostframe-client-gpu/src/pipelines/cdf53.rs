@@ -72,9 +72,12 @@ const WORK_AREA_STRIDE: u64 = 12288;
 const MAX_PASSES_PER_TILE: u64 = 14;
 
 /// One arrived Cdf53 pass: (tile_x, tile_y, generation, pass_idx,
-/// bit_planes, present_passes). `bit_planes` is exactly 384 bytes;
-/// `present_passes` is `Some` only on pass 0.
-pub type Cdf53PassEntry = (u8, u8, u8, u8, Vec<u8>, Option<u16>);
+/// bit_planes, present_passes, frame_seq). `bit_planes` is exactly 384 bytes;
+/// `present_passes` is `Some` only on pass 0. `frame_seq` is the datagram's
+/// label, fixed per tile generation by the server: with `generation` it
+/// identifies the generation, since the 4-bit number wraps and a tile that
+/// spent a run of generations in another codec returns on one it used.
+pub type Cdf53PassEntry = (u8, u8, u8, u8, Vec<u8>, Option<u16>, u32);
 
 /// `dirty_tiles` is never read back by field name after `resize` builds the
 /// cached bind groups from it -- it is held here only so the buffer
@@ -104,6 +107,8 @@ struct PersistentBuffers {
 #[derive(Clone, Copy, Default)]
 struct TileTrack {
     last_seen_gen: u32,
+    /// Label of the generation `last_seen_gen` names.
+    last_seen_seq: u32,
     received_mask: u16,
     present_passes: u16,
     passes_processed: u32,
@@ -439,7 +444,7 @@ impl Cdf53Pipeline {
         let sign_zero = vec![0u8; SIGN_STRIDE as usize];
         let mut cleared_tiles: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
-        for (i, (tile_x, tile_y, generation, pass_idx, bit_planes, present_passes)) in
+        for (i, (tile_x, tile_y, generation, pass_idx, bit_planes, present_passes, frame_seq)) in
             tiles.iter().enumerate()
         {
             debug_assert_eq!(
@@ -454,7 +459,9 @@ impl Cdf53Pipeline {
                 self.dirty.push(tile_idx);
             }
 
-            if track.last_seen_gen != *generation as u32 && cleared_tiles.insert(tile_idx) {
+            if (track.last_seen_gen != *generation as u32 || track.last_seen_seq != *frame_seq)
+                && cleared_tiles.insert(tile_idx)
+            {
                 queue.write_buffer(
                     &buffers.coefficient,
                     tile_idx as u64 * COEFFICIENT_STRIDE,
@@ -468,6 +475,7 @@ impl Cdf53Pipeline {
                 track.present_passes = 0;
                 track.received_mask = 0;
                 track.last_seen_gen = *generation as u32;
+                track.last_seen_seq = *frame_seq;
             }
 
             track.received_mask |= 1u16 << pass_idx;

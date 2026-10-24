@@ -345,6 +345,7 @@ impl Renderer {
                             pass_idx,
                             bit_planes,
                             present_passes,
+                            frame_seq,
                         ));
                     }
                 }

@@ -56,7 +56,7 @@ fn entries(tile: (u8, u8), gen: u8, seed: u32, keep: impl Fn(u8) -> bool) -> Vec
     passes(seed)
         .into_iter()
         .filter(|(p, _, _)| keep(*p))
-        .map(|(p, bp, pp)| (tile.0, tile.1, gen, p, bp, pp))
+        .map(|(p, bp, pp)| (tile.0, tile.1, gen, p, bp, pp, 0))
         .collect()
 }
 
@@ -233,6 +233,28 @@ fn tile_repainted_by_another_codec_is_no_longer_resurrected() {
     );
 }
 
+/// A tile returns to CDF 5/3 on the 4-bit generation it already holds, with a
+/// newer label: new content. The coefficients of the old must not survive
+/// into it. (Not run in the PR that added it: no GPU was used.)
+#[test]
+fn a_new_label_under_the_same_generation_replaces_the_content() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut rig = Rig::new(&ctx, false);
+    let at = |seed: u32, seq: u32| -> Vec<Cdf53PassEntry> {
+        entries((2, 2), 1, seed, |_| true)
+            .into_iter()
+            .map(|mut e| {
+                e.6 = seq;
+                e
+            })
+            .collect()
+    };
+    let old = rig.batch(&ctx, &at(50, 100));
+    assert_eq!(tile_pixels(&old, 2, 2), expected_rgba(50));
+    let new = rig.batch(&ctx, &at(51, 200));
+    assert_eq!(tile_pixels(&new, 2, 2), expected_rgba(51));
+}
+
 /// A later batch that refines a tile re-inverts it from ALL passes seen so
 /// far (persistent coefficient state), not just that batch's.
 #[test]
@@ -262,7 +284,7 @@ fn inverse_cost_4096_tiles() {
     let p0 = passes(10).into_iter().next().unwrap();
     let all: Vec<Cdf53PassEntry> = (0..rows)
         .flat_map(|y| (0..cols).map(move |x| (x, y)))
-        .map(|(x, y)| (x as u8, y as u8, 1, p0.0, p0.1.clone(), p0.2))
+        .map(|(x, y)| (x as u8, y as u8, 1, p0.0, p0.1.clone(), p0.2, 0))
         .collect();
     let wait = || {
         ctx.device

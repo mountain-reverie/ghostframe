@@ -12,6 +12,11 @@ export interface PrevalidatedCdf53 {
   tileX: number;
   tileY: number;
   gen: number;     // 0..15
+  /** The datagram's `frame_seq`: fixed per tile generation by the server and
+   *  larger for every later one, so it tells apart two generations that share
+   *  the 4-bit `gen`. The core has already dropped stale arrivals; a change
+   *  of label under an unchanged `gen` is new content. Absent: treated as 0. */
+  frameSeq?: number;
   passIdx: number; // 0..13
   bitPlanes: Uint8Array; // 384 = 128 × 3 (B, G, R)
   /** `present_passes` bitmap, non-null only on pass 0. See
@@ -113,6 +118,10 @@ export class Cdf53Pipeline {
   // intra-shader clear (which had a cross-workgroup race when multiple
   // passes for the same tile shared a single batch).
   private lastSeenGen: Uint32Array = new Uint32Array(0);
+  /** Label of the generation `lastSeenGen` names. Together they identify it:
+   *  the 4-bit generation wraps, and a tile that spent a run of generations in
+   *  another codec returns on a number it already used. */
+  private lastSeenSeq: Uint32Array = new Uint32Array(0);
   // Reusable zero buffers, sized at resize() to avoid per-clear allocation.
   private coefZeroPerTile = new Uint8Array(0);
   private signZeroPerTile = new Uint8Array(0);
@@ -296,6 +305,7 @@ export class Cdf53Pipeline {
       return;
     }
     this.lastSeenGen = new Uint32Array(maxTiles);
+    this.lastSeenSeq = new Uint32Array(maxTiles);
     this.coefZeroPerTile = new Uint8Array(6144);
     this.signZeroPerTile = new Uint8Array(384);
     // Destroy old buffers if any.
@@ -431,6 +441,7 @@ export class Cdf53Pipeline {
     this.device.queue.writeBuffer(this.tileGenBuffer, 0, genZeros);
     this.device.queue.writeBuffer(this.passesProcessedBuffer, 0, passesZeros);
     this.lastSeenGen.fill(0);
+    this.lastSeenSeq.fill(0);
     this.passesProcessedCpu.fill(0);
     this.presentPassesCpu.fill(0);
     this.receivedMaskCpu.fill(0);
@@ -513,7 +524,11 @@ export class Cdf53Pipeline {
     for (let i = 0; i < entries.length; i++) {
       const e = entries[i];
       const tileIdx = e.tileY * this.cols + e.tileX;
-      if (this.lastSeenGen[tileIdx] !== e.gen && !clearedTiles.has(tileIdx)) {
+      const seq = (e.frameSeq ?? 0) >>> 0;
+      if (
+        (this.lastSeenGen[tileIdx] !== e.gen || this.lastSeenSeq[tileIdx] !== seq) &&
+        !clearedTiles.has(tileIdx)
+      ) {
         this.device.queue.writeBuffer(this.coefficientBuffer, tileIdx * 6144, this.coefZeroPerTile);
         this.device.queue.writeBuffer(this.signBuffer, tileIdx * 384, this.signZeroPerTile);
         // Gen bump also resets pass-count tracking for the tile. The
@@ -523,6 +538,7 @@ export class Cdf53Pipeline {
         this.presentPassesCpu[tileIdx] = 0;
         this.receivedMaskCpu[tileIdx] = 0;
         this.lastSeenGen[tileIdx] = e.gen;
+        this.lastSeenSeq[tileIdx] = seq;
         clearedTiles.add(tileIdx);
       }
       // Track which passes have landed, and the tile's present set once
