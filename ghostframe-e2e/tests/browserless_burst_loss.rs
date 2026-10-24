@@ -354,9 +354,12 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
         // (0 / 0, and 0 in the other two seeds). The mechanism itself is pinned
         // by the lib tests `a_late_ack_retracts_the_pending_loss_it_contradicts`
         // and `a_late_ack_after_the_flush_is_counted_apart_from_one_before_it`.
+        // The 95th percentile, not the median: with the estimate binding the
+        // admission rate the FIFO is empty at the median (p50 7-16 ms before,
+        // 0-3 ms now) and the gate's queue shows only in the tail.
         assert!(
-            i.lag_p50_us > 1_000,
-            "{n}: a standing queue shows in the lag"
+            i.lag_p95_us > 1_000,
+            "{n}: the FIFO never queued: the lag histogram saw no standing queue"
         );
     }
 }
@@ -583,7 +586,11 @@ async fn the_budget_floor_term_is_counted_when_it_binds() {
 /// is pinned by `a_scheduler_retry_is_labelled_apart_from_a_first_send`.
 #[tokio::test(start_paused = true)]
 async fn a_send_buffer_smaller_than_the_unbounded_queue_is_never_asked_to_block() {
-    const BUFFER: usize = 32 * 1024;
+    // 64 KiB: still 30 to 80 times under the 2-5 MB the old path queued. It
+    // was 32 KiB while `D_target` stayed under it; with the
+    // admission rate no longer held to 0.9 x cwnd / srtt, `D_target` (10 ms of
+    // the rate) reaches 38 kB on this uncapped link.
+    const BUFFER: usize = 64 * 1024;
     let mut sc = scene(0xB0_B057, 6);
     sc.datagram_send_buffer_bytes = Some(BUFFER);
     let r = run_browserless_with_links(sc, LinkOverrides::default())
