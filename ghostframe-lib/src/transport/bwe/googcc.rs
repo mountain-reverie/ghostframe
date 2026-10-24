@@ -27,8 +27,10 @@ const MIN_BPS: i64 = 200_000;
 const MAX_BPS: i64 = 200_000_000;
 
 /// How far the estimate may sit from the ceiling before goog_cc is told to
-/// move: under `PROBE_UNCERTAINTY` (5 %, goog_cc's own margin for how well a
-/// probe result is known) there is nothing to say.
+/// move. Empirical: a hysteresis against re-seeding on the rounding of the
+/// windowed rate (one acknowledgement batch moves it by a few percent), kept
+/// under goog_cc's `PROBE_UNCERTAINTY` (5 %), the margin to which one of its
+/// probe results is known.
 const FOLLOW_TOLERANCE: f64 = 0.02;
 
 /// `AIMD_BACKOFF` as a float for the delivery test.
