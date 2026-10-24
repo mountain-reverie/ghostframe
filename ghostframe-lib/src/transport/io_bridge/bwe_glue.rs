@@ -57,7 +57,9 @@ pub(super) fn select_live_rtt(
 /// is taken per loop iteration, so the window was a count of wakeups, not a
 /// span of time: whether it was full when the first probe ladder was issued
 /// depended on how many wakeups the handshake had cost, and the hybrid
-/// post-quantum handshake lost that race in 19 of 20 startup cells.
+/// post-quantum handshake lost that race in 19 of 20 startup cells in the
+/// 2026-10-11 findings (2 of 24 on the base of this change, after admission and
+/// the departure tracker had changed the turn count; 0 of 24 now).
 ///
 /// Four round trips span several windows of feedback and the swing of a
 /// Cubic cycle's growth step; the floor keeps it from shrinking below the
