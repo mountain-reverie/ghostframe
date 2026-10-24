@@ -53,6 +53,10 @@ pub struct ReliableTileEmitter {
     /// Membership of `pending_nacks`, so a request repeated while the first
     /// is still waiting does not become a second retransmission.
     pending_nack_set: HashSet<EmitKey>,
+    /// Wire bytes each datagram costs beyond its own length (the
+    /// WebTransport framing), added to what `tick_budgeted` bills. Zero
+    /// unless the transport sets it.
+    wire_overhead: usize,
     pub stats: EmitterStats,
 }
 
@@ -171,8 +175,32 @@ impl ReliableTileEmitter {
             transmissions: Vec::new(),
             pending_nacks: VecDeque::new(),
             pending_nack_set: HashSet::new(),
+            wire_overhead: 0,
             stats: EmitterStats::default(),
         }
+    }
+
+    /// Bill `bytes` more than each retransmitted datagram's length against
+    /// `tick_budgeted`'s byte bound: the framing the transport adds.
+    pub fn set_wire_overhead(&mut self, bytes: usize) {
+        self.wire_overhead = bytes;
+    }
+
+    /// Datagrams built (wire_seq allocated, cached, timer started) and not
+    /// yet handed to the transport.
+    pub fn emission_queue_len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Retransmissions the client asked for that are waiting for budget.
+    pub fn pending_nack_count(&self) -> usize {
+        self.pending_nacks.len()
+    }
+
+    /// Whether a retransmission timer is due at `now`. An upper bound: the
+    /// entry may since have left the cache.
+    pub fn has_due_rto(&self, now: Instant) -> bool {
+        self.rto.has_due(now)
     }
 
     /// Update the measured ACK-latency p95 that `rto_for_attempt` derives
@@ -458,9 +486,37 @@ impl ReliableTileEmitter {
         max_bytes: usize,
     ) -> usize {
         let mut count = 0;
+        let nacks = self.tick_nacks_budgeted(now, max_retransmits, max_bytes, &mut count);
+        let rto = self.tick_rto_budgeted(
+            now,
+            max_retransmits,
+            max_bytes.saturating_sub(nacks),
+            &mut count,
+        );
+        let spent = nacks + rto;
+        if spent >= max_bytes && (!self.pending_nacks.is_empty() || self.rto.has_due(now)) {
+            self.stats.retransmit_budget_deferrals += 1;
+        }
+        spent
+    }
+
+    /// The first half of [`Self::tick_budgeted`]: the retransmissions the
+    /// client asked for, oldest request first, until `max_bytes` is spent.
+    /// Returns the wire bytes queued. `count` carries the number of
+    /// retransmissions made so far against `max_retransmits`.
+    ///
+    /// Its own method so the admission pass can serve NACK repair ahead of
+    /// every other class and the timer's retransmissions after it.
+    pub fn tick_nacks_budgeted(
+        &mut self,
+        now: Instant,
+        max_retransmits: usize,
+        max_bytes: usize,
+        count: &mut usize,
+    ) -> usize {
         let mut spent = 0usize;
         let emit_us_now = self.emit_us64(now);
-        while count < max_retransmits && spent < max_bytes {
+        while *count < max_retransmits && spent < max_bytes {
             let Some(key) = self.pending_nacks.pop_front() else {
                 break;
             };
@@ -505,13 +561,27 @@ impl ReliableTileEmitter {
             if bytes.len() >= 12 {
                 self.feed_group(ws, bytes.clone());
             }
-            spent += bytes.len();
+            spent += bytes.len() + self.wire_overhead;
             self.queue.push_source(bytes, WireClass::NackRepair);
             self.stats.retransmit_attempts_total += 1;
             self.stats.retransmit_by_nack += 1;
-            count += 1;
+            *count += 1;
         }
-        while count < max_retransmits && spent < max_bytes {
+        spent
+    }
+
+    /// The second half of [`Self::tick_budgeted`]: the retransmissions whose
+    /// timer is due, until `max_bytes` is spent. Returns the wire bytes
+    /// queued. See [`Self::tick_nacks_budgeted`] for `count`.
+    pub fn tick_rto_budgeted(
+        &mut self,
+        now: Instant,
+        max_retransmits: usize,
+        max_bytes: usize,
+        count: &mut usize,
+    ) -> usize {
+        let mut spent = 0usize;
+        while *count < max_retransmits && spent < max_bytes {
             let Some(key) = self.rto.pop_due(now) else {
                 break;
             };
@@ -621,16 +691,13 @@ impl ReliableTileEmitter {
             if bytes.len() >= 12 {
                 self.feed_group(ws, bytes.clone());
             }
-            spent += bytes.len();
+            spent += bytes.len() + self.wire_overhead;
             self.queue.push_source(bytes, WireClass::RtoRetransmit);
             self.rto.schedule(key, now + new_rto);
             self.stats.rto_fired += 1;
             self.note_rto_fire(key, first_ws);
             self.stats.retransmit_attempts_total += 1;
-            count += 1;
-        }
-        if spent >= max_bytes && (!self.pending_nacks.is_empty() || self.rto.has_due(now)) {
-            self.stats.retransmit_budget_deferrals += 1;
+            *count += 1;
         }
         spent
     }
@@ -848,6 +915,13 @@ impl ReliableTileEmitter {
 
     /// Record the outcome of sending an emission from [`Self::next_emission`].
     /// Returns false when the caller must stop draining.
+    /// Put an emission the admission gate refused back at the head of the
+    /// queue. Unlike a refusal by the transport this is not a failed send:
+    /// nothing was attempted, so `send_rejected` does not move.
+    pub(crate) fn hold_emission(&mut self, emission: Emission) {
+        self.queue.push_front(emission);
+    }
+
     pub(crate) fn settle_emission(&mut self, emission: Emission, outcome: SendOutcome) -> bool {
         match outcome {
             SendOutcome::Sent => {
@@ -2011,6 +2085,69 @@ mod tests {
         e.drain(&mut sender, t0);
         assert_eq!(sender.sent.len(), 2, "and it is sent once budget allows");
         assert_eq!(spent, sender.sent[1].len(), "billed at its wire size");
+    }
+
+    /// The framing the transport adds is part of what a retransmission costs
+    /// on the wire, so the bound is in the unit the caller bills in.
+    #[test]
+    fn retransmissions_are_billed_with_the_transports_framing() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.set_wire_overhead(2);
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        e.on_nack(&[key], t0);
+        let spent = e.tick_budgeted(t0, usize::MAX, usize::MAX);
+        let mut sender = CollectSender::default();
+        e.drain(&mut sender, t0);
+        let retx = sender.sent.last().unwrap();
+        assert_eq!(spent, retx.len() + 2);
+    }
+
+    /// The two halves the admission pass serves in priority order are the
+    /// halves `tick_budgeted` is made of: NACK repair first, then the timer.
+    #[test]
+    fn the_nack_half_and_the_timer_half_are_what_tick_budgeted_does() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        let (k0, k1) = (EmitKey::new(1, 0, 0, 0), EmitKey::new(1, 1, 0, 0));
+        e.submit_one(k0, fake_source(1, 0, 0), t0, None, t0);
+        e.submit_one(k1, fake_source(2, 0, 0), t0, None, t0);
+        let late = t0 + Duration::from_secs(10);
+        e.on_nack(&[k0], late);
+        let mut n = 0;
+        let nacks = e.tick_nacks_budgeted(late, usize::MAX, usize::MAX, &mut n);
+        assert_eq!(
+            (n, e.stats.retransmit_by_nack, e.stats.rto_fired),
+            (1, 1, 0)
+        );
+        let rto = e.tick_rto_budgeted(late, usize::MAX, usize::MAX, &mut n);
+        assert_eq!(e.stats.rto_fired, 2, "both timers are due ten seconds on");
+        assert!(nacks > 0 && rto > 0);
+        // The count carries across, so one `max_retransmits` bounds both.
+        assert_eq!(n, 3);
+    }
+
+    /// An emission the admission gate holds back is not a failed send.
+    #[test]
+    fn a_held_emission_goes_back_to_the_head_without_counting_a_rejection() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.submit_one(EmitKey::new(1, 0, 0, 0), fake_source(1, 0, 0), t0, None, t0);
+        e.submit_one(EmitKey::new(1, 1, 0, 0), fake_source(2, 0, 0), t0, None, t0);
+        assert_eq!(e.emission_queue_len(), 2);
+        let first = e.next_emission(t0).unwrap();
+        let first_bytes = match &first {
+            Emission::Source(b, _) => b.clone(),
+            Emission::Parity(b) => b.clone(),
+        };
+        e.hold_emission(first);
+        assert_eq!(e.emission_queue_len(), 2);
+        assert_eq!(e.stats.send_rejected, 0);
+        match e.next_emission(t0).unwrap() {
+            Emission::Source(b, _) => assert_eq!(b, first_bytes, "same datagram, same place"),
+            Emission::Parity(_) => panic!("parity ahead of its sources"),
+        }
     }
 
     /// The client repeats a request until the pass arrives. Requests that
