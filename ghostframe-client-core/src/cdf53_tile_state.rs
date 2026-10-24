@@ -116,6 +116,12 @@ impl Cdf53TileState {
         rgba
     }
 
+    /// Forget one tile's planes, for a new generation that reuses the
+    /// 4-bit number the tile holds (which `integrate` cannot tell apart).
+    pub fn forget_tile(&mut self, tile_x: u8, tile_y: u8) {
+        self.tiles.remove(&(tile_x, tile_y));
+    }
+
     /// Clear all per-tile accumulation state.
     pub fn reset(&mut self) {
         self.tiles.clear();

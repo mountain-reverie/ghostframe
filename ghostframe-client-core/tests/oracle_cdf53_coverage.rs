@@ -200,7 +200,7 @@ fn gap_detection_nacks_missing_lower_passes() {
         last_change_us: 42,
         sweep_attempts: 0,
     };
-    let out = apply_cdf53_arrival(Some(prev), 3, 4, 9, 100, true, None);
+    let out = apply_cdf53_arrival(Some(prev), 3, 4, 5, 100, true, None);
     assert_eq!(out.nack_passes, vec![1, 2, 3]);
     assert_eq!(out.entry.pass_mask, 0b0010001);
     assert_eq!(out.entry.nacked_mask, 0b0001110);
@@ -598,8 +598,12 @@ fn arrival_order_follows_the_label_not_the_four_bit_generation() {
     assert!(arrival_is_stale(9, 50, 0, 10));
     // A newer label wins whatever the 4 bits say.
     assert!(!arrival_is_stale(9, 50, 0, 60));
-    // The same generation is never stale, whatever its label.
-    assert!(!arrival_is_stale(4, 50, 4, 10));
+    // The same generation with the same label is more of the same content.
+    assert!(!arrival_is_stale(4, 50, 4, 50));
+    // The same 4-bit generation with a different label is different content:
+    // newer is a new generation (see `classify_arrival`), older is stale.
+    assert!(!arrival_is_stale(4, 50, 4, 60));
+    assert!(arrival_is_stale(4, 50, 4, 10));
     // Same label, different generation: the 4-bit compare decides.
     assert!(!arrival_is_stale(4, 50, 5, 50));
     assert!(arrival_is_stale(5, 50, 4, 50));
@@ -617,14 +621,71 @@ fn labels_compare_across_the_31_bit_wrap() {
 }
 
 #[test]
-fn a_late_retransmission_does_not_move_the_label_back() {
+fn a_retransmission_of_the_held_generation_is_accepted_under_its_label() {
     let held = CoverageEntry {
         generation: 4,
         frame_seq: 50,
         pass_mask: 1,
         ..Default::default()
     };
-    let out = apply_cdf53_arrival(Some(held), 4, 2, 40, 10, true, None);
+    let out = apply_cdf53_arrival(Some(held), 4, 2, 50, 10, true, None);
     assert_eq!(out.entry.frame_seq, 50);
     assert_eq!(out.entry.pass_mask, 0b101, "and the pass is accepted");
+    assert!(out.committed && !out.new_generation);
+}
+
+#[test]
+fn a_label_is_plausible_only_within_the_window_of_the_newest_received() {
+    use ghostframe_client_core::cdf53_coverage::{label_runs_ahead, LABEL_WINDOW};
+    // Nothing received: nothing to judge by.
+    assert!(!label_runs_ahead(1_000_000, None));
+    assert!(!label_runs_ahead(100 + LABEL_WINDOW, Some(100)));
+    assert!(label_runs_ahead(100 + LABEL_WINDOW + 1, Some(100)));
+    // Behind, however far, is not "ahead" (the held-label rule judges it).
+    assert!(!label_runs_ahead(5, Some(100)));
+    assert!(!label_runs_ahead(0x7FFF_FFF0, Some(100)));
+    // Across the 31-bit wrap.
+    assert!(!label_runs_ahead(10, Some(0x7FFF_FFF0)));
+}
+
+#[test]
+fn a_held_label_expires_before_serial_comparison_inverts() {
+    use ghostframe_client_core::cdf53_coverage::{label_expired, LABEL_EXPIRY, LABEL_WINDOW};
+    assert!(!label_expired(100, None));
+    assert!(!label_expired(100, Some(100 + LABEL_EXPIRY)));
+    assert!(label_expired(100, Some(100 + LABEL_EXPIRY + 1)));
+    // Past the inversion point the held label reads as ahead; still expired.
+    assert!(label_expired(100, Some(100 + (1 << 30) + 5)));
+    // A label slightly ahead of the newest (a legitimate rebuild) is not.
+    assert!(!label_expired(110, Some(100)));
+    assert!(!label_expired(100 + LABEL_WINDOW, Some(100)));
+}
+
+#[test]
+fn a_new_generation_that_fails_prevalidation_is_not_committed() {
+    let held = CoverageEntry {
+        generation: 1,
+        frame_seq: 100,
+        pass_mask: 1,
+        ..Default::default()
+    };
+    let out = apply_cdf53_arrival(Some(held), 2, 0, 1_000_100, 10, false, None);
+    assert!(!out.committed && !out.new_generation);
+    assert_eq!(out.entry, held, "the held entry is what comes back");
+    // A failing pass of the generation held is bookkeeping as before.
+    let out = apply_cdf53_arrival(Some(held), 1, 3, 100, 10, false, None);
+    assert!(out.committed && !out.new_generation);
+}
+
+#[test]
+fn the_same_number_with_a_newer_label_starts_a_new_generation() {
+    let held = CoverageEntry {
+        generation: 5,
+        frame_seq: 100,
+        pass_mask: 0b111,
+        ..Default::default()
+    };
+    let out = apply_cdf53_arrival(Some(held), 5, 0, 200, 10, true, None);
+    assert!(out.new_generation && out.committed);
+    assert_eq!((out.entry.frame_seq, out.entry.pass_mask), (200, 1));
 }
