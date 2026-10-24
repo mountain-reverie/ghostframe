@@ -242,7 +242,8 @@ fn assert_p3(n: &str, r: &BrowserlessResult, lossy: bool) {
 ///   in ghostframe-lib, which drives the production turn.
 /// - `budget.floor`: the floor is one datagram, far below the bandwidth term
 ///   on this link. Asserted in `the_budget_floor_term_is_counted_when_it_binds`.
-/// - `budget.pacer`: binds in some runs only (the pacer is 2.5x the estimate);
+/// - `budget.pacer`: binds in some runs only (the pacer is `K = 1/0.85` times
+///   the estimate, bounded by `K x` the acknowledged rate);
 ///   asserted over the lossy runs together by the caller.
 /// - ECN `last_marked`: ghostbridge carries no ECN, so quinn abandons ECN
 ///   after the first acknowledgements (`ect0_tx` is the handshake's few

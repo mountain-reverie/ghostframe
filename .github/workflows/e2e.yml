@@ -132,6 +132,12 @@ jobs:
       - run: cargo test --test browserless_nested_cc -- --test-threads=1
         continue-on-error: true
       - run: cargo test --test browserless_burst_loss -- --test-threads=1
+      # D1 PR-6 gates: the first probe ladder is never capped (both key
+      # exchanges), the estimate follows 20 s capacity steps, settles at the
+      # link on a CoDel path over five seeds, and is not clamped to an
+      # application-limited sender's own rate. The full startup map is the
+      # target's #[ignore]d test, run by hand at PR-0, PR-7 and PR-10.
+      - run: cargo test --test browserless_bwe_rate_source -- --test-threads=1
 
   harness-smoke:
     name: harness-smoke
