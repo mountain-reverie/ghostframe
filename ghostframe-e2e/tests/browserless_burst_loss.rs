@@ -520,6 +520,38 @@ async fn iid_versus_burst_loss_at_equal_average_rate() {
 /// ranks above it. It is NOT the term that sets most budgets: once the pacer
 /// is trusted (150 samples) the pacer's min ranks first and takes the rest of
 /// the ticks (floor=2, pacer=115 in the recorded run).
+/// Report-only sweep over the three committed seeds of the burst-loss
+/// comparison (`0xB0B057`, `0xB0B058`, `0xB0B059`): iid 2 %, Gilbert-Elliott
+/// 2 % and iid 1 % s2c loss, one line per run in the `BURSTREPORT` /
+/// `D1INSTR` formats above. Used to compare a change against its base on the
+/// same scenes: the burst rows are draws from a chaotic regime, so one seed
+/// says little. Asserts only that each run established a session.
+///
+/// `#[ignore]`d (about 9 runs of 12 s): `-- --ignored --nocapture`.
+#[tokio::test(start_paused = true)]
+#[ignore = "report-only seed sweep, ~9 scenes; run on demand"]
+async fn burst_loss_report_over_three_seeds() {
+    const SECS: u64 = 12;
+    let ge = GilbertElliott::from_rate_and_burst(RATE, BURST, 1.0).expect("feasible");
+    for seed in [0xB0_B057u64, 0xB0_B058, 0xB0_B059] {
+        let iid2 = run_browserless_with_links(scene(seed, SECS), s2c_only(|p| p.loss = RATE))
+            .await
+            .expect("scene ran");
+        let burst2 = run_browserless_with_links(scene(seed, SECS), s2c_only(|p| ge.apply_to(p)))
+            .await
+            .expect("scene ran");
+        let iid1 = run_browserless_with_links(scene(seed, SECS), s2c_only(|p| p.loss = 0.01))
+            .await
+            .expect("scene ran");
+        for (n, r) in [("iid2%", &iid2), ("burst2%", &burst2), ("iid1%", &iid1)] {
+            let name = format!("{n}@{seed:#x}");
+            report(&name, r);
+            report_instruments(&name, r);
+            assert_established(&name, r);
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_budget_floor_term_is_counted_when_it_binds() {
     let mut sc = scene(0xB0_B057, 4);
