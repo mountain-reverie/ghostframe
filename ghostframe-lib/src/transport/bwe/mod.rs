@@ -71,6 +71,19 @@ pub struct BweSnapshot {
     /// comment for why the two fields diverge and `pad_window` (padding to
     /// hold a floor rate) is deliberately not surfaced here at all.
     pub pacer_rate_bps: Option<u64>,
+    /// Counters for scenes and tests; none of them steers anything.
+    pub stats: BweStats,
+}
+
+/// What the estimator wrapper has done, in numbers a scene can hold it to.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BweStats {
+    /// Probe clusters goog_cc has asked for since startup.
+    pub probe_requests: u64,
+    /// Target rate of the first four clusters it asked for, in request order
+    /// (zero for a cluster not yet asked for). The first two are the startup
+    /// ladder, `3 x` and `6 x` the start rate when nothing capped it.
+    pub first_probe_targets_bps: [u64; 4],
 }
 
 /// A probe goog_cc has asked for (BWE Stage 2.4), surfaced from

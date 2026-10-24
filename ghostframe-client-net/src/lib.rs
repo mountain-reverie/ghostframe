@@ -61,6 +61,9 @@ pub struct ClientNet {
     config: ClientNetConfig,
     /// Further acceptable certificate hashes (the server's successor cert).
     extra_cert_pins: Vec<[u8; 32]>,
+    /// Offer only classical key-exchange groups (see
+    /// [`ClientNet::with_classical_key_exchange`]).
+    classical_kx: bool,
     connected: bool,
     /// The WebTransport CONNECT was accepted (status 200): datagrams may
     /// now flow both ways. Mirrors `WebTransportServer`'s own `connected`
@@ -121,6 +124,16 @@ impl ClientNet {
         self
     }
 
+    /// Offer no hybrid post-quantum group, so the handshake negotiates
+    /// classical X25519, as a peer without ML-KEM would. The two handshakes
+    /// differ in how many loop iterations they cost the server before the
+    /// first feedback, which is what the bandwidth-estimator startup scenes
+    /// compare. Never used by the product.
+    pub fn with_classical_key_exchange(mut self) -> Self {
+        self.classical_kx = true;
+        self
+    }
+
     /// `now_us` seeds `ClientCore`'s internal deadlines (tail sweep,
     /// feedback cadence — see `ClientCore::new`); it is
     /// otherwise unused here (there is nothing else to schedule before
@@ -172,6 +185,7 @@ impl ClientNet {
         Ok(Self {
             config,
             extra_cert_pins: Vec::new(),
+            classical_kx: false,
             connected: false,
             session_ready: false,
             datagrams_read: 0,
@@ -198,7 +212,11 @@ impl ClientNet {
         let now = self.instant(now_us);
 
         let verifier = Arc::new(tls::PinnedCertVerifier::with_hashes(self.cert_pins()));
-        let provider = Arc::new(tls::pq_provider());
+        let provider = Arc::new(if self.classical_kx {
+            tls::classical_provider()
+        } else {
+            tls::pq_provider()
+        });
         let mut client_tls = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(|e| ClientNetError::Tls(e.to_string()))?

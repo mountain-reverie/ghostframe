@@ -579,6 +579,10 @@ impl IoBridge {
                 .iter()
                 .copied()
                 .fold(f32::INFINITY, f32::min);
+            self.instr.hint_feeds += 1;
+            if self.bwe.snapshot().samples_seen == 0 {
+                self.instr.hint_feeds_before_feedback += 1;
+            }
             self.bwe
                 .set_transport_capacity_hint(conservative, now_std());
         }
