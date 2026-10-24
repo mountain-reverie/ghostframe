@@ -378,8 +378,9 @@ impl IoBridge {
         }
         // The session-scoped instruments describe this connection; quinn
         // reuses handles, so a stale mirror would alias the next one.
-        if self.last_hello_from == Some(handle) || self.instr.mirror_handle() == Some(handle) {
+        if self.last_hello_from == Some(handle) || self.departures_handle == Some(handle) {
             self.instr.reset_session_scope(0);
+            self.release_departures();
         }
         self.wt_sessions.remove(&handle);
         self.feedback_recv_bufs.remove(&handle);
@@ -504,6 +505,11 @@ impl IoBridge {
                     // overwhelmingly `Blocked`).
                     if wt.send_datagram(conn, &datagram).is_ok() {
                         notices_sent += 1;
+                        // Not put in the departure tracker, though it is in
+                        // quinn's FIFO: this session is forgotten just below,
+                        // which discards the tracker with it, and the byte
+                        // arithmetic reads the session's own counter, which
+                        // counts it.
                         // Only the live session's sends are billed: the
                         // notice usually goes to a session that is no longer it.
                         if self.last_hello_from == Some(handle) {

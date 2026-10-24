@@ -67,7 +67,7 @@ impl IoBridge {
                     }
                 }
             }
-            let outcome = self.send_counted(&bytes, class, true);
+            let outcome = self.send_counted(&bytes, class, true, emission.wire_seq());
             if matches!(
                 outcome,
                 crate::transport::reliable_emitter::traits::SendOutcome::Rejected
@@ -155,18 +155,23 @@ impl IoBridge {
         dg: &[u8],
         class: WireClass,
     ) -> crate::transport::reliable_emitter::traits::SendOutcome {
-        self.send_counted(dg, class, false)
+        self.send_counted(dg, class, false, None)
     }
 
     /// [`Self::send_to_all_sessions`], saying whether the datagram came
     /// through the admission gate (`gated`: it was charged to the bucket
     /// before it got here) or bypassed it (an H.264 frame or a control
     /// datagram, billed to the bucket afterwards).
+    ///
+    /// `wire_seq` names the transmission the datagram carries, when it is one
+    /// the ledger tracks; it ties the datagram's departure from quinn's FIFO
+    /// to that transmission's loss clock and retransmission timer.
     pub(super) fn send_counted(
         &mut self,
         dg: &[u8],
         class: WireClass,
         gated: bool,
+        wire_seq: Option<u32>,
     ) -> crate::transport::reliable_emitter::traits::SendOutcome {
         use crate::transport::reliable_emitter::traits::SendOutcome;
         #[cfg(test)]
@@ -177,12 +182,14 @@ impl IoBridge {
                 // A harness-injected drop *consumes* the datagram. Reporting
                 // `Rejected` here would make the emitter re-queue the same
                 // bytes forever and the injected loss would never happen.
+                self.departed_without_quinn(wire_seq);
                 return SendOutcome::Sent;
             }
         }
         #[cfg(any(test, feature = "test-loss-injection"))]
         if let Some(inj) = self.outbound_loss.as_mut() {
             if inj.should_drop(dg) {
+                self.departed_without_quinn(wire_seq);
                 return SendOutcome::Sent; // injected loss: consumed, see above
             }
         }
@@ -193,6 +200,7 @@ impl IoBridge {
                 .expect("drop_plan mutex poisoned")
                 .should_drop(dg)
             {
+                self.departed_without_quinn(wire_seq);
                 return SendOutcome::Sent; // injected drop: consumed, see above
             }
         }
@@ -249,6 +257,7 @@ impl IoBridge {
                     gated,
                     dg_len: dg.len(),
                     framing_len: framing,
+                    wire_seq,
                     cum_enqueued: cum,
                     queued,
                 },

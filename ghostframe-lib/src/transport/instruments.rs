@@ -53,11 +53,6 @@ impl OfferedBytes {
 // Enqueue -> departure lag
 // ---------------------------------------------------------------------------
 
-/// Most entries the departure mirror holds. The FIFO itself is bounded by
-/// quinn's send buffer; this is a backstop so a quinn behaviour this mirror
-/// does not model (see [`DepartureMirror`]) cannot grow memory without bound.
-const MIRROR_CAP: usize = 1 << 18;
-
 /// Log-linear histogram of durations in microseconds: exact below 4 us, then
 /// four sub-buckets per octave (a reading is within 25 % of the truth).
 /// Fixed size, O(1) record.
@@ -130,84 +125,6 @@ impl LagHistogram {
             }
         }
         self.max_us
-    }
-}
-
-/// A mirror of quinn's datagram FIFO that stamps each datagram when it
-/// leaves it. OBSERVABILITY ONLY: nothing may read it for behaviour.
-///
-/// quinn's queue is strictly FIFO and `outgoing_total` falls by a datagram's
-/// length at exactly one point that matters here: `DatagramState::write`,
-/// which pops the head and decrements in the same call, immediately before
-/// encoding the frame into the packet being built
-/// (quinn-proto 0.11.14 `connection/datagrams.rs:162-185`: `pop_front` at
-/// :167, put back untouched with `push_front` at :175 when it does not fit,
-/// `outgoing_total -= len` at :181). It is called from the DATAGRAM section of
-/// `populate_packet` (`connection/mod.rs:3337`). The count rises only in
-/// `send` (`datagrams.rs:55`, after the `Blocked` check), so
-/// `cum_departed = cum_enqueued - outgoing_total` is the byte count that has
-/// been written into packets.
-///
-/// Two other places also lower the count without sending: `drop_oversized`
-/// (`datagrams.rs:143-160`, on an MTU black hole, `mod.rs:1773`) and the
-/// `drop = true` branch of `send` (`datagrams.rs:38-48`; this crate always
-/// passes `drop = false`). A datagram discarded by `drop_oversized` is read
-/// here as departed, so a lag can be stamped early in that case. It is rare
-/// and bounded, and only the lag histogram sees it.
-///
-/// Granularity is one poll: every datagram that left during one
-/// `drain_outbound` gets that drain's stamp.
-#[derive(Debug, Default)]
-pub struct DepartureMirror {
-    /// `(cum_end, enqueued_at)`, oldest first. `cum_end` is the session's
-    /// cumulative enqueued byte count after this datagram was accepted.
-    q: VecDeque<(u64, Instant)>,
-    pub lag: LagHistogram,
-    /// Entries dropped unstamped because the mirror hit [`MIRROR_CAP`].
-    pub overflowed: u64,
-    #[cfg(test)]
-    pub(crate) stamped: Vec<(Instant, Instant)>,
-}
-
-impl DepartureMirror {
-    pub fn len(&self) -> usize {
-        self.q.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.q.is_empty()
-    }
-
-    pub fn clear(&mut self) {
-        self.q.clear();
-    }
-
-    /// A datagram was accepted by quinn; `cum_enqueued` is the session's
-    /// cumulative accepted byte count including it.
-    pub fn on_enqueue(&mut self, cum_enqueued: u64, now: Instant) {
-        if self.q.len() >= MIRROR_CAP {
-            self.q.pop_front();
-            self.overflowed += 1;
-        }
-        self.q.push_back((cum_enqueued, now));
-    }
-
-    /// After a `poll_transmit` batch: stamp everything that has left.
-    /// `outgoing_total` is quinn's queued byte count
-    /// (`datagram_send_buffer_size - send_buffer_space()`).
-    pub fn on_poll(&mut self, cum_enqueued: u64, outgoing_total: u64, now: Instant) {
-        let departed = cum_enqueued.saturating_sub(outgoing_total);
-        while let Some(&(cum_end, enq)) = self.q.front() {
-            if cum_end > departed {
-                break;
-            }
-            self.q.pop_front();
-            self.lag.record(now.saturating_duration_since(enq));
-            #[cfg(test)]
-            if self.stamped.len() < 4096 {
-                self.stamped.push((enq, now));
-            }
-        }
     }
 }
 
@@ -643,7 +560,7 @@ pub struct InstrumentSummary {
     pub lag_p50_us: u64,
     pub lag_p95_us: u64,
     pub lag_max_us: u64,
-    /// Entries the departure mirror still held at the last reading.
+    /// Entries the departure tracker still held at the last reading.
     pub mirror_len: u64,
     pub mirror_overflowed: u64,
     pub budget: BudgetBinding,
@@ -668,6 +585,17 @@ pub struct InstrumentSummary {
     /// 16 384 tombstones, and a late acknowledgement for an evicted one
     /// resolves to nothing, so it appears only in `ledger_unknown_acks`.
     pub late_acked_unreported: u64,
+    /// Transmissions declared lost while still queued in the emitter or in
+    /// quinn's FIFO. Zero by construction (F3: the loss clock starts at
+    /// departure); read from the ledger record at the moment of the verdict,
+    /// so a clock that starts at enqueue again shows here.
+    pub ledger_expired_before_departure: u64,
+    /// Transmissions the departure tracker stamped on a ledger record.
+    pub ledger_departures_stamped: u64,
+    /// Transmissions the ledger's capacity cap evicted before they departed.
+    pub ledger_evicted_before_departure: u64,
+    /// Retransmission timers started by a departure.
+    pub rto_armed_at_departure: u64,
     /// Acknowledgements naming a `wire_seq` the ledger knows nothing of
     /// (duplicates, or declared lost and since evicted from the tombstones).
     pub ledger_unknown_acks: u64,
@@ -733,54 +661,6 @@ mod tests {
         assert!((950..=1000).contains(&p95), "p95 {p95}");
         assert_eq!(h.max_us(), 1000);
         assert_eq!(LagHistogram::default().quantile_us(0.5), 0);
-    }
-
-    #[test]
-    fn departure_stamps_are_monotone_and_the_mirror_drains() {
-        let base = Instant::now();
-        let mut m = DepartureMirror::default();
-        // Ten 100-byte datagrams accepted 1 ms apart.
-        let mut cum = 0u64;
-        for i in 0..10u64 {
-            cum += 100;
-            m.on_enqueue(cum, t(base, i * 1_000));
-        }
-        assert_eq!(m.len(), 10);
-        // Nothing has left: queue still holds all 1000 bytes.
-        m.on_poll(cum, 1000, t(base, 10_000));
-        assert_eq!(m.len(), 10);
-        // Three leave (queued 700), then a partial 50 bytes more (no whole
-        // datagram), then everything.
-        m.on_poll(cum, 700, t(base, 11_000));
-        assert_eq!(m.len(), 7);
-        m.on_poll(cum, 650, t(base, 12_000));
-        assert_eq!(m.len(), 7, "a datagram leaves only when all of it has");
-        m.on_poll(cum, 0, t(base, 13_000));
-        assert!(m.is_empty(), "the mirror drains when quinn's queue does");
-        assert_eq!(m.lag.count(), 10);
-        // Stamps in FIFO order never go backwards, and each datagram departs
-        // no earlier than it was enqueued.
-        let departures: Vec<Instant> = m.stamped.iter().map(|&(_, d)| d).collect();
-        assert!(departures.windows(2).all(|w| w[0] <= w[1]));
-        assert!(m.stamped.iter().all(|&(e, d)| e <= d));
-        let enqueues: Vec<Instant> = m.stamped.iter().map(|&(e, _)| e).collect();
-        assert!(enqueues.windows(2).all(|w| w[0] <= w[1]));
-        // First datagram: enqueued at 0, left at 11 ms.
-        assert_eq!(
-            m.stamped[0].1 - m.stamped[0].0,
-            Duration::from_micros(11_000)
-        );
-    }
-
-    #[test]
-    fn mirror_is_bounded() {
-        let base = Instant::now();
-        let mut m = DepartureMirror::default();
-        for i in 0..(MIRROR_CAP as u64 + 10) {
-            m.on_enqueue(i + 1, base);
-        }
-        assert_eq!(m.len(), MIRROR_CAP);
-        assert_eq!(m.overflowed, 10);
     }
 
     #[test]

@@ -73,6 +73,18 @@ pub enum Emission {
 }
 
 impl Emission {
+    /// The `wire_seq` a source datagram carries (stamped at bytes 8..12 by the
+    /// emitter), which names the transmission in the ledger. Parity is not a
+    /// tracked transmission.
+    pub fn wire_seq(&self) -> Option<u32> {
+        match self {
+            Emission::Source(b, _) if b.len() >= 12 => {
+                Some(u32::from_be_bytes([b[8], b[9], b[10], b[11]]))
+            }
+            Emission::Source(..) | Emission::Parity(_) => None,
+        }
+    }
+
     pub fn class(&self) -> WireClass {
         match self {
             Emission::Source(_, c) => *c,
