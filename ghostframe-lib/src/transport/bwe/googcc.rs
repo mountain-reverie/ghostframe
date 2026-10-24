@@ -5,6 +5,7 @@
 //! envelope are sufficient. A constant clock offset between the two cancels in
 //! GoogCC's `recv_delta - send_delta`.
 
+use super::ceiling::{CeilingReading, EstimateCeiling};
 use super::timeline::Lo16Timeline;
 use super::{AckArrival, BweSnapshot};
 use goog_cc::experiments::FieldTrials;
@@ -24,6 +25,24 @@ use std::time::{Duration, Instant};
 /// a probe overshoot proposing an absurd rate on a fast LAN.
 const MIN_BPS: i64 = 200_000;
 const MAX_BPS: i64 = 200_000_000;
+
+/// How far the estimate may sit from the ceiling before goog_cc is told to
+/// move: under `PROBE_UNCERTAINTY` (5 %, goog_cc's own margin for how well a
+/// probe result is known) there is nothing to say.
+const FOLLOW_TOLERANCE: f64 = 0.02;
+
+/// `AIMD_BACKOFF` as a float for the delivery test.
+const AIMD_BACKOFF_F: f64 = super::ceiling::AIMD_BACKOFF;
+
+/// goog_cc's `pacing_factor`: the pacer rate is this times the loss-based
+/// target. 1.0: the pacer rate is the estimate.
+///
+/// libwebrtc's default is 2.5, its allowance for draining an encoder's frames
+/// ahead of the rate it is asked to hold. Here it put the pacer term of the
+/// admission rate (`min(cwnd / srtt, factor x estimate)`) out of reach of the
+/// cwnd term: measured on the 5 -> 15 -> 5 Mbit steps the pacer term bound in
+/// 3 % of admission passes at 2.5 and in 41 % at 1.0.
+const PACING_FACTOR: f64 = 1.0;
 
 pub(crate) struct GoogCcDriver {
     ctl: SendCtl,
@@ -58,6 +77,16 @@ pub(crate) struct GoogCcDriver {
     /// on a slow link. Bounded by `MAX_PENDING_PROBE_REQUESTS`.
     pending_probe_requests: std::collections::VecDeque<super::ProbeRequest>,
     stats: super::BweStats,
+    /// The acknowledged-rate ceiling (`ceiling.rs`) and the figures it is
+    /// made of. `active_ceiling_bps` is `Some` only while the sender was
+    /// saturated; it bounds what `snapshot` reports.
+    ceiling: EstimateCeiling,
+    acked_cum_bytes: f64,
+    active_ceiling_bps: Option<u64>,
+    /// Countable bytes per token spent, last measured (see `BweSnapshot`).
+    payload_fraction: f64,
+    /// When goog_cc was last given an estimate (`reseed`).
+    last_reseed_us: Option<u64>,
 }
 
 /// Newtype carrying the `Send` assertion, so it covers exactly the one type
@@ -122,6 +151,9 @@ impl GoogCcDriver {
                 // 5.5 Mbps estimated on a link that stepped up to
                 // 20 Mbps mid-scene.
                 requests_alr_probing: Some(true),
+                // The pacer rate is the estimate, not libwebrtc's `2.5 x`.
+                // See `PACING_FACTOR`.
+                pacing_factor: Some(PACING_FACTOR),
                 // The t=0 ladder is issued before the first frame has been
                 // captured, so the scheduler queue is empty and the
                 // windows close having emitted nothing (`packets_sent=0`,
@@ -197,6 +229,11 @@ impl GoogCcDriver {
             pacer_rate_bps: None,
             pending_probe_requests: std::collections::VecDeque::new(),
             stats: super::BweStats::default(),
+            ceiling: EstimateCeiling::default(),
+            acked_cum_bytes: 0.0,
+            active_ceiling_bps: None,
+            payload_fraction: 1.0,
+            last_reseed_us: None,
         }
     }
 
@@ -241,6 +278,150 @@ impl GoogCcDriver {
         };
         let upd = self.ctl.0.on_network_state_estimate(est);
         self.absorb(upd);
+    }
+
+    /// Take the capacity hint back: nothing is known of the path's capacity
+    /// beyond the configured maximum, so that is the upper bound stated.
+    ///
+    /// Not an infinite `link_capacity_upper`: goog_cc's probe controller reads
+    /// an infinite one as "no network-state estimate" and then never issues a
+    /// network-state probe, which (with the pacer at the estimate rather than
+    /// 2.5 x, and the sender saturated, so never application-limited, where
+    /// the ALR probes would otherwise run) leaves nothing to look for
+    /// headroom with. A finite bound at the configured
+    /// maximum caps no probe a lower one would not, and lets the controller's
+    /// periodic probe (every `network_state_interval`, at up to `alr_scale x`
+    /// the estimate) run.
+    pub(crate) fn withdraw_transport_capacity_hint(&mut self, now: Instant) {
+        let at = self.to_timestamp(now);
+        let max = DataRate::from_bits_per_sec(MAX_BPS);
+        let est = NetworkStateEstimate {
+            confidence: 0.5,
+            update_time: at,
+            last_receive_time: at,
+            last_send_time: at,
+            link_capacity: max,
+            link_capacity_lower: DataRate::zero(),
+            link_capacity_upper: max,
+            ..Default::default()
+        };
+        let upd = self.ctl.0.on_network_state_estimate(est);
+        self.absorb(upd);
+    }
+
+    /// Wire bytes of the transmissions recorded so far, cumulative.
+    pub(crate) fn note_offered(&mut self, now: Instant, cumulative_bytes: f64) {
+        let now_us = self.micros_since_base(now);
+        self.ceiling.note_offered(now_us, cumulative_bytes);
+    }
+
+    /// The admission bucket's cumulative grant and spend, as of the end of an
+    /// admission pass.
+    pub(crate) fn note_admission(&mut self, now: Instant, granted: f64, spent: f64) {
+        let now_us = self.micros_since_base(now);
+        self.ceiling.note_admission(now_us, granted, spent);
+        self.refresh_ceiling(now);
+    }
+
+    fn micros_since_base(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.base).as_micros() as u64
+    }
+
+    /// Re-read the ceiling. Called whenever either of its inputs moved.
+    fn refresh_ceiling(&mut self, now: Instant) {
+        let now_us = self.micros_since_base(now);
+        let srtt_us = self.path_rtt.map_or(0, |d| d.as_micros() as u64);
+        let reading: Option<CeilingReading> = self.ceiling.read(now_us, srtt_us);
+        self.active_ceiling_bps = reading.and_then(|r| r.ceiling_bps).map(|c| c as u64);
+        if let Some(r) = reading {
+            self.payload_fraction = r.payload_fraction;
+            self.stats.payload_fraction_ppm = (r.payload_fraction * 1e6) as u64;
+            self.stats.ceiling_reads += 1;
+            self.stats.ceiling_acked_bps = r.acked_bps as u64;
+            self.stats.ceiling_saturated_reads += r.ceiling_bps.is_some() as u64;
+        }
+        self.stats.ceiling_bps = self.active_ceiling_bps.unwrap_or(0);
+        if self
+            .active_ceiling_bps
+            .is_some_and(|c| c < self.estimate_bps)
+        {
+            self.stats.ceiling_binding_reads += 1;
+        }
+        if let Some(r) = reading {
+            self.follow_ceiling(now, now_us, srtt_us, r);
+        }
+    }
+
+    /// Keep goog_cc's own estimate level with the ceiling: hand it the ceiling
+    /// as its new estimate when it is above, and, while the path is showing no
+    /// limit, when it is below. At most once per window.
+    ///
+    /// *Above.* Left alone, goog_cc's estimate keeps running at its additive
+    /// limit and the published one is held at the ceiling by `bounded`; its
+    /// probe controller would then reason from an estimate nobody sends at.
+    /// Handing it the ceiling is also the re-measurement the estimate asks
+    /// for: goog_cc continues from what the path was seen to carry, and its
+    /// own probes (`withdraw_transport_capacity_hint` lets the controller
+    /// issue them) and delay detector take it from there.
+    ///
+    /// *Below.* With the pacer at the estimate, goog_cc's AIMD grows by one
+    /// packet per round trip once it believes it is near capacity, which it
+    /// does after any overuse: nothing in what it sees says the path has room,
+    /// because the sender never offers more than the estimate allows. The ceiling is the evidence it lacks: the sender used
+    /// what it was granted (`saturated`), the path delivered at least
+    /// `AIMD_BACKOFF` of what was offered (it is not dropping or queueing the
+    /// excess), and the estimate is under `K x` what was delivered. Raising it
+    /// to that bound grows it by `K` per window while the path has room. The
+    /// delay detector is untouched and still lowers the estimate when the
+    /// path does not (to `AIMD_BACKOFF` of the acknowledged rate); the next
+    /// lift is a window later, no sooner.
+    fn follow_ceiling(&mut self, now: Instant, now_us: u64, srtt_us: u64, r: CeilingReading) {
+        let Some(ceiling) = r.ceiling_bps else { return };
+        let window_us = EstimateCeiling::window_us(srtt_us);
+        let cooled = self
+            .last_reseed_us
+            .is_none_or(|t| now_us.saturating_sub(t) >= window_us);
+        if !cooled || r.acked_bps <= 0.0 {
+            return;
+        }
+        let est = self.estimate_bps as f64;
+        let ceiling = ceiling.max(MIN_BPS as f64);
+        if est > ceiling * (1.0 + FOLLOW_TOLERANCE) {
+            self.reseed(now, now_us, ceiling);
+            self.stats.ceiling_reseeds_down += 1;
+        } else if est < ceiling * (1.0 - FOLLOW_TOLERANCE)
+            && r.acked_bps >= AIMD_BACKOFF_F * r.offered_bps
+        {
+            self.reseed(now, now_us, ceiling);
+            self.stats.ceiling_reseeds_up += 1;
+        }
+    }
+
+    /// Tell goog_cc to continue from `bps`: the one API it has for an
+    /// estimate the application knows better (`TargetRateConstraints`).
+    fn reseed(&mut self, now: Instant, now_us: u64, bps: f64) {
+        let at = self.to_timestamp(now);
+        let rate = (bps as i64).clamp(MIN_BPS, MAX_BPS);
+        let upd = self
+            .ctl
+            .0
+            .on_target_rate_constraints(TargetRateConstraints {
+                at_time: at,
+                min_data_rate: Some(DataRate::from_bits_per_sec(MIN_BPS)),
+                max_data_rate: Some(DataRate::from_bits_per_sec(MAX_BPS)),
+                starting_rate: Some(DataRate::from_bits_per_sec(rate)),
+            });
+        self.absorb(upd);
+        self.last_reseed_us = Some(now_us);
+    }
+
+    /// `bps` bounded by the ceiling while one applies (never below the
+    /// controller's own floor: a stalled link is the loss path's to report).
+    fn bounded(&self, bps: u64) -> u64 {
+        match self.active_ceiling_bps {
+            Some(c) => bps.min(c.max(MIN_BPS as u64)),
+            None => bps,
+        }
     }
 
     /// Record quinn's measured path RTT. Deliberately NOT fed to the
@@ -402,15 +583,25 @@ impl GoogCcDriver {
         });
         self.absorb(upd);
 
+        // What was acknowledged is counted as goog_cc counts it: the wire size
+        // of each acknowledged transmission, the bytes the estimate is a rate
+        // of.
+        self.acked_cum_bytes += records.iter().map(|r| r.size_bytes as f64).sum::<f64>();
+        let now_us = self.micros_since_base(now);
+        self.ceiling.note_acked(now_us, self.acked_cum_bytes);
+        self.refresh_ceiling(now);
+
         self.snapshot()
     }
 
+    /// The estimate and pacer rate, bounded by the ceiling while one applies.
     pub(crate) fn snapshot(&self) -> BweSnapshot {
         BweSnapshot {
-            bitrate_bps: self.estimate_bps,
+            bitrate_bps: self.bounded(self.estimate_bps),
             samples_seen: self.samples_seen,
             implausible_rtt_samples: self.implausible_rtt_samples,
-            pacer_rate_bps: self.pacer_rate_bps,
+            pacer_rate_bps: self.pacer_rate_bps.map(|p| self.bounded(p)),
+            payload_fraction: self.payload_fraction,
             stats: self.stats,
         }
     }
@@ -636,6 +827,104 @@ mod tests {
             snap.bitrate_bps, 1_000_000,
             "estimate never moved off the starting rate — the controller's \
              updates are not being absorbed"
+        );
+    }
+
+    /// Drive `d` for `secs` with a clean path delivering `ACKED_BPS`, and an
+    /// admission bucket that was granted `GRANT_BPS` and spent `spend` of it.
+    /// What was offered is what was acknowledged (delivery is complete).
+    const ACKED_BPS: f64 = 12.0 * 1200.0 * 8.0 / 0.020;
+
+    fn drive_clean(d: &mut GoogCcDriver, t0: Instant, secs: u64, spend: f64) {
+        const GRANT_BPS: f64 = 9.0e6;
+        d.note_path_rtt(Duration::from_millis(30));
+        let (mut granted, mut spent, mut offered) = (0.0f64, 0.0f64, 0.0f64);
+        for step in 0..(secs * 50) as u32 {
+            let now = t0 + Duration::from_millis(20 * step as u64);
+            granted += GRANT_BPS / 8.0 * 0.020;
+            spent += GRANT_BPS / 8.0 * 0.020 * spend;
+            offered += 12.0 * 1200.0;
+            let batch: Vec<AckArrival> = (0..12u32)
+                .map(|i| {
+                    let emit_us = ((step * 20 + i) as u64) * 1_000;
+                    AckArrival {
+                        server_emit_us: emit_us,
+                        client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
+                        size_bytes: 1200,
+                        probe: None,
+                    }
+                })
+                .collect();
+            d.note_offered(now, offered);
+            d.note_admission(now, granted, spent);
+            d.update(&batch, &[], now, 14_400);
+        }
+    }
+
+    /// While the sender uses what it is granted, the published estimate and
+    /// pacer rate stay within `HEADROOM x` what the path acknowledged, whatever
+    /// goog_cc's own estimate is doing.
+    #[test]
+    fn a_saturated_sender_is_held_to_headroom_times_the_acknowledged_rate() {
+        let t0 = Instant::now();
+        let mut d = GoogCcDriver::new(4_000_000, t0);
+        drive_clean(&mut d, t0, 12, 1.0);
+        let snap = d.snapshot();
+        let bound = crate::transport::bwe::ceiling::HEADROOM * ACKED_BPS;
+        assert!(
+            snap.stats.ceiling_saturated_reads > 0,
+            "premise: the ceiling was never applied ({:?})",
+            snap.stats
+        );
+        // The window holds seven or eight 20 ms batches, so the acknowledged
+        // rate it reads is the true one to within one batch (about 13 %).
+        let ceiling = snap.stats.ceiling_bps as f64;
+        assert!(
+            (0.85 * bound..=1.15 * bound).contains(&ceiling),
+            "the ceiling {ceiling} is not K x the acknowledged rate {bound}"
+        );
+        assert!(
+            snap.bitrate_bps as f64 <= ceiling,
+            "published {} above the ceiling {ceiling}",
+            snap.bitrate_bps
+        );
+        assert!(
+            snap.pacer_rate_bps.unwrap() as f64 <= ceiling,
+            "pacer {:?} above the ceiling {ceiling}",
+            snap.pacer_rate_bps
+        );
+        // Premise for the above meaning something: goog_cc's own estimate
+        // would have been higher (the ceiling lowered what is published).
+        assert!(
+            snap.stats.ceiling_binding_reads > 0 || snap.stats.ceiling_reseeds_down > 0,
+            "the ceiling never bound: {:?}",
+            snap.stats
+        );
+    }
+
+    /// The same path with a sender that spent a fifth of its grant (nothing to
+    /// send): the acknowledged rate is its own, and bounding by it would
+    /// pin the estimate there. The ceiling must not apply, and the estimate
+    /// must be free to sit where goog_cc puts it, above `HEADROOM x acked`.
+    #[test]
+    fn an_app_limited_sender_is_not_bounded_by_what_it_chose_to_send() {
+        let t0 = Instant::now();
+        let mut d = GoogCcDriver::new(4_000_000, t0);
+        drive_clean(&mut d, t0, 12, 0.2);
+        let snap = d.snapshot();
+        assert!(
+            snap.stats.ceiling_reads > 0,
+            "premise: no reading was taken"
+        );
+        assert_eq!(
+            snap.stats.ceiling_saturated_reads, 0,
+            "a ceiling was applied to a sender that was not rate-limited"
+        );
+        assert!(
+            snap.bitrate_bps as f64 > crate::transport::bwe::ceiling::HEADROOM * ACKED_BPS * 1.05,
+            "estimate {} is held down at its own rate {}",
+            snap.bitrate_bps,
+            ACKED_BPS
         );
     }
 

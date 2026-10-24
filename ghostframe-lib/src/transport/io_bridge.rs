@@ -794,9 +794,12 @@ pub struct IoBridge {
     /// counter but log at `debug` to avoid 30 Hz warn-spam under
     /// sustained backpressure.
     datagram_send_err_first_logged: bool,
-    /// Recent `cwnd / smoothed_rtt` samples; the BWE capacity hint is their
-    /// minimum. See `apply_path_stats_snapshot`.
-    capacity_hint_window: std::collections::VecDeque<f32>,
+    /// Cumulative wire bytes of the transmissions recorded in the ledger: what
+    /// the estimator counts of what was sent. See `BweSnapshot::payload_fraction`.
+    offered_wire_bytes: f64,
+    /// Recent `cwnd / smoothed_rtt` samples taken while quinn was the limit;
+    /// the BWE capacity hint is their minimum. See `CapacityHintWindow`.
+    capacity_hint_window: bwe_glue::CapacityHintWindow,
     /// quinn's cumulative `sent_packets` at the previous path-stats sample,
     /// and the delta since. Zero delta means the link was idle over that
     /// interval, which is when `cwnd / rtt` stops meaning anything.
@@ -1330,7 +1333,8 @@ impl IoBridge {
             feedback_recv_bufs: HashMap::new(),
             datagram_send_errs: 0,
             datagram_send_err_first_logged: false,
-            capacity_hint_window: std::collections::VecDeque::new(),
+            offered_wire_bytes: 0.0,
+            capacity_hint_window: Default::default(),
             path_sent_packets_last: 0,
             transport_probe: TransportProbe::default(),
             instr: Default::default(),

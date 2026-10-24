@@ -9,7 +9,7 @@
 //! - path-stats sampling (`sample_all_path_stats`,
 //!   `apply_path_stats_snapshot`), which writes `adaptation_context`
 //!   (`bytes_per_us`, `smoothed_rtt_us`) and pushes the cwnd/rtt capacity hint
-//!   to the estimator (`push_capacity_hint`, `capacity_hint_window`,
+//!   to the estimator (`CapacityHintWindow`, `capacity_hint_window`,
 //!   `path_last_sent_at`);
 //! - receiver-feedback suspension debounce (`ingest_feedback_for_adaptation`,
 //!   `recent_suspension_flags`);
@@ -52,11 +52,119 @@ pub(super) fn select_live_rtt(
     rtts.filter(|(h, _)| *h == live).map(|(_, r)| r).min()
 }
 
-/// How many `cwnd / rtt` samples the capacity hint takes its minimum over.
-/// Sized to span a few RTTs of path-stats sampling, long enough to swallow a
-/// transient window balloon without being so long the hint stops tracking a
-/// genuine capacity change.
-const CAPACITY_HINT_WINDOW: usize = 16;
+/// The capacity hint's window is `HINT_WINDOW_SRTTS` smoothed round trips,
+/// never under `HINT_WINDOW_FLOOR`. It was the last 16 samples, and a sample
+/// is taken per loop iteration, so the window was a count of wakeups, not a
+/// span of time: whether it was full when the first probe ladder was issued
+/// depended on how many wakeups the handshake had cost, and the hybrid
+/// post-quantum handshake lost that race in 19 of 20 startup cells.
+///
+/// Four round trips span several windows of feedback and the swing of a
+/// Cubic cycle's growth step; the floor keeps it from shrinking below the
+/// path's own timing resolution (the 5 ms ACK flush plus a batch).
+const HINT_WINDOW_SRTTS: u32 = 4;
+const HINT_WINDOW_FLOOR: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// What the hint should do after a reading.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum HintAction {
+    /// Hand this `bytes_per_us` to the estimator as the capacity ceiling.
+    Feed(f32),
+    /// Nothing in the window describes a busy path: tell the estimator the
+    /// capacity is bounded only by its configured maximum.
+    Unbounded,
+    None,
+}
+
+/// What the estimator was last told.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum HintState {
+    /// Nothing yet (no feedback has been heard).
+    #[default]
+    Silent,
+    Bounded,
+    Unbounded,
+}
+
+/// The `cwnd / srtt` readings that may cap a probe, and the rules for when.
+///
+/// `cwnd / srtt` is a rate only while `cwnd` is the limit. When the sender is
+/// held back by anything else (the admission bucket, the application) quinn's
+/// window is whatever it last grew to and says nothing about the path, so:
+///
+/// 1. only readings taken while quinn was the limit (its datagram queue still
+///    holding data at the end of the turn: cwnd or its pacer, which is
+///    `1.25 x cwnd / srtt`) enter the window;
+/// 2. the window is a span of time, `max(4 x srtt, 100 ms)`;
+/// 3. nothing is handed to the estimator before it has heard its first
+///    feedback. The hint caps goog_cc's startup ladder; before any feedback
+///    the reading is of a window nothing has used (12 000 bytes over quinn's
+///    333 ms initial RTT is 288 kbit/s) and it collapsed the 6 / 12 Mbit
+///    ladder to the 2 Mbit start rate;
+/// 4. when the window is empty the estimator is told the capacity is
+///    unbounded (up to its configured maximum), so a stale reading does not
+///    cap probes for as long as the path stays unfilled.
+#[derive(Debug, Default)]
+pub(super) struct CapacityHintWindow {
+    samples: std::collections::VecDeque<(std::time::Instant, f32)>,
+    state: HintState,
+}
+
+impl CapacityHintWindow {
+    pub(super) fn window(srtt: std::time::Duration) -> std::time::Duration {
+        (srtt * HINT_WINDOW_SRTTS).max(HINT_WINDOW_FLOOR)
+    }
+
+    /// Take one reading at `now`.
+    pub(super) fn observe(
+        &mut self,
+        now: std::time::Instant,
+        srtt: std::time::Duration,
+        bytes_per_us: f32,
+        quinn_limited: bool,
+        feedback_heard: bool,
+    ) -> HintAction {
+        let window = Self::window(srtt);
+        while self
+            .samples
+            .front()
+            .is_some_and(|(t, _)| now.saturating_duration_since(*t) > window)
+        {
+            self.samples.pop_front();
+        }
+        if quinn_limited {
+            self.samples.push_back((now, bytes_per_us));
+        }
+        if !feedback_heard {
+            return HintAction::None;
+        }
+        match self.samples.iter().map(|(_, v)| *v).reduce(f32::min) {
+            Some(min) => {
+                self.state = HintState::Bounded;
+                HintAction::Feed(min)
+            }
+            None => self.unbounded(),
+        }
+    }
+
+    /// The path is idle: forget every reading.
+    pub(super) fn clear(&mut self, feedback_heard: bool) -> HintAction {
+        self.samples.clear();
+        if feedback_heard {
+            self.unbounded()
+        } else {
+            HintAction::None
+        }
+    }
+
+    fn unbounded(&mut self) -> HintAction {
+        if std::mem::replace(&mut self.state, HintState::Unbounded) == HintState::Unbounded {
+            HintAction::None
+        } else {
+            HintAction::Unbounded
+        }
+    }
+}
 
 /// How long without a packet on the path before `cwnd / rtt` stops being
 /// treated as a live measurement. Comfortably longer than a 33 ms frame tick
@@ -565,26 +673,22 @@ impl IoBridge {
         (rtt * LOSS_HORIZON_RTTS).clamp(LOSS_HORIZON_FLOOR, LOSS_HORIZON_CEIL)
     }
 
-    /// Record one `cwnd / rtt` sample and, once the window is full, feed its
-    /// minimum to the estimator as a capacity ceiling. See the call site for
-    /// why the minimum and why only while the path is busy.
-    fn push_capacity_hint(&mut self, bytes_per_us: f32) {
-        self.capacity_hint_window.push_back(bytes_per_us);
-        while self.capacity_hint_window.len() > CAPACITY_HINT_WINDOW {
-            self.capacity_hint_window.pop_front();
-        }
-        if self.capacity_hint_window.len() == CAPACITY_HINT_WINDOW {
-            let conservative = self
-                .capacity_hint_window
-                .iter()
-                .copied()
-                .fold(f32::INFINITY, f32::min);
-            self.instr.hint_feeds += 1;
-            if self.bwe.snapshot().samples_seen == 0 {
-                self.instr.hint_feeds_before_feedback += 1;
+    /// Hand the estimator what the hint window decided. See
+    /// `CapacityHintWindow` for the rules.
+    fn apply_hint_action(&mut self, action: HintAction) {
+        match action {
+            HintAction::Feed(v) => {
+                self.instr.hint_feeds += 1;
+                if self.bwe.snapshot().samples_seen == 0 {
+                    self.instr.hint_feeds_before_feedback += 1;
+                }
+                self.bwe.set_transport_capacity_hint(v, now_std());
             }
-            self.bwe
-                .set_transport_capacity_hint(conservative, now_std());
+            HintAction::Unbounded => {
+                self.instr.hint_unbounded += 1;
+                self.bwe.withdraw_transport_capacity_hint(now_std());
+            }
+            HintAction::None => {}
         }
     }
 
@@ -645,15 +749,27 @@ impl IoBridge {
             Some(t) => now_std().saturating_duration_since(t) > PATH_IDLE_AFTER,
             None => true,
         };
-        if idle {
+        let action = if idle {
             // The classifier's `adaptation_context` below is deliberately
             // still updated: it wants the path's current state whether or not
             // the link is busy. Only the BWE hint, which licenses the
             // estimator to *raise* its estimate, is withheld.
-            self.capacity_hint_window.clear();
+            self.capacity_hint_window
+                .clear(self.bwe.snapshot().samples_seen > 0)
         } else {
-            self.push_capacity_hint(bytes_per_us);
-        }
+            // quinn is the limit when it still holds datagrams at the end of
+            // the turn (cwnd, or its pacer at `1.25 x cwnd / srtt`).
+            let quinn_limited = self.live_fifo_depth().unwrap_or(0) > 0;
+            let feedback_heard = self.bwe.snapshot().samples_seen > 0;
+            self.capacity_hint_window.observe(
+                now_std(),
+                std::time::Duration::from_secs_f64(f64::from(smoothed_rtt_us) / 1e6),
+                bytes_per_us,
+                quinn_limited,
+                feedback_heard,
+            )
+        };
+        self.apply_hint_action(action);
         self.adaptation_context.bytes_per_us = bytes_per_us;
         self.adaptation_context.smoothed_rtt_us = smoothed_rtt_us;
         self.adaptation_context.last_update_seq =
@@ -701,5 +817,122 @@ impl IoBridge {
             self.apply_path_stats_snapshot(cwnd, rtt_us);
         }
         self.update_transport_probe();
+    }
+}
+
+#[cfg(test)]
+mod hint_window_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const MS: Duration = Duration::from_millis(1);
+
+    /// The window is a span of time. Sixteen readings taken within a few
+    /// milliseconds are all inside it; readings older than the window are
+    /// gone however few came after.
+    #[test]
+    fn the_window_is_a_span_of_time_not_a_count() {
+        let t0 = Instant::now();
+        let srtt = Duration::from_millis(20);
+        let mut w = CapacityHintWindow::default();
+        // Twenty readings in 2 ms: all kept (the old window kept sixteen).
+        for i in 0..20u32 {
+            w.observe(
+                t0 + Duration::from_micros(100 * i as u64),
+                srtt,
+                5.0,
+                true,
+                true,
+            );
+        }
+        assert_eq!(w.samples.len(), 20);
+        // 4 x 20 ms = 80 ms is under the 100 ms floor, so the window is 100 ms:
+        // a reading 101 ms later finds every earlier one expired.
+        assert_eq!(CapacityHintWindow::window(srtt), 100 * MS);
+        w.observe(t0 + 103 * MS, srtt, 7.0, true, true);
+        assert_eq!(w.samples.len(), 1);
+        // 4 round trips once that is longer than the floor.
+        assert_eq!(
+            CapacityHintWindow::window(Duration::from_millis(60)),
+            240 * MS
+        );
+    }
+
+    #[test]
+    fn only_readings_taken_while_quinn_was_the_limit_count() {
+        let t0 = Instant::now();
+        let srtt = Duration::from_millis(30);
+        let mut w = CapacityHintWindow::default();
+        // A wildly high reading while the bucket was the limit: ignored, and
+        // with nothing else to go on the estimator is told nothing caps it.
+        assert_eq!(
+            w.observe(t0, srtt, 90.0, false, true),
+            HintAction::Unbounded
+        );
+        assert!(w.samples.is_empty());
+        // Then a real one.
+        assert_eq!(
+            w.observe(t0 + MS, srtt, 3.0, true, true),
+            HintAction::Feed(3.0)
+        );
+        // The minimum over the window is what is fed.
+        assert_eq!(
+            w.observe(t0 + 2 * MS, srtt, 4.0, true, true),
+            HintAction::Feed(3.0)
+        );
+    }
+
+    /// Nothing is fed before the estimator has heard feedback, however many
+    /// readings came first; the first feedback then releases what was seen.
+    #[test]
+    fn nothing_is_fed_before_the_first_feedback_whatever_the_reading_count() {
+        let t0 = Instant::now();
+        let srtt = Duration::from_millis(40);
+        for readings in [0u64, 1, 15, 16, 17, 64, 1_000] {
+            let mut w = CapacityHintWindow::default();
+            for i in 0..readings {
+                let a = w.observe(t0 + Duration::from_micros(10 * i), srtt, 0.036, true, false);
+                assert_eq!(a, HintAction::None, "{readings} readings, before feedback");
+            }
+            let after = w.observe(
+                t0 + Duration::from_micros(10 * readings),
+                srtt,
+                0.036,
+                true,
+                true,
+            );
+            assert_eq!(after, HintAction::Feed(0.036), "{readings} readings");
+        }
+    }
+
+    #[test]
+    fn the_hint_is_unbounded_once_when_the_window_empties() {
+        let t0 = Instant::now();
+        let srtt = Duration::from_millis(20);
+        let mut w = CapacityHintWindow::default();
+        assert_eq!(w.observe(t0, srtt, 2.0, true, true), HintAction::Feed(2.0));
+        // Not quinn-limited any more; the reading ages out after 100 ms.
+        assert_eq!(
+            w.observe(t0 + 50 * MS, srtt, 9.0, false, true),
+            HintAction::Feed(2.0)
+        );
+        assert_eq!(
+            w.observe(t0 + 150 * MS, srtt, 9.0, false, true),
+            HintAction::Unbounded
+        );
+        assert_eq!(
+            w.observe(t0 + 160 * MS, srtt, 9.0, false, true),
+            HintAction::None,
+            "told once, not every turn"
+        );
+        // An idle path releases a hint too, and once.
+        assert_eq!(
+            w.observe(t0 + 170 * MS, srtt, 2.0, true, true),
+            HintAction::Feed(2.0)
+        );
+        assert_eq!(w.clear(true), HintAction::Unbounded);
+        assert_eq!(w.clear(true), HintAction::None);
+        // Before any feedback there is nothing to release.
+        assert_eq!(CapacityHintWindow::default().clear(false), HintAction::None);
     }
 }

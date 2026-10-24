@@ -3002,6 +3002,76 @@ async fn sample_quic_path_stats_updates_bytes_per_us_and_rtt() {
     assert!((bridge.adaptation_context.bytes_per_us - 5.0).abs() < 0.01);
 }
 
+/// The first probe ladder is never capped by a reading taken before any
+/// feedback (design gate P6a, the glue half).
+///
+/// The hint caps goog_cc's probes at `max(estimate, hint)`. Before anything is
+/// measured quinn's window over its 333 ms initial RTT reads 288 kbit/s, so a
+/// hint fed ahead of the first feedback collapses the 6 / 12 Mbit ladder to
+/// the 2 Mbit start rate, and the sender then never exceeds quinn's window and
+/// never finds out. The old window was sixteen readings, one per loop turn: a
+/// handshake that cost the loop enough turns lost that race, and the hybrid
+/// post-quantum handshake lost it far more often than the classical one.
+///
+/// The two key exchanges differ here only in how many turns precede the first
+/// feedback, so this sweeps that count over a range that covers both (the
+/// measured threshold was 16; the sweep runs 0 to 256), with every reading
+/// taken while quinn is the limit, which is the worst case for the hint.
+#[tokio::test]
+async fn the_first_probe_ladder_is_never_capped_whatever_the_handshake_cost() {
+    let start = crate::transport::bwe::BweWrapper::INITIAL_BPS;
+    for turns_before_feedback in [0usize, 1, 8, 15, 16, 17, 24, 64, 256] {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        // quinn is the limit on every turn, and the path is busy.
+        bridge.forced_fifo_depth_for_test = Some(1_200);
+        for _ in 0..turns_before_feedback {
+            bridge.path_last_sent_at = Some(now_std());
+            // 12 000 bytes over 333 ms: quinn's window before any measurement.
+            bridge.apply_path_stats_snapshot(12_000, 333_000.0);
+        }
+        assert_eq!(
+            bridge.instr.hint_feeds_before_feedback, 0,
+            "{turns_before_feedback} turns: the hint reached the estimator before any feedback"
+        );
+        // The first feedback: a few acknowledged datagrams.
+        let t0 = now_std();
+        let records: Vec<crate::transport::bwe::AckArrival> = (0..12u32)
+            .map(|i| crate::transport::bwe::AckArrival {
+                server_emit_us: i as u64 * 1_000,
+                client_arrival_ms_lo16: (i + 15) as u16,
+                size_bytes: 1_200,
+                probe: None,
+            })
+            .collect();
+        bridge.bwe.update(
+            &records,
+            &[],
+            t0 + std::time::Duration::from_millis(20),
+            14_400,
+        );
+        let stats = bridge.bwe.snapshot().stats;
+        assert!(
+            stats.probe_requests >= 2,
+            "{turns_before_feedback} turns: no ladder was requested ({stats:?})"
+        );
+        // `ProbeControllerConfig::p1` and `p2`: 3 x and 6 x the start rate.
+        assert_eq!(
+            &stats.first_probe_targets_bps[..2],
+            &[3 * start, 6 * start],
+            "{turns_before_feedback} turns: the ladder was capped"
+        );
+        assert!(
+            stats.first_probe_targets_bps[..2]
+                .iter()
+                .all(|t| *t >= 3 * start),
+            "no probe cluster target is below 3 x the start rate"
+        );
+    }
+}
+
 /// The budget floor is one datagram, not a fixed 256 KiB.
 ///
 /// This is a regression gate, not a description: the old flat floor was
@@ -3030,7 +3100,7 @@ async fn the_budget_floor_is_one_datagram_not_a_fixed_quarter_megabyte() {
     );
 
     // A fast path must clear the floor and be set by the estimate:
-    // 5 B/µs * 33_333 µs * 0.90 = 149_998 bytes.
+    // 5 B/µs * 33_333 µs = 166_665 bytes.
     bridge.adaptation_context.bytes_per_us = 5.0;
     let fast = bridge.base_budget_bytes();
     assert!(

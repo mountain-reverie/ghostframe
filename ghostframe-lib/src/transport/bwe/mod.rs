@@ -18,6 +18,7 @@
 
 use std::time::{Duration, Instant};
 
+mod ceiling;
 mod googcc;
 mod timeline;
 
@@ -71,6 +72,12 @@ pub struct BweSnapshot {
     /// comment for why the two fields diverge and `pad_window` (padding to
     /// hold a floor rate) is deliberately not surfaced here at all.
     pub pacer_rate_bps: Option<u64>,
+    /// Countable bytes per token the admission bucket spends: how much of
+    /// what is billed (parity, framing, control datagrams) goog_cc is told
+    /// of. The estimate and `pacer_rate_bps` are rates of countable bytes, so
+    /// the token rate that carries them is `rate / payload_fraction`. In
+    /// `(0.5, 1.0]`; `1.0` until there is spend to measure it on.
+    pub payload_fraction: f64,
     /// Counters for scenes and tests; none of them steers anything.
     pub stats: BweStats,
 }
@@ -84,6 +91,27 @@ pub struct BweStats {
     /// (zero for a cluster not yet asked for). The first two are the startup
     /// ladder, `3 x` and `6 x` the start rate when nothing capped it.
     pub first_probe_targets_bps: [u64; 4],
+    /// Readings of the estimate ceiling that had a full window of history.
+    pub ceiling_reads: u64,
+    /// Of those, readings taken while the sender was saturated, so a ceiling
+    /// applied. Zero in an app-limited run proves the gate held.
+    pub ceiling_saturated_reads: u64,
+    /// Readings at which the ceiling was below the estimate and lowered what
+    /// was published. Zero in a run that was meant to be bounded proves
+    /// nothing was measured.
+    pub ceiling_binding_reads: u64,
+    /// Times goog_cc was handed the ceiling as its estimate because its own
+    /// was above it.
+    pub ceiling_reseeds_down: u64,
+    /// Times it was handed the ceiling because its own was below it while the
+    /// path showed no limit.
+    pub ceiling_reseeds_up: u64,
+    /// The payload fraction last measured, in parts per million.
+    pub payload_fraction_ppm: u64,
+    /// The last acknowledged rate read, bits per second.
+    pub ceiling_acked_bps: u64,
+    /// The last ceiling applied (zero if none was), bits per second.
+    pub ceiling_bps: u64,
 }
 
 /// A probe goog_cc has asked for (BWE Stage 2.4), surfaced from
@@ -180,6 +208,25 @@ impl BweWrapper {
     /// for what this number is and is not.
     pub fn set_transport_capacity_hint(&mut self, bytes_per_us: f32, now: Instant) {
         self.driver.set_transport_capacity_hint(bytes_per_us, now);
+    }
+
+    /// Withdraw the capacity hint: the path is no longer being filled, so
+    /// `cwnd / srtt` no longer describes it and must not cap a probe.
+    pub fn withdraw_transport_capacity_hint(&mut self, now: Instant) {
+        self.driver.withdraw_transport_capacity_hint(now);
+    }
+
+    /// Wire bytes of the transmissions recorded so far (cumulative): what
+    /// goog_cc is told of what was sent, to set against the tokens spent.
+    pub fn note_offered(&mut self, now: Instant, cumulative_bytes: f64) {
+        self.driver.note_offered(now, cumulative_bytes);
+    }
+
+    /// The admission bucket's cumulative grant and spend, read at the end of
+    /// an admission pass. The estimate ceiling uses them to tell a sender that
+    /// was rate-limited from one with nothing to send.
+    pub fn note_admission(&mut self, now: Instant, granted_bytes: f64, spent_bytes: f64) {
+        self.driver.note_admission(now, granted_bytes, spent_bytes);
     }
 
     /// Return and clear the most recently requested probe cluster, if any

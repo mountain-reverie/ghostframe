@@ -131,6 +131,15 @@ pub(crate) struct AdmissionBucket {
     /// gated classes get nothing. That is a bitrate-control matter (H.264 has
     /// no BWE-linked rate yet), not something a bucket can fix.
     debt_cap: f64,
+    /// Cumulative tokens credited by [`Self::refill`] at the rate given, before
+    /// the bank cap trimmed them. A sender that does not use its grant has
+    /// the trimmed part counted here and not in `spent_total`.
+    granted_total: f64,
+    /// Cumulative tokens granted by [`Self::try_take`], less refunds. Soft
+    /// charges ([`Self::charge`]: H.264 frames and control datagrams, which
+    /// are not tile transmissions and are never acknowledged by `wire_seq`)
+    /// are left out.
+    spent_total: f64,
 }
 
 impl AdmissionBucket {
@@ -139,7 +148,21 @@ impl AdmissionBucket {
             tokens: 0.0,
             last_refill: None,
             debt_cap: 0.0,
+            granted_total: 0.0,
+            spent_total: 0.0,
         }
+    }
+
+    /// Cumulative tokens the rate has granted (untrimmed). Together with
+    /// [`Self::spent_total`], the estimator's measure of whether the sender
+    /// used what it was allowed.
+    pub(crate) fn granted_total(&self) -> f64 {
+        self.granted_total
+    }
+
+    /// Cumulative tokens spent on granted sends (net of refunds).
+    pub(crate) fn spent_total(&self) -> f64 {
+        self.spent_total
     }
 
     /// Credit the time elapsed since the last refill at `rate` bytes per
@@ -157,6 +180,7 @@ impl AdmissionBucket {
             None => self.tokens = cap,
             Some(prev) => {
                 let dt = now.saturating_duration_since(prev).as_secs_f64();
+                self.granted_total += rate.max(0.0) * dt;
                 self.tokens = (self.tokens + rate.max(0.0) * dt).min(cap);
             }
         }
@@ -179,6 +203,7 @@ impl AdmissionBucket {
     pub(crate) fn try_take(&mut self, bytes: usize) -> bool {
         if self.tokens >= bytes as f64 {
             self.tokens -= bytes as f64;
+            self.spent_total += bytes as f64;
             true
         } else {
             false
@@ -188,6 +213,7 @@ impl AdmissionBucket {
     /// Give back a grant whose send was refused downstream.
     pub(crate) fn refund(&mut self, bytes: usize) {
         self.tokens += bytes as f64;
+        self.spent_total -= bytes as f64;
     }
 
     /// Bill `bytes` that were sent without asking (an H.264 frame). May drive

@@ -45,9 +45,19 @@ use crate::transport::instruments::{classify_rate_term, BudgetTerm};
 /// capture; the rate is `per-tick bytes / tick`.
 pub(crate) const SCHEDULER_TICK_INTERVAL_US: f64 = 33_333.0;
 
-// Leave 10 % headroom in the rate so we don't push right up to quinn's
-// drain rate (ACKs, feedback, NACK retransmits still need wire).
-const SCHEDULER_TICK_BUDGET_FRACTION: f64 = 0.90;
+/// The share of `cwnd / srtt` the rate may use. It was 0.90, "so we don't push
+/// right up to quinn's drain rate", from when nothing bounded quinn's datagram
+/// queue (16 MiB). The depth gate bounds it by construction now (a datagram is
+/// admitted only while the queue holds under `D_target`, 10 ms of the rate),
+/// so a rate at the whole of `cwnd / srtt` cannot build a queue, and what the
+/// headroom did instead was close a loop: at 0.9 quinn's datagram queue is
+/// empty at the end of every turn, `app_limited` is set, Cubic's `on_ack`
+/// returns early, the window stops growing, and `cwnd / srtt` stops growing
+/// with it (design section 2.3; the PR-0 instrument read `cwnd` as the
+/// binding term in 66 to 99 % of passes). At 1.0 the queue stands at the gate
+/// while the estimate permits more than the window and Cubic grows, and the
+/// estimate (`pacer_rate_bps`) is the binding term whenever it is the smaller.
+const SCHEDULER_TICK_BUDGET_FRACTION: f64 = 1.0;
 
 /// Rate floor, in datagrams per tick rather than bytes.
 ///
@@ -208,6 +218,15 @@ pub fn combine_pacing_budget(
     }
 }
 
+/// The token rate that carries `countable_bps` of the bytes goog_cc counts,
+/// given the payload fraction (countable bytes per token billed). The fraction
+/// is clamped to `[0.5, 1.0]`: a reading outside it is a window that straddled
+/// a burst of control traffic, and more than every token carrying payload is
+/// not possible.
+pub(super) fn countable_to_token_bps(countable_bps: u64, payload_fraction: f64) -> u64 {
+    (countable_bps as f64 / payload_fraction.clamp(0.5, 1.0)) as u64
+}
+
 /// Why a drain of the emission queue stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Stop {
@@ -288,36 +307,70 @@ impl IoBridge {
             + Self::WT_VARINT_OVERHEAD
     }
 
-    /// The rate admission runs at, bytes per second, and which input set it.
+    /// The rate admission runs at, bytes per second, and which input set it:
     ///
-    /// `0.9 x cwnd / srtt` (floored at one datagram per tick), then the
-    /// minimum with goog_cc's pacer once that is trusted, then the maximum
-    /// with a probe window's target while one is open: the same arithmetic as
-    /// the per-tick budget, divided by the tick.
+    /// ```text
+    /// R = max( probe_target / f,
+    ///          min( max(cwnd / srtt, one datagram per tick),
+    ///               min(E, K x A) / f ) )                      K = 1 / 0.85
+    /// ```
+    ///
+    /// * `E` is goog_cc's loss-based target, `A` the acknowledged rate over a
+    ///   window (`bwe/ceiling.rs`; `min(E, K x A)` is `pacer_rate_bps`:
+    ///   goog_cc's pacer at `pacing_factor = 1.0`, bounded by the estimate
+    ///   ceiling while the sender is saturated).
+    /// * `f` is the payload fraction (`BweSnapshot::payload_fraction`, 0.8 to
+    ///   0.9 here): the countable share of the bytes the bucket bills. `E`, `A`
+    ///   and `probe_target` are rates of the bytes goog_cc counts; the bucket
+    ///   bills parity, framing and control datagrams too, so the token rate
+    ///   that carries a countable rate is that rate over `f`.
+    /// * The `min` with the pacer is taken only once the estimator has
+    ///   `BWE_PACED_MODE_SAMPLE_THRESHOLD` samples (before that `R` is the
+    ///   cwnd term alone). `probe_target` is a probe window's rate while one
+    ///   is open, zero otherwise. The same arithmetic as the per-tick budget,
+    ///   divided by the tick.
+    ///
+    /// The pacing factor was goog_cc's default of 2.5, which made the pacer
+    /// term `2.5 x E`: it bound only while the cwnd term was under `2.5 x E`,
+    /// so in steady state the cwnd decided and the estimate did not limit what
+    /// was sent (the PR-0 instrument read `cwnd` in 66 to 99 % of passes across
+    /// nested_cc's seven scenes). At 1.0 the pacer term is the estimate.
     fn admission_rate(&self) -> AdmissionRate {
         let tick_s = SCHEDULER_TICK_INTERVAL_US / 1_000_000.0;
         let snap = self.bwe.snapshot();
         let mode = select_pacing_mode(snap.samples_seen);
+        // The estimate and the probe target are rates of the bytes goog_cc
+        // counts; the bucket bills every byte (parity, framing, control). The
+        // token rate that carries a countable rate is that rate over the
+        // payload fraction. Without the division a sender paced at the
+        // estimate offered goog_cc only `fraction x` the estimate, and a
+        // probe cluster fell short of the bytes goog_cc requires of it (80 %
+        // of target x duration) in every window.
+        let pacer_tokens_bps = snap
+            .pacer_rate_bps
+            .map(|bps| countable_to_token_bps(bps, snap.payload_fraction));
         let paced = combine_pacing_budget(
             mode,
             self.base_budget_bytes(),
-            snap.pacer_rate_bps,
+            pacer_tokens_bps,
             SCHEDULER_TICK_INTERVAL_US,
         );
         // A probe must send at *least* its target rate, but never less than
         // we otherwise would: overriding outright throttled emission whenever
-        // the target sat below the pacer rate (the pacer runs at 2.5x the
-        // estimate, an early ladder rung is only 2x). Measured on the
-        // propagation-delay scene: delivered bytes fell 23 % (747 kB -> 577 kB).
+        // the target sat below the pacer rate. Measured on the
+        // propagation-delay scene (when the pacer ran at 2.5x the estimate):
+        // delivered bytes fell 23 % (747 kB -> 577 kB).
         let (per_tick, probe_binds) = match &self.active_probe {
             Some(probe) => {
-                let probe_budget =
-                    pacer_tick_budget_bytes(probe.target_rate_bps, SCHEDULER_TICK_INTERVAL_US);
+                let probe_budget = pacer_tick_budget_bytes(
+                    countable_to_token_bps(probe.target_rate_bps, snap.payload_fraction),
+                    SCHEDULER_TICK_INTERVAL_US,
+                );
                 (probe_budget.max(paced), probe_budget > paced)
             }
             None => (paced, false),
         };
-        let pacer_rate = match (mode, snap.pacer_rate_bps) {
+        let pacer_rate = match (mode, pacer_tokens_bps) {
             (PacingMode::Paced, Some(bps)) => Some(bps as f64 / 8.0),
             _ => None,
         };
@@ -451,6 +504,13 @@ impl IoBridge {
             }
         }
         out.admitted = (self.instr.admission.datagrams_admitted - admitted_before) as usize;
+        // What the bucket granted and what was spent of it, for the estimate
+        // ceiling: it applies only to a sender that used its grant.
+        self.bwe.note_admission(
+            now,
+            self.admission.granted_total(),
+            self.admission.spent_total(),
+        );
 
         // What held the rest back, and when to look again.
         self.admission_wake = None;
@@ -643,5 +703,27 @@ impl IoBridge {
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn set_tick_budget_floor_bytes(&mut self, bytes: usize) {
         self.tick_budget_floor_bytes = Some(bytes);
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+
+    #[test]
+    fn a_countable_rate_is_carried_by_that_rate_over_the_payload_fraction() {
+        // 8.4 Mbit of countable bytes at 0.84 countable per token billed
+        // needs 10 Mbit of tokens.
+        assert_eq!(countable_to_token_bps(8_400_000, 0.84), 10_000_000);
+        // No overhead measured yet: the rate passes through.
+        assert_eq!(countable_to_token_bps(8_400_000, 1.0), 8_400_000);
+    }
+
+    #[test]
+    fn the_payload_fraction_is_clamped_to_what_is_possible() {
+        // Above 1 would bill less than the payload; below 0.5 is a window of
+        // control traffic, not the sender's overhead.
+        assert_eq!(countable_to_token_bps(1_000_000, 1.7), 1_000_000);
+        assert_eq!(countable_to_token_bps(1_000_000, 0.1), 2_000_000);
     }
 }
