@@ -126,7 +126,8 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
          admission[pumps={} admitted={} d_target_max_B={} depth_violations={} backlog_turns={} starved_turns={} \
          charged_B={} soft_charged_B={} ungated_at_depth={}] \
          ledger[declared={} flushed={} overflowed={} late_before_flush={} late_after_flush={} \
-         late_unreported={} unknown_acks={} tombstone_evictions={}] \
+         late_unreported={} unknown_acks={} tombstone_evictions={} expired_before_departure={} \
+         departures_stamped={} evicted_before_departure={} rto_armed_at_departure={}] \
          ecn[ect0={} unmarked={} last_marked={}] rto_fired={} rto_spurious={} rto_useful={} \
          generation_replacements={} rto_fired_superseded={}",
         i.window_us / 1000,
@@ -179,6 +180,10 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
         i.late_acked_unreported,
         i.ledger_unknown_acks,
         i.ledger_tombstone_evictions,
+        i.ledger_expired_before_departure,
+        i.ledger_departures_stamped,
+        i.ledger_evicted_before_departure,
+        i.rto_armed_at_departure,
         i.ecn.ect0_tx,
         i.ecn.unmarked_tx,
         i.ecn.last_marked,
@@ -249,15 +254,15 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
         i.quinn_bytes_departed,
         i.quinn_bytes_enqueued
     );
-    // Departure mirror: every datagram that went through the send path is
-    // either stamped or still queued; only the control datagrams that bypass
-    // the mirror (pongs, eviction) may be missing.
+    // Departure tracker: every datagram quinn accepted for the live session
+    // (tiles, parity, H.264, dimensions, pongs) is either stamped or still
+    // queued. Eviction notices are the one exception and none are sent here.
     let all: u64 = i.offered.datagrams.iter().sum();
-    let tracked = all - i.offered.datagrams[W::Control.index()];
     assert!(i.lag_samples > 0, "{n}: no departure was stamped");
-    assert!(
-        tracked <= i.lag_samples + i.mirror_len && i.lag_samples + i.mirror_len <= all,
-        "{n}: mirror lost track of datagrams: stamped {} + queued {} vs {tracked}..{all}",
+    assert_eq!(
+        i.lag_samples + i.mirror_len,
+        all,
+        "{n}: tracker lost track of datagrams: stamped {} + queued {}",
         i.lag_samples,
         i.mirror_len
     );
@@ -268,6 +273,17 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
         i.lag_p50_us,
         i.lag_p95_us,
         i.lag_max_us
+    );
+    // F3: the loss clock starts at departure. A verdict on a transmission
+    // that is still queued is a defect, and the stamps must have arrived for
+    // the zero to mean anything.
+    assert!(
+        i.ledger_departures_stamped > 0 && i.rto_armed_at_departure > 0,
+        "{n}: no departure reached the ledger or the emitter"
+    );
+    assert_eq!(
+        i.ledger_expired_before_departure, 0,
+        "{n}: transmissions declared lost while still queued"
     );
     // Budget binding: every tick lands in exactly one term.
     assert!(
@@ -302,10 +318,16 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
             i.ledger_losses_flushed + i.ledger_losses_overflowed <= i.ledger_losses_declared,
             "{n}: more losses accounted for than declared"
         );
-        assert!(
-            i.late_acked_before_flush > 0,
-            "{n}: no late ack withdrew a pending loss"
-        );
+        // Not asserted any more: that some late ack withdrew a pending loss
+        // (`late_acked_before_flush > 0`; 354 / 160 for seed b057, iid / burst,
+        // before the departure tracker). Those were transmissions declared lost
+        // by a clock that started at enqueue while they stood in a queue, then
+        // acknowledged once they had been sent. The clock starts at departure
+        // now, so a transmission is declared lost only after a horizon on the
+        // wire, and none is acknowledged after that on this 10 ms path
+        // (0 / 0, and 0 in the other two seeds). The mechanism itself is pinned
+        // by the lib tests `a_late_ack_retracts_the_pending_loss_it_contradicts`
+        // and `a_late_ack_after_the_flush_is_counted_apart_from_one_before_it`.
         assert!(
             i.lag_p50_us > 1_000,
             "{n}: a standing queue shows in the lag"

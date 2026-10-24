@@ -151,6 +151,105 @@ fn assert_premises(r: &BrowserlessResult, scene: &str, min_points: usize) {
     );
 }
 
+/// The D1 transport instruments for this scene, one METRIC line each: the
+/// FIFO, the departure lag, and the ledger's verdicts against the real drops.
+/// `expired_before_departure` is gated in `s1_slow_start_c10_droptail`.
+fn report_d1(scene: &str, r: &BrowserlessResult) {
+    let i = &r.transport.instr;
+    metric(scene, "d1_fifo_max_B", i.fifo_depth_max);
+    metric(scene, "d1_fifo_mean_B", i.fifo_depth_mean);
+    metric(
+        scene,
+        "d1_depart_lag_us",
+        format!(
+            "n={} p50={} p95={} max={}",
+            i.lag_samples, i.lag_p50_us, i.lag_p95_us, i.lag_max_us
+        ),
+    );
+    metric(
+        scene,
+        "d1_admission",
+        format!(
+            "d_target_max_B={} depth_violations={} gate_stops[depth={} tokens={}] pacer_term={} cwnd_term={}",
+            i.admission.d_target_max,
+            i.admission.depth_violations,
+            i.budget.gate_depth,
+            i.budget.gate_tokens,
+            i.budget.pacer,
+            i.budget.cwnd
+        ),
+    );
+    metric(scene, "d1_departures_stamped", i.ledger_departures_stamped);
+    metric(
+        scene,
+        "d1_expired_before_departure",
+        i.ledger_expired_before_departure,
+    );
+    metric(
+        scene,
+        "d1_evicted_before_departure",
+        i.ledger_evicted_before_departure,
+    );
+    metric(scene, "d1_rto_armed_at_departure", i.rto_armed_at_departure);
+    metric(
+        scene,
+        "d1_ledger_losses",
+        format!(
+            "declared={} flushed={} cap_trimmed={} real_drops={}",
+            i.ledger_losses_declared,
+            i.ledger_losses_flushed,
+            i.ledger_losses_overflowed,
+            r.s2c_datagrams_dropped
+        ),
+    );
+    metric(
+        scene,
+        "d1_rto",
+        format!(
+            "fired={} spurious={} useful={}",
+            r.rto_fired, r.rto_spurious, r.rto_useful
+        ),
+    );
+}
+
+/// P3: no transmission is declared lost by the ledger while it is still in
+/// the FIFO (or the emitter's queue): the loss clock starts at departure.
+///
+/// Structural, so exact: the counter is read from the ledger record at the
+/// moment of each verdict, and is zero by construction of the code under test,
+/// whatever the scheduling. The premises make the zero mean something: the
+/// FIFO really did hold datagrams (departures were stamped, with a measurable
+/// lag, and the FIFO stood non-empty), the loss clock really ran (verdicts
+/// were issued), and the retransmission timers really were started by
+/// departures.
+fn assert_p3(scene: &str, r: &BrowserlessResult) {
+    let i = &r.transport.instr;
+    assert!(
+        i.fifo_depth_max > 0 && i.quinn_limited_turns > 0,
+        "{scene}: premise: the FIFO was never non-empty"
+    );
+    assert!(
+        i.lag_samples > 0 && i.lag_max_us > 0,
+        "{scene}: premise: no datagram waited in the FIFO"
+    );
+    assert!(
+        i.ledger_departures_stamped > 0,
+        "{scene}: premise: no departure reached the ledger"
+    );
+    assert!(
+        i.ledger_losses_declared > 0,
+        "{scene}: premise: the ledger issued no verdict, so the zero below proves nothing"
+    );
+    assert!(
+        i.rto_armed_at_departure > 0,
+        "{scene}: premise: no retransmission timer was started by a departure"
+    );
+    assert_eq!(
+        i.ledger_expired_before_departure, 0,
+        "{scene}: transmissions declared lost while still queued"
+    );
+}
+
 /// Everything that is not a timing metric: queue/latency/probe context so a
 /// reader can see whether the estimate tracks the queue rather than the link.
 fn report_context(scene: &str, r: &BrowserlessResult, cap_bps: f64, from_us: u64, to_us: u64) {
@@ -178,6 +277,7 @@ fn report_context(scene: &str, r: &BrowserlessResult, cap_bps: f64, from_us: u64
         r.queued_critical_latency_mean_us,
     );
     metric(scene, "implausible_rtt", r.implausible_rtt_samples);
+    report_d1(scene, r);
     if let Some(m) = cc::median_bps(s, from_us, to_us) {
         metric(scene, "settled_median_bps", m);
         metric(
@@ -239,6 +339,9 @@ async fn slow_start(name: &str, cap_mbit: u64, q: Queue, seed: u64) {
         fmt_opt(cc::peak_to_peak_over_mean(s, tail_from, end).map(|v| format!("{v:.3}"))),
     );
     report_context(name, &r, cap_bps, tail_from, end);
+    if name == "s1_c10_droptail" {
+        assert_p3(name, &r);
+    }
 }
 
 #[tokio::test(start_paused = true)]
