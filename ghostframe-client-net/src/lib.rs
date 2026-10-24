@@ -129,6 +129,7 @@ impl ClientNet {
     /// differ in how many loop iterations they cost the server before the
     /// first feedback, which is what the bandwidth-estimator startup scenes
     /// compare. Never used by the product.
+    #[doc(hidden)]
     pub fn with_classical_key_exchange(mut self) -> Self {
         self.classical_kx = true;
         self

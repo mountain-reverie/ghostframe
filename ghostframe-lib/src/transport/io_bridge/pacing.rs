@@ -20,7 +20,10 @@
 //! Boundary with `bwe_glue.rs`: this file consumes the estimator (the
 //! `bwe.snapshot()` samples count and `pacer_rate_bps`) and the probe window
 //! (`active_probe.target_rate_bps` replaces the rate while a window is open)
-//! but does not feed the estimator or manage the window.
+//! but does not manage the window. It hands the estimator one thing, at the
+//! end of every pass: the bucket's cumulative grant and spend
+//! (`bwe.note_admission`), which the estimate ceiling reads to tell a
+//! rate-limited sender from one with nothing to send.
 //! `emit_via_scheduler` straddles the two (it calls
 //! `open_probe_window_for_burst`) and is left here whole.
 //!

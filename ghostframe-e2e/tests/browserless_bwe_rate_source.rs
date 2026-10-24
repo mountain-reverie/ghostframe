@@ -203,7 +203,7 @@ fn report_transport(scene: &str, r: &BrowserlessResult) {
         scene,
         "ceiling",
         format!(
-            "reads={} saturated={} binding={} last_acked_bps={} last_ceiling_bps={} reseeds[down={} up={}] payload_fraction={:.3}",
+            "reads={} saturated={} binding={} last_acked_bps={} last_ceiling_bps={} reseeds[down={} up={} down_skipped_gap={}] lifts[checked={} undone={} blocked_by_queue={}] payload_fraction={:.3}",
             i.bwe.ceiling_reads,
             i.bwe.ceiling_saturated_reads,
             i.bwe.ceiling_binding_reads,
@@ -211,6 +211,10 @@ fn report_transport(scene: &str, r: &BrowserlessResult) {
             i.bwe.ceiling_bps,
             i.bwe.ceiling_reseeds_down,
             i.bwe.ceiling_reseeds_up,
+            i.bwe.ceiling_reseeds_skipped_gap,
+            i.bwe.ceiling_lifts_checked,
+            i.bwe.ceiling_lifts_undone,
+            i.bwe.ceiling_lifts_blocked_queue,
             i.bwe.payload_fraction_ppm as f64 / 1e6
         ),
     );
@@ -332,6 +336,9 @@ async fn p6c_codel_c10_settles_at_the_link_rate_on_five_seeds() {
             ratios.iter().map(|r| format!("{r:.3}")).collect::<Vec<_>>()
         ),
     );
+    // The bound is in goog_cc's countable bytes against the link's nominal
+    // rate: the countable rate delivered on this link is about 0.85 of it, so
+    // 1.05 here is about 1.24 x what was delivered (K = 1.176 is the ceiling).
     for (i, ratio) in ratios.iter().enumerate() {
         assert!(
             *ratio <= 1.05,
@@ -513,12 +520,11 @@ async fn app_limited_then_burst(name: &str, loss: f64) -> Option<u64> {
     // Ten seconds of a sender that wanted a tenth of the link must not have
     // lowered the estimate: it starts at `START_BPS`, and an idle sender's
     // own rate says nothing about the path.
-    if let Some(b) = before {
-        assert!(
-            b as f64 >= 0.9 * START_BPS as f64,
-            "{name}: the estimate fell to {b} while the sender had nothing to send"
-        );
-    }
+    let b = before.expect("estimate samples in the 3 s before the burst");
+    assert!(
+        b as f64 >= 0.9 * START_BPS as f64,
+        "{name}: the estimate fell to {b} while the sender had nothing to send"
+    );
     reach
 }
 

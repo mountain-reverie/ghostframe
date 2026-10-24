@@ -60,6 +60,28 @@ fn s2c_only(mutate: impl FnOnce(&mut NetProfile)) -> LinkOverrides {
     }
 }
 
+/// What reached the screen, from the client's events: decoded tile updates,
+/// the distinct (tile, frame) pairs among them, and the updates beyond the
+/// first of a pair (refinement passes of a tile already shown). Fewer bytes
+/// for the same figures is less waste; fewer figures is content lost.
+fn content_delivered(r: &BrowserlessResult) -> (usize, usize, usize) {
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0;
+    for e in &r.events {
+        if let ClientNetEvent::Core(ghostframe_client_core::Event::TileReady {
+            frame_seq,
+            tile_x,
+            tile_y,
+            ..
+        }) = e
+        {
+            total += 1;
+            seen.insert((*frame_seq, *tile_x, *tile_y));
+        }
+    }
+    (total, seen.len(), total - seen.len())
+}
+
 fn tiles_present(r: &BrowserlessResult) -> usize {
     (0..COLS as u8)
         .flat_map(|x| (0..ROWS as u8).map(move |y| (x, y)))
@@ -242,8 +264,8 @@ fn assert_p3(n: &str, r: &BrowserlessResult, lossy: bool) {
 ///   in ghostframe-lib, which drives the production turn.
 /// - `budget.floor`: the floor is one datagram, far below the bandwidth term
 ///   on this link. Asserted in `the_budget_floor_term_is_counted_when_it_binds`.
-/// - `budget.pacer`: binds in some runs only (the pacer is `K = 1/0.85` times
-///   the estimate, bounded by `K x` the acknowledged rate);
+/// - `budget.pacer`: binds in some runs only (the pacer is 1.0 x the estimate,
+///   bounded by `K = 1/0.85` x the acknowledged rate);
 ///   asserted over the lossy runs together by the caller.
 /// - ECN `last_marked`: ghostbridge carries no ECN, so quinn abandons ECN
 ///   after the first acknowledgements (`ect0_tx` is the handshake's few
@@ -354,12 +376,18 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
         // (0 / 0, and 0 in the other two seeds). The mechanism itself is pinned
         // by the lib tests `a_late_ack_retracts_the_pending_loss_it_contradicts`
         // and `a_late_ack_after_the_flush_is_counted_apart_from_one_before_it`.
-        // The 95th percentile, not the median: with the estimate binding the
-        // admission rate the FIFO is empty at the median (p50 7-16 ms before,
-        // 0-3 ms now) and the gate's queue shows only in the tail.
+        // The tail, not the median, and weaker than it was: the median queue
+        // is gone (p50 was 7-16 ms, is 0-3 ms), and the log-spaced histogram's
+        // p95 reads the same 20.5 ms bucket on either side of this change, so
+        // it no longer tells a standing queue from none. What still does is
+        // the longest wait: a datagram waited at least the gate's own depth,
+        // `QUEUE_TARGET` = 10 ms, which a FIFO that never held more than a
+        // datagram or two could not produce (0 on a clean link's median, tens
+        // of ms to seconds here in every lossy run).
         assert!(
-            i.lag_p95_us > 1_000,
-            "{n}: the FIFO never queued: the lag histogram saw no standing queue"
+            i.lag_max_us >= 10_000,
+            "{n}: no datagram ever waited the gate's depth in the FIFO (max lag {} us)",
+            i.lag_max_us
         );
     }
 }
@@ -551,6 +579,12 @@ async fn burst_loss_report_over_three_seeds() {
             let name = format!("{n}@{seed:#x}");
             report(&name, r);
             report_instruments(&name, r);
+            let (ready, distinct, refinements) = content_delivered(r);
+            println!(
+                "CONTENT {name}: tile_ready={ready} distinct_tile_frames={distinct} refinement_updates={refinements} s2c_bytes={} bytes_per_distinct_tile_frame={:.0}",
+                r.bytes_delivered_s2c,
+                r.bytes_delivered_s2c as f64 / distinct.max(1) as f64
+            );
             assert_established(&name, r);
         }
     }
