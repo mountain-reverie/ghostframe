@@ -195,6 +195,41 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
     );
 }
 
+/// P3 gate: the ledger never declares a transmission lost while it is still
+/// queued (the loss clock starts at departure).
+///
+/// What the counter guards: `expired_before_departure` is read from the
+/// record at the moment of a verdict. It is zero by construction of the
+/// departure-ordered walk in `expire_with_seq`; it does not exercise the
+/// tracker (that rests on the real-quinn proptest in `departure.rs`). It
+/// goes positive if the walk returns to recording order (the mutation
+/// recorded in the PR: 172 at burst 2 %, failing the assertion below), and
+/// only when queued transmissions are in the FIFO and verdicts are issued,
+/// which is what the premises establish. The FIFO must have been non-empty,
+/// departures stamped, timers started by them, and (on lossy runs) the clock
+/// must really have issued verdicts, or the zero proves nothing.
+fn assert_p3(n: &str, r: &BrowserlessResult, lossy: bool) {
+    let i = &r.transport.instr;
+    assert!(
+        i.fifo_depth_max > 0 && i.quinn_limited_turns > 0,
+        "{n}: P3 premise: the FIFO was never non-empty"
+    );
+    assert!(
+        i.ledger_departures_stamped > 0 && i.rto_armed_at_departure > 0,
+        "{n}: P3 premise: no departure reached the ledger or the emitter"
+    );
+    if lossy {
+        assert!(
+            i.ledger_losses_declared > 0,
+            "{n}: P3 premise: no verdict was issued, so the zero proves nothing"
+        );
+    }
+    assert_eq!(
+        i.ledger_expired_before_departure, 0,
+        "{n}: transmissions declared lost while still queued"
+    );
+}
+
 /// Premise for the D1 instruments: a counter that never moves is a dead probe,
 /// and reads exactly like a healthy link. Everything asserted here is exact or
 /// structural, not a threshold: the scene is stepped and reproducible.
@@ -274,17 +309,7 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
         i.lag_p95_us,
         i.lag_max_us
     );
-    // F3: the loss clock starts at departure. A verdict on a transmission
-    // that is still queued is a defect, and the stamps must have arrived for
-    // the zero to mean anything.
-    assert!(
-        i.ledger_departures_stamped > 0 && i.rto_armed_at_departure > 0,
-        "{n}: no departure reached the ledger or the emitter"
-    );
-    assert_eq!(
-        i.ledger_expired_before_departure, 0,
-        "{n}: transmissions declared lost while still queued"
-    );
+    assert_p3(n, r, lossy);
     // Budget binding: every tick lands in exactly one term.
     assert!(
         i.budget.ticks() > 0 && i.budget.cwnd > 0,

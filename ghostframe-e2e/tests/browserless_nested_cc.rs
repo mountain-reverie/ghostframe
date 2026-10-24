@@ -153,7 +153,9 @@ fn assert_premises(r: &BrowserlessResult, scene: &str, min_points: usize) {
 
 /// The D1 transport instruments for this scene, one METRIC line each: the
 /// FIFO, the departure lag, and the ledger's verdicts against the real drops.
-/// `expired_before_departure` is gated in `s1_slow_start_c10_droptail`.
+/// `expired_before_departure` is reported here only; the P3 gate is
+/// `assert_p3` in `browserless_burst_loss` (this scene's FIFO never holds
+/// enough for the counter to be able to move).
 fn report_d1(scene: &str, r: &BrowserlessResult) {
     let i = &r.transport.instr;
     metric(scene, "d1_fifo_max_B", i.fifo_depth_max);
@@ -209,44 +211,6 @@ fn report_d1(scene: &str, r: &BrowserlessResult) {
             "fired={} spurious={} useful={}",
             r.rto_fired, r.rto_spurious, r.rto_useful
         ),
-    );
-}
-
-/// P3: no transmission is declared lost by the ledger while it is still in
-/// the FIFO (or the emitter's queue): the loss clock starts at departure.
-///
-/// Structural, so exact: the counter is read from the ledger record at the
-/// moment of each verdict, and is zero by construction of the code under test,
-/// whatever the scheduling. The premises make the zero mean something: the
-/// FIFO really did hold datagrams (departures were stamped, with a measurable
-/// lag, and the FIFO stood non-empty), the loss clock really ran (verdicts
-/// were issued), and the retransmission timers really were started by
-/// departures.
-fn assert_p3(scene: &str, r: &BrowserlessResult) {
-    let i = &r.transport.instr;
-    assert!(
-        i.fifo_depth_max > 0 && i.quinn_limited_turns > 0,
-        "{scene}: premise: the FIFO was never non-empty"
-    );
-    assert!(
-        i.lag_samples > 0 && i.lag_max_us > 0,
-        "{scene}: premise: no datagram waited in the FIFO"
-    );
-    assert!(
-        i.ledger_departures_stamped > 0,
-        "{scene}: premise: no departure reached the ledger"
-    );
-    assert!(
-        i.ledger_losses_declared > 0,
-        "{scene}: premise: the ledger issued no verdict, so the zero below proves nothing"
-    );
-    assert!(
-        i.rto_armed_at_departure > 0,
-        "{scene}: premise: no retransmission timer was started by a departure"
-    );
-    assert_eq!(
-        i.ledger_expired_before_departure, 0,
-        "{scene}: transmissions declared lost while still queued"
     );
 }
 
@@ -339,9 +303,6 @@ async fn slow_start(name: &str, cap_mbit: u64, q: Queue, seed: u64) {
         fmt_opt(cc::peak_to_peak_over_mean(s, tail_from, end).map(|v| format!("{v:.3}"))),
     );
     report_context(name, &r, cap_bps, tail_from, end);
-    if name == "s1_c10_droptail" {
-        assert_p3(name, &r);
-    }
 }
 
 #[tokio::test(start_paused = true)]

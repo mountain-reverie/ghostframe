@@ -585,10 +585,9 @@ pub struct InstrumentSummary {
     /// 16 384 tombstones, and a late acknowledgement for an evicted one
     /// resolves to nothing, so it appears only in `ledger_unknown_acks`.
     pub late_acked_unreported: u64,
-    /// Transmissions declared lost while still queued in the emitter or in
-    /// quinn's FIFO. Zero by construction (F3: the loss clock starts at
-    /// departure); read from the ledger record at the moment of the verdict,
-    /// so a clock that starts at enqueue again shows here.
+    /// Verdicts issued on a record that had not departed. Zero while the
+    /// ledger's expiry walk follows departure order; it guards that walk
+    /// order, not the departure tracker (see `LedgerStats`).
     pub ledger_expired_before_departure: u64,
     /// Transmissions the departure tracker stamped on a ledger record.
     pub ledger_departures_stamped: u64,
