@@ -68,6 +68,7 @@ async fn run(cost: Option<Duration>) -> BrowserlessResult {
             // harness writes and the bridge reads at the same virtual
             // instant and every delay is 0 by construction.
             mode: HarnessMode::Concurrent,
+            ..Default::default()
         },
     )
     .await

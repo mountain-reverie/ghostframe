@@ -609,6 +609,16 @@ pub struct InstrumentSummary {
     /// RTO fires for a pass whose tile had moved to another generation.
     /// Expected zero: the client drops such a pass unacknowledged.
     pub rto_fired_superseded: u64,
+    /// Times the cwnd/srtt capacity hint was handed to the estimator.
+    pub hint_feeds: u64,
+    /// Of those, before the estimator had heard any feedback. The hint caps
+    /// the startup probe ladder; before the first feedback it is a reading of
+    /// a window nothing has used yet.
+    pub hint_feeds_before_feedback: u64,
+    /// Times a hint that no longer described a busy path was withdrawn.
+    pub hint_withdrawals: u64,
+    /// The estimator wrapper's own counters.
+    pub bwe: crate::transport::bwe::BweStats,
 }
 
 impl InstrumentSummary {

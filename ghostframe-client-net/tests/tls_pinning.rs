@@ -149,6 +149,17 @@ fn provider_prefers_the_hybrid_post_quantum_group() {
 }
 
 #[test]
+fn the_classical_provider_offers_no_hybrid_group() {
+    use rustls::NamedGroup;
+    let p = ghostframe_client_net::tls::classical_provider();
+    assert!(p
+        .kx_groups
+        .iter()
+        .all(|g| g.name() != NamedGroup::X25519MLKEM768));
+    assert_eq!(p.kx_groups[0].name(), NamedGroup::X25519);
+}
+
+#[test]
 fn accepts_either_of_two_pinned_hashes() {
     let (der_a, hash_a) = cert_expiring_in(5);
     let (der_b, hash_b) = cert_expiring_in(5);

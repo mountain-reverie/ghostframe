@@ -216,6 +216,12 @@ pub struct RunOptions {
     pub frame_cost: Option<Duration>,
     /// How the server's event loop is driven. See [`HarnessMode`].
     pub mode: HarnessMode,
+    /// The client offers no hybrid post-quantum group, so the handshake
+    /// negotiates classical X25519 (`false`, the default, is what the
+    /// product offers: X25519MLKEM768 first). The two handshakes cost the
+    /// server a different number of loop iterations before the first
+    /// feedback, which the bandwidth-estimator startup scenes compare.
+    pub classical_kx: bool,
 }
 
 /// How a scene drives the server's `IoBridge`.
@@ -1173,6 +1179,9 @@ async fn drive_session(
     rng_seed[..8].copy_from_slice(&seed.to_le_bytes());
     let mut client = ClientNet::with_rng_seed(cfg, now_us(base), rng_seed)
         .map_err(|e| anyhow!("seed {seed}: ClientNet::with_rng_seed failed: {e}"))?;
+    if opts.classical_kx {
+        client = client.with_classical_key_exchange();
+    }
     client
         .connect(server_addr, now_us(base))
         .map_err(|e| anyhow!("seed {seed}: ClientNet::connect failed: {e}"))?;

@@ -67,6 +67,18 @@ pub fn pq_provider() -> rustls::crypto::CryptoProvider {
     rustls::crypto::ring::default_provider()
 }
 
+/// [`pq_provider`] without the hybrid group: what a peer that does not offer
+/// X25519MLKEM768 (an older browser) sends, so the handshake negotiates
+/// classical X25519. For measurement scenes that compare the two handshakes;
+/// the client never selects it on its own.
+pub fn classical_provider() -> rustls::crypto::CryptoProvider {
+    let mut provider = pq_provider();
+    provider
+        .kx_groups
+        .retain(|g| g.name() != rustls::NamedGroup::X25519MLKEM768);
+    provider
+}
+
 #[derive(Debug)]
 pub struct PinnedCertVerifier {
     /// Any one of these hashes is accepted: the server advertises its

@@ -57,6 +57,7 @@ pub(crate) struct GoogCcDriver {
     /// last discarded the lower rung — the one more likely to be answerable
     /// on a slow link. Bounded by `MAX_PENDING_PROBE_REQUESTS`.
     pending_probe_requests: std::collections::VecDeque<super::ProbeRequest>,
+    stats: super::BweStats,
 }
 
 /// Newtype carrying the `Send` assertion, so it covers exactly the one type
@@ -195,6 +196,7 @@ impl GoogCcDriver {
             implausible_rtt_samples: 0,
             pacer_rate_bps: None,
             pending_probe_requests: std::collections::VecDeque::new(),
+            stats: super::BweStats::default(),
         }
     }
 
@@ -409,6 +411,7 @@ impl GoogCcDriver {
             samples_seen: self.samples_seen,
             implausible_rtt_samples: self.implausible_rtt_samples,
             pacer_rate_bps: self.pacer_rate_bps,
+            stats: self.stats,
         }
     }
 
@@ -486,8 +489,16 @@ impl GoogCcDriver {
             if self.pending_probe_requests.len() == Self::MAX_PENDING_PROBE_REQUESTS {
                 self.pending_probe_requests.pop_front();
             }
-            self.pending_probe_requests
-                .push_back(Self::to_probe_request(cfg));
+            let req = Self::to_probe_request(cfg);
+            if let Some(slot) = self
+                .stats
+                .first_probe_targets_bps
+                .get_mut(self.stats.probe_requests as usize)
+            {
+                *slot = req.target_rate_bps;
+            }
+            self.stats.probe_requests += 1;
+            self.pending_probe_requests.push_back(req);
         }
     }
 

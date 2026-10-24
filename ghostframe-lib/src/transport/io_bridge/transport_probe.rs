@@ -96,6 +96,10 @@ pub(super) struct Instruments {
     pub(super) flushed: crate::transport::instruments::FlushedLosses,
     /// Late acknowledgements of losses goog_cc had already been told about.
     pub(super) late_acked_after_flush: u64,
+    /// Capacity-hint feeds, and how many came before any feedback.
+    pub(super) hint_feeds: u64,
+    pub(super) hint_feeds_before_feedback: u64,
+    pub(super) hint_withdrawals: u64,
 }
 
 impl Instruments {
@@ -365,6 +369,10 @@ impl IoBridge {
             ecn: i.ecn,
             generation_replacements: self.reliable_emitter.stats.generation_replacements,
             rto_fired_superseded: self.reliable_emitter.stats.rto_fired_superseded,
+            hint_feeds: i.hint_feeds,
+            hint_feeds_before_feedback: i.hint_feeds_before_feedback,
+            hint_withdrawals: i.hint_withdrawals,
+            bwe: self.bwe.snapshot().stats,
         }
     }
 
