@@ -422,8 +422,8 @@ mod invariant_tests {
 
     const MS: u64 = 1_000;
 
-    /// At every spend share a saturated sender can have (`SATURATION` up to
-    /// 1) with everything it offered acknowledged, the ceiling expressed as a
+    /// At every spend share a saturated sender can have (from `SATURATION`
+    /// to all of it) with everything it offered acknowledged, the ceiling expressed as a
     /// token rate (the estimate over the payload fraction) is at or above the
     /// grant: the ceiling never cuts a sender that is delivering under its own
     /// grant. Below `AIMD_BACKOFF` of spend it would, which is why
