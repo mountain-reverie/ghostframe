@@ -235,7 +235,7 @@ fn tile_repainted_by_another_codec_is_no_longer_resurrected() {
 
 /// A tile returns to CDF 5/3 on the 4-bit generation it already holds, with a
 /// newer label: new content. The coefficients of the old must not survive
-/// into it. (Not run in the PR that added it: no GPU was used.)
+/// into it. Fails if the clear keys on the generation alone.
 #[test]
 fn a_new_label_under_the_same_generation_replaces_the_content() {
     let ctx = WgpuContext::new().expect("wgpu context");
