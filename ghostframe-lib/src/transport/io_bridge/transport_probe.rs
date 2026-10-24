@@ -133,7 +133,8 @@ impl IoBridge {
         self.departures = Default::default();
         self.departures_handle = None;
         self.transmission_ledger.discard_undeparted();
-        self.reliable_emitter.forget_awaiting_departure();
+        self.reliable_emitter
+            .forget_awaiting_departure(super::now_std());
     }
 
     /// Move what the emitter put on the wire since the last call into the

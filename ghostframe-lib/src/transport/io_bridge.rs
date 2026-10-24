@@ -2456,7 +2456,8 @@ impl IoBridge {
         })
         .await;
         // The datagrams quinn wrote into packets above left its FIFO at `now`,
-        // the instant given to `poll_transmit`. Observability only.
+        // the instant given to `poll_transmit`. This stamps the ledger and starts
+        // the retransmission timers (F2/F3).
         self.poll_departures(now);
         written
     }

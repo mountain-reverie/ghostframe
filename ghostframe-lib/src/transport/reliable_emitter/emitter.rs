@@ -222,8 +222,8 @@ impl ReliableTileEmitter {
         self.wire_overhead = bytes;
     }
 
-    /// Datagrams built (wire_seq allocated, cached, timer started) and not
-    /// yet handed to the transport.
+    /// Datagrams built (wire_seq allocated, cached; the timer is not running
+    /// yet, it starts at departure) and not yet handed to the transport.
     pub fn emission_queue_len(&self) -> usize {
         self.queue.len()
     }
@@ -479,8 +479,9 @@ impl ReliableTileEmitter {
     /// already ACKed or cancelled). Bump `attempts` (used only for RTO
     /// backoff selection), re-enqueue every cached fragment via the
     /// EmissionQueue with the same wire_seqs (so client dedup keys
-    /// remain stable), and reschedule a new RTO deadline using
-    /// `rto_for_attempt`. Never retires — the entry stays in the cache
+    /// remain stable), and leave the entry with no running timer: the
+    /// retransmission's own (backed-off, `rto_for_attempt`) timer starts when
+    /// that datagram departs (`on_departed`). Never retires — the entry stays in the cache
     /// until ACKed, cancelled via `cancel_for_tile`, or the session
     /// ends via `clear_cache`.
     ///
@@ -588,7 +589,13 @@ impl ReliableTileEmitter {
                 bytes[12..16].copy_from_slice(&(emit_us_now as u32).to_be_bytes());
             }
             let bytes = Bytes::from(bytes);
-            entry.attempts = entry.attempts.saturating_add(1);
+            // A repair made before the original has departed (its timer is
+            // not running, `attempts` is 0) must not back off the original's
+            // first deadline: that timer starts from the original's own
+            // departure, as an attempt-0 timer.
+            if !(entry.rto_deadline.is_none() && entry.attempts == 0) {
+                entry.attempts = entry.attempts.saturating_add(1);
+            }
             entry.last_sent_at = now;
             entry.probe = None;
             self.transmissions.push(EmittedDatagram {
@@ -664,7 +671,8 @@ impl ReliableTileEmitter {
                     rto_for_attempt(self.ack_deadline, entry.attempts).as_micros(),
                 );
             }
-            // Bump attempts, re-enqueue the cached datagram, reschedule RTO.
+            // Bump attempts and re-enqueue the cached datagram; its timer
+            // starts at departure.
             entry.attempts += 1;
             entry.last_sent_at = now;
             // A probe cluster measures one burst: goog_cc divides the
@@ -969,9 +977,16 @@ impl ReliableTileEmitter {
     }
 
     /// Stop waiting for departures that will not happen: the session they
-    /// were queued for is gone. Their cache entries keep no running timer.
-    pub fn forget_awaiting_departure(&mut self) {
-        self.awaiting_departure.clear();
+    /// were queued for is gone (or they were never queued anywhere). Their
+    /// cache entries are armed at `now`, as if they had left now, so each
+    /// still has a timer; without it an entry would wait for an
+    /// acknowledgement, a cancel or the 30 s retire with nothing able to
+    /// start its timer.
+    pub fn forget_awaiting_departure(&mut self, now: Instant) {
+        let waiting: Vec<(u32, EmitKey)> = self.awaiting_departure.drain().collect();
+        for (ws, key) in waiting {
+            self.arm_rto(key, ws, now);
+        }
     }
 
     /// Transmissions whose timer is waiting for them to leave. Diagnostic.
@@ -2561,6 +2576,58 @@ mod tests {
         assert_eq!(e.awaiting_departure_len(), 0);
     }
 
+    /// Releasing the departure waits (first HELLO, a handle switch, a session
+    /// end) must not leave a cache entry with no timer and nothing able to
+    /// start one: it would wait for an acknowledgement, a cancel or the 30 s
+    /// retire. Each released key is armed at the release instant.
+    #[test]
+    fn a_released_never_departed_pass_still_gets_a_timer() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.set_ack_deadline(Some(Duration::from_millis(100)));
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        assert_eq!(e.awaiting_departure_len(), 1, "premise: it is waiting");
+        assert!(e.cache.get(&key).unwrap().rto_deadline.is_none());
+
+        let t_rel = t0 + Duration::from_secs(3);
+        e.forget_awaiting_departure(t_rel);
+        assert_eq!(e.awaiting_departure_len(), 0);
+        let rto = rto_for_attempt(e.ack_deadline, 0);
+        assert_eq!(
+            e.cache.get(&key).unwrap().rto_deadline,
+            Some(t_rel + rto),
+            "armed at the release instant"
+        );
+        e.tick_budgeted(t_rel + rto, usize::MAX, usize::MAX);
+        assert_eq!(e.stats.rto_fired, 1, "and it fires");
+    }
+
+    /// A NACK repair made before the original has left must not back off the
+    /// original's first deadline.
+    #[test]
+    fn a_repair_before_the_original_departs_does_not_back_off_its_timer() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.set_ack_deadline(Some(Duration::from_millis(100)));
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        let ws0 = e.take_transmissions()[0].wire_seq;
+        e.on_nack(&[key], t0);
+        e.tick_budgeted(t0, usize::MAX, usize::MAX);
+        assert_eq!(
+            e.stats.retransmit_by_nack, 1,
+            "premise: the repair was made"
+        );
+        let t_dep = t0 + Duration::from_millis(5);
+        e.on_departed(ws0, t_dep);
+        assert_eq!(
+            e.cache.get(&key).unwrap().rto_deadline,
+            Some(t_dep + rto_for_attempt(e.ack_deadline, 0)),
+            "the original's timer is an attempt-0 timer"
+        );
+    }
+
     /// The client saying "this did not arrive" outranks a timer guessing
     /// that it might not have.
     #[test]
@@ -2724,7 +2791,7 @@ mod tests {
         assert_eq!(sink.len(), 70, "got {}", sink.len());
 
         // After many ticks at budget=64, all 1000 entries should be popped
-        // (each pop reschedules its RTO into the future, so subsequent ticks
+        // (each pop takes the entry off the timer, so subsequent ticks
         // at t1 yield None). 1000 / 64 ≈ 16 ticks needed.
         for _ in 0..20 {
             e.tick(t1, 64);

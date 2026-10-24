@@ -74,10 +74,12 @@ pub struct LedgerStats {
     /// for an evicted one resolves to nothing (counted in `unknown_acks`), so
     /// `acked_after_declared_lost` is blind to it. Measurement only.
     pub tombstone_evictions: u64,
-    /// Transmissions declared lost while they had not left quinn's FIFO. Zero
-    /// by construction: the loss clock starts at departure, so a queued
-    /// transmission is never on it. Counted where a verdict is issued, from
-    /// the record's own state, so a clock that starts early shows here.
+    /// Verdicts issued on a record that had not departed. Reachable only if
+    /// the expiry walk stops following departure order (it walks
+    /// `departed_order`, whose entries all carry a stamp), so this guards the
+    /// walk order, NOT the departure tracker: that rests on the real-quinn
+    /// proptest in `departure.rs`. It reads positive under the mutation "walk
+    /// in recording order" (see the burst-loss P3 gate).
     pub expired_before_departure: u64,
     /// Departures stamped on a record (one per transmission, at most).
     pub departures_stamped: u64,

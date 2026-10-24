@@ -652,7 +652,7 @@ impl IoBridge {
         let mut total_wire_bytes_sent: usize = 0;
         // Build per-fragment (EmitKey, Bytes) items for the reliable
         // emitter. The emitter stamps wire_seq into bytes[8..12], caches
-        // for retransmit, schedules RTO, and queues parity per FEC group.
+        // for retransmit, awaits departure to start the RTO, and queues parity per FEC group.
         // The actual wire write happens in `drain_reliable_emitter(now)`
         // below.
         let mut items: Vec<(
@@ -849,7 +849,7 @@ impl IoBridge {
                 retry_flags.push(is_retry);
             }
         }
-        // Submit the batch (stamps wire_seq, caches, schedules RTO + parity).
+        // Submit the batch (stamps wire_seq, caches, queues parity; the RTO starts at departure).
         self.reliable_emitter
             .submit_batch_marking_retries(items, &retry_flags, now);
         self.drain_reliable_emitter(now);
