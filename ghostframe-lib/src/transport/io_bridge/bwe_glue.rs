@@ -108,8 +108,11 @@ enum HintState {
 ///    cap probes for as long as the path stays unfilled.
 #[derive(Debug, Default)]
 pub(super) struct CapacityHintWindow {
-    samples: std::collections::VecDeque<(std::time::Instant, f32)>,
+    /// The readings of the window, as a sliding minimum (O(1) per turn).
+    samples: crate::transport::bwe::sliding_min::SlidingMin<std::time::Instant, f32>,
     state: HintState,
+    /// The estimator has heard feedback (seen at the last `observe`).
+    heard: bool,
 }
 
 impl CapacityHintWindow {
@@ -118,6 +121,14 @@ impl CapacityHintWindow {
     }
 
     /// Take one reading at `now`.
+    ///
+    /// `quinn_limited` is "quinn's datagram queue still held data at the end
+    /// of the turn". That is an approximation of "cwnd-limited": quinn's
+    /// pacer (`1.25 x cwnd / srtt`) and a datagram that did not fit the
+    /// packet also leave data queued, and a window that is exactly full at
+    /// the instant the queue empties reads as not limited. It errs towards
+    /// feeding fewer readings, which leaves the hint unbounded, the safe
+    /// side for a cap.
     pub(super) fn observe(
         &mut self,
         now: std::time::Instant,
@@ -126,21 +137,23 @@ impl CapacityHintWindow {
         quinn_limited: bool,
         feedback_heard: bool,
     ) -> HintAction {
-        let window = Self::window(srtt);
-        while self
-            .samples
-            .front()
-            .is_some_and(|(t, _)| now.saturating_duration_since(*t) > window)
-        {
-            self.samples.pop_front();
+        // Readings taken before the first feedback describe a window nothing
+        // had used (288 kbit/s at quinn's initial window and round trip):
+        // they are not carried across into the first hint.
+        if feedback_heard && !self.heard {
+            self.samples.clear();
         }
+        self.heard = feedback_heard;
+        let window = Self::window(srtt);
+        self.samples
+            .expire_before(now.checked_sub(window).unwrap_or(now));
         if quinn_limited {
-            self.samples.push_back((now, bytes_per_us));
+            self.samples.push(now, bytes_per_us);
         }
         if !feedback_heard {
             return HintAction::None;
         }
-        match self.samples.iter().map(|(_, v)| *v).reduce(f32::min) {
+        match self.samples.min() {
             Some(min) => {
                 self.state = HintState::Bounded;
                 HintAction::Feed(min)
@@ -842,7 +855,8 @@ mod hint_window_tests {
             w.observe(
                 t0 + Duration::from_micros(100 * i as u64),
                 srtt,
-                5.0,
+                // Rising values: a sliding minimum keeps every one.
+                5.0 + i as f32,
                 true,
                 true,
             );
@@ -871,7 +885,7 @@ mod hint_window_tests {
             w.observe(t0, srtt, 90.0, false, true),
             HintAction::Unbounded
         );
-        assert!(w.samples.is_empty());
+        assert_eq!(w.samples.min(), None);
         // Then a real one.
         assert_eq!(
             w.observe(t0 + MS, srtt, 3.0, true, true),
@@ -885,9 +899,10 @@ mod hint_window_tests {
     }
 
     /// Nothing is fed before the estimator has heard feedback, however many
-    /// readings came first; the first feedback then releases what was seen.
+    /// readings came first, and those readings are not carried into the first
+    /// hint: they describe a window nothing had used.
     #[test]
-    fn nothing_is_fed_before_the_first_feedback_whatever_the_reading_count() {
+    fn nothing_is_fed_before_the_first_feedback_and_none_of_it_is_kept() {
         let t0 = Instant::now();
         let srtt = Duration::from_millis(40);
         for readings in [0u64, 1, 15, 16, 17, 64, 1_000] {
@@ -896,14 +911,21 @@ mod hint_window_tests {
                 let a = w.observe(t0 + Duration::from_micros(10 * i), srtt, 0.036, true, false);
                 assert_eq!(a, HintAction::None, "{readings} readings, before feedback");
             }
-            let after = w.observe(
-                t0 + Duration::from_micros(10 * readings),
-                srtt,
-                0.036,
-                true,
-                true,
+            let at = t0 + Duration::from_micros(10 * readings);
+            // First feedback, and quinn is not the limit: nothing caps the
+            // probes, however low the earlier readings were.
+            assert_eq!(
+                w.observe(at, srtt, 9.0, false, true),
+                HintAction::Unbounded,
+                "{readings} readings"
             );
-            assert_eq!(after, HintAction::Feed(0.036), "{readings} readings");
+            // A reading taken after it is the hint, not the minimum of the
+            // 0.036 readings from before it.
+            assert_eq!(
+                w.observe(at + MS, srtt, 3.0, true, true),
+                HintAction::Feed(3.0),
+                "{readings} readings"
+            );
         }
     }
 
