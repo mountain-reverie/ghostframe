@@ -393,9 +393,8 @@ impl IoBridge {
             // PalRle emission still queued would keep its palette reference
             // and carry count for good, and a full table is what sends tiles
             // here.
-            self.reliable_emitter.cancel_for_tile(x as u8, y as u8);
+            self.cancel_in_flight_for_tile(x as u8, y as u8);
             let (_, superseded) = self.scheduler.bump_generation_collecting(x as u8, y as u8);
-            self.fragment_coverage.drop_cdf53_for_tile(x as u8, y as u8);
             self.settle_superseded_palettes(x as u8, y as u8, &superseded);
             self.commit_tile_to_cdf53(
                 x as u8,
@@ -508,22 +507,12 @@ impl IoBridge {
             // call (replaces the Task 20 set_cancel_callback machinery, which
             // captured a raw pointer to self.reliable_emitter that dangled when
             // the bridge was moved out of `new`).
-            self.reliable_emitter
-                .cancel_for_tile(tile_x as u8, tile_y as u8);
+            self.cancel_in_flight_for_tile(tile_x as u8, tile_y as u8);
             let (gen, superseded) = self
                 .scheduler
                 .bump_generation_collecting(tile_x as u8, tile_y as u8);
             self.bump_count_accumulator.priority_path =
                 self.bump_count_accumulator.priority_path.saturating_add(1);
-            // Drop any in-flight Cdf53 coverage for this tile. The bump
-            // marked the matching refinement-queue work `Superseded`; the
-            // already-emitted-but-not-yet-ACKed Cdf53 coverage must be
-            // discarded in lockstep so `pending_refinement_snapshot` does
-            // not keep reporting the cancelled passes as still pending until
-            // LRU eviction. Non-Cdf53 coverage is preserved — see
-            // `FragmentCoverageMap::drop_cdf53_for_tile` docs.
-            self.fragment_coverage
-                .drop_cdf53_for_tile(tile_x as u8, tile_y as u8);
             // New generation: tile is eligible for re-escalation.
             // Guard with a bounds check to stay safe when metrics_tracker has
             // not yet been sized (e.g. a unit-test bridge).
@@ -858,6 +847,27 @@ impl IoBridge {
         (stats, total_wire_bytes_sent, drained_count)
     }
 
+    /// The transport's half of superseding a tile: forget what the retransmit
+    /// cache still holds for it and the Cdf53 coverage of passes in flight.
+    ///
+    /// Every place that replaces a tile's content pairs this with a scheduler
+    /// bump (or, in the browserless harness, a plain supersede), so that no
+    /// pass of an older generation is retransmitted after a newer one exists.
+    /// A client discards such a pass without acknowledging it, so a
+    /// retransmit of it can never be settled and repeats until the cache
+    /// retires it. The two calls live together so a caller cannot take one
+    /// and forget the other, which is how the harness drifted from production.
+    ///
+    /// Cdf53 coverage is dropped (not PalRle's): the bump marked the matching
+    /// refinement-queue work `Superseded`, and coverage of the cancelled
+    /// passes must go in lockstep or `pending_refinement_snapshot` keeps
+    /// reporting them as pending until LRU eviction. See
+    /// `FragmentCoverageMap::drop_cdf53_for_tile`.
+    pub(super) fn cancel_in_flight_for_tile(&mut self, tile_x: u8, tile_y: u8) {
+        self.reliable_emitter.cancel_for_tile(tile_x, tile_y);
+        self.fragment_coverage.drop_cdf53_for_tile(tile_x, tile_y);
+    }
+
     /// Enqueue an injected frame's tile work into the scheduler, then
     /// attempt to drain it to the wire. Used by both the `run()` select
     /// arm and the `drain_injection_for_test` test accessor, so the two
@@ -927,6 +937,11 @@ impl IoBridge {
             }
             let coord = (work.tile_x, work.tile_y);
             if !superseded.contains(&coord) {
+                // The scheduler's half of a bump (the harness supplies its own
+                // generations, so it does not bump) AND the transport's half.
+                // Without the latter the superseded generations' passes sit in
+                // the retransmit cache and are re-sent by RTO for up to 30 s.
+                self.cancel_in_flight_for_tile(coord.0, coord.1);
                 self.scheduler.supersede_pending_for_tile(coord.0, coord.1);
                 superseded.push(coord);
             }
