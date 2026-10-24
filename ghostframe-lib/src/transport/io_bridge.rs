@@ -803,9 +803,15 @@ pub struct IoBridge {
     path_sent_packets_last: u64,
     /// Transport measurements (see `transport_probe`). Measurement only.
     transport_probe: TransportProbe,
-    /// D1 instruments (offered bytes by class, FIFO series, departure mirror,
+    /// D1 instruments (offered bytes by class, FIFO series,
     /// budget-binding counts, ECN). Measurement only, never read by a decision.
     instr: transport_probe::Instruments,
+    /// F2: when each datagram left quinn's FIFO for the wire (see
+    /// `transport::departure`). Not an instrument: the ledger's loss clock
+    /// and the emitter's retransmission timer start from what it stamps.
+    departures: crate::transport::departure::DepartureTracker,
+    /// The connection `departures` mirrors; a different one starts it afresh.
+    departures_handle: Option<quinn_proto::ConnectionHandle>,
     /// Harness read-back of `transport_probe`, same pattern as the other
     /// `*_publish` cells.
     #[cfg(any(test, feature = "browserless-harness"))]
@@ -1328,6 +1334,8 @@ impl IoBridge {
             path_sent_packets_last: 0,
             transport_probe: TransportProbe::default(),
             instr: Default::default(),
+            departures: Default::default(),
+            departures_handle: None,
             #[cfg(any(test, feature = "browserless-harness"))]
             transport_probe_publish: std::sync::Arc::new(std::sync::Mutex::new(
                 TransportProbe::default(),
@@ -2258,17 +2266,7 @@ impl IoBridge {
         // record. `wire_seq` is allocated inside the emitter, so this is
         // the only place that knows which value each datagram carried.
         let ledger_now = now_std();
-        for e in self.reliable_emitter.take_transmissions() {
-            self.transmission_ledger.record(
-                e.wire_seq,
-                ledger_now,
-                crate::transport::transmission_ledger::Transmission {
-                    emit_us: e.emit_us,
-                    wire_bytes: e.wire_bytes,
-                    key: e.key,
-                },
-            );
-        }
+        self.record_emitted_transmissions(ledger_now);
         self.expire_transmissions(ledger_now);
         self.retract_late_acked_losses();
         // Reported only alongside an acknowledgement: goog_cc unwraps the
@@ -2344,12 +2342,7 @@ impl IoBridge {
                         .queued_refinement_latency_stats
                         .record(queued_latency_us),
                 }
-                records.push(AckArrival {
-                    server_emit_us: s.server_emit_us,
-                    client_arrival_ms_lo16: s.client_arrival_ms_lo16,
-                    size_bytes: s.size_bytes,
-                    probe: s.probe,
-                });
+                records.push(s.ack_arrival());
             }
             // Once per drain is enough: this is a cheap setter, and the
             // tracker only just received new samples above. Derives the
@@ -2510,6 +2503,9 @@ impl IoBridge {
                     // wt+conn borrows). Defer ACK/etc. dispatch to a second pass
                     // because dispatch_ack_datagram takes `&mut self`.
                     let mut to_dispatch: Vec<Vec<u8>> = Vec::new();
+                    // Session counter after each pong accepted for the live
+                    // session, for the departure tracker (below).
+                    let mut control_cums: Vec<u64> = Vec::new();
                     if let Some(wt) = self.wt_sessions.get_mut(&handle) {
                         if let Some(conn) = self.server.connections.get_mut(&handle) {
                             while let Some(payload) = wt.recv_datagram(conn) {
@@ -2526,6 +2522,7 @@ impl IoBridge {
                                         // Only the live session's sends are billed.
                                         Ok(()) if live => {
                                             let framing = wt.datagram_framing_len();
+                                            control_cums.push(wt.datagram_bytes_enqueued());
                                             self.instr.offered.bill(
                                                 WireClass::Control,
                                                 response.len(),
@@ -2547,6 +2544,9 @@ impl IoBridge {
                                 }
                             }
                         }
+                    }
+                    for cum in control_cums {
+                        self.track_enqueue(handle, None, cum);
                     }
                     for dg in to_dispatch {
                         self.dispatch_inbound_datagram(handle, &dg);
