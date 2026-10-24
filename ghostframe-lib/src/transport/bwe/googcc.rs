@@ -913,7 +913,7 @@ mod tests {
     const ACKED_BPS: f64 = 12.0 * 1200.0 * 8.0 / 0.020;
 
     fn drive_clean(d: &mut GoogCcDriver, t0: Instant, secs: u64, spend: f64) {
-        drive_clean_then_silence(d, t0, secs, spend, 0);
+        drive_clean_then_silence(d, t0, secs, spend, 0, u64::MAX);
     }
 
     /// `drive_clean`, then `silence_ms` in which the bucket keeps granting and
@@ -924,12 +924,18 @@ mod tests {
         secs: u64,
         spend: f64,
         silence_ms: u64,
+        queue_after_ms: u64,
     ) -> crate::transport::bwe::BweStats {
         const GRANT_BPS: f64 = 9.0e6;
         d.note_path_rtt(Duration::from_millis(30));
         let (mut granted, mut spent, mut offered) = (0.0f64, 0.0f64, 0.0f64);
         for step in 0..(secs * 50) as u32 {
             let now = t0 + Duration::from_millis(20 * step as u64);
+            // From `queue_after_ms` the smoothed round trip is double its
+            // minimum: a queue is standing.
+            if 20 * step as u64 == queue_after_ms {
+                d.note_path_rtt(Duration::from_millis(60));
+            }
             granted += GRANT_BPS / 8.0 * 0.020;
             spent += GRANT_BPS / 8.0 * 0.020 * spend;
             offered += 12.0 * 1200.0;
@@ -1023,6 +1029,30 @@ mod tests {
         );
     }
 
+    /// The lift is not made while a queue stands: with quinn's round trip at
+    /// twice its minimum, the lift count stops where a path with no queue goes
+    /// on lifting, and the refusals are counted.
+    #[test]
+    fn the_estimate_is_not_lifted_under_a_standing_queue() {
+        let t0 = Instant::now();
+        let mut free = GoogCcDriver::new(4_000_000, t0);
+        let free_stats = drive_clean_then_silence(&mut free, t0, 12, 1.0, 0, u64::MAX);
+        assert!(free_stats.ceiling_reseeds_up > 5, "premise: lifts happen");
+        assert_eq!(free_stats.ceiling_lifts_blocked_queue, 0);
+        let mut queued = GoogCcDriver::new(4_000_000, t0);
+        let q = drive_clean_then_silence(&mut queued, t0, 12, 1.0, 0, 6_000);
+        assert!(
+            q.ceiling_lifts_blocked_queue > 0,
+            "no lift was refused: {q:?}"
+        );
+        assert!(
+            q.ceiling_reseeds_up < free_stats.ceiling_reseeds_up,
+            "lifts went on under a standing queue: {} against {}",
+            q.ceiling_reseeds_up,
+            free_stats.ceiling_reseeds_up
+        );
+    }
+
     /// A stall inside the window: the bound is published, goog_cc is not told
     /// to continue from a rate that is a measurement of the gap.
     #[test]
@@ -1030,7 +1060,7 @@ mod tests {
         let t0 = Instant::now();
         let mut d = GoogCcDriver::new(4_000_000, t0);
         // 8 s of steady delivery, then 200 ms with one late batch (srtt 30 ms).
-        let before = drive_clean_then_silence(&mut d, t0, 8, 1.0, 200);
+        let before = drive_clean_then_silence(&mut d, t0, 8, 1.0, 200, u64::MAX);
         assert!(before.ceiling_reseeds_down > 0, "premise: reseeds happen");
         let after = d.snapshot();
         assert!(
