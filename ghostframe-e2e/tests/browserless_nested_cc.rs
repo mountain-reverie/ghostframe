@@ -151,6 +151,69 @@ fn assert_premises(r: &BrowserlessResult, scene: &str, min_points: usize) {
     );
 }
 
+/// The D1 transport instruments for this scene, one METRIC line each: the
+/// FIFO, the departure lag, and the ledger's verdicts against the real drops.
+/// `expired_before_departure` is reported here only; the P3 gate is
+/// `assert_p3` in `browserless_burst_loss` (this scene's FIFO never holds
+/// enough for the counter to be able to move).
+fn report_d1(scene: &str, r: &BrowserlessResult) {
+    let i = &r.transport.instr;
+    metric(scene, "d1_fifo_max_B", i.fifo_depth_max);
+    metric(scene, "d1_fifo_mean_B", i.fifo_depth_mean);
+    metric(
+        scene,
+        "d1_depart_lag_us",
+        format!(
+            "n={} p50={} p95={} max={}",
+            i.lag_samples, i.lag_p50_us, i.lag_p95_us, i.lag_max_us
+        ),
+    );
+    metric(
+        scene,
+        "d1_admission",
+        format!(
+            "d_target_max_B={} depth_violations={} gate_stops[depth={} tokens={}] pacer_term={} cwnd_term={}",
+            i.admission.d_target_max,
+            i.admission.depth_violations,
+            i.budget.gate_depth,
+            i.budget.gate_tokens,
+            i.budget.pacer,
+            i.budget.cwnd
+        ),
+    );
+    metric(scene, "d1_departures_stamped", i.ledger_departures_stamped);
+    metric(
+        scene,
+        "d1_expired_before_departure",
+        i.ledger_expired_before_departure,
+    );
+    metric(
+        scene,
+        "d1_evicted_before_departure",
+        i.ledger_evicted_before_departure,
+    );
+    metric(scene, "d1_rto_armed_at_departure", i.rto_armed_at_departure);
+    metric(
+        scene,
+        "d1_ledger_losses",
+        format!(
+            "declared={} flushed={} cap_trimmed={} real_drops={}",
+            i.ledger_losses_declared,
+            i.ledger_losses_flushed,
+            i.ledger_losses_overflowed,
+            r.s2c_datagrams_dropped
+        ),
+    );
+    metric(
+        scene,
+        "d1_rto",
+        format!(
+            "fired={} spurious={} useful={}",
+            r.rto_fired, r.rto_spurious, r.rto_useful
+        ),
+    );
+}
+
 /// Everything that is not a timing metric: queue/latency/probe context so a
 /// reader can see whether the estimate tracks the queue rather than the link.
 fn report_context(scene: &str, r: &BrowserlessResult, cap_bps: f64, from_us: u64, to_us: u64) {
@@ -178,6 +241,7 @@ fn report_context(scene: &str, r: &BrowserlessResult, cap_bps: f64, from_us: u64
         r.queued_critical_latency_mean_us,
     );
     metric(scene, "implausible_rtt", r.implausible_rtt_samples);
+    report_d1(scene, r);
     if let Some(m) = cc::median_bps(s, from_us, to_us) {
         metric(scene, "settled_median_bps", m);
         metric(

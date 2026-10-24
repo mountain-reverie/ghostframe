@@ -226,6 +226,15 @@ pub(super) struct BweSample {
     /// when it first did. Full width: the datagram header's `u32` stamp wraps
     /// every 71.6 minutes, this does not.
     pub(super) server_emit_us: u64,
+    /// When this transmission left quinn's FIFO for the wire, on the same
+    /// clock as `server_emit_us` (the datagram's header carries the earlier
+    /// moment it was built). This is the send time the estimator is given
+    /// (F3): the delay signal measures the path, not the host's queue. The
+    /// latency statistics above stay on `server_emit_us` on purpose, so they
+    /// keep reporting what the user waited for. `server_emit_us` itself when
+    /// the transmission was never stamped (a test, or an acknowledgement that
+    /// beat the poll).
+    pub(super) depart_us: u64,
     /// When the underlying `TileWork` became available to the scheduler
     /// (`CacheEntry::queued_at`, ultimately `TileWork::queued_at`), in
     /// microseconds since the bridge's BWE epoch — same clock and units as
@@ -254,6 +263,21 @@ pub(super) struct BweSample {
     pub(super) probe: Option<crate::transport::reliable_emitter::cache::ProbeTag>,
     /// Wall-clock instant when the ACK arrived (for periodic-drain timing).
     pub(super) received_at: std::time::Instant,
+}
+
+impl BweSample {
+    /// What the estimator is told of this acknowledgement. Its send time is
+    /// when the transmission left quinn's FIFO (`depart_us`), not when it was
+    /// built (`server_emit_us`): the delay signal and a probe cluster's send
+    /// span should measure the path, not the host's queue.
+    pub(super) fn ack_arrival(self) -> crate::transport::bwe::AckArrival {
+        crate::transport::bwe::AckArrival {
+            server_emit_us: self.depart_us,
+            client_arrival_ms_lo16: self.client_arrival_ms_lo16,
+            size_bytes: self.size_bytes,
+            probe: self.probe,
+        }
+    }
 }
 
 impl IoBridge {
@@ -462,9 +486,12 @@ impl IoBridge {
         }
         self.instr.losses_declared += expired.len() as u64;
         for (wire_seq, tx) in expired {
+            // The loss is reported against the moment the datagram went out,
+            // the same clock the acknowledgements' send times are on, not the
+            // moment it was built.
             self.pending_losses.push(PendingLoss {
                 wire_seq,
-                emit_us: tx.emit_us,
+                emit_us: tx.depart_us.unwrap_or(tx.emit_us),
                 wire_bytes: tx.wire_bytes,
             });
             self.loss_window.record(tx.emit_us as u32, true);
@@ -510,6 +537,7 @@ impl IoBridge {
                 emit_us: 0,
                 wire_bytes: 1200,
                 key,
+                depart_us: None,
             },
         );
     }

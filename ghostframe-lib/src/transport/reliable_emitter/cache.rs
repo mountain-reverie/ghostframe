@@ -51,7 +51,17 @@ pub struct CacheEntry {
     pub first_sent_at: Instant,
     pub last_sent_at: Instant,
     pub attempts: u8,
-    pub rto_deadline: Instant,
+    /// When the retransmission timer is due, or `None` while it is not
+    /// running. It starts when the transmission it guards leaves quinn's
+    /// FIFO (`ReliableTileEmitter::on_departed`), not when the datagram is
+    /// built or enqueued: a datagram still queued has not been sent, so the
+    /// path has had no time to lose or delay it.
+    pub rto_deadline: Option<Instant>,
+    /// The `wire_seq` whose departure starts the timer. A departure of any
+    /// other transmission of this key (an older one the entry has since been
+    /// re-sent past, or a NACK repair, which never moves the timer) leaves it
+    /// alone.
+    pub arm_ws: u32,
     /// See `ProbeTag`'s doc comment.
     pub probe: Option<ProbeTag>,
 }
@@ -296,7 +306,8 @@ mod tests {
             first_sent_at: now,
             last_sent_at: now,
             attempts: 0,
-            rto_deadline: now,
+            rto_deadline: Some(now),
+            arm_ws: 0,
             probe: None,
         }
     }

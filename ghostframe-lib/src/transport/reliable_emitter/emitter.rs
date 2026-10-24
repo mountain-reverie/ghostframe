@@ -61,6 +61,11 @@ pub struct ReliableTileEmitter {
     /// allocated; the caller cannot otherwise know which value a datagram
     /// carried.
     transmissions: Vec<EmittedDatagram>,
+    /// Transmissions whose retransmission timer is waiting for them to leave
+    /// quinn's FIFO: `wire_seq -> key`. Filled when a datagram is built,
+    /// emptied by [`Self::on_departed`]. Bounded by what is queued; cleared
+    /// with the cache.
+    awaiting_departure: HashMap<u32, EmitKey>,
     /// Passes the client has asked for again, waiting for retransmit
     /// budget. Served oldest first by `tick_budgeted`, ahead of the RTO.
     ///
@@ -145,6 +150,9 @@ pub struct EmitterStats {
     /// earned its keep. `rto_fired - rto_spurious - rto_useful` fired for
     /// passes not acknowledged yet. Measurement only.
     pub rto_useful: u64,
+    /// Retransmission timers started by a departure (F3). Every timer is, so
+    /// this moving is what shows the departure path is wired.
+    pub rto_armed_at_departure: u64,
     /// Times the RTO bookkeeping hit its cap and was dropped; fires made
     /// before a reset and not yet acknowledged are never attributed.
     pub rto_origin_resets: u64,
@@ -200,6 +208,7 @@ impl ReliableTileEmitter {
             ack_deadline: None,
             time_base: now,
             transmissions: Vec::new(),
+            awaiting_departure: HashMap::new(),
             pending_nacks: VecDeque::new(),
             pending_nack_set: HashSet::new(),
             wire_overhead: 0,
@@ -213,8 +222,8 @@ impl ReliableTileEmitter {
         self.wire_overhead = bytes;
     }
 
-    /// Datagrams built (wire_seq allocated, cached, timer started) and not
-    /// yet handed to the transport.
+    /// Datagrams built (wire_seq allocated, cached; the timer is not running
+    /// yet, it starts at departure) and not yet handed to the transport.
     pub fn emission_queue_len(&self) -> usize {
         self.queue.len()
     }
@@ -316,19 +325,20 @@ impl ReliableTileEmitter {
             wire_bytes: bytes.len(),
             key,
         });
-        // Cache & RTO.
+        // Cache & RTO. The timer is not started here: the datagram has only
+        // been built. It starts when it leaves quinn's FIFO (`on_departed`).
         let entry = CacheEntry {
             datagram: bytes.clone(),
             queued_at,
             first_sent_at: now,
             last_sent_at: now,
             attempts: 0,
-            rto_deadline: now + rto_for_attempt(self.ack_deadline, 0),
+            rto_deadline: None,
+            arm_ws: wire_seq,
             probe,
         };
         self.cache.insert(key, entry);
-        self.rto
-            .schedule(key, now + rto_for_attempt(self.ack_deadline, 0));
+        self.await_departure(key, wire_seq, bytes.len(), now);
         // Feed group builder; on K-th source build & schedule parity envelope.
         self.feed_group(wire_seq, bytes.clone());
         self.note_emission_queue_depth();
@@ -469,8 +479,9 @@ impl ReliableTileEmitter {
     /// already ACKed or cancelled). Bump `attempts` (used only for RTO
     /// backoff selection), re-enqueue every cached fragment via the
     /// EmissionQueue with the same wire_seqs (so client dedup keys
-    /// remain stable), and reschedule a new RTO deadline using
-    /// `rto_for_attempt`. Never retires — the entry stays in the cache
+    /// remain stable), and leave the entry with no running timer: the
+    /// retransmission's own (backed-off, `rto_for_attempt`) timer starts when
+    /// that datagram departs (`on_departed`). Never retires — the entry stays in the cache
     /// until ACKed, cancelled via `cancel_for_tile`, or the session
     /// ends via `clear_cache`.
     ///
@@ -578,7 +589,13 @@ impl ReliableTileEmitter {
                 bytes[12..16].copy_from_slice(&(emit_us_now as u32).to_be_bytes());
             }
             let bytes = Bytes::from(bytes);
-            entry.attempts = entry.attempts.saturating_add(1);
+            // A repair made before the original has departed (its timer is
+            // not running, `attempts` is 0) must not back off the original's
+            // first deadline: that timer starts from the original's own
+            // departure, as an attempt-0 timer.
+            if !(entry.rto_deadline.is_none() && entry.attempts == 0) {
+                entry.attempts = entry.attempts.saturating_add(1);
+            }
             entry.last_sent_at = now;
             entry.probe = None;
             self.transmissions.push(EmittedDatagram {
@@ -613,6 +630,7 @@ impl ReliableTileEmitter {
         count: &mut usize,
     ) -> usize {
         let mut spent = 0usize;
+        let emit_us_now = self.emit_us64(now);
         while *count < max_retransmits && spent < max_bytes {
             let Some(key) = self.rto.pop_due(now) else {
                 break;
@@ -627,8 +645,12 @@ impl ReliableTileEmitter {
             // leaves its first entry behind with an earlier deadline than
             // the cache entry's current one. Fire only for the deadline the
             // cache entry holds; the entry pushed with it is still queued.
-            if entry.rto_deadline > now {
-                continue;
+            // A timer that is not running (its datagram is still queued)
+            // has no deadline to be past, and one pushed out since this heap
+            // entry was made is not due.
+            match entry.rto_deadline {
+                Some(d) if d <= now => {}
+                _ => continue,
             }
             // [RTO-PROBE] temporary instrumentation: how old was this entry
             // when its timer fired, and what deadline was it given?
@@ -649,7 +671,8 @@ impl ReliableTileEmitter {
                     rto_for_attempt(self.ack_deadline, entry.attempts).as_micros(),
                 );
             }
-            // Bump attempts, re-enqueue the cached datagram, reschedule RTO.
+            // Bump attempts and re-enqueue the cached datagram; its timer
+            // starts at departure.
             entry.attempts += 1;
             entry.last_sent_at = now;
             // A probe cluster measures one burst: goog_cc divides the
@@ -670,8 +693,9 @@ impl ReliableTileEmitter {
             // delay gradient tolerates the ambiguity; the probe-rate
             // division does not, so only the latter opts out.
             entry.probe = None;
-            let new_rto = rto_for_attempt(self.ack_deadline, entry.attempts);
-            entry.rto_deadline = now + new_rto;
+            // The retransmission goes to the back of the queue. Its timer
+            // starts when it leaves, not now (`on_departed`).
+            entry.rto_deadline = None;
             let mut bytes = entry.datagram.to_vec();
             // [H3-DIAG] log every actual retransmit. Captures the EmitKey
             // routing tuple + a fingerprint of the first fragment so a
@@ -714,7 +738,7 @@ impl ReliableTileEmitter {
             }
             let mut stamped = 0u64;
             if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
-                stamped = self.emit_us64(now);
+                stamped = emit_us_now;
                 bytes[12..16].copy_from_slice(&(stamped as u32).to_be_bytes());
             }
             if let Some(g) = tile_datagram_generation(&bytes) {
@@ -727,6 +751,7 @@ impl ReliableTileEmitter {
                 }
             }
             let bytes = Bytes::from(bytes);
+            entry.arm_ws = ws;
             self.transmissions.push(EmittedDatagram {
                 wire_seq: ws,
                 emit_us: stamped,
@@ -742,8 +767,9 @@ impl ReliableTileEmitter {
                 self.feed_group(ws, bytes.clone());
             }
             spent += bytes.len() + self.wire_overhead;
+            let blen = bytes.len();
             self.queue.push_source(bytes, WireClass::RtoRetransmit);
-            self.rto.schedule(key, now + new_rto);
+            self.await_departure(key, ws, blen, now);
             self.stats.rto_fired += 1;
             self.note_rto_fire(key, first_ws);
             self.stats.retransmit_attempts_total += 1;
@@ -860,6 +886,7 @@ impl ReliableTileEmitter {
         self.cache.clear();
         self.rto_origin.clear();
         self.latest_tile_generation.clear();
+        self.awaiting_departure.clear();
         // RTO heap entries will validate against the empty cache on pop
         // and silently skip; no need to flush the heap.
     }
@@ -910,6 +937,63 @@ impl ReliableTileEmitter {
         now.duration_since(self.time_base).as_micros() as u64
     }
 
+    /// Note that `wire_seq` was just built and its timer waits for it to
+    /// leave. A datagram too short to carry a `wire_seq` cannot be matched to
+    /// a departure; it starts its timer now, as a transmission with no queue
+    /// to wait in would.
+    fn await_departure(&mut self, key: EmitKey, wire_seq: u32, len: usize, now: Instant) {
+        if len >= 12 {
+            self.awaiting_departure.insert(wire_seq, key);
+        } else {
+            self.arm_rto(key, wire_seq, now);
+        }
+    }
+
+    /// Start the retransmission timer of the transmission that just left
+    /// quinn's FIFO (F3: transport timers start at departure). `at` is when it
+    /// left. A no-op for a transmission this emitter is not waiting on, one
+    /// whose pass was acknowledged or cancelled meanwhile, or one the pass
+    /// has since been re-sent past.
+    ///
+    /// O(1) for the lookup, O(log n) for the heap push.
+    pub fn on_departed(&mut self, wire_seq: u32, at: Instant) {
+        let Some(key) = self.awaiting_departure.remove(&wire_seq) else {
+            return;
+        };
+        self.arm_rto(key, wire_seq, at);
+    }
+
+    fn arm_rto(&mut self, key: EmitKey, wire_seq: u32, at: Instant) {
+        let Some(entry) = self.cache.get_mut(&key) else {
+            return;
+        };
+        if entry.arm_ws != wire_seq || entry.rto_deadline.is_some() {
+            return;
+        }
+        let deadline = at + rto_for_attempt(self.ack_deadline, entry.attempts);
+        entry.rto_deadline = Some(deadline);
+        self.rto.schedule(key, deadline);
+        self.stats.rto_armed_at_departure += 1;
+    }
+
+    /// Stop waiting for departures that will not happen: the session they
+    /// were queued for is gone (or they were never queued anywhere). Their
+    /// cache entries are armed at `now`, as if they had left now, so each
+    /// still has a timer; without it an entry would wait for an
+    /// acknowledgement, a cancel or the 30 s retire with nothing able to
+    /// start its timer.
+    pub fn forget_awaiting_departure(&mut self, now: Instant) {
+        let waiting: Vec<(u32, EmitKey)> = self.awaiting_departure.drain().collect();
+        for (ws, key) in waiting {
+            self.arm_rto(key, ws, now);
+        }
+    }
+
+    /// Transmissions whose timer is waiting for them to leave. Diagnostic.
+    pub fn awaiting_departure_len(&self) -> usize {
+        self.awaiting_departure.len()
+    }
+
     /// Drain emissions to a sender until the queue is empty.
     /// Take everything put on the wire since the last call, for recording in
     /// the transmission ledger.
@@ -948,8 +1032,22 @@ impl ReliableTileEmitter {
                 Emission::Source(bytes, _) => sender.send(bytes),
                 Emission::Parity(bytes) => sender.send(bytes),
             };
+            // A `DatagramSender` is the wire as far as this method is
+            // concerned (a test's collector, the simulator's link), so what it
+            // accepted has departed. The bridge does not come through here: it
+            // hands the datagram to quinn and starts the timer when quinn's
+            // FIFO releases it.
+            let departed_ws = match (&emission, outcome) {
+                (Emission::Source(b, _), SendOutcome::Sent) if b.len() >= 12 => {
+                    Some(u32::from_be_bytes([b[8], b[9], b[10], b[11]]))
+                }
+                _ => None,
+            };
             if !self.settle_emission(emission, outcome) {
                 return;
+            }
+            if let Some(ws) = departed_ws {
+                self.on_departed(ws, now);
             }
         }
     }
@@ -1576,7 +1674,12 @@ mod tests {
                 // layer adds a varint.
                 offered.bill(class, len, 2);
                 handed += (len + 2) as u64;
+                let ws = em.wire_seq();
                 assert!(e.settle_emission(em, SendOutcome::Sent));
+                // The test's wire takes it at once.
+                if let Some(ws) = ws {
+                    e.on_departed(ws, now);
+                }
             }
         };
 
@@ -2228,6 +2331,10 @@ mod tests {
         let (k0, k1) = (EmitKey::new(1, 0, 0, 0), EmitKey::new(1, 1, 0, 0));
         e.submit_one(k0, fake_source(1, 0, 0), t0, None, t0);
         e.submit_one(k1, fake_source(2, 0, 0), t0, None, t0);
+        // Both leave at once, which starts their timers.
+        for t in e.take_transmissions() {
+            e.on_departed(t.wire_seq, t0);
+        }
         let late = t0 + Duration::from_secs(10);
         e.on_nack(&[k0], late);
         let mut n = 0;
@@ -2348,6 +2455,8 @@ mod tests {
         let mut sender = CollectSender::default();
         let key = EmitKey::new(1, 0, 0, 0);
         e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        // It leaves at once, so the first heap entry is real.
+        e.drain(&mut sender, t0);
         let rto = rto_for_attempt(e.ack_deadline, 0);
         // The scheduler re-sends the same pass half an RTO later.
         let t_re = t0 + rto / 2;
@@ -2363,6 +2472,160 @@ mod tests {
         let t_late = t_re + rto + Duration::from_millis(1);
         e.tick_budgeted(t_late, usize::MAX, usize::MAX);
         assert_eq!(e.stats.rto_fired, 1, "the current deadline fires, once");
+    }
+
+    // ---- F3: the retransmission timer starts at departure ----
+
+    /// A pass whose datagram sits in a queue (quinn's FIFO, or the emitter's
+    /// own) has not been sent, so its timer is not running: however long it
+    /// waits, the RTO does not fire for it. The timer starts when the
+    /// datagram leaves, and measures from there. Arming at submit instead
+    /// (the old behaviour) makes the first half of this fail.
+    #[test]
+    fn a_pass_still_in_the_queue_does_not_time_out_until_it_has_left() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.set_ack_deadline(Some(Duration::from_millis(100)));
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        let ws = e.take_transmissions()[0].wire_seq;
+        let rto = rto_for_attempt(e.ack_deadline, 0);
+        assert!(rto >= Duration::from_millis(150), "premise: a real timeout");
+
+        // It waits in the queue for ten timeouts. Nothing fires.
+        let t_wait = t0 + rto * 10;
+        e.tick_budgeted(t_wait, usize::MAX, usize::MAX);
+        assert_eq!(
+            e.stats.rto_fired, 0,
+            "a queued datagram cannot have timed out"
+        );
+        assert_eq!(e.stats.rto_armed_at_departure, 0);
+        assert_eq!(e.awaiting_departure_len(), 1);
+
+        // It leaves. One timeout later, not before, the timer fires.
+        e.on_departed(ws, t_wait);
+        assert_eq!(e.stats.rto_armed_at_departure, 1);
+        assert_eq!(e.awaiting_departure_len(), 0);
+        e.tick_budgeted(
+            t_wait + rto - Duration::from_millis(1),
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(e.stats.rto_fired, 0, "measured from departure");
+        e.tick_budgeted(t_wait + rto, usize::MAX, usize::MAX);
+        assert_eq!(e.stats.rto_fired, 1);
+    }
+
+    /// The retransmission an RTO produces waits in the queue like any other
+    /// datagram, and its (backed-off) timer starts when it leaves.
+    #[test]
+    fn a_retransmission_starts_its_own_timer_when_it_leaves() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.set_ack_deadline(Some(Duration::from_millis(100)));
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        let ws0 = e.take_transmissions()[0].wire_seq;
+        e.on_departed(ws0, t0);
+        let rto0 = rto_for_attempt(e.ack_deadline, 0);
+        let rto1 = rto_for_attempt(e.ack_deadline, 1);
+        assert!(rto1 > rto0, "premise: the retry backs off");
+        let t1 = t0 + rto0;
+        e.tick_budgeted(t1, usize::MAX, usize::MAX);
+        assert_eq!(e.stats.rto_fired, 1, "premise: it fired once");
+        let ws1 = e.take_transmissions()[0].wire_seq;
+        assert_ne!(ws0, ws1);
+        assert!(e.cache.get(&key).unwrap().rto_deadline.is_none());
+
+        // The retransmission sits in the queue past its own backed-off timeout.
+        let t_wait = t1 + rto1 * 5;
+        e.tick_budgeted(t_wait, usize::MAX, usize::MAX);
+        assert_eq!(e.stats.rto_fired, 1, "queued: no second fire");
+
+        // The original's late departure (it was still queued behind...) does
+        // not start the timer of the newer transmission.
+        e.on_departed(ws0, t_wait);
+        assert_eq!(e.stats.rto_armed_at_departure, 1, "only the first so far");
+
+        e.on_departed(ws1, t_wait);
+        e.tick_budgeted(
+            t_wait + rto1 - Duration::from_millis(1),
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(e.stats.rto_fired, 1);
+        e.tick_budgeted(t_wait + rto1, usize::MAX, usize::MAX);
+        assert_eq!(e.stats.rto_fired, 2);
+    }
+
+    /// A departure for a pass that has been acknowledged or forgotten starts
+    /// nothing, and a departure the emitter was not waiting for is ignored.
+    #[test]
+    fn a_departure_for_a_pass_that_is_gone_starts_no_timer() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        let ws = e.take_transmissions()[0].wire_seq;
+        e.on_ack(&[key]);
+        e.on_departed(ws, t0);
+        e.on_departed(9_999, t0);
+        assert_eq!(e.stats.rto_armed_at_departure, 0);
+        assert_eq!(e.rto.len(), 0, "nothing was scheduled");
+        // And it was consumed: a second report of the same departure is inert.
+        assert_eq!(e.awaiting_departure_len(), 0);
+    }
+
+    /// Releasing the departure waits (first HELLO, a handle switch, a session
+    /// end) must not leave a cache entry with no timer and nothing able to
+    /// start one: it would wait for an acknowledgement, a cancel or the 30 s
+    /// retire. Each released key is armed at the release instant.
+    #[test]
+    fn a_released_never_departed_pass_still_gets_a_timer() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.set_ack_deadline(Some(Duration::from_millis(100)));
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        assert_eq!(e.awaiting_departure_len(), 1, "premise: it is waiting");
+        assert!(e.cache.get(&key).unwrap().rto_deadline.is_none());
+
+        let t_rel = t0 + Duration::from_secs(3);
+        e.forget_awaiting_departure(t_rel);
+        assert_eq!(e.awaiting_departure_len(), 0);
+        let rto = rto_for_attempt(e.ack_deadline, 0);
+        assert_eq!(
+            e.cache.get(&key).unwrap().rto_deadline,
+            Some(t_rel + rto),
+            "armed at the release instant"
+        );
+        e.tick_budgeted(t_rel + rto, usize::MAX, usize::MAX);
+        assert_eq!(e.stats.rto_fired, 1, "and it fires");
+    }
+
+    /// A NACK repair made before the original has left must not back off the
+    /// original's first deadline.
+    #[test]
+    fn a_repair_before_the_original_departs_does_not_back_off_its_timer() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.set_ack_deadline(Some(Duration::from_millis(100)));
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        let ws0 = e.take_transmissions()[0].wire_seq;
+        e.on_nack(&[key], t0);
+        e.tick_budgeted(t0, usize::MAX, usize::MAX);
+        assert_eq!(
+            e.stats.retransmit_by_nack, 1,
+            "premise: the repair was made"
+        );
+        let t_dep = t0 + Duration::from_millis(5);
+        e.on_departed(ws0, t_dep);
+        assert_eq!(
+            e.cache.get(&key).unwrap().rto_deadline,
+            Some(t_dep + rto_for_attempt(e.ack_deadline, 0)),
+            "the original's timer is an attempt-0 timer"
+        );
     }
 
     /// The client saying "this did not arrive" outranks a timer guessing
@@ -2528,7 +2791,7 @@ mod tests {
         assert_eq!(sink.len(), 70, "got {}", sink.len());
 
         // After many ticks at budget=64, all 1000 entries should be popped
-        // (each pop reschedules its RTO into the future, so subsequent ticks
+        // (each pop takes the entry off the timer, so subsequent ticks
         // at t1 yield None). 1000 / 64 ≈ 16 ticks needed.
         for _ in 0..20 {
             e.tick(t1, 64);

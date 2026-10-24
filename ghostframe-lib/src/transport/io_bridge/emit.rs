@@ -67,7 +67,7 @@ impl IoBridge {
                     }
                 }
             }
-            let outcome = self.send_counted(&bytes, class, true);
+            let outcome = self.send_counted(&bytes, class, true, emission.wire_seq());
             if matches!(
                 outcome,
                 crate::transport::reliable_emitter::traits::SendOutcome::Rejected
@@ -155,18 +155,23 @@ impl IoBridge {
         dg: &[u8],
         class: WireClass,
     ) -> crate::transport::reliable_emitter::traits::SendOutcome {
-        self.send_counted(dg, class, false)
+        self.send_counted(dg, class, false, None)
     }
 
     /// [`Self::send_to_all_sessions`], saying whether the datagram came
     /// through the admission gate (`gated`: it was charged to the bucket
     /// before it got here) or bypassed it (an H.264 frame or a control
     /// datagram, billed to the bucket afterwards).
+    ///
+    /// `wire_seq` names the transmission the datagram carries, when it is one
+    /// the ledger tracks; it ties the datagram's departure from quinn's FIFO
+    /// to that transmission's loss clock and retransmission timer.
     pub(super) fn send_counted(
         &mut self,
         dg: &[u8],
         class: WireClass,
         gated: bool,
+        wire_seq: Option<u32>,
     ) -> crate::transport::reliable_emitter::traits::SendOutcome {
         use crate::transport::reliable_emitter::traits::SendOutcome;
         #[cfg(test)]
@@ -177,12 +182,14 @@ impl IoBridge {
                 // A harness-injected drop *consumes* the datagram. Reporting
                 // `Rejected` here would make the emitter re-queue the same
                 // bytes forever and the injected loss would never happen.
+                self.departed_without_quinn(wire_seq);
                 return SendOutcome::Sent;
             }
         }
         #[cfg(any(test, feature = "test-loss-injection"))]
         if let Some(inj) = self.outbound_loss.as_mut() {
             if inj.should_drop(dg) {
+                self.departed_without_quinn(wire_seq);
                 return SendOutcome::Sent; // injected loss: consumed, see above
             }
         }
@@ -193,6 +200,7 @@ impl IoBridge {
                 .expect("drop_plan mutex poisoned")
                 .should_drop(dg)
             {
+                self.departed_without_quinn(wire_seq);
                 return SendOutcome::Sent; // injected drop: consumed, see above
             }
         }
@@ -249,6 +257,7 @@ impl IoBridge {
                     gated,
                     dg_len: dg.len(),
                     framing_len: framing,
+                    wire_seq,
                     cum_enqueued: cum,
                     queued,
                 },
@@ -643,7 +652,7 @@ impl IoBridge {
         let mut total_wire_bytes_sent: usize = 0;
         // Build per-fragment (EmitKey, Bytes) items for the reliable
         // emitter. The emitter stamps wire_seq into bytes[8..12], caches
-        // for retransmit, schedules RTO, and queues parity per FEC group.
+        // for retransmit, awaits departure to start the RTO, and queues parity per FEC group.
         // The actual wire write happens in `drain_reliable_emitter(now)`
         // below.
         let mut items: Vec<(
@@ -840,7 +849,7 @@ impl IoBridge {
                 retry_flags.push(is_retry);
             }
         }
-        // Submit the batch (stamps wire_seq, caches, schedules RTO + parity).
+        // Submit the batch (stamps wire_seq, caches, queues parity; the RTO starts at departure).
         self.reliable_emitter
             .submit_batch_marking_retries(items, &retry_flags, now);
         self.drain_reliable_emitter(now);

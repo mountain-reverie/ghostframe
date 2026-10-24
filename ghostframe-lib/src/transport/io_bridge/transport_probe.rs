@@ -10,8 +10,7 @@
 
 use super::{IoBridge, WireClass};
 use crate::transport::instruments::{
-    AdmissionCounters, BudgetBinding, DepartureMirror, EcnObservation, FifoSeries,
-    InstrumentSummary, OfferedBytes,
+    AdmissionCounters, BudgetBinding, EcnObservation, FifoSeries, InstrumentSummary, OfferedBytes,
 };
 use quinn_proto::ConnectionHandle;
 
@@ -56,6 +55,8 @@ pub(super) struct Enqueued {
     pub(super) dg_len: usize,
     /// What that layer added.
     pub(super) framing_len: usize,
+    /// The transmission it carries (its `wire_seq`), when the ledger tracks it.
+    pub(super) wire_seq: Option<u32>,
     /// The session's cumulative accepted bytes including this one.
     pub(super) cum_enqueued: u64,
     /// quinn's queued bytes after it.
@@ -65,8 +66,9 @@ pub(super) struct Enqueued {
 /// The mutable state behind [`InstrumentSummary`]. Measurement only: nothing
 /// in the bridge reads any field of this to decide anything.
 ///
-/// Scope. The offered-load accounting, the FIFO series, the departure mirror
-/// and the quinn byte counters describe the LIVE session only: they are
+/// Scope. The offered-load accounting, the FIFO series and the quinn byte
+/// counters describe the LIVE session only (the departure tracker, which is
+/// not an instrument, follows the same rule on the bridge): they are
 /// reset when a different connection becomes live (`apply_hello`) and when a
 /// session is forgotten, and only sends to the live session are billed.
 /// The budget, ECN, and ledger counters belong to the bridge and run for its
@@ -74,9 +76,6 @@ pub(super) struct Enqueued {
 #[derive(Debug, Default)]
 pub(super) struct Instruments {
     pub(super) offered: OfferedBytes,
-    pub(super) mirror: DepartureMirror,
-    /// The session the mirror describes; a new session starts it afresh.
-    mirror_handle: Option<ConnectionHandle>,
     pub(super) fifo: FifoSeries,
     /// Largest FIFO depth seen right after a datagram was accepted.
     pub(super) fifo_peak_at_enqueue: u64,
@@ -100,16 +99,10 @@ pub(super) struct Instruments {
 }
 
 impl Instruments {
-    pub(super) fn mirror_handle(&self) -> Option<ConnectionHandle> {
-        self.mirror_handle
-    }
-
     /// Start the session-scoped instruments afresh. `bytes_base` is the new
     /// live session's accepted-byte counter at this moment.
     pub(super) fn reset_session_scope(&mut self, bytes_base: u64) {
         self.offered = OfferedBytes::default();
-        self.mirror = DepartureMirror::default();
-        self.mirror_handle = None;
         self.fifo = FifoSeries::default();
         self.fifo_peak_at_enqueue = 0;
         self.quinn_bytes_enqueued = 0;
@@ -126,6 +119,97 @@ impl IoBridge {
             .get(&handle)
             .map_or(0, |wt| wt.datagram_bytes_enqueued());
         self.instr.reset_session_scope(base);
+        // The previous live session's queue is gone with it.
+        self.release_departures();
+    }
+
+    /// The session the departure tracker describes is over (or another one
+    /// became live): nothing will ever stamp what it still holds, so forget
+    /// those transmissions rather than leave them on the books. They are
+    /// neither lost nor delivered, they were never sent to anyone who counts,
+    /// so the estimator hears nothing about them. Quinn reuses handles, so a
+    /// stale tracker would alias the next connection.
+    pub(super) fn release_departures(&mut self) {
+        self.departures = Default::default();
+        self.departures_handle = None;
+        self.transmission_ledger.discard_undeparted();
+        self.reliable_emitter
+            .forget_awaiting_departure(super::now_std());
+    }
+
+    /// Move what the emitter put on the wire since the last call into the
+    /// ledger. A transmission has to be on the books before it can be stamped
+    /// as departed, so this runs ahead of every departure poll as well as at
+    /// the end of the turn.
+    pub(super) fn record_emitted_transmissions(&mut self, now: std::time::Instant) {
+        for e in self.reliable_emitter.take_transmissions() {
+            self.transmission_ledger.record(
+                e.wire_seq,
+                now,
+                crate::transport::transmission_ledger::Transmission {
+                    emit_us: e.emit_us,
+                    wire_bytes: e.wire_bytes,
+                    key: e.key,
+                    depart_us: None,
+                },
+            );
+        }
+    }
+
+    /// `wire_seq` left for the wire at `at`: start the loss clock on its
+    /// ledger record and the timer on its cache entry.
+    pub(super) fn stamp_departure(&mut self, wire_seq: u32, at: std::time::Instant) {
+        stamp_departure_in(
+            &mut self.transmission_ledger,
+            &mut self.reliable_emitter,
+            wire_seq,
+            at,
+        );
+    }
+
+    /// A datagram that was consumed before quinn saw it (a harness-injected
+    /// drop) has left the host as far as the transport is concerned: it is on
+    /// the wire and lost. Its clocks start now, so the loss is declared on the
+    /// usual horizon rather than never.
+    pub(super) fn departed_without_quinn(&mut self, wire_seq: Option<u32>) {
+        let Some(ws) = wire_seq else { return };
+        let now = super::now_std();
+        self.record_emitted_transmissions(now);
+        self.stamp_departure(ws, now);
+    }
+
+    /// Mirror a datagram quinn just accepted into the departure tracker.
+    /// `cum_enqueued` is the session's cumulative accepted byte count
+    /// including it, `wire_seq` the transmission it carries if the ledger
+    /// tracks it. Every datagram quinn accepts for the live session goes
+    /// through here, whether or not it names a transmission: the byte
+    /// arithmetic needs the whole FIFO.
+    pub(super) fn track_enqueue(
+        &mut self,
+        handle: ConnectionHandle,
+        wire_seq: Option<u32>,
+        cum_enqueued: u64,
+    ) {
+        match self.departures_handle {
+            Some(h) if h == handle => {}
+            other => {
+                // A different connection than the tracker describes. Quinn
+                // reuses handles from a slab, so the old state must not
+                // alias it. With no tracker yet (`None`) there is nothing of
+                // a previous session to release: everything on the books is
+                // this session's, and the ledger holds transmissions queued
+                // for it that have not been sent, which must stay.
+                if other.is_some() {
+                    self.release_departures();
+                }
+                self.departures_handle = Some(handle);
+            }
+        }
+        let now = super::now_std();
+        if let Some(pushed_out) = self.departures.on_enqueue(wire_seq, cum_enqueued, now) {
+            // The backstop cap; see `TRACKER_CAP`.
+            self.stamp_departure(pushed_out, now);
+        }
     }
 
     /// Read the live session's quinn stats and send-queue depth.
@@ -159,13 +243,14 @@ impl IoBridge {
     }
 
     /// Note a datagram quinn just accepted: bill its class and wire bytes,
-    /// put it in the departure mirror and track the FIFO's peak depth.
+    /// put it in the departure tracker and track the FIFO's peak depth.
     pub(super) fn note_enqueued(&mut self, handle: ConnectionHandle, e: Enqueued) {
         let Enqueued {
             class,
             gated,
             dg_len,
             framing_len,
+            wire_seq,
             cum_enqueued,
             queued,
         } = e;
@@ -195,22 +280,23 @@ impl IoBridge {
         let i = &mut self.instr;
         i.offered.bill(class, dg_len, framing_len);
         i.fifo_peak_at_enqueue = i.fifo_peak_at_enqueue.max(queued);
-        if i.mirror_handle != Some(handle) {
-            i.mirror.clear();
-            i.mirror_handle = Some(handle);
-        }
-        i.mirror.on_enqueue(cum_enqueued, super::now_std());
+        self.track_enqueue(handle, wire_seq, cum_enqueued);
     }
 
     /// After a `poll_transmit` batch, stamp the datagrams that left quinn's
-    /// FIFO. Does nothing while the mirror is empty.
+    /// FIFO: start the ledger's loss clock and the emitter's retransmission
+    /// timer for each transmission among them, at `now`, the instant given to
+    /// `poll_transmit`. Does nothing while the tracker is empty.
     pub(super) fn poll_departures(&mut self, now: std::time::Instant) {
-        let Some(handle) = self.instr.mirror_handle else {
+        let Some(handle) = self.departures_handle else {
             return;
         };
-        if self.instr.mirror.is_empty() {
+        if self.departures.is_empty() {
             return;
         }
+        // Everything stamped below was built before it was sent, but the
+        // ledger only hears of it at the end of a turn.
+        self.record_emitted_transmissions(now);
         let capacity = self.server.datagram_send_buffer();
         let (Some(conn), Some(wt)) = (
             self.server.connections.get_mut(&handle),
@@ -219,9 +305,14 @@ impl IoBridge {
             return;
         };
         let queued = capacity.saturating_sub(conn.datagrams().send_buffer_space()) as u64;
-        self.instr
-            .mirror
-            .on_poll(wt.datagram_bytes_enqueued(), queued, now);
+        let ledger = &mut self.transmission_ledger;
+        let emitter = &mut self.reliable_emitter;
+        self.departures
+            .on_poll(wt.datagram_bytes_enqueued(), queued, now, |ws, _| {
+                if let Some(ws) = ws {
+                    stamp_departure_in(ledger, emitter, ws, now);
+                }
+            });
     }
 
     /// Snapshot every instrument.
@@ -229,7 +320,7 @@ impl IoBridge {
         let i = &self.instr;
         // Mirror the session counter against what was still queued at the
         // last reading; both are as of the last `update_transport_probe`.
-        let lag = &i.mirror.lag;
+        let lag = &self.departures.lag;
         let late_total = self.transmission_ledger.stats().acked_after_declared_lost;
         InstrumentSummary {
             window_us: i.fifo.window_us(),
@@ -240,6 +331,16 @@ impl IoBridge {
             fifo_depth_slope_last_quarter_bps: i.fifo.slope_last_quarter().round() as i64,
             quinn_limited_turns: i.fifo.nonempty(),
             quinn_limited_us: i.fifo.nonempty_us(),
+            ledger_expired_before_departure: self
+                .transmission_ledger
+                .stats()
+                .expired_before_departure,
+            ledger_departures_stamped: self.transmission_ledger.stats().departures_stamped,
+            ledger_evicted_before_departure: self
+                .transmission_ledger
+                .stats()
+                .evicted_before_departure,
+            rto_armed_at_departure: self.reliable_emitter.stats.rto_armed_at_departure,
             ledger_unknown_acks: self.transmission_ledger.stats().unknown_acks,
             ledger_tombstone_evictions: self.transmission_ledger.stats().tombstone_evictions,
             offered: i.offered,
@@ -249,8 +350,8 @@ impl IoBridge {
             lag_p50_us: lag.quantile_us(0.5),
             lag_p95_us: lag.quantile_us(0.95),
             lag_max_us: lag.max_us(),
-            mirror_len: i.mirror.len() as u64,
-            mirror_overflowed: i.mirror.overflowed,
+            mirror_len: self.departures.len() as u64,
+            mirror_overflowed: self.departures.overflowed,
             budget: i.budget,
             admission: i.admission,
             ledger_losses_declared: i.losses_declared,
@@ -276,4 +377,16 @@ impl IoBridge {
         p.client_received += u64::from(fb.datagrams_received);
         p.client_recovered += u64::from(fb.datagrams_recovered_fec);
     }
+}
+
+/// [`IoBridge::stamp_departure`] on the two fields it touches, for a caller
+/// that holds a borrow of another one (the departure tracker's callback).
+fn stamp_departure_in(
+    ledger: &mut crate::transport::transmission_ledger::TransmissionLedger,
+    emitter: &mut crate::transport::reliable_emitter::ReliableTileEmitter,
+    wire_seq: u32,
+    at: std::time::Instant,
+) {
+    ledger.mark_departed(wire_seq, at, emitter.emit_us64(at));
+    emitter.on_departed(wire_seq, at);
 }

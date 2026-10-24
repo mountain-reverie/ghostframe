@@ -27,6 +27,12 @@ pub struct Transmission {
     pub wire_bytes: usize,
     /// Content identity, for the consumers that still think in tile-passes.
     pub key: EmitKey,
+    /// The emitter-clock microseconds (the clock `emit_us` is on) at which
+    /// this transmission left quinn's FIFO for the wire. `None` while it is
+    /// still queued, in the emitter or in quinn. `emit_us` is when it was
+    /// built; this is when it was sent, and the difference is the time it
+    /// sat in a queue.
+    pub depart_us: Option<u64>,
 }
 
 /// What an acknowledgement turned out to refer to.
@@ -68,13 +74,40 @@ pub struct LedgerStats {
     /// for an evicted one resolves to nothing (counted in `unknown_acks`), so
     /// `acked_after_declared_lost` is blind to it. Measurement only.
     pub tombstone_evictions: u64,
+    /// Verdicts issued on a record that had not departed. Reachable only if
+    /// the expiry walk stops following departure order (it walks
+    /// `departed_order`, whose entries all carry a stamp), so this guards the
+    /// walk order, NOT the departure tracker: that rests on the real-quinn
+    /// proptest in `departure.rs`. It reads positive under the mutation "walk
+    /// in recording order" (see the burst-loss P3 gate).
+    pub expired_before_departure: u64,
+    /// Departures stamped on a record (one per transmission, at most).
+    pub departures_stamped: u64,
+    /// Transmissions evicted by the capacity cap before they had departed.
+    pub evicted_before_departure: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Record {
+    /// When the ledger was told of it (enqueue). Identity and capacity order
+    /// only: the loss clock is `departed`.
+    #[allow(dead_code)]
+    recorded_at: Instant,
+    /// When it left quinn's FIFO. `None` until then.
+    departed: Option<Instant>,
+    tx: Transmission,
 }
 
 pub struct TransmissionLedger {
-    records: HashMap<u32, (Instant, Transmission)>,
-    /// Insertion order, so expiry and capacity eviction both walk oldest
-    /// first without sorting.
+    records: HashMap<u32, Record>,
+    /// Recording order, for the capacity cap: the oldest record goes first.
+    /// Resolved entries are skipped lazily.
     order: VecDeque<u32>,
+    /// Departure order, for the loss clock. A transmission enters when it is
+    /// stamped, so the front is always the one that has been on the wire the
+    /// longest and the walk in `expire_with_seq` stops at the first young
+    /// one. Resolved entries are skipped lazily.
+    departed_order: VecDeque<u32>,
     capacity: usize,
     stats: LedgerStats,
     /// `wire_seq -> Transmission` for expired records, retained so a late
@@ -89,6 +122,7 @@ impl TransmissionLedger {
         Self {
             records: HashMap::new(),
             order: VecDeque::new(),
+            departed_order: VecDeque::new(),
             capacity,
             stats: LedgerStats::default(),
             tombstones: HashMap::new(),
@@ -119,8 +153,20 @@ impl TransmissionLedger {
     /// around while an entry was still outstanding. The old record is
     /// replaced and counted as a capacity eviction rather than silently
     /// dropped, since it can no longer be classified.
+    ///
+    /// Recording is identity only. The loss clock does not start until
+    /// [`Self::mark_departed`]: a transmission still queued in the emitter or
+    /// in quinn's FIFO has not been sent, so it cannot have been lost.
     pub fn record(&mut self, wire_seq: u32, at: Instant, tx: Transmission) {
-        if self.records.insert(wire_seq, (at, tx)).is_some() {
+        let rec = Record {
+            recorded_at: at,
+            departed: None,
+            tx: Transmission {
+                depart_us: None,
+                ..tx
+            },
+        };
+        if self.records.insert(wire_seq, rec).is_some() {
             self.stats.capacity_evictions += 1;
             self.order.retain(|w| *w != wire_seq);
         }
@@ -128,13 +174,61 @@ impl TransmissionLedger {
         while self.records.len() > self.capacity {
             match self.order.pop_front() {
                 Some(oldest) => {
-                    if self.records.remove(&oldest).is_some() {
+                    if let Some(r) = self.records.remove(&oldest) {
                         self.stats.capacity_evictions += 1;
+                        if r.departed.is_none() {
+                            self.stats.evicted_before_departure += 1;
+                        }
                     }
                 }
                 None => break,
             }
         }
+        self.compact_if_sparse();
+    }
+
+    /// [`Self::record`] for a test that wants the transmission on the wire:
+    /// stamped as departed at `at`, `depart_us` the same as its `emit_us`.
+    #[cfg(test)]
+    pub(crate) fn record_departed(&mut self, wire_seq: u32, at: Instant, tx: Transmission) {
+        let us = tx.emit_us;
+        self.record(wire_seq, at, tx);
+        self.mark_departed(wire_seq, at, us);
+    }
+
+    /// Stamp `wire_seq` as having left quinn's FIFO at `at` (`depart_us` on
+    /// the emitter's clock). From here the loss clock runs.
+    ///
+    /// Returns whether it stamped a record: `false` for a transmission that
+    /// is unknown (already acknowledged, expired, evicted) or already
+    /// stamped. O(1).
+    pub fn mark_departed(&mut self, wire_seq: u32, at: Instant, depart_us: u64) -> bool {
+        let Some(rec) = self.records.get_mut(&wire_seq) else {
+            return false;
+        };
+        if rec.departed.is_some() {
+            return false;
+        }
+        rec.departed = Some(at);
+        rec.tx.depart_us = Some(depart_us);
+        self.departed_order.push_back(wire_seq);
+        self.stats.departures_stamped += 1;
+        true
+    }
+
+    /// Has `wire_seq` left quinn's FIFO? `None` if the ledger does not hold it.
+    pub fn departed(&self, wire_seq: u32) -> Option<bool> {
+        self.records.get(&wire_seq).map(|r| r.departed.is_some())
+    }
+
+    /// Forget every record that has not departed. The session they were
+    /// built for is gone: they are neither delivered nor lost, so no verdict
+    /// is issued and no tombstone kept. Returns how many were forgotten.
+    /// O(n); runs on a session change only.
+    pub fn discard_undeparted(&mut self) -> usize {
+        let before = self.records.len();
+        self.records.retain(|_, r| r.departed.is_some());
+        before - self.records.len()
     }
 
     /// Classify a transmission as received. Returns `None` if it is not
@@ -148,8 +242,8 @@ impl TransmissionLedger {
     /// this ledger only classifies the acknowledgement as `Resolution::Late`,
     /// which also lets the content be released.
     pub fn resolve(&mut self, wire_seq: u32) -> Option<Resolution> {
-        if let Some((_, tx)) = self.records.remove(&wire_seq) {
-            return Some(Resolution::Live(tx));
+        if let Some(rec) = self.records.remove(&wire_seq) {
+            return Some(Resolution::Live(rec.tx));
         }
         if let Some(tx) = self.tombstones.remove(&wire_seq) {
             self.stats.acked_after_declared_lost += 1;
@@ -159,7 +253,8 @@ impl TransmissionLedger {
         None
     }
 
-    /// Classify everything outstanding longer than `horizon` as lost.
+    /// Classify everything that has been on the wire longer than `horizon`
+    /// as lost.
     pub fn expire(&mut self, now: Instant, horizon: std::time::Duration) -> Vec<Transmission> {
         self.expire_with_seq(now, horizon)
             .into_iter()
@@ -169,46 +264,88 @@ impl TransmissionLedger {
 
     /// [`Self::expire`], with each lost transmission's `wire_seq` so the
     /// caller can later match a late acknowledgement to it exactly.
+    ///
+    /// The clock is the departure stamp, not the recording time: a
+    /// transmission that has not left quinn's FIFO is never on it. Departure
+    /// order is the walk order, so it stops at the first transmission that
+    /// has not been on the wire for `horizon` yet.
     pub fn expire_with_seq(
         &mut self,
         now: Instant,
         horizon: std::time::Duration,
     ) -> Vec<(u32, Transmission)> {
         let mut lost = Vec::new();
-        while let Some(front) = self.order.front().copied() {
+        while let Some(front) = self.departed_order.front().copied() {
             match self.records.get(&front) {
-                // Already resolved; drop the stale order entry and continue.
+                // Already resolved, or the record was replaced by a newer one
+                // under the same `wire_seq` that has not departed yet; drop
+                // the stale order entry and continue.
                 None => {
-                    self.order.pop_front();
+                    self.departed_order.pop_front();
                 }
-                Some((at, _)) => {
+                Some(Record { departed: None, .. }) => {
+                    self.departed_order.pop_front();
+                }
+                Some(Record {
+                    departed: Some(at), ..
+                }) => {
                     if now.saturating_duration_since(*at) < horizon {
-                        // Insertion order is send order, so nothing behind
-                        // this is older.
                         break;
                     }
-                    self.order.pop_front();
-                    if let Some((_, tx)) = self.records.remove(&front) {
-                        if crate::transport::reliable_emitter::rto_probe_enabled() {
-                            eprintln!("RTOPROBE expired_ws ws={}", front);
-                        }
-                        self.tombstones.insert(front, tx);
-                        self.tombstone_order.push_back(front);
-                        while self.tombstones.len() > self.capacity {
-                            if let Some(oldest) = self.tombstone_order.pop_front() {
-                                if self.tombstones.remove(&oldest).is_some() {
-                                    self.stats.tombstone_evictions += 1;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                        lost.push((front, tx));
-                    }
+                    self.departed_order.pop_front();
+                    self.declare_lost(front, &mut lost);
                 }
             }
         }
+        self.compact_if_sparse();
         lost
+    }
+
+    /// Issue the verdict for `wire_seq`: remove its record, keep a tombstone
+    /// so a late acknowledgement can still release the content, and hand it
+    /// to the caller. The one place a loss is declared.
+    fn declare_lost(&mut self, wire_seq: u32, lost: &mut Vec<(u32, Transmission)>) {
+        let Some(rec) = self.records.remove(&wire_seq) else {
+            return;
+        };
+        if rec.departed.is_none() {
+            self.stats.expired_before_departure += 1;
+        }
+        if crate::transport::reliable_emitter::rto_probe_enabled() {
+            eprintln!("RTOPROBE expired_ws ws={}", wire_seq);
+        }
+        let tx = rec.tx;
+        self.tombstones.insert(wire_seq, tx);
+        self.tombstone_order.push_back(wire_seq);
+        while self.tombstones.len() > self.capacity {
+            if let Some(oldest) = self.tombstone_order.pop_front() {
+                if self.tombstones.remove(&oldest).is_some() {
+                    self.stats.tombstone_evictions += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        lost.push((wire_seq, tx));
+    }
+
+    /// The two order queues skip resolved entries lazily, which is amortised
+    /// O(1) while the front keeps moving. A front that does not move (a
+    /// record that never departs, a young one at the head of the walk) would
+    /// let resolved entries pile up behind it, so rebuild when they outnumber
+    /// the live ones by a wide margin.
+    fn compact_if_sparse(&mut self) {
+        let live = self.records.len();
+        let slack = 2 * self.capacity + 64;
+        if self.order.len() > live + slack {
+            let records = &self.records;
+            self.order.retain(|w| records.contains_key(w));
+        }
+        if self.departed_order.len() > live + slack {
+            let records = &self.records;
+            self.departed_order
+                .retain(|w| records.get(w).is_some_and(|r| r.departed.is_some()));
+        }
     }
 }
 
@@ -222,6 +359,15 @@ mod tests {
             emit_us: n as u64 * 1000,
             wire_bytes: 1200,
             key: EmitKey::new(n, 0, 0, 0),
+            depart_us: None,
+        }
+    }
+
+    /// `tx(n)` as the ledger hands it back once it has departed at `us`.
+    fn departed(n: u32, us: u64) -> Transmission {
+        Transmission {
+            depart_us: Some(us),
+            ..tx(n)
         }
     }
 
@@ -230,7 +376,8 @@ mod tests {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(64);
         l.record(7, t0, tx(7));
-        assert_eq!(l.resolve(7), Some(Resolution::Live(tx(7))));
+        assert!(l.mark_departed(7, t0, 5));
+        assert_eq!(l.resolve(7), Some(Resolution::Live(departed(7, 5))));
         assert_eq!(l.resolve(7), None, "a second resolve finds nothing");
         assert!(
             l.expire(t0 + Duration::from_secs(10), Duration::from_millis(1))
@@ -244,8 +391,9 @@ mod tests {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(64);
         l.record(7, t0, tx(7));
+        l.mark_departed(7, t0, 5);
         let lost = l.expire(t0 + Duration::from_millis(500), Duration::from_millis(100));
-        assert_eq!(lost, vec![tx(7)]);
+        assert_eq!(lost, vec![departed(7, 5)]);
         assert!(
             l.expire(t0 + Duration::from_secs(10), Duration::from_millis(1))
                 .is_empty(),
@@ -265,6 +413,7 @@ mod tests {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(64);
         l.record(7, t0, tx(7));
+        l.mark_departed(7, t0, 5);
         assert_eq!(
             l.expire(t0 + Duration::from_millis(500), Duration::from_millis(100))
                 .len(),
@@ -272,7 +421,7 @@ mod tests {
         );
         assert_eq!(
             l.resolve(7),
-            Some(Resolution::Late(tx(7))),
+            Some(Resolution::Late(departed(7, 5))),
             "the content must still be releasable, or its cache entry is stranded"
         );
         assert_eq!(
@@ -289,14 +438,16 @@ mod tests {
 
     #[test]
     fn expiry_stops_at_the_first_young_record() {
-        // Insertion order is send order, so the walk must not scan the whole
+        // Departure order is send order, so the walk must not scan the whole
         // ledger on every sweep.
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(64);
         l.record(1, t0, tx(1));
-        l.record(2, t0 + Duration::from_millis(400), tx(2));
+        l.record(2, t0, tx(2));
+        l.mark_departed(1, t0, 1);
+        l.mark_departed(2, t0 + Duration::from_millis(400), 2);
         let lost = l.expire(t0 + Duration::from_millis(500), Duration::from_millis(200));
-        assert_eq!(lost, vec![tx(1)], "only the old one");
+        assert_eq!(lost, vec![departed(1, 1)], "only the old one");
         assert_eq!(l.len(), 1);
     }
 
@@ -352,7 +503,9 @@ mod tests {
                         emit_us: ws as u64,
                         wire_bytes: 1200,
                         key: EmitKey::new(ws, 0, 0, 0),
+                        depart_us: None,
                     });
+                    l.mark_departed(ws, now, ws as u64);
                     outstanding.insert(ws);
                     slot_ws.insert(slot, ws);
                 }
@@ -396,8 +549,10 @@ mod tests {
                 emit_us: 10,
                 wire_bytes: 500,
                 key,
+                depart_us: None,
             },
         );
+        l.mark_departed(99, t0, 10);
 
         let lost = l.expire(t0 + Duration::from_millis(300), Duration::from_millis(100));
         assert_eq!(lost.len(), 1, "the transmission is declared lost");
@@ -421,6 +576,7 @@ mod tests {
                 emit_us: 10,
                 wire_bytes: 500,
                 key,
+                depart_us: None,
             },
         );
         match l.resolve(99) {
@@ -441,8 +597,10 @@ mod tests {
                 emit_us: 10,
                 wire_bytes: 500,
                 key: EmitKey::new(7, 1, 2, 0),
+                depart_us: None,
             },
         );
+        l.mark_departed(99, t0, 10);
         let _ = l.expire(t0 + Duration::from_millis(300), Duration::from_millis(100));
         assert!(matches!(l.resolve(99), Some(Resolution::Late(_))));
         assert!(
@@ -468,8 +626,10 @@ mod tests {
                     emit_us: 0,
                     wire_bytes: 1,
                     key: EmitKey::new(ws, 0, 0, 0),
+                    depart_us: None,
                 },
             );
+            l.mark_departed(ws, t0, 0);
             let _ = l.expire(t0 + Duration::from_millis(300), Duration::from_millis(100));
         }
         assert!(
@@ -500,5 +660,93 @@ mod tests {
         assert_eq!(l.resolve(1), None, "oldest was evicted");
         assert_eq!(l.resolve(3), Some(Resolution::Live(tx(3))));
         assert_eq!(l.stats().capacity_evictions, 1);
+    }
+
+    #[test]
+    fn a_transmission_that_has_not_departed_is_never_declared_lost() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        l.record(1, t0, tx(1));
+        l.record(2, t0, tx(2));
+        let lost = l.expire(t0 + Duration::from_secs(3600), Duration::from_millis(1));
+        assert!(lost.is_empty(), "queued transmissions are not on the clock");
+        assert_eq!(l.stats().expired_before_departure, 0);
+        assert_eq!(l.len(), 2, "and they are still outstanding");
+    }
+
+    #[test]
+    fn the_loss_clock_starts_at_departure_not_at_recording() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        l.record(1, t0, tx(1));
+        // Sat in a queue for 400 ms, then left.
+        let left = t0 + Duration::from_millis(400);
+        assert!(l.mark_departed(1, left, 400_000));
+        let horizon = Duration::from_millis(200);
+        assert!(
+            l.expire(t0 + Duration::from_millis(500), horizon)
+                .is_empty(),
+            "100 ms on the wire is inside the 200 ms horizon, however long it queued"
+        );
+        let lost = l.expire(t0 + Duration::from_millis(601), horizon);
+        assert_eq!(lost, vec![departed(1, 400_000)]);
+        assert_eq!(l.stats().expired_before_departure, 0);
+    }
+
+    #[test]
+    fn departure_is_stamped_once_and_only_for_a_known_record() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        assert!(!l.mark_departed(9, t0, 1), "unknown wire_seq");
+        l.record(9, t0, tx(9));
+        assert!(l.mark_departed(9, t0, 1));
+        assert!(!l.mark_departed(9, t0 + Duration::from_secs(1), 2), "twice");
+        assert_eq!(l.departed(9), Some(true));
+        assert_eq!(l.stats().departures_stamped, 1);
+        assert!(matches!(
+            l.resolve(9),
+            Some(Resolution::Live(Transmission {
+                depart_us: Some(1),
+                ..
+            }))
+        ));
+        assert!(!l.mark_departed(9, t0, 3), "resolved");
+    }
+
+    #[test]
+    fn eviction_of_a_queued_transmission_is_counted() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(2);
+        l.record(1, t0, tx(1));
+        l.record(2, t0, tx(2));
+        l.mark_departed(2, t0, 0);
+        l.record(3, t0, tx(3));
+        assert_eq!(l.stats().capacity_evictions, 1);
+        assert_eq!(l.stats().evicted_before_departure, 1);
+    }
+
+    /// A record that never departs sits at the front of the recording order
+    /// forever. The resolved entries behind it must not pile up without bound.
+    #[test]
+    fn the_order_queues_stay_bounded_behind_a_stuck_front() {
+        let t0 = Instant::now();
+        let cap = 64;
+        let mut l = TransmissionLedger::new(cap);
+        l.record(0, t0, tx(0)); // never departs, never resolves
+        for ws in 1..20_000u32 {
+            l.record(ws, t0, tx(ws));
+            l.mark_departed(ws, t0, 0);
+            assert!(l.resolve(ws).is_some());
+        }
+        assert!(
+            l.order.len() <= l.len() + 2 * cap + 64 + 1,
+            "recording order grew to {}",
+            l.order.len()
+        );
+        assert!(
+            l.departed_order.len() <= l.len() + 2 * cap + 64 + 1,
+            "departure order grew to {}",
+            l.departed_order.len()
+        );
     }
 }

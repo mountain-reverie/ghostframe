@@ -2398,6 +2398,10 @@ impl IoBridge {
                 // Lower bound: a late ack for a tombstone the ring has since
                 // evicted lands in `ledger_unknown_acks` instead.
                 late_acked_unreported = ins.late_acked_unreported,
+                ledger_expired_before_departure = ins.ledger_expired_before_departure,
+                ledger_departures_stamped = ins.ledger_departures_stamped,
+                ledger_evicted_before_departure = ins.ledger_evicted_before_departure,
+                rto_armed_at_departure = ins.rto_armed_at_departure,
                 ledger_unknown_acks = ins.ledger_unknown_acks,
                 ledger_tombstone_evictions = ins.ledger_tombstone_evictions,
                 ecn_ect0_tx = ins.ecn.ect0_tx,

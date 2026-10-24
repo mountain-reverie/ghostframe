@@ -54,13 +54,14 @@ fn record_transmissions(b: &mut IoBridge) -> Vec<(u32, EmitKey)> {
     let now = super::now_std();
     let mut out = Vec::new();
     for e in b.reliable_emitter.take_transmissions() {
-        b.transmission_ledger.record(
+        b.transmission_ledger.record_departed(
             e.wire_seq,
             now,
             crate::transport::transmission_ledger::Transmission {
                 emit_us: e.emit_us,
                 wire_bytes: e.wire_bytes,
                 key: e.key,
+                depart_us: None,
             },
         );
         out.push((e.wire_seq, e.key));

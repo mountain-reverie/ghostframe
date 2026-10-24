@@ -1755,13 +1755,14 @@ async fn ack_routes_through_emitter_dropping_cache() {
     let emitted = bridge.reliable_emitter.take_transmissions();
     assert_eq!(emitted.len(), 1, "one datagram was submitted");
     for e in &emitted {
-        bridge.transmission_ledger.record(
+        bridge.transmission_ledger.record_departed(
             e.wire_seq,
             ledger_now,
             crate::transport::transmission_ledger::Transmission {
                 emit_us: e.emit_us,
                 wire_bytes: e.wire_bytes,
                 key: e.key,
+                depart_us: None,
             },
         );
     }
@@ -1792,7 +1793,7 @@ async fn the_classifiers_loss_rate_is_the_ledgers_verdict() {
     let mut acked = Vec::new();
     for wire_seq in 0..400u32 {
         let now = now_std();
-        bridge.transmission_ledger.record(
+        bridge.transmission_ledger.record_departed(
             wire_seq,
             now,
             crate::transport::transmission_ledger::Transmission {
@@ -1804,6 +1805,7 @@ async fn the_classifiers_loss_rate_is_the_ledgers_verdict() {
                     0,
                     0,
                 ),
+                depart_us: None,
             },
         );
         if !wire_seq.is_multiple_of(5) {
@@ -3422,13 +3424,14 @@ async fn bwe_estimate_advances_through_bridge_production_wiring() {
         // production drain does.
         let ledger_now = super::now_std();
         for e in bridge.reliable_emitter.take_transmissions() {
-            bridge.transmission_ledger.record(
+            bridge.transmission_ledger.record_departed(
                 e.wire_seq,
                 ledger_now,
                 crate::transport::transmission_ledger::Transmission {
                     emit_us: e.emit_us,
                     wire_bytes: e.wire_bytes,
                     key: e.key,
+                    depart_us: None,
                 },
             );
             entries.push(AckEntry {
@@ -4908,13 +4911,14 @@ fn seed_unacked_entry(
     assert_eq!(emitted.len(), 1);
     let ledger_now = now_std();
     for e in &emitted {
-        bridge.transmission_ledger.record(
+        bridge.transmission_ledger.record_departed(
             e.wire_seq,
             ledger_now,
             crate::transport::transmission_ledger::Transmission {
                 emit_us: e.emit_us,
                 wire_bytes: e.wire_bytes,
                 key: e.key,
+                depart_us: None,
             },
         );
     }
@@ -5513,6 +5517,7 @@ fn ledger_tx(
         emit_us,
         wire_bytes: bytes,
         key: crate::transport::reliable_emitter::EmitKey::new(frame_seq, 1, 2, 0),
+        depart_us: None,
     }
 }
 
@@ -5527,10 +5532,10 @@ async fn a_late_ack_retracts_the_pending_loss_it_contradicts() {
     let t0 = super::now_std();
     bridge
         .transmission_ledger
-        .record(41, t0, ledger_tx(1_000, 1_200, 1));
+        .record_departed(41, t0, ledger_tx(1_000, 1_200, 1));
     bridge
         .transmission_ledger
-        .record(42, t0, ledger_tx(2_000, 900, 2));
+        .record_departed(42, t0, ledger_tx(2_000, 900, 2));
     bridge.expire_transmissions(t0 + std::time::Duration::from_secs(60));
     assert_eq!(bridge.pending_losses.len(), 2, "both declared lost");
 
@@ -5564,7 +5569,7 @@ async fn a_late_ack_withdraws_its_own_loss_among_identical_twins() {
     for ws in [10, 11, 12] {
         bridge
             .transmission_ledger
-            .record(ws, t0, ledger_tx(5_000, 1_200, ws));
+            .record_departed(ws, t0, ledger_tx(5_000, 1_200, ws));
     }
     bridge.expire_transmissions(t0 + std::time::Duration::from_secs(60));
     let batch = AckBatch {
@@ -5588,10 +5593,10 @@ async fn a_late_ack_for_an_already_flushed_loss_is_a_no_op() {
     let t0 = super::now_std();
     bridge
         .transmission_ledger
-        .record(1, t0, ledger_tx(1_000, 1_200, 1));
+        .record_departed(1, t0, ledger_tx(1_000, 1_200, 1));
     bridge
         .transmission_ledger
-        .record(2, t0, ledger_tx(2_000, 1_200, 2));
+        .record_departed(2, t0, ledger_tx(2_000, 1_200, 2));
     bridge.expire_transmissions(t0 + std::time::Duration::from_secs(60));
     bridge.pending_losses.retain(|l| l.wire_seq != 1); // wire_seq 1 was flushed
     let batch = AckBatch {
@@ -5620,10 +5625,10 @@ async fn post_turn_withdraws_the_loss_of_a_late_acked_transmission() {
         .expect("monotonic clock has 60 s of history");
     bridge
         .transmission_ledger
-        .record(41, long_ago, ledger_tx(1_000, 1_200, 1));
+        .record_departed(41, long_ago, ledger_tx(1_000, 1_200, 1));
     bridge
         .transmission_ledger
-        .record(42, long_ago, ledger_tx(2_000, 900, 2));
+        .record_departed(42, long_ago, ledger_tx(2_000, 900, 2));
 
     bridge.post_turn().await.expect("post_turn");
     assert_eq!(
@@ -5668,9 +5673,11 @@ async fn a_late_ack_after_the_flush_is_counted_apart_from_one_before_it() {
         .checked_sub(std::time::Duration::from_secs(60))
         .expect("monotonic clock has 60 s of history");
     for ws in [1, 2] {
-        bridge
-            .transmission_ledger
-            .record(ws, long_ago, ledger_tx(1_000 * ws as u64, 1_200, ws));
+        bridge.transmission_ledger.record_departed(
+            ws,
+            long_ago,
+            ledger_tx(1_000 * ws as u64, 1_200, ws),
+        );
     }
     bridge.post_turn().await.expect("post_turn");
     assert_eq!(bridge.pending_losses.len(), 2, "declared, not yet reported");
@@ -5680,7 +5687,7 @@ async fn a_late_ack_after_the_flush_is_counted_apart_from_one_before_it() {
     // A live acknowledgement gives goog_cc a report to carry the losses.
     bridge
         .transmission_ledger
-        .record(3, super::now_std(), ledger_tx(3_000, 1_200, 3));
+        .record_departed(3, super::now_std(), ledger_tx(3_000, 1_200, 3));
     bridge.dispatch_ack_datagram(&ack(3));
     bridge.post_turn().await.expect("post_turn");
     assert!(bridge.pending_losses.is_empty(), "flushed to goog_cc");
@@ -5701,7 +5708,7 @@ async fn a_late_ack_after_the_flush_is_counted_apart_from_one_before_it() {
 }
 
 /// quinn reuses connection handles. The session-scoped instruments must not
-/// carry one connection's departure mirror (or its billing) into the next one
+/// carry one connection's departure tracker (or its billing) into the next one
 /// that is given the same handle, or its first lags are stamped against
 /// byte counts that belong to a connection that no longer exists.
 #[tokio::test]
@@ -5715,6 +5722,7 @@ async fn a_forgotten_session_does_not_leak_its_mirror_into_a_reused_handle() {
             gated: true,
             dg_len: 100,
             framing_len: 2,
+            wire_seq: None,
             cum_enqueued: 102,
             queued: 102,
         },
@@ -5726,17 +5734,18 @@ async fn a_forgotten_session_does_not_leak_its_mirror_into_a_reused_handle() {
             gated: true,
             dg_len: 100,
             framing_len: 2,
+            wire_seq: None,
             cum_enqueued: 204,
             queued: 204,
         },
     );
-    assert_eq!(bridge.instr.mirror.len(), 2);
+    assert_eq!(bridge.departures.len(), 2);
     assert_eq!(bridge.instr.offered.total(), 204);
 
     bridge.forget_session(h);
-    assert!(bridge.instr.mirror.is_empty(), "forgotten session's mirror");
+    assert!(bridge.departures.is_empty(), "forgotten session's mirror");
     assert_eq!(bridge.instr.offered.total(), 0);
-    assert_eq!(bridge.instr.mirror_handle(), None);
+    assert_eq!(bridge.departures_handle, None);
 
     // The same handle, a new connection whose counter starts again.
     bridge.note_enqueued(
@@ -5746,12 +5755,13 @@ async fn a_forgotten_session_does_not_leak_its_mirror_into_a_reused_handle() {
             gated: true,
             dg_len: 100,
             framing_len: 2,
+            wire_seq: None,
             cum_enqueued: 102,
             queued: 102,
         },
     );
     assert_eq!(
-        bridge.instr.mirror.len(),
+        bridge.departures.len(),
         1,
         "no stale entry from the old one"
     );
@@ -5791,13 +5801,14 @@ async fn bwe_sample_send_time_is_not_the_wrapped_emit_clock() {
         true_us > u32::MAX as u64,
         "the fixture must be past the wrap"
     );
-    bridge.transmission_ledger.record(
+    bridge.transmission_ledger.record_departed(
         sent[0].wire_seq,
         now,
         crate::transport::transmission_ledger::Transmission {
             emit_us: sent[0].emit_us,
             wire_bytes: sent[0].wire_bytes,
             key: sent[0].key,
+            depart_us: None,
         },
     );
     let batch = AckBatch {
@@ -5842,13 +5853,14 @@ async fn pending_loss_send_time_is_not_the_wrapped_emit_clock() {
         now,
     );
     for e in bridge.reliable_emitter.take_transmissions() {
-        bridge.transmission_ledger.record(
+        bridge.transmission_ledger.record_departed(
             e.wire_seq,
             now,
             crate::transport::transmission_ledger::Transmission {
                 emit_us: e.emit_us,
                 wire_bytes: e.wire_bytes,
                 key: e.key,
+                depart_us: None,
             },
         );
     }
@@ -5884,13 +5896,14 @@ async fn pre_wrap_sample_send_time_equals_the_emitted_stamp() {
     let sent = bridge.reliable_emitter.take_transmissions();
     let e = sent[0];
     assert_eq!(e.emit_us, 1_234_000);
-    bridge.transmission_ledger.record(
+    bridge.transmission_ledger.record_departed(
         e.wire_seq,
         now,
         crate::transport::transmission_ledger::Transmission {
             emit_us: e.emit_us,
             wire_bytes: e.wire_bytes,
             key: e.key,
+            depart_us: None,
         },
     );
     let batch = AckBatch {
@@ -6482,6 +6495,7 @@ async fn ungated_accepts_at_or_above_the_depth_target_are_counted() {
         gated: false,
         dg_len: 1_000,
         framing_len: 2,
+        wire_seq: None,
         cum_enqueued: queued,
         queued,
     };
@@ -6493,4 +6507,106 @@ async fn ungated_accepts_at_or_above_the_depth_target_are_counted() {
     assert_eq!(bridge.instr.admission.ungated_at_depth, 1);
     assert_eq!(bridge.instr.admission.depth_violations, 0);
     assert_eq!(bridge.instr.admission.soft_charged_bytes, 2_004);
+}
+
+// ---- F3: the loss clock and the estimator's send times start at departure ----
+
+/// A transmission that has been built and recorded but has not left quinn's
+/// FIFO is not on the loss clock, however old it is; once it leaves, the
+/// verdict is on the usual horizon from then, and it is reported to goog_cc
+/// against the moment it left, not the moment it was built.
+#[tokio::test]
+async fn a_queued_transmission_is_not_declared_lost_and_a_departed_one_is_reported_at_departure() {
+    let mut bridge = make_bridge_for_test().await;
+    let long_ago = super::now_std()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .expect("monotonic clock has 60 s of history");
+    // The emitter's clock starts a minute ago, so "5 ms in" is a minute ago.
+    bridge.reliable_emitter.time_base = long_ago;
+    let base = long_ago;
+    bridge
+        .transmission_ledger
+        .record(41, long_ago, ledger_tx(1_000, 1_200, 1));
+
+    bridge.post_turn().await.expect("post_turn");
+    assert!(
+        bridge.pending_losses.is_empty(),
+        "a transmission still queued cannot have been lost"
+    );
+    assert_eq!(bridge.instr.losses_declared, 0);
+    assert_eq!(bridge.transmission_ledger.len(), 1, "and it is still owed");
+
+    // It leaves 5 ms after the emitter's epoch.
+    let left = base + std::time::Duration::from_millis(5);
+    bridge.stamp_departure(41, left);
+    bridge.post_turn().await.expect("post_turn");
+    assert_eq!(bridge.pending_losses.len(), 1, "on the wire a minute: lost");
+    assert_eq!(
+        bridge.pending_losses[0].emit_us, 5_000,
+        "reported against the departure (5 ms), not the build stamp (1 ms)"
+    );
+    assert_eq!(
+        bridge.transmission_ledger.stats().expired_before_departure,
+        0
+    );
+}
+
+/// The estimator's send time for an acknowledged transmission is when it left
+/// the FIFO; the latency statistics keep the build stamp.
+#[tokio::test]
+async fn an_acknowledged_transmission_reaches_the_estimator_at_its_departure_time() {
+    use crate::transport::ack::{AckBatch, AckEntry};
+    let mut bridge = make_bridge_for_test().await;
+    let base = bridge.reliable_emitter.time_base;
+    let now = super::now_std();
+    bridge
+        .transmission_ledger
+        .record(7, now, ledger_tx(1_000, 1_200, 1));
+    // Built at 1 ms, left at 9 ms.
+    bridge.stamp_departure(7, base + std::time::Duration::from_millis(9));
+    let batch = AckBatch {
+        entries: vec![AckEntry {
+            wire_seq: 7,
+            arrival_time_ms_lo16: 3,
+        }],
+    };
+    bridge.dispatch_ack_datagram(&batch.encode());
+    assert_eq!(bridge.bwe_samples_buffer.len(), 1);
+    let s = &bridge.bwe_samples_buffer[0];
+    assert_eq!(s.depart_us, 9_000, "the estimator's send time");
+    assert_eq!(
+        s.server_emit_us, 1_000,
+        "the latency stats' start, unchanged"
+    );
+    assert_eq!(
+        s.ack_arrival().server_emit_us,
+        9_000,
+        "what goog_cc is given is the departure time"
+    );
+}
+
+/// Forgetting the live session discards the transmissions that were queued
+/// for it and never left: they are neither lost nor delivered, so the
+/// estimator hears nothing, and nothing is left on the books to alias the
+/// next connection that reuses the handle. Ones that did leave stay.
+#[tokio::test]
+async fn forgetting_a_session_discards_what_never_left_and_keeps_what_did() {
+    let h = ConnectionHandle(7);
+    let mut bridge = test_bridge_with_sessions(&[h]).await;
+    let now = super::now_std();
+    bridge
+        .transmission_ledger
+        .record(1, now, ledger_tx(1_000, 1_200, 1));
+    bridge
+        .transmission_ledger
+        .record_departed(2, now, ledger_tx(2_000, 1_200, 2));
+    bridge.track_enqueue(h, Some(1), 100);
+    assert_eq!(bridge.departures.len(), 1);
+
+    bridge.forget_session(h);
+
+    assert!(bridge.departures.is_empty());
+    assert_eq!(bridge.departures_handle, None);
+    assert_eq!(bridge.transmission_ledger.departed(1), None, "discarded");
+    assert_eq!(bridge.transmission_ledger.departed(2), Some(true), "kept");
 }

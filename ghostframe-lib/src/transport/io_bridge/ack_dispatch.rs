@@ -275,6 +275,7 @@ impl IoBridge {
             self.bwe_samples_buffer.push(BweSample {
                 tier,
                 server_emit_us,
+                depart_us: tx.depart_us.unwrap_or(server_emit_us),
                 queued_since_epoch_us,
                 client_arrival_ms_lo16: *arrival_lo16,
                 owd_ms_lo16,
