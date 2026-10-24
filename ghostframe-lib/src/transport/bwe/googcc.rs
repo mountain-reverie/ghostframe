@@ -33,6 +33,31 @@ const MAX_BPS: i64 = 200_000_000;
 /// probe results is known.
 const FOLLOW_TOLERANCE: f64 = 0.02;
 
+/// The estimate is lifted only while the path has no standing queue: quinn's
+/// smoothed RTT within this factor of its minimum over `MIN_RTT_SPAN`.
+///
+/// With a filling queue `A >= 0.85 x offered` keeps holding up to `K x C`
+/// (the queue absorbs the excess), so lifting there walks the estimate to
+/// `K x capacity` and keeps it there, and the delay detector's back-off (to
+/// `0.85 x A`) is undone a window later. The owner's bound is a quarter of
+/// the base RTT; it is also what CoDel's own 5 ms target adds to a 20 ms
+/// path, so the standing queue CoDel allows does not block the lift, and a
+/// drop-tail buffer that has filled (100 ms) does. quinn's `PathStats`
+/// carries only the smoothed RTT, not its minimum, so the minimum is the
+/// least smoothed RTT seen in the span (a slight over-estimate of the true
+/// minimum, which errs towards lifting).
+const QUEUE_RTT_RATIO: f64 = 1.25;
+
+/// Span of the minimum round trip: twice goog_cc's `MIN_TIME_BETWEEN_ALR_PROBES`
+/// (5 s), the longest it waits to re-measure a path, so a route change ages out
+/// of it on the same scale as everything else the estimator forgets.
+const MIN_RTT_SPAN_US: u64 = 10_000_000;
+
+/// A lift counts as undone when the estimate one feedback later is under this
+/// share of the value handed to goog_cc (2 % below it: the `FOLLOW_TOLERANCE`
+/// around the ceiling is the noise a lift is measured against).
+const LIFT_SURVIVAL: f64 = 0.98;
+
 /// `AIMD_BACKOFF` as a float for the delivery test.
 const AIMD_BACKOFF_F: f64 = super::ceiling::AIMD_BACKOFF;
 
@@ -89,6 +114,11 @@ pub(crate) struct GoogCcDriver {
     payload_fraction: f64,
     /// When goog_cc was last given an estimate (`reseed`).
     last_reseed_us: Option<u64>,
+    /// Least smoothed RTT seen over `MIN_RTT_SPAN_US`, microseconds.
+    min_rtt: super::sliding_min::SlidingMin<u64, u64>,
+    /// The raw estimate a lift handed goog_cc, until the next feedback has
+    /// been absorbed and compared with it.
+    pending_lift_bps: Option<u64>,
 }
 
 /// Newtype carrying the `Send` assertion, so it covers exactly the one type
@@ -236,6 +266,8 @@ impl GoogCcDriver {
             active_ceiling_bps: None,
             payload_fraction: 1.0,
             last_reseed_us: None,
+            min_rtt: Default::default(),
+            pending_lift_bps: None,
         }
     }
 
@@ -334,6 +366,7 @@ impl GoogCcDriver {
         let now_us = self.micros_since_base(now);
         let srtt_us = self.path_rtt.map_or(0, |d| d.as_micros() as u64);
         let reading: Option<CeilingReading> = self.ceiling.read(now_us, srtt_us);
+        let standing_queue = self.standing_queue();
         self.active_ceiling_bps = reading.and_then(|r| r.ceiling_bps).map(|c| c as u64);
         if let Some(r) = reading {
             self.payload_fraction = r.payload_fraction;
@@ -350,7 +383,15 @@ impl GoogCcDriver {
             self.stats.ceiling_binding_reads += 1;
         }
         if let Some(r) = reading {
-            self.follow_ceiling(now, now_us, srtt_us, r);
+            self.follow_ceiling(now, now_us, srtt_us, r, standing_queue);
+        }
+    }
+
+    /// quinn's round trip is well above its minimum: a queue is standing.
+    fn standing_queue(&self) -> bool {
+        match (self.path_rtt, self.min_rtt.min()) {
+            (Some(rtt), Some(min)) => rtt.as_micros() as f64 > QUEUE_RTT_RATIO * min as f64,
+            _ => false,
         }
     }
 
@@ -377,7 +418,14 @@ impl GoogCcDriver {
     /// delay detector is untouched and still lowers the estimate when the
     /// path does not (to `AIMD_BACKOFF` of the acknowledged rate); the next
     /// lift is a window later, no sooner.
-    fn follow_ceiling(&mut self, now: Instant, now_us: u64, srtt_us: u64, r: CeilingReading) {
+    fn follow_ceiling(
+        &mut self,
+        now: Instant,
+        now_us: u64,
+        srtt_us: u64,
+        r: CeilingReading,
+        standing_queue: bool,
+    ) {
         let Some(ceiling) = r.ceiling_bps else { return };
         let window_us = EstimateCeiling::window_us(srtt_us);
         let cooled = self
@@ -389,12 +437,25 @@ impl GoogCcDriver {
         let est = self.estimate_bps as f64;
         let ceiling = ceiling.max(MIN_BPS as f64);
         if est > ceiling * (1.0 + FOLLOW_TOLERANCE) {
+            // A gap in the acknowledgements (a stall, a blackout) makes the
+            // window's rate a measurement of the gap, not of the path: the
+            // bound is still published (`bounded`), but goog_cc is not told
+            // to continue from it.
+            if self.ceiling.ack_gap_us(now_us, srtt_us) > srtt_us {
+                self.stats.ceiling_reseeds_skipped_gap += 1;
+                return;
+            }
             self.reseed(now, now_us, ceiling);
             self.stats.ceiling_reseeds_down += 1;
         } else if est < ceiling * (1.0 - FOLLOW_TOLERANCE)
             && r.acked_bps >= AIMD_BACKOFF_F * r.offered_bps
         {
+            if standing_queue {
+                self.stats.ceiling_lifts_blocked_queue += 1;
+                return;
+            }
             self.reseed(now, now_us, ceiling);
+            self.pending_lift_bps = Some(ceiling as u64);
             self.stats.ceiling_reseeds_up += 1;
         }
     }
@@ -591,6 +652,20 @@ impl GoogCcDriver {
         self.acked_cum_bytes += records.iter().map(|r| r.size_bytes as f64).sum::<f64>();
         let now_us = self.micros_since_base(now);
         self.ceiling.note_acked(now_us, self.acked_cum_bytes);
+        if let Some(rtt) = self.path_rtt {
+            self.min_rtt.push(now_us, rtt.as_micros() as u64);
+            self.min_rtt
+                .expire_before(now_us.saturating_sub(MIN_RTT_SPAN_US));
+        }
+        // Did the last lift survive one feedback? Under goog_cc's loss-based
+        // estimator (v2) a lift is undone at the next feedback: its state is
+        // not reset by the constraints call. Counted, not acted on.
+        if let Some(lifted) = self.pending_lift_bps.take() {
+            self.stats.ceiling_lifts_checked += 1;
+            if (self.estimate_bps as f64) < LIFT_SURVIVAL * lifted as f64 {
+                self.stats.ceiling_lifts_undone += 1;
+            }
+        }
         self.refresh_ceiling(now);
 
         self.snapshot()
@@ -838,6 +913,18 @@ mod tests {
     const ACKED_BPS: f64 = 12.0 * 1200.0 * 8.0 / 0.020;
 
     fn drive_clean(d: &mut GoogCcDriver, t0: Instant, secs: u64, spend: f64) {
+        drive_clean_then_silence(d, t0, secs, spend, 0);
+    }
+
+    /// `drive_clean`, then `silence_ms` in which the bucket keeps granting and
+    /// spending and nothing is acknowledged (a stall).
+    fn drive_clean_then_silence(
+        d: &mut GoogCcDriver,
+        t0: Instant,
+        secs: u64,
+        spend: f64,
+        silence_ms: u64,
+    ) -> crate::transport::bwe::BweStats {
         const GRANT_BPS: f64 = 9.0e6;
         d.note_path_rtt(Duration::from_millis(30));
         let (mut granted, mut spent, mut offered) = (0.0f64, 0.0f64, 0.0f64);
@@ -861,6 +948,38 @@ mod tests {
             d.note_admission(now, granted, spent);
             d.update(&batch, &[], now, 14_400);
         }
+        let end = t0 + Duration::from_millis(secs * 1000);
+        // The first 40 ms of silence are still inside a round trip's grace
+        // (srtt 30 ms): the snapshot is taken once the gap is longer.
+        let mut before_silence = d.snapshot().stats;
+        for ms in 1..=silence_ms {
+            let now = end + Duration::from_millis(ms);
+            granted += GRANT_BPS / 8.0 * 0.001;
+            spent += GRANT_BPS / 8.0 * 0.001 * spend;
+            d.note_offered(now, offered);
+            d.note_admission(now, granted, spent);
+            if ms == 40 {
+                before_silence = d.snapshot().stats;
+            }
+            if ms == 100 {
+                // One late batch: the window holds some delivery (so a rate
+                // is read) across a stretch of silence on either side.
+                let step = (secs * 50) as u32;
+                let batch: Vec<AckArrival> = (0..12u32)
+                    .map(|i| {
+                        let emit_us = ((step * 20 + i) as u64) * 1_000;
+                        AckArrival {
+                            server_emit_us: emit_us,
+                            client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
+                            size_bytes: 1200,
+                            probe: None,
+                        }
+                    })
+                    .collect();
+                d.update(&batch, &[], now, 14_400);
+            }
+        }
+        before_silence
     }
 
     /// While the sender uses what it is granted, the published estimate and
@@ -901,6 +1020,31 @@ mod tests {
             snap.stats.ceiling_binding_reads > 0 || snap.stats.ceiling_reseeds_down > 0,
             "the ceiling never bound: {:?}",
             snap.stats
+        );
+    }
+
+    /// A stall inside the window: the bound is published, goog_cc is not told
+    /// to continue from a rate that is a measurement of the gap.
+    #[test]
+    fn a_gap_in_the_acknowledgements_is_published_but_not_pushed_into_goog_cc() {
+        let t0 = Instant::now();
+        let mut d = GoogCcDriver::new(4_000_000, t0);
+        // 8 s of steady delivery, then 200 ms with one late batch (srtt 30 ms).
+        let before = drive_clean_then_silence(&mut d, t0, 8, 1.0, 200);
+        assert!(before.ceiling_reseeds_down > 0, "premise: reseeds happen");
+        let after = d.snapshot();
+        assert!(
+            after.stats.ceiling_reseeds_skipped_gap > before.ceiling_reseeds_skipped_gap,
+            "premise: the gap was met ({:?})",
+            after.stats
+        );
+        assert_eq!(
+            after.stats.ceiling_reseeds_down, before.ceiling_reseeds_down,
+            "goog_cc was handed a bound read across a stall"
+        );
+        assert!(
+            after.bitrate_bps as f64 <= after.stats.ceiling_bps as f64,
+            "the bound is still published"
         );
     }
 

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 mod ceiling;
 mod googcc;
+pub(crate) mod sliding_min;
 mod timeline;
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -106,6 +107,16 @@ pub struct BweStats {
     /// Times it was handed the ceiling because its own was below it while the
     /// path showed no limit.
     pub ceiling_reseeds_up: u64,
+    /// Lifts checked one feedback after they were made, and how many had
+    /// fallen under 0.98 of the lifted value by then (goog_cc's loss-based
+    /// estimator undoes a lift while it is in a loss-limited state).
+    pub ceiling_lifts_checked: u64,
+    pub ceiling_lifts_undone: u64,
+    /// Lifts not made because quinn's round trip said a queue was standing.
+    pub ceiling_lifts_blocked_queue: u64,
+    /// Reseeds down not made because the window held a gap in the
+    /// acknowledgements longer than a round trip.
+    pub ceiling_reseeds_skipped_gap: u64,
     /// The payload fraction last measured, in parts per million.
     pub payload_fraction_ppm: u64,
     /// The last acknowledged rate read, bits per second.
