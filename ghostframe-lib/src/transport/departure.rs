@@ -12,11 +12,11 @@
 //! - `outgoing_total` falls by a datagram's length in exactly one place that
 //!   matters, in the same call as the `pop_front`, immediately before the
 //!   frame is encoded into the packet (`:181`). That call sits in
-//!   `populate_packet`'s DATAGRAM section (`connection/mod.rs:3335-3345`), and
-//!   the packet is finished and returned by `poll_transmit`
-//!   (`connection/mod.rs:881` ... `finish_and_track`, no path abandons it
-//!   after `populate_packet`). So the datagrams a `poll_transmit` batch wrote
-//!   are exactly the ones whose bytes left `outgoing_total` during it.
+//!   `populate_packet`'s DATAGRAM section (`connection/mod.rs:3334-3345`),
+//!   which `poll_transmit` calls at `:881` and then finishes the packet
+//!   (`finish_and_track`, `:927`); nothing abandons a packet between the two.
+//!   So the datagrams a `poll_transmit` batch wrote are exactly the ones
+//!   whose bytes left `outgoing_total` during it.
 //! - It rises only in `send` (`datagrams.rs:55`), after the `Blocked` check.
 //!
 //! So with `cum_enqueued` the session's cumulative accepted byte count,
@@ -32,7 +32,7 @@
 //!   (`WebTransportServer::send_datagram`), so a full buffer is `Blocked`,
 //!   and a `Blocked` datagram is never mirrored because it was never queued.
 //! - `drop_oversized` discards queued datagrams after an MTU black hole
-//!   (`datagrams.rs:143-160`, `connection/mod.rs:1773`). The dropped
+//!   (`datagrams.rs:147-160`, `connection/mod.rs:1773`). The dropped
 //!   datagrams read as departed, and so do any behind them up to the dropped
 //!   byte count: a stamp can be early, by at most one FIFO's worth, and only
 //!   on a black hole. A datagram stamped here that did not leave is then
