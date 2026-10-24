@@ -158,6 +158,12 @@ pub struct Scheduler {
     /// (`drain_refinement_pass_major`) is a walk over buckets rather than a
     /// repeated `min()` over the whole queue.
     refinement_order: [VecDeque<Handle>; PASS_SLOTS],
+    /// Items in `work` whose state is `Pending`, in either queue. Maintained
+    /// at every transition into and out of `Pending` so that
+    /// `has_pending_work` is O(1); `pending_items_recomputed` is the scan it
+    /// replaced, kept as the oracle for the test that walks a random
+    /// operation sequence.
+    pending_items: usize,
     /// Tiles with queued refinement work; see `RefinementDeficit`.
     refinement_deficit: RefinementDeficit,
     /// How long an `InFlight` priority item waits for its acknowledgement
@@ -221,6 +227,7 @@ impl Scheduler {
             work: Slab::new(),
             priority_order: VecDeque::new(),
             refinement_order: std::array::from_fn(|_| VecDeque::new()),
+            pending_items: 0,
             refinement_deficit: RefinementDeficit::new(cols, rows),
             retry_after: Duration::from_millis(40),
             item_overhead: 0,
@@ -243,6 +250,7 @@ impl Scheduler {
         self.cols = cols;
         self.rows = rows;
         self.work.clear();
+        self.pending_items = 0;
         self.priority_order.clear();
         for q in self.refinement_order.iter_mut() {
             q.clear();
@@ -257,6 +265,7 @@ impl Scheduler {
     /// work from polluting the new client's first tick.
     pub fn clear(&mut self) {
         self.work.clear();
+        self.pending_items = 0;
         self.priority_order.clear();
         for q in self.refinement_order.iter_mut() {
             q.clear();
@@ -311,15 +320,25 @@ impl Scheduler {
     /// Whether the next tick would have something to send that is not a
     /// retry: a priority item still `Pending`, or anything in the refinement
     /// queue. `queue_len` cannot say, because it counts items in flight and
-    /// waiting for an acknowledgement. Scans the priority queue, so it is for
-    /// the caller that asks once per loop turn, not per tile.
+    /// waiting for an acknowledgement. O(1): `pending_items` is kept at every
+    /// state transition. (A pending item in the refinement queue is counted
+    /// too, which changes nothing: any refinement entry already answers yes.)
     pub fn has_pending_work(&self) -> bool {
-        self.refinement_queue_len() > 0
-            || self.priority_order.iter().any(|&h| {
+        self.refinement_queue_len() > 0 || self.pending_items > 0
+    }
+
+    /// The scan `pending_items` replaced: items in the slab in `Pending`.
+    #[cfg(test)]
+    pub(crate) fn pending_items_recomputed(&self) -> usize {
+        self.priority_order
+            .iter()
+            .chain(self.refinement_order.iter().flatten())
+            .filter(|&&h| {
                 self.work
                     .get(h)
                     .is_some_and(|w| w.state == WorkState::Pending)
             })
+            .count()
     }
 
     /// Count of unique (tile_x, tile_y) coordinates with outstanding
@@ -398,6 +417,7 @@ impl Scheduler {
         let (tx, ty, pass) = (work.tile_x, work.tile_y, work.pass_idx);
         self.supersede_live_handle(tx, ty, pass);
         let h = self.work.insert(work);
+        self.pending_items += 1;
         self.slots.set_handle(tx, ty, pass, Some(h));
         self.priority_order.push_back(h);
     }
@@ -420,6 +440,9 @@ impl Scheduler {
         };
         if let Some(w) = self.work.get_mut(h) {
             if matches!(w.state, WorkState::Pending | WorkState::InFlight) {
+                if w.state == WorkState::Pending {
+                    self.pending_items -= 1;
+                }
                 w.state = WorkState::Superseded;
             }
         }
@@ -448,6 +471,7 @@ impl Scheduler {
         let (tx, ty, pass) = (work.tile_x, work.tile_y, work.pass_idx);
         self.supersede_live_handle(tx, ty, pass);
         let h = self.work.insert(work);
+        self.pending_items += 1;
         self.slots.set_handle(tx, ty, pass, Some(h));
         self.refinement_order[(pass as usize).min(PASS_SLOTS - 1)].push_back(h);
         self.refinement_deficit.push(tx, ty);
@@ -492,6 +516,9 @@ impl Scheduler {
             if let Some(h) = self.slots.handle(tile_x, tile_y, p) {
                 if let Some(w) = self.work.get_mut(h) {
                     if matches!(w.state, WorkState::Pending | WorkState::InFlight) {
+                        if w.state == WorkState::Pending {
+                            self.pending_items -= 1;
+                        }
                         w.state = WorkState::Superseded;
                     }
                 }
@@ -782,6 +809,9 @@ impl Scheduler {
                 palette_bundled,
                 via_ack: false,
             });
+            if entry.state == WorkState::Pending {
+                self.pending_items -= 1;
+            }
             entry.state = WorkState::Superseded;
         }
         (self.slots.bump_generation(tile_x, tile_y), resolved)
@@ -871,6 +901,7 @@ impl Scheduler {
         Self::drain_priority_queue(
             &mut self.work,
             &mut self.priority_order,
+            &mut self.pending_items,
             priority_budget,
             retry_after,
             now,
@@ -879,7 +910,7 @@ impl Scheduler {
             &mut emitted,
             &mut self.last_tick_retries,
         );
-        Self::drain_refinement_pass_major(
+        let left_pending = Self::drain_refinement_pass_major(
             &mut self.work,
             &mut self.refinement_order,
             &mut self.refinement_deficit,
@@ -888,6 +919,7 @@ impl Scheduler {
             self.item_overhead,
             &mut emitted,
         );
+        self.pending_items -= left_pending;
 
         self.delivery_window_emitted = self
             .delivery_window_emitted
@@ -903,6 +935,7 @@ impl Scheduler {
     fn drain_priority_queue(
         work: &mut Slab<TileWork>,
         order: &mut VecDeque<Handle>,
+        pending_items: &mut usize,
         budget: usize,
         retry_after: Duration,
         now: Instant,
@@ -951,6 +984,8 @@ impl Scheduler {
             }
             if w.state == WorkState::InFlight {
                 retries.push(out.len());
+            } else {
+                *pending_items -= 1;
             }
             w.state = WorkState::InFlight;
             w.last_sent_at = Some(now);
@@ -971,7 +1006,9 @@ impl Scheduler {
         now: Instant,
         item_overhead: usize,
         out: &mut Vec<TileWork>,
-    ) {
+    ) -> usize {
+        // Items sent that were `Pending`, for `pending_items`.
+        let mut left_pending = 0usize;
         // Drop terminal-state entries first, freeing their slab slot.
         // Mirrors drain_priority_queue. Without this, plain bump_generation
         // (which only marks Superseded without retain) leaves stale
@@ -1010,11 +1047,14 @@ impl Scheduler {
                 // admits a few hundred bytes at a time) would otherwise never
                 // let this pass go, however many times it was asked.
                 if budget == 0 || (spent > 0 && spent + cost > budget) {
-                    return;
+                    return left_pending;
                 }
                 bucket.pop_front();
                 if let Some(mut w) = work.remove(h) {
                     deficit.pop(w.tile_x, w.tile_y);
+                    if w.state == WorkState::Pending {
+                        left_pending += 1;
+                    }
                     w.last_sent_at = Some(now);
                     w.state = WorkState::InFlight;
                     spent += cost;
@@ -1022,6 +1062,7 @@ impl Scheduler {
                 }
             }
         }
+        left_pending
     }
 
     fn maybe_adjust_refinement_fraction(&mut self) {
@@ -1121,6 +1162,7 @@ impl Scheduler {
                 state: WorkState::Pending,
             };
             let h = self.work.insert(w);
+            self.pending_items += 1;
             self.slots.set_handle(tile_x, tile_y, pass_idx, Some(h));
             self.refinement_order[(pass_idx as usize).min(PASS_SLOTS - 1)].push_back(h);
             self.refinement_deficit.push(tile_x, tile_y);
@@ -1193,6 +1235,7 @@ impl Scheduler {
                 state: WorkState::Pending,
             };
             let h = self.work.insert(w);
+            self.pending_items += 1;
             self.slots.set_handle(tile_x, tile_y, pass_idx, Some(h));
             self.refinement_order[(pass_idx as usize).min(PASS_SLOTS - 1)].push_back(h);
             self.refinement_deficit.push(tile_x, tile_y);
@@ -1590,6 +1633,64 @@ mod tests {
         let out = s.tick_at(100, Instant::now());
         assert_eq!(out.len(), 1, "one item crosses a budget it does not fit");
         assert_eq!(s.refinement_queue_len(), 1);
+    }
+
+    /// `pending_items` agrees with a full scan after every operation of a
+    /// random sequence over enqueue (both queues), tick, ack, supersede,
+    /// bump, clear. Skipping the decrement in any one transition makes this
+    /// fail.
+    #[test]
+    fn the_pending_counter_matches_a_full_scan() {
+        let mut s = Scheduler::new(4, 4);
+        let mut rng = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut fired = [0u32; 8];
+        for step in 0..3_000 {
+            let r = next();
+            let (tx, ty) = ((r >> 8) as u8 % 4, (r >> 16) as u8 % 4);
+            let op = (r % 8) as usize;
+            fired[op] += 1;
+            match op {
+                0 => s.enqueue(TileWork::raw_for_test(tx, ty, 0, vec![0; 10])),
+                1 => {
+                    s.enqueue_refinement(tx, ty, 0, vec![vec![0u8; 10]; 1 + (r >> 24) as usize % 3])
+                }
+                2 => {
+                    s.tick((r >> 24) as usize % 80);
+                }
+                3 => {
+                    let g = s.generation_for(tx, ty);
+                    s.mark_acked(tx, ty, g, (r >> 24) as u8 % 3);
+                }
+                4 => s.supersede_pending_for_tile(tx, ty),
+                5 => {
+                    let _ = s.bump_generation(tx, ty);
+                }
+                6 => {
+                    let _ = s.bump_generation_collecting(tx, ty);
+                }
+                _ => {
+                    if r >> 40 & 0x7 == 0 {
+                        s.clear();
+                    }
+                }
+            }
+            assert_eq!(
+                s.pending_items,
+                s.pending_items_recomputed(),
+                "step {step} op {op}"
+            );
+            assert_eq!(
+                s.has_pending_work(),
+                s.refinement_queue_len() > 0 || s.pending_items_recomputed() > 0
+            );
+        }
+        assert!(fired.iter().take(7).all(|&n| n > 100), "{fired:?}");
     }
 
     #[test]

@@ -124,7 +124,7 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
          quinn_departed_Bps={:.0} lag_us[n={} p50={} p95={} max={}] mirror_len={} \
          mirror_overflowed={} budget_passes[cwnd={} pacer={} floor={} probe={}] gate_stops[depth={} tokens={} rejected={}] \
          admission[pumps={} admitted={} d_target_max_B={} depth_violations={} backlog_turns={} starved_turns={} \
-         charged_B={} soft_charged_B={}] \
+         charged_B={} soft_charged_B={} ungated_at_depth={}] \
          ledger[declared={} flushed={} overflowed={} late_before_flush={} late_after_flush={} \
          late_unreported={} unknown_acks={} tombstone_evictions={}] \
          ecn[ect0={} unmarked={} last_marked={}] rto_fired={} rto_spurious={} rto_useful={}",
@@ -169,6 +169,7 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
         i.admission.starved_turns,
         i.admission.charged_bytes,
         i.admission.soft_charged_bytes,
+        i.admission.ungated_at_depth,
         i.ledger_losses_declared,
         i.ledger_losses_flushed,
         i.ledger_losses_overflowed,
@@ -462,7 +463,6 @@ async fn the_budget_floor_term_is_counted_when_it_binds() {
     );
 }
 
-/// PLACEHOLDER
 /// A send buffer far below what the old path queued: with the depth gate the
 /// FIFO never gets near it, so quinn is never asked to refuse a datagram.
 /// Before admission the same scene made quinn refuse 355 and the send-buffer

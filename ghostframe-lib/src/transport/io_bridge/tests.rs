@@ -3677,6 +3677,34 @@ async fn injected_frame_dimensions_derive_from_the_fixed_grid() {
     );
 }
 
+/// The frame-dimensions datagram is sent while the depth gate is saturated.
+/// It is checked once per frame before the admission pass, so in a
+/// cwnd-limited steady state (FIFO always at `D_target`) a gated send
+/// starved, and the client refused every tile larger than the dimensions it
+/// knew. Putting the old `depth >= d_target` skip back makes this fail.
+#[tokio::test(start_paused = true)]
+async fn frame_dimensions_are_sent_while_the_depth_gate_is_saturated() {
+    let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
+    let server = QuicServer::new().expect("QuicServer::new");
+    let (_tx, rx) = mpsc::channel(8);
+    let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 5, 3);
+    bridge.gate = Some(pacing::GateParams { d_target: 2_500 });
+    bridge.forced_fifo_depth_for_test = Some(2_500); // at the bound: the gate refuses
+    assert_eq!(bridge.live_fifo_depth(), Some(2_500));
+
+    bridge.emit_frame_dimensions(1, 0, 160, 96);
+
+    assert!(
+        !bridge.sent_log_for_test.is_empty(),
+        "the dimensions datagram must go out although the FIFO is at D_target"
+    );
+    assert_eq!(
+        bridge.dimensions_retransmits_left,
+        FRAME_DIMENSIONS_RETRANSMITS - 1,
+        "and the send is spent"
+    );
+}
+
 /// Work that an injected frame enqueued and a budget-limited pass did not
 /// reach must be sent by a later admission pass, not wait for the *next
 /// injected frame* -- which may never arrive once a scene has finished
@@ -6416,4 +6444,53 @@ mod recheck_answers {
             Some(crate::transport::io_bridge::session::CLOSE_CODE_ACCESS_REVOKED)
         );
     }
+}
+
+#[test]
+fn the_token_wake_floor_is_a_millisecond_or_a_datagram_at_the_rate() {
+    use std::time::Duration;
+    // 10 MB/s: a 1.4 kB datagram is 140 us, so the 1 ms floor rules.
+    assert_eq!(
+        pacing::token_wake_floor(1_400, 10_000_000.0),
+        Duration::from_millis(1)
+    );
+    // 100 kB/s: a datagram is 14 ms of tokens, longer than the floor.
+    assert_eq!(
+        pacing::token_wake_floor(1_400, 100_000.0),
+        Duration::from_millis(14)
+    );
+    assert_eq!(
+        pacing::token_wake_floor(1_400, 0.0),
+        Duration::from_millis(1)
+    );
+}
+
+/// An ungated accept (H.264, control) that finds quinn's FIFO already at
+/// `D_target` is counted, and one that finds it below is not; either way it
+/// is charged to the bucket. `depth_violations` stays for the gated classes.
+#[tokio::test(start_paused = true)]
+async fn ungated_accepts_at_or_above_the_depth_target_are_counted() {
+    use super::transport_probe::Enqueued;
+    let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
+    let server = QuicServer::new().expect("QuicServer::new");
+    let (_tx, rx) = mpsc::channel(8);
+    let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
+    bridge.gate = Some(pacing::GateParams { d_target: 2_000 });
+    let h = ConnectionHandle(0);
+    let e = |queued: u64| Enqueued {
+        class: WireClass::H264,
+        gated: false,
+        dg_len: 1_000,
+        framing_len: 2,
+        cum_enqueued: queued,
+        queued,
+    };
+    // The FIFO stood at 500 before this one (1,502 after): below.
+    bridge.note_enqueued(h, e(1_502));
+    assert_eq!(bridge.instr.admission.ungated_at_depth, 0);
+    // It stood at 2,000 before (3,002 after): at the target.
+    bridge.note_enqueued(h, e(3_002));
+    assert_eq!(bridge.instr.admission.ungated_at_depth, 1);
+    assert_eq!(bridge.instr.admission.depth_violations, 0);
+    assert_eq!(bridge.instr.admission.soft_charged_bytes, 2_004);
 }
