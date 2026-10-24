@@ -346,6 +346,7 @@ fn entries_at_gen(
                 *pass_idx,
                 bit_planes.clone(),
                 *present_passes,
+                0,
             )
         })
         .collect()

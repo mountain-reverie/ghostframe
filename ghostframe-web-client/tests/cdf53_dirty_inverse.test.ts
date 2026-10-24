@@ -255,4 +255,30 @@ describe('Cdf53Pipeline dirty-tile inverse', () => {
     // And no per-tile 4-byte writes remain.
     expect(device.queue.writes.slice(before).filter((w) => w.words.length === 1 && w.offsetBytes % 4 === 0 && w.buf.size === MAX_TILES * 4 && w.offsetBytes !== 0)).toHaveLength(0);
   });
+
+  it('a new label under the same 4-bit generation is a new generation', () => {
+    // A tile that spent a run of generations in another codec returns to CDF53
+    // on a number it already used. Coefficients accumulated for the old
+    // content must not survive into the new.
+    const { pipe, device } = setup();
+    const at = (seq: number, passIdx: number) => ({ ...entry(1, 1, 5, passIdx), frameSeq: seq });
+    const tileIdx = 1 * COLS + 1;
+    const coef = () => (pipe as unknown as { coefficientBuffer: Buf }).coefficientBuffer;
+    const clears = () =>
+      device.queue.writes.filter((w) => w.buf === coef() && w.offsetBytes === tileIdx * 6144).length;
+
+    pipe.uploadBatch([at(100, 0), at(100, 1)]);
+    expect(clears()).toBe(1);
+    expect(pipe.debugTile(tileIdx)!.receivedMask).toBe(0b11);
+
+    // More of the same generation (same label): accumulates, no clear.
+    pipe.uploadBatch([at(100, 2)]);
+    expect(clears()).toBe(1);
+    expect(pipe.debugTile(tileIdx)!.receivedMask).toBe(0b111);
+
+    // Same number, newer label: cleared, only the new pass is held.
+    pipe.uploadBatch([at(5000, 0)]);
+    expect(clears()).toBe(2);
+    expect(pipe.debugTile(tileIdx)!.receivedMask).toBe(0b1);
+  });
 });
