@@ -800,8 +800,8 @@ async fn p2a_the_fifo_never_exceeds_its_gate_under_one_percent_loss() {
 async fn p2b_quinn_is_never_left_idle_while_admission_holds_work() {
     use ghostframe_e2e::netsim::{Bottleneck, CapTimeline};
     for (name, cap, loss) in [
-        ("saturated_4mbit", 500_000u64, 0.0),
-        ("saturated_4mbit_loss1%", 500_000, 0.01),
+        ("saturated_2mbit", 250_000u64, 0.0),
+        ("saturated_2mbit_loss1%", 250_000, 0.01),
     ] {
         let mut sc = scene(0xB0_B057, 8);
         sc.net = NetProfile {
