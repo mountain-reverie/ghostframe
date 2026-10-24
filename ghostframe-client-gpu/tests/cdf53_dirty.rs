@@ -267,6 +267,43 @@ fn refinement_in_a_later_batch_uses_the_accumulated_passes() {
     assert_eq!(tile_pixels(&done, 2, 2), expected_rgba(40));
 }
 
+/// The wire generation is 4 bits and wraps through 0 (`bump_generation`), so
+/// 0 is a real generation. The inverse shaders gate on `tileGen != 0` as
+/// "never seen"; a tile at wire generation 0 must still be inverse-transformed.
+#[test]
+fn generation_zero_tile_is_painted() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut rig = Rig::new(&ctx, false);
+    let fb = rig.batch(&ctx, &entries((1, 1), 0, 50, |_| true));
+    assert_ne!(
+        tile_pixels(&fb, 1, 1),
+        [1u8, 2, 3, 0xFF].repeat(1024),
+        "gen 0 tile left stale"
+    );
+    assert_eq!(tile_pixels(&fb, 1, 1), expected_rgba(50));
+}
+
+/// The wrap: a tile at generation 15 is superseded by generation 0.
+#[test]
+fn generation_wrap_15_to_0_is_painted() {
+    for full in [false, true] {
+        let ctx = WgpuContext::new().expect("wgpu context");
+        let mut rig = Rig::new(&ctx, full);
+        let a = rig.batch(&ctx, &entries((2, 0), 15, 51, |_| true));
+        assert_eq!(
+            tile_pixels(&a, 2, 0),
+            expected_rgba(51),
+            "gen 15 (full={full})"
+        );
+        let b = rig.batch(&ctx, &entries((2, 0), 0, 52, |_| true));
+        assert_eq!(
+            tile_pixels(&b, 2, 0),
+            expected_rgba(52),
+            "gen 0 after 15 (full={full})"
+        );
+    }
+}
+
 /// Not a gate: prints inverse cost (encode + submit + device idle) on a 64x64 grid (the context caps textures at 2048; half the tile count of 4K) for
 /// 1 dirty tile, 1/10 of the grid, and the whole grid, against the old
 /// full-grid dispatch. Run: `cargo test -p ghostframe-client-gpu --test
