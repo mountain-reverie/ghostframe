@@ -97,8 +97,8 @@ pub use crate::harness::load_profile::PRODUCTION_CADENCE_US as DEFAULT_CADENCE_U
 /// Spacing between post-injection heartbeat ticks (see `drive_session`'s
 /// doc comment on why heartbeats exist at all). Deliberately much coarser
 /// than `FRAME_SPACING_US`: the sole purpose of a heartbeat is to reach
-/// `IoBridge::apply_injected_frame`'s unconditional `sweep_rto_retransmits`
-/// call often enough that a cached, unacked fragment's RTO deadline (floor
+/// `IoBridge::apply_injected_frame`'s unconditional admission pass
+/// (`pump_admission`, which also fires due retransmissions) often enough that a cached, unacked fragment's RTO deadline (floor
 /// 25ms, see `reliable_emitter::rto::rto_for_attempt`) gets checked well
 /// before `scene.duration` runs out — not to reproduce a particular real
 /// capture framerate. Ticking at `FRAME_SPACING_US` (16ms) would work too,
@@ -126,8 +126,8 @@ pub enum SceneLoad {
     /// anything measuring bandwidth, pacing or probing, where a scene that
     /// goes quiet after a short burst is not modelling production at all.
     ///
-    /// The heartbeat path below exists so `sweep_rto_retransmits` keeps
-    /// being called once a script is exhausted. A profile generates
+    /// The heartbeat path below exists so the admission pass keeps being
+    /// run once a script is exhausted. A profile generates
     /// `duration / cadence_us` frames while injection only begins at
     /// `SessionReady`, so its last frame is scheduled past the scene's own
     /// deadline and `next_frame_idx < frames.len()` holds throughout —
@@ -1512,33 +1512,27 @@ async fn drive_session(
                         // may still have plenty of virtual time left, and a
                         // datagram dropped on its one and only send attempt
                         // needs *something* to keep giving it a chance to
-                        // land. `IoBridge::sweep_rto_retransmits` (the
+                        // land. `IoBridge::pump_admission` (which serves the
                         // server-side RTO wheel that actually resends a
-                        // dropped, unacked tile datagram) is only ever
-                        // called from three places: a real capture frame's
-                        // post-dispatch path, `apply_injected_frame`'s own
-                        // post-drain mirror of that, and the
-                        // `Event::DatagramsUnblocked` handler — see that
-                        // function's doc comment. In production the first
-                        // of those fires unconditionally on a fixed timer
-                        // for as long as a client stays connected (the
-                        // capture loop free-runs regardless of screen
-                        // dirtiness), so the RTO wheel is always getting
-                        // swept somewhere. This harness has no such
+                        // dropped, unacked tile datagram) runs after every
+                        // loop turn, but a turn needs an event to happen at
+                        // all, and nothing wakes the loop for an RTO
+                        // deadline. In production the capture loop
+                        // free-runs for as long as a client stays connected
+                        // (regardless of screen dirtiness), so there is
+                        // always a turn soon. This harness has no such
                         // free-running capture loop: once the frame list
                         // runs out, nothing would otherwise ever call
-                        // `apply_injected_frame` again, and `DatagramsUnblocked`
-                        // does not fire on its own absent a previously
-                        // blocked send. Sending an empty-work `InjectedFrame`
-                        // on the coarser `HEARTBEAT_SPACING_US` cadence (see
-                        // its doc comment for why heartbeats don't reuse
+                        // `apply_injected_frame` again. Sending an
+                        // empty-work `InjectedFrame` on the coarser
+                        // `HEARTBEAT_SPACING_US` cadence (see its doc
+                        // comment for why heartbeats don't reuse
                         // `FRAME_SPACING_US`) has no tile content to
-                        // enqueue, but still reaches
-                        // `apply_injected_frame`'s unconditional
-                        // `sweep_rto_retransmits()` call — this is the
-                        // harness's substitute for "a client stays
-                        // connected and capture keeps ticking", not a new
-                        // behavior IoBridge doesn't already have.
+                        // enqueue, but still reaches `apply_injected_frame`'s
+                        // admission pass -- this is the harness's substitute
+                        // for "a client stays connected and capture keeps
+                        // ticking", not a new behavior IoBridge doesn't
+                        // already have.
                         inject_heartbeat(heartbeat_seq, cadence_us, inject_tx)
                             .await
                             .map_err(|e| {
@@ -1737,10 +1731,9 @@ async fn inject_frame(
         // its own per-tick budget the same way the production capture path
         // does (`IoBridge::base_budget_bytes`), rather than accepting one
         // from the caller. The netsim's token bucket still does the link
-        // capping, and `IoBridge` still clamps to quinn's actual send
-        // capacity (`clamp_to_quinn_capacity`) — this only removes the
-        // harness's own unbounded "drain everything" budget that sat in
-        // front of both.
+        // capping, and `IoBridge` still holds quinn's queue to its depth
+        // gate (`admission`) — this only removes the harness's own
+        // unbounded "drain everything" budget that sat in front of both.
         work,
         cost,
     };
@@ -1761,7 +1754,7 @@ async fn inject_frame(
 
 /// Send an empty-work `InjectedFrame` — no tiles, nothing new to encode —
 /// purely to reach `IoBridge::apply_injected_frame`'s unconditional
-/// post-drain `sweep_rto_retransmits()` call. See the doc comment at the
+/// admission pass (`pump_admission`). See the doc comment at the
 /// `drive_session` call site for why this is needed once `scene.frames` is
 /// exhausted but `scene.duration` still has virtual time left: without
 /// something to keep calling into `IoBridge`, a datagram dropped on its one
