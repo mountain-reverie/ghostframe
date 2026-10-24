@@ -228,6 +228,20 @@ pub(super) struct GateParams {
     pub(super) d_target: usize,
 }
 
+/// The shortest wait the loop is woken for when the bucket is empty:
+/// `max(1 ms, one datagram at the rate)`. A wake for less than a datagram's
+/// worth of tokens finds the pass unable to send, sets the same wake again,
+/// and spins the loop; at 1 ms the loop does at most 1,000 passes a second
+/// however high the rate.
+pub(super) fn token_wake_floor(mtu: usize, rate: f64) -> std::time::Duration {
+    let datagram = if rate > 0.0 {
+        std::time::Duration::try_from_secs_f64(mtu as f64 / rate).unwrap_or_default()
+    } else {
+        std::time::Duration::ZERO
+    };
+    datagram.max(std::time::Duration::from_millis(1))
+}
+
 /// The rate admission runs at and the term that set it.
 struct AdmissionRate {
     bytes_per_sec: f64,
@@ -249,6 +263,10 @@ impl IoBridge {
     /// Bytes quinn's datagram queue holds for the live session, or `None`
     /// with no live session. One subtraction (quinn `datagrams.rs`).
     pub(super) fn live_fifo_depth(&mut self) -> Option<usize> {
+        #[cfg(test)]
+        if let Some(d) = self.forced_fifo_depth_for_test {
+            return Some(d);
+        }
         let capacity = self.server.datagram_send_buffer();
         let handle = self.live_send_handle()?;
         let conn = self.server.connections.get_mut(&handle)?;
@@ -454,7 +472,7 @@ impl IoBridge {
                         .admission
                         .time_until(need, rate.bytes_per_sec)
                         .unwrap_or(std::time::Duration::from_millis(33))
-                        .max(std::time::Duration::from_micros(500));
+                        .max(token_wake_floor(mtu, rate.bytes_per_sec));
                     self.admission_wake = Some(now + wait);
                 }
                 Stop::Empty => {}

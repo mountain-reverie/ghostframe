@@ -110,9 +110,27 @@ pub(crate) fn source_budget(tokens: usize) -> usize {
 pub(crate) struct AdmissionBucket {
     /// May go negative only through [`Self::charge`] (H.264 frames, which
     /// have no queue to hold them back); a debt is repaid before anything
-    /// further is granted.
+    /// further is granted. Never below `-debt_cap`.
     tokens: f64,
     last_refill: Option<Instant>,
+    /// The deepest debt [`Self::charge`] may record, as a positive number of
+    /// bytes: the burst cap of the last refill (`max(2 x MTU, R x 33 ms)`).
+    ///
+    /// Why the burst cap and not `D_target`: the cap is the bank's own size,
+    /// so a debt never exceeds one bank, and a debt of one bank is repaid in
+    /// one `BURST_WINDOW` (33 ms) at `R`, i.e. a burst of ungated sends can
+    /// freeze NACK repair, timer repair and refinement for at most one tick
+    /// after it ends. `D_target` (10 ms) would be tighter but is below one
+    /// frame's worth of debt, which would make every H.264 frame look the
+    /// same as no debt at all. Without any floor an H.264 region above the
+    /// link rate (8 Mbit/s on 4) grew the debt for as long as the video
+    /// played and froze every other class for as long again afterwards.
+    ///
+    /// The floor bounds the aftermath, not the starvation while the video
+    /// plays: a stream above `R` keeps the bucket pinned at the floor and the
+    /// gated classes get nothing. That is a bitrate-control matter (H.264 has
+    /// no BWE-linked rate yet), not something a bucket can fix.
+    debt_cap: f64,
 }
 
 impl AdmissionBucket {
@@ -120,6 +138,7 @@ impl AdmissionBucket {
         Self {
             tokens: 0.0,
             last_refill: None,
+            debt_cap: 0.0,
         }
     }
 
@@ -133,6 +152,7 @@ impl AdmissionBucket {
     /// waited out.
     pub(crate) fn refill(&mut self, now: Instant, rate: f64, mtu: usize) {
         let cap = burst_cap(rate, mtu);
+        self.debt_cap = cap;
         match self.last_refill {
             None => self.tokens = cap,
             Some(prev) => {
@@ -140,6 +160,8 @@ impl AdmissionBucket {
                 self.tokens = (self.tokens + rate.max(0.0) * dt).min(cap);
             }
         }
+        // A falling rate shrinks the debt allowed as well as the bank.
+        self.tokens = self.tokens.max(-cap);
         self.last_refill = Some(now);
     }
 
@@ -169,9 +191,20 @@ impl AdmissionBucket {
     }
 
     /// Bill `bytes` that were sent without asking (an H.264 frame). May drive
-    /// the bucket negative; the debt is repaid by the refill.
+    /// the bucket negative, down to `-debt_cap` and no further; the debt is
+    /// repaid by the refill.
     pub(crate) fn charge(&mut self, bytes: usize) {
-        self.tokens -= bytes as f64;
+        self.tokens = (self.tokens - bytes as f64).max(-self.debt_cap);
+    }
+
+    /// Bytes of debt currently recorded (zero when the bucket is in credit).
+    #[cfg(test)]
+    pub(crate) fn debt(&self) -> usize {
+        if self.tokens < 0.0 {
+            (-self.tokens) as usize
+        } else {
+            0
+        }
     }
 
     /// How long until `bytes` are affordable at `rate`; zero if they already
@@ -289,6 +322,34 @@ mod tests {
         assert!(b.available() > 0);
     }
 
+    /// An ungated stream above the rate cannot dig the debt deeper than one
+    /// bank, so the aftermath is one `BURST_WINDOW` and not as long as the
+    /// stream played. Removing the floor in `charge` makes this fail.
+    #[test]
+    fn debt_is_floored_at_one_bank_so_the_aftermath_is_bounded() {
+        let t0 = Instant::now();
+        let rate = 500_000.0; // 4 Mbit/s
+        let mut b = AdmissionBucket::new();
+        b.refill(t0, rate, MTU);
+        let cap = burst_cap(rate, MTU) as usize;
+        // 8 Mbit/s of H.264 for 10 s, one frame per 33.3 ms.
+        let mut t_us = 0u64;
+        for _ in 0..300 {
+            t_us += 33_333;
+            b.refill(at(t0, t_us), rate, MTU);
+            b.charge(33_333); // 1 MB/s x 33.3 ms
+            assert!(b.debt() <= cap, "debt {} beyond one bank {cap}", b.debt());
+        }
+        assert!(b.debt() > 0, "the stream must have built a debt");
+        // The video stops. Repair is granted again within one burst window.
+        t_us += 2 * BURST_WINDOW.as_micros() as u64;
+        b.refill(at(t0, t_us), rate, MTU);
+        assert!(
+            b.try_take(MTU),
+            "10 s of overspend must not outlast the stream by more than a tick"
+        );
+    }
+
     #[test]
     fn a_grant_is_whole_or_nothing() {
         let mut b = AdmissionBucket::new();
@@ -385,13 +446,21 @@ mod tests {
 
     proptest! {
         /// Over any window, the bytes granted are at most `R x window` plus
-        /// the largest burst the bucket could hold, however often it is asked
-        /// and however `R` moves.
+        /// the largest burst the bucket could hold when the window opened,
+        /// however `R` moves.
+        ///
+        /// Demand saturates the bucket: every step asks, one datagram at a
+        /// time, until the bucket refuses (bounded at 4,000 asks so a bucket
+        /// that never refuses still ends, and fails). Rates stay where the
+        /// bucket binds: at the top (4 MB/s x 40 ms = 160 kB) the demand of
+        /// 4,000 x len is still more than a step can refill. A refill that
+        /// credits 1.2x the rate, or a `try_take` that always grants, fails
+        /// this.
         #[test]
         fn granted_bytes_are_bounded_by_rate_times_window_plus_burst(
             steps in proptest::collection::vec(
-                (0u64..40_000, 0u32..20_000_000, proptest::collection::vec(1usize..=1_200, 0..6)),
-                1..60,
+                (0u64..40_000, 0u32..4_000_000, 200usize..=1_200),
+                2..60,
             ),
         ) {
             let t0 = Instant::now();
@@ -399,20 +468,22 @@ mod tests {
             let mut t_us = 0u64;
             // (time, rate in force over the interval ending here, granted at this time)
             let mut log: Vec<(u64, f64, usize)> = Vec::new();
-            for (dt, rate, takes) in &steps {
+            for &(dt, rate, len) in &steps {
                 t_us += dt;
-                let rate = f64::from(*rate);
+                let rate = f64::from(rate);
                 b.refill(at(t0, t_us), rate, MTU);
                 let mut granted = 0usize;
-                for &len in takes {
-                    if b.try_take(len) {
-                        granted += len;
+                for _ in 0..4_000 {
+                    if !b.try_take(len) {
+                        break;
                     }
+                    granted += len;
                 }
                 log.push((t_us, rate, granted));
             }
-            let cap_max = log.iter().map(|&(_, r, _)| burst_cap(r, MTU)).fold(0.0, f64::max);
             for i in 0..log.len() {
+                // The most the bank could hold when the window opened.
+                let cap_i = burst_cap(log[i].1, MTU);
                 let mut got = 0usize;
                 let mut allowed = 0.0f64;
                 for j in i..log.len() {
@@ -422,8 +493,8 @@ mod tests {
                         allowed += log[j].1 * (log[j].0 - log[j - 1].0) as f64 / 1e6;
                     }
                     prop_assert!(
-                        got as f64 <= allowed + cap_max + 1e-6,
-                        "granted {got} over window {i}..={j} > {allowed} + {cap_max}"
+                        got as f64 <= allowed + cap_i + 1e-6,
+                        "granted {got} over window {i}..={j} > {allowed} + {cap_i}"
                     );
                 }
             }

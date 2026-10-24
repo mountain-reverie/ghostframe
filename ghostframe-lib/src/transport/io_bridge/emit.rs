@@ -169,6 +169,8 @@ impl IoBridge {
         gated: bool,
     ) -> crate::transport::reliable_emitter::traits::SendOutcome {
         use crate::transport::reliable_emitter::traits::SendOutcome;
+        #[cfg(test)]
+        self.sent_log_for_test.push(dg.to_vec());
         #[cfg(any(test, feature = "test-loss-injection"))]
         if let Some(cap) = self.outbound_bandwidth_cap.as_mut() {
             if !cap.try_consume(dg.len()) {
@@ -279,23 +281,22 @@ impl IoBridge {
             self.last_emitted_dimensions = Some((width, height));
         }
         if self.dimensions_retransmits_left > 0 {
-            // Behind the depth gate like every other datagram, so the queue
-            // bound has no exception to carry. A repeat that finds the FIFO
-            // at `D_target` is not spent: the next frame sends it.
-            let over = match (self.gate, self.live_fifo_depth()) {
-                (Some(g), Some(depth)) => depth >= g.d_target,
-                _ => false,
-            };
-            if !over {
-                let dg = crate::transport::protocol::build_frame_dimensions_datagram(
-                    seq,
-                    timestamp_us,
-                    width,
-                    height,
-                );
-                self.send_to_all_sessions(&dg, WireClass::Control);
-                self.dimensions_retransmits_left -= 1;
-            }
+            // Not behind the depth gate, like the eviction notice: ~20 bytes
+            // that the client cannot do without (it refuses tiles larger than
+            // the dimensions it knows). This runs once per frame, before the
+            // admission pass, and in a cwnd-limited steady state the FIFO
+            // stands at `D_target` whenever a frame arrives, so a gated send
+            // would starve for as long as the link stays saturated while
+            // tiles were admitted regardless. It is soft-charged to the
+            // bucket (`note_enqueued`), so the classes that can wait pay.
+            let dg = crate::transport::protocol::build_frame_dimensions_datagram(
+                seq,
+                timestamp_us,
+                width,
+                height,
+            );
+            self.send_to_all_sessions(&dg, WireClass::Control);
+            self.dimensions_retransmits_left -= 1;
         }
     }
 
@@ -613,9 +614,9 @@ impl IoBridge {
     /// returned `TileWork`, and return the per-codec / wire-byte stats
     /// alongside the total bytes drained and the number of TileWork
     /// items emitted. Shared between the per-frame dispatch entry point
-    /// (`dispatch_dirty_tiles_via_scheduler`) and the
-    /// `Event::DatagramsUnblocked` continuation handler — both want the
-    /// same pull-from-scheduler / fragment / record-coverage / send
+    /// (`dispatch_dirty_tiles_via_scheduler`) and the admission pass that
+    /// runs after every `drain_outbound` (`refill_after_drain`) — both want
+    /// the same pull-from-scheduler / fragment / record-coverage / send
     /// loop, the only difference being the budget they pass in.
     ///
     /// `seq` / `timestamp_us` tag the outbound fragments with the
@@ -865,8 +866,8 @@ impl IoBridge {
     /// Enqueuing alone would leave the work sitting in the scheduler
     /// forever: `drain_scheduler_into_quinn` is the only thing that turns
     /// queued `TileWork` into datagrams (see its two production callers,
-    /// `dispatch_dirty_tiles_via_scheduler` and the `DatagramsUnblocked`
-    /// continuation). If there's no connected session yet,
+    /// `dispatch_dirty_tiles_via_scheduler` and the admission pass after
+    /// each drain). If there's no connected session yet,
     /// `compute_max_datagram_size` returns `None` and the drain is
     /// skipped — the work stays queued for the next opportunity.
     ///

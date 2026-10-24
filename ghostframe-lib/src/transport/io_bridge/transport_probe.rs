@@ -186,6 +186,11 @@ impl IoBridge {
             // classes that can wait pay for them.
             self.admission.charge(wire);
             self.instr.admission.soft_charged_bytes += wire as u64;
+            if let Some(g) = self.gate {
+                if queued.saturating_sub(wire as u64) >= g.d_target as u64 {
+                    self.instr.admission.ungated_at_depth += 1;
+                }
+            }
         }
         let i = &mut self.instr;
         i.offered.bill(class, dg_len, framing_len);

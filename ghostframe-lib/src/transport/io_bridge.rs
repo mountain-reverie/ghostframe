@@ -566,6 +566,14 @@ pub struct IoBridge {
     #[cfg(any(test, feature = "test-loss-injection"))]
     pub(crate) drop_plan:
         Option<std::sync::Arc<std::sync::Mutex<crate::transport::drop_plan::DropPlan>>>,
+    /// Unit tests only: every datagram handed to `send_counted`, in order,
+    /// whether or not a session was there to take it.
+    #[cfg(test)]
+    pub(crate) sent_log_for_test: Vec<Vec<u8>>,
+    /// Unit tests only: what `live_fifo_depth` reports, so a test can stand
+    /// the gate saturated without a handshaked connection.
+    #[cfg(test)]
+    pub(crate) forced_fifo_depth_for_test: Option<usize>,
 
     /// Harness only: the tokio-clock instant at which the inbound arm took
     /// each packet off the socket, in order. Paired by position with the
@@ -1303,6 +1311,10 @@ impl IoBridge {
             send_errs_publish: std::sync::Arc::new(std::sync::Mutex::new(0)),
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
+            #[cfg(test)]
+            sent_log_for_test: Vec::new(),
+            #[cfg(test)]
+            forced_fifo_depth_for_test: None,
             connected_session_count: watch::Sender::new(0),
             was_idle: true,
             input_injector: None,
@@ -2498,30 +2510,17 @@ impl IoBridge {
                     // wt+conn borrows). Defer ACK/etc. dispatch to a second pass
                     // because dispatch_ack_datagram takes `&mut self`.
                     let mut to_dispatch: Vec<Vec<u8>> = Vec::new();
-                    let send_capacity = self.server.datagram_send_buffer();
-                    let gate = self.gate;
                     if let Some(wt) = self.wt_sessions.get_mut(&handle) {
                         if let Some(conn) = self.server.connections.get_mut(&handle) {
                             while let Some(payload) = wt.recv_datagram(conn) {
                                 if let Some(response) = handle_datagram_payload(&payload) {
-                                    // Behind the depth gate like every datagram
-                                    // of the live session: with the FIFO at its
-                                    // bound the pong is withheld, and the next
-                                    // ping is answered instead.
+                                    // Not behind the depth gate: a pong is a
+                                    // few bytes, and withholding it while the
+                                    // FIFO stands at its bound (the steady
+                                    // state of a cwnd-limited link) would
+                                    // starve the client's RTT measurement. It
+                                    // is soft-charged below, like eviction.
                                     let live = self.last_hello_from == Some(handle);
-                                    if live
-                                        && gate.is_some_and(|g| {
-                                            send_capacity.saturating_sub(
-                                                conn.datagrams().send_buffer_space(),
-                                            ) >= g.d_target
-                                        })
-                                    {
-                                        tracing::trace!(
-                                            ?handle,
-                                            "ping received, FIFO at its bound; pong withheld"
-                                        );
-                                        continue;
-                                    }
                                     tracing::trace!(?handle, "ping received, sending pong");
                                     match wt.send_datagram(conn, response) {
                                         // Only the live session's sends are billed.

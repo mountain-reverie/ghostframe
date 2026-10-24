@@ -10,7 +10,9 @@
 /// `SendDatagramError::Blocked`, its datagram send buffer being full. That is
 /// normal flow control, not an error: quinn's own high-level API provokes it
 /// deliberately (`Connection::send_datagram_wait` sends, takes `Blocked`,
-/// then waits on the `DatagramsUnblocked` event it produces).
+/// then waits on the `DatagramsUnblocked` event it produces). This server
+/// does not wait on that event: the depth gate keeps the FIFO far below the
+/// buffer and the admission pass refills after every drain.
 ///
 /// It has to be reported because this trait is the single funnel every
 /// datagram passes through -- source, parity and retransmit alike. While

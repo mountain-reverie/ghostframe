@@ -116,12 +116,6 @@ pub struct EmitterStats {
     /// NACKs for a fragment that already had a request waiting for budget.
     /// The client repeats itself every tail sweep; these cost nothing.
     pub nack_deduped: u64,
-    /// Times `tick_budgeted` stopped on its byte budget with retransmission
-    /// work still due. Occasional is healthy -- it is the budget doing its
-    /// job. Growing on every tick means retransmission demand is exceeding
-    /// its share of the link, which is the precondition for the storm this
-    /// budget exists to prevent.
-    pub retransmit_budget_deferrals: u64,
     /// Of `retransmit_attempts_total`, those a NACK asked for (the rest are
     /// RTO fires: `rto_fired`). Measurement only.
     pub retransmit_by_nack: u64,
@@ -448,9 +442,8 @@ impl ReliableTileEmitter {
     /// where the link can never settle). Capping at a small number per
     /// call converts that storm into orderly drip-feed: heap entries
     /// not popped this tick stay due, and the next call pops the next
-    /// batch. Pairs with the `Event::DatagramsUnblocked` continuation
-    /// in `IoBridge::run` which calls this again whenever quinn frees
-    /// up datagram-buffer space.
+    /// batch. The admission pass calls the budgeted halves again after
+    /// every drain, as quinn's FIFO empties.
     pub fn tick(&mut self, now: Instant, max_retransmits: usize) {
         self.tick_budgeted(now, max_retransmits, usize::MAX);
     }
@@ -459,8 +452,8 @@ impl ReliableTileEmitter {
     /// queued for retransmission, so the caller can bill them.
     ///
     /// Retransmission used to be bounded only by `max_retransmits` per call,
-    /// and this is called on every frame *and* on every
-    /// `Event::DatagramsUnblocked` -- so the bound was per event, not per
+    /// and this was called on every frame *and* on every event that freed
+    /// quinn's buffer (since removed) -- so the bound was per event, not per
     /// unit of time, and said nothing about what the link could carry.
     /// Measured on a 2040-tile screen behind 8 Mbit, in the nine seconds
     /// after a full-screen change: 29,889 retransmissions (14,081 RTO,
@@ -494,11 +487,7 @@ impl ReliableTileEmitter {
             max_bytes.saturating_sub(nacks),
             &mut count,
         );
-        let spent = nacks + rto;
-        if spent >= max_bytes && (!self.pending_nacks.is_empty() || self.rto.has_due(now)) {
-            self.stats.retransmit_budget_deferrals += 1;
-        }
-        spent
+        nacks + rto
     }
 
     /// The first half of [`Self::tick_budgeted`]: the retransmissions the
@@ -590,6 +579,15 @@ impl ReliableTileEmitter {
                 // Already ACKed or cancelled — stale heap entry; skip silently.
                 continue;
             };
+            // Lazy deletion. The heap is never edited in place, so a key
+            // submitted again (a scheduler retry rebuilds the same
+            // `EmitKey`: one frame label covers a whole tile generation)
+            // leaves its first entry behind with an earlier deadline than
+            // the cache entry's current one. Fire only for the deadline the
+            // cache entry holds; the entry pushed with it is still queued.
+            if entry.rto_deadline > now {
+                continue;
+            }
             // [RTO-PROBE] temporary instrumentation: how old was this entry
             // when its timer fired, and what deadline was it given?
             if crate::transport::reliable_emitter::rto_probe_enabled() {
@@ -914,8 +912,6 @@ impl ReliableTileEmitter {
         self.queue.pop(next, now)
     }
 
-    /// Record the outcome of sending an emission from [`Self::next_emission`].
-    /// Returns false when the caller must stop draining.
     /// Put an emission the admission gate refused back at the head of the
     /// queue. Unlike a refusal by the transport this is not a failed send:
     /// nothing was attempted, so `send_rejected` does not move.
@@ -923,6 +919,8 @@ impl ReliableTileEmitter {
         self.queue.push_front(emission);
     }
 
+    /// Record the outcome of sending an emission from [`Self::next_emission`].
+    /// Returns false when the caller must stop draining.
     pub(crate) fn settle_emission(&mut self, emission: Emission, outcome: SendOutcome) -> bool {
         match outcome {
             SendOutcome::Sent => {
@@ -2216,16 +2214,39 @@ mod tests {
         let spent = e.tick_budgeted(t1, usize::MAX, 10 * one);
         assert_eq!(e.stats.rto_fired, 10);
         assert_eq!(spent, 10 * one);
-        assert_eq!(
-            e.stats.retransmit_budget_deferrals, 1,
-            "stopping with work still due is worth counting: sustained \
-             growth means retransmission demand exceeds its share of the link"
-        );
 
         // Not lost, only later.
         let spent = e.tick_budgeted(t1, usize::MAX, usize::MAX);
         assert_eq!(e.stats.rto_fired, 100);
         assert_eq!(spent, 90 * one);
+    }
+
+    /// A key submitted again keeps its first heap entry, whose deadline is
+    /// earlier than the cache entry's new one. That entry must not fire the
+    /// retransmission early; the later one does, once. Removing the
+    /// `rto_deadline > now` skip in `tick_rto_budgeted` makes this fail.
+    #[test]
+    fn a_key_rearmed_later_does_not_fire_from_its_earlier_heap_entry() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        let mut sender = CollectSender::default();
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        let rto = rto_for_attempt(e.ack_deadline, 0);
+        // The scheduler re-sends the same pass half an RTO later.
+        let t_re = t0 + rto / 2;
+        e.submit_one(key, fake_source(1, 0, 0), t_re, None, t_re);
+        e.drain(&mut sender, t_re);
+
+        // Past the first deadline, before the second.
+        let t_mid = t0 + rto + Duration::from_millis(1);
+        assert!(t_mid < t_re + rto);
+        e.tick_budgeted(t_mid, usize::MAX, usize::MAX);
+        assert_eq!(e.stats.rto_fired, 0, "the earlier heap entry is stale");
+
+        let t_late = t_re + rto + Duration::from_millis(1);
+        e.tick_budgeted(t_late, usize::MAX, usize::MAX);
+        assert_eq!(e.stats.rto_fired, 1, "the current deadline fires, once");
     }
 
     /// The client saying "this did not arrive" outranks a timer guessing

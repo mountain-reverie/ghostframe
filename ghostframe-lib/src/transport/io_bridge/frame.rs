@@ -2185,7 +2185,6 @@ impl IoBridge {
                 // tiles stranded without their finest bit-planes.
                 nack_resolved_by_content = es.nack_resolved_by_content,
                 nack_deduped = es.nack_deduped,
-                retransmit_budget_deferrals = es.retransmit_budget_deferrals,
                 // Step A's counter: datagrams quinn refused. Never
                 // surfaced before, and it is the difference between
                 // "we never sent it" and "we sent it and it was lost".
@@ -2386,6 +2385,7 @@ impl IoBridge {
                 admit_starved_turns = ins.admission.starved_turns,
                 admit_charged_bytes = ins.admission.charged_bytes,
                 admit_soft_charged_bytes = ins.admission.soft_charged_bytes,
+                admit_ungated_at_depth = ins.admission.ungated_at_depth,
                 ledger_losses_declared = ins.ledger_losses_declared,
                 ledger_losses_flushed = ins.ledger_losses_flushed,
                 ledger_losses_overflowed = ins.ledger_losses_overflowed,

@@ -558,6 +558,12 @@ pub struct AdmissionCounters {
     pub charged_bytes: u64,
     /// Wire bytes charged without being asked (H.264 frames).
     pub soft_charged_bytes: u64,
+    /// Datagrams sent without the gate (H.264 frames, control datagrams)
+    /// that quinn accepted while its FIFO already held `D_target` or more:
+    /// the depth the gate cannot hold because something bypassed it. Nonzero
+    /// is expected while video plays; the bound P2a states is for the gated
+    /// classes.
+    pub ungated_at_depth: u64,
 }
 
 // ---------------------------------------------------------------------------
