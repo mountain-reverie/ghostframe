@@ -53,8 +53,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
   // bits — reproduced as sign-bit drops at HL2 cols 4/5 of ch=0).
   // We still atomicStore tileGen here so the inverse shaders' early-exit
   // gating sees the right value; idempotent across same-gen WGs.
+  // Stored as gen + 1: the wire generation is 4 bits and wraps through 0, and
+  // the inverse shaders read tileGen == 0 as "never integrated".
   if (lid == 0u) {
-    atomicStore(&tileGen[tile_idx], entry.gen);
+    atomicStore(&tileGen[tile_idx], entry.gen + 1u);
   }
   workgroupBarrier();
 
