@@ -675,6 +675,13 @@ pub struct InstrumentSummary {
     /// acknowledgement can no longer be classified.
     pub ledger_tombstone_evictions: u64,
     pub ecn: EcnObservation,
+    /// Tile datagrams emitted at a different generation from their tile's
+    /// previous one. The premise for `rto_fired_superseded`: zero means no
+    /// tile was replaced and a zero there proves nothing.
+    pub generation_replacements: u64,
+    /// RTO fires for a pass whose tile had moved to another generation.
+    /// Expected zero: the client drops such a pass unacknowledged.
+    pub rto_fired_superseded: u64,
 }
 
 impl InstrumentSummary {

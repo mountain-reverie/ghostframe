@@ -262,6 +262,8 @@ impl IoBridge {
                 .saturating_sub(self.pending_losses_retracted)
                 .saturating_sub(i.late_acked_after_flush),
             ecn: i.ecn,
+            generation_replacements: self.reliable_emitter.stats.generation_replacements,
+            rto_fired_superseded: self.reliable_emitter.stats.rto_fired_superseded,
         }
     }
 

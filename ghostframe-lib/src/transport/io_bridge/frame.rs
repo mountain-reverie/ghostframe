@@ -2198,6 +2198,10 @@ impl IoBridge {
                 retx_nack = es.retransmit_by_nack,
                 rto_spurious = es.rto_spurious,
                 rto_useful = es.rto_useful,
+                // Superseded content: tile generations replaced (the premise),
+                // and RTO fires for a pass whose tile had moved on (expect 0).
+                generation_replacements = es.generation_replacements,
+                rto_fired_superseded = es.rto_fired_superseded,
                 // quinn's view of the path and the depth of its datagram
                 // send queue. A queue that only grows while `quinn_cwnd`
                 // stays cut is the standing queue behind the RTO cascade.

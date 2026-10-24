@@ -13,6 +13,19 @@ use bytes::{Bytes, BytesMut};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+/// Generation stamped in the `TileHeader` of a tile datagram's first
+/// fragment, or `None` for anything else (control datagrams, later fragments,
+/// short buffers). Byte 0's top bit marks a tile datagram; the tile header
+/// starts after the 16-byte datagram header and carries
+/// `generation << 4 | pass` in its fourth byte.
+fn tile_datagram_generation(bytes: &[u8]) -> Option<u8> {
+    const GEN_PASS: usize = crate::transport::protocol::DATAGRAM_HEADER_SIZE + 3;
+    if bytes.len() <= GEN_PASS || bytes[0] & 0x80 == 0 || bytes[4..6] != [0, 0] {
+        return None;
+    }
+    Some(bytes[GEN_PASS] >> 4)
+}
+
 pub struct ReliableTileEmitter {
     pub(crate) cache: RetransmitCache,
     pub(crate) alloc: WireSeqAllocator,
@@ -23,6 +36,11 @@ pub struct ReliableTileEmitter {
     /// retransmission's `wire_seq` and how many times it fired. Resolved by
     /// [`Self::note_ack_origin`]. Measurement only.
     rto_origin: HashMap<EmitKey, RtoOrigin>,
+    /// Per tile: the generation of the last first-fragment tile datagram
+    /// emitted for it. Only read when an RTO fires, to tell a fire for the
+    /// tile's current content from one for content it has moved past
+    /// (`rto_fired_superseded`). Measurement only.
+    latest_tile_generation: HashMap<(u8, u8), u8>,
     /// Latest measured ACK-latency p95, fed from `IoBridge` via
     /// `set_ack_deadline` once per BWE-sample drain. `rto_for_attempt`
     /// derives the actual first-attempt RTO deadline from this (doubling,
@@ -130,6 +148,20 @@ pub struct EmitterStats {
     /// Times the RTO bookkeeping hit its cap and was dropped; fires made
     /// before a reset and not yet acknowledged are never attributed.
     pub rto_origin_resets: u64,
+    /// First-fragment tile datagrams emitted at a different generation from
+    /// the tile's previous one: tile content replaced while the emitter was
+    /// watching. The premise of `rto_fired_superseded`, and deliberately
+    /// independent of `cancel_for_tile` (a count of cancellations would read
+    /// zero exactly when the cancel is missing, hiding that bug behind a failed
+    /// premise). Zero means no tile changed and a zero there proves nothing.
+    /// Measurement only.
+    pub generation_replacements: u64,
+    /// RTO fires for a pass whose tile has since been emitted at a different
+    /// generation: the timer re-sent content the client will discard
+    /// unacknowledged, so the fire can never be settled. Zero by construction
+    /// while every supersession cancels the cache; non-zero means a path
+    /// replaces tile content without cancelling. Measurement only.
+    pub rto_fired_superseded: u64,
 }
 
 /// What is known about a pass that RTO'd: the first retransmission's
@@ -164,6 +196,7 @@ impl ReliableTileEmitter {
             group: GroupBuilder::new(FEC_GROUP_SIZE_K),
             rto: RtoTimerWheel::new(),
             rto_origin: HashMap::new(),
+            latest_tile_generation: HashMap::new(),
             ack_deadline: None,
             time_base: now,
             transmissions: Vec::new(),
@@ -264,6 +297,15 @@ impl ReliableTileEmitter {
             let emit_us = self.emit_us64(now);
             stamped_emit_us = emit_us;
             bytes[12..16].copy_from_slice(&(emit_us as u32).to_be_bytes());
+        }
+        if let Some(g) = tile_datagram_generation(&bytes) {
+            if self
+                .latest_tile_generation
+                .insert((key.tile_x, key.tile_y), g)
+                .is_some_and(|prev| prev != g)
+            {
+                self.stats.generation_replacements += 1;
+            }
         }
         // One allocation from here on: the cache, the FEC group and the
         // emission queue share it by reference count.
@@ -675,6 +717,15 @@ impl ReliableTileEmitter {
                 stamped = self.emit_us64(now);
                 bytes[12..16].copy_from_slice(&(stamped as u32).to_be_bytes());
             }
+            if let Some(g) = tile_datagram_generation(&bytes) {
+                if self
+                    .latest_tile_generation
+                    .get(&(key.tile_x, key.tile_y))
+                    .is_some_and(|&latest| latest != g)
+                {
+                    self.stats.rto_fired_superseded += 1;
+                }
+            }
             let bytes = Bytes::from(bytes);
             self.transmissions.push(EmittedDatagram {
                 wire_seq: ws,
@@ -808,6 +859,7 @@ impl ReliableTileEmitter {
     pub fn clear_cache(&mut self) {
         self.cache.clear();
         self.rto_origin.clear();
+        self.latest_tile_generation.clear();
         // RTO heap entries will validate against the empty cache on pop
         // and silently skip; no need to flush the heap.
     }
@@ -1315,6 +1367,70 @@ mod tests {
         assert!(entry.last_sent_at > entry_first_sent);
         assert_eq!(e.stats.rto_fired, 1);
         assert_eq!(e.stats.retransmit_attempts_total, 1);
+    }
+
+    /// `fake_source` with a generation stamped into the tile header.
+    fn fake_source_gen(seq: u32, generation: u8) -> Bytes {
+        let mut v = fake_source(seq, 0, 0).to_vec();
+        v[19] = generation << 4;
+        Bytes::from(v)
+    }
+
+    #[test]
+    fn an_rto_for_a_generation_the_tile_has_left_is_counted_apart() {
+        let mut e = ReliableTileEmitter::new(Instant::now());
+        let mut sender = CollectSender::default();
+        let t0 = Instant::now();
+        e.submit_one(
+            EmitKey::new(1, 0, 0, 0),
+            fake_source_gen(1, 3),
+            t0,
+            None,
+            t0,
+        );
+        // Same tile, newer generation, and the old pass is NOT cancelled: the
+        // situation `cancel_for_tile` exists to prevent.
+        e.submit_one(
+            EmitKey::new(2, 0, 0, 0),
+            fake_source_gen(2, 4),
+            t0,
+            None,
+            t0,
+        );
+        assert_eq!(e.stats.generation_replacements, 1, "premise: tile moved on");
+        e.drain(&mut sender, t0);
+        e.tick(t0 + Duration::from_millis(1_100), usize::MAX);
+        assert_eq!(e.stats.rto_fired, 2, "premise: both timers fired");
+        assert_eq!(
+            e.stats.rto_fired_superseded, 1,
+            "only the pass of the generation the tile left is superseded"
+        );
+    }
+
+    #[test]
+    fn cancelling_a_tile_stops_its_old_generation_from_firing() {
+        let mut e = ReliableTileEmitter::new(Instant::now());
+        let mut sender = CollectSender::default();
+        let t0 = Instant::now();
+        e.submit_one(
+            EmitKey::new(1, 0, 0, 0),
+            fake_source_gen(1, 3),
+            t0,
+            None,
+            t0,
+        );
+        e.cancel_for_tile(0, 0);
+        e.submit_one(
+            EmitKey::new(2, 0, 0, 0),
+            fake_source_gen(2, 4),
+            t0,
+            None,
+            t0,
+        );
+        e.drain(&mut sender, t0);
+        e.tick(t0 + Duration::from_millis(1_100), usize::MAX);
+        assert_eq!(e.stats.rto_fired, 1, "premise: the current pass fired");
+        assert_eq!(e.stats.rto_fired_superseded, 0);
     }
 
     /// Fire the RTO once for a single pass sent as wire_seq 0 (the retransmit
