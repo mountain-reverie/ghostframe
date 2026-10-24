@@ -33,6 +33,10 @@ const GENERATION_MASK: u8 = 0x0F;
 #[derive(Debug, Clone)]
 pub struct TileSlot {
     pub current_gen: u8,
+    /// The frame identity every datagram of this generation is stamped with:
+    /// that of the first one sent. `None` until then, and again after the
+    /// generation is superseded. See [`SlotMap::label_or_assign`].
+    pub label: Option<u32>,
     pub acked_mask: u16,
     pub passes: [Option<Handle>; PASS_SLOTS],
 }
@@ -41,6 +45,7 @@ impl Default for TileSlot {
     fn default() -> Self {
         Self {
             current_gen: 0,
+            label: None,
             acked_mask: 0,
             passes: [None; PASS_SLOTS],
         }
@@ -95,10 +100,43 @@ impl SlotMap {
         match self.slot_mut(tile_x, tile_y) {
             Some(s) => {
                 s.current_gen = (s.current_gen.wrapping_add(1)) & GENERATION_MASK;
+                s.label = None;
                 s.acked_mask = 0;
                 s.current_gen
             }
             None => 0,
+        }
+    }
+
+    /// The frame identity the tile's current generation is stamped with,
+    /// fixed by whichever of its datagrams is sent first (`seq` is that
+    /// moment's frame). Every later datagram of the generation -- the rest of
+    /// a CDF 5/3 pass set, a scheduler retry -- reuses it.
+    ///
+    /// A tile's passes are not sent in one go: admission spreads them over as
+    /// many turns as the rate needs, and a NACK or timer repair re-sends a
+    /// cached datagram with the identity it first carried. Stamped with
+    /// whichever frame happened to be draining, a repair of an early pass
+    /// arrives labelled older than the passes sent after it, and a receiver
+    /// that drops what is older than the newest it has seen for the tile (the
+    /// browserless framebuffer; the native renderer's paint ledger for
+    /// stateless draws) discards the more complete image. One identity per
+    /// generation is also what the client's ledger assumes: "refinement
+    /// passes of one tile re-use a single `frame_seq`".
+    ///
+    /// Out of range: `seq` itself.
+    pub fn label_or_assign(&mut self, tile_x: u8, tile_y: u8, seq: u32) -> u32 {
+        match self.slot_mut(tile_x, tile_y) {
+            Some(s) => *s.label.get_or_insert(seq),
+            None => seq,
+        }
+    }
+
+    /// Forget the tile's label, so the next datagram sent for it takes a new
+    /// one. For new content that does not advance the generation.
+    pub fn clear_label(&mut self, tile_x: u8, tile_y: u8) {
+        if let Some(s) = self.slot_mut(tile_x, tile_y) {
+            s.label = None;
         }
     }
 
@@ -187,6 +225,27 @@ mod tests {
         assert_eq!(map.index(3, 2), Some(11));
         assert_eq!(map.index(4, 0), None, "x out of range");
         assert_eq!(map.index(0, 3), None, "y out of range");
+    }
+
+    #[test]
+    fn a_generation_keeps_the_label_of_its_first_datagram() {
+        let mut map = SlotMap::new(2, 2);
+        assert_eq!(map.label_or_assign(1, 0, 7), 7);
+        assert_eq!(
+            map.label_or_assign(1, 0, 9),
+            7,
+            "later frames do not relabel it"
+        );
+        assert_eq!(map.label_or_assign(0, 0, 9), 9, "tiles are independent");
+        map.bump_generation(1, 0);
+        assert_eq!(map.label_or_assign(1, 0, 12), 12, "new content, new label");
+        map.clear_label(1, 0);
+        assert_eq!(map.label_or_assign(1, 0, 15), 15);
+        assert_eq!(
+            map.label_or_assign(5, 5, 3),
+            3,
+            "out of range is the seq itself"
+        );
     }
 
     #[test]
