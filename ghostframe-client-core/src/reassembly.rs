@@ -233,6 +233,19 @@ impl ClientCore {
             }
         }
 
+        // The newest label the wire has delivered. Only datagrams QUIC
+        // authenticated count: a rebuilt one is derived from them and is what
+        // this is the yardstick for. See `label_runs_ahead`.
+        if !is_sentinel && provenance == Provenance::Received {
+            let advance = match self.newest_received_label {
+                None => true,
+                Some(newest) => crate::cdf53_coverage::frame_seq_is_newer(frame_seq, newest),
+            };
+            if advance {
+                self.newest_received_label = Some(frame_seq);
+            }
+        }
+
         // Advance latest_frame_seq (main.ts:1156-1158).
         if frame_seq > self.latest_frame_seq {
             self.latest_frame_seq = frame_seq;
@@ -419,7 +432,17 @@ impl ClientCore {
                 // because coverage bookkeeping and rendering are separate
                 // consumers; fixing the bookkeeping alone stopped the
                 // spurious NACKs and left the pixels wrong.
-                let prev = self.cdf53_coverage.get(&(tx, ty)).copied();
+                //
+                // A label implausibly far ahead of everything received off
+                // the wire is dropped before it can be believed, and a held
+                // entry that has aged out is treated as absent. See
+                // `label_runs_ahead` and `label_expired`.
+                if crate::cdf53_coverage::label_runs_ahead(frame_seq, self.newest_received_label) {
+                    return;
+                }
+                let prev = self.cdf53_coverage.get(&(tx, ty)).copied().filter(|e| {
+                    !crate::cdf53_coverage::label_expired(e.frame_seq, self.newest_received_label)
+                });
                 if let Some(entry) = prev {
                     if crate::cdf53_coverage::arrival_is_stale(
                         entry.generation,
@@ -443,7 +466,14 @@ impl ClientCore {
                     ok,
                     present_passes,
                 );
-                self.cdf53_coverage.insert((tx, ty), outcome.entry);
+                if outcome.committed {
+                    self.cdf53_coverage.insert((tx, ty), outcome.entry);
+                }
+                if outcome.new_generation {
+                    // The integrator keys on the 4-bit generation alone, so
+                    // it cannot see a new generation that reuses the number.
+                    self.cdf53_tile_state.forget_tile(tx, ty);
+                }
                 for p in outcome.nack_passes {
                     // Coverage NACKs are routed through the debounced
                     // pending-NACK queue (main.ts `queuePassNack`,

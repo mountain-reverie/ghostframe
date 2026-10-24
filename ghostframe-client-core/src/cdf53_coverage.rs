@@ -37,6 +37,19 @@ pub struct CoverageEntry {
 pub struct ArrivalOutcome {
     pub entry: CoverageEntry,
     pub nack_passes: Vec<u8>,
+    /// The arrival began a new generation of the tile, so anything held for
+    /// the old one (the coverage entry, and the CPU integrator's planes,
+    /// which key on the 4-bit generation alone) belongs to different
+    /// content. False for a stale arrival and for one that merely adds to
+    /// the generation already held.
+    pub new_generation: bool,
+    /// Whether `entry` should replace the tile's stored coverage. False for
+    /// a stale arrival, and for a would-be new generation whose payload
+    /// failed prevalidation: that one has not shown it is real, so it must
+    /// not displace the generation the tile already holds. `entry` is then
+    /// the held entry (or, with none held, the entry the arrival would have
+    /// created, for its NACK bookkeeping), and is not to be stored.
+    pub committed: bool,
 }
 
 /// Is `candidate` a newer 4-bit generation than `current`?
@@ -69,8 +82,78 @@ pub fn frame_seq_is_newer(a: u32, b: u32) -> bool {
     forward != 0 && forward < (1 << 30)
 }
 
-/// Should an arrival of generation `generation`, labelled `frame_seq`, be
-/// discarded because the tile already holds a newer generation?
+/// How an arrival relates to the generation a tile currently holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrivalOrder {
+    /// Another datagram of the generation held: accumulate.
+    Current,
+    /// Content newer than what is held: start over from this arrival.
+    NewGeneration,
+    /// Content the tile has already superseded: ignore.
+    Stale,
+}
+
+/// How many frames ahead of the newest label received off the wire a label
+/// may be and still be believed.
+///
+/// A datagram rebuilt from parity is the one arrival whose label is not
+/// vouched for by QUIC: if the group was mis-assembled, the bytes (label
+/// included) are arbitrary. A real rebuilt datagram was sent no later than
+/// the group-mates that let it be rebuilt, and a label is the `seq` of a
+/// frame at or before the datagram's own, so it can be ahead of the newest
+/// received label by at most a parity group's worth of frames. 2^12 frames
+/// (about 68 s at 60 fps) is hundreds of times that, yet 2^18 times smaller
+/// than the 2^30 serial half-range a poisoned label needs to be accepted as
+/// "newer". See [`label_runs_ahead`].
+pub const LABEL_WINDOW: u32 = 1 << 12;
+
+/// A held label this far behind the newest label received is treated as
+/// expired. Serial comparison inverts at 2^30 frames (about 207 days at
+/// 60 fps); a tile unchanged for that long would otherwise reject its next
+/// generation. Expiring at 2^29 leaves a full 2^29 of margin before the
+/// inversion (provided some datagram is received in the interval, which a
+/// live session does), and no live session's current content is that old.
+pub const LABEL_EXPIRY: u32 = 1 << 29;
+
+fn forward(a: u32, b: u32) -> u32 {
+    (a & FRAME_SEQ_MASK).wrapping_sub(b & FRAME_SEQ_MASK) & FRAME_SEQ_MASK
+}
+
+/// Is `label` implausibly far ahead of `newest_received`, the newest label
+/// seen on a datagram that came off the wire?
+///
+/// With nothing received yet (`None`) there is no evidence to judge by, and
+/// the label is believed: the first tile datagram of a session has to be
+/// accepted, and a parity rebuild cannot precede every received datagram
+/// because it is built from them.
+pub fn label_runs_ahead(label: u32, newest_received: Option<u32>) -> bool {
+    match newest_received {
+        None => false,
+        Some(newest) => {
+            let ahead = forward(label, newest);
+            ahead > LABEL_WINDOW && ahead < (1 << 30)
+        }
+    }
+}
+
+/// Has a held label aged out relative to the newest label received? See
+/// [`LABEL_EXPIRY`].
+pub fn label_expired(held_label: u32, newest_received: Option<u32>) -> bool {
+    match newest_received {
+        None => false,
+        Some(newest) => {
+            // Modulo 2^31, "behind by 2^30 or more" is what a serial
+            // comparison reads as *ahead*; that is exactly the inversion to
+            // catch, so it counts. Only a label ahead of the newest by up to
+            // `LABEL_WINDOW` (a rebuilt datagram, legitimately) does not.
+            let behind = forward(newest, held_label);
+            behind > LABEL_EXPIRY && behind < (1 << 31) - LABEL_WINDOW
+        }
+    }
+}
+
+/// Order an arrival of generation `generation`, labelled `frame_seq`, against
+/// the generation the tile holds.
 ///
 /// The server stamps every datagram of one tile generation -- first send, NACK
 /// and timer repairs, scheduler retries, refinement passes sent many frames
@@ -78,40 +161,64 @@ pub fn frame_seq_is_newer(a: u32, b: u32) -> bool {
 /// parity rebuilds restore the original bytes, label included. So the label
 /// is a per-generation identity that also grows with every generation, and
 /// unlike the 4-bit generation it does not wrap within any realistic session.
+/// Two datagrams with different labels are therefore different content, even
+/// when their 4-bit generations are equal.
 ///
-/// - Same generation: never stale. Retransmissions of the current generation
-///   (any label) must be accepted; a pass 16 generations old that aliases the
-///   current number is not distinguishable here and is treated as the current
-///   generation, as it always was. Closing that needs more generation bits.
-/// - Different generation, different label: the label decides. A strictly
-///   older label is a superseded generation, however its 4 bits compare.
-/// - Different generation, same label: the server's drain can label two
+/// - Different label: the label decides. Newer is a new generation, older is
+///   superseded. This includes an *equal* 4-bit generation: a tile that
+///   spends 16 generations in PalRle/Solid (which do not touch the CDF 5/3
+///   entry) returns on an aliased number, a scheduler resize resets
+///   generations to 0 while the client keeps its state, and the fallback
+///   path bumps twice per change. Merging those into the held generation
+///   painted old coefficients into new content and hid the new generation's
+///   gaps from NACK.
+/// - Same label, same generation: more of the generation held.
+/// - Same label, different generation: the server's drain can label two
 ///   generations of a tile with one frame when both are sent within it;
 ///   they are at most a handful of generations apart, which is what the
 ///   4-bit comparison can order.
+pub fn classify_arrival(
+    held_generation: u8,
+    held_frame_seq: u32,
+    generation: u8,
+    frame_seq: u32,
+) -> ArrivalOrder {
+    let (new, old) = (frame_seq & FRAME_SEQ_MASK, held_frame_seq & FRAME_SEQ_MASK);
+    if new != old {
+        return if frame_seq_is_newer(new, old) {
+            ArrivalOrder::NewGeneration
+        } else {
+            ArrivalOrder::Stale
+        };
+    }
+    if generation == held_generation {
+        ArrivalOrder::Current
+    } else if generation_is_newer(generation, held_generation) {
+        ArrivalOrder::NewGeneration
+    } else {
+        ArrivalOrder::Stale
+    }
+}
+
+/// Should this arrival be discarded because the tile already holds newer
+/// content? See [`classify_arrival`].
 pub fn arrival_is_stale(
     held_generation: u8,
     held_frame_seq: u32,
     generation: u8,
     frame_seq: u32,
 ) -> bool {
-    if generation == held_generation {
-        return false;
-    }
-    let (new, old) = (frame_seq & FRAME_SEQ_MASK, held_frame_seq & FRAME_SEQ_MASK);
-    if new != old {
-        return !frame_seq_is_newer(new, old);
-    }
-    !generation_is_newer(generation, held_generation)
+    classify_arrival(held_generation, held_frame_seq, generation, frame_seq) == ArrivalOrder::Stale
 }
 
 /// Apply one CDF53 pass arrival to the coverage entry.
 ///
-/// - If `prev` is `None`, or its generation is *older* than `generation`, a
-///   fresh entry is created with `pass_mask = 0`, `nacked_mask = 0`.
-/// - If `prev`'s generation is *newer*, the arrival is stale and is ignored
-///   entirely: the entry is returned untouched and no NACK is raised. See
-///   [`arrival_is_stale`].
+/// - If `prev` is `None`, or the arrival is a newer generation by
+///   [`classify_arrival`] (a newer label, including one with the same 4-bit
+///   generation), a fresh entry is created with `pass_mask = 0`,
+///   `nacked_mask = 0`.
+/// - If the arrival is stale, it is ignored entirely: the entry is returned
+///   untouched and no NACK is raised.
 /// - On prevalidation FAILURE: `pass_mask` stays unset for that bit. The
 ///   failed pass is NACKed once, dedup'd via `nacked_mask`.
 /// - On prevalidation SUCCESS: `pass_mask` gets the bit set. If the
@@ -144,40 +251,32 @@ pub fn apply_cdf53_arrival(
     // and generation 1's pass 0 was lost from the mask for good. The tile
     // could never reach a complete pass set and never got its base layer, so
     // it rendered wrong no matter how long it waited.
-    if let Some(entry) = prev {
-        if arrival_is_stale(entry.generation, entry.frame_seq, generation, frame_seq) {
-            return ArrivalOutcome {
-                entry,
-                nack_passes: Vec::new(),
-            };
-        }
+    let order = match prev {
+        None => ArrivalOrder::NewGeneration,
+        Some(entry) => classify_arrival(entry.generation, entry.frame_seq, generation, frame_seq),
+    };
+    if order == ArrivalOrder::Stale {
+        return ArrivalOutcome {
+            entry: prev.expect("only a held entry can make an arrival stale"),
+            nack_passes: Vec::new(),
+            new_generation: false,
+            committed: false,
+        };
     }
 
-    let mut e: CoverageEntry;
-    let is_new_generation: bool;
-    match prev {
-        Some(entry) if entry.generation == generation => {
-            e = entry;
-            // The entry carries its generation's label, which a late
-            // arrival of the same generation must not move backwards.
-            if frame_seq_is_newer(frame_seq & FRAME_SEQ_MASK, e.frame_seq & FRAME_SEQ_MASK) {
-                e.frame_seq = frame_seq;
-            }
-            is_new_generation = false;
-        }
-        _ => {
-            e = CoverageEntry {
-                generation,
-                frame_seq,
-                pass_mask: 0,
-                nacked_mask: 0,
-                present_passes: None,
-                last_change_us: now_us,
-                sweep_attempts: 0,
-            };
-            is_new_generation = true;
-        }
-    }
+    let is_new_generation = order == ArrivalOrder::NewGeneration;
+    let mut e: CoverageEntry = match prev {
+        Some(entry) if !is_new_generation => entry,
+        _ => CoverageEntry {
+            generation,
+            frame_seq,
+            pass_mask: 0,
+            nacked_mask: 0,
+            present_passes: None,
+            last_change_us: now_us,
+            sweep_attempts: 0,
+        },
+    };
 
     // Pass 0's bitmap, once known, is stuck to the entry regardless of
     // whether this particular arrival is the one that set it (passes 1..13
@@ -194,9 +293,17 @@ pub fn apply_cdf53_arrival(
             nack_passes.push(pass_idx);
             e.nacked_mask |= pass_bit;
         }
+        // A new generation is only believed once a payload of it has been
+        // shown to be real. One that fails prevalidation (a datagram rebuilt
+        // from the wrong parity group, a server bug) must not displace the
+        // generation held, least of all by moving its label: a label far
+        // ahead would make every later, genuine generation read as stale.
+        let committed = !is_new_generation;
         return ArrivalOutcome {
-            entry: e,
+            entry: if committed { e } else { prev.unwrap_or(e) },
             nack_passes,
+            new_generation: false,
+            committed,
         };
     }
 
@@ -237,6 +344,8 @@ pub fn apply_cdf53_arrival(
     ArrivalOutcome {
         entry: e,
         nack_passes,
+        new_generation: is_new_generation,
+        committed: true,
     }
 }
 

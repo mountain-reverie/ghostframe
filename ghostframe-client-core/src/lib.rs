@@ -163,6 +163,10 @@ pub struct ClientCore {
     pub(crate) palettes: Box<[[[u8; 4]; 16]; 256]>,
     pub(crate) cdf53_coverage: HashMap<(u8, u8), CoverageEntry>,
     pub(crate) cdf53_tile_state: Cdf53TileState,
+    /// Newest `frame_seq` label on a tile datagram that came off the wire
+    /// (not one rebuilt from parity). The yardstick for judging a label
+    /// plausible; see `cdf53_coverage::label_runs_ahead`.
+    pub(crate) newest_received_label: Option<u32>,
     pub(crate) latest_frame_seq: u32,
     /// H.264 frame-level reassembly state (keyed by `frame_seq`).
     pub(crate) frame_assemblies: HashMap<u32, FrameAssembly>,
@@ -208,6 +212,7 @@ impl ClientCore {
             palettes: Box::new([[[0u8; 4]; 16]; 256]),
             cdf53_coverage: HashMap::new(),
             cdf53_tile_state: Cdf53TileState::new(),
+            newest_received_label: None,
             latest_frame_seq: 0,
             frame_assemblies: HashMap::new(),
             latest_full_frame_seq: 0,
