@@ -377,6 +377,7 @@ impl IoBridge {
             verdict_content_gone: self.reliable_emitter.stats.verdict_content_gone,
             verdict_newer_in_flight: self.reliable_emitter.stats.verdict_newer_in_flight,
             verdict_already_queued: self.reliable_emitter.stats.verdict_already_queued,
+            verdict_deferred_to_pto: self.reliable_emitter.stats.verdict_deferred_to_pto,
             spurious_loss: self.reliable_emitter.stats.spurious_loss,
             spurious_pto: self.reliable_emitter.stats.spurious_pto,
             ledger_unknown_acks: self.transmission_ledger.stats().unknown_acks,
