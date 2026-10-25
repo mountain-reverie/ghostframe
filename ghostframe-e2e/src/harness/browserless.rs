@@ -537,6 +537,11 @@ pub struct BrowserlessResult {
     /// `(datagram frames quinn received, frames read by the application)` on
     /// the client; the difference is receive-buffer drops.
     pub client_rx_datagrams: Option<(u64, u64)>,
+    /// The client's per-tile CDF 5/3 coverage when the scene ended: how many
+    /// tiles are still owed passes (`partial`) and how many have stopped
+    /// asking (`gave_up`). Tiles stuck at a partial pass set show here and
+    /// nowhere else.
+    pub client_cdf53: ghostframe_client_core::cdf53_coverage::Cdf53CoverageSummary,
 }
 
 impl BrowserlessResult {
@@ -1134,6 +1139,7 @@ async fn run_inner(
         transport,
         client_wire_loss: client_probe.wire_loss,
         client_rx_datagrams: client_probe.rx_datagrams,
+        client_cdf53: client_probe.cdf53,
         nack_hit: emitter_stats.nack_hit,
         nack_miss: emitter_stats.nack_miss,
         rto_fired: emitter_stats.rto_fired,
@@ -1701,6 +1707,7 @@ async fn drive_session(
     let client_probe = ClientProbe {
         wire_loss: client.wire_loss_stats(),
         rx_datagrams: client.datagram_rx_counts(),
+        cdf53: client.cdf53_coverage_summary(),
     };
     Ok((
         events,
@@ -1715,13 +1722,15 @@ async fn drive_session(
 
 /// What the client measured about its own receive path, read when the scene
 /// ends. Measurement only.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ClientProbe {
     /// Pre-FEC loss, loss-run histogram and FEC recoveries from `wire_seq` gaps.
     pub wire_loss: ghostframe_client_core::WireLossStats,
     /// `(datagram frames quinn received, frames read by the application)`.
     /// The difference is what quinn's receive buffer dropped.
     pub rx_datagrams: Option<(u64, u64)>,
+    /// Per-tile CDF 5/3 coverage at the end of the scene.
+    pub cdf53: ghostframe_client_core::cdf53_coverage::Cdf53CoverageSummary,
 }
 
 /// Encode and inject one `FrameScript`'s tiles as an `InjectedFrame`.
