@@ -157,7 +157,8 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
          loss[pkt={} time={} pto={} k_pkt={} k_raises={} spurious_ledger={} loss_retx={} probe_retx={} pto_fires={} \
          verdict_no_retx[gone={} newer={} queued={}] spurious_loss={} spurious_pto={}] \
          ecn[ect0={} unmarked={} last_marked={}] rto_fired={} rto_spurious={} rto_useful={} \
-         generation_replacements={} rto_fired_superseded={}",
+         generation_replacements={} rto_fired_superseded={} \
+         nack_miss[pending_in_scheduler={} not_owed={}]",
         i.window_us / 1000,
         i.fifo_samples,
         i.fifo_depth_max,
@@ -233,6 +234,8 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
         r.rto_useful,
         i.generation_replacements,
         i.rto_fired_superseded,
+        i.nack_miss_pending,
+        i.nack_miss_not_owed,
     );
 }
 
