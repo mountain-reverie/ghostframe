@@ -657,7 +657,9 @@ impl IoBridge {
     /// deadline (the probe timeout from the same RTT estimator), so the two
     /// retry mechanisms race the same clock.
     ///
-    /// Not a function of QUIC RTT. See `Scheduler::set_retry_after`.
+    /// Not a function of QUIC RTT: the estimator measures application
+    /// acknowledgements and is not seeded from the transport. See
+    /// `Scheduler::set_retry_after`.
     pub(super) fn priority_retry_after(&self) -> std::time::Duration {
         self.reliable_emitter.pto()
     }

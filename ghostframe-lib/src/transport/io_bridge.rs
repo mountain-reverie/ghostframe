@@ -2211,14 +2211,6 @@ impl IoBridge {
 
     /// Housekeeping run once per `run` loop turn, after the `select!`.
     async fn post_turn(&mut self) -> io::Result<()> {
-        // Until the first acknowledgement is measured, the retransmission
-        // deadline stands on quinn's own RTT (the handshake's), not on a
-        // cold-start guess. Skipped once a sample exists.
-        if !self.reliable_emitter.rtt.has_sample() {
-            if let Some(rtt) = self.live_path_rtt() {
-                self.reliable_emitter.rtt.seed(rtt);
-            }
-        }
         // Arm/enforce close deadlines first, so a CONNECTION_CLOSE queued
         // here leaves in the drain_outbound just below.
         self.sweep_rechecks(now_std());

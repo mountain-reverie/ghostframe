@@ -23,9 +23,16 @@
 //!
 //! `PTO = srtt + max(4 x rttvar, 1 ms) + max_ack_delay`, doubled for every
 //! consecutive PTO and reset by any acknowledgement. Before the first sample
-//! it is computed from a seed (quinn's handshake RTT, available by HELLO
-//! time) exactly as RFC 9002 §6.2.2 does from `kInitialRtt`: `srtt = seed`,
-//! `rttvar = seed / 2`. With no seed either it is the RFC's 333 ms.
+//! it is computed from RFC 9002 §6.2.2's `kInitialRtt` (333 ms: `srtt = 333`,
+//! `rttvar = 166.5`, PTO about 1 s).
+//!
+//! Deliberately **not** seeded from quinn's handshake RTT, which the design
+//! suggested. Quinn measures the transport round trip (a few ms on a LAN);
+//! the timer waits for an *application* acknowledgement, which comes after the
+//! client's 5 ms flush and its event loop (a live session measured an ACK p95
+//! of 38.6 ms on a path with a QUIC RTT of a few ms). A seed that small gives a
+//! PTO near 8 ms, and before the first ACK there is nothing for the
+//! hold-back to hold on, so every first-paint pass would fire.
 
 use std::time::{Duration, Instant};
 
@@ -55,7 +62,6 @@ pub struct RttEstimator {
     latest_rtt: Duration,
     /// Whether `srtt` came from a measurement (`false`: a seed or nothing).
     sampled: bool,
-    seeded: bool,
     samples: u64,
     max_ack_delay: Duration,
     /// Consecutive PTOs since the last acknowledgement.
@@ -80,29 +86,11 @@ impl RttEstimator {
             rttvar: INITIAL_RTT / 2,
             latest_rtt: Duration::ZERO,
             sampled: false,
-            seeded: false,
             samples: 0,
             max_ack_delay: MAX_ACK_DELAY,
             pto_count: 0,
             next_count_at: None,
         }
-    }
-
-    /// Seed `srtt` / `rttvar` from an RTT measured elsewhere (quinn's
-    /// handshake estimate) until the first real sample. Ignored once a sample
-    /// exists, and a zero RTT is not a measurement.
-    pub fn seed(&mut self, rtt: Duration) {
-        if self.sampled || rtt.is_zero() {
-            return;
-        }
-        self.srtt = rtt;
-        self.rttvar = rtt / 2;
-        self.seeded = true;
-    }
-
-    /// Whether a seed or a sample has replaced the 333 ms default.
-    pub fn has_basis(&self) -> bool {
-        self.sampled || self.seeded
     }
 
     /// Whether any real sample has been taken.
@@ -274,25 +262,21 @@ mod tests {
         assert_eq!(e.pto_count(), 0);
     }
 
-    /// Before the first sample, a seed (quinn's handshake RTT) stands in as
-    /// RFC 9002 §6.2.2 has it (`srtt = seed`, `rttvar = seed / 2`) and the
-    /// first real sample replaces it outright; with no seed it is the RFC's
-    /// 333 ms, never a one-second guess.
+    /// Before the first sample the estimator stands on RFC 9002's initial RTT
+    /// (333 ms, PTO 333 + 4 x 166.5 + 5 = 1004 ms), and the first real sample
+    /// replaces it outright, with no blend.
     #[test]
-    fn a_seed_stands_in_until_the_first_sample_and_is_then_replaced() {
+    fn the_initial_rtt_stands_until_the_first_sample_and_is_then_replaced() {
         let mut e = RttEstimator::new();
-        assert!(!e.has_basis());
-        // 333 + 4 x 166.5 + 5
+        assert!(!e.has_sample());
         assert_eq!(e.pto_interval(0), ms(1004));
-        e.seed(Duration::ZERO);
-        assert!(!e.has_basis(), "zero is not a measurement");
-        e.seed(ms(30));
-        assert!(e.has_basis() && !e.has_sample());
-        assert_eq!(e.pto_interval(0), ms(30 + 4 * 15 + 5));
         e.on_sample(ms(10));
-        assert_eq!(e.srtt(), ms(10), "the sample replaces the seed, no blend");
+        assert!(e.has_sample());
+        assert_eq!(
+            e.srtt(),
+            ms(10),
+            "the sample replaces the default, no blend"
+        );
         assert_eq!(e.rttvar(), ms(5));
-        e.seed(ms(500));
-        assert_eq!(e.srtt(), ms(10), "a seed never overrides a measurement");
     }
 }

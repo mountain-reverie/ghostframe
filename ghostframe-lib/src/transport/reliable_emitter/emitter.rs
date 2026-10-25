@@ -5,7 +5,9 @@ use crate::transport::protocol::TileParityEnvelope;
 use crate::transport::reliable_emitter::cache::{CacheEntry, ProbeTag, RetransmitCache};
 use crate::transport::reliable_emitter::emission_queue::{Emission, EmissionQueue, WireClass};
 use crate::transport::reliable_emitter::parity::GroupBuilder;
-use crate::transport::reliable_emitter::rto::{pto_for_attempt, RtoTimerWheel};
+use crate::transport::reliable_emitter::rto::{
+    pto_for_attempt, pto_resume_for_attempt, RtoTimerWheel,
+};
 use crate::transport::reliable_emitter::traits::{DatagramSender, SendOutcome};
 use crate::transport::reliable_emitter::wire_seq::WireSeqAllocator;
 use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K, PARITY_INTERLEAVE_OFFSET};
@@ -158,6 +160,11 @@ pub struct EmitterStats {
     /// `rto_spurious` this verdict is final: the acknowledgement of the
     /// retransmission that follows an acknowledged original (every duplicate
     /// is acknowledged) does not turn it into a useful fire. Measurement only.
+    ///
+    /// Not disjoint from `rto_useful`: a fire is both when the original is
+    /// acknowledged first and the retransmission after it, so
+    /// `rto_original_first + rto_useful` can exceed `rto_fired`. Read it as a
+    /// share of `rto_fired`, not as a partition.
     pub rto_original_first: u64,
     /// RTO fires whose pass was acknowledged by a retransmission: the timer
     /// earned its keep. `rto_fired - rto_spurious - rto_useful` fired for
@@ -706,12 +713,26 @@ impl ReliableTileEmitter {
             // A pass that something later has been acknowledged past is not
             // held: its own deadline stands, as it did before. This only
             // ever delays a fire, never brings one forward.
+            //
+            // "Departed after" is ordered by `departed_us`, the per-turn stamp
+            // of F2 (every transmission of one `drain_outbound` shares it), not
+            // by a departure index. Two passes of one turn compare equal, so
+            // neither is "overtaken" by the other: conservative, and fine for
+            // a hold-back that can only delay. PR-5's packet threshold counts
+            // departures and must use a real departure index.
+            //
+            // Cost: a held pass is pushed back onto the heap with its new
+            // deadline, once per PTO. At most `inflight` passes are held, and
+            // `inflight` is about rate x RTT while a PTO is at least an RTT, so
+            // the pushes are O(log n) each and about one per datagram sent, not
+            // a per-tick scan. Each is bounded by the pop that finds it due, so
+            // a tick does at most one push per heap entry that came due in it.
             let overtaken = self
                 .max_acked_depart_us
                 .is_some_and(|m| m > entry.departed_us);
             if !overtaken {
                 if let Some(acked_at) = self.last_ack_at {
-                    let resume = acked_at + pto_for_attempt(&self.rtt, entry.attempts);
+                    let resume = acked_at + pto_resume_for_attempt(&self.rtt, entry.attempts);
                     if resume > now {
                         entry.rto_deadline = Some(resume);
                         self.rto.schedule(key, resume);
@@ -956,8 +977,21 @@ impl ReliableTileEmitter {
         self.rto_origin.clear();
         self.latest_tile_generation.clear();
         self.awaiting_departure.clear();
+        // The estimator and the acknowledgement progress describe the
+        // connection that is gone. Its PTO backoff, srtt and "newest ACK"
+        // must not hold back or delay the next connection's first passes.
+        self.reset_connection_state();
         // RTO heap entries will validate against the empty cache on pop
         // and silently skip; no need to flush the heap.
+    }
+
+    /// Forget everything measured on the current connection: the RTT
+    /// estimator (back to RFC 9002's initial RTT, backoff zero) and the
+    /// acknowledgement progress the hold-back reads.
+    pub fn reset_connection_state(&mut self) {
+        self.rtt = RttEstimator::new();
+        self.last_ack_at = None;
+        self.max_acked_depart_us = None;
     }
 
     pub fn has_cache_entries_for_tile(&self, tile_x: u8, tile_y: u8) -> bool {
@@ -2698,6 +2732,102 @@ mod tests {
         );
         e.tick_budgeted(t_rel + rto, usize::MAX, usize::MAX);
         assert_eq!(e.stats.rto_fired, 1, "and it fires");
+    }
+
+    /// A pass first sent at the end of a stall (several consecutive PTOs, so
+    /// the connection's backoff count is up) is armed with an unbacked-off
+    /// deadline: the stall is handled when the timer is evaluated (the
+    /// hold-back's resume time), not by pushing every new original out. Arming
+    /// with the larger of the key's retries and the connection's count makes
+    /// this fail.
+    #[test]
+    fn a_pass_first_sent_after_a_stall_is_armed_without_the_connections_backoff() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.rtt.on_sample(Duration::from_millis(40));
+        let base = pto_for_attempt(&e.rtt, 0);
+        // A one-second stall: PTOs expire three times with no ACK between.
+        e.rtt.on_pto_fire(t0);
+        e.rtt.on_pto_fire(t0 + base * 2);
+        e.rtt.on_pto_fire(t0 + base * 8);
+        assert_eq!(e.rtt.pto_count(), 3, "premise: the backoff count is up");
+
+        let t_send = t0 + Duration::from_secs(1);
+        let key = EmitKey::new(9, 0, 0, 0);
+        e.submit_one(key, fake_source(9, 0, 0), t_send, None, t_send);
+        let ws = e.take_transmissions()[0].wire_seq;
+        e.on_departed(ws, t_send);
+        assert_eq!(
+            e.cache.get(&key).unwrap().rto_deadline,
+            Some(t_send + base),
+            "an original is armed with attempts only"
+        );
+    }
+
+    /// The silence is still honoured at evaluation time: with the count up and
+    /// no ACK for a while, a held pass resumes later than one PTO after the
+    /// newest ACK, and an ACK ends the backoff.
+    #[test]
+    fn a_held_pass_resumes_later_while_the_connection_is_silent() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.rtt.on_sample(Duration::from_millis(40));
+        let base = pto_for_attempt(&e.rtt, 0);
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        let ws = e.take_transmissions()[0].wire_seq;
+        e.on_departed(ws, t0);
+        // An ACK of something older, then silence: three consecutive PTOs.
+        e.note_ack(0, t0);
+        e.rtt.on_pto_fire(t0 + base);
+        e.rtt.on_pto_fire(t0 + base * 3);
+        e.rtt.on_pto_fire(t0 + base * 7);
+        assert_eq!(e.rtt.pto_count(), 3);
+        // Own deadline (t0 + base) and one PTO after the ACK have passed, but
+        // the backed-off resume (t0 + 8 base) has not.
+        e.tick_budgeted(t0 + base * 2, usize::MAX, usize::MAX);
+        assert_eq!(e.stats.rto_fired, 0);
+        assert!(e.stats.rto_deferred_by_ack >= 1, "premise: it was held");
+        e.tick_budgeted(t0 + base * 8, usize::MAX, usize::MAX);
+        assert_eq!(e.stats.rto_fired, 1);
+    }
+
+    /// What was measured on a connection that is gone must not carry over: its
+    /// PTO backoff would delay the next connection's first loss recovery, its
+    /// srtt would set the next one's deadlines, and its newest ACK would hold
+    /// back the next one's passes. `clear_cache` (a dead connection, an
+    /// eviction) resets all three. Removing the reset makes this fail.
+    #[test]
+    fn a_dead_connections_estimate_and_backoff_do_not_carry_over() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.rtt.on_sample(Duration::from_millis(40));
+        let base = pto_for_attempt(&e.rtt, 0);
+        e.note_ack(5, t0);
+        e.rtt.on_pto_fire(t0);
+        e.rtt.on_pto_fire(t0 + base * 2);
+        assert_eq!(
+            e.rtt.pto_count(),
+            2,
+            "premise: backoff from the old connection"
+        );
+        assert!(e.last_ack_at.is_some() && e.max_acked_depart_us.is_some());
+
+        e.clear_cache();
+
+        assert_eq!(e.rtt.pto_count(), 0);
+        assert!(!e.rtt.has_sample());
+        assert!(e.last_ack_at.is_none() && e.max_acked_depart_us.is_none());
+        // The next connection's first pass is armed from the initial RTT, not
+        // from the old 40 ms estimate, and nothing holds it back.
+        let t1 = t0 + Duration::from_secs(2);
+        let key = EmitKey::new(2, 0, 0, 0);
+        e.submit_one(key, fake_source(2, 0, 0), t1, None, t1);
+        let ws = e.take_transmissions()[0].wire_seq;
+        e.on_departed(ws, t1);
+        let initial = pto_for_attempt(&RttEstimator::new(), 0);
+        assert_eq!(e.cache.get(&key).unwrap().rto_deadline, Some(t1 + initial));
+        assert!(initial > base * 3, "premise: the two estimates differ");
     }
 
     /// A NACK repair made before the original has left must not back off the

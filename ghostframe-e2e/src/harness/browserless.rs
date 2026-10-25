@@ -508,7 +508,9 @@ pub struct BrowserlessResult {
     /// `EmitterStats::rto_original_first`). The share of `rto_fired` that
     /// this is, is the spurious-timeout rate; `rto_spurious` above reverts to
     /// useful once the retransmission is acknowledged too, which it nearly
-    /// always is.
+    /// always is. Not disjoint from `rto_useful` (a fire is both when the
+    /// original is acknowledged first and the retransmission after it), so
+    /// the two can sum to more than `rto_fired`.
     pub rto_original_first: u64,
     /// RTO fires whose pass was repaired by the retransmission.
     pub rto_useful: u64,

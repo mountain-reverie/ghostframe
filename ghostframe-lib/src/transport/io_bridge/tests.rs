@@ -3995,12 +3995,9 @@ async fn the_priority_retry_gate_is_the_emitters_probe_timeout() {
     let (_tx, rx) = mpsc::channel(8);
     let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
 
-    // No measurement at all: RFC 9002's initial RTT (333 + 4 x 166.5 + 5 ms).
+    // No measurement yet: RFC 9002's initial RTT (333 + 4 x 166.5 + 5 ms),
+    // not quinn's handshake RTT (see `rtt_estimator`'s module doc).
     assert_eq!(bridge.priority_retry_after(), Duration::from_millis(1004));
-
-    // A seed (quinn's handshake RTT) stands in before the first sample.
-    bridge.reliable_emitter.rtt.seed(Duration::from_millis(20));
-    assert_eq!(bridge.priority_retry_after(), Duration::from_millis(65));
 
     // A first sample replaces it: 6 ms is a fast path plus the client's 5 ms
     // flush, 6 + 4 x 3 + 5.
