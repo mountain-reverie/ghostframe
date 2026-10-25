@@ -33,7 +33,39 @@ pub struct Transmission {
     /// built; this is when it was sent, and the difference is the time it
     /// sat in a queue.
     pub depart_us: Option<u64>,
+    /// Position in the order datagrams left quinn's FIFO: 0, 1, 2, ... one
+    /// per datagram, assigned by [`TransmissionLedger::mark_departed`] in the
+    /// departure tracker's FIFO order. `None` while queued. `depart_us` is a
+    /// per-turn stamp (every datagram of one `drain_outbound` shares it), so it
+    /// cannot say which of two such datagrams went first; this can, and loss
+    /// detection counts in it.
+    pub dep_idx: Option<u64>,
 }
+
+/// Why a transmission was declared lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LossReason {
+    /// `K_PKT` or more departures after it have been acknowledged (RFC 9002
+    /// section 6.1.1).
+    Packet,
+    /// It departed more than the time threshold before the newest
+    /// acknowledged departure (section 6.1.2).
+    Time,
+    /// The probe timeout found its content gone (superseded) while it was the
+    /// newest outstanding: it cannot be probed, and it is not coming back.
+    Pto,
+}
+
+/// RFC 9002 section 6.1.1: a transmission is lost when this many departures
+/// after it have been acknowledged.
+pub(crate) const K_PKT_INITIAL: u64 = 3;
+/// The adaptive packet threshold never exceeds this (RACK's reordering window
+/// is bounded the same way).
+pub(crate) const K_PKT_MAX: u64 = 8;
+/// Verdicts the adaptation looks back over.
+const ADAPT_WINDOW: u64 = 64;
+/// Spurious share of the window above which `K_PKT` goes up by one: 10 %.
+const ADAPT_SPURIOUS_PERCENT: u64 = 10;
 
 /// What an acknowledgement turned out to refer to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +117,18 @@ pub struct LedgerStats {
     pub departures_stamped: u64,
     /// Transmissions evicted by the capacity cap before they had departed.
     pub evicted_before_departure: u64,
+    /// Verdicts by reason. Their sum is the number of transmissions declared
+    /// lost.
+    pub lost_packet_threshold: u64,
+    pub lost_time_threshold: u64,
+    pub lost_pto: u64,
+    /// Verdicts later contradicted: the transmission was acknowledged after
+    /// being declared lost. Equal to `acked_after_declared_lost` (a tombstone
+    /// resolves once); kept under the Eifel name.
+    pub spurious_losses: u64,
+    /// The packet threshold now (3 to 8) and how often it has been raised.
+    pub k_pkt: u64,
+    pub k_pkt_raises: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -113,8 +157,21 @@ pub struct TransmissionLedger {
     /// `wire_seq -> Transmission` for expired records, retained so a late
     /// acknowledgement can still release its content. Bounded by the same
     /// capacity as `records`; oldest evicted first.
-    tombstones: HashMap<u32, Transmission>,
+    tombstones: HashMap<u32, (Transmission, u64)>,
     tombstone_order: VecDeque<u32>,
+    /// Next departure index to hand out.
+    next_dep_idx: u64,
+    /// The newest acknowledged departure: its index and when it left. Loss
+    /// is only ever judged against this, never against the clock, so a queue
+    /// that delays everything in order cannot produce a verdict (F4).
+    largest_acked: Option<(u64, Instant)>,
+    /// Current packet threshold, and what it adapts from: verdicts issued so
+    /// far, and one bit per recent verdict (by verdict number modulo 64) set
+    /// when that verdict was contradicted by a late acknowledgement.
+    k_pkt: u64,
+    freeze_k_pkt: bool,
+    verdicts: u64,
+    spurious_bits: u64,
 }
 
 impl TransmissionLedger {
@@ -127,11 +184,31 @@ impl TransmissionLedger {
             stats: LedgerStats::default(),
             tombstones: HashMap::new(),
             tombstone_order: VecDeque::new(),
+            next_dep_idx: 0,
+            largest_acked: None,
+            k_pkt: K_PKT_INITIAL,
+            freeze_k_pkt: false,
+            verdicts: 0,
+            spurious_bits: 0,
         }
     }
 
+    /// Keep `K_PKT` at its initial value whatever the spurious rate says. The
+    /// mutation the adaptive-threshold gate is shown against.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub fn freeze_k_pkt(&mut self) {
+        self.freeze_k_pkt = true;
+    }
+
     pub fn stats(&self) -> LedgerStats {
-        self.stats
+        LedgerStats {
+            k_pkt: self.k_pkt,
+            ..self.stats
+        }
+    }
+
+    pub fn k_pkt(&self) -> u64 {
+        self.k_pkt
     }
 
     pub fn tombstone_len(&self) -> usize {
@@ -163,6 +240,7 @@ impl TransmissionLedger {
             departed: None,
             tx: Transmission {
                 depart_us: None,
+                dep_idx: None,
                 ..tx
             },
         };
@@ -211,6 +289,8 @@ impl TransmissionLedger {
         }
         rec.departed = Some(at);
         rec.tx.depart_us = Some(depart_us);
+        rec.tx.dep_idx = Some(self.next_dep_idx);
+        self.next_dep_idx += 1;
         self.departed_order.push_back(wire_seq);
         self.stats.departures_stamped += 1;
         true
@@ -243,79 +323,196 @@ impl TransmissionLedger {
     /// which also lets the content be released.
     pub fn resolve(&mut self, wire_seq: u32) -> Option<Resolution> {
         if let Some(rec) = self.records.remove(&wire_seq) {
+            if let (Some(idx), Some(at)) = (rec.tx.dep_idx, rec.departed) {
+                if self.largest_acked.is_none_or(|(l, _)| idx > l) {
+                    self.largest_acked = Some((idx, at));
+                }
+            }
             return Some(Resolution::Live(rec.tx));
         }
-        if let Some(tx) = self.tombstones.remove(&wire_seq) {
+        if let Some((tx, verdict_no)) = self.tombstones.remove(&wire_seq) {
             self.stats.acked_after_declared_lost += 1;
+            self.stats.spurious_losses += 1;
+            self.note_spurious(verdict_no);
             return Some(Resolution::Late(tx));
         }
         self.stats.unknown_acks += 1;
         None
     }
 
-    /// Classify everything that has been on the wire longer than `horizon`
-    /// as lost.
-    pub fn expire(&mut self, now: Instant, horizon: std::time::Duration) -> Vec<Transmission> {
-        self.expire_with_seq(now, horizon)
-            .into_iter()
-            .map(|(_, tx)| tx)
-            .collect()
-    }
-
-    /// [`Self::expire`], with each lost transmission's `wire_seq` so the
-    /// caller can later match a late acknowledgement to it exactly.
+    /// Declare lost every outstanding transmission that the acknowledgements
+    /// received so far put out of contention (RFC 9002 section 6.1), oldest
+    /// first. `time_threshold` is `9/8 x max(srtt, latest_rtt)`.
     ///
-    /// The clock is the departure stamp, not the recording time: a
-    /// transmission that has not left quinn's FIFO is never on it. Departure
-    /// order is the walk order, so it stops at the first transmission that
-    /// has not been on the wire for `horizon` yet.
-    pub fn expire_with_seq(
+    /// A transmission is lost when it departed before the newest acknowledged
+    /// departure **and** either
+    /// - `K_PKT` or more departures separate them in departure index
+    ///   ([`Transmission::dep_idx`], one per datagram), or
+    /// - it left more than `time_threshold` before the newest acknowledged
+    ///   departure left.
+    ///
+    /// Both compare against an *acknowledged* departure, never against the
+    /// clock. A bottleneck that queues but neither drops nor reorders delivers
+    /// acknowledgements in departure order, so nothing outstanding departed
+    /// before the newest acknowledged one by `K_PKT` places, and a growing
+    /// queue produces no verdict however deep it gets.
+    ///
+    /// Walks `departed_order` from the front and stops at the first record that
+    /// is not lost: a later departure has a larger index and a later time, so
+    /// it cannot be lost if this one is not. Resolved entries it passes are
+    /// dropped. Amortised O(1) per transmission.
+    pub fn detect_losses(
         &mut self,
-        now: Instant,
-        horizon: std::time::Duration,
-    ) -> Vec<(u32, Transmission)> {
+        time_threshold: std::time::Duration,
+    ) -> Vec<(u32, Transmission, LossReason)> {
         let mut lost = Vec::new();
+        let Some((largest_idx, largest_at)) = self.largest_acked else {
+            return lost;
+        };
         while let Some(front) = self.departed_order.front().copied() {
-            match self.records.get(&front) {
+            let (idx, at) = match self.records.get(&front) {
                 // Already resolved, or the record was replaced by a newer one
                 // under the same `wire_seq` that has not departed yet; drop
                 // the stale order entry and continue.
-                None => {
+                None | Some(Record { departed: None, .. }) => {
                     self.departed_order.pop_front();
-                }
-                Some(Record { departed: None, .. }) => {
-                    self.departed_order.pop_front();
+                    continue;
                 }
                 Some(Record {
-                    departed: Some(at), ..
-                }) => {
-                    if now.saturating_duration_since(*at) < horizon {
-                        break;
-                    }
-                    self.departed_order.pop_front();
-                    self.declare_lost(front, &mut lost);
-                }
+                    departed: Some(at),
+                    tx,
+                    ..
+                }) => (tx.dep_idx.unwrap_or(u64::MAX), *at),
+            };
+            if idx >= largest_idx {
+                break;
             }
+            let reason = if idx + self.k_pkt <= largest_idx {
+                LossReason::Packet
+            } else if at + time_threshold <= largest_at {
+                LossReason::Time
+            } else {
+                break;
+            };
+            self.departed_order.pop_front();
+            self.declare_lost(front, reason, &mut lost);
         }
         self.compact_if_sparse();
         lost
     }
 
+    /// The newest outstanding transmissions that have departed, newest first:
+    /// up to `n` of them, looking at no more than `max_scan` records from the
+    /// back. Resolved entries at the back are dropped as they are met.
+    ///
+    /// What the probe timeout retransmits. A bounded scan, so an unlucky run
+    /// of resolved entries behind the tail cannot make one probe expensive.
+    pub fn newest_outstanding(&mut self, n: usize, max_scan: usize) -> Vec<(u32, Transmission)> {
+        // Resolved entries at the very back are dead weight for every later
+        // probe: drop them.
+        while let Some(back) = self.departed_order.back().copied() {
+            match self.records.get(&back) {
+                Some(Record {
+                    departed: Some(_), ..
+                }) => break,
+                _ => {
+                    self.departed_order.pop_back();
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for ws in self.departed_order.iter().rev().take(max_scan) {
+            if out.len() >= n {
+                break;
+            }
+            if let Some(Record {
+                departed: Some(_),
+                tx,
+                ..
+            }) = self.records.get(ws)
+            {
+                out.push((*ws, *tx));
+            }
+        }
+        out
+    }
+
+    /// When the newest outstanding transmission left quinn's FIFO, or `None`
+    /// when nothing departed is outstanding. Drops resolved entries at the back
+    /// to find out.
+    pub fn latest_outstanding_departure(&mut self) -> Option<Instant> {
+        while let Some(back) = self.departed_order.back().copied() {
+            match self.records.get(&back) {
+                Some(Record {
+                    departed: Some(at), ..
+                }) => return Some(*at),
+                _ => {
+                    self.departed_order.pop_back();
+                }
+            }
+        }
+        None
+    }
+
+    /// Declare one outstanding transmission lost by the probe timeout: the
+    /// timer found it with nothing left to retransmit. `None` if it is not
+    /// outstanding.
+    pub fn declare_lost_by_pto(&mut self, wire_seq: u32) -> Option<Transmission> {
+        let mut lost = Vec::new();
+        self.declare_lost(wire_seq, LossReason::Pto, &mut lost);
+        lost.pop().map(|(_, tx, _)| tx)
+    }
+
+    /// Verdict number `verdict_no` was contradicted by an acknowledgement. If
+    /// it is still inside the last [`ADAPT_WINDOW`] verdicts, mark it; when more
+    /// than 10 % of the window is marked, raise `K_PKT` by one and start the
+    /// evidence over (RACK's reorder-window growth, RFC 8985 section 6.2).
+    /// Bounded at [`K_PKT_MAX`]; the same session's threshold only goes up. O(1):
+    /// a bit set and a popcount.
+    fn note_spurious(&mut self, verdict_no: u64) {
+        if self.verdicts - verdict_no > ADAPT_WINDOW {
+            return;
+        }
+        self.spurious_bits |= 1 << (verdict_no % ADAPT_WINDOW);
+        let in_window = self.verdicts.min(ADAPT_WINDOW);
+        let marked = u64::from(self.spurious_bits.count_ones());
+        if marked * 100 > in_window * ADAPT_SPURIOUS_PERCENT {
+            if !self.freeze_k_pkt && self.k_pkt < K_PKT_MAX {
+                self.k_pkt += 1;
+                self.stats.k_pkt_raises += 1;
+            }
+            self.spurious_bits = 0;
+        }
+    }
+
     /// Issue the verdict for `wire_seq`: remove its record, keep a tombstone
     /// so a late acknowledgement can still release the content, and hand it
     /// to the caller. The one place a loss is declared.
-    fn declare_lost(&mut self, wire_seq: u32, lost: &mut Vec<(u32, Transmission)>) {
+    fn declare_lost(
+        &mut self,
+        wire_seq: u32,
+        reason: LossReason,
+        lost: &mut Vec<(u32, Transmission, LossReason)>,
+    ) {
         let Some(rec) = self.records.remove(&wire_seq) else {
             return;
         };
         if rec.departed.is_none() {
             self.stats.expired_before_departure += 1;
         }
+        match reason {
+            LossReason::Packet => self.stats.lost_packet_threshold += 1,
+            LossReason::Time => self.stats.lost_time_threshold += 1,
+            LossReason::Pto => self.stats.lost_pto += 1,
+        }
         if crate::transport::reliable_emitter::rto_probe_enabled() {
-            eprintln!("RTOPROBE expired_ws ws={}", wire_seq);
+            eprintln!("RTOPROBE lost_ws ws={} reason={:?}", wire_seq, reason);
         }
         let tx = rec.tx;
-        self.tombstones.insert(wire_seq, tx);
+        self.verdicts += 1;
+        // This verdict's bit starts clear: it replaces the one 64 verdicts ago.
+        self.spurious_bits &= !(1 << (self.verdicts % ADAPT_WINDOW));
+        self.tombstones.insert(wire_seq, (tx, self.verdicts));
         self.tombstone_order.push_back(wire_seq);
         while self.tombstones.len() > self.capacity {
             if let Some(oldest) = self.tombstone_order.pop_front() {
@@ -326,7 +523,7 @@ impl TransmissionLedger {
                 break;
             }
         }
-        lost.push((wire_seq, tx));
+        lost.push((wire_seq, tx, reason));
     }
 
     /// The two order queues skip resolved entries lazily, which is amortised
@@ -354,264 +551,259 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    const MS: Duration = Duration::from_millis(1);
+    /// A time threshold nothing in these tests reaches unless it means to.
+    const FAR: Duration = Duration::from_secs(3600);
+
     fn tx(n: u32) -> Transmission {
         Transmission {
             emit_us: n as u64 * 1000,
             wire_bytes: 1200,
             key: EmitKey::new(n, 0, 0, 0),
             depart_us: None,
+            dep_idx: None,
         }
     }
 
-    /// `tx(n)` as the ledger hands it back once it has departed at `us`.
-    fn departed(n: u32, us: u64) -> Transmission {
-        Transmission {
-            depart_us: Some(us),
-            ..tx(n)
+    /// Record `ws` and put it on the wire at `at` (all of one "turn" share the
+    /// same instant, as the departure tracker's stamps do).
+    fn send(l: &mut TransmissionLedger, ws: u32, at: Instant) {
+        l.record(ws, at, tx(ws));
+        assert!(l.mark_departed(ws, at, ws as u64));
+    }
+
+    fn lost_ws(v: &[(u32, Transmission, LossReason)]) -> Vec<u32> {
+        v.iter().map(|(w, _, _)| *w).collect()
+    }
+
+    /// Departure index is per datagram, in departure order, even when the
+    /// stamps are equal.
+    #[test]
+    fn departure_index_is_per_datagram_and_ignores_equal_stamps() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        for ws in [10u32, 11, 12] {
+            send(&mut l, ws, t0);
         }
+        let idx = |l: &mut TransmissionLedger, ws| match l.resolve(ws) {
+            Some(Resolution::Live(t)) => t.dep_idx,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(idx(&mut l, 11), Some(1));
+        assert_eq!(idx(&mut l, 10), Some(0));
+        assert_eq!(idx(&mut l, 12), Some(2));
     }
 
     #[test]
-    fn a_resolved_transmission_is_classified_once_and_not_expired() {
+    fn a_resolved_transmission_is_classified_once_and_never_lost() {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(64);
-        l.record(7, t0, tx(7));
-        assert!(l.mark_departed(7, t0, 5));
-        assert_eq!(l.resolve(7), Some(Resolution::Live(departed(7, 5))));
+        send(&mut l, 7, t0);
+        send(&mut l, 8, t0);
+        assert!(matches!(l.resolve(7), Some(Resolution::Live(_))));
         assert_eq!(l.resolve(7), None, "a second resolve finds nothing");
-        assert!(
-            l.expire(t0 + Duration::from_secs(10), Duration::from_millis(1))
-                .is_empty(),
-            "an acknowledged transmission must never also be reported lost"
-        );
+        assert!(l.detect_losses(FAR).is_empty());
     }
 
+    /// With nothing acknowledged there is nothing to be lost *relative to*: no
+    /// verdict however old the transmissions are.
     #[test]
-    fn an_unresolved_transmission_expires_as_lost_once() {
+    fn no_verdict_without_an_acknowledgement() {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(64);
-        l.record(7, t0, tx(7));
-        l.mark_departed(7, t0, 5);
-        let lost = l.expire(t0 + Duration::from_millis(500), Duration::from_millis(100));
-        assert_eq!(lost, vec![departed(7, 5)]);
-        assert!(
-            l.expire(t0 + Duration::from_secs(10), Duration::from_millis(1))
-                .is_empty(),
-            "expiry must not report the same transmission twice"
-        );
-    }
-
-    /// A late acknowledgement is visible and does not retract the loss --
-    /// but it does release the content.
-    ///
-    /// Previously this asserted `resolve` returned `None`, which made the
-    /// acknowledgement countable while leaving its cache entry unreachable
-    /// forever. Visibility and non-retraction were the point and are kept;
-    /// the stranding was not, and is gone.
-    #[test]
-    fn an_acknowledgement_after_expiry_is_counted_and_releases_content() {
-        let t0 = Instant::now();
-        let mut l = TransmissionLedger::new(64);
-        l.record(7, t0, tx(7));
-        l.mark_departed(7, t0, 5);
-        assert_eq!(
-            l.expire(t0 + Duration::from_millis(500), Duration::from_millis(100))
-                .len(),
-            1
-        );
-        assert_eq!(
-            l.resolve(7),
-            Some(Resolution::Late(departed(7, 5))),
-            "the content must still be releasable, or its cache entry is stranded"
-        );
-        assert_eq!(
-            l.stats().acked_after_declared_lost,
-            1,
-            "a late acknowledgement is visible, not silent"
-        );
-        assert_eq!(
-            l.stats().unknown_acks,
-            0,
-            "it is no longer an unknown acknowledgement -- we know exactly what it was"
-        );
-    }
-
-    #[test]
-    fn expiry_stops_at_the_first_young_record() {
-        // Departure order is send order, so the walk must not scan the whole
-        // ledger on every sweep.
-        let t0 = Instant::now();
-        let mut l = TransmissionLedger::new(64);
-        l.record(1, t0, tx(1));
-        l.record(2, t0, tx(2));
-        l.mark_departed(1, t0, 1);
-        l.mark_departed(2, t0 + Duration::from_millis(400), 2);
-        let lost = l.expire(t0 + Duration::from_millis(500), Duration::from_millis(200));
-        assert_eq!(lost, vec![departed(1, 1)], "only the old one");
-        assert_eq!(l.len(), 1);
-    }
-
-    // The invariant the whole design rests on, and the one most likely to
-    // break under an ordering nobody thought of: across any interleaving of
-    // recording, resolving and expiring, a transmission is classified
-    // **exactly once** — never both received and lost, never neither.
-    //
-    // Capacity is deliberately left larger than the operation count here.
-    // The hard cap is a backstop against a pathological peer and drops
-    // records *unclassified* by design; mixing it into this property would
-    // assert something the cap explicitly does not promise. It has its own
-    // test above.
-    proptest::proptest! {
-        #[test]
-        fn every_transmission_is_classified_exactly_once(
-            ops in proptest::collection::vec(
-                (0u32..12, proptest::bool::ANY, 0u64..300), 1..200)
-        ) {
-            use std::collections::HashSet;
-            let t0 = Instant::now();
-            let horizon = Duration::from_millis(100);
-            let mut l = TransmissionLedger::new(4096);
-            let mut outstanding: HashSet<u32> = HashSet::new();
-            let mut classified: HashSet<u32> = HashSet::new();
-            // wire_seq is unique per transmission, so a fresh one each time.
-            let mut next_ws: u32 = 0;
-            // Maps the proptest slot back to whichever wire_seq is currently
-            // outstanding for it, so "resolve something plausible" can name a
-            // real record as well as a stale one.
-            let mut slot_ws: std::collections::HashMap<u32, u32> = Default::default();
-            let mut now = t0;
-
-            for (slot, do_resolve, advance_us) in ops {
-                now += Duration::from_micros(advance_us);
-                if do_resolve {
-                    if let Some(ws) = slot_ws.remove(&slot) {
-                        if l.resolve(ws).is_some() {
-                            proptest::prop_assert!(
-                                outstanding.remove(&ws),
-                                "resolved a transmission that was not outstanding"
-                            );
-                            proptest::prop_assert!(
-                                classified.insert(ws),
-                                "wire_seq {} classified twice", ws
-                            );
-                        }
-                    }
-                } else {
-                    let ws = next_ws;
-                    next_ws += 1;
-                    l.record(ws, now, Transmission {
-                        emit_us: ws as u64,
-                        wire_bytes: 1200,
-                        key: EmitKey::new(ws, 0, 0, 0),
-                        depart_us: None,
-                    });
-                    l.mark_departed(ws, now, ws as u64);
-                    outstanding.insert(ws);
-                    slot_ws.insert(slot, ws);
-                }
-                for tx in l.expire(now, horizon) {
-                    let ws = tx.emit_us as u32;
-                    proptest::prop_assert!(
-                        outstanding.remove(&ws),
-                        "expired a transmission that was not outstanding"
-                    );
-                    proptest::prop_assert!(
-                        classified.insert(ws),
-                        "wire_seq {} classified twice", ws
-                    );
-                    slot_ws.retain(|_, v| *v != ws);
-                }
-            }
-
-            // Drain whatever is still in flight; nothing may be left unknown.
-            for tx in l.expire(now + horizon * 2, horizon) {
-                let ws = tx.emit_us as u32;
-                proptest::prop_assert!(outstanding.remove(&ws));
-                proptest::prop_assert!(classified.insert(ws));
-            }
-            proptest::prop_assert!(
-                outstanding.is_empty(),
-                "{} transmissions were never classified", outstanding.len()
-            );
-            proptest::prop_assert_eq!(classified.len(), next_ws as usize);
+        for ws in 0..20 {
+            send(&mut l, ws, t0 + ws * 100 * MS);
         }
+        assert!(l.detect_losses(MS).is_empty());
+        assert_eq!(l.len(), 20);
     }
 
+    /// Packet threshold: three departures after it acknowledged.
     #[test]
-    fn a_late_acknowledgement_still_resolves_after_expiry() {
+    fn three_later_departures_acknowledged_declare_a_transmission_lost() {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(64);
-        let key = EmitKey::new(7, 1, 2, 0);
-        l.record(
-            99,
-            t0,
-            Transmission {
-                emit_us: 10,
-                wire_bytes: 500,
-                key,
-                depart_us: None,
-            },
-        );
-        l.mark_departed(99, t0, 10);
-
-        let lost = l.expire(t0 + Duration::from_millis(300), Duration::from_millis(100));
-        assert_eq!(lost.len(), 1, "the transmission is declared lost");
-
-        match l.resolve(99) {
-            Some(Resolution::Late(tx)) => assert_eq!(tx.key, key),
-            other => panic!("a late ack must still resolve to its content, got {other:?}"),
+        for ws in 0..5 {
+            send(&mut l, ws, t0);
         }
+        // 4 is acknowledged: 0 and 1 are three or more places behind it.
+        assert!(l.resolve(4).is_some());
+        let lost = l.detect_losses(FAR);
+        assert_eq!(lost_ws(&lost), vec![0, 1]);
+        assert!(lost.iter().all(|(_, _, r)| *r == LossReason::Packet));
+        // 2 and 3 are inside the threshold, and are not lost by the clock.
+        assert_eq!(l.len(), 2);
+        assert_eq!(l.stats().lost_packet_threshold, 2);
+        assert!(l.detect_losses(FAR).is_empty(), "verdicts are issued once");
+    }
+
+    /// Time threshold: it left more than the threshold before the newest
+    /// acknowledged departure, however few places behind.
+    #[test]
+    fn a_departure_far_enough_before_the_newest_acknowledged_one_is_lost() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        send(&mut l, 0, t0);
+        send(&mut l, 1, t0 + 500 * MS);
+        assert!(l.resolve(1).is_some());
+        assert!(l.detect_losses(600 * MS).is_empty(), "inside the threshold");
+        let lost = l.detect_losses(100 * MS);
+        assert_eq!(lost_ws(&lost), vec![0]);
+        assert_eq!(lost[0].2, LossReason::Time);
+    }
+
+    /// F4's structural claim: acknowledgements that arrive in departure order
+    /// produce no verdict, at any queue depth and any pace. (The clock is not
+    /// an input at all.)
+    #[test]
+    fn acknowledgements_in_departure_order_never_produce_a_verdict() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(4096);
+        // 1000 datagrams departing 1 ms apart, acknowledged in order a growing
+        // time later (up to 5 s of queue), a few at a time.
+        for ws in 0..1000u32 {
+            send(&mut l, ws, t0 + ws * MS);
+        }
+        let mut verdicts = 0;
+        for ws in 0..1000u32 {
+            assert!(l.resolve(ws).is_some());
+            verdicts += l.detect_losses(MS).len();
+        }
+        assert_eq!(verdicts, 0);
+        assert_eq!(
+            l.stats().lost_packet_threshold + l.stats().lost_time_threshold,
+            0
+        );
+    }
+
+    /// And a real loss in the same stream is found as soon as three later
+    /// departures are acknowledged.
+    #[test]
+    fn a_hole_in_an_in_order_stream_is_found_after_three_more() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        for ws in 0..10u32 {
+            send(&mut l, ws, t0 + ws * MS);
+        }
+        let mut found_after = None;
+        for ws in (0..10u32).filter(|w| *w != 4) {
+            assert!(l.resolve(ws).is_some());
+            if !l.detect_losses(FAR).is_empty() && found_after.is_none() {
+                found_after = Some(ws);
+            }
+        }
+        assert_eq!(found_after, Some(7), "4 + 3 departures");
+    }
+
+    /// A late acknowledgement is visible, releases the content and is counted
+    /// as a spurious verdict.
+    #[test]
+    fn an_acknowledgement_after_a_verdict_is_spurious_and_releases_content() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        for ws in 0..5 {
+            send(&mut l, ws, t0);
+        }
+        assert!(l.resolve(4).is_some());
+        assert_eq!(l.detect_losses(FAR).len(), 2);
+        assert!(
+            matches!(l.resolve(0), Some(Resolution::Late(t)) if t.key == EmitKey::new(0, 0, 0, 0))
+        );
         assert_eq!(l.stats().acked_after_declared_lost, 1);
+        assert_eq!(l.stats().spurious_losses, 1);
+        assert_eq!(l.stats().unknown_acks, 0);
+        assert!(l.resolve(0).is_none(), "a tombstone resolves once");
+        assert_eq!(l.stats().spurious_losses, 1, "and is not counted twice");
     }
 
-    #[test]
-    fn a_live_acknowledgement_resolves_as_live() {
-        let t0 = Instant::now();
-        let mut l = TransmissionLedger::new(64);
-        let key = EmitKey::new(7, 1, 2, 0);
-        l.record(
-            99,
-            t0,
-            Transmission {
-                emit_us: 10,
-                wire_bytes: 500,
-                key,
-                depart_us: None,
-            },
-        );
-        match l.resolve(99) {
-            Some(Resolution::Live(tx)) => assert_eq!(tx.key, key),
-            other => panic!("expected Live, got {other:?}"),
+    /// 70 sent, the last acknowledged: all but the last `K_PKT` are lost. Then
+    /// the first `spurious` of the verdicts are contradicted.
+    fn window(l: &mut TransmissionLedger, t0: Instant, base: u32, spurious: u32) {
+        for ws in base..base + 70 {
+            send(l, ws, t0);
         }
-        assert_eq!(l.stats().acked_after_declared_lost, 0);
+        assert!(l.resolve(base + 69).is_some());
+        let lost = l.detect_losses(FAR);
+        // Everything but the last K of these 70 (and whatever the previous
+        // window left behind) is lost.
+        assert!(lost.len() as u64 >= 70 - l.k_pkt(), "{}", lost.len());
+        for ws in base..base + spurious {
+            let _ = l.resolve(ws);
+        }
+    }
+
+    /// One contradicted verdict in sixty-odd is 1.5 %: no change. The
+    /// threshold goes up one step each time more than 10 % of the last 64
+    /// verdicts have been contradicted, and stays inside [3, 8].
+    #[test]
+    fn the_packet_threshold_adapts_to_reordering_and_is_bounded() {
+        let t0 = Instant::now();
+        let mut quiet = TransmissionLedger::new(8192);
+        window(&mut quiet, t0, 0, 1);
+        assert_eq!(quiet.k_pkt(), 3);
+
+        let mut l = TransmissionLedger::new(8192);
+        let mut seen = vec![l.k_pkt()];
+        let mut base = 0;
+        for _ in 0..12 {
+            window(&mut l, t0, base, 30);
+            base += 70;
+            seen.push(l.k_pkt());
+        }
+        assert!(
+            seen.windows(2).all(|w| w[1] >= w[0]),
+            "never goes down: {seen:?}"
+        );
+        assert!(seen.windows(2).all(|w| w[1] - w[0] <= 5), "{seen:?}");
+        assert_eq!(l.k_pkt(), K_PKT_MAX, "bounded at K_PKT_MAX: {seen:?}");
+        assert!(
+            seen[1] > seen[0] && seen[1] <= 7,
+            "a step per ~7 contradicted verdicts: {seen:?}"
+        );
+        assert!(l.stats().k_pkt_raises >= 5);
     }
 
     #[test]
-    fn a_tombstone_resolves_only_once() {
+    fn a_frozen_threshold_does_not_adapt() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(8192);
+        l.freeze_k_pkt();
+        window(&mut l, t0, 0, 30);
+        assert_eq!(l.k_pkt(), 3);
+    }
+
+    #[test]
+    fn the_newest_outstanding_are_found_from_the_back_and_resolved_tails_are_dropped() {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(64);
-        l.record(
-            99,
-            t0,
-            Transmission {
-                emit_us: 10,
-                wire_bytes: 500,
-                key: EmitKey::new(7, 1, 2, 0),
-                depart_us: None,
-            },
-        );
-        l.mark_departed(99, t0, 10);
-        let _ = l.expire(t0 + Duration::from_millis(300), Duration::from_millis(100));
-        assert!(matches!(l.resolve(99), Some(Resolution::Late(_))));
-        assert!(
-            l.resolve(99).is_none(),
-            "a duplicate ack must not resolve twice"
-        );
+        for ws in 0..6u32 {
+            send(&mut l, ws, t0 + ws * MS);
+        }
+        assert!(l.resolve(5).is_some());
+        assert!(l.resolve(4).is_some());
+        assert_eq!(l.latest_outstanding_departure(), Some(t0 + 3 * MS));
+        let n = l.newest_outstanding(2, 32);
+        assert_eq!(n.iter().map(|(w, _)| *w).collect::<Vec<_>>(), vec![3, 2]);
+        // A resolved one in the middle is skipped, not returned.
+        assert!(l.resolve(2).is_some());
+        let n = l.newest_outstanding(2, 32);
+        assert_eq!(n.iter().map(|(w, _)| *w).collect::<Vec<_>>(), vec![3, 1]);
+        // The scan is bounded.
+        assert_eq!(l.newest_outstanding(2, 1).len(), 1);
+    }
+
+    #[test]
+    fn a_probe_that_finds_no_content_declares_the_transmission_lost() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        send(&mut l, 1, t0);
         assert_eq!(
-            l.stats().acked_after_declared_lost,
-            1,
-            "and must not double-count"
+            l.declare_lost_by_pto(1).map(|t| t.key),
+            Some(EmitKey::new(1, 0, 0, 0))
         );
+        assert_eq!(l.stats().lost_pto, 1);
+        assert!(l.declare_lost_by_pto(1).is_none());
+        assert!(matches!(l.resolve(1), Some(Resolution::Late(_))));
     }
 
     #[test]
@@ -619,26 +811,10 @@ mod tests {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(8);
         for ws in 0..40u32 {
-            l.record(
-                ws,
-                t0,
-                Transmission {
-                    emit_us: 0,
-                    wire_bytes: 1,
-                    key: EmitKey::new(ws, 0, 0, 0),
-                    depart_us: None,
-                },
-            );
-            l.mark_departed(ws, t0, 0);
-            let _ = l.expire(t0 + Duration::from_millis(300), Duration::from_millis(100));
+            send(&mut l, ws, t0);
+            let _ = l.declare_lost_by_pto(ws);
         }
-        assert!(
-            l.tombstone_len() <= 8,
-            "tombstones must be bounded by capacity; got {}",
-            l.tombstone_len()
-        );
-        // The most recent expiry must still be resolvable -- eviction drops
-        // the oldest, which is the one least likely to still be in flight.
+        assert!(l.tombstone_len() <= 8, "got {}", l.tombstone_len());
         assert!(matches!(l.resolve(39), Some(Resolution::Late(_))));
     }
 
@@ -662,35 +838,21 @@ mod tests {
         assert_eq!(l.stats().capacity_evictions, 1);
     }
 
+    /// A transmission still queued is on no clock and in no ordering.
     #[test]
     fn a_transmission_that_has_not_departed_is_never_declared_lost() {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(64);
         l.record(1, t0, tx(1));
-        l.record(2, t0, tx(2));
-        let lost = l.expire(t0 + Duration::from_secs(3600), Duration::from_millis(1));
-        assert!(lost.is_empty(), "queued transmissions are not on the clock");
+        send(&mut l, 2, t0);
+        for ws in 3..10 {
+            send(&mut l, ws, t0);
+        }
+        assert!(l.resolve(9).is_some());
+        let lost = lost_ws(&l.detect_losses(FAR));
+        assert!(!lost.contains(&1), "{lost:?}");
         assert_eq!(l.stats().expired_before_departure, 0);
-        assert_eq!(l.len(), 2, "and they are still outstanding");
-    }
-
-    #[test]
-    fn the_loss_clock_starts_at_departure_not_at_recording() {
-        let t0 = Instant::now();
-        let mut l = TransmissionLedger::new(64);
-        l.record(1, t0, tx(1));
-        // Sat in a queue for 400 ms, then left.
-        let left = t0 + Duration::from_millis(400);
-        assert!(l.mark_departed(1, left, 400_000));
-        let horizon = Duration::from_millis(200);
-        assert!(
-            l.expire(t0 + Duration::from_millis(500), horizon)
-                .is_empty(),
-            "100 ms on the wire is inside the 200 ms horizon, however long it queued"
-        );
-        let lost = l.expire(t0 + Duration::from_millis(601), horizon);
-        assert_eq!(lost, vec![departed(1, 400_000)]);
-        assert_eq!(l.stats().expired_before_departure, 0);
+        assert_eq!(l.departed(1), Some(false));
     }
 
     #[test]
@@ -700,13 +862,14 @@ mod tests {
         assert!(!l.mark_departed(9, t0, 1), "unknown wire_seq");
         l.record(9, t0, tx(9));
         assert!(l.mark_departed(9, t0, 1));
-        assert!(!l.mark_departed(9, t0 + Duration::from_secs(1), 2), "twice");
+        assert!(!l.mark_departed(9, t0 + 1000 * MS, 2), "twice");
         assert_eq!(l.departed(9), Some(true));
         assert_eq!(l.stats().departures_stamped, 1);
         assert!(matches!(
             l.resolve(9),
             Some(Resolution::Live(Transmission {
                 depart_us: Some(1),
+                dep_idx: Some(0),
                 ..
             }))
         ));
@@ -740,13 +903,63 @@ mod tests {
         }
         assert!(
             l.order.len() <= l.len() + 2 * cap + 64 + 1,
-            "recording order grew to {}",
+            "{}",
             l.order.len()
         );
         assert!(
             l.departed_order.len() <= l.len() + 2 * cap + 64 + 1,
-            "departure order grew to {}",
+            "{}",
             l.departed_order.len()
         );
+    }
+
+    // The invariant the whole design rests on: across any interleaving of
+    // sending, acknowledging (in any order) and detecting, a transmission is
+    // classified **exactly once** as received or lost, and a lost one is
+    // received at most once more, as Late.
+    proptest::proptest! {
+        #[test]
+        fn every_transmission_is_classified_exactly_once(
+            ops in proptest::collection::vec((0u8..3, 0u32..40), 1..300)
+        ) {
+            use std::collections::HashSet;
+            let t0 = Instant::now();
+            let mut l = TransmissionLedger::new(8192);
+            let mut outstanding: HashSet<u32> = HashSet::new();
+            let mut lost: HashSet<u32> = HashSet::new();
+            let mut next_ws = 0u32;
+            let mut now = t0;
+            for (op, arg) in ops {
+                now += MS;
+                match op {
+                    0 => {
+                        send(&mut l, next_ws, now);
+                        outstanding.insert(next_ws);
+                        next_ws += 1;
+                    }
+                    1 => {
+                        let ws = arg % next_ws.max(1);
+                        match l.resolve(ws) {
+                            Some(Resolution::Live(_)) => {
+                                proptest::prop_assert!(outstanding.remove(&ws), "live ack of non-outstanding");
+                            }
+                            Some(Resolution::Late(_)) => {
+                                proptest::prop_assert!(lost.remove(&ws), "late ack of non-lost");
+                            }
+                            None => {}
+                        }
+                    }
+                    _ => {
+                        for (ws, _, _) in l.detect_losses(5 * MS) {
+                            proptest::prop_assert!(outstanding.remove(&ws), "verdict on non-outstanding {}", ws);
+                            proptest::prop_assert!(lost.insert(ws));
+                        }
+                    }
+                }
+            }
+            // Nothing outstanding is also lost.
+            proptest::prop_assert!(outstanding.is_disjoint(&lost));
+            proptest::prop_assert_eq!(l.len(), outstanding.len());
+        }
     }
 }

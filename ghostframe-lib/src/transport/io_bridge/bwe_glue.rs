@@ -4,7 +4,7 @@
 //!
 //! Owns, as logic over `IoBridge` fields that stay in `io_bridge.rs`:
 //! - the loss signal: `transmission_ledger` expiry (`expire_transmissions`,
-//!   `loss_horizon`, `live_path_rtt`, `select_live_rtt`), `pending_losses`,
+//!   `loss_path`, `live_path_rtt`, `select_live_rtt`), `pending_losses`,
 //!   `loss_window` and `adaptation_context.loss_rate` (`refresh_loss_rate`);
 //! - path-stats sampling (`sample_all_path_stats`,
 //!   `apply_path_stats_snapshot`), which writes `adaptation_context`
@@ -207,25 +207,6 @@ pub(super) struct PendingLoss {
 /// against a horizon measured in hundreds of milliseconds. The cap is a
 /// backstop against a peer that stops acknowledging, not the normal bound.
 pub(super) const TRANSMISSION_LEDGER_CAPACITY: usize = 16_384;
-
-/// Loss horizon bounds. An unacknowledged transmission is declared lost after
-/// `clamp(LOSS_HORIZON_RTTS x smoothed_rtt, FLOOR, CEIL)`.
-///
-/// Adaptive because the spread is too wide for one number: measured RTT on
-/// this system runs from ~20 ms on a clean link to 147 ms through the
-/// bufferbloated wifi bottleneck.
-///
-/// The floor covers the client's 5 ms ACK batching plus a batch interval,
-/// which is RTT-independent and does not shrink on a fast link.
-///
-/// The ceiling bounds a perverse coupling: under bufferbloat RTT inflates
-/// *because of* the congestion being detected, which would stretch the
-/// horizon exactly when loss should be reported fastest.
-pub(super) const LOSS_HORIZON_RTTS: u32 = 3;
-
-pub(super) const LOSS_HORIZON_FLOOR: std::time::Duration = std::time::Duration::from_millis(60);
-
-pub(super) const LOSS_HORIZON_CEIL: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// Visual-importance tier of a CDF53 pass.
 /// - Critical: passes 0-3 — LL3 sub-band + first 3 bit-planes. Carry
@@ -591,33 +572,72 @@ impl IoBridge {
         self.pending_losses_retracted += (before - self.pending_losses.len()) as u64;
     }
 
-    /// Declare lost everything outstanding past the horizon, and bring the
+    /// Declare lost what the acknowledgements received so far put out of
+    /// contention (packet and time threshold, RFC 9002 section 6.1), queue one
+    /// retransmission for each whose content is still current, and bring the
     /// loss rate up to date.
     ///
-    /// This is the complete loss signal: it does not care whether the
-    /// content was superseded, which is precisely what NACK- and RTO-derived
-    /// signals could not see.
+    /// This is the complete loss signal: it does not care whether the content
+    /// was superseded, which is precisely what NACK- and RTO-derived signals
+    /// could not see. It replaces the 3 x RTT horizon, which declared a loss
+    /// for anything the clock called overdue, whether the path was dropping or
+    /// only queueing.
     pub(super) fn expire_transmissions(&mut self, now: std::time::Instant) {
-        let horizon = self.loss_horizon();
-        let expired = self.transmission_ledger.expire_with_seq(now, horizon);
-        if crate::transport::reliable_emitter::rto_probe_enabled() && !expired.is_empty() {
-            eprintln!(
-                "RTOPROBE expire n={} horizon_us={}",
-                expired.len(),
-                horizon.as_micros()
-            );
+        let out = crate::transport::loss_path::detect(
+            &mut self.transmission_ledger,
+            &mut self.reliable_emitter,
+        );
+        self.instr.losses_declared += out.lost.len() as u64;
+        self.instr.loss_retx_requested += out.retx_queued;
+        for (wire_seq, tx) in out.lost {
+            self.report_loss(wire_seq, tx);
         }
-        self.instr.losses_declared += expired.len() as u64;
-        for (wire_seq, tx) in expired {
-            // The loss is reported against the moment the datagram went out,
-            // the same clock the acknowledgements' send times are on, not the
-            // moment it was built.
-            self.pending_losses.push(PendingLoss {
-                wire_seq,
-                emit_us: tx.depart_us.unwrap_or(tx.emit_us),
-                wire_bytes: tx.wire_bytes,
-            });
-            self.loss_window.record(tx.emit_us as u32, true);
+        self.refresh_loss_rate(now);
+    }
+
+    /// Feed one loss verdict to the estimators: the pending list (flushed to
+    /// goog_cc with the next acknowledgement) and the sender-side loss window.
+    fn report_loss(
+        &mut self,
+        wire_seq: u32,
+        tx: crate::transport::transmission_ledger::Transmission,
+    ) {
+        // The loss is reported against the moment the datagram went out, the
+        // same clock the acknowledgements' send times are on, not the moment
+        // it was built.
+        self.pending_losses.push(PendingLoss {
+            wire_seq,
+            emit_us: tx.depart_us.unwrap_or(tx.emit_us),
+            wire_bytes: tx.wire_bytes,
+        });
+        self.loss_window.record(tx.emit_us as u32, true);
+    }
+
+    /// Declare `wire_seqs` lost as a verdict would, for a test that is about
+    /// what a loss does afterwards, not about finding one.
+    #[cfg(test)]
+    pub(crate) fn declare_lost_for_test(&mut self, wire_seqs: &[u32]) {
+        for ws in wire_seqs {
+            if let Some(tx) = self.transmission_ledger.declare_lost_by_pto(*ws) {
+                self.instr.losses_declared += 1;
+                self.report_loss(*ws, tx);
+            }
+        }
+    }
+
+    /// Run the probe timeout if it is due (see `loss_path::probe`).
+    pub(super) fn poll_pto(&mut self, now: std::time::Instant) {
+        let Some(out) = crate::transport::loss_path::probe(
+            &mut self.transmission_ledger,
+            &mut self.reliable_emitter,
+            now,
+        ) else {
+            return;
+        };
+        self.instr.pto_probes_requested += out.retx_queued;
+        self.instr.losses_declared += out.lost.len() as u64;
+        for (wire_seq, tx) in out.lost {
+            self.report_loss(wire_seq, tx);
         }
         self.refresh_loss_rate(now);
     }
@@ -661,18 +681,13 @@ impl IoBridge {
                 wire_bytes: 1200,
                 key,
                 depart_us: None,
+                dep_idx: None,
             },
         );
     }
 
-    /// How long an unacknowledged transmission waits before being declared
-    /// lost. See `LOSS_HORIZON_RTTS` and friends for why this adapts, and why
-    /// it is bounded at both ends.
-    ///
-    /// Sourced from quinn's measured path RTT rather than the estimator's
-    /// derived one: the derived value is downstream of the very feedback this
-    /// horizon governs, and `GoogCcDriver::note_path_rtt` already exists
-    /// because that derivation has been seen to go implausible.
+    /// quinn's measured path RTT for the HELLO'd connection. Used to give the
+    /// goog_cc estimator a plausibility reference.
     pub(super) fn live_path_rtt(&self) -> Option<std::time::Duration> {
         select_live_rtt(
             self.last_hello_from,
@@ -681,11 +696,6 @@ impl IoBridge {
                 .iter()
                 .map(|(h, c)| (*h, c.stats().path.rtt)),
         )
-    }
-
-    pub(super) fn loss_horizon(&self) -> std::time::Duration {
-        let rtt = self.live_path_rtt().unwrap_or(LOSS_HORIZON_FLOOR);
-        (rtt * LOSS_HORIZON_RTTS).clamp(LOSS_HORIZON_FLOOR, LOSS_HORIZON_CEIL)
     }
 
     /// Hand the estimator what the hint window decided. See

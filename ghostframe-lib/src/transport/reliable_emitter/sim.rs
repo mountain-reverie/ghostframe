@@ -80,6 +80,7 @@ fn key_from_datagram(dg: &[u8]) -> Option<EmitKey> {
 
 struct Sim {
     emitter: ReliableTileEmitter,
+    ledger: crate::transport::transmission_ledger::TransmissionLedger,
     delivered: Rc<RefCell<Vec<Vec<u8>>>>,
     sender: LossSender,
     t: Instant,
@@ -95,6 +96,7 @@ impl Sim {
         emitter.rtt.on_sample(Duration::from_millis(20));
         Self {
             emitter,
+            ledger: crate::transport::transmission_ledger::TransmissionLedger::new(16_384),
             sender: LossSender {
                 delivered: delivered.clone(),
                 rng: DetRng::new(seed),
@@ -104,21 +106,51 @@ impl Sim {
             t,
         }
     }
-    /// Drain freshly-delivered datagrams from the loss sender and feed
-    /// matching ACKs back to the emitter — models a perfect-RTT client
-    /// that ACKs every received tile-pass. Without this feedback loop the
-    /// RTO wheel would fire spurious retransmits even on a clean wire.
-    fn ack_delivered(&mut self) {
-        let mut delivered = self.delivered.borrow_mut();
-        let keys: Vec<EmitKey> = delivered
-            .iter()
-            .filter_map(|dg| key_from_datagram(dg))
-            .collect();
-        delivered.clear();
-        drop(delivered);
-        if !keys.is_empty() {
-            self.emitter.on_ack(&keys);
+    /// Put what the emitter built on the books and on the wire.
+    fn book_departures(&mut self) {
+        use crate::transport::transmission_ledger::Transmission;
+        for em in self.emitter.take_transmissions() {
+            self.ledger.record(
+                em.wire_seq,
+                self.t,
+                Transmission {
+                    emit_us: em.emit_us,
+                    wire_bytes: em.wire_bytes,
+                    key: em.key,
+                    depart_us: None,
+                    dep_idx: None,
+                },
+            );
+            self.ledger.mark_departed(em.wire_seq, self.t, 0);
+            self.emitter.on_departed(em.wire_seq, self.t);
         }
+    }
+    /// Drain freshly-delivered datagrams from the loss sender and acknowledge
+    /// each by its transmission, as the client does: a perfect-RTT client that
+    /// acknowledges every received tile datagram. Then run the loss path.
+    fn ack_delivered(&mut self) {
+        use crate::transport::transmission_ledger::Resolution;
+        self.book_departures();
+        let mut delivered = self.delivered.borrow_mut();
+        let dgs: Vec<Vec<u8>> = std::mem::take(&mut *delivered);
+        drop(delivered);
+        for dg in dgs {
+            if key_from_datagram(&dg).is_none() || dg.len() < 12 {
+                continue;
+            }
+            let ws = u32::from_be_bytes(dg[8..12].try_into().unwrap());
+            match self.ledger.resolve(ws) {
+                Some(Resolution::Live(tx)) | Some(Resolution::Late(tx)) => {
+                    self.emitter.note_ack_origin(tx.key, ws);
+                    self.emitter.on_ack(&[tx.key]);
+                    self.emitter.rtt.on_sample(Duration::from_millis(20));
+                    self.emitter.note_ack(self.t);
+                }
+                None => {}
+            }
+        }
+        let _ = crate::transport::loss_path::detect(&mut self.ledger, &mut self.emitter);
+        let _ = crate::transport::loss_path::probe(&mut self.ledger, &mut self.emitter, self.t);
     }
     fn submit_many(&mut self, n: u32) {
         for i in 0..n {
@@ -135,6 +167,7 @@ impl Sim {
     }
     fn advance(&mut self, dt: Duration) {
         self.t += dt;
+        self.ack_delivered();
         self.emitter.tick(self.t, usize::MAX);
         self.emitter.drain(&mut self.sender, self.t);
         self.ack_delivered();
@@ -160,7 +193,7 @@ fn sim_low_loss_5pct() {
         sim.advance(Duration::from_millis(100));
     }
     // At 5% loss with FEC + retransmit, near-100% delivery within a
-    // few RTO windows. The emitter doesn't track delivered count; we
+    // few round trips. The emitter doesn't track delivered count; we
     // approximate it via cache.len() (entries still pending) being small.
     assert!(
         sim.emitter.cache.len() < 50,

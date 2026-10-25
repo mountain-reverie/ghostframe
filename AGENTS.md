@@ -135,7 +135,7 @@ Env-gated, off by default:
   order, on target `ghostframe::ackorder`. Replaying an RFC 9002
   packet-threshold rule against that order says whether ordering-based loss
   inference is usable on a path.
-- `GHOSTFRAME_NO_RTO=1` — disables the emitter's RTO timer only, leaving the
+- `GHOSTFRAME_NO_RTO=1` — disables the loss-path and probe-timeout retransmissions only, leaving the
   cache and NACK path intact. Useful for attributing a retransmission to its
   mechanism.
 
