@@ -20,7 +20,8 @@ use std::time::Duration;
 use ghostframe_client_net::ClientNetEvent;
 use ghostframe_e2e::harness::browserless::FrameScript;
 use ghostframe_e2e::harness::browserless::{
-    run_browserless_with_links, BrowserlessResult, BrowserlessScene, LinkOverrides, SceneLoad,
+    run_browserless_with_links, run_browserless_with_options, BrowserlessResult, BrowserlessScene,
+    LinkOverrides, RunOptions, SceneLoad,
 };
 use ghostframe_e2e::harness::load_profile::{
     gradient_tile, Churn, LoadProfile, PRODUCTION_CADENCE_US,
@@ -240,18 +241,18 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
 }
 
 /// P3 gate: the ledger never declares a transmission lost while it is still
-/// queued (the loss clock starts at departure).
+/// queued (loss is judged on departure index and departure time).
 ///
 /// What the counter guards: `expired_before_departure` is read from the
 /// record at the moment of a verdict. It is zero by construction of the
-/// departure-ordered walk in `expire_with_seq`; it does not exercise the
+/// departure-ordered walk in `detect_losses_at`; it does not exercise the
 /// tracker (that rests on the real-quinn proptest in `departure.rs`). It
 /// goes positive if the walk returns to recording order (the mutation
 /// recorded in the PR: 172 at burst 2 %, failing the assertion below), and
 /// only when queued transmissions are in the FIFO and verdicts are issued,
 /// which is what the premises establish. The FIFO must have been non-empty,
-/// departures stamped, timers started by them, and (on lossy runs) the clock
-/// must really have issued verdicts, or the zero proves nothing.
+/// departures stamped, and (on lossy runs) the detector must really have issued
+/// verdicts, or the zero proves nothing.
 fn assert_p3(n: &str, r: &BrowserlessResult, lossy: bool) {
     let i = &r.transport.instr;
     assert!(
@@ -1009,46 +1010,61 @@ fn repair_bill(r: &BrowserlessResult) -> RepairBill {
     }
 }
 
-/// P5a: a lossy screen is repaired, once. Over five seeds of 2 % i.i.d. loss
-/// and of 2 % Gilbert-Elliott loss (mean burst 8), each on one full-grid CDF
+/// P5a: a lossy screen is repaired, once. Over five seeds of 5 % i.i.d. loss
+/// and of 5 % Gilbert-Elliott loss (mean burst 8), each on one full-grid CDF
 /// 5/3 frame followed by silence:
 ///
 /// - **Structural** (counters that must be exactly zero or all-present): every
 ///   tile is on the client's screen, the retransmit cache is empty at the end
-///   (nothing sent was left without a repair that arrived), and nothing was
-///   retired by the 30 s backstop. A transmission lost with current content
-///   and never retransmitted would sit in the cache for ever.
+///   (nothing sent was left without a repair that arrived), nothing is declared
+///   lost by the probe (no superseded content in this scene), and at least 80 %
+///   of the retransmissions are the threshold detector's. A transmission lost
+///   with current content and never retransmitted would sit in the cache for
+///   ever.
 /// - **Margin-argued**: retransmissions per datagram the client saw missing
 ///   (`lost_pre_fec`, datagram-level: one lost QUIC packet carries several)
-///   is at most `RATIO_BOUND`.
+///   is at most `RATIO_BOUND` (measured 1.033 pooled, 1.097 worst run).
 ///
 /// Re-measured baselines on the sweep scene family (15 runs per row, sweep
 /// `burst_loss_report_over_three_seeds`): the PR-3 base 0.86, PR-4 1.03 (RTO
 /// and NACK both repair the same loss). The design's 2.7 to 26 was the #225
 /// loop and the unbounded FIFO.
+///
+/// The client's own gap NACKs repair what they can see, so with the detector
+/// off the ratio and the latency barely move (0.968, same latencies); the
+/// detector-share premise is what bites there. The `_alone` twin below drops
+/// every client NACK at the server and measures the detector and the probe
+/// by themselves.
 const RATIO_BOUND: f64 = 1.2;
 
-#[tokio::test(start_paused = true)]
-async fn p5a_a_lost_datagram_is_repaired_about_once_and_nothing_is_stranded() {
+async fn p5a(ignore_client_nacks: bool) -> (u64, u64, u64, u64) {
     const P5_RATE: f64 = 0.05;
     let ge = GilbertElliott::from_rate_and_burst(P5_RATE, BURST, 1.0).expect("feasible");
-    let (mut lost, mut retx, mut loss_repairs) = (0u64, 0u64, 0u64);
+    let (mut lost, mut retx, mut loss_repairs, mut by_nack) = (0u64, 0u64, 0u64, 0u64);
     for i in 0..5u64 {
         let seed = 0xB0_B057 ^ (i * 0x100);
         for (model, links) in [
             ("iid5%", s2c_only(|p| p.loss = P5_RATE)),
             ("burst5%", s2c_only(|p| ge.apply_to(p))),
         ] {
-            let r = run_browserless_with_links(p5_scene(seed, 10), links)
-                .await
-                .expect("scene ran");
+            let r = run_browserless_with_options(
+                p5_scene(seed, 10),
+                links,
+                RunOptions {
+                    ignore_client_nacks,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("scene ran");
             let n = format!("{model}@{seed:#x}");
             assert_established(&n, &r);
             let b = repair_bill(&r);
             println!(
-                "P5A {n}: lost_datagrams={} retransmits={} (loss={} probe={} nack={}) ratio={:.3} \
-                 cache_left={} tiles={} stale={} verdicts={} spurious={} k_pkt={} pto_fires={} \
-                 critical_lat_mean_us={} max_us={}",
+                "P5A{} {n}: lost_datagrams={} retransmits={} (loss={} probe={} nack={}) ratio={:.3} \
+                 cache_left={} tiles={} stale={} verdicts={} spurious={} fec_possible={} k_pkt={} pto_fires={} \
+                 critical_lat_mean_us={} max_us={} queued_crit_mean_us={}",
+                if ignore_client_nacks { "_ALONE" } else { "" },
                 b.lost_datagrams,
                 b.retransmits,
                 b.by_loss,
@@ -1058,15 +1074,15 @@ async fn p5a_a_lost_datagram_is_repaired_about_once_and_nothing_is_stranded() {
                 r.emitter_cache_entries,
                 tiles_present(&r),
                 r.stale_generation_tiles,
-                r.transport.instr.loss_by_packet_threshold
-                    + r.transport.instr.loss_by_time_threshold,
+                r.transport.instr.loss_by_packet_threshold + r.transport.instr.loss_by_time_threshold,
                 r.transport.instr.ledger_spurious_losses,
+                r.transport.instr.late_acks_fec_possible,
                 r.transport.instr.k_pkt,
                 r.transport.instr.pto_fires,
                 r.critical_latency_mean_us,
                 r.critical_latency_max_us,
+                r.queued_critical_latency_mean_us,
             );
-            loss_repairs += b.by_loss;
             assert_eq!(
                 tiles_present(&r),
                 (COLS * ROWS) as usize,
@@ -1076,23 +1092,50 @@ async fn p5a_a_lost_datagram_is_repaired_about_once_and_nothing_is_stranded() {
                 r.emitter_cache_entries, 0,
                 "{n}: passes left in the retransmit cache: sent, never acknowledged"
             );
-            assert_eq!(r.transport.instr.loss_by_pto, 0, "{n}");
             lost += b.lost_datagrams;
             retx += b.retransmits;
+            loss_repairs += b.by_loss;
+            by_nack += b.by_nack;
         }
     }
+    (lost, retx, loss_repairs, by_nack)
+}
+
+#[tokio::test(start_paused = true)]
+async fn p5a_a_lost_datagram_is_repaired_about_once_and_nothing_is_stranded() {
+    let (lost, retx, loss_repairs, _) = p5a(false).await;
     let ratio = retx as f64 / lost as f64;
     println!("P5A pooled: retransmits={retx} lost_datagrams={lost} ratio={ratio:.3}");
     assert!(lost >= 500, "premise: only {lost} missing datagrams");
-    // Who repaired it. The client's own gap NACKs also repair a loss they
-    // can see, so with the threshold detector switched off the ratio and the
-    // latency below do not move (measured: ratio 0.968, the same latencies);
-    // what moves is the cause: no repair at all comes from the detector, and
-    // the client's NACKs and the probe do the work. Measured with it on: 1302
-    // of 1445 retransmissions (90 %) are the detector's; off, 0.
+    // Who repaired it. Measured with the detector on: 1302 of 1445
+    // retransmissions (90 %) are the detector's; off, 0.
     assert!(
         loss_repairs * 100 >= retx * 80,
         "the threshold detector made {loss_repairs} of {retx} retransmissions"
+    );
+    assert!(
+        ratio <= RATIO_BOUND,
+        "{retx} retransmissions for {lost} missing datagrams: {ratio:.3} > {RATIO_BOUND}"
+    );
+}
+
+/// P5a with every client NACK dropped at the server: the detector and the
+/// probe by themselves. Nothing may be stranded and the ratio holds; the repair
+/// is the detector's (>= 90 %), the rest the probe's. With the detector off
+/// only the probe is left and the cache does not drain in the scene's 10 s (the
+/// mutation recorded in the PR).
+#[tokio::test(start_paused = true)]
+async fn p5a_alone_the_detector_and_the_probe_repair_everything_without_the_client() {
+    let (lost, retx, loss_repairs, by_nack) = p5a(true).await;
+    let ratio = retx as f64 / lost as f64;
+    println!(
+        "P5A_ALONE pooled: retransmits={retx} lost_datagrams={lost} ratio={ratio:.3} detector={loss_repairs}"
+    );
+    assert_eq!(by_nack, 0, "premise: the client's NACKs were dropped");
+    assert!(lost >= 500, "premise: only {lost} missing datagrams");
+    assert!(
+        loss_repairs * 100 >= retx * 90,
+        "the detector made {loss_repairs} of {retx} retransmissions"
     );
     assert!(
         ratio <= RATIO_BOUND,
@@ -1165,4 +1208,131 @@ async fn p5_a_lost_only_datagram_on_a_static_screen_is_repaired_by_the_probe_on_
         "repaired {} us after the send; the PTO is 1004 ms",
         r.queued_critical_latency_mean_us
     );
+}
+
+/// The probe is a wake deadline, at scene level: one Solid tile, its only
+/// datagram dropped, a static screen and a harness heartbeat only every three
+/// seconds. The repair must land one PTO plus a round trip after the send
+/// (1004 + 40 ms), not at the next heartbeat. Without `pto` in
+/// `next_wake_deadline` the event loop sleeps until the heartbeat (the
+/// mutation recorded in the PR) and the repair slips to about three seconds.
+#[tokio::test(start_paused = true)]
+async fn p5_wake_the_probe_fires_on_time_when_nothing_else_wakes_the_loop() {
+    let mut sc = scene(0xB0_B057, 8);
+    sc.cadence_us = 3_000_000;
+    sc.load = SceneLoad::Script(vec![FrameScript {
+        tiles: vec![(
+            (1, 1),
+            TileSpec::Solid {
+                bgra: [10, 20, 30, 255],
+            },
+        )],
+    }]);
+    sc.drops = DropPlan::new(vec![DropRule {
+        tile_x: 1,
+        tile_y: 1,
+        occurrences: vec![0],
+    }]);
+    let r = run_browserless_with_links(sc, LinkOverrides::default())
+        .await
+        .expect("scene ran");
+    println!(
+        "P5WAKE drops_fired={:?} pto_fires={} probe_retx={} queued_critical_lat_us={} tile_present={}",
+        r.drops_fired,
+        r.transport.instr.pto_fires,
+        r.transport.instr.pto_probe_retransmits,
+        r.queued_critical_latency_mean_us,
+        r.framebuffer.tile_rgba(1, 1).is_some()
+    );
+    assert_eq!(
+        r.drops_fired,
+        vec![1],
+        "premise: the only datagram was dropped"
+    );
+    assert!(r.framebuffer.tile_rgba(1, 1).is_some(), "never repaired");
+    assert_eq!(r.transport.instr.pto_probe_retransmits, 1);
+    assert!(
+        (1_000_000..1_300_000).contains(&r.queued_critical_latency_mean_us),
+        "repaired {} us after the send: the PTO plus a round trip is about 1.05 s, the next \
+         heartbeat 3 s",
+        r.queued_critical_latency_mean_us
+    );
+}
+
+/// Seed 0x22 under PR-9's suspicion (a missing wake term strands tiles): the
+/// churning screen of `scene()` for 5 s, then silence, over 2 % burst loss and
+/// 2 % / 5 % i.i.d. loss, 20 s in all. Everything the server owes is in the
+/// first 5 s. At the end:
+///
+/// - i.i.d. loss: every pass has been acknowledged (the retransmit cache is
+///   empty) and every tile is on screen;
+/// - burst loss: whatever is still owed is sitting in quinn's datagram FIFO, not
+///   in the server's hands.
+///
+/// What this found. The burst case at seed 0x22 leaves 24 to 33 passes owed
+/// however long the scene runs, and it is not the server: all of them are in
+/// quinn's FIFO (72 datagrams, `sent_packets` frozen) while quinn waits for its
+/// own loss-recovery timer, 5.6 s away at t = 7.6 s and doubling. The netsim's
+/// Gilbert-Elliott chain advances per datagram, not per second, so once a burst
+/// has begun the link stays dead until about eight more datagrams have been
+/// offered, and quinn's backed-off probes offer one every few seconds: each dies
+/// and the timer doubles. A real burst ends with time. Nothing the emitter or the
+/// ledger does can move a datagram out of quinn's FIFO, the server's own probe
+/// had nothing left to find (7 fires, no outstanding departure), and removing
+/// the probe and loss-time terms from `next_wake_deadline` changes nothing here
+/// (measured: identical counters), so a missing wake term is not the cause of
+/// this strand.
+#[tokio::test(start_paused = true)]
+async fn p5_seed_0x22_converges_once_the_churn_stops() {
+    let ge = GilbertElliott::from_rate_and_burst(RATE, BURST, 1.0).expect("feasible");
+    for seed in [0x22u64, 0xB0_B057] {
+        for (model, links) in [
+            ("iid2%", s2c_only(|p| p.loss = 0.02)),
+            ("iid5%", s2c_only(|p| p.loss = 0.05)),
+            ("burst2%", s2c_only(|p| ge.apply_to(p))),
+        ] {
+            let mut sc = scene(seed, 20);
+            let profile = LoadProfile {
+                cadence_us: PRODUCTION_CADENCE_US,
+                churn: Churn::Region { tiles_per_tick: 32 },
+            };
+            sc.load = SceneLoad::Script(profile.frames_for(
+                Duration::from_secs(5),
+                COLS as u8,
+                ROWS as u8,
+            ));
+            let r = run_browserless_with_links(sc, links)
+                .await
+                .expect("scene ran");
+            println!(
+                "P5SEED22 seed={seed:#x} {model}: dropped={} retx={} cache_left={} tiles={} nack_hit={} pto_fires={}",
+                r.s2c_datagrams_dropped,
+                r.retransmit_attempts_total,
+                r.emitter_cache_entries,
+                tiles_present(&r),
+                r.nack_hit,
+                r.transport.instr.pto_fires
+            );
+            assert!(r.s2c_datagrams_dropped > 0, "{seed:#x} {model}: premise");
+            let in_quinn =
+                r.transport.instr.quinn_bytes_enqueued - r.transport.instr.quinn_bytes_departed;
+            if model == "burst2%" {
+                assert!(
+                    r.emitter_cache_entries == 0 || in_quinn > 0,
+                    "{seed:#x} {model}: {} passes owed and nothing in quinn's FIFO: the server is holding them",
+                    r.emitter_cache_entries
+                );
+            } else {
+                assert_eq!(
+                    r.emitter_cache_entries, 0,
+                    "{seed:#x} {model}: passes still owed 15 s after the churn stopped"
+                );
+                assert_eq!(
+                    tiles_present(&r),
+                    (COLS * ROWS) as usize,
+                    "{seed:#x} {model}: tiles missing"
+                );
+            }
+        }
+    }
 }

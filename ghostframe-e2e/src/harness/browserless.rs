@@ -198,6 +198,9 @@ pub struct BrowserlessScene {
 /// default changes nothing, so every existing scene is bit-identical.
 #[derive(Clone, Copy, Default)]
 pub struct RunOptions {
+    /// Drop every client tile NACK at the server: measures the server's own
+    /// repair (threshold loss and the probe) with no help from the client.
+    pub ignore_client_nacks: bool,
     /// Hold the server's event loop this long (virtual time) for every real
     /// scene frame, inline, before it is applied. Models `process_frame`
     /// running on the loop: see `InjectedFrame::cost`.
@@ -948,6 +951,7 @@ async fn run_inner(
     let drop_plan_cell =
         std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut scene.drops)));
     bridge.set_drop_plan(drop_plan_cell.clone());
+    bridge.set_ignore_tile_nacks(opts.ignore_client_nacks);
     if let Some(floor) = scene.tick_budget_floor_bytes {
         bridge.set_tick_budget_floor_bytes(floor);
     }
