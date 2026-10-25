@@ -589,6 +589,22 @@ async fn burst_loss_report_over_three_seeds() {
                 b.ceiling_lifts_blocked_queue,
                 b.ceiling_reseeds_skipped_gap
             );
+            println!(
+                "LATENCY {name}: critical n={} mean_us={} max_us={} refinement n={} mean_us={} max_us={} retx_B[nack={} rto={}] rto_original_first={}",
+                r.critical_latency_count,
+                r.critical_latency_mean_us,
+                r.critical_latency_max_us,
+                r.refinement_latency_count,
+                r.refinement_latency_mean_us,
+                r.refinement_latency_max_us,
+                r.transport.instr.offered.of(
+                    ghostframe_lib::transport::reliable_emitter::emission_queue::WireClass::NackRepair
+                ),
+                r.transport.instr.offered.of(
+                    ghostframe_lib::transport::reliable_emitter::emission_queue::WireClass::RtoRetransmit
+                ),
+                r.rto_original_first,
+            );
             let (ready, distinct, refinements) = content_delivered(r);
             println!(
                 "CONTENT {name}: tile_ready={ready} distinct_tile_frames={distinct} refinement_updates={refinements} s2c_bytes={} bytes_per_distinct_tile_frame={:.0}",
@@ -834,5 +850,84 @@ async fn p2b_quinn_is_never_left_idle_while_admission_holds_work() {
             a.backlog_turns
         );
         assert!(r.transport.instr.budget.gate_depth > 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F4 gate (D1 PR-4): the retransmission timer is a measured probe timeout.
+// ---------------------------------------------------------------------------
+
+/// P4: under 2 % i.i.d. loss the share of RTO fires that were for data that
+/// had in fact arrived (`rto_original_first`: the pass was first acknowledged
+/// through its original, the Eifel test) stays at or under 10 % on each of five
+/// seeds, and a clean link fires no timer at all.
+///
+/// Why i.i.d. and why this counter. `rto_spurious` takes a spurious verdict
+/// back when the retransmission is acknowledged too, which it nearly always is
+/// (every duplicate is acknowledged), so it read 0 on every base run and could
+/// not tell a bad timer from a good one; the design's 0.68 to 0.75 was the
+/// retransmit loop of #225. `rto_original_first` is final. Re-measured on 5
+/// seeds of this scene (stepped, so exact per seed):
+///
+/// | build | share per seed | pooled |
+/// |---|---|---|
+/// | PR-3 base (p95 x 2, 150 ms floor) | 0.020 0.062 0.095 0.121 0.132 | 0.083 |
+/// | this change | 0.001 0.003 0.010 0.030 0.059 | 0.021 |
+/// | arm at enqueue, p95 x 2, 16 MiB buffer, `T_q` 500 ms | 0.667 0.887 0.905 0.935 | 0.891 |
+///
+/// The gate sits between 0.059 and 0.667 and fails the base on one seed. Burst
+/// loss (Gilbert-Elliott) is reported by the sweep but not gated: its shares are
+/// 0 to 0.77 per seed under the same mutation, so it does not separate them.
+/// The seeds are reproducible, so these are exact values, not samples.
+///
+/// Premises, asserted: each run fires at least 50 times (a share of nothing is
+/// not a share), the session carried load, the netsim dropped something.
+#[tokio::test(start_paused = true)]
+async fn p4_spurious_share_of_rto_fires_under_iid_loss() {
+    const SECS: u64 = 12;
+    let mut worst = 0.0f64;
+    for i in 0..5u64 {
+        let seed = 0xB0_B057 ^ (i * 0x100);
+        let lossy = run_browserless_with_links(scene(seed, SECS), s2c_only(|p| p.loss = RATE))
+            .await
+            .expect("scene ran");
+        let n = format!("iid2%@{seed:#x}");
+        assert_established(&n, &lossy);
+        assert!(lossy.s2c_datagrams_dropped > 0, "{n}: dropped nothing");
+        assert!(
+            lossy.rto_fired >= 50,
+            "{n}: premise: only {} RTO fires, a share of them proves nothing",
+            lossy.rto_fired
+        );
+        let share = lossy.rto_original_first as f64 / lossy.rto_fired as f64;
+        println!(
+            "P4 {n}: rto_fired={} rto_original_first={} (rto_spurious={} rto_useful={}) share={share:.4}",
+            lossy.rto_fired, lossy.rto_original_first, lossy.rto_spurious, lossy.rto_useful
+        );
+        worst = worst.max(share);
+        assert!(
+            share <= 0.10,
+            "{n}: {} of {} RTO fires were for data that arrived",
+            lossy.rto_original_first,
+            lossy.rto_fired
+        );
+    }
+    println!("P4 worst share over 5 seeds: {worst:.4}");
+    for i in 0..3u64 {
+        let seed = 0xB0_B057 ^ (i * 0x100);
+        let clean = run_browserless_with_links(scene(seed, SECS), LinkOverrides::default())
+            .await
+            .expect("scene ran");
+        let n = format!("clean@{seed:#x}");
+        assert_established(&n, &clean);
+        assert_eq!(clean.s2c_datagrams_dropped, 0, "{n}: control dropped");
+        assert!(
+            clean.transport.instr.generation_replacements > 0,
+            "{n}: premise: no tile changed, the control exercised nothing"
+        );
+        assert_eq!(
+            clean.rto_fired, 0,
+            "{n}: a timer fired on a link that dropped nothing"
+        );
     }
 }
