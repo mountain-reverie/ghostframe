@@ -372,6 +372,19 @@ use ghostframe_e2e::netsim::{DropPlan, DropRule};
 #[tokio::test(start_paused = true)]
 async fn retransmission_alone_separates_queued_from_sent() {
     let mut scene = burst_scene(8, 8, 25);
+    // A link with a round trip. On the zero-delay link this scene used, a
+    // loss was repaired (since D1 PR-5) in the same virtual instant: the
+    // acknowledgements of the datagrams sent after the lost one arrive the
+    // moment they are sent, three of them declare it lost, and its
+    // retransmission is acknowledged in the same instant, so `queued_at` and
+    // `last_sent_at` never differ. The per-pass RTO that used to make the
+    // repair take 150 ms or more is gone. What the test is about, that a
+    // retransmission moves `last_sent_at` and not `queued_at`, needs the
+    // repair to take time, as it does on any real path.
+    scene.net = NetProfile {
+        delay_us: 10_000,
+        ..NetProfile::perfect()
+    };
     // Pinned to the old flat 256 KiB budget floor. This test is about what
     // the two clocks *mean* -- a retransmit moves `last_sent_at` and leaves
     // `queued_at` alone, so the two separate -- and it needs enough
@@ -386,6 +399,11 @@ async fn retransmission_alone_separates_queued_from_sent() {
         tile_y: 2,
         occurrences: (0..40).collect(),
     }]);
+    // The same scene without the drops, as a control: the two clocks agree.
+    let mut clean_scene = burst_scene(8, 8, 25);
+    clean_scene.net = scene.net.clone();
+    clean_scene.tick_budget_floor_bytes = scene.tick_budget_floor_bytes;
+    let clean = run_browserless(clean_scene).await.expect("scene ran");
     let r = run_browserless(scene).await.expect("scene ran");
     report("retransmit_separation", &r);
 
@@ -407,19 +425,35 @@ async fn retransmission_alone_separates_queued_from_sent() {
          retransmission-driven latency separation"
     );
 
-    let observed = ratio(
-        r.queued_critical_latency_mean_us,
-        r.critical_latency_mean_us,
-    );
+    // Measured on the REFINEMENT tier, 565 samples. It used to be the critical
+    // tier (ratio ~6.9, then >2.0 asserted): the dropped tile's critical pass
+    // is one sample of 64, and since D1 PR-5 a lost pass is found by the
+    // acknowledgements of the datagrams sent after it and that sample is the
+    // one a spurious verdict leaves out (a late acknowledgement is not a
+    // latency sample), so the critical tier no longer carries the
+    // demonstration. The refinement tier does: 1.55 with the drops, 1.00
+    // without, on the same link (10 ms each way).
+    let ratio_of = |x: &BrowserlessResult| {
+        ratio(
+            x.queued_refinement_latency_mean_us,
+            x.refinement_latency_mean_us,
+        )
+    };
+    let (observed, control) = (ratio_of(&r), ratio_of(&clean));
     println!(
-        "retransmit separation: ratio={observed:.2} nack_hit={} nack_miss={} retransmits={}",
+        "retransmit separation (refinement tier): ratio={observed:.2} control={control:.2} \
+         nack_hit={} nack_miss={} retransmits={}",
         r.nack_hit, r.nack_miss, r.retransmit_attempts_total
     );
     assert!(
-        observed > 2.0,
+        control <= 1.05,
+        "the lossless control must not separate the clocks: ratio={control:.2}"
+    );
+    assert!(
+        observed > 1.3,
         "expected retransmission to separate the two clocks, but ratio={observed:.2} \
          (queued_mean={} us, wire_mean={} us)",
-        r.queued_critical_latency_mean_us,
-        r.critical_latency_mean_us
+        r.queued_refinement_latency_mean_us,
+        r.refinement_latency_mean_us
     );
 }
