@@ -220,6 +220,20 @@ fn report_transport(scene: &str, r: &BrowserlessResult) {
     );
     p6(
         scene,
+        "delivery",
+        format!(
+            "marked={} app_limited_marks={} samples={} app_limited_samples={} latest_bps={} latest_app_limited={} max_bps={}",
+            i.delivery.marked,
+            i.delivery.app_limited_marks,
+            i.delivery.samples,
+            i.delivery.app_limited_samples,
+            i.delivery.latest_bps,
+            i.delivery.latest_app_limited,
+            i.delivery.max_bps
+        ),
+    );
+    p6(
+        scene,
         "rto",
         format!(
             "fired={} spurious={} useful={}",
@@ -728,4 +742,102 @@ async fn p6a_startup_ladder_is_never_capped_full_map() {
         }
     }
     run_map(&cells).await;
+}
+
+// ---------------------------------------------------------------------------
+// PR-6b: the per-transmission delivery-rate sampler
+// ---------------------------------------------------------------------------
+
+/// A 10 Mbit link, drop-tail, with `offered_mbit` of load for `secs`.
+async fn delivery_scene(seed: u64, offered_mbit: f64, secs: u64) -> BrowserlessResult {
+    run_heavy(
+        seed,
+        CapTimeline::constant(10 * MBIT),
+        Queue::DropTail100,
+        secs,
+        offered_mbit,
+    )
+    .await
+}
+
+fn report_delivery(scene: &str, r: &BrowserlessResult) {
+    let d = &r.transport.instr.delivery;
+    let max = r
+        .delivery_rate_samples
+        .iter()
+        .map(|(_, v)| *v)
+        .max()
+        .unwrap_or(0);
+    p6(
+        scene,
+        "delivery_sampler",
+        format!(
+            "marked={} app_limited_marks={} acked={} samples={} app_limited_samples={} \
+             latest_bps={} peak_windowed_max_bps={}",
+            d.marked,
+            d.app_limited_marks,
+            d.acked,
+            d.samples,
+            d.app_limited_samples,
+            d.latest_bps,
+            max
+        ),
+    );
+}
+
+/// A sender that wants a tenth of the link never holds work back and never
+/// leaves quinn a queue, so what it sends is app-limited: the departures are
+/// marked, and the samples they produce say so. Premises are counts that are
+/// non-zero only if the wiring (F1 backlog and FIFO signals) was reached.
+#[tokio::test(start_paused = true)]
+async fn d6b_a_sender_with_little_to_send_is_marked_app_limited() {
+    let r = delivery_scene(0xD6B0_0001, 1.0, 8).await;
+    premises(&r, "d6b_sparse", 50);
+    report_delivery("d6b_sparse", &r);
+    let d = &r.transport.instr.delivery;
+    assert!(d.marked > 100, "only {} departures marked", d.marked);
+    assert!(d.samples > 20, "only {} samples", d.samples);
+    assert!(
+        d.app_limited_marks > d.marked / 2,
+        "{} of {} departures marked app-limited",
+        d.app_limited_marks,
+        d.marked
+    );
+    assert!(
+        d.app_limited_samples > d.samples / 2,
+        "{} of {} samples app-limited",
+        d.app_limited_samples,
+        d.samples
+    );
+}
+
+/// An overdriven sender has backlog throughout, so most of what it sends is
+/// not app-limited, and the sampler reads a rate: nonzero, and of the link's
+/// order (the exact figure is reported, not gated; it is PR-7's input).
+#[tokio::test(start_paused = true)]
+async fn d6b_a_saturated_sender_is_not_marked_app_limited() {
+    let r = delivery_scene(0xD6B0_0002, OVERDRIVE * 10.0, 12).await;
+    premises(&r, "d6b_saturated", 100);
+    report_delivery("d6b_saturated", &r);
+    let d = &r.transport.instr.delivery;
+    assert!(d.samples > 100, "only {} samples", d.samples);
+    assert!(
+        d.app_limited_marks < d.marked / 2,
+        "{} of {} departures marked app-limited under overload",
+        d.app_limited_marks,
+        d.marked
+    );
+    assert!(
+        d.app_limited_samples < d.samples / 2,
+        "{} of {} samples app-limited under overload",
+        d.app_limited_samples,
+        d.samples
+    );
+    let max = r
+        .delivery_rate_samples
+        .iter()
+        .map(|(_, v)| *v)
+        .max()
+        .unwrap_or(0);
+    assert!(max > 0, "the windowed maximum never rose");
 }
