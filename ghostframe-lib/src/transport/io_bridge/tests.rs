@@ -3984,34 +3984,44 @@ async fn a_priority_tile_the_emitter_still_holds_is_not_re_emitted_by_the_schedu
     assert!(bridge.reliable_emitter.holds_pass(2, 1, 0));
 }
 
-/// The scheduler's retry gate follows measured ACK latency and never
-/// drops to the scale of the transport RTT.
+/// The scheduler's retry gate is the reliable emitter's own probe timeout,
+/// from the departure-based RTT estimator: one notion of "overdue", which
+/// follows measured round trips (batching delay included) in both directions.
 #[tokio::test(start_paused = true)]
-async fn the_priority_retry_gate_tracks_ack_latency_not_rtt() {
-    use crate::transport::reliable_emitter::rto::{ACK_DEADLINE_COLD_START, ACK_DEADLINE_FLOOR};
+async fn the_priority_retry_gate_is_the_emitters_probe_timeout() {
+    use std::time::Duration;
     let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
     let server = QuicServer::new().expect("QuicServer::new");
     let (_tx, rx) = mpsc::channel(8);
     let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
 
-    // No samples yet: assume the worst, as the RTO does.
-    assert_eq!(bridge.priority_retry_after(), ACK_DEADLINE_COLD_START);
+    // No measurement at all: RFC 9002's initial RTT (333 + 4 x 166.5 + 5 ms).
+    assert_eq!(bridge.priority_retry_after(), Duration::from_millis(1004));
 
-    // A path so fast that 2 x RTT -- or 2 x ACK latency -- is under a
-    // frame. The gate must still clear a 33 ms tick comfortably.
+    // A seed (quinn's handshake RTT) stands in before the first sample.
+    bridge.reliable_emitter.rtt.seed(Duration::from_millis(20));
+    assert_eq!(bridge.priority_retry_after(), Duration::from_millis(65));
+
+    // A first sample replaces it: 6 ms is a fast path plus the client's 5 ms
+    // flush, 6 + 4 x 3 + 5.
     bridge
         .reliable_emitter
-        .set_ack_deadline(Some(std::time::Duration::from_millis(1)));
-    assert_eq!(bridge.priority_retry_after(), ACK_DEADLINE_FLOOR);
-    assert!(bridge.priority_retry_after() > std::time::Duration::from_micros(33_333));
+        .rtt
+        .on_sample(Duration::from_millis(6));
+    assert_eq!(bridge.priority_retry_after(), Duration::from_millis(23));
+    assert_eq!(bridge.priority_retry_after(), bridge.reliable_emitter.pto());
 
-    // And it stretches when acknowledgements are genuinely slow.
-    bridge
-        .reliable_emitter
-        .set_ack_deadline(Some(std::time::Duration::from_millis(400)));
-    assert_eq!(
-        bridge.priority_retry_after(),
-        std::time::Duration::from_millis(800)
+    // And it stretches when round trips are genuinely slow.
+    for _ in 0..200 {
+        bridge
+            .reliable_emitter
+            .rtt
+            .on_sample(Duration::from_millis(400));
+    }
+    let slow = bridge.priority_retry_after();
+    assert!(
+        slow >= Duration::from_millis(405) && slow < Duration::from_millis(420),
+        "{slow:?}"
     );
 }
 

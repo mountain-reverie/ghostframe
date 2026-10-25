@@ -1007,15 +1007,12 @@ pub struct IoBridge {
     queued_critical_latency_stats: TierLatencyStats,
     /// Same as `queued_critical_latency_stats`, for `PassTier::Refinement`.
     queued_refinement_latency_stats: TierLatencyStats,
-    /// Rolling ACK-latency tracker feeding the RTO policy. Recorded once
+    /// Rolling enqueue -> ACK latency window. Statistics only: recorded once
     /// per sample at the same drain site as the `*_latency_stats` fields
-    /// above (`ack_latency_us`, before it's routed to a per-tier bucket);
-    /// its p95 is pushed into `reliable_emitter.set_ack_deadline` once per
-    /// drain. See `ack_latency::AckLatencyTracker`'s doc comment for why
-    /// p95 over a small window rather than the cumulative mean/max the
-    /// `TierLatencyStats` fields track — this is a control input, not a
-    /// baseline measurement, and needs to track the *current* path rather
-    /// than the whole session.
+    /// above (`ack_latency_us`, before it's routed to a per-tier bucket) and
+    /// logged as `rto_ack_latency_p95_us`. It used to set the retransmission
+    /// deadline (p95 x 2); that is now `reliable_emitter.rtt`'s probe
+    /// timeout, from departure-based samples. See `ack_latency::AckLatencyTracker`.
     ack_latency_tracker: crate::transport::ack_latency::AckLatencyTracker,
     /// Snapshot of (critical, refinement) byte counters at the previous
     /// periodic-log tick, used to derive per-window rates without
@@ -2214,6 +2211,14 @@ impl IoBridge {
 
     /// Housekeeping run once per `run` loop turn, after the `select!`.
     async fn post_turn(&mut self) -> io::Result<()> {
+        // Until the first acknowledgement is measured, the retransmission
+        // deadline stands on quinn's own RTT (the handshake's), not on a
+        // cold-start guess. Skipped once a sample exists.
+        if !self.reliable_emitter.rtt.has_sample() {
+            if let Some(rtt) = self.live_path_rtt() {
+                self.reliable_emitter.rtt.seed(rtt);
+            }
+        }
         // Arm/enforce close deadlines first, so a CONNECTION_CLOSE queued
         // here leaves in the drain_outbound just below.
         self.sweep_rechecks(now_std());
@@ -2324,13 +2329,22 @@ impl IoBridge {
                     PassTier::Critical => self.critical_latency_stats.record(ack_latency_us),
                     PassTier::Refinement => self.refinement_latency_stats.record(ack_latency_us),
                 }
-                // Feed the RTO policy's rolling tracker with the same
-                // per-sample latency, regardless of tier -- the RTO
-                // applies uniformly to every emitted tile-pass, so its
-                // deadline should track the whole population rather
-                // than either tier alone. See `ack_latency_tracker`'s
-                // doc comment.
+                // Observability only now: the rolling p95 no longer decides
+                // anything (D1 F4 part 1). Enqueue -> ACK includes the host's
+                // own queue and censors exactly its slowest samples.
                 self.ack_latency_tracker.record(ack_latency_us);
+                // The retransmission deadline's sample: ACK receipt minus the
+                // transmission's departure from quinn's FIFO (RFC 9002 §5).
+                // `depart_us` is `server_emit_us` when the transmission was
+                // never stamped (an ACK that beat the poll), which only makes
+                // the sample larger. Wrapping u32 as above: exact for a delta
+                // of milliseconds.
+                let rtt_us =
+                    (elapsed_since_epoch_us as u32).wrapping_sub(s.depart_us as u32) as u64;
+                self.reliable_emitter
+                    .rtt
+                    .on_sample(std::time::Duration::from_micros(rtt_us));
+                self.reliable_emitter.note_ack(s.depart_us, s.received_at);
                 // BWE Stage 2.1: `queued_at -> ACK`, alongside (not
                 // instead of) the `last_sent_at -> ACK` pair above.
                 // Starts earlier (when the work was queued rather than
@@ -2348,13 +2362,6 @@ impl IoBridge {
                 }
                 records.push(s.ack_arrival());
             }
-            // Once per drain is enough: this is a cheap setter, and the
-            // tracker only just received new samples above. Derives the
-            // emitter's next first-attempt RTO deadline from the
-            // rolling p95 -- see `rto::rto_for_attempt`'s doc comment
-            // for the floor/ceiling this feeds into.
-            self.reliable_emitter
-                .set_ack_deadline(self.ack_latency_tracker.p95());
             // quinn already measures path RTT for the scheduler; reuse it
             // as the reference for the estimator's plausibility check.
             if let Some(rtt) = self.live_path_rtt() {

@@ -22,6 +22,7 @@ pub mod quic;
 pub use ghostframe_tsnet as ghostbridge;
 pub(crate) mod admission;
 pub mod reliable_emitter;
+pub mod rtt_estimator;
 pub mod scheduler;
 pub mod transmission_ledger;
 pub mod webtransport;

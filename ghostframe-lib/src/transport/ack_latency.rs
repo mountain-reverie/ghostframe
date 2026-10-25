@@ -1,11 +1,18 @@
-//! Rolling acknowledgement-latency tracker.
+//! Rolling acknowledgement-latency tracker: statistics only.
 //!
-//! Feeds the emitter's RTO policy (`reliable_emitter::rto::rto_for_attempt`).
-//! The retransmit-storm investigation found the RTO deadline hard-coded at a
-//! 50 ms ceiling — in practice 40 ms, since the `smoothed_rtt` input it was
-//! derived from was never updated from its 20 ms default — racing a
-//! distribution whose *mean* was 29 ms but whose *max* was 103 ms. A fixed
-//! constant cannot track that; this tracker exists so the deadline can.
+//! Enqueue -> ACK latency over a recent window, logged as
+//! `rto_ack_latency_p95_us`. It used to set the emitter's RTO (p95 x 2,
+//! clamped to a fitted 150 ms..2 s band): that deadline was measured from
+//! enqueue, so it included the host's own queue, it had no variance term, and
+//! it was censored exactly when it would have been largest (only acknowledged
+//! transmissions were sampled). Since D1 F4 the deadline is an RFC 9002 probe
+//! timeout from departure-based samples (`rtt_estimator`, `rto::pto_for_attempt`)
+//! and this tracker decides nothing.
+//!
+//! History, kept because the numbers still explain why a fixed deadline
+//! cannot work: the retransmit-storm investigation found the RTO hard-coded at
+//! a 50 ms ceiling, racing a distribution whose *mean* was 29 ms but whose
+//! *max* was 103 ms.
 //!
 //! # Design
 //!

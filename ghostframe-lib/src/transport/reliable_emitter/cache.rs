@@ -62,6 +62,11 @@ pub struct CacheEntry {
     /// re-sent past, or a NACK repair, which never moves the timer) leaves it
     /// alone.
     pub arm_ws: u32,
+    /// When the transmission that armed the timer left quinn's FIFO, in
+    /// microseconds on the emitter's clock (the ledger's `depart_us`). Only
+    /// meaningful while `rto_deadline` is set. It orders this pass against
+    /// acknowledged departures for the PTO gate.
+    pub departed_us: u64,
     /// See `ProbeTag`'s doc comment.
     pub probe: Option<ProbeTag>,
 }
@@ -308,6 +313,7 @@ mod tests {
             attempts: 0,
             rto_deadline: Some(now),
             arm_ws: 0,
+            departed_us: 0,
             probe: None,
         }
     }

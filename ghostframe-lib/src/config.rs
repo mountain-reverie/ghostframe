@@ -618,18 +618,18 @@ impl LibConfig {
 // process-global read that races other tests. CI enforces it -- grep for
 // `env::var` outside this file fails the build.
 
-/// Reliable-emitter retransmission-timer knobs: the RTO backoff ceiling and
-/// the first-attempt ACK-deadline band (see `rto::rto_for_attempt`).
+/// Reliable-emitter retransmission-timer knob: the backoff ceiling.
 ///
-/// These are the constants at the centre of the retransmit-storm report; field
-/// experiments on them used to need a rebuild. Defaults are the compiled-in
-/// constants in `transport/reliable_emitter/rto.rs`, so an unset environment
-/// changes nothing.
+/// The deadline itself is measured, not configured: an RFC 9002 probe timeout
+/// from the departure-based RTT estimator (`rto::pto_for_attempt`). The
+/// `ACK_DEADLINE_FLOOR/COLD_START/CEILING` constants and their environment
+/// overrides went with the p95 x 2 formula they bounded. The default is the
+/// compiled-in constant in `transport/reliable_emitter/rto.rs`, so an unset
+/// environment changes nothing.
 ///
-/// **Wired.** `rto_for_attempt` reads the process-wide copy returned by
-/// `emitter_config()` (parsed once, like `no_rto()`), so every caller picks
-/// the values up without a signature change. `rto_for_attempt_with` takes an
-/// explicit config and is what the tests drive.
+/// `pto_for_attempt` reads the process-wide copy returned by
+/// `emitter_config()` (parsed once, like `no_rto()`); `pto_for_attempt_with`
+/// takes an explicit config and is what the tests drive.
 ///
 /// There is deliberately no cache-capacity field: `RetransmitCache` is
 /// unbounded by design (an un-ACKed tile-pass is never dropped) and has no
@@ -639,15 +639,6 @@ impl LibConfig {
 pub struct EmitterConfig {
     /// `GHOSTFRAME_RTO_BACKOFF_MAX_MS` (default 5000). Any value `> 0`.
     pub rto_backoff_max: std::time::Duration,
-    /// `GHOSTFRAME_ACK_DEADLINE_FLOOR_MS` (default 150). Any value `> 0`.
-    pub ack_deadline_floor: std::time::Duration,
-    /// `GHOSTFRAME_ACK_DEADLINE_COLD_START_MS` (default 1000). Any value `> 0`.
-    pub ack_deadline_cold_start: std::time::Duration,
-    /// `GHOSTFRAME_ACK_DEADLINE_CEILING_MS` (default 2000). Any value `> 0`.
-    /// If the floor ends up above the ceiling (a pair of overrides that
-    /// contradict each other, or one that contradicts a default), the whole
-    /// band reverts to its defaults rather than panicking in `Duration::clamp`.
-    pub ack_deadline_ceiling: std::time::Duration,
 }
 
 impl Default for EmitterConfig {
@@ -655,9 +646,6 @@ impl Default for EmitterConfig {
         use crate::transport::reliable_emitter::rto;
         Self {
             rto_backoff_max: rto::RTO_BACKOFF_MAX,
-            ack_deadline_floor: rto::ACK_DEADLINE_FLOOR,
-            ack_deadline_cold_start: rto::ACK_DEADLINE_COLD_START,
-            ack_deadline_ceiling: rto::ACK_DEADLINE_CEILING,
         }
     }
 }
@@ -672,20 +660,9 @@ impl EmitterConfig {
                 .unwrap_or(default)
         };
         let d = Self::default();
-        let mut cfg = Self {
+        Self {
             rto_backoff_max: ms("GHOSTFRAME_RTO_BACKOFF_MAX_MS", d.rto_backoff_max),
-            ack_deadline_floor: ms("GHOSTFRAME_ACK_DEADLINE_FLOOR_MS", d.ack_deadline_floor),
-            ack_deadline_cold_start: ms(
-                "GHOSTFRAME_ACK_DEADLINE_COLD_START_MS",
-                d.ack_deadline_cold_start,
-            ),
-            ack_deadline_ceiling: ms("GHOSTFRAME_ACK_DEADLINE_CEILING_MS", d.ack_deadline_ceiling),
-        };
-        if cfg.ack_deadline_floor > cfg.ack_deadline_ceiling {
-            cfg.ack_deadline_floor = d.ack_deadline_floor;
-            cfg.ack_deadline_ceiling = d.ack_deadline_ceiling;
         }
-        cfg
     }
 
     pub fn from_env() -> Self {
@@ -694,7 +671,7 @@ impl EmitterConfig {
 }
 
 /// Process-wide `EmitterConfig`, parsed once. Cached for the same reason as
-/// `no_rto()`: `rto_for_attempt` runs on the scheduler tick.
+/// `no_rto()`: `pto_for_attempt` runs on the scheduler tick.
 pub(crate) fn emitter_config() -> &'static EmitterConfig {
     static CFG: std::sync::OnceLock<EmitterConfig> = std::sync::OnceLock::new();
     CFG.get_or_init(EmitterConfig::from_env)
@@ -1045,46 +1022,18 @@ mod tests {
         use std::time::Duration;
         let d = EmitterConfig::default();
         assert_eq!(d.rto_backoff_max, Duration::from_secs(5));
-        assert_eq!(d.ack_deadline_floor, Duration::from_millis(150));
-        assert_eq!(d.ack_deadline_cold_start, Duration::from_secs(1));
-        assert_eq!(d.ack_deadline_ceiling, Duration::from_secs(2));
         assert_eq!(EmitterConfig::from_lookup(lookup(&[])), d);
     }
 
     #[test]
     fn emitter_config_parses_ms_and_rejects_nonsense() {
         use std::time::Duration;
-        let c = EmitterConfig::from_lookup(lookup(&[
-            ("GHOSTFRAME_RTO_BACKOFF_MAX_MS", "10000"),
-            ("GHOSTFRAME_ACK_DEADLINE_FLOOR_MS", "0"),
-            ("GHOSTFRAME_ACK_DEADLINE_COLD_START_MS", "abc"),
-            ("GHOSTFRAME_ACK_DEADLINE_CEILING_MS", "3000"),
-        ]));
+        let c = EmitterConfig::from_lookup(lookup(&[("GHOSTFRAME_RTO_BACKOFF_MAX_MS", "10000")]));
         assert_eq!(c.rto_backoff_max, Duration::from_secs(10));
-        assert_eq!(
-            c.ack_deadline_floor,
-            Duration::from_millis(150),
-            "0 ignored"
-        );
-        assert_eq!(c.ack_deadline_cold_start, Duration::from_secs(1));
-        assert_eq!(c.ack_deadline_ceiling, Duration::from_secs(3));
-    }
-
-    #[test]
-    fn emitter_config_inverted_band_reverts_instead_of_panicking() {
-        use crate::transport::reliable_emitter::rto::rto_for_attempt_with;
-        use std::time::Duration;
-        // floor 5 s > default ceiling 2 s: `Duration::clamp` would panic.
-        let c = EmitterConfig::from_lookup(lookup(&[("GHOSTFRAME_ACK_DEADLINE_FLOOR_MS", "5000")]));
-        assert_eq!(
-            c.ack_deadline_floor,
-            EmitterConfig::default().ack_deadline_floor
-        );
-        assert_eq!(
-            c.ack_deadline_ceiling,
-            EmitterConfig::default().ack_deadline_ceiling
-        );
-        let _ = rto_for_attempt_with(&c, Some(Duration::from_millis(10)), 0);
+        for bad in ["0", "abc", "-5"] {
+            let c = EmitterConfig::from_lookup(lookup(&[("GHOSTFRAME_RTO_BACKOFF_MAX_MS", bad)]));
+            assert_eq!(c, EmitterConfig::default(), "{bad:?} ignored");
+        }
     }
 
     #[test]
