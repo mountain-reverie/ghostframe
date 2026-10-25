@@ -1573,6 +1573,7 @@ mod tests {
         let mark = |bytes: usize, before: u64, dep_idx: u64| RateMark {
             pkt_num: bytes as u64 * 1000 + before + dep_idx,
             state: RateSamplePacketState::default(),
+            pacer_limited: false,
         };
         l.record(1, t0, tx(1));
         l.mark_rate(1, mark);
