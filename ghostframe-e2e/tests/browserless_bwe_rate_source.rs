@@ -222,14 +222,16 @@ fn report_transport(scene: &str, r: &BrowserlessResult) {
         scene,
         "delivery",
         format!(
-            "marked={} app_limited_marks={} samples={} app_limited_samples={} latest_bps={} latest_app_limited={} max_bps={}",
+            "marked={} app_limited_marks={} samples={} app_limited_samples={} pacer_limited_samples={} latest_bps={} latest_app_limited={} max_bps={} max_unpaced_bps={}",
             i.delivery.marked,
             i.delivery.app_limited_marks,
             i.delivery.samples,
             i.delivery.app_limited_samples,
+            i.delivery.pacer_limited_samples,
             i.delivery.latest_bps,
             i.delivery.latest_app_limited,
-            i.delivery.max_bps
+            i.delivery.max_bps,
+            i.delivery.max_unpaced_bps
         ),
     );
     p6(
