@@ -16,7 +16,7 @@ mod sim;
 #[cfg(test)]
 mod proptest_invariants;
 
-pub use emitter::ReliableTileEmitter;
+pub use emitter::{ReliableTileEmitter, RetxCause, RetxRequest};
 
 /// Logical identity of a tile-pass — the unit ACKed, NACKed, RTO'd, and
 /// cancelled by bump_generation. Matches M3.3d's ACK key bit-for-bit.

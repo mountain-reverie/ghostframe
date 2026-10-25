@@ -11,6 +11,7 @@ pub mod fragment_coverage;
 pub mod input_inject;
 pub mod instruments;
 pub mod io_bridge;
+pub mod loss_path;
 pub mod loss_window;
 pub mod origin;
 pub mod peer_auth;

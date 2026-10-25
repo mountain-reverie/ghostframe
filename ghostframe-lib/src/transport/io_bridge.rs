@@ -79,13 +79,13 @@ pub(crate) use ack_dispatch::handle_datagram_payload;
 
 #[path = "io_bridge/bwe_glue.rs"]
 mod bwe_glue;
+#[cfg(test)]
+use bwe_glue::select_live_rtt;
 pub use bwe_glue::TierLatencyStats;
 use bwe_glue::{
     pass_tier, ActiveProbe, BweSample, PassTier, PendingLoss, BWE_SAMPLES_BUFFER_CAPACITY,
     MAX_PENDING_LOSSES, TRANSMISSION_LEDGER_CAPACITY,
 };
-#[cfg(test)]
-use bwe_glue::{select_live_rtt, LOSS_HORIZON_CEIL, LOSS_HORIZON_FLOOR, LOSS_HORIZON_RTTS};
 
 #[path = "io_bridge/pacing.rs"]
 mod pacing;
@@ -1892,7 +1892,11 @@ impl IoBridge {
         let close = self.close_deadlines.values().map(|d| d.at).min();
         let recheck = self.rechecker.next_due();
         let admission = self.admission_wake;
-        [quic, display, close, recheck, admission]
+        // The probe timeout is a real deadline: with a static screen after a
+        // lost final pass there is no frame and no heartbeat to run it, and the
+        // loop would sleep through it.
+        let pto = self.reliable_emitter.pto_deadline();
+        [quic, display, close, recheck, admission, pto]
             .into_iter()
             .flatten()
             .min()
@@ -2269,6 +2273,7 @@ impl IoBridge {
         let ledger_now = now_std();
         self.record_emitted_transmissions(ledger_now);
         self.expire_transmissions(ledger_now);
+        self.poll_pto(ledger_now);
         self.retract_late_acked_losses();
         // Reported only alongside an acknowledgement: goog_cc unwraps the
         // max receive time over a report's received packets, so a
@@ -2336,7 +2341,7 @@ impl IoBridge {
                 self.reliable_emitter
                     .rtt
                     .on_sample(std::time::Duration::from_micros(rtt_us));
-                self.reliable_emitter.note_ack(s.depart_us, s.received_at);
+                self.reliable_emitter.note_ack(s.received_at);
                 // BWE Stage 2.1: `queued_at -> ACK`, alongside (not
                 // instead of) the `last_sent_at -> ACK` pair above.
                 // Starts earlier (when the work was queued rather than

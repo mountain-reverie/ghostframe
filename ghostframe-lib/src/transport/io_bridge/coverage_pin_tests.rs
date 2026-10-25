@@ -62,6 +62,7 @@ fn record_transmissions(b: &mut IoBridge) -> Vec<(u32, EmitKey)> {
                 wire_bytes: e.wire_bytes,
                 key: e.key,
                 depart_us: None,
+                dep_idx: None,
             },
         );
         out.push((e.wire_seq, e.key));

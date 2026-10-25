@@ -253,9 +253,28 @@ impl IoBridge {
                 // bytes twice) or withdrawn from `pending_losses` this turn
                 // (see `retract_late_acked_losses`). Its arrival time reflects
                 // the stall rather than the path, so it is not fed as delivered.
-                // It is still an acknowledgement: the path is delivering, so
-                // the PTO backoff ends.
-                self.reliable_emitter.rtt.on_ack();
+                // It is still an acknowledgement, and the verdict that
+                // preceded it was spurious (Eifel, RFC 3522): the path was
+                // delivering, only later than the detector allowed. So the
+                // PTO backoff ends and the late round trip is absorbed into
+                // srtt/rttvar (the next time threshold and PTO are longer for
+                // it). The loss itself is retracted from the loss window at
+                // resolve time and from `pending_losses` by
+                // `retract_late_acked_losses`; what already reached goog_cc
+                // cannot be taken back and is counted in
+                // `late_acked_after_flush`.
+                if let Some(depart_us) = tx.depart_us {
+                    let elapsed_us = now_for_samples
+                        .saturating_duration_since(self.bwe_epoch)
+                        .as_micros() as u64;
+                    let rtt_us = (elapsed_us as u32).wrapping_sub(depart_us as u32) as u64;
+                    self.reliable_emitter
+                        .rtt
+                        .on_sample(std::time::Duration::from_micros(rtt_us));
+                } else {
+                    self.reliable_emitter.rtt.on_ack();
+                }
+                self.reliable_emitter.note_ack(now_for_samples);
                 continue;
             }
             if self.bwe_samples_buffer.len() >= BWE_SAMPLES_BUFFER_CAPACITY {
