@@ -17,7 +17,7 @@
 //!   datagram as having left quinn's FIFO. `bytes_in_flight` is what the ledger
 //!   holds as departed and unresolved.
 //! - packet acked: [`DeliverySampler::on_acked`] for each live `wire_seq` of an
-//!   acknowledgement batch, then [`DeliverySampler::end_ack`] once for the
+//!   acknowledgement batch (folded in `pkt_num` order), then [`DeliverySampler::end_ack`] once for the
 //!   batch, which is the draft's "upon receiving ACK, fill in the rate
 //!   sample". A late acknowledgement of a transmission already declared lost
 //!   is not sampled.
@@ -48,6 +48,10 @@ pub const MAX_FILTER_WINDOW: Duration = Duration::from_secs(1);
 pub struct RateMark {
     pub pkt_num: u64,
     pub state: RateSamplePacketState,
+    /// The admission rate was set by goog_cc's pacer or the per-tick floor
+    /// when this departure was stamped (`BudgetTerm::Pacer` / `Floor`), so a
+    /// sample over it measures `min(path, pacer, bucket)`, not the path.
+    pub pacer_limited: bool,
 }
 
 /// One rate sample, as [`DeliverySampler::end_ack`] returns it.
@@ -56,6 +60,9 @@ pub struct RateSample {
     /// `rs.delivery_rate`, bytes per second.
     pub bytes_per_sec: u64,
     pub is_app_limited: bool,
+    /// The newest transmission of the batch was departed while the pacer
+    /// (or the floor) set the admission rate.
+    pub pacer_limited: bool,
     pub rtt: Duration,
 }
 
@@ -74,6 +81,13 @@ pub struct DeliveryRateStats {
     /// The latest sample, bits per second, and whether it was app-limited.
     pub latest_bps: u64,
     pub latest_app_limited: bool,
+    /// Samples taken over departures the pacer or floor limited, and the
+    /// windowed maximum over the others (same app-limited rule): the better
+    /// read of the path, since a pacer-limited sample is capped by the pacer.
+    pub pacer_limited_samples: u64,
+    pub max_unpaced_bps: u64,
+    /// `C.delivered`: wire bytes of acknowledged transmissions so far.
+    pub delivered_bytes: u64,
     /// The windowed maximum ([`MAX_FILTER_WINDOW`]) as of the reading, bits
     /// per second. An app-limited sample enters it only when it exceeds the
     /// maximum, the draft's rule for `max_bw`.
@@ -120,12 +134,16 @@ pub struct DeliverySampler {
     next_pkt: u64,
     /// Acknowledged transmissions folded into the estimator since the last
     /// [`Self::end_ack`].
-    updated: u32,
+    pending: Vec<SentPacket>,
+    pacer_flags: Vec<(u64, bool)>,
     /// Departure time of the most recent send. Read only by the mutation
     /// that reproduces quinn BBR's sampling (see the unit tests).
     #[allow(dead_code)]
     last_sent_at: Option<Instant>,
     max: WindowedMax,
+    max_unpaced: WindowedMax,
+    /// The `pacer_limited` of the newest transmission folded in this batch.
+    batch_pacer_limited: bool,
     stats: DeliveryRateStats,
 }
 
@@ -134,9 +152,12 @@ impl DeliverySampler {
         Self {
             est: DeliveryRateEstimator::new(now),
             next_pkt: 1,
-            updated: 0,
+            pending: Vec::new(),
+            pacer_flags: Vec::new(),
             last_sent_at: None,
             max: WindowedMax::default(),
+            max_unpaced: WindowedMax::default(),
+            batch_pacer_limited: false,
             stats: DeliveryRateStats::default(),
         }
     }
@@ -155,6 +176,7 @@ impl DeliverySampler {
         at: Instant,
         wire_bytes: usize,
         bytes_in_flight: u64,
+        pacer_limited: bool,
     ) -> RateMark {
         let mut p = SentPacket {
             pkt_num: self.next_pkt,
@@ -171,6 +193,7 @@ impl DeliverySampler {
         RateMark {
             pkt_num: p.pkt_num,
             state: p.rate_sample_state,
+            pacer_limited,
         }
     }
 
@@ -182,7 +205,8 @@ impl DeliverySampler {
     }
 
     /// A live transmission was acknowledged at `acked_at`. `mark` is its
-    /// ledger mark, `departed_at` its own departure stamp.
+    /// ledger mark, `departed_at` its own departure stamp. Held until
+    /// [`Self::end_ack`], which folds the batch in `pkt_num` order.
     pub fn on_acked(
         &mut self,
         mark: &RateMark,
@@ -190,51 +214,81 @@ impl DeliverySampler {
         wire_bytes: usize,
         acked_at: Instant,
     ) {
-        let mut p = SentPacket {
+        // The transmission's own send time is the point of the exercise: a
+        // sampler that uses the most recent send's here reads a round trip
+        // near zero.
+        self.pending.push(SentPacket {
             pkt_num: mark.pkt_num,
             time_sent: departed_at,
             time_acked: Some(acked_at),
             sent_size: wire_bytes,
             rate_sample_state: mark.state,
-        };
-        // The transmission's own send time is the point of the exercise: a
-        // sampler that uses the most recent send's here reads about half the
-        // rate under ack-every-2.
-        self.est.update_rate_sample(&mut p);
-        self.updated += 1;
+        });
+        self.pacer_flags.push((mark.pkt_num, mark.pacer_limited));
         self.stats.acked += 1;
     }
 
     /// End of one acknowledgement batch: generate the rate sample if the
     /// batch acknowledged anything. Returns it when it carries a new rate.
+    ///
+    /// The batch is folded into the estimator in `pkt_num` order, newest
+    /// last. TQUIC's `update_rate_sample` takes `send_elapsed`, `ack_elapsed`
+    /// and `rtt` from the last packet it is given rather than the newest, so
+    /// an ACK batch listing an older `wire_seq` last would otherwise be
+    /// sampled over the older packet's (longer or shorter) interval; the
+    /// draft uses the newest.
     pub fn end_ack(&mut self, now: Instant) -> Option<RateSample> {
-        if std::mem::take(&mut self.updated) == 0 {
+        if self.pending.is_empty() {
             return None;
         }
+        self.pending.sort_by_key(Self::fold_order);
+        for p in &mut self.pending {
+            self.est.update_rate_sample(p);
+        }
+        self.batch_pacer_limited = self
+            .pacer_flags
+            .iter()
+            .max_by_key(|(n, _)| *n)
+            .is_some_and(|(_, f)| *f);
+        self.pending.clear();
+        self.pacer_flags.clear();
         self.est.generate_rate_sample();
+        self.stats.delivered_bytes = self.est.delivered();
         if self.est.sample_interval().is_zero() {
             return None;
         }
         let s = RateSample {
             bytes_per_sec: self.est.delivery_rate(),
             is_app_limited: self.est.is_sample_app_limited(),
+            pacer_limited: self.batch_pacer_limited,
             rtt: self.est.sample_rtt(),
         };
         let bps = s.bytes_per_sec.saturating_mul(8);
         self.stats.samples += 1;
         self.stats.app_limited_samples += u64::from(s.is_app_limited);
+        self.stats.pacer_limited_samples += u64::from(s.pacer_limited);
         self.stats.latest_bps = bps;
         self.stats.latest_app_limited = s.is_app_limited;
         if !s.is_app_limited || bps >= self.max.get(now) {
             self.max.push(now, bps);
         }
+        if !s.pacer_limited && (!s.is_app_limited || bps >= self.max_unpaced.get(now)) {
+            self.max_unpaced.push(now, bps);
+        }
         Some(s)
+    }
+
+    /// The order a batch is folded in. The mutation proof for the unit test
+    /// replaces this with a constant.
+    fn fold_order(p: &SentPacket) -> u64 {
+        p.pkt_num
     }
 
     /// The readings, with the windowed maximum as of `now`.
     pub fn stats(&self, now: Instant) -> DeliveryRateStats {
         DeliveryRateStats {
             max_bps: self.max.get(now),
+            max_unpaced_bps: self.max_unpaced.get(now),
             ..self.stats
         }
     }
@@ -274,6 +328,12 @@ mod tests {
     }
 
     fn run(mode: Mode, every: usize, duration_us: u64) -> Run {
+        run_with(mode, every, duration_us, false)
+    }
+
+    /// `reversed`: each acknowledgement batch lists its entries newest first,
+    /// so the older `wire_seq` comes last (reordered ACK entries).
+    fn run_with(mode: Mode, every: usize, duration_us: u64, reversed: bool) -> Run {
         let base = Instant::now();
         let at = |us: u64| base + Duration::from_micros(us);
         let mut s = DeliverySampler::new(base);
@@ -297,7 +357,7 @@ mod tests {
                     open: &mut Vec<(u64, u64, RateMark, usize)>,
                     acks: &mut BinaryHeap<Reverse<(u64, usize)>>,
                     batches: &mut Vec<Vec<(u64, RateMark, usize)>>| {
-            let mark = s.on_departure(at(now), SIZE, *inflight);
+            let mark = s.on_departure(at(now), SIZE, *inflight, false);
             *inflight += SIZE as u64;
             let start = now.max(*link_free);
             *link_free = start + SIZE as u64 * 1_000_000 / RATE_BPS;
@@ -372,7 +432,11 @@ mod tests {
             if ta > duration_us {
                 break;
             }
-            for (sent, mark, size) in batches[bi].clone() {
+            let mut entries = batches[bi].clone();
+            if reversed {
+                entries.reverse();
+            }
+            for (sent, mark, size) in entries {
                 s.on_acked(&mark, at(sent), size, at(ta));
                 inflight -= size as u64;
             }
@@ -474,6 +538,41 @@ mod tests {
                 q.iter().map(|x| x.1).take(5).collect::<Vec<_>>()
             );
             assert_eq!(r.final_stats.latest_bps, RATE_BPS * 8);
+        }
+    }
+
+    /// An acknowledgement batch that lists an older `wire_seq` last must not
+    /// change the sample: TQUIC takes the interval from the last packet it is
+    /// given, so the sampler folds a batch in `pkt_num` order.
+    #[test]
+    fn a_reordered_ack_batch_gives_the_same_sample() {
+        for every in [2usize, 3] {
+            // 61 in flight: the batches straddle two send instants, so the
+            // members of one batch carry different delivery stamps.
+            let r = run_with(Mode::Saturated { window: 61 }, every, 1_000_000, true);
+            let steady: Vec<_> = r
+                .samples
+                .iter()
+                .filter(|(sent, _)| *sent >= r.first_ack_us + 3 * (2 * PROP_US + 1_000))
+                .collect();
+            assert!(
+                steady.len() > 100,
+                "ack-every-{every}: {} steady",
+                steady.len()
+            );
+            for (sent, s) in &r.samples {
+                assert!(
+                    s.bytes_per_sec <= RATE_BPS,
+                    "ack-every-{every}: reordered batch read {} above the link ({sent} us)",
+                    s.bytes_per_sec
+                );
+            }
+            for (sent, s) in &steady {
+                assert_eq!(
+                    s.bytes_per_sec, RATE_BPS,
+                    "ack-every-{every}: reordered batch, send at {sent} us"
+                );
+            }
         }
     }
 

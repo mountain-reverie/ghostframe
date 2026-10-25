@@ -6804,6 +6804,49 @@ async fn departures_are_marked_and_an_ack_batch_makes_one_rate_sample() {
     assert_eq!(bridge.delivery_sampler.stats(super::now_std()).samples, 2);
 }
 
+/// A session change replaces the sampler: its `delivered` and ordinals belong
+/// to the session that is gone, and a mark left on a surviving record must not
+/// be read against the fresh estimator.
+#[tokio::test]
+async fn a_session_change_replaces_the_delivery_sampler_and_drops_old_marks() {
+    use crate::transport::ack::{AckBatch, AckEntry};
+    let mut bridge = make_bridge_for_test().await;
+    let now = super::now_std();
+    let t0 = now - std::time::Duration::from_millis(40);
+    for ws in 1..=3u32 {
+        bridge
+            .transmission_ledger
+            .record(ws, t0, ledger_tx(1_000, 1_200, ws));
+        bridge.stamp_departure(ws, t0 + std::time::Duration::from_millis(ws as u64));
+    }
+    let ack = |ws: u32| {
+        AckBatch {
+            entries: vec![AckEntry {
+                wire_seq: ws,
+                arrival_time_ms_lo16: 3,
+            }],
+        }
+        .encode()
+    };
+    bridge.dispatch_ack_datagram(&ack(1));
+    let before = bridge.delivery_sampler.stats(super::now_std());
+    assert_eq!(before.marked, 3);
+    assert_eq!(before.samples, 1, "premise: the old sampler had state");
+
+    bridge.release_departures();
+
+    let after = bridge.delivery_sampler.stats(super::now_std());
+    assert_eq!(after.marked, 0, "a fresh sampler");
+    assert_eq!(after.delivered_bytes, 0);
+    // 2 and 3 departed under the old sampler. The ledger reset forgot them
+    // (the same call resets both), so their acknowledgement is unknown and is
+    // not sampled against the new sampler.
+    assert_eq!(bridge.transmission_ledger.departed(2), None);
+    bridge.dispatch_ack_datagram(&ack(2));
+    let st = bridge.delivery_sampler.stats(super::now_std());
+    assert_eq!((st.acked, st.samples), (0, 0));
+}
+
 /// Forgetting the live session discards the transmissions that were queued
 /// for it and never left: they are neither lost nor delivered, so the
 /// estimator hears nothing, and nothing is left on the books to alias the

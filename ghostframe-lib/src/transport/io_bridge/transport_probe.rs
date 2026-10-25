@@ -158,6 +158,11 @@ impl IoBridge {
         self.pending_losses.clear();
         self.late_acked.clear();
         self.instr.flushed = Default::default();
+        // The sampler's `delivered` and ordinals belong to the session that
+        // is gone, and the ledger reset above dropped the marks it issued:
+        // one place resets both.
+        self.delivery_sampler =
+            crate::transport::delivery_sampler::DeliverySampler::new(super::now_std());
     }
 
     /// Move what the emitter put on the wire since the last call into the
@@ -186,13 +191,19 @@ impl IoBridge {
         }
     }
 
+    fn pacer_limited_now(&self) -> bool {
+        pacer_limited_term(self.last_admission_term)
+    }
+
     /// `wire_seq` left for the wire at `at`: give its ledger record a departure
     /// ledger record and the timer on its cache entry.
     pub(super) fn stamp_departure(&mut self, wire_seq: u32, at: std::time::Instant) {
+        let pacer_limited = self.pacer_limited_now();
         stamp_departure_in(
             &mut self.transmission_ledger,
             &mut self.reliable_emitter,
             &mut self.delivery_sampler,
+            pacer_limited,
             wire_seq,
             at,
         );
@@ -345,11 +356,12 @@ impl IoBridge {
         let ledger = &mut self.transmission_ledger;
         let emitter = &mut self.reliable_emitter;
         let sampler = &mut self.delivery_sampler;
+        let pacer_limited = pacer_limited_term(self.last_admission_term);
         let marked_before = sampler.marked();
         self.departures
             .on_poll(wt.datagram_bytes_enqueued(), queued, now, |ws, _| {
                 if let Some(ws) = ws {
-                    stamp_departure_in(ledger, emitter, sampler, ws, now);
+                    stamp_departure_in(ledger, emitter, sampler, pacer_limited, ws, now);
                 }
             });
         let retain =
@@ -458,18 +470,27 @@ impl IoBridge {
     }
 }
 
+/// Whether the admission rate was set by goog_cc's pacer or the per-tick
+/// floor rather than by the window or a probe: a delivery-rate sample over
+/// such departures is capped by that term, not by the path.
+fn pacer_limited_term(t: crate::transport::instruments::BudgetTerm) -> bool {
+    use crate::transport::instruments::BudgetTerm;
+    matches!(t, BudgetTerm::Pacer | BudgetTerm::Floor)
+}
+
 /// [`IoBridge::stamp_departure`] on the two fields it touches, for a caller
 /// that holds a borrow of another one (the departure tracker's callback).
 fn stamp_departure_in(
     ledger: &mut crate::transport::transmission_ledger::TransmissionLedger,
     emitter: &mut crate::transport::reliable_emitter::ReliableTileEmitter,
     sampler: &mut crate::transport::delivery_sampler::DeliverySampler,
+    pacer_limited: bool,
     wire_seq: u32,
     at: std::time::Instant,
 ) {
     if ledger.mark_departed(wire_seq, at, emitter.emit_us64(at)) {
         ledger.mark_rate(wire_seq, |bytes, in_flight, _dep_idx| {
-            sampler.on_departure(at, bytes, in_flight)
+            sampler.on_departure(at, bytes, in_flight, pacer_limited)
         });
     }
     emitter.on_departed(wire_seq, at);
