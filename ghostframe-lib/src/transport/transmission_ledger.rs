@@ -197,7 +197,7 @@ pub struct TransmissionLedger {
     /// The newest acknowledged departure: its index and when it left. Loss
     /// is only ever judged against this, never against the clock, so a queue
     /// that delays everything in order cannot produce a verdict (F4).
-    largest_acked: Option<(u64, Instant)>,
+    largest_acked: Option<u64>,
     /// Current packet threshold, and what it adapts from: verdicts issued so
     /// far, and one bit per recent verdict (by verdict number modulo 64) set
     /// when that verdict was contradicted by a late acknowledgement.
@@ -376,9 +376,9 @@ impl TransmissionLedger {
     /// which also lets the content be released.
     pub fn resolve(&mut self, wire_seq: u32) -> Option<Resolution> {
         if let Some(rec) = self.records.remove(&wire_seq) {
-            if let (Some(idx), Some(at)) = (rec.tx.dep_idx, rec.departed) {
-                if self.largest_acked.is_none_or(|(l, _)| idx > l) {
-                    self.largest_acked = Some((idx, at));
+            if let (Some(idx), Some(_)) = (rec.tx.dep_idx, rec.departed) {
+                if self.largest_acked.is_none_or(|l| idx > l) {
+                    self.largest_acked = Some(idx);
                 }
             }
             return Some(Resolution::Live(rec.tx));
@@ -389,9 +389,9 @@ impl TransmissionLedger {
             let tx = t.tx;
             // An acknowledgement of a departure newer than any acknowledged so
             // far moves the reference the thresholds are judged against.
-            if let (Some(idx), Some(at)) = (tx.dep_idx, t.departed) {
-                if self.largest_acked.is_none_or(|(l, _)| idx > l) {
-                    self.largest_acked = Some((idx, at));
+            if let (Some(idx), Some(_)) = (tx.dep_idx, t.departed) {
+                if self.largest_acked.is_none_or(|l| idx > l) {
+                    self.largest_acked = Some(idx);
                 }
             }
             let fec_possible = tx
@@ -416,25 +416,27 @@ impl TransmissionLedger {
     /// departure **and** either
     /// - `K_PKT` or more departures separate them in departure index
     ///   ([`Transmission::dep_idx`], one per datagram), or
-    /// - it left more than `time_threshold` before the newest acknowledged
-    ///   departure left.
+    /// - it left at least `time_threshold` ago (`loss_time` in RFC 9002: a hole
+    ///   followed by fewer than `K_PKT` departures is still found, by the clock,
+    ///   once something later has been acknowledged to make it a hole).
     ///
-    /// Both compare against an *acknowledged* departure, never against the
-    /// clock. A bottleneck that queues but neither drops nor reorders delivers
-    /// acknowledgements in departure order, so nothing outstanding departed
-    /// before the newest acknowledged one by `K_PKT` places, and a growing
-    /// queue produces no verdict however deep it gets.
+    /// Both need an *acknowledged* later departure to exist. A bottleneck that
+    /// queues but neither drops nor reorders delivers acknowledgements in
+    /// departure order, so nothing outstanding departed before the newest
+    /// acknowledged one, and a growing queue produces no verdict however deep it
+    /// gets. [`Self::next_loss_time`] says when the time rule next fires.
     ///
     /// Walks `departed_order` from the front and stops at the first record that
     /// is not lost: a later departure has a larger index and a later time, so
     /// it cannot be lost if this one is not. Resolved entries it passes are
     /// dropped. Amortised O(1) per transmission.
-    pub fn detect_losses(
+    pub fn detect_losses_at(
         &mut self,
+        now: Instant,
         time_threshold: std::time::Duration,
     ) -> Vec<(u32, Transmission, LossReason)> {
         let mut lost = Vec::new();
-        let Some((largest_idx, largest_at)) = self.largest_acked else {
+        let Some(largest_idx) = self.largest_acked else {
             return lost;
         };
         while let Some(front) = self.departed_order.front().copied() {
@@ -457,7 +459,7 @@ impl TransmissionLedger {
             }
             let reason = if idx + self.k_pkt <= largest_idx {
                 LossReason::Packet
-            } else if at + time_threshold <= largest_at {
+            } else if at + time_threshold <= now {
                 LossReason::Time
             } else {
                 break;
@@ -467,6 +469,42 @@ impl TransmissionLedger {
         }
         self.compact_if_sparse();
         lost
+    }
+
+    /// [`Self::detect_losses_at`] with the clock read here, for the tests that
+    /// are not about the time rule.
+    #[cfg(test)]
+    pub(crate) fn detect_losses(
+        &mut self,
+        time_threshold: std::time::Duration,
+    ) -> Vec<(u32, Transmission, LossReason)> {
+        self.detect_losses_at(Instant::now(), time_threshold)
+    }
+
+    /// When the time rule next declares something lost: the oldest outstanding
+    /// departure, if an acknowledged one is already later than it (so it is a
+    /// hole), plus `time_threshold`. `None` when there is no such record. The
+    /// event loop wakes for it, so a hole followed by fewer than `K_PKT`
+    /// departures is found at about 9/8 of a round trip and not at the probe
+    /// timeout. Drops resolved entries at the front to find out.
+    pub fn next_loss_time(&mut self, time_threshold: std::time::Duration) -> Option<Instant> {
+        let largest_idx = self.largest_acked?;
+        while let Some(front) = self.departed_order.front().copied() {
+            match self.records.get(&front) {
+                Some(Record {
+                    departed: Some(at),
+                    tx,
+                    ..
+                }) => {
+                    return (tx.dep_idx.unwrap_or(u64::MAX) < largest_idx)
+                        .then(|| *at + time_threshold);
+                }
+                _ => {
+                    self.departed_order.pop_front();
+                }
+            }
+        }
+        None
     }
 
     /// The newest outstanding transmissions that have departed, newest first:
@@ -717,19 +755,41 @@ mod tests {
         assert!(l.detect_losses(FAR).is_empty(), "verdicts are issued once");
     }
 
-    /// Time threshold: it left more than the threshold before the newest
-    /// acknowledged departure, however few places behind.
+    /// Time threshold: a hole followed by fewer than `K_PKT` departures is
+    /// declared once it is `time_threshold` old, and not before.
     #[test]
-    fn a_departure_far_enough_before_the_newest_acknowledged_one_is_lost() {
+    fn a_hole_is_declared_at_the_time_threshold_when_too_few_departures_follow() {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(64);
-        send(&mut l, 0, t0);
-        send(&mut l, 1, t0 + 500 * MS);
+        for ws in 0..3u32 {
+            send(&mut l, ws, t0 + ws * MS);
+        }
+        // Two later departures acknowledged: 0 is a hole, but two places back.
         assert!(l.resolve(1).is_some());
-        assert!(l.detect_losses(600 * MS).is_empty(), "inside the threshold");
-        let lost = l.detect_losses(100 * MS);
+        assert!(l.resolve(2).is_some());
+        let thr = 100 * MS;
+        assert_eq!(l.next_loss_time(thr), Some(t0 + thr));
+        assert!(l.detect_losses_at(t0 + 99 * MS, thr).is_empty());
+        let lost = l.detect_losses_at(t0 + thr, thr);
         assert_eq!(lost_ws(&lost), vec![0]);
         assert_eq!(lost[0].2, LossReason::Time);
+        assert_eq!(l.next_loss_time(thr), None);
+    }
+
+    /// With no acknowledged departure later than it, nothing is a hole and the
+    /// clock alone declares nothing: a queue that is only slow.
+    #[test]
+    fn the_clock_alone_declares_nothing() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        for ws in 0..3u32 {
+            send(&mut l, ws, t0);
+        }
+        assert_eq!(l.next_loss_time(MS), None);
+        assert!(l.detect_losses_at(t0 + 3600 * 1000 * MS, MS).is_empty());
+        // Only the oldest being acknowledged leaves nothing behind it either.
+        assert!(l.resolve(0).is_some());
+        assert_eq!(l.next_loss_time(MS), None);
     }
 
     /// F4's structural claim: acknowledgements that arrive in departure order
@@ -1132,7 +1192,7 @@ mod tests {
                         }
                     }
                     _ => {
-                        for (ws, _, _) in l.detect_losses(5 * MS) {
+                        for (ws, _, _) in l.detect_losses_at(now, 5 * MS) {
                             proptest::prop_assert!(outstanding.remove(&ws), "verdict on non-outstanding {}", ws);
                             proptest::prop_assert!(lost.insert(ws));
                         }

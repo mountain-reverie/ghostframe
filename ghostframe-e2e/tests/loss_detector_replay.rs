@@ -94,7 +94,7 @@ fn replay(trace: &[Option<u64>], freeze: bool) -> Replay {
     // 9/8 of a round trip that includes the whole reorder window.
     let threshold = Duration::from_millis(60);
     let quarter = N * 3 / 4;
-    for (_, ws) in arrivals {
+    for (at_us, ws) in arrivals {
         match ledger.resolve(ws) {
             Some(Resolution::Late { .. }) => {
                 out.spurious += 1;
@@ -104,7 +104,8 @@ fn replay(trace: &[Option<u64>], freeze: bool) -> Replay {
             }
             Some(Resolution::Live(_)) | None => {}
         }
-        for (lost_ws, _, _) in ledger.detect_losses(threshold) {
+        let now = t0 + Duration::from_micros(at_us);
+        for (lost_ws, _, _) in ledger.detect_losses_at(now, threshold) {
             out.verdicts += 1;
             declared.insert(lost_ws);
             if lost_ws >= quarter {
