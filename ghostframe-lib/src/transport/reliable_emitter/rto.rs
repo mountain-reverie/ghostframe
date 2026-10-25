@@ -97,10 +97,11 @@ pub const RTO_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// (0 for an original): the probe timeout of RFC 9002 §6.2 from `rtt`, doubled
 /// per backoff step and held to `EmitterConfig::rto_backoff_max`.
 ///
-/// The exponent is the larger of the key's own `attempts` and the connection's
-/// consecutive-PTO count ([`RttEstimator::pto_count`]): a transmission first
-/// sent while the path is silent is armed as late as a retry would be, and the
-/// count falls back to zero with the first acknowledgement.
+/// Only the key's own retry count backs it off. The connection's
+/// consecutive-PTO count ([`RttEstimator::pto_count`]) does not: an original
+/// first sent at the end of a stall would otherwise be armed as late as a
+/// retry, and stay so after the ACKs resume. Silence is handled where the timer
+/// is evaluated instead, by [`pto_resume_for_attempt`].
 ///
 /// # History
 ///
@@ -117,8 +118,19 @@ pub fn pto_for_attempt(rtt: &RttEstimator, attempts: u8) -> Duration {
 
 /// [`pto_for_attempt`] against an explicit `EmitterConfig`.
 pub fn pto_for_attempt_with(cfg: &EmitterConfig, rtt: &RttEstimator, attempts: u8) -> Duration {
-    let exp = (attempts as u32).max(rtt.pto_count()).min(8);
-    rtt.pto_interval(exp).min(cfg.rto_backoff_max)
+    rtt.pto_interval((attempts as u32).min(8))
+        .min(cfg.rto_backoff_max)
+}
+
+/// How long after the newest acknowledgement a held-back pass may fire: the
+/// probe timeout backed off by the larger of the key's retries and the
+/// connection's consecutive PTOs, so that during silence the passes of a dead
+/// path are spaced out together rather than each firing at its own first
+/// deadline. The count falls to zero with the first acknowledgement.
+pub fn pto_resume_for_attempt(rtt: &RttEstimator, attempts: u8) -> Duration {
+    let cfg = crate::config::emitter_config();
+    rtt.pto_interval((attempts as u32).max(rtt.pto_count()).min(8))
+        .min(cfg.rto_backoff_max)
 }
 
 #[cfg(test)]
@@ -146,15 +158,6 @@ mod tests {
         assert_eq!(pto_for_attempt(&RttEstimator::new(), 0), 1004 * MS);
     }
 
-    /// A seed (quinn's handshake RTT) replaces the cold start before the
-    /// first sample: 20 ms seed gives 20 + 4 x 10 + 5.
-    #[test]
-    fn a_handshake_rtt_seeds_the_deadline_before_the_first_sample() {
-        let mut e = RttEstimator::new();
-        e.seed(20 * MS);
-        assert_eq!(pto_for_attempt(&e, 0), 65 * MS);
-    }
-
     #[test]
     fn backoff_doubles_per_attempt_and_caps_at_the_ceiling() {
         let e = est(100);
@@ -167,21 +170,23 @@ mod tests {
         assert_eq!(pto_for_attempt(&e, 99), RTO_BACKOFF_MAX);
     }
 
-    /// The connection's consecutive-PTO count backs off a first transmission
-    /// too, and an acknowledgement ends it.
+    /// The connection's consecutive-PTO count backs off the *resume* time of a
+    /// held pass but never the deadline an original is armed with, and an
+    /// acknowledgement ends it.
     #[test]
-    fn a_silent_path_backs_off_first_transmissions_until_an_ack() {
+    fn a_silent_path_backs_off_the_resume_time_not_the_arming_deadline() {
         let t0 = Instant::now();
         let mut e = est(40);
         let base = pto_for_attempt(&e, 0);
         e.on_pto_fire(t0);
         e.on_pto_fire(t0 + base * 2);
         assert_eq!(e.pto_count(), 2);
-        assert_eq!(pto_for_attempt(&e, 0), base * 4);
+        assert_eq!(pto_for_attempt(&e, 0), base, "arming ignores the count");
+        assert_eq!(pto_resume_for_attempt(&e, 0), base * 4);
         // The key's own retry count wins when it is the larger.
-        assert_eq!(pto_for_attempt(&e, 3), base * 8);
+        assert_eq!(pto_resume_for_attempt(&e, 3), base * 8);
         e.on_ack();
-        assert_eq!(pto_for_attempt(&e, 0), base);
+        assert_eq!(pto_resume_for_attempt(&e, 0), base);
     }
 
     #[test]

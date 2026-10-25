@@ -74,9 +74,9 @@ impl Script {
 pub(super) fn run_script(sc: Script) -> Run {
     let t0 = Instant::now();
     let mut e = ReliableTileEmitter::new(t0);
-    // Before the first acknowledgement the deadline stands on the handshake
-    // RTT, as it does in the bridge.
-    e.rtt.seed(sc.base_rtt);
+    // A session that has carried one acknowledgement already: the first
+    // sample is the path's own round trip.
+    e.rtt.on_sample(sc.base_rtt);
     let step = Duration::from_millis(1);
 
     // (ack_due, key, departed)
@@ -216,10 +216,43 @@ mod tests {
         assert!(r.lost >= 20, "premise: datagrams were dropped: {r:?}");
         assert!(r.fires >= r.lost, "every lost pass fires: {r:?}");
         // The first loss is the tenth datagram, sent at 90 ms. Its deadline is
-        // the handshake-seeded one (40 + 4 x 20 + 5 = 125 ms) until samples
-        // arrive: well under a second.
+        // the primed one (40 + 4 x 20 + 5 = 125 ms) until samples arrive: well
+        // under a second.
         let first = r.first_fire_after_departure.expect("a fire");
         assert!(first < 500 * MS, "{first:?}");
+    }
+
+    /// Before the first acknowledgement the deadline is RFC 9002's initial
+    /// value, not a function of the transport RTT. Here quinn would report
+    /// 1 ms while the application acknowledgement comes back after 60 ms (the
+    /// client's flush and event loop). Two hundred first-paint passes leave at
+    /// once; none may fire before the first ACK arrives. Seeding the estimator
+    /// from the 1 ms transport RTT (PTO about 8 ms) fires every one of them.
+    #[test]
+    fn nothing_fires_before_the_first_ack_when_the_app_ack_is_slower_than_the_transport_rtt() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        let keys: Vec<EmitKey> = (0..200).map(|i| EmitKey::new(i, 0, 0, 0)).collect();
+        for (i, k) in keys.iter().enumerate() {
+            e.submit_one(*k, source(i as u32), t0, None, t0);
+            let ws = e.take_transmissions()[0].wire_seq;
+            e.on_departed(ws, t0);
+        }
+        // Every millisecond up to the first ACK, at 60 ms.
+        let mut ms = 0u64;
+        while ms < 60 {
+            e.tick_budgeted(t0 + Duration::from_millis(ms), usize::MAX, usize::MAX);
+            ms += 1;
+        }
+        assert_eq!(
+            e.stats.rto_fired, 0,
+            "timers fired before the first acknowledgement could arrive"
+        );
+        assert!(
+            e.pto() > Duration::from_millis(60),
+            "premise: {:?}",
+            e.pto()
+        );
     }
 
     /// And a path that goes silent (the last datagram is lost and nothing else

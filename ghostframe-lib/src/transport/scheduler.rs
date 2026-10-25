@@ -296,9 +296,12 @@ impl Scheduler {
     ///
     /// The caller now passes the reliable emitter's own first-attempt
     /// deadline, the probe timeout of its RTT estimator
-    /// (`rto::pto_for_attempt`). That estimator's samples include the
-    /// client's batching delay, so it sits above a frame wherever the
-    /// batching does, without a fitted floor.
+    /// (`rto::pto_for_attempt`). That estimator's samples are application
+    /// acknowledgements, so they include the client's batching delay and event
+    /// loop, which the transport RTT does not: the deadline sits above a frame
+    /// wherever the batching does, without a fitted floor. Until the first
+    /// acknowledgement it is RFC 9002's initial value (about 1 s), not a
+    /// function of quinn's RTT.
     pub fn set_retry_after(&mut self, retry_after: Duration) {
         self.retry_after = retry_after;
     }
