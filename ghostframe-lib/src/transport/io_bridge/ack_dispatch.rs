@@ -442,6 +442,24 @@ impl IoBridge {
                 )
             })
             .collect();
+        // P5c: split the misses by whether the pass is still waiting in the
+        // scheduler (not yet sent: the client asked early) or is simply not
+        // owed any more (acknowledged, superseded, retired).
+        for k in &entries {
+            if !self
+                .reliable_emitter
+                .holds_pass(k.tile_x, k.tile_y, k.pass_idx)
+            {
+                if self
+                    .scheduler
+                    .refinement_queue_holds_tile(k.tile_x, k.tile_y)
+                {
+                    self.instr.nack_miss_pending += 1;
+                } else {
+                    self.instr.nack_miss_not_owed += 1;
+                }
+            }
+        }
         self.reliable_emitter.on_nack(&entries, now_std());
     }
 
