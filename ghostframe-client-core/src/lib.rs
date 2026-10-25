@@ -397,10 +397,11 @@ impl ClientCore {
     /// the wasm cutover, leaving the client's `cdf53-coverage` log line
     /// reporting zeros on sessions that had decoded thousands of tiles.
     ///
-    /// `gave_up` is the field worth watching: it counts tiles that have
-    /// exhausted `MAX_TAIL_SWEEP_ATTEMPTS` and stopped asking for the passes
-    /// they are missing, which means they are stuck at a partial pass set and
-    /// will render wrong for the rest of the session.
+    /// `partial` is the stranding signal: tiles still owed a pass. `gave_up`
+    /// counts tiles that exhausted `MAX_TAIL_SWEEP_ATTEMPTS` on a gap that was
+    /// known (a higher pass arrived) and never repaired. A tile whose final
+    /// pass was lost has no gap evidence, so it never asks and never counts as
+    /// `gave_up`; only `partial` shows it.
     pub fn cdf53_coverage_summary(&self) -> crate::cdf53_coverage::Cdf53CoverageSummary {
         crate::cdf53_coverage::summarize(self.cdf53_coverage.values(), MAX_TAIL_SWEEP_ATTEMPTS)
     }

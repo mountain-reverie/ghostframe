@@ -137,7 +137,9 @@ Env-gated, off by default:
   inference is usable on a path.
 - `GHOSTFRAME_NO_RTO=1` — disables the emitter's RTO timer only, leaving the
   cache and NACK path intact. Useful for attributing a retransmission to its
-  mechanism.
+  mechanism. Since the client tail sweep needs gap evidence, a lost *final*
+  pass of a tile has no client-side repair: with the RTO off it stays
+  unrepaired until the 30 s stuck-entry retire.
 
 See also `reference_e2e_loss_injection` and `reference_e2e_diagnose` notes for
 the e2e-side injection variables.

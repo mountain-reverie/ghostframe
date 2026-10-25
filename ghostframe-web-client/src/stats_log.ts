@@ -82,10 +82,10 @@ export function createStatsLogger({ renderer, core, log, getNackSent }: StatsLog
         `cdf53fails:${cdf53Fails}(last=${cdf53Last}) ` +
         `raf:${rafTicks} submit:${renderer.submitCount}`;
 
-      // `gave_up` is the field to watch: tiles that exhausted
-      // MAX_TAIL_SWEEP_ATTEMPTS and stopped asking for the passes they are
-      // missing, so they stay at a partial pass set for the rest of the
-      // session. `incomplete` then names them.
+      // `partial` is the field to watch: tiles still owed passes.
+      // `gave_up` is narrower: tiles that exhausted MAX_TAIL_SWEEP_ATTEMPTS
+      // on a known gap. A lost final pass has no gap evidence and appears
+      // only in `partial`. `incomplete` then names them.
       let coverageLine: string;
       let incompleteLine: string | null = null;
       try {
