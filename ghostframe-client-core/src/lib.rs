@@ -492,6 +492,22 @@ impl ClientCore {
                 if now_us.saturating_sub(entry.last_change_us) < TAIL_FALLBACK_US {
                     continue;
                 }
+                // Gap evidence (RC5): only a pass that a higher pass of this
+                // generation has overtaken is known to be lost. Silence on
+                // its own is not -- the server may not have sent it yet
+                // (refinement queued behind bandwidth) -- and NACKing it
+                // made every such pass a miss on the server, indistinguishable
+                // from a real cache miss. The 1.5 s grace above stays as a
+                // floor on how long a gap is left to the cheaper repair paths.
+                //
+                // Content superseded by a later frame needs no rule here:
+                // a newer `frame_seq` replaces the whole entry (see
+                // `classify_arrival`), so an older frame's gaps are dropped
+                // with it and never asked for.
+                let missing = entry.gap_evidence_mask(missing);
+                if missing == 0 {
+                    continue;
+                }
                 // Give up on a tile that has stopped making progress. The
                 // sweep clears `nacked_mask` below so a request can repeat,
                 // which on its own never terminates: a pass that will never

@@ -29,6 +29,7 @@ fn replaces_the_entry_when_generation_differs() {
         present_passes: None,
         last_change_us: 50,
         sweep_attempts: 0,
+        highest_pass_seen: None,
     };
     let out = apply_cdf53_arrival(Some(stale), 3, 5, 7, 100, true, None);
     assert_eq!(out.entry.generation, 3);
@@ -49,6 +50,7 @@ fn refreshes_frame_seq_on_existing_generation_arrival() {
         present_passes: None,
         last_change_us: 0,
         sweep_attempts: 0,
+        highest_pass_seen: None,
     };
     let out = apply_cdf53_arrival(Some(e), 1, 1, 9, 10, true, None);
     assert_eq!(out.entry.frame_seq, 9);
@@ -68,6 +70,7 @@ fn runs_gap_detection_on_existing_gen_success_and_nacks_missing_lower_passes() {
         present_passes: Some(0x3FFF),
         last_change_us: 0,
         sweep_attempts: 0,
+        highest_pass_seen: None,
     };
     let out = apply_cdf53_arrival(Some(e), 1, 4, 0, 10, true, None);
     assert_eq!(out.nack_passes, vec![1, 2, 3]);
@@ -97,6 +100,7 @@ fn dedups_gap_detection_nacks_via_nacked_mask() {
         present_passes: Some(0x3FFF),
         last_change_us: 0,
         sweep_attempts: 0,
+        highest_pass_seen: None,
     };
     let out = apply_cdf53_arrival(Some(e), 1, 3, 0, 10, true, None);
     assert_eq!(out.nack_passes, vec![2]);
@@ -121,6 +125,7 @@ fn phase_1_5a_does_not_re_nack_an_already_nacked_failed_pass() {
         present_passes: None,
         last_change_us: 0,
         sweep_attempts: 0,
+        highest_pass_seen: None,
     };
     let out = apply_cdf53_arrival(Some(e), 1, 7, 0, 100, false, None);
     assert_eq!(out.nack_passes, Vec::<u8>::new());
@@ -138,6 +143,7 @@ fn phase_1_5a_failure_does_not_advance_last_change_us() {
         present_passes: None,
         last_change_us: 42,
         sweep_attempts: 0,
+        highest_pass_seen: None,
     };
     let out = apply_cdf53_arrival(Some(e), 1, 3, 0, 999, false, None);
     assert_eq!(out.entry.last_change_us, 42);
@@ -153,6 +159,7 @@ fn phase_1_5a_success_on_a_previously_failed_pass_sets_bit_and_retains_nacked_ma
         present_passes: None,
         last_change_us: 0,
         sweep_attempts: 0,
+        highest_pass_seen: None,
     };
     let out = apply_cdf53_arrival(Some(e), 1, 5, 0, 200, true, None);
     assert_eq!(out.entry.pass_mask, 1 << 5);
@@ -176,6 +183,7 @@ fn duplicate_success_arrivals_do_not_advance_last_change_us() {
         present_passes: None,
         last_change_us: 42,
         sweep_attempts: 0,
+        highest_pass_seen: None,
     };
     let out = apply_cdf53_arrival(Some(e), 1, 3, 0, 999, true, None);
     assert_eq!(out.entry.pass_mask, 1 << 3);
@@ -199,6 +207,7 @@ fn gap_detection_nacks_missing_lower_passes() {
         present_passes: Some(0x3FFF),
         last_change_us: 42,
         sweep_attempts: 0,
+        highest_pass_seen: None,
     };
     let out = apply_cdf53_arrival(Some(prev), 3, 4, 5, 100, true, None);
     assert_eq!(out.nack_passes, vec![1, 2, 3]);
@@ -230,6 +239,7 @@ fn a_pass_from_an_older_generation_is_ignored() {
         present_passes: None,
         last_change_us: 500,
         sweep_attempts: 0,
+        highest_pass_seen: None,
     };
     // Labelled 3: the server labels an older generation with an older frame.
     let out = apply_cdf53_arrival(Some(current), 0, 12, 3, 900, true, None);
@@ -250,6 +260,7 @@ fn a_pass_from_a_newer_generation_starts_over() {
         present_passes: None,
         last_change_us: 500,
         sweep_attempts: 0,
+        highest_pass_seen: None,
     };
     let out = apply_cdf53_arrival(Some(current), 2, 0, 11, 900, true, None);
     assert_eq!(out.entry.generation, 2);
@@ -334,6 +345,7 @@ fn gap_detection_skips_passes_the_tile_never_had() {
         present_passes: Some(present),
         last_change_us: 0,
         sweep_attempts: 0,
+        highest_pass_seen: None,
     };
     // Pass 7 arrives; pass 6 is a real gap, 1-5 are not gaps at all.
     let out = apply_cdf53_arrival(Some(e), 1, 7, 0, 10, true, Some(present));
@@ -365,6 +377,7 @@ fn entry(pass_mask: u16, present: Option<u16>, sweeps: u8) -> CoverageEntry {
         present_passes: present,
         last_change_us: 0,
         sweep_attempts: sweeps,
+        highest_pass_seen: None,
     }
 }
 
