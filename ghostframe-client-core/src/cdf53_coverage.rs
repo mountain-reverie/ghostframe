@@ -20,7 +20,8 @@ pub struct CoverageEntry {
     pub last_change_us: u64,
     /// Tail sweeps spent on this entry since it last made progress.
     ///
-    /// The sweep re-requests every missing pass and clears `nacked_mask` so
+    /// The sweep re-requests every missing pass that has gap evidence (see
+    /// `highest_pass_seen`) and clears `nacked_mask` so
     /// the request can repeat, which has no terminating condition of its own:
     /// a pass that will never arrive is asked for every 500 ms for the life of
     /// the session. Measured in production on a *static* screen with nothing
@@ -323,7 +324,12 @@ pub fn apply_cdf53_arrival(
     // Gap evidence for the tail sweep: this pass arrived, so every lower
     // pass of the generation was sent before it. A failed validation counts
     // -- the datagram was on the wire; its payload is what is wrong.
-    e.highest_pass_seen = Some(e.highest_pass_seen.map_or(pass_idx, |h| h.max(pass_idx)));
+    //
+    // Only a real pass index counts: a corrupt 14 or 15 would otherwise set
+    // the evidence to 15 and unlock every pass of the tile.
+    if pass_idx < 14 {
+        e.highest_pass_seen = Some(e.highest_pass_seen.map_or(pass_idx, |h| h.max(pass_idx)));
+    }
 
     if !prevalidation_ok {
         let pass_bit = 1u16 << pass_idx;
@@ -406,9 +412,11 @@ pub struct Cdf53CoverageSummary {
     /// Tiles whose bitmap is still unknown because pass 0 has not arrived.
     /// These cannot be judged complete at all, and can only ask for pass 0.
     pub bitmap_unknown: u32,
-    /// Tiles that have exhausted their tail-sweep budget and stopped asking.
-    /// A non-zero count here is the signal that some tile is permanently
-    /// stuck at a partial pass set — i.e. rendering wrong, forever.
+    /// Tiles that have exhausted their tail-sweep budget and stopped asking:
+    /// a gap that was known (a higher pass arrived) and never repaired.
+    /// This is NOT the stranding signal. A tile whose last pass was lost
+    /// has no gap evidence, never asks, and never counts here; it shows in
+    /// `partial`.
     pub gave_up: u32,
     /// Histogram over the number of received passes (index = popcount of
     /// `pass_mask`, 0..=14).

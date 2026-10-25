@@ -139,13 +139,23 @@ fn core_with_passes(passes: &[u8]) -> ClientCore {
 /// Run the clock from 1.5 s to `end_us` in 50 ms steps and return every
 /// `pass_idx` NACKed in that window, in order, one per entry.
 fn nacked_passes_until(core: &mut ClientCore, end_us: u64) -> Vec<u8> {
+    nacked_entries_until(core, end_us)
+        .into_iter()
+        .map(|(_, pass)| pass)
+        .collect()
+}
+
+/// As `nacked_passes_until`, as `(frame_seq, pass_idx)` pairs.
+fn nacked_entries_until(core: &mut ClientCore, end_us: u64) -> Vec<(u32, u8)> {
     let mut out = Vec::new();
     let mut t = 1_500_000;
     while t <= end_us {
         core.on_timeout(t);
         for d in drain_datagrams(core).into_iter().filter(|d| d[0] == 0x05) {
             for i in 0..d[1] as usize {
-                out.push(d[2 + 7 * i + 6]);
+                let e = 2 + 7 * i;
+                let fs = u32::from_le_bytes([d[e], d[e + 1], d[e + 2], d[e + 3]]);
+                out.push((fs, d[e + 6]));
             }
         }
         t += 50_000;
@@ -182,8 +192,11 @@ fn tail_sweep_stays_silent_when_nothing_overtook_a_missing_pass() {
 
 #[test]
 fn tail_sweep_unknown_bitmap_asks_for_pass_zero_only_once_something_arrived() {
-    // Pass 0 lost, pass 3 arrived: the bitmap is unknown, pass 0 is the one
-    // pass guaranteed to exist, and pass 3 overtook it.
+    // Pins that evidence is recorded while the bitmap is still unknown: pass
+    // 0 lost, pass 3 arrived, so `present_passes` is `None`, pass 0 is the
+    // one pass guaranteed to exist, and pass 3 overtook it. (Pass 0 is the
+    // only candidate here, so this does not discriminate the evidence mask
+    // itself; the unit tests on `gap_evidence_mask` do.)
     let mut core = test_core();
     let dgs = tile_datagrams(1, 2, 3, Codec::Cdf53, 3, &valid_cdf53_payload(), 1200);
     core.handle_datagram(&dgs[0], 0);
@@ -195,7 +208,7 @@ fn tail_sweep_unknown_bitmap_asks_for_pass_zero_only_once_something_arrived() {
 }
 
 #[test]
-fn a_later_frame_drops_the_older_frames_gaps_instead_of_asking_for_them() {
+fn a_later_frame_replaces_the_entry_so_no_nack_names_the_older_frame() {
     // Frame 1 has a gap at pass 5 (0..4 and 6 arrived). Frame 2 of the same
     // tile then arrives with its pass 0. The older frame is superseded:
     // its pass 5 is content the server has replaced, so asking for it would
@@ -206,8 +219,12 @@ fn a_later_frame_drops_the_older_frames_gaps_instead_of_asking_for_them() {
     core.on_timeout(300_000);
     drain_datagrams(&mut core);
     drain_stream(&mut core);
-    let nacked = nacked_passes_until(&mut core, 5_000_000);
-    assert!(nacked.is_empty(), "stale frame's gap NACKed: {nacked:?}");
+    let nacked = nacked_entries_until(&mut core, 5_000_000);
+    assert!(
+        nacked.iter().all(|(fs, _)| *fs != 1),
+        "the superseded frame's gap was NACKed: {nacked:?}"
+    );
+    assert!(nacked.is_empty(), "silence NACKed: {nacked:?}");
 }
 
 #[test]
