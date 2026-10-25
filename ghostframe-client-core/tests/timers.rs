@@ -117,34 +117,106 @@ fn feedback_emitted_every_100ms() {
     assert_eq!(msgs[0].len(), 18);
 }
 
-#[test]
-fn tail_sweep_renacks_stalled_cdf53_tile_after_1500ms() {
+/// Feed `passes` of tile (2, 3), frame 1, all at t=0 (pass 0 carries the
+/// all-14 bitmap), then let the arrival-time gap NACKs flush and drain them.
+fn core_with_passes(passes: &[u8]) -> ClientCore {
     let mut core = test_core();
-    // One valid pass 0 at t=0 -> coverage entry created, pass_mask bit 0 set.
-    let dgs = tile_datagrams(1, 2, 3, Codec::Cdf53, 0, &valid_cdf53_pass0_payload(), 1200);
-    core.handle_datagram(&dgs[0], 0);
-    // Drain the ACK/decode outputs from the initial arrival.
+    for &p in passes {
+        let payload = if p == 0 {
+            valid_cdf53_pass0_payload()
+        } else {
+            valid_cdf53_payload()
+        };
+        let dgs = tile_datagrams(1, 2, 3, Codec::Cdf53, p, &payload, 1200);
+        core.handle_datagram(&dgs[0], 0);
+    }
+    core.on_timeout(100_000);
     drain_datagrams(&mut core);
     drain_stream(&mut core);
+    core
+}
 
-    // Sweep at 1500ms+ should NACK passes 1..13 (missing).
-    core.on_timeout(1_500_000);
-    // Debounced: the NACKs land in nack_batcher only after the debounce
-    // window (50ms) elapses (or the sweep + debounce fire in later calls).
-    core.on_timeout(1_550_000);
+/// Run the clock from 1.5 s to `end_us` in 50 ms steps and return every
+/// `pass_idx` NACKed in that window, in order, one per entry.
+fn nacked_passes_until(core: &mut ClientCore, end_us: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut t = 1_500_000;
+    while t <= end_us {
+        core.on_timeout(t);
+        for d in drain_datagrams(core).into_iter().filter(|d| d[0] == 0x05) {
+            for i in 0..d[1] as usize {
+                out.push(d[2 + 7 * i + 6]);
+            }
+        }
+        t += 50_000;
+    }
+    out
+}
 
-    let nacks: Vec<Vec<u8>> = drain_datagrams(&mut core)
-        .into_iter()
-        .filter(|d| d[0] == 0x05)
-        .collect();
-    assert!(
-        !nacks.is_empty(),
-        "expected re-NACK datagram(s) after tail sweep"
-    );
-    // Total NACK entry count across all datagrams should cover passes 1..13
-    // (13 entries).
-    let total: u32 = nacks.iter().map(|d| d[1] as u32).sum();
-    assert_eq!(total, 13, "expected 13 missing passes re-NACKed");
+#[test]
+fn tail_sweep_renacks_a_gap_that_a_higher_pass_overtook() {
+    // Passes 0..4 and 6 arrived; 5 is the gap. 7..13 are above everything
+    // received, so they may simply not have been sent.
+    let mut core = core_with_passes(&[0, 1, 2, 3, 4, 6]);
+    let nacked = nacked_passes_until(&mut core, 1_700_000);
+    assert_eq!(nacked, vec![5], "exactly the overtaken pass is re-NACKed");
+}
+
+#[test]
+fn tail_sweep_stays_silent_when_nothing_overtook_a_missing_pass() {
+    // Passes 0..4 arrived and 5..13 were never sent (queued behind
+    // bandwidth). Silence is not evidence: no NACK, however long it lasts,
+    // and the tile does not burn its sweep budget either.
+    let mut core = core_with_passes(&[0, 1, 2, 3, 4]);
+    let nacked = nacked_passes_until(&mut core, 10_000_000);
+    assert!(nacked.is_empty(), "silence NACKed passes {nacked:?}");
+    let summary = core.cdf53_coverage_summary();
+    assert_eq!((summary.partial, summary.gave_up), (1, 0));
+    // Premise: the tile really is incomplete and past the grace period, so
+    // the sweep reached the evidence check rather than skipping the tile.
+    let tiles = core.cdf53_incomplete_tiles(8);
+    assert_eq!(tiles.len(), 1);
+    assert_eq!(tiles[0].2, 0b1_1111, "received passes 0..4");
+    assert_eq!(tiles[0].4, 0, "no sweep attempt spent");
+}
+
+#[test]
+fn tail_sweep_unknown_bitmap_asks_for_pass_zero_only_once_something_arrived() {
+    // Pass 0 lost, pass 3 arrived: the bitmap is unknown, pass 0 is the one
+    // pass guaranteed to exist, and pass 3 overtook it.
+    let mut core = test_core();
+    let dgs = tile_datagrams(1, 2, 3, Codec::Cdf53, 3, &valid_cdf53_payload(), 1200);
+    core.handle_datagram(&dgs[0], 0);
+    core.on_timeout(100_000);
+    drain_datagrams(&mut core);
+    drain_stream(&mut core);
+    let nacked = nacked_passes_until(&mut core, 1_700_000);
+    assert_eq!(nacked, vec![0]);
+}
+
+#[test]
+fn a_later_frame_drops_the_older_frames_gaps_instead_of_asking_for_them() {
+    // Frame 1 has a gap at pass 5 (0..4 and 6 arrived). Frame 2 of the same
+    // tile then arrives with its pass 0. The older frame is superseded:
+    // its pass 5 is content the server has replaced, so asking for it would
+    // fetch a stale pass. The entry is the new frame's, with no evidence.
+    let mut core = core_with_passes(&[0, 1, 2, 3, 4, 6]);
+    let dgs = tile_datagrams(2, 2, 3, Codec::Cdf53, 0, &valid_cdf53_pass0_payload(), 1200);
+    core.handle_datagram(&dgs[0], 200_000);
+    core.on_timeout(300_000);
+    drain_datagrams(&mut core);
+    drain_stream(&mut core);
+    let nacked = nacked_passes_until(&mut core, 5_000_000);
+    assert!(nacked.is_empty(), "stale frame's gap NACKed: {nacked:?}");
+}
+
+#[test]
+fn tail_sweep_keeps_asking_for_a_lost_gap_until_it_gives_up() {
+    // Repair is not lost: a real gap is re-asked every sweep, up to the
+    // budget (6), and then the tile stops.
+    let mut core = core_with_passes(&[0, 1, 2, 3, 4, 6]);
+    let nacked = nacked_passes_until(&mut core, 20_000_000);
+    assert_eq!(nacked, vec![5; 6]);
 }
 
 #[test]
