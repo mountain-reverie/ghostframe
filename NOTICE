@@ -1,0 +1,36 @@
+Ghostframe
+Third-party notices
+
+This repository had no NOTICE or third-party licences file before D1 PR-6b;
+this one is new. It lists code that was copied or ported into the tree. It
+does not list crates.io dependencies, which carry their own licences and are
+resolved through Cargo.lock.
+
+--------------------------------------------------------------------------
+Tencent TQUIC (Apache License 2.0)
+
+  Source:   https://github.com/Tencent/tquic
+  Commit:   938e90adb460b5ff08b2bc6d11a3e1ba52c27a8d
+  Upstream: src/congestion_control/delivery_rate.rs
+  Here:     ghostframe-lib/src/transport/delivery_rate.rs
+
+  Copyright (c) 2023 The TQUIC Authors.
+
+  Licensed under the Apache License, Version 2.0 (the "License"); you may
+  not use this file except in compliance with the License. You may obtain a
+  copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+  WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+  License for the specific language governing permissions and limitations
+  under the License.
+
+  The file keeps TQUIC's licence header. Changes from upstream are listed in
+  its module documentation: the connection, path and packet-number-space types
+  are replaced by two small structs, `Default` is replaced by `new(now)`, and
+  one accessor is added. The estimator arithmetic is unchanged.
+  ghostframe-lib/src/transport/testdata/delivery_rate_tquic_938e90a.txt holds
+  readings produced by running the upstream file at the commit above.
