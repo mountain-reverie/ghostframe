@@ -149,6 +149,60 @@ fn assert_premises(r: &BrowserlessResult, scene: &str, min_points: usize) {
         r.bytes_delivered_s2c > 0,
         "{scene}: no server->client bytes; the session did not carry load"
     );
+    // The delivery-rate sampler (D1 PR-6b) was fed, and its series is as long
+    // as the estimate's: a sampler that never fired reads as zero everywhere.
+    let d = &r.transport.instr.delivery;
+    assert!(
+        d.samples > 0 && d.marked > 0,
+        "{scene}: delivery-rate sampler never produced a sample"
+    );
+    assert_eq!(
+        r.delivery_rate_samples.len(),
+        r.bwe_estimate_samples.len(),
+        "{scene}: delivery series sampled at other instants than the estimate"
+    );
+}
+
+/// The delivery-rate sampler against the link and against goog_cc, over
+/// `[from_us, to_us)`: the median of its windowed maximum, as a fraction of
+/// `cap_bps` and of the median estimate. Report only (D1 PR-6b feeds PR-7).
+fn report_delivery(
+    scene: &str,
+    label: &str,
+    r: &BrowserlessResult,
+    cap_bps: f64,
+    from_us: u64,
+    to_us: u64,
+) {
+    let med = cc::median_bps(&r.delivery_rate_samples, from_us, to_us);
+    let est = cc::median_bps(&r.bwe_estimate_samples, from_us, to_us);
+    let peak = cc::window(&r.delivery_rate_samples, from_us, to_us)
+        .iter()
+        .map(|(_, v)| *v)
+        .max();
+    metric(
+        scene,
+        &format!("delivery_{label}_max_median_bps"),
+        fmt_opt(med),
+    );
+    metric(
+        scene,
+        &format!("delivery_{label}_max_peak_bps"),
+        fmt_opt(peak),
+    );
+    metric(
+        scene,
+        &format!("delivery_{label}_max_over_cap"),
+        fmt_opt(med.map(|m| format!("{:.3}", m as f64 / cap_bps))),
+    );
+    metric(
+        scene,
+        &format!("delivery_{label}_max_over_est"),
+        fmt_opt(
+            med.zip(est)
+                .map(|(m, e)| format!("{:.3}", m as f64 / e as f64)),
+        ),
+    );
 }
 
 /// The D1 transport instruments for this scene, one METRIC line each: the
@@ -258,6 +312,31 @@ fn report_context(scene: &str, r: &BrowserlessResult, cap_bps: f64, from_us: u64
     );
     metric(scene, "implausible_rtt", r.implausible_rtt_samples);
     report_d1(scene, r);
+    let d = &r.transport.instr.delivery;
+    metric(
+        scene,
+        "delivery_counts",
+        format!(
+            "marked={} app_limited_marks={} acked={} samples={} app_limited_samples={} latest_bps={} latest_app_limited={}",
+            d.marked,
+            d.app_limited_marks,
+            d.acked,
+            d.samples,
+            d.app_limited_samples,
+            d.latest_bps,
+            d.latest_app_limited
+        ),
+    );
+    report_delivery(scene, "settled", r, cap_bps, from_us, to_us);
+    metric(
+        scene,
+        "delivery_series_100ms",
+        r.delivery_rate_samples
+            .iter()
+            .map(|(t, b)| format!("{}:{}", t / 1000, b / 1000))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
     if let Some(m) = cc::median_bps(s, from_us, to_us) {
         metric(scene, "settled_median_bps", m);
         metric(
@@ -500,6 +579,7 @@ async fn s3_probe_under_load_capacity_steps() {
             &format!("{label}_median_over_cap"),
             fmt_opt(cc::median_bps(s, from, to).map(|m| format!("{:.3}", m as f64 / cap))),
         );
+        report_delivery(name, label, &r, cap, from, to);
     }
     report_context(name, &r, high, DOWN_AT - 5 * S, DOWN_AT);
 }

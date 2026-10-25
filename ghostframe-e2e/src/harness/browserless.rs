@@ -400,6 +400,12 @@ pub struct BrowserlessResult {
     /// number. A step-up scene needs to see both sides of the step, so this
     /// records the series the final value is drawn from.
     pub bwe_estimate_samples: Vec<(u64, u64)>,
+    /// `(virtual_us, bits_per_second)`: the server's per-transmission
+    /// delivery-rate sampler (D1 PR-6b), windowed maximum, read at the same
+    /// instants as `bwe_estimate_samples`. Observability: compare it with the
+    /// estimate and with the link, never feed it back. The latest sample and
+    /// the sample counts are in `transport.instr.delivery`.
+    pub delivery_rate_samples: Vec<(u64, u64)>,
     /// Count of derived RTTs implausible against quinn's measured path RTT.
     /// Non-zero means emit and arrival timestamps are not on one clock.
     pub implausible_rtt_samples: u64,
@@ -1015,6 +1021,7 @@ async fn run_inner(
     let mut s2c_loss = S2cLoss::default();
     let mut bwe_estimate_samples: Vec<(u64, u64)> = Vec::new();
     let mut injections: Vec<(u64, bool)> = Vec::new();
+    let mut delivery_rate_samples: Vec<(u64, u64)> = Vec::new();
     let outcome = drive_session(
         cfg,
         bridge_slot.as_mut(),
@@ -1028,6 +1035,7 @@ async fn run_inner(
         &bwe_cell,
         &mut bwe_estimate_samples,
         &mut injections,
+        (&transport_probe_cell, &mut delivery_rate_samples),
         &server_live_rx,
         &links,
         &mut s2c_loss,
@@ -1137,6 +1145,7 @@ async fn run_inner(
         bwe_estimate_bps: bwe_snapshot.bitrate_bps,
         pacer_rate_bps: bwe_snapshot.pacer_rate_bps,
         bwe_estimate_samples,
+        delivery_rate_samples,
         implausible_rtt_samples: bwe_snapshot.implausible_rtt_samples,
         bwe_samples_seen: bwe_snapshot.samples_seen,
         retransmit_attempts_total: emitter_stats.retransmit_attempts_total,
@@ -1206,6 +1215,10 @@ async fn drive_session(
     bwe_cell: &std::sync::Arc<std::sync::Mutex<ghostframe_lib::transport::bwe::BweSnapshot>>,
     bwe_samples: &mut Vec<(u64, u64)>,
     injections: &mut Vec<(u64, bool)>,
+    delivery: (
+        &std::sync::Arc<std::sync::Mutex<ghostframe_lib::transport::io_bridge::TransportProbe>>,
+        &mut Vec<(u64, u64)>,
+    ),
     server_live_rx: &tokio::sync::watch::Receiver<usize>,
     links: &LinkOverrides,
     s2c_loss: &mut S2cLoss,
@@ -1399,6 +1412,14 @@ async fn drive_session(
                 .expect("bwe_publish mutex poisoned")
                 .bitrate_bps;
             bwe_samples.push((vt_now, bps));
+            let max_bps = delivery
+                .0
+                .lock()
+                .expect("transport_probe_publish mutex poisoned")
+                .instr
+                .delivery
+                .max_bps;
+            delivery.1.push((vt_now, max_bps));
             next_bwe_sample_us = vt_now + 100_000;
         }
         if vt_now > last_progress_vt {
