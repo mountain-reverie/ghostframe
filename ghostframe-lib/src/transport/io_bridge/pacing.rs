@@ -432,6 +432,7 @@ impl IoBridge {
             a.d_target_max = a.d_target_max.max(d_target as u64);
         }
         self.instr.budget.note_rate(rate.term);
+        self.last_admission_term = rate.term;
         self.scheduler
             .set_item_overhead(TILE_DATAGRAM_HEADERS + framing);
         self.reliable_emitter.set_wire_overhead(framing);
