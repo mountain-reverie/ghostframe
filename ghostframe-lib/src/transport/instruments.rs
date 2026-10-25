@@ -615,6 +615,7 @@ pub struct InstrumentSummary {
     pub verdict_content_gone: u64,
     pub verdict_newer_in_flight: u64,
     pub verdict_already_queued: u64,
+    pub verdict_deferred_to_pto: u64,
     pub spurious_loss: u64,
     pub spurious_pto: u64,
     /// Acknowledgements naming a `wire_seq` the ledger knows nothing of

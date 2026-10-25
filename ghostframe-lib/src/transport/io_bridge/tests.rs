@@ -6924,3 +6924,27 @@ async fn the_loss_time_of_a_hole_is_a_wake_deadline() {
     assert_eq!(bridge.pending_losses.len(), 1, "declared at the loss time");
     assert_eq!(bridge.transmission_ledger.stats().lost_time_threshold, 1);
 }
+
+/// What the `loss path` journal event reads: the instrument summary carries the
+/// packet threshold, the verdicts by rule, the contradicted ones and what the
+/// probe did, from the live counters.
+#[tokio::test(start_paused = true)]
+async fn the_loss_path_counters_reach_the_instrument_summary() {
+    let mut bridge = make_bridge_for_test().await;
+    let now = super::now_std();
+    bridge
+        .transmission_ledger
+        .record_departed(1, now, ledger_tx(1_000, 1_200, 1));
+    bridge.declare_lost_for_test(&[1]);
+    bridge.reliable_emitter.note_pto_fire(now);
+    let s = bridge.instrument_summary();
+    assert_eq!((s.k_pkt, s.loss_by_pto, s.pto_fires), (3, 1, 1));
+    assert_eq!(
+        (s.loss_by_packet_threshold, s.loss_by_time_threshold),
+        (0, 0)
+    );
+    assert_eq!(
+        (s.spurious_loss, s.spurious_pto, s.late_acks_fec_possible),
+        (0, 0, 0)
+    );
+}

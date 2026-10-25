@@ -2412,6 +2412,35 @@ impl IoBridge {
                 "cumulative emit (datagrams handed to quinn since startup, per codec)"
             );
 
+            // The loss path (D1 F4 part 2), a separate event at the same
+            // cadence: the `cumulative emit` line above is at the tracing
+            // macro's recursion limit. These are what a native validation run
+            // reads from the journal: the packet threshold, how many verdicts
+            // and by which rule, how many were contradicted (and how many of
+            // those could have been FEC recoveries), and what the probe did.
+            tracing::info!(
+                target: LOG_TARGET,
+                frame_seq = seq,
+                k_pkt = ins.k_pkt,
+                k_pkt_raises = ins.k_pkt_raises,
+                lost_by_packet = ins.loss_by_packet_threshold,
+                lost_by_time = ins.loss_by_time_threshold,
+                lost_by_pto = ins.loss_by_pto,
+                spurious_loss = ins.spurious_loss,
+                spurious_pto = ins.spurious_pto,
+                spurious_ledger = ins.ledger_spurious_losses,
+                late_acks_fec_possible = ins.late_acks_fec_possible,
+                loss_retransmits = ins.loss_retransmits,
+                pto_fires = ins.pto_fires,
+                pto_probe_retransmits = ins.pto_probe_retransmits,
+                verdict_content_gone = ins.verdict_content_gone,
+                verdict_newer_in_flight = ins.verdict_newer_in_flight,
+                verdict_deferred_to_pto = ins.verdict_deferred_to_pto,
+                nack_miss_pending = ins.nack_miss_pending,
+                nack_miss_not_owed = ins.nack_miss_not_owed,
+                "loss path (threshold loss, probe timeout, spurious undo; cumulative)"
+            );
+
             // Per-window bump counts. Each bump_generation supersedes
             // the prior gen's still-Pending refinement passes. If
             // these stay non-zero after the initial burst, repeated
