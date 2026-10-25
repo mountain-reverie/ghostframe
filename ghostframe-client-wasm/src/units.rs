@@ -392,6 +392,7 @@ pub fn apply_cdf53_arrival(
         present_passes: prev_present_passes,
         last_change_us: prev_last_change_us,
         sweep_attempts: 0,
+        highest_pass_seen: (prev_pass_mask != 0).then(|| 15 - prev_pass_mask.leading_zeros() as u8),
     });
     let out = WasmArrivalOutcome::from(cdf53_coverage::apply_cdf53_arrival(
         prev,

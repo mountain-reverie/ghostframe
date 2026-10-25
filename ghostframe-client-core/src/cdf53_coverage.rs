@@ -31,6 +31,38 @@ pub struct CoverageEntry {
     /// Reset whenever a pass actually lands, so a tile still making progress
     /// keeps its full budget and only a stalled one gives up.
     pub sweep_attempts: u8,
+    /// Highest `pass_idx` of this generation that has arrived off the wire,
+    /// whether or not it validated. `None` until something has.
+    ///
+    /// This is the tail sweep's *gap evidence*. A pass in `present_passes`
+    /// that has not arrived is only known to be lost if a higher pass of the
+    /// same generation did: the server sends a tile's passes in order, so a
+    /// later pass landing means the earlier one was dropped (or reordered
+    /// past it). A pass above everything received may simply not have been
+    /// sent yet -- refinement passes are queued behind bandwidth -- and
+    /// asking for it measures the server's queue, not the network. See
+    /// [`CoverageEntry::gap_evidence_mask`].
+    pub highest_pass_seen: Option<u8>,
+}
+
+impl CoverageEntry {
+    /// The passes the tail sweep may ask for: the missing ones that a
+    /// higher-numbered arrival of the same generation vouches were sent.
+    ///
+    /// `missing` is the caller's judgement of what is still owed (the tile's
+    /// own `present_passes` minus `pass_mask`, or pass 0 alone while the
+    /// bitmap is unknown). The result is `missing` restricted to
+    /// `pass_idx <= highest_pass_seen`; the highest pass itself is included
+    /// because it can be in `missing` only if it arrived but failed
+    /// prevalidation, which is a request already owed.
+    ///
+    /// No arrival, no evidence: silence alone never produces a request.
+    pub fn gap_evidence_mask(&self, missing: u16) -> u16 {
+        match self.highest_pass_seen {
+            None => 0,
+            Some(h) => missing & ((2u16 << h.min(14)) - 1),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,6 +307,7 @@ pub fn apply_cdf53_arrival(
             present_passes: None,
             last_change_us: now_us,
             sweep_attempts: 0,
+            highest_pass_seen: None,
         },
     };
 
@@ -286,6 +319,11 @@ pub fn apply_cdf53_arrival(
     }
 
     let mut nack_passes = Vec::new();
+
+    // Gap evidence for the tail sweep: this pass arrived, so every lower
+    // pass of the generation was sent before it. A failed validation counts
+    // -- the datagram was on the wire; its payload is what is wrong.
+    e.highest_pass_seen = Some(e.highest_pass_seen.map_or(pass_idx, |h| h.max(pass_idx)));
 
     if !prevalidation_ok {
         let pass_bit = 1u16 << pass_idx;
