@@ -643,6 +643,9 @@ pub struct InstrumentSummary {
     pub hint_unbounded: u64,
     /// The estimator wrapper's own counters.
     pub bwe: crate::transport::bwe::BweStats,
+    /// Per-transmission delivery-rate samples (PR-6b): the latest sample and
+    /// the windowed maximum, for comparison with the estimate. Observability.
+    pub delivery: crate::transport::delivery_sampler::DeliveryRateStats,
 }
 
 impl InstrumentSummary {
