@@ -192,6 +192,7 @@ impl IoBridge {
         stamp_departure_in(
             &mut self.transmission_ledger,
             &mut self.reliable_emitter,
+            &mut self.delivery_sampler,
             wire_seq,
             at,
         );
@@ -343,10 +344,12 @@ impl IoBridge {
         let queued = capacity.saturating_sub(conn.datagrams().send_buffer_space()) as u64;
         let ledger = &mut self.transmission_ledger;
         let emitter = &mut self.reliable_emitter;
+        let sampler = &mut self.delivery_sampler;
+        let marked_before = sampler.marked();
         self.departures
             .on_poll(wt.datagram_bytes_enqueued(), queued, now, |ws, _| {
                 if let Some(ws) = ws {
-                    stamp_departure_in(ledger, emitter, ws, now);
+                    stamp_departure_in(ledger, emitter, sampler, ws, now);
                 }
             });
         let retain =
@@ -354,6 +357,16 @@ impl IoBridge {
         for group_first in self.departures.take_departed_parity() {
             self.transmission_ledger
                 .note_parity_departed(group_first, now, retain);
+        }
+        // App-limited, in the delivery-rate draft's sense: these departures
+        // left nothing behind in admission and nothing queued in quinn, so
+        // the sender, not the path, ran out of work. `queued` is the FIFO
+        // after the batch; admission's own backlog is the F1 signal.
+        if self.delivery_sampler.marked() != marked_before
+            && queued == 0
+            && !self.admission_backlog(now)
+        {
+            self.delivery_sampler.note_no_backlog();
         }
     }
 
@@ -430,6 +443,7 @@ impl IoBridge {
             hint_feeds_before_feedback: i.hint_feeds_before_feedback,
             hint_unbounded: i.hint_unbounded,
             bwe: self.bwe.snapshot().stats,
+            delivery: self.delivery_sampler.stats(super::now_std()),
         }
     }
 
@@ -449,9 +463,14 @@ impl IoBridge {
 fn stamp_departure_in(
     ledger: &mut crate::transport::transmission_ledger::TransmissionLedger,
     emitter: &mut crate::transport::reliable_emitter::ReliableTileEmitter,
+    sampler: &mut crate::transport::delivery_sampler::DeliverySampler,
     wire_seq: u32,
     at: std::time::Instant,
 ) {
-    ledger.mark_departed(wire_seq, at, emitter.emit_us64(at));
+    if ledger.mark_departed(wire_seq, at, emitter.emit_us64(at)) {
+        ledger.mark_rate(wire_seq, |bytes, in_flight, _dep_idx| {
+            sampler.on_departure(at, bytes, in_flight)
+        });
+    }
     emitter.on_departed(wire_seq, at);
 }

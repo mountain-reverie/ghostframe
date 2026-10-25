@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::transport::delivery_sampler::RateMark;
 use crate::transport::reliable_emitter::EmitKey;
 
 /// What was sent, and what it was sent for.
@@ -124,6 +125,9 @@ struct Tombstone {
     /// `None` for time-threshold and probe verdicts, which do not adapt it.
     packet_verdict_no: Option<u64>,
     departed: Option<Instant>,
+    /// The delivery-rate mark the record carried, so a late acknowledgement
+    /// is still a delivery sample (D1 PR-6b).
+    rate: Option<RateMark>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -186,6 +190,8 @@ struct Record {
     recorded_at: Instant,
     /// When it left quinn's FIFO. `None` until then.
     departed: Option<Instant>,
+    /// The delivery-rate mark taken at departure (D1 PR-6b). Observability.
+    rate: Option<RateMark>,
     tx: Transmission,
 }
 
@@ -225,6 +231,10 @@ pub struct TransmissionLedger {
     freeze_k_pkt: bool,
     verdicts: u64,
     spurious_bits: u64,
+    /// Wire bytes of the records that have departed and not yet left the
+    /// ledger (acknowledged, declared lost, evicted or replaced): the
+    /// sampler's `bytes_in_flight`.
+    departed_bytes: u64,
 }
 
 impl TransmissionLedger {
@@ -245,6 +255,7 @@ impl TransmissionLedger {
             freeze_k_pkt: false,
             verdicts: 0,
             spurious_bits: 0,
+            departed_bytes: 0,
         }
     }
 
@@ -338,13 +349,15 @@ impl TransmissionLedger {
         let rec = Record {
             recorded_at: at,
             departed: None,
+            rate: None,
             tx: Transmission {
                 depart_us: None,
                 dep_idx: None,
                 ..tx
             },
         };
-        if self.records.insert(wire_seq, rec).is_some() {
+        if let Some(old) = self.records.insert(wire_seq, rec) {
+            self.leave(&old);
             self.stats.capacity_evictions += 1;
             self.order.retain(|w| *w != wire_seq);
         }
@@ -353,6 +366,7 @@ impl TransmissionLedger {
             match self.order.pop_front() {
                 Some(oldest) => {
                     if let Some(r) = self.records.remove(&oldest) {
+                        self.leave(&r);
                         self.stats.capacity_evictions += 1;
                         if r.departed.is_none() {
                             self.stats.evicted_before_departure += 1;
@@ -391,9 +405,53 @@ impl TransmissionLedger {
         rec.tx.depart_us = Some(depart_us);
         rec.tx.dep_idx = Some(self.next_dep_idx);
         self.next_dep_idx += 1;
+        self.departed_bytes += rec.tx.wire_bytes as u64;
         self.departed_order.push_back(wire_seq);
         self.stats.departures_stamped += 1;
         true
+    }
+
+    /// Wire bytes that have departed and are still outstanding. O(1).
+    pub fn departed_bytes_in_flight(&self) -> u64 {
+        self.departed_bytes
+    }
+
+    /// Take the delivery-rate mark for `wire_seq`, which has just been
+    /// stamped by [`Self::mark_departed`]: `make(wire_bytes,
+    /// bytes_in_flight_before, dep_idx)` builds it and the record keeps it.
+    /// O(1).
+    pub fn mark_rate(&mut self, wire_seq: u32, make: impl FnOnce(usize, u64, u64) -> RateMark) {
+        let Some(rec) = self.records.get_mut(&wire_seq) else {
+            return;
+        };
+        if rec.departed.is_none() || rec.rate.is_some() {
+            return;
+        }
+        let bytes = rec.tx.wire_bytes;
+        let before = self.departed_bytes.saturating_sub(bytes as u64);
+        let Some(dep_idx) = rec.tx.dep_idx else {
+            return;
+        };
+        rec.rate = Some(make(bytes, before, dep_idx));
+    }
+
+    /// The delivery-rate mark of `wire_seq`, outstanding or declared lost
+    /// (its tombstone keeps it), and its departure instant, for the
+    /// acknowledgement that is about to resolve it. O(1).
+    pub fn rate_mark(&self, wire_seq: u32) -> Option<(RateMark, Instant)> {
+        if let Some(rec) = self.records.get(&wire_seq) {
+            return Some((rec.rate?, rec.departed?));
+        }
+        let t = self.tombstones.get(&wire_seq)?;
+        Some((t.rate?, t.departed?))
+    }
+
+    /// A record leaves the ledger without being resolved by [`Self::resolve`]
+    /// or declared lost: keep the in-flight tally honest.
+    fn leave(&mut self, rec: &Record) {
+        if rec.departed.is_some() {
+            self.departed_bytes = self.departed_bytes.saturating_sub(rec.tx.wire_bytes as u64);
+        }
     }
 
     /// Has `wire_seq` left quinn's FIFO? `None` if the ledger does not hold it.
@@ -428,6 +486,7 @@ impl TransmissionLedger {
         self.largest_acked = None;
         self.parity_departed.clear();
         self.parity_order.clear();
+        self.departed_bytes = 0;
         self.k_pkt = K_PKT_INITIAL;
         self.verdicts = 0;
         self.spurious_bits = 0;
@@ -460,6 +519,7 @@ impl TransmissionLedger {
                     self.largest_acked = Some(idx);
                 }
             }
+            self.leave(&rec);
             return Some(Resolution::Live(rec.tx));
         }
         if let Some(t) = self.tombstones.remove(&wire_seq) {
@@ -708,6 +768,7 @@ impl TransmissionLedger {
         let Some(rec) = self.records.remove(&wire_seq) else {
             return;
         };
+        self.leave(&rec);
         if rec.departed.is_none() {
             self.stats.expired_before_departure += 1;
         }
@@ -734,6 +795,7 @@ impl TransmissionLedger {
                 tx,
                 packet_verdict_no,
                 departed: rec.departed,
+                rate: rec.rate,
             },
         );
         self.tombstone_order.push_back(wire_seq);
@@ -1453,5 +1515,83 @@ mod tests {
             proptest::prop_assert!(outstanding.is_disjoint(&lost));
             proptest::prop_assert_eq!(l.len(), outstanding.len());
         }
+    }
+
+    #[test]
+    fn departed_bytes_tally_follows_every_way_a_record_leaves() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(3);
+        let sized = |n: u32, bytes: usize| Transmission {
+            wire_bytes: bytes,
+            ..tx(n)
+        };
+        l.record(1, t0, sized(1, 100));
+        assert_eq!(
+            l.departed_bytes_in_flight(),
+            0,
+            "queued bytes are not in flight"
+        );
+        l.mark_departed(1, t0, 1);
+        assert_eq!(l.departed_bytes_in_flight(), 100);
+        l.record(2, t0, sized(2, 200));
+        l.mark_departed(2, t0, 2);
+        l.record(3, t0, sized(3, 400));
+        l.mark_departed(3, t0, 3);
+        assert_eq!(l.departed_bytes_in_flight(), 700);
+        // Resolved: leaves.
+        assert!(l.resolve(1).is_some());
+        assert_eq!(l.departed_bytes_in_flight(), 600);
+        // 3 is acknowledged ahead of 2, which makes 2 a hole; the time rule
+        // (zero threshold) declares it lost. Declared lost: leaves, and its
+        // late ack does not leave twice.
+        assert!(l.resolve(3).is_some());
+        assert_eq!(l.departed_bytes_in_flight(), 200);
+        let lost = l.detect_losses_at(t0 + Duration::from_secs(5), Duration::ZERO);
+        assert_eq!(lost.len(), 1);
+        assert_eq!(l.departed_bytes_in_flight(), 0);
+        assert!(matches!(l.resolve(2), Some(Resolution::Late { .. })));
+        assert_eq!(l.departed_bytes_in_flight(), 0);
+        // Replaced under the same wire_seq: the old departed record leaves.
+        l.record(4, t0, sized(4, 50));
+        l.mark_departed(4, t0, 4);
+        l.record(4, t0, sized(4, 70));
+        assert_eq!(l.departed_bytes_in_flight(), 0);
+        // Evicted by the capacity cap: leaves.
+        l.mark_departed(4, t0, 4);
+        assert_eq!(l.departed_bytes_in_flight(), 70);
+        for ws in 5..=7 {
+            l.record(ws, t0, sized(ws, 10));
+        }
+        assert_eq!(l.departed_bytes_in_flight(), 0, "4 was the oldest and went");
+    }
+
+    #[test]
+    fn a_rate_mark_is_taken_once_after_departure_and_read_before_resolve() {
+        use crate::transport::delivery_rate::RateSamplePacketState;
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(8);
+        let mark = |bytes: usize, before: u64, dep_idx: u64| RateMark {
+            pkt_num: bytes as u64 * 1000 + before + dep_idx,
+            state: RateSamplePacketState::default(),
+        };
+        l.record(1, t0, tx(1));
+        l.mark_rate(1, mark);
+        assert!(l.rate_mark(1).is_none(), "not departed: no mark");
+        l.mark_departed(1, t0, 1);
+        l.mark_rate(1, mark);
+        let (m, at) = l.rate_mark(1).expect("marked");
+        assert_eq!(
+            (m.pkt_num, at),
+            (1200 * 1000, t0),
+            "bytes in flight before it: 0"
+        );
+        l.mark_rate(1, |_, _, _| mark(1, 1, 1));
+        assert_eq!(l.rate_mark(1).unwrap().0, m, "taken once");
+        l.record(2, t0, tx(2));
+        l.mark_departed(2, t0, 2);
+        l.mark_rate(2, mark);
+        assert_eq!(l.rate_mark(2).unwrap().0.pkt_num, 1200 * 1000 + 1200 + 1);
+        assert!(l.resolve(1).is_some());
+        assert!(l.rate_mark(1).is_none());
     }
 }

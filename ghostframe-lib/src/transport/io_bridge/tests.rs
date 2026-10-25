@@ -6734,6 +6734,76 @@ async fn an_acknowledged_transmission_reaches_the_estimator_at_its_departure_tim
     );
 }
 
+// ---- D1 PR-6b: the delivery-rate sampler is fed by departures and ACKs ----
+
+/// Four transmissions depart, the newest is acknowledged and the three behind
+/// it are declared lost; four more depart and three are acknowledged as one
+/// batch. Each is marked at its departure, a batch makes one sample, the
+/// in-flight tally follows every way a record leaves, and a transmission
+/// declared lost leaves the tally without feeding the sampler.
+#[tokio::test]
+async fn departures_are_marked_and_an_ack_batch_makes_one_rate_sample() {
+    use crate::transport::ack::{AckBatch, AckEntry};
+    let mut bridge = make_bridge_for_test().await;
+    let now = super::now_std();
+    let t0 = now - std::time::Duration::from_millis(40);
+    for ws in 1..=4u32 {
+        bridge
+            .transmission_ledger
+            .record(ws, t0, ledger_tx(1_000, 1_200, ws));
+    }
+    for ws in 1..=4u32 {
+        bridge.stamp_departure(ws, t0 + std::time::Duration::from_millis(ws as u64));
+    }
+    assert_eq!(bridge.delivery_sampler.marked(), 4);
+    assert_eq!(bridge.transmission_ledger.departed_bytes_in_flight(), 4_800);
+    let ack = |wss: std::ops::RangeInclusive<u32>| {
+        AckBatch {
+            entries: wss
+                .map(|ws| AckEntry {
+                    wire_seq: ws,
+                    arrival_time_ms_lo16: 3,
+                })
+                .collect(),
+        }
+        .encode()
+    };
+
+    // 4 is acknowledged ahead of 1..=3, which makes them holes; the time rule
+    // (zero threshold) declares them lost. Their bytes leave the tally and
+    // they are never sampled.
+    bridge.dispatch_ack_datagram(&ack(4..=4));
+    let lost = bridge.transmission_ledger.detect_losses_at(
+        now + std::time::Duration::from_secs(60),
+        std::time::Duration::ZERO,
+    );
+    assert_eq!(lost.len(), 3, "premise: three holes behind the ack");
+    assert_eq!(bridge.transmission_ledger.departed_bytes_in_flight(), 0);
+    assert_eq!(bridge.delivery_sampler.stats(super::now_std()).acked, 1);
+
+    for ws in 1..=4u32 {
+        bridge
+            .transmission_ledger
+            .record(10 + ws, t0, ledger_tx(1_000, 1_200, ws));
+        bridge.stamp_departure(
+            10 + ws,
+            t0 + std::time::Duration::from_millis(10 + ws as u64),
+        );
+    }
+    assert_eq!(bridge.transmission_ledger.departed_bytes_in_flight(), 4_800);
+
+    bridge.dispatch_ack_datagram(&ack(11..=13));
+    let st = bridge.delivery_sampler.stats(super::now_std());
+    assert_eq!(st.acked, 4);
+    assert_eq!(st.samples, 2, "one sample per acknowledgement batch");
+    assert!(st.latest_bps > 0, "the sample carries a rate");
+    assert_eq!(bridge.transmission_ledger.departed_bytes_in_flight(), 1_200);
+
+    // A duplicate of the same batch resolves to nothing and samples nothing.
+    bridge.dispatch_ack_datagram(&ack(11..=13));
+    assert_eq!(bridge.delivery_sampler.stats(super::now_std()).samples, 2);
+}
+
 /// Forgetting the live session discards the transmissions that were queued
 /// for it and never left: they are neither lost nor delivered, so the
 /// estimator hears nothing, and nothing is left on the books to alias the
