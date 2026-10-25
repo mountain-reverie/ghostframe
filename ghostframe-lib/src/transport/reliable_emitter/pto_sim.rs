@@ -227,7 +227,7 @@ pub(super) fn run_script(sc: Script) -> Run {
             }
         }
         // The loss path, exactly as the bridge runs it each turn.
-        let out = loss_path::detect(&mut ledger, &mut e);
+        let out = loss_path::detect(&mut ledger, &mut e, now);
         let _ = out;
         let _ = loss_path::probe(&mut ledger, &mut e, now);
         let before = e.stats.rto_fired;
@@ -337,6 +337,29 @@ mod tests {
         // 3 later departures at 10 ms plus the round trip: a few tens of ms.
         let first = r.first_repair_after_drop.expect("a repair");
         assert!(first < Duration::from_millis(200), "{first:?}");
+    }
+
+    /// A slow sender (a datagram every 100 ms): a hole has at most one or two
+    /// departures behind it by the time anything could be said, so the packet
+    /// rule (three) would wait 300 ms of sending. The time rule declares it
+    /// when the next acknowledgement makes it a hole and it is 9/8 of a round
+    /// trip old, well before the packet rule and before the probe.
+    #[test]
+    fn a_hole_behind_a_slow_sender_is_found_by_the_time_rule() {
+        let mut sc = Script::steady(12);
+        sc.send_every = Duration::from_millis(100);
+        sc.drop_every = Some(6);
+        let r = run_script(sc);
+        // Datagrams 5 and 11 dropped; 11 is the tail and goes to the probe.
+        assert_eq!(r.dropped, 2, "{r:?}");
+        assert_eq!(r.passes_acked, 12, "{r:?}");
+        assert!(r.verdicts_time >= 1, "the time rule found the hole: {r:?}");
+        assert_eq!(r.verdicts_packet, 0, "{r:?}");
+        let first = r.first_repair_after_drop.expect("a repair");
+        assert!(
+            first < Duration::from_millis(250),
+            "found at the next acknowledgement, not 300 ms of sending later: {first:?}"
+        );
     }
 
     /// PR-9 depends on this: a lost final pass with nothing after it has no

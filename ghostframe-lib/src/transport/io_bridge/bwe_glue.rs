@@ -586,6 +586,7 @@ impl IoBridge {
         let out = crate::transport::loss_path::detect(
             &mut self.transmission_ledger,
             &mut self.reliable_emitter,
+            now,
         );
         self.instr.losses_declared += out.lost.len() as u64;
         self.instr.loss_retx_requested += out.retx_queued;

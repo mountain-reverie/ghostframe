@@ -6637,7 +6637,9 @@ async fn a_queued_transmission_is_not_declared_lost_and_a_departed_one_is_report
         bridge.pending_losses.iter().all(|l| l.wire_seq != 41),
         "a transmission still queued cannot have been lost"
     );
-    assert_eq!(bridge.instr.losses_declared, 2, "42 and 43");
+    // 42 and 43 by the packet rule, 44 and 45 by the time rule (a minute old,
+    // behind the acknowledged 46).
+    assert_eq!(bridge.instr.losses_declared, 4, "42 to 45");
     assert_eq!(bridge.transmission_ledger.departed(41), Some(false));
     bridge.pending_losses.clear();
 
@@ -6890,4 +6892,35 @@ async fn an_acknowledgement_far_enough_after_the_verdict_to_be_an_fec_recovery_i
     assert_eq!(bridge.instr.late_acks_fec_possible, 1);
     assert_eq!(bridge.instr.late_acked_after_flush, 0);
     assert_eq!(bridge.reliable_emitter.rtt.samples(), 0, "and not a sample");
+}
+
+/// A hole with too few departures behind it for the packet rule is found by
+/// the time rule, and the event loop wakes for it: `next_wake_deadline` carries
+/// the loss time, so it is declared at about 9/8 of a round trip and not at
+/// the probe timeout.
+#[tokio::test(start_paused = true)]
+async fn the_loss_time_of_a_hole_is_a_wake_deadline() {
+    let mut bridge = make_bridge_for_test().await;
+    bridge
+        .reliable_emitter
+        .rtt
+        .on_sample(std::time::Duration::from_millis(40));
+    let thr = crate::transport::loss_path::time_threshold(&bridge.reliable_emitter.rtt);
+    assert_eq!(thr, std::time::Duration::from_millis(45));
+    let now = super::now_std();
+    for ws in 0..3u32 {
+        bridge
+            .transmission_ledger
+            .record_departed(ws, now, ledger_tx(1_000, 1_200, ws));
+    }
+    assert!(bridge.transmission_ledger.resolve(1).is_some());
+    assert!(bridge.transmission_ledger.resolve(2).is_some());
+    // Hole at 0, two departures behind it: no packet verdict, a loss time.
+    bridge.expire_transmissions(now);
+    assert!(bridge.pending_losses.is_empty());
+    assert_eq!(bridge.next_wake_deadline(), Some(now + thr));
+    tokio::time::advance(thr).await;
+    bridge.expire_transmissions(super::now_std());
+    assert_eq!(bridge.pending_losses.len(), 1, "declared at the loss time");
+    assert_eq!(bridge.transmission_ledger.stats().lost_time_threshold, 1);
 }

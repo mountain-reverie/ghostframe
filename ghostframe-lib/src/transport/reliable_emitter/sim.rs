@@ -149,7 +149,7 @@ impl Sim {
                 None => {}
             }
         }
-        let _ = crate::transport::loss_path::detect(&mut self.ledger, &mut self.emitter);
+        let _ = crate::transport::loss_path::detect(&mut self.ledger, &mut self.emitter, self.t);
         let _ = crate::transport::loss_path::probe(&mut self.ledger, &mut self.emitter, self.t);
     }
     fn submit_many(&mut self, n: u32) {

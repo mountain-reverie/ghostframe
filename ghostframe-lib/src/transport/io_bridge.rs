@@ -1896,7 +1896,15 @@ impl IoBridge {
         // lost final pass there is no frame and no heartbeat to run it, and the
         // loop would sleep through it.
         let pto = self.reliable_emitter.pto_deadline();
-        [quic, display, close, recheck, admission, pto]
+        // And for the time rule of loss detection: a hole with too few
+        // departures behind it for the packet rule is declared when it is 9/8
+        // of a round trip old, not at the probe timeout.
+        let loss_time =
+            self.transmission_ledger
+                .next_loss_time(crate::transport::loss_path::time_threshold(
+                    &self.reliable_emitter.rtt,
+                ));
+        [quic, display, close, recheck, admission, pto, loss_time]
             .into_iter()
             .flatten()
             .min()
