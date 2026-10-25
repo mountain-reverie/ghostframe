@@ -18,10 +18,14 @@
 use std::time::Duration;
 
 use ghostframe_client_net::ClientNetEvent;
+use ghostframe_e2e::harness::browserless::FrameScript;
 use ghostframe_e2e::harness::browserless::{
     run_browserless_with_links, BrowserlessResult, BrowserlessScene, LinkOverrides, SceneLoad,
 };
-use ghostframe_e2e::harness::load_profile::{Churn, LoadProfile, PRODUCTION_CADENCE_US};
+use ghostframe_e2e::harness::load_profile::{
+    gradient_tile, Churn, LoadProfile, PRODUCTION_CADENCE_US,
+};
+use ghostframe_e2e::harness::scene_tiles::TileSpec;
 use ghostframe_e2e::netsim::{GilbertElliott, NetProfile};
 
 const COLS: u32 = 16;
@@ -834,5 +838,60 @@ async fn p2b_quinn_is_never_left_idle_while_admission_holds_work() {
             a.backlog_turns
         );
         assert!(r.transport.instr.budget.gate_depth > 0);
+    }
+}
+
+/// RC5: the client's tail sweep asks only for passes a higher pass overtook,
+/// and a screen under real loss still ends with every tile complete.
+///
+/// One full-grid CDF 5/3 frame, then silence, over a link dropping 5 % of
+/// the s2c datagrams. Premises: datagrams were dropped and NACKs repaired
+/// something (`nack_hit > 0`), or the zero below is the zero of a scene that
+/// needed no repair. Outcome: no tile is owed a pass and none has given up.
+///
+/// What this does and does not prove. Measured with the sweep disabled
+/// outright, this scene converges identically, so the sweep is not what
+/// repairs it here; the repair comes from arrival-time gap NACKs and the
+/// server's RTO. The gate guards that the evidence rule does not strand a
+/// tile. The rule itself is pinned by `ghostframe-client-core/tests/timers.rs`.
+#[tokio::test(start_paused = true)]
+async fn a_lossy_screen_converges_under_the_evidence_gated_tail_sweep() {
+    let frame = || FrameScript {
+        tiles: (0..COLS as u8)
+            .flat_map(|x| {
+                (0..ROWS as u8).map(move |y| {
+                    (
+                        (x, y),
+                        TileSpec::Cdf53 {
+                            bgra: gradient_tile(0, x, y),
+                        },
+                    )
+                })
+            })
+            .collect(),
+    };
+    for seed in [0xB0_B057u64, 0xB0_B058, 0xB0_B059] {
+        let mut sc = scene(seed, 8);
+        sc.load = SceneLoad::Script(vec![frame()]);
+        let r = run_browserless_with_links(sc, s2c_only(|p| p.loss = 0.05))
+            .await
+            .expect("scene ran");
+        assert_established("lossy", &r);
+        let c = &r.client_cdf53;
+        println!(
+            "RC5 seed={seed:#x}: dropped={} nack_hit={} nack_miss={} tiles={} complete={} partial={} gave_up={}",
+            r.s2c_datagrams_dropped, r.nack_hit, r.nack_miss, c.tiles, c.complete, c.partial, c.gave_up
+        );
+        assert!(
+            r.s2c_datagrams_dropped > 0,
+            "{seed:#x}: nothing was dropped"
+        );
+        assert!(r.nack_hit > 0, "{seed:#x}: no NACK repaired anything");
+        assert_eq!(c.tiles, COLS * ROWS, "{seed:#x}: tiles with no coverage");
+        assert_eq!(
+            (c.partial, c.gave_up, c.bitmap_unknown),
+            (0, 0, 0),
+            "{seed:#x}: tiles stranded"
+        );
     }
 }
