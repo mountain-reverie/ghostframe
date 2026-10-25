@@ -2341,7 +2341,6 @@ impl IoBridge {
                 self.reliable_emitter
                     .rtt
                     .on_sample(std::time::Duration::from_micros(rtt_us));
-                self.reliable_emitter.note_ack(s.received_at);
                 // BWE Stage 2.1: `queued_at -> ACK`, alongside (not
                 // instead of) the `last_sent_at -> ACK` pair above.
                 // Starts earlier (when the work was queued rather than

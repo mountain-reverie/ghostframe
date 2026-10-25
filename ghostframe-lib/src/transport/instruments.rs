@@ -605,6 +605,9 @@ pub struct InstrumentSummary {
     pub loss_retx_requested: u64,
     pub nack_miss_pending: u64,
     pub nack_miss_not_owed: u64,
+    /// Late acknowledgements that arrived far enough after their verdict to be
+    /// an FEC recovery (not retracted, not adapted to).
+    pub late_acks_fec_possible: u64,
     pub pto_probes_requested: u64,
     pub pto_fires: u64,
     pub loss_retransmits: u64,

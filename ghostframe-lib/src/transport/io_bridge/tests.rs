@@ -1833,10 +1833,11 @@ async fn the_classifiers_loss_rate_is_the_ledgers_verdict() {
     assert_eq!(bridge.instr.losses_declared, 80);
     assert_eq!(bridge.adaptation_context.loss_rate, 0.0);
 
-    // One of them turns up after all.
+    // One of them turns up after all: the last unacknowledged one (fewer
+    // than an FEC distance of departures later, so it cannot be a recovery).
     let late = crate::transport::ack::AckBatch {
         entries: vec![crate::transport::ack::AckEntry {
-            wire_seq: 0,
+            wire_seq: 395,
             arrival_time_ms_lo16: 0,
         }],
     };
@@ -6692,9 +6693,11 @@ async fn an_acknowledged_transmission_reaches_the_estimator_at_its_departure_tim
 /// Forgetting the live session discards the transmissions that were queued
 /// for it and never left: they are neither lost nor delivered, so the
 /// estimator hears nothing, and nothing is left on the books to alias the
-/// next connection that reuses the handle. Ones that did leave stay.
+/// next connection that reuses the handle. Ones that did leave go too (since
+/// PR-5): outstanding, they would be declared lost into the next connection's
+/// estimator, and its adapted threshold would carry over.
 #[tokio::test]
-async fn forgetting_a_session_discards_what_never_left_and_keeps_what_did() {
+async fn forgetting_a_session_clears_the_ledger() {
     let h = ConnectionHandle(7);
     let mut bridge = test_bridge_with_sessions(&[h]).await;
     let now = super::now_std();
@@ -6712,19 +6715,53 @@ async fn forgetting_a_session_discards_what_never_left_and_keeps_what_did() {
     assert!(bridge.departures.is_empty());
     assert_eq!(bridge.departures_handle, None);
     assert_eq!(bridge.transmission_ledger.departed(1), None, "discarded");
-    assert_eq!(bridge.transmission_ledger.departed(2), Some(true), "kept");
+    assert_eq!(
+        bridge.transmission_ledger.departed(2),
+        None,
+        "and the departed"
+    );
+    assert_eq!(bridge.transmission_ledger.len(), 0);
+}
+
+/// A loss verdict from the old session cannot reach the new connection's
+/// estimator: the old session's outstanding records are gone, and a threshold
+/// the old path's reordering raised is back at its initial value.
+#[tokio::test]
+async fn a_new_session_does_not_inherit_the_old_sessions_verdicts() {
+    let h = ConnectionHandle(7);
+    let mut bridge = test_bridge_with_sessions(&[h]).await;
+    let now = super::now_std();
+    // Five departures, the last acknowledged: two are lost, three outstanding.
+    for ws in 0..5u32 {
+        bridge
+            .transmission_ledger
+            .record_departed(ws, now, ledger_tx(1_000, 1_200, ws));
+    }
+    assert!(bridge.transmission_ledger.resolve(4).is_some());
+    bridge.track_enqueue(h, Some(1), 100);
+    bridge.forget_session(h);
+    // The new connection acknowledges one of its own.
+    bridge
+        .transmission_ledger
+        .record_departed(100, now, ledger_tx(1_000, 1_200, 100));
+    assert!(bridge.transmission_ledger.resolve(100).is_some());
+    bridge.expire_transmissions(now);
+    assert!(
+        bridge.pending_losses.is_empty(),
+        "the old session's transmissions were declared lost into the new one"
+    );
+    assert_eq!(bridge.instr.losses_declared, 0);
 }
 
 // ---- F4 part 2: a verdict contradicted by a late acknowledgement is undone ----
 
 /// Eifel response: the acknowledgement of a transmission already declared lost
-/// retracts the loss from the loss window and from the pending list, ends the
-/// PTO backoff, and its (long) round trip is absorbed into srtt, which
-/// lengthens the next time threshold and PTO. goog_cc cannot be told to forget,
+/// retracts the loss from the loss window and from the pending list and ends
+/// the PTO backoff; its (long) round trip is not a sample. goog_cc cannot be told to forget,
 /// and the instruments say how much it was told (`late_acked_after_flush`).
 /// Skipping the retraction leaves the loss rate and the pending loss standing.
 #[tokio::test(start_paused = true)]
-async fn a_spurious_verdict_is_retracted_and_its_round_trip_absorbed() {
+async fn a_spurious_verdict_is_retracted_and_its_round_trip_is_not_a_sample() {
     use crate::transport::ack::{AckBatch, AckEntry};
     let mut bridge = make_bridge_for_test().await;
     bridge
@@ -6764,12 +6801,14 @@ async fn a_spurious_verdict_is_retracted_and_its_round_trip_absorbed() {
     );
     assert_eq!(bridge.pending_losses_retracted, 1);
     assert_eq!(bridge.reliable_emitter.rtt.pto_count(), 0, "backoff reset");
-    assert!(
-        bridge.reliable_emitter.rtt.srtt() > srtt_before,
-        "srtt absorbed the late round trip: {:?} vs {:?}",
+    // The late round trip is NOT a sample: it includes the time the verdict
+    // beat it by (and a recovered datagram's reflects the parity).
+    assert_eq!(
         bridge.reliable_emitter.rtt.srtt(),
-        srtt_before
+        srtt_before,
+        "a late acknowledgement must not move srtt"
     );
+    assert_eq!(bridge.reliable_emitter.rtt.samples(), 1);
     assert_eq!(bridge.transmission_ledger.stats().spurious_losses, 1);
 }
 
@@ -6820,4 +6859,35 @@ async fn the_probe_timeout_is_a_wake_deadline() {
     bridge.poll_pto(super::now_std());
     assert_eq!(bridge.reliable_emitter.pending_loss_count(), 1);
     assert_eq!(bridge.instr.pto_probes_requested, 1);
+}
+
+/// The client acks a datagram it rebuilt from parity under its original
+/// `wire_seq`, long after the verdict. That is a loss that happened: it stays in
+/// the pending list and the loss window and is counted apart. (A prompt late
+/// acknowledgement is retracted: `a_spurious_verdict_is_retracted_...`.)
+#[tokio::test(start_paused = true)]
+async fn an_acknowledgement_far_enough_after_the_verdict_to_be_an_fec_recovery_is_not_retracted() {
+    use crate::transport::ack::{AckBatch, AckEntry};
+    let mut bridge = make_bridge_for_test().await;
+    let now = super::now_std();
+    for ws in 0..30u32 {
+        bridge
+            .transmission_ledger
+            .record_departed(ws, now, ledger_tx(1_000, 1_200, ws));
+    }
+    bridge.declare_lost_for_test(&[3]);
+    assert_eq!(bridge.pending_losses.len(), 1, "premise: declared lost");
+    let batch = AckBatch {
+        entries: vec![AckEntry {
+            wire_seq: 3,
+            arrival_time_ms_lo16: 1,
+        }],
+    };
+    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.retract_late_acked_losses();
+    assert_eq!(bridge.pending_losses.len(), 1, "a real loss stays reported");
+    assert_eq!(bridge.pending_losses_retracted, 0);
+    assert_eq!(bridge.instr.late_acks_fec_possible, 1);
+    assert_eq!(bridge.instr.late_acked_after_flush, 0);
+    assert_eq!(bridge.reliable_emitter.rtt.samples(), 0, "and not a sample");
 }
