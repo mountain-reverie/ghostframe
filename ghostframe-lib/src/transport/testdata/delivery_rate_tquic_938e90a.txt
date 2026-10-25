@@ -14,6 +14,16 @@
 #         R <delivery_rate> <delivered> <sample_delivered>
 #           <sample_prior_delivered> <sample_app_limited> <sample_rtt_us>
 #                                         upstream's reading after the A above
+#
+# To regenerate (from the repository root; the harness is tools/tquic-delivery-rate-vectors,
+# a standalone crate outside the workspace):
+#   D=tools/tquic-delivery-rate-vectors; S=$(mktemp -d)
+#   curl -sSL -o $D/src/delivery_rate.rs \
+#     https://raw.githubusercontent.com/Tencent/tquic/938e90adb460b5ff08b2bc6d11a3e1ba52c27a8d/src/congestion_control/delivery_rate.rs
+#   python3 $D/gen_trace.py > $S/trace_in.txt
+#   cargo run --release --manifest-path $D/Cargo.toml -- $S/trace_in.txt > $S/trace_out.txt
+#   { grep '^#' <this file>; cat $S/trace_out.txt; } > <this file>.new   # keep this header
+# The result is byte-identical to the body below (checked when this recipe was written).
 S 0 1 700 0 0
 S 100 2 1200 700 0
 S 200 3 1200 1900 0

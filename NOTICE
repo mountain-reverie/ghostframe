@@ -15,6 +15,7 @@ Tencent TQUIC (Apache License 2.0)
   Here:     ghostframe-lib/src/transport/delivery_rate.rs
 
   Copyright (c) 2023 The TQUIC Authors.
+  Copyright (C) 2023 THL A29 Limited, a Tencent company. All rights reserved.
 
   Licensed under the Apache License, Version 2.0 (the "License"); you may
   not use this file except in compliance with the License. You may obtain a
@@ -28,7 +29,16 @@ Tencent TQUIC (Apache License 2.0)
   License for the specific language governing permissions and limitations
   under the License.
 
-  The file keeps TQUIC's licence header. Changes from upstream are listed in
+  Upstream ships no NOTICE file (the commit above has none), so there are no
+  upstream attribution notices to reproduce beyond the copyright lines above.
+  The full licence text is in LICENSES/Apache-2.0.txt, taken from upstream's
+  LICENSE.
+
+  The struct shapes of SentPacket and RateSamplePacketState come from
+  src/connection/space.rs at the same commit.
+
+  The file keeps TQUIC's licence header and is marked as modified by the
+  Ghostframe authors. Changes from upstream are listed in
   its module documentation: the connection, path and packet-number-space types
   are replaced by two small structs, `Default` is replaced by `new(now)`, and
   one accessor is added. The estimator arithmetic is unchanged.
