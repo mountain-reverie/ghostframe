@@ -98,8 +98,8 @@ pub use crate::harness::load_profile::PRODUCTION_CADENCE_US as DEFAULT_CADENCE_U
 /// doc comment on why heartbeats exist at all). Deliberately much coarser
 /// than `FRAME_SPACING_US`: the sole purpose of a heartbeat is to reach
 /// `IoBridge::apply_injected_frame`'s unconditional admission pass
-/// (`pump_admission`, which also fires due retransmissions) often enough that a cached, unacked fragment's RTO deadline (floor
-/// 25ms, see `reliable_emitter::rto::rto_for_attempt`) gets checked well
+/// (`pump_admission`, which also fires due retransmissions) often enough that a cached, unacked fragment's RTO deadline (a
+/// probe timeout, see `reliable_emitter::rto::pto_for_attempt`) gets checked well
 /// before `scene.duration` runs out — not to reproduce a particular real
 /// capture framerate. Ticking at `FRAME_SPACING_US` (16ms) would work too,
 /// but multiplies the outer event loop's iteration count by
@@ -504,6 +504,12 @@ pub struct BrowserlessResult {
     /// way). `rto_fired - rto_spurious - rto_useful` fired for passes not
     /// acknowledged by the end of the scene.
     pub rto_spurious: u64,
+    /// RTO fires whose pass was first acknowledged through the original (see
+    /// `EmitterStats::rto_original_first`). The share of `rto_fired` that
+    /// this is, is the spurious-timeout rate; `rto_spurious` above reverts to
+    /// useful once the retransmission is acknowledged too, which it nearly
+    /// always is.
+    pub rto_original_first: u64,
     /// RTO fires whose pass was repaired by the retransmission.
     pub rto_useful: u64,
     /// quinn path stats, send-queue depth and the client's feedback totals,
@@ -1104,6 +1110,7 @@ async fn run_inner(
         retransmit_attempts_total: emitter_stats.retransmit_attempts_total,
         retransmit_by_nack: emitter_stats.retransmit_by_nack,
         rto_spurious: emitter_stats.rto_spurious,
+        rto_original_first: emitter_stats.rto_original_first,
         rto_useful: emitter_stats.rto_useful,
         transport,
         client_wire_loss: client_probe.wire_loss,

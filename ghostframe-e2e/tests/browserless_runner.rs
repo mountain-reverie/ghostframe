@@ -530,6 +530,11 @@ async fn bwe_estimator_is_fed_and_epoch_consistent() {
 /// an acknowledgement is back long before any timer could fire. The bug this
 /// guards lives entirely in the gap between that and a real path.
 ///
+/// (Since D1 F4 the deadline is an RFC 9002 probe timeout from the
+/// departure-based RTT estimator, `rto::pto_for_attempt`; the p95 x 2 formula
+/// and its 150 ms floor described below are gone. The history stays because
+/// the failure modes it lists are still the ones to rule out.)
+///
 /// `rto_for_attempt` used to compute `min(max(2 x smoothed_rtt, 25ms),
 /// BASE_RTO_MS)` for a first attempt, and `BASE_RTO_MS` was 50 ms. That `min`
 /// was a *ceiling*: no matter how slow the path, the first retransmission
