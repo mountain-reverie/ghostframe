@@ -1,5 +1,6 @@
 //! Central facade that ties cache, emission queue, allocator, group
-//! builder, and RTO wheel into one struct. Per-session.
+//! builder, the loss-path queue and the probe timer into one struct.
+//! Per-session.
 
 use crate::transport::protocol::TileParityEnvelope;
 use crate::transport::reliable_emitter::cache::{CacheEntry, ProbeTag, RetransmitCache};
@@ -32,12 +33,13 @@ pub struct ReliableTileEmitter {
     pub(crate) alloc: WireSeqAllocator,
     pub(crate) queue: EmissionQueue,
     pub(crate) group: GroupBuilder,
-    /// Per pass that RTO'd and is not acknowledged yet: the first
-    /// retransmission's `wire_seq` and how many times it fired. Resolved by
+    /// Per pass the loss path resent and that is not acknowledged yet: the
+    /// first retransmission's `wire_seq`, how many times it was resent and by
+    /// whom (a verdict or the probe). Resolved by
     /// [`Self::note_ack_origin`]. Measurement only.
     rto_origin: HashMap<EmitKey, RtoOrigin>,
     /// Per tile: the generation of the last first-fragment tile datagram
-    /// emitted for it. Only read when an RTO fires, to tell a fire for the
+    /// emitted for it. Only read when the loss path resends, to tell a resend for the
     /// tile's current content from one for content it has moved past
     /// (`rto_fired_superseded`). Measurement only.
     latest_tile_generation: HashMap<(u8, u8), u8>,
@@ -68,7 +70,7 @@ pub struct ReliableTileEmitter {
     /// carried.
     transmissions: Vec<EmittedDatagram>,
     /// Passes the client has asked for again, waiting for retransmit
-    /// budget. Served oldest first by `tick_budgeted`, ahead of the RTO.
+    /// budget. Served oldest first by `tick_budgeted`, ahead of the loss path.
     ///
     /// A queue rather than an immediate send because a NACK arrives when the
     /// client decides to send it, which has nothing to do with whether the
@@ -85,6 +87,14 @@ pub struct ReliableTileEmitter {
     /// here at most once.
     pending_loss: VecDeque<(EmitKey, RetxCause, u32)>,
     pending_loss_set: HashSet<EmitKey>,
+    /// Passes a loss verdict declined to resend ([`RetxRequest::Deferred`]),
+    /// oldest first, left to the probe timeout. Their latest transmission has
+    /// been declared lost, so the ledger no longer shows them as outstanding and
+    /// the probe's scan of the newest departures cannot find them: this list is
+    /// how the probe does. Without it a pass lost four times running would sit in
+    /// the cache until the 30 s backstop.
+    deferred: VecDeque<EmitKey>,
+    deferred_set: HashSet<EmitKey>,
     /// Wire bytes each datagram costs beyond its own length (the
     /// WebTransport framing), added to what `tick_budgeted` bills. Zero
     /// unless the transport sets it.
@@ -151,16 +161,18 @@ pub struct EmitterStats {
     /// NACKs for a fragment that already had a request waiting for budget.
     /// The client repeats itself every tail sweep; these cost nothing.
     pub nack_deduped: u64,
-    /// Of `retransmit_attempts_total`, those a NACK asked for (the rest are
-    /// RTO fires: `rto_fired`). Measurement only.
+    /// Of `retransmit_attempts_total`, those a NACK asked for (the rest are the
+    /// loss path's: `rto_fired`). Measurement only.
     pub retransmit_by_nack: u64,
-    /// RTO fires whose pass was then acknowledged by a transmission sent
-    /// BEFORE the first retransmission: the timer fired for data that was
-    /// still on its way. Measurement only.
+    /// Loss-path resends (`rto_fired`) whose pass was then acknowledged by a
+    /// transmission sent BEFORE the first resend: the data was still on its way.
+    /// Takes its verdict back when the resend is acknowledged too (nearly always;
+    /// every duplicate is acknowledged), so it reads far too low; see
+    /// `rto_original_first`. Measurement only.
     pub rto_spurious: u64,
-    /// RTO fires whose pass was first acknowledged through a transmission sent
-    /// before the first retransmission: the original arrived, so the timer
-    /// fired for data that was only late (the Eifel test, RFC 3522). Unlike
+    /// Loss-path resends whose pass was first acknowledged through a
+    /// transmission sent before the first resend: the original arrived, so the
+    /// verdict or probe was premature (the Eifel test, RFC 3522). Unlike
     /// `rto_spurious` this verdict is final: the acknowledgement of the
     /// retransmission that follows an acknowledged original (every duplicate
     /// is acknowledged) does not turn it into a useful fire. Measurement only.
@@ -170,9 +182,9 @@ pub struct EmitterStats {
     /// `rto_original_first + rto_useful` can exceed `rto_fired`. Read it as a
     /// share of `rto_fired`, not as a partition.
     pub rto_original_first: u64,
-    /// RTO fires whose pass was acknowledged by a retransmission: the timer
-    /// earned its keep. `rto_fired - rto_spurious - rto_useful` fired for
-    /// passes not acknowledged yet. Measurement only.
+    /// Loss-path resends whose pass was acknowledged by a retransmission: the
+    /// resend earned its keep. `rto_fired - rto_spurious - rto_useful` were
+    /// for passes not acknowledged yet. Measurement only.
     pub rto_useful: u64,
     /// Retransmissions made because a loss verdict (packet or time threshold)
     /// named a transmission whose content was still current.
@@ -200,7 +212,7 @@ pub struct EmitterStats {
     pub spurious_loss: u64,
     /// The same for probe retransmissions: spurious probes.
     pub spurious_pto: u64,
-    /// Times the RTO bookkeeping hit its cap and was dropped; fires made
+    /// Times the resend bookkeeping hit its cap and was dropped; resends made
     /// before a reset and not yet acknowledged are never attributed.
     pub rto_origin_resets: u64,
     /// First-fragment tile datagrams emitted at a different generation from
@@ -211,15 +223,15 @@ pub struct EmitterStats {
     /// premise). Zero means no tile changed and a zero there proves nothing.
     /// Measurement only.
     pub generation_replacements: u64,
-    /// RTO fires for a pass whose tile has since been emitted at a different
-    /// generation: the timer re-sent content the client will discard
+    /// Loss-path resends for a pass whose tile has since been emitted at a
+    /// different generation: the path re-sent content the client will discard
     /// unacknowledged, so the fire can never be settled. Zero by construction
     /// while every supersession cancels the cache; non-zero means a path
     /// replaces tile content without cancelling. Measurement only.
     pub rto_fired_superseded: u64,
 }
 
-/// What is known about a pass that RTO'd: the first retransmission's
+/// What is known about a pass the loss path resent: the first retransmission's
 /// `wire_seq`, how many times it fired, and whether those fires are already
 /// counted as spurious (an older transmission was acknowledged) so a later
 /// acknowledgement of a retransmission can move them to useful.
@@ -277,7 +289,7 @@ pub enum RetxRequest {
     Deferred,
 }
 
-/// Most passes whose RTO history is tracked at once. Measurement only: a
+/// Most passes whose resend history is tracked at once. Measurement only: a
 /// pass that fires and is never acknowledged (cancelled, retired, or every
 /// copy lost) would otherwise sit here forever. At the cap the whole table is
 /// dropped and `rto_origin_resets` counts it, so the newest fires stay
@@ -308,6 +320,8 @@ impl ReliableTileEmitter {
             pending_nack_set: HashSet::new(),
             pending_loss: VecDeque::new(),
             pending_loss_set: HashSet::new(),
+            deferred: VecDeque::new(),
+            deferred_set: HashSet::new(),
             wire_overhead: 0,
             stats: EmitterStats::default(),
         }
@@ -478,7 +492,7 @@ impl ReliableTileEmitter {
     /// and hand it to the emission queue.
     ///
     /// Every site that allocates a `wire_seq` for a source transmission —
-    /// `submit_one`, `tick`'s RTO retransmit, and `on_nack` — must route
+    /// `submit_one`, `tick`'s loss-path retransmit, and `on_nack` — must route
     /// through here rather than each building its own envelope. The
     /// decoder reconstructs a group's membership as a contiguous run of
     /// `k` wire_seqs starting at `group_first_wire_seq`, so if any
@@ -562,15 +576,15 @@ impl ReliableTileEmitter {
         );
     }
 
-    /// An acknowledgement named `wire_seq` for pass `key`. If that pass had
-    /// RTO'd: an acknowledgement for a transmission sent BEFORE the first
-    /// retransmission counts its fires as spurious (the timer fired for data
-    /// still on its way); one for the retransmission or later counts them as
+    /// An acknowledgement named `wire_seq` for pass `key`. If the loss path had
+    /// resent that pass: an acknowledgement for a transmission sent BEFORE the
+    /// first resend counts those resends as spurious (the data was still on its
+    /// way); one for the retransmission or later counts them as
     /// useful and overrides an earlier spurious verdict, because a
     /// multi-fragment pass is acknowledged fragment by fragment and the
     /// first entry may be a fragment that was never lost. Measurement only:
     /// changes no state the emitter acts on. A NACK retransmission is
-    /// indistinguishable from the RTO's here, so a pass both fired and
+    /// indistinguishable from the loss path's here, so a pass both resent and
     /// NACKed is attributed by whichever transmission was acknowledged.
     pub fn note_ack_origin(&mut self, key: EmitKey, wire_seq: u32) {
         let Some(e) = self.rto_origin.get_mut(&key) else {
@@ -948,9 +962,10 @@ impl ReliableTileEmitter {
     /// every stalled tile each 500 ms, and nothing between that and the wire
     /// knew what the link could carry. See `tick_budgeted`.
     ///
-    /// The RTO heap entry for this key stays in place; `tick_budgeted` bumps
-    /// `attempts` when the datagram actually goes out, and the RTO re-fires
-    /// with the capped backoff from there. No heap removal is required.
+    /// A loss verdict or probe request already waiting for this pass becomes
+    /// stale when the NACK repair goes out (it is the pass's newest transmission
+    /// then) and is dropped at send time; `tick_budgeted` bumps `attempts` when
+    /// the datagram actually goes out.
     ///
     /// `_now` is unused now that the send is deferred, and kept so callers
     /// continue to pass the clock they use for `submit_one` / `tick`.
@@ -1004,8 +1019,8 @@ impl ReliableTileEmitter {
 
     pub fn cancel_for_tile(&mut self, tile_x: u8, tile_y: u8) {
         self.cache.cancel_for_tile(tile_x, tile_y);
-        // RTO heap entries are left in place; validation-on-pop in tick() will
-        // drop them when the cache lookup misses.
+        // Loss-path requests still queued for the tile are dropped when they
+        // come up and the cache lookup misses.
     }
 
     /// Drop every cached entry. Called from `IoBridge::Event::ConnectionLost`
@@ -1016,17 +1031,19 @@ impl ReliableTileEmitter {
         self.latest_tile_generation.clear();
         self.pending_loss.clear();
         self.pending_loss_set.clear();
+        self.deferred.clear();
+        self.deferred_set.clear();
         // The estimator and the acknowledgement progress describe the
         // connection that is gone. Its PTO backoff, srtt and "newest ACK"
         // must not hold back or delay the next connection's first passes.
         self.reset_connection_state();
-        // RTO heap entries will validate against the empty cache on pop
-        // and silently skip; no need to flush the heap.
+        // Queued loss-path requests are dropped when they come up and the
+        // cache lookup misses.
     }
 
     /// Forget everything measured on the current connection: the RTT
     /// estimator (back to RFC 9002's initial RTT, backoff zero) and the
-    /// acknowledgement progress the hold-back reads.
+    /// newest-acknowledgement time and departure the probe timer runs from.
     pub fn reset_connection_state(&mut self) {
         self.rtt = RttEstimator::new();
         self.last_ack_at = None;
@@ -1108,6 +1125,23 @@ impl ReliableTileEmitter {
         }
     }
 
+    /// Up to `n` passes left to the probe by a declined verdict, oldest first,
+    /// each with the `wire_seq` of its newest transmission. Passes that have
+    /// since been acknowledged or cancelled are dropped on the way.
+    pub fn take_deferred(&mut self, n: usize) -> Vec<(EmitKey, u32)> {
+        let mut out = Vec::new();
+        while out.len() < n {
+            let Some(key) = self.deferred.pop_front() else {
+                break;
+            };
+            self.deferred_set.remove(&key);
+            if let Some(e) = self.cache.get(&key) {
+                out.push((key, e.latest_ws));
+            }
+        }
+        out
+    }
+
     /// Transmission `wire_seq` of pass `key` was declared lost (packet or time
     /// threshold) or is being probed (the timeout expired with it among the
     /// newest outstanding). If its content is current, queue one retransmission
@@ -1131,7 +1165,12 @@ impl ReliableTileEmitter {
             RetxRequest::ContentGone => self.stats.verdict_content_gone += 1,
             RetxRequest::NewerInFlight => self.stats.verdict_newer_in_flight += 1,
             RetxRequest::AlreadyQueued => self.stats.verdict_already_queued += 1,
-            RetxRequest::Deferred => self.stats.verdict_deferred_to_pto += 1,
+            RetxRequest::Deferred => {
+                self.stats.verdict_deferred_to_pto += 1;
+                if self.deferred_set.insert(key) {
+                    self.deferred.push_back(key);
+                }
+            }
             RetxRequest::Disabled => {}
         }
         r

@@ -117,13 +117,14 @@ struct Tombstone {
 pub struct LedgerStats {
     /// Acknowledgements naming a `wire_seq` this ledger has no record of.
     /// Either a duplicate (the overlap entries every ACK batch carries, or a
-    /// genuinely duplicated datagram) or an acknowledgement that arrived after
-    /// its horizon expired. Counted rather than silent: a sustained rise means
-    /// the horizon is too short, or a peer is confused.
+    /// genuinely duplicated datagram) or an acknowledgement for a verdict whose
+    /// tombstone the ring has since evicted. Counted rather than silent: a
+    /// sustained rise means verdicts are outrunning acknowledgements by more
+    /// than the tombstone ring holds, or a peer is confused.
     pub unknown_acks: u64,
-    /// Records dropped by the hard cap rather than by the horizon. Non-zero
+    /// Records dropped by the hard cap rather than by a verdict. Non-zero
     /// means transmissions outran acknowledgements badly enough that the cap
-    /// bound the ledger instead of time — the loss ratio is under-reported
+    /// bound the ledger instead of the detector — the loss ratio is under-reported
     /// while this is rising.
     pub capacity_evictions: u64,
     /// Acknowledgements that arrived after their transmission had been
@@ -167,7 +168,7 @@ pub struct LedgerStats {
 #[derive(Debug, Clone, Copy)]
 struct Record {
     /// When the ledger was told of it (enqueue). Identity and capacity order
-    /// only: the loss clock is `departed`.
+    /// only: loss is judged on departure (`departed`, `dep_idx`).
     #[allow(dead_code)]
     recorded_at: Instant,
     /// When it left quinn's FIFO. `None` until then.
@@ -180,14 +181,14 @@ pub struct TransmissionLedger {
     /// Recording order, for the capacity cap: the oldest record goes first.
     /// Resolved entries are skipped lazily.
     order: VecDeque<u32>,
-    /// Departure order, for the loss clock. A transmission enters when it is
+    /// Departure order, for loss detection. A transmission enters when it is
     /// stamped, so the front is always the one that has been on the wire the
-    /// longest and the walk in `expire_with_seq` stops at the first young
+    /// longest and the walk in `detect_losses_at` stops at the first not lost
     /// one. Resolved entries are skipped lazily.
     departed_order: VecDeque<u32>,
     capacity: usize,
     stats: LedgerStats,
-    /// `wire_seq -> Transmission` for expired records, retained so a late
+    /// `wire_seq -> Tombstone` for records declared lost, retained so a late
     /// acknowledgement can still release its content. Bounded by the same
     /// capacity as `records`; oldest evicted first.
     tombstones: HashMap<u32, Tombstone>,
@@ -264,7 +265,7 @@ impl TransmissionLedger {
     /// replaced and counted as a capacity eviction rather than silently
     /// dropped, since it can no longer be classified.
     ///
-    /// Recording is identity only. The loss clock does not start until
+    /// Recording is identity only. The transmission is in no departure order until
     /// [`Self::mark_departed`]: a transmission still queued in the emitter or
     /// in quinn's FIFO has not been sent, so it cannot have been lost.
     pub fn record(&mut self, wire_seq: u32, at: Instant, tx: Transmission) {
@@ -308,7 +309,7 @@ impl TransmissionLedger {
     }
 
     /// Stamp `wire_seq` as having left quinn's FIFO at `at` (`depart_us` on
-    /// the emitter's clock). From here the loss clock runs.
+    /// the emitter's clock). From here it has a departure index and a time and can be judged.
     ///
     /// Returns whether it stamped a record: `false` for a transmission that
     /// is unknown (already acknowledged, expired, evicted) or already
