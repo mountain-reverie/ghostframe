@@ -616,7 +616,10 @@ async fn run_cell(c: &Cell) -> CellResult {
     let mut frames = vec![first_paint];
     frames.extend(
         region(tiles_for(OVERDRIVE * c.rate_mbit as f64)).frames_for(
-            Duration::from_secs(secs - 1),
+            // The full duration, not `secs - 1`: injection starts after the
+            // handshake, so a shorter profile left about a second of
+            // heartbeat-only tail and `final_est_bps` was read inside it.
+            Duration::from_secs(secs),
             cols,
             rows,
         ),

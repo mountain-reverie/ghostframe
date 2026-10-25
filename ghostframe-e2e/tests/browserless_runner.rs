@@ -1787,3 +1787,66 @@ async fn a_slow_lossy_handshake_is_not_closed_as_never_hello() {
         .await
         .expect("a legitimate client on a 10% loss link must get a session");
 }
+
+/// D1 PR-1 (F5): once a scripted scene's frames run out, the heartbeats that
+/// keep the admission pass running tick at the scene's `cadence_us`, not at a
+/// harness constant. A cadence that is neither the old 100 ms heartbeat nor
+/// the default 33 ms makes the two distinguishable.
+///
+/// Premises are checked before the property: frames were injected, and a long
+/// tail of heartbeats followed them (a loop that never reached the heartbeat
+/// path would pass any interval assertion vacuously).
+///
+/// Mutation: restore `spacing_us = HEARTBEAT_SPACING_US` (100 ms) in
+/// `drive_session`; the tail intervals read 100 ms and this fails.
+#[tokio::test(start_paused = true)]
+async fn heartbeats_tick_at_the_scenes_cadence() {
+    const CADENCE_US: u64 = 40_000;
+    let scene = BrowserlessScene {
+        seed: 7,
+        tick_budget_floor_bytes: None,
+        datagram_send_buffer_bytes: None,
+        load: SceneLoad::Script(busy_frames_grid(3, 2, 2)),
+        cadence_us: CADENCE_US,
+        net: NetProfile::perfect(),
+        drops: Default::default(),
+        duration: Duration::from_secs(3),
+        grid_cols: 2,
+        grid_rows: 2,
+    };
+    let result = run_browserless(scene).await.expect("scene ran");
+
+    let frames = result.injections.iter().filter(|(_, hb)| !*hb).count();
+    let beats = result.injections.iter().filter(|(_, hb)| *hb).count();
+    assert_eq!(frames, 3, "all three scene frames must be injected");
+    assert!(
+        beats >= 10,
+        "the post-frame tail must hold many heartbeats, got {beats}"
+    );
+
+    // Every interval from the last scene frame onwards, frame -> heartbeat
+    // included.
+    let tail: Vec<u64> = result
+        .injections
+        .iter()
+        .skip(frames - 1)
+        .map(|(t, _)| *t)
+        .collect();
+    for w in tail.windows(2) {
+        let gap = w[1] - w[0];
+        assert!(
+            gap.abs_diff(CADENCE_US) <= 1_000,
+            "injection interval {gap} us differs from cadence {CADENCE_US} us by more than 1 ms"
+        );
+    }
+
+    // The heartbeats cover the whole tail: the last one lands within one
+    // cadence (and the tolerance) of the scene's end, so a loop that stopped
+    // early cannot pass on a handful of well-spaced beats.
+    let last = *tail.last().expect("tail is non-empty");
+    let end_us = 3_000_000;
+    assert!(
+        last + CADENCE_US + 1_000 >= end_us,
+        "heartbeats stop at {last} us, more than one cadence before the scene's end at {end_us} us"
+    );
+}
