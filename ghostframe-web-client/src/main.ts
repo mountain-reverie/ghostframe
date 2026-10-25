@@ -186,12 +186,13 @@ async function main() {
 
   // Per-tile Cdf53 coverage, for e2e assertions.
   //
-  // The interesting fields are `gave_up` (tiles that exhausted
-  // MAX_TAIL_SWEEP_ATTEMPTS and stopped asking, so they are stranded at a
-  // partial pass set for the rest of the session) and `partial` (tiles still
-  // owed passes). A production-shaped scene that ends with either non-zero
-  // has reproduced the stale-tile symptom; `incomplete` then names the
-  // coordinates and the missing-pass mask.
+  // The interesting fields are `partial` (tiles still owed passes: the
+  // stranding signal) and `gave_up` (tiles that exhausted
+  // MAX_TAIL_SWEEP_ATTEMPTS on a known gap that was never repaired). A tile
+  // whose final pass was lost has no gap evidence, so it never asks and shows
+  // only in `partial`. A production-shaped scene that ends with either
+  // non-zero has reproduced the stale-tile symptom; `incomplete` then names
+  // the coordinates and the missing-pass mask.
   //
   // Exposed here rather than scraped from the log line so a test asserts on
   // structured state instead of parsing prose.

@@ -702,3 +702,52 @@ fn the_same_number_with_a_newer_label_starts_a_new_generation() {
     assert!(out.new_generation && out.committed);
     assert_eq!((out.entry.frame_seq, out.entry.pass_mask), (200, 1));
 }
+
+// ---- gap evidence (D1 PR-9) ----
+
+fn evidence_entry(highest: Option<u8>) -> CoverageEntry {
+    CoverageEntry {
+        highest_pass_seen: highest,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn gap_evidence_mask_admits_passes_up_to_and_including_the_highest_seen() {
+    let all: u16 = 0x3FFF;
+    // No arrival, no evidence.
+    assert_eq!(evidence_entry(None).gap_evidence_mask(all), 0);
+    // h = 0: pass 0 itself is admitted (a failed pass 0), nothing above.
+    assert_eq!(evidence_entry(Some(0)).gap_evidence_mask(all), 0b1);
+    assert_eq!(evidence_entry(Some(0)).gap_evidence_mask(0b10), 0);
+    // h = 5: passes 0..=5, not 6.
+    assert_eq!(evidence_entry(Some(5)).gap_evidence_mask(all), 0b11_1111);
+    // h = 13: every real pass.
+    assert_eq!(evidence_entry(Some(13)).gap_evidence_mask(all), all);
+    // h = 14 or 15 (not reachable through `apply_cdf53_arrival`) must not
+    // shift out of range or admit a bit above the 14 real passes.
+    assert_eq!(evidence_entry(Some(14)).gap_evidence_mask(all), all);
+    assert_eq!(evidence_entry(Some(15)).gap_evidence_mask(all), all);
+}
+
+#[test]
+fn a_failed_prevalidation_arrival_is_evidence_for_itself_and_lower_passes() {
+    let out = apply_cdf53_arrival(None, 1, 3, 7, 100, false, None);
+    assert_eq!(out.entry.highest_pass_seen, Some(3));
+    assert_eq!(out.entry.pass_mask, 0, "the pass did not validate");
+    // Pass 3 is missing (failed) and is admitted; pass 4 is not.
+    assert_eq!(out.entry.gap_evidence_mask(0b1_1000), 0b0_1000);
+}
+
+#[test]
+fn a_corrupt_pass_index_is_not_evidence() {
+    for bad in [14u8, 15] {
+        let out = apply_cdf53_arrival(None, 1, bad, 7, 100, false, None);
+        assert_eq!(out.entry.highest_pass_seen, None, "pass_idx {bad}");
+        let e = out.entry;
+        let held = apply_cdf53_arrival(Some(e), 1, 2, 7, 101, true, None).entry;
+        let after = apply_cdf53_arrival(Some(held), 1, bad, 7, 102, false, None).entry;
+        assert_eq!(after.highest_pass_seen, Some(2), "pass_idx {bad}");
+        assert_eq!(after.gap_evidence_mask(0x3FFF) & !0b111, 0);
+    }
+}

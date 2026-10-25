@@ -26,7 +26,7 @@ use ghostframe_e2e::harness::load_profile::{
     gradient_tile, Churn, LoadProfile, PRODUCTION_CADENCE_US,
 };
 use ghostframe_e2e::harness::scene_tiles::TileSpec;
-use ghostframe_e2e::netsim::{GilbertElliott, NetProfile};
+use ghostframe_e2e::netsim::{DropPlan, DropRule, GilbertElliott, NetProfile};
 
 const COLS: u32 = 16;
 const ROWS: u32 = 16;
@@ -844,6 +844,10 @@ async fn p2b_quinn_is_never_left_idle_while_admission_holds_work() {
 /// RC5: the client's tail sweep asks only for passes a higher pass overtook,
 /// and a screen under real loss still ends with every tile complete.
 ///
+/// This is the STRANDING GUARD, not the repair gate: it passes with the sweep
+/// disabled outright, because arrival-time gap NACKs and the RTO do the work.
+/// The lost-final-pass scene below gates the RTO path the sweep leaves to.
+///
 /// One full-grid CDF 5/3 frame, then silence, over a link dropping 5 % of
 /// the s2c datagrams. Premises: datagrams were dropped and NACKs repaired
 /// something (`nack_hit > 0`), or the zero below is the zero of a scene that
@@ -894,4 +898,69 @@ async fn a_lossy_screen_converges_under_the_evidence_gated_tail_sweep() {
             "{seed:#x}: tiles stranded"
         );
     }
+}
+
+fn tail_scene(seed: u64, occurrence: u32, secs: u64) -> BrowserlessScene {
+    let mut sc = scene(seed, secs);
+    sc.load = SceneLoad::Script(vec![FrameScript {
+        tiles: vec![(
+            (1, 1),
+            TileSpec::Cdf53 {
+                bgra: gradient_tile(0, 1, 1),
+            },
+        )],
+    }]);
+    sc.drops = DropPlan::new(vec![DropRule {
+        tile_x: 1,
+        tile_y: 1,
+        occurrences: vec![occurrence],
+    }]);
+    sc
+}
+
+/// Datagrams the gradient tile (1, 1) sends on a clean link: 9 (the passes its
+/// bitmap marks present). Occurrence `TAIL_N - 1` is its final pass.
+const TAIL_N: u32 = 9;
+
+/// RC5's cost, gated: a tile whose FINAL pass is lost has no gap evidence (no
+/// higher pass follows), so the client's tail sweep never asks for it. The
+/// repair is the server's RTO alone, and this scene is the gate on that path.
+///
+/// Drops the final datagram of the tile once, then holds the screen static.
+/// Premises: the drop fired, and it hit the last datagram (occurrence
+/// `TAIL_N` does not exist on a clean run). Outcome: the RTO fired and no
+/// tile is left owed a pass.
+///
+/// Mutation: with `GHOSTFRAME_NO_RTO=1` the tile stays `partial` for the whole
+/// scene (see the PR body for the output).
+#[tokio::test(start_paused = true)]
+async fn a_lost_final_pass_is_repaired_by_the_rto_since_the_sweep_has_no_evidence() {
+    let probe =
+        run_browserless_with_links(tail_scene(0xB0_B057, TAIL_N, 6), LinkOverrides::default())
+            .await
+            .expect("scene ran");
+    assert_eq!(
+        probe.drops_fired,
+        vec![0],
+        "premise: the tile sends more than {TAIL_N} datagrams, so {} is not its last",
+        TAIL_N - 1
+    );
+    let r = run_browserless_with_links(
+        tail_scene(0xB0_B057, TAIL_N - 1, 6),
+        LinkOverrides::default(),
+    )
+    .await
+    .expect("scene ran");
+    let c = &r.client_cdf53;
+    println!(
+        "RC5TAIL drops_fired={:?} rto_fired={} nack_hit={} nack_miss={} tiles={} complete={} partial={} gave_up={}",
+        r.drops_fired, r.rto_fired, r.nack_hit, r.nack_miss, c.tiles, c.complete, c.partial, c.gave_up
+    );
+    assert!(
+        r.drops_fired.iter().any(|&n| n > 0),
+        "the final pass was never dropped"
+    );
+    assert!(r.rto_fired > 0, "the RTO never fired");
+    assert_eq!(c.tiles, 1, "the tile has no coverage at all");
+    assert_eq!(c.partial, 0, "the lost final pass was never repaired");
 }
