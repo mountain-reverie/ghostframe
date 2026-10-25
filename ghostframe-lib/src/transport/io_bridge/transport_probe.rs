@@ -91,6 +91,11 @@ pub(super) struct Instruments {
     /// Ledger expiries (declared lost) and how many were handed to goog_cc.
     pub(super) losses_declared: u64,
     pub(super) loss_retx_requested: u64,
+    /// NACKs for a pass not in the retransmit cache, split by whether the
+    /// scheduler still holds the tile's work (`pending`: not sent yet) or the
+    /// pass is no longer owed.
+    pub(super) nack_miss_pending: u64,
+    pub(super) nack_miss_not_owed: u64,
     pub(super) pto_probes_requested: u64,
     pub(super) losses_flushed: u64,
     /// Declared lost but dropped from the pending list by its cap.
@@ -358,6 +363,8 @@ impl IoBridge {
             k_pkt: self.transmission_ledger.stats().k_pkt,
             k_pkt_raises: self.transmission_ledger.stats().k_pkt_raises,
             loss_retx_requested: i.loss_retx_requested,
+            nack_miss_pending: i.nack_miss_pending,
+            nack_miss_not_owed: i.nack_miss_not_owed,
             pto_probes_requested: i.pto_probes_requested,
             pto_fires: self.reliable_emitter.stats.pto_fires,
             loss_retransmits: self.reliable_emitter.stats.loss_retransmits,

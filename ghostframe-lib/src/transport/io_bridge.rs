@@ -2391,7 +2391,9 @@ impl IoBridge {
         #[cfg(any(test, feature = "browserless-harness"))]
         {
             *self.bwe_publish.lock().unwrap() = self.bwe.snapshot();
-            *self.emitter_stats_publish.lock().unwrap() = self.reliable_emitter.stats;
+            let mut published = self.reliable_emitter.stats;
+            published.cache_entries = self.reliable_emitter.pending_cache_entries();
+            *self.emitter_stats_publish.lock().unwrap() = published;
             *self.send_errs_publish.lock().unwrap() = self.datagram_send_errs;
             *self.latency_stats_publish.lock().unwrap() =
                 (self.critical_latency_stats, self.refinement_latency_stats);

@@ -603,6 +603,8 @@ pub struct InstrumentSummary {
     pub k_pkt: u64,
     pub k_pkt_raises: u64,
     pub loss_retx_requested: u64,
+    pub nack_miss_pending: u64,
+    pub nack_miss_not_owed: u64,
     pub pto_probes_requested: u64,
     pub pto_fires: u64,
     pub loss_retransmits: u64,
