@@ -155,11 +155,13 @@ impl IoBridge {
             .rtt
             .min_rtt()
             .unwrap_or(std::time::Duration::ZERO);
-        batch
+        let resolved: Vec<ResolvedAck> = batch
             .entries
             .iter()
             .filter_map(|e| {
                 use crate::transport::transmission_ledger::Resolution;
+                // Read before `resolve_at` removes the record or tombstone.
+                let rate = self.transmission_ledger.rate_mark(e.wire_seq);
                 let r = match self
                     .transmission_ledger
                     .resolve_at(e.wire_seq, Some((now_for_samples, min_rtt)))
@@ -169,6 +171,14 @@ impl IoBridge {
                         // in the turn: the probe timeout runs before the
                         // drain and must see this acknowledgement.
                         self.reliable_emitter.note_ack(now_for_samples);
+                        if let Some((mark, departed)) = rate {
+                            self.delivery_sampler.on_acked(
+                                &mark,
+                                departed,
+                                tx.wire_bytes,
+                                now_for_samples,
+                            );
+                        }
                         self.reliable_emitter.note_ack_origin(tx.key, e.wire_seq);
                         self.loss_window.record(tx.emit_us as u32, false);
                         Some((tx.key, tx, e.arrival_time_ms_lo16, false))
@@ -184,6 +194,18 @@ impl IoBridge {
                             // told of.
                             self.instr.late_acks_fec_possible += 1;
                         } else {
+                            // The network did deliver it, only late: its
+                            // bytes count as delivered for the rate sample.
+                            // (Not when it may be an FEC recovery: then the
+                            // network did not.)
+                            if let Some((mark, departed)) = rate {
+                                self.delivery_sampler.on_acked(
+                                    &mark,
+                                    departed,
+                                    tx.wire_bytes,
+                                    now_for_samples,
+                                );
+                            }
                             self.loss_window.retract(tx.emit_us as u32);
                             // Observability: was goog_cc already told this was
                             // lost?
@@ -215,7 +237,10 @@ impl IoBridge {
                 }
                 r
             })
-            .collect()
+            .collect();
+        // One rate sample per acknowledgement batch, as the draft has it.
+        self.delivery_sampler.end_ack(now_for_samples);
+        resolved
     }
 
     /// Env-gated ACK instrumentation (ACKORDER and RTOPROBE).

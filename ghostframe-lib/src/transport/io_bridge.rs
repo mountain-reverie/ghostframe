@@ -835,6 +835,9 @@ pub struct IoBridge {
     /// that one is content-scoped and emptied by supersession, which is what
     /// hid most losses from the estimator.
     transmission_ledger: crate::transport::transmission_ledger::TransmissionLedger,
+    /// Per-transmission delivery-rate samples (D1 PR-6b). Observability only:
+    /// nothing reads it to decide anything.
+    delivery_sampler: crate::transport::delivery_sampler::DeliverySampler,
     /// The ledger's verdicts as a rate: `adaptation_context.loss_rate`.
     loss_window: crate::transport::loss_window::LossWindow,
     /// When quinn's `sent_packets` last advanced. `None` before the first
@@ -1353,6 +1356,7 @@ impl IoBridge {
             transmission_ledger: crate::transport::transmission_ledger::TransmissionLedger::new(
                 TRANSMISSION_LEDGER_CAPACITY,
             ),
+            delivery_sampler: crate::transport::delivery_sampler::DeliverySampler::new(now_std()),
             loss_window: crate::transport::loss_window::LossWindow::new(),
             path_last_sent_at: None,
             last_drain_frame_context: None,

@@ -393,7 +393,7 @@ impl IoBridge {
     /// datagram built and waiting, a client request or a timer due, or tiles
     /// in the scheduler. A scheduler with no frame identity to tag its work
     /// with has nothing it can send.
-    fn admission_backlog(&self, now: std::time::Instant) -> bool {
+    pub(super) fn admission_backlog(&self, now: std::time::Instant) -> bool {
         self.reliable_emitter.emission_queue_len() > 0
             || self.reliable_emitter.pending_nack_count() > 0
             || self.reliable_emitter.pending_loss_count() > 0

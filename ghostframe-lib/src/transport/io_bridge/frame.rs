@@ -2411,6 +2411,18 @@ impl IoBridge {
                 ecn_last_tx_marked = ins.ecn.last_marked,
                 "cumulative emit (datagrams handed to quinn since startup, per codec)"
             );
+            // Its own event: the macro above is at tracing's field limit.
+            tracing::info!(
+                target: LOG_TARGET,
+                frame_seq = seq,
+                delivery_marked = ins.delivery.marked,
+                delivery_samples = ins.delivery.samples,
+                delivery_app_limited_samples = ins.delivery.app_limited_samples,
+                delivery_latest_bps = ins.delivery.latest_bps,
+                delivery_latest_app_limited = ins.delivery.latest_app_limited,
+                delivery_max_bps = ins.delivery.max_bps,
+                "delivery rate (per-transmission samples, bits/s; observability only)"
+            );
 
             // The loss path (D1 F4 part 2), a separate event at the same
             // cadence: the `cumulative emit` line above is at the tracing
