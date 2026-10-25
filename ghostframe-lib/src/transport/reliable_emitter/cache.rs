@@ -51,22 +51,11 @@ pub struct CacheEntry {
     pub first_sent_at: Instant,
     pub last_sent_at: Instant,
     pub attempts: u8,
-    /// When the retransmission timer is due, or `None` while it is not
-    /// running. It starts when the transmission it guards leaves quinn's
-    /// FIFO (`ReliableTileEmitter::on_departed`), not when the datagram is
-    /// built or enqueued: a datagram still queued has not been sent, so the
-    /// path has had no time to lose or delay it.
-    pub rto_deadline: Option<Instant>,
-    /// The `wire_seq` whose departure starts the timer. A departure of any
-    /// other transmission of this key (an older one the entry has since been
-    /// re-sent past, or a NACK repair, which never moves the timer) leaves it
-    /// alone.
-    pub arm_ws: u32,
-    /// When the transmission that armed the timer left quinn's FIFO, in
-    /// microseconds on the emitter's clock (the ledger's `depart_us`). Only
-    /// meaningful while `rto_deadline` is set. It orders this pass against
-    /// acknowledged departures for the PTO gate.
-    pub departed_us: u64,
+    /// The `wire_seq` of the newest transmission of this pass, whichever path
+    /// made it (the original, a NACK repair, a loss retransmission, a probe).
+    /// A loss verdict on an older transmission of the pass is moot: a newer one
+    /// is already in flight and has its own verdict coming.
+    pub latest_ws: u32,
     /// See `ProbeTag`'s doc comment.
     pub probe: Option<ProbeTag>,
 }
@@ -311,9 +300,7 @@ mod tests {
             first_sent_at: now,
             last_sent_at: now,
             attempts: 0,
-            rto_deadline: Some(now),
-            arm_ws: 0,
-            departed_us: 0,
+            latest_ws: 0,
             probe: None,
         }
     }

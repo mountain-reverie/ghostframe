@@ -5,9 +5,7 @@ use crate::transport::protocol::TileParityEnvelope;
 use crate::transport::reliable_emitter::cache::{CacheEntry, ProbeTag, RetransmitCache};
 use crate::transport::reliable_emitter::emission_queue::{Emission, EmissionQueue, WireClass};
 use crate::transport::reliable_emitter::parity::GroupBuilder;
-use crate::transport::reliable_emitter::rto::{
-    pto_for_attempt, pto_resume_for_attempt, RtoTimerWheel,
-};
+use crate::transport::reliable_emitter::rto::pto_for_attempt;
 use crate::transport::reliable_emitter::traits::{DatagramSender, SendOutcome};
 use crate::transport::reliable_emitter::wire_seq::WireSeqAllocator;
 use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K, PARITY_INTERLEAVE_OFFSET};
@@ -34,7 +32,6 @@ pub struct ReliableTileEmitter {
     pub(crate) alloc: WireSeqAllocator,
     pub(crate) queue: EmissionQueue,
     pub(crate) group: GroupBuilder,
-    pub(crate) rto: RtoTimerWheel,
     /// Per pass that RTO'd and is not acknowledged yet: the first
     /// retransmission's `wire_seq` and how many times it fired. Resolved by
     /// [`Self::note_ack_origin`]. Measurement only.
@@ -49,14 +46,15 @@ pub struct ReliableTileEmitter {
     /// retransmission deadline from it (D1 F4).
     pub(crate) rtt: RttEstimator,
     /// When the newest acknowledgement of any tile transmission was received.
-    /// The PTO is armed from the later of a pass's departure and this: "reset
-    /// on any ACK" (RFC 9002 §6.2.1). See [`Self::note_ack`].
+    /// The probe timeout runs from the later of the newest departure and this:
+    /// "reset on any ACK" (RFC 9002 section 6.2.1). See [`Self::note_ack`].
     last_ack_at: Option<Instant>,
-    /// The latest departure (emitter clock, microseconds) among acknowledged
-    /// transmissions. A pass that departed *before* it was overtaken: on a path
-    /// that delivers in order it is lost, not queued, and its own deadline
-    /// stands. A pass that departed after it is still behind the queue.
-    max_acked_depart_us: Option<u64>,
+    /// When the newest tile transmission left quinn's FIFO.
+    latest_departure_at: Option<Instant>,
+    /// When the probe timeout last fired. A probe's retransmissions wait in
+    /// the queue before they depart, so the departure alone does not move the
+    /// timer; this does.
+    last_pto_fire_at: Option<Instant>,
     /// Reference instant this emitter was constructed with. Tile-datagram
     /// emit stamps (`DatagramHeader.timestamp_us`) are measured as
     /// `now.duration_since(time_base)` rather than the wall clock, so they
@@ -69,11 +67,6 @@ pub struct ReliableTileEmitter {
     /// allocated; the caller cannot otherwise know which value a datagram
     /// carried.
     transmissions: Vec<EmittedDatagram>,
-    /// Transmissions whose retransmission timer is waiting for them to leave
-    /// quinn's FIFO: `wire_seq -> key`. Filled when a datagram is built,
-    /// emptied by [`Self::on_departed`]. Bounded by what is queued; cleared
-    /// with the cache.
-    awaiting_departure: HashMap<u32, EmitKey>,
     /// Passes the client has asked for again, waiting for retransmit
     /// budget. Served oldest first by `tick_budgeted`, ahead of the RTO.
     ///
@@ -84,6 +77,11 @@ pub struct ReliableTileEmitter {
     /// Membership of `pending_nacks`, so a request repeated while the first
     /// is still waiting does not become a second retransmission.
     pending_nack_set: HashSet<EmitKey>,
+    /// Passes a loss verdict or the probe timeout asked to be sent again,
+    /// waiting for budget, oldest first, with who asked. Served after NACK
+    /// repair. A key waits here at most once.
+    pending_loss: VecDeque<(EmitKey, RetxCause)>,
+    pending_loss_set: HashSet<EmitKey>,
     /// Wire bytes each datagram costs beyond its own length (the
     /// WebTransport framing), added to what `tick_budgeted` bills. Zero
     /// unless the transport sets it.
@@ -111,6 +109,9 @@ pub struct EmittedDatagram {
 pub struct EmitterStats {
     pub source_emitted: u64,
     pub parity_emitted: u64,
+    /// Retransmissions made by the loss path: `loss_retransmits` plus
+    /// `pto_probe_retransmits`. (The name predates the per-pass timer, which
+    /// is gone.)
     pub rto_fired: u64,
     pub rto_max_retransmits_reached: u64,
     pub ack_hit: u64,
@@ -170,12 +171,26 @@ pub struct EmitterStats {
     /// earned its keep. `rto_fired - rto_spurious - rto_useful` fired for
     /// passes not acknowledged yet. Measurement only.
     pub rto_useful: u64,
-    /// Retransmission timers started by a departure (F3). Every timer is, so
-    /// this moving is what shows the departure path is wired.
-    pub rto_armed_at_departure: u64,
-    /// Due timers held back because the path was still delivering ahead of
-    /// them (see the gate in [`ReliableTileEmitter::tick_rto_budgeted`]).
-    pub rto_deferred_by_ack: u64,
+    /// Retransmissions made because a loss verdict (packet or time threshold)
+    /// named a transmission whose content was still current.
+    pub loss_retransmits: u64,
+    /// Retransmissions made by the probe timeout: the newest one or two
+    /// outstanding transmissions, when it expired.
+    pub pto_probe_retransmits: u64,
+    /// Times the probe timeout expired.
+    pub pto_fires: u64,
+    /// Verdicts with no retransmission, by why: the pass was no longer cached
+    /// (acknowledged or superseded), or a newer transmission of it was already
+    /// in flight (a NACK repair, say), or one was already waiting.
+    pub verdict_content_gone: u64,
+    pub verdict_newer_in_flight: u64,
+    pub verdict_already_queued: u64,
+    /// Loss retransmissions whose original turned out to have arrived (the
+    /// original was the first transmission of the pass to be acknowledged):
+    /// spurious loss verdicts, Eifel style. Counted per retransmission.
+    pub spurious_loss: u64,
+    /// The same for probe retransmissions: spurious probes.
+    pub spurious_pto: u64,
     /// Times the RTO bookkeeping hit its cap and was dropped; fires made
     /// before a reset and not yet acknowledged are never attributed.
     pub rto_origin_resets: u64,
@@ -208,6 +223,34 @@ struct RtoOrigin {
     /// before the first retransmission. Sticky: unlike `counted_spurious` it
     /// is not taken back when the retransmission is acknowledged as well.
     original_first: bool,
+    /// The probe timeout made the first retransmission (rather than a loss
+    /// verdict).
+    by_pto: bool,
+}
+
+/// Who asked for a retransmission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetxCause {
+    /// A loss verdict from the threshold detector.
+    Loss,
+    /// The probe timeout.
+    Probe,
+}
+
+/// What became of a request to retransmit a transmission's content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetxRequest {
+    /// Queued: the content is current and nothing else is repairing it.
+    Queued,
+    /// The pass is not cached: it was acknowledged, or superseded.
+    ContentGone,
+    /// A newer transmission of the pass exists (a repair already in flight).
+    NewerInFlight,
+    /// The pass already waits for budget.
+    AlreadyQueued,
+    /// `GHOSTFRAME_NO_RTO=1`: the loss path and the probe are off; the cache
+    /// and the NACK path are not.
+    Disabled,
 }
 
 /// Most passes whose RTO history is tracked at once. Measurement only: a
@@ -229,17 +272,18 @@ impl ReliableTileEmitter {
             alloc: WireSeqAllocator::new(),
             queue: EmissionQueue::new(),
             group: GroupBuilder::new(FEC_GROUP_SIZE_K),
-            rto: RtoTimerWheel::new(),
             rto_origin: HashMap::new(),
             latest_tile_generation: HashMap::new(),
             rtt: RttEstimator::new(),
             last_ack_at: None,
-            max_acked_depart_us: None,
+            latest_departure_at: None,
+            last_pto_fire_at: None,
             time_base: now,
             transmissions: Vec::new(),
-            awaiting_departure: HashMap::new(),
             pending_nacks: VecDeque::new(),
             pending_nack_set: HashSet::new(),
+            pending_loss: VecDeque::new(),
+            pending_loss_set: HashSet::new(),
             wire_overhead: 0,
             stats: EmitterStats::default(),
         }
@@ -262,10 +306,40 @@ impl ReliableTileEmitter {
         self.pending_nacks.len()
     }
 
-    /// Whether a retransmission timer is due at `now`. An upper bound: the
-    /// entry may since have left the cache.
-    pub fn has_due_rto(&self, now: Instant) -> bool {
-        self.rto.has_due(now)
+    /// Retransmissions a loss verdict or a probe asked for that are waiting
+    /// for budget.
+    pub fn pending_loss_count(&self) -> usize {
+        self.pending_loss.len()
+    }
+
+    /// When the probe timeout expires, or `None` while it is not running
+    /// (nothing is cached, or nothing has departed yet). Runs from the later
+    /// of the newest departure, the newest acknowledgement and the last
+    /// expiry, for one PTO backed off by the consecutive expiries since the
+    /// last acknowledgement (RFC 9002 section 6.2).
+    pub fn pto_deadline(&self) -> Option<Instant> {
+        if self.pending_cache_entries() == 0 {
+            return None;
+        }
+        let departed = self.latest_departure_at?;
+        let base = [self.last_ack_at, self.last_pto_fire_at]
+            .into_iter()
+            .flatten()
+            .fold(departed, Instant::max);
+        let backoff = self.rtt.pto_count().min(8) as u8;
+        Some(base + pto_for_attempt(&self.rtt, backoff))
+    }
+
+    pub fn pto_due(&self, now: Instant) -> bool {
+        self.pto_deadline().is_some_and(|d| d <= now)
+    }
+
+    /// The probe timeout expired at `now`: count it and restart it. The caller
+    /// then asks for the newest outstanding transmissions to be probed.
+    pub fn note_pto_fire(&mut self, now: Instant) {
+        self.rtt.on_pto_fire(now);
+        self.last_pto_fire_at = Some(now);
+        self.stats.pto_fires += 1;
     }
 
     /// The probe timeout of a first transmission: what the scheduler's
@@ -352,21 +426,16 @@ impl ReliableTileEmitter {
             wire_bytes: bytes.len(),
             key,
         });
-        // Cache & RTO. The timer is not started here: the datagram has only
-        // been built. It starts when it leaves quinn's FIFO (`on_departed`).
         let entry = CacheEntry {
             datagram: bytes.clone(),
             queued_at,
             first_sent_at: now,
             last_sent_at: now,
             attempts: 0,
-            rto_deadline: None,
-            arm_ws: wire_seq,
-            departed_us: 0,
+            latest_ws: wire_seq,
             probe,
         };
         self.cache.insert(key, entry);
-        self.await_departure(key, wire_seq, bytes.len(), now);
         // Feed group builder; on K-th source build & schedule parity envelope.
         self.feed_group(wire_seq, bytes.clone());
         self.note_emission_queue_depth();
@@ -436,7 +505,7 @@ impl ReliableTileEmitter {
         }
     }
 
-    fn note_rto_fire(&mut self, key: EmitKey, first_ws: Option<u32>) {
+    fn note_rto_fire(&mut self, key: EmitKey, first_ws: Option<u32>, by_pto: bool) {
         let Some(ws) = first_ws else { return };
         if let Some(e) = self.rto_origin.get_mut(&key) {
             e.fires += 1;
@@ -445,6 +514,11 @@ impl ReliableTileEmitter {
             }
             if e.original_first {
                 self.stats.rto_original_first += 1;
+                if e.by_pto {
+                    self.stats.spurious_pto += 1;
+                } else {
+                    self.stats.spurious_loss += 1;
+                }
             }
             return;
         }
@@ -459,6 +533,7 @@ impl ReliableTileEmitter {
                 fires: 1,
                 counted_spurious: false,
                 original_first: false,
+                by_pto,
             },
         );
     }
@@ -486,6 +561,11 @@ impl ReliableTileEmitter {
             if !e.original_first {
                 e.original_first = true;
                 self.stats.rto_original_first += fires;
+                if e.by_pto {
+                    self.stats.spurious_pto += fires;
+                } else {
+                    self.stats.spurious_loss += fires;
+                }
             }
         } else {
             if e.counted_spurious {
@@ -510,41 +590,30 @@ impl ReliableTileEmitter {
         }
     }
 
-    /// Record an acknowledgement of a transmission that departed at
-    /// `depart_us` (the ledger's stamp, emitter clock), received at
+    /// Record that an acknowledgement of a tile transmission was received at
     /// `received_at`. The caller also feeds the RTT estimator; this is the
     /// other half of the PTO: the timer restarts from the newest acknowledgement.
     /// O(1).
-    pub fn note_ack(&mut self, depart_us: u64, received_at: Instant) {
+    pub fn note_ack(&mut self, received_at: Instant) {
+        self.rtt.on_ack();
         self.last_ack_at = Some(self.last_ack_at.map_or(received_at, |t| t.max(received_at)));
-        self.max_acked_depart_us = Some(
-            self.max_acked_depart_us
-                .map_or(depart_us, |m| m.max(depart_us)),
-        );
     }
 
-    /// Drain up to `max_retransmits` due RTO entries. For each due key,
-    /// validate against the live cache (silently skip stale entries —
-    /// already ACKed or cancelled). Bump `attempts` (used only for RTO
-    /// backoff selection), re-enqueue every cached fragment via the
-    /// EmissionQueue with the same wire_seqs (so client dedup keys
-    /// remain stable), and leave the entry with no running timer: the
-    /// retransmission's own (backed-off, `pto_for_attempt`) timer starts when
-    /// that datagram departs (`on_departed`). Never retires — the entry stays in the cache
-    /// until ACKed, cancelled via `cancel_for_tile`, or the session
+    /// Send what is owed: the client's NACKs, then the loss path's requests
+    /// (loss verdicts and probes), each bounded by `max_retransmits` and, in
+    /// `tick_budgeted`, by bytes. Nothing here finds losses: the transmission
+    /// ledger's threshold detector and the probe timeout do, and ask through
+    /// [`Self::request_retransmit`]. This only builds the datagrams, one per
+    /// request, with a fresh `wire_seq` (so client dedup keys stay stable and
+    /// acknowledgements name transmissions). The cache entry stays until ACKed,
+    /// cancelled via `cancel_for_tile`, retired by `retire_stuck` or the session
     /// ends via `clear_cache`.
     ///
-    /// Rate-limit rationale: when many entries are simultaneously due
-    /// (typical when sustained loss has filled the cache with thousands
-    /// of pending passes), firing them all in one `tick()` call hands
-    /// quinn far more datagrams than its `datagram_send_buffer` can
-    /// absorb, generating `SendDatagramError::Blocked` on the rejected
-    /// ones (they're silently dropped from the wire — the cache still
-    /// has the entry, so RTO will fire it again, perpetuating a storm
-    /// where the link can never settle). Capping at a small number per
-    /// call converts that storm into orderly drip-feed: heap entries
-    /// not popped this tick stay due, and the next call pops the next
-    /// batch. The admission pass calls the budgeted halves again after
+    /// Rate-limit rationale: when many requests are waiting (sustained loss),
+    /// handing them all to quinn in one call exceeds its datagram buffer and
+    /// turns repair into a storm. A small per-call count and a byte bound
+    /// convert that into an orderly drip-feed: requests not served this call
+    /// stay queued for the next, and the admission pass calls again after
     /// every drain, as quinn's FIFO empties.
     pub fn tick(&mut self, now: Instant, max_retransmits: usize) {
         self.tick_budgeted(now, max_retransmits, usize::MAX);
@@ -583,7 +652,7 @@ impl ReliableTileEmitter {
     ) -> usize {
         let mut count = 0;
         let nacks = self.tick_nacks_budgeted(now, max_retransmits, max_bytes, &mut count);
-        let rto = self.tick_rto_budgeted(
+        let rto = self.tick_loss_budgeted(
             now,
             max_retransmits,
             max_bytes.saturating_sub(nacks),
@@ -638,13 +707,8 @@ impl ReliableTileEmitter {
                 bytes[12..16].copy_from_slice(&(emit_us_now as u32).to_be_bytes());
             }
             let bytes = Bytes::from(bytes);
-            // A repair made before the original has departed (its timer is
-            // not running, `attempts` is 0) must not back off the original's
-            // first deadline: that timer starts from the original's own
-            // departure, as an attempt-0 timer.
-            if !(entry.rto_deadline.is_none() && entry.attempts == 0) {
-                entry.attempts = entry.attempts.saturating_add(1);
-            }
+            entry.attempts = entry.attempts.saturating_add(1);
+            entry.latest_ws = ws;
             entry.last_sent_at = now;
             entry.probe = None;
             self.transmissions.push(EmittedDatagram {
@@ -668,10 +732,11 @@ impl ReliableTileEmitter {
         spent
     }
 
-    /// The second half of [`Self::tick_budgeted`]: the retransmissions whose
-    /// timer is due, until `max_bytes` is spent. Returns the wire bytes
-    /// queued. See [`Self::tick_nacks_budgeted`] for `count`.
-    pub fn tick_rto_budgeted(
+    /// The second half of [`Self::tick_budgeted`]: the retransmissions the
+    /// loss path asked for (loss verdicts and probes), oldest request first,
+    /// until `max_bytes` is spent. Returns the wire bytes queued. See
+    /// [`Self::tick_nacks_budgeted`] for `count`.
+    pub fn tick_loss_budgeted(
         &mut self,
         now: Instant,
         max_retransmits: usize,
@@ -681,68 +746,15 @@ impl ReliableTileEmitter {
         let mut spent = 0usize;
         let emit_us_now = self.emit_us64(now);
         while *count < max_retransmits && spent < max_bytes {
-            let Some(key) = self.rto.pop_due(now) else {
+            let Some((key, cause)) = self.pending_loss.pop_front() else {
                 break;
             };
+            self.pending_loss_set.remove(&key);
             let Some(entry) = self.cache.get_mut(&key) else {
-                // Already ACKed or cancelled — stale heap entry; skip silently.
+                // Acknowledged or superseded while it waited: nothing to send.
                 continue;
             };
-            // Lazy deletion. The heap is never edited in place, so a key
-            // submitted again (a scheduler retry rebuilds the same
-            // `EmitKey`: one frame label covers a whole tile generation)
-            // leaves its first entry behind with an earlier deadline than
-            // the cache entry's current one. Fire only for the deadline the
-            // cache entry holds; the entry pushed with it is still queued.
-            // A timer that is not running (its datagram is still queued)
-            // has no deadline to be past, and one pushed out since this heap
-            // entry was made is not due.
-            match entry.rto_deadline {
-                Some(d) if d <= now => {}
-                _ => continue,
-            }
-            // The probe timeout restarts at every acknowledgement (RFC 9002
-            // §6.2.1; D1 F4: "reset on any ACK"). A pass is held back while
-            // the path is still delivering ahead of it: nothing that departed
-            // after it has been acknowledged (so, on a path that delivers in
-            // order, it is queued behind what is being acknowledged, not
-            // lost), and the newest acknowledgement is younger than a PTO.
-            // Without this a queue that grows steadily outruns any estimate
-            // of its delay and every pass in it times out in turn.
-            //
-            // A pass that something later has been acknowledged past is not
-            // held: its own deadline stands, as it did before. This only
-            // ever delays a fire, never brings one forward.
-            //
-            // "Departed after" is ordered by `departed_us`, the per-turn stamp
-            // of F2 (every transmission of one `drain_outbound` shares it), not
-            // by a departure index. Two passes of one turn compare equal, so
-            // neither is "overtaken" by the other: conservative, and fine for
-            // a hold-back that can only delay. PR-5's packet threshold counts
-            // departures and must use a real departure index.
-            //
-            // Cost: a held pass is pushed back onto the heap with its new
-            // deadline, once per PTO. At most `inflight` passes are held, and
-            // `inflight` is about rate x RTT while a PTO is at least an RTT, so
-            // the pushes are O(log n) each and about one per datagram sent, not
-            // a per-tick scan. Each is bounded by the pop that finds it due, so
-            // a tick does at most one push per heap entry that came due in it.
-            let overtaken = self
-                .max_acked_depart_us
-                .is_some_and(|m| m > entry.departed_us);
-            if !overtaken {
-                if let Some(acked_at) = self.last_ack_at {
-                    let resume = acked_at + pto_resume_for_attempt(&self.rtt, entry.attempts);
-                    if resume > now {
-                        entry.rto_deadline = Some(resume);
-                        self.rto.schedule(key, resume);
-                        self.stats.rto_deferred_by_ack += 1;
-                        continue;
-                    }
-                }
-            }
-            // [RTO-PROBE] temporary instrumentation: how old was this entry
-            // when its timer fired, and what deadline was it given?
+            // [RTO-PROBE] temporary instrumentation.
             if crate::transport::reliable_emitter::rto_probe_enabled() {
                 let probe_codec = entry
                     .datagram
@@ -751,19 +763,16 @@ impl ReliableTileEmitter {
                     .map(|b| b >> 1)
                     .unwrap_or(255);
                 eprintln!(
-                    "RTOPROBE fire codec={} pass={} age_since_first_us={} age_since_last_us={} attempts={} rto_us={}",
+                    "RTOPROBE retx cause={:?} codec={} pass={} age_since_first_us={} age_since_last_us={} attempts={}",
+                    cause,
                     probe_codec,
                     key.pass_idx,
                     now.saturating_duration_since(entry.first_sent_at).as_micros(),
                     now.saturating_duration_since(entry.last_sent_at).as_micros(),
                     entry.attempts,
-                    pto_for_attempt(&self.rtt, entry.attempts).as_micros(),
                 );
             }
-            // Bump attempts and re-enqueue the cached datagram; its timer
-            // starts at departure.
-            entry.attempts += 1;
-            self.rtt.on_pto_fire(now);
+            entry.attempts = entry.attempts.saturating_add(1);
             entry.last_sent_at = now;
             // A probe cluster measures one burst: goog_cc divides the
             // cluster's bytes by the span between its first and last send
@@ -783,9 +792,6 @@ impl ReliableTileEmitter {
             // delay gradient tolerates the ambiguity; the probe-rate
             // division does not, so only the latter opts out.
             entry.probe = None;
-            // The retransmission goes to the back of the queue. Its timer
-            // starts when it leaves, not now (`on_departed`).
-            entry.rto_deadline = None;
             let mut bytes = entry.datagram.to_vec();
             // [H3-DIAG] log every actual retransmit. Captures the EmitKey
             // routing tuple + a fingerprint of the first fragment so a
@@ -841,7 +847,7 @@ impl ReliableTileEmitter {
                 }
             }
             let bytes = Bytes::from(bytes);
-            entry.arm_ws = ws;
+            entry.latest_ws = ws;
             self.transmissions.push(EmittedDatagram {
                 wire_seq: ws,
                 emit_us: stamped,
@@ -857,11 +863,13 @@ impl ReliableTileEmitter {
                 self.feed_group(ws, bytes.clone());
             }
             spent += bytes.len() + self.wire_overhead;
-            let blen = bytes.len();
             self.queue.push_source(bytes, WireClass::RtoRetransmit);
-            self.await_departure(key, ws, blen, now);
             self.stats.rto_fired += 1;
-            self.note_rto_fire(key, first_ws);
+            match cause {
+                RetxCause::Loss => self.stats.loss_retransmits += 1,
+                RetxCause::Probe => self.stats.pto_probe_retransmits += 1,
+            }
+            self.note_rto_fire(key, first_ws, cause == RetxCause::Probe);
             self.stats.retransmit_attempts_total += 1;
             *count += 1;
         }
@@ -976,7 +984,8 @@ impl ReliableTileEmitter {
         self.cache.clear();
         self.rto_origin.clear();
         self.latest_tile_generation.clear();
-        self.awaiting_departure.clear();
+        self.pending_loss.clear();
+        self.pending_loss_set.clear();
         // The estimator and the acknowledgement progress describe the
         // connection that is gone. Its PTO backoff, srtt and "newest ACK"
         // must not hold back or delay the next connection's first passes.
@@ -991,7 +1000,8 @@ impl ReliableTileEmitter {
     pub fn reset_connection_state(&mut self) {
         self.rtt = RttEstimator::new();
         self.last_ack_at = None;
-        self.max_acked_depart_us = None;
+        self.latest_departure_at = None;
+        self.last_pto_fire_at = None;
     }
 
     pub fn has_cache_entries_for_tile(&self, tile_x: u8, tile_y: u8) -> bool {
@@ -1040,62 +1050,51 @@ impl ReliableTileEmitter {
         now.duration_since(self.time_base).as_micros() as u64
     }
 
-    /// Note that `wire_seq` was just built and its timer waits for it to
-    /// leave. A datagram too short to carry a `wire_seq` cannot be matched to
-    /// a departure; it starts its timer now, as a transmission with no queue
-    /// to wait in would.
-    fn await_departure(&mut self, key: EmitKey, wire_seq: u32, len: usize, now: Instant) {
-        if len >= 12 {
-            self.awaiting_departure.insert(wire_seq, key);
-        } else {
-            self.arm_rto(key, wire_seq, now);
+    /// A tile transmission left quinn's FIFO at `at`: the probe timeout runs
+    /// from the newest departure. O(1). (Which transmission it was does not
+    /// matter here; the ledger orders them.)
+    pub fn on_departed(&mut self, _wire_seq: u32, at: Instant) {
+        self.latest_departure_at = Some(self.latest_departure_at.map_or(at, |t| t.max(at)));
+    }
+
+    /// What a request to retransmit `key`'s content, because transmission
+    /// `wire_seq` of it is lost or overdue, would do. Content is current when
+    /// the pass is cached and `wire_seq` is the newest transmission of it.
+    fn classify_retx(&self, key: &EmitKey, wire_seq: u32) -> RetxRequest {
+        match self.cache.get(key) {
+            None => RetxRequest::ContentGone,
+            Some(e) if e.latest_ws != wire_seq => RetxRequest::NewerInFlight,
+            Some(_) if self.pending_loss_set.contains(key) => RetxRequest::AlreadyQueued,
+            Some(_) => RetxRequest::Queued,
         }
     }
 
-    /// Start the retransmission timer of the transmission that just left
-    /// quinn's FIFO (F3: transport timers start at departure). `at` is when it
-    /// left. A no-op for a transmission this emitter is not waiting on, one
-    /// whose pass was acknowledged or cancelled meanwhile, or one the pass
-    /// has since been re-sent past.
-    ///
-    /// O(1) for the lookup, O(log n) for the heap push.
-    pub fn on_departed(&mut self, wire_seq: u32, at: Instant) {
-        let Some(key) = self.awaiting_departure.remove(&wire_seq) else {
-            return;
-        };
-        self.arm_rto(key, wire_seq, at);
-    }
-
-    fn arm_rto(&mut self, key: EmitKey, wire_seq: u32, at: Instant) {
-        let Some(entry) = self.cache.get_mut(&key) else {
-            return;
-        };
-        if entry.arm_ws != wire_seq || entry.rto_deadline.is_some() {
-            return;
+    /// Transmission `wire_seq` of pass `key` was declared lost (packet or time
+    /// threshold) or is being probed (the timeout expired with it among the
+    /// newest outstanding). If its content is current, queue one retransmission
+    /// for `tick_loss_budgeted`; otherwise say why not. The verdict itself, and
+    /// what it does to the loss estimate, are the caller's.
+    pub fn request_retransmit(
+        &mut self,
+        key: EmitKey,
+        wire_seq: u32,
+        cause: RetxCause,
+    ) -> RetxRequest {
+        if crate::config::no_rto() {
+            return RetxRequest::Disabled;
         }
-        let deadline = at + pto_for_attempt(&self.rtt, entry.attempts);
-        entry.rto_deadline = Some(deadline);
-        entry.departed_us = at.saturating_duration_since(self.time_base).as_micros() as u64;
-        self.rto.schedule(key, deadline);
-        self.stats.rto_armed_at_departure += 1;
-    }
-
-    /// Stop waiting for departures that will not happen: the session they
-    /// were queued for is gone (or they were never queued anywhere). Their
-    /// cache entries are armed at `now`, as if they had left now, so each
-    /// still has a timer; without it an entry would wait for an
-    /// acknowledgement, a cancel or the 30 s retire with nothing able to
-    /// start its timer.
-    pub fn forget_awaiting_departure(&mut self, now: Instant) {
-        let waiting: Vec<(u32, EmitKey)> = self.awaiting_departure.drain().collect();
-        for (ws, key) in waiting {
-            self.arm_rto(key, ws, now);
+        let r = self.classify_retx(&key, wire_seq);
+        match r {
+            RetxRequest::Queued => {
+                self.pending_loss.push_back((key, cause));
+                self.pending_loss_set.insert(key);
+            }
+            RetxRequest::ContentGone => self.stats.verdict_content_gone += 1,
+            RetxRequest::NewerInFlight => self.stats.verdict_newer_in_flight += 1,
+            RetxRequest::AlreadyQueued => self.stats.verdict_already_queued += 1,
+            RetxRequest::Disabled => {}
         }
-    }
-
-    /// Transmissions whose timer is waiting for them to leave. Diagnostic.
-    pub fn awaiting_departure_len(&self) -> usize {
-        self.awaiting_departure.len()
+        r
     }
 
     /// Drain emissions to a sender until the queue is empty.
@@ -1255,6 +1254,13 @@ mod tests {
         v[20..24].copy_from_slice(&1u32.to_be_bytes()); // payload_len
         v[24] = payload;
         Bytes::from(v)
+    }
+
+    /// Ask the loss path to resend `key`'s newest transmission, as a verdict
+    /// or a probe would.
+    fn ask(e: &mut ReliableTileEmitter, key: EmitKey) -> RetxRequest {
+        let ws = e.cache.get(&key).map_or(0, |c| c.latest_ws);
+        e.request_retransmit(key, ws, RetxCause::Loss)
     }
 
     /// The stamp is applied in place, so the bytes on the wire must equal what
@@ -1550,7 +1556,7 @@ mod tests {
     }
 
     #[test]
-    fn tick_retransmits_when_rto_expires() {
+    fn tick_retransmits_what_the_loss_path_asked_for() {
         let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
@@ -1559,8 +1565,14 @@ mod tests {
         e.drain(&mut sender, t0);
         assert_eq!(sender.sent.len(), 1);
         let entry_first_sent = e.cache.get(&key).unwrap().first_sent_at;
-        // Advance past RTO; tick should retransmit.
+        assert_eq!(ask(&mut e, key), RetxRequest::Queued);
+        assert_eq!(
+            ask(&mut e, key),
+            RetxRequest::AlreadyQueued,
+            "once per wait"
+        );
         let t1 = t0 + Duration::from_millis(1_100);
+        ask(&mut e, key);
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 2);
@@ -1601,6 +1613,8 @@ mod tests {
         );
         assert_eq!(e.stats.generation_replacements, 1, "premise: tile moved on");
         e.drain(&mut sender, t0);
+        ask(&mut e, EmitKey::new(1, 0, 0, 0));
+        ask(&mut e, EmitKey::new(2, 0, 0, 0));
         e.tick(t0 + Duration::from_millis(1_100), usize::MAX);
         assert_eq!(e.stats.rto_fired, 2, "premise: both timers fired");
         assert_eq!(
@@ -1630,6 +1644,8 @@ mod tests {
             t0,
         );
         e.drain(&mut sender, t0);
+        ask(&mut e, EmitKey::new(1, 0, 0, 0));
+        ask(&mut e, EmitKey::new(2, 0, 0, 0));
         e.tick(t0 + Duration::from_millis(1_100), usize::MAX);
         assert_eq!(e.stats.rto_fired, 1, "premise: the current pass fired");
         assert_eq!(e.stats.rto_fired_superseded, 0);
@@ -1644,10 +1660,12 @@ mod tests {
         let key = EmitKey::new(1, 0, 0, 0);
         e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
         e.drain(&mut sender, t0);
+        ask(&mut e, key);
         let t1 = t0 + Duration::from_millis(1_100);
+        ask(&mut e, key);
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
-        assert_eq!(e.stats.rto_fired, 1, "premise: the RTO fired");
+        assert_eq!(e.stats.rto_fired, 1, "premise: the loss path fired");
         (e, key)
     }
 
@@ -1716,10 +1734,10 @@ mod tests {
         let key = EmitKey::new(1, 0, 0, 0);
         // First retransmission at wire_seq 2; the original (u32::MAX - 1, i.e.
         // 4 earlier across the wrap) is acknowledged.
-        e.note_rto_fire(key, Some(2));
+        e.note_rto_fire(key, Some(2), false);
         e.note_ack_origin(key, u32::MAX - 1);
         assert_eq!(e.stats.rto_spurious, 1, "pre-wrap original is older");
-        e.note_rto_fire(key, Some(9));
+        e.note_rto_fire(key, Some(9), false);
         assert_eq!(e.stats.rto_spurious, 2);
     }
 
@@ -1727,7 +1745,7 @@ mod tests {
     fn the_rto_bookkeeping_is_bounded_and_counts_its_resets() {
         let mut e = ReliableTileEmitter::new(Instant::now());
         for i in 0..(RTO_ORIGIN_CAP as u32 + 5) {
-            e.note_rto_fire(EmitKey::new(i, 0, 0, 0), Some(i));
+            e.note_rto_fire(EmitKey::new(i, 0, 0, 0), Some(i), false);
         }
         assert!(e.rto_origin.len() <= RTO_ORIGIN_CAP);
         assert_eq!(e.stats.rto_origin_resets, 1);
@@ -1832,7 +1850,13 @@ mod tests {
         e.on_nack(&[EmitKey::new(1, 0, 0, 0)], t0);
         e.tick_budgeted(t0, usize::MAX, usize::MAX);
         hand_over(&mut e, t0);
-        // Long enough that the RTO fires for everything still unacknowledged.
+        // The loss path asks for four of the passes still unacknowledged.
+        for i in 2..6 {
+            ask(
+                &mut e,
+                EmitKey::new(i, 0, 0, if i % 3 == 0 { 5 } else { 0 }),
+            );
+        }
         let t1 = t0 + Duration::from_secs(10);
         e.tick_budgeted(t1, 4, usize::MAX);
         hand_over(&mut e, t1);
@@ -1918,6 +1942,7 @@ mod tests {
             e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
             e.drain(&mut sender, t0);
             let t1 = t0 + Duration::from_millis(1_100);
+            ask(&mut e, key);
             e.tick(t1, usize::MAX);
             e.drain(&mut sender, t1);
             assert_eq!(
@@ -1982,8 +2007,9 @@ mod tests {
         assert_eq!(sender.sent.len(), 1);
         let first = wire_seq_of(&sender.sent[0]);
 
-        // RTO retransmit.
+        // Loss-path retransmit.
         let t1 = t0 + Duration::from_millis(1_100);
+        ask(&mut e, key);
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 2);
@@ -2033,6 +2059,7 @@ mod tests {
         );
 
         let t1 = t0 + Duration::from_millis(1_100);
+        ask(&mut e, key);
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
 
@@ -2061,6 +2088,7 @@ mod tests {
         let mut tn = t0;
         for _ in 0..10 {
             tn += Duration::from_millis(500);
+            ask(&mut e, key);
             e.tick(tn, usize::MAX);
             e.drain(&mut sender, tn);
         }
@@ -2080,6 +2108,7 @@ mod tests {
         e.drain(&mut sender, t0);
         e.on_ack(&[key]);
         let t1 = t0 + Duration::from_millis(1_100);
+        ask(&mut e, key);
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 1, "no retransmit after ACK");
@@ -2389,8 +2418,11 @@ mod tests {
         assert!(e.cache.get(&k1).is_none());
         assert!(e.cache.get(&k2).is_none());
         assert!(e.cache.get(&k3).is_some());
-        // Tick past RTO — no retransmit for cancelled, retransmit for k3.
+        // Ask for all three — nothing to send for the cancelled, one for k3.
         let t1 = t0 + Duration::from_millis(1_100);
+        for k in [k1, k2, k3] {
+            ask(&mut e, k);
+        }
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 4, "3 initial + 1 retransmit for k3 only");
@@ -2456,29 +2488,31 @@ mod tests {
     /// The two halves the admission pass serves in priority order are the
     /// halves `tick_budgeted` is made of: NACK repair first, then the timer.
     #[test]
-    fn the_nack_half_and_the_timer_half_are_what_tick_budgeted_does() {
+    fn the_nack_half_and_the_loss_half_are_what_tick_budgeted_does() {
         let t0 = Instant::now();
         let mut e = ReliableTileEmitter::new(t0);
         let (k0, k1) = (EmitKey::new(1, 0, 0, 0), EmitKey::new(1, 1, 0, 0));
         e.submit_one(k0, fake_source(1, 0, 0), t0, None, t0);
         e.submit_one(k1, fake_source(2, 0, 0), t0, None, t0);
-        // Both leave at once, which starts their timers.
         for t in e.take_transmissions() {
             e.on_departed(t.wire_seq, t0);
         }
         let late = t0 + Duration::from_secs(10);
         e.on_nack(&[k0], late);
+        ask(&mut e, k0);
+        ask(&mut e, k1);
         let mut n = 0;
         let nacks = e.tick_nacks_budgeted(late, usize::MAX, usize::MAX, &mut n);
         assert_eq!(
             (n, e.stats.retransmit_by_nack, e.stats.rto_fired),
             (1, 1, 0)
         );
-        let rto = e.tick_rto_budgeted(late, usize::MAX, usize::MAX, &mut n);
-        assert_eq!(e.stats.rto_fired, 2, "both timers are due ten seconds on");
-        assert!(nacks > 0 && rto > 0);
+        let loss = e.tick_loss_budgeted(late, usize::MAX, usize::MAX, &mut n);
+        // k0's NACK repair is the newest transmission of k0 now, but the
+        // request named the one before it; k1's is current.
+        assert!(nacks > 0 && loss > 0);
         // The count carries across, so one `max_retransmits` bounds both.
-        assert_eq!(n, 3);
+        assert_eq!(n, 1 + e.stats.rto_fired as usize);
     }
 
     /// An emission the admission gate holds back is not a failed send.
@@ -2552,9 +2586,9 @@ mod tests {
         assert_eq!(sender.sent.len(), 1);
     }
 
-    /// The byte budget bounds RTO replay, and what it defers stays due.
+    /// The byte budget bounds loss-path retransmission, and what it defers stays queued.
     #[test]
-    fn the_byte_budget_bounds_rto_replay_and_defers_the_rest() {
+    fn the_byte_budget_bounds_loss_replay_and_defers_the_rest() {
         let t0 = Instant::now();
         let mut e = ReliableTileEmitter::new(t0);
         let mut sender = CollectSender::default();
@@ -2564,232 +2598,17 @@ mod tests {
         e.drain(&mut sender, t0);
         let one = sender.sent[0].len();
 
+        for i in 0..100u32 {
+            ask(&mut e, EmitKey::new(i, 0, 0, 0));
+        }
         let t1 = t0 + e.pto() + Duration::from_millis(1);
         let spent = e.tick_budgeted(t1, usize::MAX, 10 * one);
         assert_eq!(e.stats.rto_fired, 10);
         assert_eq!(spent, 10 * one);
 
-        // Not lost, only later.
         let spent = e.tick_budgeted(t1, usize::MAX, usize::MAX);
         assert_eq!(e.stats.rto_fired, 100);
         assert_eq!(spent, 90 * one);
-    }
-
-    /// A key submitted again keeps its first heap entry, whose deadline is
-    /// earlier than the cache entry's new one. That entry must not fire the
-    /// retransmission early; the later one does, once. Removing the
-    /// `rto_deadline > now` skip in `tick_rto_budgeted` makes this fail.
-    #[test]
-    fn a_key_rearmed_later_does_not_fire_from_its_earlier_heap_entry() {
-        let t0 = Instant::now();
-        let mut e = ReliableTileEmitter::new(t0);
-        let mut sender = CollectSender::default();
-        let key = EmitKey::new(1, 0, 0, 0);
-        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
-        // It leaves at once, so the first heap entry is real.
-        e.drain(&mut sender, t0);
-        let rto = pto_for_attempt(&e.rtt, 0);
-        // The scheduler re-sends the same pass half an RTO later.
-        let t_re = t0 + rto / 2;
-        e.submit_one(key, fake_source(1, 0, 0), t_re, None, t_re);
-        e.drain(&mut sender, t_re);
-
-        // Past the first deadline, before the second.
-        let t_mid = t0 + rto + Duration::from_millis(1);
-        assert!(t_mid < t_re + rto);
-        e.tick_budgeted(t_mid, usize::MAX, usize::MAX);
-        assert_eq!(e.stats.rto_fired, 0, "the earlier heap entry is stale");
-
-        let t_late = t_re + rto + Duration::from_millis(1);
-        e.tick_budgeted(t_late, usize::MAX, usize::MAX);
-        assert_eq!(e.stats.rto_fired, 1, "the current deadline fires, once");
-    }
-
-    // ---- F3: the retransmission timer starts at departure ----
-
-    /// A pass whose datagram sits in a queue (quinn's FIFO, or the emitter's
-    /// own) has not been sent, so its timer is not running: however long it
-    /// waits, the RTO does not fire for it. The timer starts when the
-    /// datagram leaves, and measures from there. Arming at submit instead
-    /// (the old behaviour) makes the first half of this fail.
-    #[test]
-    fn a_pass_still_in_the_queue_does_not_time_out_until_it_has_left() {
-        let t0 = Instant::now();
-        let mut e = ReliableTileEmitter::new(t0);
-        e.rtt.on_sample(Duration::from_millis(100));
-        let key = EmitKey::new(1, 0, 0, 0);
-        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
-        let ws = e.take_transmissions()[0].wire_seq;
-        let rto = pto_for_attempt(&e.rtt, 0);
-        assert!(rto >= Duration::from_millis(150), "premise: a real timeout");
-
-        // It waits in the queue for ten timeouts. Nothing fires.
-        let t_wait = t0 + rto * 10;
-        e.tick_budgeted(t_wait, usize::MAX, usize::MAX);
-        assert_eq!(
-            e.stats.rto_fired, 0,
-            "a queued datagram cannot have timed out"
-        );
-        assert_eq!(e.stats.rto_armed_at_departure, 0);
-        assert_eq!(e.awaiting_departure_len(), 1);
-
-        // It leaves. One timeout later, not before, the timer fires.
-        e.on_departed(ws, t_wait);
-        assert_eq!(e.stats.rto_armed_at_departure, 1);
-        assert_eq!(e.awaiting_departure_len(), 0);
-        e.tick_budgeted(
-            t_wait + rto - Duration::from_millis(1),
-            usize::MAX,
-            usize::MAX,
-        );
-        assert_eq!(e.stats.rto_fired, 0, "measured from departure");
-        e.tick_budgeted(t_wait + rto, usize::MAX, usize::MAX);
-        assert_eq!(e.stats.rto_fired, 1);
-    }
-
-    /// The retransmission an RTO produces waits in the queue like any other
-    /// datagram, and its (backed-off) timer starts when it leaves.
-    #[test]
-    fn a_retransmission_starts_its_own_timer_when_it_leaves() {
-        let t0 = Instant::now();
-        let mut e = ReliableTileEmitter::new(t0);
-        e.rtt.on_sample(Duration::from_millis(100));
-        let key = EmitKey::new(1, 0, 0, 0);
-        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
-        let ws0 = e.take_transmissions()[0].wire_seq;
-        e.on_departed(ws0, t0);
-        let rto0 = pto_for_attempt(&e.rtt, 0);
-        let rto1 = pto_for_attempt(&e.rtt, 1);
-        assert!(rto1 > rto0, "premise: the retry backs off");
-        let t1 = t0 + rto0;
-        e.tick_budgeted(t1, usize::MAX, usize::MAX);
-        assert_eq!(e.stats.rto_fired, 1, "premise: it fired once");
-        let ws1 = e.take_transmissions()[0].wire_seq;
-        assert_ne!(ws0, ws1);
-        assert!(e.cache.get(&key).unwrap().rto_deadline.is_none());
-
-        // The retransmission sits in the queue past its own backed-off timeout.
-        let t_wait = t1 + rto1 * 5;
-        e.tick_budgeted(t_wait, usize::MAX, usize::MAX);
-        assert_eq!(e.stats.rto_fired, 1, "queued: no second fire");
-
-        // The original's late departure (it was still queued behind...) does
-        // not start the timer of the newer transmission.
-        e.on_departed(ws0, t_wait);
-        assert_eq!(e.stats.rto_armed_at_departure, 1, "only the first so far");
-
-        e.on_departed(ws1, t_wait);
-        e.tick_budgeted(
-            t_wait + rto1 - Duration::from_millis(1),
-            usize::MAX,
-            usize::MAX,
-        );
-        assert_eq!(e.stats.rto_fired, 1);
-        e.tick_budgeted(t_wait + rto1, usize::MAX, usize::MAX);
-        assert_eq!(e.stats.rto_fired, 2);
-    }
-
-    /// A departure for a pass that has been acknowledged or forgotten starts
-    /// nothing, and a departure the emitter was not waiting for is ignored.
-    #[test]
-    fn a_departure_for_a_pass_that_is_gone_starts_no_timer() {
-        let t0 = Instant::now();
-        let mut e = ReliableTileEmitter::new(t0);
-        let key = EmitKey::new(1, 0, 0, 0);
-        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
-        let ws = e.take_transmissions()[0].wire_seq;
-        e.on_ack(&[key]);
-        e.on_departed(ws, t0);
-        e.on_departed(9_999, t0);
-        assert_eq!(e.stats.rto_armed_at_departure, 0);
-        assert_eq!(e.rto.len(), 0, "nothing was scheduled");
-        // And it was consumed: a second report of the same departure is inert.
-        assert_eq!(e.awaiting_departure_len(), 0);
-    }
-
-    /// Releasing the departure waits (first HELLO, a handle switch, a session
-    /// end) must not leave a cache entry with no timer and nothing able to
-    /// start one: it would wait for an acknowledgement, a cancel or the 30 s
-    /// retire. Each released key is armed at the release instant.
-    #[test]
-    fn a_released_never_departed_pass_still_gets_a_timer() {
-        let t0 = Instant::now();
-        let mut e = ReliableTileEmitter::new(t0);
-        e.rtt.on_sample(Duration::from_millis(100));
-        let key = EmitKey::new(1, 0, 0, 0);
-        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
-        assert_eq!(e.awaiting_departure_len(), 1, "premise: it is waiting");
-        assert!(e.cache.get(&key).unwrap().rto_deadline.is_none());
-
-        let t_rel = t0 + Duration::from_secs(3);
-        e.forget_awaiting_departure(t_rel);
-        assert_eq!(e.awaiting_departure_len(), 0);
-        let rto = pto_for_attempt(&e.rtt, 0);
-        assert_eq!(
-            e.cache.get(&key).unwrap().rto_deadline,
-            Some(t_rel + rto),
-            "armed at the release instant"
-        );
-        e.tick_budgeted(t_rel + rto, usize::MAX, usize::MAX);
-        assert_eq!(e.stats.rto_fired, 1, "and it fires");
-    }
-
-    /// A pass first sent at the end of a stall (several consecutive PTOs, so
-    /// the connection's backoff count is up) is armed with an unbacked-off
-    /// deadline: the stall is handled when the timer is evaluated (the
-    /// hold-back's resume time), not by pushing every new original out. Arming
-    /// with the larger of the key's retries and the connection's count makes
-    /// this fail.
-    #[test]
-    fn a_pass_first_sent_after_a_stall_is_armed_without_the_connections_backoff() {
-        let t0 = Instant::now();
-        let mut e = ReliableTileEmitter::new(t0);
-        e.rtt.on_sample(Duration::from_millis(40));
-        let base = pto_for_attempt(&e.rtt, 0);
-        // A one-second stall: PTOs expire three times with no ACK between.
-        e.rtt.on_pto_fire(t0);
-        e.rtt.on_pto_fire(t0 + base * 2);
-        e.rtt.on_pto_fire(t0 + base * 8);
-        assert_eq!(e.rtt.pto_count(), 3, "premise: the backoff count is up");
-
-        let t_send = t0 + Duration::from_secs(1);
-        let key = EmitKey::new(9, 0, 0, 0);
-        e.submit_one(key, fake_source(9, 0, 0), t_send, None, t_send);
-        let ws = e.take_transmissions()[0].wire_seq;
-        e.on_departed(ws, t_send);
-        assert_eq!(
-            e.cache.get(&key).unwrap().rto_deadline,
-            Some(t_send + base),
-            "an original is armed with attempts only"
-        );
-    }
-
-    /// The silence is still honoured at evaluation time: with the count up and
-    /// no ACK for a while, a held pass resumes later than one PTO after the
-    /// newest ACK, and an ACK ends the backoff.
-    #[test]
-    fn a_held_pass_resumes_later_while_the_connection_is_silent() {
-        let t0 = Instant::now();
-        let mut e = ReliableTileEmitter::new(t0);
-        e.rtt.on_sample(Duration::from_millis(40));
-        let base = pto_for_attempt(&e.rtt, 0);
-        let key = EmitKey::new(1, 0, 0, 0);
-        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
-        let ws = e.take_transmissions()[0].wire_seq;
-        e.on_departed(ws, t0);
-        // An ACK of something older, then silence: three consecutive PTOs.
-        e.note_ack(0, t0);
-        e.rtt.on_pto_fire(t0 + base);
-        e.rtt.on_pto_fire(t0 + base * 3);
-        e.rtt.on_pto_fire(t0 + base * 7);
-        assert_eq!(e.rtt.pto_count(), 3);
-        // Own deadline (t0 + base) and one PTO after the ACK have passed, but
-        // the backed-off resume (t0 + 8 base) has not.
-        e.tick_budgeted(t0 + base * 2, usize::MAX, usize::MAX);
-        assert_eq!(e.stats.rto_fired, 0);
-        assert!(e.stats.rto_deferred_by_ack >= 1, "premise: it was held");
-        e.tick_budgeted(t0 + base * 8, usize::MAX, usize::MAX);
-        assert_eq!(e.stats.rto_fired, 1);
     }
 
     /// What was measured on a connection that is gone must not carry over: its
@@ -2803,62 +2622,98 @@ mod tests {
         let mut e = ReliableTileEmitter::new(t0);
         e.rtt.on_sample(Duration::from_millis(40));
         let base = pto_for_attempt(&e.rtt, 0);
-        e.note_ack(5, t0);
-        e.rtt.on_pto_fire(t0);
-        e.rtt.on_pto_fire(t0 + base * 2);
+        e.note_ack(t0);
+        e.on_departed(1, t0);
+        e.note_pto_fire(t0);
+        e.note_pto_fire(t0 + base * 2);
         assert_eq!(
             e.rtt.pto_count(),
             2,
             "premise: backoff from the old connection"
         );
-        assert!(e.last_ack_at.is_some() && e.max_acked_depart_us.is_some());
+        assert!(e.last_ack_at.is_some() && e.latest_departure_at.is_some());
 
         e.clear_cache();
 
         assert_eq!(e.rtt.pto_count(), 0);
         assert!(!e.rtt.has_sample());
-        assert!(e.last_ack_at.is_none() && e.max_acked_depart_us.is_none());
-        // The next connection's first pass is armed from the initial RTT, not
-        // from the old 40 ms estimate, and nothing holds it back.
+        assert!(e.last_ack_at.is_none() && e.latest_departure_at.is_none());
+        assert!(e.last_pto_fire_at.is_none());
+        // The next connection's first pass is probed on the initial RTT, not
+        // on the old 40 ms estimate with its backoff.
         let t1 = t0 + Duration::from_secs(2);
         let key = EmitKey::new(2, 0, 0, 0);
         e.submit_one(key, fake_source(2, 0, 0), t1, None, t1);
         let ws = e.take_transmissions()[0].wire_seq;
         e.on_departed(ws, t1);
         let initial = pto_for_attempt(&RttEstimator::new(), 0);
-        assert_eq!(e.cache.get(&key).unwrap().rto_deadline, Some(t1 + initial));
+        assert_eq!(e.pto_deadline(), Some(t1 + initial));
         assert!(initial > base * 3, "premise: the two estimates differ");
     }
 
-    /// A NACK repair made before the original has left must not back off the
-    /// original's first deadline.
-    #[test]
-    fn a_repair_before_the_original_departs_does_not_back_off_its_timer() {
-        let t0 = Instant::now();
+    const MS_1: Duration = Duration::from_millis(1);
+
+    // ---- the probe timeout (one per connection) ----
+
+    fn one_departed_pass(t0: Instant) -> (ReliableTileEmitter, EmitKey) {
         let mut e = ReliableTileEmitter::new(t0);
-        e.rtt.on_sample(Duration::from_millis(100));
+        e.rtt.on_sample(Duration::from_millis(40));
         let key = EmitKey::new(1, 0, 0, 0);
         e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
-        let ws0 = e.take_transmissions()[0].wire_seq;
-        e.on_nack(&[key], t0);
-        e.tick_budgeted(t0, usize::MAX, usize::MAX);
+        let ws = e.take_transmissions()[0].wire_seq;
+        e.on_departed(ws, t0);
+        (e, key)
+    }
+
+    /// Not running with nothing cached, nor before anything has left.
+    #[test]
+    fn the_probe_timeout_runs_only_with_a_departed_pass_outstanding() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        assert_eq!(e.pto_deadline(), None);
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        assert_eq!(e.pto_deadline(), None, "queued, not departed");
+        let ws = e.take_transmissions()[0].wire_seq;
+        e.on_departed(ws, t0);
+        assert!(e.pto_deadline().is_some());
+        e.on_ack(&[key]);
+        assert_eq!(e.pto_deadline(), None, "nothing left to probe for");
+    }
+
+    /// One PTO from the newest departure; an acknowledgement restarts it; each
+    /// expiry restarts it and doubles the next; an acknowledgement ends the
+    /// doubling.
+    #[test]
+    fn the_probe_timeout_restarts_on_acks_and_backs_off_on_expiries() {
+        let t0 = Instant::now();
+        let (mut e, _key) = one_departed_pass(t0);
+        let pto = e.pto();
+        assert_eq!(e.pto_deadline(), Some(t0 + pto));
+        let t_ack = t0 + pto / 2;
+        e.note_ack(t_ack);
+        assert_eq!(e.pto_deadline(), Some(t_ack + pto), "reset on any ACK");
+        // Expires; restarts from the expiry, backed off once.
+        let t1 = t_ack + pto;
+        assert!(e.pto_due(t1));
+        e.note_pto_fire(t1);
+        assert!(!e.pto_due(t1));
+        assert_eq!(e.pto_deadline(), Some(t1 + pto * 2));
+        let t2 = t1 + pto * 2;
+        e.note_pto_fire(t2);
+        assert_eq!(e.pto_deadline(), Some(t2 + pto * 4));
+        e.note_ack(t2 + MS_1);
         assert_eq!(
-            e.stats.retransmit_by_nack, 1,
-            "premise: the repair was made"
-        );
-        let t_dep = t0 + Duration::from_millis(5);
-        e.on_departed(ws0, t_dep);
-        assert_eq!(
-            e.cache.get(&key).unwrap().rto_deadline,
-            Some(t_dep + pto_for_attempt(&e.rtt, 0)),
-            "the original's timer is an attempt-0 timer"
+            e.pto_deadline(),
+            Some(t2 + MS_1 + pto),
+            "an ACK ends the backoff"
         );
     }
 
     /// The client saying "this did not arrive" outranks a timer guessing
     /// that it might not have.
     #[test]
-    fn nacks_are_served_ahead_of_the_rto() {
+    fn nacks_are_served_ahead_of_the_loss_path() {
         let t0 = Instant::now();
         let mut e = ReliableTileEmitter::new(t0);
         let mut sender = CollectSender::default();
@@ -2874,9 +2729,10 @@ mod tests {
 
         let t1 = t0 + Duration::from_secs(1);
         e.on_nack(&[nacked], t1);
+        ask(&mut e, timed_out);
         // Room for exactly one.
         e.tick_budgeted(t1, usize::MAX, one);
-        assert_eq!(e.stats.rto_fired, 0, "the timer waits its turn");
+        assert_eq!(e.stats.rto_fired, 0, "the loss path waits its turn");
         assert_eq!(e.cache.get(&nacked).unwrap().attempts, 1);
         assert_eq!(e.cache.get(&timed_out).unwrap().attempts, 0);
     }
@@ -2926,6 +2782,7 @@ mod tests {
         let mut t = now;
         for _ in 0..30 {
             t += std::time::Duration::from_secs(5);
+            ask(&mut e, key);
             e.tick(t, usize::MAX);
             e.drain(&mut Sink(&mut sink), t);
         }
@@ -2969,7 +2826,9 @@ mod tests {
         e.drain(&mut Sink(&mut sink), now);
         sink.clear();
 
-        // Advance past the first RTO deadline of every entry.
+        for i in 0..1000u32 {
+            ask(&mut e, EmitKey::new(i, 0, 0, 0));
+        }
         let t1 = now + e.pto() + std::time::Duration::from_millis(1);
 
         // First tick with budget=64: must fire exactly 64.

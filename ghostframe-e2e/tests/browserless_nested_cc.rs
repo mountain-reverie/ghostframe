@@ -192,7 +192,23 @@ fn report_d1(scene: &str, r: &BrowserlessResult) {
         "d1_evicted_before_departure",
         i.ledger_evicted_before_departure,
     );
-    metric(scene, "d1_rto_armed_at_departure", i.rto_armed_at_departure);
+    metric(
+        scene,
+        "d1_loss_path",
+        format!(
+            "verdicts[packet={} time={} pto={}] k_pkt={} spurious={} retx[loss={} probe={}] pto_fires={} verdict_no_retx[gone={} newer={}]",
+            i.loss_by_packet_threshold,
+            i.loss_by_time_threshold,
+            i.loss_by_pto,
+            i.k_pkt,
+            i.ledger_spurious_losses,
+            i.loss_retransmits,
+            i.pto_probe_retransmits,
+            i.pto_fires,
+            i.verdict_content_gone,
+            i.verdict_newer_in_flight
+        ),
+    );
     metric(
         scene,
         "d1_ledger_losses",

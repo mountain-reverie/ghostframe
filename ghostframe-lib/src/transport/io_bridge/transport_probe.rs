@@ -90,6 +90,8 @@ pub(super) struct Instruments {
     session_bytes_base: u64,
     /// Ledger expiries (declared lost) and how many were handed to goog_cc.
     pub(super) losses_declared: u64,
+    pub(super) loss_retx_requested: u64,
+    pub(super) pto_probes_requested: u64,
     pub(super) losses_flushed: u64,
     /// Declared lost but dropped from the pending list by its cap.
     pub(super) losses_overflowed: u64,
@@ -137,8 +139,6 @@ impl IoBridge {
         self.departures = Default::default();
         self.departures_handle = None;
         self.transmission_ledger.discard_undeparted();
-        self.reliable_emitter
-            .forget_awaiting_departure(super::now_std());
     }
 
     /// Move what the emitter put on the wire since the last call into the
@@ -158,6 +158,7 @@ impl IoBridge {
                     wire_bytes: e.wire_bytes,
                     key: e.key,
                     depart_us: None,
+                    dep_idx: None,
                 },
             );
         }
@@ -350,7 +351,22 @@ impl IoBridge {
                 .transmission_ledger
                 .stats()
                 .evicted_before_departure,
-            rto_armed_at_departure: self.reliable_emitter.stats.rto_armed_at_departure,
+            loss_by_packet_threshold: self.transmission_ledger.stats().lost_packet_threshold,
+            loss_by_time_threshold: self.transmission_ledger.stats().lost_time_threshold,
+            loss_by_pto: self.transmission_ledger.stats().lost_pto,
+            ledger_spurious_losses: self.transmission_ledger.stats().spurious_losses,
+            k_pkt: self.transmission_ledger.stats().k_pkt,
+            k_pkt_raises: self.transmission_ledger.stats().k_pkt_raises,
+            loss_retx_requested: i.loss_retx_requested,
+            pto_probes_requested: i.pto_probes_requested,
+            pto_fires: self.reliable_emitter.stats.pto_fires,
+            loss_retransmits: self.reliable_emitter.stats.loss_retransmits,
+            pto_probe_retransmits: self.reliable_emitter.stats.pto_probe_retransmits,
+            verdict_content_gone: self.reliable_emitter.stats.verdict_content_gone,
+            verdict_newer_in_flight: self.reliable_emitter.stats.verdict_newer_in_flight,
+            verdict_already_queued: self.reliable_emitter.stats.verdict_already_queued,
+            spurious_loss: self.reliable_emitter.stats.spurious_loss,
+            spurious_pto: self.reliable_emitter.stats.spurious_pto,
             ledger_unknown_acks: self.transmission_ledger.stats().unknown_acks,
             ledger_tombstone_evictions: self.transmission_ledger.stats().tombstone_evictions,
             offered: i.offered,

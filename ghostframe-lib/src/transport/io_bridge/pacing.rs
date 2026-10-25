@@ -396,7 +396,8 @@ impl IoBridge {
     fn admission_backlog(&self, now: std::time::Instant) -> bool {
         self.reliable_emitter.emission_queue_len() > 0
             || self.reliable_emitter.pending_nack_count() > 0
-            || self.reliable_emitter.has_due_rto(now)
+            || self.reliable_emitter.pending_loss_count() > 0
+            || self.reliable_emitter.pto_due(now)
             || (self.last_drain_frame_context.is_some() && self.scheduler.has_pending_work())
     }
 
@@ -473,7 +474,7 @@ impl IoBridge {
                         }
                         AdmitClass::Retransmit => {
                             let mut n = 0;
-                            self.reliable_emitter.tick_rto_budgeted(
+                            self.reliable_emitter.tick_loss_budgeted(
                                 now,
                                 usize::MAX,
                                 remaining,

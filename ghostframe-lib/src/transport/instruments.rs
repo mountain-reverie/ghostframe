@@ -593,8 +593,25 @@ pub struct InstrumentSummary {
     pub ledger_departures_stamped: u64,
     /// Transmissions the ledger's capacity cap evicted before they departed.
     pub ledger_evicted_before_departure: u64,
-    /// Retransmission timers started by a departure.
-    pub rto_armed_at_departure: u64,
+    /// The loss path (D1 F4 part 2): verdicts by reason, the ones later
+    /// contradicted, the packet threshold now, retransmissions asked for by
+    /// verdicts and by probes, and why verdicts sent nothing.
+    pub loss_by_packet_threshold: u64,
+    pub loss_by_time_threshold: u64,
+    pub loss_by_pto: u64,
+    pub ledger_spurious_losses: u64,
+    pub k_pkt: u64,
+    pub k_pkt_raises: u64,
+    pub loss_retx_requested: u64,
+    pub pto_probes_requested: u64,
+    pub pto_fires: u64,
+    pub loss_retransmits: u64,
+    pub pto_probe_retransmits: u64,
+    pub verdict_content_gone: u64,
+    pub verdict_newer_in_flight: u64,
+    pub verdict_already_queued: u64,
+    pub spurious_loss: u64,
+    pub spurious_pto: u64,
     /// Acknowledgements naming a `wire_seq` the ledger knows nothing of
     /// (duplicates, or declared lost and since evicted from the tombstones).
     pub ledger_unknown_acks: u64,

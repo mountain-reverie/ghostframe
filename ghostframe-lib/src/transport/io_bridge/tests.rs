@@ -1763,6 +1763,7 @@ async fn ack_routes_through_emitter_dropping_cache() {
                 wire_bytes: e.wire_bytes,
                 key: e.key,
                 depart_us: None,
+                dep_idx: None,
             },
         );
     }
@@ -1806,6 +1807,7 @@ async fn the_classifiers_loss_rate_is_the_ledgers_verdict() {
                     0,
                 ),
                 depart_us: None,
+                dep_idx: None,
             },
         );
         if !wire_seq.is_multiple_of(5) {
@@ -1825,9 +1827,10 @@ async fn the_classifiers_loss_rate_is_the_ledgers_verdict() {
     // Acknowledgements alone say nothing about loss.
     assert_eq!(bridge.adaptation_context.loss_rate, 0.0);
 
-    // Declared lost, but not yet beyond recall: still no reading.
-    tokio::time::advance(LOSS_HORIZON_FLOOR).await;
+    // Declared lost (three or more later departures were acknowledged past
+    // each of them), but not yet beyond recall: still no reading.
     bridge.expire_transmissions(now_std());
+    assert_eq!(bridge.instr.losses_declared, 80);
     assert_eq!(bridge.adaptation_context.loss_rate, 0.0);
 
     // One of them turns up after all.
@@ -3502,6 +3505,7 @@ async fn bwe_estimate_advances_through_bridge_production_wiring() {
                     wire_bytes: e.wire_bytes,
                     key: e.key,
                     depart_us: None,
+                    dep_idx: None,
                 },
             );
             entries.push(AckEntry {
@@ -4996,6 +5000,7 @@ fn seed_unacked_entry(
                 wire_bytes: e.wire_bytes,
                 key: e.key,
                 depart_us: None,
+                dep_idx: None,
             },
         );
     }
@@ -5267,13 +5272,19 @@ fn live_path_rtt_reads_only_the_live_sessions_connection() {
     );
 }
 
-#[tokio::test]
-async fn loss_horizon_falls_back_to_the_floor_without_a_live_connection() {
-    let bridge = test_bridge_with_sessions(&[]).await;
-    assert_eq!(
-        bridge.loss_horizon(),
-        (LOSS_HORIZON_FLOOR * LOSS_HORIZON_RTTS).clamp(LOSS_HORIZON_FLOOR, LOSS_HORIZON_CEIL)
-    );
+/// The time threshold is 9/8 of the larger of srtt and the latest round trip,
+/// from the emitter's own (application-acknowledgement) estimator.
+#[test]
+fn the_time_threshold_is_nine_eighths_of_the_larger_rtt() {
+    use crate::transport::rtt_estimator::RttEstimator;
+    let ms = std::time::Duration::from_millis;
+    let mut e = RttEstimator::new();
+    e.on_sample(ms(80));
+    assert_eq!(crate::transport::loss_path::time_threshold(&e), ms(90));
+    // A latest sample above srtt wins.
+    e.on_sample(ms(160));
+    assert!(e.latest_rtt() > e.srtt());
+    assert_eq!(crate::transport::loss_path::time_threshold(&e), ms(180));
 }
 
 #[tokio::test]
@@ -5595,6 +5606,7 @@ fn ledger_tx(
         wire_bytes: bytes,
         key: crate::transport::reliable_emitter::EmitKey::new(frame_seq, 1, 2, 0),
         depart_us: None,
+        dep_idx: None,
     }
 }
 
@@ -5613,7 +5625,7 @@ async fn a_late_ack_retracts_the_pending_loss_it_contradicts() {
     bridge
         .transmission_ledger
         .record_departed(42, t0, ledger_tx(2_000, 900, 2));
-    bridge.expire_transmissions(t0 + std::time::Duration::from_secs(60));
+    bridge.declare_lost_for_test(&[41, 42]);
     assert_eq!(bridge.pending_losses.len(), 2, "both declared lost");
 
     // Only wire_seq 41 turns out to have arrived.
@@ -5648,7 +5660,7 @@ async fn a_late_ack_withdraws_its_own_loss_among_identical_twins() {
             .transmission_ledger
             .record_departed(ws, t0, ledger_tx(5_000, 1_200, ws));
     }
-    bridge.expire_transmissions(t0 + std::time::Duration::from_secs(60));
+    bridge.declare_lost_for_test(&[10, 11, 12]);
     let batch = AckBatch {
         entries: vec![AckEntry {
             wire_seq: 11,
@@ -5674,7 +5686,7 @@ async fn a_late_ack_for_an_already_flushed_loss_is_a_no_op() {
     bridge
         .transmission_ledger
         .record_departed(2, t0, ledger_tx(2_000, 1_200, 2));
-    bridge.expire_transmissions(t0 + std::time::Duration::from_secs(60));
+    bridge.declare_lost_for_test(&[1, 2]);
     bridge.pending_losses.retain(|l| l.wire_seq != 1); // wire_seq 1 was flushed
     let batch = AckBatch {
         entries: vec![AckEntry {
@@ -5706,12 +5718,13 @@ async fn post_turn_withdraws_the_loss_of_a_late_acked_transmission() {
     bridge
         .transmission_ledger
         .record_departed(42, long_ago, ledger_tx(2_000, 900, 2));
+    bridge.declare_lost_for_test(&[41, 42]);
 
     bridge.post_turn().await.expect("post_turn");
     assert_eq!(
         bridge.pending_losses.len(),
         2,
-        "both expired, no sample to flush them"
+        "both declared, no sample to flush them"
     );
 
     let batch = AckBatch {
@@ -5756,6 +5769,7 @@ async fn a_late_ack_after_the_flush_is_counted_apart_from_one_before_it() {
             ledger_tx(1_000 * ws as u64, 1_200, ws),
         );
     }
+    bridge.declare_lost_for_test(&[1, 2]);
     bridge.post_turn().await.expect("post_turn");
     assert_eq!(bridge.pending_losses.len(), 2, "declared, not yet reported");
     assert_eq!(bridge.instr.losses_declared, 2);
@@ -5886,6 +5900,7 @@ async fn bwe_sample_send_time_is_not_the_wrapped_emit_clock() {
             wire_bytes: sent[0].wire_bytes,
             key: sent[0].key,
             depart_us: None,
+            dep_idx: None,
         },
     );
     let batch = AckBatch {
@@ -5929,7 +5944,9 @@ async fn pending_loss_send_time_is_not_the_wrapped_emit_clock() {
         None,
         now,
     );
+    let mut first_ws = 0;
     for e in bridge.reliable_emitter.take_transmissions() {
+        first_ws = e.wire_seq;
         bridge.transmission_ledger.record_departed(
             e.wire_seq,
             now,
@@ -5938,10 +5955,11 @@ async fn pending_loss_send_time_is_not_the_wrapped_emit_clock() {
                 wire_bytes: e.wire_bytes,
                 key: e.key,
                 depart_us: None,
+                dep_idx: None,
             },
         );
     }
-    bridge.expire_transmissions(now + std::time::Duration::from_secs(60));
+    bridge.declare_lost_for_test(&[first_ws]);
     assert_eq!(bridge.pending_losses.len(), 1);
     let true_us = now.duration_since(base).as_micros() as u64;
     assert!(
@@ -5981,6 +5999,7 @@ async fn pre_wrap_sample_send_time_equals_the_emitted_stamp() {
             wire_bytes: e.wire_bytes,
             key: e.key,
             depart_us: None,
+            dep_idx: None,
         },
     );
     let batch = AckBatch {
@@ -6589,9 +6608,9 @@ async fn ungated_accepts_at_or_above_the_depth_target_are_counted() {
 // ---- F3: the loss clock and the estimator's send times start at departure ----
 
 /// A transmission that has been built and recorded but has not left quinn's
-/// FIFO is not on the loss clock, however old it is; once it leaves, the
-/// verdict is on the usual horizon from then, and it is reported to goog_cc
-/// against the moment it left, not the moment it was built.
+/// FIFO is in no departure order, however old it is; once it leaves, a verdict
+/// on it is reported to goog_cc against the moment it left, not the moment it
+/// was built.
 #[tokio::test]
 async fn a_queued_transmission_is_not_declared_lost_and_a_departed_one_is_reported_at_departure() {
     let mut bridge = make_bridge_for_test().await;
@@ -6604,20 +6623,28 @@ async fn a_queued_transmission_is_not_declared_lost_and_a_departed_one_is_report
     bridge
         .transmission_ledger
         .record(41, long_ago, ledger_tx(1_000, 1_200, 1));
-
+    // Five later transmissions leave and the last is acknowledged: the first
+    // three of them are lost, and the queued one is not among them however old.
+    for ws in 42..=46u32 {
+        bridge
+            .transmission_ledger
+            .record_departed(ws, long_ago, ledger_tx(1_000, 1_200, ws));
+    }
+    assert!(bridge.transmission_ledger.resolve(46).is_some());
     bridge.post_turn().await.expect("post_turn");
     assert!(
-        bridge.pending_losses.is_empty(),
+        bridge.pending_losses.iter().all(|l| l.wire_seq != 41),
         "a transmission still queued cannot have been lost"
     );
-    assert_eq!(bridge.instr.losses_declared, 0);
-    assert_eq!(bridge.transmission_ledger.len(), 1, "and it is still owed");
+    assert_eq!(bridge.instr.losses_declared, 2, "42 and 43");
+    assert_eq!(bridge.transmission_ledger.departed(41), Some(false));
+    bridge.pending_losses.clear();
 
-    // It leaves 5 ms after the emitter's epoch.
+    // It leaves 5 ms after the emitter's epoch, and is then declared lost.
     let left = base + std::time::Duration::from_millis(5);
     bridge.stamp_departure(41, left);
-    bridge.post_turn().await.expect("post_turn");
-    assert_eq!(bridge.pending_losses.len(), 1, "on the wire a minute: lost");
+    bridge.declare_lost_for_test(&[41]);
+    assert_eq!(bridge.pending_losses.len(), 1);
     assert_eq!(
         bridge.pending_losses[0].emit_us, 5_000,
         "reported against the departure (5 ms), not the build stamp (1 ms)"
@@ -6686,4 +6713,111 @@ async fn forgetting_a_session_discards_what_never_left_and_keeps_what_did() {
     assert_eq!(bridge.departures_handle, None);
     assert_eq!(bridge.transmission_ledger.departed(1), None, "discarded");
     assert_eq!(bridge.transmission_ledger.departed(2), Some(true), "kept");
+}
+
+// ---- F4 part 2: a verdict contradicted by a late acknowledgement is undone ----
+
+/// Eifel response: the acknowledgement of a transmission already declared lost
+/// retracts the loss from the loss window and from the pending list, ends the
+/// PTO backoff, and its (long) round trip is absorbed into srtt, which
+/// lengthens the next time threshold and PTO. goog_cc cannot be told to forget,
+/// and the instruments say how much it was told (`late_acked_after_flush`).
+/// Skipping the retraction leaves the loss rate and the pending loss standing.
+#[tokio::test(start_paused = true)]
+async fn a_spurious_verdict_is_retracted_and_its_round_trip_absorbed() {
+    use crate::transport::ack::{AckBatch, AckEntry};
+    let mut bridge = make_bridge_for_test().await;
+    bridge
+        .reliable_emitter
+        .rtt
+        .on_sample(std::time::Duration::from_millis(40));
+    let srtt_before = bridge.reliable_emitter.rtt.srtt();
+    let now = super::now_std();
+    bridge.transmission_ledger.record_departed(
+        7,
+        now,
+        ledger_tx(bridge.reliable_emitter.emit_us64(now), 1_200, 7),
+    );
+    bridge.declare_lost_for_test(&[7]);
+    assert_eq!(bridge.pending_losses.len(), 1, "premise: declared lost");
+    // The path was silent: the probe backoff is up.
+    bridge.reliable_emitter.note_pto_fire(now);
+    bridge
+        .reliable_emitter
+        .note_pto_fire(now + std::time::Duration::from_secs(1));
+    assert_eq!(bridge.reliable_emitter.rtt.pto_count(), 2, "premise");
+
+    // A second later the "lost" datagram is acknowledged.
+    tokio::time::advance(std::time::Duration::from_millis(900)).await;
+    let batch = AckBatch {
+        entries: vec![AckEntry {
+            wire_seq: 7,
+            arrival_time_ms_lo16: 1,
+        }],
+    };
+    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.retract_late_acked_losses();
+
+    assert!(
+        bridge.pending_losses.is_empty(),
+        "retracted before it reached goog_cc"
+    );
+    assert_eq!(bridge.pending_losses_retracted, 1);
+    assert_eq!(bridge.reliable_emitter.rtt.pto_count(), 0, "backoff reset");
+    assert!(
+        bridge.reliable_emitter.rtt.srtt() > srtt_before,
+        "srtt absorbed the late round trip: {:?} vs {:?}",
+        bridge.reliable_emitter.rtt.srtt(),
+        srtt_before
+    );
+    assert_eq!(bridge.transmission_ledger.stats().spurious_losses, 1);
+}
+
+/// The probe timeout is a wake deadline of the event loop: with a static
+/// screen after a lost final pass there is no frame and no heartbeat to run it,
+/// and a loop that did not wake for it would sleep through the repair.
+#[tokio::test(start_paused = true)]
+async fn the_probe_timeout_is_a_wake_deadline() {
+    let mut bridge = make_bridge_for_test().await;
+    bridge
+        .reliable_emitter
+        .rtt
+        .on_sample(std::time::Duration::from_millis(40));
+    assert_eq!(
+        bridge.next_wake_deadline(),
+        None,
+        "premise: nothing pending"
+    );
+    let now = super::now_std();
+    let key = crate::transport::reliable_emitter::EmitKey::new(1, 1, 2, 0);
+    let mut frag = vec![0u8; 20];
+    frag[0] = 0x80;
+    bridge
+        .reliable_emitter
+        .submit_one(key, bytes::Bytes::from(frag), now, None, now);
+    for e in bridge.reliable_emitter.take_transmissions() {
+        bridge.transmission_ledger.record_departed(
+            e.wire_seq,
+            now,
+            crate::transport::transmission_ledger::Transmission {
+                emit_us: e.emit_us,
+                wire_bytes: e.wire_bytes,
+                key: e.key,
+                depart_us: None,
+                dep_idx: None,
+            },
+        );
+        bridge.reliable_emitter.on_departed(e.wire_seq, now);
+    }
+    let pto = bridge.reliable_emitter.pto();
+    assert_eq!(
+        bridge.next_wake_deadline(),
+        Some(now + pto),
+        "the loop wakes for the probe"
+    );
+    // And it fires there, on its own: the pass is sent again.
+    tokio::time::advance(pto).await;
+    bridge.poll_pto(super::now_std());
+    assert_eq!(bridge.reliable_emitter.pending_loss_count(), 1);
+    assert_eq!(bridge.instr.pto_probes_requested, 1);
 }

@@ -153,7 +153,9 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
          charged_B={} soft_charged_B={} ungated_at_depth={}] \
          ledger[declared={} flushed={} overflowed={} late_before_flush={} late_after_flush={} \
          late_unreported={} unknown_acks={} tombstone_evictions={} expired_before_departure={} \
-         departures_stamped={} evicted_before_departure={} rto_armed_at_departure={}] \
+         departures_stamped={} evicted_before_departure={}] \
+         loss[pkt={} time={} pto={} k_pkt={} k_raises={} spurious_ledger={} loss_retx={} probe_retx={} pto_fires={} \
+         verdict_no_retx[gone={} newer={} queued={}] spurious_loss={} spurious_pto={}] \
          ecn[ect0={} unmarked={} last_marked={}] rto_fired={} rto_spurious={} rto_useful={} \
          generation_replacements={} rto_fired_superseded={}",
         i.window_us / 1000,
@@ -209,7 +211,20 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
         i.ledger_expired_before_departure,
         i.ledger_departures_stamped,
         i.ledger_evicted_before_departure,
-        i.rto_armed_at_departure,
+        i.loss_by_packet_threshold,
+        i.loss_by_time_threshold,
+        i.loss_by_pto,
+        i.k_pkt,
+        i.k_pkt_raises,
+        i.ledger_spurious_losses,
+        i.loss_retransmits,
+        i.pto_probe_retransmits,
+        i.pto_fires,
+        i.verdict_content_gone,
+        i.verdict_newer_in_flight,
+        i.verdict_already_queued,
+        i.spurious_loss,
+        i.spurious_pto,
         i.ecn.ect0_tx,
         i.ecn.unmarked_tx,
         i.ecn.last_marked,
@@ -241,8 +256,8 @@ fn assert_p3(n: &str, r: &BrowserlessResult, lossy: bool) {
         "{n}: P3 premise: the FIFO was never non-empty"
     );
     assert!(
-        i.ledger_departures_stamped > 0 && i.rto_armed_at_departure > 0,
-        "{n}: P3 premise: no departure reached the ledger or the emitter"
+        i.ledger_departures_stamped > 0,
+        "{n}: P3 premise: no departure reached the ledger"
     );
     if lossy {
         assert!(
