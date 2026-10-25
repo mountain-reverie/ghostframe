@@ -215,7 +215,7 @@ pub(super) fn run_script(sc: Script) -> Run {
                     passes_acked.insert(tx.key);
                     run.finished_at = t;
                 }
-                Some(Resolution::Late(tx)) => {
+                Some(Resolution::Late { tx, .. }) => {
                     e.note_ack_origin(tx.key, ws);
                     e.on_ack(&[tx.key]);
                     e.rtt.on_sample(t - departed);

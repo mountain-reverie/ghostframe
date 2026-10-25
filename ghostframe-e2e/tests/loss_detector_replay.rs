@@ -96,7 +96,7 @@ fn replay(trace: &[Option<u64>], freeze: bool) -> Replay {
     let quarter = N * 3 / 4;
     for (_, ws) in arrivals {
         match ledger.resolve(ws) {
-            Some(Resolution::Late(_)) => {
+            Some(Resolution::Late { .. }) => {
                 out.spurious += 1;
                 if ws >= quarter {
                     out.spurious_last_quarter += 1;

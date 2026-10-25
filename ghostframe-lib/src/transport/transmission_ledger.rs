@@ -62,8 +62,16 @@ pub(crate) const K_PKT_INITIAL: u64 = 3;
 /// The adaptive packet threshold never exceeds this (RACK's reordering window
 /// is bounded the same way).
 pub(crate) const K_PKT_MAX: u64 = 8;
-/// Verdicts the adaptation looks back over.
+/// Packet-threshold verdicts the adaptation looks back over.
 const ADAPT_WINDOW: u64 = 64;
+/// Verdicts the window must hold before `K_PKT` may be raised: a share of a
+/// handful is no evidence.
+const ADAPT_MIN_VERDICTS: u64 = 32;
+/// A late acknowledgement this many departures after the transmission could be
+/// an FEC recovery: the group's parity leaves `PARITY_INTERLEAVE_OFFSET`
+/// wire_seqs after the group starts, so before that distance no parity exists
+/// to rebuild anything from.
+const FEC_POSSIBLE_AFTER: u64 = crate::transport::reliable_emitter::PARITY_INTERLEAVE_OFFSET as u64;
 /// Spurious share of the window above which `K_PKT` goes up by one: 10 %.
 const ADAPT_SPURIOUS_PERCENT: u64 = 10;
 
@@ -81,7 +89,28 @@ pub enum Resolution {
     /// **not** be fed to the estimator — that transmission has already been
     /// accounted for as a loss, and counting it again would report the same
     /// bytes twice.
-    Late(Transmission),
+    Late {
+        tx: Transmission,
+        /// The acknowledgement came at least `PARITY_INTERLEAVE_OFFSET`
+        /// departures after the transmission, so it may be the client acking a
+        /// datagram it rebuilt from parity under its original `wire_seq`: a
+        /// real network loss, not a premature verdict. Nothing on the wire
+        /// says which, so the caller treats it as a loss that happened (no
+        /// retraction, no threshold adaptation) and counts it apart. A late
+        /// acknowledgement arriving sooner cannot be a recovery and is a
+        /// genuinely premature verdict.
+        fec_possible: bool,
+    },
+}
+
+/// A verdict kept so a late acknowledgement can be recognised.
+#[derive(Debug, Clone, Copy)]
+struct Tombstone {
+    tx: Transmission,
+    /// Number of the packet-threshold verdict, for the adaptation window.
+    /// `None` for time-threshold and probe verdicts, which do not adapt it.
+    packet_verdict_no: Option<u64>,
+    departed: Option<Instant>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -126,6 +155,10 @@ pub struct LedgerStats {
     /// being declared lost. Equal to `acked_after_declared_lost` (a tombstone
     /// resolves once); kept under the Eifel name.
     pub spurious_losses: u64,
+    /// Of `spurious_losses`, those that arrived late enough to be an FEC
+    /// recovery (see [`Resolution::Late`]). They do not retract the loss or
+    /// adapt `K_PKT`.
+    pub late_acks_fec_possible: u64,
     /// The packet threshold now (3 to 8) and how often it has been raised.
     pub k_pkt: u64,
     pub k_pkt_raises: u64,
@@ -157,7 +190,7 @@ pub struct TransmissionLedger {
     /// `wire_seq -> Transmission` for expired records, retained so a late
     /// acknowledgement can still release its content. Bounded by the same
     /// capacity as `records`; oldest evicted first.
-    tombstones: HashMap<u32, (Transmission, u64)>,
+    tombstones: HashMap<u32, Tombstone>,
     tombstone_order: VecDeque<u32>,
     /// Next departure index to hand out.
     next_dep_idx: u64,
@@ -311,6 +344,26 @@ impl TransmissionLedger {
         before - self.records.len()
     }
 
+    /// Forget everything about the session that ended: the outstanding
+    /// records (neither delivered nor lost to anyone who counts), the
+    /// tombstones, the acknowledgement reference, the adapted threshold and
+    /// the evidence behind it. A record left behind would be declared lost
+    /// against the next connection's goog_cc, and a threshold raised by the old
+    /// path's reordering would blunt the new path's. O(n), on a session change
+    /// only.
+    pub fn reset_session(&mut self) {
+        self.records.clear();
+        self.order.clear();
+        self.departed_order.clear();
+        self.tombstones.clear();
+        self.tombstone_order.clear();
+        self.next_dep_idx = 0;
+        self.largest_acked = None;
+        self.k_pkt = K_PKT_INITIAL;
+        self.verdicts = 0;
+        self.spurious_bits = 0;
+    }
+
     /// Classify a transmission as received. Returns `None` if it is not
     /// outstanding and has no tombstone — already resolved, or the
     /// acknowledgement is unknown to this ledger entirely.
@@ -330,11 +383,26 @@ impl TransmissionLedger {
             }
             return Some(Resolution::Live(rec.tx));
         }
-        if let Some((tx, verdict_no)) = self.tombstones.remove(&wire_seq) {
+        if let Some(t) = self.tombstones.remove(&wire_seq) {
             self.stats.acked_after_declared_lost += 1;
             self.stats.spurious_losses += 1;
-            self.note_spurious(verdict_no);
-            return Some(Resolution::Late(tx));
+            let tx = t.tx;
+            // An acknowledgement of a departure newer than any acknowledged so
+            // far moves the reference the thresholds are judged against.
+            if let (Some(idx), Some(at)) = (tx.dep_idx, t.departed) {
+                if self.largest_acked.is_none_or(|(l, _)| idx > l) {
+                    self.largest_acked = Some((idx, at));
+                }
+            }
+            let fec_possible = tx
+                .dep_idx
+                .is_some_and(|i| self.next_dep_idx.saturating_sub(i) >= FEC_POSSIBLE_AFTER);
+            if fec_possible {
+                self.stats.late_acks_fec_possible += 1;
+            } else if let Some(n) = t.packet_verdict_no {
+                self.note_spurious(n);
+            }
+            return Some(Resolution::Late { tx, fec_possible });
         }
         self.stats.unknown_acks += 1;
         None
@@ -470,13 +538,13 @@ impl TransmissionLedger {
     /// Bounded at [`K_PKT_MAX`]; the same session's threshold only goes up. O(1):
     /// a bit set and a popcount.
     fn note_spurious(&mut self, verdict_no: u64) {
-        if self.verdicts - verdict_no > ADAPT_WINDOW {
+        if self.verdicts - verdict_no >= ADAPT_WINDOW {
             return;
         }
         self.spurious_bits |= 1 << (verdict_no % ADAPT_WINDOW);
         let in_window = self.verdicts.min(ADAPT_WINDOW);
         let marked = u64::from(self.spurious_bits.count_ones());
-        if marked * 100 > in_window * ADAPT_SPURIOUS_PERCENT {
+        if in_window >= ADAPT_MIN_VERDICTS && marked * 100 > in_window * ADAPT_SPURIOUS_PERCENT {
             if !self.freeze_k_pkt && self.k_pkt < K_PKT_MAX {
                 self.k_pkt += 1;
                 self.stats.k_pkt_raises += 1;
@@ -509,10 +577,22 @@ impl TransmissionLedger {
             eprintln!("RTOPROBE lost_ws ws={} reason={:?}", wire_seq, reason);
         }
         let tx = rec.tx;
-        self.verdicts += 1;
-        // This verdict's bit starts clear: it replaces the one 64 verdicts ago.
-        self.spurious_bits &= !(1 << (self.verdicts % ADAPT_WINDOW));
-        self.tombstones.insert(wire_seq, (tx, self.verdicts));
+        // Only packet-threshold verdicts adapt the packet threshold: a time or
+        // probe verdict says nothing about reordering depth.
+        let packet_verdict_no = (reason == LossReason::Packet).then(|| {
+            self.verdicts += 1;
+            // This verdict's bit starts clear: it replaces the one 64 ago.
+            self.spurious_bits &= !(1 << (self.verdicts % ADAPT_WINDOW));
+            self.verdicts
+        });
+        self.tombstones.insert(
+            wire_seq,
+            Tombstone {
+                tx,
+                packet_verdict_no,
+                departed: rec.departed,
+            },
+        );
         self.tombstone_order.push_back(wire_seq);
         while self.tombstones.len() > self.capacity {
             if let Some(oldest) = self.tombstone_order.pop_front() {
@@ -707,7 +787,7 @@ mod tests {
         assert!(l.resolve(4).is_some());
         assert_eq!(l.detect_losses(FAR).len(), 2);
         assert!(
-            matches!(l.resolve(0), Some(Resolution::Late(t)) if t.key == EmitKey::new(0, 0, 0, 0))
+            matches!(l.resolve(0), Some(Resolution::Late { tx: t, .. }) if t.key == EmitKey::new(0, 0, 0, 0))
         );
         assert_eq!(l.stats().acked_after_declared_lost, 1);
         assert_eq!(l.stats().spurious_losses, 1);
@@ -717,8 +797,10 @@ mod tests {
     }
 
     /// 70 sent, the last acknowledged: all but the last `K_PKT` are lost. Then
-    /// the first `spurious` of the verdicts are contradicted.
-    fn window(l: &mut TransmissionLedger, t0: Instant, base: u32, spurious: u32) {
+    /// the newest `spurious` of the verdicts are contradicted at once, so each
+    /// late acknowledgement comes fewer than `PARITY_INTERLEAVE_OFFSET`
+    /// departures after its transmission (too soon to be an FEC recovery).
+    fn window(l: &mut TransmissionLedger, t0: Instant, base: u32, spurious: usize) {
         for ws in base..base + 70 {
             send(l, ws, t0);
         }
@@ -727,14 +809,23 @@ mod tests {
         // Everything but the last K of these 70 (and whatever the previous
         // window left behind) is lost.
         assert!(lost.len() as u64 >= 70 - l.k_pkt(), "{}", lost.len());
-        for ws in base..base + spurious {
-            let _ = l.resolve(ws);
+        // The newest lost one is K + 1 departures behind; stay inside the FEC
+        // distance of 20.
+        let n = spurious.min(19 - l.k_pkt() as usize);
+        for (ws, _, _) in lost.iter().rev().take(n) {
+            assert!(matches!(
+                l.resolve(*ws),
+                Some(Resolution::Late {
+                    fec_possible: false,
+                    ..
+                })
+            ));
         }
     }
 
     /// One contradicted verdict in sixty-odd is 1.5 %: no change. The
     /// threshold goes up one step each time more than 10 % of the last 64
-    /// verdicts have been contradicted, and stays inside [3, 8].
+    /// packet verdicts have been contradicted, and stays inside [3, 8].
     #[test]
     fn the_packet_threshold_adapts_to_reordering_and_is_bounded() {
         let t0 = Instant::now();
@@ -746,7 +837,7 @@ mod tests {
         let mut seen = vec![l.k_pkt()];
         let mut base = 0;
         for _ in 0..12 {
-            window(&mut l, t0, base, 30);
+            window(&mut l, t0, base, 15);
             base += 70;
             seen.push(l.k_pkt());
         }
@@ -754,13 +845,104 @@ mod tests {
             seen.windows(2).all(|w| w[1] >= w[0]),
             "never goes down: {seen:?}"
         );
-        assert!(seen.windows(2).all(|w| w[1] - w[0] <= 5), "{seen:?}");
         assert_eq!(l.k_pkt(), K_PKT_MAX, "bounded at K_PKT_MAX: {seen:?}");
         assert!(
-            seen[1] > seen[0] && seen[1] <= 7,
+            seen[1] > seen[0] && seen[1] <= 6,
             "a step per ~7 contradicted verdicts: {seen:?}"
         );
         assert!(l.stats().k_pkt_raises >= 5);
+    }
+
+    /// The client acks a datagram it rebuilt from parity under its original
+    /// `wire_seq`, which can only be after the group's parity left: at least
+    /// `PARITY_INTERLEAVE_OFFSET` departures after it. That is a loss that
+    /// happened, so it neither retracts nor adapts anything.
+    #[test]
+    fn a_loss_recovered_by_parity_does_not_raise_the_packet_threshold() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(8192);
+        // 12 windows, each: 70 sent, the last acked, and the OLDEST 17 verdicts
+        // acked late: 50+ departures after their own.
+        let mut base = 0u32;
+        for _ in 0..12 {
+            for ws in base..base + 70 {
+                send(&mut l, ws, t0);
+            }
+            assert!(l.resolve(base + 69).is_some());
+            let lost = l.detect_losses(FAR);
+            for (ws, _, _) in lost.iter().take(17) {
+                match l.resolve(*ws) {
+                    Some(Resolution::Late { fec_possible, .. }) => assert!(fec_possible),
+                    other => panic!("{other:?}"),
+                }
+            }
+            base += 70;
+        }
+        assert_eq!(l.k_pkt(), 3, "parity recoveries are not reordering");
+        assert_eq!(l.stats().k_pkt_raises, 0);
+        assert!(l.stats().late_acks_fec_possible >= 12 * 17);
+        // They are still counted as late acknowledgements.
+        assert_eq!(l.stats().spurious_losses, l.stats().late_acks_fec_possible);
+    }
+
+    /// Only a packet-threshold verdict says anything about reordering depth: a
+    /// time or probe verdict contradicted soon after does not move the
+    /// threshold.
+    #[test]
+    fn only_packet_verdicts_adapt_the_packet_threshold() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(8192);
+        for round in 0..100u32 {
+            let base = round * 2;
+            send(&mut l, base, t0);
+            let _ = l.declare_lost_by_pto(base);
+            // A prompt contradiction, well inside the FEC distance.
+            assert!(matches!(
+                l.resolve(base),
+                Some(Resolution::Late {
+                    fec_possible: false,
+                    ..
+                })
+            ));
+        }
+        assert_eq!(l.k_pkt(), 3);
+        assert_eq!(l.stats().spurious_losses, 100);
+    }
+
+    /// New session, clean slate: records, tombstones, the acknowledgement
+    /// reference, the adapted threshold and its evidence.
+    #[test]
+    fn a_new_session_starts_with_an_empty_ledger_and_the_initial_threshold() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(8192);
+        let mut base = 0;
+        for _ in 0..4 {
+            window(&mut l, t0, base, 15);
+            base += 70;
+        }
+        assert!(l.k_pkt() > 3, "premise: the threshold adapted");
+        assert!(
+            !l.is_empty() && l.tombstone_len() > 0,
+            "premise: state held"
+        );
+
+        l.reset_session();
+        assert_eq!((l.len(), l.tombstone_len(), l.k_pkt()), (0, 0, 3));
+        // Nothing of the old session can be declared lost any more, nor can a
+        // stale acknowledgement of it be mistaken for anything.
+        assert!(l.detect_losses(FAR).is_empty());
+        assert!(l.resolve(1).is_none());
+        // And the new session's first hole is judged against the new session's
+        // acknowledgements only.
+        for ws in 0..5 {
+            send(&mut l, ws, t0);
+        }
+        assert!(
+            l.detect_losses(FAR).is_empty(),
+            "no acknowledged reference yet"
+        );
+        assert!(l.resolve(4).is_some());
+        assert_eq!(l.detect_losses(FAR).len(), 2);
     }
 
     #[test]
@@ -768,7 +950,7 @@ mod tests {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(8192);
         l.freeze_k_pkt();
-        window(&mut l, t0, 0, 30);
+        window(&mut l, t0, 0, 15);
         assert_eq!(l.k_pkt(), 3);
     }
 
@@ -803,7 +985,7 @@ mod tests {
         );
         assert_eq!(l.stats().lost_pto, 1);
         assert!(l.declare_lost_by_pto(1).is_none());
-        assert!(matches!(l.resolve(1), Some(Resolution::Late(_))));
+        assert!(matches!(l.resolve(1), Some(Resolution::Late { .. })));
     }
 
     #[test]
@@ -815,7 +997,7 @@ mod tests {
             let _ = l.declare_lost_by_pto(ws);
         }
         assert!(l.tombstone_len() <= 8, "got {}", l.tombstone_len());
-        assert!(matches!(l.resolve(39), Some(Resolution::Late(_))));
+        assert!(matches!(l.resolve(39), Some(Resolution::Late { .. })));
     }
 
     #[test]
@@ -943,7 +1125,7 @@ mod tests {
                             Some(Resolution::Live(_)) => {
                                 proptest::prop_assert!(outstanding.remove(&ws), "live ack of non-outstanding");
                             }
-                            Some(Resolution::Late(_)) => {
+                            Some(Resolution::Late { .. }) => {
                                 proptest::prop_assert!(lost.remove(&ws), "late ack of non-lost");
                             }
                             None => {}

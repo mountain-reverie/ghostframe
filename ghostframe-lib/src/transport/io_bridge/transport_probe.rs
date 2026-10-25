@@ -96,6 +96,7 @@ pub(super) struct Instruments {
     /// pass is no longer owed.
     pub(super) nack_miss_pending: u64,
     pub(super) nack_miss_not_owed: u64,
+    pub(super) late_acks_fec_possible: u64,
     pub(super) pto_probes_requested: u64,
     pub(super) losses_flushed: u64,
     /// Declared lost but dropped from the pending list by its cap.
@@ -143,7 +144,10 @@ impl IoBridge {
     pub(super) fn release_departures(&mut self) {
         self.departures = Default::default();
         self.departures_handle = None;
-        self.transmission_ledger.discard_undeparted();
+        // The whole ledger, not just what never left: records of the old
+        // session would otherwise be declared lost into the next connection's
+        // estimator, and its adapted threshold would carry over.
+        self.transmission_ledger.reset_session();
     }
 
     /// Move what the emitter put on the wire since the last call into the
@@ -365,6 +369,7 @@ impl IoBridge {
             loss_retx_requested: i.loss_retx_requested,
             nack_miss_pending: i.nack_miss_pending,
             nack_miss_not_owed: i.nack_miss_not_owed,
+            late_acks_fec_possible: i.late_acks_fec_possible,
             pto_probes_requested: i.pto_probes_requested,
             pto_fires: self.reliable_emitter.stats.pto_fires,
             loss_retransmits: self.reliable_emitter.stats.loss_retransmits,

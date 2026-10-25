@@ -140,7 +140,7 @@ impl Sim {
             }
             let ws = u32::from_be_bytes(dg[8..12].try_into().unwrap());
             match self.ledger.resolve(ws) {
-                Some(Resolution::Live(tx)) | Some(Resolution::Late(tx)) => {
+                Some(Resolution::Live(tx)) | Some(Resolution::Late { tx, .. }) => {
                     self.emitter.note_ack_origin(tx.key, ws);
                     self.emitter.on_ack(&[tx.key]);
                     self.emitter.rtt.on_sample(Duration::from_millis(20));
