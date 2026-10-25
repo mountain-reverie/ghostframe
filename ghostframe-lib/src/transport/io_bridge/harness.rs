@@ -306,6 +306,12 @@ impl IoBridge {
         self.transport_probe_publish.clone()
     }
 
+    /// Drop every client tile NACK at the door (see `ignore_tile_nacks`).
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn set_ignore_tile_nacks(&mut self, ignore: bool) {
+        self.ignore_tile_nacks = ignore;
+    }
+
     /// Clone of the `Arc` behind `emitter_stats_publish`, for a caller that
     /// is about to move `self` into a `spawn_local`'d task and needs a way
     /// to read the reliable-emitter counters back out afterwards. See

@@ -10,31 +10,42 @@
 //! the wire.
 //!
 //! The transmission ledger already knows the fate of every datagram the
-//! emitter sent, one verdict each -- acknowledged, or outstanding past the
-//! loss horizon. This is that, as a rate.
+//! emitter sent, one verdict each -- acknowledged, or declared lost by the
+//! threshold detector (three later departures acknowledged, or a hole 9/8 of a
+//! round trip old). This is that, as a rate.
 //!
 //! Outcomes are filed under the time their datagram was *sent*, not the
 //! time the verdict came in. An acknowledgement arrives one round trip
-//! after the send and a loss is declared a whole horizon after it, so
-//! counting by verdict time shows the tail of every burst as nothing but
-//! losses.
+//! after the send and a loss is declared a round trip and a few departures
+//! after it, so counting by verdict time shows the tail of every burst as
+//! nothing but losses.
 //!
 //! And the rate reads only sends old enough that their verdict is final.
-//! The ledger's horizon is set for the congestion controller, which wants
-//! its answer early and can absorb a wrong one: it declares a loss after as
-//! little as 60 ms. A browser that is busy for 150 ms acknowledges four
-//! whole frames late, and all of them are "lost" for a moment first.
-//! Measured on a loss-free link: 5248 of 29184 transmissions expired that
-//! way, in two episodes, reading as 83% and 12% loss. `loss_override`
-//! bypasses hysteresis, so it must not act on a verdict that is about to be
-//! withdrawn. Hence [`SETTLE`], and `retract` for the acknowledgement that
-//! arrives inside it.
+//! The detector wants its answer early and can absorb a wrong one: a browser
+//! that is busy for 150 ms acknowledges four whole frames late, and each of
+//! them is "lost" for a moment first (a packet verdict three departures after
+//! it). Measured on a loss-free link under the old horizon: 5248 of 29184
+//! transmissions expired that way, in two episodes, reading as 83% and 12%
+//! loss. `loss_override` bypasses hysteresis, so it must not act on a verdict
+//! that is about to be withdrawn. Hence [`SETTLE`], and `retract` for the
+//! acknowledgement that arrives inside it. (An acknowledgement 20 or more
+//! departures after its verdict may be an FEC recovery and is not retracted:
+//! see `Resolution::Late`.)
 
 use std::collections::VecDeque;
 
 /// How long after its send a transmission's verdict is treated as final.
-/// The ledger's own upper bound on the loss horizon: past this, it would
-/// have given up on the datagram under any path conditions.
+///
+/// A verdict is made about one round trip after the send (the acknowledgement of
+/// a later datagram, plus a few departures), and a prompt contradiction follows
+/// within another round trip and at most 20 departures; later than that the
+/// acknowledgement may be an FEC recovery and is not retracted. So the window
+/// must cover about two round trips: 600 ms covers paths up to roughly 250 ms,
+/// beyond the tailnet paths measured (20-150 ms). It was the old horizon's
+/// ceiling; it is kept because nothing measured argues for a different value,
+/// and a path slower than that would read a retraction as a final loss for the
+/// part of the window it misses. Making it a multiple of srtt is the follow-up
+/// if such a path appears.
 pub const SETTLE: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// How much send time one reading covers.
@@ -210,7 +221,7 @@ mod tests {
     }
 
     /// The loss-free link that read as 83% loss: a client busy for longer
-    /// than the ledger's horizon acknowledges whole frames late. Each was
+    /// than the detector's verdict delay acknowledges whole frames late. Each was
     /// declared lost, then acknowledged; by the time the window reads those
     /// sends, nothing is missing.
     #[test]
