@@ -880,36 +880,39 @@ async fn p2b_quinn_is_never_left_idle_while_admission_holds_work() {
 // F4 gate (D1 PR-4): the retransmission timer is a measured probe timeout.
 // ---------------------------------------------------------------------------
 
-/// P4: under 2 % i.i.d. loss the share of RTO fires that were for data that
-/// had in fact arrived (`rto_original_first`: the pass was first acknowledged
-/// through its original, the Eifel test), pooled over five seeds, is at most
-/// 10 %; and a clean link fires no timer at all.
+/// P4: under 2 % i.i.d. loss the share of loss-path resends (`rto_fired`: loss
+/// verdicts and probes) that were for data that had in fact arrived
+/// (`rto_original_first`: the pass was first acknowledged through its original,
+/// the Eifel test), pooled over five seeds, is at most 10 %; and a clean link
+/// resends nothing.
 ///
 /// Why i.i.d., why this counter, why pooled. `rto_spurious` takes a spurious
 /// verdict back when the retransmission is acknowledged too, which it nearly
 /// always is (every duplicate is acknowledged), so it read 0 on every base run
 /// and could not tell a bad timer from a good one; the design's 0.68 to 0.75
 /// was the retransmit loop of #225. `rto_original_first` is final. The scene is
-/// stepped, so each seed's value is exact, but it is chaotic: a review fix that
-/// changed only what happens around stalls moved one seed from 0.001 to 0.114
-/// while the other four stayed under 0.05. A per-seed bound would gate on that
-/// one draw; the pooled share (total originals-first over total fires) does
-/// not. Per-seed values are printed.
+/// stepped, so each seed's value is exact, but it is chaotic: between PR-4
+/// revisions one seed moved from 0.001 to 0.114 while the other four stayed
+/// under 0.05. A per-seed bound would gate on that one draw; the pooled share
+/// (total originals-first over total resends) does not. Per-seed values are
+/// printed.
 ///
 /// | build | share per seed (sorted) | pooled |
 /// |---|---|---|
 /// | PR-3 base (p95 x 2, 150 ms floor) | 0.020 0.062 0.095 0.121 0.132 | 0.083 |
-/// | this change | 0.004 0.008 0.026 0.043 0.114 | 0.040 |
-/// | arm at enqueue, p95 x 2, 16 MiB buffer, `T_q` 500 ms | 0.667 0.878 0.887 0.905 0.935 | 0.89 |
+/// | PR-4 (per-key PTO with the ACK hold-back) | 0.004 0.008 0.026 0.043 0.114 | 0.040 |
+/// | PR-5 (threshold loss and probe), first revision | | 0.0225 |
+/// | PR-5 after the FEC fix (this) | 0.006 0.008 0.009 0.012 0.015 | 0.0099 |
+/// | PR-4's mutation: p95 x 2 armed at enqueue, 16 MiB buffer, `T_q` 500 ms | 0.667 0.878 0.887 0.905 0.935 | 0.89 |
 ///
-/// The bound sits 2.5x above this change and 8.9x below the mutation, and the
-/// mutation's best seed (0.667) is above it by 6x. It does not separate this
-/// change from the base (0.083 pooled is already under it): what this
-/// change buys over the base is the 0.083 to 0.040 reduction, reported not
-/// gated. Burst loss (Gilbert-Elliott) is reported by the sweep but not gated:
-/// its shares are 0 to 0.77 per seed under the same mutation.
+/// The bound sits 10x above this build and 9x below that mutation, which has
+/// no equivalent in this code (there is no per-key timer to arm at enqueue); the
+/// P5 gates carry the discriminating power now. It does not separate this build
+/// from the PR-3 base (0.083 is already under it): the 0.083 to 0.0099 drop is
+/// reported, not gated. Burst loss (Gilbert-Elliott) is reported by the sweep but
+/// not gated: its shares are 0 to 0.77 per seed under the PR-4 mutation.
 ///
-/// Premises, asserted: each run fires at least 50 times (a share of nothing is
+/// Premises, asserted: each run resends at least 50 times (a share of nothing is
 /// not a share), the session carried load, the netsim dropped something.
 #[tokio::test(start_paused = true)]
 async fn p4_spurious_share_of_rto_fires_under_iid_loss() {
