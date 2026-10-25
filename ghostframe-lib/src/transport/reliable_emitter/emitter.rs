@@ -78,9 +78,12 @@ pub struct ReliableTileEmitter {
     /// is still waiting does not become a second retransmission.
     pending_nack_set: HashSet<EmitKey>,
     /// Passes a loss verdict or the probe timeout asked to be sent again,
-    /// waiting for budget, oldest first, with who asked. Served after NACK
-    /// repair. A key waits here at most once.
-    pending_loss: VecDeque<(EmitKey, RetxCause)>,
+    /// waiting for budget, oldest first, with who asked and which transmission
+    /// of the pass was judged. Served after NACK repair; an entry whose
+    /// transmission is no longer the newest of its pass when it comes up (a NACK
+    /// repair went first) is dropped, so a loss is repaired once. A key waits
+    /// here at most once.
+    pending_loss: VecDeque<(EmitKey, RetxCause, u32)>,
     pending_loss_set: HashSet<EmitKey>,
     /// Wire bytes each datagram costs beyond its own length (the
     /// WebTransport framing), added to what `tick_budgeted` bills. Zero
@@ -188,6 +191,9 @@ pub struct EmitterStats {
     pub verdict_content_gone: u64,
     pub verdict_newer_in_flight: u64,
     pub verdict_already_queued: u64,
+    /// Verdicts left to the probe because the pass had been resent
+    /// [`LOSS_RETX_MAX_ATTEMPTS`] times.
+    pub verdict_deferred_to_pto: u64,
     /// Loss retransmissions whose original turned out to have arrived (the
     /// original was the first transmission of the pass to be acknowledged):
     /// spurious loss verdicts, Eifel style. Counted per retransmission.
@@ -240,6 +246,16 @@ pub enum RetxCause {
     Probe,
 }
 
+/// Retransmissions of one pass after which a loss verdict stops resending it
+/// and leaves the pass to the probe timeout. Three: the pass has then been lost
+/// four times running, which at 5 % independent loss happens once in 160,000
+/// passes and at 50 % in 1 of 16, and the verdict-driven resends so far cost
+/// one round trip each; past that the path or the pass is not behaving, and a
+/// resend per round trip (each one another reported loss) is the storm the
+/// per-pass RTO backoff used to prevent. The probe's own backoff (doubling to 5
+/// s) takes over.
+pub(crate) const LOSS_RETX_MAX_ATTEMPTS: u8 = 3;
+
 /// What became of a request to retransmit a transmission's content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetxRequest {
@@ -254,6 +270,11 @@ pub enum RetxRequest {
     /// `GHOSTFRAME_NO_RTO=1`: the loss path and the probe are off; the cache
     /// and the NACK path are not.
     Disabled,
+    /// The pass has already been resent [`LOSS_RETX_MAX_ATTEMPTS`] times: a
+    /// verdict no longer resends it (and so does not report another loss every
+    /// round trip for a pass the client never acknowledges); only the probe
+    /// does, and it backs off.
+    Deferred,
 }
 
 /// Most passes whose RTO history is tracked at once. Measurement only: a
@@ -749,7 +770,7 @@ impl ReliableTileEmitter {
         let mut spent = 0usize;
         let emit_us_now = self.emit_us64(now);
         while *count < max_retransmits && spent < max_bytes {
-            let Some((key, cause)) = self.pending_loss.pop_front() else {
+            let Some((key, cause, judged_ws)) = self.pending_loss.pop_front() else {
                 break;
             };
             self.pending_loss_set.remove(&key);
@@ -757,6 +778,12 @@ impl ReliableTileEmitter {
                 // Acknowledged or superseded while it waited: nothing to send.
                 continue;
             };
+            if entry.latest_ws != judged_ws {
+                // A NACK repair (or a resubmission) went first: the pass has a
+                // newer transmission and its own verdict will come.
+                self.stats.verdict_newer_in_flight += 1;
+                continue;
+            }
             // [RTO-PROBE] temporary instrumentation.
             if crate::transport::reliable_emitter::rto_probe_enabled() {
                 let probe_codec = entry
@@ -1063,11 +1090,20 @@ impl ReliableTileEmitter {
     /// What a request to retransmit `key`'s content, because transmission
     /// `wire_seq` of it is lost or overdue, would do. Content is current when
     /// the pass is cached and `wire_seq` is the newest transmission of it.
-    fn classify_retx(&self, key: &EmitKey, wire_seq: u32) -> RetxRequest {
+    fn classify_retx(&self, key: &EmitKey, wire_seq: u32, cause: RetxCause) -> RetxRequest {
         match self.cache.get(key) {
             None => RetxRequest::ContentGone,
             Some(e) if e.latest_ws != wire_seq => RetxRequest::NewerInFlight,
-            Some(_) if self.pending_loss_set.contains(key) => RetxRequest::AlreadyQueued,
+            // A NACK repair already waiting will be the pass's newest
+            // transmission before this one could be sent.
+            Some(_)
+                if self.pending_loss_set.contains(key) || self.pending_nack_set.contains(key) =>
+            {
+                RetxRequest::AlreadyQueued
+            }
+            Some(e) if cause == RetxCause::Loss && e.attempts >= LOSS_RETX_MAX_ATTEMPTS => {
+                RetxRequest::Deferred
+            }
             Some(_) => RetxRequest::Queued,
         }
     }
@@ -1086,15 +1122,16 @@ impl ReliableTileEmitter {
         if crate::config::no_rto() {
             return RetxRequest::Disabled;
         }
-        let r = self.classify_retx(&key, wire_seq);
+        let r = self.classify_retx(&key, wire_seq, cause);
         match r {
             RetxRequest::Queued => {
-                self.pending_loss.push_back((key, cause));
+                self.pending_loss.push_back((key, cause, wire_seq));
                 self.pending_loss_set.insert(key);
             }
             RetxRequest::ContentGone => self.stats.verdict_content_gone += 1,
             RetxRequest::NewerInFlight => self.stats.verdict_newer_in_flight += 1,
             RetxRequest::AlreadyQueued => self.stats.verdict_already_queued += 1,
+            RetxRequest::Deferred => self.stats.verdict_deferred_to_pto += 1,
             RetxRequest::Disabled => {}
         }
         r
@@ -2655,6 +2692,73 @@ mod tests {
     }
 
     const MS_1: Duration = Duration::from_millis(1);
+
+    // ---- one repair per loss, whoever asks first ----
+
+    fn one_sent_pass() -> (ReliableTileEmitter, EmitKey, Instant) {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        e.take_transmissions();
+        (e, key, t0)
+    }
+
+    /// The loss verdict was queued first, then the client's NACK for the same
+    /// pass. The NACK is served first and becomes the pass's newest
+    /// transmission; the verdict's entry is stale when its turn comes and
+    /// sends nothing. One retransmission, not two.
+    #[test]
+    fn a_nack_after_a_loss_verdict_is_the_only_repair() {
+        let (mut e, key, t0) = one_sent_pass();
+        assert_eq!(ask(&mut e, key), RetxRequest::Queued);
+        e.on_nack(&[key], t0);
+        let mut n = 0;
+        e.tick_nacks_budgeted(t0, usize::MAX, usize::MAX, &mut n);
+        e.tick_loss_budgeted(t0, usize::MAX, usize::MAX, &mut n);
+        assert_eq!((n, e.stats.retransmit_attempts_total), (1, 1));
+        assert_eq!((e.stats.retransmit_by_nack, e.stats.rto_fired), (1, 0));
+        assert_eq!(
+            e.stats.verdict_newer_in_flight, 1,
+            "the stale entry is counted"
+        );
+    }
+
+    /// The other order: the NACK waits for budget when the verdict comes. The
+    /// verdict is not queued behind it.
+    #[test]
+    fn a_loss_verdict_after_a_queued_nack_is_not_a_second_repair() {
+        let (mut e, key, t0) = one_sent_pass();
+        e.on_nack(&[key], t0);
+        assert_eq!(ask(&mut e, key), RetxRequest::AlreadyQueued);
+        let mut n = 0;
+        e.tick_nacks_budgeted(t0, usize::MAX, usize::MAX, &mut n);
+        e.tick_loss_budgeted(t0, usize::MAX, usize::MAX, &mut n);
+        assert_eq!((n, e.stats.retransmit_attempts_total), (1, 1));
+        assert_eq!(e.stats.rto_fired, 0);
+    }
+
+    /// After `LOSS_RETX_MAX_ATTEMPTS` resends a verdict leaves the pass to the
+    /// probe: no more once-per-round-trip resends (and reports) for a pass the
+    /// client never acknowledges. The probe is not limited.
+    #[test]
+    fn a_pass_resent_three_times_is_left_to_the_probe() {
+        let (mut e, key, t0) = one_sent_pass();
+        for round in 0..LOSS_RETX_MAX_ATTEMPTS {
+            assert_eq!(ask(&mut e, key), RetxRequest::Queued, "resend {round}");
+            e.tick(t0, usize::MAX);
+            e.take_transmissions();
+        }
+        assert_eq!(e.cache.get(&key).unwrap().attempts, LOSS_RETX_MAX_ATTEMPTS);
+        assert_eq!(ask(&mut e, key), RetxRequest::Deferred);
+        assert_eq!(e.stats.verdict_deferred_to_pto, 1);
+        let ws = e.cache.get(&key).unwrap().latest_ws;
+        assert_eq!(
+            e.request_retransmit(key, ws, RetxCause::Probe),
+            RetxRequest::Queued,
+            "the probe still resends it"
+        );
+    }
 
     // ---- the probe timeout (one per connection) ----
 
