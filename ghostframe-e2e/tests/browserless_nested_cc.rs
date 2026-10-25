@@ -174,35 +174,52 @@ fn report_delivery(
     from_us: u64,
     to_us: u64,
 ) {
-    let med = cc::median_bps(&r.delivery_rate_samples, from_us, to_us);
     let est = cc::median_bps(&r.bwe_estimate_samples, from_us, to_us);
-    let peak = cc::window(&r.delivery_rate_samples, from_us, to_us)
-        .iter()
-        .map(|(_, v)| *v)
-        .max();
-    metric(
-        scene,
-        &format!("delivery_{label}_max_median_bps"),
-        fmt_opt(med),
-    );
-    metric(
-        scene,
-        &format!("delivery_{label}_max_peak_bps"),
-        fmt_opt(peak),
-    );
-    metric(
-        scene,
-        &format!("delivery_{label}_max_over_cap"),
-        fmt_opt(med.map(|m| format!("{:.3}", m as f64 / cap_bps))),
-    );
-    metric(
-        scene,
-        &format!("delivery_{label}_max_over_est"),
-        fmt_opt(
-            med.zip(est)
-                .map(|(m, e)| format!("{:.3}", m as f64 / e as f64)),
-        ),
-    );
+    // The payload fraction last measured: the share of link bytes that are
+    // ledger-tracked datagram bytes. The sampler is not scaled by it; the
+    // `/payload` columns are for comparing with a link capacity.
+    let frac = r.transport.instr.bwe.payload_fraction_ppm as f64 / 1e6;
+    for (kind, series) in [
+        ("max", &r.delivery_rate_samples),
+        ("unpaced_max", &r.delivery_rate_unpaced_samples),
+    ] {
+        let med = cc::median_bps(series, from_us, to_us);
+        let peak = cc::window(series, from_us, to_us)
+            .iter()
+            .map(|(_, v)| *v)
+            .max();
+        metric(
+            scene,
+            &format!("delivery_{label}_{kind}_median_bps"),
+            fmt_opt(med),
+        );
+        metric(
+            scene,
+            &format!("delivery_{label}_{kind}_peak_bps"),
+            fmt_opt(peak),
+        );
+        metric(
+            scene,
+            &format!("delivery_{label}_{kind}_over_cap"),
+            fmt_opt(med.map(|m| format!("{:.3}", m as f64 / cap_bps))),
+        );
+        metric(
+            scene,
+            &format!("delivery_{label}_{kind}_over_payload_over_cap"),
+            fmt_opt(
+                med.filter(|_| frac > 0.0)
+                    .map(|m| format!("{:.3}", m as f64 / frac / cap_bps)),
+            ),
+        );
+        metric(
+            scene,
+            &format!("delivery_{label}_{kind}_over_est"),
+            fmt_opt(
+                med.zip(est)
+                    .map(|(m, e)| format!("{:.3}", m as f64 / e as f64)),
+            ),
+        );
+    }
 }
 
 /// The D1 transport instruments for this scene, one METRIC line each: the
@@ -317,14 +334,26 @@ fn report_context(scene: &str, r: &BrowserlessResult, cap_bps: f64, from_us: u64
         scene,
         "delivery_counts",
         format!(
-            "marked={} app_limited_marks={} acked={} samples={} app_limited_samples={} latest_bps={} latest_app_limited={}",
+            "marked={} app_limited_marks={} acked={} samples={} app_limited_samples={} pacer_limited_samples={} latest_bps={} latest_app_limited={}",
             d.marked,
             d.app_limited_marks,
             d.acked,
             d.samples,
             d.app_limited_samples,
+            d.pacer_limited_samples,
             d.latest_bps,
             d.latest_app_limited
+        ),
+    );
+    metric(
+        scene,
+        "delivery_vs_netsim_s2c",
+        format!(
+            "payload_fraction_ppm={} delivered_bytes={} netsim_s2c_bytes={} ratio={:.3}",
+            r.transport.instr.bwe.payload_fraction_ppm,
+            d.delivered_bytes,
+            r.bytes_delivered_s2c,
+            d.delivered_bytes as f64 / r.bytes_delivered_s2c.max(1) as f64
         ),
     );
     report_delivery(scene, "settled", r, cap_bps, from_us, to_us);
