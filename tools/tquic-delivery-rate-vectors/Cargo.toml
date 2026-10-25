@@ -1,0 +1,13 @@
+# Standalone: NOT a workspace member (the empty [workspace] table detaches it),
+# so `cargo clippy --workspace`, fmt and CI never build it. It exists to
+# regenerate ghostframe-lib/src/transport/testdata/delivery_rate_tquic_938e90a.txt
+# by running TQUIC's delivery_rate.rs unmodified. See that file's header.
+[package]
+name = "tquic_delivery_rate_vectors"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+
+[workspace]
