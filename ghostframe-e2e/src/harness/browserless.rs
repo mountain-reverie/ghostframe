@@ -94,21 +94,27 @@ use crate::netsim::{NetProfile, NetSim, SocketPairPump, Verdict};
 /// `LoadProfile` cannot drift to different defaults.
 pub use crate::harness::load_profile::PRODUCTION_CADENCE_US as DEFAULT_CADENCE_US;
 
-/// Spacing between post-injection heartbeat ticks (see `drive_session`'s
-/// doc comment on why heartbeats exist at all). Deliberately much coarser
-/// than `FRAME_SPACING_US`: the sole purpose of a heartbeat is to reach
-/// `IoBridge::apply_injected_frame`'s unconditional admission pass
-/// (`pump_admission`, which also fires due retransmissions) often enough that a cached, unacked fragment's RTO deadline (a
-/// probe timeout, see `reliable_emitter::rto::pto_for_attempt`) gets checked well
-/// before `scene.duration` runs out — not to reproduce a particular real
-/// capture framerate. Ticking at `FRAME_SPACING_US` (16ms) would work too,
-/// but multiplies the outer event loop's iteration count by
-/// `scene.duration / FRAME_SPACING_US` for the entire remainder of every
-/// scene once its declared frames run out, which measurably pushed
-/// longer-duration scenes toward `drive_session`'s no-progress bail-out.
-/// 100ms comfortably clears the RTO floor with room for multiple backoff
-/// attempts, while keeping that iteration multiplier small.
-const HEARTBEAT_SPACING_US: u64 = 100_000;
+// Heartbeats tick at the scene's own `cadence_us`, the same spacing as the
+// frames before them (see `drive_session`'s doc comment on why heartbeats
+// exist at all). Their purpose is to reach `IoBridge::apply_injected_frame`
+// and its unconditional admission pass (`pump_admission`) the way a
+// free-running capture loop would in production.
+//
+// Admission billing no longer depends on this: it refills by elapsed time and
+// `admission_wake` wakes the bridge for `Stop::Tokens`. What still depends on
+// the turn rate is work with no bridge wake of its own:
+// `IoBridge::next_wake_deadline` has no RTO-wheel term and no scheduler
+// `retry_after` term, so a due retransmission or a scheduler retry is only
+// noticed on a turn, and a heartbeat is such a turn. It used to be a fixed
+// 100ms, three times coarser than the 33ms production cadence, so those
+// checks ran up to 100ms late (a probe timeout is now RTT-derived, see
+// `reliable_emitter::rto::pto_for_attempt`, and can be well under 100ms).
+//
+// The cost is `scene.duration / cadence_us` outer-loop iterations for the
+// tail of a scripted scene instead of a third as many. The no-progress guard
+// counts iterations that do not advance virtual time; a heartbeat schedules
+// the next one `cadence_us` ahead, so it advances time provided
+// `cadence_us > 0` (`drive_session` rejects zero).
 
 /// One scene frame's worth of declared tile content, keyed by `(tile_x,
 /// tile_y)`.
@@ -160,7 +166,7 @@ pub struct BrowserlessScene {
     /// the bandwidth term actually bind.
     pub tick_budget_floor_bytes: Option<usize>,
     /// Resolved once at the top of `drive_session`, then drained in order
-    /// after `SessionReady`, one `FrameScript` every `FRAME_SPACING_US` of
+    /// after `SessionReady`, one `FrameScript` every `cadence_us` of
     /// virtual time. See the module docs.
     pub load: SceneLoad,
     /// Interval between injected frames. Use [`DEFAULT_CADENCE_US`] unless
@@ -303,6 +309,14 @@ pub struct BrowserlessResult {
     /// loop actually sat in an injected frame's `cost` hold, logged by the
     /// bridge itself. Empty without a cost.
     pub frame_cost_windows: Vec<(u64, u64)>,
+    /// `(virtual_us, is_heartbeat)` for every frame the harness handed to
+    /// the bridge, in order: scene frames first, then the empty-work
+    /// heartbeats that follow once the frame list runs out. The instant is
+    /// when the harness sent the frame to the bridge. For a heartbeat (no
+    /// `cost`) in stepped mode that is when `apply_injected_frame` runs. After
+    /// a held costly frame the bridge applies later, and in concurrent mode
+    /// the bridge task applies whenever it is scheduled.
+    pub injections: Vec<(u64, bool)>,
     pub framebuffer: FrameBuffer,
     pub events: Vec<ClientNetEvent>,
     pub bytes_delivered: u64,
@@ -987,6 +1001,7 @@ async fn run_inner(
     let mut framebuffer = FrameBuffer::new();
     let mut s2c_loss = S2cLoss::default();
     let mut bwe_estimate_samples: Vec<(u64, u64)> = Vec::new();
+    let mut injections: Vec<(u64, bool)> = Vec::new();
     let outcome = drive_session(
         cfg,
         bridge_slot.as_mut(),
@@ -999,6 +1014,7 @@ async fn run_inner(
         &mut framebuffer,
         &bwe_cell,
         &mut bwe_estimate_samples,
+        &mut injections,
         &server_live_rx,
         &links,
         &mut s2c_loss,
@@ -1086,6 +1102,7 @@ async fn run_inner(
     Ok(BrowserlessResult {
         inbound_service_delays,
         frame_cost_windows,
+        injections,
         send_datagram_errs,
         emission_queue_peak: emitter_stats.emission_queue_peak,
         framebuffer,
@@ -1143,8 +1160,9 @@ async fn run_inner(
 }
 
 /// Drive the client<->server session to `SessionReady` and then, if the
-/// scene declares any `frames`, inject them in order at `FRAME_SPACING_US`
-/// intervals of virtual time — routing every datagram through a seeded
+/// scene declares any `frames`, inject them in order at `cadence_us`
+/// intervals of virtual time, then empty-work heartbeats at the same spacing
+/// until `scene.duration` — routing every datagram through a seeded
 /// `NetSim` per direction throughout, and feeding every decoded
 /// `Event::TileReady` into `framebuffer`.
 ///
@@ -1172,12 +1190,21 @@ async fn drive_session(
     framebuffer: &mut FrameBuffer,
     bwe_cell: &std::sync::Arc<std::sync::Mutex<ghostframe_lib::transport::bwe::BweSnapshot>>,
     bwe_samples: &mut Vec<(u64, u64)>,
+    injections: &mut Vec<(u64, bool)>,
     server_live_rx: &tokio::sync::watch::Receiver<usize>,
     links: &LinkOverrides,
     s2c_loss: &mut S2cLoss,
     opts: RunOptions,
 ) -> anyhow::Result<(Vec<ClientNetEvent>, u64, u64, u64, u64, u64, ClientProbe)> {
     let seed = scene.seed;
+    anyhow::ensure!(
+        match &scene.load {
+            SceneLoad::Profile(p) => p.cadence_us,
+            SceneLoad::Script(_) => scene.cadence_us,
+        } > 0,
+        "seed {seed}: cadence_us must be non-zero: frames and heartbeats are spaced by it, \
+         and a zero spacing would never advance virtual time"
+    );
 
     // Pin the client endpoint's RNG to the scene seed. Left to entropy,
     // quinn-proto skips one application-space packet number drawn from
@@ -1523,6 +1550,7 @@ async fn drive_session(
                         .map_err(|e| {
                             anyhow!("seed {seed}: frame {next_frame_idx} injection failed: {e}")
                         })?;
+                        injections.push((now_us(base), false));
                         next_frame_idx += 1;
                         spacing_us = cadence_us;
                     } else {
@@ -1542,11 +1570,9 @@ async fn drive_session(
                         // free-running capture loop: once the frame list
                         // runs out, nothing would otherwise ever call
                         // `apply_injected_frame` again. Sending an
-                        // empty-work `InjectedFrame` on the coarser
-                        // `HEARTBEAT_SPACING_US` cadence (see its doc
-                        // comment for why heartbeats don't reuse
-                        // `FRAME_SPACING_US`) has no tile content to
-                        // enqueue, but still reaches `apply_injected_frame`'s
+                        // empty-work `InjectedFrame` on the `cadence_us`
+                        // cadence, the same spacing as the frames, has no
+                        // tile content to enqueue, but still reaches `apply_injected_frame`'s
                         // admission pass -- this is the harness's substitute
                         // for "a client stays connected and capture keeps
                         // ticking", not a new behavior IoBridge doesn't
@@ -1558,8 +1584,9 @@ async fn drive_session(
                                     "seed {seed}: heartbeat {heartbeat_seq} injection failed: {e}"
                                 )
                             })?;
+                        injections.push((now_us(base), true));
                         heartbeat_seq += 1;
-                        spacing_us = HEARTBEAT_SPACING_US;
+                        spacing_us = cadence_us;
                     }
                     next_inject_at_us = Some(due_at + spacing_us);
                     moved = true;

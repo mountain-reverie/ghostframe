@@ -320,6 +320,9 @@ fn full_digest(r: &BrowserlessResult) -> Vec<(&'static str, u64)> {
         ("transport_client_recovered", r.transport.client_recovered),
         ("client_lost_pre_fec", r.client_wire_loss.lost_pre_fec),
         ("events_hash", hash_of(&format!("{:?}", r.events))),
+        // The injector's own schedule (frames and heartbeats, virtual instants).
+        ("injections_hash", hash_of(&r.injections)),
+        ("injections_len", r.injections.len() as u64),
         // Every datagram, both directions: offer instant, length, and what
         // the netsim made of it. Counters can agree while a datagram went
         // out at another instant or at another size; this cannot. Lengths,
