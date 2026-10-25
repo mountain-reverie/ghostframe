@@ -88,8 +88,13 @@ impl Sim {
     fn new(loss_p: f64, seed: u64) -> Self {
         let delivered = Rc::new(RefCell::new(Vec::new()));
         let t = Instant::now();
+        // A client that acknowledges within the step has a measured RTT; with
+        // none, the deadline would be the RFC's 1 s initial value and these
+        // 100 ms steps would never reach it.
+        let mut emitter = ReliableTileEmitter::new(t);
+        emitter.rtt.on_sample(Duration::from_millis(20));
         Self {
-            emitter: ReliableTileEmitter::new(t),
+            emitter,
             sender: LossSender {
                 delivered: delivered.clone(),
                 rng: DetRng::new(seed),

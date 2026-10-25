@@ -295,8 +295,10 @@ impl Scheduler {
     /// which kept the gate expiring.
     ///
     /// The caller now passes the reliable emitter's own first-attempt
-    /// deadline, which is derived from measured ACK latency and floored
-    /// well above a frame (`rto::ACK_DEADLINE_FLOOR`) for the same reason.
+    /// deadline, the probe timeout of its RTT estimator
+    /// (`rto::pto_for_attempt`). That estimator's samples include the
+    /// client's batching delay, so it sits above a frame wherever the
+    /// batching does, without a fitted floor.
     pub fn set_retry_after(&mut self, retry_after: Duration) {
         self.retry_after = retry_after;
     }

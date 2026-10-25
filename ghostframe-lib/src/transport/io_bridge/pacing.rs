@@ -654,14 +654,12 @@ impl IoBridge {
 
     /// How long the scheduler waits for a priority tile's acknowledgement
     /// before sending it again: the reliable emitter's first-attempt
-    /// deadline, so the two retry mechanisms race the same clock.
+    /// deadline (the probe timeout from the same RTT estimator), so the two
+    /// retry mechanisms race the same clock.
     ///
     /// Not a function of QUIC RTT. See `Scheduler::set_retry_after`.
     pub(super) fn priority_retry_after(&self) -> std::time::Duration {
-        crate::transport::reliable_emitter::rto::rto_for_attempt(
-            self.reliable_emitter.ack_deadline,
-            0,
-        )
+        self.reliable_emitter.pto()
     }
 
     /// The frame-time entry into the admission pass: tell it which frame the

@@ -60,8 +60,6 @@
 
 #define END_OF_STREAM_PARITY_FLUSH_MS 5
 
-#define RTO_BACKOFF_FACTOR 2
-
 #define CACHE_CAPACITY 32768
 
 /**

@@ -9,6 +9,8 @@ pub mod traits;
 pub mod wire_seq;
 
 #[cfg(test)]
+mod pto_sim;
+#[cfg(test)]
 mod sim;
 
 #[cfg(test)]
@@ -42,7 +44,6 @@ pub const FEC_GROUP_SIZE_K: usize = 10;
 pub const FEC_PARITY_PER_GROUP_R: usize = 1;
 pub const PARITY_INTERLEAVE_OFFSET: u32 = (2 * FEC_GROUP_SIZE_K) as u32;
 pub const END_OF_STREAM_PARITY_FLUSH_MS: u64 = 5;
-pub const RTO_BACKOFF_FACTOR: u32 = 2;
 // Historical sizing of the retransmit cache, kept only as the scale the cache
 // tests exercise. The cache no longer has a capacity: an LRU bound of 8 K
 // evicted ~16 K entries of a first-paint burst at 48 % wire loss and left
