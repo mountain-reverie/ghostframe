@@ -158,22 +158,37 @@ impl IoBridge {
                 use crate::transport::transmission_ledger::Resolution;
                 let r = match self.transmission_ledger.resolve(e.wire_seq) {
                     Some(Resolution::Live(tx)) => {
+                        // At dispatch, not when the samples are drained later
+                        // in the turn: the probe timeout runs before the
+                        // drain and must see this acknowledgement.
+                        self.reliable_emitter.note_ack(now_for_samples);
                         self.reliable_emitter.note_ack_origin(tx.key, e.wire_seq);
                         self.loss_window.record(tx.emit_us as u32, false);
                         Some((tx.key, tx, e.arrival_time_ms_lo16, false))
                     }
-                    Some(Resolution::Late(tx)) => {
+                    Some(Resolution::Late { tx, fec_possible }) => {
+                        self.reliable_emitter.note_ack(now_for_samples);
                         self.reliable_emitter.note_ack_origin(tx.key, e.wire_seq);
-                        self.loss_window.retract(tx.emit_us as u32);
-                        // Observability: was goog_cc already told this was lost?
-                        if self.instr.flushed.take(e.wire_seq) {
-                            self.instr.late_acked_after_flush += 1;
-                        }
-                        // Withdrawn from `pending_losses` once per turn (see
-                        // `retract_late_acked_losses`); only worth noting when
-                        // something is waiting there.
-                        if !self.pending_losses.is_empty() {
-                            self.late_acked.insert(e.wire_seq);
+                        let was_flushed = self.instr.flushed.take(e.wire_seq);
+                        if fec_possible {
+                            // May be the client acking a datagram it rebuilt
+                            // from parity: a loss that happened. Not
+                            // retracted, not counted as one goog_cc was wrongly
+                            // told of.
+                            self.instr.late_acks_fec_possible += 1;
+                        } else {
+                            self.loss_window.retract(tx.emit_us as u32);
+                            // Observability: was goog_cc already told this was
+                            // lost?
+                            if was_flushed {
+                                self.instr.late_acked_after_flush += 1;
+                            }
+                            // Withdrawn from `pending_losses` once per turn
+                            // (see `retract_late_acked_losses`); only worth
+                            // noting when something is waiting there.
+                            if !self.pending_losses.is_empty() {
+                                self.late_acked.insert(e.wire_seq);
+                            }
                         }
                         if crate::transport::reliable_emitter::rto_probe_enabled() {
                             eprintln!(
@@ -253,28 +268,12 @@ impl IoBridge {
                 // bytes twice) or withdrawn from `pending_losses` this turn
                 // (see `retract_late_acked_losses`). Its arrival time reflects
                 // the stall rather than the path, so it is not fed as delivered.
-                // It is still an acknowledgement, and the verdict that
-                // preceded it was spurious (Eifel, RFC 3522): the path was
-                // delivering, only later than the detector allowed. So the
-                // PTO backoff ends and the late round trip is absorbed into
-                // srtt/rttvar (the next time threshold and PTO are longer for
-                // it). The loss itself is retracted from the loss window at
-                // resolve time and from `pending_losses` by
-                // `retract_late_acked_losses`; what already reached goog_cc
-                // cannot be taken back and is counted in
-                // `late_acked_after_flush`.
-                if let Some(depart_us) = tx.depart_us {
-                    let elapsed_us = now_for_samples
-                        .saturating_duration_since(self.bwe_epoch)
-                        .as_micros() as u64;
-                    let rtt_us = (elapsed_us as u32).wrapping_sub(depart_us as u32) as u64;
-                    self.reliable_emitter
-                        .rtt
-                        .on_sample(std::time::Duration::from_micros(rtt_us));
-                } else {
-                    self.reliable_emitter.rtt.on_ack();
-                }
-                self.reliable_emitter.note_ack(now_for_samples);
+                // It is still an acknowledgement (the PTO backoff ended at
+                // dispatch, in `resolve_ack_entries`), but its round trip is
+                // not a sample: it includes the time the verdict beat it by,
+                // and a recovered datagram's reflects the parity, not the
+                // path. srtt, rttvar and the latest round trip stay as the
+                // live acknowledgements made them.
                 continue;
             }
             if self.bwe_samples_buffer.len() >= BWE_SAMPLES_BUFFER_CAPACITY {
