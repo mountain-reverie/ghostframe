@@ -1086,3 +1086,210 @@ async fn a_lost_final_pass_is_repaired_by_the_rto_since_the_sweep_has_no_evidenc
     assert_eq!(c.tiles, 1, "the tile has no coverage at all");
     assert_eq!(c.partial, 0, "the lost final pass was never repaired");
 }
+
+// ---------------------------------------------------------------------------
+// F4 part 2 gates (D1 PR-5): threshold loss drives repair, the probe is the tail.
+// ---------------------------------------------------------------------------
+
+/// One full-grid CDF 5/3 frame, then silence: everything the server owes is in
+/// the first second, so whatever is still unrepaired at the end is stranded.
+fn full_grid_frame() -> FrameScript {
+    FrameScript {
+        tiles: (0..COLS as u8)
+            .flat_map(|x| {
+                (0..ROWS as u8).map(move |y| {
+                    (
+                        (x, y),
+                        TileSpec::Cdf53 {
+                            bgra: gradient_tile(0, x, y),
+                        },
+                    )
+                })
+            })
+            .collect(),
+    }
+}
+
+fn p5_scene(seed: u64, secs: u64) -> BrowserlessScene {
+    let mut sc = scene(seed, secs);
+    sc.load = SceneLoad::Script(vec![full_grid_frame()]);
+    sc
+}
+
+/// What one lossy run cost, from the counters that name the cause.
+struct RepairBill {
+    lost_datagrams: u64,
+    retransmits: u64,
+    by_loss: u64,
+    by_probe: u64,
+    by_nack: u64,
+}
+
+fn repair_bill(r: &BrowserlessResult) -> RepairBill {
+    let i = &r.transport.instr;
+    RepairBill {
+        lost_datagrams: r.client_wire_loss.lost_pre_fec,
+        retransmits: r.retransmit_attempts_total,
+        by_loss: i.loss_retransmits,
+        by_probe: i.pto_probe_retransmits,
+        by_nack: r.retransmit_by_nack,
+    }
+}
+
+/// P5a: a lossy screen is repaired, once. Over five seeds of 2 % i.i.d. loss
+/// and of 2 % Gilbert-Elliott loss (mean burst 8), each on one full-grid CDF
+/// 5/3 frame followed by silence:
+///
+/// - **Structural** (counters that must be exactly zero or all-present): every
+///   tile is on the client's screen, the retransmit cache is empty at the end
+///   (nothing sent was left without a repair that arrived), and nothing was
+///   retired by the 30 s backstop. A transmission lost with current content
+///   and never retransmitted would sit in the cache for ever.
+/// - **Margin-argued**: retransmissions per datagram the client saw missing
+///   (`lost_pre_fec`, datagram-level: one lost QUIC packet carries several)
+///   is at most `RATIO_BOUND`.
+///
+/// Re-measured baselines on the sweep scene family (15 runs per row, sweep
+/// `burst_loss_report_over_three_seeds`): the PR-3 base 0.86, PR-4 1.03 (RTO
+/// and NACK both repair the same loss). The design's 2.7 to 26 was the #225
+/// loop and the unbounded FIFO.
+const RATIO_BOUND: f64 = 1.2;
+
+#[tokio::test(start_paused = true)]
+async fn p5a_a_lost_datagram_is_repaired_about_once_and_nothing_is_stranded() {
+    const P5_RATE: f64 = 0.05;
+    let ge = GilbertElliott::from_rate_and_burst(P5_RATE, BURST, 1.0).expect("feasible");
+    let (mut lost, mut retx, mut loss_repairs) = (0u64, 0u64, 0u64);
+    for i in 0..5u64 {
+        let seed = 0xB0_B057 ^ (i * 0x100);
+        for (model, links) in [
+            ("iid5%", s2c_only(|p| p.loss = P5_RATE)),
+            ("burst5%", s2c_only(|p| ge.apply_to(p))),
+        ] {
+            let r = run_browserless_with_links(p5_scene(seed, 10), links)
+                .await
+                .expect("scene ran");
+            let n = format!("{model}@{seed:#x}");
+            assert_established(&n, &r);
+            let b = repair_bill(&r);
+            println!(
+                "P5A {n}: lost_datagrams={} retransmits={} (loss={} probe={} nack={}) ratio={:.3} \
+                 cache_left={} tiles={} stale={} verdicts={} spurious={} k_pkt={} pto_fires={} \
+                 critical_lat_mean_us={} max_us={}",
+                b.lost_datagrams,
+                b.retransmits,
+                b.by_loss,
+                b.by_probe,
+                b.by_nack,
+                b.retransmits as f64 / b.lost_datagrams.max(1) as f64,
+                r.emitter_cache_entries,
+                tiles_present(&r),
+                r.stale_generation_tiles,
+                r.transport.instr.loss_by_packet_threshold
+                    + r.transport.instr.loss_by_time_threshold,
+                r.transport.instr.ledger_spurious_losses,
+                r.transport.instr.k_pkt,
+                r.transport.instr.pto_fires,
+                r.critical_latency_mean_us,
+                r.critical_latency_max_us,
+            );
+            loss_repairs += b.by_loss;
+            assert_eq!(
+                tiles_present(&r),
+                (COLS * ROWS) as usize,
+                "{n}: tiles missing at the end"
+            );
+            assert_eq!(
+                r.emitter_cache_entries, 0,
+                "{n}: passes left in the retransmit cache: sent, never acknowledged"
+            );
+            assert_eq!(r.transport.instr.loss_by_pto, 0, "{n}");
+            lost += b.lost_datagrams;
+            retx += b.retransmits;
+        }
+    }
+    let ratio = retx as f64 / lost as f64;
+    println!("P5A pooled: retransmits={retx} lost_datagrams={lost} ratio={ratio:.3}");
+    assert!(lost >= 500, "premise: only {lost} missing datagrams");
+    // Who repaired it. The client's own gap NACKs also repair a loss they
+    // can see, so with the threshold detector switched off the ratio and the
+    // latency below do not move (measured: ratio 0.968, the same latencies);
+    // what moves is the cause: no repair at all comes from the detector, and
+    // the client's NACKs and the probe do the work. Measured with it on: 1302
+    // of 1445 retransmissions (90 %) are the detector's; off, 0.
+    assert!(
+        loss_repairs * 100 >= retx * 80,
+        "the threshold detector made {loss_repairs} of {retx} retransmissions"
+    );
+    assert!(
+        ratio <= RATIO_BOUND,
+        "{retx} retransmissions for {lost} missing datagrams: {ratio:.3} > {RATIO_BOUND}"
+    );
+}
+
+/// The tail: the ONLY datagram of the screen is lost and the screen then stays
+/// static (one Solid tile, one datagram, dropped once). Nothing after it will
+/// ever be acknowledged, so no threshold can find it, and the client cannot ask
+/// for a pass it never heard of. The probe timeout must repair it, with no frame
+/// and no heartbeat that matters to wake the server: about one PTO after the
+/// send, which before any acknowledgement is RFC 9002's initial 1004 ms.
+///
+/// Premises: the drop fired and hit the only datagram (the tile appears in no
+/// other way: no verdict, no NACK). Outcome: one probe retransmission, the tile
+/// on screen, the cache empty, and the repair neither early (before the PTO)
+/// nor at the 30 s backstop.
+#[tokio::test(start_paused = true)]
+async fn p5_a_lost_only_datagram_on_a_static_screen_is_repaired_by_the_probe_on_time() {
+    let mut sc = scene(0xB0_B057, 6);
+    sc.load = SceneLoad::Script(vec![FrameScript {
+        tiles: vec![(
+            (1, 1),
+            TileSpec::Solid {
+                bgra: [10, 20, 30, 255],
+            },
+        )],
+    }]);
+    sc.drops = DropPlan::new(vec![DropRule {
+        tile_x: 1,
+        tile_y: 1,
+        occurrences: vec![0],
+    }]);
+    let r = run_browserless_with_links(sc, LinkOverrides::default())
+        .await
+        .expect("scene ran");
+    let i = &r.transport.instr;
+    println!(
+        "P5TAIL drops_fired={:?} pto_fires={} probe_retx={} loss_retx={} nack_retx={} cache_left={}          tile_present={} queued_critical_lat_us={}",
+        r.drops_fired,
+        i.pto_fires,
+        i.pto_probe_retransmits,
+        i.loss_retransmits,
+        r.retransmit_by_nack,
+        r.emitter_cache_entries,
+        r.framebuffer.tile_rgba(1, 1).is_some(),
+        r.queued_critical_latency_mean_us
+    );
+    assert_eq!(
+        r.drops_fired,
+        vec![1],
+        "premise: the only datagram was dropped"
+    );
+    assert_eq!(
+        (i.loss_retransmits, r.retransmit_by_nack),
+        (0, 0),
+        "premise: nothing but the probe could have found it"
+    );
+    assert!(
+        r.framebuffer.tile_rgba(1, 1).is_some(),
+        "the lost only datagram was never repaired"
+    );
+    assert_eq!(i.pto_probe_retransmits, 1);
+    assert_eq!(r.emitter_cache_entries, 0);
+    // On time: the acknowledgement of the retransmission arrives one PTO plus a
+    // round trip after the send. Not before the PTO, not seconds after it.
+    assert!(
+        (1_000_000..1_300_000).contains(&r.queued_critical_latency_mean_us),
+        "repaired {} us after the send; the PTO is 1004 ms",
+        r.queued_critical_latency_mean_us
+    );
+}

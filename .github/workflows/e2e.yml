@@ -114,7 +114,7 @@ jobs:
       # exactly. Concurrent mode (browserless_loop_stall) is not reproducible.
       # Stepped is also latently broken by goog_cc's AlrDetector wall-clock
       # read until the separate goog_cc patch lands.
-      - run: cargo test --test netsim --test netsim_pump --test netsim_burst --test fec_burst_analysis --test scene_tiles --test framebuffer
+      - run: cargo test --test netsim --test netsim_pump --test netsim_burst --test fec_burst_analysis --test scene_tiles --test framebuffer --test loss_detector_replay
       - run: cargo test --test browserless_runner -- --test-threads=1
       # Split out of browserless_runner: two 20s bottleneck scenes that both
       # pass in isolation and flaked ~1 run in 9 inside a 22-test sequential

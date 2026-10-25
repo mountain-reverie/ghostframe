@@ -526,6 +526,10 @@ pub struct BrowserlessResult {
     /// original is acknowledged first and the retransmission after it), so
     /// the two can sum to more than `rto_fired`.
     pub rto_original_first: u64,
+    /// Passes still in the retransmit cache when the scene ended: sent and not
+    /// acknowledged. After a scene that stops sending and settles, non-zero
+    /// means content nobody is repairing.
+    pub emitter_cache_entries: usize,
     /// RTO fires whose pass was repaired by the retransmission.
     pub rto_useful: u64,
     /// quinn path stats, send-queue depth and the client's feedback totals,
@@ -1135,6 +1139,7 @@ async fn run_inner(
         retransmit_by_nack: emitter_stats.retransmit_by_nack,
         rto_spurious: emitter_stats.rto_spurious,
         rto_original_first: emitter_stats.rto_original_first,
+        emitter_cache_entries: emitter_stats.cache_entries,
         rto_useful: emitter_stats.rto_useful,
         transport,
         client_wire_loss: client_probe.wire_loss,

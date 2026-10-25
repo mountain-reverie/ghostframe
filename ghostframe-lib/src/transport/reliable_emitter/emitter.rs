@@ -182,6 +182,9 @@ pub struct EmitterStats {
     /// Verdicts with no retransmission, by why: the pass was no longer cached
     /// (acknowledged or superseded), or a newer transmission of it was already
     /// in flight (a NACK repair, say), or one was already waiting.
+    /// Passes still cached (sent, not acknowledged, not cancelled) when the
+    /// stats were last published. Only set by the publish; zero in `stats`.
+    pub cache_entries: usize,
     pub verdict_content_gone: u64,
     pub verdict_newer_in_flight: u64,
     pub verdict_already_queued: u64,
