@@ -66,22 +66,6 @@ fn replay(trace: &[Option<u64>], freeze: bool) -> Replay {
     if freeze {
         ledger.freeze_k_pkt();
     }
-    // Departures happen in send order, one per datagram.
-    for i in 0..N {
-        let at = t0 + Duration::from_micros(i as u64 * INTERVAL_US);
-        ledger.record(
-            i,
-            at,
-            Transmission {
-                emit_us: i as u64 * INTERVAL_US,
-                wire_bytes: 1200,
-                key: EmitKey::new(i, 0, 0, 0),
-                depart_us: None,
-                dep_idx: None,
-            },
-        );
-        ledger.mark_departed(i, at, i as u64 * INTERVAL_US);
-    }
     // Acknowledgements in arrival order (stable for equal times).
     let mut arrivals: Vec<(u64, u32)> = trace
         .iter()
@@ -94,7 +78,28 @@ fn replay(trace: &[Option<u64>], freeze: bool) -> Replay {
     // 9/8 of a round trip that includes the whole reorder window.
     let threshold = Duration::from_millis(60);
     let quarter = N * 3 / 4;
+    // Departures happen in send order, one per datagram, interleaved with the
+    // arrivals in time: a datagram has departed only once its send time has
+    // come (the ledger's FEC-distance rule reads how many departures followed).
+    let mut next_send = 0u32;
     for (at_us, ws) in arrivals {
+        while next_send < N && next_send as u64 * INTERVAL_US <= at_us {
+            let i = next_send;
+            let at = t0 + Duration::from_micros(i as u64 * INTERVAL_US);
+            ledger.record(
+                i,
+                at,
+                Transmission {
+                    emit_us: i as u64 * INTERVAL_US,
+                    wire_bytes: 1200,
+                    key: EmitKey::new(i, 0, 0, 0),
+                    depart_us: None,
+                    dep_idx: None,
+                },
+            );
+            ledger.mark_departed(i, at, i as u64 * INTERVAL_US);
+            next_send += 1;
+        }
         match ledger.resolve(ws) {
             Some(Resolution::Late { .. }) => {
                 out.spurious += 1;
