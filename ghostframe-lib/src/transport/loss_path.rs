@@ -85,7 +85,10 @@ pub(crate) fn probe(
                     out.lost.push((ws, tx));
                 }
             }
-            RetxRequest::NewerInFlight | RetxRequest::AlreadyQueued | RetxRequest::Disabled => {}
+            RetxRequest::NewerInFlight
+            | RetxRequest::AlreadyQueued
+            | RetxRequest::Deferred
+            | RetxRequest::Disabled => {}
         }
     }
     Some(out)
