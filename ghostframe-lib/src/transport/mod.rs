@@ -3,6 +3,8 @@ pub mod ack_latency;
 pub mod bwe;
 pub mod client_caps;
 pub mod decode_error;
+pub mod delivery_rate;
+pub mod delivery_sampler;
 pub mod departure;
 pub mod display;
 pub use ghostframe_protocol::fec;
