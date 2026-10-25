@@ -115,7 +115,9 @@ journalctl _UID=$(id -u <user>) --no-pager | grep 'cumulative emit' | tail -1
 ```
 
 That `cumulative emit` line is the most informative single line in the log:
-per-codec emission counts, `rto_fired`, `nack_received`, `emitter_ack_hits` /
+per-codec emission counts, `rto_fired` (retransmissions made by the loss path:
+verdicts and probes; the name predates the per-pass timer, which is gone),
+`nack_received`, `emitter_ack_hits` /
 `ack_misses`, `retransmit_attempts_total`, `cache_pending_entries`, and the
 latency tiers.
 
@@ -129,8 +131,11 @@ they always read zero. `fec-coverage` says `n/a(wasm-internal)` explicitly.
 
 Env-gated, off by default:
 
-- `GHOSTFRAME_RTO_PROBE=1` — one line per RTO fire, acknowledgement, resolve
-  miss and ledger expiry.
+- `GHOSTFRAME_RTO_PROBE=1` — one line per loss-path retransmission (`retx`, with
+  its cause: a verdict or the probe), ledger verdict (`lost_ws`, with its
+  rule), acknowledgement, late acknowledgement and resolve miss. The `loss
+  path` journal event (same cadence as `cumulative emit`) carries `k_pkt`,
+  verdicts by rule, `spurious_*`, `pto_fires` and the retransmission causes.
 - `GHOSTFRAME_ACK_ORDER_PROBE=1` — every acknowledged `wire_seq` in arrival
   order, on target `ghostframe::ackorder`. Replaying an RFC 9002
   packet-threshold rule against that order says whether ordering-based loss

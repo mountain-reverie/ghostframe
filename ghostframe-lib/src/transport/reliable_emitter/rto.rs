@@ -8,21 +8,20 @@ use crate::config::EmitterConfig;
 use crate::transport::rtt_estimator::RttEstimator;
 use std::time::Duration;
 
-/// Maximum RTO backoff. Beyond this, retries fire every `RTO_BACKOFF_MAX`
-/// indefinitely. Picked so a single un-delivered tile-pass under sustained
-/// loss still retries 12 times per minute — fast enough that recovery is
-/// perceptible to the user, slow enough to not flood the link.
+/// Ceiling of the probe timeout's backoff. Beyond this, the probe repeats every
+/// `RTO_BACKOFF_MAX` indefinitely. Picked so a single un-delivered tile-pass
+/// under sustained loss still gets 12 probes per minute — fast enough that
+/// recovery is perceptible to the user, slow enough to not flood the link.
 pub const RTO_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
-/// The deadline of a transmission that left `attempts` retransmissions ago
-/// (0 for an original): the probe timeout of RFC 9002 §6.2 from `rtt`, doubled
-/// per backoff step and held to `EmitterConfig::rto_backoff_max`.
+/// The probe timeout of RFC 9002 §6.2 from `rtt`, doubled `attempts` times and
+/// held to `EmitterConfig::rto_backoff_max`.
 ///
-/// Only the key's own retry count backs it off. The connection's
-/// consecutive-PTO count ([`RttEstimator::pto_count`]) does not: an original
-/// first sent at the end of a stall would otherwise be armed as late as a
-/// retry, and stay so after the ACKs resume. Silence is handled where the timer
-/// is evaluated instead: the emitter's PTO timer backs off by the count.
+/// `attempts` is a plain backoff exponent. The scheduler's priority retry gate
+/// passes 0 (the PTO of a fresh transmission); the emitter's probe timer
+/// passes the connection's consecutive-expiry count
+/// ([`RttEstimator::pto_count`]), which an acknowledgement resets. No per-pass
+/// timer exists any more.
 ///
 /// # History
 ///
@@ -80,10 +79,10 @@ mod tests {
         assert_eq!(pto_for_attempt(&e, 99), RTO_BACKOFF_MAX);
     }
 
-    /// Only the retry count backs a deadline off here; the connection's
-    /// consecutive-PTO count is applied by the emitter's timer itself.
+    /// The interval backs off only by the exponent it is given; the estimator's
+    /// consecutive-expiry count is the emitter timer's to pass in.
     #[test]
-    fn arming_ignores_the_connections_pto_count() {
+    fn the_interval_backs_off_only_by_the_exponent_it_is_given() {
         let t0 = std::time::Instant::now();
         let mut e = est(40);
         let base = pto_for_attempt(&e, 0);

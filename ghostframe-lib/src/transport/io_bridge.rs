@@ -527,6 +527,10 @@ pub struct IoBridge {
     /// Cfg-gated inbound-datagram loss injector for e2e tests.
     #[cfg(any(test, feature = "test-loss-injection"))]
     pub(crate) inbound_loss: Option<crate::transport::loss_injection::LossInjector>,
+    /// Test knob: drop every client tile NACK at the door, so the loss detector
+    /// and the probe are measured without the client's own repair requests.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub(crate) ignore_tile_nacks: bool,
     /// Cfg-gated outbound bandwidth cap for e2e tests / bench scenes.
     /// `None` ⇒ no rate limiting (the `GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP`
     /// env var was unset at construction time). Production code path is
@@ -1262,6 +1266,8 @@ impl IoBridge {
             outbound_loss: lib_config.transport.outbound_loss,
             #[cfg(any(test, feature = "test-loss-injection"))]
             inbound_loss: lib_config.transport.inbound_loss,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            ignore_tile_nacks: false,
             #[cfg(any(test, feature = "test-loss-injection"))]
             outbound_bandwidth_cap: lib_config
                 .transport

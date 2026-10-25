@@ -32,7 +32,7 @@
 //! client's 5 ms flush and its event loop (a live session measured an ACK p95
 //! of 38.6 ms on a path with a QUIC RTT of a few ms). A seed that small gives a
 //! PTO near 8 ms, and before the first ACK there is nothing for the
-//! hold-back to hold on, so every first-paint pass would fire.
+//! timer to restart from, so every first-paint pass would be probed.
 
 use std::time::{Duration, Instant};
 
@@ -66,9 +66,9 @@ pub struct RttEstimator {
     max_ack_delay: Duration,
     /// Consecutive PTOs since the last acknowledgement.
     pto_count: u32,
-    /// A fire counts toward `pto_count` only once per PTO interval: the
-    /// per-key timer wheel can pop many due keys in one tick, but RFC 9002
-    /// has one timer per connection and one expiry is one PTO.
+    /// A fire counts toward `pto_count` only once per PTO interval, so a caller
+    /// that reports one expiry more than once (RFC 9002 has one timer per
+    /// connection, and one expiry is one PTO) does not back off twice.
     next_count_at: Option<Instant>,
 }
 

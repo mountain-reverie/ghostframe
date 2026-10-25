@@ -1,5 +1,5 @@
 //! Per-session retransmit cache. Holds the emitted datagram of each tile pass by EmitKey for
-//! re-emission on RTO / NACK. Unbounded — entries live until ACKed,
+//! re-emission on a loss verdict, a probe or a NACK. Unbounded — entries live until ACKed,
 //! superseded via `cancel_for_tile`, or the session ends via `clear`.
 
 use crate::transport::reliable_emitter::EmitKey;
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 /// `None` for ordinary traffic, which is the overwhelming majority — only
 /// passes emitted while `IoBridge`'s `ActiveProbe` window is open carry
 /// `Some`. Mirrors `queued_at`: copied through unchanged once set, since
-/// `ReliableTileEmitter::tick`'s RTO retransmit path resends the cached
+/// `ReliableTileEmitter::tick`'s loss-path retransmit resends the cached
 /// bytes directly (`self.queue.push_source`) without going through
 /// `submit_one` again, so a retransmitted pass keeps whatever tag (or lack
 /// of one) it was originally submitted with.

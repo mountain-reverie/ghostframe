@@ -107,6 +107,13 @@ pub(crate) fn probe(
             break;
         }
     }
+    // Passes a declined verdict left to the probe: their newest transmission is
+    // already tombstoned, so the scan above cannot see them.
+    for (key, ws) in emitter.take_deferred(PROBE_COUNT) {
+        if emitter.request_retransmit(key, ws, RetxCause::Probe) == RetxRequest::Queued {
+            out.retx_queued += 1;
+        }
+    }
     Some(out)
 }
 
@@ -201,5 +208,80 @@ mod tests {
             interval1,
             third.duration_since(second)
         );
+    }
+}
+
+#[cfg(test)]
+mod deferred_tests {
+    use super::*;
+    use crate::transport::reliable_emitter::emitter::LOSS_RETX_MAX_ATTEMPTS;
+    use crate::transport::reliable_emitter::EmitKey;
+    use crate::transport::transmission_ledger::Transmission;
+    use bytes::Bytes;
+
+    /// A pass lost four times running: the verdict on its last transmission is
+    /// declined (it has been resent `LOSS_RETX_MAX_ATTEMPTS` times) and that
+    /// transmission is tombstoned, so the ledger shows nothing outstanding for
+    /// it. The probe must still find the pass, or it waits for the 30 s
+    /// backstop (the seed 0x22 burst scene left 24 passes owed that way).
+    #[test]
+    fn a_pass_whose_verdict_was_declined_is_still_found_by_the_probe() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.rtt.on_sample(Duration::from_millis(40));
+        let mut l = TransmissionLedger::new(256);
+        let key = EmitKey::new(1, 0, 0, 0);
+        let mut v = vec![0u8; 25];
+        v[0..4].copy_from_slice(&(0x8000_0000u32 | 1).to_be_bytes());
+        v[6..8].copy_from_slice(&1u16.to_be_bytes());
+        e.submit_one(key, Bytes::from(v), t0, None, t0);
+        let book = |e: &mut ReliableTileEmitter, l: &mut TransmissionLedger| {
+            for em in e.take_transmissions() {
+                l.record(
+                    em.wire_seq,
+                    t0,
+                    Transmission {
+                        emit_us: 0,
+                        wire_bytes: em.wire_bytes,
+                        key,
+                        depart_us: None,
+                        dep_idx: None,
+                    },
+                );
+                l.mark_departed(em.wire_seq, t0, 0);
+                e.on_departed(em.wire_seq, t0);
+            }
+        };
+        book(&mut e, &mut l);
+        // Resent by verdicts until the limit, each transmission then declared
+        // lost in turn.
+        for _ in 0..LOSS_RETX_MAX_ATTEMPTS {
+            let ws = e.cache.get(&key).unwrap().latest_ws;
+            assert_eq!(l.declare_lost_by_pto(ws).map(|t| t.key), Some(key));
+            assert_eq!(
+                e.request_retransmit(key, ws, RetxCause::Loss),
+                RetxRequest::Queued
+            );
+            e.tick(t0, usize::MAX);
+            book(&mut e, &mut l);
+        }
+        let ws = e.cache.get(&key).unwrap().latest_ws;
+        l.declare_lost_by_pto(ws).expect("outstanding");
+        assert_eq!(
+            e.request_retransmit(key, ws, RetxCause::Loss),
+            RetxRequest::Deferred
+        );
+        assert_eq!(
+            l.newest_outstanding(8, 8).len(),
+            0,
+            "premise: nothing outstanding"
+        );
+
+        let due = e.pto_deadline().expect("running");
+        let out = probe(&mut l, &mut e, due).expect("due");
+        assert_eq!(out.retx_queued, 1, "the probe resends the deferred pass");
+        let mut n = 0;
+        e.tick_loss_budgeted(due, usize::MAX, usize::MAX, &mut n);
+        assert_eq!(e.stats.pto_probe_retransmits, 1);
     }
 }

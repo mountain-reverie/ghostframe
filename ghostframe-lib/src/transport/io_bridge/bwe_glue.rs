@@ -42,7 +42,7 @@
 use super::*;
 
 /// Path RTT of the live (HELLO'd) session only. An unauthenticated or
-/// evicted connection must not steer the loss horizon or the BWE reference.
+/// evicted connection must not steer the BWE reference.
 /// `None` when there is no live session or its connection is gone.
 pub(super) fn select_live_rtt(
     live: Option<ConnectionHandle>,
@@ -202,10 +202,12 @@ pub(super) struct PendingLoss {
     pub(super) wire_bytes: usize,
 }
 
-/// Outstanding transmissions the ledger will hold. Sized by send rate x
-/// horizon rather than session length — roughly 2000 packets/s at 20 Mbps
-/// against a horizon measured in hundreds of milliseconds. The cap is a
-/// backstop against a peer that stops acknowledging, not the normal bound.
+/// Outstanding transmissions the ledger will hold. Sized by send rate x round
+/// trip rather than session length — roughly 2000 packets/s at 20 Mbps against
+/// a round trip measured in hundreds of milliseconds. The cap is a backstop
+/// against a peer that stops acknowledging (and, with no horizon any more, the
+/// only thing that retires the records of a dead tail the probe cannot find
+/// content for), not the normal bound.
 pub(super) const TRANSMISSION_LEDGER_CAPACITY: usize = 16_384;
 
 /// Visual-importance tier of a CDF53 pass.

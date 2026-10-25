@@ -176,7 +176,7 @@ impl IoBridge {
         }
     }
 
-    /// `wire_seq` left for the wire at `at`: start the loss clock on its
+    /// `wire_seq` left for the wire at `at`: give its ledger record a departure
     /// ledger record and the timer on its cache entry.
     pub(super) fn stamp_departure(&mut self, wire_seq: u32, at: std::time::Instant) {
         stamp_departure_in(
@@ -189,8 +189,8 @@ impl IoBridge {
 
     /// A datagram that was consumed before quinn saw it (a harness-injected
     /// drop) has left the host as far as the transport is concerned: it is on
-    /// the wire and lost. Its clocks start now, so the loss is declared on the
-    /// usual horizon rather than never.
+    /// the wire and lost. It departs now, so later acknowledgements can find the
+    /// loss rather than never.
     pub(super) fn departed_without_quinn(&mut self, wire_seq: Option<u32>) {
         let Some(ws) = wire_seq else { return };
         let now = super::now_std();

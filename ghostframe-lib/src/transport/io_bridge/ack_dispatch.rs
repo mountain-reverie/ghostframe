@@ -65,9 +65,8 @@ impl IoBridge {
                     "ack_batch_received"
                 );
                 // Route every ACKed key into the reliable-tile emitter as
-                // well — it owns the retransmit cache + RTO heap and needs
-                // to drop the matching CacheEntry so `tick` stops re-firing
-                // it. Runs alongside the scheduler/coverage path below,
+                // well — it owns the retransmit cache and needs to drop the
+                // matching CacheEntry so nothing sends the pass again. Runs alongside the scheduler/coverage path below,
                 // which is not legacy: the coverage record outlives the
                 // cache entry in several cases, and `apply_ack_coverage`
                 // reads it for exactly those late ACKs (see the
@@ -85,7 +84,7 @@ impl IoBridge {
                 // the only place that reflects the actual on-wire moment for a
                 // retransmitted pass. The BWE consumer uses relative deltas
                 // only, so clock skew is acceptable. Cache misses are silent
-                // (already ACKed by an overlapping batch, or RTO-evicted).
+                // (already ACKed by an overlapping batch, or retired).
                 let now_for_samples = now_std();
                 // Entries name transmissions now, so the ledger supplies both
                 // halves: the content identity every delivery consumer below
@@ -110,7 +109,7 @@ impl IoBridge {
                 // tile was superseded. Absent, the sample is still recorded:
                 // its timing is what the estimator came for.
                 // [RTO-PROBE] temporary instrumentation: emit -> acknowledgement
-                // latency, measured on the same clock the RTO deadline uses.
+                // latency, measured on the same clock the probe timeout uses.
                 self.log_ack_probes(&batch, &resolved, now_for_samples);
                 self.record_ack_bwe_samples(&resolved, now_for_samples);
                 self.reliable_emitter.on_ack(&emit_keys);
@@ -424,6 +423,10 @@ impl IoBridge {
             if inj.should_drop(data) {
                 return;
             }
+        }
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        if self.ignore_tile_nacks {
+            return;
         }
         use crate::transport::protocol::TileNackEnvelope;
         let Ok(env) = TileNackEnvelope::decode(data) else {

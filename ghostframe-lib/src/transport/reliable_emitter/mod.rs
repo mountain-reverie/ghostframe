@@ -18,7 +18,7 @@ mod proptest_invariants;
 
 pub use emitter::{ReliableTileEmitter, RetxCause, RetxRequest};
 
-/// Logical identity of a tile-pass — the unit ACKed, NACKed, RTO'd, and
+/// Logical identity of a tile-pass — the unit ACKed, NACKed, resent, and
 /// cancelled by bump_generation. Matches M3.3d's ACK key bit-for-bit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EmitKey {
@@ -71,8 +71,10 @@ pub(crate) fn ack_order_probe_enabled() -> bool {
 }
 
 /// [RTO-PROBE] temporary: gate for the retransmission-storm measurement.
-/// Set `GHOSTFRAME_RTO_PROBE=1` to emit one line per RTO fire and per
-/// acknowledgement, for offline histogramming. Remove with the probe.
+/// Set `GHOSTFRAME_RTO_PROBE=1` to emit one line per loss-path retransmission
+/// (`retx`, with its cause), per ledger verdict (`lost_ws`, with its rule), per
+/// acknowledgement (`ack`) and per late acknowledgement (`late_ack`), for
+/// offline histogramming. Remove with the probe.
 pub(crate) fn rto_probe_enabled() -> bool {
     crate::config::rto_probe_enabled()
 }
