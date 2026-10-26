@@ -34,6 +34,9 @@ pub struct ReliableTileEmitter {
     pub(crate) alloc: WireSeqAllocator,
     pub(crate) queue: EmissionQueue,
     pub(crate) group: GroupBuilder,
+    /// Whether source datagrams feed the XOR parity group builder. Off by
+    /// default; see `TransportConfig::tile_fec`.
+    tile_fec: bool,
     /// Per pass the loss path resent and that is not acknowledged yet: the
     /// first retransmission's `wire_seq`, how many times it was resent and by
     /// whom (a verdict or the probe). Resolved by
@@ -343,6 +346,7 @@ impl ReliableTileEmitter {
             alloc: WireSeqAllocator::new(),
             queue: EmissionQueue::new(),
             group: GroupBuilder::new(FEC_GROUP_SIZE_K),
+            tile_fec: false,
             rto_origin: HashMap::new(),
             latest_tile_generation: HashMap::new(),
             rtt: RttEstimator::new(),
@@ -359,6 +363,13 @@ impl ReliableTileEmitter {
             wire_overhead: 0,
             stats: EmitterStats::default(),
         }
+    }
+
+    /// Turn tile XOR parity on or off. Off at construction. Turn it on before
+    /// the first submit: a group needs contiguous `wire_seq`s, so enabling it
+    /// mid-stream makes the first group short and it never completes.
+    pub fn set_tile_fec(&mut self, on: bool) {
+        self.tile_fec = on;
     }
 
     /// Bill `bytes` more than each retransmitted datagram's length against
@@ -537,6 +548,9 @@ impl ReliableTileEmitter {
     /// `wire_seq` that was never a source as a missing one and fabricate
     /// a datagram that was never sent.
     fn feed_group(&mut self, wire_seq: u32, bytes: Bytes) {
+        if !self.tile_fec {
+            return;
+        }
         if let Some(result) = self.group.add(wire_seq, bytes) {
             let envelope = TileParityEnvelope {
                 group_first_wire_seq: result.group_first_wire_seq,
@@ -1499,6 +1513,7 @@ mod tests {
     fn cache_and_queue_share_one_allocation() {
         let now = Instant::now();
         let mut e = ReliableTileEmitter::new(now);
+        e.set_tile_fec(true);
         let key = EmitKey::new(1, 0, 0, 0);
         e.submit_one(key, fake_source(1, 0, 0xAA), now, None, now);
         let cached_ptr = e.cache.get(&key).unwrap().datagram.as_ptr();
@@ -1636,10 +1651,45 @@ mod tests {
         assert_eq!(ws1, 1);
     }
 
+    /// Tile parity is opt-in. The same stream is run with and without it, so
+    /// the zero cannot be a stream too short to complete a group.
+    #[test]
+    fn no_tile_parity_is_emitted_unless_asked_for() {
+        let run = |fec: bool| {
+            let mut e = ReliableTileEmitter::new(Instant::now());
+            if fec {
+                e.set_tile_fec(true);
+            }
+            let mut sender = CollectSender::default();
+            let now = Instant::now();
+            for i in 0..(FEC_GROUP_SIZE_K as u32 * 5) {
+                e.submit_one(
+                    EmitKey::new(i, 0, 0, 0),
+                    fake_source(i, 0, 0),
+                    now,
+                    None,
+                    now,
+                );
+            }
+            e.drain(&mut sender, now);
+            (e.stats.parity_emitted, sender.sent.len())
+        };
+        let (on_parity, on_sent) = run(true);
+        let (off_parity, off_sent) = run(false);
+        assert!(on_parity > 0, "premise: opt-in emits parity ({on_parity})");
+        assert_eq!(off_parity, 0, "default emits no parity");
+        assert_eq!(
+            off_sent as u64 + on_parity,
+            on_sent as u64,
+            "the only difference is the parity datagrams"
+        );
+    }
+
     #[test]
     fn submit_k_sources_emits_one_parity_after_offset() {
         use crate::transport::reliable_emitter::FEC_GROUP_SIZE_K;
         let mut e = ReliableTileEmitter::new(Instant::now());
+        e.set_tile_fec(true);
         let mut sender = CollectSender::default();
         let now = Instant::now();
         // Submit K sources for group 0, then K sources for group 1 (so the
@@ -1956,6 +2006,7 @@ mod tests {
         use crate::transport::reliable_emitter::FEC_GROUP_SIZE_K;
 
         let mut e = ReliableTileEmitter::new(Instant::now());
+        e.set_tile_fec(true);
         let mut offered = OfferedBytes::default();
         let mut handed = 0u64;
         let t0 = Instant::now();
@@ -3019,6 +3070,7 @@ mod tests {
         // tick(t, budget) must fire at most `budget` retransmits per call,
         // leaving the rest still due in the heap for the next call.
         let mut e = ReliableTileEmitter::new(Instant::now());
+        e.set_tile_fec(true);
         let now = Instant::now();
         for i in 0..1000u32 {
             let k = EmitKey::new(i, 0, 0, 0);
@@ -3281,6 +3333,7 @@ mod tests {
     fn a_parity_emission_names_its_groups_first_wire_seq() {
         let t0 = Instant::now();
         let mut e = ReliableTileEmitter::new(t0);
+        e.set_tile_fec(true);
         let n = FEC_GROUP_SIZE_K as u32;
         let mut first_ws = Vec::new();
         for i in 0..n {

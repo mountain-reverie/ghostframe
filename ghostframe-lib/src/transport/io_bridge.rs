@@ -1368,9 +1368,11 @@ impl IoBridge {
             last_cumulative_emit_log_frame: 0,
             color_histogram_accumulator: UniqueColorHistogram::default(),
             bump_count_accumulator: BumpCountAccumulator::default(),
-            reliable_emitter: crate::transport::reliable_emitter::ReliableTileEmitter::new(
-                now_std(),
-            ),
+            reliable_emitter: {
+                let mut e = crate::transport::reliable_emitter::ReliableTileEmitter::new(now_std());
+                e.set_tile_fec(lib_config.transport.tile_fec);
+                e
+            },
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
             bwe: crate::transport::bwe::BweWrapper::new(
                 crate::transport::bwe::BweWrapper::INITIAL_BPS,
