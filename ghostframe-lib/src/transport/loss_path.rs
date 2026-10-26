@@ -10,10 +10,15 @@ use crate::transport::rtt_estimator::RttEstimator;
 use crate::transport::transmission_ledger::{Transmission, TransmissionLedger};
 use std::time::{Duration, Instant};
 
-/// Transmissions a probe sends.
+/// Transmissions a probe sends. The same number bounds the deferred passes
+/// resent in one turn, but those are a separate allowance: a probe is the
+/// connection's one timer, a deferred pass has its own.
 pub(crate) const PROBE_COUNT: usize = 2;
 /// Records looked at from the back of the departure order when probing.
 pub(crate) const PROBE_SCAN: usize = 32;
+/// Rounds of `PROBE_SCAN` records a probe looks through while records keep
+/// being removed (content gone): 1,024 records at most.
+pub(crate) const PROBE_MAX_ROUNDS: usize = 32;
 
 /// RFC 9002 section 6.1.2: a transmission that left more than
 /// `9/8 x max(srtt, latest_rtt)` before the newest acknowledged departure is
@@ -35,7 +40,10 @@ pub(crate) struct Outcome {
 
 /// Declare lost what the acknowledgements so far put out of contention (packet
 /// and time threshold), and queue one retransmission for each whose content is
-/// still current.
+/// still current. Also resends the passes earlier verdicts declined whose own
+/// backed-off deadline has come (at most `PROBE_COUNT` a turn), so they do not
+/// wait for the connection's probe timer, which acknowledgements keep from
+/// expiring.
 pub(crate) fn detect(
     ledger: &mut TransmissionLedger,
     emitter: &mut ReliableTileEmitter,
@@ -48,6 +56,11 @@ pub(crate) fn detect(
             out.retx_queued += 1;
         }
         out.lost.push((ws, tx));
+    }
+    for (key, ws) in emitter.take_due_deferred(now, PROBE_COUNT) {
+        if emitter.request_retransmit(key, ws, RetxCause::Probe) == RetxRequest::Queued {
+            out.retx_queued += 1;
+        }
     }
     out
 }
@@ -76,11 +89,13 @@ pub(crate) fn probe(
     emitter.note_pto_fire(now);
     let mut out = Outcome::default();
     // Transmissions whose content is gone are declared lost and leave the
-    // ledger, so they do not count against the scan: look again from the new
-    // back until a pass over `PROBE_SCAN` records removes nothing or two
-    // probes are queued. Each removal is O(1) and happens once.
-    'rounds: loop {
-        let candidates = ledger.newest_outstanding(PROBE_SCAN, PROBE_SCAN);
+    // ledger, so they do not count against the scan: look again until a round
+    // removes nothing or two probes are queued. A cursor (`kept`, the live
+    // records already looked at and left alone) keeps a round from reading
+    // them again, and `PROBE_MAX_ROUNDS` bounds the whole.
+    let mut kept = 0usize;
+    'rounds: for _ in 0..PROBE_MAX_ROUNDS {
+        let candidates = ledger.newest_outstanding_after(kept, PROBE_SCAN, PROBE_SCAN);
         if candidates.is_empty() {
             break;
         }
@@ -90,28 +105,26 @@ pub(crate) fn probe(
                 break 'rounds;
             }
             match emitter.request_retransmit(tx.key, ws, RetxCause::Probe) {
-                RetxRequest::Queued => out.retx_queued += 1,
+                RetxRequest::Queued => {
+                    out.retx_queued += 1;
+                    kept += 1;
+                }
                 RetxRequest::ContentGone => {
                     if let Some(tx) = ledger.declare_lost_by_pto(ws) {
                         out.lost.push((ws, tx));
                         removed = true;
+                    } else {
+                        kept += 1;
                     }
                 }
                 RetxRequest::NewerInFlight
                 | RetxRequest::AlreadyQueued
                 | RetxRequest::Deferred
-                | RetxRequest::Disabled => {}
+                | RetxRequest::Disabled => kept += 1,
             }
         }
         if !removed {
             break;
-        }
-    }
-    // Passes a declined verdict left to the probe: their newest transmission is
-    // already tombstoned, so the scan above cannot see them.
-    for (key, ws) in emitter.take_deferred(PROBE_COUNT) {
-        if emitter.request_retransmit(key, ws, RetxCause::Probe) == RetxRequest::Queued {
-            out.retx_queued += 1;
         }
     }
     Some(out)
@@ -214,57 +227,79 @@ mod tests {
 #[cfg(test)]
 mod deferred_tests {
     use super::*;
-    use crate::transport::reliable_emitter::emitter::LOSS_RETX_MAX_ATTEMPTS;
+    use crate::transport::reliable_emitter::emitter::{DEFERRED_CAP, LOSS_RETX_MAX_ATTEMPTS};
+    use crate::transport::reliable_emitter::rto::pto_for_attempt;
     use crate::transport::reliable_emitter::EmitKey;
     use crate::transport::transmission_ledger::Transmission;
     use bytes::Bytes;
 
+    fn pass(i: u32) -> Bytes {
+        let mut v = vec![0u8; 25];
+        v[0..4].copy_from_slice(&(0x8000_0000u32 | i).to_be_bytes());
+        v[6..8].copy_from_slice(&1u16.to_be_bytes());
+        Bytes::from(v)
+    }
+
+    /// Put what the emitter sent on the books, departed at `at`.
+    fn book(e: &mut ReliableTileEmitter, l: &mut TransmissionLedger, at: Instant) {
+        for em in e.take_transmissions() {
+            l.record(
+                em.wire_seq,
+                at,
+                Transmission {
+                    emit_us: 0,
+                    wire_bytes: em.wire_bytes,
+                    key: em.key,
+                    depart_us: None,
+                    dep_idx: None,
+                },
+            );
+            l.mark_departed(em.wire_seq, at, 0);
+            e.on_departed(em.wire_seq, at);
+        }
+    }
+
+    /// `key` sent at `t`, then lost and resent by verdicts `lost_times` times,
+    /// each resend a second apart. Returns the clock after the last.
+    fn lost_n_times(
+        e: &mut ReliableTileEmitter,
+        l: &mut TransmissionLedger,
+        key: EmitKey,
+        lost_times: u8,
+        t0: Instant,
+    ) -> Instant {
+        let mut t = t0;
+        e.submit_one(key, pass(key.frame_seq), t, None, t);
+        book(e, l, t);
+        for _ in 0..lost_times {
+            let ws = e.cache.get(&key).unwrap().latest_ws;
+            assert_eq!(l.declare_lost_by_pto(ws).map(|x| x.key), Some(key));
+            assert_eq!(
+                e.request_retransmit(key, ws, RetxCause::Loss),
+                RetxRequest::Queued
+            );
+            t += Duration::from_secs(1);
+            e.tick(t, usize::MAX);
+            book(e, l, t);
+        }
+        t
+    }
+
     /// A pass lost four times running: the verdict on its last transmission is
     /// declined (it has been resent `LOSS_RETX_MAX_ATTEMPTS` times) and that
     /// transmission is tombstoned, so the ledger shows nothing outstanding for
-    /// it. The probe must still find the pass, or it waits for the 30 s
-    /// backstop (the seed 0x22 burst scene left 24 passes owed that way).
+    /// it. It is resent at its own backed-off deadline, found by `detect`, while
+    /// acknowledgements of other passes keep arriving, so the connection's probe
+    /// timer never expires. Before this it waited for that timer (or the 30 s
+    /// backstop): the seed 0x22 burst scene left 24 passes owed that way.
     #[test]
-    fn a_pass_whose_verdict_was_declined_is_still_found_by_the_probe() {
+    fn a_deferred_pass_is_resent_at_its_own_deadline_while_acknowledgements_flow() {
         let t0 = Instant::now();
         let mut e = ReliableTileEmitter::new(t0);
         e.rtt.on_sample(Duration::from_millis(40));
         let mut l = TransmissionLedger::new(256);
         let key = EmitKey::new(1, 0, 0, 0);
-        let mut v = vec![0u8; 25];
-        v[0..4].copy_from_slice(&(0x8000_0000u32 | 1).to_be_bytes());
-        v[6..8].copy_from_slice(&1u16.to_be_bytes());
-        e.submit_one(key, Bytes::from(v), t0, None, t0);
-        let book = |e: &mut ReliableTileEmitter, l: &mut TransmissionLedger| {
-            for em in e.take_transmissions() {
-                l.record(
-                    em.wire_seq,
-                    t0,
-                    Transmission {
-                        emit_us: 0,
-                        wire_bytes: em.wire_bytes,
-                        key,
-                        depart_us: None,
-                        dep_idx: None,
-                    },
-                );
-                l.mark_departed(em.wire_seq, t0, 0);
-                e.on_departed(em.wire_seq, t0);
-            }
-        };
-        book(&mut e, &mut l);
-        // Resent by verdicts until the limit, each transmission then declared
-        // lost in turn.
-        for _ in 0..LOSS_RETX_MAX_ATTEMPTS {
-            let ws = e.cache.get(&key).unwrap().latest_ws;
-            assert_eq!(l.declare_lost_by_pto(ws).map(|t| t.key), Some(key));
-            assert_eq!(
-                e.request_retransmit(key, ws, RetxCause::Loss),
-                RetxRequest::Queued
-            );
-            e.tick(t0, usize::MAX);
-            book(&mut e, &mut l);
-        }
+        let mut t = lost_n_times(&mut e, &mut l, key, LOSS_RETX_MAX_ATTEMPTS, t0);
         let ws = e.cache.get(&key).unwrap().latest_ws;
         l.declare_lost_by_pto(ws).expect("outstanding");
         assert_eq!(
@@ -274,14 +309,136 @@ mod deferred_tests {
         assert_eq!(
             l.newest_outstanding(8, 8).len(),
             0,
-            "premise: nothing outstanding"
+            "premise: nothing outstanding for the probe to find"
         );
+        let sent_at = e.cache.get(&key).unwrap().last_sent_at;
+        let first_interval = pto_for_attempt(&e.rtt, LOSS_RETX_MAX_ATTEMPTS);
+        let due = e.next_deferred_due().expect("deferred");
+        assert_eq!(due, sent_at + first_interval);
 
-        let due = e.pto_deadline().expect("running");
-        let out = probe(&mut l, &mut e, due).expect("due");
-        assert_eq!(out.retx_queued, 1, "the probe resends the deferred pass");
+        // Acknowledgements of other traffic keep arriving every 10 ms: the
+        // connection's probe timer, which restarts at each, never expires.
+        let mut probe_fired = false;
+        let mut queued_at = None;
+        while t < due + Duration::from_millis(50) {
+            t += Duration::from_millis(10);
+            e.note_ack(t);
+            if e.pto_due(t) {
+                probe_fired = true;
+            }
+            let out = detect(&mut l, &mut e, t);
+            if out.retx_queued > 0 && queued_at.is_none() {
+                queued_at = Some(t);
+            }
+        }
+        assert!(
+            !probe_fired,
+            "premise: acknowledgements kept the probe quiet"
+        );
+        let queued_at = queued_at.expect("the deferred pass was resent");
+        assert!(
+            queued_at >= due && queued_at < due + Duration::from_millis(20),
+            "at its deadline ({due:?}), not before or long after: {queued_at:?}"
+        );
+        // Sent, and lost again: the next deferral backs off.
+        e.tick(queued_at, usize::MAX);
+        book(&mut e, &mut l, queued_at);
+        let ws = e.cache.get(&key).unwrap().latest_ws;
+        l.declare_lost_by_pto(ws).expect("outstanding");
+        assert_eq!(
+            e.request_retransmit(key, ws, RetxCause::Loss),
+            RetxRequest::Deferred
+        );
+        let second_interval = e.next_deferred_due().unwrap() - queued_at;
+        assert!(
+            second_interval > first_interval,
+            "{first_interval:?} then {second_interval:?}"
+        );
+    }
+
+    /// A client asking for a pass again says nothing about the path losing it:
+    /// NACK repairs do not use up the loss path's allowance.
+    #[test]
+    fn nack_repairs_do_not_count_toward_giving_up_on_verdicts() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.rtt.on_sample(Duration::from_millis(40));
+        let mut l = TransmissionLedger::new(256);
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, pass(1), t0, None, t0);
+        book(&mut e, &mut l, t0);
+        for _ in 0..LOSS_RETX_MAX_ATTEMPTS + 2 {
+            e.on_nack(&[key], t0);
+            let mut n = 0;
+            e.tick_nacks_budgeted(t0, usize::MAX, usize::MAX, &mut n);
+            book(&mut e, &mut l, t0);
+        }
+        assert!(e.cache.get(&key).unwrap().attempts > LOSS_RETX_MAX_ATTEMPTS);
+        let ws = e.cache.get(&key).unwrap().latest_ws;
+        assert_eq!(
+            e.request_retransmit(key, ws, RetxCause::Loss),
+            RetxRequest::Queued,
+            "five NACK repairs, no loss-path resend: a verdict still resends"
+        );
+    }
+
+    /// The entry names the transmission judged. If anything resends the pass
+    /// first, the entry is moot and dropped.
+    #[test]
+    fn a_deferred_entry_is_dropped_when_the_pass_has_been_resent_or_acknowledged() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.rtt.on_sample(Duration::from_millis(40));
+        let mut l = TransmissionLedger::new(256);
+        let defer = |e: &mut ReliableTileEmitter, l: &mut TransmissionLedger, k: EmitKey| {
+            let t = lost_n_times(e, l, k, LOSS_RETX_MAX_ATTEMPTS, t0);
+            let ws = e.cache.get(&k).unwrap().latest_ws;
+            l.declare_lost_by_pto(ws).unwrap();
+            assert_eq!(
+                e.request_retransmit(k, ws, RetxCause::Loss),
+                RetxRequest::Deferred
+            );
+            t
+        };
+        let a = EmitKey::new(1, 0, 0, 0);
+        let b = EmitKey::new(2, 1, 0, 0);
+        let c = EmitKey::new(3, 2, 0, 0);
+        let t = defer(&mut e, &mut l, a);
+        defer(&mut e, &mut l, b);
+        defer(&mut e, &mut l, c);
+        assert_eq!(e.deferred_len(), 3);
+        // a is repaired on the client's request, b is acknowledged, c waits.
+        e.on_nack(&[a], t);
         let mut n = 0;
-        e.tick_loss_budgeted(due, usize::MAX, usize::MAX, &mut n);
-        assert_eq!(e.stats.pto_probe_retransmits, 1);
+        e.tick_nacks_budgeted(t, usize::MAX, usize::MAX, &mut n);
+        e.on_ack(&[b]);
+        assert_eq!(e.deferred_len(), 2, "an acknowledgement removes its entry");
+        let far = t + Duration::from_secs(60);
+        let due = e.take_due_deferred(far, 8);
+        assert_eq!(
+            due.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            vec![c],
+            "a was resent since the verdict, b is acknowledged"
+        );
+        assert_eq!(e.deferred_len(), 0, "and the moot one is gone");
+    }
+
+    /// Bounded: past the cap a new pass is not tracked (it has the 30 s
+    /// backstop) and the overflow is counted.
+    #[test]
+    fn the_deferred_list_is_bounded() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.rtt.on_sample(Duration::from_millis(40));
+        let mut l = TransmissionLedger::new(8192);
+        for i in 0..DEFERRED_CAP as u32 + 5 {
+            let k = EmitKey::new(i, (i % 200) as u8, (i / 200) as u8, 0);
+            lost_n_times(&mut e, &mut l, k, LOSS_RETX_MAX_ATTEMPTS, t0);
+            let ws = e.cache.get(&k).unwrap().latest_ws;
+            let _ = l.declare_lost_by_pto(ws);
+            let _ = e.request_retransmit(k, ws, RetxCause::Loss);
+        }
+        assert_eq!(e.deferred_len(), DEFERRED_CAP);
+        assert_eq!(e.stats.deferred_overflow, 5);
     }
 }
