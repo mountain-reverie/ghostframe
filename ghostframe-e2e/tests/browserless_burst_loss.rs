@@ -1353,12 +1353,17 @@ async fn p5_a_lost_only_datagram_on_a_static_screen_is_repaired_by_the_probe_on_
     );
 }
 
-/// The probe is a wake deadline, at scene level: one Solid tile, its only
-/// datagram dropped, a static screen and a harness heartbeat only every three
-/// seconds. The repair must land one PTO plus a round trip after the send
-/// (1004 + 40 ms), not at the next heartbeat. Without `pto` in
-/// `next_wake_deadline` the event loop sleeps until the heartbeat (the
-/// mutation recorded in the PR) and the repair slips to about three seconds.
+/// The probe timeout at scene level: one Solid tile, its only datagram dropped,
+/// a static screen and a harness heartbeat only every three seconds. The repair
+/// must land one PTO plus a round trip after the send (about 1.03 s).
+///
+/// This does NOT guard the `pto` term of `next_wake_deadline`. Measured with
+/// the term removed: the repair lands at 1.045 s instead of 1.029 s, inside
+/// the asserted window, because quinn's own timers keep waking the loop about
+/// then. It guards the probe itself (it fires, once, on time, and repairs). The
+/// wake term is guarded by the unit tests in `io_bridge/tests.rs`; for the time
+/// rule see `p5_wake_the_time_rule_fires_on_time_when_nothing_else_wakes_the_loop`,
+/// which does bite.
 #[tokio::test(start_paused = true)]
 async fn p5_wake_the_probe_fires_on_time_when_nothing_else_wakes_the_loop() {
     let mut sc = scene(0xB0_B057, 8);
@@ -1400,6 +1405,106 @@ async fn p5_wake_the_probe_fires_on_time_when_nothing_else_wakes_the_loop() {
          heartbeat 3 s",
         r.queued_critical_latency_mean_us
     );
+}
+
+/// The time rule of loss detection is a wake deadline, at scene level: two
+/// Solid tiles in one frame, the first one's datagram dropped, the second one
+/// delivered, a static screen and a harness heartbeat only every three seconds.
+/// The delivered tile's acknowledgement puts the hole behind the newest
+/// acknowledged departure, but with one departure behind it the packet rule
+/// (three) cannot declare it. Only the time rule can, 9/8 of a round trip after
+/// the hole's departure: that is the `loss_time` term of `next_wake_deadline`.
+///
+/// What this can and cannot show. Quinn's own timers keep the loop waking about
+/// a round trip after the last acknowledgement, so without the term the hole is
+/// still declared, just at the next such waking: later by about a sixth of a
+/// round trip (measured 57 ms at a 300 ms round trip, 16 ms at 20 ms), not by
+/// seconds. Nothing in the harness can silence quinn's timers, so the scene
+/// cannot show a stranded repair, only a late one. The property is therefore a
+/// tight one, derived from the rule: the repair is acknowledged within the time
+/// threshold (9/8 of the round trip) plus one round trip of the send, and the
+/// loop may overshoot that by at most a tenth of a round trip. The round trip is
+/// the one the delivered tile measured (its acknowledgement latency).
+///
+/// The scene is a single frame on a perfect link, so it has no chaos; three
+/// seeds are run for the record.
+#[tokio::test(start_paused = true)]
+async fn p5_wake_the_time_rule_fires_on_time_when_nothing_else_wakes_the_loop() {
+    for seed in [0xB0_B057u64, 0xB0_B057 ^ 1, 0xB0_B057 ^ 2] {
+        let mut sc = scene(seed, 8);
+        // A long round trip (300 ms) so that a late waking is many
+        // milliseconds, not a rounding error.
+        sc.net.delay_us = 150_000;
+        sc.cadence_us = 3_000_000;
+        sc.load = SceneLoad::Script(vec![FrameScript {
+            tiles: vec![
+                (
+                    (1, 1),
+                    TileSpec::Solid {
+                        bgra: [10, 20, 30, 255],
+                    },
+                ),
+                (
+                    (2, 1),
+                    TileSpec::Solid {
+                        bgra: [40, 50, 60, 255],
+                    },
+                ),
+            ],
+        }]);
+        sc.drops = DropPlan::new(vec![DropRule {
+            tile_x: 1,
+            tile_y: 1,
+            occurrences: vec![0],
+        }]);
+        let r = run_browserless_with_links(sc, LinkOverrides::default())
+            .await
+            .expect("scene ran");
+        let i = &r.transport.instr;
+        println!(
+            "P5TIMERULE seed={seed:#x} drops_fired={:?} probe_retx={} losses_declared={} \
+             loss_resends={} lat_max_us={} lat_mean_us={} lat_count={}",
+            r.drops_fired,
+            i.pto_probe_retransmits,
+            i.ledger_losses_declared,
+            r.retransmit_attempts_total,
+            r.queued_critical_latency_max_us,
+            r.queued_critical_latency_mean_us,
+            r.queued_critical_latency_count
+        );
+        assert_eq!(
+            r.drops_fired,
+            vec![1],
+            "premise: only the first datagram was dropped"
+        );
+        assert!(
+            r.framebuffer.tile_rgba(2, 1).is_some(),
+            "premise: delivered"
+        );
+        assert!(r.framebuffer.tile_rgba(1, 1).is_some(), "never repaired");
+        assert!(
+            r.retransmit_attempts_total >= 1 && i.ledger_losses_declared >= 1,
+            "premise: the loss path declared the hole and resent"
+        );
+        assert_eq!(i.pto_probe_retransmits, 0, "the probe did not repair it");
+        assert_eq!(
+            r.queued_critical_latency_count, 2,
+            "premise: two tiles timed"
+        );
+        // Two samples: the delivered tile's (one round trip) and the repaired
+        // one's (the longer).
+        let rtt = 2 * r.queued_critical_latency_mean_us - r.queued_critical_latency_max_us;
+        let due = rtt * 9 / 8 + rtt;
+        let slack = rtt / 10;
+        assert!(
+            r.queued_critical_latency_max_us <= due + slack,
+            "seed {seed:#x}: the repair was acknowledged {} us after its send; the time rule is \
+             due {} us after it (9/8 x {rtt} us + {rtt} us), and the loop may overshoot by {} us",
+            r.queued_critical_latency_max_us,
+            due,
+            slack
+        );
+    }
 }
 
 /// Seed 0x22 under PR-9's suspicion (a missing wake term strands tiles): the
