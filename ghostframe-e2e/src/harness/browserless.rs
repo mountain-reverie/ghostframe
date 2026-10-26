@@ -227,6 +227,11 @@ pub struct RunOptions {
     /// production. Off by default, like the product, so a scene that does not
     /// ask for it sees no parity datagram.
     pub tile_fec: bool,
+    /// Who owns the send rate. `None` follows `GHOSTFRAME_CC` (default
+    /// Cubic), so any scene can be run under either arm with the variable.
+    pub congestion: Option<ghostframe_lib::config::CongestionMode>,
+    /// The model controller's settings. `None` follows `GHOSTFRAME_CC_*`.
+    pub model: Option<ghostframe_lib::config::ModelSettings>,
     /// How the server's event loop is driven. See [`HarnessMode`].
     pub mode: HarnessMode,
     /// The client offers no hybrid post-quantum group, so the handshake
@@ -390,6 +395,12 @@ pub struct BrowserlessResult {
     /// divergence between two runs.
     pub wire_trace: WireTrace,
     pub s2c_loss_run_max: u64,
+    /// `(offered_us, transit_us)` for every server -> client datagram the
+    /// netsim delivered: the time from the server handing it to the link to
+    /// its arrival, so propagation delay plus the bottleneck's queue wait.
+    /// Subtract `NetProfile::delay_us` for the queue. Dropped datagrams have
+    /// no entry. Bounded at 2 M entries.
+    pub s2c_transit_samples: Vec<(u64, u64)>,
     /// Read from `FrameBuffer::stale_frame_tiles()` — a scene run only
     /// ever ingests via `FrameBuffer::apply_tile_ready` (real decoded
     /// `TileReady` events), never `FrameBuffer::apply`, so the `frame_seq`
@@ -598,7 +609,13 @@ struct S2cLoss {
     runs: u64,
     run_max: u64,
     cur_run: u64,
+    /// `(offered_us, transit_us)` of every delivered server -> client copy,
+    /// capped at `MAX_TRANSIT_SAMPLES`. See `BrowserlessResult::s2c_transit_samples`.
+    transit: Vec<(u64, u64)>,
 }
+
+/// Bound on `S2cLoss::transit`: 16 B each, so 32 MB at the cap.
+const MAX_TRANSIT_SAMPLES: usize = 2_000_000;
 
 /// Running hash of the scene's wire traffic: for every datagram offered to the
 /// netsim, its direction, the instant it was offered, its length, and what the
@@ -996,6 +1013,14 @@ async fn run_inner(
     bridge.set_drop_plan(drop_plan_cell.clone());
     bridge.set_ignore_tile_nacks(opts.ignore_client_nacks);
     bridge.set_tile_fec(opts.tile_fec);
+    let env_transport = ghostframe_lib::config::TransportConfig::from_env();
+    if opts
+        .congestion
+        .unwrap_or(env_transport.congestion)
+        == ghostframe_lib::config::CongestionMode::Model
+    {
+        bridge.use_model_controller_for_test(opts.model.unwrap_or(env_transport.model));
+    }
     if let Some(floor) = scene.tick_budget_floor_bytes {
         bridge.set_tick_budget_floor_bytes(floor);
     }
@@ -1164,6 +1189,7 @@ async fn run_inner(
         wire_datagrams: s2c_loss.wire.datagrams,
         wire_trace: std::mem::take(&mut s2c_loss.wire).into_trace(),
         s2c_loss_run_max: s2c_loss.run_max,
+        s2c_transit_samples: std::mem::take(&mut s2c_loss.transit),
         stale_generation_tiles,
         seed,
         bwe_estimate_bps: bwe_snapshot.bitrate_bps,
@@ -1392,6 +1418,9 @@ async fn drive_session(
             // `rule` returns nothing exactly for `Verdict::Drop`.
             s2c_loss.record(items.is_empty());
             for item in items {
+                if s2c_loss.transit.len() < MAX_TRANSIT_SAMPLES {
+                    s2c_loss.transit.push((t, item.at_us.saturating_sub(t)));
+                }
                 if item.at_us <= t {
                     // Its own arrival instant, for the same reason as in
                     // `flush_due`. Equal to `t` at zero delay, earlier than it
