@@ -312,6 +312,13 @@ impl IoBridge {
         self.ignore_tile_nacks = ignore;
     }
 
+    /// Opt this bridge's emitter in to tile XOR parity (off by default; see
+    /// `TransportConfig::tile_fec`). Call before the first datagram is built.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn set_tile_fec(&mut self, on: bool) {
+        self.reliable_emitter.set_tile_fec(on);
+    }
+
     /// Clone of the `Arc` behind `emitter_stats_publish`, for a caller that
     /// is about to move `self` into a `spawn_local`'d task and needs a way
     /// to read the reliable-emitter counters back out afterwards. See

@@ -372,9 +372,19 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
         i.window_us
     );
     // Offered load against quinn: every byte billed, none twice.
-    for c in [W::Critical, W::Refinement, W::Parity, W::Control] {
+    for c in [W::Critical, W::Refinement, W::Control] {
         assert!(i.offered.of(c) > 0, "{n}: {c:?} never billed");
     }
+    // Tile parity is off by default (C3-3): none may be billed. That every
+    // other class is billed above, and that an opted-in run does bill parity
+    // (`tile_fec_is_billed_only_when_opted_in`), is what makes this zero mean
+    // something.
+    assert_eq!(
+        i.offered.of(W::Parity),
+        0,
+        "{n}: tile parity billed on a default run (WireClass::Parity also counts H.264 parity, \
+         which these scenes never send)"
+    );
     assert!(i.offered.overhead > 0, "{n}: no framing overhead billed");
     assert_eq!(
         i.offered.total(),
@@ -473,6 +483,66 @@ fn assert_established(name: &str, r: &BrowserlessResult) {
         "{name}: session never established"
     );
     assert!(r.s2c_datagrams_offered > 0, "{name}: no s2c traffic at all");
+}
+
+/// C3-3: tile parity is billed, sent and consumed only when asked for. The
+/// same lossy scene is run both ways, so a zero on the default run cannot be a
+/// scene too short or too clean to complete a parity group, and the opted-in
+/// run proves the whole path (emitter, wire, client decoder) is still alive.
+#[tokio::test(start_paused = true)]
+async fn tile_fec_is_billed_only_when_opted_in() {
+    use ghostframe_lib::transport::reliable_emitter::emission_queue::WireClass as W;
+    let run = |fec: bool| async move {
+        run_browserless_with_options(
+            scene(0xB0_B057, 8),
+            s2c_only(|p| p.loss = RATE),
+            RunOptions {
+                tile_fec: fec,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("scene ran")
+    };
+    let on = run(true).await;
+    let off = run(false).await;
+    for (n, r) in [("tile_fec on", &on), ("tile_fec off", &off)] {
+        assert_established(n, r);
+        assert!(
+            r.s2c_datagrams_dropped > 0,
+            "{n}: premise: the scene lost nothing"
+        );
+    }
+    println!(
+        "C33 on: parity_B={} client_recovered={} s2c_bytes={} | off: parity_B={} client_recovered={} s2c_bytes={}",
+        on.transport.instr.offered.of(W::Parity),
+        on.client_wire_loss.recovered,
+        on.bytes_delivered_s2c,
+        off.transport.instr.offered.of(W::Parity),
+        off.client_wire_loss.recovered,
+        off.bytes_delivered_s2c,
+    );
+    assert!(
+        on.transport.instr.offered.of(W::Parity) > 0,
+        "opted in, no parity was billed"
+    );
+    assert_eq!(
+        off.transport.instr.offered.of(W::Parity),
+        0,
+        "default: tile parity billed (these scenes send no H.264 parity)"
+    );
+    assert!(
+        on.client_wire_loss.recovered > 0,
+        "opted in, the client rebuilt nothing from parity: the decoder path is not proven"
+    );
+    assert_eq!(
+        off.client_wire_loss.recovered, 0,
+        "default: the client rebuilt a datagram from parity that was never sent"
+    );
+    assert_eq!(
+        off.transport.instr.late_acks_fec_possible, 0,
+        "default: a late ack was taken for a parity recovery with no parity sent"
+    );
 }
 
 #[tokio::test(start_paused = true)]
