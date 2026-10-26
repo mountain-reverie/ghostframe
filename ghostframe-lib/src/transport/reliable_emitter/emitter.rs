@@ -6,7 +6,7 @@ use crate::transport::protocol::TileParityEnvelope;
 use crate::transport::reliable_emitter::cache::{CacheEntry, ProbeTag, RetransmitCache};
 use crate::transport::reliable_emitter::emission_queue::{Emission, EmissionQueue, WireClass};
 use crate::transport::reliable_emitter::parity::GroupBuilder;
-use crate::transport::reliable_emitter::rto::pto_for_attempt;
+use crate::transport::reliable_emitter::pto::pto_for_attempt;
 use crate::transport::reliable_emitter::traits::{DatagramSender, SendOutcome};
 use crate::transport::reliable_emitter::wire_seq::WireSeqAllocator;
 use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K, PARITY_INTERLEAVE_OFFSET};
@@ -724,13 +724,13 @@ impl ReliableTileEmitter {
     ) -> usize {
         let mut count = 0;
         let nacks = self.tick_nacks_budgeted(now, max_retransmits, max_bytes, &mut count);
-        let rto = self.tick_loss_budgeted(
+        let loss = self.tick_loss_budgeted(
             now,
             max_retransmits,
             max_bytes.saturating_sub(nacks),
             &mut count,
         );
-        nacks + rto
+        nacks + loss
     }
 
     /// The first half of [`Self::tick_budgeted`]: the retransmissions the
@@ -942,7 +942,7 @@ impl ReliableTileEmitter {
                 self.feed_group(ws, bytes.clone());
             }
             spent += bytes.len() + self.wire_overhead;
-            self.queue.push_source(bytes, WireClass::RtoRetransmit);
+            self.queue.push_source(bytes, WireClass::LossRetransmit);
             self.stats.loss_path_resends += 1;
             match cause {
                 RetxCause::Loss => self.stats.loss_retransmits += 1,
@@ -1736,7 +1736,7 @@ mod tests {
     }
 
     #[test]
-    fn an_rto_for_a_generation_the_tile_has_left_is_counted_apart() {
+    fn a_resend_for_a_generation_the_tile_has_left_is_counted_apart() {
         let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
@@ -1818,7 +1818,7 @@ mod tests {
     }
 
     #[test]
-    fn an_ack_for_the_original_after_an_rto_is_a_spurious_fire() {
+    fn an_ack_for_the_original_after_a_resend_is_a_spurious_fire() {
         let (mut e, key) = loss_path_resend_once();
         e.note_ack_origin(key, 0);
         assert_eq!(
@@ -1926,7 +1926,7 @@ mod tests {
     }
 
     #[test]
-    fn the_rto_bookkeeping_is_bounded_and_counts_its_resets() {
+    fn the_resend_bookkeeping_is_bounded_and_counts_its_resets() {
         let mut e = ReliableTileEmitter::new(Instant::now());
         for i in 0..(RESEND_ORIGIN_CAP as u32 + 5) {
             e.note_loss_path_resend(EmitKey::new(i, 0, 0, 0), Some(i), false);
@@ -1940,7 +1940,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_cache_forgets_rto_history() {
+    fn clear_cache_forgets_resend_history() {
         let (mut e, key) = loss_path_resend_once();
         e.clear_cache();
         e.note_ack_origin(key, 0);
@@ -2061,7 +2061,7 @@ mod tests {
             WireClass::Critical,
             WireClass::Refinement,
             WireClass::NackRepair,
-            WireClass::RtoRetransmit,
+            WireClass::LossRetransmit,
             WireClass::Parity,
         ] {
             assert!(offered.of(class) > 0, "{class:?} never billed");
@@ -2086,7 +2086,7 @@ mod tests {
             e.stats.retransmit_by_nack * src
         );
         assert_eq!(
-            offered.of(WireClass::RtoRetransmit),
+            offered.of(WireClass::LossRetransmit),
             e.stats.loss_path_resends * src
         );
         assert_eq!(
@@ -2130,7 +2130,7 @@ mod tests {
     /// exactly when retransmits are many.
     #[test]
     fn the_retransmit_fingerprint_is_only_computed_when_traced() {
-        fn one_rto_retransmit() {
+        fn one_loss_retransmit() {
             let mut e = ReliableTileEmitter::new(Instant::now());
             let mut sender = CollectSender::default();
             let t0 = Instant::now();
@@ -2150,7 +2150,7 @@ mod tests {
         // Nobody listening: no fingerprint.
         FP_COMPUTED.with(|c| c.set(0));
         tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
-            one_rto_retransmit()
+            one_loss_retransmit()
         });
         assert_eq!(FP_COMPUTED.with(|c| c.get()), 0);
 
@@ -2177,7 +2177,7 @@ mod tests {
             .with_max_level(tracing::Level::TRACE)
             .with_writer(sink.clone())
             .finish();
-        tracing::subscriber::with_default(sub, one_rto_retransmit);
+        tracing::subscriber::with_default(sub, one_loss_retransmit);
         assert_eq!(FP_COMPUTED.with(|c| c.get()), 1);
         let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
         assert!(out.contains("[H3-SRV] retransmit"), "got: {out}");

@@ -296,7 +296,7 @@ impl Scheduler {
     ///
     /// The caller now passes the reliable emitter's own first-attempt
     /// deadline, the probe timeout of its RTT estimator
-    /// (`rto::pto_for_attempt`). That estimator's samples are application
+    /// (`pto::pto_for_attempt`). That estimator's samples are application
     /// acknowledgements, so they include the client's batching delay and event
     /// loop, which the transport RTT does not: the deadline sits above a frame
     /// wherever the batching does, without a fitted floor. Until the first

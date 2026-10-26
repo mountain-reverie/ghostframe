@@ -2276,7 +2276,7 @@ impl IoBridge {
                 refinement_latency_max_us = self.refinement_latency_stats.max_us,
                 refinement_latency_buckets = ?self.refinement_latency_stats.buckets,
                 // The retransmission deadline's inputs and output (RFC 9002
-                // estimator, `rto::pto_for_attempt`): smoothed RTT, its
+                // estimator, `pto::pto_for_attempt`): smoothed RTT, its
                 // variance and the minimum, all from departure-based
                 // samples, and the first-attempt probe timeout they give.
                 // `rto_ack_latency_p95_us` is the old enqueue -> ACK p95,
@@ -2296,7 +2296,7 @@ impl IoBridge {
                     .p95()
                     .map(|d| d.as_micros() as i64)
                     .unwrap_or(-1),
-                rto_first_attempt_deadline_us = self.reliable_emitter.pto().as_micros() as u64,
+                pto_us = self.reliable_emitter.pto().as_micros() as u64,
                 // BWE Stage 2.1: same population, measured from
                 // `queued_at` (when the work became available to
                 // the scheduler) instead of `last_sent_at`. This is
@@ -2361,7 +2361,7 @@ impl IoBridge {
                 offered_critical_B = ins.offered.of(WireClass::Critical),
                 offered_refinement_B = ins.offered.of(WireClass::Refinement),
                 offered_nack_repair_B = ins.offered.of(WireClass::NackRepair),
-                offered_rto_retransmit_B = ins.offered.of(WireClass::RtoRetransmit),
+                offered_loss_retransmit_B = ins.offered.of(WireClass::LossRetransmit),
                 offered_scheduler_retry_B = ins.offered.of(WireClass::SchedulerRetry),
                 offered_parity_B = ins.offered.of(WireClass::Parity),
                 offered_h264_B = ins.offered.of(WireClass::H264),

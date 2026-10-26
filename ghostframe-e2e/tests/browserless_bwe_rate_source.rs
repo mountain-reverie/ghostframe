@@ -236,7 +236,7 @@ fn report_transport(scene: &str, r: &BrowserlessResult) {
     );
     p6(
         scene,
-        "rto",
+        "loss_path",
         format!(
             "fired={} spurious={} useful={}",
             r.loss_path_resends, r.loss_path_resends_spurious, r.loss_path_resends_useful

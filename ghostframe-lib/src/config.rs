@@ -621,10 +621,10 @@ impl LibConfig {
 /// Reliable-emitter retransmission-timer knob: the backoff ceiling.
 ///
 /// The deadline itself is measured, not configured: an RFC 9002 probe timeout
-/// from the departure-based RTT estimator (`rto::pto_for_attempt`). The
+/// from the departure-based RTT estimator (`pto::pto_for_attempt`). The
 /// `ACK_DEADLINE_FLOOR/COLD_START/CEILING` constants and their environment
 /// overrides went with the p95 x 2 formula they bounded. The default is the
-/// compiled-in constant in `transport/reliable_emitter/rto.rs`, so an unset
+/// compiled-in constant in `transport/reliable_emitter/pto.rs`, so an unset
 /// environment changes nothing.
 ///
 /// `pto_for_attempt` reads the process-wide copy returned by
@@ -643,9 +643,9 @@ pub struct EmitterConfig {
 
 impl Default for EmitterConfig {
     fn default() -> Self {
-        use crate::transport::reliable_emitter::rto;
+        use crate::transport::reliable_emitter::pto;
         Self {
-            rto_backoff_max: rto::RTO_BACKOFF_MAX,
+            rto_backoff_max: pto::RTO_BACKOFF_MAX,
         }
     }
 }

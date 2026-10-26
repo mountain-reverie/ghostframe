@@ -25,7 +25,7 @@ pub enum WireClass {
     /// A retransmission the client asked for.
     NackRepair,
     /// A retransmission the emitter's RTO timer fired.
-    RtoRetransmit,
+    LossRetransmit,
     /// The scheduler re-sent a pass it had in flight and nothing else was
     /// holding (`Scheduler::drain_priority_queue`'s fallback retry). It goes
     /// through `submit_one` like a first send, so it is labelled here.
@@ -45,7 +45,7 @@ impl WireClass {
         WireClass::Critical,
         WireClass::Refinement,
         WireClass::NackRepair,
-        WireClass::RtoRetransmit,
+        WireClass::LossRetransmit,
         WireClass::SchedulerRetry,
         WireClass::Parity,
         WireClass::H264,

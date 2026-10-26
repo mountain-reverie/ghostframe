@@ -108,7 +108,7 @@ pub use crate::harness::load_profile::PRODUCTION_CADENCE_US as DEFAULT_CADENCE_U
 // noticed on a turn, and a heartbeat is such a turn. It used to be a fixed
 // 100ms, three times coarser than the 33ms production cadence, so those
 // checks ran up to 100ms late (a probe timeout is now RTT-derived, see
-// `reliable_emitter::rto::pto_for_attempt`, and can be well under 100ms).
+// `reliable_emitter::pto::pto_for_attempt`, and can be well under 100ms).
 //
 // The cost is `scene.duration / cadence_us` outer-loop iterations for the
 // tail of a scripted scene instead of a third as many. The no-progress guard

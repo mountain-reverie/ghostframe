@@ -156,7 +156,7 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
     println!(
         "D1INSTR {name}: window_ms={} fifo_samples={} fifo_max_B={} fifo_peak_at_enqueue_B={} \
          fifo_mean_B={} fifo_slope_last_quarter_Bps={} quinn_limited[turns={:.3} time={:.3}] \
-         offered_Bps[crit={:.0} refine={:.0} nack={:.0} rto={:.0} sched_retry={:.0} parity={:.0} h264={:.0} \
+         offered_Bps[crit={:.0} refine={:.0} nack={:.0} loss={:.0} sched_retry={:.0} parity={:.0} h264={:.0} \
          control={:.0} overhead={:.0}] offered_total_B={} quinn_enqueued_B={} \
          quinn_departed_Bps={:.0} lag_us[n={} p50={} p95={} max={}] mirror_len={} \
          mirror_overflowed={} budget_passes[cwnd={} pacer={} floor={} probe={}] gate_stops[depth={} tokens={} rejected={}] \
@@ -181,7 +181,7 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
         i.per_second(i.offered.of(W::Critical)),
         i.per_second(i.offered.of(W::Refinement)),
         i.per_second(i.offered.of(W::NackRepair)),
-        i.per_second(i.offered.of(W::RtoRetransmit)),
+        i.per_second(i.offered.of(W::LossRetransmit)),
         i.per_second(i.offered.of(W::SchedulerRetry)),
         i.per_second(i.offered.of(W::Parity)),
         i.per_second(i.offered.of(W::H264)),
@@ -378,7 +378,7 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
         "{n}: ECN transmits not observed"
     );
     if lossy {
-        for c in [W::NackRepair, W::RtoRetransmit] {
+        for c in [W::NackRepair, W::LossRetransmit] {
             assert!(i.offered.of(c) > 0, "{n}: {c:?} never billed under loss");
         }
         assert!(i.ledger_losses_declared > 0, "{n}: no ledger loss");
@@ -546,7 +546,7 @@ async fn iid_versus_burst_loss_at_equal_average_rate() {
         // 13,760 of 21,256 (iid) before admission, fires for datagrams still
         // queued behind a 2 MB FIFO; with the FIFO bounded there are none to
         // count, and the counter is exercised by the lib tests
-        // (`an_ack_for_the_original_after_an_rto_is_a_spurious_fire`).
+        // (`an_ack_for_the_original_after_a_resend_is_a_spurious_fire`).
         assert!(
             r.loss_path_resends_useful > 0,
             "{n}: {} RTO fires, none useful",
@@ -623,7 +623,7 @@ async fn burst_loss_report_over_three_seeds() {
                 b.ceiling_reseeds_skipped_gap
             );
             println!(
-                "LATENCY {name}: critical n={} mean_us={} max_us={} refinement n={} mean_us={} max_us={} retx_B[nack={} rto={}] loss_path_resends_original_first={}",
+                "LATENCY {name}: critical n={} mean_us={} max_us={} refinement n={} mean_us={} max_us={} retx_B[nack={} loss={}] loss_path_resends_original_first={}",
                 r.critical_latency_count,
                 r.critical_latency_mean_us,
                 r.critical_latency_max_us,
@@ -634,7 +634,7 @@ async fn burst_loss_report_over_three_seeds() {
                     ghostframe_lib::transport::reliable_emitter::emission_queue::WireClass::NackRepair
                 ),
                 r.transport.instr.offered.of(
-                    ghostframe_lib::transport::reliable_emitter::emission_queue::WireClass::RtoRetransmit
+                    ghostframe_lib::transport::reliable_emitter::emission_queue::WireClass::LossRetransmit
                 ),
                 r.loss_path_resends_original_first,
             );
@@ -925,7 +925,7 @@ async fn p2b_quinn_is_never_left_idle_while_admission_holds_work() {
 /// Premises, asserted: each run resends at least 50 times (a share of nothing is
 /// not a share), the session carried load, the netsim dropped something.
 #[tokio::test(start_paused = true)]
-async fn p4_spurious_share_of_rto_fires_under_iid_loss() {
+async fn p4_spurious_share_of_loss_path_resends_under_iid_loss() {
     const SECS: u64 = 12;
     let (mut fired, mut original_first) = (0u64, 0u64);
     for i in 0..5u64 {
@@ -1073,7 +1073,7 @@ const TAIL_N: u32 = 9;
 /// Mutation: with `GHOSTFRAME_NO_RTO=1` the tile stays `partial` for the whole
 /// scene (see the PR body for the output).
 #[tokio::test(start_paused = true)]
-async fn a_lost_final_pass_is_repaired_by_the_rto_since_the_sweep_has_no_evidence() {
+async fn a_lost_final_pass_is_repaired_by_the_loss_path_since_the_sweep_has_no_evidence() {
     let probe =
         run_browserless_with_links(tail_scene(0xB0_B057, TAIL_N, 6), LinkOverrides::default())
             .await

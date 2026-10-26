@@ -531,7 +531,7 @@ async fn bwe_estimator_is_fed_and_epoch_consistent() {
 /// guards lives entirely in the gap between that and a real path.
 ///
 /// (Since D1 F4 the deadline is an RFC 9002 probe timeout from the
-/// departure-based RTT estimator, `rto::pto_for_attempt`; the p95 x 2 formula
+/// departure-based RTT estimator, `pto::pto_for_attempt`; the p95 x 2 formula
 /// and its 150 ms floor described below are gone. The history stays because
 /// the failure modes it lists are still the ones to rule out.)
 ///
@@ -676,7 +676,7 @@ async fn a_lossless_link_with_a_real_rtt_does_not_retransmit() {
          racing a fixed constant instead of tracking measured latency. \
          Diagnose with GHOSTFRAME_RTO_PROBE=1 and look at the `attempts=` \
          and `rto_us=` distribution, and at the `rto_ack_latency_p95_us` / \
-         `rto_first_attempt_deadline_us` fields on the `cumulative emit` log \
+         `pto_us` fields on the `cumulative emit` log \
          line.",
         (ONE_WAY_US * 2) / 1000,
         r.retransmit_attempts_total

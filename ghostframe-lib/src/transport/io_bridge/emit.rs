@@ -39,7 +39,7 @@ impl IoBridge {
                     let wire = bytes.len() + self.live_framing_len();
                     let admit_class = match class {
                         WireClass::NackRepair => AdmitClass::NackRepair,
-                        WireClass::RtoRetransmit => AdmitClass::Retransmit,
+                        WireClass::LossRetransmit => AdmitClass::Retransmit,
                         WireClass::Parity => AdmitClass::Parity,
                         WireClass::Refinement => AdmitClass::Refinement,
                         // First sends and the scheduler's own retry are the
