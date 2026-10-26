@@ -1401,7 +1401,7 @@ async fn p5_wake_the_probe_fires_on_time_when_nothing_else_wakes_the_loop() {
     assert_eq!(r.transport.instr.pto_probe_retransmits, 1);
     assert!(
         (1_000_000..1_300_000).contains(&r.queued_critical_latency_mean_us),
-        "repaired {} us after the send: the PTO plus a round trip is about 1.05 s, the next \
+        "repaired {} us after the send: the PTO plus a round trip is about 1.03 s, the next \
          heartbeat 3 s",
         r.queued_critical_latency_mean_us
     );
@@ -1463,11 +1463,14 @@ async fn p5_wake_the_time_rule_fires_on_time_when_nothing_else_wakes_the_loop() 
         let i = &r.transport.instr;
         println!(
             "P5TIMERULE seed={seed:#x} drops_fired={:?} probe_retx={} losses_declared={} \
-             loss_resends={} lat_max_us={} lat_mean_us={} lat_count={}",
+             loss_path_resends={} by_nack={} time_rule={} packet_rule={} lat_max_us={} lat_mean_us={} lat_count={}",
             r.drops_fired,
             i.pto_probe_retransmits,
             i.ledger_losses_declared,
-            r.retransmit_attempts_total,
+            r.loss_path_resends,
+            r.retransmit_by_nack,
+            i.ledger_lost_time_threshold,
+            i.ledger_lost_packet_threshold,
             r.queued_critical_latency_max_us,
             r.queued_critical_latency_mean_us,
             r.queued_critical_latency_count
@@ -1483,8 +1486,14 @@ async fn p5_wake_the_time_rule_fires_on_time_when_nothing_else_wakes_the_loop() 
         );
         assert!(r.framebuffer.tile_rgba(1, 1).is_some(), "never repaired");
         assert!(
-            r.retransmit_attempts_total >= 1 && i.ledger_losses_declared >= 1,
-            "premise: the loss path declared the hole and resent"
+            r.loss_path_resends >= 1 && r.retransmit_by_nack == 0,
+            "premise: the loss path resent, and no NACK did"
+        );
+        assert!(
+            i.ledger_lost_time_threshold >= 1 && i.ledger_lost_packet_threshold == 0,
+            "premise: the time rule declared the hole, not the packet rule ({} / {})",
+            i.ledger_lost_time_threshold,
+            i.ledger_lost_packet_threshold
         );
         assert_eq!(i.pto_probe_retransmits, 0, "the probe did not repair it");
         assert_eq!(
