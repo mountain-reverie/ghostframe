@@ -361,7 +361,7 @@ use ghostframe_e2e::netsim::{DropPlan, DropRule};
 /// link. Critical tier comes back at ratio ~6.9 with a 3.1 s worst case --
 /// on a scene whose lossless twin reports ratio 1.00.
 ///
-/// This matters for reading production, which had `loss_path_resends=6739` against
+/// This matters for reading production, which had `rto_fired=6739` against
 /// 9208 original passes. Its 16.8 s `queued_critical_latency_max_us` cannot
 /// be attributed to scheduler queueing without separating the two causes
 /// first.

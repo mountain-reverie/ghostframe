@@ -98,7 +98,7 @@ fn squeezed_scene(cols: u8, rows: u8, send_buffer: Option<usize>) -> Browserless
 ///
 /// Delivered *bytes* are the wrong metric, and an earlier version of this
 /// test used them. The roomy run retransmits heavily (measured
-/// loss_path_resends=7,696 and retransmits=7,801 against the squeezed run's 693), so
+/// rto_fired=7,696 and retransmits=7,801 against the squeezed run's 693), so
 /// counting bytes rewards retransmit waste: a run can "deliver" more bytes
 /// while rendering no more screen.
 fn tiles_rendered(r: &BrowserlessResult, cols: u8, rows: u8) -> usize {

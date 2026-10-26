@@ -547,7 +547,7 @@ async fn bwe_estimator_is_fed_and_epoch_consistent() {
 /// from anywhere, so `smoothed_rtt` also stayed at its 20 ms constructor
 /// default and the ceiling was reached from below as well.
 ///
-/// Observed in production on a tailnet path: `loss_path_resends=33685` and
+/// Observed in production on a tailnet path: `rto_fired=33685` and
 /// `retransmit_attempts_total=44207` against 26578 fresh emissions — 1.7x
 /// more retransmission than actual picture — while `emitter_ack_hits`
 /// covered every single emission (`emitter_ack_misses=59`). Nothing was

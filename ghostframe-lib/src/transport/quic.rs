@@ -204,7 +204,7 @@ pub(crate) fn count_from_source(remotes: impl Iterator<Item = SocketAddr>, ip: I
 /// |---|---|---|
 /// | emitted_cdf53 | 4,506 | 40,800 |
 /// | send_datagram_errs_total | **15,944** | 0 |
-/// | loss_path_resends | 14,301 | - |
+/// | rto_fired | 14,301 | - |
 /// | client coverage | complete=0, gave_up=2034 | complete=2040 |
 ///
 /// The scheduler's `0.8 * send_buffer_space()` clamp covers scheduler
