@@ -154,6 +154,17 @@ fn median(s: &[(u64, u64)], from: u64, to: u64) -> Option<u64> {
     cc::median_bps(s, from, to)
 }
 
+/// Mean of the samples in `[from, to)`: the series is sampled on a fixed
+/// cadence, so this is the time average of the estimate. The median hides a
+/// bimodal phase (an estimate that spends half its time at each of two values).
+fn mean(s: &[(u64, u64)], from: u64, to: u64) -> Option<f64> {
+    let w = cc::window(s, from, to);
+    if w.is_empty() {
+        return None;
+    }
+    Some(w.iter().map(|(_, v)| *v as f64).sum::<f64>() / w.len() as f64)
+}
+
 fn max_in(s: &[(u64, u64)], from: u64, to: u64) -> Option<u64> {
     cc::window(s, from, to).iter().map(|(_, v)| *v).max()
 }
@@ -203,7 +214,7 @@ fn report_transport(scene: &str, r: &BrowserlessResult) {
         scene,
         "ceiling",
         format!(
-            "reads={} saturated={} binding={} last_acked_bps={} last_ceiling_bps={} reseeds[down={} up={} down_skipped_gap={}] lifts[checked={} undone={} blocked_by_queue={}] payload_fraction={:.3}",
+            "reads={} saturated={} binding={} last_acked_bps={} last_ceiling_bps={} reseeds[down={} up={} down_skipped_gap={}] lifts[checked={} undone={} checked_1s={} undone_1s={} blocked_by_queue={} blocked_by_loss={}] down_while_loss_limited={} loss_state_feedbacks={:?} payload_fraction={:.3}",
             i.bwe.ceiling_reads,
             i.bwe.ceiling_saturated_reads,
             i.bwe.ceiling_binding_reads,
@@ -214,7 +225,12 @@ fn report_transport(scene: &str, r: &BrowserlessResult) {
             i.bwe.ceiling_reseeds_skipped_gap,
             i.bwe.ceiling_lifts_checked,
             i.bwe.ceiling_lifts_undone,
+            i.bwe.ceiling_lifts_checked_1s,
+            i.bwe.ceiling_lifts_undone_1s,
             i.bwe.ceiling_lifts_blocked_queue,
+            i.bwe.ceiling_lifts_blocked_loss,
+            i.bwe.ceiling_reseeds_down_loss_limited,
+            i.bwe.loss_state_feedbacks,
             i.bwe.payload_fraction_ppm as f64 / 1e6
         ),
     );
@@ -440,6 +456,22 @@ async fn p6b_the_estimate_follows_capacity_steps_each_held_20s() {
             name,
             &format!("{label}_median_over_cap"),
             opt(median(s, from, to).map(|m| format!("{:.3}", m as f64 / cap))),
+        );
+        p6(
+            name,
+            &format!("{label}_mean_over_cap"),
+            opt(mean(s, from, to).map(|m| format!("{:.3}", m / cap))),
+        );
+    }
+    for (label, from, to, cap) in [
+        ("low1_phase", 0, UP_AT, low),
+        ("high_phase", UP_AT, DOWN_AT, high),
+        ("low2_phase", DOWN_AT, end, low),
+    ] {
+        p6(
+            name,
+            &format!("{label}_mean_over_cap"),
+            opt(mean(s, from, to).map(|m| format!("{:.3}", m / cap))),
         );
     }
     report_transport(name, &r);
