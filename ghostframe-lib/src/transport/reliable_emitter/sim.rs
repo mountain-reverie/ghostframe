@@ -182,7 +182,6 @@ fn sim_clean_wire_no_retransmits() {
         sim.advance(Duration::from_millis(100));
     }
     assert_eq!(sim.emitter.stats.loss_path_resends, 0);
-    assert_eq!(sim.emitter.stats.rto_max_retransmits_reached, 0);
 }
 
 #[test]
@@ -208,19 +207,15 @@ fn sim_high_loss_50pct() {
     for _ in 0..20 {
         sim.advance(Duration::from_millis(200));
     }
-    // There is still no ATTEMPT cap -- 0aa97de removed it because it abandoned
-    // passes that were legitimately in flight -- so this counter stays 0.
-    //
-    // Age-based retirement (`retire_stuck`) does now exist, and deliberately
-    // does not touch this counter: it is a different mechanism with a
-    // different failure mode, and conflating them would hide whichever one
-    // fired. This scenario runs 20 x 200 ms = 4 s, far inside the 30 s
+    // There is no ATTEMPT cap (0aa97de removed it because it abandoned passes
+    // that were legitimately in flight). Age-based retirement (`retire_stuck`)
+    // exists: this scenario runs 20 x 200 ms = 4 s, far inside the 30 s
     // staleness threshold, so it also serves as evidence that retirement
     // leaves a busy-but-healthy cache alone.
     assert_eq!(
-        sim.emitter.stats.rto_max_retransmits_reached, 0,
+        sim.emitter.stats.stuck_entries_retired, 0,
         "got {}",
-        sim.emitter.stats.rto_max_retransmits_reached
+        sim.emitter.stats.stuck_entries_retired
     );
 }
 

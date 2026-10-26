@@ -2157,7 +2157,6 @@ impl IoBridge {
                 send_datagram_errs_total = self.datagram_send_errs,
                 fec_parity_emitted = es.parity_emitted,
                 loss_path_resends = es.loss_path_resends,
-                rto_max_retransmits_reached = es.rto_max_retransmits_reached,
                 // Split, not summed. This was logged as a single
                 // `nack_received = nack_hit + nack_miss`, which cannot
                 // distinguish "the client asked and we resent" from
