@@ -40,6 +40,38 @@
 //! i.i.d.; true i.i.d. at rate `a` has mean run `1 / (1 - a)`. For an i.i.d.
 //! control use `NetProfile::loss` directly.
 //!
+//! # Time, not datagrams (the default)
+//!
+//! The derivation above is for a chain that steps once per datagram. That is
+//! wrong for a link whose sender backs off: a quinn connection that has lost
+//! a burst sends one probe every few seconds, and each probe stepped the
+//! chain once, so a "burst of 8 datagrams" lasted eight probes -- tens of
+//! seconds -- and every probe died inside it (seed 0x22 stranded 147 tiles
+//! for that reason; PR #237). A real burst is an interval of time.
+//!
+//! [`GilbertElliott::from_rate_and_burst`] therefore builds a chain that
+//! steps once per [`BURST_QUANTUM_US`] of virtual time, whatever was sent:
+//! `NetSim::decide` advances it by the number of quanta elapsed since the
+//! previous datagram, in closed form (one rng draw per call, as before), so
+//! a gap of any length costs O(1) and the draw order is unchanged.
+//!
+//! **Conversion from datagrams.** The `len` the callers and the env protocol
+//! give is "mean burst in datagrams *at the reference send rate*". The
+//! reference is [`REFERENCE_DATAGRAM_INTERVAL_US`] = 1000 us: the browserless
+//! burst scenes offer ~1030 s2c datagrams per virtual second on a clean link
+//! (12363 in 12 s, `iid_versus_burst_loss_at_equal_average_rate`). So
+//! `mean burst = len * 1000 us`, i.e. 8 datagrams is an 8 ms burst, and a
+//! scene sending at the reference rate sees the same mean loss rate and (to
+//! within +-0.5 datagram) the same loss-run length as before. A sender
+//! slower than the reference now sees shorter runs, which is the point.
+//! Per quantum: `r = 1 / (len * REF / QUANTUM)`, `pi_B` and `p` as above.
+//!
+//! The per-datagram chain remains available as
+//! [`GilbertElliott::from_rate_and_burst_per_datagram`] (and as the raw
+//! `NetProfile` fields with `burst_quantum_us == 0`) for analyses that
+//! reason about runs of consecutive datagrams by index
+//! (`fec_burst_analysis`) and for the netsim mechanics tests.
+//!
 //! # Env protocol (harness layer: QUIC packets, browserless only)
 //!
 //! Per direction `<DIR>` in `OUTBOUND` (server -> client) / `INBOUND`
@@ -48,8 +80,9 @@
 //!
 //! * `GHOSTFRAME_<DIR>_BURST_LOSS_PROBABILITY` -- long-run average, in (0, 1).
 //!   Unset => no burst model for that direction.
-//! * `GHOSTFRAME_<DIR>_BURST_MEAN_LEN` -- mean loss-run length in datagrams,
-//!   `>= 1`. Required when the probability is set.
+//! * `GHOSTFRAME_<DIR>_BURST_MEAN_LEN` -- mean burst length in datagrams at
+//!   the reference send rate (see above), `>= 1`. Required when the
+//!   probability is set.
 //! * `GHOSTFRAME_<DIR>_BURST_LOSS_BAD` -- loss probability in the bad state,
 //!   default `1.0`.
 //! * `GHOSTFRAME_<DIR>_BURST_SEED` -- u64, default `0`; XORed into the
@@ -74,6 +107,12 @@ impl BurstDirection {
     }
 }
 
+/// Virtual-time step of the time-based chain, in microseconds.
+pub const BURST_QUANTUM_US: u64 = 100;
+
+/// The send interval that converts "datagrams" to time: see the module docs.
+pub const REFERENCE_DATAGRAM_INTERVAL_US: u64 = 1_000;
+
 /// Gilbert-Elliott parameters. See the module docs for semantics.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GilbertElliott {
@@ -83,23 +122,65 @@ pub struct GilbertElliott {
     pub p_bg: f64,
     pub loss_good: f64,
     pub loss_bad: f64,
+    /// Virtual microseconds per chain step; 0 steps once per datagram.
+    /// `p_gb`/`p_bg` are probabilities per step.
+    pub quantum_us: u64,
 }
 
 impl GilbertElliott {
-    /// Solve for `p_gb`/`p_bg` so the stationary loss rate is `avg_loss` and
-    /// the mean Bad sojourn is `mean_burst_len` datagrams, with `loss_good`
-    /// fixed at 0. With `loss_bad == 1.0` that is also the mean loss-run
-    /// length.
+    /// Time-based model: stationary loss rate `avg_loss`, mean Bad sojourn
+    /// `mean_burst_len` datagrams at the reference send rate
+    /// ([`REFERENCE_DATAGRAM_INTERVAL_US`]), `loss_good` fixed at 0.
     pub fn from_rate_and_burst(
         avg_loss: f64,
         mean_burst_len: f64,
         loss_bad: f64,
     ) -> Result<Self, String> {
-        if !(avg_loss.is_finite() && avg_loss > 0.0 && avg_loss < 1.0) {
-            return Err(format!("avg_loss {avg_loss} must be in (0, 1)"));
-        }
         if !(mean_burst_len.is_finite() && mean_burst_len >= 1.0) {
             return Err(format!("mean_burst_len {mean_burst_len} must be >= 1"));
+        }
+        Self::from_rate_and_burst_us(
+            avg_loss,
+            mean_burst_len * REFERENCE_DATAGRAM_INTERVAL_US as f64,
+            loss_bad,
+        )
+    }
+
+    /// Time-based model with the burst given directly as a mean duration.
+    pub fn from_rate_and_burst_us(
+        avg_loss: f64,
+        mean_burst_us: f64,
+        loss_bad: f64,
+    ) -> Result<Self, String> {
+        if !(mean_burst_us.is_finite() && mean_burst_us >= BURST_QUANTUM_US as f64) {
+            return Err(format!(
+                "mean_burst_us {mean_burst_us} must be >= the {BURST_QUANTUM_US} us quantum"
+            ));
+        }
+        let steps = mean_burst_us / BURST_QUANTUM_US as f64;
+        let mut m = Self::solve(avg_loss, steps, loss_bad)?;
+        m.quantum_us = BURST_QUANTUM_US;
+        Ok(m)
+    }
+
+    /// The old model: the chain steps once per datagram, so `mean_burst_len`
+    /// is a count of datagrams whatever the send rate. Only for analyses
+    /// that reason about runs by datagram index.
+    pub fn from_rate_and_burst_per_datagram(
+        avg_loss: f64,
+        mean_burst_len: f64,
+        loss_bad: f64,
+    ) -> Result<Self, String> {
+        if !(mean_burst_len.is_finite() && mean_burst_len >= 1.0) {
+            return Err(format!("mean_burst_len {mean_burst_len} must be >= 1"));
+        }
+        Self::solve(avg_loss, mean_burst_len, loss_bad)
+    }
+
+    /// Per-step probabilities for a mean Bad sojourn of `mean_burst_len` steps.
+    fn solve(avg_loss: f64, mean_burst_len: f64, loss_bad: f64) -> Result<Self, String> {
+        if !(avg_loss.is_finite() && avg_loss > 0.0 && avg_loss < 1.0) {
+            return Err(format!("avg_loss {avg_loss} must be in (0, 1)"));
         }
         if !(loss_bad.is_finite() && loss_bad > 0.0 && loss_bad <= 1.0) {
             return Err(format!("loss_bad {loss_bad} must be in (0, 1]"));
@@ -125,7 +206,14 @@ impl GilbertElliott {
             p_bg,
             loss_good: 0.0,
             loss_bad,
+            quantum_us: 0,
         })
+    }
+
+    /// Mean Bad sojourn in microseconds (`None` for the per-datagram model,
+    /// which has no time scale).
+    pub fn mean_burst_us(&self) -> Option<f64> {
+        (self.quantum_us > 0).then(|| self.quantum_us as f64 / self.p_bg)
     }
 
     /// Stationary probability of being in the Bad state.
@@ -145,6 +233,7 @@ impl GilbertElliott {
         profile.burst_exit = self.p_bg;
         profile.burst_loss = self.loss_bad;
         profile.loss = self.loss_good;
+        profile.burst_quantum_us = self.quantum_us;
     }
 }
 

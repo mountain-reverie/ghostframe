@@ -21,7 +21,11 @@
 //! NACK/RTO must still cover.
 //!
 //! The mask comes from `NetSim::decide`, so iid and burst use the same
-//! machinery. Run with `--nocapture` for the table.
+//! machinery. The burst model is the per-datagram chain
+//! (`from_rate_and_burst_per_datagram`): this analysis reasons about runs of
+//! consecutive datagram *indices* against fixed group boundaries, which a
+//! time-based chain would turn into a function of the 100 us spacing used to
+//! drive it. Run with `--nocapture` for the table.
 
 use ghostframe_e2e::netsim::{GilbertElliott, NetProfile, NetSim, Verdict};
 use ghostframe_lib::transport::reliable_emitter::{FEC_GROUP_SIZE_K, PARITY_INTERLEAVE_OFFSET};
@@ -112,7 +116,7 @@ fn analyse(layout: &[Kind], lost: &[bool], groups: usize) -> Outcome {
 
 fn ge(avg: f64, len: f64) -> NetProfile {
     let mut p = NetProfile::perfect();
-    GilbertElliott::from_rate_and_burst(avg, len, 1.0)
+    GilbertElliott::from_rate_and_burst_per_datagram(avg, len, 1.0)
         .expect("feasible")
         .apply_to(&mut p);
     p

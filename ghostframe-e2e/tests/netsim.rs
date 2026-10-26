@@ -283,6 +283,7 @@ fn adding_a_cap_does_not_shift_the_rng_draw_sequence() {
             burst_enter: 0.02,
             burst_exit: 0.30,
             burst_loss: 0.50,
+            burst_quantum_us: 0,
             duplicate: 0.05,
             corrupt: 0.05,
             delay_us: 10_000,
