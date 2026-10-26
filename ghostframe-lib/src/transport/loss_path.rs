@@ -225,7 +225,7 @@ mod tests {
 mod deferred_tests {
     use super::*;
     use crate::transport::reliable_emitter::emitter::LOSS_RETX_MAX_ATTEMPTS;
-    use crate::transport::reliable_emitter::rto::pto_for_attempt;
+    use crate::transport::reliable_emitter::pto::pto_for_attempt;
     use crate::transport::reliable_emitter::EmitKey;
     use crate::transport::transmission_ledger::Transmission;
     use bytes::Bytes;

@@ -6,7 +6,7 @@
 //! enqueue, so it included the host's own queue, it had no variance term, and
 //! it was censored exactly when it would have been largest (only acknowledged
 //! transmissions were sampled). Since D1 F4 the deadline is an RFC 9002 probe
-//! timeout from departure-based samples (`rtt_estimator`, `rto::pto_for_attempt`)
+//! timeout from departure-based samples (`rtt_estimator`, `pto::pto_for_attempt`)
 //! and this tracker decides nothing.
 //!
 //! History, kept because the numbers still explain why a fixed deadline
@@ -197,7 +197,7 @@ mod tests {
     fn p95_of_100_samples_is_the_95th_smallest() {
         // 94 samples at 50ms, 6 samples at 80ms: sorted ascending, index 94
         // (0-based, the 95th element) is the first 80ms entry. This is the
-        // exact fixture the RTO integration test in rto.rs relies on to
+        // exact fixture the RTO integration test in pto.rs relies on to
         // assert the derived deadline lands at 160ms.
         let mut t = AckLatencyTracker::new();
         for _ in 0..94 {
