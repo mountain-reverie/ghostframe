@@ -202,8 +202,51 @@ fn conditional_loss_follows_the_n_step_law_of_the_chain() {
     }
 }
 
+/// The time-based branch must consume exactly one rng draw per call, like the
+/// per-datagram one, so that every later draw (jitter here) is where it was.
+/// With no loss in either state the burst state cannot change a verdict, so
+/// the Deliver times of a time-based profile and of `perfect()` plus the same
+/// jitter must be identical; an extra (or missing) draw in the time branch
+/// shifts the jitter stream and breaks it.
 #[test]
-fn irregular_gaps_are_deterministic_and_cost_one_draw_each() {
+fn the_time_branch_draws_exactly_once_per_call() {
+    let mut time_p = NetProfile::perfect();
+    time_p.burst_enter = 0.3;
+    time_p.burst_exit = 0.2;
+    time_p.burst_quantum_us = Q;
+    time_p.burst_loss = 0.0;
+    time_p.jitter_us = 800;
+    let mut base = NetProfile::perfect();
+    base.jitter_us = 800;
+    // Same-quantum repeats (n = 0), small and huge gaps.
+    let times: Vec<u64> = (0..5_000u64)
+        .map(|i| [0, 0, 50, 100, 1_000, 123_456, 9_000_000_000][i as usize % 7] + i * 3 * Q)
+        .collect();
+    let run = |p: &NetProfile| {
+        let mut sim = NetSim::new(p.clone(), 77);
+        times
+            .iter()
+            .map(|&t| sim.decide(1200, t))
+            .collect::<Vec<_>>()
+    };
+    let (a, b) = (run(&time_p), run(&base));
+    assert!(
+        a.iter().all(|v| matches!(v, Verdict::Deliver { .. })),
+        "premise: no drops"
+    );
+    assert!(
+        a.windows(2).any(|w| w[0] != w[1]),
+        "premise: jitter actually varies"
+    );
+    let first = a.iter().zip(&b).position(|(x, y)| x != y);
+    assert!(
+        first.is_none(),
+        "jitter stream shifted at call {first:?}: the time branch drew a different number of times"
+    );
+}
+
+#[test]
+fn irregular_gaps_are_deterministic() {
     // Same seed, same offered times => same verdicts; and the profile
     // being time-based must not change how many draws a call consumes, so
     // a Deliver's jitter after a long gap matches a run with the same gap
@@ -301,7 +344,7 @@ fn env_unset_means_none() {
     // The other direction's variables must not leak across.
     let g = lookup(&[
         ("GHOSTFRAME_OUTBOUND_BURST_LOSS_PROBABILITY", "0.02"),
-        ("GHOSTFRAME_OUTBOUND_BURST_MEAN_LEN", "8"),
+        ("GHOSTFRAME_OUTBOUND_BURST_MEAN_MS", "8"),
     ]);
     assert_eq!(
         BurstConfig::from_lookup(BurstDirection::Inbound, &g).unwrap(),
@@ -316,7 +359,7 @@ fn env_unset_means_none() {
 fn env_parses_values_defaults_and_seed() {
     let g = lookup(&[
         ("GHOSTFRAME_INBOUND_BURST_LOSS_PROBABILITY", "0.02"),
-        ("GHOSTFRAME_INBOUND_BURST_MEAN_LEN", "8"),
+        ("GHOSTFRAME_INBOUND_BURST_MEAN_MS", "8"),
         ("GHOSTFRAME_INBOUND_BURST_SEED", "99"),
     ]);
     let c = BurstConfig::from_lookup(BurstDirection::Inbound, g)
@@ -329,7 +372,7 @@ fn env_parses_values_defaults_and_seed() {
 
     let g = lookup(&[
         ("GHOSTFRAME_OUTBOUND_BURST_LOSS_PROBABILITY", "0.02"),
-        ("GHOSTFRAME_OUTBOUND_BURST_MEAN_LEN", "4"),
+        ("GHOSTFRAME_OUTBOUND_BURST_MEAN_MS", "4"),
         ("GHOSTFRAME_OUTBOUND_BURST_LOSS_BAD", "0.5"),
     ]);
     let c = BurstConfig::from_lookup(BurstDirection::Outbound, g)
@@ -344,7 +387,7 @@ fn env_rejects_bad_values_instead_of_silently_disabling() {
     let base = |extra: &[(&'static str, &'static str)]| {
         let mut v = vec![
             ("GHOSTFRAME_OUTBOUND_BURST_LOSS_PROBABILITY", "0.02"),
-            ("GHOSTFRAME_OUTBOUND_BURST_MEAN_LEN", "8"),
+            ("GHOSTFRAME_OUTBOUND_BURST_MEAN_MS", "8"),
         ];
         for (k, val) in extra {
             v.retain(|(kk, _)| kk != k);
@@ -356,15 +399,24 @@ fn env_rejects_bad_values_instead_of_silently_disabling() {
     assert!(base(&[("GHOSTFRAME_OUTBOUND_BURST_LOSS_PROBABILITY", "abc")]).is_err());
     assert!(base(&[("GHOSTFRAME_OUTBOUND_BURST_LOSS_PROBABILITY", "1.5")]).is_err());
     assert!(base(&[("GHOSTFRAME_OUTBOUND_BURST_LOSS_PROBABILITY", "0")]).is_err());
-    assert!(base(&[("GHOSTFRAME_OUTBOUND_BURST_MEAN_LEN", "0.5")]).is_err());
-    assert!(base(&[("GHOSTFRAME_OUTBOUND_BURST_MEAN_LEN", "x")]).is_err());
+    assert!(base(&[("GHOSTFRAME_OUTBOUND_BURST_MEAN_MS", "0.05")]).is_err());
+    assert!(base(&[("GHOSTFRAME_OUTBOUND_BURST_MEAN_MS", "x")]).is_err());
     assert!(base(&[("GHOSTFRAME_OUTBOUND_BURST_LOSS_BAD", "0.01")]).is_err());
     assert!(base(&[("GHOSTFRAME_OUTBOUND_BURST_SEED", "-1")]).is_err());
+    // The old datagram-denominated variable is an error, not reinterpreted.
+    let leftover = lookup(&[
+        ("GHOSTFRAME_OUTBOUND_BURST_LOSS_PROBABILITY", "0.02"),
+        ("GHOSTFRAME_OUTBOUND_BURST_MEAN_MS", "8"),
+        ("GHOSTFRAME_OUTBOUND_BURST_MEAN_LEN", "8"),
+    ]);
+    let e = BurstConfig::from_lookup(BurstDirection::Outbound, leftover).unwrap_err();
+    assert!(e.contains("MEAN_MS"), "{e}");
     // Probability without a length is a configuration error, not "off".
     let only_p = lookup(&[("GHOSTFRAME_OUTBOUND_BURST_LOSS_PROBABILITY", "0.02")]);
     assert!(BurstConfig::from_lookup(BurstDirection::Outbound, only_p).is_err());
     // Sibling variables without the probability must not silently disable it.
     for k in [
+        "GHOSTFRAME_OUTBOUND_BURST_MEAN_MS",
         "GHOSTFRAME_OUTBOUND_BURST_MEAN_LEN",
         "GHOSTFRAME_OUTBOUND_BURST_SEED",
         "GHOSTFRAME_OUTBOUND_BURST_LOSS_BAD",

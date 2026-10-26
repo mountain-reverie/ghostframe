@@ -95,6 +95,22 @@ fn tiles_present(r: &BrowserlessResult) -> usize {
         .count()
 }
 
+/// The drop fraction a run actually saw, next to the one the link was
+/// configured for. They differ under a reactive sender: quinn sends less while
+/// a burst hurts and more once it has recovered, so it samples the chain
+/// preferentially while Good and the realised burst fraction falls below the
+/// target (0.3 to 1.8 % against 2 %), whereas i.i.d. loss is rate-blind. A
+/// "burst vs i.i.d. at equal average rate" comparison is therefore at equal
+/// *configured* rate, not equal realised rate; read these lines with it.
+fn realised(name: &str, target: f64, r: &BrowserlessResult) {
+    println!(
+        "REALISED {name}: target={target:.4} realised={:.4} dropped={} offered={}",
+        r.s2c_datagrams_dropped as f64 / r.s2c_datagrams_offered.max(1) as f64,
+        r.s2c_datagrams_dropped,
+        r.s2c_datagrams_offered
+    );
+}
+
 fn report(name: &str, r: &BrowserlessResult) {
     let ratio = if r.s2c_datagrams_dropped == 0 {
         0.0
@@ -449,6 +465,7 @@ async fn iid_versus_burst_loss_at_equal_average_rate() {
         .await
         .expect("scene ran");
     report("iid2%", &iid);
+    realised("iid2%", RATE, &iid);
     report_instruments("iid2%", &iid);
 
     let ge = GilbertElliott::from_rate_and_burst(RATE, BURST, 1.0).expect("feasible");
@@ -456,6 +473,7 @@ async fn iid_versus_burst_loss_at_equal_average_rate() {
         .await
         .expect("scene ran");
     report("burst2%_len8", &burst);
+    realised("burst2%_len8", RATE, &burst);
     report_instruments("burst2%_len8", &burst);
 
     for (n, r) in [("clean", &clean), ("iid", &iid), ("burst", &burst)] {
@@ -612,6 +630,7 @@ async fn burst_loss_report_over_three_seeds() {
         for (n, r) in [("iid2%", &iid2), ("burst2%", &burst2), ("iid1%", &iid1)] {
             let name = format!("{n}@{seed:#x}");
             report(&name, r);
+            realised(&name, if n == "iid1%" { 0.01 } else { RATE }, r);
             report_instruments(&name, r);
             let b = &r.transport.instr.bwe;
             println!(
@@ -1204,6 +1223,7 @@ async fn p5a(ignore_client_nacks: bool) -> (u64, u64, u64, u64) {
             let n = format!("{model}@{seed:#x}");
             assert_established(&n, &r);
             let b = repair_bill(&r);
+            realised(&n, P5_RATE, &r);
             println!(
                 "P5A{} {n}: lost_datagrams={} retransmits={} (loss={} probe={} nack={}) ratio={:.3} \
                  cache_left={} tiles={} stale={} verdicts={} spurious={} fec_possible={} k_pkt={} pto_fires={} \
@@ -1578,6 +1598,126 @@ async fn p5_seed_0x22_converges_once_the_churn_stops() {
                 (COLS * ROWS) as usize,
                 "{seed:#x} {model}: tiles missing"
             );
+        }
+    }
+}
+
+/// A burst longer than the PTO. The 8 ms bursts of the arm above end before
+/// any timer fires, so they say nothing about a link that is down for whole
+/// seconds. Here the Bad state lasts 1.5 s on average (30 % of the time, so a
+/// burst begins inside the first seconds of every seed), under the same 5 s
+/// of churn and then silence, 30 s in all. Premise: the link
+/// dropped datagrams, and over the five seeds quinn's PTO fired in at least
+/// four (the sender really was left waiting on a timer; measured 4 of 5). Outcome: once the burst is over, every pass
+/// is acknowledged and every tile is on screen.
+///
+/// This is the case the time-based chain exists to make testable: a
+/// per-datagram chain cannot express "down for 1.5 s" to a sender that sends
+/// one probe per backoff period.
+#[tokio::test(start_paused = true)]
+async fn p5_a_burst_longer_than_the_pto_is_recovered_from() {
+    let ge = GilbertElliott::from_rate_and_burst_us(0.30, 1_500_000.0, 1.0).expect("feasible");
+    let mut pto_runs = 0;
+    for seed in [0x22u64, 0xB0_B057, 0xB0_B157, 0xB0_B257, 0xB0_B357] {
+        let mut sc = scene(seed, 30);
+        let profile = LoadProfile {
+            cadence_us: PRODUCTION_CADENCE_US,
+            churn: Churn::Region { tiles_per_tick: 32 },
+        };
+        sc.load =
+            SceneLoad::Script(profile.frames_for(Duration::from_secs(5), COLS as u8, ROWS as u8));
+        let r = run_browserless_with_links(sc, s2c_only(|p| ge.apply_to(p)))
+            .await
+            .expect("scene ran");
+        println!(
+            "P5LONGBURST seed={seed:#x}: offered={} dropped={} retx={} cache_left={} tiles={} pto_fires={}",
+            r.s2c_datagrams_offered,
+            r.s2c_datagrams_dropped,
+            r.retransmit_attempts_total,
+            r.emitter_cache_entries,
+            tiles_present(&r),
+            r.transport.instr.pto_fires
+        );
+        assert!(r.s2c_datagrams_dropped > 0, "{seed:#x}: premise: no loss");
+        pto_runs += usize::from(r.transport.instr.pto_fires > 0);
+        assert_eq!(
+            r.emitter_cache_entries, 0,
+            "{seed:#x}: passes still owed after the burst ended"
+        );
+        assert_eq!(
+            tiles_present(&r),
+            (COLS * ROWS) as usize,
+            "{seed:#x}: tiles missing"
+        );
+    }
+    // A chaotic scene: a seed may place its bursts where no timer is left
+    // waiting (0xb0b357 does: 0 fires), so the premise is on the sweep.
+    assert!(
+        pto_runs >= 4,
+        "premise: the PTO fired in only {pto_runs} of 5 runs, so the bursts did not outlast it"
+    );
+}
+
+/// Before/after of the burst chain, for the PR that made it time-based:
+/// three burst scenes x five seeds x {per-datagram ("old"), time-based
+/// ("new")}, one `SWEEP` line per run. Report-only; run with
+/// `--ignored --nocapture sweep_per_datagram_versus_time_chain`.
+#[tokio::test(start_paused = true)]
+#[ignore = "report-only before/after sweep, 30 scenes (~2 min); run on demand"]
+async fn sweep_per_datagram_versus_time_chain() {
+    let seeds = [0x22u64, 0xB0_B057, 0xB0_B157, 0xB0_B257, 0xB0_B357];
+    for model in ["old", "new"] {
+        for (scn, rate) in [("churn2", 0.02f64), ("p5_5", 0.05), ("s22_2", 0.02)] {
+            let ge = if model == "old" {
+                GilbertElliott::from_rate_and_burst_per_datagram(rate, BURST, 1.0)
+            } else {
+                GilbertElliott::from_rate_and_burst(rate, BURST, 1.0)
+            }
+            .expect("feasible");
+            for seed in seeds {
+                let sc = match scn {
+                    "churn2" => scene(seed, 12),
+                    "p5_5" => p5_scene(seed, 10),
+                    _ => {
+                        let mut sc = scene(seed, 20);
+                        sc.load = SceneLoad::Script(
+                            LoadProfile {
+                                cadence_us: PRODUCTION_CADENCE_US,
+                                churn: Churn::Region { tiles_per_tick: 32 },
+                            }
+                            .frames_for(
+                                Duration::from_secs(5),
+                                COLS as u8,
+                                ROWS as u8,
+                            ),
+                        );
+                        sc
+                    }
+                };
+                let r = run_browserless_with_links(sc, s2c_only(|p| ge.apply_to(p)))
+                    .await
+                    .expect("scene ran");
+                let dropped = r.s2c_datagrams_dropped;
+                println!(
+                    "SWEEP {model} {scn} {seed:#x}: offered={} dropped={} realised={:.4} retx={} \
+                     ratio={:.3} runs={} mean_run={:.2} tiles={}/256 stranded={} cache_left={} \
+                     crit_n={} crit_mean_us={} crit_max_us={} pto_fires={}",
+                    r.s2c_datagrams_offered,
+                    dropped,
+                    dropped as f64 / r.s2c_datagrams_offered.max(1) as f64,
+                    r.retransmit_attempts_total,
+                    r.retransmit_attempts_total as f64 / dropped.max(1) as f64,
+                    r.s2c_loss_runs,
+                    r.s2c_mean_loss_run(),
+                    tiles_present(&r),
+                    256 - tiles_present(&r),
+                    r.emitter_cache_entries,
+                    r.critical_latency_count,
+                    r.critical_latency_mean_us,
+                    r.critical_latency_max_us,
+                    r.transport.instr.pto_fires,
+                );
+            }
         }
     }
 }

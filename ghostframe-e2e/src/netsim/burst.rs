@@ -46,31 +46,47 @@
 //! wrong for a link whose sender backs off: a quinn connection that has lost
 //! a burst sends one probe every few seconds, and each probe stepped the
 //! chain once, so a "burst of 8 datagrams" lasted eight probes -- tens of
-//! seconds -- and every probe died inside it (seed 0x22 stranded 147 tiles
-//! for that reason; PR #237). A real burst is an interval of time.
+//! seconds -- and every probe died inside it. At seed 0x22 of
+//! `p5_seed_0x22_converges_once_the_churn_stops` that left 31 passes owed 15 s
+//! after the churn stopped (no tile missing); it was a harness artifact, not
+//! a product bug (PR #237). A real burst is an interval of time.
 //!
-//! [`GilbertElliott::from_rate_and_burst`] therefore builds a chain that
+//! [`GilbertElliott::from_rate_and_burst_us`] therefore builds a chain that
 //! steps once per [`BURST_QUANTUM_US`] of virtual time, whatever was sent:
 //! `NetSim::decide` advances it by the number of quanta elapsed since the
 //! previous datagram, in closed form (one rng draw per call, as before), so
-//! a gap of any length costs O(1) and the draw order is unchanged.
+//! a gap of any length costs O(1) and the draw order is unchanged. The mean
+//! Bad sojourn is `mean_burst_us`, per quantum `r = QUANTUM / mean_burst_us`,
+//! `pi_B` and `p` as above.
 //!
-//! **Conversion from datagrams.** The `len` the callers and the env protocol
-//! give is "mean burst in datagrams *at the reference send rate*". The
-//! reference is [`REFERENCE_DATAGRAM_INTERVAL_US`] = 1000 us: the browserless
-//! burst scenes offer ~1030 s2c datagrams per virtual second on a clean link
-//! (12363 in 12 s, `iid_versus_burst_loss_at_equal_average_rate`). So
-//! `mean burst = len * 1000 us`, i.e. 8 datagrams is an 8 ms burst, and a
-//! scene sending at the reference rate sees the same mean loss rate and (to
-//! within +-0.5 datagram) the same loss-run length as before. A sender
-//! slower than the reference now sees shorter runs, which is the point.
-//! Per quantum: `r = 1 / (len * REF / QUANTUM)`, `pi_B` and `p` as above.
+//! **Datagram-denominated convenience.** [`GilbertElliott::from_rate_and_burst`]
+//! takes "mean burst in datagrams at the reference send rate" and converts at
+//! [`REFERENCE_DATAGRAM_INTERVAL_US`] = 1000 us: the browserless burst scenes
+//! offer ~1030 s2c datagrams per virtual second on a clean link (12363 in
+//! 12 s, `iid_versus_burst_loss_at_equal_average_rate`), so 8 datagrams is an
+//! 8 ms burst. Prefer stating the burst in time.
+//!
+//! **What the reference does and does not buy.** Only a sender that really
+//! sends one datagram per millisecond sees the old numbers. Even then the
+//! loss run is not simply the old `len`: sampling a geometric burst once per
+//! reference interval gives a run of about `len + 0.5` for large `len` and
+//! `1 / (1 - e^-1)`-ish (+0.57 at `len = 1`) for small. A real quinn sender
+//! sends in trains and then goes quiet, so on the scenes the measured mean
+//! run is longer (churn: 9.0 to 15.4, about 11.7, for `len = 8`) and
+//! all-or-nothing on a one-frame scene (12 to 73 drops out of ~500). And
+//! **realised burst loss falls below the target** under a reactive sender:
+//! quinn sends less while a burst is hurting it and more once it has
+//! recovered, so it samples the chain preferentially while Good (sweep: 0.3 to
+//! 1.8 % of datagrams dropped against a 2 % target; the chain's own long-run
+//! fraction of *time* in Bad is exact). "Equal average rate" therefore holds for the chain, not for what
+//! a backing-off sender experiences; compare the realised drop fraction.
 //!
 //! The per-datagram chain remains available as
 //! [`GilbertElliott::from_rate_and_burst_per_datagram`] (and as the raw
 //! `NetProfile` fields with `burst_quantum_us == 0`) for analyses that
 //! reason about runs of consecutive datagrams by index
-//! (`fec_burst_analysis`) and for the netsim mechanics tests.
+//! (`fec_burst_analysis`) and for the netsim mechanics tests. Never drive a
+//! real sender with it: it reintroduces the stranding artifact above.
 //!
 //! # Env protocol (harness layer: QUIC packets, browserless only)
 //!
@@ -80,9 +96,10 @@
 //!
 //! * `GHOSTFRAME_<DIR>_BURST_LOSS_PROBABILITY` -- long-run average, in (0, 1).
 //!   Unset => no burst model for that direction.
-//! * `GHOSTFRAME_<DIR>_BURST_MEAN_LEN` -- mean burst length in datagrams at
-//!   the reference send rate (see above), `>= 1`. Required when the
-//!   probability is set.
+//! * `GHOSTFRAME_<DIR>_BURST_MEAN_MS` -- mean burst duration in milliseconds
+//!   of virtual time, at least one quantum (0.1). Required when the
+//!   probability is set. The former `..._BURST_MEAN_LEN` (datagrams) is an
+//!   error if still set, not silently reinterpreted.
 //! * `GHOSTFRAME_<DIR>_BURST_LOSS_BAD` -- loss probability in the bad state,
 //!   default `1.0`.
 //! * `GHOSTFRAME_<DIR>_BURST_SEED` -- u64, default `0`; XORed into the
@@ -164,8 +181,14 @@ impl GilbertElliott {
     }
 
     /// The old model: the chain steps once per datagram, so `mean_burst_len`
-    /// is a count of datagrams whatever the send rate. Only for analyses
-    /// that reason about runs by datagram index.
+    /// is a count of datagrams whatever the send rate.
+    ///
+    /// **Never drive a real sender with it**: a sender that backs off sends
+    /// rarely, and each rare datagram still advances the chain one step, so a
+    /// "burst" outlasts the sender's recovery timers and strands it (the
+    /// harness artifact this module's docs describe). Keep it for analyses
+    /// that reason about runs by datagram index (`fec_burst_analysis`) and
+    /// for the raw-field mechanics tests in `tests/netsim.rs`.
     pub fn from_rate_and_burst_per_datagram(
         avg_loss: f64,
         mean_burst_len: f64,
@@ -260,7 +283,7 @@ impl BurstConfig {
         };
         let pn = name("LOSS_PROBABILITY");
         let Some(p_raw) = get(&pn) else {
-            for s in ["MEAN_LEN", "LOSS_BAD", "SEED"] {
+            for s in ["MEAN_MS", "MEAN_LEN", "LOSS_BAD", "SEED"] {
                 if get(&name(s)).is_some() {
                     return Err(format!("{} is set but {pn} is not", name(s)));
                 }
@@ -268,9 +291,17 @@ impl BurstConfig {
             return Ok(None);
         };
         let avg = parse_f64(&pn, p_raw)?;
-        let ln = name("MEAN_LEN");
-        let len_raw = get(&ln).ok_or_else(|| format!("{pn} is set but {ln} is not"))?;
-        let len = parse_f64(&ln, len_raw)?;
+        let old = name("MEAN_LEN");
+        if get(&old).is_some() {
+            return Err(format!(
+                "{old} (datagrams) no longer exists: the burst chain runs on time. \
+                 Set {} in milliseconds instead",
+                name("MEAN_MS")
+            ));
+        }
+        let ln = name("MEAN_MS");
+        let ms_raw = get(&ln).ok_or_else(|| format!("{pn} is set but {ln} is not"))?;
+        let ms = parse_f64(&ln, ms_raw)?;
         let bn = name("LOSS_BAD");
         let bad = match get(&bn) {
             Some(raw) => parse_f64(&bn, raw)?,
@@ -284,7 +315,7 @@ impl BurstConfig {
                 .map_err(|e| format!("{sn}={raw:?}: {e}"))?,
             None => 0,
         };
-        let model = GilbertElliott::from_rate_and_burst(avg, len, bad)
+        let model = GilbertElliott::from_rate_and_burst_us(avg, ms * 1000.0, bad)
             .map_err(|e| format!("{pn}/{ln}/{bn}: {e}"))?;
         Ok(Some(Self { model, seed }))
     }

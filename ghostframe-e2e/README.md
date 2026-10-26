@@ -72,10 +72,13 @@ from the i.i.d. ones on purpose so one variable can never trigger both.
 
 - `GHOSTFRAME_<DIR>_BURST_LOSS_PROBABILITY` - long-run average loss in
   `(0, 1)`. Unset means no burst model for that direction.
-- `GHOSTFRAME_<DIR>_BURST_MEAN_LEN` - mean loss-run length in datagrams,
-  `>= 1`; required when the probability is set.
+- `GHOSTFRAME_<DIR>_BURST_MEAN_MS` - mean burst duration in milliseconds of
+  virtual time, `>= 0.1`; required when the probability is set. The chain
+  advances with time, not with datagrams, so a sender that backs off still
+  sees bursts end. The old `..._BURST_MEAN_LEN` (datagrams) is an error if
+  set.
 - `GHOSTFRAME_<DIR>_BURST_LOSS_BAD` - loss probability in the bad state,
-  default `1.0` (with 1.0, bad-state sojourn equals the loss run).
+  default `1.0`.
 - `GHOSTFRAME_<DIR>_BURST_SEED` - u64 salt XORed into the direction's
   `NetSim` seed, default `0`.
 
@@ -83,6 +86,11 @@ from the i.i.d. ones on purpose so one variable can never trigger both.
 infeasible values panic rather than silently running a clean link. Scenes
 that must not depend on process-global env use
 `run_browserless_with_links` with explicit `LinkOverrides`. See
-`src/netsim/burst.rs` for the derivation of the transition probabilities;
-note a mean length of 1 is anti-clustered (never two adjacent drops), not
-i.i.d.
+`src/netsim/burst.rs` for the derivation of the transition probabilities.
+The long-run loss fraction is the target for the chain, but a reactive
+sender (quinn after a loss) samples the chain preferentially while it is
+good, so the *realised* drop fraction of a backing-off sender is lower than
+the target (about 0.3 to 1.8 % against 2 % in the burst scenes); compare the
+realised fraction the scenes print, not the nominal one. On the client to
+server direction an 8 ms burst now costs an ACK stream one or two ACKs, not
+eight consecutive ones.
