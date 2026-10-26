@@ -53,6 +53,10 @@ struct Replay {
     spurious: u64,
     /// The same, among the datagrams of the last quarter of the trace.
     spurious_last_quarter: u64,
+    /// Late acknowledgements the ledger took for FEC recoveries (not retracted,
+    /// not counted as reordering). The trace has no parity loss recovery in it,
+    /// so every one is a misreading.
+    taken_for_fec: u64,
     verdicts_last_quarter: u64,
     k_pkt_at_end: u64,
     /// Datagrams the netsim dropped and the detector found.
@@ -82,6 +86,9 @@ fn replay(trace: &[Option<u64>], freeze: bool) -> Replay {
     // arrivals in time: a datagram has departed only once its send time has
     // come (the ledger's FEC-distance rule reads how many departures followed).
     let mut next_send = 0u32;
+    // The ordinary round trip, here the one-way delay: the replay returns the
+    // acknowledgement at once.
+    let min_rtt = Duration::from_micros(20_000);
     for (at_us, ws) in arrivals {
         while next_send < N && next_send as u64 * INTERVAL_US <= at_us {
             let i = next_send;
@@ -98,18 +105,24 @@ fn replay(trace: &[Option<u64>], freeze: bool) -> Replay {
                 },
             );
             ledger.mark_departed(i, at, i as u64 * INTERVAL_US);
+            // The group's parity leaves right behind the datagram that
+            // allocates `first + 20`, i.e. after `first + 19` has left.
+            if i % 10 == 9 && i >= 19 {
+                ledger.note_parity_departed(i - 19, at);
+            }
             next_send += 1;
         }
-        match ledger.resolve(ws) {
-            Some(Resolution::Late { .. }) => {
+        let now = t0 + Duration::from_micros(at_us);
+        match ledger.resolve_at(ws, Some((now, min_rtt))) {
+            Some(Resolution::Late { fec_possible, .. }) => {
                 out.spurious += 1;
+                out.taken_for_fec += u64::from(fec_possible);
                 if ws >= quarter {
                     out.spurious_last_quarter += 1;
                 }
             }
             Some(Resolution::Live(_)) | None => {}
         }
-        let now = t0 + Duration::from_micros(at_us);
         for (lost_ws, _, _) in ledger.detect_losses_at(now, threshold) {
             out.verdicts += 1;
             declared.insert(lost_ws);
@@ -205,4 +218,37 @@ fn the_adaptive_threshold_stops_being_wrong_about_deep_reordering() {
         adaptive.real_losses_found,
         adaptive.real_losses
     );
+}
+
+/// Reordering as deep as the interleave itself: a window of 16 intervals
+/// displaces a datagram by up to 15 places. A single group member delayed by
+/// 19 - p intervals or more (p its position in the group) acknowledges exactly
+/// when a parity recovery of it would, and nothing the server can see tells the
+/// two apart without a wire flag, so some of those are taken for recoveries.
+/// What the group-aware test does buy is the case of several members of one
+/// group displaced together (two cannot both be rebuilt), which halves the
+/// misreading here.
+///
+/// What is asserted is the property, not the number: the misread share stays
+/// a minority (the sibling test removed, it is 40 %), and the late
+/// acknowledgements that are not taken for recoveries still drive the
+/// threshold to its ceiling. Exact for the fixed seed; see the comment on
+/// `Provenance::Rebuilt` in the PR body for the wire-flag follow-up that
+/// closes the rest.
+#[test]
+fn deep_reordering_is_mostly_not_mistaken_for_parity_recovery() {
+    let t = trace(profile(16.0, 0.02), 0x5EED);
+    let adaptive = replay(&t, false);
+    println!("P5B 16-interval: {adaptive:?}");
+    // Premises: late acknowledgements exist in quantity, and there are
+    // real losses in the trace.
+    assert!(adaptive.spurious > 200, "premise: {adaptive:?}");
+    assert!(adaptive.real_losses > 100, "premise: {adaptive:?}");
+    assert!(
+        adaptive.taken_for_fec * 4 <= adaptive.spurious,
+        "late acknowledgements taken for parity recoveries: {} of {}",
+        adaptive.taken_for_fec,
+        adaptive.spurious
+    );
+    assert!(adaptive.k_pkt_at_end > 3, "adapts: {adaptive:?}");
 }
