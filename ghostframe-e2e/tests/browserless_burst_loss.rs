@@ -2,7 +2,8 @@
 //! loss at the same long-run rate?
 //!
 //! Three runs of the same sustained tile load: a clean control, ~2% s2c i.i.d.
-//! loss, and ~2% s2c Gilbert-Elliott loss with mean burst 8 datagrams. Loss is
+//! loss, and ~2% s2c Gilbert-Elliott loss with mean burst 8 datagrams (8 ms: the
+//! chain runs on virtual time, see `netsim::burst`). Loss is
 //! on the server -> client direction only.
 //!
 //! These scenes REPORT (println!, use `--nocapture`); they do not assert
@@ -1518,31 +1519,28 @@ async fn p5_wake_the_time_rule_fires_on_time_when_nothing_else_wakes_the_loop() 
 
 /// Seed 0x22 under PR-9's suspicion (a missing wake term strands tiles): the
 /// churning screen of `scene()` for 5 s, then silence, over 2 % burst loss and
-/// 2 % / 5 % i.i.d. loss, 20 s in all. Everything the server owes is in the
-/// first 5 s. At the end:
+/// 2 % / 5 % i.i.d. loss, 20 s in all, on five seeds. Everything the server
+/// owes is in the first 5 s. At the end, under every loss model: every pass has
+/// been acknowledged (the retransmit cache is empty) and every tile is on
+/// screen.
 ///
-/// - i.i.d. loss: every pass has been acknowledged (the retransmit cache is
-///   empty) and every tile is on screen;
-/// - burst loss: whatever is still owed is sitting in quinn's datagram FIFO, not
-///   in the server's hands.
-///
-/// What this found. The burst case at seed 0x22 leaves 24 to 33 passes owed
-/// however long the scene runs, and it is not the server: all of them are in
-/// quinn's FIFO (72 datagrams, `sent_packets` frozen) while quinn waits for its
-/// own loss-recovery timer, 5.6 s away at t = 7.6 s and doubling. The netsim's
-/// Gilbert-Elliott chain advances per datagram, not per second, so once a burst
-/// has begun the link stays dead until about eight more datagrams have been
-/// offered, and quinn's backed-off probes offer one every few seconds: each dies
-/// and the timer doubles. A real burst ends with time. Nothing the emitter or the
-/// ledger does can move a datagram out of quinn's FIFO, the server's own probe
-/// had nothing left to find (7 fires, no outstanding departure), and removing
-/// the probe and loss-time terms from `next_wake_deadline` changes nothing here
-/// (measured: identical counters), so a missing wake term is not the cause of
-/// this strand.
+/// History. This arm used to accept permanent stranding for the burst model
+/// ("not a convergence gate"): at seed 0x22 it left 24 to 33 passes owed
+/// however long the scene ran, all of them in quinn's datagram FIFO while quinn
+/// waited for its own loss-recovery timer, 5.6 s away and doubling. That was
+/// the harness, not the product: the netsim's Gilbert-Elliott chain advanced
+/// per datagram, so a burst lasted eight datagrams however far apart quinn's
+/// backed-off probes were, and every probe died inside it. The chain now
+/// advances with virtual time (`netsim::burst`), a burst is a few
+/// milliseconds, and a probe seconds later finds the link up. With that
+/// fixed, the burst arm converges like the i.i.d. arms, so it is held to the
+/// same assertions. (Mutation: build the burst model with
+/// `GilbertElliott::from_rate_and_burst_per_datagram` and seed 0x22 leaves
+/// passes owed again.)
 #[tokio::test(start_paused = true)]
 async fn p5_seed_0x22_converges_once_the_churn_stops() {
     let ge = GilbertElliott::from_rate_and_burst(RATE, BURST, 1.0).expect("feasible");
-    for seed in [0x22u64, 0xB0_B057] {
+    for seed in [0x22u64, 0xB0_B057, 0xB0_B157, 0xB0_B257, 0xB0_B357] {
         for (model, links) in [
             ("iid2%", s2c_only(|p| p.loss = 0.02)),
             ("iid5%", s2c_only(|p| p.loss = 0.05)),
@@ -1571,25 +1569,15 @@ async fn p5_seed_0x22_converges_once_the_churn_stops() {
                 r.transport.instr.pto_fires
             );
             assert!(r.s2c_datagrams_dropped > 0, "{seed:#x} {model}: premise");
-            let in_quinn =
-                r.transport.instr.quinn_bytes_enqueued - r.transport.instr.quinn_bytes_departed;
-            if model == "burst2%" {
-                assert!(
-                    r.emitter_cache_entries == 0 || in_quinn > 0,
-                    "{seed:#x} {model}: {} passes owed and nothing in quinn's FIFO: the server is holding them",
-                    r.emitter_cache_entries
-                );
-            } else {
-                assert_eq!(
-                    r.emitter_cache_entries, 0,
-                    "{seed:#x} {model}: passes still owed 15 s after the churn stopped"
-                );
-                assert_eq!(
-                    tiles_present(&r),
-                    (COLS * ROWS) as usize,
-                    "{seed:#x} {model}: tiles missing"
-                );
-            }
+            assert_eq!(
+                r.emitter_cache_entries, 0,
+                "{seed:#x} {model}: passes still owed 15 s after the churn stopped"
+            );
+            assert_eq!(
+                tiles_present(&r),
+                (COLS * ROWS) as usize,
+                "{seed:#x} {model}: tiles missing"
+            );
         }
     }
 }
