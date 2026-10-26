@@ -548,42 +548,58 @@ impl WebTransportServer {
                 self.pending_bidi_streams.retain(|&s| s != sid);
                 return;
             };
+            // Decode the stream type ALONE first. A stream that is not a
+            // WebTransport data stream (the native client's HELLO is
+            // `03 <caps>`) must be passed through at once: waiting for a
+            // second varint would read the caps byte as a session id and,
+            // once a capability bit reaches 0x40, stall for bytes that
+            // never come.
             let mut slice: &[u8] = buf.as_slice();
             let before = slice.len();
-            match (VarInt::decode(&mut slice), VarInt::decode(&mut slice)) {
-                (Ok(kind), Ok(session)) => {
-                    let consumed = before - slice.len();
-                    if u64::from(kind) == WEBTRANSPORT_BI_STREAM {
-                        buf.advance(consumed);
-                        tracing::debug!(
-                            stream_id = ?sid,
-                            session_id = u64::from(session),
-                            header_bytes = consumed,
-                            "stripped WebTransport bidi stream header"
-                        );
-                    } else {
-                        // Not a WT data stream. Leave the bytes alone and
-                        // let the feedback parser decide -- it is the layer
-                        // that knows its own message types, and guessing
-                        // here would hide a genuine protocol change.
-                        // `debug`, not `warn`: the native client sends no
-                        // header, so every native session takes this branch.
-                        tracing::debug!(
-                            stream_id = ?sid,
-                            stream_type = u64::from(kind),
-                            "bidi stream has no WebTransport header; \
-                             passing bytes through unstripped"
-                        );
-                    }
-                    self.wt_header_stripped.insert(sid);
-                }
-                _ => {
+            let Ok(kind) = VarInt::decode(&mut slice) else {
+                // Stream type split across reads: keep buffering.
+                return;
+            };
+            if u64::from(kind) == WEBTRANSPORT_BI_STREAM {
+                let Ok(session) = VarInt::decode(&mut slice) else {
                     // Header split across reads. Keep buffering: returning
-                    // here without draining is what makes the partial case
+                    // without draining is what makes the partial case
                     // safe, and is why this cannot use `remove`.
                     return;
+                };
+                let consumed = before - slice.len();
+                let session_id = u64::from(session);
+                let expected = self.session_stream.map(u64::from);
+                if expected.is_some_and(|e| e != session_id) {
+                    tracing::debug!(
+                        stream_id = ?sid,
+                        session_id,
+                        expected,
+                        "WebTransport bidi stream names a different session \
+                         than this connection's; accepting anyway"
+                    );
                 }
+                buf.advance(consumed);
+                tracing::debug!(
+                    stream_id = ?sid,
+                    session_id,
+                    header_bytes = consumed,
+                    "stripped WebTransport bidi stream header"
+                );
+            } else {
+                // Not a WT data stream. Leave the bytes alone and let the
+                // feedback parser decide -- it knows its own message types,
+                // and guessing here would hide a genuine protocol change.
+                // `debug`: the native client sends no header, so every
+                // native session takes this branch.
+                tracing::debug!(
+                    stream_id = ?sid,
+                    stream_type = u64::from(kind),
+                    "bidi stream has no WebTransport header; \
+                     passing bytes through unstripped"
+                );
             }
+            self.wt_header_stripped.insert(sid);
         }
 
         if let Some(buf) = self.stream_bufs.remove(&sid) {
@@ -1011,6 +1027,44 @@ mod tests {
         assert!(wt.wt_header_stripped.contains(&sid), "premise: recorded");
         wt.stream_ended(sid);
         assert!(wt.wt_header_stripped.is_empty());
+    }
+
+    #[test]
+    fn native_hello_with_a_high_caps_byte_is_not_held_for_a_session_id() {
+        // `03 <caps>`: the caps byte must never be read as a session-id
+        // varint. 0x40 / 0x80 would announce 1 / 3 more bytes that never
+        // come, stalling the native session.
+        for caps in [0x01u8, 0x3F, 0x40, 0x80, 0xC0] {
+            let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+            let mut wt = WebTransportServer::new();
+            wt.test_feed_feedback_stream(sid, &[0x03, caps]);
+            assert_eq!(
+                wt.drain_feedback(),
+                vec![vec![0x03, caps]],
+                "caps={caps:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_is_stripped_for_every_session_id_size_fed_a_byte_at_a_time() {
+        // Session ids 0 / 64 / 2^14 / 2^30 encode as 1 / 2 / 4 / 8 bytes.
+        // Also a non-minimal 0x41 (`80 00 00 41`, 4-byte encoding).
+        let mut cases: Vec<Vec<u8>> = [0u64, 64, 1 << 14, 1 << 30]
+            .iter()
+            .map(|&id| wt_bidi_header(id))
+            .collect();
+        cases.push(vec![0x80, 0x00, 0x00, 0x41, 0x00]);
+        for header in cases {
+            let payload = [0x03u8, 0x40];
+            let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+            let mut wt = WebTransportServer::new();
+            for b in header.iter().chain(payload.iter()) {
+                wt.test_feed_feedback_stream(sid, &[*b]);
+            }
+            let got: Vec<u8> = wt.drain_feedback().concat();
+            assert_eq!(got, payload, "header {header:02x?}");
+        }
     }
 
     #[test]
