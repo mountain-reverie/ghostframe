@@ -146,6 +146,13 @@ Env-gated, off by default:
   pass of a tile has no client-side repair: with the RTO off it stays
   unrepaired until the 30 s stuck-entry retire.
 
+Tile XOR parity (k=10) is **off by default** (`TransportConfig::tile_fec`).
+`GHOSTFRAME_TILE_FEC=1` turns it back on; a browserless scene opts in with
+`RunOptions { tile_fec: true, .. }`. The client decodes parity either way, and
+H.264 parity is a separate path that this switch does not touch. A counter
+that reads zero (`parity`, `client_recovered`, `late_acks_fec_possible`) on a
+default run is the switch, not a broken probe.
+
 See also `reference_e2e_loss_injection` and `reference_e2e_diagnose` notes for
 the e2e-side injection variables.
 
