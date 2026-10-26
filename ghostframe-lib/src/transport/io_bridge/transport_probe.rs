@@ -429,6 +429,8 @@ impl IoBridge {
             spurious_pto: self.reliable_emitter.stats.spurious_pto,
             ledger_unknown_acks: self.transmission_ledger.stats().unknown_acks,
             ledger_tombstone_evictions: self.transmission_ledger.stats().tombstone_evictions,
+            ledger_lost_packet_threshold: self.transmission_ledger.stats().lost_packet_threshold,
+            ledger_lost_time_threshold: self.transmission_ledger.stats().lost_time_threshold,
             offered: i.offered,
             quinn_bytes_enqueued: i.quinn_bytes_enqueued,
             quinn_bytes_departed: i.quinn_bytes_enqueued.saturating_sub(i.quinn_bytes_queued),

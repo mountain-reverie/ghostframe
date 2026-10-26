@@ -624,6 +624,10 @@ pub struct InstrumentSummary {
     /// Tombstones evicted by newer ones; each is a loss whose late
     /// acknowledgement can no longer be classified.
     pub ledger_tombstone_evictions: u64,
+    /// Ledger verdicts by rule: the packet threshold (`K_PKT` departures
+    /// behind the hole) and the time threshold (9/8 of a round trip old).
+    pub ledger_lost_packet_threshold: u64,
+    pub ledger_lost_time_threshold: u64,
     pub ecn: EcnObservation,
     /// Tile datagrams emitted at a different generation from their tile's
     /// previous one. The premise for `loss_path_resends_superseded`: zero means no
