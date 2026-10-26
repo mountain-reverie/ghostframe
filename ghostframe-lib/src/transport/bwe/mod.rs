@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 mod ceiling;
 mod googcc;
+#[cfg(test)]
+mod react_replay;
 pub(crate) mod sliding_min;
 mod timeline;
 
