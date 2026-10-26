@@ -28,7 +28,9 @@ pub mod profile;
 pub mod pump;
 pub mod rng;
 
-pub use burst::{BurstConfig, BurstDirection, GilbertElliott};
+pub use burst::{
+    BurstConfig, BurstDirection, GilbertElliott, BURST_QUANTUM_US, REFERENCE_DATAGRAM_INTERVAL_US,
+};
 /// `DropPlan`/`DropRule` now live in `ghostframe_lib::transport::drop_plan`:
 /// see that module's doc comment for why. Re-exported here so existing
 /// `ghostframe_e2e::netsim::{DropPlan, DropRule}` callers (scenes and tests)
@@ -66,8 +68,12 @@ pub struct NetSim {
     rng: DetRng,
 
     /// Gilbert-Elliott burst state: true while the link is in the bad
-    /// (high-loss) state. Advanced once per `decide` call.
+    /// (high-loss) state. Advanced once per `decide` call, or by elapsed quanta
+    /// when `burst_quantum_us > 0`.
     in_burst: bool,
+    /// Time-based chain only: the quantum index (`now_us / burst_quantum_us`)
+    /// `in_burst` is current for.
+    burst_quantum_idx: u64,
 
     /// Token-bucket state for the bandwidth cap: bytes currently available
     /// to spend, and the time of the last refill.
@@ -100,6 +106,7 @@ impl NetSim {
             profile,
             rng: DetRng::new(seed),
             in_burst: false,
+            burst_quantum_idx: 0,
             tokens: 0.0,
             last_refill_us: 0,
             queue_drain_at_us: 0,
@@ -246,8 +253,30 @@ impl NetSim {
         }
         self.last_refill_us = now_us;
 
-        // 1. Advance Gilbert-Elliott burst state.
-        if self.in_burst {
+        // 1. Advance Gilbert-Elliott burst state: one draw, either way.
+        // `checked_div` is None exactly when the quantum is 0.
+        if let Some(idx) = now_us.checked_div(self.profile.burst_quantum_us) {
+            // Time-based chain: step once per elapsed quantum, in closed
+            // form. With p = enter, r = exit, pi = p / (p + r) and
+            // l = 1 - p - r, the n-step probability of Bad is
+            // pi + (1 - pi) l^n from Bad and pi (1 - l^n) from Good. n = 0
+            // keeps the state exactly (and still draws once).
+            let n = idx.saturating_sub(self.burst_quantum_idx);
+            self.burst_quantum_idx = self.burst_quantum_idx.max(idx);
+            let (p, r) = (self.profile.burst_enter, self.profile.burst_exit);
+            let pi = if p + r > 0.0 { p / (p + r) } else { 0.0 };
+            let ln = (1.0 - p - r).powi(n.min(i32::MAX as u64) as i32);
+            let p_bad = if n == 0 {
+                // Exactly the current state, not 1 - epsilon.
+                f64::from(u8::from(self.in_burst))
+            } else if self.in_burst {
+                pi + (1.0 - pi) * ln
+            } else {
+                pi * (1.0 - ln)
+            };
+            self.in_burst = self.rng.bernoulli(p_bad);
+        } else if self.in_burst {
+            // Per-datagram chain.
             if self.rng.bernoulli(self.profile.burst_exit) {
                 self.in_burst = false;
             }

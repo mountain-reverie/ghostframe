@@ -14,6 +14,11 @@ pub struct NetProfile {
     pub burst_exit: f64,
     /// Drop probability while in the bad state.
     pub burst_loss: f64,
+    /// Virtual microseconds per Gilbert-Elliott step. 0 (the raw-field
+    /// default) steps the chain once per datagram, `burst_enter`/`burst_exit`
+    /// being per-datagram probabilities. Nonzero steps it once per quantum of
+    /// elapsed virtual time, whatever was sent (see `netsim::burst`).
+    pub burst_quantum_us: u64,
 
     /// Independent per-datagram duplication probability: [0, 1].
     pub duplicate: f64,
@@ -136,6 +141,7 @@ impl NetProfile {
             burst_enter: 0.0,
             burst_exit: 1.0,
             burst_loss: 0.0,
+            burst_quantum_us: 0,
             duplicate: 0.0,
             corrupt: 0.0,
             delay_us: 0,

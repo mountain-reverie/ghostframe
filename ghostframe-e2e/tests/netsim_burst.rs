@@ -7,23 +7,42 @@
 //! rng draw order does not make them fail by luck.
 
 use ghostframe_e2e::netsim::{
-    BurstConfig, BurstDirection, GilbertElliott, NetProfile, NetSim, Verdict,
+    BurstConfig, BurstDirection, GilbertElliott, NetProfile, NetSim, Verdict, BURST_QUANTUM_US,
+    REFERENCE_DATAGRAM_INTERVAL_US,
 };
 use std::collections::HashMap;
 
 const N: usize = 2_000_000;
 
-/// Drop mask for `n` datagrams through a profile.
-fn mask(profile: NetProfile, seed: u64, n: usize) -> Vec<bool> {
+const Q: u64 = BURST_QUANTUM_US;
+const REF: u64 = REFERENCE_DATAGRAM_INTERVAL_US;
+
+/// Drop mask for `n` datagrams through a profile, one every `spacing_us`.
+fn mask_at(profile: NetProfile, seed: u64, n: usize, spacing_us: u64) -> Vec<bool> {
     let mut sim = NetSim::new(profile, seed);
     (0..n)
-        .map(|i| matches!(sim.decide(1200, i as u64 * 100), Verdict::Drop))
+        .map(|i| matches!(sim.decide(1200, i as u64 * spacing_us), Verdict::Drop))
         .collect()
 }
 
+/// At the reference send rate, which is what `len` is denominated in.
+fn mask(profile: NetProfile, seed: u64, n: usize) -> Vec<bool> {
+    mask_at(profile, seed, n, REF)
+}
+
+/// Time-based model (the default).
 fn ge_profile(avg: f64, len: f64, bad: f64) -> NetProfile {
     let mut p = NetProfile::perfect();
     GilbertElliott::from_rate_and_burst(avg, len, bad)
+        .expect("feasible")
+        .apply_to(&mut p);
+    p
+}
+
+/// The old per-datagram chain.
+fn ge_profile_per_datagram(avg: f64, len: f64, bad: f64) -> NetProfile {
+    let mut p = NetProfile::perfect();
+    GilbertElliott::from_rate_and_burst_per_datagram(avg, len, bad)
         .expect("feasible")
         .apply_to(&mut p);
     p
@@ -76,7 +95,10 @@ fn partial_loss_in_bad_state_still_hits_the_average() {
 }
 
 #[test]
-fn mean_loss_run_length_matches_configured_burst() {
+fn mean_burst_duration_matches_configured_burst_in_time() {
+    // Sampled once per quantum, a loss run of k datagrams is k quanta of
+    // burst, so mean run * quantum is the mean burst duration, which the
+    // configuration states as `len` reference intervals.
     for &(avg, len) in &[
         (0.05, 1.0),
         (0.05, 4.0),
@@ -84,24 +106,127 @@ fn mean_loss_run_length_matches_configured_burst() {
         (0.02, 8.0),
         (0.1, 20.0),
     ] {
-        let (_, mean, runs) = stats(&mask(ge_profile(avg, len, 1.0), 3, N));
+        let (_, mean, runs) = stats(&mask_at(ge_profile(avg, len, 1.0), 3, 6 * N, Q));
         assert!(runs > 1000, "premise: only {runs} runs");
+        let want_us = len * REF as f64;
+        let got_us = mean * Q as f64;
         assert!(
-            (mean - len).abs() < len * 0.06,
-            "avg {avg}: wanted mean run {len}, measured {mean:.3} over {runs} runs"
+            (got_us - want_us).abs() < want_us * 0.06,
+            "avg {avg}: wanted a {want_us} us burst, measured {got_us:.0} us over {runs} runs"
         );
     }
 }
 
 #[test]
-fn same_average_different_burst_length_moves_the_measured_run_length() {
-    let (r1, m1, _) = stats(&mask(ge_profile(0.05, 2.0, 1.0), 5, N));
-    let (r2, m2, _) = stats(&mask(ge_profile(0.05, 16.0, 1.0), 5, N));
-    assert!((r1 - r2).abs() < 0.005, "premise: rates {r1} vs {r2} equal");
+fn per_datagram_model_still_has_its_mean_run_in_datagrams() {
+    // The legacy chain, kept for fec_burst_analysis: run length is in
+    // datagrams, with no time scale.
+    for &(avg, len) in &[(0.05, 1.0), (0.05, 12.0), (0.1, 20.0)] {
+        let (_, mean, runs) = stats(&mask(ge_profile_per_datagram(avg, len, 1.0), 3, N));
+        assert!(runs > 1000);
+        assert!(
+            (mean - len).abs() < len * 0.06,
+            "wanted mean run {len}, measured {mean:.3}"
+        );
+    }
+}
+
+/// The property the per-datagram chain got wrong. Hold the link and the
+/// configured burst (8 reference intervals = 8 ms) fixed and change only how
+/// often the sender sends.
+///
+/// * The long-run loss fraction is the configured average at every rate.
+/// * Sending every 100 us (80x denser than the burst is long) a loss run is
+///   about 80 datagrams; sending every 200 ms (25x longer than the burst)
+///   consecutive datagrams are independent samples of the chain, so the mean
+///   run is that of i.i.d. loss, 1 / (1 - avg), not 8 and not 80. A chain
+///   that steps per datagram gives ~8 at both.
+#[test]
+fn burst_is_a_duration_not_a_datagram_count() {
+    let avg = 0.05;
+    let p = ge_profile(avg, 8.0, 1.0);
+    let n = 4_000_000;
+    let (rate_dense, run_dense, runs_d) = stats(&mask_at(p.clone(), 21, n, Q));
+    let (rate_ref, run_ref, runs_r) = stats(&mask_at(p.clone(), 21, n, REF));
+    let (rate_sparse, run_sparse, runs_s) = stats(&mask_at(p, 21, n, 200_000));
+    assert!(runs_d > 500 && runs_r > 500 && runs_s > 500, "premise");
+    for (name, r) in [
+        ("dense", rate_dense),
+        ("ref", rate_ref),
+        ("sparse", rate_sparse),
+    ] {
+        assert!(
+            (r - avg).abs() < avg * 0.08,
+            "{name}: loss fraction {r:.4} vs {avg}"
+        );
+    }
+    assert!(run_dense > 60.0, "dense mean run {run_dense:.1}");
     assert!(
-        m2 > m1 * 4.0,
-        "measurement must move with the knob: {m1:.2} vs {m2:.2}"
+        (6.0..12.0).contains(&run_ref),
+        "reference-rate mean run {run_ref:.2}"
     );
+    let iid_run = 1.0 / (1.0 - avg);
+    assert!(
+        (run_sparse - iid_run).abs() < 0.1,
+        "sparse mean run {run_sparse:.3}: consecutive datagrams 200 ms apart must be \
+         independent (i.i.d. {iid_run:.3}), not one burst"
+    );
+}
+
+/// P(lost | previous datagram lost, `gap` of virtual time earlier) must be
+/// the chain's own n-step law, pi + (1 - pi) l^n, with n = gap / quantum.
+/// This pins the closed-form advance against the step-by-step definition.
+#[test]
+fn conditional_loss_follows_the_n_step_law_of_the_chain() {
+    let (avg, len) = (0.05, 8.0);
+    let m = GilbertElliott::from_rate_and_burst(avg, len, 1.0).unwrap();
+    let pi = m.stationary_bad();
+    let l = 1.0 - m.p_gb - m.p_bg;
+    let p = ge_profile(avg, len, 1.0);
+    for gap_us in [Q, 3 * Q, 10 * Q, 40 * Q, 120 * Q, 1_000 * Q] {
+        let mk = mask_at(p.clone(), 17, N, gap_us);
+        let (mut after_loss, mut both) = (0usize, 0usize);
+        for w in mk.windows(2) {
+            if w[0] {
+                after_loss += 1;
+                both += usize::from(w[1]);
+            }
+        }
+        assert!(after_loss > 20_000, "premise: {after_loss} losses");
+        let got = both as f64 / after_loss as f64;
+        let want = pi + (1.0 - pi) * l.powi((gap_us / Q) as i32);
+        assert!(
+            (got - want).abs() < 0.02,
+            "gap {gap_us} us: P(loss | loss) {got:.4}, chain says {want:.4}"
+        );
+    }
+}
+
+#[test]
+fn irregular_gaps_are_deterministic_and_cost_one_draw_each() {
+    // Same seed, same offered times => same verdicts; and the profile
+    // being time-based must not change how many draws a call consumes, so
+    // a Deliver's jitter after a long gap matches a run with the same gap
+    // pattern (determinism), not a shifted stream.
+    let mut p = ge_profile(0.05, 8.0, 1.0);
+    p.jitter_us = 500;
+    let times: Vec<u64> = (0..20_000u64)
+        .map(|i| i * i % 7_919 * 137 + i * 90)
+        .collect();
+    let run = |seed| {
+        let mut sim = NetSim::new(p.clone(), seed);
+        let mut t = 0;
+        times
+            .iter()
+            .map(|d| {
+                t += d;
+                sim.decide(1200, t)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(run(5), run(5));
+    assert_ne!(run(5), run(6));
+    assert!(run(5).iter().any(|v| matches!(v, Verdict::Drop)), "premise");
 }
 
 #[test]
@@ -111,10 +236,10 @@ fn iid_run_length_is_short_compared_to_burst_at_equal_rate() {
         ..NetProfile::perfect()
     };
     let (_, m_iid, _) = stats(&mask(iid, 9, N));
-    let (_, m_b, _) = stats(&mask(ge_profile(0.05, 8.0, 1.0), 9, N));
+    let (_, m_b, _) = stats(&mask_at(ge_profile(0.05, 8.0, 1.0), 9, N, Q));
     // i.i.d. mean run is 1 / (1 - 0.05) = 1.0526.
     assert!((m_iid - 1.0526).abs() < 0.02, "iid mean run {m_iid}");
-    assert!(m_b > 7.0, "burst mean run {m_b}");
+    assert!(m_b > 70.0, "burst mean run {m_b}");
 }
 
 #[test]
@@ -132,7 +257,11 @@ fn same_seed_same_sequence_different_seed_differs() {
 fn analytic_expectation_agrees_with_construction() {
     let m = GilbertElliott::from_rate_and_burst(0.04, 6.0, 0.8).unwrap();
     assert!((m.expected_loss() - 0.04).abs() < 1e-12);
-    assert!((1.0 / m.p_bg - 6.0).abs() < 1e-12);
+    assert!((m.mean_burst_us().unwrap() - 6.0 * REF as f64).abs() < 1e-6);
+    let d = GilbertElliott::from_rate_and_burst_per_datagram(0.04, 6.0, 0.8).unwrap();
+    assert!((d.expected_loss() - 0.04).abs() < 1e-12);
+    assert!((1.0 / d.p_bg - 6.0).abs() < 1e-12);
+    assert_eq!(d.mean_burst_us(), None);
 }
 
 #[test]
@@ -146,8 +275,13 @@ fn infeasible_inputs_are_rejected() {
     assert!(f(0.5, 4.0, 0.5).is_err(), "avg == loss_bad");
     assert!(f(0.05, 4.0, 0.0).is_err());
     assert!(f(0.05, 4.0, 1.5).is_err());
-    // pi_B = 0.9, r = 1 => p = 9 > 1: bursts too short for that much loss.
-    assert!(f(0.9, 1.0, 1.0).is_err(), "p_gb > 1");
+    // Per datagram: pi_B = 0.9, r = 1 => p = 9 > 1. In time: r = 1/10 per
+    // quantum, pi_B = 0.95 => p = 1.9 > 1.
+    assert!(
+        GilbertElliott::from_rate_and_burst_per_datagram(0.9, 1.0, 1.0).is_err(),
+        "p_gb > 1"
+    );
+    assert!(f(0.95, 1.0, 1.0).is_err(), "p_gb > 1");
     assert!(f(0.05, 4.0, 1.0).is_ok());
 }
 
@@ -191,7 +325,7 @@ fn env_parses_values_defaults_and_seed() {
     assert_eq!(c.seed, 99);
     assert_eq!(c.model.loss_bad, 1.0);
     assert!((c.model.expected_loss() - 0.02).abs() < 1e-12);
-    assert!((1.0 / c.model.p_bg - 8.0).abs() < 1e-12);
+    assert!((c.model.mean_burst_us().unwrap() - 8.0 * REF as f64).abs() < 1e-6);
 
     let g = lookup(&[
         ("GHOSTFRAME_OUTBOUND_BURST_LOSS_PROBABILITY", "0.02"),
