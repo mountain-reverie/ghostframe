@@ -1595,4 +1595,32 @@ mod tests {
         assert!(l.resolve(1).is_some());
         assert!(l.rate_mark(1).is_none());
     }
+
+    /// A verdict keeps the delivery-rate mark in the tombstone, so a late
+    /// acknowledgement of the lost transmission can still be sampled.
+    #[test]
+    fn a_tombstone_keeps_the_rate_mark_and_the_departure_instant() {
+        use crate::transport::delivery_rate::RateSamplePacketState;
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(8);
+        let mark = |_: usize, _: u64, dep_idx: u64| RateMark {
+            pkt_num: dep_idx + 1,
+            state: RateSamplePacketState::default(),
+            pacer_limited: false,
+        };
+        for ws in 1..=3 {
+            l.record(ws, t0, tx(ws));
+            l.mark_departed(ws, t0, ws as u64);
+            l.mark_rate(ws, mark);
+        }
+        // 3 acknowledged ahead of 2: 2 is a hole and the time rule takes it.
+        assert!(l.resolve(3).is_some());
+        let lost = l.detect_losses_at(t0 + Duration::from_secs(5), Duration::ZERO);
+        assert_eq!(lost.iter().map(|l| l.0).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(l.tombstone_len(), 2, "premise: both are tombstones");
+        let (m, at) = l.rate_mark(2).expect("the tombstone kept the mark");
+        assert_eq!((m.pkt_num, at), (2, t0));
+        assert!(matches!(l.resolve(2), Some(Resolution::Late { .. })));
+        assert!(l.rate_mark(2).is_none(), "taken with the tombstone");
+    }
 }

@@ -489,8 +489,8 @@ fn stamp_departure_in(
     at: std::time::Instant,
 ) {
     if ledger.mark_departed(wire_seq, at, emitter.emit_us64(at)) {
-        ledger.mark_rate(wire_seq, |bytes, in_flight, _dep_idx| {
-            sampler.on_departure(at, bytes, in_flight, pacer_limited)
+        ledger.mark_rate(wire_seq, |bytes, in_flight, dep_idx| {
+            sampler.on_departure(at, bytes, in_flight, pacer_limited, dep_idx)
         });
     }
     emitter.on_departed(wire_seq, at);

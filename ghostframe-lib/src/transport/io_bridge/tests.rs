@@ -6804,6 +6804,50 @@ async fn departures_are_marked_and_an_ack_batch_makes_one_rate_sample() {
     assert_eq!(bridge.delivery_sampler.stats(super::now_std()).samples, 2);
 }
 
+/// A transmission declared lost and acknowledged after all was delivered by
+/// the network, only late: it is a delivery sample (the tombstone keeps its
+/// mark). One that may be an FEC recovery is not (nothing was delivered).
+#[tokio::test]
+async fn a_late_ack_of_a_declared_lost_transmission_is_still_sampled() {
+    use crate::transport::ack::{AckBatch, AckEntry};
+    let mut bridge = make_bridge_for_test().await;
+    let now = super::now_std();
+    let t0 = now - std::time::Duration::from_millis(40);
+    for ws in 1..=3u32 {
+        bridge
+            .transmission_ledger
+            .record(ws, t0, ledger_tx(1_000, 1_200, ws));
+        bridge.stamp_departure(ws, t0 + std::time::Duration::from_millis(ws as u64));
+    }
+    let ack = |ws: u32| {
+        AckBatch {
+            entries: vec![AckEntry {
+                wire_seq: ws,
+                arrival_time_ms_lo16: 3,
+            }],
+        }
+        .encode()
+    };
+    bridge.dispatch_ack_datagram(&ack(3));
+    let lost = bridge.transmission_ledger.detect_losses_at(
+        now + std::time::Duration::from_secs(60),
+        std::time::Duration::ZERO,
+    );
+    assert_eq!(lost.len(), 2, "premise: 1 and 2 are declared lost");
+    let before = bridge.delivery_sampler.stats(super::now_std());
+    assert_eq!((before.acked, before.samples), (1, 1));
+
+    bridge.dispatch_ack_datagram(&ack(2));
+    let after = bridge.delivery_sampler.stats(super::now_std());
+    assert_eq!(after.acked, 2, "the late ack was folded in");
+    assert_eq!(after.samples, 2, "and made a sample");
+    assert_eq!(
+        bridge.transmission_ledger.stats().acked_after_declared_lost,
+        1,
+        "premise: it went through the Late path"
+    );
+}
+
 /// A session change replaces the sampler: its `delivered` and ordinals belong
 /// to the session that is gone, and a mark left on a surviving record must not
 /// be read against the fresh estimator.

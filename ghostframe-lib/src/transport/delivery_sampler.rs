@@ -131,7 +131,6 @@ impl WindowedMax {
 
 pub struct DeliverySampler {
     est: DeliveryRateEstimator,
-    next_pkt: u64,
     /// Acknowledged transmissions folded into the estimator since the last
     /// [`Self::end_ack`].
     pending: Vec<SentPacket>,
@@ -151,7 +150,6 @@ impl DeliverySampler {
     pub fn new(now: Instant) -> Self {
         Self {
             est: DeliveryRateEstimator::new(now),
-            next_pkt: 1,
             pending: Vec::new(),
             pacer_flags: Vec::new(),
             last_sent_at: None,
@@ -177,15 +175,18 @@ impl DeliverySampler {
         wire_bytes: usize,
         bytes_in_flight: u64,
         pacer_limited: bool,
+        dep_idx: u64,
     ) -> RateMark {
         let mut p = SentPacket {
-            pkt_num: self.next_pkt,
+            // The ledger's departure index, one per datagram in FIFO order.
+            // Shifted by one: TQUIC reads 0 as "none" in its app-limited
+            // bookkeeping.
+            pkt_num: dep_idx + 1,
             time_sent: at,
             time_acked: None,
             sent_size: wire_bytes,
             rate_sample_state: RateSamplePacketState::default(),
         };
-        self.next_pkt += 1;
         self.est.on_packet_sent(&mut p, bytes_in_flight, 0);
         self.last_sent_at = Some(at);
         self.stats.marked += 1;
@@ -357,7 +358,8 @@ mod tests {
                     open: &mut Vec<(u64, u64, RateMark, usize)>,
                     acks: &mut BinaryHeap<Reverse<(u64, usize)>>,
                     batches: &mut Vec<Vec<(u64, RateMark, usize)>>| {
-            let mark = s.on_departure(at(now), SIZE, *inflight, false);
+            let dep_idx = s.marked();
+            let mark = s.on_departure(at(now), SIZE, *inflight, false, dep_idx);
             *inflight += SIZE as u64;
             let start = now.max(*link_free);
             *link_free = start + SIZE as u64 * 1_000_000 / RATE_BPS;
