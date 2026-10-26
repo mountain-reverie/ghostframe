@@ -103,8 +103,8 @@ fn report(name: &str, r: &BrowserlessResult) {
     println!(
         "BURSTREPORT {name}: offered={} dropped={} realised_loss={:.4} loss_runs={} \
          mean_run={:.3} max_run={} retransmit_attempts_total={} nack_hit={} nack_miss={} \
-         rto_fired={} retx_per_drop={:.3} tiles_present={}/{} stale={} \
-         s2c_bytes={} s2c_dg={} total_bytes={} retx_nack={} rto_spurious={} rto_useful={} \
+         loss_path_resends={} retx_per_drop={:.3} tiles_present={}/{} stale={} \
+         s2c_bytes={} s2c_dg={} total_bytes={} retx_nack={} loss_path_resends_spurious={} loss_path_resends_useful={} \
          quinn_cwnd={} quinn_cong={} quinn_lost_pk={} queue_max_B={} client_lost_pre_fec={} \
          client_run_hist={:?} client_recovered={} client_dup_rebuilt={} client_rx={:?}",
         r.s2c_datagrams_offered,
@@ -116,7 +116,7 @@ fn report(name: &str, r: &BrowserlessResult) {
         r.retransmit_attempts_total,
         r.nack_hit,
         r.nack_miss,
-        r.rto_fired,
+        r.loss_path_resends,
         ratio,
         tiles_present(r),
         COLS * ROWS,
@@ -125,8 +125,8 @@ fn report(name: &str, r: &BrowserlessResult) {
         r.datagrams_delivered_s2c,
         r.bytes_delivered,
         r.retransmit_by_nack,
-        r.rto_spurious,
-        r.rto_useful,
+        r.loss_path_resends_spurious,
+        r.loss_path_resends_useful,
         r.transport.cwnd,
         r.transport.congestion_events,
         r.transport.lost_packets,
@@ -167,8 +167,8 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
          departures_stamped={} evicted_before_departure={}] \
          loss[pkt={} time={} pto={} k_pkt={} k_raises={} spurious_ledger={} loss_retx={} probe_retx={} pto_fires={} \
          verdict_no_retx[gone={} newer={} queued={}] spurious_loss={} spurious_pto={}] \
-         ecn[ect0={} unmarked={} last_marked={}] rto_fired={} rto_spurious={} rto_useful={} \
-         generation_replacements={} rto_fired_superseded={} \
+         ecn[ect0={} unmarked={} last_marked={}] loss_path_resends={} loss_path_resends_spurious={} loss_path_resends_useful={} \
+         generation_replacements={} loss_path_resends_superseded={} \
          nack_miss[pending_in_scheduler={} not_owed={}]",
         i.window_us / 1000,
         i.fifo_samples,
@@ -240,11 +240,11 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
         i.ecn.ect0_tx,
         i.ecn.unmarked_tx,
         i.ecn.last_marked,
-        r.rto_fired,
-        r.rto_spurious,
-        r.rto_useful,
+        r.loss_path_resends,
+        r.loss_path_resends_spurious,
+        r.loss_path_resends_useful,
         i.generation_replacements,
-        i.rto_fired_superseded,
+        i.loss_path_resends_superseded,
         i.nack_miss_pending,
         i.nack_miss_not_owed,
     );
@@ -476,7 +476,7 @@ async fn iid_versus_burst_loss_at_equal_average_rate() {
             "{n}: client counted no datagrams"
         );
         assert_eq!(
-            r.retransmit_by_nack + r.rto_fired,
+            r.retransmit_by_nack + r.loss_path_resends,
             r.retransmit_attempts_total,
             "{n}: every retransmission is a NACK's or the RTO's"
         );
@@ -502,7 +502,7 @@ async fn iid_versus_burst_loss_at_equal_average_rate() {
             "{n}: premise: no tile changed generation, so the checks below prove nothing"
         );
         assert_eq!(
-            i.rto_fired_superseded, 0,
+            i.loss_path_resends_superseded, 0,
             "{n}: the RTO re-sent a pass of a generation its tile had moved past"
         );
         assert_eq!(
@@ -539,7 +539,7 @@ async fn iid_versus_burst_loss_at_equal_average_rate() {
             "{n}: queue depth never measured"
         );
         assert!(
-            r.rto_fired > 0,
+            r.loss_path_resends > 0,
             "{n}: premise: the RTO fires under loss in this scene"
         );
         // Not asserted any more: that some RTO fires were spurious. They were
@@ -548,12 +548,12 @@ async fn iid_versus_burst_loss_at_equal_average_rate() {
         // count, and the counter is exercised by the lib tests
         // (`an_ack_for_the_original_after_an_rto_is_a_spurious_fire`).
         assert!(
-            r.rto_useful > 0,
+            r.loss_path_resends_useful > 0,
             "{n}: {} RTO fires, none useful",
-            r.rto_fired
+            r.loss_path_resends
         );
         assert!(
-            r.rto_spurious + r.rto_useful <= r.rto_fired,
+            r.loss_path_resends_spurious + r.loss_path_resends_useful <= r.loss_path_resends,
             "{n}: more fires attributed than fired"
         );
         assert!(
@@ -623,7 +623,7 @@ async fn burst_loss_report_over_three_seeds() {
                 b.ceiling_reseeds_skipped_gap
             );
             println!(
-                "LATENCY {name}: critical n={} mean_us={} max_us={} refinement n={} mean_us={} max_us={} retx_B[nack={} rto={}] rto_original_first={}",
+                "LATENCY {name}: critical n={} mean_us={} max_us={} refinement n={} mean_us={} max_us={} retx_B[nack={} rto={}] loss_path_resends_original_first={}",
                 r.critical_latency_count,
                 r.critical_latency_mean_us,
                 r.critical_latency_max_us,
@@ -636,7 +636,7 @@ async fn burst_loss_report_over_three_seeds() {
                 r.transport.instr.offered.of(
                     ghostframe_lib::transport::reliable_emitter::emission_queue::WireClass::RtoRetransmit
                 ),
-                r.rto_original_first,
+                r.loss_path_resends_original_first,
             );
             let (ready, distinct, refinements) = content_delivered(r);
             println!(
@@ -719,8 +719,8 @@ fn report_p2(name: &str, r: &BrowserlessResult) {
     let i = &r.transport.instr;
     println!(
         "P2 {name}: s2c_bytes={} s2c_dg={} total_bytes={} dropped={} fifo_max={} \
-         fifo_peak_at_enqueue={} lag_p50_us={} lag_p95_us={} rto_fired={} rto_spurious={} \
-         rto_useful={} quinn_cwnd={}",
+         fifo_peak_at_enqueue={} lag_p50_us={} lag_p95_us={} loss_path_resends={} loss_path_resends_spurious={} \
+         loss_path_resends_useful={} quinn_cwnd={}",
         r.bytes_delivered_s2c,
         r.datagrams_delivered_s2c,
         r.bytes_delivered,
@@ -729,9 +729,9 @@ fn report_p2(name: &str, r: &BrowserlessResult) {
         i.fifo_depth_peak_at_enqueue,
         i.lag_p50_us,
         i.lag_p95_us,
-        r.rto_fired,
-        r.rto_spurious,
-        r.rto_useful,
+        r.loss_path_resends,
+        r.loss_path_resends_spurious,
+        r.loss_path_resends_useful,
         r.transport.cwnd
     );
 }
@@ -890,17 +890,17 @@ async fn p2b_quinn_is_never_left_idle_while_admission_holds_work() {
 // F4 gate (D1 PR-4): the retransmission timer is a measured probe timeout.
 // ---------------------------------------------------------------------------
 
-/// P4: under 2 % i.i.d. loss the share of loss-path resends (`rto_fired`: loss
+/// P4: under 2 % i.i.d. loss the share of loss-path resends (`loss_path_resends`: loss
 /// verdicts and probes) that were for data that had in fact arrived
-/// (`rto_original_first`: the pass was first acknowledged through its original,
+/// (`loss_path_resends_original_first`: the pass was first acknowledged through its original,
 /// the Eifel test), pooled over five seeds, is at most 10 %; and a clean link
 /// resends nothing.
 ///
-/// Why i.i.d., why this counter, why pooled. `rto_spurious` takes a spurious
+/// Why i.i.d., why this counter, why pooled. `loss_path_resends_spurious` takes a spurious
 /// verdict back when the retransmission is acknowledged too, which it nearly
 /// always is (every duplicate is acknowledged), so it read 0 on every base run
 /// and could not tell a bad timer from a good one; the design's 0.68 to 0.75
-/// was the retransmit loop of #225. `rto_original_first` is final. The scene is
+/// was the retransmit loop of #225. `loss_path_resends_original_first` is final. The scene is
 /// stepped, so each seed's value is exact, but it is chaotic: between PR-4
 /// revisions one seed moved from 0.001 to 0.114 while the other four stayed
 /// under 0.05. A per-seed bound would gate on that one draw; the pooled share
@@ -937,17 +937,17 @@ async fn p4_spurious_share_of_rto_fires_under_iid_loss() {
         assert_established(&n, &lossy);
         assert!(lossy.s2c_datagrams_dropped > 0, "{n}: dropped nothing");
         assert!(
-            lossy.rto_fired >= 50,
+            lossy.loss_path_resends >= 50,
             "{n}: premise: only {} RTO fires, a share of them proves nothing",
-            lossy.rto_fired
+            lossy.loss_path_resends
         );
-        let share = lossy.rto_original_first as f64 / lossy.rto_fired as f64;
+        let share = lossy.loss_path_resends_original_first as f64 / lossy.loss_path_resends as f64;
         println!(
-            "P4 {n}: rto_fired={} rto_original_first={} (rto_spurious={} rto_useful={}) share={share:.4}",
-            lossy.rto_fired, lossy.rto_original_first, lossy.rto_spurious, lossy.rto_useful
+            "P4 {n}: loss_path_resends={} loss_path_resends_original_first={} (loss_path_resends_spurious={} loss_path_resends_useful={}) share={share:.4}",
+            lossy.loss_path_resends, lossy.loss_path_resends_original_first, lossy.loss_path_resends_spurious, lossy.loss_path_resends_useful
         );
-        fired += lossy.rto_fired;
-        original_first += lossy.rto_original_first;
+        fired += lossy.loss_path_resends;
+        original_first += lossy.loss_path_resends_original_first;
     }
     let pooled = original_first as f64 / fired as f64;
     println!("P4 pooled share over 5 seeds: {pooled:.4} ({original_first} of {fired})");
@@ -968,7 +968,7 @@ async fn p4_spurious_share_of_rto_fires_under_iid_loss() {
             "{n}: premise: no tile changed, the control exercised nothing"
         );
         assert_eq!(
-            clean.rto_fired, 0,
+            clean.loss_path_resends, 0,
             "{n}: a timer fired on a link that dropped nothing"
         );
     }
@@ -984,7 +984,7 @@ async fn p4_spurious_share_of_rto_fires_under_iid_loss() {
 /// One full-grid CDF 5/3 frame, then silence, over a link dropping 5 % of
 /// the s2c datagrams. Premises: datagrams were dropped and something repaired
 /// them, by a NACK (`nack_hit > 0`) or by the server's probe timeout
-/// (`rto_useful > 0`), or the zero below is the zero of a scene that needed no
+/// (`loss_path_resends_useful > 0`), or the zero below is the zero of a scene that needed no
 /// repair. Which of the two repairs a given seed is not fixed: since the RTT
 /// based probe timeout (D1 PR-4) seed 0xB0B058 is repaired by the timeout
 /// alone, `nack_hit` 0. Outcome: no tile is owed a pass and none has given up.
@@ -1019,15 +1019,15 @@ async fn a_lossy_screen_converges_under_the_evidence_gated_tail_sweep() {
         assert_established("lossy", &r);
         let c = &r.client_cdf53;
         println!(
-            "RC5 seed={seed:#x}: dropped={} nack_hit={} nack_miss={} rto_fired={} rto_useful={} tiles={} complete={} partial={} gave_up={}",
-            r.s2c_datagrams_dropped, r.nack_hit, r.nack_miss, r.rto_fired, r.rto_useful, c.tiles, c.complete, c.partial, c.gave_up
+            "RC5 seed={seed:#x}: dropped={} nack_hit={} nack_miss={} loss_path_resends={} loss_path_resends_useful={} tiles={} complete={} partial={} gave_up={}",
+            r.s2c_datagrams_dropped, r.nack_hit, r.nack_miss, r.loss_path_resends, r.loss_path_resends_useful, c.tiles, c.complete, c.partial, c.gave_up
         );
         assert!(
             r.s2c_datagrams_dropped > 0,
             "{seed:#x}: nothing was dropped"
         );
         assert!(
-            r.nack_hit + r.rto_useful > 0,
+            r.nack_hit + r.loss_path_resends_useful > 0,
             "{seed:#x}: neither a NACK nor the RTO repaired anything"
         );
         assert_eq!(c.tiles, COLS * ROWS, "{seed:#x}: tiles with no coverage");
@@ -1092,14 +1092,14 @@ async fn a_lost_final_pass_is_repaired_by_the_rto_since_the_sweep_has_no_evidenc
     .expect("scene ran");
     let c = &r.client_cdf53;
     println!(
-        "RC5TAIL drops_fired={:?} rto_fired={} nack_hit={} nack_miss={} tiles={} complete={} partial={} gave_up={}",
-        r.drops_fired, r.rto_fired, r.nack_hit, r.nack_miss, c.tiles, c.complete, c.partial, c.gave_up
+        "RC5TAIL drops_fired={:?} loss_path_resends={} nack_hit={} nack_miss={} tiles={} complete={} partial={} gave_up={}",
+        r.drops_fired, r.loss_path_resends, r.nack_hit, r.nack_miss, c.tiles, c.complete, c.partial, c.gave_up
     );
     assert!(
         r.drops_fired.iter().any(|&n| n > 0),
         "the final pass was never dropped"
     );
-    assert!(r.rto_fired > 0, "the RTO never fired");
+    assert!(r.loss_path_resends > 0, "the RTO never fired");
     assert_eq!(c.tiles, 1, "the tile has no coverage at all");
     assert_eq!(c.partial, 0, "the lost final pass was never repaired");
 }

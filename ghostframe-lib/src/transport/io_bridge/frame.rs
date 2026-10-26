@@ -2156,7 +2156,7 @@ impl IoBridge {
                 emitted_h264 = c.h264,
                 send_datagram_errs_total = self.datagram_send_errs,
                 fec_parity_emitted = es.parity_emitted,
-                rto_fired = es.rto_fired,
+                loss_path_resends = es.loss_path_resends,
                 rto_max_retransmits_reached = es.rto_max_retransmits_reached,
                 // Split, not summed. This was logged as a single
                 // `nack_received = nack_hit + nack_miss`, which cannot
@@ -2191,17 +2191,17 @@ impl IoBridge {
                 send_rejected = es.send_rejected,
                 // Retransmission cause and the RTO's hit rate. Of
                 // `retransmit_attempts_total`, `retx_nack` were asked for by
-                // the client and `rto_fired` were the timer's. A fire whose
+                // the client and `loss_path_resends` were the timer's. A fire whose
                 // pass was then acknowledged by an earlier transmission is
-                // `rto_spurious`; one repaired by its retransmission is
-                // `rto_useful`.
+                // `loss_path_resends_spurious`; one repaired by its retransmission is
+                // `loss_path_resends_useful`.
                 retx_nack = es.retransmit_by_nack,
-                rto_spurious = es.rto_spurious,
-                rto_useful = es.rto_useful,
+                loss_path_resends_spurious = es.loss_path_resends_spurious,
+                loss_path_resends_useful = es.loss_path_resends_useful,
                 // Superseded content: tile generations replaced (the premise),
                 // and RTO fires for a pass whose tile had moved on (expect 0).
                 generation_replacements = es.generation_replacements,
-                rto_fired_superseded = es.rto_fired_superseded,
+                loss_path_resends_superseded = es.loss_path_resends_superseded,
                 // quinn's view of the path and the depth of its datagram
                 // send queue. A queue that only grows while `quinn_cwnd`
                 // stays cut is the standing queue behind the RTO cascade.

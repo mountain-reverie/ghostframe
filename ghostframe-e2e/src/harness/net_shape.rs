@@ -94,7 +94,7 @@ impl NetShape {
     }
 
     /// `tailnet_like`, plus the loss rate at which the production session's
-    /// retransmit path was active (`rto_fired=6739` against 9208 original
+    /// retransmit path was active (`loss_path_resends=6739` against 9208 original
     /// passes).
     pub fn tailnet_like_lossy() -> Self {
         Self {

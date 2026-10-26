@@ -296,7 +296,7 @@ fn report_d1(scene: &str, r: &BrowserlessResult) {
         "d1_rto",
         format!(
             "fired={} spurious={} useful={}",
-            r.rto_fired, r.rto_spurious, r.rto_useful
+            r.loss_path_resends, r.loss_path_resends_spurious, r.loss_path_resends_useful
         ),
     );
 }

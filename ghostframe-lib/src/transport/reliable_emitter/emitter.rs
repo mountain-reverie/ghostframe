@@ -38,11 +38,11 @@ pub struct ReliableTileEmitter {
     /// first retransmission's `wire_seq`, how many times it was resent and by
     /// whom (a verdict or the probe). Resolved by
     /// [`Self::note_ack_origin`]. Measurement only.
-    rto_origin: HashMap<EmitKey, RtoOrigin>,
+    resend_origin: HashMap<EmitKey, ResendOrigin>,
     /// Per tile: the generation of the last first-fragment tile datagram
     /// emitted for it. Only read when the loss path resends, to tell a resend for the
     /// tile's current content from one for content it has moved past
-    /// (`rto_fired_superseded`). Measurement only.
+    /// (`loss_path_resends_superseded`). Measurement only.
     latest_tile_generation: HashMap<(u8, u8), u8>,
     /// RFC 9002 RTT estimator, fed by `IoBridge` with one departure-based
     /// sample per acknowledged `wire_seq`. [`pto_for_attempt`] derives every
@@ -130,9 +130,9 @@ pub struct EmitterStats {
     pub source_emitted: u64,
     pub parity_emitted: u64,
     /// Retransmissions made by the loss path: `loss_retransmits` plus
-    /// `pto_probe_retransmits`. (The name predates the per-pass timer, which
+    /// `pto_probe_retransmits`. (Formerly `rto_fired`, from the per-pass timer, which
     /// is gone.)
-    pub rto_fired: u64,
+    pub loss_path_resends: u64,
     pub rto_max_retransmits_reached: u64,
     pub ack_hit: u64,
     pub ack_miss: u64,
@@ -169,30 +169,30 @@ pub struct EmitterStats {
     /// The client repeats itself every tail sweep; these cost nothing.
     pub nack_deduped: u64,
     /// Of `retransmit_attempts_total`, those a NACK asked for (the rest are the
-    /// loss path's: `rto_fired`). Measurement only.
+    /// loss path's: `loss_path_resends`). Measurement only.
     pub retransmit_by_nack: u64,
-    /// Loss-path resends (`rto_fired`) whose pass was then acknowledged by a
+    /// Loss-path resends (`loss_path_resends`) whose pass was then acknowledged by a
     /// transmission sent BEFORE the first resend: the data was still on its way.
     /// Takes its verdict back when the resend is acknowledged too (nearly always;
     /// every duplicate is acknowledged), so it reads far too low; see
-    /// `rto_original_first`. Measurement only.
-    pub rto_spurious: u64,
+    /// `loss_path_resends_original_first`. Measurement only.
+    pub loss_path_resends_spurious: u64,
     /// Loss-path resends whose pass was first acknowledged through a
     /// transmission sent before the first resend: the original arrived, so the
     /// verdict or probe was premature (the Eifel test, RFC 3522). Unlike
-    /// `rto_spurious` this verdict is final: the acknowledgement of the
+    /// `loss_path_resends_spurious` this verdict is final: the acknowledgement of the
     /// retransmission that follows an acknowledged original (every duplicate
     /// is acknowledged) does not turn it into a useful fire. Measurement only.
     ///
-    /// Not disjoint from `rto_useful`: a fire is both when the original is
+    /// Not disjoint from `loss_path_resends_useful`: a fire is both when the original is
     /// acknowledged first and the retransmission after it, so
-    /// `rto_original_first + rto_useful` can exceed `rto_fired`. Read it as a
-    /// share of `rto_fired`, not as a partition.
-    pub rto_original_first: u64,
+    /// `loss_path_resends_original_first + loss_path_resends_useful` can exceed `loss_path_resends`. Read it as a
+    /// share of `loss_path_resends`, not as a partition.
+    pub loss_path_resends_original_first: u64,
     /// Loss-path resends whose pass was acknowledged by a retransmission: the
-    /// resend earned its keep. `rto_fired - rto_spurious - rto_useful` were
+    /// resend earned its keep. `loss_path_resends - loss_path_resends_spurious - loss_path_resends_useful` were
     /// for passes not acknowledged yet. Measurement only.
-    pub rto_useful: u64,
+    pub loss_path_resends_useful: u64,
     /// Retransmissions made because a loss verdict (packet or time threshold)
     /// named a transmission whose content was still current.
     pub loss_retransmits: u64,
@@ -221,10 +221,10 @@ pub struct EmitterStats {
     pub spurious_pto: u64,
     /// Times the resend bookkeeping hit its cap and was dropped; resends made
     /// before a reset and not yet acknowledged are never attributed.
-    pub rto_origin_resets: u64,
+    pub resend_origin_resets: u64,
     /// First-fragment tile datagrams emitted at a different generation from
     /// the tile's previous one: tile content replaced while the emitter was
-    /// watching. The premise of `rto_fired_superseded`, and deliberately
+    /// watching. The premise of `loss_path_resends_superseded`, and deliberately
     /// independent of `cancel_for_tile` (a count of cancellations would read
     /// zero exactly when the cancel is missing, hiding that bug behind a failed
     /// premise). Zero means no tile changed and a zero there proves nothing.
@@ -235,7 +235,7 @@ pub struct EmitterStats {
     /// unacknowledged, so the fire can never be settled. Zero by construction
     /// while every supersession cancels the cache; non-zero means a path
     /// replaces tile content without cancelling. Measurement only.
-    pub rto_fired_superseded: u64,
+    pub loss_path_resends_superseded: u64,
 }
 
 /// What is known about a pass the loss path resent: the first retransmission's
@@ -243,7 +243,7 @@ pub struct EmitterStats {
 /// counted as spurious (an older transmission was acknowledged) so a later
 /// acknowledgement of a retransmission can move them to useful.
 #[derive(Clone, Copy)]
-struct RtoOrigin {
+struct ResendOrigin {
     first_retx_ws: u32,
     fires: u32,
     counted_spurious: bool,
@@ -327,9 +327,9 @@ pub enum RetxRequest {
 /// Most passes whose resend history is tracked at once. Measurement only: a
 /// pass that fires and is never acknowledged (cancelled, retired, or every
 /// copy lost) would otherwise sit here forever. At the cap the whole table is
-/// dropped and `rto_origin_resets` counts it, so the newest fires stay
+/// dropped and `resend_origin_resets` counts it, so the newest fires stay
 /// attributed and a reader can see that older ones were forgotten.
-const RTO_ORIGIN_CAP: usize = 16_384;
+const RESEND_ORIGIN_CAP: usize = 16_384;
 
 impl ReliableTileEmitter {
     /// `now` becomes `time_base` — the reference instant every subsequent
@@ -343,7 +343,7 @@ impl ReliableTileEmitter {
             alloc: WireSeqAllocator::new(),
             queue: EmissionQueue::new(),
             group: GroupBuilder::new(FEC_GROUP_SIZE_K),
-            rto_origin: HashMap::new(),
+            resend_origin: HashMap::new(),
             latest_tile_generation: HashMap::new(),
             rtt: RttEstimator::new(),
             last_ack_at: None,
@@ -578,15 +578,15 @@ impl ReliableTileEmitter {
         }
     }
 
-    fn note_rto_fire(&mut self, key: EmitKey, first_ws: Option<u32>, by_pto: bool) {
+    fn note_loss_path_resend(&mut self, key: EmitKey, first_ws: Option<u32>, by_pto: bool) {
         let Some(ws) = first_ws else { return };
-        if let Some(e) = self.rto_origin.get_mut(&key) {
+        if let Some(e) = self.resend_origin.get_mut(&key) {
             e.fires += 1;
             if e.counted_spurious {
-                self.stats.rto_spurious += 1;
+                self.stats.loss_path_resends_spurious += 1;
             }
             if e.original_first {
-                self.stats.rto_original_first += 1;
+                self.stats.loss_path_resends_original_first += 1;
                 if e.by_pto {
                     self.stats.spurious_pto += 1;
                 } else {
@@ -595,13 +595,13 @@ impl ReliableTileEmitter {
             }
             return;
         }
-        if self.rto_origin.len() >= RTO_ORIGIN_CAP {
-            self.rto_origin.clear();
-            self.stats.rto_origin_resets += 1;
+        if self.resend_origin.len() >= RESEND_ORIGIN_CAP {
+            self.resend_origin.clear();
+            self.stats.resend_origin_resets += 1;
         }
-        self.rto_origin.insert(
+        self.resend_origin.insert(
             key,
-            RtoOrigin {
+            ResendOrigin {
                 first_retx_ws: ws,
                 fires: 1,
                 counted_spurious: false,
@@ -622,18 +622,18 @@ impl ReliableTileEmitter {
     /// indistinguishable from the loss path's here, so a pass both resent and
     /// NACKed is attributed by whichever transmission was acknowledged.
     pub fn note_ack_origin(&mut self, key: EmitKey, wire_seq: u32) {
-        let Some(e) = self.rto_origin.get_mut(&key) else {
+        let Some(e) = self.resend_origin.get_mut(&key) else {
             return;
         };
         let fires = u64::from(e.fires);
         if (wire_seq.wrapping_sub(e.first_retx_ws) as i32) < 0 {
             if !e.counted_spurious {
                 e.counted_spurious = true;
-                self.stats.rto_spurious += fires;
+                self.stats.loss_path_resends_spurious += fires;
             }
             if !e.original_first {
                 e.original_first = true;
-                self.stats.rto_original_first += fires;
+                self.stats.loss_path_resends_original_first += fires;
                 if e.by_pto {
                     self.stats.spurious_pto += fires;
                 } else {
@@ -642,10 +642,10 @@ impl ReliableTileEmitter {
             }
         } else {
             if e.counted_spurious {
-                self.stats.rto_spurious -= fires;
+                self.stats.loss_path_resends_spurious -= fires;
             }
-            self.stats.rto_useful += fires;
-            self.rto_origin.remove(&key);
+            self.stats.loss_path_resends_useful += fires;
+            self.resend_origin.remove(&key);
         }
     }
 
@@ -923,7 +923,7 @@ impl ReliableTileEmitter {
                     .get(&(key.tile_x, key.tile_y))
                     .is_some_and(|&latest| latest != g)
                 {
-                    self.stats.rto_fired_superseded += 1;
+                    self.stats.loss_path_resends_superseded += 1;
                 }
             }
             let bytes = Bytes::from(bytes);
@@ -944,12 +944,12 @@ impl ReliableTileEmitter {
             }
             spent += bytes.len() + self.wire_overhead;
             self.queue.push_source(bytes, WireClass::RtoRetransmit);
-            self.stats.rto_fired += 1;
+            self.stats.loss_path_resends += 1;
             match cause {
                 RetxCause::Loss => self.stats.loss_retransmits += 1,
                 RetxCause::Probe => self.stats.pto_probe_retransmits += 1,
             }
-            self.note_rto_fire(key, first_ws, cause == RetxCause::Probe);
+            self.note_loss_path_resend(key, first_ws, cause == RetxCause::Probe);
             self.stats.retransmit_attempts_total += 1;
             *count += 1;
         }
@@ -971,7 +971,7 @@ impl ReliableTileEmitter {
         let retired = self.cache.retire_older_than(now, older_than);
         self.stats.stuck_entries_retired += retired.len() as u64;
         for k in &retired {
-            self.rto_origin.remove(k);
+            self.resend_origin.remove(k);
         }
         retired
     }
@@ -1063,7 +1063,7 @@ impl ReliableTileEmitter {
     /// — see `RetransmitCache::clear` doc.
     pub fn clear_cache(&mut self) {
         self.cache.clear();
-        self.rto_origin.clear();
+        self.resend_origin.clear();
         self.latest_tile_generation.clear();
         self.pending_loss.clear();
         self.pending_loss_set.clear();
@@ -1725,7 +1725,7 @@ mod tests {
         let entry = e.cache.get(&key).unwrap();
         assert_eq!(entry.attempts, 1);
         assert!(entry.last_sent_at > entry_first_sent);
-        assert_eq!(e.stats.rto_fired, 1);
+        assert_eq!(e.stats.loss_path_resends, 1);
         assert_eq!(e.stats.retransmit_attempts_total, 1);
     }
 
@@ -1762,9 +1762,9 @@ mod tests {
         ask(&mut e, EmitKey::new(1, 0, 0, 0));
         ask(&mut e, EmitKey::new(2, 0, 0, 0));
         e.tick(t0 + Duration::from_millis(1_100), usize::MAX);
-        assert_eq!(e.stats.rto_fired, 2, "premise: both timers fired");
+        assert_eq!(e.stats.loss_path_resends, 2, "premise: both timers fired");
         assert_eq!(
-            e.stats.rto_fired_superseded, 1,
+            e.stats.loss_path_resends_superseded, 1,
             "only the pass of the generation the tile left is superseded"
         );
     }
@@ -1793,13 +1793,16 @@ mod tests {
         ask(&mut e, EmitKey::new(1, 0, 0, 0));
         ask(&mut e, EmitKey::new(2, 0, 0, 0));
         e.tick(t0 + Duration::from_millis(1_100), usize::MAX);
-        assert_eq!(e.stats.rto_fired, 1, "premise: the current pass fired");
-        assert_eq!(e.stats.rto_fired_superseded, 0);
+        assert_eq!(
+            e.stats.loss_path_resends, 1,
+            "premise: the current pass fired"
+        );
+        assert_eq!(e.stats.loss_path_resends_superseded, 0);
     }
 
     /// Fire the RTO once for a single pass sent as wire_seq 0 (the retransmit
     /// is wire_seq 1).
-    fn rto_fired_once() -> (ReliableTileEmitter, EmitKey) {
+    fn loss_path_resend_once() -> (ReliableTileEmitter, EmitKey) {
         let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
@@ -1811,22 +1814,34 @@ mod tests {
         ask(&mut e, key);
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
-        assert_eq!(e.stats.rto_fired, 1, "premise: the loss path fired");
+        assert_eq!(e.stats.loss_path_resends, 1, "premise: the loss path fired");
         (e, key)
     }
 
     #[test]
     fn an_ack_for_the_original_after_an_rto_is_a_spurious_fire() {
-        let (mut e, key) = rto_fired_once();
+        let (mut e, key) = loss_path_resend_once();
         e.note_ack_origin(key, 0);
-        assert_eq!((e.stats.rto_spurious, e.stats.rto_useful), (1, 0));
+        assert_eq!(
+            (
+                e.stats.loss_path_resends_spurious,
+                e.stats.loss_path_resends_useful
+            ),
+            (1, 0)
+        );
     }
 
     #[test]
     fn an_ack_for_the_retransmission_is_a_useful_fire() {
-        let (mut e, key) = rto_fired_once();
+        let (mut e, key) = loss_path_resend_once();
         e.note_ack_origin(key, 1);
-        assert_eq!((e.stats.rto_spurious, e.stats.rto_useful), (0, 1));
+        assert_eq!(
+            (
+                e.stats.loss_path_resends_spurious,
+                e.stats.loss_path_resends_useful
+            ),
+            (0, 1)
+        );
     }
 
     #[test]
@@ -1834,44 +1849,65 @@ mod tests {
         // A multi-fragment pass is acknowledged fragment by fragment: fragment
         // 0's original may be acknowledged first although fragment 1 was lost
         // and only the retransmission delivered it.
-        let (mut e, key) = rto_fired_once();
+        let (mut e, key) = loss_path_resend_once();
         e.note_ack_origin(key, 0);
-        assert_eq!((e.stats.rto_spurious, e.stats.rto_useful), (1, 0));
-        e.note_ack_origin(key, 1);
-        assert_eq!((e.stats.rto_spurious, e.stats.rto_useful), (0, 1));
+        assert_eq!(
+            (
+                e.stats.loss_path_resends_spurious,
+                e.stats.loss_path_resends_useful
+            ),
+            (1, 0)
+        );
         e.note_ack_origin(key, 1);
         assert_eq!(
-            (e.stats.rto_spurious, e.stats.rto_useful),
+            (
+                e.stats.loss_path_resends_spurious,
+                e.stats.loss_path_resends_useful
+            ),
+            (0, 1)
+        );
+        e.note_ack_origin(key, 1);
+        assert_eq!(
+            (
+                e.stats.loss_path_resends_spurious,
+                e.stats.loss_path_resends_useful
+            ),
             (0, 1),
             "counted once"
         );
     }
 
-    /// `rto_original_first` is the Eifel verdict and it is final: the original
+    /// `loss_path_resends_original_first` is the Eifel verdict and it is final: the original
     /// arrived first, so the timer was early, whatever the retransmission's
-    /// own acknowledgement does to `rto_spurious` afterwards.
+    /// own acknowledgement does to `loss_path_resends_spurious` afterwards.
     #[test]
     fn the_original_acknowledged_first_stays_a_spurious_fire_after_the_retransmission_is_too() {
-        let (mut e, key) = rto_fired_once();
+        let (mut e, key) = loss_path_resend_once();
         e.note_ack_origin(key, 0);
-        assert_eq!(e.stats.rto_original_first, 1);
+        assert_eq!(e.stats.loss_path_resends_original_first, 1);
         e.note_ack_origin(key, 1);
         assert_eq!(
-            (e.stats.rto_spurious, e.stats.rto_useful),
+            (
+                e.stats.loss_path_resends_spurious,
+                e.stats.loss_path_resends_useful
+            ),
             (0, 1),
             "the older counter takes it back"
         );
-        assert_eq!(e.stats.rto_original_first, 1, "this one does not");
+        assert_eq!(
+            e.stats.loss_path_resends_original_first, 1,
+            "this one does not"
+        );
     }
 
     #[test]
     fn the_retransmission_acknowledged_first_is_not_an_original_first_fire() {
-        let (mut e, key) = rto_fired_once();
+        let (mut e, key) = loss_path_resend_once();
         e.note_ack_origin(key, 1);
         // The original's acknowledgement, late: the pass is already settled.
         e.note_ack_origin(key, 0);
-        assert_eq!(e.stats.rto_original_first, 0);
-        assert_eq!(e.stats.rto_useful, 1);
+        assert_eq!(e.stats.loss_path_resends_original_first, 0);
+        assert_eq!(e.stats.loss_path_resends_useful, 1);
     }
 
     #[test]
@@ -1880,45 +1916,60 @@ mod tests {
         let key = EmitKey::new(1, 0, 0, 0);
         // First retransmission at wire_seq 2; the original (u32::MAX - 1, i.e.
         // 4 earlier across the wrap) is acknowledged.
-        e.note_rto_fire(key, Some(2), false);
+        e.note_loss_path_resend(key, Some(2), false);
         e.note_ack_origin(key, u32::MAX - 1);
-        assert_eq!(e.stats.rto_spurious, 1, "pre-wrap original is older");
-        e.note_rto_fire(key, Some(9), false);
-        assert_eq!(e.stats.rto_spurious, 2);
+        assert_eq!(
+            e.stats.loss_path_resends_spurious, 1,
+            "pre-wrap original is older"
+        );
+        e.note_loss_path_resend(key, Some(9), false);
+        assert_eq!(e.stats.loss_path_resends_spurious, 2);
     }
 
     #[test]
     fn the_rto_bookkeeping_is_bounded_and_counts_its_resets() {
         let mut e = ReliableTileEmitter::new(Instant::now());
-        for i in 0..(RTO_ORIGIN_CAP as u32 + 5) {
-            e.note_rto_fire(EmitKey::new(i, 0, 0, 0), Some(i), false);
+        for i in 0..(RESEND_ORIGIN_CAP as u32 + 5) {
+            e.note_loss_path_resend(EmitKey::new(i, 0, 0, 0), Some(i), false);
         }
-        assert!(e.rto_origin.len() <= RTO_ORIGIN_CAP);
-        assert_eq!(e.stats.rto_origin_resets, 1);
+        assert!(e.resend_origin.len() <= RESEND_ORIGIN_CAP);
+        assert_eq!(e.stats.resend_origin_resets, 1);
         // The newest fire is still attributable after the reset.
-        let newest = EmitKey::new(RTO_ORIGIN_CAP as u32 + 4, 0, 0, 0);
-        e.note_ack_origin(newest, RTO_ORIGIN_CAP as u32 + 4);
-        assert_eq!(e.stats.rto_useful, 1);
+        let newest = EmitKey::new(RESEND_ORIGIN_CAP as u32 + 4, 0, 0, 0);
+        e.note_ack_origin(newest, RESEND_ORIGIN_CAP as u32 + 4);
+        assert_eq!(e.stats.loss_path_resends_useful, 1);
     }
 
     #[test]
     fn clear_cache_forgets_rto_history() {
-        let (mut e, key) = rto_fired_once();
+        let (mut e, key) = loss_path_resend_once();
         e.clear_cache();
         e.note_ack_origin(key, 0);
-        assert_eq!((e.stats.rto_spurious, e.stats.rto_useful), (0, 0));
+        assert_eq!(
+            (
+                e.stats.loss_path_resends_spurious,
+                e.stats.loss_path_resends_useful
+            ),
+            (0, 0)
+        );
     }
 
     #[test]
     fn an_ack_for_a_pass_that_never_fired_counts_neither() {
-        let (mut e, _) = rto_fired_once();
+        let (mut e, _) = loss_path_resend_once();
         e.note_ack_origin(EmitKey::new(9, 0, 0, 0), 0);
-        assert_eq!((e.stats.rto_spurious, e.stats.rto_useful), (0, 0));
+        assert_eq!(
+            (
+                e.stats.loss_path_resends_spurious,
+                e.stats.loss_path_resends_useful
+            ),
+            (0, 0)
+        );
     }
 
     #[test]
     fn retransmissions_are_split_by_cause() {
-        let (e, _) = rto_fired_once();
+        let (e, _) = loss_path_resend_once();
         assert_eq!(
             (
                 e.stats.retransmit_attempts_total,
@@ -1938,7 +1989,7 @@ mod tests {
             (
                 e.stats.retransmit_attempts_total,
                 e.stats.retransmit_by_nack,
-                e.stats.rto_fired
+                e.stats.loss_path_resends
             ),
             (1, 1, 0)
         );
@@ -2016,7 +2067,7 @@ mod tests {
         ] {
             assert!(offered.of(class) > 0, "{class:?} never billed");
         }
-        assert!(e.stats.rto_fired > 0 && e.stats.retransmit_by_nack > 0);
+        assert!(e.stats.loss_path_resends > 0 && e.stats.retransmit_by_nack > 0);
         assert!(e.stats.parity_emitted > 0);
         assert_eq!(
             offered.total(),
@@ -2037,7 +2088,7 @@ mod tests {
         );
         assert_eq!(
             offered.of(WireClass::RtoRetransmit),
-            e.stats.rto_fired * src
+            e.stats.loss_path_resends * src
         );
         assert_eq!(
             offered.datagrams[WireClass::Parity.index()],
@@ -2258,7 +2309,7 @@ mod tests {
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 1, "no retransmit after ACK");
-        assert_eq!(e.stats.rto_fired, 0);
+        assert_eq!(e.stats.loss_path_resends, 0);
     }
 
     #[test]
@@ -2650,7 +2701,7 @@ mod tests {
         let mut n = 0;
         let nacks = e.tick_nacks_budgeted(late, usize::MAX, usize::MAX, &mut n);
         assert_eq!(
-            (n, e.stats.retransmit_by_nack, e.stats.rto_fired),
+            (n, e.stats.retransmit_by_nack, e.stats.loss_path_resends),
             (1, 1, 0)
         );
         let loss = e.tick_loss_budgeted(late, usize::MAX, usize::MAX, &mut n);
@@ -2658,7 +2709,7 @@ mod tests {
         // request named the one before it; k1's is current.
         assert!(nacks > 0 && loss > 0);
         // The count carries across, so one `max_retransmits` bounds both.
-        assert_eq!(n, 1 + e.stats.rto_fired as usize);
+        assert_eq!(n, 1 + e.stats.loss_path_resends as usize);
     }
 
     /// An emission the admission gate holds back is not a failed send.
@@ -2749,11 +2800,11 @@ mod tests {
         }
         let t1 = t0 + e.pto() + Duration::from_millis(1);
         let spent = e.tick_budgeted(t1, usize::MAX, 10 * one);
-        assert_eq!(e.stats.rto_fired, 10);
+        assert_eq!(e.stats.loss_path_resends, 10);
         assert_eq!(spent, 10 * one);
 
         let spent = e.tick_budgeted(t1, usize::MAX, usize::MAX);
-        assert_eq!(e.stats.rto_fired, 100);
+        assert_eq!(e.stats.loss_path_resends, 100);
         assert_eq!(spent, 90 * one);
     }
 
@@ -2823,7 +2874,10 @@ mod tests {
         e.tick_nacks_budgeted(t0, usize::MAX, usize::MAX, &mut n);
         e.tick_loss_budgeted(t0, usize::MAX, usize::MAX, &mut n);
         assert_eq!((n, e.stats.retransmit_attempts_total), (1, 1));
-        assert_eq!((e.stats.retransmit_by_nack, e.stats.rto_fired), (1, 0));
+        assert_eq!(
+            (e.stats.retransmit_by_nack, e.stats.loss_path_resends),
+            (1, 0)
+        );
         assert_eq!(
             e.stats.verdict_newer_in_flight, 1,
             "the stale entry is counted"
@@ -2841,7 +2895,7 @@ mod tests {
         e.tick_nacks_budgeted(t0, usize::MAX, usize::MAX, &mut n);
         e.tick_loss_budgeted(t0, usize::MAX, usize::MAX, &mut n);
         assert_eq!((n, e.stats.retransmit_attempts_total), (1, 1));
-        assert_eq!(e.stats.rto_fired, 0);
+        assert_eq!(e.stats.loss_path_resends, 0);
     }
 
     /// After `LOSS_RETX_MAX_ATTEMPTS` resends a verdict leaves the pass to the
@@ -2945,7 +2999,7 @@ mod tests {
         ask(&mut e, timed_out);
         // Room for exactly one.
         e.tick_budgeted(t1, usize::MAX, one);
-        assert_eq!(e.stats.rto_fired, 0, "the loss path waits its turn");
+        assert_eq!(e.stats.loss_path_resends, 0, "the loss path waits its turn");
         assert_eq!(e.cache.get(&nacked).unwrap().attempts, 1);
         assert_eq!(e.cache.get(&timed_out).unwrap().attempts, 0);
     }
@@ -3045,15 +3099,15 @@ mod tests {
         let t1 = now + e.pto() + std::time::Duration::from_millis(1);
 
         // First tick with budget=64: must fire exactly 64.
-        let before = e.stats.rto_fired;
+        let before = e.stats.loss_path_resends;
         e.tick(t1, 64);
         e.drain(&mut Sink(&mut sink), t1);
         assert_eq!(
-            e.stats.rto_fired - before,
+            e.stats.loss_path_resends - before,
             64,
             "first tick must fire exactly the budget"
         );
-        // Counted from `rto_fired` above rather than `sink.len()`: since a
+        // Counted from `loss_path_resends` above rather than `sink.len()`: since a
         // retransmission allocates its own `wire_seq`, and (as of the fix
         // that feeds every allocated `wire_seq` into the FEC group builder)
         // that `wire_seq` is now a genuine group member, 64 contiguous
@@ -3073,11 +3127,11 @@ mod tests {
 
         // Second tick at same instant: another 64 should fire (936 still due).
         sink.clear();
-        let before = e.stats.rto_fired;
+        let before = e.stats.loss_path_resends;
         e.tick(t1, 64);
         e.drain(&mut Sink(&mut sink), t1);
         assert_eq!(
-            e.stats.rto_fired - before,
+            e.stats.loss_path_resends - before,
             64,
             "second tick fires another batch"
         );
@@ -3261,7 +3315,7 @@ mod tests {
         // rather than inside `on_nack`. One retransmission only, so it is
         // the NACK branch that stamps and not the RTO behind it.
         e.tick_budgeted(now1, 1, usize::MAX);
-        assert_eq!(e.stats.rto_fired, 0);
+        assert_eq!(e.stats.loss_path_resends, 0);
 
         let last_sent_at = e.cache.get(&key).unwrap().last_sent_at;
         let delta = last_sent_at.duration_since(t0);

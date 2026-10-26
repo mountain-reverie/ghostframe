@@ -450,7 +450,7 @@ impl IoBridge {
                 .saturating_sub(i.late_acked_after_flush),
             ecn: i.ecn,
             generation_replacements: self.reliable_emitter.stats.generation_replacements,
-            rto_fired_superseded: self.reliable_emitter.stats.rto_fired_superseded,
+            loss_path_resends_superseded: self.reliable_emitter.stats.loss_path_resends_superseded,
             hint_feeds: i.hint_feeds,
             hint_feeds_before_feedback: i.hint_feeds_before_feedback,
             hint_unbounded: i.hint_unbounded,

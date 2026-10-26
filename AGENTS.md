@@ -115,8 +115,8 @@ journalctl _UID=$(id -u <user>) --no-pager | grep 'cumulative emit' | tail -1
 ```
 
 That `cumulative emit` line is the most informative single line in the log:
-per-codec emission counts, `rto_fired` (retransmissions made by the loss path:
-verdicts and probes; the name predates the per-pass timer, which is gone),
+per-codec emission counts, `loss_path_resends` (retransmissions made by the loss path:
+verdicts and probes; called `rto_fired` before the per-pass timer was removed),
 `nack_received`, `emitter_ack_hits` /
 `ack_misses`, `retransmit_attempts_total`, `cache_pending_entries`, and the
 latency tiers.

@@ -230,9 +230,9 @@ pub(super) fn run_script(sc: Script) -> Run {
         let out = loss_path::detect(&mut ledger, &mut e, now);
         let _ = out;
         let _ = loss_path::probe(&mut ledger, &mut e, now);
-        let before = e.stats.rto_fired;
+        let before = e.stats.loss_path_resends;
         e.tick_budgeted(now, usize::MAX, usize::MAX);
-        if e.stats.rto_fired > before && run.first_repair_after_drop.is_none() {
+        if e.stats.loss_path_resends > before && run.first_repair_after_drop.is_none() {
             run.first_repair_after_drop = first_drop_at.map(|d| t.saturating_sub(d));
         }
         put_on_wire(

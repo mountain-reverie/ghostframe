@@ -98,7 +98,7 @@ fn squeezed_scene(cols: u8, rows: u8, send_buffer: Option<usize>) -> Browserless
 ///
 /// Delivered *bytes* are the wrong metric, and an earlier version of this
 /// test used them. The roomy run retransmits heavily (measured
-/// rto_fired=7,696 and retransmits=7,801 against the squeezed run's 693), so
+/// loss_path_resends=7,696 and retransmits=7,801 against the squeezed run's 693), so
 /// counting bytes rewards retransmit waste: a run can "deliver" more bytes
 /// while rendering no more screen.
 fn tiles_rendered(r: &BrowserlessResult, cols: u8, rows: u8) -> usize {
@@ -114,12 +114,12 @@ const OVERDRIVE_FLOOR_BYTES: usize = 256 * 1024;
 fn report(name: &str, r: &BrowserlessResult) {
     println!(
         "{name}: send_errs={} emit_q_peak={} s2c_dg={} s2c_bytes={} \
-         rto_fired={} retransmits={} nack_hit={} nack_miss={} stale={}",
+         loss_path_resends={} retransmits={} nack_hit={} nack_miss={} stale={}",
         r.send_datagram_errs,
         r.emission_queue_peak,
         r.datagrams_delivered_s2c,
         r.bytes_delivered_s2c,
-        r.rto_fired,
+        r.loss_path_resends,
         r.retransmit_attempts_total,
         r.nack_hit,
         r.nack_miss,
@@ -379,7 +379,7 @@ async fn work_rejected_by_a_full_send_buffer_still_reaches_the_client() {
          drain_refinement_pass_major pops with queue.remove, so a datagram \
          the transport refuses has no scheduler-side retry.",
         squeezed.send_datagram_errs,
-        squeezed.rto_fired
+        squeezed.loss_path_resends
     );
 }
 
