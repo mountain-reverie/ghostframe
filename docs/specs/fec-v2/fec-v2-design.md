@@ -2,7 +2,8 @@
 
 **Date:** 2026-10-15. **Code base:** origin/master `5098db6`. Line numbers refer to that commit (`git show 5098db6:<path>`).
 **Scope:** test the owner's hypothesis that broken FEC causes the retransmission volume, survey the state of the art (including "Kyber"), and propose a design, protocol change and schedule.
-**Revision 4 (2026-10-26, owner decision):** the ACK v4 design is replaced (§4.9). Repair symbols are transmissions with their own `bundle_seq`, ACKed like sources. A source the client rebuilt is not acknowledged as an arrival. A separate RECOVERED section of ACK v4 releases its content. This replaces revision 1's `recovered` bit in `arrival_time_ms_lo16`. Code references in §4.9 are to origin/master `93e5efec`.
+**Revision 4 (2026-10-26, owner decision):** the ACK v4 design is replaced (§4.9). Repair symbols are transmissions with their own `bundle_seq`, ACKed like sources. A source the client rebuilt is not acknowledged as an arrival. A separate RECOVERED report releases its content (an ACK v4 section in revision 4; a reliable-stream record since revision 5). This replaces revision 1's `recovered` bit in `arrival_time_ms_lo16`. Code references in §4.9 are to origin/master `93e5efec`.
+**Revision 5 (2026-10-26, owner decisions on §6.4 items 14-15):** RECOVERED, CONTENT_REJECTED and a new DECLINED record leave the ACK datagram and travel on a reliable client→server QUIC stream, the *repair-status stream* (§4.9.2). Each is sent once, and quinn or the browser's WebTransport retransmits it on loss; the 3-copy repeat and the 48-id cap are gone. ACK v4 (0x08) is arrivals only. Because every terminal client outcome of a block is now stated reliably, `T_def` becomes a 60 s backstop for the lossless (tile) classes, an alarm for a client bug, and H.264 has no deferral at all (§4.9.5). The deadline release no longer drops lossless content: it ends the block's repair phase and hands the content back to ARQ (§4.8.2 step 4). Legacy 0x04 tile parity is off for every session from D3-c on.
 
 **How claims are marked.** **[M]** measured, by WS-C3's browserless runs (`data_c3_rows.txt`, copied from `gf-c3/target/tmp`) or by the scripts in this directory. **[C]** read from code, with file:line. **[L]** from the literature, cited in §8. **[E]** my estimate or inference, not confirmed.
 
@@ -64,9 +65,9 @@ The owner's claim is therefore refuted as a description of Kyber's own logic. Wh
 - **Bill parity against the bandwidth estimate**, and report **recovered ≠ received** to the estimator. Since revision 4 (§4.9) this needs no estimator code:
   - repair symbols are transmissions, ACKed like sources;
   - a rebuilt source is never ACKed as an arrival, so the RFC 9002 detector declares it lost;
-  - a separate RECOVERED section of ACK v4 releases its content.
+  - a RECOVERED record on a reliable client→server stream (the repair-status stream, revision 5) releases its content. The same stream carries DECLINED, which the client sends when it holds k symbols but does not rebuild, and CONTENT_REJECTED, for a record that fails prevalidation. With all three reliable, the server never waits on a guess: `T_def` is a 60 s alarm for the tile classes, not a latency mechanism, and H.264 has none.
 - **Caps-gated:** HELLO bit 2.
-- **Backward compatible:** two new server→client discriminators (BUNDLE 0x09, REPAIR 0x0A), sent only to clients that set the bit, and three new client→server datagram types (LOSS_REPORT 0x07, ACK v4 0x08, REPAIR_REQUEST 0x0B) that old servers already drop harmlessly **[C]**. The client sends the three only after it has received its first FEC-v2 bundle.
+- **Backward compatible:** two new server→client discriminators (BUNDLE 0x09, REPAIR 0x0A), sent only to clients that set the bit, and three new client→server datagram types (LOSS_REPORT 0x07, ACK v4 0x08, REPAIR_REQUEST 0x0B) that old servers already drop harmlessly **[C]**. The client sends the three, and opens the repair-status stream, only after it has received its first FEC-v2 bundle.
 
 **Where it fits** (details in §6):
 - **Wave C, now.** C3's three no-wire PRs (decoder duplicate fix, client consumes the existing H.264 XOR parity, tile FEC off by default). Plus a measurement-only PR: client-side pre-FEC loss and burst counters, populate `datagrams_recovered_fec`, server logs quinn path loss and RTO-cause counters. The PR changes no behaviour and no wire format. It is what lets D1 confirm or refute the cascade above. C4 fixes the per-fragment cache.
@@ -74,7 +75,7 @@ The owner's claim is therefore refuted as a description of Kyber's own logic. Wh
 - **After D1 (a new "D3 fec-v2" stream, 6 PRs).** Bundling, then the codec, then FEC emission, then adaptation.
 - **H.264 per-frame RS** depends on nothing in D1 and can land at the end of Wave C or early in D, coordinated with C5 (GOP / reference invalidation).
 
-**Owner decisions** (§6.4; revision 3 adds the reconstruction-first policy, its latency cost under bursts, and repair-symbol requests; the QUIC-stream option is withdrawn). Accept that the storm is a transport defect and gate tile FEC behind D1. Approve bundling as a wire change. Choose the codec (recommended: in-house GF(2^8) Cauchy RS; alternative: `reed-solomon-simd`). Spend HELLO bit 2. Set the recovered-versus-received semantics for the estimator. Set an overhead cap. Set the native-client version-skew policy.
+**Owner decisions** (§6.4; revision 3 adds the reconstruction-first policy, its latency cost under bursts, and repair-symbol requests; the QUIC-stream option is withdrawn). Accept that the storm is a transport defect and gate tile FEC behind D1. Approve bundling as a wire change. Choose the codec (recommended: in-house GF(2^8) Cauchy RS; alternative: `reed-solomon-simd`). Spend HELLO bit 2. Set the recovered-versus-received semantics for the estimator. Set an overhead cap. Set the native-client version-skew policy. *Revision 5:* items 14 and 15 (the ACK v4 details and the meaning of an arrival) were decided on 2026-10-26; item 16 (which stream carries the repair-status records) is open.
 
 ---
 
@@ -275,7 +276,7 @@ Reject:
 - WebRTC's burst-optimised FEC masks exist but go unused, because there is no burst feedback. ghostframe's LOSS_REPORT histogram supplies that feedback.
 
 ### 2.4 QUIC and FEC [R28–R36] **[L]**
-- **RFC 9265** (coding for QUIC): "a recovered packet must be considered as a lost packet" for congestion control. FEC v2 follows this by never acknowledging a rebuilt source as an arrival, and by releasing its content through ACK v4's separate RECOVERED section (§4.9, revision 4; revision 1 used a `recovered` flag).
+- **RFC 9265** (coding for QUIC): "a recovered packet must be considered as a lost packet" for congestion control. FEC v2 follows this by never acknowledging a rebuilt source as an arrival, and by releasing its content through a separate RECOVERED record (§4.9, revision 4; on the reliable repair-status stream since revision 5; revision 1 used a `recovered` flag).
 - **draft-michel-quic-fec** adds SOURCE_SYMBOL / REPAIR / SYMBOL_ACK frames inside QUIC, and forbids a source symbol spanning packets.
 - **QUIC-FEC** (2019): FEC slows transfers at low loss and low delay, so it must be adaptive.
 - **FlEC** (IEEE/ACM ToN 2023):
@@ -445,14 +446,14 @@ received at least one FEC-v2 bundle (so an old server never sees it; if it did, 
  [52..54] h264_frames_lost  u16
  (54 bytes; unknown trailing bytes ignored, so later versions may append)
 
-ACK_BATCH v4 (0x08), revision 4 (2026-10-26); full specification in section 4.9.2:
+ACK_BATCH v4 (0x08), revision 5 (2026-10-26); full specification in section 4.9.2:
  [0] 0x08
- [1] n_arr u8 (0..=72), then n_arr x { bundle_seq u32 LE, arrival_time_ms_lo16 u16 LE }
+ [1] n u8 (1..=72), then n x { bundle_seq u32 LE, arrival_time_ms_lo16 u16 LE }
      arrivals only: every BUNDLE and every REPAIR symbol the network delivered, never a rebuilt source
- [.] n_rec u8 (0..=48), then n_rec x { bundle_seq u32 LE }
-     RECOVERED: sources the client rebuilt; releases content, MUST NOT feed congestion state
-Sent only to a server that sent FEC-v2 bundles. (Revision 1 put a `recovered` bit in bit 15 of
-arrival_time_ms_lo16 instead; replaced, see section 4.9.9.)
+Sent only to a server that sent FEC-v2 bundles. RECOVERED, DECLINED and CONTENT_REJECTED are not in
+the datagram: they are records on the reliable repair-status stream (section 4.9.2). (Revision 1 put
+a `recovered` bit in bit 15 of arrival_time_ms_lo16; revision 4 a RECOVERED section in this
+datagram, sent 3 times; both replaced, see section 4.9.9.)
 ```
 
 **Server.** New fields on the `cumulative emit` line:
@@ -473,7 +474,8 @@ arrival_time_ms_lo16 instead; replaced, see section 4.9.9.)
 | **BUNDLE (0x09)**: `[0x09][ver/flags u8][bundle_seq u32][block_id u16][idx_in_block u8][k u8][r u8][records: (len u16, DatagramHeader+TileHeader+payload)…]` | s→c | **only to a client whose HELLO set bit 2** | an old client must never receive it. A byte below 0x80, ≥ 20 B and not 0x04 goes to H.264 assembly (`reassembly.rs:152-158`) and can set `latest_full_frame_seq` (C3 trap) |
 | **REPAIR (0x0A)**: `[0x0A][ver u8][block_id u16][k u8][r u8][repair_idx u8][depth u8][bundle_seq u32][lens: k x u16][repair payload]`. *Revision 4:* the u32 is the repair symbol's **own** `bundle_seq`, drawn from the same counter as BUNDLEs, and no longer `first_bundle_seq`. Block membership comes from each BUNDLE's `block_id` and `idx_in_block`, so the field was redundant, and repair symbols are now transmissions (§4.9.1) | s→c | same | same trap; never sent to old clients |
 | H.264 per-frame RS: frame parity datagrams with `frag_idx = n+1+j` (never `== frag_total`), `reserved` = scheme 1, an 11-byte RS header (C3 design) | s→c | bit 2 | old client: `is_parity()` true, so dropped (`frame_assembly.rs:64`); legacy XOR still sent to old clients |
-| LOSS_REPORT 0x07, ACK v4 0x08 (arrival section + RECOVERED section, §4.9.2) | c→s | sent only after FEC-v2 traffic arrives | old server: `Unknown`, counted and dropped |
+| LOSS_REPORT 0x07, ACK v4 0x08 (arrivals only, §4.9.2) | c→s | sent only after FEC-v2 traffic arrives | old server: `Unknown`, counted and dropped |
+| **Repair-status stream** (revision 5): a second client-opened bidirectional stream carrying RECOVERED (0x09), CONTENT_REJECTED (0x0A) and DECLINED (0x0B) records, `[type u8][len u16 LE][body]` (§4.9.2) | c→s | opened only after FEC-v2 traffic arrives | never reaches an old server. Its feedback dispatcher (`io_bridge.rs`, `dispatch_feedback_bytes`) would discard the rest of the buffer at the first unknown type |
 
 - **Mixed versions.** The web client is embedded in the server binary (`ghostbridge/web_server.go`, `//go:embed`), so web and server always match. Only the **native client** can be skewed:
   - a new native client against an old server: the bit is ignored and the client sees only legacy traffic;
@@ -497,7 +499,7 @@ Each test asserts a **property**, and each comes with a deliberate break that mu
 | loop stability | browserless with WS-A8's GE model, looped 12x (the harness is not seed-reproducible; feedback_browserless_not_seed_reproducible) | on a step 0 % → 2 % → 0 % loss, overhead rises and returns to 0 within 3 s; no more than 2 (k,r) changes per second; `residual ≤ target` in the steady state of the 2 % phase | feed post-FEC loss instead of pre-FEC (it oscillates; the change-rate property fails) |
 | repair actually avoided | browserless, after D1 | `retransmit_attempts / net_lost_bundles ≤ 1.2` with FEC off (the D1 exit condition) and `≤ 0.3` with FEC v2 at 2 % iid; `rto_spurious ≤ 5 %` of fires | turn FEC emission off (the ratio returns to ~1) |
 | H.264 RS | client-core access-unit test with NetSim GE (C3 plan) + e2e `OUTBOUND_LOSS_PREDICATE=all` under the heavy lock | frame-loss rate within 1.5x of the offline Monte Carlo for the same model; decoded frames bit-exact | no-op recovery (frame loss returns to the "none" column) |
-| ACK v4: repair as transmission, RECOVERED, deferral (revision 4) | protocol proptest, client-core unit, server unit, browserless | see §4.9.8: fourteen tests, each with its mutation | see §4.9.8 |
+| ACK v4: repair as transmission, RECOVERED, DECLINED, CONTENT_REJECTED on the repair-status stream, deferral (revisions 4-5) | protocol proptest, client-core unit, server unit, loopback, browserless | see §4.9.8: each test with its mutation | see §4.9.8 |
 | caps safety | unit + e2e | a client without bit 2 receives zero 0x09/0x0A datagrams (counter over a whole e2e session); an old-format client still renders | send one bundle regardless of caps (the old client's frame assembly sees it; the test that counts H.264 assemblies created from non-H.264 bytes fails) |
 
 E2E loss injection sits at the plaintext seam, not at the QUIC packet (feedback_harness_hook_plaintext_seam). With bundling, a datagram is a packet, so seam-level loss becomes representative. Without bundling it was not, which is one more reason the bundles come first.
@@ -562,7 +564,7 @@ Concretely:
    - The sender answers with m **new** repair symbols, with indices never used before for that block, and sends them at once at the head of the pacer.
    - If the answer is itself short at `now + RTT + A`, repeat while the deadline allows.
 4. **When the deadline does not allow any round:**
-   - **tiles:** no repair. The cache entry is released as lost, and the tile is re-encoded fresh if it is still current. This is the supersession path that already exists.
+   - **tiles:** no more repair. *Revision 5:* tile content is lossless, so the deadline ends B's **repair phase**, not the delivery of its content. The server drops B's RS encode state, and every source of B not yet accounted for (no arrival entry, no RECOVERED) falls back to ARQ: it is re-encoded fresh if the tile is still current (the supersession path that already exists), or re-sent from the cache otherwise. The new transmission is an ordinary unprotected one and is retained until it is delivered. Nothing is ever released as lost without a replacement on its way (§4.9.3, "Retention").
    - **H.264:** the frame is dropped and `h264_frames_lost` is counted. C5's keyframe request or reference invalidation fires (it is a new receiver→server signal and belongs to C5).
 5. **Unprotected classes keep today's ARQ**, as fixed by D1/C4: CDF53 refinement passes, and any class whose adaptive r is 0. That means fragment and coverage NACKs plus the last-resort RTO (since D1: the RFC 9002 detector and the connection PTO, §4.8.3).
 
@@ -597,8 +599,12 @@ The refusal is a new `RetxRequest::Protected` returned by `classify_retx` for a 
 
 **A protected source's content is therefore retransmitted only through one of these paths:**
 - a REPAIR_REQUEST, answered with new repair symbols (not sources);
-- the deferral timeout `T_def` of §4.9.5, answered with a content retransmit. This is the only path that resends a protected source's content;
-- the deadline release (§4.8.2 step 4), which releases the content as lost; the tile is re-encoded fresh if it is still current. **Every protected class MUST implement the deadline release before it is switched to the protected rules**, because it is the backstop when every other path is blind (§4.9.5, "When the server's view is wrong").
+- a DECLINED record (revision 5, §4.9.2), answered at once with a content retransmit of the sources it names;
+- a CONTENT_REJECTED record, answered with a retransmit of the rejected record's tile (§4.9.3);
+- the deferral backstop `T_def` of §4.9.5 (60 s for tiles), answered with a content retransmit. With RECOVERED and DECLINED reliable it fires only on a client bug, so `deferral_timeout` is an alarm;
+- the deadline release (§4.8.2 step 4): for tiles, the repair phase ends and the content falls back to ARQ; for H.264, the frame is dropped. **Every protected class MUST implement the deadline release before it is switched to the protected rules** (§6.4 item 14(d), decided): it is the backstop when the client cannot speak, because it never learnt the block exists or holds fewer than k symbols and its REPAIR_REQUESTs were lost (§4.9.5, "When the server's view is wrong").
+
+Only the first and the deadline release apply to H.264: H.264 content is never retransmitted (§4.3 step 6), so H.264 has no deferral, no `T_def` and no content path (§4.9.5).
 
 **The last-resort timer** for lost feedback remains:
 
@@ -607,13 +613,14 @@ The refusal is a new `RetxRequest::Protected` returned by `classify_retx` for a 
 where `W_B` is the sender's estimate of the receiver's window: block span plus the allowance reported in LOSS_REPORT. Any of these cancels it:
 - **every** source of B accounted for: each one either has an arrival entry or is named by a RECOVERED id (one arrival for some symbol of B is not enough: it says nothing about the other sources);
 - a REPAIR_REQUEST for B;
-- a LOSS_REPORT whose range covers B.
+- a LOSS_REPORT whose range covers B;
+- *(revision 5)* a DECLINED record for B, or the start of B's deferral (held(B) ≥ k): the client can decode, its outcome will arrive reliably, and a repair symbol would not help it.
 
 If `T_lr` fires, the sender sends `r_lr = 1` extra repair symbol (a transmission with its own `bundle_seq`) and re-arms once. `T_lr` itself never resends sources. After the deadline it releases B, as in §4.8.2 step 4.
 
 **The ledger** declares a protected transmission (source or repair) lost **only through D1's RFC 9002 detector** (packet threshold `K_PKT`, time threshold 9/8 RTT, `transmission_ledger.rs`), which works only on ACKs, plus `declare_lost_by_pto` for a probe candidate whose content is gone. LOSS_REPORT and REPAIR_REQUEST are not ledger loss sources: they feed adaptation and repair. (Revision 3 also listed them and a horizon; D1 removed the horizon, which also removes §1.3 step (c) for all traffic.) **A loss verdict on protected data is congestion state only**: `loss_window` and goog_cc, never a retransmission.
 
-**The PTO and `T_def`.** The PTO runs from `max(newest departure, last_ack_at, last fire) + srtt + 4·rttvar + max_ack_delay`, so after the ACK that brings held(B) to k it can expire before `T_def`. That is harmless because of the table above: the probe skips a block in deferral and never sends protected source content. The PTO stops (`pto_deadline` is `None`) when no content is cached. A RECOVERED that releases the last cached content can therefore disarm it. That is the same effect any content release has today, and it is correct: the PTO exists to recover content, and repair records hold none. Outstanding repair records are declared lost by the detector on the next ACK, or leave the ledger at retention expiry.
+**The PTO and `T_def`.** *(Revision 5: a deferral normally closes within one uplink delivery of the RECOVERED record, so the interplay below matters for milliseconds, not for `T_def`'s 60 s. On the client-bug path a PTO whose candidates are all in deferral sends nothing and backs off as for any fire.)* The PTO runs from `max(newest departure, last_ack_at, last fire) + srtt + 4·rttvar + max_ack_delay`, so after the ACK that brings held(B) to k it can expire before `T_def`. That is harmless because of the table above: the probe skips a block in deferral and never sends protected source content. The PTO stops (`pto_deadline` is `None`) when no content is cached. A RECOVERED that releases the last cached content can therefore disarm it. That is the same effect any content release has today, and it is correct: the PTO exists to recover content, and repair records hold none. Outstanding repair records are declared lost by the detector on the next ACK, or leave the ledger at retention expiry.
 
 **The split between D1 and D3:**
 - **D1** (landed) made the timers honest: departure-time clocks, the RFC 9002 detector, the connection PTO, deferred passes. It did not add a per-class policy hook, and none is needed before D3.
@@ -682,14 +689,15 @@ LOSS_REPORT (0x07) gains, at its tail (older parsers ignore trailing bytes):
 New fields on the server's `cumulative emit` line:
 - `repair_requests_rx`, `repair_symbols_sent`
 - `lr_timer_fired`, the last-resort timer; non-zero only when feedback is lost
-- `retx_avoided_by_reconstruction`: protected sources lost pre-FEC and released with no repair traffic, counted from ACK v4 RECOVERED ids (§4.9)
-- `recovered_rx` (distinct RECOVERED ids that released content), `recovered_unknown`, `repair_acked`, `deferral_started`, `deferral_released` (closed by RECOVERED), `deferral_timeout` (closed by `T_def`, content retransmitted), `recovered_ids_rx_distinct` (distinct RECOVERED ids received whatever the ledger state, for the FECORACLE), `have_mismatch` (REPAIR_REQUEST `have` < k while held(B) ≥ k), `protected_retx_refused` (per path: verdict, deferred, PTO, TILE_NACK), `deadline_released`; revision 4, §4.8.3 and §4.9.5
+- `retx_avoided_by_reconstruction`: protected sources lost pre-FEC and released with no repair traffic, counted from RECOVERED ids (§4.9)
+- `recovered_rx` (distinct RECOVERED ids that released content), `recovered_unknown`, `repair_acked`, `deferral_started`, `deferral_released` (closed by RECOVERED), `deferral_timeout` (closed by `T_def`, content retransmitted; **an alarm**: non-zero means a client bug or a wedged repair-status stream, and it is logged at warn, rate-limited), `recovered_ids_rx_distinct` (distinct RECOVERED ids received whatever the ledger state, for the FECORACLE), `have_mismatch` (REPAIR_REQUEST `have` < k while held(B) ≥ k), `protected_retx_refused` (per path: verdict, deferred, PTO, TILE_NACK), `deadline_released` (repair phase ended, content handed to ARQ); revision 4, §4.8.3 and §4.9.5
+- *(revision 5)* `declined_rx{pruned,evicted,invalid_symbol,length_bound,header_mismatch}`, `deferral_declined` (closed by DECLINED), `content_rejected_rx`, `h264_declined`, `repair_status_malformed` (records the server could not parse; the rest of that stream's buffer is discarded, so this is also an alarm), `deferral_pinned_max` (high-water mark of ledger records pinned by open deferrals)
 - `repair_after_recovery` and `repair_after_deadline`, which the client reports as `repair_late`
 - `protected_timer_suppressed`: protected entries that would have had a timer under today's policy
 
 **Validation additions** (in the style of §4.6):
 - **Unit, client.** For scripted symbol arrival patterns, a REPAIR_REQUEST goes out only when held < k at `close(B)`, with `missing = k − held`. **Break:** fire at the first gap; the "no request for a recoverable block" property fails.
-- **Unit, server.** A protected source's content is never retransmitted by `loss_path::detect`, `take_due_deferred`, the PTO or a TILE_NACK; its only content retransmit is the `T_def` fallback (§4.9.5). **Break:** let `classify_retx` return `Queued` for protected keys; the counter-based test fails.
+- **Unit, server.** A protected source's content is never retransmitted by `loss_path::detect`, `take_due_deferred`, the PTO or a TILE_NACK; its only content retransmits are DECLINED, CONTENT_REJECTED, the `T_def` backstop and the deadline hand-off to ARQ (§4.9.5). **Break:** let `classify_retx` return `Queued` for protected keys; the counter-based test fails.
 - **Browserless after D3.** `repair_after_recovery == 0` and `retx_avoided_by_reconstruction / lost_pre_fec ≥ 0.9` at 2 % i.i.d. with a 75 ms netsim delay (12 runs). **Break:** re-enable submit-time RTO for protected entries; wasted repairs > 0.
 
 ### 4.9 ACK v4: repair symbols are transmissions, rebuilt sources are not arrivals (revision 4, owner decision 2026-10-26)
@@ -704,6 +712,8 @@ The receiver states both, and the sender guesses neither. This is the consensus 
 - WebRTC transport-wide feedback: FEC packets carry their own transport sequence number, and recovered media packets are not reported as received;
 - Tetrys' window update (RFC 9407).
 
+**Revision 5 (owner decisions, 2026-10-26, §6.4 items 14-15).** Rules 1, 2 and 4 are unchanged. RECOVERED moves from an ACK v4 section to a reliable client→server stream, where it is sent once (rule 3, §4.9.2). Rule 5 is decided: arrivals report the network, and a CONTENT_REJECTED record on the same stream reports a bad record. A new DECLINED record lets the client say that it holds k symbols of a block and will not rebuild it. With every terminal client outcome reliable, `T_def` becomes a 60 s backstop for the tile classes, and H.264 has no deferral (§4.9.5).
+
 #### 4.9.1 Rules
 
 1. **A repair symbol is a transmission.** Every REPAIR datagram (0x0A) takes a `bundle_seq` from the same per-session counter as the BUNDLEs (0x09). That includes the extra symbols sent for a REPAIR_REQUEST and the `T_lr` symbol. Each one is:
@@ -713,7 +723,7 @@ The receiver states both, and the sender guesses neither. This is the consensus 
 
    RTT, the RFC 9002 loss detector, goog_cc feedback and the delivery-rate sampler therefore see every byte the network carried. Because repairs and sources share one counter, the sources of a block are **not** contiguous in `bundle_seq`, so no `first + idx` arithmetic can name them. **An RS source symbol is the whole BUNDLE datagram**, from its `0x09` byte through its last record, header and `bundle_seq` included, zero-padded to the block's symbol length. REPAIR's `lens` array gives each source datagram's true length. A rebuilt source therefore carries its own `bundle_seq`, `block_id` and `idx_in_block`, and the client reads the id it reports from the rebuilt bytes (§4.9.2, "Ids"). A repair record has no content, so its ACK is transport-only and releases nothing. For FEC-v2 traffic this settles PR #239's open question: parity bytes were delivered but not counted (the ~0.85 payload factor), and now they are counted. Pre-FEC loss measured from `bundle_seq` gaps (§4.3) then measures every packet of the channel, repairs included.
 2. **A source the client rebuilt is not an arrival.** The client never puts a rebuilt source's `bundle_seq` in the arrival section. Its absence becomes a loss through the RFC 9002 threshold detector D1 built: `K_PKT` later departures acknowledged, or 9/8 RTT elapsed. That is the same path as any other lost packet. Congestion control reads it as lost and untimed (RFC 9265 Rec. 1), and no congestion code path knows about FEC.
-3. **A separate RECOVERED report releases content.** It names the `bundle_seq` of each rebuilt source. It travels as a section of the same ACK v4 message (§4.9.2), so it shares that message's batching and repeat redundancy.
+3. **A separate RECOVERED record releases content.** It names the `bundle_seq` of each rebuilt source. *Revision 5:* it travels on the **repair-status stream**, a reliable client→server QUIC stream (§4.9.2), and each id is written once; quinn, or the browser's QUIC stack, retransmits it on loss. (Revision 4 carried it in an ACK v4 section, three times.)
    - **It MUST NOT feed congestion state.** It produces none of the following: a loss verdict or retraction, an RTT, rttvar or `min_rtt` sample, a goog_cc arrival, a delivery-rate sample (the batch-level `delivery_sampler.end_ack` included), `K_PKT` evidence, a PTO restart (`last_ack_at` is not moved) or a backoff change. It does not move `largest_acked`. Its only effect on the PTO is the one every content release has: releasing the last cached content disarms it, which is correct because the PTO exists to recover content (§4.8.3).
    - **Its effects are limited to two.** It releases the record's content: `on_ack` drops the cache entry, marks coverage and cancels any retransmission. It also closes the deferral of §4.9.5.
    - **It does not resolve the ledger record.** The record stays outstanding until the detector declares it lost or its original arrives. On a record already declared lost it reads the tombstone without consuming it (today's `resolve_at` removes the tombstone), so a late original still finds it and takes the spurious-verdict path.
@@ -722,24 +732,63 @@ The receiver states both, and the sender guesses neither. This is the consensus 
    - an ACK of a transmission already declared lost. That takes the **existing spurious-verdict path**: `loss_window` retraction, `pending_losses` withdrawal if not yet flushed, a late delivery-rate sample, and `K_PKT` evidence.
 
    Content release is idempotent, so the earlier RECOVERED changes neither case. **No "rebuilt then received" rule is needed, and that is the reason this design was chosen over the flag.** With a rebuilt bit, the same `bundle_seq` could be ACKed twice: first as rebuilt, then as received. The server had to tell the second ACK apart from an overlap repeat of the first. That needed a time-bounded `rebuilt` set and its own ledger branch. Here an identity appears as an arrival entry at most once per network arrival, and a repeat of it resolves to "already acknowledged", as it does today.
-5. **Arrivals and content validity are not settled yet.** Rules 1-4 make an arrival entry a statement about the network. Today a CDF53 pass that fails prevalidation is deliberately **not** ACKed (`ghostframe-client-core/src/reassembly.rs`, the deferred ACK), and that missing ACK is how it gets retransmitted. With bundles both readings cannot hold: ACK-on-arrival would release bad content and strand the tile, and withholding the arrival would tell congestion control the network lost a packet it delivered. **This is an owner decision (§6.4 item 15)**; it fixes the meaning of every arrival entry, not only of RECOVERED. RECOVERED follows whatever rule arrivals follow.
+5. **Arrivals report the network; CONTENT_REJECTED reports bad records** (§6.4 item 15, option A, decided 2026-10-26). Every received datagram gets an arrival entry, including a bundle with a record that fails prevalidation. The client names that record in a CONTENT_REJECTED record on the repair-status stream, and the server re-sends its tile (§4.9.3). This replaces today's deferred ACK, in which a CDF53 pass that fails prevalidation is deliberately not acknowledged (`ghostframe-client-core/src/reassembly.rs`) so that it is retransmitted: with bundles, withholding the arrival would tell congestion control that the network lost a packet it delivered, and would hold back the bundle's other records. A rebuilt bundle follows the same rule: RECOVERED names the bundle, and CONTENT_REJECTED names its bad record, written first on the same stream (§4.9.2, "Ordering"). The existing DECODE_ERROR message (0x04 on the feedback stream) is not a substitute: it is keyed by tile and code, not by transmission, and rate-limited to 1/s per tile and 32/s in all, so it cannot say which record to withhold from release. It stays as the diagnostic and palette-recovery path it is today.
 
 #### 4.9.2 Encoding
 
+*Revision 5:* the client→server report now uses two channels. The ACK datagram carries arrivals only, because arrivals must be timely and a lost one is covered by the overlap repeat. RECOVERED, CONTENT_REJECTED and DECLINED travel on a reliable stream, because each one must arrive and none is needed within the next few milliseconds.
+
 ```
-ACK_BATCH v4 (0x08), client -> server. The client switches from 0x06 to 0x08 when it receives
- its first FEC-v2 bundle (0x09 or 0x0A), never on the HELLO bit alone: until then the server may
- be one that does not send bundles, and it would drop 0x08 as Unknown and see no ACKs at all.
+ACK_BATCH v4 (0x08), client -> server datagram. Arrivals only. The client switches from 0x06 to
+ 0x08 when it receives its first FEC-v2 bundle (0x09 or 0x0A), never on the HELLO bit alone: until
+ then the server may be one that does not send bundles, and it would drop 0x08 as Unknown and see
+ no ACKs at all.
  [0]          0x08
- [1]          n_arr  u8, 0..=72                arrival section: fresh + overlap, as in 0x06
- [2 .. 2+6n]  n_arr x { bundle_seq u32 LE, arrival_time_ms_lo16 u16 LE }    6 B per entry
- [a]          n_rec  u8, 0..=48                RECOVERED section, always present (0 when empty)
- [a+1 ..]     n_rec x { bundle_seq u32 LE }                                 4 B per id
- Valid only if n_arr + n_rec >= 1 and the datagram ends exactly after the RECOVERED section
- (a missing n_rec byte, a short section and trailing bytes are all decode errors).
+ [1]          n  u8, 1..=72                    fresh + overlap, as in 0x06
+ [2 .. 2+6n]  n x { bundle_seq u32 LE, arrival_time_ms_lo16 u16 LE }    6 B per entry
+ Valid only if n >= 1 and the datagram ends exactly after the last entry.
+
+REPAIR-STATUS STREAM, client -> server, reliable. A second client-opened bidirectional stream. The
+ server never writes on it, and the client does not finish it while the session lives. The client
+ opens it when it switches to 0x08. Its content is a sequence of records:
+ [0]          type u8      0x10 RECOVERED | 0x11 CONTENT_REJECTED | 0x12 DECLINED
+ [1..3]       len  u16 LE  body length: a non-zero multiple of the type's entry size, <= 1020
+ [3 .. 3+len] len / entry_size entries:
+   RECOVERED         { bundle_seq u32 LE }                                              4 B
+   CONTENT_REJECTED  { bundle_seq u32 LE, record_idx u8 }                               5 B
+   DECLINED          { class u8 (0 = tile bundle, 1 = H.264), block_id u32 LE (H.264: frame_seq),
+                       reason u8, missing u64 LE }                                     14 B
+     reason: 1 pruned, 2 evicted, 3 invalid_symbol, 4 length_bound, 5 header_mismatch
+     missing: bit i set = source idx_in_block i that the client neither received nor rebuilt
+              (tile k <= 64, which the codec clamps; 0 and ignored for H.264, whose frame is lost whole)
+ A record split across stream reads waits for its tail. An unknown type, or a len that is 0, not a
+ multiple of the entry size, or > 1020, is a protocol error: it is counted (repair_status_malformed)
+ and the rest of that stream's buffer is discarded, as the feedback stream does today. A client
+ with more entries than fit writes several records.
 ```
 
-- **Ids.** A RECOVERED id is the rebuilt source's own `bundle_seq`, so the server finds it with the same O(1) ledger lookup as an arrival. The client reads it from the rebuilt datagram's own header: the RS source symbol covers the whole BUNDLE datagram (§4.9.1 rule 1). The client then checks that the rebuilt header's `block_id` and `idx_in_block` match the hole it filled; a mismatch is a decode failure, counted, and nothing is reported. Covering the header costs ~10 B per symbol (<1 % of a 1.2 kB bundle). The alternatives for naming sources were all rejected:
+The records are length-prefixed, unlike the existing feedback-stream messages, which have a fixed size per type. A parser can therefore check a record's length before it reads it, and a later revision can add an entry field without a new type.
+
+- **Which stream (checked on master `cf533c22`).** The client already opens one reliable stream once the session is up: the bidirectional **feedback stream**.
+  - Native: `ghostframe-client-net/src/lib.rs`, `feedback_stream`, opened with `open(Dir::Bi)` at `SessionReady` and written from `PollOutput::Stream`.
+  - Web: `ghostframe-web-client/src/main.ts`, `transport.createBidirectionalStream()`, written through `feedbackWriter`.
+  - It carries HELLO, ReceiverFeedback, DECODE_ERROR, INPUT, DISPLAY_INFO and DISPLAY_MODE (`ghostframe-protocol/src/feedback_stream.rs`).
+  - The server routes every peer-opened bidi stream after CONNECT to `feedback_queue` (`transport/webtransport.rs`, `try_decode_connect`) and parses it in `IoBridge::dispatch_feedback_bytes` (`io_bridge.rs`).
+  - Nothing else uses a stream. ACKs, NACKs and, later, LOSS_REPORT and REPAIR_REQUEST are datagrams (web: `transport.datagrams.writable`, `ackWriter`). There is no client unidirectional stream: the server reads peer uni streams as HTTP/3 control streams (`try_decode_settings`).
+- **Recommendation: a second bidirectional stream, not the feedback stream.** The reason is head-of-line blocking against input. The feedback stream carries keystrokes and pointer events. On it, a lost packet holding a RECOVERED record would also hold back every input event written after it until the sender retransmits that packet, about one RTT later. Repair-status writes add packets to the stream whenever recoveries happen, up to one per ACK flush. That multiplies the number of packets an input event can be stuck behind **[E]**: at 75 ms RTT and one write per 5 ms flush, up to ~15 writes are in flight; at 1 % uplink loss, ~14 % of input events would wait an extra RTT, against ~1 % when input has the stream to itself.
+  - A second stream costs one `open(Dir::Bi)` or `createBidirectionalStream()` per front end.
+  - It is bidirectional rather than unidirectional because the server already routes peer bidi streams to the feedback dispatcher, while its uni path would have to learn the WebTransport stream type.
+  - The cheaper fallback is the same records on the existing feedback stream, accepting the HOL cost on input. The server dispatcher accepts the record types on either stream, so the choice is the client's (§6.4 open question 16).
+- **This is not the stream option that §4.8.1 rejects.** That objection is to carrying FEC-protected *content* on a stream: quinn's recovery would re-send data that RS had already rebuilt. The repair-status records are feedback with no FEC of their own, so stream recovery duplicates nothing, and reliability is exactly what they need.
+- **What the second stream needs on the server, whichever stream is used:**
+  - `feedback_queue` drops the stream id, and `feedback_recv_bufs` accumulates per connection handle. With two streams, one stream's bytes could complete the other's partial message. Both must be keyed by `(handle, StreamId)`.
+  - The three types join `FEEDBACK_STREAM_MSG_TYPES`, so `stream_message_types_are_distinct` covers them. 0x10-0x12 are chosen so they alias no datagram discriminator (0x04-0x0B are all in use there), which removes a source of confusion the module doc of `feedback_stream.rs` already warns about.
+  - **To verify in D3-b:** I found no server code that strips the WebTransport stream signal (`0x41` plus the session id) that a browser writes at the start of a bidi stream it opens. The native client writes none. Before relying on a second browser-opened stream, D3-b must confirm with a capture what `dispatch_feedback_bytes` reads first on one, because the dispatcher discards the rest of a buffer at the first unknown type.
+- **What it needs on the clients.**
+  - Client-core gets a new `PollOutput::RepairStatus(Vec<u8>)` (`event.rs`), so each front end routes it to the second stream. The wasm `pollTransmit` reports it as `kind: 'RepairStatus'`.
+  - The web client's `drainTransmit` today `await`s `feedbackWriter.write` inside the loop that also writes the ACK datagrams. A repair-status write must not be awaited there: a stalled stream would hold the ACKs back. Write it without awaiting, with a `catch`, as `ackWriter` is written.
+  - The client batches records at the ACK batcher's flush (`FLUSH_INTERVAL_US`, 5 ms): at most one record per type per flush.
+- **Ids.** A RECOVERED id is the rebuilt source's own `bundle_seq`, so the server finds it with the same O(1) ledger lookup as an arrival. The client reads it from the rebuilt datagram's own header: the RS source symbol covers the whole BUNDLE datagram (§4.9.1 rule 1). The client then checks that the rebuilt header's `block_id` and `idx_in_block` match the hole it filled. A mismatch is a decode failure: it is counted, and the client sends DECLINED with reason `header_mismatch`. Covering the header costs ~10 B per symbol (<1 % of a 1.2 kB bundle). The alternatives for naming sources were all rejected:
   - REPAIR listing its block's k source `bundle_seq`s: 4k B per repair symbol, ~4 % at k = 10;
   - a separate source counter, so that `first_bundle_seq + idx` works: two transmission-identity spaces for one ledger, which is what rule 1 exists to avoid;
   - `first + idx` over the shared counter: wrong as soon as a repair of another block, or a retransmission, departs between two sources.
@@ -748,39 +797,53 @@ ACK_BATCH v4 (0x08), client -> server. The client switches from 0x06 to 0x08 whe
   - `(block_id, bitmap)`: smaller only for blocks with several recoveries, and it needs a block index on the server for a report that is a few per cent of entries;
   - `(block_id, idx)` pairs: no smaller than a `u32`.
 - **The arrival entry is unchanged and its time stays 16 bits.** No bit is taken from `arrival_time_ms_lo16`. The arrival unwrapper (`bwe/timeline.rs`) assumes a 16-bit period. It is correct only while consecutive samples are less than 32 s apart. A 15-bit field would halve that to 16 s, which is shorter than the ACK silence of an idle static desktop.
-- **Size cost** **[E]**:
-  - the `n_rec` byte adds 1 B per batch, 0.23 % of a full 434-byte arrival batch;
-  - each recovery costs 4 B per copy, and 3 copies are sent (below), so 12 B in all;
-  - at 1080p after bundling (~6k bundles/s), 1 % loss and ~90 % recovered, that is ~55 recoveries/s, about 0.7 KB/s. Arrival entries are ~36 KB/s;
+- **Size cost, against revision 4's three datagram copies** **[E]**:
+  - a RECOVERED id costs 4 B, once. Each write adds the 3 B record header and a QUIC STREAM frame header (type, stream id, offset and length varints, ~6-10 B);
+  - at 1080p after bundling (~6k bundles/s), 1 % loss and ~90 % recovered, that is ~55 recoveries/s and at most 55 writes/s of one or two ids: ~0.8 KB/s. Revision 4 cost ~0.7 KB/s (12 B per id). Arrival entries are ~36 KB/s;
+  - STREAM frames share QUIC packets with the ACK datagrams when both are pending, so the stream mostly adds frames, not packets. Revision 4's repeat-only flushes, up to two extra small datagrams after the last recovery, are gone;
+  - the byte count is a wash. **The gain is certainty:** revision 4 lost a RECOVERED whenever three consecutive batches were lost, and that cost a content retransmit; here a RECOVERED is not lost while the connection lives. It also deletes the per-id copy counter, the 48-id cap and the repeat flush;
   - repair symbols add their own arrival entries: +20 % entries at r/k = 0.2. They are priced like any other transmission, because they are one.
-- **Redundancy.** Each section has its own repeat rule:
-  - **Arrival section.** It keeps 0x06's overlap: each batch repeats the last `ACK_OVERLAP_COUNT` (8) arrival entries of the previous batch.
-  - **RECOVERED section.** Each id is carried in the batch that first reports it and in the next two batches, 3 copies in all, so it survives two consecutive lost batches.
-    - A pending repeat arms the batcher's flush timer (`FLUSH_INTERVAL_US`, 5 ms) like a fresh entry. Repeats therefore go out even when no new arrivals do: at most two extra small datagrams after the last recovery.
-    - Fresh ids come first, then repeats, at most 48 ids per batch. A full batch is therefore 2 + 72·6 + 1 + 48·4 = 627 B, well under the uplink datagram size.
-    - An id that does not fit waits for the next batch. It is never dropped.
-  - **When all three copies are lost**, the outcome depends on the server's view of B. If it knows held(B) ≥ k, the deferral of §4.9.5 times out and the server retransmits content the client already holds: safe and wasteful, never wrong. If arrival entries were lost too, beyond the 8-entry overlap, the server undercounts held(B), no deferral starts, and the client (which holds ≥ k) sends no REPAIR_REQUEST. The content then waits for `T_lr` and finally for the deadline release (§4.9.5, "When the server's view is wrong").
-- **When the client emits a RECOVERED id.** It emits one at the point where the rebuilt bundle enters the record path an arrived bundle takes. A RECOVERED id must mean, for content, exactly what the source's arrival entry means; how a record that fails prevalidation is signalled is §6.4 item 15.
-- **Processing order within one message: arrivals first, then RECOVERED.** The arrival section is one ACK batch for congestion control (one `delivery_sampler.end_ack`, one goog_cc feedback report), and it updates held(B) before any RECOVERED id is applied. RECOVERED is then a pure content pass. Its outcome does not depend on the order, because it touches no congestion state and content release is idempotent. When an original and its RECOVERED id share a message (the original arrived after the rebuild but before the flush), the arrival resolves the record and the RECOVERED id finds it acknowledged, which is a no-op. If item 15 adds a content-rejection section, it is processed **before** arrivals, so that an arrival never releases a record the same message rejects.
-- **Discriminator.** ACK v4 uses 0x08, the number revision 1 already gave it, which leaves 0x07 for LOSS_REPORT. It is a new type, not a version byte inside 0x06. That is the project's convention (`ghostframe-protocol/src/ack.rs`): bump the discriminator so a stale binary fails loudly with `WrongMsgType` instead of mis-parsing.
+- **Latency on uplink loss.** The sender's RFC 9002 recovery retransmits a lost stream packet (quinn natively, the browser's QUIC stack on the web). It does so by packet threshold once 3 later packets are acknowledged, which the continuous ACK datagrams provide within a few flushes, by time threshold at 9/8 RTT, or at the PTO. A lost RECOVERED therefore arrives about 1 to 1.5 RTT late, where revision 4's next copy came 5 ms later. The effect is that the content stays cached and B's deferral stays open one RTT longer. Nothing is retransmitted, because `T_def` is 60 s. A DECLINED delayed by an RTT delays a rare retransmit by an RTT. That is the trade the owner chose: bandwidth and certainty, for a few milliseconds of cache lifetime.
+- **Head-of-line blocking within the stream.** One lost packet holds back the records written after it. All of them are content releases and repair-phase outcomes, and none is latency-critical once `T_def` is a backstop, so this is acceptable. REPAIR_REQUEST stays a datagram for this reason: it is deadline-gated (`now + RTT + A ≤ deadline`, §4.8.2), a lost one is simply sent again, smaller, and HOL blocking would push it past the deadline.
+- **Congestion control.** The stream shares the client connection's congestion window with the ACK datagrams. At ~1 KB/s it is negligible. Its volume is orders of magnitude below quinn's default stream receive window, so flow control never binds. The server drains the stream in the same event-loop pass as the feedback stream (`io_bridge.rs`, `drain_feedback`).
+- **RECOVERED is still congestion-inert.** The channel changes nothing in rule 3. The server's record handlers call content release, the deferral and the retransmit request, and nothing else. QUIC's own acknowledgements of the stream's packets belong to quinn and never reach the application's estimator.
+- **Ordering across the two channels.** The stream and the datagrams are not ordered with respect to each other. A source's late original can be acknowledged on a datagram before or after its RECOVERED arrives on the stream, and held(B) can reach k before or after a RECOVERED or DECLINED for B arrives. The server handling is defined so that every order gives the same final state (§4.9.3):
+  - content release is idempotent: the first of {arrival entry, RECOVERED} releases, and the second is a no-op;
+  - RECOVERED never resolves a ledger record and never touches congestion state. Whether a late original's ACK is Live or a spurious verdict therefore depends only on the detector, never on when RECOVERED came;
+  - B's **accounted set** (sources with an arrival entry or a RECOVERED id) grows by union. The deferral covers only the sources still unaccounted when held(B) reaches k, and closes when the set covers them all;
+  - DECLINED retransmits the named sources that are not yet accounted. A later arrival or RECOVERED of one of them makes that retransmit redundant (counted, safe), never wrong;
+  - CONTENT_REJECTED is handled without the cache entry, because the bundle's arrival entry may already have released it (§4.9.3).
+
+  Within the stream, order is kept. For a rebuilt bundle with a rejected record, the client writes CONTENT_REJECTED before RECOVERED, so the server never releases a record it is about to be told is bad.
+- **When the client emits each record.**
+  - **RECOVERED:** at the point where the rebuilt bundle enters the record path an arrived bundle takes. A RECOVERED id means, for content, exactly what the source's arrival entry means.
+  - **CONTENT_REJECTED:** where today's code withholds the deferred ACK, that is, when a record fails prevalidation, whether its bundle arrived or was rebuilt.
+  - **DECLINED:** when the client holds at least k symbols of B and does not produce its sources. It gives one of the reasons of §4.9.5 and the missing sources. One DECLINED per block; the client does not repeat it, because the stream is reliable.
+- **Discriminator.** ACK v4 keeps 0x08, although its layout is now 0x06's. What changed is the meaning of an entry's id: a `bundle_seq` from the bundle counter, with repair symbols acknowledged and rebuilt sources absent, against 0x06's `wire_seq`. Both namespaces are u32 counters that start near zero. An entry read in the wrong one is therefore a valid-looking id that resolves the wrong ledger record, silently. Both namespaces are live in one session around the switch: 0x06 batches still in flight for pre-bundle traffic arrive after the first 0x08. The type byte is what tells the server which namespace a batch belongs to, and a stale binary that sends the wrong one fails loudly (`WrongMsgType`, counted) instead of mis-resolving. That is the project's convention (`ghostframe-protocol/src/ack.rs`): bump the discriminator when the meaning changes. It costs one constant, and the codec is shared with 0x06.
   - Register 0x08 in `INBOUND_DISCRIMINATORS` and `classify_inbound` (`ghostframe-protocol/src/protocol.rs`).
   - 0x06 remains the ACK until the client receives its first FEC-v2 bundle, and for every session that never receives one. At D3-f it joins the `AckBatchV1` arm.
-  - The message-type constant is a `pub const`, so `ghostframe-lib/include/ghostframe.h` must be regenerated (the cbindgen gate). The same applies to any new cap constant, unless it is `pub(crate)`.
+  - The message-type constants are `pub const`, so `ghostframe-lib/include/ghostframe.h` must be regenerated (the cbindgen gate). The same applies to any new cap constant, unless it is `pub(crate)`.
 
 #### 4.9.3 Server handling of each report
 
-| report | ledger state of the `bundle_seq` | action |
+| report (channel) | ledger state of the `bundle_seq` | action |
 |---|---|---|
-| arrival, source | Live | as today: release the content; record it delivered in `loss_window`; take an RTT sample, a goog_cc arrival and a delivery-rate sample; advance `largest_acked`; count toward held(B) |
-| arrival, repair | Live | the same, but no content to release |
-| arrival, either | declared lost | the existing spurious-verdict path (retract, late delivery sample, `K_PKT` evidence); release the content if it is a source; count toward held(B) |
-| arrival, either | already acknowledged, or unknown | nothing (overlap repeat, or past retention) |
-| RECOVERED | Live | release the content; close the deferral; **the record stays outstanding**, and the detector declares it lost unless its original arrives |
-| RECOVERED | declared lost | release the content; close the deferral and cancel any queued content retransmit |
-| RECOVERED | already acknowledged | nothing: the original arrived first, or this is a repeat |
-| RECOVERED | unknown, or names a repair record | nothing; `recovered_unknown += 1` |
+| arrival, source (datagram) | Live | as today: release the content; record it delivered in `loss_window`; take an RTT sample, a goog_cc arrival and a delivery-rate sample; advance `largest_acked`; count toward held(B); add to B's accounted set |
+| arrival, repair (datagram) | Live | the same, but no content to release and nothing to account |
+| arrival, either (datagram) | declared lost | the existing spurious-verdict path (retract, late delivery sample, `K_PKT` evidence); release the content if it is a source; count toward held(B) |
+| arrival, either (datagram) | already acknowledged, or unknown | nothing (overlap repeat, or past retention) |
+| RECOVERED (stream) | Live | release the content; add to B's accounted set; close the deferral if this was its last unaccounted source; **the record stays outstanding**, and the detector declares it lost unless its original arrives |
+| RECOVERED (stream) | declared lost | release the content; add to B's accounted set; close the deferral and cancel any queued content retransmit |
+| RECOVERED (stream) | already acknowledged | nothing: the original arrived first |
+| RECOVERED (stream) | unknown, or names a repair record | nothing; `recovered_unknown += 1` |
+| DECLINED, tile (stream) | any | for each source in `missing` that is not in B's accounted set: a content retransmit now, re-bundled under a new `bundle_seq`, or the tile re-encoded fresh if it was superseded. Close B's deferral if open (`deferral_declined`), cancel `T_lr`, drop B's repair state. A second DECLINED for B is a no-op, counted |
+| DECLINED, H.264 (stream) | any | the frame is lost: `h264_declined += 1`, and C5's keyframe or reference-invalidation request fires now instead of at the deadline. Drop the block state. Nothing is retransmitted |
+| CONTENT_REJECTED (stream) | any, before or after the bundle's arrival entry | the named record is not delivered: queue its tile through `request_retransmit`, which re-sends the cached content if it is still cached and re-encodes the tile fresh if it is gone or superseded. A second rejection of the same content forces the fresh re-encode, which bounds a loop on content the encoder got wrong **[E]**. Congestion state is untouched: the arrival entry already said the network delivered the datagram. The bundle's other records are released as usual |
 
-The ledger must retain protected records, including tombstones, for at least `max(T_lr(B), T_def(B), deadline(B))` after departure, the longest time a RECOVERED can still be useful. Otherwise a late RECOVERED finds nothing to release, and the content is retransmitted for nothing. A RECOVERED id reads a tombstone without consuming it (§4.9.1 rule 3).
+**Retention (revision 5).** A RECOVERED or DECLINED can be delayed by one uplink stream retransmission, ~1-1.5 RTT, and on the client-bug path a deferral lasts `T_def` = 60 s. Retaining every protected record for 60 s would mean ~360 k records at 6 k bundles/s. Instead:
+- every protected record, tombstones included, is retained for at least `max(today's floor of 600 ms, T_lr(B), deadline(B))`. The floor covers one stream retransmission at any RTT up to ~400 ms **[E]**. A RECOVERED later than that finds nothing (`recovered_unknown`), and its content is handed to ARQ at the deadline: a wasted retransmit, never a wrong tile. A RECOVERED reads a tombstone without consuming it (§4.9.1 rule 3);
+- a source record in an **open deferral is pinned**: it is exempt from retention expiry and from capacity eviction until the deferral closes (RECOVERED, DECLINED or `T_def`) or the session resets. Repair records are never pinned. Normally the pinned set is a few tens of records (recoveries per second times one uplink delivery). On the client-bug path it is recoveries per second times 60 s, ~3 k at 1080p and 1 % loss **[E]**. `deferral_pinned_max` reports the high-water mark. A cap (`MAX_DEFERRAL_PINNED`, `pub(crate)`, 16 384 suggested) resolves the oldest deferral early by its `T_def` action, counted, so a buggy client cannot grow server memory without bound;
+- **lossless content is retained until it is delivered**: by an arrival entry, by a RECOVERED, or by supersession with a newer encode of the same tile, which is itself retained until delivered. No path releases tile content as lost without a replacement transmission on its way. This is the "fully lossless screen" goal stated as an invariant, and test 12 checks it.
 
 #### 4.9.4 What a rebuilt source costs each consumer
 
@@ -796,54 +859,61 @@ What goog_cc reads is pre-FEC loss. With FEC on, it reads more loss than today's
 
 #### 4.9.5 Reconstruction-first deferral on the server
 
-Repair symbols are now ACKed, so the server can count from arrival entries alone how many symbols of block B the client holds: `held(B)`, the number of distinct ACKed `bundle_seq`s among B's sources and repairs. The count is exact up to ACK loss, which the overlap repeat mostly covers. It is one counter per open block, updated in O(1) per ACK from the `(block_id, k)` on each record.
+Repair symbols are now ACKed, so the server can count from arrival entries alone how many symbols of block B the client holds: `held(B)`, the number of distinct ACKed `bundle_seq`s among B's sources and repairs. The count is exact up to ACK loss, which the overlap repeat mostly covers. It is one counter per open block, updated in O(1) per ACK from the `(block_id, k)` on each record, next to B's accounted set (§4.9.2, "Ordering").
 
 - **held(B) < k.** Nothing new. The client's recovery window and REPAIR_REQUEST (§4.8.2) handle it, and `T_lr` remains the last resort.
-- **held(B) ≥ k.** The client can decode B. Under reconstruction-first it decodes as soon as the k-th symbol arrives. A lost source of B is therefore **not retransmitted when the detector declares it lost**. Its retransmission is **deferred** until one of two things happens:
-  - RECOVERED names it: the content is released and the deferral closes (`deferral_released`);
-  - the deferral expires at
+- **held(B) ≥ k, tile classes** (CDF 5/3, PalRLE, Solid and every other tile codec: everything except H.264). The client can decode B. Under reconstruction-first it decodes as soon as the k-th symbol arrives. A lost source of B is therefore **not retransmitted when the detector declares it lost**. `T_lr` is cancelled (§4.8.3), and the source's retransmission is **deferred** until one of three things happens:
+  - RECOVERED names it: the content is released, and the deferral closes once every lost source is accounted for (`deferral_released`);
+  - DECLINED names B: the content is retransmitted at once (`deferral_declined`, §4.9.3);
+  - the backstop expires at
 
-    `T_def(B) = t_k + 2·max_ack_delay + max(srtt, 4·rttvar, ack_delay_p99)`
+    `T_def(B) = t_k + T_DEF_LOSSLESS`,   `T_DEF_LOSSLESS = 60 s`
 
-    where `t_k` is the server time at which the ACK that brought held(B) to k arrived, and `max_ack_delay` is the client batcher's flush interval (5 ms).
+    where `t_k` is the server time at which the ACK that brought held(B) to k arrived. `T_DEF_LOSSLESS` is a named `pub(crate)` constant in the ledger, so it stays out of `ghostframe.h`.
 
-  How `T_def` is derived:
-  - The client records the k-th symbol's arrival and decodes in the same step (decode takes µs, §4.2). The RECOVERED id therefore leaves in the same batch as that arrival entry, or in the next one at most one flush interval later. That is the first `max_ack_delay`.
-  - If that batch is lost, the repeat rides the following batch. That is the second `max_ack_delay`.
-  - The last term is the slack for uplink jitter, reordering between batches and client stalls. It is generous on purpose. Firing late costs latency, and only on a rebuild the client declined, which is rare. Firing early wastes a retransmission on every recovery.
-    - `srtt` alone is too small on a fast path: at srtt ≈ 1 ms the total slack is ~11 ms. A web-client paint or main-thread stall of 16 ms or more would then fire `T_def` on every recovery that straddles a flush. (When the k-th arrival entry and its RECOVERED id share a batch, a stall delays both together and `t_k` absorbs it.)
-    - `4·rttvar` is the PTO's variance term.
-    - `ack_delay_p99` is the measured client hold time. For each batch, the server computes `d` = its receipt time minus the unwrapped `arrival_time` of the batch's oldest fresh entry, minus the running minimum of `d`; subtracting the minimum removes the clock offset and the one-way delay. `ack_delay_p99` is the p99 of `d` over a rolling window, kept in a ring like `ack_latency.rs`'s. That tracker measures enqueue-to-ACK latency and decides nothing today, so this is a sibling ring, not a reuse.
-    - Recommended in §6.4 item 14(a).
-- **At `T_def` with no RECOVERED (`deferral_timeout`).** Either the client declined the rebuild, or all three RECOVERED copies were lost. **The server never releases content on this deduction.** The client can decline a rebuild for reasons the server cannot predict. Today's XOR decoder declines in four cases:
+  **Why 60 s and no RTT formula** (owner decision 2026-10-26, §6.4 item 14(a): "pretty much forever, as we want to get to a fully lossless screen; maybe 1 min").
+  - Revision 4's `T_def = t_k + 2·max_ack_delay + max(srtt, 4·rttvar, ack_delay_p99)` was a latency mechanism. It guessed when a RECOVERED that had not come would never come, because three lost datagram copies and a declined rebuild both looked like a slow RECOVERED.
+  - Revision 5 removes both reasons. RECOVERED is reliable, so a slow one is never a lost one. A declined rebuild says so, with DECLINED. Every terminal outcome of a block the client knows about is now a reliable client statement, and the server has nothing left to guess.
+  - What remains for `T_def` is a client that says nothing at all while the connection lives: a client bug (a rebuild that emits neither RECOVERED nor DECLINED, or a malformed record that discards the rest of the stream's buffer), or a wedged repair-status stream (a front end that stopped writing it).
+  - A dead client is not that case. quinn closes the connection after its idle timeout, the default 30 s, since neither side sets `max_idle_timeout` (`transport/quic.rs`, `ghostframe-client-net/src/lib.rs`). `reset_session` then clears the deferral before 60 s.
+  - So `T_def` is a backstop that keeps a bug from stranding a tile forever, and **`deferral_timeout` is an alarm**: every test and scene asserts it is 0 (§4.9.8 tests 9b and 10). 60 s rather than "forever", so that the screen still converges on a buggy client. Not shorter, because a fire on a slow, correct client wastes a retransmit, and a short value would invite tuning it as a latency knob again.
+  - The `ack_delay_p99` ring that revision 4 needed for the slack is dropped.
+- **At `T_def` with neither RECOVERED nor DECLINED (`deferral_timeout`).** **The server never releases content on this deduction.** The client can decline a rebuild for reasons the server cannot predict, and it now names them in DECLINED. Today's XOR decoder declines in four cases:
   - a group that the evicted-group guard (`max_evicted`) rejects;
   - a member that is not a tile datagram;
   - a length outside the source-length bound;
   - pending state that was pruned.
 
-  The RS decoder will have the same kinds of reason: block state pruned, a symbol that fails validation, a length bound, eviction. Releasing content on a deduction would leave a tile permanently wrong with no repair, which breaks PixelPerfect. **Content release stays a client statement.** The fallback is a **content retransmit**: the source's records are re-bundled under a new `bundle_seq`, subject to supersession and the deadline skip (§4.3 step 6). The fallback is not more repair symbols. A client that held k symbols and did not decode would not decode with k + 1.
-- **A verdict before held(B) ≥ k is known** affects congestion state only. The deferral starts when held(B) reaches k. If B's deadline passes first, the content is released as lost (§4.8.2 step 4).
-- **When the server's view is wrong.** Three cases leave the server with no trigger at all:
-  - arrival entries lost beyond the 8-entry overlap, so held(B) is undercounted and no deferral starts, while the client holds ≥ k and so sends no REPAIR_REQUEST;
-  - an undercounted held(B) together with all three RECOVERED copies lost;
-  - a client that declined a rebuild while the server undercounts held(B).
+  The RS decoder will have the same kinds of reason, which are DECLINED's reason codes: block state pruned, evicted, a symbol that fails validation, a length bound, a rebuilt header that does not match its hole. Releasing content on a deduction would leave a tile permanently wrong with no repair, which breaks PixelPerfect. **Content release stays a client statement.** The fallback is a **content retransmit**: the source's records are re-bundled under a new `bundle_seq`, or the tile is re-encoded fresh if it was superseded. It is not more repair symbols: a client that held k symbols and did not decode would not decode with k + 1. `T_def` also logs at warn, rate-limited, because it means a bug.
+- **held(B) ≥ k, H.264: excluded** (owner, 2026-10-26). H.264 is not ARQ-lossless. No fragment is ever retransmitted (§4.3 step 6), and a late frame is worthless to a decoder that needs its references in order. A content retransmit at `T_def` would have nothing to do. So H.264 gets **no deferral and no `T_def`**, neither revision 4's short formula nor the 60 s one: the short formula existed only to bound the latency of a content retransmit, and H.264 has none. Its rules stay what revision 3 gave it:
+  - reconstruction, then REPAIR_REQUEST while its deadline (1-2 frame intervals) allows;
+  - at the deadline, the frame is dropped and counted (`h264_frames_lost`), and C5's keyframe or reference-invalidation request fires;
+  - RECOVERED for an H.264 source releases the block's repair state early and is counted;
+  - DECLINED for an H.264 block declares the frame lost at once, so C5's request leaves without waiting for the deadline.
+- **A verdict before held(B) ≥ k is known** affects congestion state only. The deferral starts when held(B) reaches k. If B's deadline passes first, its repair phase ends and the content falls back to ARQ (§4.8.2 step 4).
+- **When the server's view is wrong (revision 5).** Revision 4 listed three cases that left the server with no trigger. Two of them now resolve by a reliable client statement:
+  - held(B) undercounted (arrival entries lost beyond the 8-entry overlap) and the client rebuilt B: its RECOVERED arrives and releases the content. No deferral was needed;
+  - held(B) undercounted and the client declined: its DECLINED arrives, and the content is retransmitted at once.
 
-  `T_lr` is not cancelled in these cases: it is cancelled only when every source of B is accounted for (§4.8.3). It sends one repair symbol, which does not help a client that holds ≥ k. What finally resolves the content is the **deadline release** (§4.8.2 step 4): the content is released as lost, and the tile is re-encoded fresh if it is still current. Revision 3 specified that release but nothing implements it yet; it is D3-d work. This design therefore **requires the deadline release for every protected class, tiles and H.264, before that class is switched to the protected retransmit rules** (§4.8.3). Without it, the cases above strand content. Test 12 (§4.9.8) covers them.
+  The case that remains is a client that cannot speak about B. Either it never received a symbol of B (a burst took the whole block), or it holds fewer than k and its REPAIR_REQUESTs were lost or no round fits. The server then knows held(B) < k. `T_lr` sends one repair symbol and re-arms once; if the client now knows B and asks, REPAIR_REQUEST serves it. Otherwise the **deadline release** ends B's repair phase and hands the content to ARQ (§4.8.2 step 4). This is why the deadline release is a precondition of switching any class to the protected rules (§6.4 item 14(d), decided). Without it, these cases strand content. Test 12 (§4.9.8) covers them.
+
+  One waste remains possible. If the client rebuilt B and its RECOVERED is slower than the deadline (one uplink stream retransmission at an RTT near the tile budget), the deadline hand-off re-sends content the client already holds. That is safe, because RECOVERED and the re-sent content are both idempotent **[E]**.
 
 **What changes in §4.8, and what stays.**
 - **Stays:**
   - the client-side recovery window `close(B)`;
-  - REPAIR_REQUEST for held < k, answered with m *new* repair symbols (each one now a transmission with its own `bundle_seq`);
+  - REPAIR_REQUEST for held < k, answered with m *new* repair symbols (each one now a transmission with its own `bundle_seq`), still a datagram;
   - the deadline gating;
   - `T_lr` and the rejection of every FEC-blind sender timer;
   - the RTT-dependent adaptation (§4.8.4).
 - **Changes:**
-  - **A server-side trigger for held ≥ k.** REPAIR_REQUEST cannot cover this case, because a client that holds k symbols never asks. The deferral and its content-retransmit fallback cover it.
-  - **Cancelling `T_lr`** now reads "every source of B has an arrival entry or a RECOVERED id" (§4.8.3). Revision 3 said "an ACK covering B's sources"; the same condition, now naming both sections.
+  - **A server-side trigger for held ≥ k.** REPAIR_REQUEST cannot cover this case, because a client that holds k symbols never asks. RECOVERED, DECLINED and the `T_def` backstop cover it.
+  - **Cancelling `T_lr`** now reads "every source of B has an arrival entry or a RECOVERED id, or B has a DECLINED, or B's deferral has started" (§4.8.3). Revision 3 said "an ACK covering B's sources".
   - **Loss verdicts on protected traffic** come from D1's RFC 9002 detector. They feed congestion state and never schedule a protected retransmission by themselves (§4.8.3, revision 4 reconciliation).
+  - **The deadline release of tile content** ends the repair phase and hands the content to ARQ, instead of releasing it as lost (revision 5, §4.8.2 step 4).
   - **Cross-checking REPAIR_REQUEST.** The request's `have` field can be checked against held(B).
     - The informative case is **held(B) ≥ k with `have` < k**: the client acknowledged symbols it no longer holds, for example because it pruned or invalidated them after the ACK. The client's statement is authoritative. The server serves the request with m new repair symbols, as asked, cancels B's deferral so that no content retransmit doubles the repair, and counts `have_mismatch`. Repair symbols, not a content retransmit, because the client says it still holds `have` symbols, and any m new symbols complete the block, whereas a content retransmit would resend every missing source.
-    - A request with `have ≥ k` is malformed (that client should have decoded). It is treated like a declined rebuild: content retransmit, counted.
+    - A request with `have ≥ k` is malformed: that client should have decoded, or sent DECLINED. It is treated like a DECLINED with every unaccounted source missing: content retransmit, counted.
 
 #### 4.9.6 Server cleanup in D3-c: delete the XOR-era heuristic
 
@@ -853,50 +923,54 @@ When the ledger moves to `bundle_seq` in D3-c, delete the server's inference of 
 - `DepartureTracker::tag_last_as_parity` and `take_departed_parity` (`departure.rs`), with the bridge plumbing in `io_bridge/transport_probe.rs` and the `parity_group` hand-off in `io_bridge/emit.rs` that feeds them.
 - The `fec_possible` branch of the `Late` arm in `io_bridge/ack_dispatch.rs`, so that one spurious-verdict path is left.
 
-`Emission::parity_group` stays only if the legacy 0x04 queue still needs it. Nothing is added in their place, because this design needs no `rebuilt` set. The server change is a net deletion.
+`Emission::parity_group` stays only while the legacy 0x04 queue exists. Since 0x04 emission is off for every session from D3-c on (§6.4 item 14(c), decided), it carries nothing after D3-c, and D3-f deletes it with the queue. Nothing is added in their place, because this design needs no `rebuilt` set. The server change is a net deletion.
 
 #### 4.9.7 Code sites, by crate
 
 **ghostframe-protocol** (D3-a)
 - `ack.rs`:
-  - an ACK v4 type (`arrivals: Vec<AckEntry>`, `recovered: Vec<u32>`) with encode and decode;
-  - the 0x08 constant and the caps (48 RECOVERED ids per batch, 3 copies);
+  - the 0x08 constant and an `AckBatchV4` type that shares 0x06's entry codec (arrivals only, 1..=72 entries);
   - the module doc, and the tests.
 - `AckEntry` keeps its layout. Its `wire_seq` field names a `bundle_seq` under v4.
 - `protocol.rs`: `InboundKind::AckBatchV4`, `INBOUND_DISCRIMINATORS`, `classify_inbound` and their tests.
+- `feedback_stream.rs`: the three record types (0x10 RECOVERED, 0x11 CONTENT_REJECTED, 0x12 DECLINED) in `FEEDBACK_STREAM_MSG_TYPES` and the distinctness test; a codec for the length-prefixed records, with the DECLINED reason codes, and an incremental parser that waits for a split record's tail.
 - REPAIR (0x0A) header: the own `bundle_seq` field (§4.5); `lens` are whole-datagram source lengths.
 - The RS block codec takes whole BUNDLE datagrams as source symbols (§4.9.1 rule 1).
 - Regenerate `ghostframe-lib/include/ghostframe.h` for any new `pub const`.
 
 **ghostframe-client-core** (D3-b)
-- `ack_batcher.rs`:
-  - a RECOVERED queue with a per-id copy count;
-  - a pending repeat arms the flush deadline;
-  - the arrival overlap is unchanged.
+- `ack_batcher.rs`: unchanged except the type byte, which switches to 0x08 on the first FEC-v2 bundle. No RECOVERED queue, copy count or repeat flush.
+- A repair-status outbox: queues RECOVERED, CONTENT_REJECTED and DECLINED entries and emits at most one record per type per ACK flush, CONTENT_REJECTED before RECOVERED for the same bundle.
+- `event.rs`: `PollOutput::RepairStatus(Vec<u8>)`.
 - The unbundle and reassembly path:
-  - an arrival entry for every BUNDLE and every REPAIR received, including the original of a source already rebuilt;
-  - an RS rebuild produces a RECOVERED id, never an arrival entry. The id is read from the rebuilt datagram's header and checked against the hole's `block_id` and `idx_in_block`;
-  - switch from 0x06 to 0x08 on the first FEC-v2 bundle received.
-- The client-local `Provenance { Received, Rebuilt }` (`reassembly.rs`) is what chooses between the two sections. It stays a client-core type: the wire carries the choice of section, not the enum. Its other uses are unchanged: the loss tracker's timing, `wire_loss`, and the newest-label yardstick.
-- Tests: `tests/oracle_ack.rs`, `tests/reassembly.rs`, and new batcher tests (§4.9.8).
+  - an arrival entry for every BUNDLE and every REPAIR received, including the original of a source already rebuilt, and including a bundle with a record that fails prevalidation (rule 5);
+  - an RS rebuild produces a RECOVERED id, never an arrival entry. The id is read from the rebuilt datagram's header and checked against the hole's `block_id` and `idx_in_block`; a mismatch produces DECLINED `header_mismatch`;
+  - a block with ≥ k symbols that is not rebuilt produces one DECLINED with its reason and missing-source mask;
+  - the deferred ACK for a CDF53 pass that fails prevalidation (`reassembly.rs`) becomes CONTENT_REJECTED under bundles. The 0x06 path keeps today's behaviour.
+- The client-local `Provenance { Received, Rebuilt }` (`reassembly.rs`) is what chooses between the arrival entry and RECOVERED. It stays a client-core type: the wire carries the choice of channel, not the enum. Its other uses are unchanged: the loss tracker's timing, `wire_loss`, and the newest-label yardstick.
+- Tests: `tests/oracle_ack.rs`, `tests/reassembly.rs`, and new outbox tests (§4.9.8).
+
+**ghostframe-client-net** (D3-b)
+- `lib.rs`: open the repair-status stream with `open(Dir::Bi)` next to `feedback_stream`, when the first FEC-v2 bundle arrives, and route `PollOutput::RepairStatus` to it.
 
 **ghostframe-client-wasm** (D3-b)
-- `units.rs`: `WasmAckBatcher` gains an add-recovered call, and `parse_ack_envelope` reads v4.
-- `boundary.rs`: `WasmAckEntry` is unchanged, and a recovered-id list is exported next to it.
-- `constants.rs`: export the 0x08 constant.
-- Nothing in `ghostframe-web-client/src` parses ACKs or calls `WasmAckBatcher` today. Confirm that by grep at implementation time: if it still holds, no TS change is needed beyond the rebuilt bundle. The `just build-release` and `just containers-build` traps in AGENTS.md apply, because the bundle is embedded.
+- `boundary.rs`: `pollTransmit` reports `kind: 'RepairStatus'`. `WasmAckEntry` is unchanged.
+- `units.rs`: `parse_ack_envelope` reads v4.
+- `constants.rs`: export 0x08 and the three record types.
+
+**ghostframe-web-client** (D3-b)
+- `main.ts`: a second `transport.createBidirectionalStream()`, opened on the first `RepairStatus` output, and its writer. `drainTransmit` writes to it without awaiting, as it writes `ackWriter`, so a stalled stream cannot hold back the ACK datagrams.
+- Nothing in `ghostframe-web-client/src` parses ACKs or calls `WasmAckBatcher` today. Confirm that by grep at implementation time. The `just build-release` and `just containers-build` traps in AGENTS.md apply, because the bundle is embedded.
 
 **ghostframe-lib, server** (D3-c, deferral in D3-d)
-- `io_bridge/ack_dispatch.rs`:
-  - decode v4;
-  - the arrival loop as today, now resolving repair records too;
-  - a RECOVERED loop, run after the arrivals, that calls only content release and the deferral close. It must not reach `record_ack_bwe_samples`, `loss_window` or the RTT estimator;
-  - `delivery_sampler.end_ack` is called once per batch today; under v4 it is skipped when `n_arr == 0`, so a RECOVERED-only batch closes no delivery-rate round.
+- `transport/webtransport.rs`: `feedback_queue` carries the `StreamId` with each chunk. Check what a browser-opened stream's first bytes are (§4.9.2, "To verify in D3-b").
+- `io_bridge.rs`, `dispatch_feedback_bytes`: the accumulator `feedback_recv_bufs` is keyed by `(handle, StreamId)`; the three record types are dispatched to a new handler module (for example `io_bridge/repair_status.rs`) that calls only content release, the accounted set, the deferral and `request_retransmit`. It must not reach `record_ack_bwe_samples`, `loss_window` or the RTT estimator. HELLO-gating applies as for every other feedback message.
+- `io_bridge/ack_dispatch.rs`: decode v4; the arrival loop as today, now resolving repair records too and feeding held(B) and the accounted set. (Revision 4's "skip `delivery_sampler.end_ack` when `n_arr == 0`" is gone: a 0x08 batch always has arrivals.)
 - `transport/transmission_ledger.rs`:
-  - records for repair symbols (no content, with `(block_id, k)`) and per-block held counters;
-  - the deferral state and its wake time, alongside `next_loss_time`;
+  - records for repair symbols (no content, with `(block_id, k)`), per-block held counters and accounted sets;
+  - the deferral state, `T_DEF_LOSSLESS` and its wake time alongside `next_loss_time`; pinning of records in an open deferral and `MAX_DEFERRAL_PINNED`;
   - a non-consuming tombstone lookup for RECOVERED (`resolve_at` consumes);
-  - retention of at least `max(T_lr, T_def, deadline)`;
+  - retention of at least `max(600 ms, T_lr, deadline)`;
   - `reset_session` clears all of it;
   - the deletions of §4.9.6.
 - `reliable_emitter/` and `departure.rs`:
@@ -906,14 +980,15 @@ When the ledger moves to `bundle_seq` in D3-c, delete the server's inference of 
   - `classify_retx` and `request_retransmit` return a new `RetxRequest::Protected` for protected content under `RetxCause::Loss` and `RetxCause::Probe`. That covers `loss_path::detect`'s per-verdict retransmit and `take_due_deferred`;
   - `loss_path::probe` answers a protected candidate with one new repair symbol of its block, and skips a block in deferral;
   - the TILE_NACK path refuses protected content;
-  - the `T_def` fallback is the one caller that requests a protected content retransmit.
-- The deadline release for every protected class (§4.9.5), and `ack_delay_p99`, a sibling ring of `ack_latency.rs`'s.
+  - DECLINED, CONTENT_REJECTED, the `T_def` backstop and the deadline hand-off are the callers that request a protected content retransmit.
+- The deadline release for every protected class (§4.9.5): for tiles, the hand-off to ARQ; for H.264, the frame drop.
 - `io_bridge.rs` event loop: wake for the earliest `T_def`.
 - Instruments: the counters of §4.8.5.
 - `io_bridge/tests.rs` and `coverage_pin_tests.rs`: the `AckEntry` literals are mechanical edits.
 
 **ghostframe-e2e**
 - `loss_detector_replay.rs`: model the client's rebuild, and ACK the late original as an arrival.
+- The browserless harness: the repair-status stream must exist in the harness too, and its c2s packets must be subject to netsim loss, or test 10's uplink-loss premise is never reached.
 - The browserless FECORACLE becomes an equality (§4.9.8 test 10).
 
 #### 4.9.8 Test plan
@@ -922,20 +997,26 @@ Each test asserts a property and names the mutation that must make it fail. Befo
 
 | # | tier | property | mutation that must fail it |
 |---|---|---|---|
-| 1 | protocol proptest | round trip for every `n_arr` in 0..=72 and `n_rec` in 0..=48 with arbitrary ids. Rejects: `n_arr + n_rec = 0`, a missing `n_rec` byte, a short RECOVERED section, trailing bytes, `n_rec > 48` | encode omits `n_rec` when it is 0; the decoder accepts trailing bytes |
-| 2 | protocol | 0x08 classifies as `AckBatchV4` in the every-envelope-byte test, and is distinct from every other inbound discriminator | delete the `classify_inbound` arm |
-| 3 | client-core | for a scripted symbol sequence in each codec family: a source rebuilt by RS appears in RECOVERED and never in arrivals; every received source **and every received repair symbol** appears in arrivals; the late original of a rebuilt source produces an arrival entry | (a) put the rebuilt source in arrivals; (b) deduplicate the original's ACK; (c) skip the ACK of repair symbols; (d) derive the RECOVERED id as `first + idx`, with repair symbols of another block interleaved between the sources (the reported id names the wrong transmission) |
-| 4 | client-core batcher | each RECOVERED id appears in exactly 3 consecutive batches; with only repeats pending, a batch leaves within `FLUSH_INTERVAL_US`; more than 48 ids spill into the next batch and none is lost | copies = 1; repeats do not arm the flush timer; truncate at 48 |
-| 5 | server unit | **RECOVERED is congestion-inert**: after a batch with only RECOVERED ids, the following are identical to their values before it: srtt, rttvar, `min_rtt`, `latest_rtt`, `loss_window`, `pending_losses`, `largest_acked`, the `K_PKT` evidence, the delivery-rate sampler state and goog_cc's feedback queue. The content was released (cache entry gone). Premise check: the content-release counter moved | (a) route RECOVERED ids through the arrival resolver; (b) call `delivery_sampler.end_ack` for a batch with `n_arr == 0` |
+| 1 | protocol proptest | 0x08 round trip for every `n` in 1..=72 with arbitrary entries; rejects `n = 0`, a short entry and trailing bytes. Repair-status records: round trip for each type and every entry count up to the 1020 B cap; rejects `len = 0`, a `len` that is not a multiple of the entry size, `len > 1020` and an unknown type; a record fed in arbitrary splits (byte by byte included) decodes to the same entries | the decoder accepts trailing bytes; the record parser accepts a `len` that is not a multiple of the entry size; the parser consumes a partial record instead of waiting for its tail |
+| 2 | protocol | 0x08 classifies as `AckBatchV4` in the every-envelope-byte test, and is distinct from every other inbound discriminator. 0x10-0x12 are in `FEEDBACK_STREAM_MSG_TYPES`, distinct from every stream type and from every datagram discriminator | delete the `classify_inbound` arm; give RECOVERED the value of an existing stream type |
+| 3 | client-core | for a scripted symbol sequence in each codec family: a source rebuilt by RS appears in a RECOVERED record and never in arrivals; every received source **and every received repair symbol** appears in arrivals; the late original of a rebuilt source produces an arrival entry | (a) put the rebuilt source in arrivals; (b) deduplicate the original's ACK; (c) skip the ACK of repair symbols; (d) derive the RECOVERED id as `first + idx`, with repair symbols of another block interleaved between the sources (the reported id names the wrong transmission) |
+| 4 | client-core outbox | each RECOVERED id is emitted exactly once, as `PollOutput::RepairStatus`, never as a `Datagram` and never as `Stream`, within one `FLUSH_INTERVAL_US` of the rebuild; a block with ≥ k symbols whose rebuild fails (one scripted case per reason) emits exactly one DECLINED with that reason and the right missing mask; for a rebuilt bundle with a bad record, CONTENT_REJECTED precedes RECOVERED in the output order | emit RECOVERED twice; route it as `Stream` (the feedback stream) or as a datagram; emit DECLINED with an empty mask; swap the CONTENT_REJECTED/RECOVERED order |
+| 5 | server unit | **RECOVERED is congestion-inert**: after delivering only RECOVERED records through the stream dispatcher, the following are identical to their values before: srtt, rttvar, `min_rtt`, `latest_rtt`, `loss_window`, `pending_losses`, `largest_acked`, the `K_PKT` evidence, the delivery-rate sampler state and goog_cc's feedback queue. The content was released (cache entry gone). Premise check: the content-release counter moved | route RECOVERED ids through the arrival resolver |
 | 6a | server unit | a source named only by RECOVERED is declared lost by the detector, by packet threshold (`K_PKT` later arrivals) and, in a second case, by time threshold, with `LossReason` set accordingly | let RECOVERED resolve the record as acknowledged (no verdict follows) |
 | 6b | server unit | **a verdict on protected data never retransmits.** The content is still cached (no RECOVERED) and held(B) < k. Loss verdicts, `take_due_deferred` and PTO fires queue no source retransmission (`RetxRequest::Protected`), and a PTO fire queues one repair symbol instead. Premise check: verdicts > 0, PTO fires > 0, content cached throughout. (Test 6a alone is vacuous here: once the content is released, today's code also answers `ContentGone`) | keep `loss_path::detect`'s retransmit for protected keys; let the probe resend a protected source |
 | 7 | server unit | late original after RECOVERED and a verdict: the spurious-verdict path runs (retraction +1, `K_PKT` evidence +1, one late delivery sample). Late original before a verdict: a Live delivery. A repeat of either: nothing | add a "content already released, skip" special case to the arrival path (the retraction is lost) |
+| 7b | server unit, **both cross-channel orders** | for one rebuilt source whose original also arrives, run the same script twice: (i) the arrival datagram, then the RECOVERED record; (ii) the RECOVERED record, then the arrival datagram; each with and without a loss verdict in between. The final congestion state (srtt, `loss_window`, `K_PKT` evidence, sampler, goog_cc queue) and content state (cache, coverage, accounted set, deferral) are equal across the two orders, and content was released exactly once. A third script delivers RECOVERED before any other symbol of B is ACKed: when held(B) later reaches k, no deferral opens for that source | let RECOVERED resolve the record (order (ii) loses the spurious-verdict retraction and the states differ); count a RECOVERED that finds the record acknowledged as a release (released twice); do not consult the accounted set when the deferral opens (the third script opens one) |
 | 8 | server unit + browserless | a repair ACK yields an RTT sample, a goog_cc arrival and a delivery sample carrying its bytes. In a lossless scene with FEC on, delivered bytes equal the bytes netsim carried, to the datagram (no payload factor) | do not record repair symbols in the ledger (their ACKs resolve unknown, so the equality fails) |
-| 9 | server unit | deferral: with held(B) ≥ k and a source lost, nothing is retransmitted before `T_def`; RECOVERED closes the deferral; with no RECOVERED (a scripted declined rebuild), the content is retransmitted at `T_def` and is **never released without RECOVERED**. Premise check: `deferral_started > 0` | (a) release content at `T_def` on deduction (the declined-rebuild case keeps a wrong tile); (b) retransmit on the verdict (the no-retransmit-before-`T_def` assertion fails) |
-| 10 | browserless FECORACLE (burst_loss sweep, which drops s2c only) | in every run, server `recovered_ids_rx_distinct` (distinct RECOVERED ids received, **whatever the ledger state**, so a late original in the same batch does not hide one) equals client `bundles_recovered`, exactly. `repair_after_recovery == 0`. `deferral_timeout == 0` when no rebuild is declined. Premises, stated and checked: no c2s loss (so no RECOVERED copy is lost; a scene with uplink loss asserts `≤` instead); recoveries > 0 in every run (iid 2 %) | the client reports rebuilt sources as arrivals (`recovered_rx` drops to 0, the equality fails) |
+| 9 | server unit | deferral: with held(B) ≥ k and a source lost, nothing is retransmitted before RECOVERED, DECLINED or `T_def`; RECOVERED closes the deferral; **DECLINED triggers the content retransmit in the same event-loop pass**, long before `T_def`, and only for the sources in its mask that are not accounted; content is **never released without RECOVERED**. Premise check: `deferral_started > 0`, `deferral_declined > 0` | (a) release content at `T_def` on deduction (the declined-rebuild case keeps a wrong tile); (b) retransmit on the verdict (the no-retransmit-before assertion fails); (c) ignore DECLINED (the retransmit waits for `T_def` and the same-pass assertion fails); (d) retransmit every source of B on DECLINED (an accounted source is re-sent) |
+| 9b | server unit, scripted clock | **`T_def` fires only when the client is silent.** (i) A correct client whose RECOVERED and DECLINED records are delayed by up to 4 RTT (scripted stream retransmissions): `deferral_timeout == 0` and every deferral closes by a client record. (ii) A silent client that rebuilds and sends nothing: `T_def` fires once per block at exactly `t_k + T_DEF_LOSSLESS`, the content is retransmitted, `deferral_timeout` counts it and the warn line is emitted. (iii) A session reset at 30 s clears the deferral and `T_def` never fires. Premise check: in (i) the records really were delayed past revision 4's formula (> `t_k + 2·max_ack_delay + srtt`) | put `T_def` back to revision 4's formula (case (i) fires); never arm `T_def` (case (ii) never retransmits); leave deferrals across `reset_session` (case (iii) fires) |
+| 9c | server unit | **H.264 is excluded**: an H.264 block with held(B) ≥ k and a lost source opens no deferral and arms no `T_def`; a DECLINED for an H.264 block counts `h264_declined`, fires the C5 hook and queues no content retransmit | apply the tile deferral to H.264 blocks; answer an H.264 DECLINED with a content retransmit |
+| 10 | browserless FECORACLE (burst_loss sweep), **with and without c2s loss** | in every run, server `recovered_ids_rx_distinct` (distinct RECOVERED ids received, **whatever the ledger state**) equals client `bundles_recovered`, exactly, **also with uplink loss**, because the stream retransmits a lost record. `repair_after_recovery == 0`; `deferral_timeout == 0` in every run. Premises, stated and checked: recoveries > 0 in every run (iid 2 %); in the c2s-loss runs, packets of the repair-status stream were actually lost and retransmitted (the client's quinn path stats show lost packets > 0, and the stream's retransmitted bytes > 0) | send RECOVERED on an unreliable datagram (the equality fails in the c2s-loss runs); the client reports rebuilt sources as arrivals (`recovered_rx` drops to 0) |
 | 11 | replay (`loss_detector_replay.rs`) + regression scenes | with the client rebuild modelled, every late original after a rebuild is read as a spurious verdict, and `K_PKT` reaches its ceiling under 16-interval reordering with no misread. The D1 regression scenes pass; goog_cc's loss input equals the client's pre-FEC loss within the reorder window, and that is treated as correct | drop the arrival ACK of the late original (the `K_PKT` property fails) |
-| 12 | server unit, scripted | **the deadline release backstops a blind server.** Drop arrival entries beyond the 8-entry overlap so that held(B) is undercounted, and drop all three RECOVERED copies (or script a declined rebuild). No deferral starts and no REPAIR_REQUEST comes. `T_lr` fires once, sends one repair symbol and re-arms. At `deadline(B)` the content is released as lost and re-encoded if current. Content is never stranded: the cache entry is gone and the tile is re-queued by the deadline. Premise check: `deferral_started == 0`, `lr_timer_fired ≥ 1` | remove the deadline release (the content stays cached past the deadline); let any single arrival for B cancel `T_lr` |
-| 13 | client-core | ACK v4 is not sent before the first FEC-v2 bundle arrives, even with HELLO bit 2 set: until then every ACK is 0x06 | switch to 0x08 on the HELLO bit |
+| 12 | server unit, scripted | **the deadline release backstops a client that cannot speak, and loses nothing.** (i) All symbols of B lost; (ii) held < k with every REPAIR_REQUEST dropped. In both, no deferral starts, `T_lr` fires once, sends one repair symbol and re-arms. At `deadline(B)` the repair phase ends and every unaccounted source of B is re-sent (or its tile re-encoded fresh if superseded) as an ordinary transmission, and that transmission is retained until an arrival entry acknowledges it. Content is never stranded and never released as lost: at the end of the script the tile has been delivered. (iii) held(B) undercounted (arrival entries dropped beyond the overlap) while the client rebuilt B: its RECOVERED releases the content and `deadline_released == 0` for B. Premise checks: `deferral_started == 0` in (i)-(ii), `lr_timer_fired ≥ 1`, the overlap really was exceeded in (iii) | remove the deadline release (the content stays cached past the deadline, never delivered); make the release drop the content without a replacement (the tile is never delivered); let any single arrival for B cancel `T_lr` |
+| 13 | client-core | ACK v4 is not sent and the repair-status stream is not opened before the first FEC-v2 bundle arrives, even with HELLO bit 2 set: until then every ACK is 0x06 and no `RepairStatus` output exists | switch to 0x08 on the HELLO bit; open the stream at `SessionReady` |
+| 14 | server unit, **both cross-channel orders** | CONTENT_REJECTED for record r of a received bundle, delivered (i) before and (ii) after the bundle's arrival entry: in both orders the bundle's other records are released, r's tile is queued for retransmit exactly once, and congestion state equals that of an ordinary arrival. A second rejection of the same content forces a fresh re-encode | look the rejected record up in the cache and skip the retransmit when it is gone (order (ii) re-sends nothing); withhold the arrival entry's congestion effects for a bundle with a rejected record |
+| 15 | loopback (`loopback_h3`-style, quinn-proto pair) | **stream isolation**: drop the one packet that carries a RECOVERED record; an INPUT event written on the feedback stream after it reaches the server before the RECOVERED retransmit does. Premise check: the drop hit a repair-status packet (the record arrives late, by ≥ one retransmission) | write repair-status records on the feedback stream (the input event waits behind the lost record) |
+| 16 | server unit | two streams of one connection are parsed separately: a message split across reads on one stream, interleaved with a complete record on the other, decodes to the same messages as either alone | keep `feedback_recv_bufs` keyed by handle only (the interleaved bytes corrupt the split message) |
 
 #### 4.9.9 Alternatives considered
 
@@ -949,10 +1030,17 @@ A separate analysis (2026-10-26, kept outside the repo) compared this design wit
 - **A per-parity group-outcome report** is tied to XOR k = 10 geometry, which FEC v2 replaces.
 
 The analysis judged a separate recovered report to carry the same information as the flag at more cost: a second redundancy design, and a release that races the loss verdict. The owner chose that shape with two changes, which together remove both costs:
-- it rides inside ACK v4, so it reuses ACK v4's batching and repeats;
+- the second redundancy design is quinn's own stream recovery (revision 5), not one of ours;
 - loss verdicts on protected data no longer trigger retransmission (§4.8.3), so the race is harmless.
 
 Making repair symbols transmissions is what the flag design lacked. It gives goog_cc and the delivery sampler the bytes the network actually carried, and it gives the server `held(B)`, the basis of the deferral.
+
+**Revision 5 alternatives.**
+- **RECOVERED in the ACK datagram, three copies** (revision 4). The same bytes per recovery, but a recovery is lost when three consecutive batches are, and that loss must then be covered by a short `T_def` that wastes a retransmit whenever it guesses wrong. It also needs a copy counter, an id cap and a repeat flush. Replaced on the owner's question "maybe we could rely on QUIC reliable stream for this?".
+- **DECLINED as a field of REPAIR_REQUEST.** REPAIR_REQUEST is a datagram that asks for repair symbols, and a lost one is re-sent smaller. DECLINED needs a content retransmit, not symbols, and it must not be lost: a lost DECLINED would wait for the 60 s backstop. It goes on the reliable stream.
+- **REPAIR_REQUEST on the stream as well.** Rejected: it is deadline-gated, and a stream retransmission (≈ 1 RTT) or HOL blocking would push it past the deadline it was sent to meet.
+- **A DECLINED reason for "short at the deadline"**, so that the client also reports blocks it holds fewer than k symbols of. Not added: the server already knows held(B) < k from arrivals and acts at the deadline, and a client report cannot cover the case that matters, a block of which the client received nothing.
+- **Folding CONTENT_REJECTED into DECODE_ERROR (0x04 on the feedback stream).** DECODE_ERROR names a tile, not a transmission, and is rate-limited; it cannot say which record to withhold. Kept separate.
 
 ---
 
@@ -966,6 +1054,7 @@ Making repair symbols transmissions is what the flag design lacked. It gives goo
 - **Adaptive-loop oscillation.** Mitigated by pre-FEC input, EWMA, hysteresis and the change-rate property test.
 - **Native version skew.** Two code paths (legacy XOR, v2) until the legacy one is retired.
 - **Expected gains are model estimates** (§3) until the browserless scene runs post-D1.
+- **A wedged repair-status stream is silent** (revision 5). If a front end stops writing the stream, or the server stops parsing it after a malformed record, content releases stop and the only symptom is `T_def` firing 60 s later. `deferral_timeout` and `repair_status_malformed` are therefore alarms, asserted 0 in every test and scene, and logged at warn in production.
 
 ---
 
@@ -1003,12 +1092,12 @@ Add to D1's scope (revision 3 also asked for a **per-class timer-policy hook**, 
 
 | PR | content | wire |
 |---|---|---|
-| D3-a | `ghostframe-protocol`: BUNDLE/REPAIR/LOSS_REPORT/ACK-v4 formats (**ACK v4 = arrival + RECOVERED sections; REPAIR carries its own `bundle_seq`, rev. 4**), GF(2^8) Cauchy codec + proptests, HELLO bit 2 constant; no behaviour | format only |
-| D3-b | client-core/wasm/native: unbundle, REPAIR decode, metrics, LOSS_REPORT + ACK v4 emission (**ACK every received repair symbol and every late original; rebuilt sources only in RECOVERED, 3 copies, rev. 4**), **recovery window + REPAIR_REQUEST (rev. 3)**; set HELLO bit 2 | yes (client) |
-| D3-c | server: bundling for bit-2 clients, FEC off; ledger/ACK by `bundle_seq` (**repair records, RECOVERED as content release only, rev. 4**); **delete the XOR-era `fec_possible` heuristic and parity-departure plumbing (§4.9.6)**; re-baseline the D1 scenes | yes (server) |
-| D3-d | server: block FEC emission at emission time, parity billed **and recorded as transmissions**; fixed (k, r) per class behind a knob; **protected classes switched to the protected retransmit rules (`RetxRequest::Protected`, probe answered with a repair symbol, `T_lr`, deadline release for every protected class, §4.8.3); serve REPAIR_REQUEST with new repair symbols; block cache until deadline (rev. 3); held(B) ≥ k deferral with `T_def` (§4.9.5, rev. 4)** | — |
+| D3-a | `ghostframe-protocol`: BUNDLE/REPAIR/LOSS_REPORT/ACK-v4 formats (**ACK v4 = arrivals only, 0x08; repair-status stream records RECOVERED/CONTENT_REJECTED/DECLINED, rev. 5; REPAIR carries its own `bundle_seq`, rev. 4**), GF(2^8) Cauchy codec + proptests, HELLO bit 2 constant; no behaviour | format only |
+| D3-b | client-core/wasm/native: unbundle, REPAIR decode, metrics, LOSS_REPORT + ACK v4 emission (**ACK every received repair symbol and every late original; rebuilt sources only in RECOVERED, rev. 4; RECOVERED/DECLINED/CONTENT_REJECTED on a second reliable stream, sent once, rev. 5**), **recovery window + REPAIR_REQUEST (rev. 3)**; set HELLO bit 2 | yes (client) |
+| D3-c | server: bundling for bit-2 clients, FEC off; ledger/ACK by `bundle_seq` (**repair records, RECOVERED as content release only, rev. 4; per-stream feedback accumulators and the repair-status record handlers, rev. 5**); **delete the XOR-era `fec_possible` heuristic and parity-departure plumbing (§4.9.6)**; **legacy 0x04 tile parity off for every session (§6.4 item 14(c))**; re-baseline the D1 scenes | yes (server) |
+| D3-d | server: block FEC emission at emission time, parity billed **and recorded as transmissions**; fixed (k, r) per class behind a knob; **protected classes switched to the protected retransmit rules (`RetxRequest::Protected`, probe answered with a repair symbol, `T_lr`, deadline release for every protected class as an explicit deliverable gated by test 12, §4.8.3); serve REPAIR_REQUEST with new repair symbols; block cache until deadline (rev. 3); held(B) ≥ k deferral for tile classes, closed by RECOVERED or DECLINED, with the 60 s `T_def` backstop (§4.9.5, rev. 5)** | — |
 | D3-e | adaptation controller + offline-generated **RTT- and deadline-dependent** table (§4.8.4) + LOSS_REPORT ingestion; telemetry fields | — |
-| D3-f | delete legacy 0x04 tile parity and the dead fragment-parity client code, once old native clients are retired | removal |
+| D3-f | delete legacy 0x04 tile parity (already off since D3-c) and the dead fragment-parity client code, once old native clients are retired | removal |
 
 **H.264 per-frame RS (C3's PRs 4–6)** reuses D3-a's codec and bit 2, with frame parity `frag_idx = n+1+j`. It does not depend on D1, so it can run right after D3-a, possibly at the end of Wave C. Add the r_min = 2 floor for small frames (Kyber, Moonlight). Pair it with **C5**: the RS residual (`h264_frames_lost` in LOSS_REPORT) should trigger reference invalidation or a keyframe, which today does not exist (GOP 11, no loss-triggered IDR).
 
@@ -1027,16 +1116,13 @@ Add to D1's scope (revision 3 also asked for a **per-class timer-policy hook**, 
 11. **(new, revision 3) Reconstruction-first repair policy** (§4.8): no sender timer on FEC-protected data except a last-resort one at window + RTT; the receiver requests m new repair symbols only when the block is unrecoverable and the deadline still allows. *Recommend yes*: the owner's direction, supported by the model.
 12. **(new, revision 3) Accept the latency cost under bursts at low RTT** (p95 ~44 ms against ~33 ms for a timer at 20 ms RTT, 2 % GE bursts), in exchange for zero wasted repairs. *Recommend yes*, reducible with larger r where bursts are measured.
 13. **(new, revision 3) Repair by new repair symbols, not by re-sent sources.** *Recommend repair symbols* (§4.8.2).
-14. **(new, revision 4) Open details of the ACK v4 design** (§4.9). The shape is decided; these parameters are not:
-    - **(a) `T_def` slack.** *Recommend `max(srtt, 4·rttvar, ack_delay_p99)` (§4.9.5).* `srtt` alone gives only ~11 ms of slack at 1 ms RTT, less than one web paint stall, and an early fire wastes a retransmission on every recovery. Revisit once D3-d has measured `ack_delay_p99` on the web client.
-    - **(b) RECOVERED redundancy.** 3 copies, at most 48 ids per batch? *Recommend yes*: about 12 B per recovery.
-    - **(c) The legacy 0x04 path after D3-c.** If tile XOR is ever re-enabled for an old native client after D3-c has deleted `fec_possible`, its recoveries are again ACKed as `Live` arrivals: a bounded under-report of loss, at most the ~1-3 % recovery rate of the XOR path. *Recommend keeping 0x04 emission off for every session from D3-c on*, which brings that part of D3-f forward.
-    - **(d) The deadline release for every protected class** (§4.9.5) is a precondition of switching a class to the protected rules, and so far it is specified but not implemented. *Recommend making it an explicit D3-d deliverable with test 12 as its gate.*
-15. **(new, revision 4) What an arrival entry means for content** (§4.9.1 rule 5). Today a CDF53 pass that fails prevalidation is not ACKed, and that missing ACK is what gets it retransmitted. With bundles, an arrival entry cannot both report "the network delivered this datagram" and "the content is valid".
-    - **Option A, arrivals report the network and a rejection section reports bad content.** Every received datagram gets an arrival entry. ACK v4 gains a third section, CONTENT_REJECTED (`bundle_seq u32` plus `record_idx u8`, 5 B each, with the same 3-copy repeat), which the client fills when a record fails prevalidation, in the same batch as the arrival entry. The server processes it before the arrivals: it does not release the rejected record and queues its content for retransmission, through ARQ for unprotected classes, and through the `T_def` content path for protected ones. Congestion control sees the truth, and content release is decoupled from arrival. Cost: one more section (+1 B per batch) and one more server path.
-    - **Option B, withhold the arrival entry for a bundle carrying a rejected record** (today's behaviour, applied per bundle). There is no new wire field. But congestion control reads a delivered packet as lost, and the bundle's other records lose their release and wait for a retransmission. Acceptable only while prevalidation failures stay at ~0.
-    - **Option C, separate content ACKs per record.** This roughly doubles the uplink ACK volume. Rejected.
-    - *Recommend A.* It keeps the arrival stream the pure record of what the network carried, which is the premise of rules 1-4, and it makes rejections countable (`content_rejected`) instead of looking like loss. RECOVERED follows the same rule: a rebuilt bundle whose record fails prevalidation is named in RECOVERED for its other records, and in CONTENT_REJECTED for that record.
+14. **(new, revision 4) Details of the ACK v4 design** (§4.9). **Decided 2026-10-26** (revision 5):
+    - **(a) `T_def`.** Owner: "T_def should be pretty much forever, as we want to get to a fully lossless screen (so this doesn't apply to H.264). Maybe 1 min." **Decided:** for the tile classes, `T_def = t_k + T_DEF_LOSSLESS`, 60 s, a backstop and not a latency mechanism. It is safe only because RECOVERED and DECLINED are reliable (b), so it fires only on a client bug, and `deferral_timeout` is an alarm. H.264 has no deferral and no `T_def` (§4.9.5). Revision 4's RTT formula and its `ack_delay_p99` ring are dropped.
+    - **(b) RECOVERED redundancy.** Owner: "maybe we could rely on QUIC reliable stream for this?" **Decided:** RECOVERED, CONTENT_REJECTED and the new DECLINED leave the ACK datagram for a reliable client→server stream, each sent once (§4.9.2). The 3-copy repeat and the 48-id cap are removed. ACK v4 (0x08) is arrivals only and keeps its own discriminator. Cost, latency on uplink loss, HOL blocking, cross-channel ordering and congestion control are analysed in §4.9.2.
+    - **(c) The legacy 0x04 path after D3-c.** **Decided:** 0x04 tile-parity emission is off for every session from D3-c on. D3-f still deletes the code.
+    - **(d) The deadline release for every protected class.** **Decided:** an explicit D3-d deliverable, gated by test 12. Reconciled with (a): for the tile classes the deadline ends the repair phase and hands the content to ARQ; lossless content is retained until delivered (§4.8.2 step 4, §4.9.3 "Retention").
+15. **(new, revision 4) What an arrival entry means for content** (§4.9.1 rule 5). **Decided 2026-10-26: option A.** Arrivals report the network; CONTENT_REJECTED (`bundle_seq u32`, `record_idx u8`) reports a bad record. Per 14(b) it rides the reliable repair-status stream rather than an ACK section, so the "processed before arrivals in the same message" rule of revision 4 becomes "handled without the cache entry, in either order" (§4.9.3, test 14). Options B (withhold the arrival) and C (per-record content ACKs) are rejected.
+16. **(new, revision 5) Which stream carries the repair-status records** (§4.9.2). *Recommend a second client-opened bidirectional stream*, so that a lost RECOVERED packet cannot hold back input events on the feedback stream (~14 % of input events delayed by an RTT at 75 ms and 1 % uplink loss during heavy recovery **[E]**). The alternative is the existing feedback stream: no new stream on any front end, at that HOL cost on input. Either way the server needs per-stream accumulators. Open, and with it one fact to check in D3-b: what the server reads first on a browser-opened bidi stream (§4.9.2, "To verify in D3-b").
 
 ---
 
