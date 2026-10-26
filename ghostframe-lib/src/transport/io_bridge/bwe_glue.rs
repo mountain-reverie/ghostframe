@@ -479,7 +479,7 @@ impl IoBridge {
     /// new request replaced it). See `probes_abandoned`'s doc comment for
     /// why under-filling is the expected outcome on an idle link, not a
     /// bug — no padding is ever sent to force completion.
-    fn close_probe_window(&mut self, probe: ActiveProbe) {
+    pub(super) fn close_probe_window(&mut self, probe: ActiveProbe) {
         self.publish_model_window(false);
         if probe.packets_sent >= probe.min_probes && probe.bytes_sent >= probe.min_bytes {
             self.probes_completed += 1;
