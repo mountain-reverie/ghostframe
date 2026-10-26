@@ -2103,6 +2103,11 @@ impl IoBridge {
                 // pacer_config absorbed yet).
                 pacing_mode = ?select_pacing_mode(bwe_snap.samples_seen),
                 pacer_rate_bps = bwe_snap.pacer_rate_bps.unwrap_or(0),
+                // goog_cc's loss-based estimator: anything but DelayBased
+                // means it is holding the estimate down.
+                loss_state = ?bwe_snap.stats.loss_state,
+                lifts_blocked_loss = bwe_snap.stats.ceiling_lifts_blocked_loss,
+                lifts_undone = bwe_snap.stats.ceiling_lifts_undone,
                 bps_critical = bps_crit,
                 bps_refinement = bps_refn,
                 cumulative_bytes_critical = self.bytes_emitted_critical,

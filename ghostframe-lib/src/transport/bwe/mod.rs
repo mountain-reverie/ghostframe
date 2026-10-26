@@ -83,6 +83,32 @@ pub struct BweSnapshot {
     pub stats: BweStats,
 }
 
+/// Whether goog_cc's loss-based estimator is holding the estimate down (or
+/// ramping it back up), as opposed to the estimate following the delay-based
+/// one. Mirrors goog_cc's `LossBasedState` so that crate's types stay inside
+/// this module.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum LossState {
+    /// No loss limit: the estimate is the delay-based one.
+    #[default]
+    DelayBased,
+    Increasing,
+    IncreasingWithPadding,
+    Decreasing,
+}
+
+impl LossState {
+    /// True in every state but `DelayBased`.
+    pub fn is_limited(self) -> bool {
+        self != LossState::DelayBased
+    }
+
+    /// Index into `BweStats::loss_state_feedbacks`.
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// What the estimator wrapper has done, in numbers a scene can hold it to.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BweStats {
@@ -112,6 +138,21 @@ pub struct BweStats {
     /// estimator undoes a lift while it is in a loss-limited state).
     pub ceiling_lifts_checked: u64,
     pub ceiling_lifts_undone: u64,
+    /// The same judged one second after the lift instead of one feedback
+    /// after: a lift that is not under 0.98 of its value a second later held.
+    /// (A later down-reseed or delay back-off also counts as undone here.)
+    pub ceiling_lifts_checked_1s: u64,
+    pub ceiling_lifts_undone_1s: u64,
+    /// The loss-based state after the last feedback.
+    pub loss_state: LossState,
+    /// Feedbacks absorbed in each loss-based state, indexed by
+    /// `LossState::index`. Their sum is the feedback count: a zero in the
+    /// limited slots on a lossy run says the state was never reached.
+    pub loss_state_feedbacks: [u64; 4],
+    /// Lifts not made because the loss-based estimator was limiting.
+    pub ceiling_lifts_blocked_loss: u64,
+    /// Reseeds down made while the loss-based estimator was limiting.
+    pub ceiling_reseeds_down_loss_limited: u64,
     /// Lifts not made because quinn's round trip said a queue was standing.
     pub ceiling_lifts_blocked_queue: u64,
     /// Reseeds down not made because the window held a gap in the

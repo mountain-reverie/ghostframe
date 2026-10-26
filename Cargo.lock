@@ -2086,7 +2086,7 @@ dependencies = [
 [[package]]
 name = "goog_cc"
 version = "0.1.4"
-source = "git+https://github.com/Bluebugs/goog_cc?rev=1835cfa00f9d4e427a4908fd421bf2386594692d#1835cfa00f9d4e427a4908fd421bf2386594692d"
+source = "git+https://github.com/Bluebugs/goog_cc?rev=14eb7a1097acdb2330630e21b89b143af24f906a#14eb7a1097acdb2330630e21b89b143af24f906a"
 dependencies = [
  "tracing",
 ]

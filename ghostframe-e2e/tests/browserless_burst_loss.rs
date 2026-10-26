@@ -88,6 +88,31 @@ fn content_delivered(r: &BrowserlessResult) -> (usize, usize, usize) {
     (total, seen.len(), total - seen.len())
 }
 
+/// How deep refinement got: updates per tile-frame (1 = the first pass only),
+/// and the share of tile-frames that reached the deepest count seen in the
+/// run. With the content fixed, a higher mean depth in the same time is
+/// faster convergence toward PixelPerfect.
+fn refinement_depth(r: &BrowserlessResult) -> (f64, f64) {
+    let mut per: std::collections::HashMap<(u32, u8, u8), u32> = std::collections::HashMap::new();
+    for e in &r.events {
+        if let ClientNetEvent::Core(ghostframe_client_core::Event::TileReady {
+            frame_seq,
+            tile_x,
+            tile_y,
+            ..
+        }) = e
+        {
+            *per.entry((*frame_seq, *tile_x, *tile_y)).or_default() += 1;
+        }
+    }
+    let max = per.values().copied().max().unwrap_or(0);
+    let n = per.len().max(1) as f64;
+    (
+        per.values().map(|&c| c as f64).sum::<f64>() / n,
+        per.values().filter(|&&c| c == max).count() as f64 / n,
+    )
+}
+
 fn tiles_present(r: &BrowserlessResult) -> usize {
     (0..COLS as u8)
         .flat_map(|x| (0..ROWS as u8).map(move |y| (x, y)))
@@ -634,13 +659,21 @@ async fn burst_loss_report_over_three_seeds() {
             report_instruments(&name, r);
             let b = &r.transport.instr.bwe;
             println!(
-                "LIFTS {name}: down={} up={} up_checked={} up_undone_next_feedback={} up_blocked_by_queue={} down_skipped_gap={}",
+                "LIFTS {name}: down={} up={} up_checked={} up_undone_next_feedback={} up_checked_1s={} up_undone_1s={} up_blocked_by_queue={} down_skipped_gap={} up_blocked_by_loss={} down_while_loss_limited={} loss_state_feedbacks[delay={} inc={} inc_pad={} dec={}]",
                 b.ceiling_reseeds_down,
                 b.ceiling_reseeds_up,
                 b.ceiling_lifts_checked,
                 b.ceiling_lifts_undone,
+                b.ceiling_lifts_checked_1s,
+                b.ceiling_lifts_undone_1s,
                 b.ceiling_lifts_blocked_queue,
-                b.ceiling_reseeds_skipped_gap
+                b.ceiling_reseeds_skipped_gap,
+                b.ceiling_lifts_blocked_loss,
+                b.ceiling_reseeds_down_loss_limited,
+                b.loss_state_feedbacks[0],
+                b.loss_state_feedbacks[1],
+                b.loss_state_feedbacks[2],
+                b.loss_state_feedbacks[3]
             );
             println!(
                 "LATENCY {name}: critical n={} mean_us={} max_us={} refinement n={} mean_us={} max_us={} retx_B[nack={} loss={}] loss_path_resends_original_first={}",
@@ -659,10 +692,13 @@ async fn burst_loss_report_over_three_seeds() {
                 r.loss_path_resends_original_first,
             );
             let (ready, distinct, refinements) = content_delivered(r);
+            let (depth, at_max) = refinement_depth(r);
             println!(
-                "CONTENT {name}: tile_ready={ready} distinct_tile_frames={distinct} refinement_updates={refinements} s2c_bytes={} bytes_per_distinct_tile_frame={:.0}",
+                "CONTENT {name}: tile_ready={ready} distinct_tile_frames={distinct} refinement_updates={refinements} s2c_bytes={} bytes_per_distinct_tile_frame={:.0} depth_x1000={:.0} at_max_depth_permille={:.0}",
                 r.bytes_delivered_s2c,
-                r.bytes_delivered_s2c as f64 / distinct.max(1) as f64
+                r.bytes_delivered_s2c as f64 / distinct.max(1) as f64,
+                depth * 1000.0,
+                at_max * 1000.0
             );
             assert_established(&name, r);
         }

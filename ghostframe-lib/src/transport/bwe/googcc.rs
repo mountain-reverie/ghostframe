@@ -119,7 +119,17 @@ pub(crate) struct GoogCcDriver {
     /// The raw estimate a lift handed goog_cc, until the next feedback has
     /// been absorbed and compared with it.
     pending_lift_bps: Option<u64>,
+    /// Lifts to judge a second after they were made: `(due_us, lifted_bps)`.
+    /// goog_cc's loss-based estimator only moves on a completed observation
+    /// (at least 250 ms of sends), so "one feedback later" can be inside one
+    /// observation and says little about whether a lift held.
+    lifts_to_judge: std::collections::VecDeque<(u64, u64)>,
 }
+
+/// How long after a lift it is judged held or not.
+const LIFT_HOLD_US: u64 = 1_000_000;
+/// Bound on `lifts_to_judge` (lifts are at most one per window).
+const MAX_LIFTS_TO_JUDGE: usize = 64;
 
 /// Newtype carrying the `Send` assertion, so it covers exactly the one type
 /// that needs it and `GoogCcDriver` derives `Send` normally. A future field
@@ -268,6 +278,7 @@ impl GoogCcDriver {
             last_reseed_us: None,
             min_rtt: Default::default(),
             pending_lift_bps: None,
+            lifts_to_judge: std::collections::VecDeque::new(),
         }
     }
 
@@ -447,6 +458,9 @@ impl GoogCcDriver {
             }
             self.reseed(now, now_us, ceiling);
             self.stats.ceiling_reseeds_down += 1;
+            if self.loss_state().is_limited() {
+                self.stats.ceiling_reseeds_down_loss_limited += 1;
+            }
         } else if est < ceiling * (1.0 - FOLLOW_TOLERANCE)
             && r.acked_bps >= AIMD_BACKOFF_F * r.offered_bps
         {
@@ -456,7 +470,22 @@ impl GoogCcDriver {
             }
             self.reseed(now, now_us, ceiling);
             self.pending_lift_bps = Some(ceiling as u64);
+            if self.lifts_to_judge.len() < MAX_LIFTS_TO_JUDGE {
+                self.lifts_to_judge
+                    .push_back((now_us + LIFT_HOLD_US, ceiling as u64));
+            }
             self.stats.ceiling_reseeds_up += 1;
+        }
+    }
+
+    /// goog_cc's loss-based state, in this module's terms.
+    fn loss_state(&self) -> super::LossState {
+        use goog_cc::LossBasedState as G;
+        match self.ctl.0.loss_based_state() {
+            G::DelayBasedEstimate => super::LossState::DelayBased,
+            G::Increasing => super::LossState::Increasing,
+            G::IncreaseUsingPadding => super::LossState::IncreasingWithPadding,
+            G::Decreasing => super::LossState::Decreasing,
         }
     }
 
@@ -657,15 +686,29 @@ impl GoogCcDriver {
             self.min_rtt
                 .expire_before(now_us.saturating_sub(MIN_RTT_SPAN_US));
         }
-        // Did the last lift survive one feedback? Under goog_cc's loss-based
-        // estimator (v2) a lift is undone at the next feedback: its state is
-        // not reset by the constraints call. Counted, not acted on.
+        // Did the last lift survive one feedback? With goog_cc as pinned
+        // before its fork reseeded the loss-based estimator (v2) on a
+        // constraints call, about 80 % did not: v2 capped the target back to
+        // its old value at the next feedback. Counted, not acted on.
         if let Some(lifted) = self.pending_lift_bps.take() {
             self.stats.ceiling_lifts_checked += 1;
             if (self.estimate_bps as f64) < LIFT_SURVIVAL * lifted as f64 {
                 self.stats.ceiling_lifts_undone += 1;
             }
         }
+        while let Some(&(due, lifted)) = self.lifts_to_judge.front() {
+            if due > now_us {
+                break;
+            }
+            self.lifts_to_judge.pop_front();
+            self.stats.ceiling_lifts_checked_1s += 1;
+            if (self.estimate_bps as f64) < LIFT_SURVIVAL * lifted as f64 {
+                self.stats.ceiling_lifts_undone_1s += 1;
+            }
+        }
+        let state = self.loss_state();
+        self.stats.loss_state = state;
+        self.stats.loss_state_feedbacks[state.index()] += 1;
         self.refresh_ceiling(now);
 
         self.snapshot()
