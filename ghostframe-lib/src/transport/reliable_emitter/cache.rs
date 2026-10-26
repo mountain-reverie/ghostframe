@@ -51,6 +51,12 @@ pub struct CacheEntry {
     pub first_sent_at: Instant,
     pub last_sent_at: Instant,
     pub attempts: u8,
+    /// Retransmissions the loss path (a verdict or the probe) made of this
+    /// pass; `attempts` counts those and NACK repairs together. A client that
+    /// asks for a pass again says nothing about whether the path is losing
+    /// it, so only these count toward giving up on verdicts
+    /// (`LOSS_RETX_MAX_ATTEMPTS`) and set the deferred deadline's backoff.
+    pub loss_attempts: u8,
     /// The `wire_seq` of the newest transmission of this pass, whichever path
     /// made it (the original, a NACK repair, a loss retransmission, a probe).
     /// A loss verdict on an older transmission of the pass is moot: a newer one
@@ -300,6 +306,7 @@ mod tests {
             first_sent_at: now,
             last_sent_at: now,
             attempts: 0,
+            loss_attempts: 0,
             latest_ws: 0,
             probe: None,
         }

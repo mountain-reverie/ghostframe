@@ -53,7 +53,7 @@ proptest! {
                     datagram: Bytes::from(vec![0u8]),
                     queued_at: now,
                     first_sent_at: now, last_sent_at: now,
-                    attempts: 0, latest_ws: 0,
+                    attempts: 0, loss_attempts: 0, latest_ws: 0,
                     probe: None,
                 },
             );
