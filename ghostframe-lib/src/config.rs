@@ -207,6 +207,99 @@ pub struct TransportConfig {
     /// decodes parity whenever it arrives, whatever this says. H.264 parity is
     /// separate and unaffected.
     pub tile_fec: bool,
+    /// Who owns the send rate. From `GHOSTFRAME_CC=cubic|model`. See
+    /// [`CongestionMode`].
+    pub congestion: CongestionMode,
+    /// The model controller's settings, from `GHOSTFRAME_CC_*`. Read whatever
+    /// the mode is, so a scene can set them without switching it.
+    pub model: ModelSettings,
+}
+
+/// Which controller owns the send rate (D1 design A against the status quo).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CongestionMode {
+    /// quinn's Cubic window and goog_cc's estimate, coupled through the
+    /// `cwnd / srtt` hint and the admission `min`.
+    #[default]
+    Cubic,
+    /// goog_cc's estimate is the rate; quinn's window is a bound derived from
+    /// it (`transport::model_controller`).
+    Model,
+}
+
+impl CongestionMode {
+    /// `model` selects [`Self::Model`]; anything else, or nothing, [`Self::Cubic`].
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        match get("GHOSTFRAME_CC").as_deref() {
+            Some("model") => Self::Model,
+            _ => Self::Cubic,
+        }
+    }
+
+    /// The mode the process environment asks for.
+    pub fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+}
+
+/// Settings of the model controller: the window gain and the idle-restart
+/// policy of D1 design section 6.6.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelSettings {
+    /// `G`: the window is `G x R_w x (min_rtt + max_ack_delay)`. A BDP bound,
+    /// not a rate limiter (admission paces). `GHOSTFRAME_CC_GAIN`.
+    pub gain: f64,
+    /// `G` from the first send after an idle until the first feedback that
+    /// follows it. `GHOSTFRAME_CC_RESTART_GAIN`.
+    pub restart_gain: f64,
+    /// A gap in sending this long is an idle: the next send is a restart.
+    /// `GHOSTFRAME_CC_IDLE_AFTER_MS`.
+    pub idle_after: std::time::Duration,
+    /// How long the last validated rate is held through an idle. Past it the
+    /// restart resumes at `restart_fraction x` the held rate.
+    /// `GHOSTFRAME_CC_T_HOLD_MS`.
+    pub t_hold: std::time::Duration,
+    /// The share of the held rate a restart past `t_hold` resumes at (never
+    /// under the start rate). `GHOSTFRAME_CC_RESTART_FRACTION`.
+    pub restart_fraction: f64,
+}
+
+impl Default for ModelSettings {
+    fn default() -> Self {
+        Self {
+            gain: 2.0,
+            restart_gain: 1.0,
+            idle_after: std::time::Duration::from_millis(250),
+            t_hold: std::time::Duration::from_secs(2),
+            restart_fraction: 0.25,
+        }
+    }
+}
+
+impl ModelSettings {
+    /// Unparseable or out-of-range values keep the default: a gain under 1
+    /// would make the window smaller than the rate it carries.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let d = Self::default();
+        let f = |k: &str, lo: f64, hi: f64, dflt: f64| {
+            get(k)
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && (lo..=hi).contains(v))
+                .unwrap_or(dflt)
+        };
+        let ms = |k: &str, dflt: std::time::Duration| {
+            get(k)
+                .and_then(|s| s.parse::<u64>().ok())
+                .map_or(dflt, std::time::Duration::from_millis)
+        };
+        Self {
+            gain: f("GHOSTFRAME_CC_GAIN", 1.0, 64.0, d.gain),
+            restart_gain: f("GHOSTFRAME_CC_RESTART_GAIN", 1.0, 64.0, d.restart_gain),
+            idle_after: ms("GHOSTFRAME_CC_IDLE_AFTER_MS", d.idle_after),
+            t_hold: ms("GHOSTFRAME_CC_T_HOLD_MS", d.t_hold),
+            restart_fraction: f("GHOSTFRAME_CC_RESTART_FRACTION", 0.01, 1.0, d.restart_fraction),
+        }
+    }
 }
 
 impl TransportConfig {
@@ -259,6 +352,8 @@ impl TransportConfig {
                 get("GHOSTFRAME_TILE_FEC").as_deref(),
                 Some("1") | Some("true")
             ),
+            congestion: CongestionMode::from_lookup(&get),
+            model: ModelSettings::from_lookup(&get),
         }
     }
 
@@ -1223,6 +1318,39 @@ mod tests {
             !TransportConfig::from_lookup(lookup(&[])).skip_palette_session_reset,
             "unset must yield false"
         );
+    }
+
+    #[test]
+    fn the_congestion_mode_is_cubic_unless_the_env_says_model() {
+        let mode = |v: &[(&str, &str)]| TransportConfig::from_lookup(lookup(v)).congestion;
+        assert_eq!(mode(&[]), CongestionMode::Cubic);
+        assert_eq!(mode(&[("GHOSTFRAME_CC", "cubic")]), CongestionMode::Cubic);
+        assert_eq!(mode(&[("GHOSTFRAME_CC", "bogus")]), CongestionMode::Cubic);
+        assert_eq!(mode(&[("GHOSTFRAME_CC", "model")]), CongestionMode::Model);
+        assert_eq!(TransportConfig::default().congestion, CongestionMode::Cubic);
+    }
+
+    #[test]
+    fn model_settings_default_to_the_design_and_reject_nonsense() {
+        let d = ModelSettings::default();
+        assert_eq!(ModelSettings::from_lookup(lookup(&[])), d);
+        assert_eq!((d.gain, d.restart_gain, d.restart_fraction), (2.0, 1.0, 0.25));
+        assert_eq!(d.t_hold, std::time::Duration::from_secs(2));
+        let s = ModelSettings::from_lookup(lookup(&[
+            ("GHOSTFRAME_CC_GAIN", "8"),
+            ("GHOSTFRAME_CC_RESTART_GAIN", "2"),
+            ("GHOSTFRAME_CC_T_HOLD_MS", "60000"),
+            ("GHOSTFRAME_CC_RESTART_FRACTION", "1"),
+        ]));
+        assert_eq!((s.gain, s.restart_gain, s.restart_fraction), (8.0, 2.0, 1.0));
+        assert_eq!(s.t_hold, std::time::Duration::from_secs(60));
+        // A gain under 1, a NaN and a zero fraction keep the default.
+        let bad = ModelSettings::from_lookup(lookup(&[
+            ("GHOSTFRAME_CC_GAIN", "0.5"),
+            ("GHOSTFRAME_CC_RESTART_GAIN", "nan"),
+            ("GHOSTFRAME_CC_RESTART_FRACTION", "0"),
+        ]));
+        assert_eq!(bad, d);
     }
 
     #[test]

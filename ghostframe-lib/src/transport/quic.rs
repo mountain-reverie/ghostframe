@@ -68,6 +68,9 @@ pub struct QuicServer {
     /// The datagram send buffer size this endpoint was configured with, so a
     /// reading of `send_buffer_space()` can be turned into queued bytes.
     datagram_send_buffer: usize,
+    /// The TLS adapter the endpoint's `ServerConfig` was built from, kept so
+    /// `use_model_controller` can build a second `ServerConfig` over it.
+    quic_tls: Arc<quinn_proto::crypto::rustls::QuicServerConfig>,
     /// Certificate fingerprint for browser pinning.
     pub(crate) cert_info: CertInfo,
     /// Stray `ConnectionEvent`s for handles we no longer hold, counted rather
@@ -514,26 +517,10 @@ impl QuicServer {
         tls_config.alpn_protocols = vec![b"h3".to_vec()];
 
         // --- 4. Wrap in quinn-proto's rustls adapter ---
-        let quic_tls = quinn_proto::crypto::rustls::QuicServerConfig::try_from(tls_config)?;
+        let quic_tls = Arc::new(quinn_proto::crypto::rustls::QuicServerConfig::try_from(tls_config)?);
 
-        // --- 5. Transport config: enable datagrams ---
-        let mut transport_config = TransportConfig::default();
-        // `datagram_receive_buffer_size` takes `Option<usize>`.
-        transport_config.datagram_receive_buffer_size(Some(65536));
-        // `datagram_send_buffer_size` takes `usize` (not Option) in quinn-proto 0.11.
-        transport_config.datagram_send_buffer_size(datagram_send_buffer);
-
-        // --- 6. ServerConfig ---
-        let mut server_config = ServerConfig::with_crypto(Arc::new(quic_tls));
-        server_config.transport = Arc::new(transport_config);
-        server_config
-            .incoming_buffer_size(INCOMING_BUFFER_PER_CONNECTION)
-            .incoming_buffer_size_total(INCOMING_BUFFER_TOTAL)
-            // A connection is admitted for the peer at its source address
-            // (see `transport::peer_auth`), so it stays on that address. A
-            // tailnet peer's address does not change under a live session:
-            // WireGuard absorbs the underlying network moving.
-            .migration(false);
+        // --- 5/6. Transport config (datagrams) and ServerConfig ---
+        let server_config = Self::server_config(quic_tls.clone(), datagram_send_buffer, None);
 
         // --- 7. Endpoint ---
         let endpoint = Endpoint::new(
@@ -547,6 +534,7 @@ impl QuicServer {
             endpoint,
             connections: HashMap::new(),
             datagram_send_buffer,
+            quic_tls,
             cert_info: CertInfo {
                 sha256_hex,
                 schedule,
@@ -559,6 +547,49 @@ impl QuicServer {
             held_overflow: 0,
             refused_per_source: 0,
         })
+    }
+
+    /// The `ServerConfig`: datagrams on, and quinn's default Cubic unless a
+    /// model cell is given (D1 design A), in which case the window is the
+    /// model controller's.
+    fn server_config(
+        quic_tls: Arc<quinn_proto::crypto::rustls::QuicServerConfig>,
+        datagram_send_buffer: usize,
+        model: Option<Arc<crate::transport::model_controller::ModelCell>>,
+    ) -> ServerConfig {
+        let mut transport_config = TransportConfig::default();
+        // `datagram_receive_buffer_size` takes `Option<usize>`.
+        transport_config.datagram_receive_buffer_size(Some(65536));
+        // `datagram_send_buffer_size` takes `usize` (not Option) in quinn-proto 0.11.
+        transport_config.datagram_send_buffer_size(datagram_send_buffer);
+        if let Some(cell) = model {
+            transport_config.congestion_controller_factory(Arc::new(
+                crate::transport::model_controller::ModelControllerFactory::new(cell),
+            ));
+        }
+
+        let mut server_config = ServerConfig::with_crypto(quic_tls);
+        server_config.transport = Arc::new(transport_config);
+        server_config
+            .incoming_buffer_size(INCOMING_BUFFER_PER_CONNECTION)
+            .incoming_buffer_size_total(INCOMING_BUFFER_TOTAL)
+            // A connection is admitted for the peer at its source address
+            // (see `transport::peer_auth`), so it stays on that address. A
+            // tailnet peer's address does not change under a live session:
+            // WireGuard absorbs the underlying network moving.
+            .migration(false);
+        server_config
+    }
+
+    /// Make connections accepted from now on use the model controller (D1
+    /// design A) over `cell`. A connection already open keeps the controller
+    /// it was built with, so call this before the first handshake.
+    pub fn use_model_controller(
+        &mut self,
+        cell: Arc<crate::transport::model_controller::ModelCell>,
+    ) {
+        let config = Self::server_config(self.quic_tls.clone(), self.datagram_send_buffer, Some(cell));
+        self.endpoint.set_server_config(Some(Arc::new(config)));
     }
 
     /// Install who may connect. Until this is called the server refuses
