@@ -6856,42 +6856,80 @@ async fn the_probe_timeout_is_a_wake_deadline() {
         Some(now + pto),
         "the loop wakes for the probe"
     );
-    // And it fires there, on its own: the pass is sent again.
+    // And it fires there, on its own: the pass is sent again, in the same
+    // turn. The probe runs before the admission pump, so the pump hands the
+    // retransmission to the transport now and not at some later wake.
+    bridge.post_turn().await.expect("post_turn");
+    let sent_before = bridge.sent_log_for_test.len();
+    assert_eq!(sent_before, 1, "premise: the original has been sent");
     tokio::time::advance(pto).await;
-    bridge.poll_pto(super::now_std());
-    assert_eq!(bridge.reliable_emitter.pending_loss_count(), 1);
+    bridge.post_turn().await.expect("post_turn");
     assert_eq!(bridge.instr.pto_probes_requested, 1);
+    assert_eq!(
+        bridge.reliable_emitter.pending_loss_count(),
+        0,
+        "the probe's retransmission was not left waiting for another turn"
+    );
+    assert_eq!(
+        bridge.sent_log_for_test.len(),
+        sent_before + 1,
+        "and it reached the transport in the turn that queued it"
+    );
 }
 
 /// The client acks a datagram it rebuilt from parity under its original
-/// `wire_seq`, long after the verdict. That is a loss that happened: it stays in
-/// the pending list and the loss window and is counted apart. (A prompt late
-/// acknowledgement is retracted: `a_spurious_verdict_is_retracted_...`.)
+/// `wire_seq`, a round trip after the group's parity left and with no other
+/// member missing. That is a loss that happened: it stays in the pending list
+/// and the loss window and is counted apart. The same acknowledgement sooner
+/// than a round trip after the parity cannot be one and is retracted
+/// (`a_spurious_verdict_is_retracted_...`).
 #[tokio::test(start_paused = true)]
-async fn an_acknowledgement_far_enough_after_the_verdict_to_be_an_fec_recovery_is_not_retracted() {
+async fn an_acknowledgement_a_round_trip_after_the_parity_is_an_fec_recovery_and_not_retracted() {
     use crate::transport::ack::{AckBatch, AckEntry};
-    let mut bridge = make_bridge_for_test().await;
-    let now = super::now_std();
-    for ws in 0..30u32 {
+    for (wait_ms, recovery) in [(50u64, true), (30, false)] {
+        let mut bridge = make_bridge_for_test().await;
         bridge
-            .transmission_ledger
-            .record_departed(ws, now, ledger_tx(1_000, 1_200, ws));
+            .reliable_emitter
+            .rtt
+            .on_sample(std::time::Duration::from_millis(40));
+        let now = super::now_std();
+        for ws in 0..10u32 {
+            bridge
+                .transmission_ledger
+                .record_departed(ws, now, ledger_tx(1_000, 1_200, ws));
+        }
+        // The group's parity has left, through the tracker as in production.
+        let _ = bridge.departures.on_enqueue(None, 100, now);
+        bridge.departures.tag_last_as_parity(0);
+        bridge.departures.on_poll(100, 0, now, |_, _| {});
+        for g in bridge.departures.take_departed_parity() {
+            bridge.transmission_ledger.note_parity_departed(g, now);
+        }
+        for ws in (0..10u32).filter(|w| *w != 3) {
+            assert!(bridge.transmission_ledger.resolve(ws).is_some());
+        }
+        bridge.declare_lost_for_test(&[3]);
+        assert_eq!(bridge.pending_losses.len(), 1, "premise: declared lost");
+        tokio::time::advance(std::time::Duration::from_millis(wait_ms)).await;
+        let batch = AckBatch {
+            entries: vec![AckEntry {
+                wire_seq: 3,
+                arrival_time_ms_lo16: 1,
+            }],
+        };
+        bridge.dispatch_ack_datagram(&batch.encode());
+        bridge.retract_late_acked_losses();
+        assert_eq!(
+            (
+                bridge.instr.late_acks_fec_possible,
+                bridge.pending_losses.len(),
+                bridge.pending_losses_retracted,
+            ),
+            if recovery { (1, 1, 0) } else { (0, 0, 1) },
+            "{wait_ms} ms after the parity"
+        );
+        assert_eq!(bridge.reliable_emitter.rtt.samples(), 1, "never a sample");
     }
-    bridge.declare_lost_for_test(&[3]);
-    assert_eq!(bridge.pending_losses.len(), 1, "premise: declared lost");
-    let batch = AckBatch {
-        entries: vec![AckEntry {
-            wire_seq: 3,
-            arrival_time_ms_lo16: 1,
-        }],
-    };
-    bridge.dispatch_ack_datagram(&batch.encode());
-    bridge.retract_late_acked_losses();
-    assert_eq!(bridge.pending_losses.len(), 1, "a real loss stays reported");
-    assert_eq!(bridge.pending_losses_retracted, 0);
-    assert_eq!(bridge.instr.late_acks_fec_possible, 1);
-    assert_eq!(bridge.instr.late_acked_after_flush, 0);
-    assert_eq!(bridge.reliable_emitter.rtt.samples(), 0, "and not a sample");
 }
 
 /// A hole with too few departures behind it for the packet rule is found by

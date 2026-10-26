@@ -1910,10 +1910,15 @@ impl IoBridge {
                 .next_loss_time(crate::transport::loss_path::time_threshold(
                     &self.reliable_emitter.rtt,
                 ));
-        [quic, display, close, recheck, admission, pto, loss_time]
-            .into_iter()
-            .flatten()
-            .min()
+        // And for a pass a verdict declined to resend, which has its own
+        // backed-off deadline.
+        let deferred = self.reliable_emitter.next_deferred_due();
+        [
+            quic, display, close, recheck, admission, pto, loss_time, deferred,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// React to a client-reported decode error. Most error codes are
@@ -2251,6 +2256,16 @@ impl IoBridge {
         self.drain_app_events();
         self.server.drain_endpoint_events();
         self.drain_outbound().await?;
+        // Verdicts and the probe come before the admission pump below, not
+        // after it: what they queue (a retransmission) is handed to quinn by
+        // that pump, in this turn, rather than waiting for an unrelated wake.
+        // Everything the emitter put on the wire becomes an outstanding
+        // record first. `wire_seq` is allocated inside the emitter, so this
+        // is the only place that knows which value each datagram carried.
+        let ledger_now = now_std();
+        self.record_emitted_transmissions(ledger_now);
+        self.expire_transmissions(ledger_now);
+        self.poll_pto(ledger_now);
         // quinn has just emptied what it could of its FIFO; feed it again
         // (and drain again) while the bucket and the gate allow, so it is not
         // left idle until the next turn.
@@ -2281,13 +2296,6 @@ impl IoBridge {
         // Phase 1 Task 8: drain accumulated BWE samples (populated by
         // the ACK-receive path in Task 5) into the estimator. Cheap
         // on empty.
-        // Everything the emitter put on the wire becomes an outstanding
-        // record. `wire_seq` is allocated inside the emitter, so this is
-        // the only place that knows which value each datagram carried.
-        let ledger_now = now_std();
-        self.record_emitted_transmissions(ledger_now);
-        self.expire_transmissions(ledger_now);
-        self.poll_pto(ledger_now);
         self.retract_late_acked_losses();
         // Reported only alongside an acknowledgement: goog_cc unwraps the
         // max receive time over a report's received packets, so a

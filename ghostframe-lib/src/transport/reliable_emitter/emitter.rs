@@ -88,13 +88,16 @@ pub struct ReliableTileEmitter {
     pending_loss: VecDeque<(EmitKey, RetxCause, u32)>,
     pending_loss_set: HashSet<EmitKey>,
     /// Passes a loss verdict declined to resend ([`RetxRequest::Deferred`]),
-    /// oldest first, left to the probe timeout. Their latest transmission has
-    /// been declared lost, so the ledger no longer shows them as outstanding and
-    /// the probe's scan of the newest departures cannot find them: this list is
-    /// how the probe does. Without it a pass lost four times running would sit in
-    /// the cache until the 30 s backstop.
-    deferred: VecDeque<EmitKey>,
-    deferred_set: HashSet<EmitKey>,
+    /// each with the transmission judged and the instant it is due to be sent
+    /// again. Their latest transmission has been declared lost, so the ledger no
+    /// longer shows them as outstanding and the probe's scan of the newest
+    /// departures cannot find them. Each has its own backed-off deadline
+    /// (`last_sent_at` plus the probe timeout at its loss-path attempt count),
+    /// checked by the loss path on every turn ([`Self::take_due_deferred`]),
+    /// so they are served while acknowledgements flow, which the single
+    /// per-connection probe timer is not. Bounded by [`DEFERRED_CAP`]; one entry
+    /// per key.
+    deferred: HashMap<EmitKey, DeferredPass>,
     /// Wire bytes each datagram costs beyond its own length (the
     /// WebTransport framing), added to what `tick_budgeted` bills. Zero
     /// unless the transport sets it.
@@ -204,8 +207,11 @@ pub struct EmitterStats {
     pub verdict_newer_in_flight: u64,
     pub verdict_already_queued: u64,
     /// Verdicts left to the probe because the pass had been resent
-    /// [`LOSS_RETX_MAX_ATTEMPTS`] times.
+    /// [`LOSS_RETX_MAX_ATTEMPTS`] times by the loss path.
     pub verdict_deferred_to_pto: u64,
+    /// Deferred passes not tracked because [`DEFERRED_CAP`] were already
+    /// waiting.
+    pub deferred_overflow: u64,
     /// Loss retransmissions whose original turned out to have arrived (the
     /// original was the first transmission of the pass to be acknowledged):
     /// spurious loss verdicts, Eifel style. Counted per retransmission.
@@ -268,6 +274,20 @@ pub enum RetxCause {
 /// s) takes over.
 pub(crate) const LOSS_RETX_MAX_ATTEMPTS: u8 = 3;
 
+/// Most passes the deferred list holds. A pass lost this many times over is a
+/// path that is not working; one beyond the cap is left to the 30 s backstop
+/// (`retire_stuck`) and counted in `deferred_overflow`.
+pub(crate) const DEFERRED_CAP: usize = 256;
+
+/// A pass a verdict declined to resend, waiting for its own deadline.
+#[derive(Debug, Clone, Copy)]
+struct DeferredPass {
+    /// The transmission judged lost. If the pass's newest transmission is no
+    /// longer this one, something else has resent it and the entry is moot.
+    judged_ws: u32,
+    due: Instant,
+}
+
 /// What became of a request to retransmit a transmission's content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetxRequest {
@@ -320,8 +340,7 @@ impl ReliableTileEmitter {
             pending_nack_set: HashSet::new(),
             pending_loss: VecDeque::new(),
             pending_loss_set: HashSet::new(),
-            deferred: VecDeque::new(),
-            deferred_set: HashSet::new(),
+            deferred: HashMap::new(),
             wire_overhead: 0,
             stats: EmitterStats::default(),
         }
@@ -470,6 +489,7 @@ impl ReliableTileEmitter {
             first_sent_at: now,
             last_sent_at: now,
             attempts: 0,
+            loss_attempts: 0,
             latest_ws: wire_seq,
             probe,
         };
@@ -620,6 +640,7 @@ impl ReliableTileEmitter {
     /// ACKs are silent.
     pub fn on_ack(&mut self, keys: &[EmitKey]) {
         for key in keys {
+            self.deferred.remove(key);
             if self.cache.remove(key).is_some() {
                 self.stats.ack_hit += 1;
             } else {
@@ -817,6 +838,7 @@ impl ReliableTileEmitter {
                 );
             }
             entry.attempts = entry.attempts.saturating_add(1);
+            entry.loss_attempts = entry.loss_attempts.saturating_add(1);
             entry.last_sent_at = now;
             // A probe cluster measures one burst: goog_cc divides the
             // cluster's bytes by the span between its first and last send
@@ -1032,7 +1054,6 @@ impl ReliableTileEmitter {
         self.pending_loss.clear();
         self.pending_loss_set.clear();
         self.deferred.clear();
-        self.deferred_set.clear();
         // The estimator and the acknowledgement progress describe the
         // connection that is gone. Its PTO backoff, srtt and "newest ACK"
         // must not hold back or delay the next connection's first passes.
@@ -1118,28 +1139,73 @@ impl ReliableTileEmitter {
             {
                 RetxRequest::AlreadyQueued
             }
-            Some(e) if cause == RetxCause::Loss && e.attempts >= LOSS_RETX_MAX_ATTEMPTS => {
+            Some(e) if cause == RetxCause::Loss && e.loss_attempts >= LOSS_RETX_MAX_ATTEMPTS => {
                 RetxRequest::Deferred
             }
             Some(_) => RetxRequest::Queued,
         }
     }
 
-    /// Up to `n` passes left to the probe by a declined verdict, oldest first,
-    /// each with the `wire_seq` of its newest transmission. Passes that have
-    /// since been acknowledged or cancelled are dropped on the way.
-    pub fn take_deferred(&mut self, n: usize) -> Vec<(EmitKey, u32)> {
-        let mut out = Vec::new();
-        while out.len() < n {
-            let Some(key) = self.deferred.pop_front() else {
-                break;
-            };
-            self.deferred_set.remove(&key);
-            if let Some(e) = self.cache.get(&key) {
-                out.push((key, e.latest_ws));
+    /// Up to `n` deferred passes whose deadline has come, oldest deadline
+    /// first, each with the `wire_seq` of the transmission that was judged.
+    /// Entries for passes since acknowledged or cancelled, or resent by
+    /// someone else since the verdict, are dropped on the way. O(list), which
+    /// [`DEFERRED_CAP`] bounds; nothing here is per datagram or per
+    /// acknowledgement.
+    pub fn take_due_deferred(&mut self, now: Instant, n: usize) -> Vec<(EmitKey, u32)> {
+        let cache = &self.cache;
+        self.deferred
+            .retain(|k, d| cache.get(k).is_some_and(|e| e.latest_ws == d.judged_ws));
+        let mut due: Vec<(Instant, EmitKey, u32)> = self
+            .deferred
+            .iter()
+            .filter(|(_, d)| d.due <= now)
+            .map(|(k, d)| (d.due, *k, d.judged_ws))
+            .collect();
+        due.sort_by_key(|(at, _, _)| *at);
+        due.truncate(n);
+        for (_, k, _) in &due {
+            self.deferred.remove(k);
+        }
+        due.into_iter().map(|(_, k, ws)| (k, ws)).collect()
+    }
+
+    /// When the earliest deferred pass is due, for the event loop's wake
+    /// deadline. Entries whose pass is gone or has been resent are skipped.
+    pub fn next_deferred_due(&self) -> Option<Instant> {
+        self.deferred
+            .iter()
+            .filter(|(k, d)| {
+                self.cache
+                    .get(k)
+                    .is_some_and(|e| e.latest_ws == d.judged_ws)
+            })
+            .map(|(_, d)| d.due)
+            .min()
+    }
+
+    /// Passes waiting on a deferred deadline.
+    pub fn deferred_len(&self) -> usize {
+        self.deferred.len()
+    }
+
+    /// Leave `key` to its own deadline: `last_sent_at` plus the probe timeout
+    /// at the pass's loss-path attempt count, which doubles with each resend.
+    fn defer(&mut self, key: EmitKey, judged_ws: u32) {
+        let Some(e) = self.cache.get(&key) else {
+            return;
+        };
+        let due = e.last_sent_at + pto_for_attempt(&self.rtt, e.loss_attempts);
+        if self.deferred.len() >= DEFERRED_CAP && !self.deferred.contains_key(&key) {
+            let cache = &self.cache;
+            self.deferred
+                .retain(|k, d| cache.get(k).is_some_and(|e| e.latest_ws == d.judged_ws));
+            if self.deferred.len() >= DEFERRED_CAP {
+                self.stats.deferred_overflow += 1;
+                return;
             }
         }
-        out
+        self.deferred.insert(key, DeferredPass { judged_ws, due });
     }
 
     /// Transmission `wire_seq` of pass `key` was declared lost (packet or time
@@ -1167,9 +1233,7 @@ impl ReliableTileEmitter {
             RetxRequest::AlreadyQueued => self.stats.verdict_already_queued += 1,
             RetxRequest::Deferred => {
                 self.stats.verdict_deferred_to_pto += 1;
-                if self.deferred_set.insert(key) {
-                    self.deferred.push_back(key);
-                }
+                self.defer(key, wire_seq);
             }
             RetxRequest::Disabled => {}
         }
