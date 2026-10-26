@@ -133,7 +133,6 @@ pub struct EmitterStats {
     /// `pto_probe_retransmits`. (Formerly `rto_fired`, from the per-pass timer, which
     /// is gone.)
     pub loss_path_resends: u64,
-    pub rto_max_retransmits_reached: u64,
     pub ack_hit: u64,
     pub ack_miss: u64,
     pub nack_hit: u64,
@@ -2275,7 +2274,7 @@ mod tests {
     fn tick_keeps_retransmitting_after_many_attempts() {
         // Retirement was removed: the emitter keeps firing RTO retransmits
         // indefinitely until ACKed or cancelled. Verify that after N ticks
-        // the entry is still present and rto_max_retransmits_reached stays 0.
+        // the entry is still present.
         let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
@@ -2291,8 +2290,6 @@ mod tests {
         }
         // Entry must still be in the cache — no retirement.
         assert!(e.cache.get(&key).is_some(), "entry must not be retired");
-        // rto_max_retransmits_reached stays 0 since we never retire.
-        assert_eq!(e.stats.rto_max_retransmits_reached, 0);
     }
 
     #[test]
