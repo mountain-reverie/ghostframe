@@ -31,7 +31,7 @@ impl IoBridge {
         while let Some(emission) = self.reliable_emitter.next_emission(now) {
             let (bytes, class) = match &emission {
                 Emission::Source(bytes, class) => (bytes.clone(), *class),
-                Emission::Parity(bytes) => (bytes.clone(), WireClass::Parity),
+                Emission::Parity(bytes, _) => (bytes.clone(), WireClass::Parity),
             };
             let mut charged = 0usize;
             if let Some(gate) = self.gate {
@@ -67,7 +67,13 @@ impl IoBridge {
                     }
                 }
             }
-            let outcome = self.send_counted(&bytes, class, true, emission.wire_seq());
+            let outcome = self.send_counted(
+                &bytes,
+                class,
+                true,
+                emission.wire_seq(),
+                emission.parity_group(),
+            );
             if matches!(
                 outcome,
                 crate::transport::reliable_emitter::traits::SendOutcome::Rejected
@@ -155,7 +161,7 @@ impl IoBridge {
         dg: &[u8],
         class: WireClass,
     ) -> crate::transport::reliable_emitter::traits::SendOutcome {
-        self.send_counted(dg, class, false, None)
+        self.send_counted(dg, class, false, None, None)
     }
 
     /// [`Self::send_to_all_sessions`], saying whether the datagram came
@@ -173,6 +179,7 @@ impl IoBridge {
         class: WireClass,
         gated: bool,
         wire_seq: Option<u32>,
+        parity_group: Option<u32>,
     ) -> crate::transport::reliable_emitter::traits::SendOutcome {
         use crate::transport::reliable_emitter::traits::SendOutcome;
         #[cfg(test)]
@@ -259,16 +266,11 @@ impl IoBridge {
                     dg_len: dg.len(),
                     framing_len: framing,
                     wire_seq,
+                    parity_group,
                     cum_enqueued: cum,
                     queued,
                 },
             );
-            // A parity datagram names its group; the ledger wants to know
-            // when it leaves (see `Resolution::Late::fec_possible`).
-            if class == WireClass::Parity && dg.len() >= 5 {
-                self.departures
-                    .tag_last_as_parity(u32::from_be_bytes([dg[1], dg[2], dg[3], dg[4]]));
-            }
         }
 
         // No connected session counts as sent, not rejected: re-queueing a

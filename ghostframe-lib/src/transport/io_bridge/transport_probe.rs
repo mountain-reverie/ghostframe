@@ -57,6 +57,9 @@ pub(super) struct Enqueued {
     pub(super) framing_len: usize,
     /// The transmission it carries (its `wire_seq`), when the ledger tracks it.
     pub(super) wire_seq: Option<u32>,
+    /// For a tile parity datagram, the first `wire_seq` of the group it covers.
+    /// `None` for everything else, H.264 frame parity included.
+    pub(super) parity_group: Option<u32>,
     /// The session's cumulative accepted bytes including this one.
     pub(super) cum_enqueued: u64,
     /// quinn's queued bytes after it.
@@ -278,6 +281,7 @@ impl IoBridge {
             dg_len,
             framing_len,
             wire_seq,
+            parity_group,
             cum_enqueued,
             queued,
         } = e;
@@ -308,6 +312,11 @@ impl IoBridge {
         i.offered.bill(class, dg_len, framing_len);
         i.fifo_peak_at_enqueue = i.fifo_peak_at_enqueue.max(queued);
         self.track_enqueue(handle, wire_seq, cum_enqueued);
+        // The ledger wants to know when a group's parity leaves (see
+        // `Resolution::Late::fec_possible`).
+        if let Some(first) = parity_group {
+            self.departures.tag_last_as_parity(first);
+        }
     }
 
     /// After a `poll_transmit` batch, stamp the datagrams that left quinn's
@@ -340,9 +349,11 @@ impl IoBridge {
                     stamp_departure_in(ledger, emitter, ws, now);
                 }
             });
+        let retain =
+            (self.reliable_emitter.rtt.srtt() * 2).max(crate::transport::loss_window::SETTLE);
         for group_first in self.departures.take_departed_parity() {
             self.transmission_ledger
-                .note_parity_departed(group_first, now);
+                .note_parity_departed(group_first, now, retain);
         }
     }
 
