@@ -265,9 +265,9 @@ pub(super) fn token_wake_floor(mtu: usize, rate: f64) -> std::time::Duration {
 }
 
 /// The rate admission runs at and the term that set it.
-struct AdmissionRate {
-    bytes_per_sec: f64,
-    term: BudgetTerm,
+pub(super) struct AdmissionRate {
+    pub(super) bytes_per_sec: f64,
+    pub(super) term: BudgetTerm,
 }
 
 /// What one admission pass did.
@@ -338,7 +338,7 @@ impl IoBridge {
     /// so in steady state the cwnd decided and the estimate did not limit what
     /// was sent (the PR-0 instrument read `cwnd` in 66 to 99 % of passes across
     /// nested_cc's seven scenes). At 1.0 the pacer term is the estimate.
-    fn admission_rate(&self) -> AdmissionRate {
+    pub(super) fn admission_rate(&self) -> AdmissionRate {
         let tick_s = SCHEDULER_TICK_INTERVAL_US / 1_000_000.0;
         if self.model.is_some() {
             return self.model_admission_rate(tick_s);
