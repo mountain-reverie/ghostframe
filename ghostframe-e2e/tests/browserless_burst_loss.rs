@@ -137,6 +137,16 @@ fn report(name: &str, r: &BrowserlessResult) {
         r.client_wire_loss.dup_rebuilt,
         r.client_rx_datagrams,
     );
+    // Report-only oracle for the server's FEC recognition: late acks the
+    // ledger took for parity recoveries against what the client says it
+    // rebuilt from parity. The server sees only late acks of transmissions it
+    // had already declared lost, so it is a subset of the client's count.
+    println!(
+        "FECORACLE {name}: late_acks_fec_possible={} ledger_late_acks={} client_recovered={}",
+        r.transport.instr.late_acks_fec_possible,
+        r.transport.instr.ledger_spurious_losses,
+        r.client_wire_loss.recovered,
+    );
 }
 
 /// The D1 instruments, one line per run (see `ghostframe_lib::transport::instruments`).

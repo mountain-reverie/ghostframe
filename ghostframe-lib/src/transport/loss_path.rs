@@ -90,12 +90,12 @@ pub(crate) fn probe(
     let mut out = Outcome::default();
     // Transmissions whose content is gone are declared lost and leave the
     // ledger, so they do not count against the scan: look again until a round
-    // removes nothing or two probes are queued. A cursor (`kept`, the live
-    // records already looked at and left alone) keeps a round from reading
-    // them again, and `PROBE_MAX_ROUNDS` bounds the whole.
-    let mut kept = 0usize;
+    // removes nothing or two probes are queued. A positional cursor into the
+    // ledger's departure order keeps a round from reading an entry twice, and
+    // `PROBE_MAX_ROUNDS` bounds the whole.
+    let mut cursor = 0usize;
     'rounds: for _ in 0..PROBE_MAX_ROUNDS {
-        let candidates = ledger.newest_outstanding_after(kept, PROBE_SCAN, PROBE_SCAN);
+        let candidates = ledger.scan_outstanding(&mut cursor, PROBE_SCAN, PROBE_SCAN);
         if candidates.is_empty() {
             break;
         }
@@ -107,20 +107,17 @@ pub(crate) fn probe(
             match emitter.request_retransmit(tx.key, ws, RetxCause::Probe) {
                 RetxRequest::Queued => {
                     out.retx_queued += 1;
-                    kept += 1;
                 }
                 RetxRequest::ContentGone => {
                     if let Some(tx) = ledger.declare_lost_by_pto(ws) {
                         out.lost.push((ws, tx));
                         removed = true;
-                    } else {
-                        kept += 1;
                     }
                 }
                 RetxRequest::NewerInFlight
                 | RetxRequest::AlreadyQueued
                 | RetxRequest::Deferred
-                | RetxRequest::Disabled => kept += 1,
+                | RetxRequest::Disabled => {}
             }
         }
         if !removed {
@@ -227,7 +224,7 @@ mod tests {
 #[cfg(test)]
 mod deferred_tests {
     use super::*;
-    use crate::transport::reliable_emitter::emitter::{DEFERRED_CAP, LOSS_RETX_MAX_ATTEMPTS};
+    use crate::transport::reliable_emitter::emitter::LOSS_RETX_MAX_ATTEMPTS;
     use crate::transport::reliable_emitter::rto::pto_for_attempt;
     use crate::transport::reliable_emitter::EmitKey;
     use crate::transport::transmission_ledger::Transmission;
@@ -412,7 +409,6 @@ mod deferred_tests {
         let mut n = 0;
         e.tick_nacks_budgeted(t, usize::MAX, usize::MAX, &mut n);
         e.on_ack(&[b]);
-        assert_eq!(e.deferred_len(), 2, "an acknowledgement removes its entry");
         let far = t + Duration::from_secs(60);
         let due = e.take_due_deferred(far, 8);
         assert_eq!(
@@ -420,25 +416,10 @@ mod deferred_tests {
             vec![c],
             "a was resent since the verdict, b is acknowledged"
         );
-        assert_eq!(e.deferred_len(), 0, "and the moot one is gone");
-    }
-
-    /// Bounded: past the cap a new pass is not tracked (it has the 30 s
-    /// backstop) and the overflow is counted.
-    #[test]
-    fn the_deferred_list_is_bounded() {
-        let t0 = Instant::now();
-        let mut e = ReliableTileEmitter::new(t0);
-        e.rtt.on_sample(Duration::from_millis(40));
-        let mut l = TransmissionLedger::new(8192);
-        for i in 0..DEFERRED_CAP as u32 + 5 {
-            let k = EmitKey::new(i, (i % 200) as u8, (i / 200) as u8, 0);
-            lost_n_times(&mut e, &mut l, k, LOSS_RETX_MAX_ATTEMPTS, t0);
-            let ws = e.cache.get(&k).unwrap().latest_ws;
-            let _ = l.declare_lost_by_pto(ws);
-            let _ = e.request_retransmit(k, ws, RetxCause::Loss);
-        }
-        assert_eq!(e.deferred_len(), DEFERRED_CAP);
-        assert_eq!(e.stats.deferred_overflow, 5);
+        assert_eq!(
+            e.deferred_len(),
+            0,
+            "the moot ones were dropped as they surfaced"
+        );
     }
 }

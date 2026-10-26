@@ -108,7 +108,7 @@ fn replay(trace: &[Option<u64>], freeze: bool) -> Replay {
             // The group's parity leaves right behind the datagram that
             // allocates `first + 20`, i.e. after `first + 19` has left.
             if i % 10 == 9 && i >= 19 {
-                ledger.note_parity_departed(i - 19, at);
+                ledger.note_parity_departed(i - 19, at, Duration::from_millis(600));
             }
             next_send += 1;
         }
