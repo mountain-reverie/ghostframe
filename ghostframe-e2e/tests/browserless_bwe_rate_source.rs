@@ -304,9 +304,20 @@ const P6C_SEED: u64 = 0xCC01_1010;
 /// not an environment variable: CI sets none.
 const P6C_SEEDS: [u64; 5] = [0, 1, 2, 3, 4];
 
-/// Gate: the settled estimate is at most 5 % over the link on every seed
-/// (the cc_probe `BAND` is +-25 %, which the PR-3 overshoot of 1.26 barely
-/// left), and it converges on at least four of five.
+/// Gate: the settled estimate is at most 1.15 x the link's rate **in the units
+/// the estimate counts**, and it converges on at least four of five seeds.
+///
+/// The estimate is a rate of goog_cc's countable bytes (the wire size of each
+/// acknowledged transmission, no framing), so it is compared with the link's
+/// wire rate times the payload fraction the run measured
+/// (`payload_fraction_ppm`, the same field `browserless_nested_cc` uses).
+/// The old gate divided by the bare wire rate and bounded it at 1.05; the
+/// payload fraction in this scene is about 0.856, so 1.05 was 1.05 / 0.856 =
+/// 1.23 in these units. In these units master settles at 1.050 to 1.090 (mean
+/// 1.074) and the data is <= 1.09; the PR-3 overshoot of 1.26 against the wire
+/// rate reads about 1.26 / 0.856 = 1.47. 1.15 is a tightening from 1.23, with
+/// room over the data, and leaves the overshoot far outside. It also no longer
+/// depends on how much of the link carries parity.
 #[tokio::test(start_paused = true)]
 async fn p6c_codel_c10_settles_at_the_link_rate_on_five_seeds() {
     const CAP_MBIT: u64 = 10;
@@ -328,10 +339,12 @@ async fn p6c_codel_c10_settles_at_the_link_rate_on_five_seeds() {
         let end = s.last().unwrap().0 + 1;
         let tail = end.saturating_sub(5 * S);
         let settled = median(s, tail, end).expect("settled window");
-        let ratio = settled as f64 / cap_bps;
+        let frac = r.transport.instr.bwe.payload_fraction_ppm as f64 / 1e6;
+        assert!(frac > 0.5 && frac <= 1.0, "{name}: payload fraction {frac}");
+        let ratio = settled as f64 / (cap_bps * frac);
         let conv = cc::convergence_time(s, 0, end, cap_bps, BAND, 3 * S);
         p6(&name, "settled_median_bps", settled);
-        p6(&name, "settled_over_cap", format!("{ratio:.3}"));
+        p6(&name, "settled_over_cap_payload", format!("{ratio:.3}"));
         p6(&name, "t_converge_ms", ms(conv));
         p6(
             &name,
@@ -352,13 +365,13 @@ async fn p6c_codel_c10_settles_at_the_link_rate_on_five_seeds() {
             ratios.iter().map(|r| format!("{r:.3}")).collect::<Vec<_>>()
         ),
     );
-    // The bound is in goog_cc's countable bytes against the link's nominal
-    // rate: the countable rate delivered on this link is about 0.85 of it, so
-    // 1.05 here is about 1.24 x what was delivered (K = 1.176 is the ceiling).
+    // Countable bytes against the link's wire rate times the payload fraction
+    // (see the gate's doc comment for the arithmetic).
     for (i, ratio) in ratios.iter().enumerate() {
         assert!(
-            *ratio <= 1.05,
-            "seed {i}: settled/cap {ratio:.3} is above 1.05 (the unbounded estimate sat at ~1.26)"
+            *ratio <= 1.15,
+            "seed {i}: settled / (cap x payload fraction) {ratio:.3} is above 1.15 \
+             (the unbounded estimate sat at ~1.47 in these units)"
         );
     }
     assert!(
