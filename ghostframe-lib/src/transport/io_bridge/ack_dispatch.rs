@@ -150,12 +150,20 @@ impl IoBridge {
         batch: &crate::transport::ack::AckBatch,
         now_for_samples: std::time::Instant,
     ) -> Vec<ResolvedAck> {
+        let min_rtt = self
+            .reliable_emitter
+            .rtt
+            .min_rtt()
+            .unwrap_or(std::time::Duration::ZERO);
         batch
             .entries
             .iter()
             .filter_map(|e| {
                 use crate::transport::transmission_ledger::Resolution;
-                let r = match self.transmission_ledger.resolve(e.wire_seq) {
+                let r = match self
+                    .transmission_ledger
+                    .resolve_at(e.wire_seq, Some((now_for_samples, min_rtt)))
+                {
                     Some(Resolution::Live(tx)) => {
                         // At dispatch, not when the samples are drained later
                         // in the turn: the probe timeout runs before the

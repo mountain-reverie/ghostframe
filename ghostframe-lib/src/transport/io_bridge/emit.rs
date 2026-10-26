@@ -263,6 +263,12 @@ impl IoBridge {
                     queued,
                 },
             );
+            // A parity datagram names its group; the ledger wants to know
+            // when it leaves (see `Resolution::Late::fec_possible`).
+            if class == WireClass::Parity && dg.len() >= 5 {
+                self.departures
+                    .tag_last_as_parity(u32::from_be_bytes([dg[1], dg[2], dg[3], dg[4]]));
+            }
         }
 
         // No connected session counts as sent, not rejected: re-queueing a
