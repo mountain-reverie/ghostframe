@@ -73,6 +73,8 @@ struct Entry {
     /// tracks. Datagrams that are not (H.264, control, parity) are mirrored
     /// all the same so the FIFO order is complete, but name no transmission.
     wire_seq: Option<u32>,
+    /// For a parity datagram, the first `wire_seq` of the group it covers.
+    parity_group: Option<u32>,
 }
 
 /// A mirror of quinn's datagram FIFO that stamps each datagram when it
@@ -88,6 +90,9 @@ pub struct DepartureTracker {
     cum_departed: u64,
     /// Datagrams stamped so far.
     stamped_total: u64,
+    /// Groups whose parity left in the last [`Self::on_poll`], for
+    /// [`Self::take_departed_parity`].
+    departed_parity: Vec<u32>,
     #[cfg(test)]
     pub(crate) stamped: Vec<(Instant, Instant)>,
 }
@@ -135,8 +140,23 @@ impl DepartureTracker {
             cum_end: cum_enqueued,
             enqueued_at: now,
             wire_seq,
+            parity_group: None,
         });
         evicted
+    }
+
+    /// The datagram just enqueued is the parity of the group starting at
+    /// `group_first`.
+    pub fn tag_last_as_parity(&mut self, group_first: u32) {
+        if let Some(e) = self.q.back_mut() {
+            e.parity_group = Some(group_first);
+        }
+    }
+
+    /// The groups whose parity left during the last [`Self::on_poll`], each
+    /// once.
+    pub fn take_departed_parity(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.departed_parity)
     }
 
     /// After a `poll_transmit` batch: stamp everything that has left.
@@ -160,6 +180,9 @@ impl DepartureTracker {
                 break;
             }
             self.q.pop_front();
+            if let Some(g) = e.parity_group {
+                self.departed_parity.push(g);
+            }
             self.stamped_total += 1;
             self.lag
                 .record(now.saturating_duration_since(e.enqueued_at));

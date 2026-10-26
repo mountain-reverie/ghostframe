@@ -148,6 +148,13 @@ impl IoBridge {
         // session would otherwise be declared lost into the next connection's
         // estimator, and its adapted threshold would carry over.
         self.transmission_ledger.reset_session();
+        // And what was waiting to be reported about it: a loss of the old
+        // path handed to the new connection's estimator at its first
+        // acknowledgement, and the late-ack marks that name the old session's
+        // wire_seqs.
+        self.pending_losses.clear();
+        self.late_acked.clear();
+        self.instr.flushed = Default::default();
     }
 
     /// Move what the emitter put on the wire since the last call into the
@@ -333,6 +340,10 @@ impl IoBridge {
                     stamp_departure_in(ledger, emitter, ws, now);
                 }
             });
+        for group_first in self.departures.take_departed_parity() {
+            self.transmission_ledger
+                .note_parity_departed(group_first, now);
+        }
     }
 
     /// Snapshot every instrument.

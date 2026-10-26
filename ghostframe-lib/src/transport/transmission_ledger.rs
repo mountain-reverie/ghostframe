@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::transport::reliable_emitter::EmitKey;
 
@@ -67,21 +67,11 @@ const ADAPT_WINDOW: u64 = 64;
 /// Verdicts the window must hold before `K_PKT` may be raised: a share of a
 /// handful is no evidence.
 const ADAPT_MIN_VERDICTS: u64 = 32;
-/// How many departures later than an ordinary acknowledgement a late one must
-/// be before it could be an FEC recovery. A group's parity leaves
-/// `PARITY_INTERLEAVE_OFFSET` (20) wire_seqs after the group starts, so for the
-/// member at position p of a K = 10 group it leaves 20 - p departures after the
-/// member: at least 11. The rebuilt datagram's acknowledgement then needs a
-/// round trip more, which an ordinary acknowledgement needs too. The
-/// distance is measured in departures *beyond what an ordinary acknowledgement
-/// takes* (an EWMA over live acknowledgements): the round trip itself is
-/// dozens of departures at 1,000 datagrams a second, so a bare departure count
-/// could not tell a recovery from any acknowledgement.
-const FEC_MIN_EXCESS: u64 = crate::transport::reliable_emitter::PARITY_INTERLEAVE_OFFSET as u64
-    - (crate::transport::reliable_emitter::FEC_GROUP_SIZE_K as u64 - 1);
-/// Before any live acknowledgement has measured the ordinary distance, the
-/// bare count is all there is.
-const FEC_POSSIBLE_AFTER: u64 = crate::transport::reliable_emitter::PARITY_INTERLEAVE_OFFSET as u64;
+/// Parity departures remembered, newest last. One entry per group of
+/// `FEC_GROUP_SIZE_K` transmissions, and a late acknowledgement is only ever
+/// judged against a group whose parity left recently, so a few seconds of
+/// traffic at the highest rates fit.
+const PARITY_RING_CAP: usize = 128;
 /// Spurious share of the window above which `K_PKT` goes up by one: 10 %.
 const ADAPT_SPURIOUS_PERCENT: u64 = 10;
 
@@ -101,15 +91,24 @@ pub enum Resolution {
     /// bytes twice.
     Late {
         tx: Transmission,
-        /// The acknowledgement came at least `FEC_MIN_EXCESS` (11) departures
-        /// later than an ordinary acknowledgement does, so it may be the client acking a
-        /// datagram it rebuilt from parity under its original `wire_seq`: a
-        /// real network loss, not a premature verdict. Nothing on the wire
-        /// says which, so the caller treats it as a loss that happened (no
-        /// retraction, no threshold adaptation) and counts it apart. A late
-        /// acknowledgement arriving sooner cannot be a recovery and is a
-        /// genuinely premature verdict (a heuristic at a changing send rate:
-        /// the ordinary distance is an average).
+        /// This acknowledgement may be the client acking a datagram it
+        /// rebuilt from parity under its original `wire_seq`: a real network
+        /// loss, not a premature verdict. Nothing on the wire says which, so
+        /// the ledger asks what would have to be true of a recovery, from
+        /// what the server itself did:
+        ///
+        /// - the group's parity departed at least `min_rtt` before this
+        ///   acknowledgement (the parity has to cross the path and the
+        ///   acknowledgement come back), and
+        /// - no other member of the group is outstanding or declared lost
+        ///   (XOR parity with k = 10 rebuilds exactly one).
+        ///
+        /// Both are facts about departures and acknowledgements, so the test
+        /// does not depend on the send rate or on how the group's parity came
+        /// to leave (full interleave or the end-of-stream flush). Treated as
+        /// a loss that happened (no retraction, no threshold adaptation) and
+        /// counted apart. A late acknowledgement failing either test cannot
+        /// be a recovery.
         fec_possible: bool,
     },
 }
@@ -210,10 +209,9 @@ pub struct TransmissionLedger {
     /// is only ever judged against this, never against the clock, so a queue
     /// that delays everything in order cannot produce a verdict (F4).
     largest_acked: Option<u64>,
-    /// Departures between a live acknowledgement's transmission and the
-    /// acknowledgement, EWMA (gain 1/8) times 8: how long an *ordinary*
-    /// acknowledgement takes, in departures.
-    ack_dist_x8: Option<u64>,
+    /// When each group's parity left quinn's FIFO: `(group_first_wire_seq,
+    /// when)`, oldest first, bounded by [`PARITY_RING_CAP`].
+    parity_departed: VecDeque<(u32, Instant)>,
     /// Current packet threshold, and what it adapts from: verdicts issued so
     /// far, and one bit per recent verdict (by verdict number modulo 64) set
     /// when that verdict was contradicted by a late acknowledgement.
@@ -235,7 +233,7 @@ impl TransmissionLedger {
             tombstone_order: VecDeque::new(),
             next_dep_idx: 0,
             largest_acked: None,
-            ack_dist_x8: None,
+            parity_departed: VecDeque::new(),
             k_pkt: K_PKT_INITIAL,
             freeze_k_pkt: false,
             verdicts: 0,
@@ -257,10 +255,38 @@ impl TransmissionLedger {
         }
     }
 
-    /// The ordinary acknowledgement distance in departures, for tests.
-    #[cfg(test)]
-    pub(crate) fn seed_ack_distance(&mut self, departures: u64) {
-        self.ack_dist_x8 = Some(departures * 8);
+    /// A group's parity datagram left quinn's FIFO at `at`. `group_first` is
+    /// the first `wire_seq` of the group it covers (the parity envelope's own
+    /// field).
+    pub fn note_parity_departed(&mut self, group_first: u32, at: Instant) {
+        if self.parity_departed.len() >= PARITY_RING_CAP {
+            self.parity_departed.pop_front();
+        }
+        self.parity_departed.push_back((group_first, at));
+    }
+
+    /// Could a late acknowledgement of `wire_seq` be an FEC recovery? See
+    /// [`Resolution::Late::fec_possible`]. `ack` is `(now, min_rtt)`; `None`
+    /// skips the parity-age test.
+    fn fec_possible(&self, wire_seq: u32, ack: Option<(Instant, Duration)>) -> bool {
+        let k = crate::transport::reliable_emitter::FEC_GROUP_SIZE_K as u32;
+        let Some(&(first, left)) = self
+            .parity_departed
+            .iter()
+            .rev()
+            .find(|(first, _)| wire_seq.wrapping_sub(*first) < k)
+        else {
+            return false;
+        };
+        if let Some((now, min_rtt)) = ack {
+            if now.saturating_duration_since(left) < min_rtt {
+                return false;
+            }
+        }
+        (0..k)
+            .map(|i| first.wrapping_add(i))
+            .filter(|m| *m != wire_seq)
+            .all(|m| !self.records.contains_key(&m) && !self.tombstones.contains_key(&m))
     }
 
     pub fn k_pkt(&self) -> u64 {
@@ -382,7 +408,7 @@ impl TransmissionLedger {
         self.tombstone_order.clear();
         self.next_dep_idx = 0;
         self.largest_acked = None;
-        self.ack_dist_x8 = None;
+        self.parity_departed.clear();
         self.k_pkt = K_PKT_INITIAL;
         self.verdicts = 0;
         self.spurious_bits = 0;
@@ -399,18 +425,21 @@ impl TransmissionLedger {
     /// this ledger only classifies the acknowledgement as `Resolution::Late`,
     /// which also lets the content be released.
     pub fn resolve(&mut self, wire_seq: u32) -> Option<Resolution> {
+        self.resolve_at(wire_seq, None)
+    }
+
+    /// [`Self::resolve`] with the acknowledgement's arrival time and the
+    /// path's `min_rtt`, which the FEC test needs (`None` skips its age test).
+    pub fn resolve_at(
+        &mut self,
+        wire_seq: u32,
+        ack: Option<(Instant, Duration)>,
+    ) -> Option<Resolution> {
         if let Some(rec) = self.records.remove(&wire_seq) {
             if let (Some(idx), Some(_)) = (rec.tx.dep_idx, rec.departed) {
                 if self.largest_acked.is_none_or(|l| idx > l) {
                     self.largest_acked = Some(idx);
                 }
-            }
-            if let Some(idx) = rec.tx.dep_idx {
-                let d8 = self.next_dep_idx.saturating_sub(idx) * 8;
-                self.ack_dist_x8 = Some(match self.ack_dist_x8 {
-                    None => d8,
-                    Some(a) => (a * 7 + d8) / 8,
-                });
             }
             return Some(Resolution::Live(rec.tx));
         }
@@ -425,13 +454,7 @@ impl TransmissionLedger {
                     self.largest_acked = Some(idx);
                 }
             }
-            let fec_possible = tx.dep_idx.is_some_and(|i| {
-                let gap = self.next_dep_idx.saturating_sub(i);
-                match self.ack_dist_x8 {
-                    None => gap >= FEC_POSSIBLE_AFTER,
-                    Some(a) => gap * 8 >= a + FEC_MIN_EXCESS * 8,
-                }
-            });
+            let fec_possible = self.fec_possible(wire_seq, ack);
             if fec_possible {
                 self.stats.late_acks_fec_possible += 1;
             } else if let Some(n) = t.packet_verdict_no {
@@ -549,6 +572,19 @@ impl TransmissionLedger {
     /// What the probe timeout retransmits. A bounded scan, so an unlucky run
     /// of resolved entries behind the tail cannot make one probe expensive.
     pub fn newest_outstanding(&mut self, n: usize, max_scan: usize) -> Vec<(u32, Transmission)> {
+        self.newest_outstanding_after(0, n, max_scan)
+    }
+
+    /// [`Self::newest_outstanding`] past the `skip` newest outstanding ones,
+    /// which the caller has already looked at and kept: a cursor, so a probe
+    /// that removes one record per round does not read the survivors again.
+    /// `max_scan` counts the records examined after the skipped ones.
+    pub fn newest_outstanding_after(
+        &mut self,
+        skip: usize,
+        n: usize,
+        max_scan: usize,
+    ) -> Vec<(u32, Transmission)> {
         // Resolved entries at the very back are dead weight for every later
         // probe: drop them.
         while let Some(back) = self.departed_order.back().copied() {
@@ -562,17 +598,30 @@ impl TransmissionLedger {
             }
         }
         let mut out = Vec::new();
-        for ws in self.departed_order.iter().rev().take(max_scan) {
-            if out.len() >= n {
+        let mut to_skip = skip;
+        let mut scanned = 0usize;
+        for ws in self.departed_order.iter().rev() {
+            if out.len() >= n || scanned >= max_scan {
                 break;
             }
-            if let Some(Record {
-                departed: Some(_),
-                tx,
-                ..
-            }) = self.records.get(ws)
-            {
-                out.push((*ws, *tx));
+            let live = matches!(
+                self.records.get(ws),
+                Some(Record {
+                    departed: Some(_),
+                    ..
+                })
+            );
+            if to_skip > 0 {
+                if live {
+                    to_skip -= 1;
+                }
+                continue;
+            }
+            scanned += 1;
+            if live {
+                if let Some(r) = self.records.get(ws) {
+                    out.push((*ws, r.tx));
+                }
             }
         }
         out
@@ -893,11 +942,9 @@ mod tests {
 
     /// 70 sent, the last acknowledged: all but the last `K_PKT` are lost. Then
     /// the newest `spurious` of the verdicts are contradicted at once, so each
-    /// late acknowledgement comes fewer than `PARITY_INTERLEAVE_OFFSET`
-    /// departures after its transmission (too soon to be an FEC recovery).
+    /// late acknowledgement is of a transmission whose group's parity has not
+    /// left (so it cannot be an FEC recovery).
     fn window(l: &mut TransmissionLedger, t0: Instant, base: u32, spurious: usize) {
-        // An ordinary acknowledgement takes 15 departures on this path.
-        l.seed_ack_distance(15);
         for ws in base..base + 70 {
             send(l, ws, t0);
         }
@@ -906,11 +953,7 @@ mod tests {
         // Everything but the last K of these 70 (and whatever the previous
         // window left behind) is lost.
         assert!(lost.len() as u64 >= 70 - l.k_pkt(), "{}", lost.len());
-        // The newest lost one is K + 1 departures behind; stay inside the FEC
-        // distance of 20.
         let n = spurious.min(19 - l.k_pkt() as usize);
-        // (Late by K + 1 .. K + 15 departures against an ordinary 15: inside the
-        // 11 beyond which it could be a recovery, up to K = 8.)
         for (ws, _, _) in lost.iter().rev().take(n) {
             assert!(matches!(
                 l.resolve(*ws),
@@ -952,81 +995,126 @@ mod tests {
         assert!(l.stats().k_pkt_raises >= 5);
     }
 
+    const RTT: Duration = Duration::from_millis(40);
+
+    /// Send `first..first + 10` as one group, then its parity at `parity_at`.
+    fn send_group(l: &mut TransmissionLedger, first: u32, t0: Instant, parity_at: Instant) {
+        for ws in first..first + 10 {
+            send(l, ws, t0);
+        }
+        l.note_parity_departed(first, parity_at);
+    }
+
+    fn late(l: &mut TransmissionLedger, ws: u32, at: Instant) -> bool {
+        match l.resolve_at(ws, Some((at, RTT))) {
+            Some(Resolution::Late { fec_possible, .. }) => fec_possible,
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// The client acks a datagram it rebuilt from parity under its original
-    /// `wire_seq`, which can only be after the group's parity left: at least
-    /// `PARITY_INTERLEAVE_OFFSET` departures after it. That is a loss that
+    /// `wire_seq`, which can only be a round trip after the group's parity
+    /// left, and only when it was the one member missing. That is a loss that
     /// happened, so it neither retracts nor adapts anything.
     #[test]
     fn a_loss_recovered_by_parity_does_not_raise_the_packet_threshold() {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(8192);
-        l.seed_ack_distance(15);
-        // 12 windows, each: 70 sent, the last acked, and the OLDEST 17 verdicts
-        // acked late: 50+ departures after their own.
+        // 12 windows of 7 groups: every member acked live but one per group
+        // (position 3), the last acked, the holes declared lost by the
+        // threshold, then acked late a round trip after their parity.
         let mut base = 0u32;
         for _ in 0..12 {
-            for ws in base..base + 70 {
-                send(&mut l, ws, t0);
+            for g in 0..7 {
+                send_group(&mut l, base + g * 10, t0, t0);
             }
-            assert!(l.resolve(base + 69).is_some());
-            let lost = l.detect_losses(FAR);
-            for (ws, _, _) in lost.iter().take(17) {
-                match l.resolve(*ws) {
-                    Some(Resolution::Late { fec_possible, .. }) => assert!(fec_possible),
-                    other => panic!("{other:?}"),
+            for ws in base..base + 70 {
+                if ws % 10 != 3 {
+                    assert!(l.resolve(ws).is_some());
                 }
+            }
+            let lost = l.detect_losses(FAR);
+            assert!(lost.len() >= 6, "{}", lost.len());
+            for (ws, _, _) in lost.iter() {
+                assert!(late(&mut l, *ws, t0 + RTT), "ws {ws}");
             }
             base += 70;
         }
         assert_eq!(l.k_pkt(), 3, "parity recoveries are not reordering");
         assert_eq!(l.stats().k_pkt_raises, 0);
-        assert!(l.stats().late_acks_fec_possible >= 12 * 17);
+        assert!(l.stats().late_acks_fec_possible >= 12 * 6);
         // They are still counted as late acknowledgements.
         assert_eq!(l.stats().spurious_losses, l.stats().late_acks_fec_possible);
     }
 
-    /// On a path where an ordinary acknowledgement already takes 40 departures
-    /// (a 40 ms round trip at 1,000 datagrams a second), "20 or more departures
-    /// after the transmission" describes every acknowledgement and tells a
-    /// recovery from nothing. What marks a possible recovery is lateness beyond
-    /// the ordinary distance: 11 departures beyond (the parity leaves at least
-    /// 11 after its member).
+    /// The age test, at every position in the group and on both sides of its
+    /// boundary: the acknowledgement of a rebuilt datagram comes at least
+    /// `min_rtt` after the parity left, whichever member it is. The group's
+    /// parity leaves 10 to 19 departures after member p at a steady rate, a
+    /// spread no count of departures can hold a line through.
     #[test]
-    fn a_possible_fec_recovery_is_late_beyond_the_ordinary_ack_distance() {
+    fn a_late_ack_is_a_possible_recovery_only_a_round_trip_after_the_parity() {
+        for p in [0u32, 5, 8, 9] {
+            let t0 = Instant::now();
+            let mut l = TransmissionLedger::new(8192);
+            send_group(&mut l, 0, t0, t0);
+            for ws in (0..10).filter(|w| *w != p) {
+                assert!(l.resolve(ws).is_some());
+            }
+            let _ = l.declare_lost_by_pto(p);
+            let early = late(&mut l, p, t0 + RTT - Duration::from_micros(1));
+            assert!(!early, "member {p}: a microsecond short of the round trip");
+            // A tombstone resolves once; do the other side on a fresh ledger.
+            let mut l = TransmissionLedger::new(8192);
+            send_group(&mut l, 0, t0, t0);
+            for ws in (0..10).filter(|w| *w != p) {
+                assert!(l.resolve(ws).is_some());
+            }
+            let _ = l.declare_lost_by_pto(p);
+            assert!(
+                late(&mut l, p, t0 + RTT),
+                "member {p}: exactly a round trip"
+            );
+        }
+    }
+
+    /// Parity rebuilds one member. If another is outstanding or lost, the late
+    /// acknowledgement is a premature verdict (reordering), whatever the
+    /// timing.
+    #[test]
+    fn a_late_ack_beside_another_missing_member_is_not_a_recovery() {
+        let t0 = Instant::now();
+        let after = t0 + RTT * 4;
+        for other_lost in [false, true] {
+            let mut l = TransmissionLedger::new(8192);
+            send_group(&mut l, 0, t0, t0);
+            for ws in 0..10 {
+                if ws != 3 && ws != 6 {
+                    assert!(l.resolve(ws).is_some());
+                }
+            }
+            let _ = l.declare_lost_by_pto(3);
+            if other_lost {
+                let _ = l.declare_lost_by_pto(6);
+            }
+            assert!(!late(&mut l, 3, after), "other_lost={other_lost}");
+        }
+    }
+
+    /// The end-of-stream flush sends a frame's last groups' parity a few
+    /// milliseconds after their members, far fewer than 20 departures later.
+    /// The recovery is still a round trip after the parity left.
+    #[test]
+    fn a_flushed_group_is_judged_by_its_parity_not_by_a_departure_count() {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(8192);
-        // 100 in-order acknowledgements, each 40 departures after its send.
-        for ws in 0..140u32 {
-            send(&mut l, ws, t0);
-            if ws >= 40 {
-                assert!(matches!(l.resolve(ws - 40), Some(Resolution::Live(_))));
-            }
+        // 10 members, then 5 ms of quiet, then the flushed parity.
+        send_group(&mut l, 0, t0, t0 + Duration::from_millis(5));
+        for ws in 1..10 {
+            assert!(l.resolve(ws).is_some());
         }
-        // Two holes in what is left, declared lost by 3 later acks.
-        let lost: Vec<u32> = (100..140).collect();
-        for ws in &lost[..30] {
-            let _ = l.declare_lost_by_pto(*ws);
-        }
-        // The next 6 departures move the distance on: ws 100 is now 46 old
-        // (6 beyond ordinary), ws 101 will be 56 (16 beyond).
-        for ws in 140..146u32 {
-            send(&mut l, ws, t0);
-        }
-        match l.resolve(100) {
-            Some(Resolution::Late { fec_possible, .. }) => {
-                assert!(!fec_possible, "46 departures against an ordinary 40")
-            }
-            other => panic!("{other:?}"),
-        }
-        for ws in 146..156u32 {
-            send(&mut l, ws, t0);
-        }
-        match l.resolve(101) {
-            Some(Resolution::Late { fec_possible, .. }) => {
-                assert!(fec_possible, "55 departures against an ordinary 40")
-            }
-            other => panic!("{other:?}"),
-        }
+        let _ = l.declare_lost_by_pto(0);
+        assert!(late(&mut l, 0, t0 + Duration::from_millis(5) + RTT));
     }
 
     /// Only a packet-threshold verdict says anything about reordering depth: a
@@ -1116,6 +1204,17 @@ mod tests {
         assert_eq!(n.iter().map(|(w, _)| *w).collect::<Vec<_>>(), vec![3, 1]);
         // The scan is bounded.
         assert_eq!(l.newest_outstanding(2, 1).len(), 1);
+        // A cursor: past the newest outstanding one, and the scan bound counts
+        // only what comes after it.
+        let n = l.newest_outstanding_after(1, 8, 8);
+        assert_eq!(n.iter().map(|(w, _)| *w).collect::<Vec<_>>(), vec![1, 0]);
+        assert_eq!(
+            l.newest_outstanding_after(1, 8, 1).len(),
+            0,
+            "the resolved 2 uses the scan"
+        );
+        assert_eq!(l.newest_outstanding_after(1, 8, 2).len(), 1);
+        assert!(l.newest_outstanding_after(9, 8, 8).is_empty());
     }
 
     #[test]
