@@ -1110,7 +1110,7 @@ Making repair symbols transmissions is what the flag design lacked. It gives goo
 |---|---|---|---|
 | C3-1 | C3 | client decoder: do not buffer a parity whose group is complete (dup rebuilds 0.7 % → 0); O(k) pending index | — |
 | C3-2 | C3 | client-core consumes the existing H.264 K=5/K=2 XOR parity (`frame_assembly.rs:62-66`) | — |
-| C3-3 | C3 | tile FEC off by default (recovers ≤ 0.8 %, costs ~15 % of bytes) | C4 (shares emitter files), after C1 |
+| C3-3 | C3 | tile FEC off by default (recovers ≤ 0.8 %, costs 11-14 % of bytes, 13 % typical). **Done**: `TransportConfig::tile_fec` / `GHOSTFRAME_TILE_FEC=1` opts back in; the emitter feeds no parity group unless set; the client still decodes parity, H.264 parity untouched | C4 (shares emitter files), after C1 |
 | **C3-M (new)** | C3 | **measurement only**: client pre-FEC loss and run-length counters from `wire_seq` gaps (logged, plus the existing `datagrams_recovered_fec` populated); server logs quinn `PathStats.{cwnd,lost_packets,sent_packets,congestion_events}`, `quinn_queue_bytes`, `rto_spurious`, `retx_by_cause` on the `cumulative emit` line; client `rx_buffer_drops` (native) | — (touches only counters; coordinate the emitter line with C1/C4) |
 | C3-W (new, tiny) | C3 or A6 owner | web client: `congestionControl: "low-latency"` on the WebTransport constructor (from Kyber); check browser support | — |
 | C4 | C4 | per-fragment cache and ACK (fixes the wrong-fragment NACK/RTO of §1.3 (f)) | C1 |
