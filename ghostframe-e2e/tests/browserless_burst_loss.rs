@@ -950,9 +950,12 @@ async fn p4_spurious_share_of_rto_fires_under_iid_loss() {
 /// The lost-final-pass scene below gates the RTO path the sweep leaves to.
 ///
 /// One full-grid CDF 5/3 frame, then silence, over a link dropping 5 % of
-/// the s2c datagrams. Premises: datagrams were dropped and NACKs repaired
-/// something (`nack_hit > 0`), or the zero below is the zero of a scene that
-/// needed no repair. Outcome: no tile is owed a pass and none has given up.
+/// the s2c datagrams. Premises: datagrams were dropped and something repaired
+/// them, by a NACK (`nack_hit > 0`) or by the server's probe timeout
+/// (`rto_useful > 0`), or the zero below is the zero of a scene that needed no
+/// repair. Which of the two repairs a given seed is not fixed: since the RTT
+/// based probe timeout (D1 PR-4) seed 0xB0B058 is repaired by the timeout
+/// alone, `nack_hit` 0. Outcome: no tile is owed a pass and none has given up.
 ///
 /// What this does and does not prove. Measured with the sweep disabled
 /// outright, this scene converges identically, so the sweep is not what
@@ -984,14 +987,17 @@ async fn a_lossy_screen_converges_under_the_evidence_gated_tail_sweep() {
         assert_established("lossy", &r);
         let c = &r.client_cdf53;
         println!(
-            "RC5 seed={seed:#x}: dropped={} nack_hit={} nack_miss={} tiles={} complete={} partial={} gave_up={}",
-            r.s2c_datagrams_dropped, r.nack_hit, r.nack_miss, c.tiles, c.complete, c.partial, c.gave_up
+            "RC5 seed={seed:#x}: dropped={} nack_hit={} nack_miss={} rto_fired={} rto_useful={} tiles={} complete={} partial={} gave_up={}",
+            r.s2c_datagrams_dropped, r.nack_hit, r.nack_miss, r.rto_fired, r.rto_useful, c.tiles, c.complete, c.partial, c.gave_up
         );
         assert!(
             r.s2c_datagrams_dropped > 0,
             "{seed:#x}: nothing was dropped"
         );
-        assert!(r.nack_hit > 0, "{seed:#x}: no NACK repaired anything");
+        assert!(
+            r.nack_hit + r.rto_useful > 0,
+            "{seed:#x}: neither a NACK nor the RTO repaired anything"
+        );
         assert_eq!(c.tiles, COLS * ROWS, "{seed:#x}: tiles with no coverage");
         assert_eq!(
             (c.partial, c.gave_up, c.bitmap_unknown),
