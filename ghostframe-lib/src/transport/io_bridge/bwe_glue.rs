@@ -453,6 +453,8 @@ impl IoBridge {
             bytes_sent: 0,
             packets_sent: 0,
         });
+        // The window must carry the probe, or quinn clips the cluster.
+        self.publish_model_window(false);
     }
 
     /// Close the active probe window once its duration is up.
@@ -478,6 +480,7 @@ impl IoBridge {
     /// why under-filling is the expected outcome on an idle link, not a
     /// bug — no padding is ever sent to force completion.
     fn close_probe_window(&mut self, probe: ActiveProbe) {
+        self.publish_model_window(false);
         if probe.packets_sent >= probe.min_probes && probe.bytes_sent >= probe.min_bytes {
             self.probes_completed += 1;
             tracing::debug!(
@@ -727,6 +730,18 @@ impl IoBridge {
         if smoothed_rtt_us <= 0.0 {
             return;
         }
+        if self.model.is_some() {
+            // Under the model controller the rate is the estimate. quinn's
+            // window is derived from it, so `cwnd / srtt` says nothing the
+            // estimate does not, and there is no hint to feed.
+            self.adaptation_context.bytes_per_us = (self.model_rate_bytes_per_s() / 1e6) as f32;
+            self.adaptation_context.smoothed_rtt_us = smoothed_rtt_us;
+            self.adaptation_context.last_update_seq =
+                self.adaptation_context.last_update_seq.wrapping_add(1);
+            self.classifier
+                .set_adaptation_context(self.adaptation_context);
+            return;
+        }
         let bytes_per_us = (cwnd_bytes as f32) / smoothed_rtt_us;
         // Same number, second consumer: the classifier uses it to pick
         // codecs, and the BWE controller uses it as the independent ceiling
@@ -844,6 +859,7 @@ impl IoBridge {
             }
             self.apply_path_stats_snapshot(cwnd, rtt_us);
         }
+        self.model_note_persistent_congestion();
         self.update_transport_probe();
     }
 }

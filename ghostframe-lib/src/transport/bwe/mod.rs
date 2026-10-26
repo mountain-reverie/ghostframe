@@ -223,6 +223,19 @@ impl BweWrapper {
         }
     }
 
+    /// `new`, for the model controller: the estimator is not fed a transport
+    /// capacity hint, so it does not probe on one either.
+    pub fn new_without_hint(initial_bps: u64, now: Instant) -> Self {
+        Self {
+            driver: googcc::GoogCcDriver::with_network_state_probing(initial_bps, now, false),
+        }
+    }
+
+    /// Continue the estimate from `bps` (an idle restart's cold start).
+    pub fn restart_from(&mut self, now: Instant, bps: u64) {
+        self.driver.restart_from(now, bps);
+    }
+
     /// Feed a batch of ACK arrival records and update the estimate.
     ///
     /// `now` is the caller's wall-clock at the time these records were

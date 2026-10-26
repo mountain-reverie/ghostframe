@@ -517,7 +517,9 @@ impl QuicServer {
         tls_config.alpn_protocols = vec![b"h3".to_vec()];
 
         // --- 4. Wrap in quinn-proto's rustls adapter ---
-        let quic_tls = Arc::new(quinn_proto::crypto::rustls::QuicServerConfig::try_from(tls_config)?);
+        let quic_tls = Arc::new(quinn_proto::crypto::rustls::QuicServerConfig::try_from(
+            tls_config,
+        )?);
 
         // --- 5/6. Transport config (datagrams) and ServerConfig ---
         let server_config = Self::server_config(quic_tls.clone(), datagram_send_buffer, None);
@@ -588,7 +590,8 @@ impl QuicServer {
         &mut self,
         cell: Arc<crate::transport::model_controller::ModelCell>,
     ) {
-        let config = Self::server_config(self.quic_tls.clone(), self.datagram_send_buffer, Some(cell));
+        let config =
+            Self::server_config(self.quic_tls.clone(), self.datagram_send_buffer, Some(cell));
         self.endpoint.set_server_config(Some(Arc::new(config)));
     }
 

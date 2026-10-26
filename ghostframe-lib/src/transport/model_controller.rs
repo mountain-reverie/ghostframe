@@ -267,7 +267,6 @@ impl Controller for ModelController {
 /// `IoBridge` feeds it the instant of every send and every estimator
 /// feedback and applies what it says.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // used by the glue in the next commit
 pub(crate) struct RestartPolicy {
     settings: ModelSettings,
     last_send: Option<Instant>,
@@ -277,7 +276,6 @@ pub(crate) struct RestartPolicy {
 
 /// What a send after a gap asks of the glue.
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)] // used by the glue in the next commit
 pub(crate) enum Resume {
     /// Not a restart.
     No,
@@ -289,7 +287,6 @@ pub(crate) enum Resume {
     Cold,
 }
 
-#[allow(dead_code)] // used by the glue in the next commit
 impl RestartPolicy {
     pub(crate) fn new(settings: ModelSettings) -> Self {
         Self {
@@ -332,6 +329,7 @@ impl RestartPolicy {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn restarting(&self) -> bool {
         self.restarting
     }
@@ -340,10 +338,6 @@ impl RestartPolicy {
     /// session's start rate `start_bps`.
     pub(crate) fn cold_rate_bps(&self, held_bps: u64, start_bps: u64) -> u64 {
         (((held_bps as f64) * self.settings.restart_fraction) as u64).max(start_bps)
-    }
-
-    pub(crate) fn settings(&self) -> ModelSettings {
-        self.settings
     }
 }
 

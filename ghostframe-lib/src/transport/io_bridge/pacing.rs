@@ -340,6 +340,9 @@ impl IoBridge {
     /// nested_cc's seven scenes). At 1.0 the pacer term is the estimate.
     fn admission_rate(&self) -> AdmissionRate {
         let tick_s = SCHEDULER_TICK_INTERVAL_US / 1_000_000.0;
+        if self.model.is_some() {
+            return self.model_admission_rate(tick_s);
+        }
         let snap = self.bwe.snapshot();
         let mode = select_pacing_mode(snap.samples_seen);
         // The estimate and the probe target are rates of the bytes goog_cc
@@ -389,6 +392,33 @@ impl IoBridge {
         }
     }
 
+    /// The admission rate under the model controller (D1 design A): `R`, the
+    /// estimate (or a probe's rate while a window is open), and nothing else.
+    /// No `cwnd / srtt` term, no pacing mode, no sample threshold: quinn's
+    /// window is derived from this same `R`, so it cannot disagree with it.
+    /// The floor is the one thing under it, a datagram a tick, so a tile can
+    /// always make progress.
+    fn model_admission_rate(&self, tick_s: f64) -> AdmissionRate {
+        let snap = self.bwe.snapshot();
+        let est = countable_to_token_bps(snap.bitrate_bps, snap.payload_fraction) as f64 / 8.0;
+        let probe = self.active_probe.as_ref().map_or(0.0, |p| {
+            countable_to_token_bps(p.target_rate_bps, snap.payload_fraction) as f64 / 8.0
+        });
+        let floor = self.tick_budget_floor() as f64 / tick_s;
+        let term = if probe > est && probe >= floor {
+            BudgetTerm::Probe
+        } else if floor > est.max(probe) {
+            BudgetTerm::Floor
+        } else {
+            // The estimate sets the rate (this arm's `Pacer`: goog_cc's).
+            BudgetTerm::Pacer
+        };
+        AdmissionRate {
+            bytes_per_sec: est.max(probe).max(floor),
+            term,
+        }
+    }
+
     /// Whether admission is holding work it has not been able to send: a
     /// datagram built and waiting, a client request or a timer due, or tiles
     /// in the scheduler. A scheduler with no frame identity to tag its work
@@ -418,6 +448,7 @@ impl IoBridge {
     pub(super) fn pump_admission(&mut self) -> PumpOutcome {
         let now = now_std();
         let mut out = PumpOutcome::default();
+        self.model_before_admission(now);
         let rate = self.admission_rate();
         let mtu = self.wire_mtu();
         let framing = self.live_framing_len();
