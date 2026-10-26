@@ -547,7 +547,7 @@ async fn bwe_estimator_is_fed_and_epoch_consistent() {
 /// from anywhere, so `smoothed_rtt` also stayed at its 20 ms constructor
 /// default and the ceiling was reached from below as well.
 ///
-/// Observed in production on a tailnet path: `rto_fired=33685` and
+/// Observed in production on a tailnet path: `loss_path_resends=33685` and
 /// `retransmit_attempts_total=44207` against 26578 fresh emissions — 1.7x
 /// more retransmission than actual picture — while `emitter_ack_hits`
 /// covered every single emission (`emitter_ack_misses=59`). Nothing was
@@ -742,7 +742,7 @@ async fn retransmits_fire_under_loss_but_not_on_a_perfect_link() {
             // operation. Once the budget floor became one datagram the
             // scheduler paces itself, and on a busy grid a dropped tile is
             // superseded by the next generation before any repair is due --
-            // measured nack_hit=0 rto_fired=0 against bytes_dropped=3494.
+            // measured nack_hit=0 loss_path_resends=0 against bytes_dropped=3494.
             // That is correct behaviour (repairing superseded content is
             // waste), but it leaves this assertion with nothing to observe,
             // so the old flat 256 KiB floor is pinned here to keep the
@@ -766,18 +766,18 @@ async fn retransmits_fire_under_loss_but_not_on_a_perfect_link() {
         (
             r.retransmit_attempts_total,
             r.nack_hit,
-            r.rto_fired,
+            r.loss_path_resends,
             r.bytes_dropped,
         )
     }
 
     // 20 runs measured: `retransmit_attempts_total` landed at 85 or 86 every
-    // time (`nack_hit` either 10 or 0, `rto_fired` making up the rest) —
+    // time (`nack_hit` either 10 or 0, `loss_path_resends` making up the rest) —
     // remarkably tight for a harness whose seed doesn't fully determine its
     // random draws (see `feedback_browserless_not_seed_reproducible`).
     // Asserting `> 0` rather than pinning the exact count regardless, since
     // that note says the exact value isn't guaranteed to stay this stable.
-    let (lossy_attempts, lossy_nack_hit, lossy_rto_fired, lossy_dropped) = run_at(
+    let (lossy_attempts, lossy_nack_hit, lossy_loss_path_resends, lossy_dropped) = run_at(
         NetProfile {
             loss: 0.10,
             ..NetProfile::perfect()
@@ -790,7 +790,7 @@ async fn retransmits_fire_under_loss_but_not_on_a_perfect_link() {
         "seed 0xDEAD: 10% loss over a busy 4x4 grid must force at least one \
          retransmit (RTO- or NACK-driven) — zero here means the reliable \
          emitter's retransmit path was never reached, not that the link \
-         was quiet (nack_hit={lossy_nack_hit} rto_fired={lossy_rto_fired} \
+         was quiet (nack_hit={lossy_nack_hit} loss_path_resends={lossy_loss_path_resends} \
          bytes_dropped={lossy_dropped})"
     );
 

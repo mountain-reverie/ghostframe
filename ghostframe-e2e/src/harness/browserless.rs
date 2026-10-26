@@ -452,7 +452,7 @@ pub struct BrowserlessResult {
     /// Count of RTO deadlines that fired (the emitter's own retransmit
     /// timer, independent of any client NACK). Zero does not imply the
     /// path was unfed — a scene can retransmit purely via `nack_hit`.
-    pub rto_fired: u64,
+    pub loss_path_resends: u64,
     /// Number of ACKed critical-tier (CDF53 passes 0-3) samples that fed
     /// `critical_latency_mean_us`/`critical_latency_max_us`/
     /// `critical_latency_buckets`. Read from
@@ -538,23 +538,23 @@ pub struct BrowserlessResult {
     pub retransmit_by_nack: u64,
     /// RTO fires whose pass was then acknowledged by a transmission sent
     /// before the first retransmission (the timer fired for data still on its
-    /// way). `rto_fired - rto_spurious - rto_useful` fired for passes not
+    /// way). `loss_path_resends - loss_path_resends_spurious - loss_path_resends_useful` fired for passes not
     /// acknowledged by the end of the scene.
-    pub rto_spurious: u64,
+    pub loss_path_resends_spurious: u64,
     /// RTO fires whose pass was first acknowledged through the original (see
-    /// `EmitterStats::rto_original_first`). The share of `rto_fired` that
-    /// this is, is the spurious-timeout rate; `rto_spurious` above reverts to
+    /// `EmitterStats::loss_path_resends_original_first`). The share of `loss_path_resends` that
+    /// this is, is the spurious-timeout rate; `loss_path_resends_spurious` above reverts to
     /// useful once the retransmission is acknowledged too, which it nearly
-    /// always is. Not disjoint from `rto_useful` (a fire is both when the
+    /// always is. Not disjoint from `loss_path_resends_useful` (a fire is both when the
     /// original is acknowledged first and the retransmission after it), so
-    /// the two can sum to more than `rto_fired`.
-    pub rto_original_first: u64,
+    /// the two can sum to more than `loss_path_resends`.
+    pub loss_path_resends_original_first: u64,
     /// Passes still in the retransmit cache when the scene ended: sent and not
     /// acknowledged. After a scene that stops sending and settles, non-zero
     /// means content nobody is repairing.
     pub emitter_cache_entries: usize,
     /// RTO fires whose pass was repaired by the retransmission.
-    pub rto_useful: u64,
+    pub loss_path_resends_useful: u64,
     /// quinn path stats, send-queue depth and the client's feedback totals,
     /// from `IoBridge::transport_probe_publish_handle()`. `transport.samples
     /// == 0` means the probe never read a live connection.
@@ -1170,17 +1170,17 @@ async fn run_inner(
         bwe_samples_seen: bwe_snapshot.samples_seen,
         retransmit_attempts_total: emitter_stats.retransmit_attempts_total,
         retransmit_by_nack: emitter_stats.retransmit_by_nack,
-        rto_spurious: emitter_stats.rto_spurious,
-        rto_original_first: emitter_stats.rto_original_first,
+        loss_path_resends_spurious: emitter_stats.loss_path_resends_spurious,
+        loss_path_resends_original_first: emitter_stats.loss_path_resends_original_first,
         emitter_cache_entries: emitter_stats.cache_entries,
-        rto_useful: emitter_stats.rto_useful,
+        loss_path_resends_useful: emitter_stats.loss_path_resends_useful,
         transport,
         client_wire_loss: client_probe.wire_loss,
         client_rx_datagrams: client_probe.rx_datagrams,
         client_cdf53: client_probe.cdf53,
         nack_hit: emitter_stats.nack_hit,
         nack_miss: emitter_stats.nack_miss,
-        rto_fired: emitter_stats.rto_fired,
+        loss_path_resends: emitter_stats.loss_path_resends,
         critical_latency_count: critical_latency.count,
         critical_latency_mean_us: critical_latency.mean_us(),
         critical_latency_max_us: critical_latency.max_us,

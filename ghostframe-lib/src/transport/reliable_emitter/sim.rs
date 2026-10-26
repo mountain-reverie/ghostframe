@@ -181,7 +181,7 @@ fn sim_clean_wire_no_retransmits() {
     for _ in 0..5 {
         sim.advance(Duration::from_millis(100));
     }
-    assert_eq!(sim.emitter.stats.rto_fired, 0);
+    assert_eq!(sim.emitter.stats.loss_path_resends, 0);
     assert_eq!(sim.emitter.stats.rto_max_retransmits_reached, 0);
 }
 

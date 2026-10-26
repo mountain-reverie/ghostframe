@@ -89,7 +89,7 @@ fn digest(r: &BrowserlessResult) -> Vec<(&'static str, u64)> {
         ("retransmit_attempts_total", r.retransmit_attempts_total),
         ("nack_hit", r.nack_hit),
         ("nack_miss", r.nack_miss),
-        ("rto_fired", r.rto_fired),
+        ("loss_path_resends", r.loss_path_resends),
         ("critical_latency_count", r.critical_latency_count),
         ("refinement_latency_count", r.refinement_latency_count),
         ("bwe_samples_seen", r.bwe_samples_seen),
@@ -272,8 +272,8 @@ fn full_digest(r: &BrowserlessResult) -> Vec<(&'static str, u64)> {
         ("s2c_datagrams_dropped", r.s2c_datagrams_dropped),
         ("s2c_loss_runs", r.s2c_loss_runs),
         ("retransmit_by_nack", r.retransmit_by_nack),
-        ("rto_spurious", r.rto_spurious),
-        ("rto_useful", r.rto_useful),
+        ("loss_path_resends_spurious", r.loss_path_resends_spurious),
+        ("loss_path_resends_useful", r.loss_path_resends_useful),
         ("send_datagram_errs", r.send_datagram_errs),
         ("emission_queue_peak", r.emission_queue_peak as u64),
         ("critical_latency_mean_us", r.critical_latency_mean_us),
@@ -446,7 +446,7 @@ fn check_premises(a: &BrowserlessResult) {
         );
     }
     assert!(
-        a.nack_hit + a.nack_miss + a.rto_fired > 0,
+        a.nack_hit + a.nack_miss + a.loss_path_resends > 0,
         "premise: no NACK and no RTO, so loss recovery never ran"
     );
 }

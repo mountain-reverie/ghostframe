@@ -731,17 +731,18 @@ pub(crate) fn ack_order_probe_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("GHOSTFRAME_ACK_ORDER_PROBE").is_ok_and(|v| v == "1"))
 }
 
-/// `GHOSTFRAME_RTO_PROBE=1` — one line per RTO fire and per acknowledgement.
+/// `GHOSTFRAME_RTO_PROBE=1` — one line per loss-path retransmission and per
+/// acknowledgement (the variable keeps its name from the per-pass RTO timer).
 pub(crate) fn rto_probe_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("GHOSTFRAME_RTO_PROBE").is_ok_and(|v| v == "1"))
 }
 
-/// `GHOSTFRAME_NO_RTO=1` — disable the RTO timer, leaving the cache and NACK
-/// path untouched, so a test can attribute a repair to one mechanism.
+/// `GHOSTFRAME_NO_RTO=1` — disable the loss path's and the probe timeout's
+/// retransmissions, leaving the cache and NACK path untouched, so a test can attribute a repair to one mechanism.
 ///
-/// Cached, unlike the buffer size above. This gates `RtoHeap::pop_due`, which
-/// runs on every scheduler tick; it previously read the environment on each
+/// Cached, unlike the buffer size above. This gates the retransmission
+/// path, which runs on every scheduler tick; it previously read the environment on each
 /// call, which is both a guard violation and a syscall-shaped cost in a hot
 /// path.
 ///

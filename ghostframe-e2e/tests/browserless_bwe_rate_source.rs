@@ -239,7 +239,7 @@ fn report_transport(scene: &str, r: &BrowserlessResult) {
         "rto",
         format!(
             "fired={} spurious={} useful={}",
-            r.rto_fired, r.rto_spurious, r.rto_useful
+            r.loss_path_resends, r.loss_path_resends_spurious, r.loss_path_resends_useful
         ),
     );
     p6(
