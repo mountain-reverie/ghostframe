@@ -1653,7 +1653,7 @@ async fn p5_seed_0x22_converges_once_the_churn_stops() {
 #[tokio::test(start_paused = true)]
 async fn p5_a_burst_longer_than_the_pto_is_recovered_from() {
     let ge = GilbertElliott::from_rate_and_burst_us(0.30, 1_500_000.0, 1.0).expect("feasible");
-    let mut pto_runs = 0;
+    let mut repaired_runs = 0;
     for seed in [0x22u64, 0xB0_B057, 0xB0_B157, 0xB0_B257, 0xB0_B357] {
         let mut sc = scene(seed, 30);
         let profile = LoadProfile {
@@ -1675,7 +1675,13 @@ async fn p5_a_burst_longer_than_the_pto_is_recovered_from() {
             r.transport.instr.pto_fires
         );
         assert!(r.s2c_datagrams_dropped > 0, "{seed:#x}: premise: no loss");
-        pto_runs += usize::from(r.transport.instr.pto_fires > 0);
+        if r.retransmit_attempts_total > 0 {
+            repaired_runs += 1;
+            assert!(
+                r.transport.instr.pto_fires > 0,
+                "{seed:#x}: premise: the run needed repairs but no burst outlasted the PTO"
+            );
+        }
         assert_eq!(
             r.emitter_cache_entries, 0,
             "{seed:#x}: passes still owed after the burst ended"
@@ -1686,11 +1692,13 @@ async fn p5_a_burst_longer_than_the_pto_is_recovered_from() {
             "{seed:#x}: tiles missing"
         );
     }
-    // A chaotic scene: a seed may place its bursts where no timer is left
-    // waiting (0xb0b357 does: 0 fires), so the premise is on the sweep.
+    // A chaotic scene: a seed may place its bursts only on content a later
+    // frame supersedes, so nothing is owed and nothing needs a timer
+    // (retransmits 0, PTO fires 0). The premise is per run on the runs that
+    // needed a repair, and enough of them must exist.
     assert!(
-        pto_runs >= 4,
-        "premise: the PTO fired in only {pto_runs} of 5 runs, so the bursts did not outlast it"
+        repaired_runs >= 3,
+        "premise: only {repaired_runs} of 5 runs needed a repair"
     );
 }
 
