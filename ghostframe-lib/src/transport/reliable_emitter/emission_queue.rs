@@ -4,6 +4,7 @@
 //! sources in the kernel UDP write window.
 
 use crate::transport::reliable_emitter::END_OF_STREAM_PARITY_FLUSH_MS;
+use crate::transport::reliable_emitter::PARITY_INTERLEAVE_OFFSET;
 use bytes::Bytes;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
@@ -69,10 +70,19 @@ impl WireClass {
 pub enum Emission {
     /// A source datagram and the reason it is on the wire.
     Source(Bytes, WireClass),
-    Parity(Bytes),
+    /// Parity datagram of the tile group starting at the given `wire_seq`.
+    Parity(Bytes, u32),
 }
 
 impl Emission {
+    /// For a tile parity datagram, the first `wire_seq` of the group it covers.
+    pub fn parity_group(&self) -> Option<u32> {
+        match self {
+            Emission::Parity(_, g) => Some(*g),
+            Emission::Source(..) => None,
+        }
+    }
+
     /// The `wire_seq` a source datagram carries (stamped at bytes 8..12 by the
     /// emitter), which names the transmission in the ledger. Parity is not a
     /// tracked transmission.
@@ -81,14 +91,14 @@ impl Emission {
             Emission::Source(b, _) if b.len() >= 12 => {
                 Some(u32::from_be_bytes([b[8], b[9], b[10], b[11]]))
             }
-            Emission::Source(..) | Emission::Parity(_) => None,
+            Emission::Source(..) | Emission::Parity(..) => None,
         }
     }
 
     pub fn class(&self) -> WireClass {
         match self {
             Emission::Source(_, c) => *c,
-            Emission::Parity(_) => WireClass::Parity,
+            Emission::Parity(..) => WireClass::Parity,
         }
     }
 }
@@ -164,8 +174,11 @@ impl EmissionQueue {
             if *after > next_wire_seq {
                 break;
             }
-            let Reverse((_, bytes)) = self.pending_parity.pop().unwrap();
-            self.queue.push_back(Emission::Parity(Bytes::from(bytes)));
+            let Reverse((after, bytes)) = self.pending_parity.pop().unwrap();
+            self.queue.push_back(Emission::Parity(
+                Bytes::from(bytes),
+                after.wrapping_sub(PARITY_INTERLEAVE_OFFSET),
+            ));
         }
         // Check end-of-stream flush.
         self.maybe_flush_pending(now);
@@ -186,8 +199,11 @@ impl EmissionQueue {
             return;
         }
         // Flush every pending parity unconditionally.
-        while let Some(Reverse((_, bytes))) = self.pending_parity.pop() {
-            self.queue.push_back(Emission::Parity(Bytes::from(bytes)));
+        while let Some(Reverse((after, bytes))) = self.pending_parity.pop() {
+            self.queue.push_back(Emission::Parity(
+                Bytes::from(bytes),
+                after.wrapping_sub(PARITY_INTERLEAVE_OFFSET),
+            ));
         }
         self.end_of_stream_idle_since = None;
     }
@@ -231,7 +247,7 @@ mod tests {
         assert!(q.pop(5, t).is_none());
         // At next=20 the parity becomes ready
         let e = q.pop(20, t).unwrap();
-        assert!(matches!(e, Emission::Parity(b) if b == vec![0xAA]));
+        assert!(matches!(e, Emission::Parity(b, 0) if b == vec![0xAA]));
     }
 
     #[test]
@@ -244,7 +260,7 @@ mod tests {
         // Advance time past flush window
         let t1 = t0 + Duration::from_millis(END_OF_STREAM_PARITY_FLUSH_MS + 1);
         let e = q.pop(0, t1).expect("flushed");
-        assert!(matches!(e, Emission::Parity(_)));
+        assert!(matches!(e, Emission::Parity(..)));
         assert!(q.is_empty());
     }
 }

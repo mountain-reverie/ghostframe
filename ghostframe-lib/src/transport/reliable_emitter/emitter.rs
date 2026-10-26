@@ -12,7 +12,8 @@ use crate::transport::reliable_emitter::wire_seq::WireSeqAllocator;
 use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K, PARITY_INTERLEAVE_OFFSET};
 use crate::transport::rtt_estimator::RttEstimator;
 use bytes::{Bytes, BytesMut};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Generation stamped in the `TileHeader` of a tile datagram's first
@@ -95,9 +96,12 @@ pub struct ReliableTileEmitter {
     /// (`last_sent_at` plus the probe timeout at its loss-path attempt count),
     /// checked by the loss path on every turn ([`Self::take_due_deferred`]),
     /// so they are served while acknowledgements flow, which the single
-    /// per-connection probe timer is not. Bounded by [`DEFERRED_CAP`]; one entry
-    /// per key.
-    deferred: HashMap<EmitKey, DeferredPass>,
+    /// per-connection probe timer is not. A min-heap on the deadline, validated
+    /// lazily when it surfaces (an entry whose pass is gone or has a newer
+    /// transmission is dropped there). Not capped: an entry exists only for a
+    /// pass in the cache, which is bounded, and each lives at most one backoff
+    /// interval past that pass.
+    deferred: BinaryHeap<Reverse<DeferredPass>>,
     /// Wire bytes each datagram costs beyond its own length (the
     /// WebTransport framing), added to what `tick_budgeted` bills. Zero
     /// unless the transport sets it.
@@ -209,9 +213,6 @@ pub struct EmitterStats {
     /// Verdicts left to the probe because the pass had been resent
     /// [`LOSS_RETX_MAX_ATTEMPTS`] times by the loss path.
     pub verdict_deferred_to_pto: u64,
-    /// Deferred passes not tracked because [`DEFERRED_CAP`] were already
-    /// waiting.
-    pub deferred_overflow: u64,
     /// Loss retransmissions whose original turned out to have arrived (the
     /// original was the first transmission of the pass to be acknowledged):
     /// spurious loss verdicts, Eifel style. Counted per retransmission.
@@ -274,18 +275,32 @@ pub enum RetxCause {
 /// s) takes over.
 pub(crate) const LOSS_RETX_MAX_ATTEMPTS: u8 = 3;
 
-/// Most passes the deferred list holds. A pass lost this many times over is a
-/// path that is not working; one beyond the cap is left to the 30 s backstop
-/// (`retire_stuck`) and counted in `deferred_overflow`.
-pub(crate) const DEFERRED_CAP: usize = 256;
-
-/// A pass a verdict declined to resend, waiting for its own deadline.
+/// A pass a verdict declined to resend, waiting for its own deadline. Ordered
+/// by `(due, judged_ws)`; the key rides along.
 #[derive(Debug, Clone, Copy)]
 struct DeferredPass {
+    key: EmitKey,
     /// The transmission judged lost. If the pass's newest transmission is no
     /// longer this one, something else has resent it and the entry is moot.
     judged_ws: u32,
     due: Instant,
+}
+
+impl PartialEq for DeferredPass {
+    fn eq(&self, o: &Self) -> bool {
+        (self.due, self.judged_ws) == (o.due, o.judged_ws)
+    }
+}
+impl Eq for DeferredPass {}
+impl PartialOrd for DeferredPass {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for DeferredPass {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        (self.due, self.judged_ws).cmp(&(o.due, o.judged_ws))
+    }
 }
 
 /// What became of a request to retransmit a transmission's content.
@@ -340,7 +355,7 @@ impl ReliableTileEmitter {
             pending_nack_set: HashSet::new(),
             pending_loss: VecDeque::new(),
             pending_loss_set: HashSet::new(),
-            deferred: HashMap::new(),
+            deferred: BinaryHeap::new(),
             wire_overhead: 0,
             stats: EmitterStats::default(),
         }
@@ -640,7 +655,6 @@ impl ReliableTileEmitter {
     /// ACKs are silent.
     pub fn on_ack(&mut self, keys: &[EmitKey]) {
         for key in keys {
-            self.deferred.remove(key);
             if self.cache.remove(key).is_some() {
                 self.stats.ack_hit += 1;
             } else {
@@ -1146,45 +1160,39 @@ impl ReliableTileEmitter {
         }
     }
 
-    /// Up to `n` deferred passes whose deadline has come, oldest deadline
-    /// first, each with the `wire_seq` of the transmission that was judged.
-    /// Entries for passes since acknowledged or cancelled, or resent by
-    /// someone else since the verdict, are dropped on the way. O(list), which
-    /// [`DEFERRED_CAP`] bounds; nothing here is per datagram or per
-    /// acknowledgement.
+    /// Up to `n` deferred passes whose deadline has come, earliest first, each
+    /// with the `wire_seq` of the transmission that was judged. Entries for
+    /// passes since acknowledged or cancelled, or resent by someone else since
+    /// the verdict, are dropped as they surface. O(log n) per entry.
     pub fn take_due_deferred(&mut self, now: Instant, n: usize) -> Vec<(EmitKey, u32)> {
-        let cache = &self.cache;
-        self.deferred
-            .retain(|k, d| cache.get(k).is_some_and(|e| e.latest_ws == d.judged_ws));
-        let mut due: Vec<(Instant, EmitKey, u32)> = self
-            .deferred
-            .iter()
-            .filter(|(_, d)| d.due <= now)
-            .map(|(k, d)| (d.due, *k, d.judged_ws))
-            .collect();
-        due.sort_by_key(|(at, _, _)| *at);
-        due.truncate(n);
-        for (_, k, _) in &due {
-            self.deferred.remove(k);
+        let mut out = Vec::new();
+        while out.len() < n {
+            let Some(Reverse(top)) = self.deferred.peek() else {
+                break;
+            };
+            if top.due > now {
+                break;
+            }
+            let Reverse(d) = self.deferred.pop().expect("peeked");
+            if self
+                .cache
+                .get(&d.key)
+                .is_some_and(|e| e.latest_ws == d.judged_ws)
+            {
+                out.push((d.key, d.judged_ws));
+            }
         }
-        due.into_iter().map(|(_, k, ws)| (k, ws)).collect()
+        out
     }
 
-    /// When the earliest deferred pass is due, for the event loop's wake
-    /// deadline. Entries whose pass is gone or has been resent are skipped.
+    /// When the earliest deferred entry surfaces, for the event loop's wake
+    /// deadline. A peek: the entry may by now be moot, in which case the wake
+    /// is spurious and `take_due_deferred` discards it.
     pub fn next_deferred_due(&self) -> Option<Instant> {
-        self.deferred
-            .iter()
-            .filter(|(k, d)| {
-                self.cache
-                    .get(k)
-                    .is_some_and(|e| e.latest_ws == d.judged_ws)
-            })
-            .map(|(_, d)| d.due)
-            .min()
+        self.deferred.peek().map(|Reverse(d)| d.due)
     }
 
-    /// Passes waiting on a deferred deadline.
+    /// Entries waiting on a deferred deadline, moot ones included.
     pub fn deferred_len(&self) -> usize {
         self.deferred.len()
     }
@@ -1196,16 +1204,11 @@ impl ReliableTileEmitter {
             return;
         };
         let due = e.last_sent_at + pto_for_attempt(&self.rtt, e.loss_attempts);
-        if self.deferred.len() >= DEFERRED_CAP && !self.deferred.contains_key(&key) {
-            let cache = &self.cache;
-            self.deferred
-                .retain(|k, d| cache.get(k).is_some_and(|e| e.latest_ws == d.judged_ws));
-            if self.deferred.len() >= DEFERRED_CAP {
-                self.stats.deferred_overflow += 1;
-                return;
-            }
-        }
-        self.deferred.insert(key, DeferredPass { judged_ws, due });
+        self.deferred.push(Reverse(DeferredPass {
+            key,
+            judged_ws,
+            due,
+        }));
     }
 
     /// Transmission `wire_seq` of pass `key` was declared lost (packet or time
@@ -1276,7 +1279,7 @@ impl ReliableTileEmitter {
         while let Some(emission) = self.next_emission(now) {
             let outcome = match &emission {
                 Emission::Source(bytes, _) => sender.send(bytes),
-                Emission::Parity(bytes) => sender.send(bytes),
+                Emission::Parity(bytes, _) => sender.send(bytes),
             };
             // A `DatagramSender` is the wire as far as this method is
             // concerned (a test's collector, the simulator's link), so what it
@@ -1320,7 +1323,7 @@ impl ReliableTileEmitter {
     pub(crate) fn settle_emission(&mut self, emission: Emission, outcome: SendOutcome) -> bool {
         match outcome {
             SendOutcome::Sent => {
-                if matches!(emission, Emission::Parity(_)) {
+                if matches!(emission, Emission::Parity(..)) {
                     self.stats.parity_emitted += 1;
                 }
                 true
@@ -1960,7 +1963,7 @@ mod tests {
             while let Some(em) = e.next_emission(now) {
                 let class = em.class();
                 let len = match &em {
-                    Emission::Source(b, _) | Emission::Parity(b) => b.len(),
+                    Emission::Source(b, _) | Emission::Parity(b, _) => b.len(),
                 };
                 // A 2-byte framing prefix per datagram, as the WebTransport
                 // layer adds a varint.
@@ -2669,14 +2672,14 @@ mod tests {
         let first = e.next_emission(t0).unwrap();
         let first_bytes = match &first {
             Emission::Source(b, _) => b.clone(),
-            Emission::Parity(b) => b.clone(),
+            Emission::Parity(b, _) => b.clone(),
         };
         e.hold_emission(first);
         assert_eq!(e.emission_queue_len(), 2);
         assert_eq!(e.stats.send_rejected, 0);
         match e.next_emission(t0).unwrap() {
             Emission::Source(b, _) => assert_eq!(b, first_bytes, "same datagram, same place"),
-            Emission::Parity(_) => panic!("parity ahead of its sources"),
+            Emission::Parity(..) => panic!("parity ahead of its sources"),
         }
     }
 
@@ -3270,5 +3273,39 @@ mod tests {
              of its `now` argument",
             delta,
         );
+    }
+
+    /// A tile group's parity emission carries the group's first `wire_seq`,
+    /// whether it leaves at the interleave offset or by the end-of-stream flush.
+    #[test]
+    fn a_parity_emission_names_its_groups_first_wire_seq() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        let n = FEC_GROUP_SIZE_K as u32;
+        let mut first_ws = Vec::new();
+        for i in 0..n {
+            e.submit_one(
+                EmitKey::new(i, 0, 0, 0),
+                Bytes::from(vec![0x80u8; 25]),
+                t0,
+                None,
+                t0,
+            );
+        }
+        for em in e.take_transmissions() {
+            first_ws.push(em.wire_seq);
+        }
+        // Not yet at the interleave offset: the end-of-stream flush releases it.
+        let mut groups = Vec::new();
+        let mut now = t0;
+        for _ in 0..200 {
+            now += Duration::from_millis(1);
+            while let Some(em) = e.next_emission(now) {
+                if let Some(g) = em.parity_group() {
+                    groups.push(g);
+                }
+            }
+        }
+        assert_eq!(groups, vec![first_ws[0]], "{groups:?} vs {first_ws:?}");
     }
 }

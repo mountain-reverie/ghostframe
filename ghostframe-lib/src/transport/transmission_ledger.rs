@@ -67,11 +67,14 @@ const ADAPT_WINDOW: u64 = 64;
 /// Verdicts the window must hold before `K_PKT` may be raised: a share of a
 /// handful is no evidence.
 const ADAPT_MIN_VERDICTS: u64 = 32;
-/// Parity departures remembered, newest last. One entry per group of
-/// `FEC_GROUP_SIZE_K` transmissions, and a late acknowledgement is only ever
-/// judged against a group whose parity left recently, so a few seconds of
-/// traffic at the highest rates fit.
-const PARITY_RING_CAP: usize = 128;
+/// Hard cap on the parity departures remembered. The real bound is time (the
+/// caller's `retain`, at least 600 ms): at 200 Mbit/s and 1,200-byte datagrams
+/// that is about 12,500 groups, so the cap is a backstop for rates beyond that,
+/// not a rate-dependent limit on ordinary operation.
+const PARITY_RING_CAP: usize = 16_384;
+
+/// Resolved entries `scan_outstanding` steps over per call.
+pub(crate) const SCAN_DEAD_BUDGET: usize = 4_096;
 /// Spurious share of the window above which `K_PKT` goes up by one: 10 %.
 const ADAPT_SPURIOUS_PERCENT: u64 = 10;
 
@@ -209,9 +212,12 @@ pub struct TransmissionLedger {
     /// is only ever judged against this, never against the clock, so a queue
     /// that delays everything in order cannot produce a verdict (F4).
     largest_acked: Option<u64>,
-    /// When each group's parity left quinn's FIFO: `(group_first_wire_seq,
-    /// when)`, oldest first, bounded by [`PARITY_RING_CAP`].
-    parity_departed: VecDeque<(u32, Instant)>,
+    /// When each group's parity left quinn's FIFO, by `group_first_wire_seq`.
+    /// Bounded by time (see [`Self::note_parity_departed`]) and, as a
+    /// backstop, by [`PARITY_RING_CAP`].
+    parity_departed: HashMap<u32, Instant>,
+    /// The same entries in departure order, for pruning.
+    parity_order: VecDeque<(u32, Instant)>,
     /// Current packet threshold, and what it adapts from: verdicts issued so
     /// far, and one bit per recent verdict (by verdict number modulo 64) set
     /// when that verdict was contradicted by a late acknowledgement.
@@ -233,7 +239,8 @@ impl TransmissionLedger {
             tombstone_order: VecDeque::new(),
             next_dep_idx: 0,
             largest_acked: None,
-            parity_departed: VecDeque::new(),
+            parity_departed: HashMap::new(),
+            parity_order: VecDeque::new(),
             k_pkt: K_PKT_INITIAL,
             freeze_k_pkt: false,
             verdicts: 0,
@@ -257,24 +264,35 @@ impl TransmissionLedger {
 
     /// A group's parity datagram left quinn's FIFO at `at`. `group_first` is
     /// the first `wire_seq` of the group it covers (the parity envelope's own
-    /// field).
-    pub fn note_parity_departed(&mut self, group_first: u32, at: Instant) {
-        if self.parity_departed.len() >= PARITY_RING_CAP {
-            self.parity_departed.pop_front();
+    /// field). Entries older than `retain` are forgotten: a recovery's
+    /// acknowledgement comes about a round trip after the parity, so the
+    /// caller passes a few round trips (never less than the loss window's
+    /// settle time), whatever the send rate.
+    pub fn note_parity_departed(&mut self, group_first: u32, at: Instant, retain: Duration) {
+        while let Some(&(g, t)) = self.parity_order.front() {
+            if self.parity_order.len() <= PARITY_RING_CAP
+                && at.saturating_duration_since(t) <= retain
+            {
+                break;
+            }
+            self.parity_order.pop_front();
+            // A newer departure of the same group first replaces it.
+            if self.parity_departed.get(&g) == Some(&t) {
+                self.parity_departed.remove(&g);
+            }
         }
-        self.parity_departed.push_back((group_first, at));
+        self.parity_departed.insert(group_first, at);
+        self.parity_order.push_back((group_first, at));
     }
 
     /// Could a late acknowledgement of `wire_seq` be an FEC recovery? See
     /// [`Resolution::Late::fec_possible`]. `ack` is `(now, min_rtt)`; `None`
-    /// skips the parity-age test.
+    /// skips the parity-age test. O(group size).
     fn fec_possible(&self, wire_seq: u32, ack: Option<(Instant, Duration)>) -> bool {
         let k = crate::transport::reliable_emitter::FEC_GROUP_SIZE_K as u32;
-        let Some(&(first, left)) = self
-            .parity_departed
-            .iter()
-            .rev()
-            .find(|(first, _)| wire_seq.wrapping_sub(*first) < k)
+        let Some((first, left)) = (0..k)
+            .map(|i| wire_seq.wrapping_sub(i))
+            .find_map(|first| self.parity_departed.get(&first).map(|t| (first, *t)))
         else {
             return false;
         };
@@ -409,6 +427,7 @@ impl TransmissionLedger {
         self.next_dep_idx = 0;
         self.largest_acked = None;
         self.parity_departed.clear();
+        self.parity_order.clear();
         self.k_pkt = K_PKT_INITIAL;
         self.verdicts = 0;
         self.spurious_bits = 0;
@@ -566,62 +585,64 @@ impl TransmissionLedger {
     }
 
     /// The newest outstanding transmissions that have departed, newest first:
-    /// up to `n` of them, looking at no more than `max_scan` records from the
-    /// back. Resolved entries at the back are dropped as they are met.
+    /// up to `n` of them, looking at no more than `max_scan` outstanding
+    /// records from the back. Resolved entries at the back are dropped as they
+    /// are met.
     ///
     /// What the probe timeout retransmits. A bounded scan, so an unlucky run
     /// of resolved entries behind the tail cannot make one probe expensive.
     pub fn newest_outstanding(&mut self, n: usize, max_scan: usize) -> Vec<(u32, Transmission)> {
-        self.newest_outstanding_after(0, n, max_scan)
+        self.scan_outstanding(&mut 0, n, max_scan)
     }
 
-    /// [`Self::newest_outstanding`] past the `skip` newest outstanding ones,
-    /// which the caller has already looked at and kept: a cursor, so a probe
-    /// that removes one record per round does not read the survivors again.
-    /// `max_scan` counts the records examined after the skipped ones.
-    pub fn newest_outstanding_after(
+    /// [`Self::newest_outstanding`] from a positional `cursor`: the number of
+    /// entries of the departure order, counted from the back, already
+    /// examined. It starts at 0 and is advanced past everything this call
+    /// examined, so a caller that removes records between calls (the probe
+    /// declaring dead content lost) never reads an entry twice. Positions
+    /// count from the back and removal is lazy, so they stay valid as the
+    /// caller removes records; only the first call (cursor 0) trims the back.
+    ///
+    /// `max_scan` bounds the *outstanding* records examined. Resolved entries
+    /// have their own budget, [`SCAN_DEAD_BUDGET`], so a long dead run neither
+    /// hides the live records behind it nor costs unboundedly.
+    pub fn scan_outstanding(
         &mut self,
-        skip: usize,
+        cursor: &mut usize,
         n: usize,
         max_scan: usize,
     ) -> Vec<(u32, Transmission)> {
-        // Resolved entries at the very back are dead weight for every later
-        // probe: drop them.
-        while let Some(back) = self.departed_order.back().copied() {
-            match self.records.get(&back) {
-                Some(Record {
-                    departed: Some(_), ..
-                }) => break,
-                _ => {
-                    self.departed_order.pop_back();
+        if *cursor == 0 {
+            // Resolved entries at the very back are dead weight for every
+            // later probe: drop them.
+            while let Some(back) = self.departed_order.back().copied() {
+                match self.records.get(&back) {
+                    Some(Record {
+                        departed: Some(_), ..
+                    }) => break,
+                    _ => {
+                        self.departed_order.pop_back();
+                    }
                 }
             }
         }
         let mut out = Vec::new();
-        let mut to_skip = skip;
-        let mut scanned = 0usize;
-        for ws in self.departed_order.iter().rev() {
-            if out.len() >= n || scanned >= max_scan {
+        let (mut live_seen, mut dead_seen) = (0usize, 0usize);
+        for ws in self.departed_order.iter().rev().skip(*cursor) {
+            if out.len() >= n || live_seen >= max_scan || dead_seen >= SCAN_DEAD_BUDGET {
                 break;
             }
-            let live = matches!(
-                self.records.get(ws),
+            *cursor += 1;
+            match self.records.get(ws) {
                 Some(Record {
                     departed: Some(_),
+                    tx,
                     ..
-                })
-            );
-            if to_skip > 0 {
-                if live {
-                    to_skip -= 1;
+                }) => {
+                    live_seen += 1;
+                    out.push((*ws, *tx));
                 }
-                continue;
-            }
-            scanned += 1;
-            if live {
-                if let Some(r) = self.records.get(ws) {
-                    out.push((*ws, r.tx));
-                }
+                _ => dead_seen += 1,
             }
         }
         out
@@ -996,13 +1017,14 @@ mod tests {
     }
 
     const RTT: Duration = Duration::from_millis(40);
+    const KEEP: Duration = Duration::from_millis(600);
 
     /// Send `first..first + 10` as one group, then its parity at `parity_at`.
     fn send_group(l: &mut TransmissionLedger, first: u32, t0: Instant, parity_at: Instant) {
         for ws in first..first + 10 {
             send(l, ws, t0);
         }
-        l.note_parity_departed(first, parity_at);
+        l.note_parity_departed(first, parity_at, KEEP);
     }
 
     fn late(l: &mut TransmissionLedger, ws: u32, at: Instant) -> bool {
@@ -1099,6 +1121,48 @@ mod tests {
             }
             assert!(!late(&mut l, 3, after), "other_lost={other_lost}");
         }
+    }
+
+    /// The memory of when parity left is bounded by time, not by a count of
+    /// groups: at 200 Mbit/s a thousand groups leave in 5 ms, and a recovery on
+    /// an 80 ms path is acknowledged 80 ms after its parity, thousands of groups
+    /// later. And an entry older than `retain` is forgotten.
+    #[test]
+    fn the_parity_memory_is_a_span_of_time_not_a_number_of_groups() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(1 << 16);
+        let rtt = Duration::from_millis(80);
+        // Group 0 is the one under test: nine members acked, one lost.
+        for ws in 0..10u32 {
+            send(&mut l, ws, t0);
+        }
+        l.note_parity_departed(0, t0, KEEP);
+        for ws in 1..10 {
+            assert!(l.resolve(ws).is_some());
+        }
+        let _ = l.declare_lost_by_pto(0);
+        // 15,000 further groups' parity in the next 75 ms (5 us apart).
+        for g in 1..15_000u32 {
+            l.note_parity_departed(g * 10, t0 + Duration::from_micros(g as u64 * 5), KEEP);
+        }
+        let late_ack = |l: &mut TransmissionLedger| match l.resolve_at(0, Some((t0 + rtt, rtt))) {
+            Some(Resolution::Late { fec_possible, .. }) => fec_possible,
+            other => panic!("{other:?}"),
+        };
+        assert!(late_ack(&mut l), "15,000 groups later, still remembered");
+
+        // And forgotten past the retention.
+        let mut l = TransmissionLedger::new(1 << 16);
+        for ws in 0..10u32 {
+            send(&mut l, ws, t0);
+        }
+        l.note_parity_departed(0, t0, KEEP);
+        for ws in 1..10 {
+            assert!(l.resolve(ws).is_some());
+        }
+        let _ = l.declare_lost_by_pto(0);
+        l.note_parity_departed(10, t0 + KEEP + Duration::from_millis(1), KEEP);
+        assert!(!late_ack(&mut l), "older than the retention");
     }
 
     /// The end-of-stream flush sends a frame's last groups' parity a few
@@ -1204,17 +1268,20 @@ mod tests {
         assert_eq!(n.iter().map(|(w, _)| *w).collect::<Vec<_>>(), vec![3, 1]);
         // The scan is bounded.
         assert_eq!(l.newest_outstanding(2, 1).len(), 1);
-        // A cursor: past the newest outstanding one, and the scan bound counts
-        // only what comes after it.
-        let n = l.newest_outstanding_after(1, 8, 8);
-        assert_eq!(n.iter().map(|(w, _)| *w).collect::<Vec<_>>(), vec![1, 0]);
+        // A cursor: the second call continues where the first stopped, and
+        // resolved entries do not spend the outstanding-record budget.
+        let mut cur = 0;
+        let a = l.scan_outstanding(&mut cur, 1, 8);
+        assert_eq!(a.iter().map(|(w, _)| *w).collect::<Vec<_>>(), vec![3]);
+        let b = l.scan_outstanding(&mut cur, 8, 1);
         assert_eq!(
-            l.newest_outstanding_after(1, 8, 1).len(),
-            0,
-            "the resolved 2 uses the scan"
+            b.iter().map(|(w, _)| *w).collect::<Vec<_>>(),
+            vec![1],
+            "the resolved 2 is stepped over without using the budget of 1"
         );
-        assert_eq!(l.newest_outstanding_after(1, 8, 2).len(), 1);
-        assert!(l.newest_outstanding_after(9, 8, 8).is_empty());
+        let c = l.scan_outstanding(&mut cur, 8, 8);
+        assert_eq!(c.iter().map(|(w, _)| *w).collect::<Vec<_>>(), vec![0]);
+        assert!(l.scan_outstanding(&mut cur, 8, 8).is_empty());
     }
 
     #[test]
