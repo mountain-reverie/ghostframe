@@ -297,7 +297,12 @@ impl ModelSettings {
             restart_gain: f("GHOSTFRAME_CC_RESTART_GAIN", 1.0, 64.0, d.restart_gain),
             idle_after: ms("GHOSTFRAME_CC_IDLE_AFTER_MS", d.idle_after),
             t_hold: ms("GHOSTFRAME_CC_T_HOLD_MS", d.t_hold),
-            restart_fraction: f("GHOSTFRAME_CC_RESTART_FRACTION", 0.01, 1.0, d.restart_fraction),
+            restart_fraction: f(
+                "GHOSTFRAME_CC_RESTART_FRACTION",
+                0.01,
+                1.0,
+                d.restart_fraction,
+            ),
         }
     }
 }
@@ -1334,7 +1339,10 @@ mod tests {
     fn model_settings_default_to_the_design_and_reject_nonsense() {
         let d = ModelSettings::default();
         assert_eq!(ModelSettings::from_lookup(lookup(&[])), d);
-        assert_eq!((d.gain, d.restart_gain, d.restart_fraction), (2.0, 1.0, 0.25));
+        assert_eq!(
+            (d.gain, d.restart_gain, d.restart_fraction),
+            (2.0, 1.0, 0.25)
+        );
         assert_eq!(d.t_hold, std::time::Duration::from_secs(2));
         let s = ModelSettings::from_lookup(lookup(&[
             ("GHOSTFRAME_CC_GAIN", "8"),
@@ -1342,7 +1350,10 @@ mod tests {
             ("GHOSTFRAME_CC_T_HOLD_MS", "60000"),
             ("GHOSTFRAME_CC_RESTART_FRACTION", "1"),
         ]));
-        assert_eq!((s.gain, s.restart_gain, s.restart_fraction), (8.0, 2.0, 1.0));
+        assert_eq!(
+            (s.gain, s.restart_gain, s.restart_fraction),
+            (8.0, 2.0, 1.0)
+        );
         assert_eq!(s.t_hold, std::time::Duration::from_secs(60));
         // A gain under 1, a NaN and a zero fraction keep the default.
         let bad = ModelSettings::from_lookup(lookup(&[

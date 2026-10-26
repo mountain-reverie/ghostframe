@@ -73,6 +73,14 @@ impl IoBridge {
         )
     }
 
+    /// Run this bridge under the model controller (D1 design A), with these
+    /// settings. Call before the first connection; harness only, because
+    /// production selects it through `LibConfig`.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn use_model_controller_for_test(&mut self, settings: crate::config::ModelSettings) {
+        self.install_model_controller(settings);
+    }
+
     /// Replace the QUIC peer gate, for a test that needs a specific policy
     /// or a background identity source.
     #[cfg(any(test, feature = "browserless-harness"))]

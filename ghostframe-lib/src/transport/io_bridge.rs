@@ -87,6 +87,9 @@ use bwe_glue::{
     MAX_PENDING_LOSSES, TRANSMISSION_LEDGER_CAPACITY,
 };
 
+#[path = "io_bridge/model_glue.rs"]
+mod model_glue;
+
 #[path = "io_bridge/pacing.rs"]
 mod pacing;
 #[cfg(test)]
@@ -801,6 +804,8 @@ pub struct IoBridge {
     /// Cumulative wire bytes of the transmissions recorded in the ledger: what
     /// the estimator counts of what was sent. See `BweSnapshot::payload_fraction`.
     offered_wire_bytes: f64,
+    /// The model controller's glue (`GHOSTFRAME_CC=model`); `None` under Cubic.
+    model: Option<model_glue::ModelGlue>,
     /// Recent `cwnd / smoothed_rtt` samples taken while quinn was the limit;
     /// the BWE capacity hint is their minimum. See `CapacityHintWindow`.
     capacity_hint_window: bwe_glue::CapacityHintWindow,
@@ -1235,6 +1240,39 @@ impl IoBridge {
         lib_config: crate::config::LibConfig,
         diffs: BaseDiffs,
     ) -> Self {
+        let (mode, settings) = (lib_config.transport.congestion, lib_config.transport.model);
+        let mut bridge = Self::base_cubic(stream, server, lib_config, diffs);
+        if mode == crate::config::CongestionMode::Model {
+            bridge.install_model_controller(settings);
+        }
+        bridge
+    }
+
+    /// Switch a freshly built bridge to the model controller (D1 design A):
+    /// quinn's window becomes `W(R_w)`, the estimator stops being fed a
+    /// capacity hint (and stops probing on one), and admission paces to `R`.
+    /// Before the first connection: a connection keeps the controller it was
+    /// built with.
+    fn install_model_controller(&mut self, settings: crate::config::ModelSettings) {
+        // The window opens at the start rate; the estimator moves it.
+        let cell = crate::transport::model_controller::ModelCell::new(
+            crate::transport::bwe::BweWrapper::INITIAL_BPS / 8,
+            settings.gain,
+        );
+        self.server.use_model_controller(cell.clone());
+        self.bwe = crate::transport::bwe::BweWrapper::new_without_hint(
+            crate::transport::bwe::BweWrapper::INITIAL_BPS,
+            now_std(),
+        );
+        self.model = Some(model_glue::ModelGlue::new(cell, settings));
+    }
+
+    fn base_cubic(
+        stream: BridgeStream,
+        server: QuicServer,
+        lib_config: crate::config::LibConfig,
+        diffs: BaseDiffs,
+    ) -> Self {
         let (peer_lookup_tx, peer_lookup_rx) = mpsc::unbounded_channel();
         Self {
             _handle: diffs.handle,
@@ -1343,6 +1381,7 @@ impl IoBridge {
             datagram_send_errs: 0,
             datagram_send_err_first_logged: false,
             offered_wire_bytes: 0.0,
+            model: None,
             capacity_hint_window: Default::default(),
             path_sent_packets_last: 0,
             transport_probe: TransportProbe::default(),
@@ -2410,6 +2449,7 @@ impl IoBridge {
                 .map(|l| (l.emit_us, l.wire_bytes))
                 .collect();
             self.bwe.update(&records, &losses, now_std(), in_flight);
+            self.model_after_feedback();
         }
 
         // Republish into `bwe_publish` every iteration, not only when

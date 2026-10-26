@@ -379,6 +379,23 @@ pub enum BudgetTerm {
     Probe,
 }
 
+/// The model controller (D1 design A) as a scene sees it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ModelProbe {
+    /// The model controller is installed (`GHOSTFRAME_CC=model`).
+    pub active: bool,
+    /// Sends after an idle of at most `t_hold`: held the estimate, restart gain.
+    pub restarts_hold: u64,
+    /// Sends after an idle past `t_hold`: resumed from a fraction of it.
+    pub restarts_cold: u64,
+    /// The window's rate `R_w` last published, bytes per second of wire bytes.
+    pub rate_bytes_per_s: u64,
+    /// The gain last published, thousandths.
+    pub gain_milli: u64,
+    /// The controller's own counters (persistent congestion, peak in-flight).
+    pub stats: crate::transport::model_controller::ModelStats,
+}
+
 /// Admission passes ("pumps") counted twice over: by the term that set the
 /// rate, and, for the passes that ended with work still waiting, by what held
 /// the rest back.
@@ -645,6 +662,8 @@ pub struct InstrumentSummary {
     /// Times the estimator was told the capacity is bounded only by its
     /// configured maximum, because no reading described a busy path.
     pub hint_unbounded: u64,
+    /// The model controller's counters (`active` is false under Cubic).
+    pub model: ModelProbe,
     /// The estimator wrapper's own counters.
     pub bwe: crate::transport::bwe::BweStats,
     /// Per-transmission delivery-rate samples (PR-6b): the latest sample and

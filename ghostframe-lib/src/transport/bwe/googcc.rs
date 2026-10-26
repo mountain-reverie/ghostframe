@@ -163,6 +163,23 @@ impl GoogCcDriver {
     const MAX_PENDING_PROBE_REQUESTS: usize = 4;
 
     pub(crate) fn new(initial_bps: u64, now: Instant) -> Self {
+        Self::with_network_state_probing(initial_bps, now, true)
+    }
+
+    /// `network_state_probing` is whether the controller may probe on a
+    /// `NetworkStateEstimate` (the transport capacity hint). The model
+    /// controller feeds none, so it turns the probes that depend on one off
+    /// and the intervals back to infinite, goog_cc's default.
+    pub(crate) fn with_network_state_probing(
+        initial_bps: u64,
+        now: Instant,
+        network_state_probing: bool,
+    ) -> Self {
+        let (network_state_interval, est_lower_than_network_interval) = if network_state_probing {
+            (TimeDelta::from_seconds(5), TimeDelta::from_seconds(3))
+        } else {
+            (TimeDelta::plus_infinity(), TimeDelta::plus_infinity())
+        };
         let at_time = Timestamp::from_millis(0);
         let cfg = NetworkControllerConfig {
             constraints: TargetRateConstraints {
@@ -220,8 +237,8 @@ impl GoogCcDriver {
                     // (`est_lower_than_network_ratio`, default 0.85) and the
                     // limit is delay-based rather than loss-based — which is
                     // exactly the post-capacity-increase situation.
-                    network_state_interval: TimeDelta::from_seconds(5),
-                    est_lower_than_network_interval: TimeDelta::from_seconds(3),
+                    network_state_interval,
+                    est_lower_than_network_interval,
                     ..ProbeControllerConfig::default()
                 },
                 ..FieldTrials::default()
@@ -505,6 +522,15 @@ impl GoogCcDriver {
             });
         self.absorb(upd);
         self.last_reseed_us = Some(now_us);
+    }
+
+    /// Resume the estimate from `bps`: the idle-restart policy's cold start
+    /// (D1 section 6.6). The same API the ceiling follower uses; the held
+    /// estimate is stale, and the evidence the ceiling needs to lift it again
+    /// is what the restarted flow produces.
+    pub(crate) fn restart_from(&mut self, now: Instant, bps: u64) {
+        let now_us = self.micros_since_base(now);
+        self.reseed(now, now_us, bps as f64);
     }
 
     /// `bps` bounded by the ceiling while one applies (never below the

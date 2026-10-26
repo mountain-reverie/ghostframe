@@ -111,6 +111,9 @@ pub(super) struct Instruments {
     pub(super) hint_feeds: u64,
     pub(super) hint_feeds_before_feedback: u64,
     pub(super) hint_unbounded: u64,
+    /// Idle restarts, by kind (model controller).
+    pub(super) model_restarts_hold: u64,
+    pub(super) model_restarts_cold: u64,
 }
 
 impl Instruments {
@@ -456,6 +459,7 @@ impl IoBridge {
             hint_feeds: i.hint_feeds,
             hint_feeds_before_feedback: i.hint_feeds_before_feedback,
             hint_unbounded: i.hint_unbounded,
+            model: self.model_probe(),
             bwe: self.bwe.snapshot().stats,
             delivery: self.delivery_sampler.stats(super::now_std()),
         }
