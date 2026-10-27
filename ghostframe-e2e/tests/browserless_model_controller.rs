@@ -34,7 +34,7 @@ use ghostframe_e2e::harness::load_profile::{
 use ghostframe_e2e::harness::scene_tiles::TileSpec;
 use ghostframe_e2e::netsim::{Bottleneck, CapTimeline, NetProfile};
 use ghostframe_lib::config::{CongestionMode, ModelSettings};
-use ghostframe_lib::transport::model_controller::model_window;
+use ghostframe_lib::transport::model_controller::{model_window, RTT_WINDOW};
 use std::time::Duration;
 
 const S: u64 = 1_000_000;
@@ -730,17 +730,18 @@ async fn p8c_a_feedback_blackout_leaves_the_window_binding_and_the_session_recov
 /// Tailscale direct path falling back to DERP; a competitor's standing queue
 /// looks the same to quinn's minimum round trip). The estimate must stay at
 /// 0.6 x the link (payload units) or more at the end, and must come back:
-/// 0.6 x the link within 3 s (the round-trip window) plus `T_up` of the
-/// step, and stay above 0.5 x thereafter, on each of five seeds; the median
-/// over the seeds of the settled level after the step is at least 0.6.
+/// 0.6 x the link within the round-trip window plus two round trips of the
+/// new path (derived at the assertion), and stay above 0.5 x thereafter, on
+/// each of five seeds; the median over the seeds of the settled level after
+/// the step is at least 0.6.
 ///
 /// quinn's `min_rtt` never rises, so a window of `G x R x (min_rtt + 5 ms)`
-/// holds the flow to `W / srtt` = `R x 2 x 10 / 80` = a quarter of `R`; with
-/// the window-limited pass counted as saturated the acknowledged-rate ceiling
-/// then took the estimate down by that factor again each window, to the
-/// 4-datagram floor. Mutation: take the srtt floor out of
-/// `ModelController::current_window` (or the load guard out of the pacing
-/// pass) and the estimate collapses.
+/// holds the flow to `W / srtt` = `R x 2 x 10 / 80` = a quarter of `R`. In that
+/// state the acknowledged rate says nothing about the path, yet goog_cc reads
+/// the step as overuse and cuts to 0.85 x it, three times in 300 ms, to a tenth
+/// of the link. Additive increase from there took 15 s. Mutation: take the
+/// `BaseRise` restore out of `model_after_feedback` and the estimate stays
+/// there.
 #[tokio::test(start_paused = true)]
 async fn p8e_the_estimate_survives_a_rising_round_trip() {
     // Chaotic scene: per seed, the estimate must come back and stay (no
@@ -830,15 +831,24 @@ async fn p8e_run(seed: u64) -> f64 {
         "premise: {before:.3} of the link before the step"
     );
     let back = recovered.expect("the estimate never came back to 0.6 of the link");
-    // The model controller's round-trip window (`RTT_WINDOW`, 3 s) plus `T_up`.
-    let bound = 3 * S + T_UP_US;
+    // Derived from the mechanism (`BaseRise`): the flow is stale until the
+    // old minimum has left the base round trip's window, at most `RTT_WINDOW`
+    // after the step; the next feedback then continues the estimate from the
+    // rate the path acknowledged before the step, one round trip on the new
+    // path, and the flow it admits is acknowledged one round trip after that. Nothing here waits on additive
+    // increase, so no `T_up`.
+    let rtt_after = 2 * 75_000 + 5_000;
+    let bound = RTT_WINDOW.as_micros() as u64 + 2 * rtt_after;
     assert!(
         back <= bound,
         "estimate back at 0.6 x link after {} ms, bound {} ms",
         back / 1000,
         bound / 1000
     );
-    let lowest = low(step_at + back, end);
+    // goog_cc takes the first feedback after a reseed back to the old value
+    // (seen in its trace) and keeps the restored one from the second, so the
+    // estimate holds from one round trip after it first reads restored.
+    let lowest = low(step_at + back + rtt_after, end);
     p8(
         name,
         "lowest_after_recovery_over_link",
