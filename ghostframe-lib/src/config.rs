@@ -287,23 +287,32 @@ impl ModelSettings {
                 .filter(|v| v.is_finite() && (lo..=hi).contains(v))
                 .unwrap_or(dflt)
         };
-        let ms = |k: &str, dflt: std::time::Duration| {
+        // Millisecond settings are bounded like the others: an idle shorter
+        // than a frame interval would make every pass a restart, and a hold
+        // shorter than the idle that starts it would make every idle cold.
+        let ms = |k: &str, lo: u64, hi: u64, dflt: std::time::Duration| {
             get(k)
                 .and_then(|s| s.parse::<u64>().ok())
+                .filter(|v| (lo..=hi).contains(v))
                 .map_or(dflt, std::time::Duration::from_millis)
         };
-        Self {
+        let mut out = Self {
             gain: f("GHOSTFRAME_CC_GAIN", 1.0, 64.0, d.gain),
             restart_gain: f("GHOSTFRAME_CC_RESTART_GAIN", 1.0, 64.0, d.restart_gain),
-            idle_after: ms("GHOSTFRAME_CC_IDLE_AFTER_MS", d.idle_after),
-            t_hold: ms("GHOSTFRAME_CC_T_HOLD_MS", d.t_hold),
+            idle_after: ms("GHOSTFRAME_CC_IDLE_AFTER_MS", 100, 60_000, d.idle_after),
+            t_hold: ms("GHOSTFRAME_CC_T_HOLD_MS", 100, 3_600_000, d.t_hold),
             restart_fraction: f(
                 "GHOSTFRAME_CC_RESTART_FRACTION",
                 0.01,
                 1.0,
                 d.restart_fraction,
             ),
+        };
+        if out.t_hold < out.idle_after {
+            out.idle_after = d.idle_after;
+            out.t_hold = d.t_hold;
         }
+        out
     }
 }
 
@@ -1362,6 +1371,14 @@ mod tests {
             ("GHOSTFRAME_CC_RESTART_FRACTION", "0"),
         ]));
         assert_eq!(bad, d);
+        // An idle of 0 ms, or a hold shorter than the idle, falls back.
+        let zero = ModelSettings::from_lookup(lookup(&[("GHOSTFRAME_CC_IDLE_AFTER_MS", "0")]));
+        assert_eq!(zero.idle_after, d.idle_after);
+        let short = ModelSettings::from_lookup(lookup(&[
+            ("GHOSTFRAME_CC_IDLE_AFTER_MS", "5000"),
+            ("GHOSTFRAME_CC_T_HOLD_MS", "1000"),
+        ]));
+        assert_eq!((short.idle_after, short.t_hold), (d.idle_after, d.t_hold));
     }
 
     #[test]

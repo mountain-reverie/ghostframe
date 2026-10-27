@@ -302,7 +302,14 @@ impl NetSim {
         // uniform in [-jitter_us, +jitter_us], clamped so at_us >= now_us.
         let jitter_frac = self.rng.next_f64(); // [0, 1)
         let jitter = ((jitter_frac * 2.0 - 1.0) * self.profile.jitter_us as f64).round() as i64;
-        let delayed = now_us as i128 + self.profile.delay_us as i128 + jitter as i128;
+        let delay_us = self
+            .profile
+            .delay_steps
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= now_us)
+            .map_or(self.profile.delay_us, |(_, d)| *d);
+        let delayed = now_us as i128 + delay_us as i128 + jitter as i128;
         let mut at_us = delayed.max(now_us as i128) as u64;
 
         // 4. Reorder: add a uniform [0, reorder_us) offset, letting a later

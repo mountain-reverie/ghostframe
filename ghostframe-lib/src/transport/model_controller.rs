@@ -9,13 +9,10 @@
 //! ```
 //!
 //! `R_w` is the rate the window must be able to carry: the estimate, or a
-//! probe cluster's rate while one is open. A probe more than about twice the
-//! link also builds a queue that outgrows `G x R_w x RTT_eff` before its
-//! window closes (the round trip it is held against is the minimum, not the
-//! one the probe causes), so while a cluster is open the window also carries
-//! the whole cluster (`probe_bytes`): a probe is never clipped by the window.
-//! `G` (2 by default) is slack for the ack clock and for the
-//! estimate rising between two updates; it is also what bounds the bottleneck
+//! probe cluster's rate while one is open (then `W = max(G x R_est, R_probe) x
+//! RTT_eff`, so a probe at the link's rate or below is never clipped, and one
+//! above it is, which is correct). `G` (2 by default) is slack for the ack clock and for the
+//! //! estimate rising between two updates; it is also what bounds the bottleneck
 //! queue a wrong estimate can build, to about `(G x R_w / C - 1) x RTT_eff`.
 //!
 //! What the controller does not do: grow or shrink on acknowledgements (quinn's
@@ -83,8 +80,12 @@ pub struct ModelCell {
     rate_bytes_per_s: AtomicU64,
     /// `G`, thousandths.
     gain_milli: AtomicU32,
-    /// Bytes of the open probe cluster, wire bytes; zero with no cluster open.
-    probe_bytes: AtomicU64,
+    /// Rate of the open probe cluster, wire bytes per second; zero with none open.
+    probe_rate: AtomicU64,
+    /// quinn's minimum and smoothed round trip as the controller last saw
+    /// them, microseconds; zero before the first sample.
+    min_rtt_us: AtomicU64,
+    srtt_us: AtomicU64,
     /// Bumped by every publish that follows estimator feedback. A collapse
     /// lasts until it moves.
     feedback_epoch: AtomicU64,
@@ -97,7 +98,9 @@ impl ModelCell {
         Arc::new(Self {
             rate_bytes_per_s: AtomicU64::new(rate_bytes_per_s),
             gain_milli: AtomicU32::new(gain_to_milli(gain)),
-            probe_bytes: AtomicU64::new(0),
+            probe_rate: AtomicU64::new(0),
+            min_rtt_us: AtomicU64::new(0),
+            srtt_us: AtomicU64::new(0),
             feedback_epoch: AtomicU64::new(0),
             persistent: AtomicU64::new(0),
             window_max: AtomicU64::new(0),
@@ -106,14 +109,8 @@ impl ModelCell {
 
     /// Write `R_w` and `G`. `fresh_feedback` is true when the estimator has
     /// just heard feedback (a persistent-congestion collapse ends there).
-    pub fn publish(
-        &self,
-        rate_bytes_per_s: u64,
-        gain: f64,
-        probe_bytes: u64,
-        fresh_feedback: bool,
-    ) {
-        self.probe_bytes.store(probe_bytes, Ordering::Relaxed);
+    pub fn publish(&self, rate_bytes_per_s: u64, gain: f64, probe_rate: u64, fresh_feedback: bool) {
+        self.probe_rate.store(probe_rate, Ordering::Relaxed);
         self.rate_bytes_per_s
             .store(rate_bytes_per_s, Ordering::Relaxed);
         self.gain_milli
@@ -127,8 +124,27 @@ impl ModelCell {
         self.rate_bytes_per_s.load(Ordering::Relaxed)
     }
 
-    pub fn probe_bytes(&self) -> u64 {
-        self.probe_bytes.load(Ordering::Relaxed)
+    pub fn probe_rate(&self) -> u64 {
+        self.probe_rate.load(Ordering::Relaxed)
+    }
+
+    /// Record the base round trip (windowed minimum) and the smoothed one.
+    pub fn note_rtts(&self, min: Duration, srtt: Duration) {
+        self.min_rtt_us
+            .store(min.as_micros() as u64, Ordering::Relaxed);
+        self.srtt_us
+            .store(srtt.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// `(base rtt, srtt)` as last seen, `None` before a sample.
+    pub fn rtts(&self) -> Option<(Duration, Duration)> {
+        let min = self.min_rtt_us.load(Ordering::Relaxed);
+        (min > 0).then(|| {
+            (
+                Duration::from_micros(min),
+                Duration::from_micros(self.srtt_us.load(Ordering::Relaxed)),
+            )
+        })
     }
 
     pub fn gain(&self) -> f64 {
@@ -169,6 +185,8 @@ impl ControllerFactory for ModelControllerFactory {
             cell: self.cell.clone(),
             mtu: u64::from(current_mtu),
             min_rtt: None,
+            rtt_cur: None,
+            rtt_prev: None,
             collapsed_at: None,
         })
     }
@@ -180,12 +198,33 @@ pub struct ModelController {
     mtu: u64,
     /// quinn's minimum round trip, once it has a sample.
     min_rtt: Option<Duration>,
+    /// Minimum smoothed round trip, as two buckets of `RTT_WINDOW / 2`.
+    rtt_cur: Option<(std::time::Instant, Duration)>,
+    rtt_prev: Option<Duration>,
     /// The feedback epoch a persistent-congestion event collapsed the window
     /// in. The window stays at the floor while the cell is still in it.
     collapsed_at: Option<u64>,
 }
 
+/// The span the base round trip is the minimum over (BBR's `RTprop` window).
+const RTT_WINDOW: Duration = Duration::from_secs(10);
+
 impl ModelController {
+    /// Fold one smoothed-round-trip reading into the windowed minimum.
+    fn note_rtt(&mut self, now: std::time::Instant, srtt: Duration) {
+        match self.rtt_cur {
+            Some((start, _)) if now.saturating_duration_since(start) >= RTT_WINDOW / 2 => {
+                self.rtt_prev = self.rtt_cur.map(|(_, m)| m);
+                self.rtt_cur = Some((now, srtt));
+                // A bucket two old is gone: `rtt_prev` is only the last one.
+            }
+            Some((start, m)) => self.rtt_cur = Some((start, m.min(srtt))),
+            None => self.rtt_cur = Some((now, srtt)),
+        }
+        let cur = self.rtt_cur.map_or(srtt, |(_, m)| m);
+        self.min_rtt = Some(self.rtt_prev.map_or(cur, |p| p.min(cur)));
+    }
+
     fn current_window(&self) -> u64 {
         if self.collapsed_at == Some(self.cell.epoch()) {
             return MIN_WINDOW_MTUS * self.mtu;
@@ -193,26 +232,36 @@ impl ModelController {
         let Some(min_rtt) = self.min_rtt else {
             return self.initial_window();
         };
-        model_window(
-            self.cell.rate_bytes_per_s(),
-            min_rtt + MAX_ACK_DELAY,
-            self.cell.gain(),
+        let rate = self.cell.rate_bytes_per_s();
+        let eff = min_rtt + MAX_ACK_DELAY;
+        // G x R over the base round trip (a probe: its own rate over it,
+        // which a probe above the link outgrows by design). The base round
+        // trip is a windowed minimum of the smoothed round trip, not quinn's
+        // `min_rtt`, which never rises: after a route change or under a
+        // competitor's standing queue that would hold the flow to
+        // W / srtt << R for the rest of the connection.
+        model_window(rate, eff, self.cell.gain(), self.mtu).max(model_window(
+            self.cell.probe_rate(),
+            eff,
+            1.0,
             self.mtu,
-        )
-        .saturating_add(self.cell.probe_bytes())
+        ))
     }
 }
 
 impl Controller for ModelController {
     fn on_ack(
         &mut self,
-        _now: std::time::Instant,
+        now: std::time::Instant,
         _sent: std::time::Instant,
         _bytes: u64,
         _app_limited: bool,
         rtt: &RttEstimator,
     ) {
-        self.min_rtt = Some(rtt.min());
+        let srtt = rtt.get();
+        self.note_rtt(now, srtt);
+        let min = self.min_rtt.unwrap_or(srtt);
+        self.cell.note_rtts(min, srtt);
     }
 
     fn on_congestion_event(
@@ -340,6 +389,8 @@ mod tests {
             cell: cell.clone(),
             mtu: MTU,
             min_rtt: Some(Duration::from_millis(30)),
+            rtt_cur: None,
+            rtt_prev: None,
             collapsed_at: None,
         }
     }
@@ -361,16 +412,43 @@ mod tests {
     }
 
     #[test]
-    fn an_open_probe_adds_its_whole_cluster_to_the_window() {
+    fn an_open_probe_widens_the_window_to_its_rate_and_no_further() {
         let cell = ModelCell::new(250_000, 2.0);
         let c = controller(&cell);
         assert_eq!(c.window(), 17_500);
-        // A 36 Mbit/s cluster for 100 ms is 450 kB; the rate is the probe's.
-        cell.publish(4_500_000, 2.0, 450_000, false);
-        assert_eq!(c.window(), 315_000 + 450_000);
-        // Closed, the cluster leaves the window.
+        // A 36 Mbit/s cluster (4.5 MB/s): its rate over RTT_eff, no cluster carry.
+        cell.publish(250_000, 2.0, 4_500_000, false);
+        assert_eq!(c.window(), 157_500);
+        // A probe under 2 x the estimate leaves the G x R bound in force.
+        cell.publish(250_000, 2.0, 400_000, false);
+        assert_eq!(c.window(), 17_500);
         cell.publish(250_000, 2.0, 0, false);
         assert_eq!(c.window(), 17_500);
+    }
+
+    /// quinn's `min_rtt` never rises. The base round trip here is the minimum
+    /// of the smoothed round trip over 10 s, so after a route change the
+    /// window follows the new path once the old samples age out. Mutation:
+    /// use `rtt.min()` (never rising) and the last assertion fails.
+    #[test]
+    fn the_base_round_trip_rises_after_ten_seconds() {
+        let cell = ModelCell::new(1_000_000, 2.0);
+        let mut c = controller(&cell);
+        let t0 = std::time::Instant::now();
+        let s = Duration::from_secs;
+        c.note_rtt(t0, Duration::from_millis(10));
+        assert_eq!(c.min_rtt, Some(Duration::from_millis(10)));
+        // The path moves to 80 ms: the old minimum holds for a while ...
+        for k in 1..=8 {
+            c.note_rtt(t0 + s(k), Duration::from_millis(80));
+        }
+        assert_eq!(c.min_rtt, Some(Duration::from_millis(10)));
+        // ... and is gone within the window.
+        for k in 9..=21 {
+            c.note_rtt(t0 + s(k), Duration::from_millis(80));
+        }
+        assert_eq!(c.min_rtt, Some(Duration::from_millis(80)));
+        assert_eq!(c.window(), 2 * 85_000);
     }
 
     #[test]

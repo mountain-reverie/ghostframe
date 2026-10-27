@@ -53,30 +53,31 @@ impl IoBridge {
     /// window count every byte on the wire, so both are divided by the payload
     /// fraction (`countable_to_token_bps`).
     pub(super) fn model_rate_bytes_per_s(&self) -> f64 {
+        let (est, probe) = self.model_rate_parts();
+        est.max(probe)
+    }
+
+    /// The estimate and the open probe's rate (zero with none), each in
+    /// billed bytes per second.
+    fn model_rate_parts(&self) -> (f64, f64) {
         let snap = self.bwe.snapshot();
-        let countable = match &self.active_probe {
-            Some(p) => snap.bitrate_bps.max(p.target_rate_bps),
-            None => snap.bitrate_bps,
-        };
-        pacing::countable_to_token_bps(countable, snap.payload_fraction) as f64 / 8.0
+        let tokens =
+            |bps: u64| pacing::countable_to_token_bps(bps, snap.payload_fraction) as f64 / 8.0;
+        let probe = self
+            .active_probe
+            .as_ref()
+            .map_or(0.0, |p| tokens(p.target_rate_bps));
+        (tokens(snap.bitrate_bps), probe)
     }
 
     /// Write `R_w` and `G` to the cell quinn's controller reads. Called when
     /// the estimate moves (after each estimator update), when a probe window
     /// opens or closes, and when a restart begins.
     pub(super) fn publish_model_window(&mut self, fresh_feedback: bool) {
-        let rate = self.model_rate_bytes_per_s();
-        // The whole open cluster, in billed bytes: see `model_controller`.
-        let probe_bytes = self.active_probe.as_ref().map_or(0.0, |p| {
-            p.min_bytes.max(0) as f64 / self.bwe.snapshot().payload_fraction
-        });
+        let (rate, probe) = self.model_rate_parts();
         let Some(m) = self.model.as_mut() else { return };
-        m.cell.publish(
-            rate as u64,
-            m.restart.gain(),
-            probe_bytes as u64,
-            fresh_feedback,
-        );
+        m.cell
+            .publish(rate as u64, m.restart.gain(), probe as u64, fresh_feedback);
     }
 
     /// Run before an admission pass that has work to send: classify the gap
@@ -159,6 +160,22 @@ impl IoBridge {
         if let Some(m) = self.model.as_mut() {
             m.forfeited += bank_dropped;
         }
+    }
+
+    /// Whether a window-limited pass was limited by load rather than by a
+    /// round trip that has outgrown the window: `srtt <= G x RTT_eff`. Past it
+    /// the flow is held below its rate by `min_rtt` being stale (a route
+    /// change, a competitor's queue), its acknowledged rate says nothing about
+    /// the path, and counting it as saturated would walk the estimate down.
+    pub(super) fn model_window_limit_is_load(&self) -> bool {
+        let Some(m) = self.model.as_ref() else {
+            return false;
+        };
+        m.cell.rtts().is_none_or(|(min, srtt)| {
+            srtt.as_secs_f64()
+                <= m.cell.gain()
+                    * (min + crate::transport::rtt_estimator::MAX_ACK_DELAY).as_secs_f64()
+        })
     }
 
     /// Tokens counted as spent that were forfeited to the window.
@@ -301,18 +318,18 @@ mod tests {
         bridge.publish_model_window(false);
         let f = bridge.bwe.snapshot().payload_fraction;
         assert_eq!(
-            cell.rate_bytes_per_s(),
+            cell.probe_rate(),
             (probe_bps as f64 / f / 8.0) as u64,
-            "R_w is the probe's rate while the window is open"
+            "the window is told the probe's rate separately from the estimate's"
         );
         assert_eq!(
-            cell.probe_bytes(),
-            (75_000.0 / f) as u64,
-            "the window also carries the whole cluster"
+            cell.rate_bytes_per_s(),
+            est,
+            "and the estimate is unchanged"
         );
         let probe = bridge.active_probe.take().expect("open");
         bridge.close_probe_window(probe);
-        assert_eq!(cell.probe_bytes(), 0, "and lets it go");
+        assert_eq!(cell.probe_rate(), 0, "and lets it go");
         assert_eq!(
             cell.rate_bytes_per_s(),
             bridge.model_rate_bytes_per_s() as u64
@@ -443,5 +460,14 @@ mod tests {
         let forfeited = gated.model_forfeited();
         assert!(forfeited > 1_000.0, "the bank was counted ({forfeited} B)");
         assert_eq!(gated.admission.available(), 0, "and dropped");
+
+        // A round trip that has outgrown the window is not load: nothing counted.
+        let mut stale = model_bridge_with_grid().await;
+        queue_two_tiles(&mut stale);
+        stale.forced_fifo_depth_for_test = Some(10_000_000);
+        let cell = stale.model_cell_handle().expect("model");
+        cell.note_rtts(Duration::from_millis(10), Duration::from_millis(80));
+        stale.pump_admission();
+        assert_eq!(stale.model_forfeited(), 0.0, "srtt 80 ms against 2 x 15 ms");
     }
 }
