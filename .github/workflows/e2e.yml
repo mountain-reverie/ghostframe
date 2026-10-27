@@ -138,6 +138,11 @@ jobs:
       # application-limited sender's own rate. The full startup map is the
       # target's #[ignore]d test, run by hand at PR-0, PR-7 and PR-10.
       - run: cargo test --test browserless_bwe_rate_source -- --test-threads=1
+      # D1 PR-8 gates (design A, the model controller): probe clusters fill,
+      # the settled estimate and the queue the window allows, a feedback
+      # blackout, and a capacity drop during an idle. The scenes select the
+      # arm themselves; GF_P8_ARM=cubic runs them on the Cubic path.
+      - run: cargo test --test browserless_model_controller -- --test-threads=1
 
   harness-smoke:
     name: harness-smoke

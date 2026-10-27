@@ -189,6 +189,16 @@ impl AdmissionBucket {
         self.last_refill = Some(now);
     }
 
+    /// Drop whatever is banked, returning the tokens dropped. For a pass the
+    /// depth gate stopped with work waiting: the bank is tokens quinn cannot
+    /// take yet, and banking them would only turn the window's next opening
+    /// into a burst on top of the rate.
+    pub(crate) fn forfeit_bank(&mut self) -> f64 {
+        let dropped = self.tokens.max(0.0);
+        self.tokens -= dropped;
+        dropped
+    }
+
     /// Whole bytes that may be granted right now.
     pub(crate) fn available(&self) -> usize {
         if self.tokens <= 0.0 {
