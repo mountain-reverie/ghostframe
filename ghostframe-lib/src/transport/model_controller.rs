@@ -207,7 +207,7 @@ pub struct ModelController {
 }
 
 /// The span the base round trip is the minimum over (BBR's `RTprop` window).
-const RTT_WINDOW: Duration = Duration::from_secs(10);
+const RTT_WINDOW: Duration = Duration::from_secs(3);
 
 impl ModelController {
     /// Fold one smoothed-round-trip reading into the windowed minimum.
@@ -431,23 +431,25 @@ mod tests {
     /// window follows the new path once the old samples age out. Mutation:
     /// use `rtt.min()` (never rising) and the last assertion fails.
     #[test]
-    fn the_base_round_trip_rises_after_ten_seconds() {
+    fn the_base_round_trip_rises_after_the_window() {
         let cell = ModelCell::new(1_000_000, 2.0);
         let mut c = controller(&cell);
         let t0 = std::time::Instant::now();
-        let s = Duration::from_secs;
-        c.note_rtt(t0, Duration::from_millis(10));
-        assert_eq!(c.min_rtt, Some(Duration::from_millis(10)));
-        // The path moves to 80 ms: the old minimum holds for a while ...
-        for k in 1..=8 {
-            c.note_rtt(t0 + s(k), Duration::from_millis(80));
+        let ms = Duration::from_millis;
+        let w = RTT_WINDOW.as_millis() as u64;
+        c.note_rtt(t0, ms(10));
+        assert_eq!(c.min_rtt, Some(ms(10)));
+        // The path moves to 80 ms: the old minimum holds for under half the
+        // window (one bucket) ...
+        for k in 1..=4 {
+            c.note_rtt(t0 + ms(k * w / 10), ms(80));
         }
-        assert_eq!(c.min_rtt, Some(Duration::from_millis(10)));
-        // ... and is gone within the window.
-        for k in 9..=21 {
-            c.note_rtt(t0 + s(k), Duration::from_millis(80));
+        assert_eq!(c.min_rtt, Some(ms(10)));
+        // ... and is gone within two windows.
+        for k in 5..=20 {
+            c.note_rtt(t0 + ms(k * w / 10), ms(80));
         }
-        assert_eq!(c.min_rtt, Some(Duration::from_millis(80)));
+        assert_eq!(c.min_rtt, Some(ms(80)));
         assert_eq!(c.window(), 2 * 85_000);
     }
 
