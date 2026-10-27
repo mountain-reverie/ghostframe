@@ -34,9 +34,16 @@ impl IoBridge {
     /// knob production-inert — so existing call sites are unaffected. Tests
     /// that need a specific config should call
     /// `new_with_lib_config_for_test` instead.
+    ///
+    /// The controller is Cubic here, whatever production defaults to: the
+    /// browserless harness picks the arm itself (`RunOptions::congestion`,
+    /// `use_model_controller_for_test`), and the unit tests built on this
+    /// constructor predate the model controller.
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn new_with_stream_for_test(stream: TokioUnixStream, server: QuicServer) -> Self {
-        Self::new_with_lib_config_for_test(stream, server, crate::config::LibConfig::default())
+        let mut cfg = crate::config::LibConfig::default();
+        cfg.transport.congestion = crate::config::CongestionMode::Cubic;
+        Self::new_with_lib_config_for_test(stream, server, cfg)
     }
 
     /// Test-only constructor taking a full `LibConfig`, for tests that need

@@ -43,9 +43,23 @@ use std::time::Duration;
 
 use ghostframe_client_net::ClientNetEvent;
 use ghostframe_e2e::harness::browserless::{
-    run_browserless, BrowserlessResult, BrowserlessScene, FrameScript, SceneLoad,
-    DEFAULT_CADENCE_US,
+    BrowserlessResult, BrowserlessScene, FrameScript, SceneLoad, DEFAULT_CADENCE_US,
 };
+
+/// These gates read the Cubic arm's mechanics (its queue clocks, its send
+/// buffer behaviour, its capacity-step response), so they run on it.
+async fn run_browserless(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult> {
+    let links = ghostframe_e2e::harness::browserless::LinkOverrides::from_burst_env(&scene.net);
+    ghostframe_e2e::harness::browserless::run_browserless_with_options(
+        scene,
+        links,
+        ghostframe_e2e::harness::browserless::RunOptions {
+            congestion: Some(ghostframe_lib::config::CongestionMode::Cubic),
+            ..Default::default()
+        },
+    )
+    .await
+}
 use ghostframe_e2e::harness::load_profile::gradient_tile;
 use ghostframe_e2e::harness::scene_tiles::TileSpec;
 use ghostframe_e2e::netsim::{Bottleneck, CapTimeline, NetProfile};
