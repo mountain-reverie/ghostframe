@@ -207,7 +207,7 @@ pub struct ModelController {
 }
 
 /// The span the base round trip is the minimum over (BBR's `RTprop` window).
-const RTT_WINDOW: Duration = Duration::from_secs(3);
+pub const RTT_WINDOW: Duration = Duration::from_secs(3);
 
 impl ModelController {
     /// Fold one smoothed-round-trip reading into the windowed minimum.
@@ -297,6 +297,72 @@ impl Controller for ModelController {
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
         self
+    }
+}
+
+/// A base round trip that rose, and the estimate it cost.
+///
+/// While the old minimum is in the window the flow is held to `W / srtt`, so
+/// the acknowledged rate says nothing about the path, and goog_cc, which takes
+/// the delay step for overuse and cuts to 0.85 x that rate, learns nothing
+/// either. This remembers the largest rate the path acknowledged before the
+/// flow went stale, and when the window has re-learned a higher base round
+/// trip continues the estimate from it. The acknowledged rate, not the
+/// estimate before: that one overshoots the link (goog_cc probes above it) and
+/// restoring it builds a queue the delay detector then, rightly, cuts. Not when the flow merely
+/// stopped being stale because a queue drained: the base did not rise, and the
+/// cut was the answer to that queue.
+#[derive(Debug, Default)]
+pub(crate) struct BaseRise {
+    /// Largest acknowledged rate seen while not stale: two buckets of
+    /// `RTT_WINDOW / 2`, like the base round trip itself.
+    cur: Option<(Instant, u64)>,
+    prev: Option<u64>,
+    /// `(peak, base round trip)` at the moment the flow went stale.
+    frozen: Option<(u64, Duration)>,
+}
+
+/// How much the base must rise for the estimate before it to be restored: the
+/// standing-queue test's own ratio, since a base that rose by less is a queue.
+const BASE_RISE_RATIO: f64 = 1.25;
+
+impl BaseRise {
+    /// One estimator feedback: the estimate and the acknowledged rate (payload
+    /// bit/s), whether the window is stale (`srtt > G x RTT_eff`) and the base
+    /// round trip. Returns the estimate to continue from, when the base has
+    /// risen and the estimate is under what the path carried before.
+    pub(crate) fn on_feedback(
+        &mut self,
+        now: Instant,
+        est_bps: u64,
+        acked_bps: u64,
+        stale: bool,
+        base: Duration,
+    ) -> Option<u64> {
+        if stale {
+            if self.frozen.is_none() {
+                let peak = self.cur.map(|(_, m)| m).max(self.prev);
+                self.frozen = peak.map(|p| (p, base));
+            }
+            return None;
+        }
+        let mut restore = None;
+        if let Some((peak, base0)) = self.frozen.take() {
+            if base.as_secs_f64() > BASE_RISE_RATIO * base0.as_secs_f64() && est_bps < peak {
+                restore = Some(peak);
+            }
+            self.cur = None;
+            self.prev = None;
+        }
+        match self.cur {
+            Some((start, _)) if now.saturating_duration_since(start) >= RTT_WINDOW / 2 => {
+                self.prev = self.cur.map(|(_, m)| m);
+                self.cur = Some((now, acked_bps));
+            }
+            Some((start, m)) => self.cur = Some((start, m.max(acked_bps))),
+            None => self.cur = Some((now, acked_bps)),
+        }
+        restore
     }
 }
 
@@ -451,6 +517,49 @@ mod tests {
         }
         assert_eq!(c.min_rtt, Some(ms(80)));
         assert_eq!(c.window(), 2 * 85_000);
+    }
+
+    #[test]
+    fn a_base_that_rose_restores_the_estimate_from_before_the_flow_went_stale() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut b = BaseRise::default();
+        for i in 0..20 {
+            assert_eq!(
+                b.on_feedback(t0 + ms(i * 50), 9_000_000, 8_000_000, false, ms(10)),
+                None
+            );
+        }
+        // Stale, and cut: nothing is learned from it, nothing is restored.
+        for i in 20..60 {
+            assert_eq!(
+                b.on_feedback(t0 + ms(i * 50), 1_000_000, 900_000, true, ms(10)),
+                None
+            );
+        }
+        // The base rose: the peak from before comes back, once.
+        assert_eq!(
+            b.on_feedback(t0 + ms(3_000), 1_000_000, 900_000, false, ms(75)),
+            Some(8_000_000)
+        );
+        assert_eq!(
+            b.on_feedback(t0 + ms(3_050), 1_000_000, 900_000, false, ms(75)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_queue_that_drained_restores_nothing() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut b = BaseRise::default();
+        b.on_feedback(t0, 9_000_000, 8_000_000, false, ms(10));
+        b.on_feedback(t0 + ms(50), 2_000_000, 1_900_000, true, ms(10));
+        // Not stale again, base unchanged: the cut was the answer to a queue.
+        assert_eq!(
+            b.on_feedback(t0 + ms(500), 2_000_000, 1_900_000, false, ms(10)),
+            None
+        );
     }
 
     #[test]

@@ -233,6 +233,11 @@ impl BweWrapper {
         }
     }
 
+    /// Continue the estimate from `bps` after the base round trip rose.
+    pub fn restore_from(&mut self, now: Instant, bps: u64) {
+        self.driver.restore_from(now, bps);
+    }
+
     /// Continue the estimate from `bps` (an idle restart's cold start).
     pub fn restart_from(&mut self, now: Instant, bps: u64) {
         self.driver.restart_from(now, bps);
