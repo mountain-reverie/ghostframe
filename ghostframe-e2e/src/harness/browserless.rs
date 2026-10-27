@@ -1014,9 +1014,7 @@ async fn run_inner(
     bridge.set_ignore_tile_nacks(opts.ignore_client_nacks);
     bridge.set_tile_fec(opts.tile_fec);
     let env_transport = ghostframe_lib::config::TransportConfig::from_env();
-    if opts
-        .congestion
-        .unwrap_or(env_transport.congestion)
+    if opts.congestion.unwrap_or(env_transport.congestion)
         == ghostframe_lib::config::CongestionMode::Model
     {
         bridge.use_model_controller_for_test(opts.model.unwrap_or(env_transport.model));
