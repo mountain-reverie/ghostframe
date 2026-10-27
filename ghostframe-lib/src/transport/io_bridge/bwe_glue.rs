@@ -310,6 +310,10 @@ pub(super) struct ActiveProbe {
     pub(super) bytes_sent: i64,
     /// Cumulative tagged packets so far, for the min-probes check at close.
     pub(super) packets_sent: i64,
+    /// When the window opened, for its length at close.
+    pub(super) opened_at: std::time::Instant,
+    /// An admission pass inside the window ran out of work.
+    pub(super) starved: bool,
 }
 
 /// One-way-delay sample observed at ACK time. Used as input to the
@@ -452,6 +456,8 @@ impl IoBridge {
             min_bytes: req.min_bytes,
             bytes_sent: 0,
             packets_sent: 0,
+            opened_at: now,
+            starved: false,
         });
         // The window must carry the probe, or quinn clips the cluster.
         self.publish_model_window(false);
@@ -481,6 +487,20 @@ impl IoBridge {
     /// bug — no padding is ever sent to force completion.
     pub(super) fn close_probe_window(&mut self, probe: ActiveProbe) {
         self.publish_model_window(false);
+        let n = self.instr.probe_windows_closed as usize;
+        if let Some(slot) = self.instr.probe_windows.get_mut(n) {
+            *slot = crate::transport::instruments::ProbeWindow {
+                target_bps: probe.target_rate_bps,
+                duration_us: probe
+                    .ends_at
+                    .saturating_duration_since(probe.opened_at)
+                    .as_micros() as u64,
+                bytes_sent: probe.bytes_sent.max(0) as u64,
+                packets_sent: probe.packets_sent.max(0) as u64,
+                starved: probe.starved,
+            };
+        }
+        self.instr.probe_windows_closed += 1;
         if probe.packets_sent >= probe.min_probes && probe.bytes_sent >= probe.min_bytes {
             self.probes_completed += 1;
             tracing::debug!(

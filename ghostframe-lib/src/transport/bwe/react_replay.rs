@@ -148,12 +148,7 @@ fn run(k: f64, idle_us: u64, restart_gain: f64) -> Outcome {
         } else {
             2.0
         };
-        let w = model_window(
-            rate_bytes as u64,
-            BASE_RTT + MAX_ACK_DELAY,
-            gain,
-            MTU,
-        );
+        let w = model_window(rate_bytes as u64, BASE_RTT + MAX_ACK_DELAY, gain, MTU);
         if resumed {
             peak_rate = peak_rate.max(snap.bitrate_bps);
         }
@@ -191,7 +186,11 @@ fn run(k: f64, idle_us: u64, restart_gain: f64) -> Outcome {
 /// the window gain `G = 1` of a restart: warm 0.29 s (`k = 10`) and 0.14 s
 /// (`k = 4`); cold 0.41 s and 0.20 s. The test asserts them doubled.
 fn bound_us(k: f64, cold: bool) -> u64 {
-    let (warm, cold_b) = if k > 6.0 { (290_000, 410_000) } else { (140_000, 200_000) };
+    let (warm, cold_b) = if k > 6.0 {
+        (290_000, 410_000)
+    } else {
+        (140_000, 200_000)
+    };
     2 * if cold { cold_b } else { warm }
 }
 
@@ -220,8 +219,7 @@ fn check(k: f64, idle_us: u64) {
     // at k = 4), and the window follows it.
     let rtt_eff_s = (BASE_RTT + MAX_ACK_DELAY).as_secs_f64();
     let r_peak = o.peak_rate_bps as f64 / 8.0;
-    let queue_bound_us =
-        ((2.0 * r_peak / C_BPS - 1.0) * rtt_eff_s * 1e6) as u64 + 2 * FLUSH_US;
+    let queue_bound_us = ((2.0 * r_peak / C_BPS - 1.0) * rtt_eff_s * 1e6) as u64 + 2 * FLUSH_US;
     assert!(
         o.peak_queue_us <= queue_bound_us,
         "k={k}: queue {} ms exceeds the window's bound {} ms",
@@ -233,9 +231,12 @@ fn check(k: f64, idle_us: u64) {
         "premise: the stale estimate built a queue ({} ms)",
         o.peak_queue_us / 1000
     );
-    let t = o
-        .t_react_us
-        .unwrap_or_else(|| panic!("k={k} idle={idle_us}: the estimate was never cut: {o:?}", o = o.final_bps));
+    let t = o.t_react_us.unwrap_or_else(|| {
+        panic!(
+            "k={k} idle={idle_us}: the estimate was never cut: {o:?}",
+            o = o.final_bps
+        )
+    });
     assert!(
         t <= bound_us(k, cold),
         "k={k} cold={cold}: T_react {} ms exceeds the doubled section 6.6 bound {} ms",

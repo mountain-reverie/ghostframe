@@ -379,6 +379,40 @@ pub enum BudgetTerm {
     Probe,
 }
 
+/// Windows `InstrumentSummary::probe_windows` keeps.
+pub(crate) const PROBE_WINDOWS_KEPT: usize = 32;
+
+/// One closed probe window: what goog_cc asked for and what the sender put on
+/// the way.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeWindow {
+    /// Requested rate, bits per second of countable bytes.
+    pub target_bps: u64,
+    /// The window's length.
+    pub duration_us: u64,
+    /// Tagged bytes handed to quinn inside it.
+    pub bytes_sent: u64,
+    /// Tagged datagrams handed to quinn inside it.
+    pub packets_sent: u64,
+    /// An admission pass inside the window found nothing left to send: the
+    /// frame was smaller than the cluster, so a short fill says nothing about
+    /// the rate. A window that was never starved had backlog throughout.
+    pub starved: bool,
+}
+
+impl ProbeWindow {
+    /// Bytes sent over bytes requested (`target x duration`). 1.0 is a full
+    /// cluster.
+    pub fn fill(&self) -> f64 {
+        let want = self.target_bps as f64 / 8.0 * self.duration_us as f64 / 1e6;
+        if want > 0.0 {
+            self.bytes_sent as f64 / want
+        } else {
+            0.0
+        }
+    }
+}
+
 /// The model controller (D1 design A) as a scene sees it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ModelProbe {
@@ -664,6 +698,10 @@ pub struct InstrumentSummary {
     pub hint_unbounded: u64,
     /// The model controller's counters (`active` is false under Cubic).
     pub model: ModelProbe,
+    /// The first `PROBE_WINDOWS_KEPT` probe windows to close, in order.
+    pub probe_windows: [ProbeWindow; PROBE_WINDOWS_KEPT],
+    /// Windows closed, which can exceed the number kept.
+    pub probe_windows_closed: u64,
     /// The estimator wrapper's own counters.
     pub bwe: crate::transport::bwe::BweStats,
     /// Per-transmission delivery-rate samples (PR-6b): the latest sample and

@@ -540,6 +540,14 @@ impl IoBridge {
             }
         }
         out.admitted = (self.instr.admission.datagrams_admitted - admitted_before) as usize;
+        // A pass that ran out of work before the cluster was full: the frame
+        // was smaller than the probe, and a short fill says nothing about the
+        // rate.
+        if stop == Stop::Empty {
+            if let Some(p) = self.active_probe.as_mut() {
+                p.starved |= p.bytes_sent < p.min_bytes;
+            }
+        }
         // What the bucket granted and what was spent of it, for the estimate
         // ceiling: it applies only to a sender that used its grant.
         self.bwe.note_admission(

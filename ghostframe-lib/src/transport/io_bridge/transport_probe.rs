@@ -111,6 +111,9 @@ pub(super) struct Instruments {
     pub(super) hint_feeds: u64,
     pub(super) hint_feeds_before_feedback: u64,
     pub(super) hint_unbounded: u64,
+    pub(super) probe_windows: [crate::transport::instruments::ProbeWindow;
+        crate::transport::instruments::PROBE_WINDOWS_KEPT],
+    pub(super) probe_windows_closed: u64,
     /// Idle restarts, by kind (model controller).
     pub(super) model_restarts_hold: u64,
     pub(super) model_restarts_cold: u64,
@@ -460,6 +463,8 @@ impl IoBridge {
             hint_feeds_before_feedback: i.hint_feeds_before_feedback,
             hint_unbounded: i.hint_unbounded,
             model: self.model_probe(),
+            probe_windows: i.probe_windows,
+            probe_windows_closed: i.probe_windows_closed,
             bwe: self.bwe.snapshot().stats,
             delivery: self.delivery_sampler.stats(super::now_std()),
         }

@@ -61,9 +61,17 @@ impl IoBridge {
     /// opens or closes, and when a restart begins.
     pub(super) fn publish_model_window(&mut self, fresh_feedback: bool) {
         let rate = self.model_rate_bytes_per_s();
+        // The whole open cluster, in billed bytes: see `model_controller`.
+        let probe_bytes = self.active_probe.as_ref().map_or(0.0, |p| {
+            p.min_bytes.max(0) as f64 / self.bwe.snapshot().payload_fraction
+        });
         let Some(m) = self.model.as_mut() else { return };
-        m.cell
-            .publish(rate as u64, m.restart.gain(), fresh_feedback);
+        m.cell.publish(
+            rate as u64,
+            m.restart.gain(),
+            probe_bytes as u64,
+            fresh_feedback,
+        );
     }
 
     /// Run before an admission pass that has work to send: classify the gap
@@ -87,39 +95,35 @@ impl IoBridge {
 
     /// `model_before_admission` once there is work: the policy and its effect.
     pub(super) fn model_restart_at(&mut self, now: std::time::Instant) {
-        let held_bps = self.bwe.snapshot().bitrate_bps;
-        let samples = self.bwe.snapshot().samples_seen;
+        let snap = self.bwe.snapshot();
         let Some(m) = self.model.as_mut() else { return };
+        let resume = m.restart.on_send(now);
+        if resume == Resume::No {
+            return;
+        }
         // Before the first feedback there is no validated rate to hold: the
         // startup ladder is the policy there.
-        let resume = match m.restart.on_send(now) {
-            Resume::No => return,
-            _ if samples == 0 => {
-                m.restart.on_feedback();
-                return;
-            }
-            r @ (Resume::Hold | Resume::Cold) => r,
-        };
+        if snap.samples_seen == 0 {
+            m.restart.on_feedback();
+            return;
+        }
+        let held_bps = snap.bitrate_bps;
         let cold_bps = m
             .restart
             .cold_rate_bps(held_bps, crate::transport::bwe::BweWrapper::INITIAL_BPS);
-        match resume {
-            Resume::Hold => {
-                self.instr.model_restarts_hold += 1;
-                tracing::debug!(target: LOG_TARGET, held_bps, "model: restart, holding the rate");
+        if resume == Resume::Cold {
+            self.instr.model_restarts_cold += 1;
+            tracing::debug!(
+                target: LOG_TARGET, held_bps, cold_bps,
+                "model: cold restart, resuming from a fraction of the held rate"
+            );
+            // A held rate under the cold one is not raised.
+            if cold_bps < held_bps {
+                self.bwe.restart_from(now, cold_bps);
             }
-            Resume::Cold => {
-                self.instr.model_restarts_cold += 1;
-                tracing::debug!(
-                    target: LOG_TARGET, held_bps, cold_bps,
-                    "model: cold restart, resuming from a fraction of the held rate"
-                );
-                // A held rate under the cold one is not raised.
-                if cold_bps < held_bps {
-                    self.bwe.restart_from(now, cold_bps);
-                }
-            }
-            Resume::No => {}
+        } else {
+            self.instr.model_restarts_hold += 1;
+            tracing::debug!(target: LOG_TARGET, held_bps, "model: restart, holding the rate");
         }
         self.publish_model_window(false);
     }
@@ -213,7 +217,10 @@ mod tests {
         bridge.set_tick_budget_floor_bytes(1_200);
         bridge.apply_path_stats_snapshot(12_000, 333_000.0);
         let snap = bridge.bwe.snapshot();
-        assert_eq!(snap.bitrate_bps, crate::transport::bwe::BweWrapper::INITIAL_BPS);
+        assert_eq!(
+            snap.bitrate_bps,
+            crate::transport::bwe::BweWrapper::INITIAL_BPS
+        );
         let rate = bridge.admission_rate();
         let expect = snap.bitrate_bps as f64 / 8.0 / snap.payload_fraction;
         assert!(
@@ -255,9 +262,11 @@ mod tests {
             target_rate_bps: probe_bps,
             ends_at: t0 + Duration::from_secs(1),
             min_probes: 1,
-            min_bytes: 1,
+            min_bytes: 75_000,
             bytes_sent: 0,
             packets_sent: 0,
+            opened_at: t0,
+            starved: false,
         });
         bridge.publish_model_window(false);
         let f = bridge.bwe.snapshot().payload_fraction;
@@ -266,9 +275,18 @@ mod tests {
             (probe_bps as f64 / f / 8.0) as u64,
             "R_w is the probe's rate while the window is open"
         );
+        assert_eq!(
+            cell.probe_bytes(),
+            (75_000.0 / f) as u64,
+            "the window also carries the whole cluster"
+        );
         let probe = bridge.active_probe.take().expect("open");
         bridge.close_probe_window(probe);
-        assert_eq!(cell.rate_bytes_per_s(), bridge.model_rate_bytes_per_s() as u64);
+        assert_eq!(cell.probe_bytes(), 0, "and lets it go");
+        assert_eq!(
+            cell.rate_bytes_per_s(),
+            bridge.model_rate_bytes_per_s() as u64
+        );
         assert!(cell.rate_bytes_per_s() < 1_000_000, "back to the estimate");
     }
 
@@ -282,7 +300,9 @@ mod tests {
         let t0 = now_std();
         feed(&mut bridge, t0 + Duration::from_millis(20));
         // A validated 40 Mbit/s: the estimator continues from it.
-        bridge.bwe.restart_from(t0 + Duration::from_millis(30), 40_000_000);
+        bridge
+            .bwe
+            .restart_from(t0 + Duration::from_millis(30), 40_000_000);
         let held = bridge.bwe.snapshot().bitrate_bps;
         assert!(held > 30_000_000, "premise: a high held rate ({held})");
         let cell = bridge.model_cell_handle().expect("model");
@@ -291,14 +311,21 @@ mod tests {
         // Steady sending: no restart.
         sent(&mut bridge, t0 + Duration::from_millis(40));
         sent(&mut bridge, t0 + Duration::from_millis(73));
-        assert_eq!(bridge.model_probe().restarts_hold + bridge.model_probe().restarts_cold, 0);
+        assert_eq!(
+            bridge.model_probe().restarts_hold + bridge.model_probe().restarts_cold,
+            0
+        );
         assert_eq!(cell.gain(), 2.0);
 
         // A 1 s idle: the rate is held, the gain drops.
         sent(&mut bridge, t0 + Duration::from_millis(1_073));
         let p = bridge.model_probe();
         assert_eq!((p.restarts_hold, p.restarts_cold), (1, 0));
-        assert_eq!(bridge.bwe.snapshot().bitrate_bps, held, "held through a short idle");
+        assert_eq!(
+            bridge.bwe.snapshot().bitrate_bps,
+            held,
+            "held through a short idle"
+        );
         assert_eq!(cell.gain(), 1.0, "restart gain until feedback");
         feed(&mut bridge, t0 + Duration::from_millis(1_110));
         assert_eq!(cell.gain(), 2.0, "feedback ends the restart");

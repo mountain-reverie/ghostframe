@@ -9,8 +9,12 @@
 //! ```
 //!
 //! `R_w` is the rate the window must be able to carry: the estimate, or a
-//! probe cluster's rate while one is open, so that a probe is never clipped by
-//! the window. `G` (2 by default) is slack for the ack clock and for the
+//! probe cluster's rate while one is open. A probe more than about twice the
+//! link also builds a queue that outgrows `G x R_w x RTT_eff` before its
+//! window closes (the round trip it is held against is the minimum, not the
+//! one the probe causes), so while a cluster is open the window also carries
+//! the whole cluster (`probe_bytes`): a probe is never clipped by the window.
+//! `G` (2 by default) is slack for the ack clock and for the
 //! estimate rising between two updates; it is also what bounds the bottleneck
 //! queue a wrong estimate can build, to about `(G x R_w / C - 1) x RTT_eff`.
 //!
@@ -90,6 +94,8 @@ pub struct ModelCell {
     rate_bytes_per_s: AtomicU64,
     /// `G`, thousandths.
     gain_milli: AtomicU32,
+    /// Bytes of the open probe cluster, wire bytes; zero with no cluster open.
+    probe_bytes: AtomicU64,
     /// Bumped by every publish that follows estimator feedback. A collapse
     /// lasts until it moves.
     feedback_epoch: AtomicU64,
@@ -104,6 +110,7 @@ impl ModelCell {
         Arc::new(Self {
             rate_bytes_per_s: AtomicU64::new(rate_bytes_per_s),
             gain_milli: AtomicU32::new(gain_to_milli(gain)),
+            probe_bytes: AtomicU64::new(0),
             feedback_epoch: AtomicU64::new(0),
             persistent: AtomicU64::new(0),
             peak_in_flight: AtomicU64::new(0),
@@ -114,7 +121,14 @@ impl ModelCell {
 
     /// Write `R_w` and `G`. `fresh_feedback` is true when the estimator has
     /// just heard feedback (a persistent-congestion collapse ends there).
-    pub fn publish(&self, rate_bytes_per_s: u64, gain: f64, fresh_feedback: bool) {
+    pub fn publish(
+        &self,
+        rate_bytes_per_s: u64,
+        gain: f64,
+        probe_bytes: u64,
+        fresh_feedback: bool,
+    ) {
+        self.probe_bytes.store(probe_bytes, Ordering::Relaxed);
         self.rate_bytes_per_s
             .store(rate_bytes_per_s, Ordering::Relaxed);
         self.gain_milli
@@ -126,6 +140,10 @@ impl ModelCell {
 
     pub fn rate_bytes_per_s(&self) -> u64 {
         self.rate_bytes_per_s.load(Ordering::Relaxed)
+    }
+
+    pub fn probe_bytes(&self) -> u64 {
+        self.probe_bytes.load(Ordering::Relaxed)
     }
 
     pub fn gain(&self) -> f64 {
@@ -200,6 +218,7 @@ impl ModelController {
             self.cell.gain(),
             self.mtu,
         )
+        .saturating_add(self.cell.probe_bytes())
     }
 }
 
@@ -366,18 +385,31 @@ mod tests {
         let cell = ModelCell::new(250_000, 2.0);
         let c = controller(&cell);
         assert_eq!(c.window(), 17_500);
-        cell.publish(2_500_000, 2.0, true);
+        cell.publish(2_500_000, 2.0, 0, true);
         assert_eq!(c.window(), 175_000);
         // And the gain: the same rate at G = 1 is half.
-        cell.publish(2_500_000, 1.0, true);
+        cell.publish(2_500_000, 1.0, 0, true);
         assert_eq!(c.window(), 87_500);
+    }
+
+    #[test]
+    fn an_open_probe_adds_its_whole_cluster_to_the_window() {
+        let cell = ModelCell::new(250_000, 2.0);
+        let c = controller(&cell);
+        assert_eq!(c.window(), 17_500);
+        // A 36 Mbit/s cluster for 100 ms is 450 kB; the rate is the probe's.
+        cell.publish(4_500_000, 2.0, 450_000, false);
+        assert_eq!(c.window(), 315_000 + 450_000);
+        // Closed, the cluster leaves the window.
+        cell.publish(250_000, 2.0, 0, false);
+        assert_eq!(c.window(), 17_500);
     }
 
     #[test]
     fn the_window_never_falls_below_four_datagrams() {
         let cell = ModelCell::new(1, 2.0);
         assert_eq!(controller(&cell).window(), 4 * MTU);
-        cell.publish(0, 2.0, false);
+        cell.publish(0, 2.0, 0, false);
         assert_eq!(controller(&cell).window(), 4 * MTU);
         // A rate that would overflow saturates rather than wrapping.
         assert_eq!(
@@ -421,10 +453,10 @@ mod tests {
 
         // A new rate without feedback behind it does not end the collapse
         // (a probe opening, an idle restart) ...
-        cell.publish(5_000_000, 2.0, false);
+        cell.publish(5_000_000, 2.0, 0, false);
         assert_eq!(c.window(), 4 * MTU);
         // ... the estimator hearing feedback does.
-        cell.publish(2_000_000, 2.0, true);
+        cell.publish(2_000_000, 2.0, 0, true);
         assert!(c.window() > 4 * MTU, "feedback restores the window");
         assert_eq!(
             c.window(),
