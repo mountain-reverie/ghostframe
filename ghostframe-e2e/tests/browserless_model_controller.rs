@@ -730,8 +730,9 @@ async fn p8c_a_feedback_blackout_leaves_the_window_binding_and_the_session_recov
 /// Tailscale direct path falling back to DERP; a competitor's standing queue
 /// looks the same to quinn's minimum round trip). The estimate must stay at
 /// 0.6 x the link (payload units) or more at the end, and must come back:
-/// 0.6 x the link within 10 s (the round-trip window) plus `T_up` of the
-/// step, and stay above 0.5 x thereafter.
+/// 0.6 x the link within 3 s (the round-trip window) plus `T_up` of the
+/// step, and stay above 0.5 x thereafter, on each of five seeds; the median
+/// over the seeds of the settled level after the step is at least 0.6.
 ///
 /// quinn's `min_rtt` never rises, so a window of `G x R x (min_rtt + 5 ms)`
 /// holds the flow to `W / srtt` = `R x 2 x 10 / 80` = a quarter of `R`; with
@@ -742,6 +743,27 @@ async fn p8c_a_feedback_blackout_leaves_the_window_binding_and_the_session_recov
 /// pass) and the estimate collapses.
 #[tokio::test(start_paused = true)]
 async fn p8e_the_estimate_survives_a_rising_round_trip() {
+    // Chaotic scene: per seed, the estimate must come back and stay (no
+    // collapse); the settled level is a property of the five seeds, not of
+    // each (one seed's median after the step sat at 0.64 with the 3 s window).
+    let mut afters = Vec::new();
+    for i in 0..5u64 {
+        afters.push(p8e_run(0xB8E0_0001 ^ (i << 8)).await);
+    }
+    afters.sort_by(f64::total_cmp);
+    let pooled = afters[afters.len() / 2];
+    p8(
+        "p8e",
+        "median_of_seed_medians_after_over_link",
+        format!("{pooled:.3}"),
+    );
+    assert!(
+        pooled >= 0.6,
+        "median over seeds {pooled:.3} of the link after the step ({afters:?})"
+    );
+}
+
+async fn p8e_run(seed: u64) -> f64 {
     const CAP_MBIT: u64 = 10;
     let secs = 40;
     let step_at = 10 * S;
@@ -753,7 +775,7 @@ async fn p8e_the_estimate_survives_a_rising_round_trip() {
     let name = "p8e";
     let r = run_frames(
         Spec::new(
-            0xB8E0_0001,
+            seed,
             NetProfile {
                 delay_us: 5_000,
                 delay_steps: vec![(step_at, 75_000)],
@@ -786,7 +808,7 @@ async fn p8e_the_estimate_survives_a_rising_round_trip() {
             / link
     };
     // The step reads as overuse, and the window holds the flow to W / srtt
-    // until the old round trips age out of the 10 s minimum: the estimate
+    // until the old round trips age out of the 3 s minimum: the estimate
     // dips. The gate is that it comes back, within the window plus `T_up`,
     // and stays.
     let t_low = cc::window(s, step_at, end)
@@ -808,7 +830,8 @@ async fn p8e_the_estimate_survives_a_rising_round_trip() {
         "premise: {before:.3} of the link before the step"
     );
     let back = recovered.expect("the estimate never came back to 0.6 of the link");
-    let bound = 10 * S + T_UP_US;
+    // The model controller's round-trip window (`RTT_WINDOW`, 3 s) plus `T_up`.
+    let bound = 3 * S + T_UP_US;
     assert!(
         back <= bound,
         "estimate back at 0.6 x link after {} ms, bound {} ms",
@@ -825,7 +848,7 @@ async fn p8e_the_estimate_survives_a_rising_round_trip() {
         lowest >= 0.5,
         "estimate fell back to {lowest:.3} of the link"
     );
-    assert!(after >= 0.6, "median {after:.3} of the link after the step");
+    after
 }
 
 // ---------------------------------------------------------------------------
