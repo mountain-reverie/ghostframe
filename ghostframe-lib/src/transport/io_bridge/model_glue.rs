@@ -27,6 +27,10 @@ pub(super) struct ModelGlue {
     pub(super) restart: RestartPolicy,
     /// Persistent-congestion events already reported to the log.
     pub(super) persistent_seen: u64,
+    /// Tokens the bucket held when the depth gate stopped a pass with work
+    /// waiting, cumulative. Counted as spent where the estimate ceiling asks
+    /// whether the sender used its grant (see `model_note_gated_pass`).
+    pub(super) forfeited: f64,
 }
 
 impl ModelGlue {
@@ -35,6 +39,7 @@ impl ModelGlue {
             cell,
             restart: RestartPolicy::new(settings),
             persistent_seen: 0,
+            forfeited: 0.0,
         }
     }
 }
@@ -134,6 +139,31 @@ impl IoBridge {
         let Some(m) = self.model.as_mut() else { return };
         m.restart.on_feedback();
         self.publish_model_window(true);
+    }
+
+    /// A pass ended with quinn holding all it will take (the depth gate) and
+    /// work still waiting: the window, not the rate, limited the sender.
+    ///
+    /// The estimate ceiling bounds the estimate by what the path acknowledged,
+    /// but only for a sender that used its grant: acknowledgements of a sender
+    /// with nothing to send describe the sender. A sender held back by its own
+    /// window is not that sender, it had more to send than it was allowed to,
+    /// and its acknowledged rate is the path's answer. Left to read as "spent
+    /// under nine tenths of the grant" it kept a stale estimate (4.7 Mbit/s on
+    /// a 2 Mbit/s link) for as long as the window held the flow at the link
+    /// rate, because the delay detector sees a flat queue as no trend.
+    ///
+    /// So the tokens the bank held at the stop count as spent, and are dropped
+    /// from the bank, since quinn could not take them.
+    pub(super) fn model_note_gated_pass(&mut self, bank_dropped: f64) {
+        if let Some(m) = self.model.as_mut() {
+            m.forfeited += bank_dropped;
+        }
+    }
+
+    /// Tokens counted as spent that were forfeited to the window.
+    pub(super) fn model_forfeited(&self) -> f64 {
+        self.model.as_ref().map_or(0.0, |m| m.forfeited)
     }
 
     /// Report persistent congestion the controller counted since the last
@@ -353,5 +383,65 @@ mod tests {
         let p = bridge.model_probe();
         assert_eq!((p.restarts_hold, p.restarts_cold), (0, 0));
         assert_eq!(bridge.model_cell_handle().unwrap().gain(), 2.0);
+    }
+
+    fn queue_two_tiles(bridge: &mut IoBridge) {
+        use crate::transport::protocol::Codec;
+        use crate::transport::scheduler::{TileWork, WorkState};
+        for (tile_x, tile_y) in [(0u8, 0u8), (1, 0)] {
+            bridge.scheduler.enqueue(TileWork {
+                tile_x,
+                tile_y,
+                generation: 0,
+                pass_idx: 0,
+                total_passes: 1,
+                codec: Codec::Solid,
+                payload: vec![10, 20, 30, 255],
+                queued_at: now_std(),
+                last_sent_at: None,
+                state: WorkState::Pending,
+            });
+        }
+        bridge.last_drain_frame_context = Some(DrainFrameContext {
+            seq: 7,
+            timestamp_us: 123,
+            max_frag: 1200,
+        });
+    }
+
+    async fn model_bridge_with_grid() -> IoBridge {
+        let (ours, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
+        bridge.use_model_controller_for_test(ModelSettings::default());
+        bridge
+    }
+
+    /// A pass the depth gate stopped with work waiting was limited by quinn's
+    /// window, not by the rate: the bank is dropped and counted as spent, so
+    /// the estimate ceiling reads the sender as saturated. A pass that sent
+    /// everything it had forfeits nothing. Mutation: drop the
+    /// `model_note_gated_pass` call and the first assertion fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_the_window_stopped_counts_its_bank_as_spent() {
+        // Control: quinn takes everything, nothing is forfeited.
+        let mut open = model_bridge_with_grid().await;
+        queue_two_tiles(&mut open);
+        open.pump_admission();
+        assert_eq!(open.model_forfeited(), 0.0, "an open gate forfeits nothing");
+
+        // The FIFO stands at the gate: the pass cannot send, work is waiting.
+        let mut gated = model_bridge_with_grid().await;
+        queue_two_tiles(&mut gated);
+        gated.forced_fifo_depth_for_test = Some(10_000_000);
+        gated.pump_admission();
+        assert!(
+            !gated.scheduler_peek_for_test().is_empty(),
+            "premise: work is still waiting"
+        );
+        let forfeited = gated.model_forfeited();
+        assert!(forfeited > 1_000.0, "the bank was counted ({forfeited} B)");
+        assert_eq!(gated.admission.available(), 0, "and dropped");
     }
 }
