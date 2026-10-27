@@ -27,6 +27,11 @@ pub struct NetProfile {
 
     /// One-way propagation delay and jitter, in microseconds.
     pub delay_us: u64,
+    /// Steps of the one-way propagation delay: from `at_us` on, the delay is
+    /// the paired value instead of `delay_us` (the last step at or before the
+    /// datagram's offer instant wins). Empty keeps `delay_us` throughout. A
+    /// route change at constant capacity.
+    pub delay_steps: Vec<(u64, u64)>,
     pub jitter_us: u64,
 
     /// Reorder window: datagrams arriving within this time window of each other
@@ -145,6 +150,7 @@ impl NetProfile {
             duplicate: 0.0,
             corrupt: 0.0,
             delay_us: 0,
+            delay_steps: Vec::new(),
             jitter_us: 0,
             reorder_us: 0,
             cap: CapTimeline::unlimited(),

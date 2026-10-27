@@ -550,7 +550,11 @@ impl IoBridge {
         }
         // What the bucket granted and what was spent of it, for the estimate
         // ceiling: it applies only to a sender that used its grant.
-        if self.model.is_some() && stop == Stop::Depth && self.admission_backlog(now) {
+        if self.model.is_some()
+            && stop == Stop::Depth
+            && self.admission_backlog(now)
+            && self.model_window_limit_is_load()
+        {
             let dropped = self.admission.forfeit_bank();
             self.model_note_gated_pass(dropped);
         }
