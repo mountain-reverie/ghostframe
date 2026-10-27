@@ -52,11 +52,6 @@ const MIN_WINDOW_MTUS: u64 = 4;
 /// `Controller::initial_window` is asked before there is one.
 const INITIAL_WINDOW_MTUS: u64 = 10;
 
-/// How far over the window a send may go before it counts as a violation:
-/// quinn's PTO probes (two datagrams) are exempt from the window, and a
-/// packet may be sent that crosses it.
-const WINDOW_SLACK_MTUS: u64 = 3;
-
 /// The window for rate `rate_bytes_per_s` over an effective round trip
 /// `rtt_eff`, with gain `gain` (to the nearest thousandth, never under 1),
 /// never under `4 x mtu`. Pure; the controller and the scenes' bounds use the
@@ -77,12 +72,6 @@ pub fn model_window(rate_bytes_per_s: u64, rtt_eff: Duration, gain: f64, mtu: u6
 pub struct ModelStats {
     /// `is_persistent_congestion` events seen.
     pub persistent_congestion_events: u64,
-    /// Largest in-flight bytes the controller tracked (sent minus acked and
-    /// lost; approximate across packet-number-space discards).
-    pub peak_in_flight: u64,
-    /// Sends that left more than `WINDOW_SLACK_MTUS` datagrams over the window
-    /// in force. Zero by construction of quinn's window check.
-    pub sends_over_window: u64,
     /// Largest window returned, bytes.
     pub window_max: u64,
 }
@@ -100,8 +89,6 @@ pub struct ModelCell {
     /// lasts until it moves.
     feedback_epoch: AtomicU64,
     persistent: AtomicU64,
-    peak_in_flight: AtomicU64,
-    over_window: AtomicU64,
     window_max: AtomicU64,
 }
 
@@ -113,8 +100,6 @@ impl ModelCell {
             probe_bytes: AtomicU64::new(0),
             feedback_epoch: AtomicU64::new(0),
             persistent: AtomicU64::new(0),
-            peak_in_flight: AtomicU64::new(0),
-            over_window: AtomicU64::new(0),
             window_max: AtomicU64::new(0),
         })
     }
@@ -157,8 +142,6 @@ impl ModelCell {
     pub fn stats(&self) -> ModelStats {
         ModelStats {
             persistent_congestion_events: self.persistent.load(Ordering::Relaxed),
-            peak_in_flight: self.peak_in_flight.load(Ordering::Relaxed),
-            sends_over_window: self.over_window.load(Ordering::Relaxed),
             window_max: self.window_max.load(Ordering::Relaxed),
         }
     }
@@ -187,7 +170,6 @@ impl ControllerFactory for ModelControllerFactory {
             mtu: u64::from(current_mtu),
             min_rtt: None,
             collapsed_at: None,
-            in_flight: 0,
         })
     }
 }
@@ -201,7 +183,6 @@ pub struct ModelController {
     /// The feedback epoch a persistent-congestion event collapsed the window
     /// in. The window stays at the floor while the cell is still in it.
     collapsed_at: Option<u64>,
-    in_flight: u64,
 }
 
 impl ModelController {
@@ -223,25 +204,14 @@ impl ModelController {
 }
 
 impl Controller for ModelController {
-    fn on_sent(&mut self, _now: std::time::Instant, bytes: u64, _last_packet_number: u64) {
-        self.in_flight += bytes;
-        self.cell
-            .peak_in_flight
-            .fetch_max(self.in_flight, Ordering::Relaxed);
-        if self.in_flight > self.current_window() + WINDOW_SLACK_MTUS * self.mtu {
-            self.cell.over_window.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     fn on_ack(
         &mut self,
         _now: std::time::Instant,
         _sent: std::time::Instant,
-        bytes: u64,
+        _bytes: u64,
         _app_limited: bool,
         rtt: &RttEstimator,
     ) {
-        self.in_flight = self.in_flight.saturating_sub(bytes);
         self.min_rtt = Some(rtt.min());
     }
 
@@ -250,9 +220,8 @@ impl Controller for ModelController {
         _now: std::time::Instant,
         _sent: std::time::Instant,
         is_persistent_congestion: bool,
-        lost_bytes: u64,
+        _lost_bytes: u64,
     ) {
-        self.in_flight = self.in_flight.saturating_sub(lost_bytes);
         if is_persistent_congestion {
             self.collapsed_at = Some(self.cell.epoch());
             self.cell.persistent.fetch_add(1, Ordering::Relaxed);
@@ -372,7 +341,6 @@ mod tests {
             mtu: MTU,
             min_rtt: Some(Duration::from_millis(30)),
             collapsed_at: None,
-            in_flight: 0,
         }
     }
 
@@ -480,23 +448,6 @@ mod tests {
         a.on_congestion_event(now, now, true, 0);
         assert_eq!(a.window(), 4 * MTU);
         assert!(b.window() > 4 * MTU, "the other connection is untouched");
-    }
-
-    #[test]
-    fn in_flight_is_tracked_and_a_send_far_over_the_window_is_counted() {
-        let cell = ModelCell::new(250_000, 2.0); // W = 17 500
-        let mut c = controller(&cell);
-        let now = std::time::Instant::now();
-        for pn in 0..14 {
-            c.on_sent(now, MTU, pn); // 16 800 in flight, under W
-        }
-        assert_eq!(cell.stats().sends_over_window, 0);
-        assert_eq!(cell.stats().peak_in_flight, 14 * MTU);
-        for pn in 14..30 {
-            c.on_sent(now, MTU, pn); // a window that was never enforced
-        }
-        assert!(cell.stats().sends_over_window > 0);
-        assert_eq!(cell.stats().peak_in_flight, 30 * MTU);
     }
 
     fn policy() -> (RestartPolicy, Instant) {

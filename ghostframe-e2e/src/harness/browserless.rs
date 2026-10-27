@@ -401,6 +401,10 @@ pub struct BrowserlessResult {
     /// Subtract `NetProfile::delay_us` for the queue. Dropped datagrams have
     /// no entry. Bounded at 2 M entries.
     pub s2c_transit_samples: Vec<(u64, u64)>,
+    /// Bytes the server offered to the server -> client link in each
+    /// `OFFERED_BIN_US` of virtual time, drops included: bin `i` covers
+    /// `[i x OFFERED_BIN_US, (i + 1) x OFFERED_BIN_US)`.
+    pub s2c_offered_bins: Vec<u32>,
     /// Read from `FrameBuffer::stale_frame_tiles()` — a scene run only
     /// ever ingests via `FrameBuffer::apply_tile_ready` (real decoded
     /// `TileReady` events), never `FrameBuffer::apply`, so the `frame_seq`
@@ -612,7 +616,14 @@ struct S2cLoss {
     /// `(offered_us, transit_us)` of every delivered server -> client copy,
     /// capped at `MAX_TRANSIT_SAMPLES`. See `BrowserlessResult::s2c_transit_samples`.
     transit: Vec<(u64, u64)>,
+    /// Bytes offered to the server -> client link per `OFFERED_BIN_US`.
+    offered_bins: Vec<u32>,
 }
+
+/// Width of a `BrowserlessResult::s2c_offered_bins` bin.
+pub const OFFERED_BIN_US: u64 = 10_000;
+/// Bound on `S2cLoss::offered_bins` (10 000 s of scene).
+const MAX_OFFERED_BINS: usize = 1_000_000;
 
 /// Bound on `S2cLoss::transit`: 16 B each, so 32 MB at the cap.
 const MAX_TRANSIT_SAMPLES: usize = 2_000_000;
@@ -1188,6 +1199,7 @@ async fn run_inner(
         wire_trace: std::mem::take(&mut s2c_loss.wire).into_trace(),
         s2c_loss_run_max: s2c_loss.run_max,
         s2c_transit_samples: std::mem::take(&mut s2c_loss.transit),
+        s2c_offered_bins: std::mem::take(&mut s2c_loss.offered_bins),
         stale_generation_tiles,
         seed,
         bwe_estimate_bps: bwe_snapshot.bitrate_bps,
@@ -1405,6 +1417,14 @@ async fn drive_session(
         ($pkt:expr) => {{
             let pkt = $pkt;
             let t = now_us(base);
+            let bin = (t / OFFERED_BIN_US) as usize;
+            if bin < MAX_OFFERED_BINS {
+                if s2c_loss.offered_bins.len() <= bin {
+                    s2c_loss.offered_bins.resize(bin + 1, 0);
+                }
+                s2c_loss.offered_bins[bin] =
+                    s2c_loss.offered_bins[bin].saturating_add(pkt.payload.len() as u32);
+            }
             let items = rule(
                 &mut net_s2c,
                 Direction::S2c,
