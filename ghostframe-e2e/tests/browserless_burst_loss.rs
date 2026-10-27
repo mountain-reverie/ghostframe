@@ -21,9 +21,27 @@ use std::time::Duration;
 use ghostframe_client_net::ClientNetEvent;
 use ghostframe_e2e::harness::browserless::FrameScript;
 use ghostframe_e2e::harness::browserless::{
-    run_browserless_with_links, run_browserless_with_options, BrowserlessResult, BrowserlessScene,
-    LinkOverrides, RunOptions, SceneLoad,
+    run_browserless_with_options, BrowserlessResult, BrowserlessScene, LinkOverrides, RunOptions,
+    SceneLoad,
 };
+
+/// Every scene in this file reads the Cubic arm's budget terms (`cwnd`,
+/// `pacer`), so they run on it. The model arm's loss behaviour is P7c in
+/// `browserless_model_controller`.
+async fn run_browserless_with_links(
+    scene: BrowserlessScene,
+    links: LinkOverrides,
+) -> anyhow::Result<BrowserlessResult> {
+    run_browserless_with_options(
+        scene,
+        links,
+        RunOptions {
+            congestion: Some(ghostframe_lib::config::CongestionMode::Cubic),
+            ..Default::default()
+        },
+    )
+    .await
+}
 use ghostframe_e2e::harness::load_profile::{
     gradient_tile, Churn, LoadProfile, PRODUCTION_CADENCE_US,
 };
@@ -498,6 +516,8 @@ async fn tile_fec_is_billed_only_when_opted_in() {
             s2c_only(|p| p.loss = RATE),
             RunOptions {
                 tile_fec: fec,
+                // These gates read the Cubic arm's budget terms.
+                congestion: Some(ghostframe_lib::config::CongestionMode::Cubic),
                 ..Default::default()
             },
         )

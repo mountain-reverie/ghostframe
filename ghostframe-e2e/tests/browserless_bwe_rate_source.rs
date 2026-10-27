@@ -106,6 +106,8 @@ async fn run_frames(
         LinkOverrides::default(),
         RunOptions {
             classical_kx,
+            // PR-6's gates are on the Cubic arm's rate source (hint, cwnd term).
+            congestion: Some(ghostframe_lib::config::CongestionMode::Cubic),
             ..Default::default()
         },
     )

@@ -207,7 +207,7 @@ pub struct TransportConfig {
     /// decodes parity whenever it arrives, whatever this says. H.264 parity is
     /// separate and unaffected.
     pub tile_fec: bool,
-    /// Who owns the send rate. From `GHOSTFRAME_CC=cubic|model`. See
+    /// Who owns the send rate. From `GHOSTFRAME_CC=model|cubic` (default `model`). See
     /// [`CongestionMode`].
     pub congestion: CongestionMode,
     /// The model controller's settings, from `GHOSTFRAME_CC_*`. Read whatever
@@ -219,20 +219,20 @@ pub struct TransportConfig {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum CongestionMode {
     /// quinn's Cubic window and goog_cc's estimate, coupled through the
-    /// `cwnd / srtt` hint and the admission `min`.
-    #[default]
+    /// `cwnd / srtt` hint and the admission `min`. `GHOSTFRAME_CC=cubic`.
     Cubic,
     /// goog_cc's estimate is the rate; quinn's window is a bound derived from
-    /// it (`transport::model_controller`).
+    /// it (`transport::model_controller`). The default.
+    #[default]
     Model,
 }
 
 impl CongestionMode {
-    /// `model` selects [`Self::Model`]; anything else, or nothing, [`Self::Cubic`].
+    /// `cubic` selects [`Self::Cubic`]; anything else, or nothing, [`Self::Model`].
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
         match get("GHOSTFRAME_CC").as_deref() {
-            Some("model") => Self::Model,
-            _ => Self::Cubic,
+            Some("cubic") => Self::Cubic,
+            _ => Self::Model,
         }
     }
 
@@ -1335,13 +1335,13 @@ mod tests {
     }
 
     #[test]
-    fn the_congestion_mode_is_cubic_unless_the_env_says_model() {
+    fn the_congestion_mode_is_model_unless_the_env_says_cubic() {
         let mode = |v: &[(&str, &str)]| TransportConfig::from_lookup(lookup(v)).congestion;
-        assert_eq!(mode(&[]), CongestionMode::Cubic);
-        assert_eq!(mode(&[("GHOSTFRAME_CC", "cubic")]), CongestionMode::Cubic);
-        assert_eq!(mode(&[("GHOSTFRAME_CC", "bogus")]), CongestionMode::Cubic);
+        assert_eq!(mode(&[]), CongestionMode::Model);
         assert_eq!(mode(&[("GHOSTFRAME_CC", "model")]), CongestionMode::Model);
-        assert_eq!(TransportConfig::default().congestion, CongestionMode::Cubic);
+        assert_eq!(mode(&[("GHOSTFRAME_CC", "bogus")]), CongestionMode::Model);
+        assert_eq!(mode(&[("GHOSTFRAME_CC", "cubic")]), CongestionMode::Cubic);
+        assert_eq!(TransportConfig::default().congestion, CongestionMode::Model);
     }
 
     #[test]

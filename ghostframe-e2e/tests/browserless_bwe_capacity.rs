@@ -2,7 +2,22 @@
 //!
 //! They live here rather than in `browserless_runner` because of how they
 
-use ghostframe_e2e::harness::browserless::{run_browserless, BrowserlessScene, SceneLoad};
+use ghostframe_e2e::harness::browserless::{BrowserlessResult, BrowserlessScene, SceneLoad};
+
+/// These gates read the Cubic arm's mechanics (its queue clocks, its send
+/// buffer behaviour, its capacity-step response), so they run on it.
+async fn run_browserless(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult> {
+    let links = ghostframe_e2e::harness::browserless::LinkOverrides::from_burst_env(&scene.net);
+    ghostframe_e2e::harness::browserless::run_browserless_with_options(
+        scene,
+        links,
+        ghostframe_e2e::harness::browserless::RunOptions {
+            congestion: Some(ghostframe_lib::config::CongestionMode::Cubic),
+            ..Default::default()
+        },
+    )
+    .await
+}
 use ghostframe_e2e::harness::load_profile::{Churn, LoadProfile, PRODUCTION_CADENCE_US};
 use ghostframe_e2e::netsim::{Bottleneck, CapTimeline, NetProfile};
 use std::time::Duration;
