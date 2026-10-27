@@ -114,6 +114,8 @@ pub(crate) struct GoogCcDriver {
     payload_fraction: f64,
     /// When goog_cc was last given an estimate (`reseed`).
     last_reseed_us: Option<u64>,
+    /// The ceiling is not read before this instant (`restore_from`).
+    ceiling_hold_until_us: u64,
     /// Least smoothed RTT seen over `MIN_RTT_SPAN_US`, microseconds.
     min_rtt: super::sliding_min::SlidingMin<u64, u64>,
     /// The raw estimate a lift handed goog_cc, until the next feedback has
@@ -293,6 +295,7 @@ impl GoogCcDriver {
             active_ceiling_bps: None,
             payload_fraction: 1.0,
             last_reseed_us: None,
+            ceiling_hold_until_us: 0,
             min_rtt: Default::default(),
             pending_lift_bps: None,
             lifts_to_judge: std::collections::VecDeque::new(),
@@ -393,7 +396,11 @@ impl GoogCcDriver {
     fn refresh_ceiling(&mut self, now: Instant) {
         let now_us = self.micros_since_base(now);
         let srtt_us = self.path_rtt.map_or(0, |d| d.as_micros() as u64);
-        let reading: Option<CeilingReading> = self.ceiling.read(now_us, srtt_us);
+        let reading: Option<CeilingReading> = if now_us < self.ceiling_hold_until_us {
+            None
+        } else {
+            self.ceiling.read(now_us, srtt_us)
+        };
         let standing_queue = self.standing_queue();
         self.active_ceiling_bps = reading.and_then(|r| r.ceiling_bps).map(|c| c as u64);
         if let Some(r) = reading {
@@ -530,6 +537,19 @@ impl GoogCcDriver {
     /// is what the restarted flow produces.
     pub(crate) fn restart_from(&mut self, now: Instant, bps: u64) {
         let now_us = self.micros_since_base(now);
+        self.reseed(now, now_us, bps as f64);
+    }
+
+    /// Continue the estimate from `bps` after the base round trip rose, and
+    /// keep the ceiling from reading until its acknowledgement window holds
+    /// nothing from before: a window (`window_us`) after the restore, plus the
+    /// round trip the first acknowledgements of the faster flow take to come
+    /// back. Before that the window averages the throttled flow with the one
+    /// the restored estimate admits, and reads the ramp as the path's limit.
+    pub(crate) fn restore_from(&mut self, now: Instant, bps: u64) {
+        let now_us = self.micros_since_base(now);
+        let srtt_us = self.path_rtt.map_or(0, |d| d.as_micros() as u64);
+        self.ceiling_hold_until_us = now_us + EstimateCeiling::window_us(srtt_us) + srtt_us;
         self.reseed(now, now_us, bps as f64);
     }
 

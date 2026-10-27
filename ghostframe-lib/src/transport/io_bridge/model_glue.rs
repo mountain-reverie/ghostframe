@@ -19,7 +19,7 @@
 
 use super::*;
 use crate::transport::instruments::ModelProbe;
-use crate::transport::model_controller::{ModelCell, RestartPolicy, Resume};
+use crate::transport::model_controller::{BaseRise, ModelCell, RestartPolicy, Resume};
 
 /// State that exists only when the model controller is installed.
 pub(super) struct ModelGlue {
@@ -31,6 +31,7 @@ pub(super) struct ModelGlue {
     /// waiting, cumulative. Counted as spent where the estimate ceiling asks
     /// whether the sender used its grant (see `model_note_gated_pass`).
     pub(super) forfeited: f64,
+    pub(super) base_rise: BaseRise,
 }
 
 impl ModelGlue {
@@ -40,6 +41,7 @@ impl ModelGlue {
             restart: RestartPolicy::new(settings),
             persistent_seen: 0,
             forfeited: 0.0,
+            base_rise: BaseRise::default(),
         }
     }
 }
@@ -137,8 +139,25 @@ impl IoBridge {
     /// The estimator heard feedback: a restart ends, a collapsed window is
     /// restored, and the new estimate reaches the window.
     pub(super) fn model_after_feedback(&mut self) {
+        if self.model.is_none() {
+            return;
+        }
+        let snap = self.bwe.snapshot();
+        let stale = !self.model_window_limit_is_load();
         let Some(m) = self.model.as_mut() else { return };
         m.restart.on_feedback();
+        if let Some((base, _)) = m.cell.rtts() {
+            let now = now_std();
+            if let Some(bps) = m.base_rise.on_feedback(
+                now,
+                snap.bitrate_bps,
+                snap.stats.ceiling_acked_bps,
+                stale,
+                base,
+            ) {
+                self.bwe.restore_from(now, bps);
+            }
+        }
         self.publish_model_window(true);
     }
 
