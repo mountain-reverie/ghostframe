@@ -29,9 +29,42 @@ pub fn system_hostname() -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// The effective user's login name, from the passwd database.
+pub fn current_username() -> Option<String> {
+    // SAFETY: getpwuid returns NULL or a pointer to static storage that stays
+    // valid until the next getpw* call; the name is copied out before any.
+    unsafe {
+        let pw = libc::getpwuid(libc::geteuid());
+        if pw.is_null() || (*pw).pw_name.is_null() {
+            return None;
+        }
+        Some(
+            std::ffi::CStr::from_ptr((*pw).pw_name)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+/// The effective uid.
+pub fn euid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_username_is_the_owner_of_this_process() {
+        let id = std::process::Command::new("id")
+            .arg("-un")
+            .output()
+            .unwrap();
+        let want = String::from_utf8(id.stdout).unwrap();
+        assert_eq!(current_username().as_deref(), Some(want.trim()));
+    }
 
     #[test]
     fn system_hostname_matches_the_kernel() {

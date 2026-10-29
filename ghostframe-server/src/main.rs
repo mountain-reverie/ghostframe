@@ -50,10 +50,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             hostname,
             control_url,
         } => commands::login::logout(&cfg, hostname, control_url),
+        Command::Install {
+            force,
+            max_resolution,
+        } => install(&cfg, force, max_resolution),
+        Command::Uninstall => uninstall(&cfg),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn install_paths(cfg: &config::ServerConfig) -> Result<commands::install::InstallPaths, String> {
+    let home = cfg
+        .home()
+        .ok_or("HOME is not set; install writes under the user's home directory")?;
+    Ok(commands::install::InstallPaths::new(std::path::Path::new(
+        home,
+    )))
+}
+
+fn install(
+    cfg: &config::ServerConfig,
+    force: bool,
+    max_resolution: cli::MaxResolution,
+) -> Result<(), String> {
+    let paths = install_paths(cfg)?;
+    let exe = std::env::current_exe().map_err(|e| format!("locating this binary: {e}"))?;
+    let username = util::current_username().ok_or("this uid has no passwd entry")?;
+    let state_dir = cfg.state_dir().ok();
+    let ctx = commands::install::InstallContext {
+        paths: &paths,
+        current_exe: &exe,
+        sysroot: std::path::Path::new("/"),
+        state_dir: state_dir.as_deref(),
+        username: &username,
+        euid: util::euid(),
+    };
+    commands::install::install(
+        &ctx,
+        force,
+        max_resolution,
+        &mut commands::install::RealSystemctl,
+        &mut std::io::stdout(),
+    )
+}
+
+fn uninstall(cfg: &config::ServerConfig) -> Result<(), String> {
+    commands::install::uninstall(
+        &install_paths(cfg)?,
+        &mut commands::install::RealSystemctl,
+        &mut std::io::stdout(),
+    )
 }
