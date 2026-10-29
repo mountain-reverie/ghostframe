@@ -20,7 +20,7 @@ Server:
 | Crate | Purpose |
 | --- | --- |
 | `ghostframe-lib` | Core library: tile engine, encoders, QUIC/WebTransport stack, Tailscale integration. Builds as `cdylib` / `staticlib` / `rlib`. |
-| `ghostframe-server` | Standalone X11/DRM capture daemon that hosts a session over an embedded Tailscale node. |
+| `ghostframe-server` | The server binary: `install`/`login`/`capture` commands; captures the user's X11 session and hosts it over an embedded Tailscale node. |
 
 Clients:
 
@@ -171,6 +171,11 @@ That target builds the web client, builds the two container images
 compiled inside the image, with a persistent BuildKit cache), then runs
 `cargo test --test e2e`.
 
+The test patterns draw into the container's Xorg with `--x11-sink`, so the e2e
+tests exercise the server's real capture path. The GPU setups still run that
+Xorg on the host's VKMS device (`xorg-vkms.conf`), so VKMS remains a host
+requirement for them.
+
 After any change to `ghostframe-lib` or `ghostframe-server`, rebuild the
 container before re-running e2e tests, otherwise tests will silently run
 the stale binary baked into the image:
@@ -205,9 +210,10 @@ documented there: [`ghostframe-lib/src/config.rs`](ghostframe-lib/src/config.rs)
 holds the recipe for adding one, and
 [`ghostframe-client-gpu/src/config.rs`](ghostframe-client-gpu/src/config.rs)
 the `GHOSTFRAME_CLIENT_DUMP_*` frame-dump knobs. CI fails if `ghostframe-lib` or
-any `ghostframe-client-*` crate reads `std::env` anywhere else. Other crates
-(ghostframe-server, test-pattern, the Go bridge) have not been converted yet and read
-their variables at the point of use.
+any `ghostframe-client-*` crate reads `std::env` anywhere else. `ghostframe-server`
+follows the same rule: [`ghostframe-server/src/config.rs`](ghostframe-server/src/config.rs)
+documents every variable it reads. The test pattern and the Go bridge read their
+variables at the point of use.
 
 ## Tailnet peer access
 
@@ -266,95 +272,6 @@ just fmt-check   # cargo fmt -- --check
 just fmt         # cargo fmt
 just ci-local    # run the fast CI tier in the order CI runs it
 ```
-
-## Alternative configurations
-
-The README's install path targets AMD GPUs via the `amdgpu` driver's
-`Virtual` connector. Other configurations are not part of the supported
-install path but are documented here for users who want to adapt the setup.
-
-### Intel iGPU
-
-The Intel `modesetting` driver exposes a `Virtual_1` connector under
-similar constraints. Swap the `Device` and `Monitor` sections in
-`packaging/xorg-headless-amdgpu.conf`:
-
-```
-Section "Device"
-    Identifier "Card0"
-    Driver     "modesetting"
-    Option     "Monitor-Virtual-1" "VirtualMonitor"
-EndSection
-```
-
-Save as `xorg-headless-intel.conf` and point the install script at it (or
-manually copy it to `/etc/X11/ghostframe-headless.conf`).
-
-### NVIDIA (proprietary driver)
-
-The NVIDIA driver supports headless operation via `AllowEmptyInitialConfiguration`
-and `AllowHeadlessMode`. A starting point:
-
-```
-Section "Device"
-    Identifier "Card0"
-    Driver     "nvidia"
-    Option     "AllowEmptyInitialConfiguration" "true"
-    Option     "AllowHeadlessMode" "true"
-EndSection
-```
-
-This has not been tested against ghostframe; PRs welcome.
-
-### Xorg + dummy driver (no display GPU)
-
-When the machine has no display GPU, `xf86-video-dummy` provides an Xorg with
-no DRM device. `ghostframe-server` will detect the absence of DRM and fall
-back to its X11 capture path. Hardware encoding is not available in this
-configuration. The server itself still needs a usable Vulkan compute device
-to analyse and encode frames: it has no software path and refuses to start
-without one (a software server may come later, as an explicit decision).
-
-```
-Section "Device"
-    Identifier "Card0"
-    Driver     "dummy"
-    VideoRam   16384
-EndSection
-```
-
-### VKMS (virtual KMS kernel module)
-
-Not useful today. VKMS is a software-only virtual KMS device; capturing from
-it and encoding on a discrete GPU is the cross-device PRIME case which is
-known broken (yields stale/scrambled bytes). The workaround in ghostframe is
-a CPU-mmap fallback, which gives no advantage over Xorg dummy. Revisit when
-the cross-device PRIME issue is resolved upstream.
-
-## WM alternatives
-
-The default `ghostframe-wm.service` runs `enlightenment_start`. To use a
-different window manager, edit the `ExecStart=` line of
-`~/.config/systemd/user/ghostframe-wm.service`. Common alternatives:
-
-| WM | `ExecStart=` |
-| --- | --- |
-| enlightenment | `/usr/bin/enlightenment_start` |
-| i3 | `/usr/bin/i3` |
-| openbox | `/usr/bin/openbox` |
-| sway (X11 via Xwayland) | not supported — sway is Wayland-only; use a different WM here |
-| fluxbox | `/usr/bin/fluxbox` |
-| xfwm4 | `/usr/bin/xfwm4` |
-
-After editing, reload and restart:
-
-```bash
-systemctl --user daemon-reload
-systemctl --user restart ghostframe-wm.service
-```
-
-The `Restart=on-failure` directive will not bring up the new WM if the
-binary doesn't exist on the host. Verify the path with `command -v`.
 
 ## Contributing
 

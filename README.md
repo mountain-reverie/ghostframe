@@ -1,15 +1,14 @@
 # Ghostframe
 
-A Linux-only remote desktop server: stream a headless Xorg session running
-your favourite window manager to a browser, over QUIC on a Tailscale
-tailnet. Per-tile adaptive encoding (H.264 for motion, palette/wavelet/
+A Linux-only remote desktop server: stream your X11 desktop session to a
+browser, over QUIC on a Tailscale tailnet. Per-tile adaptive encoding (H.264 for motion, palette/wavelet/
 solid-fill for static content) keeps bandwidth low and text crisp.
 
 There are two halves, and you do not need both:
 
 | | What it is | Build |
 | --- | --- | --- |
-| **Server** | `ghostframe-server` — headless Xorg, capture, encode, tailnet. Serves the browser client itself. | [Install](#install) |
+| **Server** | `ghostframe-server` — captures your X11 desktop session, encodes, joins the tailnet. Serves the browser client itself. | [Install](#install) |
 | **Native client** | `ghostframe` — a Linux desktop client. No browser, no server. | [Native client](#native-client) |
 
 Any device on the tailnet can also just open the server's URL in Chrome —
@@ -18,7 +17,7 @@ client is the alternative to *that*, not to the server.
 
 **If you only want the native client, skip straight to [Native
 client](#native-client).** It builds a strict subset of the workspace:
-no Xorg, no GPU driver setup, no Node, no Docker.
+no X session to capture, no GPU driver setup, no Node, no Docker.
 
 For the full design see
 [docs/specs/ghostframe-initial-spec.md](docs/specs/ghostframe-initial-spec.md).
@@ -31,14 +30,14 @@ For the native client only, see [Native client](#native-client) instead —
 its dependency list is much shorter.
 
 Ghostframe today does not ship pre-built binaries — you build from source
-during install. The prerequisites cover both the runtime stack (Xorg + GPU
-driver + WM + Vulkan) and the build-from-source toolchain.
+during install. The prerequisites cover both the runtime stack (Vulkan) and
+the build-from-source toolchain.
 
-The install path is supported on **AMD GPUs with the `amdgpu` driver**.
-Other GPUs are documented in [DEVELOPERS.md](DEVELOPERS.md#alternative-configurations)
-but not part of the supported install. The default window manager is
-**Enlightenment**; alternatives are one `ExecStart=` line away (see
-[DEVELOPERS.md](DEVELOPERS.md#wm-alternatives)).
+The server captures the X11 session of the user who installs it, whatever
+window manager it runs. It needs a Vulkan device for analysis and encoding
+(AMD with `amdgpu`/RADV is what it is developed on); VA-API is used for H.264
+when present. No root access is needed to install or run it. Wayland sessions
+are not supported yet.
 
 **Ubuntu 24.04:**
 
@@ -49,8 +48,7 @@ sudo apt-get install \
     nodejs npm \
     libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavdevice-dev \
     libx264-dev libx11-dev libxext-dev libxdamage-dev libdrm-dev \
-    libvulkan1 mesa-vulkan-drivers vulkan-tools \
-    xserver-xorg xserver-xorg-video-amdgpu enlightenment
+    libvulkan1 mesa-vulkan-drivers vulkan-tools
 ```
 
 **Arch Linux:**
@@ -58,8 +56,7 @@ sudo apt-get install \
 ```bash
 sudo pacman -S base-devel rsync clang go rust nodejs npm \
     ffmpeg x264 libx11 libxext libxdamage libdrm \
-    vulkan-icd-loader vulkan-tools \
-    xorg-server xf86-video-amdgpu enlightenment
+    vulkan-icd-loader vulkan-tools
 ```
 
 Then, on either distribution:
@@ -78,191 +75,112 @@ Then, on either distribution:
   browser bundle for embedding. Missing `rsync` fails the build with a bare
   `rsync: command not found` from inside a build script.
 
-You also need an `amdgpu` kernel module configured to expose a virtual
-display. Add `/etc/modprobe.d/amdgpu.conf`:
-
-```
-options amdgpu virtual_display=<PCI_ID>,1
-```
-
-Find `<PCI_ID>` with `lspci -D | grep VGA` (use the form `0000:03:00.0`).
-Reboot after creating this file.
-
-A Tailscale account with a pre-auth key
-(https://login.tailscale.com/admin/settings/keys) is required to register
-the host on your tailnet. The install script will prompt for it. Prefer a
-**one-off** key: the user who created the key becomes the node's owner, and
-every device of that user may connect (see
-[Who can connect](#who-can-connect)), so a reusable key that is still valid
-lets anyone holding it register a device that will be admitted.
+A Tailscale account. `ghostframe-server login` prints a sign-in URL; the
+tailnet user who approves it owns the node, and every device of that user may
+connect (see [Who can connect](#who-can-connect)). To join without a browser,
+set `TS_AUTHKEY` to a **one-off** pre-auth key for that one `login`: a reusable
+key that is still valid lets anyone holding it register an admitted device.
 
 ## Install
 
+As the desktop user whose session should be served — not root:
+
 ```bash
-# 1. Clone and build from source. `just build` runs the web client SPA
-#    build first (vite) so ghostbridge can //go:embed it before the
-#    daemon links.
 git clone https://github.com/mountain-reverie/ghostframe.git
 cd ghostframe
 just build-release
-
-# 2. Run the installer as root, targeting the user that should own the
-#    headless session.
-sudo ./packaging/install.sh <username>
-
-# 3. Paste your Tailscale auth key when the script prompts, then reboot.
-sudo reboot
+./target/release/ghostframe-server install    # binary, user unit, autostart
+./target/release/ghostframe-server login      # prints a sign-in URL, waits for approval
+systemctl --user start ghostframe-server
 ```
 
-After reboot, the configured user is automatically logged in on `tty1`,
-Xorg comes up on display `:1`, Enlightenment starts inside that session,
-and `ghostframe-server` joins the tailnet and starts capturing.
+`install` copies the binary to `~/.local/bin/ghostframe-server`, writes
+`~/.config/systemd/user/ghostframe-server.service` and
+`~/.config/autostart/ghostframe-server.desktop` (some desktops, Enlightenment
+among them, never activate `graphical-session.target`), and enables the unit.
+From then on the server starts with your graphical session. It starts the
+service itself when the node has already joined a tailnet (including a
+registration left by the old `ghostframe-xdaemon`, which it adopts); otherwise
+it tells you to run `login`. A bare `ghostframe-server` prints the help.
 
-## Attach Mode
+`install` must be run from your desktop session: it refuses root, needs the
+user systemd manager to be reachable, and needs `HOME` to match your passwd
+home. It also replaces the old `packaging/install.sh` install (attach or
+headless): it stops and removes those user units, and lists any root-owned
+leftovers with the command to remove them; it never touches `/etc`. When run
+from inside the old headless session, stopping that session would kill it, so
+it re-runs itself as the transient unit `ghostframe-install`; follow it with
+`journalctl --user -u ghostframe-install -f`. `login` and `capture` refuse to
+run while the old `ghostframe-xdaemon` unit is installed or running.
 
-Attach mode captures the operator's existing X session instead of creating a
-dedicated headless session. This is useful when ghostframe is the primary
-workload and the machine would otherwise have a local desktop session
-contending for the same GPU.
+Joined means the file `.joined` exists in the state directory, written by
+`login` or by a `capture` that joined with `TS_AUTHKEY`. The service never
+prints a sign-in URL: started without that marker and without `TS_AUTHKEY`, it
+exits with status 2 (which the unit does not restart on) and says to run
+`login`.
 
-### When to Choose Attach Mode
+### Security position
 
-The fundamental constraint is that a GPU has exactly one DRM master at a time.
-When two X servers need to drive the same GPU — one running the local desktop,
-one running ghostframe — they contend for this mastership through VT switching.
-The local session's display is disrupted while ghostframe is active, and vice
-versa.
+Any client admitted over the tailnet sees your desktop: your files, browser
+sessions, saved passwords and sudo. Single-client eviction applies (one remote
+client at a time). Access is limited to the tailnet user who owns the node plus
+anyone in `GHOSTFRAME_ALLOWED_USERS` (see [Who can connect](#who-can-connect));
+**everyone admitted gets full access to your session**, so keep the list short
+and restrict the node in your tailnet ACLs as well.
 
-Attach mode avoids this contention by running ghostframe in the *same* X
-session as the local desktop, so there is no competition for the DRM master.
-This makes sense when the remote session *is* the primary use of the machine.
-It also makes the local output more useful rather than less: a monitor or KVM
-attached to the host shows exactly what the remote client sees, rather than a
-second, unrelated desktop.
+### Max resolution
 
-### What It Does Not Require
+`install` caps what a remote client may set at **1920×1080**: the session is
+the physical display, which a KVM or remote-management console may be
+capturing as the machine's recovery view, and a mode it cannot show removes
+that view exactly when it is needed. Change it with
+`ghostframe-server install --force --max-resolution 2560x1440`, or
+`--max-resolution none`. The value is `GHOSTFRAME_MAX_RESOLUTION` in the unit.
+(The old `GHOSTFRAME_ATTACH_MAX_RESOLUTION` is no longer read.)
 
-Unlike headless mode, attach mode does not need:
+### Mode changes and Enlightenment
 
-- The `amdgpu virtual_display=` kernel module option or a reboot to install it
-- VKMS (Virtual Kernel Mode Setting)
-- A dedicated non-interactive user (it captures the existing operator's session)
-- A getty autologin on `tty1`
-- Loosening of `Xwrapper.config` to allow X servers to run as the current user
+A client's resolution request is applied with RandR, reusing an existing
+output mode, and the server reads the result back. If the desktop overrides
+it, the server logs that and does not fight it. An unpatched Enlightenment
+(its `e_randr2` restores its saved per-monitor mode) reverts an external mode
+change about 1-2 s later, so on an unpatched Enlightenment a client's resolution
+change does not stick; a patch is in progress upstream.
+`GHOSTFRAME_RANDR_SETTLE_MS` (default 5000; `0` turns the read-back off) sets
+how long the server waits before it checks.
 
-The operator's existing X session becomes the capture source, whichever window
-manager it runs. The unit does hardcode `DISPLAY=:0`, though, so a host that puts
-its graphical session somewhere else — a second seat, or a lightdm config that
-moves it — needs that changed before the daemon finds anything to capture.
+### Unattended boot
 
-### Security Position
+The session must exist to be captured. For a machine that should serve after
+a reboot without anyone logging in, the display manager must log you in
+automatically; `install` checks LightDM and prints the one root command when it
+is not set up. Anyone who reaches the machine physically then finds a
+logged-in desktop.
 
-In attach mode, any client that connects to the tailnet endpoint sees the
-operator's own desktop: their files, browser sessions, saved passwords, and
-sudo privileges. There is no sandbox or separation from the local account.
+### Uninstall and logout
 
-Single-client eviction still applies — only one remote client can attach at a
-time. Access is limited to the tailnet user who owns the ghostframe node, plus
-anyone you add to `GHOSTFRAME_ALLOWED_USERS` (see
-[Who can connect](#who-can-connect)). **Everyone admitted that way gets full
-access to that account's session**, so keep the list short, and restrict the
-node in your tailnet ACLs as well.
-
-### Max Resolution
-
-By default, attach mode caps the remote client to a maximum resolution of
-**1920×1080**. The reason is that attach mode is capturing the physical display,
-which may itself be captured by a KVM switch or remote management system as a
-recovery view. If a remote client sets a video mode that the recovery path cannot
-capture, you lose access at the moment you need it most.
-
-To override this limit once you are confident recovery access is not needed:
-
-```bash
-sudo ./packaging/install.sh <user> --mode attach --max-resolution none
-```
-
-The flag writes `GHOSTFRAME_ATTACH_MAX_RESOLUTION` into the installed unit, and
-the installer prints the value it used. If a client with a larger display than
-1080p gets 1080p anyway, that variable is what to look for.
-
-### Installation
-
-Attach mode requires **lightdm** as the display manager. The installer will error
-rather than silently skip if lightdm is not present, since silent failure after
-reboot is worse than failing loudly.
-
-If you do not already have lightdm installed:
-
-**Ubuntu 24.04:**
-```bash
-sudo apt-get install lightdm
-```
-
-**Arch Linux:**
-```bash
-sudo pacman -S lightdm
-```
-
-Then install ghostframe in attach mode:
-
-```bash
-# 1. Clone and build from source (same as headless).
-git clone https://github.com/mountain-reverie/ghostframe.git
-cd ghostframe
-just build-release
-
-# 2. Run the installer in attach mode, targeting the user who owns the local session.
-sudo ./packaging/install.sh <user> --mode attach
-
-# 3. Optionally cap the maximum resolution (default is 1920×1080):
-#    sudo ./packaging/install.sh <user> --mode attach --max-resolution 2560x1440
-
-# 4. Paste your Tailscale auth key when prompted. Unlike headless mode,
-#    no reboot is necessary — the changes take effect immediately.
-```
-
-After the install completes, `ghostframe-server` is installed as a user service
-for the specified account. It will start automatically on the next login, or can
-be started immediately if already logged in.
-
-### Unattended Boot Behavior
-
-In attach mode, the session must exist for ghostframe to capture it. On an
-unattended boot, this means the specified user remains logged in automatically
-(via lightdm). This is by design: a machine whose purpose is to serve that
-session remotely has no competing need for a local logout. The consequence is
-worth stating plainly, though: anyone who reaches the machine physically after a
-boot finds a logged-in desktop, not a login prompt. If that is not acceptable,
-use headless mode, which runs its own session under a separate account.
+`ghostframe-server uninstall` removes the binary, unit and autostart entry and
+keeps the tailnet state. `ghostframe-server logout` (with the service stopped:
+`systemctl --user stop ghostframe-server`) removes the node from the tailnet
+and deletes the state; it deletes only the files tsnet is known to write and
+refuses if it finds anything else in the directory. Pass the same `--hostname`
+and `--control-url` that `login` was given, if any. `login`, `logout` and the
+service share one state directory,
+`${XDG_STATE_HOME:-~/.local/state}/ghostframe` (mode 0700; `TS_STATE_DIR`
+overrides it and is held to the same check), and refuse to run at the same
+time.
 
 ## Update
 
-To pick up a new version, rebuild from source and re-run the installer
-with `--force` so the binary and Xorg config are overwritten in place.
-The tsnet state dir is preserved (step 6 of `install.sh` self-skips when
-it's already seeded), so you do not need to re-paste your auth key.
-The state dir is `${XDG_STATE_HOME:-~/.local/state}/ghostframe`, mode 0700; the
-daemon refuses to start if it is group- or world-accessible or owned by another
-user. `TS_STATE_DIR` overrides it and is held to the same check.
-
 ```bash
-# 1. Pull and rebuild.
 cd ghostframe
 git pull
 just build-release
-
-# 2. Reinstall over the existing files.
-sudo ./packaging/install.sh <username> --force
-
-# 3. Restart the session so Xorg and the daemon pick up the new binary.
-#    A reboot also works.
-sudo -u <username> XDG_RUNTIME_DIR=/run/user/$(id -u <username>) \
-    systemctl --user restart ghostframe.target
+./target/release/ghostframe-server install --force
 ```
 
-Restarting `ghostframe.target` tears down Xorg, which will drop any
-active browser sessions — they auto-reconnect once the daemon is back.
+`install --force` replaces the binary and restarts the service when the node
+has joined. Then hard-reload open browser tabs (Ctrl+Shift+R).
 
 ## First connection
 
@@ -273,7 +191,7 @@ https://<hostname>-ghostframe.<tailnet>.ts.net/
 ```
 
 in Chrome / Chromium / Edge. `<hostname>` is your machine's hostname
-(the installer registers it as `<hostname>-ghostframe`); `<tailnet>` is
+(`login` and the service register it as `<hostname>-ghostframe`); `<tailnet>` is
 your tailnet's MagicDNS suffix.
 
 The daemon serves the web client and its WebTransport cert hash
@@ -330,20 +248,16 @@ GHOSTFRAME_ALLOWED_USERS=alice@example.com,bob@github,tag:ops
 
 Login names are matched exactly, as the refusal log prints them. A tag
 admits devices carrying it; a tagged device is identified by its tags only,
-never by the user behind it. Set it with a drop-in for the daemon's
-**user** unit (`<user>` is the account `install.sh` was run for; a drop-in
-under `/etc/systemd/system/` has no effect on a user unit), then restart
-the daemon:
+never by the user behind it. Set it with a drop-in for the server's
+**user** unit (a drop-in under
+`/etc/systemd/system/` has no effect on a user unit), as the user it runs
+as:
 
 ```bash
-sudo mkdir -p ~<user>/.config/systemd/user/ghostframe-server.service.d
-sudo tee ~<user>/.config/systemd/user/ghostframe-server.service.d/allowed-users.conf <<'CONF'
-[Service]
-Environment=GHOSTFRAME_ALLOWED_USERS=alice@example.com,tag:ops
-CONF
-sudo chown -R <user>: ~<user>/.config/systemd/user/ghostframe-server.service.d
-sudo machinectl shell <user>@ /usr/bin/systemctl --user daemon-reload
-sudo machinectl shell <user>@ /usr/bin/systemctl --user restart ghostframe-server.service
+systemctl --user edit ghostframe-server
+#   [Service]
+#   Environment=GHOSTFRAME_ALLOWED_USERS=alice@example.com,tag:ops
+systemctl --user restart ghostframe-server
 ```
 
 The startup log names the owner and the list in effect. A malformed entry
@@ -405,7 +319,7 @@ TCP 80 redirects to it and serves `/config.json` to the native client.
 node, connects to a ghostframe server, and opens a single window (X11 or
 Wayland) rendering the remote session. It decodes and composites on the
 GPU via Vulkan, so it needs a working Vulkan driver but no Xorg
-configuration, no `amdgpu` virtual display, and no window manager of its
+configuration and no window manager of its
 own.
 
 It is **independent of the server install above.** Nothing on this page's

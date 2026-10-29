@@ -18,7 +18,7 @@ test harness that Task 9/11 builds out.
 export TS_AUTHKEY=tskey-auth-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 export TS_HOSTNAME=ghostframe-m0-dev
 export TS_STATE_DIR=/tmp/ghostframe-ts-m0-dev
-./target/release/ghostframe-server
+DISPLAY=:0 ./target/release/ghostframe-server capture
 ```
 
 The daemon joins the tailnet and prints a line like:
