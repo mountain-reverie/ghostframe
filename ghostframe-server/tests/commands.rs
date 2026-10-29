@@ -148,3 +148,13 @@ fn logout_refuses_a_directory_it_did_not_create() {
     assert!(stderr(&out).contains("holiday.jpg"), "{}", stderr(&out));
     assert!(state.path().join("holiday.jpg").exists());
 }
+
+#[test]
+fn help_lists_every_command() {
+    let out = run(&["--help"], &[]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    for cmd in ["install", "uninstall", "login", "logout", "capture"] {
+        assert!(text.contains(cmd), "{cmd} missing from:\n{text}");
+    }
+}

@@ -13,6 +13,18 @@ pub struct Cli {
 
 #[derive(Debug, PartialEq, Eq, clap::Subcommand)]
 pub enum Command {
+    /// Install this binary, its systemd user unit and an autostart entry
+    /// for the current user, and remove what the old root installer left.
+    Install {
+        /// Replace a different ~/.local/bin/ghostframe-server.
+        #[arg(long)]
+        force: bool,
+        /// Largest resolution a client may set, `WIDTHxHEIGHT`, or `none`.
+        #[arg(long, value_name = "WxH|none", default_value = "1920x1080", value_parser = parse_max_resolution)]
+        max_resolution: MaxResolution,
+    },
+    /// Remove what `install` wrote. Keeps the tailnet state (see `logout`).
+    Uninstall,
     /// Join the tailnet: print a sign-in URL and wait until the node is
     /// authorised. With TS_AUTHKEY set, join without a browser.
     Login {
@@ -35,6 +47,31 @@ pub enum Command {
     },
     /// Run the server (what the systemd unit starts).
     Capture,
+}
+
+/// The ceiling `install` writes into the unit as `GHOSTFRAME_MAX_RESOLUTION`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxResolution {
+    Limit(u16, u16),
+    Unlimited,
+}
+
+/// `WIDTHxHEIGHT` (both non-zero) or `none`. Unlike the runtime parser in
+/// `capture::x11::display`, which ignores a bad value rather than stop a
+/// running service, `install` rejects one before writing anything.
+pub fn parse_max_resolution(s: &str) -> Result<MaxResolution, String> {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("none") {
+        return Ok(MaxResolution::Unlimited);
+    }
+    let bad = || format!("{s:?} is not WIDTHxHEIGHT or 'none'");
+    let (w, h) = t.split_once(['x', 'X']).ok_or_else(bad)?;
+    let w: u16 = w.trim().parse().map_err(|_| bad())?;
+    let h: u16 = h.trim().parse().map_err(|_| bad())?;
+    if w == 0 || h == 0 {
+        return Err(bad());
+    }
+    Ok(MaxResolution::Limit(w, h))
 }
 
 #[cfg(test)]
@@ -78,6 +115,46 @@ mod tests {
                 control_url: Some("http://hs".into())
             }
         );
+    }
+
+    #[test]
+    fn install_defaults_to_1080p_and_takes_none() {
+        assert_eq!(
+            parse(&["install"]).unwrap(),
+            Command::Install {
+                force: false,
+                max_resolution: MaxResolution::Limit(1920, 1080)
+            }
+        );
+        assert_eq!(
+            parse(&["install", "--force", "--max-resolution", "none"]).unwrap(),
+            Command::Install {
+                force: true,
+                max_resolution: MaxResolution::Unlimited
+            }
+        );
+        assert_eq!(parse(&["uninstall"]).unwrap(), Command::Uninstall);
+    }
+
+    #[test]
+    fn max_resolution_rejects_what_it_cannot_write() {
+        assert_eq!(
+            parse_max_resolution("2560X1440"),
+            Ok(MaxResolution::Limit(2560, 1440))
+        );
+        for bad in [
+            "",
+            "1920",
+            "1920x",
+            "x1080",
+            "0x1080",
+            "1920x0",
+            "abcxdef",
+            "1920*1080",
+        ] {
+            assert!(parse_max_resolution(bad).is_err(), "{bad:?} accepted");
+        }
+        assert!(parse(&["install", "--max-resolution", "huge"]).is_err());
     }
 
     #[test]

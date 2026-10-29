@@ -17,7 +17,7 @@
 //! | `GHOSTFRAME_LOG_FORMAT` | `json` for JSON logs | text |
 //! | `TS_HOSTNAME` | tsnet node name | `<hostname>-ghostframe` (`ghostframe-server` if the host has no name) |
 //! | `TS_STATE_DIR` | tsnet state directory (holds node keys) | `$XDG_STATE_HOME/ghostframe`, else `~/.local/state/ghostframe` |
-//! | `XDG_STATE_HOME`, `HOME` | only to locate the default state directory | unset |
+//! | `XDG_STATE_HOME`, `HOME` | the default state directory; `HOME` also roots `install` | unset |
 //! | `TS_AUTHKEY` | tsnet auth key: `login` without a browser | unset |
 //! | `TS_CONTROL_URL` | tsnet control server | empty |
 //! | `CAPTURE_FPS` | capture rate; invalid or 0 falls back | 30 |
@@ -84,6 +84,11 @@ impl ServerConfig {
             Some(h) => abs("HOME", h).map(|p| p.join(".local/state/ghostframe")),
             None => Err("no state directory: set TS_STATE_DIR, XDG_STATE_HOME or HOME".into()),
         }
+    }
+
+    /// `$HOME`, if set and non-empty: where `install` puts everything.
+    pub fn home(&self) -> Option<&str> {
+        self.home.as_deref()
     }
 
     /// Read the process environment. Call once, from `main()`.

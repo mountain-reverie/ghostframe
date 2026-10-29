@@ -1,0 +1,34 @@
+# Written by `ghostframe-server install`, which overwrites it: put local
+# changes in a drop-in (`systemctl --user edit ghostframe-server`).
+#
+# This service captures the X session of the user it runs as (DISPLAY=:0,
+# your own desktop). A client admitted over the tailnet therefore gets that
+# desktop: your files, your browser sessions, your sudo. Single-client
+# eviction still applies, so two clients cannot both attach, but the tailnet
+# is the only boundary.
+
+[Unit]
+Description=Ghostframe remote desktop server
+After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+Environment=TS_STATE_DIR=%S/ghostframe
+# Caps how large a remote client may make this session. The session is the
+# physical display, which a KVM may be capturing as the machine's recovery
+# view; an unclamped client could set a mode that view cannot show.
+# `install --max-resolution none` leaves the variable out.
+@MAX_RESOLUTION@
+ExecStart=%h/.local/bin/ghostframe-server capture
+Restart=on-failure
+# Exit 2 is "not logged in" or "unsupported session": retrying cannot fix it.
+RestartPreventExitStatus=2
+RestartSec=2
+SyslogIdentifier=ghostframe-server
+
+[Install]
+WantedBy=graphical-session.target

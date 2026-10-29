@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Ghostframe server
+Comment=Starts ghostframe-server.service in this graphical session
+# Written by `ghostframe-server install`. The unit's
+# WantedBy=graphical-session.target is not enough on its own: many desktops
+# (Enlightenment among them) never activate that target, so the service
+# would be enabled and never start. XDG autostart is honoured by every
+# desktop that honours anything, and `systemctl --user start` is idempotent.
+Exec=systemctl --user start ghostframe-server.service
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
