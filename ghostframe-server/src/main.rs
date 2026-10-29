@@ -40,6 +40,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
 
+    // The old xdaemon shares the tailnet state and takes no lock on it.
+    if matches!(cli.command, Command::Capture | Command::Login { .. }) {
+        if let Err(e) = refuse_if_legacy_xdaemon_installed(&cfg) {
+            eprintln!("error: {e}");
+            // 2: the unit does not restart-loop on it.
+            std::process::exit(if matches!(cli.command, Command::Capture) {
+                2
+            } else {
+                1
+            });
+        }
+    }
+
     let result = match cli.command {
         Command::Capture => return commands::capture::run(cfg).await,
         Command::Login {
@@ -82,6 +95,25 @@ fn install(
     let paths = commands::install::InstallPaths::new(&home);
     let exe = std::env::current_exe().map_err(|e| format!("locating this binary: {e}"))?;
     let username = pw.map(|p| p.name).ok_or("this uid has no passwd entry")?;
+    // Inside the old headless session, stopping it would kill this process:
+    // continue as a transient unit outside its cgroup.
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    let real_exe = std::fs::read_link("/proc/self/exe").unwrap_or_else(|_| exe.clone());
+    let mut pass_env = Vec::new();
+    if let Some(x) = cfg.xdg_state_home() {
+        pass_env.push(("XDG_STATE_HOME", x));
+    }
+    if commands::install::maybe_detach(
+        &mut commands::install::RealSystemctl,
+        &cgroup,
+        cfg.install_detached(),
+        &real_exe,
+        &commands::install::install_args(force, max_resolution),
+        &pass_env,
+        &mut std::io::stdout(),
+    )? {
+        return Ok(());
+    }
     let state_dir = cfg.unit_state_dir(&home)?;
     if let Some(ts) = cfg.ts_state_dir() {
         if std::path::Path::new(ts) != state_dir {
@@ -115,4 +147,17 @@ fn uninstall(cfg: &config::ServerConfig) -> Result<(), String> {
         &mut commands::install::RealSystemctl,
         &mut std::io::stdout(),
     )
+}
+
+/// `login` and `capture` refuse while the old xdaemon is installed or active.
+fn refuse_if_legacy_xdaemon_installed(cfg: &config::ServerConfig) -> Result<(), String> {
+    let home = cfg.home().map(std::path::Path::new);
+    commands::install::refuse_if_legacy_xdaemon(home, || {
+        // Only ask when a user manager is plausibly there (XDG_RUNTIME_DIR).
+        cfg.user_manager_possible()
+            && commands::install::Systemctl::is_active(
+                &mut commands::install::RealSystemctl,
+                "ghostframe-xdaemon.service",
+            )
+    })
 }
