@@ -13,7 +13,7 @@
 //! sandbox in this repository and deleted real files).
 
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::cli::MaxResolution;
@@ -36,6 +36,8 @@ const LEGACY_UNITS: &[&str] = &[
 /// Drop-in directories of legacy units (the 2026-10-29 stopgap lives in one).
 const LEGACY_DROPIN_DIRS: &[&str] = &["ghostframe-xdaemon.service.d"];
 /// The old attach-mode autostart entry.
+/// The one file the 2026-10-29 stopgap put in the drop-in directory.
+const STOPGAP_DROPIN: &str = "50-force-root-get-image.conf";
 const LEGACY_AUTOSTART: &str = "ghostframe-attach.desktop";
 
 /// Root-owned files the old installer wrote and nothing needs any more.
@@ -92,6 +94,8 @@ pub struct InstallContext<'a> {
 pub trait Systemctl {
     /// Run `systemctl --user <args>`; `Err` carries the reason.
     fn user(&mut self, args: &[&str]) -> Result<(), String>;
+    /// Whether the unit is active right now (false when unknown).
+    fn is_active(&mut self, unit: &str) -> bool;
 }
 
 /// The real `systemctl`.
@@ -104,7 +108,13 @@ impl Systemctl for RealSystemctl {
             .args(args)
             .output()
             .map_err(|e| format!("cannot run systemctl: {e}"))?;
-        if out.status.success() {
+        // `stop` of a unit the manager never loaded (or already unloaded after
+        // its file went) exits 5 with "Unit ... not loaded": nothing to stop,
+        // so not a failure. Any other failure is.
+        let not_loaded = args.first() == Some(&"stop")
+            && (out.status.code() == Some(5)
+                || String::from_utf8_lossy(&out.stderr).contains("not loaded"));
+        if out.status.success() || not_loaded {
             Ok(())
         } else {
             Err(format!(
@@ -113,6 +123,13 @@ impl Systemctl for RealSystemctl {
                 String::from_utf8_lossy(&out.stderr).trim()
             ))
         }
+    }
+
+    fn is_active(&mut self, unit: &str) -> bool {
+        std::process::Command::new("systemctl")
+            .args(["--user", "is-active", "--quiet", unit])
+            .status()
+            .is_ok_and(|s| s.success())
     }
 }
 
@@ -137,7 +154,52 @@ pub fn render_autostart() -> &'static str {
     AUTOSTART_TEMPLATE
 }
 
-/// `install`: see the design, section 3.1, for the steps.
+/// A `systemctl` failure after the files are written: install is idempotent,
+/// so say how to finish.
+fn finish_hint(e: String) -> String {
+    format!(
+        "{e}\n  re-running `ghostframe-server install` is safe; to finish by hand: \
+         `systemctl --user daemon-reload && systemctl --user enable --now ghostframe-server.service`"
+    )
+}
+
+/// Resolve the home directory `install` writes under. The unit's `%h`
+/// resolves to the passwd entry's home, so `HOME` must be absolute and equal
+/// to it, or the files written would not be the ones the unit points at.
+pub fn validated_home(
+    env_home: Option<&str>,
+    passwd_home: Option<&str>,
+) -> Result<PathBuf, String> {
+    let home = env_home.ok_or("HOME is not set; install writes under the user's home directory")?;
+    if !Path::new(home).is_absolute() {
+        return Err(format!("HOME={home:?} is not an absolute path"));
+    }
+    let pw = passwd_home.ok_or("this uid has no passwd entry, so its home cannot be checked")?;
+    if Path::new(home) != Path::new(pw) {
+        return Err(format!(
+            "HOME={home} is not your passwd home {pw}, which is what the unit's %h resolves \
+             to; run install as yourself with a login shell"
+        ));
+    }
+    Ok(PathBuf::from(home))
+}
+
+/// `install`: see the design, section 3.1, for the steps. Order, and why:
+///
+/// 1. Refuse root; require a reachable user manager (`show-environment`).
+///    Nothing has been touched yet, so a failure here is free.
+/// 2. Warn if a headless `ghostframe-xorg` session is active: stopping it
+///    ends the session this may be running in (SIGHUP is ignored by the
+///    caller, so install still finishes).
+/// 3. Everything that does not depend on the old units being stopped:
+///    binary, unit, autostart, `daemon-reload`, `enable`.
+/// 4. Stop every legacy unit by name, file or no file. A failure is fatal,
+///    and nothing below has happened: the legacy files are intact, so a
+///    re-run retries the stop.
+/// 5. Only now delete the legacy files and `daemon-reload` again.
+/// 6. Only now, with the old xdaemon confirmed stopped, read its state and
+///    adopt a registration that predates the marker.
+/// 7. Last: start the new service, if the node has joined.
 pub fn install(
     ctx: &InstallContext,
     force: bool,
@@ -148,7 +210,7 @@ pub fn install(
     let w = |out: &mut dyn Write, s: String| {
         let _ = writeln!(out, "{s}");
     };
-    // 1. Never as root: everything below belongs to the desktop user.
+    // 1.
     if ctx.euid == 0 {
         return Err(
             "refusing to install as root: run `ghostframe-server install` as the \
@@ -156,8 +218,31 @@ pub fn install(
                 .into(),
         );
     }
+    sys.user(&["show-environment"]).map_err(|e| {
+        format!(
+            "run `ghostframe-server install` from your desktop session (no user systemd \
+             manager reachable): {e}"
+        )
+    })?;
 
-    // 2. The binary.
+    // 2.
+    let stop_names = legacy_stop_names(ctx.paths)?;
+    for n in stop_names
+        .iter()
+        .filter(|n| n.starts_with("ghostframe-xorg"))
+    {
+        if sys.is_active(n) {
+            w(
+                out,
+                format!(
+                    "warning: {n} is active; stopping it ends the current graphical session. \
+                     install keeps going (SIGHUP is ignored) but this terminal may close"
+                ),
+            );
+        }
+    }
+
+    // 3.
     match copy_binary(ctx.current_exe, &ctx.paths.bin, force)? {
         CopyOutcome::AlreadyRunningFromTarget => w(
             out,
@@ -172,8 +257,6 @@ pub fn install(
             format!("binary: installed {}", ctx.paths.bin.display()),
         ),
     }
-
-    // 3. The unit.
     write_file(&ctx.paths.unit_dir.join(UNIT_NAME), &render_unit(max))?;
     w(
         out,
@@ -182,8 +265,7 @@ pub fn install(
             ctx.paths.unit_dir.join(UNIT_NAME).display()
         ),
     );
-
-    // 4. Autostart: Enlightenment never activates graphical-session.target.
+    // Enlightenment never activates graphical-session.target.
     write_file(
         &ctx.paths.autostart_dir.join(AUTOSTART_NAME),
         render_autostart(),
@@ -195,10 +277,21 @@ pub fn install(
             ctx.paths.autostart_dir.join(AUTOSTART_NAME).display()
         ),
     );
+    sys.user(&["daemon-reload"]).map_err(finish_hint)?;
+    sys.user(&["enable", UNIT_NAME]).map_err(finish_hint)?;
 
-    // 5. Migrate away from the old installer: stop and remove the old units
-    // before anything below looks at the state they were using.
-    for removed in migrate(ctx.paths, sys)? {
+    // 4.
+    for name in &stop_names {
+        sys.user(&["stop", name]).map_err(|e| {
+            format!(
+                "{e}\n  the old unit may still be running, so nothing of it was removed and \
+                 the tailnet state was not touched; fix that and re-run `ghostframe-server install`"
+            )
+        })?;
+    }
+
+    // 5.
+    for removed in remove_legacy(ctx.paths, out)? {
         w(out, format!("migrate: removed {}", removed.display()));
     }
     for leftover in root_leftovers(ctx.sysroot) {
@@ -209,9 +302,9 @@ pub fn install(
             ),
         );
     }
+    sys.user(&["daemon-reload"]).map_err(finish_hint)?;
 
-    // 6. Seeded? The old xdaemon registered the node without writing the
-    // marker; with it stopped, an offline check of its state can adopt it.
+    // 6. The old xdaemon registered the node without writing the marker.
     let mut seeded = ctx.state_dir.is_some_and(state::state_dir_seeded);
     if let Some(dir) = ctx.state_dir {
         if !seeded && state::state_is_registered(dir) {
@@ -229,11 +322,9 @@ pub fn install(
         }
     }
 
-    // 7. Enable, and start only if the node can join.
-    sys.user(&["daemon-reload"])?;
-    sys.user(&["enable", UNIT_NAME])?;
+    // 7.
     if seeded {
-        sys.user(&["restart", UNIT_NAME])?;
+        sys.user(&["restart", UNIT_NAME]).map_err(finish_hint)?;
         w(out, format!("service: enabled and (re)started {UNIT_NAME}"));
     } else {
         w(
@@ -247,7 +338,7 @@ pub fn install(
         );
     }
 
-    // 8. Unattended boot needs the session to exist: report, never fail.
+    // Unattended boot needs the session to exist: report, never fail.
     if lightdm_autologin_user(ctx.sysroot).as_deref() == Some(ctx.username) {
         w(
             out,
@@ -268,19 +359,38 @@ pub fn uninstall(
 ) -> Result<(), String> {
     // Not installed, or the user manager is gone: removing the files below
     // is still right, so report and continue.
+    let mut disable_failed = false;
     if let Err(e) = sys.user(&["disable", "--now", UNIT_NAME]) {
+        disable_failed = true;
         let _ = writeln!(out, "service: {e}");
     }
+    // `disable` also removes the enable link; when it could not run, remove
+    // that link by name or a dangling one keeps the unit "wanted".
+    let wants = paths
+        .unit_dir
+        .join("graphical-session.target.wants")
+        .join(UNIT_NAME);
     for path in [
         paths.unit_dir.join(UNIT_NAME),
+        wants,
         paths.autostart_dir.join(AUTOSTART_NAME),
         paths.bin.clone(),
     ] {
-        if remove_if_present(&path)? {
+        if remove_if_present(&path, false)? {
             let _ = writeln!(out, "removed {}", path.display());
         }
     }
-    sys.user(&["daemon-reload"])?;
+    if let Err(e) = sys.user(&["daemon-reload"]) {
+        disable_failed = true;
+        let _ = writeln!(out, "service: {e}");
+    }
+    if disable_failed {
+        let _ = writeln!(
+            out,
+            "warning: the user manager could not be told; if the service is still running, \
+             stop it with `systemctl --user stop ghostframe-server.service` from your desktop session"
+        );
+    }
     let _ = writeln!(
         out,
         "the tailnet state is kept; `ghostframe-server logout` removes it"
@@ -325,11 +435,33 @@ fn copy_binary(exe: &Path, target: &Path, force: bool) -> Result<CopyOutcome, St
         .ok_or_else(|| format!("{} has no parent directory", target.display()))?;
     std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     let staging = target.with_extension("new");
-    std::fs::copy(exe, &staging).map_err(|e| format!("copying to {}: {e}", staging.display()))?;
-    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("chmod {}: {e}", staging.display()))?;
-    std::fs::rename(&staging, target)
-        .map_err(|e| format!("renaming onto {}: {e}", target.display()))?;
+    // A leftover from an interrupted run (or a planted one) must not be
+    // written through: unlink it, then create exclusively.
+    match std::fs::remove_file(&staging) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("removing {}: {e}", staging.display())),
+    }
+    let stage = || -> Result<(), String> {
+        let mut src =
+            std::fs::File::open(exe).map_err(|e| format!("opening {}: {e}", exe.display()))?;
+        let mut dst = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(&staging)
+            .map_err(|e| format!("creating {}: {e}", staging.display()))?;
+        std::io::copy(&mut src, &mut dst)
+            .map_err(|e| format!("copying to {}: {e}", staging.display()))?;
+        dst.sync_all()
+            .map_err(|e| format!("syncing {}: {e}", staging.display()))?;
+        std::fs::rename(&staging, target)
+            .map_err(|e| format!("renaming onto {}: {e}", target.display()))
+    };
+    if let Err(e) = stage() {
+        let _ = std::fs::remove_file(&staging);
+        return Err(e);
+    }
     Ok(CopyOutcome::Copied)
 }
 
@@ -341,15 +473,23 @@ fn write_file(path: &Path, contents: &str) -> Result<(), String> {
     std::fs::write(path, contents).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
-/// Remove a file, symlink or directory if it exists; never follows a
-/// symlink. Returns whether anything was there.
-fn remove_if_present(path: &Path) -> Result<bool, String> {
+/// Remove a file or symlink if it exists; never follows a symlink. A
+/// directory is refused unless `allow_dir` (only the listed drop-in
+/// directories). Returns whether anything was there.
+fn remove_if_present(path: &Path, allow_dir: bool) -> Result<bool, String> {
     let md = match std::fs::symlink_metadata(path) {
         Ok(md) => md,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(format!("stat {}: {e}", path.display())),
     };
     let res = if md.is_dir() {
+        if !allow_dir {
+            return Err(format!(
+                "{} is a directory, not a file or symlink; refusing to remove it, \
+                 move it away and re-run",
+                path.display()
+            ));
+        }
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
@@ -358,10 +498,31 @@ fn remove_if_present(path: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Stop, disable and delete the old installer's user units, their drop-ins,
-/// the `*.wants/` links `enable` made for them, and the old autostart entry.
-/// Only names in the legacy lists are touched.
-fn migrate(paths: &InstallPaths, sys: &mut dyn Systemctl) -> Result<Vec<PathBuf>, String> {
+/// Every legacy unit to stop, by name: the fixed names whether or not their
+/// file exists (a loaded unit can outlive its file), plus any
+/// `ghostframe-xorg*.service` file present.
+fn legacy_stop_names(paths: &InstallPaths) -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = LEGACY_UNITS.iter().map(|s| s.to_string()).collect();
+    match std::fs::read_dir(&paths.unit_dir) {
+        Ok(rd) => {
+            let mut extra: Vec<String> = rd
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| is_legacy_unit(n) && !LEGACY_UNITS.contains(&n.as_str()))
+                .collect();
+            extra.sort();
+            names.extend(extra);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("reading {}: {e}", paths.unit_dir.display())),
+    }
+    Ok(names)
+}
+
+/// Delete the old installer's unit files, drop-ins, the `*.wants/` links
+/// `enable` made for them, and the old autostart entry. Only names in the
+/// legacy lists are touched; the units are already stopped.
+fn remove_legacy(paths: &InstallPaths, out: &mut dyn Write) -> Result<Vec<PathBuf>, String> {
     let mut removed = Vec::new();
     let entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(&paths.unit_dir) {
         Ok(rd) => rd.filter_map(Result::ok).collect(),
@@ -371,30 +532,48 @@ fn migrate(paths: &InstallPaths, sys: &mut dyn Systemctl) -> Result<Vec<PathBuf>
     for entry in &entries {
         let name = entry.file_name().to_string_lossy().into_owned();
         if is_legacy_unit(&name) {
-            // Best effort: a unit the user manager never loaded cannot be
-            // disabled, and the file goes either way.
-            let _ = sys.user(&["disable", "--now", &name]);
-            if remove_if_present(&entry.path())? {
+            if remove_if_present(&entry.path(), false)? {
                 removed.push(entry.path());
             }
         } else if LEGACY_DROPIN_DIRS.contains(&name.as_str()) {
-            if remove_if_present(&entry.path())? {
+            let mut foreign = false;
+            let mut files: Vec<String> = std::fs::read_dir(entry.path())
+                .map(|rd| {
+                    rd.filter_map(Result::ok)
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            files.sort();
+            for f in &files {
+                let _ = writeln!(out, "migrate: removing drop-in {name}/{f}");
+                foreign |= f != STOPGAP_DROPIN;
+            }
+            if remove_if_present(&entry.path(), true)? {
                 removed.push(entry.path());
             }
-        } else if name.ends_with(".wants") && entry.path().is_dir() {
+            if foreign {
+                let _ = writeln!(
+                    out,
+                    "  {name}/ held a file other than {STOPGAP_DROPIN}: if it carried settings \
+                     you want, recreate them with `systemctl --user edit ghostframe-server` \
+                     (GHOSTFRAME_ATTACH_MAX_RESOLUTION is now GHOSTFRAME_MAX_RESOLUTION)"
+                );
+            }
+        } else if name.ends_with(".wants") && entry.file_type().is_ok_and(|t| t.is_dir()) {
             for link in std::fs::read_dir(entry.path())
                 .map_err(|e| format!("reading {}: {e}", entry.path().display()))?
                 .filter_map(Result::ok)
             {
                 let link_name = link.file_name().to_string_lossy().into_owned();
-                if is_legacy_unit(&link_name) && remove_if_present(&link.path())? {
+                if is_legacy_unit(&link_name) && remove_if_present(&link.path(), false)? {
                     removed.push(link.path());
                 }
             }
         }
     }
     let autostart = paths.autostart_dir.join(LEGACY_AUTOSTART);
-    if remove_if_present(&autostart)? {
+    if remove_if_present(&autostart, false)? {
         removed.push(autostart);
     }
     removed.sort();
@@ -460,17 +639,39 @@ fn autologin_hint(username: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     /// Records `systemctl --user` calls instead of making them.
     #[derive(Default)]
     struct Recorder {
         calls: Vec<String>,
+        /// Calls (joined args) that fail.
+        fail_on: Vec<String>,
+        /// Units reported active.
+        active: Vec<String>,
+        /// When this call is made, write a registered `tailscaled.state`
+        /// into the directory: the old xdaemon registering "while it runs",
+        /// visible only if the state is read after the stop.
+        write_state_on: Option<(String, PathBuf)>,
     }
 
     impl Systemctl for Recorder {
         fn user(&mut self, args: &[&str]) -> Result<(), String> {
-            self.calls.push(args.join(" "));
+            let call = args.join(" ");
+            self.calls.push(call.clone());
+            if let Some((on, dir)) = &self.write_state_on {
+                if *on == call {
+                    write_state(dir, true);
+                }
+            }
+            if self.fail_on.contains(&call) {
+                return Err(format!("systemctl --user {call} failed: injected"));
+            }
             Ok(())
+        }
+
+        fn is_active(&mut self, unit: &str) -> bool {
+            self.active.iter().any(|u| u == unit)
         }
     }
 
@@ -527,8 +728,16 @@ mod tests {
         }
 
         fn run_install(&self, seeded: bool, force: bool) -> (Result<(), String>, Recorder, String) {
+            self.run_install_with(seeded, force, Recorder::default())
+        }
+
+        fn run_install_with(
+            &self,
+            seeded: bool,
+            force: bool,
+            mut sys: Recorder,
+        ) -> (Result<(), String>, Recorder, String) {
             let sysroot = self.sysroot();
-            let mut sys = Recorder::default();
             let mut out = Vec::new();
             let r = install(
                 &self.ctx(&sysroot, seeded),
@@ -588,7 +797,15 @@ mod tests {
         assert!(sb.paths.autostart_dir.join(AUTOSTART_NAME).exists());
         assert_eq!(
             sys.calls,
-            ["daemon-reload", "enable ghostframe-server.service"]
+            [
+                "show-environment",
+                "daemon-reload",
+                "enable ghostframe-server.service",
+                "stop ghostframe-xdaemon.service",
+                "stop ghostframe.target",
+                "stop ghostframe-wm.service",
+                "daemon-reload"
+            ]
         );
         assert!(out.contains("run `ghostframe-server login`"), "{out}");
     }
@@ -601,8 +818,13 @@ mod tests {
         assert_eq!(
             sys.calls,
             [
+                "show-environment",
                 "daemon-reload",
                 "enable ghostframe-server.service",
+                "stop ghostframe-xdaemon.service",
+                "stop ghostframe.target",
+                "stop ghostframe-wm.service",
+                "daemon-reload",
                 "restart ghostframe-server.service"
             ]
         );
@@ -698,8 +920,8 @@ mod tests {
             "ghostframe-xorg.service",
         ] {
             assert!(
-                sys.calls.contains(&format!("disable --now {unit}")),
-                "{unit} not disabled: {:?}",
+                sys.calls.contains(&format!("stop {unit}")),
+                "{unit} not stopped: {:?}",
                 sys.calls
             );
         }
@@ -804,10 +1026,15 @@ mod tests {
     fn a_legacy_home_ends_up_migrated_adopted_and_started_in_order() {
         let sb = Sandbox::new();
         let legacy = legacy_layout(&sb);
-        write_state(&sb.state, true);
+        // The registration appears only when the old xdaemon is stopped, so
+        // adopting before that stop finds nothing and the marker stays out.
+        let rec = Recorder {
+            write_state_on: Some(("stop ghostframe-xdaemon.service".into(), sb.state.clone())),
+            ..Recorder::default()
+        };
         assert!(!state::state_dir_seeded(&sb.state));
 
-        let (r, sys, out) = sb.run_install(false, false);
+        let (r, sys, out) = sb.run_install_with(false, false, rec);
         r.unwrap();
 
         for p in &legacy {
@@ -825,26 +1052,26 @@ mod tests {
             out.contains("adopted the existing tailnet registration"),
             "{out}"
         );
-        // Old units stopped first, then reload, enable, start.
-        let n = sys.calls.len();
-        assert!(n >= 4, "{:?}", sys.calls);
-        assert!(
-            sys.calls[..n - 3]
-                .iter()
-                .all(|c| c.starts_with("disable --now ghostframe")),
-            "{:?}",
-            sys.calls
+        // Everything independent of the stop first, then the stops, the
+        // deletes' reload, and the start last.
+        assert_eq!(
+            sys.calls[..3],
+            [
+                "show-environment",
+                "daemon-reload",
+                "enable ghostframe-server.service"
+            ]
         );
+        let n = sys.calls.len();
+        assert!(sys.calls[3..n - 2]
+            .iter()
+            .all(|c| c.starts_with("stop ghostframe")));
         assert!(sys
             .calls
-            .contains(&"disable --now ghostframe-xdaemon.service".to_string()));
+            .contains(&"stop ghostframe-xdaemon.service".to_string()));
         assert_eq!(
-            sys.calls[n - 3..],
-            [
-                "daemon-reload",
-                "enable ghostframe-server.service",
-                "restart ghostframe-server.service"
-            ]
+            sys.calls[n - 2..],
+            ["daemon-reload", "restart ghostframe-server.service"]
         );
     }
 
@@ -903,5 +1130,186 @@ mod tests {
             sys.calls,
             ["disable --now ghostframe-server.service", "daemon-reload"]
         );
+    }
+
+    #[test]
+    fn no_user_manager_fails_before_anything_is_touched() {
+        let sb = Sandbox::new();
+        let legacy = legacy_layout(&sb);
+        let rec = Recorder {
+            fail_on: vec!["show-environment".into()],
+            ..Recorder::default()
+        };
+        let (r, sys, _) = sb.run_install_with(false, false, rec);
+        let e = r.unwrap_err();
+        assert!(e.contains("from your desktop session"), "{e}");
+        assert_eq!(sys.calls, ["show-environment"]);
+        assert!(!sb.paths.bin.exists() && !sb.paths.unit_dir.join(UNIT_NAME).exists());
+        for p in &legacy {
+            assert!(p.exists());
+        }
+    }
+
+    #[test]
+    fn a_failed_stop_is_fatal_before_any_delete_or_adopt_and_a_rerun_retries() {
+        let sb = Sandbox::new();
+        let legacy = legacy_layout(&sb);
+        write_state(&sb.state, true);
+        let rec = Recorder {
+            fail_on: vec!["stop ghostframe-xdaemon.service".into()],
+            ..Recorder::default()
+        };
+        let (r, sys, _) = sb.run_install_with(false, false, rec);
+        let e = r.unwrap_err();
+        assert!(e.contains("re-run"), "{e}");
+        for p in &legacy {
+            assert!(
+                p.exists(),
+                "{} deleted despite the failed stop",
+                p.display()
+            );
+        }
+        assert!(
+            !state::state_dir_seeded(&sb.state),
+            "adopted despite failed stop"
+        );
+        assert!(!sys.calls.iter().any(|c| c.starts_with("restart")));
+        // The files are still there, so the re-run stops again and finishes.
+        let (r, sys, _) = sb.run_install(false, false);
+        r.unwrap();
+        assert!(sys
+            .calls
+            .contains(&"stop ghostframe-xdaemon.service".to_string()));
+        assert!(state::state_dir_seeded(&sb.state));
+    }
+
+    #[test]
+    fn units_are_stopped_by_name_even_when_their_files_are_gone() {
+        let sb = Sandbox::new();
+        let (r, sys, _) = sb.run_install(false, false);
+        r.unwrap();
+        assert!(sys
+            .calls
+            .contains(&"stop ghostframe-xdaemon.service".to_string()));
+    }
+
+    #[test]
+    fn a_failing_systemctl_after_the_files_says_rerun_is_safe() {
+        let sb = Sandbox::new();
+        let rec = Recorder {
+            fail_on: vec!["enable ghostframe-server.service".into()],
+            ..Recorder::default()
+        };
+        let e = sb.run_install_with(false, false, rec).0.unwrap_err();
+        assert!(e.contains("re-running"), "{e}");
+        assert!(e.contains("systemctl --user daemon-reload && systemctl --user enable --now ghostframe-server.service"), "{e}");
+    }
+
+    #[test]
+    fn an_active_headless_session_is_warned_about() {
+        let sb = Sandbox::new();
+        sb.touch(&sb.paths.unit_dir.join("ghostframe-xorg.service"));
+        let rec = Recorder {
+            active: vec!["ghostframe-xorg.service".into()],
+            ..Recorder::default()
+        };
+        let (r, _, out) = sb.run_install_with(false, false, rec);
+        r.unwrap();
+        assert!(out.contains("ends the current graphical session"), "{out}");
+        let (_, _, out) = sb.run_install(false, false);
+        assert!(!out.contains("ends the current graphical session"), "{out}");
+    }
+
+    #[test]
+    fn uninstall_continues_past_a_failed_disable_and_removes_the_wants_link() {
+        let sb = Sandbox::new();
+        sb.run_install(false, false).0.unwrap();
+        let link = sb
+            .paths
+            .unit_dir
+            .join("graphical-session.target.wants")
+            .join(UNIT_NAME);
+        sb.touch(&link);
+        let mut sys = Recorder {
+            fail_on: vec!["disable --now ghostframe-server.service".into()],
+            ..Recorder::default()
+        };
+        let mut out = Vec::new();
+        uninstall(&sb.paths, &mut sys, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("injected"), "{out}");
+        assert!(!link.exists() && !sb.paths.bin.exists());
+        assert!(!sb.paths.unit_dir.join(UNIT_NAME).exists());
+        assert!(sys.calls.contains(&"daemon-reload".to_string()));
+    }
+
+    #[test]
+    fn dropin_files_are_listed_and_foreign_ones_get_a_hint() {
+        let sb = Sandbox::new();
+        let d = sb.paths.unit_dir.join("ghostframe-xdaemon.service.d");
+        sb.touch(&d.join("50-force-root-get-image.conf"));
+        let (_, _, out) = sb.run_install(false, false);
+        assert!(
+            out.contains(
+                "removing drop-in ghostframe-xdaemon.service.d/50-force-root-get-image.conf"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("systemctl --user edit"), "{out}");
+        sb.touch(&d.join("local.conf"));
+        let (_, _, out) = sb.run_install(false, false);
+        assert!(
+            out.contains("systemctl --user edit ghostframe-server"),
+            "{out}"
+        );
+        assert!(out.contains("GHOSTFRAME_ATTACH_MAX_RESOLUTION"), "{out}");
+    }
+
+    #[test]
+    fn a_directory_named_like_a_legacy_unit_is_refused_not_deleted() {
+        let sb = Sandbox::new();
+        let dir = sb.paths.unit_dir.join("ghostframe-wm.service");
+        sb.touch(&dir.join("precious"));
+        let e = sb.run_install(false, false).0.unwrap_err();
+        assert!(e.contains("refusing to remove"), "{e}");
+        assert!(dir.join("precious").exists());
+    }
+
+    #[test]
+    fn a_symlinked_wants_dir_is_not_followed() {
+        let sb = Sandbox::new();
+        let outside = sb.root.path().join("outside.wants");
+        sb.touch(&outside.join("ghostframe-xdaemon.service"));
+        std::fs::create_dir_all(&sb.paths.unit_dir).unwrap();
+        std::os::unix::fs::symlink(&outside, sb.paths.unit_dir.join("evil.wants")).unwrap();
+        sb.run_install(false, false).0.unwrap();
+        assert!(outside.join("ghostframe-xdaemon.service").exists());
+    }
+
+    #[test]
+    fn a_stale_staging_file_is_not_written_through() {
+        let sb = Sandbox::new();
+        let victim = sb.root.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        std::fs::create_dir_all(sb.paths.bin.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&victim, sb.paths.bin.with_extension("new")).unwrap();
+        sb.run_install(false, false).0.unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(std::fs::read(&sb.paths.bin).unwrap(), b"binary v2");
+        assert!(!sb.paths.bin.with_extension("new").exists());
+    }
+
+    #[test]
+    fn home_must_be_absolute_and_the_passwd_home() {
+        assert_eq!(
+            validated_home(Some("/srv/alice"), Some("/srv/alice")).unwrap(),
+            PathBuf::from("/srv/alice")
+        );
+        let e = validated_home(Some("srv/alice"), Some("/srv/alice")).unwrap_err();
+        assert!(e.contains("not an absolute path"), "{e}");
+        let e = validated_home(Some("/tmp/fake"), Some("/srv/alice")).unwrap_err();
+        assert!(e.contains("not your passwd home /srv/alice"), "{e}");
+        assert!(validated_home(None, Some("/srv/alice")).is_err());
+        assert!(validated_home(Some("/srv/alice"), None).is_err());
     }
 }

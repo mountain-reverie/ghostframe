@@ -63,13 +63,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-fn install_paths(cfg: &config::ServerConfig) -> Result<commands::install::InstallPaths, String> {
-    let home = cfg
-        .home()
-        .ok_or("HOME is not set; install writes under the user's home directory")?;
-    Ok(commands::install::InstallPaths::new(std::path::Path::new(
-        home,
-    )))
+/// The validated home, and the passwd entry it was checked against.
+fn checked_home(
+    cfg: &config::ServerConfig,
+) -> Result<(std::path::PathBuf, Option<util::Passwd>), String> {
+    let pw = util::current_passwd();
+    let home = commands::install::validated_home(cfg.home(), pw.as_ref().map(|p| p.home.as_str()))?;
+    Ok((home, pw))
 }
 
 fn install(
@@ -77,15 +77,26 @@ fn install(
     force: bool,
     max_resolution: cli::MaxResolution,
 ) -> Result<(), String> {
-    let paths = install_paths(cfg)?;
+    util::ignore_sighup();
+    let (home, pw) = checked_home(cfg)?;
+    let paths = commands::install::InstallPaths::new(&home);
     let exe = std::env::current_exe().map_err(|e| format!("locating this binary: {e}"))?;
-    let username = util::current_username().ok_or("this uid has no passwd entry")?;
-    let state_dir = cfg.state_dir().ok();
+    let username = pw.map(|p| p.name).ok_or("this uid has no passwd entry")?;
+    let state_dir = cfg.unit_state_dir(&home)?;
+    if let Some(ts) = cfg.ts_state_dir() {
+        if std::path::Path::new(ts) != state_dir {
+            eprintln!(
+                "warning: TS_STATE_DIR={ts} in this shell is ignored: the installed service \
+                 uses {}",
+                state_dir.display()
+            );
+        }
+    }
     let ctx = commands::install::InstallContext {
         paths: &paths,
         current_exe: &exe,
         sysroot: std::path::Path::new("/"),
-        state_dir: state_dir.as_deref(),
+        state_dir: Some(&state_dir),
         username: &username,
         euid: util::euid(),
     };
@@ -100,7 +111,7 @@ fn install(
 
 fn uninstall(cfg: &config::ServerConfig) -> Result<(), String> {
     commands::install::uninstall(
-        &install_paths(cfg)?,
+        &commands::install::InstallPaths::new(&checked_home(cfg)?.0),
         &mut commands::install::RealSystemctl,
         &mut std::io::stdout(),
     )
