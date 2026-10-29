@@ -8,9 +8,10 @@
 //! must not gain an X concept. See the M4b design doc §5 and §7.
 
 use std::io::Read as _;
-use std::os::fd::AsRawFd as _;
+use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -69,7 +70,7 @@ pub struct XrandrDisplay {
     completed: Arc<AtomicU64>,
     /// Set by the worker as it exits (tests watch it).
     #[cfg(test)]
-    worker_exited: Arc<std::sync::atomic::AtomicBool>,
+    worker_exited: Arc<AtomicBool>,
     /// Test fault: fail the step that sets the target CRTC mode.
     #[cfg(test)]
     fail_set_crtc: std::sync::atomic::AtomicBool,
@@ -102,20 +103,53 @@ impl ReadbackTiming {
 }
 
 /// The handle on the read-back worker. Dropping `wake` hangs up the pipe the
-/// worker polls, which is how it learns to exit.
+/// worker polls, which is how it learns to exit while idle.
 struct Readback {
     /// The newest unverified request; a newer one replaces it.
     slot: Arc<Mutex<Option<Request>>>,
     wake: UnixStream,
     handle: Option<std::thread::JoinHandle<()>>,
+    /// A dup of the worker's X socket. The pipe cannot wake a worker that is
+    /// blocked in a round trip to an X server that has stopped answering;
+    /// shutting this socket down can.
+    x_fd: OwnedFd,
+    /// The worker sends once as it exits.
+    done: Mutex<mpsc::Receiver<()>>,
+    /// Set before the shutdown, so the worker's exit is not reported as a
+    /// failure.
+    stopping: Arc<AtomicBool>,
 }
+
+/// How long `Drop` waits for the worker before it gives up and detaches it.
+const WORKER_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 impl Drop for XrandrDisplay {
     fn drop(&mut self) {
-        if let Some(Readback { wake, handle, .. }) = self.readback.take() {
+        // The last owner of this controller can be capture's exit path; it
+        // must never hang there, or the service manager never gets to
+        // restart us.
+        if let Some(Readback {
+            wake,
+            handle,
+            x_fd,
+            done,
+            stopping,
+            ..
+        }) = self.readback.take()
+        {
+            stopping.store(true, Ordering::SeqCst);
+            // SAFETY: shutdown(2) on an fd we own; failure is harmless.
+            unsafe { libc::shutdown(x_fd.as_raw_fd(), libc::SHUT_RDWR) };
             drop(wake);
-            if let Some(h) = handle {
-                let _ = h.join();
+            match done.into_inner().unwrap().recv_timeout(WORKER_JOIN_TIMEOUT) {
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    tracing::warn!("the RandR read-back worker did not stop; detaching it");
+                }
+                _ => {
+                    if let Some(h) = handle {
+                        let _ = h.join();
+                    }
+                }
             }
         }
     }
@@ -240,7 +274,7 @@ impl XrandrDisplay {
             u32::from(root_setup.height_in_millimeters),
         )));
         #[cfg(test)]
-        let worker_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_exited = Arc::new(AtomicBool::new(false));
         let readback = timing.and_then(|timing| {
             match spawn_readback_worker(
                 display,
@@ -251,6 +285,7 @@ impl XrandrDisplay {
                     overridden: Arc::clone(&overridden),
                     completed: Arc::clone(&completed),
                     known_mm: Arc::clone(&known_mm),
+                    stopping: Arc::new(AtomicBool::new(false)),
                     #[cfg(test)]
                     exited: Arc::clone(&worker_exited),
                 },
@@ -296,11 +331,21 @@ impl XrandrDisplay {
     /// needs no separate notice -- capture polls the root geometry every
     /// frame and the frame size it reports follows.
     fn queue_readback(&self, ticket: u64, requested: (u16, u16)) {
-        use std::io::Write as _;
         if let Some(rb) = &self.readback {
             *rb.slot.lock().unwrap() = Some(Request { ticket, requested });
             // A full pipe already holds a wake-up; that is as good as ours.
-            let _ = (&rb.wake).write(&[1]);
+            // send(2) with MSG_NOSIGNAL rather than write: a dead worker must
+            // not raise SIGPIPE, and this process links Go, whose runtime
+            // owns signal handling.
+            // SAFETY: a valid fd and a one-byte buffer for the call.
+            unsafe {
+                libc::send(
+                    rb.wake.as_raw_fd(),
+                    [1u8].as_ptr().cast(),
+                    1,
+                    libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+                )
+            };
         }
     }
 
@@ -566,7 +611,13 @@ impl DisplayController for XrandrDisplay {
                     // The screen is whatever it is now; if the restore of it
                     // failed, the requested mode is the one that fits.
                     if let Err(e2) = set_crtc(mode, &[self.output]) {
-                        tracing::warn!(error = %e2, "could not light the output again; it may be dark");
+                        tracing::warn!(
+                            error = %e2,
+                            mode,
+                            mode_w,
+                            mode_h,
+                            "could not light the output again with the requested mode; it may be dark"
+                        );
                     }
                 }
             }
@@ -665,15 +716,25 @@ struct Worker {
     overridden: Arc<Mutex<Option<Overridden>>>,
     completed: Arc<AtomicU64>,
     known_mm: Arc<Mutex<(u32, u32)>>,
+    stopping: Arc<AtomicBool>,
     #[cfg(test)]
-    exited: Arc<std::sync::atomic::AtomicBool>,
+    exited: Arc<AtomicBool>,
 }
 
 /// Is a read-back due? `elapsed` since the request was applied, `since_event`
 /// since the last RandR event: after `settle` AND once `quiet`, or at `cap`
 /// whatever the desktop is still doing.
-fn due(elapsed: Duration, since_event: Duration, t: &ReadbackTiming) -> bool {
-    (elapsed >= t.settle && since_event >= t.quiet) || elapsed >= t.cap
+///
+/// `since_applied` is the time since the request was applied. It equals
+/// `elapsed` for a fresh request; a re-opened one starts `elapsed` at
+/// `settle`, but the watch still ends `cap` after the apply.
+fn due(
+    elapsed: Duration,
+    since_event: Duration,
+    since_applied: Duration,
+    t: &ReadbackTiming,
+) -> bool {
+    (elapsed >= t.settle && since_event >= t.quiet) || elapsed >= t.cap || since_applied >= t.cap
 }
 
 /// A request being watched towards its verdict.
@@ -710,6 +771,13 @@ fn spawn_readback_worker(
     let (wake, mut wake_rx) = UnixStream::pair().context("wake pipe")?;
     wake.set_nonblocking(true)?;
     wake_rx.set_nonblocking(true)?;
+    let x_fd = conn
+        .stream()
+        .as_fd()
+        .try_clone_to_owned()
+        .context("dup the X socket")?;
+    let (done_tx, done) = mpsc::channel::<()>();
+    let stopping = Arc::clone(&shared.stopping);
     let slot: Arc<Mutex<Option<Request>>> = Arc::new(Mutex::new(None));
     let worker_slot = Arc::clone(&slot);
     let handle = std::thread::Builder::new()
@@ -726,12 +794,16 @@ fn spawn_readback_worker(
             );
             #[cfg(test)]
             shared.exited.store(true, Ordering::SeqCst);
+            let _ = done_tx.send(());
         })
         .context("spawn randr-readback")?;
     Ok(Readback {
         slot,
         wake,
         handle: Some(handle),
+        x_fd,
+        done: Mutex::new(done),
+        stopping,
     })
 }
 
@@ -759,12 +831,20 @@ fn readback_loop(
                     last_event = Instant::now();
                     saw_event = true;
                     if let Event::RandrScreenChangeNotify(e) = ev {
-                        *shared.known_mm.lock().unwrap() =
-                            (u32::from(e.mwidth), u32::from(e.mheight));
+                        // A rotated screen reports its physical size turned.
+                        let turned = u16::from(e.rotation)
+                            & (u16::from(randr::Rotation::ROTATE90)
+                                | u16::from(randr::Rotation::ROTATE270))
+                            != 0;
+                        let (w, h) = (u32::from(e.mwidth), u32::from(e.mheight));
+                        *shared.known_mm.lock().unwrap() = if turned { (h, w) } else { (w, h) };
                     }
                 }
                 Ok(None) => break,
-                Err(_) => return,
+                Err(e) => {
+                    worker_failed(shared, "reading X events", &e);
+                    return;
+                }
             }
         }
         let now = Instant::now();
@@ -799,7 +879,12 @@ fn readback_loop(
                 continue;
             }
             let elapsed = now.duration_since(p.start);
-            if due(elapsed, now.duration_since(last_event), &timing) {
+            if due(
+                elapsed,
+                now.duration_since(last_event),
+                now.duration_since(p.applied),
+                &timing,
+            ) {
                 let Pending { req, applied, .. } = pending.take().expect("checked Some above");
                 last = Some((req, applied));
                 match read_actual(conn, root, crtc) {
@@ -816,7 +901,10 @@ fn readback_loop(
             }
             let quiet_at = last_event + timing.quiet;
             let settled_at = p.start + timing.settle;
-            let deadline = settled_at.max(quiet_at).min(p.start + timing.cap);
+            let deadline = settled_at
+                .max(quiet_at)
+                .min(p.start + timing.cap)
+                .min(p.applied + timing.cap);
             timeout = Some(deadline.saturating_duration_since(now));
         } else if let Some((_, applied)) = last {
             timeout = Some((applied + timing.cap).saturating_duration_since(now));
@@ -844,6 +932,7 @@ fn readback_loop(
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
+            worker_failed(shared, "poll", &std::io::Error::last_os_error());
             return;
         }
         if fds[1].revents != 0 {
@@ -853,10 +942,21 @@ fn readback_loop(
                     Ok(0) => return, // the controller was dropped
                     Ok(_) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => return,
+                    Err(e) => {
+                        worker_failed(shared, "reading the wake pipe", &e);
+                        return;
+                    }
                 }
             }
         }
+    }
+}
+
+/// The worker is leaving because something failed. Said once, unless the
+/// controller is the one stopping it (then the X socket was shut on purpose).
+fn worker_failed(shared: &Worker, what: &str, err: &dyn std::fmt::Display) {
+    if !shared.stopping.load(Ordering::SeqCst) {
+        tracing::warn!(error = %err, "the RandR read-back stopped while {what}; later overrides will go unreported");
     }
 }
 
@@ -1368,6 +1468,14 @@ mod live_tests {
         cap: Duration::from_millis(6000),
     };
 
+    /// Wide enough that scheduling jitter cannot reorder the steps of a test
+    /// that must act before the settle time.
+    const WIDE: ReadbackTiming = ReadbackTiming {
+        settle: Duration::from_millis(2500),
+        quiet: Duration::from_millis(1500),
+        cap: Duration::from_millis(10_000),
+    };
+
     fn with_readback(x: &PrivateXvfb) -> XrandrDisplay {
         XrandrDisplay::with_timing(Some(x.display()), None, Some(T)).unwrap()
     }
@@ -1381,6 +1489,36 @@ mod live_tests {
             );
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    /// The screen's physical size as a new client sees it.
+    fn screen_mm(display: &str) -> (u16, u16) {
+        let (conn, n) = x11rb::connect(Some(display)).unwrap();
+        let r = &conn.setup().roots[n];
+        (r.width_in_millimeters, r.height_in_millimeters)
+    }
+
+    /// The pid of the X server behind `display`, from the socket's peer.
+    fn server_pid(display: &str) -> libc::pid_t {
+        let sock = std::os::unix::net::UnixStream::connect(format!(
+            "/tmp/.X11-unix/X{}",
+            display.trim_start_matches(':')
+        ))
+        .unwrap();
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `cred` and `len` are valid for the call.
+        let r = unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(r, 0);
+        cred.pid
     }
 
     fn screen_size(display: &str) -> (u16, u16) {
@@ -1437,14 +1575,18 @@ mod live_tests {
     }
 
     /// Some -> None: an override, then a request that sticks clears it, and
-    /// the worker demonstrably ran for both.
+    /// the worker demonstrably ran for both. Its own, wide timing: the revert
+    /// must land well before the first verdict, or the count below is wrong.
     #[test]
     fn a_request_that_sticks_clears_an_earlier_override() {
         let x = PrivateXvfb::spawn(&["-screen", "0", "1280x1024x24"]);
         add_800x600(x.display());
-        let ctl = with_readback(&x);
+        let ctl = XrandrDisplay::with_timing(Some(x.display()), None, Some(WIDE)).unwrap();
+        let start = Instant::now();
         ctl.set_output(800, 600, 1000).unwrap();
         xrandr(x.display(), &["--output", "screen", "--mode", "1280x1024"]);
+        assert_eq!(ctl.completed.load(Ordering::SeqCst), 0);
+        assert!(Instant::now().duration_since(start) < WIDE.settle);
         wait_for("override", || ctl.overridden().is_some());
         assert_eq!(ctl.completed.load(Ordering::SeqCst), 1);
         ctl.set_output(800, 600, 1000).unwrap();
@@ -1491,9 +1633,14 @@ mod live_tests {
         let x = PrivateXvfb::spawn(&["-screen", "0", "1280x1024x24"]);
         add_800x600(x.display());
         let ctl = with_readback(&x);
+        // A scale of 2 gives the screen a physical size no default would.
+        ctl.set_output(1280, 1024, 2000).unwrap();
+        let mm = screen_mm(x.display());
+        assert_eq!(mm, (169, 135), "precondition: a distinctive size");
         ctl.fail_set_crtc.store(true, Ordering::SeqCst);
         assert!(ctl.set_output(800, 600, 1000).is_err());
         assert_eq!(screen_size(x.display()), (1280, 1024));
+        assert_eq!(screen_mm(x.display()), mm, "the physical size came back");
         let info = ctl
             .conn
             .randr_get_crtc_info(ctl.crtc, 0)
@@ -1541,14 +1688,18 @@ mod live_tests {
         };
         let ms = Duration::from_millis;
         // Settle not reached, however quiet the screen has been.
-        assert!(!due(ms(4000), ms(4000), &t));
+        assert!(!due(ms(4000), ms(4000), ms(4000), &t));
         // Settle reached, but an event 500 ms ago.
-        assert!(!due(ms(5200), ms(500), &t));
+        assert!(!due(ms(5200), ms(500), ms(5200), &t));
         // Both reached.
-        assert!(due(ms(5200), ms(1500), &t));
+        assert!(due(ms(5200), ms(1500), ms(5200), &t));
         // Never quiet, but the cap passed.
-        assert!(!due(ms(11_900), ms(10), &t));
-        assert!(due(ms(12_000), ms(10), &t));
+        assert!(!due(ms(11_900), ms(10), ms(11_900), &t));
+        assert!(due(ms(12_000), ms(10), ms(12_000), &t));
+        // A re-opened watch: `elapsed` starts at settle, but the cap counts
+        // from the apply.
+        assert!(!due(ms(5100), ms(10), ms(11_900), &t));
+        assert!(due(ms(5100), ms(10), ms(12_000), &t));
     }
 
     /// Dropping the controller ends the worker (Drop joins it, so this would
@@ -1569,20 +1720,69 @@ mod live_tests {
         assert!(exited.load(Ordering::SeqCst));
     }
 
-    /// Events inside the quiet period postpone the verdict: the desktop
-    /// changes the mode away and back, and only the end state is judged.
+    /// An X server that stops answering must not hang the drop: the worker
+    /// is blocked in a round trip, which only shutting its socket down
+    /// interrupts. (The 500 ms join bound is the second line of defence and
+    /// is not separately exercised: with the shutdown working it never fires.)
+    #[test]
+    fn dropping_the_controller_does_not_wait_for_a_stopped_x_server() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "1280x1024x24"]);
+        let t = ReadbackTiming {
+            settle: Duration::from_millis(100),
+            quiet: Duration::from_millis(50),
+            cap: Duration::from_millis(1000),
+        };
+        let ctl = XrandrDisplay::with_timing(Some(x.display()), None, Some(t)).unwrap();
+        ctl.set_output(1000, 700, 1000).unwrap();
+        let pid = server_pid(x.display());
+        // SAFETY: signalling the private Xvfb this test started.
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        // The read-back falls due at ~150 ms and blocks on the stopped server.
+        std::thread::sleep(Duration::from_millis(600));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let began = Instant::now();
+        std::thread::spawn(move || {
+            drop(ctl);
+            let _ = tx.send(());
+        });
+        let returned = rx.recv_timeout(Duration::from_secs(3));
+        let took = Instant::now().duration_since(began);
+        // SAFETY: as above.
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+        returned.expect("drop hung on a stopped X server");
+        assert!(
+            took < Duration::from_millis(400),
+            "took {took:?}: only the join bound saved it"
+        );
+    }
+
+    /// Events inside the quiet period postpone the verdict. The desktop
+    /// changes the mode away shortly before the settle time and back shortly
+    /// after it: judged at the settle time (no quiet period) the screen would
+    /// look overridden; judged once quiet, it is not.
     #[test]
     fn the_verdict_waits_for_the_screen_to_go_quiet() {
         let x = PrivateXvfb::spawn(&["-screen", "0", "1280x1024x24"]);
         add_800x600(x.display());
-        let ctl = with_readback(&x);
-        ctl.set_output(800, 600, 1000).unwrap();
-        std::thread::sleep(Duration::from_millis(800));
-        xrandr(x.display(), &["--output", "screen", "--mode", "1280x1024"]);
-        std::thread::sleep(Duration::from_millis(300));
-        xrandr(x.display(), &["--output", "screen", "--mode", "800x600_t"]);
+        let ctl = XrandrDisplay::with_timing(Some(x.display()), None, Some(WIDE)).unwrap();
         let start = Instant::now();
-        while Instant::now().duration_since(start) < Duration::from_millis(2500) {
+        ctl.set_output(800, 600, 1000).unwrap();
+        std::thread::sleep(Duration::from_millis(2000));
+        xrandr(x.display(), &["--output", "screen", "--mode", "1280x1024"]);
+        let away = Instant::now();
+        // Preconditions, pinned: still before settle, nothing judged yet.
+        assert!(away.duration_since(start) < WIDE.settle, "ran too late");
+        assert_eq!(ctl.completed.load(Ordering::SeqCst), 0);
+        std::thread::sleep(Duration::from_millis(1000));
+        xrandr(x.display(), &["--output", "screen", "--mode", "800x600_t"]);
+        // Back inside the quiet period of the change away, after settle.
+        assert!(
+            Instant::now().duration_since(away) < WIDE.quiet,
+            "ran too late"
+        );
+        assert!(Instant::now().duration_since(start) > WIDE.settle);
+        let polling = Instant::now();
+        while Instant::now().duration_since(polling) < Duration::from_millis(5500) {
             assert_eq!(ctl.overridden(), None, "judged mid-flap");
             std::thread::sleep(Duration::from_millis(25));
         }
