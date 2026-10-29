@@ -37,7 +37,7 @@ pub struct XrandrDisplay {
     /// subsequent successful call -- never a hardcoded guess.
     ceiling_fallback: Mutex<(u16, u16)>,
     /// `GHOSTFRAME_ATTACH_MAX_RESOLUTION`, read once at construction (this
-    /// crate's convention -- see `main.rs`). `Some("WIDTHxHEIGHT")` lowers
+    /// crate's convention -- see `config.rs`). `Some("WIDTHxHEIGHT")` lowers
     /// what `ceiling()` reports; `None` (unset) leaves the hardware ceiling
     /// alone. Applied by `clamp_ceiling()` on every path through `ceiling()`.
     max_resolution: Option<String>,
@@ -48,7 +48,7 @@ impl XrandrDisplay {
     /// present, and pick the first connected output with an available CRTC.
     ///
     /// Errors if no DISPLAY, RandR is missing, or there is no connected
-    /// output -- the caller (ghostframe-server's `main`) logs and continues with no
+    /// output -- the caller (`X11Backend::new`) logs and continues with no
     /// display controller, exactly like `XTestInjector::new`.
     pub fn new(max_resolution: Option<String>) -> anyhow::Result<Self> {
         use anyhow::{anyhow, Context};

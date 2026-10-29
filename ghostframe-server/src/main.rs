@@ -283,7 +283,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let frame_w = frame.width;
             let frame_h = frame.height;
             let frame_stride = frame.stride;
-            let frame_has_dmabuf = frame.dmabuf_fd.is_some();
             let frame_pixels_len = frame.pixels.len();
 
             // Optional PNG dump of the captured frame so we can SEE what the
@@ -333,7 +332,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     w = frame_w,
                     h = frame_h,
                     stride = frame_stride,
-                    has_dmabuf = frame_has_dmabuf,
                     pixels_len = frame_pixels_len,
                     capture_us = capture_us,
                     submit_us = submit_us,

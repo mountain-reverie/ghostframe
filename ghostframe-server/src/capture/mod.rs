@@ -1,7 +1,7 @@
 //! Capture backends.
 //!
 //! A backend bundles everything `GhostframeServer` consumes from the desktop
-//! it serves: frames, an input injector and an optional display controller.
+//! it serves: frames, damage, an optional input injector and an optional display controller.
 //! X11 is the only one today; a PipeWire/Wayland backend implements the same
 //! trait later (design: `docs/superpowers/specs/2026-10-29-ghostframe-server-x11-design.md`).
 
