@@ -9,9 +9,16 @@ done
 export TS_HOSTNAME=${TS_HOSTNAME:-ghostframe-server}
 export TS_STATE_DIR=${TS_STATE_DIR:-/tmp/ghostframe-ts}
 export TS_CONTROL_URL=${TS_CONTROL_URL:-http://headscale:8080}
-export DRM_DEVICE=${DRM_DEVICE:-/dev/dri/card0}
-export CAPTURE_FPS=${CAPTURE_FPS:-2}
 export DISPLAY=:99
+
+# --x11-sink patterns repaint at up to 60 Hz, and the tests built on them were
+# tuned at 30 fps capture (the old DRM-direct default). Everything else keeps
+# 2 fps. A CAPTURE_FPS set by the test wins either way.
+if [[ "${TEST_PATTERN:-}" == *--x11-sink* ]]; then
+    export CAPTURE_FPS=${CAPTURE_FPS:-30}
+else
+    export CAPTURE_FPS=${CAPTURE_FPS:-2}
+fi
 
 # M3.7b: apply tc qdisc shaping if SHAPE_* env vars set.
 # netem provides delay + loss; tbf provides bandwidth rate-limit.
@@ -31,27 +38,6 @@ if [[ -n "${SHAPE_BANDWIDTH_KBPS:-}" ]]; then
     else
         echo "entrypoint: WARNING — tc shaping unavailable (netem add failed; container needs --privileged or NET_ADMIN cap)"
     fi
-fi
-
-# If TEST_PATTERN uses DRM-direct mode, skip Xorg entirely — test-pattern
-# will be the DRM master itself and ghostframe-server's drm_capture will
-# read the FB the test-pattern attaches.
-if [[ "${TEST_PATTERN:-}" == *--drm-direct* ]]; then
-    echo "entrypoint: TEST_PATTERN is DRM-direct, skipping Xorg"
-    # Override the line-13 default of 2 fps: the DRM-direct path is
-    # GPU-light (no Xorg compositor in the loop) and needs a higher capture
-    # rate so the classifier-flip e2e windows see enough H.264 datagrams
-    # during motion phases. Caller can override via CAPTURE_FPS_DRM_DIRECT
-    # for ad-hoc experiments.
-    export CAPTURE_FPS=${CAPTURE_FPS_DRM_DIRECT:-30}
-    # No Xorg in the container — tell ghostframe-server to skip its
-    # `wait_for_x11` gate, which would otherwise block on display :99
-    # for 10 s and abort startup. Added when wait_for_x11 was introduced
-    # (commit 73c26a4) and silently broke every drm-direct e2e.
-    export GHOSTFRAME_NO_X11_WAIT=1
-    ghostframe-test-pattern ${TEST_PATTERN} &
-    sleep 1
-    exec /usr/local/bin/ghostframe-server
 fi
 
 # If XORG_CONF is unset, auto-detect the right config:
@@ -74,11 +60,45 @@ if [ -z "${XORG_CONF:-}" ]; then
 fi
 
 Xorg :99 -config "$XORG_CONF" &
-sleep 2
+for _ in $(seq 1 50); do
+    xrandr --query >/dev/null 2>&1 && break
+    sleep 0.2
+done
+
+# Switch the first connected output to WxH: one of its own modes when it has
+# one (VKMS lists 1024x768, 1920x1080 and 4096x2160), else a new mode (the
+# dummy driver accepts any timings).
+set_screen_mode() {
+    local mode=$1 w=${1%x*} h=${1#*x} out clock
+    out=$(xrandr --query | awk '/ connected/ {print $1; exit}')
+    if [[ -z "$out" ]]; then
+        echo "entrypoint: no connected output on $DISPLAY" >&2
+        return 1
+    fi
+    if ! xrandr --output "$out" --mode "$mode" 2>/dev/null; then
+        clock=$(( (w + 160) * (h + 30) * 60 / 1000000 + 1 ))
+        xrandr --newmode "gf_$mode" "$clock" \
+            "$w" $((w + 48)) $((w + 80)) $((w + 160)) \
+            "$h" $((h + 3)) $((h + 8)) $((h + 30))
+        xrandr --addmode "$out" "gf_$mode"
+        xrandr --output "$out" --mode "gf_$mode"
+    fi
+    echo "entrypoint: $out set to $mode for --x11-sink"
+}
+
+# --x11-sink draws a buffer the size of the root window, so the screen must
+# have the size the test expects before the pattern starts. The variable keeps
+# its DRM-direct name because tests and scenes set it; unset means 1024x768,
+# the VKMS preferred mode the DRM-direct patterns painted at.
+if [[ "${TEST_PATTERN:-}" == *--x11-sink* ]]; then
+    set_screen_mode "${GHOSTFRAME_DRM_MODE:-1024x768}"
+    # The DRM probe would read a VKMS scanout that X drawing does not reach.
+    export GHOSTFRAME_X11_CAPTURE_ONLY=1
+fi
 
 # Paint root window — default is --solid-red, override with TEST_PATTERN env var
 ghostframe-test-pattern ${TEST_PATTERN:---solid-red} &
 sleep 1
 
-# Start ghostframe-server (captures X11 root, serves via WebTransport)
+# Start the server (captures X11 root, serves via WebTransport)
 exec /usr/local/bin/ghostframe-server

@@ -222,7 +222,7 @@ async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
 /// single color, so `classify_tile`'s Rule 6 (`unique_colors <= 1`) always
 /// picks `CodecState::Solid` -- CDF 5/3 is never entered at all, and
 /// `cdf53_coverage_summary` would report `tiles=0` regardless of what the
-/// link does to it. `--gradient --drm-direct` (used by
+/// link does to it. `--gradient --x11-sink` (used by
 /// `e2e_cdf53_lossless_buildup_*` for exactly this reason) paints a static,
 /// full-screen diagonal gradient: every 32x32 tile has hundreds of unique
 /// colors, so the classifier's Rule 8 fallback forces Cdf53, and the scene
@@ -243,7 +243,7 @@ async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
 async fn native_client_converges_at_production_scale_under_loss() {
     eprintln!("[phase] starting headscale + ghostframe-server containers (production scale)");
     let setup = setup_e2e_server(E2eServerSpec {
-        test_pattern_args: "--gradient --drm-direct",
+        test_pattern_args: "--gradient --x11-sink",
         extra_env: &[
             ("GHOSTFRAME_DRM_MODE", "1920x1080"),
             ("GHOSTFRAME_ENABLE_CDF53", "1"),

@@ -2,7 +2,7 @@
 //! document on a shaped link, measured from server telemetry and from
 //! screenshots of the browser's canvas.
 //!
-//! Stimulus: `ghostframe-test-pattern --drm-direct --scroll-text`. The
+//! Stimulus: `ghostframe-test-pattern --x11-sink --scroll-text`. The
 //! reference frames come from the *same* pure renderer the stimulus paints
 //! with; because this library cannot depend on `ghostframe-test-pattern`
 //! (it depends on `ghostframe-bench`, which depends on this crate), the
@@ -283,7 +283,7 @@ pub async fn run_scroll_run(spec: &ScrollRunSpec, render: RefRender<'_>) -> Resu
     let scene = SceneSpec {
         name: "scroll_text",
         test_pattern_args: [
-            "--drm-direct",
+            "--x11-sink",
             "--scroll-text",
             "--scroll-rows-per-frame",
             &spec.rows_per_frame.to_string(),

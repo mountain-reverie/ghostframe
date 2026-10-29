@@ -1,6 +1,6 @@
-//! `--solid-per-tile --drm-direct` mode.
+//! `--solid-per-tile --x11-sink` mode.
 //!
-//! Paints a fixed scene into a DRM dumb buffer so the classifier sees
+//! Paints a fixed scene into a frame buffer so the classifier sees
 //! `unique_colors == 1` per corner tile and picks `CodecState::Solid`,
 //! while a central motion region keeps the tile-codec pipeline engaged so
 //! the classifier does NOT fall back to the whole-frame H.264 encoder.
@@ -16,7 +16,7 @@
 //!   * bottom-right  `YELLOW`  (0xFFFF00)
 //!
 //! Everything else is `BG_PIXEL = 0x141414` (the same near-black used by
-//! `text_grid_drm`). A 64×64 motion region centred on the screen cycles
+//! `text_grid_sink`). A 64×64 motion region centred on the screen cycles
 //! colours every ~16ms so capture frames see fresh dirty in the central
 //! tiles and the classifier stays in tile-codec mode.
 //!
@@ -34,14 +34,12 @@
 //! so the SAD-based dirty detector reports them as unchanged → classifier
 //! sees zero motion → enters Solid steady-state. Only the central motion
 //! region is repainted per tick (16ms cadence — same constant as
-//! `drm_direct::MOTION_TICK`).
+//! `cycle::MOTION_TICK`).
 
 use std::thread;
 use std::time::{Duration, Instant};
 
-use drm::control::Device as ControlDevice;
-
-use crate::drm_direct::{msync_buffer, setup_dumb_scanout};
+use crate::x11_sink::Scanout;
 
 /// Dark-grey background. Packed XRGB8888 → bytes `[0x14, 0x14, 0x14, 0x00]`.
 /// X (high byte) stays 0x00 to match the rest of the codebase's "X is don't
@@ -63,7 +61,7 @@ pub const CORNER_SIZE: u32 = 32;
 pub const MOTION_SIZE: u32 = 64;
 /// Motion-region repaint cadence. MUST stay below capture-frame interval so
 /// every captured frame sees fresh bytes in the central tiles — see the
-/// note in `drm_direct.rs` for the same constant.
+/// note in `cycle.rs` for the same constant.
 const MOTION_TICK: Duration = Duration::from_millis(16);
 
 /// One classifier-Solid sample location plus the colour the WebGPU client's
@@ -113,8 +111,8 @@ pub fn samples(width: u32, height: u32) -> Vec<CornerSample> {
 
 /// Paint the scene once, then loop forever repainting only the central
 /// motion region every `MOTION_TICK`.
-pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut scanout = setup_dumb_scanout(card_path)?;
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut scanout = Scanout::connect(None)?;
     let width = scanout.mode_w;
     let height = scanout.mode_h;
     let pitch = scanout.pitch as usize;
@@ -125,10 +123,7 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // ── One-time paint: background + four corner tiles ──────────────────────
     {
-        let mut map = scanout
-            .card
-            .map_dumb_buffer(&mut scanout.db)
-            .map_err(|e| format!("map_dumb_buffer: {e}"))?;
+        let mut map = scanout.map();
         let bytes = map.as_mut();
 
         // Background fill.
@@ -200,8 +195,6 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             },
             YELLOW_PIXEL,
         );
-
-        msync_buffer(fb.bytes);
         // `map` drops here.
     }
 
@@ -215,10 +208,7 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         {
-            let mut map = scanout
-                .card
-                .map_dumb_buffer(&mut scanout.db)
-                .map_err(|e| format!("map_dumb_buffer motion: {e}"))?;
+            let mut map = scanout.map();
             let bytes = map.as_mut();
 
             // 2-color flip at 33ms cadence (≈30Hz). Both colours form stable
@@ -231,7 +221,7 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             const FLIP_BLUE: u32 = 0x0000_00FF;
             #[allow(
                 clippy::disallowed_methods,
-                reason = "ghostframe-test-pattern does not depend on tokio at all -- this is a plain synchronous DRM scanout loop painting at a real 33ms wall-clock cadence, so there is no virtual clock for `start` to have come from"
+                reason = "ghostframe-test-pattern does not depend on tokio at all -- this is a plain synchronous root-window frame loop painting at a real 33ms wall-clock cadence, so there is no virtual clock for `start` to have come from"
             )]
             let pixel = if (start.elapsed().as_millis() / 33).is_multiple_of(2) {
                 FLIP_RED
@@ -255,8 +245,6 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 },
                 pixel,
             );
-
-            msync_buffer(fb.bytes);
         }
         thread::sleep(MOTION_TICK);
     }

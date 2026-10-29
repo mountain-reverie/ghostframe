@@ -1,4 +1,4 @@
-//! `--palrle-exact --drm-direct` mode.
+//! `--palrle-exact --x11-sink` mode.
 //!
 //! Paint-once scene with four 32×32 PalRle test tiles, each with a
 //! distinct 2-color pattern. Drives `e2e_palrle_exact_pixels` (M3.2c
@@ -30,9 +30,7 @@
 use std::thread;
 use std::time::Duration;
 
-use drm::control::Device as ControlDevice;
-
-use crate::drm_direct::{msync_buffer, setup_dumb_scanout};
+use crate::x11_sink::Scanout;
 
 /// Dark-grey background. Packed XRGB8888 → bytes `[0x14, 0x14, 0x14, 0x00]`.
 const BG_PIXEL: u32 = 0x0014_1414;
@@ -161,10 +159,10 @@ pub fn samples() -> Vec<ExactSample> {
     ]
 }
 
-/// Paint the scene once, then enter a keepalive loop that re-maps the
-/// dumb buffer and msyncs without writing — the pattern is static.
-pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut scanout = setup_dumb_scanout(card_path)?;
+/// Paint the scene once, then enter a keepalive
+/// loop that only sleeps — the pattern is static.
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut scanout = Scanout::connect(None)?;
     let width = scanout.mode_w;
     let height = scanout.mode_h;
     let pitch = scanout.pitch as usize;
@@ -174,10 +172,7 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     {
-        let mut map = scanout
-            .card
-            .map_dumb_buffer(&mut scanout.db)
-            .map_err(|e| format!("map_dumb_buffer: {e}"))?;
+        let mut map = scanout.map();
         let bytes = map.as_mut();
 
         // Background fill — every active pixel set to BG_PIXEL.
@@ -204,20 +199,13 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         paint_tile(bytes, pitch, width, height, T_BLOCKS2X2, |px, py| {
             (px / 2 + py / 2) % 2 == 0
         });
-
-        msync_buffer(bytes);
     }
 
     eprintln!("palrle_exact: scene painted — entering keepalive loop");
 
-    let keepalive = Duration::from_millis(33);
+    // The root window keeps what was drawn; nothing to refresh.
     loop {
-        thread::sleep(keepalive);
-        let mut map = scanout
-            .card
-            .map_dumb_buffer(&mut scanout.db)
-            .map_err(|e| format!("map_dumb_buffer keepalive: {e}"))?;
-        msync_buffer(map.as_mut());
+        thread::sleep(Duration::from_secs(60));
     }
 }
 

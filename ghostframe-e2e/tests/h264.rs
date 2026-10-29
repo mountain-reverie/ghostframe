@@ -3,7 +3,7 @@
 //! Requires Docker, a GPU, VA-API, and the host VKMS setup (the server's
 //! full-frame H.264 encoder is fed by the GPU capture pipeline, so the CPU
 //! capture path `native_client.rs` uses produces no H.264 at all). This is
-//! the same `gpu: true` + `--drm-direct` shape `e2e_mode_switch_chromium`
+//! the same `gpu: true` + `--x11-sink` shape `e2e_mode_switch_chromium`
 //! uses, not the M1 test's shape. Deliberately NOT named in any CI workflow
 //! -- see `.github/workflows/e2e.yml` for why `native_client.rs` and
 //! `showcase.rs` are unlisted; the same reasoning applies here.
@@ -104,7 +104,7 @@ async fn h264_frames_from_the_server_render_into_the_dmabuf() {
 
     eprintln!("[phase] starting headscale + ghostframe-server containers (gpu capture)");
     let setup = setup_e2e_server(E2eServerSpec {
-        test_pattern_args: "--gradient --drm-direct",
+        test_pattern_args: "--gradient --x11-sink",
         // Pin H.264 rather than relying on the adaptation policy choosing
         // it. Sessions already start in H.264 (`io_bridge.rs:3435`), but
         // "already" is how a test comes to depend on a default nobody
