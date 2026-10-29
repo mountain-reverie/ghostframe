@@ -153,6 +153,8 @@ jobs:
       # Integration-test targets are not covered by --lib and CI names them
       # explicitly; a new tests/*.rs file runs nowhere until it is listed here.
       - run: cargo test -p ghostframe-lib --test bwe_bench
+      # ghostframe-server's command-line contract (exit codes, the state lock).
+      - run: cargo test -p ghostframe-server --test commands
 
   build-release:
     name: build-release
