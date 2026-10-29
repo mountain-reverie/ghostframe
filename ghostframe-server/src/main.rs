@@ -476,8 +476,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 /// Consecutive failed captures tolerated before the daemon exits (about ten
-/// seconds at the default 30 fps). Transient failures (a mode switch, a
-/// momentary DRM master loss) clear well inside this.
+/// seconds at the default 30 fps). Transient failures (a mode switch, an X
+/// server hiccup) clear well inside this.
 const MAX_CONSECUTIVE_CAPTURE_FAILURES: u32 = 300;
 
 #[derive(Debug, Default)]
