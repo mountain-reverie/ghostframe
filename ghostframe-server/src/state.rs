@@ -8,7 +8,7 @@
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The lock file's name inside the state directory.
 pub const LOCK_FILE: &str = ".lock";
@@ -21,8 +21,8 @@ pub fn state_dir_seeded(state_dir: &Path) -> bool {
 
 #[derive(Debug)]
 pub enum LockError {
-    /// Another process holds the lock.
-    Busy,
+    /// Another process holds the lock; `path` is the lock file.
+    Busy { path: PathBuf },
     /// The lock file could not be opened or locked.
     Io(std::io::Error),
 }
@@ -30,10 +30,13 @@ pub enum LockError {
 impl std::fmt::Display for LockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LockError::Busy => write!(
+            LockError::Busy { path } => write!(
                 f,
                 "the ghostframe-server service is running; stop it first \
-                 (systemctl --user stop ghostframe-server)"
+                 (systemctl --user stop ghostframe-server; lock: {}; \
+                 `fuser {}` shows the holder)",
+                path.display(),
+                path.display()
             ),
             LockError::Io(e) => write!(f, "cannot lock the state directory: {e}"),
         }
@@ -65,7 +68,9 @@ impl StateLock {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let e = std::io::Error::last_os_error();
             return Err(if e.kind() == std::io::ErrorKind::WouldBlock {
-                LockError::Busy
+                LockError::Busy {
+                    path: state_dir.join(LOCK_FILE),
+                }
             } else {
                 LockError::Io(e)
             });
@@ -94,14 +99,17 @@ mod tests {
         // flock locks belong to the open file description, so a second open
         // in the same process conflicts exactly as another process would.
         let second = StateLock::acquire(d.path());
-        assert!(matches!(second, Err(LockError::Busy)), "{second:?}");
+        assert!(matches!(second, Err(LockError::Busy { .. })), "{second:?}");
         drop(first);
         StateLock::acquire(d.path()).expect("free again once dropped");
     }
 
     #[test]
     fn the_busy_message_says_to_stop_the_service() {
-        let msg = LockError::Busy.to_string();
+        let path = PathBuf::from("/state/.lock");
+        let msg = LockError::Busy { path: path.clone() }.to_string();
         assert!(msg.contains("service is running; stop it first"), "{msg}");
+        assert!(msg.contains("lock: /state/.lock"), "{msg}");
+        assert!(msg.contains("`fuser /state/.lock`"), "{msg}");
     }
 }

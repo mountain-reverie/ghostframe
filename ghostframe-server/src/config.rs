@@ -12,7 +12,7 @@
 //!
 //! | Variable | Meaning | Default |
 //! |---|---|---|
-//! | `DISPLAY` | X display (diagnostics only; x11rb reads it itself) | unset |
+//! | `DISPLAY` | X display; passed explicitly to the capture, damage and input connections | unset |
 //! | `GHOSTFRAME_LOG_FORMAT` | `json` for JSON logs | text |
 //! | `TS_HOSTNAME` | tsnet node name | `<hostname>-ghostframe` (`ghostframe-server` if the host has no name) |
 //! | `TS_STATE_DIR` | tsnet state directory (holds node keys) | `$XDG_STATE_HOME/ghostframe`, else `~/.local/state/ghostframe` |
