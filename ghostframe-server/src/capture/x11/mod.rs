@@ -31,12 +31,13 @@ impl X11Backend {
     /// control are each optional and logged when missing, so a desktop that
     /// lacks one still streams.
     pub fn new(cfg: &ServerConfig) -> io::Result<Self> {
-        let frames = frames::X11Frames::connect(None, cfg.dump_first_frame.clone())?;
+        let frames =
+            frames::X11Frames::connect(cfg.display.as_deref(), cfg.dump_first_frame.clone())?;
 
         // Not armed yet: damage reporting is switched on and off with the
         // capture gate, so the X server does no damage bookkeeping for us
         // while no client is connected.
-        let damage = damage::XDamageMonitor::new();
+        let damage = damage::XDamageMonitor::new(cfg.display.as_deref());
         if damage.is_some() {
             tracing::info!("XDamage available; armed only while a client is connected");
         } else {
@@ -114,6 +115,11 @@ impl super::Backend for X11Backend {
         self.damage.as_ref().is_some_and(|d| d.is_armed())
     }
 
+    /// Drained damage plus the cursor's tiles.
+    ///
+    /// The lib's GPU path does not consume these hints today (only the CPU
+    /// comparison in `process_frame_cpu_at` reads `damage_tiles`); the cursor
+    /// merge is here for the day it does.
     fn drain_damage(&mut self) -> Option<Vec<(u32, u32)>> {
         // The cursor is blended into every frame but X reports no damage for
         // it. Poll it on every drain (it is also the cursor `capture` then
@@ -140,8 +146,9 @@ fn merge_cursor_damage(
     if damage.is_empty() {
         return None;
     }
+    let mut seen: std::collections::HashSet<_> = damage.iter().copied().collect();
     for t in cursor {
-        if !damage.contains(&t) {
+        if seen.insert(t) {
             damage.push(t);
         }
     }
@@ -182,7 +189,64 @@ pub fn wait_for_x11(timeout: Duration, display: Option<&str>) -> Result<(), Stri
 
 #[cfg(test)]
 mod tests {
-    use super::merge_cursor_damage;
+    use super::*;
+    use crate::capture::x11::test_support::PrivateXvfb;
+    use crate::capture::Backend;
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ConnectionExt, CreateGCAux, Rectangle};
+
+    /// Damage hints at the backend level: a pointer warp raises no damage,
+    /// so with other damage present the hint must still cover the tiles the
+    /// cursor left and entered.
+    #[test]
+    fn drain_damage_covers_the_cursor_tiles_alongside_real_damage() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "256x256x24"]);
+        let d = x.display();
+        let mut backend = X11Backend {
+            frames: frames::X11Frames::connect(Some(d), None).unwrap(),
+            damage: damage::XDamageMonitor::new(Some(d)),
+            input: None,
+            display: None,
+        };
+        backend.arm_damage();
+        assert!(backend.damage_armed());
+
+        let (conn, n) = x11rb::connect(Some(d)).unwrap();
+        let root = conn.setup().roots[n].root;
+        let warp = |px: i16, py: i16| {
+            conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, px, py)
+                .unwrap();
+            conn.get_input_focus().unwrap().reply().unwrap();
+        };
+
+        // Draw the cursor at (10,10), then prime: drop everything so far.
+        warp(10, 10);
+        backend.capture(0).unwrap();
+        let _ = backend.drain_damage();
+
+        // Real damage in tile (7,7), and a silent pointer move.
+        let gc = conn.generate_id().unwrap();
+        conn.create_gc(gc, root, &CreateGCAux::new().foreground(0xffffff))
+            .unwrap();
+        conn.poly_fill_rectangle(
+            root,
+            gc,
+            &[Rectangle {
+                x: 230,
+                y: 230,
+                width: 10,
+                height: 10,
+            }],
+        )
+        .unwrap();
+        conn.get_input_focus().unwrap().reply().unwrap();
+        warp(100, 70);
+
+        let hint = backend.drain_damage().expect("damage was reported");
+        for tile in [(7, 7), (0, 0), (3, 2)] {
+            assert!(hint.contains(&tile), "{tile:?} missing from {hint:?}");
+        }
+    }
 
     #[test]
     fn cursor_tiles_join_the_damage_without_duplicates() {

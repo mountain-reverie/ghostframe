@@ -45,15 +45,16 @@ pub struct XDamageMonitor {
 }
 
 impl XDamageMonitor {
-    /// Connect to `$DISPLAY` and confirm the XDamage extension is present.
+    /// Connect to `display` (`None` = `$DISPLAY`) and confirm the XDamage
+    /// extension is present.
     ///
     /// Returns `None` if the extension is unavailable. Does **not** arm: the
     /// daemon starts with no client connected, and arming then would be the
     /// leak this type exists to avoid. Call [`arm`] when a client attaches.
     ///
     /// [`arm`]: XDamageMonitor::arm
-    pub fn new() -> Option<Self> {
-        let (conn, screen_num) = RustConnection::connect(None).ok()?;
+    pub fn new(display: Option<&str>) -> Option<Self> {
+        let (conn, screen_num) = RustConnection::connect(display).ok()?;
 
         // Query the damage extension. This also registers extension info so
         // events are properly parsed once we do arm.
@@ -345,18 +346,12 @@ mod rect_tests {
     }
 }
 
-/// Tests that need a live X server on `$DISPLAY`.
-///
-/// They create and destroy a Damage object on the real root window and draw
-/// nothing, so running them against a developer's own session is invisible --
-/// a Damage object is a per-client server resource.
-///
-/// CI has no X server, so the `unit` job runs `cargo test --workspace --bins`
-/// under `xvfb-run`. The skip belongs in the workflow, never here: a runtime
-/// self-skip would mean a developer who breaks this never sees it fail.
+/// Tests that need a live X server: each starts its own private Xvfb
+/// (`test_support::PrivateXvfb`), so they never touch `$DISPLAY`.
 #[cfg(test)]
 mod x11_tests {
     use super::*;
+    use crate::capture::x11::test_support::PrivateXvfb;
 
     /// The arm/disarm cycle reuses one XID across every reconnect, which is
     /// only sound if the server accepts `damage_create` under an XID the
@@ -370,7 +365,8 @@ mod x11_tests {
     /// Without both, a rejected request is indistinguishable from success.
     #[test]
     fn x11_arm_disarm_cycle_is_accepted_by_the_server() {
-        let mut m = XDamageMonitor::new().expect("XDamage extension on $DISPLAY");
+        let x = PrivateXvfb::spawn(&["-screen", "0", "256x256x24"]);
+        let mut m = XDamageMonitor::new(Some(x.display())).expect("XDamage extension");
         assert!(!m.is_armed(), "new() must not arm: the daemon starts idle");
 
         for cycle in 0..3 {
@@ -397,7 +393,8 @@ mod x11_tests {
     /// `armed` guard would show up as a queued error here.
     #[test]
     fn x11_arm_and_disarm_are_idempotent() {
-        let mut m = XDamageMonitor::new().expect("XDamage extension on $DISPLAY");
+        let x = PrivateXvfb::spawn(&["-screen", "0", "256x256x24"]);
+        let mut m = XDamageMonitor::new(Some(x.display())).expect("XDamage extension");
 
         m.disarm();
         assert!(!m.is_armed(), "disarming an unarmed monitor is a no-op");
@@ -421,7 +418,8 @@ mod x11_tests {
     /// This is the property the capture loop's gate depends on.
     #[test]
     fn x11_drain_is_empty_while_disarmed() {
-        let m = XDamageMonitor::new().expect("XDamage extension on $DISPLAY");
+        let x = PrivateXvfb::spawn(&["-screen", "0", "256x256x24"]);
+        let m = XDamageMonitor::new(Some(x.display())).expect("XDamage extension");
         assert!(
             m.drain_damage().is_empty(),
             "a monitor that was never armed cannot have damage to report"
@@ -443,7 +441,8 @@ mod x11_tests {
         use x11rb::protocol::xproto::ConnectionExt as _;
         use x11rb::protocol::xproto::{CreateGCAux, Rectangle};
 
-        let mut m = XDamageMonitor::new().expect("XDamage extension on $DISPLAY");
+        let x = PrivateXvfb::spawn(&["-screen", "0", "256x256x24"]);
+        let mut m = XDamageMonitor::new(Some(x.display())).expect("XDamage extension");
         let pixmap = m.retarget_to_scratch_pixmap(128, 128);
 
         let gc = m.conn.generate_id().expect("generate_id for gc");

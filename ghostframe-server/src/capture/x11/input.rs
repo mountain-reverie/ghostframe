@@ -31,11 +31,11 @@ pub struct XTestInjector {
 impl XTestInjector {
     /// Connect to the local X server and confirm the XTEST extension is
     /// present. Errors if no DISPLAY or XTEST is missing — the caller
-    /// (ghostframe-server's main) logs and continues with no injector.
+    /// (`X11Backend::new`) logs and continues with no injector.
     pub fn new(display: Option<&str>) -> Result<Self> {
         let display_env = display.unwrap_or("<unset>").to_string();
         let (conn, screen_num) =
-            x11rb::connect(None).map_err(|e| anyhow!("x11rb::connect: {e}"))?;
+            x11rb::connect(display).map_err(|e| anyhow!("x11rb::connect: {e}"))?;
         let root = conn.setup().roots[screen_num].root;
 
         // Confirm XTEST extension is available.
