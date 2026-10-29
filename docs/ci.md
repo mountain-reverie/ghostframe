@@ -45,7 +45,7 @@ The exact list lives in [`ci/skip-list.txt`](../ci/skip-list.txt), grouped
 into two categories:
 
 **Category 1 — VKMS-gated (~25 tests).** Tests whose body calls
-`setup_e2e_webgpu_gpu(...)` or passes `--drm-direct` to the test pattern.
+`setup_e2e_webgpu_gpu(...)` or passes `--x11-sink` to the test pattern.
 They require the host kernel's `vkms` module (`enable_writeback=1`) with
 `/dev/dri` bind-mounted into the test-server container. GitHub-hosted
 runners cannot load kernel modules.

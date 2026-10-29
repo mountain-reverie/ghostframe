@@ -1953,8 +1953,6 @@ name = "ghostframe-test-pattern"
 version = "0.1.0"
 dependencies = [
  "clap",
- "drm",
- "drm-ffi",
  "ghostframe-bench",
  "libc",
  "x11rb",

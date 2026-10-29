@@ -12,9 +12,7 @@ name = "ghostframe-test-pattern"
 path = "src/main.rs"
 
 [dependencies]
-x11rb = "0.13"
+x11rb = { version = "0.13", features = ["shm"] }
 clap = { version = "4", features = ["derive"] }
-drm = "0.15"
-drm-ffi = "0.9"
 libc = "0.2"
 ghostframe-bench = { path = "../ghostframe-bench" }

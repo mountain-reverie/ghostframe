@@ -3,7 +3,7 @@
 //! Re-exports the modules the e2e tests need to import (font tables, text-grid
 //! coordinates). The binary CLI lives in `main.rs`.
 
-pub mod drm_direct;
+pub mod cycle;
 pub mod font;
 pub mod gradient;
 pub mod lossless_golden;
@@ -15,5 +15,6 @@ pub mod scroll_text;
 pub mod solid_per_tile;
 pub mod subtle_drift;
 pub mod text_grid;
-pub mod text_grid_drm;
+pub mod text_grid_sink;
 pub mod tile_pattern;
+pub mod x11_sink;

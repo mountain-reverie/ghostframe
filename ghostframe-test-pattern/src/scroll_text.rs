@@ -1,4 +1,4 @@
-//! `--drm-direct --scroll-text`: a text document scrolling vertically at a
+//! `--x11-sink --scroll-text`: a text document scrolling vertically at a
 //! fixed rate, then held still.
 //!
 //! This is the stimulus for the text-under-motion bench scene (scroll
@@ -29,7 +29,7 @@
 //!    then paint `scroll_secs * fps` further frames, `rows_per_frame` rows
 //!    lower each, on a fixed deadline schedule.
 //! 3. Emit `scroll-event phase=stop mono_ns=... final_offset_rows=...` and hold
-//!    the final frame forever (a keep-alive `msync` only, no pixel writes).
+//!    the final frame forever (re-drawn unchanged every 33 ms).
 //!
 //! `CLOCK_MONOTONIC` is the same clock the server's `ghostframe::bench`
 //! telemetry stamps (`capture_done_ns`), and containers share the host's, so
@@ -42,11 +42,9 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use drm::control::Device as ControlDevice;
-
-use crate::drm_direct::{msync_buffer, setup_dumb_scanout};
 use crate::font::{pixel_set, GLYPH_H, GLYPH_W};
 use crate::text_grid::{BG_PIXEL, FG_PIXEL};
+use crate::x11_sink::Scanout;
 
 /// Integer upscale applied to the 6x8 font.
 pub const SCALE: u32 = 2;
@@ -185,17 +183,11 @@ pub struct ScrollConfig {
     pub go_file: Option<String>,
 }
 
-fn present(
-    scanout: &mut crate::drm_direct::DrmScanout,
-    frame: Option<&[u8]>,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn present(scanout: &mut Scanout, frame: Option<&[u8]>) -> Result<(), Box<dyn std::error::Error>> {
     let pitch = scanout.pitch as usize;
     let row_bytes = scanout.mode_w as usize * 4;
     let height = scanout.mode_h as usize;
-    let mut map = scanout
-        .card
-        .map_dumb_buffer(&mut scanout.db)
-        .map_err(|e| format!("map_dumb_buffer: {e}"))?;
+    let mut map = scanout.map();
     let bytes = map.as_mut();
     if let Some(f) = frame {
         // One bulk copy per row from a fully rendered local frame, so a
@@ -205,12 +197,11 @@ fn present(
                 .copy_from_slice(&f[y * row_bytes..(y + 1) * row_bytes]);
         }
     }
-    msync_buffer(bytes);
     Ok(())
 }
 
-pub fn run(card_path: &str, cfg: &ScrollConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let mut scanout = setup_dumb_scanout(card_path)?;
+pub fn run(cfg: &ScrollConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scanout = Scanout::connect(None)?;
     let (w, h) = (scanout.mode_w, scanout.mode_h);
     eprintln!(
         "scroll_text: scanout {w}x{h} active rows_per_frame={} secs={} fps={}",

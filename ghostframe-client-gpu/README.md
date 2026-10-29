@@ -49,7 +49,7 @@ dmabuf export) and Weston in addition to Docker, deliberately not named
 in any CI workflow.
 
 `ghostframe-e2e --test h264` (`tests/h264.rs`) is the M3 acceptance test:
-H.264 access units encoded by a live server (GPU capture, `--drm-direct`,
+H.264 access units encoded by a live server (GPU capture, `--x11-sink`,
 frame mode pinned to H.264), carried over the same tailnet as
 `native_client`, decoded on VA-API hardware, and blitted through the
 NV12->RGB shader into an exported dmabuf. It asserts the decoded frame

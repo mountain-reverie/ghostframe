@@ -35,7 +35,7 @@ Not a Criterion bench: a Docker + VKMS + Chromium scene, driven by an example in
 frames, and `ghostframe-test-pattern -> ghostframe-bench -> ghostframe-e2e`
 forbids a normal dependency the other way).
 
-Stimulus: `ghostframe-test-pattern --drm-direct --scroll-text` scrolls a
+Stimulus: `ghostframe-test-pattern --x11-sink --scroll-text` scrolls a
 procedural text document at `--scroll-rows-per-frame` (default 3) rows per frame,
 30 fps, for `--scroll-secs` (default 10), then holds the last frame.
 `--scroll-rows-per-frame 0` is the static control (same timeline, nothing moves).

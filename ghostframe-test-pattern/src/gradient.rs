@@ -1,4 +1,4 @@
-//! `--gradient --drm-direct` mode.
+//! `--gradient --x11-sink` mode.
 //!
 //! Full-screen diagonal RGB gradient. Each 32×32 tile contains >16 unique
 //! colors, forcing the classifier into the high-color path (Raw fallback,
@@ -14,15 +14,13 @@
 //!
 //! Pixel format: XRGB8888 little-endian — bytes are [B, G, R, X].
 
-use drm::control::Device as ControlDevice;
-
-use crate::drm_direct::{msync_buffer, setup_dumb_scanout};
+use crate::x11_sink::Scanout;
 
 /// Paint the gradient once, then sleep forever (matches the
 /// `solid_per_tile` "paint once, hold scanout" pattern but without
 /// the motion loop — Cdf53 emission tests don't need motion).
-pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut scanout = setup_dumb_scanout(card_path)?;
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut scanout = Scanout::connect(None)?;
     let width = scanout.mode_w;
     let height = scanout.mode_h;
     let pitch = scanout.pitch as usize;
@@ -32,10 +30,7 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     {
-        let mut map = scanout
-            .card
-            .map_dumb_buffer(&mut scanout.db)
-            .map_err(|e| format!("map_dumb_buffer: {e}"))?;
+        let mut map = scanout.map();
         let bytes = map.as_mut();
 
         let row_active = width as usize * 4;
@@ -52,9 +47,7 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 chunk[3] = 0xFF;
             }
         }
-
-        msync_buffer(bytes);
-        // `map` drops here, returning the buffer to the DRM master.
+        // `map` drops here, which draws the frame into root.
     }
 
     eprintln!("gradient: scene painted — holding scanout");

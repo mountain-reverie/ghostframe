@@ -922,16 +922,16 @@ async fn e2e_palrle_5pct_loss_body<B: helpers::BrowserSession>(browser: &mut B) 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_palrle_5pct_loss_chromium() -> Result<()> {
-    // CAPTURE_FPS_DRM_DIRECT=2: keep CDP responsive.  5% loss with
+    // CAPTURE_FPS=2: keep CDP responsive.  5% loss with
     // text-grid (mostly static) still exercises the retransmit path
     // at 2 fps; the test asserts on log lines, not per-frame timing.
     let mut setup = setup_e2e_webgpu_gpu_with_env(
-        "--text-grid --drm-direct",
+        "--text-grid --x11-sink",
         &[
             ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.05"),
             ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled"),
             ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42"),
-            ("CAPTURE_FPS_DRM_DIRECT", "2"),
+            ("CAPTURE_FPS", "2"),
         ],
     )
     .await?;
@@ -942,7 +942,7 @@ async fn e2e_palrle_5pct_loss_chromium() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_palrle_5pct_loss_firefox() -> Result<()> {
     let mut setup = setup_e2e_webgpu_gpu_with_env_firefox(
-        "--text-grid --drm-direct",
+        "--text-grid --x11-sink",
         &[
             ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.05"),
             ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled"),
@@ -963,16 +963,14 @@ async fn e2e_palrle_5pct_loss_firefox() -> Result<()> {
 async fn e2e_solid_per_tile_pixels() -> Result<()> {
     use ghostframe_test_pattern::solid_per_tile::samples;
 
-    // CAPTURE_FPS_DRM_DIRECT=2: keep the JS main thread idle enough that
+    // CAPTURE_FPS=2: keep the JS main thread idle enough that
     // CDP Runtime.evaluate returns within chromiumoxide's 30 s budget.
     // The entrypoint default is 30 fps which saturates Chrome's renderer
     // and makes the per-sample __readPixel evals time out.  This test
     // only needs enough captures to settle the 4 corner tiles, not 30 fps.
-    let setup = setup_e2e_webgpu_gpu_with_env(
-        "--solid-per-tile --drm-direct",
-        &[("CAPTURE_FPS_DRM_DIRECT", "2")],
-    )
-    .await?;
+    let setup =
+        setup_e2e_webgpu_gpu_with_env("--solid-per-tile --x11-sink", &[("CAPTURE_FPS", "2")])
+            .await?;
     // Allow page load → WebGPU init → first frame capture → palette/solid
     // emission → render. The corners get one bundled Solid frame each;
     // the motion region keeps the codec pipeline engaged so the classifier
@@ -1033,7 +1031,7 @@ async fn e2e_solid_per_tile_pixels() -> Result<()> {
 
 /// W3/B1 — Exact-pixel verification of the PalRLE compute shader.
 ///
-/// Drives `--palrle-exact --drm-direct`'s four 32×32 PalRle tiles
+/// Drives `--palrle-exact --x11-sink`'s four 32×32 PalRle tiles
 /// (checkerboard / horizontal stripes / vertical stripes / 2×2 blocks,
 /// all sharing a 2-color red/blue palette) and asserts exact RGBA at
 /// 16 sample points. Catches nibble-swap, per-pixel arithmetic,
@@ -1046,14 +1044,11 @@ async fn e2e_solid_per_tile_pixels() -> Result<()> {
 async fn e2e_palrle_exact_pixels() -> Result<()> {
     use ghostframe_test_pattern::palrle_exact::samples;
 
-    // CAPTURE_FPS_DRM_DIRECT=2: see e2e_solid_per_tile_pixels for the
+    // CAPTURE_FPS=2: see e2e_solid_per_tile_pixels for the
     // rationale.  The static four-tile checkerboard pattern only needs
     // a couple of captures to settle; 30 fps saturates CDP.
-    let setup = setup_e2e_webgpu_gpu_with_env(
-        "--palrle-exact --drm-direct",
-        &[("CAPTURE_FPS_DRM_DIRECT", "2")],
-    )
-    .await?;
+    let setup =
+        setup_e2e_webgpu_gpu_with_env("--palrle-exact --x11-sink", &[("CAPTURE_FPS", "2")]).await?;
     // 5s covers QUIC slow-start + first-frame H.264 phase + classifier
     // transition to PalRle for the four 2-color test tiles.
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1101,7 +1096,7 @@ async fn e2e_palrle_exact_pixels() -> Result<()> {
 /// handle_decode_error logs the message via tracing::warn — we
 /// substring-match the rendered log line.
 ///
-/// Test pattern: `--palrle-exact --drm-direct` paints four 32x32 tiles
+/// Test pattern: `--palrle-exact --x11-sink` paints four 32x32 tiles
 /// that are genuinely two-colour (red/blue), at tile coords (5,5), (10,5),
 /// (5,10), (10,10). They classify as `PalRle` on the first dirty pass.
 /// Tile (5,5) is the checkerboard. (This used `--solid-per-tile` and tile
@@ -1124,10 +1119,10 @@ async fn e2e_palrle_oob_index() -> Result<()> {
     // paints four tiles that are genuinely two-colour; tile (5,5) is the
     // checkerboard.
     let _setup = setup_e2e_webgpu_gpu_with_env(
-        "--palrle-exact --drm-direct",
+        "--palrle-exact --x11-sink",
         &[
             ("GHOSTFRAME_INJECT_OOB_PALRLE", "5,5"),
-            ("CAPTURE_FPS_DRM_DIRECT", "2"),
+            ("CAPTURE_FPS", "2"),
         ],
     )
     .await?;
@@ -1269,13 +1264,10 @@ async fn e2e_palrle_session_reset_body<B: helpers::BrowserSession>(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_palrle_session_reset_chromium() -> Result<()> {
-    // CAPTURE_FPS_DRM_DIRECT=2: keep CDP responsive across the
+    // CAPTURE_FPS=2: keep CDP responsive across the
     // page.reload + post-reset codec evals.
-    let mut setup = setup_e2e_webgpu_gpu_with_env(
-        "--text-grid --drm-direct",
-        &[("CAPTURE_FPS_DRM_DIRECT", "2")],
-    )
-    .await?;
+    let mut setup =
+        setup_e2e_webgpu_gpu_with_env("--text-grid --x11-sink", &[("CAPTURE_FPS", "2")]).await?;
     let page_url = setup.server.page_url.clone();
     e2e_palrle_session_reset_body(&mut setup.browser, &page_url).await?;
     setup.browser.close().await
@@ -1283,7 +1275,7 @@ async fn e2e_palrle_session_reset_chromium() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_palrle_session_reset_firefox() -> Result<()> {
-    let mut setup = setup_e2e_webgpu_gpu_firefox("--text-grid --drm-direct").await?;
+    let mut setup = setup_e2e_webgpu_gpu_firefox("--text-grid --x11-sink").await?;
     let page_url = setup.server.page_url.clone();
     e2e_palrle_session_reset_body(&mut setup.browser, &page_url).await?;
     setup.browser.close().await
@@ -1797,7 +1789,7 @@ async fn e2e_static_mixed_codecs_converge_on_a_shaped_link() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_a_4k_screen_runs_on_the_gpu_path_and_converges() -> Result<()> {
     let setup = setup_e2e_webgpu_gpu_with_env(
-        "--gradient --drm-direct",
+        "--gradient --x11-sink",
         &[
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
             ("GHOSTFRAME_FORCE_TILECODEC", "1"),
@@ -1942,7 +1934,7 @@ async fn e2e_a_4k_screen_runs_on_the_gpu_path_and_converges() -> Result<()> {
 /// It was committed as a reproduction of the production defect, on the
 /// strength of `tiles=2040 complete=0 gave_up=1587` with tiles stranded
 /// missing their three finest passes. That was real, reproducible, and an
-/// artifact of this test: `CAPTURE_FPS_DRM_DIRECT=5`, inherited from the
+/// artifact of this test: `CAPTURE_FPS=5`, inherited from the
 /// overload scene. Production captures at ~30 fps. Raising it converges the
 /// same scene completely.
 ///
@@ -1986,13 +1978,13 @@ async fn e2e_production_scale_with_loss_converges() -> Result<()> {
         // compositor an X11 repaint after the initial modeset never reaches
         // scanout. Measured -- a mixed.rs repaint printed its marker and the
         // server then captured 44 frames without a single dirty tile.
-        "--tile-pattern photo --subtle-drift-once 60000 --drm-direct",
+        "--tile-pattern photo --subtle-drift-once 60000 --x11-sink",
         &[
             // Production captures at ~30 fps. 5 was inherited from the
             // overload scene and is not production-like: the refinement
             // drain fires about once per captured frame, so a low capture
             // rate throttles delivery independently of link capacity.
-            ("CAPTURE_FPS_DRM_DIRECT", "30"),
+            ("CAPTURE_FPS", "30"),
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
             ("GHOSTFRAME_FORCE_TILECODEC", "1"),
             // Production scale. VKMS prefers 1024x768 (32x24 = 768 tiles);
@@ -2233,9 +2225,9 @@ async fn e2e_saturated_link_starves_tiles_into_giving_up() -> Result<()> {
         // supersede churn a live desktop does, and the lossless/static
         // variants above already show a static screen converges cleanly
         // even at 2 Mbit with 8% loss.
-        "--tile-pattern photo --subtle-drift 250 --drm-direct",
+        "--tile-pattern photo --subtle-drift 250 --x11-sink",
         &[
-            ("CAPTURE_FPS_DRM_DIRECT", "5"),
+            ("CAPTURE_FPS", "5"),
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
             // See the lossless scene: pins the frame mode so a cost-based
             // H264 switch cannot masquerade as stranded tiles.
@@ -2368,9 +2360,9 @@ async fn e2e_production_shaped_session_strands_no_tiles() -> Result<()> {
     use ghostframe_e2e::harness::net_shape::NetShape;
 
     let setup = setup_e2e_webgpu_gpu_with_env(
-        "--gradient --drm-direct",
+        "--gradient --x11-sink",
         &[
-            ("CAPTURE_FPS_DRM_DIRECT", "2"),
+            ("CAPTURE_FPS", "2"),
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
             // Pin the frame mode. Without this the classifier may switch to
             // H264 mid-scene on cost grounds, Cdf53 emission stops, and the
@@ -2460,14 +2452,11 @@ async fn e2e_production_shaped_session_strands_no_tiles() -> Result<()> {
 async fn e2e_text_clarity() -> Result<()> {
     use ghostframe_test_pattern::text_grid::SAMPLES;
 
-    // CAPTURE_FPS_DRM_DIRECT=2: see e2e_solid_per_tile_pixels for the
+    // CAPTURE_FPS=2: see e2e_solid_per_tile_pixels for the
     // rationale.  Static text grid converges in a few captures; 30 fps
     // saturates CDP and the per-pair contrast evals time out.
-    let setup = setup_e2e_webgpu_gpu_with_env(
-        "--text-grid --drm-direct",
-        &[("CAPTURE_FPS_DRM_DIRECT", "2")],
-    )
-    .await?;
+    let setup =
+        setup_e2e_webgpu_gpu_with_env("--text-grid --x11-sink", &[("CAPTURE_FPS", "2")]).await?;
 
     // Allow QUIC slow-start + a couple of frames so every glyph tile arrives.
     tokio::time::sleep(Duration::from_secs(6)).await;
@@ -3262,7 +3251,7 @@ async fn e2e_mode_switch_body<B: helpers::BrowserSession>(browser: &mut B) -> Re
 #[tokio::test]
 async fn e2e_mode_switch_chromium() -> Result<()> {
     let mut setup = setup_e2e_webgpu_gpu_with_env(
-        "--drm-direct --mode-switch-cycle 3 --motion video",
+        "--x11-sink --mode-switch-cycle 3 --motion video",
         &[("GHOSTFRAME_ENABLE_CDF53", "1")],
     )
     .await?;
@@ -3372,13 +3361,13 @@ async fn sample_mode_dominance(
 /// headroom_guard override must force H264 mode even for content
 /// the M3.5 cost comparison alone would assign to TileCodec.
 ///
-/// Uses `--drm-direct --mode-switch-cycle 2` (alternating static/motion)
+/// Uses `--x11-sink --mode-switch-cycle 2` (alternating static/motion)
 /// so the classifier has a mix of content; the headroom_guard override
 /// forces H264 regardless of which half the classifier is currently in.
 #[tokio::test]
 async fn e2e_headroom_guard_forces_h264() -> Result<()> {
     let setup = setup_e2e_webgpu_gpu_with_env(
-        "--drm-direct --mode-switch-cycle 2",
+        "--x11-sink --mode-switch-cycle 2",
         &[
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
             ("GHOSTFRAME_TEST_FORCE_BYTES_PER_US", "0.1"),
@@ -3428,7 +3417,7 @@ async fn e2e_headroom_guard_forces_h264() -> Result<()> {
 #[tokio::test]
 async fn e2e_loss_override_forces_h264() -> Result<()> {
     let setup = setup_e2e_webgpu_gpu_with_env(
-        "--drm-direct --mode-switch-cycle 2 --motion-tick-ms 100",
+        "--x11-sink --mode-switch-cycle 2 --motion-tick-ms 100",
         &[
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
             // OUTBOUND, not inbound: it is the server's tile datagrams that
@@ -3533,7 +3522,7 @@ async fn e2e_ack_loss() -> Result<()> {
 ///
 /// Closes the M3.2c B2 deferral (originally blocked on a PalRle-emitting
 /// test pattern + the latent on_session_reset / LRU bugs, all fixed by
-/// 2026-05-18). Uses `--solid-per-tile --drm-direct`: motion region's
+/// 2026-05-18). Uses `--solid-per-tile --x11-sink`: motion region's
 /// 2-color flip emits bundled palette in the first frame for each color,
 /// the client ACKs, server marks delivered=true, and subsequent dirty
 /// frames for the same palette emit thin+indices_raw (flags=0x02).
@@ -3557,13 +3546,13 @@ async fn e2e_indices_raw_handshake() -> Result<()> {
     // re-send carries indices only -- thin, and with the capability
     // negotiated, indices-raw.
     //
-    // CAPTURE_FPS_DRM_DIRECT=2: see e2e_solid_per_tile_pixels for the
+    // CAPTURE_FPS=2: see e2e_solid_per_tile_pixels for the
     // rationale. 30 fps saturates CDP and the later evals time out. The drift
     // interval is shorter than the capture interval so every captured frame
     // differs from the last.
     let setup = setup_e2e_webgpu_gpu_with_env(
-        "--tile-pattern flat_ui --subtle-drift 100 --drm-direct",
-        &[("CAPTURE_FPS_DRM_DIRECT", "2")],
+        "--tile-pattern flat_ui --subtle-drift 100 --x11-sink",
+        &[("CAPTURE_FPS", "2")],
     )
     .await?;
 
@@ -3637,13 +3626,13 @@ async fn e2e_decode_error_thin_uncached() -> Result<()> {
     // `--palrle-exact` (static, four genuinely two-colour tiles), at the
     // default capture rate. Not `--solid-per-tile`: since 9bfaff2 its
     // motion tiles are single-colour per frame and take Solid, so no palette
-    // is ever delivered. Not CAPTURE_FPS_DRM_DIRECT=2 either: a session reset
+    // is ever delivered. Not CAPTURE_FPS=2 either: a session reset
     // puts the server in H.264 until `exit_sustain_frames = 30` static frames
     // have passed (15 s at 2 fps, 1 s at 30), and thin PalRle can only be
     // emitted after that handoff. Phase 3 below waits 6 s. The test does
     // only ~10 evaluate() calls, so 30 fps does not saturate CDP here.
     let setup = setup_e2e_webgpu_gpu_with_env(
-        "--palrle-exact --drm-direct",
+        "--palrle-exact --x11-sink",
         &[("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET", "1")],
     )
     .await?;
@@ -3762,11 +3751,9 @@ async fn e2e_webgpu_fallback_swiftshader() -> Result<()> {
 /// are dropped silently but recorded in `__ghostframeRecordedCodecs`.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_cdf53_gradient_emission() -> Result<()> {
-    let setup = setup_e2e_webgpu_gpu_with_env(
-        "--gradient --drm-direct",
-        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
-    )
-    .await?;
+    let setup =
+        setup_e2e_webgpu_gpu_with_env("--gradient --x11-sink", &[("GHOSTFRAME_ENABLE_CDF53", "1")])
+            .await?;
     // 5s settle covers initial H264 burst + mode-flip handoff + Cdf53 emissions.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -4032,11 +4019,9 @@ async fn e2e_cdf53_lossless_buildup_body<B: helpers::BrowserSession>(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_cdf53_lossless_buildup_chromium() -> Result<()> {
-    let mut setup = setup_e2e_webgpu_gpu_with_env(
-        "--gradient --drm-direct",
-        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
-    )
-    .await?;
+    let mut setup =
+        setup_e2e_webgpu_gpu_with_env("--gradient --x11-sink", &[("GHOSTFRAME_ENABLE_CDF53", "1")])
+            .await?;
     e2e_cdf53_lossless_buildup_body(&mut setup.browser).await?;
     setup.browser.close().await
 }
@@ -4050,11 +4035,9 @@ async fn e2e_cdf53_lossless_buildup_chromium() -> Result<()> {
 /// non-blank, so an all-black screen cannot pass.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_cdf53_dirty_inverse_matches_full_grid() -> Result<()> {
-    let mut setup = setup_e2e_webgpu_gpu_with_env(
-        "--gradient --drm-direct",
-        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
-    )
-    .await?;
+    let mut setup =
+        setup_e2e_webgpu_gpu_with_env("--gradient --x11-sink", &[("GHOSTFRAME_ENABLE_CDF53", "1")])
+            .await?;
     tokio::time::sleep(Duration::from_secs(15)).await;
     let r: serde_json::Value = setup
         .browser
@@ -4085,7 +4068,7 @@ async fn e2e_cdf53_dirty_inverse_matches_full_grid() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_cdf53_lossless_buildup_firefox() -> Result<()> {
     let mut setup = setup_e2e_webgpu_gpu_with_env_firefox(
-        "--gradient --drm-direct",
+        "--gradient --x11-sink",
         &[("GHOSTFRAME_ENABLE_CDF53", "1")],
     )
     .await?;
@@ -4156,7 +4139,7 @@ async fn e2e_cdf53_lossless_under_congestion_body<B: helpers::BrowserSession>(
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_cdf53_lossless_under_congestion_chromium() -> Result<()> {
     let mut setup = setup_e2e_webgpu_gpu_with_env(
-        "--gradient --drm-direct",
+        "--gradient --x11-sink",
         &[
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
             // 25% tile-datagram loss: high enough that ~5% of tiles won't
@@ -4177,7 +4160,7 @@ async fn e2e_cdf53_lossless_under_congestion_chromium() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_cdf53_lossless_under_congestion_firefox() -> Result<()> {
     let mut setup = setup_e2e_webgpu_gpu_with_env_firefox(
-        "--gradient --drm-direct",
+        "--gradient --x11-sink",
         &[
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
             ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.25"),
@@ -4196,7 +4179,7 @@ async fn e2e_cdf53_lossless_under_congestion_firefox() -> Result<()> {
 /// wavelet bug is in `cdf53_integrate.wgsl` or in the inverse-shader chain.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_cdf53_bypass_integrate() -> Result<()> {
-    let setup = setup_e2e_webgpu_gpu("--gradient --drm-direct").await?;
+    let setup = setup_e2e_webgpu_gpu("--gradient --x11-sink").await?;
     // Wait for framebuffer to be sized.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
@@ -4279,7 +4262,7 @@ async fn e2e_cdf53_bypass_integrate() -> Result<()> {
 /// `uploadBatch`'s packing) correctly accumulates bit-planes.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_cdf53_integrate_correctness() -> Result<()> {
-    let setup = setup_e2e_webgpu_gpu("--gradient --drm-direct").await?;
+    let setup = setup_e2e_webgpu_gpu("--gradient --x11-sink").await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let fixture: serde_json::Value = serde_json::from_slice(helpers::fixtures::CDF53_FIXTURE_JSON)?;
@@ -4394,11 +4377,9 @@ async fn e2e_cdf53_integrate_correctness() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "diagnostic-only: run on demand with --ignored"]
 async fn e2e_cdf53_live_tile_state_col18() -> Result<()> {
-    let setup = setup_e2e_webgpu_gpu_with_env(
-        "--gradient --drm-direct",
-        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
-    )
-    .await?;
+    let setup =
+        setup_e2e_webgpu_gpu_with_env("--gradient --x11-sink", &[("GHOSTFRAME_ENABLE_CDF53", "1")])
+            .await?;
     tokio::time::sleep(Duration::from_secs(15)).await;
     for tile_y in &[5u32, 10, 15, 20] {
         let tile_x = 18u32;
@@ -4492,11 +4473,9 @@ async fn e2e_cdf53_live_tile_state_col18() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "diagnostic-only: run on demand with --ignored"]
 async fn e2e_cdf53_live_tile_state() -> Result<()> {
-    let setup = setup_e2e_webgpu_gpu_with_env(
-        "--gradient --drm-direct",
-        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
-    )
-    .await?;
+    let setup =
+        setup_e2e_webgpu_gpu_with_env("--gradient --x11-sink", &[("GHOSTFRAME_ENABLE_CDF53", "1")])
+            .await?;
     tokio::time::sleep(Duration::from_secs(15)).await;
 
     // Pixel (600, 160) was a known-bad sample. Tile = (600/32, 160/32) = (18, 5).
@@ -4653,7 +4632,7 @@ async fn e2e_cdf53_tile_watcher() -> Result<()> {
     // in the first ~7 rAF ticks for a static gradient frame, so by the time
     // the test's evaluate runs, the burst is already drained.
     let setup = setup_e2e_webgpu_gpu_with_env_url(
-        "--gradient --drm-direct",
+        "--gradient --x11-sink",
         &[("GHOSTFRAME_ENABLE_CDF53", "1")],
         "&cdf53watch=18,5",
     )
@@ -4940,7 +4919,7 @@ async fn e2e_cdf53_tile_watcher() -> Result<()> {
 /// specific data values.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_cdf53_inverse_gradient_tile() -> Result<()> {
-    let setup = setup_e2e_webgpu_gpu("--gradient --drm-direct").await?;
+    let setup = setup_e2e_webgpu_gpu("--gradient --x11-sink").await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Compute gradient pixels for tile (18, 5).
@@ -5046,7 +5025,7 @@ async fn e2e_cdf53_server_gpu_vs_cpu_diff() -> Result<()> {
     } else if verify_l2_only {
         env.push(("GHOSTFRAME_CDF53_SKIP_L3", "1"));
     }
-    let _setup = setup_e2e_webgpu_gpu_with_env("--gradient --drm-direct", &env).await?;
+    let _setup = setup_e2e_webgpu_gpu_with_env("--gradient --x11-sink", &env).await?;
     // 5s is plenty: gradient is static and the server emits cdf53 once per
     // gen-bump; the one-shot diff log fires on the next cdf53 batch.
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -5417,7 +5396,7 @@ fn parse_pending_snapshot_line(line: &str) -> Vec<(u8, u8, u8, u8)> {
 /// re-introduces per-tile semantics for non-Cdf53 codecs.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_ack_telemetry_no_waste() -> Result<()> {
-    let _setup = setup_e2e_webgpu_gpu("--solid-per-tile --drm-direct").await?;
+    let _setup = setup_e2e_webgpu_gpu("--solid-per-tile --x11-sink").await?;
     tokio::time::sleep(Duration::from_secs(8)).await;
 
     let logs = helpers::read_server_logs_stripped("ghostframe-server");
@@ -5611,7 +5590,7 @@ async fn e2e_lossless_golden_png() -> Result<()> {
         frame_rgba, region_boundary_palrle_cdf53, region_boundary_solid_palrle,
     };
 
-    // CAPTURE_FPS_DRM_DIRECT=2: the entrypoint default for drm-direct
+    // CAPTURE_FPS=2: the entrypoint default for --x11-sink
     // is 30 fps to give classifier-flip tests enough motion samples.
     // Our pattern is static — we only need enough captures to settle
     // within the 30 s convergence budget — and at 30 fps the client's
@@ -5649,14 +5628,14 @@ async fn e2e_lossless_golden_png() -> Result<()> {
 
     let drm_mode = format!("{WIDTH}x{HEIGHT}");
     let setup = setup_e2e_webgpu_gpu_with_env_url(
-        "--lossless-golden --drm-direct",
+        "--lossless-golden --x11-sink",
         &[
             ("GHOSTFRAME_FORCE_TILECODEC", "1"),
             // Pinned from WIDTH/HEIGHT above so the mode and the golden
             // cannot drift apart again. VKMS offers this as its preferred
             // mode, so the pin matches what an unpinned run would choose.
             ("GHOSTFRAME_DRM_MODE", &drm_mode),
-            ("CAPTURE_FPS_DRM_DIRECT", "2"),
+            ("CAPTURE_FPS", "2"),
         ],
         "&e2e=lossless",
     )

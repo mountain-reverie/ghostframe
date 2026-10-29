@@ -4,13 +4,13 @@
 # comment; blank lines are ignored.
 
 # --- Category 1: VKMS-gated -------------------------------------------------
-# Tests whose body calls `setup_e2e_webgpu_gpu(...)` or passes `--drm-direct`
+# Tests whose body calls `setup_e2e_webgpu_gpu(...)` or passes `--x11-sink`
 # to the test pattern. They require the host kernel's `vkms` module
 # (`enable_writeback=1`) with `/dev/dri` bind-mounted into the test-server
 # container. GitHub-hosted runners cannot load kernel modules.
 #
 # Regenerate this group with:
-#   awk '/^async fn e2e_[a-z_]+/{n=$0;sub(/.*fn /,"",n);sub(/\(.*/,"",n);t=1;g=0;next} t{if($0~/setup_e2e_webgpu_gpu|--drm-direct/)g=1;if($0~/^}$/){if(g)print n;t=0}}' ghostframe-e2e/tests/e2e.rs | sort -u
+#   awk '/^async fn e2e_[a-z_]+/{n=$0;sub(/.*fn /,"",n);sub(/\(.*/,"",n);t=1;g=0;next} t{if($0~/setup_e2e_webgpu_gpu|--x11-sink/)g=1;if($0~/^}$/){if(g)print n;t=0}}' ghostframe-e2e/tests/e2e.rs | sort -u
 #
 # When a new GPU-pipeline e2e test lands, add its name here in the same PR.
 e2e_ack_telemetry_no_waste

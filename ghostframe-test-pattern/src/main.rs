@@ -51,13 +51,9 @@ struct Args {
     #[arg(long)]
     mixed_static_repaint_ms: Option<u64>,
 
-    /// With --drm-direct and --tile-pattern: paint, wait this many
+    /// With --x11-sink and --tile-pattern: paint, wait this many
     /// milliseconds, shift the bitmap ONCE, then leave the screen alone
     /// forever. Models a dialog opening on a settled desktop.
-    ///
-    /// Must be the DRM path: the e2e server captures from DRM, and with no
-    /// compositor an X11 repaint after the initial modeset never reaches
-    /// scanout, so the change is invisible to capture.
     #[arg(long)]
     subtle_drift_once: Option<u64>,
 
@@ -67,13 +63,13 @@ struct Args {
     #[arg(long)]
     mode_switch_cycle: Option<u64>,
 
-    /// What the motion half of `--drm-direct --mode-switch-cycle` paints:
+    /// What the motion half of `--x11-sink --mode-switch-cycle` paints:
     /// `bands` (all-Solid tiles, which TileCodec should keep) or `video`
     /// (all-Cdf53 tiles, which should drive the classifier into H.264).
     #[arg(long, value_enum, default_value_t)]
-    motion: ghostframe_test_pattern::drm_direct::Motion,
+    motion: ghostframe_test_pattern::cycle::Motion,
 
-    /// Milliseconds between repaints in the motion half of `--drm-direct
+    /// Milliseconds between repaints in the motion half of `--x11-sink
     /// --mode-switch-cycle`. The default repaints faster than capture, so
     /// every captured frame is dirty; a longer tick lowers the rate of
     /// changed frames below the capture rate.
@@ -85,61 +81,56 @@ struct Args {
     #[arg(long)]
     palette_churn: Option<u32>,
 
-    /// Run as a DRM master and paint directly to `/dev/dri/card<N>`'s scanout
-    /// instead of speaking X11. Required for environments where Xorg holds
-    /// the DRM master and prevents framebuffer-update propagation (e.g.
-    /// VKMS). Mutually exclusive with the X11 modes; combine with
-    /// `--mode-switch-cycle`.
+    /// Render the pattern into a BGRX buffer the size of the root window and
+    /// draw it into root with (Shm)PutImage, pixel-exact. Required by the
+    /// patterns below that say so; with `--mode-switch-cycle` it selects the
+    /// buffer-painted cycle instead of the X11-primitive one.
     #[arg(long)]
-    drm_direct: bool,
-
-    /// DRM device path for `--drm-direct`. Defaults to `/dev/dri/card0`.
-    #[arg(long, default_value = "/dev/dri/card0")]
-    drm_device: String,
+    x11_sink: bool,
 
     /// Paint four 32x32 corner tiles in fixed colours (RED/GREEN/BLUE/YELLOW)
-    /// plus a central 64x64 motion region. Combine with `--drm-direct` to
-    /// paint to the DRM dumb-buffer scanout. Drives `e2e_solid_per_tile_pixels`.
+    /// plus a central 64x64 motion region. Combine with `--x11-sink` to
+    /// paint pixel-exactly into root. Drives `e2e_solid_per_tile_pixels`.
     #[arg(long)]
     solid_per_tile: bool,
 
     /// Paint a four-tile PalRle test scene (checkerboard / horizontal
     /// stripes / vertical stripes / 2×2 blocks) with a known 2-color
-    /// palette. Combine with `--drm-direct` to paint to the DRM
-    /// dumb-buffer scanout. Drives `e2e_palrle_exact_pixels`.
+    /// palette. Combine with `--x11-sink` to paint pixel-exactly into
+    /// root. Drives `e2e_palrle_exact_pixels`.
     #[arg(long)]
     palrle_exact: bool,
 
     /// Paint a full-screen diagonal RGB gradient. Each 32×32 tile has >16
     /// unique colors so the classifier picks the high-color path
     /// (Raw fallback, or Cdf53 when GHOSTFRAME_ENABLE_CDF53 is set).
-    /// Combine with `--drm-direct` to paint to the DRM dumb-buffer scanout.
+    /// Combine with `--x11-sink` to paint pixel-exactly into root.
     /// Drives the M3.3a e2e tests.
     #[arg(long)]
     gradient: bool,
 
     /// Paint a static codec-mixed test frame (Solid left third / PalRle
     /// middle third / Cdf53 right third) for the lossless-golden whole-
-    /// frame strict pixel-compare e2e test. Combine with `--drm-direct`.
+    /// frame strict pixel-compare e2e test. Combine with `--x11-sink`.
     /// Drives `e2e_lossless_golden_png`.
     #[arg(long)]
     lossless_golden: bool,
 
     /// Fill the full screen by repeating a 32×32 fixture tile for one of the
     /// six M3.5 Layer B content classes: solid, flat_ui, text, gradient,
-    /// photo, motion. Requires `--drm-direct`.
+    /// photo, motion. Requires `--x11-sink`.
     ///
-    /// Example: `--drm-direct --tile-pattern flat_ui`
+    /// Example: `--x11-sink --tile-pattern flat_ui`
     #[arg(long, value_name = "CLASS")]
     tile_pattern: Option<String>,
 
     /// M3.7a: shift the rendered tile_pattern by 1 px every N ms to
     /// generate dirty events for the classifier under pure-scene
-    /// content. Requires --drm-direct and --tile-pattern.
+    /// content. Requires --x11-sink and --tile-pattern.
     #[arg(long)]
     subtle_drift: Option<u64>,
 
-    /// With `--drm-direct`: paint a text document that scrolls vertically
+    /// With `--x11-sink`: paint a text document that scrolls vertically
     /// (`--scroll-rows-per-frame` pixel rows per frame at `--scroll-fps` for
     /// `--scroll-secs` seconds), then hold the final frame. Logs
     /// `scroll-event phase=start|stop mono_ns=...` for the bench harness.
@@ -177,62 +168,53 @@ struct Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    // DRM-direct palrle-exact mode: paint four 32×32 PalRle test tiles
+    // Sink palrle-exact mode: paint four 32×32 PalRle test tiles
     // with known 2-color patterns. Drives `e2e_palrle_exact_pixels`
     // (M3.2c B1 follow-up).
-    if args.drm_direct && args.palrle_exact {
-        return ghostframe_test_pattern::palrle_exact::run(&args.drm_device);
+    if args.x11_sink && args.palrle_exact {
+        return ghostframe_test_pattern::palrle_exact::run();
     }
 
-    // DRM-direct solid-per-tile mode: paint fixed corner tiles + a small
+    // Sink solid-per-tile mode: paint fixed corner tiles + a small
     // central motion region so the classifier sees `unique_colors == 1`
     // per corner and picks `CodecState::Solid`. Drives
     // `e2e_solid_per_tile_pixels` (M3.2c W3/B3).
-    if args.drm_direct && args.solid_per_tile {
-        return ghostframe_test_pattern::solid_per_tile::run(&args.drm_device);
+    if args.x11_sink && args.solid_per_tile {
+        return ghostframe_test_pattern::solid_per_tile::run();
     }
 
-    // DRM-direct gradient mode: full-screen high-color gradient for M3.3a
-    // Cdf53 e2e tests. No X11 path; gradient is DRM-only.
-    if args.drm_direct && args.gradient {
-        return ghostframe_test_pattern::gradient::run(&args.drm_device);
+    // Sink gradient mode: full-screen high-color gradient for M3.3a
+    // Cdf53 e2e tests. Sink only.
+    if args.x11_sink && args.gradient {
+        return ghostframe_test_pattern::gradient::run();
     }
 
-    // DRM-direct lossless-golden mode: static codec-mixed frame
+    // Sink lossless-golden mode: static codec-mixed frame
     // (Solid + PalRle + Cdf53 regions) for whole-frame strict pixel
     // compare. Drives `e2e_lossless_golden_png`.
-    if args.drm_direct && args.lossless_golden {
-        return ghostframe_test_pattern::lossless_golden::run(&args.drm_device);
+    if args.x11_sink && args.lossless_golden {
+        return ghostframe_test_pattern::lossless_golden::run();
     }
 
-    // DRM-direct tile-pattern mode: full-screen ContentClass fixture tile
-    // repeated to cover the scanout. Drives M3.5 Layer B pure-scene benches.
+    // Sink tile-pattern mode: full-screen ContentClass fixture tile
+    // repeated to cover the screen. Drives M3.5 Layer B pure-scene benches.
     // With --subtle-drift <ms>, shifts the bitmap 1 px/X per tick to generate
     // dirty events for the classifier (M3.7a bench).
-    if args.drm_direct {
+    if args.x11_sink {
         if let Some(ref class_name) = args.tile_pattern {
             if let Some(delay_ms) = args.subtle_drift_once {
-                return ghostframe_test_pattern::subtle_drift::run_once(
-                    &args.drm_device,
-                    class_name,
-                    delay_ms,
-                );
+                return ghostframe_test_pattern::subtle_drift::run_once(class_name, delay_ms);
             }
             if let Some(drift_ms) = args.subtle_drift {
-                return ghostframe_test_pattern::subtle_drift::run(
-                    &args.drm_device,
-                    class_name,
-                    drift_ms,
-                );
+                return ghostframe_test_pattern::subtle_drift::run(class_name, drift_ms);
             }
-            return ghostframe_test_pattern::tile_pattern::run(&args.drm_device, class_name);
+            return ghostframe_test_pattern::tile_pattern::run(class_name);
         }
     }
 
-    // DRM-direct scrolling-text mode (text-under-motion bench scene).
-    if args.drm_direct && args.scroll_text {
+    // Sink scrolling-text mode (text-under-motion bench scene).
+    if args.x11_sink && args.scroll_text {
         return ghostframe_test_pattern::scroll_text::run(
-            &args.drm_device,
             &ghostframe_test_pattern::scroll_text::ScrollConfig {
                 rows_per_frame: args.scroll_rows_per_frame,
                 scroll_secs: args.scroll_secs,
@@ -242,28 +224,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // DRM-direct text-grid mode: paint text glyphs directly to scanout,
-    // bypassing Xorg. Required for E2E tests where Xorg-on-VKMS yields
-    // >16 unique colours per tile and PalRle never wins classification.
+    // Sink text-grid mode: paint `font.rs` glyphs pixel-exactly. The X11
+    // core-font `--text-grid` yields > 16 unique colours per tile, so PalRle
+    // never wins classification on it.
     // See docs/superpowers/specs/2026-05-15-m3.2c-verification-design.md.
-    if args.drm_direct && args.text_grid {
-        return ghostframe_test_pattern::text_grid_drm::run(&args.drm_device);
+    if args.x11_sink && args.text_grid {
+        return ghostframe_test_pattern::text_grid_sink::run();
     }
 
-    // DRM-direct path: take DRM master and paint straight to scanout.
-    // Must run before any X11 connect attempt — there is no X server in
-    // this configuration.
-    if args.drm_direct {
+    // Sink mode-switch cycle: the buffer-painted static/motion loop.
+    if args.x11_sink {
         let secs = args
             .mode_switch_cycle
-            .ok_or_else(|| "--drm-direct requires --mode-switch-cycle SECS".to_string())?;
+            .ok_or_else(|| "--x11-sink requires --mode-switch-cycle SECS".to_string())?;
         let half = std::time::Duration::from_secs(secs);
-        return ghostframe_test_pattern::drm_direct::run(
-            &args.drm_device,
+        return ghostframe_test_pattern::cycle::run(
             half,
             args.motion,
             args.motion_tick_ms.map_or(
-                ghostframe_test_pattern::drm_direct::MOTION_TICK,
+                ghostframe_test_pattern::cycle::MOTION_TICK,
                 std::time::Duration::from_millis,
             ),
         );

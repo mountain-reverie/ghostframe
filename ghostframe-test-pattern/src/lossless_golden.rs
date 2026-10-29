@@ -1,4 +1,4 @@
-//! `--lossless-golden --drm-direct` mode.
+//! `--lossless-golden --x11-sink` mode.
 //!
 //! Fully static, fully deterministic codec-mixed test frame designed for
 //! whole-frame strict pixel compare in `e2e_lossless_golden_png`.
@@ -37,15 +37,15 @@
 //! Return buffer from [`frame_rgba`] is RGBA8 in scanline order
 //! (`[R, G, B, A, R, G, B, A, …]`). The alpha byte is forced to
 //! `0x00` to match what the WebGPU renderer actually writes to the
-//! framebuffer: the DRM scanout is XRGB8888 with `X = 0x00`, and the
+//! framebuffer: the root window is XRGB8888 with `X = 0x00`, and the
 //! Solid/PalRle/Cdf53 shaders pass that byte through unchanged to the
 //! alpha channel. (Canvas `alphaMode: 'opaque'` masks this visually,
 //! but exact-pixel byte-compare must expect alpha = 0x00 — same
 //! convention as `solid_per_tile::samples()`.)
 //!
-//! For DRM scanout (XRGB8888 little-endian, bytes `[B, G, R, X]`) the
+//! For root-window frame (XRGB8888 little-endian, bytes `[B, G, R, X]`) the
 //! [`run`] function does the RGBA→XRGB byte swap when copying into the
-//! dumb buffer (X stays 0x00).
+//! frame buffer (X stays 0x00).
 //!
 //! ## Determinism contract
 //!
@@ -55,9 +55,7 @@
 //! property: if a future change breaks the partitioning, the tests
 //! fail before the e2e even runs.
 
-use drm::control::Device as ControlDevice;
-
-use crate::drm_direct::{msync_buffer, setup_dumb_scanout};
+use crate::x11_sink::Scanout;
 
 /// Tile size — matches `ghostframe-lib::tile::TILE_SIZE`. Region
 /// boundaries are snapped to multiples of this so every tile lies
@@ -183,14 +181,14 @@ pub fn frame_rgba(width: u32, height: u32) -> Vec<u8> {
     buf
 }
 
-/// Paint the lossless-golden frame once into the DRM dumb buffer,
+/// Paint the lossless-golden frame once into the frame buffer,
 /// then hold the scanout indefinitely.
 ///
 /// The frame is **fully static** — there is no motion loop. The e2e
 /// test relies on `GHOSTFRAME_FORCE_TILECODEC=1` to bypass the
 /// classifier's H.264 forced-start so the cdf53 path actually runs.
-pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut scanout = setup_dumb_scanout(card_path)?;
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut scanout = Scanout::connect(None)?;
     let width = scanout.mode_w;
     let height = scanout.mode_h;
     let pitch = scanout.pitch as usize;
@@ -200,14 +198,11 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Generate the canonical RGBA frame, then copy into the XRGB8888
-    // dumb buffer with the R/B swap that XRGB requires.
+    // frame buffer with the R/B swap that XRGB requires.
     let rgba = frame_rgba(width, height);
 
     {
-        let mut map = scanout
-            .card
-            .map_dumb_buffer(&mut scanout.db)
-            .map_err(|e| format!("map_dumb_buffer: {e}"))?;
+        let mut map = scanout.map();
         let bytes = map.as_mut();
         let row_active = width as usize * 4;
         for y in 0..height as usize {
@@ -223,7 +218,6 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 dst[3] = 0x00; // X don't-care
             }
         }
-        msync_buffer(bytes);
     }
 
     let solid_w = region_boundary_solid_palrle(width);

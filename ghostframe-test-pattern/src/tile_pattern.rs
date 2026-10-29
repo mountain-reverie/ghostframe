@@ -1,4 +1,4 @@
-//! `--tile-pattern <class> --drm-direct` mode.
+//! `--tile-pattern <class> --x11-sink` mode.
 //!
 //! Fills the full scanout framebuffer with a 32×32 `ContentClass` fixture tile
 //! tiled to cover the entire screen. Each `ContentClass` variant maps to one of
@@ -10,7 +10,7 @@
 //!
 //! ## Pixel format
 //!
-//! Fixture tiles are BGRA8 — bytes `[B, G, R, A]`. The DRM scanout expects
+//! Fixture tiles are BGRA8 — bytes `[B, G, R, A]`. The root-window frame expects
 //! XRGB8888 little-endian — bytes `[B, G, R, X]`. The B/G/R bytes are at the
 //! same positions, so we just copy the fixture bytes and let the X/A byte be
 //! whatever the fixture emits (the scanout's X channel is a don't-care).
@@ -23,14 +23,12 @@
 //! For the current static implementation this results in identical bytes every
 //! tick — acceptable per M3.5 spec §Architecture ("pure-scene model").
 
-use drm::control::Device as ControlDevice;
-
-use crate::drm_direct::{msync_buffer, setup_dumb_scanout};
+use crate::x11_sink::Scanout;
 
 /// Fill `out` (a flat `frame_w × frame_h × 4` byte slice) with the 32×32 tile
 /// from `class` repeated to cover every pixel.
 ///
-/// `out` is the mmap slice for the DRM dumb buffer; `stride` may be larger than
+/// `out` is the frame buffer; `stride` may be larger than
 /// `frame_w * 4` (hardware pitch padding). We write only the active pixel area
 /// and leave any pitch padding untouched.
 pub fn fill_with_tile_pattern(
@@ -72,8 +70,8 @@ pub fn fill_with_tile_pattern(
 /// For `motion` the fixture is static on the first paint; the scene is held on
 /// scanout without repainting.  Layer B bench measurement runs instantaneously
 /// against a pre-painted buffer, so motion animation is not required here.
-pub fn run(card_path: &str, class_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut scanout = setup_dumb_scanout(card_path)?;
+pub fn run(class_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scanout = Scanout::connect(None)?;
     let width = scanout.mode_w;
     let height = scanout.mode_h;
     let pitch = scanout.pitch as usize;
@@ -83,14 +81,10 @@ pub fn run(card_path: &str, class_name: &str) -> Result<(), Box<dyn std::error::
     );
 
     {
-        let mut map = scanout
-            .card
-            .map_dumb_buffer(&mut scanout.db)
-            .map_err(|e| format!("map_dumb_buffer: {e}"))?;
+        let mut map = scanout.map();
         let bytes = map.as_mut();
 
         fill_with_tile_pattern(class_name, width, height, pitch, bytes);
-        msync_buffer(bytes);
     }
 
     eprintln!("tile-pattern: scene painted — holding scanout");
