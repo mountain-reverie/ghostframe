@@ -1,21 +1,13 @@
 mod capture;
 mod config;
+mod state;
 mod util;
 
-use std::path::Path;
 use std::time::Duration;
 
 use capture::Backend;
 
 use ghostframe_lib::{GhostbridgeConfig, GhostframeServer};
-
-/// Returns true if the tsnet state directory has been seeded with a successful
-/// login. tsnet writes `tailscaled.state` after the first successful join; we
-/// use its presence as the "has been --init'd" proxy. If this returns false,
-/// the daemon needs a TS_AUTHKEY (either via env or via `--init`).
-fn state_dir_seeded(state_dir: &Path) -> bool {
-    state_dir.join("tailscaled.state").exists()
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -58,7 +50,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
     let state_dir = state_dir_path.to_string_lossy().into_owned();
-    let seeded = state_dir_seeded(&state_dir_path);
+    // Held until the process exits: no second tsnet may write this state.
+    let _state_lock = match state::StateLock::acquire(&state_dir_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let seeded = state::state_dir_seeded(&state_dir_path);
 
     let authkey = match (init_mode, cfg.ts_authkey.clone(), seeded) {
         (true, Some(k), _) if !k.is_empty() => k,
@@ -451,21 +451,6 @@ fn dump_frame_as_png(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-
-    fn temp_dir() -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "ghostframe-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&base).unwrap();
-        base
-    }
 
     #[test]
     fn capture_failures_trip_after_budget_and_reset_on_success() {
@@ -479,26 +464,5 @@ mod tests {
             assert!(!f.record_failure());
         }
         assert!(f.record_failure(), "budget exhausted must trip");
-    }
-
-    #[test]
-    fn state_dir_seeded_returns_false_for_empty_dir() {
-        let d = temp_dir();
-        assert!(!state_dir_seeded(&d));
-        fs::remove_dir_all(&d).ok();
-    }
-
-    #[test]
-    fn state_dir_seeded_returns_false_for_missing_dir() {
-        let d = temp_dir().join("does-not-exist");
-        assert!(!state_dir_seeded(&d));
-    }
-
-    #[test]
-    fn state_dir_seeded_returns_true_when_tailscaled_state_present() {
-        let d = temp_dir();
-        fs::write(d.join("tailscaled.state"), b"{}").unwrap();
-        assert!(state_dir_seeded(&d));
-        fs::remove_dir_all(&d).ok();
     }
 }

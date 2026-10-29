@@ -15,3 +15,6 @@ x11rb = { version = "0.13", features = ["damage", "xtest", "xfixes", "randr", "s
 # disk when GHOSTFRAME_CAPTURE_DUMP_DIR is set. Default-features off keeps
 # the dependency tree small (PNG encoder only).
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dev-dependencies]
+tempfile = "3"
