@@ -323,6 +323,7 @@ impl Client {
                     state_dir: self.config.state_dir.to_string_lossy().into_owned(),
                     control_url,
                     quiet: false,
+                    non_interactive: false,
                 })?);
                 b.up()?;
                 b

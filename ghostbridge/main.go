@@ -83,6 +83,9 @@ type serverHandle struct {
 	// request; Rust registers it via gbridge_set_peer_authorizer. Empty
 	// means refuse everyone.
 	authz authorizerSlot
+	// nonInteractive: gbridge_up fails with gbridgeUpStatusNeedsLogin instead
+	// of waiting for a person (see upNonInteractive).
+	nonInteractive bool
 }
 
 // setNonblock sets O_NONBLOCK on a raw fd. The Rust side wraps this fd in
@@ -95,7 +98,7 @@ func setNonblock(fd int) error {
 func discardLogf(string, ...any) {}
 
 //export gbridge_new
-func gbridge_new(cHostname, cAuthkey, cStateDir, cControlURL *C.char, quiet C.int32_t, sdOut *C.int32_t) C.gbridge_status {
+func gbridge_new(cHostname, cAuthkey, cStateDir, cControlURL *C.char, quiet, nonInteractive C.int32_t, sdOut *C.int32_t) C.gbridge_status {
 	hostname := C.GoString(cHostname)
 	authkey := C.GoString(cAuthkey)
 	stateDir := C.GoString(cStateDir)
@@ -120,6 +123,12 @@ func gbridge_new(cHostname, cAuthkey, cStateDir, cControlURL *C.char, quiet C.in
 		s.Logf = discardLogf
 		s.UserLogf = discardLogf
 	}
+	// nonInteractive: a daemon with no auth key must never print a sign-in
+	// URL. Anyone who can read its journal could claim the node.
+	if nonInteractive != 0 && quiet == 0 {
+		s.Logf = nonInteractiveLogf(log.Printf)
+		s.UserLogf = nonInteractiveLogf(log.Printf)
+	}
 	if controlURL != "" {
 		s.ControlURL = controlURL
 	}
@@ -127,7 +136,7 @@ func gbridge_new(cHostname, cAuthkey, cStateDir, cControlURL *C.char, quiet C.in
 	serversMu.Lock()
 	id := nextHandle
 	nextHandle++
-	servers[id] = &serverHandle{server: s, certHashes: newCertHashStore()}
+	servers[id] = &serverHandle{server: s, certHashes: newCertHashStore(), nonInteractive: nonInteractive != 0}
 	serversMu.Unlock()
 
 	*sdOut = C.int32_t(id)
@@ -141,6 +150,27 @@ func gbridge_up(sd C.int32_t) C.gbridge_status {
 		return -1
 	}
 	log.Printf("ghostbridge: gbridge_up: calling server.Up()")
+	if h.nonInteractive {
+		lc, err := h.server.LocalClient()
+		if err != nil {
+			log.Printf("ghostbridge: gbridge_up: LocalClient: %v", err)
+			return -2
+		}
+		err = upNonInteractive(func(ctx context.Context) error {
+			_, err := h.server.Up(ctx)
+			return err
+		}, lc, upPollInterval, needsLoginGrace)
+		if errors.Is(err, errNeedsLogin) {
+			log.Printf("ghostbridge: gbridge_up: node needs login (key expired or node removed)")
+			return gbridgeUpStatusNeedsLogin
+		}
+		if err != nil {
+			log.Printf("ghostbridge: gbridge_up: server.Up() error: %v", err)
+			return -2
+		}
+		log.Printf("ghostbridge: gbridge_up: server.Up() done")
+		return 0
+	}
 	st, err := h.server.Up(context.Background())
 	if err != nil {
 		log.Printf("ghostbridge: gbridge_up: server.Up() error: %v", err)
@@ -286,7 +316,80 @@ var errLoginTimeout = errors.New("ghostbridge: timed out waiting for auth URL or
 const (
 	gbridgeLoginStatusBufferTooSmall = -5
 	gbridgeLoginStatusTimeout        = -6
+	// gbridge_login_url: the node authenticated but an admin must approve it.
+	gbridgeLoginStatusMachineAuth = -8
+	// gbridge_up in non-interactive mode: the node needs a person to log in.
+	gbridgeUpStatusNeedsLogin = -7
 )
+
+// errNeedsLogin: see upNonInteractive. errMachineAuth: see loginURL.
+var (
+	errNeedsLogin  = errors.New("ghostbridge: node needs login")
+	errMachineAuth = errors.New("ghostbridge: node needs device approval")
+)
+
+const (
+	upPollInterval = 500 * time.Millisecond
+	// needsLoginGrace is how long NeedsLogin may persist without an auth URL
+	// before a non-interactive Up gives up. tsnet briefly reports NeedsLogin
+	// even with a valid key (see tsnet.Up's TODO).
+	needsLoginGrace = 15 * time.Second
+)
+
+// authURLLogMarkers identify tsnet/controlclient log lines that carry or
+// announce the interactive sign-in URL.
+var authURLLogMarkers = []string{"go to:", "AuthURL", "authURL=", "open URL"}
+
+// nonInteractiveLogf wraps next, dropping lines that would print the sign-in
+// URL. Everything else passes through.
+func nonInteractiveLogf(next func(string, ...any)) func(string, ...any) {
+	return func(format string, args ...any) {
+		for _, m := range authURLLogMarkers {
+			if strings.Contains(format, m) {
+				return
+			}
+		}
+		next(format, args...)
+	}
+}
+
+// upNonInteractive runs up and fails with errNeedsLogin if the backend asks
+// for an interactive login: an auth URL appears, or NeedsLogin persists for
+// grace. tsnet.Up itself waits for Running forever (its own TODO), which in
+// a daemon without an auth key means logging a claimable URL until someone
+// answers it.
+func upNonInteractive(up func(context.Context) error, lc statusPoller, interval, grace time.Duration) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- up(ctx) }()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var since time.Time
+	for {
+		select {
+		case err := <-done:
+			return err
+		case <-ticker.C:
+		}
+		st, err := lc.StatusWithoutPeers(ctx)
+		if err != nil {
+			continue
+		}
+		if st.AuthURL != "" {
+			return errNeedsLogin
+		}
+		if st.BackendState == "NeedsLogin" {
+			if since.IsZero() {
+				since = time.Now()
+			} else if time.Since(since) >= grace {
+				return errNeedsLogin
+			}
+		} else {
+			since = time.Time{}
+		}
+	}
+}
 
 const (
 	loginPollInterval = 250 * time.Millisecond
@@ -365,6 +468,9 @@ func loginURL(lc statusPoller, timeout time.Duration) (string, error) {
 		if st.BackendState == "Running" {
 			return "", nil
 		}
+		if st.BackendState == "NeedsMachineAuth" {
+			return "", errMachineAuth
+		}
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
@@ -420,6 +526,8 @@ func gbridge_login_url(sd C.int32_t, cBuf *C.char, cBufLen C.size_t) C.gbridge_s
 		switch {
 		case errors.Is(err, errUnknownHandle):
 			return -1
+		case errors.Is(err, errMachineAuth):
+			return gbridgeLoginStatusMachineAuth
 		case errors.Is(err, errLoginTimeout):
 			log.Printf("ghostbridge: gbridge_login_url: timed out waiting for auth URL or running state")
 			return -6

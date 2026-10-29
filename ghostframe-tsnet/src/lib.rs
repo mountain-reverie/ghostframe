@@ -37,6 +37,7 @@ extern "C" {
         state_dir: *const c_char,
         control_url: *const c_char,
         quiet: c_int,
+        non_interactive: c_int,
         sd_out: *mut c_int,
     ) -> c_int;
     fn gbridge_up(sd: c_int) -> c_int;
@@ -96,7 +97,19 @@ pub struct GhostbridgeConfig {
     /// Discard tsnet's own log output. For interactive commands that print
     /// their own progress; daemons and clients leave it `false`.
     pub quiet: bool,
+    /// Never wait for a person: `up` fails with [`UP_NEEDS_LOGIN_RC`] when
+    /// the node needs an interactive login, and no sign-in URL is logged.
+    /// For a daemon that has no auth key.
+    pub non_interactive: bool,
 }
+
+/// `gbridge_up` in non-interactive mode: the node needs a person to log in
+/// (key expired, or removed in the admin console). ghostbridge/main.go
+/// `gbridgeUpStatusNeedsLogin`.
+pub const UP_NEEDS_LOGIN_RC: c_int = -7;
+/// `gbridge_login_url`: authenticated, but an admin must approve the device.
+/// ghostbridge/main.go `gbridgeLoginStatusMachineAuth`.
+pub const LOGIN_URL_MACHINE_AUTH_RC: c_int = -8;
 
 pub struct GhostbridgeHandle {
     sd: c_int,
@@ -117,6 +130,7 @@ impl GhostbridgeHandle {
                 c_state_dir.as_ptr(),
                 c_control_url.as_ptr(),
                 c_int::from(config.quiet),
+                c_int::from(config.non_interactive),
                 &mut sd,
             )
         };
@@ -538,6 +552,13 @@ mod tests {
         let rest = [1, 2, 3, 4];
         let err = parse_frame_rest(&rest, 10).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn login_status_codes_match_ghostbridge() {
+        // ghostbridge/main.go gbridgeUpStatusNeedsLogin / gbridgeLoginStatusMachineAuth.
+        assert_eq!(super::UP_NEEDS_LOGIN_RC, -7);
+        assert_eq!(super::LOGIN_URL_MACHINE_AUTH_RC, -8);
     }
 
     #[test]

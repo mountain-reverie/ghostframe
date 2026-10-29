@@ -83,6 +83,7 @@ pub fn login(
         state_dir: dir.to_string_lossy().into_owned(),
         control_url: login_server.unwrap_or_default(),
         quiet: false,
+        non_interactive: false,
     };
 
     let bridge = GhostbridgeHandle::connect(&config)?;
@@ -127,6 +128,7 @@ pub fn logout() -> Result<(), CommandError> {
         state_dir: dir.to_string_lossy().into_owned(),
         control_url: String::new(),
         quiet: false,
+        non_interactive: false,
     };
     let bridge = GhostbridgeHandle::connect(&config)?;
 

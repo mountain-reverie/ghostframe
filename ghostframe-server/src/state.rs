@@ -58,6 +58,10 @@ pub fn mark_joined(state_dir: &Path) -> std::io::Result<()> {
 /// as `Config`, `LoggedOut`), types/persist/persist.go (`NodeID`,
 /// `UserProfile`), tailcfg.UserProfile (`LoginName`), ipn/store.go
 /// (`_current-profile`, whose value is the state key itself).
+#[allow(
+    dead_code,
+    reason = "Task 12 (install) adopts pre-marker state with this"
+)]
 pub fn state_is_registered(state_dir: &Path) -> bool {
     use base64::Engine;
     fn inner(state_dir: &Path) -> Option<bool> {

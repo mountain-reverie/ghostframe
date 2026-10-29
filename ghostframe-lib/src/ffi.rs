@@ -53,6 +53,7 @@ pub unsafe extern "C" fn gf_server_new(
             state_dir: CStr::from_ptr(state_dir).to_string_lossy().into_owned(),
             control_url: CStr::from_ptr(control_url).to_string_lossy().into_owned(),
             quiet: false,
+            non_interactive: false,
         };
 
         let rt = match tokio::runtime::Runtime::new() {
