@@ -1,4 +1,4 @@
-//! Scene orchestration: spin up xdaemon + Chromium for one scene, sample
+//! Scene orchestration: spin up ghostframe-server + Chromium for one scene, sample
 //! telemetry, return aggregated records.
 //!
 //! Implementation completed in Task 17 of the M3.5a plan.
@@ -152,11 +152,11 @@ pub(crate) struct ScenarioStack {
     pub(crate) page: chromiumoxide::Page,
     /// Docker container name, used to collect logs after the run.
     pub(crate) server_container_name: String,
-    /// Host-namespace PID of the ghostframe-xdaemon process. On rootful
+    /// Host-namespace PID of the ghostframe-server process. On rootful
     /// Docker, container processes appear in `/proc` under their host PID.
     /// We locate this by reading the container root's host PID from
-    /// `docker inspect State.Pid` then searching children for xdaemon.
-    xdaemon_host_pid: Option<u32>,
+    /// `docker inspect State.Pid` then searching children for ghostframe-server.
+    server_host_pid: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +204,7 @@ pub(crate) async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioSt
 
     // M3.6c: forward bench-set env vars into the container so
     // GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP + GHOSTFRAME_INBOUND_LOSS_*
-    // actually reach xdaemon. Without this, the env vars stay on
+    // actually reach ghostframe-server. Without this, the env vars stay on
     // the bench process and the container sees defaults.
     let mut server_image = GenericImage::new("ghostframe/test-server", "latest")
         .with_container_name(&server_container_name)
@@ -249,7 +249,7 @@ pub(crate) async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioSt
         "GHOSTFRAME_INBOUND_LOSS_PREDICATE",
         // M3.7a: classifier env-var overrides — bench sweep modes set
         // these per swept value; without forwarding they'd silently
-        // never reach xdaemon and every swept value would behave
+        // never reach ghostframe-server and every swept value would behave
         // identically (the bug that produced near-identical mode_switch
         // counts across bias_sweep / loss_axis runs in v4).
         "GHOSTFRAME_TEST_REFINEMENT_BIAS_US",
@@ -260,7 +260,7 @@ pub(crate) async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioSt
         // all. e2e_progressive_refinement sets this explicitly; bench
         // sweeps that target refinement (PixelPerfect outcome metric)
         // need it forwarded so the codec is actually enabled in the
-        // container's xdaemon.
+        // container's ghostframe-server.
         "GHOSTFRAME_ENABLE_CDF53",
         // M3.7b: tc qdisc shaping vars consumed by the entrypoint.
         "SHAPE_BANDWIDTH_KBPS",
@@ -281,8 +281,8 @@ pub(crate) async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioSt
 
     let server: ContainerAsync<GenericImage> = server_image.start().await?;
 
-    // Resolve xdaemon's host-visible PID for /proc sampling.
-    let xdaemon_host_pid = resolve_xdaemon_host_pid(&server_container_name).await;
+    // Resolve ghostframe-server's host-visible PID for /proc sampling.
+    let server_host_pid = resolve_server_host_pid(&server_container_name).await;
 
     // --- TestNode + forwarders ---
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
@@ -390,15 +390,15 @@ pub(crate) async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioSt
         _xvfb: xvfb,
         page,
         server_container_name,
-        xdaemon_host_pid,
+        server_host_pid,
     })
 }
 
-/// Resolve the host-namespace PID of the `ghostframe-xdaemon` process running
+/// Resolve the host-namespace PID of the `ghostframe-server` process running
 /// inside `container_name`.
 ///
 /// Strategy:
-/// 1. `docker exec <container> pidof ghostframe-xdaemon` → in-container PID.
+/// 1. `docker exec <container> pidof ghostframe-server` → in-container PID.
 /// 2. `docker inspect --format='{{.State.Pid}}' <container>` → container root
 ///    host PID (the init/entrypoint process in the host's PID namespace).
 /// 3. Walk `/proc/<root_host_pid>/root/proc/<inner_pid>/status` — this reads
@@ -410,10 +410,10 @@ pub(crate) async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioSt
 ///    parent is reachable from the container root.
 ///
 /// Falls back to `None` on any failure (sampling just skips).
-async fn resolve_xdaemon_host_pid(container_name: &str) -> Option<u32> {
-    // Step 1: get in-container PID of xdaemon.
+async fn resolve_server_host_pid(container_name: &str) -> Option<u32> {
+    // Step 1: get in-container PID of ghostframe-server.
     let out = tokio::process::Command::new("docker")
-        .args(["exec", container_name, "pidof", "ghostframe-xdaemon"])
+        .args(["exec", container_name, "pidof", "ghostframe-server"])
         .output()
         .await
         .ok()?;
@@ -496,7 +496,7 @@ pub async fn run_scene(spec: &SceneSpec) -> Result<SceneResult> {
     // Start ProcSampler tokio task.
     let proc_samples: Arc<AsyncMutex<Vec<ProcSample>>> = Arc::new(AsyncMutex::new(Vec::new()));
     let proc_handle = tokio::spawn(sample_proc_loop(
-        stack.xdaemon_host_pid,
+        stack.server_host_pid,
         stack.server_container_name.clone(),
         Arc::clone(&proc_samples),
     ));
@@ -569,13 +569,13 @@ pub(crate) fn monotonic_now_ns() -> u64 {
 // Helper: /proc sampler
 // ---------------------------------------------------------------------------
 
-/// Sample `ghostframe-xdaemon`'s CPU and memory usage every 100 ms.
+/// Sample `ghostframe-server`'s CPU and memory usage every 100 ms.
 ///
 /// Two modes:
 /// - If `host_pid` is `Some(pid)`, read `/proc/<pid>/stat` and
 ///   `/proc/<pid>/status` directly (host-visible process).
 /// - If `host_pid` is `None`, use `docker exec <container> cat /proc/1/stat`
-///   as a best-effort fallback (samples the container init, not xdaemon, but
+///   as a best-effort fallback (samples the container init, not ghostframe-server, but
 ///   avoids a hard failure). The loop exits when the container stops responding.
 async fn sample_proc_loop(
     host_pid: Option<u32>,
@@ -600,14 +600,14 @@ async fn sample_proc_loop(
             (stat, status)
         } else {
             // Fallback: exec into container (slow, ~10ms overhead per call).
-            // Use `cat` to read xdaemon's /proc/1 as a rough proxy.
+            // Use `cat` to read ghostframe-server's /proc/1 as a rough proxy.
             let stat_out = tokio::process::Command::new("docker")
                 .args([
                     "exec",
                     &container_name,
                     "sh",
                     "-c",
-                    "cat /proc/$(pidof ghostframe-xdaemon | awk '{print $1}')/stat 2>/dev/null || echo ''",
+                    "cat /proc/$(pidof ghostframe-server | awk '{print $1}')/stat 2>/dev/null || echo ''",
                 ])
                 .output()
                 .await;
@@ -617,7 +617,7 @@ async fn sample_proc_loop(
                     &container_name,
                     "sh",
                     "-c",
-                    "cat /proc/$(pidof ghostframe-xdaemon | awk '{print $1}')/status 2>/dev/null || echo ''",
+                    "cat /proc/$(pidof ghostframe-server | awk '{print $1}')/status 2>/dev/null || echo ''",
                 ])
                 .output()
                 .await;

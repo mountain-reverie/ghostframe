@@ -36,8 +36,8 @@
 //! and matching float math will drift off by rounding.
 //!
 //! A one-off wide sweep against the real `cvt(1)` binary (not a unit test —
-//! it shells out) lives at `ghostframe-xdaemon/src/bin/cvt_sweep.rs`. Run it
-//! with `cargo run -p ghostframe-xdaemon --example cvt_sweep` before touching
+//! it shells out) lives at `ghostframe-server/src/bin/cvt_sweep.rs`. Run it
+//! with `cargo run -p ghostframe-server --example cvt_sweep` before touching
 //! this module's arithmetic; it re-includes this file's source directly so
 //! it can never drift out of sync with what actually ships.
 

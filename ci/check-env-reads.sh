@@ -51,20 +51,20 @@ if [[ -n "$hits" ]]; then
     fail "ghostframe-client-* crates must read std::env only in config.rs"
 fi
 
-# ghostframe-xdaemon, same rule. tests/ is not scanned: integration tests
+# ghostframe-server, same rule. tests/ is not scanned: integration tests
 # legitimately read PATH. It must not mutate the environment either.
-hits=$(scan 'env::var' ghostframe-xdaemon/src \
-    | drop '^ghostframe-xdaemon/src/config.rs' \
+hits=$(scan 'env::var' ghostframe-server/src \
+    | drop '^ghostframe-server/src/config.rs' \
     | code_only)
 if [[ -n "$hits" ]]; then
     echo "$hits"
-    fail "ghostframe-xdaemon must read std::env only in config.rs"
+    fail "ghostframe-server must read std::env only in config.rs"
 fi
-hits=$(scan_e 'env::(set_var|remove_var)' ghostframe-xdaemon/src \
+hits=$(scan_e 'env::(set_var|remove_var)' ghostframe-server/src \
     | code_only)
 if [[ -n "$hits" ]]; then
     echo "$hits"
-    fail "ghostframe-xdaemon must not mutate the process environment"
+    fail "ghostframe-server must not mutate the process environment"
 fi
 
 exit "$status"

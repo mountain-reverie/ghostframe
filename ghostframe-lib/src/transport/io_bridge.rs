@@ -227,7 +227,7 @@ impl tokio::io::AsyncWrite for BridgeStream {
 //   1. The `process_frame` duration probe (`t0`/`dt_us`, ~line 1000 below) --
 //      measures real CPU cost of encode work, not protocol/deadline time.
 //   2. `monotonic_now_ns()` (below) -- reads `CLOCK_MONOTONIC` directly and
-//      is paired *offline*, after the fact, with xdaemon's `capture_done_ns`
+//      is paired *offline*, after the fact, with ghostframe-server's `capture_done_ns`
 //      timestamp from a separate process. Neither process shares the other's
 //      tokio runtime, so there is no virtual clock to route through here.
 //
@@ -735,7 +735,7 @@ pub struct IoBridge {
     /// frame re-emits the dimensions datagram; loss tolerance is 0.05^10 ≈ 1e-13.
     dimensions_retransmits_left: u8,
     /// Count of `wt_sessions` entries whose handshake is currently up,
-    /// published to `GhostframeServer` so the capture loop in xdaemon can skip
+    /// published to `GhostframeServer` so the capture loop in ghostframe-server can skip
     /// capture work when no consumer exists. Refreshed inside
     /// `compute_max_datagram_size` and in the run loop after handling events.
     ///
@@ -2706,7 +2706,7 @@ impl IoBridge {
         }
 
         // Bootstrap-deadlock guard: refresh the connected-session count so a
-        // freshly established WT session unblocks xdaemon's capture gate
+        // freshly established WT session unblocks ghostframe-server's capture gate
         // BEFORE any frame submission (without this, the gate would stay at
         // 0 until a frame triggered `compute_max_datagram_size`, which can't
         // happen because the gate suppresses frames).

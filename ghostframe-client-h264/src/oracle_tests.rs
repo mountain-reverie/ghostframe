@@ -211,7 +211,7 @@ fn hardware_decode_matches_software_decode_exactly() {
 ///
 /// No explicit `DMA_BUF_IOCTL_SYNC` around the mmap read below, unlike every
 /// other CPU mmap of a dmabuf in this repo (`export.rs`,
-/// `ghostframe-xdaemon/src/drm_capture.rs`). Believed unnecessary here:
+/// `ghostframe-server/src/drm_capture.rs`). Believed unnecessary here:
 /// `av_hwframe_transfer_data` above already ran a full GPU readback through
 /// ffmpeg/libva before this function ever calls `mmap`, which is itself a
 /// synchronization point, and this mmap is read-only, so there is no write

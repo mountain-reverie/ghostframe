@@ -10,7 +10,7 @@ command.
 ## Build, install, deploy
 
 ```bash
-just build-release      # build-web THEN cargo build --release -p ghostframe-xdaemon
+just build-release      # build-web THEN cargo build --release -p ghostframe-server
                         # -- the order matters; daemon only, see below
 just ci-local           # the real gate: fmt, env-read guard, clippy --workspace --all-targets,
                         # unit tests, web build, tsc, release build,
@@ -18,7 +18,7 @@ just ci-local           # the real gate: fmt, env-read guard, clippy --workspace
 just lint               # clippy --workspace --all-targets -- -D warnings
 just test-unit          # cargo test --lib
 just test-e2e           # containers + Chromium over a local headscale
-just containers-build   # REQUIRED after any ghostframe-lib/xdaemon change,
+just containers-build   # REQUIRED after any ghostframe-lib/ghostframe-server change,
                         # or e2e silently runs the stale image
 ```
 
@@ -49,7 +49,7 @@ over every package in one build, and `ghostframe-bench` depends on
 `ghostframe-e2e`, which turns on ghostframe-lib's `test-loss-injection` and
 `browserless-harness`. So `cargo build --release` at the root (and even
 `--workspace --exclude ghostframe-e2e`) compiles the daemon with them.
-`just build-release` builds `-p ghostframe-xdaemon` only and runs
+`just build-release` builds `-p ghostframe-server` only and runs
 `ci/check-release-features.sh`, which fails if the daemon's resolved feature
 set contains a test-only feature. Build a daemon you will install with that
 recipe, not by hand.
@@ -57,12 +57,12 @@ recipe, not by hand.
 **`cargo build` does not rebuild the web client, and the client is embedded at
 compile time.** `ghostbridge/web_server.go` does `//go:embed all:dist`, so the
 browser client is baked into the daemon binary. Building with
-`cargo build -p ghostframe-xdaemon` after a protocol change ships a server that
+`cargo build -p ghostframe-server` after a protocol change ships a server that
 no longer speaks the embedded client's protocol. The symptom is not a clear
 error — it is a NACK storm, slow convergence and visual artifacts. Use
 `just build-release`, which runs `build-web` first. After building, it is worth
 confirming the bundle actually changed:
-`strings target/release/ghostframe-xdaemon | grep -c <new-bundle-hash>`.
+`strings target/release/ghostframe-server | grep -c <new-bundle-hash>`.
 
 **The embed is behind `ghostframe-tsnet`'s `web-embed` feature, off by
 default.** Server crates enable it (`ghostframe-lib` does); client crates do
@@ -105,7 +105,7 @@ because per-crate test runs never touch it.
 ## Reading a live session
 
 The daemon logs to the journal; its default filter is `ghostframe=info`
-(`ghostframe-xdaemon/src/main.rs`). `RUST_LOG=ghostframe=debug` turns DEBUG on;
+(`ghostframe-server/src/main.rs`). `RUST_LOG=ghostframe=debug` turns DEBUG on;
 the e2e harness runs at `ghostframe=trace,debug`, so a DEBUG-only cost shows up
 in e2e and not in a stock deploy.
 

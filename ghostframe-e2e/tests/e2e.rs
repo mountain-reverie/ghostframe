@@ -2662,7 +2662,7 @@ async fn e2e_palette_eviction_body<B: helpers::BrowserSession>(browser: &mut B) 
         }
         e2e_diag!("[H5-STATS-SERIES palette_eviction] {stats_series:?}");
 
-        // Filtered xdaemon-format log lines (tracing-style timestamps +
+        // Filtered ghostframe-server-format log lines (tracing-style timestamps +
         // our [CAP]/[BRIDGE]/"Server ready"/"capture-dump" markers).
         let srv_logs_full = helpers::read_server_logs_stripped("ghostframe-server");
         let xd_lines: Vec<&str> = srv_logs_full
@@ -2678,7 +2678,7 @@ async fn e2e_palette_eviction_body<B: helpers::BrowserSession>(browser: &mut B) 
             })
             .collect();
         e2e_diag!(
-            "[XD-LOG-FILTERED palette_eviction] {} xdaemon-format lines:",
+            "[XD-LOG-FILTERED palette_eviction] {} ghostframe-server-format lines:",
             xd_lines.len()
         );
         let xd_show: &[&str] = if xd_lines.len() > 300 {

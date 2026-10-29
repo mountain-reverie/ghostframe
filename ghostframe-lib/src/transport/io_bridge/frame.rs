@@ -70,7 +70,7 @@ pub(crate) fn palrle_index_slice(
 
 /// Read CLOCK_MONOTONIC and return nanoseconds since the epoch.
 /// Used for the `frame.last_send` telemetry event (and symmetric to the
-/// capture-side `capture_done_ns` populated by `xdaemon`).
+/// capture-side `capture_done_ns` populated by `ghostframe-server`).
 ///
 /// # Safety
 /// `libc::clock_gettime` is async-signal-safe. The timespec struct is
@@ -2320,7 +2320,7 @@ impl IoBridge {
                     self.queued_refinement_latency_stats.max_us,
                 // The per-tick emission budget and the floor it is
                 // clamped against. These were only ever logged at
-                // `debug!`, on a per-frame site, which the xdaemon's
+                // `debug!`, on a per-frame site, which the ghostframe-server's
                 // `ghostframe=info` default filter drops -- so a
                 // deployed build could not show whether the budget
                 // was tracking the path or pinned at its floor.

@@ -236,7 +236,7 @@ fn probe_wayland() -> Option<ClientDisplay> {
 }
 
 /// Probe over X11: a short-lived RandR query for the first connected
-/// output with an active CRTC, mirroring `ghostframe-xdaemon`'s
+/// output with an active CRTC, mirroring `ghostframe-server`'s
 /// `XrandrDisplay::new` (same extension check, same "first connected
 /// output" choice) but read-only and one-shot -- this never applies a
 /// mode, it only reads the current one.

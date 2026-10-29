@@ -90,7 +90,7 @@ impl GhostframeServer {
     ///
     /// `lib_config` is passed straight through to `IoBridge`: this is the
     /// executable boundary. `GhostframeServer` itself never reads the
-    /// process environment; callers (the `ghostframe-xdaemon` binary and the
+    /// process environment; callers (the `ghostframe-server` binary and the
     /// C FFI layer) build it once via `crate::config::LibConfig::from_env()`
     /// and hand it in here.
     pub async fn new(

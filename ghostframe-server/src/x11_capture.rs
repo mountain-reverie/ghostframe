@@ -178,7 +178,7 @@ impl X11Capture {
             // answer. There's also no cached *root pixmap* to invalidate:
             // `capture_root` re-issues `GetImage` on `self.root` (the
             // window, not a pixmap) fresh every call. If we ever observe
-            // a compositor start or stop without an xdaemon restart,
+            // a compositor start or stop without an ghostframe-server restart,
             // that would be the trigger to reconsider this.
         }
         Ok(())

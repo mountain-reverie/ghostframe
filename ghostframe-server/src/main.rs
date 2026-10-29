@@ -121,7 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 "error: TS_AUTHKEY not set and state dir {state_dir:?} has not been initialised.\n\
                  Run once with TS_AUTHKEY set and the --init flag to seed the state dir, e.g.\n\
                  \n\
-                 \tTS_AUTHKEY=tskey-auth-... TS_STATE_DIR={state_dir:?} ghostframe-xdaemon --init\n\
+                 \tTS_AUTHKEY=tskey-auth-... TS_STATE_DIR={state_dir:?} ghostframe-server --init\n\
                  \n\
                  (packaging/install.sh does this for you during setup.)"
             );
@@ -267,7 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // /dev/dri/card0's active scanout (the host's real display) rather than
     // the guest Xorg on :1, producing solid-black or host-screen captures
     // for the guest-mode install. See packaging/systemd/
-    // ghostframe-xdaemon.service which sets the env var by default.
+    // ghostframe-server.service which sets the env var by default.
     let force_x11 = cfg.x11_capture_only;
     let mut backend = if force_x11 {
         tracing::info!("GHOSTFRAME_X11_CAPTURE_ONLY set; skipping DRM probe");
@@ -494,7 +494,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let submit_res = server.submit_frame(frame).await;
             #[allow(
                 clippy::disallowed_methods,
-                reason = "xdaemon is a standalone capture-loop process with its own tokio runtime, never driven by the browserless harness's paused clock -- submit_us is real wall-clock latency telemetry for how long submit_frame() actually took"
+                reason = "ghostframe-server is a standalone capture-loop process with its own tokio runtime, never driven by the browserless harness's paused clock -- submit_us is real wall-clock latency telemetry for how long submit_frame() actually took"
             )]
             let submit_us = submit_start.elapsed().as_micros() as u64;
             if let Err(e) = submit_res {
@@ -522,7 +522,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // exactly which one stalls when the daemon goes silent.
             if frame_count.is_multiple_of(heartbeat_every) {
                 tracing::trace!(
-                    target: "ghostframe::xdaemon::capture",
+                    target: "ghostframe::server::capture",
                     frames = frame_count,
                     w = frame_w,
                     h = frame_h,
@@ -537,7 +537,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             capture_failures.record_success();
         } else {
             tracing::trace!(
-                target: "ghostframe::xdaemon::capture",
+                target: "ghostframe::server::capture",
                 frames = frame_count,
                 capture_us = capture_us,
                 "[CAP] capture returned None (no submission this iter)"
@@ -560,7 +560,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         #[allow(
             clippy::disallowed_methods,
-            reason = "xdaemon paces real screen capture against real wall-clock frame_interval on its own tokio runtime (not the browserless harness's paused one) -- this elapsed time directly controls how long tokio::time::sleep below actually sleeps"
+            reason = "ghostframe-server paces real screen capture against real wall-clock frame_interval on its own tokio runtime (not the browserless harness's paused one) -- this elapsed time directly controls how long tokio::time::sleep below actually sleeps"
         )]
         let elapsed = loop_iter_start.elapsed();
         if elapsed < frame_interval {
@@ -638,7 +638,7 @@ fn dump_frame_as_png(
     }
     match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
         Ok(()) => {
-            tracing::debug!(target: "ghostframe::xdaemon::capture", ?path, count, "[CAP-PNG] wrote frame")
+            tracing::debug!(target: "ghostframe::server::capture", ?path, count, "[CAP-PNG] wrote frame")
         }
         Err(e) => tracing::warn!(?path, error = %e, "failed to write capture PNG"),
     }

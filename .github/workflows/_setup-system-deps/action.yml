@@ -3,7 +3,7 @@ description: >
   Installs the apt packages required to build ghostframe on a runner
   (clang, ffmpeg dev libs, x264, X11/DRM dev headers, xkbcommon for the
   native client's keyboard handling, GStreamer dev libs for the ARM
-  client's decode backend, and Xvfb so the X11-dependent xdaemon tests
+  client's decode backend, and Xvfb so the X11-dependent ghostframe-server tests
   can run -- see the `unit` job in ci.yml). When the
   `e2e-runtime` input is `true`, also installs the runtime packages
   the e2e harness needs on the host itself (weston compositor,

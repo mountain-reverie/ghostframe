@@ -110,7 +110,7 @@ impl std::fmt::Display for DisplayError {
 impl std::error::Error for DisplayError {}
 
 /// Server-side display control. Implemented against X/RandR in
-/// `ghostframe-xdaemon`; mocked in tests. Mirrors `InputInjector`
+/// `ghostframe-server`; mocked in tests. Mirrors `InputInjector`
 /// (`transport/input_inject.rs`), which exists for the same reason: keep
 /// protocol logic testable without a running display server.
 ///

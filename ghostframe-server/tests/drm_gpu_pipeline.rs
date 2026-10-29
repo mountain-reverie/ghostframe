@@ -6,9 +6,9 @@
 //!
 //! Skips gracefully if no DRM device or GPU is available.
 //!
-//! Run: cargo test -p ghostframe-xdaemon --test drm_gpu_pipeline
+//! Run: cargo test -p ghostframe-server --test drm_gpu_pipeline
 
-// Access xdaemon's internal modules via the binary crate.
+// Access ghostframe-server's internal modules via the binary crate.
 // We can't import from main.rs directly, so we duplicate the minimal
 // DRM capture call inline (it's 5 lines).
 

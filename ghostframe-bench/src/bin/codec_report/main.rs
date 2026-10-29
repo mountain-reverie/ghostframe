@@ -102,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
     } else if args.bias_sweep {
         use ghostframe_e2e::harness::{FrameMode, SceneSpec};
         // Required for CDF53 refinement to fire at all — without this
-        // env var the codec is disabled in xdaemon and the PixelPerfect
+        // env var the codec is disabled in ghostframe-server and the PixelPerfect
         // outcome metric stays at zero regardless of bias value.
         std::env::set_var("GHOSTFRAME_ENABLE_CDF53", "1");
         // 30 fps gives the refinement loop enough ticks per second to

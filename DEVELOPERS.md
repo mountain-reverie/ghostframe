@@ -20,7 +20,7 @@ Server:
 | Crate | Purpose |
 | --- | --- |
 | `ghostframe-lib` | Core library: tile engine, encoders, QUIC/WebTransport stack, Tailscale integration. Builds as `cdylib` / `staticlib` / `rlib`. |
-| `ghostframe-xdaemon` | Standalone X11/DRM capture daemon that hosts a session over an embedded Tailscale node. |
+| `ghostframe-server` | Standalone X11/DRM capture daemon that hosts a session over an embedded Tailscale node. |
 
 Clients:
 
@@ -171,7 +171,7 @@ That target builds the web client, builds the two container images
 compiled inside the image, with a persistent BuildKit cache), then runs
 `cargo test --test e2e`.
 
-After any change to `ghostframe-lib` or `ghostframe-xdaemon`, rebuild the
+After any change to `ghostframe-lib` or `ghostframe-server`, rebuild the
 container before re-running e2e tests, otherwise tests will silently run
 the stale binary baked into the image:
 
@@ -195,7 +195,7 @@ reachable by the current user.
 ## Manual smoke test against a real tailnet
 
 See [docs/m0-manual-smoke-test.md](docs/m0-manual-smoke-test.md) for the
-ping/pong smoke test that exercises `ghostframe-xdaemon` + the web client
+ping/pong smoke test that exercises `ghostframe-server` + the web client
 against a real Tailscale tailnet.
 
 ## Environment variables
@@ -206,7 +206,7 @@ holds the recipe for adding one, and
 [`ghostframe-client-gpu/src/config.rs`](ghostframe-client-gpu/src/config.rs)
 the `GHOSTFRAME_CLIENT_DUMP_*` frame-dump knobs. CI fails if `ghostframe-lib` or
 any `ghostframe-client-*` crate reads `std::env` anywhere else. Other crates
-(xdaemon, test-pattern, the Go bridge) have not been converted yet and read
+(ghostframe-server, test-pattern, the Go bridge) have not been converted yet and read
 their variables at the point of use.
 
 ## Tailnet peer access
@@ -309,7 +309,7 @@ This has not been tested against ghostframe; PRs welcome.
 ### Xorg + dummy driver (no display GPU)
 
 When the machine has no display GPU, `xf86-video-dummy` provides an Xorg with
-no DRM device. `ghostframe-xdaemon` will detect the absence of DRM and fall
+no DRM device. `ghostframe-server` will detect the absence of DRM and fall
 back to its X11 capture path. Hardware encoding is not available in this
 configuration. The server itself still needs a usable Vulkan compute device
 to analyse and encode frames: it has no software path and refuses to start

@@ -34,7 +34,7 @@ if [[ -n "${SHAPE_BANDWIDTH_KBPS:-}" ]]; then
 fi
 
 # If TEST_PATTERN uses DRM-direct mode, skip Xorg entirely — test-pattern
-# will be the DRM master itself and ghostframe-xdaemon's drm_capture will
+# will be the DRM master itself and ghostframe-server's drm_capture will
 # read the FB the test-pattern attaches.
 if [[ "${TEST_PATTERN:-}" == *--drm-direct* ]]; then
     echo "entrypoint: TEST_PATTERN is DRM-direct, skipping Xorg"
@@ -44,14 +44,14 @@ if [[ "${TEST_PATTERN:-}" == *--drm-direct* ]]; then
     # during motion phases. Caller can override via CAPTURE_FPS_DRM_DIRECT
     # for ad-hoc experiments.
     export CAPTURE_FPS=${CAPTURE_FPS_DRM_DIRECT:-30}
-    # No Xorg in the container — tell ghostframe-xdaemon to skip its
+    # No Xorg in the container — tell ghostframe-server to skip its
     # `wait_for_x11` gate, which would otherwise block on display :99
     # for 10 s and abort startup. Added when wait_for_x11 was introduced
     # (commit 73c26a4) and silently broke every drm-direct e2e.
     export GHOSTFRAME_NO_X11_WAIT=1
     ghostframe-test-pattern ${TEST_PATTERN} &
     sleep 1
-    exec /usr/local/bin/ghostframe-xdaemon
+    exec /usr/local/bin/ghostframe-server
 fi
 
 # If XORG_CONF is unset, auto-detect the right config:
@@ -80,5 +80,5 @@ sleep 2
 ghostframe-test-pattern ${TEST_PATTERN:---solid-red} &
 sleep 1
 
-# Start xdaemon (captures X11 root, serves via WebTransport)
-exec /usr/local/bin/ghostframe-xdaemon
+# Start ghostframe-server (captures X11 root, serves via WebTransport)
+exec /usr/local/bin/ghostframe-server

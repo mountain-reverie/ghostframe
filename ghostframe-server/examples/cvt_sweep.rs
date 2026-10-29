@@ -7,7 +7,7 @@
 //! `src/bin/*` binary. Not a test because it shells out to an external
 //! process for thousands of cases, which is far too slow and
 //! environment-dependent for `cargo test`. Not a `src/bin/*` because
-//! `cargo build -p ghostframe-xdaemon` builds every binary in the package,
+//! `cargo build -p ghostframe-server` builds every binary in the package,
 //! and the e2e container image does exactly that
 //! (`tests/containers/test-server/Dockerfile`) — a dev-only tool would be
 //! compiled into and shipped with that image. `cargo build -p` does not
@@ -17,7 +17,7 @@
 //! Run it by hand before touching the arithmetic in `../src/cvt.rs`:
 //!
 //! ```text
-//! cargo run -p ghostframe-xdaemon --example cvt_sweep
+//! cargo run -p ghostframe-server --example cvt_sweep
 //! ```
 //!
 //! It re-includes `../cvt.rs` verbatim via `#[path]` (not a copy), so it can
