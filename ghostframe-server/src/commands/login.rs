@@ -134,6 +134,9 @@ pub fn login_with<T: Tailnet>(
                 state::mark_joined(&dir).map_err(|e| format!("recording the join: {e}"))?;
                 writeln!(out, "authorised as {}", config.hostname).map_err(w)?;
             }
+            // None = Running with an empty AuthURL. Caveat: a node resumed from a
+            // cached netmap can report Running before control re-validated its
+            // key, so this is "authorised as far as we can tell offline".
             None => {
                 state::mark_joined(&dir).map_err(|e| format!("recording the join: {e}"))?;
                 writeln!(out, "already authorised as {}", config.hostname).map_err(w)?;
@@ -191,8 +194,23 @@ pub fn logout_with<T: Tailnet>(
     crate::util::ensure_private_dir(&dir)?;
     let lock = StateLock::acquire(&dir).map_err(|e| e.to_string())?;
 
+    // Scan BEFORE deregistering: a directory holding anything ghostframe did
+    // not create is refused while the node is still registered and still
+    // marked joined. Refusing afterwards would leave a deregistered node
+    // whose marker survives, and the next `capture` would start an
+    // interactive tsnet.
+    if let Err(RemoveError::Unknown(names)) = state::plan_removal(&dir) {
+        return Err(format!(
+            "{} holds entries ghostframe did not create: {}. No change was made. \
+             Is TS_STATE_DIR right?",
+            dir.display(),
+            names.join(", ")
+        ));
+    }
+
     // Nothing to deregister for a node that never got past tsnet's own start.
-    if dir.join("tailscaled.state").exists() && !state::never_joined(&dir) {
+    let registered = dir.join("tailscaled.state").exists() && !state::never_joined(&dir);
+    if registered {
         let mut config = bridge_config(cfg, &dir, &hostname, &control_url);
         config.authkey = String::new();
         let bridge = connect(&config).map_err(tailnet_err)?;
@@ -209,19 +227,44 @@ pub fn logout_with<T: Tailnet>(
         })?;
         // Dropping the handle closes the tsnet server.
         drop(bridge);
-    }
-    match state::remove_state_dir(&dir) {
-        Ok(()) => {}
-        Err(RemoveError::Unknown(names)) => {
-            return Err(format!(
-                "{} holds entries ghostframe did not create, so nothing was removed: {}. \
-                 Is TS_STATE_DIR right?",
-                dir.display(),
-                names.join(", ")
-            ))
+        // The node is deregistered: the directory must stop claiming a join
+        // before anything else can go wrong.
+        match std::fs::remove_file(dir.join(state::JOINED_FILE)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "logged out, but could not remove {}: {e}; delete the state directory \
+                     by hand before starting the service: rm -r {:?}",
+                    state::JOINED_FILE,
+                    dir
+                ))
+            }
         }
-        Err(RemoveError::Io(e)) => return Err(format!("removing {}: {e}", dir.display())),
     }
+    if dir.join("files").is_dir() {
+        writeln!(
+            out,
+            "removing {}/files/ (files received over Taildrop)",
+            dir.display()
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    state::remove_state_dir(&dir).map_err(|e| {
+        let why = match e {
+            RemoveError::Unknown(names) => {
+                format!(
+                    "entries ghostframe did not create appeared: {}",
+                    names.join(", ")
+                )
+            }
+            RemoveError::Io(e) => e.to_string(),
+        };
+        format!(
+            "logged out of the tailnet, but the local state in {} was not fully removed: {why}",
+            dir.display()
+        )
+    })?;
     drop(lock);
     writeln!(out, "logged out; removed {}", dir.display()).map_err(|e| e.to_string())?;
     Ok(())
@@ -244,6 +287,8 @@ mod tests {
         up_saw_lock_busy: Cell<bool>,
         logout_saw_state: Cell<bool>,
         url_calls: Cell<u32>,
+        logout_calls: Cell<u32>,
+        foreign_during_logout: bool,
     }
 
     impl Tailnet for &Fake {
@@ -265,6 +310,10 @@ mod tests {
             Ok(self.url.clone())
         }
         fn logout(&self) -> Result<(), GhostbridgeError> {
+            self.logout_calls.set(self.logout_calls.get() + 1);
+            if self.foreign_during_logout {
+                std::fs::write(self.dir.join("holiday.jpg"), b"precious").unwrap();
+            }
             self.logout_saw_state
                 .set(self.dir.join("tailscaled.state").exists());
             if self.logout_err {
@@ -390,9 +439,20 @@ mod tests {
         std::fs::write(dir.join("holiday.jpg"), b"precious").unwrap();
         let canary = root.path().join("canary");
         std::fs::write(&canary, b"x").unwrap();
-        let (r, _) = run_logout(&cfg, &fake(&dir));
+        let f = fake(&dir);
+        let (r, _) = run_logout(&cfg, &f);
         let e = r.unwrap_err();
+        assert_eq!(
+            f.logout_calls.get(),
+            0,
+            "refused up front, before deregistering"
+        );
+        assert!(
+            state::state_dir_seeded(&dir),
+            "still registered, still marked"
+        );
         assert!(e.contains("holiday.jpg"), "{e}");
+        assert!(e.contains("No change was made"), "{e}");
         assert!(dir.join("holiday.jpg").exists());
         assert!(dir.join("tailscaled.state").exists());
         assert!(canary.exists());
@@ -515,5 +575,36 @@ mod tests {
         let e = r.unwrap_err();
         assert!(e.contains("within 60 s"), "{e}");
         assert!(!state::state_dir_seeded(&dir));
+    }
+
+    #[test]
+    fn a_node_logged_out_is_never_left_marked_joined() {
+        // A foreign file appears after the up-front scan; the removal then
+        // fails. The node IS deregistered by then, so the marker must be gone
+        // or the next `capture` starts an interactive tsnet.
+        let (_r, cfg, dir) = setup(&[]);
+        registered_state(&dir);
+        let f = Fake {
+            foreign_during_logout: true,
+            ..fake(&dir)
+        };
+        let (r, _) = run_logout(&cfg, &f);
+        let e = r.unwrap_err();
+        assert_eq!(f.logout_calls.get(), 1);
+        assert!(!state::state_dir_seeded(&dir), "marker survived a logout");
+        assert!(dir.join("holiday.jpg").exists());
+        assert!(e.contains("logged out"), "says what did happen: {e}");
+        assert!(!e.contains("nothing was removed"), "{e}");
+    }
+
+    #[test]
+    fn logout_says_when_it_removes_taildrop_files() {
+        let (_r, cfg, dir) = setup(&[]);
+        registered_state(&dir);
+        std::fs::create_dir(dir.join("files")).unwrap();
+        std::fs::write(dir.join("files/received.txt"), b"x").unwrap();
+        let (r, out) = run_logout(&cfg, &fake(&dir));
+        r.unwrap();
+        assert!(out.contains("files/"), "{out}");
     }
 }
