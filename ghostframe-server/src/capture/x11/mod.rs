@@ -6,6 +6,8 @@ pub mod display;
 pub mod frames;
 pub mod input;
 #[cfg(test)]
+pub(crate) mod randr_events;
+#[cfg(test)]
 pub(crate) mod test_support;
 
 use std::io;
@@ -62,20 +64,23 @@ impl X11Backend {
         // RandR is an ordinary, unprivileged X client operation. If it is
         // unavailable (extension missing, no connected output), continue with
         // no display controller: a fixed resolution beats refusing to start.
-        let display: Option<Arc<dyn DisplayController>> =
-            match display::XrandrDisplay::new(cfg.max_resolution.clone()) {
-                Ok(ctl) => {
-                    tracing::info!("XRandR display controller ready");
-                    Some(Arc::new(ctl))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "XRandR display controller unavailable; resolution negotiation disabled"
-                    );
-                    None
-                }
-            };
+        let display: Option<Arc<dyn DisplayController>> = match display::XrandrDisplay::new(
+            cfg.display.as_deref(),
+            cfg.max_resolution.clone(),
+            cfg.randr_settle,
+        ) {
+            Ok(ctl) => {
+                tracing::info!("XRandR display controller ready");
+                Some(Arc::new(ctl))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "XRandR display controller unavailable; resolution negotiation disabled"
+                );
+                None
+            }
+        };
 
         Ok(Self {
             frames,

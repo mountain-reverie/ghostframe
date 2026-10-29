@@ -37,3 +37,6 @@ libxkbcommon-x11-dev
 libgstreamer1.0-dev
 libgstreamer-plugins-base1.0-dev
 xvfb
+# xrandr: the RandR tests compare a server-initiated mode change with the
+# event stream `xrandr --output O --mode M` produces on the same Xvfb.
+x11-xserver-utils

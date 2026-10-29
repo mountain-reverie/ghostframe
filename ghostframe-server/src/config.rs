@@ -24,10 +24,14 @@
 //! | `GHOSTFRAME_CAPTURE_DUMP_DIR` | write each frame as PNG here (test builds only) | off |
 //! | `GHOSTFRAME_CAPTURE_HEARTBEAT_EVERY` | trace heartbeat every N frames | 5 |
 //! | `GHOSTFRAME_DUMP_FIRST_FRAME` | dump first raw frame to this path (test builds only) | off |
+//! | `GHOSTFRAME_RANDR_SETTLE_MS` | wait after a mode change before checking the desktop kept it | 2500 |
 //! | `GHOSTFRAME_MAX_RESOLUTION` | `WxH` resolution ceiling, or `none` | none (the unit `install` writes sets `1920x1080`) |
 
 pub const DEFAULT_CAPTURE_FPS: u64 = 30;
 const DEFAULT_HEARTBEAT_EVERY: u64 = 5;
+/// Long enough for a desktop's own debounce (Enlightenment's
+/// `hotplug_response` is 1 s, and it reverts ~1.7 s after a change).
+pub const DEFAULT_RANDR_SETTLE_MS: u64 = 2500;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -48,6 +52,8 @@ pub struct ServerConfig {
     pub heartbeat_every: u64,
     pub dump_first_frame: Option<String>,
     pub max_resolution: Option<String>,
+    /// `GHOSTFRAME_RANDR_SETTLE_MS`; zero cannot be set (it is not positive).
+    pub randr_settle: std::time::Duration,
 }
 
 impl ServerConfig {
@@ -123,6 +129,11 @@ impl ServerConfig {
             ),
             dump_first_frame: knob("GHOSTFRAME_DUMP_FIRST_FRAME"),
             max_resolution: nonempty("GHOSTFRAME_MAX_RESOLUTION"),
+            randr_settle: std::time::Duration::from_millis(parse_positive(
+                "GHOSTFRAME_RANDR_SETTLE_MS",
+                get("GHOSTFRAME_RANDR_SETTLE_MS"),
+                DEFAULT_RANDR_SETTLE_MS,
+            )),
         }
     }
 }
@@ -163,6 +174,23 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         ServerConfig::from_lookup(|k| m.get(k).cloned(), Some("testhost".into()))
+    }
+
+    #[test]
+    fn randr_settle_defaults_and_parses() {
+        assert_eq!(cfg(&[]).randr_settle.as_millis(), 2500);
+        assert_eq!(
+            cfg(&[("GHOSTFRAME_RANDR_SETTLE_MS", "400")])
+                .randr_settle
+                .as_millis(),
+            400
+        );
+        assert_eq!(
+            cfg(&[("GHOSTFRAME_RANDR_SETTLE_MS", "0")])
+                .randr_settle
+                .as_millis(),
+            2500
+        );
     }
 
     #[test]
