@@ -179,7 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Tracks whether the loop is currently in idle (no-client) mode, so we
     // emit a single info log on each idle↔active flip. The IoBridge logs the
     // corresponding event on its side; this log shows the capture loop's view
-    // (X11 GetImage suspended/resumed).
+    // (root grab suspended/resumed).
     // None = nothing logged yet, so the FIRST pass through the loop announces
     // whichever state it finds. Seeded `true` this stayed silent on the most
     // common startup path -- no client yet -- so the daemon logged "entering
@@ -210,7 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         let loop_iter_start = std::time::Instant::now();
         // Skip the capture scrape entirely when nobody is connected. Without
-        // this gate, X11 GetImage copies a full 1920x1080 framebuffer through
+        // this gate, the root grab copies a full 1920x1080 framebuffer through
         // the X server every 33 ms regardless of demand.
         //
         // `wait_for_client` parks on the connect event itself. The earlier

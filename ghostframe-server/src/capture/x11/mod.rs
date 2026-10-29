@@ -115,16 +115,37 @@ impl super::Backend for X11Backend {
     }
 
     fn drain_damage(&mut self) -> Option<Vec<(u32, u32)>> {
+        // The cursor is blended into every frame but X reports no damage for
+        // it. Poll it on every drain (it is also the cursor `capture` then
+        // draws) and union its old and new tiles into any hinted set;
+        // otherwise a moved pointer leaves a trail whenever something else
+        // is damaged.
+        let cursor_tiles = self.frames.poll_cursor();
         // An empty drain means no damage events since the last call, but the
         // first frame for a newly connected client must still be compared in
         // full, so empty maps to `None` ("check every tile").
         let tiles = self.damage.as_ref()?.drain_damage();
-        if tiles.is_empty() {
-            None
-        } else {
-            Some(tiles)
+        merge_cursor_damage(tiles, cursor_tiles)
+    }
+}
+
+/// Hints for the lib: the drained damage plus the cursor's tiles, or `None`
+/// ("compare every tile") when nothing was damaged. Cursor tiles alone never
+/// make a hint: with no other change the first frame for a new client must
+/// still be compared in full.
+fn merge_cursor_damage(
+    mut damage: Vec<(u32, u32)>,
+    cursor: Vec<(u32, u32)>,
+) -> Option<Vec<(u32, u32)>> {
+    if damage.is_empty() {
+        return None;
+    }
+    for t in cursor {
+        if !damage.contains(&t) {
+            damage.push(t);
         }
     }
+    Some(damage)
 }
 
 /// Block until `$DISPLAY` accepts an X11 connection, or the timeout expires.
@@ -157,4 +178,22 @@ pub fn wait_for_x11(timeout: Duration, display: Option<&str>) -> Result<(), Stri
         "X11 display {display} not ready after {timeout:?} ({attempt} attempt(s)); \
          last error: {last_err}"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_cursor_damage;
+
+    #[test]
+    fn cursor_tiles_join_the_damage_without_duplicates() {
+        assert_eq!(
+            merge_cursor_damage(vec![(5, 5), (1, 1)], vec![(1, 1), (0, 0)]),
+            Some(vec![(5, 5), (1, 1), (0, 0)])
+        );
+    }
+
+    #[test]
+    fn no_damage_stays_unknown_whatever_the_cursor_did() {
+        assert_eq!(merge_cursor_damage(vec![], vec![(0, 0)]), None);
+    }
 }
