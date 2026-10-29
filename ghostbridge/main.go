@@ -126,10 +126,12 @@ func gbridge_new(cHostname, cAuthkey, cStateDir, cControlURL *C.char, quiet, non
 	}
 	// redactAuthURLs: a daemon must never put a sign-in URL in its journal,
 	// with or without an auth key (a key can expire, a node can be removed).
-	// UserLogf exists to be shown to a person, so it is discarded outright.
+	// UserLogf is kept (its diagnostics are useful) but redacted too, and so
+	// is the stdlib logger.
 	if redactAuthURLs != 0 && quiet == 0 {
 		s.Logf = redactingLogf(log.Printf)
-		s.UserLogf = discardLogf
+		s.UserLogf = redactingLogf(log.Printf)
+		redactStdlibLog(os.Stderr)
 	}
 	if controlURL != "" {
 		s.ControlURL = controlURL
@@ -345,6 +347,21 @@ const (
 // the words around it, means a release that rewords the line or passes the
 // URL through "%s" still cannot leak it.
 var authURLRe = regexp.MustCompile(`https?://\S+/(a|register)/\S+`)
+
+// redactWriter applies authURLRe to everything written through it.
+type redactWriter struct{ w io.Writer }
+
+func (r redactWriter) Write(p []byte) (int, error) {
+	if _, err := r.w.Write(authURLRe.ReplaceAll(p, []byte("[sign-in URL redacted]"))); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// redactStdlibLog routes the process-wide stdlib logger through authURLRe.
+// tailscale calls log.Printf directly in places (controlclient/direct.go
+// under TS_DEBUG_MAP), which Logf redaction cannot see.
+func redactStdlibLog(w io.Writer) { log.SetOutput(redactWriter{w}) }
 
 // redactingLogf formats first, then replaces any sign-in URL in the result.
 // A daemon's journal is readable by more people than the node's owner, and

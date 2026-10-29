@@ -13,10 +13,12 @@ package main
 // so that untestable layer holds no decisions.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -369,6 +371,39 @@ func TestUpNonInteractivePassesUpErrorsThrough(t *testing.T) {
 	err := upNonInteractive(func(context.Context) error { return boom }, f, time.Millisecond, time.Hour, nil)
 	if !errors.Is(err, boom) || errors.Is(err, errNeedsLogin) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// Tailscale also calls the stdlib logger directly (controlclient/direct.go
+// under TS_DEBUG_MAP); Logf redaction alone does not cover that.
+func TestRedactLogOutputCoversStdlibLog(t *testing.T) {
+	var buf bytes.Buffer
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	defer func() { log.SetOutput(prevOut); log.SetFlags(prevFlags) }()
+	redactStdlibLog(&buf)
+	log.Printf("%s", "https://login.tailscale.com/a/0123456789abc")
+	log.Printf("plain line")
+	out := buf.String()
+	if strings.Contains(out, "/a/0123") || strings.Contains(out, "login.tailscale.com") {
+		t.Fatalf("URL survived: %q", out)
+	}
+	if !strings.Contains(out, "plain line") {
+		t.Fatalf("ordinary line lost: %q", out)
+	}
+}
+
+// A UserLogf line is shown to people, so it stays, minus any URL.
+func TestUserLogfKeepsDiagnosticsButRedactsURLs(t *testing.T) {
+	var got []string
+	next := func(f string, a ...any) { got = append(got, fmt.Sprintf(f, a...)) }
+	l := redactingLogf(next)
+	l("Authkey is set; but state is %s. Ignoring authkey.", "NeedsLogin")
+	l("To start this tsnet server, restart with TS_AUTHKEY set, or go to: %s", "https://login.tailscale.com/a/abc123")
+	if len(got) != 2 || !strings.Contains(got[0], "Ignoring authkey") {
+		t.Fatalf("got %q", got)
+	}
+	if strings.Contains(got[1], "abc123") || !strings.Contains(got[1], "restart with TS_AUTHKEY") {
+		t.Fatalf("got %q", got[1])
 	}
 }
 
