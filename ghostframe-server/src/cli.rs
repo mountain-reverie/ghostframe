@@ -23,8 +23,16 @@ pub enum Command {
         #[arg(long, value_name = "URL")]
         control_url: Option<String>,
     },
-    /// Leave the tailnet and delete the node's state.
-    Logout,
+    /// Leave the tailnet and delete the node's state. Pass the same
+    /// --hostname/--control-url that `login` was given.
+    Logout {
+        /// Node name it was registered under (default: TS_HOSTNAME, else `<host>-ghostframe`).
+        #[arg(long)]
+        hostname: Option<String>,
+        /// Control server URL it was registered with (default: TS_CONTROL_URL, else Tailscale).
+        #[arg(long, value_name = "URL")]
+        control_url: Option<String>,
+    },
     /// Run the server (what the systemd unit starts).
     Capture,
 }
@@ -42,7 +50,20 @@ mod tests {
     #[test]
     fn parses_each_command() {
         assert_eq!(parse(&["capture"]).unwrap(), Command::Capture);
-        assert_eq!(parse(&["logout"]).unwrap(), Command::Logout);
+        assert_eq!(
+            parse(&["logout"]).unwrap(),
+            Command::Logout {
+                hostname: None,
+                control_url: None
+            }
+        );
+        assert_eq!(
+            parse(&["logout", "--hostname", "h", "--control-url", "http://hs"]).unwrap(),
+            Command::Logout {
+                hostname: Some("h".into()),
+                control_url: Some("http://hs".into())
+            }
+        );
         assert_eq!(
             parse(&["login"]).unwrap(),
             Command::Login {

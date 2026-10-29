@@ -46,7 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             hostname,
             control_url,
         } => commands::login::login(&cfg, hostname, control_url),
-        Command::Logout => commands::login::logout(&cfg),
+        Command::Logout {
+            hostname,
+            control_url,
+        } => commands::login::logout(&cfg, hostname, control_url),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");

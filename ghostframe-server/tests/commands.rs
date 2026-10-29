@@ -120,3 +120,31 @@ fn init_is_gone() {
         );
     }
 }
+
+#[test]
+fn capture_does_not_treat_a_started_but_unauthorised_node_as_joined() {
+    // What an interrupted `login` leaves: tsnet writes `{}` (then the machine
+    // key) before any authorisation. Starting capture on it would make tsnet
+    // log a claimable sign-in URL to the journal every few seconds.
+    for content in [&b"{}"[..], br#"{"_machinekey":"AAAA"}"#] {
+        let state = private_dir();
+        std::fs::write(state.path().join("tailscaled.state"), content).unwrap();
+        let out = run(&["capture"], &[("TS_STATE_DIR", state.path())]);
+        assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+        assert!(
+            stderr(&out).contains("run `ghostframe-server login`"),
+            "{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn logout_refuses_a_directory_it_did_not_create() {
+    let state = private_dir();
+    std::fs::write(state.path().join("holiday.jpg"), b"precious").unwrap();
+    let out = run(&["logout"], &[("TS_STATE_DIR", state.path())]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("holiday.jpg"), "{}", stderr(&out));
+    assert!(state.path().join("holiday.jpg").exists());
+}

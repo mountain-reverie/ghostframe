@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 clap = { workspace = true }
+serde_json = "1"
 ghostframe-lib = { path = "../ghostframe-lib" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing = { workspace = true }

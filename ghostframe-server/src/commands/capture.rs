@@ -53,7 +53,7 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
         (None, false) => {
             eprintln!(
                 "error: this node has not joined a tailnet yet ({state_dir:?} holds no \
-                 tailscaled.state).\n\
+                 completed join; tsnet's own tailscaled.state does not count).\n\
                  run `ghostframe-server login`, then `systemctl --user start ghostframe-server`"
             );
             std::process::exit(2);
@@ -66,6 +66,7 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
         authkey,
         state_dir,
         control_url: cfg.ts_control_url.clone(),
+        quiet: false,
     };
 
     if let Err(msg) =
@@ -118,6 +119,12 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
             return Err(e);
         }
     };
+
+    // The join completed (an auth-key join, or already-authorised state).
+    // Without the marker a later start would not count this state as joined.
+    if let Err(e) = state::mark_joined(&state_dir_path) {
+        tracing::warn!(error = %e, "could not record the join; the next start will ask for `login`");
+    }
 
     tracing::info!("Server ready, entering capture loop");
 

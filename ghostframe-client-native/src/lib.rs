@@ -322,6 +322,7 @@ impl Client {
                     authkey: self.config.authkey.clone(),
                     state_dir: self.config.state_dir.to_string_lossy().into_owned(),
                     control_url,
+                    quiet: false,
                 })?);
                 b.up()?;
                 b

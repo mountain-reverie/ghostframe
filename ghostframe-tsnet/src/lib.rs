@@ -36,6 +36,7 @@ extern "C" {
         authkey: *const c_char,
         state_dir: *const c_char,
         control_url: *const c_char,
+        quiet: c_int,
         sd_out: *mut c_int,
     ) -> c_int;
     fn gbridge_up(sd: c_int) -> c_int;
@@ -92,6 +93,9 @@ pub struct GhostbridgeConfig {
     pub authkey: String,
     pub state_dir: String,
     pub control_url: String,
+    /// Discard tsnet's own log output. For interactive commands that print
+    /// their own progress; daemons and clients leave it `false`.
+    pub quiet: bool,
 }
 
 pub struct GhostbridgeHandle {
@@ -112,6 +116,7 @@ impl GhostbridgeHandle {
                 c_authkey.as_ptr(),
                 c_state_dir.as_ptr(),
                 c_control_url.as_ptr(),
+                c_int::from(config.quiet),
                 &mut sd,
             )
         };

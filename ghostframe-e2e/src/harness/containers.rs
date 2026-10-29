@@ -91,6 +91,7 @@ impl TestNode {
             authkey,
             state_dir: format!("/tmp/ghostframe-e2e-client-{}", std::process::id()),
             control_url,
+            quiet: false,
         })?;
         handle.up()?;
         Ok(Self {

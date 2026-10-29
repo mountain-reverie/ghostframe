@@ -82,6 +82,7 @@ pub fn login(
         authkey: authkey.clone().unwrap_or_default(),
         state_dir: dir.to_string_lossy().into_owned(),
         control_url: login_server.unwrap_or_default(),
+        quiet: false,
     };
 
     let bridge = GhostbridgeHandle::connect(&config)?;
@@ -125,6 +126,7 @@ pub fn logout() -> Result<(), CommandError> {
         authkey: String::new(),
         state_dir: dir.to_string_lossy().into_owned(),
         control_url: String::new(),
+        quiet: false,
     };
     let bridge = GhostbridgeHandle::connect(&config)?;
 
