@@ -17,26 +17,9 @@ pub fn monotonic_now_ns() -> u64 {
     (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
 }
 
-/// Interpret an environment value as a boolean flag: set, non-empty and not
-/// `"0"` means on. `None` (unset) is off.
-pub fn env_flag(value: Option<&str>) -> bool {
-    value.is_some_and(|v| !v.is_empty() && v != "0")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn env_flag_truth_table() {
-        assert!(!env_flag(None));
-        assert!(!env_flag(Some("")));
-        assert!(!env_flag(Some("0")));
-        assert!(env_flag(Some("1")));
-        assert!(env_flag(Some("true")));
-        // Only the exact string "0" is off.
-        assert!(env_flag(Some("00")));
-    }
 
     #[test]
     fn monotonic_clock_is_nonzero_and_nondecreasing() {

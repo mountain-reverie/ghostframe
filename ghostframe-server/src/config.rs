@@ -23,10 +23,7 @@
 //! | `GHOSTFRAME_CAPTURE_DUMP_DIR` | write each frame as PNG here (test builds only) | off |
 //! | `GHOSTFRAME_CAPTURE_HEARTBEAT_EVERY` | trace heartbeat every N frames | 5 |
 //! | `GHOSTFRAME_DUMP_FIRST_FRAME` | dump first raw frame to this path (test builds only) | off |
-//! | `GHOSTFRAME_FORCE_ROOT_GET_IMAGE` | bypass compositor probe | off |
 //! | `GHOSTFRAME_ATTACH_MAX_RESOLUTION` | `WxH` ceiling in attach mode | none |
-
-use crate::util::env_flag;
 
 pub const DEFAULT_CAPTURE_FPS: u64 = 30;
 const DEFAULT_HEARTBEAT_EVERY: u64 = 5;
@@ -48,7 +45,6 @@ pub struct XdaemonConfig {
     /// Always >= 1 (it is used as a modulus).
     pub heartbeat_every: u64,
     pub dump_first_frame: Option<String>,
-    pub force_root_get_image: bool,
     pub attach_max_resolution: Option<String>,
 }
 
@@ -118,7 +114,6 @@ impl XdaemonConfig {
                 DEFAULT_HEARTBEAT_EVERY,
             ),
             dump_first_frame: knob("GHOSTFRAME_DUMP_FIRST_FRAME"),
-            force_root_get_image: env_flag(get("GHOSTFRAME_FORCE_ROOT_GET_IMAGE").as_deref()),
             attach_max_resolution: get("GHOSTFRAME_ATTACH_MAX_RESOLUTION"),
         }
     }

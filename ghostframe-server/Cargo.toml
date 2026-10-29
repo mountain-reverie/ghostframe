@@ -10,7 +10,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 libc = { workspace = true }
-x11rb = { version = "0.13", features = ["damage", "xtest", "composite", "xfixes", "randr"] }
+x11rb = { version = "0.13", features = ["damage", "xtest", "xfixes", "randr", "shm"] }
 # Optional capture-dump diagnostic: write each captured frame to a PNG on
 # disk when GHOSTFRAME_CAPTURE_DUMP_DIR is set. Default-features off keeps
 # the dependency tree small (PNG encoder only).
