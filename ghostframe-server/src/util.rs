@@ -29,20 +29,36 @@ pub fn system_hostname() -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// The effective user's login name, from the passwd database.
-pub fn current_username() -> Option<String> {
+/// The effective user's passwd entry: login name and home directory.
+pub struct Passwd {
+    pub name: String,
+    pub home: String,
+}
+
+/// The effective user's passwd entry. Used to check `HOME` and to name the
+/// user; never to derive a path to write under.
+pub fn current_passwd() -> Option<Passwd> {
     // SAFETY: getpwuid returns NULL or a pointer to static storage that stays
-    // valid until the next getpw* call; the name is copied out before any.
+    // valid until the next getpw* call; both strings are copied out before any.
     unsafe {
         let pw = libc::getpwuid(libc::geteuid());
-        if pw.is_null() || (*pw).pw_name.is_null() {
+        if pw.is_null() || (*pw).pw_name.is_null() || (*pw).pw_dir.is_null() {
             return None;
         }
-        Some(
-            std::ffi::CStr::from_ptr((*pw).pw_name)
-                .to_string_lossy()
-                .into_owned(),
-        )
+        let s = |p: *const libc::c_char| std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
+        Some(Passwd {
+            name: s((*pw).pw_name),
+            home: s((*pw).pw_dir),
+        })
+    }
+}
+
+/// Ignore SIGHUP for the rest of the process: `install` may stop the very
+/// session it was started from.
+pub fn ignore_sighup() {
+    // SAFETY: installing SIG_IGN for a standard signal has no preconditions.
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
 }
 
@@ -63,7 +79,10 @@ mod tests {
             .output()
             .unwrap();
         let want = String::from_utf8(id.stdout).unwrap();
-        assert_eq!(current_username().as_deref(), Some(want.trim()));
+        assert_eq!(
+            current_passwd().map(|p| p.name).as_deref(),
+            Some(want.trim())
+        );
     }
 
     #[test]

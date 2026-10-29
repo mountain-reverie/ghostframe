@@ -91,6 +91,25 @@ impl ServerConfig {
         self.home.as_deref()
     }
 
+    /// The state directory the installed unit uses: its
+    /// `TS_STATE_DIR=%S/ghostframe`, i.e. `$XDG_STATE_HOME/ghostframe` or
+    /// `<home>/.local/state/ghostframe`. Ignores `TS_STATE_DIR`, which the
+    /// unit overrides anyway.
+    pub fn unit_state_dir(&self, home: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        match &self.xdg_state_home {
+            Some(x) if std::path::Path::new(x).is_absolute() => {
+                Ok(std::path::Path::new(x).join("ghostframe"))
+            }
+            Some(x) => Err(format!("XDG_STATE_HOME={x:?} is not an absolute path")),
+            None => Ok(home.join(".local/state/ghostframe")),
+        }
+    }
+
+    /// `TS_STATE_DIR` as set in this shell, if any.
+    pub fn ts_state_dir(&self) -> Option<&str> {
+        self.ts_state_dir.as_deref()
+    }
+
     /// Read the process environment. Call once, from `main()`.
     pub fn from_env() -> Self {
         Self::from_lookup(|k| std::env::var(k).ok(), crate::util::system_hostname())
@@ -193,6 +212,22 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         ServerConfig::from_lookup(|k| m.get(k).cloned(), Some("testhost".into()))
+    }
+
+    #[test]
+    fn unit_state_dir_follows_the_unit_not_ts_state_dir() {
+        let h = std::path::Path::new("/h");
+        let d = |pairs: &[(&str, &str)]| cfg(pairs).unit_state_dir(h);
+        assert_eq!(d(&[]).unwrap(), h.join(".local/state/ghostframe"));
+        assert_eq!(
+            d(&[("TS_STATE_DIR", "/elsewhere")]).unwrap(),
+            h.join(".local/state/ghostframe")
+        );
+        assert_eq!(
+            d(&[("XDG_STATE_HOME", "/x")]).unwrap(),
+            std::path::Path::new("/x/ghostframe")
+        );
+        assert!(d(&[("XDG_STATE_HOME", "rel")]).is_err());
     }
 
     #[test]
