@@ -1309,7 +1309,7 @@ fn dmabuf_real_cdf53_forward_gpu_matches_cpu_reference() {
 /// `import_pixels`) instead of `process_frame` (the DMA-BUF path).
 ///
 /// **Why this exists separately:** the live X11-on-AMD deployment runs
-/// the daemon with `GHOSTFRAME_X11_CAPTURE_ONLY=1`, which routes
+/// the daemon, which captures over X11 only and so routes
 /// `FrameSubmission.pixels` (a `Vec<u8>` of BGRA bytes from XGetImage)
 /// straight into `process_frame_from_pixels`. None of the previous
 /// gradient/lossless e2e tests exercise that path — they all use
