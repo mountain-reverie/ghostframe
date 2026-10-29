@@ -167,7 +167,8 @@ fn record(secs: u64) -> Result<()> {
 }
 
 fn apply(w: u16, h: u16) -> Result<()> {
-    let ctl = display::XrandrDisplay::new(None).map_err(|e| e.to_string())?;
+    let ctl = display::XrandrDisplay::new(None, None, std::time::Duration::ZERO)
+        .map_err(|e| e.to_string())?;
     ctl.set_output(w, h, 1000).map_err(|e| e.to_string())?;
     println!("set_output({w}, {h}, 1000) returned Ok");
     Ok(())

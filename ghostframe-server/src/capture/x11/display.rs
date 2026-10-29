@@ -1,13 +1,15 @@
 //! `DisplayController` backed by X RandR.
 //!
 //! Implements `ghostframe_lib::transport::display::DisplayController`
-//! (mirrors `input::XTestInjector`, which implements `InputInjector`
+//! (mirrors `input_inject::XTestInjector`, which implements `InputInjector`
 //! for the same reason: keep the protocol/`IoBridge` layer testable without
 //! a running display server). Everything X-specific -- RandR requests,
 //! modelines, millimetres -- stays inside this module; the trait itself
 //! must not gain an X concept. See the M4b design doc §5 and §7.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::{self, ConnectionExt as RandrExt};
@@ -36,11 +38,31 @@ pub struct XrandrDisplay {
     /// fails. Seeded from a real query in `new()` and refreshed on every
     /// subsequent successful call -- never a hardcoded guess.
     ceiling_fallback: Mutex<(u16, u16)>,
-    /// `GHOSTFRAME_MAX_RESOLUTION`, read once at construction (this
-    /// crate's convention -- see `config.rs`). `Some("WIDTHxHEIGHT")` lowers
+    /// `GHOSTFRAME_ATTACH_MAX_RESOLUTION`, read once at construction (this
+    /// crate's convention -- see `main.rs`). `Some("WIDTHxHEIGHT")` lowers
     /// what `ceiling()` reports; `None` (unset) leaves the hardware ceiling
     /// alone. Applied by `clamp_ceiling()` on every path through `ceiling()`.
     max_resolution: Option<String>,
+    /// The display this controller was connected to (`None` = `$DISPLAY`),
+    /// so the read-back thread can open its own connection.
+    display: Option<String>,
+    /// How long after a change the read-back waits before looking again;
+    /// zero disables it. See [`Self::spawn_readback`].
+    settle: Duration,
+    /// Bumped by every `set_output`; a read-back whose number is stale
+    /// belongs to a superseded request and says nothing.
+    generation: Arc<AtomicU64>,
+    /// What the last read-back found when the desktop had overridden the
+    /// request, `None` while the request stuck. Shared with the read-back
+    /// threads; the tests observe it.
+    overridden: Arc<Mutex<Option<Overridden>>>,
+}
+
+/// A mode change the desktop undid or altered after we applied it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Overridden {
+    pub requested: (u16, u16),
+    pub actual: (u16, u16),
 }
 
 impl XrandrDisplay {
@@ -48,13 +70,26 @@ impl XrandrDisplay {
     /// present, and pick the first connected output with an available CRTC.
     ///
     /// Errors if no DISPLAY, RandR is missing, or there is no connected
-    /// output -- the caller (`X11Backend::new`) logs and continues with no
+    /// output -- the caller (ghostframe-server's `main`) logs and continues with no
     /// display controller, exactly like `XTestInjector::new`.
-    pub fn new(max_resolution: Option<String>) -> anyhow::Result<Self> {
+    pub fn new(
+        display: Option<&str>,
+        max_resolution: Option<String>,
+        settle: Duration,
+    ) -> anyhow::Result<Self> {
+        Self::connect(display, max_resolution, settle)
+    }
+
+    /// [`Self::new`] under its older name; kept so the tests read the same.
+    pub fn connect(
+        display: Option<&str>,
+        max_resolution: Option<String>,
+        settle: Duration,
+    ) -> anyhow::Result<Self> {
         use anyhow::{anyhow, Context};
 
         let (conn, screen_num) =
-            x11rb::connect(None).map_err(|e| anyhow!("x11rb::connect: {e}"))?;
+            x11rb::connect(display).map_err(|e| anyhow!("x11rb::connect: {e}"))?;
         let root = conn.setup().roots[screen_num].root;
 
         let ext = conn
@@ -65,6 +100,11 @@ impl XrandrDisplay {
         if !ext.present {
             return Err(anyhow!("RandR extension not present on this Xorg build"));
         }
+        // RandR 1.2+ requests need the version negotiated first.
+        conn.randr_query_version(1, 5)
+            .context("RandR QueryVersion request")?
+            .reply()
+            .context("RandR QueryVersion reply")?;
 
         let resources = conn
             .randr_get_screen_resources(root)
@@ -124,7 +164,71 @@ impl XrandrDisplay {
             crtc,
             ceiling_fallback: Mutex::new((range.max_width, range.max_height)),
             max_resolution,
+            display: display.map(str::to_owned),
+            settle,
+            generation: Arc::new(AtomicU64::new(0)),
+            overridden: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// What the last read-back found, if the desktop overrode a request.
+    #[cfg(test)]
+    fn overridden(&self) -> Option<Overridden> {
+        *self.overridden.lock().unwrap()
+    }
+
+    /// After a settle delay, look at the screen again. A window manager or
+    /// desktop may restore its own saved mode some time after ours (on
+    /// Enlightenment, e_randr2 does so about 1.7 s later), so a successful
+    /// `set_output` does not mean the size stuck. This only observes: it
+    /// never re-applies, because fighting the desktop would flicker the
+    /// monitor forever. The client needs no separate notice -- capture polls
+    /// the root geometry every frame and the frame size it reports follows.
+    fn spawn_readback(&self, requested: (u16, u16)) {
+        if self.settle.is_zero() {
+            return;
+        }
+        let ticket = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = Arc::clone(&self.generation);
+        let overridden = Arc::clone(&self.overridden);
+        let display = self.display.clone();
+        let (settle, crtc) = (self.settle, self.crtc);
+        let spawned = std::thread::Builder::new()
+            .name("randr-readback".into())
+            .spawn(move || {
+                std::thread::sleep(settle);
+                if generation.load(Ordering::SeqCst) != ticket {
+                    return; // a newer request owns the verdict
+                }
+                let actual = match read_actual(display.as_deref(), crtc) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "RandR read-back failed");
+                        return;
+                    }
+                };
+                let mut slot = overridden.lock().unwrap();
+                if actual == requested {
+                    *slot = None;
+                    return;
+                }
+                let found = Overridden { requested, actual };
+                if *slot != Some(found) {
+                    tracing::info!(
+                        "the desktop overrode the requested mode {}x{}; keeping the desktop's \
+                         {}x{} (on Enlightenment this is e_randr2 restoring its saved monitor \
+                         config)",
+                        requested.0,
+                        requested.1,
+                        actual.0,
+                        actual.1
+                    );
+                }
+                *slot = Some(found);
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "could not start the RandR read-back thread");
+        }
     }
 
     /// Live `GetScreenSizeRange` query, used by `ceiling()`. Split out so
@@ -160,17 +264,6 @@ impl DisplayController for XrandrDisplay {
     }
 
     fn set_output(&self, width: u16, height: u16, scale_milli: u16) -> Result<(), DisplayError> {
-        let timing = cvt::reduced_blanking(width, height, 60);
-        // The actually-applied mode is `h_active x v_active`, not the raw
-        // requested `width x height`: CVT rounds h_active up to a multiple
-        // of 8 (v_active never differs from `height` -- there's no vertical
-        // rounding), and every X-facing use below (the dedup match, the
-        // mode name, and `SetScreenSize`) must agree with what the mode
-        // object itself says, or a non-8-aligned request creates a mode
-        // whose own dedup check can never find it again.
-        let mode_w = timing.h_active;
-        let mode_h = timing.v_active;
-
         let resources = self
             .conn
             .randr_get_screen_resources(self.root)
@@ -185,95 +278,24 @@ impl DisplayController for XrandrDisplay {
             .reply()
             .map_err(|e| DisplayError(format!("GetOutputInfo reply: {e}")))?;
 
-        // X accumulates modes for the lifetime of the connection; only
-        // create a new one if this output doesn't already have one of the
-        // exact size requested. Without this check, a client dragging a
-        // resize handle would leave the server full of one-off modes that
-        // are never cleaned up.
-        let existing_mode = output_info.modes.iter().copied().find(|&mode_id| {
-            resources
-                .modes
-                .iter()
-                .any(|m| m.id == mode_id && m.width == mode_w && m.height == mode_h)
-        });
-
-        let mode = match existing_mode {
-            Some(id) => id,
-            None => {
-                let name = format!("ghostframe_{mode_w}x{mode_h}");
-                // Verified locally against `cvt(1)`'s own Modeline output
-                // (`cvt 1920 1080 60 -r` -> "... +hsync -vsync"): CVT
-                // reduced-blanking inverts standard CVT's sync polarity.
-                // `cvt.rs` itself carries no flags/polarity data -- this
-                // check is local to this module.
-                let mode_info = randr::ModeInfo {
-                    id: 0,
-                    width: mode_w,
-                    height: mode_h,
-                    // ModeInfo.dot_clock is Hz; `Timing::pixel_clock_khz` is kHz.
-                    //
-                    // Verified against a live X server rather than assumed:
-                    // `xrandr --verbose` reports 1920x1080 at 148.500MHz with
-                    // htotal 2640 and a horizontal clock of 56.25KHz, and
-                    // 148_500_000 / 2640 = 56_250 exactly. Only a Hz-valued
-                    // dot_clock makes that arithmetic close, so the *1000 is
-                    // right. A kHz value here would produce a mode whose
-                    // clock is 1000x too slow -- one X accepts and no display
-                    // can drive.
-                    dot_clock: timing.pixel_clock_khz * 1000,
-                    hsync_start: timing.h_sync_start,
-                    hsync_end: timing.h_sync_end,
-                    htotal: timing.h_total,
-                    hskew: 0,
-                    vsync_start: timing.v_sync_start,
-                    vsync_end: timing.v_sync_end,
-                    vtotal: timing.v_total,
-                    name_len: name.len() as u16,
-                    mode_flags: randr::ModeFlag::HSYNC_POSITIVE | randr::ModeFlag::VSYNC_NEGATIVE,
-                };
-                match self
-                    .conn
-                    .randr_create_mode(self.root, mode_info, name.as_bytes())
-                    .map_err(|e| DisplayError(format!("CreateMode request: {e}")))?
-                    .reply()
-                {
-                    Ok(created) => {
-                        self.conn
-                            .randr_add_output_mode(self.output, created.mode)
-                            .map_err(|e| DisplayError(format!("AddOutputMode request: {e}")))?
-                            .check()
-                            .map_err(|e| DisplayError(format!("AddOutputMode: {e}")))?;
-                        created.mode
-                    }
-                    // `RRModeCreateUser` checks for a name collision before
-                    // creating anything and returns BadName if one exists --
-                    // which happens if this exact size was created earlier
-                    // and later detached from every output (e.g. a prior
-                    // `DeleteOutputMode`, or a multi-output setup where
-                    // another output made it first). Without this fallback
-                    // that size becomes permanently uncreatable for the life
-                    // of the X server; instead, look the existing mode up by
-                    // name and attach it to this output.
-                    Err(x11rb::errors::ReplyError::X11Error(ref e))
-                        if e.error_kind == x11rb::protocol::ErrorKind::Name =>
-                    {
-                        let mode_id =
-                            find_mode_by_name(&resources, name.as_bytes()).ok_or_else(|| {
-                                DisplayError(format!(
-                                    "CreateMode: BadName for {name:?} but no matching \
-                                     global mode found"
-                                ))
-                            })?;
-                        self.conn
-                            .randr_add_output_mode(self.output, mode_id)
-                            .map_err(|e| DisplayError(format!("AddOutputMode request: {e}")))?
-                            .check()
-                            .map_err(|e| DisplayError(format!("AddOutputMode: {e}")))?;
-                        mode_id
-                    }
-                    Err(e) => return Err(DisplayError(format!("CreateMode reply: {e}"))),
-                }
-            }
+        // `xrandr --output O --mode WxH` selects one of the output's own
+        // modes. Do the same whenever one fits, so the window manager sees
+        // a mode it already knows; only a size no mode offers gets a CVT
+        // mode of our own.
+        let timing = cvt::reduced_blanking(width, height, 60);
+        let (mode, mode_w, mode_h) = match pick_existing_mode(
+            &output_info.modes,
+            output_info.num_preferred,
+            &resources.modes,
+            (width, height),
+            (timing.h_active, timing.v_active),
+        ) {
+            Some(m) => (m.id, m.width, m.height),
+            None => (
+                self.create_cvt_mode(&resources, &timing)?,
+                timing.h_active,
+                timing.v_active,
+            ),
         };
 
         let crtc_info = self
@@ -290,7 +312,7 @@ impl DisplayController for XrandrDisplay {
             .reply()
             .map_err(|e| DisplayError(format!("GetGeometry reply: {e}")))?;
 
-        let set_crtc = || -> Result<(), DisplayError> {
+        let set_crtc = |mode: randr::Mode, outputs: &[randr::Output]| -> Result<(), DisplayError> {
             let reply = self
                 .conn
                 .randr_set_crtc_config(
@@ -301,7 +323,7 @@ impl DisplayController for XrandrDisplay {
                     0,
                     mode,
                     randr::Rotation::ROTATE0,
-                    &[self.output],
+                    outputs,
                 )
                 .map_err(|e| DisplayError(format!("SetCrtcConfig request: {e}")))?
                 .reply()
@@ -325,85 +347,212 @@ impl DisplayController for XrandrDisplay {
                 .map_err(|e| DisplayError(format!("SetScreenSize: {e}")))
         };
 
-        for step in resize_steps(
+        let steps = apply_steps(
             (screen_geom.width, screen_geom.height),
-            (crtc_info.width, crtc_info.height),
+            crtc_info.mode,
+            mode,
             (mode_w, mode_h),
-        ) {
-            match step {
-                ResizeStep::SetScreen(w, h) => set_screen(w, h)?,
-                ResizeStep::SetCrtc => set_crtc()?,
+        );
+        let mut grabbed = false;
+        let mut disabled = false;
+        let result = (|| -> Result<(), DisplayError> {
+            for step in &steps {
+                match *step {
+                    RandrStep::Grab => {
+                        self.conn
+                            .grab_server()
+                            .map_err(|e| DisplayError(format!("GrabServer: {e}")))?;
+                        grabbed = true;
+                    }
+                    RandrStep::DisableCrtc => {
+                        set_crtc(x11rb::NONE, &[])?;
+                        disabled = true;
+                    }
+                    RandrStep::SetScreen(w, h) => set_screen(w, h)?,
+                    RandrStep::SetCrtc => {
+                        set_crtc(mode, &[self.output])?;
+                        disabled = false;
+                    }
+                    RandrStep::Ungrab => {
+                        self.conn
+                            .ungrab_server()
+                            .map_err(|e| DisplayError(format!("UngrabServer: {e}")))?;
+                        grabbed = false;
+                    }
+                }
             }
+            Ok(())
+        })();
+        if result.is_err() && disabled {
+            // Never leave the output dark: put the CRTC back the way it was.
+            let _ = self.conn.randr_set_crtc_config(
+                self.crtc,
+                x11rb::CURRENT_TIME,
+                resources.config_timestamp,
+                crtc_info.x,
+                crtc_info.y,
+                crtc_info.mode,
+                crtc_info.rotation,
+                &crtc_info.outputs,
+            );
         }
-
-        Ok(())
+        if grabbed {
+            let _ = self.conn.ungrab_server();
+        }
+        let _ = self.conn.flush();
+        if result.is_ok() {
+            self.spawn_readback((mode_w, mode_h));
+        }
+        result
     }
 }
 
-/// One step of applying a size change through RandR's screen/CRTC coupling.
-/// `SetCrtc` always switches to the caller's final target mode -- there is
-/// never an "intermediate" CRTC mode, only an intermediate screen size.
+impl XrandrDisplay {
+    /// Create (or find by name, after a BadName) and attach a CVT
+    /// reduced-blanking mode for a size none of the output's modes offers.
+    fn create_cvt_mode(
+        &self,
+        resources: &randr::GetScreenResourcesReply,
+        timing: &cvt::Timing,
+    ) -> Result<randr::Mode, DisplayError> {
+        let (mode_w, mode_h) = (timing.h_active, timing.v_active);
+        let name = format!("ghostframe_{mode_w}x{mode_h}");
+        // CVT reduced blanking is +hsync -vsync (checked against `cvt -r`).
+        let mode_info = randr::ModeInfo {
+            id: 0,
+            width: mode_w,
+            height: mode_h,
+            // ModeInfo.dot_clock is Hz; `Timing::pixel_clock_khz` is kHz.
+            dot_clock: timing.pixel_clock_khz * 1000,
+            hsync_start: timing.h_sync_start,
+            hsync_end: timing.h_sync_end,
+            htotal: timing.h_total,
+            hskew: 0,
+            vsync_start: timing.v_sync_start,
+            vsync_end: timing.v_sync_end,
+            vtotal: timing.v_total,
+            name_len: name.len() as u16,
+            mode_flags: randr::ModeFlag::HSYNC_POSITIVE | randr::ModeFlag::VSYNC_NEGATIVE,
+        };
+        let mode_id = match self
+            .conn
+            .randr_create_mode(self.root, mode_info, name.as_bytes())
+            .map_err(|e| DisplayError(format!("CreateMode request: {e}")))?
+            .reply()
+        {
+            Ok(created) => created.mode,
+            // BadName: this size was created earlier and later detached from
+            // every output. Reuse it by name rather than failing forever.
+            Err(x11rb::errors::ReplyError::X11Error(ref e))
+                if e.error_kind == x11rb::protocol::ErrorKind::Name =>
+            {
+                find_mode_by_name(resources, name.as_bytes()).ok_or_else(|| {
+                    DisplayError(format!(
+                        "CreateMode: BadName for {name:?} but no matching global mode found"
+                    ))
+                })?
+            }
+            Err(e) => return Err(DisplayError(format!("CreateMode reply: {e}"))),
+        };
+        self.conn
+            .randr_add_output_mode(self.output, mode_id)
+            .map_err(|e| DisplayError(format!("AddOutputMode request: {e}")))?
+            .check()
+            .map_err(|e| DisplayError(format!("AddOutputMode: {e}")))?;
+        Ok(mode_id)
+    }
+}
+
+/// The size the desktop shows now: the screen (what capture grabs) when the
+/// CRTC's own size agrees with it, otherwise whichever disagrees, screen
+/// first. Opens its own connection, so it can run from any thread.
+fn read_actual(display: Option<&str>, crtc: randr::Crtc) -> anyhow::Result<(u16, u16)> {
+    use anyhow::Context;
+    let (conn, n) = x11rb::connect(display).context("connect")?;
+    let root = conn.setup().roots[n].root;
+    let geom = conn.get_geometry(root)?.reply().context("GetGeometry")?;
+    let screen = (geom.width, geom.height);
+    let info = conn
+        .randr_get_crtc_info(crtc, 0)?
+        .reply()
+        .context("GetCrtcInfo")?;
+    // A disabled CRTC has no size of its own; the screen is all there is.
+    if info.mode == x11rb::NONE || (info.width, info.height) == screen {
+        Ok(screen)
+    } else {
+        Ok((info.width, info.height))
+    }
+}
+
+/// One request of a mode change, in the order `xrandr(1)` issues them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResizeStep {
+enum RandrStep {
+    Grab,
+    DisableCrtc,
     SetScreen(u16, u16),
     SetCrtc,
+    Ungrab,
 }
 
-/// Determine the ordered steps needed to move from the current screen size
-/// and CRTC mode to `new`, obeying X's two independent, differently-scoped
-/// guards (verified against the xserver source, `rrscreen.c` /
-/// `rrcrtc.c`):
+/// The requests for a mode change, ordered as `xrandr --output O --mode M`
+/// orders them. Recorded on Xvfb (2026-10-29, xrandr 1.5) for both a grow
+/// and a shrink: `crtc 0: disable`, then `screen 0: WxH`, then
+/// `crtc 0: <mode>`, all inside a server grab. Disabling first makes every
+/// screen size legal, so there is no grow/shrink/mixed special case.
 ///
-/// - `ProcRRSetScreenSize`: legal only if the **new** screen still fits
-///   every enabled CRTC's **current** mode (`crtc.x + mode.width <=
-///   new_width`, ditto height) -- i.e. it depends on `crtc`, not `screen`.
-/// - `ProcRRSetCrtcConfig`: legal only if the **new** mode fits the
-///   **current** screen (`x + mode.width <= screen.width`, ditto height) --
-///   i.e. it depends on `screen`, not `crtc`.
-///
-/// A plain increase in both dimensions (`new >= crtc` in both) can go
-/// screen-first: growing the screen to `new` trivially satisfies the first
-/// guard (the *old*, smaller CRTC mode still fits), and the CRTC switch
-/// that follows trivially satisfies the second (the screen is now exactly
-/// `new`). A plain decrease relative to the *current screen* (`new <=
-/// screen` in both) is the mirror: CRTC-first, since switching to the
-/// smaller mode first trivially satisfies the second guard against the
-/// *old*, larger screen, and the screen shrink that follows trivially
-/// satisfies the first (the CRTC is now exactly `new`).
-///
-/// Neither two-step order covers every case -- most notably a mixed resize
-/// (one dimension grows, the other shrinks), where the growing dimension
-/// wants "screen first" and the shrinking one wants "CRTC first" at the
-/// same time, so both direct one-shot orders are illegal. `xrandr(1)`
-/// itself falls back to a three-step sequence here: grow the screen to a
-/// superset of both the current CRTC mode and the new mode (always legal --
-/// it only ever grows relative to both dimensions the first guard checks),
-/// switch the CRTC to the new mode (now legal -- the intermediate screen is
-/// `>=` it in both dimensions), then shrink the screen down to the exact
-/// new size (now legal -- the CRTC already matches it exactly). The two
-/// fast paths above are just optimisations of this general sequence for the
-/// cases where the middle step is a no-op.
-fn resize_steps(screen: (u16, u16), crtc: (u16, u16), new: (u16, u16)) -> Vec<ResizeStep> {
-    let (screen_w, screen_h) = screen;
-    let (crtc_w, crtc_h) = crtc;
-    let (new_w, new_h) = new;
-
-    let screen_first_legal = new_w >= crtc_w && new_h >= crtc_h;
-    let crtc_first_legal = new_w <= screen_w && new_h <= screen_h;
-
-    if screen_first_legal {
-        vec![ResizeStep::SetScreen(new_w, new_h), ResizeStep::SetCrtc]
-    } else if crtc_first_legal {
-        vec![ResizeStep::SetCrtc, ResizeStep::SetScreen(new_w, new_h)]
-    } else {
-        let mid_w = screen_w.max(crtc_w).max(new_w);
-        let mid_h = screen_h.max(crtc_h).max(new_h);
-        vec![
-            ResizeStep::SetScreen(mid_w, mid_h),
-            ResizeStep::SetCrtc,
-            ResizeStep::SetScreen(new_w, new_h),
-        ]
+/// When the CRTC already shows the target mode and the screen already has
+/// the target size, only the physical size can differ (a scale change), and
+/// SetScreenSize alone carries it -- the output is not blanked for nothing.
+fn apply_steps(
+    screen: (u16, u16),
+    current_mode: randr::Mode,
+    target_mode: randr::Mode,
+    target: (u16, u16),
+) -> Vec<RandrStep> {
+    if current_mode == target_mode && screen == target {
+        return vec![RandrStep::SetScreen(target.0, target.1)];
     }
+    let mut steps = vec![RandrStep::Grab];
+    if current_mode != x11rb::NONE {
+        steps.push(RandrStep::DisableCrtc);
+    }
+    steps.push(RandrStep::SetScreen(target.0, target.1));
+    steps.push(RandrStep::SetCrtc);
+    steps.push(RandrStep::Ungrab);
+    steps
+}
+
+/// The output mode to use for a `want` request, if the output already has
+/// one: an exact `want` size first, then the CVT-rounded `cvt` size. Among
+/// equal sizes a preferred mode (the first `num_preferred` of
+/// `output_modes`) wins, then the highest refresh rate.
+fn pick_existing_mode(
+    output_modes: &[randr::Mode],
+    num_preferred: u16,
+    all_modes: &[randr::ModeInfo],
+    want: (u16, u16),
+    cvt: (u16, u16),
+) -> Option<randr::ModeInfo> {
+    let refresh_mhz = |m: &randr::ModeInfo| -> u64 {
+        let total = u64::from(m.htotal) * u64::from(m.vtotal);
+        (u64::from(m.dot_clock) * 1000)
+            .checked_div(total)
+            .unwrap_or(0)
+    };
+    for size in [want, cvt] {
+        let best = output_modes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, id)| {
+                let info = all_modes.iter().find(|m| m.id == *id)?;
+                ((info.width, info.height) == size).then_some((idx, *info))
+            })
+            .max_by_key(|(idx, info)| (*idx < usize::from(num_preferred), refresh_mhz(info)));
+        if let Some((_, info)) = best {
+            return Some(info);
+        }
+    }
+    None
 }
 
 /// Look up a mode by name in a `GetScreenResourcesReply`. Names are packed
@@ -440,7 +589,7 @@ fn mm_for_scale(px: u16, scale_milli: u16) -> u32 {
 
 /// Lower a hardware ceiling to an operator-configured maximum.
 ///
-/// `raw` is the value of `GHOSTFRAME_MAX_RESOLUTION`: `"WIDTHxHEIGHT"`
+/// `raw` is the value of `GHOSTFRAME_ATTACH_MAX_RESOLUTION`: `"WIDTHxHEIGHT"`
 /// to clamp, `"none"` to disable, absent to disable.
 ///
 /// **Only ever lowers.** A configured value above the hardware ceiling is
@@ -467,7 +616,7 @@ fn clamp_ceiling(hardware: (u16, u16), raw: Option<&str>) -> (u16, u16) {
         None => {
             tracing::warn!(
                 value = raw,
-                "GHOSTFRAME_MAX_RESOLUTION is not WIDTHxHEIGHT or 'none'; ignoring"
+                "GHOSTFRAME_ATTACH_MAX_RESOLUTION is not WIDTHxHEIGHT or 'none'; ignoring"
             );
             hardware
         }
@@ -504,75 +653,102 @@ mod tests {
         assert_eq!(mm_for_scale(1920, 0), mm_for_scale(1920, 1));
     }
 
-    #[test]
-    fn resize_steps_plain_growth_is_screen_first() {
-        // Both dimensions increase relative to the current CRTC mode.
-        let steps = resize_steps((1920, 1080), (1920, 1080), (2560, 1440));
-        assert_eq!(
-            steps,
-            vec![ResizeStep::SetScreen(2560, 1440), ResizeStep::SetCrtc]
-        );
+    fn mode(id: u32, w: u16, h: u16, dot_clock: u32) -> randr::ModeInfo {
+        randr::ModeInfo {
+            id,
+            width: w,
+            height: h,
+            dot_clock,
+            htotal: 1000,
+            vtotal: 1000,
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn resize_steps_plain_shrink_is_crtc_first() {
-        // Both dimensions decrease relative to the current screen.
-        let steps = resize_steps((1920, 1080), (1920, 1080), (1280, 720));
-        assert_eq!(
-            steps,
-            vec![ResizeStep::SetCrtc, ResizeStep::SetScreen(1280, 720)]
-        );
+    fn apply_steps_follow_xrandr_order() {
+        // Recorded from `xrandr --verbose --output screen --mode M` on Xvfb,
+        // for a shrink and for a grow alike: disable, screen, crtc.
+        let all = vec![
+            RandrStep::Grab,
+            RandrStep::DisableCrtc,
+            RandrStep::SetScreen(1280, 720),
+            RandrStep::SetCrtc,
+            RandrStep::Ungrab,
+        ];
+        assert_eq!(apply_steps((1920, 1080), 7, 9, (1280, 720)), all);
+        let grow = apply_steps((1280, 720), 9, 7, (1920, 1080));
+        assert_eq!(grow[1], RandrStep::DisableCrtc);
+        assert_eq!(grow[2], RandrStep::SetScreen(1920, 1080));
     }
 
     #[test]
-    fn resize_steps_mixed_width_shrinks_height_grows_needs_three_steps() {
-        // The exact failing case from the review: drag a corner so width
-        // shrinks and height grows. Steady state going in has screen ==
-        // crtc == 1920x1080; target 1280x1440. Neither two-step order is
-        // legal (screen-first needs new >= crtc in both dims; crtc-first
-        // needs new <= screen in both dims), so this must fall back to the
-        // three-step sequence.
-        let steps = resize_steps((1920, 1080), (1920, 1080), (1280, 1440));
+    fn apply_steps_skip_the_disable_for_a_disabled_crtc() {
         assert_eq!(
-            steps,
+            apply_steps((1920, 1080), x11rb::NONE, 9, (1280, 720)),
             vec![
-                ResizeStep::SetScreen(1920, 1440),
-                ResizeStep::SetCrtc,
-                ResizeStep::SetScreen(1280, 1440),
+                RandrStep::Grab,
+                RandrStep::SetScreen(1280, 720),
+                RandrStep::SetCrtc,
+                RandrStep::Ungrab,
             ]
         );
     }
 
     #[test]
-    fn resize_steps_mixed_width_grows_height_shrinks_needs_three_steps() {
-        // The mirror mixed case: width grows, height shrinks.
-        let steps = resize_steps((1920, 1080), (1920, 1080), (2560, 800));
+    fn apply_steps_for_the_current_mode_only_resize_the_screen() {
+        // A scale-only change: the output must not blank.
         assert_eq!(
-            steps,
-            vec![
-                ResizeStep::SetScreen(2560, 1080),
-                ResizeStep::SetCrtc,
-                ResizeStep::SetScreen(2560, 800),
-            ]
+            apply_steps((1920, 1080), 9, 9, (1920, 1080)),
+            vec![RandrStep::SetScreen(1920, 1080)]
         );
     }
 
     #[test]
-    fn resize_steps_does_not_assume_screen_equals_crtc() {
-        // Defensive case: screen and CRTC mode have drifted apart (e.g. a
-        // partially-applied previous change). Growing relative to the CRTC
-        // mode but shrinking relative to the (larger) screen must still
-        // take the three-step path, not the screen-first fast path -- a
-        // fast path here would enable the CRTC into a mode that already
-        // fits without ever touching the oversized screen, but would
-        // leave the screen wrong. Concretely: screen is 2000x2000 (drifted
-        // large), crtc mode is 1920x1080, new target is 1920x1500 --
-        // this is >= crtc in both dims (screen-first legal) so it *does*
-        // take the fast path; assert that explicitly rather than assuming.
-        let steps = resize_steps((2000, 2000), (1920, 1080), (1920, 1500));
+    fn pick_existing_mode_prefers_exact_then_cvt_size() {
+        let all = [
+            mode(1, 1920, 1080, 60_000_000),
+            mode(2, 1368, 768, 60_000_000),
+        ];
+        // Exact size present.
         assert_eq!(
-            steps,
-            vec![ResizeStep::SetScreen(1920, 1500), ResizeStep::SetCrtc]
+            pick_existing_mode(&[1, 2], 0, &all, (1920, 1080), (1920, 1080)).map(|m| m.id),
+            Some(1)
+        );
+        // 1366 is not offered; the CVT-rounded 1368 is.
+        assert_eq!(
+            pick_existing_mode(&[1, 2], 0, &all, (1366, 768), (1368, 768)).map(|m| m.id),
+            Some(2)
+        );
+        // Neither: create a CVT mode.
+        assert_eq!(
+            pick_existing_mode(&[1, 2], 0, &all, (1000, 700), (1000, 700)).map(|m| m.id),
+            None
+        );
+        // A global mode not on this output does not count.
+        assert_eq!(
+            pick_existing_mode(&[2], 0, &all, (1920, 1080), (1920, 1080)).map(|m| m.id),
+            None
+        );
+    }
+
+    #[test]
+    fn pick_existing_mode_prefers_preferred_then_refresh() {
+        // 1000x1000 totals: dot_clock / 1e6 is the refresh rate in Hz.
+        let all = [
+            mode(1, 1920, 1080, 60_000_000),
+            mode(2, 1920, 1080, 75_000_000),
+            mode(3, 1920, 1080, 50_000_000),
+        ];
+        // No preferred mode: the highest refresh.
+        assert_eq!(
+            pick_existing_mode(&[1, 2, 3], 0, &all, (1920, 1080), (1920, 1080)).map(|m| m.id),
+            Some(2)
+        );
+        // The first mode is preferred: it wins over a faster one.
+        assert_eq!(
+            pick_existing_mode(&[3, 1, 2], 1, &all, (1920, 1080), (1920, 1080)).map(|m| m.id),
+            Some(3)
         );
     }
 
@@ -649,5 +825,161 @@ mod tests {
         assert_eq!(find_mode_by_name(&resources, b"first"), Some(100));
         assert_eq!(find_mode_by_name(&resources, b"bbbb"), Some(200));
         assert_eq!(find_mode_by_name(&resources, b"nope"), None);
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    //! Against a private Xvfb, whose single output is called `screen` and
+    //! whose initial screen size is also its maximum.
+    use super::*;
+    use crate::capture::x11::randr_events::{shape, Recorder};
+    use crate::capture::x11::test_support::PrivateXvfb;
+    use std::process::Command;
+    use std::time::Duration;
+
+    fn xrandr(display: &str, args: &[&str]) {
+        let status = Command::new("xrandr")
+            .arg("-display")
+            .arg(display)
+            .args(args)
+            .status()
+            .expect("run xrandr (CI installs x11-xserver-utils)");
+        assert!(status.success(), "xrandr {args:?} failed");
+    }
+
+    /// Give the output an 800x600 mode of its own, as a real output has.
+    fn add_800x600(display: &str) {
+        xrandr(
+            display,
+            &[
+                "--newmode",
+                "800x600_t",
+                "40",
+                "800",
+                "840",
+                "968",
+                "1056",
+                "600",
+                "601",
+                "605",
+                "628",
+            ],
+        );
+        xrandr(display, &["--addmode", "screen", "800x600_t"]);
+    }
+
+    fn mode_names(display: &str) -> Vec<String> {
+        let (conn, n) = x11rb::connect(Some(display)).unwrap();
+        let root = conn.setup().roots[n].root;
+        let res = conn
+            .randr_get_screen_resources(root)
+            .unwrap()
+            .reply()
+            .unwrap();
+        let mut off = 0usize;
+        res.modes
+            .iter()
+            .map(|m| {
+                let end = off + usize::from(m.name_len);
+                let name = String::from_utf8_lossy(&res.names[off..end]).into_owned();
+                off = end;
+                name
+            })
+            .collect()
+    }
+
+    /// The window manager's view of a server-initiated change must match
+    /// `xrandr --output screen --mode M` exactly, for a shrink and a grow.
+    #[test]
+    fn set_output_emits_the_same_events_as_xrandr() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "1280x1024x24"]);
+        add_800x600(x.display());
+        let rec = Recorder::connect(Some(x.display())).unwrap();
+        let ctl = XrandrDisplay::connect(Some(x.display()), None, Duration::ZERO).unwrap();
+        let settle = || {
+            rec.collect(Duration::from_millis(200), Duration::from_secs(3))
+                .unwrap()
+        };
+        settle();
+        for (name, other, (w, h)) in [
+            ("800x600_t", "1280x1024", (800u16, 600u16)),
+            ("1280x1024", "800x600_t", (1280, 1024)),
+        ] {
+            xrandr(x.display(), &["--output", "screen", "--mode", name]);
+            let theirs = shape(&settle());
+            xrandr(x.display(), &["--output", "screen", "--mode", other]);
+            settle();
+            ctl.set_output(w, h, 1000).unwrap();
+            let ours = shape(&settle());
+            assert!(!theirs.is_empty(), "xrandr produced no events");
+            assert_eq!(ours, theirs, "to {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn set_output_reuses_an_existing_mode_and_creates_cvt_only_otherwise() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "1280x1024x24"]);
+        add_800x600(x.display());
+        let ctl = XrandrDisplay::connect(Some(x.display()), None, Duration::ZERO).unwrap();
+        let before = mode_names(x.display());
+        ctl.set_output(800, 600, 1000).unwrap();
+        assert_eq!(mode_names(x.display()), before, "800x600_t must be reused");
+        ctl.set_output(1000, 700, 1000).unwrap();
+        let after = mode_names(x.display());
+        assert!(
+            after.iter().any(|n| n == "ghostframe_1000x700"),
+            "{after:?}"
+        );
+        let (conn, n) = x11rb::connect(Some(x.display())).unwrap();
+        let g = conn
+            .get_geometry(conn.setup().roots[n].root)
+            .unwrap()
+            .reply()
+            .unwrap();
+        assert_eq!((g.width, g.height), (1000, 700));
+    }
+
+    /// A desktop that restores its own mode inside the settle window must be
+    /// noticed, and the picture the client gets is the desktop's. We never
+    /// re-apply.
+    #[test]
+    fn a_desktop_reverting_the_mode_is_noticed_and_not_fought() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "1280x1024x24"]);
+        add_800x600(x.display());
+        let ctl =
+            XrandrDisplay::connect(Some(x.display()), None, Duration::from_millis(800)).unwrap();
+        ctl.set_output(800, 600, 1000).unwrap();
+        // The "window manager" restores its saved mode inside the window.
+        std::thread::sleep(Duration::from_millis(300));
+        xrandr(x.display(), &["--output", "screen", "--mode", "1280x1024"]);
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!(
+            ctl.overridden(),
+            Some(Overridden {
+                requested: (800, 600),
+                actual: (1280, 1024)
+            })
+        );
+        assert_eq!(
+            read_actual(Some(x.display()), ctl.crtc).unwrap(),
+            (1280, 1024)
+        );
+    }
+
+    /// When the request sticks there is nothing to report.
+    #[test]
+    fn a_mode_that_sticks_reports_no_override() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "1280x1024x24"]);
+        add_800x600(x.display());
+        let ctl =
+            XrandrDisplay::connect(Some(x.display()), None, Duration::from_millis(300)).unwrap();
+        ctl.set_output(800, 600, 1000).unwrap();
+        std::thread::sleep(Duration::from_millis(900));
+        assert_eq!(ctl.overridden(), None);
+        assert_eq!(
+            read_actual(Some(x.display()), ctl.crtc).unwrap(),
+            (800, 600)
+        );
     }
 }
