@@ -1897,6 +1897,7 @@ name = "ghostframe-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "ghostframe-lib",
  "image",
  "libc",

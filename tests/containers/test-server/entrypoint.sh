@@ -99,4 +99,4 @@ ghostframe-test-pattern ${TEST_PATTERN:---solid-red} &
 sleep 1
 
 # Start the server (captures X11 root, serves via WebTransport)
-exec /usr/local/bin/ghostframe-server
+exec /usr/local/bin/ghostframe-server capture

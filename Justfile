@@ -224,6 +224,7 @@ ci-local:
     @echo "=== unit tests ==="
     cargo test --workspace --lib
     cargo test --workspace --bins
+    cargo test -p ghostframe-server --test commands
     @echo "=== packaging tests ==="
     just test-packaging
     @echo "=== web client build ==="

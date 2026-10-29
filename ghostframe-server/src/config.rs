@@ -13,6 +13,7 @@
 //! | Variable | Meaning | Default |
 //! |---|---|---|
 //! | `DISPLAY` | X display; passed explicitly to the capture, damage and input connections | unset |
+//! | `WAYLAND_DISPLAY` | only to refuse a Wayland-only session with a clear error | unset |
 //! | `GHOSTFRAME_LOG_FORMAT` | `json` for JSON logs | text |
 //! | `TS_HOSTNAME` | tsnet node name | `<hostname>-ghostframe` (`ghostframe-server` if the host has no name) |
 //! | `TS_STATE_DIR` | tsnet state directory (holds node keys) | `$XDG_STATE_HOME/ghostframe`, else `~/.local/state/ghostframe` |
@@ -31,6 +32,7 @@ const DEFAULT_HEARTBEAT_EVERY: u64 = 5;
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub display: Option<String>,
+    pub wayland_display: Option<String>,
     pub log_json: bool,
     pub ts_hostname: String,
     /// Explicit `TS_STATE_DIR`, if set and non-empty. Use [`Self::state_dir`].
@@ -100,7 +102,8 @@ impl ServerConfig {
             }
         };
         Self {
-            display: get("DISPLAY"),
+            display: nonempty("DISPLAY"),
+            wayland_display: nonempty("WAYLAND_DISPLAY"),
             log_json: get("GHOSTFRAME_LOG_FORMAT").as_deref() == Some("json"),
             ts_hostname: nonempty("TS_HOSTNAME")
                 .unwrap_or_else(|| default_hostname(system_hostname)),
