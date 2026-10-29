@@ -93,23 +93,22 @@ fn install(
     util::ignore_sighup();
     let (home, pw) = checked_home(cfg)?;
     let paths = commands::install::InstallPaths::new(&home);
+    commands::install::refuse_root(util::euid())?;
     let exe = std::env::current_exe().map_err(|e| format!("locating this binary: {e}"))?;
     let username = pw.map(|p| p.name).ok_or("this uid has no passwd entry")?;
     // Inside the old headless session, stopping it would kill this process:
-    // continue as a transient unit outside its cgroup.
+    // continue as a transient unit outside its cgroup, running the installed
+    // copy (copied first, so the unit does not depend on this path).
     let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
-    let real_exe = std::fs::read_link("/proc/self/exe").unwrap_or_else(|_| exe.clone());
-    let mut pass_env = Vec::new();
-    if let Some(x) = cfg.xdg_state_home() {
-        pass_env.push(("XDG_STATE_HOME", x));
+    if !cfg.install_detached() && commands::install::in_legacy_headless_cgroup(&cgroup) {
+        commands::install::copy_binary(&exe, &paths.bin, force)?;
     }
     if commands::install::maybe_detach(
         &mut commands::install::RealSystemctl,
         &cgroup,
         cfg.install_detached(),
-        &real_exe,
+        &paths.bin,
         &commands::install::install_args(force, max_resolution),
-        &pass_env,
         &mut std::io::stdout(),
     )? {
         return Ok(());

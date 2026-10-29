@@ -9,17 +9,41 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
+/// Run the binary with an environment that cannot reach a real control
+/// server: `TS_CONTROL_URL` points at a closed local port and `TS_AUTHKEY` is
+/// empty, unless a test's own pair overrides them. A wall-clock limit kills a
+/// run that hangs, so a regressed guard fails the test instead of waiting on
+/// the network.
 fn run(args: &[&str], env: &[(&str, &Path)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ghostframe-server"));
     cmd.args(args)
         .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default());
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("TS_CONTROL_URL", "http://127.0.0.1:1")
+        .env("TS_AUTHKEY", "")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.output().expect("spawn ghostframe-server")
+    let mut child = cmd.spawn().expect("spawn ghostframe-server");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while child.try_wait().expect("poll child").is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let out = child.wait_with_output().expect("collect output");
+            panic!(
+                "ghostframe-server {args:?} did not exit within 20 s; stderr:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().expect("collect output")
 }
 
 /// A 0700 state directory, as the server insists on.

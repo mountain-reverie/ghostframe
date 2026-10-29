@@ -28,8 +28,10 @@ const AUTOSTART_TEMPLATE: &str = include_str!("../../templates/ghostframe-server
 
 /// User units the old installer wrote, by exact name. `ghostframe-xorg*.service`
 /// is matched by [`is_legacy_unit`] as well.
+/// The old installer's daemon unit.
+const LEGACY_XDAEMON_UNIT: &str = "ghostframe-xdaemon.service";
 const LEGACY_UNITS: &[&str] = &[
-    "ghostframe-xdaemon.service",
+    LEGACY_XDAEMON_UNIT,
     "ghostframe.target",
     "ghostframe-wm.service",
     "ghostframe-xorg.service",
@@ -196,7 +198,8 @@ pub fn install_args(force: bool, max: MaxResolution) -> Vec<String> {
 /// If this process runs inside the old headless session, re-run `install` as
 /// the transient user unit `ghostframe-install` (outside that cgroup, so
 /// stopping the session cannot kill it) and return `true`; the caller then
-/// exits. `exe` must be the absolute `/proc/self/exe`. `detached` is true in
+/// exits. `exe` is the installed copy (`~/.local/bin/ghostframe-server`), so
+/// the unit does not depend on a path that may vanish. `detached` is true in
 /// the re-exec'd copy, which never re-execs again.
 pub fn maybe_detach(
     sys: &mut dyn Systemctl,
@@ -204,7 +207,6 @@ pub fn maybe_detach(
     detached: bool,
     exe: &Path,
     install_args: &[String],
-    pass_env: &[(&str, &str)],
     out: &mut dyn Write,
 ) -> Result<bool, String> {
     if detached || !in_legacy_headless_cgroup(cgroup) {
@@ -219,17 +221,26 @@ pub fn maybe_detach(
     .iter()
     .map(|s| s.to_string())
     .collect();
-    for (k, v) in pass_env {
-        args.push(format!("--setenv={k}={v}"));
-    }
     args.push(exe.display().to_string());
     args.extend(install_args.iter().cloned());
-    sys.systemd_run(&args)?;
+    sys.systemd_run(&args).map_err(|e| {
+        if e.contains("already exists") {
+            format!(
+                "{e}\n  an install is already running: journalctl --user -u ghostframe-install -f"
+            )
+        } else {
+            format!(
+                "{e}\n  no unit was written and nothing was stopped (the binary itself may \
+                 have been copied); re-run `ghostframe-server install`"
+            )
+        }
+    })?;
     let _ = writeln!(
         out,
         "the old headless session will end; install continues as ghostframe-install.service \
          - follow it with `journalctl --user -u ghostframe-install -f` (e.g. over ssh), or \
-         reconnect once ghostframe-server is up"
+         reconnect once ghostframe-server is up.\n  Exit status 0 here means the install was \
+         handed off, not that it has finished."
     );
     Ok(true)
 }
@@ -256,7 +267,11 @@ pub fn ts_state_dir_from_environment(env_line: &str) -> Option<PathBuf> {
     if !cur.is_empty() {
         words.push(cur);
     }
-    let v = words.iter().find_map(|w| w.strip_prefix("TS_STATE_DIR="))?;
+    // systemd applies the last assignment (a drop-in overrides the unit).
+    let v = words
+        .iter()
+        .rev()
+        .find_map(|w| w.strip_prefix("TS_STATE_DIR="))?;
     Path::new(v).is_absolute().then(|| PathBuf::from(v))
 }
 
@@ -267,20 +282,25 @@ pub fn refuse_if_legacy_xdaemon(
     home: Option<&Path>,
     active: impl FnOnce() -> bool,
 ) -> Result<(), String> {
-    let msg =
-        "the old ghostframe-xdaemon is still installed; run `ghostframe-server install` first";
     if let Some(h) = home {
         if InstallPaths::new(h)
             .unit_dir
-            .join(LEGACY_UNITS[0])
+            .join(LEGACY_XDAEMON_UNIT)
             .symlink_metadata()
             .is_ok()
         {
-            return Err(msg.into());
+            return Err(
+                "the old ghostframe-xdaemon is installed or running; run `ghostframe-server \
+                 install` first"
+                    .into(),
+            );
         }
     }
     if active() {
-        return Err(msg.into());
+        return Err(format!(
+            "the old ghostframe-xdaemon is installed or running; run `systemctl --user stop \
+             {LEGACY_XDAEMON_UNIT}`, then `ghostframe-server install`"
+        ));
     }
     Ok(())
 }
@@ -351,6 +371,18 @@ pub fn validated_home(
     Ok(PathBuf::from(pw))
 }
 
+/// `install` and its detach step both refuse root first.
+pub fn refuse_root(euid: u32) -> Result<(), String> {
+    if euid == 0 {
+        return Err(
+            "refusing to install as root: run `ghostframe-server install` as the \
+                    desktop user whose session it should serve"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// `install`: see the design, section 3.1, for the steps. Order, and why:
 ///
 /// 1. Refuse root; require a reachable user manager (`show-environment`).
@@ -378,13 +410,7 @@ pub fn install(
         let _ = writeln!(out, "{s}");
     };
     // 1.
-    if ctx.euid == 0 {
-        return Err(
-            "refusing to install as root: run `ghostframe-server install` as the \
-                    desktop user whose session it should serve"
-                .into(),
-        );
-    }
+    refuse_root(ctx.euid)?;
     sys.user(&["show-environment"]).map_err(|e| {
         format!(
             "run `ghostframe-server install` from your desktop session (no user systemd \
@@ -583,7 +609,7 @@ pub fn uninstall(
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum CopyOutcome {
+pub enum CopyOutcome {
     AlreadyRunningFromTarget,
     Unchanged,
     Copied,
@@ -592,7 +618,7 @@ enum CopyOutcome {
 /// Copy `exe` to `target`, refusing to replace a different binary without
 /// `force`. Writes beside the target and renames over it, so a running copy
 /// of the old binary is never written into.
-fn copy_binary(exe: &Path, target: &Path, force: bool) -> Result<CopyOutcome, String> {
+pub fn copy_binary(exe: &Path, target: &Path, force: bool) -> Result<CopyOutcome, String> {
     if target.exists() {
         let same_file = match (exe.canonicalize(), target.canonicalize()) {
             (Ok(a), Ok(b)) => a == b,
@@ -853,6 +879,8 @@ mod tests {
         unit_path: Option<PathBuf>,
         /// `systemd-run` argument lists.
         runs: Vec<Vec<String>>,
+        /// `systemd-run` fails with this.
+        run_err: Option<String>,
     }
 
     impl Systemctl for Recorder {
@@ -880,7 +908,10 @@ mod tests {
 
         fn systemd_run(&mut self, args: &[String]) -> Result<(), String> {
             self.runs.push(args.to_vec());
-            Ok(())
+            match &self.run_err {
+                Some(e) => Err(e.clone()),
+                None => Ok(()),
+            }
         }
 
         fn is_active(&mut self, unit: &str) -> bool {
@@ -1562,16 +1593,7 @@ mod tests {
         let args = install_args(true, MaxResolution::Limit(1920, 1080));
         let mut sys = Recorder::default();
         let mut out = Vec::new();
-        let done = maybe_detach(
-            &mut sys,
-            cg,
-            false,
-            exe,
-            &args,
-            &[("XDG_STATE_HOME", "/x")],
-            &mut out,
-        )
-        .unwrap();
+        let done = maybe_detach(&mut sys, cg, false, exe, &args, &mut out).unwrap();
         assert!(done);
         assert_eq!(sys.runs.len(), 1);
         let run = &sys.runs[0];
@@ -1580,7 +1602,7 @@ mod tests {
             ["--user", "--collect", "--unit=ghostframe-install"]
         );
         assert!(run.contains(&"--setenv=GHOSTFRAME_INSTALL_DETACHED=1".to_string()));
-        assert!(run.contains(&"--setenv=XDG_STATE_HOME=/x".to_string()));
+        assert!(!run.iter().any(|a| a.contains("XDG_STATE_HOME")));
         assert_eq!(
             run[run.len() - 5..],
             [
@@ -1598,14 +1620,13 @@ mod tests {
         );
         // The re-exec'd copy, and a session that is not the headless one, run in place.
         let mut sys = Recorder::default();
-        assert!(!maybe_detach(&mut sys, cg, true, exe, &args, &[], &mut Vec::new()).unwrap());
+        assert!(!maybe_detach(&mut sys, cg, true, exe, &args, &mut Vec::new()).unwrap());
         assert!(!maybe_detach(
             &mut sys,
             "0::/user.slice/session-1.scope\n",
             false,
             exe,
             &args,
-            &[],
             &mut Vec::new()
         )
         .unwrap());
@@ -1614,6 +1635,80 @@ mod tests {
             install_args(false, MaxResolution::Unlimited),
             ["install", "--max-resolution", "none"]
         );
+        assert!(
+            out.contains("handed off, not that it has finished"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn install_args_round_trip_through_the_clap_parser() {
+        use clap::Parser;
+        for force in [false, true] {
+            for max in [
+                MaxResolution::Unlimited,
+                MaxResolution::Limit(1920, 1080),
+                MaxResolution::Limit(3840, 2160),
+            ] {
+                let argv = std::iter::once("ghostframe-server".to_string())
+                    .chain(install_args(force, max));
+                let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+                assert_eq!(
+                    cli.command,
+                    crate::cli::Command::Install {
+                        force,
+                        max_resolution: max
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_failing_systemd_run_says_nothing_was_changed_or_that_one_is_running() {
+        let cg = "0::/user.slice/ghostframe-wm.service\n";
+        let run = |err: &str| {
+            let mut sys = Recorder {
+                run_err: Some(err.into()),
+                ..Recorder::default()
+            };
+            maybe_detach(&mut sys, cg, false, Path::new("/x"), &[], &mut Vec::new()).unwrap_err()
+        };
+        let e = run("systemd-run failed: Failed to connect to bus");
+        assert!(
+            e.contains("no unit was written and nothing was stopped"),
+            "{e}"
+        );
+        let e = run("systemd-run failed: Unit ghostframe-install.service already exists.");
+        assert!(
+            e.contains("an install is already running: journalctl --user -u ghostframe-install -f"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn the_last_ts_state_dir_wins_and_escapes_inside_quotes_work() {
+        let p = ts_state_dir_from_environment;
+        // A drop-in's assignment comes later in the list and overrides.
+        assert_eq!(
+            p("TS_STATE_DIR=/first A=1 TS_STATE_DIR=/second"),
+            Some(PathBuf::from("/second"))
+        );
+        // The last one counts even when it is unusable.
+        assert_eq!(p("TS_STATE_DIR=/first TS_STATE_DIR=rel"), None);
+        assert_eq!(
+            p(r#""TS_STATE_DIR=/a\"b c" X=1"#),
+            Some(PathBuf::from("/a\"b c"))
+        );
+        assert_eq!(p(r#""TS_STATE_DIR=/a\\b""#), Some(PathBuf::from("/a\\b")));
+    }
+
+    #[test]
+    fn root_is_refused_before_anything() {
+        assert!(refuse_root(0)
+            .unwrap_err()
+            .contains("refusing to install as root"));
+        assert!(refuse_root(1000).is_ok());
     }
 
     #[test]
@@ -1723,10 +1818,14 @@ mod tests {
         assert!(refuse_if_legacy_xdaemon(Some(&home), || false).is_ok());
         assert!(refuse_if_legacy_xdaemon(None, || false).is_ok());
         let e = refuse_if_legacy_xdaemon(Some(&home), || true).unwrap_err();
-        assert!(e.contains("run `ghostframe-server install` first"), "{e}");
+        assert!(e.contains("installed or running"), "{e}");
+        assert!(
+            e.contains("systemctl --user stop ghostframe-xdaemon.service"),
+            "{e}"
+        );
         sb.touch(&sb.paths.unit_dir.join("ghostframe-xdaemon.service"));
         let e =
             refuse_if_legacy_xdaemon(Some(&home), || panic!("file check comes first")).unwrap_err();
-        assert!(e.contains("still installed"), "{e}");
+        assert!(e.contains("run `ghostframe-server install` first"), "{e}");
     }
 }

@@ -109,11 +109,6 @@ impl ServerConfig {
         }
     }
 
-    /// `XDG_STATE_HOME` as set in this shell, if any.
-    pub fn xdg_state_home(&self) -> Option<&str> {
-        self.xdg_state_home.as_deref()
-    }
-
     /// Whether this is the re-exec'd copy of `install` (see `GHOSTFRAME_INSTALL_DETACHED`).
     pub fn install_detached(&self) -> bool {
         self.install_detached
