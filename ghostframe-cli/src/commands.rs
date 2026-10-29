@@ -84,6 +84,7 @@ pub fn login(
         control_url: login_server.unwrap_or_default(),
         quiet: false,
         non_interactive: false,
+        redact_auth_urls: false,
     };
 
     let bridge = GhostbridgeHandle::connect(&config)?;
@@ -129,6 +130,7 @@ pub fn logout() -> Result<(), CommandError> {
         control_url: String::new(),
         quiet: false,
         non_interactive: false,
+        redact_auth_urls: false,
     };
     let bridge = GhostbridgeHandle::connect(&config)?;
 

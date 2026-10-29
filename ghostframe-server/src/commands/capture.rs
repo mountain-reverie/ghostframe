@@ -67,6 +67,8 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
         // in the journal would be claimable by whoever can read it: fail
         // instead (`needs_login`).
         non_interactive: authkey.is_empty(),
+        // Always: a key can expire and a node can be removed after start.
+        redact_auth_urls: true,
         authkey,
         state_dir,
         control_url: cfg.ts_control_url.clone(),

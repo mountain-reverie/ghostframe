@@ -335,7 +335,7 @@ func TestRateLimitedLogSuppressesWithinInterval(t *testing.T) {
 func TestUpNonInteractiveFailsOnAuthURL(t *testing.T) {
 	f := &fakePoller{statuses: []*ipnstate.Status{{BackendState: "NeedsLogin", AuthURL: "https://login.example/a/1"}}}
 	blocked := func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }
-	err := upNonInteractive(blocked, f, time.Millisecond, time.Hour)
+	err := upNonInteractive(blocked, f, time.Millisecond, time.Hour, nil)
 	if !errors.Is(err, errNeedsLogin) {
 		t.Fatalf("got %v, want errNeedsLogin", err)
 	}
@@ -344,7 +344,7 @@ func TestUpNonInteractiveFailsOnAuthURL(t *testing.T) {
 func TestUpNonInteractiveFailsOnLingeringNeedsLogin(t *testing.T) {
 	f := &fakePoller{} // exhausted: NeedsLogin forever, no URL
 	blocked := func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }
-	err := upNonInteractive(blocked, f, time.Millisecond, 20*time.Millisecond)
+	err := upNonInteractive(blocked, f, time.Millisecond, 20*time.Millisecond, nil)
 	if !errors.Is(err, errNeedsLogin) {
 		t.Fatalf("got %v, want errNeedsLogin", err)
 	}
@@ -358,7 +358,7 @@ func TestUpNonInteractiveToleratesABriefNeedsLogin(t *testing.T) {
 		time.Sleep(30 * time.Millisecond)
 		return nil
 	}
-	if err := upNonInteractive(up, f, time.Millisecond, time.Hour); err != nil {
+	if err := upNonInteractive(up, f, time.Millisecond, time.Hour, nil); err != nil {
 		t.Fatalf("got %v, want nil", err)
 	}
 }
@@ -366,23 +366,46 @@ func TestUpNonInteractiveToleratesABriefNeedsLogin(t *testing.T) {
 func TestUpNonInteractivePassesUpErrorsThrough(t *testing.T) {
 	boom := errors.New("boom")
 	f := &fakePoller{statuses: []*ipnstate.Status{{BackendState: "Running"}}}
-	err := upNonInteractive(func(context.Context) error { return boom }, f, time.Millisecond, time.Hour)
+	err := upNonInteractive(func(context.Context) error { return boom }, f, time.Millisecond, time.Hour, nil)
 	if !errors.Is(err, boom) || errors.Is(err, errNeedsLogin) {
 		t.Fatalf("got %v", err)
 	}
 }
 
-// The auth URL must never reach the journal in non-interactive mode, and
-// nothing else may be lost.
-func TestNonInteractiveLogfDropsAuthURLLines(t *testing.T) {
+// The sign-in URL must never reach the journal, however a tailscale release
+// phrases the line: it is redacted by SHAPE, not by the words around it.
+func TestRedactingLogfRemovesURLsPassedAsArguments(t *testing.T) {
 	var got []string
 	next := func(f string, a ...any) { got = append(got, fmt.Sprintf(f, a...)) }
-	l := nonInteractiveLogf(next)
-	l("To start this tsnet server, restart with TS_AUTHKEY set, or go to: %s", "https://login.example/a/1")
-	l("AuthURL is %v", "https://login.example/a/1")
-	l("RegisterReq: got response; nodeKeyExpired=%v, machineAuthorized=%v; authURL=%v", true, false, true)
-	l("magicsock: endpoints changed")
-	if len(got) != 1 || got[0] != "magicsock: endpoints changed" {
+	l := redactingLogf(next)
+	for _, url := range []string{
+		"https://login.tailscale.com/a/0123456789abc",
+		"https://hs.example.net:8443/register/mkey:abcdef",
+		"http://127.0.0.1:8080/register/xyz",
+	} {
+		got = nil
+		l("%s", url)
+		l("something unrelated: %v (retrying)", url)
+		l("no verb at all, url=" + url)
+		if len(got) != 3 {
+			t.Fatalf("got %q", got)
+		}
+		for _, line := range got {
+			if strings.Contains(line, url) || strings.Contains(line, "/a/0123") || strings.Contains(line, "/register/") {
+				t.Fatalf("URL survived in %q", line)
+			}
+		}
+	}
+}
+
+func TestRedactingLogfKeepsOrdinaryLines(t *testing.T) {
+	var got []string
+	next := func(f string, a ...any) { got = append(got, fmt.Sprintf(f, a...)) }
+	l := redactingLogf(next)
+	l("magicsock: endpoints changed: %s", "1.2.3.4:5")
+	l("control server key from %s", "https://controlplane.tailscale.com")
+	if len(got) != 2 || got[0] != "magicsock: endpoints changed: 1.2.3.4:5" ||
+		got[1] != "control server key from https://controlplane.tailscale.com" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -393,5 +416,19 @@ func TestLoginURLReportsMachineAuth(t *testing.T) {
 	_, err := loginURL(f, time.Second)
 	if !errors.Is(err, errMachineAuth) {
 		t.Fatalf("got %v, want errMachineAuth", err)
+	}
+}
+
+func TestUpNonInteractiveHintsOnceWhenWaitingForApproval(t *testing.T) {
+	f := &fakePoller{statuses: []*ipnstate.Status{
+		{BackendState: "NeedsMachineAuth"}, {BackendState: "NeedsMachineAuth"}, {BackendState: "NeedsMachineAuth"},
+	}}
+	up := func(ctx context.Context) error { time.Sleep(60 * time.Millisecond); return nil }
+	n := 0
+	if err := upNonInteractive(up, f, time.Millisecond, time.Hour, func() { n++ }); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("hint called %d times, want 1", n)
 	}
 }

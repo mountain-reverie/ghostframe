@@ -17,17 +17,23 @@ pub const LOCK_FILE: &str = ".lock";
 /// `capture` after an auth-key join). Its absence means "never joined".
 pub const JOINED_FILE: &str = ".joined";
 
-/// True once a join completed. NOT "tailscaled.state exists": tsnet writes
-/// that file (`{}`, then the machine key) when it starts, before any
-/// authorisation, so a `login` that was interrupted, timed out or was given
+/// True once this directory's node has been registered (once: key expiry or
+/// removal in the admin console later does not clear it; `capture` fails
+/// cleanly on those, see `non_interactive`). NOT "tailscaled.state exists":
+/// tsnet writes that file (`{}`, then the machine key) when it starts, before
+/// any registration, so a `login` that was interrupted, timed out or was given
 /// a bad control URL leaves it behind. Treating that as joined made `capture`
 /// start an interactive tsnet that logs a claimable sign-in URL to the journal.
-/// (tailscale.com v1.104.1, ipn/store/stores.go NewFileStore.) The state
-/// file's other keys cannot stand in for the marker at run time: a profile
-/// entry may be written before authorisation, only with an empty
-/// `Config.NodeID` and `UserProfile.LoginName` (ipn/ipnlocal/profiles.go,
-/// `SetPrefs`). [`state_is_registered`] reads exactly those fields, for
-/// adopting state that predates the marker.
+/// (tailscale.com v1.104.1, ipn/store/stores.go NewFileStore.)
+///
+/// Three ways to ask the same question, from cheapest:
+/// - this: the marker, written by `login`/`capture` after a successful join;
+/// - [`never_joined`]: no marker and the state holds nothing but the machine
+///   key, so there is certainly nothing to deregister (used by `logout`);
+/// - [`state_is_registered`]: reads the profile prefs offline
+///   (`Config.NodeID`, `UserProfile.LoginName`, both empty until control has
+///   answered; ipn/ipnlocal/profiles.go `SetPrefs`), to adopt state that
+///   predates the marker.
 pub fn state_dir_seeded(state_dir: &Path) -> bool {
     state_dir.join(JOINED_FILE).exists()
 }
@@ -154,6 +160,17 @@ pub fn plan_removal(state_dir: &Path) -> Result<Vec<PathBuf>, RemoveError> {
     Ok(entries)
 }
 
+/// Delete the marker (absent is fine) and make that durable: a crash must not
+/// bring back a marker for a node that has been deregistered.
+pub fn remove_marker(state_dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(state_dir.join(JOINED_FILE)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    File::open(state_dir)?.sync_all()
+}
+
 /// Delete the state directory, but only if everything in it is known. The
 /// path is user-supplied (`TS_STATE_DIR`); a recursive delete of whatever it
 /// names would wipe a home directory. `.joined` goes first, so that if
@@ -161,11 +178,7 @@ pub fn plan_removal(state_dir: &Path) -> Result<Vec<PathBuf>, RemoveError> {
 pub fn remove_state_dir(state_dir: &Path) -> Result<(), RemoveError> {
     let mut entries = plan_removal(state_dir)?;
     // First, and before anything that can fail part-way.
-    match std::fs::remove_file(state_dir.join(JOINED_FILE)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(RemoveError::Io(e)),
-    }
+    remove_marker(state_dir).map_err(RemoveError::Io)?;
     entries.retain(|p| p.file_name() != Some(std::ffi::OsStr::new(JOINED_FILE)));
     for p in entries {
         if std::fs::symlink_metadata(&p)
@@ -485,5 +498,14 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(r.is_err(), "removal must fail part-way for this test");
         assert!(!state_dir_seeded(&dir), "marker must be gone first");
+    }
+
+    #[test]
+    fn remove_marker_is_idempotent() {
+        let d = tempfile::tempdir().unwrap();
+        mark_joined(d.path()).unwrap();
+        remove_marker(d.path()).unwrap();
+        assert!(!state_dir_seeded(d.path()));
+        remove_marker(d.path()).unwrap();
     }
 }

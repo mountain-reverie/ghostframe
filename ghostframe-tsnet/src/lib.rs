@@ -38,6 +38,7 @@ extern "C" {
         control_url: *const c_char,
         quiet: c_int,
         non_interactive: c_int,
+        redact_auth_urls: c_int,
         sd_out: *mut c_int,
     ) -> c_int;
     fn gbridge_up(sd: c_int) -> c_int;
@@ -101,6 +102,10 @@ pub struct GhostbridgeConfig {
     /// the node needs an interactive login, and no sign-in URL is logged.
     /// For a daemon that has no auth key.
     pub non_interactive: bool,
+    /// Replace any sign-in URL in tsnet's log output and drop its user-facing
+    /// log. For a daemon, with or without an auth key: a key can expire and
+    /// a node can be removed, and the journal is not private to the owner.
+    pub redact_auth_urls: bool,
 }
 
 /// `gbridge_up` in non-interactive mode: the node needs a person to log in
@@ -131,6 +136,7 @@ impl GhostbridgeHandle {
                 c_control_url.as_ptr(),
                 c_int::from(config.quiet),
                 c_int::from(config.non_interactive),
+                c_int::from(config.redact_auth_urls),
                 &mut sd,
             )
         };

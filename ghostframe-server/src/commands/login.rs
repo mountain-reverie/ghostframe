@@ -100,6 +100,7 @@ fn bridge_config(
         // person must see, not tsnet's backend log.
         quiet: true,
         non_interactive: false,
+        redact_auth_urls: false,
     }
 }
 
@@ -207,13 +208,22 @@ pub fn logout_with<T: Tailnet>(
     // marked joined. Refusing afterwards would leave a deregistered node
     // whose marker survives, and the next `capture` would start an
     // interactive tsnet.
-    if let Err(RemoveError::Unknown(names)) = state::plan_removal(&dir) {
-        return Err(format!(
-            "{} holds entries ghostframe did not create: {}. No change was made. \
-             Is TS_STATE_DIR right?",
-            dir.display(),
-            names.join(", ")
-        ));
+    match state::plan_removal(&dir) {
+        Ok(_) => {}
+        Err(RemoveError::Unknown(names)) => {
+            return Err(format!(
+                "{} holds entries ghostframe did not create: {}. No change was made. \
+                 Is TS_STATE_DIR right?",
+                dir.display(),
+                names.join(", ")
+            ))
+        }
+        Err(RemoveError::Io(e)) => {
+            return Err(format!(
+                "cannot inspect {}: {e}. No change was made.",
+                dir.display()
+            ))
+        }
     }
 
     // Nothing to deregister for a node that never got past tsnet's own start.
@@ -237,7 +247,7 @@ pub fn logout_with<T: Tailnet>(
         drop(bridge);
         // The node is deregistered: the directory must stop claiming a join
         // before anything else can go wrong.
-        match std::fs::remove_file(dir.join(state::JOINED_FILE)) {
+        match state::remove_marker(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -386,6 +396,7 @@ mod tests {
                     control_url: c.control_url.clone(),
                     quiet: c.quiet,
                     non_interactive: c.non_interactive,
+                    redact_auth_urls: c.redact_auth_urls,
                 });
                 Ok(f)
             },
