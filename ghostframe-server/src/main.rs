@@ -1,7 +1,6 @@
 mod config;
 mod cvt;
 mod display;
-mod drm_capture;
 mod input_inject;
 mod util;
 mod x11_capture;
@@ -10,17 +9,7 @@ mod xdamage;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use ghostframe_lib::{FrameSubmission, GhostbridgeConfig, GhostframeServer};
-
-/// Capture backend selection.
-enum CaptureBackend {
-    /// DRM/KMS capture — passes DMA-BUF fd directly for zero-copy GPU pipeline.
-    Drm,
-    /// X11 GetImage fallback (for containers without DRM).
-    X11 {
-        capture: Box<x11_capture::X11Capture>,
-    },
-}
+use ghostframe_lib::{GhostbridgeConfig, GhostframeServer};
 
 /// Returns true if the tsnet state directory has been seeded with a successful
 /// login. tsnet writes `tailscaled.state` after the first successful join; we
@@ -140,14 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Skip in --init mode: that path only seeds the tsnet state and exits
     // without capturing anything, and install.sh runs --init before X is up.
-    //
-    // Also skip when GHOSTFRAME_NO_X11_WAIT is set — the DRM-direct e2e
-    // path runs ghostframe-test-pattern as the DRM master with no Xorg
-    // anywhere in the container, so blocking on a non-existent display :99
-    // would just time out after 10 s and abort startup. The DRM-direct
-    // entrypoint sets this env var; production never does.
-    let skip_x11_wait = cfg.no_x11_wait;
-    if !init_mode && !skip_x11_wait {
+    if !init_mode {
         if let Err(msg) = wait_for_x11(Duration::from_secs(10), cfg.display.as_deref()) {
             // Name both deployments. This hint used to point only at
             // ghostframe-xorg.service, which does not exist in attach mode --
@@ -261,50 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
-    // Select capture backend. Default: try DRM first, fall back to X11. With
-    // GHOSTFRAME_X11_CAPTURE_ONLY=1, skip the DRM probe entirely — the
-    // modesetting-FB fallback inside `drm_capture::capture()` would read
-    // /dev/dri/card0's active scanout (the host's real display) rather than
-    // the guest Xorg on :1, producing solid-black or host-screen captures
-    // for the guest-mode install. See packaging/systemd/
-    // ghostframe-server.service which sets the env var by default.
-    let force_x11 = cfg.x11_capture_only;
-    let mut backend = if force_x11 {
-        tracing::info!("GHOSTFRAME_X11_CAPTURE_ONLY set; skipping DRM probe");
-        let capture = x11_capture::X11Capture::new(&cfg)?;
-        CaptureBackend::X11 {
-            capture: Box::new(capture),
-        }
-    } else {
-        match drm_capture::capture() {
-            Ok(result) => {
-                let (path_label, w, h) = match &result {
-                    drm_capture::CaptureResult::Prime(_, g, _) => {
-                        ("zero-copy GPU path (PRIME DMA-BUF)", g.width, g.height)
-                    }
-                    drm_capture::CaptureResult::Pixels(_, g, _) => {
-                        ("CPU-mmap path (modesetting FB)", g.width, g.height)
-                    }
-                };
-                drop(result);
-                tracing::info!(
-                    width = w,
-                    height = h,
-                    "DRM capture available ({})",
-                    path_label
-                );
-                CaptureBackend::Drm
-            }
-            Err(e) => {
-                tracing::warn!("DRM capture unavailable: {e}");
-                tracing::info!("Falling back to X11 capture");
-                let capture = x11_capture::X11Capture::new(&cfg)?;
-                CaptureBackend::X11 {
-                    capture: Box::new(capture),
-                }
-            }
-        }
-    };
+    let mut capture = x11_capture::X11Capture::new(&cfg)?;
 
     // Not armed yet: damage reporting is switched on and off with the capture
     // gate below, so the X server does no damage bookkeeping for us while no
@@ -422,51 +361,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         });
 
-        let submission = match &mut backend {
-            CaptureBackend::Drm => match drm_capture::capture() {
-                Ok(drm_capture::CaptureResult::Prime(dmabuf_fd, geom, capture_done_ns)) => {
-                    let timestamp_us = (frame_count * frame_interval.as_micros() as u64) as u32;
-                    Some(FrameSubmission {
-                        width: geom.width,
-                        height: geom.height,
-                        stride: geom.stride,
-                        pixels: Vec::new(),
-                        dmabuf_fd: Some(dmabuf_fd),
-                        timestamp_us,
-                        damage_tiles: damage_tiles.clone(),
-                        capture_done_ns,
-                    })
-                }
-                Ok(drm_capture::CaptureResult::Pixels(pixels, geom, capture_done_ns)) => {
-                    let timestamp_us = (frame_count * frame_interval.as_micros() as u64) as u32;
-                    Some(FrameSubmission {
-                        width: geom.width,
-                        height: geom.height,
-                        stride: geom.stride,
-                        pixels,
-                        dmabuf_fd: None,
-                        timestamp_us,
-                        damage_tiles: damage_tiles.clone(),
-                        capture_done_ns,
-                    })
-                }
-                Err(e) => {
-                    tracing::warn!("DRM capture failed: {e}");
-                    None
-                }
-            },
-            CaptureBackend::X11 { capture } => {
-                let timestamp_us = (frame_count * frame_interval.as_micros() as u64) as u32;
-                match capture.capture(timestamp_us) {
-                    Ok(mut frame) => {
-                        frame.damage_tiles = damage_tiles.clone();
-                        Some(frame)
-                    }
-                    Err(e) => {
-                        tracing::warn!("X11 capture failed: {e}");
-                        None
-                    }
-                }
+        let timestamp_us = (frame_count * frame_interval.as_micros() as u64) as u32;
+        let submission = match capture.capture(timestamp_us) {
+            Ok(mut frame) => {
+                frame.damage_tiles = damage_tiles;
+                Some(frame)
+            }
+            Err(e) => {
+                tracing::warn!("X11 capture failed: {e}");
+                None
             }
         };
 

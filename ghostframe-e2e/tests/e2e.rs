@@ -1511,10 +1511,9 @@ async fn e2e_edge_tiles_body<B: helpers::BrowserSession>(browser: &mut B) -> Res
 #[tokio::test]
 async fn e2e_edge_tiles_chromium() -> Result<()> {
     // Use the non-GPU path so xorg-odd.conf's dummy driver at 700×500 is
-    // the actual capture source. With gpu=true the container's bind-mounted
-    // VKMS DRM device dominates (1024×768) and Xorg's dummy framebuffer is
-    // ignored by drm_capture — defeats the purpose of the odd-resolution
-    // test.
+    // the actual capture source. With gpu=true the container's Xorg runs on
+    // the bind-mounted VKMS device (1024×768) instead of the dummy
+    // framebuffer — defeats the purpose of the odd-resolution test.
     let mut setup =
         setup_e2e_webgpu_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-odd.conf")])
             .await?;
