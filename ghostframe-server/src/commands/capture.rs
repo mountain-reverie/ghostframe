@@ -61,19 +61,7 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
     };
     let capture_fps = cfg.capture_fps;
 
-    let config = GhostbridgeConfig {
-        hostname: cfg.ts_hostname.clone(),
-        // Without a key nobody is there to answer a sign-in URL, and the URL
-        // in the journal would be claimable by whoever can read it: fail
-        // instead (`needs_login`).
-        non_interactive: authkey.is_empty(),
-        // Always: a key can expire and a node can be removed after start.
-        redact_auth_urls: true,
-        authkey,
-        state_dir,
-        control_url: cfg.ts_control_url.clone(),
-        quiet: false,
-    };
+    let config = bridge_config(&cfg, authkey, state_dir);
 
     if let Err(msg) =
         crate::capture::x11::wait_for_x11(Duration::from_secs(10), cfg.display.as_deref())
@@ -343,6 +331,23 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
     Ok(())
 }
 
+/// The tailnet settings `capture` runs with.
+fn bridge_config(cfg: &ServerConfig, authkey: String, state_dir: String) -> GhostbridgeConfig {
+    GhostbridgeConfig {
+        hostname: cfg.ts_hostname.clone(),
+        // Without a key nobody is there to answer a sign-in URL, and the URL
+        // in the journal would be claimable by whoever can read it: fail
+        // instead (`needs_login`).
+        non_interactive: authkey.is_empty(),
+        // Always: a key can expire and a node can be removed after start.
+        redact_auth_urls: true,
+        authkey,
+        state_dir,
+        control_url: cfg.ts_control_url.clone(),
+        quiet: false,
+    }
+}
+
 /// Whether `e` (or anything it wraps) is a non-interactive `up` that found the
 /// node needing a login.
 fn needs_login(e: &(dyn std::error::Error + 'static)) -> bool {
@@ -434,6 +439,16 @@ fn dump_frame_as_png(
 mod tests {
     use super::*;
     use ghostframe_lib::GhostbridgeError;
+
+    #[test]
+    fn capture_always_redacts_and_only_a_keyless_one_is_non_interactive() {
+        let cfg = ServerConfig::from_lookup(|_| None, Some("h".into()));
+        let keyed = bridge_config(&cfg, "tskey-x".into(), "/s".into());
+        assert!(keyed.redact_auth_urls && !keyed.non_interactive);
+        let keyless = bridge_config(&cfg, String::new(), "/s".into());
+        assert!(keyless.redact_auth_urls && keyless.non_interactive);
+        assert!(!keyless.quiet);
+    }
 
     #[test]
     fn only_a_needs_login_up_failure_maps_to_the_login_message() {

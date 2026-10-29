@@ -54,7 +54,8 @@ pub unsafe extern "C" fn gf_server_new(
             control_url: CStr::from_ptr(control_url).to_string_lossy().into_owned(),
             quiet: false,
             non_interactive: false,
-            redact_auth_urls: false,
+            // C-API embedders are daemons too: keep sign-in URLs out of logs.
+            redact_auth_urls: true,
         };
 
         let rt = match tokio::runtime::Runtime::new() {
