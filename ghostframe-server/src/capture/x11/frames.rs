@@ -30,7 +30,8 @@ use x11rb::protocol::xfixes::{ConnectionExt as XfixesExt, GetCursorImageReply};
 use x11rb::protocol::xproto::{ConnectionExt, ImageFormat, ImageOrder};
 use x11rb::rust_connection::RustConnection;
 
-/// Frames between MIT-SHM attach retries after a local allocation error.
+/// Frames to capture with GetImage after a local MIT-SHM allocation error
+/// before the retry; the retry runs on the frame after these.
 const SHM_RETRY_FRAMES: u32 = 300;
 
 /// Count a pending retry down by one frame; true when it is due now.
@@ -159,6 +160,9 @@ pub struct X11Frames {
     last_cursor: Option<CursorRect>,
     /// Frames left until MIT-SHM is retried after a local allocation error.
     shm_retry_in: Option<u32>,
+    /// The last MIT-SHM allocation failed locally and has not succeeded since;
+    /// set so that a persistent failure warns once, not on every retry.
+    shm_alloc_failing: bool,
 }
 
 /// A cursor image's rectangle in root coordinates.
@@ -245,6 +249,7 @@ impl X11Frames {
             polled_cursor: None,
             last_cursor: None,
             shm_retry_in: None,
+            shm_alloc_failing: false,
         };
         me.ensure_segment();
         tracing::info!(width, height, path = ?me.path(), "X11 capture connected to display");
@@ -284,15 +289,25 @@ impl X11Frames {
             }
         }
         match ShmSegment::attach(&self.conn, len) {
-            Ok(s) => self.shm = Some(s),
+            Ok(s) => {
+                self.shm = Some(s);
+                self.shm_alloc_failing = false;
+            }
             Err(AttachError::X(e)) => {
                 tracing::warn!(error = %e, "MIT-SHM segment attach refused; using GetImage(root)");
                 self.shm_usable = false;
             }
             Err(AttachError::Os(e)) => {
                 // Local and possibly transient: GetImage for now, retried at
-                // the next resize or after SHM_RETRY_FRAMES frames.
-                tracing::warn!(error = %e, "MIT-SHM segment allocation failed; using GetImage(root) for now");
+                // the next resize or after SHM_RETRY_FRAMES frames. Only the
+                // first failure is news; a persistent one would otherwise warn
+                // on every retry.
+                if self.shm_alloc_failing {
+                    tracing::debug!(error = %e, "MIT-SHM segment allocation failed again; using GetImage(root)");
+                } else {
+                    tracing::warn!(error = %e, "MIT-SHM segment allocation failed; using GetImage(root) for now");
+                }
+                self.shm_alloc_failing = true;
                 self.shm_retry_in = Some(SHM_RETRY_FRAMES);
             }
         }
@@ -588,6 +603,84 @@ fn blit_cursor(target: &mut [u8], target_w: i32, target_h: i32, cursor: &GetCurs
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A setup whose root is a 24-bit TrueColor visual with the given masks,
+    /// little-endian, 32 bits per pixel: everything `check_pixel_format` reads.
+    fn synthetic_setup(red: u32, green: u32, blue: u32) -> x11rb::protocol::xproto::Setup {
+        use x11rb::protocol::xproto::{
+            BackingStore, Depth, EventMask, Format, ImageOrder, Setup, VisualClass, Visualtype,
+        };
+        let visual = Visualtype {
+            visual_id: 0x21,
+            class: VisualClass::TRUE_COLOR,
+            bits_per_rgb_value: 8,
+            colormap_entries: 256,
+            red_mask: red,
+            green_mask: green,
+            blue_mask: blue,
+        };
+        let screen = x11rb::protocol::xproto::Screen {
+            root: 0x100,
+            default_colormap: 0x20,
+            white_pixel: 0xffff_ffff,
+            black_pixel: 0,
+            current_input_masks: EventMask::NO_EVENT,
+            width_in_pixels: 1280,
+            height_in_pixels: 1024,
+            width_in_millimeters: 338,
+            height_in_millimeters: 271,
+            min_installed_maps: 1,
+            max_installed_maps: 1,
+            root_visual: visual.visual_id,
+            backing_stores: BackingStore::NOT_USEFUL,
+            save_unders: false,
+            root_depth: 24,
+            allowed_depths: vec![Depth {
+                depth: 24,
+                visuals: vec![visual],
+            }],
+        };
+        Setup {
+            status: 1,
+            protocol_major_version: 11,
+            protocol_minor_version: 0,
+            length: 0,
+            release_number: 0,
+            resource_id_base: 0,
+            resource_id_mask: 0,
+            motion_buffer_size: 0,
+            maximum_request_length: 0xffff,
+            image_byte_order: ImageOrder::LSB_FIRST,
+            bitmap_format_bit_order: ImageOrder::LSB_FIRST,
+            bitmap_format_scanline_unit: 32,
+            bitmap_format_scanline_pad: 32,
+            min_keycode: 8,
+            max_keycode: 255,
+            vendor: Vec::new(),
+            pixmap_formats: vec![Format {
+                depth: 24,
+                bits_per_pixel: 32,
+                scanline_pad: 32,
+            }],
+            roots: vec![screen],
+        }
+    }
+
+    #[test]
+    fn a_bgrx_root_visual_is_accepted() {
+        let setup = synthetic_setup(0x00ff_0000, 0x0000_ff00, 0x0000_00ff);
+        check_pixel_format(&setup, &setup.roots[0]).expect("BGRX root must be accepted");
+    }
+
+    #[test]
+    fn an_rgb_ordered_root_visual_is_refused() {
+        // Same depth and bpp as the BGRX case: only the channel order differs,
+        // so this refusal can only come from the mask check.
+        let setup = synthetic_setup(0x0000_00ff, 0x0000_ff00, 0x00ff_0000);
+        let err =
+            check_pixel_format(&setup, &setup.roots[0]).expect_err("RGB root must be refused");
+        assert!(err.to_string().contains("channel masks"), "{err}");
+    }
 
     #[test]
     fn a_changed_root_geometry_requires_a_resize() {

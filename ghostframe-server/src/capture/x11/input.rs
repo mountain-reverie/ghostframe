@@ -33,7 +33,7 @@ impl XTestInjector {
     /// present. Errors if no DISPLAY or XTEST is missing — the caller
     /// (`X11Backend::new`) logs and continues with no injector.
     pub fn new(display: Option<&str>) -> Result<Self> {
-        let display_env = display.unwrap_or("<unset>").to_string();
+        let display_env = display.unwrap_or("$DISPLAY").to_string();
         let (conn, screen_num) =
             x11rb::connect(display).map_err(|e| anyhow!("x11rb::connect: {e}"))?;
         let root = conn.setup().roots[screen_num].root;
