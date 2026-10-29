@@ -30,6 +30,24 @@ use x11rb::protocol::xfixes::{ConnectionExt as XfixesExt, GetCursorImageReply};
 use x11rb::protocol::xproto::{ConnectionExt, ImageFormat, ImageOrder};
 use x11rb::rust_connection::RustConnection;
 
+/// Frames between MIT-SHM attach retries after a local allocation error.
+const SHM_RETRY_FRAMES: u32 = 300;
+
+/// Count a pending retry down by one frame; true when it is due now.
+fn retry_due(counter: &mut Option<u32>) -> bool {
+    match counter {
+        Some(0) => {
+            *counter = None;
+            true
+        }
+        Some(n) => {
+            *n -= 1;
+            false
+        }
+        None => false,
+    }
+}
+
 /// Which request fills a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrabPath {
@@ -131,11 +149,16 @@ pub struct X11Frames {
     shm_usable: bool,
     /// One-shot raw-frame dump target (`GHOSTFRAME_DUMP_FIRST_FRAME`); taken on first use.
     dump_first_frame: Option<String>,
-    /// The cursor as seen by the last `poll_cursor`, consumed by `capture`
-    /// so one frame uses one cursor query.
-    cursor: Option<GetCursorImageReply>,
-    /// Where the cursor was drawn as of the last poll.
+    /// The outcome of the last `poll_cursor`, consumed by `capture` so one
+    /// frame uses one cursor query. The outer `None` means "no poll since
+    /// the last capture"; `Some(None)` means a poll whose query failed, which
+    /// `capture` must not retry.
+    polled_cursor: Option<Option<GetCursorImageReply>>,
+    /// Where the cursor was last DRAWN into a frame (set by `capture`, so a
+    /// failed capture does not advance it).
     last_cursor: Option<CursorRect>,
+    /// Frames left until MIT-SHM is retried after a local allocation error.
+    shm_retry_in: Option<u32>,
 }
 
 /// A cursor image's rectangle in root coordinates.
@@ -201,7 +224,7 @@ impl X11Frames {
         let screen = &conn.setup().roots[screen_num];
         let root = screen.root;
         let (width, height) = (screen.width_in_pixels, screen.height_in_pixels);
-        check_pixel_format(conn.setup(), screen.root_depth)?;
+        check_pixel_format(conn.setup(), screen)?;
 
         // XFixes needs its version negotiated before GetCursorImage. Without
         // it the frame is still correct, minus the cursor.
@@ -219,8 +242,9 @@ impl X11Frames {
             shm: None,
             shm_usable,
             dump_first_frame,
-            cursor: None,
+            polled_cursor: None,
             last_cursor: None,
+            shm_retry_in: None,
         };
         me.ensure_segment();
         tracing::info!(width, height, path = ?me.path(), "X11 capture connected to display");
@@ -239,6 +263,7 @@ impl X11Frames {
     /// Make the segment match the root size, or drop to `GetImage` for good
     /// if MIT-SHM cannot be used.
     fn ensure_segment(&mut self) {
+        self.shm_retry_in = None;
         if !self.shm_usable {
             return;
         }
@@ -265,9 +290,10 @@ impl X11Frames {
                 self.shm_usable = false;
             }
             Err(AttachError::Os(e)) => {
-                // Local and possibly transient: GetImage for now, and the
-                // next resize tries again.
-                tracing::warn!(error = %e, "MIT-SHM segment allocation failed; using GetImage(root) until the next resize");
+                // Local and possibly transient: GetImage for now, retried at
+                // the next resize or after SHM_RETRY_FRAMES frames.
+                tracing::warn!(error = %e, "MIT-SHM segment allocation failed; using GetImage(root) for now");
+                self.shm_retry_in = Some(SHM_RETRY_FRAMES);
             }
         }
     }
@@ -354,6 +380,8 @@ impl X11Frames {
 
     /// Query the cursor for the next frame and return the tiles its
     /// movement or image change dirtied (see [`cursor_dirty_tiles`]).
+    ///
+    /// Diffs against where the cursor was last drawn, not last polled.
     pub fn poll_cursor(&mut self) -> Vec<(u32, u32)> {
         let cursor = self.query_cursor();
         let cur = cursor.as_ref().map(CursorRect::of);
@@ -363,17 +391,23 @@ impl X11Frames {
             u32::from(self.width),
             u32::from(self.height),
         );
-        self.last_cursor = cur;
-        self.cursor = cursor;
+        self.polled_cursor = Some(cursor);
         tiles
     }
 
     /// Capture a single frame: root, then the cursor on top.
     pub fn capture(&mut self, timestamp_us: u32) -> io::Result<FrameSubmission> {
         self.refresh_geometry()?;
+        if retry_due(&mut self.shm_retry_in) {
+            self.ensure_segment();
+        }
         let mut pixels = self.grab()?;
         // Best effort: without XFixes the frame is correct minus the cursor.
-        let cursor = self.cursor.take().or_else(|| self.query_cursor());
+        let cursor = match self.polled_cursor.take() {
+            Some(polled) => polled,
+            None => self.query_cursor(),
+        };
+        self.last_cursor = cursor.as_ref().map(CursorRect::of);
         if let Some(cursor) = cursor {
             blit_cursor(
                 &mut pixels,
@@ -421,7 +455,11 @@ impl X11Frames {
 /// Everything downstream reads BGRX at `width * 4` per row. A 16 bpp root
 /// returns half-size images and used to panic `blit_cursor`; fail at connect
 /// with a message instead.
-fn check_pixel_format(setup: &x11rb::protocol::xproto::Setup, root_depth: u8) -> io::Result<()> {
+fn check_pixel_format(
+    setup: &x11rb::protocol::xproto::Setup,
+    screen: &x11rb::protocol::xproto::Screen,
+) -> io::Result<()> {
+    let root_depth = screen.root_depth;
     let unsupported = |msg: String| io::Error::new(io::ErrorKind::Unsupported, msg);
     if setup.image_byte_order != ImageOrder::LSB_FIRST {
         return Err(unsupported(
@@ -435,6 +473,20 @@ fn check_pixel_format(setup: &x11rb::protocol::xproto::Setup, root_depth: u8) ->
              Start the X server with a 24-bit screen"
         )));
     }
+    let visual = screen
+        .allowed_depths
+        .iter()
+        .flat_map(|d| d.visuals.iter())
+        .find(|v| v.visual_id == screen.root_visual);
+    if let Some(v) = visual {
+        if !masks_are_bgrx(v.red_mask, v.green_mask, v.blue_mask) {
+            return Err(unsupported(format!(
+                "X root visual has channel masks r={:#x} g={:#x} b={:#x}; \
+                 capture needs 0xff0000/0xff00/0xff (BGRX)",
+                v.red_mask, v.green_mask, v.blue_mask
+            )));
+        }
+    }
     match setup.pixmap_formats.iter().find(|f| f.depth == root_depth) {
         Some(f) if f.bits_per_pixel == 32 => Ok(()),
         Some(f) => Err(unsupported(format!(
@@ -445,6 +497,11 @@ fn check_pixel_format(setup: &x11rb::protocol::xproto::Setup, root_depth: u8) ->
             "X server lists no pixmap format for root depth {root_depth}"
         ))),
     }
+}
+
+/// The channel layout every later stage assumes: B in byte 0, G in 1, R in 2.
+fn masks_are_bgrx(red: u32, green: u32, blue: u32) -> bool {
+    (red, green, blue) == (0x00ff_0000, 0x0000_ff00, 0x0000_00ff)
 }
 
 /// MIT-SHM 1.2 (`AttachFd`) is present on this connection.
@@ -478,10 +535,8 @@ fn resize_needed(current: (u16, u16), actual: (u16, u16)) -> Option<(u16, u16)> 
 ///
 /// applied per channel.
 fn blit_cursor(target: &mut [u8], target_w: i32, target_h: i32, cursor: &GetCursorImageReply) {
-    let cx = (cursor.x as i32) - (cursor.xhot as i32);
-    let cy = (cursor.y as i32) - (cursor.yhot as i32);
-    let cw = cursor.width as i32;
-    let ch = cursor.height as i32;
+    let CursorRect { x: cx, y: cy, w, h } = CursorRect::of(cursor);
+    let (cw, ch) = (w as i32, h as i32);
 
     let x0 = cx.max(0);
     let y0 = cy.max(0);
@@ -620,6 +675,46 @@ mod tests {
         let mut target = vec![0u8; 4];
         blit_cursor(&mut target, 1, 1, &px_cursor(0, 0, 1, 1, 0xff11_2233));
         assert_eq!(target, [0x33, 0x22, 0x11, 0xff]);
+    }
+
+    #[test]
+    fn cursor_rect_subtracts_the_hotspot_and_can_straddle_a_tile() {
+        // Pointer at x=40 with hotspot 10: the image starts at 30, so an
+        // 8-wide cursor covers 30..38 and crosses the tile boundary at 32.
+        let c = GetCursorImageReply {
+            x: 40,
+            y: 40,
+            xhot: 10,
+            yhot: 10,
+            width: 8,
+            height: 8,
+            ..Default::default()
+        };
+        let r = CursorRect::of(&c);
+        assert_eq!(r, rect(30, 30, 8, 8));
+        assert_eq!(
+            cursor_dirty_tiles(None, Some(r), 256, 256),
+            vec![(0, 0), (0, 1), (1, 0), (1, 1)]
+        );
+    }
+
+    #[test]
+    fn masks_must_be_bgrx() {
+        assert!(masks_are_bgrx(0xff0000, 0xff00, 0xff));
+        assert!(!masks_are_bgrx(0xff, 0xff00, 0xff0000)); // RGB order
+        assert!(!masks_are_bgrx(0xf800, 0x7e0, 0x1f)); // 565
+    }
+
+    #[test]
+    fn shm_retry_counts_down_then_fires_once() {
+        let mut c = None;
+        assert!(!retry_due(&mut c));
+        c = Some(2);
+        assert!(!retry_due(&mut c));
+        assert!(!retry_due(&mut c));
+        assert!(retry_due(&mut c));
+        assert_eq!(c, None);
+        assert!(!retry_due(&mut c));
     }
 
     fn rect(x: i32, y: i32, w: u32, h: u32) -> CursorRect {
@@ -881,6 +976,8 @@ mod live_tests {
         warp(10, 10);
         let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
         f.poll_cursor();
+        // The diff is against where the cursor was DRAWN.
+        f.capture(0).unwrap();
         warp(100, 70);
         let tiles = f.poll_cursor();
         assert!(
@@ -890,6 +987,29 @@ mod live_tests {
         assert!(
             tiles.contains(&tile_of(100, 70)),
             "entered tile missing: {tiles:?}"
+        );
+    }
+
+    /// `last_cursor` is where the cursor was DRAWN: polling twice without a
+    /// capture in between must report the same vacated tile both times.
+    #[test]
+    fn polling_does_not_advance_where_the_cursor_was_drawn() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "128x96x24"]);
+        let (conn, n) = x11rb::connect(Some(x.display())).unwrap();
+        let root = conn.setup().roots[n].root;
+        let warp = |px: i16, py: i16| {
+            conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, px, py)
+                .unwrap();
+            conn.get_input_focus().unwrap().reply().unwrap();
+        };
+        warp(10, 10);
+        let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
+        f.capture(0).unwrap();
+        warp(100, 70);
+        assert!(f.poll_cursor().contains(&(0, 0)));
+        assert!(
+            f.poll_cursor().contains(&(0, 0)),
+            "second poll forgot the drawn position"
         );
     }
 }
