@@ -259,7 +259,13 @@ impl Drop for XDamageMonitor {
 /// rectangle straddling the screen edge over-approximates by the clipped
 /// amount. Over-approximating costs a redundant tile; under-approximating
 /// would drop a changed tile from the frame.
-fn rect_to_tiles(x: i16, y: i16, width: u16, height: u16, out: &mut HashSet<(u32, u32)>) {
+pub(super) fn rect_to_tiles(
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    out: &mut HashSet<(u32, u32)>,
+) {
     let x = x.max(0) as u32;
     let y = y.max(0) as u32;
     let w = u32::from(width);

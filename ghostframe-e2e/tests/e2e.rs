@@ -389,8 +389,8 @@ async fn setup_e2e_firefox_inner(
 
 /// M1: Verify that captured pixels appear correctly in the browser.
 ///
-/// The server captures from the X11 root window (XGetImage fallback) since
-/// the test container uses the Xorg dummy driver which has no DRM device.
+/// The server captures the whole X11 root window (MIT-SHM `ShmGetImage`,
+/// `GetImage` when MIT-SHM is unavailable) from the container's Xorg.
 /// The test pattern app draws a red square at (100,100)-(300,300).
 #[tokio::test]
 async fn e2e_raw_frame_round_trip() -> Result<()> {

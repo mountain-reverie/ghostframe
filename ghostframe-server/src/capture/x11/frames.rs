@@ -17,15 +17,17 @@
 //! The root path never drew the cursor (X does not include it in an image).
 //! It is blended here from `XFixesGetCursorImage`, at `(x - xhot, y - yhot)`.
 
+use std::collections::HashSet;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+use crate::capture::x11::damage::rect_to_tiles;
 use crate::util::monotonic_now_ns;
 use ghostframe_lib::FrameSubmission;
 use x11rb::connection::Connection;
 use x11rb::protocol::shm::{self, ConnectionExt as ShmExt};
 use x11rb::protocol::xfixes::{ConnectionExt as XfixesExt, GetCursorImageReply};
-use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
+use x11rb::protocol::xproto::{ConnectionExt, ImageFormat, ImageOrder};
 use x11rb::rust_connection::RustConnection;
 
 /// Which request fills a frame.
@@ -44,20 +46,31 @@ struct ShmSegment {
     len: usize,
 }
 
+/// Why a segment could not be attached.
+enum AttachError {
+    /// memfd/ftruncate/mmap failed: local and possibly transient (memory
+    /// pressure), so the next resize tries again.
+    Os(io::Error),
+    /// The X server refused or the request could not be sent (BadAccess /
+    /// BadMatch on a remote display, fd passing failing over TCP): this
+    /// connection will never share memory.
+    X(io::Error),
+}
+
 impl ShmSegment {
     /// Create a `len`-byte memfd, map it, and attach it to the server
     /// writable (`ShmGetImage` writes into it).
-    fn attach(conn: &RustConnection, len: usize) -> io::Result<Self> {
+    fn attach(conn: &RustConnection, len: usize) -> Result<Self, AttachError> {
         // SAFETY: memfd_create takes a NUL-terminated name and flags only.
         let raw = unsafe { libc::memfd_create(c"ghostframe-shm".as_ptr(), libc::MFD_CLOEXEC) };
         if raw < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(AttachError::Os(io::Error::last_os_error()));
         }
         // SAFETY: `raw` is a fresh descriptor nothing else owns.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         // SAFETY: ftruncate on a descriptor we own.
         if unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) } != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(AttachError::Os(io::Error::last_os_error()));
         }
         // SAFETY: maps `len` bytes of a memfd just sized to `len`.
         let ptr = unsafe {
@@ -71,7 +84,7 @@ impl ShmSegment {
             )
         };
         if ptr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
+            return Err(AttachError::Os(io::Error::last_os_error()));
         }
         // Built before the attach so an error below still unmaps.
         let mut me = Self {
@@ -79,12 +92,14 @@ impl ShmSegment {
             ptr: ptr.cast(),
             len,
         };
-        me.seg = conn.generate_id().map_err(io::Error::other)?;
+        me.seg = conn
+            .generate_id()
+            .map_err(|e| AttachError::X(io::Error::other(e)))?;
         // x11rb sends the fd and closes our copy; the mapping keeps the memory.
         conn.shm_attach_fd(me.seg, fd, false)
-            .map_err(io::Error::other)?
+            .map_err(|e| AttachError::X(io::Error::other(e)))?
             .check()
-            .map_err(io::Error::other)?;
+            .map_err(|e| AttachError::X(io::Error::other(e)))?;
         Ok(me)
     }
 
@@ -116,6 +131,66 @@ pub struct X11Frames {
     shm_usable: bool,
     /// One-shot raw-frame dump target (`GHOSTFRAME_DUMP_FIRST_FRAME`); taken on first use.
     dump_first_frame: Option<String>,
+    /// The cursor as seen by the last `poll_cursor`, consumed by `capture`
+    /// so one frame uses one cursor query.
+    cursor: Option<GetCursorImageReply>,
+    /// Where the cursor was drawn as of the last poll.
+    last_cursor: Option<CursorRect>,
+}
+
+/// A cursor image's rectangle in root coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CursorRect {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+}
+
+impl CursorRect {
+    fn of(c: &GetCursorImageReply) -> Self {
+        Self {
+            x: i32::from(c.x) - i32::from(c.xhot),
+            y: i32::from(c.y) - i32::from(c.yhot),
+            w: u32::from(c.width),
+            h: u32::from(c.height),
+        }
+    }
+}
+
+/// Tiles to recompare because the cursor moved or changed: those under the
+/// previous and the current rectangle. X reports no damage for a pointer
+/// move or a cursor-image change, yet the cursor is blended into the frame,
+/// so without these a hinted comparison keeps a stale cursor until something
+/// else touches the tile. Clipped to the `screen_w` x `screen_h` grid.
+fn cursor_dirty_tiles(
+    prev: Option<CursorRect>,
+    cur: Option<CursorRect>,
+    screen_w: u32,
+    screen_h: u32,
+) -> Vec<(u32, u32)> {
+    let mut out = HashSet::new();
+    for r in [prev, cur].into_iter().flatten() {
+        // Clip to the screen in pixels first: only on-screen tiles exist,
+        // and the i16/u16 arguments of `rect_to_tiles` must not wrap.
+        let x0 = r.x.max(0) as u32;
+        let y0 = r.y.max(0) as u32;
+        let x1 = (i64::from(r.x) + i64::from(r.w)).clamp(0, i64::from(screen_w)) as u32;
+        let y1 = (i64::from(r.y) + i64::from(r.h)).clamp(0, i64::from(screen_h)) as u32;
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+        rect_to_tiles(
+            x0 as i16,
+            y0 as i16,
+            (x1 - x0) as u16,
+            (y1 - y0) as u16,
+            &mut out,
+        );
+    }
+    let mut v: Vec<_> = out.into_iter().collect();
+    v.sort_unstable();
+    v
 }
 
 impl X11Frames {
@@ -126,6 +201,7 @@ impl X11Frames {
         let screen = &conn.setup().roots[screen_num];
         let root = screen.root;
         let (width, height) = (screen.width_in_pixels, screen.height_in_pixels);
+        check_pixel_format(conn.setup(), screen.root_depth)?;
 
         // XFixes needs its version negotiated before GetCursorImage. Without
         // it the frame is still correct, minus the cursor.
@@ -143,6 +219,8 @@ impl X11Frames {
             shm: None,
             shm_usable,
             dump_first_frame,
+            cursor: None,
+            last_cursor: None,
         };
         me.ensure_segment();
         tracing::info!(width, height, path = ?me.path(), "X11 capture connected to display");
@@ -169,13 +247,27 @@ impl X11Frames {
             return;
         }
         if let Some(old) = self.shm.take() {
-            let _ = self.conn.shm_detach(old.seg);
+            // Checked, so a refusal is read here and not left in the event
+            // queue; the segment is going away either way.
+            if let Err(e) = self
+                .conn
+                .shm_detach(old.seg)
+                .map_err(io::Error::other)
+                .and_then(|c| c.check().map_err(io::Error::other))
+            {
+                tracing::debug!(error = %e, "MIT-SHM detach failed");
+            }
         }
         match ShmSegment::attach(&self.conn, len) {
             Ok(s) => self.shm = Some(s),
-            Err(e) => {
-                tracing::warn!(error = %e, "MIT-SHM segment attach failed; using GetImage(root)");
+            Err(AttachError::X(e)) => {
+                tracing::warn!(error = %e, "MIT-SHM segment attach refused; using GetImage(root)");
                 self.shm_usable = false;
+            }
+            Err(AttachError::Os(e)) => {
+                // Local and possibly transient: GetImage for now, and the
+                // next resize tries again.
+                tracing::warn!(error = %e, "MIT-SHM segment allocation failed; using GetImage(root) until the next resize");
             }
         }
     }
@@ -244,7 +336,36 @@ impl X11Frames {
             .map_err(io::Error::other)?
             .reply()
             .map_err(io::Error::other)?;
+        if reply.data.len() != want {
+            return Err(io::Error::other(format!(
+                "GetImage returned {} bytes for {w}x{h}, expected {want}",
+                reply.data.len()
+            )));
+        }
         Ok(reply.data)
+    }
+
+    fn query_cursor(&self) -> Option<GetCursorImageReply> {
+        self.conn
+            .xfixes_get_cursor_image()
+            .ok()
+            .and_then(|c| c.reply().ok())
+    }
+
+    /// Query the cursor for the next frame and return the tiles its
+    /// movement or image change dirtied (see [`cursor_dirty_tiles`]).
+    pub fn poll_cursor(&mut self) -> Vec<(u32, u32)> {
+        let cursor = self.query_cursor();
+        let cur = cursor.as_ref().map(CursorRect::of);
+        let tiles = cursor_dirty_tiles(
+            self.last_cursor,
+            cur,
+            u32::from(self.width),
+            u32::from(self.height),
+        );
+        self.last_cursor = cur;
+        self.cursor = cursor;
+        tiles
     }
 
     /// Capture a single frame: root, then the cursor on top.
@@ -252,15 +373,14 @@ impl X11Frames {
         self.refresh_geometry()?;
         let mut pixels = self.grab()?;
         // Best effort: without XFixes the frame is correct minus the cursor.
-        if let Ok(cookie) = self.conn.xfixes_get_cursor_image() {
-            if let Ok(cursor) = cookie.reply() {
-                blit_cursor(
-                    &mut pixels,
-                    i32::from(self.width),
-                    i32::from(self.height),
-                    &cursor,
-                );
-            }
+        let cursor = self.cursor.take().or_else(|| self.query_cursor());
+        if let Some(cursor) = cursor {
+            blit_cursor(
+                &mut pixels,
+                i32::from(self.width),
+                i32::from(self.height),
+                &cursor,
+            );
         }
         let capture_done_ns = monotonic_now_ns();
         let width = u32::from(self.width);
@@ -293,6 +413,37 @@ impl X11Frames {
             );
         }
         Ok(frame)
+    }
+}
+
+/// Refuse a display whose root is not little-endian 32 bits per pixel.
+///
+/// Everything downstream reads BGRX at `width * 4` per row. A 16 bpp root
+/// returns half-size images and used to panic `blit_cursor`; fail at connect
+/// with a message instead.
+fn check_pixel_format(setup: &x11rb::protocol::xproto::Setup, root_depth: u8) -> io::Result<()> {
+    let unsupported = |msg: String| io::Error::new(io::ErrorKind::Unsupported, msg);
+    if setup.image_byte_order != ImageOrder::LSB_FIRST {
+        return Err(unsupported(
+            "X server image byte order is MSB-first; only LSB-first (BGRX) roots are supported"
+                .into(),
+        ));
+    }
+    if root_depth != 24 && root_depth != 32 {
+        return Err(unsupported(format!(
+            "X root depth is {root_depth}; capture needs 24 (or 32). \
+             Start the X server with a 24-bit screen"
+        )));
+    }
+    match setup.pixmap_formats.iter().find(|f| f.depth == root_depth) {
+        Some(f) if f.bits_per_pixel == 32 => Ok(()),
+        Some(f) => Err(unsupported(format!(
+            "X root depth {root_depth} is stored at {} bits per pixel; capture needs 32",
+            f.bits_per_pixel
+        ))),
+        None => Err(unsupported(format!(
+            "X server lists no pixmap format for root depth {root_depth}"
+        ))),
     }
 }
 
@@ -431,6 +582,81 @@ mod tests {
         }
     }
 
+    fn px_cursor(x: i16, y: i16, w: u16, h: u16, argb: u32) -> GetCursorImageReply {
+        GetCursorImageReply {
+            x,
+            y,
+            width: w,
+            height: h,
+            cursor_image: vec![argb; usize::from(w) * usize::from(h)],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn blit_cursor_clips_at_the_top_left_corner() {
+        // Pointer at (-1,-1), no hotspot: only the cursor's bottom-right
+        // pixel is on screen.
+        let mut target = vec![0u8; 4 * 4 * 4];
+        blit_cursor(&mut target, 4, 4, &px_cursor(-1, -1, 2, 2, 0xffff_ffff));
+        for (i, px) in target.chunks_exact(4).enumerate() {
+            let want: &[u8] = if i == 0 { &[255; 4] } else { &[0; 4] };
+            assert_eq!(px, want, "pixel index {i}");
+        }
+    }
+
+    #[test]
+    fn blit_cursor_larger_than_the_target_is_clipped_not_overrun() {
+        // 2x the target in both dimensions: every target pixel is covered,
+        // and nothing writes past the buffer.
+        let mut target = vec![0u8; 3 * 2 * 4];
+        blit_cursor(&mut target, 3, 2, &px_cursor(0, 0, 6, 4, 0xffff_ffff));
+        assert_eq!(target, vec![255u8; 3 * 2 * 4]);
+    }
+
+    #[test]
+    fn blit_cursor_keeps_colour_channels_in_bgra_order() {
+        // Opaque ARGB 0xff_11_22_33: R=0x11, G=0x22, B=0x33; BGRA in memory.
+        let mut target = vec![0u8; 4];
+        blit_cursor(&mut target, 1, 1, &px_cursor(0, 0, 1, 1, 0xff11_2233));
+        assert_eq!(target, [0x33, 0x22, 0x11, 0xff]);
+    }
+
+    fn rect(x: i32, y: i32, w: u32, h: u32) -> CursorRect {
+        CursorRect { x, y, w, h }
+    }
+
+    #[test]
+    fn a_moved_cursor_dirties_the_tiles_it_left_and_the_ones_it_entered() {
+        // 32 px tiles. Old rect in tile (0,0); new rect in tile (3,2).
+        let t = cursor_dirty_tiles(Some(rect(2, 2, 8, 8)), Some(rect(100, 70, 8, 8)), 256, 256);
+        assert_eq!(t, vec![(0, 0), (3, 2)]);
+    }
+
+    #[test]
+    fn a_cursor_straddling_tiles_dirties_all_of_them_and_is_clipped_to_the_screen() {
+        let t = cursor_dirty_tiles(None, Some(rect(28, 28, 8, 8)), 256, 256);
+        assert_eq!(t, vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
+        // Hanging off the top-left and past the bottom-right: only real tiles.
+        let t = cursor_dirty_tiles(
+            Some(rect(-4, -4, 8, 8)),
+            Some(rect(250, 250, 20, 20)),
+            256,
+            256,
+        );
+        assert_eq!(t, vec![(0, 0), (7, 7)]);
+        // Entirely off screen: nothing.
+        assert!(cursor_dirty_tiles(None, Some(rect(-50, 0, 8, 8)), 256, 256).is_empty());
+    }
+
+    #[test]
+    fn a_resized_cursor_image_dirties_the_old_and_new_extent() {
+        // Same hotspot-adjusted origin, bigger image: old rect in one tile,
+        // new rect reaching the next.
+        let t = cursor_dirty_tiles(Some(rect(0, 0, 8, 8)), Some(rect(0, 0, 40, 8)), 256, 256);
+        assert_eq!(t, vec![(0, 0), (1, 0)]);
+    }
+
     #[test]
     fn blit_cursor_blends_premultiplied_alpha() {
         // 50% black over white: out = 0 + 255 * (255 - 128) / 255 = 127.
@@ -461,22 +687,26 @@ mod live_tests {
 
     /// Paint a deterministic, non-uniform image into root.
     fn paint_root(display: &str) {
+        paint_root_sized(display, W, H);
+    }
+
+    fn paint_root_sized(display: &str, w: u16, h: u16) {
         let (conn, n) = x11rb::connect(Some(display)).unwrap();
         let screen = &conn.setup().roots[n];
         let gc = conn.generate_id().unwrap();
         conn.create_gc(gc, screen.root, &CreateGCAux::new())
             .unwrap();
-        let mut data = vec![0u8; usize::from(W) * usize::from(H) * 4];
+        let mut data = vec![0u8; usize::from(w) * usize::from(h) * 4];
         for (i, px) in data.chunks_exact_mut(4).enumerate() {
-            let (x, y) = (i % usize::from(W), i / usize::from(W));
+            let (x, y) = (i % usize::from(w), i / usize::from(w));
             px.copy_from_slice(&[(x * 7) as u8, (y * 5) as u8, (x ^ y) as u8, 0]);
         }
         conn.put_image(
             ImageFormat::Z_PIXMAP,
             screen.root,
             gc,
-            W,
-            H,
+            w,
+            h,
             0,
             0,
             0,
@@ -488,9 +718,13 @@ mod live_tests {
     }
 
     fn root_get_image(display: &str) -> Vec<u8> {
+        root_get_image_sized(display, W, H)
+    }
+
+    fn root_get_image_sized(display: &str, w: u16, h: u16) -> Vec<u8> {
         let (conn, n) = x11rb::connect(Some(display)).unwrap();
         let s = &conn.setup().roots[n];
-        conn.get_image(ImageFormat::Z_PIXMAP, s.root, 0, 0, W, H, !0)
+        conn.get_image(ImageFormat::Z_PIXMAP, s.root, 0, 0, w, h, !0)
             .unwrap()
             .reply()
             .unwrap()
@@ -563,5 +797,99 @@ mod live_tests {
             }
         }
         assert!(changed > 0, "the cursor was not drawn");
+    }
+
+    /// Resize the root of `display` the way `xrandr --fb` does: disable the
+    /// CRTC (it would not fit), then set the screen size.
+    fn set_root_size(display: &str, w: u16, h: u16) {
+        use x11rb::protocol::randr::{self, ConnectionExt as _};
+        let (conn, n) = x11rb::connect(Some(display)).unwrap();
+        let root = conn.setup().roots[n].root;
+        let res = conn
+            .randr_get_screen_resources(root)
+            .unwrap()
+            .reply()
+            .unwrap();
+        for crtc in &res.crtcs {
+            conn.randr_set_crtc_config(
+                *crtc,
+                x11rb::CURRENT_TIME,
+                res.config_timestamp,
+                0,
+                0,
+                0,
+                randr::Rotation::ROTATE0,
+                &[],
+            )
+            .unwrap()
+            .reply()
+            .unwrap();
+        }
+        conn.randr_set_screen_size(root, w, h, 10, 10)
+            .unwrap()
+            .check()
+            .unwrap();
+        conn.get_input_focus().unwrap().reply().unwrap();
+    }
+
+    /// The segment must follow the root size across shrinks and growth.
+    /// Connecting after a shrink makes the segment smaller than the root's
+    /// later sizes, so a segment that is not re-created fails the grab.
+    #[test]
+    fn the_segment_follows_a_shrinking_and_growing_root() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "64x48x24"]);
+        set_root_size(x.display(), 32, 24);
+        let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
+        assert_eq!(f.path(), GrabPath::Shm);
+
+        for (w, h) in [(64u16, 48u16), (32, 24), (64, 48)] {
+            set_root_size(x.display(), w, h);
+            paint_root_sized(x.display(), w, h);
+            let frame = f.capture(0).unwrap();
+            assert_eq!((frame.width, frame.height), (u32::from(w), u32::from(h)));
+            assert_eq!(frame.pixels.len(), usize::from(w) * usize::from(h) * 4);
+            assert_eq!(f.path(), GrabPath::Shm, "after resizing to {w}x{h}");
+            let plain = f.grab().unwrap();
+            assert!(plain.iter().any(|&b| b != 0), "root not painted at {w}x{h}");
+            assert_eq!(plain, root_get_image_sized(x.display(), w, h), "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn a_16_bit_root_is_refused_at_connect() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "64x48x16"]);
+        let err = X11Frames::connect(Some(x.display()), None)
+            .err()
+            .expect("a 16 bpp root must not connect");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("root depth is 16"), "{err}");
+    }
+
+    /// A pointer warp raises no damage event; `poll_cursor` is the only
+    /// thing that reports the tiles it left and entered.
+    #[test]
+    fn poll_cursor_reports_the_tiles_of_a_warped_pointer() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "128x96x24"]);
+        let (conn, n) = x11rb::connect(Some(x.display())).unwrap();
+        let root = conn.setup().roots[n].root;
+        let warp = |px: i16, py: i16| {
+            conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, px, py)
+                .unwrap();
+            conn.get_input_focus().unwrap().reply().unwrap();
+        };
+        let tile_of = |px: i16, py: i16| ((px as u32) / 32, (py as u32) / 32);
+        warp(10, 10);
+        let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
+        f.poll_cursor();
+        warp(100, 70);
+        let tiles = f.poll_cursor();
+        assert!(
+            tiles.contains(&tile_of(10, 10)),
+            "left tile missing: {tiles:?}"
+        );
+        assert!(
+            tiles.contains(&tile_of(100, 70)),
+            "entered tile missing: {tiles:?}"
+        );
     }
 }
