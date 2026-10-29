@@ -20,7 +20,7 @@ use crate::transport::peer_auth::{GateCheck, PeerGate, PeerIdentitySource, PeerL
 
 /// SHA-256 fingerprint of the self-signed certificate.
 ///
-/// Printed by the xdaemon at startup (`CERT_HASH_SHA256=<hex>`) so the E2E
+/// Printed by the ghostframe-server at startup (`CERT_HASH_SHA256=<hex>`) so the E2E
 /// test and the browser client can pin the certificate via `certificateHashes`.
 pub struct CertInfo {
     /// Hash of the certificate that was current when the server was built.

@@ -298,7 +298,7 @@ impl GpuFrameProcessor {
     /// host memory into a transient HOST_VISIBLE LINEAR STORAGE VkImage and
     /// runs the same SAD/NV12/classifier pipeline as the DMA-BUF path.
     ///
-    /// Used by the `xdaemon`'s modesetting-FB capture path when DMA-BUF cross-
+    /// Used by the `ghostframe-server`'s modesetting-FB capture path when DMA-BUF cross-
     /// device import is unreliable (e.g. VKMS exporter → discrete-GPU importer).
     pub(super) unsafe fn process_frame_inner_from_pixels(
         &mut self,

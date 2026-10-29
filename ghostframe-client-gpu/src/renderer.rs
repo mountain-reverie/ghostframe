@@ -641,7 +641,7 @@ impl Renderer {
     ///   shaders, and the export is a red herring.
     ///
     /// PPM because it needs no dependency and every viewer opens it;
-    /// `ghostframe-xdaemon` pulls in a PNG encoder for its own capture dump,
+    /// `ghostframe-server` pulls in a PNG encoder for its own capture dump,
     /// but that is a server-side cost and this is a library.
     fn maybe_dump_framebuffer(&mut self, ctx: &WgpuContext) {
         let Some(prefix) = self.dump.frame_prefix.clone() else {

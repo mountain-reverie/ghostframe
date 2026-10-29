@@ -1,4 +1,4 @@
-//! Every environment variable `ghostframe-xdaemon` reads, parsed once.
+//! Every environment variable `ghostframe-server` reads, parsed once.
 //!
 //! `XdaemonConfig::from_env()` is called once at the top of `main()` and the
 //! result is passed down. This is the only file in the crate allowed to touch
@@ -91,7 +91,7 @@ impl XdaemonConfig {
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
         // The two dump knobs write captured screen contents to a path the
         // environment names. They are honoured only in a test build; the
-        // release daemon ignores them. xdaemon has no cargo features of its
+        // release daemon ignores them. ghostframe-server has no cargo features of its
         // own, so it follows the lib's `test-loss-injection`, which the e2e
         // image enables and `ci/check-release-features.sh` forbids in a
         // release build.

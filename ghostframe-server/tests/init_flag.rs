@@ -1,4 +1,4 @@
-//! Integration tests for ghostframe-xdaemon's --init flag and TS_AUTHKEY
+//! Integration tests for ghostframe-server's --init flag and TS_AUTHKEY
 //! optionality. These run the binary as a subprocess with empty/seeded state
 //! directories and verify the pre-tsnet error paths. A real --init that joins
 //! a tsnet control server is exercised by the e2e harness.
@@ -8,12 +8,12 @@ use std::process::Command;
 
 fn binary_path() -> PathBuf {
     // `cargo test` sets CARGO_BIN_EXE_<name> to the integration-test binary.
-    PathBuf::from(env!("CARGO_BIN_EXE_ghostframe-xdaemon"))
+    PathBuf::from(env!("CARGO_BIN_EXE_ghostframe-server"))
 }
 
 fn unique_tmp(label: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!(
-        "ghostframe-xdaemon-test-{label}-{}-{}",
+        "ghostframe-server-test-{label}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -34,7 +34,7 @@ fn errors_when_no_authkey_and_empty_state_dir() {
         .env("TS_STATE_DIR", &state)
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .output()
-        .expect("spawn xdaemon");
+        .expect("spawn ghostframe-server");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr was: {stderr}");
     assert!(
@@ -53,7 +53,7 @@ fn errors_when_init_flag_set_but_no_authkey() {
         .env("TS_STATE_DIR", &state)
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .output()
-        .expect("spawn xdaemon");
+        .expect("spawn ghostframe-server");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr was: {stderr}");
     assert!(
@@ -73,7 +73,7 @@ fn refuses_world_accessible_state_dir() {
         .env("TS_AUTHKEY", "tskey-auth-not-used")
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .output()
-        .expect("spawn xdaemon");
+        .expect("spawn ghostframe-server");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr was: {stderr}");
     assert!(stderr.contains("chmod 700"), "stderr was: {stderr}");

@@ -152,7 +152,7 @@ pub fn invalidate() {
 }
 
 /// `DMA_BUF_IOCTL_SYNC` bracket around CPU reads. Errors are ignored, as in
-/// `ghostframe-xdaemon/src/drm_capture.rs`: it is a best-effort cache
+/// `ghostframe-server/src/drm_capture.rs`: it is a best-effort cache
 /// maintenance step and plain system memory is coherent without it. Returns
 /// whether the ioctl succeeded so the caller can keep START/END balanced
 /// (no END after a failed START).

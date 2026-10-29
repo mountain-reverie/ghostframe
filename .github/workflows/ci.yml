@@ -130,11 +130,11 @@ jobs:
       # does the same through the frame backend.
       # `invalidate_baseline_keeps_the_longer_cushion` needs a real device too.
       - run: "cargo test --workspace --lib -- --skip dmabuf_real_ --skip gpu_pipeline::fallback_tests:: --skip gpu_backend_pre_encodes_ --skip invalidate_baseline_keeps_the_longer_cushion"
-      # --lib skips binary crates entirely, so ghostframe-xdaemon's tests (the
+      # --lib skips binary crates entirely, so ghostframe-server's tests (the
       # display clamp, the capture resize logic) and codec_report's ran nowhere
       # in CI. No hardware needed.
       #
-      # Under xvfb-run because ghostframe-xdaemon's xdamage tests need a real
+      # Under xvfb-run because ghostframe-server's xdamage tests need a real
       # X server: they arm and disarm a Damage object and assert that damage
       # actually flows, which is the only way to catch an arm that silently
       # stops reporting. A runtime self-skip was the alternative and is worse
@@ -170,10 +170,10 @@ jobs:
       # The workspace build unifies ghostframe-e2e's test features (via
       # ghostframe-bench) into the daemon, so rebuild it alone, as
       # `just build-release` does, and check that one. Mirrors `just ci-local`.
-      - run: cargo build --release -p ghostframe-xdaemon
+      - run: cargo build --release -p ghostframe-server
       - name: release daemon carries no test-only feature
         run: |
-          if grep -aq 'software Vulkan permitted (test build)' target/release/ghostframe-xdaemon; then echo "::error::release ghostframe-xdaemon contains the software-Vulkan test-build literal"; exit 1; fi
+          if grep -aq 'software Vulkan permitted (test build)' target/release/ghostframe-server; then echo "::error::release ghostframe-server contains the software-Vulkan test-build literal"; exit 1; fi
           ci/check-release-binary.sh
 
   web-client:

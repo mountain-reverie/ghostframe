@@ -10,7 +10,7 @@
 //! has no browser and no GPU.
 //!
 //! The browser e2e has the opposite shape: real Chromium, real WebGPU, real
-//! xdaemon in a container, real QUIC over a real (local) tailnet -- and no
+//! ghostframe-server in a container, real QUIC over a real (local) tailnet -- and no
 //! shaping at all. Its RTT is ~0 and its bandwidth is a loopback bridge,
 //! which is nothing like the tailnet path a production session runs over.
 //!

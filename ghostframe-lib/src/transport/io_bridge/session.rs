@@ -76,7 +76,7 @@ impl IoBridge {
     ///
     /// Called from `compute_max_datagram_size` (so the count is fresh every
     /// frame submission) AND from the run-loop's event drain (so a freshly
-    /// established session unblocks xdaemon's gate even before the first
+    /// established session unblocks ghostframe-server's gate even before the first
     /// frame is submitted — without this hook, no frame ever flows because
     /// the gate stays at 0 until a frame submission updates it, which can't
     /// happen until the gate opens. Classic bootstrap deadlock).

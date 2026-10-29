@@ -12,7 +12,7 @@ members = [
     "ghostframe-client-h264",
     "ghostframe-cli",
     "ghostframe-lib",
-    "ghostframe-xdaemon",
+    "ghostframe-server",
     "ghostframe-test-pattern",
     "ghostframe-e2e",
     "ghostframe-bench",

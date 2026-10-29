@@ -3,7 +3,7 @@
 //! A handful of decisions here are load-bearing enough to spell out once,
 //! rather than leave implicit in the code below:
 //!
-//! - **`XCBConnection`, not `RustConnection`.** `ghostframe-xdaemon` (the
+//! - **`XCBConnection`, not `RustConnection`.** `ghostframe-server` (the
 //!   server side) uses x11rb's pure-Rust `RustConnection`, which has no
 //!   `libxcb` dependency. This backend cannot: keycode -> keysym
 //!   translation goes through `xkbcommon-x11`
@@ -13,7 +13,7 @@
 //!   `as-raw-xcb-connection`. This is the same choice other Rust X11
 //!   clients that need XKB make (e.g. winit's x11 backend) -- it is not
 //!   specific to this crate's needs, but it is a real, new runtime
-//!   dependency on `libxcb.so` that `ghostframe-xdaemon` does not have.
+//!   dependency on `libxcb.so` that `ghostframe-server` does not have.
 //!
 //! - **Fullscreen before the first map.** [`X11Backend::open`] sets
 //!   `_NET_WM_STATE` to `_NET_WM_STATE_FULLSCREEN` via `change_property`

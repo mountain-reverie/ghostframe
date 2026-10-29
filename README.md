@@ -9,7 +9,7 @@ There are two halves, and you do not need both:
 
 | | What it is | Build |
 | --- | --- | --- |
-| **Server** | `ghostframe-xdaemon` — headless Xorg, capture, encode, tailnet. Serves the browser client itself. | [Install](#install) |
+| **Server** | `ghostframe-server` — headless Xorg, capture, encode, tailnet. Serves the browser client itself. | [Install](#install) |
 | **Native client** | `ghostframe` — a Linux desktop client. No browser, no server. | [Native client](#native-client) |
 
 Any device on the tailnet can also just open the server's URL in Chrome —
@@ -116,7 +116,7 @@ sudo reboot
 
 After reboot, the configured user is automatically logged in on `tty1`,
 Xorg comes up on display `:1`, Enlightenment starts inside that session,
-and `ghostframe-xdaemon` joins the tailnet and starts capturing.
+and `ghostframe-server` joins the tailnet and starts capturing.
 
 ## Attach Mode
 
@@ -222,7 +222,7 @@ sudo ./packaging/install.sh <user> --mode attach
 #    no reboot is necessary — the changes take effect immediately.
 ```
 
-After the install completes, `ghostframe-xdaemon` is installed as a user service
+After the install completes, `ghostframe-server` is installed as a user service
 for the specified account. It will start automatically on the next login, or can
 be started immediately if already logged in.
 
@@ -336,14 +336,14 @@ under `/etc/systemd/system/` has no effect on a user unit), then restart
 the daemon:
 
 ```bash
-sudo mkdir -p ~<user>/.config/systemd/user/ghostframe-xdaemon.service.d
-sudo tee ~<user>/.config/systemd/user/ghostframe-xdaemon.service.d/allowed-users.conf <<'CONF'
+sudo mkdir -p ~<user>/.config/systemd/user/ghostframe-server.service.d
+sudo tee ~<user>/.config/systemd/user/ghostframe-server.service.d/allowed-users.conf <<'CONF'
 [Service]
 Environment=GHOSTFRAME_ALLOWED_USERS=alice@example.com,tag:ops
 CONF
-sudo chown -R <user>: ~<user>/.config/systemd/user/ghostframe-xdaemon.service.d
+sudo chown -R <user>: ~<user>/.config/systemd/user/ghostframe-server.service.d
 sudo machinectl shell <user>@ /usr/bin/systemctl --user daemon-reload
-sudo machinectl shell <user>@ /usr/bin/systemctl --user restart ghostframe-xdaemon.service
+sudo machinectl shell <user>@ /usr/bin/systemctl --user restart ghostframe-server.service
 ```
 
 The startup log names the owner and the list in effect. A malformed entry

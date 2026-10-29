@@ -15,7 +15,7 @@
 //!
 //! Painting on every loop iteration (the naïve approach) introduced a
 //! race window: between the BG fill and the FG glyph paint the buffer
-//! contained a partially-painted frame.  If xdaemon captured during that
+//! contained a partially-painted frame.  If ghostframe-server captured during that
 //! window the GPU saw all-BG tiles, classified them as Solid, and the
 //! client rendered BG at every ink position.  Painting once eliminates the
 //! race entirely.

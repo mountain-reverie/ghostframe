@@ -48,7 +48,7 @@ impl XrandrDisplay {
     /// present, and pick the first connected output with an available CRTC.
     ///
     /// Errors if no DISPLAY, RandR is missing, or there is no connected
-    /// output -- the caller (xdaemon's `main`) logs and continues with no
+    /// output -- the caller (ghostframe-server's `main`) logs and continues with no
     /// display controller, exactly like `XTestInjector::new`.
     pub fn new(max_resolution: Option<String>) -> anyhow::Result<Self> {
         use anyhow::{anyhow, Context};

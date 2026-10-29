@@ -1,5 +1,5 @@
 [package]
-name = "ghostframe-xdaemon"
+name = "ghostframe-server"
 version = "0.1.0"
 edition = "2021"
 

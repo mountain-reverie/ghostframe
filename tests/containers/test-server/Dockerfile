@@ -111,7 +111,7 @@ ENV RUST_MIN_STACK=16777216
 # extracts) all of it, windows-only crates included, in the final step.
 COPY --from=planner /build/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json \
-        -p ghostframe-xdaemon -p ghostframe-test-pattern \
+        -p ghostframe-server -p ghostframe-test-pattern \
         --features ghostframe-lib/test-loss-injection,ghostframe-lib/cdf53-diag,ghostframe-lib/allow-software-vulkan \
     && cargo fetch --locked
 
@@ -129,7 +129,7 @@ RUN cd ghostbridge && go build -tags noweb -buildmode=c-archive -o /tmp/warm.a .
 # Copy workspace files for dependency caching
 COPY Cargo.toml Cargo.lock ./
 COPY ghostframe-lib/Cargo.toml ghostframe-lib/Cargo.toml
-COPY ghostframe-xdaemon/Cargo.toml ghostframe-xdaemon/Cargo.toml
+COPY ghostframe-server/Cargo.toml ghostframe-server/Cargo.toml
 COPY ghostframe-test-pattern/Cargo.toml ghostframe-test-pattern/Cargo.toml
 # ghostframe-lib depends on ghostframe-protocol, so its full source is needed.
 COPY ghostframe-protocol/ ghostframe-protocol/
@@ -171,12 +171,12 @@ COPY ghostframe-bench/Cargo.toml ghostframe-bench/Cargo.toml
 # library declares `pub mod fixtures;` which expects fixtures/ on disk.
 COPY ghostframe-bench/src/ ghostframe-bench/src/
 # Cargo.toml declares [[bench]] targets; the .rs files must exist for the
-# manifest to parse, even though they aren't compiled by `-p ghostframe-xdaemon`.
+# manifest to parse, even though they aren't compiled by `-p ghostframe-server`.
 COPY ghostframe-bench/benches/ ghostframe-bench/benches/
 
 # Copy full source
 COPY ghostframe-lib/ ghostframe-lib/
-COPY ghostframe-xdaemon/ ghostframe-xdaemon/
+COPY ghostframe-server/ ghostframe-server/
 COPY ghostframe-test-pattern/ ghostframe-test-pattern/
 
 # ghostbridge //go:embeds ghostframe-web-client/dist/ at compile time.
@@ -200,9 +200,9 @@ COPY ghostframe-web-client/dist/ ghostframe-web-client/dist/
 # ci/check-test-features.sh and ci-local prove it reached no other. The
 # binaries stay in /build/target for the runtime stage to COPY.
 RUN find /build -path /build/target -prune -o -type f -print0 | xargs -0 touch \
-    && cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern \
+    && cargo build --release -p ghostframe-server -p ghostframe-test-pattern \
         --features ghostframe-lib/test-loss-injection,ghostframe-lib/cdf53-diag,ghostframe-lib/allow-software-vulkan \
-    && grep -aq 'software Vulkan permitted (test build)' target/release/ghostframe-xdaemon
+    && grep -aq 'software Vulkan permitted (test build)' target/release/ghostframe-server
 
 # Stage 2: Runtime image
 FROM ubuntu:24.04
@@ -229,7 +229,7 @@ RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install
     libx264-164 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/ghostframe-xdaemon /usr/local/bin/ghostframe-xdaemon
+COPY --from=builder /build/target/release/ghostframe-server /usr/local/bin/ghostframe-server
 COPY --from=builder /build/target/release/ghostframe-test-pattern /usr/local/bin/ghostframe-test-pattern
 COPY tests/containers/test-server/entrypoint.sh /entrypoint.sh
 COPY tests/containers/test-server/xorg.conf /etc/X11/xorg.conf

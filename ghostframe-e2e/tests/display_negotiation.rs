@@ -15,7 +15,7 @@
 //! (`ghostframe-lib/src/transport/display.rs`), the debounce + clamp +
 //! width-alignment dispatch logic (`ghostframe-lib/src/transport/
 //! io_bridge.rs`), and `XrandrDisplay::set_output`'s RandR sequencing
-//! (`ghostframe-xdaemon/src/display.rs`). None of those tests drive a real
+//! (`ghostframe-server/src/display.rs`). None of those tests drive a real
 //! Xorg server, so none of them can tell us whether the RandR calls this
 //! milestone assembled actually change what a client sees. This test is
 //! the one place that finds out. If it goes red, that is a finding about
@@ -227,7 +227,7 @@ async fn client_requests_a_mode_and_the_server_actually_applies_it() {
 /// and Xorg falls back to that) a hard framebuffer ceiling, or merely the
 /// *initial* size that RandR can grow past?
 ///
-/// `XrandrDisplay::ceiling()` (`ghostframe-xdaemon/src/display.rs`) queries
+/// `XrandrDisplay::ceiling()` (`ghostframe-server/src/display.rs`) queries
 /// `GetScreenSizeRange`, which on the dev box reports `16384x16384`
 /// regardless of `Virtual` -- so the driver's advertised *capability* is
 /// not the limit. What's untested is whether a `SetScreenSize` call that

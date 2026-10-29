@@ -165,7 +165,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The in-container cargo build of ghostframe-xdaemon + e2e deps
+      # The in-container cargo build of ghostframe-server + e2e deps
       # produces ~5 GB of release artefacts. With the runner's default
       # ~14 GB free disk, docker image export runs out of space at the
       # final layer. Strip preinstalled toolchains we don't need (Android

@@ -9,16 +9,16 @@ test harness that Task 9/11 builds out.
 - A Tailscale account with a reusable pre-auth key
   (https://login.tailscale.com/admin/settings/keys).
 - A Chromium-based browser (Chrome, Chromium, Edge).
-- The ghostframe workspace built: `cargo build --release -p ghostframe-xdaemon`.
+- The ghostframe workspace built: `cargo build --release -p ghostframe-server`.
 - The web client built: `cd ghostframe-web-client && npm install && npm run build`.
 
-## 1. Start the xdaemon
+## 1. Start the ghostframe-server
 
 ```bash
 export TS_AUTHKEY=tskey-auth-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 export TS_HOSTNAME=ghostframe-m0-dev
 export TS_STATE_DIR=/tmp/ghostframe-ts-m0-dev
-./target/release/ghostframe-xdaemon
+./target/release/ghostframe-server
 ```
 
 The daemon joins the tailnet and prints a line like:
@@ -72,10 +72,10 @@ tailnet hostname.
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | `WebTransport is not defined` | Browser too old. | Use Chrome/Chromium 97+ or Edge 97+. |
-| `net::ERR_QUIC_PROTOCOL_ERROR` | Cert hash wrong or missing. | Re-copy from the xdaemon stdout line. |
+| `net::ERR_QUIC_PROTOCOL_ERROR` | Cert hash wrong or missing. | Re-copy from the ghostframe-server stdout line. |
 | `net::ERR_CERT_DATE_INVALID` | Server cert expired; we use `generate_simple_self_signed` which issues a long-lived cert, but clock skew can still trip this. | Check system clock. |
 | Page loads but never reaches `Connected`. | The daemon did not fully join the tailnet or magicDNS has not propagated. | Wait 5–10s and retry. Run `tailscale status` on another node to confirm the daemon is visible. |
-| Firewall blocks UDP to tailnet IP. | Host firewall rule. | Tailscale uses UDP on ephemeral ports; make sure `ghostframe-xdaemon` is not blocked. |
+| Firewall blocks UDP to tailnet IP. | Host firewall rule. | Tailscale uses UDP on ephemeral ports; make sure `ghostframe-server` is not blocked. |
 | "Sent: ping" but no pong. | Either the daemon is not processing the datagram, or the browser is reading datagrams from a different session. | Check `TS_AUTHKEY` permissions; check `RUST_LOG=ghostframe=debug` output for `"ping received, sending pong"`. |
 
 ## What this smoke test proves

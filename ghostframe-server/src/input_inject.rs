@@ -31,7 +31,7 @@ pub struct XTestInjector {
 impl XTestInjector {
     /// Connect to the local X server and confirm the XTEST extension is
     /// present. Errors if no DISPLAY or XTEST is missing — the caller
-    /// (xdaemon's main) logs and continues with no injector.
+    /// (ghostframe-server's main) logs and continues with no injector.
     pub fn new(display: Option<&str>) -> Result<Self> {
         let display_env = display.unwrap_or("<unset>").to_string();
         let (conn, screen_num) =

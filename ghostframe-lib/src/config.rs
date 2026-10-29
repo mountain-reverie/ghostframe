@@ -879,7 +879,7 @@ pub(crate) fn no_rto() -> bool {
 }
 
 /// Whether this build of `ghostframe-lib` was compiled with its test knobs
-/// (`test-loss-injection`). Lets `ghostframe-xdaemon`, which has no features
+/// (`test-loss-injection`). Lets `ghostframe-server`, which has no features
 /// of its own, gate its dump env vars on the same switch. A function rather
 /// than a `pub const` so it stays out of the generated C header.
 pub fn test_knobs_compiled() -> bool {

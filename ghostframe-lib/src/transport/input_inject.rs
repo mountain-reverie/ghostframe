@@ -60,7 +60,7 @@ pub enum InputMsg {
 }
 
 /// Abstract handle the I/O layer uses to inject events into a windowing
-/// system. Production impl lives in `ghostframe-xdaemon` (X11 via
+/// system. Production impl lives in `ghostframe-server` (X11 via
 /// `x11rb`'s `xtest`); test bridges pass `None` and skip injection.
 pub trait InputInjector: Send + Sync {
     fn pointer_move(&self, x: i16, y: i16);

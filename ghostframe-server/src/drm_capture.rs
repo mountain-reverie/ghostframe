@@ -52,11 +52,11 @@
 //!   to RandR and therefore cannot be leased through the X server.
 //! * **Direct kernel `drmModeCreateLease`** — must be called by the
 //!   master, so requires a cooperating compositor.
-//! * **Run xdaemon without Xorg** — xdaemon becomes master, sets its own
+//! * **Run ghostframe-server without Xorg** — ghostframe-server becomes master, sets its own
 //!   modeset on the Virtual connector, and applications render directly
-//!   into a buffer xdaemon owns. Architecturally invasive.
+//!   into a buffer ghostframe-server owns. Architecturally invasive.
 //!
-//! On real hardware where xdaemon is the only DRM client (e.g. headless
+//! On real hardware where ghostframe-server is the only DRM client (e.g. headless
 //! servers without an X server), the writeback path works as designed.
 
 use crate::util::monotonic_now_ns;

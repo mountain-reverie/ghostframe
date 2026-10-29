@@ -68,7 +68,7 @@ web-transport-proto = { workspace = true }
 # acceptance tests). Deliberately a DEV-dependency: making it a normal one
 # pulls ghostframe-client-gpu into the normal dependency graph, and the e2e
 # test-server container image then compiles it during
-# `cargo build -p ghostframe-xdaemon -p ghostframe-test-pattern` -- where
+# `cargo build -p ghostframe-server -p ghostframe-test-pattern` -- where
 # `shaders/` is not copied, so every `include_str!` fails and the image
 # build dies. That is how CI broke on PR #96.
 ghostframe-client-native = { path = "../ghostframe-client-native" }

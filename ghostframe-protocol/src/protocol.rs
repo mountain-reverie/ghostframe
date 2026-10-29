@@ -121,7 +121,7 @@ pub struct DatagramHeader {
     /// long left the in-flight set.
     pub wire_seq: u32,
     /// **For frame (full-image H.264) datagrams:** capture time of the
-    /// originating frame in microseconds, propagated from xdaemon. Used for
+    /// originating frame in microseconds, propagated from ghostframe-server. Used for
     /// end-to-end latency bench metrics.
     ///
     /// **For tile datagrams (`TILE_DATAGRAM_FLAG` set in `frame_seq`):**

@@ -57,7 +57,7 @@ thiserror = { workspace = true }
 # `web-embed`: this is the server half, so the ghostbridge archive it links
 # must carry the browser SPA. The feature is off by default so the native
 # client can link the same crate without building the web client; enabling
-# it here is what keeps `ghostframe-xdaemon` serving a real client.
+# it here is what keeps `ghostframe-server` serving a real client.
 ghostframe-tsnet = { path = "../ghostframe-tsnet", features = ["web-embed"] }
 tracing = { workspace = true }
 rustls = { workspace = true, features = ["aws_lc_rs", "ring"] }
