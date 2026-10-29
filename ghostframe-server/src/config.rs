@@ -20,8 +20,6 @@
 //! | `TS_AUTHKEY` | tsnet auth key (needed for `--init`) | unset |
 //! | `TS_CONTROL_URL` | tsnet control server | empty |
 //! | `CAPTURE_FPS` | capture rate; invalid or 0 falls back | 30 |
-//! | `GHOSTFRAME_NO_X11_WAIT` | skip the X11 readiness wait (DRM-direct e2e) | off |
-//! | `GHOSTFRAME_X11_CAPTURE_ONLY` | skip the DRM probe | off |
 //! | `GHOSTFRAME_CAPTURE_DUMP_DIR` | write each frame as PNG here (test builds only) | off |
 //! | `GHOSTFRAME_CAPTURE_HEARTBEAT_EVERY` | trace heartbeat every N frames | 5 |
 //! | `GHOSTFRAME_DUMP_FIRST_FRAME` | dump first raw frame to this path (test builds only) | off |
@@ -46,8 +44,6 @@ pub struct XdaemonConfig {
     pub ts_control_url: String,
     /// Always >= 1.
     pub capture_fps: u64,
-    pub no_x11_wait: bool,
-    pub x11_capture_only: bool,
     pub capture_dump_dir: Option<std::path::PathBuf>,
     /// Always >= 1 (it is used as a modulus).
     pub heartbeat_every: u64,
@@ -113,8 +109,6 @@ impl XdaemonConfig {
             ts_authkey: get("TS_AUTHKEY"),
             ts_control_url: get("TS_CONTROL_URL").unwrap_or_default(),
             capture_fps: parse_positive("CAPTURE_FPS", get("CAPTURE_FPS"), DEFAULT_CAPTURE_FPS),
-            no_x11_wait: env_flag(get("GHOSTFRAME_NO_X11_WAIT").as_deref()),
-            x11_capture_only: env_flag(get("GHOSTFRAME_X11_CAPTURE_ONLY").as_deref()),
             capture_dump_dir: knob("GHOSTFRAME_CAPTURE_DUMP_DIR")
                 .filter(|s| !s.is_empty())
                 .map(Into::into),
@@ -163,7 +157,7 @@ mod tests {
         let c = cfg(&[]);
         assert_eq!(c.capture_fps, 30);
         assert_eq!(c.heartbeat_every, 5);
-        assert!(!c.log_json && !c.no_x11_wait && !c.x11_capture_only);
+        assert!(!c.log_json);
         assert!(c.capture_dump_dir.is_none());
     }
 
@@ -217,13 +211,10 @@ mod tests {
     #[test]
     fn flags_and_paths() {
         let c = cfg(&[
-            ("GHOSTFRAME_X11_CAPTURE_ONLY", "1"),
-            ("GHOSTFRAME_NO_X11_WAIT", "0"),
             ("GHOSTFRAME_CAPTURE_DUMP_DIR", ""),
             ("GHOSTFRAME_LOG_FORMAT", "json"),
         ]);
-        assert!(c.x11_capture_only && c.log_json);
-        assert!(!c.no_x11_wait);
+        assert!(c.log_json);
         assert!(c.capture_dump_dir.is_none());
     }
 
