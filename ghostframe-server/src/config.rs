@@ -119,7 +119,7 @@ impl ServerConfig {
                 DEFAULT_HEARTBEAT_EVERY,
             ),
             dump_first_frame: knob("GHOSTFRAME_DUMP_FIRST_FRAME"),
-            max_resolution: get("GHOSTFRAME_MAX_RESOLUTION"),
+            max_resolution: nonempty("GHOSTFRAME_MAX_RESOLUTION"),
         }
     }
 }
@@ -193,6 +193,11 @@ mod tests {
         );
         assert_eq!(
             cfg(&[("GHOSTFRAME_ATTACH_MAX_RESOLUTION", "2560x1440")]).max_resolution,
+            None
+        );
+        // An empty value means unset, like the neighbouring keys.
+        assert_eq!(
+            cfg(&[("GHOSTFRAME_MAX_RESOLUTION", "")]).max_resolution,
             None
         );
     }
