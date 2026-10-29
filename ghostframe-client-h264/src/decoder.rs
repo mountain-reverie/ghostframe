@@ -98,7 +98,16 @@ impl HwFrame {
     /// returned `MappedFrame` does not borrow from `self` and may outlive
     /// it -- `self` can be dropped (freeing this `HwFrame`'s own reference)
     /// while the mapping, and the dmabuf fd inside it, stay valid.
+    ///
+    /// Waits for the hardware to finish decoding the surface first. The
+    /// mapping itself does not, on every FFmpeg this builds against: 4.4's
+    /// `vaapi_map_to_drm_esh` exports the handle without a `vaSyncSurface`
+    /// (later releases added one), and the kernel's implicit dma-buf fencing
+    /// does not order VA-API's decode against a Vulkan read on amdgpu either
+    /// -- measured: without this wait, the second frame of every H.264
+    /// episode was sampled as zeros, a solid green frame on screen.
     pub fn map_dmabuf(&self) -> Result<MappedFrame, H264Error> {
+        self.sync_surface()?;
         // SAFETY: `self.frame` is a live VAAPI frame owned by `self` for the
         // duration of this call. `drm` is a fresh allocation freed on every
         // error path below; on success ownership passes to `MappedFrame`,
@@ -140,6 +149,70 @@ impl HwFrame {
             }
         }
     }
+}
+
+impl HwFrame {
+    /// `vaSyncSurface` on this frame's surface: block until the decode that
+    /// writes it has finished. See [`HwFrame::map_dmabuf`] for why the map
+    /// cannot be trusted to do this.
+    fn sync_surface(&self) -> Result<(), H264Error> {
+        let Some(va_sync_surface) = va_sync_surface() else {
+            return Err(H264Error::Ffmpeg(
+                "vaSyncSurface is not resolvable in this process, so a mapped \
+                 surface could be read before its decode finishes"
+                    .into(),
+            ));
+        };
+        // SAFETY: `self.frame` is a live VAAPI frame, so `hw_frames_ctx` is
+        // a live `AVHWFramesContext` whose device is a VA-API device
+        // (`H264Decoder` creates no other kind), making `hwctx` an
+        // `AVVAAPIDeviceContext`; `data[3]` of an `AV_PIX_FMT_VAAPI` frame is
+        // its `VASurfaceID` (`hwcontext_vaapi.h`). Each pointer is checked
+        // before it is followed.
+        let status = unsafe {
+            let frames_ref = (*self.frame).hw_frames_ctx;
+            if frames_ref.is_null() {
+                return Err(H264Error::Ffmpeg("frame has no hw_frames_ctx".into()));
+            }
+            let frames = (*frames_ref).data as *const ffi::AVHWFramesContext;
+            let device = (*frames).device_ctx;
+            if device.is_null() || (*device).hwctx.is_null() {
+                return Err(H264Error::Ffmpeg("hw frames context has no device".into()));
+            }
+            let display = (*((*device).hwctx as *const ffi::AVVAAPIDeviceContext)).display;
+            let surface = (*self.frame).data[3] as usize as ffi::VASurfaceID;
+            va_sync_surface(display, surface)
+        };
+        if status != 0 {
+            return Err(H264Error::Ffmpeg(format!(
+                "vaSyncSurface failed with VAStatus {status}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+type VaSyncSurfaceFn = unsafe extern "C" fn(ffi::VADisplay, ffi::VASurfaceID) -> i32;
+
+/// libva's `vaSyncSurface`, looked up in the running process.
+///
+/// Not linked with `-lva`: libavutil already loads libva to drive the VA-API
+/// device, and a build machine with only the runtime `libva.so.2` (no
+/// `libva.so` dev symlink) cannot name it at link time. `None` means libva is
+/// not loaded, in which case no VA-API frame could exist to sync either.
+fn va_sync_surface() -> Option<VaSyncSurfaceFn> {
+    static SYM: std::sync::OnceLock<Option<VaSyncSurfaceFn>> = std::sync::OnceLock::new();
+    *SYM.get_or_init(|| {
+        // SAFETY: `dlsym` with `RTLD_DEFAULT` and a NUL-terminated name only
+        // searches the already-loaded objects. A non-null result is libva's
+        // `vaSyncSurface`, whose C signature is
+        // `VAStatus vaSyncSurface(VADisplay, VASurfaceID)` -- `VAStatus` is an
+        // `int` -- matching `VaSyncSurfaceFn`.
+        unsafe {
+            let p = libc::dlsym(libc::RTLD_DEFAULT, c"vaSyncSurface".as_ptr());
+            (!p.is_null()).then(|| std::mem::transmute::<*mut libc::c_void, VaSyncSurfaceFn>(p))
+        }
+    })
 }
 
 impl Drop for HwFrame {
