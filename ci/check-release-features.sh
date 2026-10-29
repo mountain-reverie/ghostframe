@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The daemon that `just build-release` produces, and packaging/install.sh
+# The server that `just build-release` produces, and `ghostframe-server install`
 # ships, must not be compiled with any of ghostframe-lib's test or diagnostic
 # features. Cargo unifies features over every package in one build, so a
 # workspace-wide `cargo build --release` used to compile the shipped daemon

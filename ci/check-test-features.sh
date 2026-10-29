@@ -39,6 +39,6 @@ while IFS= read -r hit; do
     esac
     echo "::error::${hit%%:*}: '$feature' must only be passed by tests/containers/test-server/Dockerfile"
     status=1
-done < <(grep -rn -- "$feature" Justfile .github ci packaging 2>/dev/null || true)
+done < <(grep -rn -- "$feature" Justfile .github ci 2>/dev/null || true)
 
 exit $status
