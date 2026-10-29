@@ -826,8 +826,8 @@ impl Renderer {
         // What this span is NOT: "submit to surface available". ffmpeg's
         // VA-API hwaccel does not synchronise the decoded surface inside
         // `avcodec_receive_frame` -- the `vaSyncSurface` wait for the
-        // hardware to actually finish decoding lives in the map-to-DRM
-        // path, i.e. inside `frame.map_dmabuf()` in `blit_h264_frame`
+        // hardware to actually finish decoding lives in
+        // `frame.map_dmabuf()` (its own explicit sync) in `blit_h264_frame`
         // below, which is timed separately. This span is submit-through-
         // `avcodec_receive_frame`-return: CPU-side packet handling plus
         // whatever of the decode VA-API's async submission model makes
@@ -998,7 +998,8 @@ impl Renderer {
         // `decode_h264`'s `decode_us` above, and load-bearing to that
         // measurement's honesty: this call, not `decoder.decode()`, is
         // where `vaSyncSurface` actually waits for the hardware to finish
-        // decoding (inside ffmpeg's map-to-DRM path in `hwcontext_vaapi`).
+        // decoding (`HwFrame::map_dmabuf` syncs explicitly: FFmpeg 4.4's
+        // map-to-DRM path does not, and skipping it drew a green frame).
         // A first review round timed only `decode()` and reported the
         // submit cost as if it were the decode cost; this span is what was
         // missing.
