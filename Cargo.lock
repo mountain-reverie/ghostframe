@@ -1900,6 +1900,7 @@ dependencies = [
  "ghostframe-lib",
  "image",
  "libc",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
