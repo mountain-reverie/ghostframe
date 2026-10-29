@@ -238,7 +238,7 @@ choice.
 - *dma-buf import:* believed not exercised today. With the test pattern holding
   DRM master, the writeback probe hits the master conflict and capture falls back
   to a CPU copy of the scanout. This is read from the code. Planning confirms it
-  from one e2e log (`IngestTier`) before relying on the claim.
+  from one e2e log (`IngestTier`) before relying on the claim. Confirmed 2026-10-29 from an e2e_cdf53_gradient_emission log: capture took the CPU-mmap path; no dma-buf was submitted.
 
 **Host requirements (amended during planning).** VKMS stays a host requirement
 for now: every `gpu: true` e2e setup (`e2e_setup.rs`, `scene.rs`) still starts
