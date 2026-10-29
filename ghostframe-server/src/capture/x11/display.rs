@@ -36,7 +36,7 @@ pub struct XrandrDisplay {
     /// fails. Seeded from a real query in `new()` and refreshed on every
     /// subsequent successful call -- never a hardcoded guess.
     ceiling_fallback: Mutex<(u16, u16)>,
-    /// `GHOSTFRAME_ATTACH_MAX_RESOLUTION`, read once at construction (this
+    /// `GHOSTFRAME_MAX_RESOLUTION`, read once at construction (this
     /// crate's convention -- see `config.rs`). `Some("WIDTHxHEIGHT")` lowers
     /// what `ceiling()` reports; `None` (unset) leaves the hardware ceiling
     /// alone. Applied by `clamp_ceiling()` on every path through `ceiling()`.
@@ -440,7 +440,7 @@ fn mm_for_scale(px: u16, scale_milli: u16) -> u32 {
 
 /// Lower a hardware ceiling to an operator-configured maximum.
 ///
-/// `raw` is the value of `GHOSTFRAME_ATTACH_MAX_RESOLUTION`: `"WIDTHxHEIGHT"`
+/// `raw` is the value of `GHOSTFRAME_MAX_RESOLUTION`: `"WIDTHxHEIGHT"`
 /// to clamp, `"none"` to disable, absent to disable.
 ///
 /// **Only ever lowers.** A configured value above the hardware ceiling is
@@ -467,7 +467,7 @@ fn clamp_ceiling(hardware: (u16, u16), raw: Option<&str>) -> (u16, u16) {
         None => {
             tracing::warn!(
                 value = raw,
-                "GHOSTFRAME_ATTACH_MAX_RESOLUTION is not WIDTHxHEIGHT or 'none'; ignoring"
+                "GHOSTFRAME_MAX_RESOLUTION is not WIDTHxHEIGHT or 'none'; ignoring"
             );
             hardware
         }
