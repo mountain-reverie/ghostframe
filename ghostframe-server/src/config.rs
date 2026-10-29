@@ -1,6 +1,6 @@
 //! Every environment variable `ghostframe-server` reads, parsed once.
 //!
-//! `XdaemonConfig::from_env()` is called once at the top of `main()` and the
+//! `ServerConfig::from_env()` is called once at the top of `main()` and the
 //! result is passed down. This is the only file in the crate allowed to touch
 //! `std::env` (CI greps for it), which keeps three things true:
 //!
@@ -14,22 +14,22 @@
 //! |---|---|---|
 //! | `DISPLAY` | X display (diagnostics only; x11rb reads it itself) | unset |
 //! | `GHOSTFRAME_LOG_FORMAT` | `json` for JSON logs | text |
-//! | `TS_HOSTNAME` | tsnet node name | `ghostframe-server` |
+//! | `TS_HOSTNAME` | tsnet node name | `<hostname>-ghostframe` (`ghostframe-server` if the host has no name) |
 //! | `TS_STATE_DIR` | tsnet state directory (holds node keys) | `$XDG_STATE_HOME/ghostframe`, else `~/.local/state/ghostframe` |
 //! | `XDG_STATE_HOME`, `HOME` | only to locate the default state directory | unset |
-//! | `TS_AUTHKEY` | tsnet auth key (needed for `--init`) | unset |
+//! | `TS_AUTHKEY` | tsnet auth key: `login` without a browser | unset |
 //! | `TS_CONTROL_URL` | tsnet control server | empty |
 //! | `CAPTURE_FPS` | capture rate; invalid or 0 falls back | 30 |
 //! | `GHOSTFRAME_CAPTURE_DUMP_DIR` | write each frame as PNG here (test builds only) | off |
 //! | `GHOSTFRAME_CAPTURE_HEARTBEAT_EVERY` | trace heartbeat every N frames | 5 |
 //! | `GHOSTFRAME_DUMP_FIRST_FRAME` | dump first raw frame to this path (test builds only) | off |
-//! | `GHOSTFRAME_ATTACH_MAX_RESOLUTION` | `WxH` ceiling in attach mode | none |
+//! | `GHOSTFRAME_MAX_RESOLUTION` | `WxH` resolution ceiling, or `none` | none (the unit `install` writes sets `1920x1080`) |
 
 pub const DEFAULT_CAPTURE_FPS: u64 = 30;
 const DEFAULT_HEARTBEAT_EVERY: u64 = 5;
 
 #[derive(Debug, Clone)]
-pub struct XdaemonConfig {
+pub struct ServerConfig {
     pub display: Option<String>,
     pub log_json: bool,
     pub ts_hostname: String,
@@ -45,10 +45,10 @@ pub struct XdaemonConfig {
     /// Always >= 1 (it is used as a modulus).
     pub heartbeat_every: u64,
     pub dump_first_frame: Option<String>,
-    pub attach_max_resolution: Option<String>,
+    pub max_resolution: Option<String>,
 }
 
-impl XdaemonConfig {
+impl ServerConfig {
     /// The tsnet state directory: `TS_STATE_DIR`, else
     /// `$XDG_STATE_HOME/ghostframe`, else `$HOME/.local/state/ghostframe`.
     /// Never a world-writable location: with none of the variables set there
@@ -76,11 +76,15 @@ impl XdaemonConfig {
 
     /// Read the process environment. Call once, from `main()`.
     pub fn from_env() -> Self {
-        Self::from_lookup(|k| std::env::var(k).ok())
+        Self::from_lookup(|k| std::env::var(k).ok(), crate::util::system_hostname())
     }
 
-    /// Build from an arbitrary lookup, so tests need no process-global state.
-    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+    /// Build from an arbitrary lookup and host name, so tests need no
+    /// process-global state.
+    pub fn from_lookup(
+        get: impl Fn(&str) -> Option<String>,
+        system_hostname: Option<String>,
+    ) -> Self {
         // The two dump knobs write captured screen contents to a path the
         // environment names. They are honoured only in a test build; the
         // release daemon ignores them. ghostframe-server has no cargo features of its
@@ -98,7 +102,8 @@ impl XdaemonConfig {
         Self {
             display: get("DISPLAY"),
             log_json: get("GHOSTFRAME_LOG_FORMAT").as_deref() == Some("json"),
-            ts_hostname: get("TS_HOSTNAME").unwrap_or_else(|| "ghostframe-server".into()),
+            ts_hostname: nonempty("TS_HOSTNAME")
+                .unwrap_or_else(|| default_hostname(system_hostname)),
             ts_state_dir: nonempty("TS_STATE_DIR"),
             xdg_state_home: nonempty("XDG_STATE_HOME"),
             home: nonempty("HOME"),
@@ -114,8 +119,18 @@ impl XdaemonConfig {
                 DEFAULT_HEARTBEAT_EVERY,
             ),
             dump_first_frame: knob("GHOSTFRAME_DUMP_FIRST_FRAME"),
-            attach_max_resolution: get("GHOSTFRAME_ATTACH_MAX_RESOLUTION"),
+            max_resolution: get("GHOSTFRAME_MAX_RESOLUTION"),
         }
+    }
+}
+
+/// `<host>-ghostframe`, the name `login` and `capture` both register when
+/// `TS_HOSTNAME` is unset; they must agree, or the node is renamed on every
+/// start.
+fn default_hostname(system_hostname: Option<String>) -> String {
+    match system_hostname {
+        Some(h) => format!("{h}-ghostframe"),
+        None => "ghostframe-server".to_string(),
     }
 }
 
@@ -139,12 +154,12 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn cfg(pairs: &[(&str, &str)]) -> XdaemonConfig {
+    fn cfg(pairs: &[(&str, &str)]) -> ServerConfig {
         let m: HashMap<String, String> = pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        XdaemonConfig::from_lookup(|k| m.get(k).cloned())
+        ServerConfig::from_lookup(|k| m.get(k).cloned(), Some("testhost".into()))
     }
 
     #[test]
@@ -154,6 +169,32 @@ mod tests {
         assert_eq!(c.heartbeat_every, 5);
         assert!(!c.log_json);
         assert!(c.capture_dump_dir.is_none());
+    }
+
+    #[test]
+    fn hostname_defaults_to_the_host_name() {
+        assert_eq!(cfg(&[]).ts_hostname, "testhost-ghostframe");
+        assert_eq!(
+            cfg(&[("TS_HOSTNAME", "")]).ts_hostname,
+            "testhost-ghostframe"
+        );
+        assert_eq!(cfg(&[("TS_HOSTNAME", "box")]).ts_hostname, "box");
+        let nameless = ServerConfig::from_lookup(|_| None, None);
+        assert_eq!(nameless.ts_hostname, "ghostframe-server");
+    }
+
+    #[test]
+    fn max_resolution_is_read_from_its_new_name_only() {
+        assert_eq!(
+            cfg(&[("GHOSTFRAME_MAX_RESOLUTION", "2560x1440")])
+                .max_resolution
+                .as_deref(),
+            Some("2560x1440")
+        );
+        assert_eq!(
+            cfg(&[("GHOSTFRAME_ATTACH_MAX_RESOLUTION", "2560x1440")]).max_resolution,
+            None
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ use ghostframe_lib::transport::display::DisplayController;
 use ghostframe_lib::transport::input_inject::InputInjector;
 use ghostframe_lib::FrameSubmission;
 
-use crate::config::XdaemonConfig;
+use crate::config::ServerConfig;
 
 /// The X11 desktop on `$DISPLAY`.
 pub struct X11Backend {
@@ -30,7 +30,7 @@ impl X11Backend {
     /// Connect every part. Frames are required; damage, input and display
     /// control are each optional and logged when missing, so a desktop that
     /// lacks one still streams.
-    pub fn new(cfg: &XdaemonConfig) -> io::Result<Self> {
+    pub fn new(cfg: &ServerConfig) -> io::Result<Self> {
         let frames = frames::X11Frames::connect(None, cfg.dump_first_frame.clone())?;
 
         // Not armed yet: damage reporting is switched on and off with the
@@ -62,7 +62,7 @@ impl X11Backend {
         // unavailable (extension missing, no connected output), continue with
         // no display controller: a fixed resolution beats refusing to start.
         let display: Option<Arc<dyn DisplayController>> =
-            match display::XrandrDisplay::new(cfg.attach_max_resolution.clone()) {
+            match display::XrandrDisplay::new(cfg.max_resolution.clone()) {
                 Ok(ctl) => {
                     tracing::info!("XRandR display controller ready");
                     Some(Arc::new(ctl))

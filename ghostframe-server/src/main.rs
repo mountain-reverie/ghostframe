@@ -19,7 +19,7 @@ fn state_dir_seeded(state_dir: &Path) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let cfg = config::XdaemonConfig::from_env();
+    let cfg = config::ServerConfig::from_env();
     // Default to INFO, not DEBUG. `ghostframe=debug` as a *default* means a
     // deployed daemon writes every DEBUG line forever: measured on a live
     // session at ~207 lines/second on a screen with nothing to send, six per
