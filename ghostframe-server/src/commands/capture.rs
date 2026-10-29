@@ -63,6 +63,10 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
 
     let config = GhostbridgeConfig {
         hostname: cfg.ts_hostname.clone(),
+        // Without a key nobody is there to answer a sign-in URL, and the URL
+        // in the journal would be claimable by whoever can read it: fail
+        // instead (`needs_login`).
+        non_interactive: authkey.is_empty(),
         authkey,
         state_dir,
         control_url: cfg.ts_control_url.clone(),
@@ -107,6 +111,13 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
     {
         Ok(s) => s,
         Err(e) => {
+            if needs_login(e.as_ref()) {
+                eprintln!(
+                    "error: the node is not authorised (key expired or removed?); \
+                     run `ghostframe-server login`"
+                );
+                std::process::exit(2);
+            }
             if let Some(ws) = e.downcast_ref::<ghostframe_lib::WebServerError>() {
                 if matches!(ws, ghostframe_lib::WebServerError::HttpsCertsDisabled) {
                     tracing::error!(
@@ -330,6 +341,21 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
     Ok(())
 }
 
+/// Whether `e` (or anything it wraps) is a non-interactive `up` that found the
+/// node needing a login.
+fn needs_login(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(e);
+    while let Some(e) = cur {
+        if let Some(ghostframe_lib::GhostbridgeError::Ffi("gbridge_up", rc)) =
+            e.downcast_ref::<ghostframe_lib::GhostbridgeError>()
+        {
+            return *rc == ghostframe_lib::transport::ghostbridge::UP_NEEDS_LOGIN_RC;
+        }
+        cur = e.source();
+    }
+    false
+}
+
 /// Consecutive failed captures tolerated before the daemon exits (about ten
 /// seconds at the default 30 fps). Transient failures (a mode switch, a
 /// momentary DRM master loss) clear well inside this.
@@ -405,6 +431,19 @@ fn dump_frame_as_png(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ghostframe_lib::GhostbridgeError;
+
+    #[test]
+    fn only_a_needs_login_up_failure_maps_to_the_login_message() {
+        let up = |rc| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(GhostbridgeError::Ffi("gbridge_up", rc))
+        };
+        assert!(needs_login(up(-7).as_ref()));
+        assert!(!needs_login(up(-2).as_ref()), "an ordinary up failure");
+        let other: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(GhostbridgeError::Ffi("gbridge_new", -7));
+        assert!(!needs_login(other.as_ref()));
+    }
 
     #[test]
     fn capture_failures_trip_after_budget_and_reset_on_success() {

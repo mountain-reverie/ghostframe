@@ -15,6 +15,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -325,5 +326,72 @@ func TestRateLimitedLogSuppressesWithinInterval(t *testing.T) {
 	}
 	if l.suppressed != 2 {
 		t.Fatalf("suppressed = %d, want 2", l.suppressed)
+	}
+}
+
+// A node whose key expired (or that was removed in the admin console) starts
+// in NeedsLogin and tsnet then publishes an auth URL. A non-interactive
+// caller (capture without a key) must get an error, not a hang.
+func TestUpNonInteractiveFailsOnAuthURL(t *testing.T) {
+	f := &fakePoller{statuses: []*ipnstate.Status{{BackendState: "NeedsLogin", AuthURL: "https://login.example/a/1"}}}
+	blocked := func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }
+	err := upNonInteractive(blocked, f, time.Millisecond, time.Hour)
+	if !errors.Is(err, errNeedsLogin) {
+		t.Fatalf("got %v, want errNeedsLogin", err)
+	}
+}
+
+func TestUpNonInteractiveFailsOnLingeringNeedsLogin(t *testing.T) {
+	f := &fakePoller{} // exhausted: NeedsLogin forever, no URL
+	blocked := func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }
+	err := upNonInteractive(blocked, f, time.Millisecond, 20*time.Millisecond)
+	if !errors.Is(err, errNeedsLogin) {
+		t.Fatalf("got %v, want errNeedsLogin", err)
+	}
+}
+
+// tsnet briefly reports NeedsLogin even with a valid key; a short blip
+// followed by Running must succeed.
+func TestUpNonInteractiveToleratesABriefNeedsLogin(t *testing.T) {
+	f := &fakePoller{statuses: []*ipnstate.Status{{BackendState: "NeedsLogin"}, {BackendState: "Running"}}}
+	up := func(ctx context.Context) error {
+		time.Sleep(30 * time.Millisecond)
+		return nil
+	}
+	if err := upNonInteractive(up, f, time.Millisecond, time.Hour); err != nil {
+		t.Fatalf("got %v, want nil", err)
+	}
+}
+
+func TestUpNonInteractivePassesUpErrorsThrough(t *testing.T) {
+	boom := errors.New("boom")
+	f := &fakePoller{statuses: []*ipnstate.Status{{BackendState: "Running"}}}
+	err := upNonInteractive(func(context.Context) error { return boom }, f, time.Millisecond, time.Hour)
+	if !errors.Is(err, boom) || errors.Is(err, errNeedsLogin) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// The auth URL must never reach the journal in non-interactive mode, and
+// nothing else may be lost.
+func TestNonInteractiveLogfDropsAuthURLLines(t *testing.T) {
+	var got []string
+	next := func(f string, a ...any) { got = append(got, fmt.Sprintf(f, a...)) }
+	l := nonInteractiveLogf(next)
+	l("To start this tsnet server, restart with TS_AUTHKEY set, or go to: %s", "https://login.example/a/1")
+	l("AuthURL is %v", "https://login.example/a/1")
+	l("RegisterReq: got response; nodeKeyExpired=%v, machineAuthorized=%v; authURL=%v", true, false, true)
+	l("magicsock: endpoints changed")
+	if len(got) != 1 || got[0] != "magicsock: endpoints changed" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// Approval pending is distinct from "no URL": say so instead of timing out.
+func TestLoginURLReportsMachineAuth(t *testing.T) {
+	f := &fakePoller{statuses: []*ipnstate.Status{{BackendState: "NeedsMachineAuth"}}}
+	_, err := loginURL(f, time.Second)
+	if !errors.Is(err, errMachineAuth) {
+		t.Fatalf("got %v, want errMachineAuth", err)
 	}
 }

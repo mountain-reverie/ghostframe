@@ -11,7 +11,9 @@
 
 use std::io::Write;
 
-use ghostframe_lib::transport::ghostbridge::{GhostbridgeError, GhostbridgeHandle};
+use ghostframe_lib::transport::ghostbridge::{
+    GhostbridgeError, GhostbridgeHandle, LOGIN_URL_MACHINE_AUTH_RC,
+};
 use ghostframe_lib::GhostbridgeConfig;
 
 use crate::config::ServerConfig;
@@ -44,6 +46,11 @@ fn tailnet_err(e: GhostbridgeError) -> String {
         GhostbridgeError::Ffi("gbridge_login_url", LOGIN_URL_TIMEOUT_RC) => "no sign-in URL from \
              the control server within 60 s; check the network or --control-url"
             .to_string(),
+        GhostbridgeError::Ffi("gbridge_login_url", LOGIN_URL_MACHINE_AUTH_RC) => {
+            "this node signed in but is waiting for device approval: approve it in the \
+             admin console, then run `ghostframe-server login` again"
+                .to_string()
+        }
         e => format!("tailnet: {e}"),
     }
 }
@@ -92,6 +99,7 @@ fn bridge_config(
         // This command owns the terminal: the sign-in URL is the one line the
         // person must see, not tsnet's backend log.
         quiet: true,
+        non_interactive: false,
     }
 }
 
@@ -277,6 +285,16 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
+    #[test]
+    fn login_url_failures_read_as_instructions() {
+        let t = tailnet_err(GhostbridgeError::Ffi("gbridge_login_url", -6));
+        assert!(t.contains("within 60 s"), "{t}");
+        let m = tailnet_err(GhostbridgeError::Ffi("gbridge_login_url", -8));
+        assert!(m.contains("device approval"), "{m}");
+        let o = tailnet_err(GhostbridgeError::Ffi("gbridge_login_url", -2));
+        assert!(o.starts_with("tailnet: "), "{o}");
+    }
+
     #[derive(Default)]
     struct Fake {
         dir: PathBuf,
@@ -367,6 +385,7 @@ mod tests {
                     state_dir: c.state_dir.clone(),
                     control_url: c.control_url.clone(),
                     quiet: c.quiet,
+                    non_interactive: c.non_interactive,
                 });
                 Ok(f)
             },

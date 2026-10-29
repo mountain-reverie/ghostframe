@@ -92,6 +92,7 @@ impl TestNode {
             state_dir: format!("/tmp/ghostframe-e2e-client-{}", std::process::id()),
             control_url,
             quiet: false,
+            non_interactive: false,
         })?;
         handle.up()?;
         Ok(Self {
