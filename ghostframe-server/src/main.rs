@@ -1,13 +1,11 @@
+mod capture;
 mod config;
-mod cvt;
-mod display;
-mod input_inject;
 mod util;
-mod x11_capture;
-mod xdamage;
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use capture::Backend;
 
 use ghostframe_lib::{GhostbridgeConfig, GhostframeServer};
 
@@ -17,41 +15,6 @@ use ghostframe_lib::{GhostbridgeConfig, GhostframeServer};
 /// the daemon needs a TS_AUTHKEY (either via env or via `--init`).
 fn state_dir_seeded(state_dir: &Path) -> bool {
     state_dir.join("tailscaled.state").exists()
-}
-
-/// Block until `$DISPLAY` accepts an X11 connection, or the timeout expires.
-///
-/// In headless mode, systemd's `After=ghostframe-wm.service` only guarantees
-/// enlightenment_start was launched, not that Xorg finished initialising. In
-/// attach mode `After=graphical-session.target` says nothing about whether the
-/// operator's session will accept a new client. Either way, without this gate
-/// the daemon would bring up tsnet (a ~5s operation) against an X server it
-/// cannot talk to, and the only symptom downstream would be "no frames".
-fn wait_for_x11(timeout: Duration, display: Option<&str>) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
-    let mut attempt: u32 = 0;
-    let last_err = loop {
-        attempt += 1;
-        let err = match x11rb::connect(None) {
-            Ok(_) => {
-                if attempt > 1 {
-                    tracing::info!(attempts = attempt, "X11 display ready");
-                }
-                return Ok(());
-            }
-            Err(e) => e.to_string(),
-        };
-        if Instant::now() >= deadline {
-            break err;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    };
-    let display = display.unwrap_or("(unset)");
-    Err(format!(
-        "X11 display {display} not ready after {:?} ({attempt} attempt(s)); \
-         last error: {last_err}",
-        timeout
-    ))
 }
 
 #[tokio::main]
@@ -130,7 +93,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Skip in --init mode: that path only seeds the tsnet state and exits
     // without capturing anything, and install.sh runs --init before X is up.
     if !init_mode {
-        if let Err(msg) = wait_for_x11(Duration::from_secs(10), cfg.display.as_deref()) {
+        if let Err(msg) =
+            capture::x11::wait_for_x11(Duration::from_secs(10), cfg.display.as_deref())
+        {
             // Name both deployments. This hint used to point only at
             // ghostframe-xorg.service, which does not exist in attach mode --
             // so the one message an operator gets on the most common startup
@@ -151,55 +116,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    // X server is up; safe to open the XTest injector connection. If the
-    // XTEST extension isn't compiled into this xorg-server build, log
-    // and continue — frames still stream, just no input.
-    let input_injector: Option<
-        std::sync::Arc<dyn ghostframe_lib::transport::input_inject::InputInjector>,
-    > = if !init_mode {
-        match input_inject::XTestInjector::new(cfg.display.as_deref()) {
-            Ok(inj) => {
-                tracing::info!("XTest input injector ready");
-                Some(std::sync::Arc::new(inj))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "XTest injector unavailable; input forwarding disabled"
-                );
-                None
-            }
-        }
-    } else {
-        // --init mode exits before serving traffic; no point opening
-        // the injector connection.
+    // The X server is up: connect the backend (frames, damage, input,
+    // display). Not in --init mode, which exits before serving anything.
+    let mut backend = if init_mode {
         None
-    };
-
-    // Same reasoning as the XTest injector above: RandR is an ordinary,
-    // unprivileged X client operation now that the X server is confirmed up.
-    // If it's unavailable (extension missing, no connected output), log and
-    // continue with no display controller -- the server still streams at a
-    // fixed resolution, which beats refusing to start.
-    let display_controller: Option<
-        std::sync::Arc<dyn ghostframe_lib::transport::display::DisplayController>,
-    > = if !init_mode {
-        match display::XrandrDisplay::new(cfg.attach_max_resolution.clone()) {
-            Ok(ctl) => {
-                tracing::info!("XRandR display controller ready");
-                Some(std::sync::Arc::new(ctl))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "XRandR display controller unavailable; resolution negotiation disabled"
-                );
-                None
-            }
-        }
     } else {
-        None
+        Some(capture::x11::X11Backend::new(&cfg)?)
     };
+    let input_injector = backend.as_ref().and_then(|b| b.input_injector());
+    let display_controller = backend.as_ref().and_then(|b| b.display_controller());
 
     let lib_config = match ghostframe_lib::config::LibConfig::from_env() {
         Ok(c) => c,
@@ -243,17 +168,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
-    let mut capture = x11_capture::X11Capture::new(&cfg)?;
-
-    // Not armed yet: damage reporting is switched on and off with the capture
-    // gate below, so the X server does no damage bookkeeping for us while no
-    // client is connected.
-    let mut xdamage_monitor = xdamage::XDamageMonitor::new();
-    if xdamage_monitor.is_some() {
-        tracing::info!("XDamage available; armed only while a client is connected");
-    } else {
-        tracing::info!("XDamage not available, using full-frame dirty detection");
-    }
+    let Some(backend) = backend.as_mut() else {
+        unreachable!("the backend is only None in --init mode, which returned above");
+    };
 
     tracing::info!("Server ready, entering capture loop");
 
@@ -308,9 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // one RAW_RECTANGLES event per damaged rectangle for output
                 // nobody reads -- and would need a timer to do the
                 // draining, which is the idle poll this loop no longer has.
-                if let Some(monitor) = xdamage_monitor.as_mut() {
-                    monitor.disarm();
-                }
+                backend.disarm_damage();
                 tracing::info!(
                     "no client connected; capture loop parked until one arrives \
                      (XDamage disarmed)"
@@ -332,15 +247,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             continue;
         }
         if was_idle != Some(false) {
-            if let Some(monitor) = xdamage_monitor.as_mut() {
-                monitor.arm();
-            }
+            backend.arm_damage();
             // `xdamage_armed` is the one place an operator can tell a working
             // damage path from a silently dead one: an unarmed monitor
             // reports no dirty tiles, every frame falls back to full-frame
             // comparison, and the output stays correct while costing more.
             tracing::info!(
-                xdamage_armed = xdamage_monitor.as_ref().is_some_and(|m| m.is_armed()),
+                xdamage_armed = backend.damage_armed(),
                 "client connected; capture loop resuming"
             );
             was_idle = Some(false);
@@ -348,21 +261,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let capture_start = std::time::Instant::now();
 
-        // XDamage drain: Some(non-empty) = only check these tiles, None = check all.
-        // An empty drain means no damage events since last call — but we still need
-        // to fall back to full-frame comparison (None) so the dirty tracker can detect
-        // the first frame for a newly connected client.
-        let damage_tiles = xdamage_monitor.as_ref().and_then(|m| {
-            let tiles = m.drain_damage();
-            if tiles.is_empty() {
-                None
-            } else {
-                Some(tiles)
-            }
-        });
+        // Some(tiles) = only these changed; None = check every tile.
+        let damage_tiles = backend.drain_damage();
 
         let timestamp_us = (frame_count * frame_interval.as_micros() as u64) as u32;
-        let submission = match capture.capture(timestamp_us) {
+        let submission = match backend.capture(timestamp_us) {
             Ok(mut frame) => {
                 frame.damage_tiles = damage_tiles;
                 Some(frame)

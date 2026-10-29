@@ -1,7 +1,7 @@
 //! `DisplayController` backed by X RandR.
 //!
 //! Implements `ghostframe_lib::transport::display::DisplayController`
-//! (mirrors `input_inject::XTestInjector`, which implements `InputInjector`
+//! (mirrors `input::XTestInjector`, which implements `InputInjector`
 //! for the same reason: keep the protocol/`IoBridge` layer testable without
 //! a running display server). Everything X-specific -- RandR requests,
 //! modelines, millimetres -- stays inside this module; the trait itself
@@ -16,7 +16,7 @@ use x11rb::rust_connection::RustConnection;
 
 use ghostframe_lib::transport::display::{DisplayController, DisplayError};
 
-use crate::cvt;
+use super::cvt;
 
 /// `DisplayController` backed by X RandR.
 ///
