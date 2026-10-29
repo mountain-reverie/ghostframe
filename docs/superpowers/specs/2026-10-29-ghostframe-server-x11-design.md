@@ -235,10 +235,11 @@ choice.
 - *Lost:* DRM capture, which is deleted anyway.
 - *Gained:* every e2e test exercises the production capture path. Today none
   does.
-- *dma-buf import:* believed not exercised today. With the test pattern holding
-  DRM master, the writeback probe hits the master conflict and capture falls back
-  to a CPU copy of the scanout. This is read from the code. Planning confirms it
-  from one e2e log (`IngestTier`) before relying on the claim. Confirmed 2026-10-29 from an e2e_cdf53_gradient_emission log: capture took the CPU-mmap path; no dma-buf was submitted.
+- *dma-buf import:* not exercised today. Confirmed 2026-10-29 from an
+  `e2e_cdf53_gradient_emission` log: the container finds no DRM writeback
+  connector on `/dev/dri/card0`, so capture takes the CPU-mmap path over the
+  modesetting framebuffer and no dma-buf is ever submitted (the DRM-master
+  conflict assumed at design time is never reached).
 
 **Host requirements (amended during planning).** VKMS stays a host requirement
 for now: every `gpu: true` e2e setup (`e2e_setup.rs`, `scene.rs`) still starts
