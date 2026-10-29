@@ -7429,14 +7429,40 @@ Claude-Session: https://claude.ai/code/session_01DGDCULokdqLykgiwofeg3N"
 
 ## Task 1 findings
 
-Filled in by Task 1 Step 8.
+Recorded 2026-10-29 on evangeline: X.Org 1.21.1.25 (amdgpu), Enlightenment
+0.27.99.25357, output `HDMI-A-1` fed by a PiKVM (EDID vendor `LNX`, product
+0x7771). Logs in `target/gf-x11-notes/` (not committed).
 
-- Date, X server, Enlightenment version (`enlightenment -version`):
-- `state-before.txt` (output, its modes around 1280x720 and 1920x1080, CRTC, panning):
-- `xrandr-shrink` shape / final screen / E re-laid out? / reverted?:
-- `xrandr-grow` shape / final screen / re-laid out? / reverted?:
-- `ours-shrink` shape / final screen / re-laid out? / reverted?:
-- `ours-grow` shape / final screen / re-laid out? / reverted?:
-- `xrandr --verbose` order (crtc disable / screen / crtc):
-- `Screen` mm values, xrandr vs ours:
-- Outcome (A/B/C/D) and the Task 8 steps it enables:
+- **First attempt blocked: X session on a background VT.** From 13:35, seat0's
+  active VT was tty1. Xorg logged `get vblank counter failed` every 500 ms, and
+  *every* modeset failed (`xrandr: Configure crtc 0 failed`, with or without
+  `--panning 0x0`). No events were sent. `loginctl activate <session>`
+  (no root) brought it back. A server on an inactive session cannot change
+  modes at all.
+- `state-before.txt`: screen 1920x1080, CRTC on mode 91 (1920x1080 @ 50 Hz),
+  panning 1920x1080+0+0. The output's **preferred** mode is 1280x720 @ 60 Hz
+  (mode 90).
+- `xrandr-shrink` (1280x720): `crtc off, output off, screen 1920x1080,
+  crtc 1280x720, output on, …, screen 1280x720`. Final 1280x720. **Kept.**
+- `xrandr-grow` (1920x1080): `crtc off, screen 1920x1080, crtc 1920x1080`, then
+  **~1.7 s later another client set the CRTC back to mode 90 (1280x720) and
+  shrank the screen to 1280x720**. xrandr's own trailing `RRSetPanning` failed
+  with BadMatch because of that revert (rc=1). Final 1280x720. **Reverted.**
+- `ours-grow` (XrandrDisplay, 1920x1080): `screen 1920x1080, crtc 1920x1080`
+  (no CRTC disable), then the same revert to mode 90 ~1.7 s later. Final
+  1280x720. **Reverted.** (`ours-shrink` not run: the screen was already at
+  1280x720.)
+- `xrandr --verbose` order: `crtc 0: disable`, `screen 0: WxH`, `crtc 0: mode`,
+  confirmed.
+- `Screen` mm: xrandr 341x192 (142.88 dpi), ours 508x286, E's revert 227x128 or
+  338x190. The DPI differs, but it does not matter: both get reverted.
+- **Cause:** Enlightenment's `e_randr2` in profile `standard` has
+  `restore = 1` and a saved entry for this exact monitor id
+  (`HDMI-A-1/<PiKVM EDID>`) at **1280x720 @ 60 Hz**. On any screen change,
+  E re-applies its saved config for the connected monitor. The way the change
+  is made does not matter. Shrinking to 1280x720 "worked" only because it
+  matched E's saved mode. The 2026-10-29 attach symptom ("E stuck at
+  1280x720") is the same mechanism.
+- **Outcome: D.** It is neither event order (A), DPI (B) nor panning (C).
+  Making our request look like `xrandr` would change nothing. Task 8 as
+  written does not fix the revert. It needs an owner decision before it runs.
