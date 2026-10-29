@@ -158,3 +158,36 @@ fn help_lists_every_command() {
         assert!(text.contains(cmd), "{cmd} missing from:\n{text}");
     }
 }
+
+#[test]
+fn login_and_capture_refuse_while_the_old_xdaemon_unit_exists() {
+    // A temporary HOME holding the old unit file; the file check needs no
+    // systemctl (XDG_RUNTIME_DIR is unset, so none is asked).
+    let home = tempfile::tempdir().unwrap();
+    let unit = home
+        .path()
+        .join(".config/systemd/user/ghostframe-xdaemon.service");
+    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    std::fs::write(&unit, b"[Service]\n").unwrap();
+    let state = private_dir();
+    for cmd in ["login", "capture"] {
+        let out = run(
+            &[cmd],
+            &[("HOME", home.path()), ("TS_STATE_DIR", state.path())],
+        );
+        let want = if cmd == "capture" { 2 } else { 1 };
+        assert_eq!(out.status.code(), Some(want), "{cmd}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("run `ghostframe-server install` first"),
+            "{cmd}: {}",
+            stderr(&out)
+        );
+    }
+    // Without the unit file the same command gets past the guard.
+    std::fs::remove_file(&unit).unwrap();
+    let out = run(
+        &["capture"],
+        &[("HOME", home.path()), ("TS_STATE_DIR", state.path())],
+    );
+    assert!(!stderr(&out).contains("install` first"), "{}", stderr(&out));
+}

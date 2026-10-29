@@ -25,6 +25,8 @@
 //! | `GHOSTFRAME_CAPTURE_HEARTBEAT_EVERY` | trace heartbeat every N frames | 5 |
 //! | `GHOSTFRAME_DUMP_FIRST_FRAME` | dump first raw frame to this path (test builds only) | off |
 //! | `GHOSTFRAME_RANDR_SETTLE_MS` | least wait after a mode change before checking the desktop kept it | 5000 (`0` turns the read-back off) |
+//! | `GHOSTFRAME_INSTALL_DETACHED` | `1`: `install` is the re-exec'd copy running as a transient unit; never re-exec again | unset |
+//! | `XDG_RUNTIME_DIR` | whether a user systemd manager can be asked about the old xdaemon (`login`, `capture`) | unset |
 //! | `GHOSTFRAME_MAX_RESOLUTION` | `WxH` resolution ceiling, or `none` | none (the unit `install` writes sets `1920x1080`) |
 
 pub const DEFAULT_CAPTURE_FPS: u64 = 30;
@@ -46,6 +48,8 @@ pub struct ServerConfig {
     /// Explicit `TS_STATE_DIR`, if set and non-empty. Use [`Self::state_dir`].
     ts_state_dir: Option<String>,
     xdg_state_home: Option<String>,
+    install_detached: bool,
+    xdg_runtime_dir: Option<String>,
     home: Option<String>,
     pub ts_authkey: Option<String>,
     pub ts_control_url: String,
@@ -105,6 +109,21 @@ impl ServerConfig {
         }
     }
 
+    /// `XDG_STATE_HOME` as set in this shell, if any.
+    pub fn xdg_state_home(&self) -> Option<&str> {
+        self.xdg_state_home.as_deref()
+    }
+
+    /// Whether this is the re-exec'd copy of `install` (see `GHOSTFRAME_INSTALL_DETACHED`).
+    pub fn install_detached(&self) -> bool {
+        self.install_detached
+    }
+
+    /// Whether a user systemd manager is plausibly reachable (`XDG_RUNTIME_DIR` set).
+    pub fn user_manager_possible(&self) -> bool {
+        self.xdg_runtime_dir.is_some()
+    }
+
     /// `TS_STATE_DIR` as set in this shell, if any.
     pub fn ts_state_dir(&self) -> Option<&str> {
         self.ts_state_dir.as_deref()
@@ -143,6 +162,8 @@ impl ServerConfig {
                 .unwrap_or_else(|| default_hostname(system_hostname)),
             ts_state_dir: nonempty("TS_STATE_DIR"),
             xdg_state_home: nonempty("XDG_STATE_HOME"),
+            install_detached: get("GHOSTFRAME_INSTALL_DETACHED").as_deref() == Some("1"),
+            xdg_runtime_dir: nonempty("XDG_RUNTIME_DIR"),
             home: nonempty("HOME"),
             ts_authkey: get("TS_AUTHKEY"),
             ts_control_url: get("TS_CONTROL_URL").unwrap_or_default(),
