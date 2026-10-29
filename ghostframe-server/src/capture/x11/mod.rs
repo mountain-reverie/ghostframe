@@ -5,6 +5,8 @@ pub mod damage;
 pub mod display;
 pub mod frames;
 pub mod input;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use std::io;
 use std::sync::Arc;
@@ -18,7 +20,7 @@ use crate::config::XdaemonConfig;
 
 /// The X11 desktop on `$DISPLAY`.
 pub struct X11Backend {
-    frames: frames::X11Capture,
+    frames: frames::X11Frames,
     damage: Option<damage::XDamageMonitor>,
     input: Option<Arc<dyn InputInjector>>,
     display: Option<Arc<dyn DisplayController>>,
@@ -29,7 +31,7 @@ impl X11Backend {
     /// control are each optional and logged when missing, so a desktop that
     /// lacks one still streams.
     pub fn new(cfg: &XdaemonConfig) -> io::Result<Self> {
-        let frames = frames::X11Capture::new(cfg)?;
+        let frames = frames::X11Frames::connect(None, cfg.dump_first_frame.clone())?;
 
         // Not armed yet: damage reporting is switched on and off with the
         // capture gate, so the X server does no damage bookkeeping for us

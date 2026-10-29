@@ -1,153 +1,192 @@
-//! X11 framebuffer capture, composite-aware via per-window pixmap
-//! enumeration.
+//! X11 frames: a full grab of the root window, plus the cursor.
 //!
-//! ## Why per-window
+//! One method, the one `x11vnc` and ffmpeg's `x11grab` use: `ShmGetImage`
+//! of the whole root into a MIT-SHM segment, falling back to
+//! `GetImage(root)` when MIT-SHM is absent or the segment cannot be attached
+//! (a remote display cannot share memory, and fd passing fails over TCP).
 //!
-//! Modern WMs (Enlightenment, Mutter, KWin) ship a built-in compositor
-//! that calls `XCompositeRedirectSubwindows(root, Manual)`. After
-//! redirect, top-level windows render into off-screen pixmaps.
+//! There used to be a second method, per-window `CompositeNameWindowPixmap`
+//! capture, chosen once at startup by probing whether the compositor painted
+//! into root. On Enlightenment at autologin the probe was inconclusive (no
+//! redirected root child of at least 64x64 existed yet), the per-window path
+//! was chosen for the life of the process, and it composited nothing: the
+//! client saw only the cursor. `GetImage(root)` on the same display returned
+//! the full desktop. Root is what every X compositor this server targets
+//! paints, so root is what is captured.
 //!
-//! Whether the root window then goes stale is **compositor-dependent**, and
-//! this module used to assert it did. Mutter and KWin composite into the
-//! Composite overlay window, leaving root holding only the wallpaper — there
-//! `GetImage(root)` really does capture just the background. Enlightenment
-//! 0.27 in X11 mode redirects windows *and* paints the composited scene back
-//! into root, where per-window capture is the broken one: measured on a live
-//! E desktop, of 19 root children 11 were BadMatch (E's 1x1 `e_layer_win`
-//! stacking anchors are not redirected), 7 unmapped, and 1 real window
-//! composited — one window on black, while `GetImage(root)` returned the whole
-//! desktop including the shelf.
-//!
-//! So `pick_strategy` verifies rather than assumes: see
-//! `root_already_composited`.
-//!
-//! We tried the obvious alternative — `XCompositeGetOverlayWindow` +
-//! `GetImage` on the overlay — but that only works for XRender-based
-//! compositors. EGL/DRI3 compositors (Enlightenment-GL, Mutter-GLES)
-//! attach a DRI3 EGL surface to the overlay and render via OpenGL,
-//! Presenting pixmaps that the X server tracks under the Present
-//! extension's machinery, not Composite's. `CompositeNameWindowPixmap`
-//! on the overlay returns `BadMatch` because the overlay isn't a
-//! redirected drawable — it's a server-created drawing target.
-//!
-//! So we go window-by-window:
-//!
-//! 1. `XQueryTree(root)` returns root's children in **stacking order**
-//!    (bottom to top per X11 spec §10.7).
-//! 2. For each child that's `Viewable` and overlaps the screen:
-//!    `CompositeNameWindowPixmap(win, …)` to alias the redirected
-//!    pixmap as a drawable, then `GetImage` on that pixmap. The
-//!    pixmap contents are whatever the app last rendered into the
-//!    window — exactly what the WM's compositor would have composited.
-//! 3. Blit each window's pixels into a reusable target framebuffer at
-//!    the window's screen-space position. Bottom-to-top order means
-//!    occluded regions are correctly overwritten by the topmost window.
-//! 4. `XFixesGetCursorImage` for the cursor — pre-multiplied ARGB
-//!    pixels + hot-spot — alpha-blended on top.
-//!
-//! No per-window XShape clipping yet (windows treated as rectangular)
-//! and no per-window opacity (treated as fully opaque); compositor
-//! drop-shadows aren't captured since they're rendered by the WM into
-//! the overlay, not the windows themselves. These are cosmetic gaps
-//! we accept for the first cut; functional content (window contents +
-//! cursor) is correct.
-//!
-//! ## Fallbacks
-//!
-//! - No COMPOSITE extension → `GetImage(root)` (legacy Xvfb path).
-//! - No active compositor (no `_NET_WM_CM_S0` selection owner) →
-//!   `GetImage(root)` (root pixmap already holds the visible content).
-//! - Per-window `NameWindowPixmap` fails (BadMatch on an unredirected
-//!   child) → that window is skipped this frame and a debug log fires
-//!   the first time it happens.
+//! The root path never drew the cursor (X does not include it in an image).
+//! It is blended here from `XFixesGetCursorImage`, at `(x - xhot, y - yhot)`.
 
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use crate::util::monotonic_now_ns;
 use ghostframe_lib::FrameSubmission;
 use x11rb::connection::Connection;
-use x11rb::protocol::composite::ConnectionExt as CompositeExt;
+use x11rb::protocol::shm::{self, ConnectionExt as ShmExt};
 use x11rb::protocol::xfixes::{ConnectionExt as XfixesExt, GetCursorImageReply};
-use x11rb::protocol::xproto::{ConnectionExt, ImageFormat, MapState};
+use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
 use x11rb::rust_connection::RustConnection;
 
-/// Selected capture strategy. Logged at startup and via `source()`.
+/// Which request fills a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Strategy {
-    /// Per-window `CompositeNameWindowPixmap` + `GetImage` of each
-    /// top-level window, blitted into a reusable target buffer in
-    /// stacking order.
-    PerWindowComposite,
-    /// `GetImage(root)` — used when COMPOSITE is unavailable or when
-    /// no compositor is running (root pixmap already holds the visible
-    /// content, Xvfb-style).
-    RootGetImage,
+pub enum GrabPath {
+    /// `ShmGetImage` into a shared segment.
+    Shm,
+    /// `GetImage(root)`: the pixels travel over the X socket.
+    GetImage,
 }
 
-/// Captures frames from the X server.
-pub struct X11Capture {
+/// A memfd-backed MIT-SHM segment the X server writes root pixels into.
+struct ShmSegment {
+    seg: shm::Seg,
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl ShmSegment {
+    /// Create a `len`-byte memfd, map it, and attach it to the server
+    /// writable (`ShmGetImage` writes into it).
+    fn attach(conn: &RustConnection, len: usize) -> io::Result<Self> {
+        // SAFETY: memfd_create takes a NUL-terminated name and flags only.
+        let raw = unsafe { libc::memfd_create(c"ghostframe-shm".as_ptr(), libc::MFD_CLOEXEC) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is a fresh descriptor nothing else owns.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: ftruncate on a descriptor we own.
+        if unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: maps `len` bytes of a memfd just sized to `len`.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        // Built before the attach so an error below still unmaps.
+        let mut me = Self {
+            seg: 0,
+            ptr: ptr.cast(),
+            len,
+        };
+        me.seg = conn.generate_id().map_err(io::Error::other)?;
+        // x11rb sends the fd and closes our copy; the mapping keeps the memory.
+        conn.shm_attach_fd(me.seg, fd, false)
+            .map_err(io::Error::other)?
+            .check()
+            .map_err(io::Error::other)?;
+        Ok(me)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: `ptr` maps exactly `len` bytes for the life of `self`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for ShmSegment {
+    fn drop(&mut self) {
+        // SAFETY: `ptr`/`len` come from a successful mmap, unmapped once.
+        unsafe {
+            libc::munmap(self.ptr.cast(), self.len);
+        }
+    }
+}
+
+/// Captures full-root frames from one X display.
+pub struct X11Frames {
     conn: RustConnection,
     root: u32,
     width: u16,
     height: u16,
-    strategy: Strategy,
+    /// The segment for the current root size; `None` means `GetImage`.
+    shm: Option<ShmSegment>,
+    /// False once MIT-SHM is known not to work on this connection, so a
+    /// resize does not retry (and re-log) a failing attach every time.
+    shm_usable: bool,
     /// One-shot raw-frame dump target (`GHOSTFRAME_DUMP_FIRST_FRAME`); taken on first use.
     dump_first_frame: Option<String>,
-    /// Reusable target buffer for per-window composition. Allocated to
-    /// `width * height * 4` once; cleared (memset to 0) each frame.
-    target: Vec<u8>,
-    /// One-shot flag for the first successful per-window composite —
-    /// logs window count + dimensions so operators see we're not just
-    /// silently returning empty frames.
-    first_composite_logged: bool,
 }
 
-impl X11Capture {
-    /// Connect to `$DISPLAY` and pick a capture strategy.
-    pub fn new(cfg: &crate::config::XdaemonConfig) -> io::Result<Self> {
-        let (conn, screen_num) = x11rb::connect(None)
+impl X11Frames {
+    /// Connect to `display` (`None` = `$DISPLAY`).
+    pub fn connect(display: Option<&str>, dump_first_frame: Option<String>) -> io::Result<Self> {
+        let (conn, screen_num) = x11rb::connect(display)
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
         let screen = &conn.setup().roots[screen_num];
         let root = screen.root;
-        let width = screen.width_in_pixels;
-        let height = screen.height_in_pixels;
+        let (width, height) = (screen.width_in_pixels, screen.height_in_pixels);
 
-        let strategy = pick_strategy(&conn, root, cfg.force_root_get_image);
-        tracing::info!(width, height, ?strategy, "X11 capture connected to display");
+        // XFixes needs its version negotiated before GetCursorImage. Without
+        // it the frame is still correct, minus the cursor.
+        match conn.xfixes_query_version(5, 0).map(|c| c.reply()) {
+            Ok(Ok(_)) => {}
+            _ => tracing::warn!("XFIXES unavailable; frames will not include the cursor"),
+        }
 
-        let buf_size = (width as usize) * (height as usize) * 4;
-        Ok(Self {
+        let shm_usable = shm_supported(&conn);
+        let mut me = Self {
             conn,
             root,
             width,
             height,
-            strategy,
-            dump_first_frame: cfg.dump_first_frame.clone(),
-            target: vec![0u8; buf_size],
-            first_composite_logged: false,
-        })
+            shm: None,
+            shm_usable,
+            dump_first_frame,
+        };
+        me.ensure_segment();
+        tracing::info!(width, height, path = ?me.path(), "X11 capture connected to display");
+        Ok(me)
     }
 
-    /// Capture identifier for tests and diagnostic logging.
-    #[allow(dead_code)]
-    pub fn source(&self) -> &'static str {
-        match self.strategy {
-            Strategy::PerWindowComposite => "per-window-composite",
-            Strategy::RootGetImage => "root",
+    /// How frames are grabbed right now.
+    pub fn path(&self) -> GrabPath {
+        if self.shm.is_some() {
+            GrabPath::Shm
+        } else {
+            GrabPath::GetImage
         }
     }
 
-    /// Poll the root window's current geometry and, if it changed since
-    /// the last capture, rebuild the cached dimensions and target buffer.
+    /// Make the segment match the root size, or drop to `GetImage` for good
+    /// if MIT-SHM cannot be used.
+    fn ensure_segment(&mut self) {
+        if !self.shm_usable {
+            return;
+        }
+        let len = usize::from(self.width) * usize::from(self.height) * 4;
+        if self.shm.as_ref().is_some_and(|s| s.len == len) {
+            return;
+        }
+        if let Some(old) = self.shm.take() {
+            let _ = self.conn.shm_detach(old.seg);
+        }
+        match ShmSegment::attach(&self.conn, len) {
+            Ok(s) => self.shm = Some(s),
+            Err(e) => {
+                tracing::warn!(error = %e, "MIT-SHM segment attach failed; using GetImage(root)");
+                self.shm_usable = false;
+            }
+        }
+    }
+
+    /// Poll the root window's current geometry and, if it changed since the
+    /// last capture, adopt it and resize the segment.
     ///
     /// Polled once per captured frame rather than driven by
-    /// `RRScreenChangeNotify`: this adds one `GetGeometry` round-trip next
-    /// to the `GetImage` the capture already performs -- negligible -- and,
-    /// unlike an event subscription, it can't miss a notification and
-    /// doesn't need a second X connection to listen on. If profiling ever
-    /// shows the round-trip matters, switching to the RandR event is the
-    /// natural upgrade; until then, this was a deliberate choice, not an
-    /// oversight.
+    /// `RRScreenChangeNotify`: one `GetGeometry` round trip next to the grab
+    /// is negligible, and unlike an event subscription it cannot miss a
+    /// notification or need a second connection to listen on.
     fn refresh_geometry(&mut self) -> io::Result<()> {
         let geom = self
             .conn
@@ -165,262 +204,103 @@ impl X11Capture {
             );
             self.width = w;
             self.height = h;
-            self.target = vec![0u8; (w as usize) * (h as usize) * 4];
-            // We deliberately do NOT re-run `pick_strategy` here.
-            // `pick_strategy` depends on (a) whether the COMPOSITE
-            // extension is present -- fixed for the lifetime of this X
-            // connection -- and (b) who currently owns `_NET_WM_CM_S0`,
-            // i.e. whether a compositor is running. A RandR mode change
-            // resizes the existing compositor's output in place; it does
-            // not tear down or restart the compositing manager, so
-            // selection ownership is unaffected and re-probing here would
-            // just be an extra round trip that always finds the same
-            // answer. There's also no cached *root pixmap* to invalidate:
-            // `capture_root` re-issues `GetImage` on `self.root` (the
-            // window, not a pixmap) fresh every call. If we ever observe
-            // a compositor start or stop without an ghostframe-server restart,
-            // that would be the trigger to reconsider this.
+            self.ensure_segment();
         }
         Ok(())
     }
 
-    /// Capture a single frame.
-    pub fn capture(&mut self, timestamp_us: u32) -> io::Result<FrameSubmission> {
-        self.refresh_geometry()?;
-        let frame = match self.strategy {
-            Strategy::PerWindowComposite => self.capture_composite(timestamp_us)?,
-            Strategy::RootGetImage => self.capture_root(timestamp_us)?,
-        };
-        // One-shot diagnostic: dump the first captured frame to the path
-        // in `GHOSTFRAME_DUMP_FIRST_FRAME` so we can byte-compare against
-        // `xwd -root` / `import -window root`. Unset on first call so
-        // subsequent frames are not re-dumped. Only fires on the CPU
-        // path (pixels.len() > 0); the DMA-BUF path would write 0 bytes.
-        if !frame.pixels.is_empty() {
-            if let Some(path) = self.dump_first_frame.take() {
-                let header = format!(
-                    "ghostframe-bgra width={} height={} stride={}\n",
-                    frame.width, frame.height, frame.stride
-                );
-                let _ = std::fs::write(format!("{path}.meta"), header.as_bytes());
-                let _ = std::fs::write(&path, &frame.pixels);
-                tracing::info!(
-                    path = %path,
-                    width = frame.width,
-                    height = frame.height,
-                    bytes = frame.pixels.len(),
-                    "GHOSTFRAME_DUMP_FIRST_FRAME: dumped raw BGRA to disk; \
-                     compare with `xwd -root` / `import -window root` to \
-                     verify whether XGetImage(root) is returning the visible \
-                     desktop or stale/empty content"
-                );
+    /// The root pixels, BGRX, `width * 4` per row, without the cursor.
+    fn grab(&mut self) -> io::Result<Vec<u8>> {
+        let (w, h) = (self.width, self.height);
+        let want = usize::from(w) * usize::from(h) * 4;
+        if let Some(seg) = &self.shm {
+            let reply = self
+                .conn
+                .shm_get_image(
+                    self.root,
+                    0,
+                    0,
+                    w,
+                    h,
+                    !0,
+                    ImageFormat::Z_PIXMAP.into(),
+                    seg.seg,
+                    0,
+                )
+                .map_err(io::Error::other)?
+                .reply()
+                .map_err(io::Error::other)?;
+            if reply.size as usize != want {
+                return Err(io::Error::other(format!(
+                    "ShmGetImage returned {} bytes for {w}x{h}, expected {want} (root is not 32 bpp)",
+                    reply.size
+                )));
             }
+            return Ok(seg.bytes()[..want].to_vec());
         }
-        Ok(frame)
-    }
-
-    /// Per-window composite path.
-    fn capture_composite(&mut self, timestamp_us: u32) -> io::Result<FrameSubmission> {
-        // Reset target to opaque black — windows below the topmost
-        // partially-covered region still need backing pixels.
-        // memset to 0x00 RGB + 0xFF alpha (BGRA layout). Browsers
-        // render the A=0 alpha case as transparent which then composes
-        // against the page background — force A=255 so the canvas
-        // shows opaque black where no window is.
-        for chunk in self.target.chunks_exact_mut(4) {
-            chunk[0] = 0; // B
-            chunk[1] = 0; // G
-            chunk[2] = 0; // R
-            chunk[3] = 0xff; // A
-        }
-
-        // Enumerate root's children in stacking order (bottom → top).
-        let tree = self
+        let reply = self
             .conn
-            .query_tree(self.root)
+            .get_image(ImageFormat::Z_PIXMAP, self.root, 0, 0, w, h, !0)
             .map_err(io::Error::other)?
             .reply()
             .map_err(io::Error::other)?;
+        Ok(reply.data)
+    }
 
-        let mut composited = 0usize;
-        let mut skipped_unmapped = 0usize;
-        let mut skipped_bad_match = 0usize;
-
-        for &child in &tree.children {
-            // Skip non-Viewable windows. GetWindowAttributes + GetGeometry
-            // are batched per window because the protocol is async — but
-            // for clarity we do them serially per window here. Roughly
-            // tens of children on a real desktop; not worth the
-            // pipelining complexity yet.
-            let attrs = match self.conn.get_window_attributes(child) {
-                Ok(c) => match c.reply() {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                },
-                Err(_) => continue,
-            };
-            if attrs.map_state != MapState::VIEWABLE {
-                skipped_unmapped += 1;
-                continue;
-            }
-
-            let geom = match self.conn.get_geometry(child) {
-                Ok(c) => match c.reply() {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                },
-                Err(_) => continue,
-            };
-
-            // Off-screen / zero-size → skip.
-            if geom.width == 0 || geom.height == 0 {
-                continue;
-            }
-            if window_is_offscreen(
-                geom.x,
-                geom.y,
-                geom.width,
-                geom.height,
-                self.width,
-                self.height,
-            ) {
-                continue;
-            }
-
-            // Name the redirected pixmap.
-            let pixmap_id = self.conn.generate_id().map_err(io::Error::other)?;
-            let name_cookie = self
-                .conn
-                .composite_name_window_pixmap(child, pixmap_id)
-                .map_err(io::Error::other)?;
-            if let Err(e) = name_cookie.check() {
-                // BadMatch on a non-redirected child — happens for
-                // override-redirect popup windows the WM didn't grab,
-                // or for the overlay window. Skip silently after the
-                // first occurrence.
-                if !self.first_composite_logged {
-                    tracing::debug!(
-                        window = child,
-                        error = %e,
-                        "NameWindowPixmap failed; skipping window"
-                    );
-                }
-                skipped_bad_match += 1;
-                continue;
-            }
-
-            let img = match self.conn.get_image(
-                ImageFormat::Z_PIXMAP,
-                pixmap_id,
-                0,
-                0,
-                geom.width,
-                geom.height,
-                !0,
-            ) {
-                Ok(cookie) => match cookie.reply() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::debug!(window = child, error = %e, "GetImage on window pixmap failed");
-                        let _ = self.conn.free_pixmap(pixmap_id);
-                        continue;
-                    }
-                },
-                Err(e) => {
-                    tracing::debug!(window = child, error = %e, "GetImage send failed");
-                    let _ = self.conn.free_pixmap(pixmap_id);
-                    continue;
-                }
-            };
-            let _ = self.conn.free_pixmap(pixmap_id);
-
-            blit_window(
-                &mut self.target,
-                self.width as i32,
-                self.height as i32,
-                &img.data,
-                BlitRect {
-                    dst_x: geom.x as i32,
-                    dst_y: geom.y as i32,
-                    src_w: geom.width as i32,
-                    src_h: geom.height as i32,
-                },
-            );
-            composited += 1;
-        }
-
-        // Cursor overlay. Best-effort — if XFixes isn't present we just
-        // skip; the captured frame is correct minus the cursor.
+    /// Capture a single frame: root, then the cursor on top.
+    pub fn capture(&mut self, timestamp_us: u32) -> io::Result<FrameSubmission> {
+        self.refresh_geometry()?;
+        let mut pixels = self.grab()?;
+        // Best effort: without XFixes the frame is correct minus the cursor.
         if let Ok(cookie) = self.conn.xfixes_get_cursor_image() {
             if let Ok(cursor) = cookie.reply() {
                 blit_cursor(
-                    &mut self.target,
-                    self.width as i32,
-                    self.height as i32,
+                    &mut pixels,
+                    i32::from(self.width),
+                    i32::from(self.height),
                     &cursor,
                 );
             }
         }
-
         let capture_done_ns = monotonic_now_ns();
-
-        if !self.first_composite_logged {
-            tracing::info!(
-                children = tree.children.len(),
-                composited,
-                skipped_unmapped,
-                skipped_bad_match,
-                "first per-window composite frame produced"
-            );
-            self.first_composite_logged = true;
-        }
-
-        let stride = (self.width as u32) * 4;
-        Ok(FrameSubmission {
-            width: self.width as u32,
-            height: self.height as u32,
-            stride,
-            pixels: self.target.clone(),
-            dmabuf_fd: None,
-            timestamp_us,
-            damage_tiles: None,
-            capture_done_ns,
-        })
-    }
-
-    /// `GetImage(root)` — used when no compositor is running.
-    fn capture_root(&self, timestamp_us: u32) -> io::Result<FrameSubmission> {
-        let reply = self
-            .conn
-            .get_image(
-                ImageFormat::Z_PIXMAP,
-                self.root,
-                0,
-                0,
-                self.width,
-                self.height,
-                !0,
-            )
-            .map_err(io::Error::other)?
-            .reply()
-            .map_err(io::Error::other)?;
-
-        let capture_done_ns = monotonic_now_ns();
-
-        let width = self.width as u32;
-        let height = self.height as u32;
-        let stride = width * 4;
-
-        Ok(FrameSubmission {
+        let width = u32::from(self.width);
+        let height = u32::from(self.height);
+        let frame = FrameSubmission {
             width,
             height,
-            stride,
-            pixels: reply.data,
+            stride: width * 4,
+            pixels,
             dmabuf_fd: None,
             timestamp_us,
             damage_tiles: None,
             capture_done_ns,
-        })
+        };
+        // One-shot diagnostic: dump the first frame to the path in
+        // `GHOSTFRAME_DUMP_FIRST_FRAME`, to byte-compare against `xwd -root`.
+        if let Some(path) = self.dump_first_frame.take() {
+            let header = format!(
+                "ghostframe-bgra width={} height={} stride={}\n",
+                frame.width, frame.height, frame.stride
+            );
+            let _ = std::fs::write(format!("{path}.meta"), header.as_bytes());
+            let _ = std::fs::write(&path, &frame.pixels);
+            tracing::info!(
+                path = %path,
+                width = frame.width,
+                height = frame.height,
+                bytes = frame.pixels.len(),
+                "GHOSTFRAME_DUMP_FIRST_FRAME: dumped raw BGRA to disk"
+            );
+        }
+        Ok(frame)
+    }
+}
+
+/// MIT-SHM 1.2 (`AttachFd`) is present on this connection.
+fn shm_supported(conn: &RustConnection) -> bool {
+    match conn.shm_query_version().map(|c| c.reply()) {
+        Ok(Ok(v)) => (v.major_version, v.minor_version) >= (1, 2),
+        _ => false,
     }
 }
 
@@ -434,303 +314,6 @@ fn resize_needed(current: (u16, u16), actual: (u16, u16)) -> Option<(u16, u16)> 
         return None;
     }
     Some(actual)
-}
-
-/// True if a window at (`x`, `y`) of size `w` x `h` lies entirely outside a
-/// `screen_w` x `screen_h` screen. Done in i32: the sum `x + w as i16` and the
-/// `screen as i16` cast overflowed (debug panic, release wrap) for windows
-/// near the i16 limits or screens wider than 32767.
-fn window_is_offscreen(x: i16, y: i16, w: u16, h: u16, screen_w: u16, screen_h: u16) -> bool {
-    let (x, y, w, h) = (i32::from(x), i32::from(y), i32::from(w), i32::from(h));
-    x >= i32::from(screen_w) || y >= i32::from(screen_h) || x + w <= 0 || y + h <= 0
-}
-
-/// Pick a strategy by probing COMPOSITE + `_NET_WM_CM_S0`.
-///
-/// `GHOSTFRAME_FORCE_ROOT_GET_IMAGE=1` is a diagnostic escape hatch:
-/// always use the plain GetImage(root) path regardless of compositor
-/// presence. Lets operators reproduce exactly what `xwd -root` /
-/// `import -window root` do, to verify whether their compositor's
-/// rendering is reachable via the legacy path.
-fn pick_strategy(conn: &RustConnection, root: u32, force_root_get_image: bool) -> Strategy {
-    if force_root_get_image {
-        tracing::info!(
-            "GHOSTFRAME_FORCE_ROOT_GET_IMAGE set; bypassing compositor probe and \
-             using plain GetImage(root) — same call `import -window root` makes"
-        );
-        return Strategy::RootGetImage;
-    }
-    let composite_present = match conn.query_extension(b"Composite") {
-        Ok(c) => c.reply().map(|r| r.present).unwrap_or(false),
-        Err(_) => false,
-    };
-    if !composite_present {
-        tracing::warn!(
-            "COMPOSITE extension not present; falling back to GetImage on root. \
-             GL/EGL-compositor desktops will appear empty."
-        );
-        return Strategy::RootGetImage;
-    }
-
-    // XFixes is required for cursor capture — not strictly necessary for
-    // the composite path itself, but log if absent so operators know
-    // why the cursor is missing.
-    let xfixes_present = match conn.query_extension(b"XFIXES") {
-        Ok(c) => c.reply().map(|r| r.present).unwrap_or(false),
-        Err(_) => false,
-    };
-    if !xfixes_present {
-        tracing::warn!(
-            "XFIXES extension not present; per-window composite will work but \
-             the captured frame won't include the cursor"
-        );
-    } else {
-        // XFixes requires version negotiation before use. We don't
-        // care about the reply, only that the server records the
-        // negotiated version.
-        if let Ok(c) = conn.xfixes_query_version(5, 0) {
-            let _ = c.reply();
-        }
-    }
-
-    // Probe for an active compositor via `_NET_WM_CM_S0` selection
-    // ownership (EWMH §"Compositing Manager"). If no client owns it,
-    // there's no compositor — root pixmap holds the visible content.
-    let cm_owner = match conn.intern_atom(false, b"_NET_WM_CM_S0") {
-        Ok(c) => match c.reply() {
-            Ok(atom_reply) => match conn.get_selection_owner(atom_reply.atom) {
-                Ok(c) => c.reply().map(|r| r.owner).unwrap_or(0),
-                Err(_) => 0,
-            },
-            Err(_) => 0,
-        },
-        Err(_) => 0,
-    };
-    if cm_owner == 0 {
-        tracing::info!("no compositor owns _NET_WM_CM_S0; capturing root pixmap directly");
-        return Strategy::RootGetImage;
-    }
-
-    // A compositor existing does NOT mean the root pixmap is stale.
-    //
-    // Mutter and KWin composite into the Composite overlay window and leave
-    // root holding only the wallpaper, so per-window capture is required.
-    // Enlightenment 0.27 in X11 mode redirects windows AND paints the
-    // composited scene straight into root. There, per-window capture produces
-    // one window on black: measured on a live E desktop, 19 root children were
-    // 11 BadMatch (E's 1x1 e_layer_win stacking anchors, which are not
-    // redirected), 7 unmapped, and exactly 1 real window composited -- while
-    // GetImage(root) returned the complete desktop, shelf and all.
-    //
-    // So verify the inference instead of making it.
-    match root_already_composited(conn, root) {
-        Some(true) => {
-            tracing::info!(
-                compositor_owner = cm_owner,
-                "compositor detected, but root already holds the composited result \
-                 (a redirected window's pixmap matches the same rectangle of root) \
-                 — using GetImage(root)"
-            );
-            Strategy::RootGetImage
-        }
-        other => {
-            tracing::info!(
-                compositor_owner = cm_owner,
-                root_check = ?other,
-                "compositor detected; using per-window NameWindowPixmap + GetImage \
-                 composite (root={root})"
-            );
-            Strategy::PerWindowComposite
-        }
-    }
-}
-
-/// Fraction of pixels in `a` and `b` equal within `tol` per channel.
-///
-/// Both slices are BGRA (or BGRX) of the same length; alpha is ignored because
-/// root and a redirected pixmap disagree about it routinely.
-fn fraction_matching(a: &[u8], b: &[u8], tol: u8) -> f32 {
-    let n = a.len().min(b.len()) / 4;
-    if n == 0 {
-        return 0.0;
-    }
-    let mut hit = 0usize;
-    for i in 0..n {
-        let (p, q) = (&a[i * 4..i * 4 + 3], &b[i * 4..i * 4 + 3]);
-        if p.iter().zip(q).all(|(x, y)| x.abs_diff(*y) <= tol) {
-            hit += 1;
-        }
-    }
-    hit as f32 / n as f32
-}
-
-/// Does the root window already contain composited window content?
-///
-/// Takes the largest viewable, on-screen child whose redirected pixmap we can
-/// name, and compares that pixmap against the same screen rectangle of root.
-/// A match means root is showing composited windows rather than bare wallpaper.
-///
-/// `None` = could not test (no nameable window, or a request failed). Callers
-/// treat `None` and `Some(false)` alike and keep the per-window path, so this
-/// only ever *adds* a fallback on positive proof — it cannot turn a working
-/// composite desktop into a broken one.
-fn root_already_composited(conn: &RustConnection, root: u32) -> Option<bool> {
-    let tree = conn.query_tree(root).ok()?.reply().ok()?;
-    let root_geom = conn.get_geometry(root).ok()?.reply().ok()?;
-
-    // Largest on-screen viewable child: the biggest sample gives the most
-    // reliable comparison, and a 1x1 anchor window tells us nothing.
-    let mut best: Option<(u32, x11rb::protocol::xproto::GetGeometryReply)> = None;
-    for &child in &tree.children {
-        let attrs = match conn.get_window_attributes(child).ok()?.reply() {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
-        if attrs.map_state != MapState::VIEWABLE {
-            continue;
-        }
-        let g = match conn.get_geometry(child).ok()?.reply() {
-            Ok(g) => g,
-            Err(_) => continue,
-        };
-        // Must lie fully inside the screen: a clipped window would compare a
-        // different rectangle on each side.
-        if g.width < 64
-            || g.height < 64
-            || g.x < 0
-            || g.y < 0
-            || (g.x as i32 + g.width as i32) > root_geom.width as i32
-            || (g.y as i32 + g.height as i32) > root_geom.height as i32
-        {
-            continue;
-        }
-        let area = g.width as u32 * g.height as u32;
-        if best.as_ref().is_none_or(|(a, _)| area > *a) {
-            best = Some((area, g));
-        }
-    }
-    let (_, geom) = best?;
-
-    // Re-walk to find the window matching that geometry and name its pixmap.
-    for &child in &tree.children {
-        let g = match conn.get_geometry(child).ok()?.reply() {
-            Ok(g) => g,
-            Err(_) => continue,
-        };
-        if g.x != geom.x || g.y != geom.y || g.width != geom.width || g.height != geom.height {
-            continue;
-        }
-        let pixmap_id = conn.generate_id().ok()?;
-        if conn
-            .composite_name_window_pixmap(child, pixmap_id)
-            .ok()?
-            .check()
-            .is_err()
-        {
-            continue;
-        }
-        let win_img = conn
-            .get_image(
-                ImageFormat::Z_PIXMAP,
-                pixmap_id,
-                0,
-                0,
-                geom.width,
-                geom.height,
-                !0,
-            )
-            .ok()
-            .and_then(|c| c.reply().ok());
-        let root_img = conn
-            .get_image(
-                ImageFormat::Z_PIXMAP,
-                root,
-                geom.x,
-                geom.y,
-                geom.width,
-                geom.height,
-                !0,
-            )
-            .ok()
-            .and_then(|c| c.reply().ok());
-        let _ = conn.free_pixmap(pixmap_id);
-
-        let (w, r) = (win_img?, root_img?);
-        // Tolerance 8 absorbs the compositor's own resampling; 0.90 leaves room
-        // for a cursor or a drop-shadow edge inside the sampled rectangle.
-        let frac = fraction_matching(&w.data, &r.data, 8);
-        tracing::debug!(
-            window = child,
-            match_fraction = frac,
-            "root-vs-window composite probe"
-        );
-        return Some(frac >= 0.90);
-    }
-    None
-}
-
-/// Bounds-and-source descriptor passed to `blit_window` — kept as a
-/// struct so the function signature stays narrow.
-struct BlitRect {
-    /// Destination origin within the target framebuffer.
-    dst_x: i32,
-    dst_y: i32,
-    /// Source dimensions; source layout is `src_w * 4` BGRA bytes per row.
-    src_w: i32,
-    src_h: i32,
-}
-
-/// Copy a window's BGRA pixels into the target framebuffer at the
-/// destination origin in `rect`, clipping to the framebuffer's bounds.
-///
-/// Source layout: contiguous BGRA rows, stride = `rect.src_w * 4`. Treats
-/// the window as fully opaque (no per-pixel alpha blending) — opacity
-/// support is a follow-up.
-fn blit_window(target: &mut [u8], target_w: i32, target_h: i32, src: &[u8], rect: BlitRect) {
-    let BlitRect {
-        dst_x,
-        dst_y,
-        src_w,
-        src_h,
-    } = rect;
-    // Compute the clipped destination rectangle.
-    let x0 = dst_x.max(0);
-    let y0 = dst_y.max(0);
-    let x1 = (dst_x + src_w).min(target_w);
-    let y1 = (dst_y + src_h).min(target_h);
-    if x0 >= x1 || y0 >= y1 {
-        return;
-    }
-
-    let src_off_x = (x0 - dst_x) as usize;
-    let src_off_y = (y0 - dst_y) as usize;
-    let copy_w = (x1 - x0) as usize;
-    let copy_h = (y1 - y0) as usize;
-
-    let target_stride = (target_w as usize) * 4;
-    let src_stride = (src_w as usize) * 4;
-
-    // Defensive: source buffer must have enough bytes.
-    let needed = src_off_y * src_stride + src_off_x * 4 + (copy_h - 1) * src_stride + copy_w * 4;
-    if needed > src.len() {
-        return;
-    }
-
-    for row in 0..copy_h {
-        let src_row = (src_off_y + row) * src_stride + src_off_x * 4;
-        let dst_row = ((y0 as usize) + row) * target_stride + (x0 as usize) * 4;
-        let src_slice = &src[src_row..src_row + copy_w * 4];
-        let dst_slice = &mut target[dst_row..dst_row + copy_w * 4];
-        // The window pixmap may have depth=24 (X-padded BGRX) — we
-        // copy verbatim and let the encoder ignore the alpha channel.
-        dst_slice.copy_from_slice(src_slice);
-        // Force alpha to 255 in case the pixmap is depth-24 with
-        // garbage alpha. The encoder treats this as opaque BGR; we
-        // don't want stray alpha values to confuse downstream stages.
-        for i in (3..copy_w * 4).step_by(4) {
-            dst_slice[i] = 0xff;
-        }
-    }
 }
 
 /// Alpha-blend the cursor onto the target framebuffer.
@@ -797,152 +380,8 @@ fn blit_cursor(target: &mut [u8], target_w: i32, target_h: i32, cursor: &GetCurs
 }
 
 #[cfg(test)]
-mod fraction_matching_tests {
-    use super::fraction_matching;
-
-    fn px(b: u8, g: u8, r: u8) -> [u8; 4] {
-        [b, g, r, 0xff]
-    }
-
-    #[test]
-    fn identical_buffers_match_completely() {
-        let a: Vec<u8> = [px(10, 20, 30), px(40, 50, 60)].concat();
-        assert_eq!(fraction_matching(&a, &a, 0), 1.0);
-    }
-
-    #[test]
-    fn alpha_is_ignored() {
-        // Root and a redirected pixmap disagree about alpha routinely; if that
-        // counted, every comparison on a desktop would fail.
-        let a: Vec<u8> = [[1, 2, 3, 0x00]].concat();
-        let b: Vec<u8> = [[1, 2, 3, 0xff]].concat();
-        assert_eq!(fraction_matching(&a, &b, 0), 1.0);
-    }
-
-    #[test]
-    fn tolerance_is_per_channel_and_inclusive() {
-        let a: Vec<u8> = [px(10, 10, 10)].concat();
-        assert_eq!(fraction_matching(&a, &[px(18, 10, 10)].concat(), 8), 1.0);
-        assert_eq!(fraction_matching(&a, &[px(19, 10, 10)].concat(), 8), 0.0);
-        // A single channel over tolerance disqualifies the pixel.
-        assert_eq!(fraction_matching(&a, &[px(10, 10, 30)].concat(), 8), 0.0);
-    }
-
-    #[test]
-    fn partial_match_is_the_pixel_fraction() {
-        let a: Vec<u8> = [px(0, 0, 0), px(0, 0, 0), px(0, 0, 0), px(0, 0, 0)].concat();
-        let b: Vec<u8> = [px(0, 0, 0), px(0, 0, 0), px(0, 0, 0), px(99, 99, 99)].concat();
-        assert_eq!(fraction_matching(&a, &b, 0), 0.75);
-    }
-
-    #[test]
-    fn mismatched_lengths_compare_the_shared_prefix() {
-        // GetImage on root and on a pixmap can disagree in length if the
-        // geometry shifted between the two round trips. Comparing the prefix
-        // beats panicking on a diagnostic path.
-        let a: Vec<u8> = [px(1, 1, 1), px(2, 2, 2)].concat();
-        let b: Vec<u8> = [px(1, 1, 1)].concat();
-        assert_eq!(fraction_matching(&a, &b, 0), 1.0);
-    }
-
-    #[test]
-    fn empty_input_does_not_divide_by_zero() {
-        assert_eq!(fraction_matching(&[], &[], 0), 0.0);
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn offscreen_check_does_not_overflow_i16() {
-        // x + w = 65534 overflows i16; the window is still visible.
-        assert!(!window_is_offscreen(-1, 0, 65535, 10, 100, 100));
-        assert!(!window_is_offscreen(32767 - 5, 0, 65535, 10, 40000, 100));
-        // Screen wider than i16::MAX: `as i16` used to make this negative.
-        assert!(!window_is_offscreen(10, 10, 20, 20, 40000, 40000));
-        assert!(window_is_offscreen(100, 0, 10, 10, 100, 100));
-        assert!(window_is_offscreen(-20, 0, 20, 10, 100, 100));
-        assert!(window_is_offscreen(0, -10, 10, 10, 100, 100));
-        assert!(!window_is_offscreen(-19, 0, 20, 10, 100, 100));
-    }
-
-    fn make_solid(w: i32, h: i32, color: [u8; 4]) -> Vec<u8> {
-        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
-        for px in buf.chunks_exact_mut(4) {
-            px.copy_from_slice(&color);
-        }
-        buf
-    }
-
-    #[test]
-    fn blit_window_inside_bounds_copies_pixels() {
-        let mut target = vec![0u8; 8 * 8 * 4];
-        let src = make_solid(2, 2, [10, 20, 30, 0]); // BGRA, alpha will be forced to 255
-        blit_window(
-            &mut target,
-            8,
-            8,
-            &src,
-            BlitRect {
-                dst_x: 1,
-                dst_y: 1,
-                src_w: 2,
-                src_h: 2,
-            },
-        );
-        // Pixel (1,1) and (2,2) should be [10,20,30,255]; (0,0) untouched.
-        let idx = |x: usize, y: usize| (y * 8 + x) * 4;
-        assert_eq!(&target[idx(1, 1)..idx(1, 1) + 4], &[10, 20, 30, 0xff]);
-        assert_eq!(&target[idx(2, 2)..idx(2, 2) + 4], &[10, 20, 30, 0xff]);
-        assert_eq!(&target[idx(0, 0)..idx(0, 0) + 4], &[0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn blit_window_clips_to_target_left_edge() {
-        let mut target = vec![0u8; 4 * 4 * 4];
-        let src = make_solid(4, 4, [99, 0, 0, 0]);
-        // dst_x = -2: 2 leftmost cols of src are clipped, right 2 land in target cols 0..2
-        blit_window(
-            &mut target,
-            4,
-            4,
-            &src,
-            BlitRect {
-                dst_x: -2,
-                dst_y: 0,
-                src_w: 4,
-                src_h: 4,
-            },
-        );
-        // Row 0 col 0 should be src[(0,2)] which is solid color.
-        let idx = |x: usize, y: usize| (y * 4 + x) * 4;
-        assert_eq!(target[idx(0, 0)], 99);
-        // Col 2 is outside the blit (clip stopped at x=1) → untouched 0.
-        assert_eq!(target[idx(2, 0)], 0);
-        assert_eq!(target[idx(3, 0)], 0);
-    }
-
-    #[test]
-    fn blit_window_fully_off_screen_is_noop() {
-        let mut target = vec![42u8; 4 * 4 * 4];
-        let backup = target.clone();
-        let src = make_solid(2, 2, [99, 0, 0, 0]);
-        blit_window(
-            &mut target,
-            4,
-            4,
-            &src,
-            BlitRect {
-                dst_x: -5,
-                dst_y: -5,
-                src_w: 2,
-                src_h: 2,
-            },
-        );
-        assert_eq!(target, backup);
-    }
 
     #[test]
     fn a_changed_root_geometry_requires_a_resize() {
@@ -965,25 +404,164 @@ mod tests {
         assert_eq!(resize_needed((1280, 800), (1280, 0)), None);
     }
 
+    /// A 3x2 opaque white cursor with its hotspot at (1, 1), pointer at
+    /// (5, 4): the image's top-left lands at (4, 3), nowhere else changes.
     #[test]
-    fn blit_window_forces_alpha_255_for_depth24_sources() {
-        let mut target = vec![0u8; 2 * 2 * 4];
-        // Source has alpha=0 (X depth-24 padding); blit must rewrite to 255.
-        let src = vec![1, 2, 3, 0, 4, 5, 6, 0, 7, 8, 9, 0, 10, 11, 12, 0];
-        blit_window(
-            &mut target,
-            2,
-            2,
-            &src,
-            BlitRect {
-                dst_x: 0,
-                dst_y: 0,
-                src_w: 2,
-                src_h: 2,
-            },
-        );
-        for px in target.chunks_exact(4) {
-            assert_eq!(px[3], 0xff);
+    fn blit_cursor_places_the_image_at_pointer_minus_hotspot() {
+        let (w, h) = (10i32, 8i32);
+        let mut target = vec![0u8; (w * h * 4) as usize];
+        let cursor = GetCursorImageReply {
+            x: 5,
+            y: 4,
+            width: 3,
+            height: 2,
+            xhot: 1,
+            yhot: 1,
+            cursor_image: vec![0xffff_ffff; 6],
+            ..Default::default()
+        };
+        blit_cursor(&mut target, w, h, &cursor);
+        for y in 0..h {
+            for x in 0..w {
+                let px = &target[((y * w + x) * 4) as usize..][..4];
+                let inside = (4..7).contains(&x) && (3..5).contains(&y);
+                let want: &[u8] = if inside { &[255; 4] } else { &[0; 4] };
+                assert_eq!(px, want, "pixel ({x},{y})");
+            }
         }
+    }
+
+    #[test]
+    fn blit_cursor_blends_premultiplied_alpha() {
+        // 50% black over white: out = 0 + 255 * (255 - 128) / 255 = 127.
+        let mut target = vec![255u8; 4];
+        let cursor = GetCursorImageReply {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            cursor_image: vec![0x8000_0000],
+            ..Default::default()
+        };
+        blit_cursor(&mut target, 1, 1, &cursor);
+        assert_eq!(target, [127, 127, 127, 255]);
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    //! Against a private Xvfb (`test_support::PrivateXvfb`), so painting
+    //! root or disabling MIT-SHM never touches another test or a session.
+    use super::*;
+    use crate::capture::x11::test_support::PrivateXvfb;
+    use x11rb::protocol::xproto::{ChangeWindowAttributesAux, CreateGCAux};
+
+    const W: u16 = 64;
+    const H: u16 = 48;
+
+    /// Paint a deterministic, non-uniform image into root.
+    fn paint_root(display: &str) {
+        let (conn, n) = x11rb::connect(Some(display)).unwrap();
+        let screen = &conn.setup().roots[n];
+        let gc = conn.generate_id().unwrap();
+        conn.create_gc(gc, screen.root, &CreateGCAux::new())
+            .unwrap();
+        let mut data = vec![0u8; usize::from(W) * usize::from(H) * 4];
+        for (i, px) in data.chunks_exact_mut(4).enumerate() {
+            let (x, y) = (i % usize::from(W), i / usize::from(W));
+            px.copy_from_slice(&[(x * 7) as u8, (y * 5) as u8, (x ^ y) as u8, 0]);
+        }
+        conn.put_image(
+            ImageFormat::Z_PIXMAP,
+            screen.root,
+            gc,
+            W,
+            H,
+            0,
+            0,
+            0,
+            screen.root_depth,
+            &data,
+        )
+        .unwrap();
+        conn.get_input_focus().unwrap().reply().unwrap();
+    }
+
+    fn root_get_image(display: &str) -> Vec<u8> {
+        let (conn, n) = x11rb::connect(Some(display)).unwrap();
+        let s = &conn.setup().roots[n];
+        conn.get_image(ImageFormat::Z_PIXMAP, s.root, 0, 0, W, H, !0)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .data
+    }
+
+    #[test]
+    fn shm_grab_is_byte_identical_to_get_image() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "64x48x24"]);
+        paint_root(x.display());
+        let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
+        assert_eq!(f.path(), GrabPath::Shm);
+        let shm = f.grab().unwrap();
+        assert!(shm.iter().any(|&b| b != 0), "root was not painted");
+        assert_eq!(shm, root_get_image(x.display()));
+    }
+
+    #[test]
+    fn falls_back_to_get_image_without_mit_shm() {
+        let x = PrivateXvfb::spawn(&["-extension", "MIT-SHM", "-screen", "0", "64x48x24"]);
+        paint_root(x.display());
+        let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
+        assert_eq!(f.path(), GrabPath::GetImage);
+        let frame = f.capture(0).unwrap();
+        assert_eq!((frame.width, frame.height, frame.stride), (64, 48, 256));
+        assert_eq!(f.grab().unwrap(), root_get_image(x.display()));
+    }
+
+    /// The live cursor (a glyph from the server's built-in cursor font) is
+    /// drawn into the frame, and only inside its rectangle at the hotspot.
+    #[test]
+    fn capture_draws_the_cursor_at_its_hotspot() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "64x48x24"]);
+        let (conn, n) = x11rb::connect(Some(x.display())).unwrap();
+        let root = conn.setup().roots[n].root;
+        let font = conn.generate_id().unwrap();
+        conn.open_font(font, b"cursor").unwrap();
+        let cursor = conn.generate_id().unwrap();
+        // XC_crosshair (34) with its mask (35): white on black.
+        conn.create_glyph_cursor(cursor, font, font, 34, 35, 0, 0, 0, 0xffff, 0xffff, 0xffff)
+            .unwrap();
+        conn.change_window_attributes(root, &ChangeWindowAttributesAux::new().cursor(cursor))
+            .unwrap();
+        conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, 30, 20)
+            .unwrap();
+        conn.get_input_focus().unwrap().reply().unwrap();
+
+        let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
+        let plain = f.grab().unwrap();
+        let frame = f.capture(0).unwrap();
+        let cur = f.conn.xfixes_get_cursor_image().unwrap().reply().unwrap();
+        let (cx, cy) = (
+            i32::from(cur.x) - i32::from(cur.xhot),
+            i32::from(cur.y) - i32::from(cur.yhot),
+        );
+        let mut changed = 0;
+        for (i, (a, b)) in plain
+            .chunks_exact(4)
+            .zip(frame.pixels.chunks_exact(4))
+            .enumerate()
+        {
+            if a[..3] != b[..3] {
+                changed += 1;
+                let (px, py) = ((i % 64) as i32, (i / 64) as i32);
+                assert!(
+                    (cx..cx + i32::from(cur.width)).contains(&px)
+                        && (cy..cy + i32::from(cur.height)).contains(&py),
+                    "pixel ({px},{py}) changed outside the cursor at ({cx},{cy})"
+                );
+            }
+        }
+        assert!(changed > 0, "the cursor was not drawn");
     }
 }
