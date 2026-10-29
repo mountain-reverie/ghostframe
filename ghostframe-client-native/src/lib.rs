@@ -324,6 +324,7 @@ impl Client {
                     control_url,
                     quiet: false,
                     non_interactive: false,
+                    redact_auth_urls: false,
                 })?);
                 b.up()?;
                 b

@@ -16,6 +16,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -98,7 +99,7 @@ func setNonblock(fd int) error {
 func discardLogf(string, ...any) {}
 
 //export gbridge_new
-func gbridge_new(cHostname, cAuthkey, cStateDir, cControlURL *C.char, quiet, nonInteractive C.int32_t, sdOut *C.int32_t) C.gbridge_status {
+func gbridge_new(cHostname, cAuthkey, cStateDir, cControlURL *C.char, quiet, nonInteractive, redactAuthURLs C.int32_t, sdOut *C.int32_t) C.gbridge_status {
 	hostname := C.GoString(cHostname)
 	authkey := C.GoString(cAuthkey)
 	stateDir := C.GoString(cStateDir)
@@ -123,11 +124,12 @@ func gbridge_new(cHostname, cAuthkey, cStateDir, cControlURL *C.char, quiet, non
 		s.Logf = discardLogf
 		s.UserLogf = discardLogf
 	}
-	// nonInteractive: a daemon with no auth key must never print a sign-in
-	// URL. Anyone who can read its journal could claim the node.
-	if nonInteractive != 0 && quiet == 0 {
-		s.Logf = nonInteractiveLogf(log.Printf)
-		s.UserLogf = nonInteractiveLogf(log.Printf)
+	// redactAuthURLs: a daemon must never put a sign-in URL in its journal,
+	// with or without an auth key (a key can expire, a node can be removed).
+	// UserLogf exists to be shown to a person, so it is discarded outright.
+	if redactAuthURLs != 0 && quiet == 0 {
+		s.Logf = redactingLogf(log.Printf)
+		s.UserLogf = discardLogf
 	}
 	if controlURL != "" {
 		s.ControlURL = controlURL
@@ -159,7 +161,9 @@ func gbridge_up(sd C.int32_t) C.gbridge_status {
 		err = upNonInteractive(func(ctx context.Context) error {
 			_, err := h.server.Up(ctx)
 			return err
-		}, lc, upPollInterval, needsLoginGrace)
+		}, lc, upPollInterval, needsLoginGrace, func() {
+			log.Printf("ghostbridge: gbridge_up: waiting for device approval: approve this node in the admin console")
+		})
 		if errors.Is(err, errNeedsLogin) {
 			log.Printf("ghostbridge: gbridge_up: node needs login (key expired or node removed)")
 			return gbridgeUpStatusNeedsLogin
@@ -336,20 +340,18 @@ const (
 	needsLoginGrace = 15 * time.Second
 )
 
-// authURLLogMarkers identify tsnet/controlclient log lines that carry or
-// announce the interactive sign-in URL.
-var authURLLogMarkers = []string{"go to:", "AuthURL", "authURL=", "open URL"}
+// authURLRe matches an interactive sign-in URL by shape: Tailscale's
+// /a/<id> and headscale's /register/<id> on any host. Matching the URL, not
+// the words around it, means a release that rewords the line or passes the
+// URL through "%s" still cannot leak it.
+var authURLRe = regexp.MustCompile(`https?://\S+/(a|register)/\S+`)
 
-// nonInteractiveLogf wraps next, dropping lines that would print the sign-in
-// URL. Everything else passes through.
-func nonInteractiveLogf(next func(string, ...any)) func(string, ...any) {
+// redactingLogf formats first, then replaces any sign-in URL in the result.
+// A daemon's journal is readable by more people than the node's owner, and
+// whoever opens the URL first claims the node.
+func redactingLogf(next func(string, ...any)) func(string, ...any) {
 	return func(format string, args ...any) {
-		for _, m := range authURLLogMarkers {
-			if strings.Contains(format, m) {
-				return
-			}
-		}
-		next(format, args...)
+		next("%s", authURLRe.ReplaceAllString(fmt.Sprintf(format, args...), "[sign-in URL redacted]"))
 	}
 }
 
@@ -358,7 +360,7 @@ func nonInteractiveLogf(next func(string, ...any)) func(string, ...any) {
 // grace. tsnet.Up itself waits for Running forever (its own TODO), which in
 // a daemon without an auth key means logging a claimable URL until someone
 // answers it.
-func upNonInteractive(up func(context.Context) error, lc statusPoller, interval, grace time.Duration) error {
+func upNonInteractive(up func(context.Context) error, lc statusPoller, interval, grace time.Duration, onMachineAuth func()) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -366,6 +368,7 @@ func upNonInteractive(up func(context.Context) error, lc statusPoller, interval,
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	var since time.Time
+	hinted := false
 	for {
 		select {
 		case err := <-done:
@@ -378,6 +381,11 @@ func upNonInteractive(up func(context.Context) error, lc statusPoller, interval,
 		}
 		if st.AuthURL != "" {
 			return errNeedsLogin
+		}
+		if st.BackendState == "NeedsMachineAuth" && !hinted && onMachineAuth != nil {
+			// Up would otherwise wait for the approval in silence.
+			hinted = true
+			onMachineAuth()
 		}
 		if st.BackendState == "NeedsLogin" {
 			if since.IsZero() {
