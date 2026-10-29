@@ -24,14 +24,18 @@
 //! | `GHOSTFRAME_CAPTURE_DUMP_DIR` | write each frame as PNG here (test builds only) | off |
 //! | `GHOSTFRAME_CAPTURE_HEARTBEAT_EVERY` | trace heartbeat every N frames | 5 |
 //! | `GHOSTFRAME_DUMP_FIRST_FRAME` | dump first raw frame to this path (test builds only) | off |
-//! | `GHOSTFRAME_RANDR_SETTLE_MS` | wait after a mode change before checking the desktop kept it | 2500 |
+//! | `GHOSTFRAME_RANDR_SETTLE_MS` | least wait after a mode change before checking the desktop kept it | 5000 (`0` turns the read-back off) |
 //! | `GHOSTFRAME_MAX_RESOLUTION` | `WxH` resolution ceiling, or `none` | none (the unit `install` writes sets `1920x1080`) |
 
 pub const DEFAULT_CAPTURE_FPS: u64 = 30;
 const DEFAULT_HEARTBEAT_EVERY: u64 = 5;
-/// Long enough for a desktop's own debounce (Enlightenment's
-/// `hotplug_response` is 1 s, and it reverts ~1.7 s after a change).
-pub const DEFAULT_RANDR_SETTLE_MS: u64 = 2500;
+/// How long after a mode change the server waits before it checks that the
+/// desktop kept it. It then also waits for 1.5 s without a RandR event, and
+/// gives up waiting after 12 s. Observed on the owner's Enlightenment: stock
+/// E reverts a change about 1.7 s after it; the patched E defers adopting or
+/// reverting for about 3 s plus its 1 s `hotplug_response`, so about 4 s.
+/// 5 s clears both.
+pub const DEFAULT_RANDR_SETTLE_MS: u64 = 5000;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -52,7 +56,7 @@ pub struct ServerConfig {
     pub heartbeat_every: u64,
     pub dump_first_frame: Option<String>,
     pub max_resolution: Option<String>,
-    /// `GHOSTFRAME_RANDR_SETTLE_MS`; zero cannot be set (it is not positive).
+    /// `GHOSTFRAME_RANDR_SETTLE_MS`; zero turns the read-back off.
     pub randr_settle: std::time::Duration,
 }
 
@@ -129,7 +133,7 @@ impl ServerConfig {
             ),
             dump_first_frame: knob("GHOSTFRAME_DUMP_FIRST_FRAME"),
             max_resolution: nonempty("GHOSTFRAME_MAX_RESOLUTION"),
-            randr_settle: std::time::Duration::from_millis(parse_positive(
+            randr_settle: std::time::Duration::from_millis(parse_millis(
                 "GHOSTFRAME_RANDR_SETTLE_MS",
                 get("GHOSTFRAME_RANDR_SETTLE_MS"),
                 DEFAULT_RANDR_SETTLE_MS,
@@ -146,6 +150,16 @@ fn default_hostname(system_hostname: Option<String>) -> String {
         Some(h) => format!("{h}-ghostframe"),
         None => "ghostframe-server".to_string(),
     }
+}
+
+/// Parse a non-negative integer (zero is meaningful); anything else warns and
+/// yields `default`.
+fn parse_millis(name: &str, raw: Option<String>, default: u64) -> u64 {
+    let Some(raw) = raw else { return default };
+    raw.trim().parse::<u64>().unwrap_or_else(|_| {
+        eprintln!("warning: {name}={raw:?} is not a non-negative integer; using {default}");
+        default
+    })
 }
 
 /// Parse a strictly positive integer; anything else warns and yields `default`.
@@ -177,20 +191,16 @@ mod tests {
     }
 
     #[test]
-    fn randr_settle_defaults_and_parses() {
-        assert_eq!(cfg(&[]).randr_settle.as_millis(), 2500);
-        assert_eq!(
-            cfg(&[("GHOSTFRAME_RANDR_SETTLE_MS", "400")])
+    fn randr_settle_defaults_parses_and_allows_zero() {
+        assert_eq!(cfg(&[]).randr_settle.as_millis(), 5000);
+        let ms = |v: &str| {
+            cfg(&[("GHOSTFRAME_RANDR_SETTLE_MS", v)])
                 .randr_settle
-                .as_millis(),
-            400
-        );
-        assert_eq!(
-            cfg(&[("GHOSTFRAME_RANDR_SETTLE_MS", "0")])
-                .randr_settle
-                .as_millis(),
-            2500
-        );
+                .as_millis()
+        };
+        assert_eq!(ms("400"), 400);
+        assert_eq!(ms("0"), 0);
+        assert_eq!(ms("soon"), 5000);
     }
 
     #[test]
