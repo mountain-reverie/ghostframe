@@ -270,8 +270,9 @@ pub(crate) async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioSt
         // the scheduler's refinement loop to make progress within bench
         // scene-duration. e2e_progressive_refinement sets this to 30.
         "CAPTURE_FPS",
-        // Pin the DRM scanout mode (e.g. 1920x1080) for scenes that need
-        // production tile counts; unset keeps the connector's preferred mode.
+        // Screen size (e.g. 1920x1080) the entrypoint applies with xrandr for
+        // `--x11-sink` scenes that need production tile counts; unset means
+        // 1024x768. The name is historical.
         "GHOSTFRAME_DRM_MODE",
     ] {
         if let Ok(val) = std::env::var(var) {

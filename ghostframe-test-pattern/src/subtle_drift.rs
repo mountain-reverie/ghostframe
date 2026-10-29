@@ -68,6 +68,9 @@ fn run_inner(
             bytes[start + row_bytes - 4..start + row_bytes].copy_from_slice(&leftmost);
         }
 
+        // The frame is drawn into root when `map` drops, so drop it before
+        // the quiet forever below, or the one burst is never drawn.
+        drop(map);
         if once {
             eprintln!("subtle-drift: single burst applied, screen is now quiet for good");
             loop {
