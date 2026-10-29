@@ -91,8 +91,11 @@ func setNonblock(fd int) error {
 	return syscall.SetNonblock(fd, true)
 }
 
+// discardLogf drops tsnet log output (see gbridge_new's quiet argument).
+func discardLogf(string, ...any) {}
+
 //export gbridge_new
-func gbridge_new(cHostname, cAuthkey, cStateDir, cControlURL *C.char, sdOut *C.int32_t) C.gbridge_status {
+func gbridge_new(cHostname, cAuthkey, cStateDir, cControlURL *C.char, quiet C.int32_t, sdOut *C.int32_t) C.gbridge_status {
 	hostname := C.GoString(cHostname)
 	authkey := C.GoString(cAuthkey)
 	stateDir := C.GoString(cStateDir)
@@ -109,6 +112,13 @@ func gbridge_new(cHostname, cAuthkey, cStateDir, cControlURL *C.char, sdOut *C.i
 		// operator's perspective and looks like a daemon bug rather than a
 		// tailnet/cert provisioning issue.
 		Logf: log.Printf,
+	}
+	// quiet: an interactive command (login, logout) owns the terminal. tsnet's
+	// backend log and its repeated "go to: <url>" would bury the one line the
+	// person must act on, which the caller prints itself.
+	if quiet != 0 {
+		s.Logf = discardLogf
+		s.UserLogf = discardLogf
 	}
 	if controlURL != "" {
 		s.ControlURL = controlURL

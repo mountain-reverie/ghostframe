@@ -1901,6 +1901,7 @@ dependencies = [
  "ghostframe-lib",
  "image",
  "libc",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
