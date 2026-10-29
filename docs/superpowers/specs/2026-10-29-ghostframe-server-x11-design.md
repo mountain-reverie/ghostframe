@@ -240,8 +240,10 @@ choice.
   to a CPU copy of the scanout. This is read from the code. Planning confirms it
   from one e2e log (`IngestTier`) before relying on the claim.
 
-**Host requirements shrink.** VKMS is no longer needed for these tests. The GPU
-render node remains (Vulkan compute, VA-API).
+**Host requirements (amended during planning).** VKMS stays a host requirement
+for now: every `gpu: true` e2e setup (`e2e_setup.rs`, `scene.rs`) still starts
+Xorg with `xorg-vkms.conf`. Only the entrypoint's VKMS auto-detection goes.
+Moving those setups to the dummy driver is a follow-up with its own e2e run.
 
 ## 8. Renames outside the crate
 
