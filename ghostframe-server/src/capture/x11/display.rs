@@ -7,14 +7,17 @@
 //! modelines, millimetres -- stays inside this module; the trait itself
 //! must not gain an X concept. See the M4b design doc §5 and §7.
 
+use std::io::Read as _;
+use std::os::fd::AsRawFd as _;
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::{self, ConnectionExt as RandrExt};
 use x11rb::protocol::xproto::ConnectionExt as XProtoExt;
+use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
 use ghostframe_lib::transport::display::{DisplayController, DisplayError};
@@ -44,9 +47,15 @@ pub struct XrandrDisplay {
     /// what `ceiling()` reports; `None` (unset) leaves the hardware ceiling
     /// alone. Applied by `clamp_ceiling()` on every path through `ceiling()`.
     max_resolution: Option<String>,
-    /// Hands each applied request to the read-back worker; `None` when the
-    /// read-back is off (settle of zero) or its connection failed.
-    readback: Option<Mutex<mpsc::Sender<Request>>>,
+    /// The read-back worker; `None` when the read-back is off (settle of
+    /// zero) or its connection failed.
+    readback: Option<Readback>,
+    /// The physical size (mm) the screen has now, as far as we know: seeded
+    /// from the connection setup, set by every `set_output`, and kept up to
+    /// date by the worker from ScreenChangeNotify. What a failed change puts
+    /// back. (`GetScreenInfo` is no use: its sizes carry the output's
+    /// physical size, not the screen's.)
+    known_mm: Arc<Mutex<(u32, u32)>>,
     /// Bumped at the top of every `set_output`, so any call -- failed ones
     /// too -- disarms the read-back of the one before it.
     generation: Arc<AtomicU64>,
@@ -58,6 +67,9 @@ pub struct XrandrDisplay {
     /// Read-backs that reached a verdict (tests prove the worker ran).
     #[cfg_attr(not(test), allow(dead_code))]
     completed: Arc<AtomicU64>,
+    /// Set by the worker as it exits (tests watch it).
+    #[cfg(test)]
+    worker_exited: Arc<std::sync::atomic::AtomicBool>,
     /// Test fault: fail the step that sets the target CRTC mode.
     #[cfg(test)]
     fail_set_crtc: std::sync::atomic::AtomicBool,
@@ -85,6 +97,26 @@ impl ReadbackTiming {
             settle,
             quiet: Duration::from_millis(1500),
             cap: settle.max(Duration::from_secs(12)),
+        }
+    }
+}
+
+/// The handle on the read-back worker. Dropping `wake` hangs up the pipe the
+/// worker polls, which is how it learns to exit.
+struct Readback {
+    /// The newest unverified request; a newer one replaces it.
+    slot: Arc<Mutex<Option<Request>>>,
+    wake: UnixStream,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for XrandrDisplay {
+    fn drop(&mut self) {
+        if let Some(Readback { wake, handle, .. }) = self.readback.take() {
+            drop(wake);
+            if let Some(h) = handle {
+                let _ = h.join();
+            }
         }
     }
 }
@@ -202,16 +234,28 @@ impl XrandrDisplay {
         let generation = Arc::new(AtomicU64::new(0));
         let overridden = Arc::new(Mutex::new(None));
         let completed = Arc::new(AtomicU64::new(0));
+        let root_setup = &conn.setup().roots[screen_num];
+        let known_mm = Arc::new(Mutex::new((
+            u32::from(root_setup.width_in_millimeters),
+            u32::from(root_setup.height_in_millimeters),
+        )));
+        #[cfg(test)]
+        let worker_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let readback = timing.and_then(|timing| {
             match spawn_readback_worker(
                 display,
                 crtc,
                 timing,
-                Arc::clone(&generation),
-                Arc::clone(&overridden),
-                Arc::clone(&completed),
+                Worker {
+                    generation: Arc::clone(&generation),
+                    overridden: Arc::clone(&overridden),
+                    completed: Arc::clone(&completed),
+                    known_mm: Arc::clone(&known_mm),
+                    #[cfg(test)]
+                    exited: Arc::clone(&worker_exited),
+                },
             ) {
-                Ok(tx) => Some(Mutex::new(tx)),
+                Ok(rb) => Some(rb),
                 Err(e) => {
                     tracing::warn!(error = %e, "RandR read-back unavailable");
                     None
@@ -227,9 +271,12 @@ impl XrandrDisplay {
             ceiling_fallback: Mutex::new((range.max_width, range.max_height)),
             max_resolution,
             readback,
+            known_mm,
             generation,
             overridden,
             completed,
+            #[cfg(test)]
+            worker_exited,
             #[cfg(test)]
             fail_set_crtc: std::sync::atomic::AtomicBool::new(false),
         })
@@ -249,31 +296,49 @@ impl XrandrDisplay {
     /// needs no separate notice -- capture polls the root geometry every
     /// frame and the frame size it reports follows.
     fn queue_readback(&self, ticket: u64, requested: (u16, u16)) {
-        if let Some(tx) = &self.readback {
-            let _ = tx.lock().unwrap().send(Request { ticket, requested });
+        use std::io::Write as _;
+        if let Some(rb) = &self.readback {
+            *rb.slot.lock().unwrap() = Some(Request { ticket, requested });
+            // A full pipe already holds a wake-up; that is as good as ours.
+            let _ = (&rb.wake).write(&[1]);
         }
     }
 
-    /// Delete the previous mode of ours once nothing shows it, so repeated
-    /// resizes do not pile up modes. Best effort: a mode the desktop still
-    /// uses (or anything that fails) is simply left.
-    fn drop_old_mode(&self, resources: &randr::GetScreenResourcesReply, old: randr::Mode) {
-        let named_ours = mode_name(resources, old).is_some_and(|n| n.starts_with(b"ghostframe_"));
-        if old == x11rb::NONE || !named_ours {
-            return;
+    /// Delete every mode of ours that nothing shows, so repeated resizes do
+    /// not pile up modes -- including one the desktop reverted away from,
+    /// which the previous call never saw as "current". Best effort: a mode
+    /// still in use (or anything that fails) is simply left. `resources` is
+    /// from before this call's own mode was created, so that one is safe.
+    fn collect_modes(&self, resources: &randr::GetScreenResourcesReply) {
+        let in_use: Vec<randr::Mode> = resources
+            .crtcs
+            .iter()
+            .map(|&c| {
+                self.conn
+                    .randr_get_crtc_info(c, 0)
+                    .ok()
+                    .and_then(|r| r.reply().ok())
+                    .map_or(u32::MAX, |i| i.mode)
+            })
+            .collect();
+        let mut offset = 0usize;
+        for m in &resources.modes {
+            let end = offset + m.name_len as usize;
+            let ours = resources
+                .names
+                .get(offset..end)
+                .is_some_and(|n| n.starts_with(b"ghostframe_"));
+            offset = end;
+            if !ours || in_use.contains(&m.id) || in_use.contains(&u32::MAX) {
+                continue;
+            }
+            if let Ok(c) = self.conn.randr_delete_output_mode(self.output, m.id) {
+                c.ignore_error();
+            }
+            if let Ok(c) = self.conn.randr_destroy_mode(m.id) {
+                c.ignore_error();
+            }
         }
-        let in_use = resources.crtcs.iter().any(|&c| {
-            self.conn
-                .randr_get_crtc_info(c, 0)
-                .ok()
-                .and_then(|r| r.reply().ok())
-                .is_none_or(|i| i.mode == old)
-        });
-        if in_use {
-            return;
-        }
-        let _ = self.conn.randr_delete_output_mode(self.output, old);
-        let _ = self.conn.randr_destroy_mode(old);
         let _ = self.conn.flush();
     }
 
@@ -312,7 +377,12 @@ impl DisplayController for XrandrDisplay {
     fn set_output(&self, width: u16, height: u16, scale_milli: u16) -> Result<(), DisplayError> {
         // Before anything can fail: a failed call must still disarm the
         // read-back of the one before it.
-        let ticket = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        // Under the verdict lock, so a verdict is either wholly before this
+        // bump (and then superseded by it) or wholly after.
+        let ticket = {
+            let _verdicts = self.overridden.lock().unwrap();
+            self.generation.fetch_add(1, Ordering::SeqCst) + 1
+        };
         let resources = self
             .conn
             .randr_get_screen_resources(self.root)
@@ -362,21 +432,7 @@ impl DisplayController for XrandrDisplay {
             .map_err(|e| DisplayError(format!("GetGeometry reply: {e}")))?;
 
         // The physical size to put back if the change fails half way.
-        let prev_mm = self
-            .conn
-            .randr_get_screen_info(self.root)
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .and_then(|i| i.sizes.get(usize::from(i.size_id)).copied())
-            .map_or_else(
-                || {
-                    (
-                        mm_for_scale(screen_geom.width, 1000),
-                        mm_for_scale(screen_geom.height, 1000),
-                    )
-                },
-                |sz| (u32::from(sz.mwidth), u32::from(sz.mheight)),
-            );
+        let prev_mm = *self.known_mm.lock().unwrap();
 
         let set_crtc = |mode: randr::Mode, outputs: &[randr::Output]| -> Result<(), DisplayError> {
             let reply = self
@@ -410,7 +466,9 @@ impl DisplayController for XrandrDisplay {
                 .randr_set_screen_size(self.root, w, h, mm_w, mm_h)
                 .map_err(|e| DisplayError(format!("SetScreenSize request: {e}")))?
                 .check()
-                .map_err(|e| DisplayError(format!("SetScreenSize: {e}")))
+                .map_err(|e| DisplayError(format!("SetScreenSize: {e}")))?;
+            *self.known_mm.lock().unwrap() = (mm_w, mm_h);
+            Ok(())
         };
 
         let steps = apply_steps(
@@ -473,8 +531,11 @@ impl DisplayController for XrandrDisplay {
                     )
                     .map_err(|e| e.to_string())
                     .and_then(|c| c.check().map_err(|e| e.to_string()));
-                if let Err(e) = back {
-                    tracing::warn!(error = %e, "could not restore the screen size after a failed mode change");
+                match back {
+                    Ok(()) => *self.known_mm.lock().unwrap() = prev_mm,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not restore the screen size after a failed mode change");
+                    }
                 }
             }
             if disabled {
@@ -501,7 +562,12 @@ impl DisplayController for XrandrDisplay {
                         }
                     });
                 if let Err(e) = back {
-                    tracing::warn!(error = %e, "could not restore the CRTC after a failed mode change; the output may be dark");
+                    tracing::warn!(error = %e, "could not restore the CRTC after a failed mode change; trying the requested mode");
+                    // The screen is whatever it is now; if the restore of it
+                    // failed, the requested mode is the one that fits.
+                    if let Err(e2) = set_crtc(mode, &[self.output]) {
+                        tracing::warn!(error = %e2, "could not light the output again; it may be dark");
+                    }
                 }
             }
         }
@@ -510,9 +576,7 @@ impl DisplayController for XrandrDisplay {
         }
         let _ = self.conn.flush();
         if result.is_ok() {
-            if crtc_info.mode != mode {
-                self.drop_old_mode(&resources, crtc_info.mode);
-            }
+            self.collect_modes(&resources);
             self.queue_readback(ticket, (mode_w, mode_h));
         }
         result
@@ -595,18 +659,44 @@ fn read_actual(conn: &RustConnection, root: u32, crtc: randr::Crtc) -> anyhow::R
     })
 }
 
+/// What the worker shares with the controller.
+struct Worker {
+    generation: Arc<AtomicU64>,
+    overridden: Arc<Mutex<Option<Overridden>>>,
+    completed: Arc<AtomicU64>,
+    known_mm: Arc<Mutex<(u32, u32)>>,
+    #[cfg(test)]
+    exited: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Is a read-back due? `elapsed` since the request was applied, `since_event`
+/// since the last RandR event: after `settle` AND once `quiet`, or at `cap`
+/// whatever the desktop is still doing.
+fn due(elapsed: Duration, since_event: Duration, t: &ReadbackTiming) -> bool {
+    (elapsed >= t.settle && since_event >= t.quiet) || elapsed >= t.cap
+}
+
+/// A request being watched towards its verdict.
+struct Pending {
+    req: Request,
+    /// Counts `settle` and `cap` from here.
+    start: Instant,
+    /// When the request was applied; bounds a later re-opening.
+    applied: Instant,
+}
+
 /// The worker behind [`ReadbackTiming`]: one thread, one persistent
 /// connection subscribed to screen and CRTC changes, and a deadline that
-/// every new request restarts. Returns the sender to queue requests on; the
-/// thread ends when it is dropped.
+/// every new request restarts. It sleeps in poll(2) on the X socket and a
+/// wake pipe, with a timeout of exactly the next deadline (none when
+/// nothing is pending), so an idle controller costs no wake-ups. Dropping
+/// the pipe's other end ends the thread.
 fn spawn_readback_worker(
     display: Option<&str>,
     crtc: randr::Crtc,
     timing: ReadbackTiming,
-    generation: Arc<AtomicU64>,
-    overridden: Arc<Mutex<Option<Overridden>>>,
-    completed: Arc<AtomicU64>,
-) -> anyhow::Result<mpsc::Sender<Request>> {
+    shared: Worker,
+) -> anyhow::Result<Readback> {
     use anyhow::{anyhow, Context};
     let (conn, n) = x11rb::connect(display).map_err(|e| anyhow!("x11rb::connect: {e}"))?;
     let root = conn.setup().roots[n].root;
@@ -617,94 +707,157 @@ fn spawn_readback_worker(
     )?
     .check()
     .context("RRSelectInput")?;
-    let (tx, rx) = mpsc::channel::<Request>();
-    std::thread::Builder::new()
+    let (wake, mut wake_rx) = UnixStream::pair().context("wake pipe")?;
+    wake.set_nonblocking(true)?;
+    wake_rx.set_nonblocking(true)?;
+    let slot: Arc<Mutex<Option<Request>>> = Arc::new(Mutex::new(None));
+    let worker_slot = Arc::clone(&slot);
+    let handle = std::thread::Builder::new()
         .name("randr-readback".into())
         .spawn(move || {
-            let mut pending: Option<(Request, Instant)> = None;
-            // The request last given a verdict. A screen change that arrives
-            // after it, with no newer call, re-opens it: a revert later than
-            // `settle` is still caught.
-            let mut last_req: Option<Request> = None;
-            let mut last_event = Instant::now();
-            loop {
-                let next = if pending.is_some() {
-                    match rx.try_recv() {
-                        Ok(r) => Some(r),
-                        Err(TryRecvError::Empty) => None,
-                        Err(TryRecvError::Disconnected) => return,
-                    }
-                } else if last_req.is_some() {
-                    // Idle but still watching for a late revert.
-                    match rx.recv_timeout(Duration::from_millis(250)) {
-                        Ok(r) => Some(r),
-                        Err(mpsc::RecvTimeoutError::Timeout) => None,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    }
-                } else {
-                    match rx.recv() {
-                        Ok(r) => Some(r),
-                        Err(_) => return,
-                    }
-                };
-                // Events stay queued while idle; the ones up to now belong to
-                // the change that was just applied, and still count as the
-                // most recent activity.
-                let mut saw_event = false;
-                loop {
-                    match conn.poll_for_event() {
-                        Ok(Some(_)) => {
-                            last_event = Instant::now();
-                            saw_event = true;
-                        }
-                        Ok(None) => break,
-                        Err(_) => return,
-                    }
-                }
-                if let Some(r) = next {
-                    pending = Some((r, Instant::now()));
-                    last_req = None;
-                    continue;
-                }
-                if pending.is_none() {
-                    if let Some(r) = last_req
-                        .filter(|r| saw_event && generation.load(Ordering::SeqCst) == r.ticket)
-                    {
-                        let now = Instant::now();
-                        pending = Some((r, now.checked_sub(timing.settle).unwrap_or(now)));
-                    }
-                    continue;
-                }
-                let Some((req, start)) = pending.as_ref() else {
-                    continue;
-                };
-                if generation.load(Ordering::SeqCst) != req.ticket {
-                    pending = None; // superseded by a newer call
-                    continue;
-                }
-                let now = Instant::now();
-                let elapsed = now.duration_since(*start);
-                let due = (elapsed >= timing.settle
-                    && now.duration_since(last_event) >= timing.quiet)
-                    || elapsed >= timing.cap;
-                if !due {
-                    std::thread::sleep(Duration::from_millis(20));
-                    continue;
-                }
-                let (req, _) = pending.take().expect("checked Some above");
-                last_req = Some(req);
-                let actual = match read_actual(&conn, root, crtc) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "RandR read-back failed");
-                        continue;
-                    }
-                };
-                record_verdict(&generation, &overridden, &completed, req, &actual);
-            }
+            readback_loop(
+                &conn,
+                root,
+                crtc,
+                timing,
+                &shared,
+                &worker_slot,
+                &mut wake_rx,
+            );
+            #[cfg(test)]
+            shared.exited.store(true, Ordering::SeqCst);
         })
         .context("spawn randr-readback")?;
-    Ok(tx)
+    Ok(Readback {
+        slot,
+        wake,
+        handle: Some(handle),
+    })
+}
+
+fn readback_loop(
+    conn: &RustConnection,
+    root: u32,
+    crtc: randr::Crtc,
+    timing: ReadbackTiming,
+    shared: &Worker,
+    slot: &Mutex<Option<Request>>,
+    wake_rx: &mut UnixStream,
+) {
+    let mut pending: Option<Pending> = None;
+    // The request last given a verdict, and when it was applied. A screen
+    // change after it, with no newer call and inside `cap` of the apply,
+    // re-opens it: a revert later than the verdict is still caught.
+    let mut last: Option<(Request, Instant)> = None;
+    let mut last_event = Instant::now();
+    loop {
+        // Everything already read is handled before sleeping.
+        let mut saw_event = false;
+        loop {
+            match conn.poll_for_event() {
+                Ok(Some(ev)) => {
+                    last_event = Instant::now();
+                    saw_event = true;
+                    if let Event::RandrScreenChangeNotify(e) = ev {
+                        *shared.known_mm.lock().unwrap() =
+                            (u32::from(e.mwidth), u32::from(e.mheight));
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => return,
+            }
+        }
+        let now = Instant::now();
+        if let Some(req) = slot.lock().unwrap().take() {
+            pending = Some(Pending {
+                req,
+                start: now,
+                applied: now,
+            });
+            last = None;
+        } else if pending.is_none() {
+            match last {
+                Some((_, applied)) if now.duration_since(applied) >= timing.cap => last = None,
+                Some((req, applied))
+                    if saw_event && shared.generation.load(Ordering::SeqCst) == req.ticket =>
+                {
+                    pending = Some(Pending {
+                        req,
+                        start: now.checked_sub(timing.settle).unwrap_or(now),
+                        applied,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // How long to sleep: to the next moment anything can change.
+        let mut timeout: Option<Duration> = None;
+        if let Some(p) = &pending {
+            if shared.generation.load(Ordering::SeqCst) != p.req.ticket {
+                pending = None; // superseded by a newer call
+                continue;
+            }
+            let elapsed = now.duration_since(p.start);
+            if due(elapsed, now.duration_since(last_event), &timing) {
+                let Pending { req, applied, .. } = pending.take().expect("checked Some above");
+                last = Some((req, applied));
+                match read_actual(conn, root, crtc) {
+                    Ok(actual) => record_verdict(
+                        &shared.generation,
+                        &shared.overridden,
+                        &shared.completed,
+                        req,
+                        &actual,
+                    ),
+                    Err(e) => tracing::debug!(error = %e, "RandR read-back failed"),
+                }
+                continue;
+            }
+            let quiet_at = last_event + timing.quiet;
+            let settled_at = p.start + timing.settle;
+            let deadline = settled_at.max(quiet_at).min(p.start + timing.cap);
+            timeout = Some(deadline.saturating_duration_since(now));
+        } else if let Some((_, applied)) = last {
+            timeout = Some((applied + timing.cap).saturating_duration_since(now));
+        }
+
+        let mut fds = [
+            libc::pollfd {
+                fd: conn.stream().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake_rx.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // Round up, so waking a hair early does not spin at zero.
+        let ms = timeout.map_or(-1, |d| {
+            i32::try_from(d.as_micros().div_ceil(1000)).unwrap_or(i32::MAX)
+        });
+        // SAFETY: `fds` is a valid array of two pollfd for the call's duration.
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, ms) };
+        if r < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        if fds[1].revents != 0 {
+            let mut buf = [0u8; 64];
+            loop {
+                match wake_rx.read(&mut buf) {
+                    Ok(0) => return, // the controller was dropped
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => return,
+                }
+            }
+        }
+    }
 }
 
 /// Decide the verdict under the `overridden` lock, after the read, against
@@ -749,20 +902,6 @@ fn record_verdict(
         );
     }
     *slot = Some(found);
-}
-
-/// The name of mode `id` in a `GetScreenResourcesReply` (see
-/// [`find_mode_by_name`] for the layout).
-fn mode_name(resources: &randr::GetScreenResourcesReply, id: randr::Mode) -> Option<&[u8]> {
-    let mut offset = 0usize;
-    for m in &resources.modes {
-        let end = offset + m.name_len as usize;
-        if m.id == id {
-            return resources.names.get(offset..end);
-        }
-        offset = end;
-    }
-    None
 }
 
 /// One request of a mode change, in the order `xrandr(1)` issues them.
@@ -1331,8 +1470,8 @@ mod live_tests {
         assert_eq!(ctl.completed.load(Ordering::SeqCst), 1);
     }
 
-    /// The generation re-check after the read: a request that begins while the
-    /// worker is reading must not have the stale verdict written.
+    /// A call that fails still bumps the generation, so it disarms the
+    /// read-back of the call before it: no verdict is reached for either.
     #[test]
     fn a_failed_call_disarms_the_previous_readback() {
         let x = PrivateXvfb::spawn(&["-screen", "0", "1280x1024x24"]);
@@ -1391,6 +1530,102 @@ mod live_tests {
         generation.store(1, Ordering::SeqCst);
         record_verdict(&generation, &overridden, &completed, req, &actual);
         assert!(overridden.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn due_follows_settle_quiet_and_cap() {
+        let t = ReadbackTiming {
+            settle: Duration::from_secs(5),
+            quiet: Duration::from_millis(1500),
+            cap: Duration::from_secs(12),
+        };
+        let ms = Duration::from_millis;
+        // Settle not reached, however quiet the screen has been.
+        assert!(!due(ms(4000), ms(4000), &t));
+        // Settle reached, but an event 500 ms ago.
+        assert!(!due(ms(5200), ms(500), &t));
+        // Both reached.
+        assert!(due(ms(5200), ms(1500), &t));
+        // Never quiet, but the cap passed.
+        assert!(!due(ms(11_900), ms(10), &t));
+        assert!(due(ms(12_000), ms(10), &t));
+    }
+
+    /// Dropping the controller ends the worker (Drop joins it, so this would
+    /// hang if the hang-up were not noticed; the thread bounds it).
+    #[test]
+    fn the_worker_exits_when_the_controller_is_dropped() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "1280x1024x24"]);
+        let ctl = with_readback(&x);
+        let exited = Arc::clone(&ctl.worker_exited);
+        assert!(!exited.load(Ordering::SeqCst));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(ctl);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("drop did not return: the worker never noticed the hang-up");
+        assert!(exited.load(Ordering::SeqCst));
+    }
+
+    /// Events inside the quiet period postpone the verdict: the desktop
+    /// changes the mode away and back, and only the end state is judged.
+    #[test]
+    fn the_verdict_waits_for_the_screen_to_go_quiet() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "1280x1024x24"]);
+        add_800x600(x.display());
+        let ctl = with_readback(&x);
+        ctl.set_output(800, 600, 1000).unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+        xrandr(x.display(), &["--output", "screen", "--mode", "1280x1024"]);
+        std::thread::sleep(Duration::from_millis(300));
+        xrandr(x.display(), &["--output", "screen", "--mode", "800x600_t"]);
+        let start = Instant::now();
+        while Instant::now().duration_since(start) < Duration::from_millis(2500) {
+            assert_eq!(ctl.overridden(), None, "judged mid-flap");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(ctl.completed.load(Ordering::SeqCst), 1);
+    }
+
+    /// The watch for a late revert ends `cap` after the apply: a change long
+    /// after that is the user's, not the desktop undoing us.
+    #[test]
+    fn the_late_revert_watch_is_bounded() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "1280x1024x24"]);
+        add_800x600(x.display());
+        let t = ReadbackTiming {
+            settle: Duration::from_millis(300),
+            quiet: Duration::from_millis(200),
+            cap: Duration::from_millis(2000),
+        };
+        let ctl = XrandrDisplay::with_timing(Some(x.display()), None, Some(t)).unwrap();
+        ctl.set_output(800, 600, 1000).unwrap();
+        wait_for("first verdict", || {
+            ctl.completed.load(Ordering::SeqCst) == 1
+        });
+        std::thread::sleep(Duration::from_millis(3000));
+        xrandr(x.display(), &["--output", "screen", "--mode", "1280x1024"]);
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!(ctl.completed.load(Ordering::SeqCst), 1);
+        assert_eq!(ctl.overridden(), None);
+    }
+
+    /// A mode of ours the desktop reverted away from is still collected by
+    /// the next call, though it was never the "current" mode.
+    #[test]
+    fn a_reverted_mode_is_collected_on_the_next_call() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "1280x1024x24"]);
+        let ctl = with_readback(&x);
+        ctl.set_output(1000, 700, 1000).unwrap();
+        xrandr(x.display(), &["--output", "screen", "--mode", "1280x1024"]);
+        ctl.set_output(900, 650, 1000).unwrap();
+        let ours: Vec<String> = mode_names(x.display())
+            .into_iter()
+            .filter(|n| n.starts_with("ghostframe_"))
+            .collect();
+        assert_eq!(ours, ["ghostframe_904x650"]);
     }
 
     #[test]
