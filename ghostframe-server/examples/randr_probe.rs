@@ -17,11 +17,11 @@
 //! `clippy --all-targets` still lints them. It includes the shipped modules
 //! verbatim via `#[path]`, so it always exercises the code that ships.
 
-#[path = "../src/cvt.rs"]
+#[path = "../src/capture/x11/cvt.rs"]
 mod cvt;
-#[path = "../src/display.rs"]
+#[path = "../src/capture/x11/display.rs"]
 mod display;
-#[path = "../src/randr_events.rs"]
+#[path = "../src/capture/x11/randr_events.rs"]
 mod randr_events;
 
 use std::time::Duration;

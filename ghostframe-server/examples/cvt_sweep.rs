@@ -14,7 +14,7 @@
 //! build examples, while `clippy --all-targets` still does, so this stays
 //! lint-clean without riding along into the container.
 //!
-//! Run it by hand before touching the arithmetic in `../src/cvt.rs`:
+//! Run it by hand before touching the arithmetic in `../src/capture/x11/cvt.rs`:
 //!
 //! ```text
 //! cargo run -p ghostframe-server --example cvt_sweep
@@ -30,7 +30,7 @@
 //! `../cvt.rs` for detail. This sweep expects exactly those two mismatches
 //! and reports anything beyond them as a failure.
 
-#[path = "../src/cvt.rs"]
+#[path = "../src/capture/x11/cvt.rs"]
 mod cvt;
 
 use std::process::Command;
