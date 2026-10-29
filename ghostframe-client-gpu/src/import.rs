@@ -4,10 +4,14 @@
 //! shapes everything here: **wgpu-hal 30 has `texture_from_raw` but no
 //! `buffer_from_raw`**, so an imported dmabuf must become a `VkImage`. For a
 //! `VK_IMAGE_TILING_LINEAR` image the driver picks the row pitch, and
-//! without `VK_EXT_image_drm_format_modifier` -- which this hardware does
-//! not expose -- there is no way to tell Vulkan the pitch the producer used.
+//! without `VK_EXT_image_drm_format_modifier` -- which the first target
+//! hardware does not expose -- there is no way to tell Vulkan the pitch the
+//! producer used. Where the extension *is* exposed (RADV on GFX10+, whose
+//! VA-API hands out tiled surfaces), a non-linear modifier is imported as
+//! that modifier with the producer's pitch stated explicitly; see
+//! [`import_nv12`].
 //!
-//! So the pitch is *checked*, not assumed: `vkGetImageSubresourceLayout`
+//! On the linear path the pitch is *checked*, not assumed: `vkGetImageSubresourceLayout`
 //! reports what the driver chose, and a disagreement fails the import. A
 //! wrong pitch does not produce obviously broken output; it produces a
 //! sheared image that looks like a decode bug and costs a day. That check
@@ -240,15 +244,27 @@ pub fn import_nv12(ctx: &WgpuContext, planes: &DmabufPlanes) -> Result<ImportedN
     // Any other modifier is a real tiled layout, which needs
     // VK_EXT_image_drm_format_modifier to import. Say so precisely rather than
     // failing deeper in with a confusing Vulkan error.
+    //
+    // A real tiled modifier on an adapter that HAS the extension is imported
+    // as exactly that modifier, with the producer's pitch stated explicitly
+    // (`VkImageDrmFormatModifierExplicitCreateInfoEXT`). This used to fall
+    // through to the linear path, and RADV on GFX10+ is the hardware that
+    // reaches it: its VA-API hands out tiled NV12 (measured on Rembrandt:
+    // `0x0200000010401b03`, GFX10 RB+ 64K_R_X), and at 1920x1080 the tiled
+    // pitches equal the linear ones, so `check_pitch` passed and tiled bytes
+    // were sampled as linear -- a garbled picture on every switch to H.264.
+    // `tests/gpu_import.rs`'s `a_decoded_surface_imports_byte_exact_or_is_refused`
+    // is the oracle for this branch.
     const DRM_FORMAT_MOD_LINEAR: u64 = 0;
     const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
-    match planes.modifier {
-        DRM_FORMAT_MOD_LINEAR => {}
+    let tiling = match planes.modifier {
+        DRM_FORMAT_MOD_LINEAR => Tiling::Linear,
         DRM_FORMAT_MOD_INVALID => {
             tracing::debug!(
                 "dmabuf reports no modifier; attempting a linear import, \
                  guarded by the pitch check"
             );
+            Tiling::Linear
         }
         m if !ctx.explicit_modifiers => {
             return Err(GpuError::Vulkan(format!(
@@ -257,24 +273,20 @@ pub fn import_nv12(ctx: &WgpuContext, planes: &DmabufPlanes) -> Result<ImportedN
                  INVALID (unspecified) can be imported"
             )));
         }
-        // KNOWN GAP, not yet closed: a real tiled modifier on an adapter
-        // that DOES have `VK_EXT_image_drm_format_modifier` falls through to
-        // here and takes the same `create_linear_image` path as LINEAR/
-        // INVALID below -- there is no
-        // `VkImageDrmFormatModifierExplicitCreateInfoEXT` branch that would
-        // create a `DRM_FORMAT_MODIFIER_EXT`-tiled image for it. A tiled
-        // buffer would therefore be misimported as linear, and `check_pitch`
-        // may or may not catch it (a tiled layout's per-subresource layout
-        // query has different semantics than a linear one's). Inherited
-        // verbatim from the plan; no hardware in this project exposes the
-        // extension, so it has never been exercised. A future milestone that
-        // targets such hardware must add that branch before trusting this
-        // path.
-        _ => {}
-    }
+        m => Tiling::Modifier(m),
+    };
 
-    ctx.with_raw(|instance, device, phys| import_inner(ctx, instance, device, phys, planes))
+    ctx.with_raw(|instance, device, phys| import_inner(ctx, instance, device, phys, planes, tiling))
         .ok_or_else(|| GpuError::Vulkan("wgpu is not running on the Vulkan backend".to_string()))?
+}
+
+/// How the plane images are created: the driver's own linear layout (checked
+/// against the producer's pitch), or the producer's DRM format modifier with
+/// its pitch stated explicitly.
+#[derive(Debug, Clone, Copy)]
+enum Tiling {
+    Linear,
+    Modifier(u64),
 }
 
 fn import_inner(
@@ -283,28 +295,48 @@ fn import_inner(
     device: &ash::Device,
     phys: vk::PhysicalDevice,
     planes: &DmabufPlanes,
+    tiling: Tiling,
 ) -> Result<ImportedNv12, GpuError> {
-    let luma = create_linear_image(device, planes.width, planes.height, vk::Format::R8_UNORM)?;
+    // Refused before any image exists: creating an image with a modifier the
+    // device does not list for that format and usage is undefined behaviour,
+    // not an error code.
+    if let Tiling::Modifier(m) = tiling {
+        check_modifier_supported(instance, phys, vk::Format::R8_UNORM, m)?;
+        check_modifier_supported(instance, phys, vk::Format::R8G8_UNORM, m)?;
+    }
+
+    let luma = create_plane_image(
+        device,
+        planes.width,
+        planes.height,
+        vk::Format::R8_UNORM,
+        tiling,
+        planes.luma,
+    )?;
     let mut guard = PartialImport {
         device,
         luma: Some(luma),
         chroma: None,
     };
 
-    let chroma = create_linear_image(
+    let chroma = create_plane_image(
         device,
         planes.chroma_width(),
         planes.chroma_height(),
         vk::Format::R8G8_UNORM,
+        tiling,
+        planes.chroma,
     )?;
     guard.chroma = Some(chroma);
 
-    // THE CHECK, run first (see module doc). The driver chose these
-    // pitches when it created each (still-unbound) image; the producer
-    // chose the ones in `planes`. If they differ, every row after the
-    // first would read from the wrong offset and the image would shear.
-    check_pitch(device, luma, "luma", planes.luma)?;
-    check_pitch(device, chroma, "chroma", planes.chroma)?;
+    // THE CHECK, run first (see module doc). On the linear path the driver
+    // chose these pitches when it created each (still-unbound) image; the
+    // producer chose the ones in `planes`. If they differ, every row after
+    // the first would read from the wrong offset and the image would shear.
+    // On the modifier path the pitch was handed to the driver, so this
+    // confirms it was honoured rather than adjusted.
+    check_pitch(device, luma, "luma", planes.luma, tiling)?;
+    check_pitch(device, chroma, "chroma", planes.chroma, tiling)?;
 
     // SAFETY: both images are live, just created above.
     let luma_req = unsafe { device.get_image_memory_requirements(luma) };
@@ -506,6 +538,156 @@ fn import_inner(
     })
 }
 
+/// The usage every imported plane image is created with: sampled by the blit,
+/// and copied from by the readback tests. Never written -- see the aliasing
+/// note in [`import_inner`].
+const PLANE_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::SAMPLED.as_raw() | vk::ImageUsageFlags::TRANSFER_SRC.as_raw(),
+);
+
+fn create_plane_image(
+    device: &ash::Device,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    tiling: Tiling,
+    plane: PlaneDesc,
+) -> Result<vk::Image, GpuError> {
+    let Tiling::Modifier(modifier) = tiling else {
+        return create_linear_image(device, width, height, format);
+    };
+
+    // One memory plane per image: each NV12 plane is its own single-plane
+    // image, bound at the plane's offset by `bind_image_memory`, so the
+    // layout offset here is relative to that binding and is 0. `size` must
+    // be 0 (VUID-VkImageDrmFormatModifierExplicitCreateInfoEXT-size-02267);
+    // the array and depth pitches are ignored for a single-layer 2D image.
+    let plane_layouts = [vk::SubresourceLayout {
+        offset: 0,
+        size: 0,
+        row_pitch: plane.pitch,
+        array_pitch: 0,
+        depth_pitch: 0,
+    }];
+    let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+        .drm_format_modifier(modifier)
+        .plane_layouts(&plane_layouts);
+    let mut external = vk::ExternalMemoryImageCreateInfo::default()
+        .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(PLANE_USAGE)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .push_next(&mut external)
+        .push_next(&mut explicit);
+
+    // SAFETY: `info` is fully populated, `device` is live, and
+    // `check_modifier_supported` has confirmed this format, modifier and
+    // usage are a combination the device accepts.
+    unsafe { device.create_image(&info, None) }.map_err(|e| {
+        GpuError::Vulkan(format!(
+            "create_image (import, {format:?}, modifier 0x{modifier:016x}): {e}"
+        ))
+    })
+}
+
+/// Refuse `modifier` for `format` unless the device lists it with a single
+/// memory plane and sampling support, and accepts a dmabuf-importable image
+/// of [`PLANE_USAGE`] with it.
+///
+/// A single memory plane is what this module can bind: a modifier with more
+/// (AMD's DCC modifiers carry a metadata plane) would need every plane's
+/// offset and pitch, and the descriptor carries one per NV12 plane. Refusing
+/// sends the frame down the CPU copy, which is correct everywhere.
+fn check_modifier_supported(
+    instance: &ash::Instance,
+    phys: vk::PhysicalDevice,
+    format: vk::Format,
+    modifier: u64,
+) -> Result<(), GpuError> {
+    let mut count_query = vk::DrmFormatModifierPropertiesListEXT::default();
+    let mut count_probe = vk::FormatProperties2::default().push_next(&mut count_query);
+    // SAFETY: `count_probe` is a valid out-param; `phys` came from
+    // `WgpuContext::with_raw` and is alive for the call's duration.
+    unsafe { instance.get_physical_device_format_properties2(phys, format, &mut count_probe) };
+
+    let count = count_query.drm_format_modifier_count as usize;
+    let mut props = vec![vk::DrmFormatModifierPropertiesEXT::default(); count];
+    let mut fill_query = vk::DrmFormatModifierPropertiesListEXT::default()
+        .drm_format_modifier_properties(&mut props);
+    let mut fill_probe = vk::FormatProperties2::default().push_next(&mut fill_query);
+    // SAFETY: as above; `props` has exactly `count` elements, matching what
+    // the first call reported.
+    unsafe { instance.get_physical_device_format_properties2(phys, format, &mut fill_probe) };
+
+    let Some(p) = props.iter().find(|p| p.drm_format_modifier == modifier) else {
+        return Err(GpuError::Vulkan(format!(
+            "dmabuf modifier 0x{modifier:016x} is not one this device lists for {format:?}"
+        )));
+    };
+    if p.drm_format_modifier_plane_count != 1 {
+        return Err(GpuError::Vulkan(format!(
+            "dmabuf modifier 0x{modifier:016x} has {} memory planes for {format:?}; \
+             this import binds exactly one",
+            p.drm_format_modifier_plane_count
+        )));
+    }
+    if !p
+        .drm_format_modifier_tiling_features
+        .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+    {
+        return Err(GpuError::Vulkan(format!(
+            "dmabuf modifier 0x{modifier:016x} cannot be sampled as {format:?} on this device"
+        )));
+    }
+
+    let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+        .drm_format_modifier(modifier)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(format)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(PLANE_USAGE)
+        .push_next(&mut external_info)
+        .push_next(&mut modifier_info);
+    let mut external_props = vk::ExternalImageFormatProperties::default();
+    let mut image_props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+    // SAFETY: both structure chains are valid for the call's duration; `phys`
+    // is alive as above.
+    unsafe {
+        instance.get_physical_device_image_format_properties2(phys, &format_info, &mut image_props)
+    }
+    .map_err(|e| {
+        GpuError::Vulkan(format!(
+            "dmabuf modifier 0x{modifier:016x} is not importable as {format:?}: {e}"
+        ))
+    })?;
+    if !external_props
+        .external_memory_properties
+        .external_memory_features
+        .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+    {
+        return Err(GpuError::Vulkan(format!(
+            "dmabuf modifier 0x{modifier:016x} is not importable as {format:?} from a dmabuf"
+        )));
+    }
+    Ok(())
+}
+
 fn create_linear_image(
     device: &ash::Device,
     width: u32,
@@ -526,7 +708,7 @@ fn create_linear_image(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::LINEAR)
-        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+        .usage(PLANE_USAGE)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .push_next(&mut external);
@@ -544,16 +726,23 @@ fn check_pitch(
     image: vk::Image,
     what: &'static str,
     plane: PlaneDesc,
+    tiling: Tiling,
 ) -> Result<(), GpuError> {
+    // A modifier-tiled image is queried per *memory* plane, not by colour
+    // aspect (VUID-vkGetImageSubresourceLayout-tiling-02271).
+    let aspect_mask = match tiling {
+        Tiling::Linear => vk::ImageAspectFlags::COLOR,
+        Tiling::Modifier(_) => vk::ImageAspectFlags::MEMORY_PLANE_0_EXT,
+    };
     let subresource = vk::ImageSubresource {
-        aspect_mask: vk::ImageAspectFlags::COLOR,
+        aspect_mask,
         mip_level: 0,
         array_layer: 0,
     };
-    // SAFETY: `image` is live and was created with
-    // `vk::ImageTiling::LINEAR`, which is one of the two tilings
-    // `vkGetImageSubresourceLayout` is defined for (the other is
-    // `DRM_FORMAT_MODIFIER_EXT`, which `export.rs` queries the same way).
+    // SAFETY: `image` is live and was created with either
+    // `vk::ImageTiling::LINEAR` or `DRM_FORMAT_MODIFIER_EXT`, the two tilings
+    // `vkGetImageSubresourceLayout` is defined for, with the aspect each
+    // one requires (above).
     // The image need not be bound to memory: the subresource layout is a
     // property of the image alone, fixed at `vkCreateImage` time, not of
     // memory bound to it afterwards -- there is no valid-usage requirement
@@ -575,7 +764,7 @@ fn check_pitch(
     // for.
     if layout.offset != 0 {
         return Err(GpuError::Vulkan(format!(
-            "{what} plane: driver's linear image reports a nonzero subresource \
+            "{what} plane: driver's image reports a nonzero subresource \
              offset ({}), which this import path does not account for",
             layout.offset
         )));

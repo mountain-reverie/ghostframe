@@ -485,3 +485,134 @@ fn a_cloned_texture_outlives_the_import_and_stays_usable() {
         }
     }
 }
+
+/// A surface the decoder really produced, imported and read back through the
+/// GPU, must hold exactly the bytes `av_hwframe_transfer_data` reports for
+/// the same surface -- or the import must refuse it, so the renderer takes the
+/// CPU copy. The tests above build their own LINEAR dmabuf and so cannot see
+/// the decoder's actual layout; this one can.
+///
+/// The case it exists for: RADV on GFX10+ exposes
+/// `VK_EXT_image_drm_format_modifier`, and its VA-API driver hands out
+/// *tiled* NV12 surfaces (measured on Rembrandt: modifier
+/// `0x0200000010401b03`, GFX10 RB+ 64K_R_X). At 640x480 the tiled chroma
+/// pitch (1024) differs from the linear one (768) and `check_pitch` refuses
+/// by luck; at 1920x1080 both pitches are 2048, the check passes, and the
+/// tiled bytes were sampled as linear -- garbage on screen, while the
+/// "looks like a gradient" check in `gpu_h264_render.rs` still passed. So
+/// 1920x1080 is the size that matters here, and 640x480 stays to keep the
+/// refusal case covered.
+///
+/// Byte-exact, not a tolerance: both sides are the same decoded surface, so
+/// any difference at all is the import misplacing bytes.
+#[test]
+fn a_decoded_surface_imports_byte_exact_or_is_refused() {
+    use ghostframe_client_h264::decoder::H264Decoder;
+    use ghostframe_client_h264::testclip::gradient_clip;
+
+    let ctx = WgpuContext::new().expect("create wgpu context");
+    match ghostframe_client_h264::driver_reports_h264_decode(
+        &ghostframe_client_h264::probe::default_device(),
+    ) {
+        Some(true) => {}
+        Some(false) => {
+            eprintln!("driver reports no H.264 VLD entrypoint; skipping");
+            return;
+        }
+        None => {
+            eprintln!("vainfo unavailable; cannot establish ground truth, skipping");
+            return;
+        }
+    }
+
+    for (w, h) in [(640u32, 480u32), (1920, 1080)] {
+        // Eight frames, not three: the unsynced-map race showed on the
+        // second decoded frame, which a three-AU clip with B-frame reordering
+        // barely reaches.
+        let clip = gradient_clip(w, h, 8);
+        let mut dec = H264Decoder::new().expect("open decoder");
+        let mut decoded = 0;
+        let mut compared = 0;
+        // Each frame is checked the moment `decode` returns it, as the
+        // renderer does. Decoding the whole clip first would give the
+        // hardware time to finish every surface and hide a map that does not
+        // wait for it.
+        for au in &clip {
+            for frame in dec.decode(au).expect("decode") {
+                decoded += 1;
+                compared += usize::from(import_matches_download(&ctx, &frame, w, h));
+            }
+        }
+        for frame in dec.finish().expect("finish") {
+            decoded += 1;
+            compared += usize::from(import_matches_download(&ctx, &frame, w, h));
+        }
+        assert!(decoded > 0, "{w}x{h}: the decoder produced no frame");
+        eprintln!("{w}x{h}: {compared} of {decoded} frames imported and matched");
+        // Refusing every frame satisfies the byte check vacuously. With
+        // explicit modifiers the device can import whatever single-plane
+        // layout the decoder produced, so a refusal there is the zero-copy
+        // path being lost, not the correct fallback.
+        if ctx.explicit_modifiers {
+            assert!(
+                compared > 0,
+                "{w}x{h}: the adapter has VK_EXT_image_drm_format_modifier but \
+                 every decoded surface was refused"
+            );
+        }
+    }
+}
+
+/// One frame of [`a_decoded_surface_imports_byte_exact_or_is_refused`]:
+/// `true` if it imported and matched, `false` if the import refused it.
+fn import_matches_download(
+    ctx: &WgpuContext,
+    frame: &ghostframe_client_h264::decoder::HwFrame,
+    w: u32,
+    h: u32,
+) -> bool {
+    // Map, import and read back BEFORE `download_nv12`: the download
+    // waits for the decode (`vaSyncSurface` inside
+    // `av_hwframe_transfer_data`), so doing it first would hand the
+    // import a finished surface and hide a map that does not wait.
+    // That ordering hid exactly that bug once: FFmpeg 4.4's
+    // VA-API->DRM map does not sync, and the renderer drew a frame of
+    // zeros -- solid green -- on every switch into H.264.
+    let mapped = frame.map_dmabuf().expect("map to dmabuf");
+    let planes = mapped.planes();
+    let imported = match import_nv12(ctx, planes) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!(
+                "{w}x{h}: import refused (modifier 0x{:016x}): {e}",
+                planes.modifier
+            );
+            return false;
+        }
+    };
+    let luma = read_back(&ctx.device, &ctx.queue, imported.luma(), w, h, 1);
+    let chroma = read_back(
+        &ctx.device,
+        &ctx.queue,
+        imported.chroma(),
+        planes.chroma_width(),
+        planes.chroma_height(),
+        2,
+    );
+    let (want_luma, want_chroma) = frame.download_nv12().expect("download_nv12");
+    assert!(
+        luma == want_luma,
+        "{w}x{h}: imported luma differs from the decoder's own download \
+         (modifier 0x{:016x}, luma {:?}) -- the import misread the layout, or read the surface before its decode finished",
+        planes.modifier,
+        planes.luma
+    );
+    assert!(
+        chroma == want_chroma,
+        "{w}x{h}: imported chroma differs from the decoder's own download \
+         (modifier 0x{:016x}, chroma {:?}) -- the import misread the layout, or read the surface before its decode finished",
+        planes.modifier,
+        planes.chroma
+    );
+    true
+}
