@@ -131,6 +131,20 @@ impl Scanout {
         let (conn, screen_num) = x11rb::connect(display)?;
         let screen = &conn.setup().roots[screen_num];
         let (root, depth) = (screen.root, screen.root_depth);
+        // The patterns write XRGB8888 and the pad byte is only ignored on a
+        // depth-24 root with a 32 bpp pixmap format.
+        let bpp = conn
+            .setup()
+            .pixmap_formats
+            .iter()
+            .find(|f| f.depth == depth)
+            .map(|f| f.bits_per_pixel);
+        if depth != 24 || bpp != Some(32) {
+            return Err(format!(
+                "x11_sink needs a depth-24 root with 32 bpp pixels, got depth {depth}, bpp {bpp:?}"
+            )
+            .into());
+        }
         let (w, h) = (
             u32::from(screen.width_in_pixels),
             u32::from(screen.height_in_pixels),
@@ -292,7 +306,9 @@ mod tests {
     }
 
     fn pixel(x: u32, y: u32) -> [u8; 3] {
-        [(x * 3) as u8, (y * 3) as u8, ((x + y) * 2) as u8]
+        // The high bits of x and y are encoded too, so a band misplaced by a
+        // multiple of 256 rows still differs.
+        [x as u8, y as u8, ((x >> 8) | ((y >> 8) << 4)) as u8]
     }
 
     /// Paint a gradient through the sink and read root back with GetImage.

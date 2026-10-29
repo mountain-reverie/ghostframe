@@ -1974,10 +1974,8 @@ async fn e2e_production_scale_with_loss_converges() -> Result<()> {
     // than assume a schedule: converge, then watch for the burst marker, then
     // converge again. Nothing here depends on how long startup took.
     let setup = setup_e2e_webgpu_gpu_with_env(
-        // DRM path, not X11: the server captures from DRM, and with no
-        // compositor an X11 repaint after the initial modeset never reaches
-        // scanout. Measured -- a mixed.rs repaint printed its marker and the
-        // server then captured 44 frames without a single dirty tile.
+        // Sink path: the pattern draws a pixel-exact buffer into root, and
+        // the server captures root over X11, as in production.
         "--tile-pattern photo --subtle-drift-once 60000 --x11-sink",
         &[
             // Production captures at ~30 fps. 5 was inherited from the

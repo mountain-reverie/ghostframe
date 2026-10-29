@@ -59,18 +59,26 @@ if [ -z "${XORG_CONF:-}" ]; then
     fi
 fi
 
-Xorg :99 -config "$XORG_CONF" &
+# -noreset: without it the server regenerates when a short-lived client (every
+# xrandr call) disconnects, and a mode created by --newmode is gone before the
+# following --addmode.
+Xorg :99 -noreset -config "$XORG_CONF" &
+up=0
 for _ in $(seq 1 50); do
-    xrandr --query >/dev/null 2>&1 && break
+    if xrandr --query >/dev/null 2>&1; then up=1; break; fi
     sleep 0.2
 done
+if [[ $up != 1 ]]; then
+    echo "entrypoint: Xorg :99 did not come up" >&2
+    exit 1
+fi
 
 # Switch the first connected output to WxH: one of its own modes when it has
 # one (VKMS lists 1024x768, 1920x1080 and 4096x2160), else a new mode (the
 # dummy driver accepts any timings).
 set_screen_mode() {
     local mode=$1 w=${1%x*} h=${1#*x} out clock
-    out=$(xrandr --query | awk '/ connected/ {print $1; exit}')
+    out=$(xrandr --query | awk '/ connected/ && !f {print $1; f=1}')
     if [[ -z "$out" ]]; then
         echo "entrypoint: no connected output on $DISPLAY" >&2
         return 1
@@ -82,6 +90,12 @@ set_screen_mode() {
             "$h" $((h + 3)) $((h + 8)) $((h + 30))
         xrandr --addmode "$out" "gf_$mode"
         xrandr --output "$out" --mode "gf_$mode"
+    fi
+    local got
+    got=$(xrandr --query | sed -n '/^Screen 0/{s/.*current \([0-9]*\) x \([0-9]*\),.*/\1x\2/p;q}')
+    if [[ "$got" != "$mode" ]]; then
+        echo "entrypoint: screen is ${got:-unknown}, wanted $mode for --x11-sink" >&2
+        exit 1
     fi
     echo "entrypoint: $out set to $mode for --x11-sink"
 }
