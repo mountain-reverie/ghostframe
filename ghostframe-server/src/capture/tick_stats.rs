@@ -3,14 +3,17 @@
 //! These are plain integers bumped at the explicit copy and allocation sites
 //! of one tick, then read and reset by the capture loop. They are not a global
 //! allocator hook: they count the sites the damage-driven plan removes (the
-//! full-root `to_vec`, the cursor image, the damage tile set and list), so a
-//! later PR that drops one of them shows up as a drop in the counter.
+//! full-root copy, gone on the SHM path since PR 2; the cursor image; the
+//! damage tile set and list), so a later PR that drops one of them shows up
+//! as a drop in the counter.
 
 /// What one capture tick copied and allocated at the counted sites.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TickStats {
     /// Bytes memcpy'd or read into freshly allocated buffers by the capture
-    /// path: exactly the root grab (every tick) and the cursor image.
+    /// path: the cursor image, and the whole root on the `GetImage` fallback
+    /// (the reply buffer). The MIT-SHM grab writes into a pooled slot and
+    /// copies nothing here (before PR 2 it was a `to_vec` of the segment).
     pub bytes_copied: u64,
     /// Heap allocations at the counted sites.
     pub allocs: u32,

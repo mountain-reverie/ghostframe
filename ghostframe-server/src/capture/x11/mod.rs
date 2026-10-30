@@ -119,6 +119,10 @@ impl super::Backend for X11Backend {
         frame
     }
 
+    fn frame_pool(&self) -> Option<ghostframe_lib::FramePool> {
+        Some(self.frames.pool())
+    }
+
     fn arm_damage(&mut self) {
         if let Some(d) = self.damage.as_mut() {
             d.arm();

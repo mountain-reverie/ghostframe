@@ -246,6 +246,26 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
             was_idle = Some(false);
         }
 
+        // Backpressure: every frame slot may still be in the pipeline. Wait
+        // here, before the damage drain, so the wait does not widen the
+        // drain-to-grab window. A slot is only ever held by a frame in
+        // flight, so this ends when the library finishes one; the warning
+        // is for the day a slot leaks and this wait never ends.
+        if let Some(pool) = backend.frame_pool() {
+            let mut waited = 0u32;
+            while tokio::time::timeout(std::time::Duration::from_secs(5), pool.wait_free())
+                .await
+                .is_err()
+            {
+                waited += 5;
+                tracing::warn!(
+                    waited_s = waited,
+                    slots = pool.slots(),
+                    "capture waiting for a free frame slot; the pipeline is not returning frames"
+                );
+            }
+        }
+
         let capture_start = std::time::Instant::now();
         // Only the ticks whose line is logged (`frame_count` is bumped before it).
         let sample_cpu = cost_trace && (frame_count + 1).is_multiple_of(heartbeat_every);

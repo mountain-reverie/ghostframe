@@ -22,7 +22,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use crate::capture::TileBitmap;
 use crate::util::monotonic_now_ns;
-use ghostframe_lib::FrameSubmission;
+use ghostframe_lib::{FrameBuf, FramePool, FrameStorage, FrameSubmission, PoolSlot};
 use x11rb::connection::Connection;
 use x11rb::protocol::shm::{self, ConnectionExt as ShmExt};
 use x11rb::protocol::xfixes::{ConnectionExt as XfixesExt, GetCursorImageReply};
@@ -32,6 +32,10 @@ use x11rb::rust_connection::RustConnection;
 /// Frames to capture with GetImage after a local MIT-SHM allocation error
 /// before the retry; the retry runs on the frame after these.
 const SHM_RETRY_FRAMES: u32 = 300;
+
+/// Frame slots: 2 queued in the submit channel + 1 in the bridge + 1 being
+/// grabbed (design: damage-driven-encoding-design.md, section 3.1).
+pub const POOL_SLOTS: usize = 4;
 
 /// Count a pending retry down by one frame; true when it is due now.
 fn retry_due(counter: &mut Option<u32>) -> bool {
@@ -57,7 +61,9 @@ pub enum GrabPath {
     GetImage,
 }
 
-/// A memfd-backed MIT-SHM segment the X server writes root pixels into.
+/// A memfd-backed MIT-SHM segment the X server writes root pixels into. It is
+/// also a frame slot's storage: the frame handed to the library is this very
+/// memory, so the grab involves no copy in this process.
 struct ShmSegment {
     seg: shm::Seg,
     ptr: *mut u8,
@@ -95,7 +101,7 @@ impl ShmSegment {
             libc::mmap(
                 std::ptr::null_mut(),
                 len,
-                libc::PROT_READ,
+                libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
                 fd.as_raw_fd(),
                 0,
@@ -120,10 +126,29 @@ impl ShmSegment {
             .map_err(|e| AttachError::X(io::Error::other(e)))?;
         Ok(me)
     }
+}
 
+// SAFETY: the mapping is plain memory owned by this value; the X server's
+// writes happen only inside a `ShmGetImage` the owner is waiting on.
+unsafe impl Send for ShmSegment {}
+
+impl FrameStorage for ShmSegment {
     fn bytes(&self) -> &[u8] {
         // SAFETY: `ptr` maps exactly `len` bytes for the life of `self`.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above, and `&mut self` is the only handle in this
+        // process. The X server also maps the memory, but it writes only
+        // during a `ShmGetImage` naming this segment id, and only the holder
+        // of the slot that owns this segment issues one.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
     }
 }
 
@@ -142,8 +167,11 @@ pub struct X11Frames {
     root: u32,
     width: u16,
     height: u16,
-    /// The segment for the current root size; `None` means `GetImage`.
-    shm: Option<ShmSegment>,
+    /// Byte length of a root frame while the SHM path is active; `None`
+    /// means `GetImage`. The segments themselves live in `pool`'s slots.
+    shm_len: Option<usize>,
+    /// The frame slots (SHM segments on the SHM path).
+    pool: FramePool,
     /// False once MIT-SHM is known not to work on this connection, so a
     /// resize does not retry (and re-log) a failing attach every time.
     shm_usable: bool,
@@ -241,7 +269,8 @@ impl X11Frames {
             root,
             width,
             height,
-            shm: None,
+            shm_len: None,
+            pool: FramePool::new(POOL_SLOTS),
             shm_usable,
             dump_first_frame,
             polled_cursor: None,
@@ -258,46 +287,54 @@ impl X11Frames {
 
     /// How frames are grabbed right now.
     pub fn path(&self) -> GrabPath {
-        if self.shm.is_some() {
+        if self.shm_len.is_some() {
             GrabPath::Shm
         } else {
             GrabPath::GetImage
         }
     }
 
-    /// Make the segment match the root size, or drop to `GetImage` for good
-    /// if MIT-SHM cannot be used.
-    fn ensure_segment(&mut self) {
-        self.shm_retry_in = None;
-        if !self.shm_usable {
-            return;
+    /// Detach a segment from the X server. Checked, so a refusal is read
+    /// here and not left in the event queue; the segment is going away
+    /// either way.
+    fn detach(&self, seg: &ShmSegment) {
+        if let Err(e) = self
+            .conn
+            .shm_detach(seg.seg)
+            .map_err(io::Error::other)
+            .and_then(|c| c.check().map_err(io::Error::other))
+        {
+            tracing::debug!(error = %e, "MIT-SHM detach failed");
         }
-        let len = usize::from(self.width) * usize::from(self.height) * 4;
-        if self.shm.as_ref().is_some_and(|s| s.len == len) {
-            return;
-        }
-        if let Some(old) = self.shm.take() {
-            // Checked, so a refusal is read here and not left in the event
-            // queue; the segment is going away either way.
-            if let Err(e) = self
-                .conn
-                .shm_detach(old.seg)
-                .map_err(io::Error::other)
-                .and_then(|c| c.check().map_err(io::Error::other))
-            {
-                tracing::debug!(error = %e, "MIT-SHM detach failed");
+    }
+
+    /// Detach and drop every free segment that does not fit the current SHM
+    /// size (all of them once the SHM path is off). Without this a LIFO free
+    /// list would keep old-size segments, and their memory, until popped.
+    fn release_stale(&mut self) {
+        let want = self.shm_len;
+        let stale = self.pool.take_free_where(|s| {
+            s.as_any()
+                .downcast_ref::<ShmSegment>()
+                .is_none_or(|seg| Some(seg.len) != want)
+        });
+        for old in stale {
+            if let Ok(seg) = old.into_any().downcast::<ShmSegment>() {
+                self.detach(&seg);
             }
         }
-        match ShmSegment::attach(&self.conn, len) {
-            Ok(s) => {
-                self.shm = Some(s);
-                self.shm_alloc_failing = false;
-            }
-            Err(AttachError::X(e)) => {
+    }
+
+    /// Record why a segment could not be attached.
+    fn attach_failed(&mut self, err: AttachError) {
+        self.shm_len = None;
+        self.release_stale();
+        match err {
+            AttachError::X(e) => {
                 tracing::warn!(error = %e, "MIT-SHM segment attach refused; using GetImage(root)");
                 self.shm_usable = false;
             }
-            Err(AttachError::Os(e)) => {
+            AttachError::Os(e) => {
                 // Local and possibly transient: GetImage for now, retried at
                 // the next resize or after SHM_RETRY_FRAMES frames. Only the
                 // first failure is news; a persistent one would otherwise warn
@@ -309,6 +346,47 @@ impl X11Frames {
                 }
                 self.shm_alloc_failing = true;
                 self.shm_retry_in = Some(SHM_RETRY_FRAMES);
+            }
+        }
+    }
+
+    /// Make the SHM path match the root size, or drop to `GetImage` for good
+    /// if MIT-SHM cannot be used. Proves an attach works at the new size and
+    /// leaves that segment in a free slot; the other slots are filled (and
+    /// stale ones replaced) lazily by `grab`.
+    fn ensure_segment(&mut self) {
+        self.shm_retry_in = None;
+        if !self.shm_usable {
+            return;
+        }
+        let len = usize::from(self.width) * usize::from(self.height) * 4;
+        if self.shm_len == Some(len) {
+            return;
+        }
+        match ShmSegment::attach(&self.conn, len) {
+            Ok(seg) => {
+                self.stats.alloc();
+                self.shm_len = Some(len);
+                self.shm_alloc_failing = false;
+                self.release_stale();
+                match self.pool.try_acquire() {
+                    Some(mut slot) => {
+                        self.discard_storage(&mut slot);
+                        slot.set_storage(Box::new(seg));
+                    }
+                    // Every slot is out with a frame; the probe has done its job.
+                    None => self.detach(&seg),
+                }
+            }
+            Err(e) => self.attach_failed(e),
+        }
+    }
+
+    /// Remove and release the slot's storage, detaching it if it is a segment.
+    fn discard_storage(&mut self, slot: &mut PoolSlot) {
+        if let Some(old) = slot.take_storage() {
+            if let Ok(seg) = old.into_any().downcast::<ShmSegment>() {
+                self.detach(&seg);
             }
         }
     }
@@ -342,11 +420,39 @@ impl X11Frames {
         Ok(())
     }
 
-    /// The root pixels, BGRX, `width * 4` per row, without the cursor.
-    fn grab(&mut self) -> io::Result<Vec<u8>> {
+    /// The root pixels, BGRX, `width * 4` per row, without the cursor, in
+    /// `slot`. On the SHM path the X server writes them straight into the
+    /// slot's segment: nothing is allocated or copied here once the slots are
+    /// warm. The `GetImage` path takes the reply's buffer as the frame (the
+    /// slot goes back unused).
+    fn grab(&mut self, mut slot: PoolSlot) -> io::Result<FrameBuf> {
         let (w, h) = (self.width, self.height);
         let want = usize::from(w) * usize::from(h) * 4;
-        if let Some(seg) = &self.shm {
+        if self.shm_len == Some(want) {
+            let fits = slot
+                .storage()
+                .and_then(|s| s.as_any().downcast_ref::<ShmSegment>())
+                .is_some_and(|s| s.len == want);
+            if !fits {
+                // A never-used slot, or one that came back from before a resize.
+                self.discard_storage(&mut slot);
+                self.release_stale();
+                match ShmSegment::attach(&self.conn, want) {
+                    Ok(seg) => {
+                        self.stats.alloc();
+                        slot.set_storage(Box::new(seg));
+                    }
+                    Err(e) => {
+                        self.attach_failed(e);
+                        return self.grab_get_image(w, h, want);
+                    }
+                }
+            }
+            let seg_id = slot
+                .storage()
+                .and_then(|s| s.as_any().downcast_ref::<ShmSegment>())
+                .map(|s| s.seg)
+                .expect("storage was just installed");
             let reply = self
                 .conn
                 .shm_get_image(
@@ -357,7 +463,7 @@ impl X11Frames {
                     h,
                     !0,
                     ImageFormat::Z_PIXMAP.into(),
-                    seg.seg,
+                    seg_id,
                     0,
                 )
                 .map_err(io::Error::other)?
@@ -369,9 +475,15 @@ impl X11Frames {
                     reply.size
                 )));
             }
-            self.stats.alloc_copy(want);
-            return Ok(seg.bytes()[..want].to_vec());
+            return slot
+                .into_buf()
+                .map_err(|_| io::Error::other("frame slot lost its storage"));
         }
+        drop(slot);
+        self.grab_get_image(w, h, want)
+    }
+
+    fn grab_get_image(&mut self, w: u16, h: u16, want: usize) -> io::Result<FrameBuf> {
         let reply = self
             .conn
             .get_image(ImageFormat::Z_PIXMAP, self.root, 0, 0, w, h, !0)
@@ -384,8 +496,14 @@ impl X11Frames {
                 reply.data.len()
             )));
         }
+        // x11rb allocated and filled this reply buffer; it becomes the frame.
         self.stats.alloc_copy(want);
-        Ok(reply.data)
+        Ok(FrameBuf::from(reply.data))
+    }
+
+    /// The pool the frames come from, for a producer loop that waits on it.
+    pub fn pool(&self) -> FramePool {
+        self.pool.clone()
     }
 
     fn query_cursor(&mut self) -> Option<GetCursorImageReply> {
@@ -441,7 +559,10 @@ impl X11Frames {
         if retry_due(&mut self.shm_retry_in) {
             self.ensure_segment();
         }
-        let mut pixels = self.grab()?;
+        let slot = self.pool.try_acquire().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::WouldBlock, "every frame slot is in flight")
+        })?;
+        let mut pixels = self.grab(slot)?;
         // Best effort: without XFixes the frame is correct minus the cursor.
         let cursor = match self.polled_cursor.take() {
             Some(polled) => polled,
@@ -451,7 +572,7 @@ impl X11Frames {
         self.last_cursor_serial = cursor.as_ref().map(|c| c.cursor_serial);
         if let Some(cursor) = cursor {
             blit_cursor(
-                &mut pixels,
+                pixels.bytes_mut(),
                 i32::from(self.width),
                 i32::from(self.height),
                 &cursor,
@@ -464,7 +585,7 @@ impl X11Frames {
             width,
             height,
             stride: width * 4,
-            pixels: pixels.into(),
+            pixels,
             dmabuf_fd: None,
             timestamp_us,
             damage_tiles: None,
@@ -951,7 +1072,7 @@ mod live_tests {
         paint_root(x.display());
         let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
         assert_eq!(f.path(), GrabPath::Shm);
-        let shm = f.grab().unwrap();
+        let shm = f.grab(f.pool().try_acquire().unwrap()).unwrap().to_vec();
         assert!(shm.iter().any(|&b| b != 0), "root was not painted");
         assert_eq!(shm, root_get_image(x.display()));
     }
@@ -964,7 +1085,10 @@ mod live_tests {
         assert_eq!(f.path(), GrabPath::GetImage);
         let frame = f.capture(0).unwrap();
         assert_eq!((frame.width, frame.height, frame.stride), (64, 48, 256));
-        assert_eq!(f.grab().unwrap(), root_get_image(x.display()));
+        assert_eq!(
+            f.grab(f.pool().try_acquire().unwrap()).unwrap().to_vec(),
+            root_get_image(x.display())
+        );
     }
 
     /// The live cursor (a glyph from the server's built-in cursor font) is
@@ -987,7 +1111,7 @@ mod live_tests {
         conn.get_input_focus().unwrap().reply().unwrap();
 
         let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
-        let plain = f.grab().unwrap();
+        let plain = f.grab(f.pool().try_acquire().unwrap()).unwrap().to_vec();
         let frame = f.capture(0).unwrap();
         let cur = f.conn.xfixes_get_cursor_image().unwrap().reply().unwrap();
         let (cx, cy) = (
@@ -1063,10 +1187,256 @@ mod live_tests {
             assert_eq!((frame.width, frame.height), (u32::from(w), u32::from(h)));
             assert_eq!(frame.pixels.len(), usize::from(w) * usize::from(h) * 4);
             assert_eq!(f.path(), GrabPath::Shm, "after resizing to {w}x{h}");
-            let plain = f.grab().unwrap();
+            let plain = f.grab(f.pool().try_acquire().unwrap()).unwrap().to_vec();
             assert!(plain.iter().any(|&b| b != 0), "root not painted at {w}x{h}");
             assert_eq!(plain, root_get_image_sized(x.display(), w, h), "{w}x{h}");
         }
+    }
+
+    fn paint_fill(display: &str, w: u16, h: u16, v: u8) {
+        let (conn, n) = x11rb::connect(Some(display)).unwrap();
+        let screen = &conn.setup().roots[n];
+        let gc = conn.generate_id().unwrap();
+        conn.create_gc(gc, screen.root, &CreateGCAux::new())
+            .unwrap();
+        let data = vec![v; usize::from(w) * usize::from(h) * 4];
+        conn.put_image(
+            ImageFormat::Z_PIXMAP,
+            screen.root,
+            gc,
+            w,
+            h,
+            0,
+            0,
+            0,
+            screen.root_depth,
+            &data,
+        )
+        .unwrap();
+        conn.get_input_focus().unwrap().reply().unwrap();
+    }
+
+    /// The point of PR 2, as a property: once the slots are warm a tick
+    /// allocates nothing for the grab and copies only the cursor image, a
+    /// tiny fraction of the root. Non-zero is proved by the warm-up ticks,
+    /// which must count the segment allocations, and by the GetImage path,
+    /// which still counts a full-frame copy.
+    #[test]
+    fn a_warm_shm_grab_allocates_and_copies_nothing() {
+        const WANT: u64 = 64 * 48 * 4;
+        let x = PrivateXvfb::spawn(&["-screen", "0", "64x48x24"]);
+        paint_root(x.display());
+        let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
+        assert_eq!(f.path(), GrabPath::Shm);
+        // Not reset after connect: the probe segment's attach counts too.
+        // Hold POOL_SLOTS frames at once so every slot is allocated.
+        let held: Vec<_> = (0..POOL_SLOTS).map(|_| f.capture(0).unwrap()).collect();
+        let warm = f.take_stats();
+        drop(held);
+        let mut cursor_allocs = None;
+        for i in 0..8 {
+            let frame = f.capture(0).unwrap();
+            drop(frame);
+            let s = f.take_stats();
+            // Only the cursor reply, the same every tick, never a full root.
+            let c = *cursor_allocs.get_or_insert(s.allocs);
+            assert!(c <= 1 && s.allocs == c, "tick {i}: {s:?}");
+            assert!(s.bytes_copied < WANT / 4, "tick {i} copied {s:?}");
+        }
+        // Warm-up = one cursor reply per capture plus one attach per slot;
+        // the cursor part alone (steady cost) must not satisfy this.
+        let c = cursor_allocs.unwrap();
+        assert!(
+            warm.allocs >= POOL_SLOTS as u32 * (1 + c),
+            "warm-up must count every slot allocation, got {warm:?} (cursor {c}/tick)"
+        );
+        // The same display through GetImage still pays the full copy, so
+        // the counter above can read low.
+        let mut g = X11Frames::connect(Some(x.display()), None).unwrap();
+        g.shm_usable = false;
+        g.shm_len = None;
+        drop(g.capture(0).unwrap());
+        let s = g.take_stats();
+        assert!(s.bytes_copied >= WANT, "GetImage path: {s:?}");
+    }
+
+    /// The pooled SHM frame is byte-identical to the GetImage frame (the
+    /// unchanged old path) for the same screen, including after the slot
+    /// held a different picture.
+    #[test]
+    fn a_recycled_slot_shows_the_current_screen_not_its_old_content() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "64x48x24"]);
+        let mut shm = X11Frames::connect(Some(x.display()), None).unwrap();
+        let mut plain = X11Frames::connect(Some(x.display()), None).unwrap();
+        plain.shm_usable = false;
+        plain.shm_len = None;
+        assert_eq!(shm.path(), GrabPath::Shm);
+        assert_eq!(plain.path(), GrabPath::GetImage);
+        for v in [0x11u8, 0x80, 0xee, 0x05, 0x40, 0x99] {
+            paint_fill(x.display(), 64, 48, v);
+            let a = shm.capture(0).unwrap();
+            let b = plain.capture(0).unwrap();
+            assert!(a.pixels.is_pooled() && !b.pixels.is_pooled());
+            assert_eq!(&*a.pixels, &*b.pixels, "fill {v:#x}");
+            assert!(a.pixels.contains(&v), "fill {v:#x} not seen");
+        }
+    }
+
+    /// Every slot is out: capture says so instead of allocating a fifth, and
+    /// dropping one frame frees exactly one slot.
+    #[test]
+    fn exhausting_the_pool_fails_the_capture_and_a_drop_recovers() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "64x48x24"]);
+        let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
+        let mut held: Vec<_> = (0..POOL_SLOTS).map(|_| f.capture(0).unwrap()).collect();
+        assert_eq!(f.pool().free_slots(), 0);
+        let err = f.capture(0).err().expect("a fifth frame appeared");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        drop(held.pop());
+        assert_eq!(f.pool().free_slots(), 1);
+        held.push(f.capture(0).unwrap());
+        drop(held);
+        assert_eq!(f.pool().free_slots(), POOL_SLOTS);
+    }
+
+    /// A grab that fails after taking a slot (the X server rejects the
+    /// request) returns the slot, on the SHM path and on the GetImage path.
+    #[test]
+    fn a_failed_grab_returns_its_slot() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "64x48x24"]);
+        let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
+        f.root = 0x00de_ad00; // not a drawable: BadDrawable
+        let err = f.grab(f.pool().try_acquire().unwrap()).unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            f.pool().free_slots(),
+            POOL_SLOTS,
+            "slot leaked on SHM error"
+        );
+        f.shm_len = None;
+        f.grab(f.pool().try_acquire().unwrap()).unwrap_err();
+        assert_eq!(
+            f.pool().free_slots(),
+            POOL_SLOTS,
+            "slot leaked on GetImage error"
+        );
+    }
+
+    /// Frames leave the pipeline three ways besides being consumed, and each
+    /// must return its slot: a failed submit (the channel is closed and the
+    /// frame comes back in the error), frames still queued when the receiver
+    /// stops, and a worker that drops a frame without looking at it. Every
+    /// wait carries a timeout, so a path that keeps its slot is a failure
+    /// and not a hang.
+    #[tokio::test]
+    async fn every_exit_path_returns_the_slot() {
+        use std::time::Duration;
+        let x = PrivateXvfb::spawn(&["-screen", "0", "64x48x24"]);
+        let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
+        let pool = f.pool();
+        let wait = |pool: FramePool| async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while pool.free_slots() != POOL_SLOTS {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+        };
+
+        // Failed submit: the receiver is gone before the send.
+        let (tx, rx) = tokio::sync::mpsc::channel::<FrameSubmission>(2);
+        drop(rx);
+        let sub = f.capture(0).unwrap();
+        let rejected = tx.send(sub).await.unwrap_err();
+        drop(rejected);
+        wait(pool.clone())
+            .await
+            .expect("slot not returned after a failed submit");
+
+        // Queued frames when the receiver stops, plus one the worker took.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FrameSubmission>(2);
+        for _ in 0..3 {
+            tx.send(f.capture(0).unwrap()).await.unwrap();
+            if pool.free_slots() == POOL_SLOTS - 2 {
+                break;
+            }
+        }
+        let worker = rx.recv().await.unwrap();
+        drop(worker);
+        drop(rx);
+        wait(pool.clone())
+            .await
+            .expect("slots not returned after the receiver stopped");
+        drop(tx);
+
+        // Worker thread stop: a frame owned by a thread that exits.
+        let sub = f.capture(0).unwrap();
+        std::thread::spawn(move || drop(sub)).join().unwrap();
+        wait(pool)
+            .await
+            .expect("slot not returned after a worker thread ended");
+    }
+
+    /// The backpressure the loop relies on: with every slot out, `wait_free`
+    /// does not resolve; it resolves when a frame is dropped.
+    #[tokio::test]
+    async fn the_capture_wait_ends_when_the_pipeline_returns_a_frame() {
+        use std::time::Duration;
+        let x = PrivateXvfb::spawn(&["-screen", "0", "64x48x24"]);
+        let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
+        let pool = f.pool();
+        let mut held: Vec<_> = (0..POOL_SLOTS).map(|_| f.capture(0).unwrap()).collect();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), pool.wait_free())
+                .await
+                .is_err(),
+            "wait_free resolved with every slot held"
+        );
+        let p = pool.clone();
+        let waiter = tokio::spawn(async move { p.wait_free().await });
+        tokio::task::yield_now().await;
+        drop(held.pop());
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("a frame was returned and the capture wait never ended")
+            .unwrap();
+    }
+
+    /// After a shrink no segment of the old length survives, even though only
+    /// one slot is used per tick (a LIFO free list would never pop the rest).
+    #[test]
+    fn a_resize_releases_every_old_size_segment() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "64x48x24"]);
+        let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
+        let held: Vec<_> = (0..POOL_SLOTS).map(|_| f.capture(0).unwrap()).collect();
+        drop(held);
+        let old = 64 * 48 * 4;
+        let count = |f: &X11Frames, len: usize| {
+            let mut n = 0;
+            let free = f.pool.take_free_where(|s| {
+                if s.as_any()
+                    .downcast_ref::<ShmSegment>()
+                    .is_some_and(|g| g.len == len)
+                {
+                    n += 1;
+                }
+                false
+            });
+            assert!(free.is_empty());
+            n
+        };
+        assert_eq!(count(&f, old), POOL_SLOTS);
+        set_root_size(x.display(), 32, 24);
+        for _ in 0..8 {
+            drop(f.capture(0).unwrap());
+        }
+        assert_eq!(count(&f, old), 0, "old-size segments survived the resize");
+        assert!(count(&f, 32 * 24 * 4) >= 1);
+        // Falling back to GetImage for good releases the rest.
+        f.shm_usable = false;
+        f.shm_len = None;
+        f.release_stale();
+        assert_eq!(count(&f, 32 * 24 * 4), 0);
     }
 
     #[test]

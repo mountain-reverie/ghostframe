@@ -73,6 +73,14 @@ pub trait Backend {
     /// it from [`Backend::drain_damage`].
     fn capture(&mut self, timestamp_us: u32) -> std::io::Result<FrameSubmission>;
 
+    /// The pool this backend's frames come from, if it has one. A capture
+    /// loop awaits [`ghostframe_lib::FramePool::wait_free`] before each tick:
+    /// `capture` is synchronous and fails rather than waits when every slot
+    /// is still in flight.
+    fn frame_pool(&self) -> Option<ghostframe_lib::FramePool> {
+        None
+    }
+
     /// Start damage reporting (a client connected). No-op without support.
     fn arm_damage(&mut self);
 
