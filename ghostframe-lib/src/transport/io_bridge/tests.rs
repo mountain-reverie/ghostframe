@@ -836,6 +836,42 @@ async fn process_frame_produces_no_panic() {
     bridge.process_frame(frame);
 }
 
+/// A pooled slot handed to the bridge comes back when the bridge stops, even
+/// with the frame still in flight in the worker: the slot must never be
+/// stranded by a shutdown (the capture loop would wait on it forever).
+#[tokio::test]
+async fn a_pooled_frame_in_flight_returns_its_slot_when_the_bridge_stops() {
+    use crate::frame_pool::FramePool;
+    let pool = FramePool::new(2);
+    let mut slot = pool.try_acquire().unwrap();
+    slot.set_storage(Box::new(vec![0x7Fu8; 64 * 64 * 4]));
+    let pixels = slot.into_buf().ok().unwrap();
+    assert_eq!(pool.free_slots(), 1);
+
+    let (our_end, _peer) = UnixStream::pair().expect("pair");
+    let server = QuicServer::new().expect("server");
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+    bridge.process_frame(crate::server::FrameSubmission {
+        width: 64,
+        height: 64,
+        stride: 64 * 4,
+        pixels,
+        dmabuf_fd: None,
+        timestamp_us: 1000,
+        damage_tiles: None,
+        capture_done_ns: 0,
+    });
+    drop(bridge);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while pool.free_slots() != 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the bridge stopped and the slot was never returned");
+}
+
 #[tokio::test]
 async fn dispatch_feedback_updates_adaptation_context() {
     let (our_end, _peer) = UnixStream::pair().expect("pair");

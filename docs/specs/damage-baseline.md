@@ -17,15 +17,18 @@ One tick = what the capture loop runs between its `capture_us` timestamps:
 - `capture_us`: wall time of that span.
 - `cpu_us`: CPU time (user+system, `getrusage(RUSAGE_THREAD)`) of the capture
   thread over the same span. The X server's own CPU is not included.
-- `bytes/tick`: exactly the root grab (`ShmGetImage` then `to_vec`, `W*H*4`)
-  plus the cursor image (1024 bytes for the 16x16 Xvfb cursor).
+- `bytes/tick`: the cursor image (1024 bytes for the 16x16 Xvfb cursor) and,
+  before PR 2, the root grab (`ShmGetImage` then `to_vec`, `W*H*4`). Since
+  PR 2 the SHM grab is written by the X server into a pooled slot and this
+  process copies nothing; only the `GetImage` fallback still counts the
+  reply buffer.
 - `allocs/tick`: real heap allocations at the counted sites: the root grab,
   the cursor reply, and the damage path (the tile set's growth steps derived
   from its final capacity, the result list, the cursor tile list, and the
   merge's `seen` set and list growth). Empty collections allocate nothing and
-  count nothing, so idle is 3 (grab, cursor reply, and the one allocation of
-  the empty-damage path). Not a global allocator count; the pooling PR (2)
-  should take the grab out of it.
+  count nothing. Not a global allocator count. Pooling (PR 2) took the grab
+  out of it; a slot allocated for the first time counts too, so the warm-up
+  ticks are not zero.
 - `hint tiles/tick`: tiles in the `drain_damage` hint (0 = `None`, "compare
   everything").
 
@@ -103,3 +106,39 @@ is recorded here.**
   change the content`); stubbing `take_stats` to zeros (`counter bytes_copied
   is zero`). `the_harness_rejects_a_zeroed_counter` covers each of the four
   counters on synthetic data.
+
+## PR 2: pooled frame buffers (before/after)
+
+Same harness, same host, run back to back, `flock`ed. "Before" is the head of
+PR 1 (`5e2288a0`: it already differs from the PR 0 table above in allocs,
+because PR 1 changed the damage path); "after" is PR 2.
+
+| layout | scene | bytes/tick before | after | allocs/tick before | after | capture_us before | after | cpu_us before | after |
+|---|---|---|---|---|---|---|---|---|---|
+| 1080p | idle | 8295424 | 1024 | 2.0 | 1.0 | 1796 | 497 | 336 | 38 |
+| 1080p | typing | 8295424 | 1024 | 2.7 | 1.7 | 1765 | 496 | 307 | 38 |
+| 1080p | video | 8295424 | 1024 | 4.0 | 3.0 | 1956 | 640 | 553 | 71 |
+| 4K | idle | 33178624 | 1024 | 2.0 | 1.0 | 6785 | 3979 | 2327 | 52 |
+| 4K | typing | 33178624 | 1024 | 2.7 | 1.7 | 6770 | 3980 | 2384 | 56 |
+| 4K | video | 33178624 | 1024 | 4.0 | 3.0 | 7497 | 4694 | 2527 | 183 |
+
+Which copy disappeared: the segment-to-`Vec` `to_vec` (and its allocation).
+Bytes fall by exactly `W*H*4` (8294400 at 1080p, 33177600 at 4K). The X server
+still writes the pixels into the segment (that is the grab itself, in the X
+server's process, and not counted); the segment *is* the frame the library
+receives, so there is no copy in the daemon. The cursor blend is in place.
+
+Not changed: the library still compares the full frame against its previous
+image (PR 3 onward), and the `GetImage` fallback (no MIT-SHM, e.g. a remote
+display) still pays one full-frame copy and allocation, because x11rb
+allocates the reply; the reply buffer becomes the frame unpooled.
+
+`capture_us` falls more than the copy alone would suggest at 1080p
+(1796 -> 497): the `to_vec` page-faulted a fresh 8 MB allocation every tick.
+The 4K figure still carries the X server's own grab, in the timed span.
+
+Gate: `a_warm_shm_grab_allocates_and_copies_nothing` (warm-up must count the
+slot allocations, steady state at most the cursor reply and far below
+`W*H*4`, and the GetImage path still counts the full copy);
+`RunReport::validate` now rejects any tick at or above `W*H*4`
+(`the_harness_rejects_a_full_frame_copy`).
