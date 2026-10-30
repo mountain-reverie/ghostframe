@@ -71,7 +71,7 @@ The crate and binary are renamed `ghostframe-server` (`ghostframe-xdaemon/` →
 | `uninstall` | Disable and remove the unit, the autostart file and `~/.local/bin/ghostframe-server`. Keeps the tailnet state (owned by `logout`). |
 | `login [--hostname H] [--control-url U]` | Bring the tsnet node up, print the sign-in URL, wait until the node is authorized, exit 0. With `TS_AUTHKEY` set, authorize non-interactively (no URL). Replaces `--init`. |
 | `logout` | Deregister the node from the control server and delete the state directory. |
-| `capture` | The daemon (section 4). Exits with code 2 and "run `ghostframe-server login`" if the state is not seeded. If `WAYLAND_DISPLAY` is set and `DISPLAY` is not, exits with a clear "Wayland sessions are not supported yet" error. |
+| `capture` | The daemon (section 4). Exits with code 2 and "run `ghostframe-server login`" if the state is not seeded. If `WAYLAND_DISPLAY` is set (whatever `DISPLAY` is: the unit hard-codes `DISPLAY=:0`), exits 2 with a clear "Wayland sessions are not supported yet" error; `install` warns about it. |
 
 Defaults are unchanged: hostname `$(hostname)-ghostframe`, state directory
 `$TS_STATE_DIR`, else `$XDG_STATE_HOME/ghostframe`, else
@@ -90,8 +90,9 @@ Defaults are unchanged: hostname `$(hostname)-ghostframe`, state directory
    - `After=graphical-session.target`, `PartOf=graphical-session.target`,
      `WantedBy=graphical-session.target`
    - `Environment=TS_STATE_DIR=%S/ghostframe`, `DISPLAY=:0`, and
-     `GHOSTFRAME_MAX_RESOLUTION` from `--max-resolution` (default `1920x1080`;
-     `none` omits it)
+     `GHOSTFRAME_MAX_RESOLUTION` from `--max-resolution` (`none` omits it;
+     without the flag a reinstall keeps the installed unit's setting and a
+     first install uses `1920x1080`)
    - the restart policy and the attach-mode warning comment of today's
      `ghostframe-xdaemon-attach.service.tmpl`
 4. Write `~/.config/autostart/ghostframe-server.desktop`

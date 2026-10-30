@@ -1,6 +1,7 @@
 //! The `ghostframe-server` binary's command-line contract, run as a
 //! subprocess with an empty environment. Every case here fails before tsnet
-//! or X is touched, so it needs neither a tailnet nor a display.
+//! is touched, so none needs a tailnet. None needs a display either, except
+//! the 16 bpp case, which starts its own Xvfb.
 //!
 //! A tests/*.rs target runs in CI only if a workflow names it: see the
 //! `--test commands` step in .github/workflows/ci.yml.
@@ -235,9 +236,10 @@ fn login_warns_when_the_shell_would_write_a_state_dir_the_service_does_not_read(
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     let err = stderr(&out);
     let unit_dir = home.path().join(".local/state/ghostframe");
+    // No unit is installed here, so only TS_STATE_DIR was compared.
+    assert!(!err.contains("XDG_STATE_HOME"), "{err}");
     assert!(
-        err.contains("the installed service reads")
-            && err.contains(&unit_dir.display().to_string()),
+        err.contains("the service will read") && err.contains(&unit_dir.display().to_string()),
         "{err}"
     );
 }
@@ -283,17 +285,14 @@ fn capture_on_a_16_bit_root_exits_2_so_the_unit_does_not_restart_loop() {
     let state = private_dir();
     // A non-empty key skips the "not logged in" exit; the backend is
     // connected before anything touches the network.
-    let out = Command::new(env!("CARGO_BIN_EXE_ghostframe-server"))
-        .arg("capture")
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("TS_CONTROL_URL", "http://127.0.0.1:1")
-        .env("TS_AUTHKEY", "tskey-unused")
-        .env("TS_STATE_DIR", state.path())
-        .env("DISPLAY", &x.display)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run capture");
+    let out = run(
+        &["capture"],
+        &[
+            ("TS_AUTHKEY", Path::new("tskey-unused")),
+            ("TS_STATE_DIR", state.path()),
+            ("DISPLAY", Path::new(&x.display)),
+        ],
+    );
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     assert!(
         stderr(&out).contains("root depth is 16"),

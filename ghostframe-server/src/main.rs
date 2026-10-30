@@ -114,18 +114,33 @@ fn install(
     if !cfg.install_detached() && commands::install::in_legacy_headless_cgroup(&cgroup) {
         commands::install::copy_binary(&exe, &paths.bin, force)?;
     }
+    // The detached copy's output goes to a journal nobody is watching: decide
+    // the cap here, print it where the terminal is, and pass it on explicitly
+    // so the copy writes what was printed.
+    let detaching =
+        !cfg.install_detached() && commands::install::in_legacy_headless_cgroup(&cgroup);
+    let (args, cap_line) = if detaching {
+        let (args, line) = commands::install::detach_install_args(
+            force,
+            max_resolution,
+            &paths.unit_dir.join(commands::install::UNIT_NAME),
+        );
+        (args, Some(line))
+    } else {
+        (commands::install::install_args(force, max_resolution), None)
+    };
+    if let Some(line) = cap_line {
+        println!("{line}");
+    }
     if commands::install::maybe_detach(
         &mut commands::install::RealSystemctl,
         &cgroup,
         cfg.install_detached(),
         &paths.bin,
-        &commands::install::install_args(force, max_resolution),
+        &args,
         &mut std::io::stdout(),
     )? {
         return Ok(());
-    }
-    if let Some(w) = commands::install::wayland_warning(cfg.wayland_display.as_deref()) {
-        eprintln!("{w}");
     }
     let state_dir = cfg.unit_state_dir(&home)?;
     if let Some(ts) = cfg.ts_state_dir() {
@@ -144,6 +159,7 @@ fn install(
         state_dir: Some(&state_dir),
         username: &username,
         euid: util::euid(),
+        shell_wayland: cfg.wayland_display.as_deref(),
     };
     commands::install::install(
         &ctx,
@@ -177,15 +193,34 @@ fn refuse_root_for(command: &Command, euid: u32) -> Result<(), String> {
 }
 
 /// `login` writes the state the *service* must read: warn when this shell
-/// would put it somewhere else (`TS_STATE_DIR`, `XDG_STATE_HOME`).
+/// would put it somewhere else. With the unit installed (and a user manager
+/// to ask) the comparison is against the manager's own view, as `install`
+/// reads it; otherwise against the directory the unit would use, which
+/// differs from this shell's only through `TS_STATE_DIR`.
 fn warn_if_login_state_dir_differs(cfg: &config::ServerConfig) {
     let (Some(home), Ok(login_dir)) = (cfg.home(), cfg.state_dir()) else {
         return;
     };
-    let Ok(unit_dir) = cfg.unit_state_dir(std::path::Path::new(home)) else {
-        return;
+    let home = std::path::Path::new(home);
+    let installed = commands::install::InstallPaths::new(home)
+        .unit_dir
+        .join(commands::install::UNIT_NAME)
+        .exists();
+    let from_manager = if installed && cfg.user_manager_possible() {
+        commands::install::manager_unit_state_dir(&mut commands::install::RealSystemctl)
+    } else {
+        None
     };
-    if let Some(w) = commands::install::state_dir_mismatch_warning(&login_dir, &unit_dir) {
+    let (unit_dir, from_manager) = match from_manager {
+        Some(d) => (d, true),
+        None => match cfg.unit_state_dir(home) {
+            Ok(d) => (d, false),
+            Err(_) => return,
+        },
+    };
+    if let Some(w) =
+        commands::install::state_dir_mismatch_warning(&login_dir, &unit_dir, from_manager)
+    {
         eprintln!("{w}");
     }
 }
