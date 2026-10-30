@@ -126,6 +126,24 @@ jobs:
       - run: cargo test --test browserless_blocked_path -- --test-threads=1
       - run: cargo test --test browserless_loop_stall -- --test-threads=1
       - run: cargo test --test c2_frame_off_loop -- --test-threads=1
+
+  # The congestion-control scenes: about 25 minutes of the browserless
+  # wall clock (browserless_model_controller alone is ~13). In the one job
+  # they pushed it to ~42 of its 45 minutes, so a slower runner or a cold
+  # cache cancelled it with no test failing. Same serial rule as above.
+  browserless-cc:
+    name: browserless-cc
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/workflows/_setup-system-deps
+      - uses: ./.github/workflows/_setup-go
+      - uses: ./.github/workflows/_build-web-client
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e
       # Report-only instrument (asserts premises, not timing); the scenes run
       # over-driven load on a constrained link and can hit the harness's
       # load-dependent stall bail, so they must not gate merges.
