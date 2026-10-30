@@ -826,7 +826,7 @@ async fn process_frame_produces_no_panic() {
         width: 64,
         height: 64,
         stride: 64 * 4,
-        pixels: vec![0xFF; 64 * 64 * 4],
+        pixels: vec![0xFF; 64 * 64 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 1000,
         damage_tiles: None,
@@ -874,7 +874,7 @@ async fn process_frame_increments_frame_seq() {
         width: 32,
         height: 32,
         stride: 32 * 4,
-        pixels: vec![0; 32 * 32 * 4],
+        pixels: vec![0; 32 * 32 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
         damage_tiles: None,
@@ -908,7 +908,7 @@ async fn process_frame_no_panic_on_empty_pixels_no_dmabuf_no_session() {
         width: 64,
         height: 64,
         stride: 64 * 4,
-        pixels: vec![0u8; 64 * 64 * 4],
+        pixels: vec![0u8; 64 * 64 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
         damage_tiles: None,
@@ -1203,7 +1203,7 @@ fn tiny_frame() -> FrameSubmission {
         width: 64,
         height: 64,
         stride: 64 * 4,
-        pixels: vec![0u8; 64 * 64 * 4],
+        pixels: vec![0u8; 64 * 64 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
         damage_tiles: None,
@@ -1410,7 +1410,7 @@ async fn a_stale_tile_result_is_dropped_and_invalidates_the_baseline() {
             trace: Default::default(),
         }),
         out,
-        Vec::new(),
+        Default::default(),
         0,
     );
     assert_eq!(
@@ -1446,7 +1446,7 @@ fn tile_inflight() -> frame::InFlight {
 #[tokio::test]
 async fn a_tile_result_with_no_live_session_left_is_dropped() {
     let (mut bridge, _peer, _log) = recording_bridge();
-    bridge.on_tile_done(tile_inflight(), empty_tile_out(), Vec::new(), 0);
+    bridge.on_tile_done(tile_inflight(), empty_tile_out(), Default::default(), 0);
     assert_eq!(
         bridge.pending_controls,
         vec![Control::InvalidateBaseline(1)]
@@ -1460,7 +1460,7 @@ async fn a_tile_result_with_no_live_session_left_is_dropped() {
 async fn a_path_mtu_that_shrank_below_a_fragment_drops_the_tile_frame() {
     let (mut bridge, _peer, _log) = recording_bridge();
     bridge.test_commit_dg_size = Some(10);
-    bridge.on_tile_done(tile_inflight(), empty_tile_out(), Vec::new(), 0);
+    bridge.on_tile_done(tile_inflight(), empty_tile_out(), Default::default(), 0);
     assert_eq!(
         bridge.pending_controls,
         vec![Control::InvalidateBaseline(1)]
@@ -2856,7 +2856,7 @@ async fn frame_captured_event_format() {
         width: 32,
         height: 32,
         stride: 32 * 4,
-        pixels: vec![0u8; 32 * 32 * 4],
+        pixels: vec![0u8; 32 * 32 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
         damage_tiles: None,
@@ -6223,7 +6223,7 @@ async fn the_tile_arm_commits_the_backends_cdf53_results_and_skips_what_it_skipp
         width: W,
         height: W,
         stride: W * 4,
-        pixels: vec![0u8; (W * W * 4) as usize],
+        pixels: vec![0u8; (W * W * 4) as usize].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
         damage_tiles: None,
@@ -6349,7 +6349,7 @@ async fn a_full_screen_tile_frame_after_an_h264_exit_makes_no_blocking_forward()
         },
         ..inflight
     };
-    bridge.on_tile_done(inflight, out, vec![0x40; (W * W * 4) as usize], 0);
+    bridge.on_tile_done(inflight, out, vec![0x40; (W * W * 4) as usize].into(), 0);
 
     assert_eq!(
         bridge.frame_pipeline.as_ref().unwrap().forward_requests(),
@@ -6473,7 +6473,7 @@ async fn gpu_backend_pre_encodes_fallback_tiles_exactly_as_the_cpu_transform() {
         width: W,
         height: H,
         stride: STRIDE,
-        pixels: pixels.clone(),
+        pixels: pixels.clone().into(),
         dmabuf_fd: None,
         timestamp_us: 0,
         damage_tiles: None,

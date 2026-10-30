@@ -1221,7 +1221,7 @@ impl IoBridge {
         &mut self,
         inflight: InFlight,
         out: TileOut,
-        frame_pixels: Vec<u8>,
+        frame_pixels: crate::frame_pool::FrameBuf,
         worker_us: u64,
     ) {
         // The session changed while the tiles were encoded. The GPU baseline

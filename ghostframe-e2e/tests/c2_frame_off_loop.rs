@@ -102,7 +102,7 @@ fn frame() -> FrameSubmission {
         width: 64,
         height: 64,
         stride: 64 * 4,
-        pixels: vec![0x40; 64 * 64 * 4],
+        pixels: vec![0x40; 64 * 64 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
         damage_tiles: None,

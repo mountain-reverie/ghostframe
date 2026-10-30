@@ -464,7 +464,7 @@ impl X11Frames {
             width,
             height,
             stride: width * 4,
-            pixels,
+            pixels: pixels.into(),
             dmabuf_fd: None,
             timestamp_us,
             damage_tiles: None,

@@ -227,7 +227,7 @@ async fn scenario(name: &str, w: u32, h: u32, dirty_frac: f64) {
                 width: w,
                 height: h,
                 stride: w * 4,
-                pixels: px,
+                pixels: px.into(),
                 dmabuf_fd: None,
                 timestamp_us: 0,
                 damage_tiles: None,
