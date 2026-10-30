@@ -243,59 +243,11 @@ impl XDamageMonitor {
             self.allocs += 1;
         }
         let mut bitmap = std::mem::replace(&mut self.scratch, TileBitmap::empty());
-        // Step 1: read every pending event.
-        let mut notified = 0usize;
-        let mut errored = false;
-        loop {
-            match self.conn.poll_for_event() {
-                Ok(Some(Event::DamageNotify(ev))) => {
-                    notified += 1;
-                    if self.report == DamageReport::Raw && notified <= self.flood_limit {
-                        bitmap.set_rect(ev.area.x, ev.area.y, ev.area.width, ev.area.height);
-                    }
-                }
-                Ok(Some(Event::Error(_))) => errored = true,
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => {
-                    errored = true;
-                    break;
-                }
-            }
-        }
-
+        // Step 1: read every pending event. Step 2: subtract.
+        let (notified, read_err) = self.read_events(&mut bitmap);
         between();
-
-        // Step 2: subtract, which resets the region.
-        let mut flooded = false;
-        match self.report {
-            DamageReport::Raw => {
-                flooded = notified > self.flood_limit;
-                errored |= self
-                    .conn
-                    .damage_subtract(self.damage_id, 0u32, 0u32)
-                    .is_err();
-            }
-            DamageReport::NonEmpty if notified > 0 => match self.subtract_into_parts() {
-                Some(rects) => {
-                    if !rects.is_empty() {
-                        self.allocs += 1; // the fetched rectangle list
-                    }
-                    if rects.len() <= self.flood_limit {
-                        for r in rects {
-                            bitmap.set_rect(r.x, r.y, r.width, r.height);
-                        }
-                    } else {
-                        flooded = true;
-                    }
-                }
-                None => errored = true,
-            },
-            DamageReport::NonEmpty => {}
-        }
-        if self.conn.flush().is_err() {
-            errored = true;
-        }
+        let (flooded, sub_err) = self.subtract(notified, &mut bitmap);
+        let errored = read_err | sub_err;
 
         let result = if errored {
             // Not trusted again until a drain completes cleanly; this one and
@@ -315,10 +267,77 @@ impl XDamageMonitor {
         result
     }
 
+    /// Step 1: read every pending event. Returns how many `DamageNotify`
+    /// arrived and whether anything went wrong. In `Raw` mode each event's
+    /// rectangle goes into `bitmap` (up to the flood limit).
+    fn read_events(&self, bitmap: &mut TileBitmap) -> (usize, bool) {
+        let mut notified = 0usize;
+        let mut errored = false;
+        loop {
+            match self.conn.poll_for_event() {
+                Ok(Some(Event::DamageNotify(ev))) => {
+                    notified += 1;
+                    if self.report == DamageReport::Raw && notified <= self.flood_limit {
+                        bitmap.set_rect(ev.area.x, ev.area.y, ev.area.width, ev.area.height);
+                    }
+                }
+                Ok(Some(Event::Error(_))) => errored = true,
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    errored = true;
+                    break;
+                }
+            }
+        }
+        (notified, errored)
+    }
+
+    /// Step 2: reset the damage region. In both modes only when step 1 saw a
+    /// notification (for `NonEmpty` that gate is why the order matters), and
+    /// the region it returns goes into `bitmap`. Returns `(flooded, errored)`.
+    fn subtract(&mut self, notified: usize, bitmap: &mut TileBitmap) -> (bool, bool) {
+        let mut flooded = false;
+        let mut errored = false;
+        match self.report {
+            // Nothing was reported, so there is nothing to reset: an idle tick
+            // sends no request at all.
+            DamageReport::Raw if notified > 0 => {
+                flooded = notified > self.flood_limit;
+                errored = self
+                    .conn
+                    .damage_subtract(self.damage_id, 0u32, 0u32)
+                    .is_err();
+                if self.conn.flush().is_err() {
+                    errored = true;
+                }
+            }
+            DamageReport::Raw => {}
+            DamageReport::NonEmpty if notified > 0 => match self.subtract_into_parts() {
+                Some(rects) => {
+                    if !rects.is_empty() {
+                        self.allocs += 1; // the fetched rectangle list
+                    }
+                    if rects.len() <= self.flood_limit {
+                        for r in rects {
+                            bitmap.set_rect(r.x, r.y, r.width, r.height);
+                        }
+                    } else {
+                        flooded = true;
+                    }
+                }
+                None => errored = true,
+            },
+            DamageReport::NonEmpty => {}
+        }
+        (flooded, errored)
+    }
+
     /// `DamageSubtract(repair = None, parts)` then `XFixesFetchRegion(parts)`.
     /// `None` on any failure.
     fn subtract_into_parts(&self) -> Option<Vec<x11rb::protocol::xproto::Rectangle>> {
-        self.conn
+        let subtract = self
+            .conn
             .damage_subtract(self.damage_id, 0u32, self.parts)
             .ok()?;
         let reply = self
@@ -327,6 +346,11 @@ impl XDamageMonitor {
             .ok()?
             .reply()
             .ok()?;
+        // DamageSubtract has no reply. If the server rejected it, `parts`
+        // still holds whatever it held before and the fetch above succeeded
+        // anyway: trusting it would report stale (or no) damage. The fetch
+        // reply is later in sequence, so this check costs no round trip.
+        subtract.check().ok()?;
         Some(reply.rectangles)
     }
 
@@ -820,5 +844,20 @@ mod x11_tests {
         rig.m.arm();
         assert_eq!(rig.drain(), Damage::Unknown);
         assert_eq!(rig.drain(), Damage::None);
+    }
+    /// A rejected `DamageSubtract` leaves `parts` as it was, and the fetch
+    /// still succeeds. That must not read as "nothing changed".
+    #[test]
+    fn x11_a_rejected_subtract_is_unknown_not_stale_damage() {
+        let mut rig = Rig::new(DamageReport::NonEmpty);
+        rig.draw(&[rect(40, 40, 4, 4)]);
+        // A Damage XID the server never heard of: BadDamage on the subtract,
+        // while the region fetch (a valid region) succeeds.
+        rig.m.damage_id = rig.m.conn.generate_id().unwrap();
+        assert_eq!(rig.drain(), Damage::Unknown);
+        assert!(
+            rig.m.force_unknown,
+            "an error also distrusts the next drain"
+        );
     }
 }
