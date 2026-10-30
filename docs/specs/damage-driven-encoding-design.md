@@ -137,7 +137,7 @@ Behaviour change, stated plainly: sub-threshold drift becomes detectable. Today 
 
 **SAD authority rule (H1).** Skipping tiles must not lose SAD's authority over what reaches the encoder. The rule: **every tile whose pixels reach the GPU this tick is a SAD candidate.** The upload copies a band; every tile in the band is a candidate (not only the hinted tiles inside it). Escalation and refinement (stage 4d in `gpu_pipeline/frame.rs`, `collect_escalation_candidates` at `frame.rs:1312`) read the current uploaded image; because anything that differs between it and the reference is a candidate, they never encode new content under an old generation. The only way new content reaches an encoder without SAD seeing it is if the server never uploaded it, i.e. a missed report, which leaves the tile stale in the upload image too and is bounded by N (section 3.4).
 
-Library changes, in order of payoff (all behind the PR 5 gating below):
+Library changes, in order of payoff (all behind the PR 6 gating and the default-off knob below):
 
 1. **Persistent upload image** instead of `import_pixels` allocating a new one every tick (`gpu_pipeline/frame.rs:1249`): allocated once per resolution; copy only the upload bands; full copy for `Unknown`.
 2. **Hinted `tile_sad`**: a candidate mask is pushed; non-candidate workgroups exit at once (or an indirect dispatch over the candidate list).
