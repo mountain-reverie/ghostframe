@@ -59,6 +59,23 @@ if [[ $up != 1 ]]; then
     exit 1
 fi
 
+# A blank root cursor. The X11 capture blends the pointer into every frame, as
+# a user must see it, and the tests compare exact pixels: the pointer rests at
+# the centre of the screen, where several of them sample. Xorg's -nocursor does
+# not help, since it hides the sprite on the display only and XFixes still
+# hands the capture the real cursor image. An empty bitmap and mask make that
+# image fully transparent. The blend itself is unit-tested.
+# xsetroot needs the hotspot defines, and the bits on a line of their own.
+cat > /tmp/blank.xbm <<'XBM'
+#define b_width 1
+#define b_height 1
+#define b_x_hot 0
+#define b_y_hot 0
+static unsigned char b_bits[] = {
+   0x00};
+XBM
+xsetroot -cursor /tmp/blank.xbm /tmp/blank.xbm
+
 # Switch the first connected output to WxH: one of its own modes when it has
 # one (VKMS lists 1024x768, 1920x1080 and 4096x2160), else a new mode (the
 # dummy driver accepts any timings).
