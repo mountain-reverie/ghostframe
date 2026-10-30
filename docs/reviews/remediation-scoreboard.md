@@ -41,7 +41,7 @@ Status at 2026-10-11.
 | Web `cdf53.ts` early-returns on a same-tile-count resize before rebuilding bind groups | PR #122 review | WS-A6 `web/perf` |
 | `browserless_determinism` flakes 1 in 64 on master (quinn packet-number skip) | PR #122 | fixed by #122 |
 | `e2e_palrle_session_reset_chromium` fails on master (`saw codecs: []`); CI skips it | PR #129 | unscheduled |
-| `e2e_polled_globals_are_live` needs VKMS, so CI skips the guard | PR #127 | unscheduled; needs a non-GPU variant |
+| `e2e_polled_globals_are_live` needs VKMS, so CI skips the guard | PR #127 | unscheduled; needs a non-GPU variant. moot: removed by the 2026-10-29 ghostframe-server rework |
 | `?e2e` gating of web recorders and pixel readbacks (PC-2 remainder) | PR #127 | WS-A6 `web/perf` |
 | AGENTS.md and `docs/specs/budget-floor-deployment-check.md` describe stats-line fields #127 removes | PR #127 | unscheduled, docs |
 | Scenes: estimate never follows a 5→15 Mbit step; settles at 0.37 of a 10 Mbit drop-tail link | PR #128 | WS-D1 entry evidence |
@@ -100,12 +100,12 @@ Scheduled as Wave V in the [plan](2026-10-10-remediation-orchestration-plan.md),
 | G5 | Error-path leaks: first-frame snapshot image if `run_first_frame_passes` fails; `import_pixels`, `allocate_owned_image`, `alloc_host_buffer`, `new_inner` | read; the `import_dmabuf` leak is fixed by #137 | #136 |
 | G6 | `FrameAnalysis` slice helpers trust GPU-written counts without clamping | read | #136 |
 | G7 | `palette_fold` over-dispatches 16x; `cdf53_escalation_count_buffer` is bound to nothing; the escalation HOST_READ barrier is recorded twice | read; cost only | #136 |
-| G8 | `process_frame(fd, w, h, stride)` assumes offset 0 and linear BGRA; nothing carries a DRM modifier | read | #137 |
+| G8 | `process_frame(fd, w, h, stride)` assumes offset 0 and linear BGRA; nothing carries a DRM modifier | read; moot: removed by the 2026-10-29 ghostframe-server rework | #137 |
 | G9 | The `frame_palette_set_count` doc says "unique palettes"; it is a hash-slot high-water mark | observed (two tests expected the wrong value) | #137 |
 | G10 | `readback_dmabuf` returns a `&[u8]` over memory the producer can still write; no retry on EINTR for `DMA_BUF_IOCTL_SYNC`; `QUEUE_FAMILY_EXTERNAL` where `FOREIGN_EXT` would be exact | read | #136, #137 |
-| G11 | No content check for the known VKMS→AMD cross-device staleness on the buffer-import tier | not built | #137 |
+| G11 | No content check for the known VKMS→AMD cross-device staleness on the buffer-import tier | not built; moot: removed by the 2026-10-29 ghostframe-server rework | #137 |
 | G12 | `tile_analysis.comp` edge density is blind to isoluminant hue edges and 1-pixel alternating patterns | read; by design, owner decision | #137 |
-| G13 | `tests/gpu_pipeline.rs` is listed in no workflow; the `dmabuf_real_*` tests are skipped on CI without proof the runner lacks `/dev/udmabuf`; the xdaemon live-framebuffer assertion ran on a blank framebuffer | observed | #137 |
+| G13 | `tests/gpu_pipeline.rs` is listed in no workflow; the `dmabuf_real_*` tests are skipped on CI without proof the runner lacks `/dev/udmabuf`; the xdaemon live-framebuffer assertion ran on a blank framebuffer | observed; moot: removed by the 2026-10-29 ghostframe-server rework | #137 |
 
 ### E2E failing on unmodified master (WS-V3)
 
@@ -148,10 +148,10 @@ Every item was reproduced before it was fixed, or closed with the reason it coul
 | G3, G5, G6 | fixed (from the spec; no validation layer on the host) | #151 |
 | G4 | not a bug: `DRAW_INDIRECT` is the defined stage for indirect dispatch parameters and is valid on compute queues | #151 |
 | G7, G9, G10 | fixed (G10: EINTR retry; `QUEUE_FAMILY_FOREIGN_EXT` not changed, no evidence it matters on RADV) | #152 |
-| G8 | needs-owner-decision: no offset or modifier is carried; the xdaemon modesetting CPU path ignores both today | — |
+| G8 | needs-owner-decision: no offset or modifier is carried; the xdaemon modesetting CPU path ignores both today; moot: removed by the 2026-10-29 ghostframe-server rework | — |
 | G11 | recorded: a content check would cost about one CPU-mmap ingest per frame | — |
 | G12 | recorded: edge density is unused by the classifier, so the blind spots cost nothing today | — |
-| G13 | fixed: the xdaemon live-framebuffer check no longer passes on a blank scanout; `gpu_pipeline.rs` documented as local-only | #149 |
+| G13 | fixed: the xdaemon live-framebuffer check no longer passes on a blank scanout; `gpu_pipeline.rs` documented as local-only; moot: removed by the 2026-10-29 ghostframe-server rework | #149 |
 | G14 | VCE faults (three host crashes, 2026-10-13/14/15): a test handed a memfd to the VA driver, and GPU tests ran in parallel within one binary; both fixed test-side. Host tests now skip VA-API by default (`gf-gpu-run`). A solo run of the encoder tests on the real encoder is still owed | #153 |
 | `new_inner` leaks | needs-owner-decision | — |
 | E1, E2, E3, E5 | fixed | #148 |
@@ -246,3 +246,30 @@ After the last wave:
 4. Fold or remove the rest of the campaign's working notes under `docs/` in the same pass.
 
 Related, already enforced: no tracked file outside `docs/` may name a home directory (`ci/check-local-paths.sh`, #175).
+
+## D1 status (2026-10-29)
+
+Merged to master (Wave D1, transport and congestion control):
+- PR-3 #228
+- PR-6 #229
+- PR-4 #230
+- PR-1 #233
+- PR-9 #234
+- PR-5 #237
+- PR-6b #239
+- FEC v2 docs #240 and #241
+- goog_cc observation #246
+- C3-3, tile XOR FEC off by default #247
+- PR-8 #248: the model controller is the default; `GHOSTFRAME_CC=cubic` is the fallback
+
+Remaining: PR-10 (the exit gate, a live run, and deleting the legacy Cubic path).
+
+**Follow-ups**
+- damage-driven encoding (`damage_tiles` ignored), next
+- Wayland/PipeWire capture spec
+- D3 FEC v2 implementation
+- D2 scroll copy-op
+- route-change estimate dip of about 2 s (P8e)
+- P8d cold-restart queue peak of 150-236 ms
+- c10 drop-tail duplicate resends of 1.39 per loss
+- live Chrome ACK-decimation check (PR-10)
