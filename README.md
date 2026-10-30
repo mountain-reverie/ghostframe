@@ -130,7 +130,9 @@ and restrict the node in your tailnet ACLs as well.
 
 ### Max resolution
 
-`install` caps what a remote client may set at **1920×1080**: the session is
+`install` caps what a remote client may set at **1920×1080** (on a first
+install; a reinstall without `--max-resolution` keeps whatever the installed
+unit says, `none` included, and prints it): the session is
 the physical display, which a KVM or remote-management console may be
 capturing as the machine's recovery view, and a mode it cannot show removes
 that view exactly when it is needed. Change it with

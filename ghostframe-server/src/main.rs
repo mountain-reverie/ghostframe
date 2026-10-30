@@ -40,8 +40,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
 
+    if let Err(e) = refuse_root_for(&cli.command, util::euid()) {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+
     // The old xdaemon shares the tailnet state and takes no lock on it.
-    if matches!(cli.command, Command::Capture | Command::Login { .. }) {
+    if matches!(
+        cli.command,
+        Command::Capture | Command::Login { .. } | Command::Logout { .. }
+    ) {
         if let Err(e) = refuse_if_legacy_xdaemon_installed(&cfg) {
             eprintln!("error: {e}");
             // 2: the unit does not restart-loop on it.
@@ -58,7 +66,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Login {
             hostname,
             control_url,
-        } => commands::login::login(&cfg, hostname, control_url),
+        } => {
+            warn_if_login_state_dir_differs(&cfg);
+            commands::login::login(&cfg, hostname, control_url)
+        }
         Command::Logout {
             hostname,
             control_url,
@@ -88,12 +99,12 @@ fn checked_home(
 fn install(
     cfg: &config::ServerConfig,
     force: bool,
-    max_resolution: cli::MaxResolution,
+    max_resolution: Option<cli::MaxResolution>,
 ) -> Result<(), String> {
     util::ignore_sighup();
     let (home, pw) = checked_home(cfg)?;
     let paths = commands::install::InstallPaths::new(&home);
-    commands::install::refuse_root(util::euid())?;
+    commands::install::refuse_root(util::euid(), "install")?;
     let exe = std::env::current_exe().map_err(|e| format!("locating this binary: {e}"))?;
     let username = pw.map(|p| p.name).ok_or("this uid has no passwd entry")?;
     // Inside the old headless session, stopping it would kill this process:
@@ -112,6 +123,9 @@ fn install(
         &mut std::io::stdout(),
     )? {
         return Ok(());
+    }
+    if let Some(w) = commands::install::wayland_warning(cfg.wayland_display.as_deref()) {
+        eprintln!("{w}");
     }
     let state_dir = cfg.unit_state_dir(&home)?;
     if let Some(ts) = cfg.ts_state_dir() {
@@ -148,7 +162,35 @@ fn uninstall(cfg: &config::ServerConfig) -> Result<(), String> {
     )
 }
 
-/// `login` and `capture` refuse while the old xdaemon is installed or active.
+/// `login`, `logout` and `uninstall` act on one user's files or tailnet
+/// state, so they refuse root like `install` does (which checks for itself,
+/// after its own prerequisites). `capture` stays allowed: the e2e container
+/// runs it as root.
+fn refuse_root_for(command: &Command, euid: u32) -> Result<(), String> {
+    let name = match command {
+        Command::Login { .. } => "login",
+        Command::Logout { .. } => "logout",
+        Command::Uninstall => "uninstall",
+        Command::Install { .. } | Command::Capture => return Ok(()),
+    };
+    commands::install::refuse_root(euid, name)
+}
+
+/// `login` writes the state the *service* must read: warn when this shell
+/// would put it somewhere else (`TS_STATE_DIR`, `XDG_STATE_HOME`).
+fn warn_if_login_state_dir_differs(cfg: &config::ServerConfig) {
+    let (Some(home), Ok(login_dir)) = (cfg.home(), cfg.state_dir()) else {
+        return;
+    };
+    let Ok(unit_dir) = cfg.unit_state_dir(std::path::Path::new(home)) else {
+        return;
+    };
+    if let Some(w) = commands::install::state_dir_mismatch_warning(&login_dir, &unit_dir) {
+        eprintln!("{w}");
+    }
+}
+
+/// `login`, `logout` and `capture` refuse while the old xdaemon is installed or active.
 fn refuse_if_legacy_xdaemon_installed(cfg: &config::ServerConfig) -> Result<(), String> {
     let home = cfg.home().map(std::path::Path::new);
     commands::install::refuse_if_legacy_xdaemon(home, || {
@@ -159,4 +201,32 @@ fn refuse_if_legacy_xdaemon_installed(cfg: &config::ServerConfig) -> Result<(), 
                 "ghostframe-xdaemon.service",
             )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_is_refused_by_login_logout_and_uninstall_but_not_capture() {
+        let login = Command::Login {
+            hostname: None,
+            control_url: None,
+        };
+        let logout = Command::Logout {
+            hostname: None,
+            control_url: None,
+        };
+        for (cmd, name) in [
+            (login, "login"),
+            (logout, "logout"),
+            (Command::Uninstall, "uninstall"),
+        ] {
+            let e = refuse_root_for(&cmd, 0).unwrap_err();
+            assert!(e.contains(&format!("refusing to {name} as root")), "{e}");
+            assert!(refuse_root_for(&cmd, 1000).is_ok());
+        }
+        // The e2e container runs capture as root.
+        assert!(refuse_root_for(&Command::Capture, 0).is_ok());
+    }
 }

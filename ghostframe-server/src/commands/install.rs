@@ -48,6 +48,8 @@ const LEGACY_AUTOSTART: &str = "ghostframe-attach.desktop";
 const ROOT_LEFTOVERS: &[&str] = &[
     "etc/systemd/system/getty@tty1.service.d/99-ghostframe-autologin.conf",
     "etc/X11/ghostframe-headless.conf",
+    // Written by the old packaging/install.sh.
+    "usr/local/bin/ghostframe-xdaemon",
 ];
 
 fn is_legacy_unit(name: &str) -> bool {
@@ -182,16 +184,20 @@ fn is_headless_session_unit(component: &str) -> bool {
 }
 
 /// The `install` arguments to repeat in the transient unit.
-pub fn install_args(force: bool, max: MaxResolution) -> Vec<String> {
+/// The flag is repeated only when it was given: the re-exec'd copy then
+/// resolves an absent one against the installed unit itself.
+pub fn install_args(force: bool, max: Option<MaxResolution>) -> Vec<String> {
     let mut a = vec!["install".to_string()];
     if force {
         a.push("--force".into());
     }
-    a.push("--max-resolution".into());
-    a.push(match max {
-        MaxResolution::Limit(w, h) => format!("{w}x{h}"),
-        MaxResolution::Unlimited => "none".into(),
-    });
+    if let Some(max) = max {
+        a.push("--max-resolution".into());
+        a.push(match max {
+            MaxResolution::Limit(w, h) => format!("{w}x{h}"),
+            MaxResolution::Unlimited => "none".into(),
+        });
+    }
     a
 }
 
@@ -321,6 +327,95 @@ pub fn render_unit(max: MaxResolution) -> String {
     out
 }
 
+/// A warning for `install` when a Wayland session is likely: `capture` will
+/// refuse to start on it.
+pub fn wayland_warning(wayland_display: Option<&str>) -> Option<String> {
+    wayland_display.map(|w| {
+        format!(
+            "warning: WAYLAND_DISPLAY={w} is set: Wayland sessions are not supported yet, so \
+             the service will refuse to start. If this is an X11 session with a stale value \
+             in the user manager, `systemctl --user unset-environment WAYLAND_DISPLAY` clears it"
+        )
+    })
+}
+
+/// A warning for `login` when this shell's environment would put the tailnet
+/// state somewhere the installed service does not read.
+pub fn state_dir_mismatch_warning(login_dir: &Path, unit_dir: &Path) -> Option<String> {
+    (login_dir != unit_dir).then(|| {
+        format!(
+            "warning: login will write {}, but the installed service reads {} (TS_STATE_DIR \
+             or XDG_STATE_HOME in this shell differ from it); the service will not see this login",
+            login_dir.display(),
+            unit_dir.display()
+        )
+    })
+}
+
+/// What `install` writes as the resolution cap, and why, for the line it
+/// prints.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ResolvedMax {
+    pub max: MaxResolution,
+    pub note: String,
+}
+
+/// The `GHOSTFRAME_MAX_RESOLUTION` an installed unit carries (its absence
+/// meaning `none`), or `None` when the text is not a unit this installer
+/// wrote (no `[Service]` or `ExecStart=`, a repeated or unparsable setting),
+/// so the caller falls back rather than guess.
+fn max_resolution_of_unit(text: &str) -> Option<MaxResolution> {
+    if !text.lines().any(|l| l == "[Service]") || !text.lines().any(|l| l.starts_with("ExecStart="))
+    {
+        return None;
+    }
+    let mut found = text.lines().filter_map(|l| {
+        l.strip_prefix("Environment=GHOSTFRAME_MAX_RESOLUTION=")
+            .map(str::trim)
+    });
+    match (found.next(), found.next()) {
+        (None, _) => Some(MaxResolution::Unlimited),
+        (Some(v), None) => crate::cli::parse_max_resolution(v).ok(),
+        _ => None,
+    }
+}
+
+/// An explicit `--max-resolution` wins. Without one, a reinstall keeps what
+/// the installed unit says, and a first install, or a unit that cannot be
+/// read back, gets 1920x1080.
+pub fn resolve_max_resolution(requested: Option<MaxResolution>, unit: &Path) -> ResolvedMax {
+    const DEFAULT: MaxResolution = MaxResolution::Limit(1920, 1080);
+    if let Some(max) = requested {
+        return ResolvedMax {
+            max,
+            note: "from --max-resolution".into(),
+        };
+    }
+    match std::fs::read_to_string(unit) {
+        Ok(text) => match max_resolution_of_unit(&text) {
+            Some(max) => ResolvedMax {
+                max,
+                note: format!("kept from the installed {}", unit.display()),
+            },
+            None => ResolvedMax {
+                max: DEFAULT,
+                note: format!(
+                    "default: could not read the cap back from the installed {}",
+                    unit.display()
+                ),
+            },
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ResolvedMax {
+            max: DEFAULT,
+            note: "default".into(),
+        },
+        Err(e) => ResolvedMax {
+            max: DEFAULT,
+            note: format!("default: could not read {}: {e}", unit.display()),
+        },
+    }
+}
+
 /// The XDG autostart entry.
 pub fn render_autostart() -> &'static str {
     AUTOSTART_TEMPLATE
@@ -371,14 +466,15 @@ pub fn validated_home(
     Ok(PathBuf::from(pw))
 }
 
-/// `install` and its detach step both refuse root first.
-pub fn refuse_root(euid: u32) -> Result<(), String> {
+/// `install`, its detach step, `uninstall`, `login` and `logout` refuse root
+/// first: each acts on one user's files or tailnet state. `capture` does not
+/// (the e2e container runs it as root).
+pub fn refuse_root(euid: u32, command: &str) -> Result<(), String> {
     if euid == 0 {
-        return Err(
-            "refusing to install as root: run `ghostframe-server install` as the \
-                    desktop user whose session it should serve"
-                .into(),
-        );
+        return Err(format!(
+            "refusing to {command} as root: run `ghostframe-server {command}` as the \
+             desktop user whose session it should serve"
+        ));
     }
     Ok(())
 }
@@ -402,7 +498,7 @@ pub fn refuse_root(euid: u32) -> Result<(), String> {
 pub fn install(
     ctx: &InstallContext,
     force: bool,
-    max: MaxResolution,
+    max: Option<MaxResolution>,
     sys: &mut dyn Systemctl,
     out: &mut dyn Write,
 ) -> Result<(), String> {
@@ -410,7 +506,7 @@ pub fn install(
         let _ = writeln!(out, "{s}");
     };
     // 1.
-    refuse_root(ctx.euid)?;
+    refuse_root(ctx.euid, "install")?;
     sys.user(&["show-environment"]).map_err(|e| {
         format!(
             "run `ghostframe-server install` from your desktop session (no user systemd \
@@ -447,12 +543,26 @@ pub fn install(
             format!("binary: installed {}", ctx.paths.bin.display()),
         ),
     }
-    write_file(&ctx.paths.unit_dir.join(UNIT_NAME), &render_unit(max))?;
+    // Resolved before the unit is overwritten, or there is nothing to keep.
+    let max = resolve_max_resolution(max, &ctx.paths.unit_dir.join(UNIT_NAME));
+    write_file(&ctx.paths.unit_dir.join(UNIT_NAME), &render_unit(max.max))?;
     w(
         out,
         format!(
             "unit: wrote {}",
             ctx.paths.unit_dir.join(UNIT_NAME).display()
+        ),
+    );
+    w(
+        out,
+        format!(
+            "max resolution: {} ({}); change it with `ghostframe-server install --max-resolution \
+             WxH|none`",
+            match max.max {
+                MaxResolution::Limit(w, h) => format!("{w}x{h}"),
+                MaxResolution::Unlimited => "none".into(),
+            },
+            max.note
         ),
     );
     // Enlightenment never activates graphical-session.target.
@@ -599,6 +709,15 @@ pub fn uninstall(
             out,
             "warning: the user manager could not be told; if the service is still running, \
              stop it with `systemctl --user stop ghostframe-server.service` from your desktop session"
+        );
+    }
+    // Local overrides live here; deleting someone's edits is not ours to do.
+    let dropin = paths.unit_dir.join(format!("{UNIT_NAME}.d"));
+    if dropin.exists() {
+        let _ = writeln!(
+            out,
+            "kept {}: local overrides are yours to remove",
+            dropin.display()
         );
     }
     let _ = writeln!(
@@ -987,7 +1106,7 @@ mod tests {
             let r = install(
                 &self.ctx(&sysroot, seeded),
                 force,
-                MaxResolution::Limit(1920, 1080),
+                Some(MaxResolution::Limit(1920, 1080)),
                 &mut sys,
                 &mut out,
             );
@@ -1089,7 +1208,7 @@ mod tests {
         let e = install(
             &ctx,
             false,
-            MaxResolution::Unlimited,
+            Some(MaxResolution::Unlimited),
             &mut sys,
             &mut Vec::new(),
         )
@@ -1189,6 +1308,16 @@ mod tests {
         );
         assert!(!out.contains("getty@tty1"), "{out}");
         assert!(conf.exists());
+        // The old packaging/install.sh's copy of the daemon.
+        let bin = sb.sysroot().join("usr/local/bin/ghostframe-xdaemon");
+        sb.touch(&bin);
+        let (r, _, out) = sb.run_install(false, false);
+        r.unwrap();
+        assert!(
+            out.contains("sudo rm /usr/local/bin/ghostframe-xdaemon"),
+            "{out}"
+        );
+        assert!(bin.exists());
     }
 
     #[test]
@@ -1380,6 +1509,93 @@ mod tests {
             sys.calls,
             ["disable --now ghostframe-server.service", "daemon-reload"]
         );
+    }
+
+    #[test]
+    fn uninstall_keeps_the_dropin_directory_and_says_so() {
+        let sb = Sandbox::new();
+        sb.run_install(false, false).0.unwrap();
+        let dropin = sb.paths.unit_dir.join("ghostframe-server.service.d");
+        sb.touch(&dropin.join("local.conf"));
+        let mut out = Vec::new();
+        uninstall(&sb.paths, &mut Recorder::default(), &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(dropin.join("local.conf").exists());
+        assert!(out.contains(&format!("kept {}", dropin.display())), "{out}");
+        // And says nothing when there is no drop-in.
+        std::fs::remove_dir_all(&dropin).unwrap();
+        let mut out = Vec::new();
+        uninstall(&sb.paths, &mut Recorder::default(), &mut out).unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("kept "));
+    }
+
+    /// Install into the sandbox with `max`, returning the unit's text and
+    /// what was printed.
+    fn install_max(sb: &Sandbox, max: Option<MaxResolution>) -> (String, String) {
+        let mut sys = Recorder {
+            unit_path: Some(sb.paths.unit_dir.join(UNIT_NAME)),
+            ..Recorder::default()
+        };
+        let sysroot = sb.sysroot();
+        let mut out = Vec::new();
+        install(&sb.ctx(&sysroot, false), true, max, &mut sys, &mut out).unwrap();
+        (
+            std::fs::read_to_string(sb.paths.unit_dir.join(UNIT_NAME)).unwrap(),
+            String::from_utf8(out).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_reinstall_without_the_flag_keeps_the_installed_cap() {
+        let sb = Sandbox::new();
+        // First install, no flag: the default, and it says so.
+        let (unit, out) = install_max(&sb, None);
+        assert!(unit.contains("GHOSTFRAME_MAX_RESOLUTION=1920x1080"));
+        assert!(out.contains("max resolution: 1920x1080 (default)"), "{out}");
+        // A custom cap survives a reinstall without the flag...
+        install_max(&sb, Some(MaxResolution::Limit(2560, 1440)));
+        let (unit, out) = install_max(&sb, None);
+        assert!(
+            unit.contains("GHOSTFRAME_MAX_RESOLUTION=2560x1440"),
+            "{unit}"
+        );
+        assert!(out.contains("max resolution: 2560x1440 (kept"), "{out}");
+        // ...so does `none`, which is the variable's absence...
+        install_max(&sb, Some(MaxResolution::Unlimited));
+        let (unit, out) = install_max(&sb, None);
+        assert!(!unit.contains("GHOSTFRAME_MAX_RESOLUTION"), "{unit}");
+        assert!(out.contains("max resolution: none (kept"), "{out}");
+        // ...and an explicit flag overrides what is installed.
+        let (unit, out) = install_max(&sb, Some(MaxResolution::Limit(1280, 720)));
+        assert!(
+            unit.contains("GHOSTFRAME_MAX_RESOLUTION=1280x720"),
+            "{unit}"
+        );
+        assert!(out.contains("from --max-resolution"), "{out}");
+    }
+
+    #[test]
+    fn an_unreadable_installed_unit_falls_back_to_the_default_and_says_so() {
+        let sb = Sandbox::new();
+        let unit_path = sb.paths.unit_dir.join(UNIT_NAME);
+        for junk in [
+            "not a unit at all\n".to_string(),
+            // Our shape, but a value this installer never writes.
+            "[Service]\nEnvironment=GHOSTFRAME_MAX_RESOLUTION=huge\nExecStart=x\n".to_string(),
+            // Two settings: which one wins is not ours to guess.
+            "[Service]\nEnvironment=GHOSTFRAME_MAX_RESOLUTION=1x1\n\
+             Environment=GHOSTFRAME_MAX_RESOLUTION=2x2\nExecStart=x\n"
+                .to_string(),
+        ] {
+            sb.touch(&unit_path);
+            std::fs::write(&unit_path, junk).unwrap();
+            let (unit, out) = install_max(&sb, None);
+            assert!(
+                unit.contains("GHOSTFRAME_MAX_RESOLUTION=1920x1080"),
+                "{unit}"
+            );
+            assert!(out.contains("could not read the cap back"), "{out}");
+        }
     }
 
     #[test]
@@ -1590,7 +1806,7 @@ mod tests {
     fn inside_the_headless_session_install_reexecs_as_a_transient_unit_once() {
         let cg = "0::/user.slice/user@1000.service/ghostframe-wm.service\n";
         let exe = Path::new("/proc/self/exe");
-        let args = install_args(true, MaxResolution::Limit(1920, 1080));
+        let args = install_args(true, Some(MaxResolution::Limit(1920, 1080)));
         let mut sys = Recorder::default();
         let mut out = Vec::new();
         let done = maybe_detach(&mut sys, cg, false, exe, &args, &mut out).unwrap();
@@ -1632,9 +1848,11 @@ mod tests {
         .unwrap());
         assert!(sys.runs.is_empty());
         assert_eq!(
-            install_args(false, MaxResolution::Unlimited),
+            install_args(false, Some(MaxResolution::Unlimited)),
             ["install", "--max-resolution", "none"]
         );
+        // Absent stays absent, so the re-exec'd copy resolves it itself.
+        assert_eq!(install_args(true, None), ["install", "--force"]);
         assert!(
             out.contains("handed off, not that it has finished"),
             "{out}"
@@ -1646,9 +1864,10 @@ mod tests {
         use clap::Parser;
         for force in [false, true] {
             for max in [
-                MaxResolution::Unlimited,
-                MaxResolution::Limit(1920, 1080),
-                MaxResolution::Limit(3840, 2160),
+                None,
+                Some(MaxResolution::Unlimited),
+                Some(MaxResolution::Limit(1920, 1080)),
+                Some(MaxResolution::Limit(3840, 2160)),
             ] {
                 let argv = std::iter::once("ghostframe-server".to_string())
                     .chain(install_args(force, max));
@@ -1704,11 +1923,33 @@ mod tests {
     }
 
     #[test]
+    fn wayland_and_state_dir_warnings_fire_only_when_they_apply() {
+        assert!(wayland_warning(None).is_none());
+        let w = wayland_warning(Some("wayland-0")).unwrap();
+        assert!(w.contains("WAYLAND_DISPLAY=wayland-0") && w.contains("unset-environment"));
+        let a = Path::new("/h/.local/state/ghostframe");
+        assert!(state_dir_mismatch_warning(a, a).is_none());
+        let w = state_dir_mismatch_warning(Path::new("/elsewhere"), a).unwrap();
+        assert!(
+            w.contains("/elsewhere") && w.contains("/h/.local/state/ghostframe"),
+            "{w}"
+        );
+    }
+
+    #[test]
     fn root_is_refused_before_anything() {
-        assert!(refuse_root(0)
+        assert!(refuse_root(0, "install")
             .unwrap_err()
             .contains("refusing to install as root"));
-        assert!(refuse_root(1000).is_ok());
+        for cmd in ["login", "logout", "uninstall"] {
+            let e = refuse_root(0, cmd).unwrap_err();
+            assert!(
+                e.contains(&format!("refusing to {cmd} as root"))
+                    && e.contains(&format!("`ghostframe-server {cmd}`")),
+                "{e}"
+            );
+        }
+        assert!(refuse_root(1000, "login").is_ok());
     }
 
     #[test]

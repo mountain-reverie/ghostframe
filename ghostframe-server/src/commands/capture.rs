@@ -9,15 +9,31 @@ use crate::capture::Backend;
 use crate::config::ServerConfig;
 use crate::state;
 
+/// The exit code for a failed [`X11Backend::new`](crate::capture::x11::X11Backend::new).
+/// `ErrorKind::Unsupported` is its contract for "this session can never be
+/// captured" (a 16 bpp or non-BGRX root): exit 2, which the unit does not
+/// restart on. Anything else (a refused connection, an X server still
+/// starting) may clear up, so it stays a plain failure the unit retries.
+fn backend_connect_exit_code(e: &std::io::Error) -> i32 {
+    if e.kind() == std::io::ErrorKind::Unsupported {
+        2
+    } else {
+        1
+    }
+}
+
 /// Run until the server shuts down. Startup failures that need the operator
 /// exit the process with code 2 and a message saying what to do.
 pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Checked first: on a Wayland session every X11 step below would fail
-    // with an error that names X, not the actual cause.
-    if cfg.display.is_none() && cfg.wayland_display.is_some() {
+    // Checked first, and regardless of DISPLAY: the installed unit hard-codes
+    // DISPLAY=:0, so on a Wayland session DISPLAY is always set and, without
+    // this, capture would stream the XWayland root without saying so.
+    if let Some(w) = cfg.wayland_display.as_deref() {
         eprintln!(
             "error: Wayland sessions are not supported yet: ghostframe-server captures \
-             X11, and this session has WAYLAND_DISPLAY set but no DISPLAY"
+             X11, and WAYLAND_DISPLAY={w} is set. If this is an X11 session with a stale \
+             value in the user manager, `systemctl --user unset-environment \
+             WAYLAND_DISPLAY` clears it"
         );
         std::process::exit(2);
     }
@@ -78,7 +94,17 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
     }
 
     // The X server is up: connect the backend (frames, damage, input, display).
-    let mut backend = crate::capture::x11::X11Backend::new(&cfg)?;
+    let mut backend = match crate::capture::x11::X11Backend::new(&cfg) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: {e}");
+            let code = backend_connect_exit_code(&e);
+            if code == 2 {
+                eprintln!("this is a property of the session, not a transient failure");
+            }
+            std::process::exit(code);
+        }
+    };
 
     let lib_config = match ghostframe_lib::config::LibConfig::from_env() {
         Ok(c) => c,
@@ -439,6 +465,17 @@ fn dump_frame_as_png(
 mod tests {
     use super::*;
     use ghostframe_lib::GhostbridgeError;
+
+    #[test]
+    fn only_an_unsupported_session_is_exit_2_not_a_transient_failure() {
+        use std::io::{Error, ErrorKind};
+        let code = |k| backend_connect_exit_code(&Error::new(k, "x"));
+        assert_eq!(code(ErrorKind::Unsupported), 2);
+        // X not up yet, or gone again: the unit may retry.
+        assert_eq!(code(ErrorKind::ConnectionRefused), 1);
+        assert_eq!(code(ErrorKind::Other), 1);
+        assert_eq!(code(ErrorKind::TimedOut), 1);
+    }
 
     #[test]
     fn capture_always_redacts_and_only_a_keyless_one_is_non_interactive() {

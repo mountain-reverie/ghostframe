@@ -32,6 +32,10 @@ impl X11Backend {
     /// Connect every part. Frames are required; damage, input and display
     /// control are each optional and logged when missing, so a desktop that
     /// lacks one still streams.
+    ///
+    /// An error of kind `Unsupported` means the session can never be
+    /// captured (see `frames::check_pixel_format`); every other kind may be
+    /// transient. `capture` exits 2 on the first and 1 on the rest.
     pub fn new(cfg: &ServerConfig) -> io::Result<Self> {
         let frames =
             frames::X11Frames::connect(cfg.display.as_deref(), cfg.dump_first_frame.clone())?;
@@ -171,7 +175,7 @@ pub fn wait_for_x11(timeout: Duration, display: Option<&str>) -> Result<(), Stri
     let mut attempt: u32 = 0;
     let last_err = loop {
         attempt += 1;
-        let err = match x11rb::connect(None) {
+        let err = match x11rb::connect(display) {
             Ok(_) => {
                 if attempt > 1 {
                     tracing::info!(attempts = attempt, "X11 display ready");
@@ -199,6 +203,16 @@ mod tests {
     use crate::capture::Backend;
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{ConnectionExt, CreateGCAux, Rectangle};
+
+    #[test]
+    fn wait_for_x11_connects_to_the_display_it_was_given() {
+        // The process environment's DISPLAY (xvfb-run sets one) must not
+        // decide the outcome: a bogus argument fails, a real one succeeds.
+        let x = PrivateXvfb::spawn(&["-screen", "0", "64x48x24"]);
+        wait_for_x11(Duration::from_millis(10), Some(x.display())).unwrap();
+        let err = wait_for_x11(Duration::from_millis(10), Some(":48000")).unwrap_err();
+        assert!(err.contains(":48000"), "{err}");
+    }
 
     /// Damage hints at the backend level: a pointer warp raises no damage,
     /// so with other damage present the hint must still cover the tiles the
