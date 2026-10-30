@@ -1,26 +1,50 @@
-//! XDamage integration: monitors root window damage events and maps
-//! damaged pixel rectangles to tile grid coordinates.
-
-use std::collections::HashSet;
+//! XDamage integration: reports which screen tiles changed since the last
+//! drain, as an honest tri-state [`Damage`].
+//!
+//! Two report levels, chosen by `GHOSTFRAME_DAMAGE_REPORT`:
+//!
+//! - `NonEmpty` (default): the server sends one event when the damage region
+//!   goes from empty to non-empty. A drain then reads the whole region with
+//!   `DamageSubtract(parts)` + `XFixesFetchRegion`; the server has already
+//!   banded and coalesced the rectangles, so the cost follows the region's
+//!   shape rather than the application's draw-call count. An idle screen costs
+//!   no round trip at all.
+//! - `RawRectangles`: one event per damaged rectangle, every one read and
+//!   mapped to tiles. The fallback.
+//!
+//! Anything that makes the answer untrustworthy yields `Damage::Unknown`: not
+//! armed, the first drain after arming, a geometry change (and the tick after
+//! it), a protocol error, a broken connection, an event flood.
 
 use x11rb::connection::Connection;
 use x11rb::protocol::damage::{self, ConnectionExt as DamageExt};
+use x11rb::protocol::xfixes::{self, ConnectionExt as XfixesExt};
 use x11rb::protocol::xproto::Drawable;
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
-use ghostframe_lib::tile::TILE_SIZE;
+use crate::capture::{Damage, TileBitmap};
+use crate::config::DamageReport;
+
+/// Events (raw) or region rectangles (non-empty) per drain above which the
+/// answer degrades to `Unknown`: one full comparison beats thousands of small
+/// ones. Same posture as x11vnc's flood escape.
+pub(crate) const FLOOD_LIMIT: usize = 512;
+
+/// Drains that stay `Unknown` once a geometry change is seen. Region contents
+/// at the moment of a mode change are meaningless, and the capture side only
+/// notices the new size one tick after this side does.
+const GEOMETRY_SETTLE_TICKS: u8 = 2;
 
 /// Tracks X11 damage events on the root window.
 ///
 /// Armed and disarmed around the capture loop's idle gate rather than held for
-/// the daemon's lifetime. `RAW_RECTANGLES` is the most expensive report level
-/// -- one event per damaged rectangle, no coalescing -- so a Damage object
-/// held while no client is connected costs the X server that bookkeeping and
-/// those socket writes for output nobody reads, and grows an event backlog in
-/// the server's per-client output buffer that nothing drains. While disarmed
-/// no Damage object exists, so the server generates nothing at all.
+/// the daemon's lifetime: a Damage object held while no client is connected
+/// costs the X server bookkeeping and socket writes for output nobody reads,
+/// and grows an event backlog in the server's per-client output buffer that
+/// nothing drains. While disarmed no Damage object exists, so the server
+/// generates nothing at all.
 ///
 /// Disarming is invisible to every other X client: a Damage object is a
 /// per-client server resource, so tearing ours down does not affect the
@@ -42,6 +66,24 @@ pub struct XDamageMonitor {
     /// disarm are idempotent on it, so the capture loop can call either on
     /// every idle transition without tracking the previous state itself.
     armed: bool,
+    /// The report level in effect. `NonEmpty` degrades to `Raw` at `new` when
+    /// the server lacks XFixes regions.
+    report: DamageReport,
+    /// XFixes region that receives `DamageSubtract`'s `parts`; created once.
+    parts: xfixes::Region,
+    flood_limit: usize,
+    /// The next drain must be `Unknown` (just armed, or the last one erred).
+    force_unknown: bool,
+    /// Screen size the last drain saw, and the `Unknown` drains left after it
+    /// changed.
+    dims: Option<(u32, u32)>,
+    settle: u8,
+    /// Bitmap reused across drains, so an idle tick allocates nothing. A
+    /// result is a clone of it.
+    scratch: TileBitmap,
+    /// Heap allocations since `take_allocs`: the scratch (re-)allocation, the
+    /// result clone, the region rectangles fetched from the server.
+    allocs: u32,
 }
 
 impl XDamageMonitor {
@@ -53,7 +95,7 @@ impl XDamageMonitor {
     /// leak this type exists to avoid. Call [`arm`] when a client attaches.
     ///
     /// [`arm`]: XDamageMonitor::arm
-    pub fn new(display: Option<&str>) -> Option<Self> {
+    pub fn new(display: Option<&str>, report: DamageReport) -> Option<Self> {
         let (conn, screen_num) = RustConnection::connect(display).ok()?;
 
         // Query the damage extension. This also registers extension info so
@@ -62,23 +104,56 @@ impl XDamageMonitor {
 
         let target = conn.setup().roots[screen_num].root;
         let damage_id = conn.generate_id().ok()?;
+        let parts = conn.generate_id().ok()?;
+
+        // Regions need XFixes 2+. Without them, the raw level still works.
+        let mut report = report;
+        let have_regions = conn
+            .xfixes_query_version(5, 0)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some()
+            && conn.xfixes_create_region(parts, &[]).is_ok()
+            && conn.flush().is_ok();
+        if !have_regions && report == DamageReport::NonEmpty {
+            tracing::warn!("XFixes regions unavailable; XDamage falls back to RawRectangles");
+            report = DamageReport::Raw;
+        }
 
         Some(Self {
             conn,
             target,
             damage_id,
             armed: false,
+            report,
+            parts,
+            flood_limit: FLOOD_LIMIT,
+            force_unknown: true,
+            dims: None,
+            settle: 0,
+            scratch: TileBitmap::empty(),
+            allocs: 0,
         })
+    }
+
+    /// Heap allocations the drains made since the last call; resets.
+    pub fn take_allocs(&mut self) -> u32 {
+        std::mem::take(&mut self.allocs)
     }
 
     /// Whether damage reporting is currently active.
     ///
     /// Logged on each idle transition. A monitor that silently fails to arm
-    /// reports no dirty tiles, the capture loop falls back to full-frame
-    /// comparison, and every frame is still *correct* -- just more expensive,
-    /// with nothing to say why. This is what makes that visible.
+    /// reports `Unknown`, the capture loop compares every frame in full, and
+    /// every frame is still *correct* -- just more expensive, with nothing to
+    /// say why. This is what makes that visible.
     pub fn is_armed(&self) -> bool {
         self.armed
+    }
+
+    /// The report level in effect (after any fallback).
+    pub fn report_level(&self) -> DamageReport {
+        self.report
     }
 
     /// Start reporting damage on `target` (the root window in production).
@@ -89,17 +164,16 @@ impl XDamageMonitor {
         }
         // Anything still queued predates this arm. Letting it through would
         // attribute stale rectangles to the newly connected client's first
-        // frame -- and since a non-empty drain means "check only these
-        // tiles", that first frame would be partial rather than full.
+        // frame.
         self.discard_pending();
 
+        let level = match self.report {
+            DamageReport::NonEmpty => damage::ReportLevel::NON_EMPTY,
+            DamageReport::Raw => damage::ReportLevel::RAW_RECTANGLES,
+        };
         if self
             .conn
-            .damage_create(
-                self.damage_id,
-                self.target,
-                damage::ReportLevel::RAW_RECTANGLES,
-            )
+            .damage_create(self.damage_id, self.target, level)
             .is_err()
             || self.conn.flush().is_err()
         {
@@ -107,6 +181,11 @@ impl XDamageMonitor {
             return;
         }
         self.armed = true;
+        // The first frame for a newly connected client must be compared in
+        // full whatever the (empty) damage region says.
+        self.force_unknown = true;
+        self.dims = None;
+        self.settle = 0;
     }
 
     /// Stop reporting damage and discard anything already queued. Idempotent.
@@ -124,57 +203,131 @@ impl XDamageMonitor {
         self.armed = false;
     }
 
-    /// Drain all pending damage events and return the set of dirty tile
-    /// coordinates. Non-blocking: returns an empty vec if no damage events are
-    /// pending, and always empty while disarmed.
-    #[cfg(test)]
-    pub fn drain_damage(&self) -> Vec<(u32, u32)> {
-        self.drain_damage_counted(&mut Default::default())
+    /// Damage since the previous drain on a `width` x `height` screen.
+    /// Non-blocking.
+    ///
+    /// **Order is load-bearing: read the events, then subtract.** With
+    /// `NonEmpty` the server sends a notification only when the region goes
+    /// empty to non-empty, so the drain is gated on having seen one. Subtract
+    /// first and a draw that lands after the subtract has its notification
+    /// consumed by the event read; the region is then non-empty with no
+    /// notification pending, and the draw is not reported until something else
+    /// draws -- a lost update. Reading first means a draw between the two
+    /// steps is simply part of what the subtract returns, and a draw after the
+    /// subtract raises a fresh notification for the next drain.
+    pub fn drain_damage(&mut self, width: u32, height: u32) -> Damage {
+        self.drain_with(width, height, &mut || {})
     }
 
-    /// [`Self::drain_damage`], adding its real heap allocations to `stats`:
-    /// the tile set's growth steps (from its final capacity) and the result
-    /// list. Nothing is counted when no tile was damaged.
-    pub fn drain_damage_counted(
-        &self,
-        stats: &mut crate::capture::tick_stats::TickStats,
-    ) -> Vec<(u32, u32)> {
+    /// `drain_damage` with `between` run after the first step (reading
+    /// events) and before the second (subtract). Production passes a no-op;
+    /// the lost-update test draws there.
+    fn drain_with(&mut self, width: u32, height: u32, between: &mut dyn FnMut()) -> Damage {
         if !self.armed {
-            return Vec::new();
+            return Damage::Unknown;
         }
-        let mut tile_set = HashSet::new();
+        let mut unknown = std::mem::take(&mut self.force_unknown);
+        if self.dims != Some((width, height)) {
+            if self.dims.is_some() {
+                self.settle = GEOMETRY_SETTLE_TICKS;
+            }
+            self.dims = Some((width, height));
+        }
+        if self.settle > 0 {
+            self.settle -= 1;
+            unknown = true;
+        }
 
-        // Drain pending events FIRST, then subtract. This ensures we consume
-        // all notifications before resetting the damage region — otherwise
-        // events queued between subtract and poll could be lost.
+        if !self.scratch.matches(width, height) || self.scratch.grid() == (0, 0) {
+            self.scratch = TileBitmap::new(width, height);
+            self.allocs += 1;
+        }
+        let mut bitmap = std::mem::replace(&mut self.scratch, TileBitmap::empty());
+        // Step 1: read every pending event.
+        let mut notified = 0usize;
+        let mut errored = false;
         loop {
             match self.conn.poll_for_event() {
                 Ok(Some(Event::DamageNotify(ev))) => {
-                    rect_to_tiles(
-                        ev.area.x,
-                        ev.area.y,
-                        ev.area.width,
-                        ev.area.height,
-                        &mut tile_set,
-                    );
+                    notified += 1;
+                    if self.report == DamageReport::Raw && notified <= self.flood_limit {
+                        bitmap.set_rect(ev.area.x, ev.area.y, ev.area.width, ev.area.height);
+                    }
                 }
-                Ok(Some(_)) => {
-                    // Ignore non-damage events
-                }
+                Ok(Some(Event::Error(_))) => errored = true,
+                Ok(Some(_)) => {}
                 Ok(None) => break,
-                Err(_) => break,
+                Err(_) => {
+                    errored = true;
+                    break;
+                }
             }
         }
 
-        // Subtract (reset) damage region after draining all events.
-        let _ = self.conn.damage_subtract(self.damage_id, 0u32, 0u32);
-        let _ = self.conn.flush();
+        between();
 
-        if tile_set.capacity() > 0 {
-            stats.allocs += crate::capture::tick_stats::hashset_allocs(tile_set.capacity());
-            stats.alloc(); // the result list
+        // Step 2: subtract, which resets the region.
+        let mut flooded = false;
+        match self.report {
+            DamageReport::Raw => {
+                flooded = notified > self.flood_limit;
+                errored |= self
+                    .conn
+                    .damage_subtract(self.damage_id, 0u32, 0u32)
+                    .is_err();
+            }
+            DamageReport::NonEmpty if notified > 0 => match self.subtract_into_parts() {
+                Some(rects) => {
+                    if !rects.is_empty() {
+                        self.allocs += 1; // the fetched rectangle list
+                    }
+                    if rects.len() <= self.flood_limit {
+                        for r in rects {
+                            bitmap.set_rect(r.x, r.y, r.width, r.height);
+                        }
+                    } else {
+                        flooded = true;
+                    }
+                }
+                None => errored = true,
+            },
+            DamageReport::NonEmpty => {}
         }
-        tile_set.into_iter().collect()
+        if self.conn.flush().is_err() {
+            errored = true;
+        }
+
+        let result = if errored {
+            // Not trusted again until a drain completes cleanly; this one and
+            // the next compare everything.
+            self.force_unknown = true;
+            Damage::Unknown
+        } else if unknown || flooded {
+            Damage::Unknown
+        } else if bitmap.is_empty() {
+            Damage::None
+        } else {
+            self.allocs += 1; // the clone handed out
+            Damage::Tiles(bitmap.clone())
+        };
+        bitmap.clear();
+        self.scratch = bitmap;
+        result
+    }
+
+    /// `DamageSubtract(repair = None, parts)` then `XFixesFetchRegion(parts)`.
+    /// `None` on any failure.
+    fn subtract_into_parts(&self) -> Option<Vec<x11rb::protocol::xproto::Rectangle>> {
+        self.conn
+            .damage_subtract(self.damage_id, 0u32, self.parts)
+            .ok()?;
+        let reply = self
+            .conn
+            .xfixes_fetch_region(self.parts)
+            .ok()?
+            .reply()
+            .ok()?;
+        Some(reply.rectangles)
     }
 
     /// Drop every event currently queued on our connection, damage or not.
@@ -268,98 +421,7 @@ impl Drop for XDamageMonitor {
     }
 }
 
-/// Map a damaged pixel rectangle onto the tile grid, inserting every tile it
-/// touches into `out`.
-///
-/// Negative origins are clamped to 0 rather than shifting the extent, so a
-/// rectangle straddling the screen edge over-approximates by the clipped
-/// amount. Over-approximating costs a redundant tile; under-approximating
-/// would drop a changed tile from the frame.
-pub(super) fn rect_to_tiles(
-    x: i16,
-    y: i16,
-    width: u16,
-    height: u16,
-    out: &mut HashSet<(u32, u32)>,
-) {
-    let x = x.max(0) as u32;
-    let y = y.max(0) as u32;
-    let w = u32::from(width);
-    let h = u32::from(height);
-
-    let tx_start = x / TILE_SIZE;
-    let ty_start = y / TILE_SIZE;
-    let tx_end = (x + w).div_ceil(TILE_SIZE);
-    let ty_end = (y + h).div_ceil(TILE_SIZE);
-
-    for ty in ty_start..ty_end {
-        for tx in tx_start..tx_end {
-            out.insert((tx, ty));
-        }
-    }
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod rect_tests {
-    use super::*;
-
-    fn tiles(x: i16, y: i16, w: u16, h: u16) -> Vec<(u32, u32)> {
-        let mut out = HashSet::new();
-        rect_to_tiles(x, y, w, h, &mut out);
-        let mut v: Vec<_> = out.into_iter().collect();
-        v.sort_unstable();
-        v
-    }
-
-    #[test]
-    fn a_rect_inside_one_tile_dirties_only_that_tile() {
-        assert_eq!(tiles(1, 1, 2, 2), vec![(0, 0)]);
-        // TILE_SIZE is 32: (40, 40) sits in tile (1, 1).
-        assert_eq!(tiles(40, 40, 2, 2), vec![(1, 1)]);
-    }
-
-    #[test]
-    fn a_rect_exactly_filling_a_tile_does_not_spill_into_the_next() {
-        // The off-by-one that matters: 0..32 is tile 0 alone, and the
-        // div_ceil must not round 32 up to tile 1. An extra tile here would
-        // be invisible in output (just redundant work); the mirrored error on
-        // the start edge would drop a changed tile.
-        assert_eq!(tiles(0, 0, 32, 32), vec![(0, 0)]);
-        assert_eq!(tiles(32, 32, 32, 32), vec![(1, 1)]);
-    }
-
-    #[test]
-    fn a_rect_crossing_a_boundary_dirties_both_tiles() {
-        assert_eq!(tiles(31, 0, 2, 1), vec![(0, 0), (1, 0)]);
-        assert_eq!(tiles(0, 31, 1, 2), vec![(0, 0), (0, 1)]);
-    }
-
-    #[test]
-    fn a_rect_spanning_several_tiles_dirties_the_whole_block() {
-        // 0..65 x 0..33 covers tiles 0..3 across and 0..2 down.
-        assert_eq!(
-            tiles(0, 0, 65, 33),
-            vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1),]
-        );
-    }
-
-    #[test]
-    fn a_negative_origin_is_clamped_and_over_approximates() {
-        // Clamping the origin without shrinking the extent reports one tile
-        // more than was really damaged. Deliberate: see `rect_to_tiles`.
-        // Under-approximating would drop a changed tile from the frame.
-        assert_eq!(tiles(-10, 0, 10, 1), vec![(0, 0)]);
-        assert_eq!(tiles(-10, 0, 40, 1), vec![(0, 0), (1, 0)]);
-    }
-
-    #[test]
-    fn a_zero_area_rect_dirties_nothing_on_a_tile_boundary() {
-        assert!(tiles(0, 0, 0, 0).is_empty());
-        assert!(tiles(32, 32, 0, 0).is_empty());
-    }
-}
 
 /// Tests that need a live X server: each starts its own private Xvfb
 /// (`test_support::PrivateXvfb`), so they never touch `$DISPLAY`.
@@ -381,7 +443,8 @@ mod x11_tests {
     #[test]
     fn x11_arm_disarm_cycle_is_accepted_by_the_server() {
         let x = PrivateXvfb::spawn(&["-screen", "0", "256x256x24"]);
-        let mut m = XDamageMonitor::new(Some(x.display())).expect("XDamage extension");
+        let mut m = XDamageMonitor::new(Some(x.display()), DamageReport::NonEmpty)
+            .expect("XDamage extension");
         assert!(!m.is_armed(), "new() must not arm: the daemon starts idle");
 
         for cycle in 0..3 {
@@ -409,7 +472,8 @@ mod x11_tests {
     #[test]
     fn x11_arm_and_disarm_are_idempotent() {
         let x = PrivateXvfb::spawn(&["-screen", "0", "256x256x24"]);
-        let mut m = XDamageMonitor::new(Some(x.display())).expect("XDamage extension");
+        let mut m = XDamageMonitor::new(Some(x.display()), DamageReport::NonEmpty)
+            .expect("XDamage extension");
 
         m.disarm();
         assert!(!m.is_armed(), "disarming an unarmed monitor is a no-op");
@@ -432,12 +496,15 @@ mod x11_tests {
     /// A disarmed monitor must report nothing, whatever the screen is doing.
     /// This is the property the capture loop's gate depends on.
     #[test]
-    fn x11_drain_is_empty_while_disarmed() {
+    fn x11_drain_is_unknown_while_never_armed() {
         let x = PrivateXvfb::spawn(&["-screen", "0", "256x256x24"]);
-        let m = XDamageMonitor::new(Some(x.display())).expect("XDamage extension");
-        assert!(
-            m.drain_damage().is_empty(),
-            "a monitor that was never armed cannot have damage to report"
+        let mut m = XDamageMonitor::new(Some(x.display()), DamageReport::NonEmpty)
+            .expect("XDamage extension");
+        assert_eq!(
+            m.drain_damage(256, 256),
+            Damage::Unknown,
+            "a monitor that was never armed knows nothing, which is not \
+             the same as nothing changed"
         );
     }
 
@@ -457,7 +524,8 @@ mod x11_tests {
         use x11rb::protocol::xproto::{CreateGCAux, Rectangle};
 
         let x = PrivateXvfb::spawn(&["-screen", "0", "256x256x24"]);
-        let mut m = XDamageMonitor::new(Some(x.display())).expect("XDamage extension");
+        let mut m = XDamageMonitor::new(Some(x.display()), DamageReport::NonEmpty)
+            .expect("XDamage extension");
         let pixmap = m.retarget_to_scratch_pixmap(128, 128);
 
         let gc = m.conn.generate_id().expect("generate_id for gc");
@@ -489,14 +557,18 @@ mod x11_tests {
         assert!(m.is_armed());
         fill(&m);
 
-        let tiles = m.drain_damage();
+        // The first drain after arming is Unknown by design; it also
+        // consumes the notification, so look at the next one.
+        assert_eq!(m.drain_damage(128, 128), Damage::Unknown);
+        fill(&m);
+        let Damage::Tiles(tiles) = m.drain_damage(128, 128) else {
+            panic!(
+                "arming produced no damage: the capture loop would silently \
+                 fall back to full-frame comparison forever"
+            );
+        };
         assert!(
-            !tiles.is_empty(),
-            "arming produced no damage: the capture loop would silently fall \
-             back to full-frame comparison forever"
-        );
-        assert!(
-            tiles.contains(&(1, 1)),
+            tiles.get(1, 1),
             "a fill at (33, 33) must dirty tile (1, 1), got {tiles:?}"
         );
 

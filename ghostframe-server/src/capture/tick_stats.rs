@@ -35,18 +35,6 @@ impl TickStats {
     }
 }
 
-/// Heap allocations a hash set made reaching `capacity`: its first allocation
-/// holds 3 items and each growth roughly doubles that (hashbrown), one
-/// allocation per step. 0 for a set that never allocated.
-pub fn hashset_allocs(capacity: usize) -> u32 {
-    let (mut steps, mut cap) = (0, 0usize);
-    while cap < capacity {
-        cap = if cap == 0 { 3 } else { cap * 2 + 1 };
-        steps += 1;
-    }
-    steps
-}
-
 /// CPU time (user + system) consumed by the calling thread, in microseconds.
 /// Only meaningful as a difference between two calls on the same thread.
 pub fn thread_cpu_us() -> u64 {

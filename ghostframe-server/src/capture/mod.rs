@@ -6,6 +6,7 @@
 //! trait later (design: `docs/superpowers/specs/2026-10-29-ghostframe-server-x11-design.md`).
 
 pub mod tick_stats;
+pub mod tile_bitmap;
 pub mod x11;
 
 use std::sync::Arc;
@@ -13,6 +14,51 @@ use std::sync::Arc;
 use ghostframe_lib::transport::display::DisplayController;
 use ghostframe_lib::transport::input_inject::InputInjector;
 use ghostframe_lib::FrameSubmission;
+
+pub use tile_bitmap::TileBitmap;
+
+/// What a backend knows about the pixels that changed since the last
+/// [`Backend::drain_damage`].
+///
+/// Three states, because "nothing changed", "I do not know" and "I never
+/// could know" are different facts and a consumer that skips work on damage
+/// must tell them apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Damage {
+    /// No knowledge: compare everything. Reported for the first frame after
+    /// damage reporting starts, after a resize, after any error or event
+    /// flood, and when damage reporting is absent or not armed.
+    Unknown,
+    /// Reporting is live and nothing changed.
+    None,
+    /// Reporting is live; the changed pixels lie within these tiles (a
+    /// superset of the truly changed ones).
+    Tiles(TileBitmap),
+}
+
+impl Damage {
+    /// [`Damage::into_hint`] for a frame of `width` x `height` pixels. A
+    /// `Tiles` bitmap built for another screen size (a resize between the
+    /// drain and the grab, even one that keeps the tile grid) says nothing
+    /// about this frame and yields no hint.
+    pub fn into_hint_for(self, width: u32, height: u32) -> Option<Vec<(u32, u32)>> {
+        match self {
+            Damage::Tiles(ref b) if !b.matches(width, height) => None,
+            d => d.into_hint(),
+        }
+    }
+
+    /// The hint in `FrameSubmission::damage_tiles` form. Only `Tiles` is a
+    /// hint; `Unknown` and `None` both stay `None` ("compare every tile"),
+    /// which is always safe. The library ignores the field today, so a
+    /// literal "no tiles" is not forwarded.
+    pub fn into_hint(self) -> Option<Vec<(u32, u32)>> {
+        match self {
+            Damage::Tiles(b) => Some(b.iter().collect()),
+            Damage::Unknown | Damage::None => Option::None,
+        }
+    }
+}
 
 /// One desktop to serve.
 pub trait Backend {
@@ -37,14 +83,33 @@ pub trait Backend {
     /// it has not silently failed.
     fn damage_armed(&self) -> bool;
 
-    /// Tiles damaged since the last call, or `None` for "unknown: check
-    /// every tile" (no damage support, or no event since the last call).
-    fn drain_damage(&mut self) -> Option<Vec<(u32, u32)>>;
+    /// Damage since the last call; see [`Damage`].
+    fn drain_damage(&mut self) -> Damage;
 
     /// Bytes copied and allocations made at the counted sites since the last
     /// call (see [`tick_stats::TickStats`]); resets them. Backends that do
     /// not count return zeros.
     fn take_tick_stats(&mut self) -> tick_stats::TickStats {
         tick_stats::TickStats::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A drain at one size and a grab at another that keeps the tile grid
+    /// (512x512 and 500x500 are both 16x16 tiles) must not forward the hint.
+    #[test]
+    fn a_hint_for_another_screen_size_is_dropped_even_on_the_same_tile_grid() {
+        let mut b = TileBitmap::new(512, 512);
+        b.set(3, 3);
+        assert_eq!(b.grid(), TileBitmap::new(500, 500).grid());
+        assert_eq!(
+            Damage::Tiles(b.clone()).into_hint_for(500, 500),
+            None,
+            "stale hint forwarded across a resize"
+        );
+        assert_eq!(Damage::Tiles(b).into_hint_for(512, 512), Some(vec![(3, 3)]));
     }
 }

@@ -251,13 +251,14 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
         let sample_cpu = cost_trace && (frame_count + 1).is_multiple_of(heartbeat_every);
         let cpu_start = if sample_cpu { thread_cpu_us() } else { 0 };
 
-        // Some(tiles) = only these changed; None = check every tile.
-        let damage_tiles = backend.drain_damage();
+        let damage = backend.drain_damage();
 
         let timestamp_us = (frame_count * frame_interval.as_micros() as u64) as u32;
         let submission = match backend.capture(timestamp_us) {
             Ok(mut frame) => {
-                frame.damage_tiles = damage_tiles;
+                // A bitmap built for another screen size says nothing about
+                // this frame: the resize happened between drain and grab.
+                frame.damage_tiles = damage.into_hint_for(frame.width, frame.height);
                 Some(frame)
             }
             Err(e) => {
