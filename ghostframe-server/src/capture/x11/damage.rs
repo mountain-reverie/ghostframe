@@ -584,4 +584,241 @@ mod x11_tests {
         let _ = m.conn.free_gc(gc);
         let _ = m.conn.free_pixmap(pixmap);
     }
+
+    // ── Producer behaviour against a real server ────────────────────────
+
+    use x11rb::protocol::xproto::{ConnectionExt as _, CreateGCAux, Rectangle};
+
+    const SCRATCH: u16 = 512;
+
+    /// An armed monitor over a scratch pixmap, with the arm-time `Unknown`
+    /// already consumed and one settled drain behind it.
+    struct Rig {
+        m: XDamageMonitor,
+        pixmap: Drawable,
+        gc: u32,
+        _x: PrivateXvfb,
+    }
+
+    impl Rig {
+        fn new(level: DamageReport) -> Self {
+            let x = PrivateXvfb::spawn(&["-screen", "0", "512x512x24"]);
+            let mut m = XDamageMonitor::new(Some(x.display()), level).expect("XDamage extension");
+            assert_eq!(m.report_level(), level, "the server lacks the level");
+            let pixmap = m.retarget_to_scratch_pixmap(SCRATCH, SCRATCH);
+            let gc = m.conn.generate_id().unwrap();
+            m.conn
+                .create_gc(gc, pixmap, &CreateGCAux::new().foreground(0x00ff_ffff))
+                .unwrap();
+            m.arm();
+            m.conn.sync().unwrap();
+            assert!(m.take_pending_errors().is_empty());
+            assert_eq!(
+                m.drain_damage(SCRATCH.into(), SCRATCH.into()),
+                Damage::Unknown,
+                "the first drain after arming must be Unknown"
+            );
+            Self {
+                m,
+                pixmap,
+                gc,
+                _x: x,
+            }
+        }
+
+        /// One request per rectangle, as separate draw calls are in
+        /// practice. (One `PolyFillRectangle` carrying many rectangles is
+        /// reported as a single bounding box by the server.)
+        fn draw(&self, rects: &[Rectangle]) {
+            for r in rects {
+                self.draw_batch(std::slice::from_ref(r));
+            }
+        }
+
+        fn draw_batch(&self, rects: &[Rectangle]) {
+            self.m
+                .conn
+                .poly_fill_rectangle(self.pixmap, self.gc, rects)
+                .unwrap();
+            // The server generates damage while processing the draw.
+            self.m.conn.sync().unwrap();
+        }
+
+        fn drain(&mut self) -> Damage {
+            self.m.drain_damage(SCRATCH.into(), SCRATCH.into())
+        }
+    }
+
+    fn rect(x: i16, y: i16, w: u16, h: u16) -> Rectangle {
+        Rectangle {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    /// Tiles a rectangle touches, computed by intersection and not through
+    /// `set_rect`, so the two cannot share a bug.
+    fn touched(r: &Rectangle) -> Vec<(u32, u32)> {
+        let (x0, y0) = (i32::from(r.x), i32::from(r.y));
+        let (x1, y1) = (x0 + i32::from(r.width), y0 + i32::from(r.height));
+        let n = i32::from(SCRATCH) / 32;
+        let mut v = Vec::new();
+        for ty in 0..n {
+            for tx in 0..n {
+                let (a, b) = (tx * 32, ty * 32);
+                if x0 < a + 32 && x1 > a && y0 < b + 32 && y1 > b {
+                    v.push((tx as u32, ty as u32));
+                }
+            }
+        }
+        v
+    }
+
+    fn lcg(state: &mut u64) -> u32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 33) as u32
+    }
+
+    /// Real draws produce a superset of the touched tiles, at both report
+    /// levels, over random rectangles (overlapping, edge-straddling, 1 px).
+    #[test]
+    fn x11_real_draws_report_a_superset_of_the_touched_tiles() {
+        for level in [DamageReport::NonEmpty, DamageReport::Raw] {
+            let mut rig = Rig::new(level);
+            let mut seed = 0x5eed_u64;
+            let mut seen_tiles = 0usize;
+            for trial in 0..60 {
+                let n = 1 + lcg(&mut seed) % 12;
+                let rects: Vec<Rectangle> = (0..n)
+                    .map(|_| {
+                        let w = 1 + (lcg(&mut seed) % 120) as u16;
+                        let h = 1 + (lcg(&mut seed) % 120) as u16;
+                        let x = (lcg(&mut seed) % (SCRATCH as u32 - u32::from(w) + 1)) as i16;
+                        let y = (lcg(&mut seed) % (SCRATCH as u32 - u32::from(h) + 1)) as i16;
+                        rect(x, y, w, h)
+                    })
+                    .collect();
+                if trial % 2 == 0 {
+                    rig.draw(&rects);
+                } else {
+                    rig.draw_batch(&rects);
+                }
+                let Damage::Tiles(got) = rig.drain() else {
+                    panic!("{level:?} trial {trial}: draws were not reported as tiles");
+                };
+                for r in &rects {
+                    for (tx, ty) in touched(r) {
+                        assert!(
+                            got.get(tx, ty),
+                            "{level:?} trial {trial}: tile ({tx},{ty}) of {r:?} missing"
+                        );
+                    }
+                }
+                seen_tiles += got.count();
+                // Nothing left behind: the next drain is quiet.
+                assert_eq!(rig.drain(), Damage::None, "{level:?} trial {trial}");
+            }
+            assert!(seen_tiles > 60, "the property never saw damage");
+        }
+    }
+
+    /// The ordering guard. A draw that lands after the events are read and
+    /// before the subtract must not be lost: across this drain and the next,
+    /// both the draw before and the draw during are reported. With the steps
+    /// reversed the second draw's notification is consumed after the
+    /// subtract already ran, the region stays non-empty with no event
+    /// pending, and the draw is never reported.
+    #[test]
+    fn x11_a_draw_between_event_read_and_subtract_is_not_lost() {
+        let mut rig = Rig::new(DamageReport::NonEmpty);
+        let a = rect(10, 10, 8, 8); // tile (0,0)
+        let b = rect(400, 400, 8, 8); // tile (12,12)
+        rig.draw(&[a]);
+
+        // A second client draws, so the closure does not borrow the monitor.
+        let (conn, _) = x11rb::connect(Some(rig._x.display())).unwrap();
+        let (pixmap, gc) = (rig.pixmap, conn.generate_id().unwrap());
+        conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0x00ff_ffff))
+            .unwrap();
+        let mut draw_b = move || {
+            conn.poly_fill_rectangle(pixmap, gc, &[b]).unwrap();
+            conn.get_input_focus().unwrap().reply().unwrap();
+        };
+        let first = rig
+            .m
+            .drain_with(SCRATCH.into(), SCRATCH.into(), &mut draw_b);
+        let second = rig.drain();
+
+        let mut covered = TileBitmap::new(SCRATCH.into(), SCRATCH.into());
+        for d in [first, second] {
+            if let Damage::Tiles(t) = d {
+                for (tx, ty) in t.iter() {
+                    covered.set(tx, ty);
+                }
+            }
+        }
+        assert!(covered.get(0, 0), "the draw before the drain was lost");
+        assert!(
+            covered.get(12, 12),
+            "the draw between event read and subtract was lost: the \
+             subtract and the event read are out of order"
+        );
+    }
+
+    #[test]
+    fn x11_an_idle_armed_screen_is_none_not_unknown() {
+        for level in [DamageReport::NonEmpty, DamageReport::Raw] {
+            let mut rig = Rig::new(level);
+            for _ in 0..3 {
+                assert_eq!(rig.drain(), Damage::None, "{level:?}");
+            }
+        }
+    }
+
+    /// More than `flood_limit` events or rectangles degrade to `Unknown`
+    /// instead of a long tile list; the next quiet drain is trusted again.
+    #[test]
+    fn x11_a_flood_degrades_to_unknown_and_recovers() {
+        for level in [DamageReport::NonEmpty, DamageReport::Raw] {
+            let mut rig = Rig::new(level);
+            rig.m.flood_limit = 4;
+            // Distinct, non-touching rects so the server cannot merge them.
+            let rects: Vec<Rectangle> = (0..8).map(|i| rect(i * 40, i * 40, 4, 4)).collect();
+            rig.draw(&rects);
+            assert_eq!(rig.drain(), Damage::Unknown, "{level:?}");
+            rig.draw(&[rect(0, 0, 4, 4)]);
+            assert!(matches!(rig.drain(), Damage::Tiles(_)), "{level:?}");
+            assert_eq!(rig.drain(), Damage::None, "{level:?}");
+        }
+    }
+
+    /// A resize makes this drain and the next `Unknown`, then trust returns.
+    #[test]
+    fn x11_a_geometry_change_forces_unknown_for_two_drains() {
+        let mut rig = Rig::new(DamageReport::NonEmpty);
+        assert_eq!(rig.m.drain_damage(480, 512), Damage::Unknown);
+        assert_eq!(rig.m.drain_damage(480, 512), Damage::Unknown);
+        assert_eq!(rig.m.drain_damage(480, 512), Damage::None);
+        // And the bitmap carries the new grid.
+        rig.draw(&[rect(1, 1, 2, 2)]);
+        let Damage::Tiles(t) = rig.m.drain_damage(480, 512) else {
+            panic!("expected tiles");
+        };
+        assert!(t.matches(480, 512));
+    }
+
+    /// Re-arming starts from Unknown again: the first frame of a new client
+    /// is compared in full.
+    #[test]
+    fn x11_rearming_forces_unknown() {
+        let mut rig = Rig::new(DamageReport::NonEmpty);
+        rig.m.disarm();
+        rig.m.arm();
+        assert_eq!(rig.drain(), Damage::Unknown);
+        assert_eq!(rig.drain(), Damage::None);
+    }
 }
