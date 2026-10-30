@@ -135,6 +135,23 @@ pub fn login_with<T: Tailnet>(
     start_service(cfg, hold, env_notes, sys, out)
 }
 
+/// The by-hand advice for `cmd`, in one place for every exit that does not
+/// start the unit. With a `hold` it says why the start is withheld and what
+/// to fix first.
+fn advice(hold: Option<&str>, env_notes: bool, cmd: &str) -> String {
+    match hold {
+        None => format!("run: {cmd}"),
+        Some(why) => {
+            let fix = if env_notes {
+                "adding the Environment= lines (`systemctl --user edit ghostframe-server`)"
+            } else {
+                "fixing the state directory (see the warning above)"
+            };
+            format!("not starting {UNIT_NAME}: {why}.\n  After {fix}, run: {cmd}")
+        }
+    }
+}
+
 /// Enable and start the installed unit after a successful join. Never fails
 /// the login: the join worked, so a systemd problem is a warning.
 fn start_service(
@@ -145,54 +162,55 @@ fn start_service(
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let w = |e: std::io::Error| format!("writing output: {e}");
-    let start_by_hand = format!("systemctl --user start {UNIT_NAME}");
+    let full = format!("systemctl --user enable {UNIT_NAME} && systemctl --user start {UNIT_NAME}");
     let Some(home) = cfg.home() else {
         writeln!(
             out,
-            "HOME is unset, cannot locate the unit; if it is installed, run: \
-             systemctl --user enable {UNIT_NAME} && {start_by_hand}"
+            "HOME is unset, cannot locate the unit; if it is installed, {}",
+            advice(hold, env_notes, &full)
         )
         .map_err(w)?;
         return Ok(());
     };
     let paths = InstallPaths::new(std::path::Path::new(home));
     if !paths.unit_dir.join(UNIT_NAME).exists() {
-        writeln!(
-            out,
-            "{UNIT_NAME} is not installed; run `ghostframe-server install` to set it up"
-        )
-        .map_err(w)?;
-        return Ok(());
-    }
-    let by_hand =
-        format!("systemctl --user enable {UNIT_NAME} && systemctl --user start {UNIT_NAME}");
-    if !cfg.user_manager_possible() {
-        writeln!(
-            out,
-            "note: no user systemd manager reachable from this shell (XDG_RUNTIME_DIR unset), \
-             so {UNIT_NAME} was not started; from your desktop session run: {by_hand}"
-        )
-        .map_err(w)?;
-        return Ok(());
-    }
-    if let Some(why) = hold {
-        // Enable is harmless; starting would run a service that ignores this
-        // login. (A differing state dir: enable still follows the unit.)
-        let enabled = sys.user(&["enable", UNIT_NAME]);
-        let first = match (&enabled, env_notes) {
-            (Err(e), _) => format!("{e}\n  "),
-            (Ok(()), true) => "after adding the Environment= lines (`systemctl --user edit \
-                 ghostframe-server`), "
-                .to_string(),
-            (Ok(()), false) => String::new(),
+        let first = if env_notes {
+            " (add the Environment= lines first)"
+        } else {
+            ""
         };
         writeln!(
             out,
-            "not starting {UNIT_NAME}: {why}.\n  {first}run: {start_by_hand}"
+            "{UNIT_NAME} is not installed; run `ghostframe-server install` to set it up{first}"
         )
         .map_err(w)?;
         return Ok(());
     }
+    if !cfg.user_manager_possible() {
+        writeln!(
+            out,
+            "note: no user systemd manager reachable from this shell (XDG_RUNTIME_DIR unset), so nothing was started. \
+             In your desktop session: {}",
+            advice(hold, env_notes, &full)
+        )
+        .map_err(w)?;
+        return Ok(());
+    }
+    if hold.is_some() {
+        // Enable is harmless; starting would run a service that ignores this
+        // login. (A differing state dir: enable still follows the unit.)
+        let msg = match sys.user(&["enable", UNIT_NAME]) {
+            Ok(()) => advice(
+                hold,
+                env_notes,
+                &format!("systemctl --user start {UNIT_NAME}"),
+            ),
+            Err(e) => format!("{e}\n  {}", advice(hold, env_notes, &full)),
+        };
+        writeln!(out, "{msg}").map_err(w)?;
+        return Ok(());
+    }
+    let by_hand = full;
     // No daemon-reload: `install` wrote the unit and reloaded; login changes
     // no unit file.
     match sys
@@ -633,7 +651,7 @@ mod tests {
         let (r, out, rec) = run_full(true, true, None, (Some("other"), None), false, true);
         r.unwrap();
         assert_eq!(rec.calls, ["enable ghostframe-server.service"]);
-        assert!(out.contains("after adding the Environment= lines"), "{out}");
+        assert!(out.contains("After adding the Environment= lines"), "{out}");
         assert!(
             out.contains("systemctl --user edit ghostframe-server"),
             "{out}"
@@ -649,7 +667,46 @@ mod tests {
         let (r, out, rec) = run_full(true, true, None, (None, Some("http://other")), false, true);
         r.unwrap();
         assert_eq!(rec.calls, ["enable ghostframe-server.service"]);
-        assert!(out.contains("after adding the Environment= lines"), "{out}");
+        assert!(out.contains("After adding the Environment= lines"), "{out}");
+    }
+
+    #[test]
+    fn no_exit_leaks_an_unqualified_enable_and_start_under_a_hold() {
+        let bare = "systemctl --user enable ghostframe-server.service && ";
+        // No manager, HOME unset, unit missing: each with a mismatch and with a note.
+        for (installed, manager, home_set) in [(true, false, true), (true, true, false)] {
+            for (flags, differs) in [((None, None), true), ((Some("other"), None), false)] {
+                let (r, out, rec) = run_full(installed, manager, None, flags, differs, home_set);
+                r.unwrap();
+                assert!(rec.calls.is_empty(), "{:?}", rec.calls);
+                assert!(out.contains("not starting"), "{out}");
+                assert!(out.contains("After "), "{out}");
+                let after = out.split("After ").nth(1).unwrap();
+                assert!(after.contains(bare), "{out}");
+                assert!(!out.split("After ").next().unwrap().contains(bare), "{out}");
+            }
+        }
+        let (_, out, _) = run_full(false, true, None, (Some("other"), None), false, true);
+        assert!(out.contains("add the Environment= lines first"), "{out}");
+    }
+
+    #[test]
+    fn a_failing_enable_under_a_hold_names_enable_and_start() {
+        let (r, out, rec) = run_full(
+            true,
+            true,
+            Some("enable ghostframe-server.service"),
+            (Some("other"), None),
+            false,
+            true,
+        );
+        r.unwrap();
+        assert_eq!(rec.calls, ["enable ghostframe-server.service"]);
+        assert!(out.contains("After adding the Environment= lines"), "{out}");
+        assert!(
+            out.contains("enable ghostframe-server.service && systemctl --user start"),
+            "{out}"
+        );
     }
 
     #[test]
