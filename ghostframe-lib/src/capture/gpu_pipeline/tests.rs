@@ -1312,8 +1312,9 @@ fn dmabuf_real_cdf53_forward_gpu_matches_cpu_reference() {
 /// the daemon, which captures over X11 only and so routes
 /// `FrameSubmission.pixels` (a `Vec<u8>` of BGRA bytes from XGetImage)
 /// straight into `process_frame_from_pixels`. None of the previous
-/// gradient/lossless e2e tests exercise that path — they all use
-/// `--drm-direct` which goes through the DMA-BUF import. A symptom seen
+/// gradient/lossless e2e tests exercised that path — they all used
+/// `--drm-direct`, which goes through the DMA-BUF import (the e2e tests now
+/// use `--x11-sink` and the CPU path, as production does). A symptom seen
 /// in the field (canvas pitch-black despite the X-side capture having
 /// the correct pixels and the encoder firing) matched the shape of an
 /// `import_pixels` upload silently filling the staging image with
