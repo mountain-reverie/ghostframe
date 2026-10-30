@@ -69,7 +69,7 @@ The crate and binary are renamed `ghostframe-server` (`ghostframe-xdaemon/` →
 |---|---|
 | `install [--force] [--max-resolution WxH\|none]` | See 3.1. |
 | `uninstall` | Disable and remove the unit, the autostart file and `~/.local/bin/ghostframe-server`. Keeps the tailnet state (owned by `logout`). |
-| `login [--hostname H] [--control-url U]` | Bring the tsnet node up, print the sign-in URL, wait until the node is authorized, exit 0. With `TS_AUTHKEY` set, authorize non-interactively (no URL). Replaces `--init`. |
+| `login [--hostname H] [--control-url U]` | Bring the tsnet node up, print the sign-in URL, wait until the node is authorized, exit 0. Then, with the state lock released, `enable` and `start` the installed unit (warn, still exit 0, if that fails; skip the start, with the command to run by hand, when the service would not see this login: a differing state dir, or `--hostname`/`--control-url` the unit does not carry; only a hint when the unit is not installed). With `TS_AUTHKEY` set, authorize non-interactively (no URL). Replaces `--init`. |
 | `logout` | Deregister the node from the control server and delete the state directory. |
 | `capture` | The daemon (section 4). Exits with code 2 and "run `ghostframe-server login`" if the state is not seeded. If `WAYLAND_DISPLAY` is set (whatever `DISPLAY` is: the unit hard-codes `DISPLAY=:0`), exits 2 with a clear "Wayland sessions are not supported yet" error; `install` warns about it. |
 
@@ -110,8 +110,8 @@ Defaults are unchanged: hostname `$(hostname)-ghostframe`, state directory
    with the command to remove them, never touched.
 6. `systemctl --user daemon-reload`, then `enable` the unit. If the state is
    seeded, also (re)start it, so the new binary replaces a running one. If it is
-   unseeded, do not start it; print "run `ghostframe-server login`, then
-   `systemctl --user start ghostframe-server`".
+   unseeded, do not start it; print "run `ghostframe-server login` (it starts the
+   service)".
 7. If no LightDM autologin for this user is detected, print the one root step
    needed for unattended boot. This is informational and does not fail.
 
