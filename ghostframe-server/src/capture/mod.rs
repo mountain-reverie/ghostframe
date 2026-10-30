@@ -94,6 +94,22 @@ pub trait Backend {
     }
 }
 
+/// One capture tick: the damage first, then the grab.
+///
+/// The order is the correctness argument. Draining subtracts the damage
+/// region; anything drawn after that is reported again next tick, so a draw
+/// racing the grab is at worst grabbed early and repeated. Reversed, a draw
+/// between the grab and the subtract is consumed by this tick's report while
+/// missing from this tick's pixels, and nothing reports it again.
+pub fn damage_then_grab<B: Backend + ?Sized>(
+    backend: &mut B,
+    timestamp_us: u32,
+) -> (Damage, std::io::Result<FrameSubmission>) {
+    let damage = backend.drain_damage();
+    let frame = backend.capture(timestamp_us);
+    (damage, frame)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

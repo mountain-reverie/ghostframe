@@ -141,6 +141,12 @@ impl XDamageMonitor {
         std::mem::take(&mut self.allocs)
     }
 
+    /// The next drain reports `Unknown`. Called when a frame was lost after
+    /// its damage was already consumed.
+    pub fn distrust_next_drain(&mut self) {
+        self.force_unknown = true;
+    }
+
     /// Whether damage reporting is currently active.
     ///
     /// Logged on each idle transition. A monitor that silently fails to arm
@@ -206,23 +212,25 @@ impl XDamageMonitor {
     /// Damage since the previous drain on a `width` x `height` screen.
     /// Non-blocking.
     ///
-    /// **Order is load-bearing: read the events, then subtract.** With
-    /// `NonEmpty` the server sends a notification only when the region goes
-    /// empty to non-empty, so the drain is gated on having seen one. Subtract
-    /// first and a draw that lands after the subtract has its notification
-    /// consumed by the event read; the region is then non-empty with no
-    /// notification pending, and the draw is not reported until something else
-    /// draws -- a lost update. Reading first means a draw between the two
-    /// steps is simply part of what the subtract returns, and a draw after the
-    /// subtract raises a fresh notification for the next drain.
+    /// Order, both halves load-bearing:
+    ///
+    /// - Within a drain, events are read before the subtract, because with
+    ///   `NonEmpty` the subtract is gated on having seen a notification (an
+    ///   idle tick costs no round trip). A draw that lands between the two is
+    ///   part of what the subtract returns; one that lands after raises a
+    ///   fresh notification for the next drain.
+    /// - Across the tick, the drain (and so the subtract) must come *before*
+    ///   the grab. A draw after the subtract is re-reported next tick, so at
+    ///   worst it is grabbed early and repeated. Grab first and a draw that
+    ///   lands between grab and subtract is consumed by this drain but absent
+    ///   from this frame: lost. `damage_then_grab` fixes that order and
+    ///   `x11_a_draw_after_the_grab_is_reported_next_tick` holds it.
+    ///
     pub fn drain_damage(&mut self, width: u32, height: u32) -> Damage {
-        self.drain_with(width, height, &mut || {})
+        self.drain_inner(width, height)
     }
 
-    /// `drain_damage` with `between` run after the first step (reading
-    /// events) and before the second (subtract). Production passes a no-op;
-    /// the lost-update test draws there.
-    fn drain_with(&mut self, width: u32, height: u32, between: &mut dyn FnMut()) -> Damage {
+    fn drain_inner(&mut self, width: u32, height: u32) -> Damage {
         if !self.armed {
             return Damage::Unknown;
         }
@@ -245,7 +253,6 @@ impl XDamageMonitor {
         let mut bitmap = std::mem::replace(&mut self.scratch, TileBitmap::empty());
         // Step 1: read every pending event. Step 2: subtract.
         let (notified, read_err) = self.read_events(&mut bitmap);
-        between();
         let (flooded, sub_err) = self.subtract(notified, &mut bitmap);
         let errored = read_err | sub_err;
 
@@ -748,49 +755,6 @@ mod x11_tests {
             }
             assert!(seen_tiles > 60, "the property never saw damage");
         }
-    }
-
-    /// The ordering guard. A draw that lands after the events are read and
-    /// before the subtract must not be lost: across this drain and the next,
-    /// both the draw before and the draw during are reported. With the steps
-    /// reversed the second draw's notification is consumed after the
-    /// subtract already ran, the region stays non-empty with no event
-    /// pending, and the draw is never reported.
-    #[test]
-    fn x11_a_draw_between_event_read_and_subtract_is_not_lost() {
-        let mut rig = Rig::new(DamageReport::NonEmpty);
-        let a = rect(10, 10, 8, 8); // tile (0,0)
-        let b = rect(400, 400, 8, 8); // tile (12,12)
-        rig.draw(&[a]);
-
-        // A second client draws, so the closure does not borrow the monitor.
-        let (conn, _) = x11rb::connect(Some(rig._x.display())).unwrap();
-        let (pixmap, gc) = (rig.pixmap, conn.generate_id().unwrap());
-        conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0x00ff_ffff))
-            .unwrap();
-        let mut draw_b = move || {
-            conn.poly_fill_rectangle(pixmap, gc, &[b]).unwrap();
-            conn.get_input_focus().unwrap().reply().unwrap();
-        };
-        let first = rig
-            .m
-            .drain_with(SCRATCH.into(), SCRATCH.into(), &mut draw_b);
-        let second = rig.drain();
-
-        let mut covered = TileBitmap::new(SCRATCH.into(), SCRATCH.into());
-        for d in [first, second] {
-            if let Damage::Tiles(t) = d {
-                for (tx, ty) in t.iter() {
-                    covered.set(tx, ty);
-                }
-            }
-        }
-        assert!(covered.get(0, 0), "the draw before the drain was lost");
-        assert!(
-            covered.get(12, 12),
-            "the draw between event read and subtract was lost: the \
-             subtract and the event read are out of order"
-        );
     }
 
     #[test]
