@@ -42,7 +42,7 @@ pub const DEFAULT_RANDR_SETTLE_MS: u64 = 5000;
 
 /// Which XDamage report level the X11 backend asks for
 /// (`GHOSTFRAME_DAMAGE_REPORT`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DamageReport {
     /// `NonEmpty` + `DamageSubtract(parts)` + `FetchRegion`: at most one event
     /// per tick, the server coalesces the rectangles. The default.
