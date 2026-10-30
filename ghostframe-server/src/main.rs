@@ -267,4 +267,25 @@ mod tests {
         // The e2e container runs capture as root.
         assert!(refuse_root_for(&Command::Capture, 0).is_ok());
     }
+
+    #[test]
+    fn the_state_dir_check_returns_true_exactly_when_it_warns() {
+        // No XDG_RUNTIME_DIR, so no systemctl is ever asked.
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path().to_string_lossy().into_owned();
+        let other = home.path().join("elsewhere").to_string_lossy().into_owned();
+        let cfg = |extra: Option<&str>| {
+            let (h, extra) = (h.clone(), extra.map(str::to_string));
+            config::ServerConfig::from_lookup(
+                move |k| match k {
+                    "HOME" => Some(h.clone()),
+                    "TS_STATE_DIR" => extra.clone(),
+                    _ => None,
+                },
+                Some("host".into()),
+            )
+        };
+        assert!(warn_if_login_state_dir_differs(&cfg(Some(&other))));
+        assert!(!warn_if_login_state_dir_differs(&cfg(None)));
+    }
 }
