@@ -114,7 +114,9 @@ impl super::Backend for X11Backend {
     }
 
     fn capture(&mut self, timestamp_us: u32) -> io::Result<FrameSubmission> {
-        self.frames.capture(timestamp_us)
+        let frame = self.frames.capture(timestamp_us);
+        distrust_after_failed_capture(&frame, self.damage.as_mut());
+        frame
     }
 
     fn arm_damage(&mut self) {
@@ -159,6 +161,20 @@ impl super::Backend for X11Backend {
         let drained = d.drain_damage(w, h);
         self.stats.allocs += d.take_allocs();
         merge_cursor_damage(drained, &cursor_tiles, (w, h), &mut self.stats)
+    }
+}
+
+/// A failed grab loses the tick's damage: the drain before it already
+/// consumed the region and no frame carried it away. The next drain must not
+/// claim to know what changed.
+fn distrust_after_failed_capture<T>(
+    frame: &io::Result<T>,
+    damage: Option<&mut damage::XDamageMonitor>,
+) {
+    if frame.is_err() {
+        if let Some(d) = damage {
+            d.distrust_next_drain();
+        }
     }
 }
 
@@ -352,6 +368,142 @@ mod tests {
             panic!("a new cursor image in the same place went unnoticed");
         };
         assert!(t.get(3, 2), "the cursor's tile is missing from {t:?}");
+    }
+
+    /// A backend that draws on the root right after every grab, standing in
+    /// for an application that paints while the frame is being processed.
+    struct DrawsAfterGrab {
+        inner: X11Backend,
+        conn: x11rb::rust_connection::RustConnection,
+        root: u32,
+        gc: u32,
+        next: Vec<Rectangle>,
+    }
+
+    impl crate::capture::Backend for DrawsAfterGrab {
+        fn input_injector(&self) -> Option<Arc<dyn InputInjector>> {
+            None
+        }
+        fn display_controller(&self) -> Option<Arc<dyn DisplayController>> {
+            None
+        }
+        fn capture(&mut self, ts: u32) -> io::Result<FrameSubmission> {
+            let frame = self.inner.capture(ts);
+            if let Some(r) = self.next.pop() {
+                self.conn
+                    .poly_fill_rectangle(self.root, self.gc, &[r])
+                    .unwrap();
+                self.conn.get_input_focus().unwrap().reply().unwrap();
+            }
+            frame
+        }
+        fn arm_damage(&mut self) {
+            self.inner.arm_damage()
+        }
+        fn disarm_damage(&mut self) {
+            self.inner.disarm_damage()
+        }
+        fn damage_armed(&self) -> bool {
+            self.inner.damage_armed()
+        }
+        fn drain_damage(&mut self) -> Damage {
+            self.inner.drain_damage()
+        }
+    }
+
+    /// The tick order is the lost-update guard: a draw after the grab must be
+    /// reported by the next tick's damage. Run the real tick function; with
+    /// the grab before the drain, the draw is consumed by the same tick's
+    /// report (which belongs to a frame that never showed it) and the next
+    /// tick reports nothing.
+    #[test]
+    fn x11_a_draw_after_the_grab_is_reported_next_tick() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "256x256x24"]);
+        let d = x.display();
+        let (conn, n) = x11rb::connect(Some(d)).unwrap();
+        let root = conn.setup().roots[n].root;
+        let gc = conn.generate_id().unwrap();
+        conn.create_gc(gc, root, &CreateGCAux::new().foreground(0xffffff))
+            .unwrap();
+        // Distinct tiles, none under the (hidden) cursor at the origin.
+        let draws = vec![
+            Rectangle {
+                x: 200,
+                y: 40,
+                width: 6,
+                height: 6,
+            },
+            Rectangle {
+                x: 100,
+                y: 200,
+                width: 6,
+                height: 6,
+            },
+            Rectangle {
+                x: 40,
+                y: 100,
+                width: 6,
+                height: 6,
+            },
+        ];
+        let mut b = DrawsAfterGrab {
+            inner: X11Backend {
+                frames: frames::X11Frames::connect(Some(d), None).unwrap(),
+                damage: damage::XDamageMonitor::new(Some(d), crate::config::DamageReport::NonEmpty),
+                input: None,
+                display: None,
+                stats: Default::default(),
+            },
+            conn,
+            root,
+            gc,
+            next: draws.clone().into_iter().rev().collect(),
+        };
+        b.arm_damage();
+        // Tick 0 is Unknown by design; it grabs, then a draw lands.
+        let (d0, f0) = crate::capture::damage_then_grab(&mut b, 0);
+        f0.unwrap();
+        assert_eq!(d0, Damage::Unknown);
+
+        let mut reported_after_draw = 0;
+        for (i, prev) in draws.iter().enumerate() {
+            let (dmg, frame) = crate::capture::damage_then_grab(&mut b, i as u32 + 1);
+            frame.unwrap();
+            let Damage::Tiles(t) = dmg else {
+                panic!(
+                    "tick {}: the draw after the previous grab was lost: {dmg:?}",
+                    i + 1
+                );
+            };
+            // The rectangle drawn after the previous tick's grab.
+            assert!(
+                t.get(prev.x as u32 / 32, prev.y as u32 / 32),
+                "tick {}: draw {prev:?} not reported by the next tick: {t:?}",
+                i + 1
+            );
+            reported_after_draw += 1;
+        }
+        assert_eq!(reported_after_draw, 3, "the loop body never ran");
+    }
+
+    #[test]
+    fn x11_a_failed_capture_makes_the_next_drain_unknown() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "256x256x24"]);
+        let mut m =
+            damage::XDamageMonitor::new(Some(x.display()), crate::config::DamageReport::NonEmpty)
+                .unwrap();
+        m.arm();
+        assert_eq!(m.drain_damage(256, 256), Damage::Unknown); // just armed
+        assert_eq!(m.drain_damage(256, 256), Damage::None);
+
+        // A good grab changes nothing.
+        distrust_after_failed_capture(&Ok(()), Some(&mut m));
+        assert_eq!(m.drain_damage(256, 256), Damage::None);
+        // A failed one does.
+        let failed: io::Result<()> = Err(io::Error::other("grab failed"));
+        distrust_after_failed_capture(&failed, Some(&mut m));
+        assert_eq!(m.drain_damage(256, 256), Damage::Unknown);
+        assert_eq!(m.drain_damage(256, 256), Damage::None, "one drain only");
     }
 
     #[test]
