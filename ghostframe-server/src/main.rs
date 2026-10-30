@@ -67,8 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             hostname,
             control_url,
         } => {
-            warn_if_login_state_dir_differs(&cfg);
-            commands::login::login(&cfg, hostname, control_url)
+            let differs = warn_if_login_state_dir_differs(&cfg);
+            commands::login::login(&cfg, hostname, control_url, differs)
         }
         Command::Logout {
             hostname,
@@ -198,9 +198,9 @@ fn refuse_root_for(command: &Command, euid: u32) -> Result<(), String> {
 /// to ask) the comparison is against the manager's own view, as `install`
 /// reads it; otherwise against the directory the unit would use, which
 /// differs from this shell's only through `TS_STATE_DIR`.
-fn warn_if_login_state_dir_differs(cfg: &config::ServerConfig) {
+fn warn_if_login_state_dir_differs(cfg: &config::ServerConfig) -> bool {
     let (Some(home), Ok(login_dir)) = (cfg.home(), cfg.state_dir()) else {
-        return;
+        return false;
     };
     let home = std::path::Path::new(home);
     let installed = commands::install::InstallPaths::new(home)
@@ -216,14 +216,16 @@ fn warn_if_login_state_dir_differs(cfg: &config::ServerConfig) {
         Some(d) => (d, true),
         None => match cfg.unit_state_dir(home) {
             Ok(d) => (d, false),
-            Err(_) => return,
+            Err(_) => return false,
         },
     };
     if let Some(w) =
         commands::install::state_dir_mismatch_warning(&login_dir, &unit_dir, from_manager)
     {
         eprintln!("{w}");
+        return true;
     }
+    false
 }
 
 /// `login`, `logout` and `capture` refuse while the old xdaemon is installed or active.

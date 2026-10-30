@@ -70,7 +70,7 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
             eprintln!(
                 "error: this node has not joined a tailnet yet ({state_dir:?} holds no \
                  completed join; tsnet's own tailscaled.state does not count).\n\
-                 run `ghostframe-server login`, then `systemctl --user start ghostframe-server`"
+                 run `ghostframe-server login` (it starts the service)"
             );
             std::process::exit(2);
         }

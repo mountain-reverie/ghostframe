@@ -720,7 +720,7 @@ pub fn install(
             out,
             format!(
                 "service: enabled {UNIT_NAME}, not started: this node has not joined a tailnet.\n  \
-                 run `ghostframe-server login`, then `systemctl --user start ghostframe-server`.\n  \
+                 run `ghostframe-server login` (it starts the service).\n  \
                  Do not run `login` while the old ghostframe-xdaemon is still up: both would use \
                  one tailnet state directory."
             ),

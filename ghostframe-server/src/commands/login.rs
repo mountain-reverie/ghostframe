@@ -60,11 +60,13 @@ pub fn login(
     cfg: &ServerConfig,
     hostname: Option<String>,
     control_url: Option<String>,
+    state_dir_differs: bool,
 ) -> Result<(), String> {
     login_with(
         cfg,
         hostname,
         control_url,
+        state_dir_differs,
         GhostbridgeHandle::connect,
         &mut RealSystemctl,
         &mut std::io::stdout(),
@@ -115,25 +117,42 @@ pub fn login_with<T: Tailnet>(
     cfg: &ServerConfig,
     hostname: Option<String>,
     control_url: Option<String>,
+    state_dir_differs: bool,
     connect: impl FnOnce(&GhostbridgeConfig) -> Result<T, GhostbridgeError>,
     sys: &mut dyn Systemctl,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     // The lock and the tsnet handle live (and die) inside `join`: the
     // service needs both free to start.
-    join(cfg, hostname, control_url, connect, out)?;
-    start_service(cfg, sys, out)
+    let env_notes = join(cfg, hostname, control_url, connect, out)?;
+    let hold = if state_dir_differs {
+        Some("the service will not see this login (it reads a different state directory, see the warning above)")
+    } else if env_notes {
+        Some("the service would register differently from this login")
+    } else {
+        None
+    };
+    start_service(cfg, hold, env_notes, sys, out)
 }
 
 /// Enable and start the installed unit after a successful join. Never fails
 /// the login: the join worked, so a systemd problem is a warning.
 fn start_service(
     cfg: &ServerConfig,
+    hold: Option<&str>,
+    env_notes: bool,
     sys: &mut dyn Systemctl,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let w = |e: std::io::Error| format!("writing output: {e}");
+    let start_by_hand = format!("systemctl --user start {UNIT_NAME}");
     let Some(home) = cfg.home() else {
+        writeln!(
+            out,
+            "HOME is unset, cannot locate the unit; if it is installed, run: \
+             systemctl --user enable {UNIT_NAME} && {start_by_hand}"
+        )
+        .map_err(w)?;
         return Ok(());
     };
     let paths = InstallPaths::new(std::path::Path::new(home));
@@ -156,13 +175,35 @@ fn start_service(
         .map_err(w)?;
         return Ok(());
     }
+    if let Some(why) = hold {
+        // Enable is harmless; starting would run a service that ignores this
+        // login. (A differing state dir: enable still follows the unit.)
+        let enabled = sys.user(&["enable", UNIT_NAME]);
+        let first = match (&enabled, env_notes) {
+            (Err(e), _) => format!("{e}\n  "),
+            (Ok(()), true) => "after adding the Environment= lines (`systemctl --user edit \
+                 ghostframe-server`), "
+                .to_string(),
+            (Ok(()), false) => String::new(),
+        };
+        writeln!(
+            out,
+            "not starting {UNIT_NAME}: {why}.\n  {first}run: {start_by_hand}"
+        )
+        .map_err(w)?;
+        return Ok(());
+    }
     // No daemon-reload: `install` wrote the unit and reloaded; login changes
     // no unit file.
     match sys
         .user(&["enable", UNIT_NAME])
         .and_then(|()| sys.user(&["start", UNIT_NAME]))
     {
-        Ok(()) => writeln!(out, "enabled and started {UNIT_NAME}").map_err(w)?,
+        Ok(()) => writeln!(
+            out,
+            "enabled and started {UNIT_NAME} (check: systemctl --user status ghostframe-server)"
+        )
+        .map_err(w)?,
         Err(e) => writeln!(
             out,
             "warning: logged in, but {UNIT_NAME} could not be enabled and started: {e}\n  \
@@ -180,7 +221,7 @@ fn join<T: Tailnet>(
     control_url: Option<String>,
     connect: impl FnOnce(&GhostbridgeConfig) -> Result<T, GhostbridgeError>,
     out: &mut dyn Write,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let dir = cfg.state_dir()?;
     crate::util::ensure_private_dir(&dir)?;
     let _lock = StateLock::acquire(&dir).map_err(|e| e.to_string())?;
@@ -225,7 +266,9 @@ fn join<T: Tailnet>(
     // anything `login` stores. Say so when they differ, or the next start
     // renames the node or talks to another control server. `logout` needs
     // the same values to reach the right control server.
+    let mut env_notes = false;
     if hostname.is_some_and(|h| h != cfg.ts_hostname) {
+        env_notes = true;
         writeln!(
             out,
             "note: the service registers as {:?} unless its unit sets TS_HOSTNAME; \
@@ -236,6 +279,7 @@ fn join<T: Tailnet>(
         .map_err(w)?;
     }
     if control_url.is_some_and(|u| u != cfg.ts_control_url) {
+        env_notes = true;
         writeln!(
             out,
             "note: the service uses the default control server unless its unit sets \
@@ -246,7 +290,7 @@ fn join<T: Tailnet>(
         )
         .map_err(w)?;
     }
-    Ok(())
+    Ok(env_notes)
 }
 
 /// Deregister the node from the control server, then delete the state
@@ -456,6 +500,7 @@ mod tests {
             cfg,
             hostname.map(Into::into),
             control.map(Into::into),
+            false,
             |c: &GhostbridgeConfig| {
                 *seen.borrow_mut() = Some(GhostbridgeConfig {
                     hostname: c.hostname.clone(),
@@ -523,9 +568,25 @@ mod tests {
         manager: bool,
         fail_on: Option<&str>,
     ) -> (Result<(), String>, String, Rec) {
+        run_full(installed, manager, fail_on, (None, None), false, true)
+    }
+
+    /// `run_service` with the `--hostname`/`--control-url` flags, the
+    /// state-dir mismatch flag, and whether `HOME` is set.
+    fn run_full(
+        installed: bool,
+        manager: bool,
+        fail_on: Option<&str>,
+        flags: (Option<&str>, Option<&str>),
+        differs: bool,
+        home_set: bool,
+    ) -> (Result<(), String>, String, Rec) {
         let home = tempfile::tempdir().unwrap();
         let h = home.path().to_string_lossy().into_owned();
-        let mut env = vec![("HOME", h.as_str())];
+        let mut env = Vec::new();
+        if home_set {
+            env.push(("HOME", h.as_str()));
+        }
         if manager {
             env.push(("XDG_RUNTIME_DIR", h.as_str()));
         }
@@ -544,13 +605,66 @@ mod tests {
         let mut out = Vec::new();
         let r = login_with(
             &cfg,
-            None,
-            None,
+            flags.0.map(Into::into),
+            flags.1.map(Into::into),
+            differs,
             |_: &GhostbridgeConfig| Ok(&f),
             &mut rec,
             &mut out,
         );
         (r, String::from_utf8(out).unwrap(), rec)
+    }
+
+    #[test]
+    fn a_state_dir_mismatch_enables_but_never_starts() {
+        let (r, out, rec) = run_full(true, true, None, (None, None), true, true);
+        r.unwrap();
+        assert_eq!(rec.calls, ["enable ghostframe-server.service"]);
+        assert!(out.contains("not starting"), "{out}");
+        assert!(out.contains("will not see this login"), "{out}");
+        assert!(
+            out.contains("run: systemctl --user start ghostframe-server.service"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_hostname_note_enables_but_never_starts() {
+        let (r, out, rec) = run_full(true, true, None, (Some("other"), None), false, true);
+        r.unwrap();
+        assert_eq!(rec.calls, ["enable ghostframe-server.service"]);
+        assert!(out.contains("after adding the Environment= lines"), "{out}");
+        assert!(
+            out.contains("systemctl --user edit ghostframe-server"),
+            "{out}"
+        );
+        assert!(
+            out.contains("run: systemctl --user start ghostframe-server.service"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_control_url_note_enables_but_never_starts() {
+        let (r, out, rec) = run_full(true, true, None, (None, Some("http://other")), false, true);
+        r.unwrap();
+        assert_eq!(rec.calls, ["enable ghostframe-server.service"]);
+        assert!(out.contains("after adding the Environment= lines"), "{out}");
+    }
+
+    #[test]
+    fn an_unset_home_prints_the_by_hand_line() {
+        let (r, out, rec) = run_full(true, true, None, (None, None), false, false);
+        r.unwrap();
+        assert!(rec.calls.is_empty());
+        assert!(
+            out.contains("HOME is unset, cannot locate the unit"),
+            "{out}"
+        );
+        assert!(
+            out.contains("systemctl --user start ghostframe-server.service"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -566,7 +680,7 @@ mod tests {
         );
         assert_eq!(rec.lock_free, [true, true], "lock still held");
         assert!(
-            out.contains("enabled and started ghostframe-server.service"),
+            out.contains("enabled and started ghostframe-server.service (check: systemctl --user status ghostframe-server)"),
             "{out}"
         );
     }
@@ -630,6 +744,7 @@ mod tests {
             &cfg,
             None,
             None,
+            false,
             |_: &GhostbridgeConfig| Ok(&f),
             &mut rec,
             &mut Vec::new(),
