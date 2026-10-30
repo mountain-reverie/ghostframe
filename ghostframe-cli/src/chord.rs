@@ -60,6 +60,16 @@ impl Chord {
         }
     }
 
+    /// Forget every held modifier and any struck prefix. For focus loss:
+    /// the releases of keys held then go to another window, so the state
+    /// tracked from this window's key stream is stale.
+    pub fn reset(&mut self) {
+        self.ctrl_held = false;
+        self.alt_held = false;
+        self.super_held = false;
+        self.armed = false;
+    }
+
     /// Feed one key event (press or release) into the state machine.
     ///
     /// Returns the action the caller should take: forward the event as
