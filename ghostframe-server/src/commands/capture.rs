@@ -251,10 +251,9 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
         let sample_cpu = cost_trace && (frame_count + 1).is_multiple_of(heartbeat_every);
         let cpu_start = if sample_cpu { thread_cpu_us() } else { 0 };
 
-        let damage = backend.drain_damage();
-
         let timestamp_us = (frame_count * frame_interval.as_micros() as u64) as u32;
-        let submission = match backend.capture(timestamp_us) {
+        let (damage, grabbed) = crate::capture::damage_then_grab(&mut backend, timestamp_us);
+        let submission = match grabbed {
             Ok(mut frame) => {
                 // A bitmap built for another screen size says nothing about
                 // this frame: the resize happened between drain and grab.
