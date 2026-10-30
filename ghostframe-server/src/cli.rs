@@ -20,8 +20,10 @@ pub enum Command {
         #[arg(long)]
         force: bool,
         /// Largest resolution a client may set, `WIDTHxHEIGHT`, or `none`.
-        #[arg(long, value_name = "WxH|none", default_value = "1920x1080", value_parser = parse_max_resolution)]
-        max_resolution: MaxResolution,
+        /// Without it a reinstall keeps the installed unit's setting; a first
+        /// install uses 1920x1080.
+        #[arg(long, value_name = "WxH|none", value_parser = parse_max_resolution)]
+        max_resolution: Option<MaxResolution>,
     },
     /// Remove what `install` wrote. Keeps the tailnet state (see `logout`).
     Uninstall,
@@ -118,19 +120,21 @@ mod tests {
     }
 
     #[test]
-    fn install_defaults_to_1080p_and_takes_none() {
+    fn install_leaves_the_cap_unset_unless_given_and_takes_none() {
+        // Absent means "keep the installed unit's, else 1920x1080": decided
+        // at install time, not here.
         assert_eq!(
             parse(&["install"]).unwrap(),
             Command::Install {
                 force: false,
-                max_resolution: MaxResolution::Limit(1920, 1080)
+                max_resolution: None
             }
         );
         assert_eq!(
             parse(&["install", "--force", "--max-resolution", "none"]).unwrap(),
             Command::Install {
                 force: true,
-                max_resolution: MaxResolution::Unlimited
+                max_resolution: Some(MaxResolution::Unlimited)
             }
         );
         assert_eq!(parse(&["uninstall"]).unwrap(), Command::Uninstall);

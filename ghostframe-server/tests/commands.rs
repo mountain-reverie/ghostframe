@@ -85,21 +85,27 @@ fn capture_without_login_exits_2_and_says_to_log_in() {
 }
 
 #[test]
-fn capture_refuses_a_wayland_only_session() {
-    let state = private_dir();
-    let out = run(
-        &["capture"],
-        &[
+fn capture_refuses_a_wayland_session_with_or_without_display() {
+    // The second case is what the installed unit produces: it hard-codes
+    // DISPLAY=:0, so DISPLAY is set on a Wayland session too.
+    for display in [None, Some(Path::new(":0"))] {
+        let state = private_dir();
+        let mut env = vec![
             ("TS_STATE_DIR", state.path()),
             ("WAYLAND_DISPLAY", Path::new("wayland-0")),
-        ],
-    );
-    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
-    assert!(
-        stderr(&out).contains("Wayland sessions are not supported yet"),
-        "{}",
-        stderr(&out)
-    );
+        ];
+        if let Some(d) = display {
+            env.push(("DISPLAY", d));
+        }
+        let out = run(&["capture"], &env);
+        assert_eq!(out.status.code(), Some(2), "{display:?}: {}", stderr(&out));
+        let err = stderr(&out);
+        assert!(
+            err.contains("Wayland sessions are not supported yet")
+                && err.contains("unset-environment"),
+            "{display:?}: {err}"
+        );
+    }
 }
 
 #[test]
@@ -184,7 +190,7 @@ fn help_lists_every_command() {
 }
 
 #[test]
-fn login_and_capture_refuse_while_the_old_xdaemon_unit_exists() {
+fn login_logout_and_capture_refuse_while_the_old_xdaemon_unit_exists() {
     // A temporary HOME holding the old unit file; the file check needs no
     // systemctl (XDG_RUNTIME_DIR is unset, so none is asked).
     let home = tempfile::tempdir().unwrap();
@@ -194,7 +200,7 @@ fn login_and_capture_refuse_while_the_old_xdaemon_unit_exists() {
     std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
     std::fs::write(&unit, b"[Service]\n").unwrap();
     let state = private_dir();
-    for cmd in ["login", "capture"] {
+    for cmd in ["login", "logout", "capture"] {
         let out = run(
             &[cmd],
             &[("HOME", home.path()), ("TS_STATE_DIR", state.path())],
@@ -214,4 +220,84 @@ fn login_and_capture_refuse_while_the_old_xdaemon_unit_exists() {
         &[("HOME", home.path()), ("TS_STATE_DIR", state.path())],
     );
     assert!(!stderr(&out).contains("install` first"), "{}", stderr(&out));
+}
+
+#[test]
+fn login_warns_when_the_shell_would_write_a_state_dir_the_service_does_not_read() {
+    // A held lock stops login right after the warning, before any network.
+    let home = tempfile::tempdir().unwrap();
+    let state = private_dir();
+    let _held = hold_lock(state.path());
+    let out = run(
+        &["login"],
+        &[("HOME", home.path()), ("TS_STATE_DIR", state.path())],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    let unit_dir = home.path().join(".local/state/ghostframe");
+    assert!(
+        err.contains("the installed service reads")
+            && err.contains(&unit_dir.display().to_string()),
+        "{err}"
+    );
+}
+
+/// An Xvfb whose root is 16 bpp: a session that can never be captured.
+struct Xvfb16 {
+    child: std::process::Child,
+    display: String,
+}
+
+impl Xvfb16 {
+    fn spawn() -> Self {
+        use std::io::{BufRead, BufReader};
+        let mut child = Command::new("Xvfb")
+            .args(["-displayfd", "1", "-nolisten", "tcp", "-noreset"])
+            .args(["-screen", "0", "64x48x16"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn Xvfb");
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let n: u32 = line.trim().parse().expect("Xvfb display number");
+        Self {
+            child,
+            display: format!(":{n}"),
+        }
+    }
+}
+
+impl Drop for Xvfb16 {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn capture_on_a_16_bit_root_exits_2_so_the_unit_does_not_restart_loop() {
+    let x = Xvfb16::spawn();
+    let state = private_dir();
+    // A non-empty key skips the "not logged in" exit; the backend is
+    // connected before anything touches the network.
+    let out = Command::new(env!("CARGO_BIN_EXE_ghostframe-server"))
+        .arg("capture")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("TS_CONTROL_URL", "http://127.0.0.1:1")
+        .env("TS_AUTHKEY", "tskey-unused")
+        .env("TS_STATE_DIR", state.path())
+        .env("DISPLAY", &x.display)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run capture");
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("root depth is 16"),
+        "{}",
+        stderr(&out)
+    );
 }
