@@ -1,5 +1,7 @@
 //! The X11 backend: full-root frames, XDamage, XTest input and RandR.
 
+#[cfg(test)]
+pub(crate) mod baseline;
 pub mod cvt;
 pub mod damage;
 pub mod display;
@@ -26,6 +28,8 @@ pub struct X11Backend {
     damage: Option<damage::XDamageMonitor>,
     input: Option<Arc<dyn InputInjector>>,
     display: Option<Arc<dyn DisplayController>>,
+    /// Allocations of `drain_damage` (the frames own theirs).
+    stats: crate::capture::tick_stats::TickStats,
 }
 
 impl X11Backend {
@@ -91,6 +95,7 @@ impl X11Backend {
             damage,
             input,
             display,
+            stats: Default::default(),
         })
     }
 }
@@ -129,6 +134,12 @@ impl super::Backend for X11Backend {
     /// The lib's GPU path does not consume these hints today (only the CPU
     /// comparison in `process_frame_cpu_at` reads `damage_tiles`); the cursor
     /// merge is here for the day it does.
+    fn take_tick_stats(&mut self) -> crate::capture::tick_stats::TickStats {
+        let mut s = std::mem::take(&mut self.stats);
+        s.add(self.frames.take_stats());
+        s
+    }
+
     fn drain_damage(&mut self) -> Option<Vec<(u32, u32)>> {
         // The cursor is blended into every frame but X reports no damage for
         // it. Poll it on every drain (it is also the cursor `capture` then
@@ -139,8 +150,11 @@ impl super::Backend for X11Backend {
         // An empty drain means no damage events since the last call, but the
         // first frame for a newly connected client must still be compared in
         // full, so empty maps to `None` ("check every tile").
-        let tiles = self.damage.as_ref()?.drain_damage();
-        merge_cursor_damage(tiles, cursor_tiles)
+        let tiles = self.damage.as_ref()?.drain_damage_counted(&mut self.stats);
+        if cursor_tiles.capacity() > 0 {
+            self.stats.alloc();
+        }
+        merge_cursor_damage(tiles, cursor_tiles, &mut self.stats)
     }
 }
 
@@ -151,15 +165,25 @@ impl super::Backend for X11Backend {
 fn merge_cursor_damage(
     mut damage: Vec<(u32, u32)>,
     cursor: Vec<(u32, u32)>,
+    stats: &mut crate::capture::tick_stats::TickStats,
 ) -> Option<Vec<(u32, u32)>> {
     if damage.is_empty() {
         return None;
     }
     let mut seen: std::collections::HashSet<_> = damage.iter().copied().collect();
+    stats.allocs += crate::capture::tick_stats::hashset_allocs(seen.capacity());
+    let (seen_cap, vec_cap) = (seen.capacity(), damage.capacity());
     for t in cursor {
         if seen.insert(t) {
             damage.push(t);
         }
+    }
+    if seen.capacity() != seen_cap {
+        stats.allocs += crate::capture::tick_stats::hashset_allocs(seen.capacity())
+            - crate::capture::tick_stats::hashset_allocs(seen_cap);
+    }
+    if damage.capacity() != vec_cap {
+        stats.alloc();
     }
     Some(damage)
 }
@@ -227,6 +251,7 @@ mod tests {
             damage: damage::XDamageMonitor::new(Some(d)),
             input: None,
             display: None,
+            stats: Default::default(),
         };
         backend.arm_damage();
         assert!(backend.damage_armed());
@@ -271,13 +296,20 @@ mod tests {
     #[test]
     fn cursor_tiles_join_the_damage_without_duplicates() {
         assert_eq!(
-            merge_cursor_damage(vec![(5, 5), (1, 1)], vec![(1, 1), (0, 0)]),
+            merge_cursor_damage(
+                vec![(5, 5), (1, 1)],
+                vec![(1, 1), (0, 0)],
+                &mut Default::default()
+            ),
             Some(vec![(5, 5), (1, 1), (0, 0)])
         );
     }
 
     #[test]
     fn no_damage_stays_unknown_whatever_the_cursor_did() {
-        assert_eq!(merge_cursor_damage(vec![], vec![(0, 0)]), None);
+        assert_eq!(
+            merge_cursor_damage(vec![], vec![(0, 0)], &mut Default::default()),
+            None
+        );
     }
 }

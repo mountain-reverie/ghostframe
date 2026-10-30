@@ -5,6 +5,7 @@
 //! X11 is the only one today; a PipeWire/Wayland backend implements the same
 //! trait later (design: `docs/superpowers/specs/2026-10-29-ghostframe-server-x11-design.md`).
 
+pub mod tick_stats;
 pub mod x11;
 
 use std::sync::Arc;
@@ -39,4 +40,11 @@ pub trait Backend {
     /// Tiles damaged since the last call, or `None` for "unknown: check
     /// every tile" (no damage support, or no event since the last call).
     fn drain_damage(&mut self) -> Option<Vec<(u32, u32)>>;
+
+    /// Bytes copied and allocations made at the counted sites since the last
+    /// call (see [`tick_stats::TickStats`]); resets them. Backends that do
+    /// not count return zeros.
+    fn take_tick_stats(&mut self) -> tick_stats::TickStats {
+        tick_stats::TickStats::default()
+    }
 }
