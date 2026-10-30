@@ -117,7 +117,7 @@ pub struct FrameSubmission {
 }
 ```
 
-`FrameBuf` is a handle into a fixed pool owned by `GhostframeServer`; dropping it (wherever the frame ends: worker, dropped frame, error) returns the slot to a free list the capture loop waits on. Pool size is the pipeline depth: 2 queued + 1 in flight + 1 being grabbed = **4 slots**. If the free list is empty the capture loop waits (backpressure, replacing `submit_frame` blocking on a full channel). The C ABI function `gf_server_submit_frame` keeps its signature: it copies the caller's pointer into a non-pooled `FrameBuf` and sends `Damage::Unknown` (`ffi.rs:140`). A `FrameBuf` type does not need to appear in the header; if a future C entry point exposes damage, regenerate `ghostframe-lib/include/ghostframe.h` and let `just ci-local` diff it.
+`FrameBuf` is a handle into a fixed `FramePool` owned by the producer (the capture backend, exposed as `Backend::frame_pool`; its slots are the backend's own storage, MIT-SHM segments on X11); dropping it (wherever the frame ends: worker, dropped frame, error) returns the slot to a free list the capture loop waits on (`FramePool::wait_free`, before the damage drain). Pool size is the pipeline depth: 2 queued + 1 in flight + 1 being grabbed = **4 slots**. If the free list is empty the capture loop waits (backpressure, replacing `submit_frame` blocking on a full channel). The C ABI function `gf_server_submit_frame` keeps its signature: it copies the caller's pointer into a non-pooled `FrameBuf` and sends `Damage::Unknown` (`ffi.rs:140`). A `FrameBuf` type does not need to appear in the header; if a future C entry point exposes damage, regenerate `ghostframe-lib/include/ghostframe.h` and let `just ci-local` diff it.
 
 **Complete-buffer invariant (M2).** Every `Content::Pixels` submission carries a complete, current buffer for the whole root, with `damage` only saying what changed. Consequence: if the library drops or fails a frame (`ensure_baseline_invalidated`, `frame.rs:838`) it needs nothing from the server; it treats the next submission as `Unknown` and does a full upload from the complete buffer.
 
@@ -246,5 +246,7 @@ Each default is a **proposed default**; the owner confirms or overrides.
 10. **Default-flip policy.** Proposed: flip only after shadow mode shows a miss rate the owner is comfortable with and the sweep catches every injected miss; keep the knob afterwards.
 
 ## 7. Appendix: `FrameSubmission` constructors to update in PR 2
+
+**Done in PR 2** (pixels are a `FrameBuf`; every site below is updated; PR 6 adds the damage variants).
 
 `ghostframe-server/src/capture/x11/frames.rs:444`, `ghostframe-lib/src/ffi.rs:140`, `ghostframe-lib/src/server.rs:298` (test), `ghostframe-e2e/tests/c2_loop_stall_measure.rs:233`, `ghostframe-e2e/tests/c2_frame_off_loop.rs:108`, and the seven sites in `ghostframe-lib/src/transport/io_bridge/tests.rs`. PR 2 changes the pixel buffer type; PR 6 adds the damage variants, with the same sites.
