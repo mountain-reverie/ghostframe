@@ -1411,6 +1411,13 @@ mod live_tests {
 
     /// The window manager's view of a server-initiated change must match
     /// `xrandr --output screen --mode M` exactly, for a shrink and a grow.
+    ///
+    /// The expected sequences are xrandr 1.5.4's, recorded under Xvfb; the
+    /// desktop recordings in the plan's Task 1 have the same shape. They are
+    /// pinned rather than compared against the installed xrandr because
+    /// xrandr 1.5.2 (Ubuntu 24.04, so CI) orders a grow differently: it keeps
+    /// the CRTC on while the screen grows, so it emits no `crtc off`,
+    /// `output off` or `output on`.
     #[test]
     fn set_output_emits_the_same_events_as_xrandr() {
         let x = PrivateXvfb::spawn(&["-screen", "0", "1280x1024x24"]);
@@ -1422,18 +1429,22 @@ mod live_tests {
                 .unwrap()
         };
         settle();
-        for (name, other, (w, h)) in [
-            ("800x600_t", "1280x1024", (800u16, 600u16)),
-            ("1280x1024", "800x600_t", (1280, 1024)),
-        ] {
-            xrandr(x.display(), &["--output", "screen", "--mode", name]);
-            let theirs = shape(&settle());
-            xrandr(x.display(), &["--output", "screen", "--mode", other]);
-            settle();
+        for ((w, h), from) in [((800u16, 600u16), "1280x1024"), ((1280, 1024), "800x600")] {
             ctl.set_output(w, h, 1000).unwrap();
-            let ours = shape(&settle());
-            assert!(!theirs.is_empty(), "xrandr produced no events");
-            assert_eq!(ours, theirs, "to {w}x{h}");
+            let to = format!("{w}x{h}");
+            let expected = [
+                format!("screen {from}"),
+                "crtc off".to_string(),
+                "output off".to_string(),
+                format!("root {from}"),
+                format!("screen {to}"),
+                format!("root {to}"),
+                format!("screen {to}"),
+                format!("crtc {to}"),
+                "output on".to_string(),
+                format!("root {to}"),
+            ];
+            assert_eq!(shape(&settle()), expected, "to {to}");
         }
     }
 
