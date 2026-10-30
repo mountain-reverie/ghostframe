@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Stage 1a: toolchain base shared by the planner and builder stages.
-FROM ubuntu:24.04 AS base
+FROM ubuntu:25.10 AS base
 
 # rsync is required by ghostbridge/Makefile's sync-dist target. It sits in
 # this first apt layer, not in a RUN after the source COPYs: down there it was
@@ -205,7 +205,7 @@ RUN find /build -path /build/target -prune -o -type f -print0 | xargs -0 touch \
     && grep -aq 'software Vulkan permitted (test build)' target/release/ghostframe-server
 
 # Stage 2: Runtime image
-FROM ubuntu:24.04
+FROM ubuntu:25.10
 
 RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install -y --allow-unauthenticated --no-install-recommends \
     ca-certificates \
