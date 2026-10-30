@@ -164,7 +164,8 @@ fn merge_cursor_damage(
     Some(damage)
 }
 
-/// Block until `$DISPLAY` accepts an X11 connection, or the timeout expires.
+/// Block until `display` (`None` = `$DISPLAY`) accepts an X11 connection, or
+/// the timeout expires.
 ///
 /// `After=graphical-session.target` says nothing about whether the user's
 /// session will accept a new client. Without this gate the server would bring

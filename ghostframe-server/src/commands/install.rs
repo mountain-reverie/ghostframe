@@ -93,6 +93,8 @@ pub struct InstallContext<'a> {
     pub username: &'a str,
     /// The effective uid; 0 is refused.
     pub euid: u32,
+    /// `WAYLAND_DISPLAY` in this shell, for the Wayland warning.
+    pub shell_wayland: Option<&'a str>,
 }
 
 /// `systemctl --user` (and `systemd-run`), behind a trait so tests can
@@ -281,7 +283,7 @@ pub fn ts_state_dir_from_environment(env_line: &str) -> Option<PathBuf> {
     Path::new(v).is_absolute().then(|| PathBuf::from(v))
 }
 
-/// Refuse `login` and `capture` while the old installer's xdaemon is still
+/// Refuse `login`, `logout` and `capture` while the old installer's xdaemon is still
 /// installed or running: it shares the tailnet state directory and takes no
 /// lock on it. `active` is asked only when the file check passes.
 pub fn refuse_if_legacy_xdaemon(
@@ -329,27 +331,95 @@ pub fn render_unit(max: MaxResolution) -> String {
 
 /// A warning for `install` when a Wayland session is likely: `capture` will
 /// refuse to start on it.
-pub fn wayland_warning(wayland_display: Option<&str>) -> Option<String> {
-    wayland_display.map(|w| {
-        format!(
-            "warning: WAYLAND_DISPLAY={w} is set: Wayland sessions are not supported yet, so \
-             the service will refuse to start. If this is an X11 session with a stale value \
-             in the user manager, `systemctl --user unset-environment WAYLAND_DISPLAY` clears it"
-        )
-    })
+///
+/// `capture` runs under the user manager, so its environment decides; the
+/// shell's is checked too because it usually mirrors the session. `manager_env`
+/// is the output of `systemctl --user show-environment`.
+pub fn wayland_warning(manager_env: &str, shell: Option<&str>) -> Option<String> {
+    let manager = manager_env
+        .lines()
+        .find_map(|l| l.strip_prefix("WAYLAND_DISPLAY="))
+        .filter(|v| !v.is_empty());
+    let (w, whose) = match (manager, shell) {
+        (Some(w), _) => (w, "the user manager"),
+        (None, Some(w)) => (w, "this shell"),
+        (None, None) => return None,
+    };
+    Some(format!(
+        "warning: WAYLAND_DISPLAY={w} is set in {whose}: Wayland sessions are not supported \
+         yet, so the service will refuse to start. If this is an X11 session with a stale \
+         value in the user manager, `systemctl --user unset-environment WAYLAND_DISPLAY` \
+         clears it"
+    ))
 }
 
 /// A warning for `login` when this shell's environment would put the tailnet
 /// state somewhere the installed service does not read.
-pub fn state_dir_mismatch_warning(login_dir: &Path, unit_dir: &Path) -> Option<String> {
+///
+/// `from_manager` says `unit_dir` is what the user manager reports for the
+/// installed unit, so the shell's `TS_STATE_DIR` and `XDG_STATE_HOME` were
+/// both compared. Otherwise it was derived from `HOME` and the shell's
+/// `XDG_STATE_HOME`, which both sides share: only `TS_STATE_DIR` can differ.
+pub fn state_dir_mismatch_warning(
+    login_dir: &Path,
+    unit_dir: &Path,
+    from_manager: bool,
+) -> Option<String> {
     (login_dir != unit_dir).then(|| {
+        let (reads, cause) = if from_manager {
+            (
+                "the installed service reads",
+                "TS_STATE_DIR or XDG_STATE_HOME in this shell differ from it",
+            )
+        } else {
+            (
+                "the service will read",
+                "TS_STATE_DIR in this shell differs from it",
+            )
+        };
         format!(
-            "warning: login will write {}, but the installed service reads {} (TS_STATE_DIR \
-             or XDG_STATE_HOME in this shell differ from it); the service will not see this login",
+            "warning: login will write {}, but {reads} {} ({cause}); the service will not \
+             see this login",
             login_dir.display(),
             unit_dir.display()
         )
     })
+}
+
+/// The `TS_STATE_DIR` the user manager reports for the installed unit, as
+/// `install` and `login` both need it. `None` when it cannot be read.
+pub fn manager_unit_state_dir(sys: &mut dyn Systemctl) -> Option<PathBuf> {
+    sys.user_output(&["show", "-p", "Environment", "--value", UNIT_NAME])
+        .ok()
+        .and_then(|o| ts_state_dir_from_environment(&o))
+}
+
+/// The "max resolution" line `install` prints.
+pub fn max_resolution_line(max: &ResolvedMax) -> String {
+    format!(
+        "max resolution: {} ({}); change it with `ghostframe-server install --max-resolution \
+         WxH|none`",
+        match max.max {
+            MaxResolution::Limit(w, h) => format!("{w}x{h}"),
+            MaxResolution::Unlimited => "none".into(),
+        },
+        max.note
+    )
+}
+
+/// The arguments for the detached re-exec, with the cap resolved here, in
+/// the terminal's process, against the unit that is installed now: the
+/// detached copy then writes exactly the value this returns the line for.
+pub fn detach_install_args(
+    force: bool,
+    requested: Option<MaxResolution>,
+    unit: &Path,
+) -> (Vec<String>, String) {
+    let resolved = resolve_max_resolution(requested, unit);
+    (
+        install_args(force, Some(resolved.max)),
+        max_resolution_line(&resolved),
+    )
 }
 
 /// What `install` writes as the resolution cap, and why, for the line it
@@ -369,11 +439,22 @@ fn max_resolution_of_unit(text: &str) -> Option<MaxResolution> {
     {
         return None;
     }
+    let mentions = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with(['#', ';']))
+        .filter(|l| l.contains("GHOSTFRAME_MAX_RESOLUTION"))
+        .count();
     let mut found = text.lines().filter_map(|l| {
         l.strip_prefix("Environment=GHOSTFRAME_MAX_RESOLUTION=")
             .map(str::trim)
     });
-    match (found.next(), found.next()) {
+    let (first, second) = (found.next(), found.next());
+    // A mention in a form this installer does not write (a quoted
+    // `Environment="..."`, say) is a cap we cannot read, not an absent one.
+    if mentions != usize::from(first.is_some()) + usize::from(second.is_some()) {
+        return None;
+    }
+    match (first, second) {
         (None, _) => Some(MaxResolution::Unlimited),
         (Some(v), None) => crate::cli::parse_max_resolution(v).ok(),
         _ => None,
@@ -507,12 +588,15 @@ pub fn install(
     };
     // 1.
     refuse_root(ctx.euid, "install")?;
-    sys.user(&["show-environment"]).map_err(|e| {
+    let manager_env = sys.user_output(&["show-environment"]).map_err(|e| {
         format!(
             "run `ghostframe-server install` from your desktop session (no user systemd \
              manager reachable): {e}"
         )
     })?;
+    if let Some(msg) = wayland_warning(&manager_env, ctx.shell_wayland) {
+        w(out, msg);
+    }
 
     // 2.
     let stop_names = legacy_stop_names(ctx.paths)?;
@@ -553,18 +637,7 @@ pub fn install(
             ctx.paths.unit_dir.join(UNIT_NAME).display()
         ),
     );
-    w(
-        out,
-        format!(
-            "max resolution: {} ({}); change it with `ghostframe-server install --max-resolution \
-             WxH|none`",
-            match max.max {
-                MaxResolution::Limit(w, h) => format!("{w}x{h}"),
-                MaxResolution::Unlimited => "none".into(),
-            },
-            max.note
-        ),
-    );
+    w(out, max_resolution_line(&max));
     // Enlightenment never activates graphical-session.target.
     write_file(
         &ctx.paths.autostart_dir.join(AUTOSTART_NAME),
@@ -582,11 +655,7 @@ pub fn install(
 
     // The state directory is the one the *unit* uses, as the user manager
     // expanded it, not whatever this shell derives.
-    let unit_state = match sys
-        .user_output(&["show", "-p", "Environment", "--value", UNIT_NAME])
-        .ok()
-        .and_then(|o| ts_state_dir_from_environment(&o))
-    {
+    let unit_state = match manager_unit_state_dir(sys) {
         Some(d) => Some(d),
         None => {
             w(
@@ -994,6 +1063,8 @@ mod tests {
         write_state_on: Option<(String, PathBuf)>,
         /// Answer to `show -p Environment`.
         env_line: Option<String>,
+        /// Answer to `show-environment`.
+        manager_env: Option<String>,
         /// `enable` must find this unit file already written.
         unit_path: Option<PathBuf>,
         /// `systemd-run` argument lists.
@@ -1018,6 +1089,9 @@ mod tests {
             }
             if self.fail_on.contains(&call) {
                 return Err(format!("systemctl --user {call} failed: injected"));
+            }
+            if call == "show-environment" {
+                return Ok(self.manager_env.clone().unwrap_or_default());
             }
             if call.starts_with("show -p Environment") {
                 return Ok(self.env_line.clone().unwrap_or_default());
@@ -1082,6 +1156,7 @@ mod tests {
                 state_dir: Some(&self.state),
                 username: "alice",
                 euid: 1000,
+                shell_wayland: None,
             }
         }
 
@@ -1582,6 +1657,9 @@ mod tests {
             "not a unit at all\n".to_string(),
             // Our shape, but a value this installer never writes.
             "[Service]\nEnvironment=GHOSTFRAME_MAX_RESOLUTION=huge\nExecStart=x\n".to_string(),
+            // A quoted form this installer never writes: unreadable, not "none".
+            "[Service]\nEnvironment=\"GHOSTFRAME_MAX_RESOLUTION=2560x1440\"\nExecStart=x\n"
+                .to_string(),
             // Two settings: which one wins is not ours to guess.
             "[Service]\nEnvironment=GHOSTFRAME_MAX_RESOLUTION=1x1\n\
              Environment=GHOSTFRAME_MAX_RESOLUTION=2x2\nExecStart=x\n"
@@ -1923,17 +2001,96 @@ mod tests {
     }
 
     #[test]
-    fn wayland_and_state_dir_warnings_fire_only_when_they_apply() {
-        assert!(wayland_warning(None).is_none());
-        let w = wayland_warning(Some("wayland-0")).unwrap();
-        assert!(w.contains("WAYLAND_DISPLAY=wayland-0") && w.contains("unset-environment"));
-        let a = Path::new("/h/.local/state/ghostframe");
-        assert!(state_dir_mismatch_warning(a, a).is_none());
-        let w = state_dir_mismatch_warning(Path::new("/elsewhere"), a).unwrap();
+    fn the_wayland_warning_reads_the_manager_and_the_shell() {
+        assert!(wayland_warning("DISPLAY=:0\n", None).is_none());
+        // An empty value is not a Wayland session.
+        assert!(wayland_warning("WAYLAND_DISPLAY=\n", None).is_none());
+        let w = wayland_warning("DISPLAY=:0\nWAYLAND_DISPLAY=wayland-1\n", None).unwrap();
         assert!(
-            w.contains("/elsewhere") && w.contains("/h/.local/state/ghostframe"),
+            w.contains("wayland-1") && w.contains("the user manager"),
             "{w}"
         );
+        assert!(w.contains("unset-environment"));
+        let w = wayland_warning("DISPLAY=:0\n", Some("wayland-0")).unwrap();
+        assert!(w.contains("wayland-0") && w.contains("this shell"), "{w}");
+    }
+
+    #[test]
+    fn install_warns_about_wayland_from_either_source() {
+        let sb = Sandbox::new();
+        let sysroot = sb.sysroot();
+        let run = |manager_env: Option<&str>, shell: Option<&str>| {
+            let mut ctx = sb.ctx(&sysroot, false);
+            ctx.shell_wayland = shell;
+            let mut sys = Recorder {
+                manager_env: manager_env.map(Into::into),
+                unit_path: Some(sb.paths.unit_dir.join(UNIT_NAME)),
+                ..Recorder::default()
+            };
+            let mut out = Vec::new();
+            install(&ctx, true, None, &mut sys, &mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert!(!run(None, None).contains("WAYLAND_DISPLAY"));
+        let out = run(Some("WAYLAND_DISPLAY=wayland-0\n"), None);
+        assert!(out.contains("set in the user manager"), "{out}");
+        let out = run(None, Some("wayland-0"));
+        assert!(out.contains("set in this shell"), "{out}");
+    }
+
+    #[test]
+    fn the_state_dir_warning_names_only_what_it_compared() {
+        let a = Path::new("/h/.local/state/ghostframe");
+        assert!(state_dir_mismatch_warning(a, a, true).is_none());
+        let w = state_dir_mismatch_warning(Path::new("/elsewhere"), a, true).unwrap();
+        assert!(
+            w.contains("/elsewhere")
+                && w.contains("the installed service reads")
+                && w.contains("XDG_STATE_HOME"),
+            "{w}"
+        );
+        let w = state_dir_mismatch_warning(Path::new("/elsewhere"), a, false).unwrap();
+        assert!(
+            w.contains("TS_STATE_DIR") && !w.contains("XDG_STATE_HOME"),
+            "{w}"
+        );
+    }
+
+    #[test]
+    fn the_manager_reports_the_state_dir_the_unit_uses() {
+        let mut sys = Recorder {
+            env_line: Some("DISPLAY=:0 TS_STATE_DIR=/srv/x/ghostframe".into()),
+            ..Recorder::default()
+        };
+        assert_eq!(
+            manager_unit_state_dir(&mut sys),
+            Some(PathBuf::from("/srv/x/ghostframe"))
+        );
+        assert_eq!(manager_unit_state_dir(&mut Recorder::default()), None);
+    }
+
+    #[test]
+    fn the_detached_copy_is_told_the_cap_the_terminal_printed() {
+        let sb = Sandbox::new();
+        let unit = sb.paths.unit_dir.join(UNIT_NAME);
+        sb.touch(&unit);
+        std::fs::write(&unit, render_unit(MaxResolution::Limit(2560, 1440))).unwrap();
+        let (args, line) = detach_install_args(true, None, &unit);
+        assert_eq!(
+            args,
+            ["install", "--force", "--max-resolution", "2560x1440"]
+        );
+        assert!(line.contains("max resolution: 2560x1440 (kept"), "{line}");
+        // An explicit flag wins; `none` is passed on as such.
+        let (args, line) = detach_install_args(false, Some(MaxResolution::Unlimited), &unit);
+        assert_eq!(args, ["install", "--max-resolution", "none"]);
+        assert!(
+            line.contains("max resolution: none (from --max-resolution)"),
+            "{line}"
+        );
+        // First install: the default, explicitly.
+        let (args, _) = detach_install_args(false, None, &sb.paths.unit_dir.join("absent"));
+        assert_eq!(args, ["install", "--max-resolution", "1920x1080"]);
     }
 
     #[test]
