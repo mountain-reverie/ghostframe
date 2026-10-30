@@ -205,25 +205,25 @@ impl RunReport {
         self.mean(|t| t.hint_tiles as u64)
     }
 
-    /// Reject a run whose measurement cannot be real. Every scene, idle
-    /// included, grabs the whole root each tick, so wall time, CPU time,
-    /// bytes and allocations must all be non-zero; a counter stuck at zero
-    /// reads as success otherwise.
+    /// Reject a run whose measurement cannot be real. Wall time, CPU time,
+    /// bytes (the cursor image) and allocations (cursor reply, damage path)
+    /// must be non-zero; a counter stuck at zero reads as success otherwise.
+    /// Since PR 2 the grab is not copied by this process, so no tick may
+    /// carry a full-root copy: that would mean the `to_vec` is back.
     pub fn validate(&self) -> Result<(), String> {
         if self.ticks.is_empty() {
             return Err("no ticks measured".into());
         }
-        // The grab copies the whole root every tick, so every tick (not just
-        // the mean) carries at least W*H*4 bytes.
-        let floor = self.pixels * 4;
+        let ceiling = self.pixels * 4;
         if let Some((i, t)) = self
             .ticks
             .iter()
             .enumerate()
-            .find(|(_, t)| t.bytes_copied < floor)
+            .find(|(_, t)| t.bytes_copied >= ceiling)
         {
             return Err(format!(
-                "{} scene: tick {i} copied {} bytes, below the W*H*4 = {floor} floor",
+                "{} scene: tick {i} copied {} bytes, at or above the W*H*4 = {ceiling} \
+                 ceiling: a full-frame copy is back",
                 self.scene.name(),
                 t.bytes_copied
             ));
@@ -258,6 +258,11 @@ pub fn run_scene(scene: Scene, w: u16, h: u16, ticks: u32, seed: u64) -> RunRepo
         display: None,
         stats: Default::default(),
     };
+    assert_eq!(
+        backend.frames.path(),
+        frames::GrabPath::Shm,
+        "the baseline measures the MIT-SHM path; the Xvfb has no usable MIT-SHM"
+    );
     backend.arm_damage();
     let mut painter = Painter::new(d, w, h, seed);
     let mut out = Vec::with_capacity(ticks as usize);
@@ -310,10 +315,11 @@ mod tests {
     fn idle_scene_measures_nonzero_cost() {
         let r = run_scene(Scene::Idle, 640, 360, 12, 7);
         r.validate().unwrap();
-        // Property, not a magic number: every tick copies the root and then
-        // the cursor image on top, so strictly more than W*H*4.
+        // Property, not a magic number: the cursor image is copied (so the
+        // counter is live) and the root is not (so well under W*H*4).
         for (i, t) in r.ticks.iter().enumerate() {
-            assert!(t.bytes_copied > 640 * 360 * 4, "tick {i}: {t:?}");
+            assert!(t.bytes_copied > 0, "tick {i}: {t:?}");
+            assert!(t.bytes_copied < 640 * 360 * 4 / 100, "tick {i}: {t:?}");
         }
         // Idle means no damage hint.
         assert_eq!(r.hint_tiles(), 0.0);
@@ -327,7 +333,7 @@ mod tests {
             assert!(r.hint_tiles() > 0.0, "{} reported no damage", s.name());
             for (i, t) in r.ticks.iter().enumerate() {
                 assert!(
-                    t.bytes_copied > 640 * 360 * 4,
+                    t.bytes_copied > 0 && t.bytes_copied < 640 * 360 * 4 / 100,
                     "{} tick {i}: {t:?}",
                     s.name()
                 );
@@ -343,7 +349,7 @@ mod tests {
                 .map(|_| Tick {
                     capture_us: if zero == 0 { 0 } else { 100 },
                     cpu_us: if zero == 1 { 0 } else { 90 },
-                    bytes_copied: if zero == 2 { 0 } else { 4096 },
+                    bytes_copied: if zero == 2 { 0 } else { 1024 },
                     allocs: if zero == 3 { 0 } else { 1 },
                     hint_tiles: 0,
                     hint: vec![],
@@ -357,6 +363,26 @@ mod tests {
             };
             assert!(r.validate().is_err(), "zeroed counter {zero} accepted");
         }
+    }
+
+    #[test]
+    fn the_harness_rejects_a_full_frame_copy() {
+        let tick = |bytes| Tick {
+            capture_us: 100,
+            cpu_us: 90,
+            bytes_copied: bytes,
+            allocs: 1,
+            hint_tiles: 0,
+            hint: vec![],
+            pixel_hash: 0,
+        };
+        let r = RunReport {
+            scene: Scene::Idle,
+            pixels: 1024,
+            ticks: vec![tick(1024), tick(1024), tick(4096 + 1024)],
+        };
+        let e = r.validate().unwrap_err();
+        assert!(e.contains("full-frame copy is back"), "{e}");
     }
 
     #[test]
