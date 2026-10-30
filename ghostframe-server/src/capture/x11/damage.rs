@@ -826,6 +826,33 @@ mod x11_tests {
         );
     }
 
+    /// `take_allocs` counts the drain's own allocation sites (`TickStats`
+    /// documents that these are explicit sites, not a global allocator hook):
+    /// nothing on an idle drain; on a drain that hands out tiles, the result
+    /// clone plus, for NonEmpty, the fetched region list; and it resets when
+    /// taken.
+    #[test]
+    fn x11_drain_counts_its_allocation_sites_and_only_when_they_run() {
+        for level in [DamageReport::NonEmpty, DamageReport::Raw] {
+            let mut rig = Rig::new(level);
+            let _ = rig.m.take_allocs(); // the scratch bitmap, allocated once
+            for _ in 0..3 {
+                assert_eq!(rig.drain(), Damage::None);
+            }
+            assert_eq!(rig.m.take_allocs(), 0, "{level:?}: idle drains allocate");
+            rig.draw(&[rect(40, 40, 4, 4)]);
+            assert!(matches!(rig.drain(), Damage::Tiles(_)));
+            let n = rig.m.take_allocs();
+            let want = if level == DamageReport::NonEmpty {
+                2
+            } else {
+                1
+            };
+            assert_eq!(n, want, "{level:?}");
+            assert_eq!(rig.m.take_allocs(), 0, "taking resets");
+        }
+    }
+
     /// Median drain time in microseconds after `n` draws of `pattern`.
     fn drain_cost_us(level: DamageReport, scattered: bool, n: usize) -> f64 {
         let mut rig = Rig::new(level);
