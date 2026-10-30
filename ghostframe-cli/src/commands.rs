@@ -177,7 +177,39 @@ pub enum LoopAction {
     Quit,
     Minimize,
     Recompute,
+    /// Release on the remote every key [`HeldKeys`] still has down.
+    ReleaseHeld,
     None,
+}
+
+/// The keys forwarded to the remote as pressed and not yet released.
+///
+/// A key held when the window loses focus is released in another window, so
+/// its release never reaches this one and the remote keeps it down -- the
+/// stuck-Ctrl bug. The loop feeds every forwarded key event through
+/// [`HeldKeys::track`] and, on [`LoopAction::ReleaseHeld`], sends a release
+/// for each key [`HeldKeys::release_all`] returns.
+#[derive(Debug, Default)]
+pub struct HeldKeys {
+    // Ordered so the releases go out in a deterministic order.
+    down: std::collections::BTreeSet<u32>,
+}
+
+impl HeldKeys {
+    /// Record one key event as forwarded. A repeated press (autorepeat) is
+    /// still one held key.
+    pub fn track(&mut self, keysym: u32, down: bool) {
+        if down {
+            self.down.insert(keysym);
+        } else {
+            self.down.remove(&keysym);
+        }
+    }
+
+    /// Every key still down, each once, leaving none held.
+    pub fn release_all(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.down).into_iter().collect()
+    }
 }
 
 /// Decide what a single backend [`WindowEvent`] means for the loop.
@@ -217,6 +249,10 @@ pub fn route_window_event(
         // returning `Recompute` just tells it to rebuild the `Placement`.
         WindowEvent::Resized { .. } => LoopAction::Recompute,
         WindowEvent::CloseRequested => LoopAction::Quit,
+        WindowEvent::FocusLost => {
+            chord.reset();
+            LoopAction::ReleaseHeld
+        }
     }
 }
 
@@ -477,6 +513,7 @@ pub fn run_window_loop(
     let backend_fd = backend.event_fd();
 
     let mut frames_presented: u64 = 0;
+    let mut held = HeldKeys::default();
 
     loop {
         if should_quit() {
@@ -621,7 +658,10 @@ pub fn run_window_loop(
             }
             match route_window_event(&ev, chord, &placement) {
                 LoopAction::Forward(input) => match input {
-                    InputToSend::Key { keysym, down } => client.push_key(keysym, down),
+                    InputToSend::Key { keysym, down } => {
+                        held.track(keysym, down);
+                        client.push_key(keysym, down)
+                    }
                     InputToSend::PointerMotion { x, y } => client.push_pointer_motion(x, y),
                     InputToSend::PointerButton { x, y, button, down } => {
                         client.push_pointer_button(x, y, button, down)
@@ -633,6 +673,11 @@ pub fn run_window_loop(
                 LoopAction::Recompute => {
                     if let Some((rw, rh)) = remote_size {
                         placement = Placement::centre(rw, rh, out_w, out_h);
+                    }
+                }
+                LoopAction::ReleaseHeld => {
+                    for keysym in held.release_all() {
+                        client.push_key(keysym, false);
                     }
                 }
                 LoopAction::None => {}

@@ -99,6 +99,10 @@ pub enum WindowEvent {
         height: u32,
     },
     CloseRequested,
+    /// The window stopped receiving keyboard input. Keys held at that
+    /// moment are released somewhere else, so their releases never arrive
+    /// here; the loop releases them on the remote itself.
+    FocusLost,
 }
 
 /// Errors surfaced by a [`Backend`] or by [`open`].

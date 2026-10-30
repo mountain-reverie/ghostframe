@@ -569,6 +569,9 @@ impl KeyboardHandler for AppData {
         _surface: &wl_surface::WlSurface,
         _serial: u32,
     ) {
+        // Keys held now are released on another surface; the loop releases
+        // them on the remote (`HeldKeys`), or they stay down there.
+        self.events.push(WindowEvent::FocusLost);
     }
 
     fn press_key(

@@ -229,10 +229,11 @@ struct CachedPixmap {
 }
 
 /// Build the XKB state for `conn`'s core keyboard device via
-/// `xkbcommon-x11`. `Context` and `Keymap` are dropped at the end of this
-/// function -- `State` takes its own internal ref to the keymap (which in
-/// turn holds the context alive), so nothing here needs to outlive it.
-fn init_xkb_state(conn: &XCBConnection) -> Result<xkb::State, WindowError> {
+/// `xkbcommon-x11`, and return it with the device id it was read from.
+/// `Context` and `Keymap` are dropped at the end of this function -- `State`
+/// takes its own internal ref to the keymap (which in turn holds the context
+/// alive), so nothing here needs to outlive it.
+fn init_xkb_state(conn: &XCBConnection) -> Result<(xkb::State, i32), WindowError> {
     let mut major_out = 0u16;
     let mut minor_out = 0u16;
     let mut base_event = 0u8;
@@ -264,7 +265,10 @@ fn init_xkb_state(conn: &XCBConnection) -> Result<xkb::State, WindowError> {
     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
     let keymap =
         xkb::x11::keymap_new_from_device(&context, conn, device_id, xkb::KEYMAP_COMPILE_NO_FLAGS);
-    Ok(xkb::x11::state_new_from_device(&keymap, conn, device_id))
+    Ok((
+        xkb::x11::state_new_from_device(&keymap, conn, device_id),
+        device_id,
+    ))
 }
 
 /// The X11 [`Backend`]: x11rb + DRI3 + Present. See the module doc for the
@@ -293,7 +297,11 @@ pub struct X11Backend {
     presented: HashMap<u32, u32>,
     /// Frames the server has finished with, drained by `take_idle_frames`.
     idle_frames: Vec<u32>,
+    /// Tracked from this window's own key events, so it misses every key
+    /// released while another window had focus; re-read from the server on
+    /// `FocusIn` (see `poll_events`).
     xkb_state: xkb::State,
+    xkb_device_id: i32,
     events: Vec<WindowEvent>,
 }
 
@@ -346,7 +354,8 @@ impl X11Backend {
                     | xproto::EventMask::BUTTON_PRESS
                     | xproto::EventMask::BUTTON_RELEASE
                     | xproto::EventMask::POINTER_MOTION
-                    | xproto::EventMask::STRUCTURE_NOTIFY,
+                    | xproto::EventMask::STRUCTURE_NOTIFY
+                    | xproto::EventMask::FOCUS_CHANGE,
             )
             .background_pixel(screen.black_pixel);
 
@@ -492,7 +501,7 @@ impl X11Backend {
                 .map_err(|e| WindowError::X11(format!("flush after fullscreen fallback: {e}")))?;
         }
 
-        let xkb_state = init_xkb_state(&conn)?;
+        let (xkb_state, xkb_device_id) = init_xkb_state(&conn)?;
 
         let mut backend = Self {
             conn,
@@ -510,6 +519,7 @@ impl X11Backend {
             presented: HashMap::new(),
             idle_frames: Vec::new(),
             xkb_state,
+            xkb_device_id,
             events: Vec::new(),
         };
         backend.clear_window()?;
@@ -780,6 +790,30 @@ impl Backend for X11Backend {
                             down: false,
                         });
                     }
+                }
+                // Keyboard focus left, including to a window manager's
+                // grab for one of its shortcuts. The releases of keys held
+                // now go elsewhere; `FocusLost` has the loop release them on
+                // the remote. `Inferior` (focus moved into a child; this
+                // window has none) and `Pointer` (sent to the window under
+                // the pointer while focus is elsewhere) do not take the
+                // keyboard from us.
+                Event::FocusOut(ev)
+                    if !matches!(
+                        ev.detail,
+                        xproto::NotifyDetail::INFERIOR | xproto::NotifyDetail::POINTER
+                    ) =>
+                {
+                    self.events.push(WindowEvent::FocusLost);
+                }
+                // Back in focus: whatever was released or pressed meanwhile
+                // happened in another window, so re-read the modifier state
+                // rather than keep the one tracked from our own events. A
+                // stale Shift would otherwise turn every letter uppercase.
+                Event::FocusIn(_) => {
+                    let keymap = self.xkb_state.get_keymap();
+                    self.xkb_state =
+                        xkb::x11::state_new_from_device(&keymap, &self.conn, self.xkb_device_id);
                 }
                 Event::ButtonPress(ev) => match classify_button(ev.detail) {
                     ButtonKind::Click(button) => self.events.push(WindowEvent::PointerButton {

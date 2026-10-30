@@ -4,7 +4,7 @@
 //! likely to be wrong, and it doesn't need one.
 
 use ghostframe_cli::chord::{Chord, Prefix};
-use ghostframe_cli::commands::{route_window_event, InputToSend, LoopAction};
+use ghostframe_cli::commands::{route_window_event, HeldKeys, InputToSend, LoopAction};
 use ghostframe_cli::geometry::Placement;
 use ghostframe_cli::window::WindowEvent;
 
@@ -218,4 +218,68 @@ fn resized_yields_recompute() {
         &placement,
     );
     assert_eq!(action, LoopAction::Recompute);
+}
+
+fn key(keysym: u32, down: bool) -> WindowEvent {
+    WindowEvent::Key { keysym, down }
+}
+
+#[test]
+fn focus_lost_yields_release_held() {
+    let mut chord = ctrl_alt_b();
+    let placement = some_placement();
+    let action = route_window_event(&WindowEvent::FocusLost, &mut chord, &placement);
+    assert_eq!(action, LoopAction::ReleaseHeld);
+}
+
+/// The stuck-Ctrl bug: Ctrl pressed in the window, focus leaves, and the
+/// release goes to another window. Only keys still down are released, each
+/// once, and the set is empty afterwards.
+#[test]
+fn release_all_returns_exactly_the_keys_still_down() {
+    let mut held = HeldKeys::default();
+    held.track(CTRL_L, true);
+    held.track(X, true);
+    held.track(X, false);
+    held.track(ALT_L, true);
+    // Autorepeat delivers further presses without a release in between.
+    held.track(ALT_L, true);
+    assert_eq!(held.release_all(), vec![CTRL_L, ALT_L]);
+    assert_eq!(held.release_all(), Vec::<u32>::new());
+}
+
+/// Ctrl and Alt released while unfocused must not leave the prefix armable:
+/// after focus is lost, `b` then `d` is typing, not a quit.
+#[test]
+fn focus_lost_forgets_held_chord_modifiers() {
+    let mut chord = ctrl_alt_b();
+    let placement = some_placement();
+    route_window_event(&key(CTRL_L, true), &mut chord, &placement);
+    route_window_event(&key(ALT_L, true), &mut chord, &placement);
+    route_window_event(&WindowEvent::FocusLost, &mut chord, &placement);
+    route_window_event(&key(B, true), &mut chord, &placement);
+    let action = route_window_event(&key(D, true), &mut chord, &placement);
+    assert_eq!(
+        action,
+        LoopAction::Forward(InputToSend::Key {
+            keysym: D,
+            down: true
+        })
+    );
+}
+
+/// An armed prefix does not survive focus leaving either.
+#[test]
+fn focus_lost_disarms_a_struck_prefix() {
+    let mut chord = ctrl_alt_b();
+    let placement = some_placement();
+    for ev in [key(CTRL_L, true), key(ALT_L, true), key(B, true)] {
+        route_window_event(&ev, &mut chord, &placement);
+    }
+    route_window_event(&WindowEvent::FocusLost, &mut chord, &placement);
+    // Modifiers pressed again after focus returns, but not the prefix key.
+    route_window_event(&key(CTRL_L, true), &mut chord, &placement);
+    route_window_event(&key(ALT_L, true), &mut chord, &placement);
+    let action = route_window_event(&key(D, true), &mut chord, &placement);
+    assert_ne!(action, LoopAction::Quit);
 }
