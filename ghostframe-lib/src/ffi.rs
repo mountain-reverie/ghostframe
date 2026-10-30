@@ -134,7 +134,7 @@ pub unsafe extern "C" fn gf_server_submit_frame(
             width,
             height,
             stride,
-            pixels: pixel_data,
+            pixels: pixel_data.into(),
             dmabuf_fd: None,
             timestamp_us,
             damage_tiles: None,

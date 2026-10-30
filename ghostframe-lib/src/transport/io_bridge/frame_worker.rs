@@ -61,6 +61,7 @@ use tokio::sync::mpsc;
 use super::frame_backend::{
     Analysed, Control, EscalationSlot, FrameBackend, H264Out, PixelSource, TileOut, TileRequest,
 };
+use crate::frame_pool::FrameBuf;
 use crate::server::FrameSubmission;
 
 /// Serialises every backend call in the process. See the module docs.
@@ -130,7 +131,7 @@ pub(super) enum FromWorker {
         seq: u32,
         out: Box<TileOut>,
         /// The frame's own pixels, when `out.pixels` is `PixelSource::Frame`.
-        frame_pixels: Vec<u8>,
+        frame_pixels: FrameBuf,
         worker_us: u64,
     },
     Discarded {
@@ -402,7 +403,7 @@ fn run_worker(
                             let frame_pixels = if matches!(out.pixels, Ok(PixelSource::Frame)) {
                                 std::mem::take(&mut frame.pixels)
                             } else {
-                                Vec::new()
+                                FrameBuf::empty()
                             };
                             FromWorker::TileDone {
                                 seq,

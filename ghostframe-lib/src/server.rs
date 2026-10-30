@@ -7,6 +7,7 @@ use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
+use crate::frame_pool::FrameBuf;
 use crate::transport::ghostbridge::GhostbridgeConfig;
 use crate::transport::io_bridge::IoBridge;
 
@@ -21,7 +22,9 @@ pub struct FrameSubmission {
     /// Bytes per row (may include padding beyond `width * 4`).
     pub stride: u32,
     /// BGRA pixel data; length must equal `stride * height`.
-    pub pixels: Vec<u8>,
+    /// Pooled when the producer has a [`crate::FramePool`]: the slot returns
+    /// to it when the frame is dropped, wherever that happens.
+    pub pixels: FrameBuf,
     /// DMA-BUF file descriptor for zero-copy GPU access.
     /// When present, the GPU pipeline uses this directly instead of `pixels`.
     pub dmabuf_fd: Option<OwnedFd>,
@@ -292,7 +295,7 @@ mod tests {
             width: 1920,
             height: 1080,
             stride: 1920 * 4,
-            pixels: vec![0u8; 1920 * 1080 * 4],
+            pixels: vec![0u8; 1920 * 1080 * 4].into(),
             dmabuf_fd: None,
             timestamp_us: 0,
             damage_tiles: None,
