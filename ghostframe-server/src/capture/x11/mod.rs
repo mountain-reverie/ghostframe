@@ -20,6 +20,7 @@ use ghostframe_lib::transport::display::DisplayController;
 use ghostframe_lib::transport::input_inject::InputInjector;
 use ghostframe_lib::FrameSubmission;
 
+use crate::capture::{Damage, TileBitmap};
 use crate::config::ServerConfig;
 
 /// The X11 desktop on `$DISPLAY`.
@@ -47,9 +48,12 @@ impl X11Backend {
         // Not armed yet: damage reporting is switched on and off with the
         // capture gate, so the X server does no damage bookkeeping for us
         // while no client is connected.
-        let damage = damage::XDamageMonitor::new(cfg.display.as_deref());
-        if damage.is_some() {
-            tracing::info!("XDamage available; armed only while a client is connected");
+        let damage = damage::XDamageMonitor::new(cfg.display.as_deref(), cfg.damage_report);
+        if let Some(d) = &damage {
+            tracing::info!(
+                report = ?d.report_level(),
+                "XDamage available; armed only while a client is connected"
+            );
         } else {
             tracing::info!("XDamage not available, using full-frame dirty detection");
         }
@@ -131,61 +135,55 @@ impl super::Backend for X11Backend {
 
     /// Drained damage plus the cursor's tiles.
     ///
-    /// The lib's GPU path does not consume these hints today (only the CPU
-    /// comparison in `process_frame_cpu_at` reads `damage_tiles`); the cursor
-    /// merge is here for the day it does.
+    /// The lib does not consume these hints today (see
+    /// `Damage::into_hint`); the cursor merge is here for the day it does.
     fn take_tick_stats(&mut self) -> crate::capture::tick_stats::TickStats {
         let mut s = std::mem::take(&mut self.stats);
         s.add(self.frames.take_stats());
         s
     }
 
-    fn drain_damage(&mut self) -> Option<Vec<(u32, u32)>> {
+    fn drain_damage(&mut self) -> Damage {
         // The cursor is blended into every frame but X reports no damage for
         // it. Poll it on every drain (it is also the cursor `capture` then
-        // draws) and union its old and new tiles into any hinted set;
-        // otherwise a moved pointer leaves a trail whenever something else
-        // is damaged.
+        // draws) and union its old and new tiles into the damage; otherwise a
+        // moved pointer leaves a trail whenever something else is damaged.
         let cursor_tiles = self.frames.poll_cursor();
-        // An empty drain means no damage events since the last call, but the
-        // first frame for a newly connected client must still be compared in
-        // full, so empty maps to `None` ("check every tile").
-        let tiles = self.damage.as_ref()?.drain_damage_counted(&mut self.stats);
+        let (w, h) = self.frames.size();
         if cursor_tiles.capacity() > 0 {
             self.stats.alloc();
         }
-        merge_cursor_damage(tiles, cursor_tiles, &mut self.stats)
+        let Some(d) = self.damage.as_mut() else {
+            return Damage::Unknown;
+        };
+        let drained = d.drain_damage(w, h);
+        self.stats.allocs += d.take_allocs();
+        merge_cursor_damage(drained, &cursor_tiles, (w, h), &mut self.stats)
     }
 }
 
-/// Hints for the lib: the drained damage plus the cursor's tiles, or `None`
-/// ("compare every tile") when nothing was damaged. Cursor tiles alone never
-/// make a hint: with no other change the first frame for a new client must
-/// still be compared in full.
+/// The drained damage with the cursor's tiles folded in. `Unknown` stays
+/// `Unknown`; a moved cursor turns `None` into `Tiles`, because the cursor is
+/// part of the pixels. `size` is the screen the cursor tiles refer to.
 fn merge_cursor_damage(
-    mut damage: Vec<(u32, u32)>,
-    cursor: Vec<(u32, u32)>,
+    damage: Damage,
+    cursor: &[(u32, u32)],
+    size: (u32, u32),
     stats: &mut crate::capture::tick_stats::TickStats,
-) -> Option<Vec<(u32, u32)>> {
-    if damage.is_empty() {
-        return None;
-    }
-    let mut seen: std::collections::HashSet<_> = damage.iter().copied().collect();
-    stats.allocs += crate::capture::tick_stats::hashset_allocs(seen.capacity());
-    let (seen_cap, vec_cap) = (seen.capacity(), damage.capacity());
-    for t in cursor {
-        if seen.insert(t) {
-            damage.push(t);
+) -> Damage {
+    let mut bitmap = match damage {
+        Damage::Unknown => return Damage::Unknown,
+        Damage::None if cursor.is_empty() => return Damage::None,
+        Damage::None => {
+            stats.alloc(); // the bitmap
+            TileBitmap::new(size.0, size.1)
         }
+        Damage::Tiles(b) => b,
+    };
+    for &(tx, ty) in cursor {
+        bitmap.set(tx, ty);
     }
-    if seen.capacity() != seen_cap {
-        stats.allocs += crate::capture::tick_stats::hashset_allocs(seen.capacity())
-            - crate::capture::tick_stats::hashset_allocs(seen_cap);
-    }
-    if damage.capacity() != vec_cap {
-        stats.alloc();
-    }
-    Some(damage)
+    Damage::Tiles(bitmap)
 }
 
 /// Block until `display` (`None` = `$DISPLAY`) accepts an X11 connection, or
@@ -227,7 +225,9 @@ mod tests {
     use crate::capture::x11::test_support::PrivateXvfb;
     use crate::capture::Backend;
     use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{ConnectionExt, CreateGCAux, Rectangle};
+    use x11rb::protocol::xproto::{
+        ChangeWindowAttributesAux, ConnectionExt, CreateGCAux, Rectangle,
+    };
 
     #[test]
     fn wait_for_x11_connects_to_the_display_it_was_given() {
@@ -248,7 +248,7 @@ mod tests {
         let d = x.display();
         let mut backend = X11Backend {
             frames: frames::X11Frames::connect(Some(d), None).unwrap(),
-            damage: damage::XDamageMonitor::new(Some(d)),
+            damage: damage::XDamageMonitor::new(Some(d), crate::config::DamageReport::NonEmpty),
             input: None,
             display: None,
             stats: Default::default(),
@@ -266,6 +266,9 @@ mod tests {
 
         // Draw the cursor at (10,10), then prime: drop everything so far.
         warp(10, 10);
+        backend.capture(0).unwrap();
+        let first = backend.drain_damage();
+        assert_eq!(first, Damage::Unknown, "the first drain after arming");
         backend.capture(0).unwrap();
         let _ = backend.drain_damage();
 
@@ -287,29 +290,115 @@ mod tests {
         conn.get_input_focus().unwrap().reply().unwrap();
         warp(100, 70);
 
-        let hint = backend.drain_damage().expect("damage was reported");
-        for tile in [(7, 7), (0, 0), (3, 2)] {
-            assert!(hint.contains(&tile), "{tile:?} missing from {hint:?}");
+        let Damage::Tiles(hint) = backend.drain_damage() else {
+            panic!("damage was reported");
+        };
+        for (tx, ty) in [(7, 7), (0, 0), (3, 2)] {
+            assert!(hint.get(tx, ty), "({tx},{ty}) missing from {hint:?}");
         }
     }
 
+    /// An unmoved cursor is no damage; a new cursor image in the same place
+    /// is. The two glyph cursors below have the same size and hotspot, so only
+    /// the image serial tells them apart: drop the serial from the unchanged
+    /// check and the swap goes unnoticed.
     #[test]
-    fn cursor_tiles_join_the_damage_without_duplicates() {
+    fn x11_a_cursor_image_swap_in_place_is_damage_and_standing_still_is_not() {
+        let x = PrivateXvfb::spawn(&["-screen", "0", "256x256x24"]);
+        let d = x.display();
+        let mut backend = X11Backend {
+            frames: frames::X11Frames::connect(Some(d), None).unwrap(),
+            damage: damage::XDamageMonitor::new(Some(d), crate::config::DamageReport::NonEmpty),
+            input: None,
+            display: None,
+            stats: Default::default(),
+        };
+        backend.arm_damage();
+
+        let (conn, n) = x11rb::connect(Some(d)).unwrap();
+        let root = conn.setup().roots[n].root;
+        let font = conn.generate_id().unwrap();
+        conn.open_font(font, b"cursor").unwrap();
+        let glyph_cursor = |conn: &x11rb::rust_connection::RustConnection| {
+            let c = conn.generate_id().unwrap();
+            // XC_left_ptr and its mask, black on white.
+            conn.create_glyph_cursor(c, font, font, 68, 69, 0, 0, 0, 0xffff, 0xffff, 0xffff)
+                .unwrap();
+            c
+        };
+        let (a, b) = (glyph_cursor(&conn), glyph_cursor(&conn));
+        let settle = || {
+            conn.get_input_focus().unwrap().reply().unwrap();
+        };
+        conn.change_window_attributes(root, &ChangeWindowAttributesAux::new().cursor(a))
+            .unwrap();
+        conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, 100, 70)
+            .unwrap();
+        settle();
+
+        assert_eq!(backend.drain_damage(), Damage::Unknown);
+        backend.capture(0).unwrap();
+        assert_eq!(
+            backend.drain_damage(),
+            Damage::None,
+            "a cursor that did not move or change is not damage"
+        );
+        backend.capture(1).unwrap();
+
+        conn.change_window_attributes(root, &ChangeWindowAttributesAux::new().cursor(b))
+            .unwrap();
+        settle();
+        let Damage::Tiles(t) = backend.drain_damage() else {
+            panic!("a new cursor image in the same place went unnoticed");
+        };
+        assert!(t.get(3, 2), "the cursor's tile is missing from {t:?}");
+    }
+
+    #[test]
+    fn cursor_tiles_join_the_damage() {
+        let mut b = TileBitmap::new(256, 256);
+        b.set(5, 5);
+        b.set(1, 1);
+        let Damage::Tiles(m) = merge_cursor_damage(
+            Damage::Tiles(b),
+            &[(1, 1), (0, 0)],
+            (256, 256),
+            &mut Default::default(),
+        ) else {
+            panic!("tiles stay tiles");
+        };
+        assert_eq!(m.iter().collect::<Vec<_>>(), vec![(0, 0), (1, 1), (5, 5)]);
+    }
+
+    #[test]
+    fn unknown_stays_unknown_and_quiet_stays_quiet() {
         assert_eq!(
             merge_cursor_damage(
-                vec![(5, 5), (1, 1)],
-                vec![(1, 1), (0, 0)],
+                Damage::Unknown,
+                &[(0, 0)],
+                (64, 64),
                 &mut Default::default()
             ),
-            Some(vec![(5, 5), (1, 1), (0, 0)])
+            Damage::Unknown
+        );
+        assert_eq!(
+            merge_cursor_damage(Damage::None, &[], (64, 64), &mut Default::default()),
+            Damage::None
         );
     }
 
     #[test]
-    fn no_damage_stays_unknown_whatever_the_cursor_did() {
-        assert_eq!(
-            merge_cursor_damage(vec![], vec![(0, 0)], &mut Default::default()),
-            None
-        );
+    fn a_moved_cursor_alone_is_damage() {
+        // The cursor is part of the pixels: with no X damage but a moved
+        // pointer the old and new tiles changed.
+        let Damage::Tiles(m) = merge_cursor_damage(
+            Damage::None,
+            &[(0, 0), (3, 2)],
+            (256, 256),
+            &mut Default::default(),
+        ) else {
+            panic!("a cursor move is damage");
+        };
+        assert_eq!(m.count(), 2);
     }
 }
