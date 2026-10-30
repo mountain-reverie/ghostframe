@@ -599,11 +599,22 @@ impl ClientNet {
     /// `drain_connection_events` used everywhere else keeps this the only
     /// place that writes to `pending_stream_out` and flushes it.
     ///
-    /// A no-op before `SessionReady` (the feedback stream is not open yet):
-    /// the bytes sit in `pending_stream_out` and are sent on the next call
-    /// that observes `session_ready`, same as a `Hello` queued before the
-    /// handshake completes.
+    /// Dropped before `SessionReady`. Input cannot wait in
+    /// `pending_stream_out` the way a `Hello` waits in `core`'s outbox: it
+    /// would be queued first and so written ahead of the `Hello` when the
+    /// session opens, and the server discards whatever follows a non-Hello
+    /// message from a session that is not live yet -- the `Hello` with it,
+    /// leaving a black window until the HELLO deadline closes the
+    /// connection. Input from before the session exists has nowhere to go
+    /// anyway: the server would refuse it for the same reason.
     pub fn send_input(&mut self, bytes: Vec<u8>, now_us: u64) {
+        if !self.session_ready {
+            tracing::debug!(
+                len = bytes.len(),
+                "input before the session is ready; dropped"
+            );
+            return;
+        }
         self.pending_stream_out.push(bytes);
         self.drain_connection_events(now_us);
     }
