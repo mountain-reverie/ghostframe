@@ -111,14 +111,15 @@ fn install(
     // continue as a transient unit outside its cgroup, running the installed
     // copy (copied first, so the unit does not depend on this path).
     let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
-    if !cfg.install_detached() && commands::install::in_legacy_headless_cgroup(&cgroup) {
+    let detaching =
+        !cfg.install_detached() && commands::install::in_legacy_headless_cgroup(&cgroup);
+    if detaching {
         commands::install::copy_binary(&exe, &paths.bin, force)?;
     }
     // The detached copy's output goes to a journal nobody is watching: decide
-    // the cap here, print it where the terminal is, and pass it on explicitly
-    // so the copy writes what was printed.
-    let detaching =
-        !cfg.install_detached() && commands::install::in_legacy_headless_cgroup(&cgroup);
+    // the cap here, print it where the terminal is (once the hand-off has
+    // succeeded), and pass it on explicitly so the copy writes what was
+    // printed.
     let (args, cap_line) = if detaching {
         let (args, line) = commands::install::detach_install_args(
             force,
@@ -129,9 +130,6 @@ fn install(
     } else {
         (commands::install::install_args(force, max_resolution), None)
     };
-    if let Some(line) = cap_line {
-        println!("{line}");
-    }
     if commands::install::maybe_detach(
         &mut commands::install::RealSystemctl,
         &cgroup,
@@ -140,6 +138,9 @@ fn install(
         &args,
         &mut std::io::stdout(),
     )? {
+        if let Some(line) = cap_line {
+            println!("{line}");
+        }
         return Ok(());
     }
     let state_dir = cfg.unit_state_dir(&home)?;
