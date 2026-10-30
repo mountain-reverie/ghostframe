@@ -17,11 +17,10 @@
 //! The root path never drew the cursor (X does not include it in an image).
 //! It is blended here from `XFixesGetCursorImage`, at `(x - xhot, y - yhot)`.
 
-use std::collections::HashSet;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use crate::capture::x11::damage::rect_to_tiles;
+use crate::capture::TileBitmap;
 use crate::util::monotonic_now_ns;
 use ghostframe_lib::FrameSubmission;
 use x11rb::connection::Connection;
@@ -158,6 +157,9 @@ pub struct X11Frames {
     /// Where the cursor was last DRAWN into a frame (set by `capture`, so a
     /// failed capture does not advance it).
     last_cursor: Option<CursorRect>,
+    /// Serial of the cursor image drawn with `last_cursor`: the same rectangle
+    /// with a new serial is a new image and must be redrawn.
+    last_cursor_serial: Option<u32>,
     /// Frames left until MIT-SHM is retried after a local allocation error.
     shm_retry_in: Option<u32>,
     /// The last MIT-SHM allocation failed locally and has not succeeded since;
@@ -198,10 +200,10 @@ fn cursor_dirty_tiles(
     screen_w: u32,
     screen_h: u32,
 ) -> Vec<(u32, u32)> {
-    let mut out = HashSet::new();
+    let mut out = TileBitmap::new(screen_w, screen_h);
     for r in [prev, cur].into_iter().flatten() {
-        // Clip to the screen in pixels first: only on-screen tiles exist,
-        // and the i16/u16 arguments of `rect_to_tiles` must not wrap.
+        // Clip to the screen in pixels first: the i16/u16 arguments of
+        // `set_rect` must not wrap.
         let x0 = r.x.max(0) as u32;
         let y0 = r.y.max(0) as u32;
         let x1 = (i64::from(r.x) + i64::from(r.w)).clamp(0, i64::from(screen_w)) as u32;
@@ -209,15 +211,9 @@ fn cursor_dirty_tiles(
         if x0 >= x1 || y0 >= y1 {
             continue;
         }
-        rect_to_tiles(
-            x0 as i16,
-            y0 as i16,
-            (x1 - x0) as u16,
-            (y1 - y0) as u16,
-            &mut out,
-        );
+        out.set_rect(x0 as i16, y0 as i16, (x1 - x0) as u16, (y1 - y0) as u16);
     }
-    let mut v: Vec<_> = out.into_iter().collect();
+    let mut v: Vec<_> = out.iter().collect();
     v.sort_unstable();
     v
 }
@@ -250,6 +246,7 @@ impl X11Frames {
             dump_first_frame,
             polled_cursor: None,
             last_cursor: None,
+            last_cursor_serial: None,
             shm_retry_in: None,
             shm_alloc_failing: false,
             stats: Default::default(),
@@ -408,6 +405,11 @@ impl X11Frames {
         std::mem::take(&mut self.stats)
     }
 
+    /// Root size in pixels as of the last capture (or connect).
+    pub fn size(&self) -> (u32, u32) {
+        (u32::from(self.width), u32::from(self.height))
+    }
+
     /// Query the cursor for the next frame and return the tiles its
     /// movement or image change dirtied (see [`cursor_dirty_tiles`]).
     ///
@@ -415,12 +417,20 @@ impl X11Frames {
     pub fn poll_cursor(&mut self) -> Vec<(u32, u32)> {
         let cursor = self.query_cursor();
         let cur = cursor.as_ref().map(CursorRect::of);
-        let tiles = cursor_dirty_tiles(
-            self.last_cursor,
-            cur,
-            u32::from(self.width),
-            u32::from(self.height),
-        );
+        // Same rectangle and same image as the one already drawn: nothing to
+        // redraw, so an idle desktop with a visible cursor reports no damage.
+        let unchanged = cur == self.last_cursor
+            && cursor.as_ref().map(|c| c.cursor_serial) == self.last_cursor_serial;
+        let tiles = if unchanged {
+            Vec::new()
+        } else {
+            cursor_dirty_tiles(
+                self.last_cursor,
+                cur,
+                u32::from(self.width),
+                u32::from(self.height),
+            )
+        };
         self.polled_cursor = Some(cursor);
         tiles
     }
@@ -438,6 +448,7 @@ impl X11Frames {
             None => self.query_cursor(),
         };
         self.last_cursor = cursor.as_ref().map(CursorRect::of);
+        self.last_cursor_serial = cursor.as_ref().map(|c| c.cursor_serial);
         if let Some(cursor) = cursor {
             blit_cursor(
                 &mut pixels,

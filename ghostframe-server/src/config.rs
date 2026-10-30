@@ -25,6 +25,7 @@
 //! | `GHOSTFRAME_CAPTURE_HEARTBEAT_EVERY` | trace heartbeat every N frames | 5 |
 //! | `GHOSTFRAME_DUMP_FIRST_FRAME` | dump first raw frame to this path (test builds only) | off |
 //! | `GHOSTFRAME_RANDR_SETTLE_MS` | least wait after a mode change before checking the desktop kept it | 5000 (`0` turns the read-back off) |
+//! | `GHOSTFRAME_DAMAGE_REPORT` | XDamage report level: `raw` selects `RawRectangles`, anything else `NonEmpty` + `FetchRegion` | `nonempty` |
 //! | `GHOSTFRAME_INSTALL_DETACHED` | `1`: `install` is the re-exec'd copy running as a transient unit; never re-exec again | unset |
 //! | `XDG_RUNTIME_DIR` | whether a user systemd manager can be asked about the old xdaemon (`login`, `capture`), and whether `login` enables and starts the installed unit | unset |
 //! | `GHOSTFRAME_MAX_RESOLUTION` | `WxH` resolution ceiling, or `none` | none (the unit `install` writes sets `1920x1080`) |
@@ -38,6 +39,29 @@ const DEFAULT_HEARTBEAT_EVERY: u64 = 5;
 /// reverting for about 3 s plus its 1 s `hotplug_response`, so about 4 s.
 /// 5 s clears both.
 pub const DEFAULT_RANDR_SETTLE_MS: u64 = 5000;
+
+/// Which XDamage report level the X11 backend asks for
+/// (`GHOSTFRAME_DAMAGE_REPORT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DamageReport {
+    /// `NonEmpty` + `DamageSubtract(parts)` + `FetchRegion`: at most one event
+    /// per tick, the server coalesces the rectangles. The default.
+    #[default]
+    NonEmpty,
+    /// `RawRectangles`: one event per damaged rectangle. The fallback.
+    Raw,
+}
+
+impl DamageReport {
+    /// `raw` selects the fallback; anything else (including unset) is the
+    /// default.
+    fn parse(raw: Option<String>) -> Self {
+        match raw.as_deref().map(str::trim) {
+            Some(v) if v.eq_ignore_ascii_case("raw") => Self::Raw,
+            _ => Self::NonEmpty,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -62,6 +86,8 @@ pub struct ServerConfig {
     pub max_resolution: Option<String>,
     /// `GHOSTFRAME_RANDR_SETTLE_MS`; zero turns the read-back off.
     pub randr_settle: std::time::Duration,
+    /// `GHOSTFRAME_DAMAGE_REPORT`.
+    pub damage_report: DamageReport,
 }
 
 impl ServerConfig {
@@ -178,6 +204,7 @@ impl ServerConfig {
                 get("GHOSTFRAME_RANDR_SETTLE_MS"),
                 DEFAULT_RANDR_SETTLE_MS,
             )),
+            damage_report: DamageReport::parse(get("GHOSTFRAME_DAMAGE_REPORT")),
         }
     }
 }
@@ -244,6 +271,19 @@ mod tests {
             std::path::Path::new("/x/ghostframe")
         );
         assert!(d(&[("XDG_STATE_HOME", "rel")]).is_err());
+    }
+
+    #[test]
+    fn damage_report_defaults_to_nonempty_and_raw_is_opt_in() {
+        assert_eq!(cfg(&[]).damage_report, DamageReport::NonEmpty);
+        assert_eq!(
+            cfg(&[("GHOSTFRAME_DAMAGE_REPORT", "raw")]).damage_report,
+            DamageReport::Raw
+        );
+        assert_eq!(
+            cfg(&[("GHOSTFRAME_DAMAGE_REPORT", "bogus")]).damage_report,
+            DamageReport::NonEmpty
+        );
     }
 
     #[test]

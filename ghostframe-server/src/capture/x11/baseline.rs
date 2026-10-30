@@ -253,7 +253,7 @@ pub fn run_scene(scene: Scene, w: u16, h: u16, ticks: u32, seed: u64) -> RunRepo
     let d = x.display();
     let mut backend = X11Backend {
         frames: frames::X11Frames::connect(Some(d), None).unwrap(),
-        damage: damage::XDamageMonitor::new(Some(d)),
+        damage: damage::XDamageMonitor::new(Some(d), crate::config::DamageReport::NonEmpty),
         input: None,
         display: None,
         stats: Default::default(),
@@ -265,7 +265,7 @@ pub fn run_scene(scene: Scene, w: u16, h: u16, ticks: u32, seed: u64) -> RunRepo
         painter.paint(scene, t);
         let cpu0 = thread_cpu_us();
         let t0 = Instant::now();
-        let hint = backend.drain_damage();
+        let hint = backend.drain_damage().into_hint();
         let frame = backend.capture(t * 33_333).expect("capture");
         #[allow(
             clippy::disallowed_methods,
