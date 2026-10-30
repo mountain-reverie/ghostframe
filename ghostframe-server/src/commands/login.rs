@@ -16,6 +16,7 @@ use ghostframe_lib::transport::ghostbridge::{
 };
 use ghostframe_lib::GhostbridgeConfig;
 
+use crate::commands::install::{InstallPaths, RealSystemctl, Systemctl, UNIT_NAME};
 use crate::config::ServerConfig;
 use crate::state::{self, RemoveError, StateLock};
 
@@ -65,6 +66,7 @@ pub fn login(
         hostname,
         control_url,
         GhostbridgeHandle::connect,
+        &mut RealSystemctl,
         &mut std::io::stdout(),
     )
 }
@@ -105,8 +107,74 @@ fn bridge_config(
 }
 
 /// Bring the node up, print the sign-in URL (unless `TS_AUTHKEY` makes that
-/// unnecessary) and return once the node is authorised.
+/// unnecessary) and return once the node is authorised. Then, with the state
+/// lock released, enable and start the installed service: `install` leaves
+/// it stopped for a node that had not joined, and nothing else would start
+/// it on a desktop that never activates `graphical-session.target`.
 pub fn login_with<T: Tailnet>(
+    cfg: &ServerConfig,
+    hostname: Option<String>,
+    control_url: Option<String>,
+    connect: impl FnOnce(&GhostbridgeConfig) -> Result<T, GhostbridgeError>,
+    sys: &mut dyn Systemctl,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    // The lock and the tsnet handle live (and die) inside `join`: the
+    // service needs both free to start.
+    join(cfg, hostname, control_url, connect, out)?;
+    start_service(cfg, sys, out)
+}
+
+/// Enable and start the installed unit after a successful join. Never fails
+/// the login: the join worked, so a systemd problem is a warning.
+fn start_service(
+    cfg: &ServerConfig,
+    sys: &mut dyn Systemctl,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let w = |e: std::io::Error| format!("writing output: {e}");
+    let Some(home) = cfg.home() else {
+        return Ok(());
+    };
+    let paths = InstallPaths::new(std::path::Path::new(home));
+    if !paths.unit_dir.join(UNIT_NAME).exists() {
+        writeln!(
+            out,
+            "{UNIT_NAME} is not installed; run `ghostframe-server install` to set it up"
+        )
+        .map_err(w)?;
+        return Ok(());
+    }
+    let by_hand =
+        format!("systemctl --user enable {UNIT_NAME} && systemctl --user start {UNIT_NAME}");
+    if !cfg.user_manager_possible() {
+        writeln!(
+            out,
+            "note: no user systemd manager reachable from this shell (XDG_RUNTIME_DIR unset), \
+             so {UNIT_NAME} was not started; from your desktop session run: {by_hand}"
+        )
+        .map_err(w)?;
+        return Ok(());
+    }
+    // No daemon-reload: `install` wrote the unit and reloaded; login changes
+    // no unit file.
+    match sys
+        .user(&["enable", UNIT_NAME])
+        .and_then(|()| sys.user(&["start", UNIT_NAME]))
+    {
+        Ok(()) => writeln!(out, "enabled and started {UNIT_NAME}").map_err(w)?,
+        Err(e) => writeln!(
+            out,
+            "warning: logged in, but {UNIT_NAME} could not be enabled and started: {e}\n  \
+             run by hand: {by_hand}"
+        )
+        .map_err(w)?,
+    }
+    Ok(())
+}
+
+/// The part of `login` that holds the state lock.
+fn join<T: Tailnet>(
     cfg: &ServerConfig,
     hostname: Option<String>,
     control_url: Option<String>,
@@ -400,9 +468,174 @@ mod tests {
                 });
                 Ok(f)
             },
+            &mut Rec::new(dir_of(cfg)),
             &mut out,
         );
         (r, String::from_utf8(out).unwrap(), seen.into_inner())
+    }
+
+    fn dir_of(cfg: &ServerConfig) -> PathBuf {
+        cfg.state_dir().unwrap()
+    }
+
+    /// Records `systemctl --user` calls and whether the state lock was free
+    /// when each was made.
+    struct Rec {
+        dir: PathBuf,
+        calls: Vec<String>,
+        lock_free: Vec<bool>,
+        fail_on: Option<String>,
+    }
+
+    impl Rec {
+        fn new(dir: PathBuf) -> Self {
+            Self {
+                dir,
+                calls: Vec::new(),
+                lock_free: Vec::new(),
+                fail_on: None,
+            }
+        }
+    }
+
+    impl Systemctl for Rec {
+        fn user_output(&mut self, args: &[&str]) -> Result<String, String> {
+            let call = args.join(" ");
+            self.lock_free.push(StateLock::acquire(&self.dir).is_ok());
+            self.calls.push(call.clone());
+            if self.fail_on.as_deref() == Some(call.as_str()) {
+                return Err(format!("systemctl --user {call} failed: injected"));
+            }
+            Ok(String::new())
+        }
+        fn is_active(&mut self, _: &str) -> bool {
+            false
+        }
+        fn systemd_run(&mut self, _: &[String]) -> Result<(), String> {
+            Err("not expected".into())
+        }
+    }
+
+    /// A joined login with `HOME` (and optionally a user manager) in a
+    /// sandbox; the unit file is written when `installed`.
+    fn run_service(
+        installed: bool,
+        manager: bool,
+        fail_on: Option<&str>,
+    ) -> (Result<(), String>, String, Rec) {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path().to_string_lossy().into_owned();
+        let mut env = vec![("HOME", h.as_str())];
+        if manager {
+            env.push(("XDG_RUNTIME_DIR", h.as_str()));
+        }
+        let (_r, cfg, dir) = setup(&env);
+        if installed {
+            let unit = InstallPaths::new(home.path()).unit_dir.join(UNIT_NAME);
+            std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+            std::fs::write(unit, b"[Service]\n").unwrap();
+        }
+        let f = Fake {
+            url: None,
+            ..fake(&dir)
+        };
+        let mut rec = Rec::new(dir);
+        rec.fail_on = fail_on.map(Into::into);
+        let mut out = Vec::new();
+        let r = login_with(
+            &cfg,
+            None,
+            None,
+            |_: &GhostbridgeConfig| Ok(&f),
+            &mut rec,
+            &mut out,
+        );
+        (r, String::from_utf8(out).unwrap(), rec)
+    }
+
+    #[test]
+    fn a_joined_login_enables_then_starts_the_unit_with_the_lock_released() {
+        let (r, out, rec) = run_service(true, true, None);
+        r.unwrap();
+        assert_eq!(
+            rec.calls,
+            [
+                "enable ghostframe-server.service",
+                "start ghostframe-server.service"
+            ]
+        );
+        assert_eq!(rec.lock_free, [true, true], "lock still held");
+        assert!(
+            out.contains("enabled and started ghostframe-server.service"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_missing_unit_touches_no_systemd_and_hints_at_install() {
+        let (r, out, rec) = run_service(false, true, None);
+        r.unwrap();
+        assert!(rec.calls.is_empty(), "{:?}", rec.calls);
+        assert!(out.contains("ghostframe-server install"), "{out}");
+    }
+
+    #[test]
+    fn no_user_manager_means_no_systemctl_and_a_by_hand_command() {
+        let (r, out, rec) = run_service(true, false, None);
+        r.unwrap();
+        assert!(rec.calls.is_empty(), "{:?}", rec.calls);
+        assert!(
+            out.contains("systemctl --user start ghostframe-server.service"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_failing_start_warns_and_the_login_still_succeeds() {
+        let (r, out, rec) = run_service(true, true, Some("start ghostframe-server.service"));
+        r.unwrap();
+        assert_eq!(rec.calls.len(), 2);
+        assert!(out.contains("warning: logged in"), "{out}");
+        assert!(out.contains("injected"), "{out}");
+        assert!(out.contains("run by hand"), "{out}");
+        assert!(
+            !out.lines().any(|l| l.starts_with("enabled and started")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_failing_enable_skips_start() {
+        let (r, out, rec) = run_service(true, true, Some("enable ghostframe-server.service"));
+        r.unwrap();
+        assert_eq!(rec.calls, ["enable ghostframe-server.service"]);
+        assert!(out.contains("warning: logged in"), "{out}");
+    }
+
+    #[test]
+    fn a_failed_join_starts_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path().to_string_lossy().into_owned();
+        let (_r, cfg, dir) = setup(&[("HOME", &h), ("XDG_RUNTIME_DIR", &h)]);
+        let unit = InstallPaths::new(home.path()).unit_dir.join(UNIT_NAME);
+        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        std::fs::write(unit, b"[Service]\n").unwrap();
+        let f = Fake {
+            up_result_err: true,
+            url: Some("http://u".into()),
+            ..fake(&dir)
+        };
+        let mut rec = Rec::new(dir);
+        let r = login_with(
+            &cfg,
+            None,
+            None,
+            |_: &GhostbridgeConfig| Ok(&f),
+            &mut rec,
+            &mut Vec::new(),
+        );
+        assert!(r.is_err());
+        assert!(rec.calls.is_empty());
     }
 
     fn run_logout(cfg: &ServerConfig, f: &Fake) -> (Result<(), String>, String) {

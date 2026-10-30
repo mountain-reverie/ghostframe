@@ -26,7 +26,7 @@
 //! | `GHOSTFRAME_DUMP_FIRST_FRAME` | dump first raw frame to this path (test builds only) | off |
 //! | `GHOSTFRAME_RANDR_SETTLE_MS` | least wait after a mode change before checking the desktop kept it | 5000 (`0` turns the read-back off) |
 //! | `GHOSTFRAME_INSTALL_DETACHED` | `1`: `install` is the re-exec'd copy running as a transient unit; never re-exec again | unset |
-//! | `XDG_RUNTIME_DIR` | whether a user systemd manager can be asked about the old xdaemon (`login`, `capture`) | unset |
+//! | `XDG_RUNTIME_DIR` | whether a user systemd manager can be asked about the old xdaemon (`login`, `capture`), and whether `login` enables and starts the installed unit | unset |
 //! | `GHOSTFRAME_MAX_RESOLUTION` | `WxH` resolution ceiling, or `none` | none (the unit `install` writes sets `1920x1080`) |
 
 pub const DEFAULT_CAPTURE_FPS: u64 = 30;
