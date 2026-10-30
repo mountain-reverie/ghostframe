@@ -809,6 +809,7 @@ mod x11_tests {
         assert_eq!(rig.drain(), Damage::Unknown);
         assert_eq!(rig.drain(), Damage::None);
     }
+
     /// A rejected `DamageSubtract` leaves `parts` as it was, and the fetch
     /// still succeeds. That must not read as "nothing changed".
     #[test]
@@ -822,6 +823,93 @@ mod x11_tests {
         assert!(
             rig.m.force_unknown,
             "an error also distrusts the next drain"
+        );
+    }
+
+    /// Median drain time in microseconds after `n` draws of `pattern`.
+    fn drain_cost_us(level: DamageReport, scattered: bool, n: usize) -> f64 {
+        let mut rig = Rig::new(level);
+        let mut seed = 7u64;
+        let mut times = Vec::new();
+        for _ in 0..15 {
+            for i in 0..n {
+                let r = if scattered {
+                    // A distinct 4x4 cell per rectangle on an 8 px grid: the
+                    // server cannot coalesce them.
+                    rect(((i % 64) * 8) as i16, ((i / 64 % 64) * 8) as i16, 4, 4)
+                } else {
+                    // Overlapping rectangles inside one 64x64 area.
+                    let x = (lcg(&mut seed) % 56) as i16;
+                    let y = (lcg(&mut seed) % 56) as i16;
+                    rect(x, y, 8, 8)
+                };
+                rig.m
+                    .conn
+                    .poly_fill_rectangle(rig.pixmap, rig.gc, &[r])
+                    .unwrap();
+            }
+            rig.m.conn.sync().unwrap();
+            let t = std::time::Instant::now();
+            let _ = rig.drain();
+            times.push(std::time::Instant::now().duration_since(t).as_secs_f64() * 1e6);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        times[times.len() / 2]
+    }
+
+    /// Least-squares slope of `ys` against `xs`.
+    fn slope(xs: &[f64], ys: &[f64]) -> f64 {
+        let n = xs.len() as f64;
+        let (mx, my) = (xs.iter().sum::<f64>() / n, ys.iter().sum::<f64>() / n);
+        let num: f64 = xs.iter().zip(ys).map(|(x, y)| (x - mx) * (y - my)).sum();
+        let den: f64 = xs.iter().map(|x| (x - mx) * (x - mx)).sum();
+        num / den
+    }
+
+    /// The report-level gate: drain cost against the number of rectangles
+    /// drawn per tick. Run under the bench lock, 3+ times:
+    ///
+    /// `flock -o $WORK/.gf-bench.lock xvfb-run -a cargo test -p
+    /// ghostframe-server --bins -- --ignored --nocapture drain_cost_slope`
+    #[test]
+    #[ignore = "timing; run under the bench lock"]
+    fn drain_cost_slope_against_event_count() {
+        let ns = [16usize, 64, 256, 1024, 4096];
+        let xs: Vec<f64> = ns.iter().map(|&n| n as f64).collect();
+        let mut slopes = std::collections::HashMap::new();
+        for scattered in [false, true] {
+            for level in [DamageReport::Raw, DamageReport::NonEmpty] {
+                let ys: Vec<f64> = ns
+                    .iter()
+                    .map(|&n| drain_cost_us(level, scattered, n))
+                    .collect();
+                let sl = slope(&xs, &ys);
+                eprintln!(
+                    "{:<9} {:<9} us at N={ns:?}: {ys:.1?}  slope {sl:.4} us/rect",
+                    if scattered { "scattered" } else { "clustered" },
+                    format!("{level:?}"),
+                );
+                slopes.insert((scattered, level), sl);
+            }
+        }
+        let (raw, ne) = (
+            slopes[&(false, DamageReport::Raw)],
+            slopes[&(false, DamageReport::NonEmpty)],
+        );
+        assert!(
+            raw > 0.0,
+            "raw slope {raw} is not positive: nothing measured"
+        );
+        // Not merely lower: flat. A NonEmpty that still did per-rect work
+        // would land near Raw's slope.
+        assert!(
+            ne < 0.25 * raw,
+            "NonEmpty slope {ne} is not well below Raw's {raw}"
+        );
+        let scattered_raw = slopes[&(true, DamageReport::Raw)];
+        assert!(
+            scattered_raw > 0.0,
+            "scattered raw slope {scattered_raw} is not positive: nothing measured"
         );
     }
 }
