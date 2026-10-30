@@ -90,8 +90,7 @@ git clone https://github.com/mountain-reverie/ghostframe.git
 cd ghostframe
 just build-release
 ./target/release/ghostframe-server install    # binary, user unit, autostart
-./target/release/ghostframe-server login      # prints a sign-in URL, waits for approval
-systemctl --user start ghostframe-server
+./target/release/ghostframe-server login      # prints a sign-in URL, waits for approval, then starts the service
 ```
 
 `install` copies the binary to `~/.local/bin/ghostframe-server`, writes
@@ -101,7 +100,12 @@ among them, never activate `graphical-session.target`), and enables the unit.
 From then on the server starts with your graphical session. It starts the
 service itself when the node has already joined a tailnet (including a
 registration left by the old `ghostframe-xdaemon`, which it adopts); otherwise
-it tells you to run `login`. A bare `ghostframe-server` prints the help.
+it tells you to run `login`, which enables and starts the service once the
+join succeeds (after releasing the state lock; if that fails it warns, still
+exits 0 and prints the `systemctl --user` commands to run by hand). With no
+unit installed, `login` only hints at `install`. The service holds the state
+lock, so stop it (`systemctl --user stop ghostframe-server`) before a repeat
+`login`; that `login` starts it again. A bare `ghostframe-server` prints the help.
 
 `install` must be run from your desktop session: it refuses root, needs the
 user systemd manager to be reachable, and needs `HOME` to match your passwd

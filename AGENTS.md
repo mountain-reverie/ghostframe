@@ -36,8 +36,11 @@ Deploying to a real session (run it from that user's desktop session, never as r
 ```bash
 just build-release
 ./target/release/ghostframe-server install --force   # as the session's user, no sudo
-./target/release/ghostframe-server login             # only if the node has not joined yet
+./target/release/ghostframe-server login             # only if the node has not joined yet; it then enables and starts the unit
 ```
+
+`login` stops being a hand-off: once joined it enables and starts the installed
+unit itself (stop the service first, since it holds the state lock).
 
 `install --force` replaces the binary and restarts `ghostframe-server.service`
 when the node has joined. `just build-release` builds `-p ghostframe-server`
