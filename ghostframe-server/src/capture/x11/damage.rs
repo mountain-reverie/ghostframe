@@ -127,7 +127,18 @@ impl XDamageMonitor {
     /// Drain all pending damage events and return the set of dirty tile
     /// coordinates. Non-blocking: returns an empty vec if no damage events are
     /// pending, and always empty while disarmed.
+    #[cfg(test)]
     pub fn drain_damage(&self) -> Vec<(u32, u32)> {
+        self.drain_damage_counted(&mut Default::default())
+    }
+
+    /// [`Self::drain_damage`], adding its real heap allocations to `stats`:
+    /// the tile set's growth steps (from its final capacity) and the result
+    /// list. Nothing is counted when no tile was damaged.
+    pub fn drain_damage_counted(
+        &self,
+        stats: &mut crate::capture::tick_stats::TickStats,
+    ) -> Vec<(u32, u32)> {
         if !self.armed {
             return Vec::new();
         }
@@ -159,6 +170,10 @@ impl XDamageMonitor {
         let _ = self.conn.damage_subtract(self.damage_id, 0u32, 0u32);
         let _ = self.conn.flush();
 
+        if tile_set.capacity() > 0 {
+            stats.allocs += crate::capture::tick_stats::hashset_allocs(tile_set.capacity());
+            stats.alloc(); // the result list
+        }
         tile_set.into_iter().collect()
     }
 

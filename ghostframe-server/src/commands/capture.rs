@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use ghostframe_lib::{GhostbridgeConfig, GhostframeServer};
 
+use crate::capture::tick_stats::thread_cpu_us;
 use crate::capture::Backend;
 use crate::config::ServerConfig;
 use crate::state;
@@ -187,6 +188,11 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
     // submit_frame (= IoBridge backpressure), or has exited.
     let heartbeat_every = cfg.heartbeat_every;
     let mut capture_failures = CaptureFailures::default();
+    // getrusage costs a syscall; only pay it when the trace line is wanted.
+    let cost_trace = tracing::enabled!(
+        target: "ghostframe::server::capture",
+        tracing::Level::TRACE
+    );
 
     loop {
         let loop_iter_start = std::time::Instant::now();
@@ -241,6 +247,9 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
         }
 
         let capture_start = std::time::Instant::now();
+        // Only the ticks whose line is logged (`frame_count` is bumped before it).
+        let sample_cpu = cost_trace && (frame_count + 1).is_multiple_of(heartbeat_every);
+        let cpu_start = if sample_cpu { thread_cpu_us() } else { 0 };
 
         // Some(tiles) = only these changed; None = check every tile.
         let damage_tiles = backend.drain_damage();
@@ -257,6 +266,13 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
             }
         };
 
+        // No await between `cpu_start` and here, so this is one thread.
+        let cpu_us = if sample_cpu {
+            thread_cpu_us().saturating_sub(cpu_start)
+        } else {
+            0
+        };
+        let tick_stats = backend.take_tick_stats();
         let capture_done = std::time::Instant::now();
         let capture_us = capture_done.duration_since(capture_start).as_micros() as u64;
 
@@ -316,6 +332,9 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
                     pixels_len = frame_pixels_len,
                     capture_us = capture_us,
                     submit_us = submit_us,
+                    cpu_us = cpu_us,
+                    bytes_copied = tick_stats.bytes_copied,
+                    allocs = tick_stats.allocs,
                     "[CAP] iter done"
                 );
             }

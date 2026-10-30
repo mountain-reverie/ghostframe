@@ -163,6 +163,8 @@ pub struct X11Frames {
     /// The last MIT-SHM allocation failed locally and has not succeeded since;
     /// set so that a persistent failure warns once, not on every retry.
     shm_alloc_failing: bool,
+    /// Copies and allocations since the last `take_stats` (PR 0 counters).
+    stats: crate::capture::tick_stats::TickStats,
 }
 
 /// A cursor image's rectangle in root coordinates.
@@ -250,6 +252,7 @@ impl X11Frames {
             last_cursor: None,
             shm_retry_in: None,
             shm_alloc_failing: false,
+            stats: Default::default(),
         };
         me.ensure_segment();
         tracing::info!(width, height, path = ?me.path(), "X11 capture connected to display");
@@ -369,6 +372,7 @@ impl X11Frames {
                     reply.size
                 )));
             }
+            self.stats.alloc_copy(want);
             return Ok(seg.bytes()[..want].to_vec());
         }
         let reply = self
@@ -383,14 +387,25 @@ impl X11Frames {
                 reply.data.len()
             )));
         }
+        self.stats.alloc_copy(want);
         Ok(reply.data)
     }
 
-    fn query_cursor(&self) -> Option<GetCursorImageReply> {
-        self.conn
+    fn query_cursor(&mut self) -> Option<GetCursorImageReply> {
+        let reply = self
+            .conn
             .xfixes_get_cursor_image()
             .ok()
-            .and_then(|c| c.reply().ok())
+            .and_then(|c| c.reply().ok());
+        if let Some(r) = &reply {
+            self.stats.alloc_copy(r.cursor_image.len() * 4);
+        }
+        reply
+    }
+
+    /// Copies and allocations since the last call; resets them.
+    pub fn take_stats(&mut self) -> crate::capture::tick_stats::TickStats {
+        std::mem::take(&mut self.stats)
     }
 
     /// Query the cursor for the next frame and return the tiles its
