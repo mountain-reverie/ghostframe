@@ -304,7 +304,7 @@ impl Client {
 
         // `TS_CONTROL_URL` mirrors `ghostframe-server`'s own
         // `env::var("TS_CONTROL_URL").unwrap_or_default()` (see
-        // `ghostframe-server/src/main.rs`): unset means "join the real
+        // `ghostframe-server/src/config.rs`): unset means "join the real
         // Tailscale network" (ghostbridge's `gbridge_new` treats an empty
         // string as "use tsnet's default `ControlURL`"), set means "join
         // this custom control plane instead" -- e.g. the e2e harness's

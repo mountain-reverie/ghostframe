@@ -14,9 +14,12 @@ procedure for deciding it on a real session instead.
 
 ```bash
 just build-release                              # build-web FIRST -- the client is //go:embed'd
-sudo ./packaging/install.sh <user> --force
-sudo machinectl shell <user>@ /usr/bin/systemctl --user restart ghostframe.target
+./target/release/ghostframe-server install --force   # as the session's user, no sudo
 ```
+
+`install --force` replaces `~/.local/bin/ghostframe-server` and restarts
+`ghostframe-server.service` when the node has joined (run `ghostframe-server
+login` first if it has not).
 
 Then **hard-reload the browser tab** (Ctrl+Shift+R). The wasm bundle is cached
 and a soft reload keeps the old one -- a stale bundle looks like a protocol
@@ -26,7 +29,7 @@ Confirm the embedded bundle actually changed rather than trusting the build:
 
 ```bash
 HASH=$(ls ghostframe-web-client/dist/assets | grep -oE 'index-[A-Za-z0-9_-]+' | sed 's/\.js$//' | head -1)
-strings target/release/ghostframe-xdaemon | grep -c "$HASH"   # expect >= 1
+strings target/release/ghostframe-server | grep -c "$HASH"   # expect >= 1
 ```
 
 The hash is vite's base64-ish digest (`index-C-pTSjk7`), not lowercase hex,
@@ -46,7 +49,7 @@ would also pass against a *stale* bundle whose hash shares that prefix.
    success for a build that failed with exit 127. This is how a stale bundle
    gets deployed while the log says the build was fine.
 3. **Check the artifact timestamps, not the build's word.** `dist/assets`
-   and `target/release/ghostframe-xdaemon` should both be newer than your
+   and `target/release/ghostframe-server` should both be newer than your
    last source edit. A stale `dist/` is silent: the daemon embeds whatever is
    there at compile time.
 
@@ -60,8 +63,8 @@ grep -c 'cdf53PassHist' ghostframe-web-client/dist/assets/*.js   # expect 0
 ## Server: what to read, and where
 
 ```bash
-journalctl _UID=$(id -u guest) -f            # live, as cedric, no sudo
-journalctl _UID=$(id -u guest) | grep 'cumulative emit'
+journalctl --user -u ghostframe-server -f    # live, as the session's user
+journalctl --user -u ghostframe-server | grep 'cumulative emit'
 ```
 
 One line every 60 frames at `info`, which is the shipped default filter
@@ -86,7 +89,7 @@ The formatter emits ANSI escapes *between* the field name and its value, so
 missing field. Strip them first:
 
 ```bash
-journalctl _UID=$(id -u guest) | grep 'cumulative emit' \
+journalctl --user -u ghostframe-server | grep 'cumulative emit' \
   | sed -r 's/\x1B\[[0-9;]*[mK]//g' \
   | grep -oE '(base_budget_bytes|tick_budget_floor_bytes|bytes_per_us|queued_critical_latency_(mean|max)_us)=[0-9.e+-]+'
 ```
