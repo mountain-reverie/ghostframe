@@ -132,20 +132,22 @@ pub fn login_with<T: Tailnet>(
     } else {
         None
     };
-    start_service(cfg, hold, env_notes, sys, out)
+    start_service(cfg, hold, state_dir_differs, env_notes, sys, out)
 }
 
 /// The by-hand advice for `cmd`, in one place for every exit that does not
 /// start the unit. With a `hold` it says why the start is withheld and what
 /// to fix first.
-fn advice(hold: Option<&str>, env_notes: bool, cmd: &str) -> String {
+fn advice(hold: Option<&str>, differs: bool, env_notes: bool, cmd: &str) -> String {
     match hold {
         None => format!("run: {cmd}"),
         Some(why) => {
-            let fix = if env_notes {
-                "adding the Environment= lines (`systemctl --user edit ghostframe-server`)"
-            } else {
-                "fixing the state directory (see the warning above)"
+            let state = "fixing the state directory (see the warning above)";
+            let env = "adding the Environment= lines (`systemctl --user edit ghostframe-server`)";
+            let fix = match (differs, env_notes) {
+                (true, true) => format!("{state} and {env}"),
+                (_, true) => env.to_string(),
+                _ => state.to_string(),
             };
             format!("not starting {UNIT_NAME}: {why}.\n  After {fix}, run: {cmd}")
         }
@@ -157,6 +159,7 @@ fn advice(hold: Option<&str>, env_notes: bool, cmd: &str) -> String {
 fn start_service(
     cfg: &ServerConfig,
     hold: Option<&str>,
+    differs: bool,
     env_notes: bool,
     sys: &mut dyn Systemctl,
     out: &mut dyn Write,
@@ -167,7 +170,7 @@ fn start_service(
         writeln!(
             out,
             "HOME is unset, cannot locate the unit; if it is installed, {}",
-            advice(hold, env_notes, &full)
+            advice(hold, differs, env_notes, &full)
         )
         .map_err(w)?;
         return Ok(());
@@ -175,7 +178,8 @@ fn start_service(
     let paths = InstallPaths::new(std::path::Path::new(home));
     if !paths.unit_dir.join(UNIT_NAME).exists() {
         let first = if env_notes {
-            " (add the Environment= lines first)"
+            "; then add the Environment= lines (`systemctl --user edit \
+             ghostframe-server`) and run `systemctl --user restart ghostframe-server`"
         } else {
             ""
         };
@@ -191,7 +195,7 @@ fn start_service(
             out,
             "note: no user systemd manager reachable from this shell (XDG_RUNTIME_DIR unset), so nothing was started. \
              In your desktop session: {}",
-            advice(hold, env_notes, &full)
+            advice(hold, differs, env_notes, &full)
         )
         .map_err(w)?;
         return Ok(());
@@ -202,10 +206,11 @@ fn start_service(
         let msg = match sys.user(&["enable", UNIT_NAME]) {
             Ok(()) => advice(
                 hold,
+                differs,
                 env_notes,
                 &format!("systemctl --user start {UNIT_NAME}"),
             ),
-            Err(e) => format!("{e}\n  {}", advice(hold, env_notes, &full)),
+            Err(e) => format!("{e}\n  {}", advice(hold, differs, env_notes, &full)),
         };
         writeln!(out, "{msg}").map_err(w)?;
         return Ok(());
@@ -673,7 +678,8 @@ mod tests {
     #[test]
     fn no_exit_leaks_an_unqualified_enable_and_start_under_a_hold() {
         let bare = "systemctl --user enable ghostframe-server.service && ";
-        // No manager, HOME unset, unit missing: each with a mismatch and with a note.
+        // Two exits (no manager; HOME unset), each with a mismatch and with a
+        // --hostname note. The missing-unit hint is checked after the loop.
         for (installed, manager, home_set) in [(true, false, true), (true, true, false)] {
             for (flags, differs) in [((None, None), true), ((Some("other"), None), false)] {
                 let (r, out, rec) = run_full(installed, manager, None, flags, differs, home_set);
@@ -687,7 +693,12 @@ mod tests {
             }
         }
         let (_, out, _) = run_full(false, true, None, (Some("other"), None), false, true);
-        assert!(out.contains("add the Environment= lines first"), "{out}");
+        assert!(
+            out.contains(
+                "`ghostframe-server install` to set it up; then add the Environment= lines"
+            ) && out.contains("systemctl --user restart ghostframe-server"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -705,6 +716,18 @@ mod tests {
         assert!(out.contains("After adding the Environment= lines"), "{out}");
         assert!(
             out.contains("enable ghostframe-server.service && systemctl --user start"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn both_hold_causes_name_both_fixes() {
+        let (r, out, rec) = run_full(true, true, None, (Some("other"), None), true, true);
+        r.unwrap();
+        assert_eq!(rec.calls, ["enable ghostframe-server.service"]);
+        assert!(
+            out.contains("fixing the state directory")
+                && out.contains("and adding the Environment= lines"),
             "{out}"
         );
     }
