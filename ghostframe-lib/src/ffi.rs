@@ -30,8 +30,34 @@ pub struct FfiHandle {
 /// Opaque pointer returned to C callers.
 pub type GfServerHandle = *mut FfiHandle;
 
+/// The tailnet configuration for a C-API embedder. Embedders are daemons:
+/// sign-in URLs stay out of their logs, so the join must be non-interactive
+/// too, or an unseeded node with no auth key would wait forever for a URL
+/// nobody can read.
+fn embedder_config(
+    hostname: String,
+    authkey: String,
+    state_dir: String,
+    control_url: String,
+) -> GhostbridgeConfig {
+    GhostbridgeConfig {
+        hostname,
+        authkey,
+        state_dir,
+        control_url,
+        quiet: false,
+        non_interactive: true,
+        redact_auth_urls: true,
+    }
+}
+
 /// Create and start a new GhostframeServer.
 /// Returns a handle on success, or null on failure.
+///
+/// The node must be able to join without a person: pass a non-empty `authkey`
+/// (a Tailscale auth key), or a `state_dir` that already holds a joined node.
+/// Sign-in URLs are redacted from the logs, so a node with neither could only
+/// wait for a sign-in nobody can see; it fails instead (null).
 ///
 /// # Safety
 /// All string pointers must be valid, NUL-terminated C strings.
@@ -47,16 +73,12 @@ pub unsafe extern "C" fn gf_server_new(
     }
     // A panic must not unwind across `extern "C"` (abort on Rust >= 1.81).
     guarded(std::ptr::null_mut(), || {
-        let config = GhostbridgeConfig {
-            hostname: CStr::from_ptr(hostname).to_string_lossy().into_owned(),
-            authkey: CStr::from_ptr(authkey).to_string_lossy().into_owned(),
-            state_dir: CStr::from_ptr(state_dir).to_string_lossy().into_owned(),
-            control_url: CStr::from_ptr(control_url).to_string_lossy().into_owned(),
-            quiet: false,
-            non_interactive: false,
-            // C-API embedders are daemons too: keep sign-in URLs out of logs.
-            redact_auth_urls: true,
-        };
+        let config = embedder_config(
+            CStr::from_ptr(hostname).to_string_lossy().into_owned(),
+            CStr::from_ptr(authkey).to_string_lossy().into_owned(),
+            CStr::from_ptr(state_dir).to_string_lossy().into_owned(),
+            CStr::from_ptr(control_url).to_string_lossy().into_owned(),
+        );
 
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
@@ -271,6 +293,14 @@ pub unsafe extern "C" fn gf_server_destroy(handle: GfServerHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Redacted URLs plus an interactive join would wait forever for a
+    /// sign-in nobody can see.
+    #[test]
+    fn embedder_config_redacts_urls_and_never_waits_for_a_person() {
+        let c = embedder_config("h".into(), String::new(), "/s".into(), String::new());
+        assert!(c.redact_auth_urls && c.non_interactive);
+    }
 
     /// stride * height = 2^32 wraps to 0 in u32; it must be rejected, not accepted as
     /// an empty or short buffer.

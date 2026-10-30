@@ -325,6 +325,11 @@ typedef struct FfiHandle *GfServerHandle;
  * Create and start a new GhostframeServer.
  * Returns a handle on success, or null on failure.
  *
+ * The node must be able to join without a person: pass a non-empty `authkey`
+ * (a Tailscale auth key), or a `state_dir` that already holds a joined node.
+ * Sign-in URLs are redacted from the logs, so a node with neither could only
+ * wait for a sign-in nobody can see; it fails instead (null).
+ *
  * # Safety
  * All string pointers must be valid, NUL-terminated C strings.
  */
