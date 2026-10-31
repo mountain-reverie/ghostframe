@@ -497,16 +497,24 @@ mod tests {
             damage::XDamageMonitor::new(Some(x.display()), crate::config::DamageReport::NonEmpty)
                 .unwrap();
         m.arm();
+        // Without the round trip every drain below can run before the server
+        // has answered `arm`, and its late notification lands as Tiles on
+        // whichever drain comes next (seen on a CI runner).
+        m.sync_for_test();
         assert_eq!(m.drain_damage(256, 256), Damage::Unknown); // just armed
+        m.sync_for_test();
         assert_eq!(m.drain_damage(256, 256), Damage::None);
 
         // A good grab changes nothing.
         distrust_after_failed_capture(&Ok(()), Some(&mut m));
+        m.sync_for_test();
         assert_eq!(m.drain_damage(256, 256), Damage::None);
         // A failed one does.
         let failed: io::Result<()> = Err(io::Error::other("grab failed"));
         distrust_after_failed_capture(&failed, Some(&mut m));
+        m.sync_for_test();
         assert_eq!(m.drain_damage(256, 256), Damage::Unknown);
+        m.sync_for_test();
         assert_eq!(m.drain_damage(256, 256), Damage::None, "one drain only");
     }
 
