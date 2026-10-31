@@ -137,6 +137,7 @@ pub unsafe extern "C" fn gf_server_submit_frame(
             pixels: pixel_data.into(),
             dmabuf_fd: None,
             timestamp_us,
+            content: crate::frame_damage::Content::Pixels,
             damage: crate::frame_damage::FrameDamage::Unknown,
             capture_done_ns: 0,
         };

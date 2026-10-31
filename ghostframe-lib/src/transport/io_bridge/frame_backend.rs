@@ -138,6 +138,9 @@ pub enum PixelSource {
     Frame,
     /// A read-back of the frame's DMA-BUF.
     Readback(ReadbackFrame),
+    /// Pixels the backend produced itself: the persistent upload image, for
+    /// an unchanged tick that has to re-send tiles.
+    Owned(Vec<u8>),
 }
 
 /// Real-clock nanoseconds the tile stage spent, for the `frame.tile_stages`
@@ -236,6 +239,9 @@ pub struct GpuBackend {
     encoder: Option<FullFrameEncoder>,
     /// The GPU outputs of the frame in flight, between `analyse` and `finish_*`.
     held: Option<FrameAnalysis>,
+    /// The screen of an unchanged tick whose analysis found tiles to send
+    /// (the first-frame branch), between `analyse` and `finish_tile`.
+    unchanged_pixels: Option<Vec<u8>>,
 }
 
 impl GpuBackend {
@@ -244,6 +250,7 @@ impl GpuBackend {
             processor,
             encoder: None,
             held: None,
+            unchanged_pixels: None,
         }
     }
 
@@ -289,9 +296,13 @@ impl FrameBackend for GpuBackend {
         want_diag: bool,
     ) -> Result<Analysed, String> {
         self.held = None;
+        self.unchanged_pixels = None;
         self.processor.set_escalation_candidates(escalation);
         let raw_fd = frame.dmabuf_fd.as_ref().map(|fd| fd.as_raw_fd());
         let result = match raw_fd {
+            _ if frame.content == crate::frame_damage::Content::Unchanged => self
+                .processor
+                .process_frame_unchanged(frame.width, frame.height),
             Some(fd) => self
                 .processor
                 .process_frame(fd, frame.width, frame.height, frame.stride),
@@ -304,6 +315,18 @@ impl FrameBackend for GpuBackend {
             ),
         };
         let analysis = result.map_err(|e| e.to_string())?;
+        // Nothing changed, yet tiles are to be sent (no reference yet): they
+        // come from the upload image, which is what the screen shows.
+        if frame.content == crate::frame_damage::Content::Unchanged
+            && !analysis.dirty_tiles.is_empty()
+        {
+            self.unchanged_pixels =
+                self.processor
+                    .read_upload_pixels(frame.width, frame.height, frame.stride);
+            if self.unchanged_pixels.is_none() {
+                return Err("unchanged tick: the upload image could not be read back".into());
+            }
+        }
 
         let ta = analysis.tile_analysis_slice();
         let dirty_analysis = analysis
@@ -391,7 +414,12 @@ impl FrameBackend for GpuBackend {
 
         // Source for tile pixel extraction. The CPU path populates
         // `frame.pixels`; the GPU/DMA-BUF path leaves it empty.
-        let pixels = if !frame.pixels.is_empty() {
+        let pixels = if frame.content == crate::frame_damage::Content::Unchanged {
+            // No dirty tile needs pixels unless the analysis read them back.
+            Ok(PixelSource::Owned(
+                self.unchanged_pixels.take().unwrap_or_default(),
+            ))
+        } else if !frame.pixels.is_empty() {
             Ok(PixelSource::Frame)
         } else {
             match frame.dmabuf_fd.as_ref() {
@@ -531,6 +559,7 @@ impl FrameBackend for GpuBackend {
             let source_pixels: &[u8] = match &pixels {
                 Ok(PixelSource::Frame) => &frame.pixels,
                 Ok(PixelSource::Readback(rb)) => rb,
+                Ok(PixelSource::Owned(v)) => v,
                 Err(_) => &[],
             };
             let grid = crate::tile::TileGrid::new(frame.width, frame.height);
