@@ -25,7 +25,9 @@ use super::bands::{self, Grab};
 use crate::capture::safety_net::Slice;
 use crate::capture::{Damage, TileBitmap};
 use crate::util::monotonic_now_ns;
-use ghostframe_lib::{FrameBuf, FramePool, FrameStorage, FrameSubmission, PoolSlot};
+use ghostframe_lib::{
+    FrameBuf, FrameDamage, FramePool, FrameStorage, FrameSubmission, PoolSlot, TileBits,
+};
 use x11rb::connection::Connection;
 use x11rb::cookie::Cookie;
 use x11rb::protocol::shm::{self, ConnectionExt as ShmExt};
@@ -210,6 +212,11 @@ pub struct X11Frames {
     plan: Option<Plan>,
     /// The planned tick's damage, reused every tick.
     plan_mask: TileBitmap,
+    /// Scratch for the sweep slice's tiles, reused every tick.
+    verify_mask: TileBitmap,
+    /// What the library is told about the tick being grabbed: set by
+    /// `choose` when the damage is believed, taken by `capture`.
+    lib_damage: Option<FrameDamage>,
     /// Grab ticks so far; a segment's `held` is one of these.
     tick: u64,
     /// The grab set of each of the last [`AGE_RING`] ticks, indexed by
@@ -268,6 +275,10 @@ pub(crate) enum Mutation {
     SkipBand,
     /// Leave the tiles under the cursor about to be blended out of the grab.
     DropBlendCursorTiles,
+    /// Tell the library no tile is damaged (it is still told the slice).
+    EmptyLibHint,
+    /// Tell the library nothing of the sweep slice.
+    EmptyLibVerify,
 }
 
 /// A cursor image's rectangle in root coordinates.
@@ -359,6 +370,8 @@ impl X11Frames {
             stats: Default::default(),
             plan: None,
             plan_mask: TileBitmap::empty(),
+            verify_mask: TileBitmap::empty(),
+            lib_damage: None,
             tick: 0,
             ring: Vec::new(),
             age_floor: 0,
@@ -734,6 +747,7 @@ impl X11Frames {
     fn choose(&mut self, held: Option<u64>, cursor: Option<CursorRect>) -> Grab {
         self.tick += 1;
         let t = self.tick;
+        self.lib_damage = None;
         let Some(plan) = self.plan.take() else {
             self.ring.clear();
             self.age_floor = t;
@@ -755,8 +769,34 @@ impl X11Frames {
         // another size says nothing about this one.
         if plan.known && self.plan_mask.matches(w, h) {
             entry.mask.copy_from(&self.plan_mask);
+            if !self.verify_mask.matches(w, h) {
+                self.verify_mask = TileBitmap::new(w, h);
+                self.stats.alloc();
+            }
+            self.verify_mask.clear();
             if let Some(s) = plan.slice {
                 entry.mask.set_rows(s.lo, s.hi);
+                self.verify_mask.set_rows(s.lo, s.hi);
+            }
+            // The library compares the rows of the damage and of the slice,
+            // whatever the grab refreshed beyond them for buffer age.
+            #[allow(unused_mut)]
+            let (mut hint_words, mut verify_words) = (
+                self.plan_mask.words().to_vec(),
+                self.verify_mask.words().to_vec(),
+            );
+            #[cfg(test)]
+            match self.mutation {
+                Mutation::EmptyLibHint => hint_words.fill(0),
+                Mutation::EmptyLibVerify => verify_words.fill(0),
+                _ => {}
+            }
+            if let (Some(hint), Some(verify)) = (
+                TileBits::from_words(w, h, hint_words),
+                TileBits::from_words(w, h, verify_words),
+            ) {
+                self.stats.alloc_copy(2 * self.plan_mask.words().len() * 8);
+                self.lib_damage = Some(FrameDamage::Tiles { hint, verify });
             }
         } else {
             entry.mask.set_all();
@@ -843,7 +883,9 @@ impl X11Frames {
             pixels,
             dmabuf_fd: None,
             timestamp_us,
-            damage: ghostframe_lib::FrameDamage::Unknown,
+            // `Tiles` only for a planned, believed tick; else the library
+            // compares everything.
+            damage: self.lib_damage.take().unwrap_or(FrameDamage::Unknown),
             capture_done_ns,
         };
         // One-shot diagnostic: dump the first frame to the path in
