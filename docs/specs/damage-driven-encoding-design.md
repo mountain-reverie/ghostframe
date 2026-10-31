@@ -147,7 +147,33 @@ Library changes, in order of payoff (all behind the PR 6 gating and the default-
 4. **Partial reference update** as defined above, via `vkCmdCopyImage` regions for committed tiles.
 5. **`Content::Unchanged`**, section 3.3.
 
-The `no_commit` cushion and the first-frame branch (`frame.rs:382-460`) stay `Unknown`-only paths.
+The `no_commit` cushion and the first-frame branch compare every tile (they still upload only the named rows when the upload image is consistent).
+
+*As landed (PR 6), `damage_mode = on`.* `FrameSubmission.damage_tiles` is replaced by `FrameDamage`: `Unknown`, or `Tiles { hint, verify }`, each one bit per tile (`TileBits`, the layout `FrameFeedback` uses, with the grid it was built for so a bitmap for another size is rejected). The C ABI and every producer but a planned `on` tick send `Unknown`; the CPU test path ignores the field. Wire format and `ghostframe.h` are unchanged.
+
+- *Server.* A planned tick whose damage is believed sends `hint` = that tick's damage mask (cursor old and new tiles merged in) and `verify` = the sweep slice due. The rows the grab refreshed beyond those for buffer age are not named: they were uploaded on the ticks that reported them. `Unknown` for the first tick, a stale-sized or unbelievable tick, a distrusted tick and any capture nobody planned. A full grab (above F) still carries `Tiles`: the slot is fresh everywhere, and the damage is relative to the previous submission, not to the grab.
+- *Upload.* `from-pixels` frames go into one persistent HOST_VISIBLE linear image per resolution (`UploadImage`), written by row: `Unknown` copies every row, `Tiles` the tile rows holding a `hint` or `verify` bit, and nothing else. The transient `import_pixels` image is gone from this path (it is still the dma-buf and `forward_cdf53_tiles` path).
+- *Candidates.* Every tile in an uploaded tile row is a SAD candidate (authority rule). The SAD, NV12 and analysis stages are dispatched over the uploaded runs only (`vkCmdDispatchBase`, so the three shaders are unchanged; the pipelines gained `DISPATCH_BASE`); runs beyond 16 are merged smallest gap first, which only adds tiles to compare. Tiles in no run are not dispatched and read as clean: the host-visible SAD buffer is cleared before the dispatch because it still holds the last frame's scores. Escalation, the palette stages and the classifier read the persistent image and the persistent analysis and NV12 buffers, which are current outside the runs.
+- *Reference and NV12.* The reference commit is PR 3's, unchanged: tile_sad commits a tile when its SAD is over the threshold, so only candidate tiles can be committed. NV12 and analysis are converted for every candidate whatever the mode, so a TileCodec-to-H.264 switch finds the buffer exact.
+- *When damage is not believed.* The processor honours `Tiles` only when the previous from-pixels frame left the upload image, NV12 and analysis consistent (`damage_baseline`). It is cleared at the start of every such frame and set when one completes, so a failed frame, a resize and a dma-buf frame leave it clear; `Control::ForgetDamage` clears it for a frame the bridge dropped before the GPU stage (no session). The next frame goes through whole. A session reset that drops `prev_image` takes the first-frame branch, which compares every tile.
+- *Test hooks.* `gpu_pipeline::damage_tests` (needs a GPU; CI exempts the module by name in the workflow) holds the oracle, the authority rule and the row-count property; `damage_report` (`--ignored`) prints upload and GPU time per damaged fraction. Server side, `x11_every_changed_row_is_named_to_the_library` checks against a real Xvfb that every pixel that differs from the previous delivered frame lies in a named row.
+
+Measured, 1080p/4K, `damage_report`, median of 3 runs, microseconds (`unknown` is the whole-frame path with the persistent image; PR 3's transient-image path measured 6.33 ms median at 1080p/5 %, `reference_report`):
+
+| res | damaged tile rows | unknown: upload / gpu | tiles: upload / gpu |
+|---|---|---|---|
+| 1080p | 0 | 591 / 3307 | 0 / 134 |
+| 1080p | 1 (typing) | 585 / 3703 | 16 / 524 |
+| 1080p | 2 (5 %) | 588 / 4327 | 32 / 1360 |
+| 1080p | 9 (25 %) | 594 / 6606 | 157 / 4265 |
+| 1080p | 34 (100 %) | 598 / 15181 | 595 / 15178 |
+| 4K | 0 | 2426 / 12776 | 0 / 226 |
+| 4K | 1 (typing) | 2434 / 13021 | 33 / 692 |
+| 4K | 4 (5 %) | 2406 / 15828 | 136 / 4012 |
+| 4K | 17 (25 %) | 2407 / 24613 | 595 / 15257 |
+| 4K | 68 (100 %) | 2411 / 59576 | 2423 / 59210 |
+
+Upload time is proportional to the uploaded rows and GPU time is a small fixed part (O(tiles) shared stages, about 0.13 ms at 1080p and 0.23 ms at 4K) plus about 0.44 ms per 1080p tile row, with no regression at saturation. The 1080p/5 % floor of 6.3 ms is now 1.4 ms. What is left of the floor is the fixed part and the per-row compare, analysis and NV12.
 
 ### 3.3 The progressive-refinement / PixelPerfect state machine, and the `Unchanged` tick
 

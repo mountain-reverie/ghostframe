@@ -59,8 +59,9 @@ pub trait Backend {
     /// Resolution control, or `None` (the session keeps its size).
     fn display_controller(&self) -> Option<Arc<dyn DisplayController>>;
 
-    /// Grab one frame. `damage_tiles` is left `None`; the capture loop fills
-    /// it from [`Backend::drain_damage`].
+    /// Grab one frame. `damage` is [`ghostframe_lib::FrameDamage::Unknown`]
+    /// unless [`Backend::plan_grab`] preceded the call and its damage is
+    /// believed, in which case it names the rows the library may compare.
     fn capture(&mut self, timestamp_us: u32) -> std::io::Result<FrameSubmission>;
 
     /// The pool this backend's frames come from, if it has one. A capture
