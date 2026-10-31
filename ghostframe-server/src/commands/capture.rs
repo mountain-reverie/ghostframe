@@ -166,11 +166,13 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
     if net.is_some() {
         server.feedback().enable();
         if cfg.damage_mode == DamageMode::On {
+            backend.set_allow_unchanged(true);
             tracing::info!(
                 full_grab_above_pct = crate::capture::x11::bands::FULL_GRAB_ABOVE_PCT,
                 "GHOSTFRAME_DAMAGE_MODE=on: the grab copies only the rows damage, the \
                  sweep and the cursor name (full grab above the threshold, when damage \
-                 is unknown or distrusted); the whole frame is still compared"
+                 is unknown or distrusted); the library compares the rows they name, \
+                 and a tick with nothing to show sends no pixels at all"
             );
         }
         tracing::info!(
