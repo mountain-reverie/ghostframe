@@ -936,6 +936,13 @@ impl IoBridge {
                 if inflight.epoch != self.session_epoch {
                     return;
                 }
+                // An unchanged tick the backend could not honour: the dropped
+                // verdict above tells the producer to send pixels, and this is
+                // neither a GPU fault to warn about nor to count.
+                if error.starts_with(super::frame_backend::UNCHANGED_REFUSED) {
+                    tracing::debug!(target: LOG_TARGET, seq, "{error}");
+                    return;
+                }
                 // No software path: a frame the GPU cannot analyse is dropped.
                 // The next frame re-reports its dirty tiles against the same
                 // baseline, so nothing is lost for good.

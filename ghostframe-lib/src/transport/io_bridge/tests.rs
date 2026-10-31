@@ -7325,3 +7325,34 @@ async fn the_dirty_set_and_a_failed_frame_reach_the_feedback_sink() {
         (43, &FeedbackKind::Dropped)
     );
 }
+
+/// An unchanged tick the backend refuses is a dropped frame, not a GPU fault:
+/// the producer is told (a Dropped verdict), nothing is counted as a failure.
+#[tokio::test]
+async fn a_refused_unchanged_tick_is_dropped_without_counting_a_gpu_failure() {
+    use crate::feedback::{FeedbackKind, FeedbackSink};
+    for (err, counted) in [
+        (
+            format!("{}no baseline", frame_backend::UNCHANGED_REFUSED),
+            0,
+        ),
+        ("vkQueueSubmit failed".to_string(), 1),
+    ] {
+        let backend = RecordingBackend {
+            analyse_err: Some(err),
+            ..Default::default()
+        };
+        let (mut bridge, _peer) = bridge_with_backend(backend);
+        let sink = Arc::new(FeedbackSink::new());
+        sink.enable();
+        bridge.feedback = Some(sink.clone());
+        bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+        let msg = next_worker_message(&mut bridge).await.expect("failed");
+        bridge.on_frame_worker_message(msg);
+        assert_eq!(bridge.gpu_analyse_failures, counted);
+        let mut got = Vec::new();
+        sink.drain_into(&mut got);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, FeedbackKind::Dropped);
+    }
+}
