@@ -823,6 +823,57 @@ impl X11Frames {
         }
     }
 
+    /// On a content-free tick, bring the cheapest free slot up to date with
+    /// everything since it was last written (cursor blended, as for a frame)
+    /// and give it back, so the next tick that carries pixels finds a slot with
+    /// nothing, or little, to catch up on. At most one slot per tick; nothing
+    /// when that slot is already current. Without it a damage tick after a
+    /// quiet stretch pays for every sweep slice the quiet ticks skipped.
+    fn keep_a_slot_current(&mut self, cursor: Option<GetCursorImageReply>) {
+        if self.pool.free_slots() == 0 {
+            return;
+        }
+        let t = self.tick;
+        let h = u32::from(self.height);
+        let pool = self.pool.clone();
+        let Some(slot) = pool.try_acquire_cheapest(|s| match segment_held(s) {
+            // A slot never written would need a full grab.
+            None => u64::from(h) + 1,
+            Some(held) => match self.grab_for(t, Some(held), None) {
+                Grab::Full => u64::from(h),
+                Grab::Bands(b) => u64::from(b.rows()),
+            },
+        }) else {
+            return;
+        };
+        let Some(held) = slot.storage().and_then(segment_held) else {
+            return;
+        };
+        // Already current: only the cursor's own tiles would be named.
+        if matches!(self.grab_for(t, Some(held), None), Grab::Bands(b) if b.rows() == 0) {
+            return;
+        }
+        let choice = self.grab_for(t, Some(held), cursor.as_ref().map(CursorRect::of));
+        match self.grab(slot, choice) {
+            Ok(mut pixels) => {
+                if let Some(cursor) = cursor {
+                    blit_cursor(
+                        pixels.bytes_mut(),
+                        i32::from(self.width),
+                        i32::from(self.height),
+                        &cursor,
+                    );
+                }
+                // Dropped here: the slot goes back to the pool, written.
+            }
+            Err(_) => {
+                self.ring.clear();
+                self.age_floor = self.tick + 1;
+                self.last_sent = None;
+            }
+        }
+    }
+
     /// Say whether a content-free tick may be sent as
     /// [`Content::Unchanged`] (the consumer of damage turns this on).
     pub fn set_allow_unchanged(&mut self, on: bool) {
@@ -936,7 +987,10 @@ impl X11Frames {
             self.ensure_segment();
         }
         if self.tick_is_content_free() {
-            return Ok(self.unchanged_tick(timestamp_us));
+            let cursor = self.polled_cursor.take().flatten();
+            let frame = self.unchanged_tick(timestamp_us);
+            self.keep_a_slot_current(cursor);
+            return Ok(frame);
         }
         if self.pool.free_slots() == 0 {
             return Err(io::Error::new(

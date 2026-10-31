@@ -134,6 +134,7 @@ impl Rig {
     /// came: no property check.
     pub fn tick_raw(&mut self) -> ghostframe_lib::FrameSubmission {
         self.ts += 33_333;
+        self.backend.frames.last_grab = None;
         let (_, frame) = damage_plan_grab(&mut self.backend, &mut self.net, self.ts);
         frame.expect("grab")
     }
@@ -761,7 +762,9 @@ fn run_unchanged_property(mutation: Mutation, ticks: u32, seed: u64) -> Result<(
     let mut rng = Rng(seed | 1);
     let row = usize::from(W) * 4;
     let mut model: Vec<u8> = Vec::new();
-    let (mut unchanged, mut pixels) = (0u32, 0u32);
+    let (mut unchanged, mut pixels, mut refreshed) = (0u32, 0u32, 0u32);
+    // The pipeline holds a frame for three ticks, so the slots rotate.
+    let mut held: std::collections::VecDeque<(u32, ghostframe_lib::FrameBuf)> = Default::default();
     for t in 0..ticks {
         // Bursts of painting between long idle runs.
         let busy = (t / 12) % 3 == 0;
@@ -785,6 +788,8 @@ fn run_unchanged_property(mutation: Mutation, ticks: u32, seed: u64) -> Result<(
         match frame.content {
             Content::Unchanged => {
                 unchanged += 1;
+                // A content-free tick that grabbed kept a free slot current.
+                refreshed += u32::from(rig.backend.frames.last_grab.is_some());
                 if !frame.pixels.is_empty() {
                     return Err(format!("tick {t}: an unchanged tick carried pixels"));
                 }
@@ -826,6 +831,13 @@ fn run_unchanged_property(mutation: Mutation, ticks: u32, seed: u64) -> Result<(
                 frame.content
             ));
         }
+        held.push_back((t, frame.pixels));
+        while held.front().is_some_and(|(at, _)| at + 3 <= t) {
+            held.pop_front();
+        }
+    }
+    if refreshed == 0 {
+        return Err("no content-free tick ever refreshed a free slot".into());
     }
     Ok((unchanged, pixels))
 }
