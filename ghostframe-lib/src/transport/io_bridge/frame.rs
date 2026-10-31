@@ -160,6 +160,8 @@ pub(crate) struct FrameMeta {
     pub stride: u32,
     pub timestamp_us: u32,
     pub capture_done_ns: u64,
+    /// The submission was [`crate::Content::Unchanged`].
+    pub unchanged: bool,
 }
 
 impl FrameMeta {
@@ -170,6 +172,7 @@ impl FrameMeta {
             stride: f.stride,
             timestamp_us: f.timestamp_us,
             capture_done_ns: f.capture_done_ns,
+            unchanged: f.content == crate::frame_damage::Content::Unchanged,
         }
     }
 }
@@ -268,9 +271,14 @@ impl IoBridge {
         // (modesetting-FB fallback uploads them into a HOST_VISIBLE VkImage).
         // Without this, CPU-pixel frames hit `process_frame_cpu`, which
         // has no classifier and sends every tile as CDF 5/3.
-        let has_gpu_input = frame.dmabuf_fd.is_some() || !frame.pixels.is_empty();
+        let has_gpu_input = frame.dmabuf_fd.is_some()
+            || !frame.pixels.is_empty()
+            || frame.content == crate::frame_damage::Content::Unchanged;
         let path = if has_gpu_input && self.frame_pipeline.is_some() {
             "gpu"
+        } else if cfg!(test) && frame.content == crate::frame_damage::Content::Unchanged {
+            // The CPU test path compares pixels; an unchanged tick has none.
+            "test-skip"
         } else if cfg!(test) {
             "test-cpu"
         } else {
@@ -300,7 +308,9 @@ impl IoBridge {
             // is unreachable in production. Unit tests build bridges without a
             // backend and drive the CDF 5/3 route below.
             #[cfg(test)]
-            self.process_frame_cpu(frame);
+            if frame.content == crate::frame_damage::Content::Pixels {
+                self.process_frame_cpu(frame);
+            }
             #[cfg(not(test))]
             tracing::error!(
                 target: LOG_TARGET,
@@ -1004,6 +1014,7 @@ impl IoBridge {
             target: LOG_TARGET,
             seq,
             dirty_count = analysis.dirty_tiles.len(),
+            unchanged = meta.unchanged,
             "process_frame_gpu: dirty tile detection complete"
         );
 
@@ -1285,6 +1296,7 @@ impl IoBridge {
         let pixels: &[u8] = match &source {
             PixelSource::Frame => &frame_pixels,
             PixelSource::Readback(rb) => rb,
+            PixelSource::Owned(v) => v,
         };
         let mut lap = Lap::new(stage_trace_enabled());
         // Hand the worker's pre-encoded fallback tiles to the dispatch below,

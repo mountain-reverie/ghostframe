@@ -26,7 +26,7 @@ use crate::capture::safety_net::Slice;
 use crate::capture::{Damage, TileBitmap};
 use crate::util::monotonic_now_ns;
 use ghostframe_lib::{
-    FrameBuf, FrameDamage, FramePool, FrameStorage, FrameSubmission, PoolSlot, TileBits,
+    Content, FrameBuf, FrameDamage, FramePool, FrameStorage, FrameSubmission, PoolSlot, TileBits,
 };
 use x11rb::connection::Connection;
 use x11rb::cookie::Cookie;
@@ -890,6 +890,7 @@ impl X11Frames {
             height,
             stride: width * 4,
             pixels,
+            content: Content::Pixels,
             dmabuf_fd: None,
             timestamp_us,
             // `Tiles` only for a planned, believed tick; else the library

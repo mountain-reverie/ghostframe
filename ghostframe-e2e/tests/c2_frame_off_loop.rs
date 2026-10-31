@@ -105,6 +105,7 @@ fn frame() -> FrameSubmission {
         pixels: vec![0x40; 64 * 64 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
+        content: ghostframe_lib::Content::Pixels,
         damage: ghostframe_lib::FrameDamage::Unknown,
         capture_done_ns: 0,
     }
