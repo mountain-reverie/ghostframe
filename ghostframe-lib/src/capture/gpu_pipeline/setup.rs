@@ -187,7 +187,10 @@ impl GpuFrameProcessor {
                     .to_string_lossy()
                     .into_owned(),
                 device_type: props.device_type,
-                has_dmabuf_import: has_all,
+                // `DISPATCH_BASE` pipelines and `vkCmdDispatchBase` are Vulkan
+                // 1.1 core, so an older device is as unusable as one without
+                // the import extensions.
+                has_dmabuf_import: has_all && props.api_version >= vk::make_api_version(0, 1, 1, 0),
             });
         }
         let chosen_idx = choose_device(&candidates)?;
@@ -1072,6 +1075,10 @@ impl GpuFrameProcessor {
             },
             descriptor_pool,
             prev_image: None,
+            upload: None,
+            damage_baseline: false,
+            #[cfg(test)]
+            probe: Default::default(),
             sad_buf: HostBuffer {
                 buffer: sad_buffer,
                 memory: sad_memory,
@@ -1110,7 +1117,8 @@ mod pool_tests {
 pub(super) struct DeviceCandidate {
     pub name: String,
     pub device_type: vk::PhysicalDeviceType,
-    /// Has `VK_KHR_external_memory_fd` and `VK_EXT_external_memory_dma_buf`.
+    /// Has `VK_KHR_external_memory_fd` and `VK_EXT_external_memory_dma_buf`,
+    /// and speaks Vulkan 1.1 or later.
     pub has_dmabuf_import: bool,
 }
 

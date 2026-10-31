@@ -424,21 +424,10 @@ impl IoBridge {
             self.dirty_tracker
                 .update(&frame.pixels, frame.stride, frame.width, frame.height)
         } else {
-            match &frame.damage_tiles {
-                Some(hints) => self.dirty_tracker.update_with_hints(
-                    &frame.pixels,
-                    frame.stride,
-                    frame.width,
-                    frame.height,
-                    hints,
-                ),
-                None => self.dirty_tracker.update(
-                    &frame.pixels,
-                    frame.stride,
-                    frame.width,
-                    frame.height,
-                ),
-            }
+            // The test path compares every tile whatever `frame.damage` says:
+            // damage narrows the GPU path's upload and compare only.
+            self.dirty_tracker
+                .update(&frame.pixels, frame.stride, frame.width, frame.height)
         };
 
         if dirty_tiles.is_empty() {
@@ -772,6 +761,9 @@ impl IoBridge {
             None => {
                 tracing::trace!(target: LOG_TARGET, seq, "process_frame_gpu: no connected sessions, dropping");
                 self.publish_dropped(&FrameMeta::of(&frame));
+                // The GPU never saw this frame, so a hinted upload would
+                // miss the tile rows it named.
+                self.backend_apply(Control::ForgetDamage);
                 return;
             }
         };
