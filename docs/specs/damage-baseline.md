@@ -82,14 +82,39 @@ Reading it:
 
 ## Baseline: owner's compositor
 
-Pending owner run. Purpose: see damage saturation (a compositor that redraws
-the whole screen on every frame reports full-screen damage even when idle).
-Run the daemon with `RUST_LOG=ghostframe::server::capture=trace` in the
-owner's session and read `bytes_copied`, `cpu_us`, `capture_us` from
-`[CAP] iter done`.
+Run on 2026-10-31 by the owner: Enlightenment on X11, AMD RX 480 with glamor,
+1920x1080, about 29 fps. Read from `[CAP] iter done`.
 
-**Row 0 of the plan is not closed until the owner's compositor / Xorg-sink run
-is recorded here.**
+Capture cost per tick, by grab size:
+
+| `damage_mode` | grab | capture_us p50 / p90 / p99 | cpu_us p50 | bytes grabbed |
+|---|---|---|---|---|
+| `off` | full grab every tick | 1213 / 2323 / 2865 | 59 | 8.29 MB |
+| `on` | content-free tick (no grab) | 68 / 128 / 223 | 31 | 0 |
+| `on` | grab under 10 % of the screen | 1154 / 1317 / 1350 | 56 | |
+| `on` | grab 10-50 % | 1376 / 1697 / 2110 | 93 | |
+| `on` | full grab under heavy motion | 2274 / 2714 / 3631 | 101 | |
+
+Finding: on Xorg with glamor, `ShmGetImage` has a fixed cost of about 1.1 ms
+however small the band, so band grabs barely cut capture time on this
+hardware. The win is the content-free tick (about 17x cheaper than an idle
+full grab) and the smaller GPU upload. Above F = 50 % of the screen the grab
+is whole by design.
+
+Saturation: Enlightenment does not saturate. At idle, damage plus the sweep
+covers about 2 % of the screen.
+
+Miss rate:
+
+- `shadow`: about 35 s of activity, 97,646 dirty tiles, 97,625 named by
+  damage, 21 suspects, all of them false_suspects (the B4 race), corrections
+  0, corrections_unswept 0.
+- `on`: about 3.5 min, no correction, no distrust entry, trust `Trusted`
+  throughout.
+- The owner tested both the web and the native client, including switching
+  between them, and reported that the result looks good in practice.
+
+**Row 0 of the plan is closed.**
 
 ## Gate
 
