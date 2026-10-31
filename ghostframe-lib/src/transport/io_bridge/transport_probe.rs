@@ -107,10 +107,6 @@ pub(super) struct Instruments {
     pub(super) flushed: crate::transport::instruments::FlushedLosses,
     /// Late acknowledgements of losses goog_cc had already been told about.
     pub(super) late_acked_after_flush: u64,
-    /// Capacity-hint feeds, and how many came before any feedback.
-    pub(super) hint_feeds: u64,
-    pub(super) hint_feeds_before_feedback: u64,
-    pub(super) hint_unbounded: u64,
     pub(super) probe_windows: [crate::transport::instruments::ProbeWindow;
         crate::transport::instruments::PROBE_WINDOWS_KEPT],
     pub(super) probe_windows_closed: u64,
@@ -459,9 +455,6 @@ impl IoBridge {
             ecn: i.ecn,
             generation_replacements: self.reliable_emitter.stats.generation_replacements,
             loss_path_resends_superseded: self.reliable_emitter.stats.loss_path_resends_superseded,
-            hint_feeds: i.hint_feeds,
-            hint_feeds_before_feedback: i.hint_feeds_before_feedback,
-            hint_unbounded: i.hint_unbounded,
             model: self.model_probe(),
             probe_windows: i.probe_windows,
             probe_windows_closed: i.probe_windows_closed,

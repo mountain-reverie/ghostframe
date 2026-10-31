@@ -227,9 +227,6 @@ pub struct RunOptions {
     /// production. Off by default, like the product, so a scene that does not
     /// ask for it sees no parity datagram.
     pub tile_fec: bool,
-    /// Who owns the send rate. `None` follows `GHOSTFRAME_CC` (default
-    /// Cubic), so any scene can be run under either arm with the variable.
-    pub congestion: Option<ghostframe_lib::config::CongestionMode>,
     /// The model controller's settings. `None` follows `GHOSTFRAME_CC_*`.
     pub model: Option<ghostframe_lib::config::ModelSettings>,
     /// How the server's event loop is driven. See [`HarnessMode`].
@@ -1025,11 +1022,7 @@ async fn run_inner(
     bridge.set_ignore_tile_nacks(opts.ignore_client_nacks);
     bridge.set_tile_fec(opts.tile_fec);
     let env_transport = ghostframe_lib::config::TransportConfig::from_env();
-    if opts.congestion.unwrap_or(env_transport.congestion)
-        == ghostframe_lib::config::CongestionMode::Model
-    {
-        bridge.use_model_controller_for_test(opts.model.unwrap_or(env_transport.model));
-    }
+    bridge.use_model_controller_for_test(opts.model.unwrap_or(env_transport.model));
     if let Some(floor) = scene.tick_budget_floor_bytes {
         bridge.set_tick_budget_floor_bytes(floor);
     }

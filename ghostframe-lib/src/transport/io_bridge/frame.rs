@@ -2131,11 +2131,8 @@ impl IoBridge {
                 target: "ghostframe::bwe",
                 bwe_estimate_bps = bwe_snap.bitrate_bps,
                 bwe_samples_seen = bwe_snap.samples_seen,
-                // BWE Stage 2.2 observability: which budget source
-                // is actually governing emission right now, and
-                // what goog_cc's pacer is asking for (0 = no
+                // What goog_cc's pacer is asking for (0 = no
                 // pacer_config absorbed yet).
-                pacing_mode = ?select_pacing_mode(bwe_snap.samples_seen),
                 pacer_rate_bps = bwe_snap.pacer_rate_bps.unwrap_or(0),
                 // goog_cc's loss-based estimator: anything but DelayBased
                 // means it is holding the estimate down.
@@ -2352,27 +2349,11 @@ impl IoBridge {
                     self.queued_refinement_latency_stats.mean_us(),
                 queued_refinement_latency_max_us =
                     self.queued_refinement_latency_stats.max_us,
-                // The per-tick emission budget and the floor it is
-                // clamped against. These were only ever logged at
-                // `debug!`, on a per-frame site, which the ghostframe-server's
-                // `ghostframe=info` default filter drops -- so a
-                // deployed build could not show whether the budget
-                // was tracking the path or pinned at its floor.
-                //
-                // That distinction is the whole point of the floor
-                // change: a flat 256 KiB floor is 7.86 MB/s and beat
-                // the bandwidth term on every link below ~70 Mbit/s,
-                // making the estimate dead code. If
-                // `base_budget_bytes` here equals
-                // `tick_budget_floor_bytes`, the estimate is still
-                // not binding and the same failure has returned.
-                //
-                // Logged on the existing 60-frame cadence rather
-                // than per frame: journald's RateLimitBurst drops a
-                // burst wholesale and leaves a hole that reads as a
-                // stalled loop, which has already cost one
-                // misdiagnosis here.
-                base_budget_bytes = self.base_budget_bytes(),
+                // The floor under the admission rate (a datagram a tick,
+                // unless a test pinned it). Logged on the existing 60-frame
+                // cadence rather than per frame: journald's RateLimitBurst
+                // drops a burst wholesale and leaves a hole that reads as a
+                // stalled loop, which has already cost one misdiagnosis here.
                 tick_budget_floor_bytes = self.tick_budget_floor(),
                 bytes_per_us = self.adaptation_context.bytes_per_us,
                 smoothed_rtt_us = self.adaptation_context.smoothed_rtt_us,
@@ -2415,7 +2396,6 @@ impl IoBridge {
                 depart_lag_max_us = ins.lag_max_us,
                 depart_mirror_len = ins.mirror_len,
                 depart_mirror_overflowed = ins.mirror_overflowed,
-                budget_term_cwnd = ins.budget.cwnd,
                 budget_term_pacer = ins.budget.pacer,
                 budget_term_floor = ins.budget.floor,
                 budget_term_probe = ins.budget.probe,

@@ -369,13 +369,11 @@ impl FlushedLosses {
 /// Which input set the admission rate `R`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetTerm {
-    /// The `cwnd / srtt` bandwidth term.
-    Cwnd,
-    /// goog_cc's pacer rate was the smaller of the two.
+    /// goog_cc's estimate (the pacer rate) set the rate.
     Pacer,
-    /// The one-datagram-per-tick floor beat the bandwidth term.
+    /// The one-datagram-per-tick floor beat the estimate.
     Floor,
-    /// A probe window's target exceeded the paced rate.
+    /// A probe window's target exceeded the estimate.
     Probe,
 }
 
@@ -416,8 +414,6 @@ impl ProbeWindow {
 /// The model controller (D1 design A) as a scene sees it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ModelProbe {
-    /// The model controller is installed (`GHOSTFRAME_CC=model`).
-    pub active: bool,
     /// Sends after an idle of at most `t_hold`: held the estimate, restart gain.
     pub restarts_hold: u64,
     /// Sends after an idle past `t_hold`: resumed from a fraction of it.
@@ -441,7 +437,6 @@ pub struct ModelProbe {
 /// full, which the gate exists to make impossible).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetBinding {
-    pub cwnd: u64,
     pub pacer: u64,
     pub floor: u64,
     pub probe: u64,
@@ -456,7 +451,6 @@ pub struct BudgetBinding {
 impl BudgetBinding {
     pub fn note_rate(&mut self, term: BudgetTerm) {
         match term {
-            BudgetTerm::Cwnd => self.cwnd += 1,
             BudgetTerm::Pacer => self.pacer += 1,
             BudgetTerm::Floor => self.floor += 1,
             BudgetTerm::Probe => self.probe += 1,
@@ -465,32 +459,7 @@ impl BudgetBinding {
 
     /// Passes counted, by rate term.
     pub fn ticks(&self) -> u64 {
-        self.cwnd + self.pacer + self.floor + self.probe
-    }
-}
-
-/// Classify an admission pass by the term that set its rate. Pure; the
-/// arguments are values the caller already computed.
-///
-/// - `probe_binds`: a probe window was open and its rate beat the paced one.
-/// - `pacer_rate`: goog_cc's pacer rate when it is trusted, bytes/s.
-/// - `bandwidth_rate` / `floor_rate`: the two operands of the base rate's
-///   `max`, bytes/s.
-pub fn classify_rate_term(
-    probe_binds: bool,
-    pacer_rate: Option<f64>,
-    bandwidth_rate: f64,
-    floor_rate: f64,
-) -> BudgetTerm {
-    let base = bandwidth_rate.max(floor_rate);
-    if probe_binds {
-        BudgetTerm::Probe
-    } else if pacer_rate.is_some_and(|p| p < base) {
-        BudgetTerm::Pacer
-    } else if bandwidth_rate <= floor_rate {
-        BudgetTerm::Floor
-    } else {
-        BudgetTerm::Cwnd
+        self.pacer + self.floor + self.probe
     }
 }
 
@@ -687,16 +656,7 @@ pub struct InstrumentSummary {
     /// RTO fires for a pass whose tile had moved to another generation.
     /// Expected zero: the client drops such a pass unacknowledged.
     pub loss_path_resends_superseded: u64,
-    /// Times the cwnd/srtt capacity hint was handed to the estimator.
-    pub hint_feeds: u64,
-    /// Of those, before the estimator had heard any feedback. The hint caps
-    /// the startup probe ladder; before the first feedback it is a reading of
-    /// a window nothing has used yet.
-    pub hint_feeds_before_feedback: u64,
-    /// Times the estimator was told the capacity is bounded only by its
-    /// configured maximum, because no reading described a busy path.
-    pub hint_unbounded: u64,
-    /// The model controller's counters (`active` is false under Cubic).
+    /// The model controller's counters .
     pub model: ModelProbe,
     /// The first `PROBE_WINDOWS_KEPT` probe windows to close, in order.
     pub probe_windows: [ProbeWindow; PROBE_WINDOWS_KEPT],
@@ -795,32 +755,18 @@ mod tests {
     }
 
     #[test]
-    fn classify_prefers_probe_then_pacer_then_floor() {
-        use BudgetTerm::*;
-        assert_eq!(classify_rate_term(true, Some(1.0), 100.0, 10.0), Probe);
-        assert_eq!(classify_rate_term(false, Some(50.0), 100.0, 10.0), Pacer);
-        assert_eq!(classify_rate_term(false, Some(150.0), 100.0, 10.0), Cwnd);
-        // The floor wins when the bandwidth term is below it...
-        assert_eq!(classify_rate_term(false, None, 5.0, 10.0), Floor);
-        assert_eq!(classify_rate_term(false, None, 100.0, 10.0), Cwnd);
-        // ...and a pacer below the floor still counts as the pacer.
-        assert_eq!(classify_rate_term(false, Some(4.0), 5.0, 10.0), Pacer);
-    }
-
-    #[test]
     fn every_pass_lands_in_exactly_one_rate_term() {
         let mut b = BudgetBinding::default();
         for t in [
-            BudgetTerm::Cwnd,
             BudgetTerm::Pacer,
             BudgetTerm::Floor,
             BudgetTerm::Probe,
-            BudgetTerm::Cwnd,
+            BudgetTerm::Pacer,
         ] {
             b.note_rate(t);
         }
-        assert_eq!(b.ticks(), 5);
-        assert_eq!((b.cwnd, b.pacer, b.floor, b.probe), (2, 1, 1, 1));
+        assert_eq!(b.ticks(), 4);
+        assert_eq!((b.pacer, b.floor, b.probe), (2, 1, 1));
     }
 
     #[test]

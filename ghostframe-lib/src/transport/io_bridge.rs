@@ -92,10 +92,7 @@ mod model_glue;
 
 #[path = "io_bridge/pacing.rs"]
 mod pacing;
-#[cfg(test)]
-use pacing::BWE_PACED_MODE_SAMPLE_THRESHOLD;
 pub(crate) use pacing::SCHEDULER_TICK_INTERVAL_US;
-pub use pacing::{combine_pacing_budget, pacer_tick_budget_bytes, select_pacing_mode, PacingMode};
 
 #[path = "io_bridge/emit.rs"]
 mod emit;
@@ -807,15 +804,9 @@ pub struct IoBridge {
     /// Cumulative wire bytes of the transmissions recorded in the ledger: what
     /// the estimator counts of what was sent. See `BweSnapshot::payload_fraction`.
     offered_wire_bytes: f64,
-    /// The model controller's glue (`GHOSTFRAME_CC=model`); `None` under Cubic.
-    model: Option<model_glue::ModelGlue>,
-    /// Recent `cwnd / smoothed_rtt` samples taken while quinn was the limit;
-    /// the BWE capacity hint is their minimum. See `CapacityHintWindow`.
-    capacity_hint_window: bwe_glue::CapacityHintWindow,
-    /// quinn's cumulative `sent_packets` at the previous path-stats sample,
-    /// and the delta since. Zero delta means the link was idle over that
-    /// interval, which is when `cwnd / rtt` stops meaning anything.
-    path_sent_packets_last: u64,
+    /// The model controller's glue: the rate the window must carry, the
+    /// idle-restart policy and the persistent-congestion notice.
+    model: model_glue::ModelGlue,
     /// Transport measurements (see `transport_probe`). Measurement only.
     transport_probe: TransportProbe,
     /// D1 instruments (offered bytes by class, FIFO series,
@@ -851,10 +842,6 @@ pub struct IoBridge {
     last_admission_term: crate::transport::instruments::BudgetTerm,
     /// The ledger's verdicts as a rate: `adaptation_context.loss_rate`.
     loss_window: crate::transport::loss_window::LossWindow,
-    /// When quinn's `sent_packets` last advanced. `None` before the first
-    /// packet. Used to tell a busy link from an idle one — see
-    /// `apply_path_stats_snapshot`.
-    path_last_sent_at: Option<std::time::Instant>,
     /// Frame identity from the most recent `drain_scheduler_into_quinn`
     /// call, from any caller. Never cleared once set — it exists purely
     /// so BWE Stage 2.4b's probe-window-open drain
@@ -1239,42 +1226,53 @@ impl IoBridge {
     /// processor. Everything else is identical by construction.
     fn base(
         stream: BridgeStream,
-        server: QuicServer,
+        mut server: QuicServer,
         lib_config: crate::config::LibConfig,
         diffs: BaseDiffs,
     ) -> Self {
-        let (mode, settings) = (lib_config.transport.congestion, lib_config.transport.model);
-        let mut bridge = Self::base_cubic(stream, server, lib_config, diffs);
-        if mode == crate::config::CongestionMode::Model {
-            bridge.install_model_controller(settings);
-        }
-        bridge
+        let settings = lib_config.transport.model;
+        let (model, bwe) = Self::model_controller_parts(&mut server, settings);
+        Self::base_with(stream, server, lib_config, diffs, model, bwe)
     }
 
-    /// Switch a freshly built bridge to the model controller (D1 design A):
-    /// quinn's window becomes `W(R_w)`, the estimator stops being fed a
-    /// capacity hint (and stops probing on one), and admission paces to `R`.
-    /// Before the first connection: a connection keeps the controller it was
+    /// The model controller (D1 design A): quinn's window becomes `W(R_w)`,
+    /// the estimator is fed no capacity hint (and stops probing on one), and
+    /// admission paces to `R`. Installs the controller on `server`, which must
+    /// not have a connection yet: a connection keeps the controller it was
     /// built with.
-    fn install_model_controller(&mut self, settings: crate::config::ModelSettings) {
+    fn model_controller_parts(
+        server: &mut QuicServer,
+        settings: crate::config::ModelSettings,
+    ) -> (model_glue::ModelGlue, crate::transport::bwe::BweWrapper) {
         // The window opens at the start rate; the estimator moves it.
         let cell = crate::transport::model_controller::ModelCell::new(
             crate::transport::bwe::BweWrapper::INITIAL_BPS / 8,
             settings.gain,
         );
-        self.server.use_model_controller(cell.clone());
-        self.bwe = crate::transport::bwe::BweWrapper::new_without_hint(
+        server.use_model_controller(cell.clone());
+        let bwe = crate::transport::bwe::BweWrapper::new_without_hint(
             crate::transport::bwe::BweWrapper::INITIAL_BPS,
             now_std(),
         );
-        self.model = Some(model_glue::ModelGlue::new(cell, settings));
+        (model_glue::ModelGlue::new(cell, settings), bwe)
     }
 
-    fn base_cubic(
+    /// Replace the model controller and its estimator with ones built from
+    /// `settings`. Before the first connection only.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    fn install_model_controller(&mut self, settings: crate::config::ModelSettings) {
+        let (model, bwe) = Self::model_controller_parts(&mut self.server, settings);
+        self.model = model;
+        self.bwe = bwe;
+    }
+
+    fn base_with(
         stream: BridgeStream,
         server: QuicServer,
         lib_config: crate::config::LibConfig,
         diffs: BaseDiffs,
+        model: model_glue::ModelGlue,
+        bwe: crate::transport::bwe::BweWrapper,
     ) -> Self {
         let (peer_lookup_tx, peer_lookup_rx) = mpsc::unbounded_channel();
         Self {
@@ -1385,9 +1383,7 @@ impl IoBridge {
             datagram_send_errs: 0,
             datagram_send_err_first_logged: false,
             offered_wire_bytes: 0.0,
-            model: None,
-            capacity_hint_window: Default::default(),
-            path_sent_packets_last: 0,
+            model,
             transport_probe: TransportProbe::default(),
             instr: Default::default(),
             departures: Default::default(),
@@ -1403,9 +1399,8 @@ impl IoBridge {
                 TRANSMISSION_LEDGER_CAPACITY,
             ),
             delivery_sampler: crate::transport::delivery_sampler::DeliverySampler::new(now_std()),
-            last_admission_term: crate::transport::instruments::BudgetTerm::Cwnd,
+            last_admission_term: crate::transport::instruments::BudgetTerm::Floor,
             loss_window: crate::transport::loss_window::LossWindow::new(),
-            path_last_sent_at: None,
             last_drain_frame_context: None,
             cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
             last_cumulative_emit_log_frame: 0,
@@ -1417,10 +1412,7 @@ impl IoBridge {
                 e
             },
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
-            bwe: crate::transport::bwe::BweWrapper::new(
-                crate::transport::bwe::BweWrapper::INITIAL_BPS,
-                now_std(),
-            ),
+            bwe,
             active_probe: None,
             probes_completed: 0,
             probes_abandoned: 0,

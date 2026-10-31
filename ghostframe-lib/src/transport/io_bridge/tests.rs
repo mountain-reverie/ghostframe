@@ -2,70 +2,6 @@ use super::*;
 use std::sync::Arc;
 use tokio::net::UnixStream;
 
-// ── BWE Stage 2.2: PacingMode ────────────────────────────────────────
-
-#[test]
-fn select_pacing_mode_below_threshold_is_path_stats() {
-    assert_eq!(
-        select_pacing_mode(BWE_PACED_MODE_SAMPLE_THRESHOLD - 1),
-        PacingMode::PathStats
-    );
-    assert_eq!(select_pacing_mode(0), PacingMode::PathStats);
-}
-
-#[test]
-fn select_pacing_mode_at_or_above_threshold_is_paced() {
-    assert_eq!(
-        select_pacing_mode(BWE_PACED_MODE_SAMPLE_THRESHOLD),
-        PacingMode::Paced
-    );
-    assert_eq!(
-        select_pacing_mode(BWE_PACED_MODE_SAMPLE_THRESHOLD * 100),
-        PacingMode::Paced
-    );
-}
-
-/// `pacer_tick_budget_bytes` is the one piece of unit-conversion
-/// arithmetic in the pacing chain; pin it against a hand-computed value
-/// so a units mistake (bits vs bytes, µs vs ms) fails loudly here
-/// instead of silently mis-pacing production traffic.
-#[test]
-fn pacer_tick_budget_bytes_matches_hand_computed_value() {
-    // 8,000,000 bps == 1,000,000 bytes/s == 1000 bytes/ms. Over a
-    // 33,333 µs (33.333 ms) tick that's 33,333 bytes.
-    let got = pacer_tick_budget_bytes(8_000_000, 33_333.0);
-    assert_eq!(got, 33_333);
-}
-
-/// `PathStats` mode must ignore `pacer_rate_bps` entirely, even when it
-/// would bind tighter than the AIMD budget — the estimator is not
-/// trusted yet at this sample count, so its output must not leak into
-/// the budget at all.
-#[test]
-fn combine_pacing_budget_path_stats_ignores_googcc() {
-    let got = combine_pacing_budget(
-        PacingMode::PathStats,
-        1_000_000,
-        Some(1_000), // absurdly small; would dominate if consulted
-        SCHEDULER_TICK_INTERVAL_US,
-    );
-    assert_eq!(got, 1_000_000);
-}
-
-/// `Paced` mode with no `pacer_config` absorbed yet (`None`) must fall
-/// back to the AIMD budget unchanged — there is nothing from goog_cc to
-/// combine with.
-#[test]
-fn combine_pacing_budget_paced_without_a_rate_falls_back_to_aimd() {
-    let got = combine_pacing_budget(
-        PacingMode::Paced,
-        1_000_000,
-        None,
-        SCHEDULER_TICK_INTERVAL_US,
-    );
-    assert_eq!(got, 1_000_000);
-}
-
 /// Test-only helper: construct an IoBridge with a fresh UnixStream pair
 /// and QuicServer. Discards the peer end of the stream pair (caller
 /// doesn't need to interact with it).
@@ -3091,31 +3027,23 @@ async fn sample_quic_path_stats_updates_bytes_per_us_and_rtt() {
     let initial_seq = bridge.adaptation_context.last_update_seq;
     // Inject a path-stats snapshot manually (the wire to a real quinn
     // Connection is exercised by integration tests, not this unit).
-    bridge.apply_path_stats_snapshot(
-        /* cwnd_bytes */ 60_000, /* smoothed_rtt_us */ 12_000.0,
-    );
+    bridge.apply_path_stats_snapshot(/* smoothed_rtt_us */ 12_000.0);
     assert!(bridge.adaptation_context.last_update_seq > initial_seq);
     assert!(bridge.adaptation_context.bytes_per_us > 0.0);
     assert!((bridge.adaptation_context.smoothed_rtt_us - 12_000.0).abs() < 1e-6);
-    // cwnd / rtt = 60_000 bytes / 12_000 µs = 5.0 B/µs.
-    assert!((bridge.adaptation_context.bytes_per_us - 5.0).abs() < 0.01);
+    // The classifier reads the estimate, in bytes per microsecond.
+    let expect = (bridge.model_rate_bytes_per_s() / 1e6) as f32;
+    assert!((bridge.adaptation_context.bytes_per_us - expect).abs() < 1e-6);
 }
 
 /// The first probe ladder is never capped by a reading taken before any
 /// feedback (design gate P6a, the glue half).
 ///
-/// The hint caps goog_cc's probes at `max(estimate, hint)`. Before anything is
-/// measured quinn's window over its 333 ms initial RTT reads 288 kbit/s, so a
-/// hint fed ahead of the first feedback collapses the 6 / 12 Mbit ladder to
-/// the 2 Mbit start rate, and the sender then never exceeds quinn's window and
-/// never finds out. The old window was sixteen readings, one per loop turn: a
-/// handshake that cost the loop enough turns lost that race, and the hybrid
-/// post-quantum handshake lost it far more often than the classical one.
-///
-/// The two key exchanges differ here only in how many turns precede the first
-/// feedback, so this sweeps that count over a range that covers both (the
-/// measured threshold was 16; the sweep runs 0 to 256), with every reading
-/// taken while quinn is the limit, which is the worst case for the hint.
+/// Before anything is measured quinn's window over its 333 ms initial RTT
+/// reads 288 kbit/s; nothing derived from it may reach the estimator, or the
+/// 6 / 12 Mbit ladder collapses to the 2 Mbit start rate. The two key
+/// exchanges differ only in how many loop turns precede the first feedback,
+/// so this sweeps that count (0 to 256), sampling the path on every turn.
 #[tokio::test]
 async fn the_first_probe_ladder_is_never_capped_whatever_the_handshake_cost() {
     let start = crate::transport::bwe::BweWrapper::INITIAL_BPS;
@@ -3124,17 +3052,12 @@ async fn the_first_probe_ladder_is_never_capped_whatever_the_handshake_cost() {
         let server = QuicServer::new().expect("server");
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
-        // quinn is the limit on every turn, and the path is busy.
+        // quinn is the limit on every turn, and the path is busy, at quinn's
+        // initial 333 ms RTT.
         bridge.forced_fifo_depth_for_test = Some(1_200);
         for _ in 0..turns_before_feedback {
-            bridge.path_last_sent_at = Some(now_std());
-            // 12 000 bytes over 333 ms: quinn's window before any measurement.
-            bridge.apply_path_stats_snapshot(12_000, 333_000.0);
+            bridge.apply_path_stats_snapshot(333_000.0);
         }
-        assert_eq!(
-            bridge.instr.hint_feeds_before_feedback, 0,
-            "{turns_before_feedback} turns: the hint reached the estimator before any feedback"
-        );
         // The first feedback: a few acknowledged datagrams.
         let t0 = now_std();
         let records: Vec<crate::transport::bwe::AckArrival> = (0..12u32)
@@ -3186,26 +3109,20 @@ async fn the_budget_floor_is_one_datagram_not_a_fixed_quarter_megabyte() {
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
     let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
 
-    // A slow path: 0.01 B/µs is 10 kB/s, far below any plausible floor.
-    bridge.adaptation_context.bytes_per_us = 0.01;
     bridge.last_max_datagram_size = Some(1_200);
 
-    let budget = bridge.base_budget_bytes();
     assert_eq!(
-        budget, 1_200,
-        "a starved path should floor at one datagram so a tile can still \
-         make progress, not at a constant that re-establishes the old \
-         ~70 Mbit/s knee"
+        bridge.tick_budget_floor(),
+        1_200,
+        "the floor is one datagram so a tile can always make progress, not a \
+         constant that re-establishes the old ~70 Mbit/s knee"
     );
-
-    // A fast path must clear the floor and be set by the estimate:
-    // 5 B/µs * 33_333 µs = 166_665 bytes.
-    bridge.adaptation_context.bytes_per_us = 5.0;
-    let fast = bridge.base_budget_bytes();
+    // A starved estimate is lifted to the floor, and no further.
+    let rate = bridge.admission_rate();
     assert!(
-        fast > 100_000,
-        "the bandwidth term must set the budget once it clears the floor, \
-         got {fast}"
+        rate.bytes_per_sec >= 1_200.0 / (SCHEDULER_TICK_INTERVAL_US / 1e6) - 1.0,
+        "the admission rate is never under the floor, got {}",
+        rate.bytes_per_sec
     );
 }
 
@@ -3221,12 +3138,8 @@ async fn test_force_bytes_per_us_overrides_path_stats() {
     bridge.test_force_bytes_per_us = Some(0.1);
 
     // Inject a snapshot that, with override active, should produce
-    // bytes_per_us == 0.1 regardless of the cwnd argument.
-    // We simulate what sample_all_path_stats would do internally: the
-    // override synthesizes cwnd from forced × rtt.
-    let rtt_us = 20_000.0;
-    let synth_cwnd = (0.1 * rtt_us) as u64; // 2_000
-    bridge.apply_path_stats_snapshot(synth_cwnd, rtt_us);
+    // bytes_per_us == 0.1 regardless of the estimate.
+    bridge.apply_path_stats_snapshot(20_000.0);
 
     // Verify AdaptationContext reflects the forced value.
     assert!(
