@@ -117,7 +117,9 @@ jobs:
       # here for the same reason as `dmabuf_real_*`; `gpu_backend_pre_encodes_*`
       # does the same through the frame backend.
       # `invalidate_baseline_keeps_the_longer_cushion` needs a real device too.
-      - run: "cargo test --workspace --lib -- --skip dmabuf_real_ --skip gpu_pipeline::fallback_tests:: --skip gpu_backend_pre_encodes_ --skip invalidate_baseline_keeps_the_longer_cushion"
+      # `gpu_pipeline::reference_tests` run tile_sad's commit-into-reference
+      # on a real Vulkan device and panic "needs a Vulkan GPU" without one.
+      - run: "cargo test --workspace --lib -- --skip dmabuf_real_ --skip gpu_pipeline::fallback_tests:: --skip gpu_backend_pre_encodes_ --skip invalidate_baseline_keeps_the_longer_cushion --skip gpu_pipeline::reference_tests::"
       # --lib skips binary crates entirely, so ghostframe-server's tests (the
       # display clamp, the capture resize logic) and codec_report's ran nowhere
       # in CI. No hardware needed.

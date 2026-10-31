@@ -4,13 +4,21 @@
 // Dispatch: one workgroup per tile (ceil(width/32) * ceil(height/32) workgroups).
 // Each thread handles one pixel within the 32x32 tile.
 // Shared memory reduction sums per-pixel differences into a single SAD score per tile.
+//
+// prev_frame is the per-tile LAST-COMMITTED reference, not the previous frame:
+// a tile whose SAD exceeds `threshold` (i.e. the tile the host will report
+// dirty) has its pixels copied from current_frame into prev_frame at the end
+// of this same dispatch. Tiles at or under the threshold keep their old
+// reference, so sub-threshold change accumulates until it crosses. This
+// replaces the whole-frame vkCmdCopyImage snapshot: write cost is
+// proportional to committed tiles.
 
 #version 450
 
 layout(local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
 
 layout(binding = 0, rgba8) readonly uniform image2D current_frame;
-layout(binding = 1, rgba8) readonly uniform image2D prev_frame;
+layout(binding = 1, rgba8) uniform image2D prev_frame;
 
 layout(binding = 2, std430) buffer SadOutput {
     uint sad_values[];
@@ -20,6 +28,7 @@ layout(push_constant) uniform PushConstants {
     uint frame_width;
     uint frame_height;
     uint cols;  // number of tile columns
+    uint threshold; // SAD above this commits the tile into prev_frame
 };
 
 shared uint shared_sad[1024]; // 32*32 = 1024 threads per workgroup
@@ -34,9 +43,11 @@ void main() {
     uint py = tile_y * 32 + gl_LocalInvocationID.y;
 
     uint diff = 0;
-    if (px < frame_width && py < frame_height) {
-        ivec2 coord = ivec2(px, py);
-        vec4 cur = imageLoad(current_frame, coord);
+    bool inside = px < frame_width && py < frame_height;
+    ivec2 coord = ivec2(px, py);
+    vec4 cur = vec4(0.0);
+    if (inside) {
+        cur = imageLoad(current_frame, coord);
         vec4 prev = imageLoad(prev_frame, coord);
 
         // SAD over RGB channels (ignore alpha), scale from [0,1] to [0,255]
@@ -56,8 +67,15 @@ void main() {
         barrier();
     }
 
+    // After the last barrier every thread sees the tile total in shared_sad[0].
+    uint total = shared_sad[0];
     if (local_idx == 0) {
         uint tile_idx = tile_y * cols + tile_x;
-        sad_values[tile_idx] = shared_sad[0];
+        sad_values[tile_idx] = total;
+    }
+    // Commit: this thread's own prev pixel was read above, so overwriting it
+    // races with nothing (no thread reads another thread's prev pixel).
+    if (inside && total > threshold) {
+        imageStore(prev_frame, coord, cur);
     }
 }

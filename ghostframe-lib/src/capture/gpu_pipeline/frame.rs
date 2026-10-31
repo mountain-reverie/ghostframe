@@ -517,19 +517,21 @@ impl GpuFrameProcessor {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(prev_image)
                 .subresource_range(subresource_range)
+                // The previous frame's SAD dispatch wrote `prev` (it commits
+                // dirty tiles), so this is RAW + WAW against that submission.
                 .src_access_mask(if prev_layout == vk::ImageLayout::PREINITIALIZED {
                     vk::AccessFlags::HOST_WRITE
                 } else {
-                    vk::AccessFlags::SHADER_READ
+                    vk::AccessFlags::SHADER_WRITE
                 })
-                .dst_access_mask(vk::AccessFlags::SHADER_READ),
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE),
         ];
         // A dma-buf ingest acquires `current` itself (copy + GENERAL); only
         // `prev` still needs the barrier then (element 1).
         let acquired = self.record_acquire_current(cmd, current);
         self.device.cmd_pipeline_barrier(
             cmd,
-            vk::PipelineStageFlags::HOST,
+            vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::DependencyFlags::empty(),
             &[],
@@ -538,7 +540,7 @@ impl GpuFrameProcessor {
         );
 
         // 2. SAD dispatch
-        let sad_push: [u32; 3] = [width, height, cols];
+        let sad_push: [u32; 4] = [width, height, cols, SAD_THRESHOLD];
         let sad_ds_guard =
             self.run_sad_stage(cmd, current.view, prev_view, &sad_push, (cols, rows, 1))?;
 
@@ -599,19 +601,14 @@ impl GpuFrameProcessor {
         let guards = self.record_shared_stages(cmd, current.view, cols, rows, escalation_count)?;
         let pal_id_bytes = guards.pal_id_bytes;
 
-        // 5a. Snapshot copy: current (DMA-BUF) -> prev_image (owned). This
-        // makes prev_image a true point-in-time snapshot of THIS frame for
-        // the next frame's SAD comparison. Must run AFTER all three shader
-        // dispatches (SAD, NV12, analysis), since they all read from current.
-        self.record_snapshot_copy(
-            cmd,
-            current.image,
-            prev_image,
-            vk::ImageLayout::GENERAL,
-            vk::AccessFlags::SHADER_READ,
-            width,
-            height,
-        );
+        // 5a. No snapshot copy here. `prev_image` is the per-tile
+        // last-committed reference and the SAD shader already advanced it for
+        // exactly the tiles whose SAD exceeded SAD_THRESHOLD (the tiles
+        // reported dirty below). Tiles under the threshold keep their old
+        // reference, so sub-threshold drift accumulates against it until it
+        // crosses; this differs from the previous-frame reference master used
+        // to copy whole every tick. See docs/specs/damage-driven-encoding-design.md
+        // section 3.2.
 
         // 5. Barriers: every output buffer -> HOST_READ.
         self.record_host_readback_barriers(
@@ -670,9 +667,9 @@ impl GpuFrameProcessor {
         drop(analysis_ds_guard);
         guards.release_forward();
 
-        // 9. prev_image is persistent (own-allocated, layout still GENERAL
-        // after the post-copy barrier). It now holds a snapshot of THIS frame
-        // for next frame's SAD comparison. The imported `current` is destroyed
+        // 9. prev_image is persistent (own-allocated, always GENERAL). It now
+        // holds THIS frame's pixels for the tiles committed above and the old
+        // reference for every other tile. The imported `current` is destroyed
         // by the caller (process_frame_inner).
         if let Some(prev_mut) = self.prev_image.as_mut() {
             prev_mut.layout = vk::ImageLayout::GENERAL;
@@ -858,15 +855,7 @@ impl GpuFrameProcessor {
         // `TRANSFER_SRC_OPTIMAL` happens), and the subsequent `buf_barrier`
         // targets buffers only — it doesn't depend on `current`'s layout.
         if let Some(snap) = snapshot {
-            self.record_snapshot_copy(
-                cmd,
-                current.image,
-                snap.image,
-                vk::ImageLayout::UNDEFINED,
-                vk::AccessFlags::empty(),
-                width,
-                height,
-            );
+            self.record_snapshot_copy(cmd, current.image, snap.image, width, height);
         }
 
         // All output buffers -> HOST_READ. srcStageMask covers both
@@ -1213,7 +1202,7 @@ impl GpuFrameProcessor {
             .image(current.image)
             .subresource_range(range)
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::TRANSFER,
@@ -2237,21 +2226,19 @@ impl GpuFrameProcessor {
     /// `dst_image` to GENERAL for the next frame's SAD pass. Must be recorded
     /// after every shader dispatch that reads `current_image`.
     ///
-    /// The steady-state path passes its persistent `prev_image` (GENERAL,
-    /// SHADER_READ); the first-frame path passes the freshly allocated
-    /// snapshot (UNDEFINED, empty access: no prior access to wait on).
+    /// Only the first-frame path (and only when it commits) uses this: it
+    /// seeds the whole reference from the freshly allocated snapshot
+    /// (UNDEFINED, empty access: no prior access to wait on). Steady state does
+    /// not copy: the SAD shader advances the reference tile by tile.
     ///
     /// # Safety
     ///
     /// `cmd` is recording and both images are valid for this device.
-    #[allow(clippy::too_many_arguments)]
     unsafe fn record_snapshot_copy(
         &self,
         cmd: vk::CommandBuffer,
         current_image: vk::Image,
         dst_image: vk::Image,
-        dst_old_layout: vk::ImageLayout,
-        dst_src_access: vk::AccessFlags,
         width: u32,
         height: u32,
     ) {
@@ -2273,15 +2260,15 @@ impl GpuFrameProcessor {
                 .subresource_range(subresource_range)
                 .src_access_mask(vk::AccessFlags::SHADER_READ)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
-            // dst: dst_src_access → TRANSFER_WRITE
+            // dst: UNDEFINED, no prior access → TRANSFER_WRITE
             vk::ImageMemoryBarrier::default()
-                .old_layout(dst_old_layout)
+                .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(dst_image)
                 .subresource_range(subresource_range)
-                .src_access_mask(dst_src_access)
+                .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE),
         ];
         self.device.cmd_pipeline_barrier(
@@ -2332,7 +2319,7 @@ impl GpuFrameProcessor {
             .image(dst_image)
             .subresource_range(subresource_range)
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::TRANSFER,
