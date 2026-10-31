@@ -139,6 +139,11 @@ impl TileBitmap {
         b.load_words(width, height, words).then_some(b)
     }
 
+    /// The bits, one per tile, row-major, `ceil(tiles / 64)` words.
+    pub fn words(&self) -> &[u64] {
+        &self.bits
+    }
+
     /// The screen size in pixels this bitmap was built for.
     pub fn px(&self) -> (u32, u32) {
         self.px
