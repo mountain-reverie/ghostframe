@@ -103,8 +103,8 @@ mod emit;
 #[path = "io_bridge/frame_backend.rs"]
 mod frame_backend;
 pub use frame_backend::{
-    Analysed, Cdf53Encoded, Cdf53Tile, Control, EscalationSlot, FrameBackend, GpuBackend, GpuDiag,
-    H264Out, OwnedPalRle, PixelSource, TileOut, TileRequest, TileTimings,
+    AnalyseError, Analysed, Cdf53Encoded, Cdf53Tile, Control, EscalationSlot, FrameBackend,
+    GpuBackend, GpuDiag, H264Out, OwnedPalRle, PixelSource, TileOut, TileRequest, TileTimings,
 };
 
 #[path = "io_bridge/frame_worker.rs"]

@@ -197,9 +197,28 @@ pub(super) fn fallback_not_in_compact_list(
         .collect()
 }
 
-/// Prefix of the `analyse` error for an unchanged tick the backend refused: a
-/// producer's claim it cannot honour, not a GPU fault.
-pub(super) const UNCHANGED_REFUSED: &str = "unchanged tick refused: ";
+/// Why `analyse` produced nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnalyseError {
+    /// An unchanged tick the backend cannot honour: the producer's claim, not
+    /// a GPU fault. The loop drops the frame quietly and tells the producer.
+    Refused(String),
+    /// The GPU stage failed; the loop logs it and counts it.
+    Failed(String),
+}
+
+impl From<String> for AnalyseError {
+    fn from(e: String) -> Self {
+        Self::Failed(e)
+    }
+}
+
+impl std::fmt::Display for AnalyseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Refused(e) | Self::Failed(e)) = self;
+        f.write_str(e)
+    }
+}
 
 /// See the module docs.
 pub trait FrameBackend: Send {
@@ -214,7 +233,7 @@ pub trait FrameBackend: Send {
         frame: &FrameSubmission,
         escalation: &[u32],
         want_diag: bool,
-    ) -> Result<Analysed, String>;
+    ) -> Result<Analysed, AnalyseError>;
 
     /// H.264 arm. Creates or resizes the encoder as needed. `None` when there
     /// is nothing to send (encoder unavailable, failed, or buffering).
@@ -293,7 +312,7 @@ impl FrameBackend for GpuBackend {
         frame: &FrameSubmission,
         escalation: &[u32],
         want_diag: bool,
-    ) -> Result<Analysed, String> {
+    ) -> Result<Analysed, AnalyseError> {
         self.held = None;
         self.processor.set_escalation_candidates(escalation);
         let raw_fd = frame.dmabuf_fd.as_ref().map(|fd| fd.as_raw_fd());
@@ -313,8 +332,8 @@ impl FrameBackend for GpuBackend {
             ),
         };
         let analysis = result.map_err(|e| match e.downcast_ref::<UnchangedRefused>() {
-            Some(r) => format!("{UNCHANGED_REFUSED}{r}"),
-            None => e.to_string(),
+            Some(r) => AnalyseError::Refused(r.to_string()),
+            None => AnalyseError::Failed(e.to_string()),
         })?;
         let ta = analysis.tile_analysis_slice();
         let dirty_analysis = analysis
