@@ -489,4 +489,20 @@ mod tests {
         stale.pump_admission();
         assert_eq!(stale.model_forfeited(), 0.0, "srtt 80 ms against 2 x 15 ms");
     }
+
+    /// The model-controller twin of `test_force_bytes_per_us_overrides_path_stats`:
+    /// that branch ignores the cwnd, so the override has to be applied to the
+    /// model rate itself, or it never reaches the classifier by default.
+    #[tokio::test]
+    async fn the_bytes_per_us_override_reaches_the_classifier_under_the_model() {
+        let mut bridge = model_bridge().await;
+        bridge.test_force_bytes_per_us = Some(0.1);
+        // A window whose cwnd/rtt is nowhere near 0.1, as the live model's rate is.
+        bridge.apply_path_stats_snapshot(10_000_000, 20_000.0);
+        assert!(
+            (bridge.adaptation_context.bytes_per_us - 0.1).abs() < 0.001,
+            "got {}",
+            bridge.adaptation_context.bytes_per_us
+        );
+    }
 }

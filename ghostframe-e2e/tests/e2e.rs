@@ -3381,6 +3381,19 @@ async fn e2e_headroom_guard_forces_h264() -> Result<()> {
 
     eprintln!("M3.6b headroom: tile={tile_total} frame={frame_total}");
 
+    let decisions = mode_decisions(&helpers::read_server_logs_stripped("ghostframe-server"));
+    eprintln!("mode decisions: {decisions:?}");
+    let first = decisions
+        .iter()
+        .find(|d| d.to == "H264")
+        .unwrap_or_else(|| {
+            panic!("the headroom guard never moved the classifier to H264: {decisions:?}")
+        });
+    assert_eq!(
+        first.reason, "headroom_guard",
+        "the forced headroom should be what put this content in H264; decisions: {decisions:?}"
+    );
+
     // headroom_guard forces H264 ⇒ frame datagrams must be substantial.
     // Threshold mirrors e2e_mode_switch MIN_FRAME_COUNT_FOR_H264_PHASE=150
     // scaled to the 5s window vs 3s. We do NOT assert frame > tile: with
