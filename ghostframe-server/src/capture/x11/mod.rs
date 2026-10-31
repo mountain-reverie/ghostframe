@@ -1,5 +1,7 @@
 //! The X11 backend: full-root frames, XDamage, XTest input and RandR.
 
+#[cfg(test)]
+mod band_tests;
 pub mod bands;
 #[cfg(test)]
 pub(crate) mod baseline;
