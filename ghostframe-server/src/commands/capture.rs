@@ -414,6 +414,8 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
                     submit_us = submit_us,
                     cpu_us = cpu_us,
                     bytes_copied = tick_stats.bytes_copied,
+                    bytes_grabbed = tick_stats.bytes_grabbed,
+                    grab_requests = tick_stats.grab_requests,
                     allocs = tick_stats.allocs,
                     "[CAP] iter done"
                 );

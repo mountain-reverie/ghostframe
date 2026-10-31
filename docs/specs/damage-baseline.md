@@ -142,3 +142,84 @@ slot allocations, steady state at most the cursor reply and far below
 `W*H*4`, and the GetImage path still counts the full copy);
 `RunReport::validate` now rejects any tick at or above `W*H*4`
 (`the_harness_rejects_a_full_frame_copy`).
+
+## PR 5: band grab (`damage_mode = on`), before/after
+
+Same harness (`baseline::band_table`, `cargo test -p ghostframe-server band_table -- --ignored --nocapture`),
+same host, run under `flock -o` on the shared bench lock. "off" is the
+whole-root grab (the before; identical to the PR 2 path), "on" the band grab
+with the default sweep, "on, no sweep" the damage-proportional part alone.
+The harness holds three frames so the four slots rotate as in the daemon, and
+runs 10 warm-up ticks; the pointer is parked at (10,10). 90 ticks per run, 3
+runs (seeds 1000-1002), median across runs with min-max for `capture_us`.
+The window is `drain_damage` + net plan + `capture`, as before.
+
+| layout | scene | damage_mode | capture_us (median, min-max) | cpu_us | MB grabbed/tick | requests/tick |
+|---|---|---|---|---|---|---|
+| 1080p | idle | off | 1060 (1038-1078) | 36 | 8.29 | 1.0 |
+| 1080p | idle | on | 136 (132-141) | 42 | 0.80 | 1.7 |
+| 1080p | idle | on, no sweep | 79 (79-81) | 34 | 0.25 | 1.0 |
+| 1080p | typing | off | 1041 (1036-1044) | 44 | 8.29 | 1.0 |
+| 1080p | typing | on | 198 (196-212) | 46 | 1.52 | 1.6 |
+| 1080p | typing | on, no sweep | 143 (143-150) | 40 | 0.98 | 1.0 |
+| 1080p | scrolling | off | 895 (883-907) | 58 | 8.29 | 1.0 |
+| 1080p | scrolling | on | 949 (941-1181) | 75 | 8.29 | 1.0 |
+| 1080p | video | off | 981 (923-1006) | 68 | 8.29 | 1.0 |
+| 1080p | video | on | 1082 (1070-1171) | 90 | 8.29 | 1.0 |
+| dual-1080p | idle | off | 2304 (2025-2637) | 55 | 16.59 | 1.0 |
+| dual-1080p | idle | on | 253 (248-293) | 62 | 1.60 | 1.7 |
+| dual-1080p | idle | on, no sweep | 129 (127-145) | 48 | 0.49 | 1.0 |
+| dual-1080p | typing | off | 2085 (2014-2236) | 54 | 16.59 | 1.0 |
+| dual-1080p | typing | on | 445 (417-452) | 66 | 3.03 | 1.6 |
+| dual-1080p | typing | on, no sweep | 323 (309-332) | 63 | 1.97 | 1.0 |
+| dual-1080p | scrolling | off | 2396 (2322-2821) | 84 | 16.59 | 1.0 |
+| dual-1080p | scrolling | on | 2907 (2822-3437) | 117 | 16.59 | 1.0 |
+| dual-1080p | video | off | 2758 (2455-2811) | 101 | 16.59 | 1.0 |
+| dual-1080p | video | on | 2589 (2578-2596) | 115 | 16.59 | 1.0 |
+| 4K | idle | off | 4814 (4158-4945) | 63 | 33.18 | 1.0 |
+| 4K | idle | on | 439 (430-457) | 78 | 2.69 | 1.8 |
+| 4K | idle | on, no sweep | 136 (133-145) | 54 | 0.49 | 1.0 |
+| 4K | typing | off | 3978 (3968-4000) | 60 | 33.18 | 1.0 |
+| 4K | typing | on | 500 (492-506) | 71 | 4.12 | 1.7 |
+| 4K | typing | on, no sweep | 282 (276-290) | 62 | 1.97 | 1.0 |
+| 4K | scrolling | off | 4109 (4105-4189) | 66 | 33.18 | 1.0 |
+| 4K | scrolling | on | 3046 (2875-3326) | 87 | 22.66 | 1.0 |
+| 4K | video | off | 4635 (4626-4855) | 100 | 33.18 | 1.0 |
+| 4K | video | on | 4874 (4736-4928) | 146 | 33.18 | 1.0 |
+
+Reading it:
+
+- Idle and typing fall by 5-8x (1080p) and 8-11x (4K) in `capture_us`, and
+  by 5-12x in bytes the X server writes. `cpu_us` is flat (the grab is the X
+  server's work, outside this process).
+- **Typing is not resolution independent in time.** The rows grabbed are
+  (`on_mode_typing_grabs_the_same_rows_at_any_resolution`), but the bands are
+  full width, so bytes and time grow with the width: no-sweep typing is 143 us
+  at 1080p and 282 us at 4K (2x the width, 2x the bytes). With the default
+  sweep it is 198 and 500 us: the sweep slice is 1/12 of the rows and each of
+  the four slots takes it once, so 4 of 5 ticks carry about 7 % of the screen,
+  which scales with the resolution. Against the full grab (1041 / 3978 us) the
+  gap widens with the resolution, but the cost is not flat. A narrower slice
+  or a rectangle copy would flatten it; not done here (design decision 3).
+- Saturation: scrolling and video fall back to the full grab (video always,
+  scrolling at 1080p always, at 4K on part of the ticks: 22.7 of 33.2 MB on average); video pays +10 % / +5 %
+  `capture_us` for the plan (`begin_tick`, ring copy), within the run-to-run
+  spread of the full grab. No regression beyond that.
+- Dual-1080p scrolling (a 3840x1080 root, where the scroll area never gets under
+  the fraction) is +21 % on `on` (2396 to 2907 us, wide min-max): the cost of
+  the plan plus a full grab. Not a gain; to be watched.
+- Round trips: requests per tick are 1.0-1.8 on average (bounded at 16 by
+  `MAX_BANDS`, tested), all sent before the first reply is read.
+
+Gate: `on_mode_idle_and_typing_grab_their_band_area` (every tick's
+`bytes_grabbed` equals the planned band area, via `RunReport::validate`, and
+over 90 % of ticks stay under 40 % of the root);
+`the_harness_rejects_a_counter_that_disagrees_with_the_plan` (the check is
+live). Correctness is in `band_tests.rs`: every delivered slot equals a fresh
+full grab over 160 random ticks. Mutations, each failing that property:
+- drop the age union: `tick 4: the delivered slot differs from a fresh full grab at byte 381992 (pixel 266,186), grab was Bands([Band { y0: 224, y1: 352 }])`
+- drop the old cursor tiles: `tick 4: ... at byte 1025944 (pixel 486,500), grab was Bands([Band { y0: 160, y1: 352 }])`
+- skip a band: `tick 4: ... at byte 1025944 (pixel 486,500), grab was Bands([Band { y0: 160, y1: 352 }, Band { y0: 480, y1: 544 }])`
+An injected miss (damage lost before the grab decides anything) shows stale
+and is repaired by the sweep within `S*k` ticks plus the pool
+(`x11_a_lost_damage_report_is_repaired_by_the_sweep`).

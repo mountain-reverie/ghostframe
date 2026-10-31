@@ -17,10 +17,33 @@ use std::time::Instant;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{ConnectionExt, CreateGCAux, Rectangle};
 
+use super::bands::Grab;
 use super::test_support::PrivateXvfb;
 use super::{damage, frames, X11Backend};
+use crate::capture::safety_net::{NetConfig, SafetyNet};
 use crate::capture::tick_stats::thread_cpu_us;
-use crate::capture::Backend;
+use crate::capture::{damage_plan_grab, Backend};
+
+/// How the backend grabs in a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// `damage_mode = off`: the whole root every tick.
+    Off,
+    /// `damage_mode = on`: row bands from the damage, the sweep and the cursor.
+    On,
+    /// `on` with the sweep switched off: the damage-proportional part alone.
+    OnNoSweep,
+}
+
+impl Mode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Off => "off",
+            Mode::On => "on",
+            Mode::OnNoSweep => "on, no sweep",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scene {
@@ -169,6 +192,13 @@ pub struct Tick {
     pub cpu_us: u64,
     pub bytes_copied: u64,
     pub allocs: u32,
+    /// Bytes the X server wrote into the frame (the counter under test).
+    pub bytes_grabbed: u64,
+    /// Grab requests sent.
+    pub grab_requests: u32,
+    /// The area the grab plan names, in bytes: the full root or the bands'
+    /// rows times the stride. `bytes_grabbed` must equal it.
+    pub planned_bytes: u64,
     /// Tiles in the damage hint; 0 when the hint was `None`.
     pub hint_tiles: usize,
     /// The hint itself, sorted, for determinism checks.
@@ -201,6 +231,12 @@ impl RunReport {
     pub fn allocs(&self) -> f64 {
         self.mean(|t| u64::from(t.allocs))
     }
+    pub fn bytes_grabbed(&self) -> f64 {
+        self.mean(|t| t.bytes_grabbed)
+    }
+    pub fn grab_requests(&self) -> f64 {
+        self.mean(|t| u64::from(t.grab_requests))
+    }
     pub fn hint_tiles(&self) -> f64 {
         self.mean(|t| t.hint_tiles as u64)
     }
@@ -213,6 +249,20 @@ impl RunReport {
     pub fn validate(&self) -> Result<(), String> {
         if self.ticks.is_empty() {
             return Err("no ticks measured".into());
+        }
+        if let Some((i, t)) = self
+            .ticks
+            .iter()
+            .enumerate()
+            .find(|(_, t)| t.bytes_grabbed != t.planned_bytes)
+        {
+            return Err(format!(
+                "{} scene: tick {i} grabbed {} bytes but its plan names {}: the counter and the \
+                 grab disagree",
+                self.scene.name(),
+                t.bytes_grabbed,
+                t.planned_bytes
+            ));
         }
         let ceiling = self.pixels * 4;
         if let Some((i, t)) = self
@@ -246,9 +296,27 @@ impl RunReport {
     }
 }
 
-/// Run `ticks` ticks of `scene` on a fresh Xvfb of `w`x`h`, after two
-/// unmeasured warm-up ticks (the first grab allocates the SHM segment).
+/// Ticks run before measuring: every one of the four pool slots has been
+/// grabbed once and the age ring is full, so the grab set is steady.
+const WARMUP: u32 = 10;
+
+/// [`run_scene_mode`] with `damage_mode = off`.
 pub fn run_scene(scene: Scene, w: u16, h: u16, ticks: u32, seed: u64) -> RunReport {
+    run_scene_mode(scene, w, h, ticks, seed, Mode::Off)
+}
+
+/// Run `ticks` ticks of `scene` on a fresh Xvfb of `w`x`h`, after unmeasured
+/// warm-up ticks (the first grabs allocate the SHM segments). Three frames
+/// are held, as the pipeline does, so the four slots rotate and ages are
+/// realistic.
+pub fn run_scene_mode(
+    scene: Scene,
+    w: u16,
+    h: u16,
+    ticks: u32,
+    seed: u64,
+    mode: Mode,
+) -> RunReport {
     let x = PrivateXvfb::spawn(&["-screen", "0", &format!("{w}x{h}x24")]);
     let d = x.display();
     let mut backend = X11Backend {
@@ -265,31 +333,59 @@ pub fn run_scene(scene: Scene, w: u16, h: u16, ticks: u32, seed: u64) -> RunRepo
         "the baseline measures the MIT-SHM path; the Xvfb has no usable MIT-SHM"
     );
     backend.arm_damage();
+    let mut net_cfg = NetConfig::for_fps(30);
+    net_cfg.sweep = mode != Mode::OnNoSweep;
+    let mut net = SafetyNet::new(net_cfg);
     let mut painter = Painter::new(d, w, h, seed);
+    // The pointer starts at the screen centre, whose tile alignment depends
+    // on the resolution; park it at the same pixel everywhere.
+    painter
+        .conn
+        .warp_pointer(x11rb::NONE, painter.root, 0, 0, 0, 0, 10, 10)
+        .unwrap();
+    painter.conn.get_input_focus().unwrap().reply().unwrap();
     let mut out = Vec::with_capacity(ticks as usize);
-    for t in 0..ticks + 2 {
+    let mut held = std::collections::VecDeque::new();
+    for t in 0..ticks + WARMUP {
         painter.paint(scene, t);
         let cpu0 = thread_cpu_us();
         let t0 = Instant::now();
-        let hint = backend.drain_damage().into_hint();
-        let frame = backend.capture(t * 33_333).expect("capture");
+        let (damage, frame) = if mode == Mode::Off {
+            crate::capture::damage_then_grab(&mut backend, t * 33_333)
+        } else {
+            damage_plan_grab(&mut backend, &mut net, t * 33_333)
+        };
+        let frame = frame.expect("capture");
         #[allow(
             clippy::disallowed_methods,
             reason = "synchronous harness on a real Xvfb, never under a paused tokio clock; this is real wall-clock capture cost"
         )]
         let capture_us = t0.elapsed().as_micros() as u64;
         let cpu_us = thread_cpu_us().saturating_sub(cpu0);
+        let hint = damage.into_hint();
         let pixel_hash = frame.pixels.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
             (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
         });
         assert_eq!((frame.width, frame.height), (u32::from(w), u32::from(h)));
+        let stride = u64::from(w) * 4;
+        let planned_bytes = match backend.frames.last_grab {
+            Some(Grab::Bands(b)) if mode != Mode::Off => u64::from(b.rows()) * stride,
+            _ => u64::from(h) * stride,
+        };
+        held.push_back(frame.pixels);
+        if held.len() > 3 {
+            held.pop_front();
+        }
         let s = backend.take_tick_stats();
-        if t >= 2 {
+        if t >= WARMUP {
             out.push(Tick {
                 capture_us,
                 cpu_us,
                 bytes_copied: s.bytes_copied,
                 allocs: s.allocs,
+                bytes_grabbed: s.bytes_grabbed,
+                grab_requests: s.grab_requests,
+                planned_bytes,
                 hint_tiles: hint.as_ref().map_or(0, |h| h.len()),
                 hint: {
                     let mut h = hint.unwrap_or_default();
@@ -352,6 +448,9 @@ mod tests {
                     cpu_us: if zero == 1 { 0 } else { 90 },
                     bytes_copied: if zero == 2 { 0 } else { 1024 },
                     allocs: if zero == 3 { 0 } else { 1 },
+                    bytes_grabbed: 0,
+                    grab_requests: 0,
+                    planned_bytes: 0,
                     hint_tiles: 0,
                     hint: vec![],
                     pixel_hash: 0,
@@ -373,6 +472,9 @@ mod tests {
             cpu_us: 90,
             bytes_copied: bytes,
             allocs: 1,
+            bytes_grabbed: 0,
+            grab_requests: 0,
+            planned_bytes: 0,
             hint_tiles: 0,
             hint: vec![],
             pixel_hash: 0,
@@ -458,6 +560,120 @@ mod tests {
                     median(col(RunReport::allocs)),
                     median(col(RunReport::hint_tiles)),
                 );
+            }
+        }
+    }
+
+    /// Gate (PR 5): in `on` mode, idle and typing grab exactly the band area
+    /// their plan names, every tick (not on average), and most ticks far less
+    /// than the root.
+    #[test]
+    fn on_mode_idle_and_typing_grab_their_band_area() {
+        let (w, h) = (1280u16, 720u16);
+        let root = u64::from(w) * u64::from(h) * 4;
+        for scene in [Scene::Idle, Scene::Typing] {
+            let r = run_scene_mode(scene, w, h, 40, 7, Mode::On);
+            r.validate().unwrap();
+            let mut small = 0;
+            for t in &r.ticks {
+                assert_eq!(t.bytes_grabbed, t.planned_bytes, "{t:?}");
+                assert!(t.bytes_grabbed > 0, "the cursor is always grabbed: {t:?}");
+                if t.bytes_grabbed * 5 <= root * 2 {
+                    small += 1;
+                }
+            }
+            assert!(
+                small * 10 >= r.ticks.len() * 9,
+                "{}: only {small}/{} ticks grabbed 40% of the root or less",
+                scene.name(),
+                r.ticks.len()
+            );
+        }
+    }
+
+    /// Gate (PR 5): the rows typing grabs do not depend on the resolution
+    /// (the damage-proportional part; the sweep slice is a fraction of the
+    /// rows and is measured separately).
+    #[test]
+    fn on_mode_typing_grabs_the_same_rows_at_any_resolution() {
+        let rows = |w: u16, h: u16| -> Vec<u64> {
+            let r = run_scene_mode(Scene::Typing, w, h, 30, 7, Mode::OnNoSweep);
+            r.validate().unwrap();
+            r.ticks
+                .iter()
+                .map(|t| t.bytes_grabbed / (u64::from(w) * 4))
+                .collect()
+        };
+        let small = rows(960, 540);
+        let big = rows(1920, 1080);
+        assert_eq!(small, big);
+        assert!(small.iter().all(|&r| r > 0 && r < 540 / 2), "{small:?}");
+    }
+
+    #[test]
+    fn the_harness_rejects_a_counter_that_disagrees_with_the_plan() {
+        let tick = |grabbed| Tick {
+            capture_us: 100,
+            cpu_us: 90,
+            bytes_copied: 1024,
+            allocs: 1,
+            bytes_grabbed: grabbed,
+            grab_requests: 1,
+            planned_bytes: 4096,
+            hint_tiles: 0,
+            hint: vec![],
+            pixel_hash: 0,
+        };
+        let r = RunReport {
+            scene: Scene::Idle,
+            pixels: 1 << 20,
+            ticks: vec![tick(4096), tick(4096 / 2)],
+        };
+        let e = r.validate().unwrap_err();
+        assert!(e.contains("the counter and the grab disagree"), "{e}");
+    }
+
+    /// Prints the band-grab table (PR 5). Slow; run it under the bench lock.
+    #[test]
+    #[ignore = "measurement, prints a table; run by hand"]
+    fn band_table() {
+        const RUNS: u64 = 3;
+        const TICKS: u32 = 90;
+        println!(
+            "| layout | scene | damage_mode | capture_us (median, min-max) | cpu_us | MB grabbed/tick | requests/tick | allocs/tick |"
+        );
+        println!("|---|---|---|---|---|---|---|---|");
+        for (name, w, h) in [
+            ("1080p", 1920u16, 1080u16),
+            ("4K", 3840, 2160),
+            ("dual-1080p", 3840, 1080),
+        ] {
+            for scene in [Scene::Idle, Scene::Typing, Scene::Scrolling, Scene::Video] {
+                for mode in [Mode::Off, Mode::On, Mode::OnNoSweep] {
+                    let runs: Vec<RunReport> = (0..RUNS)
+                        .map(|i| {
+                            let r = run_scene_mode(scene, w, h, TICKS, 1000 + i, mode);
+                            r.validate().unwrap();
+                            r
+                        })
+                        .collect();
+                    let col = |f: fn(&RunReport) -> f64| runs.iter().map(f).collect::<Vec<_>>();
+                    let cap = col(RunReport::capture_us);
+                    let (lo, hi) = (
+                        cap.iter().cloned().fold(f64::MAX, f64::min),
+                        cap.iter().cloned().fold(0.0, f64::max),
+                    );
+                    println!(
+                        "| {name} | {} | {} | {:.0} ({lo:.0}-{hi:.0}) | {:.0} | {:.2} | {:.1} | {:.1} |",
+                        scene.name(),
+                        mode.name(),
+                        median(cap.clone()),
+                        median(col(RunReport::cpu_us)),
+                        median(col(RunReport::bytes_grabbed)) / 1e6,
+                        median(col(RunReport::grab_requests)),
+                        median(col(RunReport::allocs)),
+                    );
+                }
             }
         }
     }
