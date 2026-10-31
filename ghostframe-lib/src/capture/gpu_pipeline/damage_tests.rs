@@ -659,7 +659,9 @@ fn an_unchanged_tick_equals_a_full_compare_of_identical_pixels() {
     let (mut full, mut unch) = pair();
     let mut r = Rng(77);
     let mut px = noise_frame(w, h, 21);
-    let candidates = [3u32, 7, 12];
+    // Tile 5 is the one the sub-threshold change lands on: the SAD reference
+    // never sees it, only the screen (the upload image) does.
+    let candidates = [3u32, 5, 7, 12];
     for gpu in [&mut full, &mut unch] {
         gpu.invalidate_baseline(0);
     }
@@ -711,6 +713,25 @@ fn an_unchanged_tick_equals_a_full_compare_of_identical_pixels() {
                 escalation_coeffs(&unch, candidates.len()),
             );
             assert_eq!(we, ge, "round {round} tick {tick}: escalation forward");
+            // And both are the CPU transform of what the screen shows.
+            let grid = crate::tile::TileGrid::new(w, h);
+            let (cols, _) = cols_rows(w, h);
+            for (k, &tile) in candidates.iter().enumerate() {
+                let cpu = crate::encoder::cdf53::forward(&grid.extract_tile(
+                    &px,
+                    w * 4,
+                    tile % cols,
+                    tile / cols,
+                ));
+                let gpu: Vec<i16> = ge[k * 3072..(k + 1) * 3072]
+                    .iter()
+                    .map(|&v| v as i16)
+                    .collect();
+                assert_eq!(
+                    gpu, cpu,
+                    "round {round} tick {tick}: tile {tile} forward vs CPU of the screen"
+                );
+            }
             esc_nonzero += usize::from(ge.iter().any(|&v| v != 0));
             // Nothing was uploaded or compared.
             assert_eq!(unch.probe.uploaded_rows, 0);
