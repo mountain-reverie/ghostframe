@@ -1272,6 +1272,17 @@ async fn session_reset_queues_invalidate_then_keyframe_and_ends_the_epoch() {
     assert_eq!(bridge.session_epoch, before + 1);
 }
 
+/// A frame dropped before the GPU stage (no session to send to) never
+/// uploaded the tile rows its damage named, so the worker is told to stop
+/// trusting damage until a whole frame has gone through.
+#[tokio::test]
+async fn a_frame_dropped_before_the_gpu_stage_makes_the_worker_forget_damage() {
+    let (mut bridge, _peer, _log) = recording_bridge();
+    bridge.process_frame(tiny_frame());
+    assert!(bridge.in_flight.is_none(), "nothing went to the worker");
+    assert_eq!(bridge.pending_controls, vec![Control::ForgetDamage]);
+}
+
 /// A frame whose session ended while the worker held it is not committed: the
 /// worker is told to discard it, and the GPU baseline, which the frame already
 /// advanced, is invalidated so the next frame repaints.
