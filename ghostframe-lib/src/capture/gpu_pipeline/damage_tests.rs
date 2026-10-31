@@ -751,12 +751,17 @@ fn an_unchanged_tick_without_a_consistent_upload_image_is_refused() {
     let (w, h) = (160u32, 128u32);
     let mut gpu = GpuFrameProcessor::new(256).expect(NEEDS_GPU);
     // Nothing uploaded yet.
-    assert!(unsafe { gpu.process_frame_inner_unchanged(w, h) }.is_err());
+    let refused = |gpu: &mut GpuFrameProcessor, w, h| {
+        unsafe { gpu.process_frame_inner_unchanged(w, h) }
+            .err()
+            .is_some_and(|e| e.downcast_ref::<UnchangedRefused>().is_some())
+    };
+    assert!(refused(&mut gpu, w, h));
     let mut r = Rng(5);
     let f0 = noise_frame(w, h, 3);
     step(&mut gpu, &f0, w, h, &FrameDamage::Unknown);
     // Another size.
-    assert!(unsafe { gpu.process_frame_inner_unchanged(96, 128) }.is_err());
+    assert!(refused(&mut gpu, 96, 128));
     // The refusal cleared the baseline, so damage is not trusted next.
     let mut f1 = f0.clone();
     change_tile(&mut f1, w, h, 9, Change::Big, &mut r);
@@ -765,26 +770,33 @@ fn an_unchanged_tick_without_a_consistent_upload_image_is_refused() {
     assert_eq!(gpu.probe.uploaded_rows, h);
     // After forget_damage the upload image is not known to match the screen.
     gpu.forget_damage();
-    assert!(unsafe { gpu.process_frame_inner_unchanged(w, h) }.is_err());
+    assert!(refused(&mut gpu, w, h));
 }
 
-/// During a session-reset cushion the unchanged tick has no reference and
-/// reports every tile dirty, from the upload image; the read-back is that
-/// image.
+/// In the session-reset cushion there is no reference. An unchanged tick
+/// would have to re-send every tile from the host-visible upload image, which
+/// costs 30-190 ms to read back (1080p-4K), so it is refused (and keeps the
+/// upload image trusted: the next pixels frame goes in as damage).
 #[test]
-fn an_unchanged_tick_in_the_reset_cushion_reports_every_tile_from_the_upload_image() {
+fn an_unchanged_tick_in_the_reset_cushion_is_refused_and_keeps_the_baseline() {
     let (w, h) = (160u32, 128u32);
     let mut gpu = GpuFrameProcessor::new(256).expect(NEEDS_GPU);
     let f0 = noise_frame(w, h, 8);
     step(&mut gpu, &f0, w, h, &FrameDamage::Unknown);
     gpu.invalidate_baseline(2);
-    let a = unsafe { gpu.process_frame_inner_unchanged(w, h) }.expect("unchanged tick");
+    let e = unsafe { gpu.process_frame_inner_unchanged(w, h) }
+        .err()
+        .expect("refused");
+    assert!(e.downcast_ref::<UnchangedRefused>().is_some(), "{e}");
+    // Not a fault, and the upload image is still the screen.
+    let got = step(&mut gpu, &f0, w, h, &tiles_damage(w, h, &[], &[]));
     let (c, rws) = cols_rows(w, h);
-    assert_eq!(a.dirty_tiles.len() as u32, c * rws);
     assert_eq!(
-        gpu.read_upload_pixels(w, h, w * 4).as_deref(),
-        Some(&f0[..])
+        got.dirty.len() as u32,
+        c * rws,
+        "the cushion frame reports every tile"
     );
+    assert_eq!(gpu.probe.uploaded_rows, 0, "damage was still trusted");
 }
 
 /// Per-tick library cost of an idle screen (PR 7): the whole frame, a

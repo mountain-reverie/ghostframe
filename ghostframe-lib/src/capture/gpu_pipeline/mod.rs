@@ -588,6 +588,18 @@ pub(super) struct DamageProbe {
     pub(super) dispatched_tile_rows: u32,
 }
 
+/// An unchanged tick the processor cannot honour; not a GPU fault.
+#[derive(Debug)]
+pub struct UnchangedRefused(pub String);
+
+impl std::fmt::Display for UnchangedRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnchangedRefused {}
+
 /// The persistent from-pixels upload image and its host mapping.
 struct UploadImage {
     frame: PrevFrame,
@@ -708,20 +720,15 @@ impl GpuFrameProcessor {
     }
 
     /// A tick on which nothing changed ([`crate::Content::Unchanged`]); see
-    /// `process_frame_inner_unchanged`. Errors when the persistent upload
-    /// image is not a consistent `width` x `height` screen.
+    /// `process_frame_inner_unchanged`. Refuses with [`UnchangedRefused`] when
+    /// the persistent upload image is not a consistent `width` x `height`
+    /// screen, or there is no reference to compare against.
     pub fn process_frame_unchanged(
         &mut self,
         width: u32,
         height: u32,
     ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
         unsafe { self.process_frame_inner_unchanged(width, height) }
-    }
-
-    /// The persistent upload image as BGRA at `stride`; `None` without one
-    /// of that size.
-    pub fn read_upload_pixels(&self, width: u32, height: u32, stride: u32) -> Option<Vec<u8>> {
-        unsafe { self.read_upload(width, height, stride) }
     }
 
     /// Stop trusting damage until a whole frame has been processed: a frame
