@@ -50,36 +50,25 @@ async fn run_bottleneck_scene(
 
 /// The estimator must tell a congested link from an uncongested one.
 ///
-/// This deliberately does **not** assert convergence to the link rate, which
-/// would be false: on the congested link the estimate sits on goog_cc's
-/// `MIN_BPS` floor (200 kbps), and on the uncongested one it stays near its
-/// 2 Mbps seed because nothing ever signals congestion. Asserting "within a
-/// factor of capacity" would fail on both sides for opposite reasons.
+/// The scenes offer the same ~10 Mbit/s of churn (`tiles_per_tick: 32`) over
+/// a 500 000 bytes/s (4 Mbit/s) link and a 2 000 000 bytes/s (16 Mbit/s)
+/// link. The 4 Mbit/s one is saturated: the session must carry at least 90 %
+/// of the link (measured 96 %), which is what separates "congested" from
+/// "the application sent little". The model controller bounds the queue
+/// instead of overflowing it, so drops are not the premise; the spacious
+/// link must have none.
 ///
-/// What it does assert is the property that makes an estimator an estimator:
-/// a link that queues and drops must produce a materially lower estimate than
-/// one with headroom to spare. Measured separation is ~10x with no run-to-run
-/// variance, so the 2x threshold here has a wide margin.
+/// The assertion is the property that makes an estimator an estimator: the
+/// saturated link must produce a materially lower estimate than the one with
+/// headroom (measured 3.78 against 9.36 Mbit/s; the threshold is 2x).
 ///
-/// On the bottleneck's role, stated precisely, because an induced-failure
-/// check refuted the stronger claim this comment first made: the *estimate
-/// separation* above is visible against the old drop-without-queueing cap
-/// too (201 kbps vs 2.02 Mbps measured). What the bottleneck changes is the
-/// `bytes_dropped` guards. A token bucket drops bursts even on a link with
-/// ample headroom — 1,200 bytes shed from the spacious scene — which is not
-/// how an uncongested link behaves, so `dropped == 0` is assertable only
-/// against a queue. It also makes the scene reproducible: queue occupancy is
-/// a deterministic function of arrivals, where the bucket's drop decisions
-/// were timing-sensitive and gave estimates spanning 215 kbps to 2.0 Mbps on
-/// identical inputs.
-///
-/// The queueing model still matters for the wider point — without a
-/// queuing-delay gradient goog_cc's delay-based half never runs at all — but
-/// that is not what *this* assertion rests on. See
-/// `docs/specs/bwe-probe-emission-timing.md`.
+/// The bottleneck is a queueing one, not a token bucket: a bucket drops
+/// bursts even on a link with ample headroom, and queue occupancy is a
+/// deterministic function of arrivals where the bucket's drop decisions were
+/// timing-sensitive. See `docs/specs/bwe-probe-emission-timing.md`.
 #[tokio::test(start_paused = true)]
 async fn the_estimate_separates_a_congested_link_from_an_uncongested_one() {
-    // Offered load is ~1.6 Mbps, so 480 kbps congests and 3.2 Mbps does not.
+    // Offered load is ~10 Mbit/s: a 500 000 bytes/s link (4 Mbit/s) congests, a 2 000 000 bytes/s one (16 Mbit/s) does not.
     let congested = run_bottleneck_scene(0xC0FF_EE01, CapTimeline::constant(500_000), 20).await;
     let spacious = run_bottleneck_scene(0xC0FF_EE01, CapTimeline::constant(2_000_000), 20).await;
 
@@ -102,9 +91,14 @@ async fn the_estimate_separates_a_congested_link_from_an_uncongested_one() {
 
     // The scenes must actually be what they claim, or the comparison below
     // is between two identical links and proves nothing.
-    // The model controller holds the queue under its bound instead of
-    // overflowing it, so "congested" is read from the estimate: it sits at or
-    // under the link it runs on, where the spacious scene's does not need to.
+    // Saturated: the session carried nearly the whole 500 000 bytes/s link,
+    // so the estimate below is the estimate of a full link, not of a quiet one.
+    assert!(
+        congested.bytes_delivered_s2c * 10 >= 500_000 * 20 * 9,
+        "the congested scene must saturate its link: delivered {} of {} bytes",
+        congested.bytes_delivered_s2c,
+        500_000 * 20
+    );
     assert!(
         congested.bwe_estimate_bps <= 500_000 * 8,
         "the congested scene's estimate must not exceed its link: est={} link={}",
@@ -126,51 +120,32 @@ async fn the_estimate_separates_a_congested_link_from_an_uncongested_one() {
     );
 }
 
-/// Capacity triples mid-session: does the estimate find the new headroom?
+/// Capacity quadruples mid-session (4 -> 16 Mbit/s): does the estimate find
+/// the new headroom?
 ///
-/// This is the scenario probing exists for, and the one no test covered.
-/// A session that starts congested and is then handed room to grow has to
-/// *discover* that room — nothing tells it. goog_cc's answer is to probe:
-/// send a short burst above the current estimate and read the ACKs.
-///
-/// Probe clusters complete here, which is itself new: at production cadence
-/// over the old drop-without-queueing cap they never did. So probing works
-/// and any slow ramp is not explained by probe abandonment — which bounds
-/// how much `drain_for_probe_window_open` could be worth, the open question
-/// in `docs/specs/bwe-probe-emission-timing.md`.
+/// This is the scenario probing exists for. A session that starts congested
+/// and is then handed room to grow has to *discover* that room; nothing tells
+/// it. The estimator's answer is to probe above the current estimate and read
+/// the ACKs, and the model controller then follows the estimate with both the
+/// admission rate and quinn's window.
 ///
 /// # Why the thresholds are what they are
 ///
-/// This test was ~50% flaky until 2026-09-20, and re-measuring showed the
-/// cause was not noise but two threshold choices that did not match the
-/// behaviour being measured.
+/// **The acceptance level.** 60 % of the new capacity (9.6 Mbit/s), far more
+/// than the "doubling" an earlier version asserted: a 2 -> 4.1 Mbit/s move
+/// would not come close. Measured on the model controller: the estimate
+/// reaches it 2.1 s after the step, and the last three seconds sit at
+/// 9.4 Mbit/s.
 ///
-/// **The acceptance level.** Measured final estimates on this 16 Mbps
-/// post-step link, 8 runs each:
+/// **The observation window.** The scene runs 26 s with the step at 4 s, so
+/// 22 s of post-step observation against an 18 s bound: the whole acceptance
+/// range is observable.
 ///
-/// | | final estimate |
-/// |---|---|
-/// | with `set_transport_capacity_hint` | 12.0 - 18.2 Mbps |
-/// | with the hint disabled | 7.0 - 7.2 Mbps |
-///
-/// The old 80% bar (12.8 Mbps) cut straight through the *with-hint* range,
-/// so the test was a coin flip on its own success case. 60% (9.6 Mbps) sits
-/// in the gap between the two populations: 34% above the no-hint maximum and
-/// 20% below the with-hint minimum. It is a weaker-sounding number that
-/// discriminates strictly better, and it is still far more than the
-/// "doubling" an earlier version asserted — a 2 -> 4.1 Mbps move would not
-/// come close.
-///
-/// **The observation window.** The scene ran 20 s with the step at 4 s, so it
-/// could only ever watch 16 s of recovery — against an 18 s bound. Part of
-/// the acceptance range was unobservable by construction. The scene is now
-/// 26 s, giving 22 s of post-step observation against the same 18 s bound.
-///
-/// Time-to-converge at the 60% level now measures 4.4 - 10.1 s across 8 runs,
-/// so 18 s carries real margin. Note the bound is no longer what guards
-/// against the hint regressing: with the hint disabled the estimate does not
-/// reach 60% *at all* within the scene, in any run. Convergence happening is
-/// the discriminator; the bound just keeps "eventually" honest.
+/// **The pre-step bound.** The estimate counts the wire size of each
+/// acknowledged transmission, so it is compared with the link's wire rate. It
+/// settles 7 % over it in the 1-4 s window (4.28 against 4.0 Mbit/s: the
+/// startup overshoot before the queue signal arrives); 10 % is the bound, so
+/// a larger overshoot, the dangerous direction, fails.
 #[tokio::test(start_paused = true)]
 async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
     const LOW: u64 = 500_000; // bytes/s -> 4 Mbps, well below the ~10 Mbps offered
@@ -179,25 +154,13 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
     /// The acceptance bound: the estimate must reach `CONVERGED_FRACTION` of
     /// the new capacity within this long after the step.
     ///
-    /// Measured 4.4-10.1 s across 8 runs at the 60% level, so this carries
-    /// roughly 80% margin over the observed worst case. It must also stay
+    /// Measured 2.1 s at the 60% level. It must also stay
     /// under the post-step observation window (26 s scene - 4 s step = 22 s),
     /// or part of the range it admits can never be observed — which is
     /// exactly what made the old 18 s bound unreachable against a 16 s
     /// window.
-    ///
-    /// Before `set_transport_capacity_hint` fed goog_cc an independent
-    /// ceiling, the estimate could only climb by `AimdRateControl`'s
-    /// multiplicative increase, which hardcodes `alpha = 1.08` capped to one
-    /// second of effect (8% per second). ALR probing cannot substitute for
-    /// it: `time_for_alr_probe` fires only when the application is
-    /// under-sending, which is exactly when there is too little traffic to
-    /// fill a probe cluster. Disabling the hint and re-running confirms it:
-    /// the estimate plateaus at ~7.1 Mbps and never reaches this bar.
     const CONVERGE_BY_US: u64 = 18_000_000;
-    /// See the "Why the thresholds are what they are" section above: this
-    /// sits in the measured gap between the with-hint and no-hint
-    /// populations, where 0.8 sat inside the with-hint spread.
+    /// See the "Why the thresholds are what they are" section above.
     const CONVERGED_FRACTION: f64 = 0.6;
 
     let r = run_bottleneck_scene(
@@ -281,11 +244,10 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
     // earlier version used a flat 3 Mbps and started failing when the
     // estimator got *better* (1.9 -> 3.03 Mbps on a 4 Mbps link), which is
     // the wrong thing for a test to punish.
-    // Allowed 15 % over the link: the estimate counts payload bytes and the
-    // startup overshoot is bounded by the same 1.15 as `browserless_bwe_rate_source`
-    // p6c; a larger overshoot is an overestimate.
+    // Allowed 10 % over the link (measured 7 %, in wire units; see the doc
+    // above); a larger overshoot is an overestimate.
     assert!(
-        median(pre_step.clone()) <= LOW * 8 * 115 / 100,
+        median(pre_step.clone()) <= LOW * 8 * 110 / 100,
         "the pre-step link carries {} bits/s; an estimate above that is an \
          overestimate, not congestion: pre_step(median)={}",
         LOW * 8,

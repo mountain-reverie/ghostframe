@@ -261,12 +261,12 @@ mod tests {
         bridge.model_after_feedback();
     }
 
-    /// The rate is the estimate, whatever quinn's window says. Under Cubic the
-    /// same path reading (12 000 bytes over 333 ms, 288 kbit/s) sets the rate;
-    /// here it must not. Mutation: drop the model branch of `admission_rate`
-    /// and this reads 36 kB/s.
+    /// The rate is the estimate, whatever the path reading says: a 333 ms
+    /// smoothed RTT (quinn's initial one) changes nothing about it, and the
+    /// classifier reads the same figure. Mutation: scale `est` in
+    /// `admission_rate` and the first assertion fails.
     #[tokio::test(start_paused = true)]
-    async fn admission_runs_at_the_estimate_not_at_cwnd_over_srtt() {
+    async fn admission_runs_at_the_estimate() {
         let mut bridge = model_bridge().await;
         // The floor under the rate: one datagram a tick (36 kB/s), well under
         // the estimate, so the floor cannot be what the assertion reads.
@@ -286,17 +286,9 @@ mod tests {
             expect
         );
         assert_eq!(rate.term, BudgetTerm::Pacer);
-        // The classifier reads the same figure, not cwnd / srtt.
+        // The classifier reads the same figure.
         let bpu = bridge.adaptation_context.bytes_per_us as f64;
         assert!((bpu * 1e6 - expect).abs() < 1.0, "classifier {bpu} B/us");
-        // Put the cwnd term back where the Cubic path reads it: the rate must
-        // not follow it.
-        bridge.adaptation_context.bytes_per_us = 12_000.0 / 333_000.0;
-        let again = bridge.admission_rate().bytes_per_sec;
-        assert!(
-            (again - expect).abs() < 1.0,
-            "rate {again} B/s followed the cwnd term, not the estimate {expect} B/s"
-        );
     }
 
     /// An open probe window raises `R_w` to the probe's rate, so quinn's window

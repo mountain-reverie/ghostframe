@@ -2132,7 +2132,8 @@ impl IoBridge {
                 bwe_estimate_bps = bwe_snap.bitrate_bps,
                 bwe_samples_seen = bwe_snap.samples_seen,
                 // What goog_cc's pacer is asking for (0 = no
-                // pacer_config absorbed yet).
+                // pacer_config absorbed yet). Informational: admission
+                // runs at `bwe_estimate_bps`.
                 pacer_rate_bps = bwe_snap.pacer_rate_bps.unwrap_or(0),
                 // goog_cc's loss-based estimator: anything but DelayBased
                 // means it is holding the estimate down.

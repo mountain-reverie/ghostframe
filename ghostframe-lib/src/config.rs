@@ -303,6 +303,17 @@ impl TransportConfig {
         allow(unused_variables)
     )]
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        // `GHOSTFRAME_CC` used to pick Cubic over the model controller. The
+        // choice is gone; say so once rather than silently ignore it.
+        if get("GHOSTFRAME_CC").is_some() {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    target: "ghostframe::config",
+                    "GHOSTFRAME_CC was removed and is ignored: the model controller is always used"
+                );
+            });
+        }
         Self {
             #[cfg(any(test, feature = "test-loss-injection"))]
             outbound_loss: loss_injector_from_lookup("OUTBOUND", &get),
@@ -1300,6 +1311,13 @@ mod tests {
             !TransportConfig::from_lookup(lookup(&[])).skip_palette_session_reset,
             "unset must yield false"
         );
+    }
+
+    #[test]
+    fn a_set_ghostframe_cc_is_ignored() {
+        let with = TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_CC", "cubic")]));
+        let without = TransportConfig::from_lookup(lookup(&[]));
+        assert_eq!(with.model, without.model);
     }
 
     #[test]

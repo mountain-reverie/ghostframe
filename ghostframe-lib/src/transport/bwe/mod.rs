@@ -69,11 +69,11 @@ pub struct BweSnapshot {
     /// BWE Stage 2.2's pacing rate, bits per second — derived from the
     /// controller's most recent `NetworkControlUpdate::pacer_config`
     /// (`PacerConfig::data_rate()`). `None` until the controller has
-    /// processed at least one feedback batch. This, not `bitrate_bps`, is
-    /// what `PacingMode::Paced` (`transport::io_bridge`) consumes to bound
-    /// the per-tick emission budget — see `GoogCcDriver::absorb`'s doc
-    /// comment for why the two fields diverge and `pad_window` (padding to
-    /// hold a floor rate) is deliberately not surfaced here at all.
+    /// processed at least one feedback batch. Informational: admission
+    /// (the model controller) reads `bitrate_bps`, and this is logged and
+    /// reported by the harness. See `GoogCcDriver::absorb`'s doc comment for
+    /// why the two fields diverge and `pad_window` (padding to hold a floor
+    /// rate) is deliberately not surfaced here at all.
     pub pacer_rate_bps: Option<u64>,
     /// Countable bytes per token the admission bucket spends: how much of
     /// what is billed (parity, framing, control datagrams) goog_cc is told

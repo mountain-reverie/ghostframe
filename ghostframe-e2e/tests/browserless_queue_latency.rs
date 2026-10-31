@@ -31,8 +31,7 @@
 //! than only in a production journal. The harness runs the real
 //! `IoBridge::run` loop, so the `DatagramsUnblocked` arm and the continuation
 //! bookkeeping are the production ones; and `apply_injected_frame` drains
-//! against `base_budget_bytes()`, the same bytes_per_us-derived budget the
-//! capture path uses.
+//! through the same admission pass (`pump_admission`) the capture path uses.
 
 use std::time::Duration;
 
@@ -310,11 +309,11 @@ async fn refinement_work_queues_behind_critical_work() {
 ///
 /// The equality did break. The predicted cause is not what broke it.
 ///
-/// What changed is the budget floor: `base_budget_bytes` used to floor at a
-/// flat 256 KiB per 33.3 ms tick (7.86 MB/s), which is far above any link
-/// here, so the scheduler over-popped into quinn on every tick and nothing
-/// ever waited with `queued_at` stamped on it. With the floor at one
-/// datagram the bandwidth term governs, the scheduler pops what the path can
+/// What changed is the budget floor: the rate used to floor at a flat 256 KiB
+/// per 33.3 ms tick (7.86 MB/s), which is far above any link here, so the
+/// scheduler over-popped into quinn on every tick and nothing ever waited
+/// with `queued_at` stamped on it. With the floor at one datagram the
+/// estimate governs, the scheduler pops what the path can
 /// carry, and the remainder waits in the scheduler queue -- which is exactly
 /// what `queued_at -> ACK` measures. The wait moved from quinn's buffer into
 /// the scheduler, where work can still be superseded rather than sent stale.
@@ -450,8 +449,16 @@ async fn retransmission_alone_separates_queued_from_sent() {
         )
     };
     let (observed, control) = (ratio_of(&r), ratio_of(&clean));
+    let crit_of = |x: &BrowserlessResult| {
+        ratio(
+            x.queued_critical_latency_mean_us,
+            x.critical_latency_mean_us,
+        )
+    };
+    let (crit_observed, crit_control) = (crit_of(&r), crit_of(&clean));
     println!(
         "retransmit separation (refinement tier): ratio={observed:.2} control={control:.2} \
+         critical ratio={crit_observed:.2} control={crit_control:.2} \
          nack_hit={} nack_miss={} retransmits={}",
         r.nack_hit, r.nack_miss, r.retransmit_attempts_total
     );
@@ -460,8 +467,14 @@ async fn retransmission_alone_separates_queued_from_sent() {
         "the lossless control must not separate the clocks: ratio={control:.2}"
     );
     // A property, not a number: retransmission separates the clocks beyond
-    // what the lossless twin shows. (A fixed 1.3 was tuned on the Cubic arm,
-    // which retransmitted more; the model arm measures 1.08 against 1.00.)
+    // what the lossless twin shows. The critical tier carries the larger
+    // separation on the model arm (1.25 against 1.00), so it is the gate; the
+    // refinement tier (1.08 against 1.00, 565 samples) must still separate.
+    assert!(
+        crit_observed > crit_control + 0.15,
+        "expected retransmission to separate the critical-tier clocks: \
+         ratio={crit_observed:.2} control={crit_control:.2}"
+    );
     assert!(
         observed > control + 0.05,
         "expected retransmission to separate the two clocks, but ratio={observed:.2} \

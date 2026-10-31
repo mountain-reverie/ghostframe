@@ -32,7 +32,7 @@
 //! * **Window `W = max(4 x srtt, 150 ms)`.** 150 ms is goog_cc's own steady
 //!   acknowledged-rate window (`bitrate_estimator.rs`), so `A` is at least as
 //!   smooth as the number being bounded; `4 x srtt` makes it span several
-//!   round trips, the same span the capacity hint uses.
+//!   round trips.
 //! * **Saturated.** `A` is evidence about the path only if the sender was
 //!   offering as much as it was allowed to. Over the same window, shifted back
 //!   by one smoothed round trip (an acknowledgement describes a send that

@@ -181,7 +181,7 @@ pub struct Scheduler {
     /// Refinement budget handed to the last `tick_at`, for diagnostics.
     ///
     /// Without it a `scheduler.tick` line showing a small `drained_bytes`
-    /// against a large `base_budget_bytes` is ambiguous: the drain may have
+    /// against a large admission rate is ambiguous: the drain may have
     /// spent its share and stopped, or stopped early with budget to spare.
     /// Those have different causes and different fixes.
     last_refinement_budget: usize,

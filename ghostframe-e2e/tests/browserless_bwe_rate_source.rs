@@ -312,22 +312,25 @@ const P6C_SEED: u64 = 0xCC01_1010;
 /// not an environment variable: CI sets none.
 const P6C_SEEDS: [u64; 5] = [0, 1, 2, 3, 4];
 
-/// Gate: the settled estimate is at most 1.15 x the link's rate **in the units
-/// the estimate counts**, and it converges on at least four of five seeds.
+/// Gate: on a CoDel 10 Mbit/s link the settled estimate holds near the link's
+/// rate without collapsing and without overshooting: between 0.75 and 1.15 x
+/// the link's rate **in the units the estimate counts**, on all five seeds.
+///
+/// The model controller does not settle *at* the link: the estimate saw-tooths
+/// (AIMD against a CoDel queue) between about 6.8 and 11 Mbit/s and its
+/// median sits 13 to 17 % under the link (settled ratios 0.83 to 0.87 here;
+/// the same on master). None of the seeds enters the 3 s convergence band, so
+/// convergence is printed (`t_converge_ms`) and not gated. The Cubic arm used
+/// to settle 1.05 to 1.09 x; that is the price of the lower standing queue,
+/// and 0.75 leaves room under the data while still failing a collapse.
 ///
 /// The estimate is a rate of goog_cc's countable bytes (the wire size of each
 /// acknowledged transmission, no framing), so it is compared with the link's
 /// wire rate times the payload fraction the run measured
-/// (`payload_fraction_ppm`, the same field `browserless_nested_cc` uses).
-/// The old gate divided by the bare wire rate and bounded it at 1.05; the
-/// payload fraction in this scene is about 0.856, so 1.05 was 1.05 / 0.856 =
-/// 1.23 in these units. In these units master settles at 1.050 to 1.090 (mean
-/// 1.074) and the data is <= 1.09; the PR-3 overshoot of 1.26 against the wire
-/// rate reads about 1.26 / 0.856 = 1.47. 1.15 is a tightening from 1.23, with
-/// room over the data, and leaves the overshoot far outside. It also no longer
-/// depends on how much of the link carries parity.
+/// (`payload_fraction_ppm`, the same field `browserless_nested_cc` uses). The
+/// 1.15 ceiling leaves the PR-3 overshoot (1.47 in these units) far outside.
 #[tokio::test(start_paused = true)]
-async fn p6c_codel_c10_settles_at_the_link_rate_on_five_seeds() {
+async fn p6c_codel_c10_holds_near_the_link_rate_without_collapsing_on_five_seeds() {
     const CAP_MBIT: u64 = 10;
     let cap_bps = (CAP_MBIT * 1_000_000) as f64;
     let mut ratios = Vec::new();
@@ -382,14 +385,10 @@ async fn p6c_codel_c10_settles_at_the_link_rate_on_five_seeds() {
              (the unbounded estimate sat at ~1.47 in these units)"
         );
     }
-    // The estimate saw-tooths around the link on this path (AIMD against a
-    // CoDel queue), so the 3 s convergence band is not a property of the
-    // model arm; "does not collapse" is. t_converge is still printed.
-    let _ = converged;
     for (i, ratio) in ratios.iter().enumerate() {
         assert!(
-            *ratio >= 0.5,
-            "seed {i}: settled / (cap x payload fraction) {ratio:.3} is under 0.5: the estimate collapsed"
+            *ratio >= 0.75,
+            "seed {i}: settled / (cap x payload fraction) {ratio:.3} is under 0.75: the estimate collapsed"
         );
     }
 }
@@ -508,15 +507,17 @@ async fn p6b_the_estimate_follows_capacity_steps_each_held_20s() {
         "step down: the estimate went back up to {:.2} x the capacity",
         worst as f64 / low
     );
-    // The estimate is the term of the admission rate in a material share of
-    // passes (the PR-0 instrument; before the cwnd term was removed it bound
-    // in 19 to 77 % across five seeds). The rest are probe windows and the
-    // floor.
+    // The floor never sets the rate here: the estimate stays above one
+    // datagram a tick through both steps (the rest of the passes are the
+    // estimate's and probe windows'). A non-zero count means the estimate
+    // collapsed to the floor.
     let b = &r.transport.instr.budget;
-    assert!(
-        b.ticks() > 0 && b.pacer * 8 >= b.ticks(),
-        "the estimate bound the admission rate in only {} of {} passes",
-        b.pacer,
+    assert!(b.ticks() > 0, "no admission pass was counted");
+    assert_eq!(
+        b.floor,
+        0,
+        "the floor set the admission rate in {} of {} passes",
+        b.floor,
         b.ticks()
     );
 }
