@@ -893,4 +893,7 @@ mod tests;
 mod readback_bench;
 
 #[cfg(test)]
+mod reference_tests;
+
+#[cfg(test)]
 mod fallback_tests;
