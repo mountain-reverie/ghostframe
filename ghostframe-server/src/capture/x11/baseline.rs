@@ -257,6 +257,7 @@ pub fn run_scene(scene: Scene, w: u16, h: u16, ticks: u32, seed: u64) -> RunRepo
         input: None,
         display: None,
         stats: Default::default(),
+        hooks: Default::default(),
     };
     assert_eq!(
         backend.frames.path(),
