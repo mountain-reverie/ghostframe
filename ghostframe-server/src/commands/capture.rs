@@ -157,7 +157,8 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
 
     tracing::info!("Server ready, entering capture loop");
 
-    // The damage safety net. `on` has no consumer yet, so it runs as shadow.
+    // The damage safety net. In `shadow` it only judges; in `on` the band
+    // grab also acts on its plan.
     let mut net = cfg
         .damage_mode
         .net_runs()
@@ -165,9 +166,11 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
     if net.is_some() {
         server.feedback().enable();
         if cfg.damage_mode == DamageMode::On {
-            tracing::warn!(
-                "GHOSTFRAME_DAMAGE_MODE=on: nothing consumes damage yet, running as shadow \
-                 (the whole screen is still grabbed and compared)"
+            tracing::info!(
+                full_grab_above_pct = crate::capture::x11::bands::FULL_GRAB_ABOVE_PCT,
+                "GHOSTFRAME_DAMAGE_MODE=on: the grab copies only the rows damage, the \
+                 sweep and the cursor name (full grab above the threshold, when damage \
+                 is unknown or distrusted); the whole frame is still compared"
             );
         }
         tracing::info!(
@@ -303,22 +306,25 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
         let cpu_start = if sample_cpu { thread_cpu_us() } else { 0 };
 
         let timestamp_us = (frame_count * frame_interval.as_micros() as u64) as u32;
-        let (damage, grabbed) = crate::capture::damage_then_grab(&mut backend, timestamp_us);
+        // The library's verdicts on earlier frames reach the net before it
+        // plans this tick.
+        if let Some(net) = net.as_mut() {
+            server.feedback().drain_into(&mut feedback_buf);
+            for fb in feedback_buf.drain(..) {
+                net.ingest(fb);
+            }
+        }
+        let consumes = cfg.damage_mode == DamageMode::On;
+        let (damage, grabbed) = match net.as_mut() {
+            // The net plans the tick before the grab in both modes, so a
+            // failed grab counts as a tick in both; only `on` acts on the plan.
+            Some(net) => crate::capture::damage_net_grab(&mut backend, net, timestamp_us, consumes),
+            None => crate::capture::damage_then_grab(&mut backend, timestamp_us),
+        };
         let submission = match grabbed {
             Ok(mut frame) => {
-                if let Some(net) = net.as_mut() {
-                    server.feedback().drain_into(&mut feedback_buf);
-                    for fb in feedback_buf.drain(..) {
-                        net.ingest(fb);
-                    }
-                    net.begin_tick(
-                        frame.timestamp_us,
-                        &damage,
-                        frame.width,
-                        frame.height,
-                        backend.damage_armed(),
-                    );
-                    // Shadow: the hint is judged, never acted on. The library
+                if net.is_some() {
+                    // The hint is judged, never acted on by the library: it
                     // still compares the whole screen.
                     frame.damage_tiles = None;
                 } else {

@@ -75,9 +75,12 @@ pub enum DamageMode {
     /// computed, sweep slices scheduled, and the library's full compare is
     /// held against them to count the misses a consumer would have suffered.
     Shadow,
-    /// Reserved for the consumers (band grab, hinted compare). Until they
-    /// land it behaves exactly as [`DamageMode::Shadow`]; the daemon says so
-    /// at startup.
+    /// The safety net runs and the X11 grab acts on it: only the row bands
+    /// the damage, the sweep slice and the cursor name are copied into the
+    /// pooled slot (the union over the slot's age), or the whole screen when
+    /// damage is unknown, distrusted, or the bands exceed
+    /// `capture::x11::bands::FULL_GRAB_ABOVE_PCT` of the rows. The library
+    /// still receives complete buffers and still compares in full.
     On,
 }
 
