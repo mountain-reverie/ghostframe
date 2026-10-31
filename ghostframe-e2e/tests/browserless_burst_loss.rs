@@ -25,22 +25,12 @@ use ghostframe_e2e::harness::browserless::{
     SceneLoad,
 };
 
-/// Every scene in this file reads the Cubic arm's budget terms (`cwnd`,
-/// `pacer`), so they run on it. The model arm's loss behaviour is P7c in
-/// `browserless_model_controller`.
+/// Run a scene with the given link overrides and default options.
 async fn run_browserless_with_links(
     scene: BrowserlessScene,
     links: LinkOverrides,
 ) -> anyhow::Result<BrowserlessResult> {
-    run_browserless_with_options(
-        scene,
-        links,
-        RunOptions {
-            congestion: Some(ghostframe_lib::config::CongestionMode::Cubic),
-            ..Default::default()
-        },
-    )
-    .await
+    run_browserless_with_options(scene, links, RunOptions::default()).await
 }
 use ghostframe_e2e::harness::load_profile::{
     gradient_tile, Churn, LoadProfile, PRODUCTION_CADENCE_US,
@@ -438,7 +428,7 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
     assert_p3(n, r, lossy);
     // Budget binding: every tick lands in exactly one term.
     assert!(
-        i.budget.ticks() > 0 && i.budget.cwnd > 0,
+        i.budget.ticks() > 0 && i.budget.pacer > 0,
         "{n}: no budget ticks"
     );
     assert!(i.budget.probe > 0, "{n}: no probe-bound tick");
@@ -448,9 +438,13 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
         "{n}: ECN transmits not observed"
     );
     if lossy {
-        for c in [W::NackRepair, W::LossRetransmit] {
-            assert!(i.offered.of(c) > 0, "{n}: {c:?} never billed under loss");
-        }
+        // Repair was billed, by either path: the server's loss path now
+        // finds a loss before the client's NACK arrives, so on the model arm
+        // `NackRepair` can legitimately stay at zero.
+        assert!(
+            i.offered.of(W::NackRepair) + i.offered.of(W::LossRetransmit) > 0,
+            "{n}: no repair billed under loss"
+        );
         assert!(i.ledger_losses_declared > 0, "{n}: no ledger loss");
         // Not asserted any more: that the pending-loss cap overflowed and the
         // tombstone ring evicted. Both were symptoms of the standing queue
@@ -479,19 +473,11 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
         // (0 / 0, and 0 in the other two seeds). The mechanism itself is pinned
         // by the lib tests `a_late_ack_retracts_the_pending_loss_it_contradicts`
         // and `a_late_ack_after_the_flush_is_counted_apart_from_one_before_it`.
-        // The tail, not the median, and weaker than it was: the median queue
-        // is gone (p50 was 7-16 ms, is 0-3 ms), and the log-spaced histogram's
-        // p95 reads the same 20.5 ms bucket on either side of this change, so
-        // it no longer tells a standing queue from none. What still does is
-        // the longest wait: a datagram waited at least the gate's own depth,
-        // `QUEUE_TARGET` = 10 ms, which a FIFO that never held more than a
-        // datagram or two could not produce (0 on a clean link's median, tens
-        // of ms to seconds here in every lossy run).
-        assert!(
-            i.lag_max_us >= 10_000,
-            "{n}: no datagram ever waited the gate's depth in the FIFO (max lag {} us)",
-            i.lag_max_us
-        );
+        // No assertion that a datagram waited the gate's depth (`lag_max_us >=
+        // QUEUE_TARGET`): that held on the Cubic arm, whose window let a FIFO
+        // stand under loss. Under the model controller the FIFO stays under
+        // the gate (max lag 6 ms here), which is the property
+        // `p2a_the_fifo_never_exceeds_its_gate_under_one_percent_loss` pins.
     }
 }
 
@@ -516,8 +502,6 @@ async fn tile_fec_is_billed_only_when_opted_in() {
             s2c_only(|p| p.loss = RATE),
             RunOptions {
                 tile_fec: fec,
-                // These gates read the Cubic arm's budget terms.
-                congestion: Some(ghostframe_lib::config::CongestionMode::Cubic),
                 ..Default::default()
             },
         )

@@ -1,12 +1,8 @@
 //! D1 PR-8 (`transport/model-controller`, design A): the scene gates.
 //!
-//! Each scene runs the model controller (`GHOSTFRAME_CC=model`, selected here
-//! through `RunOptions::congestion`) and prints its numbers as
-//! `P8 <scene> <name> <value>` before it asserts. `GF_P8_ARM=cubic` runs the
-//! same scene on the Cubic path, which is how the baselines in the PR body
-//! and the P8a mutation ("Cubic back as the factory") are taken; a scene run
-//! that way is expected to fail the gate it names. `GF_P8_SEED` is XORed into
-//! every seed for sweeps.
+//! Each scene runs the model controller (the only controller) and prints its
+//! numbers as `P8 <scene> <name> <value>` before it asserts. `GF_P8_SEED` is
+//! XORed into every seed for sweeps.
 //!
 //! * **P8a, probes.** On the startup map, every probe cluster that had backlog
 //!   put at least 0.9 of its target on the way, and a probe completed in every
@@ -33,7 +29,7 @@ use ghostframe_e2e::harness::load_profile::{
 };
 use ghostframe_e2e::harness::scene_tiles::TileSpec;
 use ghostframe_e2e::netsim::{Bottleneck, CapTimeline, NetProfile};
-use ghostframe_lib::config::{CongestionMode, ModelSettings};
+use ghostframe_lib::config::ModelSettings;
 use ghostframe_lib::transport::model_controller::{model_window, RTT_WINDOW};
 use std::time::Duration;
 
@@ -49,13 +45,6 @@ const T_Q_US: u64 = 10_000;
 const MTU: u64 = 1_200;
 /// `T_up` of P6b: two `MIN_TIME_BETWEEN_ALR_PROBES` and a second.
 const T_UP_US: u64 = 11 * S;
-
-fn arm() -> CongestionMode {
-    match std::env::var("GF_P8_ARM").as_deref() {
-        Ok("cubic") => CongestionMode::Cubic,
-        _ => CongestionMode::Model,
-    }
-}
 
 fn seed_xor() -> u64 {
     std::env::var("GF_P8_SEED")
@@ -132,7 +121,6 @@ async fn run_frames(spec: Spec, frames: Vec<FrameScript>) -> BrowserlessResult {
         },
         RunOptions {
             classical_kx: spec.classical_kx,
-            congestion: Some(arm()),
             model: spec.model,
             ..Default::default()
         },
@@ -168,7 +156,6 @@ fn payload_fraction(r: &BrowserlessResult) -> f64 {
 
 fn report_common(scene: &str, r: &BrowserlessResult) {
     let i = &r.transport.instr;
-    p8(scene, "arm", format!("{:?}", arm()));
     p8(scene, "final_est_bps", r.bwe_estimate_bps);
     p8(
         scene,
@@ -253,10 +240,9 @@ fn premises(r: &BrowserlessResult, scene: &str) {
         r.bytes_delivered_s2c > 0,
         "{scene}: no server->client bytes"
     );
-    assert_eq!(
-        r.transport.instr.model.active,
-        arm() == CongestionMode::Model,
-        "{scene}: the arm that ran is not the arm asked for"
+    assert!(
+        r.transport.instr.model.rate_bytes_per_s > 0,
+        "{scene}: the model controller never published a window rate"
     );
 }
 
@@ -379,10 +365,8 @@ async fn run_cell(c: &Cell) -> (usize, usize, f64) {
 /// window that sent 98.8 % (less than one datagram short) is "abandoned", and
 /// whether a cell has one that lands on the right side of the line is a
 /// granularity coin flip, not a property of the rate. The model arm also asks
-/// for fewer clusters than Cubic (it feeds no capacity hint, so no
+/// for fewer clusters than the old Cubic path did (it feeds no capacity hint, so no
 /// network-state probes), which lowers the odds further.
-///
-/// Mutation: `GF_P8_ARM=cubic`, the clusters clip at startup.
 #[tokio::test(start_paused = true)]
 async fn p8a_every_probe_cluster_with_backlog_fills_on_the_startup_map() {
     let mut cells = Vec::new();
@@ -1102,7 +1086,7 @@ async fn p8d_a_capacity_drop_during_an_idle_costs_no_spurious_resend() {
 /// latency for better latency and throughput the rest of the time. The cold
 /// restart's first round trip puts tens of kB on a 2 Mbit/s link before any
 /// feedback can cut it (queue ~215 ms against the 113 ms bound derived from
-/// the window; Cubic: 705 ms). The bound is printed as `queue_bound_ms` and
+/// the window). The bound is printed as `queue_bound_ms` and
 /// the peak as `queue_peak_after_resume_ms`. Design P8d: zero spurious retransmissions after the resume
 /// (structural: timers start at departure and a PTO resets on every ack), and
 /// the peak queue stays at or under the bound for the restart actually taken:
