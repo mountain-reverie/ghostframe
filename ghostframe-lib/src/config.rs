@@ -207,39 +207,8 @@ pub struct TransportConfig {
     /// decodes parity whenever it arrives, whatever this says. H.264 parity is
     /// separate and unaffected.
     pub tile_fec: bool,
-    /// Who owns the send rate. From `GHOSTFRAME_CC=model|cubic` (default `model`). See
-    /// [`CongestionMode`].
-    pub congestion: CongestionMode,
-    /// The model controller's settings, from `GHOSTFRAME_CC_*`. Read whatever
-    /// the mode is, so a scene can set them without switching it.
+    /// The model controller's settings, from `GHOSTFRAME_CC_*`.
     pub model: ModelSettings,
-}
-
-/// Which controller owns the send rate (D1 design A against the status quo).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum CongestionMode {
-    /// quinn's Cubic window and goog_cc's estimate, coupled through the
-    /// `cwnd / srtt` hint and the admission `min`. `GHOSTFRAME_CC=cubic`.
-    Cubic,
-    /// goog_cc's estimate is the rate; quinn's window is a bound derived from
-    /// it (`transport::model_controller`). The default.
-    #[default]
-    Model,
-}
-
-impl CongestionMode {
-    /// `cubic` selects [`Self::Cubic`]; anything else, or nothing, [`Self::Model`].
-    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
-        match get("GHOSTFRAME_CC").as_deref() {
-            Some("cubic") => Self::Cubic,
-            _ => Self::Model,
-        }
-    }
-
-    /// The mode the process environment asks for.
-    pub fn from_env() -> Self {
-        Self::from_lookup(|k| std::env::var(k).ok())
-    }
 }
 
 /// Settings of the model controller: the window gain and the idle-restart
@@ -366,7 +335,6 @@ impl TransportConfig {
                 get("GHOSTFRAME_TILE_FEC").as_deref(),
                 Some("1") | Some("true")
             ),
-            congestion: CongestionMode::from_lookup(&get),
             model: ModelSettings::from_lookup(&get),
         }
     }
@@ -1332,16 +1300,6 @@ mod tests {
             !TransportConfig::from_lookup(lookup(&[])).skip_palette_session_reset,
             "unset must yield false"
         );
-    }
-
-    #[test]
-    fn the_congestion_mode_is_model_unless_the_env_says_cubic() {
-        let mode = |v: &[(&str, &str)]| TransportConfig::from_lookup(lookup(v)).congestion;
-        assert_eq!(mode(&[]), CongestionMode::Model);
-        assert_eq!(mode(&[("GHOSTFRAME_CC", "model")]), CongestionMode::Model);
-        assert_eq!(mode(&[("GHOSTFRAME_CC", "bogus")]), CongestionMode::Model);
-        assert_eq!(mode(&[("GHOSTFRAME_CC", "cubic")]), CongestionMode::Cubic);
-        assert_eq!(TransportConfig::default().congestion, CongestionMode::Model);
     }
 
     #[test]

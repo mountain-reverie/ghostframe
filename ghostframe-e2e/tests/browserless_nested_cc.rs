@@ -243,13 +243,12 @@ fn report_d1(scene: &str, r: &BrowserlessResult) {
         scene,
         "d1_admission",
         format!(
-            "d_target_max_B={} depth_violations={} gate_stops[depth={} tokens={}] pacer_term={} cwnd_term={}",
+            "d_target_max_B={} depth_violations={} gate_stops[depth={} tokens={}] pacer_term={}",
             i.admission.d_target_max,
             i.admission.depth_violations,
             i.budget.gate_depth,
             i.budget.gate_tokens,
-            i.budget.pacer,
-            i.budget.cwnd
+            i.budget.pacer
         ),
     );
     metric(scene, "d1_departures_stamped", i.ledger_departures_stamped);

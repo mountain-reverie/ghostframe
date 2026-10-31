@@ -1,12 +1,8 @@
 //! The admission rate, the depth gate's inputs, and the pass that feeds quinn.
 //!
 //! Owns, as logic over `IoBridge` fields that stay in `io_bridge.rs`:
-//! - the rate: `base_budget_bytes` (`adaptation_context.bytes_per_us` x one
-//!   tick x `SCHEDULER_TICK_BUDGET_FRACTION`, bounded below by
-//!   `tick_budget_floor`), the goog_cc combination (`PacingMode`,
-//!   `select_pacing_mode`, `combine_pacing_budget`, `pacer_tick_budget_bytes`,
-//!   `BWE_PACED_MODE_SAMPLE_THRESHOLD`) and the probe override, folded into
-//!   one bytes-per-second figure by `admission_rate`;
+//! - the rate: the estimate, the probe override and `tick_budget_floor`,
+//!   folded into one bytes-per-second figure by `admission_rate`;
 //! - the admission pass `pump_admission`, which refills the bucket from that
 //!   rate, serves the byte classes in strict priority against it and stops at
 //!   the depth gate (the arithmetic is in `transport::admission`);
@@ -27,12 +23,11 @@
 //! `emit_via_scheduler` straddles the two (it calls
 //! `open_probe_window_for_burst`) and is left here whole.
 //!
-//! Must not: decode ACKs or feedback, update the loss signal or the capacity
-//! hint, or decide session lifetime.
+//! Must not: decode ACKs or feedback, update the loss signal, or decide session lifetime.
 
 use super::*;
 use crate::transport::admission::{depth_target, pull_in_priority, source_budget, AdmitClass};
-use crate::transport::instruments::{classify_rate_term, BudgetTerm};
+use crate::transport::instruments::BudgetTerm;
 
 // ---------------------------------------------------------------------------
 // The admission rate
@@ -48,26 +43,11 @@ use crate::transport::instruments::{classify_rate_term, BudgetTerm};
 /// capture; the rate is `per-tick bytes / tick`.
 pub(crate) const SCHEDULER_TICK_INTERVAL_US: f64 = 33_333.0;
 
-/// The share of `cwnd / srtt` the rate may use. It was 0.90, "so we don't push
-/// right up to quinn's drain rate", from when nothing bounded quinn's datagram
-/// queue (16 MiB). The depth gate bounds it by construction now (a datagram is
-/// admitted only while the queue holds under `D_target`, 10 ms of the rate),
-/// so a rate at the whole of `cwnd / srtt` cannot build a queue, and what the
-/// headroom did instead was close a loop: at 0.9 quinn's datagram queue is
-/// empty at the end of every turn, `app_limited` is set, Cubic's `on_ack`
-/// returns early, the window stops growing, and `cwnd / srtt` stops growing
-/// with it (design section 2.3; the PR-0 instrument read `cwnd` as the
-/// binding term in 66 to 99 % of passes). At 1.0 the queue stands at the gate
-/// while the estimate permits more than the window and Cubic grows, and the
-/// estimate (`pacer_rate_bps`) is the binding term whenever it is the smaller.
-const SCHEDULER_TICK_BUDGET_FRACTION: f64 = 1.0;
-
 /// Rate floor, in datagrams per tick rather than bytes.
 ///
-/// This was a flat 256 KiB, which is 7.86 MB/s at a 33.3 ms tick. With
-/// `SCHEDULER_TICK_BUDGET_FRACTION` that meant the bandwidth-derived term in
-/// `base_budget_bytes` only overtook the floor above ~70 Mbit/s -- above every
-/// link this system serves. The rate was therefore a constant, and slow
+/// This was a flat 256 KiB, which is 7.86 MB/s at a 33.3 ms tick: the
+/// bandwidth-derived term only overtook the floor above ~70 Mbit/s -- above
+/// every link this system serves. The rate was therefore a constant, and slow
 /// links were overdriven by up to ~12x. Measured cost of that on a saturating
 /// 60x34 scene: 511,473 retransmit attempts and an emitter queue 389,053 deep
 /// at 5 Mbit, and 1,213,785 retransmits on a 5 -> 50 Mbit step-up.
@@ -75,7 +55,7 @@ const SCHEDULER_TICK_BUDGET_FRACTION: f64 = 1.0;
 /// The floor's only legitimate job is to keep the rate above a single
 /// datagram per tick, so a tile can always make progress even when the
 /// estimate is pessimistic or not yet established. Everything above that
-/// belongs to the bandwidth term. See `docs/specs/blocked-path-redesign.md`.
+/// belongs to the estimate. See `docs/specs/blocked-path-redesign.md`.
 const SCHEDULER_TICK_BUDGET_FLOOR_DATAGRAMS: usize = 1;
 
 /// Datagram size assumed when no session is connected yet, so the floor is
@@ -128,98 +108,6 @@ const STUCK_ENTRY_AGE: std::time::Duration = std::time::Duration::from_secs(30);
 /// Ticks between stuck-entry sweeps. The sweep scans the whole cache, which is
 /// large exactly when it matters, so it does not belong on every tick.
 const STUCK_SWEEP_EVERY_TICKS: u32 = 30;
-
-// ── BWE Stage 2.2: PacingMode ────────────────────────────────────────────
-//
-// The estimate takes charge of the admission rate. `admission_rate` routes
-// the quinn-path-stats rate through `combine_pacing_budget`, so the
-// "should goog_cc bind here?" decision is made in one place.
-
-/// Minimum `BweSnapshot::samples_seen` before `PacingMode::Paced` is
-/// trusted over `PacingMode::PathStats`. Below this, `GoogCcDriver` is
-/// still reporting values seeded at construction (`BweWrapper::INITIAL_BPS`
-/// for `bitrate_bps`; no `pacer_config` at all yet for `pacer_rate_bps`) —
-/// indistinguishable from a converged estimate without this check. Stage 1
-/// added `samples_seen` for exactly this reason.
-///
-/// EMPIRICAL GUESS, not yet validated against the bench (flagged per this
-/// project's precedent — see the M3.6/M3.7 constant-tuning work — for
-/// retuning once real data exists): the browserless baseline scene
-/// (`docs/specs/bwe-tier-latency-baseline.md`) produces roughly 500 ACK
-/// samples over its 10 s duration, ~50/s pooled across 30 runs. 150 samples
-/// is ~3 s of steady ACK arrivals at that rate — long enough to clear
-/// goog_cc's own delay-based estimator warm-up (the trendline/inter-arrival
-/// machinery wants on the order of a few dozen packet groups before its
-/// slope estimate means anything) while still switching to `Paced` well
-/// before a typical session's midpoint rather than at the very end of it.
-///
-/// Deliberately not `pub`: it would otherwise leak into `ghostframe.h`
-/// (cbindgen scrapes every `pub const` in this crate for the C FFI surface)
-/// alongside genuinely wire-relevant constants like `FEC_GROUP_SIZE_K` —
-/// this is an internal tuning knob.
-pub(super) const BWE_PACED_MODE_SAMPLE_THRESHOLD: u64 = 150;
-
-/// Which source governs the admission rate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PacingMode {
-    /// Quinn path stats alone. The startup mode,
-    /// and the fallback while the estimator has too few samples to trust
-    /// (see `BWE_PACED_MODE_SAMPLE_THRESHOLD`).
-    PathStats,
-    /// goog_cc's `pacer_config` additionally governs the budget — see
-    /// `combine_pacing_budget`. Does not replace the `PathStats`
-    /// computation; the two are combined by taking the minimum.
-    Paced,
-}
-
-/// Select `PacingMode` from the estimator's `samples_seen` counter.
-/// `samples_seen` only grows for the life of a session, so in practice this
-/// is a one-way switch (`PathStats` -> `Paced`), never back — matching the
-/// design's framing of `PathStats` as "the startup mode."
-pub fn select_pacing_mode(samples_seen: u64) -> PacingMode {
-    if samples_seen >= BWE_PACED_MODE_SAMPLE_THRESHOLD {
-        PacingMode::Paced
-    } else {
-        PacingMode::PathStats
-    }
-}
-
-/// Bytes a `pacer_rate_bps` rate (bits per second, from
-/// `BweSnapshot::pacer_rate_bps`) affords over one tick of `tick_interval_us`
-/// microseconds. Pure arithmetic, factored out of `combine_pacing_budget` so
-/// it's independently checkable and so `bwe_bench.rs` can pin the unit
-/// conversion directly.
-pub fn pacer_tick_budget_bytes(pacer_rate_bps: u64, tick_interval_us: f64) -> usize {
-    (((pacer_rate_bps as f64) / 8.0) * tick_interval_us / 1_000_000.0) as usize
-}
-
-/// Combine the quinn-path-stats-derived budget with goog_cc's
-/// pacer-derived budget for the same tick, by taking the smaller —
-/// `min`, not a replacement. They constrain different things: quinn's send
-/// buffer is a hard local limit whose violation drops popped work; goog_cc's
-/// pacer is a network estimate that can simply be wrong. Taking the minimum
-/// means a wrong estimate costs throughput rather than dropping tiles.
-///
-/// `PacingMode::PathStats`, or `Paced` before the estimator has ever
-/// produced a `pacer_config` (`pacer_rate_bps: None`), returns
-/// `path_budget_bytes` unchanged — there is nothing from goog_cc to combine
-/// with yet.
-///
-/// This function has no knowledge of quinn's live queue; the depth gate in
-/// `admission` is what bounds that, whichever mode produced the rate.
-pub fn combine_pacing_budget(
-    mode: PacingMode,
-    path_budget_bytes: usize,
-    pacer_rate_bps: Option<u64>,
-    tick_interval_us: f64,
-) -> usize {
-    match (mode, pacer_rate_bps) {
-        (PacingMode::Paced, Some(bps)) => {
-            path_budget_bytes.min(pacer_tick_budget_bytes(bps, tick_interval_us))
-        }
-        _ => path_budget_bytes,
-    }
-}
 
 /// The token rate that carries `countable_bps` of the bytes goog_cc counts,
 /// given the payload fraction (countable bytes per token billed). The fraction
@@ -310,95 +198,27 @@ impl IoBridge {
             + Self::WT_VARINT_OVERHEAD
     }
 
-    /// The rate admission runs at, bytes per second, and which input set it:
+    /// The rate admission runs at, bytes per second, and which input set it
+    /// (D1 design A, the model controller):
     ///
     /// ```text
-    /// R = max( probe_target / f,
-    ///          min( max(cwnd / srtt, one datagram per tick),
-    ///               min(E, K x A) / f ) )                      K = 1 / 0.85
+    /// R = max( probe_target / f, E / f, one datagram per tick )
     /// ```
     ///
-    /// * `E` is goog_cc's loss-based target, `A` the acknowledged rate over a
-    ///   window (`bwe/ceiling.rs`; `min(E, K x A)` is `pacer_rate_bps`:
-    ///   goog_cc's pacer at `pacing_factor = 1.0`, bounded by the estimate
-    ///   ceiling while the sender is saturated).
+    /// * `E` is the estimate (goog_cc's loss-based target, bounded by the
+    ///   estimate ceiling while the sender is saturated) and `probe_target` a
+    ///   probe window's rate while one is open, zero otherwise.
     /// * `f` is the payload fraction (`BweSnapshot::payload_fraction`, 0.8 to
-    ///   0.9 here): the countable share of the bytes the bucket bills. `E`, `A`
-    ///   and `probe_target` are rates of the bytes goog_cc counts; the bucket
+    ///   0.9 here): the countable share of the bytes the bucket bills. `E` and
+    ///   `probe_target` are rates of the bytes goog_cc counts; the bucket
     ///   bills parity, framing and control datagrams too, so the token rate
     ///   that carries a countable rate is that rate over `f`.
-    /// * The `min` with the pacer is taken only once the estimator has
-    ///   `BWE_PACED_MODE_SAMPLE_THRESHOLD` samples (before that `R` is the
-    ///   cwnd term alone). `probe_target` is a probe window's rate while one
-    ///   is open, zero otherwise. The same arithmetic as the per-tick budget,
-    ///   divided by the tick.
     ///
-    /// The pacing factor was goog_cc's default of 2.5, which made the pacer
-    /// term `2.5 x E`: it bound only while the cwnd term was under `2.5 x E`,
-    /// so in steady state the cwnd decided and the estimate did not limit what
-    /// was sent (the PR-0 instrument read `cwnd` in 66 to 99 % of passes across
-    /// nested_cc's seven scenes). At 1.0 the pacer term is the estimate.
+    /// There is no `cwnd / srtt` term: quinn's window is derived from this
+    /// same `R`, so it cannot disagree with it. The floor is the one thing
+    /// under it, a datagram a tick, so a tile can always make progress.
     pub(super) fn admission_rate(&self) -> AdmissionRate {
         let tick_s = SCHEDULER_TICK_INTERVAL_US / 1_000_000.0;
-        if self.model.is_some() {
-            return self.model_admission_rate(tick_s);
-        }
-        let snap = self.bwe.snapshot();
-        let mode = select_pacing_mode(snap.samples_seen);
-        // The estimate and the probe target are rates of the bytes goog_cc
-        // counts; the bucket bills every byte (parity, framing, control). The
-        // token rate that carries a countable rate is that rate over the
-        // payload fraction. Without the division a sender paced at the
-        // estimate offered goog_cc only `fraction x` the estimate, and a
-        // probe cluster fell short of the bytes goog_cc requires of it (80 %
-        // of target x duration) in every window.
-        let pacer_tokens_bps = snap
-            .pacer_rate_bps
-            .map(|bps| countable_to_token_bps(bps, snap.payload_fraction));
-        let paced = combine_pacing_budget(
-            mode,
-            self.base_budget_bytes(),
-            pacer_tokens_bps,
-            SCHEDULER_TICK_INTERVAL_US,
-        );
-        // A probe must send at *least* its target rate, but never less than
-        // we otherwise would: overriding outright throttled emission whenever
-        // the target sat below the pacer rate. Measured on the
-        // propagation-delay scene (when the pacer ran at 2.5x the estimate):
-        // delivered bytes fell 23 % (747 kB -> 577 kB).
-        let (per_tick, probe_binds) = match &self.active_probe {
-            Some(probe) => {
-                let probe_budget = pacer_tick_budget_bytes(
-                    countable_to_token_bps(probe.target_rate_bps, snap.payload_fraction),
-                    SCHEDULER_TICK_INTERVAL_US,
-                );
-                (probe_budget.max(paced), probe_budget > paced)
-            }
-            None => (paced, false),
-        };
-        let pacer_rate = match (mode, pacer_tokens_bps) {
-            (PacingMode::Paced, Some(bps)) => Some(bps as f64 / 8.0),
-            _ => None,
-        };
-        let term = classify_rate_term(
-            probe_binds,
-            pacer_rate,
-            self.bandwidth_budget_term() as f64 / tick_s,
-            self.tick_budget_floor() as f64 / tick_s,
-        );
-        AdmissionRate {
-            bytes_per_sec: per_tick as f64 / tick_s,
-            term,
-        }
-    }
-
-    /// The admission rate under the model controller (D1 design A): `R`, the
-    /// estimate (or a probe's rate while a window is open), and nothing else.
-    /// No `cwnd / srtt` term, no pacing mode, no sample threshold: quinn's
-    /// window is derived from this same `R`, so it cannot disagree with it.
-    /// The floor is the one thing under it, a datagram a tick, so a tile can
-    /// always make progress.
-    fn model_admission_rate(&self, tick_s: f64) -> AdmissionRate {
         let snap = self.bwe.snapshot();
         let est = countable_to_token_bps(snap.bitrate_bps, snap.payload_fraction) as f64 / 8.0;
         let probe = self.active_probe.as_ref().map_or(0.0, |p| {
@@ -410,7 +230,7 @@ impl IoBridge {
         } else if floor > est.max(probe) {
             BudgetTerm::Floor
         } else {
-            // The estimate sets the rate (this arm's `Pacer`: goog_cc's).
+            // The estimate sets the rate (`Pacer`: goog_cc's).
             BudgetTerm::Pacer
         };
         AdmissionRate {
@@ -550,11 +370,7 @@ impl IoBridge {
         }
         // What the bucket granted and what was spent of it, for the estimate
         // ceiling: it applies only to a sender that used its grant.
-        if self.model.is_some()
-            && stop == Stop::Depth
-            && self.admission_backlog(now)
-            && self.model_window_limit_is_load()
-        {
+        if stop == Stop::Depth && self.admission_backlog(now) && self.model_window_limit_is_load() {
             let dropped = self.admission.forfeit_bank();
             self.model_note_gated_pass(dropped);
         }
@@ -671,24 +487,7 @@ impl IoBridge {
         }
     }
 
-    /// Per-tick bytes at the measured rate: measured QUIC bandwidth
-    /// (`adaptation_context.bytes_per_us`) x the tick interval x a fixed
-    /// headroom fraction, floored by `tick_budget_floor` so the first frames
-    /// of a session (before `bytes_per_us` is populated from path stats)
-    /// still emit promptly. The admission rate is this over the tick.
-    pub(super) fn base_budget_bytes(&self) -> usize {
-        self.bandwidth_budget_term().max(self.tick_budget_floor())
-    }
-
-    /// The bandwidth operand of `base_budget_bytes`: measured QUIC bandwidth
-    /// x the tick interval x the headroom fraction, before the floor.
-    fn bandwidth_budget_term(&self) -> usize {
-        ((self.adaptation_context.bytes_per_us as f64)
-            * SCHEDULER_TICK_INTERVAL_US
-            * SCHEDULER_TICK_BUDGET_FRACTION) as usize
-    }
-
-    /// Lower bound for `base_budget_bytes`: one datagram at the live MTU,
+    /// Lower bound for the rate: one datagram at the live MTU,
     /// unless a test has pinned it. Sized in datagrams so it scales with the
     /// path rather than with a constant chosen for a link speed we do not
     /// serve -- see `SCHEDULER_TICK_BUDGET_FLOOR_DATAGRAMS`.
@@ -748,7 +547,7 @@ impl IoBridge {
         (out.stats, out.scheduler_bytes, out.scheduler_count)
     }
 
-    /// Override the `base_budget_bytes` floor. See `tick_budget_floor_bytes`
+    /// Override the rate floor. See `tick_budget_floor_bytes`
     /// for why this is worth varying: the default sits above every link the
     /// system actually serves, so without lowering it a test cannot observe
     /// the bandwidth-derived budget binding at all.

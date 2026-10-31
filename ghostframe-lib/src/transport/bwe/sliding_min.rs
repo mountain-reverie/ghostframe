@@ -43,10 +43,6 @@ impl<T: PartialOrd + Copy, V: PartialOrd + Copy> SlidingMin<T, V> {
         self.deque.front().map(|(_, v)| *v)
     }
 
-    pub(crate) fn clear(&mut self) {
-        self.deque.clear();
-    }
-
     /// Samples the deque holds (not the samples pushed: dominated ones are
     /// gone).
     #[cfg(test)]

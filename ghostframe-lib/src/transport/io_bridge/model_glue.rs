@@ -3,7 +3,7 @@
 //! notice.
 //!
 //! Owns, as logic over `IoBridge` fields that stay in `io_bridge.rs`:
-//! - `ModelGlue`, the state that exists only under `GHOSTFRAME_CC=model`;
+//! - `ModelGlue`, the controller's state;
 //! - `model_rate_bytes_per_s`, `R`: the estimator's rate in the bucket's
 //!   units, which admission, the window and the classifier all read;
 //! - `publish_model_window`, which hands `R_w` and `G` to quinn's controller
@@ -21,7 +21,7 @@ use super::*;
 use crate::transport::instruments::ModelProbe;
 use crate::transport::model_controller::{BaseRise, ModelCell, RestartPolicy, Resume};
 
-/// State that exists only when the model controller is installed.
+/// The model controller's state.
 pub(super) struct ModelGlue {
     pub(super) cell: Arc<ModelCell>,
     pub(super) restart: RestartPolicy,
@@ -77,7 +77,7 @@ impl IoBridge {
     /// opens or closes, and when a restart begins.
     pub(super) fn publish_model_window(&mut self, fresh_feedback: bool) {
         let (rate, probe) = self.model_rate_parts();
-        let Some(m) = self.model.as_mut() else { return };
+        let m = &mut self.model;
         m.cell
             .publish(rate as u64, m.restart.gain(), probe as u64, fresh_feedback);
     }
@@ -95,7 +95,7 @@ impl IoBridge {
     /// A pass with nothing to send is not a send, so a gap is measured to the
     /// first pass that has something.
     pub(super) fn model_before_admission(&mut self, now: std::time::Instant) {
-        if self.model.is_none() || !self.admission_backlog(now) {
+        if !self.admission_backlog(now) {
             return;
         }
         self.model_restart_at(now);
@@ -104,7 +104,7 @@ impl IoBridge {
     /// `model_before_admission` once there is work: the policy and its effect.
     pub(super) fn model_restart_at(&mut self, now: std::time::Instant) {
         let snap = self.bwe.snapshot();
-        let Some(m) = self.model.as_mut() else { return };
+        let m = &mut self.model;
         let resume = m.restart.on_send(now);
         if resume == Resume::No {
             return;
@@ -139,12 +139,9 @@ impl IoBridge {
     /// The estimator heard feedback: a restart ends, a collapsed window is
     /// restored, and the new estimate reaches the window.
     pub(super) fn model_after_feedback(&mut self) {
-        if self.model.is_none() {
-            return;
-        }
         let snap = self.bwe.snapshot();
         let stale = !self.model_window_limit_is_load();
-        let Some(m) = self.model.as_mut() else { return };
+        let m = &mut self.model;
         m.restart.on_feedback();
         if let Some((base, _)) = m.cell.rtts() {
             let now = now_std();
@@ -176,9 +173,7 @@ impl IoBridge {
     /// So the tokens the bank held at the stop count as spent, and are dropped
     /// from the bank, since quinn could not take them.
     pub(super) fn model_note_gated_pass(&mut self, bank_dropped: f64) {
-        if let Some(m) = self.model.as_mut() {
-            m.forfeited += bank_dropped;
-        }
+        self.model.forfeited += bank_dropped;
     }
 
     /// Whether a window-limited pass was limited by load rather than by a
@@ -187,9 +182,7 @@ impl IoBridge {
     /// change, a competitor's queue), its acknowledged rate says nothing about
     /// the path, and counting it as saturated would walk the estimate down.
     pub(super) fn model_window_limit_is_load(&self) -> bool {
-        let Some(m) = self.model.as_ref() else {
-            return false;
-        };
+        let m = &self.model;
         m.cell.rtts().is_none_or(|(min, srtt)| {
             srtt.as_secs_f64()
                 <= m.cell.gain()
@@ -199,14 +192,14 @@ impl IoBridge {
 
     /// Tokens counted as spent that were forfeited to the window.
     pub(super) fn model_forfeited(&self) -> f64 {
-        self.model.as_ref().map_or(0.0, |m| m.forfeited)
+        self.model.forfeited
     }
 
     /// Report persistent congestion the controller counted since the last
     /// look. The window has already collapsed; this is the log line and the
     /// place a future consumer (the estimator) would be told.
     pub(super) fn model_note_persistent_congestion(&mut self) {
-        let Some(m) = self.model.as_mut() else { return };
+        let m = &mut self.model;
         let n = m.cell.stats().persistent_congestion_events;
         if n > m.persistent_seen {
             tracing::warn!(
@@ -219,24 +212,21 @@ impl IoBridge {
     }
 
     pub(super) fn model_probe(&self) -> ModelProbe {
-        match &self.model {
-            None => ModelProbe::default(),
-            Some(m) => ModelProbe {
-                active: true,
-                restarts_hold: self.instr.model_restarts_hold,
-                restarts_cold: self.instr.model_restarts_cold,
-                rate_bytes_per_s: m.cell.rate_bytes_per_s(),
-                gain_milli: (m.cell.gain() * 1000.0).round() as u64,
-                stats: m.cell.stats(),
-            },
+        let m = &self.model;
+        ModelProbe {
+            restarts_hold: self.instr.model_restarts_hold,
+            restarts_cold: self.instr.model_restarts_cold,
+            rate_bytes_per_s: m.cell.rate_bytes_per_s(),
+            gain_milli: (m.cell.gain() * 1000.0).round() as u64,
+            stats: m.cell.stats(),
         }
     }
 
     /// The cell quinn's controller reads, for a harness that wants the
     /// controller's counters after the bridge has moved into its task.
     #[cfg(any(test, feature = "browserless-harness"))]
-    pub fn model_cell_handle(&self) -> Option<Arc<ModelCell>> {
-        self.model.as_ref().map(|m| m.cell.clone())
+    pub fn model_cell_handle(&self) -> Arc<ModelCell> {
+        self.model.cell.clone()
     }
 }
 
@@ -281,7 +271,7 @@ mod tests {
         // The floor under the rate: one datagram a tick (36 kB/s), well under
         // the estimate, so the floor cannot be what the assertion reads.
         bridge.set_tick_budget_floor_bytes(1_200);
-        bridge.apply_path_stats_snapshot(12_000, 333_000.0);
+        bridge.apply_path_stats_snapshot(333_000.0);
         let snap = bridge.bwe.snapshot();
         assert_eq!(
             snap.bitrate_bps,
@@ -307,8 +297,6 @@ mod tests {
             (again - expect).abs() < 1.0,
             "rate {again} B/s followed the cwnd term, not the estimate {expect} B/s"
         );
-        // And no hint was handed to the estimator.
-        assert_eq!(bridge.instr.hint_feeds + bridge.instr.hint_unbounded, 0);
     }
 
     /// An open probe window raises `R_w` to the probe's rate, so quinn's window
@@ -318,7 +306,7 @@ mod tests {
         let mut bridge = model_bridge().await;
         let t0 = now_std();
         feed(&mut bridge, t0 + Duration::from_millis(20));
-        let cell = bridge.model_cell_handle().expect("model installed");
+        let cell = bridge.model_cell_handle();
         let est = bridge.model_rate_bytes_per_s() as u64;
         assert_eq!(cell.rate_bytes_per_s(), est, "published after feedback");
 
@@ -371,7 +359,7 @@ mod tests {
             .restart_from(t0 + Duration::from_millis(30), 40_000_000);
         let held = bridge.bwe.snapshot().bitrate_bps;
         assert!(held > 30_000_000, "premise: a high held rate ({held})");
-        let cell = bridge.model_cell_handle().expect("model");
+        let cell = bridge.model_cell_handle();
         let sent = |b: &mut IoBridge, at| b.model_restart_at(at);
 
         // Steady sending: no restart.
@@ -418,7 +406,7 @@ mod tests {
         bridge.model_restart_at(t0 + Duration::from_secs(5));
         let p = bridge.model_probe();
         assert_eq!((p.restarts_hold, p.restarts_cold), (0, 0));
-        assert_eq!(bridge.model_cell_handle().unwrap().gain(), 2.0);
+        assert_eq!(bridge.model_cell_handle().gain(), 2.0);
     }
 
     fn queue_two_tiles(bridge: &mut IoBridge) {
@@ -484,7 +472,7 @@ mod tests {
         let mut stale = model_bridge_with_grid().await;
         queue_two_tiles(&mut stale);
         stale.forced_fifo_depth_for_test = Some(10_000_000);
-        let cell = stale.model_cell_handle().expect("model");
+        let cell = stale.model_cell_handle();
         cell.note_rtts(Duration::from_millis(10), Duration::from_millis(80));
         stale.pump_admission();
         assert_eq!(stale.model_forfeited(), 0.0, "srtt 80 ms against 2 x 15 ms");
@@ -498,7 +486,7 @@ mod tests {
         let mut bridge = model_bridge().await;
         bridge.test_force_bytes_per_us = Some(0.1);
         // A window whose cwnd/rtt is nowhere near 0.1, as the live model's rate is.
-        bridge.apply_path_stats_snapshot(10_000_000, 20_000.0);
+        bridge.apply_path_stats_snapshot(20_000.0);
         assert!(
             (bridge.adaptation_context.bytes_per_us - 0.1).abs() < 0.001,
             "got {}",

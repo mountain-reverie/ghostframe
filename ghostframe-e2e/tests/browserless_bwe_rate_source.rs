@@ -179,8 +179,8 @@ fn report_transport(scene: &str, r: &BrowserlessResult) {
         scene,
         "budget_terms",
         format!(
-            "pacer={} cwnd={} floor={} probe={}",
-            i.budget.pacer, i.budget.cwnd, i.budget.floor, i.budget.probe
+            "pacer={} floor={} probe={}",
+            i.budget.pacer, i.budget.floor, i.budget.probe
         ),
     );
     p6(
@@ -200,14 +200,6 @@ fn report_transport(scene: &str, r: &BrowserlessResult) {
             r.probes_completed,
             r.probes_abandoned,
             i.bwe.first_probe_targets_bps
-        ),
-    );
-    p6(
-        scene,
-        "hint",
-        format!(
-            "feeds={} before_feedback={} unbounded={}",
-            i.hint_feeds, i.hint_feeds_before_feedback, i.hint_unbounded
         ),
     );
     p6(
@@ -516,17 +508,16 @@ async fn p6b_the_estimate_follows_capacity_steps_each_held_20s() {
         "step down: the estimate went back up to {:.2} x the capacity",
         worst as f64 / low
     );
-    // The estimate is a term of the admission rate in a material share of
-    // passes (the PR-0 instrument): with goog_cc's default pacing factor of
-    // 2.5 the pacer term sat out of reach of the cwnd term (3 % of passes in
-    // this scene); at 1.0 it binds in 19 to 77 % across five seeds (41 % at
-    // this one); the PR-3 base: 10 %.
+    // The estimate is the term of the admission rate in a material share of
+    // passes (the PR-0 instrument; before the cwnd term was removed it bound
+    // in 19 to 77 % across five seeds). The rest are probe windows and the
+    // floor.
     let b = &r.transport.instr.budget;
     assert!(
-        b.pacer * 8 >= b.cwnd,
+        b.ticks() > 0 && b.pacer * 8 >= b.ticks(),
         "the estimate bound the admission rate in only {} of {} passes",
         b.pacer,
-        b.pacer + b.cwnd
+        b.ticks()
     );
 }
 

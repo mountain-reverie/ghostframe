@@ -183,8 +183,8 @@ fn report_common(scene: &str, r: &BrowserlessResult) {
         scene,
         "budget_terms",
         format!(
-            "pacer={} cwnd={} floor={} probe={}",
-            i.budget.pacer, i.budget.cwnd, i.budget.floor, i.budget.probe
+            "pacer={} floor={} probe={}",
+            i.budget.pacer, i.budget.floor, i.budget.probe
         ),
     );
     p8(

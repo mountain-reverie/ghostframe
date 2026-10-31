@@ -209,7 +209,7 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
          offered_Bps[crit={:.0} refine={:.0} nack={:.0} loss={:.0} sched_retry={:.0} parity={:.0} h264={:.0} \
          control={:.0} overhead={:.0}] offered_total_B={} quinn_enqueued_B={} \
          quinn_departed_Bps={:.0} lag_us[n={} p50={} p95={} max={}] mirror_len={} \
-         mirror_overflowed={} budget_passes[cwnd={} pacer={} floor={} probe={}] gate_stops[depth={} tokens={} rejected={}] \
+         mirror_overflowed={} budget_passes[pacer={} floor={} probe={}] gate_stops[depth={} tokens={} rejected={}] \
          admission[pumps={} admitted={} d_target_max_B={} depth_violations={} backlog_turns={} starved_turns={} \
          charged_B={} soft_charged_B={} ungated_at_depth={}] \
          ledger[declared={} flushed={} overflowed={} late_before_flush={} late_after_flush={} \
@@ -246,7 +246,6 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
         i.lag_max_us,
         i.mirror_len,
         i.mirror_overflowed,
-        i.budget.cwnd,
         i.budget.pacer,
         i.budget.floor,
         i.budget.probe,
@@ -790,10 +789,7 @@ async fn the_budget_floor_term_is_counted_when_it_binds() {
     let b = r.transport.instr.budget;
     println!("D1INSTR floor_pinned: budget={b:?}");
     assert!(b.floor > 0, "floor never bound with the floor pinned high");
-    assert_eq!(
-        b.cwnd, 0,
-        "the bandwidth term cannot bind below a pinned floor"
-    );
+    assert_eq!(b.pacer, 0, "the estimate cannot bind below a pinned floor");
 }
 
 /// A send buffer far below what the old path queued: with the depth gate the
@@ -811,7 +807,7 @@ async fn the_budget_floor_term_is_counted_when_it_binds() {
 async fn a_send_buffer_smaller_than_the_unbounded_queue_is_never_asked_to_block() {
     // 64 KiB: still 30 to 80 times under the 2-5 MB the old path queued. It
     // was 32 KiB while `D_target` stayed under it; with the
-    // admission rate no longer held to 0.9 x cwnd / srtt, `D_target` (10 ms of
+    // admission rate set by the estimate alone, `D_target` (10 ms of
     // the rate) reaches 38 kB on this uncapped link.
     const BUFFER: usize = 64 * 1024;
     let mut sc = scene(0xB0_B057, 6);

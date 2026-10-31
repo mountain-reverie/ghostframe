@@ -551,9 +551,10 @@ impl QuicServer {
         })
     }
 
-    /// The `ServerConfig`: datagrams on, and quinn's default Cubic unless a
-    /// model cell is given (D1 design A), in which case the window is the
-    /// model controller's.
+    /// The `ServerConfig`: datagrams on, and the model controller's window
+    /// (D1 design A) when a model cell is given. `IoBridge` always gives one
+    /// (`use_model_controller`) before the first connection; a bare
+    /// `QuicServer` that is never handed one keeps quinn's own default.
     fn server_config(
         quic_tls: Arc<quinn_proto::crypto::rustls::QuicServerConfig>,
         datagram_send_buffer: usize,
