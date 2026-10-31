@@ -1336,7 +1336,7 @@ impl IoBridge {
 
     /// Per-frame idle-escalation sweep and stranded-tile detection; stores the
     /// merged candidate list on the bridge and hands it to the GPU processor.
-    fn collect_escalation_candidates(&mut self) -> Vec<u32> {
+    pub(super) fn collect_escalation_candidates(&mut self) -> Vec<u32> {
         // Gate on self.frame_mode (the PREVIOUS frame's mode). Skipping
         // escalation while the previous frame was H264 avoids ~5 ms of
         // wasted GPU forward + 6 MB of HOST_COHERENT writes per frame:
