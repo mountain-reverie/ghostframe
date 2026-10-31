@@ -475,6 +475,8 @@ impl X11Frames {
                     reply.size
                 )));
             }
+            self.stats.bytes_grabbed += want as u64;
+            self.stats.grab_requests += 1;
             return slot
                 .into_buf()
                 .map_err(|_| io::Error::other("frame slot lost its storage"));
@@ -498,6 +500,8 @@ impl X11Frames {
         }
         // x11rb allocated and filled this reply buffer; it becomes the frame.
         self.stats.alloc_copy(want);
+        self.stats.bytes_grabbed += want as u64;
+        self.stats.grab_requests += 1;
         Ok(FrameBuf::from(reply.data))
     }
 

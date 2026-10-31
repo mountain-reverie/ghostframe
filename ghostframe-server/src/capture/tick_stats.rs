@@ -17,6 +17,14 @@ pub struct TickStats {
     pub bytes_copied: u64,
     /// Heap allocations at the counted sites.
     pub allocs: u32,
+    /// Bytes the X server wrote into the frame this tick: the whole root for
+    /// a full grab, the sum of the row bands for a band grab (damage-driven
+    /// encoding PR 5). Written by the X server, not copied by this process,
+    /// so it is not part of `bytes_copied`.
+    pub bytes_grabbed: u64,
+    /// Grab requests sent this tick (one per band, one for a full grab); all
+    /// of a tick's requests are pipelined and read back together.
+    pub grab_requests: u32,
 }
 
 impl TickStats {
@@ -35,6 +43,8 @@ impl TickStats {
     pub fn add(&mut self, other: TickStats) {
         self.bytes_copied += other.bytes_copied;
         self.allocs += other.allocs;
+        self.bytes_grabbed += other.bytes_grabbed;
+        self.grab_requests += other.grab_requests;
     }
 }
 
