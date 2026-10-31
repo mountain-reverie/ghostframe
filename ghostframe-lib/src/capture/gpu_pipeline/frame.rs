@@ -556,6 +556,116 @@ impl GpuFrameProcessor {
         }
     }
 
+    /// A tick on which the producer says nothing changed
+    /// ([`crate::Content::Unchanged`]): run the frame's state machine against
+    /// the persistent upload image, which holds what the screen shows, and
+    /// upload and compare nothing.
+    ///
+    /// The same call as a damaged frame whose damage names no tile row, minus
+    /// the pixels, so the escalation forward, the palette and classifier
+    /// stages read the persistent image and the persistent NV12 and analysis
+    /// buffers exactly as they do after a full compare of an identical frame.
+    /// A frame with no reference to compare against takes the first-frame
+    /// branch, which reports every tile dirty from the upload image.
+    ///
+    /// Errors, leaving the processor as it was but for the baseline flag
+    /// (cleared, so the next pixels frame goes through whole), when the
+    /// upload image cannot stand in for the screen: the last from-pixels
+    /// frame did not leave it consistent, or it has another size.
+    pub(super) unsafe fn process_frame_inner_unchanged(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
+        #[cfg(test)]
+        let _gpu = crate::gpu_test_lock::lock();
+        let baseline = std::mem::replace(&mut self.damage_baseline, false);
+        if !baseline
+            || self.upload.is_none()
+            || width != self.last_width
+            || height != self.last_height
+        {
+            return Err(format!(
+                "unchanged tick for {width}x{height} but the upload image is not a consistent {}x{} screen",
+                self.last_width, self.last_height
+            )
+            .into());
+        }
+        let escalation_count_this_frame = self.staged_escalation_count;
+        self.staged_escalation_count = 0;
+        let geom = FrameGeometry::from_dims(width, height);
+        self.ensure_nv12_buffer(width, height)?;
+        let up = self.upload.take().expect("checked above");
+        // Zero runs: nothing is dispatched and every tile reads as clean. A
+        // frame with no reference ignores them (first-frame branch).
+        let dispatch_runs: Option<&[RowRun]> = self.prev_image.is_some().then_some(&[]);
+        #[cfg(test)]
+        let t_start = std::time::Instant::now();
+        let result = self.process_frame_with_imported(
+            &up.frame,
+            geom,
+            escalation_count_this_frame,
+            dispatch_runs,
+        );
+        #[cfg(test)]
+        {
+            self.probe = DamageProbe {
+                upload_us: 0,
+                gpu_us: std::time::Instant::now()
+                    .duration_since(t_start)
+                    .as_micros() as u64,
+                uploaded_rows: 0,
+                dispatched_tile_rows: if dispatch_runs.is_some() {
+                    0
+                } else {
+                    geom.rows
+                },
+            };
+        }
+        let mut up = up;
+        match result {
+            Ok(analysis) => {
+                up.frame.layout = vk::ImageLayout::GENERAL;
+                self.upload = Some(up);
+                self.damage_baseline = true;
+                Ok(analysis)
+            }
+            Err(e) => {
+                self.destroy_upload(up);
+                Err(e)
+            }
+        }
+    }
+
+    /// The persistent upload image as a tightly packed BGRA frame with the
+    /// given `stride`: what an unchanged tick shows when a stage needs the
+    /// pixels themselves (the first-frame branch re-sends every tile).
+    pub(super) unsafe fn read_upload(
+        &self,
+        width: u32,
+        height: u32,
+        stride: u32,
+    ) -> Option<Vec<u8>> {
+        let up = self.upload.as_ref()?;
+        if width != self.last_width || height != self.last_height {
+            return None;
+        }
+        let stride = stride as usize;
+        let row_bytes = width as usize * 4;
+        if stride < row_bytes {
+            return None;
+        }
+        let mut out = vec![0u8; stride * height as usize];
+        for row in 0..height as usize {
+            std::ptr::copy_nonoverlapping(
+                up.map.add(up.offset + row * up.row_pitch),
+                out.as_mut_ptr().add(row * stride),
+                row_bytes.min(up.row_pitch),
+            );
+        }
+        Some(out)
+    }
+
     /// Allocate and map the persistent upload image for `width` x `height`.
     unsafe fn create_upload(
         &self,

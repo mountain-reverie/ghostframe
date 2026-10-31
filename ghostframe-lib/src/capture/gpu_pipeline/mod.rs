@@ -707,6 +707,23 @@ impl GpuFrameProcessor {
         }
     }
 
+    /// A tick on which nothing changed ([`crate::Content::Unchanged`]); see
+    /// `process_frame_inner_unchanged`. Errors when the persistent upload
+    /// image is not a consistent `width` x `height` screen.
+    pub fn process_frame_unchanged(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
+        unsafe { self.process_frame_inner_unchanged(width, height) }
+    }
+
+    /// The persistent upload image as BGRA at `stride`; `None` without one
+    /// of that size.
+    pub fn read_upload_pixels(&self, width: u32, height: u32, stride: u32) -> Option<Vec<u8>> {
+        unsafe { self.read_upload(width, height, stride) }
+    }
+
     /// Stop trusting damage until a whole frame has been processed: a frame
     /// that named tile rows never reached the processor, so the upload image
     /// lacks them.

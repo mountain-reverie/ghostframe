@@ -77,6 +77,21 @@ pub enum FrameDamage {
     },
 }
 
+/// What a submission's `pixels` hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Content {
+    /// A complete, current buffer for the whole frame (what `damage` narrows).
+    #[default]
+    Pixels,
+    /// No new pixels: `pixels` is empty. The screen is what the previous
+    /// submission left in the library's upload image, and the tick is only
+    /// the clock the refinement, PixelPerfect and escalation state machine
+    /// runs on (design note section 3.3). The producer sends it only when it
+    /// knows nothing changed; a library that cannot honour it (no consistent
+    /// upload image of that size) drops the tick.
+    Unchanged,
+}
+
 /// A run of tile rows `[first, first + count)`.
 pub(crate) type RowRun = (u32, u32);
 
