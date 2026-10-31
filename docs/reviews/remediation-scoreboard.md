@@ -260,9 +260,9 @@ Merged to master (Wave D1, transport and congestion control):
 - FEC v2 docs #240 and #241
 - goog_cc observation #246
 - C3-3, tile XOR FEC off by default #247
-- PR-8 #248: the model controller is the default; `GHOSTFRAME_CC=cubic` is the fallback
+- PR-8 #248: the model controller is the default; `GHOSTFRAME_CC=cubic` was the fallback (removed in PR-10, the variable is now ignored)
 
-Remaining: PR-10 (the exit gate, a live run, and deleting the legacy Cubic path).
+Remaining: PR-10 (the exit gate and a live run). The legacy Cubic path is deleted: `CongestionMode`, `GHOSTFRAME_CC`, the `cwnd / srtt` capacity hint, `PacingMode` and the Cubic browserless arms.
 
 **Follow-ups**
 - damage-driven encoding (`damage_tiles` ignored), next

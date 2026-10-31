@@ -158,8 +158,8 @@ jobs:
       - run: cargo test --test browserless_bwe_rate_source -- --test-threads=1
       # D1 PR-8 gates (design A, the model controller): probe clusters fill,
       # the settled estimate and the queue the window allows, a feedback
-      # blackout, and a capacity drop during an idle. The scenes select the
-      # arm themselves; GF_P8_ARM=cubic runs them on the Cubic path.
+      # blackout, and a capacity drop during an idle. The model controller is
+      # the only controller; there is no Cubic arm any more.
       - run: cargo test --test browserless_model_controller -- --test-threads=1
 
   harness-smoke:
