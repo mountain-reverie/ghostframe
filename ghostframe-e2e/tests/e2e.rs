@@ -5240,7 +5240,10 @@ async fn e2e_progressive_refinement_firefox() -> Result<()> {
 /// static→motion transition) cancels remaining passes for the old generation.
 ///
 /// Setup:
-/// - `--mode-switch-cycle 3` (3s static + 3s motion = 6s full cycle).
+/// - `--x11-sink --mode-switch-cycle 3 --static-half gradient` (3s static +
+///   3s motion = 6s full cycle). The X11-primitive cycle this test used to
+///   run draws one band per capture tick on Xorg, so no captured frame ever
+///   held more than a few dozen changed tiles.
 /// - `CAPTURE_FPS=30` so the static half sees ~90 frames — enough for the
 ///   classifier to fire Cdf53 on the bottom gradient stripe (without this,
 ///   the default `CAPTURE_FPS=2` yields only ~6 frames per static half,
@@ -5254,9 +5257,12 @@ async fn e2e_progressive_refinement_firefox() -> Result<()> {
 /// What is checked is the transition itself, read from the server's own
 /// log rather than sampled: the snapshot is dumped once per frame, after
 /// the refinement encode and before the dispatch that bumps the tiles
-/// which turned Solid. So for a frame that dispatched the whole screen as
-/// Solid, everything its snapshot listed must be absent from the next
-/// frame's.
+/// which turned Solid. The static half is a gradient over the whole screen
+/// and the motion half repaints only the top-left 8x2 tiles (`--motion-region`),
+/// few enough to be sent in the frame that dirties them -- a whole-screen
+/// repaint is paced over many frames by the send budget. So for a frame that
+/// dispatched exactly those 16 tiles as Solid, every snapshot entry inside
+/// that region must be absent from the next frame's.
 ///
 /// It used to sample "the last snapshot" twice, seven seconds apart. That
 /// passed for a reason unrelated to cancellation -- see the comment at the
@@ -5266,8 +5272,11 @@ async fn e2e_progressive_refinement_firefox() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_refinement_cancel() -> Result<()> {
     let _setup = setup_e2e_webgpu_gpu_with_env(
-        "--mode-switch-cycle 3",
+        "--x11-sink --mode-switch-cycle 3 --static-half gradient --motion-region 8x2",
         &[
+            // The sink paints a buffer the size of the screen; the default
+            // would be 1024x768, and the gradient half should be production size.
+            ("GHOSTFRAME_DRM_MODE", "1920x1080"),
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
             ("GHOSTFRAME_CDF53_DUMP_PENDING", "1"),
             ("CAPTURE_FPS", "30"),
@@ -5288,9 +5297,13 @@ async fn e2e_refinement_cancel() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(18)).await;
     let logs = helpers::read_server_logs_stripped("ghostframe-server");
 
-    // 1920x1080 in 32 px tiles. A frame that sent this many Solid tiles and
-    // no Cdf53 ones bumped every tile on the screen.
-    const FULL_SCREEN_TILES: u32 = 2040;
+    // The motion half repaints the top-left 8x2 tiles, so a frame that sent
+    // exactly that many Solid tiles, and no Cdf53 ones, bumped all of them.
+    // (A whole-screen repaint cannot be observed: the send budget paces it
+    // over many frames, and the tiles it has not reached are not bumped yet.)
+    const MOTION_W: u8 = 8;
+    const MOTION_H: u8 = 2;
+    const MOTION_TILES: u32 = MOTION_W as u32 * MOTION_H as u32;
     let field = |line: &str, name: &str| -> Option<u32> {
         let at = line.find(name)? + name.len();
         let digits: String = line[at..]
@@ -5303,19 +5316,29 @@ async fn e2e_refinement_cancel() -> Result<()> {
     struct Frame {
         /// The snapshot dumped in this frame, before its dispatch.
         pending: Vec<(u8, u8, u8, u8)>,
-        /// Whether that dispatch then bumped every tile on the screen.
-        bumped_everything: bool,
+        /// Dirty tiles the frame announced just before its dispatch.
+        dirty: Option<u32>,
+        /// Whether that dispatch then bumped every motion tile, and
+        /// nothing else.
+        bumped_motion_region: bool,
     }
     let mut frames: Vec<Frame> = Vec::new();
     for line in logs.lines() {
         if line.contains("cdf53.pending_snapshot") {
             frames.push(Frame {
                 pending: parse_pending_snapshot_line(line),
-                bumped_everything: false,
+                dirty: None,
+                bumped_motion_region: false,
             });
+        } else if line.contains("process_frame_gpu: about to dispatch") {
+            if let Some(frame) = frames.last_mut() {
+                frame.dirty = field(line, "dirty_tiles=");
+            }
         } else if line.contains("process_frame_gpu: dispatch returned") {
             if let Some(frame) = frames.last_mut() {
-                frame.bumped_everything = field(line, "codec_solid=") == Some(FULL_SCREEN_TILES)
+                frame.bumped_motion_region = frame.dirty == Some(MOTION_TILES)
+                    && field(line, "dispatched_tiles=") == Some(MOTION_TILES)
+                    && field(line, "codec_solid=") == Some(MOTION_TILES)
                     && field(line, "codec_cdf53=") == Some(0);
             }
         }
@@ -5325,8 +5348,15 @@ async fn e2e_refinement_cancel() -> Result<()> {
     let mut cancelled = 0usize;
     let mut leaked: Vec<(u8, u8, u8, u8)> = Vec::new();
     for pair in frames.windows(2) {
-        let (before, after) = (&pair[0].pending, &pair[1].pending);
-        if before.is_empty() || !pair[0].bumped_everything {
+        // Only the tiles that were bumped: the rest of the screen is
+        // untouched and may legitimately still be refining.
+        let before: Vec<_> = pair[0]
+            .pending
+            .iter()
+            .filter(|e| e.0 < MOTION_W && e.1 < MOTION_H)
+            .collect();
+        let after = &pair[1].pending;
+        if before.is_empty() || !pair[0].bumped_motion_region {
             continue;
         }
         flips += 1;
@@ -5349,7 +5379,7 @@ async fn e2e_refinement_cancel() -> Result<()> {
 
     assert!(
         flips >= 1 && cancelled >= 1,
-        "premise: no frame bumped the whole screen while refinement was in \
+        "premise: no frame bumped the motion tiles while refinement was in \
          flight ({} frames logged, {flips} flips) -- the pattern did not \
          produce a static->motion transition with Cdf53 pending",
         frames.len()

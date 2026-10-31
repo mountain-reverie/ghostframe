@@ -45,15 +45,29 @@ pub enum Motion {
     Video,
 }
 
+/// What the static half paints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum Static {
+    /// One flat colour: every tile is `Solid` and nothing is left to refine.
+    #[default]
+    Solid,
+    /// The `Motion::Video` frame at phase 0, held still: every tile holds
+    /// far more than 16 colours, so each classifies as `Cdf53` and the
+    /// encoder has refinement passes to send while the half lasts.
+    Gradient,
+}
+
 /// Run the static/motion paint loop on the root window.
 pub fn run(
     half_cycle: Duration,
+    static_half: Static,
     motion: Motion,
     motion_tick: Duration,
+    motion_region: Option<(u32, u32)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut scanout = Scanout::connect(None)?;
     // Pre-fill with the static background before the first capture sees any pixels.
-    fill_solid(&mut scanout, STATIC_BG_PIXEL);
+    paint_static(&mut scanout, static_half);
     eprintln!("cycle: root painted — entering paint loop");
 
     let cycle = half_cycle * 2;
@@ -62,8 +76,8 @@ pub fn run(
     loop {
         let cycle_start = Instant::now();
 
-        // Static half: paint the buffer once with the solid colour.
-        fill_solid(&mut scanout, STATIC_BG_PIXEL);
+        // Static half: paint the buffer once.
+        paint_static(&mut scanout, static_half);
         thread::sleep(half_cycle);
 
         // Motion half: rewrite tile-aligned bands of shifting colours every
@@ -71,12 +85,19 @@ pub fn run(
         let motion_deadline = cycle_start + cycle;
         while Instant::now() < motion_deadline {
             match motion {
-                Motion::Bands => paint_motion(&mut scanout, motion_phase),
+                Motion::Bands => paint_motion(&mut scanout, motion_phase, motion_region),
                 Motion::Video => paint_video(&mut scanout, motion_phase),
             }
             motion_phase = motion_phase.wrapping_add(7);
             thread::sleep(motion_tick);
         }
+    }
+}
+
+fn paint_static(scanout: &mut Scanout, static_half: Static) {
+    match static_half {
+        Static::Solid => fill_solid(scanout, STATIC_BG_PIXEL),
+        Static::Gradient => paint_video(scanout, 0),
     }
 }
 
@@ -126,10 +147,18 @@ fn paint_video(scanout: &mut Scanout, motion_phase: u8) {
 }
 
 /// Paint horizontal bands of shifting colours, each `BAND_H` rows tall.
-fn paint_motion(scanout: &mut Scanout, motion_phase: u8) {
+///
+/// `region` is a `(tiles_wide, tiles_high)` rectangle at the top left to
+/// confine the motion to; `None` repaints the whole frame. A region small
+/// enough to fit one frame's send budget lets a test observe every changed
+/// tile being sent in the frame that changed it.
+fn paint_motion(scanout: &mut Scanout, motion_phase: u8, region: Option<(u32, u32)>) {
     let row_pitch = scanout.pitch as usize;
-    let row_active = (scanout.mode_w as usize) * 4;
-    let height = scanout.mode_h;
+    let (region_w, region_h) = region.map_or((u32::MAX, u32::MAX), |(w, h)| {
+        (w.saturating_mul(BAND_H), h.saturating_mul(BAND_H))
+    });
+    let row_active = (scanout.mode_w.min(region_w) as usize) * 4;
+    let height = scanout.mode_h.min(region_h);
     let mut map = scanout.map();
     let bytes = map.as_mut();
     let mut band_idx: u8 = 0;

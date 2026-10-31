@@ -69,6 +69,17 @@ struct Args {
     #[arg(long, value_enum, default_value_t)]
     motion: ghostframe_test_pattern::cycle::Motion,
 
+    /// What the static half of `--x11-sink --mode-switch-cycle` paints:
+    /// `solid` (nothing to refine) or `gradient` (all-Cdf53 tiles, so
+    /// progressive refinement is in flight when the motion half starts).
+    #[arg(long = "static-half", value_enum, default_value_t)]
+    static_half: ghostframe_test_pattern::cycle::Static,
+
+    /// Confine the `bands` motion to this many tiles, `WxH`, at the top left
+    /// (32 px tiles). Default: the whole screen.
+    #[arg(long, value_parser = parse_tiles)]
+    motion_region: Option<(u32, u32)>,
+
     /// Milliseconds between repaints in the motion half of `--x11-sink
     /// --mode-switch-cycle`. The default repaints faster than capture, so
     /// every captured frame is dirty; a longer tick lowers the rate of
@@ -165,8 +176,29 @@ struct Args {
     height: u16,
 }
 
+/// `WxH` in tiles, both at least 1.
+fn parse_tiles(s: &str) -> Result<(u32, u32), String> {
+    let (w, h) = s.split_once('x').ok_or("expected WxH")?;
+    let (w, h) = (
+        w.parse::<u32>().map_err(|e| e.to_string())?,
+        h.parse::<u32>().map_err(|e| e.to_string())?,
+    );
+    if w == 0 || h == 0 {
+        return Err("both sides must be at least 1".into());
+    }
+    Ok((w, h))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    // These only shape the sink cycle; elsewhere they would be silently ignored.
+    if (args.motion_region.is_some()
+        || args.static_half != ghostframe_test_pattern::cycle::Static::Solid)
+        && !(args.x11_sink && args.mode_switch_cycle.is_some())
+    {
+        return Err("--motion-region and --static-half need --x11-sink --mode-switch-cycle".into());
+    }
 
     // Sink palrle-exact mode: paint four 32×32 PalRle test tiles
     // with known 2-color patterns. Drives `e2e_palrle_exact_pixels`
@@ -240,11 +272,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let half = std::time::Duration::from_secs(secs);
         return ghostframe_test_pattern::cycle::run(
             half,
+            args.static_half,
             args.motion,
             args.motion_tick_ms.map_or(
                 ghostframe_test_pattern::cycle::MOTION_TICK,
                 std::time::Duration::from_millis,
             ),
+            args.motion_region,
         );
     }
 
