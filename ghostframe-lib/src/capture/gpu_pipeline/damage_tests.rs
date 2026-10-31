@@ -765,3 +765,50 @@ fn an_unchanged_tick_in_the_reset_cushion_reports_every_tile_from_the_upload_ima
         Some(&f0[..])
     );
 }
+
+/// Per-tick library cost of an idle screen (PR 7): the whole frame, a
+/// `Tiles` frame naming nothing (upload and compare skipped, pixels still
+/// handed over) and an `Unchanged` tick (no pixels at all).
+/// `gf-gpu-run cargo test -p ghostframe-lib --lib unchanged_report -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn unchanged_report() {
+    for (label, w, h) in [("1080p", 1920u32, 1088u32), ("4K", 3840, 2160)] {
+        let (cols, rows) = cols_rows(w, h);
+        let mut gpu = GpuFrameProcessor::new(cols * rows + 8).expect(NEEDS_GPU);
+        let base = noise_like(w, h, 0);
+        unsafe { gpu.process_frame_inner_from_pixels(&base, w, h, w * 4) }.unwrap();
+        let empty = tiles_damage(w, h, &[], &[]);
+        for mode in ["unknown", "tiles-empty", "unchanged"] {
+            let mut us = Vec::new();
+            for _ in 0..16 {
+                // The probe covers the upload and the GPU stage, as in `damage_report`.
+                match mode {
+                    "unknown" => unsafe {
+                        gpu.process_frame_inner_from_pixels_damaged(
+                            &base,
+                            w,
+                            h,
+                            w * 4,
+                            &FrameDamage::Unknown,
+                        )
+                    }
+                    .map(|_| ()),
+                    "tiles-empty" => unsafe {
+                        gpu.process_frame_inner_from_pixels_damaged(&base, w, h, w * 4, &empty)
+                    }
+                    .map(|_| ()),
+                    _ => unsafe { gpu.process_frame_inner_unchanged(w, h) }.map(|_| ()),
+                }
+                .unwrap();
+                us.push(gpu.probe.upload_us + gpu.probe.gpu_us);
+            }
+            us.drain(..2);
+            us.sort_unstable();
+            println!(
+                "UNCH {label} mode={mode} upload+gpu_us={}",
+                us[us.len() / 2]
+            );
+        }
+    }
+}

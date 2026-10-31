@@ -579,8 +579,8 @@ fn x11_a_slot_idle_longer_than_the_age_ring_is_regrabbed_in_full() {
         paint(&rig);
         assert_eq!(rig.tick().mismatch, None); // all four slots known
     }
-    rig.hold = 0; // one slot is reused for 14 ticks; the others go idle
-    for _ in 0..14 {
+    rig.hold = 0; // one slot is reused for 40 ticks; the others go idle
+    for _ in 0..40 {
         paint(&rig);
         assert_eq!(rig.tick().mismatch, None);
     }
