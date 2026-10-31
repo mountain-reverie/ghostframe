@@ -369,7 +369,7 @@ impl FlushedLosses {
 /// Which input set the admission rate `R`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetTerm {
-    /// goog_cc's estimate (the pacer rate) set the rate.
+    /// The estimate set the rate.
     Pacer,
     /// The one-datagram-per-tick floor beat the estimate.
     Floor,
@@ -656,7 +656,7 @@ pub struct InstrumentSummary {
     /// RTO fires for a pass whose tile had moved to another generation.
     /// Expected zero: the client drops such a pass unacknowledged.
     pub loss_path_resends_superseded: u64,
-    /// The model controller's counters .
+    /// The model controller's counters.
     pub model: ModelProbe,
     /// The first `PROBE_WINDOWS_KEPT` probe windows to close, in order.
     pub probe_windows: [ProbeWindow; PROBE_WINDOWS_KEPT],

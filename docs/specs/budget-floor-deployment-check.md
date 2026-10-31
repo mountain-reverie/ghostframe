@@ -75,9 +75,9 @@ concluding the field is missing. The fields that matter here:
 
 | field | reading |
 |---|---|
-| `base_budget_bytes` | the per-tick emission budget actually in force |
-| `tick_budget_floor_bytes` | what it is floored against -- should be ~one MTU |
-| `bytes_per_us` | the estimate driving it (`cwnd / smoothed_rtt`) |
+| `bytes_per_us` | the admission rate in force, in bytes per microsecond: the estimate (or a probe window's rate), over the payload fraction -- the model controller's `R` |
+| `tick_budget_floor_bytes` | the floor under that rate, per 33.3 ms tick -- should be ~one MTU |
+| `budget_term_pacer` / `_floor` / `_probe` | admission passes by the term that set the rate; `_floor` should stay ~0 |
 | `queued_critical_latency_mean_us` / `_max_us` | **the headline metric** |
 | `send_datagram_errs_total` | quinn refusing datagrams -- overdrive |
 | `retransmit_attempts_total` | wasted work |
@@ -85,36 +85,40 @@ concluding the field is missing. The fields that matter here:
 ### Grepping these out
 
 The formatter emits ANSI escapes *between* the field name and its value, so
-`grep -oE 'base_budget_bytes=[0-9]+'` matches **nothing** and looks like a
+`grep -oE 'tick_budget_floor_bytes=[0-9]+'` matches **nothing** and looks like a
 missing field. Strip them first:
 
 ```bash
 journalctl --user -u ghostframe-server | grep 'cumulative emit' \
   | sed -r 's/\x1B\[[0-9;]*[mK]//g' \
-  | grep -oE '(base_budget_bytes|tick_budget_floor_bytes|bytes_per_us|queued_critical_latency_(mean|max)_us)=[0-9.e+-]+'
+  | grep -oE '(tick_budget_floor_bytes|bytes_per_us|budget_term_(pacer|floor|probe)|queued_critical_latency_(mean|max)_us)=[0-9.e+-]+'
 ```
 
-Verified against a real container session on 2026-09-22:
+A reading from a container session (2026-09-22, before the model controller,
+when `bytes_per_us` was `cwnd / smoothed_rtt` and a `base_budget_bytes` field
+also existed):
 
 ```
-base_budget_bytes=2039581   tick_budget_floor_bytes=1198
-bytes_per_us=67.98          smoothed_rtt_us=6148.65
+tick_budget_floor_bytes=1198   bytes_per_us=67.98   smoothed_rtt_us=6148.65
 queued_critical_latency_mean_us=152486   queued_critical_latency_max_us=162237
 send_datagram_errs_total=0  retransmit_attempts_total=0
 ```
 
-`1198` is one MTU, which is the shipped floor. `67.98 * 33333 * 0.90 =
-2,039,575`, matching `base_budget_bytes` -- the bandwidth term is setting the
-budget and the floor is inert, which is the intended state. (That container
-link is ~544 Mbit, above the ~70 Mbit knee, so the old floor would not have
-bound there either. A slow real link is where the change matters.)
+`1198` is one MTU, which is the shipped floor. Under the model controller
+`bytes_per_us` is the estimate over the payload fraction, so the check is:
+
+* `bytes_per_us * 33333` (the rate per tick) is well above
+  `tick_budget_floor_bytes` on a healthy link: the estimate is setting the
+  rate and the floor is inert, which is the intended state;
+* `budget_term_floor` is ~0 against `budget_term_pacer`; a floor term that
+  climbs means the estimate has collapsed to one datagram a tick.
 
 **The first check is that the change is live at all:** if
-`base_budget_bytes == tick_budget_floor_bytes` on every line, the estimate is
-still not binding and the floor is still the policy. Before this change that
-was true on every link below ~70 Mbit/s, which is all of them.
+`bytes_per_us * 33333 <= tick_budget_floor_bytes` on every line, the estimate
+is not binding and the floor is the policy. Before the floor change that was
+true on every link below ~70 Mbit/s, which is all of them.
 
-These four fields were previously `debug!`-only on a per-frame site, which the
+These fields were previously `debug!`-only on a per-frame site, which the
 `ghostframe=info` default drops -- so a deployed build could not show whether
 the budget was tracking the path. They now ride the existing 60-frame `info`
 line, deliberately: journald's `RateLimitBurst` silently drops a burst and
@@ -170,8 +174,9 @@ same way and was removed on 2026-09-22 -- it produced values nothing printed.
 
 ## If the numbers do not move
 
-The next suspect is not the floor. `base_budget_bytes` is clamped afterwards
-by `clamp_to_quinn_capacity`, which is `0.80 * send_buffer_space()`. On a real
-path that clamp can still be the binding constraint even with a correct
-budget, and it is the one the browserless harness cannot exercise. See
-`docs/specs/blocked-path-redesign.md`.
+The next suspect is not the floor. The rate is applied through the admission
+bucket and its depth gate, which holds quinn's datagram FIFO to `D_target`
+(10 ms of the rate). On a real path the gate (`budget_gate_depth`,
+`budget_gate_tokens`) can still be what limits throughput even with a correct
+rate, and the real kernel send path is what the browserless harness cannot
+exercise. See `docs/specs/blocked-path-redesign.md`.

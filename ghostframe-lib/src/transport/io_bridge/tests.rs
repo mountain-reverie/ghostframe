@@ -3117,11 +3117,20 @@ async fn the_budget_floor_is_one_datagram_not_a_fixed_quarter_megabyte() {
         "the floor is one datagram so a tile can always make progress, not a \
          constant that re-establishes the old ~70 Mbit/s knee"
     );
-    // A starved estimate is lifted to the floor, and no further.
+    let tick_s = SCHEDULER_TICK_INTERVAL_US / 1e6;
+    // The initial estimate (2 Mbit/s) is far above one datagram a tick
+    // (36 kB/s), so the estimate sets the rate...
     let rate = bridge.admission_rate();
+    assert_eq!(rate.term, crate::transport::instruments::BudgetTerm::Pacer);
+    assert!(rate.bytes_per_sec > 1_200.0 / tick_s);
+    // ...and a floor above the estimate lifts the rate to exactly the floor
+    // and is counted as the floor.
+    bridge.set_tick_budget_floor_bytes(1 << 20);
+    let rate = bridge.admission_rate();
+    assert_eq!(rate.term, crate::transport::instruments::BudgetTerm::Floor);
     assert!(
-        rate.bytes_per_sec >= 1_200.0 / (SCHEDULER_TICK_INTERVAL_US / 1e6) - 1.0,
-        "the admission rate is never under the floor, got {}",
+        (rate.bytes_per_sec - (1u64 << 20) as f64 / tick_s).abs() < 1.0,
+        "the admission rate is the floor when the floor is higher, got {}",
         rate.bytes_per_sec
     );
 }

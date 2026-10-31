@@ -169,11 +169,11 @@ async fn the_production_send_buffer_never_rejects_a_datagram() {
 /// # Why this scene has to overdrive on purpose
 ///
 /// It did not, once. A 64 KiB buffer on a 2 Mbit link used to reject
-/// thousands of datagrams all by itself, because `base_budget_bytes` floored
+/// thousands of datagrams all by itself, because the rate floored
 /// at a flat 256 KiB per 33.3 ms tick -- 7.86 MB/s, about 31x the link. The
 /// sender simply outran the path, and `Blocked` fell out of that.
 ///
-/// Once the floor became one datagram and the bandwidth term took over, the
+/// Once the floor became one datagram and the estimate took over, the
 /// sender paced itself and this scene stopped rejecting anything at all
 /// (`send_errs=0`). That is the fix working, but it would have quietly
 /// deleted the only coverage of step A's re-queue path, so the overdrive is
@@ -269,7 +269,8 @@ async fn work_rejected_by_a_full_send_buffer_still_reaches_the_client() {
     // out to hinge on how the sender's bandwidth estimate settles in the first
     // second, which moved with the handshake shape under quinn's MTU discovery
     // (swapping ring for the hybrid X25519MLKEM768 handshake took `send_errs` from 2-5 to 0; the mechanism
-    // is unexplained, quinn's cwnd/rtt capacity hint is the suspect). The premise
+    // was never explained, and the cwnd/rtt capacity hint that was the
+    // suspect no longer exists). The premise
     // therefore has to be set explicitly, as
     // `a_small_send_buffer_does_provoke_rejections` does, rather than inherited
     // from an accident of the estimator. The roomy run keeps default pacing: it
@@ -344,25 +345,27 @@ async fn work_rejected_by_a_full_send_buffer_still_reaches_the_client() {
         squeezed_tiles
     );
 
-    // Rejections must be bounded by how often we attempt a drain, not by how
-    // much work is queued. ~20,400 passes are enqueued here; hammering
-    // produced 4,726 rejections (23% of the queue), backing off produces
-    // ~330 (1.6%). 1,000 sits an order of magnitude below the former and
-    // 3x above the latter.
-    // A refusal must stay the minority outcome of what is offered. The
-    // overdriven floor (63 Mbit/s) puts `D_target` above the 64 KiB buffer, so
-    // some refusals are the setup's own; hammering a full buffer would make
-    // them the majority. (The fixed 1,000 was tuned on the Cubic arm, whose
-    // window limited the squeezed run to 1.6 %; the model arm measures 16 %.)
-    let admitted = squeezed.transport.instr.admission.datagrams_admitted;
-    assert!(
-        squeezed.send_datagram_errs * 2 < admitted,
-        "{} rejections against {} admitted datagrams: the drain is hammering \
-         a full send buffer rather than stopping at the first refusal. Each \
-         rejection past the first is a datagram offered to a transport that \
-         has already said no.",
+    // One refusal ends the admission pass that met it (`Stop::Rejected`), so
+    // rejections are bounded by the number of passes, not by how much work is
+    // queued. Hammering a full buffer (offering datagram after datagram to a
+    // transport that already said no) produced 4,726 rejections against
+    // ~20,400 passes enqueued; every rejection in this scene comes from a
+    // gated pass (tile frames only, no H.264 or control bypass), so the
+    // pass count is the bound.
+    let i = &squeezed.transport.instr;
+    println!(
+        "rejections={} pumps={} gate_rejected={} admitted={}",
         squeezed.send_datagram_errs,
-        admitted
+        i.admission.pumps,
+        i.budget.gate_rejected,
+        i.admission.datagrams_admitted
+    );
+    assert!(
+        squeezed.send_datagram_errs <= i.admission.pumps,
+        "{} rejections in {} admission passes: a pass kept offering datagrams \
+         to a full send buffer after the first refusal",
+        squeezed.send_datagram_errs,
+        i.admission.pumps
     );
 
     // The backlog must not simply migrate out of quinn's send buffer into
@@ -537,12 +540,11 @@ async fn probe_send_buffer_sizes() {
 // Bandwidth as an axis
 // ---------------------------------------------------------------------------
 
-/// A floor low enough that `base_budget_bytes`'s bandwidth term always wins.
+/// A floor low enough that the estimate always wins.
 ///
-/// The production floor is 256 KiB per 33.3 ms tick, i.e. 7.86 MB/s, so with
-/// `SCHEDULER_TICK_BUDGET_FRACTION = 0.90` the bandwidth term only overtakes
-/// it above ~70 Mbit/s. Every link measured in this file is below that, which
-/// means the budget has been the constant 256 KiB in all of them.
+/// The old production floor was 256 KiB per 33.3 ms tick, i.e. 7.86 MB/s,
+/// which the estimate only overtook above ~70 Mbit/s. Every link measured in
+/// this file is below that, so under it the rate was the constant 256 KiB.
 const LOW_FLOOR_BYTES: usize = 8 * 1024;
 
 fn mbit(m: f64) -> u64 {

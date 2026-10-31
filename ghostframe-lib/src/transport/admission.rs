@@ -6,8 +6,8 @@
 //! Nothing used to read how much was already waiting in quinn's datagram
 //! queue. The scheduler's budget was a rate per call, retransmission had a
 //! half-billed allowance of its own, parity was unbilled, and the queue was
-//! 16 MiB deep, so any excess integrated: under 2 % random loss Cubic shrinks
-//! the window, the scheduler keeps enqueuing, and the FIFO stood at 2-5 MB
+//! 16 MiB deep, so any excess integrated: under 2 % random loss the (then Cubic)
+//! window shrank, the scheduler kept enqueuing, and the FIFO stood at 2-5 MB
 //! with a median enqueue-to-departure lag over a second. The sender's own
 //! queue is the one queue it can bound, and it is the only place a stale tile
 //! can still be superseded, so the work that cannot be admitted stays in the

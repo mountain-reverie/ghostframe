@@ -597,15 +597,13 @@ pub struct IoBridge {
     #[cfg(any(test, feature = "browserless-harness"))]
     pub(crate) arm_picked: bool,
 
-    /// Lower bound applied to `base_budget_bytes`; `None` derives it from the
+    /// Lower bound applied to the admission rate; `None` derives it from the
     /// live MTU (`tick_budget_floor`).
     ///
     /// A field rather than a bare constant because a flat floor is not a
-    /// neutral safety net: 256 KiB per 33.3 ms tick is 7.86 MB/s, so the
-    /// floor only stops dominating above ~70 Mbit/s. Every link this system
-    /// has been measured on is below that, which means the bandwidth-derived
-    /// term has never once bound and the budget has been a constant. Varying
-    /// the floor is how a test reaches the other side of that knee.
+    /// neutral safety net: 256 KiB per 33.3 ms tick is 7.86 MB/s, so a floor
+    /// that size dominates the estimate on every link this system serves.
+    /// Varying the floor is how a test overdrives the path on purpose.
     tick_budget_floor_bytes: Option<usize>,
 
     /// Most recent result of `compute_max_datagram_size`, so the budget

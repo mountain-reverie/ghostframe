@@ -65,10 +65,9 @@ const AIMD_BACKOFF_F: f64 = super::ceiling::AIMD_BACKOFF;
 /// target. 1.0: the pacer rate is the estimate.
 ///
 /// libwebrtc's default is 2.5, its allowance for draining an encoder's frames
-/// ahead of the rate it is asked to hold. Here it put the pacer term of the
-/// admission rate (`min(cwnd / srtt, factor x estimate)`) out of reach of the
-/// cwnd term: measured on the 5 -> 15 -> 5 Mbit steps the pacer term bound in
-/// 3 % of admission passes at 2.5 and in 41 % at 1.0.
+/// ahead of the rate it is asked to hold. Here it put the pacer rate at 2.5 x
+/// the estimate, out of step with the rate admission is held to; at 1.0 the
+/// pacer rate is the estimate.
 const PACING_FACTOR: f64 = 1.0;
 
 pub(crate) struct GoogCcDriver {
@@ -313,6 +312,8 @@ impl GoogCcDriver {
     /// cannot substitute: it fires only when the application is
     /// under-sending, which is precisely when there is too little traffic to
     /// fill a probe cluster (measured 0 completed / 7 abandoned).
+    ///
+    /// (No longer called by the transport: the model controller feeds no hint.)
     ///
     /// `bytes_per_us` is `cwnd / smoothed_rtt` from quinn's `PathStats` — a
     /// BDP-derived rate, which is **not** a capacity measurement. It is what
@@ -1267,10 +1268,9 @@ mod tests {
         assert_eq!(d.snapshot().implausible_rtt_samples, 0);
     }
 
-    /// BWE Stage 2.2 consumes `pacer_rate_bps`, not `bitrate_bps`, to drive
-    /// emission. Before any feedback it must be `None` (nothing to consume
-    /// yet — `PacingMode::Paced` must not be reachable off a
-    /// never-produced pacer config), and it must become `Some` once the
+    /// `pacer_rate_bps` is informational (admission reads `bitrate_bps`).
+    /// Before any feedback it must be `None` (nothing absorbed yet), and it
+    /// must become `Some` once the
     /// controller has processed at least one feedback batch, since
     /// `GoogCcNetworkController::on_transport_packets_feedback` /
     /// `on_process_interval` always populate `pacer_config` (see

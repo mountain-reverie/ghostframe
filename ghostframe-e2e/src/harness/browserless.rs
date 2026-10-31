@@ -159,11 +159,10 @@ pub struct BrowserlessScene {
     /// concurrent scenes instead of configuring one.
     pub datagram_send_buffer_bytes: Option<usize>,
 
-    /// Override `IoBridge`'s `base_budget_bytes` floor, in bytes per
-    /// 33.3 ms tick. `None` keeps the production default (256 KiB), which
-    /// is equivalent to 7.86 MB/s and therefore dominates the
-    /// bandwidth-derived term on any link below ~70 Mbit/s. Lower it to let
-    /// the bandwidth term actually bind.
+    /// Override the admission rate's floor (`IoBridge::tick_budget_floor`),
+    /// in bytes per 33.3 ms tick. `None` keeps the production default (one
+    /// datagram). Raise it to overdrive the path on purpose; the rate is
+    /// `max(estimate, probe, floor)`.
     pub tick_budget_floor_bytes: Option<usize>,
     /// Resolved once at the top of `drive_session`, then drained in order
     /// after `SessionReady`, one `FrameScript` every `cadence_us` of
@@ -412,10 +411,9 @@ pub struct BrowserlessResult {
     /// Server-side bandwidth estimate at the end of the scene, bits per
     /// second. Zero if the controller never produced one.
     pub bwe_estimate_bps: u64,
-    /// goog_cc's pacer rate at scene end, bits per second. This, not
-    /// `bwe_estimate_bps`, is what `combine_pacing_budget` actually limits
-    /// emission with, so a scene whose wire rate exceeds the estimate should
-    /// be read against this before concluding the estimate is being ignored.
+    /// goog_cc's pacer rate at scene end, bits per second. Informational:
+    /// admission runs at `bwe_estimate_bps`, and this is the pacer's own
+    /// figure (`min(E, K x A)` while the sender is saturated).
     pub pacer_rate_bps: Option<u64>,
     /// `(virtual_us, bitrate_bps)` sampled at most every 100 ms of virtual
     /// time while the scene runs.
@@ -1873,10 +1871,10 @@ async fn inject_frame(
     let frame = InjectedFrame {
         seq: frame_idx as u32,
         timestamp_us: (frame_idx as u64 * cadence_us) as u32,
-        // No `budget_bytes` here: `IoBridge::apply_injected_frame` derives
-        // its own per-tick budget the same way the production capture path
-        // does (`IoBridge::base_budget_bytes`), rather than accepting one
-        // from the caller. The netsim's token bucket still does the link
+        // No `budget_bytes` here: `IoBridge::apply_injected_frame` drains
+        // through the same admission pass the production capture path does
+        // (`pump_admission`), rather than accepting a budget from the
+        // caller. The netsim's token bucket still does the link
         // capping, and `IoBridge` still holds quinn's queue to its depth
         // gate (`admission`) — this only removes the harness's own
         // unbounded "drain everything" budget that sat in front of both.
