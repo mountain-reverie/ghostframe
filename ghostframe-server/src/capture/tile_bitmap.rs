@@ -182,6 +182,15 @@ impl TileBitmap {
         }
     }
 
+    /// The inverse of [`TileBitmap::set_rect`]: clear every tile the
+    /// rectangle touches. Tests inject lost damage with it.
+    #[cfg(test)]
+    pub fn clear_rect(&mut self, x: i16, y: i16, width: u16, height: u16) {
+        let mut cleared = TileBitmap::new(self.px.0, self.px.1);
+        cleared.set_rect(x, y, width, height);
+        self.clear_bits_of(&cleared);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.bits.iter().all(|&w| w == 0)
     }
