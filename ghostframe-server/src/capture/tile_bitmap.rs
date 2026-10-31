@@ -61,13 +61,25 @@ impl TileBitmap {
         }
     }
 
-    /// Mark the tile rows `lo..hi` (clipped to the grid).
-    #[cfg(test)]
+    /// Mark the tile rows `lo..hi` (clipped to the grid). Rows are contiguous
+    /// in the row-major bit order, so this fills a bit range word by word.
     pub fn set_rows(&mut self, lo: u32, hi: u32) {
-        for ty in lo..hi.min(self.tiles_h) {
-            for tx in 0..self.tiles_w {
-                self.set(tx, ty);
-            }
+        let hi = hi.min(self.tiles_h);
+        if lo >= hi {
+            return;
+        }
+        let start = lo as usize * self.tiles_w as usize;
+        let end = hi as usize * self.tiles_w as usize;
+        let (first, last) = (start / 64, (end - 1) / 64);
+        for wi in first..=last {
+            let from = if wi == first { start % 64 } else { 0 };
+            let to = if wi == last { (end - 1) % 64 + 1 } else { 64 };
+            let mask = if to - from == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << (to - from)) - 1) << from
+            };
+            self.bits[wi] |= mask;
         }
     }
 
@@ -263,6 +275,35 @@ mod tests {
         let mut d = TileBitmap::new(66, 40);
         d.or_with(&b);
         assert!(d.is_empty());
+    }
+
+    /// `set_rows` fills a bit range word by word; it must equal the per-tile
+    /// loop for every row range on grids whose rows straddle word edges.
+    #[test]
+    fn set_rows_equals_setting_every_tile_of_the_rows() {
+        for (w, h) in [
+            (32, 320),
+            (100, 70),
+            (7 * 32, 11 * 32),
+            (13 * 32, 9 * 32),
+            (64 * 32, 4 * 32),
+        ] {
+            let probe = TileBitmap::new(w, h);
+            let rows = probe.grid().1;
+            for lo in 0..=rows {
+                for hi in lo..=rows + 2 {
+                    let mut fast = TileBitmap::new(w, h);
+                    fast.set_rows(lo, hi);
+                    let mut slow = TileBitmap::new(w, h);
+                    for ty in lo..hi.min(rows) {
+                        for tx in 0..slow.grid().0 {
+                            slow.set(tx, ty);
+                        }
+                    }
+                    assert_eq!(fast, slow, "{w}x{h} rows {lo}..{hi}");
+                }
+            }
+        }
     }
 
     /// The library's feedback bits and this bitmap must agree on the layout

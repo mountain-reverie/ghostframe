@@ -17,13 +17,17 @@
 //! The root path never drew the cursor (X does not include it in an image).
 //! It is blended here from `XFixesGetCursorImage`, at `(x - xhot, y - yhot)`.
 
+use std::cell::Cell;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use crate::capture::TileBitmap;
+use super::bands::{self, Grab};
+use crate::capture::safety_net::Slice;
+use crate::capture::{Damage, TileBitmap};
 use crate::util::monotonic_now_ns;
 use ghostframe_lib::{FrameBuf, FramePool, FrameStorage, FrameSubmission, PoolSlot};
 use x11rb::connection::Connection;
+use x11rb::cookie::Cookie;
 use x11rb::protocol::shm::{self, ConnectionExt as ShmExt};
 use x11rb::protocol::xfixes::{ConnectionExt as XfixesExt, GetCursorImageReply};
 use x11rb::protocol::xproto::{ConnectionExt, ImageFormat, ImageOrder};
@@ -68,6 +72,11 @@ struct ShmSegment {
     seg: shm::Seg,
     ptr: *mut u8,
     len: usize,
+    /// The grab tick whose content this segment holds, or `None` when it is
+    /// fresh or a grab into it did not finish: the segment's age, for the
+    /// band grab. Lives here because the segment is the slot's memory and
+    /// follows it through the pool.
+    held: Cell<Option<u64>>,
 }
 
 /// Why a segment could not be attached.
@@ -115,6 +124,7 @@ impl ShmSegment {
             seg: 0,
             ptr: ptr.cast(),
             len,
+            held: Cell::new(None),
         };
         me.seg = conn
             .generate_id()
@@ -195,6 +205,70 @@ pub struct X11Frames {
     shm_alloc_failing: bool,
     /// Copies and allocations since the last `take_stats` (PR 0 counters).
     stats: crate::capture::tick_stats::TickStats,
+    /// What the next `capture` may take from the damage (`on` mode); `None`
+    /// means a full grab.
+    plan: Option<Plan>,
+    /// The planned tick's damage, reused every tick.
+    plan_mask: TileBitmap,
+    /// Grab ticks so far; a segment's `held` is one of these.
+    tick: u64,
+    /// The grab set of each of the last [`AGE_RING`] ticks, indexed by
+    /// `tick % AGE_RING`: damage, sweep slice and (for an `Unknown` or
+    /// distrusted tick) everything. A slot last made current at tick `s` is
+    /// refreshed with the union of ticks `s+1..=t` (buffer age, design 3.1).
+    ring: Vec<AgeEntry>,
+    /// Slots last made current before this tick have unknown age: set when
+    /// the ring is cleared (resize, failed grab, a tick without a plan).
+    age_floor: u64,
+    /// Scratch for the union, reused every tick.
+    union: TileBitmap,
+    /// What the last `capture` grabbed, for the tests.
+    #[cfg(test)]
+    pub(crate) last_grab: Option<Grab>,
+    /// Test-only faults: see [`Mutation`].
+    #[cfg(test)]
+    pub(crate) mutation: Mutation,
+    /// Test-only fault: the next band grab with two or more bands fails after
+    /// its first band has been written.
+    #[cfg(test)]
+    pub(crate) fail_second_band_once: bool,
+}
+
+/// Ticks of grab set kept. A slot idle for more than this many ticks has
+/// unknown age and gets a full grab.
+const AGE_RING: usize = 8;
+
+#[derive(Debug, Clone)]
+struct AgeEntry {
+    /// The tick this entry describes; 0 when empty (ticks start at 1).
+    tick: u64,
+    mask: TileBitmap,
+}
+
+/// What a consumer of damage tells the next grab.
+#[derive(Debug, Clone)]
+struct Plan {
+    /// Whether `plan_mask` holds this tick's damage (cursor tiles included).
+    /// False when it cannot be believed: unknown, a stale size, distrusted.
+    known: bool,
+    slice: Option<Slice>,
+}
+
+/// Faults the band-grab tests inject to prove each rule load-bearing.
+#[cfg(test)]
+#[allow(dead_code, reason = "the variants are constructed by band_tests")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Mutation {
+    #[default]
+    None,
+    /// Refresh only this tick's grab set, not the union over the slot's age.
+    DropAgeUnion,
+    /// Leave the cursor's previous tiles out of the damage.
+    DropOldCursorTiles,
+    /// Do not request the last band.
+    SkipBand,
+    /// Leave the tiles under the cursor about to be blended out of the grab.
+    DropBlendCursorTiles,
 }
 
 /// A cursor image's rectangle in root coordinates.
@@ -230,20 +304,25 @@ fn cursor_dirty_tiles(
 ) -> Vec<(u32, u32)> {
     let mut out = TileBitmap::new(screen_w, screen_h);
     for r in [prev, cur].into_iter().flatten() {
-        // Clip to the screen in pixels first: the i16/u16 arguments of
-        // `set_rect` must not wrap.
-        let x0 = r.x.max(0) as u32;
-        let y0 = r.y.max(0) as u32;
-        let x1 = (i64::from(r.x) + i64::from(r.w)).clamp(0, i64::from(screen_w)) as u32;
-        let y1 = (i64::from(r.y) + i64::from(r.h)).clamp(0, i64::from(screen_h)) as u32;
-        if x0 >= x1 || y0 >= y1 {
-            continue;
-        }
-        out.set_rect(x0 as i16, y0 as i16, (x1 - x0) as u16, (y1 - y0) as u16);
+        cursor_tiles_into(&mut out, r);
     }
     let mut v: Vec<_> = out.iter().collect();
     v.sort_unstable();
     v
+}
+
+/// Mark the tiles under a cursor rectangle, clipped to the bitmap's screen.
+fn cursor_tiles_into(out: &mut TileBitmap, r: CursorRect) {
+    let (screen_w, screen_h) = out.px();
+    // Clip to the screen in pixels first: the i16/u16 arguments of
+    // `set_rect` must not wrap.
+    let x0 = r.x.max(0) as u32;
+    let y0 = r.y.max(0) as u32;
+    let x1 = (i64::from(r.x) + i64::from(r.w)).clamp(0, i64::from(screen_w)) as u32;
+    let y1 = (i64::from(r.y) + i64::from(r.h)).clamp(0, i64::from(screen_h)) as u32;
+    if x0 < x1 && y0 < y1 {
+        out.set_rect(x0 as i16, y0 as i16, (x1 - x0) as u16, (y1 - y0) as u16);
+    }
 }
 
 impl X11Frames {
@@ -279,6 +358,18 @@ impl X11Frames {
             shm_retry_in: None,
             shm_alloc_failing: false,
             stats: Default::default(),
+            plan: None,
+            plan_mask: TileBitmap::empty(),
+            tick: 0,
+            ring: Vec::new(),
+            age_floor: 0,
+            union: TileBitmap::empty(),
+            #[cfg(test)]
+            last_grab: None,
+            #[cfg(test)]
+            mutation: Mutation::None,
+            #[cfg(test)]
+            fail_second_band_once: false,
         };
         me.ensure_segment();
         tracing::info!(width, height, path = ?me.path(), "X11 capture connected to display");
@@ -415,6 +506,10 @@ impl X11Frames {
             );
             self.width = w;
             self.height = h;
+            self.ring.clear();
+            // Whatever the slots hold is the old geometry, even when the byte
+            // size is the same (1920x1080 <-> 1080x1920) and the segments stay.
+            self.age_floor = self.tick + 1;
             self.ensure_segment();
         }
         Ok(())
@@ -425,7 +520,7 @@ impl X11Frames {
     /// slot's segment: nothing is allocated or copied here once the slots are
     /// warm. The `GetImage` path takes the reply's buffer as the frame (the
     /// slot goes back unused).
-    fn grab(&mut self, mut slot: PoolSlot) -> io::Result<FrameBuf> {
+    fn grab(&mut self, mut slot: PoolSlot, mut grab: Grab) -> io::Result<FrameBuf> {
         let (w, h) = (self.width, self.height);
         let want = usize::from(w) * usize::from(h) * 4;
         if self.shm_len == Some(want) {
@@ -434,7 +529,9 @@ impl X11Frames {
                 .and_then(|s| s.as_any().downcast_ref::<ShmSegment>())
                 .is_some_and(|s| s.len == want);
             if !fits {
-                // A never-used slot, or one that came back from before a resize.
+                // A never-used slot, or one that came back from before a resize:
+                // nothing in it to refresh, so everything is grabbed.
+                grab = Grab::Full;
                 self.discard_storage(&mut slot);
                 self.release_stale();
                 match ShmSegment::attach(&self.conn, want) {
@@ -448,35 +545,76 @@ impl X11Frames {
                     }
                 }
             }
-            let seg_id = slot
+            let (seg_id, held) = slot
                 .storage()
                 .and_then(|s| s.as_any().downcast_ref::<ShmSegment>())
-                .map(|s| s.seg)
+                .map(|s| (s.seg, &s.held))
                 .expect("storage was just installed");
-            let reply = self
-                .conn
-                .shm_get_image(
-                    self.root,
-                    0,
-                    0,
-                    w,
-                    h,
-                    !0,
-                    ImageFormat::Z_PIXMAP.into(),
-                    seg_id,
-                    0,
-                )
-                .map_err(io::Error::other)?
-                .reply()
-                .map_err(io::Error::other)?;
-            if reply.size as usize != want {
-                return Err(io::Error::other(format!(
-                    "ShmGetImage returned {} bytes for {w}x{h}, expected {want} (root is not 32 bpp)",
-                    reply.size
-                )));
+            // Not current until every request below has been answered.
+            held.set(None);
+            let full = [bands::Band {
+                y0: 0,
+                y1: u32::from(h),
+            }];
+            let wanted: &[bands::Band] = match &grab {
+                Grab::Full => &full,
+                Grab::Bands(b) => b.as_slice(),
+            };
+            #[cfg(test)]
+            let wanted = match (self.mutation, wanted) {
+                (Mutation::SkipBand, [rest @ .., _]) if matches!(grab, Grab::Bands(_)) => rest,
+                _ => wanted,
+            };
+            let stride = usize::from(w) * 4;
+            // Pipelined: every request goes out before the first reply is
+            // read, so a tick costs one round trip however many bands.
+            let mut cookies: [Option<Cookie<'_, RustConnection, shm::GetImageReply>>;
+                bands::MAX_BANDS] = Default::default();
+            for (b, c) in wanted.iter().zip(cookies.iter_mut()) {
+                *c = Some(
+                    self.conn
+                        .shm_get_image(
+                            self.root,
+                            0,
+                            b.y0 as i16,
+                            w,
+                            b.rows() as u16,
+                            !0,
+                            ImageFormat::Z_PIXMAP.into(),
+                            seg_id,
+                            b.y0 * stride as u32,
+                        )
+                        .map_err(io::Error::other)?,
+                );
             }
-            self.stats.bytes_grabbed += want as u64;
-            self.stats.grab_requests += 1;
+            let mut grabbed = 0usize;
+            for (i, (b, c)) in wanted.iter().zip(cookies).enumerate() {
+                #[cfg(test)]
+                if i == 1 && std::mem::take(&mut self.fail_second_band_once) {
+                    return Err(io::Error::other("injected band failure"));
+                }
+                let _ = i;
+                let reply = c
+                    .expect("a cookie per band")
+                    .reply()
+                    .map_err(io::Error::other)?;
+                let want_b = b.rows() as usize * stride;
+                if reply.size as usize != want_b {
+                    return Err(io::Error::other(format!(
+                        "ShmGetImage returned {} bytes for {w}x{} rows, expected {want_b} (root is not 32 bpp)",
+                        reply.size,
+                        b.rows()
+                    )));
+                }
+                grabbed += want_b;
+            }
+            self.stats.bytes_grabbed += grabbed as u64;
+            self.stats.grab_requests += wanted.len() as u32;
+            held.set(Some(self.tick));
+            #[cfg(test)]
+            {
+                self.last_grab = Some(grab);
+            }
             return slot
                 .into_buf()
                 .map_err(|_| io::Error::other("frame slot lost its storage"));
@@ -543,18 +681,115 @@ impl X11Frames {
         // redraw, so an idle desktop with a visible cursor reports no damage.
         let unchanged = cur == self.last_cursor
             && cursor.as_ref().map(|c| c.cursor_serial) == self.last_cursor_serial;
+        #[cfg(test)]
+        let prev = if self.mutation == Mutation::DropOldCursorTiles {
+            None
+        } else {
+            self.last_cursor
+        };
+        #[cfg(not(test))]
+        let prev = self.last_cursor;
         let tiles = if unchanged {
             Vec::new()
         } else {
-            cursor_dirty_tiles(
-                self.last_cursor,
-                cur,
-                u32::from(self.width),
-                u32::from(self.height),
-            )
+            cursor_dirty_tiles(prev, cur, u32::from(self.width), u32::from(self.height))
         };
         self.polled_cursor = Some(cursor);
         tiles
+    }
+
+    /// Tell the next [`X11Frames::capture`] what the damage says (`on` mode).
+    ///
+    /// `damage` is the drain's report with the cursor's tiles merged in;
+    /// `slice` the sweep slice due this tick; `trusted` false when hints must
+    /// not be believed. Without a call a capture grabs the whole root, so a
+    /// caller that does not consume damage changes nothing.
+    pub fn plan_grab(&mut self, damage: &Damage, slice: Option<Slice>, trusted: bool) {
+        let (w, h) = (u32::from(self.width), u32::from(self.height));
+        if !self.plan_mask.matches(w, h) {
+            self.plan_mask = TileBitmap::new(w, h);
+        }
+        let known = trusted
+            && match damage {
+                Damage::Tiles(b) if b.matches(w, h) => {
+                    self.plan_mask.copy_from(b);
+                    true
+                }
+                Damage::None => {
+                    self.plan_mask.clear();
+                    true
+                }
+                Damage::Tiles(_) | Damage::Unknown => false,
+            };
+        self.plan = Some(Plan { known, slice });
+    }
+
+    /// Decide what this tick grabs into a slot last made current at tick
+    /// `held`, and file the tick's grab set in the age ring.
+    ///
+    /// The set for the slot is the union of the grab sets of every tick since
+    /// it was last current (buffer age, design 3.1), plus the tiles under the
+    /// cursor about to be blended. A slot of unknown or too old an age, an
+    /// unbelievable tick, or a union above [`bands::FULL_GRAB_ABOVE_PCT`] of
+    /// the rows gets the full grab.
+    fn choose(&mut self, held: Option<u64>, cursor: Option<CursorRect>) -> Grab {
+        self.tick += 1;
+        let t = self.tick;
+        let Some(plan) = self.plan.take() else {
+            self.ring.clear();
+            self.age_floor = t;
+            return Grab::Full;
+        };
+        let (w, h) = (u32::from(self.width), u32::from(self.height));
+        if !self.ring.first().is_some_and(|e| e.mask.matches(w, h)) {
+            self.ring = (0..AGE_RING)
+                .map(|_| AgeEntry {
+                    tick: 0,
+                    mask: TileBitmap::new(w, h),
+                })
+                .collect();
+            self.union = TileBitmap::new(w, h);
+        }
+        let entry = &mut self.ring[(t % AGE_RING as u64) as usize];
+        entry.tick = t;
+        // The plan was made before the geometry was re-read: a mask for
+        // another size says nothing about this one.
+        if plan.known && self.plan_mask.matches(w, h) {
+            entry.mask.copy_from(&self.plan_mask);
+            if let Some(s) = plan.slice {
+                entry.mask.set_rows(s.lo, s.hi);
+            }
+        } else {
+            entry.mask.set_all();
+        }
+        let Some(s) = held.filter(|&s| s < t && s >= self.age_floor && t - s <= AGE_RING as u64)
+        else {
+            return Grab::Full;
+        };
+        #[cfg(test)]
+        let from = if self.mutation == Mutation::DropAgeUnion {
+            t
+        } else {
+            s + 1
+        };
+        #[cfg(not(test))]
+        let from = s + 1;
+        self.union.clear();
+        for u in from..=t {
+            let e = &self.ring[(u % AGE_RING as u64) as usize];
+            if e.tick != u || !e.mask.matches(w, h) {
+                return Grab::Full;
+            }
+            self.union.or_with(&e.mask);
+        }
+        #[cfg(test)]
+        let blend_tiles = self.mutation != Mutation::DropBlendCursorTiles;
+        #[cfg(not(test))]
+        let blend_tiles = true;
+        if let Some(c) = cursor.filter(|_| blend_tiles) {
+            cursor_tiles_into(&mut self.union, c);
+        }
+        bands::plan(&self.union, h)
     }
 
     /// Capture a single frame: root, then the cursor on top.
@@ -566,11 +801,28 @@ impl X11Frames {
         let slot = self.pool.try_acquire().ok_or_else(|| {
             io::Error::new(io::ErrorKind::WouldBlock, "every frame slot is in flight")
         })?;
-        let mut pixels = self.grab(slot)?;
-        // Best effort: without XFixes the frame is correct minus the cursor.
+        // The cursor is resolved before the grab: its rectangle is part of
+        // the grab set (it is blended into the slot, so its rows must be
+        // fresh before the blend). Best effort: without XFixes the frame is
+        // correct minus the cursor.
         let cursor = match self.polled_cursor.take() {
             Some(polled) => polled,
             None => self.query_cursor(),
+        };
+        let held = slot
+            .storage()
+            .and_then(|s| s.as_any().downcast_ref::<ShmSegment>())
+            .and_then(|s| s.held.get());
+        let choice = self.choose(held, cursor.as_ref().map(CursorRect::of));
+        let mut pixels = match self.grab(slot, choice) {
+            Ok(p) => p,
+            Err(e) => {
+                // The tick's grab set was consumed and nothing carries it:
+                // every slot's age is unknown from here.
+                self.ring.clear();
+                self.age_floor = self.tick + 1;
+                return Err(e);
+            }
         };
         self.last_cursor = cursor.as_ref().map(CursorRect::of);
         self.last_cursor_serial = cursor.as_ref().map(|c| c.cursor_serial);
@@ -1076,7 +1328,10 @@ mod live_tests {
         paint_root(x.display());
         let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
         assert_eq!(f.path(), GrabPath::Shm);
-        let shm = f.grab(f.pool().try_acquire().unwrap()).unwrap().to_vec();
+        let shm = f
+            .grab(f.pool().try_acquire().unwrap(), Grab::Full)
+            .unwrap()
+            .to_vec();
         assert!(shm.iter().any(|&b| b != 0), "root was not painted");
         assert_eq!(shm, root_get_image(x.display()));
     }
@@ -1090,7 +1345,9 @@ mod live_tests {
         let frame = f.capture(0).unwrap();
         assert_eq!((frame.width, frame.height, frame.stride), (64, 48, 256));
         assert_eq!(
-            f.grab(f.pool().try_acquire().unwrap()).unwrap().to_vec(),
+            f.grab(f.pool().try_acquire().unwrap(), Grab::Full)
+                .unwrap()
+                .to_vec(),
             root_get_image(x.display())
         );
     }
@@ -1115,7 +1372,10 @@ mod live_tests {
         conn.get_input_focus().unwrap().reply().unwrap();
 
         let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
-        let plain = f.grab(f.pool().try_acquire().unwrap()).unwrap().to_vec();
+        let plain = f
+            .grab(f.pool().try_acquire().unwrap(), Grab::Full)
+            .unwrap()
+            .to_vec();
         let frame = f.capture(0).unwrap();
         let cur = f.conn.xfixes_get_cursor_image().unwrap().reply().unwrap();
         let (cx, cy) = (
@@ -1191,7 +1451,10 @@ mod live_tests {
             assert_eq!((frame.width, frame.height), (u32::from(w), u32::from(h)));
             assert_eq!(frame.pixels.len(), usize::from(w) * usize::from(h) * 4);
             assert_eq!(f.path(), GrabPath::Shm, "after resizing to {w}x{h}");
-            let plain = f.grab(f.pool().try_acquire().unwrap()).unwrap().to_vec();
+            let plain = f
+                .grab(f.pool().try_acquire().unwrap(), Grab::Full)
+                .unwrap()
+                .to_vec();
             assert!(plain.iter().any(|&b| b != 0), "root not painted at {w}x{h}");
             assert_eq!(plain, root_get_image_sized(x.display(), w, h), "{w}x{h}");
         }
@@ -1310,7 +1573,9 @@ mod live_tests {
         let x = PrivateXvfb::spawn(&["-screen", "0", "64x48x24"]);
         let mut f = X11Frames::connect(Some(x.display()), None).unwrap();
         f.root = 0x00de_ad00; // not a drawable: BadDrawable
-        let err = f.grab(f.pool().try_acquire().unwrap()).unwrap_err();
+        let err = f
+            .grab(f.pool().try_acquire().unwrap(), Grab::Full)
+            .unwrap_err();
         assert!(!err.to_string().is_empty());
         assert_eq!(
             f.pool().free_slots(),
@@ -1318,7 +1583,8 @@ mod live_tests {
             "slot leaked on SHM error"
         );
         f.shm_len = None;
-        f.grab(f.pool().try_acquire().unwrap()).unwrap_err();
+        f.grab(f.pool().try_acquire().unwrap(), Grab::Full)
+            .unwrap_err();
         assert_eq!(
             f.pool().free_slots(),
             POOL_SLOTS,

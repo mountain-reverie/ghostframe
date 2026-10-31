@@ -1,5 +1,6 @@
 //! The X11 backend: full-root frames, XDamage, XTest input and RandR.
 
+pub mod bands;
 #[cfg(test)]
 pub(crate) mod baseline;
 pub mod cvt;
@@ -163,6 +164,19 @@ impl super::Backend for X11Backend {
 
     fn frame_pool(&self) -> Option<ghostframe_lib::FramePool> {
         Some(self.frames.pool())
+    }
+
+    fn screen_size(&self) -> Option<(u32, u32)> {
+        Some(self.frames.size())
+    }
+
+    fn plan_grab(
+        &mut self,
+        damage: &Damage,
+        slice: Option<crate::capture::safety_net::Slice>,
+        trusted: bool,
+    ) {
+        self.frames.plan_grab(damage, slice, trusted);
     }
 
     fn arm_damage(&mut self) {
