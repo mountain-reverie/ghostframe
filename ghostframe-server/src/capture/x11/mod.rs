@@ -10,6 +10,8 @@ pub mod input;
 #[cfg(test)]
 pub(crate) mod randr_events;
 #[cfg(test)]
+mod shadow_tests;
+#[cfg(test)]
 pub(crate) mod test_support;
 
 use std::io;
@@ -31,6 +33,40 @@ pub struct X11Backend {
     display: Option<Arc<dyn DisplayController>>,
     /// Allocations of `drain_damage` (the frames own theirs).
     stats: crate::capture::tick_stats::TickStats,
+    /// Fault injection for the safety-net tests: see [`TestHooks`].
+    #[cfg(test)]
+    pub(crate) hooks: TestHooks,
+}
+
+/// Faults a test injects inside the backend, at the points a real fault would
+/// occur, so the real tick (`damage_then_grab`) runs around them.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestHooks {
+    /// Pixel rectangles whose damage is lost: removed from every drained
+    /// report, after the cursor merge and before `capture` decides anything,
+    /// the way a driver that never raises the event would.
+    pub lose_damage: Vec<(i16, i16, u16, u16)>,
+    /// Runs at the start of `capture`, after the drain: an application that
+    /// paints between the damage subtract and the grab.
+    pub before_grab: Option<Box<dyn FnMut()>>,
+}
+
+#[cfg(test)]
+impl TestHooks {
+    fn lose(&self, damage: Damage) -> Damage {
+        let Damage::Tiles(mut b) = damage else {
+            return damage;
+        };
+        for &(x, y, w, h) in &self.lose_damage {
+            b.clear_rect(x, y, w, h);
+        }
+        if b.is_empty() {
+            Damage::None
+        } else {
+            Damage::Tiles(b)
+        }
+    }
 }
 
 impl X11Backend {
@@ -100,6 +136,8 @@ impl X11Backend {
             input,
             display,
             stats: Default::default(),
+            #[cfg(test)]
+            hooks: Default::default(),
         })
     }
 }
@@ -114,6 +152,10 @@ impl super::Backend for X11Backend {
     }
 
     fn capture(&mut self, timestamp_us: u32) -> io::Result<FrameSubmission> {
+        #[cfg(test)]
+        if let Some(f) = self.hooks.before_grab.as_mut() {
+            f();
+        }
         let frame = self.frames.capture(timestamp_us);
         distrust_after_failed_capture(&frame, self.damage.as_mut());
         frame
@@ -164,7 +206,10 @@ impl super::Backend for X11Backend {
         };
         let drained = d.drain_damage(w, h);
         self.stats.allocs += d.take_allocs();
-        merge_cursor_damage(drained, &cursor_tiles, (w, h), &mut self.stats)
+        let merged = merge_cursor_damage(drained, &cursor_tiles, (w, h), &mut self.stats);
+        #[cfg(test)]
+        let merged = self.hooks.lose(merged);
+        merged
     }
 }
 
@@ -272,6 +317,7 @@ mod tests {
             input: None,
             display: None,
             stats: Default::default(),
+            hooks: Default::default(),
         };
         backend.arm_damage();
         assert!(backend.damage_armed());
@@ -332,6 +378,7 @@ mod tests {
             input: None,
             display: None,
             stats: Default::default(),
+            hooks: Default::default(),
         };
         backend.arm_damage();
 
@@ -457,6 +504,7 @@ mod tests {
                 input: None,
                 display: None,
                 stats: Default::default(),
+                hooks: Default::default(),
             },
             conn,
             root,
