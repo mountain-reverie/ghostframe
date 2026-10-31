@@ -197,16 +197,13 @@ impl super::Backend for X11Backend {
         self.damage.as_ref().is_some_and(|d| d.is_armed())
     }
 
-    /// Drained damage plus the cursor's tiles.
-    ///
-    /// The lib does not consume these hints today (see
-    /// `Damage::into_hint`); the cursor merge is here for the day it does.
     fn take_tick_stats(&mut self) -> crate::capture::tick_stats::TickStats {
         let mut s = std::mem::take(&mut self.stats);
         s.add(self.frames.take_stats());
         s
     }
 
+    /// Drained damage plus the cursor's tiles.
     fn drain_damage(&mut self) -> Damage {
         // The cursor is blended into every frame but X reports no damage for
         // it. Poll it on every drain (it is also the cursor `capture` then
