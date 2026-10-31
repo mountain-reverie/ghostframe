@@ -145,7 +145,7 @@ impl FrameBackend for ScreenBackend {
         frame: &FrameSubmission,
         escalation: &[u32],
         _want_diag: bool,
-    ) -> Result<Analysed, String> {
+    ) -> Result<Analysed, AnalyseError> {
         self.seen
             .lock()
             .unwrap()
@@ -159,7 +159,7 @@ impl FrameBackend for ScreenBackend {
                     "an unchanged tick carries no pixels"
                 );
                 if self.upload.is_none() {
-                    return Err("no upload image".into());
+                    return Err(String::from("no upload image").into());
                 }
             }
         }

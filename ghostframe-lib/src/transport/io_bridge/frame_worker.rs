@@ -59,7 +59,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::frame_backend::{
-    Analysed, Control, EscalationSlot, FrameBackend, H264Out, PixelSource, TileOut, TileRequest,
+    AnalyseError, Analysed, Control, EscalationSlot, FrameBackend, H264Out, PixelSource, TileOut,
+    TileRequest,
 };
 use crate::frame_pool::FrameBuf;
 use crate::server::FrameSubmission;
@@ -120,7 +121,7 @@ pub(super) enum FromWorker {
     /// frame.
     AnalyseFailed {
         seq: u32,
-        error: String,
+        error: AnalyseError,
     },
     H264Done {
         seq: u32,
