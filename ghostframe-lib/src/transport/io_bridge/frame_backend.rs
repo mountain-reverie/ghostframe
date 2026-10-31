@@ -57,6 +57,9 @@ pub enum Control {
     InvalidateBaseline(u32),
     /// The next H.264 frame is an IDR.
     RequestKeyframe,
+    /// A frame that named only some tile rows was dropped before the GPU
+    /// stage saw it: upload and compare the next frame whole.
+    ForgetDamage,
 }
 
 /// The GPU stage's outputs, owned.
@@ -270,6 +273,7 @@ impl FrameBackend for GpuBackend {
     fn apply(&mut self, control: Control) {
         match control {
             Control::InvalidateBaseline(n) => self.processor.invalidate_baseline(n),
+            Control::ForgetDamage => self.processor.forget_damage(),
             Control::RequestKeyframe => {
                 if let Some(enc) = self.encoder.as_mut() {
                     enc.request_keyframe();
@@ -291,11 +295,12 @@ impl FrameBackend for GpuBackend {
             Some(fd) => self
                 .processor
                 .process_frame(fd, frame.width, frame.height, frame.stride),
-            None => self.processor.process_frame_from_pixels(
+            None => self.processor.process_frame_from_pixels_damaged(
                 &frame.pixels,
                 frame.width,
                 frame.height,
                 frame.stride,
+                &frame.damage,
             ),
         };
         let analysis = result.map_err(|e| e.to_string())?;

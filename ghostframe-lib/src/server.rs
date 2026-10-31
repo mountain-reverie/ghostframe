@@ -7,6 +7,7 @@ use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
+use crate::frame_damage::FrameDamage;
 use crate::frame_pool::FrameBuf;
 use crate::transport::ghostbridge::GhostbridgeConfig;
 use crate::transport::io_bridge::IoBridge;
@@ -30,8 +31,10 @@ pub struct FrameSubmission {
     pub dmabuf_fd: Option<OwnedFd>,
     /// Capture timestamp in microseconds.
     pub timestamp_us: u32,
-    /// Optional damage hints as tile coordinates. If `None`, all tiles are checked.
-    pub damage_tiles: Option<Vec<(u32, u32)>>,
+    /// What changed since the previous submission, if the producer knows.
+    /// [`FrameDamage::Unknown`] (always safe) uploads and compares the whole
+    /// frame; `Tiles` narrows both to the tile rows it names (GPU path only).
+    pub damage: FrameDamage,
     /// Monotonic-clock timestamp (CLOCK_MONOTONIC nanoseconds) at the
     /// moment capture finished. Used by M3.5 Layer B bench to compute
     /// capture→send server-side latency interval.
@@ -309,7 +312,7 @@ mod tests {
             pixels: vec![0u8; 1920 * 1080 * 4].into(),
             dmabuf_fd: None,
             timestamp_us: 0,
-            damage_tiles: None,
+            damage: crate::frame_damage::FrameDamage::Unknown,
             capture_done_ns: 0,
         };
         assert_eq!(sub.width, 1920);

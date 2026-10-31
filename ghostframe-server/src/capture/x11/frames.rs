@@ -843,7 +843,7 @@ impl X11Frames {
             pixels,
             dmabuf_fd: None,
             timestamp_us,
-            damage_tiles: None,
+            damage: ghostframe_lib::FrameDamage::Unknown,
             capture_done_ns,
         };
         // One-shot diagnostic: dump the first frame to the path in

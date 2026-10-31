@@ -2452,6 +2452,17 @@ fn dmabuf_real_from_pixels_rejects_a_stride_shorter_than_a_row() {
 }
 
 #[test]
+fn dmabuf_real_from_pixels_rejects_a_buffer_shorter_than_the_frame() {
+    let mut p = GpuFrameProcessor::new(4096).expect(NEEDS_GPU);
+    let px = vec![0x55u8; 64 * 64 * 4];
+    // One byte short: the row copies would read past the end.
+    assert!(p
+        .process_frame_from_pixels(&px[..px.len() - 1], 64, 64, 64 * 4)
+        .is_err());
+    assert!(p.process_frame_from_pixels(&px, 64, 64, 64 * 4).is_ok());
+}
+
+#[test]
 fn dmabuf_real_nv12_buffer_is_a_whole_number_of_words_and_bad_input_costs_nothing() {
     // The NV12 shader writes u32 words: 33x17 needs 33*17 + 34*9 = 867 bytes.
     let mut p = GpuFrameProcessor::new(4096).expect(NEEDS_GPU);
