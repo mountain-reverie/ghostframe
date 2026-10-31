@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use ghostframe_lib::{GhostbridgeConfig, GhostframeServer};
 
+use crate::capture::safety_net::{NetConfig, SafetyNet};
 use crate::capture::tick_stats::thread_cpu_us;
 use crate::capture::Backend;
-use crate::config::ServerConfig;
+use crate::config::{DamageMode, ServerConfig};
 use crate::state;
 
 /// The exit code for a failed [`X11Backend::new`](crate::capture::x11::X11Backend::new).
@@ -156,6 +157,30 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
 
     tracing::info!("Server ready, entering capture loop");
 
+    // The damage safety net. `on` has no consumer yet, so it runs as shadow.
+    let mut net = cfg
+        .damage_mode
+        .net_runs()
+        .then(|| SafetyNet::new(NetConfig::for_fps(capture_fps)));
+    if net.is_some() {
+        server.feedback().enable();
+        if cfg.damage_mode == DamageMode::On {
+            tracing::warn!(
+                "GHOSTFRAME_DAMAGE_MODE=on: nothing consumes damage yet, running as shadow \
+                 (the whole screen is still grabbed and compared)"
+            );
+        }
+        tracing::info!(
+            mode = ?cfg.damage_mode,
+            sweep_every_ticks = crate::capture::safety_net::SWEEP_EVERY,
+            sweep_slices = crate::capture::safety_net::SWEEP_SLICES,
+            "damage safety net running; counters follow as `damage safety net` lines"
+        );
+    }
+    let mut feedback_buf = Vec::new();
+    // Roughly every five seconds of ticks.
+    let net_log_every = capture_fps.saturating_mul(5).max(1);
+
     let frame_interval = Duration::from_micros(1_000_000 / capture_fps);
     let mut frame_count = 0u64;
     // Tracks whether the loop is currently in idle (no-client) mode, so we
@@ -213,6 +238,12 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
                 // nobody reads -- and would need a timer to do the
                 // draining, which is the idle poll this loop no longer has.
                 backend.disarm_damage();
+                if let Some(net) = net.as_mut() {
+                    net.reset_stream();
+                    // Verdicts for the departed client's frames.
+                    server.feedback().drain_into(&mut feedback_buf);
+                    feedback_buf.clear();
+                }
                 tracing::info!(
                     "no client connected; capture loop parked until one arrives \
                      (XDamage disarmed)"
@@ -275,9 +306,27 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
         let (damage, grabbed) = crate::capture::damage_then_grab(&mut backend, timestamp_us);
         let submission = match grabbed {
             Ok(mut frame) => {
-                // A bitmap built for another screen size says nothing about
-                // this frame: the resize happened between drain and grab.
-                frame.damage_tiles = damage.into_hint_for(frame.width, frame.height);
+                if let Some(net) = net.as_mut() {
+                    server.feedback().drain_into(&mut feedback_buf);
+                    for fb in feedback_buf.drain(..) {
+                        net.ingest(fb);
+                    }
+                    net.begin_tick(
+                        frame.timestamp_us,
+                        &damage,
+                        frame.width,
+                        frame.height,
+                        backend.damage_armed(),
+                    );
+                    // Shadow: the hint is judged, never acted on. The library
+                    // still compares the whole screen.
+                    frame.damage_tiles = None;
+                } else {
+                    // A bitmap built for another screen size says nothing
+                    // about this frame: the resize happened between drain and
+                    // grab.
+                    frame.damage_tiles = damage.into_hint_for(frame.width, frame.height);
+                }
                 Some(frame)
             }
             Err(e) => {
@@ -327,6 +376,11 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
                 break;
             }
             frame_count += 1;
+            if let Some(net) = net.as_ref() {
+                if frame_count.is_multiple_of(net_log_every) {
+                    net.log_counters(cfg.damage_mode, backend.damage_armed());
+                }
+            }
             if frame_count == 1 {
                 tracing::info!("first frame submitted");
             } else if frame_count.is_multiple_of(30) {

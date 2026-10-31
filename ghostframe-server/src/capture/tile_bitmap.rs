@@ -47,6 +47,91 @@ impl TileBitmap {
         self.bits.fill(0);
     }
 
+    /// Mark every tile. Bits past the grid stay clear so `count` and `iter`
+    /// agree.
+    pub fn set_all(&mut self) {
+        let total = (self.tiles_w as usize) * (self.tiles_h as usize);
+        self.bits.fill(u64::MAX);
+        let n = self.bits.len();
+        if let Some(last) = self.bits.last_mut() {
+            let used = total - (n - 1) * 64;
+            if used < 64 {
+                *last = (1u64 << used) - 1;
+            }
+        }
+    }
+
+    /// Mark the tile rows `lo..hi` (clipped to the grid).
+    #[cfg(test)]
+    pub fn set_rows(&mut self, lo: u32, hi: u32) {
+        for ty in lo..hi.min(self.tiles_h) {
+            for tx in 0..self.tiles_w {
+                self.set(tx, ty);
+            }
+        }
+    }
+
+    /// `self |= other`; a bitmap of another screen size is ignored.
+    pub fn or_with(&mut self, other: &TileBitmap) {
+        if self.px == other.px {
+            for (a, b) in self.bits.iter_mut().zip(&other.bits) {
+                *a |= *b;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    /// `self &= !other`; a bitmap of another screen size is ignored.
+    pub fn clear_bits_of(&mut self, other: &TileBitmap) {
+        if self.px == other.px {
+            for (a, b) in self.bits.iter_mut().zip(&other.bits) {
+                *a &= !*b;
+            }
+        }
+    }
+
+    /// Become a copy of `other`, reusing the allocation when the size matches.
+    pub fn copy_from(&mut self, other: &TileBitmap) {
+        if self.px == other.px {
+            self.bits.copy_from_slice(&other.bits);
+        } else {
+            *self = other.clone();
+        }
+    }
+
+    /// Become the bitmap of `words` for a `width` x `height` screen, reusing
+    /// the allocation; `false` when the word count does not fit.
+    pub fn load_words(&mut self, width: u32, height: u32, words: &[u64]) -> bool {
+        if !self.matches(width, height) {
+            *self = Self::new(width, height);
+        }
+        if self.bits.len() != words.len() {
+            return false;
+        }
+        self.bits.copy_from_slice(words);
+        let total = (self.tiles_w as usize) * (self.tiles_h as usize);
+        let n = self.bits.len();
+        if let Some(last) = self.bits.last_mut() {
+            let used = total - (n - 1) * 64;
+            if used < 64 {
+                *last &= (1u64 << used) - 1;
+            }
+        }
+        true
+    }
+
+    /// [`TileBitmap::load_words`] into a fresh bitmap.
+    #[cfg(test)]
+    pub fn from_words(width: u32, height: u32, words: &[u64]) -> Option<Self> {
+        let mut b = Self::new(width, height);
+        b.load_words(width, height, words).then_some(b)
+    }
+
+    /// The screen size in pixels this bitmap was built for.
+    pub fn px(&self) -> (u32, u32) {
+        self.px
+    }
+
     /// Grid size in tiles.
     pub fn grid(&self) -> (u32, u32) {
         (self.tiles_w, self.tiles_h)
@@ -72,7 +157,6 @@ impl TileBitmap {
         }
     }
 
-    #[cfg(test)]
     pub fn get(&self, tx: u32, ty: u32) -> bool {
         self.index(tx, ty)
             .is_some_and(|i| self.bits[i / 64] >> (i % 64) & 1 == 1)
@@ -102,7 +186,6 @@ impl TileBitmap {
         self.bits.iter().all(|&w| w == 0)
     }
 
-    #[cfg(test)]
     pub fn count(&self) -> usize {
         self.bits.iter().map(|w| w.count_ones() as usize).sum()
     }
@@ -146,6 +229,50 @@ mod tests {
         assert_eq!(b.count(), 3);
         assert!(b.get(3, 2) && !b.get(2, 3) && !b.get(8, 0));
         assert_eq!(b.iter().collect::<Vec<_>>(), vec![(0, 0), (3, 2), (7, 7)]);
+    }
+
+    #[test]
+    fn whole_bitmap_operations_respect_the_grid() {
+        let mut a = TileBitmap::new(70, 33); // 3x2 = 6 tiles
+        a.set_all();
+        assert_eq!(a.count(), 6, "set_all must not light bits past the grid");
+        let mut b = TileBitmap::new(70, 33);
+        b.set_rows(1, 5);
+        assert_eq!(b.iter().collect::<Vec<_>>(), vec![(0, 1), (1, 1), (2, 1)]);
+        a.clear_bits_of(&b);
+        assert_eq!(a.count(), 3);
+        a.or_with(&b);
+        assert_eq!(a.count(), 6);
+        let mut c = TileBitmap::new(70, 33);
+        c.copy_from(&b);
+        assert_eq!(c, b);
+        // Words from the wire: stray high bits are masked, a wrong length refused.
+        let w = TileBitmap::from_words(70, 33, &[u64::MAX]).unwrap();
+        assert_eq!(w.count(), 6);
+        assert!(TileBitmap::from_words(70, 33, &[0, 0]).is_none());
+        // Another screen size is never merged.
+        let mut d = TileBitmap::new(66, 40);
+        d.or_with(&b);
+        assert!(d.is_empty());
+    }
+
+    /// The library's feedback bits and this bitmap must agree on the layout
+    /// (`y * cols + x`); a transposed or off-by-one layout would turn every
+    /// verdict into misses elsewhere.
+    #[test]
+    fn the_library_feedback_layout_is_this_bitmaps_layout() {
+        use ghostframe_lib::{FeedbackKind, FrameFeedback};
+        // 100x70 px: 4 x 3 tiles; flat index = y * 4 + x.
+        let mut want = TileBitmap::new(100, 70);
+        for (x, y) in [(0, 0), (3, 0), (1, 2), (3, 2)] {
+            want.set(x, y);
+        }
+        let flat: Vec<u32> = want.iter().map(|(x, y)| y * 4 + x).collect();
+        let fb = FrameFeedback::from_dirty(1, 100, 70, &flat);
+        let FeedbackKind::Dirty(words) = fb.kind else {
+            panic!("not saturated");
+        };
+        assert_eq!(TileBitmap::from_words(100, 70, &words), Some(want));
     }
 
     #[test]
