@@ -891,3 +891,78 @@ fn x11_a_dropped_verdict_makes_the_next_tick_carry_pixels() {
     let after = rig.tick_raw();
     assert_eq!(after.content, Content::Unchanged);
 }
+
+/// A grab that fails while a content-free tick keeps a free slot current costs
+/// nothing but that slot: the tick is still `Unchanged`, the slot is regrabbed
+/// in full when next used, and every pixels frame afterwards equals a fresh
+/// full grab.
+#[test]
+fn x11_a_failed_slot_refresh_leaves_no_stale_frame() {
+    use ghostframe_lib::Content;
+    let mut rig = Rig::new(Mutation::None);
+    rig.backend.set_allow_unchanged(true);
+    // Pixels frames held for a while, so all four slots get allocated.
+    let mut warm = Vec::new();
+    for i in 0..12 {
+        rig.fill(
+            Rectangle {
+                x: 10 * i as i16,
+                y: 300,
+                width: 8,
+                height: 4,
+            },
+            0x0000_00ff + i as u32,
+        );
+        warm.push(rig.tick_raw());
+        if warm.len() > 3 {
+            warm.remove(0);
+        }
+    }
+    drop(warm);
+    for _ in 0..3 {
+        rig.tick_raw();
+    }
+    // Two far-apart rows of damage, delivered in a frame the pipeline keeps,
+    // leave every other slot needing two bands.
+    for y in [2 * 32, 14 * 32] {
+        rig.fill(
+            Rectangle {
+                x: 10,
+                y,
+                width: 40,
+                height: 10,
+            },
+            0x00ff_0000 + y as u32,
+        );
+    }
+    let kept = rig.tick_raw();
+    assert_eq!(kept.content, Content::Pixels);
+    rig.backend.frames.fail_second_band_once = true;
+    let u = rig.tick_raw();
+    assert_eq!(u.content, Content::Unchanged);
+    assert!(
+        !rig.backend.frames.fail_second_band_once,
+        "the refresh grab never ran"
+    );
+    drop(kept);
+    for i in 0..14 {
+        rig.fill(
+            Rectangle {
+                x: 100,
+                y: 5 * 32 + i,
+                width: 20,
+                height: 3,
+            },
+            0x0000_ff00 + i as u32,
+        );
+        let frame = rig.tick_raw();
+        let fresh = rig.fresh();
+        if frame.content == Content::Pixels {
+            assert_eq!(
+                frame.pixels.iter().zip(&fresh).position(|(a, b)| a != b),
+                None,
+                "tick {i} after the failed refresh"
+            );
+        }
+    }
+}

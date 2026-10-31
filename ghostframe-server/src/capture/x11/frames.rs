@@ -866,11 +866,10 @@ impl X11Frames {
                 }
                 // Dropped here: the slot goes back to the pool, written.
             }
-            Err(_) => {
-                self.ring.clear();
-                self.age_floor = self.tick + 1;
-                self.last_sent = None;
-            }
+            // Nothing was lost: the grab cleared the slot's `held`, so it is
+            // regrabbed in full when next used, and no frame carried this
+            // tick's damage (there was none).
+            Err(e) => tracing::debug!(error = %e, "refreshing a free slot failed"),
         }
     }
 
