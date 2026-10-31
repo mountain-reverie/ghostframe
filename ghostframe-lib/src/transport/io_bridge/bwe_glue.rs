@@ -754,7 +754,17 @@ impl IoBridge {
             // Under the model controller the rate is the estimate. quinn's
             // window is derived from it, so `cwnd / srtt` says nothing the
             // estimate does not, and there is no hint to feed.
-            self.adaptation_context.bytes_per_us = (self.model_rate_bytes_per_s() / 1e6) as f32;
+            let bytes_per_us = (self.model_rate_bytes_per_s() / 1e6) as f32;
+            // The test override replaces the *classifier's* view of the
+            // headroom. `sample_all_path_stats` synthesises a cwnd for the
+            // quinn-hint path below, and this branch ignores the cwnd, so
+            // without this the override never reached the classifier under
+            // the model controller (the default): the headroom guard fired
+            // only once the live estimate happened to decay under the
+            // threshold, ~9 s into the session.
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            let bytes_per_us = self.test_force_bytes_per_us.unwrap_or(bytes_per_us);
+            self.adaptation_context.bytes_per_us = bytes_per_us;
             self.adaptation_context.smoothed_rtt_us = smoothed_rtt_us;
             self.adaptation_context.last_update_seq =
                 self.adaptation_context.last_update_seq.wrapping_add(1);
