@@ -223,3 +223,72 @@ full grab over 160 random ticks. Mutations, each failing that property:
 An injected miss (damage lost before the grab decides anything) shows stale
 and is repaired by the sweep within `S*k` ticks plus the pool
 (`x11_a_lost_damage_report_is_repaired_by_the_sweep`).
+
+## PR 7: content-free tick (`Content::Unchanged`), before/after
+
+`baseline::unchanged_table` (`cargo test -p ghostframe-server unchanged_table
+-- --ignored --nocapture`), same host, under `flock -o` on the shared bench
+lock, 90 ticks per run, 3 runs (seeds 1000-1002), median across runs with
+min-max for `capture_us`. "on" is PR 5/6's band grab with every tick a pixels
+frame; "on, unchanged" sends the ticks that name no damage, no cursor change
+and no sweep slice as `Unchanged`: no slot, no grab, no cursor blend. "Frame
+held" is how many ticks the harness keeps each frame before returning its slot
+(3 is a backlog; 1 is a pipeline that finishes within a tick). `capture_us on
+damage ticks` is the mean over the ticks that carry a hint: the grab part of
+damage-to-first-datagram.
+
+| layout | scene | frame held | damage_mode | capture_us (mean, min-max) | capture_us on damage ticks | cpu_us | MB grabbed/tick | KB copied/tick | unchanged ticks |
+|---|---|---|---|---|---|---|---|---|---|
+| 1080p | idle | 3 | off | 1029 (1022-1030) | - | 37 | 8.29 | 1.02 | 0 % |
+| 1080p | idle | 3 | on | 128 (127-140) | - | 40 | 0.80 | 1.54 | 0 % |
+| 1080p | idle | 3 | on, unchanged | 48 (48-49) | - | 24 | 0.19 | 1.13 | 80 % |
+| 1080p | typing | 3 | on | 197 (197-207) | 213 | 49 | 1.52 | 1.54 | 0 % |
+| 1080p | typing | 3 | on, unchanged | 121 (121-137) | 228 | 35 | 0.85 | 1.26 | 53 % |
+| 1080p | typing | 1 | on | 137 (131-140) | 168 | 42 | 1.01 | 1.54 | 0 % |
+| 1080p | typing | 1 | on, unchanged | 108 (96-112) | 187 | 34 | 0.68 | 1.26 | 53 % |
+| 4K | idle | 3 | off | 3956 (3922-3980) | - | 52 | 33.18 | 1.02 | 0 % |
+| 4K | idle | 3 | on | 353 (353-359) | - | 64 | 2.69 | 3.07 | 0 % |
+| 4K | idle | 3 | on, unchanged | 106 (105-107) | - | 31 | 0.65 | 1.43 | 80 % |
+| 4K | typing | 3 | on | 499 (491-517) | 506 | 66 | 4.12 | 3.07 | 0 % |
+| 4K | typing | 3 | on, unchanged | 334 (322-334) | 680 | 56 | 2.53 | 1.98 | 53 % |
+| 4K | typing | 1 | on | 353 (339-354) | 411 | 66 | 2.54 | 3.07 | 0 % |
+| 4K | typing | 1 | on, unchanged | 255 (251-259) | 498 | 47 | 1.88 | 1.98 | 53 % |
+
+Library side, `damage_tests::unchanged_report` (three runs, median of 14
+ticks; upload + GPU stage, microseconds, no pixels changed):
+
+| res | whole frame | `Tiles`, nothing named | `Unchanged` |
+|---|---|---|---|
+| 1080p | 3759 / 3748 / 4002 | 134 / 137 / 147 | 134 / 137 / 147 |
+| 4K | 15152 / 15184 / 15132 | 269 / 225 / 225 | 214 / 212 / 213 |
+
+Reading it:
+
+- Idle falls to the sweep floor: 80 % of ticks grab nothing, the rest one slice
+  (and the cursor image, about 1 KB, which is the O(1) per-tick floor until
+  PR 8 replaces the `GetCursorImage` poll). Per tick, against PR 5's "on":
+  `capture_us` 128 -> 48 (1080p) and 353 -> 106 (4K), grabbed bytes 0.80 ->
+  0.19 MB and 2.69 -> 0.65 MB, thread CPU 40 -> 24 us and 64 -> 31 us. Against
+  the whole-root grab it is 21x and 37x in time. The library's idle tick is
+  the O(tiles) part the design note predicts (about 0.13 ms at 1080p, 0.22 ms
+  at 4K); an `Unchanged` tick costs the same GPU time as PR 6's empty `Tiles`
+  tick, minus the pixels handed over and the slot taken.
+- Typing: the per-tick mean falls (121 vs 197 us at 1080p, 334 vs 499 at 4K),
+  but **the ticks that carry damage do not get cheaper**: 228 vs 213 us
+  (+7 %) at 1080p and 680 vs 506 us (+34 %) at 4K with a backlog, 187 vs 168
+  (+11 %) and 498 vs 411 (+21 %) with a pipeline that keeps up. A slot that
+  sat out several content-free ticks has to catch up on the sweep slices and
+  damage of all of them when the next damage arrives, so that grab is larger
+  (up to 10 MB at 4K against 4.4 MB) even though the average one is smaller.
+  Taking the cheapest free slot did not remove it (the free slots are all
+  stale). Left as is and flagged for the owner: see the open questions in the
+  PR description. The library side of a damage tick is unchanged by this PR.
+- Two defects found and fixed on the way: the 8-entry age ring made any slot
+  idle for more than 8 ticks come back with a full grab (typing on, unchanged:
+  an 8 MB grab every few ticks, 4K mean 707 us, worse than "on"); it is 32
+  entries now (about 1 KB each at 4K). And the harness held three *frames*
+  rather than three ticks of frames, which starved the pool of old slots.
+
+Correctness (not a measurement; `x11_the_library_screen_stays_exact_across_unchanged_ticks`,
+`unchanged_oracle_tests`, `damage_tests::an_unchanged_tick_*`): see the design
+note, section 3.3 "As landed (PR 7)".
