@@ -140,6 +140,11 @@ directory, so stop the service before `logout`. A node counts as joined when
 `<state_dir>/.joined` exists; started without it and without `TS_AUTHKEY`,
 `capture` exits 2 and the unit does not restart it.
 
+With `GHOSTFRAME_DAMAGE_MODE=shadow` or `on` the daemon also logs a cumulative
+`damage safety net` line every 5 s (target `ghostframe::server::damage`);
+`corrections_unswept` against `dirty_tiles` is the would-have-been miss rate
+(design note section 3.4, "As landed (PR 4)").
+
 Client-side diagnostics are printed by the browser console. **Some of them are
 dead**: `rx{...}` and `cdf53-coverage` read `window.__tileCounts` /
 `window.__cdf53Coverage`, which nothing populates since the wasm cutover, so
