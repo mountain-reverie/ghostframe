@@ -218,7 +218,12 @@ impl TileGrid {
     }
 }
 
-/// Tracks which tiles changed between consecutive frames.
+/// Tracks which tiles changed against their last-committed content.
+///
+/// `prev_tiles` is a per-tile last-committed reference: a tile is rewritten
+/// only when it is reported dirty (and not in a no-commit update), the same
+/// policy the GPU path implements in `tile_sad`. (The CPU compare is exact
+/// equality with no SAD threshold, so it is not the same rule as the GPU path: any change commits the tile, and sub-threshold drift never arises. A PR 6 oracle comparing the two must not expect identical dirty sets for small changes.)
 ///
 /// Uses a single flat `Vec<u8>` buffer to store all previous tile data,
 /// avoiding one heap allocation per tile. On the first frame (when the
