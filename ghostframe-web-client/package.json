@@ -13,10 +13,10 @@
     "test:watch": "vitest"
   },
   "devDependencies": {
-    "@types/node": "^26.5.1",
-    "@webgpu/types": "^0.1.40",
+    "@types/node": "^26.6.5",
+    "@webgpu/types": "^0.1.74",
     "typescript": "^5.5",
-    "vite": "^8.1",
+    "vite": "^8.3",
     "vitest": "^2.0"
   }
 }
