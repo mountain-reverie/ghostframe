@@ -639,3 +639,129 @@ fn oracle_holds_across_a_baseline_invalidation() {
         oracle_with(&mut a, &mut b, w, h, &frames, Some(3)).unwrap();
     }
 }
+
+// -- Content::Unchanged (PR 7) ------------------------------------------------
+
+/// The escalation forward's coefficients for `n` candidates, read back.
+fn escalation_coeffs(gpu: &GpuFrameProcessor, n: usize) -> Vec<i32> {
+    if n == 0 {
+        return Vec::new();
+    }
+    unsafe { std::slice::from_raw_parts(gpu.cdf53_escalation_coefficients_ptr, n * 3072).to_vec() }
+}
+
+/// An unchanged tick leaves what a full compare of identical pixels leaves:
+/// no dirty tile, the same NV12, analysis and reference, and an escalation
+/// forward that reads the screen (the upload image), not the SAD reference.
+#[test]
+fn an_unchanged_tick_equals_a_full_compare_of_identical_pixels() {
+    let (w, h) = (160u32, 128u32);
+    let (mut full, mut unch) = pair();
+    let mut r = Rng(77);
+    let mut px = noise_frame(w, h, 21);
+    let candidates = [3u32, 7, 12];
+    for gpu in [&mut full, &mut unch] {
+        gpu.invalidate_baseline(0);
+    }
+    step(&mut full, &px, w, h, &FrameDamage::Unknown);
+    step(&mut unch, &px, w, h, &FrameDamage::Unknown);
+    let mut esc_nonzero = 0;
+    for round in 0..6 {
+        // A change, then idle ticks. The change on tile 5 is sub-threshold
+        // after round 2 (one byte), so the reference and the screen differ.
+        if round < 3 {
+            change_tile(&mut px, w, h, 5 + round, Change::Big, &mut r);
+        } else {
+            let o = (32 * w * 4 + 4) as usize;
+            px[o] = px[o].wrapping_add(1);
+        }
+        let d = FrameDamage::Unknown;
+        assert_eq!(
+            step(&mut full, &px, w, h, &d),
+            step(&mut unch, &px, w, h, &d),
+            "round {round}: changed frame"
+        );
+        for tick in 0..3 {
+            full.set_escalation_candidates(&candidates);
+            unch.set_escalation_candidates(&candidates);
+            let want = step(&mut full, &px, w, h, &FrameDamage::Unknown);
+            let a = unsafe { unch.process_frame_inner_unchanged(w, h) }.expect("unchanged tick");
+            let got = {
+                // Same readback as `step`, from the analysis just made.
+                let uv = (a.nv12_uv_stride * h.div_ceil(2)) as usize;
+                let nv12 = unsafe {
+                    std::slice::from_raw_parts(a.nv12_data, a.nv12_uv_offset as usize + uv).to_vec()
+                };
+                (a.dirty_tiles.clone(), nv12)
+            };
+            assert!(
+                got.0.is_empty(),
+                "round {round} tick {tick}: dirty {:?}",
+                got.0
+            );
+            assert_eq!(want.dirty, got.0);
+            assert_eq!(want.nv12, got.1, "round {round} tick {tick}: NV12");
+            assert_eq!(
+                want.reference,
+                unsafe { read_reference(&unch, w, h) },
+                "round {round} tick {tick}: reference"
+            );
+            let (we, ge) = (
+                escalation_coeffs(&full, candidates.len()),
+                escalation_coeffs(&unch, candidates.len()),
+            );
+            assert_eq!(we, ge, "round {round} tick {tick}: escalation forward");
+            esc_nonzero += usize::from(ge.iter().any(|&v| v != 0));
+            // Nothing was uploaded or compared.
+            assert_eq!(unch.probe.uploaded_rows, 0);
+            assert_eq!(unch.probe.dispatched_tile_rows, 0);
+        }
+    }
+    assert!(
+        esc_nonzero > 0,
+        "the escalation forward never produced coefficients"
+    );
+}
+
+/// An unchanged tick that the upload image cannot stand in for is refused and
+/// leaves the next pixels frame to compare whole.
+#[test]
+fn an_unchanged_tick_without_a_consistent_upload_image_is_refused() {
+    let (w, h) = (160u32, 128u32);
+    let mut gpu = GpuFrameProcessor::new(256).expect(NEEDS_GPU);
+    // Nothing uploaded yet.
+    assert!(unsafe { gpu.process_frame_inner_unchanged(w, h) }.is_err());
+    let mut r = Rng(5);
+    let f0 = noise_frame(w, h, 3);
+    step(&mut gpu, &f0, w, h, &FrameDamage::Unknown);
+    // Another size.
+    assert!(unsafe { gpu.process_frame_inner_unchanged(96, 128) }.is_err());
+    // The refusal cleared the baseline, so damage is not trusted next.
+    let mut f1 = f0.clone();
+    change_tile(&mut f1, w, h, 9, Change::Big, &mut r);
+    let got = step(&mut gpu, &f1, w, h, &tiles_damage(w, h, &[], &[]));
+    assert_eq!(got.dirty, vec![9], "compared whole after a refused tick");
+    assert_eq!(gpu.probe.uploaded_rows, h);
+    // After forget_damage the upload image is not known to match the screen.
+    gpu.forget_damage();
+    assert!(unsafe { gpu.process_frame_inner_unchanged(w, h) }.is_err());
+}
+
+/// During a session-reset cushion the unchanged tick has no reference and
+/// reports every tile dirty, from the upload image; the read-back is that
+/// image.
+#[test]
+fn an_unchanged_tick_in_the_reset_cushion_reports_every_tile_from_the_upload_image() {
+    let (w, h) = (160u32, 128u32);
+    let mut gpu = GpuFrameProcessor::new(256).expect(NEEDS_GPU);
+    let f0 = noise_frame(w, h, 8);
+    step(&mut gpu, &f0, w, h, &FrameDamage::Unknown);
+    gpu.invalidate_baseline(2);
+    let a = unsafe { gpu.process_frame_inner_unchanged(w, h) }.expect("unchanged tick");
+    let (c, rws) = cols_rows(w, h);
+    assert_eq!(a.dirty_tiles.len() as u32, c * rws);
+    assert_eq!(
+        gpu.read_upload_pixels(w, h, w * 4).as_deref(),
+        Some(&f0[..])
+    );
+}
