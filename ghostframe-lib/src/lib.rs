@@ -16,6 +16,7 @@
 pub mod capture;
 pub mod config;
 pub mod encoder;
+pub mod feedback;
 pub mod ffi;
 pub mod frame_pool;
 #[cfg(test)]
@@ -24,6 +25,7 @@ pub mod server;
 pub mod tile;
 pub mod transport;
 
+pub use feedback::{FeedbackKind, FeedbackSink, FrameFeedback};
 pub use frame_pool::{FrameBuf, FramePool, FrameStorage, PoolSlot};
 pub use server::{FrameSubmission, GhostframeServer, ServerShutDown};
 pub use transport::ghostbridge::{GhostbridgeConfig, GhostbridgeError, WebServerError};

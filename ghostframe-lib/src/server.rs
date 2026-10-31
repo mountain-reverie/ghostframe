@@ -77,6 +77,8 @@ pub struct GhostframeServer {
     /// [`connected_session_count`]: GhostframeServer::connected_session_count
     /// [`wait_for_client`]: GhostframeServer::wait_for_client
     connected_session_count: watch::Receiver<usize>,
+    /// The full compare's verdict on each frame; see [`crate::feedback`].
+    feedback: Arc<crate::feedback::FeedbackSink>,
     _io_task: tokio::task::JoinHandle<()>,
     /// Republishes the cert hash list as the certificate rotates.
     _cert_task: Option<tokio::task::JoinHandle<()>>,
@@ -109,6 +111,8 @@ impl GhostframeServer {
             IoBridge::new_with_frames(&config, listen_addr, frame_rx, lib_config).await?;
         bridge.input_injector = input_injector;
         bridge.display_controller = display_controller;
+        let feedback = Arc::new(crate::feedback::FeedbackSink::new());
+        bridge.feedback = Some(feedback.clone());
         let cert_hash = bridge.cert_hash_sha256().to_owned();
         let connected_session_count = bridge.connected_session_count_handle();
 
@@ -165,6 +169,7 @@ impl GhostframeServer {
             frame_tx,
             cert_hash,
             connected_session_count,
+            feedback,
             _io_task: io_task,
             _cert_task: cert_task,
         })
@@ -208,6 +213,12 @@ impl GhostframeServer {
         frame: FrameSubmission,
     ) -> Result<(), mpsc::error::SendError<FrameSubmission>> {
         self.frame_tx.send(frame).await
+    }
+
+    /// The mailbox for the library's per-frame compare verdicts. Records
+    /// nothing until [`FeedbackSink::enable`](crate::feedback::FeedbackSink::enable).
+    pub fn feedback(&self) -> &Arc<crate::feedback::FeedbackSink> {
+        &self.feedback
     }
 
     /// Return the SHA-256 hex fingerprint of the server's TLS certificate.

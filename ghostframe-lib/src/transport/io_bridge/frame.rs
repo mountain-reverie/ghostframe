@@ -771,6 +771,7 @@ impl IoBridge {
             Some(sz) => sz,
             None => {
                 tracing::trace!(target: LOG_TARGET, seq, "process_frame_gpu: no connected sessions, dropping");
+                self.publish_dropped(&FrameMeta::of(&frame));
                 return;
             }
         };
@@ -822,6 +823,17 @@ impl IoBridge {
             max_dg_size,
             stage: InFlightStage::Analysing { pre_us },
         });
+    }
+
+    /// Tell the damage safety net this frame never reached a compare.
+    fn publish_dropped(&self, meta: &FrameMeta) {
+        if let Some(sink) = self.feedback.as_ref().filter(|s| s.is_enabled()) {
+            sink.publish(crate::feedback::FrameFeedback::dropped(
+                meta.timestamp_us,
+                meta.width,
+                meta.height,
+            ));
+        }
     }
 
     /// Queue a hardware control for the worker; it is applied, in order, before
@@ -918,6 +930,7 @@ impl IoBridge {
                 self.on_analysed(inflight, *analysed, worker_us)
             }
             FromWorker::AnalyseFailed { error, .. } => {
+                self.publish_dropped(&inflight.meta);
                 if inflight.epoch != self.session_epoch {
                     return;
                 }
@@ -975,6 +988,7 @@ impl IoBridge {
         // dirty tiles belong to a client that is gone. Its baseline advanced
         // already, so make the next frame repaint everything.
         if epoch != self.session_epoch {
+            self.publish_dropped(&inflight.meta);
             self.ensure_baseline_invalidated();
             self.send_finish(
                 inflight,
@@ -984,6 +998,15 @@ impl IoBridge {
             return;
         }
         let mut lap = Lap::new(stage_trace_enabled());
+
+        if let Some(sink) = self.feedback.as_ref().filter(|s| s.is_enabled()) {
+            sink.publish(crate::feedback::FrameFeedback::from_dirty(
+                inflight.meta.timestamp_us,
+                inflight.meta.width,
+                inflight.meta.height,
+                &analysis.dirty_tiles,
+            ));
+        }
 
         tracing::debug!(
             target: LOG_TARGET,

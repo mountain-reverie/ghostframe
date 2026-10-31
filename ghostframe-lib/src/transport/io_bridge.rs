@@ -768,6 +768,9 @@ pub struct IoBridge {
     /// `input_injector`'s pattern.
     pub(crate) display_controller:
         Option<std::sync::Arc<dyn crate::transport::display::DisplayController>>,
+    /// Where the full compare's verdict on each frame goes, for the server's
+    /// damage safety net. `None` on the paths that have no such consumer.
+    pub(crate) feedback: Option<std::sync::Arc<crate::feedback::FeedbackSink>>,
     /// Scale most recently advertised by `DisplayInfoMsg`. Carried forward
     /// into every subsequent `set_output` call so a later resize doesn't
     /// silently reset the user's DPI. Defaults to `DEFAULT_SCALE_MILLI`
@@ -1375,6 +1378,7 @@ impl IoBridge {
             was_idle: true,
             input_injector: None,
             display_controller: None,
+            feedback: None,
             display_scale_milli: DEFAULT_SCALE_MILLI,
             pending_display_mode: None,
             feedback_recv_bufs: HashMap::new(),

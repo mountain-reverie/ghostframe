@@ -7257,3 +7257,51 @@ async fn the_loss_path_counters_reach_the_instrument_summary() {
         (0, 0, 0)
     );
 }
+
+/// The compare's verdict reaches the feedback sink under the frame's own
+/// timestamp, as a mask of exactly the dirty tiles; a frame whose GPU stage
+/// failed is reported dropped. (A sink that was never enabled records
+/// nothing, which `feedback::tests` covers.)
+#[tokio::test]
+async fn the_dirty_set_and_a_failed_frame_reach_the_feedback_sink() {
+    use crate::feedback::{FeedbackKind, FeedbackSink};
+    let backend = RecordingBackend {
+        dirty_tiles: vec![1, 2],
+        ..Default::default()
+    };
+    let (mut bridge, _peer) = bridge_with_backend(backend);
+    let sink = Arc::new(FeedbackSink::new());
+    sink.enable();
+    bridge.feedback = Some(sink.clone());
+
+    let mut frame = tiny_frame(); // 64x64: a 2x2 tile grid
+    frame.timestamp_us = 42;
+    bridge.start_analysis(frame, 1, 1200, Vec::new(), 0);
+    let analysed = next_worker_message(&mut bridge).await.expect("analysed");
+    bridge.on_frame_worker_message(analysed);
+    let mut got = Vec::new();
+    sink.drain_into(&mut got);
+    assert_eq!(got.len(), 1, "one record per analysed frame");
+    assert_eq!(got[0].timestamp_us, 42);
+    assert_eq!((got[0].width, got[0].height), (64, 64));
+    assert_eq!(got[0].kind, FeedbackKind::Dirty(vec![0b0110]));
+
+    let backend = RecordingBackend {
+        analyse_err: Some("boom".into()),
+        ..Default::default()
+    };
+    let (mut bridge, _peer) = bridge_with_backend(backend);
+    bridge.feedback = Some(sink.clone());
+    let mut frame = tiny_frame();
+    frame.timestamp_us = 43;
+    bridge.start_analysis(frame, 1, 1200, Vec::new(), 0);
+    let failed = next_worker_message(&mut bridge).await.expect("failed");
+    bridge.on_frame_worker_message(failed);
+    got.clear();
+    sink.drain_into(&mut got);
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        (got[0].timestamp_us, &got[0].kind),
+        (43, &FeedbackKind::Dropped)
+    );
+}
