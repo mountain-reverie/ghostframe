@@ -39,7 +39,7 @@ use std::os::unix::io::AsRawFd;
 
 use crate::capture::dmabuf::ReadbackFrame;
 use crate::capture::gpu_pipeline::{
-    FrameAnalysis, FramePaletteEntryRaw, GpuFrameProcessor, TileAnalysis,
+    FrameAnalysis, FramePaletteEntryRaw, GpuFrameProcessor, TileAnalysis, UnchangedRefused,
 };
 use crate::encoder::h264_vaapi::FullFrameEncoder;
 use crate::server::FrameSubmission;
@@ -138,8 +138,7 @@ pub enum PixelSource {
     Frame,
     /// A read-back of the frame's DMA-BUF.
     Readback(ReadbackFrame),
-    /// Pixels the backend produced itself: the persistent upload image, for
-    /// an unchanged tick that has to re-send tiles.
+    /// Pixels the backend holds itself: none, for an unchanged tick.
     Owned(Vec<u8>),
 }
 
@@ -198,6 +197,10 @@ pub(super) fn fallback_not_in_compact_list(
         .collect()
 }
 
+/// Prefix of the `analyse` error for an unchanged tick the backend refused: a
+/// producer's claim it cannot honour, not a GPU fault.
+pub(super) const UNCHANGED_REFUSED: &str = "unchanged tick refused: ";
+
 /// See the module docs.
 pub trait FrameBackend: Send {
     /// Apply a control. Controls are applied in the order the loop issued them.
@@ -239,9 +242,6 @@ pub struct GpuBackend {
     encoder: Option<FullFrameEncoder>,
     /// The GPU outputs of the frame in flight, between `analyse` and `finish_*`.
     held: Option<FrameAnalysis>,
-    /// The screen of an unchanged tick whose analysis found tiles to send
-    /// (the first-frame branch), between `analyse` and `finish_tile`.
-    unchanged_pixels: Option<Vec<u8>>,
 }
 
 impl GpuBackend {
@@ -250,7 +250,6 @@ impl GpuBackend {
             processor,
             encoder: None,
             held: None,
-            unchanged_pixels: None,
         }
     }
 
@@ -296,7 +295,6 @@ impl FrameBackend for GpuBackend {
         want_diag: bool,
     ) -> Result<Analysed, String> {
         self.held = None;
-        self.unchanged_pixels = None;
         self.processor.set_escalation_candidates(escalation);
         let raw_fd = frame.dmabuf_fd.as_ref().map(|fd| fd.as_raw_fd());
         let result = match raw_fd {
@@ -314,20 +312,10 @@ impl FrameBackend for GpuBackend {
                 &frame.damage,
             ),
         };
-        let analysis = result.map_err(|e| e.to_string())?;
-        // Nothing changed, yet tiles are to be sent (no reference yet): they
-        // come from the upload image, which is what the screen shows.
-        if frame.content == crate::frame_damage::Content::Unchanged
-            && !analysis.dirty_tiles.is_empty()
-        {
-            self.unchanged_pixels =
-                self.processor
-                    .read_upload_pixels(frame.width, frame.height, frame.stride);
-            if self.unchanged_pixels.is_none() {
-                return Err("unchanged tick: the upload image could not be read back".into());
-            }
-        }
-
+        let analysis = result.map_err(|e| match e.downcast_ref::<UnchangedRefused>() {
+            Some(r) => format!("{UNCHANGED_REFUSED}{r}"),
+            None => e.to_string(),
+        })?;
         let ta = analysis.tile_analysis_slice();
         let dirty_analysis = analysis
             .dirty_tiles
@@ -415,10 +403,8 @@ impl FrameBackend for GpuBackend {
         // Source for tile pixel extraction. The CPU path populates
         // `frame.pixels`; the GPU/DMA-BUF path leaves it empty.
         let pixels = if frame.content == crate::frame_damage::Content::Unchanged {
-            // No dirty tile needs pixels unless the analysis read them back.
-            Ok(PixelSource::Owned(
-                self.unchanged_pixels.take().unwrap_or_default(),
-            ))
+            // Nothing is dirty on an unchanged tick, so nothing reads pixels.
+            Ok(PixelSource::Owned(Vec::new()))
         } else if !frame.pixels.is_empty() {
             Ok(PixelSource::Frame)
         } else {

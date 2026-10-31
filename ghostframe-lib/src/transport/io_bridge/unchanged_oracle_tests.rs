@@ -234,7 +234,7 @@ impl FrameBackend for ScreenBackend {
             .collect();
         TileOut {
             pixels: Ok(if frame.content == Content::Unchanged {
-                PixelSource::Owned(up)
+                PixelSource::Owned(Vec::new())
             } else {
                 PixelSource::Frame
             }),
