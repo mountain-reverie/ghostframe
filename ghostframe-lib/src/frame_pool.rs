@@ -98,6 +98,33 @@ impl FramePool {
         }
     }
 
+    /// [`try_acquire`](Self::try_acquire), taking the free storage for which
+    /// `cost` is smallest (the latest returned among equals) instead of the
+    /// one returned last. A producer whose storage remembers when it was last
+    /// written can price what each would need refreshed (buffer age) and take
+    /// the cheapest. A slot with no storage yet is taken only when no free
+    /// storage exists.
+    pub fn try_acquire_cheapest(
+        &self,
+        mut cost: impl FnMut(&dyn FrameStorage) -> u64,
+    ) -> Option<PoolSlot> {
+        let permit = match self.inner.permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) | Err(TryAcquireError::Closed) => return None,
+        };
+        let mut free = self.inner.free.lock().unwrap_or_else(|e| e.into_inner());
+        let best = (0..free.len())
+            .rev()
+            .min_by_key(|&i| cost(free[i].as_ref()));
+        let storage = best.map(|i| free.swap_remove(i));
+        drop(free);
+        Some(PoolSlot {
+            permit: Some(permit),
+            storage,
+            pool: self.inner.clone(),
+        })
+    }
+
     /// Wait for a slot.
     pub async fn acquire(&self) -> PoolSlot {
         // The semaphore is never closed, so this cannot fail.
@@ -336,6 +363,28 @@ mod tests {
         // The same allocation comes back: nothing was allocated again.
         let slot = pool.try_acquire().unwrap();
         assert_eq!(slot.storage().unwrap().bytes().as_ptr(), ptr);
+    }
+
+    #[test]
+    fn try_acquire_cheapest_takes_the_cheapest_free_storage_and_keeps_the_others() {
+        let pool = FramePool::new(4);
+        // Three slots written with costs 5, 2, 9, returned in that order.
+        let frames: Vec<_> = [5u8, 2, 9].into_iter().map(|v| buf(&pool, v)).collect();
+        drop(frames);
+        let cost = |s: &dyn FrameStorage| u64::from(s.bytes()[0]);
+        let a = pool.try_acquire_cheapest(cost).unwrap();
+        assert_eq!(a.storage().unwrap().bytes()[0], 2);
+        let b = pool.try_acquire_cheapest(cost).unwrap();
+        assert_eq!(b.storage().unwrap().bytes()[0], 5);
+        let c = pool.try_acquire_cheapest(cost).unwrap();
+        assert_eq!(c.storage().unwrap().bytes()[0], 9);
+        // The fourth slot was never allocated.
+        let d = pool.try_acquire_cheapest(cost).unwrap();
+        assert!(d.storage().is_none());
+        assert!(
+            pool.try_acquire_cheapest(cost).is_none(),
+            "all four are out"
+        );
     }
 
     #[test]
