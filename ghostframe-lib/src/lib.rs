@@ -18,6 +18,7 @@ pub mod config;
 pub mod encoder;
 pub mod feedback;
 pub mod ffi;
+pub mod frame_damage;
 pub mod frame_pool;
 #[cfg(test)]
 pub(crate) mod gpu_test_lock;
@@ -26,6 +27,7 @@ pub mod tile;
 pub mod transport;
 
 pub use feedback::{FeedbackKind, FeedbackSink, FrameFeedback};
+pub use frame_damage::{FrameDamage, TileBits};
 pub use frame_pool::{FrameBuf, FramePool, FrameStorage, PoolSlot};
 pub use server::{FrameSubmission, GhostframeServer, ServerShutDown};
 pub use transport::ghostbridge::{GhostbridgeConfig, GhostbridgeError, WebServerError};

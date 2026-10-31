@@ -15,6 +15,8 @@ use super::super::pipeline_builder::{
     alloc_host_readback_buffer_mapped, fail_point, find_memory_type, note_released, Defer,
 };
 use super::*;
+use crate::frame_damage::RowRun;
+use crate::tile::TILE_SIZE;
 
 /// Build a whole-queue-family-ignoring [`vk::BufferMemoryBarrier`] at offset 0.
 fn buf_barrier(
@@ -80,8 +82,18 @@ enum StageBinding {
 /// How `GpuFrameProcessor::record_stage` dispatches. `Skip` still binds
 /// and pushes (used by the cdf53-diag skip logic).
 #[derive(Clone, Copy)]
-enum StageDispatch {
+enum StageDispatch<'a> {
     Direct(u32, u32, u32),
+    /// One dispatch per run of tile rows: `cols` workgroups wide, a run
+    /// `(first, count)` being `count * unit` workgroup rows from `first *
+    /// unit`, the last run cut at `limit` workgroup rows (a partial bottom
+    /// tile row). `unit` is workgroup rows per tile row.
+    Runs {
+        cols: u32,
+        runs: &'a [RowRun],
+        unit: u32,
+        limit: u32,
+    },
     Indirect(vk::Buffer),
     Skip,
 }
@@ -128,7 +140,7 @@ impl GpuFrameProcessor {
 
     /// End-of-frame: submit `cmd` (already `end_command_buffer`ed) and block
     /// until the GPU is done with it.
-    unsafe fn submit_frame_cmd_and_wait(
+    pub(super) unsafe fn submit_frame_cmd_and_wait(
         &self,
         cmd: vk::CommandBuffer,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -214,6 +226,106 @@ impl GpuFrameProcessor {
 // process_frame() — main public API
 // ---------------------------------------------------------------------------
 
+/// Most dispatches a damaged frame makes per stage; runs beyond it are merged
+/// smallest gap first, which only adds tiles to compare.
+const MAX_DISPATCH_RUNS: usize = 16;
+
+/// Merge `runs` (sorted, disjoint tile-row runs) into at most `max` by
+/// joining the neighbours with the smallest gap between them first. The result
+/// covers every row of the input, plus the gap rows it joined.
+pub(super) fn merge_runs(runs: &[RowRun], max: usize) -> Vec<RowRun> {
+    let mut out = runs.to_vec();
+    while out.len() > max.max(1) {
+        let i = (0..out.len() - 1)
+            .min_by_key(|&i| out[i + 1].0 - (out[i].0 + out[i].1))
+            .expect("two or more runs");
+        let end = out[i + 1].0 + out[i + 1].1;
+        out[i].1 = end - out[i].0;
+        out.remove(i + 1);
+    }
+    out
+}
+
+fn check_pixels(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // A stride below one row of pixels would leave the tail of every GPU
+    // row uninitialised and the frame would be garbage, not an error.
+    if (stride as u64) < (width as u64) * 4 {
+        return Err(format!(
+            "import_pixels: stride {stride} < width*4 = {}",
+            (width as u64) * 4
+        )
+        .into());
+    }
+    let required = (stride as usize) * (height as usize);
+    if pixels.len() < required {
+        return Err(format!(
+            "import_pixels: pixels.len()={} < stride*height={}",
+            pixels.len(),
+            required
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Copy rows `rows` of `src` (pitch `src_pitch`) to `dst` (pitch `dst_pitch`,
+/// pointing at row 0), `width * 4` bytes of each; the source padding is not
+/// copied.
+///
+/// # Safety
+///
+/// `dst` must be valid for `dst_pitch` bytes per row over `rows`, and `src`
+/// must hold `rows.end` rows of `src_pitch` bytes.
+unsafe fn copy_rows(
+    src: &[u8],
+    src_pitch: usize,
+    dst: *mut u8,
+    dst_pitch: usize,
+    width: u32,
+    rows: std::ops::Range<u32>,
+) {
+    let row_bytes = (width as usize * 4).min(dst_pitch);
+    if src_pitch == dst_pitch && row_bytes == src_pitch {
+        let first = rows.start as usize * src_pitch;
+        let n = rows.len() * src_pitch;
+        std::ptr::copy_nonoverlapping(src.as_ptr().add(first), dst.add(first), n);
+        return;
+    }
+    for row in rows {
+        let row = row as usize;
+        std::ptr::copy_nonoverlapping(
+            src.as_ptr().add(row * src_pitch),
+            dst.add(row * dst_pitch),
+            row_bytes,
+        );
+    }
+}
+
+impl UploadImage {
+    /// Write rows `rows` of `pixels` into the persistent image.
+    unsafe fn copy_rows(
+        &mut self,
+        pixels: &[u8],
+        stride: u32,
+        width: u32,
+        rows: std::ops::Range<u32>,
+    ) {
+        copy_rows(
+            pixels,
+            stride as usize,
+            self.map.add(self.offset),
+            self.row_pitch,
+            width,
+            rows,
+        );
+    }
+}
+
 impl GpuFrameProcessor {
     pub(super) unsafe fn process_frame_inner(
         &mut self,
@@ -259,6 +371,9 @@ impl GpuFrameProcessor {
 
         // Ensure the NV12 output buffer is allocated at the right size.
         self.ensure_nv12_buffer(width, height)?;
+        // This frame bypasses the upload image, which no longer mirrors the
+        // last frame the NV12 buffer and analysis describe.
+        self.damage_baseline = false;
 
         // Import DMA-BUF as VkImage. This is transient: we destroy it at the
         // end of this function. We never reuse it as the SAD `prev_image`
@@ -288,7 +403,8 @@ impl GpuFrameProcessor {
         };
         // Result must always destroy `current` at end. Use a closure-style
         // cleanup by carrying it forward and explicitly destroying.
-        let result = self.process_frame_with_imported(&current, geom, escalation_count_this_frame);
+        let result =
+            self.process_frame_with_imported(&current, geom, escalation_count_this_frame, None);
         // Always clean up the imported DMA-BUF VkImage (transient).
         self.destroy_prev_frame(current);
         result
@@ -307,20 +423,42 @@ impl GpuFrameProcessor {
         height: u32,
         stride: u32,
     ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
+        self.process_frame_inner_from_pixels_damaged(
+            pixels,
+            width,
+            height,
+            stride,
+            &FrameDamage::Unknown,
+        )
+    }
+
+    /// [`process_frame_inner_from_pixels`](Self::process_frame_inner_from_pixels)
+    /// told what changed. The pixels go into a persistent upload image, and
+    /// when `damage` names tile rows (and the last frame left the upload image,
+    /// NV12 buffer and analysis consistent) only those rows are copied and
+    /// compared; SAD decides over every tile in them. Anything else uploads
+    /// and compares the whole frame.
+    pub(super) unsafe fn process_frame_inner_from_pixels_damaged(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+        damage: &FrameDamage,
+    ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
         #[cfg(test)]
         let _gpu = crate::gpu_test_lock::lock();
-        // Reject bad input before any state changes (staged escalation count,
-        // baseline, NV12 buffer): a rejected frame must cost nothing.
+        // Read, then clear: any way out below but the last leaves the
+        // baseline unproven, because this frame's rows were not uploaded.
+        let mut baseline = std::mem::replace(&mut self.damage_baseline, false);
+        // Reject bad input before any other state changes (staged escalation
+        // count, NV12 buffer, upload image). The baseline flag is already
+        // cleared above, so a rejected frame costs one whole-frame compare.
         if width == 0 || height == 0 {
             return Err(format!("from-pixels frame has a zero dimension: {width}x{height}").into());
         }
-        if (stride as u64) < (width as u64) * 4 {
-            return Err(format!(
-                "from-pixels stride {stride} < width*4 = {}",
-                (width as u64) * 4
-            )
-            .into());
-        }
+        // The row copies below read `stride * height` bytes unchecked.
+        check_pixels(pixels, width, height, stride)?;
 
         let escalation_count_this_frame = self.staged_escalation_count;
         self.staged_escalation_count = 0;
@@ -340,20 +478,116 @@ impl GpuFrameProcessor {
             if let Some(prev) = self.prev_image.take() {
                 self.destroy_prev_frame(prev);
             }
+            if let Some(up) = self.upload.take() {
+                self.destroy_upload(up);
+            }
+            baseline = false;
             self.last_width = width;
             self.last_height = height;
         }
 
         self.ensure_nv12_buffer(width, height)?;
 
-        let current = self.import_pixels(pixels, width, height, stride)?;
-        let result = self.process_frame_with_imported(&current, geom, escalation_count_this_frame);
-        self.destroy_prev_frame(current);
-        result
+        let mut up = match self.upload.take() {
+            Some(up) => up,
+            None => self.create_upload(width, height)?,
+        };
+        // Tile rows to upload; `None` is the whole frame.
+        let runs = if baseline {
+            damage.upload_runs(width, height)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        let t_start = std::time::Instant::now();
+        match &runs {
+            Some(runs) => {
+                for &(first, count) in runs {
+                    let y0 = first * TILE_SIZE;
+                    let y1 = ((first + count) * TILE_SIZE).min(height);
+                    up.copy_rows(pixels, stride, width, y0..y1);
+                }
+            }
+            None => up.copy_rows(pixels, stride, width, 0..height),
+        }
+        // A frame with no reference compares every tile whatever was named.
+        let dispatch_runs = match (&runs, self.prev_image.is_some()) {
+            (Some(r), true) => Some(merge_runs(r, MAX_DISPATCH_RUNS)),
+            _ => None,
+        };
+        #[cfg(test)]
+        let t_copied = std::time::Instant::now();
+        let result = self.process_frame_with_imported(
+            &up.frame,
+            geom,
+            escalation_count_this_frame,
+            dispatch_runs.as_deref(),
+        );
+        #[cfg(test)]
+        {
+            let t_done = std::time::Instant::now();
+            self.probe = DamageProbe {
+                upload_us: t_copied.duration_since(t_start).as_micros() as u64,
+                gpu_us: t_done.duration_since(t_copied).as_micros() as u64,
+                uploaded_rows: match &runs {
+                    Some(r) => r
+                        .iter()
+                        .map(|&(f, n)| ((f + n) * TILE_SIZE).min(height) - f * TILE_SIZE)
+                        .sum(),
+                    None => height,
+                },
+                dispatched_tile_rows: match &dispatch_runs {
+                    Some(r) => r.iter().map(|&(_, n)| n).sum(),
+                    None => geom.rows,
+                },
+            };
+        }
+        match result {
+            Ok(analysis) => {
+                up.frame.layout = vk::ImageLayout::GENERAL;
+                self.upload = Some(up);
+                self.damage_baseline = true;
+                Ok(analysis)
+            }
+            Err(e) => {
+                self.destroy_upload(up);
+                Err(e)
+            }
+        }
+    }
+
+    /// Allocate and map the persistent upload image for `width` x `height`.
+    unsafe fn create_upload(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Result<UploadImage, Box<dyn std::error::Error>> {
+        let (frame, offset, row_pitch) = self.create_linear_image(width, height)?;
+        let frame_guard = Defer::new(|| self.free_linear_image(&frame));
+        let map =
+            self.device
+                .map_memory(frame.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
+                as *mut u8;
+        frame_guard.disarm();
+        Ok(UploadImage {
+            frame,
+            map,
+            offset,
+            row_pitch,
+        })
+    }
+
+    /// Free the upload image and its mapping.
+    pub(super) unsafe fn destroy_upload(&self, up: UploadImage) {
+        self.device.unmap_memory(up.frame.memory);
+        self.destroy_prev_frame(up.frame);
     }
 
     /// Run SAD + NV12 + snapshot-copy against an already-imported DMA-BUF
-    /// VkImage. Splits out the destruction of `current` from
+    /// VkImage. With `runs` (subsequent frames only) the SAD, NV12 and
+    /// analysis stages cover just those tile rows and every other tile reads
+    /// as clean; `current` must then differ from the last frame only inside
+    /// them, which the persistent upload image guarantees. Splits out the destruction of `current` from
     /// [`process_frame_inner`] so the cleanup path is bullet-proof regardless
     /// of which step errors out.
     unsafe fn process_frame_with_imported(
@@ -361,6 +595,7 @@ impl GpuFrameProcessor {
         current: &PrevFrame,
         geom: FrameGeometry,
         escalation_count: u32,
+        runs: Option<&[RowRun]>,
     ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
         let FrameGeometry {
             width,
@@ -502,7 +737,7 @@ impl GpuFrameProcessor {
         };
         let barriers = [
             vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::PREINITIALIZED)
+                .old_layout(current.layout)
                 .new_layout(vk::ImageLayout::GENERAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -539,10 +774,46 @@ impl GpuFrameProcessor {
             &barriers[usize::from(acquired)..],
         );
 
+        // Stage dispatches: the whole grid, or only the uploaded tile rows.
+        // Tiles outside the runs are not dispatched, so the SAD of every one
+        // of them must read zero (clean): clear the host-visible buffer, which
+        // still holds the last frame's scores.
+        let (sad_dispatch, nv12_dispatch, analysis_dispatch) = match runs {
+            None => (
+                StageDispatch::Direct(cols, rows, 1),
+                StageDispatch::Direct(width.div_ceil(2), height.div_ceil(2), 1),
+                StageDispatch::Direct(cols, rows, 1),
+            ),
+            Some(runs) => {
+                std::ptr::write_bytes(self.sad_buf.ptr, 0, tile_count as usize);
+                // One tile row is 16 NV12 workgroup rows (32 px / 2).
+                (
+                    StageDispatch::Runs {
+                        cols,
+                        runs,
+                        unit: 1,
+                        limit: rows,
+                    },
+                    StageDispatch::Runs {
+                        cols: width.div_ceil(2),
+                        runs,
+                        unit: TILE_SIZE / 2,
+                        limit: height.div_ceil(2),
+                    },
+                    StageDispatch::Runs {
+                        cols,
+                        runs,
+                        unit: 1,
+                        limit: rows,
+                    },
+                )
+            }
+        };
+
         // 2. SAD dispatch
         let sad_push: [u32; 4] = [width, height, cols, SAD_THRESHOLD];
         let sad_ds_guard =
-            self.run_sad_stage(cmd, current.view, prev_view, &sad_push, (cols, rows, 1))?;
+            self.run_sad_stage(cmd, current.view, prev_view, &sad_push, sad_dispatch)?;
 
         // 3. No barrier needed between SAD and NV12 dispatches:
         //    - both read `current.image` (read-after-read is hazard-free),
@@ -558,20 +829,15 @@ impl GpuFrameProcessor {
 
         // 4. NV12 dispatch
         let nv12_push: [u32; 5] = [width, height, nv12_y_stride, nv12_uv_offset, nv12_uv_stride];
-        let nv12_ds_guard = self.run_nv12_stage(
-            cmd,
-            current.view,
-            nv12_buffer,
-            &nv12_push,
-            (width.div_ceil(2), height.div_ceil(2), 1),
-        )?;
+        let nv12_ds_guard =
+            self.run_nv12_stage(cmd, current.view, nv12_buffer, &nv12_push, nv12_dispatch)?;
 
         // 4b. Analysis dispatch. No barrier needed vs SAD/NV12 — all read
         // current_frame read-only and write to disjoint buffers; the final
         // HOST-readback barrier covers all three output buffers.
         let analysis_push: [u32; 3] = [width, height, cols];
         let analysis_ds_guard =
-            self.run_analysis_stage(cmd, current.view, &analysis_push, (cols, rows, 1))?;
+            self.run_analysis_stage(cmd, current.view, &analysis_push, analysis_dispatch)?;
 
         // Inter-dispatch barrier: SAD + tile_analysis writes must be visible to Stage 1.5a reads.
         let buf_barrier_inputs = [
@@ -759,7 +1025,7 @@ impl GpuFrameProcessor {
         };
         // Transition current image PREINITIALIZED → GENERAL
         let img_barrier = [vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::PREINITIALIZED)
+            .old_layout(current.layout)
             .new_layout(vk::ImageLayout::GENERAL)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -786,7 +1052,7 @@ impl GpuFrameProcessor {
             current.view,
             nv12_buffer,
             &nv12_push,
-            (width.div_ceil(2), height.div_ceil(2), 1),
+            StageDispatch::Direct(width.div_ceil(2), height.div_ceil(2), 1),
         )?;
 
         // Analysis dispatch. No barrier needed vs NV12 — both read `current`
@@ -796,8 +1062,12 @@ impl GpuFrameProcessor {
         // the subsequent-frames branch comment at the SAD/NV12/Analysis
         // dispatch trio.
         let analysis_push: [u32; 3] = [width, height, cols];
-        let analysis_ds_guard =
-            self.run_analysis_stage(cmd, current.view, &analysis_push, (cols, rows, 1))?;
+        let analysis_ds_guard = self.run_analysis_stage(
+            cmd,
+            current.view,
+            &analysis_push,
+            StageDispatch::Direct(cols, rows, 1),
+        )?;
 
         // ============================================================
         // Stages 1.5–3: PalRle compact, indirect args, palette fold,
@@ -1242,25 +1512,45 @@ impl GpuFrameProcessor {
         height: u32,
         stride: u32,
     ) -> Result<PrevFrame, Box<dyn std::error::Error>> {
-        // A stride below one row of pixels would leave the tail of every GPU
-        // row uninitialised and the frame would be garbage, not an error.
-        if (stride as u64) < (width as u64) * 4 {
-            return Err(format!(
-                "import_pixels: stride {stride} < width*4 = {}",
-                (width as u64) * 4
-            )
-            .into());
-        }
-        let required = (stride as usize) * (height as usize);
-        if pixels.len() < required {
-            return Err(format!(
-                "import_pixels: pixels.len()={} < stride*height={}",
-                pixels.len(),
-                required
-            )
-            .into());
-        }
+        check_pixels(pixels, width, height, stride)?;
+        let (frame, gpu_offset, gpu_row_pitch) = self.create_linear_image(width, height)?;
+        // Every `?` below releases what exists so far (disarmed on success).
+        let frame_guard = Defer::new(|| self.free_linear_image(&frame));
 
+        // Map and memcpy row-by-row.
+        let map_ptr =
+            self.device
+                .map_memory(frame.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
+                as *mut u8;
+        copy_rows(
+            pixels,
+            stride as usize,
+            map_ptr.add(gpu_offset),
+            gpu_row_pitch,
+            width,
+            0..height,
+        );
+        self.device.unmap_memory(frame.memory);
+        frame_guard.disarm();
+        Ok(frame)
+    }
+
+    /// Release what [`create_linear_image`](Self::create_linear_image) made.
+    unsafe fn free_linear_image(&self, f: &PrevFrame) {
+        self.device.destroy_image_view(f.view, None);
+        self.device.destroy_image(f.image, None);
+        self.device.free_memory(f.memory, None);
+    }
+
+    /// A HOST_VISIBLE | HOST_COHERENT LINEAR STORAGE `B8G8R8A8_UNORM` image
+    /// with its view, in `PREINITIALIZED`, plus the byte offset of row 0 and
+    /// the row pitch the driver chose (LINEAR images may pad rows). Nothing is
+    /// mapped or written.
+    unsafe fn create_linear_image(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Result<(PrevFrame, usize, usize), Box<dyn std::error::Error>> {
         // Create LINEAR STORAGE image first so we can query its real row pitch.
         let image_ci = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -1302,29 +1592,12 @@ impl GpuFrameProcessor {
         fail_point("import_pixels:map")?;
 
         // Query subresource layout so we can copy row-by-row at the GPU's
-        // expected row pitch (LINEAR images may pad rows for alignment).
+        // expected row pitch.
         let subresource = vk::ImageSubresource::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .mip_level(0)
             .array_layer(0);
         let sl = self.device.get_image_subresource_layout(image, subresource);
-        let gpu_row_pitch = sl.row_pitch as usize;
-        let gpu_offset = sl.offset as usize;
-
-        // Map and memcpy row-by-row.
-        let map_ptr =
-            self.device
-                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
-                as *mut u8;
-        let src_row_pitch = stride as usize;
-        // Copy the pixels, not the source padding.
-        let copy_bytes_per_row = (width as usize * 4).min(gpu_row_pitch);
-        for row in 0..(height as usize) {
-            let src = pixels.as_ptr().add(row * src_row_pitch);
-            let dst = map_ptr.add(gpu_offset + row * gpu_row_pitch);
-            std::ptr::copy_nonoverlapping(src, dst, copy_bytes_per_row);
-        }
-        self.device.unmap_memory(memory);
 
         // Create VkImageView.
         let view_ci = vk::ImageViewCreateInfo::default()
@@ -1348,15 +1621,19 @@ impl GpuFrameProcessor {
         image_guard.disarm();
         memory_guard.disarm();
 
-        Ok(PrevFrame {
-            image,
-            memory,
-            view,
-            layout: vk::ImageLayout::PREINITIALIZED,
-            width,
-            height,
-            ingest: None,
-        })
+        Ok((
+            PrevFrame {
+                image,
+                memory,
+                view,
+                layout: vk::ImageLayout::PREINITIALIZED,
+                width,
+                height,
+                ingest: None,
+            },
+            sl.offset as usize,
+            sl.row_pitch as usize,
+        ))
     }
 
     /// Allocate an own (non-DMA-BUF, DEVICE_LOCAL) `B8G8R8A8_UNORM` image used
@@ -1390,7 +1667,11 @@ impl GpuFrameProcessor {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_DST)
+            .usage(
+                vk::ImageUsageFlags::STORAGE
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::TRANSFER_SRC,
+            )
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
@@ -1472,7 +1753,7 @@ impl GpuFrameProcessor {
         stage: &ComputeStage,
         bindings: &[StageBinding],
         push: &[u32],
-        dispatch: StageDispatch,
+        dispatch: StageDispatch<'_>,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
         debug_assert!(bindings.len() <= MAX_STAGE_BINDINGS);
         // Allocate one descriptor set from the pool. The returned guard frees
@@ -1546,6 +1827,20 @@ impl GpuFrameProcessor {
         }
         match dispatch {
             StageDispatch::Direct(x, y, z) => self.device.cmd_dispatch(cmd, x, y, z),
+            StageDispatch::Runs {
+                cols,
+                runs,
+                unit,
+                limit,
+            } => {
+                for &(first, count) in runs {
+                    let base = first * unit;
+                    let n = (count * unit).min(limit.saturating_sub(base));
+                    if n > 0 {
+                        self.device.cmd_dispatch_base(cmd, 0, base, 0, cols, n, 1);
+                    }
+                }
+            }
             StageDispatch::Indirect(buffer) => self.device.cmd_dispatch_indirect(cmd, buffer, 0),
             StageDispatch::Skip => {}
         }
@@ -1578,7 +1873,7 @@ impl GpuFrameProcessor {
         current_view: vk::ImageView,
         prev_view: vk::ImageView,
         push_constants: &[u32],
-        workgroups: (u32, u32, u32),
+        dispatch: StageDispatch<'_>,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
         self.record_stage(
             cmd,
@@ -1589,7 +1884,7 @@ impl GpuFrameProcessor {
                 StageBinding::Buffer(self.sad_buf.buffer),
             ],
             push_constants,
-            StageDispatch::Direct(workgroups.0, workgroups.1, workgroups.2),
+            dispatch,
         )
     }
 
@@ -1620,7 +1915,7 @@ impl GpuFrameProcessor {
         current_view: vk::ImageView,
         nv12_buffer: vk::Buffer,
         push_constants: &[u32],
-        workgroups: (u32, u32, u32),
+        dispatch: StageDispatch<'_>,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
         // NV12 shader: workgroup = 2x2 pixels, dispatch = (width/2, height/2, 1)
         self.record_stage(
@@ -1631,7 +1926,7 @@ impl GpuFrameProcessor {
                 StageBinding::Buffer(nv12_buffer),
             ],
             push_constants,
-            StageDispatch::Direct(workgroups.0, workgroups.1, workgroups.2),
+            dispatch,
         )
     }
 
@@ -1658,7 +1953,7 @@ impl GpuFrameProcessor {
         cmd: vk::CommandBuffer,
         current_view: vk::ImageView,
         push_constants: &[u32],
-        workgroups: (u32, u32, u32),
+        dispatch: StageDispatch<'_>,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
         self.record_stage(
             cmd,
@@ -1668,7 +1963,7 @@ impl GpuFrameProcessor {
                 StageBinding::Buffer(self.analysis_buf.buffer),
             ],
             push_constants,
-            StageDispatch::Direct(workgroups.0, workgroups.1, workgroups.2),
+            dispatch,
         )
     }
 
@@ -3189,5 +3484,36 @@ impl GpuFrameProcessor {
         })();
         self.destroy_prev_frame(current);
         result
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::merge_runs;
+
+    #[test]
+    fn few_runs_are_left_alone() {
+        let runs = [(0, 2), (5, 1), (9, 3)];
+        assert_eq!(merge_runs(&runs, 3), runs.to_vec());
+        assert_eq!(merge_runs(&[], 3), vec![]);
+    }
+
+    #[test]
+    fn the_smallest_gap_is_joined_first_and_every_row_stays_covered() {
+        // Gaps: 1 (rows 2), 5, 1 (row 12).
+        let runs = [(0, 2), (3, 1), (9, 2), (12, 1)];
+        let m = merge_runs(&runs, 3);
+        assert_eq!(m, vec![(0, 4), (9, 2), (12, 1)]);
+        let m = merge_runs(&runs, 2);
+        assert_eq!(m, vec![(0, 4), (9, 4)]);
+        let m = merge_runs(&runs, 1);
+        assert_eq!(m, vec![(0, 13)]);
+        for out in [merge_runs(&runs, 3), merge_runs(&runs, 2), m] {
+            for &(f, n) in &runs {
+                for r in f..f + n {
+                    assert!(out.iter().any(|&(of, on)| r >= of && r < of + on));
+                }
+            }
+        }
     }
 }

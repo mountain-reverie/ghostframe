@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::io;
 
-use ghostframe_lib::FrameBuf;
+use ghostframe_lib::{FrameBuf, FrameDamage};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{ChangeGCAux, ConnectionExt, CreateGCAux, Rectangle};
 use x11rb::rust_connection::RustConnection;
@@ -55,6 +55,8 @@ pub(crate) struct Rig {
     held: VecDeque<FrameBuf>,
     /// How many frames `held` keeps; 0 returns each slot at once.
     pub hold: usize,
+    /// The previous delivered frame, for the named-rows check.
+    prev: Option<Vec<u8>>,
     size: (u16, u16),
 }
 
@@ -64,6 +66,10 @@ pub(crate) struct TickOut {
     pub stats: TickStats,
     /// First differing byte against the fresh full grab, if any.
     pub mismatch: Option<usize>,
+    /// What the library was told, and the first tile that differs from the
+    /// previous delivered frame although no tile in its row was named.
+    pub damage: FrameDamage,
+    pub unnamed_change: Option<u32>,
 }
 
 impl Rig {
@@ -102,6 +108,7 @@ impl Rig {
             ts: 1000,
             held: VecDeque::new(),
             hold: 3,
+            prev: None,
             size: (w, h),
         }
     }
@@ -140,6 +147,8 @@ impl Rig {
             .iter()
             .zip(fresh.pixels.iter())
             .position(|(a, b)| a != b);
+        let unnamed_change = self.unnamed_change(&frame.damage, frame.pixels.as_ref());
+        self.prev = Some(frame.pixels.to_vec());
         self.held.push_back(frame.pixels);
         while self.held.len() > self.hold {
             self.held.pop_front();
@@ -148,11 +157,40 @@ impl Rig {
             grab,
             stats,
             mismatch,
+            damage: frame.damage,
+            unnamed_change,
         })
+    }
+
+    /// The library may skip every tile row `damage` does not name, so a tile
+    /// that differs from the frame it last saw must be in a named row.
+    fn unnamed_change(&self, damage: &FrameDamage, now: &[u8]) -> Option<u32> {
+        let (FrameDamage::Tiles { hint, verify }, Some(prev)) = (damage, &self.prev) else {
+            return None;
+        };
+        let (w, h) = (usize::from(self.size.0), usize::from(self.size.1));
+        let cols = w.div_ceil(32);
+        let named =
+            |ty: usize| (0..cols).any(|tx| hint.get(ty * cols + tx) || verify.get(ty * cols + tx));
+        for y in 0..h {
+            let row = y * w * 4..(y + 1) * w * 4;
+            if prev[row.clone()] != now[row.clone()] {
+                // Which tile columns changed on this pixel row.
+                for tx in 0..cols {
+                    let x0 = row.start + tx * 32 * 4;
+                    let x1 = (x0 + 32 * 4).min(row.end);
+                    if prev[x0..x1] != now[x0..x1] && !named(y / 32) {
+                        return Some(((y / 32) * cols + tx) as u32);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Resize the root the way `xrandr --fb` does.
     pub fn resize(&mut self, w: u16, h: u16) {
+        self.prev = None;
         use x11rb::protocol::randr::{self, ConnectionExt as _};
         let res = self
             .conn
@@ -269,6 +307,7 @@ fn run_property_with(
     }
     let mut rng = Rng(seed | 1);
     let (mut bands_ticks, mut full_ticks) = (0, 0);
+    let mut told_ticks = 0u32;
     for t in 0..ticks {
         // Mostly small local updates; now and then a wide one that crosses
         // the full-grab fraction; the pointer wanders.
@@ -303,6 +342,14 @@ fn run_property_with(
                 out.grab
             ));
         }
+        if let Some(tile) = out.unnamed_change {
+            return Err(format!(
+                "tick {t}: tile {tile} changed but no tile in its row is named to the library"
+            ));
+        }
+        if matches!(out.damage, FrameDamage::Tiles { .. }) {
+            told_ticks += 1;
+        }
         // The counter is the band area, whatever was grabbed.
         let expect = band_area_bytes(&out.grab);
         if out.stats.bytes_grabbed != expect {
@@ -318,6 +365,10 @@ fn run_property_with(
                 assert_eq!(out.stats.grab_requests as usize, b.as_slice().len());
             }
         }
+    }
+    // The rows check is vacuous unless the library was told something.
+    if told_ticks < ticks / 2 {
+        return Err(format!("only {told_ticks} of {ticks} ticks carried Tiles"));
     }
     Ok((bands_ticks, full_ticks))
 }
@@ -480,6 +531,11 @@ fn x11_a_band_failing_mid_grab_leaves_no_stale_slot() {
             "tick {i} after the failure: {:?}",
             out.grab
         );
+        // Nothing may be left unnamed to the library. This holds without the
+        // `age_floor` rule too, because the backend's distrust already makes the
+        // tick after a failed capture Unknown; the rule itself is pinned by
+        // `x11_the_tick_after_a_failed_grab_goes_to_the_library_as_unknown`.
+        assert_eq!(out.unnamed_change, None, "tick {i} after the failure");
         if out.grab == Grab::Full {
             fulls += 1;
         }
@@ -525,4 +581,153 @@ fn x11_a_slot_idle_longer_than_the_age_ring_is_regrabbed_in_full() {
         fulls >= 1,
         "no slot came back old enough to need a full grab"
     );
+}
+
+/// The library is told damage as `Tiles` on a believed tick, `Unknown` on the
+/// first and on a distrusted one; the hint is exactly the planned mask.
+#[test]
+fn x11_the_library_is_told_tiles_only_when_damage_is_believed() {
+    let mut rig = Rig::new(Mutation::None);
+    let first = rig.tick();
+    assert_eq!(first.damage, FrameDamage::Unknown, "no history yet");
+    for _ in 0..3 {
+        rig.tick();
+    }
+    rig.fill(
+        Rectangle {
+            x: 40,
+            y: 70,
+            width: 10,
+            height: 10,
+        },
+        0x00ff_0000,
+    );
+    let out = rig.tick();
+    let FrameDamage::Tiles { hint, verify } = out.damage else {
+        panic!("a believed tick must carry Tiles");
+    };
+    let cols = usize::from(W).div_ceil(32);
+    assert!(hint.get(2 * cols + 1), "the painted tile (1, 2) is named");
+    let named = (0..cols * usize::from(H).div_ceil(32))
+        .filter(|&i| hint.get(i))
+        .count();
+    assert!(named < 8, "a 10x10 fill names a few tiles, not {named}");
+    // A capture nobody planned (`off`, `shadow`) tells the library nothing.
+    let unplanned = rig.backend.capture(1).expect("unplanned grab");
+    assert_eq!(unplanned.damage, FrameDamage::Unknown);
+    // The slice is a whole run of tile rows.
+    let sliced = (0..cols * usize::from(H).div_ceil(32))
+        .filter(|&i| verify.get(i))
+        .count();
+    assert_eq!(sliced % cols, 0, "verify is whole tile rows");
+}
+
+/// A change in the delivered pixels is always in a row the library is told
+/// to compare: through painting, pointer moves and full-grab fallbacks.
+#[test]
+fn x11_every_changed_row_is_named_to_the_library() {
+    run_property(Mutation::None, 160, 0x7a11).unwrap();
+}
+
+#[test]
+fn x11_mutation_telling_the_library_no_hint_fails_the_rows_check() {
+    let e = run_property(Mutation::EmptyLibHint, 160, 0x7a11)
+        .expect_err("an empty hint must be caught");
+    println!("mutation EmptyLibHint: {e}");
+    assert!(e.contains("no tile in its row is named"), "{e}");
+}
+
+/// A lost damage report shows in the pixels only when the sweep slice
+/// refreshes the rows, and that tick must name them in `verify`.
+#[test]
+fn x11_a_swept_repair_is_named_to_the_library() {
+    for (m, must_fail) in [(Mutation::None, false), (Mutation::EmptyLibVerify, true)] {
+        let mut rig = Rig::new(m);
+        for _ in 0..8 {
+            assert_eq!(rig.tick().unnamed_change, None);
+        }
+        let r = Rectangle {
+            x: 40,
+            y: 7 * 32 + 3,
+            width: 50,
+            height: 20,
+        };
+        rig.backend
+            .hooks
+            .lose_damage
+            .push((r.x, r.y, r.width, r.height));
+        rig.fill(r, 0x00ab_cdef);
+        let period = u64::from(SWEEP_EVERY * SWEEP_SLICES);
+        let mut unnamed = 0;
+        let mut changed_ticks = 0;
+        for _ in 0..period + 8 {
+            let out = rig.tick();
+            unnamed += u32::from(out.unnamed_change.is_some());
+            changed_ticks += u32::from(out.mismatch.is_none());
+        }
+        assert!(changed_ticks > 0);
+        assert_eq!(unnamed > 0, must_fail, "{m:?}: {unnamed} unnamed changes");
+    }
+}
+
+/// The library is told `Unknown` for the tick after a failed grab, even if the
+/// caller (bypassing the backend's distrust) plans it as believed: the failed
+/// tick's rows never reached the library, so the new tick's damage names only
+/// part of what it lacks.
+#[test]
+fn x11_the_tick_after_a_failed_grab_goes_to_the_library_as_unknown() {
+    use crate::capture::{Damage, TileBitmap};
+    let mut rig = Rig::new(Mutation::None);
+    for _ in 0..10 {
+        assert_eq!(rig.tick().mismatch, None);
+    }
+    let tiles = |ys: &[u32]| {
+        let mut b = TileBitmap::new(u32::from(W), u32::from(H));
+        for &y in ys {
+            b.set(1, y);
+        }
+        Damage::Tiles(b)
+    };
+    let f = &mut rig.backend.frames;
+    f.plan_grab(&tiles(&[2, 14]), None, true);
+    f.fail_second_band_once = true;
+    assert!(f.capture(1).is_err(), "the injected failure did not fire");
+    f.plan_grab(&tiles(&[5]), None, true);
+    let frame = f.capture(2).unwrap();
+    assert_eq!(frame.damage, FrameDamage::Unknown);
+    drop(frame);
+    // And the one after is believed again.
+    f.plan_grab(&tiles(&[5]), None, true);
+    assert!(matches!(
+        f.capture(3).unwrap().damage,
+        FrameDamage::Tiles { .. }
+    ));
+}
+
+/// A capture that fails before it consumes its plan (every slot in flight)
+/// loses that tick's damage: the next plan must not be believed, or the
+/// library is told only the new tick's rows.
+#[test]
+fn x11_the_tick_after_a_would_block_goes_to_the_library_as_unknown() {
+    use crate::capture::{Damage, TileBitmap};
+    let mut rig = Rig::new(Mutation::None);
+    for _ in 0..10 {
+        assert_eq!(rig.tick().mismatch, None);
+    }
+    let tiles = |y: u32| {
+        let mut b = TileBitmap::new(u32::from(W), u32::from(H));
+        b.set(1, y);
+        Damage::Tiles(b)
+    };
+    let f = &mut rig.backend.frames;
+    let mut held = Vec::new();
+    while let Ok(fr) = f.capture(1) {
+        held.push(fr);
+    }
+    f.plan_grab(&tiles(2), None, true);
+    assert!(f.capture(2).is_err(), "every slot is in flight");
+    held.pop();
+    f.plan_grab(&tiles(5), None, true);
+    let frame = f.capture(3).unwrap();
+    assert_eq!(frame.damage, FrameDamage::Unknown);
 }

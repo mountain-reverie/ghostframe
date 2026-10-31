@@ -13,6 +13,7 @@
 //! [`diff`][GpuFrameProcessor::diff] is a thin wrapper that calls `process_frame`
 //! and returns only the dirty tile indices, preserving the old API.
 
+use crate::frame_damage::FrameDamage;
 use ash::vk;
 
 // ---------------------------------------------------------------------------
@@ -417,6 +418,19 @@ pub struct GpuFrameProcessor {
 
     descriptor_pool: vk::DescriptorPool,
     prev_image: Option<PrevFrame>,
+    /// The persistent upload image of the from-pixels path (damage-driven
+    /// encoding): one HOST_VISIBLE linear image per resolution, written by row
+    /// band instead of allocated and filled whole every tick.
+    upload: Option<UploadImage>,
+    /// The upload image, the NV12 buffer and the analysis buffer all describe
+    /// the last frame fully, so a frame that names only some tile rows can
+    /// leave the rest alone. Cleared at the start of every from-pixels frame
+    /// and set again when it completes, so a failure leaves it clear; also
+    /// cleared by a resolution change, a dma-buf frame and `forget_damage`.
+    damage_baseline: bool,
+    /// What the last from-pixels frame did, for the damage tests.
+    #[cfg(test)]
+    probe: DamageProbe,
 
     // SAD output buffer (HOST_VISIBLE, persistently mapped)
     sad_buf: HostBuffer<u32>,
@@ -560,6 +574,30 @@ impl FrameGeometry {
     }
 }
 
+/// What the last from-pixels frame uploaded and dispatched (test builds).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct DamageProbe {
+    /// Microseconds copying pixels into the upload image.
+    pub(super) upload_us: u64,
+    /// Microseconds from the end of the copy to the end of the frame.
+    pub(super) gpu_us: u64,
+    /// Pixel rows written into the upload image.
+    pub(super) uploaded_rows: u32,
+    /// Tile rows the SAD stage dispatched; the whole grid for a full compare.
+    pub(super) dispatched_tile_rows: u32,
+}
+
+/// The persistent from-pixels upload image and its host mapping.
+struct UploadImage {
+    frame: PrevFrame,
+    /// Base of the persistent mapping of the image's whole allocation.
+    map: *mut u8,
+    /// Byte offset of row 0 and the row pitch the driver chose.
+    offset: usize,
+    row_pitch: usize,
+}
+
 struct PrevFrame {
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -648,6 +686,32 @@ impl GpuFrameProcessor {
         stride: u32,
     ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
         unsafe { self.process_frame_inner_from_pixels(pixels, width, height, stride) }
+    }
+
+    /// [`process_frame_from_pixels`](Self::process_frame_from_pixels) told what
+    /// changed since the previous frame. With [`FrameDamage::Tiles`] only the
+    /// tile rows it names are uploaded and compared (every tile in them is a
+    /// SAD candidate); the result equals a full compare whenever those rows
+    /// hold every changed tile. Falls back to the whole frame when the
+    /// previous frame did not leave the processor consistent.
+    pub fn process_frame_from_pixels_damaged(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+        damage: &FrameDamage,
+    ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
+        unsafe {
+            self.process_frame_inner_from_pixels_damaged(pixels, width, height, stride, damage)
+        }
+    }
+
+    /// Stop trusting damage until a whole frame has been processed: a frame
+    /// that named tile rows never reached the processor, so the upload image
+    /// lacks them.
+    pub fn forget_damage(&mut self) {
+        self.damage_baseline = false;
     }
 
     /// Compare the DMA-BUF frame at `fd` against the previous frame.
@@ -743,6 +807,9 @@ impl Drop for GpuFrameProcessor {
 
             if let Some(prev) = self.prev_image.take() {
                 self.destroy_prev_frame(prev);
+            }
+            if let Some(up) = self.upload.take() {
+                self.destroy_upload(up);
             }
 
             // NV12 buffer
@@ -894,6 +961,9 @@ mod readback_bench;
 
 #[cfg(test)]
 mod reference_tests;
+
+#[cfg(test)]
+mod damage_tests;
 
 #[cfg(test)]
 mod fallback_tests;

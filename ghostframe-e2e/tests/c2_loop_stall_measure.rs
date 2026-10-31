@@ -230,7 +230,7 @@ async fn scenario(name: &str, w: u32, h: u32, dirty_frac: f64) {
                 pixels: px.into(),
                 dmabuf_fd: None,
                 timestamp_us: 0,
-                damage_tiles: None,
+                damage: ghostframe_lib::FrameDamage::Unknown,
                 capture_done_ns: 0,
             });
             next_frame = Instant::now() + frame_period;

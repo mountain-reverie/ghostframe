@@ -162,7 +162,11 @@ pub unsafe fn build_compute_pipeline(
         .stage(vk::ShaderStageFlags::COMPUTE)
         .module(shader_module)
         .name(entry_name);
+    // DISPATCH_BASE lets a stage run over a band of workgroups
+    // (`vkCmdDispatchBase`) with `gl_WorkGroupID` already offset, which is how
+    // a damaged frame compares only the tile rows it uploaded.
     let compute_ci = vk::ComputePipelineCreateInfo::default()
+        .flags(vk::PipelineCreateFlags::DISPATCH_BASE)
         .stage(stage)
         .layout(pipeline_layout);
     let pipelines = device

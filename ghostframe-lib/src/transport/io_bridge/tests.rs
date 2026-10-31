@@ -829,7 +829,7 @@ async fn process_frame_produces_no_panic() {
         pixels: vec![0xFF; 64 * 64 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 1000,
-        damage_tiles: None,
+        damage: crate::frame_damage::FrameDamage::Unknown,
         capture_done_ns: 0,
     };
     // No connected sessions, so datagrams go nowhere, but should not panic
@@ -859,7 +859,7 @@ async fn a_pooled_frame_in_flight_returns_its_slot_when_the_bridge_stops() {
         pixels,
         dmabuf_fd: None,
         timestamp_us: 1000,
-        damage_tiles: None,
+        damage: crate::frame_damage::FrameDamage::Unknown,
         capture_done_ns: 0,
     });
     drop(bridge);
@@ -913,7 +913,7 @@ async fn process_frame_increments_frame_seq() {
         pixels: vec![0; 32 * 32 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
-        damage_tiles: None,
+        damage: crate::frame_damage::FrameDamage::Unknown,
         capture_done_ns: 0,
     };
 
@@ -947,7 +947,7 @@ async fn process_frame_no_panic_on_empty_pixels_no_dmabuf_no_session() {
         pixels: vec![0u8; 64 * 64 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
-        damage_tiles: None,
+        damage: crate::frame_damage::FrameDamage::Unknown,
         capture_done_ns: 0,
     };
     bridge.process_frame(frame);
@@ -1242,7 +1242,7 @@ fn tiny_frame() -> FrameSubmission {
         pixels: vec![0u8; 64 * 64 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
-        damage_tiles: None,
+        damage: crate::frame_damage::FrameDamage::Unknown,
         capture_done_ns: 0,
     }
 }
@@ -1270,6 +1270,17 @@ async fn session_reset_queues_invalidate_then_keyframe_and_ends_the_epoch() {
         vec![Control::InvalidateBaseline(20), Control::RequestKeyframe]
     );
     assert_eq!(bridge.session_epoch, before + 1);
+}
+
+/// A frame dropped before the GPU stage (no session to send to) never
+/// uploaded the tile rows its damage named, so the worker is told to stop
+/// trusting damage until a whole frame has gone through.
+#[tokio::test]
+async fn a_frame_dropped_before_the_gpu_stage_makes_the_worker_forget_damage() {
+    let (mut bridge, _peer, _log) = recording_bridge();
+    bridge.process_frame(tiny_frame());
+    assert!(bridge.in_flight.is_none(), "nothing went to the worker");
+    assert_eq!(bridge.pending_controls, vec![Control::ForgetDamage]);
 }
 
 /// A frame whose session ended while the worker held it is not committed: the
@@ -2895,7 +2906,7 @@ async fn frame_captured_event_format() {
         pixels: vec![0u8; 32 * 32 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
-        damage_tiles: None,
+        damage: crate::frame_damage::FrameDamage::Unknown,
         capture_done_ns: 12345,
     };
     // frame_seq starts at 0; after process_frame it becomes 1.
@@ -6262,7 +6273,7 @@ async fn the_tile_arm_commits_the_backends_cdf53_results_and_skips_what_it_skipp
         pixels: vec![0u8; (W * W * 4) as usize].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
-        damage_tiles: None,
+        damage: crate::frame_damage::FrameDamage::Unknown,
         capture_done_ns: 0,
     };
     let enc = |p: u16| Cdf53Encoded {
@@ -6512,7 +6523,7 @@ async fn gpu_backend_pre_encodes_fallback_tiles_exactly_as_the_cpu_transform() {
         pixels: pixels.clone().into(),
         dmabuf_fd: None,
         timestamp_us: 0,
-        damage_tiles: None,
+        damage: crate::frame_damage::FrameDamage::Unknown,
         capture_done_ns: 0,
     };
     backend.analyse(&frame, &[], false).expect("analyse");

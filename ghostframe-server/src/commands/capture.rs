@@ -315,26 +315,16 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
             }
         }
         let consumes = cfg.damage_mode == DamageMode::On;
-        let (damage, grabbed) = match net.as_mut() {
+        let (_damage, grabbed) = match net.as_mut() {
             // The net plans the tick before the grab in both modes, so a
             // failed grab counts as a tick in both; only `on` acts on the plan.
             Some(net) => crate::capture::damage_net_grab(&mut backend, net, timestamp_us, consumes),
             None => crate::capture::damage_then_grab(&mut backend, timestamp_us),
         };
         let submission = match grabbed {
-            Ok(mut frame) => {
-                if net.is_some() {
-                    // The hint is judged, never acted on by the library: it
-                    // still compares the whole screen.
-                    frame.damage_tiles = None;
-                } else {
-                    // A bitmap built for another screen size says nothing
-                    // about this frame: the resize happened between drain and
-                    // grab.
-                    frame.damage_tiles = damage.into_hint_for(frame.width, frame.height);
-                }
-                Some(frame)
-            }
+            // `frame.damage` is whatever the backend filled in: `Tiles` only
+            // from a planned `on` tick, `Unknown` otherwise.
+            Ok(frame) => Some(frame),
             Err(e) => {
                 tracing::warn!("X11 capture failed: {e}");
                 None

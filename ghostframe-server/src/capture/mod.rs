@@ -38,21 +38,10 @@ pub enum Damage {
 }
 
 impl Damage {
-    /// [`Damage::into_hint`] for a frame of `width` x `height` pixels. A
-    /// `Tiles` bitmap built for another screen size (a resize between the
-    /// drain and the grab, even one that keeps the tile grid) says nothing
-    /// about this frame and yields no hint.
-    pub fn into_hint_for(self, width: u32, height: u32) -> Option<Vec<(u32, u32)>> {
-        match self {
-            Damage::Tiles(ref b) if !b.matches(width, height) => None,
-            d => d.into_hint(),
-        }
-    }
-
-    /// The hint in `FrameSubmission::damage_tiles` form. Only `Tiles` is a
-    /// hint; `Unknown` and `None` both stay `None` ("compare every tile"),
-    /// which is always safe. The library ignores the field today, so a
-    /// literal "no tiles" is not forwarded.
+    /// The damaged tiles as coordinates. Only `Tiles` is a hint; `Unknown`
+    /// and `None` both stay `None` ("compare every tile"). Used by the
+    /// baseline harness; the library is told through `FrameSubmission::damage`.
+    #[cfg(test)]
     pub fn into_hint(self) -> Option<Vec<(u32, u32)>> {
         match self {
             Damage::Tiles(b) => Some(b.iter().collect()),
@@ -70,8 +59,9 @@ pub trait Backend {
     /// Resolution control, or `None` (the session keeps its size).
     fn display_controller(&self) -> Option<Arc<dyn DisplayController>>;
 
-    /// Grab one frame. `damage_tiles` is left `None`; the capture loop fills
-    /// it from [`Backend::drain_damage`].
+    /// Grab one frame. `damage` is [`ghostframe_lib::FrameDamage::Unknown`]
+    /// unless [`Backend::plan_grab`] preceded the call and its damage is
+    /// believed, in which case it names the rows the library may compare.
     fn capture(&mut self, timestamp_us: u32) -> std::io::Result<FrameSubmission>;
 
     /// The pool this backend's frames come from, if it has one. A capture
@@ -172,24 +162,4 @@ pub fn damage_net_grab<B: Backend + ?Sized>(
     }
     let frame = backend.capture(timestamp_us);
     (damage, frame)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A drain at one size and a grab at another that keeps the tile grid
-    /// (512x512 and 500x500 are both 16x16 tiles) must not forward the hint.
-    #[test]
-    fn a_hint_for_another_screen_size_is_dropped_even_on_the_same_tile_grid() {
-        let mut b = TileBitmap::new(512, 512);
-        b.set(3, 3);
-        assert_eq!(b.grid(), TileBitmap::new(500, 500).grid());
-        assert_eq!(
-            Damage::Tiles(b.clone()).into_hint_for(500, 500),
-            None,
-            "stale hint forwarded across a resize"
-        );
-        assert_eq!(Damage::Tiles(b).into_hint_for(512, 512), Some(vec![(3, 3)]));
-    }
 }
