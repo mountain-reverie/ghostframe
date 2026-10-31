@@ -164,6 +164,15 @@ impl XDamageMonitor {
 
     /// Start reporting damage on `target` (the root window in production).
     /// Idempotent.
+    /// Round trip on the monitor's own connection, so every event the server
+    /// has generated for it so far is readable by the next drain. A drain that
+    /// sees no event makes no round trip, so without this a test's drains can
+    /// all run before the server has answered `arm`.
+    #[cfg(test)]
+    pub(super) fn sync_for_test(&self) {
+        self.conn.sync().expect("sync with the X server");
+    }
+
     pub fn arm(&mut self) {
         if self.armed {
             return;
