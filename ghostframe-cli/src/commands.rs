@@ -556,7 +556,15 @@ pub fn run_window_loop(
         while let Some(ev) = client.next_event() {
             match ev {
                 ClientEvent::Connected => {
-                    tracing::info!("session ready");
+                    tracing::info!(out_w, out_h, "session ready; requesting display mode");
+                    // The backends report only *changes* of size as
+                    // `WindowEvent::Resized`, never the size the window
+                    // opened at, so a window that is never resized would
+                    // otherwise leave the remote at whatever mode it had.
+                    client.request_display_mode(
+                        u16::try_from(out_w).unwrap_or(u16::MAX),
+                        u16::try_from(out_h).unwrap_or(u16::MAX),
+                    );
                 }
                 ClientEvent::Resized { width, height } => {
                     remote_size = Some((width, height));
