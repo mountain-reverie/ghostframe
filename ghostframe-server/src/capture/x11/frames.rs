@@ -247,9 +247,19 @@ pub struct X11Frames {
     pub(crate) fail_second_band_once: bool,
 }
 
+/// The tick a pool slot's segment was last made current at, if it has been.
+fn segment_held(s: &dyn FrameStorage) -> Option<u64> {
+    s.as_any()
+        .downcast_ref::<ShmSegment>()
+        .and_then(|s| s.held.get())
+}
+
 /// Ticks of grab set kept. A slot idle for more than this many ticks has
-/// unknown age and gets a full grab.
-const AGE_RING: usize = 8;
+/// unknown age and gets a full grab. Content-free ticks use no slot, so a
+/// slot can stay unused for several of them; the ring has to span that, or an
+/// idle desktop with a trickle of damage pays a full grab each time a slot
+/// comes round (a 1080p root is 8 MB, an entry here about 1 KB).
+const AGE_RING: usize = 32;
 
 #[derive(Debug, Clone)]
 struct AgeEntry {
@@ -819,22 +829,17 @@ impl X11Frames {
         self.allow_unchanged = on;
     }
 
-    /// Decide what this tick grabs into a slot last made current at tick
-    /// `held`, and file the tick's grab set in the age ring.
-    ///
-    /// The set for the slot is the union of the grab sets of every tick since
-    /// it was last current (buffer age, design 3.1), plus the tiles under the
-    /// cursor about to be blended. A slot of unknown or too old an age, an
-    /// unbelievable tick, or a union above [`bands::FULL_GRAB_ABOVE_PCT`] of
-    /// the rows gets the full grab.
-    fn choose(&mut self, held: Option<u64>, cursor: Option<CursorRect>) -> Grab {
+    /// Start a grabbing tick: number it and file its grab set in the age ring
+    /// (an unplanned tick clears the ring: every slot's age is unknown).
+    /// Returns the tick number.
+    fn file_tick(&mut self) -> u64 {
         self.tick += 1;
         let t = self.tick;
         self.lib_damage = None;
         let Some(plan) = self.plan.take() else {
             self.ring.clear();
             self.age_floor = t;
-            return Grab::Full;
+            return t;
         };
         let (w, h) = (u32::from(self.width), u32::from(self.height));
         self.ensure_ring(w, h);
@@ -881,6 +886,19 @@ impl X11Frames {
         } else {
             entry.mask.set_all();
         }
+        t
+    }
+
+    /// What tick `t` (filed by [`file_tick`](Self::file_tick)) grabs into a
+    /// slot last made current at tick `held`.
+    ///
+    /// The set for the slot is the union of the grab sets of every tick since
+    /// it was last current (buffer age, design 3.1), plus the tiles under the
+    /// cursor about to be blended. A slot of unknown or too old an age, an
+    /// unbelievable tick, or a union above [`bands::FULL_GRAB_ABOVE_PCT`] of
+    /// the rows gets the full grab.
+    fn grab_for(&mut self, t: u64, held: Option<u64>, cursor: Option<CursorRect>) -> Grab {
+        let (w, h) = (u32::from(self.width), u32::from(self.height));
         let Some(s) = held.filter(|&s| s < t && s >= self.age_floor && t - s <= AGE_RING as u64)
         else {
             return Grab::Full;
@@ -920,9 +938,12 @@ impl X11Frames {
         if self.tick_is_content_free() {
             return Ok(self.unchanged_tick(timestamp_us));
         }
-        let slot = self.pool.try_acquire().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::WouldBlock, "every frame slot is in flight")
-        })?;
+        if self.pool.free_slots() == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "every frame slot is in flight",
+            ));
+        }
         // The cursor is resolved before the grab: its rectangle is part of
         // the grab set (it is blended into the slot, so its rows must be
         // fresh before the blend). Best effort: without XFixes the frame is
@@ -931,11 +952,24 @@ impl X11Frames {
             Some(polled) => polled,
             None => self.query_cursor(),
         };
-        let held = slot
-            .storage()
-            .and_then(|s| s.as_any().downcast_ref::<ShmSegment>())
-            .and_then(|s| s.held.get());
-        let choice = self.choose(held, cursor.as_ref().map(CursorRect::of));
+        let cur = cursor.as_ref().map(CursorRect::of);
+        let t = self.file_tick();
+        // Of the free slots, the one that needs the least grabbing: a slot
+        // written recently has little to catch up on, and with content-free
+        // ticks using no slot the free ones can be very different in age.
+        let h = u32::from(self.height);
+        let pool = self.pool.clone();
+        let slot = pool
+            .try_acquire_cheapest(|s| {
+                let g = self.grab_for(t, segment_held(s), cur);
+                match g {
+                    Grab::Full => u64::from(h),
+                    Grab::Bands(b) => u64::from(b.rows()),
+                }
+            })
+            .expect("a free slot was counted above");
+        let held = slot.storage().and_then(segment_held);
+        let choice = self.grab_for(t, held, cur);
         let mut pixels = match self.grab(slot, choice) {
             Ok(p) => p,
             Err(e) => {
