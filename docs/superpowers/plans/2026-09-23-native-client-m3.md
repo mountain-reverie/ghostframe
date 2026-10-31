@@ -274,7 +274,7 @@ failure — the design anticipates it.
 - [ ] **Step 5: Commit the finding**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add docs/superpowers/specs/2026-09-23-native-client-m3-design.md
 git commit -m "spike(m3): record the DRM modifier VA-API exports for H.264 decode"
 ```
@@ -969,7 +969,7 @@ libx264 being in the host's ffmpeg build, and no encode cost on the connect
 path.
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 ffmpeg -hide_banner -loglevel error -f lavfi -i color=c=gray:s=64x64:d=1 \
   -frames:v 1 -c:v libx264 -preset veryfast -profile:v high -f h264 \
   -y ghostframe-client-h264/src/probe_clip.h264

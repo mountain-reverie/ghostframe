@@ -29,7 +29,7 @@
 
 - [ ] **Step 1: Write the module**
 
-Create `/home/cedric/work/ghostframe/ghostframe-test-pattern/src/palrle_exact.rs` with exactly:
+Create `ghostframe-test-pattern/src/palrle_exact.rs` with exactly:
 
 ```rust
 //! `--palrle-exact --drm-direct` mode.
@@ -221,10 +221,10 @@ fn paint_tile<F: Fn(u32, u32) -> bool>(
 
 - [ ] **Step 2: Add the module to lib.rs**
 
-Edit `/home/cedric/work/ghostframe/ghostframe-test-pattern/src/lib.rs`. The current file (post-2026-05-17) declares modules including `solid_per_tile`. Add the new module declaration in alphabetical order — between `mode_switch` (or wherever fits) and `solid_per_tile`:
+Edit `ghostframe-test-pattern/src/lib.rs`. The current file (post-2026-05-17) declares modules including `solid_per_tile`. Add the new module declaration in alphabetical order — between `mode_switch` (or wherever fits) and `solid_per_tile`:
 
 ```bash
-grep -n "^pub mod" /home/cedric/work/ghostframe/ghostframe-test-pattern/src/lib.rs
+grep -n "^pub mod" ghostframe-test-pattern/src/lib.rs
 ```
 
 Find the line `pub mod solid_per_tile;` and add immediately ABOVE it:
@@ -236,7 +236,7 @@ pub mod palrle_exact;
 - [ ] **Step 3: Verify the test-pattern crate builds**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build -p ghostframe-test-pattern 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo build -p ghostframe-test-pattern 2>&1 | tail -5
 ```
 
 Expected: succeeds. The module's `pub` items (`ExactSample`, `samples`, `run`) are reachable; the helper `paint_tile` is private (not used outside the module).
@@ -244,7 +244,7 @@ Expected: succeeds. The module's `pub` items (`ExactSample`, `samples`, `run`) a
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-test-pattern/src/palrle_exact.rs ghostframe-test-pattern/src/lib.rs
 git commit -m "$(cat <<'EOF'
 feat(test-pattern): palrle_exact module — four 2-color PalRle tiles
@@ -278,7 +278,7 @@ EOF
 Find the `Args` struct (around line 50-65). Find the existing `solid_per_tile: bool` field:
 
 ```bash
-grep -nA2 "solid_per_tile: bool" /home/cedric/work/ghostframe/ghostframe-test-pattern/src/main.rs
+grep -nA2 "solid_per_tile: bool" ghostframe-test-pattern/src/main.rs
 ```
 
 Add immediately AFTER the `solid_per_tile` field's closing line:
@@ -297,7 +297,7 @@ Add immediately AFTER the `solid_per_tile` field's closing line:
 Find the existing `if args.drm_direct && args.solid_per_tile { ... }` branch (around line 83):
 
 ```bash
-grep -nB1 -A2 "drm_direct && args.solid_per_tile" /home/cedric/work/ghostframe/ghostframe-test-pattern/src/main.rs
+grep -nB1 -A2 "drm_direct && args.solid_per_tile" ghostframe-test-pattern/src/main.rs
 ```
 
 Add a new dispatch branch immediately BEFORE the `solid_per_tile` one:
@@ -316,8 +316,8 @@ Order matters here because `--drm-direct` alone (without sub-mode) also has a br
 - [ ] **Step 3: Verify CLI parses + binary builds**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build -p ghostframe-test-pattern 2>&1 | tail -3
-cd /home/cedric/work/ghostframe && cargo run -p ghostframe-test-pattern -- --help 2>&1 | grep -i palrle-exact
+CARGO_INCREMENTAL=0 cargo build -p ghostframe-test-pattern 2>&1 | tail -3
+cargo run -p ghostframe-test-pattern -- --help 2>&1 | grep -i palrle-exact
 ```
 
 Expected: build succeeds; `--help` lists the new flag with its description.
@@ -325,7 +325,7 @@ Expected: build succeeds; `--help` lists the new flag with its description.
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-test-pattern/src/main.rs
 git commit -m "$(cat <<'EOF'
 feat(test-pattern): --palrle-exact --drm-direct CLI flag
@@ -349,7 +349,7 @@ EOF
 - [ ] **Step 1: Find a good location for the new test**
 
 ```bash
-grep -n "fn e2e_palrle_5pct_loss\|fn e2e_solid_per_tile_pixels\|fn e2e_palrle_oob_index" /home/cedric/work/ghostframe/ghostframe-lib/tests/e2e.rs
+grep -n "fn e2e_palrle_5pct_loss\|fn e2e_solid_per_tile_pixels\|fn e2e_palrle_oob_index" ghostframe-lib/tests/e2e.rs
 ```
 
 The new test fits next to the other PalRle and solid_per_tile tests. Place it right after `e2e_solid_per_tile_pixels` (the most similar test in shape — same setup helper, similar SAMPLES-driven assertion).
@@ -410,7 +410,7 @@ async fn e2e_palrle_exact_pixels() -> Result<()> {
 - [ ] **Step 3: Verify the test compiles**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build --tests -p ghostframe-lib 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo build --tests -p ghostframe-lib 2>&1 | tail -5
 ```
 
 Expected: build succeeds. The `use ghostframe_test_pattern::palrle_exact::samples;` import resolves because the lib.rs declared the module pub in Task 1.
@@ -420,7 +420,7 @@ Expected: build succeeds. The `use ghostframe_test_pattern::palrle_exact::sample
 The test-pattern binary needs to land in the container image.
 
 ```
-cd /home/cedric/work/ghostframe && docker build -t ghostframe/test-server:latest -f tests/containers/test-server/Dockerfile . 2>&1 | tail -3
+docker build -t ghostframe/test-server:latest -f tests/containers/test-server/Dockerfile . 2>&1 | tail -3
 ```
 
 Expected: "Successfully tagged ghostframe/test-server:latest". If "no space left on device", run `docker system prune -a -f` first.
@@ -428,7 +428,7 @@ Expected: "Successfully tagged ghostframe/test-server:latest". If "no space left
 - [ ] **Step 5: Run the test in isolation**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_palrle_exact_pixels -- --test-threads=1 --nocapture 2>&1 | tee /tmp/palrle_exact.log | tail -15
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_palrle_exact_pixels -- --test-threads=1 --nocapture 2>&1 | tee /tmp/palrle_exact.log | tail -15
 ```
 
 Expected: 1 passed; 0 failed.
@@ -444,7 +444,7 @@ If FAIL:
 - [ ] **Step 6: Commit (only if Step 5 passes)**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/tests/e2e.rs
 git commit -m "$(cat <<'EOF'
 test(e2e): exact-pixel verification of PalRLE compute shader (B1)
@@ -470,7 +470,7 @@ EOF
 - [ ] **Step 1: Run the full e2e suite for regression**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e -- --test-threads=1 2>&1 | tee /tmp/palrle_exact_full.log | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e -- --test-threads=1 2>&1 | tee /tmp/palrle_exact_full.log | tail -5
 ```
 
 Expected: **24 passed, 0 failed, 2 ignored** (was 23/0/2 — the new test adds one to the pass count).
@@ -480,8 +480,8 @@ If a previously-passing test regresses, investigate the failing test's panic bef
 - [ ] **Step 2: Run lib unit tests + vitest sanity**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -3
-cd /home/cedric/work/ghostframe/ghostframe-web-client && npm test 2>&1 | tail -3
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -3
+cd ghostframe-web-client && npm test 2>&1 | tail -3
 ```
 
 Expected: 282 lib tests passed (no change — no new lib tests); 27 vitest tests passed (no change — no client changes).
@@ -525,7 +525,7 @@ Replace with:
 - [ ] **Step 5: Final commit check**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git status --short
 ```
 

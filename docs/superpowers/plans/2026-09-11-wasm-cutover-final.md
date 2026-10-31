@@ -74,7 +74,7 @@ Task 4 exists solely to prove each of the ten is *live*, by making it move.
 - [ ] **Step 1: Identify every protocol function**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client/src
+cd ghostframe-web-client/src
 grep -n '^  \(async \)\?function ' main.ts
 ```
 
@@ -156,7 +156,7 @@ The core queues a Hello on construction. Confirm the first `pollTransmit` yields
 - [ ] **Step 5: Build and commit**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client
+cd ghostframe-web-client
 export PATH="$HOME/.cargo/bin:$PATH"
 npm run build 2>&1 | tail -6
 ```
@@ -324,7 +324,7 @@ scoped follow-up rather than a surprise. Record it in the map doc.
 - [ ] **Step 1: Confirm each of the seven is unreferenced**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client
+cd ghostframe-web-client
 for m in ack nack fec parity_decoder feedback cdf53_coverage decode_error_batcher; do
   printf "%-24s %s\n" "$m" "$(grep -rl "from '.*/$m'" src/ tests/ | tr '\n' ' ')"
 done

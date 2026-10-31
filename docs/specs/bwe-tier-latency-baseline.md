@@ -57,7 +57,7 @@ bail-out so a skipped attempt doesn't cost a data point) and prints each
 run's `TierLatencyStats` summary from `BrowserlessResult`. Reproduce with:
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 cargo test -p ghostframe-e2e --test browserless_runner \
   bwe_tier_latency_baseline -- --ignored --nocapture --test-threads=1
 ```

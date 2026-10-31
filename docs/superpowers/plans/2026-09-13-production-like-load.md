@@ -116,7 +116,7 @@ mod tests {
 - [x] **Step 2: Run them to verify they fail**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 cargo test -p ghostframe-e2e --lib load_profile 2>&1 | tail -5
 ```
 

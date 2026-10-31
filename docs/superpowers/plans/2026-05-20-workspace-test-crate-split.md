@@ -178,10 +178,10 @@ Create `ghostframe-bench/src/lib.rs` with this exact content:
 Read the current workspace `Cargo.toml`:
 
 ```bash
-cat /home/cedric/work/ghostframe/Cargo.toml | head -10
+cat Cargo.toml | head -10
 ```
 
-Modify `/home/cedric/work/ghostframe/Cargo.toml` to add the two new members. The current `[workspace]` block looks like:
+Modify `Cargo.toml` to add the two new members. The current `[workspace]` block looks like:
 
 ```toml
 [workspace]
@@ -210,7 +210,7 @@ members = [
 - [ ] **Step 4: Build verification.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 systemd-run --user --scope -p MemoryMax=18G --quiet -- cargo build --workspace -j 1 2>&1 | tail -10
 ```
 
@@ -221,7 +221,7 @@ If errors surface they're likely typos in the Cargo.tomls — re-check against t
 - [ ] **Step 5: Stage and commit.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add Cargo.toml \
         ghostframe-e2e/Cargo.toml ghostframe-e2e/src/lib.rs \
         ghostframe-bench/Cargo.toml ghostframe-bench/src/lib.rs
@@ -280,14 +280,14 @@ EOF
 - [ ] **Step 1: Create the destination directory.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 mkdir -p ghostframe-e2e/tests
 ```
 
 - [ ] **Step 2: Move e2e.rs and its helpers directory.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git mv ghostframe-lib/tests/e2e.rs ghostframe-e2e/tests/e2e.rs
 git mv ghostframe-lib/tests/e2e ghostframe-e2e/tests/e2e
 ```
@@ -302,7 +302,7 @@ ls ghostframe-lib/tests/    # should show only: gpu_pipeline.rs  loopback_h3.rs 
 - [ ] **Step 3: Move loopback_h3.rs.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git mv ghostframe-lib/tests/loopback_h3.rs ghostframe-e2e/tests/loopback_h3.rs
 ```
 
@@ -316,7 +316,7 @@ ls ghostframe-e2e/tests/    # should show: e2e/  e2e.rs  loopback_h3.rs
 - [ ] **Step 4: Compile-check the e2e crate.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 systemd-run --user --scope -p MemoryMax=18G --quiet -- cargo build --tests --package ghostframe-e2e -j 1 2>&1 | tail -15
 ```
 
@@ -330,7 +330,7 @@ Expected: clean build. Common failure modes:
 - [ ] **Step 5: Verify ghostframe-lib still builds (didn't accidentally orphan a reference).**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 systemd-run --user --scope -p MemoryMax=18G --quiet -- cargo build --tests --package ghostframe-lib -j 1 2>&1 | tail -10
 ```
 
@@ -339,7 +339,7 @@ Expected: clean build. (Lib's `[dev-dependencies]` still contain all the e2e dep
 - [ ] **Step 6: Stage and commit.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git status --short
 ```
 
@@ -401,14 +401,14 @@ EOF
 - [ ] **Step 1: Create destination directory.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 mkdir -p ghostframe-bench/benches
 ```
 
 - [ ] **Step 2: Move all bench files.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git mv ghostframe-lib/benches/codec_callgrind.rs   ghostframe-bench/benches/codec_callgrind.rs
 git mv ghostframe-lib/benches/codec_latency.rs     ghostframe-bench/benches/codec_latency.rs
 git mv ghostframe-lib/benches/pipeline_throughput.rs ghostframe-bench/benches/pipeline_throughput.rs
@@ -424,7 +424,7 @@ git mv ghostframe-lib/benches/README.md ghostframe-bench/benches/README.md
 - [ ] **Step 3: Remove the now-empty ghostframe-lib/benches directory.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 rmdir ghostframe-lib/benches 2>&1 || ls ghostframe-lib/benches
 ```
 
@@ -433,7 +433,7 @@ If `rmdir` fails because the directory is not empty, list what's left and decide
 - [ ] **Step 4: Compile-check the bench crate.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 systemd-run --user --scope -p MemoryMax=18G --quiet -- cargo build --benches --package ghostframe-bench -j 1 2>&1 | tail -15
 ```
 
@@ -444,7 +444,7 @@ If you see `cannot find feature "gpu-bench" in this scope`, double-check that `g
 - [ ] **Step 5: Verify ghostframe-lib still builds.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 systemd-run --user --scope -p MemoryMax=18G --quiet -- cargo build --tests --package ghostframe-lib -j 1 2>&1 | tail -10
 ```
 
@@ -453,7 +453,7 @@ Expected: clean. ghostframe-lib's Cargo.toml still has the `[[bench]]` entries p
 - [ ] **Step 6: Stage and commit.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git status --short
 ```
 
@@ -507,7 +507,7 @@ This is the payoff commit. The lib's compilation graph shrinks.
 - [ ] **Step 1: Read current ghostframe-lib/Cargo.toml.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 cat ghostframe-lib/Cargo.toml
 ```
 
@@ -572,7 +572,7 @@ After this edit, the bottom of `ghostframe-lib/Cargo.toml` should end with the l
 - [ ] **Step 4: Build verification — ghostframe-lib's test compile is now lighter.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 systemd-run --user --scope -p MemoryMax=18G --quiet -- cargo build --tests --package ghostframe-lib -j 1 2>&1 | tail -10
 ```
 
@@ -585,7 +585,7 @@ If errors surface they're almost certainly:
 - [ ] **Step 5: Build the rest of the workspace, confirm nothing broke.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 systemd-run --user --scope -p MemoryMax=18G --quiet -- cargo build --workspace -j 1 2>&1 | tail -10
 ```
 
@@ -594,7 +594,7 @@ Expected: clean workspace build.
 - [ ] **Step 6: Stage and commit.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git status --short
 ```
 
@@ -654,7 +654,7 @@ EOF
 - [ ] **Step 1: Re-measure `cargo build --tests --package ghostframe-lib`.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 touch ghostframe-lib/src/lib.rs   # invalidate cache for ghostframe-lib only
 python3 /tmp/measure_rss.py -- \
   systemd-run --user --scope -p MemoryMax=18G --quiet -- \
@@ -670,7 +670,7 @@ If the peak is unchanged or higher, something went wrong — investigate before 
 - [ ] **Step 2: Re-measure `cargo build --tests --package ghostframe-e2e`.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 touch ghostframe-e2e/src/lib.rs
 python3 /tmp/measure_rss.py -- \
   systemd-run --user --scope -p MemoryMax=18G --quiet -- \
@@ -681,7 +681,7 @@ Record the output. This number will be HIGHER than the lib's because it pulls al
 
 - [ ] **Step 3: Document the result.**
 
-Append a small note to the spec doc to record the actual measurement. Open `/home/cedric/work/ghostframe/docs/superpowers/specs/2026-05-20-workspace-test-crate-split-design.md` and add a new section after "Done definition":
+Append a small note to the spec doc to record the actual measurement. Open `docs/superpowers/specs/2026-05-20-workspace-test-crate-split-design.md` and add a new section after "Done definition":
 
 ```markdown
 ## Post-split measurement (recorded after Task 5)
@@ -700,7 +700,7 @@ Fill in `<FILL_IN>` with the actual numbers from Steps 1-2.
 - [ ] **Step 4: Stage and commit.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git status --short
 ```
 

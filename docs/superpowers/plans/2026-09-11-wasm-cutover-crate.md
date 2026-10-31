@@ -236,7 +236,7 @@ pub fn protocol_stamp() -> String {
 Create empty placeholder modules so this compiles:
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 for m in boundary core input units; do
   printf '//! Placeholder; filled in by a later task.\n' > "ghostframe-client-wasm/src/$m.rs"
 done
@@ -297,7 +297,7 @@ Expected: `Finished` with no errors. A `cdylib` builds a `.so` on native — har
 - [ ] **Step 6: Verify the wasm build works**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-client-wasm
+cd ghostframe-client-wasm
 export PATH="$HOME/.cargo/bin:$PATH"
 wasm-pack build --target nodejs --out-dir pkg-node 2>&1 | tail -4
 ```
@@ -311,7 +311,7 @@ Expected: `Your wasm pkg is ready to publish at .../pkg-node.`
 - [ ] **Step 7: Verify the e2e image still builds**
 
 ```bash
-cd /home/cedric/work/ghostframe && just containers-build 2>&1 | tail -5
+just containers-build 2>&1 | tail -5
 ```
 
 Expected: builds to completion. This is the check that catches a missed COPY line.
@@ -480,7 +480,7 @@ export function protocolStamp() {
 - [ ] **Step 3: Verify both sides agree**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-client-wasm
+cd ghostframe-client-wasm
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build 2>&1 | tail -2
 echo "rust: $(grep -ao 'GHOSTFRAME_PROTOCOL_STAMP=[0-9a-f]*' ../target/debug/build/ghostframe-client-wasm-*/output | head -1)"
@@ -506,7 +506,7 @@ pub const PROTOCOL_STAMP: &str = env!("GHOSTFRAME_PROTOCOL_STAMP");
 - [ ] **Step 5: Verify it still builds**
 
 ```bash
-cd /home/cedric/work/ghostframe && cargo build -p ghostframe-client-wasm 2>&1 | tail -3
+cargo build -p ghostframe-client-wasm 2>&1 | tail -3
 ```
 
 Expected: `Finished`.
@@ -618,7 +618,7 @@ mod tests {
 - [ ] **Step 2: Run it to confirm it fails**
 
 ```bash
-cd /home/cedric/work/ghostframe && cargo test -p ghostframe-client-wasm 2>&1 | tail -15
+cargo test -p ghostframe-client-wasm 2>&1 | tail -15
 ```
 
 Expected: compile error — `WasmEvent` not found.
@@ -777,7 +777,7 @@ impl From<PollOutput> for WasmPollOutput {
 - [ ] **Step 4: Run the tests**
 
 ```bash
-cd /home/cedric/work/ghostframe && cargo test -p ghostframe-client-wasm 2>&1 | tail -8
+cargo test -p ghostframe-client-wasm 2>&1 | tail -8
 ```
 
 Expected: `test result: ok. 3 passed`.
@@ -905,7 +905,7 @@ impl WasmClientCore {
 - [ ] **Step 2: Verify it builds for both targets**
 
 ```bash
-cd /home/cedric/work/ghostframe && cargo build -p ghostframe-client-wasm 2>&1 | tail -3
+cargo build -p ghostframe-client-wasm 2>&1 | tail -3
 cd ghostframe-client-wasm && export PATH="$HOME/.cargo/bin:$PATH"
 wasm-pack build --target nodejs --out-dir pkg-node 2>&1 | tail -3
 ```
@@ -915,7 +915,7 @@ Expected: both `Finished` / `ready to publish`.
 - [ ] **Step 3: Check the generated TypeScript declarations**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-client-wasm && cat pkg-node/ghostframe_client_wasm.d.ts
+cd ghostframe-client-wasm && cat pkg-node/ghostframe_client_wasm.d.ts
 ```
 
 Expected: `WasmClientCore` with `handleDatagram`, `onTimeout`, `pollTransmit`,
@@ -987,7 +987,7 @@ pub fn key_to_keysym(key: &str) -> Option<u32> {
 - [ ] **Step 2: Verify it builds**
 
 ```bash
-cd /home/cedric/work/ghostframe && cargo build -p ghostframe-client-wasm 2>&1 | tail -3
+cargo build -p ghostframe-client-wasm 2>&1 | tail -3
 ```
 
 Expected: `Finished`.
@@ -1309,7 +1309,7 @@ use crate::boundary::WasmAckEntry;
 - [ ] **Step 3: Verify it builds**
 
 ```bash
-cd /home/cedric/work/ghostframe && cargo build -p ghostframe-client-wasm 2>&1 | tail -3
+cargo build -p ghostframe-client-wasm 2>&1 | tail -3
 ```
 
 Expected: `Finished`.
@@ -1331,7 +1331,7 @@ git commit -m "feat(wasm): ACK/NACK/decode-error batcher shims"
 - [ ] **Step 1: Read the three Rust surfaces**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-client-core
+cd ghostframe-client-core
 sed -n '1,50p' src/palette_shadow.rs
 sed -n '25,127p' src/parity_decoder.rs
 sed -n '1,94p' src/loss_tracker.rs
@@ -1481,7 +1481,7 @@ impl Default for WasmLossTracker {
 - [ ] **Step 3: Verify it builds**
 
 ```bash
-cd /home/cedric/work/ghostframe && cargo build -p ghostframe-client-wasm 2>&1 | tail -3
+cargo build -p ghostframe-client-wasm 2>&1 | tail -3
 ```
 
 - [ ] **Step 4: Commit**
@@ -1501,7 +1501,7 @@ git commit -m "feat(wasm): palette-shadow, parity-decoder, loss-tracker shims"
 - [ ] **Step 1: Read the three Rust surfaces**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-client-core
+cd ghostframe-client-core
 sed -n '1,60p' src/pal_rle_decode.rs
 sed -n '1,51p' src/cdf53_prevalidate.rs
 sed -n '1,60p' src/cdf53_coverage.rs
@@ -1750,7 +1750,7 @@ use ghostframe_client_core::cdf53_coverage::CoverageEntry;
 - [ ] **Step 4: Verify it builds**
 
 ```bash
-cd /home/cedric/work/ghostframe && cargo build -p ghostframe-client-wasm 2>&1 | tail -3
+cargo build -p ghostframe-client-wasm 2>&1 | tail -3
 ```
 
 Expected: `Finished`.
@@ -1851,7 +1851,7 @@ describe('wasm module', () => {
 - [ ] **Step 4: Run the suite**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client
+cd ghostframe-web-client
 export PATH="$HOME/.cargo/bin:$PATH"
 npm test 2>&1 | tail -20
 ```
@@ -1864,7 +1864,7 @@ still pass** — nothing in `src/` changed.
 A stamp test that passes no matter what is worthless. Prove it fails on drift:
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 printf '\n// stamp drift probe\n' >> ghostframe-client-core/src/palette_shadow.rs
 cd ghostframe-web-client && npx vitest run tests/wasm_smoke.test.ts 2>&1 | tail -12
 ```
@@ -1876,7 +1876,7 @@ would rebuild the wasm and mask the drift.)
 Then revert and confirm it passes again:
 
 ```bash
-cd /home/cedric/work/ghostframe && git checkout ghostframe-client-core/src/palette_shadow.rs
+git checkout ghostframe-client-core/src/palette_shadow.rs
 cd ghostframe-web-client && npm test 2>&1 | tail -6
 ```
 
@@ -1903,7 +1903,7 @@ keeping the web client dependency-free."
 - [ ] **Step 1: Read the current workflow**
 
 ```bash
-cd /home/cedric/work/ghostframe && cat .github/workflows/client-core.yml
+cat .github/workflows/client-core.yml
 ```
 
 Note the existing job installs the `wasm32-unknown-unknown` target and runs
@@ -1947,7 +1947,7 @@ checkout/toolchain step style):
 - [ ] **Step 4: Verify the workflow parses**
 
 ```bash
-cd /home/cedric/work/ghostframe && python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/client-core.yml')); print('ok')"
+python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/client-core.yml')); print('ok')"
 ```
 
 Expected: `ok`.
@@ -1987,7 +1987,7 @@ measurement. It is a record, not a gate.
 - [ ] **Step 1: Measure the current bundle, before wasm is in it**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client
+cd ghostframe-web-client
 git stash list >/dev/null
 npx vite build 2>&1 | tail -8
 ```
@@ -1997,7 +1997,7 @@ Record each emitted asset and its gzip size.
 - [ ] **Step 2: Measure the wasm module on its own**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client
+cd ghostframe-web-client
 export PATH="$HOME/.cargo/bin:$PATH"
 npm run build:wasm
 ls -l pkg-web/*.wasm

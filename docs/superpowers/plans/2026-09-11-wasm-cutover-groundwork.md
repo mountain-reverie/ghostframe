@@ -12,7 +12,7 @@
 
 ## Before you start
 
-Run cargo with `export TMPDIR=/home/cedric/.cache/ghostframe-tmp` (mkdir -p it first) in the same shell invocation. `/tmp` fills on this machine and produces a confusing build.rs panic from ghostbridge's Go link step.
+Run cargo with `export TMPDIR=~/.cache/ghostframe-tmp` (mkdir -p it first) in the same shell invocation. `/tmp` fills on this machine and produces a confusing build.rs panic from ghostbridge's Go link step.
 
 Run cargo in the **foreground** with an explicit timeout. Never `git add -A`.
 
@@ -766,7 +766,7 @@ Five tasks have touched the dispatch that every existing consumer depends on. Th
 - [ ] **Step 1: Full workspace verification**
 
 ```bash
-export TMPDIR=/home/cedric/.cache/ghostframe-tmp
+export TMPDIR=~/.cache/ghostframe-tmp
 cargo test -p ghostframe-client-core
 cargo test -p ghostframe-lib --lib
 cargo test -p ghostframe-lib --test bwe_bench

@@ -991,7 +991,7 @@ EOF
 
 - [ ] **Step 1: Locate where the `GhostbridgeHandle` lives.**
 
-Run: `grep -n "GhostbridgeHandle" /home/cedric/work/ghostframe/ghostframe-lib/src/transport/io_bridge.rs | head`
+Run: `grep -n "GhostbridgeHandle" ghostframe-lib/src/transport/io_bridge.rs | head`
 Expected: lines that show whether `IoBridge` owns the handle directly or hides it. The plan assumes `IoBridge` exposes it — if not, add a method `IoBridge::ghostbridge(&self) -> &GhostbridgeHandle` returning a borrow.
 
 - [ ] **Step 2: Extend `GhostframeServer::new`.**
@@ -1230,7 +1230,7 @@ EOF
 
 - [ ] **Step 1: Check current dependencies.**
 
-Run: `grep -E 'rcgen|sha2|base64' /home/cedric/work/ghostframe/ghostframe-e2e/Cargo.toml`
+Run: `grep -E 'rcgen|sha2|base64' ghostframe-e2e/Cargo.toml`
 Expected: rcgen may already be in scope via workspace; if not, add `rcgen = "0.13"`, `sha2 = "0.10"`, `base64 = "0.22"` to `[dependencies]`. (Versions: match what `ghostframe-lib` already pulls in — check `cargo tree -p ghostframe-lib | grep -E 'rcgen|sha2|base64'`.)
 
 - [ ] **Step 2: Write the failing test.**
@@ -1414,7 +1414,7 @@ Add a method on `GhostbridgeHandle`. The returned fd is a Unix-domain socketpair
 
 Look at how `TestNode::dial` (UDP path) is implemented:
 
-Run: `grep -n "fn dial\b\|fn dial(" /home/cedric/work/ghostframe/ghostframe-e2e/src/harness/containers.rs`
+Run: `grep -n "fn dial\b\|fn dial(" ghostframe-e2e/src/harness/containers.rs`
 
 Add a sibling method that wraps the new `GhostbridgeHandle::dial_tcp`. Signature shape (adjust field name `handle` to whatever the file uses):
 ```rust
@@ -1515,7 +1515,7 @@ In `scene.rs`, locate the existing block starting at line 208 (`let mut server_i
    .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem)
    ```
 
-3. Replace the `with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])` line — the daemon no longer prints that. Use a generic readiness probe: tail for an info line that the IoBridge always emits, e.g. `"IoBridge: spawned tasks"` or whatever exists today. Run `grep -nE 'tracing::info!.*("|started|ready' /home/cedric/work/ghostframe/ghostframe-lib/src/transport/io_bridge.rs | head -5` to find a stable line; pick one that prints exactly once per boot. Use that exact string with `WaitFor::message_on_stderr` (tracing writes to stderr in text format) or `message_on_stdout` (for json format the env sets above).
+3. Replace the `with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])` line — the daemon no longer prints that. Use a generic readiness probe: tail for an info line that the IoBridge always emits, e.g. `"IoBridge: spawned tasks"` or whatever exists today. Run `grep -nE 'tracing::info!.*("|started|ready' ghostframe-lib/src/transport/io_bridge.rs | head -5` to find a stable line; pick one that prints exactly once per boot. Use that exact string with `WaitFor::message_on_stderr` (tracing writes to stderr in text format) or `message_on_stdout` (for json format the env sets above).
 
 4. Remove the `let cert_hash = crate::harness::containers::read_cert_hash_from_logs(...)` call — the e2e no longer needs it because `/config.json` will deliver it to the browser.
 
@@ -1583,7 +1583,7 @@ Three test bodies in `tests/e2e.rs` still set up their own scene without using `
 
 - [ ] **Step 1: Find the inline setups.**
 
-Run: `grep -n 'CERT_HASH_SHA256\|certHash' /home/cedric/work/ghostframe/ghostframe-e2e/tests/e2e.rs`
+Run: `grep -n 'CERT_HASH_SHA256\|certHash' ghostframe-e2e/tests/e2e.rs`
 Expected: about six lines across three tests (`e2e_quic_ping_pong_over_tailscale`, plus two others — exact names depend on the file).
 
 - [ ] **Step 2: Apply the Task 15 pattern to each.**
@@ -1644,7 +1644,7 @@ In `mod.rs`, drop `start_static_server` from the re-export list (`pub use transp
 
 - [ ] **Step 3: Drop unused dependencies.**
 
-Run: `grep -E 'axum|tower-http' /home/cedric/work/ghostframe/ghostframe-e2e/Cargo.toml`
+Run: `grep -E 'axum|tower-http' ghostframe-e2e/Cargo.toml`
 If those are listed only for the deleted helper, remove them. Otherwise leave them.
 
 - [ ] **Step 4: Build.**
@@ -1701,7 +1701,7 @@ time.
 
 - [ ] **Step 2: Update `packaging/install.sh` final output.**
 
-Run: `grep -n 'CERT_HASH_SHA256\|python3 -m http.server\|First connection' /home/cedric/work/ghostframe/packaging/install.sh`
+Run: `grep -n 'CERT_HASH_SHA256\|python3 -m http.server\|First connection' packaging/install.sh`
 
 For each printed instruction that references the old flow, replace with a final block at the script's success path:
 ```bash

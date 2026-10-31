@@ -6,7 +6,7 @@
 
 **Architecture:** Two new workspace crates. `ghostframe-protocol` extracts the pure wire-format + codec modules that today live inside `ghostframe-lib` (whose native deps — ffmpeg/ash/quinn/tokio — are unconditional and therefore un-reusable as-is). `ghostframe-client-core` builds the sans-IO client state machine on top of it: `handle_datagram(&[u8], now_us) -> Vec<Event>`, `poll_transmit(now_us) -> Option<PollOutput>`, `poll_timeout() -> Option<u64>`, `on_timeout(now_us)`. No sockets, timers, or async inside; time is injected as `u64` microseconds (wasm-friendly — no `std::time::Instant`).
 
-**Tech Stack:** Rust 2021, `thiserror`, `smallvec`, `proptest` (dev), workspace at `/home/cedric/work/ghostframe/Cargo.toml`. Reference TS implementation in `ghostframe-web-client/src/`; behavioral oracle in `ghostframe-web-client/tests/`.
+**Tech Stack:** Rust 2021, `thiserror`, `smallvec`, `proptest` (dev), workspace at `Cargo.toml`. Reference TS implementation in `ghostframe-web-client/src/`; behavioral oracle in `ghostframe-web-client/tests/`.
 
 ## Global Constraints
 

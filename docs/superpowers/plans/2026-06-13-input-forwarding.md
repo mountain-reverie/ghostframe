@@ -92,7 +92,7 @@ Open `ghostframe-lib/src/transport/mod.rs` and add `pub mod input_inject;` in al
 - [ ] **Step 3: Verify it compiles**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 cargo check -p ghostframe-lib 2>&1 | tail -5
 ```
 
@@ -636,7 +636,7 @@ bridge.input_injector = input_injector;
 The compile will fail at every call site of `GhostframeServer::new`. Find them:
 
 ```bash
-grep -rn 'GhostframeServer::new' --include='*.rs' /home/cedric/work/ghostframe
+grep -rn 'GhostframeServer::new' --include='*.rs' .
 ```
 
 For each, pass `None` for the new parameter (these are tests / harness / the bench codec_report — none want X11 injection). Example mechanical fix:
@@ -697,7 +697,7 @@ x11rb = { version = "0.13", features = ["damage", "xtest"] }
 - [ ] **Step 3: Verify it resolves**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 cargo check -p ghostframe-xdaemon 2>&1 | tail -5
 ```
 
@@ -1220,7 +1220,7 @@ Expected: all green, including the 9 new keymap tests.
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-web-client/src/input/keymap.ts ghostframe-web-client/tests/input.test.ts
 git commit -m "feat(web-client): input keymap.ts — KeyboardEvent.key → X11 KeySym"
 ```
@@ -1389,7 +1389,7 @@ Expected: all green.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-web-client/src/input/encode.ts ghostframe-web-client/tests/input.test.ts
 git commit -m "feat(web-client): input encode.ts — five wire encoders + 8 round-trip tests"
 ```
@@ -1593,7 +1593,7 @@ Expected: all green.
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-web-client/src/input/wire.ts
 git commit -m "feat(web-client): attachInputCapture — DOM listeners + RAF coalesce + dispatch"
 ```
@@ -1654,7 +1654,7 @@ Expected: all green.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-web-client/src/main.ts
 git commit -m "feat(web-client): wire attachInputCapture in main.ts"
 ```
@@ -1670,7 +1670,7 @@ git commit -m "feat(web-client): wire attachInputCapture in main.ts"
 The web client dist is `//go:embed`-ed into `libghostbridge.a`, which is linked into the daemon binary. Both need to be rebuilt:
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 cd ghostbridge && make archive 2>&1 | tail -3
 cd ..
 cargo build --release -p ghostframe-xdaemon 2>&1 | tail -3

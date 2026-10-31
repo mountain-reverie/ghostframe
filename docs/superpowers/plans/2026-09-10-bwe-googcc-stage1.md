@@ -12,7 +12,7 @@
 
 ## Before you start
 
-Run every cargo command with `export TMPDIR=/home/cedric/.cache/ghostframe-tmp` (mkdir -p it first). `/tmp` fills up on this machine and produces a confusing build.rs panic from ghostbridge's Go link step.
+Run every cargo command with `export TMPDIR=~/.cache/ghostframe-tmp` (mkdir -p it first). `/tmp` fills up on this machine and produces a confusing build.rs panic from ghostbridge's Go link step.
 
 Run cargo in the **foreground** with an explicit timeout. Never `git add -A`.
 
@@ -1194,7 +1194,7 @@ git commit -m "test(netsim): assert the estimate tracks the simulator's own band
 - [ ] **Step 1: Run the whole affected surface**
 
 ```bash
-export TMPDIR=/home/cedric/.cache/ghostframe-tmp
+export TMPDIR=~/.cache/ghostframe-tmp
 cargo test -p ghostframe-lib --lib
 cargo test -p ghostframe-lib --test bwe_bench
 cargo test -p ghostframe-e2e --test netsim

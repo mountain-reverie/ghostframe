@@ -37,7 +37,7 @@ The fix in Phase 2 doesn't add new files. It modifies existing renderer / frameb
 - [ ] **Step 1: Read the current instrumentation block**
 
 ```bash
-sed -n '335,360p' /home/cedric/work/ghostframe/ghostframe-web-client/src/main.ts
+sed -n '335,360p' ghostframe-web-client/src/main.ts
 ```
 
 Confirm the existing block looks like:
@@ -96,7 +96,7 @@ if (typeof window !== "undefined") {
 - [ ] **Step 3: Verify the web-client builds**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client && npm run build 2>&1 | tail -10
+cd ghostframe-web-client && npm run build 2>&1 | tail -10
 ```
 
 Expected: build succeeds. If TypeScript complains about `asm.header.frameSeq` not existing, replace with the actual field name (search `asm.header` references in main.ts for the canonical naming).
@@ -104,7 +104,7 @@ Expected: build succeeds. If TypeScript complains about `asm.header.frameSeq` no
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-web-client/src/main.ts
 git commit -m "diag(client): __ghostframeRecordedTiles per-tile event recorder (W5)"
 ```
@@ -119,7 +119,7 @@ git commit -m "diag(client): __ghostframeRecordedTiles per-tile event recorder (
 - [ ] **Step 1: Read both call sites**
 
 ```bash
-sed -n '315,340p' /home/cedric/work/ghostframe/ghostframe-web-client/src/main.ts
+sed -n '315,340p' ghostframe-web-client/src/main.ts
 ```
 
 Identify the two call sites:
@@ -200,7 +200,7 @@ if (canvasEl.width < minWidth || canvasEl.height < minHeight) {
 - [ ] **Step 5: Verify the web-client builds**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client && npm run build 2>&1 | tail -5
+cd ghostframe-web-client && npm run build 2>&1 | tail -5
 ```
 
 Expected: build succeeds.
@@ -208,7 +208,7 @@ Expected: build succeeds.
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-web-client/src/main.ts
 git commit -m "diag(client): __ghostframeRecordedResizes resize-event recorder (W5)"
 ```
@@ -223,7 +223,7 @@ git commit -m "diag(client): __ghostframeRecordedResizes resize-event recorder (
 - [ ] **Step 1: Locate the existing diagnostic dump**
 
 ```bash
-grep -nB2 -A20 "e2e_edge_tiles diagnostic" /home/cedric/work/ghostframe/ghostframe-lib/tests/e2e.rs
+grep -nB2 -A20 "e2e_edge_tiles diagnostic" ghostframe-lib/tests/e2e.rs
 ```
 
 Confirm the existing block ends with `eprintln!("e2e_edge_tiles diagnostic: ...")` after `let diag: serde_json::Value = setup.page.evaluate(diag_js).await?.into_value()?;`.
@@ -256,7 +256,7 @@ eprintln!(
 - [ ] **Step 3: Verify the test compiles**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build --tests -p ghostframe-lib 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo build --tests -p ghostframe-lib 2>&1 | tail -5
 ```
 
 Expected: build succeeds.
@@ -264,7 +264,7 @@ Expected: build succeeds.
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/tests/e2e.rs
 git commit -m "diag(e2e): dump per-tile + resize event logs in e2e_edge_tiles (W5)"
 ```
@@ -280,23 +280,23 @@ git commit -m "diag(e2e): dump per-tile + resize event logs in e2e_edge_tiles (W
 The client TypeScript change must land in the bundled web client assets that the test serves. Check whether the web client is rebuilt as part of the e2e setup or whether it ships pre-built in the container.
 
 ```bash
-ls /home/cedric/work/ghostframe/ghostframe-web-client/dist/ 2>&1 | head -5
+ls ghostframe-web-client/dist/ 2>&1 | head -5
 ```
 
 If `dist/` is present and the e2e uses it directly (search `serve_dist` / `start_static_server` in `tests/e2e/helpers.rs`), rebuild dist:
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client && npm run build
+cd ghostframe-web-client && npm run build
 ```
 
 If the docker image bundles the client, also rebuild the image:
 ```bash
-cd /home/cedric/work/ghostframe && docker build -t ghostframe/test-server:latest -f tests/containers/test-server/Dockerfile . 2>&1 | tail -3
+docker build -t ghostframe/test-server:latest -f tests/containers/test-server/Dockerfile . 2>&1 | tail -3
 ```
 
 - [ ] **Step 2: Run e2e_edge_tiles with --ignored**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_edge_tiles -- --test-threads=1 --ignored --nocapture 2>&1 | tee /tmp/edge_diag.log | tail -30
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_edge_tiles -- --test-threads=1 --ignored --nocapture 2>&1 | tee /tmp/edge_diag.log | tail -30
 ```
 
 Expected: test FAILS at the pixel-readback assertion (we haven't fixed anything yet), AND prints three blocks to stderr:
@@ -321,7 +321,7 @@ Document the chosen bucket in the spec's "Phase 1 findings" section.
 - [ ] **Step 4: Append findings to the spec**
 
 ```bash
-cat >> /home/cedric/work/ghostframe/docs/superpowers/specs/2026-05-17-edge-tiles-diagnose-fix-design.md <<'EOF'
+cat >> docs/superpowers/specs/2026-05-17-edge-tiles-diagnose-fix-design.md <<'EOF'
 
 ## Phase 1 findings (2026-05-17)
 
@@ -342,7 +342,7 @@ Fill in the bucket, the evidence snippet, and the chosen path.
 - [ ] **Step 5: Commit findings**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add docs/superpowers/specs/2026-05-17-edge-tiles-diagnose-fix-design.md
 git commit -m "diag(w5): e2e_edge_tiles Phase 1 findings — bucket R<N>"
 ```
@@ -425,7 +425,7 @@ frameDimensionsKnown = true;
 - [ ] **Step 3: Verify build**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client && npm run build 2>&1 | tail -5
+cd ghostframe-web-client && npm run build 2>&1 | tail -5
 ```
 
 Expected: build succeeds.
@@ -439,7 +439,7 @@ Same as Task 4 Step 1 — either `npm run build` is enough or the docker image a
 Drop the `#[ignore]` line first (do this in Task 6), but for now do a sanity run with `--ignored`:
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_edge_tiles -- --test-threads=1 --ignored --nocapture 2>&1 | tee /tmp/edge_r1.log | tail -15
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_edge_tiles -- --test-threads=1 --ignored --nocapture 2>&1 | tee /tmp/edge_r1.log | tail -15
 ```
 
 Expected: PASS (the diagnostic dumps still print, but all 4 pixel assertions now succeed).
@@ -449,7 +449,7 @@ If still failing: the R1 fix wasn't sufficient. The canvas is now over-allocated
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-web-client/src/main.ts
 git commit -m "fix(web-client): round resize to tile-multiples to preserve partial edge tiles (W5 R1)"
 ```
@@ -527,7 +527,7 @@ writeRawTile(tileX: number, tileY: number, bgra: Uint8Array): void {
 - [ ] **Step 2: Verify build**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client && npm run build 2>&1 | tail -5
+cd ghostframe-web-client && npm run build 2>&1 | tail -5
 ```
 
 Expected: build succeeds.
@@ -535,7 +535,7 @@ Expected: build succeeds.
 - [ ] **Step 3: Run vitest**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client && npm test 2>&1 | tail -10
+cd ghostframe-web-client && npm test 2>&1 | tail -10
 ```
 
 Expected: all 27+ vitest tests still pass. If a renderer-related test fails, the clip introduced a regression — investigate before continuing.
@@ -543,7 +543,7 @@ Expected: all 27+ vitest tests still pass. If a renderer-related test fails, the
 - [ ] **Step 4: Rebuild test-server container (if needed) + run e2e_edge_tiles with --ignored**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_edge_tiles -- --test-threads=1 --ignored --nocapture 2>&1 | tee /tmp/edge_r3.log | tail -15
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_edge_tiles -- --test-threads=1 --ignored --nocapture 2>&1 | tee /tmp/edge_r3.log | tail -15
 ```
 
 Expected: PASS at all 4 pixel assertions.
@@ -553,7 +553,7 @@ If still failing: the diagnostic dump now shows whether the Raw fix landed. Chec
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-web-client/src/webgpu/renderer.ts
 git commit -m "fix(web-client): clip writeRawTile extent to framebuffer bounds (W5 R3)"
 ```
@@ -568,7 +568,7 @@ git commit -m "fix(web-client): clip writeRawTile extent to framebuffer bounds (
 - [ ] **Step 1: Find the `#[ignore]` line**
 
 ```bash
-grep -n "#\[ignore.*M3.2c carry-over.*700×500" /home/cedric/work/ghostframe/ghostframe-lib/tests/e2e.rs
+grep -n "#\[ignore.*M3.2c carry-over.*700×500" ghostframe-lib/tests/e2e.rs
 ```
 
 It's around line 1199. Confirm the message is the W5-carry-over one introduced by commit `9e56fdd`.
@@ -589,7 +589,7 @@ Fill in the actual commit SHA from Task 5R1 / 5R3.
 - [ ] **Step 3: Verify the test now runs as part of the normal suite**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_edge_tiles -- --test-threads=1 --nocapture 2>&1 | tail -8
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_edge_tiles -- --test-threads=1 --nocapture 2>&1 | tail -8
 ```
 
 Expected: `1 passed; 0 failed; 0 ignored`.
@@ -597,7 +597,7 @@ Expected: `1 passed; 0 failed; 0 ignored`.
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/tests/e2e.rs
 git commit -m "test(e2e): drop #[ignore] on e2e_edge_tiles — W5 carry-over closed"
 ```
@@ -611,7 +611,7 @@ git commit -m "test(e2e): drop #[ignore] on e2e_edge_tiles — W5 carry-over clo
 - [ ] **Step 1: Run the full e2e suite to catch regressions**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e -- --test-threads=1 2>&1 | tee /tmp/edge_final.log | tail -15
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e -- --test-threads=1 2>&1 | tee /tmp/edge_final.log | tail -15
 ```
 
 Expected: 21 passed (20 previously-passing + e2e_edge_tiles); 3 ignored (palrle_session_reset, decode_error_thin_uncached, resolution_change); 0 failed.
@@ -623,7 +623,7 @@ The flaky `e2e_palette_eviction` may fail intermittently in batch (passes in iso
 - [ ] **Step 2: Run lib unit tests**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -5
 ```
 
 Expected: 278+ tests pass.
@@ -637,7 +637,7 @@ Edit `~/.claude/projects/-home-cedric-work-ghostframe/memory/MEMORY.md` — bump
 - [ ] **Step 4: Final commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 # the memory dir is NOT a git repo — no `git add` for those files.
 # If there are project-tree changes from earlier steps that weren't committed,
 # commit them now. Otherwise skip.

@@ -38,7 +38,7 @@
 - [ ] **Step 1: Locate the `connected` field on WebTransportServer**
 
 ```bash
-grep -n "connected\|pub struct WebTransportServer\|impl WebTransportServer\|fn is_connected" /home/cedric/work/ghostframe/ghostframe-lib/src/transport/webtransport.rs | head -10
+grep -n "connected\|pub struct WebTransportServer\|impl WebTransportServer\|fn is_connected" ghostframe-lib/src/transport/webtransport.rs | head -10
 ```
 
 Identify the field name (likely `connected: bool` or similar) and which `impl` block holds `is_connected`.
@@ -66,8 +66,8 @@ If the field name differs (e.g., `is_connected_flag`, `state`, etc.), adjust the
 - [ ] **Step 3: Verify the lib still compiles in both cfg profiles**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build -p ghostframe-lib --tests 2>&1 | tail -5
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build -p ghostframe-lib --release --no-default-features 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo build -p ghostframe-lib --tests 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo build -p ghostframe-lib --release --no-default-features 2>&1 | tail -5
 ```
 
 Expected: both succeed. The `#[cfg(test)]` gate means the production build doesn't see the function.
@@ -75,7 +75,7 @@ Expected: both succeed. The `#[cfg(test)]` gate means the production build doesn
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/src/transport/webtransport.rs
 git commit -m "$(cat <<'EOF'
 test(webtransport): cfg-gated test_set_connected seam
@@ -101,7 +101,7 @@ EOF
 - [ ] **Step 1: Add the `HashSet` import (if not already imported)**
 
 ```bash
-grep -n "use std::collections::HashSet\|use std::collections::HashMap" /home/cedric/work/ghostframe/ghostframe-lib/src/transport/io_bridge.rs | head -3
+grep -n "use std::collections::HashSet\|use std::collections::HashMap" ghostframe-lib/src/transport/io_bridge.rs | head -3
 ```
 
 If `HashSet` is not in the imports, add it. The existing `HashMap` import probably looks like:
@@ -153,7 +153,7 @@ next to the `wt_sessions: HashMap::new(),` line in each.
 Locate the existing inline reset body inside `Stream(Readable)` event handler — search for `self.palette_table.on_session_reset(`:
 
 ```bash
-grep -n "palette_table.on_session_reset" /home/cedric/work/ghostframe/ghostframe-lib/src/transport/io_bridge.rs
+grep -n "palette_table.on_session_reset" ghostframe-lib/src/transport/io_bridge.rs
 ```
 
 It's the `Stream(Readable)` branch, around line 1454-1490. The current shape:
@@ -231,9 +231,9 @@ Copy the body line-by-line from the existing inline block — make NO logic chan
 - [ ] **Step 6: Verify build + run all lib tests**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build -p ghostframe-lib --tests 2>&1 | tail -5
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build -p ghostframe-lib --release --no-default-features 2>&1 | tail -5
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo build -p ghostframe-lib --tests 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo build -p ghostframe-lib --release --no-default-features 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -5
 ```
 
 Expected: all three succeed. Lib tests: 280 passed (no new tests yet).
@@ -241,7 +241,7 @@ Expected: all three succeed. Lib tests: 280 passed (no new tests yet).
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/src/transport/io_bridge.rs
 git commit -m "$(cat <<'EOF'
 refactor(io_bridge): extract fire_session_reset + add session_resets_fired field
@@ -322,7 +322,7 @@ Verify the imports exist or add them at the top of the `mod tests` block. The ex
 
 If `QuicServer::test_default()` doesn't exist by that name, find the right constructor by searching:
 ```bash
-grep -nE "QuicServer.*for_test|QuicServer::new|fn test_default" /home/cedric/work/ghostframe/ghostframe-lib/src/transport/quic.rs | head -5
+grep -nE "QuicServer.*for_test|QuicServer::new|fn test_default" ghostframe-lib/src/transport/quic.rs | head -5
 ```
 And substitute the right one.
 
@@ -331,7 +331,7 @@ If `WebTransportServer::default()` isn't derived — check by searching for `Def
 - [ ] **Step 2: Run the test to verify it fails to compile**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib maybe_fire_session_reset_fires_exactly_once_per_handle 2>&1 | tail -15
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib maybe_fire_session_reset_fires_exactly_once_per_handle 2>&1 | tail -15
 ```
 
 Expected: COMPILE ERROR — `maybe_fire_session_reset` method does not exist on `IoBridge`.
@@ -359,7 +359,7 @@ The `HashSet::insert` returns `true` if the value was NEWLY inserted, `false` if
 - [ ] **Step 4: Run the unit test again, verify it passes**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib maybe_fire_session_reset_fires_exactly_once_per_handle 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib maybe_fire_session_reset_fires_exactly_once_per_handle 2>&1 | tail -5
 ```
 
 Expected: 1 passed; 0 failed.
@@ -371,7 +371,7 @@ If FAIL with `palette_table.delivered.insert` not found — check the public API
 - [ ] **Step 5: Run all lib tests to catch regressions**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -5
 ```
 
 Expected: 281 passed (280 baseline + 1 new). 0 failed.
@@ -379,7 +379,7 @@ Expected: 281 passed (280 baseline + 1 new). 0 failed.
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/src/transport/io_bridge.rs
 git commit -m "$(cat <<'EOF'
 feat(io_bridge): maybe_fire_session_reset gate + exactly-once unit test
@@ -409,7 +409,7 @@ EOF
 - [ ] **Step 1: Locate the three event handlers to update**
 
 ```bash
-grep -n "Event::Stream(StreamEvent::\(Opened\|Readable\)\|Event::ConnectionLost" /home/cedric/work/ghostframe/ghostframe-lib/src/transport/io_bridge.rs | head -10
+grep -n "Event::Stream(StreamEvent::\(Opened\|Readable\)\|Event::ConnectionLost" ghostframe-lib/src/transport/io_bridge.rs | head -10
 ```
 
 Three sites:
@@ -500,9 +500,9 @@ Event::ConnectionLost { reason } => {
 - [ ] **Step 5: Verify build + all lib tests**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build -p ghostframe-lib --tests 2>&1 | tail -5
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build -p ghostframe-lib --release --no-default-features 2>&1 | tail -5
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo build -p ghostframe-lib --tests 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo build -p ghostframe-lib --release --no-default-features 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -5
 ```
 
 Expected: all three succeed. Lib tests: 281 passed.
@@ -510,7 +510,7 @@ Expected: all three succeed. Lib tests: 281 passed.
 - [ ] **Step 6: Quick smoke-test with an existing e2e that exercises session establishment**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_solid_color -- --test-threads=1 --nocapture 2>&1 | tee /tmp/wire_smoke.log | tail -10
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_solid_color -- --test-threads=1 --nocapture 2>&1 | tee /tmp/wire_smoke.log | tail -10
 grep "new session connected" /tmp/wire_smoke.log
 ```
 
@@ -521,7 +521,7 @@ If the test FAILS with a new behavior (e.g., panic in the H.264 path because fra
 - [ ] **Step 7: Rebuild docker image (server-side change in lib affects xdaemon binary)**
 
 ```bash
-cd /home/cedric/work/ghostframe && docker build -t ghostframe/test-server:latest -f tests/containers/test-server/Dockerfile . 2>&1 | tail -3
+docker build -t ghostframe/test-server:latest -f tests/containers/test-server/Dockerfile . 2>&1 | tail -3
 ```
 
 Expected: "Successfully tagged ghostframe/test-server:latest". If "no space left on device", run `docker system prune -a -f` first and retry.
@@ -529,7 +529,7 @@ Expected: "Successfully tagged ghostframe/test-server:latest". If "no space left
 - [ ] **Step 8: Run the full e2e suite for regression**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e -- --test-threads=1 2>&1 | tee /tmp/wire_full.log | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e -- --test-threads=1 2>&1 | tee /tmp/wire_full.log | tail -5
 ```
 
 Expected: 22 passed, 0 failed, 3 ignored (baseline from `f8019a0`). The e2e_decode_error_thin_uncached is still `#[ignore]`'d at this stage — Task 7 drops it.
@@ -539,7 +539,7 @@ If regressions appear, the bug A wiring exposed a side effect that breaks someth
 - [ ] **Step 9: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/src/transport/io_bridge.rs
 git commit -m "$(cat <<'EOF'
 fix(io_bridge): wire maybe_fire_session_reset into event handlers (Bug A)
@@ -633,7 +633,7 @@ fn acquire_or_allocate_uses_empty_slots_before_evicting_cached() {
 - [ ] **Step 2: Run the test, verify it fails with the CURRENT (pre-fix) ladder order**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib acquire_or_allocate_uses_empty_slots_before_evicting_cached 2>&1 | tail -15
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib acquire_or_allocate_uses_empty_slots_before_evicting_cached 2>&1 | tail -15
 ```
 
 Expected: FAIL with `assertion failed: id_blue == 1` (actual: 0). Confirms the bug: slot 0 gets overwritten because find_eligible_free_slot runs before find_empty_slot.
@@ -644,7 +644,7 @@ If it passes UNEXPECTEDLY, the ladder may have already been reordered by someone
 
 Locate `acquire_or_allocate`:
 ```bash
-grep -nA20 "pub fn acquire_or_allocate" /home/cedric/work/ghostframe/ghostframe-lib/src/encoder/pal_rle.rs | head -25
+grep -nA20 "pub fn acquire_or_allocate" ghostframe-lib/src/encoder/pal_rle.rs | head -25
 ```
 
 Currently (line 228 in commit `f8019a0`):
@@ -704,7 +704,7 @@ pub fn acquire_or_allocate(&mut self, palette: &PaletteEntry) -> Option<u8> {
 - [ ] **Step 4: Re-run the test, verify it passes**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib acquire_or_allocate_uses_empty_slots_before_evicting_cached 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib acquire_or_allocate_uses_empty_slots_before_evicting_cached 2>&1 | tail -5
 ```
 
 Expected: 1 passed; 0 failed.
@@ -712,19 +712,19 @@ Expected: 1 passed; 0 failed.
 - [ ] **Step 5: Run all lib tests for regression**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -5
 ```
 
 Expected: 282 passed (281 baseline + 1 new). 0 failed.
 
-Pay particular attention to other `acquire_or_allocate_*` tests (find with `grep -n "fn acquire_or_allocate" /home/cedric/work/ghostframe/ghostframe-lib/src/encoder/pal_rle.rs`). If any pre-existing test fails:
+Pay particular attention to other `acquire_or_allocate_*` tests (find with `grep -n "fn acquire_or_allocate" ghostframe-lib/src/encoder/pal_rle.rs`). If any pre-existing test fails:
 - It probably depended on the OLD order's "prefer reused FreeButCached" semantics.
 - Inspect the test's expected slot ID — if it expected slot 0 (after reset) but now sees slot 1 (because the empty slot path wins), the test was over-specifying the implementation detail and should be relaxed.
 
 - [ ] **Step 6: Rebuild docker image (lib change affects xdaemon binary)**
 
 ```bash
-cd /home/cedric/work/ghostframe && docker build -t ghostframe/test-server:latest -f tests/containers/test-server/Dockerfile . 2>&1 | tail -3
+docker build -t ghostframe/test-server:latest -f tests/containers/test-server/Dockerfile . 2>&1 | tail -3
 ```
 
 Expected: "Successfully tagged ghostframe/test-server:latest".
@@ -732,7 +732,7 @@ Expected: "Successfully tagged ghostframe/test-server:latest".
 - [ ] **Step 7: Quick e2e smoke-test on a PalRle-using test**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_palrle_5pct_loss e2e_palrle_oob_index e2e_solid_per_tile_pixels -- --test-threads=1 2>&1 | tee /tmp/palrle_smoke.log | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_palrle_5pct_loss e2e_palrle_oob_index e2e_solid_per_tile_pixels -- --test-threads=1 2>&1 | tee /tmp/palrle_smoke.log | tail -5
 ```
 
 Expected: 3 passed. Spot-check the log for the `in_flight_carrying underflow` warning — it should appear ZERO times now (was 660+ per test pre-fix):
@@ -746,7 +746,7 @@ Expected: 0.
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/src/encoder/pal_rle.rs
 git commit -m "$(cat <<'EOF'
 fix(pal_rle): reorder acquire_or_allocate ladder (Bug B)
@@ -778,7 +778,7 @@ EOF
 - [ ] **Step 1: Locate the "Per-frame allocation algorithm" section**
 
 ```bash
-grep -nA8 "Per-frame allocation algorithm" /home/cedric/work/ghostframe/docs/superpowers/specs/2026-05-13-palrle-codec-design.md
+grep -nA8 "Per-frame allocation algorithm" docs/superpowers/specs/2026-05-13-palrle-codec-design.md
 ```
 
 Currently lines 565-572:
@@ -813,7 +813,7 @@ See `acquire_or_allocate` in Phase A above. The 4-way ladder:
 - [ ] **Step 3: Verify the doc still renders sensibly**
 
 ```bash
-sed -n "563,580p" /home/cedric/work/ghostframe/docs/superpowers/specs/2026-05-13-palrle-codec-design.md
+sed -n "563,580p" docs/superpowers/specs/2026-05-13-palrle-codec-design.md
 ```
 
 Visual scan: the section reads coherently and the surrounding sections (Phase A reference, Connection lifecycle) still make sense.
@@ -821,7 +821,7 @@ Visual scan: the section reads coherently and the surrounding sections (Phase A 
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add docs/superpowers/specs/2026-05-13-palrle-codec-design.md
 git commit -m "$(cat <<'EOF'
 docs(palrle): document reordered 4-way allocation ladder (Bug B)
@@ -846,7 +846,7 @@ EOF
 - [ ] **Step 1: Locate the test**
 
 ```bash
-grep -nB18 "fn e2e_decode_error_thin_uncached" /home/cedric/work/ghostframe/ghostframe-lib/tests/e2e.rs | head -25
+grep -nB18 "fn e2e_decode_error_thin_uncached" ghostframe-lib/tests/e2e.rs | head -25
 ```
 
 There's a multi-line `// W3 / A5 / B6` comment block above it (from commit `70efa56`) describing the prior carry-over rationale.
@@ -874,7 +874,7 @@ Before (current):
 //       delivered. The server emits BUNDLED then THIN within the same
 //       flip cycle, so the client never sees thin against an empty shadow.
 //
-// Full diagnosis at /home/cedric/.claude/projects/-home-cedric-work-ghostframe/
+// Full diagnosis at ~/.claude/projects/-home-cedric-work-ghostframe/
 // memory/project_decode_error_thin_diagnosis.md.  Closing this test cleanly
 // requires fixing (1) and (2), both of which are out of M3.2c scope.
 #[ignore = "M3.2c carry-over: natural pipeline blocked by latent on_session_reset dead-code + LRU thrashing on 2-palette workloads — see project_decode_error_thin_diagnosis.md"]
@@ -898,7 +898,7 @@ Drop the entire `#[ignore = "..."]` line.
 - [ ] **Step 3: Verify the test compiles**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build --tests -p ghostframe-lib 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo build --tests -p ghostframe-lib 2>&1 | tail -5
 ```
 
 Expected: build succeeds.
@@ -906,7 +906,7 @@ Expected: build succeeds.
 - [ ] **Step 4: Run the test**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_decode_error_thin_uncached -- --test-threads=1 --nocapture 2>&1 | tee /tmp/decode_validate.log | tail -20
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_decode_error_thin_uncached -- --test-threads=1 --nocapture 2>&1 | tee /tmp/decode_validate.log | tail -20
 ```
 
 Expected: 1 passed.
@@ -917,7 +917,7 @@ If FAIL: proceed to the contingency below. Do NOT commit until either (a) the te
 
 The two latent bugs were the diagnosis's full root-cause set. If the test still fails, a third blocker exists. To diagnose:
 
-(a) Re-add the four client-side recorders from the prior diagnosis session (`__ghostframeRecordedPrevalidate`, `__ghostframeDecodeErrorReports`, `__ghostframeDecodeErrorFlushes`, `__ghostframeFeedbackWriteErrors`) and the test-side dumps — see `/home/cedric/work/ghostframe/.claude/decode_thin_diag_findings.md` for the exact patches that were applied uncommitted in commit `70efa56`'s predecessor session.
+(a) Re-add the four client-side recorders from the prior diagnosis session (`__ghostframeRecordedPrevalidate`, `__ghostframeDecodeErrorReports`, `__ghostframeDecodeErrorFlushes`, `__ghostframeFeedbackWriteErrors`) and the test-side dumps — see `.claude/decode_thin_diag_findings.md` for the exact patches that were applied uncommitted in commit `70efa56`'s predecessor session.
 
 (b) Re-run the test, classify the new failure into the hypothesis grid in that same findings file (H1: prevalidate ever fires errorCode=3? H2: DecodeErrorBatcher.report called? H3: batcher flushes? H4: feedback write errors?).
 
@@ -930,7 +930,7 @@ The two latent bugs were the diagnosis's full root-cause set. If the test still 
 - [ ] **Step 5: Commit (only if Step 4 passed)**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/tests/e2e.rs
 git commit -m "$(cat <<'EOF'
 test(e2e): close e2e_decode_error_thin_uncached via Bug A + Bug B fixes
@@ -1009,7 +1009,7 @@ To:
 - [ ] **Step 4: Run the FULL e2e suite to confirm green**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e -- --test-threads=1 2>&1 | tee /tmp/decode_final.log | tail -10
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e -- --test-threads=1 2>&1 | tee /tmp/decode_final.log | tail -10
 ```
 
 Expected: 23 passed, 0 failed, 2 ignored.
@@ -1017,7 +1017,7 @@ Expected: 23 passed, 0 failed, 2 ignored.
 - [ ] **Step 5: Run lib unit tests**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -5
 ```
 
 Expected: 282 passed (280 prior + maybe_fire_session_reset_fires_exactly_once_per_handle + acquire_or_allocate_uses_empty_slots_before_evicting_cached). 0 failed.
@@ -1025,7 +1025,7 @@ Expected: 282 passed (280 prior + maybe_fire_session_reset_fires_exactly_once_pe
 - [ ] **Step 6: Run vitest sanity**
 
 ```
-cd /home/cedric/work/ghostframe/ghostframe-web-client && npm test 2>&1 | tail -5
+cd ghostframe-web-client && npm test 2>&1 | tail -5
 ```
 
 Expected: 27 passed (unchanged — no client-side changes in this plan).
@@ -1033,7 +1033,7 @@ Expected: 27 passed (unchanged — no client-side changes in this plan).
 - [ ] **Step 7: Final commit if any straggler tweaks needed**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git status --short
 ```
 

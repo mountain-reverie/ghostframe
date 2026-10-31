@@ -69,7 +69,7 @@ pub fn cleanup_stale_xvfb_sockets() {
 - [ ] **Step 2: Verify the test crate compiles**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build --tests -p ghostframe-lib 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo build --tests -p ghostframe-lib 2>&1 | tail -5
 ```
 
 Expected: build succeeds, no errors. (If you see "unused import" warnings from the `UnixStream` use being scoped to the function body, that's fine — Rust accepts that.)
@@ -87,7 +87,7 @@ ls /tmp/.X11-unix/ | grep -E '^X(100|101)$' | wc -l
 Then run any existing e2e test that uses `setup_e2e_inner`. The helper runs and removes them. Verify after:
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_solid_color -- --test-threads=1 2>&1 | tee /tmp/cleanup_smoke.log | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_solid_color -- --test-threads=1 2>&1 | tee /tmp/cleanup_smoke.log | tail -5
 grep "cleanup_stale_xvfb_sockets: removed" /tmp/cleanup_smoke.log || echo "WARNING: cleanup didn't run yet — Task 2 wires the call site"
 ls /tmp/.X11-unix/ | grep -E '^X(100|101)$' | wc -l
 ```
@@ -104,7 +104,7 @@ rm -f /tmp/.X11-unix/X100 /tmp/.X11-unix/X101 /tmp/.X100-lock
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/tests/e2e/helpers.rs
 git commit -m "$(cat <<'EOF'
 feat(e2e-helpers): cleanup_stale_xvfb_sockets probe-then-unlink helper
@@ -132,7 +132,7 @@ EOF
 - [ ] **Step 1: Locate `setup_e2e_inner`**
 
 ```bash
-grep -n "async fn setup_e2e_inner" /home/cedric/work/ghostframe/ghostframe-lib/tests/e2e.rs
+grep -n "async fn setup_e2e_inner" ghostframe-lib/tests/e2e.rs
 ```
 
 Note the line number (around line 247 as of commit `33247f8`).
@@ -140,7 +140,7 @@ Note the line number (around line 247 as of commit `33247f8`).
 - [ ] **Step 2: Read the function signature + first few lines**
 
 ```bash
-sed -n "247,255p" /home/cedric/work/ghostframe/ghostframe-lib/tests/e2e.rs
+sed -n "247,255p" ghostframe-lib/tests/e2e.rs
 ```
 
 Confirm the signature is:
@@ -174,7 +174,7 @@ async fn setup_e2e_inner(
 - [ ] **Step 4: Verify the test crate compiles**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build --tests -p ghostframe-lib 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo build --tests -p ghostframe-lib 2>&1 | tail -5
 ```
 
 Expected: build succeeds.
@@ -186,7 +186,7 @@ Seed fake stale sockets, run a single test, confirm both the cleanup eprintln fi
 ```bash
 touch /tmp/.X11-unix/X100 /tmp/.X11-unix/X101 /tmp/.X11-unix/X102 /tmp/.X100-lock
 ls /tmp/.X11-unix/ | grep -cE '^X1(00|01|02)$'  # expect: 3
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_solid_color -- --test-threads=1 --nocapture 2>&1 | tee /tmp/cleanup_smoke.log | tail -10
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_solid_color -- --test-threads=1 --nocapture 2>&1 | tee /tmp/cleanup_smoke.log | tail -10
 grep "cleanup_stale_xvfb_sockets: removed" /tmp/cleanup_smoke.log
 ls /tmp/.X11-unix/ | grep -cE '^X1(00|01|02)$'  # expect: 0
 ```
@@ -208,7 +208,7 @@ XVFB_PID=$!
 sleep 1
 ls /tmp/.X11-unix/X150
 # Expected: file exists, owned by Xvfb's user
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_solid_color -- --test-threads=1 --nocapture 2>&1 | grep cleanup_stale_xvfb_sockets
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_solid_color -- --test-threads=1 --nocapture 2>&1 | grep cleanup_stale_xvfb_sockets
 # Expected: either no log line at all, OR a log line with a count that does NOT remove X150
 ls /tmp/.X11-unix/X150
 # Expected: file STILL exists
@@ -220,7 +220,7 @@ If Xvfb isn't installed, skip this step and document it; the probe semantics are
 - [ ] **Step 7: Run the full e2e suite to confirm no regressions**
 
 ```
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e -- --test-threads=1 2>&1 | tee /tmp/cleanup_full.log | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e -- --test-threads=1 2>&1 | tee /tmp/cleanup_full.log | tail -5
 ```
 
 Expected: same count as pre-fix (22 passed, 0 failed, 3 ignored as of commit `f8019a0`). If any regression, the cleanup is touching something it shouldn't — investigate `cleanup_smoke.log` for unexpected removals.
@@ -228,7 +228,7 @@ Expected: same count as pre-fix (22 passed, 0 failed, 3 ignored as of commit `f8
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/tests/e2e.rs
 git commit -m "$(cat <<'EOF'
 feat(e2e): call cleanup_stale_xvfb_sockets at setup_e2e_inner start

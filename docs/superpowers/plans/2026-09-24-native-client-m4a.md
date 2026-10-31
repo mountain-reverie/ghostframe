@@ -942,7 +942,7 @@ function showDisconnectedOverlay(message: string): void {
 
 ```bash
 cd ghostframe-web-client && npm test
-cd /home/cedric/work/ghostframe && PATH="$HOME/.cargo/bin:$PATH" just build-web
+PATH="$HOME/.cargo/bin:$PATH" just build-web
 ```
 
 Expected: the new tests pass, the existing suite stays green, the build is
