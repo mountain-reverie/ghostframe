@@ -312,9 +312,7 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
         // plans this tick.
         if let Some(net) = net.as_mut() {
             server.feedback().drain_into(&mut feedback_buf);
-            for fb in feedback_buf.drain(..) {
-                net.ingest(fb);
-            }
+            crate::capture::ingest_feedback(&mut backend, net, feedback_buf.drain(..));
         }
         let consumes = cfg.damage_mode == DamageMode::On;
         let (_damage, grabbed) = match net.as_mut() {

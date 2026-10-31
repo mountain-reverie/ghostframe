@@ -856,3 +856,38 @@ fn x11_mutation_sending_unchanged_over_damage_fails_the_property() {
         .expect_err("the mutation must break the property");
     println!("mutation UnchangedIgnoresDamage: {e}");
 }
+
+/// A Dropped verdict from the library (it refused an `Unchanged` tick, or
+/// failed a frame) makes the very next tick a whole pixels frame, instead of
+/// more content-free ticks until the next sweep slice.
+#[test]
+fn x11_a_dropped_verdict_makes_the_next_tick_carry_pixels() {
+    use ghostframe_lib::{Content, FeedbackKind, FrameFeedback};
+    let mut rig = Rig::new(Mutation::None);
+    rig.backend.set_allow_unchanged(true);
+    // Idle: pixels on the sweep tick, unchanged in between. Stop right after
+    // the first unchanged tick of a gap, where the next one would be too.
+    let mut prev = Content::Pixels;
+    let mut stopped = false;
+    for _ in 0..40 {
+        let c = rig.tick_raw().content;
+        if prev == Content::Pixels && c == Content::Unchanged {
+            stopped = true;
+            break;
+        }
+        prev = c;
+    }
+    assert!(stopped, "no unchanged tick after a pixels tick");
+    let drop = FrameFeedback {
+        timestamp_us: rig.ts,
+        width: u32::from(W),
+        height: u32::from(H),
+        kind: FeedbackKind::Dropped,
+    };
+    crate::capture::ingest_feedback(&mut rig.backend, &mut rig.net, [drop]);
+    let next = rig.tick_raw();
+    assert_eq!(next.content, Content::Pixels, "the tick after a drop");
+    // It delivered a frame, so content-free ticks resume.
+    let after = rig.tick_raw();
+    assert_eq!(after.content, Content::Unchanged);
+}
