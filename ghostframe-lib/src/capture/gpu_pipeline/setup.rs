@@ -192,6 +192,21 @@ impl GpuFrameProcessor {
         }
         let chosen_idx = choose_device(&candidates)?;
         let physical_device = phys_devices[chosen_idx];
+        // `tile_sad` loads and stores the B8G8R8A8 reference image (it commits
+        // dirty tiles into it), so storage-image support is required, not
+        // just sampled reads. Not mandatory for this format; fail clearly.
+        let bgra_props = instance
+            .get_physical_device_format_properties(physical_device, vk::Format::B8G8R8A8_UNORM);
+        if !bgra_props
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
+        {
+            return Err(
+                "Vulkan device lacks STORAGE_IMAGE support for B8G8R8A8_UNORM \
+                        (needed by the tile_sad reference commit)"
+                    .into(),
+            );
+        }
         tracing::info!(
             device = %candidates[chosen_idx].name,
             device_type = ?candidates[chosen_idx].device_type,
@@ -260,9 +275,9 @@ impl GpuFrameProcessor {
         //   0: STORAGE_IMAGE (current frame)
         //   1: STORAGE_IMAGE (prev frame)
         //   2: STORAGE_BUFFER (SAD output)
-        // Push constants: 3 × u32 = 12 bytes (frame_width, frame_height, cols).
+        // Push constants: 4 × u32 = 16 bytes (frame_width, frame_height, cols, threshold).
         let (descriptor_set_layout, pipeline_layout, pipeline) =
-            pipeline_builder::build_compute_pipeline(&device, &SAD_BINDINGS, 12, shader_module)?;
+            pipeline_builder::build_compute_pipeline(&device, &SAD_BINDINGS, 16, shader_module)?;
 
         // --- NV12 compute pipeline ---
         // Bindings:
