@@ -531,8 +531,10 @@ fn x11_a_band_failing_mid_grab_leaves_no_stale_slot() {
             "tick {i} after the failure: {:?}",
             out.grab
         );
-        // The failed tick's rows never reached the library: nothing may be
-        // left unnamed to it (the tick after a failure goes out as Unknown).
+        // Nothing may be left unnamed to the library. This holds without the
+        // `age_floor` rule too, because the backend's distrust already makes the
+        // tick after a failed capture Unknown; the rule itself is pinned by
+        // `x11_the_tick_after_a_failed_grab_goes_to_the_library_as_unknown`.
         assert_eq!(out.unnamed_change, None, "tick {i} after the failure");
         if out.grab == Grab::Full {
             fulls += 1;
@@ -700,4 +702,32 @@ fn x11_the_tick_after_a_failed_grab_goes_to_the_library_as_unknown() {
         f.capture(3).unwrap().damage,
         FrameDamage::Tiles { .. }
     ));
+}
+
+/// A capture that fails before it consumes its plan (every slot in flight)
+/// loses that tick's damage: the next plan must not be believed, or the
+/// library is told only the new tick's rows.
+#[test]
+fn x11_the_tick_after_a_would_block_goes_to_the_library_as_unknown() {
+    use crate::capture::{Damage, TileBitmap};
+    let mut rig = Rig::new(Mutation::None);
+    for _ in 0..10 {
+        assert_eq!(rig.tick().mismatch, None);
+    }
+    let tiles = |y: u32| {
+        let mut b = TileBitmap::new(u32::from(W), u32::from(H));
+        b.set(1, y);
+        Damage::Tiles(b)
+    };
+    let f = &mut rig.backend.frames;
+    let mut held = Vec::new();
+    while let Ok(fr) = f.capture(1) {
+        held.push(fr);
+    }
+    f.plan_grab(&tiles(2), None, true);
+    assert!(f.capture(2).is_err(), "every slot is in flight");
+    held.pop();
+    f.plan_grab(&tiles(5), None, true);
+    let frame = f.capture(3).unwrap();
+    assert_eq!(frame.damage, FrameDamage::Unknown);
 }

@@ -721,7 +721,11 @@ impl X11Frames {
         if !self.plan_mask.matches(w, h) {
             self.plan_mask = TileBitmap::new(w, h);
         }
+        // A plan nobody consumed (the capture failed before it could: a stale
+        // geometry, every slot in flight) took its damage with it, so this
+        // tick's mask does not name what the library lacks.
         let known = trusted
+            && self.plan.is_none()
             && match damage {
                 Damage::Tiles(b) if b.matches(w, h) => {
                     self.plan_mask.copy_from(b);
