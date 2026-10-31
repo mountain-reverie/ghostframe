@@ -130,6 +130,23 @@ impl Rig {
         self.conn.get_input_focus().unwrap().reply().unwrap();
     }
 
+    /// One tick in `on` mode with `Unchanged` allowed, and the frame as it
+    /// came: no property check.
+    pub fn tick_raw(&mut self) -> ghostframe_lib::FrameSubmission {
+        self.ts += 33_333;
+        let (_, frame) = damage_plan_grab(&mut self.backend, &mut self.net, self.ts);
+        frame.expect("grab")
+    }
+
+    /// A fresh whole-root grab (cursor blended), by the reference connection.
+    pub fn fresh(&mut self) -> Vec<u8> {
+        self.reference
+            .capture(self.ts)
+            .expect("reference grab")
+            .pixels
+            .to_vec()
+    }
+
     /// One tick of the capture loop in `on` mode, then the property check.
     pub fn tick(&mut self) -> TickOut {
         self.try_tick().expect("grab")
@@ -730,4 +747,100 @@ fn x11_the_tick_after_a_would_block_goes_to_the_library_as_unknown() {
     f.plan_grab(&tiles(5), None, true);
     let frame = f.capture(3).unwrap();
     assert_eq!(frame.damage, FrameDamage::Unknown);
+}
+
+/// What a library that trusts `Unchanged` believes the screen shows after
+/// each tick: a pixels frame replaces the rows its damage names (all rows for
+/// `Unknown`), an unchanged tick leaves it. It must equal a fresh full grab
+/// after every tick, which fails the moment the server says "unchanged" about
+/// a tick that changed something.
+fn run_unchanged_property(mutation: Mutation, ticks: u32, seed: u64) -> Result<(u32, u32), String> {
+    use ghostframe_lib::Content;
+    let mut rig = Rig::new(mutation);
+    rig.backend.set_allow_unchanged(true);
+    let mut rng = Rng(seed | 1);
+    let row = usize::from(W) * 4;
+    let mut model: Vec<u8> = Vec::new();
+    let (mut unchanged, mut pixels) = (0u32, 0u32);
+    for t in 0..ticks {
+        // Bursts of painting between long idle runs.
+        let busy = (t / 12) % 3 == 0;
+        if busy && rng.below(2) == 0 {
+            let r = Rectangle {
+                x: rng.below(u64::from(W) - 8) as i16,
+                y: rng.below(u64::from(H) - 4) as i16,
+                width: (8 + rng.below(60)) as u16,
+                height: (4 + rng.below(40)) as u16,
+            };
+            rig.fill(r, (rng.next() as u32) & 0xff_ffff);
+        }
+        if busy && rng.below(8) == 0 {
+            rig.warp(
+                rng.below(u64::from(W)) as i16,
+                rng.below(u64::from(H)) as i16,
+            );
+        }
+        let frame = rig.tick_raw();
+        let fresh = rig.fresh();
+        match frame.content {
+            Content::Unchanged => {
+                unchanged += 1;
+                if !frame.pixels.is_empty() {
+                    return Err(format!("tick {t}: an unchanged tick carried pixels"));
+                }
+            }
+            Content::Pixels => {
+                pixels += 1;
+                if let Some(i) = frame.pixels.iter().zip(&fresh).position(|(a, b)| a != b) {
+                    return Err(format!(
+                        "tick {t}: delivered slot differs from a full grab at byte {i}"
+                    ));
+                }
+                match &frame.damage {
+                    FrameDamage::Tiles { hint, verify } if !model.is_empty() => {
+                        let cols = usize::from(W).div_ceil(32);
+                        for ty in 0..usize::from(H).div_ceil(32) {
+                            if (0..cols)
+                                .any(|tx| hint.get(ty * cols + tx) || verify.get(ty * cols + tx))
+                            {
+                                let (y0, y1) = (ty * 32, ((ty + 1) * 32).min(usize::from(H)));
+                                model[y0 * row..y1 * row]
+                                    .copy_from_slice(&frame.pixels[y0 * row..y1 * row]);
+                            }
+                        }
+                    }
+                    _ => model = frame.pixels.to_vec(),
+                }
+            }
+        }
+        if model != fresh {
+            let i = model
+                .iter()
+                .zip(&fresh)
+                .position(|(a, b)| a != b)
+                .unwrap_or(0);
+            return Err(format!(
+                "tick {t}: the library's screen differs from the real one at pixel {},{} after a {:?} tick",
+                (i / 4) % usize::from(W),
+                (i / 4) / usize::from(W),
+                frame.content
+            ));
+        }
+    }
+    Ok((unchanged, pixels))
+}
+
+#[test]
+fn x11_the_library_screen_stays_exact_across_unchanged_ticks() {
+    let (unchanged, pixels) = run_unchanged_property(Mutation::None, 240, 0xfeed).unwrap();
+    // Not vacuous: idle ticks went out without pixels, busy ones with.
+    assert!(unchanged >= 60, "only {unchanged} unchanged ticks");
+    assert!(pixels >= 60, "only {pixels} pixels ticks");
+}
+
+#[test]
+fn x11_mutation_sending_unchanged_over_damage_fails_the_property() {
+    let e = run_unchanged_property(Mutation::UnchangedIgnoresDamage, 240, 0xfeed)
+        .expect_err("the mutation must break the property");
+    println!("mutation UnchangedIgnoresDamage: {e}");
 }

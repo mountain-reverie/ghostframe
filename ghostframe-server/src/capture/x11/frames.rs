@@ -210,6 +210,12 @@ pub struct X11Frames {
     /// What the next `capture` may take from the damage (`on` mode); `None`
     /// means a full grab.
     plan: Option<Plan>,
+    /// Whether a believed tick with nothing to show may be sent as
+    /// [`Content::Unchanged`] (design 3.3). Off unless the consumer asks.
+    allow_unchanged: bool,
+    /// The size of the last frame handed to the caller; `Unchanged` is only
+    /// sent for that size, and not after a failed grab.
+    last_sent: Option<(u16, u16)>,
     /// The planned tick's damage, reused every tick.
     plan_mask: TileBitmap,
     /// Scratch for the sweep slice's tiles, reused every tick.
@@ -279,6 +285,8 @@ pub(crate) enum Mutation {
     EmptyLibHint,
     /// Tell the library nothing of the sweep slice.
     EmptyLibVerify,
+    /// Send `Unchanged` whatever the damage and the sweep say.
+    UnchangedIgnoresDamage,
 }
 
 /// A cursor image's rectangle in root coordinates.
@@ -369,6 +377,8 @@ impl X11Frames {
             shm_alloc_failing: false,
             stats: Default::default(),
             plan: None,
+            allow_unchanged: false,
+            last_sent: None,
             plan_mask: TileBitmap::empty(),
             verify_mask: TileBitmap::empty(),
             lib_damage: None,
@@ -740,6 +750,75 @@ impl X11Frames {
         self.plan = Some(Plan { known, slice });
     }
 
+    /// Size the age ring for a `w` x `h` root (empty entries, tick 0).
+    fn ensure_ring(&mut self, w: u32, h: u32) {
+        if !self.ring.first().is_some_and(|e| e.mask.matches(w, h)) {
+            self.ring = (0..AGE_RING)
+                .map(|_| AgeEntry {
+                    tick: 0,
+                    mask: TileBitmap::new(w, h),
+                })
+                .collect();
+            self.union = TileBitmap::new(w, h);
+        }
+    }
+
+    /// Whether this tick has nothing to show the library (design 3.3): the
+    /// plan is believed and names no damage and no cursor change, no sweep
+    /// slice is due, and the last frame sent was of this size and was grabbed
+    /// by a tick whose damage the library saw. The library's own baseline is
+    /// its business: a tick it cannot honour it drops.
+    fn tick_is_content_free(&self) -> bool {
+        let (w, h) = (u32::from(self.width), u32::from(self.height));
+        self.allow_unchanged
+            && self.last_sent == Some((self.width, self.height))
+            // The tick after a failed grab lost its predecessor's damage.
+            && self.tick + 1 != self.age_floor
+            // Poll-less callers cannot say the cursor is where it was drawn.
+            && self.polled_cursor.is_some()
+            && self.plan.as_ref().is_some_and(|p| {
+                #[cfg(test)]
+                if self.mutation == Mutation::UnchangedIgnoresDamage {
+                    return p.known;
+                }
+                p.known && p.slice.is_none() && self.plan_mask.matches(w, h) && self.plan_mask.is_empty()
+            })
+    }
+
+    /// A tick with no pixels: no slot, no grab, no cursor blend. It still
+    /// takes its place in the age ring, with an empty mask, so a slot grabbed
+    /// later refreshes exactly what the ticks since it was last current
+    /// changed.
+    fn unchanged_tick(&mut self, timestamp_us: u32) -> FrameSubmission {
+        self.tick += 1;
+        let t = self.tick;
+        self.lib_damage = None;
+        self.plan = None;
+        self.polled_cursor = None;
+        let (w, h) = (u32::from(self.width), u32::from(self.height));
+        self.ensure_ring(w, h);
+        let entry = &mut self.ring[(t % AGE_RING as u64) as usize];
+        entry.tick = t;
+        entry.mask.clear();
+        FrameSubmission {
+            width: w,
+            height: h,
+            stride: w * 4,
+            pixels: FrameBuf::default(),
+            content: Content::Unchanged,
+            dmabuf_fd: None,
+            timestamp_us,
+            damage: FrameDamage::Unknown,
+            capture_done_ns: monotonic_now_ns(),
+        }
+    }
+
+    /// Say whether a content-free tick may be sent as
+    /// [`Content::Unchanged`] (the consumer of damage turns this on).
+    pub fn set_allow_unchanged(&mut self, on: bool) {
+        self.allow_unchanged = on;
+    }
+
     /// Decide what this tick grabs into a slot last made current at tick
     /// `held`, and file the tick's grab set in the age ring.
     ///
@@ -758,15 +837,7 @@ impl X11Frames {
             return Grab::Full;
         };
         let (w, h) = (u32::from(self.width), u32::from(self.height));
-        if !self.ring.first().is_some_and(|e| e.mask.matches(w, h)) {
-            self.ring = (0..AGE_RING)
-                .map(|_| AgeEntry {
-                    tick: 0,
-                    mask: TileBitmap::new(w, h),
-                })
-                .collect();
-            self.union = TileBitmap::new(w, h);
-        }
+        self.ensure_ring(w, h);
         let entry = &mut self.ring[(t % AGE_RING as u64) as usize];
         entry.tick = t;
         // The plan was made before the geometry was re-read: a mask for
@@ -846,6 +917,9 @@ impl X11Frames {
         if retry_due(&mut self.shm_retry_in) {
             self.ensure_segment();
         }
+        if self.tick_is_content_free() {
+            return Ok(self.unchanged_tick(timestamp_us));
+        }
         let slot = self.pool.try_acquire().ok_or_else(|| {
             io::Error::new(io::ErrorKind::WouldBlock, "every frame slot is in flight")
         })?;
@@ -869,6 +943,7 @@ impl X11Frames {
                 // every slot's age is unknown from here.
                 self.ring.clear();
                 self.age_floor = self.tick + 1;
+                self.last_sent = None;
                 return Err(e);
             }
         };
@@ -885,6 +960,7 @@ impl X11Frames {
         let capture_done_ns = monotonic_now_ns();
         let width = u32::from(self.width);
         let height = u32::from(self.height);
+        self.last_sent = Some((self.width, self.height));
         let frame = FrameSubmission {
             width,
             height,
