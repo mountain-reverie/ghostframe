@@ -26,7 +26,7 @@
 //! | `GHOSTFRAME_DUMP_FIRST_FRAME` | dump first raw frame to this path (test builds only) | off |
 //! | `GHOSTFRAME_RANDR_SETTLE_MS` | least wait after a mode change before checking the desktop kept it | 5000 (`0` turns the read-back off) |
 //! | `GHOSTFRAME_DAMAGE_REPORT` | XDamage report level: `raw` selects `RawRectangles`, anything else `NonEmpty` + `FetchRegion` | `nonempty` |
-//! | `GHOSTFRAME_DAMAGE_MODE` | damage-driven encoding: `off`, `shadow` (hints and sweeps are computed and judged against the library's full compare, the whole screen is still grabbed), `on` (today the same as `shadow`; consumers land later) | `off` |
+//! | `GHOSTFRAME_DAMAGE_MODE` | damage-driven encoding: `off`, `shadow` (hints and sweeps are computed and judged against the library's full compare, the whole screen is still grabbed), `on` (band grab: only the damaged rows are copied, the library compares only the damaged rows, and a tick with no damage is content-free) | `on` |
 //! | `GHOSTFRAME_INSTALL_DETACHED` | `1`: `install` is the re-exec'd copy running as a transient unit; never re-exec again | unset |
 //! | `XDG_RUNTIME_DIR` | whether a user systemd manager can be asked about the old xdaemon (`login`, `capture`), and whether `login` enables and starts the installed unit | unset |
 //! | `GHOSTFRAME_MAX_RESOLUTION` | `WxH` resolution ceiling, or `none` | none (the unit `install` writes sets `1920x1080`) |
@@ -67,9 +67,7 @@ impl DamageReport {
 /// How much of the damage-driven encoding path runs (`GHOSTFRAME_DAMAGE_MODE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DamageMode {
-    /// Nothing runs: every tick grabs and compares the whole screen. The
-    /// default.
-    #[default]
+    /// Nothing runs: every tick grabs and compares the whole screen.
     Off,
     /// The safety net runs beside the unchanged full path: hints are
     /// computed, sweep slices scheduled, and the library's full compare is
@@ -80,19 +78,23 @@ pub enum DamageMode {
     /// pooled slot (the union over the slot's age), or the whole screen when
     /// damage is unknown, distrusted, or the bands exceed
     /// `capture::x11::bands::FULL_GRAB_ABOVE_PCT` of the rows. The library
-    /// still receives complete buffers and still compares in full.
+    /// compares only the damaged rows, and a tick with no damage carries no
+    /// pixels. The default.
+    #[default]
     On,
 }
 
 impl DamageMode {
-    /// `off` / `shadow` / `on`, case-insensitive. Anything else warns and is
-    /// `off`: a typo must not turn a trust-sensitive feature on.
+    /// `off` / `shadow` / `on`, case-insensitive. Unset or empty is `on`, the
+    /// default. Anything else warns and is `off`: a typo is read
+    /// conservatively, as "the operator wanted to change something", so it
+    /// lands on the path that trusts no damage.
     fn parse(raw: Option<String>) -> Self {
-        let Some(raw) = raw else { return Self::Off };
+        let Some(raw) = raw else { return Self::On };
         match raw.trim().to_ascii_lowercase().as_str() {
-            "" | "off" => Self::Off,
+            "" | "on" => Self::On,
+            "off" => Self::Off,
             "shadow" => Self::Shadow,
-            "on" => Self::On,
             _ => {
                 eprintln!(
                     "warning: GHOSTFRAME_DAMAGE_MODE={raw:?} is not off, shadow or on; using off"
@@ -335,9 +337,11 @@ mod tests {
     }
 
     #[test]
-    fn damage_mode_defaults_off_and_a_typo_never_turns_it_on() {
+    fn damage_mode_defaults_on_and_a_typo_falls_back_to_off() {
         let m = |v: &str| cfg(&[("GHOSTFRAME_DAMAGE_MODE", v)]).damage_mode;
-        assert_eq!(cfg(&[]).damage_mode, DamageMode::Off);
+        assert_eq!(cfg(&[]).damage_mode, DamageMode::On);
+        assert_eq!(m(""), DamageMode::On);
+        assert_eq!(m("  "), DamageMode::On);
         assert_eq!(m("shadow"), DamageMode::Shadow);
         assert_eq!(m(" Shadow "), DamageMode::Shadow);
         assert_eq!(m("on"), DamageMode::On);
