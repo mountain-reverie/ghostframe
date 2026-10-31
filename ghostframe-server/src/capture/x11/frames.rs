@@ -874,6 +874,11 @@ impl X11Frames {
         }
     }
 
+    /// The library dropped a frame: send a whole one next (no `Unchanged`).
+    pub fn frame_dropped(&mut self) {
+        self.last_sent = None;
+    }
+
     /// Say whether a content-free tick may be sent as
     /// [`Content::Unchanged`] (the consumer of damage turns this on).
     pub fn set_allow_unchanged(&mut self, on: bool) {

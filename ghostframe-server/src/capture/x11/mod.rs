@@ -179,6 +179,10 @@ impl super::Backend for X11Backend {
         Some(self.frames.size())
     }
 
+    fn frame_dropped(&mut self) {
+        self.frames.frame_dropped();
+    }
+
     fn plan_grab(
         &mut self,
         damage: &Damage,

@@ -85,6 +85,12 @@ pub trait Backend {
     /// everything; the default ignores the call.
     fn plan_grab(&mut self, _damage: &Damage, _slice: Option<safety_net::Slice>, _trusted: bool) {}
 
+    /// The library dropped a frame this backend sent (a refused `Unchanged`
+    /// tick, a failed analysis, no client): whatever it was told about the
+    /// pixels cannot be relied on, so the next tick carries a whole frame.
+    /// Default: nothing to forget.
+    fn frame_dropped(&mut self) {}
+
     /// Start damage reporting (a client connected). No-op without support.
     fn arm_damage(&mut self);
 
@@ -162,4 +168,21 @@ pub fn damage_net_grab<B: Backend + ?Sized>(
     }
     let frame = backend.capture(timestamp_us);
     (damage, frame)
+}
+
+/// Hand the library's verdicts to the safety net, and tell the backend about
+/// the dropped ones so it stops sending content-free ticks until it has
+/// delivered a frame (a refused `Unchanged` tick would otherwise repeat until
+/// the next sweep slice).
+pub fn ingest_feedback<B: Backend + ?Sized>(
+    backend: &mut B,
+    net: &mut safety_net::SafetyNet,
+    records: impl IntoIterator<Item = ghostframe_lib::FrameFeedback>,
+) {
+    for fb in records {
+        if fb.kind == ghostframe_lib::FeedbackKind::Dropped {
+            backend.frame_dropped();
+        }
+        net.ingest(fb);
+    }
 }
