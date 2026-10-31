@@ -796,7 +796,12 @@ impl X11Frames {
                 TileBits::from_words(w, h, verify_words),
             ) {
                 self.stats.alloc_copy(2 * self.plan_mask.words().len() * 8);
-                self.lib_damage = Some(FrameDamage::Tiles { hint, verify });
+                // The tick after a failed grab (or a resize) follows frames the
+                // library never saw, so the damage names only part of what it
+                // lacks: it compares everything.
+                if t != self.age_floor {
+                    self.lib_damage = Some(FrameDamage::Tiles { hint, verify });
+                }
             }
         } else {
             entry.mask.set_all();

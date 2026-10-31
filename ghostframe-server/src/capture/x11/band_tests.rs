@@ -531,6 +531,9 @@ fn x11_a_band_failing_mid_grab_leaves_no_stale_slot() {
             "tick {i} after the failure: {:?}",
             out.grab
         );
+        // The failed tick's rows never reached the library: nothing may be
+        // left unnamed to it (the tick after a failure goes out as Unknown).
+        assert_eq!(out.unnamed_change, None, "tick {i} after the failure");
         if out.grab == Grab::Full {
             fulls += 1;
         }
@@ -663,4 +666,38 @@ fn x11_a_swept_repair_is_named_to_the_library() {
         assert!(changed_ticks > 0);
         assert_eq!(unnamed > 0, must_fail, "{m:?}: {unnamed} unnamed changes");
     }
+}
+
+/// The library is told `Unknown` for the tick after a failed grab, even if the
+/// caller (bypassing the backend's distrust) plans it as believed: the failed
+/// tick's rows never reached the library, so the new tick's damage names only
+/// part of what it lacks.
+#[test]
+fn x11_the_tick_after_a_failed_grab_goes_to_the_library_as_unknown() {
+    use crate::capture::{Damage, TileBitmap};
+    let mut rig = Rig::new(Mutation::None);
+    for _ in 0..10 {
+        assert_eq!(rig.tick().mismatch, None);
+    }
+    let tiles = |ys: &[u32]| {
+        let mut b = TileBitmap::new(u32::from(W), u32::from(H));
+        for &y in ys {
+            b.set(1, y);
+        }
+        Damage::Tiles(b)
+    };
+    let f = &mut rig.backend.frames;
+    f.plan_grab(&tiles(&[2, 14]), None, true);
+    f.fail_second_band_once = true;
+    assert!(f.capture(1).is_err(), "the injected failure did not fire");
+    f.plan_grab(&tiles(&[5]), None, true);
+    let frame = f.capture(2).unwrap();
+    assert_eq!(frame.damage, FrameDamage::Unknown);
+    drop(frame);
+    // And the one after is believed again.
+    f.plan_grab(&tiles(&[5]), None, true);
+    assert!(matches!(
+        f.capture(3).unwrap().damage,
+        FrameDamage::Tiles { .. }
+    ));
 }
