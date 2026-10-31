@@ -33,6 +33,9 @@ pub enum Mode {
     On,
     /// `on` with the sweep switched off: the damage-proportional part alone.
     OnNoSweep,
+    /// `on` with content-free ticks sent as `Unchanged` (PR 7): no grab at
+    /// all unless damage, the cursor or a sweep slice is due.
+    OnUnchanged,
 }
 
 impl Mode {
@@ -41,6 +44,7 @@ impl Mode {
             Mode::Off => "off",
             Mode::On => "on",
             Mode::OnNoSweep => "on, no sweep",
+            Mode::OnUnchanged => "on, unchanged",
         }
     }
 }
@@ -199,6 +203,8 @@ pub struct Tick {
     /// The area the grab plan names, in bytes: the full root or the bands'
     /// rows times the stride. `bytes_grabbed` must equal it.
     pub planned_bytes: u64,
+    /// The tick was sent as `Unchanged` (it may still have refreshed a free slot).
+    pub unchanged: bool,
     /// Tiles in the damage hint; 0 when the hint was `None`.
     pub hint_tiles: usize,
     /// The hint itself, sorted, for determinism checks.
@@ -236,6 +242,30 @@ impl RunReport {
     }
     pub fn grab_requests(&self) -> f64 {
         self.mean(|t| u64::from(t.grab_requests))
+    }
+    /// The `q` quantile (0..=1) of `capture_us` over the damage ticks.
+    pub fn damage_tick_quantile(&self, q: f64) -> f64 {
+        let mut v: Vec<u64> = self
+            .ticks
+            .iter()
+            .filter(|t| t.hint_tiles > 0)
+            .map(|t| t.capture_us)
+            .collect();
+        if v.is_empty() {
+            return 0.0;
+        }
+        v.sort_unstable();
+        v[((v.len() - 1) as f64 * q).round() as usize] as f64
+    }
+    pub fn damage_tick_p50(&self) -> f64 {
+        self.damage_tick_quantile(0.5)
+    }
+    pub fn damage_tick_p99(&self) -> f64 {
+        self.damage_tick_quantile(0.99)
+    }
+    /// Fraction of ticks sent as `Unchanged` (no grab planned).
+    pub fn unchanged_frac(&self) -> f64 {
+        self.mean(|t| u64::from(t.unchanged))
     }
     pub fn hint_tiles(&self) -> f64 {
         self.mean(|t| t.hint_tiles as u64)
@@ -317,6 +347,22 @@ pub fn run_scene_mode(
     seed: u64,
     mode: Mode,
 ) -> RunReport {
+    run_scene_held(scene, w, h, ticks, seed, mode, 3)
+}
+
+/// [`run_scene_mode`] with the pipeline holding each frame for `hold_ticks`
+/// ticks before it is returned to the pool. 3 is a backlog (the default of the
+/// tables above); 1 is a pipeline that finishes a frame within a tick, as the
+/// library does when it keeps up.
+pub fn run_scene_held(
+    scene: Scene,
+    w: u16,
+    h: u16,
+    ticks: u32,
+    seed: u64,
+    mode: Mode,
+    hold_ticks: u32,
+) -> RunReport {
     let x = PrivateXvfb::spawn(&["-screen", "0", &format!("{w}x{h}x24")]);
     let d = x.display();
     let mut backend = X11Backend {
@@ -336,6 +382,7 @@ pub fn run_scene_mode(
     let mut net_cfg = NetConfig::for_fps(30);
     net_cfg.sweep = mode != Mode::OnNoSweep;
     let mut net = SafetyNet::new(net_cfg);
+    backend.set_allow_unchanged(mode == Mode::OnUnchanged);
     let mut painter = Painter::new(d, w, h, seed);
     // The pointer starts at the screen centre, whose tile alignment depends
     // on the resolution; park it at the same pixel everywhere.
@@ -347,6 +394,7 @@ pub fn run_scene_mode(
     let mut out = Vec::with_capacity(ticks as usize);
     let mut held = std::collections::VecDeque::new();
     for t in 0..ticks + WARMUP {
+        backend.frames.last_grab = None;
         painter.paint(scene, t);
         let cpu0 = thread_cpu_us();
         let t0 = Instant::now();
@@ -369,11 +417,16 @@ pub fn run_scene_mode(
         assert_eq!((frame.width, frame.height), (u32::from(w), u32::from(h)));
         let stride = u64::from(w) * 4;
         let planned_bytes = match backend.frames.last_grab {
+            // An unchanged tick grabs only to refresh a free slot, if at all.
+            None if frame.content == ghostframe_lib::Content::Unchanged => 0,
             Some(Grab::Bands(b)) if mode != Mode::Off => u64::from(b.rows()) * stride,
             _ => u64::from(h) * stride,
         };
-        held.push_back(frame.pixels);
-        if held.len() > 3 {
+        // The pipeline holds a frame for about three ticks of time, not three
+        // frames: an unchanged tick has none to hold. (With a frame every tick
+        // the two are the same.)
+        held.push_back((t, frame.pixels));
+        while held.front().is_some_and(|(at, _)| at + hold_ticks <= t) {
             held.pop_front();
         }
         let s = backend.take_tick_stats();
@@ -386,6 +439,7 @@ pub fn run_scene_mode(
                 bytes_grabbed: s.bytes_grabbed,
                 grab_requests: s.grab_requests,
                 planned_bytes,
+                unchanged: frame.content == ghostframe_lib::Content::Unchanged,
                 hint_tiles: hint.as_ref().map_or(0, |h| h.len()),
                 hint: {
                     let mut h = hint.unwrap_or_default();
@@ -451,6 +505,7 @@ mod tests {
                     bytes_grabbed: 0,
                     grab_requests: 0,
                     planned_bytes: 0,
+                    unchanged: false,
                     hint_tiles: 0,
                     hint: vec![],
                     pixel_hash: 0,
@@ -475,6 +530,7 @@ mod tests {
             bytes_grabbed: 0,
             grab_requests: 0,
             planned_bytes: 0,
+            unchanged: false,
             hint_tiles: 0,
             hint: vec![],
             pixel_hash: 0,
@@ -620,6 +676,7 @@ mod tests {
             bytes_grabbed: grabbed,
             grab_requests: 1,
             planned_bytes: 4096,
+            unchanged: false,
             hint_tiles: 0,
             hint: vec![],
             pixel_hash: 0,
@@ -672,6 +729,52 @@ mod tests {
                         median(col(RunReport::bytes_grabbed)) / 1e6,
                         median(col(RunReport::grab_requests)),
                         median(col(RunReport::allocs)),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Prints the content-free tick table (PR 7): the per-tick cost of an
+    /// idle and a typing screen with `Unchanged` ticks against the band grab
+    /// of PR 5 and the whole-root grab. Run it under the bench lock.
+    #[test]
+    #[ignore = "measurement, prints a table; run by hand"]
+    fn unchanged_table() {
+        const RUNS: u64 = 3;
+        const TICKS: u32 = 90;
+        println!(
+            "| layout | scene | frame held (ticks) | damage_mode | capture_us (mean, min-max) | damage-tick capture_us p50 / p99 | cpu_us | MB grabbed/tick | KB copied/tick | allocs/tick | unchanged ticks |"
+        );
+        println!("|---|---|---|---|---|---|---|---|---|---|---|");
+        for (name, w, h) in [("1080p", 1920u16, 1080u16), ("4K", 3840, 2160)] {
+            for (scene, hold) in [(Scene::Idle, 3), (Scene::Typing, 3), (Scene::Typing, 1)] {
+                for mode in [Mode::Off, Mode::On, Mode::OnUnchanged] {
+                    let runs: Vec<RunReport> = (0..RUNS)
+                        .map(|i| {
+                            let r = run_scene_held(scene, w, h, TICKS, 1000 + i, mode, hold);
+                            r.validate().unwrap();
+                            r
+                        })
+                        .collect();
+                    let col = |f: fn(&RunReport) -> f64| runs.iter().map(f).collect::<Vec<_>>();
+                    let cap = col(RunReport::capture_us);
+                    let (lo, hi) = (
+                        cap.iter().cloned().fold(f64::MAX, f64::min),
+                        cap.iter().cloned().fold(0.0, f64::max),
+                    );
+                    println!(
+                        "| {name} | {} | {hold} | {} | {:.0} ({lo:.0}-{hi:.0}) | {:.0} / {:.0} | {:.0} | {:.2} | {:.2} | {:.1} | {:.0} % |",
+                        scene.name(),
+                        mode.name(),
+                        median(cap.clone()),
+                        median(col(RunReport::damage_tick_p50)),
+                        median(col(RunReport::damage_tick_p99)),
+                        median(col(RunReport::cpu_us)),
+                        median(col(RunReport::bytes_grabbed)) / 1e6,
+                        median(col(RunReport::bytes_copied)) / 1e3,
+                        median(col(RunReport::allocs)),
+                        median(col(RunReport::unchanged_frac)) * 100.0,
                     );
                 }
             }

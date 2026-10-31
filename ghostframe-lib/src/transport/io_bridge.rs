@@ -103,8 +103,8 @@ mod emit;
 #[path = "io_bridge/frame_backend.rs"]
 mod frame_backend;
 pub use frame_backend::{
-    Analysed, Cdf53Encoded, Cdf53Tile, Control, EscalationSlot, FrameBackend, GpuBackend, GpuDiag,
-    H264Out, OwnedPalRle, PixelSource, TileOut, TileRequest, TileTimings,
+    AnalyseError, Analysed, Cdf53Encoded, Cdf53Tile, Control, EscalationSlot, FrameBackend,
+    GpuBackend, GpuDiag, H264Out, OwnedPalRle, PixelSource, TileOut, TileRequest, TileTimings,
 };
 
 #[path = "io_bridge/frame_worker.rs"]
@@ -2735,6 +2735,10 @@ fn parse_listen_port(listen_addr: &str) -> io::Result<u16> {
 #[cfg(test)]
 #[path = "io_bridge/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "io_bridge/unchanged_oracle_tests.rs"]
+mod unchanged_oracle_tests;
 
 #[cfg(test)]
 #[path = "io_bridge/coverage_pin_tests.rs"]

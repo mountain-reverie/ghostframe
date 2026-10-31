@@ -223,3 +223,74 @@ full grab over 160 random ticks. Mutations, each failing that property:
 An injected miss (damage lost before the grab decides anything) shows stale
 and is repaired by the sweep within `S*k` ticks plus the pool
 (`x11_a_lost_damage_report_is_repaired_by_the_sweep`).
+
+## PR 7: content-free tick (`Content::Unchanged`), before/after
+
+`baseline::unchanged_table` (`cargo test -p ghostframe-server unchanged_table
+-- --ignored --nocapture`), same host, under `flock -o` on the shared bench
+lock, 90 ticks per run, 3 runs (seeds 1000-1002), median across runs with
+min-max for `capture_us`. "on" is PR 5/6's band grab with every tick a pixels
+frame; "on, unchanged" sends the ticks that name no damage, no cursor change
+and no sweep slice as `Unchanged`: no frame slot, and at most one free slot
+brought up to date. "Frame held" is how many ticks the harness keeps each
+frame before returning its slot (3 is a backlog; 1 is a pipeline that finishes
+within a tick). The damage-tick columns are the p50 and p99 of `capture_us`
+over the ticks that carry a hint: the grab part of damage-to-first-datagram
+(per run, median across runs).
+
+| layout | scene | frame held | damage_mode | capture_us (mean, min-max) | damage-tick capture_us p50 / p99 | cpu_us | MB grabbed/tick | KB copied/tick | allocs/tick | unchanged ticks |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1080p | idle | 3 | off | 1033 (1016-1042) | 0 / 0 | 39 | 8.29 | 1.02 | 1.0 | 0 % |
+| 1080p | idle | 3 | on | 128 (126-136) | 0 / 0 | 40 | 0.80 | 1.54 | 2.0 | 0 % |
+| 1080p | idle | 3 | on, unchanged | 51 (49-55) | 0 / 0 | 24 | 0.19 | 1.13 | 1.2 | 80 % |
+| 1080p | typing | 3 | on | 198 (192-202) | 218 / 264 | 47 | 1.52 | 1.54 | 2.7 | 0 % |
+| 1080p | typing | 3 | on, unchanged | 151 (143-152) | 134 / 312 | 39 | 1.14 | 1.26 | 2.1 | 53 % |
+| 1080p | typing | 1 | on | 146 (134-150) | 164 / 266 | 49 | 1.01 | 1.54 | 2.7 | 0 % |
+| 1080p | typing | 1 | on, unchanged | 109 (107-125) | 120 / 218 | 38 | 0.96 | 1.26 | 2.1 | 53 % |
+| 4K | idle | 3 | off | 3976 (3947-3983) | 0 / 0 | 50 | 33.18 | 1.02 | 1.0 | 0 % |
+| 4K | idle | 3 | on | 351 (349-357) | 0 / 0 | 64 | 2.69 | 3.07 | 2.0 | 0 % |
+| 4K | idle | 3 | on, unchanged | 103 (103-107) | 0 / 0 | 30 | 0.65 | 1.43 | 1.2 | 80 % |
+| 4K | typing | 3 | on | 492 (488-508) | 542 / 639 | 68 | 4.12 | 3.07 | 2.7 | 0 % |
+| 4K | typing | 3 | on, unchanged | 354 (350-355) | 229 / 865 | 58 | 3.08 | 1.98 | 2.1 | 53 % |
+| 4K | typing | 1 | on | 347 (347-354) | 313 / 633 | 69 | 2.54 | 3.07 | 2.7 | 0 % |
+| 4K | typing | 1 | on, unchanged | 304 (297-310) | 266 / 634 | 55 | 2.45 | 1.98 | 2.1 | 53 % |
+
+Library side, `damage_tests::unchanged_report` (three runs, median of 14
+ticks; upload + GPU stage, microseconds, no pixels changed):
+
+| res | whole frame | `Tiles`, nothing named | `Unchanged` |
+|---|---|---|---|
+| 1080p | 3759 / 3748 / 4002 | 134 / 137 / 147 | 134 / 137 / 147 |
+| 4K | 15152 / 15184 / 15132 | 269 / 225 / 225 | 214 / 212 / 213 |
+
+Reading it:
+
+- Idle falls to the sweep floor: 80 % of ticks grab nothing, the rest one slice
+  (and the cursor image, about 1 KB, which is the O(1) per-tick floor until
+  PR 8 replaces the `GetCursorImage` poll). The free slot an unchanged tick
+  keeps current is already current in a pure idle run (the previous sweep tick
+  wrote it), so idle pays nothing for it. Against PR 5's "on": `capture_us`
+  128 -> 49 (1080p) and 351 -> 103 (4K), grabbed bytes 0.80 -> 0.19 MB and
+  2.69 -> 0.65 MB, thread CPU 40 -> 24 us and 64 -> 30 us. The library's idle
+  tick is the O(tiles) part (about 0.13 ms at 1080p, 0.21 ms at 4K).
+- Typing: the damage-tick p50 is below "on" in all four cells (1080p 134 vs 218
+  and 120 vs 164; 4K 229 vs 542 and 266 vs 313). The p99 is not: 4K with a
+  backlog 865 vs 639, 1080p with a backlog 312 vs 264 (the tick whose free
+  slots are all stale). Without the kept-current slot the p50 was 7-34 %
+  *worse* than "on", because a slot that sat out quiet ticks had to catch up on
+  every sweep slice it skipped.
+- The age ring stays at 32 ticks. At 8 the quiet gaps push slots past it and
+  the p99 becomes a full grab (4K, backlog: 3997 us; 1080p 1027 us).
+- Reset-cushion read-back, measured on the GPU (the read that an `Unchanged`
+  tick with no SAD reference would need to re-send every tile from the
+  host-visible, uncached upload image): 31-47 ms at 1080p and 127-187 ms at
+  4K, against a 33 ms tick. So that tick is refused instead (the next pixels
+  frame, at most 5 ticks later, does it from the slot).
+- Two defects found and fixed on the way: the 8-entry age ring made any slot
+  idle for more than 8 ticks come back with a full grab; and the harness held
+  three *frames* rather than three ticks of frames, which starved the pool of
+  old slots.
+
+Correctness (not a measurement; `x11_the_library_screen_stays_exact_across_unchanged_ticks`,
+`unchanged_oracle_tests`, `damage_tests::an_unchanged_tick_*`): see the design
+note, section 3.3 "As landed (PR 7)".

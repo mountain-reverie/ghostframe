@@ -829,6 +829,7 @@ async fn process_frame_produces_no_panic() {
         pixels: vec![0xFF; 64 * 64 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 1000,
+        content: crate::frame_damage::Content::Pixels,
         damage: crate::frame_damage::FrameDamage::Unknown,
         capture_done_ns: 0,
     };
@@ -859,6 +860,7 @@ async fn a_pooled_frame_in_flight_returns_its_slot_when_the_bridge_stops() {
         pixels,
         dmabuf_fd: None,
         timestamp_us: 1000,
+        content: crate::frame_damage::Content::Pixels,
         damage: crate::frame_damage::FrameDamage::Unknown,
         capture_done_ns: 0,
     });
@@ -913,6 +915,7 @@ async fn process_frame_increments_frame_seq() {
         pixels: vec![0; 32 * 32 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
+        content: crate::frame_damage::Content::Pixels,
         damage: crate::frame_damage::FrameDamage::Unknown,
         capture_done_ns: 0,
     };
@@ -947,6 +950,7 @@ async fn process_frame_no_panic_on_empty_pixels_no_dmabuf_no_session() {
         pixels: vec![0u8; 64 * 64 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
+        content: crate::frame_damage::Content::Pixels,
         damage: crate::frame_damage::FrameDamage::Unknown,
         capture_done_ns: 0,
     };
@@ -1007,6 +1011,8 @@ struct RecordingBackend {
     /// `forward_cdf53_tiles` fails, as a lost device or a failed submit would.
     fail_forward: bool,
     analyse_err: Option<String>,
+    /// `analyse` refuses the (unchanged) tick instead of failing.
+    analyse_refused: Option<String>,
     /// Tiles `analyse` reports dirty.
     dirty_tiles: Vec<u32>,
     panic_in_analyse: bool,
@@ -1025,7 +1031,7 @@ impl FrameBackend for RecordingBackend {
         _frame: &FrameSubmission,
         _escalation: &[u32],
         _want_diag: bool,
-    ) -> Result<Analysed, String> {
+    ) -> Result<Analysed, AnalyseError> {
         use std::sync::atomic::Ordering::SeqCst;
         self.log.lock().unwrap().push("analyse".into());
         if self.panic_in_analyse {
@@ -1039,8 +1045,11 @@ impl FrameBackend for RecordingBackend {
         if let Some(inside) = &self.inside {
             inside.fetch_sub(1, SeqCst);
         }
+        if let Some(why) = &self.analyse_refused {
+            return Err(AnalyseError::Refused(why.clone()));
+        }
         match &self.analyse_err {
-            Some(e) => Err(e.clone()),
+            Some(e) => Err(e.clone().into()),
             None => Ok(Analysed {
                 dirty_analysis: vec![None; self.dirty_tiles.len()],
                 dirty_tiles: self.dirty_tiles.clone(),
@@ -1242,6 +1251,7 @@ fn tiny_frame() -> FrameSubmission {
         pixels: vec![0u8; 64 * 64 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
+        content: crate::frame_damage::Content::Pixels,
         damage: crate::frame_damage::FrameDamage::Unknown,
         capture_done_ns: 0,
     }
@@ -1524,7 +1534,12 @@ async fn a_frame_with_dirty_tiles_does_not_announce_its_dimensions_at_analysis()
         fn apply(&mut self, c: Control) {
             self.0.apply(c)
         }
-        fn analyse(&mut self, f: &FrameSubmission, e: &[u32], d: bool) -> Result<Analysed, String> {
+        fn analyse(
+            &mut self,
+            f: &FrameSubmission,
+            e: &[u32],
+            d: bool,
+        ) -> Result<Analysed, AnalyseError> {
             let mut a = self.0.analyse(f, e, d)?;
             a.dirty_tiles = vec![0];
             a.dirty_analysis = vec![None];
@@ -2906,6 +2921,7 @@ async fn frame_captured_event_format() {
         pixels: vec![0u8; 32 * 32 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
+        content: crate::frame_damage::Content::Pixels,
         damage: crate::frame_damage::FrameDamage::Unknown,
         capture_done_ns: 12345,
     };
@@ -6273,6 +6289,7 @@ async fn the_tile_arm_commits_the_backends_cdf53_results_and_skips_what_it_skipp
         pixels: vec![0u8; (W * W * 4) as usize].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
+        content: crate::frame_damage::Content::Pixels,
         damage: crate::frame_damage::FrameDamage::Unknown,
         capture_done_ns: 0,
     };
@@ -6393,6 +6410,7 @@ async fn a_full_screen_tile_frame_after_an_h264_exit_makes_no_blocking_forward()
             stride: W * 4,
             timestamp_us: 0,
             capture_done_ns: 0,
+            unchanged: false,
         },
         ..inflight
     };
@@ -6523,6 +6541,7 @@ async fn gpu_backend_pre_encodes_fallback_tiles_exactly_as_the_cpu_transform() {
         pixels: pixels.clone().into(),
         dmabuf_fd: None,
         timestamp_us: 0,
+        content: crate::frame_damage::Content::Pixels,
         damage: crate::frame_damage::FrameDamage::Unknown,
         capture_done_ns: 0,
     };
@@ -7315,4 +7334,30 @@ async fn the_dirty_set_and_a_failed_frame_reach_the_feedback_sink() {
         (got[0].timestamp_us, &got[0].kind),
         (43, &FeedbackKind::Dropped)
     );
+}
+
+/// An unchanged tick the backend refuses is a dropped frame, not a GPU fault:
+/// the producer is told (a Dropped verdict), nothing is counted as a failure.
+#[tokio::test]
+async fn a_refused_unchanged_tick_is_dropped_without_counting_a_gpu_failure() {
+    use crate::feedback::{FeedbackKind, FeedbackSink};
+    for (refused, counted) in [(true, 0), (false, 1)] {
+        let backend = RecordingBackend {
+            analyse_refused: refused.then(|| "no baseline".to_string()),
+            analyse_err: (!refused).then(|| "vkQueueSubmit failed".to_string()),
+            ..Default::default()
+        };
+        let (mut bridge, _peer) = bridge_with_backend(backend);
+        let sink = Arc::new(FeedbackSink::new());
+        sink.enable();
+        bridge.feedback = Some(sink.clone());
+        bridge.start_analysis(tiny_frame(), 1, 1200, Vec::new(), 0);
+        let msg = next_worker_message(&mut bridge).await.expect("failed");
+        bridge.on_frame_worker_message(msg);
+        assert_eq!(bridge.gpu_analyse_failures, counted);
+        let mut got = Vec::new();
+        sink.drain_into(&mut got);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, FeedbackKind::Dropped);
+    }
 }

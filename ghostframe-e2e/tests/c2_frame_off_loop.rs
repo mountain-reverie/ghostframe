@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 use ghostframe_client_net::{ClientNet, ClientNetConfig, ClientNetEvent};
 use ghostframe_e2e::netsim::SocketPairPump;
 use ghostframe_lib::transport::io_bridge::{
-    Analysed, Cdf53Encoded, Control, FrameBackend, H264Out, IoBridge, OwnedPalRle, PixelSource,
-    TileOut, TileRequest, TileTimings,
+    AnalyseError, Analysed, Cdf53Encoded, Control, FrameBackend, H264Out, IoBridge, OwnedPalRle,
+    PixelSource, TileOut, TileRequest, TileTimings,
 };
 use ghostframe_lib::transport::quic::QuicServer;
 use ghostframe_lib::FrameSubmission;
@@ -56,7 +56,7 @@ impl FrameBackend for SleepyBackend {
         _frame: &FrameSubmission,
         _escalation: &[u32],
         _want_diag: bool,
-    ) -> Result<Analysed, String> {
+    ) -> Result<Analysed, AnalyseError> {
         self.busy("analyse");
         // Every tile of the 64x64 test frame (a 2x2 grid) is dirty.
         Ok(Analysed {
@@ -105,6 +105,7 @@ fn frame() -> FrameSubmission {
         pixels: vec![0x40; 64 * 64 * 4].into(),
         dmabuf_fd: None,
         timestamp_us: 0,
+        content: ghostframe_lib::Content::Pixels,
         damage: ghostframe_lib::FrameDamage::Unknown,
         capture_done_ns: 0,
     }

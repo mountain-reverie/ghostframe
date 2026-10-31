@@ -26,6 +26,9 @@ pub struct FrameSubmission {
     /// Pooled when the producer has a [`crate::FramePool`]: the slot returns
     /// to it when the frame is dropped, wherever that happens.
     pub pixels: FrameBuf,
+    /// Whether `pixels` is a frame or empty because nothing changed;
+    /// see [`Content`].
+    pub content: crate::frame_damage::Content,
     /// DMA-BUF file descriptor for zero-copy GPU access.
     /// When present, the GPU pipeline uses this directly instead of `pixels`.
     pub dmabuf_fd: Option<OwnedFd>,
@@ -312,6 +315,7 @@ mod tests {
             pixels: vec![0u8; 1920 * 1080 * 4].into(),
             dmabuf_fd: None,
             timestamp_us: 0,
+            content: crate::frame_damage::Content::Pixels,
             damage: crate::frame_damage::FrameDamage::Unknown,
             capture_done_ns: 0,
         };

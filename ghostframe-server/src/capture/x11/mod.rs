@@ -73,6 +73,13 @@ impl TestHooks {
 }
 
 impl X11Backend {
+    /// Let a believed tick with nothing to show go out as
+    /// [`ghostframe_lib::Content::Unchanged`], with no grab and no frame slot
+    /// (`damage_mode = on`).
+    pub fn set_allow_unchanged(&mut self, on: bool) {
+        self.frames.set_allow_unchanged(on);
+    }
+
     /// Connect every part. Frames are required; damage, input and display
     /// control are each optional and logged when missing, so a desktop that
     /// lacks one still streams.
@@ -170,6 +177,10 @@ impl super::Backend for X11Backend {
 
     fn screen_size(&self) -> Option<(u32, u32)> {
         Some(self.frames.size())
+    }
+
+    fn frame_dropped(&mut self) {
+        self.frames.frame_dropped();
     }
 
     fn plan_grab(

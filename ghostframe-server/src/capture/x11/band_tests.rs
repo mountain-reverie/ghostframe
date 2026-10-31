@@ -130,6 +130,24 @@ impl Rig {
         self.conn.get_input_focus().unwrap().reply().unwrap();
     }
 
+    /// One tick in `on` mode with `Unchanged` allowed, and the frame as it
+    /// came: no property check.
+    pub fn tick_raw(&mut self) -> ghostframe_lib::FrameSubmission {
+        self.ts += 33_333;
+        self.backend.frames.last_grab = None;
+        let (_, frame) = damage_plan_grab(&mut self.backend, &mut self.net, self.ts);
+        frame.expect("grab")
+    }
+
+    /// A fresh whole-root grab (cursor blended), by the reference connection.
+    pub fn fresh(&mut self) -> Vec<u8> {
+        self.reference
+            .capture(self.ts)
+            .expect("reference grab")
+            .pixels
+            .to_vec()
+    }
+
     /// One tick of the capture loop in `on` mode, then the property check.
     pub fn tick(&mut self) -> TickOut {
         self.try_tick().expect("grab")
@@ -562,8 +580,8 @@ fn x11_a_slot_idle_longer_than_the_age_ring_is_regrabbed_in_full() {
         paint(&rig);
         assert_eq!(rig.tick().mismatch, None); // all four slots known
     }
-    rig.hold = 0; // one slot is reused for 14 ticks; the others go idle
-    for _ in 0..14 {
+    rig.hold = 0; // one slot is reused for 40 ticks; the others go idle
+    for _ in 0..40 {
         paint(&rig);
         assert_eq!(rig.tick().mismatch, None);
     }
@@ -730,4 +748,221 @@ fn x11_the_tick_after_a_would_block_goes_to_the_library_as_unknown() {
     f.plan_grab(&tiles(5), None, true);
     let frame = f.capture(3).unwrap();
     assert_eq!(frame.damage, FrameDamage::Unknown);
+}
+
+/// What a library that trusts `Unchanged` believes the screen shows after
+/// each tick: a pixels frame replaces the rows its damage names (all rows for
+/// `Unknown`), an unchanged tick leaves it. It must equal a fresh full grab
+/// after every tick, which fails the moment the server says "unchanged" about
+/// a tick that changed something.
+fn run_unchanged_property(mutation: Mutation, ticks: u32, seed: u64) -> Result<(u32, u32), String> {
+    use ghostframe_lib::Content;
+    let mut rig = Rig::new(mutation);
+    rig.backend.set_allow_unchanged(true);
+    let mut rng = Rng(seed | 1);
+    let row = usize::from(W) * 4;
+    let mut model: Vec<u8> = Vec::new();
+    let (mut unchanged, mut pixels, mut refreshed) = (0u32, 0u32, 0u32);
+    // The pipeline holds a frame for three ticks, so the slots rotate.
+    let mut held: std::collections::VecDeque<(u32, ghostframe_lib::FrameBuf)> = Default::default();
+    for t in 0..ticks {
+        // Bursts of painting between long idle runs.
+        let busy = (t / 12) % 3 == 0;
+        if busy && rng.below(2) == 0 {
+            let r = Rectangle {
+                x: rng.below(u64::from(W) - 8) as i16,
+                y: rng.below(u64::from(H) - 4) as i16,
+                width: (8 + rng.below(60)) as u16,
+                height: (4 + rng.below(40)) as u16,
+            };
+            rig.fill(r, (rng.next() as u32) & 0xff_ffff);
+        }
+        if busy && rng.below(8) == 0 {
+            rig.warp(
+                rng.below(u64::from(W)) as i16,
+                rng.below(u64::from(H)) as i16,
+            );
+        }
+        let frame = rig.tick_raw();
+        let fresh = rig.fresh();
+        match frame.content {
+            Content::Unchanged => {
+                unchanged += 1;
+                // A content-free tick that grabbed kept a free slot current.
+                refreshed += u32::from(rig.backend.frames.last_grab.is_some());
+                if !frame.pixels.is_empty() {
+                    return Err(format!("tick {t}: an unchanged tick carried pixels"));
+                }
+            }
+            Content::Pixels => {
+                pixels += 1;
+                if let Some(i) = frame.pixels.iter().zip(&fresh).position(|(a, b)| a != b) {
+                    return Err(format!(
+                        "tick {t}: delivered slot differs from a full grab at byte {i}"
+                    ));
+                }
+                match &frame.damage {
+                    FrameDamage::Tiles { hint, verify } if !model.is_empty() => {
+                        let cols = usize::from(W).div_ceil(32);
+                        for ty in 0..usize::from(H).div_ceil(32) {
+                            if (0..cols)
+                                .any(|tx| hint.get(ty * cols + tx) || verify.get(ty * cols + tx))
+                            {
+                                let (y0, y1) = (ty * 32, ((ty + 1) * 32).min(usize::from(H)));
+                                model[y0 * row..y1 * row]
+                                    .copy_from_slice(&frame.pixels[y0 * row..y1 * row]);
+                            }
+                        }
+                    }
+                    _ => model = frame.pixels.to_vec(),
+                }
+            }
+        }
+        if model != fresh {
+            let i = model
+                .iter()
+                .zip(&fresh)
+                .position(|(a, b)| a != b)
+                .unwrap_or(0);
+            return Err(format!(
+                "tick {t}: the library's screen differs from the real one at pixel {},{} after a {:?} tick",
+                (i / 4) % usize::from(W),
+                (i / 4) / usize::from(W),
+                frame.content
+            ));
+        }
+        held.push_back((t, frame.pixels));
+        while held.front().is_some_and(|(at, _)| at + 3 <= t) {
+            held.pop_front();
+        }
+    }
+    if refreshed == 0 {
+        return Err("no content-free tick ever refreshed a free slot".into());
+    }
+    Ok((unchanged, pixels))
+}
+
+#[test]
+fn x11_the_library_screen_stays_exact_across_unchanged_ticks() {
+    let (unchanged, pixels) = run_unchanged_property(Mutation::None, 240, 0xfeed).unwrap();
+    // Not vacuous: idle ticks went out without pixels, busy ones with.
+    assert!(unchanged >= 60, "only {unchanged} unchanged ticks");
+    assert!(pixels >= 60, "only {pixels} pixels ticks");
+}
+
+#[test]
+fn x11_mutation_sending_unchanged_over_damage_fails_the_property() {
+    let e = run_unchanged_property(Mutation::UnchangedIgnoresDamage, 240, 0xfeed)
+        .expect_err("the mutation must break the property");
+    println!("mutation UnchangedIgnoresDamage: {e}");
+}
+
+/// A Dropped verdict from the library (it refused an `Unchanged` tick, or
+/// failed a frame) makes the very next tick a whole pixels frame, instead of
+/// more content-free ticks until the next sweep slice.
+#[test]
+fn x11_a_dropped_verdict_makes_the_next_tick_carry_pixels() {
+    use ghostframe_lib::{Content, FeedbackKind, FrameFeedback};
+    let mut rig = Rig::new(Mutation::None);
+    rig.backend.set_allow_unchanged(true);
+    // Idle: pixels on the sweep tick, unchanged in between. Stop right after
+    // the first unchanged tick of a gap, where the next one would be too.
+    let mut prev = Content::Pixels;
+    let mut stopped = false;
+    for _ in 0..40 {
+        let c = rig.tick_raw().content;
+        if prev == Content::Pixels && c == Content::Unchanged {
+            stopped = true;
+            break;
+        }
+        prev = c;
+    }
+    assert!(stopped, "no unchanged tick after a pixels tick");
+    let drop = FrameFeedback {
+        timestamp_us: rig.ts,
+        width: u32::from(W),
+        height: u32::from(H),
+        kind: FeedbackKind::Dropped,
+    };
+    crate::capture::ingest_feedback(&mut rig.backend, &mut rig.net, [drop]);
+    let next = rig.tick_raw();
+    assert_eq!(next.content, Content::Pixels, "the tick after a drop");
+    // It delivered a frame, so content-free ticks resume.
+    let after = rig.tick_raw();
+    assert_eq!(after.content, Content::Unchanged);
+}
+
+/// A grab that fails while a content-free tick keeps a free slot current costs
+/// nothing but that slot: the tick is still `Unchanged`, the slot is regrabbed
+/// in full when next used, and every pixels frame afterwards equals a fresh
+/// full grab.
+#[test]
+fn x11_a_failed_slot_refresh_leaves_no_stale_frame() {
+    use ghostframe_lib::Content;
+    let mut rig = Rig::new(Mutation::None);
+    rig.backend.set_allow_unchanged(true);
+    // Pixels frames held for a while, so all four slots get allocated.
+    let mut warm = Vec::new();
+    for i in 0..12 {
+        rig.fill(
+            Rectangle {
+                x: 10 * i as i16,
+                y: 300,
+                width: 8,
+                height: 4,
+            },
+            0x0000_00ff + i as u32,
+        );
+        warm.push(rig.tick_raw());
+        if warm.len() > 3 {
+            warm.remove(0);
+        }
+    }
+    drop(warm);
+    for _ in 0..3 {
+        rig.tick_raw();
+    }
+    // Two far-apart rows of damage, delivered in a frame the pipeline keeps,
+    // leave every other slot needing two bands.
+    for y in [2 * 32, 14 * 32] {
+        rig.fill(
+            Rectangle {
+                x: 10,
+                y,
+                width: 40,
+                height: 10,
+            },
+            0x00ff_0000 + y as u32,
+        );
+    }
+    let kept = rig.tick_raw();
+    assert_eq!(kept.content, Content::Pixels);
+    rig.backend.frames.fail_second_band_once = true;
+    let u = rig.tick_raw();
+    assert_eq!(u.content, Content::Unchanged);
+    assert!(
+        !rig.backend.frames.fail_second_band_once,
+        "the refresh grab never ran"
+    );
+    drop(kept);
+    for i in 0..14 {
+        rig.fill(
+            Rectangle {
+                x: 100,
+                y: 5 * 32 + i,
+                width: 20,
+                height: 3,
+            },
+            0x0000_ff00 + i as u32,
+        );
+        let frame = rig.tick_raw();
+        let fresh = rig.fresh();
+        if frame.content == Content::Pixels {
+            assert_eq!(
+                frame.pixels.iter().zip(&fresh).position(|(a, b)| a != b),
+                None,
+                "tick {i} after the failed refresh"
+            );
+        }
+    }
 }

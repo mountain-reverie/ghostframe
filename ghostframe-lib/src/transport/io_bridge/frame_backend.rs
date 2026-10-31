@@ -39,7 +39,7 @@ use std::os::unix::io::AsRawFd;
 
 use crate::capture::dmabuf::ReadbackFrame;
 use crate::capture::gpu_pipeline::{
-    FrameAnalysis, FramePaletteEntryRaw, GpuFrameProcessor, TileAnalysis,
+    FrameAnalysis, FramePaletteEntryRaw, GpuFrameProcessor, TileAnalysis, UnchangedRefused,
 };
 use crate::encoder::h264_vaapi::FullFrameEncoder;
 use crate::server::FrameSubmission;
@@ -138,6 +138,8 @@ pub enum PixelSource {
     Frame,
     /// A read-back of the frame's DMA-BUF.
     Readback(ReadbackFrame),
+    /// Pixels the backend holds itself: none, for an unchanged tick.
+    Owned(Vec<u8>),
 }
 
 /// Real-clock nanoseconds the tile stage spent, for the `frame.tile_stages`
@@ -195,6 +197,29 @@ pub(super) fn fallback_not_in_compact_list(
         .collect()
 }
 
+/// Why `analyse` produced nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnalyseError {
+    /// An unchanged tick the backend cannot honour: the producer's claim, not
+    /// a GPU fault. The loop drops the frame quietly and tells the producer.
+    Refused(String),
+    /// The GPU stage failed; the loop logs it and counts it.
+    Failed(String),
+}
+
+impl From<String> for AnalyseError {
+    fn from(e: String) -> Self {
+        Self::Failed(e)
+    }
+}
+
+impl std::fmt::Display for AnalyseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Refused(e) | Self::Failed(e)) = self;
+        f.write_str(e)
+    }
+}
+
 /// See the module docs.
 pub trait FrameBackend: Send {
     /// Apply a control. Controls are applied in the order the loop issued them.
@@ -208,7 +233,7 @@ pub trait FrameBackend: Send {
         frame: &FrameSubmission,
         escalation: &[u32],
         want_diag: bool,
-    ) -> Result<Analysed, String>;
+    ) -> Result<Analysed, AnalyseError>;
 
     /// H.264 arm. Creates or resizes the encoder as needed. `None` when there
     /// is nothing to send (encoder unavailable, failed, or buffering).
@@ -287,11 +312,14 @@ impl FrameBackend for GpuBackend {
         frame: &FrameSubmission,
         escalation: &[u32],
         want_diag: bool,
-    ) -> Result<Analysed, String> {
+    ) -> Result<Analysed, AnalyseError> {
         self.held = None;
         self.processor.set_escalation_candidates(escalation);
         let raw_fd = frame.dmabuf_fd.as_ref().map(|fd| fd.as_raw_fd());
         let result = match raw_fd {
+            _ if frame.content == crate::frame_damage::Content::Unchanged => self
+                .processor
+                .process_frame_unchanged(frame.width, frame.height),
             Some(fd) => self
                 .processor
                 .process_frame(fd, frame.width, frame.height, frame.stride),
@@ -303,8 +331,10 @@ impl FrameBackend for GpuBackend {
                 &frame.damage,
             ),
         };
-        let analysis = result.map_err(|e| e.to_string())?;
-
+        let analysis = result.map_err(|e| match e.downcast_ref::<UnchangedRefused>() {
+            Some(r) => AnalyseError::Refused(r.to_string()),
+            None => AnalyseError::Failed(e.to_string()),
+        })?;
         let ta = analysis.tile_analysis_slice();
         let dirty_analysis = analysis
             .dirty_tiles
@@ -391,7 +421,10 @@ impl FrameBackend for GpuBackend {
 
         // Source for tile pixel extraction. The CPU path populates
         // `frame.pixels`; the GPU/DMA-BUF path leaves it empty.
-        let pixels = if !frame.pixels.is_empty() {
+        let pixels = if frame.content == crate::frame_damage::Content::Unchanged {
+            // Nothing is dirty on an unchanged tick, so nothing reads pixels.
+            Ok(PixelSource::Owned(Vec::new()))
+        } else if !frame.pixels.is_empty() {
             Ok(PixelSource::Frame)
         } else {
             match frame.dmabuf_fd.as_ref() {
@@ -531,6 +564,7 @@ impl FrameBackend for GpuBackend {
             let source_pixels: &[u8] = match &pixels {
                 Ok(PixelSource::Frame) => &frame.pixels,
                 Ok(PixelSource::Readback(rb)) => rb,
+                Ok(PixelSource::Owned(v)) => v,
                 Err(_) => &[],
             };
             let grid = crate::tile::TileGrid::new(frame.width, frame.height);

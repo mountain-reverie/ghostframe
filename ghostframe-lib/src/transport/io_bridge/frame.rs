@@ -160,6 +160,8 @@ pub(crate) struct FrameMeta {
     pub stride: u32,
     pub timestamp_us: u32,
     pub capture_done_ns: u64,
+    /// The submission was [`crate::Content::Unchanged`].
+    pub unchanged: bool,
 }
 
 impl FrameMeta {
@@ -170,6 +172,7 @@ impl FrameMeta {
             stride: f.stride,
             timestamp_us: f.timestamp_us,
             capture_done_ns: f.capture_done_ns,
+            unchanged: f.content == crate::frame_damage::Content::Unchanged,
         }
     }
 }
@@ -268,9 +271,14 @@ impl IoBridge {
         // (modesetting-FB fallback uploads them into a HOST_VISIBLE VkImage).
         // Without this, CPU-pixel frames hit `process_frame_cpu`, which
         // has no classifier and sends every tile as CDF 5/3.
-        let has_gpu_input = frame.dmabuf_fd.is_some() || !frame.pixels.is_empty();
+        let has_gpu_input = frame.dmabuf_fd.is_some()
+            || !frame.pixels.is_empty()
+            || frame.content == crate::frame_damage::Content::Unchanged;
         let path = if has_gpu_input && self.frame_pipeline.is_some() {
             "gpu"
+        } else if cfg!(test) && frame.content == crate::frame_damage::Content::Unchanged {
+            // The CPU test path compares pixels; an unchanged tick has none.
+            "test-skip"
         } else if cfg!(test) {
             "test-cpu"
         } else {
@@ -300,7 +308,9 @@ impl IoBridge {
             // is unreachable in production. Unit tests build bridges without a
             // backend and drive the CDF 5/3 route below.
             #[cfg(test)]
-            self.process_frame_cpu(frame);
+            if frame.content == crate::frame_damage::Content::Pixels {
+                self.process_frame_cpu(frame);
+            }
             #[cfg(not(test))]
             tracing::error!(
                 target: LOG_TARGET,
@@ -926,6 +936,13 @@ impl IoBridge {
                 if inflight.epoch != self.session_epoch {
                     return;
                 }
+                // An unchanged tick the backend could not honour: the dropped
+                // verdict above tells the producer to send pixels, and this is
+                // neither a GPU fault to warn about nor to count.
+                if let super::frame_backend::AnalyseError::Refused(why) = &error {
+                    tracing::debug!(target: LOG_TARGET, seq, "unchanged tick refused: {why}");
+                    return;
+                }
                 // No software path: a frame the GPU cannot analyse is dropped.
                 // The next frame re-reports its dirty tiles against the same
                 // baseline, so nothing is lost for good.
@@ -1004,6 +1021,7 @@ impl IoBridge {
             target: LOG_TARGET,
             seq,
             dirty_count = analysis.dirty_tiles.len(),
+            unchanged = meta.unchanged,
             "process_frame_gpu: dirty tile detection complete"
         );
 
@@ -1285,6 +1303,7 @@ impl IoBridge {
         let pixels: &[u8] = match &source {
             PixelSource::Frame => &frame_pixels,
             PixelSource::Readback(rb) => rb,
+            PixelSource::Owned(v) => v,
         };
         let mut lap = Lap::new(stage_trace_enabled());
         // Hand the worker's pre-encoded fallback tiles to the dispatch below,
@@ -1324,7 +1343,7 @@ impl IoBridge {
 
     /// Per-frame idle-escalation sweep and stranded-tile detection; stores the
     /// merged candidate list on the bridge and hands it to the GPU processor.
-    fn collect_escalation_candidates(&mut self) -> Vec<u32> {
+    pub(super) fn collect_escalation_candidates(&mut self) -> Vec<u32> {
         // Gate on self.frame_mode (the PREVIOUS frame's mode). Skipping
         // escalation while the previous frame was H264 avoids ~5 ms of
         // wasted GPU forward + 6 MB of HOST_COHERENT writes per frame:
