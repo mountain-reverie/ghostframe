@@ -256,7 +256,6 @@ struct Plan {
 
 /// Faults the band-grab tests inject to prove each rule load-bearing.
 #[cfg(test)]
-#[allow(dead_code, reason = "the variants are constructed by band_tests")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Mutation {
     #[default]

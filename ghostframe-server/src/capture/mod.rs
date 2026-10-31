@@ -139,10 +139,6 @@ pub fn damage_then_grab<B: Backend + ?Sized>(
 /// slice and says whether hints are believed). Falls back to
 /// [`damage_then_grab`] for a backend that cannot report its screen size.
 #[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "called by the band tests and the baseline harness"
-)]
 pub fn damage_plan_grab<B: Backend + ?Sized>(
     backend: &mut B,
     net: &mut safety_net::SafetyNet,
