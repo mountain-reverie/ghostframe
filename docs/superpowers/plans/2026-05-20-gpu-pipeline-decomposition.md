@@ -62,7 +62,7 @@ External callers (anyone importing from `crate::capture::gpu_pipeline`) see no c
 - [ ] **Step 1: Capture baseline.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 wc -l ghostframe-lib/src/capture/gpu_pipeline.rs ghostframe-lib/src/capture/gpu_pipeline_tests.rs
 cargo test --workspace --lib -- --test-threads=1 2>&1 | grep "^test result"
 ```
@@ -1211,7 +1211,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 - [ ] **Step 1: Full e2e suite.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 cargo test --workspace --tests -- --test-threads=1 2>&1 | grep "^test result"
 ```
 
@@ -1236,7 +1236,7 @@ Expected: `Tests 27 passed (27)` and `Test Files 6 passed (6)`. (Not affected by
 - [ ] **Step 3: Confirm `frame.rs` size cap.**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 wc -l ghostframe-lib/src/capture/gpu_pipeline/*.rs
 ```
 

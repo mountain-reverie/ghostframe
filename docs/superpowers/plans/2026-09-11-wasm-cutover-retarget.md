@@ -93,7 +93,7 @@ independent of this step.
 - [ ] **Step 1: Find every literal**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-client-core
+cd ghostframe-client-core
 grep -n '0x03' src/loss_tracker.rs
 grep -n '0x04' src/decode_error_batcher.rs
 grep -n 'const FLUSH_INTERVAL_US\|const NACK_BATCH_MAX' src/nack_batcher.rs
@@ -147,7 +147,7 @@ suite imports it.
 - [ ] **Step 5: Verify nothing changed behaviourally**
 
 ```bash
-cd /home/cedric/work/ghostframe && cargo test -p ghostframe-client-core 2>&1 | grep 'test result' | tail -3
+cargo test -p ghostframe-client-core 2>&1 | grep 'test result' | tail -3
 ```
 
 Expected: the same 193-test pass count as before, zero failures. This task
@@ -365,7 +365,7 @@ tracking which is which, wrap them all.
 - [ ] **Step 4: Run it**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client
+cd ghostframe-web-client
 export PATH="$HOME/.cargo/bin:$PATH"
 npm test 2>&1 | tail -12
 ```
@@ -401,7 +401,7 @@ implementations already — this is wiring, not new logic.
 - [ ] **Step 1: Confirm each Rust counterpart exists**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 grep -n 'impl TileNackEnvelope' -A 40 ghostframe-protocol/src/protocol.rs | grep 'pub fn'
 grep -n 'impl TileParityEnvelope' -A 20 ghostframe-protocol/src/protocol.rs | grep 'pub fn'
 grep -n 'pub fn rle_decode' ghostframe-protocol/src/codec/cdf53.rs
@@ -571,7 +571,7 @@ pub fn rle_decode(rle: &[u8]) -> Vec<u8> {
 - [ ] **Step 4: Verify**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 cargo build -p ghostframe-client-wasm --target wasm32-unknown-unknown 2>&1 | tail -2
 cargo clippy -p ghostframe-client-wasm --all-targets 2>&1 | tail -5
 cargo fmt -p ghostframe-client-wasm
@@ -678,7 +678,7 @@ many such call sites. `tsc` catches it statically.
 Add `tests` to `include`, then:
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client && npx tsc --noEmit
+cd ghostframe-web-client && npx tsc --noEmit
 ```
 
 **Expect pre-existing errors in the untouched suites.** They have never been

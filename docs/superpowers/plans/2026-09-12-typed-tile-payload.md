@@ -103,7 +103,7 @@ Keep the `match` on `Event` exhaustive, and make the `match` on `TileData` exhau
 - [ ] **Step 5: Verify**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 cargo build --workspace 2>&1 | tail -3
 cargo build -p ghostframe-client-wasm --target wasm32-unknown-unknown 2>&1 | tail -2
 cargo clippy -p ghostframe-client-core -p ghostframe-client-wasm --all-targets 2>&1 | tail -5
@@ -143,7 +143,7 @@ The PalRLE and CDF53 tests previously asserted on the raw payload. They now asse
 - [ ] **Step 2: Run**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 cargo test -p ghostframe-client-core 2>&1 | grep 'test result' | tail -3
 ```
 
@@ -206,7 +206,7 @@ Keep `__cdf53DispatchSeen`'s formula — `TilePayload{Cdf53} + DecodeError{Cdf53
 - [ ] **Step 3: Verify**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client
+cd ghostframe-web-client
 export PATH="$HOME/.cargo/bin:$PATH"
 rm -rf pkg-web pkg-node dist
 npm test 2>&1 | tail -12
@@ -260,7 +260,7 @@ The loop at `renderer.ts:292-306` becomes a direct move of the queue into the ba
 - [ ] **Step 4: Verify**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client
+cd ghostframe-web-client
 export PATH="$HOME/.cargo/bin:$PATH"
 rm -rf pkg-web pkg-node dist
 npm run build 2>&1 | tail -6
@@ -305,7 +305,7 @@ cargo test -p ghostframe-client-core --test tile_delivery 2>&1 | grep 'test resu
 - [ ] **Step 1: Confirm each is unreferenced**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client
+cd ghostframe-web-client
 for m in prevalidate prevalidate_cdf53 palette_shadow feedback decode_error_batcher; do
   printf "%-22s %s\n" "$m" "$(grep -rl "from '\./$m\|from '\.\./$m" src/ tests/ | tr '\n' ' ')"
 done
@@ -331,7 +331,7 @@ npm run build && npm test
 - [ ] **Step 1: Everything, from clean**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 cargo test -p ghostframe-client-core -p ghostframe-client-wasm 2>&1 | grep 'test result'
 cargo clippy --workspace --all-targets 2>&1 | tail -3
 cargo build --workspace

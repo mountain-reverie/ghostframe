@@ -29,7 +29,7 @@
 - [ ] **Step 0.1: Create the feature branch from `master`**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git checkout master
 git pull --ff-only
 git checkout -b feature/github-actions-ci

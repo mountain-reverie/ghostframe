@@ -63,7 +63,7 @@ fn on_session_reset_preserve_delivered_keeps_bit() {
 - [ ] **Step 2: Run the test to verify it fails to compile**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib on_session_reset_preserve_delivered_keeps_bit 2>&1 | tail -10
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib on_session_reset_preserve_delivered_keeps_bit 2>&1 | tail -10
 ```
 
 Expected: COMPILE ERROR — `on_session_reset` takes 0 args, you passed 1. Confirms the parameter doesn't exist yet.
@@ -103,7 +103,7 @@ Find:
 - [ ] **Step 5: Run all three on_session_reset tests**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib on_session_reset 2>&1 | tail -10
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib on_session_reset 2>&1 | tail -10
 ```
 
 Expected: 3 passed; 0 failed.
@@ -113,7 +113,7 @@ Expected: 3 passed; 0 failed.
 The change at Task 1 broke `io_bridge.rs:1435`. Quick fix to keep the build green between commits — pass `false` (we'll wire the real flag in Task 3):
 
 ```bash
-grep -n "palette_table.on_session_reset" /home/cedric/work/ghostframe/ghostframe-lib/src/transport/io_bridge.rs
+grep -n "palette_table.on_session_reset" ghostframe-lib/src/transport/io_bridge.rs
 ```
 
 Edit the line (around 1435) from:
@@ -128,7 +128,7 @@ self.palette_table.on_session_reset(false);
 - [ ] **Step 7: Verify the lib still builds**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build -p ghostframe-lib --tests 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo build -p ghostframe-lib --tests 2>&1 | tail -5
 ```
 
 Expected: build succeeds.
@@ -136,7 +136,7 @@ Expected: build succeeds.
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/src/encoder/pal_rle.rs ghostframe-lib/src/transport/io_bridge.rs
 git commit -m "feat(pal_rle): on_session_reset takes preserve_delivered: bool"
 ```
@@ -175,7 +175,7 @@ fn skip_palette_session_reset_from_env_parses() {
 - [ ] **Step 2: Run the test to verify it fails**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib skip_palette_session_reset_from_env_parses 2>&1 | tail -10
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib skip_palette_session_reset_from_env_parses 2>&1 | tail -10
 ```
 
 Expected: COMPILE ERROR — `skip_palette_session_reset_from_env` is not defined.
@@ -197,7 +197,7 @@ fn skip_palette_session_reset_from_env() -> bool {
 - [ ] **Step 4: Run the test to verify it passes**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib skip_palette_session_reset_from_env_parses 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib skip_palette_session_reset_from_env_parses 2>&1 | tail -5
 ```
 
 Expected: 1 passed.
@@ -205,7 +205,7 @@ Expected: 1 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/src/transport/io_bridge.rs
 git commit -m "feat(test-hook): GHOSTFRAME_SKIP_PALETTE_SESSION_RESET parser (A5/B6)"
 ```
@@ -274,7 +274,7 @@ if preserve_delivered {
 - [ ] **Step 5: Verify the lib builds (test + production feature configs)**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 CARGO_INCREMENTAL=0 cargo build -p ghostframe-lib --tests 2>&1 | tail -5
 CARGO_INCREMENTAL=0 cargo build -p ghostframe-lib --release --no-default-features 2>&1 | tail -5
 ```
@@ -284,7 +284,7 @@ Expected: both succeed. The release/no-default-features build proves the cfg-gat
 - [ ] **Step 6: Run all lib tests**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -10
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -10
 ```
 
 Expected: 279 passed (278 prior + new `skip_palette_session_reset_from_env_parses`); 0 failed. The other on_session_reset tests still pass.
@@ -292,7 +292,7 @@ Expected: 279 passed (278 prior + new `skip_palette_session_reset_from_env_parse
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/src/transport/io_bridge.rs
 git commit -m "feat(test-hook): wire skip_palette_session_reset to on_session_reset (A5/B6)"
 ```
@@ -307,7 +307,7 @@ git commit -m "feat(test-hook): wire skip_palette_session_reset to on_session_re
 - [ ] **Step 1: Locate the motion-region pixel calculation**
 
 ```bash
-grep -nA3 "let phase = " /home/cedric/work/ghostframe/ghostframe-test-pattern/src/solid_per_tile.rs
+grep -nA3 "let phase = " ghostframe-test-pattern/src/solid_per_tile.rs
 ```
 
 Expected: a block like:
@@ -342,7 +342,7 @@ let pixel = if phase % 2 == 0 { FLIP_RED } else { FLIP_BLUE };
 - [ ] **Step 3: Verify the test pattern still builds**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build -p ghostframe-test-pattern 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo build -p ghostframe-test-pattern 2>&1 | tail -5
 ```
 
 Expected: build succeeds.
@@ -352,20 +352,20 @@ Expected: build succeeds.
 The corner tiles aren't touched, but worth a sanity run since the test does pixel-assertions:
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_solid_per_tile_pixels -- --test-threads=1 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_solid_per_tile_pixels -- --test-threads=1 2>&1 | tail -5
 ```
 
 Expected: 1 passed. If FAIL: the motion-region change inadvertently broke the corners (shouldn't — they aren't repainted). Investigate before continuing.
 
 If the test-server container needs rebuilding for the test pattern change to take effect, rebuild it before this step:
 ```bash
-cd /home/cedric/work/ghostframe && docker build -t ghostframe/test-server:latest -f tests/containers/test-server/Dockerfile . 2>&1 | tail -3
+docker build -t ghostframe/test-server:latest -f tests/containers/test-server/Dockerfile . 2>&1 | tail -3
 ```
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-test-pattern/src/solid_per_tile.rs
 git commit -m "feat(test-pattern): solid_per_tile motion region as 2-color flip (A5/B6)"
 ```
@@ -382,7 +382,7 @@ This task is a small refactor that the spec calls for. Two existing tests inline
 
 - [ ] **Step 1: Add the helper to helpers.rs**
 
-At the end of `/home/cedric/work/ghostframe/ghostframe-lib/tests/e2e/helpers.rs`, append:
+At the end of `ghostframe-lib/tests/e2e/helpers.rs`, append:
 
 ```rust
 /// Read `docker logs <container>` (stdout + stderr concatenated) and strip
@@ -414,7 +414,7 @@ pub fn read_server_logs_stripped(container_name: &str) -> String {
 - [ ] **Step 2: Replace the inline fold in `e2e_indices_raw_handshake`**
 
 ```bash
-grep -n "fn e2e_indices_raw_handshake" /home/cedric/work/ghostframe/ghostframe-lib/tests/e2e.rs
+grep -n "fn e2e_indices_raw_handshake" ghostframe-lib/tests/e2e.rs
 ```
 
 Find the existing block (around line 1846-1874 — the `let out = std::process::Command::new(...)` through `}).0;`). Replace the whole 22-line block (from `let out = ...` to `}).0;`) with:
@@ -434,7 +434,7 @@ let logs = helpers::read_server_logs_stripped("ghostframe-server");
 - [ ] **Step 4: Verify both tests still pass**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_indices_raw_handshake e2e_palrle_oob_index -- --test-threads=1 2>&1 | tail -10
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_indices_raw_handshake e2e_palrle_oob_index -- --test-threads=1 2>&1 | tail -10
 ```
 
 Expected: 2 passed; 0 failed.
@@ -442,7 +442,7 @@ Expected: 2 passed; 0 failed.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/tests/e2e/helpers.rs ghostframe-lib/tests/e2e.rs
 git commit -m "refactor(e2e): extract read_server_logs_stripped helper"
 ```
@@ -457,7 +457,7 @@ git commit -m "refactor(e2e): extract read_server_logs_stripped helper"
 - [ ] **Step 1: Locate the existing test**
 
 ```bash
-grep -nB5 "fn e2e_decode_error_thin_uncached" /home/cedric/work/ghostframe/ghostframe-lib/tests/e2e.rs
+grep -nB5 "fn e2e_decode_error_thin_uncached" ghostframe-lib/tests/e2e.rs
 ```
 
 Confirm the existing `#[ignore = "M3.2c follow-up: test design needs multi-palette / dynamic content for thin emission"]` line is present.
@@ -531,7 +531,7 @@ async fn e2e_decode_error_thin_uncached() -> Result<()> {
 - [ ] **Step 3: Verify the test compiles**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build --tests -p ghostframe-lib 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo build --tests -p ghostframe-lib 2>&1 | tail -5
 ```
 
 Expected: build succeeds.
@@ -541,7 +541,7 @@ Expected: build succeeds.
 The server-side env-var hook lands in this PR — the container needs a fresh build to include it.
 
 ```bash
-cd /home/cedric/work/ghostframe && docker build -t ghostframe/test-server:latest -f tests/containers/test-server/Dockerfile . 2>&1 | tail -3
+docker build -t ghostframe/test-server:latest -f tests/containers/test-server/Dockerfile . 2>&1 | tail -3
 ```
 
 Expected: "Successfully tagged ghostframe/test-server:latest".
@@ -549,7 +549,7 @@ Expected: "Successfully tagged ghostframe/test-server:latest".
 - [ ] **Step 5: Run the test**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_decode_error_thin_uncached -- --test-threads=1 --nocapture 2>&1 | tee /tmp/decode_thin.log | tail -15
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_decode_error_thin_uncached -- --test-threads=1 --nocapture 2>&1 | tee /tmp/decode_thin.log | tail -15
 ```
 
 Expected: 1 passed.
@@ -564,7 +564,7 @@ If FAIL on `expected 'force_rebundle'`: `handle_decode_error` received error_cod
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/tests/e2e.rs
 git commit -m "test(e2e): close e2e_decode_error_thin_uncached via session-reset hook (A5/B6)"
 ```
@@ -594,7 +594,7 @@ In the "Remaining for full M3.2c closure" section, REMOVE the bullet covering "B
 - [ ] **Step 3: Run the full e2e suite for regression**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e -- --test-threads=1 2>&1 | tee /tmp/decode_final.log | tail -10
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e -- --test-threads=1 2>&1 | tee /tmp/decode_final.log | tail -10
 ```
 
 Expected: 21 passed (20 prior + e2e_decode_error_thin_uncached); 3 ignored (palrle_session_reset, edge_tiles unless that plan ran first too, resolution_change); 0 failed.
@@ -604,7 +604,7 @@ The flaky `e2e_palette_eviction` may fail intermittently in batch (passes in iso
 - [ ] **Step 4: Run lib unit tests**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -5
 ```
 
 Expected: 280 tests pass (278 prior + `on_session_reset_preserve_delivered_keeps_bit` + `skip_palette_session_reset_from_env_parses`).
@@ -612,7 +612,7 @@ Expected: 280 tests pass (278 prior + `on_session_reset_preserve_delivered_keeps
 - [ ] **Step 5: Final commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git status --short
 ```
 

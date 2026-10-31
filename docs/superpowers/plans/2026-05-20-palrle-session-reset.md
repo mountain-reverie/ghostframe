@@ -566,7 +566,7 @@ EOF
 The xdaemon binary inside the container links the lib code we just changed.
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern
 docker build -t ghostframe/test-server -f tests/containers/test-server/Dockerfile .
 ```

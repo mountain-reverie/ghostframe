@@ -27,7 +27,7 @@
 - [ ] **Step 1: Read the current instrumentation block**
 
 ```bash
-sed -n '385,402p' /home/cedric/work/ghostframe/ghostframe-web-client/src/main.ts
+sed -n '385,402p' ghostframe-web-client/src/main.ts
 ```
 
 Confirm the existing block looks like (paraphrased; the exact field-name list may have grown — `__ghostframeRecordedTiles` was added in commit `8bf4ab0`):
@@ -90,8 +90,8 @@ The push order doesn't matter; placing the new push right after the codecs push 
 - [ ] **Step 3: Verify the web-client builds + vitest still passes**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client && npm run build 2>&1 | tail -5
-cd /home/cedric/work/ghostframe/ghostframe-web-client && npm test 2>&1 | tail -5
+cd ghostframe-web-client && npm run build 2>&1 | tail -5
+cd ghostframe-web-client && npm test 2>&1 | tail -5
 ```
 
 Expected: both succeed. The `npm run build` emits `dist/assets/index-*.js`. The 27 vitest tests pass (the recorder is JS-only, no behavior change to production codec paths).
@@ -99,7 +99,7 @@ Expected: both succeed. The `npm run build` emits `dist/assets/index-*.js`. The 
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-web-client/src/main.ts
 git commit -m "$(cat <<'EOF'
 diag(client): __ghostframeRecordedFlags recorder for B2 wire assertion
@@ -124,7 +124,7 @@ EOF
 - [ ] **Step 1: Locate the current test**
 
 ```bash
-grep -nB18 "fn e2e_indices_raw_handshake" /home/cedric/work/ghostframe/ghostframe-lib/tests/e2e.rs | head -25
+grep -nB18 "fn e2e_indices_raw_handshake" ghostframe-lib/tests/e2e.rs | head -25
 ```
 
 Confirm:
@@ -203,7 +203,7 @@ Three substantive changes from the prior version:
 - [ ] **Step 3: Verify the test compiles**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo build --tests -p ghostframe-lib 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo build --tests -p ghostframe-lib 2>&1 | tail -5
 ```
 
 Expected: build succeeds. Pre-existing warnings (`setup_e2e`, `setup_e2e_with_env`, etc. unused) stay; no new errors.
@@ -213,7 +213,7 @@ Expected: build succeeds. Pre-existing warnings (`setup_e2e`, `setup_e2e_with_en
 The web-client `dist/` was rebuilt at the end of Task 1, so the new recorder is already serving. No docker rebuild needed (the change is client-side only — the server-side encoder and `palrle.wire indices_raw emitted` log behavior are unchanged).
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_indices_raw_handshake -- --test-threads=1 --nocapture 2>&1 | tee /tmp/b2_validate.log | tail -10
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e e2e_indices_raw_handshake -- --test-threads=1 --nocapture 2>&1 | tee /tmp/b2_validate.log | tail -10
 ```
 
 Expected: 1 passed; 0 failed.
@@ -226,7 +226,7 @@ If the third assertion fails:
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git add ghostframe-lib/tests/e2e.rs
 git commit -m "$(cat <<'EOF'
 test(e2e): assert indices_raw wire emission (B2 closure)
@@ -259,7 +259,7 @@ EOF
 - [ ] **Step 1: Run the full e2e suite for regression**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e -- --test-threads=1 2>&1 | tee /tmp/b2_full.log | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --test e2e -- --test-threads=1 2>&1 | tee /tmp/b2_full.log | tail -5
 ```
 
 Expected: **23 passed, 0 failed, 2 ignored**. Same count as the post-A5/B6-closure baseline — `e2e_indices_raw_handshake` was already counted in the 23; this task gains it a stronger assertion without changing the count.
@@ -271,7 +271,7 @@ If any regression, identify and fix before moving on. Likely candidates:
 - [ ] **Step 2: Run lib unit tests**
 
 ```bash
-cd /home/cedric/work/ghostframe && CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -5
+CARGO_INCREMENTAL=0 cargo test -p ghostframe-lib --lib 2>&1 | tail -5
 ```
 
 Expected: 282 passed (no change — this task adds no lib unit tests). 0 failed.
@@ -279,7 +279,7 @@ Expected: 282 passed (no change — this task adds no lib unit tests). 0 failed.
 - [ ] **Step 3: Run vitest**
 
 ```bash
-cd /home/cedric/work/ghostframe/ghostframe-web-client && npm test 2>&1 | tail -5
+cd ghostframe-web-client && npm test 2>&1 | tail -5
 ```
 
 Expected: 27 passed (no change).
@@ -334,7 +334,7 @@ Change to:
 - [ ] **Step 6: Final commit if anything project-side remains uncommitted**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 git status --short
 ```
 

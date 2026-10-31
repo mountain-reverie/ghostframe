@@ -108,7 +108,7 @@ tick.
 - [ ] **Step 4: Verify and commit**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 cargo build -p ghostframe-lib 2>&1 | tail -3
 cargo clippy -p ghostframe-lib --all-targets 2>&1 | tail -3
 cargo fmt -p ghostframe-lib
@@ -299,7 +299,7 @@ tracks normally.
 - [ ] **Step 1: Full suites**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd .
 cargo test -p ghostframe-lib 2>&1 | grep 'test result' | tail -4
 cargo test -p ghostframe-e2e --test browserless_runner -- --test-threads=1 2>&1 | grep 'test result'
 cargo clippy -p ghostframe-lib -p ghostframe-e2e --all-targets 2>&1 | tail -3
