@@ -1011,6 +1011,8 @@ struct RecordingBackend {
     /// `forward_cdf53_tiles` fails, as a lost device or a failed submit would.
     fail_forward: bool,
     analyse_err: Option<String>,
+    /// `analyse` refuses the (unchanged) tick instead of failing.
+    analyse_refused: Option<String>,
     /// Tiles `analyse` reports dirty.
     dirty_tiles: Vec<u32>,
     panic_in_analyse: bool,
@@ -1029,7 +1031,7 @@ impl FrameBackend for RecordingBackend {
         _frame: &FrameSubmission,
         _escalation: &[u32],
         _want_diag: bool,
-    ) -> Result<Analysed, String> {
+    ) -> Result<Analysed, AnalyseError> {
         use std::sync::atomic::Ordering::SeqCst;
         self.log.lock().unwrap().push("analyse".into());
         if self.panic_in_analyse {
@@ -1043,8 +1045,11 @@ impl FrameBackend for RecordingBackend {
         if let Some(inside) = &self.inside {
             inside.fetch_sub(1, SeqCst);
         }
+        if let Some(why) = &self.analyse_refused {
+            return Err(AnalyseError::Refused(why.clone()));
+        }
         match &self.analyse_err {
-            Some(e) => Err(e.clone()),
+            Some(e) => Err(e.clone().into()),
             None => Ok(Analysed {
                 dirty_analysis: vec![None; self.dirty_tiles.len()],
                 dirty_tiles: self.dirty_tiles.clone(),
@@ -1529,7 +1534,12 @@ async fn a_frame_with_dirty_tiles_does_not_announce_its_dimensions_at_analysis()
         fn apply(&mut self, c: Control) {
             self.0.apply(c)
         }
-        fn analyse(&mut self, f: &FrameSubmission, e: &[u32], d: bool) -> Result<Analysed, String> {
+        fn analyse(
+            &mut self,
+            f: &FrameSubmission,
+            e: &[u32],
+            d: bool,
+        ) -> Result<Analysed, AnalyseError> {
             let mut a = self.0.analyse(f, e, d)?;
             a.dirty_tiles = vec![0];
             a.dirty_analysis = vec![None];
@@ -7331,15 +7341,10 @@ async fn the_dirty_set_and_a_failed_frame_reach_the_feedback_sink() {
 #[tokio::test]
 async fn a_refused_unchanged_tick_is_dropped_without_counting_a_gpu_failure() {
     use crate::feedback::{FeedbackKind, FeedbackSink};
-    for (err, counted) in [
-        (
-            format!("{}no baseline", frame_backend::UNCHANGED_REFUSED),
-            0,
-        ),
-        ("vkQueueSubmit failed".to_string(), 1),
-    ] {
+    for (refused, counted) in [(true, 0), (false, 1)] {
         let backend = RecordingBackend {
-            analyse_err: Some(err),
+            analyse_refused: refused.then(|| "no baseline".to_string()),
+            analyse_err: (!refused).then(|| "vkQueueSubmit failed".to_string()),
             ..Default::default()
         };
         let (mut bridge, _peer) = bridge_with_backend(backend);
