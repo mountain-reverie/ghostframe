@@ -5,6 +5,7 @@
 //! X11 is the only one today; a PipeWire/Wayland backend implements the same
 //! trait later (design: `docs/superpowers/specs/2026-10-29-ghostframe-server-x11-design.md`).
 
+pub mod safety_net;
 pub mod tick_stats;
 pub mod tile_bitmap;
 pub mod x11;

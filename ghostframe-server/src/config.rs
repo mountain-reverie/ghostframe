@@ -26,6 +26,7 @@
 //! | `GHOSTFRAME_DUMP_FIRST_FRAME` | dump first raw frame to this path (test builds only) | off |
 //! | `GHOSTFRAME_RANDR_SETTLE_MS` | least wait after a mode change before checking the desktop kept it | 5000 (`0` turns the read-back off) |
 //! | `GHOSTFRAME_DAMAGE_REPORT` | XDamage report level: `raw` selects `RawRectangles`, anything else `NonEmpty` + `FetchRegion` | `nonempty` |
+//! | `GHOSTFRAME_DAMAGE_MODE` | damage-driven encoding: `off`, `shadow` (hints and sweeps are computed and judged against the library's full compare, the whole screen is still grabbed), `on` (today the same as `shadow`; consumers land later) | `off` |
 //! | `GHOSTFRAME_INSTALL_DETACHED` | `1`: `install` is the re-exec'd copy running as a transient unit; never re-exec again | unset |
 //! | `XDG_RUNTIME_DIR` | whether a user systemd manager can be asked about the old xdaemon (`login`, `capture`), and whether `login` enables and starts the installed unit | unset |
 //! | `GHOSTFRAME_MAX_RESOLUTION` | `WxH` resolution ceiling, or `none` | none (the unit `install` writes sets `1920x1080`) |
@@ -63,6 +64,47 @@ impl DamageReport {
     }
 }
 
+/// How much of the damage-driven encoding path runs (`GHOSTFRAME_DAMAGE_MODE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DamageMode {
+    /// Nothing runs: every tick grabs and compares the whole screen. The
+    /// default.
+    #[default]
+    Off,
+    /// The safety net runs beside the unchanged full path: hints are
+    /// computed, sweep slices scheduled, and the library's full compare is
+    /// held against them to count the misses a consumer would have suffered.
+    Shadow,
+    /// Reserved for the consumers (band grab, hinted compare). Until they
+    /// land it behaves exactly as [`DamageMode::Shadow`]; the daemon says so
+    /// at startup.
+    On,
+}
+
+impl DamageMode {
+    /// `off` / `shadow` / `on`, case-insensitive. Anything else warns and is
+    /// `off`: a typo must not turn a trust-sensitive feature on.
+    fn parse(raw: Option<String>) -> Self {
+        let Some(raw) = raw else { return Self::Off };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "off" => Self::Off,
+            "shadow" => Self::Shadow,
+            "on" => Self::On,
+            _ => {
+                eprintln!(
+                    "warning: GHOSTFRAME_DAMAGE_MODE={raw:?} is not off, shadow or on; using off"
+                );
+                Self::Off
+            }
+        }
+    }
+
+    /// Whether the safety net runs at all.
+    pub fn net_runs(self) -> bool {
+        self != Self::Off
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub display: Option<String>,
@@ -88,6 +130,8 @@ pub struct ServerConfig {
     pub randr_settle: std::time::Duration,
     /// `GHOSTFRAME_DAMAGE_REPORT`.
     pub damage_report: DamageReport,
+    /// `GHOSTFRAME_DAMAGE_MODE`.
+    pub damage_mode: DamageMode,
 }
 
 impl ServerConfig {
@@ -205,6 +249,7 @@ impl ServerConfig {
                 DEFAULT_RANDR_SETTLE_MS,
             )),
             damage_report: DamageReport::parse(get("GHOSTFRAME_DAMAGE_REPORT")),
+            damage_mode: DamageMode::parse(get("GHOSTFRAME_DAMAGE_MODE")),
         }
     }
 }
@@ -284,6 +329,20 @@ mod tests {
             cfg(&[("GHOSTFRAME_DAMAGE_REPORT", "bogus")]).damage_report,
             DamageReport::NonEmpty
         );
+    }
+
+    #[test]
+    fn damage_mode_defaults_off_and_a_typo_never_turns_it_on() {
+        let m = |v: &str| cfg(&[("GHOSTFRAME_DAMAGE_MODE", v)]).damage_mode;
+        assert_eq!(cfg(&[]).damage_mode, DamageMode::Off);
+        assert_eq!(m("shadow"), DamageMode::Shadow);
+        assert_eq!(m(" Shadow "), DamageMode::Shadow);
+        assert_eq!(m("on"), DamageMode::On);
+        assert_eq!(m("off"), DamageMode::Off);
+        for bad in ["shadwo", "1", "true", "yes"] {
+            assert_eq!(m(bad), DamageMode::Off, "{bad:?}");
+        }
+        assert!(!DamageMode::Off.net_runs() && DamageMode::On.net_runs());
     }
 
     #[test]
