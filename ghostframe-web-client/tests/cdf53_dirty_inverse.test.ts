@@ -72,8 +72,20 @@ const COLS = 4;
 const ROWS = 3;
 const MAX_TILES = COLS * ROWS;
 
+/** A pass of a tile that is drawable once it lands: pass 0 declares itself
+ * the tile's only pass (complete, as a sparse black tile is), and a later
+ * pass carries a magnitude bit. The partial case has its own tests below. */
 function entry(tileX: number, tileY: number, gen: number, passIdx: number) {
-  return { tileX, tileY, gen, passIdx, bitPlanes: new Uint8Array(384), presentPasses: null };
+  const bitPlanes = new Uint8Array(384);
+  if (passIdx > 0) bitPlanes[0] = 1;
+  return { tileX, tileY, gen, passIdx, bitPlanes, presentPasses: passIdx === 0 ? 1 : null };
+}
+
+/** A pass of a tile still in progress: pass 0 says passes 0..2 exist. */
+function partial(tileX: number, tileY: number, gen: number, passIdx: number, magnitude: boolean) {
+  const bitPlanes = new Uint8Array(384);
+  if (magnitude) bitPlanes[5] = 0x10;
+  return { tileX, tileY, gen, passIdx, bitPlanes, presentPasses: passIdx === 0 ? 0b111 : null };
 }
 
 function setup() {
@@ -185,6 +197,41 @@ describe('Cdf53Pipeline dirty-tile inverse', () => {
     const bound = genBufferOf(e.passes[0], 0);
     const list = [...device.queue.writes].reverse().find((w) => w.buf === bound)!.words;
     expect(list[0]).toBe(1 * COLS + 2);
+  });
+
+  it('does not invert a tile that has only its sign plane (no black flash)', () => {
+    // Pass 0 carries signs only; with no magnitude bits the inverse paints
+    // black over the tile's previous content.
+    const { pipe, enc, device } = setup();
+    pipe.uploadBatch([partial(1, 2, 3, 0, false)]);
+    expect(pipe.pendingInverseTiles).toBe(0);
+    const e = enc();
+    pipe.encodeInverse(e);
+    expect(e.passes).toHaveLength(0);
+    // Its pass count still reached the GPU, for the midpoint correction.
+    const tile = 2 * COLS + 1;
+    const counted = device.queue.writes.some(
+      (w) => w.buf === (pipe as unknown as { passesProcessedBuffer: Buf }).passesProcessedBuffer &&
+        w.offsetBytes <= tile * 4 && w.offsetBytes + w.words.length * 4 > tile * 4,
+    );
+    expect(counted).toBe(true);
+  });
+
+  it('inverts the tile once a magnitude plane lands, and only then', () => {
+    const { pipe } = setup();
+    pipe.uploadBatch([partial(1, 2, 3, 0, false)]);
+    pipe.uploadBatch([partial(1, 2, 3, 1, false)]); // an empty magnitude plane: still nothing
+    expect(pipe.pendingInverseTiles).toBe(0);
+    pipe.uploadBatch([partial(1, 2, 3, 2, true)]);
+    expect(pipe.pendingInverseTiles).toBe(1);
+  });
+
+  it('a new generation starts without magnitudes again', () => {
+    const { pipe } = setup();
+    pipe.uploadBatch([partial(0, 0, 3, 0, false), partial(0, 0, 3, 1, true)]);
+    expect(pipe.pendingInverseTiles).toBe(1);
+    pipe.uploadBatch([partial(0, 0, 4, 0, false)]);
+    expect(pipe.pendingInverseTiles).toBe(0);
   });
 
   it('drops out-of-grid tiles instead of throwing', () => {
