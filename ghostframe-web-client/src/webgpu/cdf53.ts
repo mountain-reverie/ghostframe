@@ -147,6 +147,10 @@ export class Cdf53Pipeline {
   // passes and reaches 14 once every present pass has landed.
   private presentPassesCpu: Uint16Array = new Uint16Array(0);
   private receivedMaskCpu: Uint16Array = new Uint16Array(0);
+  // 1 once the tile's current generation has a non-empty magnitude plane;
+  // see the drawable rule in uploadBatch. Mirrors `TileTrack::has_magnitude`
+  // in ghostframe-client-gpu/src/pipelines/cdf53.rs.
+  private hasMagnitudeCpu: Uint8Array = new Uint8Array(0);
   private cols: number = 0;
 
   // M3.3b diagnostic: per-tile capture. When (watcherX, watcherY) is set,
@@ -340,6 +344,7 @@ export class Cdf53Pipeline {
     this.passesProcessedCpu = new Uint32Array(maxTiles);
     this.presentPassesCpu = new Uint16Array(maxTiles);
     this.receivedMaskCpu = new Uint16Array(maxTiles);
+    this.hasMagnitudeCpu = new Uint8Array(maxTiles);
     this.dirtyTilesBuffer = this.device.createBuffer({
       size: Math.max(maxTiles, 1) * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
@@ -445,6 +450,7 @@ export class Cdf53Pipeline {
     this.passesProcessedCpu.fill(0);
     this.presentPassesCpu.fill(0);
     this.receivedMaskCpu.fill(0);
+    this.hasMagnitudeCpu.fill(0);
   }
 
   /** Returns the framebuffer view for binding by the L1 inverse shader. */
@@ -521,6 +527,8 @@ export class Cdf53Pipeline {
     // intra-shader clear had (HL2 cols 4/5 sign-bit loss for ch=0).
     const clearedTiles = new Set<number>();
     const touchedTiles = new Set<number>();
+    // The subset of touchedTiles to invert this batch -- see below.
+    const drawTiles = new Set<number>();
     for (let i = 0; i < entries.length; i++) {
       const e = entries[i];
       const tileIdx = e.tileY * this.cols + e.tileX;
@@ -537,6 +545,7 @@ export class Cdf53Pipeline {
         this.passesProcessedCpu[tileIdx] = 0;
         this.presentPassesCpu[tileIdx] = 0;
         this.receivedMaskCpu[tileIdx] = 0;
+        this.hasMagnitudeCpu[tileIdx] = 0;
         this.lastSeenGen[tileIdx] = e.gen;
         this.lastSeenSeq[tileIdx] = seq;
         clearedTiles.add(tileIdx);
@@ -564,6 +573,23 @@ export class Cdf53Pipeline {
         e.passIdx,
       );
       touchedTiles.add(tileIdx);
+      // Invert the tile only once its reconstruction is a picture. Pass 0
+      // carries signs only and the inverse has no level shift, so a tile
+      // with no magnitude bits yet inverts to black -- inverting it on pass 0
+      // painted every new generation of a tile black before its content
+      // arrived. Until then the tile keeps what the framebuffer shows. A tile
+      // whose every pass is resolved is drawn regardless: a genuinely black
+      // tile is pass 0 alone when sparse-encoded. (Its passesProcessed is
+      // still uploaded above: touchedTiles, not drawTiles, drives that.)
+      if (e.passIdx > 0 && e.bitPlanes.some((b) => b !== 0)) {
+        this.hasMagnitudeCpu[tileIdx] = 1;
+      }
+      if (
+        this.hasMagnitudeCpu[tileIdx] === 1 ||
+        this.passesProcessedCpu[tileIdx] >= protocol().cdf53PassCount
+      ) {
+        drawTiles.add(tileIdx);
+      }
     }
     // Upload the passes-processed updates in ONE writeBuffer covering the
     // touched span (PC-M2), instead of a 4-byte write per touched tile. The
@@ -588,9 +614,9 @@ export class Cdf53Pipeline {
     // Dense unique list of tiles for the inverse dispatch (dispatch size ==
     // list length). Only the used prefix is uploaded.
     let n = 0;
-    for (const tileIdx of touchedTiles) this.dirtyListCpu[n++] = tileIdx;
+    for (const tileIdx of drawTiles) this.dirtyListCpu[n++] = tileIdx;
     this.device.queue.writeBuffer(this.dirtyListBuffer, 0, this.dirtyListCpu, 0, n);
-    this.inverseTileCount = touchedTiles.size;
+    this.inverseTileCount = drawTiles.size;
     for (let i = 0; i < entries.length; i++) {
       const e = entries[i];
       tileWork[i * 5 + 0] = e.tileX;
