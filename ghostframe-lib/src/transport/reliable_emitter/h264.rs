@@ -133,6 +133,22 @@ impl H264Cache {
         dropped
     }
 
+    /// Forget every frame from `frame_seq` on: they chain from a frame that
+    /// will not be decoded, so nothing of them is worth probing. Returns the
+    /// fragments dropped.
+    pub fn drop_from(&mut self, frame_seq: u32) -> usize {
+        let gone = self.frames.split_off(&frame_seq);
+        let mut dropped = 0;
+        for f in gone.into_values() {
+            for e in f.frags.into_values() {
+                dropped += 1;
+                self.bytes -= e.datagram.len();
+            }
+        }
+        self.entries -= dropped;
+        dropped
+    }
+
     /// Keep only the newest `max_frames` frames. Returns the fragments dropped.
     pub fn trim_to(&mut self, max_frames: usize) -> usize {
         if self.frames.len() <= max_frames {
@@ -207,6 +223,18 @@ mod tests {
         assert_eq!((c.len(), c.frames(), c.bytes_outstanding()), (4, 2, 40));
         assert!(c.get(2, 0).is_none() && c.get(3, 1).is_some());
         assert_eq!(c.drop_before(3), 0, "idempotent");
+    }
+
+    #[test]
+    fn dropping_from_a_frame_forgets_it_and_every_later_one() {
+        let mut c = H264Cache::new();
+        for f in 1..=4 {
+            c.insert(f, 0, false, entry(10));
+        }
+        assert_eq!(c.drop_from(3), 2);
+        assert_eq!((c.len(), c.frames(), c.bytes_outstanding()), (2, 2, 20));
+        assert!(c.get(2, 0).is_some() && c.get(3, 0).is_none());
+        assert_eq!(c.drop_from(3), 0);
     }
 
     #[test]

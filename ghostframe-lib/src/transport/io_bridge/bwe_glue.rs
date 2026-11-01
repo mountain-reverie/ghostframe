@@ -477,6 +477,7 @@ impl IoBridge {
         );
         self.instr.losses_declared += out.lost.len() as u64;
         self.instr.loss_retx_requested += out.retx_queued;
+        self.note_h264_verdicts(&out.lost, now);
         for (wire_seq, tx) in out.lost {
             self.report_loss(wire_seq, tx);
         }
@@ -524,6 +525,8 @@ impl IoBridge {
         };
         self.instr.pto_probes_requested += out.retx_queued;
         self.instr.losses_declared += out.lost.len() as u64;
+        self.h264.stats.tx_forgotten += out.forgotten.len() as u64;
+        self.note_h264_verdicts(&out.lost, now);
         for (wire_seq, tx) in out.lost {
             self.report_loss(wire_seq, tx);
         }

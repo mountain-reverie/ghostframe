@@ -341,6 +341,17 @@ impl IoBridge {
         self.emitter_stats_publish.clone()
     }
 
+    /// Clone of the `Arc` behind `h264_stats_publish`: the H.264 transport
+    /// counters (IDRs by cause, verdicts, holds, skipped frames, the ledger
+    /// accounting), read back after the bridge task is aborted. Same pattern
+    /// as [`Self::emitter_stats_publish_handle`].
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn h264_stats_publish_handle(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<crate::transport::io_bridge::H264Stats>> {
+        self.h264_stats_publish.clone()
+    }
+
     /// Clone of the `Arc` behind `send_errs_publish` — cumulative
     /// `send_datagram` failures, overwhelmingly `Blocked`. Same
     /// ownership problem and fix as `emitter_stats_publish_handle`.

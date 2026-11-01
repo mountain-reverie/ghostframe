@@ -169,6 +169,9 @@ pub struct LedgerStats {
     /// ([`TransmissionLedger::forget_undeparted`]): superseded H.264
     /// fragments removed from the emission queue. Neither delivered nor lost.
     pub forgotten_before_departure: u64,
+    /// Outstanding records the sender took back with no verdict
+    /// ([`TransmissionLedger::forget_outstanding`]).
+    pub forgotten_without_verdict: u64,
     /// Verdicts by reason. Their sum is the number of transmissions declared
     /// lost.
     pub lost_packet_threshold: u64,
@@ -464,6 +467,17 @@ impl TransmissionLedger {
         self.records.get(&wire_seq).map(|r| r.departed.is_some())
     }
 
+    /// Outstanding records whose content `pred` accepts, for a test of the
+    /// accounting identity (recorded = acknowledged + judged + forgotten +
+    /// outstanding).
+    #[cfg(test)]
+    pub(crate) fn count_outstanding(&self, pred: impl Fn(&Content) -> bool) -> usize {
+        self.records
+            .values()
+            .filter(|r| pred(&r.tx.content))
+            .count()
+    }
+
     /// Forget one record that has not departed: its datagram was taken out of
     /// the emission queue before it reached quinn (an H.264 fragment of a frame
     /// an IDR superseded). It was never sent, so it is neither delivered nor
@@ -480,6 +494,18 @@ impl TransmissionLedger {
         self.records.remove(&wire_seq);
         self.stats.forgotten_before_departure += 1;
         true
+    }
+
+    /// Forget one outstanding record, departed or not, with no verdict and no
+    /// tombstone: its content is gone (an H.264 fragment trimmed from the
+    /// probe cache or superseded by an IDR), so there is nothing to send again
+    /// and nothing known about whether it arrived. Not a loss: the estimators
+    /// hear nothing. `None` if it is not outstanding.
+    pub fn forget_outstanding(&mut self, wire_seq: u32) -> Option<Transmission> {
+        let rec = self.records.remove(&wire_seq)?;
+        self.leave(&rec);
+        self.stats.forgotten_without_verdict += 1;
+        Some(rec.tx)
     }
 
     /// Forget every record that has not departed. The session they were

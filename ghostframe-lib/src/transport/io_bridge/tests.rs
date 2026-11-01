@@ -7632,3 +7632,180 @@ async fn the_reset_request_window_is_cleared_by_a_session_reset() {
         "a new session starts a new window"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The H.264 arm of the frame path: the encoder gate between the classifier and
+// the worker (the policy itself is tested in `h264_tx`).
+// ---------------------------------------------------------------------------
+
+/// A bridge with an unacknowledged IDR out (so P frames are held), a frame
+/// analysed by the recording worker and ready to be finished, and the log.
+async fn h264_arm_with_idr_out() -> (
+    IoBridge,
+    frame::InFlight,
+    Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::net::UnixStream,
+) {
+    let (mut bridge, peer, log) = recording_bridge();
+    bridge.expect_h264_idr(IdrCause::Session);
+    bridge.send_h264_frame(
+        H264Out {
+            payload: vec![1; 3_000],
+            is_keyframe: true,
+        },
+        &frame::FrameMeta::of(&tiny_frame()),
+        1,
+        1_200,
+    );
+    assert!(
+        bridge.h264.hold.is_some(),
+        "premise: the IDR is unacknowledged"
+    );
+    bridge.start_analysis(tiny_frame(), 2, 1_200, Vec::new(), 0);
+    let msg = next_worker_message(&mut bridge).await.expect("analysed");
+    assert!(matches!(msg, FromWorker::Analysed { .. }), "premise");
+    let inflight = bridge.in_flight.take().expect("a frame in flight");
+    log.lock().unwrap().clear();
+    (bridge, inflight, log, peer)
+}
+
+fn log_has(log: &Arc<std::sync::Mutex<Vec<String>>>, prefix: &str) -> bool {
+    log.lock().unwrap().iter().any(|l| l.starts_with(prefix))
+}
+
+#[tokio::test]
+async fn a_frame_held_for_an_idr_is_discarded_and_the_next_one_is_made_whole() {
+    let (mut bridge, inflight, log, _peer) = h264_arm_with_idr_out().await;
+    bridge.finish_h264_arm(
+        inflight,
+        FinishAction::H264 {
+            force_keyframe: false,
+        },
+        Default::default(),
+    );
+    let msg = next_worker_message(&mut bridge).await.expect("finished");
+    assert!(matches!(msg, FromWorker::Discarded { .. }), "no encode");
+    assert!(!log_has(&log, "finish_h264"), "the encoder never ran");
+    assert!(log_has(&log, "finish_discard"));
+    assert!(
+        log_has(&log, "apply InvalidateBaseline"),
+        "the next frame is made fully dirty, or a screen that stops changing now \
+         would never be sent: {:?}",
+        log.lock().unwrap()
+    );
+    assert_eq!(bridge.h264.stats.frames_skipped_hold, 1);
+}
+
+#[tokio::test]
+async fn a_frame_is_encoded_once_the_idr_is_acknowledged() {
+    let (mut bridge, inflight, log, _peer) = h264_arm_with_idr_out().await;
+    // Every fragment of the IDR is acknowledged.
+    let sent: Vec<u32> = bridge
+        .sent_log_for_test
+        .iter()
+        .filter(|d| d.len() >= 22 && d[0] & 0x80 == 0)
+        .map(|d| u32::from_be_bytes(d[8..12].try_into().unwrap()))
+        .filter(|ws| *ws != crate::transport::protocol::NO_ACK)
+        .collect();
+    bridge.record_emitted_transmissions(now_std());
+    for ws in &sent {
+        bridge.transmission_ledger.mark_departed(*ws, now_std(), 0);
+    }
+    let batch = ghostframe_protocol::ack::AckBatch {
+        entries: sent
+            .iter()
+            .map(|ws| ghostframe_protocol::ack::AckEntry {
+                wire_seq: *ws,
+                arrival_time_ms_lo16: 0,
+            })
+            .collect(),
+    };
+    bridge.dispatch_ack_datagram(&batch.encode());
+    assert!(bridge.h264.hold.is_none(), "premise");
+    bridge.finish_h264_arm(
+        inflight,
+        FinishAction::H264 {
+            force_keyframe: false,
+        },
+        Default::default(),
+    );
+    let msg = next_worker_message(&mut bridge).await.expect("finished");
+    assert!(matches!(msg, FromWorker::H264Done { .. }));
+    assert!(log_has(&log, "finish_h264 force_keyframe=false"));
+}
+
+/// Back from the tile codec the client has no H.264 anchor, so the frame is an
+/// IDR and runs past the hold; the demand is named even though the encoder is
+/// told to force it itself.
+#[tokio::test]
+async fn re_entry_from_the_tile_codec_is_encoded_as_an_idr_past_the_hold() {
+    let (mut bridge, inflight, log, _peer) = h264_arm_with_idr_out().await;
+    // A loss request left over from before the tile stretch.
+    bridge.h264.pending_idr = Some(IdrCause::Loss);
+    bridge.finish_h264_arm(
+        inflight,
+        FinishAction::H264 {
+            force_keyframe: true,
+        },
+        Default::default(),
+    );
+    let msg = next_worker_message(&mut bridge).await.expect("finished");
+    assert!(matches!(msg, FromWorker::H264Done { .. }));
+    assert!(log_has(&log, "finish_h264 force_keyframe=true"));
+    assert_eq!(bridge.h264.pending_idr, Some(IdrCause::Reentry));
+    assert_eq!(bridge.h264.stats.frames_skipped_hold, 0);
+}
+
+/// An empty H.264 frame is discarded without consulting the gate.
+#[tokio::test]
+async fn an_empty_h264_frame_is_discarded_and_not_counted_as_skipped() {
+    let (mut bridge, inflight, log, _peer) = h264_arm_with_idr_out().await;
+    bridge.finish_h264_arm(inflight, FinishAction::Discard, Default::default());
+    let msg = next_worker_message(&mut bridge).await.expect("finished");
+    assert!(matches!(msg, FromWorker::Discarded { .. }));
+    assert!(log_has(&log, "finish_discard"));
+    assert!(!log_has(&log, "apply InvalidateBaseline"));
+    assert_eq!(bridge.h264.stats.frames_skipped_hold, 0);
+}
+
+/// A loss IDR is requested, or owed under the rate limit, on a screen that may
+/// have stopped changing: with no dirty tiles there would be no H.264 frame
+/// and no IDR, so the request also invalidates the GPU baseline and the next
+/// capture is whole.
+#[tokio::test(start_paused = true)]
+async fn a_loss_idr_request_makes_the_next_capture_whole() {
+    let (mut bridge, _peer, _log) = recording_bridge();
+    let meta = frame::FrameMeta::of(&tiny_frame());
+    let payload = |k| H264Out {
+        payload: vec![1; 3_000],
+        is_keyframe: k,
+    };
+    bridge.expect_h264_idr(IdrCause::Session);
+    bridge.send_h264_frame(payload(true), &meta, 1, 1_200);
+    bridge.send_h264_frame(payload(false), &meta, 2, 1_200);
+    let baseline = |b: &IoBridge| {
+        b.pending_controls
+            .iter()
+            .filter(|c| matches!(c, Control::InvalidateBaseline(_)))
+            .count()
+    };
+    bridge.pending_controls.clear();
+    bridge.h264.hold = None;
+    bridge.note_h264_verdict(2, 0, super::now_std());
+    assert_eq!(bridge.h264.pending_idr, Some(IdrCause::Loss), "premise");
+    assert_eq!(baseline(&bridge), 1, "{:?}", bridge.pending_controls);
+    assert!(bridge.pending_controls.contains(&Control::RequestKeyframe));
+
+    // The IDR is made; a second loss inside the interval is only owed, and
+    // the owed IDR needs a whole capture too.
+    bridge.note_h264_encoded(true, (64, 64));
+    bridge.send_h264_frame(payload(false), &meta, 3, 1_200);
+    bridge.pending_controls.clear();
+    tokio::time::advance(std::time::Duration::from_millis(100)).await;
+    bridge.note_h264_verdict(3, 0, super::now_std());
+    assert!(
+        bridge.h264.deferred_loss_idr,
+        "premise: owed, not requested"
+    );
+    assert_eq!(baseline(&bridge), 1, "{:?}", bridge.pending_controls);
+}

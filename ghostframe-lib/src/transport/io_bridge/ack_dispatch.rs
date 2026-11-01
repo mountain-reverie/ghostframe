@@ -116,6 +116,7 @@ impl IoBridge {
                 self.log_ack_probes(&batch, &resolved, now_for_samples);
                 self.record_ack_bwe_samples(&resolved, now_for_samples);
                 self.reliable_emitter.on_ack(&emit_keys);
+                self.apply_h264_acks(&resolved, now_for_samples);
                 self.apply_ack_coverage(&resolved);
             } else {
                 // The first byte already said `ACK_BATCH_MSG_TYPE` so a
@@ -320,7 +321,17 @@ impl IoBridge {
                 break;
             }
             let tile_key = content.tile();
-            let cache_entry = tile_key.and_then(|k| self.reliable_emitter.cache.get(&k));
+            // `queued_at` and the probe tag come from whichever cache holds the
+            // content: the tile cache, or the H.264 probe cache.
+            let cache_entry = match content {
+                crate::transport::reliable_emitter::Content::Tile(k) => {
+                    self.reliable_emitter.cache.get(k)
+                }
+                crate::transport::reliable_emitter::Content::H264Frag {
+                    frame_seq,
+                    frag_idx,
+                } => self.reliable_emitter.h264.get(*frame_seq, *frag_idx),
+            };
             let server_emit_us = tx.emit_us;
             let queued_since_epoch_us = cache_entry
                 .map(|entry| {
@@ -452,6 +463,12 @@ impl IoBridge {
                     // and a new codec needing release/refcount work
                     // here would otherwise get none, silently -- the
                     // shape of the PalRle palette-leak bug.
+                    //
+                    // `Codec::H264` here is a tile-pass codec value, which no
+                    // tile pass carries. H.264 frame fragments never reach
+                    // this function: `apply_ack_coverage` skips them, and
+                    // `apply_h264_acks` releases their probe-cache entries and
+                    // feeds the frame tracker.
                     Codec::Solid | Codec::H264 | Codec::Skip => {}
                 }
             }

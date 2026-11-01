@@ -44,8 +44,9 @@ impl IoBridge {
                         WireClass::Refinement => AdmitClass::Refinement,
                         // First sends and the scheduler's own retry are the
                         // scheduler's critical tier as far as the bucket is
-                        // concerned; H.264 and control datagrams never come
-                        // through the emitter.
+                        // concerned, and so are the H.264 fragments (frame
+                        // XOR parity comes as `Parity`); control datagrams
+                        // never come through the emitter.
                         WireClass::Critical
                         | WireClass::SchedulerRetry
                         | WireClass::H264
@@ -166,8 +167,8 @@ impl IoBridge {
 
     /// [`Self::send_to_all_sessions`], saying whether the datagram came
     /// through the admission gate (`gated`: it was charged to the bucket
-    /// before it got here) or bypassed it (an H.264 frame or a control
-    /// datagram, billed to the bucket afterwards).
+    /// before it got here) or bypassed it (a control datagram, billed to the
+    /// bucket afterwards).
     ///
     /// `wire_seq` names the transmission the datagram carries, when it is one
     /// the ledger tracks; it ties the datagram's departure from quinn's FIFO
