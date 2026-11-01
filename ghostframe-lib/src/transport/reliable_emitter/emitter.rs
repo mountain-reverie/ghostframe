@@ -5,7 +5,9 @@
 use crate::transport::protocol::TileParityEnvelope;
 use crate::transport::reliable_emitter::cache::{CacheEntry, ProbeTag, RetransmitCache};
 use crate::transport::reliable_emitter::emission_queue::{Emission, EmissionQueue, WireClass};
-use crate::transport::reliable_emitter::h264::{H264Cache, H264Submit, H264_CACHE_FRAMES};
+use crate::transport::reliable_emitter::h264::{
+    H264Cache, H264Submit, H264_CACHE_FRAMES, PAD_FRAME_SEQ,
+};
 use crate::transport::reliable_emitter::parity::GroupBuilder;
 use crate::transport::reliable_emitter::pto::pto_for_attempt;
 use crate::transport::reliable_emitter::traits::{DatagramSender, SendOutcome};
@@ -222,6 +224,8 @@ pub struct EmitterStats {
     pub h264_idr_resends: u64,
     /// H.264 fragments sent again by the probe timeout (any frame).
     pub h264_probe_resends: u64,
+    /// Probe padding datagrams queued (`submit_h264_pad`).
+    pub h264_pad_datagrams: u64,
     /// Verdicts on a P-frame fragment, which are not sent again.
     pub h264_p_verdicts_not_resent: u64,
     /// Fragments released by an acknowledgement, and acknowledgements that
@@ -620,6 +624,66 @@ impl ReliableTileEmitter {
         self.note_emission_queue_depth();
         self.queue.push_source(bytes, WireClass::H264);
         self.stats.h264_fragments_submitted += 1;
+    }
+
+    /// Queue one datagram of probe padding: `template` (a frame datagram the
+    /// client has already acknowledged) again, under a `wire_seq` of its own,
+    /// tagged for the probe cluster `probe`. The client acknowledges it on
+    /// receipt and discards it, so it is measured and costs the picture nothing.
+    ///
+    /// It is a ledger transmission (acknowledged or judged like any other)
+    /// named `H264Frag { PAD_FRAME_SEQ, idx }`, and the probe cache holds an
+    /// entry under that name only to carry the tag to the acknowledgement; no
+    /// path ever sends it again (`classify_retx`, `entry_view`). Returns the
+    /// datagram's bytes.
+    pub fn submit_h264_pad(
+        &mut self,
+        template: &Bytes,
+        idx: u16,
+        probe: crate::transport::reliable_emitter::cache::ProbeTag,
+        now: Instant,
+    ) -> usize {
+        let wire_seq = self.alloc.allocate();
+        let mut buf = BytesMut::from(&template[..]);
+        debug_assert!(buf.len() >= 12, "a frame datagram has a 22-byte header");
+        if buf.len() >= 12 {
+            buf[8..12].copy_from_slice(&wire_seq.to_be_bytes());
+        }
+        let bytes: Bytes = buf.freeze();
+        let len = bytes.len();
+        self.transmissions.push(EmittedDatagram {
+            wire_seq,
+            emit_us: self.emit_us64(now),
+            wire_bytes: len,
+            content: Content::H264Frag {
+                frame_seq: PAD_FRAME_SEQ,
+                frag_idx: idx,
+            },
+        });
+        self.h264.insert(
+            PAD_FRAME_SEQ,
+            idx,
+            false,
+            CacheEntry {
+                datagram: bytes.clone(),
+                queued_at: now,
+                first_sent_at: now,
+                last_sent_at: now,
+                attempts: 0,
+                loss_attempts: 0,
+                latest_ws: wire_seq,
+                probe: Some(probe),
+            },
+        );
+        self.note_emission_queue_depth();
+        self.queue.push_source(bytes, WireClass::H264);
+        self.stats.h264_pad_datagrams += 1;
+        len
+    }
+
+    /// Forget padding entries nobody acknowledged (see [`PAD_ENTRY_TTL`]).
+    pub fn expire_h264_pad(&mut self, now: Instant) {
+        self.h264.expire_pad(now);
     }
 
     /// Send a cached H.264 fragment again, with a `wire_seq` of its own.
@@ -1380,6 +1444,11 @@ impl ReliableTileEmitter {
                 None => return RetxRequest::ContentGone,
                 Some(e) => (e.latest_ws, e.loss_attempts, false),
             },
+            // Probe padding is never sent again, whoever asks.
+            Content::H264Frag {
+                frame_seq: PAD_FRAME_SEQ,
+                ..
+            } => return RetxRequest::ContentGone,
             Content::H264Frag {
                 frame_seq,
                 frag_idx,
@@ -1471,6 +1540,10 @@ impl ReliableTileEmitter {
                 .cache
                 .get(key)
                 .map(|e| (e.latest_ws, e.loss_attempts, e.last_sent_at)),
+            Content::H264Frag {
+                frame_seq: PAD_FRAME_SEQ,
+                ..
+            } => None,
             Content::H264Frag {
                 frame_seq,
                 frag_idx,

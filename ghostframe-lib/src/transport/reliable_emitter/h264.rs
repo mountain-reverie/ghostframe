@@ -17,6 +17,17 @@
 use crate::transport::reliable_emitter::cache::CacheEntry;
 use std::collections::{BTreeMap, HashMap};
 
+/// The cache key (`frame_seq`) of probe padding: copies of an already
+/// acknowledged fragment sent to fill a probe cluster. No real frame has it
+/// (the frame counter would take 4 billion frames to get here), it is the
+/// newest key so trimming to the newest frames never evicts it, and an IDR's
+/// `drop_before` never reaches it. Its entries exist only to carry the probe
+/// tag to the acknowledgement; nothing is ever re-sent from them.
+pub(crate) const PAD_FRAME_SEQ: u32 = u32::MAX;
+
+/// Padding entries unacknowledged this long are forgotten.
+pub(crate) const PAD_ENTRY_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Most frames the cache holds. Bounds the memory of a stalled
 /// acknowledgement path (frames keep being produced while nothing is
 /// acknowledged) and so how far back the probe's "content is current" reaches.
@@ -115,6 +126,24 @@ impl H264Cache {
             self.frames.remove(&frame_seq);
         }
         Some(entry)
+    }
+
+    /// Forget padding entries older than [`PAD_ENTRY_TTL`] at `now`. Returns
+    /// how many.
+    pub fn expire_pad(&mut self, now: std::time::Instant) -> usize {
+        let Some(frame) = self.frames.get_mut(&PAD_FRAME_SEQ) else {
+            return 0;
+        };
+        let stale: Vec<u16> = frame
+            .frags
+            .iter()
+            .filter(|(_, e)| now.saturating_duration_since(e.queued_at) > PAD_ENTRY_TTL)
+            .map(|(i, _)| *i)
+            .collect();
+        for i in &stale {
+            self.remove(PAD_FRAME_SEQ, *i);
+        }
+        stale.len()
     }
 
     /// Forget every frame older than `frame_seq`: an IDR at `frame_seq`
