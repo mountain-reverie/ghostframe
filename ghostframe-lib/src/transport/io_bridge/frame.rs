@@ -1673,6 +1673,7 @@ impl IoBridge {
         }
 
         // FEC parity
+        let mut parity_bytes = 0u64;
         let fec_k = fec_group_size(encoded.is_keyframe);
         if datagrams.len() > 1 {
             let source_payloads: Vec<&[u8]> = datagrams
@@ -1688,12 +1689,16 @@ impl IoBridge {
                     datagrams.len() as u16,
                     parity_payload,
                 );
+                parity_bytes += parity_dg.len() as u64;
                 self.send_to_all_sessions(&parity_dg, WireClass::Parity);
             }
         }
 
         // M3.5 bench telemetry: H264 frame completed — all fragments sent.
         let h264_wire_bytes: u32 = datagrams.iter().map(|dg| dg.len() as u32).sum();
+        self.bytes_emitted_h264 = self
+            .bytes_emitted_h264
+            .saturating_add(u64::from(h264_wire_bytes) + parity_bytes);
         tracing::info!(
             target: "ghostframe::bench",
             frame_seq = seq,
@@ -1706,6 +1711,10 @@ impl IoBridge {
             codec_h264 = 1u8,
             "frame.last_send"
         );
+
+        // The H.264 mode has no tile path; without this the periodic transport
+        // lines went silent for the whole of an H.264 stretch.
+        self.log_periodic_transport(seq);
     }
 
     /// TileCodec arm of `process_frame_gpu`, after the pixel source is chosen:
@@ -2075,6 +2084,39 @@ impl IoBridge {
             "process_frame_gpu: dispatch returned"
         );
 
+        self.log_periodic_transport(seq);
+
+        // Frame stats — emit per design Section 4.
+        tracing::debug!(
+            target: "palrle.frame",
+            reused_or_allocated = self.palette_table.stats_frame.reused_or_allocated,
+            fell_back_to_raw = self.palette_table.stats_frame.fell_back_to_raw,
+            unique_frame_palettes = frame_palette_set_count,
+            "palrle frame stats"
+        );
+        self.palette_table.stats_frame = Default::default();
+
+        // M3.5 bench telemetry: timestamp of the last datagram handed to QUIC.
+        tracing::info!(
+            target: "ghostframe::bench",
+            frame_seq = seq,
+            last_send_ns = monotonic_now_ns(),
+            total_wire_bytes = stats.total_wire_bytes,
+            tile_count = stats.tile_count,
+            codec_solid = stats.codec_histogram.solid,
+            codec_palrle = stats.codec_histogram.palrle,
+            codec_cdf53 = stats.codec_histogram.cdf53,
+            codec_h264 = stats.codec_histogram.h264,
+            "frame.last_send"
+        );
+    }
+
+    /// Periodic transport diagnostics: the throttled `cumulative emit` family
+    /// and the ~1 Hz BWE snapshot. Called once per frame sent, from both the
+    /// tile path (`emit_tile_codec_frame`) and the H.264 path
+    /// (`send_h264_frame`), so the lines keep coming whatever the frame mode.
+    /// A tick sends through exactly one of the two, so nothing is logged twice.
+    pub(super) fn log_periodic_transport(&mut self, seq: u32) {
         // ---- Cumulative emit + color-histogram diagnostics ----
         //
         // Throttled to once per `CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES`
@@ -2109,7 +2151,7 @@ impl IoBridge {
             let prev_at = self.bwe_log_last_at;
             self.bwe_log_last_at = Some(now);
             let bwe_snap = self.bwe.snapshot();
-            let (prev_crit, prev_refn) = self.bytes_emitted_snapshot;
+            let (prev_crit, prev_refn, prev_h264) = self.bytes_emitted_snapshot;
             // Compute dt against the previous log's instant — on
             // the very first log, fall back to a sensible window
             // (1 s) so the first rate isn't divided by zero.
@@ -2125,8 +2167,15 @@ impl IoBridge {
                 .saturating_mul(8)
                 .saturating_mul(1000)
                 / dt_ms;
-            self.bytes_emitted_snapshot =
-                (self.bytes_emitted_critical, self.bytes_emitted_refinement);
+            let bps_h264 = (self.bytes_emitted_h264.saturating_sub(prev_h264))
+                .saturating_mul(8)
+                .saturating_mul(1000)
+                / dt_ms;
+            self.bytes_emitted_snapshot = (
+                self.bytes_emitted_critical,
+                self.bytes_emitted_refinement,
+                self.bytes_emitted_h264,
+            );
             tracing::info!(
                 target: "ghostframe::bwe",
                 bwe_estimate_bps = bwe_snap.bitrate_bps,
@@ -2140,37 +2189,17 @@ impl IoBridge {
                 loss_state = ?bwe_snap.stats.loss_state,
                 lifts_blocked_loss = bwe_snap.stats.ceiling_lifts_blocked_loss,
                 lifts_undone = bwe_snap.stats.ceiling_lifts_undone,
+                // critical/refinement count tile frames only; in H.264 mode
+                // they read ~0 and `bps_h264` carries the rate.
                 bps_critical = bps_crit,
                 bps_refinement = bps_refn,
+                bps_h264 = bps_h264,
                 cumulative_bytes_critical = self.bytes_emitted_critical,
                 cumulative_bytes_refinement = self.bytes_emitted_refinement,
+                cumulative_bytes_h264 = self.bytes_emitted_h264,
                 "bwe periodic snapshot"
             );
         }
-
-        // Frame stats — emit per design Section 4.
-        tracing::debug!(
-            target: "palrle.frame",
-            reused_or_allocated = self.palette_table.stats_frame.reused_or_allocated,
-            fell_back_to_raw = self.palette_table.stats_frame.fell_back_to_raw,
-            unique_frame_palettes = frame_palette_set_count,
-            "palrle frame stats"
-        );
-        self.palette_table.stats_frame = Default::default();
-
-        // M3.5 bench telemetry: timestamp of the last datagram handed to QUIC.
-        tracing::info!(
-            target: "ghostframe::bench",
-            frame_seq = seq,
-            last_send_ns = monotonic_now_ns(),
-            total_wire_bytes = stats.total_wire_bytes,
-            tile_count = stats.tile_count,
-            codec_solid = stats.codec_histogram.solid,
-            codec_palrle = stats.codec_histogram.palrle,
-            codec_cdf53 = stats.codec_histogram.cdf53,
-            codec_h264 = stats.codec_histogram.h264,
-            "frame.last_send"
-        );
     }
 
     /// Throttled cumulative per-codec emission line and bump-count/histogram

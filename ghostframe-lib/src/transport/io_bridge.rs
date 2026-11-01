@@ -992,6 +992,9 @@ pub struct IoBridge {
     /// Cumulative bytes of CDF53 refinement-tier (passes 4-13) datagrams
     /// emitted since startup. Same semantics as `bytes_emitted_critical`.
     bytes_emitted_refinement: u64,
+    /// Wire bytes of H.264 frames (fragments and parity) sent since startup.
+    /// Cumulative like the tile counters above, which are tile-only.
+    bytes_emitted_h264: u64,
     /// Per-tier ACK round-trip latency stats (BWE Stage 2.0 baseline
     /// measurement). See `TierLatencyStats`'s doc comment for the exact
     /// latency expression and the drain site in `run()` for where it's
@@ -1020,7 +1023,7 @@ pub struct IoBridge {
     /// Snapshot of (critical, refinement) byte counters at the previous
     /// periodic-log tick, used to derive per-window rates without
     /// polluting the cumulative counters.
-    bytes_emitted_snapshot: (u64, u64),
+    bytes_emitted_snapshot: (u64, u64, u64),
     /// Wall-clock instant of the previous periodic-log tick. None until
     /// the first log fires.
     bwe_log_last_at: Option<std::time::Instant>,
@@ -1458,12 +1461,13 @@ impl IoBridge {
             probe_stats_publish: std::sync::Arc::new(std::sync::Mutex::new((0u64, 0u64))),
             bytes_emitted_critical: 0,
             bytes_emitted_refinement: 0,
+            bytes_emitted_h264: 0,
             critical_latency_stats: TierLatencyStats::default(),
             refinement_latency_stats: TierLatencyStats::default(),
             queued_critical_latency_stats: TierLatencyStats::default(),
             queued_refinement_latency_stats: TierLatencyStats::default(),
             ack_latency_tracker: crate::transport::ack_latency::AckLatencyTracker::new(),
-            bytes_emitted_snapshot: (0, 0),
+            bytes_emitted_snapshot: (0, 0, 0),
             bwe_log_last_at: None,
             diagnostics: lib_config.diagnostics,
             peer_lookup_tx,
