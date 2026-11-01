@@ -42,6 +42,10 @@ pub(crate) enum RenderMsg {
     /// `ExportedImage`), so this round-trips through here rather than
     /// letting the caller reach the buffer directly.
     DebugMapFrame(u32, Sender<Result<DebugFrameBytes, String>>),
+    /// The H.264 decoder finished a frame after the access unit that fed it
+    /// was applied. Sent from a decoder thread; see
+    /// [`Renderer::set_h264_frame_ready_notify`].
+    H264FramesReady,
     Shutdown,
 }
 
@@ -109,6 +113,7 @@ fn handle_core_event(
     host_visible: bool,
     preferred_modifiers: &[u64],
     open_h264_eagerly: bool,
+    self_tx: &Sender<RenderMsg>,
 ) -> bool {
     if renderer.is_none() {
         let CoreEvent::FrameDimensions { width, height } = &ev else {
@@ -128,7 +133,18 @@ fn handle_core_event(
             host_visible,
             open_h264_eagerly,
         ) {
-            Ok(r) => *renderer = Some(r),
+            Ok(mut r) => {
+                // A Sender into this thread's own channel, held by the decoder,
+                // so `rx.recv()` cannot end by every Sender dropping while the
+                // renderer lives. It does not need to: the loop ends on the
+                // explicit `RenderMsg::Shutdown` the client always sends.
+                let tx = self_tx.clone();
+                r.set_h264_frame_ready_notify(Arc::new(move || {
+                    // A send error means the loop has already exited.
+                    let _ = tx.send(RenderMsg::H264FramesReady);
+                }));
+                *renderer = Some(r);
+            }
             Err(e) => {
                 queue.push(ClientEvent::Error {
                     message: format!("renderer init failed: {e}"),
@@ -154,6 +170,23 @@ fn handle_core_event(
         return false;
     }
     true
+}
+
+/// Answer [`RenderMsg::H264FramesReady`]: blit what the decoder finished.
+/// `true` when a publish is due -- including on an error, so the batch's
+/// `flush` meets and reports it the usual way rather than this reporting it
+/// a second time.
+fn poll_h264(ctx: &WgpuContext, renderer: &mut Option<Renderer>) -> bool {
+    let Some(r) = renderer.as_mut() else {
+        return false;
+    };
+    match r.poll_h264(ctx) {
+        Ok(drew) => drew,
+        Err(e) => {
+            tracing::warn!(error = %e, "H.264 late-frame blit failed");
+            true
+        }
+    }
 }
 
 /// Dump the EXPORTED dmabuf's own pixels when `GHOSTFRAME_CLIENT_DUMP_EXPORT`
@@ -382,6 +415,7 @@ pub(crate) fn run(
     preferred_modifiers: Vec<u64>,
     open_h264_eagerly: bool,
     reset_sink: ResetSink,
+    self_tx: Sender<RenderMsg>,
 ) {
     let ctx = match WgpuContext::new() {
         Ok(ctx) => {
@@ -437,10 +471,14 @@ pub(crate) fn run(
                     host_visible,
                     &preferred_modifiers,
                     open_h264_eagerly,
+                    &self_tx,
                 );
             }
             RenderMsg::DebugMapFrame(buffer_id, reply) => {
                 let _ = reply.send(handle_debug_map_frame(&renderer, buffer_id));
+            }
+            RenderMsg::H264FramesReady => {
+                got_event |= poll_h264(&ctx, &mut renderer);
             }
         }
 
@@ -496,10 +534,14 @@ pub(crate) fn run(
                         host_visible,
                         &preferred_modifiers,
                         open_h264_eagerly,
+                        &self_tx,
                     );
                 }
                 Ok(RenderMsg::DebugMapFrame(buffer_id, reply)) => {
                     let _ = reply.send(handle_debug_map_frame(&renderer, buffer_id));
+                }
+                Ok(RenderMsg::H264FramesReady) => {
+                    got_event |= poll_h264(&ctx, &mut renderer);
                 }
                 Err(_) => break,
             }
@@ -641,7 +683,8 @@ mod tests {
         let queue = Arc::new(EventQueue::new().expect("event queue"));
         let published = Arc::new(Mutex::new(None));
         let handle = {
-            let (queue, published) = (Arc::clone(&queue), Arc::clone(&published));
+            let (queue, published, self_tx) =
+                (Arc::clone(&queue), Arc::clone(&published), tx.clone());
             std::thread::spawn(move || {
                 run(
                     ready_tx,
@@ -653,6 +696,7 @@ mod tests {
                     vec![],
                     false,
                     Box::new(|_, _| {}),
+                    self_tx,
                 )
             })
         };
