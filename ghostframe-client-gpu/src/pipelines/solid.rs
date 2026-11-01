@@ -124,14 +124,8 @@ impl SolidPipeline {
         self.instance_capacity = capacity;
     }
 
-    /// `tiles` is (tile_x, tile_y, bgra).
-    ///
-    /// The render pass uses `LoadOp::Load`, never `Clear`: the framebuffer is
-    /// persistent and shared with the other codecs within a frame, and a
-    /// clear here would wipe every tile PalRle, Cdf53, or Raw already wrote.
-    /// An empty `tiles` is a no-op -- an empty instance buffer is a wgpu
-    /// validation error, so the draw is skipped entirely rather than issued
-    /// with zero instances.
+    /// Draw `tiles` in a submit of its own; see [`SolidPipeline::encode`] for
+    /// the form a frame uses.
     pub fn draw(
         &mut self,
         device: &wgpu::Device,
@@ -139,8 +133,35 @@ impl SolidPipeline {
         fb: &Framebuffer,
         tiles: &[(u8, u8, [u8; 4])],
     ) {
+        crate::submit::submit_now(device, queue, "ghostframe-solid-draw", |e| {
+            self.encode(device, queue, e, fb, tiles)
+        });
+    }
+
+    /// Record a draw of `tiles`, (tile_x, tile_y, bgra). Returns whether
+    /// anything was recorded.
+    ///
+    /// The render pass uses `LoadOp::Load`, never `Clear`: the framebuffer is
+    /// persistent and shared with the other codecs within a frame, and a
+    /// clear here would wipe every tile PalRle, Cdf53, or Raw already wrote.
+    /// An empty `tiles` is a no-op -- an empty instance buffer is a wgpu
+    /// validation error, so the draw is skipped entirely rather than issued
+    /// with zero instances.
+    ///
+    /// The instances are written through the queue now, which wgpu runs ahead
+    /// of the commands of the next submit, so call this at most once per
+    /// encoder: a second call would overwrite the first's instances before
+    /// either's draw ran.
+    pub fn encode(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        fb: &Framebuffer,
+        tiles: &[(u8, u8, [u8; 4])],
+    ) -> bool {
         if tiles.is_empty() {
-            return;
+            return false;
         }
 
         self.ensure_capacity(device, tiles.len());
@@ -161,17 +182,11 @@ impl SolidPipeline {
             .expect("ensure_capacity set it");
         queue.write_buffer(instance_buffer, 0, &data);
 
-        let view = fb
-            .texture()
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("ghostframe-solid-draw"),
-        });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ghostframe-solid-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: fb.view(),
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -189,6 +204,6 @@ impl SolidPipeline {
             pass.set_vertex_buffer(0, instance_buffer.slice(..));
             pass.draw(0..6, 0..tiles.len() as u32);
         }
-        queue.submit(std::iter::once(encoder.finish()));
+        true
     }
 }

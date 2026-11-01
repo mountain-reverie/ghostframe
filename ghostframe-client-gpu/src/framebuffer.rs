@@ -39,26 +39,53 @@ struct BlitPipeline {
 
 pub struct Framebuffer {
     texture: wgpu::Texture,
+    /// The default view of `texture`, made once. Every pass that binds the
+    /// framebuffer used to make its own per flush.
+    view: wgpu::TextureView,
+    /// Names this texture. A fresh one for every texture ever created, so a
+    /// bind group cached against an epoch is stale exactly when the texture
+    /// it holds is no longer the framebuffer's -- whether `resize` replaced
+    /// it or the pipeline is now being driven by another `Framebuffer`.
+    epoch: u64,
     /// Public rather than an accessor: the M1 plan's own test asserts
     /// `fb.width`/`fb.height` directly after a resize.
     pub width: u32,
     pub height: u32,
     blit: std::cell::OnceCell<BlitPipeline>,
+    /// The blit's source bind group (this framebuffer's view). Dropped by
+    /// `resize`, which replaces the view it holds.
+    blit_src: std::cell::OnceCell<wgpu::BindGroup>,
 }
 
 impl Framebuffer {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let texture = create_texture(device, width, height);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         Framebuffer {
             texture,
+            view,
+            epoch: next_epoch(),
             width,
             height,
             blit: std::cell::OnceCell::new(),
+            blit_src: std::cell::OnceCell::new(),
         }
     }
 
     pub fn texture(&self) -> &wgpu::Texture {
         &self.texture
+    }
+
+    /// The texture's default view, shared by every pass that binds it.
+    pub fn view(&self) -> &wgpu::TextureView {
+        &self.view
+    }
+
+    /// Identifies the current texture: it changes whenever the texture is
+    /// replaced. Bind groups that hold [`Framebuffer::view`] are cached
+    /// against it.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Replace the framebuffer with a new one of `width` x `height`,
@@ -90,9 +117,12 @@ impl Framebuffer {
                     depth_or_array_layers: 1,
                 },
             );
-            queue.submit(std::iter::once(encoder.finish()));
+            crate::submit::submit(queue, encoder);
         }
 
+        self.view = new_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.epoch = next_epoch();
+        self.blit_src = std::cell::OnceCell::new();
         self.texture = new_texture;
         self.width = width;
         self.height = height;
@@ -110,7 +140,24 @@ impl Framebuffer {
         self.blit_rects(device, queue, dst, &[full]);
     }
 
-    /// Copy only `rects` (PIXEL coordinates) into `dst`.
+    /// Copy only `rects` (PIXEL coordinates) into `dst`, in a submit of its
+    /// own. [`Framebuffer::encode_blit_rects`] is the form a frame uses, to
+    /// share one submit with the work that produced the pixels.
+    pub fn blit_rects(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        dst: &wgpu::Texture,
+        rects: &[crate::coalesce::Rect],
+    ) {
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+        crate::submit::submit_now(device, queue, "ghostframe-framebuffer-blit-rects", |e| {
+            self.encode_blit_rects(device, e, dst, &dst_view, rects)
+        });
+    }
+
+    /// Record a copy of only `rects` (PIXEL coordinates) into `dst`, whose
+    /// default view is `dst_view`. Returns whether anything was recorded.
     ///
     /// A render pass, not `copy_texture_to_texture`. The export buffer is
     /// `bgra8unorm` and the framebuffer is `rgba8unorm`, and WebGPU does not
@@ -124,15 +171,16 @@ impl Framebuffer {
     /// damage clip is free and the load op stays `Load`, so untouched pixels
     /// keep the content the buffer already had -- which is what lets the
     /// export ring send only damage.
-    pub fn blit_rects(
+    pub fn encode_blit_rects(
         &self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         dst: &wgpu::Texture,
+        dst_view: &wgpu::TextureView,
         rects: &[crate::coalesce::Rect],
-    ) {
+    ) -> bool {
         if rects.iter().all(|r| r.w == 0 || r.h == 0) {
-            return;
+            return false;
         }
         let blit = self
             .blit
@@ -144,27 +192,22 @@ impl Framebuffer {
              pipeline is cached per Framebuffer and cannot follow it"
         );
 
-        let src_view = self
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ghostframe-export-blit"),
-            layout: &blit.layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&src_view),
-            }],
+        let bind_group = self.blit_src.get_or_init(|| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ghostframe-export-blit"),
+                layout: &blit.layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.view),
+                }],
+            })
         });
-        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("ghostframe-framebuffer-blit-rects"),
-        });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ghostframe-export-blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst_view,
+                    view: dst_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -181,7 +224,7 @@ impl Framebuffer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&blit.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[]);
             for rect in rects {
                 if rect.w == 0 || rect.h == 0 {
                     continue;
@@ -198,7 +241,7 @@ impl Framebuffer {
                 pass.draw(0..3, 0..1);
             }
         }
-        queue.submit(std::iter::once(encoder.finish()));
+        true
     }
 
     /// Fill the whole framebuffer with one RGBA colour. Test use only.
@@ -314,7 +357,7 @@ impl Framebuffer {
                 depth_or_array_layers: 1,
             },
         );
-        queue.submit(std::iter::once(encoder.finish()));
+        crate::submit::submit(queue, encoder);
 
         let slice = staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, |r| {
@@ -402,6 +445,11 @@ fn build_blit_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> Bl
         layout,
         format,
     }
+}
+
+fn next_epoch() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn create_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {

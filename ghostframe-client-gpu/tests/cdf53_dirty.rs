@@ -409,3 +409,115 @@ fn a_black_tile_is_still_drawn_from_pass_0() {
         "a complete black tile must be drawn"
     );
 }
+
+/// The CPU reference for a partly refined tile: `Cdf53TileState` fed the same
+/// passes, its picture after the last one that changed it.
+fn cpu_refine(
+    st: &mut ghostframe_client_core::cdf53_tile_state::Cdf53TileState,
+    tile: (u8, u8),
+    seed: u32,
+    keep: impl Fn(u8) -> bool,
+    last: &mut Vec<u8>,
+) {
+    let coeffs = codec::forward(&content(seed));
+    let (_, sparse) = codec::encode_passes_sparse(&coeffs);
+    for (p, payload) in sparse.iter().filter(|(p, _)| keep(*p)) {
+        let pre = prevalidate_cdf53(payload, 1, *p).expect("prevalidates");
+        if let Some(rgba) = st.integrate(tile.0, tile.1, &pre) {
+            *last = rgba;
+        }
+    }
+}
+
+/// The pass count the inverse levels read (`passesProcessed`) must be on the
+/// GPU for every tile a batch touched, and intact for the ones inside the
+/// written range that it did not. A tile refined only to a middle pass
+/// reconstructs with a midpoint correction that depends on that count, so a
+/// count left at zero is a visibly different picture, unlike a fully refined
+/// tile, where it makes no difference.
+///
+/// The dirty-list inverse only reads the counts of tiles it lists, so the
+/// untouched-but-in-range tile is checked through the full-grid inverse, which
+/// reads every slot.
+#[test]
+fn pass_counts_of_partly_refined_tiles_reach_the_gpu() {
+    use ghostframe_client_core::cdf53_tile_state::Cdf53TileState;
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut rig = Rig::new(&ctx, false);
+    // Tile indices 0, 5 and 11: the middle one is inside the range of a batch
+    // that touches only the outer two.
+    let tiles = [((0u8, 0u8), 10u32), ((1, 1), 11), ((3, 2), 12)];
+    let mut cpu: Vec<(Cdf53TileState, Vec<u8>)> = tiles
+        .iter()
+        .map(|_| (Cdf53TileState::new(), Vec::new()))
+        .collect();
+
+    let check = |rig: &mut Rig,
+                 cpu: &mut Vec<(Cdf53TileState, Vec<u8>)>,
+                 batch: Vec<Cdf53PassEntry>,
+                 upto: [u8; 3],
+                 from: [u8; 3]| {
+        for (i, (tile, seed)) in tiles.iter().enumerate() {
+            if upto[i] >= from[i] {
+                let (st, last) = &mut cpu[i];
+                cpu_refine(st, *tile, *seed, |p| p >= from[i] && p <= upto[i], last);
+            }
+        }
+        let fb = rig.batch(&ctx, &batch);
+        for (i, (tile, _)) in tiles.iter().enumerate() {
+            assert_eq!(
+                tile_pixels(&fb, tile.0 as u32, tile.1 as u32),
+                cpu[i].1,
+                "tile {tile:?} after a batch ending at pass {}",
+                upto[i]
+            );
+        }
+    };
+
+    let mut b1 = Vec::new();
+    for (tile, seed) in &tiles {
+        b1.extend(entries(*tile, 1, *seed, |p| p <= 6));
+    }
+    check(&mut rig, &mut cpu, b1, [6, 6, 6], [0, 0, 0]);
+    // The partial picture must differ from the finished one, or this test
+    // could not tell a missing pass count from a present one.
+    assert_ne!(cpu[0].1, expected_rgba(10), "fixture: pass 6 is not final");
+
+    // Refine the outer two only; the middle tile's count must be left alone.
+    let mut b2 = Vec::new();
+    b2.extend(entries(tiles[0].0, 1, tiles[0].1, |p| (7..=9).contains(&p)));
+    b2.extend(entries(tiles[2].0, 1, tiles[2].1, |p| (7..=9).contains(&p)));
+    check(&mut rig, &mut cpu, b2, [9, 6, 9], [7, 7, 7]);
+
+    // Re-invert every slot: the middle tile's count (inside b2's written range,
+    // not in b2) must still be the one b1 wrote.
+    rig.pipe.inverse_full_grid(&ctx.device, &ctx.queue, &rig.fb);
+    let fb = rig.fb.debug_read(&ctx.device, &ctx.queue);
+    for (i, (tile, _)) in tiles.iter().enumerate() {
+        assert_eq!(
+            tile_pixels(&fb, tile.0 as u32, tile.1 as u32),
+            cpu[i].1,
+            "tile {tile:?} after the full-grid inverse"
+        );
+    }
+
+    // Now refine the middle one alone, re-inverting it from its own count.
+    let b3 = entries(tiles[1].0, 1, tiles[1].1, |p| (7..=8).contains(&p));
+    check(&mut rig, &mut cpu, b3, [9, 8, 9], [10, 7, 10]);
+}
+
+/// The inverse's last stage binds the framebuffer's view and caches that bind
+/// group against its epoch; a resize replaces the texture (keeping the pixels),
+/// and the cache must follow, or the second tile is inverted into a discarded
+/// texture.
+#[test]
+fn inverse_draws_into_a_framebuffer_texture_that_replaced_the_one_it_cached() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut rig = Rig::new(&ctx, false);
+    let first = rig.batch(&ctx, &entries((0, 0), 1, 40, |_| true));
+    assert_eq!(tile_pixels(&first, 0, 0), expected_rgba(40));
+    rig.fb.resize(&ctx.device, &ctx.queue, W, H + 32);
+    let second = rig.batch(&ctx, &entries((1, 1), 1, 41, |_| true));
+    assert_eq!(tile_pixels(&second, 1, 1), expected_rgba(41));
+    assert_eq!(tile_pixels(&second, 0, 0), expected_rgba(40));
+}

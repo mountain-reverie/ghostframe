@@ -44,6 +44,95 @@ const MAX_PENDING_DECODE_ERRORS: usize = 1024;
 /// per tile, so they cross near 30.
 const MIN_TILES_PER_UPLOAD: u32 = 32;
 
+/// Row stride of a buffer-to-texture copy: wgpu requires a multiple of this
+/// whenever the copy has more than one row.
+const COPY_ROW_ALIGN: u64 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64;
+
+/// First size of [`UploadStaging`]'s buffer. A full 1920x1080 repaint is 8 MiB,
+/// so a typical session grows it at most a couple of times.
+const MIN_UPLOAD_STAGING: u64 = 1 << 20;
+
+/// Where `TileReady` pixels wait between being written by the CPU and being
+/// copied into the framebuffer by a command in the frame's encoder.
+///
+/// This replaces `queue.write_texture` for those uploads. A queue write runs
+/// ahead of *every* command of the next submit, so a rectangle uploaded that
+/// way would land before the frame's Solid and PalRle draws instead of after
+/// them -- changing which wins where two entries of one `frame_seq` cover the
+/// same tile (see [`crate::paint_order`]). A copy recorded in the encoder keeps
+/// its place in the paint order. The buffer is written through
+/// `write_buffer_with`, so the pixels still go straight into wgpu's staging
+/// memory with no extra pass.
+///
+/// Bump-allocated per flush: every upload gets its own range, so no write can
+/// overwrite another's before the GPU has run its copy.
+#[derive(Default)]
+struct UploadStaging {
+    buffer: Option<wgpu::Buffer>,
+    capacity: u64,
+    cursor: u64,
+}
+
+impl UploadStaging {
+    /// Start a flush: the previous flush's ranges are free again (its copies
+    /// were submitted, and queue writes are ordered after them).
+    fn begin(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// A range of `size` bytes, 256-aligned. Growing replaces the buffer; the
+    /// copies already recorded keep the old one alive through the encoder.
+    fn reserve(&mut self, device: &wgpu::Device, size: u64) -> (&wgpu::Buffer, u64) {
+        let size = size.next_multiple_of(COPY_ROW_ALIGN);
+        if self.buffer.is_none() || self.cursor + size > self.capacity {
+            self.capacity = size.max(self.capacity * 2).max(MIN_UPLOAD_STAGING);
+            self.cursor = 0;
+            self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ghostframe-tile-upload-staging"),
+                size: self.capacity,
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let offset = self.cursor;
+        self.cursor += size;
+        (self.buffer.as_ref().expect("just ensured"), offset)
+    }
+}
+
+/// One buffer-to-texture copy of a flush: the pixel rectangle `(x, y, w, h)`
+/// it covers and where its rows come from.
+struct Copy<'a> {
+    px: (u32, u32, u32, u32),
+    src: CopySrc<'a>,
+}
+
+enum CopySrc<'a> {
+    /// A `TileReady` payload with fewer than 32 rows, or a tile on a narrow
+    /// framebuffer edge.
+    Short(&'a [u8]),
+    /// A coalesced rectangle (in tile coordinates) of full tiles.
+    Tiles(crate::coalesce::Rect),
+}
+
+/// The pixel rectangle a short `TileReady` payload covers, clipped to the
+/// framebuffer; `None` for a payload with no full row or one wholly outside.
+/// Performs no swizzle: `TileReady::rgba` is already RGBA.
+fn short_tile_rect(
+    fb: &Framebuffer,
+    tile_x: u8,
+    tile_y: u8,
+    rgba: &[u8],
+) -> Option<(u32, u32, u32, u32)> {
+    let row_bytes = (TILE_SIZE * 4) as usize;
+    let full_rows = (rgba.len() / row_bytes).min(TILE_SIZE as usize);
+    let x = tile_x as u32 * TILE_SIZE;
+    let y = tile_y as u32 * TILE_SIZE;
+    let w = TILE_SIZE.min(fb.width.saturating_sub(x));
+    let h = (full_rows as u32).min(fb.height.saturating_sub(y));
+    (w > 0 && h > 0).then_some((x, y, w, h))
+}
+
 /// A tile the GPU decode rejected; the shape `ClientCore`'s
 /// `DecodeErrorBatcher::report` takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +197,11 @@ pub struct Renderer {
     /// `TileReady` tiles awaiting upload, batched by [`Renderer::flush`].
     pending_rgba: Vec<(u32, u8, u8, Vec<u8>)>,
     batch_seq: SeqLedger,
+    /// Staging for `TileReady` pixel uploads; see [`UploadStaging`].
+    upload_staging: UploadStaging,
+    /// Submits the most recent flush made for its own GPU work. See
+    /// [`Renderer::last_flush_submits`].
+    last_flush_submits: u32,
     /// GPU-detected decode failures not yet drained by
     /// [`Renderer::take_decode_errors`].
     decode_errors: Vec<GpuDecodeError>,
@@ -286,6 +380,8 @@ impl Renderer {
             pending_cdf53: Vec::new(),
             pending_rgba: Vec::new(),
             batch_seq: SeqLedger::default(),
+            upload_staging: UploadStaging::default(),
+            last_flush_submits: 0,
             decode_errors: Vec::new(),
             collect_decode_errors: false,
             dumps_written: 0,
@@ -392,7 +488,16 @@ impl Renderer {
                 // against it.
                 self.flush(ctx)?;
 
+                let epoch = self.fb.epoch();
                 self.fb.resize(&ctx.device, &ctx.queue, width, height);
+                if self.fb.epoch() != epoch {
+                    // The cached bind groups hold the old texture; drop them
+                    // now rather than when each codec next draws, or the old
+                    // framebuffer outlives the resize.
+                    self.rgba.drop_framebuffer_cache();
+                    self.palrle.drop_framebuffer_cache();
+                    self.cdf53.drop_framebuffer_cache();
+                }
                 if let Err(e) = self.ring.resize(ctx, width, height) {
                     tracing::error!(error = %e, width, height, "export ring resize failed");
                 }
@@ -458,21 +563,81 @@ impl Renderer {
         std::mem::take(&mut self.decode_errors)
     }
 
-    /// Submit all batched work.
+    /// Submit all batched work, in one submit.
     ///
-    /// Fails if the device cannot be waited on (e.g. it was lost); the
-    /// batched work of the failing stage is dropped.
+    /// Every codec records into one command encoder, in the paint order
+    /// below, and the encoder is submitted once. Each submit costs a
+    /// `glFlush` and a fence on GLES, and on panfrost a flush ends the job
+    /// batch -- a separate kernel submission -- so one per codec per frame
+    /// was most of this function's cost on a Pinebook Pro.
+    ///
+    /// **Why the order survives.** Buffer and texture contents reach the GPU
+    /// two ways, and they do not interleave. `queue.write_buffer` /
+    /// `write_buffer_with` / `write_texture` are queue operations that wgpu
+    /// runs ahead of *all* the commands of the next submit; commands in an
+    /// encoder run in the order they were recorded. So (1) every codec's
+    /// inputs are in place before any codec's pass runs, which is harmless
+    /// because the codecs use disjoint buffers, and (2) nothing that must be
+    /// ordered against a pass may go through the queue: the `TileReady`
+    /// rectangles are copied by commands (see [`UploadStaging`]) for exactly
+    /// that reason. (3) A buffer written twice before one submit keeps only
+    /// the second write, so each pipeline's `encode` is called once per
+    /// encoder, and the staging ranges never overlap.
+    ///
+    /// Fails only if the opt-in PalRle error readback cannot wait on the
+    /// device (e.g. it was lost). That runs after the submit, so the frame's
+    /// work is already on the GPU; the errors it would have reported are lost.
     pub fn flush(&mut self, ctx: &WgpuContext) -> Result<(), GpuError> {
+        self.flush_inner(ctx, false).map(|_| ())
+    }
+
+    /// [`Renderer::flush`] and [`Renderer::publish`] in one submit: the
+    /// export blit is recorded after the codecs, into the same encoder.
+    ///
+    /// `Ok(None)` when every export buffer is held by the host (the flush
+    /// still ran). On error nothing is published; the damage stays in the
+    /// ring's history for the next publish.
+    pub fn flush_and_publish(
+        &mut self,
+        ctx: &WgpuContext,
+    ) -> Result<Option<PublishedFrame>, GpuError> {
+        self.flush_inner(ctx, true)
+    }
+
+    /// Submits the most recent flush made for its own GPU work: 1 when it had
+    /// anything to draw (with or without a publish), 0 when it had nothing.
+    /// Not counted: the opt-in PalRle error readback and framebuffer dump,
+    /// which are submits of their own by design. For tests and diagnostics.
+    pub fn last_flush_submits(&self) -> u32 {
+        self.last_flush_submits
+    }
+
+    fn flush_inner(
+        &mut self,
+        ctx: &WgpuContext,
+        publish: bool,
+    ) -> Result<Option<PublishedFrame>, GpuError> {
+        let submits_before = crate::submit::count();
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ghostframe-flush"),
+            });
+        let mut recorded = false;
+
         // Order within a batch is by `frame_seq`, not by codec (see
         // `crate::paint_order`). The CDF 5/3 lift goes first so that a newer
         // stateless entry lands on top of an older pass; a stateless entry
         // older than anything else for its tile is dropped, so a newer pass
         // is not covered either. Passes are never dropped.
         if !self.pending_cdf53.is_empty() {
-            self.cdf53
-                .integrate(&ctx.device, &ctx.queue, &self.pending_cdf53);
+            recorded |= self
+                .cdf53
+                .encode_integrate(&ctx.queue, &mut encoder, &self.pending_cdf53);
             self.pending_cdf53.clear();
-            self.cdf53.inverse(&ctx.device, &ctx.queue, &self.fb);
+            recorded |= self
+                .cdf53
+                .encode_inverse(&ctx.device, &ctx.queue, &mut encoder, &self.fb);
         }
 
         let ledger = &self.batch_seq;
@@ -490,20 +655,40 @@ impl Renderer {
             .retain(|&(seq, tx, ty, _)| !ledger.superseded(tx, ty, seq));
         self.batch_seq.clear();
 
-        if !solid.is_empty() {
-            self.solid.draw(&ctx.device, &ctx.queue, &self.fb, &solid);
+        recorded |= self
+            .solid
+            .encode(&ctx.device, &ctx.queue, &mut encoder, &self.fb, &solid);
+        recorded |= self.palrle.encode(
+            &ctx.device,
+            &ctx.queue,
+            &mut encoder,
+            &self.fb,
+            &palrle_batch,
+        );
+        recorded |= self.encode_pending_rgba(ctx, &mut encoder);
+
+        let plan = if publish {
+            self.ring.plan_publish(&self.fb)
+        } else {
+            None
+        };
+        if let Some(plan) = &plan {
+            recorded |= self
+                .ring
+                .encode_blit(&ctx.device, &mut encoder, &self.fb, plan);
         }
-        if !palrle_batch.is_empty() {
-            self.palrle
-                .decode(&ctx.device, &ctx.queue, &self.fb, &palrle_batch);
-            let batch = palrle_batch;
-            let errors = if self.collect_decode_errors {
-                self.palrle.take_errors(&ctx.device, &ctx.queue)?
-            } else {
-                Vec::new()
-            };
+
+        if recorded {
+            crate::submit::submit(&ctx.queue, encoder);
+        }
+        let submits = crate::submit::count().wrapping_sub(submits_before) as u32;
+        self.last_flush_submits = submits;
+        tracing::debug!(submits, publish, "flush: submitted");
+
+        if !palrle_batch.is_empty() && self.collect_decode_errors {
+            let errors = self.palrle.take_errors(&ctx.device, &ctx.queue)?;
             for (i, code) in errors {
-                let Some((tile_x, tile_y, ..)) = batch.get(i as usize) else {
+                let Some((tile_x, tile_y, ..)) = palrle_batch.get(i as usize) else {
                     continue;
                 };
                 let Some(code) = decode_error_code(code) else {
@@ -522,16 +707,16 @@ impl Renderer {
                 }
             }
         }
-        self.upload_pending_rgba(ctx);
 
         self.flushes = self.flushes.saturating_add(1);
         self.maybe_dump_framebuffer(ctx);
-        Ok(())
+        Ok(plan.map(|plan| self.ring.finish_publish(&ctx.device, plan)))
     }
 
-    /// Upload every buffered `TileReady` tile with as few calls as possible:
-    /// one `write_texture` per large rectangle of dirty tiles, and every other
-    /// tile in one [`RgbaPipeline`] dispatch.
+    /// Record the upload of every buffered `TileReady` tile with as few
+    /// commands as possible: one buffer-to-texture copy per large rectangle of
+    /// dirty tiles, and every other tile in one [`RgbaPipeline`] dispatch.
+    /// Returns whether anything was recorded.
     ///
     /// **Why this exists.** `write_texture` costs about the same whatever it
     /// carries: measured on a Pinebook Pro (Mali-T860), 2040 calls of 32x32
@@ -549,28 +734,31 @@ impl Renderer {
     /// the GPU in one buffer and one dispatch instead (see
     /// `upload_bench.rs::rgba_pipeline_breakdown` for the crossover).
     ///
+    /// The rectangles go through [`UploadStaging`] and a recorded copy rather
+    /// than `write_texture`, so that they stay in the frame's paint order
+    /// within its one submit; the cost model above is unchanged, since
+    /// `write_texture` stages through a buffer the same way.
+    ///
     /// Tiles whose payload is shorter than a full tile take neither route and
     /// are uploaded individually. Both routes assume every tile supplies all
     /// its rows; a short one would leave the remainder as buffer fill and
     /// write black over live pixels, which is a silent corruption rather than
     /// a dropped update.
-    fn upload_pending_rgba(&mut self, ctx: &WgpuContext) {
+    fn encode_pending_rgba(
+        &mut self,
+        ctx: &WgpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> bool {
         if self.pending_rgba.is_empty() {
-            return;
+            return false;
         }
         let full_tile_bytes = (TILE_SIZE * TILE_SIZE * 4) as usize;
         let pending = std::mem::take(&mut self.pending_rgba);
 
-        // Short payloads keep the old one-call-each path; see the doc above.
+        // Short payloads keep the one-copy-each path; see the doc above.
         let (full, short): (Vec<_>, Vec<_>) = pending
             .into_iter()
             .partition(|(_, _, _, rgba)| rgba.len() >= full_tile_bytes);
-        for (_, tx, ty, rgba) in &short {
-            upload_rgba_tile(&ctx.queue, &self.fb, *tx, *ty, rgba);
-        }
-        if full.is_empty() {
-            return;
-        }
 
         // Last write wins for a tile that arrived twice in one batch, matching
         // the per-tile path's ordering.
@@ -587,7 +775,17 @@ impl Renderer {
             by_tile.insert((tx, ty), rgba.as_slice());
         }
 
-        let row_bytes = (TILE_SIZE * 4) as usize;
+        // Every copy of the flush, in paint order (short tiles first, as
+        // before), each with the pixel rectangle it covers.
+        let mut copies: Vec<Copy> = Vec::new();
+        for (_, tx, ty, rgba) in &short {
+            if let Some(px) = short_tile_rect(&self.fb, *tx, *ty, rgba) {
+                copies.push(Copy {
+                    px,
+                    src: CopySrc::Short(rgba),
+                });
+            }
+        }
         let mut scattered: Vec<(u32, u32, &[u8])> = Vec::new();
         for rect in crate::coalesce::coalesce(&grid) {
             if rect.w * rect.h < MIN_TILES_PER_UPLOAD {
@@ -604,56 +802,117 @@ impl Renderer {
             if px.w == 0 || px.h == 0 {
                 continue;
             }
-            let dst_row_bytes = px.w as usize * 4;
-            let mut buf = vec![0u8; dst_row_bytes * px.h as usize];
+            copies.push(Copy {
+                px: (px.x, px.y, px.w, px.h),
+                src: CopySrc::Tiles(rect),
+            });
+        }
 
-            for ty in rect.y..rect.y + rect.h {
-                for tx in rect.x..rect.x + rect.w {
-                    // `coalesce` emits rectangles covering exactly the set
-                    // tiles, so every tile here was inserted above.
-                    let Some(src) = by_tile.get(&(tx, ty)) else {
-                        continue;
-                    };
-                    let dx = (tx - rect.x) as usize * TILE_SIZE as usize;
-                    let dy = (ty - rect.y) as usize * TILE_SIZE as usize;
-                    // Clip against the rectangle, which is itself already
-                    // clamped to the framebuffer edge.
-                    let w = (TILE_SIZE as usize).min(px.w as usize - dx);
-                    let h = (TILE_SIZE as usize).min(px.h as usize - dy);
-                    for row in 0..h {
-                        let s = row * row_bytes;
-                        let d = (dy + row) * dst_row_bytes + dx * 4;
-                        buf[d..d + w * 4].copy_from_slice(&src[s..s + w * 4]);
+        let mut recorded = self.encode_staged_copies(ctx, encoder, &copies, &by_tile);
+        recorded |= self
+            .rgba
+            .encode(&ctx.device, &ctx.queue, encoder, &self.fb, &scattered);
+        recorded
+    }
+
+    /// Record every copy in `copies` into the framebuffer, all staged through
+    /// one range of [`UploadStaging`] and so one `write_buffer_with`: each
+    /// queue write is a staging buffer and, on panfrost, several flushes.
+    /// Each copy has its own sub-range (a multiple of the row alignment), so
+    /// none overwrites another. Returns whether anything was recorded.
+    fn encode_staged_copies(
+        &mut self,
+        ctx: &WgpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        copies: &[Copy],
+        by_tile: &std::collections::HashMap<(u32, u32), &[u8]>,
+    ) -> bool {
+        if copies.is_empty() {
+            return false;
+        }
+        self.upload_staging.begin();
+        // (row stride, offset within the range) per copy.
+        let mut layout = Vec::with_capacity(copies.len());
+        let mut total = 0u64;
+        for c in copies {
+            let stride = (c.px.2 as u64 * 4).next_multiple_of(COPY_ROW_ALIGN);
+            layout.push((stride, total));
+            total += stride * c.px.3 as u64;
+        }
+        let (buffer, base) = self.upload_staging.reserve(&ctx.device, total);
+        let Some(mut view) = ctx.queue.write_buffer_with(
+            buffer,
+            base,
+            wgpu::BufferSize::new(total).expect("non-empty copies"),
+        ) else {
+            // Only on a validation failure (the range is within the buffer by
+            // construction); wgpu has already reported it.
+            return false;
+        };
+        let row_bytes = (TILE_SIZE * 4) as usize;
+        for (c, &(stride, at)) in copies.iter().zip(&layout) {
+            let (stride, at) = (stride as usize, at as usize);
+            let (_, _, w, h) = c.px;
+            match &c.src {
+                CopySrc::Short(rgba) => {
+                    for row in 0..h as usize {
+                        let d = at + row * stride;
+                        view.slice(d..d + w as usize * 4).copy_from_slice(
+                            &rgba[row * row_bytes..row * row_bytes + w as usize * 4],
+                        );
+                    }
+                }
+                CopySrc::Tiles(rect) => {
+                    for ty in rect.y..rect.y + rect.h {
+                        for tx in rect.x..rect.x + rect.w {
+                            // `coalesce` emits rectangles covering exactly the
+                            // set tiles, so every tile here was inserted.
+                            let Some(src) = by_tile.get(&(tx, ty)) else {
+                                continue;
+                            };
+                            let dx = (tx - rect.x) as usize * TILE_SIZE as usize;
+                            let dy = (ty - rect.y) as usize * TILE_SIZE as usize;
+                            // Clip against the rectangle, which is itself
+                            // already clamped to the framebuffer edge.
+                            let tw = (TILE_SIZE as usize).min(w as usize - dx);
+                            let th = (TILE_SIZE as usize).min(h as usize - dy);
+                            for row in 0..th {
+                                let d = at + (dy + row) * stride + dx * 4;
+                                view.slice(d..d + tw * 4).copy_from_slice(
+                                    &src[row * row_bytes..row * row_bytes + tw * 4],
+                                );
+                            }
+                        }
                     }
                 }
             }
-
-            ctx.queue.write_texture(
+        }
+        drop(view);
+        for (c, &(stride, at)) in copies.iter().zip(&layout) {
+            let (x, y, w, h) = c.px;
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: base + at,
+                        bytes_per_row: Some(stride as u32),
+                        rows_per_image: Some(h),
+                    },
+                },
                 wgpu::TexelCopyTextureInfo {
                     texture: self.fb.texture(),
                     mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: px.x,
-                        y: px.y,
-                        z: 0,
-                    },
+                    origin: wgpu::Origin3d { x, y, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
-                &buf,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(px.w * 4),
-                    rows_per_image: Some(px.h),
-                },
                 wgpu::Extent3d {
-                    width: px.w,
-                    height: px.h,
+                    width: w,
+                    height: h,
                     depth_or_array_layers: 1,
                 },
             );
         }
-        self.rgba
-            .draw(&ctx.device, &ctx.queue, &self.fb, &scattered);
+        true
     }
 
     /// Seal a generation and hand out an export buffer, if one is free.
@@ -1289,57 +1548,6 @@ fn wait_for_submission(ctx: &WgpuContext, submission: wgpu::SubmissionIndex, fra
 
 fn log_decode_error(codec: Codec, tile_x: u8, tile_y: u8, code: DecodeErrorCode) {
     tracing::warn!(?codec, tile_x, tile_y, ?code, "tile decode error");
-}
-
-/// Upload an already-RGBA tile (`Event::TileReady`'s payload) directly into
-/// `fb` at tile coordinates `(tile_x, tile_y)`.
-///
-/// Handles a partial last row and a framebuffer edge narrower than a tile by
-/// clamping. Performs no BGRA -> RGBA swizzle: `TileReady::rgba` is already
-/// RGBA.
-fn upload_rgba_tile(queue: &wgpu::Queue, fb: &Framebuffer, tile_x: u8, tile_y: u8, rgba: &[u8]) {
-    let row_bytes = (TILE_SIZE * 4) as usize;
-    let full_rows = (rgba.len() / row_bytes).min(TILE_SIZE as usize);
-    if full_rows == 0 {
-        return;
-    }
-
-    let x = tile_x as u32 * TILE_SIZE;
-    let y = tile_y as u32 * TILE_SIZE;
-    let w = TILE_SIZE.min(fb.width.saturating_sub(x));
-    let h = (full_rows as u32).min(fb.height.saturating_sub(y));
-    if w == 0 || h == 0 {
-        return;
-    }
-
-    // Clip to `w` columns per row, so a framebuffer edge narrower than a
-    // full tile is handled.
-    let mut tight = Vec::with_capacity(w as usize * h as usize * 4);
-    for row in 0..h as usize {
-        let row_start = row * row_bytes;
-        let row_end = row_start + w as usize * 4;
-        tight.extend_from_slice(&rgba[row_start..row_end]);
-    }
-
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: fb.texture(),
-            mip_level: 0,
-            origin: wgpu::Origin3d { x, y, z: 0 },
-            aspect: wgpu::TextureAspect::All,
-        },
-        &tight,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(w * 4),
-            rows_per_image: Some(h),
-        },
-        wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-    );
 }
 
 /// Shortest gap between two reset requests from this client. Slightly longer

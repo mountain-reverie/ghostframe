@@ -89,6 +89,7 @@ pub(crate) mod paint_order;
 pub mod pipelines;
 pub mod renderer;
 pub mod ring;
+pub(crate) mod submit;
 // Needs no GPU (see the module doc): a syntax/type error in any WGSL under
 // `shaders/client/` would otherwise reach `master` green, since naga only
 // parses a shader at `create_shader_module` time, which CI's GPU-less

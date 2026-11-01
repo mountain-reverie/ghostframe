@@ -628,7 +628,9 @@ pub(crate) fn run(
             // buffer is free for this very publish.
             withdraw_unacquired(&published, &mut renderer);
             if let Some(r) = renderer.as_mut() {
-                let flushed = r.flush(&ctx);
+                // Flush and publish in one GPU submit: the export blit is
+                // recorded into the flush's own command encoder.
+                let flushed = r.flush_and_publish(&ctx);
                 if let Err(e) = &flushed {
                     // E.g. device loss while waiting on the GPU. Report it
                     // (once: the queue is unbounded and a lost device fails
@@ -657,15 +659,12 @@ pub(crate) fn run(
                         "GPU tile decode errors (not yet sent to server)"
                     );
                 }
-                let published_frame = if flushed.is_ok() {
-                    r.publish(&ctx)
-                } else {
-                    None
-                };
-                if flushed.is_ok() && published_frame.is_none() {
+                let flush_ok = flushed.is_ok();
+                let published_frame = flushed.unwrap_or(None);
+                if flush_ok && published_frame.is_none() {
                     tally.publish_starved += 1;
                 }
-                publish_pending = flushed.is_ok() && published_frame.is_none();
+                publish_pending = flush_ok && published_frame.is_none();
                 if let Some(pf) = published_frame {
                     tally.publishes += 1;
                     maybe_dump_export(r, &pf, &mut export_dumps, &dump_cfg);

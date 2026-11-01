@@ -311,3 +311,112 @@ fn rgba_pipeline_breakdown() {
         }
     }
 }
+
+/// One frame of every codec at once, through the real `Renderer`: the case a
+/// per-pipeline `submit` penalises, since each codec used to end in its own
+/// glFlush and fence. Run by hand with `--ignored --nocapture`; under
+/// `PAN_MESA_DEBUG=perf` the "Gallium flush" lines in the log count the
+/// kernel submissions per frame.
+#[test]
+#[ignore = "hardware benchmark; run by hand"]
+fn mixed_batch_flush_and_publish() {
+    use ghostframe_client_core::{ClientConfig, ClientCore, Event, TileData, TileDelivery};
+    use ghostframe_client_gpu::renderer::Renderer;
+
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut r = Renderer::new(&ctx, W, H, 3, &[], false, false).expect("renderer");
+
+    // CDF 5/3 passes come from the shared capture (tiles in the top rows).
+    let mut core = ClientCore::new(
+        ClientConfig {
+            indices_raw_enabled: false,
+            supports_h264: false,
+            h264_acked_ref: false,
+            tile_delivery: TileDelivery::Payload,
+            display: None,
+        },
+        0,
+    );
+    let mut cdf: Vec<Event> = Vec::new();
+    for (i, d) in ghostframe_client_gpu::testdata::mixed_codec_capture()
+        .iter()
+        .enumerate()
+    {
+        cdf.extend(core.handle_datagram(d, i as u64 * 1_000));
+    }
+
+    let at = |i: u32, row0: u32| (i % 60, row0 + i / 60);
+    let frame_events = |seq: u32| -> Vec<Event> {
+        let mut evs = cdf.clone();
+        evs.push(Event::PaletteUpdated {
+            palette_id: 1,
+            colors: (0..16u8).map(|c| [c * 15, 255 - c * 15, c, 255]).collect(),
+        });
+        for i in 0..240 {
+            let (tile_x, tile_y) = at(i, 4);
+            evs.push(Event::TilePayload {
+                frame_seq: seq,
+                tile_x: tile_x as u8,
+                tile_y: tile_y as u8,
+                generation: 0,
+                data: TileData::Solid([i as u8, seq as u8, 7, 255]),
+            });
+            let (tile_x, tile_y) = at(i, 10);
+            evs.push(Event::TilePayload {
+                frame_seq: seq,
+                tile_x: tile_x as u8,
+                tile_y: tile_y as u8,
+                generation: 0,
+                data: TileData::PalRle {
+                    palette_id: 1,
+                    count: 16,
+                    indices: vec![(i as u8) & 0x77; 512],
+                    wire_flags: 0,
+                },
+            });
+        }
+        // Scattered TileReady (no two adjacent) and one 8x8 block.
+        let rgba = vec![seq as u8; (TILE * TILE * 4) as usize];
+        for y in 16..20u32 {
+            for x in (0..60u32).filter(|x| (x + y) % 2 == 0) {
+                evs.push(Event::TileReady {
+                    frame_seq: seq,
+                    tile_x: x as u8,
+                    tile_y: y as u8,
+                    rgba: rgba.clone(),
+                });
+            }
+        }
+        for y in 22..30u32 {
+            for x in 0..8u32 {
+                evs.push(Event::TileReady {
+                    frame_seq: seq,
+                    tile_x: x as u8,
+                    tile_y: y as u8,
+                    rgba: rgba.clone(),
+                });
+            }
+        }
+        evs
+    };
+
+    let mut run = |frames: u32, base: u32| -> f64 {
+        let mut total = 0.0;
+        for f in 0..frames {
+            for ev in frame_events(base + f + 1) {
+                r.apply_event(&ctx, ev).expect("gpu ok");
+            }
+            let t0 = Instant::now();
+            let pf = r
+                .flush_and_publish(&ctx)
+                .expect("flush")
+                .expect("a free export buffer");
+            total += Instant::now().saturating_duration_since(t0).as_secs_f64() * 1e3;
+            r.release(pf.frame_id);
+        }
+        total / frames as f64
+    };
+    run(10, 0); // warm-up: pipeline compile, buffer growth
+    let ms = run(100, 10);
+    eprintln!("\nmixed batch (240 solid, 240 palrle, 120+64 TileReady, 3 cdf53): flush+publish {ms:.2} ms/frame");
+}

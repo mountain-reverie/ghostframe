@@ -132,6 +132,10 @@ pub struct Cdf53Pipeline {
     inverse_l3_bind_group: Option<wgpu::BindGroup>,
     inverse_l2_bind_group: Option<wgpu::BindGroup>,
     inverse_l1_bind_group: Option<wgpu::BindGroup>,
+    /// The last inverse stage writes the framebuffer, so its bind group holds
+    /// the framebuffer view and is cached against that texture's
+    /// [`Framebuffer::epoch`]. Dropped by `resize` with the buffers it binds.
+    inverse_l1_pass2_bind_group: Option<(u64, wgpu::BindGroup)>,
 
     cols: u32,
     max_tiles: u32,
@@ -146,6 +150,12 @@ pub struct Cdf53Pipeline {
 }
 
 impl Cdf53Pipeline {
+    /// Drop the cached bind group that holds the framebuffer's view, so a
+    /// replaced framebuffer texture is not kept alive by it.
+    pub fn drop_framebuffer_cache(&mut self) {
+        self.inverse_l1_pass2_bind_group = None;
+    }
+
     pub fn new(device: &wgpu::Device) -> Self {
         let make_module = |label: &str, src: &str| {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -206,6 +216,7 @@ impl Cdf53Pipeline {
             inverse_l3_bind_group: None,
             inverse_l2_bind_group: None,
             inverse_l1_bind_group: None,
+            inverse_l1_pass2_bind_group: None,
             cols: 0,
             max_tiles: 0,
             tracks: Vec::new(),
@@ -412,20 +423,43 @@ impl Cdf53Pipeline {
         self.inverse_l3_bind_group = Some(inverse_l3_bind_group);
         self.inverse_l2_bind_group = Some(inverse_l2_bind_group);
         self.inverse_l1_bind_group = Some(inverse_l1_bind_group);
+        self.inverse_l1_pass2_bind_group = None;
         self.max_tiles = max_tiles;
     }
 
-    /// `tiles` is (tile_x, tile_y, generation, pass_idx, bit_planes,
-    /// present_passes). `bit_planes` is exactly 384 bytes. `present_passes`
-    /// is Some only on pass 0.
+    /// Integrate `tiles` in a submit of its own; see
+    /// [`Cdf53Pipeline::encode_integrate`] for the form a frame uses.
     pub fn integrate(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         tiles: &[Cdf53PassEntry],
     ) {
+        crate::submit::submit_now(device, queue, "ghostframe-cdf53-integrate", |e| {
+            self.encode_integrate(queue, e, tiles)
+        });
+    }
+
+    /// Record the integration of `tiles`, (tile_x, tile_y, generation,
+    /// pass_idx, bit_planes, present_passes, frame_seq). `bit_planes` is
+    /// exactly 384 bytes. `present_passes` is Some only on pass 0. Returns
+    /// whether anything was recorded.
+    ///
+    /// The per-batch buffers, the generation clears and the pass counts are
+    /// written through the queue now, which wgpu runs ahead of the commands of
+    /// the next submit. So call this at most once per encoder: a second call
+    /// would overwrite the first's batch (and its pass counts) before the
+    /// first's dispatch ran. Tiles integrated since the last inverse
+    /// accumulate on the CPU, so [`Cdf53Pipeline::encode_inverse`] after it,
+    /// in the same encoder, sees them all.
+    pub fn encode_integrate(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        tiles: &[Cdf53PassEntry],
+    ) -> bool {
         if tiles.is_empty() {
-            return;
+            return false;
         }
         let buffers = self
             .buffers
@@ -443,10 +477,13 @@ impl Cdf53Pipeline {
 
         // Per-tile gen transitions: clear those tiles BEFORE the integrate
         // pass sees them. See the module doc for why this must stay
-        // host-side, and why it is deduped within the batch.
-        let coef_zero = vec![0u8; COEFFICIENT_STRIDE as usize];
-        let sign_zero = vec![0u8; SIGN_STRIDE as usize];
+        // host-side, and why it is deduped within the batch. The clears are
+        // recorded into the encoder, ahead of the integrate pass: a clear is
+        // a command, so it needs no staging write of its own.
         let mut cleared_tiles: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        // Tiles whose pass count changed, as a range: the CPU mirror below
+        // is the single source of truth for what the GPU buffer must hold.
+        let (mut first_touched, mut end_touched) = (u32::MAX, 0u32);
 
         for (i, (tile_x, tile_y, generation, pass_idx, bit_planes, present_passes, frame_seq)) in
             tiles.iter().enumerate()
@@ -462,12 +499,6 @@ impl Cdf53Pipeline {
             if (track.last_seen_gen != *generation as u32 || track.last_seen_seq != *frame_seq)
                 && cleared_tiles.insert(tile_idx)
             {
-                queue.write_buffer(
-                    &buffers.coefficient,
-                    tile_idx as u64 * COEFFICIENT_STRIDE,
-                    &coef_zero,
-                );
-                queue.write_buffer(&buffers.sign, tile_idx as u64 * SIGN_STRIDE, &sign_zero);
                 // Gen bump also resets pass-count tracking. The bitmap is
                 // per-generation too: a new generation re-encodes the tile
                 // and may have a different present set entirely.
@@ -489,11 +520,8 @@ impl Cdf53Pipeline {
                 track.passes_processed,
                 *pass_idx,
             );
-            queue.write_buffer(
-                &buffers.passes_processed,
-                tile_idx as u64 * 4,
-                &track.passes_processed.to_le_bytes(),
-            );
+            first_touched = first_touched.min(tile_idx);
+            end_touched = end_touched.max(tile_idx + 1);
 
             // Invert the tile only once its reconstruction is a picture.
             // Pass 0 carries signs only and the inverse has no level shift,
@@ -524,11 +552,42 @@ impl Cdf53Pipeline {
 
         queue.write_buffer(&buffers.tile_work, 0, &tile_work);
         queue.write_buffer(&buffers.bit_planes, 0, &bit_planes_data);
-        queue.write_buffer(&buffers.dirty_tiles_count, 0, &[0u8; 16]);
+        // Clear the generation-bumped tiles' state as contiguous runs of tile
+        // slots: one command per run, however many tiles bumped.
+        let mut bumped: Vec<u32> = cleared_tiles.into_iter().collect();
+        bumped.sort_unstable();
+        let mut i = 0;
+        while i < bumped.len() {
+            let start = bumped[i];
+            let mut end = start + 1;
+            i += 1;
+            while i < bumped.len() && bumped[i] == end {
+                end += 1;
+                i += 1;
+            }
+            let n = (end - start) as u64;
+            encoder.clear_buffer(
+                &buffers.coefficient,
+                start as u64 * COEFFICIENT_STRIDE,
+                Some(n * COEFFICIENT_STRIDE),
+            );
+            encoder.clear_buffer(
+                &buffers.sign,
+                start as u64 * SIGN_STRIDE,
+                Some(n * SIGN_STRIDE),
+            );
+        }
+        // One write for every changed pass count, not one per entry: each
+        // queue write is a staging buffer and, on panfrost, several flushes.
+        // Tiles in the range this batch did not touch hold their own mirror,
+        // which equals what the GPU buffer already has.
+        let counts: Vec<u8> = self.tracks[first_touched as usize..end_touched as usize]
+            .iter()
+            .flat_map(|t| t.passes_processed.to_le_bytes())
+            .collect();
+        queue.write_buffer(&buffers.passes_processed, first_touched as u64 * 4, &counts);
+        encoder.clear_buffer(&buffers.dirty_tiles_count, 0, Some(16));
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("ghostframe-cdf53-integrate"),
-        });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ghostframe-cdf53-integrate-pass"),
@@ -538,11 +597,19 @@ impl Cdf53Pipeline {
             pass.set_bind_group(0, self.integrate_bind_group.as_ref().unwrap(), &[]);
             pass.dispatch_workgroups(tiles.len() as u32, 1, 1);
         }
-        queue.submit(std::iter::once(encoder.finish()));
+        true
     }
 
-    /// Run the inverse levels for the tiles integrated since the last call,
-    /// into `fb`. Does nothing (no encoder, no submit) when none were.
+    /// Run the inverse in a submit of its own; see
+    /// [`Cdf53Pipeline::encode_inverse`] for the form a frame uses.
+    pub fn inverse(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, fb: &Framebuffer) {
+        crate::submit::submit_now(device, queue, "ghostframe-cdf53-inverse", |e| {
+            self.encode_inverse(device, queue, e, fb)
+        });
+    }
+
+    /// Record the inverse levels for the tiles integrated since the last call,
+    /// into `fb`. Records nothing (and returns false) when none were.
     ///
     /// Each tile is listed once however many passes of it arrived, and
     /// workgroup N of every level maps to `list[N]`. Tiles not in the list
@@ -550,17 +617,27 @@ impl Cdf53Pipeline {
     /// NOT re-inverted, so anything painted over one since (solid, PalRle,
     /// raw) survives. Their coefficient state is persistent, so a later
     /// batch touching one re-inverts it from everything integrated so far.
-    pub fn inverse(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, fb: &Framebuffer) {
+    ///
+    /// The list is written through the queue now, ahead of the next submit's
+    /// commands: at most one call per encoder.
+    pub fn encode_inverse(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        fb: &Framebuffer,
+    ) -> bool {
         if self.dirty.is_empty() {
-            return;
+            return false;
         }
         let list = std::mem::take(&mut self.dirty);
         for &t in &list {
             self.dirty_mark[t as usize] = false;
         }
-        self.run_inverse(device, queue, fb, &list);
+        self.record_inverse(device, queue, encoder, fb, &list);
         self.dirty = list;
         self.dirty.clear();
+        true
     }
 
     /// The pre-dirty-list behaviour: invert every tile slot, relying on the
@@ -578,13 +655,17 @@ impl Cdf53Pipeline {
         }
         self.dirty.clear();
         let all: Vec<u32> = (0..self.max_tiles).collect();
-        self.run_inverse(device, queue, fb, &all);
+        crate::submit::submit_now(device, queue, "ghostframe-cdf53-inverse", |e| {
+            self.record_inverse(device, queue, e, fb, &all);
+            true
+        });
     }
 
-    fn run_inverse(
-        &self,
+    fn record_inverse(
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         fb: &Framebuffer,
         list: &[u32],
     ) {
@@ -597,39 +678,39 @@ impl Cdf53Pipeline {
         let list_bytes: Vec<u8> = list.iter().flat_map(|t| t.to_le_bytes()).collect();
         queue.write_buffer(&buffers.inverse_list, 0, &list_bytes);
 
-        let fb_view = fb
-            .texture()
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let inverse_l1_pass2_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ghostframe-cdf53-inverse-l1-pass2-bind-group"),
-            layout: &self.inverse_l1_pass2_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffers.tile_gen.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: buffers.work_area.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&fb_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.uniforms.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: buffers.inverse_list.as_entire_binding(),
-                },
-            ],
-        });
+        let epoch = fb.epoch();
+        if self.inverse_l1_pass2_bind_group.as_ref().map(|(e, _)| *e) != Some(epoch) {
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ghostframe-cdf53-inverse-l1-pass2-bind-group"),
+                layout: &self.inverse_l1_pass2_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffers.tile_gen.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buffers.work_area.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(fb.view()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.uniforms.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: buffers.inverse_list.as_entire_binding(),
+                    },
+                ],
+            });
+            self.inverse_l1_pass2_bind_group = Some((epoch, bind_group));
+        }
+        let (_, inverse_l1_pass2_bind_group) =
+            self.inverse_l1_pass2_bind_group.as_ref().expect("just set");
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("ghostframe-cdf53-inverse"),
-        });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ghostframe-cdf53-inverse-l3-pass"),
@@ -665,9 +746,8 @@ impl Cdf53Pipeline {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.inverse_l1_pass2_pipeline);
-            pass.set_bind_group(0, &inverse_l1_pass2_bind_group, &[]);
+            pass.set_bind_group(0, inverse_l1_pass2_bind_group, &[]);
             pass.dispatch_workgroups(wg_cap, 1, 1);
         }
-        queue.submit(std::iter::once(encoder.finish()));
     }
 }
