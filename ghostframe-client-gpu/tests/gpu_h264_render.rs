@@ -165,6 +165,53 @@ fn a_decoded_frame_lands_in_the_framebuffer() {
     assert_looks_like_gradient(&pixels, 640, 480);
 }
 
+/// A frame the decoder finishes after `apply_event` returned is drawn by
+/// `poll_h264` when the ready callback fires -- not left waiting for another
+/// access unit, which on a remote desktop arrives only when the screen next
+/// changes. One access unit in, nothing else fed, and the framebuffer must
+/// hold its picture.
+///
+/// GStreamer only: VA-API decodes synchronously, so its frame is drawn inside
+/// `apply_event` and there is never a late one to poll for.
+#[cfg(feature = "decode-gstreamer")]
+#[test]
+fn a_late_frame_is_drawn_by_poll_h264_without_another_access_unit() {
+    let Some(ctx) = gpu_and_vaapi_or_skip() else {
+        return;
+    };
+    let mut renderer = Renderer::new(&ctx, 640, 480, 3, &[], true, false).expect("renderer");
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    renderer.set_h264_frame_ready_notify(Arc::new(move || {
+        let _ = tx.send(());
+    }));
+
+    let clip = ghostframe_client_h264::testclip::low_latency_clip(640, 480, 1);
+    renderer
+        .apply_event(
+            &ctx,
+            Event::NeedsH264 {
+                frame_seq: 0,
+                timestamp_us: 0,
+                is_keyframe: true,
+                ref_frame_seq: u32::MAX,
+                flags: 0,
+                slots: 0,
+                payload: clip[0].clone(),
+            },
+        )
+        .expect("gpu ok");
+
+    let mut drew = false;
+    // Bounded so a frame that never comes fails rather than hangs.
+    while !drew && rx.recv_timeout(Duration::from_secs(2)).is_ok() {
+        drew = renderer.poll_h264(&ctx).expect("gpu ok");
+    }
+    assert!(drew, "the ready callback never led to a drawn frame");
+    renderer.flush(&ctx).expect("gpu ok");
+    let pixels = renderer.debug_read_framebuffer(&ctx);
+    assert_looks_like_gradient(&pixels, 640, 480);
+}
+
 /// Not a correctness test: this drives `Renderer` through enough 1920x1080
 /// decode/flush/publish/release cycles, at the production resolution, to
 /// give M3 design doc §10 real percentile samples -- `decode_h264`'s

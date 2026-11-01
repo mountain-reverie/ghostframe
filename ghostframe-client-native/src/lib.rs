@@ -415,6 +415,7 @@ impl Client {
                 }
             })
         };
+        let render_self_tx = render_tx.clone();
         let render_handle = std::thread::Builder::new()
             .name("gf-render".into())
             .spawn(move || {
@@ -428,6 +429,7 @@ impl Client {
                     preferred_modifiers,
                     open_h264_eagerly,
                     reset_sink,
+                    render_self_tx,
                 )
             })
             .map_err(ClientError::Io)?;

@@ -146,6 +146,9 @@ pub struct Renderer {
     /// Detects a lost reference picture from the stream's own `frame_num`.
     /// See [`ghostframe_client_h264::bitstream`].
     h264_continuity: ghostframe_client_h264::bitstream::RefContinuity,
+    /// Handed to the decoder whenever one is opened. See
+    /// [`Renderer::set_h264_frame_ready_notify`].
+    h264_ready_notify: Option<ghostframe_client_h264::FrameReadyNotify>,
     /// Set when a lost reference picture (or a hard decode error) means the
     /// decoder may be holding state built on references that will never
     /// arrive. Cleared by
@@ -284,6 +287,7 @@ impl Renderer {
             h264_import_path: None,
             h264_last_frame_seq: None,
             h264_continuity: ghostframe_client_h264::bitstream::RefContinuity::new(),
+            h264_ready_notify: None,
             h264_needs_reset: false,
             recovery: H264Recovery::default(),
             h264_size_mismatch_logged: false,
@@ -734,7 +738,8 @@ impl Renderer {
         self.fb.debug_read(&ctx.device, &ctx.queue)
     }
 
-    /// Decode one access unit and blit every frame it produced.
+    /// Decode one access unit and blit every frame the decoder has ready.
+    /// Frames that finish later are collected by [`Renderer::poll_h264`].
     ///
     /// Failures are logged, never fatal: a corrupt access unit (FEC failed
     /// to recover one) must not take down the session. "The next keyframe
@@ -774,7 +779,12 @@ impl Renderer {
             let new_us = new_start.elapsed().as_micros() as u64;
             tracing::debug!(new_us, "decode_h264: H264Decoder::new stall");
             match opened {
-                Ok(d) => self.h264_decoder = Some(d),
+                Ok(mut d) => {
+                    if let Some(notify) = &self.h264_ready_notify {
+                        d.set_frame_ready_notify(notify.clone());
+                    }
+                    self.h264_decoder = Some(d);
+                }
                 Err(e) => {
                     tracing::error!(
                         error = %e,
@@ -887,6 +897,17 @@ impl Renderer {
             "decode_h264: decoder.decode stall"
         );
 
+        self.blit_h264_frames(ctx, frame_seq, frames);
+        Ok(())
+    }
+
+    /// Blit `frames` and mark the ring dirty if any landed.
+    fn blit_h264_frames(
+        &mut self,
+        ctx: &WgpuContext,
+        frame_seq: u32,
+        frames: Vec<ghostframe_client_h264::decoder::HwFrame>,
+    ) -> bool {
         let mut any_blitted = false;
         for frame in frames {
             if self.blit_h264_frame(ctx, frame_seq, &frame) {
@@ -901,7 +922,60 @@ impl Renderer {
         if any_blitted {
             self.ring.mark_dirty_all();
         }
-        Ok(())
+        any_blitted
+    }
+
+    /// Install the callback the H.264 decoder runs when a frame finishes
+    /// decoding after [`Renderer::apply_event`] returned -- see
+    /// [`ghostframe_client_h264::FrameReadyNotify`]. The owner answers it by
+    /// calling [`Renderer::poll_h264`]. Applies to the current decoder and to
+    /// any opened later.
+    pub fn set_h264_frame_ready_notify(
+        &mut self,
+        notify: ghostframe_client_h264::FrameReadyNotify,
+    ) {
+        if let Some(d) = self.h264_decoder.as_mut() {
+            d.set_frame_ready_notify(notify.clone());
+        }
+        self.h264_ready_notify = Some(notify);
+    }
+
+    /// Blit every H.264 frame the decoder finished since the last access unit.
+    /// Returns whether anything was drawn, i.e. whether a publish is due.
+    ///
+    /// Without this a frame waits for the *next* access unit to be collected,
+    /// and on a remote desktop the next one comes when the screen next
+    /// changes: a keystroke's echo stayed invisible until the one after it.
+    pub fn poll_h264(&mut self, ctx: &WgpuContext) -> Result<bool, GpuError> {
+        let Some(decoder) = self.h264_decoder.as_mut() else {
+            return Ok(false);
+        };
+        let frames = match decoder.take_ready() {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(error = %e, "H.264 decode failed (late frame)");
+                self.h264_needs_reset = true;
+                return Ok(false);
+            }
+        };
+        if frames.is_empty() {
+            return Ok(false);
+        }
+        // Same ordering rule as `decode_h264`: batched tile work for the
+        // older framebuffer state lands before the full-frame draw.
+        self.flush(ctx)?;
+        if self.h264_pipeline.is_none() {
+            self.h264_pipeline = Some(crate::pipelines::h264_nv12::H264Nv12Pipeline::new(
+                &ctx.device,
+            ));
+        }
+        let frame_seq = self.h264_last_frame_seq.unwrap_or(0);
+        tracing::debug!(
+            frame_seq,
+            frame_count = frames.len(),
+            "poll_h264: late frames ready"
+        );
+        Ok(self.blit_h264_frames(ctx, frame_seq, frames))
     }
 
     /// The reset request a decode error queued, if any; the embedder sends it
