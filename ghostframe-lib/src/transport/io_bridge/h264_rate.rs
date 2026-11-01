@@ -997,7 +997,7 @@ mod tests {
         b.h264_probe_pad(now_std(), false, 0);
         let p = b.active_probe.expect("the cluster is open");
         assert!(
-            p.id >= APP_PROBE_ID_BASE,
+            p.id >= 1_000_000_000,
             "an id goog_cc never issues: {}",
             p.id
         );
