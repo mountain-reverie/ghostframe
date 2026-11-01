@@ -275,19 +275,6 @@ impl BweWrapper {
         self.driver.note_path_rtt(rtt);
     }
 
-    /// Feed the transport's own BDP-derived rate as an independent ceiling
-    /// for probe decisions. See `GoogCcDriver::set_transport_capacity_hint`
-    /// for what this number is and is not.
-    pub fn set_transport_capacity_hint(&mut self, bytes_per_us: f32, now: Instant) {
-        self.driver.set_transport_capacity_hint(bytes_per_us, now);
-    }
-
-    /// Withdraw the capacity hint: the path is no longer being filled, so
-    /// `cwnd / srtt` no longer describes it and must not cap a probe.
-    pub fn withdraw_transport_capacity_hint(&mut self, now: Instant) {
-        self.driver.withdraw_transport_capacity_hint(now);
-    }
-
     /// Wire bytes of the transmissions recorded so far (cumulative): what
     /// goog_cc is told of what was sent, to set against the tokens spent.
     pub fn note_offered(&mut self, now: Instant, cumulative_bytes: f64) {

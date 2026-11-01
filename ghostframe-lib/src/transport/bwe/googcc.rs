@@ -11,9 +11,8 @@ use super::{AckArrival, BweSnapshot};
 use goog_cc::experiments::FieldTrials;
 use goog_cc::network_control::{NetworkControllerConfig, NetworkControllerInterface};
 use goog_cc::transport::{
-    NetworkAvailability, NetworkControlUpdate, NetworkStateEstimate, PacedPacketInfo, PacketResult,
-    ProbeClusterConfig, ProcessInterval, SentPacket, StreamsConfig, TargetRateConstraints,
-    TransportPacketsFeedback,
+    NetworkAvailability, NetworkControlUpdate, PacedPacketInfo, PacketResult, ProbeClusterConfig,
+    ProcessInterval, SentPacket, StreamsConfig, TargetRateConstraints, TransportPacketsFeedback,
 };
 use goog_cc::units::{DataRate, DataSize, TimeDelta, Timestamp};
 use goog_cc::ProbeControllerConfig;
@@ -301,80 +300,6 @@ impl GoogCcDriver {
         }
     }
 
-    /// Feed an independent, transport-derived view of the link's ceiling so
-    /// `ProbeController::time_for_network_state_probe` has something to
-    /// compare the estimate against.
-    ///
-    /// Without this the controller's only route to a mid-session capacity
-    /// increase is `AimdRateControl`'s multiplicative increase, hardcoded at
-    /// `alpha = 1.08` capped to one second of effect — at most 8% per second,
-    /// measured at 21.9 s to reach 80% of a 4 -> 16 Mbps step. ALR probing
-    /// cannot substitute: it fires only when the application is
-    /// under-sending, which is precisely when there is too little traffic to
-    /// fill a probe cluster (measured 0 completed / 7 abandoned).
-    ///
-    /// (No longer called by the transport: the model controller feeds no hint.)
-    ///
-    /// `bytes_per_us` is `cwnd / smoothed_rtt` from quinn's `PathStats` — a
-    /// BDP-derived rate, which is **not** a capacity measurement. It is what
-    /// quinn's own congestion controller is currently willing to keep in
-    /// flight, so it is bounded below by what the path has actually carried
-    /// without loss, and it responds to congestion on its own. That makes it
-    /// a defensible *upper* hint and a poor absolute truth, which is why it
-    /// is fed only as `link_capacity_upper` and paired with a deliberately
-    /// conservative `confidence`. `link_capacity_lower` is left at zero
-    /// rather than guessed: goog_cc uses the lower bound to raise estimates
-    /// directly, and a wrong floor would push the estimate up with no
-    /// measurement behind it.
-    pub(crate) fn set_transport_capacity_hint(&mut self, bytes_per_us: f32, now: Instant) {
-        if !(bytes_per_us.is_finite() && bytes_per_us > 0.0) {
-            return;
-        }
-        let bps = (bytes_per_us as f64 * 8.0 * 1_000_000.0).min(MAX_BPS as f64);
-        let at = self.to_timestamp(now);
-        let est = NetworkStateEstimate {
-            confidence: 0.5,
-            update_time: at,
-            last_receive_time: at,
-            last_send_time: at,
-            link_capacity: DataRate::from_bits_per_sec(bps as i64),
-            link_capacity_lower: DataRate::zero(),
-            link_capacity_upper: DataRate::from_bits_per_sec(bps as i64),
-            ..Default::default()
-        };
-        let upd = self.ctl.0.on_network_state_estimate(est);
-        self.absorb(upd);
-    }
-
-    /// Take the capacity hint back: nothing is known of the path's capacity
-    /// beyond the configured maximum, so that is the upper bound stated.
-    ///
-    /// Not an infinite `link_capacity_upper`: goog_cc's probe controller reads
-    /// an infinite one as "no network-state estimate" and then never issues a
-    /// network-state probe, which (with the pacer at the estimate rather than
-    /// 2.5 x, and the sender saturated, so never application-limited, where
-    /// the ALR probes would otherwise run) leaves nothing to look for
-    /// headroom with. A finite bound at the configured
-    /// maximum caps no probe a lower one would not, and lets the controller's
-    /// periodic probe (every `network_state_interval`, at up to `alr_scale x`
-    /// the estimate) run.
-    pub(crate) fn withdraw_transport_capacity_hint(&mut self, now: Instant) {
-        let at = self.to_timestamp(now);
-        let max = DataRate::from_bits_per_sec(MAX_BPS);
-        let est = NetworkStateEstimate {
-            confidence: 0.5,
-            update_time: at,
-            last_receive_time: at,
-            last_send_time: at,
-            link_capacity: max,
-            link_capacity_lower: DataRate::zero(),
-            link_capacity_upper: max,
-            ..Default::default()
-        };
-        let upd = self.ctl.0.on_network_state_estimate(est);
-        self.absorb(upd);
-    }
-
     /// Wire bytes of the transmissions recorded so far, cumulative.
     pub(crate) fn note_offered(&mut self, now: Instant, cumulative_bytes: f64) {
         let now_us = self.micros_since_base(now);
@@ -440,8 +365,7 @@ impl GoogCcDriver {
     /// probe controller would then reason from an estimate nobody sends at.
     /// Handing it the ceiling is also the re-measurement the estimate asks
     /// for: goog_cc continues from what the path was seen to carry, and its
-    /// own probes (`withdraw_transport_capacity_hint` lets the controller
-    /// issue them) and delay detector take it from there.
+    /// own probes (the controller issues them) and delay detector take it from there.
     ///
     /// *Below.* With the pacer at the estimate, goog_cc's AIMD grows by one
     /// packet per round trip once it believes it is near capacity, which it
