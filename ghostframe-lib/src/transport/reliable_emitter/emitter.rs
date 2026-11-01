@@ -649,6 +649,11 @@ impl ReliableTileEmitter {
         if buf.len() >= 12 {
             buf[8..12].copy_from_slice(&wire_seq.to_be_bytes());
         }
+        // The pad bit: the client acknowledges the datagram and discards it,
+        // whatever frame it names.
+        if buf.len() > 16 {
+            buf[16] |= crate::transport::protocol::FRAME_FLAG_PAD;
+        }
         let bytes: Bytes = buf.freeze();
         let len = bytes.len();
         self.transmissions.push(EmittedDatagram {
