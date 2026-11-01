@@ -125,6 +125,10 @@ jobs:
       - run: cargo test --test browserless_queue_latency -- --test-threads=1
       - run: cargo test --test browserless_blocked_path -- --test-threads=1
       - run: cargo test --test browserless_loop_stall -- --test-threads=1
+      # H.264 in the transport (design PR A3): ledger accounting, lost-IDR
+      # repair, acknowledgement stalls, frame skip. A scripted encoder over the
+      # real bridge and client; named here because nothing else lists it.
+      - run: cargo test --test browserless_h264 -- --test-threads=1
       - run: cargo test --test c2_frame_off_loop -- --test-threads=1
 
   # The congestion-control scenes: about 25 minutes of the browserless

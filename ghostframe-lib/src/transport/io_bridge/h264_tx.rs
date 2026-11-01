@@ -1156,6 +1156,28 @@ mod tests {
         assert_eq!(b.h264.stats.frames_skipped_backpressure, skipped);
     }
 
+    /// With no acknowledgement ever arriving, the probe cache and the tracker
+    /// stay bounded: the cache to its newest frames, the tracker by its ring.
+    #[tokio::test(start_paused = true)]
+    async fn the_probe_cache_stays_bounded_when_nothing_is_acknowledged() {
+        use crate::transport::reliable_emitter::h264::H264_CACHE_FRAMES;
+        let mut b = bridge().await;
+        for seq in 1..=(H264_CACHE_FRAMES as u32 + 40) {
+            // A pending IDR runs the encoder past the hold and the backlog.
+            b.h264.pending_idr = Some(IdrCause::ClientReset);
+            send(&mut b, seq, seq == 1);
+            b.h264.hold = None;
+        }
+        assert_eq!(b.reliable_emitter.h264.frames(), H264_CACHE_FRAMES);
+        assert!(b.reliable_emitter.h264.get(1, 0).is_none());
+        assert!(b
+            .reliable_emitter
+            .h264
+            .get(H264_CACHE_FRAMES as u32 + 40, 0)
+            .is_some());
+        assert!(b.reliable_emitter.stats.h264_cache_dropped > 0);
+    }
+
     /// An IDR purges what the stale frames still have queued.
     #[tokio::test(start_paused = true)]
     async fn an_idr_purges_the_fragments_of_the_frames_it_supersedes() {
