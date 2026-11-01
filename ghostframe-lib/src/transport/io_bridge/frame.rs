@@ -186,6 +186,17 @@ pub(super) struct StageTrace {
     classify_us: u64,
 }
 
+/// The wire-v2 reference description of an H.264 frame from the ffmpeg
+/// encoder: an IDR names no reference; a P frame names the previous H.264
+/// frame sent (`last`), or `REF_FRAME_NONE` ("unknown") when none was.
+pub(super) fn h264_ref_info(is_keyframe: bool, last: Option<u32>) -> FrameRefInfo {
+    if is_keyframe {
+        FrameRefInfo::IDR
+    } else {
+        FrameRefInfo::predicted(last.unwrap_or(REF_FRAME_NONE))
+    }
+}
+
 /// What to tell the worker for a frame the classifier put in H.264 mode: nothing
 /// when no tile changed, otherwise encode, forcing an IDR when the previous
 /// frame was on the tile path (a fresh anchor for the client).
@@ -1655,10 +1666,17 @@ impl IoBridge {
         // returns TooLarge, dropping every H.264 datagram silently.
         // And the limit leaves room for the parity's own header, or
         // it is the parity that overshoots instead.
-        let datagrams = fragment_frame(
+        //
+        // Reference description (wire v2): an IDR names no reference; a P
+        // frame names the previous H.264 frame this bridge sent, which is what
+        // the ffmpeg encoder predicts from (one reference, no long-term
+        // slots). With none sent yet it carries `REF_FRAME_NONE`, "unknown".
+        let ref_info = h264_ref_info(encoded.is_keyframe, self.last_h264_frame_seq);
+        self.last_h264_frame_seq = Some(seq);
+        let datagrams = fragment_frame_ref(
             seq,
             frame.timestamp_us,
-            encoded.is_keyframe,
+            ref_info,
             &encoded.payload,
             max_fec_frame_fragment_payload(max_dg_size),
         );
@@ -2470,6 +2488,19 @@ impl IoBridge {
                 delivery_latest_app_limited = ins.delivery.latest_app_limited,
                 delivery_max_bps = ins.delivery.max_bps,
                 "delivery rate (per-transmission samples, bits/s; observability only)"
+            );
+
+            // H.264 wire v2 client feedback (frame acks 0x0A, reset requests
+            // 0x09), a separate event at the same cadence for the same reason.
+            tracing::info!(
+                target: LOG_TARGET,
+                frame_seq = seq,
+                frame_acks_received = self.frame_acks_received,
+                frame_acks_malformed = self.frame_acks_malformed,
+                reset_requests_received = self.reset_requests_received,
+                reset_requests_honoured = self.reset_requests_honoured,
+                reset_requests_rate_limited = self.reset_requests_rate_limited,
+                "h264 client feedback (frame acks and reset requests; cumulative)"
             );
 
             // The loss path (D1 F4 part 2), a separate event at the same

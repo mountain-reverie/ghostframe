@@ -267,10 +267,42 @@ async fn apply_hello_enables_indices_raw() {
         caps: ClientCapabilities {
             indices_raw_enabled: true,
             supports_h264: false,
+            h264_acked_ref: false,
         },
     };
     bridge.apply_hello(ConnectionHandle(0), msg);
     assert!(bridge.current_client_caps().indices_raw_enabled);
+}
+
+#[tokio::test]
+async fn h264_is_enabled_by_hello_bit_1_alone() {
+    // Bit 1 alone enables H.264 (the web client); bit 2 alone (v2 feedback
+    // without a decoder) does not; both do.
+    use crate::transport::client_caps::{ClientCapabilities, HelloMsg};
+    let mut bridge = make_bridge_for_test().await;
+    attach_session(&mut bridge, ConnectionHandle(0));
+    for (supports_h264, h264_acked_ref, expect) in [
+        (true, false, true),
+        (false, true, false),
+        (true, true, true),
+        (false, false, false),
+    ] {
+        bridge.apply_hello(
+            ConnectionHandle(0),
+            HelloMsg {
+                caps: ClientCapabilities {
+                    indices_raw_enabled: false,
+                    supports_h264,
+                    h264_acked_ref,
+                },
+            },
+        );
+        assert_eq!(
+            bridge.classifier.adaptation_context().supports_h264,
+            expect,
+            "bit1={supports_h264} bit2={h264_acked_ref}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -290,6 +322,7 @@ async fn apply_hello_propagates_h264_capability_to_classifier() {
             caps: ClientCapabilities {
                 indices_raw_enabled: false,
                 supports_h264: false,
+                h264_acked_ref: false,
             },
         },
     );
@@ -302,6 +335,7 @@ async fn apply_hello_propagates_h264_capability_to_classifier() {
             caps: ClientCapabilities {
                 indices_raw_enabled: false,
                 supports_h264: true,
+                h264_acked_ref: true,
             },
         },
     );
@@ -320,6 +354,7 @@ async fn dispatch_feedback_bytes_knows_which_session_sent_it() {
         caps: crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: false,
             supports_h264: true,
+            h264_acked_ref: false,
         },
     }
     .encode(&mut buf);
@@ -348,6 +383,7 @@ async fn hello_coalesced_with_the_webtransport_header_makes_the_session_live() {
         caps: crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: false,
             supports_h264: true,
+            h264_acked_ref: false,
         },
     }
     .encode(&mut hello);
@@ -377,6 +413,7 @@ async fn forget_session_clears_last_hello_from_for_that_handle() {
         caps: crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: false,
             supports_h264: true,
+            h264_acked_ref: false,
         },
     }
     .encode(&mut buf);
@@ -404,6 +441,7 @@ async fn forget_session_leaves_a_different_sessions_attribution_intact() {
         caps: crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: false,
             supports_h264: true,
+            h264_acked_ref: false,
         },
     }
     .encode(&mut buf);
@@ -429,6 +467,7 @@ fn hello(supports_h264: bool) -> crate::transport::client_caps::HelloMsg {
         caps: crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: false,
             supports_h264,
+            h264_acked_ref: false,
         },
     }
 }
@@ -2554,6 +2593,7 @@ fn phase_b_emits_indices_raw_when_caps_enabled_and_thin() {
     let caps = crate::transport::client_caps::ClientCapabilities {
         indices_raw_enabled: true,
         supports_h264: false,
+        h264_acked_ref: false,
     };
     let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps, None);
     let payload = &map[&(0, 0)];
@@ -2578,6 +2618,7 @@ fn phase_b_emits_thin_rle_when_caps_disabled() {
     let caps = crate::transport::client_caps::ClientCapabilities {
         indices_raw_enabled: false,
         supports_h264: false,
+        h264_acked_ref: false,
     };
     let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps, None);
     let payload = &map[&(5, 7)];
@@ -2605,6 +2646,7 @@ fn phase_b_emits_bundled_when_bundled_regardless_of_caps() {
     let caps = crate::transport::client_caps::ClientCapabilities {
         indices_raw_enabled: true,
         supports_h264: false,
+        h264_acked_ref: false,
     };
     let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps, None);
     let payload = &map[&(1, 1)];
@@ -2641,6 +2683,7 @@ async fn feedback_stream_parses_hello_then_feedback_then_decode_error() {
         caps: ClientCapabilities {
             indices_raw_enabled: true,
             supports_h264: false,
+            h264_acked_ref: false,
         },
     };
     let fb = ReceiverFeedback {
@@ -7376,4 +7419,215 @@ async fn a_tile_frame_drives_the_periodic_transport_logs() {
         CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES
     );
     assert!(bridge.bwe_log_last_at.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// H.264 wire v2: reset requests (0x09) and frame acks (0x0A)
+// ---------------------------------------------------------------------------
+
+fn reset_request_bytes(
+    reason: ghostframe_protocol::feedback_stream::ResetReason,
+    frame_seq: u32,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    ghostframe_protocol::feedback_stream::ResetRequest { reason, frame_seq }.encode(&mut buf);
+    buf
+}
+
+fn keyframe_controls(bridge: &IoBridge) -> usize {
+    bridge
+        .pending_controls
+        .iter()
+        .filter(|c| **c == Control::RequestKeyframe)
+        .count()
+}
+
+#[tokio::test]
+async fn a_decoder_failure_reset_request_asks_for_one_idr_per_two_seconds() {
+    use ghostframe_protocol::feedback_stream::ResetReason;
+    let (mut bridge, _peer) = bridge_with_backend(RecordingBackend::default());
+    make_live(&mut bridge, ConnectionHandle(0));
+    bridge.pending_controls.clear();
+
+    let msg = reset_request_bytes(ResetReason::DecoderFailure, 77);
+    bridge.dispatch_feedback_bytes(ConnectionHandle(0), &msg);
+    assert_eq!(keyframe_controls(&bridge), 1, "first request is honoured");
+    assert_eq!(bridge.reset_requests_honoured, 1);
+
+    // A burst inside the window is answered by the IDR already requested.
+    bridge.dispatch_feedback_bytes(ConnectionHandle(0), &msg);
+    bridge.dispatch_feedback_bytes(ConnectionHandle(0), &msg);
+    assert_eq!(keyframe_controls(&bridge), 1);
+    assert_eq!(bridge.reset_requests_received, 3);
+    assert_eq!(bridge.reset_requests_rate_limited, 2);
+
+    // Past the window the next one acts again. Drive the handler with a
+    // synthetic clock rather than sleeping.
+    let t0 = bridge.last_reset_request_idr_at.expect("recorded");
+    let req = ghostframe_protocol::feedback_stream::ResetRequest::decode(&msg).unwrap();
+    bridge.handle_reset_request(req, t0 + std::time::Duration::from_millis(1999));
+    assert_eq!(keyframe_controls(&bridge), 1, "1.999 s is still inside");
+    bridge.handle_reset_request(req, t0 + std::time::Duration::from_secs(2));
+    assert_eq!(keyframe_controls(&bridge), 2, "2 s later it acts");
+}
+
+#[tokio::test]
+async fn reset_reasons_other_than_decoder_failure_request_no_idr() {
+    use ghostframe_protocol::feedback_stream::ResetReason;
+    let (mut bridge, _peer) = bridge_with_backend(RecordingBackend::default());
+    make_live(&mut bridge, ConnectionHandle(0));
+    bridge.pending_controls.clear();
+    for reason in [
+        ResetReason::Resolution,
+        ResetReason::NoDecoder,
+        ResetReason::GateReset,
+    ] {
+        bridge.dispatch_feedback_bytes(ConnectionHandle(0), &reset_request_bytes(reason, 1));
+    }
+    assert_eq!(keyframe_controls(&bridge), 0);
+    assert_eq!(bridge.reset_requests_received, 3);
+    assert_eq!(bridge.reset_requests_honoured, 0);
+}
+
+#[tokio::test]
+async fn reset_requests_survive_stream_splits_and_neighbours() {
+    use ghostframe_protocol::feedback_stream::ResetReason;
+    let (mut bridge, _peer) = bridge_with_backend(RecordingBackend::default());
+    make_live(&mut bridge, ConnectionHandle(0));
+    bridge.pending_controls.clear();
+
+    // Split across two stream reads, with an undefined-reason message and a
+    // real one behind it in the same buffer: the fixed length keeps the
+    // stream in step, so the later message still lands.
+    let mut bad = reset_request_bytes(ResetReason::DecoderFailure, 5);
+    bad[1] = 0xEE;
+    let good = reset_request_bytes(ResetReason::DecoderFailure, 6);
+    let mut all = bad.clone();
+    all.extend_from_slice(&good);
+    bridge.dispatch_feedback_bytes(ConnectionHandle(0), &all[..4]);
+    assert_eq!(keyframe_controls(&bridge), 0, "incomplete message waits");
+    bridge.dispatch_feedback_bytes(ConnectionHandle(0), &all[4..]);
+    assert_eq!(keyframe_controls(&bridge), 1);
+    assert_eq!(
+        bridge.reset_requests_received, 1,
+        "the undefined one is not counted"
+    );
+}
+
+#[tokio::test]
+async fn a_reset_request_from_a_session_that_never_said_hello_does_nothing() {
+    use ghostframe_protocol::feedback_stream::ResetReason;
+    let (mut bridge, _peer) = bridge_with_backend(RecordingBackend::default());
+    bridge.pending_controls.clear();
+    bridge.dispatch_feedback_bytes(
+        ConnectionHandle(9),
+        &reset_request_bytes(ResetReason::DecoderFailure, 1),
+    );
+    assert_eq!(keyframe_controls(&bridge), 0);
+    assert_eq!(bridge.reset_requests_received, 0);
+}
+
+#[tokio::test]
+async fn frame_acks_are_counted_and_ignored() {
+    use crate::transport::protocol::{FrameAck, FRAME_ACK_SIZE};
+    let mut bridge = make_bridge_for_test().await;
+    make_live(&mut bridge, ConnectionHandle(0));
+
+    let mut dg = Vec::new();
+    FrameAck {
+        newest_seq: 10,
+        decoded_mask: 0b111,
+        refused_mask: 0,
+    }
+    .encode(&mut dg);
+    bridge.dispatch_inbound_datagram(ConnectionHandle(0), &dg);
+    assert_eq!(bridge.frame_acks_received, 1);
+
+    // Truncated and over-long acks are malformed, not routed elsewhere.
+    bridge.dispatch_inbound_datagram(ConnectionHandle(0), &dg[..FRAME_ACK_SIZE - 1]);
+    let mut long = dg.clone();
+    long.push(0);
+    bridge.dispatch_inbound_datagram(ConnectionHandle(0), &long);
+    assert_eq!(bridge.frame_acks_received, 1);
+    assert_eq!(bridge.frame_acks_malformed, 2);
+    assert_eq!(bridge.unroutable_inbound_datagrams, 0);
+}
+
+#[test]
+fn h264_frames_name_the_previous_frame_as_their_reference() {
+    use crate::transport::protocol::{FRAME_FLAG_IDR, REF_FRAME_NONE};
+    let idr = frame::h264_ref_info(true, Some(41));
+    assert_eq!(idr.flags, FRAME_FLAG_IDR);
+    assert_eq!(
+        idr.ref_frame_seq, REF_FRAME_NONE,
+        "an IDR names no reference"
+    );
+    assert_eq!(idr.slots, 0);
+
+    let p = frame::h264_ref_info(false, Some(41));
+    assert_eq!(p.flags, 0, "a P frame carries no idr bit");
+    assert_eq!(p.ref_frame_seq, 41);
+
+    let unknown = frame::h264_ref_info(false, None);
+    assert_eq!(
+        unknown.ref_frame_seq, REF_FRAME_NONE,
+        "no previous frame: unknown"
+    );
+}
+
+fn h264_frame_meta() -> frame::FrameMeta {
+    frame::FrameMeta {
+        width: 64,
+        height: 64,
+        stride: 256,
+        timestamp_us: 0,
+        capture_done_ns: 0,
+        unchanged: false,
+    }
+}
+
+#[tokio::test]
+async fn sending_an_h264_frame_records_it_as_the_next_frames_reference_until_a_session_reset() {
+    let mut bridge = make_bridge_for_test().await;
+    assert_eq!(bridge.last_h264_frame_seq, None);
+    let meta = h264_frame_meta();
+    let out = |k| H264Out {
+        payload: vec![1; 50],
+        is_keyframe: k,
+    };
+    bridge.send_h264_frame(out(true), &meta, 7, 1200);
+    assert_eq!(bridge.last_h264_frame_seq, Some(7));
+    bridge.send_h264_frame(out(false), &meta, 9, 1200);
+    assert_eq!(
+        bridge.last_h264_frame_seq,
+        Some(9),
+        "tracks the newest frame"
+    );
+
+    // A session reset clears it, and the rate-limit window with it, so a new
+    // client's first decoder failure is honoured at once.
+    bridge.last_reset_request_idr_at = Some(std::time::Instant::now());
+    bridge.fire_session_reset(ConnectionHandle(0));
+    assert_eq!(bridge.last_h264_frame_seq, None);
+    assert_eq!(bridge.last_reset_request_idr_at, None);
+}
+
+#[tokio::test]
+async fn the_reset_request_window_is_cleared_by_a_session_reset() {
+    use ghostframe_protocol::feedback_stream::ResetReason;
+    let (mut bridge, _peer) = bridge_with_backend(RecordingBackend::default());
+    make_live(&mut bridge, ConnectionHandle(0));
+    let msg = reset_request_bytes(ResetReason::DecoderFailure, 1);
+    bridge.dispatch_feedback_bytes(ConnectionHandle(0), &msg);
+    bridge.pending_controls.clear();
+    bridge.dispatch_feedback_bytes(ConnectionHandle(0), &msg);
+    assert_eq!(keyframe_controls(&bridge), 0, "inside the window");
+    bridge.fire_session_reset(ConnectionHandle(0));
+    bridge.pending_controls.clear();
+    bridge.dispatch_feedback_bytes(ConnectionHandle(0), &msg);
+    assert_eq!(
+        keyframe_controls(&bridge),
+        1,
+        "a new session starts a new window"
+    );
 }

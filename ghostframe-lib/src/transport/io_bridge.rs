@@ -44,9 +44,10 @@ use crate::transport::peer_auth::{
     AccessPolicy, DenialLog, PeerGate, PeerLookup, SessionRechecker, TsnetWhoIs, WhoIsError,
 };
 use crate::transport::protocol::{
-    build_frame_parity_datagram, encode_tile_datagram, fragment_frame,
-    max_fec_frame_fragment_payload, max_fragment_payload, Codec, TileFragmentInputs,
-    FRAME_HEADER_SIZE, MAX_TILE_PAYLOAD, PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
+    build_frame_parity_datagram, encode_tile_datagram, fragment_frame_ref,
+    max_fec_frame_fragment_payload, max_fragment_payload, Codec, FrameRefInfo, TileFragmentInputs,
+    FRAME_HEADER_SIZE, MAX_TILE_PAYLOAD, PING_PAYLOAD, PONG_PAYLOAD, REF_FRAME_NONE,
+    TILE_DATAGRAM_FLAG,
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::reliable_emitter::emission_queue::WireClass;
@@ -268,6 +269,9 @@ pub(crate) fn now_std() -> std::time::Instant {
 fn now_std_impl() -> std::time::Instant {
     tokio::time::Instant::now().into_std()
 }
+
+/// Shortest gap between two IDRs requested by client reset requests.
+const RESET_REQUEST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Scratch buffer size for quinn-proto's `endpoint.handle` / `conn.poll_transmit`.
 /// Sized above a 1500-byte MTU with headroom for ECN/padding; quinn-proto may
@@ -727,6 +731,17 @@ pub struct IoBridge {
     frame_acks_received: u64,
     /// Frame-ack datagrams that failed to decode.
     frame_acks_malformed: u64,
+    /// `frame_seq` of the last H.264 frame sent; the next P frame names it as
+    /// its reference. Cleared when the session resets (the next frame is then
+    /// an IDR).
+    last_h264_frame_seq: Option<u32>,
+    /// When the last client-requested IDR (reset request 0x09) was honoured;
+    /// requests inside `RESET_REQUEST_MIN_INTERVAL` of it are dropped.
+    last_reset_request_idr_at: Option<std::time::Instant>,
+    /// Reset requests received / honoured / rate-limited (cumulative).
+    reset_requests_received: u64,
+    reset_requests_honoured: u64,
+    reset_requests_rate_limited: u64,
     /// Last (width, height) the server emitted as a frame-dimensions datagram.
     /// `None` means we've never emitted dimensions (first frame upcoming).
     last_emitted_dimensions: Option<(u32, u32)>,
@@ -1372,6 +1387,11 @@ impl IoBridge {
             unroutable_inbound_datagrams: 0,
             frame_acks_received: 0,
             frame_acks_malformed: 0,
+            last_h264_frame_seq: None,
+            last_reset_request_idr_at: None,
+            reset_requests_received: 0,
+            reset_requests_honoured: 0,
+            reset_requests_rate_limited: 0,
             #[cfg(any(test, feature = "browserless-harness"))]
             send_errs_publish: std::sync::Arc::new(std::sync::Mutex::new(0)),
             last_emitted_dimensions: None,
@@ -1730,6 +1750,9 @@ impl IoBridge {
             DISPLAY_MODE_MSG_TYPE, DISPLAY_MODE_SIZE,
         };
         use crate::transport::feedback::{FEEDBACK_MSG_TYPE, FEEDBACK_SIZE};
+        use ghostframe_protocol::feedback_stream::{
+            ResetRequest, RESET_REQUEST_MSG_TYPE, RESET_REQUEST_SIZE,
+        };
 
         // Append the new chunk to our accumulator. QUIC stream reads can
         // split a single browser-side write across multiple deliveries
@@ -1799,6 +1822,20 @@ impl IoBridge {
                         self.handle_decode_error(msg);
                     }
                     offset += DECODE_ERROR_SIZE;
+                }
+                RESET_REQUEST_MSG_TYPE => {
+                    if buf.len() - offset < RESET_REQUEST_SIZE {
+                        break;
+                    }
+                    match ResetRequest::decode(&buf[offset..]) {
+                        Some(msg) => self.handle_reset_request(msg, now_std()),
+                        None => {
+                            // An undefined reason is a protocol violation, but the
+                            // message has a fixed length, so the stream stays in step.
+                            tracing::debug!("reset request with an undefined reason; ignored");
+                        }
+                    }
+                    offset += RESET_REQUEST_SIZE;
                 }
                 DISPLAY_INFO_MSG_TYPE => {
                     if buf.len() - offset < DISPLAY_INFO_SIZE {
@@ -2003,6 +2040,53 @@ impl IoBridge {
                 return;
             }
             self.recover_from_decode_error(msg);
+        }
+    }
+
+    /// Handle a client reset request (feedback stream 0x09).
+    ///
+    /// Phase A of the H.264 rework: a `DecoderFailure` asks the existing
+    /// ffmpeg encoder for an IDR, at most one per
+    /// [`RESET_REQUEST_MIN_INTERVAL`]; the other reasons are counted and
+    /// logged only. Requests inside the window are dropped, not queued: the
+    /// IDR already on its way answers them.
+    pub(crate) fn handle_reset_request(
+        &mut self,
+        msg: ghostframe_protocol::feedback_stream::ResetRequest,
+        now: std::time::Instant,
+    ) {
+        use ghostframe_protocol::feedback_stream::ResetReason;
+
+        self.reset_requests_received = self.reset_requests_received.saturating_add(1);
+        match msg.reason {
+            ResetReason::DecoderFailure => {
+                let limited = self
+                    .last_reset_request_idr_at
+                    .is_some_and(|t| now.saturating_duration_since(t) < RESET_REQUEST_MIN_INTERVAL);
+                if limited {
+                    self.reset_requests_rate_limited =
+                        self.reset_requests_rate_limited.saturating_add(1);
+                    tracing::debug!(
+                        frame_seq = msg.frame_seq,
+                        "reset request (decoder_failure) rate-limited"
+                    );
+                    return;
+                }
+                self.last_reset_request_idr_at = Some(now);
+                self.reset_requests_honoured = self.reset_requests_honoured.saturating_add(1);
+                tracing::info!(
+                    frame_seq = msg.frame_seq,
+                    "client reports H.264 decoder failure; requesting an IDR"
+                );
+                self.backend_apply(Control::RequestKeyframe);
+            }
+            ResetReason::Resolution | ResetReason::NoDecoder | ResetReason::GateReset => {
+                tracing::debug!(
+                    reason = ?msg.reason,
+                    frame_seq = msg.frame_seq,
+                    "reset request noted; only decoder_failure acts in this version"
+                );
+            }
         }
     }
 
