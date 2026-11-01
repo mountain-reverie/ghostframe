@@ -7283,3 +7283,97 @@ async fn a_refused_unchanged_tick_is_dropped_without_counting_a_gpu_failure() {
         assert_eq!(got[0].kind, FeedbackKind::Dropped);
     }
 }
+
+/// The periodic transport lines (`cumulative emit`, `bwe periodic snapshot`)
+/// are driven from the frame-sending step of both frame modes. They used to
+/// live only in the tile arm, so an H.264 stretch went silent.
+#[tokio::test]
+async fn an_h264_frame_drives_the_periodic_transport_logs() {
+    let (mut bridge, _peer, _log) = recording_bridge();
+    let meta = frame::FrameMeta {
+        width: 128,
+        height: 128,
+        stride: 512,
+        timestamp_us: 0,
+        capture_done_ns: 0,
+        unchanged: false,
+    };
+    assert_eq!(bridge.last_cumulative_emit_log_frame, 0);
+    assert!(bridge.bwe_log_last_at.is_none());
+    // Inside the throttle window: nothing is logged, the marker stays put.
+    bridge.send_h264_frame(
+        H264Out {
+            payload: vec![7; 64],
+            is_keyframe: true,
+        },
+        &meta,
+        CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES - 1,
+        1200,
+    );
+    assert_eq!(bridge.last_cumulative_emit_log_frame, 0);
+    // Past it: the cumulative line fires and the marker advances.
+    bridge.send_h264_frame(
+        H264Out {
+            payload: vec![7; 64],
+            is_keyframe: false,
+        },
+        &meta,
+        CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES,
+        1200,
+    );
+    assert_eq!(
+        bridge.last_cumulative_emit_log_frame,
+        CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES
+    );
+    assert!(
+        bridge.bwe_log_last_at.is_some(),
+        "the BWE snapshot fired in H.264 mode"
+    );
+    assert!(bridge.cumulative_datagrams_emitted.h264 > 0);
+    assert!(
+        bridge.bytes_emitted_h264 > 0 && bridge.bytes_emitted_snapshot.2 > 0,
+        "the H.264 byte counter feeds bps_h264"
+    );
+}
+
+/// The mirror of the H.264 test: the tile arm still drives the periodic lines.
+#[tokio::test]
+async fn a_tile_frame_drives_the_periodic_transport_logs() {
+    let (mut bridge, _peer, _log) = recording_bridge();
+    bridge.scheduler.resize(4, 4);
+    bridge.metrics_tracker.resize(4, 4);
+    let frame = FrameSubmission {
+        width: 128,
+        height: 128,
+        stride: 512,
+        pixels: vec![0u8; 128 * 128 * 4].into(),
+        dmabuf_fd: None,
+        timestamp_us: 0,
+        content: crate::frame_damage::Content::Pixels,
+        damage: crate::frame_damage::FrameDamage::Unknown,
+        capture_done_ns: 0,
+    };
+    let results = frame::TileResults {
+        palrle: OwnedPalRle::default(),
+        cdf53_dirty: Vec::new(),
+        cdf53_escalation: Vec::new(),
+        escalation_candidates: Vec::new(),
+        stranded_count: 0,
+        timings: TileTimings::default(),
+        frame_palette_set_count: 0,
+    };
+    assert_eq!(bridge.last_cumulative_emit_log_frame, 0);
+    bridge.emit_tile_codec_frame(
+        &[],
+        &frame::FrameMeta::of(&frame),
+        &frame.pixels,
+        results,
+        CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES,
+        1000,
+    );
+    assert_eq!(
+        bridge.last_cumulative_emit_log_frame,
+        CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES
+    );
+    assert!(bridge.bwe_log_last_at.is_some());
+}
