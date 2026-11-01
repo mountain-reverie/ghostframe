@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use ghostframe_client_core::{ClientConfig, ClientCore, ClientDisplay, PollOutput};
+use ghostframe_client_core::{ClientConfig, ClientCore, ClientDisplay, PollOutput, TileDelivery};
 use quinn_proto::{Dir, StreamId, TransportConfig};
 use web_transport_proto::VarInt;
 
@@ -121,6 +121,15 @@ impl ClientNet {
 
     pub fn with_extra_cert_pins(mut self, pins: Vec<[u8; 32]>) -> Self {
         self.extra_cert_pins = pins;
+        self
+    }
+
+    /// Choose how tiles come out of [`ClientNet::take_events`] (the default
+    /// is [`TileDelivery::Decoded`]). `Payload` leaves the pixel decode to
+    /// the caller -- typically a [`ghostframe_client_core::TileDecoder`] on
+    /// another thread, so this one only does transport and protocol work.
+    pub fn with_tile_delivery(mut self, delivery: TileDelivery) -> Self {
+        self.core.set_tile_delivery(delivery);
         self
     }
 
