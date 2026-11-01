@@ -70,6 +70,10 @@ use crate::{DmabufPlanes, H264Error, PlaneDesc, DRM_FORMAT_GR88, DRM_FORMAT_R8};
 /// deadlocks the decoder, which is the first thing this backend got wrong.
 type SampleQueue = Arc<Mutex<VecDeque<gst::Sample>>>;
 
+/// The caller's [`crate::FrameReadyNotify`], shared with the streaming thread.
+/// `None` until [`H264Decoder::set_frame_ready_notify`] installs one.
+type NotifySlot = Arc<Mutex<Option<crate::FrameReadyNotify>>>;
+
 /// Nominal frame duration for the timestamps handed to `appsrc`.
 ///
 /// The decoder needs monotonically increasing PTS to order its output; the
@@ -253,6 +257,7 @@ pub struct H264Decoder {
     /// negotiation failure otherwise shows up only as "no frames came out".
     errors: Arc<Mutex<Vec<String>>>,
     samples: SampleQueue,
+    notify: NotifySlot,
     next_pts: gst::ClockTime,
     /// Mirrors ffmpeg's terminal `AVERROR_EOF` state after [`Self::finish`], so
     /// the contract `decode_after_finish_without_reset_is_an_error` guarantees
@@ -298,6 +303,13 @@ impl H264Decoder {
                     .build(),
             )
             .format(gst::Format::Time)
+            // Live, because it is: access units arrive when the remote screen
+            // changes, not on a clock. A non-live source costs a frame of
+            // latency twice over -- `v4l2slh264dec` adds a one-frame output
+            // delay for non-live input, and the H.264 base class only takes its
+            // low-latency DPB-bumping path for a live one. Measured on RK3399:
+            // frame N came out after access unit N+2 non-live, N+1 live.
+            .is_live(true)
             .build();
         let parse = make("h264parse")?;
         let dec = make("v4l2slh264dec")?;
@@ -305,6 +317,8 @@ impl H264Decoder {
         let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let samples: SampleQueue = Arc::new(Mutex::new(VecDeque::new()));
         let queue_for_cb = samples.clone();
+        let notify: NotifySlot = Arc::new(Mutex::new(None));
+        let notify_for_cb = notify.clone();
         let sink = gst_app::AppSink::builder()
             // Requirement 1: the feature only. See the module docs.
             .caps(
@@ -327,6 +341,16 @@ impl H264Decoder {
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .push_back(sample);
+                        // After the push, so a woken caller finds the frame.
+                        // Cloned out of the lock so the callback never runs
+                        // under it.
+                        let cb = notify_for_cb
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone();
+                        if let Some(cb) = cb {
+                            cb();
+                        }
                         Ok(gst::FlowSuccess::Ok)
                     })
                     .build(),
@@ -380,22 +404,36 @@ impl H264Decoder {
             sink,
             errors,
             samples,
+            notify,
             next_pts: gst::ClockTime::ZERO,
             finished: false,
         })
     }
 
-    /// Feed one access unit; return every frame it completed.
+    /// Feed one access unit; return every frame the pipeline has ready.
     ///
     /// An empty result is normal, not an error: nothing comes out before the
-    /// decoder has an SPS and a keyframe.
+    /// decoder has an SPS and a keyframe, and a frame usually finishes decoding
+    /// a few milliseconds *after* this returns. Those frames are collected with
+    /// [`Self::take_ready`], prompted by the [`Self::set_frame_ready_notify`]
+    /// callback -- not by the next access unit, which on a screen that changes
+    /// rarely can be seconds away.
     pub fn decode(&mut self, au: &[u8]) -> Result<Vec<HwFrame>, H264Error> {
         if self.finished {
             return Err(H264Error::Gst(
                 "decode() after finish() without an intervening reset()".into(),
             ));
         }
-        let mut buffer = gst::Buffer::from_slice(au.to_vec());
+        // One spare DPB slot, or the base class holds every picture until the
+        // next access unit. See `crate::bitstream::low_latency_sps`.
+        let au = match crate::bitstream::low_latency_sps(au) {
+            Some(rewritten) => {
+                tracing::debug!("gst decode: SPS rewritten for one spare DPB slot");
+                rewritten
+            }
+            None => au.to_vec(),
+        };
+        let mut buffer = gst::Buffer::from_slice(au);
         {
             let b = buffer
                 .get_mut()
@@ -412,12 +450,27 @@ impl H264Decoder {
         self.drain_ready()
     }
 
+    /// Install the callback run when a decoded frame becomes ready for
+    /// [`Self::take_ready`]. It runs on a GStreamer streaming thread, once per
+    /// frame, and must only wake the owner -- never decode or draw. Survives
+    /// [`Self::reset`].
+    pub fn set_frame_ready_notify(&mut self, notify: crate::FrameReadyNotify) {
+        *self.notify.lock().unwrap_or_else(|p| p.into_inner()) = Some(notify);
+    }
+
+    /// Every frame decoded since the last `decode`/`take_ready`, without
+    /// waiting and without feeding anything.
+    pub fn take_ready(&mut self) -> Result<Vec<HwFrame>, H264Error> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        self.drain_ready()
+    }
+
     /// Everything the pipeline has ready right now, without waiting.
     ///
     /// Genuinely without waiting: the samples were collected by the `new_sample`
-    /// callback, so this is a queue drain and not a pull. A frame therefore
-    /// arrives on the `decode` call *after* the one that fed its access unit,
-    /// which is what the "an empty result is normal" contract already allowed.
+    /// callback, so this is a queue drain and not a pull.
     fn drain_ready(&mut self) -> Result<Vec<HwFrame>, H264Error> {
         let taken: Vec<gst::Sample> = {
             let mut q = self.samples.lock().unwrap_or_else(|p| p.into_inner());

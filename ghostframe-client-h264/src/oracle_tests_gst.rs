@@ -16,7 +16,7 @@
 
 use crate::decoder::H264Decoder;
 use crate::software_decode::software_decode_nv12;
-use crate::testclip::gradient_clip;
+use crate::testclip::{gradient_clip, low_latency_clip};
 
 /// Where the exactness comparison runs. 640x480 is the case where display and
 /// coded height coincide, which is exactly why it is not the only case tested.
@@ -351,5 +351,73 @@ fn frames_come_out_once_each_and_in_order() {
          order. Repeats and gaps are the signature of a frame outliving the buffer \
          it describes -- every frame is genuine, just the wrong one, which reads as \
          a stutter and sends you hunting in the renderer"
+    );
+}
+
+/// The SPS rewrite that buys the low-latency path (`bitstream::low_latency_sps`)
+/// must not change a pixel: the decode of the rewritten stream is compared
+/// against a software decode of the stream *as the server sent it*.
+#[test]
+fn a_low_latency_stream_decodes_exactly_despite_the_sps_rewrite() {
+    let clip = low_latency_clip(TALL_W, TALL_H, FRAMES);
+    assert!(
+        crate::bitstream::low_latency_sps(&clip[0]).is_some(),
+        "premise: the clip's SPS is the shape that gets rewritten; otherwise this \
+         test compares an untouched stream and proves nothing about the rewrite"
+    );
+    let Some(hw) = with_decoder(|d| hardware_decode_nv12(d, &clip)) else {
+        return;
+    };
+    let sw = software_decode_nv12(&clip, TALL_W, TALL_H);
+    assert_eq!(hw.len(), sw.len(), "frame count");
+    for (i, (h, s)) in hw.iter().zip(sw.iter()).enumerate() {
+        assert!(h == s, "frame {i} differs from the software decode");
+    }
+}
+
+/// The latency regression this backend shipped with: on a no-reorder stream,
+/// frame N did not come out until access unit N+2 was pushed. A remote desktop
+/// sends an access unit only when the screen changes, so the last two changes
+/// of every burst -- a keystroke's echo -- stayed off screen until two more
+/// arrived. Here every frame must be ready, and announced through the notify
+/// callback, before the next access unit is fed.
+#[test]
+fn every_frame_comes_out_before_the_next_access_unit_is_pushed() {
+    let clip = low_latency_clip(TALL_W, TALL_H, FRAMES);
+    let Some(per_au) = with_decoder(|d| {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        d.set_frame_ready_notify(std::sync::Arc::new(move || {
+            let _ = tx.send(());
+        }));
+        let mut out = 0usize;
+        let mut notified = 0usize;
+        let mut per_au = Vec::new();
+        for au in &clip {
+            out += d.decode(au).expect("decode").len();
+            // Bounded: a frame that never comes must fail the assertion
+            // below, not hang. 1080p decodes in ~2-5 ms on rkvdec.
+            while rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_ok()
+            {
+                notified += 1;
+                out += d.take_ready().expect("take_ready").len();
+                if out == per_au.len() + 1 {
+                    break;
+                }
+            }
+            per_au.push(out);
+        }
+        (per_au, notified)
+    }) else {
+        return;
+    };
+    let (per_au, notified) = per_au;
+    assert!(notified > 0, "the frame-ready callback never ran");
+    let expected: Vec<usize> = (1..=clip.len()).collect();
+    assert_eq!(
+        per_au, expected,
+        "frames out after each access unit; a value trailing its position is \
+         frames held until later input"
     );
 }

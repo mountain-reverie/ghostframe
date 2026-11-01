@@ -58,6 +58,7 @@ pub mod decoder;
 #[path = "decoder_gst.rs"]
 pub mod decoder;
 
+pub mod bitstream;
 pub mod descriptor;
 
 #[cfg(feature = "vaapi")]
@@ -132,6 +133,14 @@ pub use probe::h264_decode_available;
 // built against.
 #[cfg(any(test, feature = "test-support"))]
 pub use probe::driver_reports_h264_decode;
+
+/// Wakes a decoder's owner when a frame is ready for `H264Decoder::take_ready`.
+///
+/// Both backends accept one, so a caller is written once. Only the GStreamer
+/// backend calls it: its pipeline finishes frames after `decode` has returned.
+/// VA-API decodes synchronously -- `decode` already returns the access unit's
+/// frame -- so it has nothing to report later and never calls it.
+pub type FrameReadyNotify = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum H264Error {
