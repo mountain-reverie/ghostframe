@@ -2128,6 +2128,9 @@ impl IoBridge {
                 }
                 self.last_reset_request_idr_at = Some(now);
                 self.reset_requests_honoured = self.reset_requests_honoured.saturating_add(1);
+                // Several honoured requests in a short while: the IDRs are not
+                // helping. Tell the classifier (see `update_h264_stall`).
+                self.note_h264_reset_honoured(now);
                 tracing::info!(
                     frame_seq = msg.frame_seq,
                     "client reports H.264 decoder failure; requesting an IDR"
@@ -2612,6 +2615,7 @@ impl IoBridge {
                 stats: self.h264.stats,
                 ledger_records: self.transmission_ledger.len(),
                 probe_cache_fragments: self.reliable_emitter.h264.len(),
+                stalled: self.h264.stalled,
                 #[cfg(any(test, feature = "test-loss-injection"))]
                 acks_blacked_out: self.acks_blacked_out,
                 #[cfg(not(any(test, feature = "test-loss-injection")))]

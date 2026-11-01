@@ -1495,4 +1495,42 @@ mod a5_guard {
         let (h, _) = episode(&mut c, low, t, 3_000_000);
         assert_eq!(h / 1_000_000, 16);
     }
+
+    /// A path that stalls half a second after every re-entry (the starved
+    /// link): without backoff that is a flip every ~2.5 s, 24 a minute; with
+    /// it the holdoffs 2, 4, 8, 16, 30 s bound it to a handful.
+    #[test]
+    fn a_path_that_always_stalls_flips_a_bounded_number_of_times_a_minute() {
+        let low = AdaptationContext {
+            bwe_estimate_bps: 500_000,
+            ..ctx()
+        };
+        let mut c = Classifier::new(ClassifierConfig::default());
+        c.set_adaptation_context(low);
+        run(&mut c, 0, 1_000_000, &BUSY, FrameMode::TileCodec);
+        assert!(c.guard.headroom_active);
+        let mut t = 1_100_000u64;
+        let mut mode = FrameMode::H264;
+        let mut entered = t;
+        let mut stalls = 0;
+        while t < 61_000_000 {
+            // The bridge reports a stall 500 ms into every H.264 stretch.
+            c.set_adaptation_context(AdaptationContext {
+                h264_stalled: mode == FrameMode::H264 && t - entered >= 500_000,
+                ..low
+            });
+            let (m, _) = step(&mut c, t, &BUSY, mode);
+            if m != mode {
+                if m == FrameMode::TileCodec {
+                    stalls += 1;
+                } else {
+                    entered = t;
+                }
+            }
+            mode = m;
+            t += FRAME_US;
+        }
+        assert!(stalls >= 4, "premise: it kept stalling: {stalls}");
+        assert!(stalls <= 6, "{stalls} stalls in a minute");
+    }
 }
