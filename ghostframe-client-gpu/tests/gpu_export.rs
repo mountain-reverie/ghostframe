@@ -594,3 +594,66 @@ fn a_repeated_frame_dimensions_does_not_retire_held_buffers() {
     assert!(fd_names(held.fd, identity));
     ring.release(held.frame_id);
 }
+
+#[test]
+fn since_previous_is_relative_to_the_previous_publish_not_the_buffer() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let fb = Framebuffer::new(&ctx.device, 128, 64);
+    let mut ring = ExportRing::new(&ctx, 128, 64, 2, &[], true).expect("ring");
+
+    // The first frame has no predecessor to be relative to.
+    ring.mark_dirty_all();
+    let a = ring.publish(&ctx.device, &ctx.queue, &fb).expect("a");
+    assert!(a.since_previous.is_none());
+
+    // Second frame goes into the other (never filled) buffer, so its own
+    // damage is the whole surface -- but against frame `a` only tile (2,0)
+    // changed, and that is what the window needs.
+    ring.mark_dirty(2, 0);
+    let b = ring.publish(&ctx.device, &ctx.queue, &fb).expect("b");
+    assert_eq!(b.damage.len(), 1);
+    assert_eq!((b.damage[0].w, b.damage[0].h), (128, 64));
+    let sp = b.since_previous.expect("b follows a");
+    assert_eq!(sp.frame_id, a.frame_id);
+    assert_eq!(sp.damage.len(), 1);
+    assert_eq!(
+        (
+            sp.damage[0].x,
+            sp.damage[0].y,
+            sp.damage[0].w,
+            sp.damage[0].h
+        ),
+        (64, 0, 32, 32)
+    );
+
+    // Both buffers are held: this publish fails, but its damage must still
+    // be carried into the next successful one.
+    ring.mark_dirty(0, 1);
+    assert!(ring.publish(&ctx.device, &ctx.queue, &fb).is_none());
+    ring.release(a.frame_id);
+    ring.mark_dirty(3, 1);
+    let c = ring.publish(&ctx.device, &ctx.queue, &fb).expect("c");
+    let sp = c.since_previous.expect("c follows b");
+    assert_eq!(sp.frame_id, b.frame_id);
+    let mut tiles: Vec<(u32, u32)> = sp.damage.iter().map(|r| (r.x / 32, r.y / 32)).collect();
+    tiles.sort_unstable();
+    assert_eq!(tiles, vec![(0, 1), (3, 1)]);
+}
+
+#[test]
+fn since_previous_is_none_after_a_resize() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let fb = Framebuffer::new(&ctx.device, 64, 64);
+    let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[], true).expect("ring");
+    ring.mark_dirty_all();
+    let a = ring.publish(&ctx.device, &ctx.queue, &fb).expect("a");
+    ring.release(a.frame_id);
+
+    ring.resize(&ctx, 96, 64).expect("resize");
+    let fb = Framebuffer::new(&ctx.device, 96, 64);
+    ring.mark_dirty_all();
+    let b = ring.publish(&ctx.device, &ctx.queue, &fb).expect("b");
+    // The history was reset, so the pre-resize frame is not a baseline: an
+    // empty delta here would mean "nothing changed" and leave stale pixels.
+    assert!(b.since_previous.is_none());
+}

@@ -46,6 +46,9 @@ pub(crate) enum RenderMsg {
     /// was applied. Sent from a decoder thread; see
     /// [`Renderer::set_h264_frame_ready_notify`].
     H264FramesReady,
+    /// Mark the whole surface dirty and publish: the host lost what it was
+    /// showing and a quiet remote screen would never resend it.
+    Redraw,
     Shutdown,
 }
 
@@ -170,6 +173,18 @@ fn handle_core_event(
         return false;
     }
     true
+}
+
+/// Answer [`RenderMsg::Redraw`]: re-damage everything. `true` when a publish
+/// is due, i.e. there is a renderer to publish from.
+fn redraw(renderer: &mut Option<Renderer>) -> bool {
+    match renderer.as_mut() {
+        Some(r) => {
+            r.mark_all_dirty();
+            true
+        }
+        None => false,
+    }
 }
 
 /// Answer [`RenderMsg::H264FramesReady`]: blit what the decoder finished.
@@ -433,6 +448,10 @@ pub(crate) fn run(
     let mut tally = EventTally::new();
     let mut export_dumps: u64 = 0;
     let mut flush_error_reported = false;
+    // A publish was due but every export buffer was held. Nothing will make
+    // the host's picture current on a quiet screen until a buffer comes back,
+    // so the next `Release` must trigger the publish that was skipped.
+    let mut publish_pending = false;
     let dump_cfg = ghostframe_client_gpu::config::DumpConfig::from_env();
     let mut last_summary = std::time::Instant::now();
     // `0` means "the embedder didn't specify a count"; a `Renderer` with
@@ -449,11 +468,13 @@ pub(crate) fn run(
         // `Err` here means every `Sender` was dropped; the loop condition
         // above already exits for us.
         let mut got_event = false;
+        let mut released = false;
         let mut shutdown = false;
 
         match first {
             RenderMsg::Shutdown => break,
             RenderMsg::Release(id) => {
+                released = true;
                 tally.releases += 1;
                 if let Some(r) = renderer.as_mut() {
                     r.release(id);
@@ -479,6 +500,9 @@ pub(crate) fn run(
             }
             RenderMsg::H264FramesReady => {
                 got_event |= poll_h264(&ctx, &mut renderer);
+            }
+            RenderMsg::Redraw => {
+                got_event |= redraw(&mut renderer);
             }
         }
 
@@ -511,6 +535,7 @@ pub(crate) fn run(
                     break;
                 }
                 Ok(RenderMsg::Release(id)) => {
+                    released = true;
                     tally.releases += 1;
                     if let Some(r) = renderer.as_mut() {
                         r.release(id);
@@ -537,6 +562,9 @@ pub(crate) fn run(
                 Ok(RenderMsg::H264FramesReady) => {
                     got_event |= poll_h264(&ctx, &mut renderer);
                 }
+                Ok(RenderMsg::Redraw) => {
+                    got_event |= redraw(&mut renderer);
+                }
                 Err(_) => break,
             }
         }
@@ -546,6 +574,7 @@ pub(crate) fn run(
             reset_sink(reason, frame_seq);
         }
 
+        got_event |= released && publish_pending;
         if got_event {
             // The slot is latest-wins: whatever the host has not picked up is
             // superseded by what we publish next. Release it first, so its
@@ -589,6 +618,7 @@ pub(crate) fn run(
                 if flushed.is_ok() && published_frame.is_none() {
                     tally.publish_starved += 1;
                 }
+                publish_pending = flushed.is_ok() && published_frame.is_none();
                 if let Some(pf) = published_frame {
                     tally.publishes += 1;
                     maybe_dump_export(r, &pf, &mut export_dumps, &dump_cfg);
@@ -735,5 +765,116 @@ mod tests {
             "ring starved after {seen} publishes with 2 buffers: an overwritten, \
              never-acquired frame kept its buffer in flight"
         );
+    }
+
+    /// Spawn a render thread with `buffers` export buffers; `None` when this
+    /// machine cannot export dmabufs.
+    #[allow(clippy::type_complexity)]
+    fn spawn_render_thread(
+        buffers: u32,
+    ) -> Option<(
+        Sender<RenderMsg>,
+        Arc<EventQueue>,
+        Arc<Mutex<Option<PublishedFrame>>>,
+        std::thread::JoinHandle<()>,
+    )> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let queue = Arc::new(EventQueue::new().expect("event queue"));
+        let published = Arc::new(Mutex::new(None));
+        let handle = {
+            let (queue, published, self_tx) =
+                (Arc::clone(&queue), Arc::clone(&published), tx.clone());
+            std::thread::spawn(move || {
+                run(
+                    ready_tx,
+                    rx,
+                    queue,
+                    published,
+                    buffers,
+                    false,
+                    vec![],
+                    false,
+                    Box::new(|_, _| {}),
+                    self_tx,
+                )
+            })
+        };
+        if ready_rx.recv().expect("ready").is_err() {
+            eprintln!("SKIP: no GPU adapter that can export dmabufs");
+            let _ = handle.join();
+            return None;
+        }
+        Some((tx, queue, published, handle))
+    }
+
+    fn pixels(rects: &[ghostframe_client_gpu::coalesce::Rect]) -> u64 {
+        rects.iter().map(|r| r.w as u64 * r.h as u64).sum()
+    }
+
+    /// After a quiet period a `Redraw` publishes a frame whose damage, both
+    /// against its own buffer and against the previous frame, is the whole
+    /// surface -- the host lost its contents and nothing else is changing.
+    #[test]
+    fn redraw_after_quiet_publishes_the_whole_surface() {
+        let Some((tx, queue, published, handle)) = spawn_render_thread(3) else {
+            return;
+        };
+        tx.send(RenderMsg::Core(CoreEvent::FrameDimensions {
+            width: 128,
+            height: 128,
+        }))
+        .unwrap();
+        let first = next_frame_ready(&queue, Duration::from_secs(10)).expect("first frame");
+        published.lock().unwrap().take();
+        tx.send(RenderMsg::Release(first)).unwrap();
+        tx.send(tile(0)).unwrap();
+        let second = next_frame_ready(&queue, Duration::from_secs(10)).expect("tile frame");
+        published.lock().unwrap().take();
+        tx.send(RenderMsg::Release(second)).unwrap();
+        assert!(
+            next_frame_ready(&queue, Duration::from_millis(300)).is_none(),
+            "a quiet screen must not publish"
+        );
+
+        tx.send(RenderMsg::Redraw).unwrap();
+        next_frame_ready(&queue, Duration::from_secs(10)).expect("redraw publishes");
+        let pf = published.lock().unwrap().take().expect("redraw frame");
+        tx.send(RenderMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+        assert_eq!(pixels(&pf.damage), 128 * 128);
+        let since = pf.since_previous.expect("follows an earlier frame");
+        assert_eq!(pixels(&since.damage), 128 * 128, "{:?}", since.damage);
+    }
+
+    /// A publish skipped because every buffer is held must happen once a
+    /// buffer returns, with no new event to trigger it.
+    #[test]
+    fn a_starved_publish_is_retried_when_a_buffer_is_released() {
+        let Some((tx, queue, published, handle)) = spawn_render_thread(2) else {
+            return;
+        };
+        tx.send(RenderMsg::Core(CoreEvent::FrameDimensions {
+            width: 128,
+            height: 128,
+        }))
+        .unwrap();
+        // The host acquires both buffers and keeps them.
+        let held = next_frame_ready(&queue, Duration::from_secs(10)).expect("frame 1");
+        published.lock().unwrap().take();
+        tx.send(tile(0)).unwrap();
+        next_frame_ready(&queue, Duration::from_secs(10)).expect("frame 2");
+        published.lock().unwrap().take();
+
+        tx.send(tile(1)).unwrap();
+        assert!(
+            next_frame_ready(&queue, Duration::from_millis(300)).is_none(),
+            "no free buffer: nothing can publish yet"
+        );
+        tx.send(RenderMsg::Release(held)).unwrap();
+        let retried = next_frame_ready(&queue, Duration::from_secs(10));
+        tx.send(RenderMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+        assert!(retried.is_some(), "the starved publish was never retried");
     }
 }

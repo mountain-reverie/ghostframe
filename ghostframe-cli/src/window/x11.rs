@@ -83,6 +83,7 @@ use x11rb::connection::Connection as X11Connection;
 use x11rb::protocol::dri3::ConnectionExt as Dri3ConnectionExt;
 use x11rb::protocol::present;
 use x11rb::protocol::present::ConnectionExt as PresentConnectionExt;
+use x11rb::protocol::xfixes::{self, ConnectionExt as XfixesConnectionExt};
 use x11rb::protocol::xproto::{self, ConnectionExt as XprotoConnectionExt};
 use x11rb::protocol::Event;
 use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
@@ -90,7 +91,7 @@ use x11rb::xcb_ffi::XCBConnection;
 
 use xkbcommon::xkb;
 
-use ghostframe_client_native::PublishedFrame;
+use ghostframe_client_native::{PublishedFrame, Rect, SincePrevious};
 
 use crate::geometry::Placement;
 use crate::window::{Backend, WindowError, WindowEvent};
@@ -204,6 +205,165 @@ fn rect(x: i32, y: i32, w: i32, h: i32) -> xproto::Rectangle {
     }
 }
 
+/// More damage rectangles than this and the region costs more to build than
+/// the copy it saves; present the whole pixmap instead.
+const MAX_UPDATE_RECTS: usize = 64;
+
+/// Most presents tracked as unconfirmed before the chain gives up and the
+/// next present is whole. Completions normally arrive within a frame or two.
+const MAX_UNCONFIRMED: usize = 32;
+
+/// What each Present sent must cover, so a present can be limited to what
+/// changed without trusting that every earlier present will be executed.
+///
+/// Two things must hold for a partial update to be right:
+///
+/// - The ring's damage is relative to the previously *published* frame, so it
+///   is relative to the window only if that frame is the last one sent
+///   (`shown`). A frame the host skipped, a cleared or exposed window, a moved
+///   image, a fresh pixmap or a failed present call [`PresentChain::invalidate`];
+///   the next present is then whole.
+/// - A queued present may never reach the window, or reach it late. Xorg and
+///   Xwayland scrap a queued present (`CompleteMode::SKIP`) only when a newer
+///   one *without* an update area arrives for the same vblank; other servers,
+///   a window moving between CRTCs or a failed vblank queue can reorder or
+///   drop them anyway. So the update area also covers everything sent before
+///   it that has not been settled. `unconfirmed` holds what each such present
+///   covered (`None` = the whole pixmap) and how it ended; see
+///   [`PresentChain::on_complete`].
+#[derive(Debug, Default)]
+struct PresentChain {
+    shown: Option<u32>,
+    /// Presents not yet settled, oldest first.
+    unconfirmed: std::collections::VecDeque<Unconfirmed>,
+}
+
+/// How a present ended, as reported by its own `PresentCompleteNotify`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Pending,
+    Executed,
+    Skipped,
+}
+
+#[derive(Debug)]
+struct Unconfirmed {
+    serial: u32,
+    /// What this present's update area covered, including everything that was
+    /// unsettled when it was sent; `None` = the whole pixmap.
+    covered: Option<Vec<Rect>>,
+    phase: Phase,
+}
+
+impl PresentChain {
+    /// The window's content is no longer known to be a given frame.
+    fn invalidate(&mut self) {
+        self.shown = None;
+    }
+
+    /// Start of a present: drop the chain if this frame's placement or
+    /// pixmap differs from what the previous one used.
+    fn begin(&mut self, placement_changed: bool, pixmap_is_new: bool) {
+        if placement_changed || pixmap_is_new {
+            self.invalidate();
+        }
+    }
+
+    /// The area the next present must update, or `None` when it must be the
+    /// whole pixmap: the chain is broken, or a still-unsettled present was
+    /// itself whole (if scrapped, nothing short of whole makes up for it).
+    fn damage(&self, since: Option<&SincePrevious>) -> Option<Vec<Rect>> {
+        let since = since?;
+        if self.shown != Some(since.frame_id) || self.unconfirmed.len() > MAX_UNCONFIRMED {
+            return None;
+        }
+        let mut out: Vec<Rect> = Vec::new();
+        let earlier = self.unconfirmed.iter().map(|u| &u.covered);
+        for rects in earlier.chain(std::iter::once(&Some(since.damage.clone()))) {
+            for r in rects.as_ref()? {
+                if !out.contains(r) {
+                    out.push(*r);
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// A present for `frame_id` was accepted by the server as `serial`,
+    /// covering `covered` (`None` = the whole pixmap).
+    fn sent(&mut self, frame_id: u32, serial: u32, covered: Option<Vec<Rect>>) {
+        self.shown = Some(frame_id);
+        self.unconfirmed.push_back(Unconfirmed {
+            serial,
+            covered,
+            phase: Phase::Pending,
+        });
+        while self.unconfirmed.len() > MAX_UNCONFIRMED + 1 {
+            self.unconfirmed.pop_front();
+        }
+    }
+
+    /// `serial` completed, executed or skipped. Only that entry is marked:
+    /// completions arrive out of order (a scrap reports the scrapped present
+    /// at once, while an older one is still queued), and one present having
+    /// run says nothing about whether an older one still will -- over newer
+    /// content. Entries are dropped from the front once settled; a skipped
+    /// one only if a later present exists, since that present's area includes
+    /// the skipped one's. The newest entry, if skipped, is kept so the next
+    /// present owes its damage.
+    fn on_complete(&mut self, serial: u32, skipped: bool) {
+        if let Some(u) = self.unconfirmed.iter_mut().find(|u| u.serial == serial) {
+            u.phase = if skipped {
+                Phase::Skipped
+            } else {
+                Phase::Executed
+            };
+        }
+        while let Some(front) = self.unconfirmed.front() {
+            let settled = match front.phase {
+                Phase::Pending => false,
+                Phase::Executed => true,
+                Phase::Skipped => self.unconfirmed.len() > 1,
+            };
+            if !settled {
+                break;
+            }
+            self.unconfirmed.pop_front();
+        }
+    }
+}
+
+/// Turn pixel `damage` into Present update-area rectangles for a
+/// `frame_w` x `frame_h` pixmap. `None` means "the whole pixmap": the damage
+/// covers everything, or is too fragmented to be worth a region.
+///
+/// Present's update-area is relative to the pixmap, not the window (the
+/// request's x/y offset places the pixmap), so there is no translation by the
+/// placement origin here. Rectangles are clipped to the pixmap and empty ones
+/// dropped; an empty result is a real answer (nothing changed).
+fn update_rects(damage: &[Rect], frame_w: u32, frame_h: u32) -> Option<Vec<xproto::Rectangle>> {
+    let mut out = Vec::with_capacity(damage.len());
+    for r in damage {
+        let x1 = r.x.saturating_add(r.w).min(frame_w);
+        let y1 = r.y.saturating_add(r.h).min(frame_h);
+        if r.x >= x1 || r.y >= y1 {
+            continue;
+        }
+        if r.x == 0 && r.y == 0 && x1 == frame_w && y1 == frame_h {
+            return None;
+        }
+        // The clip above keeps every value within the frame, and a frame is
+        // at most MAX_FRAME_DIMENSION (8192) per side, so i16/u16 hold them.
+        out.push(xproto::Rectangle {
+            x: r.x as i16,
+            y: r.y as i16,
+            width: (x1 - r.x) as u16,
+            height: (y1 - r.y) as u16,
+        });
+    }
+    (out.len() <= MAX_UPDATE_RECTS).then_some(out)
+}
+
 /// `dup(2)` `fd` into a fresh, owned fd. Required before handing a
 /// dmabuf fd to `dri3_pixmap_from_buffers`: see this module's doc on fd
 /// ownership.
@@ -292,6 +452,11 @@ pub struct X11Backend {
     /// module doc.
     last_placement: Option<Placement>,
     next_serial: u32,
+    /// XFixes region reused as Present's update area, or `None` when the
+    /// server has no XFixes (every present then updates the whole pixmap).
+    update_region: Option<xfixes::Region>,
+    /// Which frame the window shows; unknown forces a whole-pixmap present.
+    chain: PresentChain,
     /// Last `(window_w, window_h, frame_w, frame_h, origin_x, origin_y)` that
     /// was logged, so the geometry line appears on change rather than per frame.
     last_geom_logged: Option<(u32, u32, u32, u32, i32, i32)>,
@@ -365,6 +530,7 @@ impl X11Backend {
                     | xproto::EventMask::BUTTON_RELEASE
                     | xproto::EventMask::POINTER_MOTION
                     | xproto::EventMask::STRUCTURE_NOTIFY
+                    | xproto::EventMask::EXPOSURE
                     | xproto::EventMask::FOCUS_CHANGE,
             )
             .background_pixel(screen.black_pixel);
@@ -515,6 +681,10 @@ impl X11Backend {
                 .map_err(|e| WindowError::X11(format!("flush after fullscreen fallback: {e}")))?;
         }
 
+        // Optional: partial Present updates need a region, but a server
+        // without XFixes still works by updating the whole pixmap.
+        let update_region = Self::create_update_region(&conn);
+
         let (xkb_state, xkb_device_id) = init_xkb_state(&conn)?;
 
         let mut backend = Self {
@@ -529,6 +699,8 @@ impl X11Backend {
             pixmaps: HashMap::new(),
             last_placement: None,
             next_serial: 0,
+            update_region,
+            chain: PresentChain::default(),
             last_geom_logged: None,
             presented: HashMap::new(),
             present_sent: HashMap::new(),
@@ -541,11 +713,24 @@ impl X11Backend {
         Ok(backend)
     }
 
+    /// Create the one XFixes region reused for every Present update area.
+    /// `None` when XFixes is unavailable or the allocation fails.
+    fn create_update_region(conn: &XCBConnection) -> Option<xfixes::Region> {
+        let version = conn.xfixes_query_version(2, 0).ok()?.reply().ok()?;
+        if version.major_version < 2 {
+            return None;
+        }
+        let region = conn.generate_id().ok()?;
+        conn.xfixes_create_region(region, &[]).ok()?.check().ok()?;
+        Some(region)
+    }
+
     /// Fill the entire window black. Called on every real
     /// `ConfigureNotify` (a resize can move the image's old content to
     /// stale coordinates, which a border-only clear wouldn't reach) and
     /// once at the end of `open`.
     fn clear_window(&mut self) -> Result<(), WindowError> {
+        self.chain.invalidate();
         let rectangle = rect(0, 0, self.width as i32, self.height as i32);
         self.conn
             .poly_fill_rectangle(self.window, self.gc, &[rectangle])
@@ -683,12 +868,37 @@ impl Backend for X11Backend {
         frame: &PublishedFrame,
         placement: &Placement,
     ) -> Result<(), WindowError> {
-        if self.last_placement != Some(*placement) {
+        let placement_changed = self.last_placement != Some(*placement);
+        if placement_changed {
             self.clear_surround(placement)?;
             self.last_placement = Some(*placement);
         }
 
+        let cached_before = self.pixmaps.get(&frame.buffer_id).map(|c| c.pixmap);
         let pixmap = self.pixmap_for(frame)?;
+        self.chain
+            .begin(placement_changed, cached_before != Some(pixmap));
+
+        // Present only what changed since the frame the window shows, when
+        // that is known; otherwise the whole pixmap.
+        let owed = self.chain.damage(frame.since_previous.as_ref());
+        let update = owed
+            .as_deref()
+            .and_then(|d| update_rects(d, frame.width, frame.height));
+        let update_id = match (update, self.update_region) {
+            (Some(rects), Some(region)) => self
+                .conn
+                .xfixes_set_region(region, &rects)
+                .ok()
+                .map(|_| region),
+            _ => None,
+        };
+        // What this present will cover, for the next one to make up for if
+        // the server scraps it.
+        let covered = update_id.and(owed);
+        // Cleared before the request so a failure cannot leave a stale
+        // "window shows frame N" behind.
+        self.chain.invalidate();
 
         // The frame is presented 1:1 -- `Placement::centre` crops rather than
         // scales -- so a window smaller than the frame silently shows only its
@@ -740,27 +950,24 @@ impl Backend for X11Backend {
                 pixmap,
                 self.next_serial,
                 0, // valid region: None -- the whole pixmap is valid
-                0, // update region: None -- treat the whole pixmap as updated
+                // Update region: the damage since the frame the window shows,
+                // or None -- treat the whole pixmap as updated.
+                update_id.unwrap_or(0),
                 placement.origin_x as i16,
                 placement.origin_y as i16,
                 0, // target_crtc: None -- let the server pick
                 0, // wait_fence: None
                 0, // idle_fence: None
                 // PresentOptionCopy. Without it the server is free to FLIP the
-                // pixmap to scanout, which makes it the live front buffer --
-                // and this backend never learns when the server is done with
-                // it: it selects no Present events, so PresentIdleNotify never
-                // arrives, and `commands.rs` releases the frame the instant
-                // `present` returns. The ring then hands that buffer straight
-                // back and the next publish blits into the buffer the server is
-                // still displaying, which shows as a partially-updated,
-                // flickering image.
+                // pixmap to scanout, which makes it the live front buffer for
+                // as long as it stays on screen. The pixmap is only reported
+                // idle (PresentIdleNotify, selected in `open`) once the server
+                // is done with it, and a flipped one stays busy indefinitely;
+                // the ring would be starved of buffers.
                 //
                 // Copying costs a blit per frame but makes the buffer ours
-                // again as soon as the request is serviced. The real fix is to
-                // select IDLE_NOTIFY and defer the release until the server
-                // reports the pixmap idle; this is the correct behaviour in the
-                // meantime rather than a silent race.
+                // again as soon as the copy is done. `commands.rs` holds the
+                // frame until that notify (or its watchdog) before releasing.
                 x11rb::protocol::present::Option::COPY.into(),
                 0, // target_msc
                 0, // divisor
@@ -772,6 +979,7 @@ impl Backend for X11Backend {
         self.conn
             .flush()
             .map_err(|e| WindowError::X11(format!("flush after present: {e}")))?;
+        self.chain.sent(frame.frame_id, self.next_serial, covered);
         Ok(())
     }
 
@@ -783,6 +991,10 @@ impl Backend for X11Backend {
         {
             match event {
                 Event::PresentCompleteNotify(ev) => {
+                    // Before the timing lookup: that map is diagnostic and is
+                    // cleared when it grows, which must not strand the chain.
+                    self.chain
+                        .on_complete(ev.serial, ev.mode == present::CompleteMode::SKIP);
                     if let Some(sent) = self.present_sent.remove(&ev.serial) {
                         let complete_us = std::time::Instant::now()
                             .saturating_duration_since(sent)
@@ -801,6 +1013,18 @@ impl Backend for X11Backend {
                     // Only now is the export buffer ours to overwrite.
                     if let Some(frame_id) = self.presented.remove(&ev.serial) {
                         self.idle_frames.push(frame_id);
+                    }
+                }
+                // Without a compositor the server discards the window's
+                // contents when it is uncovered; only a whole-pixmap present
+                // repaints that.
+                Event::Expose(ev) if ev.window == self.window => {
+                    self.chain.invalidate();
+                    // The last event of a burst: ask for a republish. A delta
+                    // already in flight only repaints its own damage, and on
+                    // a static remote screen nothing else would follow.
+                    if ev.count == 0 {
+                        self.events.push(WindowEvent::Exposed);
                     }
                 }
                 Event::KeyPress(ev) => {
@@ -955,6 +1179,172 @@ impl Backend for X11Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn px(x: u32, y: u32, w: u32, h: u32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    /// `xproto::Rectangle` has no `PartialEq`; compare as tuples.
+    fn flat(r: Option<Vec<xproto::Rectangle>>) -> Option<Vec<(i16, i16, u16, u16)>> {
+        r.map(|v| v.iter().map(|r| (r.x, r.y, r.width, r.height)).collect())
+    }
+
+    #[test]
+    fn update_rects_keep_pixmap_relative_coordinates() {
+        // Present's update area is relative to the pixmap; translating by the
+        // placement origin would damage the wrong part of the window.
+        let got = flat(update_rects(&[px(32, 64, 32, 32)], 1920, 1080));
+        assert_eq!(got, Some(vec![(32, 64, 32, 32)]));
+    }
+
+    #[test]
+    fn update_rects_clip_to_the_pixmap_and_drop_empty_rects() {
+        let got = flat(update_rects(
+            &[px(1900, 1070, 64, 64), px(10, 10, 0, 5), px(2000, 0, 8, 8)],
+            1920,
+            1080,
+        ));
+        assert_eq!(got, Some(vec![(1900, 1070, 20, 10)]));
+    }
+
+    #[test]
+    fn update_rects_report_nothing_changed_as_empty_not_everything() {
+        assert_eq!(flat(update_rects(&[], 1920, 1080)), Some(vec![]));
+    }
+
+    #[test]
+    fn update_rects_covering_the_whole_pixmap_mean_none() {
+        assert_eq!(
+            flat(update_rects(&[px(0, 0, 1920, 1080)], 1920, 1080)),
+            None
+        );
+        // Over-covering after the clip is still everything.
+        assert_eq!(
+            flat(update_rects(&[px(0, 0, 2048, 2048)], 1920, 1080)),
+            None
+        );
+    }
+
+    #[test]
+    fn update_rects_give_up_on_fragmented_damage() {
+        let many: Vec<Rect> = (0..=MAX_UPDATE_RECTS as u32)
+            .map(|i| px(i * 4, 0, 2, 2))
+            .collect();
+        assert_eq!(flat(update_rects(&many, 1920, 1080)), None);
+        assert!(update_rects(&many[..MAX_UPDATE_RECTS], 1920, 1080).is_some());
+    }
+
+    fn since(frame_id: u32, x: u32) -> SincePrevious {
+        SincePrevious {
+            frame_id,
+            damage: vec![px(x, 0, 32, 32)],
+        }
+    }
+
+    #[test]
+    fn chain_uses_damage_only_when_the_window_shows_the_previous_frame() {
+        let mut chain = PresentChain::default();
+        // Nothing presented yet.
+        assert_eq!(chain.damage(Some(&since(7, 0))), None);
+        chain.sent(7, 1, None);
+        chain.on_complete(1, false);
+        assert_eq!(
+            chain.damage(Some(&since(7, 0))),
+            Some(vec![px(0, 0, 32, 32)])
+        );
+        // A frame was skipped, so the window shows an older one.
+        assert_eq!(chain.damage(Some(&since(8, 0))), None);
+        // No delta from the ring.
+        assert_eq!(chain.damage(None), None);
+    }
+
+    #[test]
+    fn chain_breaks_on_invalidate_placement_and_new_pixmap() {
+        let sp = since(3, 0);
+        let shown = || {
+            let mut c = PresentChain::default();
+            c.sent(3, 1, None);
+            c.on_complete(1, false);
+            c
+        };
+        let mut c = shown();
+        c.invalidate();
+        assert_eq!(c.damage(Some(&sp)), None, "expose/failure/clear");
+        let mut c = shown();
+        c.begin(true, false);
+        assert_eq!(c.damage(Some(&sp)), None, "placement changed");
+        let mut c = shown();
+        c.begin(false, true);
+        assert_eq!(c.damage(Some(&sp)), None, "fresh pixmap");
+        let mut c = shown();
+        c.begin(false, false);
+        assert!(c.damage(Some(&sp)).is_some(), "nothing changed");
+    }
+
+    /// Chain at frame 1 (settled), then frame 2 (x=0) sent as serial 2.
+    fn chain_with_2_in_flight() -> PresentChain {
+        let mut c = PresentChain::default();
+        c.sent(1, 1, None);
+        c.on_complete(1, false);
+        c.sent(2, 2, Some(vec![px(0, 0, 32, 32)]));
+        c
+    }
+
+    #[test]
+    fn a_skipped_present_leaves_its_damage_owed_to_the_next() {
+        let mut c = chain_with_2_in_flight();
+        // Skipped, and nothing newer yet: still owed.
+        c.on_complete(2, true);
+        let owed = c.damage(Some(&since(2, 64))).expect("chain intact");
+        assert!(owed.contains(&px(0, 0, 32, 32)), "skipped damage dropped");
+        assert!(owed.contains(&px(64, 0, 32, 32)));
+        c.sent(3, 3, Some(owed));
+        // The successor ran: the skipped entry is settled with it.
+        c.on_complete(3, false);
+        assert_eq!(c.unconfirmed.len(), 0);
+        assert_eq!(
+            c.damage(Some(&since(3, 96))),
+            Some(vec![px(96, 0, 32, 32)]),
+            "settled presents are not owed again"
+        );
+    }
+
+    #[test]
+    fn an_executed_present_settles_itself() {
+        let mut c = chain_with_2_in_flight();
+        assert!(c
+            .damage(Some(&since(2, 64)))
+            .unwrap()
+            .contains(&px(0, 0, 32, 32)));
+        c.on_complete(2, false);
+        assert_eq!(c.damage(Some(&since(2, 64))), Some(vec![px(64, 0, 32, 32)]));
+    }
+
+    #[test]
+    fn an_out_of_order_completion_does_not_settle_an_older_present() {
+        let mut c = chain_with_2_in_flight();
+        let owed = c.damage(Some(&since(2, 64))).unwrap();
+        c.sent(3, 3, Some(owed));
+        // 3 runs while 2 is still queued (another CRTC, a slow vblank).
+        c.on_complete(3, false);
+        let owed = c.damage(Some(&since(3, 96))).expect("intact");
+        assert!(
+            owed.contains(&px(0, 0, 32, 32)),
+            "2 may still run over newer content and must stay owed: {owed:?}"
+        );
+        // Once 2 has actually run, everything is settled.
+        c.on_complete(2, false);
+        assert_eq!(c.unconfirmed.len(), 0);
+    }
+
+    #[test]
+    fn a_whole_unsettled_present_forces_whole_until_it_completes() {
+        let mut c = PresentChain::default();
+        c.sent(1, 1, None);
+        assert_eq!(c.damage(Some(&since(1, 0))), None);
+        c.on_complete(1, false);
+        assert!(c.damage(Some(&since(1, 0))).is_some());
+    }
 
     #[test]
     fn ordinary_buttons_classify_as_clicks() {

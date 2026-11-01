@@ -747,6 +747,11 @@ impl Renderer {
         self.ring.release(frame_id);
     }
 
+    /// Mark the whole surface dirty, so the next `publish` carries all of it.
+    pub fn mark_all_dirty(&mut self) {
+        self.ring.mark_dirty_all();
+    }
+
     /// Take back a published frame the host never acquired.
     ///
     /// Releases its buffer, and marks the whole surface dirty. Releasing alone

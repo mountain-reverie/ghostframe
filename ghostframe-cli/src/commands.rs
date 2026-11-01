@@ -200,6 +200,8 @@ pub enum LoopAction {
     Recompute,
     /// Release on the remote every key [`HeldKeys`] still has down.
     ReleaseHeld,
+    /// Ask the client to republish the whole frame.
+    Redraw,
     None,
 }
 
@@ -270,6 +272,7 @@ pub fn route_window_event(
         // returning `Recompute` just tells it to rebuild the `Placement`.
         WindowEvent::Resized { .. } => LoopAction::Recompute,
         WindowEvent::CloseRequested => LoopAction::Quit,
+        WindowEvent::Exposed => LoopAction::Redraw,
         WindowEvent::FocusLost => {
             chord.reset();
             LoopAction::ReleaseHeld
@@ -733,6 +736,7 @@ pub fn run_window_loop(
                         client.push_key(keysym, false);
                     }
                 }
+                LoopAction::Redraw => client.request_redraw(),
                 LoopAction::None => {}
             }
         }
