@@ -104,8 +104,41 @@ struct DmabufFrameInputs {
     force_idr: bool,
 }
 
-/// I-frame interval: one IDR + 10 P-frames = ~6 keyframes/sec at 60 fps.
-const FULL_FRAME_GOP: u32 = 11;
+/// What a [`FullFrameEncoder`] is opened with: a constant bit rate and a GOP.
+///
+/// CBR rather than CQP so the stream's rate is something the transport can
+/// follow: the bridge sets `bps` from the bandwidth estimate and reopens the
+/// encoder to change it (the rate cannot change in place without an RC reset).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateParams {
+    /// Target (and maximum) bit rate, bits per second.
+    pub bps: u32,
+    /// Frames between IDRs.
+    pub gop_frames: u32,
+}
+
+impl Default for RateParams {
+    /// 4 Mbit/s and a 3 s GOP at 60 fps: what an encoder opened before the
+    /// transport has said anything gets.
+    fn default() -> Self {
+        Self {
+            bps: 4_000_000,
+            gop_frames: 180,
+        }
+    }
+}
+
+impl RateParams {
+    /// VBV buffer, in bits: one second of the rate. It must hold an IDR, which
+    /// is several times a P frame (a P frame is `bps / 60` bits; an IDR of 20 P
+    /// frames is a third of a second), or the rate control would starve the IDR
+    /// of bits and the picture after it would take many frames to recover. A
+    /// smaller buffer would also throttle the probe burst the IDR is for. The
+    /// transport's admission, not the VBV, paces what leaves the machine.
+    pub(crate) fn vbv_bits(self) -> i32 {
+        self.bps.min(i32::MAX as u32) as i32
+    }
+}
 
 /// Full-frame H.264 encoder.
 ///
@@ -126,25 +159,41 @@ pub struct FullFrameEncoder {
     /// One-shot keyframe request: set by `request_keyframe()`, cleared on next
     /// `encode_nv12_buffer` / `encode_frame` call.
     keyframe_pending: bool,
+    /// The rate and GOP the encoder was opened with.
+    params: RateParams,
 }
 
 // SAFETY: same reasoning as H264VaapiEncoder.
 unsafe impl Send for FullFrameEncoder {}
 
 impl FullFrameEncoder {
-    /// Create a full-frame encoder, preferring VA-API, falling back to libx264.
+    /// Create a full-frame encoder at the default rate and GOP, preferring
+    /// VA-API, falling back to libx264.
     pub fn new(width: u32, height: u32) -> Result<Self, ffmpeg::Error> {
+        Self::with_params(width, height, RateParams::default())
+    }
+
+    /// The rate and GOP this encoder was opened with.
+    pub fn params(&self) -> RateParams {
+        self.params
+    }
+
+    /// Create a full-frame encoder with the given rate and GOP, preferring
+    /// VA-API, falling back to libx264.
+    pub fn with_params(width: u32, height: u32, params: RateParams) -> Result<Self, ffmpeg::Error> {
         FFMPEG_INIT.call_once(|| {
             ffmpeg::init().expect("ffmpeg::init() failed");
         });
 
         if let Some(vaapi_codec) = encoder::find_by_name("h264_vaapi") {
-            match Self::try_open_vaapi(vaapi_codec, width, height) {
+            match Self::try_open_vaapi(vaapi_codec, width, height, params) {
                 Ok(this) => {
                     info!(
                         enc_w = this.enc_w,
                         enc_h = this.enc_h,
-                        "FullFrameEncoder: using h264_vaapi hardware encoder"
+                        bps = params.bps,
+                        gop_frames = params.gop_frames,
+                        "FullFrameEncoder: using h264_vaapi hardware encoder (CBR)"
                     );
                     return Ok(this);
                 }
@@ -158,8 +207,12 @@ impl FullFrameEncoder {
         }
 
         let x264_codec = encoder::find_by_name("libx264").ok_or(ffmpeg::Error::EncoderNotFound)?;
-        info!("FullFrameEncoder: using libx264 software encoder");
-        Self::try_open_sw(x264_codec, width, height)
+        info!(
+            bps = params.bps,
+            gop_frames = params.gop_frames,
+            "FullFrameEncoder: using libx264 software encoder (CBR)"
+        );
+        Self::try_open_sw(x264_codec, width, height, params)
     }
 
     pub fn width(&self) -> u32 {
@@ -199,6 +252,7 @@ impl FullFrameEncoder {
         enc_codec: codec::codec::Codec,
         width: u32,
         height: u32,
+        params: RateParams,
     ) -> Result<Self, ffmpeg::Error> {
         unsafe {
             // Create DRM device first, then derive VAAPI from it.
@@ -242,8 +296,11 @@ impl FullFrameEncoder {
             ctx.set_time_base(Rational(1, 60));
             ctx.set_frame_rate(Some(Rational(60, 1)));
             ctx.set_format(Pixel::VAAPI);
+            ctx.set_bit_rate(params.bps as usize);
+            ctx.set_max_bit_rate(params.bps as usize);
 
             let ctx_ptr = ctx.as_mut_ptr();
+            (*ctx_ptr).rc_buffer_size = params.vbv_bits();
             (*ctx_ptr).hw_frames_ctx = ffi::av_buffer_ref(hw_frames_ctx);
             if (*ctx_ptr).hw_frames_ctx.is_null() {
                 ffi::av_buffer_unref(&mut { hw_frames_ctx });
@@ -252,7 +309,10 @@ impl FullFrameEncoder {
             }
 
             let mut opts = ffmpeg::Dictionary::new();
-            opts.set("g", &FULL_FRAME_GOP.to_string());
+            opts.set("g", &params.gop_frames.to_string());
+            // Constant bit rate: with `bit_rate == rc_max_rate` the driver
+            // picks CBR anyway; say so rather than rely on that.
+            opts.set("rc_mode", "CBR");
 
             let opened = match ctx.open_with(opts) {
                 Ok(enc) => enc,
@@ -274,6 +334,7 @@ impl FullFrameEncoder {
                 hw_frames_ctx: Some(BufRef(hw_frames_ctx)),
                 _drm_device_ctx: drm_device_ctx.ok().map(BufRef),
                 keyframe_pending: false,
+                params,
             })
         }
     }
@@ -282,6 +343,7 @@ impl FullFrameEncoder {
         enc_codec: codec::codec::Codec,
         width: u32,
         height: u32,
+        params: RateParams,
     ) -> Result<Self, ffmpeg::Error> {
         let mut ctx = codec::context::Context::new_with_codec(enc_codec)
             .encoder()
@@ -292,11 +354,18 @@ impl FullFrameEncoder {
         ctx.set_time_base(Rational(1, 60));
         ctx.set_frame_rate(Some(Rational(60, 1)));
         ctx.set_format(Pixel::YUV420P);
+        ctx.set_bit_rate(params.bps as usize);
+        ctx.set_max_bit_rate(params.bps as usize);
+        // SAFETY: `ctx` is a valid, not yet opened codec context.
+        unsafe {
+            (*ctx.as_mut_ptr()).rc_buffer_size = params.vbv_bits();
+        }
 
         let mut opts = ffmpeg::Dictionary::new();
         opts.set("preset", "ultrafast");
         opts.set("tune", "zerolatency");
-        opts.set("g", &FULL_FRAME_GOP.to_string());
+        opts.set("g", &params.gop_frames.to_string());
+        opts.set("nal-hrd", "cbr");
 
         let opened = ctx.open_with(opts)?;
 
@@ -318,6 +387,7 @@ impl FullFrameEncoder {
             hw_frames_ctx: None,
             _drm_device_ctx: None,
             keyframe_pending: false,
+            params,
         })
     }
 
@@ -344,7 +414,8 @@ impl FullFrameEncoder {
         let pts = self.pts;
         self.pts += 1;
 
-        let force_idr = pts % FULL_FRAME_GOP as i64 == 0 || self.keyframe_pending;
+        let force_idr =
+            pts % i64::from(self.params.gop_frames.max(1)) == 0 || self.keyframe_pending;
         self.keyframe_pending = false;
 
         let input = DmabufFrameInputs {
@@ -385,7 +456,8 @@ impl FullFrameEncoder {
     ) -> Result<Option<FullFrameEncoded>, ffmpeg::Error> {
         let pts = self.pts;
         self.pts += 1;
-        let force_idr = pts % FULL_FRAME_GOP as i64 == 0 || self.keyframe_pending;
+        let force_idr =
+            pts % i64::from(self.params.gop_frames.max(1)) == 0 || self.keyframe_pending;
         self.keyframe_pending = false;
 
         unsafe {
