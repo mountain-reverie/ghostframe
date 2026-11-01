@@ -19,6 +19,7 @@
 pub mod bootstrap;
 mod decode_thread;
 pub mod event;
+mod frame_clock;
 pub mod input;
 mod net_thread;
 mod render_thread;
@@ -441,6 +442,7 @@ impl Client {
                     open_h264_eagerly,
                     reset_sink,
                     render_self_tx,
+                    frame_clock::DEFAULT_FRAME_INTERVAL,
                 )
             })
             .map_err(ClientError::Io)?;

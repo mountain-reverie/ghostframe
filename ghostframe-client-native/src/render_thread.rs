@@ -14,6 +14,10 @@
 //! immediately available is applied, then `flush` + `publish` run once --
 //! this is the "frame boundary" the crate-level docs describe, since
 //! `ClientCore` has no explicit end-of-frame event of its own to key off.
+//!
+//! `flush` + `publish` are further paced by a [`FrameClock`]: events are applied
+//! as they arrive, but the expensive half runs at most once per display
+//! interval, and the loop wakes at the deadline on its own.
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -24,6 +28,7 @@ use ghostframe_client_gpu::ring::PublishedFrame;
 use ghostframe_client_gpu::wgpu_ctx::WgpuContext;
 
 use crate::event::{ClientEvent, EventQueue};
+use crate::frame_clock::{FrameClock, Pace};
 use crate::DebugFrameBytes;
 
 /// Default export-ring buffer count used when [`crate::Config::n_export_buffers`]
@@ -431,6 +436,7 @@ pub(crate) fn run(
     open_h264_eagerly: bool,
     reset_sink: ResetSink,
     self_tx: Sender<RenderMsg>,
+    frame_interval: std::time::Duration,
 ) {
     let ctx = match WgpuContext::new() {
         Ok(ctx) => {
@@ -452,6 +458,11 @@ pub(crate) fn run(
     // the host's picture current on a quiet screen until a buffer comes back,
     // so the next `Release` must trigger the publish that was skipped.
     let mut publish_pending = false;
+    let mut clock = FrameClock::new(frame_interval);
+    // Events were applied (or a publish was retried) and `flush` + `publish`
+    // have not run for them yet because the clock said wait.
+    let mut render_due = false;
+    let mut wake_at: Option<std::time::Instant> = None;
     let dump_cfg = ghostframe_client_gpu::config::DumpConfig::from_env();
     let mut last_summary = std::time::Instant::now();
     // `0` means "the embedder didn't specify a count"; a `Renderer` with
@@ -464,45 +475,61 @@ pub(crate) fn run(
         export_buffers as usize
     };
 
-    while let Ok(first) = rx.recv() {
-        // `Err` here means every `Sender` was dropped; the loop condition
-        // above already exits for us.
+    loop {
+        // While a render is deferred, wake at its deadline even if nothing
+        // arrives; otherwise block as before.
+        let first = match wake_at {
+            Some(t) => {
+                match rx.recv_timeout(t.saturating_duration_since(std::time::Instant::now())) {
+                    Ok(m) => Some(m),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            None => match rx.recv() {
+                Ok(m) => Some(m),
+                // Every `Sender` was dropped.
+                Err(_) => break,
+            },
+        };
         let mut got_event = false;
         let mut released = false;
         let mut shutdown = false;
 
-        match first {
-            RenderMsg::Shutdown => break,
-            RenderMsg::Release(id) => {
-                released = true;
-                tally.releases += 1;
-                if let Some(r) = renderer.as_mut() {
-                    r.release(id);
+        if let Some(first) = first {
+            match first {
+                RenderMsg::Shutdown => break,
+                RenderMsg::Release(id) => {
+                    released = true;
+                    tally.releases += 1;
+                    if let Some(r) = renderer.as_mut() {
+                        r.release(id);
+                    }
                 }
-            }
-            RenderMsg::Core(ev) => {
-                tally.record(&ev);
-                got_event |= handle_core_event(
-                    &ctx,
-                    &mut renderer,
-                    ev,
-                    &queue,
-                    &published,
-                    export_buffers,
-                    host_visible,
-                    &preferred_modifiers,
-                    open_h264_eagerly,
-                    &self_tx,
-                );
-            }
-            RenderMsg::DebugMapFrame(buffer_id, reply) => {
-                let _ = reply.send(handle_debug_map_frame(&renderer, buffer_id));
-            }
-            RenderMsg::H264FramesReady => {
-                got_event |= poll_h264(&ctx, &mut renderer);
-            }
-            RenderMsg::Redraw => {
-                got_event |= redraw(&mut renderer);
+                RenderMsg::Core(ev) => {
+                    tally.record(&ev);
+                    got_event |= handle_core_event(
+                        &ctx,
+                        &mut renderer,
+                        ev,
+                        &queue,
+                        &published,
+                        export_buffers,
+                        host_visible,
+                        &preferred_modifiers,
+                        open_h264_eagerly,
+                        &self_tx,
+                    );
+                }
+                RenderMsg::DebugMapFrame(buffer_id, reply) => {
+                    let _ = reply.send(handle_debug_map_frame(&renderer, buffer_id));
+                }
+                RenderMsg::H264FramesReady => {
+                    got_event |= poll_h264(&ctx, &mut renderer);
+                }
+                RenderMsg::Redraw => {
+                    got_event |= redraw(&mut renderer);
+                }
             }
         }
 
@@ -515,8 +542,11 @@ pub(crate) fn run(
         // than the consumer there is no guaranteed bound on how long `flush`
         // and `publish` below are deferred. The cap is one screen's worth of
         // tiles at 1080p (60x34 = 2040, rounded up), which makes the invariant
-        // easy to state: never batch more than a full frame before presenting
-        // one. On a machine that keeps up, the channel empties first and this
+        // easy to state: never apply more than a full frame's tiles before the
+        // clock is consulted again. The bound on how long `flush` and `publish`
+        // are deferred is therefore time -- one frame interval (two while the
+        // host holds the last frame) plus at most one drain -- not a batch
+        // size. On a machine that keeps up, the channel empties first and this
         // never binds.
         //
         // Do NOT read this as the fix for a low frame rate -- it was tried as
@@ -574,8 +604,25 @@ pub(crate) fn run(
             reset_sink(reason, frame_seq);
         }
 
-        got_event |= released && publish_pending;
-        if got_event {
+        render_due |= got_event || (released && publish_pending);
+        let woke_for = wake_at.take();
+        let mut run_render = false;
+        if render_due {
+            let pace_now = std::time::Instant::now();
+            let unacquired = published
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+            match clock.decide(pace_now, unacquired) {
+                Pace::Now => {
+                    clock.attempted(pace_now, woke_for);
+                    render_due = false;
+                    run_render = true;
+                }
+                Pace::WaitUntil(t) => wake_at = Some(t),
+            }
+        }
+        if run_render {
             // The slot is latest-wins: whatever the host has not picked up is
             // superseded by what we publish next. Release it first, so its
             // buffer is free for this very publish.
@@ -629,8 +676,11 @@ pub(crate) fn run(
             }
         }
 
-        // Once a second, whatever happened -- including nothing. See
-        // `EventTally`'s doc for why a quiet second is the interesting case.
+        // Once a second while the loop is running -- including a second in
+        // which nothing was applied. See `EventTally`'s doc for why a quiet
+        // second is the interesting case. The loop blocks in `recv` when
+        // nothing is deferred, so a fully idle client logs nothing until the
+        // next message; the first line after an idle spell covers all of it.
         //
         // `saturating_duration_since`, not `elapsed()`: the latter is banned in
         // this workspace (see the clippy config) because it reads the real wall
@@ -721,6 +771,7 @@ mod tests {
                     false,
                     Box::new(|_, _| {}),
                     self_tx,
+                    Duration::ZERO,
                 )
             })
         };
@@ -778,6 +829,21 @@ mod tests {
         Arc<Mutex<Option<PublishedFrame>>>,
         std::thread::JoinHandle<()>,
     )> {
+        spawn_paced_render_thread(buffers, Duration::ZERO)
+    }
+
+    /// As [`spawn_render_thread`], with the frame clock set to `interval`.
+    /// The older tests use zero (no pacing) so each event publishes on its own.
+    #[allow(clippy::type_complexity)]
+    fn spawn_paced_render_thread(
+        buffers: u32,
+        interval: Duration,
+    ) -> Option<(
+        Sender<RenderMsg>,
+        Arc<EventQueue>,
+        Arc<Mutex<Option<PublishedFrame>>>,
+        std::thread::JoinHandle<()>,
+    )> {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tx, rx) = std::sync::mpsc::channel();
         let queue = Arc::new(EventQueue::new().expect("event queue"));
@@ -797,6 +863,7 @@ mod tests {
                     false,
                     Box::new(|_, _| {}),
                     self_tx,
+                    interval,
                 )
             })
         };
@@ -876,5 +943,133 @@ mod tests {
         tx.send(RenderMsg::Shutdown).unwrap();
         handle.join().unwrap();
         assert!(retried.is_some(), "the starved publish was never retried");
+    }
+    /// Count `FrameReady`s arriving within `window`, releasing each so the ring
+    /// never starves, and acquiring it so the host is never "behind".
+    fn count_frames(
+        tx: &Sender<RenderMsg>,
+        queue: &EventQueue,
+        published: &Mutex<Option<PublishedFrame>>,
+        window: Duration,
+    ) -> u32 {
+        let deadline = Instant::now() + window;
+        let mut n = 0;
+        while let Some(id) =
+            next_frame_ready(queue, deadline.saturating_duration_since(Instant::now()))
+        {
+            published.lock().unwrap().take();
+            tx.send(RenderMsg::Release(id)).unwrap();
+            n += 1;
+        }
+        n
+    }
+
+    const TEST_INTERVAL: Duration = Duration::from_millis(400);
+
+    /// A burst of events inside one interval costs one flush + publish, not
+    /// one per event -- and that one still happens without any further event.
+    #[test]
+    fn a_burst_within_one_interval_publishes_once_at_the_deadline() {
+        let Some((tx, queue, published, handle)) = spawn_paced_render_thread(3, TEST_INTERVAL)
+        else {
+            return;
+        };
+        tx.send(RenderMsg::Core(CoreEvent::FrameDimensions {
+            width: 256,
+            height: 128,
+        }))
+        .unwrap();
+        let first = next_frame_ready(&queue, Duration::from_secs(10)).expect("first frame");
+        published.lock().unwrap().take();
+        tx.send(RenderMsg::Release(first)).unwrap();
+
+        let burst = 8;
+        // Spread out (they would otherwise drain as one batch whether or not
+        // anything paces them), yet well inside one interval: unpaced this is
+        // one publish per tile.
+        for i in 0..burst {
+            tx.send(tile(i)).unwrap();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        let frames = count_frames(&tx, &queue, &published, TEST_INTERVAL * 3);
+        tx.send(RenderMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+        assert_eq!(
+            frames, 1,
+            "{burst} events in one interval must publish once"
+        );
+    }
+
+    /// An event after a quiet period is not delayed, and a deferred one lands
+    /// by the end of the interval with no further event to wake the loop.
+    #[test]
+    fn isolated_event_is_immediate_and_a_deferred_one_lands_by_the_deadline() {
+        let Some((tx, queue, published, handle)) = spawn_paced_render_thread(3, TEST_INTERVAL)
+        else {
+            return;
+        };
+        tx.send(RenderMsg::Core(CoreEvent::FrameDimensions {
+            width: 256,
+            height: 128,
+        }))
+        .unwrap();
+        let first = next_frame_ready(&queue, Duration::from_secs(10)).expect("first frame");
+        published.lock().unwrap().take();
+        tx.send(RenderMsg::Release(first)).unwrap();
+
+        // Quiet for longer than an interval, then one event.
+        std::thread::sleep(TEST_INTERVAL * 2);
+        let t0 = Instant::now();
+        tx.send(tile(0)).unwrap();
+        let second = next_frame_ready(&queue, Duration::from_secs(10)).expect("isolated frame");
+        let isolated = Instant::now().saturating_duration_since(t0);
+        published.lock().unwrap().take();
+        tx.send(RenderMsg::Release(second)).unwrap();
+        assert!(
+            isolated < TEST_INTERVAL / 2,
+            "an isolated event waited {isolated:?}"
+        );
+
+        // Right behind it: deferred to the deadline, with nothing else sent.
+        let t1 = Instant::now();
+        tx.send(tile(1)).unwrap();
+        let third = next_frame_ready(&queue, Duration::from_secs(10)).expect("deferred frame");
+        let deferred = Instant::now().saturating_duration_since(t1);
+        tx.send(RenderMsg::Release(third)).unwrap();
+        tx.send(RenderMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+        // The test thread polls every 5 ms, so allow slack on the high side
+        // only; the low side proves the frame really was deferred.
+        assert!(
+            deferred >= TEST_INTERVAL / 2,
+            "the second event published after {deferred:?}: not deferred"
+        );
+        assert!(
+            deferred < TEST_INTERVAL * 3,
+            "deferred publish took {deferred:?}: the loop did not wake at the deadline"
+        );
+    }
+
+    /// Shutdown while a render is deferred must not wait for the deadline.
+    #[test]
+    fn shutdown_does_not_wait_for_a_deferred_render() {
+        let Some((tx, queue, published, handle)) =
+            spawn_paced_render_thread(3, Duration::from_secs(30))
+        else {
+            return;
+        };
+        tx.send(RenderMsg::Core(CoreEvent::FrameDimensions {
+            width: 128,
+            height: 128,
+        }))
+        .unwrap();
+        next_frame_ready(&queue, Duration::from_secs(10)).expect("first frame");
+        published.lock().unwrap().take();
+        tx.send(tile(0)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let t0 = Instant::now();
+        tx.send(RenderMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+        assert!(Instant::now().saturating_duration_since(t0) < Duration::from_secs(5));
     }
 }
