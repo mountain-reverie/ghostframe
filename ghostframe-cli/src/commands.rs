@@ -45,6 +45,21 @@ pub fn state_dir() -> Result<PathBuf, CommandError> {
         .join("tsnet"))
 }
 
+/// The environment variable that stops this client advertising H.264.
+pub const NO_H264_ENV: &str = "GHOSTFRAME_NO_H264";
+
+/// Whether to advertise H.264, given `GHOSTFRAME_NO_H264`'s value. `1` or
+/// `true` withholds it, which makes the server's classifier stay on the tile
+/// codecs (`h264_unsupported` comes before every rule that would force H.264).
+/// Anything else, including unset, leaves the decision to the hardware probe.
+///
+/// For a link too slow for full-frame keyframes: each is ~340 KB at 1080p,
+/// and on the Pinebook's Wi-Fi every frame queued behind one arrived ~400 ms
+/// late -- a keystroke echo included.
+pub fn h264_allowed(no_h264: Option<&str>) -> bool {
+    !matches!(no_h264, Some("1" | "true"))
+}
+
 /// A sensible default node name: `ghostframe-<machine hostname>`, or a
 /// fixed fallback if the machine's hostname can't be determined.
 fn default_hostname() -> String {
@@ -339,11 +354,16 @@ pub fn connect(
     // fatal to `connect`.
     let display = crate::display_probe::probe();
 
+    let supports_h264 = h264_allowed(std::env::var(NO_H264_ENV).ok().as_deref());
+    if !supports_h264 {
+        tracing::info!("{NO_H264_ENV} set: not advertising H.264; the server will use tile codecs");
+    }
+
     let config = Config {
         hostname: default_hostname(),
         authkey: String::new(),
         state_dir: dir,
-        supports_h264: true,
+        supports_h264,
         indices_raw: false,
         n_export_buffers: 3,
         preferred_modifiers,
@@ -715,6 +735,21 @@ pub fn run_window_loop(
                 }
                 LoopAction::None => {}
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::h264_allowed;
+
+    #[test]
+    fn no_h264_withholds_h264_only_when_asked() {
+        assert!(h264_allowed(None), "unset: the probe decides");
+        assert!(!h264_allowed(Some("1")));
+        assert!(!h264_allowed(Some("true")));
+        for v in ["", "0", "false", "yes"] {
+            assert!(h264_allowed(Some(v)), "{v:?} must not disable H.264");
         }
     }
 }
