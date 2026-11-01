@@ -24,6 +24,8 @@ pub mod frame_pool;
 pub(crate) mod gpu_test_lock;
 pub mod server;
 pub mod tile;
+#[cfg(test)]
+pub(crate) mod tracing_test_support;
 pub mod transport;
 
 pub use feedback::{FeedbackKind, FeedbackSink, FrameFeedback};
