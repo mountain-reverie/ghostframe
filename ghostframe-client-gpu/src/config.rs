@@ -62,6 +62,29 @@ impl DumpConfig {
     }
 }
 
+/// Whether the native client uses upload slabs. On by default; the knob exists
+/// to A/B the slab path against the `Vec` path in one binary, and as an escape
+/// hatch should a driver mishandle the linear texture.
+///
+/// `GHOSTFRAME_NO_UPLOAD_SLABS=1` (any value but `0` or empty) turns them off.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UploadConfig {
+    pub slabs_disabled: bool,
+}
+
+impl UploadConfig {
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        Self {
+            slabs_disabled: get("GHOSTFRAME_NO_UPLOAD_SLABS")
+                .is_some_and(|v| !matches!(v.as_str(), "" | "0")),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +96,18 @@ mod tests {
                 .find(|(n, _)| *n == k)
                 .map(|(_, v)| v.to_string())
         }
+    }
+
+    #[test]
+    fn slabs_are_on_unless_switched_off() {
+        let off = |v: &'static str| UploadConfig::from_lookup(lookup_one(v)).slabs_disabled;
+        assert!(!UploadConfig::from_lookup(lookup(&[])).slabs_disabled);
+        assert!(!off("0") && !off(""));
+        assert!(off("1") && off("yes"));
+    }
+
+    fn lookup_one(v: &'static str) -> impl Fn(&str) -> Option<String> {
+        move |k| (k == "GHOSTFRAME_NO_UPLOAD_SLABS").then(|| v.to_string())
     }
 
     #[test]

@@ -312,6 +312,188 @@ fn rgba_pipeline_breakdown() {
     }
 }
 
+/// The staged path against the slab path, per batch size, producer and
+/// consumer side separately.
+///
+/// "staged" is `RgbaPipeline`, what the renderer does with `Vec` tiles that do
+/// not coalesce: `produce` is the decode thread building the `Vec`s (allocate,
+/// write rows), `issue` is the render thread copying them into wgpu staging and
+/// recording and submitting the dispatch. "slab" is `RgbaSlabPipeline`:
+/// `produce` is the decode thread writing the same rows into mapped slab
+/// memory (plus the sync ioctls), `issue` is the render thread recording the
+/// dispatch and writing the small work table. `+gpu` is the time until the
+/// device finished. The `bench:` marker lines let a `PAN_MESA_DEBUG=perf` log
+/// be split per measurement to count "Gallium flush" lines.
+///
+/// Run by hand: `cargo test -p ghostframe-client-gpu --no-default-features
+/// --features gles,decode-gstreamer,test-support --test upload_bench
+/// slab_pipeline_breakdown -- --nocapture --test-threads=1`.
+#[test]
+fn slab_pipeline_breakdown() {
+    use ghostframe_client_core::{TileOut, TileSink};
+    use ghostframe_client_gpu::pipelines::rgba::RgbaPipeline;
+    use ghostframe_client_gpu::pipelines::rgba_slab::{RgbaSlabPipeline, SlabWork};
+    use ghostframe_client_gpu::upload_pool::UploadPool;
+
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let fb = Framebuffer::new(&ctx.device, W, H);
+    let wait = || {
+        ctx.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll")
+    };
+    let (pool, mut alloc) = UploadPool::new(&ctx).expect("upload pool");
+    let mut slab_pipe = RgbaSlabPipeline::new(&ctx.device, &pool);
+    let mut staged = RgbaPipeline::new(&ctx.device);
+    let row = [0x7Au8; 128];
+    // An array assignment, as the decoder does: `copy_from_slice` is a libc
+    // `memcpy` call at this crate's opt-level, and a call per 128-byte row into
+    // write-combined memory measured 5x slower than the inline store.
+    let fill = |out: &mut TileOut<'_>| (0..32).for_each(|y| *out.row_mut(y) = row);
+    let ms = |from: Instant| Instant::now().saturating_duration_since(from).as_secs_f64() * 1e3;
+
+    for n in [16usize, 256, 1020, 2040] {
+        for rep in 0..4 {
+            // --- staged ---
+            eprintln!("bench: staged n={n} rep={rep}");
+            let t0 = Instant::now();
+            let vecs: Vec<Vec<u8>> = (0..n)
+                .map(|_| {
+                    let mut v = vec![0u8; 4096];
+                    fill(&mut TileOut::new(&mut v, 128));
+                    v
+                })
+                .collect();
+            let produce = ms(t0);
+            let batch: Vec<(u32, u32, &[u8])> = vecs
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i as u32 % 60, i as u32 / 60, &v[..]))
+                .collect();
+            let t1 = Instant::now();
+            staged.draw(&ctx.device, &ctx.queue, &fb, &batch);
+            let issue = ms(t1);
+            wait();
+            eprintln!(
+                "n={n:>4} rep={rep} staged produce {produce:>6.2}ms  issue {issue:>6.2}ms  +gpu {:>6.2}ms",
+                ms(t1)
+            );
+            drop(vecs);
+
+            // --- slab ---
+            eprintln!("bench: slab n={n} rep={rep}");
+            let t0 = Instant::now();
+            let mut by_slab: std::collections::BTreeMap<usize, Vec<SlabWork>> = Default::default();
+            let mut counts = vec![0u32; pool.slab_count()];
+            for i in 0..n {
+                let mut out = alloc.acquire().expect("a free slot");
+                fill(&mut out);
+                let slot = alloc.commit(0, 0, 0);
+                counts[slot.slab()] += 1;
+                by_slab.entry(slot.slab()).or_default().push(SlabWork {
+                    tile_x: i as u32 % 60,
+                    tile_y: i as u32 / 60,
+                    slot: slot.index(),
+                });
+            }
+            alloc.end_cpu_writes();
+            let produce = ms(t0);
+            let batches: Vec<_> = by_slab.into_iter().collect();
+            let t1 = Instant::now();
+            let mut enc = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            slab_pipe.encode(&ctx.device, &ctx.queue, &mut enc, &fb, &pool, &batches);
+            ctx.queue.submit([enc.finish()]);
+            let issue = ms(t1);
+            wait();
+            eprintln!(
+                "n={n:>4} rep={rep} slab   produce {produce:>6.2}ms  issue {issue:>6.2}ms  +gpu {:>6.2}ms",
+                ms(t1)
+            );
+            pool.retire_now(&counts);
+        }
+    }
+}
+
+/// Does opening a CPU write window (`DMA_BUF_IOCTL_SYNC` START|WRITE) on a slab
+/// wait for GPU jobs that are still sampling earlier slots of it? The decode
+/// thread does exactly this: it keeps filling the current slab while the
+/// render thread's dispatch over the slots already announced is in flight.
+///
+/// Submits a full-screen slab dispatch, then without waiting writes more tiles
+/// into the same slab and reports the time START and END took
+/// (`PoolStats::sync_ns`), against the same calls on an idle GPU.
+#[test]
+fn slab_sync_while_gpu_reads() {
+    use ghostframe_client_core::TileSink;
+    use ghostframe_client_gpu::pipelines::rgba_slab::{RgbaSlabPipeline, SlabWork};
+    use ghostframe_client_gpu::upload_pool::UploadPool;
+
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let fb = Framebuffer::new(&ctx.device, W, H);
+    let (pool, mut alloc) = UploadPool::with_slabs(&ctx, 2).expect("upload pool");
+    let mut pipe = RgbaSlabPipeline::new(&ctx.device, &pool);
+    let row = [0x7Au8; 128];
+    let write = |alloc: &mut ghostframe_client_gpu::upload_pool::SlotAllocator, n: usize| {
+        let mut work = Vec::new();
+        for i in 0..n {
+            let mut out = alloc.acquire().expect("slot");
+            (0..32).for_each(|y| *out.row_mut(y) = row);
+            let slot = alloc.commit(0, 0, 0);
+            work.push((
+                slot.slab(),
+                SlabWork {
+                    tile_x: i as u32 % 60,
+                    tile_y: i as u32 / 60,
+                    slot: slot.index(),
+                },
+            ));
+        }
+        alloc.end_cpu_writes();
+        work
+    };
+    for rep in 0..12 {
+        // Idle: a window on a slab nothing reads.
+        let before = pool.stats();
+        let first = write(&mut alloc, 900);
+        let idle = pool.stats();
+        // Busy: the GPU draws those 900 while the next 100 are written into
+        // the SAME slab.
+        let mut enc = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let batches = vec![(
+            first[0].0,
+            first.iter().map(|(_, w)| *w).collect::<Vec<_>>(),
+        )];
+        pipe.encode(&ctx.device, &ctx.queue, &mut enc, &fb, &pool, &batches);
+        ctx.queue.submit([enc.finish()]);
+        let t0 = Instant::now();
+        let second = write(&mut alloc, 100);
+        let wrote = Instant::now().saturating_duration_since(t0).as_secs_f64() * 1e3;
+        let busy = pool.stats();
+        ctx.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        eprintln!(
+            "rep={rep} sync idle: {} calls {:.3}ms | while gpu reads same slab: {} calls {:.3}ms, of which END {:.3}ms (100 tiles took {wrote:.2}ms)",
+            idle.sync_calls - before.sync_calls,
+            (idle.sync_ns - before.sync_ns) as f64 / 1e6,
+            busy.sync_calls - idle.sync_calls,
+            (busy.sync_ns - idle.sync_ns) as f64 / 1e6,
+            (busy.sync_end_ns - idle.sync_end_ns) as f64 / 1e6,
+        );
+        // Fill the slab (900 + 100 + 24 = 1024) so the next rep gets another.
+        let rest = write(&mut alloc, 24);
+        let mut counts = vec![0u32; pool.slab_count()];
+        for (slab, _) in first.iter().chain(&second).chain(&rest) {
+            counts[*slab] += 1;
+        }
+        pool.retire_now(&counts);
+    }
+}
+
 /// One frame of every codec at once, through the real `Renderer`: the case a
 /// per-pipeline `submit` penalises, since each codec used to end in its own
 /// glFlush and fence. Run by hand with `--ignored --nocapture`; under

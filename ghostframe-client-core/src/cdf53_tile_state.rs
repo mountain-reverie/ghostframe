@@ -13,8 +13,26 @@
 //! re-RLE-encoding them just to satisfy `decode_passes`'s signature.
 
 use crate::cdf53_prevalidate::PrevalidatedCdf53;
+use crate::tile_out::{TileOut, TILE_ROW_BYTES};
 use ghostframe_protocol::codec::cdf53::{decode_planes, inverse, CDF53_PASS_COUNT};
 use std::collections::HashMap;
+
+/// Write a 1024-triple BGR tile (as `inverse()` returns it) into `out` as
+/// RGBA, alpha 255. A row is built on the stack and stored in one copy, so a
+/// destination in write-combined memory sees whole 128-byte writes.
+pub fn write_bgr_rows(bgr: &[u8], out: &mut TileOut<'_>) {
+    assert_eq!(bgr.len(), 1024 * 3, "a tile is 1024 BGR triples");
+    for y in 0..32 {
+        let mut row = [0u8; TILE_ROW_BYTES];
+        for (px, src) in row
+            .chunks_exact_mut(4)
+            .zip(bgr[y * 96..][..96].chunks_exact(3))
+        {
+            px.copy_from_slice(&[src[2], src[1], src[0], 255]);
+        }
+        *out.row_mut(y) = row;
+    }
+}
 
 #[derive(Clone, Default)]
 struct TileEntry {
@@ -87,6 +105,22 @@ impl Cdf53TileState {
         tile_y: u8,
         entry: &PrevalidatedCdf53,
     ) -> Option<Vec<u8>> {
+        let bgr = self.integrate_bgr(tile_x, tile_y, entry)?;
+        let mut rgba = vec![0u8; 1024 * 4];
+        let mut out = TileOut::new(&mut rgba, TILE_ROW_BYTES);
+        write_bgr_rows(&bgr, &mut out);
+        Some(rgba)
+    }
+
+    /// [`Self::integrate`] up to, and not including, the pixel format: the
+    /// tile as `inverse()` made it, 1024 BGR triples, for
+    /// [`write_bgr_rows`] to put wherever the pixels are wanted.
+    pub fn integrate_bgr(
+        &mut self,
+        tile_x: u8,
+        tile_y: u8,
+        entry: &PrevalidatedCdf53,
+    ) -> Option<Vec<u8>> {
         let tile = self.tiles.entry((tile_x, tile_y)).or_default();
 
         if !tile.generation_set || tile.generation != entry.generation {
@@ -136,16 +170,7 @@ impl Cdf53TileState {
             return None;
         }
         tile.drawn_prefix = Some(prefix_len);
-        let bgr = inverse(&coefficients);
-
-        let mut rgba = vec![0u8; 1024 * 4];
-        for px in 0..1024 {
-            rgba[px * 4] = bgr[px * 3 + 2]; // R
-            rgba[px * 4 + 1] = bgr[px * 3 + 1]; // G
-            rgba[px * 4 + 2] = bgr[px * 3]; // B
-            rgba[px * 4 + 3] = 255; // A
-        }
-        Some(rgba)
+        Some(inverse(&coefficients))
     }
 
     /// Forget one tile's planes, for a new generation that reuses the

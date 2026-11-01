@@ -451,21 +451,21 @@ impl Client {
         // still fails synchronously on an unusable adapter. A closed channel
         // means the thread died before reporting, which is a bug in it rather
         // than a GPU problem -- say so instead of reporting a GPU error.
-        match gpu_ready_rx.recv() {
-            Ok(Ok(())) => {}
+        let slot_allocator = match gpu_ready_rx.recv() {
+            Ok(Ok(slots)) => slots,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 return Err(ClientError::Io(std::io::Error::other(
                     "render thread exited before reporting GPU readiness",
                 )))
             }
-        }
+        };
 
         let (decode_tx, decode_rx) = mpsc::channel();
         let decode_render_tx = render_tx.clone();
         let decode_handle = std::thread::Builder::new()
             .name("gf-decode".into())
-            .spawn(move || decode_thread::run(decode_rx, decode_render_tx))
+            .spawn(move || decode_thread::run(decode_rx, decode_render_tx, slot_allocator))
             .map_err(ClientError::Io)?;
 
         let net_queue = Arc::clone(&self.queue);

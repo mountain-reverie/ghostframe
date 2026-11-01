@@ -115,35 +115,37 @@ const FORMAT_WGPU: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 // declarations is cheaper than a dependency in a library others link.
 
 #[repr(C)]
-struct GbmDevice {
+pub(crate) struct GbmDevice {
     _opaque: [u8; 0],
 }
 #[repr(C)]
-struct GbmBo {
+pub(crate) struct GbmBo {
     _opaque: [u8; 0],
 }
 
+// `pub(crate)`: `upload_slab_gles` allocates its slabs through the same five
+// entry points rather than declaring them a second time.
 #[link(name = "gbm")]
 extern "C" {
-    fn gbm_create_device(fd: i32) -> *mut GbmDevice;
-    fn gbm_device_destroy(dev: *mut GbmDevice);
-    fn gbm_bo_create(
+    pub(crate) fn gbm_create_device(fd: i32) -> *mut GbmDevice;
+    pub(crate) fn gbm_device_destroy(dev: *mut GbmDevice);
+    pub(crate) fn gbm_bo_create(
         dev: *mut GbmDevice,
         width: u32,
         height: u32,
         format: u32,
         flags: u32,
     ) -> *mut GbmBo;
-    fn gbm_bo_destroy(bo: *mut GbmBo);
-    fn gbm_bo_get_fd(bo: *mut GbmBo) -> i32;
-    fn gbm_bo_get_stride(bo: *mut GbmBo) -> u32;
-    fn gbm_bo_get_modifier(bo: *mut GbmBo) -> u64;
+    pub(crate) fn gbm_bo_destroy(bo: *mut GbmBo);
+    pub(crate) fn gbm_bo_get_fd(bo: *mut GbmBo) -> i32;
+    pub(crate) fn gbm_bo_get_stride(bo: *mut GbmBo) -> u32;
+    pub(crate) fn gbm_bo_get_modifier(bo: *mut GbmBo) -> u64;
 }
 
 /// `GBM_BO_USE_RENDERING` -- the buffer will be a render/copy target.
-const GBM_BO_USE_RENDERING: u32 = 1 << 2;
+pub(crate) const GBM_BO_USE_RENDERING: u32 = 1 << 2;
 /// `GBM_BO_USE_LINEAR` -- the whole point. Without it panfrost picks AFBC.
-const GBM_BO_USE_LINEAR: u32 = 1 << 4;
+pub(crate) const GBM_BO_USE_LINEAR: u32 = 1 << 4;
 
 /// `DRM_FORMAT_ARGB8888`, `fourcc_code('A','R','2','4')`.
 ///
@@ -156,7 +158,7 @@ const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
 /// The render node GBM allocates from. Matches `ghostframe-client-h264`'s
 /// `RENDER_NODE`; a machine with several GPUs and a client on the wrong one is
 /// a problem neither has solved yet.
-const RENDER_NODE: &str = "/dev/dri/renderD128";
+pub(crate) const RENDER_NODE: &str = "/dev/dri/renderD128";
 
 /// A LINEAR dmabuf, allocated through GBM, wrapped as a wgpu texture.
 ///

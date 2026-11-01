@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use ghostframe_client_core::Event as CoreEvent;
 use ghostframe_client_gpu::renderer::Renderer;
 use ghostframe_client_gpu::ring::PublishedFrame;
+use ghostframe_client_gpu::upload_pool::{SlotAllocator, SlotRef, UploadPool};
 use ghostframe_client_gpu::wgpu_ctx::WgpuContext;
 
 use crate::event::{ClientEvent, EventQueue};
@@ -40,6 +41,15 @@ const DEFAULT_EXPORT_BUFFER_COUNT: u32 = 3;
 
 pub(crate) enum RenderMsg {
     Core(CoreEvent),
+    /// A `TileReady` whose pixels the decode thread already wrote into an
+    /// upload slab. Rides the same channel as [`RenderMsg::Core`], so it keeps
+    /// its place among tiles, dimensions and H.264 frames.
+    SlabTile {
+        frame_seq: u32,
+        tile_x: u8,
+        tile_y: u8,
+        slot: SlotRef,
+    },
     Release(u32),
     /// Map a published frame's exported dmabuf and reply with its bytes.
     /// Test and diagnostic use only -- see [`crate::Client::debug_map_frame`].
@@ -122,7 +132,15 @@ fn handle_core_event(
     preferred_modifiers: &[u64],
     open_h264_eagerly: bool,
     self_tx: &Sender<RenderMsg>,
+    pool: Option<&UploadPool>,
 ) -> bool {
+    // A bigger frame needs a bigger pool. Before the renderer sees the event:
+    // the decode thread has already been decoding the new size's tiles.
+    if let (CoreEvent::FrameDimensions { width, height }, Some(pool)) = (&ev, pool) {
+        if let Err(e) = pool.ensure_for(ctx, *width, *height) {
+            tracing::warn!(error = %e, "could not grow the upload pool; extra tiles use Vecs");
+        }
+    }
     if renderer.is_none() {
         let CoreEvent::FrameDimensions { width, height } = &ev else {
             tracing::warn!(
@@ -151,6 +169,9 @@ fn handle_core_event(
                     // A send error means the loop has already exited.
                     let _ = tx.send(RenderMsg::H264FramesReady);
                 }));
+                if let Some(pool) = pool {
+                    r.attach_upload_pool(ctx, pool);
+                }
                 *renderer = Some(r);
             }
             Err(e) => {
@@ -178,6 +199,32 @@ fn handle_core_event(
         return false;
     }
     true
+}
+
+/// Route one slab tile to the renderer. Returns whether it was taken.
+///
+/// A tile that cannot be drawn (no renderer yet, no pool attached) still holds
+/// a slot the decode thread issued, so it is handed back at once: dropping it
+/// silently would pin its slab until the pool is gone.
+fn handle_slab_tile(
+    renderer: &mut Option<Renderer>,
+    pool: Option<&UploadPool>,
+    frame_seq: u32,
+    tile_x: u8,
+    tile_y: u8,
+    slot: SlotRef,
+) -> bool {
+    let taken = renderer
+        .as_mut()
+        .is_some_and(|r| r.apply_slot_tile(frame_seq, tile_x, tile_y, slot));
+    if !taken {
+        if let Some(pool) = pool {
+            let mut counts = vec![0u32; pool.slab_count()];
+            counts[slot.slab()] = 1;
+            pool.retire_now(&counts);
+        }
+    }
+    taken
 }
 
 /// Answer [`RenderMsg::Redraw`]: re-damage everything. `true` when a publish
@@ -306,6 +353,11 @@ fn maybe_dump_export(
 #[derive(Default)]
 struct EventTally {
     tile_ready: u64,
+    /// Of `tile_ready`, the tiles that arrived in an upload slab. Their pixels
+    /// are not scanned for `tile_ready_nonblack`: reading them back from
+    /// write-combined memory on the render thread would cost more than the
+    /// path saves, and only to feed a debug line.
+    tile_slab: u64,
     /// `TileReady` tiles carrying at least one non-black pixel.
     ///
     /// Distinguishes the two explanations for a black framebuffer that no
@@ -388,6 +440,7 @@ impl EventTally {
         tracing::debug!(
             events = self.total(),
             tile_ready = self.tile_ready,
+            tile_slab = self.tile_slab,
             tile_ready_nonblack = self.tile_ready_nonblack,
             tile_payload = self.tile_payload,
             frame_dimensions = self.frame_dimensions,
@@ -426,7 +479,7 @@ pub(crate) type ResetSink = Box<dyn Fn(ghostframe_client_core::ResetReason, u32)
 /// built on changed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
-    ready: std::sync::mpsc::Sender<Result<(), crate::ClientError>>,
+    ready: std::sync::mpsc::Sender<Result<Option<SlotAllocator>, crate::ClientError>>,
     rx: Receiver<RenderMsg>,
     queue: Arc<EventQueue>,
     published: Arc<Mutex<Option<PublishedFrame>>>,
@@ -439,17 +492,33 @@ pub(crate) fn run(
     frame_interval: std::time::Duration,
 ) {
     let ctx = match WgpuContext::new() {
-        Ok(ctx) => {
-            // Ignore a send failure: it only means `connect` gave up first,
-            // and there is nothing useful to do about it here.
-            let _ = ready.send(Ok(()));
-            ctx
-        }
+        Ok(ctx) => ctx,
         Err(e) => {
             let _ = ready.send(Err(crate::ClientError::Gpu(e)));
             return;
         }
     };
+    // The upload slabs. They belong to the GPU context, not to a session's
+    // renderer, so a renderer replaced mid-run keeps drawing from the same
+    // pool; the decode thread gets the write side with the readiness message.
+    // A backend that cannot make them is not an error -- tiles then travel as
+    // `Vec`s, exactly as before.
+    let (upload_pool, slot_allocator) =
+        if ghostframe_client_gpu::config::UploadConfig::from_env().slabs_disabled {
+            tracing::info!("upload slabs disabled by GHOSTFRAME_NO_UPLOAD_SLABS");
+            (None, None)
+        } else {
+            match UploadPool::new(&ctx) {
+                Ok((pool, alloc)) => (Some(pool), Some(alloc)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "upload slabs unavailable; tiles travel as Vecs");
+                    (None, None)
+                }
+            }
+        };
+    // Ignore a send failure: it only means `connect` gave up first, and there
+    // is nothing useful to do about it here.
+    let _ = ready.send(Ok(slot_allocator));
     let mut renderer: Option<Renderer> = None;
     let mut tally = EventTally::new();
     let mut export_dumps: u64 = 0;
@@ -519,6 +588,24 @@ pub(crate) fn run(
                         &preferred_modifiers,
                         open_h264_eagerly,
                         &self_tx,
+                        upload_pool.as_ref(),
+                    );
+                }
+                RenderMsg::SlabTile {
+                    frame_seq,
+                    tile_x,
+                    tile_y,
+                    slot,
+                } => {
+                    tally.tile_ready += 1;
+                    tally.tile_slab += 1;
+                    got_event |= handle_slab_tile(
+                        &mut renderer,
+                        upload_pool.as_ref(),
+                        frame_seq,
+                        tile_x,
+                        tile_y,
+                        slot,
                     );
                 }
                 RenderMsg::DebugMapFrame(buffer_id, reply) => {
@@ -584,6 +671,24 @@ pub(crate) fn run(
                         &preferred_modifiers,
                         open_h264_eagerly,
                         &self_tx,
+                        upload_pool.as_ref(),
+                    );
+                }
+                Ok(RenderMsg::SlabTile {
+                    frame_seq,
+                    tile_x,
+                    tile_y,
+                    slot,
+                }) => {
+                    tally.tile_ready += 1;
+                    tally.tile_slab += 1;
+                    got_event |= handle_slab_tile(
+                        &mut renderer,
+                        upload_pool.as_ref(),
+                        frame_seq,
+                        tile_x,
+                        tile_y,
+                        slot,
                     );
                 }
                 Ok(RenderMsg::DebugMapFrame(buffer_id, reply)) => {
@@ -687,6 +792,17 @@ pub(crate) fn run(
         // returns 0ns forever instead of erroring.
         let now = std::time::Instant::now();
         if now.saturating_duration_since(last_summary) >= std::time::Duration::from_secs(1) {
+            if let Some(pool) = &upload_pool {
+                let st = pool.stats();
+                tracing::debug!(
+                    exhausted = st.exhausted,
+                    sync_ms = st.sync_ns as f64 / 1e6,
+                    sync_end_ms = st.sync_end_ns as f64 / 1e6,
+                    sync_calls = st.sync_calls,
+                    slabs = ?st.slabs,
+                    "upload pool (issued, consumed) per slab; totals since start"
+                );
+            }
             tally.flush_log();
             last_summary = now;
         }
@@ -719,6 +835,25 @@ mod tests {
         // The setting survives the once-a-second reset.
         on.flush_log();
         assert!(on.scan_nonblack && on.tile_ready == 0);
+    }
+
+    /// A slab tile that arrives before any renderer exists cannot be drawn, but
+    /// its slot was issued: it must be handed back or its slab is pinned.
+    #[test]
+    fn a_slab_tile_with_no_renderer_is_retired_at_once() {
+        use ghostframe_client_core::TileSink;
+        let Ok(ctx) = WgpuContext::new() else {
+            eprintln!("SKIP: no GPU");
+            return;
+        };
+        let (pool, mut alloc) = UploadPool::with_slabs(&ctx, 1).expect("pool");
+        let mut out = alloc.acquire().expect("slot");
+        out.row_mut(0).fill(1);
+        let slot = alloc.commit(0, 0, 0);
+        alloc.end_cpu_writes();
+        let mut renderer = None;
+        assert!(!handle_slab_tile(&mut renderer, Some(&pool), 0, 0, 0, slot));
+        assert_eq!(pool.consumed(0), 1);
     }
 
     fn tile(x: u8) -> RenderMsg {

@@ -97,6 +97,17 @@ pub(crate) mod submit;
 #[cfg(test)]
 mod shader_validation;
 pub mod testdata;
+// Upload slabs: persistent CPU-writable textures the decode thread writes tiles
+// into. `upload_slab` names one module per backend, the way `export` and
+// `import` do; each file's `SlabAlloc` and `SlabMap` must keep the same surface
+// (`upload_pool.rs` is their only caller).
+pub mod upload_pool;
+#[cfg(feature = "vulkan")]
+#[path = "upload_slab.rs"]
+mod upload_slab;
+#[cfg(feature = "gles")]
+#[path = "upload_slab_gles.rs"]
+mod upload_slab;
 pub mod wgpu_ctx;
 
 use thiserror::Error;

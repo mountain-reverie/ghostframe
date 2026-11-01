@@ -29,11 +29,13 @@ pub mod palette_shadow;
 pub mod parity_decoder;
 mod reassembly;
 pub mod tile_decoder;
+pub mod tile_out;
 pub mod wire_loss;
 pub use cdf53_coverage::CoverageEntry;
 pub use event::{DecodeErrorCode, Event, PollOutput, TileData, TileKey};
 pub use ghostframe_protocol::feedback_stream::ResetReason;
 pub use tile_decoder::TileDecoder;
+pub use tile_out::{Decoded, NoSlots, TileOut, TileSink, TILE_BYTES, TILE_ROW_BYTES};
 pub use wire_loss::WireLossStats;
 
 use std::collections::{HashMap, VecDeque};
