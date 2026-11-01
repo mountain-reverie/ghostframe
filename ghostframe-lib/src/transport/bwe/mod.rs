@@ -263,13 +263,6 @@ impl BweWrapper {
         self.driver.hold_ceiling(now, hold);
     }
 
-    /// The application chose its own send rate (a CBR stream at a share of the
-    /// estimate): let goog_cc treat the sender as application-limited, so it
-    /// requests its periodic ALR probes. See `googcc::ALR_DECLARED_FACTOR`.
-    pub fn set_alr_declared(&mut self, declared: bool) {
-        self.driver.set_alr_declared(declared);
-    }
-
     /// Return the current observability snapshot without advancing the estimator.
     pub fn snapshot(&self) -> BweSnapshot {
         self.driver.snapshot()

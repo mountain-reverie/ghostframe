@@ -7775,7 +7775,7 @@ async fn the_encoder_is_told_its_rate_before_the_first_frame_it_encodes() {
     assert!(rate < finish, "{log:?}");
     assert!(log[rate].contains("reopen: false"), "{log:?}");
     assert!(
-        log[rate].contains(&format!("gop_frames: {}", bridge.h264.gop_frames)),
+        log[rate].contains(&format!("fps: {}", bridge.h264.fps)),
         "{log:?}"
     );
     assert!(bridge.h264.stats.rate_target_bps >= super::h264_rate::RATE_FLOOR_BPS);

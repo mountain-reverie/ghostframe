@@ -203,6 +203,10 @@ struct Record {
     tx: Transmission,
 }
 
+/// A datagram that departed inside a probe burst is judged lost by the time
+/// rule after this many times the usual threshold.
+const BURST_REORDER_FACTOR: u32 = 3;
+
 pub struct TransmissionLedger {
     records: HashMap<u32, Record>,
     /// Recording order, for the capacity cap: the oldest record goes first.
@@ -222,6 +226,10 @@ pub struct TransmissionLedger {
     tombstone_order: VecDeque<u32>,
     /// Next departure index to hand out.
     next_dep_idx: u64,
+    /// The span of a probe burst (its window plus the queue it leaves): a
+    /// datagram that departed inside it gets a longer time threshold. See
+    /// [`Self::mark_probe_burst`].
+    probe_burst: Option<(Instant, Instant)>,
     /// The newest acknowledged departure: its index and when it left. Loss
     /// is only ever judged against this, never against the clock, so a queue
     /// that delays everything in order cannot produce a verdict (F4).
@@ -256,6 +264,7 @@ impl TransmissionLedger {
             tombstones: HashMap::new(),
             tombstone_order: VecDeque::new(),
             next_dep_idx: 0,
+            probe_burst: None,
             largest_acked: None,
             parity_departed: HashMap::new(),
             parity_order: VecDeque::new(),
@@ -518,6 +527,31 @@ impl TransmissionLedger {
         before - self.records.len()
     }
 
+    /// A probe burst departs from `start` and its queue drains by `end`.
+    /// A datagram that departed inside that span is delayed by the burst's own
+    /// queue, and on a jittery path it can be overtaken by a later one: the
+    /// time rule judges such a datagram lost only after
+    /// [`BURST_REORDER_FACTOR`] times the usual threshold. Scoped to the
+    /// burst; a datagram outside it, tile or frame, is judged as ever.
+    pub fn mark_probe_burst(&mut self, start: Instant, end: Instant) {
+        self.probe_burst = Some(match self.probe_burst {
+            Some((s, e)) if start <= e => (s.min(start), e.max(end)),
+            _ => (start, end),
+        });
+    }
+
+    /// Whether `at` falls inside a marked probe burst.
+    pub fn in_probe_burst(&self, at: Instant) -> bool {
+        self.probe_burst.is_some_and(|(s, e)| at >= s && at <= e)
+    }
+
+    fn time_threshold_for(&self, departed: Instant, base: Duration) -> Duration {
+        match self.probe_burst {
+            Some((s, e)) if departed >= s && departed <= e => base * BURST_REORDER_FACTOR,
+            _ => base,
+        }
+    }
+
     /// Forget everything about the session that ended: the outstanding
     /// records (neither delivered nor lost to anyone who counts), the
     /// tombstones, the acknowledgement reference, the adapted threshold and
@@ -532,6 +566,7 @@ impl TransmissionLedger {
         self.tombstones.clear();
         self.tombstone_order.clear();
         self.next_dep_idx = 0;
+        self.probe_burst = None;
         self.largest_acked = None;
         self.parity_departed.clear();
         self.parity_order.clear();
@@ -563,7 +598,12 @@ impl TransmissionLedger {
         ack: Option<(Instant, Duration)>,
     ) -> Option<Resolution> {
         if let Some(rec) = self.records.remove(&wire_seq) {
-            if let (Some(idx), Some(_)) = (rec.tx.dep_idx, rec.departed) {
+            // Probe padding is acknowledged (it is a measurement) but never
+            // moves the reference real datagrams are judged against: a pad
+            // that overtakes a real datagram on a jittery path would make the
+            // real one look like a hole.
+            let is_pad = matches!(rec.tx.content, Content::Pad(_));
+            if let (Some(idx), Some(_), false) = (rec.tx.dep_idx, rec.departed, is_pad) {
                 if self.largest_acked.is_none_or(|l| idx > l) {
                     self.largest_acked = Some(idx);
                 }
@@ -577,7 +617,11 @@ impl TransmissionLedger {
             let tx = t.tx;
             // An acknowledgement of a departure newer than any acknowledged so
             // far moves the reference the thresholds are judged against.
-            if let (Some(idx), Some(_)) = (tx.dep_idx, t.departed) {
+            if let (Some(idx), Some(_), false) = (
+                tx.dep_idx,
+                t.departed,
+                matches!(tx.content, Content::Pad(_)),
+            ) {
                 if self.largest_acked.is_none_or(|l| idx > l) {
                     self.largest_acked = Some(idx);
                 }
@@ -645,7 +689,7 @@ impl TransmissionLedger {
             }
             let reason = if idx + self.k_pkt <= largest_idx {
                 LossReason::Packet
-            } else if at + time_threshold <= now {
+            } else if at + self.time_threshold_for(at, time_threshold) <= now {
                 LossReason::Time
             } else {
                 break;
@@ -682,8 +726,9 @@ impl TransmissionLedger {
                     tx,
                     ..
                 }) => {
-                    return (tx.dep_idx.unwrap_or(u64::MAX) < largest_idx)
-                        .then(|| *at + time_threshold);
+                    let (idx, at) = (tx.dep_idx.unwrap_or(u64::MAX), *at);
+                    return (idx < largest_idx)
+                        .then(|| at + self.time_threshold_for(at, time_threshold));
                 }
                 _ => {
                     self.departed_order.pop_front();
@@ -938,6 +983,57 @@ mod tests {
         assert!(matches!(l.resolve(7), Some(Resolution::Live(_))));
         assert_eq!(l.resolve(7), None, "a second resolve finds nothing");
         assert!(l.detect_losses(FAR).is_empty());
+    }
+
+    /// A pad is acknowledged and classified once like any datagram, but its
+    /// acknowledgement is not the reference real datagrams are judged against:
+    /// a pad that overtakes a real datagram would otherwise make it a hole.
+    #[test]
+    fn a_pad_acknowledgement_does_not_move_the_reference_real_datagrams_are_judged_by() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        send(&mut l, 1, t0); // real, will be reordered behind the pad
+                             // The pad departs after it.
+        let mut pad = tx(2);
+        pad.content = Content::Pad(2);
+        l.record(2, t0, pad);
+        assert!(l.mark_departed(2, t0, 2));
+        assert!(
+            matches!(l.resolve(2), Some(Resolution::Live(_))),
+            "classified once"
+        );
+        assert!(
+            l.detect_losses_at(t0 + 10_000 * MS, MS).is_empty(),
+            "the pad's acknowledgement is no reference: nothing is a hole yet"
+        );
+        // A real one after it, acknowledged: now 1 is a hole.
+        send(&mut l, 3, t0);
+        assert!(matches!(l.resolve(3), Some(Resolution::Live(_))));
+        assert_eq!(lost_ws(&l.detect_losses_at(t0 + 10_000 * MS, MS)), vec![1]);
+    }
+
+    /// Inside a marked probe burst the time rule waits three times as long;
+    /// outside it, nothing changes.
+    #[test]
+    fn the_time_rule_is_patient_with_datagrams_that_departed_in_a_probe_burst() {
+        let thr = 100 * MS;
+        for in_burst in [false, true] {
+            let t0 = Instant::now();
+            let mut l = TransmissionLedger::new(64);
+            if in_burst {
+                l.mark_probe_burst(t0, t0 + 50 * MS);
+            }
+            send(&mut l, 1, t0);
+            send(&mut l, 2, t0);
+            assert!(matches!(l.resolve(2), Some(Resolution::Live(_))));
+            // 150 ms: past 100 ms, short of 300 ms.
+            let lost = l.detect_losses_at(t0 + 150 * MS, thr);
+            assert_eq!(lost.len(), usize::from(!in_burst), "in_burst={in_burst}");
+            if in_burst {
+                assert_eq!(l.next_loss_time(thr), Some(t0 + 300 * MS));
+                assert_eq!(l.detect_losses_at(t0 + 300 * MS, thr).len(), 1);
+            }
+        }
     }
 
     /// With nothing acknowledged there is nothing to be lost *relative to*: no

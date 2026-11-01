@@ -17,17 +17,6 @@
 use crate::transport::reliable_emitter::cache::CacheEntry;
 use std::collections::{BTreeMap, HashMap};
 
-/// The cache key (`frame_seq`) of probe padding: copies of an already
-/// acknowledged fragment sent to fill a probe cluster. No real frame has it
-/// (the frame counter would take 4 billion frames to get here), it is the
-/// newest key so trimming to the newest frames never evicts it, and an IDR's
-/// `drop_before` never reaches it. Its entries exist only to carry the probe
-/// tag to the acknowledgement; nothing is ever re-sent from them.
-pub(crate) const PAD_FRAME_SEQ: u32 = u32::MAX;
-
-/// Padding entries unacknowledged this long are forgotten.
-pub(crate) const PAD_ENTRY_TTL: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// Most frames the cache holds. Bounds the memory of a stalled
 /// acknowledgement path (frames keep being produced while nothing is
 /// acknowledged) and so how far back the probe's "content is current" reaches.
@@ -128,24 +117,6 @@ impl H264Cache {
         Some(entry)
     }
 
-    /// Forget padding entries older than [`PAD_ENTRY_TTL`] at `now`. Returns
-    /// how many.
-    pub fn expire_pad(&mut self, now: std::time::Instant) -> usize {
-        let Some(frame) = self.frames.get_mut(&PAD_FRAME_SEQ) else {
-            return 0;
-        };
-        let stale: Vec<u16> = frame
-            .frags
-            .iter()
-            .filter(|(_, e)| now.saturating_duration_since(e.queued_at) > PAD_ENTRY_TTL)
-            .map(|(i, _)| *i)
-            .collect();
-        for i in &stale {
-            self.remove(PAD_FRAME_SEQ, *i);
-        }
-        stale.len()
-    }
-
     /// Forget every frame older than `frame_seq`: an IDR at `frame_seq`
     /// supersedes them. Returns the fragments dropped.
     pub fn drop_before(&mut self, frame_seq: u32) -> usize {
@@ -200,6 +171,101 @@ impl H264Cache {
     pub fn clear(&mut self) {
         self.frames.clear();
         self.entries = 0;
+        self.bytes = 0;
+    }
+}
+
+/// The probe padding in flight: datagrams of a probe cluster that repeat
+/// something the client already has. They hold no frame slot, so the frame
+/// cache's trimming and dropping never reach them, and nothing is ever sent
+/// again from them. An entry exists to carry the probe tag to the
+/// acknowledgement, and to count its bytes as in flight meanwhile.
+#[derive(Default)]
+pub struct PadRing {
+    entries: std::collections::HashMap<u32, PadEntry>,
+    order: std::collections::VecDeque<u32>,
+    bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PadEntry {
+    pub probe: crate::transport::reliable_emitter::cache::ProbeTag,
+    pub queued_at: std::time::Instant,
+    pub len: usize,
+}
+
+/// Most padding datagrams held at once (a window pads at most a few hundred
+/// kilobytes, and an entry lives two seconds at most).
+pub(crate) const PAD_RING_CAP: usize = 512;
+/// An unacknowledged padding entry is forgotten after this long.
+pub(crate) const PAD_ENTRY_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl PadRing {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Datagram bytes of the padding in flight.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn get(&self, wire_seq: u32) -> Option<&PadEntry> {
+        self.entries.get(&wire_seq)
+    }
+
+    pub fn insert(&mut self, wire_seq: u32, entry: PadEntry) {
+        while self.entries.len() >= PAD_RING_CAP {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            self.remove(old);
+        }
+        self.bytes += entry.len;
+        if let Some(old) = self.entries.insert(wire_seq, entry) {
+            self.bytes -= old.len;
+        } else {
+            self.order.push_back(wire_seq);
+        }
+    }
+
+    /// Release an entry: its datagram was acknowledged. Returns whether it was held.
+    pub fn remove(&mut self, wire_seq: u32) -> bool {
+        match self.entries.remove(&wire_seq) {
+            Some(e) => {
+                self.bytes -= e.len;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Forget entries older than [`PAD_ENTRY_TTL`] at `now`. Returns how many.
+    pub fn expire(&mut self, now: std::time::Instant) -> usize {
+        let mut n = 0;
+        while let Some(&ws) = self.order.front() {
+            match self.entries.get(&ws) {
+                None => {
+                    self.order.pop_front();
+                }
+                Some(e) if now.saturating_duration_since(e.queued_at) > PAD_ENTRY_TTL => {
+                    self.order.pop_front();
+                    self.remove(ws);
+                    n += 1;
+                }
+                Some(_) => break,
+            }
+        }
+        n
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
         self.bytes = 0;
     }
 }
@@ -608,5 +674,106 @@ mod emitter_tests {
             tile(&mut e, i);
         }
         assert_eq!(parity_groups(&mut e), vec![after_fragment]);
+    }
+
+    #[test]
+    fn padding_is_flagged_tagged_billed_in_flight_and_never_sent_again() {
+        use crate::transport::protocol::FRAME_FLAG_PAD;
+        use crate::transport::reliable_emitter::cache::ProbeTag;
+        let t = Instant::now();
+        let mut e = ReliableTileEmitter::new(t);
+        let template = frame(3, false, 1).remove(0);
+        assert_eq!(
+            template[16] & FRAME_FLAG_PAD,
+            0,
+            "premise: the original is no pad"
+        );
+        let tag = ProbeTag {
+            id: 1_000_000_001,
+            min_probes: 5,
+            min_bytes: 5000,
+            bytes_sent_before: 0,
+        };
+        let len = e.submit_h264_pad(&template, tag, t);
+        assert_eq!(len, template.len());
+        let sent = e.take_transmissions();
+        assert_eq!(sent.len(), 1);
+        let ws = sent[0].wire_seq;
+        assert_eq!(
+            sent[0].content,
+            Content::Pad(ws),
+            "named by its own wire_seq"
+        );
+        let em = e.next_emission(t).expect("queued");
+        let Emission::Source(bytes, _) = &em else {
+            panic!("a source emission")
+        };
+        assert_eq!(
+            bytes[16] & FRAME_FLAG_PAD,
+            FRAME_FLAG_PAD,
+            "flagged on the wire"
+        );
+        assert_eq!(stamped(&em), ws);
+        assert_eq!(bytes[..8], template[..8], "it still names the old frame");
+        // The tag waits for the acknowledgement; the bytes count as in flight.
+        assert_eq!(e.pads.get(ws).map(|p| p.probe), Some(tag));
+        assert_eq!(e.bytes_in_flight(), len);
+        // No path sends it again, whoever asks and whatever the cause.
+        for cause in [RetxCause::Loss, RetxCause::Probe] {
+            assert_eq!(
+                e.request_retransmit(Content::Pad(ws), ws, cause),
+                RetxRequest::ContentGone
+            );
+        }
+        // It holds no frame slot: the frame cache never saw it.
+        assert!(e.h264.is_empty() && e.h264.frames() == 0);
+    }
+
+    #[test]
+    fn padding_is_forgotten_when_acknowledged_expired_or_the_session_ends() {
+        use crate::transport::reliable_emitter::cache::ProbeTag;
+        let t = Instant::now();
+        let mut e = ReliableTileEmitter::new(t);
+        let template = frame(3, false, 1).remove(0);
+        let tag = ProbeTag {
+            id: 1_000_000_002,
+            min_probes: 5,
+            min_bytes: 5000,
+            bytes_sent_before: 0,
+        };
+        for _ in 0..3 {
+            e.submit_h264_pad(&template, tag, t);
+        }
+        let ws: Vec<u32> = e.take_transmissions().iter().map(|x| x.wire_seq).collect();
+        assert_eq!(e.pads.len(), 3);
+        assert!(e.pads.remove(ws[0]), "acknowledged");
+        assert!(!e.pads.remove(ws[0]), "once");
+        e.expire_h264_pad(t + PAD_ENTRY_TTL);
+        assert_eq!(e.pads.len(), 2, "not yet: the TTL is exclusive");
+        e.expire_h264_pad(t + PAD_ENTRY_TTL + Duration::from_millis(1));
+        assert!(e.pads.is_empty() && e.pads.bytes() == 0, "expired");
+        e.submit_h264_pad(&template, tag, t);
+        assert_eq!(e.pads.len(), 1);
+        e.clear_cache();
+        assert!(e.pads.is_empty());
+    }
+
+    #[test]
+    fn the_pad_ring_is_bounded() {
+        use crate::transport::reliable_emitter::cache::ProbeTag;
+        let t = Instant::now();
+        let mut e = ReliableTileEmitter::new(t);
+        let template = frame(3, false, 1).remove(0);
+        let tag = ProbeTag {
+            id: 1_000_000_003,
+            min_probes: 5,
+            min_bytes: 5000,
+            bytes_sent_before: 0,
+        };
+        for _ in 0..PAD_RING_CAP + 50 {
+            e.submit_h264_pad(&template, tag, t);
+        }
+        assert_eq!(e.pads.len(), PAD_RING_CAP);
+        assert_eq!(e.pads.bytes(), PAD_RING_CAP * template.len());
     }
 }

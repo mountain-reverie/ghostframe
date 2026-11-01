@@ -123,28 +123,7 @@ pub(crate) struct GoogCcDriver {
     /// (at least 250 ms of sends), so "one feedback later" can be inside one
     /// observation and says little about whether a lift held.
     lifts_to_judge: std::collections::VecDeque<(u64, u64)>,
-    /// The application declares itself rate-limited by its own choice (a CBR
-    /// stream held at a share of the estimate). See [`ALR_DECLARED_FACTOR`].
-    alr_declared: bool,
 }
-
-/// While the application declares itself application-limited, the size
-/// goog_cc's ALR detector is told of each sent packet is this fraction of the
-/// real one.
-///
-/// goog_cc keeps its ALR detector private and drives it from the sent-packet
-/// sizes alone; the probe controller reads its verdict at every process
-/// interval, so it cannot be told directly. A CBR stream held at 0.8 x the
-/// estimate counts at about 0.83 x it on the wire (parity is not
-/// acknowledged), above the detector's 65 % usage line, so the detector never
-/// calls it application-limited and no periodic ALR probe is ever requested
-/// (design 4.3). But the application chose that rate, which is what ALR
-/// means. At 0.5 the detector sees about 0.41 x the estimate, well under the
-/// line, and an IDR burst (0.2 s of the rate once per GOP) does not lift the
-/// usage over the 50 % stop level. Only the size handed to the detector is
-/// scaled: acknowledgements, the acknowledged-rate estimate and every other
-/// consumer see the real bytes.
-pub(crate) const ALR_DECLARED_FACTOR: f64 = 0.5;
 
 /// How long after a lift it is judged held or not.
 const LIFT_HOLD_US: u64 = 1_000_000;
@@ -182,13 +161,6 @@ impl GoogCcDriver {
     /// will never work through while the rates still describe the link.
     const MAX_PENDING_PROBE_REQUESTS: usize = 4;
 
-    /// goog_cc is never given a `NetworkStateEstimate` (the model controller
-    /// feeds no capacity hint), so `ProbeController::time_for_network_state_probe`
-    /// returns false at its first check: every network-state path needs one.
-    /// The defaults would keep it quiet anyway: `network_state_interval` is
-    /// infinite and `est_lower_than_network_ratio` is 0 (its 3 s interval is
-    /// unreachable). Headroom is looked for by the t=0 ladder, the repeated
-    /// initial probes and ALR probing.
     /// Do not read the estimate ceiling until `hold` after `now`. A probe
     /// burst spends the whole grant for a moment while its acknowledgements
     /// are still a round trip (plus the queue it built) away, so the ceiling
@@ -199,22 +171,13 @@ impl GoogCcDriver {
         self.ceiling_hold_until_us = self.ceiling_hold_until_us.max(until);
     }
 
-    /// Declare (or stop declaring) the application rate-limited by its own
-    /// choice. See [`ALR_DECLARED_FACTOR`].
-    pub(crate) fn set_alr_declared(&mut self, declared: bool) {
-        self.alr_declared = declared;
-    }
-
-    /// The sent packet as the controller's sent-packet hook (which feeds only
-    /// the ALR detector) should see it.
-    fn alr_view(&self, mut sent: SentPacket) -> SentPacket {
-        if self.alr_declared {
-            let bytes = (sent.size.bytes() as f64 * ALR_DECLARED_FACTOR) as i64;
-            sent.size = DataSize::from_bytes(bytes);
-        }
-        sent
-    }
-
+    /// goog_cc is never given a `NetworkStateEstimate` (the model controller
+    /// feeds no capacity hint), so `ProbeController::time_for_network_state_probe`
+    /// returns false at its first check: every network-state path needs one.
+    /// The defaults would keep it quiet anyway: `network_state_interval` is
+    /// infinite and `est_lower_than_network_ratio` is 0 (its 3 s interval is
+    /// unreachable). Headroom is looked for by the t=0 ladder, the repeated
+    /// initial probes and ALR probing.
     pub(crate) fn new(initial_bps: u64, now: Instant) -> Self {
         let at_time = Timestamp::from_millis(0);
         let cfg = NetworkControllerConfig {
@@ -237,14 +200,18 @@ impl GoogCcDriver {
                 // Without this, `enable_periodic_alr_probing` is never
                 // called and stays at its `false` default, so
                 // `ProbeController::time_for_alr_probe` returns `false`
-                // unconditionally. A screen-sharing source is
-                // application-limited almost all of the time — it sends
-                // what the screen produced, not what the link could carry
-                // — so ALR probing is the mechanism that would ever
-                // re-measure capacity after startup. Without it a link
-                // whose capacity rises is never discovered: measured
-                // 5.5 Mbps estimated on a link that stepped up to
-                // 20 Mbps mid-scene.
+                // unconditionally. A tile-mode screen-sharing source is
+                // application-limited almost all of the time (it sends what
+                // the screen produced, not what the link could carry), and
+                // goog_cc's own ALR detector sees that; ALR probing is then
+                // what re-measures capacity after start-up (measured: 5.5
+                // Mbps estimated on a link that stepped up to 20 Mbps
+                // mid-scene, without it). A CBR H.264 stream held at 0.8 x
+                // its estimate is NOT seen as application-limited by that
+                // detector (its usage line is 65 %), so for that stream
+                // ghostframe starts probe clusters of its own (`h264_rate`:
+                // `h264_app_probe`), which this estimator measures like any
+                // other because it takes the cluster id from the packets.
                 requests_alr_probing: Some(true),
                 // The pacer rate is the estimate, not libwebrtc's `2.5 x`.
                 // See `PACING_FACTOR`.
@@ -313,7 +280,6 @@ impl GoogCcDriver {
             min_rtt: Default::default(),
             pending_lift_bps: None,
             lifts_to_judge: std::collections::VecDeque::new(),
-            alr_declared: false,
         }
     }
 
@@ -596,7 +562,7 @@ impl GoogCcDriver {
                 ..Default::default()
             };
             // The controller must see the send before the acknowledgement.
-            self.ctl.0.on_sent_packet(self.alr_view(sent));
+            self.ctl.0.on_sent_packet(sent);
             packet_feedbacks.push(PacketResult {
                 sent_packet: sent,
                 receive_time: Timestamp::from_millis(recv_ms),
@@ -625,7 +591,7 @@ impl GoogCcDriver {
                 pacing_info: PacedPacketInfo::default(),
                 ..Default::default()
             };
-            self.ctl.0.on_sent_packet(self.alr_view(sent));
+            self.ctl.0.on_sent_packet(sent);
             packet_feedbacks.push(PacketResult {
                 sent_packet: sent,
                 receive_time: Timestamp::plus_infinity(),

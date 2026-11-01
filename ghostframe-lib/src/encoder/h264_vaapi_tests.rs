@@ -208,6 +208,10 @@ fn dmabuf_real_full_frame_encode_from_dmabuf() {
     assert!(got_keyframe, "first output should be a keyframe");
 }
 
+/// The encoder has no GOP of its own: the bridge decides when an IDR is due
+/// (a time since the last IDR) and asks with `request_keyframe`. Fed far more
+/// frames than the old 11-frame GOP, or a 3 s one at 30 fps, it makes exactly
+/// one IDR (the first frame) and one more per request.
 #[test]
 fn full_frame_keyframe_interval() {
     let _vaapi = lock_vaapi();
@@ -215,13 +219,9 @@ fn full_frame_keyframe_interval() {
 
     let width: u32 = 128;
     let height: u32 = 128;
-
-    // The production GOP is 3 s (180 frames), too long to cross in a unit
-    // test; the parameter, not the constant, is what the encoder honours.
-    const GOP: u32 = 11;
     let params = RateParams {
         bps: 2_000_000,
-        gop_frames: GOP,
+        fps: 30,
     };
     let mut encoder = match FullFrameEncoder::with_params(width, height, params) {
         Ok(e) => e,
@@ -232,22 +232,25 @@ fn full_frame_keyframe_interval() {
     };
     assert_eq!(encoder.params(), params);
 
-    // This test is about the GOP, so it feeds the production entry point
+    // This test is about the IDRs, so it feeds the production entry point
     // (`encode_nv12_buffer`) with ordinary heap memory: no file descriptor is
     // ever handed to the VA driver.
     let nv12 = vec![128u8; (width * height * 3 / 2) as usize];
 
-    let mut keyframe_pts: Vec<i64> = Vec::new();
+    let mut keyframes: Vec<i64> = Vec::new();
     let mut output_idx: i64 = 0;
-
-    // Encode 14 frames (more than one full GOP of `GOP` = 11).
-    for _ in 0..14 {
+    // 200 frames: more than the old GOP of 11 many times over, and more than
+    // 3 s at 30 fps. A request is made at frame 120.
+    for i in 0..200 {
+        if i == 120 {
+            encoder.request_keyframe();
+        }
         match encoder.encode_nv12_buffer(nv12.as_ptr(), width, height, width, width, width * height)
         {
             Ok(Some(encoded)) => {
                 assert!(!encoded.payload.is_empty());
                 if encoded.is_keyframe {
-                    keyframe_pts.push(output_idx);
+                    keyframes.push(output_idx);
                 }
                 output_idx += 1;
             }
@@ -255,23 +258,17 @@ fn full_frame_keyframe_interval() {
             Err(e) => panic!("encode_nv12_buffer failed: {e}"),
         }
     }
-
-    eprintln!("keyframe output indices: {keyframe_pts:?}");
-
-    // We must have gotten at least one keyframe (the very first frame).
-    assert!(
-        !keyframe_pts.is_empty(),
-        "expected at least one keyframe in 14 frames"
+    eprintln!("keyframe output indices: {keyframes:?}");
+    assert_eq!(
+        keyframes.len(),
+        2,
+        "the first frame and the requested one: {keyframes:?}"
     );
-
-    // If we got at least two keyframes, check that the interval is ≈ GOP size.
-    if keyframe_pts.len() >= 2 {
-        let interval = keyframe_pts[1] - keyframe_pts[0];
-        assert!(
-            (GOP as i64 - 2..=GOP as i64 + 2).contains(&interval),
-            "keyframe interval should be ~{GOP} frames, got {interval}"
-        );
-    }
+    assert_eq!(keyframes[0], 0);
+    assert!(
+        (118..=125).contains(&keyframes[1]),
+        "the request was made at frame 120 (the encoder may buffer a few): {keyframes:?}"
+    );
 }
 
 #[test]
@@ -290,7 +287,7 @@ fn request_keyframe_forces_idr_outside_gop_boundary() {
     let nv12_size = (width * height * 3 / 2) as usize;
     let nv12 = vec![128u8; nv12_size];
     let _ = encoder.encode_nv12_buffer(nv12.as_ptr(), width, height, width, width, width * height);
-    // PTS 1 normally would NOT be a keyframe (the GOP is 180 frames by default). Request one,
+    // PTS 1 normally would NOT be a keyframe (the encoder has no GOP of its own). Request one,
     // then drain frames until a packet emerges — the encoder may buffer the first
     // few PTS values before emitting the IDR. The first emitted packet must be a
     // keyframe; if no packet appears within a reasonable window the test fails.
@@ -315,7 +312,7 @@ fn request_keyframe_forces_idr_outside_gop_boundary() {
 
     // Subsequent encodes (continuing PTS sequence after the keyframe) should NOT
     // all be keyframes — the latch was one-shot. Drain another 5 frames; at least
-    // one must be a P-frame. Stop well before PTS 11 (next natural GOP boundary).
+    // one must be a P-frame. Stop well before PTS 11.
     let start_pts = keyframe_pts.unwrap() + 1;
     let mut saw_p_frame = false;
     for _pts in start_pts..(start_pts + 5).min(10) {
@@ -331,18 +328,18 @@ fn request_keyframe_forces_idr_outside_gop_boundary() {
     assert!(saw_p_frame, "latch must not persist beyond one frame");
 }
 
-/// The default open parameters are the 3 s GOP at 60 fps and a CBR rate, and
-/// the VBV is one second of the rate.
+/// The default open parameters are a CBR rate at the server's default 30 fps,
+/// and the VBV is one second of the rate.
 #[test]
-fn default_rate_params_are_cbr_with_a_three_second_gop() {
+fn default_rate_params_are_cbr_at_thirty_fps() {
     let p = RateParams::default();
-    assert_eq!(p.gop_frames, 180, "3 s at 60 fps");
+    assert_eq!(p.fps, 30);
     assert!(p.bps >= 300_000);
     assert_eq!(p.vbv_bits() as u32, p.bps, "VBV is one second of the rate");
     assert_eq!(
         RateParams {
             bps: u32::MAX,
-            gop_frames: 1
+            fps: 30
         }
         .vbv_bits(),
         i32::MAX,
@@ -350,23 +347,31 @@ fn default_rate_params_are_cbr_with_a_three_second_gop() {
     );
 }
 
-/// CBR holds the output to the target: noisy content at a low rate must not
-/// come out at the rate uncontrolled quality would give it (about 40 kB a frame
-/// at this size, 4.8 MB over the 120 frames, 38 x the target). Bound: over 120
-/// frames (2 s at the encoder's 60 fps) the output is at most 8 x the target
-/// for those 2 s. The slack is the first IDR of noise, which a one-second VBV
-/// lets through whole (a software x264 run, by accident, was above 2.5 x), plus
-/// the rate control's convergence; 8 x is still a fifth of the uncontrolled
-/// output. Not run in CI (needs the GPU lock); the orchestrator runs it with
-/// the other encoder tests, and the bound is the first thing to adjust if it
-/// is too tight on hardware.
+/// CBR holds the output to the target, on content that moves and compresses
+/// the way a desktop does (a structured moving pattern, not noise).
+///
+/// 320x240 at 30 fps for 5 s at 1 Mbit/s. The checks, from the rate control's
+/// own definition (the output of any window of a CBR stream is bounded by the
+/// rate over the window plus what the VBV may hold):
+///  * every sliding 1 s window (30 consecutive output frames) is at most
+///    `1.2 x (bps + vbv) / 8` bytes, `vbv` being one second of the rate;
+///  * the whole run is at most `1.5 x bps x 5 s / 8`.
+///
+/// Quality-controlled (CQP) output of this pattern is several times that.
+///
+/// To see it fail: mutate `try_open_vaapi` to open for CQP instead of CBR,
+/// replacing `opts.set("rc_mode", "CBR");` with
+/// `opts.set("rc_mode", "CQP"); opts.set("qp", "12");` (for the software
+/// fallback, delete the `nal-hrd` option and the `set_bit_rate` calls).
+///
+/// Not run in CI (needs the GPU lock); run it on hardware.
 #[test]
-fn cbr_output_stays_near_the_target_rate_on_noisy_content() {
+fn cbr_output_stays_near_the_target_rate_on_moving_content() {
     let _vaapi = lock_vaapi();
     let (width, height) = (320u32, 240u32);
     let params = RateParams {
-        bps: 500_000,
-        gop_frames: 180,
+        bps: 1_000_000,
+        fps: 30,
     };
     let mut encoder = match FullFrameEncoder::with_params(width, height, params) {
         Ok(e) => e,
@@ -375,28 +380,54 @@ fn cbr_output_stays_near_the_target_rate_on_noisy_content() {
             return;
         }
     };
-    let mut total = 0usize;
-    let mut x: u32 = 0x1234_5678;
-    for _ in 0..120 {
-        let nv12: Vec<u8> = (0..(width * height * 3 / 2) as usize)
-            .map(|_| {
-                x ^= x << 13;
-                x ^= x >> 17;
-                x ^= x << 5;
-                x as u8
-            })
-            .collect();
+    let frames = 5 * params.fps as usize;
+    let mut sizes: Vec<usize> = Vec::new();
+    for t in 0..frames {
+        // A diagonal XOR pattern drifting 3 pixels a frame, with text-like
+        // 8x8 blocks of flat chroma that change every 10 frames.
+        let mut nv12 = vec![128u8; (width * height * 3 / 2) as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                nv12[y * width as usize + x] = (((x + 3 * t) ^ (2 * y + t)) & 0xFF) as u8;
+            }
+        }
+        let uv = (width * height) as usize;
+        for by in 0..(height as usize / 16) {
+            for bx in 0..(width as usize / 8) {
+                let v = (((bx * 7 + by * 13 + t / 10 * 29) * 37) & 0xFF) as u8;
+                let row = by * width as usize + bx * 8;
+                for k in 0..8 {
+                    nv12[uv + row + k] = v;
+                }
+            }
+        }
         if let Ok(Some(out)) =
             encoder.encode_nv12_buffer(nv12.as_ptr(), width, height, width, width, width * height)
         {
-            total += out.payload.len();
+            sizes.push(out.payload.len());
         }
     }
-    let target_bytes = (params.bps as usize / 8) * 2;
-    eprintln!("cbr: {total} bytes in 2 s, target {target_bytes}");
-    assert!(total > 0, "premise: the encoder produced output");
     assert!(
-        total <= target_bytes * 8,
-        "CBR output {total} bytes over 2 s against a target of {target_bytes}"
+        sizes.len() + 5 >= frames,
+        "premise: the encoder produced the frames"
+    );
+    let total: usize = sizes.iter().sum();
+    let bits_per_s = f64::from(params.bps);
+    let window_bound = (1.2 * (bits_per_s + f64::from(params.vbv_bits())) / 8.0) as usize;
+    let run_bound = (1.5 * bits_per_s * 5.0 / 8.0) as usize;
+    let worst = sizes
+        .windows(params.fps as usize)
+        .map(|w| w.iter().sum::<usize>())
+        .max()
+        .expect("at least one window");
+    eprintln!("cbr: total {total} B (bound {run_bound}), worst 1 s window {worst} B (bound {window_bound})");
+    assert!(total > 0, "premise: output");
+    assert!(
+        worst <= window_bound,
+        "a 1 s window carried {worst} B against a bound of {window_bound}"
+    );
+    assert!(
+        total <= run_bound,
+        "the run carried {total} B against a bound of {run_bound}"
     );
 }

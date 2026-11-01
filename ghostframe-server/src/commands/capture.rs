@@ -108,13 +108,15 @@ pub async fn run(cfg: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
         }
     };
 
-    let lib_config = match ghostframe_lib::config::LibConfig::from_env() {
+    let mut lib_config = match ghostframe_lib::config::LibConfig::from_env() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("{e}; refusing to start");
             std::process::exit(2);
         }
     };
+    // The H.264 encoder's per-frame budget is its rate over the rate it is fed.
+    lib_config.transport.capture_fps = u32::try_from(capture_fps).unwrap_or(30);
     tracing::info!(?lib_config, "effective LibConfig");
 
     tracing::info!("Connecting to Tailscale...");

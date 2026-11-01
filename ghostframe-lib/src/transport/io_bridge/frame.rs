@@ -1250,8 +1250,8 @@ impl IoBridge {
             H264Gate::Encode => {
                 // The rate for this frame; a reopen goes to the worker ahead
                 // of the finish, which therefore encodes an IDR.
-                let gop_frames = self.h264.gop_frames;
-                self.h264_rate_step(now_std(), gop_frames);
+                let (gop, fps) = (self.h264.gop, self.h264.fps);
+                self.h264_rate_step(now_std(), gop, fps);
                 self.send_finish(inflight, action, InFlightStage::FinishingH264 { trace });
             }
             H264Gate::SkipHold | H264Gate::SkipBackpressure => {
@@ -1606,7 +1606,7 @@ impl IoBridge {
                 self.abandon_h264_inflight(seq, now);
             }
             if new_mode == FrameMode::TileCodec {
-                self.h264_end_alr();
+                self.h264_reset_probing();
             }
             if prev_mode == FrameMode::H264
                 && new_mode == FrameMode::TileCodec
@@ -1826,7 +1826,7 @@ impl IoBridge {
         }
         // A probe window an IDR claimed, or one a P frame may claim, is
         // filled up to the cluster with padding (see `h264_probe_pad`).
-        self.h264_probe_pad(now, is_idr);
+        self.h264_probe_pad(now, is_idr, h264_wire_bytes as usize);
         self.reliable_emitter.expire_h264_pad(now);
         let mut parity_bytes = 0u64;
         for parity_dg in parity_datagrams {
@@ -2655,7 +2655,8 @@ impl IoBridge {
                     rate_reopens_gop = h.rate_reopens_gop,
                     idr_rate_rise = h.idr_by_cause[IdrCause::RateRise.index()],
                     rate_target_bps = h.rate_target_bps,
-                    alr_signalled = h.alr_signalled,
+                    app_probes = h.app_probes,
+                    frames_skipped_pad = h.frames_skipped_pad,
                     probe_padding_windows = h.probe_padding_windows,
                     probe_padding_bytes = h.probe_padding_bytes,
                     loss_idr_rate_limited = h.loss_idr_rate_limited,

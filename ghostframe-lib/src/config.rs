@@ -249,6 +249,11 @@ pub struct TransportConfig {
     /// is the default ([`H264_GOP_SECS_DEFAULT`]). Already clamped to
     /// [`H264_GOP_SECS_MIN`]..=[`H264_GOP_SECS_MAX`].
     pub h264_gop_secs: Option<f64>,
+    /// The capture rate the H.264 encoder is fed at (frames per second), set
+    /// by the server from its own configuration; 0 means unknown and is read
+    /// as [`H264_DEFAULT_FPS`]. The encoder's per-frame budget is the rate
+    /// divided by it.
+    pub capture_fps: u32,
 }
 
 /// H.264 GOP length: default, and the range `GHOSTFRAME_H264_GOP_SECONDS` may
@@ -259,9 +264,9 @@ pub struct TransportConfig {
 pub(crate) const H264_GOP_SECS_DEFAULT: f64 = 3.0;
 pub(crate) const H264_GOP_SECS_MIN: f64 = 2.0;
 pub(crate) const H264_GOP_SECS_MAX: f64 = 5.0;
-/// The encoder's nominal frame rate (its `time_base` is 1/60): a GOP of `n`
-/// seconds is `n x` this many frames.
-pub(crate) const H264_ENCODER_FPS: u32 = 60;
+/// The capture rate assumed when the server has not said (it is the server's
+/// default, `DEFAULT_CAPTURE_FPS`).
+pub(crate) const H264_DEFAULT_FPS: u32 = 30;
 
 /// `GHOSTFRAME_H264_GOP_SECONDS`: unset is the default; an unparseable value
 /// is ignored with a warning; one out of range is clamped with a warning.
@@ -425,13 +430,22 @@ impl TransportConfig {
             ),
             model: ModelSettings::from_lookup(&get),
             h264_gop_secs: h264_gop_secs_from_lookup(&get),
+            capture_fps: 0,
         }
     }
 
-    /// The H.264 GOP in frames.
-    pub fn h264_gop_frames(&self) -> u32 {
-        let secs = self.h264_gop_secs.unwrap_or(H264_GOP_SECS_DEFAULT);
-        (secs * f64::from(H264_ENCODER_FPS)).round() as u32
+    /// The H.264 GOP: the time between IDRs when nothing else asks for one.
+    pub fn h264_gop(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(self.h264_gop_secs.unwrap_or(H264_GOP_SECS_DEFAULT))
+    }
+
+    /// The frame rate the H.264 encoder is opened for.
+    pub fn h264_fps(&self) -> u32 {
+        if self.capture_fps == 0 {
+            H264_DEFAULT_FPS
+        } else {
+            self.capture_fps
+        }
     }
 
     /// Parse environment variables into a transport configuration. Reads the
@@ -1480,23 +1494,35 @@ mod tests {
 
     #[test]
     fn the_h264_gop_defaults_to_three_seconds_and_clamps_to_two_to_five() {
-        let gop = |v: &[(&str, &str)]| TransportConfig::from_lookup(lookup(v)).h264_gop_frames();
-        assert_eq!(gop(&[]), 180, "3 s at 60 fps");
-        assert_eq!(TransportConfig::default().h264_gop_frames(), 180);
-        assert_eq!(gop(&[("GHOSTFRAME_H264_GOP_SECONDS", "2")]), 120);
-        assert_eq!(gop(&[("GHOSTFRAME_H264_GOP_SECONDS", "4.5")]), 270);
+        let gop = |v: &[(&str, &str)]| {
+            TransportConfig::from_lookup(lookup(v))
+                .h264_gop()
+                .as_secs_f64()
+        };
+        assert_eq!(gop(&[]), 3.0);
+        assert_eq!(TransportConfig::default().h264_gop().as_secs_f64(), 3.0);
+        assert_eq!(gop(&[("GHOSTFRAME_H264_GOP_SECONDS", "2")]), 2.0);
+        assert_eq!(gop(&[("GHOSTFRAME_H264_GOP_SECONDS", "4.5")]), 4.5);
         assert_eq!(
             gop(&[("GHOSTFRAME_H264_GOP_SECONDS", "0.1")]),
-            120,
+            2.0,
             "clamped up"
         );
         assert_eq!(
             gop(&[("GHOSTFRAME_H264_GOP_SECONDS", "60")]),
-            300,
+            5.0,
             "clamped down"
         );
-        assert_eq!(gop(&[("GHOSTFRAME_H264_GOP_SECONDS", "nan")]), 180);
-        assert_eq!(gop(&[("GHOSTFRAME_H264_GOP_SECONDS", "soon")]), 180);
+        assert_eq!(gop(&[("GHOSTFRAME_H264_GOP_SECONDS", "nan")]), 3.0);
+        assert_eq!(gop(&[("GHOSTFRAME_H264_GOP_SECONDS", "soon")]), 3.0);
+    }
+
+    #[test]
+    fn the_h264_fps_is_the_servers_or_thirty() {
+        let mut t = TransportConfig::default();
+        assert_eq!(t.h264_fps(), 30);
+        t.capture_fps = 60;
+        assert_eq!(t.h264_fps(), 60);
     }
 
     #[test]

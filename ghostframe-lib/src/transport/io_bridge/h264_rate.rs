@@ -67,6 +67,9 @@ const DROP_FRACTION: f64 = 0.30;
 /// (goog_cc's additive-increase limit), well inside a GOP: waiting for the
 /// scheduled IDR would hand the headroom back before the stream ever used it.
 const RISE_FRACTION: f64 = 0.30;
+/// A rise needs the raw estimate over the line on this many consecutive
+/// evaluations (at least [`EVAL_MIN_INTERVAL`] apart): about half a second.
+const RISE_CONFIRMATIONS: u32 = 2;
 /// Reopens are at least this far apart.
 pub(crate) const MIN_REOPEN_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -80,12 +83,39 @@ const PAD_MARGIN: f64 = 1.2;
 const PAD_MAX_BYTES: usize = 384 * 1024;
 /// Padding for one window is at most this many seconds of the estimate.
 const PAD_MAX_ESTIMATE_SECS: f64 = 0.3;
+/// No padding this soon after a rate cut.
+const PAD_QUIET_AFTER_CUT: Duration = Duration::from_secs(3);
+/// Cadence of the application's own probes (goog_cc's ALR probing interval),
+/// and the pause between two probes of a chain.
+const APP_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+const APP_PROBE_CHAIN_GAP: Duration = Duration::from_millis(400);
+/// A probe chain goes on while the estimate reached this much of the last
+/// target, and at most this many probes long.
+const APP_PROBE_CHAIN_RATIO: f64 = 0.7;
+const APP_PROBE_CHAIN_MAX: u32 = 4;
+/// A cluster of the application's: lasts `APP_PROBE_DURATION`, at least this
+/// many packets (goog_cc's ALR probes ask for 5).
+const APP_PROBE_DURATION: Duration = Duration::from_millis(100);
+const APP_PROBE_MIN_PROBES: i64 = 5;
+/// The application's cluster ids start here; goog_cc counts up from 1 and would
+/// need a billion probes to meet them.
+const APP_PROBE_ID_BASE: i32 = 1_000_000_000;
+
+/// The application's own probing (see `h264_start_app_probe`).
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct AppProbe {
+    next_at: Option<Instant>,
+    last_target: Option<u64>,
+    chain_len: u32,
+    counter: u32,
+}
+
 /// How long after padding the estimate ceiling stays off: the 100 ms window,
 /// the queue the burst builds on the path (up to about 0.3 s on the scenes'
 /// links) and the round trip of the acknowledgements.
 const PAD_CEILING_HOLD: Duration = Duration::from_millis(1000);
-/// An IDR within this many frames is the burst of the window; no padding.
-const PAD_IDR_LOOKAHEAD_FRAMES: u32 = 3;
+/// An IDR this close is the burst of the window; no padding.
+const PAD_IDR_LOOKAHEAD: Duration = Duration::from_millis(150);
 
 /// What the policy wants done for the frame about to be encoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +140,11 @@ pub(crate) enum RateStep {
 pub(crate) struct RatePolicy {
     ewma_bps: Option<f64>,
     last_obs: Option<Instant>,
+    /// The latest raw observation (not smoothed, not held).
+    last_raw_bps: f64,
+    /// Consecutive evaluations in which the raw estimate alone put the target
+    /// over the rise line. A rise reopen needs [`RISE_CONFIRMATIONS`].
+    rise_streak: u32,
     /// A jump of the raw estimate, and when its hold ends.
     spike: Option<(f64, Instant)>,
     /// The rate the encoder runs at, as last commanded.
@@ -134,6 +169,7 @@ impl RatePolicy {
     pub(crate) fn reset_session(&mut self) {
         self.ewma_bps = None;
         self.last_obs = None;
+        self.rise_streak = 0;
         self.spike = None;
         self.candidate = None;
         self.candidate_at = None;
@@ -166,6 +202,7 @@ impl RatePolicy {
             _ => self.ewma_bps = Some(est),
         }
         self.last_obs = Some(now);
+        self.last_raw_bps = est;
     }
 
     fn reopen_allowed(&self, now: Instant) -> bool {
@@ -191,6 +228,18 @@ impl RatePolicy {
             .is_none_or(|t| now.saturating_duration_since(t) >= EVAL_MIN_INTERVAL)
         {
             self.last_eval = Some(now);
+            // A rise must be seen in the raw estimate on consecutive
+            // evaluations, not only in the held spike: goog_cc pulls a probe's
+            // result back within a few hundred milliseconds when nothing uses
+            // it, and a stream raised on a blip is cut again a probe later (a
+            // RateRise and a RateDrop for one probe chain).
+            let raw_target = (RATE_SHARE * self.last_raw_bps)
+                .clamp(f64::from(RATE_FLOOR_BPS), f64::from(RATE_CAP_BPS));
+            if raw_target > f64::from(applied) * (1.0 + RISE_FRACTION) {
+                self.rise_streak += 1;
+            } else {
+                self.rise_streak = 0;
+            }
             let target = self.target(now);
             let adopt = match (self.candidate, self.candidate_at) {
                 (Some(c), Some(at)) => {
@@ -209,7 +258,8 @@ impl RatePolicy {
             return RateStep::Keep;
         }
         let dropped = f64::from(cand) < f64::from(applied) * (1.0 - DROP_FRACTION);
-        let rose = f64::from(cand) > f64::from(applied) * (1.0 + RISE_FRACTION);
+        let rose = f64::from(cand) > f64::from(applied) * (1.0 + RISE_FRACTION)
+            && self.rise_streak >= RISE_CONFIRMATIONS;
         if dropped || rose || at_gop {
             self.applied = Some(cand);
             self.last_reopen = Some(now);
@@ -232,18 +282,16 @@ impl RatePolicy {
 /// The harness's stand-in for a CBR encoder (see
 /// [`InjectedH264::cbr`](super::InjectedH264)): frame sizes follow the rate the
 /// bridge last set through [`Control::H264Rate`], an IDR is `idr_over_p` P
-/// frames, and a reopen (or the GOP, or a pending IDR request) makes the next
-/// frame an IDR. It takes exactly the controls the real backend does, so the
+/// frames, and a reopen (or a pending IDR request, the GOP's included) makes
+/// the next frame an IDR. It takes exactly the controls the real backend does, so the
 /// scenes exercise the real policy.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ScriptedCbr {
     fps: u32,
     idr_over_p: u32,
     rate_bps: u32,
-    gop_frames: u32,
     reopen: bool,
-    /// Frames since the last IDR, that IDR included; 0 before the first frame.
-    since_idr: u32,
+    started: bool,
 }
 
 impl ScriptedCbr {
@@ -252,32 +300,26 @@ impl ScriptedCbr {
             fps: cfg.fps.max(1),
             idr_over_p: cfg.idr_over_p.max(1),
             rate_bps: RATE_INITIAL_BPS,
-            gop_frames: 0,
             reopen: false,
-            since_idr: 0,
+            started: false,
         }
     }
 
     pub(super) fn apply(&mut self, c: Control) {
-        if let Control::H264Rate {
-            bps,
-            gop_frames,
-            reopen,
-        } = c
-        {
+        if let Control::H264Rate { bps, fps, reopen } = c {
             self.rate_bps = bps;
-            self.gop_frames = gop_frames;
+            self.fps = fps.max(1);
             self.reopen |= reopen;
         }
     }
 
     /// The next frame: `(is_idr, payload bytes)`. `requested` is an IDR the
-    /// bridge asked for.
+    /// bridge asked for. As the real encoder it makes one on no initiative of
+    /// its own but its first frame and a fresh open.
     pub(super) fn next_frame(&mut self, requested: bool) -> (bool, usize) {
-        let gop_due = self.gop_frames > 0 && self.since_idr >= self.gop_frames;
-        let is_idr = requested || self.reopen || gop_due || self.since_idr == 0;
+        let is_idr = requested || self.reopen || !self.started;
         self.reopen = false;
-        self.since_idr = if is_idr { 1 } else { self.since_idr + 1 };
+        self.started = true;
         let p = (u64::from(self.rate_bps) / 8 / u64::from(self.fps)) as usize;
         (
             is_idr,
@@ -304,42 +346,99 @@ impl IoBridge {
         self.backend_apply(control);
     }
 
-    /// Tell the estimator the application is rate-limited by its own choice:
-    /// a CBR stream at a share of the estimate is application-limited by
-    /// construction, and goog_cc only asks for ALR probes of a sender it calls
-    /// application-limited (see `googcc::ALR_DECLARED_FACTOR`).
-    fn h264_declare_alr(&mut self) {
-        if !self.h264.alr_declared {
-            self.h264.alr_declared = true;
-            self.h264.stats.alr_signalled += 1;
-            self.bwe.set_alr_declared(true);
-        }
+    /// The probe machinery of a stream that is no longer in charge (it left
+    /// H.264 mode, or the session ended): forget the app-probe cadence and the
+    /// padding in flight.
+    pub(super) fn h264_reset_probing(&mut self) {
+        self.h264.app_probe = AppProbe::default();
+        self.reliable_emitter.pads.clear();
     }
 
-    /// The H.264 rate policy is no longer in charge (the stream left H.264
-    /// mode, or the session ended).
-    pub(super) fn h264_end_alr(&mut self) {
-        if self.h264.alr_declared {
-            self.h264.alr_declared = false;
-            self.bwe.set_alr_declared(false);
+    /// Whether padding may be queued now (design: bounded, never in the way).
+    /// Not while the H.264 queue holds anything but the frame just queued
+    /// (`own_bytes`), and not within [`PAD_QUIET_AFTER_CUT`] of a rate cut: the
+    /// path is shrinking, probing it is the wrong moment, and it is also when
+    /// the extra queue would cost frames.
+    fn h264_pad_allowed(&self, now: Instant, own_bytes: usize) -> bool {
+        if self
+            .h264
+            .last_cut_at
+            .is_some_and(|t| now.saturating_duration_since(t) < PAD_QUIET_AFTER_CUT)
+        {
+            return false;
         }
+        self.reliable_emitter
+            .queued_h264_bytes()
+            .saturating_sub(own_bytes)
+            == 0
     }
 
-    /// Fill a probe window for a P frame that was just sent, without forcing
-    /// an IDR (design 4.3).
+    /// Start a probe cluster of ghostframe's own, if one is due.
     ///
-    /// goog_cc asks for a periodic ALR probe (a cluster of `min_bytes` at a
-    /// rate above the estimate) and the only thing that claims one is a burst.
-    /// If an IDR is due within the window it is the burst and nothing is
-    /// done here. Otherwise the window is opened now and filled with copies of
-    /// an already acknowledged P-frame fragment under new `wire_seq`s: the
-    /// client acknowledges a fragment on receipt and discards a duplicate, so
-    /// the copies are measured and cost the picture nothing. They are billed
-    /// as probe, never counted as frame data, never retransmitted, bounded by
-    /// the cluster (`PAD_MARGIN` over `min_bytes`, `PAD_MAX_BYTES` overall) and
-    /// sent at the probe rate (the admission rate is the window's while it is
-    /// open).
-    pub(super) fn h264_probe_pad(&mut self, now: Instant, is_idr: bool) {
+    /// goog_cc's periodic ALR probing needs its ALR detector to call the
+    /// sender application-limited, and a CBR stream at 0.8 x its estimate is
+    /// above that detector's usage line, so it never asks. The stream *is*
+    /// application-limited in the sense that matters (it chose not to send
+    /// more), so the application probes: a cluster at twice the estimate every
+    /// [`APP_PROBE_INTERVAL`], and, while a probe keeps succeeding (the
+    /// estimate reached 0.7 x its target), the next one straight after, as
+    /// goog_cc chains its own. The cluster has an id from a range goog_cc never
+    /// issues ([`APP_PROBE_ID_BASE`]); goog_cc's probe estimator measures any
+    /// cluster id it finds on acknowledged packets (`probe_bitrate_estimator.rs`
+    /// `handle_probe_and_estimate_bitrate`, keyed by the packet's id alone),
+    /// and applies the result like one it asked for.
+    fn h264_start_app_probe(&mut self, now: Instant) {
+        let est = self.bwe.snapshot().bitrate_bps;
+        let p = &mut self.h264.app_probe;
+        let due = match p.next_at {
+            None => {
+                // First look: the start-up ladder is goog_cc's.
+                p.next_at = Some(now + APP_PROBE_INTERVAL);
+                false
+            }
+            Some(t) => now >= t,
+        };
+        if !due {
+            return;
+        }
+        // A chain goes on while the last probe's target was (nearly) reached.
+        let chaining = p
+            .last_target
+            .is_some_and(|t| est as f64 >= APP_PROBE_CHAIN_RATIO * t as f64)
+            && p.chain_len < APP_PROBE_CHAIN_MAX;
+        if p.last_target.is_some() && !chaining {
+            // The chain ended: the next probe is an interval from now.
+            p.last_target = None;
+            p.chain_len = 0;
+            p.next_at = Some(now + APP_PROBE_INTERVAL);
+            return;
+        }
+        let target = est.saturating_mul(2);
+        let duration = APP_PROBE_DURATION;
+        let min_bytes = (target as f64 / 8.0 * duration.as_secs_f64()) as i64;
+        let id = APP_PROBE_ID_BASE + (p.counter % 1_000_000) as i32;
+        p.counter += 1;
+        p.last_target = Some(target);
+        p.chain_len += 1;
+        p.next_at = Some(now + APP_PROBE_CHAIN_GAP);
+        self.h264.stats.app_probes += 1;
+        self.open_probe_cluster(now, id, target, duration, APP_PROBE_MIN_PROBES, min_bytes);
+    }
+
+    /// Fill a probe window for a frame that was just sent, without forcing
+    /// an IDR (design 4.3). `own_bytes` is the wire size of that frame.
+    ///
+    /// A window is claimed by a burst. If an IDR is due within the window it
+    /// is the burst and nothing is done here. Otherwise a window is opened now
+    /// (goog_cc's own request first, else the application's, see
+    /// [`Self::h264_start_app_probe`]) and filled with copies of an already
+    /// acknowledged P-frame fragment under new `wire_seq`s, flagged as padding:
+    /// the client acknowledges them on receipt and discards them, so they are
+    /// measured and cost the picture nothing. They are billed as probe, never
+    /// counted as frame data, never retransmitted, bounded by the cluster
+    /// (`PAD_MARGIN` over `min_bytes`, `PAD_MAX_BYTES` overall) and sent at
+    /// the probe rate (the admission rate is the window's while it is open).
+    pub(super) fn h264_probe_pad(&mut self, now: Instant, is_idr: bool, own_bytes: usize) {
         if self.h264.rate.applied().is_none() {
             return;
         }
@@ -347,17 +446,22 @@ impl IoBridge {
             return;
         };
         if self.active_probe.is_none() && !is_idr {
-            let gop = self.h264.gop_frames;
+            if !self.h264_pad_allowed(now, own_bytes) {
+                return;
+            }
+            let gop = self.h264.gop;
             let idr_soon = self.h264.pending_idr.is_some()
-                || (gop > 0
-                    && self
-                        .h264
-                        .frames_since_idr
-                        .is_some_and(|n| n.saturating_add(PAD_IDR_LOOKAHEAD_FRAMES) >= gop));
+                || self
+                    .h264
+                    .last_idr_at
+                    .is_some_and(|t| now.saturating_duration_since(t) + PAD_IDR_LOOKAHEAD >= gop);
             if idr_soon {
                 return;
             }
             self.open_probe_window_for_burst(now);
+            if self.active_probe.is_none() {
+                self.h264_start_app_probe(now);
+            }
         }
         // An open window, however it was claimed (an IDR, or just above), is
         // topped up to the cluster's size: an IDR smaller than the cluster
@@ -383,8 +487,7 @@ impl IoBridge {
         let cap = (PAD_MAX_BYTES.min(by_estimate) as i64 / len).max(1);
         let n = by_bytes.max(by_count).clamp(1, cap);
         let mut bytes = 0u64;
-        let first_idx = self.h264.stats.probe_padding_datagrams;
-        for i in 0..n {
+        for _ in 0..n {
             let tag = crate::transport::reliable_emitter::cache::ProbeTag {
                 id: p.id,
                 min_probes: p.min_probes,
@@ -393,12 +496,7 @@ impl IoBridge {
             };
             p.bytes_sent = p.bytes_sent.saturating_add(len);
             p.packets_sent = p.packets_sent.saturating_add(1);
-            bytes += self.reliable_emitter.submit_h264_pad(
-                &template,
-                ((first_idx + i as u64) % 4096) as u16,
-                tag,
-                now,
-            ) as u64;
+            bytes += self.reliable_emitter.submit_h264_pad(&template, tag, now) as u64;
         }
         // The burst spends the whole grant before any of it is acknowledged:
         // keep the estimate ceiling from reading that as a saturated, silent
@@ -410,26 +508,37 @@ impl IoBridge {
         self.h264.stats.probe_padding_bytes += bytes;
     }
 
-    /// Run the rate policy for a frame the gate has let through. `gop_frames`
-    /// is the GOP in frames.
-    pub(super) fn h264_rate_step(&mut self, now: Instant, gop_frames: u32) {
+    /// Run the rate policy for a frame the gate has let through. `gop` is the
+    /// time between IDRs, `fps` the frame rate the encoder is opened for.
+    ///
+    /// The GOP is the bridge's: the frame is the scheduled IDR when `gop` has
+    /// passed since the last IDR of any cause (a loss or rate IDR restarts the
+    /// clock). A rate change that wants an IDR takes that one; without one the
+    /// bridge asks the encoder for it, so the encoder needs no GOP of its own.
+    pub(super) fn h264_rate_step(&mut self, now: Instant, gop: Duration, fps: u32) {
         let estimate = self.bwe.snapshot().bitrate_bps;
-        let at_gop = gop_frames > 0 && self.h264.frames_since_idr.is_some_and(|n| n >= gop_frames);
-        self.h264_declare_alr();
+        let at_gop = self
+            .h264
+            .last_idr_at
+            .is_some_and(|t| now.saturating_duration_since(t) >= gop);
         let step = self.h264.rate.step(now, estimate, at_gop);
-        self.h264_apply_rate_step(step, estimate, gop_frames);
+        let reopens = matches!(step, RateStep::Reopen { .. } | RateStep::ReopenRise { .. });
+        self.h264_apply_rate_step(step, estimate, fps);
+        if at_gop && !reopens && self.h264.pending_idr.is_none() {
+            self.request_h264_idr(IdrCause::GopPeriodic, now);
+        }
     }
 
     /// Act on what the policy decided. Split from [`Self::h264_rate_step`] so a
     /// test can hand it a decision without steering the estimator.
-    pub(super) fn h264_apply_rate_step(&mut self, step: RateStep, estimate: u64, gop_frames: u32) {
+    pub(super) fn h264_apply_rate_step(&mut self, step: RateStep, estimate: u64, fps: u32) {
         match step {
             RateStep::Keep => {}
             RateStep::Initial(bps) => {
                 self.h264.stats.rate_target_bps = bps;
                 self.h264_control(Control::H264Rate {
                     bps,
-                    gop_frames,
+                    fps,
                     reopen: false,
                 });
             }
@@ -445,7 +554,7 @@ impl IoBridge {
                 );
                 self.h264_control(Control::H264Rate {
                     bps,
-                    gop_frames,
+                    fps,
                     reopen: true,
                 });
             }
@@ -461,6 +570,7 @@ impl IoBridge {
                     // only deepen the queue it has to cross.
                     self.expect_h264_idr(IdrCause::RateDrop);
                     self.h264.stats.rate_reopens_drop += 1;
+                    self.h264.last_cut_at = Some(now_std());
                 } else {
                     // The scheduled IDR taking a new rate: no hold, like any
                     // periodic IDR, and counted as one.
@@ -475,7 +585,7 @@ impl IoBridge {
                 );
                 self.h264_control(Control::H264Rate {
                     bps,
-                    gop_frames,
+                    fps,
                     reopen: true,
                 });
             }
@@ -486,6 +596,7 @@ impl IoBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::io_bridge::now_std;
 
     const MBIT: u64 = 1_000_000;
 
@@ -673,24 +784,28 @@ mod tests {
     }
 
     #[test]
-    fn a_brief_jump_is_held_long_enough_to_be_followed_and_a_decay_is_not_held() {
+    fn a_jump_that_lasts_is_followed_a_blip_is_not_and_a_decay_gets_no_hold() {
         let t0 = Instant::now();
-        // A probe lifts the estimate 4x for 300 ms and goog_cc pulls it back.
-        let mut p = RatePolicy::default();
-        p.step(t0, 2 * MBIT, false);
-        let mut reopened = false;
-        for i in 1..=120u64 {
-            let t = 16 * i;
-            let est = if (400..700).contains(&t) {
-                8 * MBIT
-            } else {
-                2 * MBIT
-            };
-            if matches!(p.step(ms(t0, t), est, false), RateStep::ReopenRise { .. }) {
-                reopened = true;
+        let follow = |len_ms: u64| {
+            // A probe lifts the estimate 4x for `len_ms` and goog_cc pulls it back.
+            let mut p = RatePolicy::default();
+            p.step(t0, 2 * MBIT, false);
+            let mut reopened = false;
+            for i in 1..=200u64 {
+                let t = 16 * i;
+                let est = if (400..400 + len_ms).contains(&t) {
+                    8 * MBIT
+                } else {
+                    2 * MBIT
+                };
+                if matches!(p.step(ms(t0, t), est, false), RateStep::ReopenRise { .. }) {
+                    reopened = true;
+                }
             }
-        }
-        assert!(reopened, "the jump must be followed");
+            reopened
+        };
+        assert!(follow(900), "a jump that lasts must be followed");
+        assert!(!follow(200), "a blip shorter than two evaluations is not");
         // A decay is not a jump: it gets no hold, so the fall is acted on as
         // fast as the smoothing allows (the 30 % test above bounds it).
         let mut p = RatePolicy::default();
@@ -817,22 +932,22 @@ mod tests {
         let mut s = ScriptedCbr::new(InjectedCbr {
             fps: 30,
             idr_over_p: 5,
-            gop_frames: None,
+            gop: None,
         });
         s.apply(Control::H264Rate {
             bps: 2_400_000,
-            gop_frames: 4,
+            fps: 30,
             reopen: false,
         });
         // 2.4 Mbit/s at 30 fps = 10 000 bytes per P frame.
         assert_eq!(s.next_frame(false), (true, 50_000), "first frame is an IDR");
-        assert_eq!(s.next_frame(false), (false, 10_000));
-        assert_eq!(s.next_frame(false), (false, 10_000));
-        assert_eq!(s.next_frame(false), (false, 10_000));
-        assert_eq!(s.next_frame(false), (true, 50_000), "GOP of 4");
+        // And no initiative of its own after it: the GOP is the bridge's.
+        for _ in 0..500 {
+            assert_eq!(s.next_frame(false), (false, 10_000));
+        }
         s.apply(Control::H264Rate {
             bps: 1_200_000,
-            gop_frames: 4,
+            fps: 30,
             reopen: true,
         });
         assert_eq!(
@@ -842,5 +957,185 @@ mod tests {
         );
         assert_eq!(s.next_frame(false), (false, 5_000));
         assert_eq!(s.next_frame(true), (true, 25_000), "a requested IDR");
+        // A frame rate change rescales the budget.
+        s.apply(Control::H264Rate {
+            bps: 1_200_000,
+            fps: 60,
+            reopen: false,
+        });
+        assert_eq!(s.next_frame(false), (false, 2_500));
+    }
+
+    // ---- the bridge: application probes and padding -------------------------
+
+    async fn bridge() -> IoBridge {
+        let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
+        let server = crate::transport::quic::QuicServer::new().expect("QuicServer::new");
+        IoBridge::new_with_stream_for_test(ours, server)
+    }
+
+    /// A bridge with the rate policy running and a padding template.
+    async fn padding_bridge() -> IoBridge {
+        let mut b = bridge().await;
+        b.h264_apply_rate_step(RateStep::Initial(2_000_000), 2_000_000, 30);
+        b.h264.rate.step(now_std(), 2 * MBIT, false);
+        b.h264.pad_template = Some(bytes::Bytes::from(vec![0u8; 1200]));
+        b
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_application_probes_at_twice_the_estimate_every_five_seconds() {
+        let mut b = padding_bridge().await;
+        let est = b.bwe.snapshot().bitrate_bps;
+        // The first look arms the cadence; the start-up ladder is goog_cc's.
+        b.h264_probe_pad(now_std(), false, 0);
+        assert!(b.active_probe.is_none() && b.h264.stats.app_probes == 0);
+        tokio::time::advance(APP_PROBE_INTERVAL - Duration::from_millis(1)).await;
+        b.h264_probe_pad(now_std(), false, 0);
+        assert!(b.active_probe.is_none(), "not yet");
+        tokio::time::advance(Duration::from_millis(2)).await;
+        b.h264_probe_pad(now_std(), false, 0);
+        let p = b.active_probe.expect("the cluster is open");
+        assert!(
+            p.id >= APP_PROBE_ID_BASE,
+            "an id goog_cc never issues: {}",
+            p.id
+        );
+        assert_eq!(p.target_rate_bps, est * 2);
+        assert_eq!(p.min_probes, APP_PROBE_MIN_PROBES);
+        assert_eq!(
+            p.min_bytes,
+            (p.target_rate_bps as f64 / 8.0 * APP_PROBE_DURATION.as_secs_f64()) as i64
+        );
+        assert_eq!(b.h264.stats.app_probes, 1);
+        // Filled with padding, tagged for this cluster, never past the cluster
+        // asked for (1.2 x min_bytes plus one datagram).
+        assert!(b.h264.stats.probe_padding_datagrams as i64 >= p.min_probes);
+        assert!(
+            p.bytes_sent >= p.min_bytes,
+            "{} of {}",
+            p.bytes_sent,
+            p.min_bytes
+        );
+        assert!(
+            p.bytes_sent <= (p.min_bytes as f64 * PAD_MARGIN) as i64 + 1200,
+            "bounded by the cluster: {} of {}",
+            p.bytes_sent,
+            p.min_bytes
+        );
+        assert_eq!(
+            b.reliable_emitter.pads.len() as u64,
+            b.h264.stats.probe_padding_datagrams
+        );
+        // Never counted as frame data.
+        assert_eq!(b.h264.stats.frames_sent, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_chain_goes_on_while_the_estimate_follows_and_ends_when_it_does_not() {
+        let mut b = padding_bridge().await;
+        let est = b.bwe.snapshot().bitrate_bps;
+        b.h264_probe_pad(now_std(), false, 0); // arms
+        tokio::time::advance(APP_PROBE_INTERVAL).await;
+        b.h264_probe_pad(now_std(), false, 0);
+        assert_eq!(b.h264.stats.app_probes, 1);
+        // The window closes; the estimate did not move (it is under 0.7 x the
+        // 2 x target): the chain ends, the next probe is an interval away.
+        b.active_probe = None;
+        b.reliable_emitter.purge_queued_h264(|_| true); // the pads went out
+        tokio::time::advance(APP_PROBE_CHAIN_GAP).await;
+        b.h264_probe_pad(now_std(), false, 0);
+        assert_eq!(b.h264.stats.app_probes, 1, "the chain ended");
+        tokio::time::advance(APP_PROBE_INTERVAL).await;
+        b.h264_probe_pad(now_std(), false, 0);
+        assert_eq!(
+            b.h264.stats.app_probes, 2,
+            "an interval after the chain ended"
+        );
+        // And a chain that succeeded goes on straight away: pretend the
+        // estimate reached the last target by lowering the bar to it.
+        let last = b.h264.app_probe.last_target.expect("a target");
+        assert!(last >= est * 2);
+        b.active_probe = None;
+        b.h264.app_probe.last_target = Some(est); // the estimate "reached" it
+        b.reliable_emitter.purge_queued_h264(|_| true);
+        tokio::time::advance(APP_PROBE_CHAIN_GAP).await;
+        b.h264_probe_pad(now_std(), false, 0);
+        assert_eq!(b.h264.stats.app_probes, 3, "the chain went on");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn padding_keeps_quiet_behind_a_backlog_and_after_a_rate_cut() {
+        let mut b = padding_bridge().await;
+        b.h264_probe_pad(now_std(), false, 0); // arms
+        tokio::time::advance(APP_PROBE_INTERVAL).await;
+        let t = now_std();
+        // A backlog: an H.264 fragment of another frame still queued.
+        let dgs = crate::transport::protocol::fragment_frame(9, 0, false, &[1u8; 800], 1200);
+        b.reliable_emitter.submit_h264_fragment(
+            crate::transport::reliable_emitter::h264::H264Submit {
+                frame_seq: 9,
+                frag_idx: 0,
+                is_idr: false,
+                bytes: bytes::Bytes::from(dgs[0].clone()),
+                queued_at: t,
+                probe: None,
+            },
+            t,
+        );
+        let own = 0; // this frame's own bytes: none, so the queue is a backlog
+        b.h264_probe_pad(t, false, own);
+        assert!(b.active_probe.is_none(), "behind a backlog");
+        // The queue holds only the frame just sent: allowed.
+        let queued = b.reliable_emitter.queued_h264_bytes();
+        // ... but not right after a rate cut.
+        b.h264.last_cut_at = Some(t);
+        b.h264_probe_pad(t, false, queued);
+        assert!(b.active_probe.is_none(), "within 3 s of a cut");
+        tokio::time::advance(PAD_QUIET_AFTER_CUT).await;
+        b.h264_probe_pad(now_std(), false, queued);
+        assert!(b.active_probe.is_some(), "quiet again");
+        assert_eq!(b.h264.stats.app_probes, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idr_due_within_the_window_is_the_burst_and_is_topped_up_not_padded_around() {
+        let mut b = padding_bridge().await;
+        b.h264_probe_pad(now_std(), false, 0); // arms
+        tokio::time::advance(APP_PROBE_INTERVAL).await;
+        // The scheduled IDR is 100 ms away (the bridge's clock, not frames).
+        b.h264.gop = Duration::from_secs(3);
+        b.h264.last_idr_at = Some(now_std() - Duration::from_millis(2_900));
+        b.h264_probe_pad(now_std(), false, 0);
+        assert!(
+            b.active_probe.is_none(),
+            "the IDR is the burst: no window opened on a P frame"
+        );
+        // An IDR that claimed a window smaller than the cluster is topped up.
+        let t = now_std();
+        b.open_probe_cluster(t, 77, 4_000_000, APP_PROBE_DURATION, 5, 50_000);
+        b.h264_probe_pad(t, true, 3_000);
+        let p = b.active_probe.expect("still open");
+        assert!(
+            p.bytes_sent >= p.min_bytes,
+            "topped up: {} of {}",
+            p.bytes_sent,
+            p.min_bytes
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leaving_h264_mode_or_the_session_forgets_the_probing_and_the_padding() {
+        let mut b = padding_bridge().await;
+        b.h264_probe_pad(now_std(), false, 0);
+        tokio::time::advance(APP_PROBE_INTERVAL).await;
+        b.h264_probe_pad(now_std(), false, 0);
+        assert!(!b.reliable_emitter.pads.is_empty());
+        b.h264_reset_probing();
+        assert!(b.reliable_emitter.pads.is_empty());
+        assert!(
+            b.h264.app_probe.next_at.is_none(),
+            "the cadence starts over"
+        );
     }
 }
