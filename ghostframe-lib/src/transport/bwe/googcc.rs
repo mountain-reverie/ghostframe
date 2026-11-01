@@ -14,8 +14,7 @@ use goog_cc::transport::{
     NetworkAvailability, NetworkControlUpdate, PacedPacketInfo, PacketResult, ProbeClusterConfig,
     ProcessInterval, SentPacket, StreamsConfig, TargetRateConstraints, TransportPacketsFeedback,
 };
-use goog_cc::units::{DataRate, DataSize, TimeDelta, Timestamp};
-use goog_cc::ProbeControllerConfig;
+use goog_cc::units::{DataRate, DataSize, Timestamp};
 use goog_cc::{GoogCcConfig, GoogCcNetworkController};
 use std::time::{Duration, Instant};
 
@@ -162,24 +161,14 @@ impl GoogCcDriver {
     /// will never work through while the rates still describe the link.
     const MAX_PENDING_PROBE_REQUESTS: usize = 4;
 
+    /// goog_cc is never given a `NetworkStateEstimate` (the model controller
+    /// feeds no capacity hint), so `ProbeController::time_for_network_state_probe`
+    /// returns false at its first check: every network-state path needs one.
+    /// The defaults would keep it quiet anyway: `network_state_interval` is
+    /// infinite and `est_lower_than_network_ratio` is 0 (its 3 s interval is
+    /// unreachable). Headroom is looked for by the t=0 ladder, the repeated
+    /// initial probes and ALR probing.
     pub(crate) fn new(initial_bps: u64, now: Instant) -> Self {
-        Self::with_network_state_probing(initial_bps, now, true)
-    }
-
-    /// `network_state_probing` is whether the controller may probe on a
-    /// `NetworkStateEstimate` (the transport capacity hint). The model
-    /// controller feeds none, so it turns the probes that depend on one off
-    /// and the intervals back to infinite, goog_cc's default.
-    pub(crate) fn with_network_state_probing(
-        initial_bps: u64,
-        now: Instant,
-        network_state_probing: bool,
-    ) -> Self {
-        let (network_state_interval, est_lower_than_network_interval) = if network_state_probing {
-            (TimeDelta::from_seconds(5), TimeDelta::from_seconds(3))
-        } else {
-            (TimeDelta::plus_infinity(), TimeDelta::plus_infinity())
-        };
         let at_time = Timestamp::from_millis(0);
         let cfg = NetworkControllerConfig {
             constraints: TargetRateConstraints {
@@ -222,27 +211,7 @@ impl GoogCcDriver {
                 enable_repeated_initial_probing: Some(true),
                 ..Default::default()
             },
-            field_trials: FieldTrials {
-                probing_configuration: ProbeControllerConfig {
-                    // Both default to `plus_infinity()`, which disables
-                    // `ProbeController::time_for_network_state_probe`
-                    // outright — it returns `false` before even looking at
-                    // the estimate. Finite intervals are what let a fed
-                    // `NetworkStateEstimate` actually trigger a probe.
-                    //
-                    // `network_state_interval` paces the "estimate is below
-                    // the link's known ceiling, go look" probe.
-                    // `est_lower_than_network_interval` paces the more
-                    // urgent case where the estimate is *far* below it
-                    // (`est_lower_than_network_ratio`, default 0.85) and the
-                    // limit is delay-based rather than loss-based — which is
-                    // exactly the post-capacity-increase situation.
-                    network_state_interval,
-                    est_lower_than_network_interval,
-                    ..ProbeControllerConfig::default()
-                },
-                ..FieldTrials::default()
-            },
+            field_trials: FieldTrials::default(),
         };
         let mut ctl = GoogCcNetworkController::new(
             cfg,
@@ -365,7 +334,7 @@ impl GoogCcDriver {
     /// probe controller would then reason from an estimate nobody sends at.
     /// Handing it the ceiling is also the re-measurement the estimate asks
     /// for: goog_cc continues from what the path was seen to carry, and its
-    /// own probes (the controller issues them) and delay detector take it from there.
+    /// delay detector takes it from there.
     ///
     /// *Below.* With the pacer at the estimate, goog_cc's AIMD grows by one
     /// packet per round trip once it believes it is near capacity, which it

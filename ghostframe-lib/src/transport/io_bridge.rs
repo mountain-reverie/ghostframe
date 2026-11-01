@@ -1234,7 +1234,7 @@ impl IoBridge {
     }
 
     /// The model controller (D1 design A): quinn's window becomes `W(R_w)`,
-    /// the estimator is fed no capacity hint (and stops probing on one), and
+    /// the estimator is fed no capacity hint, and
     /// admission paces to `R`. Installs the controller on `server`, which must
     /// not have a connection yet: a connection keeps the controller it was
     /// built with.
@@ -1248,7 +1248,7 @@ impl IoBridge {
             settings.gain,
         );
         server.use_model_controller(cell.clone());
-        let bwe = crate::transport::bwe::BweWrapper::new_without_hint(
+        let bwe = crate::transport::bwe::BweWrapper::new(
             crate::transport::bwe::BweWrapper::INITIAL_BPS,
             now_std(),
         );
