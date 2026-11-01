@@ -895,6 +895,14 @@ impl IoBridge {
         self.h264.ignore_before = self.h264.ignore_before.max(frame_seq);
         self.supersede_h264_before(frame_seq, now);
         self.end_h264_hold(now);
+        // The rate side of H.264 lets go here too, in one place: the padding in
+        // flight is forgotten and the application's probe cadence starts over
+        // (`h264_reset_probing`), the rate policy's estimate restarts (the
+        // encoder keeps its rate), and the GOP clock is cleared (the return is
+        // an IDR, which starts it again).
+        self.h264_reset_probing();
+        self.h264.rate.reset_session();
+        self.h264.last_idr_at = None;
     }
 
     /// Route the loss verdicts of a pass of the loss path to the H.264 policy.

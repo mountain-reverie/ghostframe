@@ -1605,9 +1605,6 @@ impl IoBridge {
             if prev_mode == FrameMode::H264 && new_mode == FrameMode::TileCodec {
                 self.abandon_h264_inflight(seq, now);
             }
-            if new_mode == FrameMode::TileCodec {
-                self.h264_reset_probing();
-            }
             if prev_mode == FrameMode::H264
                 && new_mode == FrameMode::TileCodec
                 && self.frame_pipeline.is_some()
