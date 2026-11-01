@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use ghostframe_protocol::ack::AckEntry;
 use ghostframe_protocol::fec::decode_parity_payload;
-use ghostframe_protocol::protocol::{decode_frame_datagram, FrameHeader, NO_ACK};
+use ghostframe_protocol::protocol::{decode_frame_datagram, FrameHeader, FRAME_FLAG_PAD, NO_ACK};
 
 use crate::event::Event;
 use crate::{ClientCore, PollOutput, MAX_FRAME_FRAGMENTS, MAX_H264_ACCESS_UNIT_BYTES};
@@ -156,6 +156,25 @@ impl ClientCore {
             }
         }
 
+        // Probe padding is acknowledged (above) and nothing else: it names a
+        // frame the receiver has already seen and must not touch its assembly.
+        if !fh.is_parity() && fh.flags & FRAME_FLAG_PAD != 0 {
+            return;
+        }
+        // A P-frame fragment of a frame at or before the newest one delivered
+        // is moot: the decoder cannot go back, and a copy (a retransmission
+        // that crossed its acknowledgement) of a single-fragment P frame would
+        // complete it a second time and be decoded again. An IDR is judged
+        // when it completes (below), because its late fragments are kept on
+        // purpose (`IDR_EXEMPT_US`).
+        if !fh.is_parity()
+            && !fh.is_keyframe()
+            && self
+                .last_delivered_frame_seq
+                .is_some_and(|last| fh.frame_seq <= last)
+        {
+            return;
+        }
         // Drop datagrams for frames older than the eviction window, except the
         // fragments of an IDR that may still complete (see `IDR_EXEMPT_US`).
         if fh.frame_seq < self.latest_full_frame_seq.saturating_sub(2)

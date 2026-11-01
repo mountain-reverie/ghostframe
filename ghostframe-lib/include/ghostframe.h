@@ -325,6 +325,14 @@
 #define FRAME_FLAG_TARGET_IS_LT 8
 
 /**
+ * Frame flag bit 4: this datagram is probe padding, a copy of a fragment the
+ * receiver already acknowledged, sent to fill a bandwidth-probe cluster. The
+ * receiver acknowledges it (that is the measurement) and discards it without
+ * touching any frame assembly.
+ */
+#define FRAME_FLAG_PAD 16
+
+/**
  * Envelope discriminator byte for the tile-FEC parity datagram.
  */
 #define TILE_PARITY_ENVELOPE 4
