@@ -11,7 +11,7 @@ export class FullFrameDecoder {
    * chunks that follow cannot be decoded without the reference they lost. Until
    * the next key chunk, drop deltas; on it, build a fresh decoder. The server
    * has no keyframe-request message, so this waits for its natural keyframe
-   * (every FULL_FRAME_GOP = 11 frames while H.264 is streaming).
+   * (every GOP, 3 s by default, while H.264 is streaming).
    */
   private awaitingKeyframe = false;
 

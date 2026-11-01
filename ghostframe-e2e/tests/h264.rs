@@ -246,6 +246,24 @@ async fn h264_frames_from_the_server_render_into_the_dmabuf() {
          server logs:\n{server_logs}"
     );
 
+    // The encoder was opened for constant bit rate with the 3 s GOP (180
+    // frames at the encoder's 60 fps; `GHOSTFRAME_H264_GOP_SECONDS` unset),
+    // not the old CQP stream with an IDR every 11 frames. The decode above
+    // therefore rests on the session's IDR and the P frames chained from it:
+    // there is no periodic IDR within the first 3 s to rescue a missed one.
+    // The bit rate is whatever the estimate gave at the first frame, so only
+    // its presence is asserted.
+    assert!(
+        server_logs.contains("FullFrameEncoder: using h264_vaapi hardware encoder (CBR)")
+            || server_logs.contains("FullFrameEncoder: using libx264 software encoder (CBR)"),
+        "the full-frame encoder was not opened with the CBR parameters. server logs:\n{server_logs}"
+    );
+    assert!(
+        server_logs.contains("gop_frames=180") && server_logs.contains("bps="),
+        "the encoder's open line does not show the 3 s GOP (gop_frames=180) and a bit rate. \
+         server logs:\n{server_logs}"
+    );
+
     // H.264 is lossy, so this test asserts non-flatness rather than exact
     // values -- a strictly weaker claim than "the frame is structurally
     // correct". It rules out an all-black or all-constant frame (a broken

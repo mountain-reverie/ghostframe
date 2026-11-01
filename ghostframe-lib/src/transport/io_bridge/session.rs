@@ -199,7 +199,7 @@ impl IoBridge {
         // gets a fresh anchor. Without this, a client connecting
         // mid-stream may receive P-frames referencing GOPs from
         // the prior session and decode garbage until the next
-        // natural keyframe (~10 frames later at GOP=11). The
+        // natural keyframe (up to a GOP, 3 s by default, later). The
         // first-time-only escape (lazy `FullFrameEncoder::new`
         // with pts=0 → IDR) only covers cold start.
         self.request_h264_idr(IdrCause::Session, std::time::Instant::now());
