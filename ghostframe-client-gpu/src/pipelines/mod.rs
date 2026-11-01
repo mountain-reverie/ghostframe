@@ -10,4 +10,5 @@ pub mod cdf53_passes;
 pub mod h264_nv12;
 pub mod palrle;
 pub mod rgba;
+pub mod rgba_slab;
 pub mod solid;

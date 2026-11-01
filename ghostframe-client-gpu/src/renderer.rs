@@ -14,8 +14,10 @@ use crate::paint_order::SeqLedger;
 use crate::pipelines::cdf53::{Cdf53PassEntry, Cdf53Pipeline};
 use crate::pipelines::palrle::PalRlePipeline;
 use crate::pipelines::rgba::RgbaPipeline;
+use crate::pipelines::rgba_slab::{RgbaSlabPipeline, SlabWork};
 use crate::pipelines::solid::SolidPipeline;
 use crate::ring::{ExportRing, PublishedFrame};
+use crate::upload_pool::{SlotRef, UploadPool};
 use crate::wgpu_ctx::WgpuContext;
 use crate::GpuError;
 
@@ -33,6 +35,14 @@ fn dimensions_valid(width: u32, height: u32) -> bool {
 
 fn tile_grid(width: u32, height: u32) -> (u32, u32) {
     (width.div_ceil(TILE_SIZE), height.div_ceil(TILE_SIZE))
+}
+
+/// Where one buffered `TileReady` tile's pixels are.
+enum RgbaSrc {
+    /// Owned bytes, to be staged and copied at flush.
+    Pixels(Vec<u8>),
+    /// A slot of an upload slab the decode thread already wrote.
+    Slot(SlotRef),
 }
 
 /// Upper bound on [`GpuDecodeError`]s held between two drains.
@@ -186,6 +196,9 @@ pub struct Renderer {
     solid: SolidPipeline,
     palrle: PalRlePipeline,
     rgba: RgbaPipeline,
+    /// The slab-sourced twin of `rgba`; `Some` once a pool is attached.
+    rgba_slab: Option<RgbaSlabPipeline>,
+    upload_pool: Option<UploadPool>,
     cdf53: Cdf53Pipeline,
 
     /// Every pending stateless entry carries the `frame_seq` it came from
@@ -195,7 +208,7 @@ pub struct Renderer {
     pending_palrle: Vec<(u32, u8, u8, u8, u8, Vec<u8>)>,
     pending_cdf53: Vec<Cdf53PassEntry>,
     /// `TileReady` tiles awaiting upload, batched by [`Renderer::flush`].
-    pending_rgba: Vec<(u32, u8, u8, Vec<u8>)>,
+    pending_rgba: Vec<(u32, u8, u8, RgbaSrc)>,
     batch_seq: SeqLedger,
     /// Staging for `TileReady` pixel uploads; see [`UploadStaging`].
     upload_staging: UploadStaging,
@@ -267,6 +280,24 @@ pub struct Renderer {
     /// disagreement does not burst-log once per frame at 60fps. Cleared as
     /// soon as a frame's size agrees with the framebuffer again.
     h264_size_mismatch_logged: bool,
+}
+
+impl Drop for Renderer {
+    /// Slots buffered but never flushed were issued by the decode thread and
+    /// will never be drawn; without this their slabs would stay held for the
+    /// life of the pool, which outlives a replaced renderer.
+    fn drop(&mut self) {
+        let Some(pool) = &self.upload_pool else {
+            return;
+        };
+        let mut counts = vec![0u32; pool.slab_count()];
+        for (_, _, _, src) in &self.pending_rgba {
+            if let RgbaSrc::Slot(slot) = src {
+                counts[slot.slab()] += 1;
+            }
+        }
+        pool.retire_now(&counts);
+    }
 }
 
 impl Renderer {
@@ -374,6 +405,8 @@ impl Renderer {
             solid,
             palrle,
             rgba,
+            rgba_slab: None,
+            upload_pool: None,
             cdf53,
             pending_solid: Vec::new(),
             pending_palrle: Vec::new(),
@@ -425,7 +458,8 @@ impl Renderer {
                 // -- so a full 1920x1080 repaint spent 363ms just issuing 2040
                 // of them. See `upload_pending_rgba`.
                 self.batch_seq.note(tile_x, tile_y, frame_seq);
-                self.pending_rgba.push((frame_seq, tile_x, tile_y, rgba));
+                self.pending_rgba
+                    .push((frame_seq, tile_x, tile_y, RgbaSrc::Pixels(rgba)));
                 self.ring.mark_dirty(tile_x as u32, tile_y as u32);
             }
             Event::TilePayload {
@@ -495,6 +529,9 @@ impl Renderer {
                     // now rather than when each codec next draws, or the old
                     // framebuffer outlives the resize.
                     self.rgba.drop_framebuffer_cache();
+                    if let Some(p) = self.rgba_slab.as_mut() {
+                        p.drop_framebuffer_cache();
+                    }
                     self.palrle.drop_framebuffer_cache();
                     self.cdf53.drop_framebuffer_cache();
                 }
@@ -546,6 +583,46 @@ impl Renderer {
             }
         }
         Ok(())
+    }
+
+    /// Let this renderer draw tiles from `pool`'s slabs
+    /// ([`Renderer::apply_slot_tile`]). Without it such tiles are dropped.
+    ///
+    /// The pool outlives any one renderer (it belongs to the GPU context); a
+    /// renderer that is replaced retires the slots it still held when it drops.
+    pub fn attach_upload_pool(&mut self, ctx: &WgpuContext, pool: &UploadPool) {
+        self.rgba_slab = Some(RgbaSlabPipeline::new(&ctx.device, pool));
+        self.upload_pool = Some(pool.clone());
+    }
+
+    /// The slab counterpart of an `Event::TileReady`: the tile's pixels are
+    /// already in `slot`, so only its place in the paint order is recorded.
+    /// Behaves exactly as `TileReady` does for ordering, superseding and
+    /// duplicates (the later of two for one tile wins, whichever kind).
+    ///
+    /// Returns whether the renderer took the slot. When it did not (no pool
+    /// attached) the slot is the caller's to hand back with
+    /// [`UploadPool::retire_now`]; when it did, the renderer retires it.
+    #[must_use]
+    pub fn apply_slot_tile(
+        &mut self,
+        frame_seq: u32,
+        tile_x: u8,
+        tile_y: u8,
+        slot: SlotRef,
+    ) -> bool {
+        let Some(pool) = &self.upload_pool else {
+            return false;
+        };
+        debug_assert!(
+            pool.is_current(slot),
+            "slot {slot:?} arrived after its slab was recycled"
+        );
+        self.batch_seq.note(tile_x, tile_y, frame_seq);
+        self.pending_rgba
+            .push((frame_seq, tile_x, tile_y, RgbaSrc::Slot(slot)));
+        self.ring.mark_dirty(tile_x as u32, tile_y as u32);
+        true
     }
 
     /// Take the GPU-detected tile decode failures accumulated by [`flush`].
@@ -618,6 +695,12 @@ impl Renderer {
         publish: bool,
     ) -> Result<Option<PublishedFrame>, GpuError> {
         let submits_before = crate::submit::count();
+        if self.upload_pool.is_some() {
+            // Fires the completion callbacks of earlier submits, so slots they
+            // read are retired even when nothing else polls the device (a
+            // flush that did not publish waits for nothing).
+            let _ = ctx.device.poll(wgpu::PollType::Poll);
+        }
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -651,8 +734,16 @@ impl Renderer {
             .filter(|&(seq, tx, ty, ..)| !ledger.superseded(tx, ty, seq))
             .map(|(_, tx, ty, id, n, idx)| (tx, ty, id, n, idx))
             .collect();
-        self.pending_rgba
-            .retain(|&(seq, tx, ty, _)| !ledger.superseded(tx, ty, seq));
+        // Slots of tiles dropped here never reach the GPU; they are still
+        // issued, so they are retired with the rest of the flush's.
+        let mut retired = vec![0u32; self.upload_pool.as_ref().map_or(0, |p| p.slab_count())];
+        self.pending_rgba.retain(|(seq, tx, ty, src)| {
+            let keep = !ledger.superseded(*tx, *ty, *seq);
+            if let (false, RgbaSrc::Slot(slot)) = (keep, src) {
+                retired[slot.slab()] += 1;
+            }
+            keep
+        });
         self.batch_seq.clear();
 
         recorded |= self
@@ -665,7 +756,7 @@ impl Renderer {
             &self.fb,
             &palrle_batch,
         );
-        recorded |= self.encode_pending_rgba(ctx, &mut encoder);
+        recorded |= self.encode_pending_rgba(ctx, &mut encoder, &mut retired);
 
         let plan = if publish {
             self.ring.plan_publish(&self.fb)
@@ -680,6 +771,15 @@ impl Renderer {
 
         if recorded {
             crate::submit::submit(&ctx.queue, encoder);
+        }
+        if let Some(pool) = &self.upload_pool {
+            // After the submit that may read them, or at once if there was none.
+            // Not tied to the publish wait below, which may not happen.
+            if recorded {
+                pool.retire_when_submitted_work_done(&ctx.queue, retired);
+            } else {
+                pool.retire_now(&retired);
+            }
         }
         let submits = crate::submit::count().wrapping_sub(submits_before) as u32;
         self.last_flush_submits = submits;
@@ -748,6 +848,7 @@ impl Renderer {
         &mut self,
         ctx: &WgpuContext,
         encoder: &mut wgpu::CommandEncoder,
+        retired: &mut [u32],
     ) -> bool {
         if self.pending_rgba.is_empty() {
             return false;
@@ -755,31 +856,66 @@ impl Renderer {
         let full_tile_bytes = (TILE_SIZE * TILE_SIZE * 4) as usize;
         let pending = std::mem::take(&mut self.pending_rgba);
 
+        // Every slot given to this flush is retired after it, whichever of the
+        // paths below (or none) ends up drawing it.
+        for (_, _, _, src) in &pending {
+            if let (RgbaSrc::Slot(slot), Some(pool)) = (src, &self.upload_pool) {
+                debug_assert!(
+                    pool.is_current(*slot),
+                    "slot {slot:?} was recycled before it was drawn"
+                );
+                retired[slot.slab()] += 1;
+            }
+        }
+
         // Short payloads keep the one-copy-each path; see the doc above.
-        let (full, short): (Vec<_>, Vec<_>) = pending
-            .into_iter()
-            .partition(|(_, _, _, rgba)| rgba.len() >= full_tile_bytes);
+        let short: Vec<(u8, u8, &[u8])> = pending
+            .iter()
+            .filter_map(|(_, tx, ty, src)| match src {
+                RgbaSrc::Pixels(rgba) if rgba.len() < full_tile_bytes => {
+                    Some((*tx, *ty, rgba.as_slice()))
+                }
+                RgbaSrc::Pixels(_) | RgbaSrc::Slot(_) => None,
+            })
+            .collect();
 
         // Last write wins for a tile that arrived twice in one batch, matching
-        // the per-tile path's ordering.
-        let mut by_tile: std::collections::HashMap<(u32, u32), &[u8]> =
-            std::collections::HashMap::with_capacity(full.len());
+        // the per-tile path's ordering -- across both kinds: a slab tile that
+        // follows a `Vec` tile for the same place replaces it and vice versa,
+        // so the two routes never both draw one tile and their relative
+        // order cannot matter.
         let (cols, rows) = tile_grid(self.fb.width, self.fb.height);
-        let mut grid = crate::dirty::DirtyGrid::new(cols, rows);
-        for (_, tx, ty, rgba) in &full {
-            let (tx, ty) = (*tx as u32, *ty as u32);
-            if tx >= cols || ty >= rows {
+        let mut by_tile: std::collections::HashMap<(u32, u32), &[u8]> =
+            std::collections::HashMap::with_capacity(pending.len());
+        let mut by_slot: std::collections::HashMap<(u32, u32), SlotRef> =
+            std::collections::HashMap::new();
+        for (_, tx, ty, src) in &pending {
+            let key = (*tx as u32, *ty as u32);
+            if key.0 >= cols || key.1 >= rows {
                 continue;
             }
+            match src {
+                RgbaSrc::Pixels(rgba) if rgba.len() >= full_tile_bytes => {
+                    by_slot.remove(&key);
+                    by_tile.insert(key, rgba.as_slice());
+                }
+                RgbaSrc::Slot(slot) => {
+                    by_tile.remove(&key);
+                    by_slot.insert(key, *slot);
+                }
+                RgbaSrc::Pixels(_) => {}
+            }
+        }
+        let mut grid = crate::dirty::DirtyGrid::new(cols, rows);
+        for &(tx, ty) in by_tile.keys() {
             grid.set(tx, ty);
-            by_tile.insert((tx, ty), rgba.as_slice());
         }
 
         // Every copy of the flush, in paint order (short tiles first, as
         // before), each with the pixel rectangle it covers.
         let mut copies: Vec<Copy> = Vec::new();
-        for (_, tx, ty, rgba) in &short {
-            if let Some(px) = short_tile_rect(&self.fb, *tx, *ty, rgba) {
+        for &(tx, ty, rgba) in &short {
+            if let Some(px) = short_tile_rect(&self.fb, tx, ty, rgba) {
                 copies.push(Copy {
                     px,
                     src: CopySrc::Short(rgba),
@@ -812,6 +948,23 @@ impl Renderer {
         recorded |= self
             .rgba
             .encode(&ctx.device, &ctx.queue, encoder, &self.fb, &scattered);
+
+        // The slab tiles: one dispatch per slab used.
+        if let (Some(pipeline), Some(pool)) = (self.rgba_slab.as_mut(), &self.upload_pool) {
+            let mut batches: Vec<(usize, Vec<SlabWork>)> = Vec::new();
+            for (&(tile_x, tile_y), slot) in &by_slot {
+                let work = SlabWork {
+                    tile_x,
+                    tile_y,
+                    slot: slot.index(),
+                };
+                match batches.iter_mut().find(|(slab, _)| *slab == slot.slab()) {
+                    Some((_, tiles)) => tiles.push(work),
+                    None => batches.push((slot.slab(), vec![work])),
+                }
+            }
+            recorded |= pipeline.encode(&ctx.device, &ctx.queue, encoder, &self.fb, pool, &batches);
+        }
         recorded
     }
 

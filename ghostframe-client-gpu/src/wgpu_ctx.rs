@@ -482,7 +482,10 @@ impl WgpuContext {
     ) -> Option<R> {
         // SAFETY: the borrowed instance/device must not outlive `self`, and
         // we must never destroy anything wgpu owns -- we only allocate our
-        // own images bound to memory we export.
+        // own images bound to memory we export. (One deliberate exception to
+        // "must not outlive": `upload_slab`'s `VkOwner` keeps an `ash::Device`
+        // clone past this call, and a `wgpu::Device` clone alongside it so the
+        // VkDevice stays alive for as long as that clone is used.)
         let hal_inst = unsafe { self.instance.as_hal::<wgpu_hal::api::Vulkan>() }?;
         let hal_dev = unsafe { self.device.as_hal::<wgpu_hal::api::Vulkan>() }?;
         Some(f(

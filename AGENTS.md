@@ -213,6 +213,16 @@ Env-gated, off by default:
   pass of a tile has no client-side repair: with the RTO off it stays
   unrepaired until the 30 s stuck-entry retire.
 
+- `GHOSTFRAME_NO_UPLOAD_SLABS=1` — native client only: do not create the
+  upload slabs (`ghostframe-client-gpu/src/upload_pool.rs`), so every decoded
+  tile travels as a `Vec` and is staged by the renderer, as before. For A/B
+  runs in one binary, and as the escape hatch if a driver mishandles the
+  linear texture. With `RUST_LOG=ghostframe=debug` the render thread's `1s
+  summary` shows `tile_slab` against `tile_ready` (`tile_ready_nonblack` does
+  not scan slab tiles) and an `upload pool` line gives `exhausted` (tiles that
+  fell back to a `Vec`), per-slab `(issued, consumed)` and the decode thread's
+  time inside the dma-buf sync ioctls.
+
 Tile XOR parity (k=10) is **off by default** (`TransportConfig::tile_fec`).
 `GHOSTFRAME_TILE_FEC=1` turns it back on; a browserless scene opts in with
 `RunOptions { tile_fec: true, .. }`. The client decodes parity either way, and

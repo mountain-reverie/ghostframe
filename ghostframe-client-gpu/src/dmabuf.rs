@@ -50,6 +50,8 @@ pub fn choose_modifier(supported: &[u64], preferred: &[u64]) -> Option<u64> {
 
 /// `DMA_BUF_SYNC_READ`, from `linux/dma-buf.h`.
 pub const DMA_BUF_SYNC_READ: u64 = 1 << 0;
+/// `DMA_BUF_SYNC_WRITE`, from `linux/dma-buf.h`.
+pub const DMA_BUF_SYNC_WRITE: u64 = 1 << 1;
 /// `DMA_BUF_SYNC_START`, from `linux/dma-buf.h`.
 pub const DMA_BUF_SYNC_START: u64 = 0;
 /// `DMA_BUF_SYNC_END`, from `linux/dma-buf.h`.
@@ -101,19 +103,88 @@ fn dma_buf_ioctl_sync() -> libc::Ioctl {
 /// `fd` must be a valid, open dmabuf file descriptor.
 pub unsafe fn dma_buf_sync(fd: i32, flags: u64) -> Result<(), GpuError> {
     let arg = DmaBufSync { flags };
-    // SAFETY: `fd` is a valid dmabuf fd per this function's contract;
-    // `arg` is a correctly-shaped `struct dma_buf_sync` for the ioctl's
-    // duration.
-    let ret = unsafe { libc::ioctl(fd, dma_buf_ioctl_sync(), &arg as *const DmaBufSync) };
-    if ret != 0 {
-        return Err(GpuError::Io(std::io::Error::last_os_error()));
+    // The kernel contract (linux/dma-buf.h): the ioctl "may return EINTR or
+    // EAGAIN, in which case the caller should restart it". START may wait for
+    // fences, so a signal can interrupt it.
+    loop {
+        // SAFETY: `fd` is a valid dmabuf fd per this function's contract;
+        // `arg` is a correctly-shaped `struct dma_buf_sync` for the ioctl's
+        // duration.
+        let ret = unsafe { libc::ioctl(fd, dma_buf_ioctl_sync(), &arg as *const DmaBufSync) };
+        if ret == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if matches!(err.raw_os_error(), Some(libc::EINTR) | Some(libc::EAGAIN)) {
+            continue;
+        }
+        return Err(GpuError::Io(err));
     }
-    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Which exporters need the CPU-access bracket
+// ---------------------------------------------------------------------------
+
+/// The kernel DRM driver behind a render-node (or any DRM) fd, from sysfs
+/// (`/sys/dev/char/<major>:<minor>/device/driver`). `None` if it cannot be
+/// read; callers must then assume the driver needs the ioctls.
+pub fn drm_driver_name(fd: i32) -> Option<String> {
+    // SAFETY: `st` is written by fstat before it is read; `fd` is a valid fd
+    // per the caller (a failing fstat is handled).
+    let rdev = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) != 0 {
+            return None;
+        }
+        st.st_rdev
+    };
+    let link = std::fs::read_link(format!(
+        "/sys/dev/char/{}:{}/device/driver",
+        libc::major(rdev),
+        libc::minor(rdev)
+    ))
+    .ok()?;
+    link.file_name()?.to_str().map(str::to_owned)
+}
+
+/// Whether `DMA_BUF_IOCTL_SYNC` can be skipped around CPU writes into a buffer
+/// exported by `driver`.
+///
+/// The dma-buf core keeps no START/END pairing: each ioctl just calls the
+/// exporter's `begin_cpu_access`/`end_cpu_access` hook, if it has one. The
+/// panfrost and panthor exporters (`drm_gem_prime_dmabuf_ops`) have none, so
+/// there END does nothing and START only waits for the buffer's fences -- which
+/// stalls the decode thread behind GPU jobs that are merely *reading* other
+/// slots of the slab (1.4-5 ms a window, measured on a Mali-T860). What makes
+/// the writes visible there is the write-combined CPU mapping plus the barriers
+/// the kernel puts around job submission, not the ioctls.
+///
+/// Any other driver may implement the hooks (an i915 non-LLC exporter flushes
+/// CPU caches in END, so skipping it would leave stale lines), so it is an
+/// allowlist: unknown or unreadable means keep the ioctls.
+pub fn cpu_access_hooks_are_noops(driver: Option<&str>) -> bool {
+    matches!(driver, Some("panfrost" | "panthor"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_exporters_known_to_have_no_cpu_access_hooks_skip_the_ioctls() {
+        assert!(cpu_access_hooks_are_noops(Some("panfrost")));
+        assert!(cpu_access_hooks_are_noops(Some("panthor")));
+        for other in [
+            "i915", "amdgpu", "xe", "radeon", "nouveau", "vc4", "msm", "",
+        ] {
+            assert!(!cpu_access_hooks_are_noops(Some(other)), "{other}");
+        }
+        assert!(
+            !cpu_access_hooks_are_noops(None),
+            "unknown keeps the ioctls"
+        );
+    }
 
     #[test]
     fn empty_preference_prefers_linear() {
