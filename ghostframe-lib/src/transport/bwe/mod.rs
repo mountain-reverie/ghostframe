@@ -19,6 +19,7 @@
 use std::time::{Duration, Instant};
 
 mod ceiling;
+pub(crate) use ceiling::SATURATION;
 mod googcc;
 #[cfg(test)]
 mod react_replay;

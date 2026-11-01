@@ -45,6 +45,7 @@ fn load(idr_bytes: usize, p_bytes: usize) -> H264Load {
         width: 1280,
         height: 720,
         quiet: None,
+        cbr: None,
     }
 }
 

@@ -7747,6 +7747,40 @@ async fn a_frame_is_encoded_once_the_idr_is_acknowledged() {
     assert!(log_has(&log, "finish_h264 force_keyframe=false"));
 }
 
+/// The production path hands the encoder its rate before the frame it
+/// encodes: the controls ride with the finish message, which applies them
+/// first. Without it the encoder would open at its built-in default.
+#[tokio::test]
+async fn the_encoder_is_told_its_rate_before_the_first_frame_it_encodes() {
+    let (mut bridge, inflight, log, _peer) = h264_arm_with_idr_out().await;
+    bridge.h264.pending_idr = Some(IdrCause::Session);
+    bridge.finish_h264_arm(
+        inflight,
+        FinishAction::H264 {
+            force_keyframe: false,
+        },
+        Default::default(),
+    );
+    let msg = next_worker_message(&mut bridge).await.expect("finished");
+    assert!(matches!(msg, FromWorker::H264Done { .. }));
+    let log = log.lock().unwrap().clone();
+    let rate = log
+        .iter()
+        .position(|l| l.starts_with("apply H264Rate"))
+        .unwrap_or_else(|| panic!("no rate control sent: {log:?}"));
+    let finish = log
+        .iter()
+        .position(|l| l.starts_with("finish_h264"))
+        .expect("encoded");
+    assert!(rate < finish, "{log:?}");
+    assert!(log[rate].contains("reopen: false"), "{log:?}");
+    assert!(
+        log[rate].contains(&format!("gop_frames: {}", bridge.h264.gop_frames)),
+        "{log:?}"
+    );
+    assert!(bridge.h264.stats.rate_target_bps >= super::h264_rate::RATE_FLOOR_BPS);
+}
+
 /// Back from the tile codec the client has no H.264 anchor, so the frame is an
 /// IDR and runs past the hold; the demand is named even though the encoder is
 /// told to force it itself.
