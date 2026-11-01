@@ -2882,6 +2882,7 @@ async fn frame_captured_event_format() {
 
     // Install a JSON subscriber that only passes ghostframe::bench=info.
     // `set_default` returns a guard; drop it at the end of the test.
+    let _pin = crate::tracing_test_support::pin_dispatcher_registry();
     let _g = tracing_subscriber::fmt()
         .json()
         .with_writer(writer)
@@ -2962,6 +2963,7 @@ async fn frame_last_send_event_format() {
     let writer = CapturingWriter(Arc::clone(&buf));
 
     // Install a JSON subscriber that only passes ghostframe::bench=info.
+    let _pin = crate::tracing_test_support::pin_dispatcher_registry();
     let _g = tracing_subscriber::fmt()
         .json()
         .with_writer(writer)
@@ -5470,6 +5472,7 @@ async fn enqueue_cdf53_generation_source_selects_counter_and_log_label() {
     }
 
     let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let _pin = crate::tracing_test_support::pin_dispatcher_registry();
     let _g = tracing_subscriber::fmt()
         .json()
         .with_writer(CapturingWriter(Arc::clone(&buf)))
@@ -5546,6 +5549,7 @@ async fn ack_batch_received_is_a_trace_event() {
     };
     let wire = batch.encode();
 
+    let _pin = crate::tracing_test_support::pin_dispatcher_registry();
     let mut bridge = make_bridge_for_test().await;
     let captured = |max: tracing::Level, bridge: &mut IoBridge| {
         let sink = Sink::default();

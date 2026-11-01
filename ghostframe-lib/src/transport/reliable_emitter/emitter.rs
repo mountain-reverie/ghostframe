@@ -2457,6 +2457,7 @@ mod tests {
             );
         }
 
+        let _pin = crate::tracing_test_support::pin_dispatcher_registry();
         // Nobody listening: no fingerprint.
         FP_COMPUTED.with(|c| c.set(0));
         tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
