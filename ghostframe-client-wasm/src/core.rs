@@ -36,6 +36,9 @@ impl WasmClientCore {
         let config = ClientConfig {
             indices_raw_enabled,
             supports_h264,
+            // The browser does not send the v2 H.264 feedback (HELLO bit 2) in
+            // A2; H.264 itself is gated by `supports_h264` alone.
+            h264_acked_ref: false,
             tile_delivery: if tile_delivery_payload {
                 TileDelivery::Payload
             } else {

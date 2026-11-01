@@ -31,6 +31,7 @@ mod reassembly;
 pub mod wire_loss;
 pub use cdf53_coverage::CoverageEntry;
 pub use event::{DecodeErrorCode, Event, PollOutput, TileData, TileKey};
+pub use ghostframe_protocol::feedback_stream::ResetReason;
 pub use wire_loss::WireLossStats;
 
 use std::collections::{HashMap, VecDeque};
@@ -125,6 +126,11 @@ pub enum TileDelivery {
 pub struct ClientConfig {
     pub indices_raw_enabled: bool,
     pub supports_h264: bool,
+    /// The client sends the v2 H.264 feedback (reset requests; frame acks in
+    /// later phases): advertised as HELLO bit 2. It does not gate H.264 --
+    /// `supports_h264` does. Defaults to `false`; the web client does not set
+    /// it yet.
+    pub h264_acked_ref: bool,
     /// See [`TileDelivery`]. Defaults to `Decoded`.
     pub tile_delivery: TileDelivery,
     /// What the client knows about its own display. `None` if the client
@@ -227,11 +233,13 @@ impl ClientCore {
         };
 
         // Construct the Hello message [0x03, caps]
-        // bit0 = indices_raw_enabled, bit1 = supports_h264
+        // bit0 = indices_raw_enabled, bit1 = supports_h264,
+        // bit2 = h264_acked_ref
         core.outbox
             .push_back(PollOutput::Stream(loss_tracker::encode_hello(
                 config.indices_raw_enabled,
                 config.supports_h264,
+                config.h264_acked_ref,
             )));
 
         if let Some(display) = config.display {
@@ -255,6 +263,16 @@ impl ClientCore {
         self.outbox
             .push_back(PollOutput::Stream(loss_tracker::encode_display_mode(
                 width, height,
+            )));
+    }
+
+    /// Ask the server for a fresh IDR (feedback stream 0x09). `frame_seq` is
+    /// the frame the client was handling when it gave up. The server
+    /// rate-limits these, so repeating one is harmless but wasteful.
+    pub fn request_reset(&mut self, reason: ResetReason, frame_seq: u32) {
+        self.outbox
+            .push_back(PollOutput::Stream(loss_tracker::encode_reset_request(
+                reason, frame_seq,
             )));
     }
 

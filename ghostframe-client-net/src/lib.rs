@@ -178,6 +178,9 @@ impl ClientNet {
             ClientConfig {
                 indices_raw_enabled: config.indices_raw_enabled,
                 supports_h264: config.supports_h264,
+                // This client reads the v2 frame header and sends reset
+                // requests, so it asks for H.264 whenever it can decode it.
+                h264_acked_ref: config.supports_h264,
                 display: config.display,
                 ..Default::default()
             },
@@ -616,6 +619,19 @@ impl ClientNet {
             return;
         }
         self.pending_stream_out.push(bytes);
+        self.drain_connection_events(now_us);
+    }
+
+    /// Ask the server for a fresh IDR (feedback stream 0x09); see
+    /// `ClientCore::request_reset`. Queued in the core's outbox like
+    /// `request_display_mode`, so it waits there until the session is ready.
+    pub fn request_reset(
+        &mut self,
+        reason: ghostframe_client_core::ResetReason,
+        frame_seq: u32,
+        now_us: u64,
+    ) {
+        self.core.request_reset(reason, frame_seq);
         self.drain_connection_events(now_us);
     }
 

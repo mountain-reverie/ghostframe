@@ -3,7 +3,10 @@
 //! (`now_us: u64`) instead of using `performance.now()`.
 
 use ghostframe_protocol::feedback::ReceiverFeedback;
-use ghostframe_protocol::feedback_stream::{HELLO_CAP_INDICES_RAW, HELLO_CAP_SUPPORTS_H264};
+use ghostframe_protocol::feedback_stream::{
+    ResetReason, ResetRequest, HELLO_CAP_H264_ACKED_REF, HELLO_CAP_INDICES_RAW,
+    HELLO_CAP_SUPPORTS_H264, RESET_REQUEST_SIZE,
+};
 
 /// Suspension threshold: how much longer a datagram may take to arrive
 /// after its predecessor than the sender spaced them, before the difference
@@ -131,8 +134,9 @@ impl Default for LossTracker {
 }
 
 /// Encode a Hello capability-advertisement message: `[0x03, caps]`.
-/// bit0 = indices_raw, bit1 = h264.
-pub fn encode_hello(indices_raw: bool, supports_h264: bool) -> Vec<u8> {
+/// bit0 = indices_raw, bit1 = h264, bit2 = sends the v2 H.264 feedback (reset
+/// requests; it does not gate H.264, bit1 does).
+pub fn encode_hello(indices_raw: bool, supports_h264: bool, h264_acked_ref: bool) -> Vec<u8> {
     let mut caps = 0u8;
     if indices_raw {
         caps |= HELLO_CAP_INDICES_RAW;
@@ -140,7 +144,18 @@ pub fn encode_hello(indices_raw: bool, supports_h264: bool) -> Vec<u8> {
     if supports_h264 {
         caps |= HELLO_CAP_SUPPORTS_H264;
     }
+    if h264_acked_ref {
+        caps |= HELLO_CAP_H264_ACKED_REF;
+    }
     vec![HELLO_MSG_TYPE, caps]
+}
+
+/// Encode a reset request (feedback stream 0x09): the client asks the server
+/// for a fresh IDR. See [`ghostframe_protocol::feedback_stream::ResetRequest`].
+pub fn encode_reset_request(reason: ResetReason, frame_seq: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(RESET_REQUEST_SIZE);
+    ResetRequest { reason, frame_seq }.encode(&mut buf);
+    buf
 }
 
 /// DisplayInfo message type. Defined once in
