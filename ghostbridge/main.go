@@ -15,6 +15,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"regexp"
 	"strconv"
@@ -216,14 +217,11 @@ func gbridge_dial_udp(sd C.int32_t, cRemote *C.char, fdOut *C.int32_t) C.gbridge
 		return -1
 	}
 	remote := C.GoString(cRemote)
-	log.Printf("ghostbridge: dialing udp %q", remote)
 	// tsnet.Server.Dial returns a net.Conn; for UDP it wraps the packet conn.
-	netConn, err := h.server.Dial(context.Background(), "udp", remote)
+	netConn, err := h.dialPeer("udp", remote)
 	if err != nil {
-		log.Printf("ghostbridge: dial udp %q failed: %v", remote, err)
 		return -3
 	}
-	log.Printf("ghostbridge: dial udp %q succeeded, remote=%s local=%s", remote, netConn.RemoteAddr(), netConn.LocalAddr())
 	// Wrap as PacketConn-like: reads come from this one peer, writes go to it.
 	pc := &dialedPacketConn{Conn: netConn}
 	goFd, cFd, err := makeSocketpair()
@@ -243,10 +241,8 @@ func gbridge_dial_tcp(sd C.int32_t, cRemote *C.char, fdOut *C.int32_t) C.gbridge
 		return -1
 	}
 	remote := C.GoString(cRemote)
-	log.Printf("ghostbridge: dialing tcp %q", remote)
-	netConn, err := h.server.Dial(context.Background(), "tcp", remote)
+	netConn, err := h.dialPeer("tcp", remote)
 	if err != nil {
-		log.Printf("ghostbridge: dial tcp %q failed: %v", remote, err)
 		return -3
 	}
 	goFd, cFd, err := makeSocketpair()
@@ -692,6 +688,36 @@ func gbridge_getips(sd C.int32_t, cBuf *C.char, cBufLen C.size_t) C.gbridge_stat
 	copy(dst, s)
 	dst[len(s)] = 0
 	return 0
+}
+
+// dialPeer dials remote through this node once the destination is a known
+// tailnet peer, by its tailnet IP. See awaitPeerAddr for why a plain
+// h.server.Dial right after Up is not enough. Logs the outcome either way.
+func (h *serverHandle) dialPeer(network, remote string) (net.Conn, error) {
+	log.Printf("ghostbridge: dialing %s %q", network, remote)
+	lc, err := h.server.LocalClient()
+	if err != nil {
+		log.Printf("ghostbridge: dial %s %q failed: %v", network, remote, err)
+		return nil, err
+	}
+	start := time.Now()
+	addr, err := awaitPeerAddr(context.Background(), lc.Status, remote, peerWaitTimeout, peerPollInterval)
+	if err != nil {
+		log.Printf("ghostbridge: dial %s %q failed: %v", network, remote, err)
+		return nil, err
+	}
+	conn, err := h.server.Dial(context.Background(), network, addr)
+	if err != nil {
+		log.Printf("ghostbridge: dial %s %q (%s) failed: %v", network, remote, addr, err)
+		return nil, err
+	}
+	log.Printf("ghostbridge: dial %s %q succeeded, remote=%s local=%s peer_wait=%v",
+		network, remote, conn.RemoteAddr(), conn.LocalAddr(), time.Since(start).Round(time.Millisecond))
+	v4, v6 := h.server.TailscaleIPs()
+	if !isLocalTailnetAddr(conn.LocalAddr(), []netip.Addr{v4, v6}) {
+		log.Printf("ghostbridge: WARNING: dial %s %q left through the host network (local=%s), not this tailnet node", network, remote, conn.LocalAddr())
+	}
+	return conn, nil
 }
 
 func lookup(sd int32) *serverHandle {
