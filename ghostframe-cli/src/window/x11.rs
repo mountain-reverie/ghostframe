@@ -109,6 +109,10 @@ atom_manager! {
 /// constant by x11rb (its `properties` module only surfaces the enum used
 /// for reading `WM_HINTS`, not the raw wire value this client message
 /// needs), so it's spelled out here with its source.
+/// Bound on `X11Backend::present_sent`. Completions normally arrive within a
+/// frame or two; this only stops the map growing if they never do.
+const PRESENT_TIMING_CAP: usize = 64;
+
 const ICCCM_ICONIC_STATE: u32 = 3;
 
 /// EWMH `_NET_WM_STATE` client message `source_indication`/`action` values
@@ -295,6 +299,12 @@ pub struct X11Backend {
     /// reported idle. Keyed on serial because `PresentIdleNotify` carries it
     /// and a pixmap can be presented more than once.
     presented: HashMap<u32, u32>,
+    /// `present` serial -> when `present_pixmap` was sent, answered by
+    /// `PresentCompleteNotify`. Diagnostic only: the debug log of how long the
+    /// X server (vblank wait, copy) took to put a frame on screen -- the one
+    /// leg of input-to-photon latency nothing else measures. Bounded by
+    /// [`PRESENT_TIMING_CAP`] in case completions stop arriving.
+    present_sent: HashMap<u32, std::time::Instant>,
     /// Frames the server has finished with, drained by `take_idle_frames`.
     idle_frames: Vec<u32>,
     /// Tracked from this window's own key events, so it misses every key
@@ -432,8 +442,12 @@ impl X11Backend {
             .generate_id()
             .map_err(|e| WindowError::X11(format!("generate_id (present eid): {e}")))?;
 
-        conn.present_select_input(present_eid, window, present::EventMask::IDLE_NOTIFY)
-            .map_err(|e| WindowError::X11(format!("present_select_input: {e}")))?;
+        conn.present_select_input(
+            present_eid,
+            window,
+            present::EventMask::IDLE_NOTIFY | present::EventMask::COMPLETE_NOTIFY,
+        )
+        .map_err(|e| WindowError::X11(format!("present_select_input: {e}")))?;
 
         conn.map_window(window)
             .map_err(|e| WindowError::X11(format!("map_window: {e}")))?;
@@ -517,6 +531,7 @@ impl X11Backend {
             next_serial: 0,
             last_geom_logged: None,
             presented: HashMap::new(),
+            present_sent: HashMap::new(),
             idle_frames: Vec::new(),
             xkb_state,
             xkb_device_id,
@@ -714,6 +729,11 @@ impl Backend for X11Backend {
 
         self.next_serial = self.next_serial.wrapping_add(1);
         self.presented.insert(self.next_serial, frame.frame_id);
+        if self.present_sent.len() >= PRESENT_TIMING_CAP {
+            self.present_sent.clear();
+        }
+        self.present_sent
+            .insert(self.next_serial, std::time::Instant::now());
         self.conn
             .present_pixmap(
                 self.window,
@@ -762,6 +782,20 @@ impl Backend for X11Backend {
             .map_err(|e| WindowError::X11(format!("polling for events: {e}")))?
         {
             match event {
+                Event::PresentCompleteNotify(ev) => {
+                    if let Some(sent) = self.present_sent.remove(&ev.serial) {
+                        let complete_us = std::time::Instant::now()
+                            .saturating_duration_since(sent)
+                            .as_micros() as u64;
+                        tracing::debug!(
+                            serial = ev.serial,
+                            complete_us,
+                            mode = ?ev.mode,
+                            msc = ev.msc,
+                            "present complete"
+                        );
+                    }
+                }
                 Event::PresentIdleNotify(ev) => {
                     // The server is done reading the pixmap for this present.
                     // Only now is the export buffer ours to overwrite.
