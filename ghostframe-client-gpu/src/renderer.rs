@@ -139,11 +139,16 @@ pub struct Renderer {
     /// the first frame; logged on every *change*, not just once ever -- see
     /// [`H264ImportPath`].
     h264_import_path: Option<H264ImportPath>,
-    /// `frame_seq` of the last access unit handed to `decode_h264`, to
-    /// detect a gap in the sequence.
+    /// `frame_seq` of the last access unit handed to `decode_h264`. For
+    /// logging only: it is the server's *capture* counter, which skips every
+    /// unchanged capture, so a jump in it says nothing about loss.
     h264_last_frame_seq: Option<u32>,
-    /// Set when a gap (or a hard decode error) means the decoder may be
-    /// holding state built on references that will never arrive. Cleared by
+    /// Detects a lost reference picture from the stream's own `frame_num`.
+    /// See [`ghostframe_client_h264::bitstream`].
+    h264_continuity: ghostframe_client_h264::bitstream::RefContinuity,
+    /// Set when a lost reference picture (or a hard decode error) means the
+    /// decoder may be holding state built on references that will never
+    /// arrive. Cleared by
     /// `reset()` at the next keyframe -- an IDR needs no prior reference,
     /// but the decoder itself does not know that until told: ffmpeg's H.264
     /// decoder does not error on missing references, it conceals, silently
@@ -278,6 +283,7 @@ impl Renderer {
             h264_unavailable,
             h264_import_path: None,
             h264_last_frame_seq: None,
+            h264_continuity: ghostframe_client_h264::bitstream::RefContinuity::new(),
             h264_needs_reset: false,
             recovery: H264Recovery::default(),
             h264_size_mismatch_logged: false,
@@ -732,8 +738,8 @@ impl Renderer {
     ///
     /// Failures are logged, never fatal: a corrupt access unit (FEC failed
     /// to recover one) must not take down the session. "The next keyframe
-    /// recovers" is made true here, not just asserted: a gap in `frame_seq`
-    /// (or a hard decode error) sets [`Renderer::h264_needs_reset`], and the
+    /// recovers" is made true here, not just asserted: a lost reference
+    /// picture (or a hard decode error) sets [`Renderer::h264_needs_reset`], and the
     /// first keyframe after that resets the decoder before it is decoded --
     /// see that field's doc for why an IDR alone does not already guarantee
     /// this.
@@ -801,15 +807,21 @@ impl Renderer {
 
         let decoder = self.h264_decoder.as_mut().expect("just created");
 
-        // Detect a gap in the access-unit sequence. `frame_assembly.rs`
-        // evicts an incomplete reassembly older than `latest-2` with no gap
-        // signal, so a jump in `frame_seq` is the only trace of it here.
-        if let Some(prev) = self.h264_last_frame_seq {
-            if frame_seq != prev.wrapping_add(1) && !self.h264_needs_reset {
+        // Detect a lost reference picture. `frame_assembly.rs` evicts an
+        // incomplete reassembly older than `latest-2` with no signal, and a
+        // jump in `frame_seq` cannot stand in for one: the server skips
+        // unchanged captures, so it jumps on nearly every access unit. Judged
+        // that way, every keyframe reset the decoder, discarding whatever
+        // frames the pipeline still held. The stream's `frame_num` is exact.
+        if let ghostframe_client_h264::bitstream::Continuity::Gap { expected, got } =
+            self.h264_continuity.observe(au)
+        {
+            if !self.h264_needs_reset {
                 tracing::warn!(
                     frame_seq,
-                    prev_frame_seq = prev,
-                    "H.264 access unit gap detected; decoder will reset at the next keyframe"
+                    expected_frame_num = expected,
+                    frame_num = got,
+                    "H.264 reference picture lost; decoder will reset at the next keyframe"
                 );
                 self.h264_needs_reset = true;
             }
