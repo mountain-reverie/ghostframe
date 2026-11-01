@@ -99,7 +99,7 @@ fn replay(trace: &[Option<u64>], freeze: bool) -> Replay {
                 Transmission {
                     emit_us: i as u64 * INTERVAL_US,
                     wire_bytes: 1200,
-                    key: EmitKey::new(i, 0, 0, 0),
+                    content: EmitKey::new(i, 0, 0, 0).into(),
                     depart_us: None,
                     dep_idx: None,
                 },

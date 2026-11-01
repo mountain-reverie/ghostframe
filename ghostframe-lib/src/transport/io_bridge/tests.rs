@@ -1830,7 +1830,7 @@ async fn ack_routes_through_emitter_dropping_cache() {
             crate::transport::transmission_ledger::Transmission {
                 emit_us: e.emit_us,
                 wire_bytes: e.wire_bytes,
-                key: e.key,
+                content: e.content,
                 depart_us: None,
                 dep_idx: None,
             },
@@ -1869,12 +1869,13 @@ async fn the_classifiers_loss_rate_is_the_ledgers_verdict() {
             crate::transport::transmission_ledger::Transmission {
                 emit_us: bridge.reliable_emitter.emit_us64(now),
                 wire_bytes: 25,
-                key: crate::transport::reliable_emitter::EmitKey::new(
+                content: crate::transport::reliable_emitter::EmitKey::new(
                     wire_seq,
                     (wire_seq % 64) as u8,
                     0,
                     0,
-                ),
+                )
+                .into(),
                 depart_us: None,
                 dep_idx: None,
             },
@@ -3564,7 +3565,7 @@ async fn bwe_estimate_advances_through_bridge_production_wiring() {
                 crate::transport::transmission_ledger::Transmission {
                     emit_us: e.emit_us,
                     wire_bytes: e.wire_bytes,
-                    key: e.key,
+                    content: e.content,
                     depart_us: None,
                     dep_idx: None,
                 },
@@ -5059,7 +5060,7 @@ fn seed_unacked_entry(
             crate::transport::transmission_ledger::Transmission {
                 emit_us: e.emit_us,
                 wire_bytes: e.wire_bytes,
-                key: e.key,
+                content: e.content,
                 depart_us: None,
                 dep_idx: None,
             },
@@ -5665,7 +5666,7 @@ fn ledger_tx(
     crate::transport::transmission_ledger::Transmission {
         emit_us,
         wire_bytes: bytes,
-        key: crate::transport::reliable_emitter::EmitKey::new(frame_seq, 1, 2, 0),
+        content: crate::transport::reliable_emitter::EmitKey::new(frame_seq, 1, 2, 0).into(),
         depart_us: None,
         dep_idx: None,
     }
@@ -5962,7 +5963,7 @@ async fn bwe_sample_send_time_is_not_the_wrapped_emit_clock() {
         crate::transport::transmission_ledger::Transmission {
             emit_us: sent[0].emit_us,
             wire_bytes: sent[0].wire_bytes,
-            key: sent[0].key,
+            content: sent[0].content,
             depart_us: None,
             dep_idx: None,
         },
@@ -6017,7 +6018,7 @@ async fn pending_loss_send_time_is_not_the_wrapped_emit_clock() {
             crate::transport::transmission_ledger::Transmission {
                 emit_us: e.emit_us,
                 wire_bytes: e.wire_bytes,
-                key: e.key,
+                content: e.content,
                 depart_us: None,
                 dep_idx: None,
             },
@@ -6061,7 +6062,7 @@ async fn pre_wrap_sample_send_time_equals_the_emitted_stamp() {
         crate::transport::transmission_ledger::Transmission {
             emit_us: e.emit_us,
             wire_bytes: e.wire_bytes,
-            key: e.key,
+            content: e.content,
             depart_us: None,
             dep_idx: None,
         },
@@ -7105,7 +7106,7 @@ async fn the_probe_timeout_is_a_wake_deadline() {
             crate::transport::transmission_ledger::Transmission {
                 emit_us: e.emit_us,
                 wire_bytes: e.wire_bytes,
-                key: e.key,
+                content: e.content,
                 depart_us: None,
                 dep_idx: None,
             },

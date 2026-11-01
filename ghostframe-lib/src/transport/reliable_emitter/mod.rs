@@ -39,6 +39,34 @@ impl EmitKey {
     }
 }
 
+/// What a transmission carries, so an acknowledgement or a loss verdict can be
+/// mapped back to the thing the sender owes: a tile pass, or one fragment of an
+/// H.264 access unit. The two never share a key; code that only understands one
+/// matches on the variant rather than inventing a sentinel for the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Content {
+    /// One pass of one tile (a pass is one datagram).
+    Tile(EmitKey),
+    /// Fragment `frag_idx` of the H.264 frame `frame_seq`.
+    H264Frag { frame_seq: u32, frag_idx: u16 },
+}
+
+impl Content {
+    /// The tile pass this is, if it is one.
+    pub fn tile(self) -> Option<EmitKey> {
+        match self {
+            Content::Tile(k) => Some(k),
+            Content::H264Frag { .. } => None,
+        }
+    }
+}
+
+impl From<EmitKey> for Content {
+    fn from(k: EmitKey) -> Self {
+        Content::Tile(k)
+    }
+}
+
 // ---- Knob constants (spec §9) ----
 pub const FEC_GROUP_SIZE_K: usize = 10;
 pub const FEC_PARITY_PER_GROUP_R: usize = 1;

@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::transport::delivery_sampler::RateMark;
-use crate::transport::reliable_emitter::EmitKey;
+use crate::transport::reliable_emitter::Content;
 
 /// What was sent, and what it was sent for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,8 +26,9 @@ pub struct Transmission {
     /// header — so the estimator sees the epoch its other inputs use.
     pub emit_us: u64,
     pub wire_bytes: usize,
-    /// Content identity, for the consumers that still think in tile-passes.
-    pub key: EmitKey,
+    /// What this transmission carried: a tile pass or an H.264 fragment. The
+    /// consumers that think in tile passes read [`Content::tile`].
+    pub content: Content,
     /// The emitter-clock microseconds (the clock `emit_us` is on) at which
     /// this transmission left quinn's FIFO for the wire. `None` while it is
     /// still queued, in the emitter or in quinn. `emit_us` is when it was
@@ -834,6 +835,7 @@ impl TransmissionLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::reliable_emitter::EmitKey;
     use std::time::Duration;
 
     const MS: Duration = Duration::from_millis(1);
@@ -844,7 +846,7 @@ mod tests {
         Transmission {
             emit_us: n as u64 * 1000,
             wire_bytes: 1200,
-            key: EmitKey::new(n, 0, 0, 0),
+            content: Content::Tile(EmitKey::new(n, 0, 0, 0)),
             depart_us: None,
             dep_idx: None,
         }
@@ -1014,7 +1016,7 @@ mod tests {
         assert!(l.resolve(4).is_some());
         assert_eq!(l.detect_losses(FAR).len(), 2);
         assert!(
-            matches!(l.resolve(0), Some(Resolution::Late { tx: t, .. }) if t.key == EmitKey::new(0, 0, 0, 0))
+            matches!(l.resolve(0), Some(Resolution::Late { tx: t, .. }) if t.content == Content::Tile(EmitKey::new(0, 0, 0, 0)))
         );
         assert_eq!(l.stats().acked_after_declared_lost, 1);
         assert_eq!(l.stats().spurious_losses, 1);
@@ -1352,8 +1354,8 @@ mod tests {
         let mut l = TransmissionLedger::new(64);
         send(&mut l, 1, t0);
         assert_eq!(
-            l.declare_lost_by_pto(1).map(|t| t.key),
-            Some(EmitKey::new(1, 0, 0, 0))
+            l.declare_lost_by_pto(1).map(|t| t.content),
+            Some(Content::Tile(EmitKey::new(1, 0, 0, 0)))
         );
         assert_eq!(l.stats().lost_pto, 1);
         assert!(l.declare_lost_by_pto(1).is_none());

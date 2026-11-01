@@ -142,7 +142,7 @@ pub(super) fn run_script(sc: Script) -> Run {
                 Transmission {
                     emit_us: em.emit_us,
                     wire_bytes: em.wire_bytes,
-                    key: em.key,
+                    content: em.content,
                     depart_us: None,
                     dep_idx: None,
                 },
@@ -208,19 +208,19 @@ pub(super) fn run_script(sc: Script) -> Run {
                 Some(Resolution::Live(tx)) => {
                     let rtt = t - departed;
                     run.max_rtt = run.max_rtt.max(rtt);
-                    e.note_ack_origin(tx.key, ws);
-                    e.on_ack(&[tx.key]);
+                    e.note_ack_origin(tx.content.tile().unwrap(), ws);
+                    e.on_ack(&[tx.content.tile().unwrap()]);
                     e.rtt.on_sample(rtt);
                     e.note_ack(now);
-                    passes_acked.insert(tx.key);
+                    passes_acked.insert(tx.content.tile().unwrap());
                     run.finished_at = t;
                 }
                 Some(Resolution::Late { tx, .. }) => {
-                    e.note_ack_origin(tx.key, ws);
-                    e.on_ack(&[tx.key]);
+                    e.note_ack_origin(tx.content.tile().unwrap(), ws);
+                    e.on_ack(&[tx.content.tile().unwrap()]);
                     e.rtt.on_sample(t - departed);
                     e.note_ack(now);
-                    passes_acked.insert(tx.key);
+                    passes_acked.insert(tx.content.tile().unwrap());
                     run.finished_at = t;
                 }
                 None => {}
@@ -406,7 +406,7 @@ mod tests {
                     Transmission {
                         emit_us: 0,
                         wire_bytes: em.wire_bytes,
-                        key: em.key,
+                        content: em.content,
                         depart_us: None,
                         dep_idx: None,
                     },
@@ -427,7 +427,7 @@ mod tests {
         let keys: Vec<u32> = e
             .take_transmissions()
             .iter()
-            .map(|t| t.key.frame_seq)
+            .map(|t| t.content.tile().unwrap().frame_seq)
             .collect();
         assert_eq!(keys, vec![99, 98]);
         // The timer restarted, backed off.
