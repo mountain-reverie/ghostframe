@@ -567,7 +567,7 @@ impl IoBridge {
             crate::transport::transmission_ledger::Transmission {
                 emit_us: 0,
                 wire_bytes: 1200,
-                key,
+                content: key.into(),
                 depart_us: None,
                 dep_idx: None,
             },

@@ -9,7 +9,9 @@ use crate::transport::reliable_emitter::parity::GroupBuilder;
 use crate::transport::reliable_emitter::pto::pto_for_attempt;
 use crate::transport::reliable_emitter::traits::{DatagramSender, SendOutcome};
 use crate::transport::reliable_emitter::wire_seq::WireSeqAllocator;
-use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K, PARITY_INTERLEAVE_OFFSET};
+use crate::transport::reliable_emitter::{
+    Content, EmitKey, FEC_GROUP_SIZE_K, PARITY_INTERLEAVE_OFFSET,
+};
 use crate::transport::rtt_estimator::RttEstimator;
 use bytes::{Bytes, BytesMut};
 use std::cmp::Reverse;
@@ -124,8 +126,9 @@ pub struct EmittedDatagram {
     pub emit_us: u64,
     pub wire_bytes: usize,
     /// The content this transmission was carrying, so an acknowledgement can
-    /// be mapped back to the tile-pass every delivery consumer expects.
-    pub key: EmitKey,
+    /// be mapped back to the tile-pass (or H.264 fragment) every delivery
+    /// consumer expects.
+    pub content: Content,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -506,7 +509,7 @@ impl ReliableTileEmitter {
             wire_seq,
             emit_us: stamped_emit_us,
             wire_bytes: bytes.len(),
-            key,
+            content: Content::Tile(key),
         });
         let entry = CacheEntry {
             datagram: bytes.clone(),
@@ -801,7 +804,7 @@ impl ReliableTileEmitter {
                 wire_seq: ws,
                 emit_us: emit_us_now,
                 wire_bytes: bytes.len(),
-                key,
+                content: Content::Tile(key),
             });
             // A NACK retransmit allocates its own `wire_seq` above; it must
             // join the FEC group exactly as a first transmission does (see
@@ -945,7 +948,7 @@ impl ReliableTileEmitter {
                 wire_seq: ws,
                 emit_us: stamped,
                 wire_bytes: bytes.len(),
-                key,
+                content: Content::Tile(key),
             });
             // A retransmit allocates its own `wire_seq` above; it must
             // join the FEC group exactly as a first transmission does
@@ -1231,13 +1234,21 @@ impl ReliableTileEmitter {
     /// what it does to the loss estimate, are the caller's.
     pub fn request_retransmit(
         &mut self,
-        key: EmitKey,
+        content: impl Into<Content>,
         wire_seq: u32,
         cause: RetxCause,
     ) -> RetxRequest {
         if crate::config::no_rto() {
             return RetxRequest::Disabled;
         }
+        let key = match content.into() {
+            Content::Tile(key) => key,
+            // Nothing retains H.264 fragments yet.
+            Content::H264Frag { .. } => {
+                self.stats.verdict_content_gone += 1;
+                return RetxRequest::ContentGone;
+            }
+        };
         let r = self.classify_retx(&key, wire_seq, cause);
         match r {
             RetxRequest::Queued => {

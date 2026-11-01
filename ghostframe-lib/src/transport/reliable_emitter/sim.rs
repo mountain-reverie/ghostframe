@@ -116,7 +116,7 @@ impl Sim {
                 Transmission {
                     emit_us: em.emit_us,
                     wire_bytes: em.wire_bytes,
-                    key: em.key,
+                    content: em.content,
                     depart_us: None,
                     dep_idx: None,
                 },
@@ -141,8 +141,8 @@ impl Sim {
             let ws = u32::from_be_bytes(dg[8..12].try_into().unwrap());
             match self.ledger.resolve(ws) {
                 Some(Resolution::Live(tx)) | Some(Resolution::Late { tx, .. }) => {
-                    self.emitter.note_ack_origin(tx.key, ws);
-                    self.emitter.on_ack(&[tx.key]);
+                    self.emitter.note_ack_origin(tx.content.tile().unwrap(), ws);
+                    self.emitter.on_ack(&[tx.content.tile().unwrap()]);
                     self.emitter.rtt.on_sample(Duration::from_millis(20));
                     self.emitter.note_ack(self.t);
                 }

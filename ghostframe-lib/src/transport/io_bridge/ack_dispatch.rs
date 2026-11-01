@@ -27,10 +27,11 @@ pub(crate) fn handle_datagram_payload(payload: &[u8]) -> Option<&'static [u8]> {
     }
 }
 
-/// One resolved ACK entry: content key, the transmission, the client arrival
-/// stamp, and whether it was already reported lost (so no timing sample).
+/// One resolved ACK entry: what the transmission carried, the transmission,
+/// the client arrival stamp, and whether it was already reported lost (so no
+/// timing sample).
 type ResolvedAck = (
-    crate::transport::reliable_emitter::EmitKey,
+    crate::transport::reliable_emitter::Content,
     crate::transport::transmission_ledger::Transmission,
     u16,
     bool,
@@ -96,8 +97,10 @@ impl IoBridge {
                 // that release is the entire point of this phase, since
                 // nothing else ever clears a cache entry acknowledged after
                 // its transmission was declared lost.
-                let emit_keys: Vec<crate::transport::reliable_emitter::EmitKey> =
-                    resolved.iter().map(|(k, _, _, _)| *k).collect();
+                let emit_keys: Vec<crate::transport::reliable_emitter::EmitKey> = resolved
+                    .iter()
+                    .filter_map(|(c, _, _, _)| c.tile())
+                    .collect();
                 // Samples come from the ledger record, not the cache entry.
                 // `Transmission::emit_us` is the stamp *this* datagram
                 // carried, so a retransmission no longer borrows the send time
@@ -179,13 +182,17 @@ impl IoBridge {
                                 now_for_samples,
                             );
                         }
-                        self.reliable_emitter.note_ack_origin(tx.key, e.wire_seq);
+                        if let Some(k) = tx.content.tile() {
+                            self.reliable_emitter.note_ack_origin(k, e.wire_seq);
+                        }
                         self.loss_window.record(tx.emit_us as u32, false);
-                        Some((tx.key, tx, e.arrival_time_ms_lo16, false))
+                        Some((tx.content, tx, e.arrival_time_ms_lo16, false))
                     }
                     Some(Resolution::Late { tx, fec_possible }) => {
                         self.reliable_emitter.note_ack(now_for_samples);
-                        self.reliable_emitter.note_ack_origin(tx.key, e.wire_seq);
+                        if let Some(k) = tx.content.tile() {
+                            self.reliable_emitter.note_ack_origin(k, e.wire_seq);
+                        }
                         let was_flushed = self.instr.flushed.take(e.wire_seq);
                         if fec_possible {
                             // May be the client acking a datagram it rebuilt
@@ -228,7 +235,7 @@ impl IoBridge {
                                     .wrapping_sub(tx.emit_us as u32)
                             );
                         }
-                        Some((tx.key, tx, e.arrival_time_ms_lo16, true))
+                        Some((tx.content, tx, e.arrival_time_ms_lo16, true))
                     }
                     None => None,
                 };
@@ -268,11 +275,12 @@ impl IoBridge {
         }
         if crate::transport::reliable_emitter::rto_probe_enabled() {
             let ack_us = self.reliable_emitter.emit_us(now_for_samples) as i64;
-            for (k, tx, _, _) in resolved.iter() {
+            for (c, tx, _, _) in resolved.iter() {
+                let Some(k) = c.tile() else { continue };
                 let codec = self
                     .reliable_emitter
                     .cache
-                    .get(k)
+                    .get(&k)
                     .and_then(|e| e.datagram.get(18).copied())
                     .map(|b| b >> 1)
                     .unwrap_or(255);
@@ -293,7 +301,7 @@ impl IoBridge {
         resolved: &[ResolvedAck],
         now_for_samples: std::time::Instant,
     ) {
-        for (emit_key, tx, arrival_lo16, late) in resolved.iter() {
+        for (content, tx, arrival_lo16, late) in resolved.iter() {
             if *late {
                 // Declared lost when it expired: either already reported to
                 // the estimator (feeding its timing now would report the same
@@ -311,7 +319,8 @@ impl IoBridge {
             if self.bwe_samples_buffer.len() >= BWE_SAMPLES_BUFFER_CAPACITY {
                 break;
             }
-            let cache_entry = self.reliable_emitter.cache.get(emit_key);
+            let tile_key = content.tile();
+            let cache_entry = tile_key.and_then(|k| self.reliable_emitter.cache.get(&k));
             let server_emit_us = tx.emit_us;
             let queued_since_epoch_us = cache_entry
                 .map(|entry| {
@@ -321,7 +330,8 @@ impl IoBridge {
                         .as_micros() as u64
                 })
                 .unwrap_or(server_emit_us);
-            let tier = pass_tier(emit_key.pass_idx);
+            // A frame fragment is first-send, latency-critical traffic.
+            let tier = tile_key.map_or(PassTier::Critical, |k| pass_tier(k.pass_idx));
             let emit_lo16 = ((server_emit_us / 1000) & 0xFFFF) as u16;
             let owd_ms_lo16 = arrival_lo16.wrapping_sub(emit_lo16);
             let probe = cache_entry.and_then(|entry| entry.probe);
@@ -342,11 +352,14 @@ impl IoBridge {
     /// Release fragment coverage, scheduler and palette state for each
     /// acknowledged tile-pass.
     fn apply_ack_coverage(&mut self, resolved: &[ResolvedAck]) {
-        for (emit_key, _, _, _) in resolved.iter() {
+        for (content, _, _, _) in resolved.iter() {
+            let Some(emit_key) = content.tile() else {
+                continue;
+            };
             // Key matches how coverage is recorded at emit time:
             // (frame_seq, tile_x, tile_y, pass_idx), recovered from
             // the ledger since the entry named a transmission.
-            let e = *emit_key;
+            let e = emit_key;
             let key = (e.frame_seq, e.tile_x, e.tile_y, e.pass_idx);
             let coverage = match self.fragment_coverage.take(key) {
                 Some(c) => c,

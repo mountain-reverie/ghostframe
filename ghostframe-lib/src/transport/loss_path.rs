@@ -52,7 +52,7 @@ pub(crate) fn detect(
     let thr = time_threshold(&emitter.rtt);
     let mut out = Outcome::default();
     for (ws, tx, _reason) in ledger.detect_losses_at(now, thr) {
-        if emitter.request_retransmit(tx.key, ws, RetxCause::Loss) == RetxRequest::Queued {
+        if emitter.request_retransmit(tx.content, ws, RetxCause::Loss) == RetxRequest::Queued {
             out.retx_queued += 1;
         }
         out.lost.push((ws, tx));
@@ -104,7 +104,7 @@ pub(crate) fn probe(
             if out.retx_queued as usize >= PROBE_COUNT {
                 break 'rounds;
             }
-            match emitter.request_retransmit(tx.key, ws, RetxCause::Probe) {
+            match emitter.request_retransmit(tx.content, ws, RetxCause::Probe) {
                 RetxRequest::Queued => {
                     out.retx_queued += 1;
                 }
@@ -158,7 +158,7 @@ mod tests {
                     Transmission {
                         emit_us: 0,
                         wire_bytes: em.wire_bytes,
-                        key,
+                        content: key.into(),
                         depart_us: None,
                         dep_idx: None,
                     },
@@ -246,7 +246,7 @@ mod deferred_tests {
                 Transmission {
                     emit_us: 0,
                     wire_bytes: em.wire_bytes,
-                    key: em.key,
+                    content: em.content,
                     depart_us: None,
                     dep_idx: None,
                 },
@@ -270,7 +270,10 @@ mod deferred_tests {
         book(e, l, t);
         for _ in 0..lost_times {
             let ws = e.cache.get(&key).unwrap().latest_ws;
-            assert_eq!(l.declare_lost_by_pto(ws).map(|x| x.key), Some(key));
+            assert_eq!(
+                l.declare_lost_by_pto(ws).and_then(|x| x.content.tile()),
+                Some(key)
+            );
             assert_eq!(
                 e.request_retransmit(key, ws, RetxCause::Loss),
                 RetxRequest::Queued
