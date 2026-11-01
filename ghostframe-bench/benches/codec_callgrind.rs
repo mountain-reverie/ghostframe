@@ -41,9 +41,11 @@ fn frame_header_encode_decode() {
         frame_seq: 1024,
         frag_idx: 3,
         frag_total: 8,
+        wire_seq: u32::MAX,
         timestamp_us: 16_666,
         flags: 1,
-        reserved: 0,
+        slots: 0,
+        ref_frame_seq: u32::MAX,
     };
     let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE);
     h.encode(&mut buf);

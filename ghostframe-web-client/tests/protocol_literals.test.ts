@@ -123,7 +123,7 @@ describe('TypeScript sources do not retype protocol constants', () => {
       ['const SUB_WHEEL = 0x03;', 'retyped constant SUB_WHEEL'],
       ['export const ERR_INDEX_OOB = 5;', 'retyped constant ERR_INDEX_OOB'],
       ['const EVICTION_REASON_DISPLACED = 1;', 'retyped constant EVICTION_REASON_DISPLACED'],
-      ['export const FRAME_HEADER_SIZE = 14;', 'retyped constant FRAME_HEADER_SIZE'],
+      ['export const FRAME_HEADER_SIZE = 22;', 'retyped constant FRAME_HEADER_SIZE'],
       ['export const enum Codec { Skip = 0 }', 'retyped Codec enum'],
       ['const T = { Cdf53: 5, Solid: 3 };', 'retyped Codec table'],
       ['onDecodeError(2, 0xFF, 0xFF, c);', 'wire discriminant written as a literal'],

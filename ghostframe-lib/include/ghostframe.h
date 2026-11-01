@@ -193,6 +193,17 @@
 #define INPUT_MSG_TYPE 5
 
 /**
+ * Client request for a fresh IDR, `[RESET_REQUEST_MSG_TYPE, reason,
+ * frame_seq u32 LE]`; see [`ResetRequest`].
+ */
+#define RESET_REQUEST_MSG_TYPE 9
+
+/**
+ * Encoded length of a reset request.
+ */
+#define RESET_REQUEST_SIZE 6
+
+/**
  * Client display capability advertisement.
  */
 #define DISPLAY_INFO_MSG_TYPE 7
@@ -217,9 +228,18 @@
 #define HELLO_CAP_SUPPORTS_H264 2
 
 /**
+ * HELLO capability bit 2: the client speaks the v2 H.264 feedback -- it sends
+ * reset requests (stream 0x09) and, in later phases, frame acks (datagram
+ * 0x0A). It does not gate whether H.264 is sent: that is
+ * [`HELLO_CAP_SUPPORTS_H264`] alone. Every client reads the 22-byte v2 frame
+ * header; this bit says only that the client also gives feedback.
+ */
+#define HELLO_CAP_H264_ACKED_REF 4
+
+/**
  * HELLO capability bits that must be zero today; the server ignores them.
  */
-#define HELLO_CAPS_RESERVED_MASK 252
+#define HELLO_CAPS_RESERVED_MASK 248
 
 #define DATAGRAM_HEADER_SIZE 16
 
@@ -270,7 +290,39 @@
  */
 #define TILE_DATAGRAM_FLAG (1 << 31)
 
-#define FRAME_HEADER_SIZE 14
+#define FRAME_HEADER_SIZE 22
+
+/**
+ * `wire_seq` value of a datagram the ledger does not track: the receiver
+ * never acknowledges it and the sender never judges it lost.
+ */
+#define NO_ACK 4294967295
+
+/**
+ * `ref_frame_seq` of a frame that references no earlier frame (an IDR), or
+ * whose reference the sender does not know.
+ */
+#define REF_FRAME_NONE 4294967295
+
+/**
+ * Frame flag bit 0: the frame is an IDR (self-contained).
+ */
+#define FRAME_FLAG_IDR 1
+
+/**
+ * Frame flag bit 1: nothing may reference this frame.
+ */
+#define FRAME_FLAG_NON_REF 2
+
+/**
+ * Frame flag bit 2: this frame is marked as a long-term reference.
+ */
+#define FRAME_FLAG_MARK_LT 4
+
+/**
+ * Frame flag bit 3: this frame predicts from a long-term reference.
+ */
+#define FRAME_FLAG_TARGET_IS_LT 8
 
 /**
  * Envelope discriminator byte for the tile-FEC parity datagram.
@@ -300,6 +352,16 @@
  */
 #define TILE_NACK_MAX_ENTRIES 64
 
+/**
+ * Datagram discriminator of the H.264 frame acknowledgement.
+ */
+#define FRAME_ACK_ENVELOPE 10
+
+/**
+ * Encoded length of a [`FrameAck`].
+ */
+#define FRAME_ACK_SIZE (((1 + 4) + 8) + 8)
+
 #define TILE_SIZE 32
 
 #define BPP 4
@@ -320,6 +382,8 @@ typedef struct FfiHandle FfiHandle;
  * Opaque pointer returned to C callers.
  */
 typedef struct FfiHandle *GfServerHandle;
+
+
 
 /**
  * Create and start a new GhostframeServer.

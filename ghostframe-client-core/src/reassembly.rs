@@ -107,20 +107,28 @@ impl ClientCore {
             return events;
         }
 
-        // 2. Ping/pong (< 20 bytes) -> ignore; too-short tile (< 24) -> drop.
+        // 2. Ping/pong (< 20 bytes) -> ignore.
         if bytes.len() < 20 {
             return events;
         }
-        if bytes.len() < TILE_MIN {
-            return events;
-        }
 
-        // 3. Not a tile datagram -> H.264 full-frame reassembly path.
+        // 3. Not a tile datagram -> H.264 full-frame reassembly path. Its floor
+        //    is the frame header, not the tile stack: the last fragment of an
+        //    access unit can carry 0 or 1 payload bytes (22 or 23 bytes on the
+        //    wire), and dropping it would stall the frame forever.
         if !is_tile_datagram(bytes) {
+            if bytes.len() < ghostframe_protocol::protocol::FRAME_HEADER_SIZE {
+                return events;
+            }
             // Counted on the branch that classifies it, not alongside it, so
             // the count cannot disagree with the path taken.
             self.datagrams_frame = self.datagrams_frame.saturating_add(1);
             self.handle_frame_datagram(bytes, now_us, &mut events);
+            return events;
+        }
+
+        // Too-short tile (< 24) -> drop.
+        if bytes.len() < TILE_MIN {
             return events;
         }
 

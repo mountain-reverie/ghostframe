@@ -85,6 +85,13 @@ pub enum Event {
         frame_seq: u32,
         timestamp_us: u32,
         is_keyframe: bool,
+        /// `frame_seq` this frame predicts from; `REF_FRAME_NONE`
+        /// (`0xFFFF_FFFF`) for an IDR or when the sender did not say.
+        ref_frame_seq: u32,
+        /// `FRAME_FLAG_*` bits of the v2 frame header.
+        flags: u8,
+        /// Long-term slot indices (bits 0-1 mark, bits 2-3 target).
+        slots: u8,
         payload: Vec<u8>,
     },
     DecodeError {

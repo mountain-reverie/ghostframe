@@ -29,13 +29,16 @@ describe('protocol constants', () => {
     expect(p.tileBytes).toBe(32 * 32 * 4);
     expect(p.datagramHeaderSize).toBe(16);
     expect(p.tileHeaderSize).toBe(8);
-    expect(p.frameHeaderSize).toBe(14);
+    expect(p.frameHeaderSize).toBe(22);
     expect(p.tileDatagramFlag).toBe(0x80000000);
     expect(p.cdf53PassCount).toBe(14);
     expect(p.cdf53FullPassMask).toBe(0x3fff);
     expect(p.frameDimensionsSentinelX).toBe(0xff);
     expect(p.evictionSentinelX).toBe(0xfe);
     expect(p.evictionReasonDisplaced).toBe(1);
+    expect(p.helloCapH264AckedRef).toBe(0x04);
+    expect(p.resetRequestMsgType).toBe(0x09);
+    expect(p.frameAckEnvelope).toBe(0x0a);
     expect(p.codec).toEqual({ Skip: 0, H264: 1, PalRle: 2, Solid: 3, Cdf53: 5 });
   });
 
@@ -47,13 +50,16 @@ describe('protocol constants', () => {
       p.inputMsgType,
       p.displayInfoMsgType,
       p.displayModeMsgType,
+      p.resetRequestMsgType,
     ];
     expect(new Set(types).size).toBe(types.length);
   });
 
   it('HELLO capability bits are disjoint single bits and agree with the core', () => {
-    expect(p.helloCapIndicesRaw & p.helloCapSupportsH264).toBe(0);
-    expect(p.helloCapsReservedMask | p.helloCapIndicesRaw | p.helloCapSupportsH264).toBe(0xff);
+    const caps = [p.helloCapIndicesRaw, p.helloCapSupportsH264, p.helloCapH264AckedRef];
+    expect(caps.reduce((a, b) => a | b, 0)).toBe(0x07);
+    expect(caps.reduce((a, b) => a + b, 0)).toBe(0x07); // disjoint
+    expect(p.helloCapsReservedMask | 0x07).toBe(0xff);
     // Cross-check against what the core actually puts on the wire.
     const core = new wasm.WasmClientCore(true, true, true, 0n);
     const hello = core.pollTransmit(0n);

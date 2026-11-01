@@ -3,7 +3,7 @@
 //! Port of the frame-level datagram branch in `main.ts` (~1326-1399): a
 //! separate reassembly track from the per-tile pipeline, keyed by
 //! `frame_seq` alone (there is exactly one in-flight H.264 access unit
-//! per `frame_seq`). Uses `FrameHeader` (14 bytes) instead of `TileHeader`.
+//! per `frame_seq`). Uses `FrameHeader` (22 bytes, v2) instead of `TileHeader`.
 //!
 //! Safety: nothing here may panic on malformed/truncated/hostile input;
 //! all arithmetic on sequence numbers saturates; the assembly map is
@@ -256,6 +256,9 @@ impl ClientCore {
                 frame_seq: asm.header.frame_seq,
                 timestamp_us: asm.header.timestamp_us,
                 is_keyframe: asm.header.is_keyframe(),
+                ref_frame_seq: asm.header.ref_frame_seq,
+                flags: asm.header.flags,
+                slots: asm.header.slots,
                 payload: out,
             });
         }

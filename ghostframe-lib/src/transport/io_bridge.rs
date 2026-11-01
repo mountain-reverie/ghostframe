@@ -722,6 +722,11 @@ pub struct IoBridge {
     /// something is arriving that nothing claims, which is worth knowing and
     /// was previously indistinguishable from a malformed ACK.
     unroutable_inbound_datagrams: u64,
+    /// Well-formed H.264 frame acks (datagram 0x0A) received. Counted and
+    /// otherwise ignored until the H.264 ledger consumes them.
+    frame_acks_received: u64,
+    /// Frame-ack datagrams that failed to decode.
+    frame_acks_malformed: u64,
     /// Last (width, height) the server emitted as a frame-dimensions datagram.
     /// `None` means we've never emitted dimensions (first frame upcoming).
     last_emitted_dimensions: Option<(u32, u32)>,
@@ -1365,6 +1370,8 @@ impl IoBridge {
                 crate::transport::fragment_coverage::FRAGMENT_COVERAGE_CAPACITY,
             ),
             unroutable_inbound_datagrams: 0,
+            frame_acks_received: 0,
+            frame_acks_malformed: 0,
             #[cfg(any(test, feature = "browserless-harness"))]
             send_errs_publish: std::sync::Arc::new(std::sync::Mutex::new(0)),
             last_emitted_dimensions: None,
