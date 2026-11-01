@@ -3353,10 +3353,11 @@ async fn sample_mode_dominance(
     Ok(last)
 }
 
-/// M3.6b: With GHOSTFRAME_TEST_FORCE_BYTES_PER_US=0.1 (below the
-/// HEADROOM_MIN_BYTES_PER_US=0.25 threshold), the classifier's
-/// headroom_guard override must force H264 mode even for content
-/// the M3.5 cost comparison alone would assign to TileCodec.
+/// M3.6b: With GHOSTFRAME_TEST_FORCE_BYTES_PER_US=0.1 (the classifier sees a
+/// bandwidth estimate of 0.1 B/us = 800 kbit/s, below the 2 Mbit/s enter
+/// threshold), the classifier's headroom_guard override must force H264 mode
+/// -- once the estimate has stayed that low for the 500 ms hold -- even for
+/// content the M3.5 cost comparison alone would assign to TileCodec.
 ///
 /// Uses `--x11-sink --mode-switch-cycle 2` (alternating static/motion)
 /// so the classifier has a mix of content; the headroom_guard override
@@ -3410,8 +3411,9 @@ async fn e2e_headroom_guard_forces_h264() -> Result<()> {
 }
 
 /// M3.6b: With GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY=0.15 (well above
-/// the LOSS_OVERRIDE_THRESHOLD=0.10), the classifier's loss_override
-/// must force H264 mode. Exercises the full pipeline:
+/// the LOSS_OVERRIDE_THRESHOLD=0.10) and the override enabled
+/// (`GHOSTFRAME_LOSS_OVERRIDE=1`; it is off by default since the H.264
+/// rework), the classifier's loss_override must force H264 mode. Exercises the full pipeline:
 /// loss injection -> unacknowledged transmissions -> the ledger's loss
 /// rate -> AdaptationContext -> loss_override -> H264.
 ///
@@ -3430,6 +3432,10 @@ async fn e2e_loss_override_forces_h264() -> Result<()> {
         "--x11-sink --mode-switch-cycle 2 --motion-tick-ms 100",
         &[
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
+            // Off by default (one lost H.264 fragment kills a frame, so
+            // "H.264 rides through loss" no longer holds); this test is
+            // about the override itself.
+            ("GHOSTFRAME_LOSS_OVERRIDE", "1"),
             // OUTBOUND, not inbound: it is the server's tile datagrams that
             // have to go missing. 0.15 against LOSS_OVERRIDE_THRESHOLD = 0.10.
             ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.15"),
@@ -5283,12 +5289,6 @@ async fn e2e_refinement_cancel() -> Result<()> {
             ("GHOSTFRAME_INBOUND_LOSS_PROBABILITY", "1.0"),
             ("GHOSTFRAME_INBOUND_LOSS_PREDICATE", "ack"),
             ("GHOSTFRAME_INBOUND_LOSS_SEED", "1"),
-            // The server measures loss as transmissions nobody acknowledged,
-            // and this test has just arranged for that to be all of them.
-            // Left alone, `loss_override` would park the session in H.264
-            // and there would be no refinement to cancel. 1.0 is a threshold
-            // no rate can exceed.
-            ("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD", "1.0"),
         ],
     )
     .await?;

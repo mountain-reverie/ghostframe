@@ -163,6 +163,9 @@ async fn main() -> anyhow::Result<()> {
         // the default threshold starts firing loss_override.
         std::env::set_var("GHOSTFRAME_ENABLE_CDF53", "1");
         std::env::set_var("CAPTURE_FPS", "30");
+        // loss_override is off by default since the H.264 rework; this axis
+        // exists to see where it fires, so turn it on for the sweep.
+        std::env::set_var("GHOSTFRAME_LOSS_OVERRIDE", "1");
         for point in loss_axis::LOSS_VALUES {
             std::env::set_var(
                 "GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP",
@@ -196,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
             std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_SEED");
             std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_PREDICATE");
         }
+        std::env::remove_var("GHOSTFRAME_LOSS_OVERRIDE");
         std::env::remove_var("GHOSTFRAME_ENABLE_CDF53");
         std::env::remove_var("CAPTURE_FPS");
     } else if args.bandwidth_matrix {

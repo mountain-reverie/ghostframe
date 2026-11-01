@@ -148,7 +148,14 @@ P fragments, `p_hold_ms` (time P frames waited for an IDR to be acknowledged),
 `tx_recorded = tx_acked_live + tx_judged_lost + tx_forgotten + outstanding`. An
 H.264 fragment is a ledger transmission, so `bwe_samples_seen` moves in H.264
 mode; a client that does not acknowledge H.264 fragments shows up as a loss
-verdict on every one.
+verdict on every one. `h264_stalled_ms` and `stalls_inflight` /
+`stalls_no_progress` / `stalls_reset` say how long, and why, the bridge told the
+classifier to leave H.264 (`mode.decision` reason `h264_stalled`; H.264 is not
+re-entered for 2 s after, doubling per repeated stall up to 30 s; 10 s of
+healthy H.264 resets it). The headroom guard reads the bandwidth *estimate*
+(engage below 2 Mbit/s for 500 ms, release above 3 Mbit/s for 1 s, or once the
+estimate is back over 2 Mbit/s and the screen has been idle for 2 s);
+`loss_override` is off unless `GHOSTFRAME_LOSS_OVERRIDE=1`.
 
 With `GHOSTFRAME_DAMAGE_MODE=shadow` or `on` the daemon also logs a cumulative
 `damage safety net` line every 5 s (target `ghostframe::server::damage`);
