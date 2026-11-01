@@ -63,6 +63,12 @@ pub enum TileData {
         /// at 16/255 per channel on flat content -- see
         /// `tests/oracle_gpu_sparse.rs`.
         present_passes: Option<u16>,
+        /// This pass starts a new generation of the tile: whatever was
+        /// accumulated for it must be dropped first. Usually the generation
+        /// number says so already, but it is 4 bits and wraps, and only the
+        /// core's coverage state (which also tracks `frame_seq`) can tell a
+        /// new generation that reuses the held number from the held one.
+        new_generation: bool,
     },
 }
 

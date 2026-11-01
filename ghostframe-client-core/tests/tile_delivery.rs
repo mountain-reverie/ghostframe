@@ -129,6 +129,7 @@ fn tile_payload_carries_the_gpu_decoders_inputs() {
             pass_idx: 3,
             bit_planes: vec![0xAA, 0xBB],
             present_passes: None,
+            new_generation: false,
         },
     };
     match e {
@@ -145,6 +146,7 @@ fn tile_payload_carries_the_gpu_decoders_inputs() {
                     pass_idx,
                     bit_planes,
                     present_passes: _,
+                    new_generation: _,
                 } => {
                     assert_eq!(pass_idx, 3);
                     assert_eq!(bit_planes, vec![0xAA, 0xBB]);
@@ -594,7 +596,7 @@ fn cdf53_in_payload_mode_keeps_the_ack_and_skips_integrate() {
                     TileData::Cdf53 {
                         pass_idx,
                         bit_planes,
-                        present_passes: _,
+                        ..
                     },
                 ..
             } => Some((*pass_idx, bit_planes.clone())),

@@ -357,10 +357,14 @@ impl Renderer {
                         self.pending_palrle
                             .push((frame_seq, tile_x, tile_y, palette_id, count, indices));
                     }
+                    // `new_generation` unused: cdf53_integrate.wgsl keys its
+                    // accumulation on the generation number alone (see
+                    // `TileData::Cdf53`).
                     TileData::Cdf53 {
                         pass_idx,
                         bit_planes,
                         present_passes,
+                        new_generation: _,
                     } => {
                         self.pending_cdf53.push((
                             tile_x,

@@ -133,10 +133,14 @@ impl From<TileData> for WasmTileData {
                 indices,
                 wire_flags,
             },
+            // `new_generation` is not forwarded yet: the browser's GPU
+            // accumulator keys on the generation number alone, as the CPU
+            // one did before it had this flag (see `TileData::Cdf53`).
             TileData::Cdf53 {
                 pass_idx,
                 bit_planes,
                 present_passes,
+                new_generation: _,
             } => WasmTileData::Cdf53 {
                 pass_idx,
                 bit_planes,
@@ -463,6 +467,7 @@ mod tests {
                 pass_idx: 13,
                 bit_planes: vec![1, 2, 3],
                 present_passes: None,
+                new_generation: false,
             },
         };
         match WasmEvent::from(&ev) {

@@ -20,8 +20,8 @@ use ghostframe_protocol::protocol::{
 use crate::cdf53_coverage::apply_cdf53_arrival;
 use crate::cdf53_prevalidate::prevalidate_cdf53;
 use crate::event::{Event, PollOutput, TileData};
-use crate::pal_rle_decode::{decode_pal_rle_tile, prevalidate_pal_rle};
-use crate::{ClientCore, TileDelivery, MAX_FRAME_DIMENSION};
+use crate::pal_rle_decode::prevalidate_pal_rle;
+use crate::{ClientCore, MAX_FRAME_DIMENSION};
 use ghostframe_protocol::tile::TILE_SIZE;
 
 /// Minimum bytes that carry a full tile header stack.
@@ -61,7 +61,6 @@ impl ClientCore {
         };
         self.cdf53_coverage.retain(|&(x, y), _| inside(x, y));
         self.pending_nacks.retain(|&(_, y, x), _| inside(x, y));
-        self.cdf53_tile_state.retain_tiles(inside);
     }
 
     /// Parse and vet a frame-dimensions payload. Anything outside
@@ -87,7 +86,22 @@ impl ClientCore {
     }
 
     /// Feed one received datagram. Returns decode/render events.
+    ///
+    /// Tiles always come out of the protocol handling as payloads; in
+    /// `TileDelivery::Decoded` mode they are then decoded to pixels here,
+    /// by the same [`crate::TileDecoder`] a consumer can run elsewhere.
     pub fn handle_datagram(&mut self, bytes: &[u8], now_us: u64) -> Vec<Event> {
+        let events = self.handle_datagram_payloads(bytes, now_us);
+        match self.decoder.as_mut() {
+            Some(decoder) => events
+                .into_iter()
+                .filter_map(|e| decoder.decode(e))
+                .collect(),
+            None => events,
+        }
+    }
+
+    fn handle_datagram_payloads(&mut self, bytes: &[u8], now_us: u64) -> Vec<Event> {
         let mut events = Vec::new();
 
         // 1. Empty -> ignore.
@@ -295,52 +309,26 @@ impl ClientCore {
         let tx = th.tile_x;
         let ty = th.tile_y;
 
-        // Payload mode stops here for the codec whose decode is purely pixel
-        // expansion. Solid carries no protocol state, so there is nothing to
-        // update before handing the bytes up. PalRle and Cdf53 do (palette
-        // upserts, pass coverage and ACKs), so they are handled inside the
-        // match instead.
-        if self.tile_delivery == TileDelivery::Payload && th.codec == Codec::Solid {
-            let Ok(quad) = <[u8; 4]>::try_from(payload) else {
-                // Wire-derived: a malformed Solid payload must not panic.
-                // main.ts only ever painted Solid when the payload was
-                // exactly 4 bytes; mirror that by dropping the tile silently
-                // rather than crashing.
-                return;
-            };
-            events.push(Event::TilePayload {
-                frame_seq,
-                tile_x: tx,
-                tile_y: ty,
-                generation: th.generation,
-                data: TileData::Solid(quad),
-            });
-            return;
-        }
-
+        // Every codec stops at its payload here; the pixel decode, if this
+        // core does it at all, runs on the result (see `handle_datagram`).
         match th.codec {
             Codec::Solid => {
-                // main.ts only paints Solid when the payload is exactly 4B.
-                if payload.len() == 4 {
-                    let (b, g, r, a) = (payload[0], payload[1], payload[2], payload[3]);
-                    let _ = a; // alpha forced to 255 (mirrors GPU solid expand)
-                    let mut rgba = vec![0u8; 4096];
-                    for px in 0..1024 {
-                        let o = px * 4;
-                        rgba[o] = r;
-                        rgba[o + 1] = g;
-                        rgba[o + 2] = b;
-                        rgba[o + 3] = 255;
-                    }
-                    events.push(Event::TileReady {
-                        frame_seq,
-                        tile_x: tx,
-                        tile_y: ty,
-                        rgba,
-                    });
-                }
+                let Ok(quad) = <[u8; 4]>::try_from(payload) else {
+                    // Wire-derived: a malformed Solid payload must not panic.
+                    // main.ts only ever painted Solid when the payload was
+                    // exactly 4 bytes; mirror that by dropping the tile
+                    // silently rather than crashing.
+                    return;
+                };
+                events.push(Event::TilePayload {
+                    frame_seq,
+                    tile_x: tx,
+                    tile_y: ty,
+                    generation: th.generation,
+                    data: TileData::Solid(quad),
+                });
             }
-            Codec::PalRle if self.tile_delivery == TileDelivery::Payload => {
+            Codec::PalRle => {
                 match prevalidate_pal_rle(payload, &self.palette_shadow) {
                     Ok(validated) => {
                         // Apply the upsert exactly as decode_pal_rle_tile does.
@@ -348,24 +336,11 @@ impl ClientCore {
                         // against this table — skipping it leaves the shader on
                         // a stale palette, which shows as wrong colours.
                         if let Some(upsert) = &validated.palette_upsert {
-                            let slot = &mut self.palettes[validated.palette_id as usize];
-                            let mut reported = Vec::with_capacity(validated.count as usize);
-                            for i in 0..validated.count as usize {
-                                let bgra = [
-                                    upsert[i * 4],
-                                    upsert[i * 4 + 1],
-                                    upsert[i * 4 + 2],
-                                    upsert[i * 4 + 3],
-                                ];
-                                // Unlike palette_shadow.put below, nothing in
-                                // payload mode ever reads self.palettes back —
-                                // only decode_pal_rle_tile does, and payload
-                                // mode never calls it. Kept so both modes
-                                // leave identical state; the colours reach the
-                                // GPU via the PaletteUpdated event instead.
-                                slot[i] = bgra;
-                                reported.push(bgra);
-                            }
+                            let reported: Vec<[u8; 4]> = upsert
+                                .chunks_exact(4)
+                                .take(validated.count as usize)
+                                .map(|c| [c[0], c[1], c[2], c[3]])
+                                .collect();
                             self.palette_shadow
                                 .put(validated.palette_id, validated.count);
                             events.push(Event::PaletteUpdated {
@@ -386,30 +361,6 @@ impl ClientCore {
                             },
                         });
                     }
-                    Err(code) => {
-                        if let Some(msg) =
-                            self.decode_error_batcher
-                                .report(Codec::PalRle, tx, ty, code, now_us)
-                        {
-                            self.outbox.push_back(PollOutput::Stream(msg));
-                        }
-                        events.push(Event::DecodeError {
-                            codec: Codec::PalRle,
-                            tile_x: tx,
-                            tile_y: ty,
-                            code,
-                        });
-                    }
-                }
-            }
-            Codec::PalRle => {
-                match decode_pal_rle_tile(payload, &mut self.palette_shadow, &mut self.palettes) {
-                    Ok(rgba) => events.push(Event::TileReady {
-                        frame_seq,
-                        tile_x: tx,
-                        tile_y: ty,
-                        rgba,
-                    }),
                     Err(code) => {
                         if let Some(msg) =
                             self.decode_error_batcher
@@ -477,11 +428,7 @@ impl ClientCore {
                 if outcome.committed {
                     self.cdf53_coverage.insert((tx, ty), outcome.entry);
                 }
-                if outcome.new_generation {
-                    // The integrator keys on the 4-bit generation alone, so
-                    // it cannot see a new generation that reuses the number.
-                    self.cdf53_tile_state.forget_tile(tx, ty);
-                }
+
                 for p in outcome.nack_passes {
                     // Coverage NACKs are routed through the debounced
                     // pending-NACK queue (main.ts `queuePassNack`,
@@ -495,37 +442,23 @@ impl ClientCore {
 
                 match result {
                     Ok(pre) => {
-                        match self.tile_delivery {
-                            TileDelivery::Decoded => {
-                                // `None`: nothing new to show yet (see
-                                // `Cdf53TileState::integrate`); the tile keeps
-                                // its previous content.
-                                if let Some(rgba) = self.cdf53_tile_state.integrate(tx, ty, &pre) {
-                                    events.push(Event::TileReady {
-                                        frame_seq,
-                                        tile_x: tx,
-                                        tile_y: ty,
-                                        rgba,
-                                    });
-                                }
-                            }
-                            TileDelivery::Payload => {
-                                // No CPU accumulation: cdf53_integrate.wgsl
-                                // accumulates passes in GPU buffers, keyed by
-                                // its own tile-generation buffer.
-                                events.push(Event::TilePayload {
-                                    frame_seq,
-                                    tile_x: tx,
-                                    tile_y: ty,
-                                    generation: th.generation,
-                                    data: TileData::Cdf53 {
-                                        pass_idx: pre.pass_idx,
-                                        bit_planes: pre.bit_planes,
-                                        present_passes: pre.present_passes,
-                                    },
-                                });
-                            }
-                        }
+                        // No accumulation here: the pixel decode (CPU
+                        // `TileDecoder` or cdf53_integrate.wgsl) does it.
+                        events.push(Event::TilePayload {
+                            frame_seq,
+                            tile_x: tx,
+                            tile_y: ty,
+                            generation: th.generation,
+                            data: TileData::Cdf53 {
+                                pass_idx: pre.pass_idx,
+                                bit_planes: pre.bit_planes,
+                                present_passes: pre.present_passes,
+                                // The pixel decode keys its accumulation on
+                                // the 4-bit generation alone, so it cannot see
+                                // a new generation that reuses the number.
+                                new_generation: outcome.new_generation,
+                            },
+                        });
                         // Deferred ACK — fires only after prevalidation success.
                         // Deliberately outside the match: it is protocol, not
                         // decoding, and must happen in both modes.
