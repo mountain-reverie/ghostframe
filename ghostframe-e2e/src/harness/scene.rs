@@ -254,6 +254,8 @@ pub(crate) async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioSt
         // counts across bias_sweep / loss_axis runs in v4).
         "GHOSTFRAME_TEST_REFINEMENT_BIAS_US",
         "GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD",
+        // The override is off unless this is set (loss-axis sweeps need it).
+        "GHOSTFRAME_LOSS_OVERRIDE",
         "GHOSTFRAME_TEST_HEADROOM_MIN_BPUS",
         "GHOSTFRAME_TEST_FORCE_BYTES_PER_US",
         // M3.6/M3.7: required for any CDF53 refinement work to fire at
