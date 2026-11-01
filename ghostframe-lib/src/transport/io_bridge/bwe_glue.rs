@@ -252,6 +252,10 @@ impl BweSample {
     }
 }
 
+/// How long after a probe window closes the queue it built is still draining,
+/// for the loss path's patience (`TransmissionLedger::mark_probe_burst`).
+const PROBE_BURST_DRAIN: std::time::Duration = std::time::Duration::from_millis(300);
+
 impl IoBridge {
     /// BWE Stage 2.4: open a new probe window if goog_cc requested one
     /// since the last poll, then close the current window once its
@@ -301,21 +305,46 @@ impl IoBridge {
         let Some(req) = self.bwe.take_probe_request() else {
             return;
         };
+        self.open_probe_cluster(
+            now,
+            req.id,
+            req.target_rate_bps,
+            req.duration,
+            req.min_probes,
+            req.min_bytes,
+        );
+    }
+
+    /// Open a probe window for cluster `id` now. The cluster is goog_cc's
+    /// (`open_probe_window_for_burst`) or ghostframe's own (`h264_rate`).
+    pub(super) fn open_probe_cluster(
+        &mut self,
+        now: std::time::Instant,
+        id: i32,
+        target_rate_bps: u64,
+        duration: std::time::Duration,
+        min_probes: i64,
+        min_bytes: i64,
+    ) {
         tracing::debug!(
             target: LOG_TARGET,
-            probe_id = req.id,
-            target_rate_bps = req.target_rate_bps,
-            duration_ms = req.duration.as_millis() as u64,
-            min_probes = req.min_probes,
-            min_bytes = req.min_bytes,
-            "bwe: probe cluster window opened on burst"
+            probe_id = id,
+            target_rate_bps,
+            duration_ms = duration.as_millis() as u64,
+            min_probes,
+            min_bytes,
+            "bwe: probe cluster window opened"
         );
+        // The datagrams that depart in this window and just after it sit in
+        // its queue: the loss path's time rule is patient with them.
+        self.transmission_ledger
+            .mark_probe_burst(now, now + duration + PROBE_BURST_DRAIN);
         self.active_probe = Some(ActiveProbe {
-            id: req.id,
-            target_rate_bps: req.target_rate_bps,
-            ends_at: now + req.duration,
-            min_probes: req.min_probes,
-            min_bytes: req.min_bytes,
+            id,
+            target_rate_bps,
+            ends_at: now + duration,
+            min_probes,
+            min_bytes,
             bytes_sent: 0,
             packets_sent: 0,
             opened_at: now,
@@ -335,6 +364,8 @@ impl IoBridge {
     /// one. A session that never emits never probes, which is correct: there
     /// is nothing to measure a link with.
     pub(super) fn poll_probe_window(&mut self, now: std::time::Instant) {
+        // Padding nobody acknowledged is forgotten on the loop's tick.
+        self.reliable_emitter.expire_h264_pad(now);
         let is_due = matches!(&self.active_probe, Some(p) if now >= p.ends_at);
         if is_due {
             let probe = self.active_probe.take().expect("checked Some above");

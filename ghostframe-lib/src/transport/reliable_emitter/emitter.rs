@@ -6,7 +6,7 @@ use crate::transport::protocol::TileParityEnvelope;
 use crate::transport::reliable_emitter::cache::{CacheEntry, ProbeTag, RetransmitCache};
 use crate::transport::reliable_emitter::emission_queue::{Emission, EmissionQueue, WireClass};
 use crate::transport::reliable_emitter::h264::{
-    H264Cache, H264Submit, H264_CACHE_FRAMES, PAD_FRAME_SEQ,
+    H264Cache, H264Submit, PadEntry, PadRing, H264_CACHE_FRAMES,
 };
 use crate::transport::reliable_emitter::parity::GroupBuilder;
 use crate::transport::reliable_emitter::pto::pto_for_attempt;
@@ -38,6 +38,8 @@ pub struct ReliableTileEmitter {
     pub(crate) cache: RetransmitCache,
     /// Fragments of H.264 frames not fully acknowledged: the probe cache.
     pub(crate) h264: H264Cache,
+    /// Probe padding in flight (see [`PadRing`]).
+    pub(crate) pads: PadRing,
     pub(crate) alloc: WireSeqAllocator,
     pub(crate) queue: EmissionQueue,
     pub(crate) group: GroupBuilder,
@@ -376,6 +378,7 @@ impl ReliableTileEmitter {
         Self {
             cache: RetransmitCache::new(),
             h264: H264Cache::new(),
+            pads: PadRing::default(),
             alloc: WireSeqAllocator::new(),
             queue: EmissionQueue::new(),
             group: GroupBuilder::new(FEC_GROUP_SIZE_K),
@@ -628,30 +631,26 @@ impl ReliableTileEmitter {
 
     /// Queue one datagram of probe padding: `template` (a frame datagram the
     /// client has already acknowledged) again, under a `wire_seq` of its own,
-    /// tagged for the probe cluster `probe`. The client acknowledges it on
-    /// receipt and discards it, so it is measured and costs the picture nothing.
+    /// flagged `FRAME_FLAG_PAD` and tagged for the probe cluster `probe`. The
+    /// client acknowledges it on receipt and discards it, so it is measured
+    /// and costs the picture nothing.
     ///
-    /// It is a ledger transmission (acknowledged or judged like any other)
-    /// named `H264Frag { PAD_FRAME_SEQ, idx }`, and the probe cache holds an
-    /// entry under that name only to carry the tag to the acknowledgement; no
-    /// path ever sends it again (`classify_retx`, `entry_view`). Returns the
-    /// datagram's bytes.
+    /// It is a ledger transmission named `Content::Pad(wire_seq)`, acknowledged
+    /// or judged like any other; the pad ring holds its probe tag until then.
+    /// No path ever sends it again. Returns the datagram's bytes.
     pub fn submit_h264_pad(
         &mut self,
         template: &Bytes,
-        idx: u16,
         probe: crate::transport::reliable_emitter::cache::ProbeTag,
         now: Instant,
     ) -> usize {
         let wire_seq = self.alloc.allocate();
         let mut buf = BytesMut::from(&template[..]);
-        debug_assert!(buf.len() >= 12, "a frame datagram has a 22-byte header");
-        if buf.len() >= 12 {
-            buf[8..12].copy_from_slice(&wire_seq.to_be_bytes());
-        }
-        // The pad bit: the client acknowledges the datagram and discards it,
-        // whatever frame it names.
+        debug_assert!(buf.len() > 16, "a frame datagram has a 22-byte header");
         if buf.len() > 16 {
+            buf[8..12].copy_from_slice(&wire_seq.to_be_bytes());
+            // The pad bit: the client acknowledges the datagram and discards
+            // it, whatever frame it names.
             buf[16] |= crate::transport::protocol::FRAME_FLAG_PAD;
         }
         let bytes: Bytes = buf.freeze();
@@ -660,24 +659,14 @@ impl ReliableTileEmitter {
             wire_seq,
             emit_us: self.emit_us64(now),
             wire_bytes: len,
-            content: Content::H264Frag {
-                frame_seq: PAD_FRAME_SEQ,
-                frag_idx: idx,
-            },
+            content: Content::Pad(wire_seq),
         });
-        self.h264.insert(
-            PAD_FRAME_SEQ,
-            idx,
-            false,
-            CacheEntry {
-                datagram: bytes.clone(),
+        self.pads.insert(
+            wire_seq,
+            PadEntry {
+                probe,
                 queued_at: now,
-                first_sent_at: now,
-                last_sent_at: now,
-                attempts: 0,
-                loss_attempts: 0,
-                latest_ws: wire_seq,
-                probe: Some(probe),
+                len,
             },
         );
         self.note_emission_queue_depth();
@@ -686,9 +675,9 @@ impl ReliableTileEmitter {
         len
     }
 
-    /// Forget padding entries nobody acknowledged (see [`PAD_ENTRY_TTL`]).
+    /// Forget padding nobody acknowledged (see `PAD_ENTRY_TTL`).
     pub fn expire_h264_pad(&mut self, now: Instant) {
-        self.h264.expire_pad(now);
+        self.pads.expire(now);
     }
 
     /// Send a cached H.264 fragment again, with a `wire_seq` of its own.
@@ -1122,6 +1111,7 @@ impl ReliableTileEmitter {
                     }
                     continue;
                 }
+                Content::Pad(_) => continue,
             };
             let Some(entry) = self.cache.get_mut(&key) else {
                 // Acknowledged or superseded while it waited: nothing to send.
@@ -1283,7 +1273,7 @@ impl ReliableTileEmitter {
     /// Wire bytes currently in flight: everything cached and not yet ACKed.
     /// Fed to goog_cc as `TransportPacketsFeedback::data_in_flight`.
     pub fn bytes_in_flight(&self) -> usize {
-        self.cache.bytes_outstanding() + self.h264.bytes_outstanding()
+        self.cache.bytes_outstanding() + self.h264.bytes_outstanding() + self.pads.bytes()
     }
 
     /// Ingest a batch of NACKs from the client. For each pass key:
@@ -1364,6 +1354,7 @@ impl ReliableTileEmitter {
     pub fn clear_cache(&mut self) {
         self.cache.clear();
         self.h264.clear();
+        self.pads.clear();
         self.resend_origin.clear();
         self.latest_tile_generation.clear();
         self.pending_loss.clear();
@@ -1450,10 +1441,7 @@ impl ReliableTileEmitter {
                 Some(e) => (e.latest_ws, e.loss_attempts, false),
             },
             // Probe padding is never sent again, whoever asks.
-            Content::H264Frag {
-                frame_seq: PAD_FRAME_SEQ,
-                ..
-            } => return RetxRequest::ContentGone,
+            Content::Pad(_) => return RetxRequest::ContentGone,
             Content::H264Frag {
                 frame_seq,
                 frag_idx,
@@ -1545,10 +1533,7 @@ impl ReliableTileEmitter {
                 .cache
                 .get(key)
                 .map(|e| (e.latest_ws, e.loss_attempts, e.last_sent_at)),
-            Content::H264Frag {
-                frame_seq: PAD_FRAME_SEQ,
-                ..
-            } => None,
+            Content::Pad(_) => None,
             Content::H264Frag {
                 frame_seq,
                 frag_idx,

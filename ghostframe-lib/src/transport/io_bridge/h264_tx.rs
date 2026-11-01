@@ -182,6 +182,9 @@ pub struct H264Stats {
     /// Verdicts by what they named.
     pub verdicts_idr_frag: u64,
     pub verdicts_p_frag: u64,
+    /// Of those: verdicts made while a probe window was open, padding was in
+    /// flight, or inside a probe burst's span (what padding could have caused).
+    pub p_verdicts_in_probe: u64,
     /// The fragment (or its whole frame) had been acknowledged by another
     /// transmission already: a spurious verdict, no action.
     pub verdicts_already_acked: u64,
@@ -223,9 +226,11 @@ pub struct H264Stats {
     pub rate_reopens_rise: u64,
     /// The rate the encoder was last told to run at, bits per second.
     pub rate_target_bps: u32,
-    /// Times the application declared itself rate-limited to the estimator
-    /// (the rate policy went active in H.264 mode).
-    pub alr_signalled: u64,
+    /// Probe clusters the application started itself (see `h264_rate`).
+    pub app_probes: u64,
+    /// Frames skipped for the emission backlog while padding was in flight
+    /// (a subset of `frames_skipped_backpressure`).
+    pub frames_skipped_pad: u64,
     /// Probe padding sent to fill a probe window without an IDR: windows
     /// filled that way, datagrams and bytes (wire bytes of the datagrams,
     /// before the transport's per-datagram overhead).
@@ -435,16 +440,21 @@ pub(super) struct H264Tx {
     pub(super) stall_eval_at: Option<std::time::Instant>,
     /// The rate policy (see `h264_rate`).
     pub(super) rate: super::h264_rate::RatePolicy,
-    /// The GOP, in frames, the encoder is told to use.
-    pub(super) gop_frames: u32,
-    /// Frames sent since the last IDR, that IDR included; `None` until one.
-    /// The bridge's clock for "the next frame is the scheduled GOP IDR".
-    pub(super) frames_since_idr: Option<u32>,
+    /// The GOP: an IDR is made when this long has passed since the last one,
+    /// whatever caused that one.
+    pub(super) gop: std::time::Duration,
+    /// The frame rate the encoder is opened for.
+    pub(super) fps: u32,
+    /// When the last IDR was made; `None` until one. The bridge's clock for
+    /// "the next frame is the scheduled GOP IDR".
+    pub(super) last_idr_at: Option<std::time::Instant>,
     /// A recently acknowledged P-frame fragment's datagram: the padding of a
     /// probe window (see `h264_rate`).
     pub(super) pad_template: Option<bytes::Bytes>,
-    /// Whether the estimator has been told the application is rate-limited.
-    pub(super) alr_declared: bool,
+    /// The application's own probing: cadence and chain state.
+    pub(super) app_probe: super::h264_rate::AppProbe,
+    /// When the encoder's rate was last cut by a reopen (padding keeps quiet).
+    pub(super) last_cut_at: Option<std::time::Instant>,
     /// The harness's scripted CBR encoder, if the scene asked for one.
     pub(super) scripted: Option<super::h264_rate::ScriptedCbr>,
 }
@@ -471,7 +481,7 @@ impl H264Tx {
         self.stalled = false;
         self.stall_eval_at = None;
         self.rate.reset_session();
-        self.frames_since_idr = None;
+        self.last_idr_at = None;
         self.pad_template = None;
     }
 }
@@ -595,6 +605,9 @@ impl IoBridge {
         }
         if self.h264_backlog_exceeded() {
             self.h264.stats.frames_skipped_backpressure += 1;
+            if !self.reliable_emitter.pads.is_empty() {
+                self.h264.stats.frames_skipped_pad += 1;
+            }
             return H264Gate::SkipBackpressure;
         }
         H264Gate::Encode
@@ -623,7 +636,6 @@ impl IoBridge {
         let dims_changed = self.h264.last_dims.is_some_and(|d| d != dims);
         self.h264.last_dims = Some(dims);
         if !is_keyframe {
-            self.h264.frames_since_idr = self.h264.frames_since_idr.map(|n| n.saturating_add(1));
             return None;
         }
         let cause = self.h264.pending_idr.take().unwrap_or(if dims_changed {
@@ -633,7 +645,7 @@ impl IoBridge {
         });
         self.h264.stats.idr_by_cause[cause.index()] += 1;
         self.h264.stats.frames_idr += 1;
-        self.h264.frames_since_idr = Some(1);
+        self.h264.last_idr_at = Some(now_std());
         Some(cause)
     }
 
@@ -686,6 +698,12 @@ impl IoBridge {
         now: std::time::Instant,
     ) {
         for (content, _, _, late) in resolved {
+            if let Content::Pad(ws) = content {
+                // Padding: its probe tag has been read (before this); the
+                // entry has nothing more to do.
+                self.reliable_emitter.pads.remove(*ws);
+                continue;
+            }
             let Content::H264Frag {
                 frame_seq,
                 frag_idx,
@@ -705,9 +723,7 @@ impl IoBridge {
             }
             // Keep a small P-frame fragment's bytes for probe padding before
             // the acknowledgement releases it.
-            if frame_seq != crate::transport::reliable_emitter::h264::PAD_FRAME_SEQ
-                && self.reliable_emitter.h264.is_idr(frame_seq) == Some(false)
-            {
+            if self.reliable_emitter.h264.is_idr(frame_seq) == Some(false) {
                 if let Some(e) = self.reliable_emitter.h264.get(frame_seq, frag_idx) {
                     if e.datagram.len() >= super::h264_rate::PAD_MIN_TEMPLATE_BYTES {
                         self.h264.pad_template = Some(e.datagram.clone());
@@ -748,6 +764,12 @@ impl IoBridge {
             return;
         }
         self.h264.stats.verdicts_p_frag += 1;
+        if self.active_probe.is_some()
+            || !self.reliable_emitter.pads.is_empty()
+            || self.transmission_ledger.in_probe_burst(now)
+        {
+            self.h264.stats.p_verdicts_in_probe += 1;
+        }
         if f.suspect {
             return;
         }
@@ -913,11 +935,11 @@ impl IoBridge {
         let (is_idr, len) = if let Some(cbr) = h.cbr {
             // A CBR encoder: the real rate policy runs, and the scripted
             // encoder takes its controls (see `h264_rate`).
-            let gop_frames = self.h264.gop_frames;
+            let gop = cbr.gop.unwrap_or(self.h264.gop);
             self.h264
                 .scripted
                 .get_or_insert_with(|| ScriptedCbr::new(cbr));
-            self.h264_rate_step(now, cbr.gop_frames.unwrap_or(gop_frames));
+            self.h264_rate_step(now, gop, cbr.fps);
             let requested = self.h264.pending_idr.is_some();
             self.h264
                 .scripted
@@ -972,7 +994,7 @@ impl IoBridge {
     /// next one would put a stale frame in its window.
     pub(super) fn reset_h264_session(&mut self) {
         self.h264.reset_session();
-        self.h264_end_alr();
+        self.h264_reset_probing();
         self.reliable_emitter.h264.clear();
         let wire_seqs = self.reliable_emitter.purge_queued_h264(|_| true);
         // The ledger is reset with the session by its callers; there is
@@ -1748,7 +1770,7 @@ mod tests {
         let cbr = InjectedCbr {
             fps: 30,
             idr_over_p: 5,
-            gop_frames: None,
+            gop: None,
         };
         let enc_frame = |b: &mut IoBridge| {
             let requested = b.h264.pending_idr.is_some();
@@ -1757,7 +1779,7 @@ mod tests {
         for urgent in [true, false] {
             let mut b = bridge().await;
             b.h264.scripted = Some(ScriptedCbr::new(cbr));
-            b.h264_apply_rate_step(RateStep::Initial(2_400_000), 5_000_000, 180);
+            b.h264_apply_rate_step(RateStep::Initial(2_400_000), 5_000_000, 30);
             // The session's IDR and a P frame.
             let (idr, _) = enc_frame(&mut b);
             assert!(idr);
@@ -1774,7 +1796,7 @@ mod tests {
                     urgent,
                 },
                 1_500_000,
-                180,
+                30,
             );
             assert_eq!(
                 b.h264.pending_idr,
@@ -1817,23 +1839,34 @@ mod tests {
         }
     }
 
-    /// The bridge's GOP clock: frames since the last IDR, that IDR included.
+    /// The GOP is a time since the last IDR of any cause, kept by the bridge:
+    /// the encoder has no periodic IDR of its own to fire first.
     #[tokio::test(start_paused = true)]
-    async fn the_gop_clock_counts_frames_since_the_last_idr() {
+    async fn the_gop_is_a_time_since_the_last_idr_of_any_cause() {
+        let gop = Duration::from_secs(3);
         let mut b = bridge().await;
-        assert_eq!(b.h264.frames_since_idr, None);
-        b.note_h264_encoded(false, (64, 64));
-        assert_eq!(b.h264.frames_since_idr, None, "no IDR yet, no GOP");
+        // The first rate step: no IDR yet, so no GOP due, and nothing asked.
+        b.h264_rate_step(now_std(), gop, 30);
+        assert_eq!(b.h264.pending_idr, None);
         b.note_h264_encoded(true, (64, 64));
-        assert_eq!(b.h264.frames_since_idr, Some(1));
-        for n in 2..=5 {
-            b.note_h264_encoded(false, (64, 64));
-            assert_eq!(b.h264.frames_since_idr, Some(n));
-        }
+        assert!(b.h264.last_idr_at.is_some());
+        tokio::time::advance(Duration::from_millis(2_900)).await;
+        b.h264_rate_step(now_std(), gop, 30);
+        assert_eq!(b.h264.pending_idr, None, "not yet: 2.9 s since the IDR");
+        // A loss IDR in between restarts the clock.
         b.note_h264_encoded(true, (64, 64));
-        assert_eq!(b.h264.frames_since_idr, Some(1));
+        tokio::time::advance(Duration::from_millis(2_900)).await;
+        b.h264_rate_step(now_std(), gop, 30);
+        assert_eq!(b.h264.pending_idr, None, "the loss IDR restarted the GOP");
+        tokio::time::advance(Duration::from_millis(200)).await;
+        b.h264_rate_step(now_std(), gop, 30);
+        assert_eq!(
+            b.h264.pending_idr,
+            Some(IdrCause::GopPeriodic),
+            "3.1 s since the last IDR: the bridge asks for the scheduled one"
+        );
         b.reset_h264_session();
-        assert_eq!(b.h264.frames_since_idr, None);
+        assert!(b.h264.last_idr_at.is_none());
     }
 
     /// A probe window is claimed, and fragments tagged, for an IDR burst and

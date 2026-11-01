@@ -433,14 +433,15 @@ pub struct InjectedH264 {
 
 /// The scripted CBR encoder of [`InjectedH264::cbr`]: a P frame is
 /// `rate / 8 / fps` bytes, an IDR is `idr_over_p` of them, and an IDR is made
-/// on a reopen, a request, and every `gop_frames` frames.
+/// on a reopen, on a request, and for the first frame, exactly as the real
+/// encoder: the periodic IDR is the bridge's (a time since the last IDR), not
+/// the encoder's.
 #[derive(Debug, Clone, Copy)]
 pub struct InjectedCbr {
     pub fps: u32,
     pub idr_over_p: u32,
-    /// The GOP, in frames, the bridge's clock and the encoder use; `None` for
-    /// the configured one (3 s of the encoder's 60 fps).
-    pub gop_frames: Option<u32>,
+    /// The GOP the bridge's clock uses; `None` for the configured one.
+    pub gop: Option<std::time::Duration>,
 }
 
 /// An arm of the `select!` in `IoBridge::run`. See `IoBridge::loop_arm_trace`.
@@ -1362,7 +1363,10 @@ impl IoBridge {
         bwe: crate::transport::bwe::BweWrapper,
     ) -> Self {
         let (peer_lookup_tx, peer_lookup_rx) = mpsc::unbounded_channel();
-        let h264_gop_frames = lib_config.transport.h264_gop_frames();
+        let (h264_gop, h264_fps) = (
+            lib_config.transport.h264_gop(),
+            lib_config.transport.h264_fps(),
+        );
         Self {
             _handle: diffs.handle,
             stream,
@@ -1460,7 +1464,8 @@ impl IoBridge {
             frame_acks_malformed: 0,
             last_h264_frame_seq: None,
             h264: H264Tx {
-                gop_frames: h264_gop_frames,
+                gop: h264_gop,
+                fps: h264_fps,
                 ..H264Tx::default()
             },
             #[cfg(any(test, feature = "browserless-harness"))]

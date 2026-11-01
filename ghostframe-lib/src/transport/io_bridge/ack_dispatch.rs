@@ -331,20 +331,30 @@ impl IoBridge {
             let tile_key = content.tile();
             // `queued_at` and the probe tag come from whichever cache holds the
             // content: the tile cache, or the H.264 probe cache.
-            let cache_entry = match content {
-                crate::transport::reliable_emitter::Content::Tile(k) => {
-                    self.reliable_emitter.cache.get(k)
-                }
+            let cache_entry: Option<(std::time::Instant, Option<_>)> = match content {
+                crate::transport::reliable_emitter::Content::Tile(k) => self
+                    .reliable_emitter
+                    .cache
+                    .get(k)
+                    .map(|e| (e.queued_at, e.probe)),
                 crate::transport::reliable_emitter::Content::H264Frag {
                     frame_seq,
                     frag_idx,
-                } => self.reliable_emitter.h264.get(*frame_seq, *frag_idx),
+                } => self
+                    .reliable_emitter
+                    .h264
+                    .get(*frame_seq, *frag_idx)
+                    .map(|e| (e.queued_at, e.probe)),
+                crate::transport::reliable_emitter::Content::Pad(ws) => self
+                    .reliable_emitter
+                    .pads
+                    .get(*ws)
+                    .map(|e| (e.queued_at, Some(e.probe))),
             };
             let server_emit_us = tx.emit_us;
             let queued_since_epoch_us = cache_entry
-                .map(|entry| {
-                    entry
-                        .queued_at
+                .map(|(queued_at, _)| {
+                    queued_at
                         .saturating_duration_since(self.bwe_epoch)
                         .as_micros() as u64
                 })
@@ -353,7 +363,7 @@ impl IoBridge {
             let tier = tile_key.map_or(PassTier::Critical, |k| pass_tier(k.pass_idx));
             let emit_lo16 = ((server_emit_us / 1000) & 0xFFFF) as u16;
             let owd_ms_lo16 = arrival_lo16.wrapping_sub(emit_lo16);
-            let probe = cache_entry.and_then(|entry| entry.probe);
+            let probe = cache_entry.and_then(|(_, probe)| probe);
             self.bwe_samples_buffer.push(BweSample {
                 tier,
                 server_emit_us,
