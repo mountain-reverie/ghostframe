@@ -26,7 +26,6 @@ use ghostframe_client_net::{ClientNet, ClientNetEvent};
 use ghostframe_tsnet::MAX_FRAME_LEN;
 
 use crate::event::{ClientEvent, EventQueue};
-use crate::render_thread::RenderMsg;
 
 /// Commands the owning `Client` sends to the net thread through the wake
 /// eventfd + this channel pair.
@@ -315,7 +314,9 @@ pub(crate) struct NetThreadArgs {
     pub udp_fd: OwnedFd,
     pub wake_fd: Arc<OwnedFd>,
     pub cmd_rx: Receiver<NetCommand>,
-    pub render_tx: std::sync::mpsc::Sender<RenderMsg>,
+    /// Core events, tiles still undecoded, for the decode thread (see
+    /// `decode_thread`).
+    pub decode_tx: std::sync::mpsc::Sender<ghostframe_client_core::Event>,
     pub queue: Arc<EventQueue>,
     pub base: Instant,
     /// The single peer address quinn-proto was told about in
@@ -333,7 +334,7 @@ pub(crate) fn run(args: NetThreadArgs) {
         udp_fd,
         wake_fd,
         cmd_rx,
-        render_tx,
+        decode_tx,
         queue,
         base,
         peer_addr,
@@ -470,11 +471,11 @@ pub(crate) fn run(args: NetThreadArgs) {
                     if let Some(host_ev) = host_event_for(&core_ev) {
                         queue.push(host_ev);
                     }
-                    if render_tx.send(RenderMsg::Core(core_ev)).is_err() {
-                        // Render thread is gone; nothing more this thread
-                        // can usefully do with decoded events, but ACK/NACK
+                    if decode_tx.send(core_ev).is_err() {
+                        // Decode thread is gone; nothing more this thread
+                        // can usefully do with core events, but ACK/NACK
                         // timing must keep running until told to stop.
-                        tracing::warn!("render thread channel closed; dropping core event");
+                        tracing::warn!("decode thread channel closed; dropping core event");
                     }
                 }
             }

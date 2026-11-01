@@ -1,6 +1,6 @@
 //! Native client library for `ghostframe-client-capi`.
 //!
-//! Owns the tsnet transport, a net thread and a render thread, and exposes
+//! Owns the tsnet transport, a net, a decode and a render thread, and exposes
 //! an idiomatic Rust [`Client`] API that `ghostframe-client-capi` wraps in
 //! a C ABI. See `docs/superpowers/specs/2026-09-22-native-client-design.md`
 //! for the full design.
@@ -12,10 +12,12 @@
 //!   report.
 //! - [`input`]: thin wrappers over `ghostframe_client_core::input` for
 //!   encoding input events onto the wire.
-//! - [`net_thread`] / [`render_thread`]: the two library threads. See
-//!   their module docs for why the split is deliberate, not incidental.
+//! - [`net_thread`] / [`decode_thread`] / [`render_thread`]: the three
+//!   library threads, in pipeline order. See their module docs for why the
+//!   split is deliberate, not incidental.
 
 pub mod bootstrap;
+mod decode_thread;
 pub mod event;
 pub mod input;
 mod net_thread;
@@ -28,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub use ghostframe_client_core::ClientDisplay;
+use ghostframe_client_core::TileDelivery;
 pub use ghostframe_client_gpu::ring::PublishedFrame;
 use ghostframe_client_net::{ClientNet, ClientNetConfig};
 use ghostframe_tsnet::{GhostbridgeConfig, GhostbridgeHandle};
@@ -167,6 +170,8 @@ pub struct Client {
     // `Some` only between a successful `connect` and `disconnect`/`Drop`.
     bridge: Option<std::sync::Arc<GhostbridgeHandle>>,
     net_thread: Option<std::thread::JoinHandle<()>>,
+    /// Exits on its own once the net thread (its only sender) has.
+    decode_thread: Option<std::thread::JoinHandle<()>>,
     render_thread: Option<std::thread::JoinHandle<()>>,
     net_cmd_tx: Option<mpsc::Sender<NetCommand>>,
     render_tx: Option<mpsc::Sender<RenderMsg>>,
@@ -231,6 +236,7 @@ impl Client {
             queue,
             bridge: None,
             net_thread: None,
+            decode_thread: None,
             render_thread: None,
             net_cmd_tx: None,
             render_tx: None,
@@ -364,7 +370,11 @@ impl Client {
             supports_h264: self.effective_h264,
             display: self.config.display,
         };
-        let mut client_net = ClientNet::new(net_config, 0)?.with_extra_cert_pins(cert_hashes);
+        // Payload: the net thread stops at validated payloads and the decode
+        // thread turns them into pixels -- see `decode_thread`.
+        let mut client_net = ClientNet::new(net_config, 0)?
+            .with_extra_cert_pins(cert_hashes)
+            .with_tile_delivery(TileDelivery::Payload);
         client_net.connect(remote, 0)?;
 
         // SAFETY: eventfd(2) with documented flags; the return value is
@@ -448,8 +458,14 @@ impl Client {
             }
         }
 
+        let (decode_tx, decode_rx) = mpsc::channel();
+        let decode_render_tx = render_tx.clone();
+        let decode_handle = std::thread::Builder::new()
+            .name("gf-decode".into())
+            .spawn(move || decode_thread::run(decode_rx, decode_render_tx))
+            .map_err(ClientError::Io)?;
+
         let net_queue = Arc::clone(&self.queue);
-        let net_render_tx = render_tx.clone();
         let net_wake_fd = Arc::clone(&wake_fd);
         let net_handle = std::thread::Builder::new()
             .name("gf-net".into())
@@ -459,7 +475,7 @@ impl Client {
                     udp_fd,
                     wake_fd: net_wake_fd,
                     cmd_rx: net_cmd_rx,
-                    render_tx: net_render_tx,
+                    decode_tx,
                     queue: net_queue,
                     base,
                     peer_addr: remote,
@@ -469,6 +485,7 @@ impl Client {
 
         self.bridge = Some(bridge);
         self.net_thread = Some(net_handle);
+        self.decode_thread = Some(decode_handle);
         self.render_thread = Some(render_handle);
         self.net_cmd_tx = Some(net_cmd_tx);
         self.render_tx = Some(render_tx);
@@ -477,7 +494,7 @@ impl Client {
         Ok(())
     }
 
-    /// Tear the session down: stop both threads, close the tsnet session.
+    /// Tear the session down: stop the threads, close the tsnet session.
     /// Idempotent -- calling it (or dropping the `Client`) when not
     /// connected is a no-op.
     pub fn disconnect(&mut self) -> Result<(), ClientError> {
@@ -508,6 +525,9 @@ impl Client {
             let _ = tx.send(RenderMsg::Shutdown);
         }
         if let Some(h) = self.net_thread.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.decode_thread.take() {
             let _ = h.join();
         }
         if let Some(h) = self.render_thread.take() {
