@@ -43,7 +43,7 @@
 //! race (HL2 cols 4/5 sign-bit loss for ch=0); keep this host-side.
 
 use crate::framebuffer::Framebuffer;
-use crate::pipelines::cdf53_passes::passes_processed;
+use crate::pipelines::cdf53_passes::{passes_processed, MAX_PASSES};
 
 const INTEGRATE_SRC: &str = include_str!("../../../shaders/client/cdf53_integrate.wgsl");
 const INVERSE_L3_SRC: &str = include_str!("../../../shaders/client/cdf53_inverse_l3.wgsl");
@@ -112,6 +112,10 @@ struct TileTrack {
     received_mask: u16,
     present_passes: u16,
     passes_processed: u32,
+    /// The current generation has a non-empty magnitude plane, so its
+    /// reconstruction is a picture rather than all-zero coefficients. See
+    /// [`Cdf53Pipeline::integrate`].
+    has_magnitude: bool,
 }
 
 pub struct Cdf53Pipeline {
@@ -454,10 +458,6 @@ impl Cdf53Pipeline {
             );
             let tile_idx = *tile_y as u32 * self.cols + *tile_x as u32;
             let track = &mut self.tracks[tile_idx as usize];
-            if !self.dirty_mark[tile_idx as usize] {
-                self.dirty_mark[tile_idx as usize] = true;
-                self.dirty.push(tile_idx);
-            }
 
             if (track.last_seen_gen != *generation as u32 || track.last_seen_seq != *frame_seq)
                 && cleared_tiles.insert(tile_idx)
@@ -474,6 +474,7 @@ impl Cdf53Pipeline {
                 track.passes_processed = 0;
                 track.present_passes = 0;
                 track.received_mask = 0;
+                track.has_magnitude = false;
                 track.last_seen_gen = *generation as u32;
                 track.last_seen_seq = *frame_seq;
             }
@@ -493,6 +494,24 @@ impl Cdf53Pipeline {
                 tile_idx as u64 * 4,
                 &track.passes_processed.to_le_bytes(),
             );
+
+            // Invert the tile only once its reconstruction is a picture.
+            // Pass 0 carries signs only and the inverse has no level shift,
+            // so a tile with no magnitude bits yet inverts to black -- and
+            // inverting it on pass 0 painted every new generation of a tile
+            // black before its content arrived. Until then the tile keeps
+            // what the framebuffer shows. A tile whose every pass is
+            // resolved is drawn regardless: a genuinely black tile is pass 0
+            // alone when sparse-encoded. Same rule as the CPU integrator
+            // (`ghostframe_client_core::cdf53_tile_state`).
+            if *pass_idx > 0 && bit_planes.iter().any(|&b| b != 0) {
+                track.has_magnitude = true;
+            }
+            let drawable = track.has_magnitude || track.passes_processed >= MAX_PASSES;
+            if drawable && !self.dirty_mark[tile_idx as usize] {
+                self.dirty_mark[tile_idx as usize] = true;
+                self.dirty.push(tile_idx);
+            }
 
             tile_work.extend_from_slice(&(*tile_x as u32).to_le_bytes());
             tile_work.extend_from_slice(&(*tile_y as u32).to_le_bytes());

@@ -363,3 +363,49 @@ fn inverse_cost_4096_tiles() {
         );
     }
 }
+
+/// A new generation's pass 0 (signs only) must not be inverted: with no
+/// magnitude bits the inverse produces black, which flashed over the tile's
+/// previous content on every update. The tile keeps what the framebuffer
+/// shows until a magnitude plane lands, then reconstructs exactly.
+#[test]
+fn a_tile_is_not_inverted_to_black_before_it_has_magnitudes() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut rig = Rig::new(&ctx, false);
+    let before = [200u8, 100, 50, 0xFF];
+    rig.fb.debug_fill(&ctx.device, &ctx.queue, before);
+
+    let after_pass0 = rig.batch(&ctx, &entries((1, 1), 1, 7, |p| p == 0));
+    assert!(
+        tile_pixels(&after_pass0, 1, 1)
+            .chunks_exact(4)
+            .all(|p| p == before),
+        "pass 0 alone repainted the tile (black flash)"
+    );
+
+    let complete = rig.batch(&ctx, &entries((1, 1), 1, 7, |p| p > 0));
+    assert_eq!(tile_pixels(&complete, 1, 1), expected_rgba(7));
+}
+
+/// The rule above must not swallow a tile that really is black: sparse, it
+/// is pass 0 alone and complete, so it is drawn.
+#[test]
+fn a_black_tile_is_still_drawn_from_pass_0() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut rig = Rig::new(&ctx, false);
+    rig.fb
+        .debug_fill(&ctx.device, &ctx.queue, [200, 100, 50, 0xFF]);
+
+    let black: Vec<u8> = (0..1024).flat_map(|_| [0, 0, 0, 0xFF]).collect();
+    let coeffs = codec::forward(&black);
+    let (present, sparse) = codec::encode_passes_sparse(&coeffs);
+    assert_eq!(sparse.len(), 1, "premise: a black tile is pass 0 only");
+    let pre = prevalidate_cdf53(&sparse[0].1, 1, 0).expect("prevalidates");
+    let fb = rig.batch(&ctx, &[(2, 0, 1, 0, pre.bit_planes, Some(present), 0)]);
+    assert!(
+        tile_pixels(&fb, 2, 0)
+            .chunks_exact(4)
+            .all(|p| p == [0, 0, 0, 0xFF]),
+        "a complete black tile must be drawn"
+    );
+}
