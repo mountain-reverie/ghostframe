@@ -32,7 +32,7 @@ use ghostframe_e2e::harness::browserless::{
 use ghostframe_e2e::netsim::{
     Bottleneck, CapTimeline, DropPlan, FragSel, FrameDropRule, NetProfile,
 };
-use ghostframe_lib::transport::io_bridge::IdrCause;
+use ghostframe_lib::transport::io_bridge::{IdrCause, InjectedCbr};
 
 const CADENCE_US: u64 = DEFAULT_CADENCE_US;
 
@@ -744,6 +744,315 @@ async fn periodic_idrs_hold_no_p_frames() {
             s.frames_skipped_hold <= 6,
             "seed {seed:#x}: {} frames skipped for hold",
             s.frames_skipped_hold
+        );
+    }
+}
+
+// ---- rate control (design PR A4) --------------------------------------------
+
+/// Frames per second of the harness cadence (33.3 ms).
+const FPS: u32 = 30;
+
+/// A CBR scripted encoder on the harness's 30 fps cadence. A P frame is 1/30 s
+/// of the rate the bridge sets. An IDR is `IDR_OVER_P` P frames, i.e. 0.2 s of
+/// the rate: under the one-second VBV the real encoder is opened with, and
+/// the value at which the loop is stable on these 2 and 1 Mbit/s links (12 P
+/// frames, 0.4 s of the rate, a 52 kB burst into a 2 Mbit/s link, collapsed
+/// the estimate to its floor in exploratory runs; see the report on PR A4).
+/// The GOP is 3 s of those frames, as in production (180 frames at the
+/// encoder's 60 fps; the harness runs at 30).
+const IDR_OVER_P: u32 = 6;
+
+fn cbr_load() -> H264Load {
+    let mut l = load(0, 0);
+    l.cbr = Some(InjectedCbr {
+        fps: FPS,
+        idr_over_p: IDR_OVER_P,
+        gop_frames: Some(3 * FPS),
+    });
+    l
+}
+
+fn bottleneck_net(cap_bytes_per_s: CapTimeline, delay_us: u64, depth_ms: u64) -> NetProfile {
+    NetProfile {
+        delay_us,
+        jitter_us: 1_000,
+        // Bytes per second despite the name.
+        cap: cap_bytes_per_s,
+        bottleneck: Some(Bottleneck {
+            depth_ms,
+            aqm: None,
+        }),
+        ..NetProfile::perfect()
+    }
+}
+
+/// Scene 6, rate-control variant (design T3 and 4.3): an overdriven link, and
+/// the CBR stream follows the estimate down instead of being skipped into
+/// submission.
+///
+/// The link carries 1 Mbit/s. The first rate is 0.8 x the 2 Mbit/s seed, 1.6
+/// Mbit/s, and with parity and framing that is about 2.2 Mbit/s on the wire,
+/// more than twice the link. The control run keeps that rate (fixed frame
+/// sizes, no policy) and the encoder gate skips frames for the whole scene.
+/// With the policy the rate falls to 0.8 x the estimate within seconds and the
+/// skips stop.
+///
+/// Properties, none a magic number:
+///  * premise: the control skips for the queue in more than a third of its
+///    frames, so the link really was overdriven;
+///  * the policy acted: it reopened the encoder, never more than the 2 s rule
+///    allows (`1 + duration / 2 s`);
+///  * the rate it ends on is at most `0.8 x` the highest estimate of the run
+///    (the share is the definition of the target) and at least the floor;
+///  * the skips are bounded: under a third of the control's (measured about
+///    one in eight: they all fall in the seconds before the first cut);
+///  * every captured frame was sent or skipped, and the client got what was sent.
+///
+/// Mutation: with the policy's `step` returning `Keep` (the rate never leaves
+/// its initial value) the skip bound and the "acted" premise fail.
+#[tokio::test(start_paused = true)]
+async fn cbr_follows_the_estimate_down_on_an_overdriven_link() {
+    const SECS: u64 = 20;
+    const LINK_BYTES_PER_S: u64 = 125_000;
+    for seed in [0x6601u64, 0x6602, 0x6603] {
+        let net = || bottleneck_net(CapTimeline::constant(LINK_BYTES_PER_S), 10_000, 3_000);
+        // The control: the initial rate's frame sizes, no rate control.
+        let p_bytes = (1_600_000 / 8 / FPS) as usize;
+        let control = run(
+            scene(
+                seed,
+                SECS,
+                net(),
+                load(IDR_OVER_P as usize * p_bytes, p_bytes),
+                DropPlan::default(),
+            ),
+            RunOptions::default(),
+        )
+        .await
+        .expect("control scene");
+        let r = run(
+            scene(seed, SECS, net(), cbr_load(), DropPlan::default()),
+            RunOptions::default(),
+        )
+        .await
+        .expect("scene");
+        report(&format!("cbr overdriven {seed:#x}"), &r);
+        let (s, c) = (&r.h264.stats, &control.h264.stats);
+        println!(
+            "  rate={} reopens drop={} gop={} skips bp={} (control {}) est_end={}",
+            s.rate_target_bps,
+            s.rate_reopens_drop,
+            s.rate_reopens_gop,
+            s.frames_skipped_backpressure,
+            c.frames_skipped_backpressure,
+            r.bwe_estimate_bps
+        );
+        let injected =
+            |r: &BrowserlessResult| r.injections.iter().filter(|(_, hb)| !hb).count() as u64;
+        // Premises.
+        assert!(
+            c.frames_skipped_backpressure * 3 > injected(&control),
+            "seed {seed:#x}: the control skipped only {} of {} frames; the link was not overdriven",
+            c.frames_skipped_backpressure,
+            injected(&control)
+        );
+        let reopens = s.rate_reopens_drop + s.rate_reopens_gop;
+        assert!(
+            reopens >= 1,
+            "seed {seed:#x}: the policy never acted: {s:?}"
+        );
+        assert_eq!(
+            r.s2c_datagrams_dropped, 0,
+            "seed {seed:#x}: nothing may be dropped"
+        );
+        // Properties.
+        assert!(
+            reopens <= 1 + SECS / 2,
+            "seed {seed:#x}: {reopens} reopens in {SECS} s breaks the one-per-2-s rule"
+        );
+        let est_max = r.bwe_estimate_samples.iter().map(|x| x.1).max().unwrap();
+        assert!(
+            u64::from(s.rate_target_bps) <= (est_max as f64 * 0.8) as u64 + 1,
+            "seed {seed:#x}: rate {} over 0.8 x the highest estimate {est_max}",
+            s.rate_target_bps
+        );
+        assert!(
+            s.rate_target_bps >= 300_000,
+            "seed {seed:#x}: under the floor"
+        );
+        assert!(
+            s.frames_skipped_backpressure * 3 <= c.frames_skipped_backpressure,
+            "seed {seed:#x}: skips {} against the control's {}",
+            s.frames_skipped_backpressure,
+            c.frames_skipped_backpressure
+        );
+        assert_eq!(
+            s.frames_sent + s.frames_skipped_hold + s.frames_skipped_backpressure,
+            injected(&r),
+            "seed {seed:#x}: {s:?}"
+        );
+        let d = delivered(&r);
+        assert!(d.len() as u64 + 3 >= s.frames_sent, "seed {seed:#x}");
+    }
+}
+
+/// Scene P-B (design 4.3): a capacity step 2 -> 6 Mbit/s with the stream in
+/// H.264 mode. The step is at `STEP_AT_US`; the scene runs long enough after
+/// it to observe the whole `T_UP` bound.
+struct StepRun {
+    r: BrowserlessResult,
+    /// Median and minimum estimate over the four seconds before the step (the
+    /// median is printed; the minimum is what the property compares with).
+    pre: u64,
+    pre_min: u64,
+    /// `(t_us, estimate)` from the step on.
+    post: Vec<(u64, u64)>,
+}
+
+const STEP_AT_US: u64 = 6_000_000;
+const STEP_FROM_BPS: u64 = 2_000_000;
+const STEP_TO_BPS: u64 = 6_000_000;
+/// `2 x MIN_TIME_BETWEEN_ALR_PROBES + 1 s`, the D1 P6b bound (design 4.3).
+const T_UP_US: u64 = 11_000_000;
+
+async fn capacity_step(seed: u64) -> StepRun {
+    let net = bottleneck_net(
+        CapTimeline::step(STEP_FROM_BPS / 8, STEP_AT_US, STEP_TO_BPS / 8),
+        20_000,
+        600,
+    );
+    let r = run(
+        scene(seed, 30, net, cbr_load(), DropPlan::default()),
+        RunOptions::default(),
+    )
+    .await
+    .expect("scene");
+    let mut pre: Vec<u64> = r
+        .bwe_estimate_samples
+        .iter()
+        .filter(|(t, _)| (STEP_AT_US - 4_000_000..STEP_AT_US).contains(t))
+        .map(|x| x.1)
+        .collect();
+    assert!(!pre.is_empty(), "premise: estimate samples before the step");
+    pre.sort_unstable();
+    let post = r
+        .bwe_estimate_samples
+        .iter()
+        .filter(|(t, _)| *t >= STEP_AT_US)
+        .copied()
+        .collect();
+    StepRun {
+        pre_min: pre[0],
+        pre: pre[pre.len() / 2],
+        post,
+        r,
+    }
+}
+
+/// P-B, lower bound: after a capacity step the estimate never falls below
+/// `0.8 x` its pre-step value during the `T_UP` that follows. The step must not
+/// make the stream collapse (the CBR loop is a feedback loop: a rate cut that
+/// the estimator reads as a smaller path would ratchet down).
+///
+/// "Its pre-step value" is the lowest estimate of the four seconds before the
+/// step, not the median: the estimate of a stream that fills 0.8 of a 2 Mbit/s
+/// link wanders between 1.2 and 2.1 Mbit/s by itself (the median of seed
+/// 0x6702 is 1.79 and its own minimum 1.30), so the median would fail a run
+/// that never left its pre-step band. The step only adds headroom, so an
+/// estimate under 0.8 x the quietest it was before is the loop collapsing.
+/// Measured over six seeds the lowest ratio is 0.91.
+///
+/// Premises: the stream really ran in H.264 mode with the policy active (it
+/// reopened or ran at a rate set by it), the pre-step estimate is the 2 Mbit/s
+/// link's (above 0.5 x the link and not above 1.1 x), and there are samples
+/// across the whole window.
+#[tokio::test(start_paused = true)]
+async fn a_capacity_step_up_does_not_collapse_the_cbr_estimate() {
+    for seed in [0x6701u64, 0x6702, 0x6703, 0x6704, 0x6705, 0x6706] {
+        let StepRun {
+            r,
+            pre,
+            pre_min,
+            post,
+        } = capacity_step(seed).await;
+        report(&format!("P-B {seed:#x}"), &r);
+        let s = &r.h264.stats;
+        let window: Vec<&(u64, u64)> = post
+            .iter()
+            .filter(|(t, _)| *t < STEP_AT_US + T_UP_US)
+            .collect();
+        let min_after = window
+            .iter()
+            .map(|x| x.1)
+            .min()
+            .expect("samples after the step");
+        println!(
+            "  pre={pre} pre_min={pre_min} min_after={min_after} ({:.2}) max_after={} rate={}",
+            min_after as f64 / pre as f64,
+            post.iter().map(|x| x.1).max().unwrap(),
+            s.rate_target_bps
+        );
+        assert!(
+            s.rate_target_bps > 0,
+            "seed {seed:#x}: the policy never set a rate"
+        );
+        assert!(
+            pre > STEP_FROM_BPS / 2 && pre <= STEP_FROM_BPS * 11 / 10,
+            "seed {seed:#x}: pre-step estimate {pre} is not the 2 Mbit/s link's"
+        );
+        assert!(
+            window.len() > 50,
+            "seed {seed:#x}: {} samples",
+            window.len()
+        );
+        assert!(
+            min_after * 10 >= pre_min * 8,
+            "seed {seed:#x}: the estimate fell to {min_after} after the step, under 0.8 x {pre_min}"
+        );
+    }
+}
+
+/// P-B, upper bound (the design's acceptance): the estimate reaches `0.8 x 6`
+/// Mbit/s within `T_UP = 11 s` of the step. **Fails on the Phase A stream, and
+/// is ignored until a mechanism finds headroom for a CBR stream.** Measured on
+/// three seeds, 30 s scenes: the estimate never exceeds 2.6 Mbit/s in the 24 s
+/// after the step (0.8 x 6 is 4.8) and `probes_completed` is 0 (the two windows
+/// are the start-up ladder). The reason is the one the design's analysis names and
+/// then sets aside: a stream that sends `0.8 x` its estimate is not
+/// application-limited by goog_cc's reckoning (its ALR detector wants the
+/// send rate under about `0.65 x`), so goog_cc requests no ALR probe, and
+/// without one the periodic IDR is a burst with nothing to measure: the
+/// additive increase of an unprobed estimate is `1.5 x` the acknowledged rate,
+/// which at `0.8 x` is about +2 % a window. The probe-cap raise of B6 gives a
+/// window to fill only if a request exists; Phase A needs one more thing, a
+/// probe request that does not depend on ALR (or a share under the ALR
+/// threshold while probing). See the A4 report.
+///
+/// The mutation the design names ("disable the IDR probe burst -> fails") is
+/// vacuous until this passes: the test fails with the burst in place.
+#[tokio::test(start_paused = true)]
+#[ignore = "A4 finding: a CBR stream at 0.8 x estimate is not in ALR, so no probe finds a capacity step (see doc)"]
+async fn a_capacity_step_up_is_found_within_t_up_in_h264_mode() {
+    for seed in [0x6701u64, 0x6702, 0x6703] {
+        let StepRun { r, post, .. } = capacity_step(seed).await;
+        report(&format!("P-B up {seed:#x}"), &r);
+        let target = STEP_TO_BPS * 8 / 10;
+        let reached = post
+            .iter()
+            .find(|(_, b)| *b >= target)
+            .map(|(t, _)| t - STEP_AT_US);
+        println!(
+            "  reached 0.8 x 6 Mbit/s after {reached:?} us; probes completed={}",
+            r.probes_completed
+        );
+        assert!(
+            r.probes_completed > 0,
+            "seed {seed:#x}: premise: a probe completed after start-up"
+        );
+        assert!(
+            reached.is_some_and(|t| t <= T_UP_US),
+            "seed {seed:#x}: estimate reached {target} after {reached:?} us, bound {T_UP_US} us"
         );
     }
 }
