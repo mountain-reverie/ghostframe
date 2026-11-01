@@ -430,6 +430,139 @@ async fn an_acknowledgement_stall_under_a_busy_stream_costs_one_idr() {
     }
 }
 
+/// An acknowledgement blackout long enough that no frame completes for much
+/// more than the 500 ms progress bound: the bridge raises `h264_stalled` (the
+/// classifier's way out of H.264, which the scripted encoder path does not
+/// run, so the flag is what is observable here), keeps it up through the
+/// blackout, and drops it when frames complete again. A healthy stretch before
+/// it raises nothing.
+#[tokio::test(start_paused = true)]
+async fn a_long_acknowledgement_blackout_raises_h264_stalled_and_recovery_clears_it() {
+    const BLACKOUT_MS: (u64, u64) = (3_000, 5_000);
+    for seed in [0x5501u64, 0x5502, 0x5503] {
+        let opts = RunOptions {
+            ack_blackout: Some((
+                Duration::from_millis(BLACKOUT_MS.0),
+                Duration::from_millis(BLACKOUT_MS.1),
+            )),
+            ..RunOptions::default()
+        };
+        let r = run(
+            scene(
+                seed,
+                9,
+                link_20ms(),
+                load(40_000, 3_000),
+                DropPlan::default(),
+            ),
+            opts,
+        )
+        .await
+        .expect("scene");
+        report(&format!("long-blackout {seed:#x}"), &r);
+        let s = &r.h264.stats;
+        println!(
+            "  stalls inflight={} no_progress={} reset={} stalled_ms={} at_end={}",
+            s.stalls_inflight,
+            s.stalls_no_progress,
+            s.stalls_reset,
+            s.h264_stalled_ms,
+            r.h264.stalled
+        );
+        // Premises: acknowledgements were dropped, and frames were sent
+        // before, during and after.
+        assert!(r.h264.acks_blacked_out > 10, "seed {seed:#x}");
+        assert!(s.frames_acked > 30, "seed {seed:#x}: {}", s.frames_acked);
+        // The stall: raised (once, for the blackout), accounted for roughly
+        // as long as the blackout minus the progress bound, and not still up.
+        assert!(
+            s.stalls_inflight + s.stalls_no_progress >= 1,
+            "seed {seed:#x}: {s:?}"
+        );
+        assert!(
+            s.h264_stalled_ms >= 1_000 && s.h264_stalled_ms <= 3_000,
+            "seed {seed:#x}: stalled {} ms for a 2000 ms blackout",
+            s.h264_stalled_ms
+        );
+        assert!(!r.h264.stalled, "seed {seed:#x}: still stalled at the end");
+    }
+}
+
+/// And a healthy run never raises it: the flag is not a side effect of load.
+#[tokio::test(start_paused = true)]
+async fn a_healthy_h264_stream_never_stalls() {
+    for seed in [0x5601u64, 0x5602] {
+        let r = run(
+            scene(
+                seed,
+                6,
+                link_20ms(),
+                load(40_000, 3_000),
+                DropPlan::default(),
+            ),
+            RunOptions::default(),
+        )
+        .await
+        .expect("scene");
+        report(&format!("healthy-stall {seed:#x}"), &r);
+        let s = &r.h264.stats;
+        assert!(s.frames_acked > 100, "premise, seed {seed:#x}: {s:?}");
+        assert_eq!(
+            (
+                s.stalls_inflight,
+                s.stalls_no_progress,
+                s.stalls_reset,
+                s.h264_stalled_ms
+            ),
+            (0, 0, 0, 0),
+            "seed {seed:#x}"
+        );
+    }
+}
+
+/// A ~100 KB first IDR over a 1 Mbit/s link takes 0.8 s to drain, longer than
+/// the 500 ms no-progress bound, with no whole frame complete until the end.
+/// Fragments are acknowledged all the while: that is progress, not a stall
+/// (a whole-frame notion of progress flapped the session tile <-> H.264 every
+/// few seconds on a starved link).
+#[tokio::test(start_paused = true)]
+async fn a_large_idr_on_a_slow_link_is_not_a_stall() {
+    const LINK_BYTES_PER_S: u64 = 125_000;
+    const IDR_BYTES: usize = 100_000;
+    for seed in [0x5701u64, 0x5702, 0x5703] {
+        let net = NetProfile {
+            delay_us: 20_000,
+            cap: CapTimeline::constant(LINK_BYTES_PER_S),
+            bottleneck: Some(Bottleneck {
+                depth_ms: 3_000,
+                aqm: None,
+            }),
+            ..NetProfile::perfect()
+        };
+        let r = run(
+            scene(seed, 8, net, load(IDR_BYTES, 1_500), DropPlan::default()),
+            RunOptions::default(),
+        )
+        .await
+        .expect("scene");
+        report(&format!("slow-idr {seed:#x}"), &r);
+        let s = &r.h264.stats;
+        // Premises: the IDR alone takes longer than the bound to cross the
+        // link, and it did cross (the stream went on).
+        assert!(
+            IDR_BYTES as u64 * 1000 / LINK_BYTES_PER_S > 500,
+            "seed {seed:#x}: the IDR must outlast the 500 ms bound"
+        );
+        assert!(s.frames_acked >= 10, "seed {seed:#x}: {s:?}");
+        assert_eq!(
+            (s.stalls_inflight, s.stalls_no_progress, s.stalls_reset),
+            (0, 0, 0),
+            "seed {seed:#x}: {s:?}"
+        );
+        assert_eq!(s.h264_stalled_ms, 0, "seed {seed:#x}");
+    }
+}
+
 /// A link that carries a fifth of what the encoder produces (1 Mbit/s against
 /// 20 KB P frames at 30 fps), behind a buffer deep enough that nothing is
 /// dropped. The encoder is not run into a queue it cannot drain: frames are

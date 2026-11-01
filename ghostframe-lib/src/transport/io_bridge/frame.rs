@@ -1448,7 +1448,7 @@ impl IoBridge {
 
     /// Dirty-tile bookkeeping, per-tile classification and frame-mode decision
     /// for one GPU frame. Returns `(dirty_xy, prev_mode, new_mode)`.
-    fn classify_dirty_tiles(
+    pub(super) fn classify_dirty_tiles(
         &mut self,
         analysis: &Analysed,
         frame: &FrameMeta,
@@ -1511,7 +1511,10 @@ impl IoBridge {
         // bridge's own `now_std()` epoch instead, so `enter_sustain_micros`
         // / `exit_sustain_micros` advance with virtual time exactly like
         // every other deadline in this file.
-        let now_us = now_std().duration_since(self.epoch).as_micros() as u64;
+        let now = now_std();
+        let now_us = now.duration_since(self.epoch).as_micros() as u64;
+        // The H.264 transport's stall flag is an input of this decision.
+        self.update_h264_stall(now);
         let new_mode = self
             .classifier
             .decide_frame_mode_at(now_us, &tentative, prev_mode);
@@ -1595,6 +1598,9 @@ impl IoBridge {
             // force_frames = 1 (not 20) because we're past QUIC slow-start by
             // the time exit_sustain elapses; ACK-based retries handle
             // individual datagram drops on the lossless tiles.
+            if prev_mode == FrameMode::H264 && new_mode == FrameMode::TileCodec {
+                self.abandon_h264_inflight(seq, now);
+            }
             if prev_mode == FrameMode::H264
                 && new_mode == FrameMode::TileCodec
                 && self.frame_pipeline.is_some()
@@ -1737,6 +1743,8 @@ impl IoBridge {
         if is_idr {
             self.supersede_h264_before(seq, now);
             self.h264.last_idr_seq = Some(seq);
+            // Whatever a verdict doomed is superseded by this IDR.
+            self.h264.doomed_from = None;
             if cause == Some(IdrCause::GopPeriodic) {
                 // The encoder's own periodic IDR: the client already has a
                 // picture, P frames after it only chain from it, and a lost
@@ -1749,7 +1757,7 @@ impl IoBridge {
         }
         self.h264
             .tracker
-            .on_frame_sent(seq, is_idr, datagrams.len() as u16);
+            .on_frame_sent(seq, is_idr, datagrams.len() as u16, now);
         self.h264.stats.frames_sent += 1;
 
         self.cumulative_datagrams_emitted.h264 = self
@@ -2645,6 +2653,10 @@ impl IoBridge {
                     frames_skipped_hold = h.frames_skipped_hold,
                     frames_skipped_backpressure = h.frames_skipped_backpressure,
                     queue_purged = h.queue_purged,
+                    h264_stalled_ms = h.h264_stalled_ms,
+                    stalls_inflight = h.stalls_inflight,
+                    stalls_no_progress = h.stalls_no_progress,
+                    stalls_reset = h.stalls_reset,
                     queued_bytes = self.reliable_emitter.queued_h264_bytes(),
                     cache_fragments = self.reliable_emitter.h264.len(),
                     tx_recorded = h.tx_recorded,

@@ -35,6 +35,39 @@ use super::*;
 use crate::transport::reliable_emitter::Content;
 use crate::transport::transmission_ledger::Transmission;
 
+/// Floor of the in-flight bound for `h264_stalled` (a): unresolved frames
+/// beyond `max(this, ceil(2 * srtt / frame interval) + 8)` mean the path has
+/// stopped carrying the stream.
+pub(super) const STALL_INFLIGHT_FLOOR: u32 = 32;
+/// `h264_stalled` (b): no H.264 fragment acknowledged for this long while
+/// frames are in flight. (A large IDR on a slow link takes seconds to drain;
+/// a fragment at a time is progress, a whole frame is not the right unit.)
+pub(super) const STALL_NO_PROGRESS: std::time::Duration = std::time::Duration::from_millis(500);
+/// `h264_stalled` (c): honoured client reset requests (each one an IDR the
+/// server made) that raise the flag: this many within [`STALL_RESET_WINDOW`].
+/// The client asking again and again means the IDRs do not help. (A client
+/// that paces its requests just outside the server's own 2 s limit would
+/// never trip a "rate-limited" test.)
+pub(super) const STALL_RESET_COUNT: usize = 3;
+pub(super) const STALL_RESET_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long the flag stays up once (c) trips.
+pub(super) const STALL_RESET_HOLD: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The in-flight bound of the stall flag (a), from the smoothed RTT.
+///
+/// Assumes the design's frame interval of a 30 Hz stream
+/// ([`SCHEDULER_TICK_INTERVAL_US`], 33.3 ms), not the capture rate actually in
+/// force: a 60 Hz stream has twice the frames in flight per RTT, which the
+/// floor of 32 and the `+ 8` absorb up to a ~400 ms round trip.
+pub(super) fn stall_inflight_bound(srtt_us: f32) -> u32 {
+    let frames_per_two_rtt = if srtt_us > 0.0 {
+        (2.0 * f64::from(srtt_us) / SCHEDULER_TICK_INTERVAL_US).ceil() as u32
+    } else {
+        0
+    };
+    STALL_INFLIGHT_FLOOR.max(frames_per_two_rtt.saturating_add(8))
+}
+
 /// Frames the tracker follows (`frame_seq % TRACKER_RING`, with a check).
 pub(super) const TRACKER_RING: usize = 256;
 
@@ -166,6 +199,13 @@ pub struct H264Stats {
     /// Queued emissions removed because an IDR superseded their frame or a
     /// verdict made it suspect.
     pub queue_purged: u64,
+    /// Time the `h264_stalled` flag was up, ms; and how many times it went up,
+    /// by the condition that raised it (in-flight bound, no progress, client
+    /// reset requests over the rate limit).
+    pub h264_stalled_ms: u64,
+    pub stalls_inflight: u64,
+    pub stalls_no_progress: u64,
+    pub stalls_reset: u64,
 }
 
 /// What the harness reads back after a scene: the counters plus two gauges.
@@ -178,6 +218,8 @@ pub struct H264Report {
     pub probe_cache_fragments: usize,
     /// Acknowledgement datagrams the harness's blackout dropped (0 in production).
     pub acks_blacked_out: u64,
+    /// The `h264_stalled` flag as of the last evaluation.
+    pub stalled: bool,
 }
 
 /// One frame the tracker follows.
@@ -189,6 +231,7 @@ struct TrackedFrame {
     acked: Vec<u64>,
     acked_count: u16,
     suspect: bool,
+    sent_at: std::time::Instant,
 }
 
 impl TrackedFrame {
@@ -233,7 +276,13 @@ impl FrameTracker {
         frame_seq as usize % TRACKER_RING
     }
 
-    pub(super) fn on_frame_sent(&mut self, frame_seq: u32, is_idr: bool, frags_total: u16) {
+    pub(super) fn on_frame_sent(
+        &mut self,
+        frame_seq: u32,
+        is_idr: bool,
+        frags_total: u16,
+        now: std::time::Instant,
+    ) {
         self.ring[Self::slot(frame_seq)] = Some(TrackedFrame {
             frame_seq,
             is_idr,
@@ -241,7 +290,35 @@ impl FrameTracker {
             acked: vec![0; (frags_total as usize).div_ceil(64)],
             acked_count: 0,
             suspect: false,
+            sent_at: now,
         });
+    }
+
+    /// The frames the stall flag counts as in flight: sent, not fully
+    /// acknowledged, not judged lost, at or after `floor` (older ones are
+    /// superseded by an IDR or abandoned with H.264 mode) and before
+    /// `doomed_from` (frames after a suspect one chain from it and will never
+    /// be resolved). Returns their number and the send time of the oldest.
+    /// A scan of the ring, once per frame decision, not per datagram.
+    pub(super) fn unresolved(
+        &self,
+        floor: u32,
+        doomed_from: Option<u32>,
+    ) -> (u32, Option<std::time::Instant>) {
+        let mut count = 0u32;
+        let mut oldest: Option<std::time::Instant> = None;
+        for f in self.ring.iter().flatten() {
+            if f.frame_seq < floor
+                || f.suspect
+                || f.complete()
+                || doomed_from.is_some_and(|d| f.frame_seq >= d)
+            {
+                continue;
+            }
+            count += 1;
+            oldest = Some(oldest.map_or(f.sent_at, |o| o.min(f.sent_at)));
+        }
+        (count, oldest)
     }
 
     fn get(&self, frame_seq: u32) -> Option<&TrackedFrame> {
@@ -315,6 +392,21 @@ pub(super) struct H264Tx {
     pub(super) acked_any: bool,
     pub(super) warned_no_acks: bool,
     pub(super) stats: H264Stats,
+    /// Frames older than this are not in flight as far as the stall flag is
+    /// concerned (set when the session leaves H.264 mode).
+    pub(super) ignore_before: u32,
+    /// The oldest frame a loss verdict made suspect since the last IDR.
+    pub(super) doomed_from: Option<u32>,
+    /// When an H.264 fragment was last acknowledged.
+    pub(super) last_ack_progress: Option<std::time::Instant>,
+    /// When the last [`STALL_RESET_COUNT`] client reset requests were
+    /// honoured (oldest first).
+    pub(super) honoured_resets: Vec<std::time::Instant>,
+    /// Until when a burst of honoured reset requests holds the stall flag.
+    pub(super) reset_storm_until: Option<std::time::Instant>,
+    /// The stall flag as of the last evaluation, and when that was.
+    pub(super) stalled: bool,
+    pub(super) stall_eval_at: Option<std::time::Instant>,
 }
 
 impl H264Tx {
@@ -331,6 +423,13 @@ impl H264Tx {
         self.last_idr_seq = None;
         self.acked_any = false;
         self.warned_no_acks = false;
+        self.ignore_before = 0;
+        self.doomed_from = None;
+        self.last_ack_progress = None;
+        self.honoured_resets.clear();
+        self.reset_storm_until = None;
+        self.stalled = false;
+        self.stall_eval_at = None;
     }
 }
 
@@ -555,6 +654,7 @@ impl IoBridge {
                 self.h264.stats.tx_acked_live += 1;
             }
             self.h264.acked_any = true;
+            self.h264.last_ack_progress = Some(now);
             if let Some(h) = self.h264.hold.as_mut().filter(|h| h.frame_seq == frame_seq) {
                 h.last_progress = now;
             }
@@ -606,6 +706,11 @@ impl IoBridge {
         if let Some(f) = self.h264.tracker.get_mut(frame_seq) {
             f.suspect = true;
         }
+        self.h264.doomed_from = Some(
+            self.h264
+                .doomed_from
+                .map_or(frame_seq, |d| d.min(frame_seq)),
+        );
         self.h264.stats.frames_suspect += 1;
         self.record_emitted_transmissions(now);
         let before = self.reliable_emitter.stats.h264_queue_purged;
@@ -616,6 +721,102 @@ impl IoBridge {
         // the probe timer and bytes-in-flight counting them.
         self.reliable_emitter.drop_h264_from(frame_seq);
         self.request_h264_idr(IdrCause::Loss, now);
+    }
+
+    /// Evaluate the `h264_stalled` flag at `now`, publish it to the
+    /// classifier's context, and return it. Called once per frame decision,
+    /// just before the classifier runs.
+    ///
+    /// Raised by any of: (a) unresolved frames beyond
+    /// [`stall_inflight_bound`]; (b) frames in flight and none fully
+    /// acknowledged for [`STALL_NO_PROGRESS`] (Phase A: progress is any H.264
+    /// fragment the 0x06 acknowledgements name; the frame-ack datagram does
+    /// not exist yet); (c) [`STALL_RESET_COUNT`] honoured client reset
+    /// requests within [`STALL_RESET_WINDOW`] (see
+    /// [`Self::note_h264_reset_honoured`]).
+    pub(super) fn update_h264_stall(&mut self, now: std::time::Instant) -> bool {
+        let floor = self
+            .h264
+            .ignore_before
+            .max(self.h264.last_idr_seq.unwrap_or(0));
+        let (in_flight, oldest) = self.h264.tracker.unresolved(floor, self.h264.doomed_from);
+        let bound = stall_inflight_bound(self.adaptation_context.smoothed_rtt_us);
+        let over_bound = in_flight > bound;
+        let no_progress = oldest.is_some_and(|oldest| {
+            let since = self
+                .h264
+                .last_ack_progress
+                .map_or(oldest, |p| p.max(oldest));
+            now.saturating_duration_since(since) >= STALL_NO_PROGRESS
+        });
+        let reset_storm = self.h264.reset_storm_until.is_some_and(|t| now < t);
+        let stalled = over_bound || no_progress || reset_storm;
+
+        let was = self.h264.stalled;
+        if was {
+            if let Some(t) = self.h264.stall_eval_at {
+                self.h264.stats.h264_stalled_ms +=
+                    now.saturating_duration_since(t).as_millis() as u64;
+            }
+        }
+        if stalled && !was {
+            let st = &mut self.h264.stats;
+            if over_bound {
+                st.stalls_inflight += 1;
+            } else if no_progress {
+                st.stalls_no_progress += 1;
+            } else {
+                st.stalls_reset += 1;
+            }
+            tracing::info!(
+                target: LOG_TARGET,
+                in_flight,
+                bound,
+                over_bound,
+                no_progress,
+                reset_storm,
+                "h264 stalled: the classifier is told to leave H.264"
+            );
+        }
+        self.h264.stalled = stalled;
+        self.h264.stall_eval_at = Some(now);
+        if self.adaptation_context.h264_stalled != stalled {
+            self.adaptation_context.h264_stalled = stalled;
+            self.adaptation_context.last_update_seq =
+                self.adaptation_context.last_update_seq.wrapping_add(1);
+            self.classifier
+                .set_adaptation_context(self.adaptation_context);
+        }
+        stalled
+    }
+
+    /// A client reset request was honoured at `now`. The third within
+    /// [`STALL_RESET_WINDOW`] raises the stall flag for [`STALL_RESET_HOLD`]:
+    /// a client that keeps asking is not helped by the IDRs it gets.
+    pub(super) fn note_h264_reset_honoured(&mut self, now: std::time::Instant) {
+        let r = &mut self.h264.honoured_resets;
+        r.push(now);
+        if r.len() > STALL_RESET_COUNT {
+            r.remove(0);
+        }
+        if r.len() == STALL_RESET_COUNT && now.saturating_duration_since(r[0]) <= STALL_RESET_WINDOW
+        {
+            self.h264.reset_storm_until = Some(now + STALL_RESET_HOLD);
+        }
+    }
+
+    /// The session left H.264 mode at `frame_seq`: frames sent so far are no
+    /// longer in flight as far as the stall flag is concerned (the tile codec
+    /// is carrying the screen now; their fate is the ledger's business).
+    ///
+    /// What was still queued for them is purged and their probe-cache entries
+    /// dropped (they would compete with the tile repaint for the same pacer
+    /// and bytes-in-flight, and the client is no longer decoding them), and
+    /// any P hold ends. Retransmissions already with quinn are left alone.
+    pub(super) fn abandon_h264_inflight(&mut self, frame_seq: u32, now: std::time::Instant) {
+        self.h264.ignore_before = self.h264.ignore_before.max(frame_seq);
+        self.supersede_h264_before(frame_seq, now);
+        self.end_h264_hold(now);
     }
 
     /// Route the loss verdicts of a pass of the loss path to the H.264 policy.
@@ -644,6 +845,8 @@ impl IoBridge {
             return;
         };
         let now = now_std();
+        // The classifier is not in this scripted path; the flag still is.
+        self.update_h264_stall(now);
         self.emit_frame_dimensions(seq, timestamp_us, h.width, h.height);
         if self.h264_frame_gate(now) != H264Gate::Encode {
             // Skipped: the admission pass still runs, as it does for a frame
@@ -712,7 +915,7 @@ mod tests {
     #[test]
     fn the_tracker_completes_a_frame_exactly_once_and_ignores_duplicates() {
         let mut t = FrameTracker::default();
-        t.on_frame_sent(7, true, 70);
+        t.on_frame_sent(7, true, 70, now_std());
         for i in 0..69 {
             assert_eq!(t.on_frag_acked(7, i), FragAck::Acked { complete: false });
         }
@@ -727,8 +930,8 @@ mod tests {
     #[test]
     fn a_slot_reused_by_a_newer_frame_does_not_answer_for_the_old_one() {
         let mut t = FrameTracker::default();
-        t.on_frame_sent(5, false, 2);
-        t.on_frame_sent(5 + TRACKER_RING as u32, false, 2);
+        t.on_frame_sent(5, false, 2, now_std());
+        t.on_frame_sent(5 + TRACKER_RING as u32, false, 2, now_std());
         assert_eq!(t.on_frag_acked(5, 0), FragAck::Unknown);
         assert!(t.get(5).is_none());
         assert_eq!(
@@ -740,7 +943,7 @@ mod tests {
     #[test]
     fn clearing_forgets_every_frame() {
         let mut t = FrameTracker::default();
-        t.on_frame_sent(1, true, 1);
+        t.on_frame_sent(1, true, 1, now_std());
         t.clear();
         assert_eq!(t.on_frag_acked(1, 0), FragAck::Unknown);
     }
@@ -1520,5 +1723,399 @@ mod tests {
         b.h264.pending_idr = None;
         b.name_reentry_idr();
         assert_eq!(b.h264.pending_idr, Some(IdrCause::Reentry));
+    }
+
+    // ---- h264_stalled (A5) ----
+
+    /// Fully acknowledge frame `seq` through the real acknowledgement path.
+    fn complete(b: &mut IoBridge, seq: u32) {
+        b.pump_admission();
+        let sent = tracked_sent(b, 0);
+        depart(b, &sent);
+        let ws: Vec<u32> = sent.iter().filter(|x| x.1 == seq).map(|x| x.0).collect();
+        assert!(!ws.is_empty(), "premise: frame {seq} has sent fragments");
+        ack(b, &ws);
+        assert_eq!(b.h264.tracker.is_complete(seq), Some(true));
+    }
+
+    fn ctx_flag(b: &IoBridge) -> bool {
+        b.classifier.adaptation_context().h264_stalled
+    }
+
+    /// (a): unresolved frames beyond `max(32, ceil(2 srtt / interval) + 8)`.
+    #[tokio::test(start_paused = true)]
+    async fn too_many_unresolved_frames_raise_the_stall_flag() {
+        let mut b = bridge().await;
+        let t0 = now_std();
+        // The bound is 32 at a short round trip (literal: see the classifier
+        // tests): 32 frames in flight are fine, a 33rd is not.
+        send(&mut b, 1, true);
+        for seq in 2..=32 {
+            send(&mut b, seq, false);
+        }
+        assert!(
+            !b.update_h264_stall(t0),
+            "the bound itself is not over the bound"
+        );
+        assert!(!ctx_flag(&b));
+        send(&mut b, 33, false);
+        assert!(b.update_h264_stall(t0));
+        assert!(ctx_flag(&b), "the flag reaches the classifier's context");
+        assert_eq!(b.h264.stats.stalls_inflight, 1);
+        assert_eq!(b.h264.stats.stalls_no_progress, 0);
+    }
+
+    /// The bound grows with the round trip: a long path has more in flight.
+    #[tokio::test(start_paused = true)]
+    async fn the_in_flight_bound_follows_the_round_trip() {
+        assert_eq!(stall_inflight_bound(0.0), 32);
+        assert_eq!(stall_inflight_bound(20_000.0), 32);
+        // 1 s: 2 s of frames at 30 Hz = ceil(60.0006) = 61, plus 8.
+        assert_eq!(stall_inflight_bound(1_000_000.0), 69);
+        let mut b = bridge().await;
+        b.adaptation_context.smoothed_rtt_us = 1_000_000.0;
+        let t0 = now_std();
+        send(&mut b, 1, true);
+        for seq in 2..=37 {
+            send(&mut b, seq, false);
+        }
+        assert!(
+            !b.update_h264_stall(t0),
+            "37 frames in flight on a 1 s path is normal"
+        );
+    }
+
+    /// (b): frames in flight and none fully acknowledged for 500 ms.
+    #[tokio::test(start_paused = true)]
+    async fn no_frame_progress_for_500ms_raises_the_stall_flag() {
+        let mut b = bridge().await;
+        let t0 = now_std();
+        // Nothing in flight: no stall, however long.
+        assert!(!b.update_h264_stall(t0 + Duration::from_secs(60)));
+        send(&mut b, 1, true);
+        assert!(!b.update_h264_stall(t0 + Duration::from_millis(499)));
+        assert!(b.update_h264_stall(t0 + Duration::from_millis(500)));
+        assert_eq!(b.h264.stats.stalls_no_progress, 1);
+        assert_eq!(b.h264.stats.stalls_inflight, 0);
+        assert!(ctx_flag(&b));
+    }
+
+    /// A stream that keeps completing frames never stalls, however long it
+    /// runs, and the flag clears when progress resumes.
+    #[tokio::test(start_paused = true)]
+    async fn completing_frames_is_progress() {
+        let mut b = bridge().await;
+        send(&mut b, 1, true);
+        complete(&mut b, 1);
+        let mut seq = 2;
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_millis(300)).await;
+            send(&mut b, seq, false);
+            assert!(!b.update_h264_stall(now_std()), "stalled at frame {seq}");
+            complete(&mut b, seq);
+            seq += 1;
+        }
+        // Now the acknowledgements stop ...
+        send(&mut b, seq, false);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(b.update_h264_stall(now_std()));
+        assert!(ctx_flag(&b));
+        // ... and resume: the stalled frame completes, the flag drops.
+        complete(&mut b, seq);
+        assert!(!b.update_h264_stall(now_std()));
+        assert!(!ctx_flag(&b));
+    }
+
+    /// One frame stuck (its verdict not in yet) while later frames complete is
+    /// a path that is alive: any frame completing is progress.
+    #[tokio::test(start_paused = true)]
+    async fn a_later_frame_completing_is_progress_while_an_earlier_one_waits() {
+        let mut b = bridge().await;
+        send(&mut b, 1, true);
+        complete(&mut b, 1);
+        send(&mut b, 2, false); // never acknowledged
+        for seq in 3..23 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            send(&mut b, seq, false);
+            complete(&mut b, seq);
+            assert!(!b.update_h264_stall(now_std()), "stalled at frame {seq}");
+        }
+        // The stuck frame is old by now; only the lack of progress would
+        // raise the flag, and there is progress.
+        assert_eq!(b.h264.stats.stalls_no_progress, 0);
+    }
+
+    /// Frames a loss verdict doomed (the suspect one and every later one) are
+    /// not "in flight": an IDR is on its way and nothing will resolve them.
+    /// A fragment verdict must not read as a stall.
+    #[tokio::test(start_paused = true)]
+    async fn frames_a_verdict_doomed_are_not_in_flight() {
+        let mut b = bridge().await;
+        send(&mut b, 1, true);
+        complete(&mut b, 1);
+        send(&mut b, 2, false);
+        send(&mut b, 3, false);
+        b.note_h264_verdict(2, 0, now_std());
+        assert_eq!(
+            b.h264.stats.frames_suspect, 1,
+            "premise: frame 2 is suspect"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(
+            !b.update_h264_stall(now_std()),
+            "frames 2 and 3 chain from a lost fragment and are not awaited"
+        );
+        // A frame sent before the verdict's IDR is superseded by it too.
+        send(&mut b, 4, false);
+        send(&mut b, 5, true);
+        complete(&mut b, 5);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(!b.update_h264_stall(now_std()));
+    }
+
+    /// (c): three honoured client reset requests within 10 s.
+    #[tokio::test(start_paused = true)]
+    async fn three_honoured_reset_requests_in_ten_seconds_raise_the_stall_flag() {
+        use ghostframe_protocol::feedback_stream::{ResetReason, ResetRequest};
+        let mut b = bridge().await;
+        let t0 = now_std();
+        let req = ResetRequest {
+            reason: ResetReason::DecoderFailure,
+            frame_seq: 7,
+        };
+        let ms = Duration::from_millis;
+        // The native client paces its requests 2.2 s apart, just outside the
+        // server's own 2 s limit: every one is honoured, none is limited.
+        b.handle_reset_request(req, t0);
+        b.handle_reset_request(req, t0 + ms(2_200));
+        assert_eq!(b.reset_requests_honoured, 2, "premise: both honoured");
+        assert!(!b.update_h264_stall(t0 + ms(2_200)), "two do not stall");
+        b.handle_reset_request(req, t0 + ms(4_400));
+        assert_eq!(b.reset_requests_honoured, 3, "premise: the third honoured");
+        let t = t0 + ms(4_400);
+        assert!(b.update_h264_stall(t));
+        assert_eq!(b.h264.stats.stalls_reset, 1);
+        assert!(b.update_h264_stall(t + ms(499)));
+        assert!(!b.update_h264_stall(t + ms(500)));
+        assert!(!ctx_flag(&b));
+    }
+
+    /// Two requests with jitter, requests spread over more than 10 s, and
+    /// requests the rate limit turned away (which made no IDR) do not stall.
+    #[tokio::test(start_paused = true)]
+    async fn sparse_or_rate_limited_reset_requests_do_not_stall() {
+        use ghostframe_protocol::feedback_stream::{ResetReason, ResetRequest};
+        let req = ResetRequest {
+            reason: ResetReason::DecoderFailure,
+            frame_seq: 7,
+        };
+        let ms = Duration::from_millis;
+        // Two, 2.2 s apart, and again 2.35 s apart.
+        for gap in [2_200, 2_350] {
+            let mut b = bridge().await;
+            let t0 = now_std();
+            b.handle_reset_request(req, t0);
+            b.handle_reset_request(req, t0 + ms(gap));
+            assert!(!b.update_h264_stall(t0 + ms(gap)), "gap {gap}");
+        }
+        // One every 5.1 s: the third is 10.2 s after the first.
+        let mut b = bridge().await;
+        let t0 = now_std();
+        for i in 0..6u64 {
+            let t = t0 + ms(i * 5_100);
+            b.handle_reset_request(req, t);
+            assert!(!b.update_h264_stall(t), "request {i}");
+        }
+        assert_eq!(b.reset_requests_honoured, 6, "premise: all honoured");
+        // A burst inside the 2 s limit makes one IDR, not three.
+        let mut b = bridge().await;
+        let t0 = now_std();
+        for i in 0..5u64 {
+            b.handle_reset_request(req, t0 + ms(i * 100));
+        }
+        assert_eq!(b.reset_requests_honoured, 1, "premise: one honoured");
+        assert!(!b.update_h264_stall(t0 + ms(400)));
+    }
+
+    /// One large IDR draining over a slow link, a fragment at a time, is
+    /// progress: it must not read as a stall, however long the drain takes.
+    /// (A 40 KB IDR of 35 fragments, one acknowledged every 25 ms: the whole
+    /// frame is not complete for 875 ms.)
+    #[tokio::test(start_paused = true)]
+    async fn a_large_idr_draining_a_fragment_at_a_time_is_not_a_stall() {
+        let mut b = bridge().await;
+        b.h264.pending_idr = Some(IdrCause::Session);
+        b.send_h264_frame(
+            H264Out {
+                payload: vec![0xA5; 40_000],
+                is_keyframe: true,
+            },
+            &meta(),
+            1,
+            DG,
+        );
+        b.pump_admission();
+        let sent = tracked_sent(&b, 0);
+        assert!(
+            sent.len() >= 33,
+            "premise: a many-fragment IDR: {}",
+            sent.len()
+        );
+        depart(&mut b, &sent);
+        let mut stalled_at = None;
+        for (i, (ws, _, _)) in sent.iter().enumerate() {
+            tokio::time::advance(Duration::from_millis(25)).await;
+            ack(&mut b, &[*ws]);
+            if b.update_h264_stall(now_std()) && stalled_at.is_none() {
+                stalled_at = Some(i);
+            }
+        }
+        assert!(
+            b.h264.tracker.is_complete(1) == Some(true),
+            "premise: the frame completed"
+        );
+        assert!(
+            sent.len() as u64 * 25 > 500,
+            "premise: the drain outlasts the 500 ms bound"
+        );
+        assert_eq!(stalled_at, None, "stalled while the IDR was draining");
+        assert_eq!(b.h264.stats.stalls_no_progress, 0);
+        // And a real stall is still found: the next frame's acks stop.
+        send(&mut b, 2, false);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(b.update_h264_stall(now_std()));
+    }
+
+    /// Leaving H.264 mode abandons what was in flight, so the flag clears and
+    /// the classifier's re-entry time can start.
+    #[tokio::test(start_paused = true)]
+    async fn leaving_h264_mode_clears_the_stall_flag() {
+        use crate::tile::FrameMode;
+        let mut b = bridge().await;
+        let t0 = now_std();
+        send(&mut b, 1, true);
+        for seq in 2..=34 {
+            send(&mut b, seq, false);
+        }
+        assert!(b.update_h264_stall(t0));
+        // The classifier, handed that context, takes the session to tile ...
+        let now_us = 1_000_000;
+        let mode = b
+            .classifier
+            .decide_frame_mode_at(now_us, &[], FrameMode::H264);
+        assert_eq!(mode, FrameMode::TileCodec);
+        // ... where the old frames no longer count.
+        b.abandon_h264_inflight(50, now_std());
+        assert!(!b.update_h264_stall(t0));
+    }
+
+    /// The wiring, through the real frame decision: a stalled stream in H.264
+    /// mode leaves it on the next decision, the frames in flight stop counting
+    /// as the mode changes, and H.264 stays out for the classifier's
+    /// re-entry time even though the content would put it back.
+    #[tokio::test(start_paused = true)]
+    async fn the_frame_decision_leaves_h264_when_stalled_and_stays_out() {
+        use crate::tile::FrameMode;
+        let mut b = bridge().await;
+        b.frame_mode = FrameMode::H264;
+        // Nothing drains: the fragments sit in the emission queue and the
+        // probe cache, and the IDR's hold is open.
+        b.forced_fifo_depth_for_test = Some(usize::MAX / 2);
+        send(&mut b, 1, true);
+        for seq in 2..=40 {
+            send(&mut b, seq, false);
+        }
+        b.record_emitted_transmissions(now_std());
+        assert!(
+            b.reliable_emitter.queued_h264_bytes() > 0,
+            "premise: queued"
+        );
+        assert!(!b.reliable_emitter.h264.is_empty(), "premise: cached");
+        assert!(b.h264.hold.is_some(), "premise: P hold open");
+        let analysed = crate::transport::io_bridge::frame_backend::Analysed::default();
+        let (_, prev, new) = b.classify_dirty_tiles(&analysed, &meta(), 4, 4, 100);
+        assert_eq!((prev, new), (FrameMode::H264, FrameMode::TileCodec));
+        assert_eq!(b.frame_mode, FrameMode::TileCodec);
+        // The abandoned H.264 does not compete with the tile repaint.
+        assert_eq!(b.reliable_emitter.queued_h264_bytes(), 0, "queue purged");
+        assert!(b.reliable_emitter.h264.is_empty(), "probe cache dropped");
+        assert!(b.h264.hold.is_none(), "P hold ended");
+        assert_eq!(b.h264.stats.stalls_inflight, 1);
+        // The next decision: the abandoned frames no longer count, so the
+        // flag is down; the classifier still holds H264 off.
+        tokio::time::advance(Duration::from_millis(40)).await;
+        let (_, _, new) = b.classify_dirty_tiles(&analysed, &meta(), 4, 4, 101);
+        assert!(!b.h264.stalled, "the flag must clear once H.264 is left");
+        assert_eq!(new, FrameMode::TileCodec);
+        // The link is starved (the guard would put H264 back after its
+        // 500 ms hold): evaluated every 100 ms, the session stays in tile
+        // until 2 s after the stall, and only then comes back.
+        b.adaptation_context.bwe_estimate_bps = 100_000;
+        b.classifier.set_adaptation_context(b.adaptation_context);
+        let mut seq = 102;
+        for step in 1..=18 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            let (_, _, new) = b.classify_dirty_tiles(&analysed, &meta(), 4, 4, seq);
+            seq += 1;
+            assert_eq!(
+                new,
+                FrameMode::TileCodec,
+                "re-entered {} ms after the stall",
+                40 + step * 100
+            );
+        }
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            b.classify_dirty_tiles(&analysed, &meta(), 4, 4, seq);
+            seq += 1;
+        }
+        assert_eq!(
+            b.frame_mode,
+            FrameMode::H264,
+            "the guard never brought H264 back after the holdoff"
+        );
+    }
+
+    /// The headroom guard's input is the estimator's own estimate, published
+    /// with the path stats (not the probe-inclusive model rate), and the test
+    /// override of the headroom replaces both views.
+    #[tokio::test(start_paused = true)]
+    async fn the_classifier_is_given_the_bandwidth_estimate() {
+        let mut b = bridge().await;
+        b.apply_path_stats_snapshot(20_000.0);
+        let est = b.bwe.snapshot().bitrate_bps;
+        assert!(est > 0, "premise: the estimator has an estimate");
+        assert_eq!(b.adaptation_context.bwe_estimate_bps, est);
+        assert_eq!(b.classifier.adaptation_context().bwe_estimate_bps, est);
+
+        b.test_force_bytes_per_us = Some(0.1);
+        b.apply_path_stats_snapshot(20_000.0);
+        assert_eq!(
+            b.classifier.adaptation_context().bwe_estimate_bps,
+            800_000,
+            "0.1 B/us is 800 kbit/s"
+        );
+    }
+
+    /// The time the flag was up is accounted, in whole milliseconds between
+    /// evaluations that saw it up.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_time_is_accounted() {
+        let mut b = bridge().await;
+        let t0 = now_std();
+        send(&mut b, 1, true);
+        assert!(b.update_h264_stall(t0 + Duration::from_millis(600)));
+        assert!(b.update_h264_stall(t0 + Duration::from_millis(900)));
+        assert!(b.update_h264_stall(t0 + Duration::from_millis(1_400)));
+        assert_eq!(b.h264.stats.h264_stalled_ms, 800);
+        b.abandon_h264_inflight(2, now_std());
+        assert!(!b.update_h264_stall(t0 + Duration::from_millis(1_500)));
+        assert_eq!(
+            b.h264.stats.h264_stalled_ms, 900,
+            "the last interval counts"
+        );
+        assert!(!b.update_h264_stall(t0 + Duration::from_millis(9_000)));
+        assert_eq!(b.h264.stats.h264_stalled_ms, 900);
+        assert_eq!(b.h264.stats.stalls_no_progress, 1, "one rising edge");
     }
 }
