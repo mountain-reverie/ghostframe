@@ -52,6 +52,14 @@ impl IoBridge {
         if data.is_empty() {
             return;
         }
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        if let Some((from, until)) = self.ack_blackout {
+            let now = now_std();
+            if data[0] == crate::transport::ack::ACK_BATCH_MSG_TYPE && now >= from && now < until {
+                self.acks_blacked_out += 1;
+                return;
+            }
+        }
         tracing::debug!(
             target: "ghostframe::cdf53",
             first_byte = data[0],

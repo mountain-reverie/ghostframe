@@ -70,7 +70,9 @@ use tokio::time::Instant as TokioInstant;
 use ghostframe_client_core::Event as CoreEvent;
 use ghostframe_client_net::{ClientNet, ClientNetConfig, ClientNetEvent};
 use ghostframe_lib::transport::ghostbridge::encode_frame;
-use ghostframe_lib::transport::io_bridge::{mem_stream_pair, InjectedFrame, IoBridge, MemStream};
+use ghostframe_lib::transport::io_bridge::{
+    mem_stream_pair, H264Report, InjectedFrame, InjectedH264, IoBridge, MemStream,
+};
 use ghostframe_lib::transport::quic::QuicServer;
 
 use crate::harness::framebuffer::FrameBuffer;
@@ -140,6 +142,31 @@ pub enum SceneLoad {
     /// heartbeats never fire here. The path stays for scripted scenes,
     /// which very much do still need it.
     Profile(crate::harness::load_profile::LoadProfile),
+    /// A scripted H.264 stream: one frame per `cadence_us` for the scene's
+    /// whole duration, through the bridge's real H.264 gate and send path with
+    /// a scripted encoder (see [`ghostframe_lib::transport::io_bridge::InjectedH264`]).
+    /// The client is a real `ClientNet` that advertises H.264 and
+    /// acknowledges fragments; it reassembles frames (`NeedsH264` events) and
+    /// decodes nothing.
+    H264(H264Load),
+}
+
+/// The scripted H.264 stream of [`SceneLoad::H264`].
+#[derive(Debug, Clone, Copy)]
+pub struct H264Load {
+    pub cadence_us: u64,
+    /// Payload bytes of an IDR and of a P frame.
+    pub idr_bytes: usize,
+    pub p_bytes: usize,
+    /// The scripted encoder's own GOP (an IDR every this many frames sent);
+    /// 0 for none: IDRs then come only when the bridge asks.
+    pub gop_frames: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Frame indexes `[from, to)` in which the screen is static: no H.264 frame
+    /// is produced (the tick is an empty heartbeat). A tail probe only fires
+    /// when the sender goes quiet, so a scene about the probe needs this.
+    pub quiet: Option<(usize, usize)>,
 }
 
 /// A netsim scene to run browserlessly: a real `IoBridge` <-> `ClientNet`
@@ -236,6 +263,11 @@ pub struct RunOptions {
     /// server a different number of loop iterations before the first
     /// feedback, which the bandwidth-estimator startup scenes compare.
     pub classical_kx: bool,
+    /// Drop every acknowledgement datagram (0x06) the server receives in this
+    /// window, `(from, until)` as offsets from the scene's start: the
+    /// acknowledgement stall of the design's scene 8. Nothing else on the
+    /// client-to-server path is touched (frame acks, feedback, QUIC itself).
+    pub ack_blackout: Option<(Duration, Duration)>,
 }
 
 /// How a scene drives the server's `IoBridge`.
@@ -548,6 +580,17 @@ pub struct BrowserlessResult {
     /// was ever dropped. Distinct from `bytes_dropped`, which counts *netsim*
     /// drops across both directions and cannot separate the two causes.
     pub drops_fired: Vec<u32>,
+    /// The same for the H.264 frame rules of `BrowserlessScene::drops`
+    /// (`DropPlan::with_frame_rules`), parallel to them.
+    pub frame_drops_fired: Vec<u32>,
+    /// The bridge's H.264 transport counters and gauges at the end of the
+    /// scene: IDRs by cause, verdicts, hold time, skipped frames, the ledger
+    /// accounting. All zero in a tile scene.
+    pub h264: H264Report,
+    /// The reliable emitter's full counters at the end of the scene, for the
+    /// ones `BrowserlessResult` has no field of its own for (`pto_fires`,
+    /// the `h264_*` resend counters).
+    pub emitter_stats: ghostframe_lib::transport::reliable_emitter::emitter::EmitterStats,
     /// Of `retransmit_attempts_total`, those a NACK asked for.
     pub retransmit_by_nack: u64,
     /// RTO fires whose pass was then acknowledged by a transmission sent
@@ -1007,6 +1050,7 @@ async fn run_inner(
     let probe_stats_cell = bridge.probe_stats_publish_handle();
     let transport_probe_cell = bridge.transport_probe_publish_handle();
     let send_errs_cell = bridge.send_errs_publish_handle();
+    let h264_cell = bridge.h264_stats_publish_handle();
     // Same ownership problem, opposite direction: this `Arc` originates
     // here (it already holds `scene.drops`'s rules), and `set_drop_plan`
     // installs it into the bridge so `send_to_all_sessions` can consult it
@@ -1019,6 +1063,13 @@ async fn run_inner(
     bridge.set_drop_plan(drop_plan_cell.clone());
     bridge.set_ignore_tile_nacks(opts.ignore_client_nacks);
     bridge.set_tile_fec(opts.tile_fec);
+    // The scene's time origin. Nothing below awaits before the original
+    // definition site (the bridge is only moved or stored), so this is the
+    // same instant it was when it was taken further down.
+    let base = TokioInstant::now();
+    if let Some((from, until)) = opts.ack_blackout {
+        bridge.set_ack_blackout(base.into_std() + from, base.into_std() + until);
+    }
     let env_transport = ghostframe_lib::config::TransportConfig::from_env();
     bridge.use_model_controller_for_test(opts.model.unwrap_or(env_transport.model));
     if let Some(floor) = scene.tick_budget_floor_bytes {
@@ -1049,7 +1100,6 @@ async fn run_inner(
             let _ = bridge.run().await;
         }));
     }
-    let base = TokioInstant::now();
     let client_addr = client_addr();
     let server_addr = server_addr();
 
@@ -1057,7 +1107,7 @@ async fn run_inner(
         server_name: "localhost".into(),
         server_cert_sha256,
         indices_raw_enabled: true,
-        supports_h264: false,
+        supports_h264: matches!(scene.load, SceneLoad::H264(_)),
         display: None,
     };
 
@@ -1133,6 +1183,12 @@ async fn run_inner(
         .expect("drop_plan mutex poisoned")
         .drops()
         .to_vec();
+    let frame_drops_fired = drop_plan_cell
+        .lock()
+        .expect("drop_plan mutex poisoned")
+        .frame_drops()
+        .to_vec();
+    let h264 = *h264_cell.lock().expect("h264_stats_publish mutex poisoned");
 
     // Pair each write with the read of the same packet by position: the
     // socketpair is a FIFO and the inbound arm takes one packet per turn.
@@ -1232,6 +1288,9 @@ async fn run_inner(
         probes_completed,
         probes_abandoned,
         drops_fired,
+        frame_drops_fired,
+        h264,
+        emitter_stats,
     })
 }
 
@@ -1278,6 +1337,7 @@ async fn drive_session(
         match &scene.load {
             SceneLoad::Profile(p) => p.cadence_us,
             SceneLoad::Script(_) => scene.cadence_us,
+            SceneLoad::H264(h) => h.cadence_us,
         } > 0,
         "seed {seed}: cadence_us must be non-zero: frames and heartbeats are spaced by it, \
          and a zero spacing would never advance virtual time"
@@ -1331,6 +1391,7 @@ async fn drive_session(
     let cadence_us = match &scene.load {
         SceneLoad::Profile(p) => p.cadence_us,
         SceneLoad::Script(_) => scene.cadence_us,
+        SceneLoad::H264(h) => h.cadence_us,
     };
 
     let generated: Vec<FrameScript>;
@@ -1340,6 +1401,28 @@ async fn drive_session(
             generated = p.frames_for(scene.duration, scene.grid_cols as u8, scene.grid_rows as u8);
             &generated
         }
+        // One empty script per tick for the whole duration: the frames carry
+        // no tiles, `inject_frame` turns each into a scripted H.264 frame.
+        SceneLoad::H264(h) => {
+            generated = (0..scene.duration.as_micros() as u64 / h.cadence_us)
+                .map(|_| FrameScript { tiles: Vec::new() })
+                .collect();
+            &generated
+        }
+    };
+    let quiet_frames: Option<(usize, usize)> = match &scene.load {
+        SceneLoad::H264(h) => h.quiet,
+        SceneLoad::Script(_) | SceneLoad::Profile(_) => None,
+    };
+    let h264_script: Option<InjectedH264> = match &scene.load {
+        SceneLoad::H264(h) => Some(InjectedH264 {
+            idr_bytes: h.idr_bytes,
+            p_bytes: h.p_bytes,
+            gop_frames: h.gop_frames,
+            width: h.width,
+            height: h.height,
+        }),
+        SceneLoad::Script(_) | SceneLoad::Profile(_) => None,
     };
 
     let mut events: Vec<ClientNetEvent> = Vec::new();
@@ -1641,6 +1724,10 @@ async fn drive_session(
                             &mut generations,
                             inject_tx,
                             opts.frame_cost,
+                            h264_script.filter(|_| {
+                                !quiet_frames
+                                    .is_some_and(|(from, to)| (from..to).contains(&next_frame_idx))
+                            }),
                         )
                         .await
                         .map_err(|e| {
@@ -1839,6 +1926,7 @@ pub struct ClientProbe {
 /// fails loudly naming the offending coordinate instead of silently
 /// dropping the tile the way `IoBridge::apply_injected_frame` does for a
 /// mis-sized harness grid.
+#[allow(clippy::too_many_arguments)]
 async fn inject_frame(
     scene: &BrowserlessScene,
     frame_idx: usize,
@@ -1847,6 +1935,7 @@ async fn inject_frame(
     generations: &mut HashMap<(u8, u8), u8>,
     inject_tx: &mpsc::Sender<InjectedFrame>,
     cost: Option<Duration>,
+    h264: Option<InjectedH264>,
 ) -> anyhow::Result<()> {
     let seed = scene.seed;
     let mut work = Vec::new();
@@ -1880,6 +1969,7 @@ async fn inject_frame(
         // unbounded "drain everything" budget that sat in front of both.
         work,
         cost,
+        h264,
     };
 
     // Bounded: a send that cannot complete (the bridge is not draining the
@@ -1921,6 +2011,7 @@ async fn inject_heartbeat(
         timestamp_us: (seq as u64 * cadence_us) as u32,
         work: Vec::new(),
         cost: None,
+        h264: None,
     };
     inject_tx
         .send(frame)

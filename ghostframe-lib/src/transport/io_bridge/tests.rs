@@ -710,6 +710,7 @@ async fn injected_frame_supersedes_prior_work_for_the_same_tile() {
         timestamp_us: seq * 16_000,
         work: vec![work],
         cost: None,
+        h264: None,
     };
 
     // No session is connected, so the drain budget clamps to zero and
@@ -3683,6 +3684,7 @@ async fn inbound_is_read_before_a_waiting_frame() {
             timestamp_us: 0,
             work: Vec::new(),
             cost: None,
+            h264: None,
         })
         .await
         .expect("inject");
@@ -3738,6 +3740,7 @@ async fn a_flood_of_inbound_still_lets_a_frame_through() {
         timestamp_us: 0,
         work: Vec::new(),
         cost: None,
+        h264: None,
     })
     .await
     .expect("inject");
@@ -4172,6 +4175,7 @@ async fn injected_work_is_enqueued_and_drain_is_attempted() {
             state: WorkState::Pending,
         }],
         cost: None,
+        h264: None,
     })
     .await
     .expect("send injection");
@@ -4246,6 +4250,7 @@ async fn injected_cdf53_work_lands_in_refinement_queue_not_priority_queue() {
             },
         ],
         cost: None,
+        h264: None,
     })
     .await
     .expect("send injection");
@@ -4346,6 +4351,7 @@ async fn second_injected_frame_does_not_clear_first_frames_queued_work() {
         timestamp_us: 0,
         work: vec![make_work(0, 0)],
         cost: None,
+        h264: None,
     })
     .await
     .expect("send injection 1");
@@ -4358,6 +4364,7 @@ async fn second_injected_frame_does_not_clear_first_frames_queued_work() {
         timestamp_us: 0,
         work: vec![make_work(3, 3)],
         cost: None,
+        h264: None,
     })
     .await
     .expect("send injection 2");
@@ -4410,6 +4417,7 @@ async fn out_of_grid_tile_is_skipped_not_enqueued() {
             state: WorkState::Pending,
         }],
         cost: None,
+        h264: None,
     })
     .await
     .expect("send injection");
@@ -4460,6 +4468,7 @@ async fn drain_injection_for_test_returns_enqueued_not_submitted_count() {
         timestamp_us: 0,
         work: vec![make_work(0, 0), make_work(5, 5)],
         cost: None,
+        h264: None,
     })
     .await
     .expect("send injection");
