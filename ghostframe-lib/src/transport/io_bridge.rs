@@ -98,6 +98,8 @@ pub(crate) use pacing::SCHEDULER_TICK_INTERVAL_US;
 #[path = "io_bridge/emit.rs"]
 mod emit;
 
+#[path = "io_bridge/h264_rate.rs"]
+mod h264_rate;
 #[path = "io_bridge/h264_tx.rs"]
 mod h264_tx;
 use h264_tx::{H264Gate, H264Tx};
@@ -422,6 +424,23 @@ pub struct InjectedH264 {
     /// Frame size, for the dimensions datagram and resolution attribution.
     pub width: u32,
     pub height: u32,
+    /// A scripted CBR encoder instead of fixed sizes: the bridge's real rate
+    /// policy runs and frame sizes follow the rate it sets (`idr_bytes`,
+    /// `p_bytes` and `gop_frames` are then unused). `None` for the fixed-size
+    /// scripted encoder.
+    pub cbr: Option<InjectedCbr>,
+}
+
+/// The scripted CBR encoder of [`InjectedH264::cbr`]: a P frame is
+/// `rate / 8 / fps` bytes, an IDR is `idr_over_p` of them, and an IDR is made
+/// on a reopen, a request, and every `gop_frames` frames.
+#[derive(Debug, Clone, Copy)]
+pub struct InjectedCbr {
+    pub fps: u32,
+    pub idr_over_p: u32,
+    /// The GOP, in frames, the bridge's clock and the encoder use; `None` for
+    /// the configured one (3 s of the encoder's 60 fps).
+    pub gop_frames: Option<u32>,
 }
 
 /// An arm of the `select!` in `IoBridge::run`. See `IoBridge::loop_arm_trace`.
@@ -1343,6 +1362,7 @@ impl IoBridge {
         bwe: crate::transport::bwe::BweWrapper,
     ) -> Self {
         let (peer_lookup_tx, peer_lookup_rx) = mpsc::unbounded_channel();
+        let h264_gop_frames = lib_config.transport.h264_gop_frames();
         Self {
             _handle: diffs.handle,
             stream,
@@ -1439,7 +1459,10 @@ impl IoBridge {
             frame_acks_received: 0,
             frame_acks_malformed: 0,
             last_h264_frame_seq: None,
-            h264: H264Tx::default(),
+            h264: H264Tx {
+                gop_frames: h264_gop_frames,
+                ..H264Tx::default()
+            },
             #[cfg(any(test, feature = "browserless-harness"))]
             h264_stats_publish: std::sync::Arc::new(std::sync::Mutex::new(H264Report::default())),
             last_reset_request_idr_at: None,

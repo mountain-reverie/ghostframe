@@ -1248,6 +1248,10 @@ impl IoBridge {
         }
         match self.h264_frame_gate(now_std()) {
             H264Gate::Encode => {
+                // The rate for this frame; a reopen goes to the worker ahead
+                // of the finish, which therefore encodes an IDR.
+                let gop_frames = self.h264.gop_frames;
+                self.h264_rate_step(now_std(), gop_frames);
                 self.send_finish(inflight, action, InFlightStage::FinishingH264 { trace });
             }
             H264Gate::SkipHold | H264Gate::SkipBackpressure => {
@@ -2640,6 +2644,9 @@ impl IoBridge {
                     idr_reentry = h.idr_by_cause[IdrCause::Reentry.index()],
                     idr_hold_timeout = h.idr_by_cause[IdrCause::HoldTimeout.index()],
                     idr_gop_periodic = h.idr_by_cause[IdrCause::GopPeriodic.index()],
+                    idr_rate_drop = h.idr_by_cause[IdrCause::RateDrop.index()],
+                    rate_reopens_gop = h.rate_reopens_gop,
+                    rate_target_bps = h.rate_target_bps,
                     loss_idr_rate_limited = h.loss_idr_rate_limited,
                     idr_requests_coalesced = h.idr_requests_coalesced,
                     verdicts_idr_frag = h.verdicts_idr_frag,

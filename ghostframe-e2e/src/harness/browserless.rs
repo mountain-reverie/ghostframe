@@ -71,7 +71,7 @@ use ghostframe_client_core::Event as CoreEvent;
 use ghostframe_client_net::{ClientNet, ClientNetConfig, ClientNetEvent};
 use ghostframe_lib::transport::ghostbridge::encode_frame;
 use ghostframe_lib::transport::io_bridge::{
-    mem_stream_pair, H264Report, InjectedFrame, InjectedH264, IoBridge, MemStream,
+    mem_stream_pair, H264Report, InjectedCbr, InjectedFrame, InjectedH264, IoBridge, MemStream,
 };
 use ghostframe_lib::transport::quic::QuicServer;
 
@@ -167,6 +167,10 @@ pub struct H264Load {
     /// is produced (the tick is an empty heartbeat). A tail probe only fires
     /// when the sender goes quiet, so a scene about the probe needs this.
     pub quiet: Option<(usize, usize)>,
+    /// A scripted CBR encoder in place of the fixed sizes: the bridge's real
+    /// rate policy runs and frame sizes follow the rate it sets
+    /// (`idr_bytes`, `p_bytes` and `gop_frames` are then unused).
+    pub cbr: Option<InjectedCbr>,
 }
 
 /// A netsim scene to run browserlessly: a real `IoBridge` <-> `ClientNet`
@@ -1421,6 +1425,7 @@ async fn drive_session(
             gop_frames: h.gop_frames,
             width: h.width,
             height: h.height,
+            cbr: h.cbr,
         }),
         SceneLoad::Script(_) | SceneLoad::Profile(_) => None,
     };
