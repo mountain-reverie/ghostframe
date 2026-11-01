@@ -32,7 +32,7 @@ use crate::tile::FrameMode;
 /// accepted as aliases, because the e2e and bench crates set them; the new
 /// name wins when both are present.
 ///
-/// All four fields are **wired**: `Classifier::new` consumes them.
+/// Every field is **wired**: `Classifier::new` consumes them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClassifierConfig {
     /// Pins the frame mode. Fed by `GHOSTFRAME_FORCE_FRAME_MODE`
@@ -44,7 +44,9 @@ pub struct ClassifierConfig {
     /// `GHOSTFRAME_REFINEMENT_BIAS_US` (alias
     /// `GHOSTFRAME_TEST_REFINEMENT_BIAS_US`); accepts any value `> 0.0`.
     pub refinement_bias_us: Option<f32>,
-    /// Overrides `HEADROOM_MIN_BYTES_PER_US`. Fed by
+    /// Overrides the headroom guard's enter threshold (the exit threshold
+    /// keeps its 3:2 ratio to it), in bytes per microsecond of bandwidth
+    /// estimate (`0.25` = 2 Mbit/s). Fed by
     /// `GHOSTFRAME_HEADROOM_MIN_BPUS` (alias
     /// `GHOSTFRAME_TEST_HEADROOM_MIN_BPUS`); accepts any value `> 0.0`.
     pub headroom_min_bpus: Option<f32>,
@@ -52,6 +54,12 @@ pub struct ClassifierConfig {
     /// `GHOSTFRAME_LOSS_OVERRIDE_THRESHOLD` (alias
     /// `GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD`); accepts `(0.0, 1.0]`.
     pub loss_override_threshold: Option<f32>,
+    /// Whether `loss_override` is evaluated at all. **Off by default**: one
+    /// lost fragment kills an H.264 frame, so "H.264 rides through loss
+    /// better" is not what the transport does any more. Fed by
+    /// `GHOSTFRAME_LOSS_OVERRIDE=1|true|yes|on` (any case; alias
+    /// `GHOSTFRAME_TEST_LOSS_OVERRIDE`).
+    pub loss_override_enabled: bool,
     /// Per-codec encode-cost overrides. See `CostModelConfig`.
     pub cost: CostModelConfig,
 }
@@ -83,6 +91,27 @@ pub struct CostModelConfig {
 
 /// First variable of `names` that `get` can see. Used for env-name aliases:
 /// the preferred name goes first, so it wins when both are set.
+/// A boolean switch: `1`/`true`/`yes`/`on` (any case) is on; `0`/`false`/`no`/
+/// `off`/empty or unset is off; anything else is off too, with one warning per
+/// process so a typo does not silently look like a deliberate "off".
+fn parse_switch(name: &str, value: Option<String>) -> bool {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(v) = value else { return false };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "" | "0" | "false" | "no" | "off" => false,
+        other => {
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "{name}={other:?} is not a recognised switch value (1/true/yes/on or \
+                     0/false/no/off); treating it as off"
+                );
+            }
+            false
+        }
+    }
+}
+
 fn get_first(get: &impl Fn(&str) -> Option<String>, names: &[&str]) -> Option<String> {
     names.iter().find_map(|n| get(n))
 }
@@ -130,6 +159,13 @@ impl ClassifierConfig {
             )
             .and_then(|s| s.parse::<f32>().ok())
             .filter(|v| *v > 0.0 && *v <= 1.0),
+            loss_override_enabled: parse_switch(
+                "GHOSTFRAME_LOSS_OVERRIDE",
+                get_first(
+                    &get,
+                    &["GHOSTFRAME_LOSS_OVERRIDE", "GHOSTFRAME_TEST_LOSS_OVERRIDE"],
+                ),
+            ),
             headroom_min_bpus: positive_f32(get_first(
                 &get,
                 &[
@@ -1221,6 +1257,38 @@ mod tests {
         );
     }
 
+    /// `loss_override` is off unless `GHOSTFRAME_LOSS_OVERRIDE` says `1` or
+    /// `true`; a threshold alone does not turn it on.
+    #[test]
+    fn loss_override_is_disabled_by_default_and_enabled_by_its_variable() {
+        assert!(!ClassifierConfig::from_lookup(lookup(&[])).loss_override_enabled);
+        assert!(
+            !ClassifierConfig::from_lookup(lookup(&[(
+                "GHOSTFRAME_LOSS_OVERRIDE_THRESHOLD",
+                "0.2"
+            )]))
+            .loss_override_enabled
+        );
+        for v in ["1", "true", "TRUE", "Yes", "on", " ON "] {
+            assert!(
+                ClassifierConfig::from_lookup(lookup(&[("GHOSTFRAME_LOSS_OVERRIDE", v)]))
+                    .loss_override_enabled,
+                "{v}"
+            );
+        }
+        assert!(
+            ClassifierConfig::from_lookup(lookup(&[("GHOSTFRAME_TEST_LOSS_OVERRIDE", "1")]))
+                .loss_override_enabled
+        );
+        for v in ["0", "false", "no", "off", "", "enable"] {
+            assert!(
+                !ClassifierConfig::from_lookup(lookup(&[("GHOSTFRAME_LOSS_OVERRIDE", v)]))
+                    .loss_override_enabled,
+                "{v}"
+            );
+        }
+    }
+
     /// `from_env` is a thin wrapper around `from_lookup` over the real
     /// environment; this is its only coverage for `ClassifierConfig`. It and
     /// its `TransportConfig` / `DiagnosticsConfig` counterparts further down
@@ -1234,6 +1302,11 @@ mod tests {
             Some(FrameMode::H264)
         );
         std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
+
+        assert!(!ClassifierConfig::from_env().loss_override_enabled);
+        std::env::set_var("GHOSTFRAME_LOSS_OVERRIDE", "1");
+        assert!(ClassifierConfig::from_env().loss_override_enabled);
+        std::env::remove_var("GHOSTFRAME_LOSS_OVERRIDE");
     }
 
     // -----------------------------------------------------------------

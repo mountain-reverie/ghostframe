@@ -30,6 +30,7 @@ fn adaptation_context_overrides_static_bytes_per_us() {
         loss_rate: 0.0,
         suspended: false,
         last_update_seq: 1,
+        ..Default::default()
     };
     c.set_adaptation_context(ctx);
     assert!((c.cost.bytes_per_us() - initial * 2.0).abs() < 1e-6);
@@ -49,6 +50,7 @@ fn adaptation_context_with_zero_bytes_per_us_preserves_cost() {
         loss_rate: 0.0,
         suspended: false,
         last_update_seq: 1,
+        ..Default::default()
     };
     c.set_adaptation_context(ctx);
     assert!(

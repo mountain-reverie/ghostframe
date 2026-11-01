@@ -598,10 +598,17 @@ impl IoBridge {
             return;
         }
         let bytes_per_us = (self.model_rate_bytes_per_s() / 1e6) as f32;
+        // The headroom guard reads the estimate itself, not the
+        // probe-inclusive model rate.
+        let bwe_estimate_bps = self.bwe.snapshot().bitrate_bps;
         // The test override replaces the *classifier's* view of the headroom.
         #[cfg(any(test, feature = "test-loss-injection"))]
-        let bytes_per_us = self.test_force_bytes_per_us.unwrap_or(bytes_per_us);
+        let (bytes_per_us, bwe_estimate_bps) = match self.test_force_bytes_per_us {
+            Some(forced) => (forced, (f64::from(forced) * 8e6) as u64),
+            None => (bytes_per_us, bwe_estimate_bps),
+        };
         self.adaptation_context.bytes_per_us = bytes_per_us;
+        self.adaptation_context.bwe_estimate_bps = bwe_estimate_bps;
         self.adaptation_context.smoothed_rtt_us = smoothed_rtt_us;
         self.adaptation_context.last_update_seq =
             self.adaptation_context.last_update_seq.wrapping_add(1);
