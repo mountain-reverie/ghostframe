@@ -614,7 +614,7 @@ async fn s3_probe_under_load_capacity_steps() {
 
 /// Not a scene under test: prints the server->client rate each churn level
 /// achieves on an uncapped link, so "heavy" is a measured number rather than
-/// a guess. Needed because the capacity-hint and pacer terms make the offered
+/// a guess. Needed because the pacer terms make the offered
 /// load far smaller than the raw tile bytes would suggest.
 ///
 /// `#[ignore]`d (~100 s): run with `-- --ignored --nocapture` when re-deriving

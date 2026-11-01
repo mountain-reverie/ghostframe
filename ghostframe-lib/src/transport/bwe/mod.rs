@@ -225,14 +225,6 @@ impl BweWrapper {
         }
     }
 
-    /// `new`, for the model controller: the estimator is not fed a transport
-    /// capacity hint, so it does not probe on one either.
-    pub fn new_without_hint(initial_bps: u64, now: Instant) -> Self {
-        Self {
-            driver: googcc::GoogCcDriver::with_network_state_probing(initial_bps, now, false),
-        }
-    }
-
     /// Continue the estimate from `bps` after the base round trip rose.
     pub fn restore_from(&mut self, now: Instant, bps: u64) {
         self.driver.restore_from(now, bps);
