@@ -177,6 +177,9 @@ pub struct ClientCore {
     /// H.264 frame-level reassembly state (keyed by `frame_seq`).
     pub(crate) frame_assemblies: HashMap<u32, FrameAssembly>,
     pub(crate) latest_full_frame_seq: u32,
+    /// Newest H.264 frame handed out as `NeedsH264`; a keyframe older than it
+    /// is not delivered.
+    pub(crate) last_delivered_frame_seq: Option<u32>,
     /// H.264 fragments rebuilt from XOR parity (cumulative).
     pub(crate) h264_fragments_recovered: u64,
     /// Coverage NACKs awaiting the debounce window before being handed to
@@ -222,6 +225,7 @@ impl ClientCore {
             latest_frame_seq: 0,
             frame_assemblies: HashMap::new(),
             latest_full_frame_seq: 0,
+            last_delivered_frame_seq: None,
             h264_fragments_recovered: 0,
             pending_nacks: std::collections::BTreeMap::new(),
             pending_nack_deadline_us: None,

@@ -13,15 +13,27 @@
 
 use std::collections::HashMap;
 
+use ghostframe_protocol::ack::AckEntry;
 use ghostframe_protocol::fec::decode_parity_payload;
-use ghostframe_protocol::protocol::{decode_frame_datagram, FrameHeader};
+use ghostframe_protocol::protocol::{decode_frame_datagram, FrameHeader, NO_ACK};
 
 use crate::event::Event;
-use crate::{ClientCore, MAX_FRAME_FRAGMENTS, MAX_H264_ACCESS_UNIT_BYTES};
+use crate::{ClientCore, PollOutput, MAX_FRAME_FRAGMENTS, MAX_H264_ACCESS_UNIT_BYTES};
+
+/// How long an IDR assembly is exempt from the `latest - 2` window. The server
+/// sends an IDR's fragments again on a loss verdict and holds its P frames back
+/// until every fragment is acknowledged, so an IDR can legitimately complete
+/// after newer frame sequence numbers have been seen (tile frames share the
+/// sequence). Bounded in time and in count: a hostile peer cannot park more
+/// than one of them (the newest; an older IDR is superseded by it), for this
+/// long.
+pub(crate) const IDR_EXEMPT_US: u64 = 2_000_000;
 
 /// One in-progress full-frame (H.264 access unit) assembly.
 pub(crate) struct FrameAssembly {
     pub header: FrameHeader,
+    /// When the first fragment arrived (`now_us`), for the IDR window exemption.
+    pub created_us: u64,
     pub fragments: Vec<Option<Vec<u8>>>,
     pub received: usize,
     /// Payload bytes buffered so far (bounded by `MAX_H264_ACCESS_UNIT_BYTES`).
@@ -113,7 +125,7 @@ impl ClientCore {
     pub(crate) fn handle_frame_datagram(
         &mut self,
         bytes: &[u8],
-        _now_us: u64,
+        now_us: u64,
         events: &mut Vec<Event>,
     ) {
         let (fh, payload) = match decode_frame_datagram(bytes) {
@@ -121,15 +133,36 @@ impl ClientCore {
             Err(_) => return,
         };
 
-        // Drop datagrams for frames older than the eviction window.
-        if fh.frame_seq < self.latest_full_frame_seq.saturating_sub(2) {
+        // A source fragment is acknowledged on receipt, whatever becomes of it:
+        // the acknowledgement says the datagram arrived, which is all the
+        // server's ledger and loss path ask of it. What the client then does
+        // with the frame (decode, refuse, drop it as stale) is no part of it.
+        // Anything the wire format cannot express as a fragment is dropped
+        // first, so it is not acknowledged, like an invalid tile.
+        if !fh.is_parity() {
+            // (`frag_total == 0` is a parity by `is_parity`, not reached here.)
+            if fh.frag_idx >= fh.frag_total || fh.frag_total > MAX_FRAME_FRAGMENTS {
+                return;
+            }
+            if fh.wire_seq != NO_ACK {
+                self.wire_loss.on_received(fh.wire_seq);
+                let entry = AckEntry {
+                    wire_seq: fh.wire_seq,
+                    arrival_time_ms_lo16: ((now_us / 1000) & 0xFFFF) as u16,
+                };
+                if let Some(dg) = self.ack_batcher.add(entry, now_us) {
+                    self.outbox.push_back(PollOutput::Datagram(dg));
+                }
+            }
+        }
+
+        // Drop datagrams for frames older than the eviction window, except the
+        // fragments of an IDR that may still complete (see `IDR_EXEMPT_US`).
+        if fh.frame_seq < self.latest_full_frame_seq.saturating_sub(2)
+            && !self.idr_fragment_is_exempt(&fh, now_us)
+        {
             return;
         }
-        // XOR parity (frag_idx == frag_total) is handled before anything that
-        // moves `latest_full_frame_seq` or evicts: it carries no frame data of
-        // its own and must never be able to advance the window and so drop
-        // real frames. It only helps a frame that already has an assembly
-        // (parity follows its sources); anything else is ignored.
         if fh.is_parity() {
             if fh.frag_idx != fh.frag_total {
                 return; // a different parity scheme: not ours to read
@@ -170,17 +203,7 @@ impl ClientCore {
             self.latest_full_frame_seq = fh.frame_seq;
         }
 
-        // Evict in-progress assemblies older than latest - 2.
-        let threshold = self.latest_full_frame_seq.saturating_sub(2);
-        let stale: Vec<u32> = self
-            .frame_assemblies
-            .keys()
-            .filter(|&&seq| seq < threshold)
-            .copied()
-            .collect();
-        for seq in stale {
-            self.frame_assemblies.remove(&seq);
-        }
+        self.evict_stale_frame_assemblies(now_us);
 
         // A frag_total of 0 is malformed (no valid fragment index can ever
         // satisfy frag_idx < frag_total); drop defensively.
@@ -193,16 +216,24 @@ impl ClientCore {
             return;
         }
 
-        let asm = self
-            .frame_assemblies
+        self.frame_assemblies
             .entry(fh.frame_seq)
             .or_insert_with(|| FrameAssembly {
                 header: fh,
+                created_us: now_us,
                 fragments: vec![None; fh.frag_total as usize],
                 received: 0,
                 bytes: 0,
                 parities: HashMap::new(),
             });
+        // A new IDR assembly supersedes the older ones: they go now, not at
+        // the next datagram, so the map is never more than the window plus one.
+        if fh.is_keyframe() {
+            self.evict_stale_frame_assemblies(now_us);
+        }
+        let Some(asm) = self.frame_assemblies.get_mut(&fh.frame_seq) else {
+            return;
+        };
 
         let fi = fh.frag_idx as usize;
         if fi < asm.fragments.len() && asm.fragments[fi].is_none() {
@@ -238,6 +269,49 @@ impl ClientCore {
         self.finish_frame_if_complete(fh.frame_seq, events);
     }
 
+    /// The newest IDR assembly held, if any.
+    fn newest_idr_assembly(&self) -> Option<u32> {
+        self.frame_assemblies
+            .iter()
+            .filter(|(_, a)| a.header.is_keyframe())
+            .map(|(&s, _)| s)
+            .max()
+    }
+
+    /// Evict in-progress assemblies older than `latest - 2`, except the newest
+    /// IDR assembly while it is inside its exemption: an older IDR is
+    /// superseded by it, and exempting every one would let a stream of IDR
+    /// fragments with fresh frame numbers (each claiming 16 K fragments) hold
+    /// memory for the exemption's length.
+    fn evict_stale_frame_assemblies(&mut self, now_us: u64) {
+        let threshold = self.latest_full_frame_seq.saturating_sub(2);
+        let keep = self.newest_idr_assembly().filter(|seq| {
+            self.frame_assemblies
+                .get(seq)
+                .is_some_and(|a| now_us.saturating_sub(a.created_us) < IDR_EXEMPT_US)
+        });
+        self.frame_assemblies
+            .retain(|&seq, _| seq >= threshold || Some(seq) == keep);
+    }
+
+    /// Whether a fragment older than the window may still be taken: it belongs
+    /// to the newest IDR, which either has an assembly inside its exemption
+    /// already, or is newer than any IDR assembly held and may start one.
+    fn idr_fragment_is_exempt(&self, fh: &FrameHeader, now_us: u64) -> bool {
+        if !fh.is_keyframe() || fh.is_parity() {
+            return false;
+        }
+        match self.frame_assemblies.get(&fh.frame_seq) {
+            Some(asm) => {
+                now_us.saturating_sub(asm.created_us) < IDR_EXEMPT_US
+                    && self.newest_idr_assembly() == Some(fh.frame_seq)
+            }
+            None => self
+                .newest_idr_assembly()
+                .is_none_or(|newest| fh.frame_seq > newest),
+        }
+    }
+
     fn finish_frame_if_complete(&mut self, frame_seq: u32, events: &mut Vec<Event>) {
         let complete = self
             .frame_assemblies
@@ -248,6 +322,19 @@ impl ClientCore {
                 Some(a) => a,
                 None => return,
             };
+            // A keyframe older than a frame already delivered would make the
+            // decoder jump back: it is moot, drop it.
+            if asm.header.is_keyframe()
+                && self
+                    .last_delivered_frame_seq
+                    .is_some_and(|last| frame_seq < last)
+            {
+                return;
+            }
+            self.last_delivered_frame_seq = Some(
+                self.last_delivered_frame_seq
+                    .map_or(frame_seq, |last| last.max(frame_seq)),
+            );
             let mut out = Vec::new();
             for b in asm.fragments.iter().flatten() {
                 out.extend_from_slice(b);
