@@ -28,16 +28,17 @@ pub mod pal_rle_decode;
 pub mod palette_shadow;
 pub mod parity_decoder;
 mod reassembly;
+pub mod tile_decoder;
 pub mod wire_loss;
 pub use cdf53_coverage::CoverageEntry;
 pub use event::{DecodeErrorCode, Event, PollOutput, TileData, TileKey};
 pub use ghostframe_protocol::feedback_stream::ResetReason;
+pub use tile_decoder::TileDecoder;
 pub use wire_loss::WireLossStats;
 
 use std::collections::{HashMap, VecDeque};
 
 use ack_batcher::AckBatcher;
-use cdf53_tile_state::Cdf53TileState;
 use decode_error_batcher::DecodeErrorBatcher;
 use frame_assembly::FrameAssembly;
 use loss_tracker::LossTracker;
@@ -165,10 +166,7 @@ pub struct ClientCore {
     pub(crate) decode_error_batcher: DecodeErrorBatcher,
     pub(crate) loss_tracker: LossTracker,
     pub(crate) palette_shadow: PaletteShadow,
-    /// BGRA palette tables, `[palette_id][slot] = [b, g, r, a]`.
-    pub(crate) palettes: Box<[[[u8; 4]; 16]; 256]>,
     pub(crate) cdf53_coverage: HashMap<(u8, u8), CoverageEntry>,
-    pub(crate) cdf53_tile_state: Cdf53TileState,
     /// Newest `frame_seq` label on a tile datagram that came off the wire
     /// (not one rebuilt from parity). The yardstick for judging a label
     /// plausible; see `cdf53_coverage::label_runs_ahead`.
@@ -198,8 +196,10 @@ pub struct ClientCore {
     pub(crate) next_tail_sweep_us: u64,
     /// Next `now_us` at which periodic feedback is emitted (always armed).
     pub(crate) next_feedback_us: u64,
-    /// See [`TileDelivery`]. Set once at construction from `ClientConfig`.
-    pub(crate) tile_delivery: TileDelivery,
+    /// The pixel decode for [`TileDelivery::Decoded`], applied to the
+    /// payload events every tile produces; `None` in `Payload` mode. See
+    /// [`TileDecoder`].
+    pub(crate) decoder: Option<TileDecoder>,
     /// Protocol datagrams accepted by `handle_datagram`, split the same way
     /// its dispatch splits them: tile datagrams (bit 31 of `frame_seq` set)
     /// and H.264 frame datagrams (bit 31 clear).
@@ -224,9 +224,7 @@ impl ClientCore {
             decode_error_batcher: DecodeErrorBatcher::new(),
             loss_tracker: LossTracker::new(),
             palette_shadow: PaletteShadow::new(),
-            palettes: Box::new([[[0u8; 4]; 16]; 256]),
             cdf53_coverage: HashMap::new(),
-            cdf53_tile_state: Cdf53TileState::new(),
             newest_received_label: None,
             latest_frame_seq: 0,
             frame_assemblies: HashMap::new(),
@@ -239,7 +237,7 @@ impl ClientCore {
             pending_nack_deadline_us: None,
             next_tail_sweep_us: now_us + TAIL_SWEEP_INTERVAL_US,
             next_feedback_us: now_us + FEEDBACK_INTERVAL_US,
-            tile_delivery: config.tile_delivery,
+            decoder: None,
             datagrams_tile: 0,
             datagrams_frame: 0,
         };
@@ -265,7 +263,18 @@ impl ClientCore {
                 )));
         }
 
+        core.set_tile_delivery(config.tile_delivery);
         core
+    }
+
+    /// Switch between [`TileDelivery`] modes. Meant for before the first
+    /// datagram: switching mid-session starts the pixel decode from empty
+    /// state (no palettes, no accumulated CDF 5/3 passes).
+    pub fn set_tile_delivery(&mut self, delivery: TileDelivery) {
+        self.decoder = match delivery {
+            TileDelivery::Decoded => Some(TileDecoder::new()),
+            TileDelivery::Payload => None,
+        };
     }
 
     /// Queue a display-mode request. The server clamps it and reports what
