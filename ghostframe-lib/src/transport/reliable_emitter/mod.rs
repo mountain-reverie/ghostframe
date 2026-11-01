@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod emission_queue;
 pub mod emitter;
+pub mod h264;
 pub mod parity;
 pub mod pto;
 pub mod traits;

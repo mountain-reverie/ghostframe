@@ -5,6 +5,7 @@
 use crate::transport::protocol::TileParityEnvelope;
 use crate::transport::reliable_emitter::cache::{CacheEntry, ProbeTag, RetransmitCache};
 use crate::transport::reliable_emitter::emission_queue::{Emission, EmissionQueue, WireClass};
+use crate::transport::reliable_emitter::h264::{H264Cache, H264Submit, H264_CACHE_FRAMES};
 use crate::transport::reliable_emitter::parity::GroupBuilder;
 use crate::transport::reliable_emitter::pto::pto_for_attempt;
 use crate::transport::reliable_emitter::traits::{DatagramSender, SendOutcome};
@@ -33,6 +34,8 @@ fn tile_datagram_generation(bytes: &[u8]) -> Option<u8> {
 
 pub struct ReliableTileEmitter {
     pub(crate) cache: RetransmitCache,
+    /// Fragments of H.264 frames not fully acknowledged: the probe cache.
+    pub(crate) h264: H264Cache,
     pub(crate) alloc: WireSeqAllocator,
     pub(crate) queue: EmissionQueue,
     pub(crate) group: GroupBuilder,
@@ -91,8 +94,8 @@ pub struct ReliableTileEmitter {
     /// transmission is no longer the newest of its pass when it comes up (a NACK
     /// repair went first) is dropped, so a loss is repaired once. A key waits
     /// here at most once.
-    pending_loss: VecDeque<(EmitKey, RetxCause, u32)>,
-    pending_loss_set: HashSet<EmitKey>,
+    pending_loss: VecDeque<(Content, RetxCause, u32)>,
+    pending_loss_set: HashSet<Content>,
     /// Passes a loss verdict declined to resend ([`RetxRequest::Deferred`]),
     /// each with the transmission judged and the instant it is due to be sent
     /// again. Their latest transmission has been declared lost, so the ledger no
@@ -213,6 +216,24 @@ pub struct EmitterStats {
     /// stats were last published. Only set by the publish; zero in `stats`.
     pub cache_entries: usize,
     pub verdict_content_gone: u64,
+    /// H.264 fragments submitted (first transmissions).
+    pub h264_fragments_submitted: u64,
+    /// H.264 fragments sent again because a verdict named an IDR fragment.
+    pub h264_idr_resends: u64,
+    /// H.264 fragments sent again by the probe timeout (any frame).
+    pub h264_probe_resends: u64,
+    /// Verdicts on a P-frame fragment, which are not sent again.
+    pub h264_p_verdicts_not_resent: u64,
+    /// Fragments released by an acknowledgement, and acknowledgements that
+    /// found no entry (a duplicate, or a frame since superseded or trimmed).
+    pub h264_ack_hits: u64,
+    pub h264_ack_misses: u64,
+    /// Cache entries dropped without an acknowledgement: superseded by an
+    /// IDR, or trimmed to the newest frames.
+    pub h264_cache_dropped: u64,
+    /// Queued emissions removed before they left (superseded by an IDR, or a
+    /// suspect frame's), fragments and parity.
+    pub h264_queue_purged: u64,
     pub verdict_newer_in_flight: u64,
     pub verdict_already_queued: u64,
     /// Verdicts left to the probe because the pass had been resent
@@ -284,7 +305,7 @@ pub(crate) const LOSS_RETX_MAX_ATTEMPTS: u8 = 3;
 /// by `(due, judged_ws)`; the key rides along.
 #[derive(Debug, Clone, Copy)]
 struct DeferredPass {
-    key: EmitKey,
+    key: Content,
     /// The transmission judged lost. If the pass's newest transmission is no
     /// longer this one, something else has resent it and the entry is moot.
     judged_ws: u32,
@@ -322,6 +343,11 @@ pub enum RetxRequest {
     /// `GHOSTFRAME_NO_RTO=1`: the loss path and the probe are off; the cache
     /// and the NACK path are not.
     Disabled,
+    /// A verdict on a fragment of an H.264 P frame: not sent again. The
+    /// client would decode it 1.5 round trips late behind newer frames that
+    /// chain from it; the caller answers with a recovery IDR instead. (A
+    /// probe does send a P fragment again, to draw an acknowledgement.)
+    NotRetransmitted,
     /// The pass has already been resent [`LOSS_RETX_MAX_ATTEMPTS`] times: a
     /// verdict no longer resends it (and so does not report another loss every
     /// round trip for a pass the client never acknowledges); only the probe
@@ -345,6 +371,7 @@ impl ReliableTileEmitter {
     pub fn new(now: Instant) -> Self {
         Self {
             cache: RetransmitCache::new(),
+            h264: H264Cache::new(),
             alloc: WireSeqAllocator::new(),
             queue: EmissionQueue::new(),
             group: GroupBuilder::new(FEC_GROUP_SIZE_K),
@@ -403,7 +430,7 @@ impl ReliableTileEmitter {
     /// expiry, for one PTO backed off by the consecutive expiries since the
     /// last acknowledgement (RFC 9002 section 6.2).
     pub fn pto_deadline(&self) -> Option<Instant> {
-        if self.pending_cache_entries() == 0 {
+        if self.pending_cache_entries() == 0 && self.h264.is_empty() {
             return None;
         }
         let departed = self.latest_departure_at?;
@@ -533,6 +560,167 @@ impl ReliableTileEmitter {
         };
         self.queue.push_source(bytes, class);
         self.stats.source_emitted += 1;
+    }
+
+    /// Submit one fragment of an H.264 access unit: allocate its `wire_seq`,
+    /// stamp it into the datagram (bytes 8..12 of the frame header, where
+    /// `fragment_frame_ref` left `NO_ACK`), report it for the ledger, keep it
+    /// in the probe cache and queue it. `bytes` is the whole frame datagram.
+    ///
+    /// The queue and the ledger see it exactly as they see a tile pass: a
+    /// real `wire_seq` is never on the wire without a ledger record, because
+    /// the record is made from the transmission reported here.
+    pub fn submit_h264_fragment(&mut self, frag: H264Submit, now: Instant) {
+        let H264Submit {
+            frame_seq,
+            frag_idx,
+            is_idr,
+            bytes,
+            queued_at,
+            probe,
+        } = frag;
+        let wire_seq = self.alloc.allocate();
+        let mut buf = match bytes.try_into_mut() {
+            Ok(m) => m,
+            Err(shared) => BytesMut::from(&shared[..]),
+        };
+        debug_assert!(buf.len() >= 12, "a frame datagram has a 22-byte header");
+        if buf.len() >= 12 {
+            buf[8..12].copy_from_slice(&wire_seq.to_be_bytes());
+        }
+        let bytes: Bytes = buf.freeze();
+        self.transmissions.push(EmittedDatagram {
+            wire_seq,
+            emit_us: self.emit_us64(now),
+            wire_bytes: bytes.len(),
+            content: Content::H264Frag {
+                frame_seq,
+                frag_idx,
+            },
+        });
+        self.h264.insert(
+            frame_seq,
+            frag_idx,
+            is_idr,
+            CacheEntry {
+                datagram: bytes.clone(),
+                queued_at,
+                first_sent_at: now,
+                last_sent_at: now,
+                attempts: 0,
+                loss_attempts: 0,
+                latest_ws: wire_seq,
+                probe,
+            },
+        );
+        // Not fed to the tile XOR group builder: a fragment takes a wire_seq,
+        // which breaks the run of a tile group in progress, and the builder
+        // abandons a group at a gap rather than emit a parity whose
+        // membership is a lie.
+        self.note_emission_queue_depth();
+        self.queue.push_source(bytes, WireClass::H264);
+        self.stats.h264_fragments_submitted += 1;
+    }
+
+    /// Send a cached H.264 fragment again, with a `wire_seq` of its own.
+    /// Returns the wire bytes queued, or `None` when there was nothing to send
+    /// (the fragment was acknowledged or dropped while the request waited, or
+    /// another transmission of it went first).
+    fn resend_h264_fragment(
+        &mut self,
+        frame_seq: u32,
+        frag_idx: u16,
+        cause: RetxCause,
+        judged_ws: u32,
+        now: Instant,
+    ) -> Option<usize> {
+        let emit_us = self.emit_us64(now);
+        let ws = self.alloc.peek();
+        let entry = self.h264.get_mut(frame_seq, frag_idx)?;
+        if entry.latest_ws != judged_ws {
+            self.stats.verdict_newer_in_flight += 1;
+            return None;
+        }
+        self.alloc.allocate();
+        entry.attempts = entry.attempts.saturating_add(1);
+        entry.loss_attempts = entry.loss_attempts.saturating_add(1);
+        entry.last_sent_at = now;
+        // A resend leaves any probe cluster it was tagged for, as a tile does.
+        entry.probe = None;
+        entry.latest_ws = ws;
+        let mut bytes = entry.datagram.to_vec();
+        bytes[8..12].copy_from_slice(&ws.to_be_bytes());
+        let bytes = Bytes::from(bytes);
+        self.transmissions.push(EmittedDatagram {
+            wire_seq: ws,
+            emit_us,
+            wire_bytes: bytes.len(),
+            content: Content::H264Frag {
+                frame_seq,
+                frag_idx,
+            },
+        });
+        let sent = bytes.len() + self.wire_overhead;
+        self.queue.push_source(bytes, WireClass::LossRetransmit);
+        self.stats.loss_path_resends += 1;
+        self.stats.retransmit_attempts_total += 1;
+        match cause {
+            RetxCause::Loss => {
+                self.stats.loss_retransmits += 1;
+                self.stats.h264_idr_resends += 1;
+            }
+            RetxCause::Probe => {
+                self.stats.pto_probe_retransmits += 1;
+                self.stats.h264_probe_resends += 1;
+            }
+        }
+        Some(sent)
+    }
+
+    /// An acknowledgement named fragment `frag_idx` of `frame_seq` (through
+    /// any of its transmissions): release it. Returns whether an entry was held.
+    pub fn on_h264_ack(&mut self, frame_seq: u32, frag_idx: u16) -> bool {
+        if self.h264.remove(frame_seq, frag_idx).is_some() {
+            self.stats.h264_ack_hits += 1;
+            true
+        } else {
+            self.stats.h264_ack_misses += 1;
+            false
+        }
+    }
+
+    /// An IDR at `frame_seq` supersedes every older frame: forget their cached
+    /// fragments and take their emissions that have not left the queue out of
+    /// it. Returns the `wire_seq`s of the queued fragments removed, whose
+    /// ledger records the caller must forget (they never departed, so they can
+    /// be neither acknowledged nor lost).
+    pub fn supersede_h264_before(&mut self, frame_seq: u32) -> Vec<u32> {
+        self.stats.h264_cache_dropped += self.h264.drop_before(frame_seq) as u64;
+        self.purge_queued_h264(|f| f < frame_seq)
+    }
+
+    /// Remove the queued frame datagrams (fragments, resends and parity) of
+    /// the frames `doomed` names. Returns the `wire_seq`s of the tracked ones.
+    pub fn purge_queued_h264(&mut self, doomed: impl Fn(u32) -> bool) -> Vec<u32> {
+        let (removed, wire_seqs) = self.queue.purge_frames(doomed);
+        self.stats.h264_queue_purged += removed as u64;
+        wire_seqs
+    }
+
+    /// Keep the probe cache to its newest [`H264_CACHE_FRAMES`] frames.
+    pub fn trim_h264_cache(&mut self) {
+        self.stats.h264_cache_dropped += self.h264.trim_to(H264_CACHE_FRAMES) as u64;
+    }
+
+    /// Queue a frame datagram the ledger does not track (XOR parity, whose
+    /// `wire_seq` is `NO_ACK`), to go through admission like any other.
+    pub fn queue_untracked(&mut self, bytes: Bytes, class: WireClass) {
+        self.queue.push_source(bytes, class);
+    }
+
+    /// Wire bytes of H.264 frame datagrams waiting in the emission queue.
+    pub fn queued_h264_bytes(&self) -> usize {
+        self.queue.frame_bytes()
     }
 
     /// Feed one freshly on-the-wire source datagram into the FEC group
@@ -835,10 +1023,25 @@ impl ReliableTileEmitter {
         let mut spent = 0usize;
         let emit_us_now = self.emit_us64(now);
         while *count < max_retransmits && spent < max_bytes {
-            let Some((key, cause, judged_ws)) = self.pending_loss.pop_front() else {
+            let Some((content, cause, judged_ws)) = self.pending_loss.pop_front() else {
                 break;
             };
-            self.pending_loss_set.remove(&key);
+            self.pending_loss_set.remove(&content);
+            let key = match content {
+                Content::Tile(key) => key,
+                Content::H264Frag {
+                    frame_seq,
+                    frag_idx,
+                } => {
+                    if let Some(sent) =
+                        self.resend_h264_fragment(frame_seq, frag_idx, cause, judged_ws, now)
+                    {
+                        spent += sent;
+                        *count += 1;
+                    }
+                    continue;
+                }
+            };
             let Some(entry) = self.cache.get_mut(&key) else {
                 // Acknowledged or superseded while it waited: nothing to send.
                 continue;
@@ -999,7 +1202,7 @@ impl ReliableTileEmitter {
     /// Wire bytes currently in flight: everything cached and not yet ACKed.
     /// Fed to goog_cc as `TransportPacketsFeedback::data_in_flight`.
     pub fn bytes_in_flight(&self) -> usize {
-        self.cache.bytes_outstanding()
+        self.cache.bytes_outstanding() + self.h264.bytes_outstanding()
     }
 
     /// Ingest a batch of NACKs from the client. For each pass key:
@@ -1079,6 +1282,7 @@ impl ReliableTileEmitter {
     /// — see `RetransmitCache::clear` doc.
     pub fn clear_cache(&mut self) {
         self.cache.clear();
+        self.h264.clear();
         self.resend_origin.clear();
         self.latest_tile_generation.clear();
         self.pending_loss.clear();
@@ -1155,32 +1359,53 @@ impl ReliableTileEmitter {
         self.latest_departure_at = Some(self.latest_departure_at.map_or(at, |t| t.max(at)));
     }
 
-    /// What a request to retransmit `key`'s content, because transmission
+    /// What a request to retransmit `content`, because transmission
     /// `wire_seq` of it is lost or overdue, would do. Content is current when
-    /// the pass is cached and `wire_seq` is the newest transmission of it.
-    fn classify_retx(&self, key: &EmitKey, wire_seq: u32, cause: RetxCause) -> RetxRequest {
-        match self.cache.get(key) {
-            None => RetxRequest::ContentGone,
-            Some(e) if e.latest_ws != wire_seq => RetxRequest::NewerInFlight,
-            // A NACK repair already waiting will be the pass's newest
-            // transmission before this one could be sent.
-            Some(_)
-                if self.pending_loss_set.contains(key) || self.pending_nack_set.contains(key) =>
-            {
-                RetxRequest::AlreadyQueued
-            }
-            Some(e) if cause == RetxCause::Loss && e.loss_attempts >= LOSS_RETX_MAX_ATTEMPTS => {
-                RetxRequest::Deferred
-            }
-            Some(_) => RetxRequest::Queued,
+    /// it is cached and `wire_seq` is the newest transmission of it.
+    fn classify_retx(&self, content: &Content, wire_seq: u32, cause: RetxCause) -> RetxRequest {
+        let (latest_ws, loss_attempts, is_p_frame) = match content {
+            Content::Tile(key) => match self.cache.get(key) {
+                None => return RetxRequest::ContentGone,
+                Some(e) => (e.latest_ws, e.loss_attempts, false),
+            },
+            Content::H264Frag {
+                frame_seq,
+                frag_idx,
+            } => match self.h264.get(*frame_seq, *frag_idx) {
+                None => return RetxRequest::ContentGone,
+                Some(e) => (
+                    e.latest_ws,
+                    e.loss_attempts,
+                    self.h264.is_idr(*frame_seq) == Some(false),
+                ),
+            },
+        };
+        if latest_ws != wire_seq {
+            return RetxRequest::NewerInFlight;
         }
+        // A NACK repair already waiting will be the pass's newest
+        // transmission before this one could be sent.
+        if self.pending_loss_set.contains(content)
+            || content
+                .tile()
+                .is_some_and(|k| self.pending_nack_set.contains(&k))
+        {
+            return RetxRequest::AlreadyQueued;
+        }
+        if is_p_frame && cause == RetxCause::Loss {
+            return RetxRequest::NotRetransmitted;
+        }
+        if cause == RetxCause::Loss && loss_attempts >= LOSS_RETX_MAX_ATTEMPTS {
+            return RetxRequest::Deferred;
+        }
+        RetxRequest::Queued
     }
 
     /// Up to `n` deferred passes whose deadline has come, earliest first, each
     /// with the `wire_seq` of the transmission that was judged. Entries for
     /// passes since acknowledged or cancelled, or resent by someone else since
     /// the verdict, are dropped as they surface. O(log n) per entry.
-    pub fn take_due_deferred(&mut self, now: Instant, n: usize) -> Vec<(EmitKey, u32)> {
+    pub fn take_due_deferred(&mut self, now: Instant, n: usize) -> Vec<(Content, u32)> {
         let mut out = Vec::new();
         while out.len() < n {
             let Some(Reverse(top)) = self.deferred.peek() else {
@@ -1191,9 +1416,8 @@ impl ReliableTileEmitter {
             }
             let Reverse(d) = self.deferred.pop().expect("peeked");
             if self
-                .cache
-                .get(&d.key)
-                .is_some_and(|e| e.latest_ws == d.judged_ws)
+                .entry_view(&d.key)
+                .is_some_and(|(latest_ws, _, _)| latest_ws == d.judged_ws)
             {
                 out.push((d.key, d.judged_ws));
             }
@@ -1215,16 +1439,34 @@ impl ReliableTileEmitter {
 
     /// Leave `key` to its own deadline: `last_sent_at` plus the probe timeout
     /// at the pass's loss-path attempt count, which doubles with each resend.
-    fn defer(&mut self, key: EmitKey, judged_ws: u32) {
-        let Some(e) = self.cache.get(&key) else {
+    fn defer(&mut self, content: Content, judged_ws: u32) {
+        let Some((_, loss_attempts, last_sent_at)) = self.entry_view(&content) else {
             return;
         };
-        let due = e.last_sent_at + pto_for_attempt(&self.rtt, e.loss_attempts);
+        let due = last_sent_at + pto_for_attempt(&self.rtt, loss_attempts);
         self.deferred.push(Reverse(DeferredPass {
-            key,
+            key: content,
             judged_ws,
             due,
         }));
+    }
+
+    /// `(latest_ws, loss_attempts, last_sent_at)` of the cached entry for
+    /// `content`, whichever cache holds it.
+    fn entry_view(&self, content: &Content) -> Option<(u32, u8, Instant)> {
+        match content {
+            Content::Tile(key) => self
+                .cache
+                .get(key)
+                .map(|e| (e.latest_ws, e.loss_attempts, e.last_sent_at)),
+            Content::H264Frag {
+                frame_seq,
+                frag_idx,
+            } => self
+                .h264
+                .get(*frame_seq, *frag_idx)
+                .map(|e| (e.latest_ws, e.loss_attempts, e.last_sent_at)),
+        }
     }
 
     /// Transmission `wire_seq` of pass `key` was declared lost (packet or time
@@ -1241,27 +1483,21 @@ impl ReliableTileEmitter {
         if crate::config::no_rto() {
             return RetxRequest::Disabled;
         }
-        let key = match content.into() {
-            Content::Tile(key) => key,
-            // Nothing retains H.264 fragments yet.
-            Content::H264Frag { .. } => {
-                self.stats.verdict_content_gone += 1;
-                return RetxRequest::ContentGone;
-            }
-        };
-        let r = self.classify_retx(&key, wire_seq, cause);
+        let content = content.into();
+        let r = self.classify_retx(&content, wire_seq, cause);
         match r {
             RetxRequest::Queued => {
-                self.pending_loss.push_back((key, cause, wire_seq));
-                self.pending_loss_set.insert(key);
+                self.pending_loss.push_back((content, cause, wire_seq));
+                self.pending_loss_set.insert(content);
             }
             RetxRequest::ContentGone => self.stats.verdict_content_gone += 1,
             RetxRequest::NewerInFlight => self.stats.verdict_newer_in_flight += 1,
             RetxRequest::AlreadyQueued => self.stats.verdict_already_queued += 1,
             RetxRequest::Deferred => {
                 self.stats.verdict_deferred_to_pto += 1;
-                self.defer(key, wire_seq);
+                self.defer(content, wire_seq);
             }
+            RetxRequest::NotRetransmitted => self.stats.h264_p_verdicts_not_resent += 1,
             RetxRequest::Disabled => {}
         }
         r
