@@ -450,6 +450,17 @@ impl H264Decoder {
         self.submit_with_retry(Some(au))
     }
 
+    /// Accepted for API parity with the GStreamer backend and never called:
+    /// decode here is synchronous, so no frame becomes ready after
+    /// [`Self::decode`] returns. See [`crate::FrameReadyNotify`].
+    pub fn set_frame_ready_notify(&mut self, _notify: crate::FrameReadyNotify) {}
+
+    /// Always empty, for the same reason: [`Self::decode`] already returned
+    /// every frame its access unit completed.
+    pub fn take_ready(&mut self) -> Result<Vec<HwFrame>, H264Error> {
+        Ok(Vec::new())
+    }
+
     /// Signal end of stream and drain what the decoder still holds.
     ///
     /// **Terminal.** After this the decoder returns `AVERROR_EOF` for every

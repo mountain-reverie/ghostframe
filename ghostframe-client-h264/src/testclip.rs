@@ -40,6 +40,24 @@ use ffmpeg_next as ffmpeg;
 /// support, not production code -- a clip that fails to synthesize should
 /// fail the test loudly, not be worked around.
 pub fn gradient_clip(w: u32, h: u32, n: usize) -> Vec<Vec<u8>> {
+    encode_gradient(w, h, n, &[])
+}
+
+/// [`gradient_clip`], encoded the way the server's stream is shaped: no
+/// B-frames, one reference picture, a VUI declaring `max_num_reorder_frames
+/// == 0` and `max_dec_frame_buffering == 1`. These are the options of the
+/// server's software fallback (`ghostframe-lib/src/encoder/h264_vaapi.rs`),
+/// and the SPS shape matches what its VA-API path was measured to emit. The
+/// default [`gradient_clip`] reorders, so a decoder's low-latency behaviour
+/// never shows on it.
+///
+/// # Panics
+/// As [`gradient_clip`].
+pub fn low_latency_clip(w: u32, h: u32, n: usize) -> Vec<Vec<u8>> {
+    encode_gradient(w, h, n, &[("preset", "ultrafast"), ("tune", "zerolatency")])
+}
+
+fn encode_gradient(w: u32, h: u32, n: usize, opts: &[(&str, &str)]) -> Vec<Vec<u8>> {
     ffmpeg::init().expect("ffmpeg init");
     // Quiets libx264's own per-frame stats (`[libx264 @ ...] frame I: ...`),
     // which it `av_log`s at INFO and which would otherwise flood every
@@ -59,7 +77,11 @@ pub fn gradient_clip(w: u32, h: u32, n: usize) -> Vec<Vec<u8>> {
     enc.set_height(h);
     enc.set_format(ffmpeg::format::Pixel::YUV420P);
     enc.set_time_base(ffmpeg::Rational::new(1, 60));
-    let mut enc = enc.open_as(codec).expect("open libx264");
+    let mut dict = ffmpeg::Dictionary::new();
+    for (k, v) in opts {
+        dict.set(k, v);
+    }
+    let mut enc = enc.open_as_with(codec, dict).expect("open libx264");
 
     let mut out = Vec::new();
     let drain = |enc: &mut ffmpeg::encoder::video::Encoder, out: &mut Vec<Vec<u8>>| {
