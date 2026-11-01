@@ -42,6 +42,14 @@ pub(crate) const RATE_INITIAL_BPS: u32 = 4_000_000;
 
 /// Time constant of the estimate's EWMA.
 const EWMA_TAU: Duration = Duration::from_millis(250);
+/// A raw estimate this many times the smoothed one is a jump, not a drift: a
+/// probe that found headroom (goog_cc sets the estimate to the probe's result
+/// and pulls it back to `1.5 x` the acknowledged rate within a few hundred
+/// milliseconds, faster than a 250 ms EWMA would follow it up).
+const SPIKE_RATIO: f64 = 1.5;
+/// A jump is held (the target is computed from it, not from the smoothed
+/// estimate) for this long, enough for the evaluation interval to see it.
+const SPIKE_HOLD: Duration = Duration::from_secs(1);
 /// A candidate is looked at no more often than this.
 const EVAL_MIN_INTERVAL: Duration = Duration::from_millis(250);
 /// A candidate is adopted at least this often, however little it moved.
@@ -53,8 +61,31 @@ const CANDIDATE_REFRESH: Duration = Duration::from_secs(1);
 const MOVE_FRACTION: f64 = 0.10;
 /// A candidate this far under the running rate reopens immediately.
 const DROP_FRACTION: f64 = 0.30;
+/// A candidate this far over the running rate reopens immediately too. A rise
+/// that large is a probe having found headroom, and an estimate nobody uses
+/// decays back toward 1.5 x the acknowledged rate within a second or two
+/// (goog_cc's additive-increase limit), well inside a GOP: waiting for the
+/// scheduled IDR would hand the headroom back before the stream ever used it.
+const RISE_FRACTION: f64 = 0.30;
 /// Reopens are at least this far apart.
 pub(crate) const MIN_REOPEN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// A padding template is a fragment at least this long (a short tail fragment
+/// would make a cluster of many tiny datagrams).
+pub(crate) const PAD_MIN_TEMPLATE_BYTES: usize = 600;
+/// Padding is this much over the cluster's `min_bytes`: the estimator needs
+/// `min_bytes` acknowledged, and a few datagrams may be late or lost.
+const PAD_MARGIN: f64 = 1.2;
+/// Padding for one probe window never exceeds this, whatever the cluster asks.
+const PAD_MAX_BYTES: usize = 384 * 1024;
+/// Padding for one window is at most this many seconds of the estimate.
+const PAD_MAX_ESTIMATE_SECS: f64 = 0.3;
+/// How long after padding the estimate ceiling stays off: the 100 ms window,
+/// the queue the burst builds on the path (up to about 0.3 s on the scenes'
+/// links) and the round trip of the acknowledgements.
+const PAD_CEILING_HOLD: Duration = Duration::from_millis(1000);
+/// An IDR within this many frames is the burst of the window; no padding.
+const PAD_IDR_LOOKAHEAD_FRAMES: u32 = 3;
 
 /// What the policy wants done for the frame about to be encoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +99,10 @@ pub(crate) enum RateStep {
     /// fall of more than 30 % (its IDR is named [`IdrCause::RateDrop`]);
     /// otherwise this is the scheduled GOP IDR taking a new rate.
     Reopen { bps: u32, urgent: bool },
+    /// Reopen at once for a rise of more than 30 % (see [`RISE_FRACTION`]).
+    /// Its IDR is [`IdrCause::RateRise`]; it holds nothing (the link is
+    /// healthy, the client already has a picture).
+    ReopenRise { bps: u32 },
 }
 
 /// The pure rate policy. See the module docs.
@@ -75,6 +110,8 @@ pub(crate) enum RateStep {
 pub(crate) struct RatePolicy {
     ewma_bps: Option<f64>,
     last_obs: Option<Instant>,
+    /// A jump of the raw estimate, and when its hold ends.
+    spike: Option<(f64, Instant)>,
     /// The rate the encoder runs at, as last commanded.
     applied: Option<u32>,
     candidate: Option<u32>,
@@ -89,7 +126,6 @@ fn relative_move(from: u32, to: u32) -> f64 {
 
 impl RatePolicy {
     /// The rate the encoder was last told to run at.
-    #[cfg(test)]
     pub(crate) fn applied(&self) -> Option<u32> {
         self.applied
     }
@@ -98,13 +134,19 @@ impl RatePolicy {
     pub(crate) fn reset_session(&mut self) {
         self.ewma_bps = None;
         self.last_obs = None;
+        self.spike = None;
         self.candidate = None;
         self.candidate_at = None;
         self.last_eval = None;
     }
 
-    fn target(&self) -> u32 {
-        let e = self.ewma_bps.unwrap_or(0.0);
+    fn target(&self, now: Instant) -> u32 {
+        let mut e = self.ewma_bps.unwrap_or(0.0);
+        if let Some((v, until)) = self.spike {
+            if now < until {
+                e = e.max(v);
+            }
+        }
         let t = (RATE_SHARE * e).clamp(f64::from(RATE_FLOOR_BPS), f64::from(RATE_CAP_BPS));
         t as u32
     }
@@ -114,6 +156,10 @@ impl RatePolicy {
         match (self.ewma_bps, self.last_obs) {
             (Some(e), Some(t)) => {
                 let dt = now.saturating_duration_since(t).as_secs_f64();
+                if est > e * SPIKE_RATIO {
+                    let until = now + SPIKE_HOLD;
+                    self.spike = Some((est.max(self.spike.map_or(0.0, |s| s.0)), until));
+                }
                 let alpha = 1.0 - (-dt / EWMA_TAU.as_secs_f64()).exp();
                 self.ewma_bps = Some(e + alpha * (est - e));
             }
@@ -133,7 +179,7 @@ impl RatePolicy {
     pub(crate) fn step(&mut self, now: Instant, estimate_bps: u64, at_gop: bool) -> RateStep {
         self.observe(now, estimate_bps);
         let Some(applied) = self.applied else {
-            let t = self.target();
+            let t = self.target(now);
             self.applied = Some(t);
             self.candidate = Some(t);
             self.candidate_at = Some(now);
@@ -145,7 +191,7 @@ impl RatePolicy {
             .is_none_or(|t| now.saturating_duration_since(t) >= EVAL_MIN_INTERVAL)
         {
             self.last_eval = Some(now);
-            let target = self.target();
+            let target = self.target(now);
             let adopt = match (self.candidate, self.candidate_at) {
                 (Some(c), Some(at)) => {
                     relative_move(c, target) > MOVE_FRACTION
@@ -163,9 +209,13 @@ impl RatePolicy {
             return RateStep::Keep;
         }
         let dropped = f64::from(cand) < f64::from(applied) * (1.0 - DROP_FRACTION);
-        if dropped || at_gop {
+        let rose = f64::from(cand) > f64::from(applied) * (1.0 + RISE_FRACTION);
+        if dropped || rose || at_gop {
             self.applied = Some(cand);
             self.last_reopen = Some(now);
+            if rose {
+                return RateStep::ReopenRise { bps: cand };
+            }
             return RateStep::Reopen {
                 bps: cand,
                 urgent: dropped,
@@ -254,11 +304,118 @@ impl IoBridge {
         self.backend_apply(control);
     }
 
+    /// Tell the estimator the application is rate-limited by its own choice:
+    /// a CBR stream at a share of the estimate is application-limited by
+    /// construction, and goog_cc only asks for ALR probes of a sender it calls
+    /// application-limited (see `googcc::ALR_DECLARED_FACTOR`).
+    fn h264_declare_alr(&mut self) {
+        if !self.h264.alr_declared {
+            self.h264.alr_declared = true;
+            self.h264.stats.alr_signalled += 1;
+            self.bwe.set_alr_declared(true);
+        }
+    }
+
+    /// The H.264 rate policy is no longer in charge (the stream left H.264
+    /// mode, or the session ended).
+    pub(super) fn h264_end_alr(&mut self) {
+        if self.h264.alr_declared {
+            self.h264.alr_declared = false;
+            self.bwe.set_alr_declared(false);
+        }
+    }
+
+    /// Fill a probe window for a P frame that was just sent, without forcing
+    /// an IDR (design 4.3).
+    ///
+    /// goog_cc asks for a periodic ALR probe (a cluster of `min_bytes` at a
+    /// rate above the estimate) and the only thing that claims one is a burst.
+    /// If an IDR is due within the window it is the burst and nothing is
+    /// done here. Otherwise the window is opened now and filled with copies of
+    /// an already acknowledged P-frame fragment under new `wire_seq`s: the
+    /// client acknowledges a fragment on receipt and discards a duplicate, so
+    /// the copies are measured and cost the picture nothing. They are billed
+    /// as probe, never counted as frame data, never retransmitted, bounded by
+    /// the cluster (`PAD_MARGIN` over `min_bytes`, `PAD_MAX_BYTES` overall) and
+    /// sent at the probe rate (the admission rate is the window's while it is
+    /// open).
+    pub(super) fn h264_probe_pad(&mut self, now: Instant, is_idr: bool) {
+        if self.h264.rate.applied().is_none() {
+            return;
+        }
+        let Some(template) = self.h264.pad_template.clone() else {
+            return;
+        };
+        if self.active_probe.is_none() && !is_idr {
+            let gop = self.h264.gop_frames;
+            let idr_soon = self.h264.pending_idr.is_some()
+                || (gop > 0
+                    && self
+                        .h264
+                        .frames_since_idr
+                        .is_some_and(|n| n.saturating_add(PAD_IDR_LOOKAHEAD_FRAMES) >= gop));
+            if idr_soon {
+                return;
+            }
+            self.open_probe_window_for_burst(now);
+        }
+        // An open window, however it was claimed (an IDR, or just above), is
+        // topped up to the cluster's size: an IDR smaller than the cluster
+        // would otherwise end the window under-filled and waste the probe.
+        let Some(p) = self.active_probe.as_mut().filter(|p| now < p.ends_at) else {
+            return;
+        };
+        let len = template.len() as i64;
+        let want_bytes = (p.min_bytes as f64 * PAD_MARGIN) as i64;
+        if p.bytes_sent >= want_bytes && p.packets_sent >= p.min_probes {
+            return;
+        }
+        let by_bytes = (want_bytes - p.bytes_sent + len - 1) / len;
+        let by_count = p.min_probes - p.packets_sent;
+        // Never more padding than a fraction of a second of the estimate: a
+        // probe cluster is `rate x 100 ms`, and a start-up ladder rung at 6 or
+        // 12 Mbit/s would otherwise queue seconds of padding on a thin path
+        // (a 1 Mbit/s link was measured skipping a third more frames). A
+        // cluster too big for that is left under-filled and abandoned, as a
+        // burst too small for it always was.
+        let est_bytes = (self.bwe.snapshot().bitrate_bps / 8) as f64;
+        let by_estimate = (est_bytes * PAD_MAX_ESTIMATE_SECS) as usize;
+        let cap = (PAD_MAX_BYTES.min(by_estimate) as i64 / len).max(1);
+        let n = by_bytes.max(by_count).clamp(1, cap);
+        let mut bytes = 0u64;
+        let first_idx = self.h264.stats.probe_padding_datagrams;
+        for i in 0..n {
+            let tag = crate::transport::reliable_emitter::cache::ProbeTag {
+                id: p.id,
+                min_probes: p.min_probes,
+                min_bytes: p.min_bytes,
+                bytes_sent_before: p.bytes_sent,
+            };
+            p.bytes_sent = p.bytes_sent.saturating_add(len);
+            p.packets_sent = p.packets_sent.saturating_add(1);
+            bytes += self.reliable_emitter.submit_h264_pad(
+                &template,
+                ((first_idx + i as u64) % 4096) as u16,
+                tag,
+                now,
+            ) as u64;
+        }
+        // The burst spends the whole grant before any of it is acknowledged:
+        // keep the estimate ceiling from reading that as a saturated, silent
+        // path for the window plus what the queue it builds and a round trip
+        // can add.
+        self.bwe.hold_ceiling(now, PAD_CEILING_HOLD);
+        self.h264.stats.probe_padding_windows += 1;
+        self.h264.stats.probe_padding_datagrams += n as u64;
+        self.h264.stats.probe_padding_bytes += bytes;
+    }
+
     /// Run the rate policy for a frame the gate has let through. `gop_frames`
     /// is the GOP in frames.
     pub(super) fn h264_rate_step(&mut self, now: Instant, gop_frames: u32) {
         let estimate = self.bwe.snapshot().bitrate_bps;
         let at_gop = gop_frames > 0 && self.h264.frames_since_idr.is_some_and(|n| n >= gop_frames);
+        self.h264_declare_alr();
         let step = self.h264.rate.step(now, estimate, at_gop);
         self.h264_apply_rate_step(step, estimate, gop_frames);
     }
@@ -274,6 +431,22 @@ impl IoBridge {
                     bps,
                     gop_frames,
                     reopen: false,
+                });
+            }
+            RateStep::ReopenRise { bps } => {
+                self.h264.stats.rate_target_bps = bps;
+                self.expect_h264_idr(IdrCause::RateRise);
+                self.h264.stats.rate_reopens_rise += 1;
+                tracing::info!(
+                    target: LOG_TARGET,
+                    bps,
+                    estimate_bps = estimate,
+                    "H.264 rate: reopening the encoder for a rise"
+                );
+                self.h264_control(Control::H264Rate {
+                    bps,
+                    gop_frames,
+                    reopen: true,
                 });
             }
             RateStep::Reopen { bps, urgent } => {
@@ -472,16 +645,58 @@ mod tests {
         let t0 = Instant::now();
         let mut p = RatePolicy::default();
         p.step(t0, 5 * MBIT, false);
-        let steps = run(&mut p, t0, 16, 6_000, 10 * MBIT, |_| false);
+        // +20 %: over the 10 % band, under the 30 % that reopens at once.
+        let steps = run(&mut p, t0, 16, 6_000, 6 * MBIT, |_| false);
         assert!(steps.is_empty(), "a rise reopens only at a GOP: {steps:?}");
-        let steps = run(&mut p, t0, 6_016, 100, 10 * MBIT, |_| true);
+        let steps = run(&mut p, t0, 6_016, 100, 6 * MBIT, |_| true);
         assert_eq!(steps.len(), 1, "{steps:?}");
         assert_eq!(steps[0].0, 6_016, "at the first GOP frame");
         let RateStep::Reopen { bps, urgent } = steps[0].1 else {
             panic!("{steps:?}");
         };
         assert!(!urgent);
+        assert!(bps.abs_diff(4_800_000) < 1_000, "{bps}");
+    }
+
+    #[test]
+    fn a_rise_over_30_percent_reopens_at_once_without_waiting_for_the_gop() {
+        let t0 = Instant::now();
+        let mut p = RatePolicy::default();
+        p.step(t0, 5 * MBIT, false);
+        let steps = run(&mut p, t0, 16, 3_000, 10 * MBIT, |_| false);
+        assert_eq!(steps.len(), 1, "{steps:?}");
+        let RateStep::ReopenRise { bps } = steps[0].1 else {
+            panic!("{steps:?}");
+        };
         assert!(bps.abs_diff(8_000_000) < 1_000, "{bps}");
+        assert!(steps[0].0 <= 1_200, "reopened at {} ms", steps[0].0);
+    }
+
+    #[test]
+    fn a_brief_jump_is_held_long_enough_to_be_followed_and_a_decay_is_not_held() {
+        let t0 = Instant::now();
+        // A probe lifts the estimate 4x for 300 ms and goog_cc pulls it back.
+        let mut p = RatePolicy::default();
+        p.step(t0, 2 * MBIT, false);
+        let mut reopened = false;
+        for i in 1..=120u64 {
+            let t = 16 * i;
+            let est = if (400..700).contains(&t) {
+                8 * MBIT
+            } else {
+                2 * MBIT
+            };
+            if matches!(p.step(ms(t0, t), est, false), RateStep::ReopenRise { .. }) {
+                reopened = true;
+            }
+        }
+        assert!(reopened, "the jump must be followed");
+        // A decay is not a jump: it gets no hold, so the fall is acted on as
+        // fast as the smoothing allows (the 30 % test above bounds it).
+        let mut p = RatePolicy::default();
+        p.step(t0, 10 * MBIT, false);
+        p.step(ms(t0, 16), 5 * MBIT, false);
+        assert!(p.spike.is_none(), "a fall is no spike");
     }
 
     #[test]
@@ -489,17 +704,19 @@ mod tests {
         let t0 = Instant::now();
         let mut p = RatePolicy::default();
         p.step(t0, 100 * MBIT / 10, true);
-        // The estimate alternates between 10 and 3 Mbit/s every 500 ms, a GOP
+        // The estimate alternates between 10 and 3 Mbit/s every 1.5 s, a GOP
         // boundary on every frame: only the 2 s limit holds the reopens back.
         let mut reopen_times = Vec::new();
         for i in 0..1000u64 {
             let t = 16 * (i + 1);
-            let est = if (t / 500) % 2 == 0 {
+            let est = if (t / 1_500) % 2 == 0 {
                 10 * MBIT
             } else {
                 3 * MBIT
             };
-            if let RateStep::Reopen { .. } = p.step(ms(t0, t), est, true) {
+            if let RateStep::Reopen { .. } | RateStep::ReopenRise { .. } =
+                p.step(ms(t0, t), est, true)
+            {
                 reopen_times.push(t);
             }
         }

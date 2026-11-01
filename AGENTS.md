@@ -164,8 +164,13 @@ reopens for a fall of more than 30 % (these hold P frames like a loss IDR),
 `rate_reopens_gop` the ones that waited for the scheduled IDR. The GOP is 3 s of
 frames; `GHOSTFRAME_H264_GOP_SECONDS` picks 2 to 5 (anything else is clamped
 with a warning). A stream at `0.8 x` the estimate is not application-limited to
-goog_cc, so no ALR probe is issued and a capacity step-up is not found (design
-4.3, scene P-B; the test is `#[ignore]`d with the measurements).
+goog_cc's ALR detector, so the bridge declares it so (`alr_signalled`, the
+detector is shown a sent size halved) and fills the probe windows goog_cc then
+asks for with padding when no IDR is due: copies of an acknowledged P-frame
+fragment under new `wire_seq`s (`probe_padding_windows` / `probe_padding_bytes`;
+the client acknowledges and discards them). A rise of more than 30 % reopens at
+once (`idr_rate_rise`), a jump of the raw estimate is held for a second, and
+the estimate ceiling is held off for a second around padding.
 
 With `GHOSTFRAME_DAMAGE_MODE=shadow` or `on` the daemon also logs a cumulative
 `damage safety net` line every 5 s (target `ghostframe::server::damage`);

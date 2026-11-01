@@ -100,12 +100,14 @@ pub enum IdrCause {
     /// The rate fell by more than 30 % and the encoder was reopened at once
     /// (a rate change that waits for the scheduled GOP IDR is `GopPeriodic`).
     RateDrop,
+    /// The rate rose by more than 30 % and the encoder was reopened at once.
+    RateRise,
     /// None of the above asked for it: the encoder's own GOP.
     GopPeriodic,
 }
 
 impl IdrCause {
-    pub(crate) const COUNT: usize = 8;
+    pub(crate) const COUNT: usize = 9;
     pub const ALL: [IdrCause; Self::COUNT] = [
         IdrCause::Session,
         IdrCause::Loss,
@@ -114,6 +116,7 @@ impl IdrCause {
         IdrCause::Reentry,
         IdrCause::HoldTimeout,
         IdrCause::RateDrop,
+        IdrCause::RateRise,
         IdrCause::GopPeriodic,
     ];
 
@@ -130,6 +133,7 @@ impl IdrCause {
             IdrCause::Reentry => "reentry",
             IdrCause::HoldTimeout => "hold_timeout",
             IdrCause::RateDrop => "rate_drop",
+            IdrCause::RateRise => "rate_rise",
             IdrCause::GopPeriodic => "gop_periodic",
         }
     }
@@ -216,8 +220,18 @@ pub struct H264Stats {
     /// than 30 % (`IdrCause::RateDrop`), or at the scheduled GOP IDR.
     pub rate_reopens_drop: u64,
     pub rate_reopens_gop: u64,
+    pub rate_reopens_rise: u64,
     /// The rate the encoder was last told to run at, bits per second.
     pub rate_target_bps: u32,
+    /// Times the application declared itself rate-limited to the estimator
+    /// (the rate policy went active in H.264 mode).
+    pub alr_signalled: u64,
+    /// Probe padding sent to fill a probe window without an IDR: windows
+    /// filled that way, datagrams and bytes (wire bytes of the datagrams,
+    /// before the transport's per-datagram overhead).
+    pub probe_padding_windows: u64,
+    pub probe_padding_datagrams: u64,
+    pub probe_padding_bytes: u64,
 }
 
 /// What the harness reads back after a scene: the counters plus two gauges.
@@ -426,6 +440,11 @@ pub(super) struct H264Tx {
     /// Frames sent since the last IDR, that IDR included; `None` until one.
     /// The bridge's clock for "the next frame is the scheduled GOP IDR".
     pub(super) frames_since_idr: Option<u32>,
+    /// A recently acknowledged P-frame fragment's datagram: the padding of a
+    /// probe window (see `h264_rate`).
+    pub(super) pad_template: Option<bytes::Bytes>,
+    /// Whether the estimator has been told the application is rate-limited.
+    pub(super) alr_declared: bool,
     /// The harness's scripted CBR encoder, if the scene asked for one.
     pub(super) scripted: Option<super::h264_rate::ScriptedCbr>,
 }
@@ -453,6 +472,7 @@ impl H264Tx {
         self.stall_eval_at = None;
         self.rate.reset_session();
         self.frames_since_idr = None;
+        self.pad_template = None;
     }
 }
 
@@ -682,6 +702,17 @@ impl IoBridge {
             self.h264.last_ack_progress = Some(now);
             if let Some(h) = self.h264.hold.as_mut().filter(|h| h.frame_seq == frame_seq) {
                 h.last_progress = now;
+            }
+            // Keep a small P-frame fragment's bytes for probe padding before
+            // the acknowledgement releases it.
+            if frame_seq != crate::transport::reliable_emitter::h264::PAD_FRAME_SEQ
+                && self.reliable_emitter.h264.is_idr(frame_seq) == Some(false)
+            {
+                if let Some(e) = self.reliable_emitter.h264.get(frame_seq, frag_idx) {
+                    if e.datagram.len() >= super::h264_rate::PAD_MIN_TEMPLATE_BYTES {
+                        self.h264.pad_template = Some(e.datagram.clone());
+                    }
+                }
             }
             self.reliable_emitter.on_h264_ack(frame_seq, frag_idx);
             if let FragAck::Acked { complete: true } =
@@ -941,6 +972,7 @@ impl IoBridge {
     /// next one would put a stale frame in its window.
     pub(super) fn reset_h264_session(&mut self) {
         self.h264.reset_session();
+        self.h264_end_alr();
         self.reliable_emitter.h264.clear();
         let wire_seqs = self.reliable_emitter.purge_queued_h264(|_| true);
         // The ledger is reset with the session by its callers; there is
