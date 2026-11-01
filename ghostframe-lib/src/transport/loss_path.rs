@@ -117,6 +117,7 @@ pub(crate) fn probe(
                 RetxRequest::NewerInFlight
                 | RetxRequest::AlreadyQueued
                 | RetxRequest::Deferred
+                | RetxRequest::NotRetransmitted
                 | RetxRequest::Disabled => {}
             }
         }
@@ -415,7 +416,9 @@ mod deferred_tests {
         let far = t + Duration::from_secs(60);
         let due = e.take_due_deferred(far, 8);
         assert_eq!(
-            due.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            due.iter()
+                .map(|(k, _)| k.tile().unwrap())
+                .collect::<Vec<_>>(),
             vec![c],
             "a was resent since the verdict, b is acknowledged"
         );
@@ -424,5 +427,177 @@ mod deferred_tests {
             0,
             "the moot ones were dropped as they surfaced"
         );
+    }
+}
+
+/// The probe timeout and H.264 fragments. The hazard these guard: the probe
+/// declares lost, on the spot, a transmission whose content is gone. A
+/// fragment the emitter kept no entry for would be gone, so one acknowledgement
+/// stall would turn every outstanding fragment into a loss reported to goog_cc.
+#[cfg(test)]
+mod h264_tests {
+    use super::*;
+    use crate::transport::protocol::fragment_frame;
+    use crate::transport::reliable_emitter::h264::H264Submit;
+    use crate::transport::reliable_emitter::Content;
+    use crate::transport::transmission_ledger::Transmission;
+    use bytes::Bytes;
+
+    const FRAG: usize = 100;
+
+    /// Frames 1..=`frames` of `frags` fragments each (frame 1 an IDR), sent and
+    /// departed at `t0`, booked in the ledger.
+    fn sent_frames(
+        frames: u32,
+        frags: usize,
+        t0: Instant,
+    ) -> (
+        ReliableTileEmitter,
+        TransmissionLedger,
+        Vec<(u32, u16, u32)>,
+    ) {
+        let mut e = ReliableTileEmitter::new(t0);
+        e.rtt.on_sample(Duration::from_millis(40));
+        let mut l = TransmissionLedger::new(4096);
+        let mut sent = Vec::new();
+        for f in 1..=frames {
+            let dgs = fragment_frame(f, 0, f == 1, &vec![7u8; FRAG * frags], FRAG);
+            for (i, dg) in dgs.into_iter().enumerate() {
+                e.submit_h264_fragment(
+                    H264Submit {
+                        frame_seq: f,
+                        frag_idx: i as u16,
+                        is_idr: f == 1,
+                        bytes: Bytes::from(dg),
+                        queued_at: t0,
+                        probe: None,
+                    },
+                    t0,
+                );
+            }
+        }
+        for em in e.take_transmissions() {
+            l.record(
+                em.wire_seq,
+                t0,
+                Transmission {
+                    emit_us: 0,
+                    wire_bytes: em.wire_bytes,
+                    content: em.content,
+                    depart_us: None,
+                    dep_idx: None,
+                },
+            );
+            l.mark_departed(em.wire_seq, t0, 0);
+            e.on_departed(em.wire_seq, t0);
+            let Content::H264Frag {
+                frame_seq,
+                frag_idx,
+            } = em.content
+            else {
+                unreachable!()
+            };
+            sent.push((frame_seq, frag_idx, em.wire_seq));
+        }
+        (e, l, sent)
+    }
+
+    /// An acknowledgement stall: nothing is acknowledged, the probe timeout
+    /// fires. It sends the newest fragment or two again and declares nothing
+    /// lost.
+    #[test]
+    fn a_probe_over_outstanding_h264_fragments_sends_two_and_declares_none_lost() {
+        let t0 = Instant::now();
+        let (mut e, mut l, sent) = sent_frames(5, 8, t0);
+        assert_eq!(sent.len(), 40);
+        let due = e.pto_deadline().expect("fragments are outstanding");
+        let out = probe(&mut l, &mut e, due).expect("due");
+        assert!(
+            out.lost.is_empty(),
+            "no fragment is declared lost by a stall: {:?}",
+            out.lost.iter().map(|(w, _)| *w).collect::<Vec<_>>()
+        );
+        assert_eq!(out.retx_queued, PROBE_COUNT as u64);
+        // They are the newest two, sent with new wire_seqs.
+        let mut n = 0;
+        e.tick_loss_budgeted(due, usize::MAX, usize::MAX, &mut n);
+        let probes = e.take_transmissions();
+        assert_eq!(probes.len(), PROBE_COUNT);
+        let newest: Vec<Content> = sent[sent.len() - PROBE_COUNT..]
+            .iter()
+            .map(|(f, i, _)| Content::H264Frag {
+                frame_seq: *f,
+                frag_idx: *i,
+            })
+            .collect();
+        for p in &probes {
+            assert!(newest.contains(&p.content), "{:?}", p.content);
+            assert!(!sent.iter().any(|(_, _, ws)| *ws == p.wire_seq));
+        }
+        assert_eq!(l.len(), 40, "nothing left the ledger");
+    }
+
+    /// The acknowledgement of a probe's copy releases the fragment, so the
+    /// original's later verdict finds the content gone and is not resent.
+    #[test]
+    fn the_probe_copy_being_acknowledged_settles_the_fragment() {
+        let t0 = Instant::now();
+        let (mut e, mut l, sent) = sent_frames(1, 4, t0);
+        let due = e.pto_deadline().unwrap();
+        probe(&mut l, &mut e, due).unwrap();
+        let mut n = 0;
+        e.tick_loss_budgeted(due, usize::MAX, usize::MAX, &mut n);
+        let copy = e.take_transmissions().pop().expect("a probe copy");
+        let Content::H264Frag {
+            frame_seq,
+            frag_idx,
+        } = copy.content
+        else {
+            unreachable!()
+        };
+        assert!(e.on_h264_ack(frame_seq, frag_idx));
+        let orig = sent
+            .iter()
+            .find(|(f, i, _)| (*f, *i) == (frame_seq, frag_idx))
+            .unwrap()
+            .2;
+        assert_eq!(
+            e.request_retransmit(copy.content, orig, RetxCause::Loss),
+            RetxRequest::ContentGone
+        );
+    }
+
+    /// The same stall over fragments the emitter holds no entry for (the case
+    /// before this change): every one is declared lost. The test above is only
+    /// load-bearing if this really happens, so it is checked here.
+    #[test]
+    fn without_a_cache_entry_the_probe_declares_the_fragments_lost() {
+        let t0 = Instant::now();
+        let (mut e, mut l, sent) = sent_frames(5, 8, t0);
+        e.h264.clear();
+        // Entries gone but the probe timer still has a pass cached to run for.
+        e.submit_one(
+            crate::transport::reliable_emitter::EmitKey::new(99, 0, 0, 0),
+            pass(99),
+            t0,
+            None,
+            t0,
+        );
+        e.on_departed(0, t0);
+        let due = e.pto_deadline().expect("armed");
+        let out = probe(&mut l, &mut e, due).expect("due");
+        assert!(
+            out.lost.len() > 8,
+            "premise: with no cache entry the probe mass-declares ({} of {})",
+            out.lost.len(),
+            sent.len()
+        );
+    }
+
+    fn pass(i: u32) -> Bytes {
+        let mut v = vec![0u8; 25];
+        v[0..4].copy_from_slice(&(0x8000_0000 | i).to_be_bytes());
+        v[6..8].copy_from_slice(&1u16.to_be_bytes());
+        Bytes::from(v)
     }
 }

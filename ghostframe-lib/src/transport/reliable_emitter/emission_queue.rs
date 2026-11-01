@@ -89,7 +89,10 @@ impl Emission {
     pub fn wire_seq(&self) -> Option<u32> {
         match self {
             Emission::Source(b, _) if b.len() >= 12 => {
-                Some(u32::from_be_bytes([b[8], b[9], b[10], b[11]]))
+                let ws = u32::from_be_bytes([b[8], b[9], b[10], b[11]]);
+                // `NO_ACK` marks a datagram the ledger does not track (XOR
+                // parity of an H.264 frame): it names no transmission.
+                (ws != crate::transport::protocol::NO_ACK).then_some(ws)
             }
             Emission::Source(..) | Emission::Parity(..) => None,
         }
@@ -105,6 +108,9 @@ impl Emission {
 
 pub struct EmissionQueue {
     queue: VecDeque<Emission>,
+    /// Bytes of the frame datagrams in `queue` (H.264 fragments, resends and
+    /// parity): the backlog the encoder's backpressure reads.
+    frame_bytes: usize,
     /// (Reverse(emit_after_wire_seq), parity_bytes). BinaryHeap is max-heap
     /// by default; Reverse turns it into a min-heap by emit_after.
     pending_parity: BinaryHeap<Reverse<(u32, Vec<u8>)>>,
@@ -119,10 +125,24 @@ impl Default for EmissionQueue {
     }
 }
 
+/// Whether `bytes` is an H.264 frame datagram rather than a tile datagram: a
+/// tile datagram's first bit is set (`TILE_DATAGRAM_FLAG`), a frame's never is.
+fn is_frame_datagram(bytes: &[u8]) -> bool {
+    bytes.len() >= crate::transport::protocol::FRAME_HEADER_SIZE && bytes[0] & 0x80 == 0
+}
+
+fn frame_len(e: &Emission) -> usize {
+    match e {
+        Emission::Source(b, _) if is_frame_datagram(b) => b.len(),
+        Emission::Source(..) | Emission::Parity(..) => 0,
+    }
+}
+
 impl EmissionQueue {
     pub fn new() -> Self {
         Self {
             queue: VecDeque::new(),
+            frame_bytes: 0,
             pending_parity: BinaryHeap::new(),
             end_of_stream_idle_since: None,
         }
@@ -150,12 +170,15 @@ impl EmissionQueue {
     /// Front, not back: the queue is in wire order, so this restores exactly
     /// the order that existed before the pop.
     pub fn push_front(&mut self, emission: Emission) {
+        self.frame_bytes += frame_len(&emission);
         self.queue.push_front(emission);
         self.end_of_stream_idle_since = None;
     }
 
     pub fn push_source(&mut self, bytes: Bytes, class: WireClass) {
-        self.queue.push_back(Emission::Source(bytes, class));
+        let e = Emission::Source(bytes, class);
+        self.frame_bytes += frame_len(&e);
+        self.queue.push_back(e);
         self.end_of_stream_idle_since = None;
     }
 
@@ -183,6 +206,9 @@ impl EmissionQueue {
         // Check end-of-stream flush.
         self.maybe_flush_pending(now);
         let popped = self.queue.pop_front();
+        if let Some(e) = &popped {
+            self.frame_bytes -= frame_len(e);
+        }
         if popped.is_some() {
             self.end_of_stream_idle_since = None;
         } else if !self.pending_parity.is_empty() && self.end_of_stream_idle_since.is_none() {
@@ -210,6 +236,40 @@ impl EmissionQueue {
 
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty() && self.pending_parity.is_empty()
+    }
+
+    /// Bytes of H.264 frame datagrams waiting to be sent.
+    pub fn frame_bytes(&self) -> usize {
+        self.frame_bytes
+    }
+
+    /// Remove every queued frame datagram whose frame `doomed` names.
+    /// Returns how many were removed and the `wire_seq`s of those that carried
+    /// one (parity does not).
+    pub fn purge_frames(&mut self, doomed: impl Fn(u32) -> bool) -> (usize, Vec<u32>) {
+        let mut wire_seqs = Vec::new();
+        let mut removed = 0usize;
+        let mut freed = 0usize;
+        self.queue.retain(|e| {
+            let Emission::Source(b, _) = e else {
+                return true;
+            };
+            if !is_frame_datagram(b) {
+                return true;
+            }
+            let frame_seq = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+            if !doomed(frame_seq) {
+                return true;
+            }
+            removed += 1;
+            freed += b.len();
+            if let Some(ws) = e.wire_seq() {
+                wire_seqs.push(ws);
+            }
+            false
+        });
+        self.frame_bytes -= freed;
+        (removed, wire_seqs)
     }
 }
 

@@ -165,6 +165,10 @@ pub struct LedgerStats {
     pub departures_stamped: u64,
     /// Transmissions evicted by the capacity cap before they had departed.
     pub evicted_before_departure: u64,
+    /// Records the sender took back before they departed
+    /// ([`TransmissionLedger::forget_undeparted`]): superseded H.264
+    /// fragments removed from the emission queue. Neither delivered nor lost.
+    pub forgotten_before_departure: u64,
     /// Verdicts by reason. Their sum is the number of transmissions declared
     /// lost.
     pub lost_packet_threshold: u64,
@@ -458,6 +462,24 @@ impl TransmissionLedger {
     /// Has `wire_seq` left quinn's FIFO? `None` if the ledger does not hold it.
     pub fn departed(&self, wire_seq: u32) -> Option<bool> {
         self.records.get(&wire_seq).map(|r| r.departed.is_some())
+    }
+
+    /// Forget one record that has not departed: its datagram was taken out of
+    /// the emission queue before it reached quinn (an H.264 fragment of a frame
+    /// an IDR superseded). It was never sent, so it is neither delivered nor
+    /// lost: no verdict, no tombstone. `false` if the record is unknown or has
+    /// departed (a departed one is judged like any other).
+    pub fn forget_undeparted(&mut self, wire_seq: u32) -> bool {
+        if self
+            .records
+            .get(&wire_seq)
+            .is_none_or(|r| r.departed.is_some())
+        {
+            return false;
+        }
+        self.records.remove(&wire_seq);
+        self.stats.forgotten_before_departure += 1;
+        true
     }
 
     /// Forget every record that has not departed. The session they were
