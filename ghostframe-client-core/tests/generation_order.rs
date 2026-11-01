@@ -143,9 +143,12 @@ fn model_render(g: &Generation) -> Vec<u8> {
 
 /// What one delivered datagram did.
 struct Effect {
-    /// The pass reached the integrator (`TileReady`).
+    /// The pass reached the integrator. Observed as its ACK: a stale pass is
+    /// dropped before integration and never acknowledged, an accepted one is
+    /// acknowledged right after. (Not as a `TileReady`: a pass that does not
+    /// change the picture -- pass 0 alone, a duplicate -- draws nothing.)
     accepted: bool,
-    /// Pixels of that `TileReady`, if any.
+    /// Pixels of the `TileReady` it produced, if it drew anything.
     rgba: Option<Vec<u8>>,
 }
 
@@ -190,7 +193,6 @@ impl Rig {
             } = ev
             {
                 if (tile_x, tile_y) == (TILE_X, TILE_Y) {
-                    effect.accepted = true;
                     effect.rgba = Some(rgba);
                 }
             }
@@ -206,6 +208,7 @@ impl Rig {
                 }
             }
         }
+        effect.accepted = acked;
         (effect, acked)
     }
 }
@@ -247,7 +250,7 @@ fn a_late_pass_of_an_old_generation_does_not_replace_the_current_one() {
                  (accepted={}, acked={acked})",
                 e.accepted
             );
-            last = e.rgba;
+            last = e.rgba.or(last);
         }
         assert_eq!(last.unwrap(), model_render(&cur), "k={k}: wrong content");
     }
@@ -296,7 +299,7 @@ fn deliver_all(rig: &mut Rig, g: &Generation, passes: std::ops::Range<u8>) -> Op
             g.label,
             e.accepted
         );
-        last = e.rgba;
+        last = e.rgba.or(last);
     }
     last
 }
@@ -569,7 +572,7 @@ proptest! {
             );
             prop_assert_eq!(acked, expect, "ack disagrees with acceptance");
             if *gi == newest {
-                last_newest_rgba = effect.rgba;
+                last_newest_rgba = effect.rgba.or(last_newest_rgba);
             }
         }
         let want = model_render(&all[newest]);

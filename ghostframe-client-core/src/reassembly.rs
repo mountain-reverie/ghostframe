@@ -497,13 +497,17 @@ impl ClientCore {
                     Ok(pre) => {
                         match self.tile_delivery {
                             TileDelivery::Decoded => {
-                                let rgba = self.cdf53_tile_state.integrate(tx, ty, &pre);
-                                events.push(Event::TileReady {
-                                    frame_seq,
-                                    tile_x: tx,
-                                    tile_y: ty,
-                                    rgba,
-                                });
+                                // `None`: nothing new to show yet (see
+                                // `Cdf53TileState::integrate`); the tile keeps
+                                // its previous content.
+                                if let Some(rgba) = self.cdf53_tile_state.integrate(tx, ty, &pre) {
+                                    events.push(Event::TileReady {
+                                        frame_seq,
+                                        tile_x: tx,
+                                        tile_y: ty,
+                                        rgba,
+                                    });
+                                }
                             }
                             TileDelivery::Payload => {
                                 // No CPU accumulation: cdf53_integrate.wgsl
