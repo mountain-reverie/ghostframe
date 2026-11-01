@@ -171,6 +171,8 @@ impl IoBridge {
             );
         }
         self.frame_mode = crate::tile::FrameMode::H264;
+        self.last_h264_frame_seq = None;
+        self.last_reset_request_idr_at = None;
         // Re-prime the frame-dimensions retransmit counter so
         // the new client receives the sentinel on its first
         // frames even if the screen has been at a stable
@@ -314,6 +316,7 @@ impl IoBridge {
             ?from,
             indices_raw = msg.caps.indices_raw_enabled,
             supports_h264 = msg.caps.supports_h264,
+            h264_acked_ref = msg.caps.h264_acked_ref,
             "HELLO received, client capabilities updated"
         );
     }
