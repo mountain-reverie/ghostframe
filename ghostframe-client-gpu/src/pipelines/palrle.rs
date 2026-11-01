@@ -42,12 +42,23 @@ pub struct PalRlePipeline {
     errors_staging: Option<wgpu::Buffer>,
     /// Tile capacity of the per-batch buffers above (not bytes).
     tile_capacity: usize,
+    /// The bind group over the atlas, the per-batch buffers and the
+    /// framebuffer view, with the [`Framebuffer::epoch`] it was built for.
+    /// Dropped when the buffers grow; rebuilt when the framebuffer's texture
+    /// is replaced.
+    bind_group: Option<(u64, wgpu::BindGroup)>,
     /// Number of tiles dispatched in the most recent `decode` call, i.e.
     /// how many error slots are valid to read back.
     last_batch_size: usize,
 }
 
 impl PalRlePipeline {
+    /// Drop the cached bind group that holds the framebuffer's view, so a
+    /// replaced framebuffer texture is not kept alive by it.
+    pub fn drop_framebuffer_cache(&mut self) {
+        self.bind_group = None;
+    }
+
     pub fn new(device: &wgpu::Device) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ghostframe-palrle-shader"),
@@ -78,6 +89,7 @@ impl PalRlePipeline {
             errors_buffer: None,
             errors_staging: None,
             tile_capacity: 0,
+            bind_group: None,
             last_batch_size: 0,
         }
     }
@@ -99,7 +111,7 @@ impl PalRlePipeline {
     }
 
     /// Ensure the per-batch buffers can hold at least `capacity` tiles,
-    /// growing (never shrinking) as needed, and rebuild the bind group.
+    /// growing (never shrinking) as needed, and drop the bind group over them.
     fn ensure_capacity(&mut self, device: &wgpu::Device, capacity: usize) {
         if capacity <= self.tile_capacity {
             return;
@@ -132,11 +144,11 @@ impl PalRlePipeline {
             mapped_at_creation: false,
         }));
         self.tile_capacity = capacity;
+        self.bind_group = None;
     }
 
-    /// `tiles` is (tile_x, tile_y, palette_id, count, indices) where
-    /// `indices` is exactly 512 bytes. `count` is the palette entry count;
-    /// an index >= count is an out-of-range error the shader records.
+    /// Decode `tiles` in a submit of its own; see [`PalRlePipeline::encode`]
+    /// for the form a frame uses.
     pub fn decode(
         &mut self,
         device: &wgpu::Device,
@@ -144,9 +156,32 @@ impl PalRlePipeline {
         fb: &Framebuffer,
         tiles: &[(u8, u8, u8, u8, Vec<u8>)],
     ) {
+        crate::submit::submit_now(device, queue, "ghostframe-palrle-decode", |e| {
+            self.encode(device, queue, e, fb, tiles)
+        });
+    }
+
+    /// Record the decode of `tiles`, (tile_x, tile_y, palette_id, count,
+    /// indices) where `indices` is exactly 512 bytes. `count` is the palette
+    /// entry count; an index >= count is an out-of-range error the shader
+    /// records. Returns whether anything was recorded.
+    ///
+    /// The per-batch buffers are written through the queue now, which wgpu
+    /// runs ahead of the commands of the next submit, so call this at most
+    /// once per encoder: a second call would overwrite the first's tiles
+    /// before either's dispatch ran. [`PalRlePipeline::take_errors`] reads
+    /// the slots after that submit.
+    pub fn encode(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        fb: &Framebuffer,
+        tiles: &[(u8, u8, u8, u8, Vec<u8>)],
+    ) -> bool {
         if tiles.is_empty() {
             self.last_batch_size = 0;
-            return;
+            return false;
         }
 
         self.ensure_capacity(device, tiles.len());
@@ -186,57 +221,57 @@ impl PalRlePipeline {
 
         // Zero the error slots for this batch before dispatch, or
         // `take_errors` would report stale failures from a previous frame.
-        let zeros = vec![0u8; tiles.len() * ERROR_STRIDE as usize];
-        queue.write_buffer(errors_buffer, 0, &zeros);
+        // A recorded clear, so it runs before the dispatch below and needs no
+        // staging write.
+        encoder.clear_buffer(errors_buffer, 0, Some(tiles.len() as u64 * ERROR_STRIDE));
 
-        let fb_view = fb
-            .texture()
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ghostframe-palrle-bind-group"),
-            layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.palette_atlas.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: tile_work_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: indices_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&fb_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: errors_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        let epoch = fb.epoch();
+        if self.bind_group.as_ref().map(|(e, _)| *e) != Some(epoch) {
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ghostframe-palrle-bind-group"),
+                layout: &self.pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.palette_atlas.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: tile_work_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: indices_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(fb.view()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: errors_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            self.bind_group = Some((epoch, bind_group));
+        }
+        let (_, bind_group) = self.bind_group.as_ref().expect("just set");
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("ghostframe-palrle-decode"),
-        });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ghostframe-palrle-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[]);
             // Four workgroups per tile in a 2x2 arrangement -- see module
             // doc comment for why this can't be a single (num_tiles, 1, 1)
             // dispatch of 32x32 workgroups.
             pass.dispatch_workgroups(tiles.len() as u32, 2, 2);
         }
-        queue.submit(std::iter::once(encoder.finish()));
 
         self.last_batch_size = tiles.len();
+        true
     }
 
     /// Read back and clear the per-tile error slots from the last `decode`.
@@ -267,7 +302,7 @@ impl PalRlePipeline {
             label: Some("ghostframe-palrle-errors-readback"),
         });
         encoder.copy_buffer_to_buffer(errors_buffer, 0, errors_staging, 0, read_bytes);
-        queue.submit(std::iter::once(encoder.finish()));
+        crate::submit::submit(queue, encoder);
 
         let slice = errors_staging.slice(0..read_bytes);
         let (map_tx, map_rx) = std::sync::mpsc::channel();

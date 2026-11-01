@@ -40,6 +40,9 @@ const HISTORY_CAPACITY: usize = 256;
 pub struct ExportBuffer {
     pub exported: ExportedImage,
     pub texture: wgpu::Texture,
+    /// The default view of `texture`, made once: the blit renders into it
+    /// every publish.
+    pub view: wgpu::TextureView,
     /// Generation this buffer's contents correspond to. `None` = never
     /// filled, which forces a full blit.
     pub filled_at_gen: Option<u64>,
@@ -99,6 +102,18 @@ pub struct PublishedFrame {
     pub planes: Vec<PlaneLayout>,
 }
 
+/// A publish decided but not yet carried out: the buffer to fill, what to
+/// copy into it, and the history to commit once the copy has run. Made by
+/// [`ExportRing::plan_publish`], recorded by [`ExportRing::encode_blit`], and
+/// committed by [`ExportRing::finish_publish`] -- split so the copy can ride in
+/// the frame's one submit instead of costing a second.
+pub(crate) struct PublishPlan {
+    buffer_id: u32,
+    gen: u64,
+    pixel_rects: Vec<Rect>,
+    since_previous: Option<SincePrevious>,
+}
+
 /// A ring of exported dmabuf buffers, filled with history-aware partial
 /// blits from a shared private [`Framebuffer`].
 pub struct ExportRing {
@@ -150,9 +165,11 @@ impl ExportRing {
             let exported =
                 ExportedImage::new(ctx, width, height, preferred_modifiers, host_visible)?;
             let texture = exported.as_wgpu_texture(&ctx.device)?;
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             buffers.push(ExportBuffer {
                 exported,
                 texture,
+                view,
                 filled_at_gen: None,
                 in_flight: false,
             });
@@ -192,7 +209,9 @@ impl ExportRing {
         &self.buffers[buffer_id as usize].exported
     }
 
-    /// Fill a free buffer from `fb` and hand it out.
+    /// Fill a free buffer from `fb` and hand it out, in a submit of its own.
+    /// [`Renderer::flush_and_publish`](crate::renderer::Renderer::flush_and_publish)
+    /// is the form a frame uses.
     ///
     /// Returns `None` when every buffer is held by the host. The library
     /// keeps decoding into its private framebuffer; nothing stalls and
@@ -204,6 +223,16 @@ impl ExportRing {
         queue: &wgpu::Queue,
         fb: &Framebuffer,
     ) -> Option<PublishedFrame> {
+        let plan = self.plan_publish(fb)?;
+        crate::submit::submit_now(device, queue, "ghostframe-export-publish", |e| {
+            self.encode_blit(device, e, fb, &plan)
+        });
+        Some(self.finish_publish(device, plan))
+    }
+
+    /// First half of a publish: seal the generation and choose the buffer and
+    /// the rectangles to copy. `None` when every buffer is held by the host.
+    pub(crate) fn plan_publish(&mut self, fb: &Framebuffer) -> Option<PublishPlan> {
         // Seal the current generation *before* checking for a free buffer.
         // `DirtyHistory` owns sealed generations independently of any
         // buffer's state, so sealing here never loses damage even if we
@@ -257,13 +286,40 @@ impl ExportRing {
             })
         });
 
-        fb.blit_rects(
-            device,
-            queue,
-            &self.buffers[buffer_id as usize].texture,
-            &pixel_rects,
-        );
+        Some(PublishPlan {
+            buffer_id,
+            gen,
+            pixel_rects,
+            since_previous,
+        })
+    }
 
+    /// Second half, recorded into `encoder`: copy the planned rectangles into
+    /// the planned buffer. Returns whether anything was recorded.
+    pub(crate) fn encode_blit(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        fb: &Framebuffer,
+        plan: &PublishPlan,
+    ) -> bool {
+        let buf = &self.buffers[plan.buffer_id as usize];
+        fb.encode_blit_rects(device, encoder, &buf.texture, &buf.view, &plan.pixel_rects)
+    }
+
+    /// Third half, once the copy has been submitted: wait for it and commit
+    /// the plan to the ring's bookkeeping.
+    pub(crate) fn finish_publish(
+        &mut self,
+        device: &wgpu::Device,
+        plan: PublishPlan,
+    ) -> PublishedFrame {
+        let PublishPlan {
+            buffer_id,
+            gen,
+            pixel_rects,
+            since_previous,
+        } = plan;
         let buf = &mut self.buffers[buffer_id as usize];
         buf.filled_at_gen = Some(gen);
         buf.in_flight = true;
@@ -298,7 +354,7 @@ impl ExportRing {
         self.last_publish = Some((frame_id, gen));
 
         let exported = &self.buffers[buffer_id as usize].exported;
-        Some(PublishedFrame {
+        PublishedFrame {
             frame_id,
             buffer_id,
             damage: pixel_rects,
@@ -308,7 +364,7 @@ impl ExportRing {
             modifier: exported.modifier,
             fd: exported.raw_fd(),
             planes: exported.planes.clone(),
-        })
+        }
     }
 
     /// Release the buffer held by `frame_id` back to the free pool. An
@@ -368,9 +424,11 @@ impl ExportRing {
                 self.host_visible,
             )?;
             let texture = exported.as_wgpu_texture(&ctx.device)?;
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             new_buffers.push(ExportBuffer {
                 exported,
                 texture,
+                view,
                 filled_at_gen: None,
                 in_flight: false,
             });
