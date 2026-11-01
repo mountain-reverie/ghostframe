@@ -58,17 +58,33 @@ func init() {
 		log.Printf("ghostbridge: init: production path (public Tailscale) — leaving TS_DEBUG_USE_DERP_HTTP unset for HTTPS DERP")
 	}
 
-	// Disable netns socket marking (SO_MARK / SO_BINDTODEVICE).
+	// netns socket protection (SO_MARK, or SO_BINDTODEVICE on the
+	// default-route interface when marking needs a privilege we lack) keeps
+	// this node's own sockets -- WireGuard, DERP, control -- out of the
+	// host's tailnet routing.
 	//
-	// In a normal tailscaled installation, netns marks outbound sockets so
-	// that DERP and control-plane traffic bypasses the TUN and goes out the
-	// real network interface. In a userspace-only tsnet node (our case),
-	// there is no TUN, so the routing-loop protection is unnecessary — and
-	// it actively breaks things when DERP is behind Docker port-mapping
-	// (the bind-to-device selects the wrong interface). tsnet's own test
-	// suite disables netns for exactly this reason.
-	netns.SetEnabled(false)
-	log.Printf("ghostbridge: init: netns socket marking disabled")
+	// "A userspace tsnet node has no TUN, so this is unnecessary" is true of
+	// this process and false of the machine. A host that also runs tailscaled
+	// with --accept-routes (or an exit node) has policy routing (table 52)
+	// that sends every unmarked packet for a routed prefix into its
+	// tailscale0. With protection off, this node's "direct" WireGuard
+	// packets to a peer on the LAN went into the host's tunnel via a subnet
+	// router advertising that LAN: small TCP packets squeezed through, QUIC's
+	// 1200-byte datagrams did not fit tailscale0's 1280-byte MTU, and the
+	// native client sat on a black window. Unprivileged, SO_MARK fails and
+	// netns falls back to SO_BINDTODEVICE, which Linux allows without
+	// privilege since 5.7 (and whose failure netns ignores for non-root, so
+	// an older kernel is no worse off than with protection disabled).
+	//
+	// Off on the headscale path only: there, DERP sits behind Docker port
+	// mapping and binding to the default-route interface selects the wrong
+	// one. tsnet's own test suite disables netns for the same reason.
+	if os.Getenv("TS_CONTROL_URL") != "" {
+		netns.SetEnabled(false)
+		log.Printf("ghostbridge: init: netns socket protection disabled (headscale path)")
+	} else {
+		log.Printf("ghostbridge: init: netns socket protection enabled (production path)")
+	}
 }
 
 var (
