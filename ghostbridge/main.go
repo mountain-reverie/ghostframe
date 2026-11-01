@@ -18,7 +18,6 @@ import (
 	"net/netip"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -779,18 +778,16 @@ type readFromWriter interface {
 }
 
 // spawnPacketBridge runs two goroutines that copy framed packets between a
-// PacketConn (tsnet side) and a blocking socketpair fd (Rust side).
-//
-// Frame layout: [total_len(4)][payload_len(4)][payload][port(2)][host\0]
-// total_len is the full frame size including the first 4 bytes.
+// PacketConn (tsnet side) and a blocking socketpair fd (Rust side). The frame
+// layout and the allocation-free framing are in packetframe.go.
 func spawnPacketBridge(conn readFromWriter, goFd int) {
 	// tsnet -> socketpair
 	go func() {
 		defer syscall.Close(goFd)
-		buf := make([]byte, 65535)
+		out := newOutFramer()
 		pktCount := 0
 		for {
-			n, srcAddr, err := conn.ReadFrom(buf)
+			n, srcAddr, err := conn.ReadFrom(out.payloadBuf())
 			if err != nil {
 				log.Printf("ghostbridge: tsnet->rust ReadFrom error after %d pkts: %v", pktCount, err)
 				return
@@ -799,12 +796,10 @@ func spawnPacketBridge(conn readFromWriter, goFd int) {
 			if pktCount <= 5 {
 				log.Printf("ghostbridge: tsnet->rust pkt #%d %d bytes from %s", pktCount, n, srcAddr)
 			}
-			host, port, err := net.SplitHostPort(srcAddr.String())
-			if err != nil {
+			frame, ok := out.frame(n, srcAddr)
+			if !ok {
 				continue
 			}
-			portNum, _ := strconv.Atoi(port)
-			frame := encodeFrame(buf[:n], host, uint16(portNum))
 			if _, err := writeAll(goFd, frame); err != nil {
 				return
 			}
@@ -815,6 +810,7 @@ func spawnPacketBridge(conn readFromWriter, goFd int) {
 	go func() {
 		defer conn.Close()
 		header := make([]byte, 8)
+		var in inFramer
 		pktCount := 0
 		for {
 			if _, err := readFull(goFd, header); err != nil {
@@ -832,38 +828,17 @@ func spawnPacketBridge(conn readFromWriter, goFd int) {
 			if uint64(totalLen) < uint64(payloadLen)+11 {
 				return // malformed
 			}
-			rest := make([]byte, totalLen-8)
-			if _, err := readFull(goFd, rest); err != nil {
+			body := in.bodyBuf(totalLen)
+			if _, err := readFull(goFd, body); err != nil {
 				return
 			}
-			payload := rest[:payloadLen]
-			port := binary.BigEndian.Uint16(rest[payloadLen : payloadLen+2])
-			hostBytes := rest[payloadLen+2:]
-			// Trim trailing null terminator.
-			if i := indexByte(hostBytes, 0); i >= 0 {
-				hostBytes = hostBytes[:i]
-			}
-			dst, err := net.ResolveUDPAddr("udp", net.JoinHostPort(string(hostBytes), strconv.Itoa(int(port))))
-			if err != nil {
+			payload, dst, ok := in.parse(body, payloadLen)
+			if !ok {
 				continue
 			}
 			conn.WriteTo(payload, dst)
 		}
 	}()
-}
-
-func encodeFrame(payload []byte, host string, port uint16) []byte {
-	hostBytes := []byte(host)
-	totalLen := 4 + 4 + len(payload) + 2 + len(hostBytes) + 1
-	frame := make([]byte, totalLen)
-	binary.BigEndian.PutUint32(frame[0:4], uint32(totalLen))
-	binary.BigEndian.PutUint32(frame[4:8], uint32(len(payload)))
-	copy(frame[8:], payload)
-	off := 8 + len(payload)
-	binary.BigEndian.PutUint16(frame[off:off+2], port)
-	copy(frame[off+2:], hostBytes)
-	frame[totalLen-1] = 0
-	return frame
 }
 
 // readFull reads exactly len(p) bytes from fd, retrying on short reads.
@@ -893,15 +868,6 @@ func writeAll(fd int, p []byte) (int, error) {
 		total += n
 	}
 	return total, nil
-}
-
-func indexByte(b []byte, c byte) int {
-	for i, x := range b {
-		if x == c {
-			return i
-		}
-	}
-	return -1
 }
 
 func main() {} // Required for c-archive build mode
