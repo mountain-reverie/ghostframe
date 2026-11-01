@@ -26,6 +26,10 @@ struct TileEntry {
     /// `None` until pass 0 arrives. See `integrate`'s doc comment for how
     /// this interacts with the "contiguous prefix" reconstruction rule.
     present_passes: Option<u16>,
+    /// Length of the pass prefix last returned as a picture for this
+    /// generation, `None` until one is. Lets `integrate` skip arrivals that
+    /// cannot change what is on screen.
+    drawn_prefix: Option<usize>,
 }
 
 /// Per-(tile_x, tile_y) CDF53 progressive-pass accumulator.
@@ -60,10 +64,29 @@ impl Cdf53TileState {
     /// what "never sent" should decode as, so treating it as immediately
     /// resolved is lossless. A gap at pass K that IS marked present in the
     /// bitmap (or the bitmap isn't known yet) means passes > K are held but
-    /// unused until the gap fills. Returns the freshly reconstructed
-    /// 4096-byte RGBA tile (BGR from `inverse()` converted to RGB, plus
-    /// alpha 255).
-    pub fn integrate(&mut self, tile_x: u8, tile_y: u8, entry: &PrevalidatedCdf53) -> Vec<u8> {
+    /// unused until the gap fills.
+    ///
+    /// Returns the reconstructed 4096-byte RGBA tile (BGR from `inverse()`
+    /// converted to RGB, plus alpha 255) only when there is something new to
+    /// draw, `None` otherwise:
+    ///
+    /// - The prefix must carry picture information: a non-zero coefficient,
+    ///   or every pass resolved. Pass 0 holds only signs, and `inverse` has
+    ///   no level shift, so a prefix with no magnitude bits reconstructs as
+    ///   black. Returning that painted every new version of a tile black
+    ///   before its content arrived -- a visible flash on each update. With
+    ///   `None` the tile keeps its previous content until the new one has
+    ///   substance. A tile that really is black is complete at pass 0 when
+    ///   sparse-encoded, so it is still drawn.
+    /// - The prefix must have grown since the last picture of this
+    ///   generation. A duplicate, or a pass held behind a gap, leaves the
+    ///   picture unchanged; uploading it again only costs a tile upload.
+    pub fn integrate(
+        &mut self,
+        tile_x: u8,
+        tile_y: u8,
+        entry: &PrevalidatedCdf53,
+    ) -> Option<Vec<u8>> {
         let tile = self.tiles.entry((tile_x, tile_y)).or_default();
 
         if !tile.generation_set || tile.generation != entry.generation {
@@ -71,6 +94,7 @@ impl Cdf53TileState {
             tile.generation_set = true;
             tile.planes = Default::default();
             tile.present_passes = None;
+            tile.drawn_prefix = None;
         }
 
         let idx = entry.pass_idx as usize;
@@ -99,11 +123,19 @@ impl Cdf53TileState {
             prefix_len += 1;
         }
 
+        if tile.drawn_prefix == Some(prefix_len) {
+            return None;
+        }
+
         let plane_refs: Vec<&[u8]> = tile.planes[..prefix_len]
             .iter()
             .map(|p| p.as_deref().expect("contiguous prefix"))
             .collect();
         let coefficients = decode_planes(&plane_refs);
+        if prefix_len < CDF53_PASS_COUNT && coefficients.iter().all(|&c| c == 0) {
+            return None;
+        }
+        tile.drawn_prefix = Some(prefix_len);
         let bgr = inverse(&coefficients);
 
         let mut rgba = vec![0u8; 1024 * 4];
@@ -113,7 +145,7 @@ impl Cdf53TileState {
             rgba[px * 4 + 2] = bgr[px * 3]; // B
             rgba[px * 4 + 3] = 255; // A
         }
-        rgba
+        Some(rgba)
     }
 
     /// Forget one tile's planes, for a new generation that reuses the

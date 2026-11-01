@@ -129,16 +129,16 @@ fn arrivals(payloads: &[(u8, Vec<u8>)]) -> Vec<(u8, Vec<u8>)> {
 }
 
 /// What the Rust client renders: `integrate` every pass, take the last
-/// result. Pass 0 first, so its bitmap is known before the rest land --
-/// the ordering production uses.
+/// picture it drew. Pass 0 first, so its bitmap is known before the rest
+/// land -- the ordering production uses.
 fn rust_client_rgba(payloads: &[(u8, Vec<u8>)]) -> Vec<u8> {
     let mut st = Cdf53TileState::new();
-    let mut last = Vec::new();
+    let mut last = None;
     for (idx, payload) in payloads {
         let pre = prevalidate_cdf53(payload, 1, *idx).expect("pass prevalidates");
-        last = st.integrate(0, 0, &pre);
+        last = st.integrate(0, 0, &pre).or(last);
     }
-    last
+    last.expect("a complete pass set always draws")
 }
 
 fn bgr_to_rgba(bgr: &[u8]) -> Vec<u8> {

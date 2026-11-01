@@ -626,21 +626,19 @@ fn cdf53_in_payload_mode_keeps_the_ack_and_skips_integrate() {
     );
 }
 
-/// The Decoded path is unchanged: pixels out, and the ACK still fires.
+/// In Decoded mode a pass is acknowledged whether or not it changes the
+/// picture. Pass 0 carries only signs, so on its own it draws nothing --
+/// drawing it painted the tile black -- but it must still be ACKed.
 #[test]
-fn cdf53_in_decoded_mode_is_unchanged() {
+fn cdf53_in_decoded_mode_acks_a_pass_with_nothing_to_draw_yet() {
     let pass0 = cdf53_pass0_payload();
     let (events, outputs) =
         drive_one_tile_with_outputs(TileDelivery::Decoded, Codec::Cdf53, &pass0);
 
-    let ready: Vec<_> = events
-        .iter()
-        .filter_map(|e| match e {
-            Event::TileReady { rgba, .. } => Some(rgba.len()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(ready, vec![4096], "got {events:?}");
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::TileReady { .. })),
+        "pass 0 alone has no picture to draw, got {events:?}"
+    );
     assert!(
         !outputs.is_empty(),
         "the deferred ACK must fire in Decoded mode too"

@@ -220,21 +220,26 @@ impl FrameBuffer {
             Codec::Skip | Codec::H264 => unreachable!("handled above"),
         };
 
+        // `None` from the CDF53 integrator means nothing new to draw yet, as
+        // in the client: the tile keeps what it showed, or the framebuffer's
+        // initial opaque black if it never showed anything.
         let rgba = match decoded {
-            Decoded::Rgba(v) => v,
+            Decoded::Rgba(v) => Some(v),
             Decoded::Cdf53Pass(p) => self.cdf53_state.integrate(tile_x, tile_y, &p),
         };
 
         self.tiles
             .entry((tile_x, tile_y))
             .and_modify(|e| {
-                e.rgba = rgba.clone();
+                if let Some(v) = &rgba {
+                    e.rgba = v.clone();
+                }
                 if e.tracker.is_none() {
                     e.tracker = Some(GenerationTracker::new(generation));
                 }
             })
             .or_insert_with(|| TileEntry {
-                rgba,
+                rgba: rgba.unwrap_or_else(|| [0, 0, 0, 255].repeat(1024)),
                 tracker: Some(GenerationTracker::new(generation)),
                 highest_frame_seq: None,
             });
