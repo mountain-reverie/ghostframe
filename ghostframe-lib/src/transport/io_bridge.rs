@@ -101,7 +101,7 @@ mod emit;
 #[path = "io_bridge/h264_tx.rs"]
 mod h264_tx;
 use h264_tx::{H264Gate, H264Tx};
-pub use h264_tx::{H264Stats, IdrCause};
+pub use h264_tx::{H264Report, H264Stats, IdrCause};
 
 #[path = "io_bridge/frame_backend.rs"]
 mod frame_backend;
@@ -396,6 +396,32 @@ pub struct InjectedFrame {
     /// see, so without this the browserless scenes could not model it at all.
     /// `None` (every existing scene) costs nothing.
     pub cost: Option<std::time::Duration>,
+    /// Harness only: make this a scripted H.264 frame rather than tile work
+    /// (see [`InjectedH264`]). `None` for every tile scene.
+    pub h264: Option<InjectedH264>,
+}
+
+/// A scripted H.264 frame: the browserless harness's stand-in for the encoder.
+///
+/// The frame goes through the bridge's real H.264 policy (`h264_frame_gate`:
+/// IDR hold, backpressure skip, pending IDR requests) and its real send path
+/// (`send_h264_frame`: fragments, ledger, admission, probe cache, parity), but
+/// nothing is encoded: the payload is `idr_bytes` or `p_bytes` of
+/// deterministic filler and the "encoder" makes an IDR exactly when the bridge
+/// asked for one (or on the optional scripted GOP). The client reassembles
+/// and reports `NeedsH264`; it decodes nothing. What this cannot show is
+/// anything about picture content: that needs the Phase B PCM writer.
+#[derive(Debug, Clone, Copy)]
+pub struct InjectedH264 {
+    /// Payload bytes of an IDR and of a P frame.
+    pub idr_bytes: usize,
+    pub p_bytes: usize,
+    /// Every this many frames sent the scripted encoder makes an IDR on its
+    /// own (the ffmpeg encoder's GOP); 0 for none.
+    pub gop_frames: u32,
+    /// Frame size, for the dimensions datagram and resolution attribution.
+    pub width: u32,
+    pub height: u32,
 }
 
 /// An arm of the `select!` in `IoBridge::run`. See `IoBridge::loop_arm_trace`.
@@ -536,6 +562,15 @@ pub struct IoBridge {
     /// Cfg-gated inbound-datagram loss injector for e2e tests.
     #[cfg(any(test, feature = "test-loss-injection"))]
     pub(crate) inbound_loss: Option<crate::transport::loss_injection::LossInjector>,
+    /// Harness: acknowledgement datagrams (0x06) arriving between these two
+    /// instants are dropped before they are read, as if the client-to-server
+    /// path lost every one: the acknowledgement stall the probe timeout has to
+    /// survive. Other datagrams (frame acks, pings) and streams are untouched.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub(crate) ack_blackout: Option<(std::time::Instant, std::time::Instant)>,
+    /// Acknowledgement datagrams the blackout dropped.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    acks_blacked_out: u64,
     /// Test knob: drop every client tile NACK at the door, so the loss detector
     /// and the probe are measured without the client's own repair requests.
     #[cfg(any(test, feature = "test-loss-injection"))]
@@ -746,7 +781,7 @@ pub struct IoBridge {
     /// Shared cell the browserless harness reads the final H.264 counters
     /// from; same read-after-abort pattern as `emitter_stats_publish`.
     #[cfg(any(test, feature = "browserless-harness"))]
-    h264_stats_publish: std::sync::Arc<std::sync::Mutex<H264Stats>>,
+    h264_stats_publish: std::sync::Arc<std::sync::Mutex<H264Report>>,
     /// When the last client-requested IDR (reset request 0x09) was honoured;
     /// requests inside `RESET_REQUEST_MIN_INTERVAL` of it are dropped.
     last_reset_request_idr_at: Option<std::time::Instant>,
@@ -1345,6 +1380,10 @@ impl IoBridge {
             #[cfg(any(test, feature = "test-loss-injection"))]
             inbound_loss: lib_config.transport.inbound_loss,
             #[cfg(any(test, feature = "test-loss-injection"))]
+            ack_blackout: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            acks_blacked_out: 0,
+            #[cfg(any(test, feature = "test-loss-injection"))]
             ignore_tile_nacks: false,
             #[cfg(any(test, feature = "test-loss-injection"))]
             outbound_bandwidth_cap: lib_config
@@ -1402,7 +1441,7 @@ impl IoBridge {
             last_h264_frame_seq: None,
             h264: H264Tx::default(),
             #[cfg(any(test, feature = "browserless-harness"))]
-            h264_stats_publish: std::sync::Arc::new(std::sync::Mutex::new(H264Stats::default())),
+            h264_stats_publish: std::sync::Arc::new(std::sync::Mutex::new(H264Report::default())),
             last_reset_request_idr_at: None,
             reset_requests_received: 0,
             reset_requests_honoured: 0,
@@ -2569,7 +2608,15 @@ impl IoBridge {
             let mut published = self.reliable_emitter.stats;
             published.cache_entries = self.reliable_emitter.pending_cache_entries();
             *self.emitter_stats_publish.lock().unwrap() = published;
-            *self.h264_stats_publish.lock().unwrap() = self.h264.stats;
+            *self.h264_stats_publish.lock().unwrap() = H264Report {
+                stats: self.h264.stats,
+                ledger_records: self.transmission_ledger.len(),
+                probe_cache_fragments: self.reliable_emitter.h264.len(),
+                #[cfg(any(test, feature = "test-loss-injection"))]
+                acks_blacked_out: self.acks_blacked_out,
+                #[cfg(not(any(test, feature = "test-loss-injection")))]
+                acks_blacked_out: 0,
+            };
             *self.send_errs_publish.lock().unwrap() = self.datagram_send_errs;
             *self.latency_stats_publish.lock().unwrap() =
                 (self.critical_latency_stats, self.refinement_latency_stats);

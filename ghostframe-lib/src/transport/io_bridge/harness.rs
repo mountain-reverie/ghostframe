@@ -314,6 +314,13 @@ impl IoBridge {
         self.transport_probe_publish.clone()
     }
 
+    /// Drop every acknowledgement datagram that arrives in `[from, until)`
+    /// (see `ack_blackout`).
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub fn set_ack_blackout(&mut self, from: std::time::Instant, until: std::time::Instant) {
+        self.ack_blackout = Some((from, until));
+    }
+
     /// Drop every client tile NACK at the door (see `ignore_tile_nacks`).
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn set_ignore_tile_nacks(&mut self, ignore: bool) {
@@ -348,7 +355,7 @@ impl IoBridge {
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn h264_stats_publish_handle(
         &self,
-    ) -> std::sync::Arc<std::sync::Mutex<crate::transport::io_bridge::H264Stats>> {
+    ) -> std::sync::Arc<std::sync::Mutex<crate::transport::io_bridge::H264Report>> {
         self.h264_stats_publish.clone()
     }
 

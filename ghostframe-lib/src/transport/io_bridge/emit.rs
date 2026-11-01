@@ -907,6 +907,10 @@ impl IoBridge {
     /// grid. Callers that need to know work was dropped (as opposed to
     /// merely queued) must use this return value, not `inj.work.len()`.
     pub(super) fn apply_injected_frame(&mut self, inj: InjectedFrame) -> usize {
+        if let Some(h) = inj.h264 {
+            self.apply_injected_h264(inj.seq, inj.timestamp_us, h);
+            return 0;
+        }
         // The scheduler grid is normally sized by the real capture path
         // (`dispatch_dirty_tiles_via_scheduler`, keyed off the frame's
         // actual dimensions via `TileGrid`). Injected work bypasses that

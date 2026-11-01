@@ -34,7 +34,7 @@
 //! `pub` specifically so nothing consulting them can drift from what
 //! actually goes on the wire.
 
-use crate::transport::protocol::{is_tile_datagram, DATAGRAM_HEADER_SIZE};
+use crate::transport::protocol::{is_tile_datagram, DATAGRAM_HEADER_SIZE, FRAME_HEADER_SIZE};
 
 /// Tile coordinates are the first two bytes of `TileHeader`, which follows
 /// the fixed-size `DatagramHeader`.
@@ -61,7 +61,34 @@ pub struct DropRule {
     pub occurrences: Vec<u32>,
 }
 
-/// A set of deterministic drop rules, at most one per tile.
+/// Which fragments of an H.264 frame a [`FrameDropRule`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FragSel {
+    /// Every source fragment of the frame.
+    All,
+    /// Fragment `n`.
+    Index(u16),
+    /// The frame's last source fragment.
+    Last,
+}
+
+/// Drop the given transmissions of an H.264 frame's source fragments.
+///
+/// `occurrences` count the datagrams matching `frame_seq` and `frag` in the
+/// order they reach the plan, zero-based. With `FragSel::Index(k)` that is
+/// the k-th fragment's first transmission, its resend, and so on; with
+/// `FragSel::All` it runs over the fragments in turn, so `vec![0, 1, 2]` drops
+/// the frame's first three fragments. XOR parity (`frag_idx >= frag_total`)
+/// never matches: the rule is for the datagrams the ledger tracks.
+#[derive(Debug, Clone)]
+pub struct FrameDropRule {
+    pub frame_seq: u32,
+    pub frag: FragSel,
+    pub occurrences: Vec<u32>,
+}
+
+/// A set of deterministic drop rules, at most one per tile, plus any number
+/// for H.264 frame fragments.
 ///
 /// Deliberately not `Clone`: the occurrence counters are live state, and a
 /// copy would silently fork the drop schedule.
@@ -72,6 +99,9 @@ pub struct DropPlan {
     seen: Vec<u32>,
     /// Datagrams actually dropped so far, per rule, parallel to `rules`.
     dropped: Vec<u32>,
+    frame_rules: Vec<FrameDropRule>,
+    frame_seen: Vec<u32>,
+    frame_dropped: Vec<u32>,
 }
 
 impl DropPlan {
@@ -106,7 +136,67 @@ impl DropPlan {
             rules,
             seen: vec![0; n],
             dropped: vec![0; n],
+            ..Self::default()
         }
+    }
+
+    /// Add rules for H.264 frame fragments. A rule naming no occurrences would
+    /// match everything and drop nothing, which would make the scene it was
+    /// written for pass vacuously.
+    pub fn with_frame_rules(mut self, rules: Vec<FrameDropRule>) -> Self {
+        for r in &rules {
+            debug_assert!(
+                !r.occurrences.is_empty(),
+                "FrameDropRule for frame {} names no occurrences: it would drop nothing",
+                r.frame_seq
+            );
+        }
+        let n = rules.len();
+        self.frame_rules = rules;
+        self.frame_seen = vec![0; n];
+        self.frame_dropped = vec![0; n];
+        self
+    }
+
+    /// Datagrams actually dropped by each frame rule, parallel to the rules
+    /// given to [`Self::with_frame_rules`]. Assert a rule's entry is non-zero
+    /// before asserting its effect, as for [`Self::drops`].
+    pub fn frame_drops(&self) -> &[u32] {
+        &self.frame_dropped
+    }
+
+    /// The frame-fragment half of [`Self::should_drop`].
+    fn should_drop_frame(&mut self, payload: &[u8]) -> bool {
+        if self.frame_rules.is_empty()
+            || payload.len() < FRAME_HEADER_SIZE
+            || payload[0] & 0x80 != 0
+        {
+            return false;
+        }
+        let frame_seq = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+        let frag_idx = u16::from_be_bytes(payload[4..6].try_into().unwrap());
+        let frag_total = u16::from_be_bytes(payload[6..8].try_into().unwrap());
+        if frag_idx >= frag_total {
+            return false; // parity
+        }
+        for (i, rule) in self.frame_rules.iter().enumerate() {
+            let hit = rule.frame_seq == frame_seq
+                && match rule.frag {
+                    FragSel::All => true,
+                    FragSel::Index(k) => k == frag_idx,
+                    FragSel::Last => frag_idx + 1 == frag_total,
+                };
+            if hit {
+                let n = self.frame_seen[i];
+                self.frame_seen[i] = n.saturating_add(1);
+                let drop = rule.occurrences.contains(&n);
+                if drop {
+                    self.frame_dropped[i] = self.frame_dropped[i].saturating_add(1);
+                }
+                return drop;
+            }
+        }
+        false
     }
 
     /// Datagrams actually dropped so far, per rule, parallel to the rules
@@ -123,6 +213,9 @@ impl DropPlan {
     /// True if this datagram should be dropped. Advances the per-rule
     /// occurrence counter for whichever rule matched.
     pub fn should_drop(&mut self, payload: &[u8]) -> bool {
+        if self.should_drop_frame(payload) {
+            return true;
+        }
         if self.rules.is_empty() {
             return false;
         }
@@ -262,6 +355,67 @@ mod tests {
         let fates: Vec<bool> = (0..5).map(|_| plan.should_drop(&dg)).collect();
         assert_eq!(fates, vec![false, true, false, true, false]);
         assert_eq!(plan.drops(), &[2]);
+    }
+
+    fn frame_datagram(frame_seq: u32, frag_idx: u16, frag_total: u16) -> Vec<u8> {
+        let mut v = vec![0u8; FRAME_HEADER_SIZE + 4];
+        v[0..4].copy_from_slice(&frame_seq.to_be_bytes());
+        v[4..6].copy_from_slice(&frag_idx.to_be_bytes());
+        v[6..8].copy_from_slice(&frag_total.to_be_bytes());
+        v
+    }
+
+    #[test]
+    fn a_frame_rule_names_fragments_and_occurrences() {
+        let mut plan = DropPlan::default().with_frame_rules(vec![
+            FrameDropRule {
+                frame_seq: 7,
+                frag: FragSel::Index(1),
+                occurrences: vec![0],
+            },
+            FrameDropRule {
+                frame_seq: 8,
+                frag: FragSel::All,
+                occurrences: vec![0, 2],
+            },
+            FrameDropRule {
+                frame_seq: 9,
+                frag: FragSel::Last,
+                occurrences: vec![0],
+            },
+        ]);
+        // Frame 7: only fragment 1, only its first transmission.
+        assert!(!plan.should_drop(&frame_datagram(7, 0, 3)));
+        assert!(plan.should_drop(&frame_datagram(7, 1, 3)));
+        assert!(
+            !plan.should_drop(&frame_datagram(7, 1, 3)),
+            "the resend passes"
+        );
+        assert!(!plan.should_drop(&frame_datagram(7, 2, 3)));
+        // Frame 8: the 1st and 3rd datagram of the frame, whichever fragments.
+        assert!(plan.should_drop(&frame_datagram(8, 0, 4)));
+        assert!(!plan.should_drop(&frame_datagram(8, 1, 4)));
+        assert!(plan.should_drop(&frame_datagram(8, 2, 4)));
+        assert!(!plan.should_drop(&frame_datagram(8, 3, 4)));
+        // Frame 9: the last fragment.
+        assert!(!plan.should_drop(&frame_datagram(9, 0, 3)));
+        assert!(plan.should_drop(&frame_datagram(9, 2, 3)));
+        // Parity is no source fragment, and an unnamed frame is untouched.
+        assert!(!plan.should_drop(&frame_datagram(9, 3, 3)));
+        assert!(!plan.should_drop(&frame_datagram(10, 0, 3)));
+        assert_eq!(plan.frame_drops(), &[1, 2, 1]);
+    }
+
+    #[test]
+    fn a_frame_rule_never_matches_a_tile_or_a_short_datagram() {
+        let mut plan = DropPlan::default().with_frame_rules(vec![FrameDropRule {
+            frame_seq: 0,
+            frag: FragSel::All,
+            occurrences: vec![0],
+        }]);
+        assert!(!plan.should_drop(&tile_datagram(0, 0)));
+        assert!(!plan.should_drop(&[0u8; FRAME_HEADER_SIZE - 1]));
+        assert_eq!(plan.frame_drops(), &[0]);
     }
 
     #[test]

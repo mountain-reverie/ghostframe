@@ -168,6 +168,18 @@ pub struct H264Stats {
     pub queue_purged: u64,
 }
 
+/// What the harness reads back after a scene: the counters plus two gauges.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct H264Report {
+    pub stats: H264Stats,
+    /// Ledger records outstanding at the end (all H.264 in an H.264-only scene).
+    pub ledger_records: usize,
+    /// Fragments still held in the probe cache.
+    pub probe_cache_fragments: usize,
+    /// Acknowledgement datagrams the harness's blackout dropped (0 in production).
+    pub acks_blacked_out: u64,
+}
+
 /// One frame the tracker follows.
 struct TrackedFrame {
     frame_seq: u32,
@@ -621,6 +633,62 @@ impl IoBridge {
                 self.note_h264_verdict(frame_seq, frag_idx, now);
             }
         }
+    }
+
+    /// The browserless harness's scripted H.264 frame (see [`InjectedH264`]):
+    /// the production gate and send path with a scripted encoder in place of
+    /// the GPU and ffmpeg. Nothing is sent without a live session, as the tile
+    /// injection path.
+    pub(super) fn apply_injected_h264(&mut self, seq: u32, timestamp_us: u32, h: InjectedH264) {
+        let Some(max_dg_size) = self.compute_max_datagram_size() else {
+            return;
+        };
+        let now = now_std();
+        self.emit_frame_dimensions(seq, timestamp_us, h.width, h.height);
+        if self.h264_frame_gate(now) != H264Gate::Encode {
+            // Skipped: the admission pass still runs, as it does for a frame
+            // the production gate drops (the loop turns on regardless).
+            self.pump_admission();
+            return;
+        }
+        let periodic = h.gop_frames > 0
+            && self
+                .h264
+                .stats
+                .frames_sent
+                .is_multiple_of(u64::from(h.gop_frames));
+        // The scripted encoder makes an IDR exactly when the bridge asked for
+        // one, on its GOP, and for the first frame of a stream.
+        let is_idr =
+            self.h264.pending_idr.is_some() || periodic || self.h264.stats.frames_sent == 0;
+        let len = if is_idr { h.idr_bytes } else { h.p_bytes };
+        // Deterministic, incompressible-looking filler; the content is not read.
+        let mut x = seq.wrapping_mul(0x9E37_79B1) | 1;
+        let payload: Vec<u8> = (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        let meta = frame::FrameMeta {
+            width: h.width,
+            height: h.height,
+            stride: h.width * 4,
+            timestamp_us,
+            capture_done_ns: 0,
+            unchanged: false,
+        };
+        self.send_h264_frame(
+            H264Out {
+                payload,
+                is_keyframe: is_idr,
+            },
+            &meta,
+            seq,
+            max_dg_size,
+        );
     }
 
     /// Forget the H.264 state of the session that ended: tracker, hold,

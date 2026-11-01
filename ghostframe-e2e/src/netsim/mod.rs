@@ -35,7 +35,7 @@ pub use burst::{
 /// see that module's doc comment for why. Re-exported here so existing
 /// `ghostframe_e2e::netsim::{DropPlan, DropRule}` callers (scenes and tests)
 /// don't need to know it moved.
-pub use ghostframe_lib::transport::drop_plan::{DropPlan, DropRule};
+pub use ghostframe_lib::transport::drop_plan::{DropPlan, DropRule, FragSel, FrameDropRule};
 pub use profile::{Bottleneck, CapTimeline, CoDel, NetProfile};
 pub use pump::SocketPairPump;
 pub use rng::DetRng;
