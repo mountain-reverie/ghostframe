@@ -393,9 +393,10 @@ enum LogLine {
     /// `decode_h264`'s lazy open) actually triggered it; both share the
     /// same log text, since both call the same `H264Decoder::new()`.
     NewStall(u64),
-    /// `decode_h264` detected a sequence gap on this `frame_seq` and
-    /// therefore called `decoder.reset()` (see that field's doc on
-    /// `Renderer::h264_needs_reset`) immediately before decoding it.
+    /// `decode_h264` found a reference picture missing (a `frame_num` gap)
+    /// on this `frame_seq`, so the decoder resets at the next keyframe (see
+    /// `Renderer::h264_needs_reset`). A jump in `frame_seq` alone no longer
+    /// counts: a re-entry whose clip starts on an IDR is continuous.
     GapDetected(u32),
     Decode {
         seq: u32,
@@ -433,7 +434,7 @@ fn parse_log(buf: &[u8]) -> Vec<LogLine> {
                     map_us,
                 });
             }
-        } else if line.contains("access unit gap detected") {
+        } else if line.contains("reference picture lost") {
             if let Some(seq) = field_u64(line, "frame_seq=") {
                 out.push(LogLine::GapDetected(seq as u32));
             }
