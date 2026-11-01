@@ -453,6 +453,25 @@ fn run_headless_loop(
     }
 }
 
+/// Log a forwarded input event, for measuring input-to-photon latency against
+/// the renderer's access-unit lines and the backend's `present complete`.
+/// Pointer motion is trace-level: it arrives at the pointer's sample rate.
+fn log_input_forwarded(input: InputToSend) -> InputToSend {
+    match &input {
+        InputToSend::Key { keysym, down } => {
+            tracing::debug!(keysym, down, "input forwarded: key")
+        }
+        InputToSend::PointerButton { button, down, .. } => {
+            tracing::debug!(button, down, "input forwarded: button")
+        }
+        InputToSend::Wheel { dx, dy } => tracing::debug!(dx, dy, "input forwarded: wheel"),
+        InputToSend::PointerMotion { x, y } => {
+            tracing::trace!(x, y, "input forwarded: motion")
+        }
+    }
+    input
+}
+
 /// Drive the render/event loop until the user quits, the window is closed,
 /// `should_quit` says to stop, or the connection drops. See the
 /// module-level pseudocode in the M2 plan for the shape this mirrors.
@@ -671,7 +690,7 @@ pub fn run_window_loop(
                 );
             }
             match route_window_event(&ev, chord, &placement) {
-                LoopAction::Forward(input) => match input {
+                LoopAction::Forward(input) => match log_input_forwarded(input) {
                     InputToSend::Key { keysym, down } => {
                         held.track(keysym, down);
                         client.push_key(keysym, down)
