@@ -146,6 +146,17 @@ pub struct AdaptationContext {
     /// would produce a frozen stream instead of degraded-but-viewable
     /// tile-codec output.
     pub supports_h264: bool,
+    /// The bandwidth *estimate* (goog_cc's `bitrate_bps`), bits per second;
+    /// `0` means "no estimate yet". Unlike `bytes_per_us` it is not
+    /// probe-inclusive and not a token rate: it is what the headroom guard
+    /// reads, so a probe window opening cannot hide a starved link.
+    pub bwe_estimate_bps: u64,
+    /// The bridge's H.264 transport has stalled (frames in flight beyond the
+    /// bound, no frame acknowledged for too long, or the client's reset
+    /// requests over their rate limit). The only H264 -> tile path from a
+    /// network stall: it beats every other override, and H.264 is not
+    /// re-entered until a holdoff (starting at [`H264_STALL_REENTRY_US`], doubling per repeated stall) after it clears.
+    pub h264_stalled: bool,
 }
 
 impl Default for AdaptationContext {
@@ -157,6 +168,8 @@ impl Default for AdaptationContext {
             suspended: false,
             last_update_seq: 0,
             supports_h264: true,
+            bwe_estimate_bps: 0,
+            h264_stalled: false,
         }
     }
 }
@@ -293,17 +306,65 @@ mod classify_tests;
 /// Retuned in M3.6c from the bandwidth × scene matrix.
 pub(crate) const REFINEMENT_BIAS_PER_TILE_US: f32 = 5.0;
 
-/// Minimum bandwidth (bytes per µs) below which the classifier
-/// hard-overrides to H264 regardless of the cost comparison. 0.25 B/µs
-/// ≈ 2 Mbps — below this, individual tile-codec emissions can't keep up
-/// with frame-rate. Retuned in M3.6c.
-pub(crate) const HEADROOM_MIN_BYTES_PER_US: f32 = 0.25;
+/// Headroom guard: the bandwidth *estimate* below which the classifier
+/// forces H264 regardless of the cost comparison, held for
+/// [`HEADROOM_ENTER_HOLD_US`] before it engages. Below ~2 Mbit/s the tile
+/// codec cannot keep up with the frame rate.
+pub(crate) const HEADROOM_ENTER_BPS: u64 = 2_000_000;
+/// The estimate above which an engaged headroom guard lets go, held for
+/// [`HEADROOM_EXIT_HOLD_US`]. Between the two the guard keeps its state, so
+/// an estimate wandering around 2 Mbit/s cannot flap the mode.
+pub(crate) const HEADROOM_EXIT_BPS: u64 = 3_000_000;
+pub(crate) const HEADROOM_ENTER_HOLD_US: u64 = 500_000;
+pub(crate) const HEADROOM_EXIT_HOLD_US: u64 = 1_000_000;
+/// Consecutive evaluations a guard condition must also hold for (the
+/// preemption-immune half of the hybrid dwell, as for the cost path).
+pub(crate) const HEADROOM_MIN_EVALUATIONS: u32 = 3;
+/// After `h264_stalled` clears, H264 may not be re-entered (by any path) for
+/// this long.
+pub(crate) const H264_STALL_REENTRY_US: u64 = 2_000_000;
+/// Each stall that follows a re-entry doubles the holdoff, up to this.
+pub(crate) const H264_STALL_REENTRY_MAX_US: u64 = 30_000_000;
+/// H.264 that runs this long without a stall resets the holdoff to
+/// [`H264_STALL_REENTRY_US`].
+pub(crate) const H264_STALL_HEALTHY_RESET_US: u64 = 10_000_000;
+/// An idle screen (no dirty tiles) this long releases an engaged headroom
+/// guard whose estimate is back above the enter threshold: tiny P frames
+/// cannot raise the estimate, so on a static screen it would never leave.
+pub(crate) const HEADROOM_IDLE_RELEASE_US: u64 = 2_000_000;
 
 /// Smoothed loss-rate threshold above which the classifier hard-overrides
-/// to H264. 10 % datagram loss makes per-tile reassembly + refinement
-/// unworkable; H264 full-frame's larger I-frame interval rides through
-/// better. Retuned in M3.6c.
+/// to H264, when the override is enabled (`GHOSTFRAME_LOSS_OVERRIDE`). It is
+/// off by default: with every H.264 fragment a ledger transmission and one
+/// lost fragment killing a frame, "H264 rides through loss better" no longer
+/// holds, and the threshold has not been re-measured.
 pub(crate) const LOSS_OVERRIDE_THRESHOLD: f32 = 0.10;
+
+/// The headroom guard's own state. Kept apart from [`ClassifierHysteresis`]
+/// because the guard's branches must not be reset by (or reset) the cost
+/// path's counters.
+#[derive(Debug, Clone, Copy, Default)]
+struct GuardState {
+    /// The guard is engaged (forcing H264).
+    headroom_active: bool,
+    /// When the estimate first went (and has stayed) below the enter
+    /// threshold / above the exit threshold, and for how many evaluations.
+    below_since_us: Option<u64>,
+    below_evals: u32,
+    above_since_us: Option<u64>,
+    above_evals: u32,
+    /// The last evaluation at which `h264_stalled` was set.
+    stalled_at_us: Option<u64>,
+    /// Stalls since H.264 last ran healthily for
+    /// [`H264_STALL_HEALTHY_RESET_US`]; the holdoff doubles with each.
+    stall_level: u32,
+    /// The holdoff of the stall in force, µs.
+    holdoff_us: u64,
+    /// When H.264 started running without a stall (None while not in H264).
+    healthy_since_us: Option<u64>,
+    /// When the dirty set last became (and stayed) empty.
+    idle_since_us: Option<u64>,
+}
 
 /// Hysteresis state for `Classifier::decide_frame_mode_at`.
 ///
@@ -352,6 +413,7 @@ pub struct Classifier {
     /// Minimum consecutive calls where exit condition holds. Default 30.
     pub exit_sustain_frames_min: u32,
     state: ClassifierHysteresis,
+    guard: GuardState,
     adaptation_context: AdaptationContext,
     refinement_deficit_tiles: u32,
     /// M3.7a env-var override: when `Some`, `decide_inner` uses this
@@ -362,7 +424,9 @@ pub struct Classifier {
     /// instead of `LOSS_OVERRIDE_THRESHOLD`. Populated from
     /// `ClassifierConfig` in `Classifier::new`.
     loss_override_threshold_override: Option<f32>,
-    /// M3.7b env-var override for HEADROOM_MIN_BYTES_PER_US. Populated
+    /// `GHOSTFRAME_LOSS_OVERRIDE`: whether `loss_override` is evaluated at all.
+    loss_override_enabled: bool,
+    /// M3.7b env-var override for the headroom guard's enter threshold. Populated
     /// from `ClassifierConfig` in `Classifier::new`.
     headroom_min_bpus_override: Option<f32>,
     /// Mode pin (`GHOSTFRAME_FORCE_FRAME_MODE`): when `Some`, `decide_inner` returns this mode every
@@ -414,10 +478,12 @@ impl Classifier {
             enter_sustain_frames_min: 3,
             exit_sustain_frames_min: 30,
             state: ClassifierHysteresis::default(),
+            guard: GuardState::default(),
             adaptation_context: AdaptationContext::default(),
             refinement_deficit_tiles: 0,
             refinement_bias_us_override: config.refinement_bias_us,
             loss_override_threshold_override: config.loss_override_threshold,
+            loss_override_enabled: config.loss_override_enabled,
             headroom_min_bpus_override: config.headroom_min_bpus,
             force_frame_mode_override: config.force_frame_mode,
             last_emitted_mode: None,
@@ -432,6 +498,7 @@ impl Classifier {
     /// streak counters don't influence the decision for the new client).
     pub fn reset(&mut self) {
         self.state = ClassifierHysteresis::default();
+        self.guard = GuardState::default();
     }
 
     /// Push a live `AdaptationContext` from the transport layer.
@@ -503,6 +570,8 @@ impl Classifier {
                 smoothed_rtt_us = ctx.smoothed_rtt_us,
                 loss_rate = ctx.loss_rate,
                 suspended = ctx.suspended,
+                h264_stalled = ctx.h264_stalled,
+                bwe_estimate_bps = ctx.bwe_estimate_bps,
                 refinement_deficit_tiles = self.refinement_deficit_tiles,
                 "mode decision"
             );
@@ -517,11 +586,102 @@ impl Classifier {
         self.last_emitted_mode
     }
 
+    /// The headroom guard with hysteresis, on the bandwidth estimate: engages
+    /// after the estimate has stayed below the enter threshold for
+    /// [`HEADROOM_ENTER_HOLD_US`], lets go after it has stayed above the exit
+    /// threshold for [`HEADROOM_EXIT_HOLD_US`], and keeps its state in
+    /// between. Both holds also need [`HEADROOM_MIN_EVALUATIONS`] consecutive
+    /// evaluations. An unknown estimate (0) changes nothing and restarts both
+    /// holds. Returns whether the guard is engaged.
+    fn headroom_guard_engaged(&mut self, now_us: u64, estimate_bps: u64, idle_us: u64) -> bool {
+        // An overridden enter threshold brings the exit threshold along at the
+        // 3:2 ratio of the defaults.
+        let (enter_bps, exit_bps) = match self.headroom_min_bpus_override {
+            Some(bpus) => {
+                let enter = (f64::from(bpus) * 8e6) as u64;
+                (enter, enter.saturating_add(enter / 2))
+            }
+            None => (HEADROOM_ENTER_BPS, HEADROOM_EXIT_BPS),
+        };
+        let g = &mut self.guard;
+        let known = estimate_bps > 0;
+        // A static screen cannot raise the estimate (a P frame of a few
+        // hundred bytes is no probe): once the estimate is back above the
+        // enter threshold and nothing has changed for a while, let go.
+        if g.headroom_active
+            && known
+            && estimate_bps >= enter_bps
+            && idle_us >= HEADROOM_IDLE_RELEASE_US
+        {
+            g.headroom_active = false;
+            g.below_since_us = None;
+            g.below_evals = 0;
+            g.above_since_us = None;
+            g.above_evals = 0;
+            return false;
+        }
+        if known && estimate_bps < enter_bps {
+            g.above_since_us = None;
+            g.above_evals = 0;
+            if !g.headroom_active {
+                let since = *g.below_since_us.get_or_insert(now_us);
+                g.below_evals = g.below_evals.saturating_add(1);
+                if now_us.saturating_sub(since) >= HEADROOM_ENTER_HOLD_US
+                    && g.below_evals >= HEADROOM_MIN_EVALUATIONS
+                {
+                    g.headroom_active = true;
+                    g.below_since_us = None;
+                    g.below_evals = 0;
+                }
+            }
+        } else if known && estimate_bps > exit_bps {
+            g.below_since_us = None;
+            g.below_evals = 0;
+            if g.headroom_active {
+                let since = *g.above_since_us.get_or_insert(now_us);
+                g.above_evals = g.above_evals.saturating_add(1);
+                if now_us.saturating_sub(since) >= HEADROOM_EXIT_HOLD_US
+                    && g.above_evals >= HEADROOM_MIN_EVALUATIONS
+                {
+                    g.headroom_active = false;
+                    g.above_since_us = None;
+                    g.above_evals = 0;
+                }
+            }
+        } else {
+            g.below_since_us = None;
+            g.below_evals = 0;
+            g.above_since_us = None;
+            g.above_evals = 0;
+        }
+        g.headroom_active
+    }
+
     /// Pure decision logic returning `(mode, reason)`. Each branch
     /// returns a static `&'static str` naming the cause:
     /// "headroom_guard", "loss_override", "suspension", "cost_comparison",
     /// or "hysteresis_clamp".
     fn decide_inner(
+        &mut self,
+        now_us: u64,
+        tentative_states: &[CodecState],
+        prev_mode: FrameMode,
+    ) -> (FrameMode, &'static str) {
+        let out = self.decide_core(now_us, tentative_states, prev_mode);
+        // H.264 that has run for a while without a stall earns the short
+        // re-entry holdoff back.
+        if out.0 == FrameMode::H264 && out.1 != "h264_stalled" {
+            let since = *self.guard.healthy_since_us.get_or_insert(now_us);
+            if now_us.saturating_sub(since) >= H264_STALL_HEALTHY_RESET_US {
+                self.guard.stall_level = 0;
+            }
+        } else {
+            self.guard.healthy_since_us = None;
+        }
+        out
+    }
+
+    fn decide_core(
         &mut self,
         now_us: u64,
         tentative_states: &[CodecState],
@@ -553,18 +713,56 @@ impl Classifier {
             return (FrameMode::TileCodec, "h264_unsupported");
         }
 
-        let headroom_threshold = self
-            .headroom_min_bpus_override
-            .unwrap_or(HEADROOM_MIN_BYTES_PER_US);
-        let headroom_force_h264 = ctx.bytes_per_us > 0.0 && ctx.bytes_per_us < headroom_threshold;
-        if headroom_force_h264 {
+        // An H.264 transport stall beats every other override, including
+        // the ones that would force H264: it is the only way out of H.264
+        // when the path stops carrying it. Re-entry (by any path) waits for
+        // the flag to have been clear for `H264_STALL_REENTRY_US`.
+        // The guard's timers run through a stall and its holdoff (its result
+        // is discarded there): an estimate that recovered while the session
+        // was in tile must release the guard on time, not when H.264 returns.
+        if tentative_states.is_empty() {
+            self.guard.idle_since_us.get_or_insert(now_us);
+        } else {
+            self.guard.idle_since_us = None;
+        }
+        let idle_us = self
+            .guard
+            .idle_since_us
+            .map_or(0, |t| now_us.saturating_sub(t));
+        let guard_engaged = self.headroom_guard_engaged(now_us, ctx.bwe_estimate_bps, idle_us);
+
+        if ctx.h264_stalled {
+            // A stall that ends a stretch of H.264 doubles the holdoff
+            // (2 s, 4 s, ... 30 s); one that restarts the holdoff already
+            // running does not.
+            if prev_mode == FrameMode::H264 {
+                self.guard.stall_level = self.guard.stall_level.saturating_add(1);
+                self.guard.holdoff_us = H264_STALL_REENTRY_US
+                    .saturating_mul(1u64 << (self.guard.stall_level - 1).min(16))
+                    .min(H264_STALL_REENTRY_MAX_US);
+            } else if self.guard.holdoff_us == 0 {
+                self.guard.holdoff_us = H264_STALL_REENTRY_US;
+            }
             self.state = ClassifierHysteresis::default();
+            self.guard.stalled_at_us = Some(now_us);
+            return (FrameMode::TileCodec, "h264_stalled");
+        }
+        if self
+            .guard
+            .stalled_at_us
+            .is_some_and(|t| now_us.saturating_sub(t) < self.guard.holdoff_us)
+        {
+            self.state = ClassifierHysteresis::default();
+            return (FrameMode::TileCodec, "h264_stalled_holdoff");
+        }
+
+        if guard_engaged {
             return (FrameMode::H264, "headroom_guard");
         }
         let loss_threshold = self
             .loss_override_threshold_override
             .unwrap_or(LOSS_OVERRIDE_THRESHOLD);
-        let loss_force_h264 = ctx.loss_rate > loss_threshold;
+        let loss_force_h264 = self.loss_override_enabled && ctx.loss_rate > loss_threshold;
         if loss_force_h264 {
             self.state = ClassifierHysteresis::default();
             return (FrameMode::H264, "loss_override");

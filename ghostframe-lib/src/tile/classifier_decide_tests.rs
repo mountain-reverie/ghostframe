@@ -240,6 +240,7 @@ fn refinement_bias_promotes_tilecodec_under_headroom() {
         loss_rate: 0.0,
         suspended: false,
         last_update_seq: 1,
+        ..Default::default()
     };
     let tentative: Vec<CodecState> = (0..40)
         .map(|_| CodecState::Cdf53 {
@@ -282,22 +283,32 @@ fn refinement_bias_promotes_tilecodec_under_headroom() {
 
 #[test]
 fn headroom_guard_forces_h264_below_threshold() {
-    use crate::tile::classifier::{AdaptationContext, Classifier, HEADROOM_MIN_BYTES_PER_US};
+    use crate::tile::classifier::{AdaptationContext, Classifier};
     use crate::tile::{CodecState, FrameMode};
     let mut c = Classifier::new(ClassifierConfig::default());
-    // Below threshold: 0.1 B/µs (~ 800 kbps).
+    // Below threshold: 1 Mbit/s of estimate.
     let ctx = AdaptationContext {
         supports_h264: true,
-        bytes_per_us: HEADROOM_MIN_BYTES_PER_US * 0.5,
+        bwe_estimate_bps: 1_000_000,
         smoothed_rtt_us: 50_000.0,
         loss_rate: 0.0,
         suspended: false,
         last_update_seq: 1,
+        ..Default::default()
     };
     c.set_adaptation_context(ctx);
     // Use a "would normally pick TileCodec" workload: 1 Solid tile.
     let tentative = vec![CodecState::Solid];
-    let mode = c.decide_frame_mode(&tentative, FrameMode::TileCodec);
+    // Not at once: the estimate has to stay low for the hold.
+    assert_eq!(
+        c.decide_frame_mode_at(0, &tentative, FrameMode::TileCodec),
+        FrameMode::TileCodec,
+        "one low reading must not engage the guard"
+    );
+    let mut mode = FrameMode::TileCodec;
+    for i in 0..=40u64 {
+        mode = c.decide_frame_mode_at(i * 16_667, &tentative, mode);
+    }
     assert_eq!(mode, FrameMode::H264, "headroom guard should override");
 }
 
@@ -305,7 +316,11 @@ fn headroom_guard_forces_h264_below_threshold() {
 fn loss_override_forces_h264_above_threshold() {
     use crate::tile::classifier::{AdaptationContext, Classifier, LOSS_OVERRIDE_THRESHOLD};
     use crate::tile::{CodecState, FrameMode};
-    let mut c = Classifier::new(ClassifierConfig::default());
+    // Enabled explicitly: it is off by default.
+    let mut c = Classifier::new(ClassifierConfig {
+        loss_override_enabled: true,
+        ..Default::default()
+    });
     let ctx = AdaptationContext {
         supports_h264: true,
         bytes_per_us: 100.0,
@@ -313,6 +328,7 @@ fn loss_override_forces_h264_above_threshold() {
         loss_rate: LOSS_OVERRIDE_THRESHOLD + 0.05,
         suspended: false,
         last_update_seq: 1,
+        ..Default::default()
     };
     c.set_adaptation_context(ctx);
     let tentative = vec![CodecState::Solid];
@@ -334,6 +350,7 @@ fn suspension_override_forces_h264() {
         loss_rate: 0.0,
         suspended: true,
         last_update_seq: 1,
+        ..Default::default()
     };
     c.set_adaptation_context(ctx);
     let tentative = vec![CodecState::Solid];
@@ -409,6 +426,7 @@ fn mode_decision_event_emitted_only_on_transition() {
         loss_rate: 0.0,
         suspended: false,
         last_update_seq: 1,
+        ..Default::default()
     };
     c.set_adaptation_context(ctx);
     let tentative = vec![CodecState::Solid];
@@ -444,6 +462,7 @@ fn env_var_override_refinement_bias_us() {
         loss_rate: 0.0,
         suspended: false,
         last_update_seq: 1,
+        ..Default::default()
     };
     let present_passes: u16 = 0x3FFF;
     let tentative: Vec<CodecState> = (0..40)
@@ -515,6 +534,7 @@ fn env_var_override_loss_override_threshold() {
 
     // Raise the threshold to 0.50 — well above the test ctx's 0.15.
     let mut c = Classifier::new(ClassifierConfig {
+        loss_override_enabled: true,
         loss_override_threshold: Some(0.50),
         ..Default::default()
     });
@@ -526,6 +546,7 @@ fn env_var_override_loss_override_threshold() {
         loss_rate: 0.15,
         suspended: false,
         last_update_seq: 1,
+        ..Default::default()
     };
     c.set_adaptation_context(ctx);
     let tentative = vec![CodecState::Solid];
@@ -541,10 +562,11 @@ fn env_var_override_loss_override_threshold() {
 #[test]
 fn env_var_override_headroom_min_bpus() {
     use crate::config::ClassifierConfig;
-    use crate::tile::classifier::{AdaptationContext, Classifier, HEADROOM_MIN_BYTES_PER_US};
+    use crate::tile::classifier::{AdaptationContext, Classifier};
     use crate::tile::{CodecState, FrameMode};
 
-    // Lower the threshold to 0.05 — well below the test ctx's 0.1.
+    // Lower the enter threshold to 0.05 B/us (400 kbit/s) -- below the test
+    // ctx's 800 kbit/s estimate, which the default threshold would act on.
     let mut c = Classifier::new(ClassifierConfig {
         headroom_min_bpus: Some(0.05),
         ..Default::default()
@@ -552,21 +574,22 @@ fn env_var_override_headroom_min_bpus() {
 
     let ctx = AdaptationContext {
         supports_h264: true,
-        bytes_per_us: 0.1,
+        bwe_estimate_bps: 800_000,
         smoothed_rtt_us: 50_000.0,
         loss_rate: 0.0,
         suspended: false,
         last_update_seq: 1,
+        ..Default::default()
     };
     c.set_adaptation_context(ctx);
     let tentative = vec![CodecState::Solid];
 
-    // 0.1 > 0.05 ⇒ headroom override should NOT fire (would fire at default 0.25).
-    assert_eq!(
-        c.decide_frame_mode(&tentative, FrameMode::TileCodec),
-        FrameMode::TileCodec
-    );
-    assert_eq!(HEADROOM_MIN_BYTES_PER_US, 0.25);
+    // 800k > 400k => the guard must NOT engage, however long it is held.
+    let mut mode = FrameMode::TileCodec;
+    for i in 0..=120u64 {
+        mode = c.decide_frame_mode_at(i * 16_667, &tentative, mode);
+    }
+    assert_eq!(mode, FrameMode::TileCodec);
 }
 
 /// `GHOSTFRAME_TEST_FORCE_FRAME_MODE=h264` pins the classifier to H264
@@ -618,6 +641,7 @@ fn env_var_force_frame_mode_tile_pins_classifier() {
         loss_rate: 0.0,
         suspended: true,
         last_update_seq: 1,
+        ..Default::default()
     };
     c.set_adaptation_context(ctx);
 
@@ -658,6 +682,7 @@ fn env_var_force_tilecodec_pins_classifier() {
         loss_rate: 0.0,
         suspended: true,
         last_update_seq: 1,
+        ..Default::default()
     };
     c.set_adaptation_context(ctx);
 
@@ -725,6 +750,7 @@ fn hybrid_hysteresis_wall_clock_jump_without_streak_does_not_flip() {
         loss_rate: 0.0,
         suspended: false,
         last_update_seq: 1,
+        ..Default::default()
     };
     c.set_adaptation_context(ctx);
 
@@ -780,6 +806,7 @@ fn hybrid_hysteresis_exit_wall_clock_jump_without_streak_does_not_flip() {
         loss_rate: 0.0,
         suspended: false,
         last_update_seq: 1,
+        ..Default::default()
     };
     c.set_adaptation_context(ctx);
 
@@ -809,16 +836,21 @@ fn h264_unsupported_forces_tile_codec_even_with_low_headroom() {
     let mut c = Classifier::new(ClassifierConfig::default());
     let ctx = AdaptationContext {
         supports_h264: false,
-        bytes_per_us: HEADROOM_MIN_BYTES_PER_US * 0.5, // below threshold
+        bwe_estimate_bps: 500_000, // well below the guard's threshold
         smoothed_rtt_us: 50_000.0,
         loss_rate: 0.0,
         suspended: false,
         last_update_seq: 1,
+        ..Default::default()
     };
     c.set_adaptation_context(ctx);
 
     let tentative = vec![CodecState::Solid];
-    let mode = c.decide_frame_mode(&tentative, FrameMode::TileCodec);
+    // Long enough for the guard to have engaged were H.264 supported.
+    let mut mode = FrameMode::TileCodec;
+    for i in 0..=120u64 {
+        mode = c.decide_frame_mode_at(i * 16_667, &tentative, mode);
+    }
     assert_eq!(
         mode,
         FrameMode::TileCodec,
@@ -830,7 +862,10 @@ fn h264_unsupported_forces_tile_codec_even_with_low_headroom() {
 fn h264_unsupported_forces_tile_codec_even_with_high_loss() {
     // Symmetric coverage: loss_override would normally force H.264 here,
     // but supports_h264=false must win.
-    let mut c = Classifier::new(ClassifierConfig::default());
+    let mut c = Classifier::new(ClassifierConfig {
+        loss_override_enabled: true,
+        ..Default::default()
+    });
     let ctx = AdaptationContext {
         supports_h264: false,
         bytes_per_us: 100.0,
@@ -838,6 +873,7 @@ fn h264_unsupported_forces_tile_codec_even_with_high_loss() {
         loss_rate: 0.50, // way past loss threshold
         suspended: false,
         last_update_seq: 1,
+        ..Default::default()
     };
     c.set_adaptation_context(ctx);
     let tentative = vec![CodecState::Solid];
@@ -862,9 +898,601 @@ fn h264_unsupported_forces_tile_codec_when_previously_in_h264() {
         loss_rate: 0.0,
         suspended: false,
         last_update_seq: 1,
+        ..Default::default()
     };
     c.set_adaptation_context(ctx);
     let tentative = vec![CodecState::Solid];
     let mode = c.decide_frame_mode(&tentative, FrameMode::H264);
     assert_eq!(mode, FrameMode::TileCodec);
+}
+
+// ---- A5: h264_stalled, the headroom guard's hysteresis, loss_override off ----
+
+mod a5_guard {
+    use super::*;
+    // The thresholds are spelled as literals on purpose: a test that reads
+    // the constant would follow it wherever a regression moved it. They are
+    // the design's numbers (section 8): enter < 2.0 Mbit/s held 500 ms, exit
+    // > 3.0 Mbit/s held 1 s, re-entry 2 s after the stall flag clears.
+    const ENTER_BPS: u64 = 2_000_000;
+    const EXIT_BPS: u64 = 3_000_000;
+    const ENTER_HOLD_US: u64 = 500_000;
+    const EXIT_HOLD_US: u64 = 1_000_000;
+    const REENTRY_US: u64 = 2_000_000;
+
+    const FRAME_US: u64 = 16_667;
+    /// A screen with something changing (an idle one releases the guard).
+    const BUSY: [CodecState; 1] = [CodecState::Solid];
+
+    fn ctx() -> AdaptationContext {
+        AdaptationContext {
+            supports_h264: true,
+            bytes_per_us: 100.0,
+            smoothed_rtt_us: 20_000.0,
+            ..Default::default()
+        }
+    }
+
+    /// One evaluation: `(mode, reason)` at `now_us`, with `prev` as the mode.
+    fn step(
+        c: &mut Classifier,
+        now_us: u64,
+        t: &[CodecState],
+        prev: FrameMode,
+    ) -> (FrameMode, &'static str) {
+        c.decide_inner(now_us, t, prev)
+    }
+
+    /// Drive `from_us..=to_us` in `FRAME_US` steps with the estimate fixed.
+    fn run(
+        c: &mut Classifier,
+        from_us: u64,
+        to_us: u64,
+        t: &[CodecState],
+        mut prev: FrameMode,
+    ) -> (FrameMode, &'static str) {
+        let mut out = (prev, "none");
+        let mut now = from_us;
+        while now <= to_us {
+            out = step(c, now, t, prev);
+            prev = out.0;
+            now += FRAME_US;
+        }
+        out
+    }
+
+    fn heavy_motion() -> Vec<CodecState> {
+        // 40 Cdf53 tiles at 100 B/us: cost comparison keeps H264 (see
+        // `refinement_deficit_biases_h264_cost_upward`).
+        (0..40)
+            .map(|_| CodecState::Cdf53 {
+                passes_sent: 3,
+                present_passes: 0x3FFF,
+            })
+            .collect()
+    }
+
+    /// The sequence that stuck in H.264 on master: the probe-inclusive rate
+    /// (`bytes_per_us`) sits under 0.25 B/us (2 Mbit/s) while the estimate is
+    /// fine and the screen is idle. Master forced H264 on every evaluation;
+    /// now the guard does not engage and the cost path leaves H264.
+    #[test]
+    fn a_low_model_rate_with_a_healthy_estimate_no_longer_sticks_in_h264() {
+        let mut c = Classifier::new(ClassifierConfig::default());
+        c.set_adaptation_context(AdaptationContext {
+            bytes_per_us: 0.20,
+            bwe_estimate_bps: 4_000_000,
+            ..ctx()
+        });
+        let (mode, reason) = run(&mut c, 0, 3_000_000, &[], FrameMode::H264);
+        assert_eq!(mode, FrameMode::TileCodec, "last reason: {reason}");
+        assert_ne!(reason, "headroom_guard");
+    }
+
+    /// And the converse: a healthy model rate with an estimate under 2 Mbit/s
+    /// does engage it (the guard reads the estimate, not `bytes_per_us`).
+    #[test]
+    fn the_guard_reads_the_estimate_not_the_model_rate() {
+        let mut c = Classifier::new(ClassifierConfig::default());
+        c.set_adaptation_context(AdaptationContext {
+            bytes_per_us: 100.0,
+            bwe_estimate_bps: ENTER_BPS - 1,
+            ..ctx()
+        });
+        let (mode, reason) = run(&mut c, 0, 1_000_000, &[], FrameMode::TileCodec);
+        assert_eq!((mode, reason), (FrameMode::H264, "headroom_guard"));
+    }
+
+    #[test]
+    fn the_guard_needs_the_enter_hold_and_the_threshold_is_strict() {
+        let mut c = Classifier::new(ClassifierConfig::default());
+        let low = AdaptationContext {
+            bwe_estimate_bps: ENTER_BPS - 1,
+            ..ctx()
+        };
+        c.set_adaptation_context(low);
+        // Just short of the hold: not engaged.
+        let (_, r) = run(&mut c, 0, ENTER_HOLD_US - 1, &[], FrameMode::TileCodec);
+        assert_ne!(r, "headroom_guard");
+        assert!(!c.guard.headroom_active);
+        // At the hold: engaged.
+        let (m, r) = step(&mut c, ENTER_HOLD_US, &[], FrameMode::TileCodec);
+        assert_eq!((m, r), (FrameMode::H264, "headroom_guard"));
+
+        // Exactly at the threshold is not "below" it.
+        let mut c = Classifier::new(ClassifierConfig::default());
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: ENTER_BPS,
+            ..ctx()
+        });
+        run(&mut c, 0, 5_000_000, &[], FrameMode::TileCodec);
+        assert!(!c.guard.headroom_active);
+    }
+
+    /// An estimate that dips below the threshold on alternate evaluations
+    /// never holds for the dwell: the guard must not engage. Once engaged, an
+    /// estimate that keeps coming back under the exit threshold must not let
+    /// it go.
+    #[test]
+    fn a_wandering_estimate_neither_engages_nor_releases_the_guard() {
+        let mut c = Classifier::new(ClassifierConfig::default());
+        let mut prev = FrameMode::TileCodec;
+        for i in 0..300u64 {
+            let bps = if i % 2 == 0 {
+                ENTER_BPS - 100_000
+            } else {
+                ENTER_BPS + 100_000
+            };
+            c.set_adaptation_context(AdaptationContext {
+                bwe_estimate_bps: bps,
+                ..ctx()
+            });
+            prev = step(&mut c, i * FRAME_US, &BUSY, prev).0;
+            assert!(!c.guard.headroom_active, "engaged at evaluation {i}");
+        }
+
+        // Engage, then wobble around the exit threshold.
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: 1_000_000,
+            ..ctx()
+        });
+        let t0 = 300 * FRAME_US;
+        run(&mut c, t0, t0 + 1_000_000, &BUSY, prev);
+        assert!(c.guard.headroom_active);
+        let t1 = t0 + 1_100_000;
+        for i in 0..300u64 {
+            let bps = if i % 2 == 0 {
+                EXIT_BPS + 500_000
+            } else {
+                EXIT_BPS - 500_000
+            };
+            c.set_adaptation_context(AdaptationContext {
+                bwe_estimate_bps: bps,
+                ..ctx()
+            });
+            step(&mut c, t1 + i * FRAME_US, &BUSY, FrameMode::H264);
+            assert!(c.guard.headroom_active, "released at evaluation {i}");
+        }
+    }
+
+    /// The dwell is wall-clock AND a streak of evaluations: two readings a
+    /// second apart (a stalled process, a paused container) are not half a
+    /// second of low estimate.
+    #[test]
+    fn a_long_gap_between_two_evaluations_does_not_engage_the_guard() {
+        let mut c = Classifier::new(ClassifierConfig::default());
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: 1_000_000,
+            ..ctx()
+        });
+        step(&mut c, 0, &BUSY, FrameMode::TileCodec);
+        let (m, r) = step(&mut c, 5_000_000, &BUSY, FrameMode::TileCodec);
+        assert_eq!(m, FrameMode::TileCodec, "{r}");
+        assert!(!c.guard.headroom_active);
+        // Same for letting go.
+        let mut c = Classifier::new(ClassifierConfig::default());
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: 1_000_000,
+            ..ctx()
+        });
+        run(&mut c, 0, 1_000_000, &BUSY, FrameMode::TileCodec);
+        assert!(c.guard.headroom_active);
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: 5_000_000,
+            ..ctx()
+        });
+        step(&mut c, 2_000_000, &BUSY, FrameMode::H264);
+        step(&mut c, 9_000_000, &BUSY, FrameMode::H264);
+        assert!(c.guard.headroom_active);
+    }
+
+    #[test]
+    fn the_guard_releases_only_after_the_exit_hold_above_the_exit_threshold() {
+        let mut c = Classifier::new(ClassifierConfig::default());
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: 1_000_000,
+            ..ctx()
+        });
+        run(&mut c, 0, 1_000_000, &BUSY, FrameMode::TileCodec);
+        assert!(c.guard.headroom_active);
+
+        // Between the thresholds nothing changes, however long.
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: 2_500_000,
+            ..ctx()
+        });
+        run(&mut c, 1_100_000, 6_000_000, &BUSY, FrameMode::H264);
+        assert!(c.guard.headroom_active, "the dead band must hold the state");
+
+        // Exactly at the exit threshold is not "above" it.
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: EXIT_BPS,
+            ..ctx()
+        });
+        run(&mut c, 6_100_000, 9_000_000, &BUSY, FrameMode::H264);
+        assert!(c.guard.headroom_active);
+
+        // Above it: held through the hold, released at it.
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: EXIT_BPS + 1,
+            ..ctx()
+        });
+        let t = 9_100_000;
+        run(&mut c, t, t + EXIT_HOLD_US - 1, &BUSY, FrameMode::H264);
+        assert!(c.guard.headroom_active, "released before the exit hold");
+        step(&mut c, t + EXIT_HOLD_US, &BUSY, FrameMode::H264);
+        assert!(!c.guard.headroom_active, "not released at the exit hold");
+    }
+
+    /// An unknown estimate (0) neither engages nor releases, and restarts
+    /// both holds.
+    #[test]
+    fn an_unknown_estimate_changes_nothing() {
+        let mut c = Classifier::new(ClassifierConfig::default());
+        c.set_adaptation_context(ctx());
+        run(&mut c, 0, 5_000_000, &[], FrameMode::TileCodec);
+        assert!(!c.guard.headroom_active);
+
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: 1_000_000,
+            ..ctx()
+        });
+        run(&mut c, 5_100_000, 6_100_000, &[], FrameMode::TileCodec);
+        assert!(c.guard.headroom_active);
+        c.set_adaptation_context(ctx());
+        run(&mut c, 6_200_000, 12_000_000, &[], FrameMode::H264);
+        assert!(c.guard.headroom_active);
+    }
+
+    #[test]
+    fn stalled_goes_to_tile_then_holds_h264_off_for_the_reentry_time() {
+        let mut c = Classifier::new(ClassifierConfig::default());
+        // Everything that would put the session in H264 at once: an engaged
+        // headroom guard's estimate, and heavy motion.
+        let h = heavy_motion();
+        let low = AdaptationContext {
+            bwe_estimate_bps: 500_000,
+            ..ctx()
+        };
+        c.set_adaptation_context(low);
+        let (m, r) = run(&mut c, 0, 1_000_000, &h, FrameMode::TileCodec);
+        assert_eq!((m, r), (FrameMode::H264, "headroom_guard"));
+
+        let t0 = 1_100_000;
+        c.set_adaptation_context(AdaptationContext {
+            h264_stalled: true,
+            ..low
+        });
+        assert_eq!(
+            step(&mut c, t0, &h, FrameMode::H264),
+            (FrameMode::TileCodec, "h264_stalled")
+        );
+        // While the flag stays up, tile.
+        let (m, r) = run(&mut c, t0, t0 + 3_000_000, &h, FrameMode::TileCodec);
+        assert_eq!((m, r), (FrameMode::TileCodec, "h264_stalled"));
+        let last = t0 + 3_000_000 / FRAME_US * FRAME_US;
+
+        // Flag clear: the re-entry time counts from the last evaluation that
+        // had it. Not a microsecond earlier.
+        c.set_adaptation_context(low);
+        let (m, r) = step(&mut c, last + REENTRY_US - 1, &h, FrameMode::TileCodec);
+        assert_eq!((m, r), (FrameMode::TileCodec, "h264_stalled_holdoff"));
+        // At it the holdoff is over. The link is still starved and the
+        // guard's state survived the stall, so it forces H264 again: that is
+        // the re-entry, and it is 2 s after the flag cleared, not before.
+        let (m, r) = step(&mut c, last + REENTRY_US, &h, FrameMode::TileCodec);
+        assert_eq!((m, r), (FrameMode::H264, "headroom_guard"));
+    }
+
+    /// The cost path's re-entry after the holdoff goes through its own
+    /// hysteresis (3 evaluations and 50 ms), not at once.
+    #[test]
+    fn after_the_holdoff_the_cost_path_still_needs_its_own_dwell() {
+        let mut c = Classifier::new(ClassifierConfig::default());
+        let h = heavy_motion();
+        c.set_adaptation_context(AdaptationContext {
+            h264_stalled: true,
+            ..ctx()
+        });
+        step(&mut c, 0, &h, FrameMode::H264);
+        c.set_adaptation_context(ctx());
+        let t = REENTRY_US;
+        let (m, r) = step(&mut c, t, &h, FrameMode::TileCodec);
+        assert_eq!((m, r), (FrameMode::TileCodec, "hysteresis_clamp"));
+        let (m, r) = run(&mut c, t + FRAME_US, t + 200_000, &h, FrameMode::TileCodec);
+        assert_eq!(m, FrameMode::H264, "{r}");
+    }
+
+    /// A flag raised again inside the re-entry time restarts it.
+    #[test]
+    fn a_second_stall_restarts_the_reentry_time() {
+        let mut c = Classifier::new(ClassifierConfig::default());
+        c.set_adaptation_context(AdaptationContext {
+            h264_stalled: true,
+            ..ctx()
+        });
+        step(&mut c, 0, &[], FrameMode::H264);
+        c.set_adaptation_context(ctx());
+        assert_eq!(
+            step(&mut c, 1_500_000, &[], FrameMode::TileCodec).1,
+            "h264_stalled_holdoff"
+        );
+        c.set_adaptation_context(AdaptationContext {
+            h264_stalled: true,
+            ..ctx()
+        });
+        step(&mut c, 1_900_000, &[], FrameMode::TileCodec);
+        c.set_adaptation_context(ctx());
+        // 2.4 s after the first stall, 0.5 s after the second.
+        assert_eq!(
+            step(&mut c, 2_400_000, &[], FrameMode::TileCodec).1,
+            "h264_stalled_holdoff"
+        );
+        assert_ne!(
+            step(&mut c, 1_900_000 + REENTRY_US, &[], FrameMode::TileCodec).1,
+            "h264_stalled_holdoff"
+        );
+    }
+
+    /// `h264_stalled` is evaluated before the headroom guard, the loss
+    /// override and suspension, including after the guard engaged.
+    #[test]
+    fn stalled_beats_every_override_that_forces_h264() {
+        let mut c = Classifier::new(ClassifierConfig {
+            loss_override_enabled: true,
+            ..Default::default()
+        });
+        let all = AdaptationContext {
+            bwe_estimate_bps: 100_000,
+            loss_rate: 0.9,
+            suspended: true,
+            ..ctx()
+        };
+        c.set_adaptation_context(all);
+        // Each of them alone, and then together, forces H264 ...
+        let (m, r) = run(&mut c, 0, 1_000_000, &[], FrameMode::TileCodec);
+        assert_eq!(m, FrameMode::H264, "{r}");
+        // ... and the stall flag beats all three.
+        c.set_adaptation_context(AdaptationContext {
+            h264_stalled: true,
+            ..all
+        });
+        assert_eq!(
+            step(&mut c, 1_100_000, &[], FrameMode::H264),
+            (FrameMode::TileCodec, "h264_stalled")
+        );
+        // Even with the guard's state already engaged, and in holdoff.
+        c.set_adaptation_context(all);
+        let (m, r) = step(&mut c, 1_200_000, &[], FrameMode::TileCodec);
+        assert_eq!((m, r), (FrameMode::TileCodec, "h264_stalled_holdoff"));
+    }
+
+    #[test]
+    fn loss_override_is_off_unless_enabled() {
+        let lossy = AdaptationContext {
+            loss_rate: 0.5,
+            ..ctx()
+        };
+        let mut off = Classifier::new(ClassifierConfig::default());
+        off.set_adaptation_context(lossy);
+        let (m, r) = run(
+            &mut off,
+            0,
+            2_000_000,
+            &[CodecState::Solid],
+            FrameMode::TileCodec,
+        );
+        assert_eq!(m, FrameMode::TileCodec, "{r}");
+
+        let mut on = Classifier::new(ClassifierConfig {
+            loss_override_enabled: true,
+            ..Default::default()
+        });
+        on.set_adaptation_context(lossy);
+        assert_eq!(
+            step(&mut on, 0, &[CodecState::Solid], FrameMode::TileCodec),
+            (FrameMode::H264, "loss_override")
+        );
+    }
+
+    /// A new session starts with no stall holdoff and a disengaged guard.
+    #[test]
+    fn reset_clears_the_guard_and_the_stall_holdoff() {
+        let mut c = Classifier::new(ClassifierConfig::default());
+        c.set_adaptation_context(AdaptationContext {
+            h264_stalled: true,
+            bwe_estimate_bps: 100_000,
+            ..ctx()
+        });
+        step(&mut c, 0, &[], FrameMode::H264);
+        c.reset();
+        c.set_adaptation_context(ctx());
+        assert_ne!(
+            step(&mut c, 10, &[], FrameMode::TileCodec).1,
+            "h264_stalled_holdoff"
+        );
+    }
+
+    /// A static screen cannot raise the estimate (P frames of a few hundred
+    /// bytes are no probe), so an engaged guard whose estimate is back above
+    /// the enter threshold lets go after 2 s with no dirty tile.
+    #[test]
+    fn an_idle_screen_releases_the_guard_once_the_estimate_is_back() {
+        let mut c = Classifier::new(ClassifierConfig::default());
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: 1_000_000,
+            ..ctx()
+        });
+        run(&mut c, 0, 1_000_000, &BUSY, FrameMode::TileCodec);
+        assert!(c.guard.headroom_active);
+        // 2.5 Mbit/s: above enter, inside the dead band (no hysteresis exit).
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: 2_500_000,
+            ..ctx()
+        });
+        let t = 1_100_000;
+        run(&mut c, t, t + 1_900_000, &[], FrameMode::H264);
+        assert!(c.guard.headroom_active, "released before 2 s idle");
+        run(&mut c, t + 1_900_000, t + 2_100_000, &[], FrameMode::H264);
+        assert!(!c.guard.headroom_active, "not released after 2 s idle");
+
+        // Not while the estimate is still under the threshold ...
+        let mut c = Classifier::new(ClassifierConfig::default());
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: 1_000_000,
+            ..ctx()
+        });
+        run(&mut c, 0, 1_000_000, &BUSY, FrameMode::TileCodec);
+        run(&mut c, 1_100_000, 9_000_000, &[], FrameMode::H264);
+        assert!(c.guard.headroom_active);
+        // ... nor when the screen is not idle (a tile at 1.9 s restarts it).
+        step(&mut c, 9_050_000, &BUSY, FrameMode::H264);
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: 2_500_000,
+            ..ctx()
+        });
+        let t = 9_100_000;
+        run(&mut c, t, t + 1_800_000, &[], FrameMode::H264);
+        step(&mut c, t + 1_900_000, &BUSY, FrameMode::H264);
+        run(&mut c, t + 1_920_000, t + 3_700_000, &[], FrameMode::H264);
+        assert!(
+            c.guard.headroom_active,
+            "activity must restart the idle time"
+        );
+    }
+
+    /// The guard's timers run while a stall or its holdoff has the session in
+    /// tile: an estimate that recovered meanwhile releases the guard on time.
+    #[test]
+    fn the_guard_releases_during_a_stall_holdoff() {
+        let mut c = Classifier::new(ClassifierConfig::default());
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: 1_000_000,
+            ..ctx()
+        });
+        run(&mut c, 0, 1_000_000, &BUSY, FrameMode::TileCodec);
+        assert!(c.guard.headroom_active);
+        // The stall, with the estimate already recovering ...
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: 6_000_000,
+            h264_stalled: true,
+            ..ctx()
+        });
+        let t = 1_100_000;
+        step(&mut c, t, &BUSY, FrameMode::H264);
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: 6_000_000,
+            ..ctx()
+        });
+        // ... held for the exit hold (1 s) inside the 2 s holdoff.
+        let (m, r) = run(
+            &mut c,
+            t + FRAME_US,
+            t + 1_200_000,
+            &BUSY,
+            FrameMode::TileCodec,
+        );
+        assert_eq!((m, r), (FrameMode::TileCodec, "h264_stalled_holdoff"));
+        assert!(
+            !c.guard.headroom_active,
+            "the guard sat frozen through the holdoff"
+        );
+        // So after the holdoff nothing forces H264.
+        let (m, r) = step(&mut c, t + 2_100_000, &BUSY, FrameMode::TileCodec);
+        assert_eq!((m, r), (FrameMode::TileCodec, "hysteresis_clamp"));
+    }
+
+    /// Stalls that follow a re-entry double the holdoff (2, 4, 8, 16, 30, 30
+    /// s); H.264 that then runs 10 s without a stall resets it to 2 s.
+    #[test]
+    fn the_reentry_holdoff_backs_off_and_resets_after_healthy_h264() {
+        // Engage the guard so that re-entry is immediate once the holdoff
+        // ends, then drive stall / holdoff / re-entry / short run.
+        fn engaged() -> (Classifier, u64) {
+            let mut c = Classifier::new(ClassifierConfig::default());
+            c.set_adaptation_context(AdaptationContext {
+                bwe_estimate_bps: 500_000,
+                ..ctx()
+            });
+            run(&mut c, 0, 1_000_000, &BUSY, FrameMode::TileCodec);
+            assert!(c.guard.headroom_active);
+            (c, 1_100_000)
+        }
+        let low = AdaptationContext {
+            bwe_estimate_bps: 500_000,
+            ..ctx()
+        };
+        // Stall at `t` out of H264, measure the holdoff, re-enter, run H264
+        // for `run_us`; returns (holdoff_us, time after the run).
+        fn episode(c: &mut Classifier, low: AdaptationContext, t: u64, run_us: u64) -> (u64, u64) {
+            c.set_adaptation_context(AdaptationContext {
+                h264_stalled: true,
+                ..low
+            });
+            assert_eq!(
+                step(c, t, &BUSY, FrameMode::H264),
+                (FrameMode::TileCodec, "h264_stalled")
+            );
+            c.set_adaptation_context(low);
+            // Find the holdoff by probing in 100 ms steps.
+            let mut h = 100_000;
+            while step(c, t + h, &BUSY, FrameMode::TileCodec).1 == "h264_stalled_holdoff" {
+                h += 100_000;
+            }
+            // (probing at the boundary: the first step outside it re-entered)
+            let reentered = step(c, t + h, &BUSY, FrameMode::TileCodec);
+            assert_eq!(reentered, (FrameMode::H264, "headroom_guard"));
+            let end = t + h + run_us;
+            run(c, t + h + FRAME_US, end, &BUSY, FrameMode::H264);
+            (h, end + FRAME_US)
+        }
+        let (mut c, mut t) = engaged();
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            let (h, next) = episode(&mut c, low, t, 3_000_000);
+            seen.push(h / 1_000_000);
+            t = next;
+        }
+        assert_eq!(seen, [2, 4, 8, 16, 30, 30]);
+
+        // 10 s of healthy H.264 resets the ladder ...
+        let (mut c, mut t) = engaged();
+        for _ in 0..2 {
+            t = episode(&mut c, low, t, 3_000_000).1;
+        }
+        let (h, t) = episode(&mut c, low, t, 10_100_000);
+        assert_eq!(h / 1_000_000, 8, "premise: the third rung");
+        let (h, _) = episode(&mut c, low, t, 3_000_000);
+        assert_eq!(h / 1_000_000, 2, "10 s of healthy H.264 resets the holdoff");
+
+        // ... 9 s does not.
+        let (mut c, mut t) = engaged();
+        for _ in 0..2 {
+            t = episode(&mut c, low, t, 3_000_000).1;
+        }
+        let (h, t) = episode(&mut c, low, t, 9_000_000);
+        assert_eq!(h / 1_000_000, 8);
+        let (h, _) = episode(&mut c, low, t, 3_000_000);
+        assert_eq!(h / 1_000_000, 16);
+    }
 }
