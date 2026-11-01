@@ -474,25 +474,79 @@ pub fn is_tile_datagram(data: &[u8]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// FrameHeader (14 bytes)
-//   [0..4]  frame_seq:     u32 BE (bit 31 always 0)
-//   [4..6]  frag_idx:      u16 BE
-//   [6..8]  frag_total:    u16 BE
-//   [8..12] timestamp_us:  u32 BE
-//   [12]    flags:         u8  (bit 0 = is_keyframe)
-//   [13]    reserved:      u8
+// FrameHeader v2 (22 bytes)
+//   [0..4]   frame_seq:     u32 BE (bit 31 always 0)
+//   [4..6]   frag_idx:      u16 BE
+//   [6..8]   frag_total:    u16 BE
+//   [8..12]  wire_seq:      u32 BE (`NO_ACK` = not tracked by the ledger)
+//   [12..16] timestamp_us:  u32 BE
+//   [16]     flags:         u8  (FRAME_FLAG_* bits)
+//   [17]     slots:         u8  (bits 0-1 mark_lt_idx, bits 2-3 target_lt_idx)
+//   [18..22] ref_frame_seq: u32 BE (`REF_FRAME_NONE` for an IDR / unknown)
 // ---------------------------------------------------------------------------
 
-pub const FRAME_HEADER_SIZE: usize = 14;
+pub const FRAME_HEADER_SIZE: usize = 22;
+
+/// `wire_seq` value of a datagram the ledger does not track: the receiver
+/// never acknowledges it and the sender never judges it lost.
+pub const NO_ACK: u32 = 0xFFFF_FFFF;
+
+/// `ref_frame_seq` of a frame that references no earlier frame (an IDR), or
+/// whose reference the sender does not know.
+pub const REF_FRAME_NONE: u32 = 0xFFFF_FFFF;
+
+/// Frame flag bit 0: the frame is an IDR (self-contained).
+pub const FRAME_FLAG_IDR: u8 = 0x01;
+/// Frame flag bit 1: nothing may reference this frame.
+pub const FRAME_FLAG_NON_REF: u8 = 0x02;
+/// Frame flag bit 2: this frame is marked as a long-term reference.
+pub const FRAME_FLAG_MARK_LT: u8 = 0x04;
+/// Frame flag bit 3: this frame predicts from a long-term reference.
+pub const FRAME_FLAG_TARGET_IS_LT: u8 = 0x08;
+
+/// The per-frame reference description carried by every fragment of a frame.
+///
+/// Parity datagrams carry NO reference information: their `flags` hold only
+/// the idr bit, `slots` is 0 and `ref_frame_seq` is `REF_FRAME_NONE`. Read the
+/// reference from a source fragment, never from a parity (Phase B must not
+/// trust these fields on a parity datagram).
+///
+/// cbindgen:ignore
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameRefInfo {
+    pub flags: u8,
+    pub slots: u8,
+    pub ref_frame_seq: u32,
+}
+
+impl FrameRefInfo {
+    /// An IDR: no reference.
+    pub const IDR: FrameRefInfo = FrameRefInfo {
+        flags: FRAME_FLAG_IDR,
+        slots: 0,
+        ref_frame_seq: REF_FRAME_NONE,
+    };
+
+    /// A P frame predicting from `ref_frame_seq` (`REF_FRAME_NONE` if unknown).
+    pub fn predicted(ref_frame_seq: u32) -> Self {
+        FrameRefInfo {
+            flags: 0,
+            slots: 0,
+            ref_frame_seq,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
     pub frame_seq: u32,
     pub frag_idx: u16,
     pub frag_total: u16,
+    pub wire_seq: u32,
     pub timestamp_us: u32,
     pub flags: u8,
-    pub reserved: u8,
+    pub slots: u8,
+    pub ref_frame_seq: u32,
 }
 
 impl FrameHeader {
@@ -500,9 +554,11 @@ impl FrameHeader {
         buf.extend_from_slice(&self.frame_seq.to_be_bytes());
         buf.extend_from_slice(&self.frag_idx.to_be_bytes());
         buf.extend_from_slice(&self.frag_total.to_be_bytes());
+        buf.extend_from_slice(&self.wire_seq.to_be_bytes());
         buf.extend_from_slice(&self.timestamp_us.to_be_bytes());
         buf.push(self.flags);
-        buf.push(self.reserved);
+        buf.push(self.slots);
+        buf.extend_from_slice(&self.ref_frame_seq.to_be_bytes());
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, ProtocolError> {
@@ -516,9 +572,11 @@ impl FrameHeader {
             frame_seq: u32::from_be_bytes(data[0..4].try_into().unwrap()),
             frag_idx: u16::from_be_bytes(data[4..6].try_into().unwrap()),
             frag_total: u16::from_be_bytes(data[6..8].try_into().unwrap()),
-            timestamp_us: u32::from_be_bytes(data[8..12].try_into().unwrap()),
-            flags: data[12],
-            reserved: data[13],
+            wire_seq: u32::from_be_bytes(data[8..12].try_into().unwrap()),
+            timestamp_us: u32::from_be_bytes(data[12..16].try_into().unwrap()),
+            flags: data[16],
+            slots: data[17],
+            ref_frame_seq: u32::from_be_bytes(data[18..22].try_into().unwrap()),
         })
     }
 
@@ -528,9 +586,9 @@ impl FrameHeader {
         self.frag_idx >= self.frag_total
     }
 
-    /// Returns `true` if the keyframe flag (bit 0) is set.
+    /// Returns `true` if the IDR flag (bit 0) is set.
     pub fn is_keyframe(&self) -> bool {
-        (self.flags & 0x01) != 0
+        (self.flags & FRAME_FLAG_IDR) != 0
     }
 }
 
@@ -540,8 +598,11 @@ impl FrameHeader {
 
 /// Fragments a full-frame H.264 payload into MTU-sized datagrams.
 ///
-/// Each datagram = [FrameHeader (14 B)][payload_fragment].
-/// Empty payload → single datagram with no payload bytes.
+/// Each datagram = [FrameHeader (22 B)][payload_fragment]. Every fragment
+/// carries `wire_seq = NO_ACK`. A keyframe is described as an IDR; a delta
+/// frame as a P frame with an unknown reference. Use [`fragment_frame_ref`]
+/// to state the reference.
+/// Empty payload -> single datagram with no payload bytes.
 pub fn fragment_frame(
     frame_seq: u32,
     timestamp_us: u32,
@@ -549,12 +610,26 @@ pub fn fragment_frame(
     payload: &[u8],
     max_fragment_payload: usize,
 ) -> Vec<Vec<u8>> {
+    let info = if is_keyframe {
+        FrameRefInfo::IDR
+    } else {
+        FrameRefInfo::predicted(REF_FRAME_NONE)
+    };
+    fragment_frame_ref(frame_seq, timestamp_us, info, payload, max_fragment_payload)
+}
+
+/// As [`fragment_frame`], with the frame's reference description given.
+pub fn fragment_frame_ref(
+    frame_seq: u32,
+    timestamp_us: u32,
+    info: FrameRefInfo,
+    payload: &[u8],
+    max_fragment_payload: usize,
+) -> Vec<Vec<u8>> {
     assert!(
         max_fragment_payload > 0,
         "max_fragment_payload must be > 0; got 0 (datagram size too small to fit headers)"
     );
-
-    let flags: u8 = if is_keyframe { 0x01 } else { 0x00 };
 
     let chunks: Vec<&[u8]> = if payload.is_empty() {
         vec![&[]]
@@ -572,9 +647,11 @@ pub fn fragment_frame(
                 frame_seq,
                 frag_idx: idx as u16,
                 frag_total,
+                wire_seq: NO_ACK,
                 timestamp_us,
-                flags,
-                reserved: 0,
+                flags: info.flags,
+                slots: info.slots,
+                ref_frame_seq: info.ref_frame_seq,
             };
             let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + chunk.len());
             fh.encode(&mut buf);
@@ -633,14 +710,16 @@ pub fn build_frame_parity_datagram(
     frag_total: u16,
     parity_payload: &[u8],
 ) -> Vec<u8> {
-    let flags: u8 = if is_keyframe { 0x01 } else { 0x00 };
+    let flags: u8 = if is_keyframe { FRAME_FLAG_IDR } else { 0x00 };
     let fh = FrameHeader {
         frame_seq,
         frag_idx: frag_total, // signals parity
         frag_total,
+        wire_seq: NO_ACK,
         timestamp_us,
         flags,
-        reserved: 0,
+        slots: 0,
+        ref_frame_seq: REF_FRAME_NONE,
     };
     let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + parity_payload.len());
     fh.encode(&mut buf);
@@ -847,6 +926,77 @@ impl TileNackEnvelope {
 }
 
 // ---------------------------------------------------------------------------
+// FRAME_ACK (0x0A, client -> server datagram)
+//   [0]      discriminator:  u8  (= FRAME_ACK_ENVELOPE = 0x0A)
+//   [1..5]   newest_seq:     u32 LE  newest *handled* frame (decoded or refused)
+//   [5..13]  decoded_mask:   u64 LE  bit i = frame `newest_seq - i` was decoded
+//   [13..21] refused_mask:   u64 LE  bit i = frame `newest_seq - i` was refused
+// Little-endian by design (H.264 rework section 6.2). Cumulative: each ack
+// restates the last 64 frames, so a lost ack costs nothing.
+// ---------------------------------------------------------------------------
+
+/// Datagram discriminator of the H.264 frame acknowledgement.
+pub const FRAME_ACK_ENVELOPE: u8 = 0x0A;
+
+/// Encoded length of a [`FrameAck`].
+pub const FRAME_ACK_SIZE: usize = 1 + 4 + 8 + 8;
+
+/// Cumulative acknowledgement of H.264 frames, 64 frames wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameAck {
+    pub newest_seq: u32,
+    pub decoded_mask: u64,
+    pub refused_mask: u64,
+}
+
+impl FrameAck {
+    pub fn encode(&self, buf: &mut Vec<u8>) {
+        buf.push(FRAME_ACK_ENVELOPE);
+        buf.extend_from_slice(&self.newest_seq.to_le_bytes());
+        buf.extend_from_slice(&self.decoded_mask.to_le_bytes());
+        buf.extend_from_slice(&self.refused_mask.to_le_bytes());
+    }
+
+    /// Decodes exactly one ack. Trailing bytes are rejected: the message has
+    /// a fixed length, so extra bytes mean the sender is not speaking this
+    /// format.
+    pub fn decode(data: &[u8]) -> Result<Self, ProtocolError> {
+        if data.len() < FRAME_ACK_SIZE {
+            return Err(ProtocolError::TooShort {
+                expected: FRAME_ACK_SIZE,
+                got: data.len(),
+            });
+        }
+        if data[0] != FRAME_ACK_ENVELOPE {
+            return Err(ProtocolError::UnknownEnvelope(data[0]));
+        }
+        if data.len() != FRAME_ACK_SIZE {
+            return Err(ProtocolError::InvalidLength);
+        }
+        Ok(FrameAck {
+            newest_seq: u32::from_le_bytes(data[1..5].try_into().unwrap()),
+            decoded_mask: u64::from_le_bytes(data[5..13].try_into().unwrap()),
+            refused_mask: u64::from_le_bytes(data[13..21].try_into().unwrap()),
+        })
+    }
+
+    /// Whether frame `seq` is inside the window and marked decoded.
+    pub fn is_decoded(&self, seq: u32) -> bool {
+        self.bit(self.decoded_mask, seq)
+    }
+
+    /// Whether frame `seq` is inside the window and marked refused.
+    pub fn is_refused(&self, seq: u32) -> bool {
+        self.bit(self.refused_mask, seq)
+    }
+
+    fn bit(&self, mask: u64, seq: u32) -> bool {
+        let back = self.newest_seq.wrapping_sub(seq);
+        back < 64 && (mask >> back) & 1 == 1
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Inbound classification
 // ---------------------------------------------------------------------------
 
@@ -862,6 +1012,7 @@ pub enum InboundKind {
     /// direction can carry.
     TileParity,
     TileNack,      // TILE_NACK_ENVELOPE (0x05)
+    FrameAck,      // FRAME_ACK_ENVELOPE (0x0A)
     FrameFragment, // first byte 0x10..=0x7F
     TileFragment,  // first byte 0x80..=0xFF (TILE_DATAGRAM_FLAG bit set)
 }
@@ -892,6 +1043,7 @@ const INBOUND_DISCRIMINATORS: &[(&str, u8, InboundKind)] = &[
         InboundKind::AckBatch,
     ),
     ("tile nack", TILE_NACK_ENVELOPE, InboundKind::TileNack),
+    ("frame ack", FRAME_ACK_ENVELOPE, InboundKind::FrameAck),
 ];
 
 pub fn classify_inbound(data: &[u8]) -> InboundKind {
@@ -922,6 +1074,7 @@ pub fn classify_inbound(data: &[u8]) -> InboundKind {
         // and there is no inbound parity arm to conflict with.
         crate::ack::ACK_BATCH_MSG_TYPE => InboundKind::AckBatch,
         TILE_NACK_ENVELOPE => InboundKind::TileNack,
+        FRAME_ACK_ENVELOPE => InboundKind::FrameAck,
         b if b < 0x10 => InboundKind::Unknown,
         b if b < 0x80 => InboundKind::FrameFragment,
         _ => InboundKind::TileFragment,
@@ -1257,9 +1410,11 @@ mod tests {
             frame_seq: 0x0000_1234,
             frag_idx: 2,
             frag_total: 5,
+            wire_seq: 0xCAFE_F00D,
             timestamp_us: 987_654_321,
-            flags: 0x01,
-            reserved: 0,
+            flags: FRAME_FLAG_IDR | FRAME_FLAG_MARK_LT,
+            slots: 0b0110,
+            ref_frame_seq: 0x0000_1233,
         };
         let mut buf = Vec::new();
         original.encode(&mut buf);
@@ -1271,15 +1426,140 @@ mod tests {
     }
 
     #[test]
+    fn frame_header_v2_layout_is_byte_exact() {
+        let fh = FrameHeader {
+            frame_seq: 0x0102_0304,
+            frag_idx: 0x0506,
+            frag_total: 0x0708,
+            wire_seq: 0x090A_0B0C,
+            timestamp_us: 0x0D0E_0F10,
+            flags: 0x11,
+            slots: 0x12,
+            ref_frame_seq: 0x1314_1516,
+        };
+        let mut buf = Vec::new();
+        fh.encode(&mut buf);
+        assert_eq!(FRAME_HEADER_SIZE, 22);
+        assert_eq!(
+            buf,
+            [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0x11, 0x12, 0x13, 0x14,
+                0x15, 0x16
+            ]
+        );
+    }
+
+    #[test]
+    fn frame_header_decode_rejects_every_short_length() {
+        let mut buf = Vec::new();
+        FrameHeader::decode(&[0u8; FRAME_HEADER_SIZE])
+            .unwrap()
+            .encode(&mut buf);
+        for len in 0..FRAME_HEADER_SIZE {
+            assert_eq!(
+                FrameHeader::decode(&buf[..len]),
+                Err(ProtocolError::TooShort {
+                    expected: FRAME_HEADER_SIZE,
+                    got: len
+                })
+            );
+        }
+        // The old 14-byte header must not decode as a v2 header.
+        assert!(FrameHeader::decode(&[0u8; 14]).is_err());
+    }
+
+    #[test]
+    fn fragment_frame_stamps_no_ack_and_reference_info() {
+        let dgs = fragment_frame(5, 1, true, &[7u8; 300], 100);
+        assert_eq!(dgs.len(), 3);
+        for dg in &dgs {
+            let (fh, _) = decode_frame_datagram(dg).unwrap();
+            assert_eq!(fh.wire_seq, NO_ACK);
+            assert_eq!(fh.flags, FRAME_FLAG_IDR);
+            assert_eq!(fh.ref_frame_seq, REF_FRAME_NONE);
+        }
+        let dgs = fragment_frame_ref(6, 1, FrameRefInfo::predicted(5), &[7u8; 10], 100);
+        let (fh, _) = decode_frame_datagram(&dgs[0]).unwrap();
+        assert!(!fh.is_keyframe());
+        assert_eq!(fh.ref_frame_seq, 5);
+        assert_eq!(fh.slots, 0);
+    }
+
+    #[test]
+    fn frame_ack_roundtrip_and_layout() {
+        let ack = FrameAck {
+            newest_seq: 0x0102_0304,
+            decoded_mask: 0x1112_1314_1516_1718,
+            refused_mask: 0x2122_2324_2526_2728,
+        };
+        let mut buf = Vec::new();
+        ack.encode(&mut buf);
+        assert_eq!(buf.len(), FRAME_ACK_SIZE);
+        assert_eq!(buf[0], 0x0A);
+        assert_eq!(&buf[1..5], &[4, 3, 2, 1], "little-endian");
+        assert_eq!(&buf[5..7], &[0x18, 0x17]);
+        assert_eq!(FrameAck::decode(&buf), Ok(ack));
+    }
+
+    #[test]
+    fn frame_ack_hostile_input() {
+        let mut good = Vec::new();
+        FrameAck {
+            newest_seq: u32::MAX,
+            decoded_mask: u64::MAX,
+            refused_mask: u64::MAX,
+        }
+        .encode(&mut good);
+        // Every truncation is rejected, none panics.
+        for len in 0..FRAME_ACK_SIZE {
+            assert!(FrameAck::decode(&good[..len]).is_err(), "len {len}");
+        }
+        // Trailing bytes are rejected.
+        let mut long = good.clone();
+        long.push(0);
+        assert_eq!(FrameAck::decode(&long), Err(ProtocolError::InvalidLength));
+        // Wrong discriminator.
+        let mut wrong = good.clone();
+        wrong[0] = TILE_NACK_ENVELOPE;
+        assert_eq!(
+            FrameAck::decode(&wrong),
+            Err(ProtocolError::UnknownEnvelope(TILE_NACK_ENVELOPE))
+        );
+        // All-ones decodes (no value is invalid) and the window helpers do not
+        // overflow at the u32 boundary.
+        let ack = FrameAck::decode(&good).unwrap();
+        assert!(ack.is_decoded(u32::MAX));
+        assert!(ack.is_decoded(u32::MAX - 63));
+        assert!(!ack.is_decoded(u32::MAX - 64));
+        assert!(!ack.is_refused(0), "outside the window");
+        let wrap = FrameAck {
+            newest_seq: 3,
+            decoded_mask: 1 << 5,
+            refused_mask: 0,
+        };
+        assert!(wrap.is_decoded(3u32.wrapping_sub(5)), "window wraps u32");
+        assert!(!wrap.is_decoded(4), "future frames are not decoded");
+    }
+
+    #[test]
+    fn frame_ack_classifies_and_is_not_a_frame_fragment() {
+        assert_eq!(classify_inbound(&[0x0A]), InboundKind::FrameAck);
+        assert_ne!(FRAME_ACK_ENVELOPE, crate::ack::ACK_BATCH_MSG_TYPE);
+        assert_ne!(FRAME_ACK_ENVELOPE, TILE_NACK_ENVELOPE);
+    }
+
+    #[test]
     fn frame_header_discriminator() {
         // Frame datagram: bit 31 of frame_seq = 0
         let fh = FrameHeader {
             frame_seq: 42,
             frag_idx: 0,
             frag_total: 1,
+            wire_seq: NO_ACK,
             timestamp_us: 0,
             flags: 0,
-            reserved: 0,
+            slots: 0,
+            ref_frame_seq: REF_FRAME_NONE,
         };
         let mut frame_buf = Vec::new();
         fh.encode(&mut frame_buf);

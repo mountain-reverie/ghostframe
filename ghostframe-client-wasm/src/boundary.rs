@@ -47,6 +47,12 @@ pub enum WasmEvent {
         frame_seq: u32,
         timestamp_us: u32,
         is_keyframe: bool,
+        /// `frame_seq` this frame predicts from; `0xFFFF_FFFF` for an IDR.
+        ref_frame_seq: u32,
+        /// `FRAME_FLAG_*` bits of the v2 frame header.
+        flags: u8,
+        /// Long-term slot indices (bits 0-1 mark, bits 2-3 target).
+        slots: u8,
         #[serde(with = "serde_bytes")]
         payload: Vec<u8>,
     },
@@ -183,11 +189,17 @@ impl From<Event> for WasmEvent {
                 frame_seq,
                 timestamp_us,
                 is_keyframe,
+                ref_frame_seq,
+                flags,
+                slots,
                 payload,
             } => WasmEvent::NeedsH264 {
                 frame_seq,
                 timestamp_us,
                 is_keyframe,
+                ref_frame_seq,
+                flags,
+                slots,
                 payload,
             },
             Event::DecodeError {

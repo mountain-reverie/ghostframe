@@ -335,6 +335,9 @@ async function main() {
         frame_seq: number;
         timestamp_us: number;
         is_keyframe: boolean;
+        ref_frame_seq: number;
+        flags: number;
+        slots: number;
         payload: Uint8Array;
       }
     | { kind: 'DecodeError'; codec: number; tile_x: number; tile_y: number; code: number }

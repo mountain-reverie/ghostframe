@@ -146,6 +146,9 @@ fn a_decoded_frame_lands_in_the_framebuffer() {
                     frame_seq: i as u32,
                     timestamp_us: i as u32 * 16_667,
                     is_keyframe: i == 0,
+                    ref_frame_seq: u32::MAX,
+                    flags: 0,
+                    slots: 0,
                     payload: au.clone(),
                 },
             )
@@ -251,6 +254,9 @@ fn run_decode_and_publish_timing(paced: bool) {
                     frame_seq: i as u32,
                     timestamp_us: i as u32 * 16_667,
                     is_keyframe: i == 0,
+                    ref_frame_seq: u32::MAX,
+                    flags: 0,
+                    slots: 0,
                     payload: au.clone(),
                 },
             )
@@ -552,6 +558,9 @@ fn drive_clip(renderer: &mut Renderer, ctx: &WgpuContext, clip: &[Vec<u8>], star
                     frame_seq: seq,
                     timestamp_us: seq.wrapping_mul(16_667),
                     is_keyframe: i == 0,
+                    ref_frame_seq: u32::MAX,
+                    flags: 0,
+                    slots: 0,
                     payload: au.clone(),
                 },
             )

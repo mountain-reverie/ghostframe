@@ -21,12 +21,13 @@ use ghostframe_protocol::codec::pal_rle::palette_fingerprint_bgra;
 use ghostframe_protocol::eviction::{EvictionReason, EVICTION_SENTINEL_X, EVICTION_SENTINEL_Y};
 use ghostframe_protocol::feedback_stream::{
     DISPLAY_INFO_MSG_TYPE, DISPLAY_MODE_MSG_TYPE, FEEDBACK_MSG_TYPE, HELLO_CAPS_RESERVED_MASK,
-    HELLO_CAP_INDICES_RAW, HELLO_CAP_SUPPORTS_H264,
+    HELLO_CAP_H264_ACKED_REF, HELLO_CAP_INDICES_RAW, HELLO_CAP_SUPPORTS_H264,
+    RESET_REQUEST_MSG_TYPE,
 };
 use ghostframe_protocol::protocol::{
-    Codec, DATAGRAM_HEADER_SIZE, FRAME_DIMENSIONS_SENTINEL_X, FRAME_DIMENSIONS_SENTINEL_Y,
-    FRAME_HEADER_SIZE, TILE_DATAGRAM_FLAG, TILE_HEADER_SIZE, TILE_NACK_ENVELOPE,
-    TILE_PARITY_ENVELOPE,
+    Codec, DATAGRAM_HEADER_SIZE, FRAME_ACK_ENVELOPE, FRAME_DIMENSIONS_SENTINEL_X,
+    FRAME_DIMENSIONS_SENTINEL_Y, FRAME_HEADER_SIZE, TILE_DATAGRAM_FLAG, TILE_HEADER_SIZE,
+    TILE_NACK_ENVELOPE, TILE_PARITY_ENVELOPE,
 };
 use ghostframe_protocol::tile::{TILE_BYTES, TILE_SIZE};
 use wasm_bindgen::prelude::*;
@@ -190,6 +191,24 @@ export_const!(
     hello_cap_supports_h264,
     u8,
     HELLO_CAP_SUPPORTS_H264
+);
+export_const!(
+    "helloCapH264AckedRef",
+    hello_cap_h264_acked_ref,
+    u8,
+    HELLO_CAP_H264_ACKED_REF
+);
+export_const!(
+    "resetRequestMsgType",
+    reset_request_msg_type,
+    u8,
+    RESET_REQUEST_MSG_TYPE
+);
+export_const!(
+    "frameAckEnvelope",
+    frame_ack_envelope,
+    u8,
+    FRAME_ACK_ENVELOPE
 );
 export_const!(
     "helloCapsReservedMask",

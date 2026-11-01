@@ -35,6 +35,9 @@ export interface ProtocolWasm {
   displayModeMsgType(): number;
   helloCapIndicesRaw(): number;
   helloCapSupportsH264(): number;
+  helloCapH264AckedRef(): number;
+  resetRequestMsgType(): number;
+  frameAckEnvelope(): number;
   helloCapsReservedMask(): number;
   codecs(): unknown;
   paletteFingerprint(bgra: Uint8Array): number;
@@ -73,6 +76,9 @@ export interface ProtocolConstants {
   readonly displayModeMsgType: number;
   readonly helloCapIndicesRaw: number;
   readonly helloCapSupportsH264: number;
+  readonly helloCapH264AckedRef: number;
+  readonly resetRequestMsgType: number;
+  readonly frameAckEnvelope: number;
   readonly helloCapsReservedMask: number;
   readonly codec: Codecs;
   /** `ghostframe_protocol::codec::pal_rle::palette_fingerprint_bgra`. */
@@ -109,6 +115,9 @@ export function initProtocol(w: ProtocolWasm): ProtocolConstants {
     displayModeMsgType: w.displayModeMsgType(),
     helloCapIndicesRaw: w.helloCapIndicesRaw(),
     helloCapSupportsH264: w.helloCapSupportsH264(),
+    helloCapH264AckedRef: w.helloCapH264AckedRef(),
+    resetRequestMsgType: w.resetRequestMsgType(),
+    frameAckEnvelope: w.frameAckEnvelope(),
     helloCapsReservedMask: w.helloCapsReservedMask(),
     codec: Object.freeze(w.codecs() as Codecs),
     paletteFingerprint: (bgra: Uint8Array) => w.paletteFingerprint(bgra),

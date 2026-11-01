@@ -498,6 +498,28 @@ impl IoBridge {
         self.reliable_emitter.on_nack(&entries, now_std());
     }
 
+    /// Handle an H.264 frame acknowledgement (datagram 0x0A). Phase A only
+    /// counts it: nothing consumes frame acks until the H.264 ledger lands, so
+    /// a malformed one is dropped and an accepted one is logged at debug.
+    fn dispatch_frame_ack_datagram(&mut self, dg: &[u8]) {
+        match crate::transport::protocol::FrameAck::decode(dg) {
+            Ok(ack) => {
+                self.frame_acks_received = self.frame_acks_received.saturating_add(1);
+                tracing::debug!(
+                    target: LOG_TARGET,
+                    newest_seq = ack.newest_seq,
+                    decoded_mask = format_args!("{:#018x}", ack.decoded_mask),
+                    refused_mask = format_args!("{:#018x}", ack.refused_mask),
+                    "frame ack received (ignored until the H.264 ledger lands)"
+                );
+            }
+            Err(e) => {
+                self.frame_acks_malformed = self.frame_acks_malformed.saturating_add(1);
+                tracing::debug!(target: LOG_TARGET, error = %e, "malformed frame ack; dropped");
+            }
+        }
+    }
+
     /// Route one inbound (non-ping) datagram from `from`.
     ///
     /// Only the HELLO'd session's datagrams are honoured: an ACK or NACK
@@ -531,6 +553,7 @@ impl IoBridge {
         match crate::transport::protocol::classify_inbound(dg) {
             K::TileNack => self.dispatch_tile_nack_datagram(dg),
             K::AckBatch => self.dispatch_ack_datagram(dg),
+            K::FrameAck => self.dispatch_frame_ack_datagram(dg),
             // Superseded ACK revisions still reach the ACK decoder, which
             // rejects them by design -- that rejection is the intended
             // handling, not a fallthrough.

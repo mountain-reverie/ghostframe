@@ -321,8 +321,9 @@ fn datagram_counts_ignore_non_protocol_traffic() {
 
     core.handle_datagram(b"", 0);
     core.handle_datagram(b"pong", 0);
-    // Long enough to pass the ping/pong guard, too short to carry a header.
-    core.handle_datagram(&[0u8; 22], 0);
+    // Long enough to pass the ping/pong guard, one byte short of a frame
+    // header (22): neither a tile nor a frame datagram.
+    core.handle_datagram(&[0u8; 21], 0);
     assert_eq!(
         core.datagram_counts(),
         (0, 0),
