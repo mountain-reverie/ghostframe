@@ -173,6 +173,9 @@ impl IoBridge {
         self.frame_mode = crate::tile::FrameMode::H264;
         self.last_h264_frame_seq = None;
         self.last_reset_request_idr_at = None;
+        // The previous session's H.264 frames, hold, probe cache and queued
+        // fragments are not the new client's.
+        self.reset_h264_session();
         // Re-prime the frame-dimensions retransmit counter so
         // the new client receives the sentinel on its first
         // frames even if the screen has been at a stable
@@ -199,7 +202,7 @@ impl IoBridge {
         // natural keyframe (~10 frames later at GOP=11). The
         // first-time-only escape (lazy `FullFrameEncoder::new`
         // with pts=0 → IDR) only covers cold start.
-        self.backend_apply(Control::RequestKeyframe);
+        self.request_h264_idr(IdrCause::Session, std::time::Instant::now());
         // info, not debug: this is the line that says a reconnecting client is
         // getting a clean slate rather than resuming, and at debug it was
         // invisible in exactly the production logs where that matters.
@@ -297,6 +300,10 @@ impl IoBridge {
         if incumbent != Some(from) {
             if self.has_seen_prior_session {
                 self.fire_session_reset(from);
+            } else {
+                // The very first session: a fresh encoder starts with an IDR
+                // on its own, so there is nothing to ask for, only to name.
+                self.expect_h264_idr(IdrCause::Session);
             }
             self.has_seen_prior_session = true;
         }
@@ -384,6 +391,9 @@ impl IoBridge {
         if self.last_hello_from == Some(handle) || self.departures_handle == Some(handle) {
             self.instr.reset_session_scope(0);
             self.release_departures();
+            // The H.264 frame tracker, IDR hold, rate limit and queued
+            // fragments are session state too, and the handle may be reused.
+            self.reset_h264_session();
         }
         self.wt_sessions.remove(&handle);
         self.feedback_recv_bufs.remove(&handle);

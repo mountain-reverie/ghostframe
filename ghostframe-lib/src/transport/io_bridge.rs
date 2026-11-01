@@ -98,6 +98,11 @@ pub(crate) use pacing::SCHEDULER_TICK_INTERVAL_US;
 #[path = "io_bridge/emit.rs"]
 mod emit;
 
+#[path = "io_bridge/h264_tx.rs"]
+mod h264_tx;
+use h264_tx::{H264Gate, H264Tx};
+pub use h264_tx::{H264Stats, IdrCause};
+
 #[path = "io_bridge/frame_backend.rs"]
 mod frame_backend;
 pub use frame_backend::{
@@ -735,6 +740,13 @@ pub struct IoBridge {
     /// its reference. Cleared when the session resets (the next frame is then
     /// an IDR).
     last_h264_frame_seq: Option<u32>,
+    /// H.264 as a member of the transport: frame tracker, IDR hold and
+    /// request policy, counters. See `h264_tx`.
+    h264: H264Tx,
+    /// Shared cell the browserless harness reads the final H.264 counters
+    /// from; same read-after-abort pattern as `emitter_stats_publish`.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    h264_stats_publish: std::sync::Arc<std::sync::Mutex<H264Stats>>,
     /// When the last client-requested IDR (reset request 0x09) was honoured;
     /// requests inside `RESET_REQUEST_MIN_INTERVAL` of it are dropped.
     last_reset_request_idr_at: Option<std::time::Instant>,
@@ -1388,6 +1400,9 @@ impl IoBridge {
             frame_acks_received: 0,
             frame_acks_malformed: 0,
             last_h264_frame_seq: None,
+            h264: H264Tx::default(),
+            #[cfg(any(test, feature = "browserless-harness"))]
+            h264_stats_publish: std::sync::Arc::new(std::sync::Mutex::new(H264Stats::default())),
             last_reset_request_idr_at: None,
             reset_requests_received: 0,
             reset_requests_honoured: 0,
@@ -2078,7 +2093,7 @@ impl IoBridge {
                     frame_seq = msg.frame_seq,
                     "client reports H.264 decoder failure; requesting an IDR"
                 );
-                self.backend_apply(Control::RequestKeyframe);
+                self.request_h264_idr(IdrCause::ClientReset, now);
             }
             ResetReason::Resolution | ResetReason::NoDecoder | ResetReason::GateReset => {
                 tracing::debug!(
@@ -2554,6 +2569,7 @@ impl IoBridge {
             let mut published = self.reliable_emitter.stats;
             published.cache_entries = self.reliable_emitter.pending_cache_entries();
             *self.emitter_stats_publish.lock().unwrap() = published;
+            *self.h264_stats_publish.lock().unwrap() = self.h264.stats;
             *self.send_errs_publish.lock().unwrap() = self.datagram_send_errs;
             *self.latency_stats_publish.lock().unwrap() =
                 (self.critical_latency_stats, self.refinement_latency_stats);

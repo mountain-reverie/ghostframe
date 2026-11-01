@@ -36,6 +36,9 @@ pub(crate) struct Outcome {
     pub lost: Vec<(u32, Transmission)>,
     /// Retransmissions queued on the emitter.
     pub retx_queued: u64,
+    /// Outstanding H.264 fragments the probe found with no content to send
+    /// (trimmed or superseded): forgotten with no verdict, so not in `lost`.
+    pub forgotten: Vec<u32>,
 }
 
 /// Declare lost what the acknowledgements so far put out of contention (packet
@@ -107,6 +110,21 @@ pub(crate) fn probe(
             match emitter.request_retransmit(tx.content, ws, RetxCause::Probe) {
                 RetxRequest::Queued => {
                     out.retx_queued += 1;
+                }
+                // An H.264 fragment whose cache entry is gone was trimmed by the
+                // cache bound or superseded by an IDR: it was not necessarily
+                // lost, and no one will send it again. Forget it; a verdict
+                // would report a loss to goog_cc that nothing observed.
+                RetxRequest::ContentGone
+                    if matches!(
+                        tx.content,
+                        crate::transport::reliable_emitter::Content::H264Frag { .. }
+                    ) =>
+                {
+                    if ledger.forget_outstanding(ws).is_some() {
+                        out.forgotten.push(ws);
+                        removed = true;
+                    }
                 }
                 RetxRequest::ContentGone => {
                     if let Some(tx) = ledger.declare_lost_by_pto(ws) {
@@ -567,11 +585,12 @@ mod h264_tests {
         );
     }
 
-    /// The same stall over fragments the emitter holds no entry for (the case
-    /// before this change): every one is declared lost. The test above is only
-    /// load-bearing if this really happens, so it is checked here.
+    /// Fragments the emitter holds no entry for (trimmed, or superseded) are
+    /// forgotten by the probe, not declared lost: no verdict reaches the
+    /// estimators for datagrams nobody observed. For tile content that is gone
+    /// the old rule stands (the control: a tile pass is declared lost).
     #[test]
-    fn without_a_cache_entry_the_probe_declares_the_fragments_lost() {
+    fn a_fragment_whose_content_is_gone_is_forgotten_not_declared_lost() {
         let t0 = Instant::now();
         let (mut e, mut l, sent) = sent_frames(5, 8, t0);
         e.h264.clear();
@@ -586,12 +605,11 @@ mod h264_tests {
         e.on_departed(0, t0);
         let due = e.pto_deadline().expect("armed");
         let out = probe(&mut l, &mut e, due).expect("due");
-        assert!(
-            out.lost.len() > 8,
-            "premise: with no cache entry the probe mass-declares ({} of {})",
-            out.lost.len(),
-            sent.len()
-        );
+        assert!(out.lost.is_empty(), "no verdict: {:?}", out.lost.len());
+        assert_eq!(out.forgotten.len(), sent.len());
+        assert_eq!(l.len(), 0, "and they left the ledger");
+        assert_eq!(l.stats().forgotten_without_verdict, sent.len() as u64);
+        assert_eq!(l.stats().lost_pto, 0);
     }
 
     fn pass(i: u32) -> Bytes {

@@ -176,6 +176,12 @@ impl IoBridge {
         for e in self.reliable_emitter.take_transmissions() {
             self.offered_wire_bytes += e.wire_bytes as f64;
             recorded = true;
+            if matches!(
+                e.content,
+                crate::transport::reliable_emitter::Content::H264Frag { .. }
+            ) {
+                self.h264.stats.tx_recorded += 1;
+            }
             self.transmission_ledger.record(
                 e.wire_seq,
                 now,
@@ -311,9 +317,9 @@ impl IoBridge {
             }
             self.instr.admission.datagrams_admitted += 1;
         } else {
-            // H.264 frames and control datagrams have no queue to hold them
-            // back, so they are billed to the bucket after the fact and the
-            // classes that can wait pay for them.
+            // Control datagrams have no queue to hold them back, so they are
+            // billed to the bucket after the fact and the classes that can
+            // wait pay for them. (H.264 fragments are admitted like tiles.)
             self.admission.charge(wire);
             self.instr.admission.soft_charged_bytes += wire as u64;
             if let Some(g) = self.gate {

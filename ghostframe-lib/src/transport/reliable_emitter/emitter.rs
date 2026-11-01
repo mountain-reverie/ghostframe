@@ -707,7 +707,19 @@ impl ReliableTileEmitter {
         wire_seqs
     }
 
+    /// A frame was found undecodable: forget the cached fragments of it and of
+    /// every later frame (they chain from it), so the probe timer and the
+    /// bytes-in-flight figure stop counting bytes nothing will deliver.
+    pub fn drop_h264_from(&mut self, frame_seq: u32) {
+        self.stats.h264_cache_dropped += self.h264.drop_from(frame_seq) as u64;
+    }
+
     /// Keep the probe cache to its newest [`H264_CACHE_FRAMES`] frames.
+    ///
+    /// The bound is a fixed 64 frames for now. It should follow the design's
+    /// in-flight bound, `max(32, ceil(2 * srtt / frame_interval) + 8)` (design
+    /// section 5), once the frame interval is known here: on a long path a
+    /// fixed bound trims fragments that are still legitimately in flight.
     pub fn trim_h264_cache(&mut self) {
         self.stats.h264_cache_dropped += self.h264.trim_to(H264_CACHE_FRAMES) as u64;
     }

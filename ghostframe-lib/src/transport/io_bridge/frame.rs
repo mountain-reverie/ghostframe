@@ -860,7 +860,7 @@ impl IoBridge {
     /// Queue an `InvalidateBaseline` unless one is already waiting: a reset's
     /// 20-frame cushion must not be shortened to 1 by a discard queued after it
     /// (the processor keeps the last value it is given).
-    fn ensure_baseline_invalidated(&mut self) {
+    pub(super) fn ensure_baseline_invalidated(&mut self) {
         if !self
             .pending_controls
             .iter()
@@ -1094,14 +1094,7 @@ impl IoBridge {
         match new_mode {
             FrameMode::H264 => {
                 let action = h264_finish_action(dirty_xy.is_empty(), prev_mode);
-                if matches!(action, FinishAction::Discard) {
-                    // Nothing will be committed for this frame, so its
-                    // dimensions go out now.
-                    self.emit_frame_dimensions(seq, meta.timestamp_us, meta.width, meta.height);
-                    self.send_finish(inflight, action, InFlightStage::FinishingDiscard);
-                } else {
-                    self.send_finish(inflight, action, InFlightStage::FinishingH264 { trace });
-                }
+                self.finish_h264_arm(inflight, action, trace);
             }
             FrameMode::TileCodec => {
                 let max_frag = max_fragment_payload(max_dg_size);
@@ -1223,6 +1216,56 @@ impl IoBridge {
             .collect()
     }
 
+    /// The H.264 arm of step 2: tell the worker what to finish the frame with.
+    /// An empty frame is discarded. Otherwise the encoder gate decides (see
+    /// `h264_frame_gate`): a frame it turns away is dropped, not queued, and
+    /// the next one is made whole.
+    pub(super) fn finish_h264_arm(
+        &mut self,
+        inflight: InFlight,
+        action: FinishAction,
+        trace: StageTrace,
+    ) {
+        let (seq, m) = (inflight.seq, inflight.meta);
+        if matches!(action, FinishAction::Discard) {
+            // Nothing will be committed for this frame, so its dimensions go
+            // out now.
+            self.emit_frame_dimensions(seq, m.timestamp_us, m.width, m.height);
+            self.send_finish(inflight, action, InFlightStage::FinishingDiscard);
+            return;
+        }
+        // Coming back from the tile codec the client has no H.264 anchor: this
+        // frame is an IDR whether or not it is encoded now (a skipped one must
+        // not lose the demand, since the next frame sees H.264 as its previous
+        // mode). Naming it as pending also lets it past the gate.
+        if matches!(
+            action,
+            FinishAction::H264 {
+                force_keyframe: true
+            }
+        ) {
+            self.name_reentry_idr();
+        }
+        match self.h264_frame_gate(now_std()) {
+            H264Gate::Encode => {
+                self.send_finish(inflight, action, InFlightStage::FinishingH264 { trace });
+            }
+            H264Gate::SkipHold | H264Gate::SkipBackpressure => {
+                // The capture is dropped, not queued: every frame is a whole
+                // screen, so the next one carries what this one would have.
+                // Make that next frame fully dirty, or a screen that stops
+                // changing right now would never be sent.
+                self.ensure_baseline_invalidated();
+                self.emit_frame_dimensions(seq, m.timestamp_us, m.width, m.height);
+                self.send_finish(
+                    inflight,
+                    FinishAction::Discard,
+                    InFlightStage::FinishingDiscard,
+                );
+            }
+        }
+    }
+
     /// Step 3 for an H.264 frame: fragment and send what the worker encoded.
     pub(super) fn on_h264_done(
         &mut self,
@@ -1234,7 +1277,7 @@ impl IoBridge {
         // chain advanced past this frame, so the next one must be an IDR or the
         // client decodes garbage until the next GOP.
         let Some(max_dg_size) = self.commit_max_datagram_size(&inflight) else {
-            self.backend_apply(Control::RequestKeyframe);
+            self.request_h264_idr(IdrCause::Session, now_std());
             return;
         };
         let InFlightStage::FinishingH264 { trace } = inflight.stage else {
@@ -1651,7 +1694,14 @@ impl IoBridge {
     }
 
     /// H.264 arm: fragment the frame the worker encoded from the GPU's NV12
-    /// output, send it with FEC parity and keep fragments for NACK.
+    /// output and hand every fragment to the reliable emitter, which gives it a
+    /// `wire_seq` and a ledger record, caches it for the loss path and the
+    /// probe, and queues it behind the admission gate (the XOR parity is
+    /// queued untracked, billed as parity).
+    ///
+    /// An IDR first supersedes every older frame: their cached and queued
+    /// fragments are dropped, and P frames are held until its own fragments
+    /// are all acknowledged (see `h264_tx`).
     pub(super) fn send_h264_frame(
         &mut self,
         encoded: H264Out,
@@ -1659,6 +1709,7 @@ impl IoBridge {
         seq: u32,
         max_dg_size: usize,
     ) {
+        let now = now_std();
         // Fragment and send. `fragment_frame` chunks the payload at the
         // per-fragment payload limit (datagram size minus the frame
         // header), not the raw datagram size — otherwise the on-wire
@@ -1681,39 +1732,95 @@ impl IoBridge {
             max_fec_frame_fragment_payload(max_dg_size),
         );
 
+        let is_idr = encoded.is_keyframe;
+        let cause = self.note_h264_encoded(is_idr, (frame.width, frame.height));
+        if is_idr {
+            self.supersede_h264_before(seq, now);
+            self.h264.last_idr_seq = Some(seq);
+            if cause == Some(IdrCause::GopPeriodic) {
+                // The encoder's own periodic IDR: the client already has a
+                // picture, P frames after it only chain from it, and a lost
+                // one becomes a loss IDR through its verdicts anyway. No hold
+                // (and an earlier hold is over: its IDR was just superseded).
+                self.end_h264_hold(now);
+            } else {
+                self.begin_h264_hold(seq, now);
+            }
+        }
+        self.h264
+            .tracker
+            .on_frame_sent(seq, is_idr, datagrams.len() as u16);
+        self.h264.stats.frames_sent += 1;
+
         self.cumulative_datagrams_emitted.h264 = self
             .cumulative_datagrams_emitted
             .h264
             .saturating_add(datagrams.len() as u64);
 
-        for dg in &datagrams {
-            self.send_to_all_sessions(dg, WireClass::H264);
+        // An IDR is a burst, the best probe material there is: claim a pending
+        // probe window for it, as a tile frame does, and tag what it sends.
+        // A P frame is a few datagrams and would only starve the window.
+        if is_idr {
+            self.open_probe_window_for_burst(now);
         }
 
-        // FEC parity
-        let mut parity_bytes = 0u64;
-        let fec_k = fec_group_size(encoded.is_keyframe);
+        // Parity is built from the payloads before the fragments move.
+        let fec_k = fec_group_size(is_idr);
+        let mut parity_datagrams: Vec<Vec<u8>> = Vec::new();
         if datagrams.len() > 1 {
             let source_payloads: Vec<&[u8]> = datagrams
                 .iter()
                 .map(|dg| &dg[FRAME_HEADER_SIZE..])
                 .collect();
-            let parities = fec::generate_parity(&source_payloads, fec_k);
-            for (_group_start, parity_payload) in &parities {
-                let parity_dg = build_frame_parity_datagram(
+            for (_group_start, parity_payload) in &fec::generate_parity(&source_payloads, fec_k) {
+                parity_datagrams.push(build_frame_parity_datagram(
                     seq,
                     frame.timestamp_us,
-                    encoded.is_keyframe,
+                    is_idr,
                     datagrams.len() as u16,
                     parity_payload,
-                );
-                parity_bytes += parity_dg.len() as u64;
-                self.send_to_all_sessions(&parity_dg, WireClass::Parity);
+                ));
             }
         }
 
-        // M3.5 bench telemetry: H264 frame completed — all fragments sent.
         let h264_wire_bytes: u32 = datagrams.iter().map(|dg| dg.len() as u32).sum();
+        let queued_at = now;
+        for (i, dg) in datagrams.into_iter().enumerate() {
+            let probe = self.active_probe.as_mut().filter(|_| is_idr).map(|p| {
+                let tag = crate::transport::reliable_emitter::cache::ProbeTag {
+                    id: p.id,
+                    min_probes: p.min_probes,
+                    min_bytes: p.min_bytes,
+                    bytes_sent_before: p.bytes_sent,
+                };
+                p.bytes_sent = p.bytes_sent.saturating_add(dg.len() as i64);
+                p.packets_sent = p.packets_sent.saturating_add(1);
+                tag
+            });
+            self.reliable_emitter.submit_h264_fragment(
+                crate::transport::reliable_emitter::h264::H264Submit {
+                    frame_seq: seq,
+                    frag_idx: i as u16,
+                    is_idr,
+                    bytes: bytes::Bytes::from(dg),
+                    queued_at,
+                    probe,
+                },
+                now,
+            );
+        }
+        let mut parity_bytes = 0u64;
+        for parity_dg in parity_datagrams {
+            parity_bytes += parity_dg.len() as u64;
+            self.reliable_emitter
+                .queue_untracked(bytes::Bytes::from(parity_dg), WireClass::Parity);
+        }
+        self.reliable_emitter.trim_h264_cache();
+        // Through the admission gate: what the bucket and quinn's FIFO depth
+        // allow goes now, the rest waits in the queue for a later pass.
+        self.pump_admission();
+
+        // M3.5 bench telemetry: H264 frame completed — all fragments handed on.
         self.bytes_emitted_h264 = self
             .bytes_emitted_h264
             .saturating_add(u64::from(h264_wire_bytes) + parity_bytes);
@@ -2502,6 +2609,53 @@ impl IoBridge {
                 reset_requests_rate_limited = self.reset_requests_rate_limited,
                 "h264 client feedback (frame acks and reset requests; cumulative)"
             );
+
+            // The H.264 transport (Phase A): IDRs by cause, how the loss path
+            // treated H.264 fragments, what the encoder gate held back, and
+            // the ledger accounting (`tx_recorded` = acked live + judged lost
+            // + forgotten + still outstanding). A cumulative line at the
+            // `cumulative emit` cadence.
+            {
+                let h = &self.h264.stats;
+                let em = &self.reliable_emitter.stats;
+                tracing::info!(
+                    target: "ghostframe::h264",
+                    frame_seq = seq,
+                    frames_sent = h.frames_sent,
+                    frames_idr = h.frames_idr,
+                    frames_acked = h.frames_acked,
+                    frames_suspect = h.frames_suspect,
+                    idr_session = h.idr_by_cause[IdrCause::Session.index()],
+                    idr_loss = h.idr_by_cause[IdrCause::Loss.index()],
+                    idr_client_reset = h.idr_by_cause[IdrCause::ClientReset.index()],
+                    idr_resolution = h.idr_by_cause[IdrCause::Resolution.index()],
+                    idr_reentry = h.idr_by_cause[IdrCause::Reentry.index()],
+                    idr_hold_timeout = h.idr_by_cause[IdrCause::HoldTimeout.index()],
+                    idr_gop_periodic = h.idr_by_cause[IdrCause::GopPeriodic.index()],
+                    loss_idr_rate_limited = h.loss_idr_rate_limited,
+                    idr_requests_coalesced = h.idr_requests_coalesced,
+                    verdicts_idr_frag = h.verdicts_idr_frag,
+                    verdicts_p_frag = h.verdicts_p_frag,
+                    verdicts_already_acked = h.verdicts_already_acked,
+                    idr_fragments_resent = em.h264_idr_resends,
+                    probe_fragments_resent = em.h264_probe_resends,
+                    p_hold_ms = h.p_hold_ms,
+                    p_holds = h.p_holds,
+                    hold_timeouts = h.hold_timeouts,
+                    frames_skipped_hold = h.frames_skipped_hold,
+                    frames_skipped_backpressure = h.frames_skipped_backpressure,
+                    queue_purged = h.queue_purged,
+                    queued_bytes = self.reliable_emitter.queued_h264_bytes(),
+                    cache_fragments = self.reliable_emitter.h264.len(),
+                    tx_recorded = h.tx_recorded,
+                    tx_acked_live = h.tx_acked_live,
+                    tx_judged_lost = h.tx_judged_lost,
+                    tx_forgotten = h.tx_forgotten,
+                    tx_acked_late = h.tx_acked_late,
+                    bwe_samples_seen = self.bwe.snapshot().samples_seen,
+                    "h264 stats (IDR causes, verdicts, hold, frame skips, ledger accounting; cumulative)"
+                );
+            }
 
             // The loss path (D1 F4 part 2), a separate event at the same
             // cadence: the `cumulative emit` line above is at the tracing
