@@ -283,3 +283,13 @@ fn focus_lost_disarms_a_struck_prefix() {
     let action = route_window_event(&key(D, true), &mut chord, &placement);
     assert_ne!(action, LoopAction::Quit);
 }
+
+#[test]
+fn an_exposed_window_asks_for_a_redraw() {
+    let mut chord = Chord::new(Prefix::CtrlAltB);
+    let placement = Placement::centre(1920, 1080, 1920, 1080);
+    assert_eq!(
+        route_window_event(&WindowEvent::Exposed, &mut chord, &placement),
+        LoopAction::Redraw
+    );
+}

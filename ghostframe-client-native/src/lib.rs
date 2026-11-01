@@ -31,7 +31,8 @@ use std::time::Instant;
 
 pub use ghostframe_client_core::ClientDisplay;
 use ghostframe_client_core::TileDelivery;
-pub use ghostframe_client_gpu::ring::PublishedFrame;
+pub use ghostframe_client_gpu::coalesce::Rect;
+pub use ghostframe_client_gpu::ring::{PublishedFrame, SincePrevious};
 use ghostframe_client_net::{ClientNet, ClientNetConfig};
 use ghostframe_tsnet::{GhostbridgeConfig, GhostbridgeHandle};
 
@@ -574,6 +575,15 @@ impl Client {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
+    }
+
+    /// Ask for the whole frame to be published again, e.g. after the window
+    /// lost its contents. Always queued; the render thread ignores it until the
+    /// first frame exists.
+    pub fn request_redraw(&self) {
+        if let Some(tx) = &self.render_tx {
+            let _ = tx.send(RenderMsg::Redraw);
+        }
     }
 
     /// Return a previously acquired frame's buffer to the render thread's

@@ -99,6 +99,10 @@ pub enum WindowEvent {
         height: u32,
     },
     CloseRequested,
+    /// The window was exposed, so its contents may have been lost. The loop
+    /// asks the client to republish the whole frame, since a static remote
+    /// screen would otherwise never repaint it.
+    Exposed,
     /// The window stopped receiving keyboard input. Keys held at that
     /// moment are released somewhere else, so their releases never arrive
     /// here; the loop releases them on the remote itself.

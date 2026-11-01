@@ -10,7 +10,8 @@
 use crate::dirty::DirtyGrid;
 use std::collections::HashMap;
 
-/// A rectangle in TILE units. Convert to pixels with [`Rect::to_pixels`].
+/// A rectangle. [`coalesce`] produces TILE units; convert to pixels with
+/// [`Rect::to_pixels`]. `PublishedFrame` damage is already in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     pub x: u32,

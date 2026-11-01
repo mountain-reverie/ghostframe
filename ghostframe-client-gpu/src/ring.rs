@@ -47,6 +47,19 @@ pub struct ExportBuffer {
     pub in_flight: bool,
 }
 
+/// Damage between a published frame and the one published just before it.
+///
+/// Only meaningful to a consumer that actually showed `frame_id`: if frames
+/// were published but never presented, the damage of those is not in here,
+/// and the consumer must treat everything as changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SincePrevious {
+    /// `frame_id` of the previously published frame.
+    pub frame_id: u32,
+    /// Changed area in PIXEL coordinates, possibly empty.
+    pub damage: Vec<Rect>,
+}
+
 /// What [`ExportRing::publish`] hands back.
 ///
 /// Carries a snapshot of the published buffer's dmabuf handle alongside the
@@ -65,7 +78,17 @@ pub struct PublishedFrame {
     pub frame_id: u32,
     pub buffer_id: u32,
     /// Damage in PIXEL coordinates, ready for the host.
+    ///
+    /// Relative to this *buffer's* previous contents, which is what a
+    /// consumer that copies the whole buffer needs. A consumer that keeps
+    /// a long-lived surface and updates it from successive frames wants
+    /// [`PublishedFrame::since_previous`] instead.
     pub damage: Vec<Rect>,
+    /// What changed since the previously published frame (not the previous
+    /// frame *this buffer* held), for a consumer whose on-screen content is
+    /// that previous frame. `None` when that cannot be said: the first
+    /// frame, the first after a resize, or damage history already evicted.
+    pub since_previous: Option<SincePrevious>,
     pub width: u32,
     pub height: u32,
     pub modifier: u64,
@@ -82,6 +105,9 @@ pub struct ExportRing {
     buffers: Vec<ExportBuffer>,
     history: DirtyHistory,
     next_frame_id: u32,
+    /// `(frame_id, generation)` of the last successful publish. `None` at
+    /// start and after a resize, which drops the history it indexes.
+    last_publish: Option<(u32, u64)>,
     /// Maps an outstanding `frame_id` to the buffer it was published into,
     /// so `release` can find it without a linear scan tied to buffer state
     /// (and so an unknown `frame_id` is trivially "not found" rather than
@@ -138,6 +164,7 @@ impl ExportRing {
             buffers,
             history: DirtyHistory::new(cols, rows, HISTORY_CAPACITY),
             next_frame_id: 0,
+            last_publish: None,
             in_flight: HashMap::new(),
             graveyard: HashMap::new(),
             width,
@@ -215,6 +242,21 @@ impl ExportRing {
             .map(|r| r.to_pixels(fb.width, fb.height))
             .collect();
 
+        // Against the previous publish rather than this buffer's watermark:
+        // every buffer is complete, so what differs from the previous frame
+        // is exactly the union of generations sealed since it.
+        let prev_publish = self.last_publish;
+        let since_previous = prev_publish.and_then(|(frame_id, prev_gen)| {
+            let dirty = self.history.union_since(Some(prev_gen))?;
+            Some(SincePrevious {
+                frame_id,
+                damage: coalesce(&dirty)
+                    .into_iter()
+                    .map(|r| r.to_pixels(fb.width, fb.height))
+                    .collect(),
+            })
+        });
+
         fb.blit_rects(
             device,
             queue,
@@ -253,12 +295,14 @@ impl ExportRing {
         let frame_id = self.next_frame_id;
         self.next_frame_id = self.next_frame_id.wrapping_add(1);
         self.in_flight.insert(frame_id, buffer_id);
+        self.last_publish = Some((frame_id, gen));
 
         let exported = &self.buffers[buffer_id as usize].exported;
         Some(PublishedFrame {
             frame_id,
             buffer_id,
             damage: pixel_rects,
+            since_previous,
             width: exported.width,
             height: exported.height,
             modifier: exported.modifier,
@@ -346,6 +390,7 @@ impl ExportRing {
 
         self.width = width;
         self.height = height;
+        self.last_publish = None;
         let (cols, rows) = tile_grid(width, height);
         self.history.reset(cols, rows);
 
