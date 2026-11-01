@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ghostframe_client_net::{ClientNet, ClientNetEvent};
-use ghostframe_tsnet::{parse_frame_rest, UdpPacket, MAX_FRAME_LEN};
+use ghostframe_tsnet::MAX_FRAME_LEN;
 
 use crate::event::{ClientEvent, EventQueue};
 use crate::render_thread::RenderMsg;
@@ -73,18 +73,28 @@ impl FrameReader {
     }
 
     /// Drain everything currently available (non-blocking) off `fd`, then
-    /// return every complete frame the accumulated buffer now contains.
-    /// `Ok(vec![])` with nothing pulled off the fd (`WouldBlock` on the
-    /// very first read) is the normal "nothing to do" case.
-    fn poll(&mut self, fd: RawFd) -> std::io::Result<Vec<UdpPacket>> {
-        let mut tmp = [0u8; 65536];
+    /// pass the payload of every complete frame the accumulated buffer now
+    /// contains to `on_payload`, in order. Nothing pulled off the fd
+    /// (`WouldBlock` on the very first read) is the normal "nothing to do"
+    /// case.
+    ///
+    /// Payloads are borrowed from the buffer: every datagram of a session
+    /// crosses here, and a `Vec` per packet plus the frame's address
+    /// formatted and re-parsed was measurable on a slow client. The address
+    /// is not decoded at all -- the loop attributes every datagram to
+    /// `peer_addr` (see `NetThreadArgs::peer_addr`).
+    fn poll(&mut self, fd: RawFd, mut on_payload: impl FnMut(&[u8])) -> std::io::Result<()> {
+        const READ_CHUNK: usize = 65536;
         loop {
+            self.buf.reserve(READ_CHUNK);
+            let spare = self.buf.spare_capacity_mut();
             // SAFETY: `fd` is a valid, open, non-blocking fd for the
-            // lifetime of this call; `tmp` is a valid buffer of the given
-            // length.
-            let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
+            // lifetime of this call; `spare` is writable for its length, and
+            // `read` initializes the first `n` bytes it reports.
+            let n = unsafe { libc::read(fd, spare.as_mut_ptr() as *mut libc::c_void, spare.len()) };
             if n > 0 {
-                self.buf.extend_from_slice(&tmp[..n as usize]);
+                // SAFETY: the kernel wrote `n` bytes into the spare capacity.
+                unsafe { self.buf.set_len(self.buf.len() + n as usize) };
                 continue;
             }
             if n == 0 {
@@ -103,7 +113,6 @@ impl FrameReader {
 
         // Walk the buffer with a cursor and drain the consumed prefix once,
         // so a burst of N frames costs one memmove, not N.
-        let mut packets = Vec::new();
         let mut pos = 0usize;
         loop {
             let avail = &self.buf[pos..];
@@ -121,13 +130,19 @@ impl FrameReader {
             if avail.len() < total_len {
                 break; // rest of the frame hasn't arrived yet
             }
-            let rest = &avail[8..total_len];
-            let pkt = parse_frame_rest(rest, payload_len)?;
-            packets.push(pkt);
+            // Minimum rest is payload + 2 (port) + 1 (the host's NUL), as
+            // `parse_frame_rest` checks.
+            if total_len - 8 < payload_len.saturating_add(3) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "frame rest shorter than declared payload",
+                ));
+            }
+            on_payload(&avail[8..8 + payload_len]);
             pos += total_len;
         }
         self.buf.drain(..pos);
-        Ok(packets)
+        Ok(())
     }
 }
 
@@ -389,18 +404,14 @@ pub(crate) fn run(args: NetThreadArgs) {
         for ev in &events[..n as usize] {
             let fd = ev.u64 as RawFd;
             if fd == udp_raw {
-                match reader.poll(udp_raw) {
-                    Ok(packets) => {
-                        for pkt in packets {
-                            let now_us = Instant::now().duration_since(base).as_micros() as u64;
-                            // Deliberately `peer_addr`, not `pkt.addr` -- see the field doc.
-                            client_net.handle_udp(&pkt.payload, peer_addr, now_us);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "tsnet udp fd read failed; net thread exiting");
-                        break 'outer;
-                    }
+                let polled = reader.poll(udp_raw, |payload| {
+                    let now_us = Instant::now().duration_since(base).as_micros() as u64;
+                    // Deliberately `peer_addr`, not the frame's address -- see the field doc.
+                    client_net.handle_udp(payload, peer_addr, now_us);
+                });
+                if let Err(e) = polled {
+                    tracing::error!(error = %e, "tsnet udp fd read failed; net thread exiting");
+                    break 'outer;
                 }
             } else if fd == timer_fd.as_raw_fd() {
                 let mut buf: u64 = 0;
@@ -517,16 +528,49 @@ mod tests {
         };
         put(&stream[..cut]);
         let mut r = FrameReader::new();
-        let first = r.poll(rd).unwrap();
+        let mut first = Vec::new();
+        r.poll(rd, |p| first.push(p.to_vec())).unwrap();
         assert_eq!(first.len(), 4);
         for (i, p) in first.iter().enumerate() {
-            assert_eq!(p.payload, vec![i as u8; 10 + i]);
+            assert_eq!(*p, vec![i as u8; 10 + i]);
         }
         put(&stream[cut..]);
-        let second = r.poll(rd).unwrap();
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].payload, vec![4u8; 14]);
+        let mut second = Vec::new();
+        r.poll(rd, |p| second.push(p.to_vec())).unwrap();
+        assert_eq!(second, vec![vec![4u8; 14]]);
         assert!(r.buf.is_empty());
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+    }
+
+    /// A payload_len that runs past the frame's own end is corrupt framing,
+    /// not a packet: no payload may be handed out for it.
+    #[test]
+    fn frame_reader_rejects_a_payload_longer_than_its_frame() {
+        let mut fds = [0i32; 2];
+        // SAFETY: valid 2-element array.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0);
+        let (rd, wr) = (fds[0], fds[1]);
+        let addr: SocketAddr = "100.64.0.1:443".parse().unwrap();
+        let mut frame = ghostframe_tsnet::encode_frame(&[1u8; 10], &addr);
+        let too_long = frame.len() as u32;
+        frame[4..8].copy_from_slice(&too_long.to_be_bytes());
+        let n = unsafe { libc::write(wr, frame.as_ptr() as *const libc::c_void, frame.len()) };
+        assert_eq!(n as usize, frame.len());
+        let mut seen = 0;
+        let err = FrameReader::new().poll(rd, |_| seen += 1).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(seen, 0);
         unsafe {
             libc::close(rd);
             libc::close(wr);
