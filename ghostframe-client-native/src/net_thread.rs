@@ -44,6 +44,12 @@ pub(crate) enum NetCommand {
     /// with it. Mirrors `RenderMsg::DebugMapFrame`'s round-trip shape -- see
     /// `Client::cdf53_coverage`.
     Cdf53Coverage(std::sync::mpsc::Sender<crate::Cdf53Coverage>),
+    /// The renderer hit an H.264 decode error: ask the server for an IDR
+    /// (feedback stream 0x09).
+    RequestReset {
+        reason: ghostframe_client_core::ResetReason,
+        frame_seq: u32,
+    },
     Shutdown,
 }
 
@@ -415,6 +421,10 @@ pub(crate) fn run(args: NetThreadArgs) {
                         Ok(NetCommand::RequestDisplayMode { width, height }) => {
                             let now_us = Instant::now().duration_since(base).as_micros() as u64;
                             client_net.request_display_mode(width, height, now_us);
+                        }
+                        Ok(NetCommand::RequestReset { reason, frame_seq }) => {
+                            let now_us = Instant::now().duration_since(base).as_micros() as u64;
+                            client_net.request_reset(reason, frame_seq, now_us);
                         }
                         Ok(NetCommand::Cdf53Coverage(reply_tx)) => {
                             let summary = client_net.cdf53_coverage_summary();

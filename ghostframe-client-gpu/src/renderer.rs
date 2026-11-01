@@ -149,6 +149,9 @@ pub struct Renderer {
     /// decoder does not error on missing references, it conceals, silently
     /// emitting frames built on stale state with no log and an `Ok` return.
     h264_needs_reset: bool,
+    /// A reset request (feedback stream 0x09) waiting for the embedder to
+    /// collect it with [`Renderer::take_reset_request`]. Set by a decode error.
+    recovery: H264Recovery,
     /// Throttles the size-mismatch warning in [`Renderer::blit_h264_frame`]
     /// to its first occurrence per mismatch episode, so a persistent
     /// disagreement does not burst-log once per frame at 60fps. Cleared as
@@ -276,6 +279,7 @@ impl Renderer {
             h264_import_path: None,
             h264_last_frame_seq: None,
             h264_needs_reset: false,
+            recovery: H264Recovery::default(),
             h264_size_mismatch_logged: false,
         })
     }
@@ -846,6 +850,15 @@ impl Renderer {
                 // wait for the next keyframe and reset on it rather than
                 // trust whatever the decoder emits from here.
                 self.h264_needs_reset = true;
+                // Ask the server for an IDR rather than wait for its next
+                // periodic one. Paced: every frame behind a broken reference
+                // can fail the same way.
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "client-side pacing of a network request, not a virtual-clock path"
+                )]
+                let now = std::time::Instant::now();
+                self.recovery.on_decode_error(frame_seq, now);
                 return Ok(());
             }
         };
@@ -877,6 +890,12 @@ impl Renderer {
             self.ring.mark_dirty_all();
         }
         Ok(())
+    }
+
+    /// The reset request a decode error queued, if any; the embedder sends it
+    /// to the server (feedback stream 0x09). Returns each request once.
+    pub fn take_reset_request(&mut self) -> Option<(ghostframe_client_core::ResetReason, u32)> {
+        self.recovery.take()
     }
 
     /// Drain and blit any frames still buffered by B-frame reordering.
@@ -1198,4 +1217,102 @@ fn upload_rgba_tile(queue: &wgpu::Queue, fb: &Framebuffer, tile_x: u8, tile_y: u
             depth_or_array_layers: 1,
         },
     );
+}
+
+/// Shortest gap between two reset requests from this client. Slightly longer
+/// than the server's 2 s window: a retry sent exactly one window after the
+/// last honoured request can reach the server inside its window (network
+/// jitter, clock granularity) and be dropped, costing another full interval.
+const RESET_REQUEST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2200);
+
+/// Decides when a decode error becomes a reset request (feedback stream
+/// 0x09). A decode error on every frame behind a broken reference must not
+/// become a request per frame, so requests are spaced out; the request waits
+/// here until the embedder collects it with [`H264Recovery::take`]. Pure: no
+/// clock of its own, so the pacing is testable without a GPU.
+#[derive(Default)]
+pub struct H264Recovery {
+    last_sent: Option<std::time::Instant>,
+    pending: Option<(ghostframe_client_core::ResetReason, u32)>,
+}
+
+impl H264Recovery {
+    /// A decode of `frame_seq` failed at `now`. Queues a `DecoderFailure`
+    /// request unless one went out less than [`RESET_REQUEST_MIN_INTERVAL`]
+    /// ago (or one is already waiting).
+    pub fn on_decode_error(&mut self, frame_seq: u32, now: std::time::Instant) {
+        if self.pending.is_some() {
+            return;
+        }
+        if self
+            .last_sent
+            .is_some_and(|t| now.saturating_duration_since(t) < RESET_REQUEST_MIN_INTERVAL)
+        {
+            return;
+        }
+        self.last_sent = Some(now);
+        self.pending = Some((
+            ghostframe_client_core::ResetReason::DecoderFailure,
+            frame_seq,
+        ));
+    }
+
+    /// The queued request, once.
+    pub fn take(&mut self) -> Option<(ghostframe_client_core::ResetReason, u32)> {
+        self.pending.take()
+    }
+}
+
+#[cfg(test)]
+mod h264_recovery_tests {
+    use super::*;
+    use ghostframe_client_core::ResetReason;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn nothing_is_queued_without_a_decode_error() {
+        let mut r = H264Recovery::default();
+        assert_eq!(r.take(), None);
+    }
+
+    #[test]
+    fn a_decode_error_queues_one_decoder_failure_request_for_that_frame() {
+        let mut r = H264Recovery::default();
+        r.on_decode_error(42, Instant::now());
+        assert_eq!(r.take(), Some((ResetReason::DecoderFailure, 42)));
+        assert_eq!(r.take(), None, "each request is returned once");
+    }
+
+    #[test]
+    fn a_burst_of_errors_is_one_request_and_the_first_frame_wins() {
+        let t0 = Instant::now();
+        let mut r = H264Recovery::default();
+        r.on_decode_error(10, t0);
+        r.on_decode_error(11, t0 + Duration::from_millis(16));
+        assert_eq!(r.take(), Some((ResetReason::DecoderFailure, 10)));
+        r.on_decode_error(12, t0 + Duration::from_millis(33));
+        assert_eq!(r.take(), None, "still inside the interval after a take");
+    }
+
+    #[test]
+    fn requests_are_spaced_by_more_than_the_servers_two_second_window() {
+        const { assert!(RESET_REQUEST_MIN_INTERVAL.as_millis() > 2000) };
+        let t0 = Instant::now();
+        let mut r = H264Recovery::default();
+        r.on_decode_error(1, t0);
+        let _ = r.take();
+        r.on_decode_error(
+            2,
+            t0 + RESET_REQUEST_MIN_INTERVAL - Duration::from_millis(1),
+        );
+        assert_eq!(r.take(), None);
+        r.on_decode_error(3, t0 + RESET_REQUEST_MIN_INTERVAL);
+        assert_eq!(r.take(), Some((ResetReason::DecoderFailure, 3)));
+        // The window restarts from the request that went out.
+        r.on_decode_error(
+            4,
+            t0 + RESET_REQUEST_MIN_INTERVAL + Duration::from_millis(1),
+        );
+        assert_eq!(r.take(), None);
+    }
 }

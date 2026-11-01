@@ -352,6 +352,9 @@ impl EventTally {
     }
 }
 
+/// How the render thread asks the net thread to send a reset request.
+pub(crate) type ResetSink = Box<dyn Fn(ghostframe_client_core::ResetReason, u32) + Send>;
+
 /// Build the GPU context *on this thread*, then run the render loop.
 ///
 /// The context is constructed here rather than by the caller because a GL
@@ -378,6 +381,7 @@ pub(crate) fn run(
     host_visible: bool,
     preferred_modifiers: Vec<u64>,
     open_h264_eagerly: bool,
+    reset_sink: ResetSink,
 ) {
     let ctx = match WgpuContext::new() {
         Ok(ctx) => {
@@ -499,6 +503,11 @@ pub(crate) fn run(
                 }
                 Err(_) => break,
             }
+        }
+
+        // A decode error in this batch asks the server for an IDR.
+        if let Some((reason, frame_seq)) = renderer.as_mut().and_then(|r| r.take_reset_request()) {
+            reset_sink(reason, frame_seq);
         }
 
         if got_event {
@@ -633,7 +642,19 @@ mod tests {
         let published = Arc::new(Mutex::new(None));
         let handle = {
             let (queue, published) = (Arc::clone(&queue), Arc::clone(&published));
-            std::thread::spawn(move || run(ready_tx, rx, queue, published, 2, false, vec![], false))
+            std::thread::spawn(move || {
+                run(
+                    ready_tx,
+                    rx,
+                    queue,
+                    published,
+                    2,
+                    false,
+                    vec![],
+                    false,
+                    Box::new(|_, _| {}),
+                )
+            })
         };
         if ready_rx.recv().expect("ready").is_err() {
             eprintln!("SKIP: no GPU adapter that can export dmabufs");
