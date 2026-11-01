@@ -140,6 +140,16 @@ directory, so stop the service before `logout`. A node counts as joined when
 `<state_dir>/.joined` exists; started without it and without `TS_AUTHKEY`,
 `capture` exits 2 and the unit does not restart it.
 
+In H.264 mode the same cadence also logs `h264 stats` (target
+`ghostframe::h264`): IDRs by cause (`idr_session`, `idr_loss`,
+`idr_client_reset`, `idr_reentry`, `idr_gop_periodic`, ...), verdicts on IDR and
+P fragments, `p_hold_ms` (time P frames waited for an IDR to be acknowledged),
+`frames_skipped_hold` / `frames_skipped_backpressure`, and the ledger identity
+`tx_recorded = tx_acked_live + tx_judged_lost + tx_forgotten + outstanding`. An
+H.264 fragment is a ledger transmission, so `bwe_samples_seen` moves in H.264
+mode; a client that does not acknowledge H.264 fragments shows up as a loss
+verdict on every one.
+
 With `GHOSTFRAME_DAMAGE_MODE=shadow` or `on` the daemon also logs a cumulative
 `damage safety net` line every 5 s (target `ghostframe::server::damage`);
 `corrections_unswept` against `dirty_tiles` is the would-have-been miss rate
