@@ -1268,3 +1268,58 @@ async fn idrs_per_minute_on_a_steady_two_megabit_link() {
         assert!(s.frames_idr <= 20 + 30, "{} IDRs in a minute", s.frames_idr);
     }
 }
+
+/// The classifier's headroom guard keeps the session in H.264 while the
+/// estimate is under 2 Mbit/s and lets go after it has stayed over 3 Mbit/s for
+/// a second. A CBR stream at 0.8 x its estimate cannot raise the estimate by
+/// itself (see `a_capacity_step_up_is_found_within_t_up_in_h264_mode`), so
+/// without the application's probes the guard would hold forever after a
+/// capacity step. This replays the estimate of that scene's run, sample by
+/// sample, through a real `Classifier` (the guard's exit is the classifier's
+/// own decision, on the estimate the bridge hands it) and asserts: the guard
+/// engages before the step, and releases within `T_UP` of it.
+///
+/// Mutation: with the application's probing disabled the estimate never
+/// reaches the exit line and this fails (the report lists it).
+#[tokio::test(start_paused = true)]
+async fn the_headroom_guard_releases_in_h264_mode_on_a_capacity_step() {
+    use ghostframe_lib::config::ClassifierConfig;
+    use ghostframe_lib::tile::classifier::{AdaptationContext, Classifier};
+    use ghostframe_lib::tile::{CodecState, FrameMode};
+    for seed in [0x6701u64, 0x6702, 0x6703] {
+        let st = capacity_step(seed).await;
+        let mut c = Classifier::new(ClassifierConfig::default());
+        let tentative = [CodecState::Solid];
+        let mut mode = FrameMode::TileCodec;
+        let mut engaged_before_step = false;
+        let mut released_at = None;
+        for (t_us, bps) in &st.r.bwe_estimate_samples {
+            c.set_adaptation_context(AdaptationContext {
+                supports_h264: true,
+                bwe_estimate_bps: *bps,
+                smoothed_rtt_us: 40_000.0,
+                loss_rate: 0.0,
+                suspended: false,
+                last_update_seq: 1,
+                ..Default::default()
+            });
+            let was_h264 = mode == FrameMode::H264;
+            mode = c.decide_frame_mode_at(*t_us, &tentative, mode);
+            if *t_us < STEP_AT_US && mode == FrameMode::H264 {
+                engaged_before_step = true;
+            }
+            if *t_us >= STEP_AT_US && was_h264 && mode == FrameMode::TileCodec {
+                released_at.get_or_insert(*t_us - STEP_AT_US);
+            }
+        }
+        println!("guard seed {seed:#x}: engaged before step: {engaged_before_step}, released {released_at:?} us after it");
+        assert!(
+            engaged_before_step,
+            "seed {seed:#x}: premise: the guard held H.264 on the 2 Mbit/s link"
+        );
+        assert!(
+            released_at.is_some_and(|t| t <= T_UP_US + 2_000_000),
+            "seed {seed:#x}: the guard released {released_at:?} us after the step (bound: T_UP plus its 1 s hold and a margin)"
+        );
+    }
+}

@@ -1138,4 +1138,58 @@ mod tests {
             "the cadence starts over"
         );
     }
+
+    /// A pad's acknowledgement proves the path delivers, not that frames do:
+    /// it must not count as H.264 ack progress for the stall flag's
+    /// no-progress rule (`last_ack_progress`), nor mark the session as one that
+    /// acknowledges H.264 (`acked_any`). A real fragment's does.
+    #[tokio::test(start_paused = true)]
+    async fn a_pad_acknowledgement_is_no_h264_ack_progress() {
+        let mut b = padding_bridge().await;
+        let now = now_std();
+        let pad_tx = crate::transport::transmission_ledger::Transmission {
+            emit_us: 0,
+            wire_bytes: 1200,
+            content: crate::transport::reliable_emitter::Content::Pad(5),
+            depart_us: None,
+            dep_idx: None,
+        };
+        b.apply_h264_acks(&[(pad_tx.content, pad_tx, 0, false)], now);
+        assert!(b.h264.last_ack_progress.is_none(), "a pad is no progress");
+        assert!(!b.h264.acked_any);
+        let frag_tx = crate::transport::transmission_ledger::Transmission {
+            content: crate::transport::reliable_emitter::Content::H264Frag {
+                frame_seq: 1,
+                frag_idx: 0,
+            },
+            ..pad_tx
+        };
+        b.apply_h264_acks(&[(frag_tx.content, frag_tx, 0, false)], now);
+        assert_eq!(b.h264.last_ack_progress, Some(now), "a fragment is");
+        assert!(b.h264.acked_any);
+    }
+
+    /// Leaving H.264 mode lets go of the rate side in one place
+    /// (`abandon_h264_inflight`): padding, the app-probe cadence, the rate
+    /// policy's estimate and the GOP clock. The encoder keeps its rate.
+    #[tokio::test(start_paused = true)]
+    async fn leaving_h264_mode_resets_padding_probing_policy_and_gop_clock_in_one_place() {
+        let mut b = padding_bridge().await;
+        b.h264_probe_pad(now_std(), false, 0); // arms
+        tokio::time::advance(APP_PROBE_INTERVAL).await;
+        b.h264_probe_pad(now_std(), false, 0);
+        assert!(
+            !b.reliable_emitter.pads.is_empty(),
+            "premise: padding in flight"
+        );
+        b.h264.last_idr_at = Some(now_std());
+        let applied = b.h264.rate.applied();
+        assert!(applied.is_some());
+        b.abandon_h264_inflight(7, now_std());
+        assert!(b.reliable_emitter.pads.is_empty());
+        assert!(b.h264.app_probe.next_at.is_none() && b.h264.app_probe.last_target.is_none());
+        assert!(b.h264.last_idr_at.is_none());
+        assert_eq!(b.h264.rate.applied(), applied, "the encoder keeps its rate");
+        assert!(b.h264.rate.ewma_bps.is_none(), "the estimate starts over");
+    }
 }
