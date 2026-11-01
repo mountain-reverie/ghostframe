@@ -456,7 +456,8 @@ pub fn encode_parity_envelope(
 /// `[HELLO_MSG_TYPE, caps]`; caps bit0 = indices_raw, bit1 = supports_h264.
 #[wasm_bindgen(js_name = encodeHello)]
 pub fn encode_hello(indices_raw: bool, supports_h264: bool) -> Vec<u8> {
-    ghostframe_client_core::loss_tracker::encode_hello(indices_raw, supports_h264)
+    // The web client does not send the v2 H.264 feedback (HELLO bit 2) yet.
+    ghostframe_client_core::loss_tracker::encode_hello(indices_raw, supports_h264, false)
 }
 
 /// `[DECODE_ERROR_MSG_TYPE, codec, tile_x, tile_y, code]`, unbatched and

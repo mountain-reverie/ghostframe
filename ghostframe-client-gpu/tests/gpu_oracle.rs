@@ -17,6 +17,7 @@ fn drain(datagrams: &[Vec<u8>], delivery: TileDelivery) -> Vec<Event> {
         ClientConfig {
             indices_raw_enabled: false,
             supports_h264: false,
+            h264_acked_ref: false,
             tile_delivery: delivery,
             display: None,
         },

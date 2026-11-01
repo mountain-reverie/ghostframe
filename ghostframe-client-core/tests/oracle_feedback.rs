@@ -5,22 +5,22 @@ use ghostframe_protocol::feedback::ReceiverFeedback;
 
 #[test]
 fn hello_indices_raw_only() {
-    assert_eq!(encode_hello(true, false), vec![0x03, 0x01]);
+    assert_eq!(encode_hello(true, false, false), vec![0x03, 0x01]);
 }
 
 #[test]
 fn hello_nothing_set() {
-    assert_eq!(encode_hello(false, false), vec![0x03, 0x00]);
+    assert_eq!(encode_hello(false, false, false), vec![0x03, 0x00]);
 }
 
 #[test]
 fn hello_h264_only() {
-    assert_eq!(encode_hello(false, true), vec![0x03, 0x02]);
+    assert_eq!(encode_hello(false, true, false), vec![0x03, 0x02]);
 }
 
 #[test]
 fn hello_both_caps() {
-    assert_eq!(encode_hello(true, true), vec![0x03, 0x03]);
+    assert_eq!(encode_hello(true, true, false), vec![0x03, 0x03]);
 }
 
 #[test]
@@ -161,5 +161,21 @@ fn display_mode_wire_bytes() {
     assert_eq!(
         encode_display_mode(1280, 800),
         vec![0x08, 0x05, 0x00, 0x03, 0x20]
+    );
+}
+
+#[test]
+fn hello_bit2_is_the_h264_v2_wire() {
+    assert_eq!(encode_hello(true, true, true), vec![0x03, 0x07]);
+    assert_eq!(encode_hello(false, false, true), vec![0x03, 0x04]);
+}
+
+#[test]
+fn reset_request_wire_bytes() {
+    use ghostframe_client_core::loss_tracker::encode_reset_request;
+    use ghostframe_client_core::ResetReason;
+    assert_eq!(
+        encode_reset_request(ResetReason::DecoderFailure, 0x0102_0304),
+        vec![0x09, 0x01, 0x04, 0x03, 0x02, 0x01]
     );
 }

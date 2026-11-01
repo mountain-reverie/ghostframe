@@ -82,3 +82,54 @@ fn input_sent_after_the_session_is_ready_reaches_the_server() {
         "input after SessionReady must reach the server, got {got:02x?}"
     );
 }
+
+/// A reset request reaches the server on the feedback stream, byte for byte,
+/// once the session is ready (and after the Hello).
+#[test]
+fn a_reset_request_reaches_the_server_on_the_feedback_stream() {
+    use ghostframe_client_core::ResetReason;
+    let (mut client, mut server, mut wt, mut now_us, base) = connected_session();
+    pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 32);
+    let _ = wt.drain_feedback();
+
+    client.request_reset(ResetReason::DecoderFailure, 0x0102_0304, now_us);
+    pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 32);
+
+    let got: Vec<u8> = wt.drain_feedback().into_iter().flatten().collect();
+    let want = [0x09, 0x01, 0x04, 0x03, 0x02, 0x01];
+    assert!(
+        got.windows(want.len()).any(|w| w == want),
+        "reset request must reach the server, got {got:02x?}"
+    );
+}
+
+/// A client that asks for H.264 also advertises the v2 feedback: Hello caps
+/// 0x02 | 0x04 (and 0x01 for indices_raw).
+#[test]
+fn an_h264_client_advertises_both_h264_hello_bits() {
+    use common::{admitting_server, pinned_hash};
+    use ghostframe_client_net::{ClientNet, ClientNetConfig};
+    use ghostframe_lib::transport::webtransport::WebTransportServer;
+    use std::net::{Ipv6Addr, SocketAddr};
+    use std::time::Instant;
+
+    let mut server = admitting_server();
+    let mut wt = WebTransportServer::new();
+    let cfg = ClientNetConfig {
+        server_name: "localhost".into(),
+        server_cert_sha256: pinned_hash(&server),
+        indices_raw_enabled: true,
+        supports_h264: true,
+        display: None,
+    };
+    let base = Instant::now();
+    let mut now_us = 0u64;
+    let mut client = ClientNet::new(cfg, now_us).expect("ClientNet::new");
+    client
+        .connect(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 443), now_us)
+        .expect("connect");
+    pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 128);
+
+    let got: Vec<u8> = wt.drain_feedback().into_iter().flatten().collect();
+    assert_eq!(&got[..2], &[0x03, 0x07], "Hello caps, got {got:02x?}");
+}
