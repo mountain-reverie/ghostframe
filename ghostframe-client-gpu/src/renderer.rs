@@ -13,6 +13,7 @@ use crate::framebuffer::Framebuffer;
 use crate::paint_order::SeqLedger;
 use crate::pipelines::cdf53::{Cdf53PassEntry, Cdf53Pipeline};
 use crate::pipelines::palrle::PalRlePipeline;
+use crate::pipelines::rgba::RgbaPipeline;
 use crate::pipelines::solid::SolidPipeline;
 use crate::ring::{ExportRing, PublishedFrame};
 use crate::wgpu_ctx::WgpuContext;
@@ -36,6 +37,12 @@ fn tile_grid(width: u32, height: u32) -> (u32, u32) {
 
 /// Upper bound on [`GpuDecodeError`]s held between two drains.
 const MAX_PENDING_DECODE_ERRORS: usize = 1024;
+
+/// The smallest rectangle of dirty `TileReady` tiles worth its own
+/// `write_texture`; smaller ones go through [`RgbaPipeline`]. Measured on a
+/// Pinebook Pro: a call costs ~178us plus ~12us per tile, the pipeline ~18us
+/// per tile, so they cross near 30.
+const MIN_TILES_PER_UPLOAD: u32 = 32;
 
 /// A tile the GPU decode rejected; the shape `ClientCore`'s
 /// `DecodeErrorBatcher::report` takes.
@@ -89,6 +96,7 @@ pub struct Renderer {
     ring: ExportRing,
     solid: SolidPipeline,
     palrle: PalRlePipeline,
+    rgba: RgbaPipeline,
     cdf53: Cdf53Pipeline,
 
     /// Every pending stateless entry carries the `frame_seq` it came from
@@ -226,6 +234,7 @@ impl Renderer {
         solid.set_canvas_size(&ctx.device, &ctx.queue, width, height);
 
         let palrle = PalRlePipeline::new(&ctx.device);
+        let rgba = RgbaPipeline::new(&ctx.device);
 
         let mut cdf53 = Cdf53Pipeline::new(&ctx.device);
         let (cols, rows) = tile_grid(width, height);
@@ -270,6 +279,7 @@ impl Renderer {
             ring,
             solid,
             palrle,
+            rgba,
             cdf53,
             pending_solid: Vec::new(),
             pending_palrle: Vec::new(),
@@ -515,8 +525,9 @@ impl Renderer {
         Ok(())
     }
 
-    /// Upload every buffered `TileReady` tile, coalesced into as few
-    /// `write_texture` calls as the dirty set allows.
+    /// Upload every buffered `TileReady` tile with as few calls as possible:
+    /// one `write_texture` per large rectangle of dirty tiles, and every other
+    /// tile in one [`RgbaPipeline`] dispatch.
     ///
     /// **Why this exists.** `write_texture` costs about the same whatever it
     /// carries: measured on a Pinebook Pro (Mali-T860), 2040 calls of 32x32
@@ -526,15 +537,19 @@ impl Renderer {
     /// therefore ~3fps, bounded entirely by call count.
     ///
     /// So the dirty tiles are merged into rectangles with the same
-    /// [`crate::coalesce`] pass the export ring already uses for damage, each
-    /// rectangle is assembled into one contiguous buffer, and each becomes one
-    /// upload. A full repaint collapses to a single call.
+    /// [`crate::coalesce`] pass the export ring already uses for damage. A
+    /// rectangle of at least [`MIN_TILES_PER_UPLOAD`] tiles is assembled into
+    /// one contiguous buffer and uploaded with one call; a full repaint is a
+    /// single call. Smaller rectangles -- scattered tiles, the usual shape of
+    /// text and UI changes -- would still cost one call each, so they all go to
+    /// the GPU in one buffer and one dispatch instead (see
+    /// `upload_bench.rs::rgba_pipeline_breakdown` for the crossover).
     ///
-    /// Tiles whose payload is shorter than a full tile do not take part in a
-    /// rectangle and are uploaded individually. A rectangle assumes every tile
-    /// inside it supplies all its rows; a short one would leave the remainder
-    /// as buffer fill and write black over live pixels, which is a silent
-    /// corruption rather than a dropped update.
+    /// Tiles whose payload is shorter than a full tile take neither route and
+    /// are uploaded individually. Both routes assume every tile supplies all
+    /// its rows; a short one would leave the remainder as buffer fill and
+    /// write black over live pixels, which is a silent corruption rather than
+    /// a dropped update.
     fn upload_pending_rgba(&mut self, ctx: &WgpuContext) {
         if self.pending_rgba.is_empty() {
             return;
@@ -569,7 +584,18 @@ impl Renderer {
         }
 
         let row_bytes = (TILE_SIZE * 4) as usize;
+        let mut scattered: Vec<(u32, u32, &[u8])> = Vec::new();
         for rect in crate::coalesce::coalesce(&grid) {
+            if rect.w * rect.h < MIN_TILES_PER_UPLOAD {
+                for ty in rect.y..rect.y + rect.h {
+                    for tx in rect.x..rect.x + rect.w {
+                        if let Some(src) = by_tile.get(&(tx, ty)) {
+                            scattered.push((tx, ty, src));
+                        }
+                    }
+                }
+                continue;
+            }
             let px = rect.to_pixels(self.fb.width, self.fb.height);
             if px.w == 0 || px.h == 0 {
                 continue;
@@ -622,6 +648,8 @@ impl Renderer {
                 },
             );
         }
+        self.rgba
+            .draw(&ctx.device, &ctx.queue, &self.fb, &scattered);
     }
 
     /// Seal a generation and hand out an export buffer, if one is free.

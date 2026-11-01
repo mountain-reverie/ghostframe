@@ -486,8 +486,8 @@ pub(crate) fn run(
         // one render pass instead of one per message -- but BOUNDED.
         //
         // An unbounded drain is a starvation hazard: `try_recv` only stops when
-        // the channel is momentarily empty, and every event here does GPU work
-        // (`upload_rgba_tile` -> `write_texture`), so against a producer faster
+        // the channel is momentarily empty, and every event here costs render
+        // thread time (and the flush GPU work), so against a producer faster
         // than the consumer there is no guaranteed bound on how long `flush`
         // and `publish` below are deferred. The cap is one screen's worth of
         // tiles at 1080p (60x34 = 2040, rounded up), which makes the invariant
@@ -496,17 +496,11 @@ pub(crate) fn run(
         // never binds.
         //
         // Do NOT read this as the fix for a low frame rate -- it was tried as
-        // exactly that and measured not to be. On a Pinebook Pro against a live
-        // server the rate was ~3 publishes/sec before and after; capping the
-        // drain only changed the batch size. `publish_starved=0` throughout, so
-        // the export ring was never the constraint either. The actual cost is
-        // per-tile upload: ~2049 events take ~1s, i.e. roughly 0.5 ms for a
-        // 32x32 `write_texture`. Fixing the frame rate means attacking that --
-        // most likely batching tiles into one upload per flush, or the
-        // framebuffer texture being AFBC-compressed on panfrost so every
-        // partial write costs a decompress/recompress of the touched blocks
-        // (the same defect `export_gles.rs` documents for the export, which is
-        // fixed there and NOT here).
+        // exactly that and measured not to be: on a Pinebook Pro the rate was
+        // ~3 publishes/sec before and after; capping the drain only changed
+        // the batch size. The cost was per-tile `write_texture` calls, since
+        // replaced by `Renderer::upload_pending_rgba`'s batching (one call per
+        // large rectangle, one compute dispatch for all other tiles).
         const MAX_DRAIN: usize = 2048;
         let mut drained = 0usize;
         while drained < MAX_DRAIN {
