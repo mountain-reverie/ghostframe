@@ -274,3 +274,84 @@ fn gpu_palrle_failures_surface_as_decode_errors() {
     r.flush(&ctx).expect("flush");
     assert!(r.take_decode_errors().is_empty());
 }
+
+/// A tile whose every pixel is distinct and says where it came from, so a
+/// pixel landing anywhere but its own place -- another row, another column,
+/// another tile -- reads back wrong.
+fn unique_tile(tile_x: u8, tile_y: u8, salt: u8) -> Vec<u8> {
+    let mut v = Vec::with_capacity((TILE_SIZE * TILE_SIZE * 4) as usize);
+    for y in 0..TILE_SIZE as u8 {
+        for x in 0..TILE_SIZE as u8 {
+            v.extend_from_slice(&[
+                x ^ tile_x.wrapping_mul(7),
+                y ^ tile_y.wrapping_mul(13),
+                salt,
+                0xFF,
+            ]);
+        }
+    }
+    v
+}
+
+#[test]
+fn both_upload_routes_put_every_pixel_where_it_belongs() {
+    // `upload_pending_rgba` sends a rectangle of 32+ tiles through one
+    // `write_texture` and everything smaller through the RGBA compute
+    // pipeline. Compare the WHOLE framebuffer against a CPU composition, with
+    // tiles taking each route, on both clamped edges, and one tile sent twice
+    // in the batch (the later must win).
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut r = renderer(&ctx);
+    let mut want = vec![0u8; (W * H * 4) as usize];
+    let mut put = |r: &mut Renderer, tx: u8, ty: u8, rgba: Vec<u8>| {
+        for y in 0..TILE_SIZE {
+            for x in 0..TILE_SIZE {
+                let (fx, fy) = (tx as u32 * TILE_SIZE + x, ty as u32 * TILE_SIZE + y);
+                if fx < W && fy < H {
+                    let s = ((y * TILE_SIZE + x) * 4) as usize;
+                    let d = ((fy * W + fx) * 4) as usize;
+                    want[d..d + 4].copy_from_slice(&rgba[s..s + 4]);
+                }
+            }
+        }
+        r.apply_event(&ctx, tile_ready(tx, ty, rgba))
+            .expect("gpu ok");
+    };
+
+    // 8x4 = 32 tiles: the write_texture route.
+    for ty in 2..6 {
+        for tx in 20..28 {
+            put(&mut r, tx, ty, unique_tile(tx, ty, 1));
+        }
+    }
+    // Scattered: the pipeline route. Includes the bottom-right corner (24px
+    // tall) and a diagonal no two of which touch.
+    let last_col = (W / TILE_SIZE - 1) as u8;
+    let last_row = (H.div_ceil(TILE_SIZE) - 1) as u8;
+    for (tx, ty) in [
+        (0, 0),
+        (3, 9),
+        (5, 11),
+        (40, 20),
+        (last_col, last_row),
+        (0, last_row),
+    ] {
+        put(&mut r, tx, ty, unique_tile(tx, ty, 2));
+    }
+    // Sent twice: first one content, then another.
+    put(&mut r, 9, 9, unique_tile(9, 9, 3));
+    put(&mut r, 9, 9, unique_tile(9, 9, 4));
+    r.flush(&ctx).expect("gpu ok");
+
+    let fb = r.debug_read_framebuffer(&ctx);
+    if let Some(i) = (0..want.len() / 4).find(|&i| fb[i * 4..i * 4 + 4] != want[i * 4..i * 4 + 4]) {
+        let (x, y) = (i as u32 % W, i as u32 / W);
+        panic!(
+            "pixel ({x},{y}) in tile ({},{}): got {:?}, want {:?}",
+            x / TILE_SIZE,
+            y / TILE_SIZE,
+            &fb[i * 4..i * 4 + 4],
+            &want[i * 4..i * 4 + 4]
+        );
+    }
+}
