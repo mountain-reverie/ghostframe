@@ -34,6 +34,20 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+      # This job builds the debug workspace under several feature sets
+      # (browserless, every client crate, the netsim targets) into one
+      # target dir and ran out of the runner's ~14 GB at the Go link of
+      # ghostbridge. Same trim as the e2e job below.
+      - name: Free disk space on the runner
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
       - uses: ./.github/workflows/_setup-system-deps
       - uses: ./.github/workflows/_setup-go
       - uses: ./.github/workflows/_build-web-client
