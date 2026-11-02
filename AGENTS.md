@@ -145,7 +145,9 @@ In H.264 mode the same cadence also logs `h264 stats` (target
 `idr_client_reset`, `idr_reentry`, `idr_gop_periodic`, ...), verdicts on IDR and
 P fragments, `p_hold_ms` (time P frames waited for an IDR to be acknowledged),
 `frames_skipped_hold` / `frames_skipped_backpressure`, and the ledger identity
-`tx_recorded = tx_acked_live + tx_judged_lost + tx_forgotten + outstanding`. An
+`tx_recorded >= tx_acked_live + tx_judged_lost + tx_forgotten` (the gap is still
+outstanding and not logged; exact only within one session, without ledger
+capacity evictions). An
 H.264 fragment is a ledger transmission, so `bwe_samples_seen` moves in H.264
 mode; a client that does not acknowledge H.264 fragments shows up as a loss
 verdict on every one. `h264_stalled_ms` and `stalls_inflight` /
@@ -176,6 +178,15 @@ With `GHOSTFRAME_DAMAGE_MODE=shadow` or `on` the daemon also logs a cumulative
 `damage safety net` line every 5 s (target `ghostframe::server::damage`);
 `corrections_unswept` against `dirty_tiles` is the would-have-been miss rate
 (design note section 3.4, "As landed (PR 4)").
+
+`h264 stats` also carries `rate_target_bps` and the stall counters.
+`GHOSTFRAME_H264_GOP_SECONDS` (default 3, clamped 2..5) sets the scheduled IDR
+interval; `GHOSTFRAME_LOSS_OVERRIDE=1` turns the off-by-default loss override
+back on. Every field and both variables are explained in
+[docs/design/h264-transport.md](docs/design/h264-transport.md). A zero
+`frame_acks_received` is expected (no client sends the 0x0A frame ack yet); it
+is on the separate `h264 client feedback` line, target
+`ghostframe_lib::transport::io_bridge`, not on `h264 stats`.
 
 Client-side diagnostics are printed by the browser console. **Some of them are
 dead**: `rx{...}` and `cdf53-coverage` read `window.__tileCounts` /
