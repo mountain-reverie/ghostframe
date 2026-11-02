@@ -51,6 +51,19 @@ impl WasmClientCore {
         }
     }
 
+    /// Ask the server for a fresh IDR (feedback stream 0x09): the browser's
+    /// decoder failed. `reason` is a `ResetReason` discriminant (1 = decoder
+    /// failure); anything else is ignored. The request is queued like any
+    /// other outbound stream message and leaves through `pollTransmit`. The
+    /// server answers at most one a second; the caller paces itself (2.2 s,
+    /// as the native renderer does).
+    #[wasm_bindgen(js_name = requestReset)]
+    pub fn request_reset(&mut self, reason: u8, frame_seq: u32) {
+        if let Some(r) = ghostframe_client_core::ResetReason::from_u8(reason) {
+            self.inner.request_reset(r, frame_seq);
+        }
+    }
+
     /// Feed one inbound datagram; returns the resulting events as an array.
     ///
     /// Inbound is datagrams-only: the browser's bidi stream carries outbound

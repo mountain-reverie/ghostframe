@@ -503,6 +503,11 @@ pub const FRAME_FLAG_NON_REF: u8 = 0x02;
 pub const FRAME_FLAG_MARK_LT: u8 = 0x04;
 /// Frame flag bit 3: this frame predicts from a long-term reference.
 pub const FRAME_FLAG_TARGET_IS_LT: u8 = 0x08;
+/// Frame flag bit 4: this datagram is probe padding, a copy of a fragment the
+/// receiver already acknowledged, sent to fill a bandwidth-probe cluster. The
+/// receiver acknowledges it (that is the measurement) and discards it without
+/// touching any frame assembly.
+pub const FRAME_FLAG_PAD: u8 = 0x10;
 
 /// The per-frame reference description carried by every fragment of a frame.
 ///

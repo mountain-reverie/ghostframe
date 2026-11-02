@@ -50,6 +50,10 @@ pub enum Content {
     Tile(EmitKey),
     /// Fragment `frag_idx` of the H.264 frame `frame_seq`.
     H264Frag { frame_seq: u32, frag_idx: u16 },
+    /// A datagram of probe padding, named by its own `wire_seq`. It owes the
+    /// client nothing and is never sent again; its transmission is
+    /// acknowledged or judged like any other.
+    Pad(u32),
 }
 
 impl Content {
@@ -57,7 +61,7 @@ impl Content {
     pub fn tile(self) -> Option<EmitKey> {
         match self {
             Content::Tile(k) => Some(k),
-            Content::H264Frag { .. } => None,
+            Content::H264Frag { .. } | Content::Pad(_) => None,
         }
     }
 }

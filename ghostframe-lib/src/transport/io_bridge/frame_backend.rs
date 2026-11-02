@@ -41,7 +41,7 @@ use crate::capture::dmabuf::ReadbackFrame;
 use crate::capture::gpu_pipeline::{
     FrameAnalysis, FramePaletteEntryRaw, GpuFrameProcessor, TileAnalysis, UnchangedRefused,
 };
-use crate::encoder::h264_vaapi::FullFrameEncoder;
+use crate::encoder::h264_vaapi::{FullFrameEncoder, RateParams};
 use crate::server::FrameSubmission;
 
 use super::frame::{clamp_gpu_tile_count, palrle_index_slice};
@@ -57,6 +57,12 @@ pub enum Control {
     InvalidateBaseline(u32),
     /// The next H.264 frame is an IDR.
     RequestKeyframe,
+    /// The H.264 encoder's rate and frame rate. The next time the encoder opens it
+    /// opens with these; with `reopen` it is closed now, so the next frame
+    /// opens a fresh encoder and is an IDR. The rate cannot change in place
+    /// (the ffmpeg encoder would reset its rate control), which is why a new
+    /// rate costs an IDR (see `h264_rate`).
+    H264Rate { bps: u32, fps: u32, reopen: bool },
     /// A frame that named only some tile rows was dropped before the GPU
     /// stage saw it: upload and compare the next frame whole.
     ForgetDamage,
@@ -259,6 +265,8 @@ pub trait FrameBackend: Send {
 pub struct GpuBackend {
     processor: GpuFrameProcessor,
     encoder: Option<FullFrameEncoder>,
+    /// The rate and GOP the encoder opens with, as the loop last set them.
+    rate: RateParams,
     /// The GPU outputs of the frame in flight, between `analyse` and `finish_*`.
     held: Option<FrameAnalysis>,
 }
@@ -268,6 +276,7 @@ impl GpuBackend {
         Self {
             processor,
             encoder: None,
+            rate: RateParams::default(),
             held: None,
         }
     }
@@ -302,6 +311,14 @@ impl FrameBackend for GpuBackend {
             Control::RequestKeyframe => {
                 if let Some(enc) = self.encoder.as_mut() {
                     enc.request_keyframe();
+                }
+            }
+            Control::H264Rate { bps, fps, reopen } => {
+                self.rate = RateParams { bps, fps };
+                if reopen {
+                    // Dropped here, opened by the next `finish_h264` at the new
+                    // rate: a fresh encoder's first frame is an IDR.
+                    self.encoder = None;
                 }
             }
         }
@@ -370,7 +387,7 @@ impl FrameBackend for GpuBackend {
             None => true,
         };
         if needs_init {
-            match FullFrameEncoder::new(frame.width, frame.height) {
+            match FullFrameEncoder::with_params(frame.width, frame.height, self.rate) {
                 Ok(enc) => self.encoder = Some(enc),
                 Err(e) => {
                     tracing::warn!(target: LOG_TARGET, "Full-frame encoder init failed: {e}");

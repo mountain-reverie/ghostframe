@@ -15,7 +15,15 @@ use std::collections::HashMap;
 
 use ghostframe_protocol::ack::AckEntry;
 use ghostframe_protocol::fec::decode_parity_payload;
-use ghostframe_protocol::protocol::{decode_frame_datagram, FrameHeader, NO_ACK};
+use ghostframe_protocol::feedback_stream::ResetReason;
+use ghostframe_protocol::protocol::{
+    decode_frame_datagram, FrameHeader, FRAME_FLAG_PAD, NO_ACK, REF_FRAME_NONE,
+};
+
+/// Reference-break reset requests are at least this far apart: the server
+/// answers one a second at most, and the native renderer paces its own decode
+/// failures the same way.
+const REF_RESET_MIN_INTERVAL_US: u64 = 2_200_000;
 
 use crate::event::Event;
 use crate::{ClientCore, PollOutput, MAX_FRAME_FRAGMENTS, MAX_H264_ACCESS_UNIT_BYTES};
@@ -156,6 +164,25 @@ impl ClientCore {
             }
         }
 
+        // Probe padding is acknowledged (above) and nothing else: it names a
+        // frame the receiver has already seen and must not touch its assembly.
+        if !fh.is_parity() && fh.flags & FRAME_FLAG_PAD != 0 {
+            return;
+        }
+        // A P-frame fragment of a frame at or before the newest one delivered
+        // is moot: the decoder cannot go back, and a copy (a retransmission
+        // that crossed its acknowledgement) of a single-fragment P frame would
+        // complete it a second time and be decoded again. An IDR is judged
+        // when it completes (below), because its late fragments are kept on
+        // purpose (`IDR_EXEMPT_US`).
+        if !fh.is_parity()
+            && !fh.is_keyframe()
+            && self
+                .last_delivered_frame_seq
+                .is_some_and(|last| fh.frame_seq <= last)
+        {
+            return;
+        }
         // Drop datagrams for frames older than the eviction window, except the
         // fragments of an IDR that may still complete (see `IDR_EXEMPT_US`).
         if fh.frame_seq < self.latest_full_frame_seq.saturating_sub(2)
@@ -192,7 +219,7 @@ impl ClientCore {
                 // group (nothing missing) has nothing to wait for.
                 asm.parities.insert(group_start, (group_len, xor.to_vec()));
             }
-            self.finish_frame_if_complete(fh.frame_seq, events);
+            self.finish_frame_if_complete(fh.frame_seq, now_us, events);
             return;
         }
         if fh.frag_idx >= fh.frag_total {
@@ -266,7 +293,7 @@ impl ClientCore {
                 }
             }
         }
-        self.finish_frame_if_complete(fh.frame_seq, events);
+        self.finish_frame_if_complete(fh.frame_seq, now_us, events);
     }
 
     /// The newest IDR assembly held, if any.
@@ -312,7 +339,7 @@ impl ClientCore {
         }
     }
 
-    fn finish_frame_if_complete(&mut self, frame_seq: u32, events: &mut Vec<Event>) {
+    fn finish_frame_if_complete(&mut self, frame_seq: u32, now_us: u64, events: &mut Vec<Event>) {
         let complete = self
             .frame_assemblies
             .get(&frame_seq)
@@ -322,14 +349,39 @@ impl ClientCore {
                 Some(a) => a,
                 None => return,
             };
-            // A keyframe older than a frame already delivered would make the
-            // decoder jump back: it is moot, drop it.
+            // A keyframe at or before a frame already delivered would make the
+            // decoder jump back (or decode the same picture twice): it is
+            // moot, drop it.
             if asm.header.is_keyframe()
                 && self
                     .last_delivered_frame_seq
-                    .is_some_and(|last| frame_seq < last)
+                    .is_some_and(|last| frame_seq <= last)
             {
                 return;
+            }
+            if asm.header.is_keyframe() {
+                self.awaiting_idr = false;
+            } else {
+                // A P frame names the frame it predicts from. If that frame
+                // was never delivered (it was lost, or dropped as stale), the
+                // decoder has no reference for this one and every one after
+                // it: a 3 s GOP would leave the picture broken for seconds
+                // with nothing to say so. Do not hand such frames over; ask
+                // for an IDR (paced), and hold P frames until it arrives.
+                let reference = asm.header.ref_frame_seq;
+                let broken =
+                    reference != REF_FRAME_NONE && self.last_delivered_frame_seq != Some(reference);
+                if self.awaiting_idr || broken {
+                    self.awaiting_idr = true;
+                    let due = self
+                        .last_ref_reset_us
+                        .is_none_or(|t| now_us.saturating_sub(t) >= REF_RESET_MIN_INTERVAL_US);
+                    if due {
+                        self.last_ref_reset_us = Some(now_us);
+                        self.request_reset(ResetReason::GateReset, frame_seq);
+                    }
+                    return;
+                }
             }
             self.last_delivered_frame_seq = Some(
                 self.last_delivered_frame_seq

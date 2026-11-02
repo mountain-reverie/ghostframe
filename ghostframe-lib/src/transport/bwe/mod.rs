@@ -19,6 +19,7 @@
 use std::time::{Duration, Instant};
 
 mod ceiling;
+pub(crate) use ceiling::SATURATION;
 mod googcc;
 #[cfg(test)]
 mod react_replay;
@@ -254,6 +255,12 @@ impl BweWrapper {
     ) -> BweSnapshot {
         self.driver
             .update(records, losses, now, data_in_flight_bytes)
+    }
+
+    /// Keep the estimate ceiling off for `hold` from `now` (a probe burst's
+    /// spend outruns its acknowledgements). See `GoogCcDriver::hold_ceiling`.
+    pub fn hold_ceiling(&mut self, now: Instant, hold: Duration) {
+        self.driver.hold_ceiling(now, hold);
     }
 
     /// Return the current observability snapshot without advancing the estimator.

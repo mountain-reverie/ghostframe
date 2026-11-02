@@ -157,6 +157,21 @@ healthy H.264 resets it). The headroom guard reads the bandwidth *estimate*
 estimate is back over 2 Mbit/s and the screen has been idle for 2 s);
 `loss_override` is off unless `GHOSTFRAME_LOSS_OVERRIDE=1`.
 
+The H.264 stream is CBR at `0.8 x` the bandwidth estimate (smoothed, floor
+300 kbit/s). The rate changes only by reopening the encoder at an IDR:
+`rate_target_bps` is the last rate it was told, `idr_rate_drop` the immediate
+reopens for a fall of more than 30 % (these hold P frames like a loss IDR),
+`rate_reopens_gop` the ones that waited for the scheduled IDR. The GOP is 3 s of
+frames; `GHOSTFRAME_H264_GOP_SECONDS` picks 2 to 5 (anything else is clamped
+with a warning). A stream at `0.8 x` the estimate is not application-limited to
+goog_cc's ALR detector, so the bridge declares it so (`alr_signalled`, the
+detector is shown a sent size halved) and fills the probe windows goog_cc then
+asks for with padding when no IDR is due: copies of an acknowledged P-frame
+fragment under new `wire_seq`s (`probe_padding_windows` / `probe_padding_bytes`;
+the client acknowledges and discards them). A rise of more than 30 % reopens at
+once (`idr_rate_rise`), a jump of the raw estimate is held for a second, and
+the estimate ceiling is held off for a second around padding.
+
 With `GHOSTFRAME_DAMAGE_MODE=shadow` or `on` the daemon also logs a cumulative
 `damage safety net` line every 5 s (target `ghostframe::server::damage`);
 `corrections_unswept` against `dirty_tiles` is the would-have-been miss rate

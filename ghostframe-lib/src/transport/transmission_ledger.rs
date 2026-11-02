@@ -203,6 +203,15 @@ struct Record {
     tx: Transmission,
 }
 
+/// A datagram that departed inside a probe burst is judged lost by the time
+/// rule after this many times the usual threshold.
+const BURST_REORDER_FACTOR: u32 = 3;
+/// Burst spans kept (a span is a probe window and its drain).
+const MAX_PROBE_BURSTS: usize = 16;
+/// How many patient records the loss scan steps over looking for verdicts
+/// behind them.
+const PATIENT_SCAN_LIMIT: usize = 2048;
+
 pub struct TransmissionLedger {
     records: HashMap<u32, Record>,
     /// Recording order, for the capacity cap: the oldest record goes first.
@@ -222,6 +231,10 @@ pub struct TransmissionLedger {
     tombstone_order: VecDeque<u32>,
     /// Next departure index to hand out.
     next_dep_idx: u64,
+    /// The span of a probe burst (its window plus the queue it leaves): a
+    /// datagram that departed inside it gets a longer time threshold. See
+    /// [`Self::mark_probe_burst`].
+    probe_bursts: VecDeque<(Instant, Instant)>,
     /// The newest acknowledged departure: its index and when it left. Loss
     /// is only ever judged against this, never against the clock, so a queue
     /// that delays everything in order cannot produce a verdict (F4).
@@ -256,6 +269,7 @@ impl TransmissionLedger {
             tombstones: HashMap::new(),
             tombstone_order: VecDeque::new(),
             next_dep_idx: 0,
+            probe_bursts: VecDeque::new(),
             largest_acked: None,
             parity_departed: HashMap::new(),
             parity_order: VecDeque::new(),
@@ -518,6 +532,47 @@ impl TransmissionLedger {
         before - self.records.len()
     }
 
+    /// A probe burst departs from `start` and its queue drains by `end`.
+    /// A datagram that departed inside that span is delayed by the burst's own
+    /// queue, and on a jittery path it can be overtaken by a later one: the
+    /// time rule judges such a datagram lost only after
+    /// [`BURST_REORDER_FACTOR`] times the usual threshold. Scoped to the
+    /// burst; a datagram outside it, tile or frame, is judged as ever.
+    pub fn mark_probe_burst(&mut self, start: Instant, end: Instant) {
+        if let Some(last) = self.probe_bursts.back_mut() {
+            if start <= last.1 {
+                last.0 = last.0.min(start);
+                last.1 = last.1.max(end);
+                return;
+            }
+        }
+        if self.probe_bursts.len() >= MAX_PROBE_BURSTS {
+            self.probe_bursts.pop_front();
+        }
+        self.probe_bursts.push_back((start, end));
+    }
+
+    /// Whether `at` falls inside a marked probe burst.
+    pub fn in_probe_burst(&self, at: Instant) -> bool {
+        self.probe_bursts.iter().any(|&(s, e)| at >= s && at <= e)
+    }
+
+    /// Whether a record is probe material that gets the burst's patience: a
+    /// datagram of the H.264 stream (a pad or a fragment; never a tile) that
+    /// departed inside a marked burst. Tile datagrams are judged as ever even
+    /// when a probe window of the tile path is open.
+    fn is_patient(&self, tx: &Transmission, departed: Instant) -> bool {
+        !matches!(tx.content, Content::Tile(_)) && self.in_probe_burst(departed)
+    }
+
+    /// Whether the verdict on `wire_seq` fell on a datagram that is probe
+    /// material departing inside a marked burst (read from its tombstone).
+    pub fn declared_lost_in_burst(&self, wire_seq: u32) -> bool {
+        self.tombstones
+            .get(&wire_seq)
+            .is_some_and(|t| t.departed.is_some_and(|d| self.is_patient(&t.tx, d)))
+    }
+
     /// Forget everything about the session that ended: the outstanding
     /// records (neither delivered nor lost to anyone who counts), the
     /// tombstones, the acknowledgement reference, the adapted threshold and
@@ -532,6 +587,7 @@ impl TransmissionLedger {
         self.tombstones.clear();
         self.tombstone_order.clear();
         self.next_dep_idx = 0;
+        self.probe_bursts.clear();
         self.largest_acked = None;
         self.parity_departed.clear();
         self.parity_order.clear();
@@ -563,7 +619,12 @@ impl TransmissionLedger {
         ack: Option<(Instant, Duration)>,
     ) -> Option<Resolution> {
         if let Some(rec) = self.records.remove(&wire_seq) {
-            if let (Some(idx), Some(_)) = (rec.tx.dep_idx, rec.departed) {
+            // Probe padding is acknowledged (it is a measurement) but never
+            // moves the reference real datagrams are judged against: a pad
+            // that overtakes a real datagram on a jittery path would make the
+            // real one look like a hole.
+            let is_pad = matches!(rec.tx.content, Content::Pad(_));
+            if let (Some(idx), Some(_), false) = (rec.tx.dep_idx, rec.departed, is_pad) {
                 if self.largest_acked.is_none_or(|l| idx > l) {
                     self.largest_acked = Some(idx);
                 }
@@ -577,7 +638,11 @@ impl TransmissionLedger {
             let tx = t.tx;
             // An acknowledgement of a departure newer than any acknowledged so
             // far moves the reference the thresholds are judged against.
-            if let (Some(idx), Some(_)) = (tx.dep_idx, t.departed) {
+            if let (Some(idx), Some(_), false) = (
+                tx.dep_idx,
+                t.departed,
+                matches!(tx.content, Content::Pad(_)),
+            ) {
                 if self.largest_acked.is_none_or(|l| idx > l) {
                     self.largest_acked = Some(idx);
                 }
@@ -625,33 +690,63 @@ impl TransmissionLedger {
         let Some(largest_idx) = self.largest_acked else {
             return lost;
         };
-        while let Some(front) = self.departed_order.front().copied() {
-            let (idx, at) = match self.records.get(&front) {
+        // Walk the departure order. A record that is not yet lost normally ends
+        // the walk (everything behind it departed later, so cannot be lost if
+        // it is not). A *patient* one (probe material that departed inside a
+        // burst, judged by a longer threshold) must not hold up verdicts on
+        // the ordinary records behind it: step over it, a bounded number of
+        // them. A record declared lost behind the front stays in the order
+        // until it reaches the front, where the stale entry is dropped.
+        let mut i = 0usize;
+        let mut stepped = 0usize;
+        while i < self.departed_order.len() {
+            let ws = self.departed_order[i];
+            let (idx, at, patient) = match self.records.get(&ws) {
                 // Already resolved, or the record was replaced by a newer one
-                // under the same `wire_seq` that has not departed yet; drop
-                // the stale order entry and continue.
+                // under the same `wire_seq` that has not departed yet.
                 None | Some(Record { departed: None, .. }) => {
-                    self.departed_order.pop_front();
+                    if i == 0 {
+                        self.departed_order.pop_front();
+                    } else {
+                        i += 1;
+                    }
                     continue;
                 }
                 Some(Record {
                     departed: Some(at),
                     tx,
                     ..
-                }) => (tx.dep_idx.unwrap_or(u64::MAX), *at),
+                }) => (
+                    tx.dep_idx.unwrap_or(u64::MAX),
+                    *at,
+                    self.is_patient(tx, *at),
+                ),
             };
             if idx >= largest_idx {
                 break;
             }
+            let threshold = if patient {
+                time_threshold * BURST_REORDER_FACTOR
+            } else {
+                time_threshold
+            };
             let reason = if idx + self.k_pkt <= largest_idx {
                 LossReason::Packet
-            } else if at + time_threshold <= now {
+            } else if at + threshold <= now {
                 LossReason::Time
+            } else if patient && stepped < PATIENT_SCAN_LIMIT {
+                stepped += 1;
+                i += 1;
+                continue;
             } else {
                 break;
             };
-            self.departed_order.pop_front();
-            self.declare_lost(front, reason, &mut lost);
+            if i == 0 {
+                self.departed_order.pop_front();
+            } else {
+                i += 1;
+            }
+            self.declare_lost(ws, reason, &mut lost);
         }
         self.compact_if_sparse();
         lost
@@ -675,22 +770,50 @@ impl TransmissionLedger {
     /// timeout. Drops resolved entries at the front to find out.
     pub fn next_loss_time(&mut self, time_threshold: std::time::Duration) -> Option<Instant> {
         let largest_idx = self.largest_acked?;
-        while let Some(front) = self.departed_order.front().copied() {
-            match self.records.get(&front) {
+        let mut best: Option<Instant> = None;
+        let mut i = 0usize;
+        let mut stepped = 0usize;
+        while i < self.departed_order.len() {
+            let ws = self.departed_order[i];
+            match self.records.get(&ws) {
                 Some(Record {
                     departed: Some(at),
                     tx,
                     ..
                 }) => {
-                    return (tx.dep_idx.unwrap_or(u64::MAX) < largest_idx)
-                        .then(|| *at + time_threshold);
+                    let (idx, at, patient) = (
+                        tx.dep_idx.unwrap_or(u64::MAX),
+                        *at,
+                        self.is_patient(tx, *at),
+                    );
+                    if idx >= largest_idx {
+                        break;
+                    }
+                    let threshold = if patient {
+                        time_threshold * BURST_REORDER_FACTOR
+                    } else {
+                        time_threshold
+                    };
+                    let due = at + threshold;
+                    best = Some(best.map_or(due, |b| b.min(due)));
+                    // An ordinary record ends the walk; a patient one is
+                    // stepped over, as `detect_losses_at` does.
+                    if !patient || stepped >= PATIENT_SCAN_LIMIT {
+                        break;
+                    }
+                    stepped += 1;
+                    i += 1;
                 }
                 _ => {
-                    self.departed_order.pop_front();
+                    if i == 0 {
+                        self.departed_order.pop_front();
+                    } else {
+                        i += 1;
+                    }
                 }
             }
         }
-        None
+        best
     }
 
     /// The newest outstanding transmissions that have departed, newest first:
@@ -938,6 +1061,124 @@ mod tests {
         assert!(matches!(l.resolve(7), Some(Resolution::Live(_))));
         assert_eq!(l.resolve(7), None, "a second resolve finds nothing");
         assert!(l.detect_losses(FAR).is_empty());
+    }
+
+    /// A pad is acknowledged and classified once like any datagram, but its
+    /// acknowledgement is not the reference real datagrams are judged against:
+    /// a pad that overtakes a real datagram would otherwise make it a hole.
+    #[test]
+    fn a_pad_acknowledgement_does_not_move_the_reference_real_datagrams_are_judged_by() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        send(&mut l, 1, t0); // real, will be reordered behind the pad
+                             // The pad departs after it.
+        let mut pad = tx(2);
+        pad.content = Content::Pad(2);
+        l.record(2, t0, pad);
+        assert!(l.mark_departed(2, t0, 2));
+        assert!(
+            matches!(l.resolve(2), Some(Resolution::Live(_))),
+            "classified once"
+        );
+        assert!(
+            l.detect_losses_at(t0 + 10_000 * MS, MS).is_empty(),
+            "the pad's acknowledgement is no reference: nothing is a hole yet"
+        );
+        // A real one after it, acknowledged: now 1 is a hole.
+        send(&mut l, 3, t0);
+        assert!(matches!(l.resolve(3), Some(Resolution::Live(_))));
+        assert_eq!(lost_ws(&l.detect_losses_at(t0 + 10_000 * MS, MS)), vec![1]);
+    }
+
+    fn send_content(l: &mut TransmissionLedger, ws: u32, at: Instant, content: Content) {
+        let mut t = tx(ws);
+        t.content = content;
+        l.record(ws, at, t);
+        assert!(l.mark_departed(ws, at, ws as u64));
+    }
+
+    fn h264(n: u32) -> Content {
+        Content::H264Frag {
+            frame_seq: n,
+            frag_idx: 0,
+        }
+    }
+
+    /// Inside a marked probe burst the time rule waits three times as long for
+    /// an H.264 datagram; a tile datagram gets no patience however open the
+    /// burst (a probe window of the tile path marks one too); outside the
+    /// burst nothing changes.
+    #[test]
+    fn the_time_rule_is_patient_only_with_h264_datagrams_that_departed_in_a_probe_burst() {
+        let thr = 100 * MS;
+        // (in_burst, content is a tile) -> is it declared lost at 150 ms?
+        for (in_burst, tile, lost_at_150) in [
+            (false, false, true),
+            (true, false, false),
+            (true, true, true),
+            (false, true, true),
+        ] {
+            let t0 = Instant::now();
+            let mut l = TransmissionLedger::new(64);
+            if in_burst {
+                l.mark_probe_burst(t0, t0 + 50 * MS);
+            }
+            let c = if tile {
+                Content::Tile(EmitKey::new(1, 0, 0, 0))
+            } else {
+                h264(1)
+            };
+            send_content(&mut l, 1, t0, c);
+            send(&mut l, 2, t0);
+            assert!(matches!(l.resolve(2), Some(Resolution::Live(_))));
+            let lost = l.detect_losses_at(t0 + 150 * MS, thr);
+            assert_eq!(
+                lost.len(),
+                usize::from(lost_at_150),
+                "in_burst={in_burst} tile={tile}"
+            );
+            if in_burst && !tile {
+                assert_eq!(l.next_loss_time(thr), Some(t0 + 300 * MS));
+                assert_eq!(l.detect_losses_at(t0 + 300 * MS, thr).len(), 1);
+                assert!(
+                    l.declared_lost_in_burst(1),
+                    "and the verdict says it fell in the burst"
+                );
+            }
+        }
+    }
+
+    /// A patient record at the head of the departure order does not hold up
+    /// verdicts on ordinary records behind it.
+    #[test]
+    fn a_patient_record_does_not_block_verdicts_behind_it() {
+        let thr = 100 * MS;
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        l.mark_probe_burst(t0, t0 + 10 * MS);
+        send_content(&mut l, 1, t0, h264(1)); // patient: waits 300 ms
+        send_content(
+            &mut l,
+            2,
+            t0 + 20 * MS,
+            Content::Tile(EmitKey::new(2, 0, 0, 0)),
+        ); // ordinary, outside the burst
+        send(&mut l, 3, t0 + 20 * MS);
+        assert!(matches!(l.resolve(3), Some(Resolution::Live(_))));
+        // 150 ms: 2 is a hole past its threshold; 1 is not yet (patient).
+        let lost = l.detect_losses_at(t0 + 130 * MS, thr);
+        assert_eq!(
+            lost_ws(&lost),
+            vec![2],
+            "the ordinary record behind the patient one"
+        );
+        assert_eq!(
+            l.next_loss_time(thr),
+            Some(t0 + 300 * MS),
+            "the patient one is still owed its wait"
+        );
+        let lost = l.detect_losses_at(t0 + 300 * MS, thr);
+        assert_eq!(lost_ws(&lost), vec![1]);
     }
 
     /// With nothing acknowledged there is nothing to be lost *relative to*: no

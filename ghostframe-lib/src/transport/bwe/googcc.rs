@@ -161,6 +161,16 @@ impl GoogCcDriver {
     /// will never work through while the rates still describe the link.
     const MAX_PENDING_PROBE_REQUESTS: usize = 4;
 
+    /// Do not read the estimate ceiling until `hold` after `now`. A probe
+    /// burst spends the whole grant for a moment while its acknowledgements
+    /// are still a round trip (plus the queue it built) away, so the ceiling
+    /// would read a saturated sender with almost nothing acknowledged and
+    /// clamp the estimate to its floor.
+    pub(crate) fn hold_ceiling(&mut self, now: Instant, hold: Duration) {
+        let until = self.micros_since_base(now) + hold.as_micros() as u64;
+        self.ceiling_hold_until_us = self.ceiling_hold_until_us.max(until);
+    }
+
     /// goog_cc is never given a `NetworkStateEstimate` (the model controller
     /// feeds no capacity hint), so `ProbeController::time_for_network_state_probe`
     /// returns false at its first check: every network-state path needs one.
@@ -190,14 +200,18 @@ impl GoogCcDriver {
                 // Without this, `enable_periodic_alr_probing` is never
                 // called and stays at its `false` default, so
                 // `ProbeController::time_for_alr_probe` returns `false`
-                // unconditionally. A screen-sharing source is
-                // application-limited almost all of the time — it sends
-                // what the screen produced, not what the link could carry
-                // — so ALR probing is the mechanism that would ever
-                // re-measure capacity after startup. Without it a link
-                // whose capacity rises is never discovered: measured
-                // 5.5 Mbps estimated on a link that stepped up to
-                // 20 Mbps mid-scene.
+                // unconditionally. A tile-mode screen-sharing source is
+                // application-limited almost all of the time (it sends what
+                // the screen produced, not what the link could carry), and
+                // goog_cc's own ALR detector sees that; ALR probing is then
+                // what re-measures capacity after start-up (measured: 5.5
+                // Mbps estimated on a link that stepped up to 20 Mbps
+                // mid-scene, without it). A CBR H.264 stream held at 0.8 x
+                // its estimate is NOT seen as application-limited by that
+                // detector (its usage line is 65 %), so for that stream
+                // ghostframe starts probe clusters of its own (`h264_rate`:
+                // `h264_app_probe`), which this estimator measures like any
+                // other because it takes the cluster id from the packets.
                 requests_alr_probing: Some(true),
                 // The pacer rate is the estimate, not libwebrtc's `2.5 x`.
                 // See `PACING_FACTOR`.

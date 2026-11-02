@@ -1,6 +1,23 @@
 // Full-frame H.264 decode via WebCodecs. All wire parsing lives in the wasm
 // core; this is only the browser-side VideoDecoder wrapper.
 
+/** Decode failures ask the server for an IDR (feedback stream 0x09), at most this often. */
+export const RESET_REQUEST_MIN_INTERVAL_MS = 2200;
+
+/**
+ * Paces decode-failure reset requests like the native renderer: the first goes
+ * out at once, the next only `RESET_REQUEST_MIN_INTERVAL_MS` after it.
+ */
+export class ResetPacer {
+  private last: number | null = null;
+  /** Whether a request may go out at `nowMs`; if so, it is recorded as sent. */
+  allow(nowMs: number): boolean {
+    if (this.last !== null && nowMs - this.last < RESET_REQUEST_MIN_INTERVAL_MS) return false;
+    this.last = nowMs;
+    return true;
+  }
+}
+
 export class FullFrameDecoder {
   private decoder!: VideoDecoder;
   private latestFrame: VideoFrame | null = null;
@@ -9,17 +26,21 @@ export class FullFrameDecoder {
   /**
    * An async decode error closes the WebCodecs decoder for good, and the delta
    * chunks that follow cannot be decoded without the reference they lost. Until
-   * the next key chunk, drop deltas; on it, build a fresh decoder. The server
-   * has no keyframe-request message, so this waits for its natural keyframe
-   * (every FULL_FRAME_GOP = 11 frames while H.264 is streaming).
+   * the next key chunk, drop deltas; on it, build a fresh decoder. The failure
+   * is reported through `onDecodeFailure` so the owner can ask the server for
+   * an IDR now instead of waiting out the GOP (3 s by default).
    */
   private awaitingKeyframe = false;
+  /** The frame_seq of the last chunk given to the decoder. */
+  private lastFrameSeq = 0;
 
   constructor(
     /** `frameSeq` is the value given to `decode()` for the chunk this frame came from. */
     private onFrame: (frame: VideoFrame, frameSeq: number) => void,
     private width: number,
     private height: number,
+    /** Called with the frame_seq last handed to the decoder when it fails. */
+    private onDecodeFailure: (frameSeq: number) => void = () => {},
   ) {
     this.open();
   }
@@ -38,7 +59,10 @@ export class FullFrameDecoder {
       },
       error: (e: DOMException) => {
         console.error('Full-frame H264 decode error:', e.message);
-        if (this.decoder === decoder) this.awaitingKeyframe = true;
+        if (this.decoder === decoder) {
+          this.awaitingKeyframe = true;
+          this.onDecodeFailure(this.lastFrameSeq);
+        }
       },
     });
     this.decoder = decoder;
@@ -58,6 +82,7 @@ export class FullFrameDecoder {
       this.awaitingKeyframe = false;
       this.open();
     }
+    this.lastFrameSeq = frameSeq;
     const chunk = new EncodedVideoChunk({
       type: isKeyframe ? 'key' : 'delta',
       timestamp: frameSeq,
@@ -70,6 +95,7 @@ export class FullFrameDecoder {
       // (lost session-start IDR, or a key chunk the browser rejected). Drop
       // the deltas that follow quietly instead of throwing for each one.
       this.awaitingKeyframe = true;
+      this.onDecodeFailure(frameSeq);
       throw e;
     }
   }

@@ -98,6 +98,8 @@ pub(crate) use pacing::SCHEDULER_TICK_INTERVAL_US;
 #[path = "io_bridge/emit.rs"]
 mod emit;
 
+#[path = "io_bridge/h264_rate.rs"]
+mod h264_rate;
 #[path = "io_bridge/h264_tx.rs"]
 mod h264_tx;
 use h264_tx::{H264Gate, H264Tx};
@@ -422,6 +424,24 @@ pub struct InjectedH264 {
     /// Frame size, for the dimensions datagram and resolution attribution.
     pub width: u32,
     pub height: u32,
+    /// A scripted CBR encoder instead of fixed sizes: the bridge's real rate
+    /// policy runs and frame sizes follow the rate it sets (`idr_bytes`,
+    /// `p_bytes` and `gop_frames` are then unused). `None` for the fixed-size
+    /// scripted encoder.
+    pub cbr: Option<InjectedCbr>,
+}
+
+/// The scripted CBR encoder of [`InjectedH264::cbr`]: a P frame is
+/// `rate / 8 / fps` bytes, an IDR is `idr_over_p` of them, and an IDR is made
+/// on a reopen, on a request, and for the first frame, exactly as the real
+/// encoder: the periodic IDR is the bridge's (a time since the last IDR), not
+/// the encoder's.
+#[derive(Debug, Clone, Copy)]
+pub struct InjectedCbr {
+    pub fps: u32,
+    pub idr_over_p: u32,
+    /// The GOP the bridge's clock uses; `None` for the configured one.
+    pub gop: Option<std::time::Duration>,
 }
 
 /// An arm of the `select!` in `IoBridge::run`. See `IoBridge::loop_arm_trace`.
@@ -1343,6 +1363,10 @@ impl IoBridge {
         bwe: crate::transport::bwe::BweWrapper,
     ) -> Self {
         let (peer_lookup_tx, peer_lookup_rx) = mpsc::unbounded_channel();
+        let (h264_gop, h264_fps) = (
+            lib_config.transport.h264_gop(),
+            lib_config.transport.h264_fps(),
+        );
         Self {
             _handle: diffs.handle,
             stream,
@@ -1439,7 +1463,11 @@ impl IoBridge {
             frame_acks_received: 0,
             frame_acks_malformed: 0,
             last_h264_frame_seq: None,
-            h264: H264Tx::default(),
+            h264: H264Tx {
+                gop: h264_gop,
+                fps: h264_fps,
+                ..H264Tx::default()
+            },
             #[cfg(any(test, feature = "browserless-harness"))]
             h264_stats_publish: std::sync::Arc::new(std::sync::Mutex::new(H264Report::default())),
             last_reset_request_idr_at: None,
