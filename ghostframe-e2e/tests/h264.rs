@@ -254,8 +254,8 @@ async fn h264_frames_from_the_server_render_into_the_dmabuf() {
     // a missed one. The bit rate is whatever the estimate gave at the first
     // frame, so only its presence is asserted.
     assert!(
-        server_logs.contains("FullFrameEncoder: using h264_vaapi hardware encoder (CBR)")
-            || server_logs.contains("FullFrameEncoder: using libx264 software encoder (CBR)"),
+        server_logs.contains("FullFrameEncoder: using h264_vaapi hardware encoder (rate-capped VBR)")
+            || server_logs.contains("FullFrameEncoder: using libx264 software encoder (rate-capped)"),
         "the full-frame encoder was not opened with the CBR parameters. server logs:\n{server_logs}"
     );
     assert!(

@@ -350,7 +350,8 @@ fn default_rate_params_are_cbr_at_thirty_fps() {
 /// CBR holds the output to the target, on content that moves and compresses
 /// the way a desktop does (a structured moving pattern, not noise).
 ///
-/// 320x240 at 30 fps for 5 s at 1 Mbit/s. The checks, from the rate control's
+/// 320x240 at 30 fps for 5 s at 1 Mbit/s, on a drifting structured pattern with
+/// per-pixel texture. The checks, from the rate control's
 /// own definition (the output of any window of a CBR stream is bounded by the
 /// rate over the window plus what the VBV may hold):
 ///  * every sliding 1 s window (30 consecutive output frames) is at most
@@ -359,10 +360,11 @@ fn default_rate_params_are_cbr_at_thirty_fps() {
 ///
 /// Quality-controlled (CQP) output of this pattern is several times that.
 ///
-/// To see it fail: mutate `try_open_vaapi` to open for CQP instead of CBR,
-/// replacing `opts.set("rc_mode", "CBR");` with
-/// `opts.set("rc_mode", "CQP"); opts.set("qp", "12");` (for the software
-/// fallback, delete the `nal-hrd` option and the `set_bit_rate` calls).
+/// To see it fail: mutate `try_open_vaapi` to open for CQP instead,
+/// replacing `opts.set("rc_mode", "VBR");` with
+/// `opts.set("rc_mode", "CQP"); opts.set("qp", "12");`. Measured on the RX 480:
+/// VBR gives 162 kB total and a worst window of 60 kB; CQP qp=12 gives 7.8 MB
+/// and 1.57 MB (bounds 937 kB and 275 kB); CBR gives 627 kB and 129 kB.
 ///
 /// Not run in CI (needs the GPU lock); run it on hardware.
 #[test]
@@ -388,7 +390,16 @@ fn cbr_output_stays_near_the_target_rate_on_moving_content() {
         let mut nv12 = vec![128u8; (width * height * 3 / 2) as usize];
         for y in 0..height as usize {
             for x in 0..width as usize {
-                nv12[y * width as usize + x] = (((x + 3 * t) ^ (2 * y + t)) & 0xFF) as u8;
+                // The structured drift plus 6 bits of per-pixel, per-frame
+                // texture (a hash, so deterministic): busy enough that a
+                // quality-controlled encode of it is several times the budget.
+                let h = (x as u32)
+                    .wrapping_mul(0x9E37_79B1)
+                    .wrapping_add((y as u32).wrapping_mul(0x85EB_CA6B))
+                    .wrapping_add((t as u32).wrapping_mul(0xC2B2_AE35));
+                let texture = ((h ^ (h >> 15)).wrapping_mul(0x2C1B_3C6D) >> 24) & 0x3F;
+                nv12[y * width as usize + x] =
+                    ((((x + 3 * t) ^ (2 * y + t)) & 0xC0) as u32 | texture) as u8;
             }
         }
         let uv = (width * height) as usize;
@@ -441,7 +452,8 @@ fn cbr_output_stays_near_the_target_rate_on_moving_content() {
 /// 8 333 bytes a frame; 30 static P frames must average under a quarter of it.
 ///
 /// To see it fail on the software fallback, put `opts.set("nal-hrd", "cbr")`
-/// back in `try_open_sw`. For VA-API there is no ffmpeg option for the
+/// back in `try_open_sw`; on VA-API, set `rc_mode` back to `CBR` (measured on
+/// the RX 480: mean 8 345 B against the 8 333 B budget). There is no ffmpeg option for the
 /// driver's stuffing (ffmpeg 9.0.2 `h264_vaapi` offers `rc_mode`, `blbrc`,
 /// `max_frame_size`, `qp`, `quality`, `low_power`, nothing like
 /// `disable_bit_stuffing`), so this test is what finds out whether the driver
