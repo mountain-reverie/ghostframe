@@ -206,12 +206,16 @@ impl GoogCcDriver {
                 // goog_cc's own ALR detector sees that; ALR probing is then
                 // what re-measures capacity after start-up (measured: 5.5
                 // Mbps estimated on a link that stepped up to 20 Mbps
-                // mid-scene, without it). A CBR H.264 stream held at 0.8 x
-                // its estimate is NOT seen as application-limited by that
-                // detector (its usage line is 65 %), so for that stream
-                // ghostframe starts probe clusters of its own (`h264_rate`:
-                // `h264_app_probe`), which this estimator measures like any
-                // other because it takes the cluster id from the packets.
+                // mid-scene, without it). The fork's ALR detector budgets
+                // 80 % of the estimate (`alr_bandwidth_usage_percent`),
+                // lets unused budget build up over a 500 ms window and starts
+                // the region above 40 % full. A rate-capped H.264 stream held
+                // at 0.8 x its estimate refills the budget exactly as fast as
+                // it spends it, so it is not reliably seen as
+                // application-limited, and for that stream ghostframe starts
+                // probe clusters of its own (`h264_rate`: `h264_app_probe`),
+                // which this estimator measures like any other because it
+                // takes the cluster id from the packets.
                 requests_alr_probing: Some(true),
                 // The pacer rate is the estimate, not libwebrtc's `2.5 x`.
                 // See `PACING_FACTOR`.

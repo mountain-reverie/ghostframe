@@ -1,4 +1,4 @@
-//! H.264 rate control, Phase A (design section 4.3): a CBR target that follows
+//! H.264 rate control, Phase A (design section 4.3): a rate-capped VBR target that follows
 //! the bandwidth estimate, applied by reopening the encoder at an IDR.
 //!
 //! The ffmpeg encoder cannot change its rate mid-stream without an RC reset,
@@ -19,7 +19,7 @@
 //! * At most one reopen per 2 s.
 //!
 //! [`RatePolicy`] is pure: time and the estimate are arguments. The glue that
-//! asks the encoder to reopen, and the harness's scripted CBR encoder, are at
+//! asks the encoder to reopen, and the harness's scripted rate-capped encoder, are at
 //! the bottom of the file.
 
 use super::*;
@@ -132,8 +132,8 @@ pub(crate) enum RateStep {
     /// otherwise this is the scheduled GOP IDR taking a new rate.
     Reopen { bps: u32, urgent: bool },
     /// Reopen at once for a rise of more than 30 % (see [`RISE_FRACTION`]).
-    /// Its IDR is [`IdrCause::RateRise`]; it holds nothing (the link is
-    /// healthy, the client already has a picture).
+    /// Its IDR is [`IdrCause::RateRise`]; like every IDR but the scheduled GOP
+    /// one it opens a P hold (`send_h264_frame`) and is not padded.
     ReopenRise { bps: u32 },
 }
 
@@ -281,7 +281,7 @@ impl RatePolicy {
 // The scripted CBR encoder of the browserless harness.
 // ---------------------------------------------------------------------------
 
-/// The harness's stand-in for a CBR encoder (see
+/// The harness's stand-in for a rate-capped encoder (see
 /// [`InjectedH264::cbr`](super::InjectedH264)): frame sizes follow the rate the
 /// bridge last set through [`Control::H264Rate`], an IDR is `idr_over_p` P
 /// frames, and a reopen (or a pending IDR request, the GOP's included) makes
@@ -378,8 +378,9 @@ impl IoBridge {
     /// Start a probe cluster of ghostframe's own, if one is due.
     ///
     /// goog_cc's periodic ALR probing needs its ALR detector to call the
-    /// sender application-limited, and a CBR stream at 0.8 x its estimate is
-    /// above that detector's usage line, so it never asks. The stream *is*
+    /// sender application-limited (budget 80 % of the estimate, region starts above
+    /// 40 % budget), and a rate-capped stream at 0.8 x its estimate spends the
+    /// budget as fast as it refills, so it does not reliably ask. The stream *is*
     /// application-limited in the sense that matters (it chose not to send
     /// more), so the application probes: a cluster at twice the estimate every
     /// [`APP_PROBE_INTERVAL`], and, while a probe keeps succeeding (the
