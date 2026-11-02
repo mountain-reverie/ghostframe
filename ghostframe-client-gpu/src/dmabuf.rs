@@ -63,9 +63,8 @@ struct DmaBufSync {
     flags: u64,
 }
 
-/// `DMA_BUF_IOCTL_SYNC` (`linux/dma-buf.h`): `_IOW(DMA_BUF_BASE, 0, struct
-/// dma_buf_sync)`, `DMA_BUF_BASE` is `'b'`, and `struct dma_buf_sync` is a
-/// single `__u64 flags` field (8 bytes). `libc` does not carry DMA-BUF's
+/// `_IOW(DMA_BUF_BASE, nr, <struct of size bytes>)` from the dma-buf uapi
+/// (`linux/dma-buf.h`). `DMA_BUF_BASE` is `'b'`. `libc` does not carry DMA-BUF's
 /// ioctl constants, so the request number is derived here from the
 /// `asm-generic/ioctl.h` encoding rather than hard-coded, so the derivation
 /// is checkable against the kernel header instead of trusted as a magic
@@ -79,23 +78,24 @@ struct DmaBufSync {
 ///     (size << _IOC_SIZESHIFT)     // _IOC_SIZESHIFT = 16
 /// _IOW(type, nr, size) = _IOC(_IOC_WRITE /* 1 */, type, nr, size_of(size))
 /// ```
-fn dma_buf_ioctl_sync() -> libc::Ioctl {
+const fn dma_buf_iow(nr: u64, size: u64) -> libc::Ioctl {
     const IOC_WRITE: u64 = 1;
     const IOC_NRSHIFT: u64 = 0;
     const IOC_TYPESHIFT: u64 = 8;
     const IOC_SIZESHIFT: u64 = 16;
     const IOC_DIRSHIFT: u64 = 30;
-
     const DMA_BUF_BASE: u64 = b'b' as u64;
-    const NR: u64 = 0;
-    const SIZE: u64 = std::mem::size_of::<DmaBufSync>() as u64;
 
     let request = (IOC_WRITE << IOC_DIRSHIFT)
         | (DMA_BUF_BASE << IOC_TYPESHIFT)
-        | (NR << IOC_NRSHIFT)
-        | (SIZE << IOC_SIZESHIFT);
+        | (nr << IOC_NRSHIFT)
+        | (size << IOC_SIZESHIFT);
     request as libc::Ioctl
 }
+
+/// `DMA_BUF_IOCTL_SYNC`: `_IOW('b', 0, struct dma_buf_sync)`, a single
+/// `__u64 flags` field (8 bytes).
+const DMA_BUF_IOCTL_SYNC: libc::Ioctl = dma_buf_iow(0, std::mem::size_of::<DmaBufSync>() as u64);
 
 /// Issue `DMA_BUF_IOCTL_SYNC` with the given flags.
 ///
@@ -110,7 +110,7 @@ pub unsafe fn dma_buf_sync(fd: i32, flags: u64) -> Result<(), GpuError> {
         // SAFETY: `fd` is a valid dmabuf fd per this function's contract;
         // `arg` is a correctly-shaped `struct dma_buf_sync` for the ioctl's
         // duration.
-        let ret = unsafe { libc::ioctl(fd, dma_buf_ioctl_sync(), &arg as *const DmaBufSync) };
+        let ret = unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_SYNC, &arg as *const DmaBufSync) };
         if ret == 0 {
             return Ok(());
         }
@@ -120,6 +120,102 @@ pub unsafe fn dma_buf_sync(fd: i32, flags: u64) -> Result<(), GpuError> {
         }
         return Err(GpuError::Io(err));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fences on a dmabuf (DMA_BUF_IOCTL_IMPORT_SYNC_FILE, poll)
+// ---------------------------------------------------------------------------
+
+/// Mirrors `struct dma_buf_import_sync_file` from `linux/dma-buf.h`.
+#[repr(C)]
+struct DmaBufImportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+/// `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`: `_IOW('b', 3, struct
+/// dma_buf_import_sync_file)` (Linux 6.0+).
+const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: libc::Ioctl =
+    dma_buf_iow(3, std::mem::size_of::<DmaBufImportSyncFile>() as u64);
+
+/// Attach `sync_file` to the dmabuf `fd` as a fence an implicit-sync consumer
+/// will wait for before it touches the buffer.
+///
+/// `flags` is `DMA_BUF_SYNC_WRITE` for a fence the buffer's last writer
+/// signals (every reader waits for it) or `DMA_BUF_SYNC_READ` (only writers do).
+/// The kernel takes its own reference to the fence, so `sync_file` stays the
+/// caller's.
+///
+/// # Safety
+/// `fd` must be a valid, open dmabuf file descriptor and `sync_file` a valid
+/// sync_file descriptor.
+pub unsafe fn dma_buf_import_sync_file(
+    fd: i32,
+    flags: u32,
+    sync_file: i32,
+) -> Result<(), GpuError> {
+    let arg = DmaBufImportSyncFile {
+        flags,
+        fd: sync_file,
+    };
+    // Restarted on EINTR/EAGAIN like `dma_buf_sync`.
+    loop {
+        // SAFETY: `fd` and `sync_file` are valid per this function's contract;
+        // `arg` is a correctly-shaped `struct dma_buf_import_sync_file` for the
+        // ioctl's duration.
+        let ret = unsafe {
+            libc::ioctl(
+                fd,
+                DMA_BUF_IOCTL_IMPORT_SYNC_FILE,
+                &arg as *const DmaBufImportSyncFile,
+            )
+        };
+        if ret == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if matches!(err.raw_os_error(), Some(libc::EINTR) | Some(libc::EAGAIN)) {
+            continue;
+        }
+        return Err(GpuError::Io(err));
+    }
+}
+
+/// Wait until the GPU has finished *writing* the dmabuf `fd`, for at most
+/// `timeout_ms` (0 polls). `true` when it has.
+///
+/// A dmabuf is pollable: `POLLIN` becomes ready once every write fence in its
+/// reservation has signalled (`POLLOUT` waits for readers too). That is what
+/// makes this a statement about the buffer rather than about one fence fd, and
+/// it works for fences the kernel attached on its own as well as ones imported
+/// with [`dma_buf_import_sync_file`].
+pub fn dma_buf_wait_write_idle(fd: i32, timeout_ms: i32) -> Result<bool, GpuError> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `pfd` is one valid, initialised `pollfd` and the count is 1;
+        // `fd` is a live fd per the caller.
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        match ret {
+            0 => return Ok(false),
+            1 => return Ok(true),
+            _ => {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(GpuError::Io(err));
+            }
+        }
+    }
+}
+
+/// Whether the GPU is still writing the dmabuf `fd`, right now.
+pub fn dma_buf_write_pending(fd: i32) -> bool {
+    !matches!(dma_buf_wait_write_idle(fd, 0), Ok(true))
 }
 
 // ---------------------------------------------------------------------------

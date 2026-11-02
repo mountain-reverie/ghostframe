@@ -1,8 +1,10 @@
 //! The render thread: owns `WgpuContext` and the per-session `Renderer`.
 //!
-//! Kept off the net thread deliberately. `ExportRing::publish` calls
-//! `device.poll(PollType::wait_indefinitely())` after its blit (see the
-//! design doc's section 5.5) -- a real GPU stall, not a fast path. If that lived
+//! Kept off the net thread deliberately. `ExportRing::publish` no longer waits
+//! for its blit, except with `GHOSTFRAME_BLOCKING_PUBLISH` or on a Vulkan device
+//! with no exportable semaphore, where it calls
+//! `device.poll(PollType::wait_indefinitely())` (see the design doc's section
+//! 5.5) -- a real GPU stall, not a fast path. If that lived
 //! on the same thread that owns `ClientNet`, a stall there would delay
 //! ACK/NACK batching and timer-driven feedback, and much of the M3
 //! transport stack is timing-sensitive. Splitting the threads means a GPU

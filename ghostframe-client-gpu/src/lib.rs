@@ -55,6 +55,10 @@ mod egl_ffi;
 #[cfg(feature = "gles")]
 #[path = "export_gles.rs"]
 pub mod export;
+// The fence a publish leaves on its export buffer. Vulkan only: on GLES the
+// kernel orders the consumer behind the job by itself (see `ring.rs`).
+#[cfg(feature = "vulkan")]
+mod fence;
 pub mod framebuffer;
 #[cfg(feature = "vulkan")]
 #[path = "import.rs"]

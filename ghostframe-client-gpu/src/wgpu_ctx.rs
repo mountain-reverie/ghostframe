@@ -161,7 +161,7 @@ impl WgpuContext {
             );
         }
 
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        let device_desc = wgpu::DeviceDescriptor {
             label: Some("ghostframe-client"),
             required_features: wgpu::Features::VULKAN_EXTERNAL_MEMORY_FD,
             // downlevel_defaults caps maxComputeInvocationsPerWorkgroup at
@@ -180,8 +180,22 @@ impl WgpuContext {
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
             ..Default::default()
-        }))
-        .map_err(|e| GpuError::Vulkan(format!("request_device: {e}")))?;
+        };
+        // wgpu-hal does not enable `VK_KHR_external_semaphore_fd`, which the
+        // export fence (`fence.rs`) needs, so open the device through its hook
+        // when the driver has it. Any trouble there is not worth refusing to
+        // start over: the plain path is what the client ran on before, and the
+        // ring falls back to waiting on the GPU without the extension.
+        let custom = if crate::config::PublishConfig::from_env().plain_device_open {
+            None
+        } else {
+            Self::open_with_semaphore_fd(&adapter, &device_desc)
+        };
+        let (device, queue) = match custom {
+            Some(pair) => pair,
+            None => pollster::block_on(adapter.request_device(&device_desc))
+                .map_err(|e| GpuError::Vulkan(format!("request_device: {e}")))?,
+        };
 
         Ok(WgpuContext {
             instance,
@@ -198,6 +212,90 @@ impl WgpuContext {
             #[cfg(feature = "gles")]
             gl_tex_fns: OnceLock::new(),
         })
+    }
+
+    /// Open the device like `Adapter::request_device` would, with
+    /// `VK_KHR_external_semaphore_fd` (and its dependency) added. `None` if
+    /// anything about that looks doubtful, so the caller can take the plain path.
+    ///
+    /// `create_device_from_hal` skips the request-time checks `request_device`
+    /// makes, so they are repeated here first. The extension list is checked
+    /// against the driver before the hal open, because a `vkCreateDevice` that
+    /// reports a missing extension is a panic in wgpu-hal, not an error; the
+    /// whole attempt is also wrapped in `catch_unwind` so nothing on this
+    /// optional path can take the client down.
+    #[cfg(feature = "vulkan")]
+    fn open_with_semaphore_fd(
+        adapter: &wgpu::Adapter,
+        desc: &wgpu::DeviceDescriptor<'_>,
+    ) -> Option<(wgpu::Device, wgpu::Queue)> {
+        if !adapter.features().contains(desc.required_features)
+            || !desc.required_limits.check_limits(&adapter.limits())
+        {
+            return None;
+        }
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::open_with_semaphore_fd_inner(adapter, desc)
+        }));
+        match attempt {
+            Ok(opened) => opened,
+            Err(_) => {
+                tracing::warn!("opening the device with external-semaphore support panicked");
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn open_with_semaphore_fd_inner(
+        adapter: &wgpu::Adapter,
+        desc: &wgpu::DeviceDescriptor<'_>,
+    ) -> Option<(wgpu::Device, wgpu::Queue)> {
+        let wanted = [
+            ash::khr::external_semaphore::NAME,
+            ash::khr::external_semaphore_fd::NAME,
+        ];
+        // SAFETY: the borrowed hal adapter lives to the end of this block; it
+        // is only read, and used to open one device.
+        let open = {
+            let hal_adapter = unsafe { adapter.as_hal::<wgpu_hal::api::Vulkan>() }?;
+            let instance = hal_adapter.shared_instance().raw_instance();
+            // SAFETY: a read-only query on the adapter's own physical device.
+            let supported = unsafe {
+                instance.enumerate_device_extension_properties(hal_adapter.raw_physical_device())
+            }
+            .ok()?;
+            let has = |name: &std::ffi::CStr| {
+                supported
+                    .iter()
+                    .any(|p| p.extension_name_as_c_str() == Ok(name))
+            };
+            if !wanted.iter().all(|name| has(name)) {
+                return None;
+            }
+            // SAFETY: the callback only appends extensions the driver listed
+            // as supported, which is all the hal contract permits.
+            unsafe {
+                hal_adapter.open_with_callback(
+                    desc.required_features,
+                    &desc.required_limits,
+                    &desc.memory_hints,
+                    Some(Box::new(
+                        move |args: wgpu_hal::vulkan::CreateDeviceCallbackArgs<'_, '_, '_>| {
+                            for name in wanted {
+                                if !args.extensions.contains(&name) {
+                                    args.extensions.push(name);
+                                }
+                            }
+                        },
+                    )),
+                )
+            }
+            .ok()?
+        };
+        // SAFETY: `open` was just opened from this adapter with the features and
+        // limits `desc` carries, which the caller checked the adapter supports.
+        unsafe { adapter.create_device_from_hal::<wgpu_hal::api::Vulkan>(open, desc) }.ok()
     }
 
     /// GLES/EGL context, for GPUs with no Vulkan driver at all.

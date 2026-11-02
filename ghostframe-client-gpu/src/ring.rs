@@ -22,6 +22,8 @@
 use crate::coalesce::{coalesce, Rect};
 use crate::dirty::DirtyHistory;
 use crate::export::{ExportedImage, PlaneLayout};
+#[cfg(feature = "vulkan")]
+use crate::fence::ExportFence;
 use crate::framebuffer::Framebuffer;
 use crate::wgpu_ctx::WgpuContext;
 use crate::GpuError;
@@ -118,6 +120,18 @@ pub(crate) struct PublishPlan {
 /// blits from a shared private [`Framebuffer`].
 pub struct ExportRing {
     buffers: Vec<ExportBuffer>,
+    /// Vulkan: makes the sync_file a publish imports into its buffer's
+    /// reservation. `None` when this device cannot (or stopped being able to),
+    /// in which case a publish waits for the GPU.
+    #[cfg(feature = "vulkan")]
+    fence: Option<ExportFence>,
+    /// Whether the next submit carries the fence's signal; set by
+    /// [`ExportRing::arm_fence`], consumed by [`ExportRing::finish_publish`].
+    #[cfg(feature = "vulkan")]
+    fence_armed: bool,
+    /// Wait for the GPU after every publish (`GHOSTFRAME_BLOCKING_PUBLISH`, or
+    /// [`ExportRing::force_blocking_publish`]).
+    blocking: bool,
     history: DirtyHistory,
     next_frame_id: u32,
     /// `(frame_id, generation)` of the last successful publish. `None` at
@@ -177,8 +191,25 @@ impl ExportRing {
 
         let (cols, rows) = tile_grid(width, height);
 
+        #[cfg(feature = "vulkan")]
+        let fence = match ExportFence::new(ctx) {
+            Ok(fence) => Some(fence),
+            Err(why) => {
+                tracing::info!(
+                    %why,
+                    "export fences unavailable; every publish will wait for the GPU"
+                );
+                None
+            }
+        };
+
         Ok(ExportRing {
             buffers,
+            #[cfg(feature = "vulkan")]
+            fence,
+            #[cfg(feature = "vulkan")]
+            fence_armed: false,
+            blocking: crate::config::PublishConfig::from_env().blocking,
             history: DirtyHistory::new(cols, rows, HISTORY_CAPACITY),
             next_frame_id: 0,
             last_publish: None,
@@ -217,17 +248,19 @@ impl ExportRing {
     /// keeps decoding into its private framebuffer; nothing stalls and
     /// nothing is lost, because damage accumulates in the history and the
     /// next released buffer picks up everything since it was written.
-    pub fn publish(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        fb: &Framebuffer,
-    ) -> Option<PublishedFrame> {
+    pub fn publish(&mut self, ctx: &WgpuContext, fb: &Framebuffer) -> Option<PublishedFrame> {
         let plan = self.plan_publish(fb)?;
-        crate::submit::submit_now(device, queue, "ghostframe-export-publish", |e| {
-            self.encode_blit(device, e, fb, &plan)
-        });
-        Some(self.finish_publish(device, plan))
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ghostframe-export-publish"),
+            });
+        let recorded = self.encode_blit(&ctx.device, &mut encoder, fb, &plan);
+        if recorded {
+            self.arm_fence(ctx);
+            crate::submit::submit(&ctx.queue, encoder);
+        }
+        Some(self.finish_publish(ctx, plan, recorded))
     }
 
     /// First half of a publish: seal the generation and choose the buffer and
@@ -249,6 +282,12 @@ impl ExportRing {
         // ring that regularly returns `None`.
         let gen = self.history.advance();
 
+        // TODO(vulkan): a free buffer is one the host has released, but the
+        // host's last read of it may still be queued (PresentIdleNotify is sent
+        // when the X server's copy is queued, not finished), and nothing here
+        // makes the re-blit wait for it. The fix would be the dmabuf's
+        // DMA_BUF_IOCTL_EXPORT_SYNC_FILE(WRITE) imported as a wait semaphore on
+        // the next submit. GLES gets this ordering from the kernel's implicit sync.
         let buffer_id = self.buffers.iter().position(|b| !b.in_flight)? as u32;
 
         let rects = match self
@@ -307,12 +346,57 @@ impl ExportRing {
         fb.encode_blit_rects(device, encoder, &buf.texture, &buf.view, &plan.pixel_rects)
     }
 
-    /// Third half, once the copy has been submitted: wait for it and commit
-    /// the plan to the ring's bookkeeping.
+    /// Call immediately before the submit that carries a planned publish, and
+    /// only when that submit is going to happen: on Vulkan it queues the
+    /// fence's semaphore for the next submit, which would otherwise signal
+    /// something unrelated. Nothing to do on GLES.
+    #[cfg(feature = "vulkan")]
+    pub(crate) fn arm_fence(&mut self, ctx: &WgpuContext) {
+        let Some(fence) = &self.fence else { return };
+        match fence.arm(ctx) {
+            Ok(()) => self.fence_armed = true,
+            Err(e) => self.disable_fence(&e),
+        }
+    }
+
+    #[cfg(feature = "gles")]
+    pub(crate) fn arm_fence(&mut self, _ctx: &WgpuContext) {}
+
+    #[cfg(feature = "vulkan")]
+    fn disable_fence(&mut self, why: &GpuError) {
+        tracing::warn!(
+            error = %why,
+            "export fence failed; publishes will wait for the GPU from now on"
+        );
+        self.fence = None;
+        self.fence_armed = false;
+    }
+
+    /// Third half, once the copy has been submitted (`submitted`: it was):
+    /// make the buffer safe to read and commit the plan to the ring's
+    /// bookkeeping.
+    ///
+    /// **GLES does not wait, and does not need a fence.** The export buffers
+    /// are GBM bos imported into Mesa, and Mesa lists every bo a batch touches
+    /// in the submit's handles, so panfrost attaches the job's fence to the
+    /// shared dmabuf's reservation at submit. Anything that honours implicit
+    /// sync (the X server through DRI3, a compositor, `DMA_BUF_IOCTL_SYNC`) then
+    /// waits for the blit by itself. Measured on Mali-T860 with no fence of our
+    /// own: straight after a 1080p publish the reservation held two unsignalled
+    /// job fences in 5 of 8 frames, and `DMA_BUF_IOCTL_SYNC(START)` blocked
+    /// 7.5 ms before the buffer went idle. `GHOSTFRAME_BLOCKING_PUBLISH=1`
+    /// restores the wait.
+    ///
+    /// **Vulkan has to supply the fence.** Memory exported from `vkAllocateMemory`
+    /// carries no implicit fence on RADV or ANV, so `fence.rs` signals an
+    /// exportable semaphore from the submit and the sync_file goes into the
+    /// dmabuf's reservation with `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`. Where that
+    /// cannot be done the publish waits for the GPU.
     pub(crate) fn finish_publish(
         &mut self,
-        device: &wgpu::Device,
+        ctx: &WgpuContext,
         plan: PublishPlan,
+        submitted: bool,
     ) -> PublishedFrame {
         let PublishPlan {
             buffer_id,
@@ -320,33 +404,27 @@ impl ExportRing {
             pixel_rects,
             since_previous,
         } = plan;
-        let buf = &mut self.buffers[buffer_id as usize];
-        buf.filled_at_gen = Some(gen);
-        buf.in_flight = true;
+        {
+            let buf = &mut self.buffers[buffer_id as usize];
+            buf.filled_at_gen = Some(gen);
+            buf.in_flight = true;
+        }
 
-        // v1 synchronisation simplification: block rather than exporting a
-        // real fence. wgpu-hal 30 *can* signal an exportable semaphore via
-        // `Queue::add_signal_semaphore`, so this is a deliberate deferral,
-        // not a limitation -- not implemented here.
-        //
-        // Timed at `debug` level so M2's pacing measurement (design doc §5)
-        // can isolate this stall from everything else `publish` does,
-        // without adding an unconditional cost to the hot path -- off by
-        // default, on with `RUST_LOG=ghostframe_client_gpu::ring=debug`.
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "measuring a real GPU stall for M2 §5's pacing decision, not a virtual-clock path"
-        )]
-        let poll_start = std::time::Instant::now();
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("poll after export publish");
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "measuring a real GPU stall for M2 §5's pacing decision, not a virtual-clock path"
-        )]
-        let poll_us = poll_start.elapsed().as_micros() as u64;
-        tracing::debug!(poll_us, "publish: device.poll stall");
+        // Nothing was submitted, so nothing new is being written: whatever
+        // last wrote this buffer is already in its reservation.
+        if submitted {
+            if self.publish_is_synced(ctx, buffer_id) {
+                // Fires the completion callbacks of finished submits (upload
+                // slab recycling) without waiting for any.
+                let _ = ctx.device.poll(wgpu::PollType::Poll);
+            } else {
+                self.wait_for_gpu(&ctx.device);
+            }
+        }
+        #[cfg(feature = "vulkan")]
+        {
+            self.fence_armed = false;
+        }
 
         let frame_id = self.next_frame_id;
         self.next_frame_id = self.next_frame_id.wrapping_add(1);
@@ -365,6 +443,113 @@ impl ExportRing {
             fd: exported.raw_fd(),
             planes: exported.planes.clone(),
         }
+    }
+
+    /// Whether the buffer just submitted is safe to read without this thread
+    /// waiting for the GPU.
+    fn publish_is_synced(&mut self, ctx: &WgpuContext, buffer_id: u32) -> bool {
+        if self.blocking {
+            return false;
+        }
+        #[cfg(feature = "vulkan")]
+        {
+            self.fence_armed && self.attach_fence(ctx, buffer_id)
+        }
+        #[cfg(feature = "gles")]
+        {
+            let _ = (ctx, buffer_id);
+            true
+        }
+    }
+
+    /// Export the fence of the submit just made and import it into the buffer's
+    /// dmabuf. `false` means the buffer has no fence and the caller must wait;
+    /// the fence is then switched off, since whatever failed will fail again.
+    #[cfg(feature = "vulkan")]
+    fn attach_fence(&mut self, ctx: &WgpuContext, buffer_id: u32) -> bool {
+        use std::os::fd::AsRawFd;
+        let Some(fence) = &self.fence else {
+            return false;
+        };
+        // Timed at `debug` level, like the blocking wait below: this is what
+        // replaced it, and `fence_us` against `poll_us` is the comparison.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "measuring a real driver call, not a virtual-clock path"
+        )]
+        let start = std::time::Instant::now();
+        let attached = fence.take(ctx).and_then(|sync_file| match sync_file {
+            // The driver reports the work already done: nothing to import.
+            None => Ok(()),
+            Some(sync_file) => {
+                let dmabuf = self.buffers[buffer_id as usize].exported.raw_fd();
+                // SAFETY: `dmabuf` is the fd the buffer's `ExportedImage` owns
+                // and keeps open; `sync_file` is an open descriptor. The kernel
+                // takes its own reference to the fence, so `sync_file` closing
+                // at the end of this arm is fine.
+                unsafe {
+                    crate::dmabuf::dma_buf_import_sync_file(
+                        dmabuf,
+                        crate::dmabuf::DMA_BUF_SYNC_WRITE as u32,
+                        sync_file.as_raw_fd(),
+                    )
+                }
+            }
+        });
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "measuring a real driver call, not a virtual-clock path"
+        )]
+        let fence_us = start.elapsed().as_micros() as u64;
+        match attached {
+            Ok(()) => {
+                tracing::debug!(fence_us, "publish: export fence attached");
+                true
+            }
+            Err(e) => {
+                self.disable_fence(&e);
+                false
+            }
+        }
+    }
+
+    /// Block until the GPU has finished everything submitted so far.
+    fn wait_for_gpu(&self, device: &wgpu::Device) {
+        // Timed at `debug` level so M2's pacing measurement (design doc §5)
+        // can isolate this stall from everything else `publish` does,
+        // without adding an unconditional cost to the hot path -- off by
+        // default, on with `RUST_LOG=ghostframe_client_gpu::ring=debug`.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "measuring a real GPU stall for M2 §5's pacing decision, not a virtual-clock path"
+        )]
+        let poll_start = std::time::Instant::now();
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll after export publish");
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "measuring a real GPU stall for M2 §5's pacing decision, not a virtual-clock path"
+        )]
+        let poll_us = poll_start.elapsed().as_micros() as u64;
+        tracing::debug!(poll_us, "publish: device.poll stall");
+    }
+
+    /// Make every publish from here on wait for the GPU, as it does where no
+    /// fence can be made. For tests of that path.
+    #[doc(hidden)]
+    pub fn force_blocking_publish(&mut self) {
+        self.blocking = true;
+    }
+
+    /// Whether a publish returns without waiting for the GPU: not asked to
+    /// block, and (on Vulkan) a fence is available.
+    pub fn publish_is_nonblocking(&self) -> bool {
+        #[cfg(feature = "vulkan")]
+        let fenced = self.fence.is_some();
+        #[cfg(feature = "gles")]
+        let fenced = true;
+        fenced && !self.blocking
     }
 
     /// Release the buffer held by `frame_id` back to the free pool. An

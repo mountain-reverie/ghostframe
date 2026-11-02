@@ -85,6 +85,36 @@ impl UploadConfig {
     }
 }
 
+/// How a publish makes its buffer safe to read. See [`crate::ring::ExportRing`].
+///
+/// - `GHOSTFRAME_BLOCKING_PUBLISH=1`: wait for the GPU after every publish, the
+///   way the ring did before it stopped. For ruling the non-blocking publish in
+///   or out when something looks torn.
+/// - `GHOSTFRAME_NO_FENCE_DEVICE=1` (Vulkan): open the device the plain wgpu
+///   way instead of adding `VK_KHR_external_semaphore_fd`. Without the
+///   extension the ring has no fence and falls back to the blocking wait.
+///
+/// Either takes any value but `0` or empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublishConfig {
+    pub blocking: bool,
+    pub plain_device_open: bool,
+}
+
+impl PublishConfig {
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let on = |name: &str| get(name).is_some_and(|v| !matches!(v.as_str(), "" | "0"));
+        Self {
+            blocking: on("GHOSTFRAME_BLOCKING_PUBLISH"),
+            plain_device_open: on("GHOSTFRAME_NO_FENCE_DEVICE"),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +178,14 @@ mod tests {
         assert_eq!(c.frame_prefix.as_deref(), Some("/tmp/f"));
         assert_eq!(c.export_prefix.as_deref(), Some("/tmp/e"));
         assert_eq!((c.every, c.count), (0, 1));
+    }
+
+    #[test]
+    fn publish_waits_only_when_asked() {
+        let cfg = |pairs| PublishConfig::from_lookup(lookup(pairs));
+        assert_eq!(cfg(&[]), PublishConfig::default());
+        assert!(cfg(&[("GHOSTFRAME_BLOCKING_PUBLISH", "1")]).blocking);
+        assert!(!cfg(&[("GHOSTFRAME_BLOCKING_PUBLISH", "0")]).blocking);
+        assert!(cfg(&[("GHOSTFRAME_NO_FENCE_DEVICE", "1")]).plain_device_open);
     }
 }
