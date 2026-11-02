@@ -104,12 +104,13 @@ struct DmabufFrameInputs {
     force_idr: bool,
 }
 
-/// What a [`FullFrameEncoder`] is opened with: a constant bit rate and the
-/// frame rate it is fed at.
+/// What a [`FullFrameEncoder`] is opened with: a rate cap (rate-capped VBR on
+/// VA-API, rate-capped x264 in software) and the frame rate it is fed at.
 ///
-/// CBR rather than CQP so the stream's rate is something the transport can
-/// follow: the bridge sets `bps` from the bandwidth estimate and reopens the
-/// encoder to change it (the rate cannot change in place without an RC reset).
+/// Rate-capped rather than CQP so the stream's rate is something the
+/// transport can follow: the bridge sets `bps` from the bandwidth estimate and
+/// reopens the encoder to change it (the rate cannot change in place without
+/// an RC reset).
 /// `fps` is the capture rate: the rate control divides the rate by it to get a
 /// frame's budget, so a wrong one scales every frame (and so the stream).
 ///
