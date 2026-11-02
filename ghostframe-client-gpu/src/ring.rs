@@ -22,6 +22,7 @@
 use crate::coalesce::{coalesce, Rect};
 use crate::dirty::DirtyHistory;
 use crate::export::{ExportedImage, PlaneLayout};
+use crate::export_copy::{prefers_blit, ExportCopy};
 #[cfg(feature = "vulkan")]
 use crate::fence::ExportFence;
 use crate::framebuffer::Framebuffer;
@@ -39,12 +40,19 @@ use std::collections::HashMap;
 const HISTORY_CAPACITY: usize = 256;
 
 /// One exported buffer plus the ring's bookkeeping for it.
+/// Field order is drop order and it matters: `storage` holds an alias of
+/// `texture`'s GL texture on GLES, so it goes first, and `texture` before
+/// `exported`, whose fd outlives both.
 pub struct ExportBuffer {
-    pub exported: ExportedImage,
-    pub texture: wgpu::Texture,
+    /// A view the compute export copy writes through, and the texture it
+    /// belongs to (which must outlive it). `None` where this export cannot be
+    /// bound as a storage image.
+    pub storage: Option<(wgpu::Texture, wgpu::TextureView)>,
     /// The default view of `texture`, made once: the blit renders into it
     /// every publish.
     pub view: wgpu::TextureView,
+    pub texture: wgpu::Texture,
+    pub exported: ExportedImage,
     /// Generation this buffer's contents correspond to. `None` = never
     /// filled, which forces a full blit.
     pub filled_at_gen: Option<u64>,
@@ -104,6 +112,15 @@ pub struct PublishedFrame {
     pub planes: Vec<PlaneLayout>,
 }
 
+/// How a publish copied its damage into the export buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyPath {
+    /// One render pass with a scissored triangle per damage rect.
+    Blit,
+    /// The compute kernel over exactly the damaged tiles.
+    Kernel,
+}
+
 /// A publish decided but not yet carried out: the buffer to fill, what to
 /// copy into it, and the history to commit once the copy has run. Made by
 /// [`ExportRing::plan_publish`], recorded by [`ExportRing::encode_blit`], and
@@ -113,7 +130,28 @@ pub(crate) struct PublishPlan {
     buffer_id: u32,
     gen: u64,
     pixel_rects: Vec<Rect>,
+    /// The same damage as `pixel_rects`, as the tiles it is made of.
+    tiles: Vec<(u32, u32)>,
     since_previous: Option<SincePrevious>,
+}
+
+impl ExportBuffer {
+    fn new(device: &wgpu::Device, exported: ExportedImage) -> Result<Self, GpuError> {
+        let texture = exported.as_wgpu_texture(device)?;
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let storage = exported.storage_texture(device, &texture).map(|t| {
+            let view = t.create_view(&wgpu::TextureViewDescriptor::default());
+            (t, view)
+        });
+        Ok(ExportBuffer {
+            exported,
+            texture,
+            view,
+            storage,
+            filled_at_gen: None,
+            in_flight: false,
+        })
+    }
 }
 
 /// A ring of exported dmabuf buffers, filled with history-aware partial
@@ -132,6 +170,15 @@ pub struct ExportRing {
     /// Wait for the GPU after every publish (`GHOSTFRAME_BLOCKING_PUBLISH`, or
     /// [`ExportRing::force_blocking_publish`]).
     blocking: bool,
+    /// The compute export copy, when every buffer can be bound as a storage
+    /// image and nothing asked for the render-pass blit. `None` means every
+    /// publish takes the blit.
+    copy: Option<ExportCopy>,
+    /// Take the kernel even for damage [`prefers_blit`] would send to the
+    /// blit. Benchmarks only.
+    always_compute: bool,
+    /// What the most recent publish that recorded a copy used.
+    last_copy: Option<CopyPath>,
     history: DirtyHistory,
     next_frame_id: u32,
     /// `(frame_id, generation)` of the last successful publish. `None` at
@@ -178,16 +225,10 @@ impl ExportRing {
         for _ in 0..count {
             let exported =
                 ExportedImage::new(ctx, width, height, preferred_modifiers, host_visible)?;
-            let texture = exported.as_wgpu_texture(&ctx.device)?;
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            buffers.push(ExportBuffer {
-                exported,
-                texture,
-                view,
-                filled_at_gen: None,
-                in_flight: false,
-            });
+            buffers.push(ExportBuffer::new(&ctx.device, exported)?);
         }
+        let config = crate::config::PublishConfig::from_env();
+        let copy = Self::make_copy(ctx, &buffers, config.render_pass_export, (width, height));
 
         let (cols, rows) = tile_grid(width, height);
 
@@ -209,7 +250,10 @@ impl ExportRing {
             fence,
             #[cfg(feature = "vulkan")]
             fence_armed: false,
-            blocking: crate::config::PublishConfig::from_env().blocking,
+            blocking: config.blocking,
+            copy,
+            always_compute: false,
+            last_copy: None,
             history: DirtyHistory::new(cols, rows, HISTORY_CAPACITY),
             next_frame_id: 0,
             last_publish: None,
@@ -220,6 +264,117 @@ impl ExportRing {
             preferred_modifiers: preferred_modifiers.to_vec(),
             host_visible,
         })
+    }
+
+    /// The compute copy for `buffers`, or `None` (with the reason logged) when
+    /// the blit has to be used.
+    fn make_copy(
+        ctx: &WgpuContext,
+        buffers: &[ExportBuffer],
+        forced_off: bool,
+        (width, height): (u32, u32),
+    ) -> Option<ExportCopy> {
+        if forced_off {
+            tracing::info!("GHOSTFRAME_NO_COMPUTE_EXPORT set; exports use the render-pass blit");
+            return None;
+        }
+        if buffers.is_empty() || buffers.iter().any(|b| b.storage.is_none()) {
+            tracing::info!(
+                "export buffers cannot be bound as storage images; \
+                 exports use the render-pass blit"
+            );
+            return None;
+        }
+        let mut copy = ExportCopy::new(&ctx.device, buffers.len());
+        if !Self::kernel_writes_the_export(ctx, &mut copy, &buffers[0], width, height) {
+            tracing::warn!(
+                "the compute export copy did not write the export buffer; \
+                 exports use the render-pass blit"
+            );
+            return None;
+        }
+        Some(copy)
+    }
+
+    /// Run the kernel once on a known pixel and read the export back.
+    ///
+    /// Binding an EGLImage-backed texture as a storage image is something GLES
+    /// 3.1 only promises for immutable textures, and `glEGLImageTargetTexture2DOES`
+    /// makes a mutable one; Mesa accepts it, another driver may silently drop
+    /// the stores. A check of the thing itself is simpler and more robust than
+    /// guessing from the driver's name. Costs one tiny submit at creation; the
+    /// buffer is then dirty garbage, which is fine because a buffer that has
+    /// never been published is always filled whole first.
+    fn kernel_writes_the_export(
+        ctx: &WgpuContext,
+        copy: &mut ExportCopy,
+        buf: &ExportBuffer,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        let Some((_, view)) = &buf.storage else {
+            return false;
+        };
+        let mut fb = Framebuffer::new(&ctx.device, width.min(32), height.min(32));
+        fb.debug_fill(&ctx.device, &ctx.queue, [0x11, 0x22, 0x33, 0x44]);
+        let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ghostframe-export-copy-selftest"),
+            size: 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ghostframe-export-copy-selftest"),
+            });
+        copy.encode(
+            &ctx.device,
+            &ctx.queue,
+            &mut encoder,
+            &fb,
+            (0, view),
+            &[(0, 0)],
+        );
+        encoder.copy_texture_to_buffer(
+            buf.texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: None,
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        crate::submit::submit(&ctx.queue, encoder);
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        if ctx
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .is_err()
+        {
+            return false;
+        }
+        // The export is BGRA, the framebuffer pixel RGBA.
+        let ok = slice
+            .get_mapped_range()
+            .is_ok_and(|bytes| bytes[..] == [0x33, 0x22, 0x11, 0x44]);
+        // The cached groups hold the throwaway framebuffer's view.
+        copy.drop_export_cache(copy.buffer_count());
+        ok
+    }
+
+    /// Whether publishes copy damage with the compute kernel rather than the
+    /// render-pass blit.
+    pub fn uses_compute_copy(&self) -> bool {
+        self.copy.is_some()
     }
 
     pub fn mark_dirty(&mut self, tx: u32, ty: u32) {
@@ -255,7 +410,7 @@ impl ExportRing {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("ghostframe-export-publish"),
             });
-        let recorded = self.encode_blit(&ctx.device, &mut encoder, fb, &plan);
+        let recorded = self.encode_blit(&ctx.device, &ctx.queue, &mut encoder, fb, &plan);
         if recorded {
             self.arm_fence(ctx);
             crate::submit::submit(&ctx.queue, encoder);
@@ -290,20 +445,26 @@ impl ExportRing {
         // the next submit. GLES gets this ordering from the kernel's implicit sync.
         let buffer_id = self.buffers.iter().position(|b| !b.in_flight)? as u32;
 
-        let rects = match self
+        let (cols, rows) = tile_grid(self.width, self.height);
+        let dirty = self
             .history
-            .union_since(self.buffers[buffer_id as usize].filled_at_gen)
-        {
-            Some(dirty) => coalesce(&dirty),
-            None => {
-                let (cols, rows) = tile_grid(self.width, self.height);
-                vec![Rect {
-                    x: 0,
-                    y: 0,
-                    w: cols,
-                    h: rows,
-                }]
-            }
+            .union_since(self.buffers[buffer_id as usize].filled_at_gen);
+        let rects = match &dirty {
+            Some(dirty) => coalesce(dirty),
+            None => vec![Rect {
+                x: 0,
+                y: 0,
+                w: cols,
+                h: rows,
+            }],
+        };
+        // Only the kernel reads the tile list; the blit works from rects.
+        let tiles = match (&self.copy, &dirty) {
+            (None, _) => Vec::new(),
+            (Some(_), Some(dirty)) => dirty.iter_set().collect(),
+            (Some(_), None) => (0..rows)
+                .flat_map(|ty| (0..cols).map(move |tx| (tx, ty)))
+                .collect(),
         };
         let pixel_rects: Vec<Rect> = rects
             .into_iter()
@@ -329,6 +490,7 @@ impl ExportRing {
             buffer_id,
             gen,
             pixel_rects,
+            tiles,
             since_previous,
         })
     }
@@ -336,14 +498,50 @@ impl ExportRing {
     /// Second half, recorded into `encoder`: copy the planned rectangles into
     /// the planned buffer. Returns whether anything was recorded.
     pub(crate) fn encode_blit(
-        &self,
+        &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         fb: &Framebuffer,
         plan: &PublishPlan,
     ) -> bool {
-        let buf = &self.buffers[plan.buffer_id as usize];
-        fb.encode_blit_rects(device, encoder, &buf.texture, &buf.view, &plan.pixel_rects)
+        let id = plan.buffer_id as usize;
+        let buf = &self.buffers[id];
+        let kernel =
+            !(plan.tiles.is_empty() || (!self.always_compute && prefers_blit(&plan.tiles)));
+        if let (true, Some(copy), Some((alias, view))) = (kernel, &mut self.copy, &buf.storage) {
+            let recorded = copy.encode(device, queue, encoder, fb, (id, view), &plan.tiles);
+            if recorded {
+                // GLES: a barrier after the image stores, for whatever reads
+                // the buffer next through its other wgpu texture. See
+                // `ExportedImage::storage_texture`. Vulkan has one texture,
+                // whose tracker does this itself.
+                #[cfg(feature = "gles")]
+                encoder.transition_resources(
+                    std::iter::empty(),
+                    std::iter::once(wgpu::TextureTransition {
+                        texture: alias,
+                        selector: None,
+                        state: wgpu::TextureUses::COLOR_TARGET,
+                    }),
+                );
+                #[cfg(feature = "vulkan")]
+                let _ = alias;
+                self.last_copy = Some(CopyPath::Kernel);
+            }
+            return recorded;
+        }
+        let recorded =
+            fb.encode_blit_rects(device, encoder, &buf.texture, &buf.view, &plan.pixel_rects);
+        if recorded {
+            self.last_copy = Some(CopyPath::Blit);
+        }
+        recorded
+    }
+
+    /// Which path the most recent recorded copy took; `None` before the first.
+    pub fn last_copy_path(&self) -> Option<CopyPath> {
+        self.last_copy
     }
 
     /// Call immediately before the submit that carries a planned publish, and
@@ -403,6 +601,7 @@ impl ExportRing {
             gen,
             pixel_rects,
             since_previous,
+            ..
         } = plan;
         {
             let buf = &mut self.buffers[buffer_id as usize];
@@ -542,6 +741,20 @@ impl ExportRing {
         self.blocking = true;
     }
 
+    /// Copy damage with the render-pass blit from here on, as where the export
+    /// cannot be bound as a storage image. For A/B tests and benchmarks.
+    #[doc(hidden)]
+    pub fn force_render_pass_export(&mut self) {
+        self.copy = None;
+    }
+
+    /// Use the compute copy for every publish, whatever the damage looks like.
+    /// For benchmarks, which want each mode on its own.
+    #[doc(hidden)]
+    pub fn force_compute_export(&mut self) {
+        self.always_compute = true;
+    }
+
     /// Whether a publish returns without waiting for the GPU: not asked to
     /// block, and (on Vulkan) a fence is available.
     pub fn publish_is_nonblocking(&self) -> bool {
@@ -608,15 +821,7 @@ impl ExportRing {
                 &self.preferred_modifiers,
                 self.host_visible,
             )?;
-            let texture = exported.as_wgpu_texture(&ctx.device)?;
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            new_buffers.push(ExportBuffer {
-                exported,
-                texture,
-                view,
-                filled_at_gen: None,
-                in_flight: false,
-            });
+            new_buffers.push(ExportBuffer::new(&ctx.device, exported)?);
         }
 
         // Everything fallible is done; from here the swap cannot fail.
@@ -626,6 +831,11 @@ impl ExportRing {
             if let Some(buf) = old.get_mut(buffer_id as usize).and_then(Option::take) {
                 self.graveyard.insert(frame_id, buf);
             }
+        }
+        // The cached bind groups hold views of the buffers just replaced, and
+        // of aliases that must not outlive them.
+        if let Some(copy) = &mut self.copy {
+            copy.drop_export_cache(self.buffers.len());
         }
         // Whatever is left was free; dropping it closes its fd, which no
         // one else holds.

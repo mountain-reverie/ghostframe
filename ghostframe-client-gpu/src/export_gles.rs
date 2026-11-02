@@ -181,6 +181,9 @@ pub struct ExportedImage {
     pub modifier: u64,
     pub planes: Vec<PlaneLayout>,
     texture: wgpu::Texture,
+    /// The GL name behind `texture`, kept to alias it for storage writes. Owned
+    /// by `texture`'s drop callback; never delete it here.
+    gl_name: u32,
     fd: OwnedFd,
 }
 
@@ -195,6 +198,15 @@ impl std::fmt::Debug for ExportedImage {
             .finish()
     }
 }
+
+/// The format a storage binding of this export's texture declares in its
+/// shader.
+///
+/// `Rgba8Unorm`, not [`FORMAT_WGPU`]: wgpu's GLES backend has no
+/// `BGRA8UNORM_STORAGE` (GLSL has no bgra image format), so the compute copy
+/// writes through an `Rgba8Unorm` alias of the same GL texture and swaps the
+/// channels itself. See [`ExportedImage::storage_texture`].
+const STORAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// Resources the texture's drop callback owns and releases, in order.
 struct TextureOwned {
@@ -483,6 +495,7 @@ impl ExportedImage {
                 stride: stride as u64,
             }],
             texture,
+            gl_name,
             fd,
         })
     }
@@ -554,6 +567,81 @@ impl ExportedImage {
                 wgpu::TextureUses::UNINITIALIZED,
             )
         }
+    }
+
+    /// A second wgpu texture over the same GL texture, declared
+    /// `Rgba8Unorm` with `STORAGE_BINDING`, for the compute export copy.
+    ///
+    /// The export is BGRA and wgpu cannot bind that as a storage image on GLES,
+    /// but `glBindImageTexture` with `GL_RGBA8` over it is a reinterpretation of
+    /// the same four bytes per pixel: channel 0 lands in byte 0, which in this
+    /// buffer is blue. The shader therefore writes `vec4(b, g, r, a)`; see
+    /// `shaders/client/export_copy_rgba_alias.wgsl`.
+    ///
+    /// Safe to alias on GLES, unlike Vulkan, because GL has no image layouts for
+    /// two wgpu trackers to disagree about. The alias has a no-op drop callback
+    /// so it never deletes the GL texture, which `primary`'s callback owns;
+    /// it, and everything holding a view of it (the ring's cached bind groups
+    /// too), must not be used once every clone of `primary` has been dropped.
+    /// The ring keeps both in one `ExportBuffer` and drops the alias first.
+    ///
+    /// The alias also declares `RENDER_ATTACHMENT`, never rendered to: it is
+    /// there so the ring can transition the alias to `COLOR_TARGET` after the
+    /// kernel ran. wgpu-hal's GLES backend emits a `glMemoryBarrier` only on a
+    /// transition out of a storage usage on the same wgpu texture, and the
+    /// blit that may follow uses the primary texture, so without this the
+    /// image stores would be ordered against it by nothing but the driver.
+    pub fn storage_texture(
+        &self,
+        device: &wgpu::Device,
+        _primary: &wgpu::Texture,
+    ) -> Option<wgpu::Texture> {
+        let size = wgpu::Extent3d {
+            width: self.width,
+            height: self.height,
+            depth_or_array_layers: 1,
+        };
+        let name = std::num::NonZeroU32::new(self.gl_name)?;
+        // SAFETY: `gl_name` is live for as long as `self.texture`'s callback has
+        // not run, and the caller keeps a clone of that texture alongside the
+        // alias. `Some(no-op)` keeps wgpu from deleting a texture it does not own.
+        let hal_texture = unsafe {
+            device.as_hal::<wgpu_hal::api::Gles>()?.texture_from_raw(
+                name,
+                &wgpu_hal::TextureDescriptor {
+                    label: Some("ghostframe-exported-image-storage"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: STORAGE_FORMAT,
+                    usage: wgpu::TextureUses::STORAGE_WRITE_ONLY | wgpu::TextureUses::COLOR_TARGET,
+                    memory_flags: wgpu_hal::MemoryFlags::empty(),
+                    view_formats: Vec::new(),
+                },
+                Some(Box::new(|| {})),
+            )
+        };
+        // SAFETY: `hal_texture` was just built from a live GL texture matching
+        // this descriptor. wgpu does not zero a texture made from hal, so the
+        // ring's history stays the only authority on what the export holds.
+        Some(unsafe {
+            device.create_texture_from_hal::<wgpu_hal::api::Gles>(
+                hal_texture,
+                &wgpu::TextureDescriptor {
+                    label: Some("ghostframe-exported-image-storage"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: STORAGE_FORMAT,
+                    usage: wgpu::TextureUsages::STORAGE_BINDING
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                },
+                wgpu::TextureUses::UNINITIALIZED,
+            )
+        })
     }
 
     pub fn raw_fd(&self) -> i32 {
