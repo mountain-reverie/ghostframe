@@ -386,7 +386,10 @@ impl FullFrameEncoder {
         opts.set("preset", "ultrafast");
         opts.set("tune", "zerolatency");
         opts.set("g", &ENCODER_OWN_GOP.to_string());
-        opts.set("nal-hrd", "cbr");
+        // No `nal-hrd=cbr`: that pads every frame with filler NALs up to
+        // bps/fps, which a stream that is mostly small P frames must not pay.
+        // bitrate + maxrate + bufsize make x264 rate-control to a VBV, without
+        // the stuffing.
 
         let opened = ctx.open_with(opts)?;
 

@@ -182,8 +182,8 @@ pub struct H264Stats {
     /// Verdicts by what they named.
     pub verdicts_idr_frag: u64,
     pub verdicts_p_frag: u64,
-    /// Of those: verdicts made while a probe window was open, padding was in
-    /// flight, or inside a probe burst's span (what padding could have caused).
+    /// Of those: verdicts on a datagram that departed inside a probe burst
+    /// (what padding could have caused), by its departure, not the verdict's time.
     pub p_verdicts_in_probe: u64,
     /// The fragment (or its whole frame) had been acknowledged by another
     /// transmission already: a spurious verdict, no action.
@@ -228,6 +228,9 @@ pub struct H264Stats {
     pub rate_target_bps: u32,
     /// Probe clusters the application started itself (see `h264_rate`).
     pub app_probes: u64,
+    /// Probes not started because padding could not fill a cluster of the
+    /// shortest useful duration at this estimate.
+    pub app_probes_skipped: u64,
     /// Frames skipped for the emission backlog while padding was in flight
     /// (a subset of `frames_skipped_backpressure`).
     pub frames_skipped_pad: u64,
@@ -663,11 +666,14 @@ impl IoBridge {
         self.forget_purged(&wire_seqs);
     }
 
-    fn forget_purged(&mut self, wire_seqs: &[u32]) {
+    pub(super) fn forget_purged(&mut self, wire_seqs: &[u32]) {
         for ws in wire_seqs {
             if self.transmission_ledger.forget_undeparted(*ws) {
                 self.h264.stats.tx_forgotten += 1;
             }
+            // A purged pad never left: its ring entry has no acknowledgement
+            // to wait for.
+            self.reliable_emitter.pads.remove(*ws);
         }
     }
 
@@ -744,11 +750,25 @@ impl IoBridge {
     /// loss path already. A P-frame fragment makes its frame suspect: nothing
     /// that chains from it can be decoded, so the queued fragments of it and
     /// of every later frame are purged, and an IDR is requested.
+    #[cfg(test)]
     pub(super) fn note_h264_verdict(
         &mut self,
         frame_seq: u32,
         frag_idx: u16,
         now: std::time::Instant,
+    ) {
+        self.note_h264_verdict_in(frame_seq, frag_idx, now, false);
+    }
+
+    /// [`Self::note_h264_verdict`] for a datagram that did (`in_burst`) or did
+    /// not depart inside a probe burst (read from the ledger, by departure,
+    /// not by when the verdict came).
+    pub(super) fn note_h264_verdict_in(
+        &mut self,
+        frame_seq: u32,
+        frag_idx: u16,
+        now: std::time::Instant,
+        in_burst: bool,
     ) {
         self.h264.stats.tx_judged_lost += 1;
         let Some(f) = self.h264.tracker.get(frame_seq) else {
@@ -764,10 +784,7 @@ impl IoBridge {
             return;
         }
         self.h264.stats.verdicts_p_frag += 1;
-        if self.active_probe.is_some()
-            || !self.reliable_emitter.pads.is_empty()
-            || self.transmission_ledger.in_probe_burst(now)
-        {
+        if in_burst {
             self.h264.stats.p_verdicts_in_probe += 1;
         }
         if f.suspect {
@@ -911,13 +928,19 @@ impl IoBridge {
         lost: &[(u32, Transmission)],
         now: std::time::Instant,
     ) {
-        for (_, tx) in lost {
+        for (ws, tx) in lost {
+            if let Content::Pad(pad_ws) = tx.content {
+                // A pad judged lost: its tag will not be read.
+                self.reliable_emitter.pads.remove(pad_ws);
+                continue;
+            }
             if let Content::H264Frag {
                 frame_seq,
                 frag_idx,
             } = tx.content
             {
-                self.note_h264_verdict(frame_seq, frag_idx, now);
+                let in_burst = self.transmission_ledger.declared_lost_in_burst(*ws);
+                self.note_h264_verdict_in(frame_seq, frag_idx, now, in_burst);
             }
         }
     }
