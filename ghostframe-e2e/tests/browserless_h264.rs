@@ -824,11 +824,10 @@ fn bottleneck_net(
 ///    allows (`1 + duration / 2 s`);
 ///  * the rate it ends on is at most `0.8 x` the highest estimate of the run
 ///    (the share is the definition of the target) and at least the floor;
-///  * the skips are bounded: at most half the control's. Measured 0.47, 0.25
-///    and 0.23 of it: the seconds before the first cut, plus the queue each
-///    padded probe window leaves on a 1 Mbit/s link (`frames_skipped_pad`, 32
-///    to 39 of them, fell while padding was in flight). A third holds on two
-///    seeds and not on the first, where the cut came late;
+///  * the skips are bounded: at most a third of the control's. Measured 0.18
+///    to 0.26 of it: the seconds before the first cut, plus the queue each
+///    padded probe window leaves on a 1 Mbit/s link (`frames_skipped_pad`, 31
+///    to 42 of them, fell while padding was in flight);
 ///  * every captured frame was sent or skipped, and the client got what was sent.
 ///
 /// Mutation: with the policy's `step` returning `Keep` (the rate never leaves
@@ -935,7 +934,7 @@ async fn cbr_follows_the_estimate_down_on_an_overdriven_link() {
     println!("skips (policy, of them for padding, control): {skip_ratios:?}");
     for (seed, skips, _, control) in skip_ratios {
         assert!(
-            skips * 2 <= control,
+            skips * 3 <= control,
             "seed {seed:#x}: skips {skips} against the control's {control}"
         );
     }
@@ -984,7 +983,14 @@ async fn padding_is_a_bounded_share_of_a_steady_cbr_stream() {
         );
         assert_eq!(s.idr_by_cause[IdrCause::Loss.index()], 0, "seed {seed:#x}");
         let d = delivered(&r);
-        assert!(d.len() as u64 + 3 >= s.frames_sent, "seed {seed:#x}");
+        // Every frame the server saw acknowledged was handed to the decoder
+        // (the ones the IDR superseded in the queue were never sent, so they
+        // are neither): the client's reference check dropped nothing.
+        assert!(d.len() as u64 + 3 >= s.frames_acked, "seed {seed:#x}");
+        assert!(
+            r.h264.stats.idr_by_cause[IdrCause::ClientReset.index()] == 0,
+            "seed {seed:#x}: the client asked for no IDR on a clean stream"
+        );
     }
 }
 
@@ -1215,6 +1221,32 @@ async fn a_capacity_step_up_with_jitter_costs_no_loss_idr() {
     let _ = loss_total;
 }
 
+/// At 2 ms of jitter the loss path judges many datagrams lost for reasons of
+/// its own (30 to 40 loss IDRs over these seeds, with or without a probe), so
+/// that is not asserted. What is: no verdict falls on a datagram that departed
+/// inside a probe burst (`p_verdicts_in_probe`, classified by departure). This
+/// is the scene that tells the burst patience is doing something: with the
+/// factor at 1 (no patience) the counter reads 2 here and 0 with it.
+#[tokio::test(start_paused = true)]
+async fn probe_bursts_cause_no_verdicts_on_a_jittery_link() {
+    let mut in_probe = 0;
+    let mut padded = 0;
+    for seed in [0x6701u64, 0x6702, 0x6703] {
+        let st = capacity_step_with_jitter(seed, 2_000).await;
+        let s = &st.r.h264.stats;
+        println!(
+            "jitter 2 ms {seed:#x}: loss idrs={} verdicts in a probe burst={} padding windows={}",
+            s.idr_by_cause[IdrCause::Loss.index()],
+            s.p_verdicts_in_probe,
+            s.probe_padding_windows
+        );
+        in_probe += s.p_verdicts_in_probe;
+        padded += s.probe_padding_windows;
+    }
+    assert!(padded > 0, "premise: padding was used");
+    assert_eq!(in_probe, 0, "a verdict fell on a datagram of a probe burst");
+}
+
 /// The population behind `P_B_SEEDS`: 24 timelines, how many meet each bound.
 /// Ignored (it asserts nothing and takes a few seconds): run it to see the
 /// numbers, which are the honest account of how reliably the bound is met.
@@ -1230,6 +1262,18 @@ async fn p_b_seed_population() {
         let st = capacity_step(seed).await;
         let (reached, low) = step_outcome(&st);
         println!("SEED {seed:#x} reached={reached:?} lowest/pre-min={low:.2}");
+        if low < 0.8 || reached.is_none_or(|t| t > T_UP_US) {
+            report("  dbg", &st.r);
+            println!("  dbg idr by cause: {:?}", st.r.h264.stats.idr_by_cause);
+            let ser: Vec<String> =
+                st.r.bwe_estimate_samples
+                    .iter()
+                    .filter(|(t, _)| *t >= STEP_AT_US - 1_000_000 && *t < STEP_AT_US + 8_000_000)
+                    .step_by(6)
+                    .map(|(t, b)| format!("{}:{}", t / 1000, b))
+                    .collect();
+            println!("  dbg est {}", ser.join(" "));
+        }
         up += reached.is_some_and(|t| t <= T_UP_US) as u32;
         low_ok += (low >= 0.8) as u32;
     }

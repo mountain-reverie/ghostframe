@@ -1823,7 +1823,7 @@ impl IoBridge {
         }
         // A probe window an IDR claimed, or one a P frame may claim, is
         // filled up to the cluster with padding (see `h264_probe_pad`).
-        self.h264_probe_pad(now, is_idr, h264_wire_bytes as usize);
+        self.h264_probe_pad(now, cause.filter(|_| is_idr), h264_wire_bytes as usize);
         self.reliable_emitter.expire_h264_pad(now);
         let mut parity_bytes = 0u64;
         for parity_dg in parity_datagrams {

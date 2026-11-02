@@ -92,6 +92,10 @@ pub unsafe extern "C" fn gf_server_new(
                 return std::ptr::null_mut();
             }
         };
+        // `capture_fps` stays 0: the embedder submits frames at a rate this
+        // call does not learn, so the H.264 encoder is opened for the server
+        // default of 30 fps (`TransportConfig::h264_fps`). An embedder that
+        // captures at another rate gets a rate off by the ratio.
         match rt.block_on(GhostframeServer::new(
             config, ":443", lib_config, None, None,
         )) {

@@ -354,7 +354,7 @@ fn default_rate_params_are_cbr_at_thirty_fps() {
 /// own definition (the output of any window of a CBR stream is bounded by the
 /// rate over the window plus what the VBV may hold):
 ///  * every sliding 1 s window (30 consecutive output frames) is at most
-///    `1.2 x (bps + vbv) / 8` bytes, `vbv` being one second of the rate;
+///    `1.1 x (bps + vbv) / 8` bytes, `vbv` being one second of the rate;
 ///  * the whole run is at most `1.5 x bps x 5 s / 8`.
 ///
 /// Quality-controlled (CQP) output of this pattern is several times that.
@@ -392,12 +392,14 @@ fn cbr_output_stays_near_the_target_rate_on_moving_content() {
             }
         }
         let uv = (width * height) as usize;
-        for by in 0..(height as usize / 16) {
+        // The chroma plane is interleaved UV, `width` bytes by `height / 2`
+        // rows; 8x8-byte blocks of flat chroma, changing every 10 frames.
+        for by in 0..(height as usize / 2 / 8) {
             for bx in 0..(width as usize / 8) {
                 let v = (((bx * 7 + by * 13 + t / 10 * 29) * 37) & 0xFF) as u8;
-                let row = by * width as usize + bx * 8;
-                for k in 0..8 {
-                    nv12[uv + row + k] = v;
+                for row in 0..8 {
+                    let at = uv + (by * 8 + row) * width as usize + bx * 8;
+                    nv12[at..at + 8].fill(v);
                 }
             }
         }
@@ -413,7 +415,7 @@ fn cbr_output_stays_near_the_target_rate_on_moving_content() {
     );
     let total: usize = sizes.iter().sum();
     let bits_per_s = f64::from(params.bps);
-    let window_bound = (1.2 * (bits_per_s + f64::from(params.vbv_bits())) / 8.0) as usize;
+    let window_bound = (1.1 * (bits_per_s + f64::from(params.vbv_bits())) / 8.0) as usize;
     let run_bound = (1.5 * bits_per_s * 5.0 / 8.0) as usize;
     let worst = sizes
         .windows(params.fps as usize)
@@ -429,5 +431,69 @@ fn cbr_output_stays_near_the_target_rate_on_moving_content() {
     assert!(
         total <= run_bound,
         "the run carried {total} B against a bound of {run_bound}"
+    );
+}
+
+/// A CBR encoder must not stuff: after the IDR, a static picture codes to tiny P
+/// frames, far below the `bps / fps` budget. Rate control that pads every
+/// frame up to the budget (filler NALs, `nal-hrd=cbr`, a driver's bit
+/// stuffing) fails this. 320x240 flat NV12, 2 Mbit/s at 30 fps: the budget is
+/// 8 333 bytes a frame; 30 static P frames must average under a quarter of it.
+///
+/// To see it fail on the software fallback, put `opts.set("nal-hrd", "cbr")`
+/// back in `try_open_sw`. For VA-API there is no ffmpeg option for the
+/// driver's stuffing (ffmpeg 9.0.2 `h264_vaapi` offers `rc_mode`, `blbrc`,
+/// `max_frame_size`, `qp`, `quality`, `low_power`, nothing like
+/// `disable_bit_stuffing`), so this test is what finds out whether the driver
+/// pads. Not run in CI (needs the GPU lock); run it on hardware.
+#[test]
+fn static_content_p_frames_are_far_below_the_cbr_budget() {
+    let _vaapi = lock_vaapi();
+    let (width, height) = (320u32, 240u32);
+    let params = RateParams {
+        bps: 2_000_000,
+        fps: 30,
+    };
+    let mut encoder = match FullFrameEncoder::with_params(width, height, params) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Skipping static cbr test (no encoder): {e}");
+            return;
+        }
+    };
+    let mut nv12 = vec![128u8; (width * height * 3 / 2) as usize];
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            // A fixed gradient: some content, none of it moving.
+            nv12[y * width as usize + x] = ((x + y) & 0xFF) as u8;
+        }
+    }
+    let mut sizes: Vec<usize> = Vec::new();
+    let mut idr_seen = false;
+    for _ in 0..40 {
+        if let Ok(Some(out)) =
+            encoder.encode_nv12_buffer(nv12.as_ptr(), width, height, width, width, width * height)
+        {
+            if out.is_keyframe {
+                idr_seen = true;
+            } else {
+                sizes.push(out.payload.len());
+            }
+        }
+    }
+    assert!(idr_seen, "premise: the first frame is an IDR");
+    // Skip the first few P frames: the rate control is still settling after the IDR.
+    let tail = &sizes[sizes.len().saturating_sub(30)..];
+    assert!(
+        tail.len() >= 20,
+        "premise: P frames were produced ({})",
+        sizes.len()
+    );
+    let mean = tail.iter().sum::<usize>() as f64 / tail.len() as f64;
+    let budget = f64::from(params.bps) / 8.0 / f64::from(params.fps);
+    eprintln!("static P frames: mean {mean:.0} B against a budget of {budget:.0} B");
+    assert!(
+        mean < 0.25 * budget,
+        "static P frames average {mean:.0} B, over a quarter of the {budget:.0} B budget: the stream is being stuffed"
     );
 }

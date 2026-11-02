@@ -96,6 +96,8 @@ const APP_PROBE_CHAIN_MAX: u32 = 4;
 /// A cluster of the application's: lasts `APP_PROBE_DURATION`, at least this
 /// many packets (goog_cc's ALR probes ask for 5).
 const APP_PROBE_DURATION: Duration = Duration::from_millis(100);
+/// The shortest cluster worth sending (goog_cc's own shortest is 15 ms).
+const APP_PROBE_MIN_DURATION: Duration = Duration::from_millis(15);
 const APP_PROBE_MIN_PROBES: i64 = 5;
 /// The application's cluster ids start here; goog_cc counts up from 1 and would
 /// need a billion probes to meet them.
@@ -414,8 +416,26 @@ impl IoBridge {
             return;
         }
         let target = est.saturating_mul(2);
-        let duration = APP_PROBE_DURATION;
+        // The cluster is sized to what padding can fill: `want = 1.2 x
+        // min_bytes` must fit under `PAD_MAX_BYTES` (and under 0.3 s of the
+        // estimate, which the 2x multiplier and the 100 ms window satisfy), or
+        // the estimator, which needs 80 % of `min_bytes` acknowledged, could
+        // never produce a result: at 30 Mbit/s a 100 ms cluster is 750 kB
+        // against a 384 kB cap. A higher estimate gets a shorter window instead;
+        // one that would need under `APP_PROBE_MIN_DURATION` is skipped, and
+        // counted.
+        let max_duration = (PAD_MAX_BYTES as f64 / PAD_MARGIN) / (target as f64 / 8.0);
+        let duration = APP_PROBE_DURATION.min(Duration::from_secs_f64(max_duration));
+        if duration < APP_PROBE_MIN_DURATION {
+            self.h264.stats.app_probes_skipped += 1;
+            let p = &mut self.h264.app_probe;
+            p.next_at = Some(now + APP_PROBE_INTERVAL);
+            p.last_target = None;
+            p.chain_len = 0;
+            return;
+        }
         let min_bytes = (target as f64 / 8.0 * duration.as_secs_f64()) as i64;
+        let p = &mut self.h264.app_probe;
         let id = APP_PROBE_ID_BASE + (p.counter % 1_000_000) as i32;
         p.counter += 1;
         p.last_target = Some(target);
@@ -438,17 +458,32 @@ impl IoBridge {
     /// counted as frame data, never retransmitted, bounded by the cluster
     /// (`PAD_MARGIN` over `min_bytes`, `PAD_MAX_BYTES` overall) and sent at
     /// the probe rate (the admission rate is the window's while it is open).
-    pub(super) fn h264_probe_pad(&mut self, now: Instant, is_idr: bool, own_bytes: usize) {
+    ///
+    /// `idr` is `Some(cause)` for an IDR. The guards are: an empty queue behind
+    /// the frame just sent, and no padding within [`PAD_QUIET_AFTER_CUT`] of a
+    /// rate cut. They apply to opening a window and to the top-up of a window an
+    /// IDR claimed. And an IDR that opens a P hold (every cause but the scheduled
+    /// GOP's) is never padded: the held P frames wait for its fragments to be
+    /// acknowledged, and padding behind them is what they would wait for.
+    pub(super) fn h264_probe_pad(&mut self, now: Instant, idr: Option<IdrCause>, own_bytes: usize) {
+        let is_idr = idr.is_some();
         if self.h264.rate.applied().is_none() {
+            return;
+        }
+        if is_idr && idr != Some(IdrCause::GopPeriodic) {
             return;
         }
         let Some(template) = self.h264.pad_template.clone() else {
             return;
         };
+        // The guards apply where padding starts: when a window is opened, and
+        // to the top-up of a window an IDR claimed. A P frame that finds a
+        // window already open and short (its own earlier padding is in the
+        // queue, so the "empty queue" test would always refuse) continues it.
+        if (self.active_probe.is_none() || is_idr) && !self.h264_pad_allowed(now, own_bytes) {
+            return;
+        }
         if self.active_probe.is_none() && !is_idr {
-            if !self.h264_pad_allowed(now, own_bytes) {
-                return;
-            }
             let gop = self.h264.gop;
             let idr_soon = self.h264.pending_idr.is_some()
                 || self
@@ -485,7 +520,14 @@ impl IoBridge {
         let est_bytes = (self.bwe.snapshot().bitrate_bps / 8) as f64;
         let by_estimate = (est_bytes * PAD_MAX_ESTIMATE_SECS) as usize;
         let cap = (PAD_MAX_BYTES.min(by_estimate) as i64 / len).max(1);
-        let n = by_bytes.max(by_count).clamp(1, cap);
+        // And never past the pad ring: when it is full, stop padding rather
+        // than evict entries that still carry a probe tag.
+        let free = (crate::transport::reliable_emitter::h264::PAD_RING_CAP
+            .saturating_sub(self.reliable_emitter.pads.len())) as i64;
+        let n = by_bytes.max(by_count).clamp(1, cap).min(free);
+        if n <= 0 {
+            return;
+        }
         let mut bytes = 0u64;
         for _ in 0..n {
             let tag = crate::transport::reliable_emitter::cache::ProbeTag {
@@ -568,9 +610,15 @@ impl IoBridge {
                     // burst most likely to lose a fragment, and the P frames
                     // behind it would be undecodable without it and would
                     // only deepen the queue it has to cross.
+                    // A re-entry from the tile codec is named first (the
+                    // reopen's IDR is its IDR) and is not a cut of the path
+                    // the application was sending on: no quiet period.
+                    let reentry = self.h264.pending_idr == Some(IdrCause::Reentry);
                     self.expect_h264_idr(IdrCause::RateDrop);
                     self.h264.stats.rate_reopens_drop += 1;
-                    self.h264.last_cut_at = Some(now_std());
+                    if !reentry {
+                        self.h264.last_cut_at = Some(now_std());
+                    }
                 } else {
                     // The scheduled IDR taking a new rate: no hold, like any
                     // periodic IDR, and counted as one.
@@ -988,13 +1036,13 @@ mod tests {
         let mut b = padding_bridge().await;
         let est = b.bwe.snapshot().bitrate_bps;
         // The first look arms the cadence; the start-up ladder is goog_cc's.
-        b.h264_probe_pad(now_std(), false, 0);
+        b.h264_probe_pad(now_std(), None, 0);
         assert!(b.active_probe.is_none() && b.h264.stats.app_probes == 0);
         tokio::time::advance(APP_PROBE_INTERVAL - Duration::from_millis(1)).await;
-        b.h264_probe_pad(now_std(), false, 0);
+        b.h264_probe_pad(now_std(), None, 0);
         assert!(b.active_probe.is_none(), "not yet");
         tokio::time::advance(Duration::from_millis(2)).await;
-        b.h264_probe_pad(now_std(), false, 0);
+        b.h264_probe_pad(now_std(), None, 0);
         let p = b.active_probe.expect("the cluster is open");
         assert!(
             p.id >= 1_000_000_000,
@@ -1035,19 +1083,19 @@ mod tests {
     async fn a_probe_chain_goes_on_while_the_estimate_follows_and_ends_when_it_does_not() {
         let mut b = padding_bridge().await;
         let est = b.bwe.snapshot().bitrate_bps;
-        b.h264_probe_pad(now_std(), false, 0); // arms
+        b.h264_probe_pad(now_std(), None, 0); // arms
         tokio::time::advance(APP_PROBE_INTERVAL).await;
-        b.h264_probe_pad(now_std(), false, 0);
+        b.h264_probe_pad(now_std(), None, 0);
         assert_eq!(b.h264.stats.app_probes, 1);
         // The window closes; the estimate did not move (it is under 0.7 x the
         // 2 x target): the chain ends, the next probe is an interval away.
         b.active_probe = None;
         b.reliable_emitter.purge_queued_h264(|_| true); // the pads went out
         tokio::time::advance(APP_PROBE_CHAIN_GAP).await;
-        b.h264_probe_pad(now_std(), false, 0);
+        b.h264_probe_pad(now_std(), None, 0);
         assert_eq!(b.h264.stats.app_probes, 1, "the chain ended");
         tokio::time::advance(APP_PROBE_INTERVAL).await;
-        b.h264_probe_pad(now_std(), false, 0);
+        b.h264_probe_pad(now_std(), None, 0);
         assert_eq!(
             b.h264.stats.app_probes, 2,
             "an interval after the chain ended"
@@ -1060,14 +1108,14 @@ mod tests {
         b.h264.app_probe.last_target = Some(est); // the estimate "reached" it
         b.reliable_emitter.purge_queued_h264(|_| true);
         tokio::time::advance(APP_PROBE_CHAIN_GAP).await;
-        b.h264_probe_pad(now_std(), false, 0);
+        b.h264_probe_pad(now_std(), None, 0);
         assert_eq!(b.h264.stats.app_probes, 3, "the chain went on");
     }
 
     #[tokio::test(start_paused = true)]
     async fn padding_keeps_quiet_behind_a_backlog_and_after_a_rate_cut() {
         let mut b = padding_bridge().await;
-        b.h264_probe_pad(now_std(), false, 0); // arms
+        b.h264_probe_pad(now_std(), None, 0); // arms
         tokio::time::advance(APP_PROBE_INTERVAL).await;
         let t = now_std();
         // A backlog: an H.264 fragment of another frame still queued.
@@ -1084,16 +1132,16 @@ mod tests {
             t,
         );
         let own = 0; // this frame's own bytes: none, so the queue is a backlog
-        b.h264_probe_pad(t, false, own);
+        b.h264_probe_pad(t, None, own);
         assert!(b.active_probe.is_none(), "behind a backlog");
         // The queue holds only the frame just sent: allowed.
         let queued = b.reliable_emitter.queued_h264_bytes();
         // ... but not right after a rate cut.
         b.h264.last_cut_at = Some(t);
-        b.h264_probe_pad(t, false, queued);
+        b.h264_probe_pad(t, None, queued);
         assert!(b.active_probe.is_none(), "within 3 s of a cut");
         tokio::time::advance(PAD_QUIET_AFTER_CUT).await;
-        b.h264_probe_pad(now_std(), false, queued);
+        b.h264_probe_pad(now_std(), None, queued);
         assert!(b.active_probe.is_some(), "quiet again");
         assert_eq!(b.h264.stats.app_probes, 1);
     }
@@ -1101,12 +1149,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_idr_due_within_the_window_is_the_burst_and_is_topped_up_not_padded_around() {
         let mut b = padding_bridge().await;
-        b.h264_probe_pad(now_std(), false, 0); // arms
+        b.h264_probe_pad(now_std(), None, 0); // arms
         tokio::time::advance(APP_PROBE_INTERVAL).await;
         // The scheduled IDR is 100 ms away (the bridge's clock, not frames).
         b.h264.gop = Duration::from_secs(3);
         b.h264.last_idr_at = Some(now_std() - Duration::from_millis(2_900));
-        b.h264_probe_pad(now_std(), false, 0);
+        b.h264_probe_pad(now_std(), None, 0);
         assert!(
             b.active_probe.is_none(),
             "the IDR is the burst: no window opened on a P frame"
@@ -1114,7 +1162,7 @@ mod tests {
         // An IDR that claimed a window smaller than the cluster is topped up.
         let t = now_std();
         b.open_probe_cluster(t, 77, 4_000_000, APP_PROBE_DURATION, 5, 50_000);
-        b.h264_probe_pad(t, true, 3_000);
+        b.h264_probe_pad(t, Some(IdrCause::GopPeriodic), 3_000);
         let p = b.active_probe.expect("still open");
         assert!(
             p.bytes_sent >= p.min_bytes,
@@ -1127,9 +1175,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn leaving_h264_mode_or_the_session_forgets_the_probing_and_the_padding() {
         let mut b = padding_bridge().await;
-        b.h264_probe_pad(now_std(), false, 0);
+        b.h264_probe_pad(now_std(), None, 0);
         tokio::time::advance(APP_PROBE_INTERVAL).await;
-        b.h264_probe_pad(now_std(), false, 0);
+        b.h264_probe_pad(now_std(), None, 0);
         assert!(!b.reliable_emitter.pads.is_empty());
         b.h264_reset_probing();
         assert!(b.reliable_emitter.pads.is_empty());
@@ -1175,9 +1223,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn leaving_h264_mode_resets_padding_probing_policy_and_gop_clock_in_one_place() {
         let mut b = padding_bridge().await;
-        b.h264_probe_pad(now_std(), false, 0); // arms
+        b.h264_probe_pad(now_std(), None, 0); // arms
         tokio::time::advance(APP_PROBE_INTERVAL).await;
-        b.h264_probe_pad(now_std(), false, 0);
+        b.h264_probe_pad(now_std(), None, 0);
         assert!(
             !b.reliable_emitter.pads.is_empty(),
             "premise: padding in flight"
@@ -1191,5 +1239,168 @@ mod tests {
         assert!(b.h264.last_idr_at.is_none());
         assert_eq!(b.h264.rate.applied(), applied, "the encoder keeps its rate");
         assert!(b.h264.rate.ewma_bps.is_none(), "the estimate starts over");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_cluster_is_sized_to_what_padding_can_fill_and_skipped_when_it_cannot() {
+        for (est, skipped) in [(30_000_000u64, false), (100_000_000, true)] {
+            let mut b = padding_bridge().await;
+            b.bwe.restore_from(now_std(), est);
+            while b.bwe.take_probe_request().is_some() {} // goog_cc's own are not under test
+            assert!(
+                b.bwe.snapshot().bitrate_bps >= est / 2,
+                "premise: the estimate is high"
+            );
+            b.h264_probe_pad(now_std(), None, 0); // arms
+            tokio::time::advance(APP_PROBE_INTERVAL).await;
+            b.h264_probe_pad(now_std(), None, 0);
+            if skipped {
+                assert!(b.active_probe.is_none());
+                assert_eq!(b.h264.stats.app_probes_skipped, 1, "counted");
+                assert_eq!(b.h264.stats.app_probes, 0);
+                continue;
+            }
+            let p = b.active_probe.expect("a cluster is open at 30 Mbit/s");
+            let want = (p.min_bytes as f64 * PAD_MARGIN) as usize;
+            assert!(
+                want <= PAD_MAX_BYTES,
+                "padding must be able to fill it: want {want} of at most {PAD_MAX_BYTES}"
+            );
+            assert!(
+                p.bytes_sent >= p.min_bytes,
+                "and it did: {} of {}",
+                p.bytes_sent,
+                p.min_bytes
+            );
+            assert!(
+                p.ends_at - p.opened_at < APP_PROBE_DURATION,
+                "a shorter window than the usual 100 ms"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idr_that_opens_a_hold_is_never_padded_and_one_that_does_not_obeys_the_guards() {
+        for cause in [
+            IdrCause::RateDrop,
+            IdrCause::Loss,
+            IdrCause::HoldTimeout,
+            IdrCause::Reentry,
+            IdrCause::Session,
+        ] {
+            let mut b = padding_bridge().await;
+            let t = now_std();
+            b.open_probe_cluster(t, 77, 4_000_000, APP_PROBE_DURATION, 5, 50_000);
+            b.h264_probe_pad(t, Some(cause), 3_000);
+            assert_eq!(
+                b.h264.stats.probe_padding_datagrams, 0,
+                "{cause:?} opens a hold"
+            );
+        }
+        // The scheduled GOP IDR (no hold) is topped up, but only with an empty
+        // queue behind it and not right after a cut.
+        let mut b = padding_bridge().await;
+        let t = now_std();
+        b.h264.last_cut_at = Some(t);
+        b.open_probe_cluster(t, 77, 4_000_000, APP_PROBE_DURATION, 5, 50_000);
+        b.h264_probe_pad(t, Some(IdrCause::GopPeriodic), 3_000);
+        assert_eq!(
+            b.h264.stats.probe_padding_datagrams, 0,
+            "within 3 s of a cut"
+        );
+        b.h264.last_cut_at = None;
+        // A backlog: another frame's fragment still queued.
+        let dgs = crate::transport::protocol::fragment_frame(9, 0, false, &[1u8; 800], 1200);
+        b.reliable_emitter.submit_h264_fragment(
+            crate::transport::reliable_emitter::h264::H264Submit {
+                frame_seq: 9,
+                frag_idx: 0,
+                is_idr: false,
+                bytes: bytes::Bytes::from(dgs[0].clone()),
+                queued_at: t,
+                probe: None,
+            },
+            t,
+        );
+        b.h264_probe_pad(t, Some(IdrCause::GopPeriodic), 0);
+        assert_eq!(b.h264.stats.probe_padding_datagrams, 0, "behind a backlog");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn padding_stops_when_the_ring_is_full_and_purged_or_lost_pads_leave_it() {
+        use crate::transport::reliable_emitter::h264::PAD_RING_CAP;
+        let mut b = padding_bridge().await;
+        let t = now_std();
+        // Fill the ring with live, tagged entries.
+        let tag = crate::transport::reliable_emitter::cache::ProbeTag {
+            id: APP_PROBE_ID_BASE,
+            min_probes: 5,
+            min_bytes: 1,
+            bytes_sent_before: 0,
+        };
+        let template = bytes::Bytes::from(vec![0u8; 1200]);
+        for _ in 0..PAD_RING_CAP {
+            b.reliable_emitter.submit_h264_pad(&template, tag, t);
+        }
+        let oldest = b.reliable_emitter.take_transmissions()[0].wire_seq;
+        assert!(b.reliable_emitter.pads.get(oldest).is_some());
+        b.open_probe_cluster(t, 78, 4_000_000, APP_PROBE_DURATION, 5, 50_000);
+        let before = b.h264.stats.probe_padding_datagrams;
+        b.h264_probe_pad(t, None, 0);
+        assert_eq!(
+            b.h264.stats.probe_padding_datagrams, before,
+            "full: no padding"
+        );
+        assert!(
+            b.reliable_emitter.pads.get(oldest).is_some(),
+            "and no tagged entry was evicted"
+        );
+        // A pad judged lost leaves the ring.
+        let lost_tx = crate::transport::transmission_ledger::Transmission {
+            emit_us: 0,
+            wire_bytes: 1200,
+            content: crate::transport::reliable_emitter::Content::Pad(oldest),
+            depart_us: None,
+            dep_idx: None,
+        };
+        b.note_h264_verdicts(&[(oldest, lost_tx)], t);
+        assert!(b.reliable_emitter.pads.get(oldest).is_none(), "judged lost");
+        // A purged pad leaves it too.
+        let next = b.reliable_emitter.pads.len();
+        assert_eq!(next, PAD_RING_CAP - 1);
+        let ws2 = b.reliable_emitter.take_transmissions().len(); // none left to take; keep the call honest
+        let _ = ws2;
+        let some_ws = oldest.wrapping_add(1);
+        assert!(b.reliable_emitter.pads.get(some_ws).is_some(), "premise");
+        b.forget_purged(&[some_ws]);
+        assert!(b.reliable_emitter.pads.get(some_ws).is_none(), "purged");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reentry_idr_that_takes_a_rate_drop_is_no_cut_of_the_path() {
+        let mut b = padding_bridge().await;
+        b.expect_h264_idr(IdrCause::Reentry);
+        b.h264_apply_rate_step(
+            RateStep::Reopen {
+                bps: 500_000,
+                urgent: true,
+            },
+            600_000,
+            30,
+        );
+        assert_eq!(b.h264.pending_idr, Some(IdrCause::Reentry), "named first");
+        assert!(b.h264.last_cut_at.is_none(), "and padding stays allowed");
+        // A plain drop is a cut.
+        let mut b = padding_bridge().await;
+        b.h264_apply_rate_step(
+            RateStep::Reopen {
+                bps: 500_000,
+                urgent: true,
+            },
+            600_000,
+            30,
+        );
+        assert_eq!(b.h264.pending_idr, Some(IdrCause::RateDrop));
+        assert!(b.h264.last_cut_at.is_some());
     }
 }
