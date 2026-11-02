@@ -4,7 +4,8 @@
 //!
 //! This owns `ClientNet` and therefore every bit of ACK/NACK timing. It is
 //! a separate thread from the renderer so a GPU stall on that side (the
-//! `poll(wait_indefinitely)` inside `ExportRing::publish`) can never delay
+//! `poll(wait_indefinitely)` inside `ExportRing::publish` when it has to wait,
+//! or a slow flush) can never delay
 //! a transport deadline -- see the module doc on `render_thread` for the
 //! other half of that argument.
 //!

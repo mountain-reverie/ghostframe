@@ -770,11 +770,14 @@ impl Renderer {
         }
 
         if recorded {
+            if plan.is_some() {
+                self.ring.arm_fence(ctx);
+            }
             crate::submit::submit(&ctx.queue, encoder);
         }
         if let Some(pool) = &self.upload_pool {
             // After the submit that may read them, or at once if there was none.
-            // Not tied to the publish wait below, which may not happen.
+            // Not tied to the publish below, which may not happen.
             if recorded {
                 pool.retire_when_submitted_work_done(&ctx.queue, retired);
             } else {
@@ -810,7 +813,7 @@ impl Renderer {
 
         self.flushes = self.flushes.saturating_add(1);
         self.maybe_dump_framebuffer(ctx);
-        Ok(plan.map(|plan| self.ring.finish_publish(&ctx.device, plan)))
+        Ok(plan.map(|plan| self.ring.finish_publish(ctx, plan, recorded)))
     }
 
     /// Record the upload of every buffered `TileReady` tile with as few
@@ -1070,7 +1073,7 @@ impl Renderer {
 
     /// Seal a generation and hand out an export buffer, if one is free.
     pub fn publish(&mut self, ctx: &WgpuContext) -> Option<PublishedFrame> {
-        self.ring.publish(&ctx.device, &ctx.queue, &self.fb)
+        self.ring.publish(ctx, &self.fb)
     }
 
     /// Write the framebuffer to binary PPM files when

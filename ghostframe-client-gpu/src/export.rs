@@ -666,6 +666,10 @@ impl ExportedImage {
 
 impl Drop for ExportedImage {
     fn drop(&mut self) {
+        // A publish no longer waits for its blit, so the GPU may still be
+        // writing the image. Freeing the memory under it would write through
+        // a dangling mapping; the reservation tells us when it is done.
+        let _ = crate::dmabuf::dma_buf_wait_write_idle(self.fd.as_raw_fd(), 10_000);
         // SAFETY: `image` and `memory` are owned exclusively by this struct
         // and were created/allocated together in `new`. Destroying the
         // image before freeing its memory is the order Vulkan requires

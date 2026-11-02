@@ -203,6 +203,13 @@ Env-gated, off by default:
   rule), acknowledgement, late acknowledgement and resolve miss. The `loss
   path` journal event (same cadence as `cumulative emit`) carries `k_pkt`,
   verdicts by rule, `spurious_*`, `pto_fires` and the retransmission causes.
+- `GHOSTFRAME_BLOCKING_PUBLISH=1` — native client: wait for the GPU after every
+  export publish, as the ring did before it stopped. The default hands the
+  buffer over while the blit is still running (GLES relies on Mesa's implicit
+  sync on the shared dmabuf; Vulkan imports an exportable-semaphore fence into
+  it). Use it to rule the non-blocking publish in or out when frames look torn.
+  `GHOSTFRAME_NO_FENCE_DEVICE=1` (Vulkan) opens the device without
+  `VK_KHR_external_semaphore_fd`, which also makes publishes block.
 - `GHOSTFRAME_ACK_ORDER_PROBE=1` — every acknowledged `wire_seq` in arrival
   order, on target `ghostframe::ackorder`. Replaying an RFC 9002
   packet-threshold rule against that order says whether ordering-based loss

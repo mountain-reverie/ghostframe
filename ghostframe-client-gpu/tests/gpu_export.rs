@@ -3,6 +3,7 @@
 //! that CI exempts itself in the workflow file rather than the test
 //! carrying an #[ignore] that would hide it from developers too.
 
+use ghostframe_client_gpu::dmabuf::dma_buf_write_pending;
 use ghostframe_client_gpu::wgpu_ctx::WgpuContext;
 
 #[test]
@@ -353,26 +354,16 @@ fn ring_partial_update_preserves_untouched_regions() {
     // Frame 1: whole surface red, into buffer A.
     fb.debug_fill(&ctx.device, &ctx.queue, [0xFF, 0x00, 0x00, 0xFF]);
     ring.mark_dirty_all();
-    let a = ring
-        .publish(&ctx.device, &ctx.queue, &fb)
-        .expect("publish 1");
-    ctx.device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .expect("poll");
+    let a = ring.publish(&ctx, &fb).expect("publish 1");
 
     // Frame 2: paint ONLY tile (1,0) green, publish into a different buffer.
     fb.debug_fill_tile(&ctx.device, &ctx.queue, 1, 0, [0x00, 0xFF, 0x00, 0xFF]);
     ring.mark_dirty(1, 0);
-    let b = ring
-        .publish(&ctx.device, &ctx.queue, &fb)
-        .expect("publish 2");
+    let b = ring.publish(&ctx, &fb).expect("publish 2");
     assert_ne!(
         a.buffer_id, b.buffer_id,
         "must not reuse a buffer still held"
     );
-    ctx.device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .expect("poll");
 
     let img = ring.buffer(b.buffer_id);
     let (bytes, stride, base) = read_export(&ctx, img);
@@ -404,12 +395,12 @@ fn publish_returns_none_when_every_buffer_is_held() {
     let fb = Framebuffer::new(&ctx.device, 64, 64);
     let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[], true).expect("ring");
     ring.mark_dirty_all();
-    assert!(ring.publish(&ctx.device, &ctx.queue, &fb).is_some());
+    assert!(ring.publish(&ctx, &fb).is_some());
     ring.mark_dirty_all();
-    assert!(ring.publish(&ctx.device, &ctx.queue, &fb).is_some());
+    assert!(ring.publish(&ctx, &fb).is_some());
     ring.mark_dirty_all();
     // Nothing free: the library keeps decoding privately, it does not stall.
-    assert!(ring.publish(&ctx.device, &ctx.queue, &fb).is_none());
+    assert!(ring.publish(&ctx, &fb).is_none());
 }
 
 #[test]
@@ -418,13 +409,13 @@ fn released_buffers_are_recycled() {
     let fb = Framebuffer::new(&ctx.device, 64, 64);
     let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[], true).expect("ring");
     ring.mark_dirty_all();
-    let a = ring.publish(&ctx.device, &ctx.queue, &fb).expect("a");
+    let a = ring.publish(&ctx, &fb).expect("a");
     ring.mark_dirty_all();
-    let b = ring.publish(&ctx.device, &ctx.queue, &fb).expect("b");
+    let b = ring.publish(&ctx, &fb).expect("b");
     ring.release(a.frame_id);
     ring.release(b.frame_id);
     ring.mark_dirty_all();
-    let c = ring.publish(&ctx.device, &ctx.queue, &fb).expect("c");
+    let c = ring.publish(&ctx, &fb).expect("c");
     assert!(c.buffer_id == a.buffer_id || c.buffer_id == b.buffer_id);
 }
 
@@ -452,9 +443,7 @@ fn recycled_buffer_receives_only_its_damage_and_keeps_the_rest() {
     // Frame 1: whole surface red, full blit into the only buffer.
     fb.debug_fill(&ctx.device, &ctx.queue, [0xFF, 0x00, 0x00, 0xFF]);
     ring.mark_dirty_all();
-    let a = ring
-        .publish(&ctx.device, &ctx.queue, &fb)
-        .expect("publish 1");
+    let a = ring.publish(&ctx, &fb).expect("publish 1");
     ctx.device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
@@ -464,13 +453,8 @@ fn recycled_buffer_receives_only_its_damage_and_keeps_the_rest() {
     // be a PARTIAL blit of just that tile.
     fb.debug_fill_tile(&ctx.device, &ctx.queue, 1, 0, [0x00, 0xFF, 0x00, 0xFF]);
     ring.mark_dirty(1, 0);
-    let b = ring
-        .publish(&ctx.device, &ctx.queue, &fb)
-        .expect("publish 2");
+    let b = ring.publish(&ctx, &fb).expect("publish 2");
     assert_eq!(a.buffer_id, b.buffer_id, "one-buffer ring must recycle");
-    ctx.device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .expect("poll");
 
     // Damage must be the single tile, not the whole surface. This is what
     // proves the partial branch ran rather than the full-blit fallback.
@@ -530,7 +514,7 @@ fn resize_while_a_frame_is_held_keeps_its_fd_open_until_release() {
     let fb = Framebuffer::new(&ctx.device, 64, 64);
     let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[], false).expect("ring");
     ring.mark_dirty_all();
-    let held = ring.publish(&ctx.device, &ctx.queue, &fb).expect("publish");
+    let held = ring.publish(&ctx, &fb).expect("publish");
     let identity = dev_ino(held.fd);
 
     ring.resize(&ctx, 128, 96).expect("resize");
@@ -549,9 +533,7 @@ fn resize_while_a_frame_is_held_keeps_its_fd_open_until_release() {
     // the C shim keys its damage list by frame_id.
     let fb2 = Framebuffer::new(&ctx.device, 128, 96);
     ring.mark_dirty_all();
-    let fresh = ring
-        .publish(&ctx.device, &ctx.queue, &fb2)
-        .expect("publish 2");
+    let fresh = ring.publish(&ctx, &fb2).expect("publish 2");
     assert_ne!(
         fresh.frame_id, held.frame_id,
         "frame_id reused across resize"
@@ -585,7 +567,7 @@ fn a_repeated_frame_dimensions_does_not_retire_held_buffers() {
     let fb = Framebuffer::new(&ctx.device, 64, 64);
     let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[], false).expect("ring");
     ring.mark_dirty_all();
-    let held = ring.publish(&ctx.device, &ctx.queue, &fb).expect("publish");
+    let held = ring.publish(&ctx, &fb).expect("publish");
     let identity = dev_ino(held.fd);
     for _ in 0..10 {
         ring.resize(&ctx, 64, 64).expect("resize");
@@ -603,14 +585,14 @@ fn since_previous_is_relative_to_the_previous_publish_not_the_buffer() {
 
     // The first frame has no predecessor to be relative to.
     ring.mark_dirty_all();
-    let a = ring.publish(&ctx.device, &ctx.queue, &fb).expect("a");
+    let a = ring.publish(&ctx, &fb).expect("a");
     assert!(a.since_previous.is_none());
 
     // Second frame goes into the other (never filled) buffer, so its own
     // damage is the whole surface -- but against frame `a` only tile (2,0)
     // changed, and that is what the window needs.
     ring.mark_dirty(2, 0);
-    let b = ring.publish(&ctx.device, &ctx.queue, &fb).expect("b");
+    let b = ring.publish(&ctx, &fb).expect("b");
     assert_eq!(b.damage.len(), 1);
     assert_eq!((b.damage[0].w, b.damage[0].h), (128, 64));
     let sp = b.since_previous.expect("b follows a");
@@ -629,10 +611,10 @@ fn since_previous_is_relative_to_the_previous_publish_not_the_buffer() {
     // Both buffers are held: this publish fails, but its damage must still
     // be carried into the next successful one.
     ring.mark_dirty(0, 1);
-    assert!(ring.publish(&ctx.device, &ctx.queue, &fb).is_none());
+    assert!(ring.publish(&ctx, &fb).is_none());
     ring.release(a.frame_id);
     ring.mark_dirty(3, 1);
-    let c = ring.publish(&ctx.device, &ctx.queue, &fb).expect("c");
+    let c = ring.publish(&ctx, &fb).expect("c");
     let sp = c.since_previous.expect("c follows b");
     assert_eq!(sp.frame_id, b.frame_id);
     let mut tiles: Vec<(u32, u32)> = sp.damage.iter().map(|r| (r.x / 32, r.y / 32)).collect();
@@ -646,14 +628,85 @@ fn since_previous_is_none_after_a_resize() {
     let fb = Framebuffer::new(&ctx.device, 64, 64);
     let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[], true).expect("ring");
     ring.mark_dirty_all();
-    let a = ring.publish(&ctx.device, &ctx.queue, &fb).expect("a");
+    let a = ring.publish(&ctx, &fb).expect("a");
     ring.release(a.frame_id);
 
     ring.resize(&ctx, 96, 64).expect("resize");
     let fb = Framebuffer::new(&ctx.device, 96, 64);
     ring.mark_dirty_all();
-    let b = ring.publish(&ctx.device, &ctx.queue, &fb).expect("b");
+    let b = ring.publish(&ctx, &fb).expect("b");
     // The history was reset, so the pre-resize frame is not a baseline: an
     // empty delta here would mean "nothing changed" and leave stale pixels.
     assert!(b.since_previous.is_none());
+}
+
+/// Publish a full-screen frame behind three queued full-screen uploads, so the
+/// GPU has real work when `publish` returns. Returns, per round, whether the
+/// GPU was still writing the export right after `publish`, having checked the
+/// pixels the CPU then reads back.
+fn publish_behind_queued_work(ring: &mut ExportRing, ctx: &WgpuContext, rounds: u32) -> Vec<bool> {
+    const W: u32 = 1920;
+    const H: u32 = 1080;
+    let mut fb = Framebuffer::new(&ctx.device, W, H);
+    let mut still_writing = Vec::new();
+    for i in 0..rounds {
+        let last = [0x10 + i as u8, 0x22, 0x33, 0xFF];
+        fb.debug_fill(&ctx.device, &ctx.queue, [0xFF, 0, 0, 0xFF]);
+        fb.debug_fill(&ctx.device, &ctx.queue, [0, 0xFF, 0, 0xFF]);
+        fb.debug_fill(&ctx.device, &ctx.queue, last);
+        ring.mark_dirty_all();
+        let frame = ring.publish(ctx, &fb).expect("publish");
+        let img = ring.buffer(frame.buffer_id);
+        // Straight away, before anything has had a reason to wait.
+        still_writing.push(dma_buf_write_pending(img.raw_fd()));
+
+        let (bytes, stride, base) = read_export(ctx, img);
+        for (x, y) in [(0, 0), (W - 1, H - 1), (W / 2, H / 3), (7, H - 2)] {
+            let off = base + y as usize * stride + x as usize * 4;
+            assert_eq!(
+                &bytes[off..off + 4],
+                &in_export(last),
+                "round {i}: stale or missing pixel at ({x},{y})"
+            );
+        }
+        ring.release(frame.frame_id);
+    }
+    still_writing
+}
+
+/// The property that matters: `publish` hands the buffer over while the GPU is
+/// still writing it (it did not block), and a CPU read of it still sees the
+/// finished frame (the reservation orders the read behind the blit).
+///
+/// "At least once in eight" rather than every time, because a fast GPU can
+/// finish early on any one frame; a publish that blocks never shows it.
+#[test]
+fn publish_does_not_block_and_a_cpu_read_still_sees_the_frame() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut ring = ExportRing::new(&ctx, 1920, 1080, 2, &[], true).expect("ring");
+    let busy = publish_behind_queued_work(&mut ring, &ctx, 8);
+    eprintln!("GPU still writing right after publish, per round: {busy:?}");
+    if ring.publish_is_nonblocking() {
+        assert!(
+            busy.iter().any(|b| *b),
+            "publish returned with the GPU idle every time: it is waiting for the blit"
+        );
+    } else {
+        eprintln!("this device has no non-blocking publish; the ring waits instead");
+    }
+}
+
+/// The blocking path (no fence, or `GHOSTFRAME_BLOCKING_PUBLISH`): the buffer is
+/// finished when `publish` returns.
+#[test]
+fn blocking_publish_returns_a_finished_buffer() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut ring = ExportRing::new(&ctx, 1920, 1080, 2, &[], true).expect("ring");
+    ring.force_blocking_publish();
+    assert!(!ring.publish_is_nonblocking());
+    let busy = publish_behind_queued_work(&mut ring, &ctx, 8);
+    assert!(
+        busy.iter().all(|b| !*b),
+        "a blocking publish returned with the GPU still writing: {busy:?}"
+    );
 }
