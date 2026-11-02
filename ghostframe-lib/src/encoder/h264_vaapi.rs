@@ -210,7 +210,7 @@ impl FullFrameEncoder {
                         open_ms = std::time::Instant::now()
                             .saturating_duration_since(opened_at)
                             .as_millis() as u64,
-                        "FullFrameEncoder: using h264_vaapi hardware encoder (CBR)"
+                        "FullFrameEncoder: using h264_vaapi hardware encoder (rate-capped VBR)"
                     );
                     return Ok(this);
                 }
@@ -231,7 +231,7 @@ impl FullFrameEncoder {
             open_ms = std::time::Instant::now()
                 .saturating_duration_since(opened_at)
                 .as_millis() as u64,
-            "FullFrameEncoder: using libx264 software encoder (CBR)"
+            "FullFrameEncoder: using libx264 software encoder (rate-capped)"
         );
         Ok(this)
     }
@@ -331,9 +331,20 @@ impl FullFrameEncoder {
 
             let mut opts = ffmpeg::Dictionary::new();
             opts.set("g", &ENCODER_OWN_GOP.to_string());
-            // Constant bit rate: with `bit_rate == rc_max_rate` the driver
-            // picks CBR anyway; say so rather than rely on that.
-            opts.set("rc_mode", "CBR");
+            // Rate-capped, not CBR: `bit_rate == rc_max_rate` with a one-second
+            // VBV caps every window at the rate, and VBR does not stuff.
+            // Measured on Mesa radeonsi (VCE, RX 480): `rc_mode=CBR` pads
+            // every frame up to `bps / fps` (static P frames averaged 8 345 B
+            // against an 8 333 B budget, i.e. all of it was filler), so a
+            // stream that is mostly small P frames paid for the whole budget
+            // and the estimator saw a saturated sender. With VBR the same
+            // static P frames are 126 B, and the busy moving-content test stays
+            // under its bounds (see `h264_vaapi_tests.rs`). The cost: VBR
+            // undershoots a busy stream (162 kB over 5 s against a 625 kB
+            // target on that test, where CBR gave 627 kB). `max_frame_size`
+            // (design 4.3's per-frame cap) is not needed to meet the tests and
+            // is left unset.
+            opts.set("rc_mode", "VBR");
 
             let opened = match ctx.open_with(opts) {
                 Ok(enc) => enc,
