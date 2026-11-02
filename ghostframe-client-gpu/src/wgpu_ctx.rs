@@ -163,7 +163,12 @@ impl WgpuContext {
 
         let device_desc = wgpu::DeviceDescriptor {
             label: Some("ghostframe-client"),
-            required_features: wgpu::Features::VULKAN_EXTERNAL_MEMORY_FD,
+            // Storage writes to the BGRA export let the compute export copy
+            // touch only the damaged tiles; without it the ring keeps the
+            // render-pass blit. Asked for only where the adapter has it, so it
+            // never costs a device that lacks it.
+            required_features: wgpu::Features::VULKAN_EXTERNAL_MEMORY_FD
+                | (adapter.features() & wgpu::Features::BGRA8UNORM_STORAGE),
             // downlevel_defaults caps maxComputeInvocationsPerWorkgroup at
             // the portable 256 that palrle_decode.wgsl was designed around,
             // so a limit the browser would not have is not silently

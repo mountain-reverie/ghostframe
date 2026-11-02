@@ -74,6 +74,12 @@ pub struct ExportedImage {
     pub height: u32,
     pub modifier: u64,
     pub planes: Vec<PlaneLayout>,
+    /// Whether the image was created with `STORAGE` usage, which is what lets
+    /// the compute export copy write it. Needs the device's
+    /// `BGRA8UNORM_STORAGE` feature and `STORAGE_IMAGE` in the format features
+    /// of the tiling or modifier the image got; either missing leaves it off
+    /// and the ring on the render-pass blit.
+    storage: bool,
     fd: OwnedFd,
     // Kept only so `Drop` can call `destroy_image`/`free_memory`. Not
     // exposed: callers reach the device through `WgpuContext` for
@@ -92,6 +98,7 @@ impl std::fmt::Debug for ExportedImage {
             .field("height", &self.height)
             .field("modifier", &self.modifier)
             .field("planes", &self.planes)
+            .field("storage", &self.storage)
             .field("fd", &self.fd.as_raw_fd())
             .finish()
     }
@@ -120,27 +127,54 @@ impl ExportedImage {
         preferred: &[u64],
         host_visible: bool,
     ) -> Result<Self, GpuError> {
+        // The device feature is the one half of storage support that is the
+        // same for every image; the format-feature half depends on the tiling
+        // and is checked where that is known.
+        let bgra_storage = ctx
+            .device
+            .features()
+            .contains(wgpu::Features::BGRA8UNORM_STORAGE);
         ctx.with_raw(|instance, device, phys| {
-            if ctx.explicit_modifiers {
-                Self::create_explicit(
-                    host_visible,
-                    instance,
-                    device,
-                    phys,
-                    width,
-                    height,
-                    preferred,
-                )
-            } else {
-                Self::create_linear(
-                    host_visible,
-                    instance,
-                    device,
-                    phys,
-                    width,
-                    height,
-                    preferred,
-                )
+            let make = |bgra_storage: bool| {
+                if ctx.explicit_modifiers {
+                    Self::create_explicit(
+                        host_visible,
+                        bgra_storage,
+                        instance,
+                        device,
+                        phys,
+                        width,
+                        height,
+                        preferred,
+                    )
+                } else {
+                    Self::create_linear(
+                        host_visible,
+                        bgra_storage,
+                        instance,
+                        device,
+                        phys,
+                        width,
+                        height,
+                        preferred,
+                    )
+                }
+            };
+            match make(bgra_storage) {
+                Ok(image) => Ok(image),
+                // A driver that passed every query and still refuses the image
+                // with STORAGE must not cost a machine that ran on the blit its
+                // exports: try once more without it. A failure of any other
+                // kind fails the same way again, and that one is returned.
+                Err(why) if bgra_storage => {
+                    tracing::warn!(
+                        %why,
+                        "creating the export image with STORAGE usage failed; \
+                         retrying without it (exports will use the render-pass blit)"
+                    );
+                    make(false)
+                }
+                Err(why) => Err(why),
             }
         })
         .ok_or_else(|| GpuError::Vulkan("wgpu is not running on the Vulkan backend".to_string()))?
@@ -148,6 +182,42 @@ impl ExportedImage {
 
     pub fn raw_fd(&self) -> i32 {
         self.fd.as_raw_fd()
+    }
+
+    /// The usages the hal descriptor declares; the image was created with the
+    /// matching Vulkan flags by [`ExportedImage::choose_usage`] (`COLOR_TARGET`
+    /// is `COLOR_ATTACHMENT`, which that asks for wherever the driver allows).
+    fn hal_usage(&self) -> wgpu::TextureUses {
+        let base = wgpu::TextureUses::COPY_SRC | wgpu::TextureUses::COLOR_TARGET;
+        if self.storage {
+            base | wgpu::TextureUses::STORAGE_WRITE_ONLY | wgpu::TextureUses::STORAGE_READ_WRITE
+        } else {
+            base
+        }
+    }
+
+    fn wgpu_usage(&self) -> wgpu::TextureUsages {
+        let base = wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::RENDER_ATTACHMENT;
+        if self.storage {
+            base | wgpu::TextureUsages::STORAGE_BINDING
+        } else {
+            base
+        }
+    }
+
+    /// The texture the compute export copy writes: `primary`, the one
+    /// [`ExportedImage::as_wgpu_texture`] made, when the image has `STORAGE`
+    /// usage; `None` otherwise.
+    ///
+    /// The same wgpu texture rather than a second over the one `VkImage`:
+    /// wgpu tracks an image's layout per texture, and two trackers over one
+    /// image would each assume a layout the other had moved it out of.
+    pub fn storage_texture(
+        &self,
+        _device: &wgpu::Device,
+        primary: &wgpu::Texture,
+    ) -> Option<wgpu::Texture> {
+        self.storage.then(|| primary.clone())
     }
 
     /// Wrap this image as a wgpu texture so blits are ordinary wgpu.
@@ -182,7 +252,7 @@ impl ExportedImage {
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
                         format: FORMAT_WGPU,
-                        usage: wgpu::TextureUses::COPY_SRC | wgpu::TextureUses::COLOR_TARGET,
+                        usage: self.hal_usage(),
                         memory_flags: wgpu_hal::MemoryFlags::empty(),
                         view_formats: Vec::new(),
                     },
@@ -210,7 +280,7 @@ impl ExportedImage {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: FORMAT_WGPU,
-                    usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    usage: self.wgpu_usage(),
                     view_formats: &[],
                 },
                 wgpu::TextureUses::UNINITIALIZED,
@@ -287,8 +357,10 @@ impl ExportedImage {
         Ok(bytes)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_linear(
         host_visible: bool,
+        bgra_storage: bool,
         instance: &ash::Instance,
         device: &ash::Device,
         phys: vk::PhysicalDevice,
@@ -311,6 +383,7 @@ impl ExportedImage {
              (VK_EXT_image_drm_format_modifier unavailable)"
         );
 
+        let (usage, storage) = Self::choose_usage(instance, phys, None, bgra_storage);
         let mut ext_image_info = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
         let image_info = vk::ImageCreateInfo::default()
@@ -326,7 +399,7 @@ impl ExportedImage {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::LINEAR)
-            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
@@ -346,10 +419,16 @@ impl ExportedImage {
             modifier,
             vk::ImageAspectFlags::COLOR,
         )
+        .map(|mut exported| {
+            exported.storage = storage;
+            exported
+        })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_explicit(
         host_visible: bool,
+        bgra_storage: bool,
         instance: &ash::Instance,
         device: &ash::Device,
         phys: vk::PhysicalDevice,
@@ -374,6 +453,7 @@ impl ExportedImage {
              only Vulkan device so far lacks VK_EXT_image_drm_format_modifier)"
         );
 
+        let (usage, storage) = Self::choose_usage(instance, phys, Some(modifier), bgra_storage);
         let chosen = [modifier];
         let mut modifier_list_info =
             vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(&chosen);
@@ -393,7 +473,7 @@ impl ExportedImage {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
@@ -437,6 +517,130 @@ impl ExportedImage {
             modifier,
             vk::ImageAspectFlags::MEMORY_PLANE_0_EXT,
         )
+        .map(|mut exported| {
+            exported.storage = storage;
+            exported
+        })
+    }
+
+    /// The usage to create an export image with, and whether it includes
+    /// `STORAGE` (what the compute export copy writes through).
+    ///
+    /// `COLOR_ATTACHMENT` is always asked for where the driver allows it: the
+    /// render-pass blit renders into this image and the hal descriptor declares
+    /// `COLOR_TARGET`, so the image has to say so too. `STORAGE` needs more than
+    /// the device feature: the driver must accept the whole combination for a
+    /// dmabuf-exportable image of this tiling, and list
+    /// `STORAGE_WRITE_WITHOUT_FORMAT` for the tiling, because naga declares a
+    /// `bgra8unorm` storage texture without a format and wgpu's own
+    /// `BGRA8UNORM_STORAGE` check only looks at optimal tiling. Must agree with
+    /// [`ExportedImage::hal_usage`] and [`ExportedImage::wgpu_usage`].
+    fn choose_usage(
+        instance: &ash::Instance,
+        phys: vk::PhysicalDevice,
+        modifier: Option<u64>,
+        bgra_storage: bool,
+    ) -> (vk::ImageUsageFlags, bool) {
+        let transfer = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC;
+        let with_color = transfer | vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        let base = if Self::image_usage_ok(instance, phys, modifier, with_color) {
+            with_color
+        } else {
+            transfer
+        };
+        let with_storage = base | vk::ImageUsageFlags::STORAGE;
+        let storage = bgra_storage
+            && Self::storage_write_features_ok(instance, phys, modifier)
+            && Self::image_usage_ok(instance, phys, modifier, with_storage);
+        (if storage { with_storage } else { base }, storage)
+    }
+
+    /// Whether the driver would create a dmabuf-exportable [`FORMAT`] image with
+    /// `usage` in this tiling (`modifier` of `None` is LINEAR).
+    fn image_usage_ok(
+        instance: &ash::Instance,
+        phys: vk::PhysicalDevice,
+        modifier: Option<u64>,
+        usage: vk::ImageUsageFlags,
+    ) -> bool {
+        let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut drm = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+            .drm_format_modifier(modifier.unwrap_or(0))
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let info = vk::PhysicalDeviceImageFormatInfo2::default()
+            .format(FORMAT)
+            .ty(vk::ImageType::TYPE_2D)
+            .tiling(if modifier.is_some() {
+                vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT
+            } else {
+                vk::ImageTiling::LINEAR
+            })
+            .usage(usage)
+            .push_next(&mut external);
+        let info = if modifier.is_some() {
+            info.push_next(&mut drm)
+        } else {
+            info
+        };
+        let mut external_props = vk::ExternalImageFormatProperties::default();
+        let mut props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+        // SAFETY: valid in/out structs on the adapter's own physical device.
+        let queried = unsafe {
+            instance.get_physical_device_image_format_properties2(phys, &info, &mut props)
+        };
+        queried.is_ok()
+            && external_props
+                .external_memory_properties
+                .external_memory_features
+                .contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE)
+    }
+
+    /// Whether the tiling lists `STORAGE_IMAGE` and `STORAGE_WRITE_WITHOUT_FORMAT`
+    /// for [`FORMAT`]. Reads the 64-bit feature flags, which a driver without
+    /// `VK_KHR_format_feature_flags2` (or Vulkan 1.3) leaves empty: that reads
+    /// as unsupported, and the blit is used.
+    fn storage_write_features_ok(
+        instance: &ash::Instance,
+        phys: vk::PhysicalDevice,
+        modifier: Option<u64>,
+    ) -> bool {
+        let wanted = vk::FormatFeatureFlags2::STORAGE_IMAGE
+            | vk::FormatFeatureFlags2::STORAGE_WRITE_WITHOUT_FORMAT;
+        match modifier {
+            None => {
+                let mut f3 = vk::FormatProperties3::default();
+                let mut props = vk::FormatProperties2::default().push_next(&mut f3);
+                // SAFETY: valid out-param on the adapter's own physical device.
+                unsafe {
+                    instance.get_physical_device_format_properties2(phys, FORMAT, &mut props)
+                };
+                f3.linear_tiling_features.contains(wanted)
+            }
+            Some(modifier) => {
+                let mut count_query = vk::DrmFormatModifierPropertiesList2EXT::default();
+                let mut count_probe = vk::FormatProperties2::default().push_next(&mut count_query);
+                // SAFETY: as above.
+                unsafe {
+                    instance.get_physical_device_format_properties2(phys, FORMAT, &mut count_probe)
+                };
+                let mut list = vec![
+                    vk::DrmFormatModifierProperties2EXT::default();
+                    count_query.drm_format_modifier_count as usize
+                ];
+                let mut fill = vk::DrmFormatModifierPropertiesList2EXT::default()
+                    .drm_format_modifier_properties(&mut list);
+                let mut fill_probe = vk::FormatProperties2::default().push_next(&mut fill);
+                // SAFETY: `list` has the length the first call reported.
+                unsafe {
+                    instance.get_physical_device_format_properties2(phys, FORMAT, &mut fill_probe)
+                };
+                list.iter().any(|p| {
+                    p.drm_format_modifier == modifier
+                        && p.drm_format_modifier_tiling_features.contains(wanted)
+                })
+            }
+        }
     }
 
     /// Enumerate the DRM format modifiers RADV/the driver reports as
@@ -446,6 +650,18 @@ impl ExportedImage {
         instance: &ash::Instance,
         phys: vk::PhysicalDevice,
     ) -> Vec<u64> {
+        Self::modifier_properties(instance, phys)
+            .iter()
+            .map(|p| p.drm_format_modifier)
+            .collect()
+    }
+
+    /// The driver's per-modifier properties for [`FORMAT`], by the two-call
+    /// pattern.
+    fn modifier_properties(
+        instance: &ash::Instance,
+        phys: vk::PhysicalDevice,
+    ) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
         let mut count_query = vk::DrmFormatModifierPropertiesListEXT::default();
         let mut count_probe = vk::FormatProperties2::default().push_next(&mut count_query);
         // SAFETY: `count_probe` is a valid out-param; `phys` came from
@@ -461,7 +677,7 @@ impl ExportedImage {
         // what the first call reported.
         unsafe { instance.get_physical_device_format_properties2(phys, FORMAT, &mut fill_probe) };
 
-        props.iter().map(|p| p.drm_format_modifier).collect()
+        props
     }
 
     /// Allocate export-capable memory for `image`, bind it, export its fd,
@@ -630,6 +846,7 @@ impl ExportedImage {
                 offset: layout.offset,
                 stride: layout.row_pitch,
             }],
+            storage: false,
             fd,
             device: device.clone(),
         })

@@ -764,9 +764,9 @@ impl Renderer {
             None
         };
         if let Some(plan) = &plan {
-            recorded |= self
-                .ring
-                .encode_blit(&ctx.device, &mut encoder, &self.fb, plan);
+            recorded |=
+                self.ring
+                    .encode_blit(&ctx.device, &ctx.queue, &mut encoder, &self.fb, plan);
         }
 
         if recorded {

@@ -94,11 +94,18 @@ impl UploadConfig {
 ///   way instead of adding `VK_KHR_external_semaphore_fd`. Without the
 ///   extension the ring has no fence and falls back to the blocking wait.
 ///
-/// Either takes any value but `0` or empty.
+/// - `GHOSTFRAME_NO_COMPUTE_EXPORT=1`: copy damage into the export buffer with
+///   the render-pass blit instead of the compute kernel that writes only the
+///   damaged tiles. The blit is also the fallback where the export cannot be
+///   bound as a storage image; this forces it where it could be. For A/B and
+///   for ruling the kernel in or out when a frame looks wrong.
+///
+/// Any of them takes any value but `0` or empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PublishConfig {
     pub blocking: bool,
     pub plain_device_open: bool,
+    pub render_pass_export: bool,
 }
 
 impl PublishConfig {
@@ -107,6 +114,7 @@ impl PublishConfig {
         Self {
             blocking: on("GHOSTFRAME_BLOCKING_PUBLISH"),
             plain_device_open: on("GHOSTFRAME_NO_FENCE_DEVICE"),
+            render_pass_export: on("GHOSTFRAME_NO_COMPUTE_EXPORT"),
         }
     }
 
@@ -187,5 +195,7 @@ mod tests {
         assert!(cfg(&[("GHOSTFRAME_BLOCKING_PUBLISH", "1")]).blocking);
         assert!(!cfg(&[("GHOSTFRAME_BLOCKING_PUBLISH", "0")]).blocking);
         assert!(cfg(&[("GHOSTFRAME_NO_FENCE_DEVICE", "1")]).plain_device_open);
+        assert!(cfg(&[("GHOSTFRAME_NO_COMPUTE_EXPORT", "1")]).render_pass_export);
+        assert!(!cfg(&[("GHOSTFRAME_NO_COMPUTE_EXPORT", "")]).render_pass_export);
     }
 }

@@ -290,6 +290,7 @@ fn read_export(ctx: &WgpuContext, img: &ExportedImage) -> (Vec<u8>, usize, usize
 }
 
 use ghostframe_client_gpu::framebuffer::Framebuffer;
+use ghostframe_client_gpu::ring::CopyPath;
 
 #[test]
 fn framebuffer_blits_into_the_exported_dmabuf() {
@@ -490,6 +491,199 @@ fn recycled_buffer_receives_only_its_damage_and_keeps_the_rest() {
     );
 }
 
+/// A pixel no neighbour shares: x, y and a constant per frame, so a copy from
+/// the wrong place, a swapped channel or a lost alpha each change the value.
+fn pattern(frame: u8, x: u32, y: u32) -> [u8; 4] {
+    [
+        (x as u8)
+            .wrapping_mul(2)
+            .wrapping_add(frame.wrapping_mul(53)),
+        (y as u8)
+            .wrapping_mul(3)
+            .wrapping_add(frame.wrapping_mul(29)),
+        frame.wrapping_mul(17) ^ 0x10,
+        0x80 | frame,
+    ]
+}
+
+fn write_pattern(ctx: &WgpuContext, fb: &Framebuffer, frame: u8) {
+    let (w, h) = (fb.width, fb.height);
+    let mut data = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            data.extend_from_slice(&pattern(frame, x, y));
+        }
+    }
+    ctx.queue.write_texture(
+        fb.texture().as_image_copy(),
+        &data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * 4),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+}
+
+/// Publish a full frame of pattern 0, then pattern 1 with only `dirty` tiles
+/// marked, into the same buffer, and compare EVERY pixel of the export: tiles
+/// in `dirty` must hold pattern 1, everything else must still hold pattern 0.
+///
+/// The framebuffer holds pattern 1 everywhere, so a copy that strays outside
+/// the damage shows up as pattern 1 where pattern 0 is expected.
+fn scattered_damage_reaches_exactly_the_damaged_tiles(w: u32, h: u32, dirty: &[(u32, u32)]) {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let fb = Framebuffer::new(&ctx.device, w, h);
+    let mut ring = ExportRing::new(&ctx, w, h, 1, &[], true).expect("ring");
+    #[cfg(feature = "gles")]
+    assert!(
+        ring.uses_compute_copy(),
+        "the compute export copy is not in use here, so this proves nothing about it"
+    );
+
+    write_pattern(&ctx, &fb, 0);
+    ring.mark_dirty_all();
+    let first = ring.publish(&ctx, &fb).expect("publish 1");
+    assert_eq!(
+        ring.last_copy_path(),
+        Some(CopyPath::Blit),
+        "a never-filled buffer is copied whole, by the blit"
+    );
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    ring.release(first.frame_id);
+
+    write_pattern(&ctx, &fb, 1);
+    for &(tx, ty) in dirty {
+        ring.mark_dirty(tx, ty);
+    }
+    let second = ring.publish(&ctx, &fb).expect("publish 2");
+    #[cfg(feature = "gles")]
+    assert_eq!(
+        ring.last_copy_path(),
+        Some(CopyPath::Kernel),
+        "scattered damage must go through the compute kernel"
+    );
+    assert_eq!(
+        first.buffer_id, second.buffer_id,
+        "one-buffer ring recycles"
+    );
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+
+    let (bytes, stride, base) = read_export(&ctx, ring.buffer(second.buffer_id));
+    let mut from_new = 0usize;
+    for y in 0..h {
+        for x in 0..w {
+            let damaged = dirty.contains(&(x / 32, y / 32));
+            let want = in_export(pattern(damaged as u8, x, y));
+            let at = base + y as usize * stride + x as usize * 4;
+            assert_eq!(
+                &bytes[at..at + 4],
+                &want,
+                "pixel ({x},{y}) in tile ({},{}), damaged={damaged}",
+                x / 32,
+                y / 32
+            );
+            from_new += damaged as usize;
+        }
+    }
+    // The property above is vacuous if no pixel was supposed to change.
+    assert!(from_new > 0, "no damaged pixel was checked");
+}
+
+/// One buffer, so every frame is copied over the previous frame's content, and
+/// the damage alternates dense (blit) and sparse (kernel) so each path writes
+/// over what the other left. Every frame compares every pixel against the
+/// frame that last owned its tile.
+#[test]
+fn switching_between_blit_and_kernel_keeps_every_tile_exact() {
+    const W: u32 = 100;
+    const H: u32 = 70;
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let fb = Framebuffer::new(&ctx.device, W, H);
+    let mut ring = ExportRing::new(&ctx, W, H, 1, &[], true).expect("ring");
+    let all: Vec<(u32, u32)> = (0..3)
+        .flat_map(|ty| (0..4).map(move |tx| (tx, ty)))
+        .collect();
+    let checker: Vec<(u32, u32)> = all
+        .iter()
+        .copied()
+        .filter(|(x, y)| (x + y) % 2 == 0)
+        .collect();
+    let steps: Vec<(&[(u32, u32)], CopyPath)> = vec![
+        (&all, CopyPath::Blit),
+        (&[(0, 0), (3, 2)], CopyPath::Kernel),
+        (&all, CopyPath::Blit),
+        (&checker, CopyPath::Kernel),
+        (&[(1, 1)], CopyPath::Blit),
+        (&[(3, 0), (0, 2)], CopyPath::Kernel),
+        (&checker, CopyPath::Kernel),
+        (&all, CopyPath::Blit),
+    ];
+    let mut owner = [[0u8; 4]; 3];
+    for (n, (dirty, want_path)) in steps.iter().enumerate() {
+        let frame = n as u8 + 1;
+        write_pattern(&ctx, &fb, frame);
+        for &(tx, ty) in dirty.iter() {
+            ring.mark_dirty(tx, ty);
+            owner[ty as usize][tx as usize] = frame;
+        }
+        let published = ring.publish(&ctx, &fb).expect("publish");
+        ctx.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        // The first frame is a never-filled buffer: whole, whatever was marked.
+        if n == 0 {
+            owner = [[frame; 4]; 3];
+        }
+        #[cfg(feature = "gles")]
+        assert_eq!(ring.last_copy_path(), Some(*want_path), "step {n}");
+        #[cfg(feature = "vulkan")]
+        let _ = want_path;
+
+        let (bytes, stride, base) = read_export(&ctx, ring.buffer(published.buffer_id));
+        for y in 0..H {
+            for x in 0..W {
+                let f = owner[(y / 32) as usize][(x / 32) as usize];
+                let at = base + y as usize * stride + x as usize * 4;
+                assert_eq!(
+                    &bytes[at..at + 4],
+                    &in_export(pattern(f, x, y)),
+                    "step {n}: pixel ({x},{y}) should still be frame {f}'s"
+                );
+            }
+        }
+        ring.release(published.frame_id);
+    }
+}
+
+#[test]
+fn damage_in_opposite_corners_and_a_clipped_edge_tile_is_copied_exactly() {
+    // 100x70: four tile columns (the last 4 px wide) and three rows (the last
+    // 6 px high), so (3,2) is clipped on both axes and (3,0) and (0,2) on one.
+    scattered_damage_reaches_exactly_the_damaged_tiles(100, 70, &[(0, 0), (3, 2), (3, 0)]);
+}
+
+#[test]
+fn checkerboard_damage_is_copied_exactly() {
+    let dirty: Vec<(u32, u32)> = (0..3)
+        .flat_map(|ty| (0..4).map(move |tx| (tx, ty)))
+        .filter(|(tx, ty)| (tx + ty) % 2 == 0)
+        .collect();
+    scattered_damage_reaches_exactly_the_damaged_tiles(100, 70, &dirty);
+}
+
 /// `true` while `fd` is an open descriptor naming the same file it did when
 /// `expect_ino` was recorded. Comparing the inode, not just `F_GETFD`, is
 /// what catches the actual defect: a closed fd number silently reused by
@@ -644,7 +838,12 @@ fn since_previous_is_none_after_a_resize() {
 /// GPU has real work when `publish` returns. Returns, per round, whether the
 /// GPU was still writing the export right after `publish`, having checked the
 /// pixels the CPU then reads back.
-fn publish_behind_queued_work(ring: &mut ExportRing, ctx: &WgpuContext, rounds: u32) -> Vec<bool> {
+fn publish_behind_queued_work(
+    ring: &mut ExportRing,
+    ctx: &WgpuContext,
+    rounds: u32,
+    scattered: bool,
+) -> Vec<bool> {
     const W: u32 = 1920;
     const H: u32 = 1080;
     let mut fb = Framebuffer::new(&ctx.device, W, H);
@@ -654,14 +853,36 @@ fn publish_behind_queued_work(ring: &mut ExportRing, ctx: &WgpuContext, rounds: 
         fb.debug_fill(&ctx.device, &ctx.queue, [0xFF, 0, 0, 0xFF]);
         fb.debug_fill(&ctx.device, &ctx.queue, [0, 0xFF, 0, 0xFF]);
         fb.debug_fill(&ctx.device, &ctx.queue, last);
-        ring.mark_dirty_all();
+        // Scattered: a checkerboard of tiles, which the kernel copies. A buffer
+        // new to the ring is copied whole whatever is marked.
+        let probes: &[(u32, u32)] = if scattered {
+            for ty in 0..H.div_ceil(32) {
+                for tx in (0..W.div_ceil(32)).filter(|tx| (tx + ty) % 2 == 0) {
+                    ring.mark_dirty(tx, ty);
+                }
+            }
+            // Inside tiles (0,0), (58,32), (30,10) and (2,2): all marked.
+            &[
+                (5, 5),
+                (58 * 32 + 5, 32 * 32 + 5),
+                (30 * 32 + 3, 10 * 32 + 3),
+                (66, 66),
+            ]
+        } else {
+            ring.mark_dirty_all();
+            &[(0, 0), (W - 1, H - 1), (W / 2, H / 3), (7, H - 2)]
+        };
         let frame = ring.publish(ctx, &fb).expect("publish");
+        if scattered && i >= 2 {
+            #[cfg(feature = "gles")]
+            assert_eq!(ring.last_copy_path(), Some(CopyPath::Kernel), "round {i}");
+        }
         let img = ring.buffer(frame.buffer_id);
         // Straight away, before anything has had a reason to wait.
         still_writing.push(dma_buf_write_pending(img.raw_fd()));
 
         let (bytes, stride, base) = read_export(ctx, img);
-        for (x, y) in [(0, 0), (W - 1, H - 1), (W / 2, H / 3), (7, H - 2)] {
+        for &(x, y) in probes {
             let off = base + y as usize * stride + x as usize * 4;
             assert_eq!(
                 &bytes[off..off + 4],
@@ -684,7 +905,7 @@ fn publish_behind_queued_work(ring: &mut ExportRing, ctx: &WgpuContext, rounds: 
 fn publish_does_not_block_and_a_cpu_read_still_sees_the_frame() {
     let ctx = WgpuContext::new().expect("wgpu context");
     let mut ring = ExportRing::new(&ctx, 1920, 1080, 2, &[], true).expect("ring");
-    let busy = publish_behind_queued_work(&mut ring, &ctx, 8);
+    let busy = publish_behind_queued_work(&mut ring, &ctx, 8, false);
     eprintln!("GPU still writing right after publish, per round: {busy:?}");
     if ring.publish_is_nonblocking() {
         assert!(
@@ -696,6 +917,22 @@ fn publish_does_not_block_and_a_cpu_read_still_sees_the_frame() {
     }
 }
 
+/// The same, with the kernel doing the copy: scattered damage behind queued
+/// work, then a CPU read of the dmabuf.
+#[test]
+fn kernel_publish_does_not_block_and_a_cpu_read_still_sees_the_frame() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut ring = ExportRing::new(&ctx, 1920, 1080, 2, &[], true).expect("ring");
+    let busy = publish_behind_queued_work(&mut ring, &ctx, 8, true);
+    eprintln!("GPU still writing right after a kernel publish, per round: {busy:?}");
+    if ring.publish_is_nonblocking() {
+        assert!(
+            busy.iter().any(|b| *b),
+            "publish returned with the GPU idle every time: it is waiting for the copy"
+        );
+    }
+}
+
 /// The blocking path (no fence, or `GHOSTFRAME_BLOCKING_PUBLISH`): the buffer is
 /// finished when `publish` returns.
 #[test]
@@ -704,7 +941,7 @@ fn blocking_publish_returns_a_finished_buffer() {
     let mut ring = ExportRing::new(&ctx, 1920, 1080, 2, &[], true).expect("ring");
     ring.force_blocking_publish();
     assert!(!ring.publish_is_nonblocking());
-    let busy = publish_behind_queued_work(&mut ring, &ctx, 8);
+    let busy = publish_behind_queued_work(&mut ring, &ctx, 8, false);
     assert!(
         busy.iter().all(|b| !*b),
         "a blocking publish returned with the GPU still writing: {busy:?}"

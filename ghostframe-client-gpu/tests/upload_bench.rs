@@ -602,3 +602,84 @@ fn mixed_batch_flush_and_publish() {
     let ms = run(100, 10);
     eprintln!("\nmixed batch (240 solid, 240 palrle, 120+64 TileReady, 3 cdf53): flush+publish {ms:.2} ms/frame");
 }
+
+/// Scattered damage into an export buffer: the render-pass blit against the
+/// compute copy of just the damaged tiles.
+///
+/// A render pass on a tiled GPU loads and stores every screen tile inside the
+/// bounding box of its draws, so two corners cost the whole frame; the kernel
+/// writes only the tiles it is given. Each round publishes into a one-buffer
+/// ring whose history is exactly the marked tiles. `auto` is what production
+/// runs: the kernel unless the damage fills most of its bounding box. "issue" is the publish call
+/// (CPU), "+gpu" runs on until the GPU is idle.
+#[test]
+#[ignore = "hardware benchmark; run by hand"]
+fn export_copy_blit_against_compute() {
+    use ghostframe_client_gpu::ring::ExportRing;
+
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let fb = Framebuffer::new(&ctx.device, W, H);
+    let (cols, rows) = tiles();
+    let all = |keep: &dyn Fn(u32, u32) -> bool| -> Vec<(u32, u32)> {
+        (0..rows)
+            .flat_map(|ty| (0..cols).map(move |tx| (tx, ty)))
+            .filter(|&(tx, ty)| keep(tx, ty))
+            .collect()
+    };
+    let scenarios: Vec<(&str, Vec<(u32, u32)>)> = vec![
+        ("two corners (2 tiles)", vec![(0, 0), (cols - 1, rows - 1)]),
+        ("checkerboard (half)", all(&|x, y| (x + y) % 2 == 0)),
+        ("one tile", vec![(cols / 2, rows / 2)]),
+        ("one 8x8 block", all(&|x, y| x < 8 && y < 8)),
+        ("every 4th tile", all(&|x, y| (x + y * cols) % 4 == 0)),
+        ("full frame", all(&|_, _| true)),
+    ];
+
+    eprintln!();
+    for (name, dirty) in &scenarios {
+        for mode in ["blit", "compute", "auto"] {
+            let mut ring = ExportRing::new(&ctx, W, H, 1, &[], false).expect("ring");
+            match mode {
+                "blit" => ring.force_render_pass_export(),
+                "compute" => ring.force_compute_export(),
+                _ => {}
+            }
+            assert_eq!(
+                ring.uses_compute_copy(),
+                mode != "blit",
+                "mode did not take"
+            );
+            ring.mark_dirty_all();
+            let f = ring.publish(&ctx, &fb).expect("first publish");
+            ctx.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("poll");
+            ring.release(f.frame_id);
+
+            let rounds = 60;
+            let (mut issue, mut total) = (0.0f64, 0.0f64);
+            for round in 0..rounds + 5 {
+                for &(tx, ty) in dirty {
+                    ring.mark_dirty(tx, ty);
+                }
+                let t0 = Instant::now();
+                let f = ring.publish(&ctx, &fb).expect("publish");
+                let submitted = Instant::now();
+                ctx.device
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .expect("poll");
+                let done = Instant::now();
+                ring.release(f.frame_id);
+                if round >= 5 {
+                    issue += submitted.saturating_duration_since(t0).as_secs_f64() * 1e3;
+                    total += done.saturating_duration_since(t0).as_secs_f64() * 1e3;
+                }
+            }
+            eprintln!(
+                "{name:<24} {mode:<8} issue {:>6.3}ms  +gpu {:>7.3}ms",
+                issue / rounds as f64,
+                total / rounds as f64
+            );
+        }
+    }
+}

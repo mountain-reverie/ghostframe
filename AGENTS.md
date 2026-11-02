@@ -230,6 +230,14 @@ Env-gated, off by default:
   fell back to a `Vec`), per-slab `(issued, consumed)` and the decode thread's
   time inside the dma-buf sync ioctls.
 
+- `GHOSTFRAME_NO_COMPUTE_EXPORT=1` (client) — copy damage into the export buffer
+  with the render-pass blit instead of the compute kernel that writes only the
+  damaged tiles (`ghostframe-client-gpu/src/export_copy.rs`). On a tiled GPU the
+  blit costs its damage's bounding box, so scattered damage is where the two
+  differ. The ring also falls back to the blit by itself when the export cannot
+  be bound as a storage image, and per frame when the damage fills most of its
+  bounding box; `ExportRing::uses_compute_copy` says which it got at creation.
+
 Tile XOR parity (k=10) is **off by default** (`TransportConfig::tile_fec`).
 `GHOSTFRAME_TILE_FEC=1` turns it back on; a browserless scene opts in with
 `RunOptions { tile_fec: true, .. }`. The client decodes parity either way, and
