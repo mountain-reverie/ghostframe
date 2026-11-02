@@ -133,6 +133,11 @@ fn h264_v2_reference_info_reaches_the_event() {
         slots: 0b0111,
         ref_frame_seq: 41,
     };
+    // The reference (frame 41) was delivered: a P frame whose reference never
+    // was is held back (`ref_break.rs`).
+    for dg in fragment_frame(41, 0, true, &[1u8; 10], 1000) {
+        core.handle_datagram(&dg, 0);
+    }
     let dgs = fragment_frame_ref(42, 7, info, &payload, 1000);
     assert_eq!(dgs.len(), 3);
     let mut evs = Vec::new();

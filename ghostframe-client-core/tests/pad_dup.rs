@@ -110,3 +110,15 @@ fn a_pad_is_acknowledged_even_when_it_is_discarded() {
         "the pad must be acknowledged: the acknowledgement is the measurement"
     );
 }
+
+#[test]
+fn a_duplicate_of_the_newest_delivered_idr_is_not_decoded_again() {
+    let mut c = core();
+    let idr = fragment_frame(1, 0, true, &[1u8; 900], 1200);
+    assert_eq!(needs(&c.handle_datagram(&idr[0], 0)), vec![1]);
+    // The same IDR again (a resend that crossed its acknowledgement): the
+    // decoder must not restart from it.
+    let mut copy = idr[0].clone();
+    copy[8..12].copy_from_slice(&900u32.to_be_bytes());
+    assert!(needs(&c.handle_datagram(&copy, 1_000)).is_empty());
+}
