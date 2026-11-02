@@ -180,6 +180,12 @@ pub struct ClientCore {
     /// Newest H.264 frame handed out as `NeedsH264`; a keyframe older than it
     /// is not delivered.
     pub(crate) last_delivered_frame_seq: Option<u32>,
+    /// A P frame arrived whose reference was never delivered: nothing can be
+    /// decoded until the next IDR, so P frames are held back (not delivered)
+    /// and the server was asked for one.
+    pub(crate) awaiting_idr: bool,
+    /// When the last reference-break reset request went out, for pacing.
+    pub(crate) last_ref_reset_us: Option<u64>,
     /// H.264 fragments rebuilt from XOR parity (cumulative).
     pub(crate) h264_fragments_recovered: u64,
     /// Coverage NACKs awaiting the debounce window before being handed to
@@ -226,6 +232,8 @@ impl ClientCore {
             frame_assemblies: HashMap::new(),
             latest_full_frame_seq: 0,
             last_delivered_frame_seq: None,
+            awaiting_idr: false,
+            last_ref_reset_us: None,
             h264_fragments_recovered: 0,
             pending_nacks: std::collections::BTreeMap::new(),
             pending_nack_deadline_us: None,

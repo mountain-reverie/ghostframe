@@ -1,4 +1,4 @@
-import { FullFrameDecoder } from './decoder.js';
+import { FullFrameDecoder, ResetPacer } from './decoder.js';
 import { WebGpuRenderer } from './webgpu/renderer.js';
 import { WebGpuUnavailableError } from './webgpu/init.js';
 import { attachInputCapture } from './input/wire';
@@ -294,6 +294,7 @@ async function main() {
 
   // Full-frame decoder state.
   let fullFrameDecoder: FullFrameDecoder | null = null;
+  const resetPacer = new ResetPacer();
 
   let firstTileRendered = false;
   let frameDimensionsKnown = false;
@@ -503,7 +504,14 @@ async function main() {
         if (!fullFrameDecoder) {
           fullFrameDecoder = new FullFrameDecoder((frame: VideoFrame, frameSeq: number) => {
             renderer.pushH264(frame, frameSeq);
-          }, 1920, 1080);
+          }, 1920, 1080, (frameSeq: number) => {
+            // The decoder failed: ask the server for an IDR now rather than
+            // waiting out the GOP. ResetReason::DecoderFailure = 1.
+            if (resetPacer.allow(performance.now())) {
+              core.requestReset(1, frameSeq);
+              drainTransmit().catch((err) => console.warn('reset request write failed:', err));
+            }
+          });
         }
         fullFrameDecoder.decode(ev.payload, ev.is_keyframe, ev.frame_seq);
 
