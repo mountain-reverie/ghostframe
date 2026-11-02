@@ -85,7 +85,7 @@ The system decomposes into **10 subsystems**, each with a clear boundary and res
 
 | Sub-encoder | GPU/CPU | Output size (32×32 tile) | When used |
 |-------------|---------|--------------------------|-----------|
-| H.264 (VA-API/NVENC) | GPU | Variable (CBR) | High-freq, high-magnitude motion |
+| H.264 (VA-API/NVENC) | GPU | Variable (rate-capped VBR) | High-freq, high-magnitude motion |
 | Palettized RLE | CPU | 64B (solid) – 1024B (worst) | ≤16 unique colors, text/UI |
 | Solid Fill | CPU | 4B | Single-color tiles |
 | BC1 (DXT1) | GPU compute | 512B | General lossy, photographic |
@@ -127,15 +127,21 @@ Both paths produce monotonic timestamps for A/V sync. Opus encoding at 64-128 kb
 **External dependencies:** `pipewire` (Rust crate), `alsa` (Rust crate), `opus` (Rust crate)
 
 ### 3.6 Bandwidth Estimation & Adaptation **(core lib)**
+
+> **H.264 transport.** Several H.264 statements below predate the current
+> implementation (bitrate control, retries, recovery). The H.264 transport as it
+> is today (wire v2, rate and GOP, probing, stall rules) is described in
+> [h264-transport.md](h264-transport.md); where the two disagree, that note wins.
+
 **Responsibility:** Estimate available bandwidth using dual signals (QUIC congestion controller + application-level GCC-inspired delay-gradient estimator), detect WiFi suspensions, and feed encoding parameters to three consumers: H.264 bitrate, tile classification thresholds, and refinement scheduler pacing.
 
 | Consumer | Control signal |
 |----------|---------------|
-| H.264 encoder | `target_bitrate = estimated_bw × 0.7`, updated every frame |
+| H.264 encoder | `target_bitrate = 0.8 × EWMA(estimate)`, applied by reopening the encoder at an IDR (see `h264-transport.md`) |
 | Tile classifier | Lower bandwidth → raise H.264 entry threshold, prefer lighter codecs |
 | Refinement scheduler | `available_for_refinement = estimated_bw × 0.2`, controls passes/round |
 
-**Congestion response:** Immediate halve H.264 bitrate, pause refinement, drop Opus to 64 kbit/s. **Recovery:** Ramp 10%/RTT.
+**Congestion response:** the H.264 rate follows the estimate: a fall of more than 30 % reopens the encoder at once, a confirmed rise of more than 30 % likewise, smaller changes wait for the next scheduled IDR (see `h264-transport.md`, section 4). Refinement pauses and Opus drops to 64 kbit/s as before.
 
 **WiFi suspension detector:** Gaps >100ms followed by line-rate burst → mark 500ms recovery window, maintain pre-suspension bandwidth estimate, skip Kalman update.
 
@@ -219,7 +225,7 @@ Compositor submits DMA-BUF fd
 │  Priority queue: Input > Video > Audio > Cursor >   │
 │  Control > Extensions > Clipboard > Refinement       │
 │  Fragment into QUIC datagrams (≤1200B each)          │
-│  H.264 fragment retries until superseded by new frame│
+│  H.264: IDR fragments retried, P frames are not      │
 │  Refinement passes: round-robin across idle tiles    │
 └─────────────────────────────────────────────────────┘
         │ QUIC packets
@@ -357,7 +363,7 @@ Every stateful per-tile mechanism uses a monotonically increasing **generation c
 - **Tile pixel data** — generation increments when tile content changes
 - **Palette table entries** — referenced by tiles with their current generation; ref-counted
 - **CDF 5/3 refinement passes** — tagged with tile generation; stale passes are discarded on arrival
-- **H.264 frame fragments** — frame sequence number acts as generation; superseded frames stop retrying
+- **H.264 frame fragments** — frame sequence number acts as generation; an IDR supersedes everything older (queued fragments are purged, cache entries dropped)
 
 This eliminates all forms of stale-data corruption without explicit cancellation messages.
 

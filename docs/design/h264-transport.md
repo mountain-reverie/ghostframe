@@ -1,0 +1,454 @@
+# H.264 transport
+
+**Status:** describes master after Phase A of the H.264 rework (wire v2, ledger
+integration, rate/GOP, stall rules). Phase B (acked-reference recovery) is not
+implemented; section 10 says what it changes.
+
+This is the note to read before touching H.264 code. It names code by file and
+function or constant, not by line. When a constant here disagrees with the
+code, the code is right and this note is stale.
+
+## 1. Overview
+
+H.264 is one of two frame modes. The other is the tile codec (Solid, PalRLE,
+CDF 5/3; see `high-level-design.md`). The classifier (`tile/classifier.rs`,
+`Classifier::decide_core`) picks the mode per frame. Reasons, in priority
+order:
+
+| Reason string | Meaning |
+|---|---|
+| `test_force` | `GHOSTFRAME_FORCE_FRAME_MODE` pins the mode; beats everything, `h264_unsupported` included |
+| `h264_unsupported` | HELLO bit 0x02 clear (Firefox WebGPU): tile codec only, beats everything below |
+| `h264_stalled`, `h264_stalled_holdoff` | transport stall (section 6): leave H.264 and stay out |
+| `headroom_guard` | bandwidth estimate too low for the tile codec: force H.264 |
+| `loss_override` | loss rate above 10 %: force H.264. **Off by default**; `GHOSTFRAME_LOSS_OVERRIDE=1` enables it, `GHOSTFRAME_LOSS_OVERRIDE_THRESHOLD` moves the line. One lost fragment kills a whole H.264 frame, so "H.264 rides through loss" no longer holds |
+| `suspension` | WiFi suspension detected: force H.264 |
+| `cost_comparison` | per-frame cost model with enter/exit hysteresis |
+| `hysteresis_clamp` | the cost model wants to switch but the dwell has not elapsed: keep the previous mode |
+
+The frame mode only switches the codec. Both modes share one transmission
+ledger, one admission bucket and one bandwidth estimator.
+
+Encoder backends (`encoder/h264_vaapi.rs`, `FullFrameEncoder`):
+
+- `h264_vaapi` through ffmpeg, preferred. Opened rate-capped VBR: `bit_rate`
+  equals `rc_max_rate`, VBV buffer is one second of the rate, `rc_mode=VBR`.
+- `libx264` software fallback (`ultrafast`, `zerolatency`, same VBV, no
+  `nal-hrd=cbr`).
+
+VBR and not CBR because Mesa radeonsi CBR stuffs every frame up to
+`bps / fps`: static P frames came out at about 8.3 kB against an 8.3 kB budget,
+all filler, and the estimator then saw a saturated sender. With VBR the same
+static P frame is about 126 bytes. The price is that VBR undershoots busy
+content (section 9). Several comments and the `RateParams` doc in the encoder
+and `h264_rate.rs` still say "CBR"; they predate that switch.
+
+Neither backend has reference control. Recovery from loss is an IDR. The
+encoder's own GOP is set to about 9 hours (`ENCODER_OWN_GOP`); the bridge asks
+for every IDR itself.
+
+## 2. Wire v2 (`ghostframe-protocol`)
+
+### FrameHeader, 22 bytes (`protocol.rs`)
+
+All big-endian.
+
+| Offset | Field | Notes |
+|---|---|---|
+| 0..4 | `frame_seq` u32 | bit 31 always 0 (bit 31 set means a tile datagram) |
+| 4..6 | `frag_idx` u16 | `frag_idx >= frag_total` marks a parity datagram |
+| 6..8 | `frag_total` u16 | client refuses above `MAX_FRAME_FRAGMENTS` |
+| 8..12 | `wire_seq` u32 | ledger identity; `NO_ACK` (0xFFFFFFFF) is untracked |
+| 12..16 | `timestamp_us` u32 | |
+| 16 | `flags` u8 | below |
+| 17 | `slots` u8 | bits 0-1 `mark_lt_idx`, bits 2-3 `target_lt_idx` |
+| 18..22 | `ref_frame_seq` u32 | frame a P frame predicts from; `REF_FRAME_NONE` for an IDR or unknown |
+
+Flags:
+
+| Bit | Name | Status today |
+|---|---|---|
+| 0x01 | `FRAME_FLAG_IDR` | in use |
+| 0x02 | `FRAME_FLAG_NON_REF` | defined, never set by the server |
+| 0x04 | `FRAME_FLAG_MARK_LT` | defined, never set; reserved for Phase B |
+| 0x08 | `FRAME_FLAG_TARGET_IS_LT` | defined, never set; reserved for Phase B |
+| 0x10 | `FRAME_FLAG_PAD` | probe padding (section 5) |
+
+The ffmpeg encoder predicts from the previous frame, so a P frame carries
+`ref_frame_seq` = the previous H.264 frame the bridge sent (`h264_ref_info` in
+`io_bridge/frame.rs`) and `slots` = 0. Parity datagrams carry no reference
+information (flags hold only the IDR bit, `ref_frame_seq` is `REF_FRAME_NONE`);
+read the reference from a source fragment, never from a parity.
+
+### Fragmentation and parity
+
+`fragment_frame_ref` cuts the access unit into fragments that fit
+`max_fec_frame_fragment_payload(max_dg_size)` (room is left for the parity
+header). Every source fragment is a ledger transmission with a real
+`wire_seq`. H.264 XOR parity is always on (`ghostframe-protocol/src/fec.rs`:
+group size 2 for an IDR, 5 for a P frame) and is billed `NO_ACK` as
+`WireClass::Parity`: the client never acknowledges it, the ledger never judges
+it. This is separate from tile parity (`GHOSTFRAME_TILE_FEC`, off by default).
+The client rebuilds one missing fragment per group (`recover_group` in
+`ghostframe-client-core/src/frame_assembly.rs`).
+
+### Frame ack, datagram 0x0A (client to server)
+
+`FrameAck`: `[0x0A][newest_seq u32 LE][decoded_mask u64 LE][refused_mask u64 LE]`,
+21 bytes, cumulative over the last 64 frames. **Nothing sends it today.** The
+codec exists and the server counts and drops it
+(`dispatch_frame_ack_datagram`, "ignored until the H.264 ledger lands";
+`frame_acks_received` in the `h264 client feedback` line). Server-side progress
+is read from the per-datagram 0x06 ack batches, which is how H.264 fragments
+are acknowledged (section 3). The frame ack is a Phase B input.
+
+### Reset request, feedback stream 0x09 (client to server)
+
+`[0x09][reason u8][frame_seq u32 LE]`, 6 bytes, on the reliable feedback
+stream (`feedback_stream.rs`, `ResetRequest`).
+
+| Reason | Value | Sent by |
+|---|---|---|
+| `DecoderFailure` | 1 | decoder returned an error (web: WebCodecs error callback; native: render thread) |
+| `Resolution` | 2 | defined; nothing sends it yet |
+| `NoDecoder` | 3 | defined; nothing sends it yet |
+| `GateReset` | 4 | `client-core` `finish_frame_if_complete`: a P frame whose reference was never delivered |
+
+**The server acts on `DecoderFailure` only** (`IoBridge::handle_reset_request`):
+at most one per `RESET_REQUEST_MIN_INTERVAL` (2 s), then
+`request_h264_idr(IdrCause::ClientReset)`. The other three reasons are counted
+and logged at debug. So a `GateReset` from the client is a request the server
+does not yet serve; the client recovers from the next loss IDR or scheduled
+GOP IDR.
+
+### HELLO capability bits (`feedback_stream.rs`, `client_caps.rs`)
+
+`[0x03][caps]`.
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 0x01 | `HELLO_CAP_INDICES_RAW` | PalRLE `indices_raw` payloads |
+| 0x02 | `HELLO_CAP_SUPPORTS_H264` | client can decode and sample H.264. **This alone gates H.264.** |
+| 0x04 | `HELLO_CAP_H264_ACKED_REF` | client sends v2 feedback (0x09; 0x0A in later phases). Does not gate H.264 |
+| 0xF8 | reserved | server ignores |
+
+The web client sends 0x02 without 0x04 (`ghostframe-client-wasm` passes
+`h264_acked_ref: false`), yet still sends 0x09 requests; Chrome stays on H.264.
+The native client sets 0x04 whenever it supports H.264. The server records bit
+0x04 (`HELLO received` log line) but nothing branches on it yet. Every client
+reads the 22-byte header regardless.
+
+## 3. Server transport
+
+Code: `transport/io_bridge/h264_tx.rs` (tracker, hold, IDR policy, stall flag),
+`io_bridge/frame.rs` (`send_h264_frame`, `finish_h264_arm`),
+`transport/reliable_emitter/h264.rs` (probe cache, pad ring).
+
+**Fragments in the ledger.** Each source fragment is submitted with
+`ReliableTileEmitter::submit_h264_fragment`, which records a
+`Content::H264Frag { frame_seq, frag_idx }` transmission, charges the admission
+bucket and feeds the estimators. Every recorded transmission ends as exactly
+one of: acknowledged live, judged lost, or forgotten. `tx_forgotten` counts
+both fragments purged before departure (`forget_purged`) and fragments whose
+content was gone when the probe timeout looked (`poll_pto` in
+`io_bridge/bwe_glue.rs`). The `h264 stats` line gives `tx_recorded >=
+tx_acked_live + tx_judged_lost + tx_forgotten`; the gap is still outstanding
+(not logged). The identity is exact only within one session and without ledger
+capacity evictions: the counters are cumulative, the ledger is wiped on a
+session reset. Acknowledged H.264 fragments are BWE samples.
+
+**Frame tracker.** `FrameTracker` is a ring of `TRACKER_RING` (256) frames with
+one bit per fragment; it tells when a frame is fully acknowledged.
+
+**Probe cache.** `H264Cache` keeps the fragments of frames not yet fully
+acknowledged (at most `H264_CACHE_FRAMES`, 64 frames). The loss path asks it
+whether a fragment is still current. Without an entry the fragment's content is
+"gone" and would be declared lost on the spot, which under an ack stall would
+hand goog_cc a false mass loss. Entries die on acknowledgement, on supersession
+by an IDR, on trimming, or at session end.
+
+**What is resent.** A loss verdict on an **IDR** fragment resends it
+(`RetxCause::Loss`, counter `idr_fragments_resent`). The probe timeout resends
+any fragment to draw an acknowledgement (`probe_fragments_resent`). A verdict
+on a **P** fragment resends nothing; it starts the loss IDR below.
+
+**P hold.** After an IDR of any cause except `GopPeriodic`, no P frame is
+encoded until every fragment of that IDR is acknowledged
+(`h264_frame_gate` returns `SkipHold`). The client evicts assemblies older than
+`latest - 2`, so P frames behind an unfinished IDR would push it out. The hold
+is a no-progress timeout: each acknowledged fragment restarts it, and after
+`IDR_HOLD_MAX` (3 s) with none it ends and a `HoldTimeout` IDR is requested. A
+scheduled GOP IDR holds nothing (the client already has a picture).
+
+**Interim loss IDR.** A verdict on an unacknowledged P-frame fragment marks the
+frame suspect, purges the queued fragments of that frame and every later one
+(they chain from a picture the client lacks), drops their cache entries and
+requests an IDR with cause `Loss`. At most one per `LOSS_IDR_MIN_INTERVAL`
+(1 s); a request turned away is remembered (`deferred_loss_idr`) and made when
+the interval passes, with P frames skipped meanwhile. Verdicts on frames an
+IDR already supersedes or has pending ask for nothing. This path is deleted by
+Phase B.
+
+**IDR causes** (`IdrCause`): `session`, `loss`, `client_reset`, `resolution`,
+`reentry` (tile to H.264; a still-pending loss request is credited to it),
+`hold_timeout`, `rate_drop`, `rate_rise`, `gop_periodic`. Requests coalesce:
+while one is pending the cause stays the first one's.
+
+**Frame skip.** The encoder is not run (the capture is dropped, the next frame
+is made fully dirty) while an IDR hold or deferred loss IDR is in force, or
+while the emission queue holds more H.264 bytes than
+`max(one 33.3 ms frame period of the admission rate, two gate depths, one
+datagram)` (`h264_backlog_exceeded`, `SkipBackpressure`).
+
+**H.264 to tile.** On the mode switch `abandon_h264_inflight` makes the frames
+sent so far no longer count as in flight, purges what is queued for them,
+drops their cache entries, ends any hold, forgets padding and the probe
+cadence, restarts the rate policy's estimate and clears the GOP clock.
+Retransmissions already with quinn are left alone. The return to H.264 is an
+`IdrCause::Reentry` IDR.
+
+## 4. Rate and GOP (`io_bridge/h264_rate.rs`, `RatePolicy`)
+
+The target is `clamp(0.8 x E, 300 kbit/s, 50 Mbit/s)` where `E` is
+`bwe.snapshot().bitrate_bps` smoothed by a 250 ms EWMA. It is not the model
+controller's probe-inclusive rate. The initial rate before any estimate is
+4 Mbit/s. The 0.8 share (`RATE_SHARE`) is asserted at compile time to stay
+below the BWE ceiling's `SATURATION`, or the ceiling would judge the sender
+saturated and shrink the estimate it follows.
+
+The encoder cannot change rate in place, so a new rate is a reopen, and a
+reopen starts with an IDR. The policy is therefore a decision about when to pay
+for an IDR:
+
+- A candidate is adopted if it moved more than 10 % from the last one, or every
+  1 s; evaluated at most every 250 ms. A running rate within 10 % of the
+  candidate is left alone.
+- A raw estimate more than 1.5 x the smoothed one is a spike and is held for
+  1 s, so the target can follow a probe that goog_cc pulls back faster than the
+  EWMA rises.
+- **Drop:** a candidate more than 30 % under the running rate reopens at once
+  (`IdrCause::RateDrop`, with a P hold; the IDR is cheaper at the lower rate).
+  It also starts a quiet period (3 s) with no padding.
+- **Rise:** a candidate more than 30 % over reopens at once
+  (`IdrCause::RateRise`; like every IDR except the scheduled GOP one it opens a
+  P hold and is not padded) only if the raw estimate was over the line on
+  2 consecutive evaluations, so a blip does not cause a rise followed by a drop.
+- **Anything else** (shallower fall or rise past 10 %) waits for the next
+  scheduled GOP IDR and takes the new rate there (counted as
+  `rate_reopens_gop`).
+- At most one reopen per 2 s (`MIN_REOPEN_INTERVAL`), urgent ones included.
+
+**GOP.** Time-based and owned by the bridge: the frame is the scheduled IDR
+when `GHOSTFRAME_H264_GOP_SECONDS` (default 3, clamped to 2..5; unparseable is
+ignored with a warning) has passed since the last IDR **of any cause**. A loss,
+reset or rate IDR restarts the clock. The encoder is opened at the real capture
+rate (`CAPTURE_FPS`, default 30), because its rate control divides the rate by
+fps to get a frame budget.
+
+## 5. Probing
+
+goog_cc's periodic probing is driven by its ALR (application-limited) detector.
+The fork's detector (`AlrDetectorConfig::default()`: `alr_bandwidth_usage_percent`
+80, `alr_start_budget_level_percent` 40, stop at -60) budgets 80 % of the
+estimate, lets unused budget build up over a 500 ms window, and starts an
+application-limited region when the budget is more than 40 % full. A stream
+held at 0.8 x E refills that budget exactly as fast as it spends it, and every
+IDR burst overdraws it, so it is not reliably seen as application-limited
+(a stream that undershoots, as VBR does on busy content, can still trip it).
+The design relies on goog_cc not probing for it after the start-up ladder; the
+app probes below run regardless. goog_cc is also never given a `NetworkStateEstimate`
+(`bwe/googcc.rs`, `GoogCcDriver::new`), so its network-state probes are off in
+every mode. Capacity step-ups in H.264 mode are therefore found by probes of
+ghostframe's own and by the IDR burst.
+
+**App probes** (`h264_start_app_probe`). A probe cluster at 2 x E, 100 ms long
+(at least 5 packets), every `APP_PROBE_INTERVAL` (5 s), where E here is the raw
+`bwe.snapshot().bitrate_bps`, not the rate policy's EWMA. The chain continues
+while that raw estimate is at least 0.7 x the previous probe's target rate: the
+next probe follows after 400 ms, up to 4 in a chain. Cluster ids start at 1,000,000,000, a range goog_cc never issues;
+goog_cc measures any cluster id it finds on acknowledged packets. A cluster
+that padding could not fill (needs a window under 15 ms at the cap) is skipped
+and counted (`app_probes_skipped`).
+
+**Padding** (`h264_probe_pad`). The cluster is filled with copies of an
+already acknowledged P-frame fragment (at least 600 bytes) under new
+`wire_seq`s, flagged `FRAME_FLAG_PAD`. The client acknowledges them on receipt
+(that is the measurement) and drops them without touching any assembly
+(section 7). They are never resent. Limits: 1.2 x the cluster's `min_bytes`;
+at most 384 KiB per window and 0.3 s of the estimate; stop when the pad ring is
+full. A window goog_cc itself asked for (start-up ladder, repeated initial probes,
+ALR) is claimed first, by `open_probe_window_for_burst`; the app probe starts
+only if none was pending. Padding is not sent when:
+
+- the emission queue holds anything beyond the frame just queued;
+- within 3 s of a rate cut;
+- an IDR is pending or due within 150 ms (the IDR is the burst);
+- the IDR is a recovery IDR (every cause but `GopPeriodic`): its P hold waits
+  for its fragments, and padding behind them would delay the hold.
+
+The empty-queue and quiet-period guards apply only when a window is opened and
+to an IDR's top-up; a P frame continuing an already open window is exempt (its
+own earlier padding is in the queue).
+
+A scheduled GOP IDR claims a pending window and is topped up with padding.
+After padding, the BWE ceiling is held off for 1 s (`PAD_CEILING_HOLD`) so a
+burst that spends the whole grant is not read as a saturated, silent path.
+
+**PadRing** (`reliable_emitter/h264.rs`): up to `PAD_RING_CAP` (512) entries,
+each forgotten after `PAD_ENTRY_TTL` (2 s). An entry exists only to carry the
+probe tag to the acknowledgement and to count the pad's bytes as in flight.
+
+**Ledger patience** (`transmission_ledger.rs`, `BURST_REORDER_FACTOR`). A
+datagram of the H.264 stream (pad or fragment, never a tile) that departed
+inside a marked probe burst is judged lost by the time rule only after 3 x the
+usual threshold, because a burst queues behind itself. The packet-count rule
+is unchanged. The burst window ends `PROBE_BURST_DRAIN` (300 ms) after the
+probe window closes.
+
+## 6. Stall rules and the headroom guard
+
+`update_h264_stall` (h264_tx.rs) evaluates `h264_stalled` once per frame
+decision and publishes it to the classifier. Frames before the last IDR (and before the frame at which the session last
+left H.264, `ignore_before`), and frames a verdict doomed, are not counted
+(`FrameTracker::unresolved` skips `frame_seq` below that floor).
+Raised by any of:
+
+- **(a) in-flight bound:** unresolved frames exceed
+  `max(32, ceil(2 x srtt / 33.3 ms) + 8)` (`stall_inflight_bound`);
+- **(b) no progress:** frames in flight and no H.264 fragment acknowledged for
+  500 ms (`STALL_NO_PROGRESS`; any acknowledged fragment is progress, since a
+  large IDR on a slow link drains a fragment at a time);
+- **(c) reset storm:** 3 honoured `DecoderFailure` resets within 10 s raise
+  the flag for 500 ms.
+
+The classifier then returns `TileCodec` with `h264_stalled`. It beats every
+other override, including the ones that force H.264. Re-entry is refused for a
+holdoff (`h264_stalled_holdoff`). The stall time is refreshed on every stalled
+evaluation, so the holdoff runs from when the stall clears: 2 s after the first stall, doubling with each
+stall that ends a stretch of H.264 (2, 4, 8, 16, 30 s cap). H.264 that then
+runs 10 s without a stall resets the holdoff to 2 s.
+
+**headroom_guard** reads the bandwidth estimate (not the probe-inclusive rate):
+engage below 2 Mbit/s held 500 ms, release above 3 Mbit/s held 1 s, at least 3
+consecutive evaluations either way; between the thresholds it keeps its state.
+An idle screen for 2 s releases an engaged guard whose estimate is back above
+the enter line (tiny P frames cannot raise the estimate). The guard's timers
+keep running through a stall and its holdoff. `GHOSTFRAME_HEADROOM_MIN_BPUS`
+moves the enter threshold (bytes per microsecond; 0.25 is 2 Mbit/s), the exit
+keeps the 3:2 ratio.
+
+## 7. Client behaviour
+
+`ghostframe-client-core/src/frame_assembly.rs` (shared by the native and wasm
+clients):
+
+- **Acknowledge on receipt.** A source fragment with a real `wire_seq` is
+  acknowledged (0x06 batch) before anything else is decided, whatever then
+  becomes of it. Malformed fragments are dropped first and not acknowledged.
+- **Pad drop.** A `FRAME_FLAG_PAD` fragment is acknowledged and then dropped.
+- **Stale drops.** A P fragment at or before the newest delivered frame is
+  dropped. An IDR that completes at or before the newest delivered frame is
+  dropped.
+- **IDR assembly exemption.** Assemblies older than `latest - 2` are evicted,
+  except the newest IDR assembly for `IDR_EXEMPT_US` (2 s), since the server
+  resends IDR fragments and holds P frames, so an IDR can complete after newer
+  `frame_seq`s were seen. Only one is exempt, so a hostile stream of IDR
+  fragments cannot park memory.
+- **Reference gate.** A P frame whose `ref_frame_seq` is not the last delivered
+  frame is not handed to the decoder; the client enters `awaiting_idr`, drops P
+  frames until an IDR completes, and sends `GateReset` (0x09) paced at 2.2 s
+  (`REF_RESET_MIN_INTERVAL_US`; the server's own limit is 2 s).
+- **Decode failure.** The web client's `FullFrameDecoder` drops deltas after an
+  async decode error until the next key chunk, rebuilds the decoder and reports
+  the failure; `main.ts` sends `DecoderFailure` through wasm `requestReset`,
+  gated by `ResetPacer` (first at once, then at least 2.2 s apart). The native
+  render thread paces the same way.
+- Malformed input, oversize access units (`MAX_H264_ACCESS_UNIT_BYTES`) and
+  large `frag_total` are refused without panics.
+
+## 8. Observability
+
+The `h264 stats` line (target `ghostframe::h264`, INFO, cumulative, same
+cadence as `cumulative emit`; `io_bridge/frame.rs`). Fields:
+
+| Group | Fields |
+|---|---|
+| frames | `frames_sent`, `frames_idr`, `frames_acked`, `frames_suspect` |
+| IDRs by cause | `idr_session`, `idr_loss`, `idr_client_reset`, `idr_resolution`, `idr_reentry`, `idr_hold_timeout`, `idr_gop_periodic`, `idr_rate_drop`, `idr_rate_rise`, `loss_idr_rate_limited`, `idr_requests_coalesced` |
+| rate and probing | `rate_reopens_gop`, `rate_target_bps`, `app_probes`, `probe_padding_windows`, `probe_padding_bytes`, `frames_skipped_pad` |
+| verdicts | `verdicts_idr_frag`, `verdicts_p_frag`, `verdicts_already_acked` |
+| resends | `idr_fragments_resent`, `probe_fragments_resent` |
+| hold and skips | `p_hold_ms`, `p_holds`, `hold_timeouts`, `frames_skipped_hold`, `frames_skipped_backpressure`, `queue_purged`, `queued_bytes`, `cache_fragments` |
+| stall | `h264_stalled_ms`, `stalls_inflight`, `stalls_no_progress`, `stalls_reset` |
+| ledger | `tx_recorded`, `tx_acked_live`, `tx_judged_lost`, `tx_forgotten`, `tx_acked_late`, `bwe_samples_seen` |
+
+`H264Stats` also holds `app_probes_skipped`, `p_verdicts_in_probe`, `verdicts_superseded`,
+`verdicts_unknown_frame`, `probe_padding_datagrams`, `idr_requests_by_cause`,
+`rate_reopens_drop`, `rate_reopens_rise`, which the log line omits
+(the tracing macro is at its field limit); the browserless harness reads them
+through `H264Report`. A second line, `h264 client feedback` (target
+`ghostframe_lib::transport::io_bridge`, not `ghostframe::h264`), carries
+`frame_acks_received`, `frame_acks_malformed`, `reset_requests_received`,
+`reset_requests_honoured`, `reset_requests_rate_limited`. Rate reopens and
+stalls also log one event each (`H.264 rate: reopening the encoder`,
+`h264 stalled: the classifier is told to leave H.264`). Reading it:
+`frames_idr` against `frames_sent` is the IDR tax; `idr_loss` high means the
+loss path is firing on P fragments; `tx_recorded` is at least the sum of
+its three outcomes; the gap is the outstanding count (not logged), exact only
+within one session and without ledger capacity evictions.
+
+Environment variables (the classifier ones also accept their older
+`GHOSTFRAME_TEST_*` names, e.g. `GHOSTFRAME_TEST_HEADROOM_MIN_BPUS`):
+
+| Variable | Effect | Default |
+|---|---|---|
+| `GHOSTFRAME_H264_GOP_SECONDS` | scheduled IDR interval | 3, clamped 2..5 |
+| `CAPTURE_FPS` | encoder frame rate | 30 |
+| `GHOSTFRAME_LOSS_OVERRIDE` | enable `loss_override` (`1`, `true`, `yes`, `on`) | off |
+| `GHOSTFRAME_LOSS_OVERRIDE_THRESHOLD` | loss rate that triggers it | 0.10 |
+| `GHOSTFRAME_HEADROOM_MIN_BPUS` | headroom guard enter threshold | 0.25 (2 Mbit/s) |
+| `GHOSTFRAME_FORCE_FRAME_MODE` | pin the frame mode (tests) | unset |
+| `GHOSTFRAME_COST_H264_FRAME_US`, `GHOSTFRAME_COST_H264_FRAME_BYTES` | classifier cost model | compiled in |
+| `GHOSTFRAME_RTO_PROBE=1` | one line per loss-path retransmission and verdict | off |
+
+## 9. Known limitations
+
+- **VBR undershoots busy content.** Measured on the moving-content encoder test
+  at 625 kB per 5 s target, VBR produced 162 kB where CBR produced 627 kB. The
+  stream is cheaper and blurrier than the estimate allows. Mesa-specific; the
+  trade is the stuffing in section 1.
+- **Shared loss path, spurious loss IDRs.** H.264 fragments are judged by the
+  same loss path as tiles. At about 2 ms of path jitter it produces roughly
+  30 to 40 spurious loss IDRs in a run (observed in the Phase A live checks,
+  not asserted by a test). Each costs an IDR and a P hold.
+- **Reordered P frames cost a reset.** A P frame that completes before its
+  reference makes the client's reference gate fire, and the server does not
+  yet act on `GateReset`, so the picture waits for the next IDR.
+- **Padding overhead,** roughly 5 to 8 % of the stream's bytes in the Phase A
+  measurements.
+- **IDR rate at low bitrate.** Near the 300 kbit/s floor an IDR is many times
+  a P frame, and rate drops, loss IDRs and the 3 s GOP each add one.
+- Frame acks (0x0A) are defined but unused; progress is inferred from 0x06
+  acknowledgements, which say a datagram arrived, not that a frame decoded.
+- Resolution and `NoDecoder` resets are defined but never sent.
+
+## 10. What Phase B changes (future, not implemented)
+
+Phase B replaces the recovery model, not the transport described above.
+
+- A reference manager tracks which frames the client has acknowledged
+  (decoded) through the 0x0A frame ack, and encodes P frames from an
+  acknowledged reference, using long-term reference marking
+  (`FRAME_FLAG_MARK_LT`, `FRAME_FLAG_TARGET_IS_LT`, `slots`; reserved in wire
+  v2 for exactly this).
+- IDRs are made only at session start, on a resolution change and on decoder
+  failure. The periodic GOP IDR, the loss-triggered IDR and the P hold are
+  removed on backends that can do explicit references; the ffmpeg backends
+  stay as they are.
+- A direct VA-API backend with explicit reference lists and mid-stream rate
+  changes, and a client gate that decides what is decodable, replace the
+  reopen-at-IDR rate model.
+- Parity and IDR-fragment retransmission are re-decided from measurements.
+
+The Phase A pieces that survive: wire v2, H.264 fragments in the ledger, the
+probe cache, padding, the rate share and the stall rules.
