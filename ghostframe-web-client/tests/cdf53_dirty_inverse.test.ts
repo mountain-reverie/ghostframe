@@ -296,9 +296,10 @@ describe('Cdf53Pipeline dirty-tile inverse', () => {
       .slice(before)
       .filter((w) => w.offsetBytes === 5 * 4 && w.words.length === 6);
     expect(spans).toHaveLength(1);
-    // Tile 5 and 6 saw pass 0 -> K=1; tile 10 saw only pass 1 -> K=2 (no
-    // bitmap: max(passIdx+1)). Untouched tiles in the span are 0.
-    expect([...spans[0].words]).toEqual([1, 1, 0, 0, 0, 2]);
+    // Tile 5 and 6 saw pass 0 declaring itself their only pass -> complete,
+    // K=14; tile 10 saw only pass 1 -> K=2 (no bitmap: max(passIdx+1)).
+    // Untouched tiles in the span are 0.
+    expect([...spans[0].words]).toEqual([14, 14, 0, 0, 0, 2]);
     // And no per-tile 4-byte writes remain.
     expect(device.queue.writes.slice(before).filter((w) => w.words.length === 1 && w.offsetBytes % 4 === 0 && w.buf.size === MAX_TILES * 4 && w.offsetBytes !== 0)).toHaveLength(0);
   });
