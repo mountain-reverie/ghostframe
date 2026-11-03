@@ -16,9 +16,9 @@ use super::refs::*;
 use super::syntax::*;
 use super::tracker::{seq_lt, FrameState, PicKind};
 
-const STEP: Duration = Duration::from_millis(10);
+pub(super) const STEP: Duration = Duration::from_millis(10);
 
-fn params() -> StreamParams {
+pub(super) fn params() -> StreamParams {
     StreamParams::emitted()
 }
 
@@ -32,45 +32,45 @@ fn config() -> RefConfig {
 
 /// What the network and client do with one planned frame.
 #[derive(Clone, Default)]
-struct Fate {
-    lose: bool,
+pub(super) struct Fate {
+    pub(super) lose: bool,
     /// Extra delivery delay, in frames (reordering).
-    jitter: usize,
+    pub(super) jitter: usize,
     /// Extra delay, in frames, on this frame's ack.
-    ack_extra: usize,
+    pub(super) ack_extra: usize,
     /// The decoded/refused ack never comes (per-frame ack mode only).
-    suppress_ack: bool,
+    pub(super) suppress_ack: bool,
     /// A ledger verdict on a frame that did arrive.
-    spurious_verdict: bool,
+    pub(super) spurious_verdict: bool,
     /// No verdict on a lost frame; only the decode deadline finds it.
-    no_verdict: bool,
+    pub(super) no_verdict: bool,
 }
 
-type FateFn = Box<dyn FnMut(usize, &FramePlan) -> Fate>;
+pub(super) type FateFn = Box<dyn FnMut(usize, &FramePlan) -> Fate>;
 
-struct Script {
-    steps: usize,
-    delay: usize,
-    fate: FateFn,
-    srtt: Box<dyn FnMut(usize) -> Duration>,
-    resolution_at: Vec<usize>,
-    client_reset_at: Vec<usize>,
-    reentry_at: Vec<usize>,
+pub(super) struct Script {
+    pub(super) steps: usize,
+    pub(super) delay: usize,
+    pub(super) fate: FateFn,
+    pub(super) srtt: Box<dyn FnMut(usize) -> Duration>,
+    pub(super) resolution_at: Vec<usize>,
+    pub(super) client_reset_at: Vec<usize>,
+    pub(super) reentry_at: Vec<usize>,
     /// Frame sequence increment per step (tile frames share the counter).
-    seq_stride: u32,
+    pub(super) seq_stride: u32,
     /// Acks are cumulative 0x0A masks instead of one event per frame.
-    cumulative: bool,
-    strip_rplm: bool,
-    strip_mmco1: bool,
+    pub(super) cumulative: bool,
+    pub(super) strip_rplm: bool,
+    pub(super) strip_mmco1: bool,
     /// The client measures `frame_num` gaps the way libavcodec does.
-    lavc_gaps: bool,
+    pub(super) lavc_gaps: bool,
     /// Fragments in an IDR; a lost-free IDR acknowledges them evenly between
     /// its first ack and its delivery.
-    idr_frags: u16,
+    pub(super) idr_frags: u16,
 }
 
 impl Script {
-    fn new(steps: usize, fate: impl FnMut(usize, &FramePlan) -> Fate + 'static) -> Self {
+    pub(super) fn new(steps: usize, fate: impl FnMut(usize, &FramePlan) -> Fate + 'static) -> Self {
         Self {
             steps,
             delay: 2,
@@ -88,21 +88,23 @@ impl Script {
         }
     }
 
-    fn lossless(steps: usize) -> Self {
+    pub(super) fn lossless(steps: usize) -> Self {
         Self::new(steps, |_, _| Fate::default())
     }
 }
 
 #[derive(Clone)]
-struct Logged {
-    step: usize,
-    plan: FramePlan,
-    lost: bool,
+pub(super) struct Logged {
+    pub(super) step: usize,
+    pub(super) plan: FramePlan,
+    pub(super) lost: bool,
     /// `Some(fed)` once delivered.
-    fed: Option<bool>,
+    pub(super) fed: Option<bool>,
     /// The effective reference on the full stream matched the plan.
-    matched: bool,
-    effective: Effective,
+    pub(super) matched: bool,
+    pub(super) effective: Effective,
+    /// The slice header as the server emitted it (after any script mutation).
+    pub(super) header: SliceHeader,
 }
 
 enum Ev {
@@ -162,25 +164,25 @@ impl Gate {
     }
 }
 
-struct Sim {
-    mgr: RefManager,
+pub(super) struct Sim {
+    pub(super) mgr: RefManager,
     client: DecoderModel,
     gate: Gate,
     handled: BTreeMap<u32, bool>,
     base: Instant,
     queue: Vec<(usize, Ev)>,
-    log: Vec<Logged>,
-    max_client_peak: usize,
-    max_enc_peak: usize,
+    pub(super) log: Vec<Logged>,
+    pub(super) max_client_peak: usize,
+    pub(super) max_enc_peak: usize,
     /// Assert the properties a correct stream has; the negative controls
     /// turn this off.
     strict: bool,
     /// Frames the manager held back while the IDR was being delivered.
-    holds: usize,
+    pub(super) holds: usize,
 }
 
 impl Sim {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             mgr: RefManager::new(config()),
             client: DecoderModel::new(params()),
@@ -295,7 +297,7 @@ impl Sim {
         }
     }
 
-    fn run(&mut self, sc: &mut Script, strict: bool) {
+    pub(super) fn run(&mut self, sc: &mut Script, strict: bool) {
         self.strict = strict;
         if sc.lavc_gaps {
             self.client = DecoderModel::new(params()).with_gap_mode(GapMode::Libavcodec);
@@ -447,6 +449,7 @@ impl Sim {
                 fed: None,
                 matched: report.matched,
                 effective: report.effective,
+                header: parsed.clone(),
             });
             if fate.lose {
                 if !fate.no_verdict {
@@ -477,7 +480,7 @@ impl Sim {
     }
 }
 
-fn run_sim(mut sc: Script) -> Sim {
+pub(super) fn run_sim(mut sc: Script) -> Sim {
     let mut sim = Sim::new();
     sim.run(&mut sc, true);
     sim
@@ -1369,13 +1372,49 @@ fn poc_stays_monotonic_across_the_16_bit_lsb_wrap() {
 // ----------------------------------------------------------------- proptests
 
 /// (lose, ack_extra, spurious, no_verdict, suppress_ack, jitter)
-type FateRow = (bool, u8, bool, bool, bool, u8);
+pub(super) type FateRow = (bool, u8, bool, bool, bool, u8);
 /// (delay, fates, loss_until, seq_stride, cumulative, srtt_ms_base, slow_idr)
 /// `slow_idr` is 0 for a prompt IDR, else the extra steps (80 or more, so
 /// more than 750 ms) its 8 fragments take to arrive and decode.
-type ScriptParams = (usize, Vec<FateRow>, usize, u32, bool, u64, usize);
+pub(super) type ScriptParams = (usize, Vec<FateRow>, usize, u32, bool, u64, usize);
 
-fn arb_script() -> impl Strategy<Value = ScriptParams> {
+/// The script a [`ScriptParams`] value describes.
+pub(super) fn script_from(params: &ScriptParams, steps: usize) -> Script {
+    let (delay, fates, loss_until, stride, cumulative, srtt_ms, slow_idr) = params.clone();
+    let mut sc = Script::new(steps, move |step, plan| {
+        let slow = if plan.kind == PicKind::Idr && slow_idr > 0 {
+            Some(slow_idr)
+        } else {
+            None
+        };
+        if step >= loss_until {
+            return Fate {
+                jitter: slow.unwrap_or(0),
+                ..Fate::default()
+            };
+        }
+        let (lose, extra, spurious, nov, supp, jitter) = fates[step % fates.len()];
+        Fate {
+            // An IDR can be lost early on; later ones always arrive.
+            lose: lose && (plan.kind != PicKind::Idr || step < 100),
+            jitter: slow.unwrap_or(usize::from(jitter)),
+            ack_extra: usize::from(extra),
+            suppress_ack: supp && step < 100,
+            spurious_verdict: spurious,
+            no_verdict: nov,
+        }
+    });
+    sc.delay = delay;
+    sc.seq_stride = stride;
+    sc.cumulative = cumulative;
+    if slow_idr > 0 {
+        sc.idr_frags = 8;
+    }
+    sc.srtt = Box::new(move |step| Duration::from_millis(srtt_ms + (step as u64 % 7) * 3));
+    sc
+}
+
+pub(super) fn arb_script() -> impl Strategy<Value = ScriptParams> {
     (
         1usize..4,
         proptest::collection::vec(
@@ -1409,38 +1448,11 @@ proptest! {
     /// once losses stop the stream settles to healthy frames the client
     /// decodes.
     #[test]
-    fn plans_match_effective_references_over_random_loss((delay, fates, loss_until, stride, cumulative, srtt_ms, slow_idr) in arb_script(), lavc in any::<bool>()) {
-        let mut sc = Script::new(700, move |step, plan| {
-            let slow = if plan.kind == PicKind::Idr && slow_idr > 0 {
-                Some(slow_idr)
-            } else {
-                None
-            };
-            if step >= loss_until {
-                return Fate {
-                    jitter: slow.unwrap_or(0),
-                    ..Fate::default()
-                };
-            }
-            let (lose, extra, spurious, nov, supp, jitter) = fates[step % fates.len()];
-            Fate {
-                // An IDR can be lost early on; later ones always arrive.
-                lose: lose && (plan.kind != PicKind::Idr || step < 100),
-                jitter: slow.unwrap_or(usize::from(jitter)),
-                ack_extra: usize::from(extra),
-                suppress_ack: supp && step < 100,
-                spurious_verdict: spurious,
-                no_verdict: nov,
-            }
-        });
-        sc.delay = delay;
+    fn plans_match_effective_references_over_random_loss(params in arb_script(), lavc in any::<bool>()) {
+        let mut sc = script_from(&params, 700);
         sc.lavc_gaps = lavc;
-        sc.seq_stride = stride;
-        sc.cumulative = cumulative;
-        if slow_idr > 0 {
-            sc.idr_frags = 8;
-        }
-        sc.srtt = Box::new(move |step| Duration::from_millis(srtt_ms + (step as u64 % 7) * 3));
+        let (delay, loss_until, stride, cumulative, srtt_ms, slow_idr) =
+            (params.0, params.2, params.3, params.4, params.5, params.6);
         let mut sim = Sim::new();
         sim.run(&mut sc, true);
 
