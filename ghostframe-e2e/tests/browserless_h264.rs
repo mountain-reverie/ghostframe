@@ -52,6 +52,7 @@ fn load(idr_bytes: usize, p_bytes: usize) -> H264Load {
         cbr: None,
         pcm: None,
         pcm_wrong_ref_every: 0,
+        pcm_rate_policy: false,
         tile_phases: [None, None],
     }
 }
@@ -1411,3 +1412,5 @@ async fn the_headroom_guard_releases_in_h264_mode_on_a_capacity_step() {
 
 #[path = "browserless_h264/pcm_scenes.rs"]
 mod pcm_scenes;
+#[path = "browserless_h264/refs_scenes.rs"]
+mod refs_scenes;

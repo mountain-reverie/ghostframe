@@ -8,7 +8,8 @@
 //! `ghostframe_e2e::harness::h264_scene`).
 //!
 //! The scenes below pin the **legacy policy** (GOP and loss IDR, each P from
-//! the frame before it) as the baseline B5 is measured against. They assert
+//! the frame before it; the acked-reference counterparts are in
+//! `refs_scenes`) as the baseline B5 is measured against. They assert
 //! what is true of it today, and most of what is true is a cost, not a defect:
 //! the client core withholds a P frame whose reference never arrived, so no
 //! wrong picture is displayed, and what the policy pays is IDRs and freezes.
@@ -466,115 +467,4 @@ async fn the_same_seed_gives_byte_identical_counters() {
         wire(0x7204).await.0,
         "another seed must give another wire"
     );
-}
-
-/// The `RefManager` source, end to end through the harness with no loss: its
-/// plans are written as real streams behind the real send path, the client
-/// decodes every one to the picture the plan named, headers carry the plan's
-/// reference, and the manager did what it does when healthy (IDR once, marks
-/// candidates, confirms them from the acknowledgements, never recovers).
-#[tokio::test(start_paused = true)]
-async fn the_ref_manager_source_runs_end_to_end_with_no_loss() {
-    for seed in SEEDS {
-        let (r, o) = pcm_run(seed, 6, Pattern::Clean, pcm_load(PcmMode::RefManager)).await;
-        line("refm", seed, &r, &o);
-        let ctx = format!("refm {seed:#x}");
-        assert_sound(&ctx, &r, &o);
-        assert!(o.correct > 100, "{ctx}");
-        assert_eq!(o.correct, o.fed, "{ctx}");
-        assert_eq!(o.idr_made, 1, "{ctx}");
-        let c = o.refs;
-        // Premise: the manager planned (not the legacy path), marked
-        // candidates, and heard the acknowledgements that confirm them.
-        assert_eq!(c.idr_session, 1, "{ctx}");
-        assert!(c.p_healthy as usize + 1 >= o.made, "{ctx}: {c:?}");
-        assert!(
-            c.candidates_marked > 0 && c.anchors_confirmed > 0,
-            "{ctx}: {c:?}"
-        );
-        assert_eq!(
-            (c.recoveries, c.p_recovery, c.plan_mismatch, c.idr_reissued),
-            (0, 0, 0, 0),
-            "{ctx}: {c:?}"
-        );
-        // The wire carries the plan: marked frames say so.
-        let marked = r
-            .events
-            .iter()
-            .filter(|e| {
-                matches!(e, ClientNetEvent::Core(CoreEvent::NeedsH264 { flags, .. })
-                    if flags & ghostframe_protocol::protocol::FRAME_FLAG_MARK_LT != 0)
-            })
-            .count();
-        assert!(marked as u64 >= c.candidates_marked, "{ctx}: {marked}");
-    }
-}
-
-/// The `RefManager` source under loss. Its picture of the client must come
-/// from what the client decoded (the modelled 0x0A), not from what the
-/// transport completed: a P frame that arrives whole behind a lost one proves
-/// nothing about the lost one, and `RefManager::frame_decoded` would mark the
-/// whole chain behind it decoded. At 5 % some P frames are lost beyond what
-/// the XOR parity repairs (premise: frames never reached the client). The
-/// manager must then recover from its anchor and stop chaining from frames
-/// the client never displayed; with the transport-complete stand-in it kept
-/// planning healthy frames off the lost one to the end of the scene
-/// (`refs_to_undisplayed` 262 of 272 with it, against a handful without).
-///
-/// With the legacy ClientCore this scene froze for about 9 s after the first
-/// real loss: it held back every P frame whose `ref_frame_seq` was not the
-/// newest it had delivered, and a recovery P names the anchor. With the
-/// client gate (design 7.1) the stream recovers: no freeze, no wrong picture.
-#[tokio::test(start_paused = true)]
-async fn the_ref_manager_source_recovers_from_a_real_loss_not_a_transport_completion() {
-    for seed in SEEDS {
-        let (r, o) = pcm_run(seed, 10, Pattern::Iid(0.05), pcm_load(PcmMode::RefManager)).await;
-        line("refm-loss", seed, &r, &o);
-        let ctx = format!("refm-loss {seed:#x}");
-        let run = r.h264_run().unwrap();
-        let c = o.refs;
-        println!("   {c:?} acks={}", run.truth.refs.frame_acks_applied);
-        // Premise: frames were really lost (not repaired by parity), the loss
-        // path judged P fragments lost, and the client's acks reached the
-        // manager.
-        assert!(r.s2c_datagrams_dropped > 0, "{ctx}");
-        assert!(r.h264.stats.verdicts_p_frag > 0, "{ctx}");
-        assert!(o.never_fed > 0, "{ctx}: no frame was lost for good");
-        assert!(run.truth.refs.frame_acks_applied > 0, "{ctx}");
-        assert_eq!(o.unknown_to_truth, 0, "{ctx}");
-        assert_eq!(o.header_ref_mismatches, 0, "{ctx}");
-        assert!(o.wrong.is_empty(), "{ctx}: {}", o.wrong_list(8));
-        assert_eq!(o.idr_made, 1, "{ctx}: the manager makes no loss IDR");
-        // Effect: it noticed, and went to its anchor.
-        assert!(c.recoveries >= 1 && c.p_recovery > 0, "{ctx}: {c:?}");
-        assert_eq!(c.plan_mismatch, 0, "{ctx}");
-        assert!(
-            o.refs_to_undisplayed < o.made / 4,
-            "{ctx}: {} of {} frames chained from a frame the client never showed",
-            o.refs_to_undisplayed,
-            o.made
-        );
-        // The client gate (design 7.1) is the real one now: a recovery P that
-        // names the anchor is fed, not held back, so the stream recovers where
-        // the legacy client froze for about 9 s. Everything the gate feeds
-        // decodes to the picture the plan named, no long frozen stretch, and the
-        // manager's recoveries all land (the last may be in flight).
-        assert_eq!(o.correct, o.fed, "{ctx}");
-        assert_eq!((o.rejected, o.no_picture, o.damaged), (0, 0, 0), "{ctx}");
-        // A freeze here is a gap over four frame periods. The stream carries no
-        // parity now (an acked-reference stream repairs from its anchor), so
-        // every lost frame is a recovery, not a repair: bounded, not rare.
-        assert!(
-            o.frozen_us < 600_000 && o.freezes <= 16,
-            "{ctx}: {} freezes, {} us",
-            o.freezes,
-            o.frozen_us
-        );
-        assert!(o.max_gap_us < 400_000, "{ctx}: gap {} us", o.max_gap_us);
-        assert!(c.recovered + 1 >= c.recoveries, "{ctx}: {c:?}");
-        assert!(
-            o.last_correct_us.unwrap_or(0) + 1_000_000 >= 10_000_000,
-            "{ctx}: dead at the end"
-        );
-    }
 }

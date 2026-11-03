@@ -1300,7 +1300,7 @@ impl IoBridge {
     /// emission queue is backed up).
     fn finish_h264_refs_arm(&mut self, inflight: InFlight, trace: StageTrace) {
         let (seq, m) = (inflight.seq, inflight.meta);
-        match self.h264_refs_plan(seq, (m.width, m.height), now_std()) {
+        match self.h264_refs_plan(seq, (m.width, m.height), now_std(), true) {
             Some(req) => {
                 let plan = Box::new(req.plan.clone());
                 self.send_finish(
@@ -2798,6 +2798,9 @@ impl IoBridge {
                     idr_probes = r.idr_probes,
                     client_resets = r.client_resets,
                     frame_acks_applied = r.frame_acks_applied,
+                    frames_decoded_acked = r.frames_decoded_acked,
+                    frames_refused = r.frames_refused,
+                    suspect_overridden = r.suspect_overridden,
                     verdicts = r.verdicts,
                     epoch_dropped = r.epoch_dropped,
                     backend_failures = r.backend_failures,

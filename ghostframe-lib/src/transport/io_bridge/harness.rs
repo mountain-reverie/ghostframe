@@ -321,6 +321,28 @@ impl IoBridge {
         self.ack_blackout = Some((from, until));
     }
 
+    /// Drop frame acks (0x0A) with probability `p` between `from` and `until`
+    /// (seeded, deterministic): the loss of the feedback alone, with every
+    /// frame datagram and transport ack intact.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub fn set_frame_ack_loss(
+        &mut self,
+        p: f32,
+        seed: u64,
+        from: std::time::Instant,
+        until: std::time::Instant,
+    ) {
+        self.frame_ack_loss = Some((
+            crate::transport::loss_injection::LossInjector::new(
+                p,
+                |dg| dg.first() == Some(&crate::transport::protocol::FRAME_ACK_ENVELOPE),
+                seed,
+            ),
+            from,
+            until,
+        ));
+    }
+
     /// Drop every client tile NACK at the door (see `ignore_tile_nacks`).
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn set_ignore_tile_nacks(&mut self, ignore: bool) {

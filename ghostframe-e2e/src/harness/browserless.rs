@@ -180,6 +180,8 @@ pub struct H264Load {
     pub pcm: Option<PcmMode>,
     /// See `InjectedH264::pcm_wrong_ref_every`: a deliberate defect.
     pub pcm_wrong_ref_every: u32,
+    /// See `InjectedH264::pcm_rate_policy`.
+    pub pcm_rate_policy: bool,
     /// Frame index ranges `[from, to)` in which the screen is drawn by the
     /// tile codec instead: one solid tile changes per frame. Entering one
     /// abandons the H.264 frames in flight, leaving it is a re-entry.
@@ -295,6 +297,9 @@ pub struct RunOptions {
     /// acknowledgement stall of the design's scene 8. Nothing else on the
     /// client-to-server path is touched (frame acks, feedback, QUIC itself).
     pub ack_blackout: Option<(Duration, Duration)>,
+    /// Drop frame acks (0x0A) with this probability between the two offsets:
+    /// the loss of the frame feedback alone (design scene 3).
+    pub frame_ack_loss: Option<(f64, Duration, Duration)>,
 }
 
 /// How long the harness's perfect decoder takes to answer for an access unit
@@ -1106,6 +1111,14 @@ async fn run_inner(
     if let Some((from, until)) = opts.ack_blackout {
         bridge.set_ack_blackout(base.into_std() + from, base.into_std() + until);
     }
+    if let Some((p, from, until)) = opts.frame_ack_loss {
+        bridge.set_frame_ack_loss(
+            p as f32,
+            scene.seed,
+            base.into_std() + from,
+            base.into_std() + until,
+        );
+    }
     let env_transport = ghostframe_lib::config::TransportConfig::from_env();
     bridge.use_model_controller_for_test(opts.model.unwrap_or(env_transport.model));
     if let Some(floor) = scene.tick_budget_floor_bytes {
@@ -1512,6 +1525,7 @@ async fn drive_session(
             cbr: h.cbr,
             pcm: h.pcm,
             pcm_wrong_ref_every: h.pcm_wrong_ref_every,
+            pcm_rate_policy: h.pcm_rate_policy,
             pcm_cadence_us: h.cadence_us,
         }),
         SceneLoad::Script(_) | SceneLoad::Profile(_) => None,

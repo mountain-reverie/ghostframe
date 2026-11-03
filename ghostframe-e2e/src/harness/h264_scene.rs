@@ -199,6 +199,9 @@ pub struct H264Outcome {
     /// loss keeps doing it to the end of the scene.
     pub refs_to_undisplayed: usize,
     pub refs: PcmRefCounters,
+    /// The longest run of consecutive frames (by `frame_seq` among those the
+    /// source made) that the client never decoded.
+    pub longest_lost_run: usize,
     /// For each tile window: how long after it ended the first correct
     /// H.264 picture was shown (`None`: never).
     pub resume_us: Vec<Option<u64>>,
@@ -279,6 +282,15 @@ impl H264Run {
             .filter(|t| t.ref_seq.is_some_and(|r| !good.contains(&r)))
             .count();
         o.never_fed = truth.keys().filter(|s| !fed_seqs.contains(s)).count();
+        let mut run = 0usize;
+        for s in truth.keys() {
+            if fed_seqs.contains(s) {
+                run = 0;
+            } else {
+                run += 1;
+                o.longest_lost_run = o.longest_lost_run.max(run);
+            }
+        }
         o.first_correct_us = good_at.first().copied();
         o.last_correct_us = good_at.last().copied();
         let mut newest = 0u32;
@@ -387,11 +399,22 @@ pub fn pcm_load(mode: ghostframe_lib::encoder::h264_harness::PcmMode) -> H264Loa
         cbr: None,
         pcm: Some(mode),
         pcm_wrong_ref_every: 0,
+        pcm_rate_policy: false,
         tile_phases: [None, None],
     }
 }
 
 impl H264Outcome {
+    /// The longest a stretch without a correct picture may last when the
+    /// stream recovers from its anchor (design T3 scene 1): each recovery
+    /// attempt costs three round trips and the loss path's verdict latency,
+    /// and an attempt can itself be lost, once per frame of the longest run
+    /// of lost frames; plus the allowance `FREEZE_GAP_FRAMES` already grants.
+    pub fn freeze_bound_us(&self, rtt_us: u64, verdict_us: u64, cadence_us: u64) -> u64 {
+        (1 + self.longest_lost_run as u64) * (3 * rtt_us + verdict_us)
+            + FREEZE_GAP_FRAMES * cadence_us
+    }
+
     /// One line with every number a scene reports, for the scene log.
     pub fn summary(&self) -> String {
         format!(
