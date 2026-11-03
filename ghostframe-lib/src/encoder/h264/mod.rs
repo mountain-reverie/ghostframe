@@ -27,4 +27,4 @@ pub(crate) mod pcm_writer;
 #[cfg(test)]
 mod refs_tests;
 #[cfg(test)]
-mod vaapi_direct_tests;
+pub(crate) mod vaapi_direct_tests;

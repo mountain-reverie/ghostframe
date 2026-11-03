@@ -984,6 +984,8 @@ enum PlannedMode {
     Coded,
     Unplanned,
     Failed,
+    /// The frame's GPU outputs were gone: nothing encoded.
+    Nothing,
 }
 
 /// A recording stand-in for the GPU backend: what the worker was asked, in
@@ -1071,6 +1073,7 @@ impl FrameBackend for RecordingBackend {
         match self.planned {
             None | Some(PlannedMode::Unplanned) => H264Reply::Unplanned,
             Some(PlannedMode::Failed) => H264Reply::Failed,
+            Some(PlannedMode::Nothing) => H264Reply::Nothing,
             Some(PlannedMode::Coded) => H264Reply::Coded(CodedAu(EncodedAu {
                 payload: vec![7; 3_000],
                 meta: AuMeta {
@@ -8196,4 +8199,490 @@ async fn a_client_without_the_v2_feedback_stays_on_phase_a() {
     refs_frame(&mut bridge, 1).await;
     assert!(!log_has(&log, "finish_h264_planned"));
     assert!(log_has(&log, "finish_h264 "));
+}
+
+// ---------------------------------------------------------------------------
+// T4 for the encode worker: the production path with the real libva-direct
+// backend. Local only (CI skips `h264_direct_` by name); run through the GPU
+// wrapper, one at a time:
+//   GF_ALLOW_VAAPI=1 flock -o <bench lock> <gf-gpu-run> \
+//     cargo test -p ghostframe-lib --lib h264_direct_worker -- --test-threads=1
+// ---------------------------------------------------------------------------
+
+/// A BGRA frame that differs from every other and moves, so a prediction from
+/// the wrong picture shows in the decode.
+fn moving_bgra(w: u32, h: u32, n: u32) -> Vec<u8> {
+    let mut px = Vec::with_capacity((w * h * 4) as usize);
+    for j in 0..h {
+        for i in 0..w {
+            let x = i.wrapping_add(n * 5);
+            let y = j.wrapping_sub(n * 3);
+            let check = if ((x / 24) + (y / 24)) & 1 != 0 {
+                60u32
+            } else {
+                180
+            };
+            let v =
+                (check + (x.wrapping_mul(3).wrapping_add(y.wrapping_mul(2)) & 63)).min(255) as u8;
+            px.extend_from_slice(&[v, v.wrapping_add(40), 255 - v, 255]);
+        }
+    }
+    px
+}
+
+/// The encode worker, a real `GpuBackend` (Vulkan analysis, libva-direct
+/// encode) and a real `RefManager` for a short stream with two lost frames:
+/// the plans are executed by the worker, every header is what the plan said,
+/// the full stream decodes with `err_recognition=explode` and zero output
+/// delay, and every surviving frame that does not depend on the loss decodes,
+/// from the stream with the lost frames removed, to the same bytes as in the
+/// full decode.
+#[test]
+fn h264_direct_worker_path_survives_a_loss_bit_exact() {
+    use crate::encoder::h264::refs::{Plan, RefConfig, RefManager};
+    use crate::encoder::h264::syntax::StreamParams;
+    use crate::encoder::h264::vaapi_direct_tests::decode;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::time::{Duration, Instant};
+
+    const W: u32 = 256;
+    const H: u32 = 128;
+    const FRAMES: u32 = 48;
+    const LOST: std::ops::Range<u32> = 20..22;
+    // No `gpu_test_lock` here: the worker thread's processor calls take it
+    // themselves, and a lock held by this thread would wait on them for ever.
+    // The tests of this binary are exclusive through `--test-threads=1`.
+    let processor = crate::capture::gpu_pipeline::GpuFrameProcessor::new(256)
+        .expect("this test needs a Vulkan GPU and must not skip");
+    let mut pipeline = FramePipeline::new(Box::new(GpuBackend::new(processor)));
+    let step = Duration::from_millis(33);
+    let srtt = Duration::from_millis(66);
+    let mut mgr = RefManager::new(RefConfig {
+        params: StreamParams::writer(),
+        frame_interval: step,
+        initial_srtt: srtt,
+    });
+    let recv = |p: &mut FramePipeline| p.rx.blocking_recv().expect("the worker answers");
+    let t0 = Instant::now();
+    let mut sent: Vec<(u32, Vec<u8>, bool)> = Vec::new(); // (seq, au, poisoned)
+    let mut poisoned: BTreeSet<u32> = BTreeSet::new();
+    let mut due: BTreeMap<u32, Vec<(u32, u8)>> = BTreeMap::new(); // 0 decoded, 1 refused, 2 suspect
+    for n in 0..FRAMES {
+        let now = t0 + step * n;
+        for (seq, kind) in due.remove(&n).unwrap_or_default() {
+            match kind {
+                0 => mgr.frame_decoded(seq),
+                1 => mgr.frame_refused(seq),
+                _ => mgr.frame_suspect(seq),
+            }
+        }
+        mgr.tick(now, srtt);
+        let Plan::Frame(plan) = mgr.plan_next(n, now) else {
+            panic!("unexpected hold at frame {n}");
+        };
+        let frame = FrameSubmission {
+            width: W,
+            height: H,
+            stride: W * 4,
+            pixels: moving_bgra(W, H, n).into(),
+            dmabuf_fd: None,
+            timestamp_us: 0,
+            content: crate::frame_damage::Content::Pixels,
+            damage: crate::frame_damage::FrameDamage::Unknown,
+            capture_done_ns: 0,
+        };
+        let controls = if n == 0 {
+            vec![Control::H264Rate {
+                bps: 3_000_000,
+                fps: 30,
+                reopen: false,
+            }]
+        } else {
+            Vec::new()
+        };
+        assert!(pipeline.send(ToWorker::Analyse {
+            seq: n,
+            frame,
+            escalation: Vec::new(),
+            want_diag: false,
+            controls,
+        }));
+        assert!(matches!(recv(&mut pipeline), FromWorker::Analysed { .. }));
+        let req = Box::new(H264Request {
+            refs: mgr.resident_refs(),
+            plan: plan.clone(),
+            fps: 30,
+            bps: 3_000_000,
+        });
+        assert!(pipeline.send(ToWorker::Finish {
+            seq: n,
+            action: FinishAction::H264Planned(req),
+            controls: Vec::new(),
+        }));
+        let FromWorker::H264Planned { reply, .. } = recv(&mut pipeline) else {
+            panic!("frame {n}: not a planned reply");
+        };
+        let H264Reply::Coded(super::frame_backend::CodedAu(au)) = reply else {
+            panic!("frame {n}: the worker did not execute the plan");
+        };
+        let header = au.meta.header.as_ref().expect("a direct AU is parsed");
+        let report = mgr
+            .frame_sent(&plan, header, 1, now)
+            .expect("plan is from the current epoch");
+        assert!(report.matched, "frame {n}: the stream is not the plan");
+        assert!(au.meta.header_matches(&plan, &StreamParams::writer()));
+        mgr.frag_acked(n, 0, now);
+        let lost = LOST.contains(&n);
+        let dependent = au.meta.ref_seq.is_some_and(|r| poisoned.contains(&r));
+        if lost || dependent {
+            poisoned.insert(n);
+        }
+        let (at, kind) = if lost {
+            (n + 3, 2)
+        } else if dependent {
+            (n + 2, 1)
+        } else {
+            (n + 2, 0)
+        };
+        due.entry(at).or_default().push((n, kind));
+        sent.push((n, au.payload, lost || dependent));
+    }
+    assert_eq!(mgr.stats().plan_mismatch, 0);
+    assert_eq!(mgr.stats().idr_session, 1, "no IDR for a loss");
+    assert!(mgr.stats().recoveries >= 1 && mgr.stats().recovered >= 1);
+    let all: Vec<(u32, &[u8])> = sent.iter().map(|s| (s.0, s.1.as_slice())).collect();
+    let kept: Vec<(u32, &[u8])> = sent
+        .iter()
+        .filter(|s| !LOST.contains(&s.0))
+        .map(|s| (s.0, s.1.as_slice()))
+        .collect();
+    let full = decode(&all, true);
+    let dropped = decode(&kept, false);
+    assert!(full.errors.is_empty(), "{:?}", full.errors);
+    for s in &sent {
+        assert!(
+            full.same_call.contains(&s.0),
+            "frame {} had output delay",
+            s.0
+        );
+    }
+    let (mut compared, mut survivors, mut diverged) = (0, 0, 0);
+    for (seq, _, bad) in sent.iter().filter(|s| !LOST.contains(&s.0)) {
+        if *bad {
+            survivors += 1;
+            diverged += usize::from(dropped.frames.get(seq) != full.frames.get(seq));
+        } else {
+            assert_eq!(
+                dropped.frames.get(seq),
+                full.frames.get(seq),
+                "clean frame {seq} differs between the full and the drop decode"
+            );
+            compared += 1;
+        }
+    }
+    eprintln!("worker path: compared {compared} clean, {survivors} poisoned ({diverged} diverged)");
+    assert!(compared > 20);
+    // The premise: frames did depend on the loss, and the oracle can see it.
+    assert!(survivors > 0 && diverged > 0, "the oracle is blind");
+}
+
+// ---- review follow-ups: sessions, stalls, failures, abandoned IDRs ----------
+
+/// An access unit that is exactly what `plan` says, for tests that plan and
+/// commit without a worker.
+fn au_for(
+    plan: &crate::encoder::h264::refs::FramePlan,
+) -> crate::encoder::h264::backend::EncodedAu {
+    use crate::encoder::h264::backend::{AuMeta, EncodedAu};
+    use crate::encoder::h264::tracker::PicKind;
+    EncodedAu {
+        payload: vec![9; 3_000],
+        meta: AuMeta {
+            idr: plan.kind == PicKind::Idr,
+            header: Some(plan.slice_header(&crate::encoder::h264::syntax::StreamParams::writer())),
+            ref_seq: plan.ref_frame_seq(),
+        },
+    }
+}
+
+fn refs_meta() -> frame::FrameMeta {
+    frame::FrameMeta::of(&tiny_frame())
+}
+
+/// Plan frame `seq` and commit what the plan says. `None`: the manager held.
+fn plan_commit(bridge: &mut IoBridge, seq: u32) -> Option<crate::encoder::h264::refs::FramePlan> {
+    let now = now_std();
+    let req = bridge.h264_refs_plan(seq, (64, 64), now, false)?;
+    let au = au_for(&req.plan);
+    assert!(bridge.h264_refs_commit(&req.plan, au, &refs_meta(), 1_200, now));
+    Some(req.plan)
+}
+
+fn acked_refs_bridge() -> IoBridge {
+    let (mut bridge, _peer) = bridge_with_backend(RecordingBackend::default());
+    bridge.test_commit_dg_size = Some(1_200);
+    bridge.client_caps.supports_h264 = true;
+    bridge.client_caps.h264_acked_ref = true;
+    bridge
+}
+
+/// A manager left over from a session with 0x04 must not serve the next
+/// session's client, which sends no v2 feedback: that one gets the Phase A
+/// loss IDR and reset IDR.
+#[tokio::test]
+async fn a_later_client_without_the_v2_feedback_gets_the_phase_a_idrs() {
+    use ghostframe_protocol::feedback_stream::{ResetReason, ResetRequest};
+    let mut bridge = acked_refs_bridge();
+    plan_commit(&mut bridge, 1).expect("the IDR");
+    assert!(bridge.h264_refs_live());
+    bridge.fire_session_reset(ConnectionHandle(0));
+    assert!(bridge.h264.refs.is_none(), "the session's manager is gone");
+    // The new client is HELLO'd without 0x04.
+    bridge.client_caps.h264_acked_ref = false;
+    assert!(!bridge.h264_refs_live());
+    assert!(!bridge.h264_refs_report().active);
+    bridge.pending_controls.clear();
+    // A reset request: a keyframe control, not a manager epoch.
+    bridge.handle_reset_request(
+        ResetRequest {
+            reason: ResetReason::DecoderFailure,
+            frame_seq: 1,
+        },
+        now_std(),
+    );
+    assert_eq!(keyframe_controls(&bridge), 1);
+    // A loss verdict on a P fragment of the new session: a loss IDR.
+    bridge.h264.pending_idr = None;
+    bridge.send_h264_frame(
+        H264Out {
+            payload: vec![1; 3_000],
+            is_keyframe: true,
+        },
+        &refs_meta(),
+        10,
+        1_200,
+    );
+    bridge.send_h264_frame(
+        H264Out {
+            payload: vec![2; 3_000],
+            is_keyframe: false,
+        },
+        &refs_meta(),
+        11,
+        1_200,
+    );
+    bridge.h264.pending_idr = None;
+    bridge.note_h264_verdict(11, 0, now_std());
+    assert_eq!(bridge.h264.pending_idr, Some(IdrCause::Loss));
+}
+
+/// A client that decodes the IDR and then refuses everything still has its
+/// transport acknowledged, and its cumulative decoded mask keeps the IDR's bit
+/// for 64 frames. It stalls all the same, after 500 ms with no new decode.
+#[tokio::test(start_paused = true)]
+async fn a_client_that_only_refuses_trips_the_stall_flag_within_the_bound() {
+    use crate::transport::io_bridge::h264_tx::STALL_NO_PROGRESS;
+    let mut bridge = acked_refs_bridge();
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    ack_every_fragment(&mut bridge, 0);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
+    assert!(!bridge.update_h264_stall(now_std()));
+    let step = std::time::Duration::from_millis(33);
+    let mut stalled_at = None;
+    let start = now_std();
+    for seq in 1..40u32 {
+        tokio::time::advance(step).await;
+        if plan_commit(&mut bridge, seq).is_none() {
+            continue;
+        }
+        ack_every_fragment(&mut bridge, seq);
+        // The cumulative mask still carries bit `seq` of the IDR for 64 frames.
+        bridge.dispatch_frame_ack_for_test(frame_ack_datagram(
+            seq,
+            1u64 << seq,
+            1u64 << (seq - 1).min(63),
+        ));
+        if bridge.update_h264_stall(now_std()) {
+            stalled_at = Some(now_std() - start);
+            break;
+        }
+    }
+    let t = stalled_at.expect("a client that refuses everything must stall");
+    assert!(
+        t >= STALL_NO_PROGRESS && t <= STALL_NO_PROGRESS + 2 * step * 2,
+        "stalled after {t:?}, bound {STALL_NO_PROGRESS:?}"
+    );
+}
+
+/// A failed encode restarts the stream with an IDR counted as an encoder fault,
+/// and a stream whose IDR flag disagrees with the plan or whose header does not
+/// parse is a failed encode.
+#[tokio::test]
+async fn a_failed_or_inconsistent_encode_is_an_encoder_fault() {
+    use crate::encoder::h264::refs::IdrCause as RefIdr;
+    let mut bridge = acked_refs_bridge();
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    let now = now_std();
+    // The flag disagrees: not sent, a fault.
+    let req = bridge.h264_refs_plan(1, (64, 64), now, false);
+    assert!(req.is_none(), "held for the unacknowledged IDR");
+    ack_every_fragment(&mut bridge, 0);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
+    let req = bridge.h264_refs_plan(1, (64, 64), now, false).expect("a P");
+    let mut au = au_for(&req.plan);
+    au.meta.idr = true;
+    let sent_before = bridge.h264.stats.frames_sent;
+    assert!(!bridge.h264_refs_commit(&req.plan, au, &refs_meta(), 1_200, now));
+    assert_eq!(bridge.h264.stats.frames_sent, sent_before);
+    assert_eq!(bridge.h264_refs_report().backend_failures, 1);
+    // The next plan is the IDR, for the fault.
+    let req = bridge
+        .h264_refs_plan(2, (64, 64), now, false)
+        .expect("an IDR");
+    assert_eq!(req.plan.idr_cause, Some(RefIdr::EncoderFault));
+    // A header that did not parse is the same.
+    let mut au = au_for(&req.plan);
+    au.meta.header = None;
+    assert!(!bridge.h264_refs_commit(&req.plan, au, &refs_meta(), 1_200, now));
+    assert_eq!(bridge.h264_refs_report().backend_failures, 2);
+    // A good IDR counts as the fault it answered.
+    let req = bridge
+        .h264_refs_plan(3, (64, 64), now, false)
+        .expect("an IDR");
+    let au = au_for(&req.plan);
+    assert!(bridge.h264_refs_commit(&req.plan, au, &refs_meta(), 1_200, now));
+    let r = bridge.h264_refs_report();
+    assert_eq!((r.idr_encoder_fault, r.idr_session), (1, 1), "{r:?}");
+}
+
+/// Three encoder faults with no anchor confirmed between them give acked
+/// references up; a confirmed anchor in between clears the run.
+#[tokio::test]
+async fn repeated_encoder_faults_without_an_anchor_fall_back_to_phase_a() {
+    let mut bridge = acked_refs_bridge();
+    let now = now_std();
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    ack_every_fragment(&mut bridge, 0);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
+    assert_eq!(bridge.h264_refs_report().anchors_confirmed, 1);
+    // Two faults, an anchor confirmed between them and the third: not yet.
+    bridge.h264_refs_encoder_failed(now);
+    bridge.h264_refs_encoder_failed(now);
+    assert!(bridge.h264_refs_active());
+    let req = bridge
+        .h264_refs_plan(1, (64, 64), now, false)
+        .expect("an IDR");
+    assert!(bridge.h264_refs_commit(&req.plan, au_for(&req.plan), &refs_meta(), 1_200, now));
+    ack_every_fragment(&mut bridge, 1);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(1, 1, 0));
+    assert_eq!(bridge.h264_refs_report().anchors_confirmed, 2);
+    bridge.h264_refs_encoder_failed(now);
+    assert!(bridge.h264_refs_active(), "an anchor was confirmed between");
+    // Three in a row with none: Phase A, asked for the Phase A way.
+    bridge.h264_refs_encoder_failed(now);
+    bridge.pending_controls.clear();
+    bridge.h264_refs_encoder_failed(now);
+    assert!(!bridge.h264_refs_active());
+    assert!(bridge.h264.refs.is_none());
+    assert_eq!(bridge.h264.pending_idr, Some(IdrCause::Session));
+    assert_eq!(keyframe_controls(&bridge), 1, "the encoder is asked for it");
+}
+
+/// Further verdicts on a frame already suspect do nothing more.
+#[tokio::test]
+async fn a_second_verdict_on_a_suspect_frame_changes_nothing() {
+    let mut bridge = acked_refs_bridge();
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    ack_every_fragment(&mut bridge, 0);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
+    plan_commit(&mut bridge, 1).expect("a P");
+    bridge.note_h264_verdict(1, 0, now_std());
+    let (r, s) = (bridge.h264_refs_report(), bridge.h264.stats);
+    bridge.pending_controls.clear();
+    bridge.note_h264_verdict(1, 1, now_std());
+    assert_eq!(bridge.h264_refs_report().verdicts, r.verdicts);
+    assert_eq!(bridge.h264.stats.frames_suspect, s.frames_suspect);
+    assert_eq!(bridge.h264.stats.queue_purged, s.queue_purged);
+    assert!(bridge.pending_controls.is_empty(), "no new invalidate");
+}
+
+/// No decoder: an IDR cannot help. H.264 is off for the session, nothing is
+/// requested of the encoder, and the manager is left alone.
+#[tokio::test]
+async fn a_client_with_no_decoder_turns_h264_off_without_an_idr() {
+    use ghostframe_protocol::feedback_stream::{ResetReason, ResetRequest};
+    let mut bridge = acked_refs_bridge();
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    bridge.pending_controls.clear();
+    let epoch = bridge.h264.refs.as_ref().unwrap().mgr.epoch();
+    bridge.handle_reset_request(
+        ResetRequest {
+            reason: ResetReason::NoDecoder,
+            frame_seq: 0,
+        },
+        now_std(),
+    );
+    assert!(!bridge.client_caps.supports_h264);
+    assert!(!bridge.adaptation_context.supports_h264);
+    assert_eq!(keyframe_controls(&bridge), 0);
+    assert_eq!(bridge.h264.refs.as_ref().unwrap().mgr.epoch(), epoch);
+    assert_eq!(bridge.h264_refs_report().client_resets, 0);
+}
+
+/// Leaving H.264 while the IDR was still being delivered purges it; the return
+/// sends the IDR at once instead of holding until its timeout.
+#[tokio::test(start_paused = true)]
+async fn an_idr_abandoned_with_the_tile_codec_is_sent_again_at_the_return() {
+    let mut bridge = acked_refs_bridge();
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    // Not acknowledged: a plan now would be held.
+    assert!(bridge
+        .h264_refs_plan(1, (64, 64), now_std(), false)
+        .is_none());
+    bridge.abandon_h264_inflight(1, now_std());
+    bridge.h264_refs_reentry(now_std());
+    let req = bridge
+        .h264_refs_plan(2, (64, 64), now_std(), false)
+        .expect("the IDR again, not a hold");
+    assert_eq!(req.plan.kind, crate::encoder::h264::tracker::PicKind::Idr);
+}
+
+/// The result of a frame whose session changed while the worker encoded is
+/// lost: nothing is sent and the manager starts a new epoch.
+#[tokio::test]
+async fn a_result_for_a_changed_session_is_lost_and_restarts_the_stream() {
+    let (mut bridge, _log, _peer) = refs_bridge(PlannedMode::Coded).await;
+    bridge.start_analysis(tiny_frame(), 1, 1_200, Vec::new(), 0);
+    let _ = next_worker_message(&mut bridge).await.expect("analysed");
+    let inflight = bridge.in_flight.take().expect("a frame in flight");
+    bridge.finish_h264_arm(
+        inflight,
+        FinishAction::H264 {
+            force_keyframe: false,
+        },
+        Default::default(),
+    );
+    let epoch = bridge.h264.refs.as_ref().unwrap().mgr.epoch();
+    // The session changes while the worker is encoding (the manager keeps its
+    // epoch: only the loop's session epoch moved).
+    bridge.session_epoch += 1;
+    let msg = next_worker_message(&mut bridge).await.expect("finished");
+    bridge.on_frame_worker_message(msg);
+    assert!(sent_frame_headers(&bridge).is_empty());
+    assert!(bridge.h264.refs.as_ref().unwrap().mgr.epoch() > epoch);
+}
+
+/// A worker that had nothing to encode (its GPU outputs were gone) leaves the
+/// manager where it was: the same plan is made again for the next frame.
+#[tokio::test]
+async fn a_frame_the_worker_could_not_encode_is_planned_again() {
+    let (mut bridge, log, _peer) = refs_bridge(PlannedMode::Nothing).await;
+    refs_frame(&mut bridge, 1).await;
+    assert!(log_has(&log, "finish_h264_planned seq=1 idr=true"));
+    assert!(sent_frame_headers(&bridge).is_empty());
+    assert!(bridge.h264_refs_active());
+    assert!(keyframe_controls(&bridge) == 0);
+    refs_frame(&mut bridge, 2).await;
+    assert!(log_has(&log, "finish_h264_planned seq=2 idr=true"));
+    assert_eq!(bridge.h264_refs_report().backend_failures, 0);
 }
