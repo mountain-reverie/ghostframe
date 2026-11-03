@@ -34,7 +34,7 @@ pub mod wire_loss;
 pub use cdf53_coverage::CoverageEntry;
 pub use event::{DecodeErrorCode, Event, PollOutput, TileData, TileKey};
 pub use ghostframe_protocol::feedback_stream::ResetReason;
-pub use tile_decoder::TileDecoder;
+pub use tile_decoder::{BatchStep, TileDecoder};
 pub use tile_out::{Decoded, NoSlots, TileOut, TileSink, TILE_BYTES, TILE_ROW_BYTES};
 pub use wire_loss::WireLossStats;
 
