@@ -8,12 +8,15 @@
 //! picture carries markers (`Picture`), so a decoded one says which frames it
 //! was built from.
 //!
-//! The client side here is the legacy client: it decodes every access unit the
-//! core delivers, in delivery order, with libavcodec (software, lenient), and
-//! asks for an IDR when the decoder fails. The client-side gate of design 7.1
-//! is B5's; until then "a wrong picture displayed" is how drift shows.
+//! The client side here is the real `ClientCore` (reference gate, frame acks,
+//! reset requests) over a software decoder: every access unit the gate feeds is
+//! decoded with libavcodec (lenient, so wrong pictures show instead of
+//! failing), and what the decoder did goes back through
+//! `ClientNet::h264_result`, exactly as the native renderer's does. The frame
+//! ack the server hears is the client's own 0x0A datagram, not a model of it.
+//! "A wrong picture displayed" is how drift shows.
 
-use ghostframe_client_core::{Event as CoreEvent, ResetReason};
+use ghostframe_client_core::{Event as CoreEvent, H264Outcome as CoreOutcome};
 use ghostframe_client_net::ClientNetEvent;
 use ghostframe_lib::encoder::h264_harness::{
     frame_bytes, Decoded, FeedError, PcmDecoder, PcmLogInner, PcmRefCounters, Picture, Strictness,
@@ -48,14 +51,11 @@ pub struct DisplayRecord {
     pub outcome: DisplayOutcome,
 }
 
-/// The legacy client's decoder, fed from the events `ClientNet` returns.
+/// The client's decoder, fed from the events `ClientNet` returns.
 pub struct H264Display {
     decoder: PcmDecoder,
-    /// What each frame was meant to show, to tell a right picture from a wrong
-    /// one when modelling the frame ack.
-    truth: Option<ghostframe_lib::encoder::h264_harness::PcmLog>,
     pub records: Vec<DisplayRecord>,
-    /// Decoder failures reported to the server as reset requests.
+    /// Decode errors reported to the core (it sends the reset request).
     pub resets: u32,
 }
 
@@ -69,39 +69,34 @@ impl H264Display {
     pub fn new() -> Self {
         Self {
             decoder: PcmDecoder::new(Strictness::Lenient),
-            truth: None,
             records: Vec::new(),
             resets: 0,
         }
     }
 
-    /// Give the display the truth log, so it can model the frame ack.
-    pub fn with_truth(mut self, log: ghostframe_lib::encoder::h264_harness::PcmLog) -> Self {
-        self.truth = Some(log);
-        self
-    }
-
-    /// Decode every H.264 access unit in `events`, in order.
-    ///
-    /// A decoder that refuses an access unit, produces no picture for it, or
-    /// flags the picture damaged has failed, and the real client then asks for
-    /// a reset (`ResetReason::DecoderFailure`) and starts a fresh decoder
-    /// (damage counts because libavcodec reports it; VA-API would not, which is
-    /// the gate's job in B5). The report also carries the modelled frame ack:
-    /// frames decoded to the picture the encoder meant, and frames not.
-    pub fn on_events(&mut self, at_us: u64, events: &[ClientNetEvent]) -> FeedReport {
-        let mut rep = FeedReport::default();
+    /// Decode every H.264 access unit in `events`, in order, and say what the
+    /// decoder did with each, as the native renderer does: a refused access
+    /// unit or one libavcodec flags damaged is a decode error (libavcodec
+    /// reports damage; VA-API would not, which is the gate's job), no picture
+    /// is `NotOutput`, anything else `Decoded`. The decoder is reset where the
+    /// gate says so (`reset_decoder`).
+    pub fn on_events(&mut self, at_us: u64, events: &[ClientNetEvent]) -> Vec<(u32, CoreOutcome)> {
+        let mut results = Vec::new();
         for ev in events {
             let ClientNetEvent::Core(CoreEvent::NeedsH264 {
                 frame_seq,
                 is_keyframe,
                 ref_frame_seq,
+                reset_decoder,
                 payload,
                 ..
             }) = ev
             else {
                 continue;
             };
+            if *reset_decoder {
+                self.decoder.reset();
+            }
             let outcome = match self.decoder.feed(payload, i64::from(*frame_seq)) {
                 Ok(Decoded { yuv, damaged, .. }) => DisplayOutcome::Shown {
                     picture: (yuv.len() == frame_bytes())
@@ -112,32 +107,17 @@ impl H264Display {
                 Err(FeedError::Rejected(_)) => DisplayOutcome::Rejected,
                 Err(FeedError::NoPicture(_)) => DisplayOutcome::NoPicture,
             };
-            let right = match (&outcome, &self.truth) {
-                (DisplayOutcome::Shown { picture, damaged }, Some(t)) => {
-                    !damaged
-                        && picture.as_ref().is_some_and(|p| {
-                            t.lock()
-                                .expect("pcm log poisoned")
-                                .truth
-                                .get(frame_seq)
-                                .is_some_and(|m| m.picture == *p)
-                        })
-                }
-                _ => false,
-            };
-            if right {
-                rep.decoded.push(*frame_seq);
-            } else {
-                rep.refused.push(*frame_seq);
-            }
-            let failed = match &outcome {
-                DisplayOutcome::Shown { damaged, .. } => *damaged,
-                DisplayOutcome::Rejected | DisplayOutcome::NoPicture => true,
-            };
-            if failed {
-                rep.failed.push(*frame_seq);
-                self.decoder.reset();
-            }
+            results.push((
+                *frame_seq,
+                match &outcome {
+                    DisplayOutcome::Shown { damaged: false, .. } => CoreOutcome::Decoded,
+                    DisplayOutcome::Shown { damaged: true, .. } | DisplayOutcome::Rejected => {
+                        self.resets += 1;
+                        CoreOutcome::DecodeError
+                    }
+                    DisplayOutcome::NoPicture => CoreOutcome::NotOutput,
+                },
+            ));
             self.records.push(DisplayRecord {
                 at_us,
                 frame_seq: *frame_seq,
@@ -146,36 +126,7 @@ impl H264Display {
                 outcome,
             });
         }
-        rep
-    }
-
-    /// The reason a failed decode is reported with.
-    pub const RESET_REASON: ResetReason = ResetReason::DecoderFailure;
-}
-
-/// What `H264Display::on_events` found in a batch of events.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct FeedReport {
-    /// Frames the decoder failed on: the client sends a reset request for each.
-    pub failed: Vec<u32>,
-    /// Frames decoded to the picture the encoder meant (the 0x0A decoded bits).
-    pub decoded: Vec<u32>,
-    /// Frames decoded to another picture, or not at all (the refused bits).
-    pub refused: Vec<u32>,
-}
-
-impl FeedReport {
-    /// The 0x0A masks for the batch: `(newest, decoded_mask, refused_mask)`,
-    /// bit `i` being frame `newest - i`; frames more than 63 behind the newest
-    /// are left out. `None` for an empty batch.
-    pub fn frame_ack(&self) -> Option<(u32, u64, u64)> {
-        let newest = self.decoded.iter().chain(&self.refused).copied().max()?;
-        let mask = |v: &[u32]| {
-            v.iter()
-                .filter(|&&s| newest - s < 64)
-                .fold(0u64, |m, &s| m | 1 << (newest - s))
-        };
-        Some((newest, mask(&self.decoded), mask(&self.refused)))
+        results
     }
 }
 
@@ -184,7 +135,7 @@ impl FeedReport {
 pub struct H264Run {
     pub truth: PcmLogInner,
     pub display: Vec<DisplayRecord>,
-    /// Decoder failures the client reported with a reset request.
+    /// Decode errors the client core turned into reset requests.
     pub decoder_resets: u32,
     /// The scene's length, for the tail of a freeze.
     pub duration_us: u64,
@@ -384,9 +335,8 @@ pub enum Pattern {
     /// Gilbert-Elliott bursts on the frame path: enter and exit probabilities
     /// per datagram, loss while in the bad state.
     Burst { enter: f64, exit: f64, loss: f64 },
-    /// Loss on the acknowledgement path only (client -> server). The frame
-    /// ack (0x0A) does not exist yet; the acknowledgements the server reads
-    /// today are the per-datagram 0x06 batches, and this is their loss.
+    /// Loss on the acknowledgement path only (client -> server): the 0x06
+    /// batches and the 0x0A frame acks alike.
     AckLoss(f64),
     /// Datagrams reordered within `window_us` on the frame path.
     Reorder { window_us: u64 },
