@@ -20,6 +20,7 @@ pub mod cdf53_tile_state;
 pub mod decode_error_batcher;
 mod event;
 mod frame_assembly;
+pub mod h264_gate;
 pub mod input;
 pub mod loss_tracker;
 pub mod nack_batcher;
@@ -32,6 +33,7 @@ pub mod wire_loss;
 pub use cdf53_coverage::CoverageEntry;
 pub use event::{DecodeErrorCode, Event, PollOutput, TileData, TileKey};
 pub use ghostframe_protocol::feedback_stream::ResetReason;
+pub use h264_gate::{H264Gate, H264Outcome, RefuseCause, ResetCause, Verdict};
 pub use wire_loss::WireLossStats;
 
 use std::collections::{HashMap, VecDeque};
@@ -177,15 +179,20 @@ pub struct ClientCore {
     /// H.264 frame-level reassembly state (keyed by `frame_seq`).
     pub(crate) frame_assemblies: HashMap<u32, FrameAssembly>,
     pub(crate) latest_full_frame_seq: u32,
-    /// Newest H.264 frame handed out as `NeedsH264`; a keyframe older than it
-    /// is not delivered.
-    pub(crate) last_delivered_frame_seq: Option<u32>,
-    /// A P frame arrived whose reference was never delivered: nothing can be
-    /// decoded until the next IDR, so P frames are held back (not delivered)
-    /// and the server was asked for one.
-    pub(crate) awaiting_idr: bool,
-    /// When the last reference-break reset request went out, for pacing.
-    pub(crate) last_ref_reset_us: Option<u64>,
+    /// Decides which completed access units reach the decoder (design 7.1).
+    pub(crate) h264_gate: h264_gate::H264Gate,
+    /// Outcome of the newest handled H.264 frames, reported in frame acks.
+    pub(crate) frame_acks: h264_gate::FrameAckWindow,
+    /// Whether frame acks (0x0A) are sent: the client said so in HELLO.
+    pub(crate) send_frame_acks: bool,
+    /// The decoder failed (or does not exist) and no frame has been fed with
+    /// `reset_decoder` since: everything it reports is untrustworthy.
+    pub(crate) decoder_broken: bool,
+    /// `frame_seq` of the newest frame fed with `reset_decoder`; results for
+    /// older frames came from before the reset.
+    pub(crate) decoder_epoch_start: Option<u32>,
+    pub(crate) h264_not_output_total: u64,
+    pub(crate) h264_not_output_streak: u64,
     /// H.264 fragments rebuilt from XOR parity (cumulative).
     pub(crate) h264_fragments_recovered: u64,
     /// Coverage NACKs awaiting the debounce window before being handed to
@@ -231,9 +238,13 @@ impl ClientCore {
             latest_frame_seq: 0,
             frame_assemblies: HashMap::new(),
             latest_full_frame_seq: 0,
-            last_delivered_frame_seq: None,
-            awaiting_idr: false,
-            last_ref_reset_us: None,
+            h264_gate: h264_gate::H264Gate::new(),
+            frame_acks: h264_gate::FrameAckWindow::new(),
+            send_frame_acks: config.h264_acked_ref,
+            decoder_broken: false,
+            decoder_epoch_start: None,
+            h264_not_output_total: 0,
+            h264_not_output_streak: 0,
             h264_fragments_recovered: 0,
             pending_nacks: std::collections::BTreeMap::new(),
             pending_nack_deadline_us: None,
@@ -288,6 +299,75 @@ impl ClientCore {
             )));
     }
 
+    /// Report what the decoder did with a frame a `NeedsH264` event handed it
+    /// (design 3.5): decoded means a picture with the frame's pts came out of
+    /// the call that consumed it. The frame joins the ack window; the frame ack
+    /// (datagram 0x0A) leaves with the next ack batch (see [`Self::on_timeout`]).
+    ///
+    /// `NotOutput` is reported refused but evicts nothing: the decoder still
+    /// holds the frame. A decode error resets the gate and asks the server for
+    /// an IDR (paced); until a frame fed with `reset_decoder` arrives, every
+    /// frame still in the pipeline is reported refused, since it was decoded
+    /// (or concealed) on a broken decoder. `NoDecoder` is sticky: it is sent
+    /// once.
+    pub fn h264_result(&mut self, frame_seq: u32, outcome: H264Outcome, now_us: u64) {
+        let before_boundary = self.decoder_broken
+            || self
+                .decoder_epoch_start
+                .is_some_and(|e| h264_gate::seq_after(e, frame_seq));
+        match outcome {
+            H264Outcome::Decoded if !before_boundary => {
+                self.h264_not_output_streak = 0;
+                self.frame_acks.record(frame_seq, true, now_us);
+            }
+            H264Outcome::Decoded | H264Outcome::NotOutput => {
+                self.h264_not_output_total += 1;
+                self.h264_not_output_streak += 1;
+                self.frame_acks.record(frame_seq, false, now_us);
+            }
+            H264Outcome::DecodeError => {
+                self.decoder_broken = true;
+                self.h264_gate
+                    .reset(ResetCause::DecoderFailure, frame_seq, now_us);
+                self.frame_acks.record(frame_seq, false, now_us);
+            }
+            H264Outcome::NoDecoder => {
+                self.decoder_broken = true;
+                self.h264_gate
+                    .reset(ResetCause::NoDecoder, frame_seq, now_us);
+                self.frame_acks.record(frame_seq, false, now_us);
+            }
+        }
+        self.after_gate();
+    }
+
+    /// Frames the decoder consumed without a same-call picture: the total, and
+    /// the run since the last frame that did produce one. A long run while the
+    /// decoder keeps producing older pictures is a decoder with output delay,
+    /// which the zero-delay assumption of the frame ack (design 3.5) does not
+    /// cover: every frame is reported refused although the stream plays.
+    pub fn h264_not_output_stats(&self) -> (u64, u64) {
+        (self.h264_not_output_total, self.h264_not_output_streak)
+    }
+
+    /// Queue the reset request the gate wants sent.
+    pub(crate) fn after_gate(&mut self) {
+        if let Some((reason, frame_seq)) = self.h264_gate.take_request() {
+            self.request_reset(reason, frame_seq);
+        }
+    }
+
+    /// Queue the frame ack after the ack batch just queued, so both leave in
+    /// one drain and share a QUIC packet. A frame ack of its own would be an
+    /// extra ack-eliciting packet that carries quinn's pending ACK frame to the
+    /// server early, which changes the server's bandwidth loop (it reads
+    /// deliveries sooner); riding the batch changes nothing it can see.
+    fn push_frame_ack(&mut self, ack: ghostframe_protocol::protocol::FrameAck) {
+        let mut buf = Vec::with_capacity(ghostframe_protocol::protocol::FRAME_ACK_SIZE);
+        ack.encode(&mut buf);
+        self.outbox.push_back(PollOutput::Datagram(buf));
+    }
+
     /// Drain one pending outbound message; call until None.
     pub fn poll_transmit(&mut self, _now_us: u64) -> Option<PollOutput> {
         self.outbox.pop_front()
@@ -309,6 +389,13 @@ impl ClientCore {
             deadline = deadline.min(n);
         }
         if let Some(d) = self.pending_nack_deadline_us {
+            deadline = deadline.min(d);
+        }
+        if let Some(d) = self
+            .frame_acks
+            .poll_timeout()
+            .filter(|_| self.send_frame_acks)
+        {
             deadline = deadline.min(d);
         }
         Some(deadline)
@@ -580,6 +667,15 @@ impl ClientCore {
     pub fn on_timeout(&mut self, now_us: u64) -> Vec<Event> {
         if let Some(dg) = self.ack_batcher.on_timeout(now_us) {
             self.outbox.push_back(PollOutput::Datagram(dg));
+            if self.send_frame_acks {
+                if let Some(ack) = self.frame_acks.take_due(now_us) {
+                    self.push_frame_ack(ack);
+                }
+            }
+        } else if self.send_frame_acks {
+            if let Some(ack) = self.frame_acks.take_overdue(now_us) {
+                self.push_frame_ack(ack);
+            }
         }
         if let Some(dg) = self.nack_batcher.on_timeout(now_us) {
             self.outbox.push_back(PollOutput::Datagram(dg));

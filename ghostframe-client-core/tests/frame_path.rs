@@ -43,6 +43,7 @@ fn h264_frame_reassembles_to_needs_h264() {
             ref_frame_seq: REF_FRAME_NONE,
             flags: FRAME_FLAG_IDR,
             slots: 0,
+            reset_decoder: true,
             payload: p,
         }] => {
             assert_eq!(p, &payload);
@@ -130,7 +131,8 @@ fn h264_v2_reference_info_reaches_the_event() {
     let payload: Vec<u8> = (0..2500u32).map(|i| (i % 251) as u8).collect();
     let info = FrameRefInfo {
         flags: 0x04 | 0x08, // mark_lt | target_is_lt
-        slots: 0b0111,
+        // mark slot 1, target slot 0: the IDR (41) holds slot 0.
+        slots: 0b0001,
         ref_frame_seq: 41,
     };
     // The reference (frame 41) was delivered: a P frame whose reference never
@@ -150,7 +152,8 @@ fn h264_v2_reference_info_reaches_the_event() {
             is_keyframe: false,
             ref_frame_seq: 41,
             flags: 0x0C,
-            slots: 0b0111,
+            slots: 0b0001,
+            reset_decoder: false,
             payload: p,
             ..
         }] => assert_eq!(p, &payload),

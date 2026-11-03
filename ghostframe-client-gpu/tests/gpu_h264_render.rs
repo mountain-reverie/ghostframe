@@ -149,6 +149,7 @@ fn a_decoded_frame_lands_in_the_framebuffer() {
                     ref_frame_seq: u32::MAX,
                     flags: 0,
                     slots: 0,
+                    reset_decoder: i == 0,
                     payload: au.clone(),
                 },
             )
@@ -257,6 +258,7 @@ fn run_decode_and_publish_timing(paced: bool) {
                     ref_frame_seq: u32::MAX,
                     flags: 0,
                     slots: 0,
+                    reset_decoder: i == 0,
                     payload: au.clone(),
                 },
             )
@@ -561,6 +563,7 @@ fn drive_clip(renderer: &mut Renderer, ctx: &WgpuContext, clip: &[Vec<u8>], star
                     ref_frame_seq: u32::MAX,
                     flags: 0,
                     slots: 0,
+                    reset_decoder: i == 0,
                     payload: au.clone(),
                 },
             )

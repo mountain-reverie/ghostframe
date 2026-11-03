@@ -996,7 +996,8 @@ impl FrameAck {
     }
 
     fn bit(&self, mask: u64, seq: u32) -> bool {
-        let back = self.newest_seq.wrapping_sub(seq);
+        // 31-bit serial order, as frame_seq is everywhere else.
+        let back = self.newest_seq.wrapping_sub(seq) & 0x7FFF_FFFF;
         back < 64 && (mask >> back) & 1 == 1
     }
 }
