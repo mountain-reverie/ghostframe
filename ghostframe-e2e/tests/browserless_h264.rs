@@ -46,6 +46,9 @@ fn load(idr_bytes: usize, p_bytes: usize) -> H264Load {
         height: 720,
         quiet: None,
         cbr: None,
+        pcm: None,
+        pcm_wrong_ref_every: 0,
+        tile_phases: [None, None],
     }
 }
 

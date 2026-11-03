@@ -17,6 +17,7 @@ pub mod e2e_setup;
 pub mod failure_dump;
 pub mod fixtures;
 pub mod framebuffer;
+pub mod h264_scene;
 pub mod load_profile;
 pub mod net_shape;
 pub mod pixels;

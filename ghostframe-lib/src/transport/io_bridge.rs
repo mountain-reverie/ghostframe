@@ -411,8 +411,9 @@ pub struct InjectedFrame {
 /// nothing is encoded: the payload is `idr_bytes` or `p_bytes` of
 /// deterministic filler and the "encoder" makes an IDR exactly when the bridge
 /// asked for one (or on the optional scripted GOP). The client reassembles
-/// and reports `NeedsH264`; it decodes nothing. What this cannot show is
-/// anything about picture content: that needs the Phase B PCM writer.
+/// and reports `NeedsH264`. With `pcm` unset the payload is filler and nothing
+/// can be said about picture content; with `pcm` set it is a real stream that
+/// a decoder shows (design T3).
 #[derive(Debug, Clone, Copy)]
 pub struct InjectedH264 {
     /// Payload bytes of an IDR and of a P frame.
@@ -429,6 +430,22 @@ pub struct InjectedH264 {
     /// `p_bytes` and `gop_frames` are then unused). `None` for the fixed-size
     /// scripted encoder.
     pub cbr: Option<InjectedCbr>,
+    /// Real PCM-patch streams in place of filler (see
+    /// [`crate::encoder::h264_harness`]): the payload decodes, and the bridge's
+    /// frame sizes are `idr_bytes` and `p_bytes` (padded with filler NAL units
+    /// up to them; 0 for the natural size). Not combined with `cbr`.
+    #[cfg(feature = "browserless-harness")]
+    pub pcm: Option<crate::encoder::h264_harness::PcmMode>,
+    /// A deliberate defect in the `Legacy` PCM source, for proving the client
+    /// side notices: every this many frames a P frame is written as a
+    /// non-reference picture while the truth log still counts it as the next
+    /// frame's reference, so the stream predicts from another picture than the
+    /// one the encoder meant. 0 for none.
+    #[cfg(feature = "browserless-harness")]
+    pub pcm_wrong_ref_every: u32,
+    /// The scene's frame period, for the `RefManager`'s decode deadlines.
+    #[cfg(feature = "browserless-harness")]
+    pub pcm_cadence_us: u64,
 }
 
 /// The scripted CBR encoder of [`InjectedH264::cbr`]: a P frame is
@@ -2164,6 +2181,10 @@ impl IoBridge {
                     "client reports H.264 decoder failure; requesting an IDR"
                 );
                 self.request_h264_idr(IdrCause::ClientReset, now);
+                #[cfg(feature = "browserless-harness")]
+                if let Some(p) = self.h264.pcm.as_mut() {
+                    p.client_reset();
+                }
             }
             ResetReason::Resolution | ResetReason::NoDecoder | ResetReason::GateReset => {
                 tracing::debug!(

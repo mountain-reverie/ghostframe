@@ -2,7 +2,10 @@
 
 // Wired into the encoder and io_bridge by B5; until then only its tests call it.
 #[allow(dead_code)]
-mod h264;
+pub(crate) mod h264;
+// The PCM-patch source of the browserless harness (design T3).
+#[cfg(feature = "browserless-harness")]
+pub use h264::harness as h264_harness;
 mod h264_tile;
 pub mod h264_vaapi;
 

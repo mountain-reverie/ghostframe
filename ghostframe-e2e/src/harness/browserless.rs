@@ -69,6 +69,7 @@ use tokio::time::Instant as TokioInstant;
 
 use ghostframe_client_core::Event as CoreEvent;
 use ghostframe_client_net::{ClientNet, ClientNetConfig, ClientNetEvent};
+use ghostframe_lib::encoder::h264_harness::PcmMode;
 use ghostframe_lib::transport::ghostbridge::encode_frame;
 use ghostframe_lib::transport::io_bridge::{
     mem_stream_pair, H264Report, InjectedCbr, InjectedFrame, InjectedH264, IoBridge, MemStream,
@@ -171,6 +172,27 @@ pub struct H264Load {
     /// rate policy runs and frame sizes follow the rate it sets
     /// (`idr_bytes`, `p_bytes` and `gop_frames` are then unused).
     pub cbr: Option<InjectedCbr>,
+    /// Real PCM-patch streams in place of filler, from this source (design
+    /// T3). The client then decodes what it is given and the result carries
+    /// the truth log and the client's records ([`BrowserlessResult::h264_pcm`]).
+    /// `idr_bytes` and `p_bytes` become padded frame sizes.
+    pub pcm: Option<PcmMode>,
+    /// See `InjectedH264::pcm_wrong_ref_every`: a deliberate defect.
+    pub pcm_wrong_ref_every: u32,
+    /// Frame index ranges `[from, to)` in which the screen is drawn by the
+    /// tile codec instead: one solid tile changes per frame. Entering one
+    /// abandons the H.264 frames in flight, leaving it is a re-entry.
+    pub tile_phases: [Option<(usize, usize)>; 2],
+}
+
+impl H264Load {
+    /// Whether frame `i` is drawn by the tile codec.
+    pub fn in_tile_phase(&self, i: usize) -> bool {
+        self.tile_phases
+            .iter()
+            .flatten()
+            .any(|&(from, to)| (from..to).contains(&i))
+    }
 }
 
 /// A netsim scene to run browserlessly: a real `IoBridge` <-> `ClientNet`
@@ -591,6 +613,9 @@ pub struct BrowserlessResult {
     /// scene: IDRs by cause, verdicts, hold time, skipped frames, the ledger
     /// accounting. All zero in a tile scene.
     pub h264: H264Report,
+    /// For a scene with a PCM source ([`H264Load::pcm`]): what each frame was
+    /// meant to show and what the client's decoder made of what it was given.
+    pub h264_pcm: Option<crate::harness::h264_scene::H264Run>,
     /// The reliable emitter's full counters at the end of the scene, for the
     /// ones `BrowserlessResult` has no field of its own for (`pto_fires`,
     /// the `h264_*` resend counters).
@@ -1055,6 +1080,7 @@ async fn run_inner(
     let transport_probe_cell = bridge.transport_probe_publish_handle();
     let send_errs_cell = bridge.send_errs_publish_handle();
     let h264_cell = bridge.h264_stats_publish_handle();
+    let pcm_log = bridge.h264_pcm_log_handle();
     // Same ownership problem, opposite direction: this `Arc` originates
     // here (it already holds `scene.drops`'s rules), and `set_drop_plan`
     // installs it into the bridge so `send_to_all_sessions` can consult it
@@ -1116,6 +1142,12 @@ async fn run_inner(
     };
 
     let mut framebuffer = FrameBuffer::new();
+    let mut h264_display = match &scene.load {
+        SceneLoad::H264(h) if h.pcm.is_some() => {
+            Some(crate::harness::h264_scene::H264Display::new().with_truth(pcm_log.clone()))
+        }
+        _ => None,
+    };
     let mut s2c_loss = S2cLoss::default();
     let mut bwe_estimate_samples: Vec<(u64, u64)> = Vec::new();
     let mut injections: Vec<(u64, bool)> = Vec::new();
@@ -1142,6 +1174,7 @@ async fn run_inner(
         &server_live_rx,
         &links,
         &mut s2c_loss,
+        &mut h264_display,
         opts,
     )
     .await;
@@ -1193,6 +1226,34 @@ async fn run_inner(
         .frame_drops()
         .to_vec();
     let h264 = *h264_cell.lock().expect("h264_stats_publish mutex poisoned");
+    let h264_pcm = h264_display.map(|d| {
+        let truth = std::mem::take(&mut *pcm_log.lock().expect("pcm log poisoned"));
+        crate::harness::h264_scene::H264Run {
+            truth,
+            decoder_resets: d.resets,
+            display: d.records,
+            duration_us: scene.duration.as_micros() as u64,
+            tile_windows: match &scene.load {
+                SceneLoad::H264(h) => h
+                    .tile_phases
+                    .iter()
+                    .flatten()
+                    .map(|&(from, to)| {
+                        let at = |i: usize| injections.get(i).map(|x| x.0);
+                        (
+                            at(from).unwrap_or(u64::MAX),
+                            at(to).unwrap_or(scene.duration.as_micros() as u64),
+                        )
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            },
+            cadence_us: match &scene.load {
+                SceneLoad::H264(h) => h.cadence_us,
+                _ => scene.cadence_us,
+            },
+        }
+    });
 
     // Pair each write with the read of the same packet by position: the
     // socketpair is a FIFO and the inbound arm takes one packet per turn.
@@ -1294,6 +1355,7 @@ async fn run_inner(
         drops_fired,
         frame_drops_fired,
         h264,
+        h264_pcm,
         emitter_stats,
     })
 }
@@ -1334,6 +1396,7 @@ async fn drive_session(
     server_live_rx: &tokio::sync::watch::Receiver<usize>,
     links: &LinkOverrides,
     s2c_loss: &mut S2cLoss,
+    h264_display: &mut Option<crate::harness::h264_scene::H264Display>,
     opts: RunOptions,
 ) -> anyhow::Result<(Vec<ClientNetEvent>, u64, u64, u64, u64, u64, ClientProbe)> {
     let seed = scene.seed;
@@ -1408,8 +1471,23 @@ async fn drive_session(
         // One empty script per tick for the whole duration: the frames carry
         // no tiles, `inject_frame` turns each into a scripted H.264 frame.
         SceneLoad::H264(h) => {
-            generated = (0..scene.duration.as_micros() as u64 / h.cadence_us)
-                .map(|_| FrameScript { tiles: Vec::new() })
+            generated = (0..(scene.duration.as_micros() as u64 / h.cadence_us) as usize)
+                .map(|i| {
+                    if h.in_tile_phase(i) {
+                        // The tile codec's stretch: one solid tile changes
+                        // per frame.
+                        FrameScript {
+                            tiles: vec![(
+                                (0, 0),
+                                TileSpec::Solid {
+                                    bgra: [(i * 7) as u8, 0x40, 0x80, 0xFF],
+                                },
+                            )],
+                        }
+                    } else {
+                        FrameScript { tiles: Vec::new() }
+                    }
+                })
                 .collect();
             &generated
         }
@@ -1426,11 +1504,16 @@ async fn drive_session(
             width: h.width,
             height: h.height,
             cbr: h.cbr,
+            pcm: h.pcm,
+            pcm_wrong_ref_every: h.pcm_wrong_ref_every,
+            pcm_cadence_us: h.cadence_us,
         }),
         SceneLoad::Script(_) | SceneLoad::Profile(_) => None,
     };
 
     let mut events: Vec<ClientNetEvent> = Vec::new();
+    let mut pending_frame_acks: std::collections::VecDeque<(u64, (u32, u64, u64))> =
+        std::collections::VecDeque::new();
     let mut bytes_delivered: u64 = 0;
     let mut bytes_delivered_s2c: u64 = 0;
     let mut bytes_delivered_c2s: u64 = 0;
@@ -1679,6 +1762,26 @@ async fn drive_session(
                 framebuffer.apply_tile_ready(*frame_seq, *tile_x, *tile_y, rgba.clone());
             }
         }
+        if let Some(d) = h264_display.as_mut() {
+            // The legacy client decodes what the core hands it and, as the
+            // renderer does, asks for an IDR when the decoder fails. The
+            // modelled frame ack (0x0A) reaches the server one one-way delay
+            // later.
+            let t = now_us(base);
+            let rep = d.on_events(t, &new_events);
+            for seq in &rep.failed {
+                d.resets += 1;
+                client.request_reset(
+                    crate::harness::h264_scene::H264Display::RESET_REASON,
+                    *seq,
+                    t,
+                );
+            }
+            if let Some(ack) = rep.frame_ack() {
+                let c2s_delay = links.c2s.as_ref().unwrap_or(&scene.net).delay_us;
+                pending_frame_acks.push_back((t + c2s_delay, ack));
+            }
+        }
         events.extend(new_events);
 
         if !session_ready && events.contains(&ClientNetEvent::SessionReady) {
@@ -1732,6 +1835,8 @@ async fn drive_session(
                             h264_script.filter(|_| {
                                 !quiet_frames
                                     .is_some_and(|(from, to)| (from..to).contains(&next_frame_idx))
+                                    && !matches!(&scene.load, SceneLoad::H264(h)
+                                        if h.in_tile_phase(next_frame_idx))
                             }),
                         )
                         .await
@@ -1779,6 +1884,20 @@ async fn drive_session(
                     next_inject_at_us = Some(due_at + spacing_us);
                     moved = true;
                 }
+            }
+        }
+
+        // The modelled frame acks that have arrived (stepped mode only: the
+        // concurrent bridge is a task this loop cannot reach).
+        if let Some(bridge) = bridge.as_deref_mut() {
+            while pending_frame_acks
+                .front()
+                .is_some_and(|&(due, _)| due <= now_us(base))
+            {
+                let (_, (newest, decoded, refused)) =
+                    pending_frame_acks.pop_front().expect("checked");
+                bridge.harness_frame_ack(newest, decoded, refused);
+                moved = true;
             }
         }
 

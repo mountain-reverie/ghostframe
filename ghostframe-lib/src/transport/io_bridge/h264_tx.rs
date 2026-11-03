@@ -381,6 +381,12 @@ impl FrameTracker {
         }
     }
 
+    /// Fragments the frame was sent in, if it is still tracked.
+    #[cfg(feature = "browserless-harness")]
+    pub(super) fn frags_total(&self, frame_seq: u32) -> Option<u16> {
+        self.get(frame_seq).map(|f| f.frags_total)
+    }
+
     #[cfg(test)]
     pub(super) fn is_complete(&self, frame_seq: u32) -> Option<bool> {
         self.get(frame_seq).map(|f| f.complete())
@@ -460,6 +466,11 @@ pub(super) struct H264Tx {
     pub(super) last_cut_at: Option<std::time::Instant>,
     /// The harness's scripted CBR encoder, if the scene asked for one.
     pub(super) scripted: Option<super::h264_rate::ScriptedCbr>,
+    /// The harness's PCM-patch source and the log the scene reads (design T3).
+    #[cfg(feature = "browserless-harness")]
+    pub(super) pcm: Option<crate::encoder::h264::harness::PcmSource>,
+    #[cfg(feature = "browserless-harness")]
+    pub(super) pcm_log: crate::encoder::h264_harness::PcmLog,
 }
 
 impl H264Tx {
@@ -486,6 +497,10 @@ impl H264Tx {
         self.rate.reset_session();
         self.last_idr_at = None;
         self.pad_template = None;
+        #[cfg(feature = "browserless-harness")]
+        if let Some(p) = self.pcm.as_mut() {
+            p.session_reset();
+        }
     }
 }
 
@@ -737,10 +752,18 @@ impl IoBridge {
                 }
             }
             self.reliable_emitter.on_h264_ack(frame_seq, frag_idx);
+            #[cfg(feature = "browserless-harness")]
+            if let Some(p) = self.h264.pcm.as_mut() {
+                p.frag_acked(frame_seq, frag_idx, now);
+            }
             if let FragAck::Acked { complete: true } =
                 self.h264.tracker.on_frag_acked(frame_seq, frag_idx)
             {
                 self.on_h264_frame_acked(frame_seq, now);
+                #[cfg(feature = "browserless-harness")]
+                if let Some(p) = self.h264.pcm.as_mut() {
+                    p.frame_complete(frame_seq);
+                }
             }
         }
     }
@@ -786,6 +809,19 @@ impl IoBridge {
         self.h264.stats.verdicts_p_frag += 1;
         if in_burst {
             self.h264.stats.p_verdicts_in_probe += 1;
+        }
+        // The harness's `RefManager` source owns recovery: the verdict makes
+        // the frame suspect there and the interim loss IDR below is not made.
+        // (B5 deletes the interim path for explicit-reference backends.)
+        #[cfg(feature = "browserless-harness")]
+        if let Some(p) = self
+            .h264
+            .pcm
+            .as_mut()
+            .filter(|p| p.mode() == crate::encoder::h264_harness::PcmMode::RefManager)
+        {
+            p.frame_suspect(frame_seq);
+            return;
         }
         if f.suspect {
             return;
@@ -954,6 +990,8 @@ impl IoBridge {
             return;
         };
         let now = now_std();
+        #[cfg(feature = "browserless-harness")]
+        self.note_injected_h264_mode();
         // The classifier is not in this scripted path; the flag still is.
         self.update_h264_stall(now);
         self.emit_frame_dimensions(seq, timestamp_us, h.width, h.height);
@@ -961,6 +999,11 @@ impl IoBridge {
             // Skipped: the admission pass still runs, as it does for a frame
             // the production gate drops (the loop turns on regardless).
             self.pump_admission();
+            return;
+        }
+        #[cfg(feature = "browserless-harness")]
+        if let Some(mode) = h.pcm {
+            self.apply_injected_pcm(seq, timestamp_us, h, mode, max_dg_size, now);
             return;
         }
         let (is_idr, len) = if let Some(cbr) = h.cbr {
@@ -1017,6 +1060,145 @@ impl IoBridge {
             seq,
             max_dg_size,
         );
+    }
+
+    /// The injected stream is in H.264 mode now. Coming back from a stretch of
+    /// tile frames the next frame is a re-entry IDR, as on the capture path
+    /// (`finish_h264_arm`); the first H.264 frame of the scene is not one.
+    #[cfg(feature = "browserless-harness")]
+    fn note_injected_h264_mode(&mut self) {
+        let prev = std::mem::replace(&mut self.frame_mode, crate::tile::FrameMode::H264);
+        if prev == crate::tile::FrameMode::TileCodec && self.h264.stats.frames_sent > 0 {
+            self.name_reentry_idr();
+            if let Some(p) = self.h264.pcm.as_mut() {
+                p.mode_reentry();
+            }
+        }
+    }
+
+    /// The modelled frame ack (see [`crate::encoder::h264_harness`]): the
+    /// client's decoded and refused frames, as 0x0A masks.
+    #[cfg(feature = "browserless-harness")]
+    pub fn harness_frame_ack(&mut self, newest: u32, decoded: u64, refused: u64) {
+        if let Some(p) = self.h264.pcm.as_mut() {
+            p.frame_ack(newest, decoded, refused);
+        }
+    }
+
+    /// The log of the PCM source: what each frame was meant to show, and the
+    /// `RefManager`'s counters. Read it after the scene.
+    #[cfg(feature = "browserless-harness")]
+    pub fn h264_pcm_log_handle(&self) -> crate::encoder::h264_harness::PcmLog {
+        self.h264.pcm_log.clone()
+    }
+
+    /// A scripted H.264 frame whose payload is a real PCM-patch stream (see
+    /// [`crate::encoder::h264_harness`]). Past the production gate, the frame
+    /// goes through the same `send_h264_frame` as every other.
+    #[cfg(feature = "browserless-harness")]
+    fn apply_injected_pcm(
+        &mut self,
+        seq: u32,
+        timestamp_us: u32,
+        h: InjectedH264,
+        mode: crate::encoder::h264_harness::PcmMode,
+        max_dg_size: usize,
+        now: std::time::Instant,
+    ) {
+        use crate::encoder::h264::harness::{pad_to, PcmSource};
+        use crate::encoder::h264_harness::PcmMode;
+        let meta = frame::FrameMeta {
+            width: h.width,
+            height: h.height,
+            stride: h.width * 4,
+            timestamp_us,
+            capture_done_ns: 0,
+            unchanged: false,
+        };
+        let log = self.h264.pcm_log.clone();
+        let source = self.h264.pcm.get_or_insert_with(|| {
+            PcmSource::new(
+                mode,
+                log,
+                std::time::Duration::from_micros(h.pcm_cadence_us),
+            )
+        });
+        source.set_wrong_ref_every(h.pcm_wrong_ref_every);
+        assert_eq!(
+            source.mode(),
+            mode,
+            "a scene does not change its PCM source midway"
+        );
+        match mode {
+            PcmMode::Legacy => {
+                let periodic = h.gop_frames > 0
+                    && self
+                        .h264
+                        .stats
+                        .frames_sent
+                        .is_multiple_of(u64::from(h.gop_frames));
+                let asked =
+                    self.h264.pending_idr.is_some() || periodic || self.h264.stats.frames_sent == 0;
+                let (mut payload, is_idr) = source.legacy_frame(seq, asked);
+                pad_to(&mut payload, if is_idr { h.idr_bytes } else { h.p_bytes });
+                self.send_h264_frame(
+                    H264Out {
+                        payload,
+                        is_keyframe: is_idr,
+                    },
+                    &meta,
+                    seq,
+                    max_dg_size,
+                );
+            }
+            PcmMode::RefManager => {
+                let srtt = self.reliable_emitter.rtt.srtt();
+                let Some(mut planned) = source.plan_frame(seq, now, srtt) else {
+                    // The epoch's IDR is still being delivered.
+                    self.pump_admission();
+                    return;
+                };
+                pad_to(
+                    &mut planned.encoded.payload,
+                    if planned.encoded.is_idr {
+                        h.idr_bytes
+                    } else {
+                        h.p_bytes
+                    },
+                );
+                if planned.encoded.is_idr {
+                    // Attribute the IDR the manager decided on.
+                    let cause = match planned.cause() {
+                        Some(crate::encoder::h264::refs::IdrCause::ResolutionChange) => {
+                            IdrCause::Resolution
+                        }
+                        Some(crate::encoder::h264::refs::IdrCause::ClientReset) => {
+                            IdrCause::ClientReset
+                        }
+                        Some(crate::encoder::h264::refs::IdrCause::EncoderFault) => IdrCause::Loss,
+                        Some(crate::encoder::h264::refs::IdrCause::SessionStart) | None => {
+                            IdrCause::Session
+                        }
+                    };
+                    self.expect_h264_idr(cause);
+                }
+                let info = planned.encoded.info;
+                self.send_h264_frame_described(
+                    H264Out {
+                        payload: std::mem::take(&mut planned.encoded.payload),
+                        is_keyframe: planned.encoded.is_idr,
+                    },
+                    &meta,
+                    seq,
+                    max_dg_size,
+                    Some(info),
+                );
+                let frags = self.h264.tracker.frags_total(seq).unwrap_or(1);
+                if let Some(p) = self.h264.pcm.as_mut() {
+                    p.plan_sent(&planned, frags, now);
+                }
+            }
+        }
     }
 
     /// Forget the H.264 state of the session that ended: tracker, hold,
