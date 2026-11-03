@@ -62,6 +62,9 @@ struct Script {
     cumulative: bool,
     strip_rplm: bool,
     strip_mmco1: bool,
+    /// Fragments in an IDR; a lost-free IDR acknowledges them evenly between
+    /// its first ack and its delivery.
+    idr_frags: u16,
 }
 
 impl Script {
@@ -78,6 +81,7 @@ impl Script {
             cumulative: false,
             strip_rplm: false,
             strip_mmco1: false,
+            idr_frags: 1,
         }
     }
 
@@ -112,6 +116,7 @@ enum Ev {
         refused: u64,
     },
     Verdict(u32),
+    FragAck(u32, u16),
 }
 
 /// The client gate of design 7.1, from the wire alone.
@@ -167,6 +172,8 @@ struct Sim {
     /// Assert the properties a correct stream has; the negative controls
     /// turn this off.
     strict: bool,
+    /// Frames the manager held back while the IDR was being delivered.
+    holds: usize,
 }
 
 impl Sim {
@@ -182,6 +189,7 @@ impl Sim {
             max_client_peak: 0,
             max_enc_peak: 0,
             strict: true,
+            holds: 0,
         }
     }
 
@@ -318,12 +326,21 @@ impl Sim {
                         refused,
                     } => self.mgr.frame_ack(newest, decoded, refused),
                     Ev::Verdict(s) => self.mgr.frame_suspect(s),
+                    Ev::FragAck(s, i) => {
+                        self.mgr.frag_acked(s, i, now);
+                    }
                 }
             }
 
             self.mgr.tick(now, (sc.srtt)(step));
             seq += sc.seq_stride;
-            let plan = self.mgr.plan_next(seq, now);
+            let plan = match self.mgr.plan_next(seq, now) {
+                Plan::Frame(p) => p,
+                Plan::Hold => {
+                    self.holds += 1;
+                    continue;
+                }
+            };
 
             let mut header = plan.slice_header(&p);
             if sc.strip_rplm {
@@ -360,7 +377,16 @@ impl Sim {
             let epoch_before = self.mgr.epoch();
             let report = self
                 .mgr
-                .frame_sent(&plan, &parsed, 1, now)
+                .frame_sent(
+                    &plan,
+                    &parsed,
+                    if plan.kind == PicKind::Idr {
+                        sc.idr_frags
+                    } else {
+                        1
+                    },
+                    now,
+                )
                 .expect("a plan from the current epoch");
             self.max_enc_peak = self.max_enc_peak.max(report.effective.dpb_peak);
             if strict {
@@ -414,6 +440,13 @@ impl Sim {
                     self.queue.push((step + 2 * sc.delay + 2, Ev::Verdict(seq)));
                 }
             } else {
+                if plan.kind == PicKind::Idr {
+                    let n = usize::from(sc.idr_frags);
+                    for i in 0..n {
+                        let due = step + sc.delay + fate.jitter * (i + 1) / n;
+                        self.queue.push((due, Ev::FragAck(seq, i as u16)));
+                    }
+                }
                 self.queue.push((
                     step + sc.delay + fate.jitter,
                     Ev::Deliver {
@@ -460,10 +493,14 @@ impl Hand {
     fn send(&mut self, step: u32) -> FramePlan {
         self.seq += 1;
         let now = self.at(step);
-        let plan = self.m.plan_next(self.seq, now);
+        let plan = self.m.plan_next(self.seq, now).frame();
         let h = plan.slice_header(&params());
         let r = self.m.frame_sent(&plan, &h, 1, now).unwrap();
         assert!(r.matched, "{plan:?} {:?}", r.effective);
+        if plan.kind == PicKind::Idr {
+            // One fragment, transport-acked at once.
+            self.m.frag_acked(plan.frame_seq, 0, now);
+        }
         plan
     }
 }
@@ -873,7 +910,7 @@ fn a_refused_idr_is_sent_again_with_its_original_cause() {
     };
     assert_eq!(idr.idr_cause, Some(IdrCause::ClientReset));
     h.m.frame_refused(idr.frame_seq);
-    let again = h.m.plan_next(10, h.at(2));
+    let again = h.m.plan_next(10, h.at(2)).frame();
     assert_eq!(
         (again.kind, again.idr_cause),
         (PicKind::Idr, Some(IdrCause::ClientReset))
@@ -1035,7 +1072,7 @@ fn chain_breaks_before_any_anchor_probe_the_idr_instead_of_waiting() {
     assert_eq!(probe.nal_ref_idc, 0);
     // A silent IDR is sent again after three decode deadlines.
     h.m.tick(h.at(100), STEP * 4);
-    let again = h.m.plan_next(50, h.at(100));
+    let again = h.m.plan_next(50, h.at(100)).frame();
     assert_eq!(again.kind, PicKind::Idr);
 }
 
@@ -1108,7 +1145,7 @@ fn tile_to_h264_reentry_is_a_reroot_from_the_anchor_or_the_idr_path() {
 fn a_stale_epoch_plan_is_ignored() {
     let mut m = RefManager::new(config());
     let t0 = Instant::now();
-    let idr = m.plan_next(1, t0);
+    let idr = m.plan_next(1, t0).frame();
     m.resolution_change();
     assert!(m
         .frame_sent(&idr, &idr.slice_header(&params()), 1, t0)
@@ -1128,7 +1165,7 @@ fn a_mismatched_frame_is_dead_never_prev_and_three_restart_the_stream() {
     for n in 1..=3u32 {
         h.seq += 1;
         let now = h.at(n);
-        let plan = h.m.plan_next(h.seq, now);
+        let plan = h.m.plan_next(h.seq, now).frame();
         // The encoder ignores the plan and names an empty long-term slot.
         let mut bad = plan.slice_header(&params());
         bad.rplm = vec![Rplm::Long(1)];
@@ -1151,7 +1188,7 @@ fn a_mismatched_or_dropped_frame_never_becomes_prev() {
     // An encoded-then-dropped reference frame is in the encoder's DPB only.
     h.seq += 1;
     let now = h.at(2);
-    let dropped = h.m.plan_next(h.seq, now);
+    let dropped = h.m.plan_next(h.seq, now).frame();
     h.m.frame_dropped(&dropped, &dropped.slice_header(&params()), now);
     assert_eq!(h.m.frame_state(dropped.frame_seq), Some(FrameState::Dead));
     // The client never gets it and would gap-fill over its frame_num, so the
@@ -1274,8 +1311,10 @@ fn poc_stays_monotonic_across_the_16_bit_lsb_wrap() {
 
 /// (lose, ack_extra, spurious, no_verdict, suppress_ack, jitter)
 type FateRow = (bool, u8, bool, bool, bool, u8);
-/// (delay, fates, loss_until, seq_stride, cumulative, srtt_ms_base)
-type ScriptParams = (usize, Vec<FateRow>, usize, u32, bool, u64);
+/// (delay, fates, loss_until, seq_stride, cumulative, srtt_ms_base, slow_idr)
+/// `slow_idr` is 0 for a prompt IDR, else the extra steps (80 or more, so
+/// more than 750 ms) its 8 fragments take to arrive and decode.
+type ScriptParams = (usize, Vec<FateRow>, usize, u32, bool, u64, usize);
 
 fn arb_script() -> impl Strategy<Value = ScriptParams> {
     (
@@ -1295,6 +1334,7 @@ fn arb_script() -> impl Strategy<Value = ScriptParams> {
         1u32..4,
         any::<bool>(),
         10u64..60,
+        prop_oneof![Just(0usize), 80usize..130],
     )
 }
 
@@ -1310,15 +1350,24 @@ proptest! {
     /// once losses stop the stream settles to healthy frames the client
     /// decodes.
     #[test]
-    fn plans_match_effective_references_over_random_loss((delay, fates, loss_until, stride, cumulative, srtt_ms) in arb_script()) {
-        let mut sc = Script::new(400, move |step, _| {
+    fn plans_match_effective_references_over_random_loss((delay, fates, loss_until, stride, cumulative, srtt_ms, slow_idr) in arb_script()) {
+        let mut sc = Script::new(700, move |step, plan| {
+            let slow = if plan.kind == PicKind::Idr && slow_idr > 0 {
+                Some(slow_idr)
+            } else {
+                None
+            };
             if step >= loss_until {
-                return Fate::default();
+                return Fate {
+                    jitter: slow.unwrap_or(0),
+                    ..Fate::default()
+                };
             }
             let (lose, extra, spurious, nov, supp, jitter) = fates[step % fates.len()];
             Fate {
-                lose,
-                jitter: usize::from(jitter),
+                // An IDR can be lost early on; later ones always arrive.
+                lose: lose && (plan.kind != PicKind::Idr || step < 100),
+                jitter: slow.unwrap_or(usize::from(jitter)),
                 ack_extra: usize::from(extra),
                 suppress_ack: supp && step < 100,
                 spurious_verdict: spurious,
@@ -1328,6 +1377,9 @@ proptest! {
         sc.delay = delay;
         sc.seq_stride = stride;
         sc.cumulative = cumulative;
+        if slow_idr > 0 {
+            sc.idr_frags = 8;
+        }
         sc.srtt = Box::new(move |step| Duration::from_millis(srtt_ms + (step as u64 % 7) * 3));
         let mut sim = Sim::new();
         sim.run(&mut sc, true);
@@ -1345,8 +1397,8 @@ proptest! {
             }
         }
         prop_assert!(sim.mgr.is_healthy());
-        let tail: Vec<&Logged> = sim.log.iter().filter(|l| (350..395).contains(&l.step)).collect();
-        prop_assert!(!tail.is_empty());
+        let tail: Vec<&Logged> = sim.log.iter().filter(|l| (650..695).contains(&l.step)).collect();
+        prop_assert!(!tail.is_empty(), "params {:?} holds {} stats {:?} log {} last {:?}", (delay, loss_until, stride, cumulative, srtt_ms, slow_idr), sim.holds, st, sim.log.len(), sim.log.last().map(|l| (l.step, l.plan.kind)));
         for l in tail {
             prop_assert_eq!(l.plan.kind, PicKind::Healthy);
             prop_assert_eq!(l.fed, Some(true));
@@ -1363,6 +1415,113 @@ fn jitter_allows(sim: &Sim, l: &Logged) -> bool {
         .log
         .iter()
         .any(|o| o.plan.kind == PicKind::Idr && seq_lt(l.plan.frame_seq, o.plan.frame_seq))
+}
+
+#[test]
+fn a_slow_idr_is_not_given_up_on_while_it_is_being_delivered() {
+    // 1080p IDRs are 100-290 KB: at 2 Mbit/s that is 0.4-1.1 s of delivery.
+    // Every IDR here takes 800 ms to arrive (8 fragments acked along the way)
+    // with srtt 40 ms. It must be delivered once, with no probe P and no
+    // second IDR, and P frames start only when it is complete.
+    let mut sc = Script::new(400, |_, plan| Fate {
+        jitter: if plan.kind == PicKind::Idr { 78 } else { 0 },
+        ..Fate::default()
+    });
+    sc.idr_frags = 8;
+    let sim = run_sim(sc);
+    let st = sim.mgr.stats();
+    assert_eq!(
+        (st.idr_session, st.idr_reissued, st.idr_probes),
+        (1, 0, 0),
+        "{st:?}"
+    );
+    assert!(sim.holds >= 70, "held {} frames", sim.holds);
+    let first_p = sim
+        .log
+        .iter()
+        .find(|l| l.plan.kind != PicKind::Idr)
+        .unwrap();
+    assert!(
+        first_p.step >= 78,
+        "a P was planned at step {}",
+        first_p.step
+    );
+    assert!(sim.mgr.is_healthy());
+    assert!(sim
+        .log
+        .iter()
+        .filter(|l| l.step >= 100 && l.step < 397)
+        .all(|l| l.fed == Some(true)));
+}
+
+#[test]
+fn idr_that_makes_no_progress_is_sent_again_with_a_growing_timeout() {
+    let mut h = Hand::new();
+    let plan = h.m.plan_next(1, h.at(0)).frame();
+    let au = plan.slice_header(&params());
+    h.m.frame_sent(&plan, &au, 4, h.at(0)).unwrap();
+    // No fragment is ever acknowledged: held for three deadlines (750 ms)...
+    assert_eq!(h.m.plan_next(2, h.at(50)), Plan::Hold);
+    assert_eq!(h.m.plan_next(3, h.at(75)), Plan::Hold);
+    let second = h.m.plan_next(4, h.at(76)).frame();
+    assert_eq!(
+        (second.kind, second.idr_cause),
+        (PicKind::Idr, Some(IdrCause::SessionStart))
+    );
+    h.m.frame_sent(&second, &second.slice_header(&params()), 4, h.at(76))
+        .unwrap();
+    // ... then twice as long, then four times as long, and no more.
+    assert_eq!(h.m.plan_next(5, h.at(76 + 150)), Plan::Hold);
+    let third = h.m.plan_next(6, h.at(76 + 151)).frame();
+    assert_eq!(third.kind, PicKind::Idr);
+    h.m.frame_sent(&third, &third.slice_header(&params()), 4, h.at(227))
+        .unwrap();
+    assert_eq!(h.m.plan_next(7, h.at(227 + 300)), Plan::Hold);
+    assert_eq!(h.m.plan_next(8, h.at(227 + 301)).frame().kind, PicKind::Idr);
+    let fourth = h.m.plan_next(9, h.at(227 + 301)).frame();
+    h.m.frame_sent(&fourth, &fourth.slice_header(&params()), 4, h.at(528))
+        .unwrap();
+    assert_eq!(
+        h.m.plan_next(10, h.at(528 + 300)),
+        Plan::Hold,
+        "capped at four times"
+    );
+    assert_eq!(
+        h.m.plan_next(11, h.at(528 + 301)).frame().kind,
+        PicKind::Idr
+    );
+    assert_eq!(h.m.stats().idr_reissued, 4);
+}
+
+#[test]
+fn each_acked_fragment_restarts_the_idr_clock_and_the_deadline_starts_when_it_is_complete() {
+    let mut h = Hand::new();
+    let idr = h.m.plan_next(1, h.at(0)).frame();
+    h.m.frame_sent(&idr, &idr.slice_header(&params()), 4, h.at(0))
+        .unwrap();
+    // One fragment every 500 ms: never 750 ms without progress, so held.
+    for (i, ms) in [500u32, 1000, 1500, 2000].into_iter().enumerate() {
+        assert_eq!(h.m.plan_next(10 + i as u32, h.at(ms / 10 - 1)), Plan::Hold);
+        h.m.frag_acked(idr.frame_seq, i as u16, h.at(ms / 10));
+    }
+    // Complete at 2.0 s: now P frames may go, and the IDR is not suspect
+    // although it was sent 2 s ago.
+    h.m.tick(h.at(200 + 10), STEP * 4);
+    assert_eq!(h.m.frame_state(idr.frame_seq), Some(FrameState::Sent));
+    assert!(matches!(h.m.plan_next(20, h.at(210)), Plan::Frame(_)));
+    // A verdict on a half-delivered IDR is ignored; on a complete one it counts.
+    let mut g = Hand::new();
+    let i2 = g.m.plan_next(1, g.at(0)).frame();
+    g.m.frame_sent(&i2, &i2.slice_header(&params()), 4, g.at(0))
+        .unwrap();
+    g.m.frame_suspect(i2.frame_seq);
+    assert_eq!(g.m.frame_state(i2.frame_seq), Some(FrameState::Sent));
+    g.m.tick(g.at(100), STEP * 4);
+    assert_eq!(
+        g.m.frame_state(i2.frame_seq),
+        Some(FrameState::Sent),
+        "no deadline while incomplete"
+    );
 }
 
 #[test]
@@ -1388,4 +1547,26 @@ fn proptest_loop_exercises_recovery_and_ignored_confirmations() {
         "late acks must trip the decode deadline: {st:?}"
     );
     assert!(sim.kinds().contains(&PicKind::Recovery));
+}
+
+#[test]
+fn a_slow_idr_survives_more_than_a_ring_of_frame_sequence_numbers() {
+    // Tile frames burn sequence numbers while the IDR is delivered: by the
+    // time it is decoded its slot in the 256-frame ring has been reused.
+    let mut sc = Script::new(300, |_, plan| Fate {
+        jitter: if plan.kind == PicKind::Idr { 123 } else { 0 },
+        ..Fate::default()
+    });
+    sc.delay = 3;
+    sc.seq_stride = 2;
+    sc.idr_frags = 8;
+    let sim = run_sim(sc);
+    let st = sim.mgr.stats();
+    assert_eq!(
+        (st.idr_session, st.idr_reissued, st.acks_unknown),
+        (1, 0, 0),
+        "{st:?}"
+    );
+    assert!(st.anchors_confirmed > 0);
+    assert!(sim.mgr.is_healthy());
 }
