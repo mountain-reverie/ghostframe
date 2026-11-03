@@ -237,6 +237,19 @@ impl FullFrameEncoder {
         Ok(this)
     }
 
+    /// Create a full-frame encoder on libx264 only, never touching VA-API.
+    pub fn with_params_software(
+        width: u32,
+        height: u32,
+        params: RateParams,
+    ) -> Result<Self, ffmpeg::Error> {
+        FFMPEG_INIT.call_once(|| {
+            ffmpeg::init().expect("ffmpeg::init() failed");
+        });
+        let x264_codec = encoder::find_by_name("libx264").ok_or(ffmpeg::Error::EncoderNotFound)?;
+        Self::try_open_sw(x264_codec, width, height, params)
+    }
+
     pub fn width(&self) -> u32 {
         self.enc_w
     }
