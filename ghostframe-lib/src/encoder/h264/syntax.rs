@@ -13,6 +13,10 @@
 //! weighted prediction, one slice per picture's header of interest.
 
 /// Stream parameters the header syntax depends on (SPS and PPS fields).
+///
+/// There is deliberately no `Default`: the app's packed headers and the
+/// stream Mesa emits differ (the emitted PPS has no deblocking control, S2 g),
+/// so the writer and the AU parser are built from different values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StreamParams {
     /// `log2_max_frame_num_minus4 + 4`. Mesa forces 7 (MaxFrameNum 128).
@@ -27,19 +31,47 @@ pub(crate) struct StreamParams {
     pub cabac: bool,
     /// PPS `deblocking_filter_control_present_flag`.
     pub deblocking_control_present: bool,
+    /// PPS `bottom_field_pic_order_in_frame_present_flag`. Not supported:
+    /// parsing a stream that sets it is an error.
+    pub bottom_field_pic_order_in_frame_present: bool,
+    /// PPS `redundant_pic_cnt_present_flag`. Not supported.
+    pub redundant_pic_cnt_present: bool,
+    /// PPS `weighted_pred_flag`. Not supported.
+    pub weighted_pred: bool,
 }
 
-impl Default for StreamParams {
-    fn default() -> Self {
+impl StreamParams {
+    /// What the app's packed headers assume: High profile with CABAC (S2 f),
+    /// the app PPS carries deblocking control.
+    pub(crate) fn writer() -> Self {
         Self {
             log2_max_frame_num: 7,
             log2_max_poc_lsb: 16,
             max_num_ref_frames: 4,
             gaps_in_frame_num_allowed: true,
             num_ref_idx_l0_default: 1,
-            cabac: false,
+            cabac: true,
             deblocking_control_present: true,
+            bottom_field_pic_order_in_frame_present: false,
+            redundant_pic_cnt_present: false,
+            weighted_pred: false,
         }
+    }
+
+    /// What the stream Mesa emits carries: the same except that its PPS has
+    /// `deblocking_filter_control_present_flag = 0`. Use it to parse emitted
+    /// access units.
+    pub(crate) fn emitted() -> Self {
+        Self {
+            deblocking_control_present: false,
+            ..Self::writer()
+        }
+    }
+
+    fn unsupported_flag(&self) -> bool {
+        self.bottom_field_pic_order_in_frame_present
+            || self.redundant_pic_cnt_present
+            || self.weighted_pred
     }
 }
 
@@ -191,6 +223,7 @@ impl BitWriter {
     }
 
     pub(crate) fn put_se(&mut self, value: i32) {
+        assert!(value != i32::MIN, "se(v) cannot code i32::MIN");
         let mapped = if value > 0 {
             (value as u32) * 2 - 1
         } else {
@@ -335,6 +368,10 @@ pub(crate) struct HeaderBits {
 
 /// Write the slice header up to and including the deblocking fields.
 pub(crate) fn write_slice_header(params: &StreamParams, h: &SliceHeader) -> HeaderBits {
+    assert!(
+        !params.unsupported_flag(),
+        "PPS flags that add slice-header syntax are not supported"
+    );
     let mut w = BitWriter::default();
     w.put_ue(h.first_mb_in_slice);
     w.put_ue(match h.slice_type {
@@ -350,6 +387,7 @@ pub(crate) fn write_slice_header(params: &StreamParams, h: &SliceHeader) -> Head
     if h.slice_type == SliceType::P {
         w.put_bit(h.num_ref_idx_override.is_some());
         if let Some(n) = h.num_ref_idx_override {
+            assert!(n >= 1, "num_ref_idx_active_override of zero entries");
             w.put_ue(n - 1);
         }
         w.put_bit(!h.rplm.is_empty());
@@ -449,6 +487,11 @@ pub(crate) fn parse_slice_header(
     params: &StreamParams,
     nal: &[u8],
 ) -> Result<(SliceHeader, usize), ParseError> {
+    if params.unsupported_flag() {
+        return Err(ParseError::Unsupported(
+            "PPS flag that adds slice-header syntax",
+        ));
+    }
     let first = *nal.first().ok_or(ParseError::Truncated)?;
     let nal_ref_idc = (first >> 5) & 3;
     let idr = match first & 0x1f {
@@ -475,7 +518,11 @@ pub(crate) fn parse_slice_header(
     let mut rplm = Vec::new();
     if slice_type == SliceType::P {
         if r.bit()? {
-            num_ref_idx_override = Some(r.ue()? + 1);
+            num_ref_idx_override = Some(
+                r.ue()?
+                    .checked_add(1)
+                    .ok_or(ParseError::Unsupported("num_ref_idx_active"))?,
+            );
         }
         if r.bit()? {
             loop {
@@ -633,6 +680,9 @@ pub(crate) struct Effective {
     pub poc: i64,
     /// Reference frames resident after this picture's marking.
     pub dpb_len: usize,
+    /// Reference frames resident right after the picture was added, before
+    /// an overflow was repaired by discarding one (`dpb_len <= dpb_peak`).
+    pub dpb_peak: usize,
     pub violations: Violations,
 }
 
@@ -857,6 +907,7 @@ impl DecoderModel {
 
         // Marking (8.2.5).
         let mut cur_frame_num = h.frame_num;
+        let mut dpb_peak = None;
         if h.idr {
             let lt = h.nal_ref_idc != 0 && h.long_term_reference_flag;
             self.max_lt_idx_plus1 = u32::from(lt);
@@ -925,6 +976,7 @@ impl DecoderModel {
                 frame_num: cur_frame_num,
                 lt_idx: cur_lt,
             });
+            dpb_peak = Some(self.pics.len());
             if self.pics.len() as u32 > self.params.max_num_ref_frames {
                 // Non-conforming. Report it, then do what libavcodec does:
                 // discard the oldest short-term picture.
@@ -948,6 +1000,7 @@ impl DecoderModel {
             list0,
             poc,
             dpb_len: self.pics.len(),
+            dpb_peak: dpb_peak.unwrap_or(self.pics.len()),
             violations: v,
         }
     }
@@ -959,7 +1012,7 @@ mod tests {
     use proptest::prelude::*;
 
     fn params() -> StreamParams {
-        StreamParams::default()
+        StreamParams::writer()
     }
 
     fn p_ref(frame_num: u32, poc_lsb: u32) -> SliceHeader {
@@ -1056,6 +1109,173 @@ mod tests {
             prop_assert_eq!(parsed, h);
             prop_assert_eq!(bits, hb.bit_len);
         }
+    }
+
+    /// Pack a string of '0'/'1' into bytes, zero padded.
+    fn pack(bits: &str) -> Vec<u8> {
+        let mut out = vec![0u8; bits.len().div_ceil(8)];
+        for (i, c) in bits.chars().enumerate() {
+            if c == '1' {
+                out[i / 8] |= 0x80 >> (i % 8);
+            }
+        }
+        out
+    }
+
+    /// Hand-computed against 7.3.3, not derived from the writer: CABAC on,
+    /// RPLM (idc 2, long_term_pic_num 1), MMCO 4 (plus1 2), 1 (diff_minus1 2),
+    /// 6 (idx 1), cabac_init_idc after the marking, QP delta -3.
+    #[test]
+    fn known_answer_p_header_with_cabac_rplm_and_mmco() {
+        let expect = concat!(
+            "1",
+            "1",
+            "1",                // first_mb_in_slice, slice_type P, pps id
+            "0000101",          // frame_num 5 (7 bits)
+            "0000000000001010", // pic_order_cnt_lsb 10
+            "1",
+            "1", // num_ref_idx_active_override_flag, minus1 = 0
+            "1",
+            "011",
+            "010",
+            "00100", // RPLM flag, idc 2, long_term_pic_num 1, idc 3
+            "1",     // adaptive_ref_pic_marking_mode_flag
+            "00101",
+            "011", // MMCO 4, max_long_term_frame_idx_plus1 2
+            "010",
+            "011", // MMCO 1, difference_of_pic_nums_minus1 2
+            "00111",
+            "010",   // MMCO 6, long_term_frame_idx 1
+            "1",     // MMCO 0
+            "1",     // cabac_init_idc 0
+            "00111", // slice_qp_delta -3
+            "1",
+            "1",
+            "1", // deblocking idc 0, alpha 0, beta 0
+        );
+        let mut h = SliceHeader::p(5, 10, 2);
+        h.rplm = vec![Rplm::Long(1)];
+        h.mmco = Some(vec![
+            Mmco::MaxLong(2),
+            Mmco::ForgetShort(2),
+            Mmco::CurrentToLong(1),
+        ]);
+        h.slice_qp_delta = -3;
+        let p = params();
+        let hb = write_slice_header(&p, &h);
+        assert_eq!(hb.bit_len, expect.len());
+        assert_eq!(hb.bytes, pack(expect));
+        let mut nal = vec![0x41];
+        nal.extend(escape_rbsp(&pack(expect)));
+        let (parsed, bits) = parse_slice_header(&p, &nal).unwrap();
+        assert_eq!(parsed, h);
+        assert_eq!(bits, expect.len());
+    }
+
+    #[test]
+    fn known_answer_idr_header() {
+        let expect = concat!(
+            "1",
+            "011",
+            "1",                // first_mb, slice_type I (ue 2), pps id
+            "0000000",          // frame_num 0
+            "010",              // idr_pic_id 1
+            "0000000000000000", // pic_order_cnt_lsb 0
+            "0",
+            "1", // no_output_of_prior_pics, long_term_reference_flag
+            "1", // slice_qp_delta 0
+            "1",
+            "1",
+            "1", // deblocking
+        );
+        let h = SliceHeader::idr(1, true);
+        let p = params();
+        assert_eq!(write_slice_header(&p, &h).bytes, pack(expect));
+        let mut nal = vec![0x65];
+        nal.extend(escape_rbsp(&pack(expect)));
+        assert_eq!(parse_slice_header(&p, &nal).unwrap().0, h);
+    }
+
+    /// The IDR slice header of a real libx264 stream (CABAC, POC type 0,
+    /// log2_max_frame_num 4, POC lsb 6 bits), checked against ffmpeg's
+    /// `trace_headers`: frame_num 0, idr_pic_id 0, qp delta -10, deblocking 0.
+    #[test]
+    fn real_x264_idr_header_parses_and_rewrites_to_the_same_bits() {
+        let p = StreamParams {
+            log2_max_frame_num: 4,
+            log2_max_poc_lsb: 6,
+            ..params()
+        };
+        let nal = [0x65, 0x88, 0x84, 0x00, 0x2b, 0xff, 0xfa];
+        let (h, bits) = parse_slice_header(&p, &nal).unwrap();
+        assert_eq!(
+            bits, 34,
+            "trace_headers: cabac_alignment_one_bit starts at bit 42, 8 of them the NAL header"
+        );
+        assert!(h.idr && h.nal_ref_idc == 3 && h.slice_type == SliceType::I);
+        assert_eq!((h.frame_num, h.idr_pic_id, h.poc_lsb), (0, 0, 0));
+        assert!(!h.long_term_reference_flag && !h.no_output_of_prior_pics);
+        assert_eq!(h.slice_qp_delta, -10);
+        assert_eq!(h.deblock.disable_idc, 0);
+        // x264 codes slice_type 7 (all slices I), the writer 2: 4 bits fewer,
+        // and the same header when parsed back.
+        let w = write_slice_header(&p, &h);
+        assert_eq!(w.bit_len, 30);
+        let mut again = vec![0x65];
+        again.extend(escape_rbsp(&w.bytes));
+        assert_eq!(parse_slice_header(&p, &again).unwrap().0, h);
+    }
+
+    #[test]
+    fn unsupported_pps_flags_are_a_parse_error_and_the_emitted_pps_has_no_deblocking() {
+        let nal = slice_nal(&params(), &SliceHeader::idr(0, true));
+        for p in [
+            StreamParams {
+                bottom_field_pic_order_in_frame_present: true,
+                ..params()
+            },
+            StreamParams {
+                redundant_pic_cnt_present: true,
+                ..params()
+            },
+            StreamParams {
+                weighted_pred: true,
+                ..params()
+            },
+        ] {
+            assert!(matches!(
+                parse_slice_header(&p, &nal),
+                Err(ParseError::Unsupported(_))
+            ));
+        }
+        assert!(
+            params().deblocking_control_present
+                && !StreamParams::emitted().deblocking_control_present
+        );
+        // Parsing with the wrong PPS shape gives a different header, which is
+        // why the writer and the AU parser take separate parameters.
+        let h = SliceHeader::p(3, 6, 2);
+        let nal = slice_nal(&StreamParams::emitted(), &h);
+        assert_eq!(
+            parse_slice_header(&StreamParams::emitted(), &nal)
+                .unwrap()
+                .0,
+            h
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "num_ref_idx_active_override")]
+    fn zero_active_references_is_refused_by_the_writer() {
+        let mut h = SliceHeader::p(1, 2, 2);
+        h.num_ref_idx_override = Some(0);
+        write_slice_header(&params(), &h);
+    }
+
+    #[test]
+    #[should_panic(expected = "i32::MIN")]
+    fn se_of_i32_min_is_refused() {
+        BitWriter::default().put_se(i32::MIN);
     }
 
     #[test]
