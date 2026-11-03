@@ -5,9 +5,11 @@
 //! per-frame state ring; `refs` is the `RefManager` that decides each frame's
 //! plan.
 
+pub(crate) mod param_sets;
 pub(crate) mod refs;
 pub(crate) mod syntax;
 pub(crate) mod tracker;
+pub(crate) mod va_sys;
 
 #[cfg(test)]
 mod refs_tests;
