@@ -515,6 +515,7 @@ fn mixed_batch_flush_and_publish() {
             supports_h264: false,
             h264_acked_ref: false,
             tile_delivery: TileDelivery::Payload,
+            cdf53_wire: false,
             display: None,
         },
         0,

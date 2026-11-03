@@ -44,6 +44,7 @@ impl WasmClientCore {
             } else {
                 TileDelivery::Decoded
             },
+            cdf53_wire: false,
             display: None,
         };
         WasmClientCore {
@@ -72,7 +73,10 @@ impl WasmClientCore {
     #[wasm_bindgen(js_name = handleDatagram)]
     pub fn handle_datagram(&mut self, bytes: &[u8], now_us: u64) -> Result<JsValue, JsValue> {
         let events = self.inner.handle_datagram(bytes, now_us);
-        let mirrored: Vec<WasmEvent> = events.into_iter().map(WasmEvent::from).collect();
+        let mirrored: Vec<WasmEvent> = events
+            .into_iter()
+            .filter_map(WasmEvent::from_event)
+            .collect();
         to_js(&mirrored)
     }
 
@@ -113,7 +117,10 @@ impl WasmClientCore {
             // caller cannot wrap.
             events.extend(self.inner.handle_datagram(datagram, *at as u64));
         }
-        let mirrored: Vec<WasmEvent> = events.into_iter().map(WasmEvent::from).collect();
+        let mirrored: Vec<WasmEvent> = events
+            .into_iter()
+            .filter_map(WasmEvent::from_event)
+            .collect();
         to_js(&mirrored)
     }
 
@@ -122,7 +129,10 @@ impl WasmClientCore {
     #[wasm_bindgen(js_name = onTimeout)]
     pub fn on_timeout(&mut self, now_us: u64) -> Result<JsValue, JsValue> {
         let events = self.inner.on_timeout(now_us);
-        let mirrored: Vec<WasmEvent> = events.into_iter().map(WasmEvent::from).collect();
+        let mirrored: Vec<WasmEvent> = events
+            .into_iter()
+            .filter_map(WasmEvent::from_event)
+            .collect();
         to_js(&mirrored)
     }
 

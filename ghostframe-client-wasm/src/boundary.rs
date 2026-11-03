@@ -112,6 +112,54 @@ pub enum WasmTileData {
     },
 }
 
+/// Expand a `Cdf53Wire` pass's streams into 384 plane bytes, or `None`.
+fn expand_wire_planes(streams: &[u8]) -> Option<Vec<u8>> {
+    let mut planes = vec![0u8; 384];
+    let dst: &mut [u8; 384] = planes.as_mut_slice().try_into().ok()?;
+    ghostframe_client_core::cdf53_prevalidate::decode_cdf53_wire(streams, dst).ok()?;
+    Some(planes)
+}
+
+impl WasmEvent {
+    /// [`From<Event>`], except that a `Cdf53Wire` pass is expanded to the
+    /// `Cdf53` mirror, and dropped (`None`) if it will not expand, like the
+    /// native renderer does.
+    pub fn from_event(ev: Event) -> Option<WasmEvent> {
+        match ev {
+            Event::TilePayload {
+                frame_seq,
+                tile_x,
+                tile_y,
+                generation,
+                data:
+                    TileData::Cdf53Wire {
+                        pass_idx,
+                        streams,
+                        present_passes,
+                        new_generation: _,
+                    },
+            } => Some(WasmEvent::TilePayload {
+                frame_seq,
+                tile_x,
+                tile_y,
+                generation,
+                data: WasmTileData::Cdf53 {
+                    pass_idx,
+                    bit_planes: expand_wire_planes(&streams)?,
+                    present_passes,
+                },
+            }),
+            other @ (Event::TileReady { .. }
+            | Event::TilePayload { .. }
+            | Event::PaletteUpdated { .. }
+            | Event::FrameDimensions { .. }
+            | Event::NeedsH264 { .. }
+            | Event::DecodeError { .. }
+            | Event::Evicted { .. }) => Some(other.into()),
+        }
+    }
+}
+
 impl From<TileData> for WasmTileData {
     /// By value: the payload `Vec`s move into the mirror instead of being
     /// cloned. Every tile event used to copy its payload here and then again
@@ -146,6 +194,23 @@ impl From<TileData> for WasmTileData {
                 bit_planes,
                 present_passes,
             },
+            // Callers go through `WasmEvent::from_event`, which expands (or
+            // drops) wire passes first; the wasm core never sets
+            // `ClientConfig::cdf53_wire` anyway. This arm only completes the
+            // match.
+            TileData::Cdf53Wire {
+                pass_idx,
+                streams,
+                present_passes,
+                new_generation: _,
+            } => {
+                debug_assert!(false, "Cdf53Wire reached the plain From conversion");
+                WasmTileData::Cdf53 {
+                    pass_idx,
+                    bit_planes: expand_wire_planes(&streams).unwrap_or_default(),
+                    present_passes,
+                }
+            }
         }
     }
 }
@@ -455,6 +520,34 @@ mod tests {
     use super::*;
     use ghostframe_client_core::{DecodeErrorCode, Event, TileData};
     use ghostframe_protocol::protocol::Codec;
+
+    #[test]
+    fn a_wire_pass_is_expanded_or_dropped_never_empty() {
+        let wire = |streams: Vec<u8>| Event::TilePayload {
+            frame_seq: 1,
+            tile_x: 0,
+            tile_y: 0,
+            generation: 0,
+            data: TileData::Cdf53Wire {
+                pass_idx: 3,
+                streams,
+                present_passes: None,
+                new_generation: false,
+            },
+        };
+        let mut good = Vec::new();
+        for _ in 0..3 {
+            good.extend_from_slice(&[0, 1, 0xFF]);
+        }
+        match WasmEvent::from_event(wire(good)) {
+            Some(WasmEvent::TilePayload {
+                data: WasmTileData::Cdf53 { bit_planes, .. },
+                ..
+            }) => assert_eq!(bit_planes, vec![0u8; 384]),
+            other => panic!("{other:?}"),
+        }
+        assert!(WasmEvent::from_event(wire(vec![0, 1, 0xFE])).is_none());
+    }
 
     #[test]
     fn tile_payload_mirrors_every_field() {

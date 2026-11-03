@@ -529,6 +529,38 @@ impl Renderer {
                             bit_planes,
                         );
                     }
+                    // The decode thread expands these (`TileDecoder`); one
+                    // reaching the renderer bypassed it. Expand here rather
+                    // than draw nothing.
+                    TileData::Cdf53Wire {
+                        pass_idx,
+                        streams,
+                        present_passes,
+                        new_generation,
+                    } => {
+                        debug_assert!(false, "TileData::Cdf53Wire reached the renderer");
+                        let mut planes = vec![0u8; 384];
+                        let expanded = <&mut [u8; 384]>::try_from(planes.as_mut_slice())
+                            .map(|p| {
+                                ghostframe_client_core::cdf53_prevalidate::decode_cdf53_wire(
+                                    &streams, p,
+                                )
+                                .is_ok()
+                            })
+                            .unwrap_or(false);
+                        if expanded {
+                            self.apply_cdf53_pass(
+                                tile_x,
+                                tile_y,
+                                frame_seq,
+                                generation,
+                                new_generation,
+                                pass_idx,
+                                present_passes,
+                                planes,
+                            );
+                        }
+                    }
                 }
             }
             Event::FrameDimensions { width, height } => {

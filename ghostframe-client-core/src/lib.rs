@@ -136,6 +136,12 @@ pub struct ClientConfig {
     pub h264_acked_ref: bool,
     /// See [`TileDelivery`]. Defaults to `Decoded`.
     pub tile_delivery: TileDelivery,
+    /// In `Payload` mode, emit CDF 5/3 passes as `TileData::Cdf53Wire`
+    /// (validated, still RLE-coded) instead of `TileData::Cdf53`, leaving the
+    /// expansion to the consumer's [`TileDecoder`]. For a client whose
+    /// network thread is its bottleneck. Defaults to `false`; ignored in
+    /// `Decoded` mode, which expands inline.
+    pub cdf53_wire: bool,
     /// What the client knows about its own display. `None` if the client
     /// cannot determine it, in which case no DisplayInfo message is sent.
     pub display: Option<ClientDisplay>,
@@ -202,6 +208,8 @@ pub struct ClientCore {
     /// payload events every tile produces; `None` in `Payload` mode. See
     /// [`TileDecoder`].
     pub(crate) decoder: Option<TileDecoder>,
+    /// Emit CDF 5/3 passes unexpanded; see [`ClientConfig::cdf53_wire`].
+    pub(crate) cdf53_wire: bool,
     /// Protocol datagrams accepted by `handle_datagram`, split the same way
     /// its dispatch splits them: tile datagrams (bit 31 of `frame_seq` set)
     /// and H.264 frame datagrams (bit 31 clear).
@@ -240,6 +248,7 @@ impl ClientCore {
             next_tail_sweep_us: now_us + TAIL_SWEEP_INTERVAL_US,
             next_feedback_us: now_us + FEEDBACK_INTERVAL_US,
             decoder: None,
+            cdf53_wire: false,
             datagrams_tile: 0,
             datagrams_frame: 0,
         };
@@ -266,7 +275,20 @@ impl ClientCore {
         }
 
         core.set_tile_delivery(config.tile_delivery);
+        core.set_cdf53_wire(config.cdf53_wire);
         core
+    }
+
+    /// Whether CDF 5/3 passes come out as `TileData::Cdf53Wire`: the flag is
+    /// on and the delivery is `Payload` (the only mode it applies to).
+    pub fn delivers_cdf53_wire(&self) -> bool {
+        self.cdf53_wire && self.decoder.is_none()
+    }
+
+    /// See [`ClientConfig::cdf53_wire`]. Only has an effect in
+    /// [`TileDelivery::Payload`] mode.
+    pub fn set_cdf53_wire(&mut self, on: bool) {
+        self.cdf53_wire = on;
     }
 
     /// Switch between [`TileDelivery`] modes. Meant for before the first

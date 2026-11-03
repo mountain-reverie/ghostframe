@@ -40,6 +40,10 @@ pub struct TileDecoder {
     /// them itself (the native client's GPU grid). This decoder then keeps no
     /// CDF 5/3 state, and the other codecs are unaffected.
     cdf53_passthrough: bool,
+    /// `TileData::Cdf53Wire` passes dropped because their streams did not
+    /// expand. Validation upstream makes that impossible; this says so if it
+    /// is not.
+    cdf53_wire_failed: u64,
 }
 
 /// A CDF 5/3 tile waiting for its one reconstruction in a batch.
@@ -98,15 +102,65 @@ impl TileDecoder {
             pending: PendingCdf53::default(),
             cdf53_coalesced: 0,
             cdf53_passthrough: false,
+            cdf53_wire_failed: 0,
         }
     }
 
-    /// A decoder that forwards `TileData::Cdf53` events as they are
+    /// A decoder that forwards CDF 5/3 passes as `TileData::Cdf53` events
     /// (`Decoded::Event(Event::TilePayload)`), in order with everything else,
-    /// instead of reconstructing them. See [`TileDecoder::cdf53_passthrough`].
+    /// instead of reconstructing them. A pass that arrives as
+    /// `TileData::Cdf53Wire` is RLE-expanded here first, so the consumer only
+    /// ever sees expanded planes. See [`TileDecoder::cdf53_passthrough`].
     pub fn with_cdf53_passthrough(mut self, on: bool) -> Self {
         self.cdf53_passthrough = on;
         self
+    }
+
+    /// How many `TileData::Cdf53Wire` passes were dropped because they would
+    /// not expand. Zero unless something other than the core built them.
+    pub fn cdf53_wire_failed(&self) -> u64 {
+        self.cdf53_wire_failed
+    }
+
+    /// Expand a `Cdf53Wire` pass into the `Cdf53` event every later stage
+    /// handles. `None` (counted in [`Self::cdf53_wire_failed`]; the caller
+    /// reports it) if the streams do not expand, which a pass validated by
+    /// the core cannot do.
+    fn expand_wire(&mut self, ev: Event) -> Option<Event> {
+        let Event::TilePayload {
+            frame_seq,
+            tile_x,
+            tile_y,
+            generation,
+            data:
+                TileData::Cdf53Wire {
+                    pass_idx,
+                    streams,
+                    present_passes,
+                    new_generation,
+                },
+        } = ev
+        else {
+            return Some(ev);
+        };
+        let mut bit_planes = vec![0u8; 384];
+        let planes: &mut [u8; 384] = bit_planes.as_mut_slice().try_into().ok()?;
+        if crate::cdf53_prevalidate::decode_cdf53_wire(&streams, planes).is_err() {
+            self.cdf53_wire_failed += 1;
+            return None;
+        }
+        Some(Event::TilePayload {
+            frame_seq,
+            tile_x,
+            tile_y,
+            generation,
+            data: TileData::Cdf53 {
+                pass_idx,
+                bit_planes,
+                present_passes,
+                new_generation,
+            },
+        })
     }
 
     /// How many CDF 5/3 reconstructions [`Self::decode_batch_into`] has not
@@ -218,6 +272,9 @@ impl TileDecoder {
         coalesce: bool,
         emit: &mut impl FnMut(&mut S, BatchStep<S::Placed>) -> bool,
     ) -> bool {
+        let Some(ev) = self.expand_wire(ev) else {
+            return true;
+        };
         if coalesce {
             // Anything that must come after a pending picture flushes it
             // first. A palette update does not: palettes only colour PalRle
@@ -252,7 +309,12 @@ impl TileDecoder {
                         return false;
                     }
                 }
-                Event::PaletteUpdated { .. } => {}
+                // Already expanded to `Cdf53` above.
+                Event::TilePayload {
+                    data: TileData::Cdf53Wire { .. },
+                    ..
+                }
+                | Event::PaletteUpdated { .. } => {}
                 Event::TileReady { .. }
                 | Event::FrameDimensions { .. }
                 | Event::NeedsH264 { .. }
@@ -282,6 +344,8 @@ impl TileDecoder {
                         palette: self.palettes[palette_id as usize],
                         indices,
                     },
+                    // `expand_wire` has already turned these into `Cdf53`.
+                    TileData::Cdf53Wire { .. } => return true,
                     TileData::Cdf53 {
                         pass_idx,
                         bit_planes,
@@ -1118,5 +1182,106 @@ mod tests {
         });
         assert_eq!(sink.acquires, 1, "only the first solid was written");
         assert!(dec.pending.tiles.is_empty());
+    }
+
+    /// `cdf_events` with every pass as the wire variant the core emits in
+    /// wire mode, built from the same payloads.
+    fn wire_events(x: u8, generation: u8, new_generation: bool, seed: u8, seq0: u32) -> Vec<Event> {
+        let (_, passes) = encode_passes_sparse(&forward(&gradient(seed)));
+        passes
+            .into_iter()
+            .enumerate()
+            .map(|(i, (idx, payload))| {
+                let info = crate::cdf53_prevalidate::validate_cdf53(&payload, idx).unwrap();
+                Event::TilePayload {
+                    frame_seq: seq0 + i as u32,
+                    tile_x: x,
+                    tile_y: 0,
+                    generation,
+                    data: TileData::Cdf53Wire {
+                        pass_idx: idx,
+                        streams: payload[info.streams].to_vec(),
+                        present_passes: info.present_passes,
+                        new_generation: new_generation && i == 0,
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Wire passes decode to exactly what the planes variant decodes to, in
+    /// CPU mode (one at a time and batched) and in passthrough mode (the
+    /// forwarded event is the planes variant).
+    #[test]
+    fn wire_passes_behave_as_plane_passes() {
+        let planes: Vec<Event> = (0..3u8)
+            .flat_map(|x| cdf_events(x, 1, true, 3 + x, 10))
+            .collect();
+        let wire: Vec<Event> = (0..3u8)
+            .flat_map(|x| wire_events(x, 1, true, 3 + x, 10))
+            .collect();
+        assert!(wire.iter().all(|e| matches!(
+            e,
+            Event::TilePayload {
+                data: TileData::Cdf53Wire { .. },
+                ..
+            }
+        )));
+        for passthrough in [false, true] {
+            let new = || TileDecoder::new().with_cdf53_passthrough(passthrough);
+            let one = |evs: &[Event]| -> Vec<Event> {
+                let mut d = new();
+                evs.iter().cloned().filter_map(|e| d.decode(e)).collect()
+            };
+            let got = one(&wire);
+            assert!(!got.is_empty());
+            assert_eq!(
+                got,
+                one(&planes),
+                "one at a time, passthrough {passthrough}"
+            );
+            assert_eq!(
+                new().decode_batch(wire.clone()),
+                new().decode_batch(planes.clone()),
+                "batched, passthrough {passthrough}"
+            );
+            if passthrough {
+                assert!(got.iter().all(|e| matches!(
+                    e,
+                    Event::TilePayload {
+                        data: TileData::Cdf53 { .. },
+                        ..
+                    }
+                )));
+            } else {
+                assert!(got.iter().all(|e| tile_of(e).is_some()));
+            }
+        }
+    }
+
+    #[test]
+    fn a_wire_pass_that_will_not_expand_is_dropped_and_counted() {
+        for batched in [false, true] {
+            let mut dec = TileDecoder::new();
+            let bad = Event::TilePayload {
+                frame_seq: 1,
+                tile_x: 0,
+                tile_y: 0,
+                generation: 0,
+                data: TileData::Cdf53Wire {
+                    pass_idx: 1,
+                    streams: vec![0, 1, 0xFE, 0, 1, 0xFF], // short, then cut
+                    present_passes: None,
+                    new_generation: true,
+                },
+            };
+            let out = if batched {
+                dec.decode_batch(vec![bad])
+            } else {
+                dec.decode(bad).into_iter().collect()
+            };
+            assert!(out.is_empty());
+            assert_eq!(dec.cdf53_wire_failed(), 1);
+        }
     }
 }

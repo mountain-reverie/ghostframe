@@ -372,11 +372,8 @@ impl Client {
             supports_h264: self.effective_h264,
             display: self.config.display,
         };
-        // Payload: the net thread stops at validated payloads and the decode
-        // thread turns them into pixels -- see `decode_thread`.
-        let mut client_net = ClientNet::new(net_config, 0)?
-            .with_extra_cert_pins(cert_hashes)
-            .with_tile_delivery(TileDelivery::Payload);
+        let mut client_net =
+            payload_delivery(ClientNet::new(net_config, 0)?.with_extra_cert_pins(cert_hashes));
         client_net.connect(remote, 0)?;
 
         // SAFETY: eventfd(2) with documented flags; the return value is
@@ -766,5 +763,43 @@ impl Drop for Client {
         // things. Always tear down cleanly, connected or not (this is a
         // no-op when `net_thread`/`render_thread` are already `None`).
         self.shutdown_threads();
+    }
+}
+
+/// Payload: the net thread stops at validated payloads and the decode thread
+/// turns them into pixels -- see `decode_thread`. CDF 5/3 passes also stay
+/// RLE-coded until there (it expands them in both decode modes), so this
+/// thread only validates them and keeps one exact-size copy of the streams
+/// per pass instead of expanding into planes.
+fn payload_delivery(net: ClientNet) -> ClientNet {
+    net.with_tile_delivery(TileDelivery::Payload)
+        .with_cdf53_wire(true)
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+    use ghostframe_client_net::ClientNetConfig;
+
+    fn net() -> ClientNet {
+        ClientNet::new(
+            ClientNetConfig {
+                server_name: "test".into(),
+                server_cert_sha256: [0; 32],
+                indices_raw_enabled: false,
+                supports_h264: false,
+                display: None,
+            },
+            0,
+        )
+        .expect("client net")
+    }
+
+    /// The native client's net thread must hand up validated, still-coded
+    /// CDF 5/3 passes; losing the flag shows only as slower gf-net otherwise.
+    #[test]
+    fn the_native_client_delivers_cdf53_passes_as_wire() {
+        assert!(!net().delivers_cdf53_wire(), "off unless asked for");
+        assert!(payload_delivery(net()).delivers_cdf53_wire());
     }
 }

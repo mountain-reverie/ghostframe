@@ -19,6 +19,7 @@ fn drain(datagrams: &[Vec<u8>], delivery: TileDelivery) -> Vec<Event> {
             supports_h264: false,
             h264_acked_ref: false,
             tile_delivery: delivery,
+            cdf53_wire: false,
             display: None,
         },
         0,
