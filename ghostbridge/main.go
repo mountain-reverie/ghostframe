@@ -78,12 +78,26 @@ func init() {
 	// Off on the headscale path only: there, DERP sits behind Docker port
 	// mapping and binding to the default-route interface selects the wrong
 	// one. tsnet's own test suite disables netns for the same reason.
+	//
+	// A control URL passed to gbridge_new counts too; see
+	// disableNetnsForCustomControl.
 	if os.Getenv("TS_CONTROL_URL") != "" {
-		netns.SetEnabled(false)
-		log.Printf("ghostbridge: init: netns socket protection disabled (headscale path)")
+		disableNetnsForCustomControl("TS_CONTROL_URL is set")
 	} else {
 		log.Printf("ghostbridge: init: netns socket protection enabled (production path)")
 	}
+}
+
+var netnsDisabledOnce sync.Once
+
+// disableNetnsForCustomControl turns netns socket protection off for the
+// process (it is a process-wide switch) when a node joins a custom control
+// plane, i.e. headscale: see init() for why that path needs it off.
+func disableNetnsForCustomControl(why string) {
+	netnsDisabledOnce.Do(func() {
+		netns.SetEnabled(false)
+		log.Printf("ghostbridge: netns socket protection disabled (headscale path: %s)", why)
+	})
 }
 
 var (
@@ -151,6 +165,13 @@ func gbridge_new(cHostname, cAuthkey, cStateDir, cControlURL *C.char, quiet, non
 	}
 	if controlURL != "" {
 		s.ControlURL = controlURL
+		// A control URL handed over by the caller, rather than through
+		// TS_CONTROL_URL, is the same headscale path that init() keys on:
+		// the e2e harness's in-process test node joins this way, and with
+		// netns protection on it bound its sockets to the default-route
+		// interface, could not reach the Docker-mapped DERP on loopback,
+		// and every dial to a peer timed out.
+		disableNetnsForCustomControl("control URL passed to gbridge_new")
 	}
 
 	serversMu.Lock()
