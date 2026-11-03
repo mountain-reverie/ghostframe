@@ -50,6 +50,13 @@ struct TileEntry {
     drawn_prefix: Option<usize>,
 }
 
+impl TileEntry {
+    /// Length of the contiguous prefix of resolved passes starting at 0.
+    fn prefix_len(&self) -> usize {
+        self.planes.iter().take_while(|p| p.is_some()).count()
+    }
+}
+
 /// Per-(tile_x, tile_y) CDF53 progressive-pass accumulator.
 pub struct Cdf53TileState {
     tiles: HashMap<(u8, u8), TileEntry>,
@@ -115,12 +122,29 @@ impl Cdf53TileState {
     /// [`Self::integrate`] up to, and not including, the pixel format: the
     /// tile as `inverse()` made it, 1024 BGR triples, for
     /// [`write_bgr_rows`] to put wherever the pixels are wanted.
+    ///
+    /// [`Self::accumulate`] then [`Self::reconstruct`], so a caller that is
+    /// behind can accumulate several passes of a tile and reconstruct once.
     pub fn integrate_bgr(
         &mut self,
         tile_x: u8,
         tile_y: u8,
         entry: &PrevalidatedCdf53,
     ) -> Option<Vec<u8>> {
+        if !self.accumulate(tile_x, tile_y, entry) {
+            return None;
+        }
+        self.reconstruct(tile_x, tile_y)
+    }
+
+    /// The cheap half of [`Self::integrate_bgr`]: store the pass, apply the
+    /// generation rule and the `present_passes` backfill, but run neither
+    /// `decode_planes` nor `inverse`. Returns whether the contiguous prefix
+    /// differs from the one last drawn, i.e. whether
+    /// [`Self::reconstruct`] may have a picture to give. A `true` is not a
+    /// promise (the black-flash rule can still decline), a `false` is: the
+    /// picture on screen is already this one.
+    pub fn accumulate(&mut self, tile_x: u8, tile_y: u8, entry: &PrevalidatedCdf53) -> bool {
         let tile = self.tiles.entry((tile_x, tile_y)).or_default();
 
         if !tile.generation_set || tile.generation != entry.generation {
@@ -151,12 +175,16 @@ impl Cdf53TileState {
             }
         }
 
-        // Contiguous prefix of resolved passes starting at 0.
-        let mut prefix_len = 0usize;
-        while prefix_len < CDF53_PASS_COUNT && tile.planes[prefix_len].is_some() {
-            prefix_len += 1;
-        }
+        tile.drawn_prefix != Some(tile.prefix_len())
+    }
 
+    /// The expensive half of [`Self::integrate_bgr`]: the picture for what
+    /// [`Self::accumulate`] has stored so far, under the rules in
+    /// [`Self::integrate`]'s doc comment. `None` when the prefix has not grown
+    /// since the last picture, or carries no magnitude bits yet.
+    pub fn reconstruct(&mut self, tile_x: u8, tile_y: u8) -> Option<Vec<u8>> {
+        let tile = self.tiles.get_mut(&(tile_x, tile_y))?;
+        let prefix_len = tile.prefix_len();
         if tile.drawn_prefix == Some(prefix_len) {
             return None;
         }
