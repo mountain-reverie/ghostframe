@@ -159,8 +159,13 @@ pub struct BweStats {
     /// Lifts not made because quinn's round trip said a queue was standing.
     pub ceiling_lifts_blocked_queue: u64,
     /// Reseeds down not made because the window held a gap in the
-    /// acknowledgements longer than a round trip.
+    /// acknowledgements longer than the round trip and a quarter of the
+    /// window (`GoogCcDriver::ack_gap_is_stall`).
     pub ceiling_reseeds_skipped_gap: u64,
+    /// Saturated readings across a gap in the acknowledgements that the path
+    /// is not answerable for (it delivered what it was offered): set aside,
+    /// the bound last read from a window without a stall kept.
+    pub ceiling_reads_held: u64,
     /// The payload fraction last measured, in parts per million.
     pub payload_fraction_ppm: u64,
     /// The last acknowledged rate read, bits per second.
@@ -261,6 +266,12 @@ impl BweWrapper {
     /// spend outruns its acknowledgements). See `GoogCcDriver::hold_ceiling`.
     pub fn hold_ceiling(&mut self, now: Instant, hold: Duration) {
         self.driver.hold_ceiling(now, hold);
+    }
+
+    /// Whether quinn's round trip is well above its least over the last ten
+    /// seconds: a queue stands on the path.
+    pub fn standing_queue(&self) -> bool {
+        self.driver.standing_queue()
     }
 
     /// Return the current observability snapshot without advancing the estimator.

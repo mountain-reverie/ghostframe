@@ -339,6 +339,40 @@ A scheduled GOP IDR claims a pending window and is topped up with padding.
 After padding, the BWE ceiling is held off for 1 s (`PAD_CEILING_HOLD`) so a
 burst that spends the whole grant is not read as a saturated, silent path.
 
+**What the ceiling reads as saturated.** A CBR stream at 0.8 x its estimate is
+not rate-limited, and its ceiling readings say so only if the signal measures
+the path. Two things made it measure the sender instead. A pass the model
+window stopped forfeits its bank, and counting that as spend made 95 % of the
+readings saturated whenever the acknowledgements were late (the window is the
+acknowledgement clock, not the link): it counts now only with a queue standing
+(quinn's round trip over 1.25 x its ten-second minimum and at least 5 ms over it), which puts the share
+at about 0.4 and makes the result independent of when the client acknowledges.
+And a window holding a stall in its acknowledgements (longer than the round
+trip and than a quarter of the window, so that a path faster than the client's
+5 ms flush and a frame interval is not mistaken for one: a frame the pacer had
+not released, a run of skipped frames) read as a path
+delivering a tenth of its rate; the sender, paced to that bound and spending
+all of it, read its own rate back as the path's and sat there until the next
+application probe, 0.13 to 0.2 x its pre-step estimate on a lossless link. A
+saturated reading across such a stall is now set aside with no queue standing
+(the last bound read from a window without a stall stays, goog_cc is not
+moved). With a queue standing the low rate is the path's answer and is
+published, as before. After a base round trip rise (a route change), and under
+jitter that lifts quinn's round trip (WiFi), the queue test stays true for up
+to ten seconds and both rules behave as they did before: the fix gives those
+paths nothing. The cost: when the base round trip steps up with no queue yet,
+the cut that the stalled window used to deliver waits for the first
+acknowledgement (`p8e`: a short second dip after the restore, up to 200 ms on
+two seeds of fourteen, one in fourteen before).
+
+Where the stalls come from: an IDR is followed by its parity (K = 2, so 38
+datagrams for a 77-fragment IDR, 54 kB), queued behind the fragments and
+unacknowledged by design. Paced at the estimate that is a quarter second or
+more with no acknowledgement at all, and the P frame queued behind it waits as
+long. Seeds 0x6720 and 0x6724 showed 0.7 s of it (38 parity datagrams of one
+IDR, none acked, the next frame's first fragment behind them) while the
+client's acknowledgement path was healthy.
+
 **PadRing** (`reliable_emitter/h264.rs`): up to `PAD_RING_CAP` (512) entries,
 each forgotten after `PAD_ENTRY_TTL` (2 s). An entry exists only to carry the
 probe tag to the acknowledgement and to count the pad's bytes as in flight.

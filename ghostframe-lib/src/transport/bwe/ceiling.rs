@@ -46,9 +46,32 @@
 //!   completely than one datagram's rounding per wake (a few percent at the
 //!   rates served), and a sender that spends under nine tenths of its grant
 //!   is not rate-limited.
+//!   What counts as spent is tokens put on the wire, plus, with a queue
+//!   standing on the path, the bank an admission pass forfeited to quinn's
+//!   window (`model_note_gated_pass`). A window that binds with the round
+//!   trip at its base is the acknowledgement clock, not the link, and
+//!   counted, it made 95 % of a CBR stream's readings saturated and the
+//!   ceiling's lifts and cuts a function of when the client acknowledges.
 //! * **History.** No ceiling until a full window (plus the shift) of both
 //!   series exists, so startup is never bounded by a measurement of nothing.
 //!   A gap in acknowledgements is not a lack of history: the counters hold.
+//! * **Gaps.** A window holding a stall in the acknowledgements, a stretch
+//!   longer than the round trip and than a quarter of the window, measures
+//!   the stall, not the path. (Not longer than the round trip alone: the
+//!   client flushes its acknowledgements every 5 ms and a CBR stream leaves
+//!   most of a frame interval idle, so below a round trip of about 15 ms every
+//!   window would hold one.) With no queue standing,
+//!   `GoogCcDriver::refresh_ceiling` sets such a reading aside: the bound last
+//!   read from a window without a stall stays and goog_cc is not moved. Taken
+//!   at face value the reading published a tenth of the path's rate for
+//!   seconds, and the sender, paced to it and spending all of it, read its own
+//!   rate back as the path's. With a queue standing the low rate is the path's
+//!   answer (a resume at a stale estimate) and is published, though goog_cc is
+//!   still not handed it. The queue test (`standing_queue`: quinn's round trip
+//!   over 1.25 x its ten-second minimum and at least 5 ms over it) is true for up to ten seconds after
+//!   the base round trip rose (a route change) and under jitter that lifts the
+//!   round trip (WiFi): there both rules fall back to what they were, forfeits
+//!   counted and gapped readings published. The fix gives those paths nothing.
 //!
 //! The reading also carries the **payload fraction**, countable bytes per
 //! token spent: admission bills parity, framing and control datagrams that no
