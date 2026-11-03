@@ -59,8 +59,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::frame_backend::{
-    AnalyseError, Analysed, Control, EscalationSlot, FrameBackend, H264Out, PixelSource, TileOut,
-    TileRequest,
+    AnalyseError, Analysed, Control, EscalationSlot, FrameBackend, H264Out, H264Reply, H264Request,
+    PixelSource, TileOut, TileRequest,
 };
 use crate::frame_pool::FrameBuf;
 use crate::server::FrameSubmission;
@@ -79,6 +79,9 @@ pub(super) enum FinishAction {
     H264 {
         force_keyframe: bool,
     },
+    /// An H.264 frame of an acked-reference session: the backend executes the
+    /// `RefManager`'s plan.
+    H264Planned(Box<H264Request>),
     Tile {
         cols: u32,
         rows: u32,
@@ -126,6 +129,12 @@ pub(super) enum FromWorker {
     H264Done {
         seq: u32,
         out: Option<H264Out>,
+        worker_us: u64,
+    },
+    /// The answer to `FinishAction::H264Planned`.
+    H264Planned {
+        seq: u32,
+        reply: H264Reply,
         worker_us: u64,
     },
     TileDone {
@@ -384,6 +393,11 @@ fn run_worker(
                         FinishAction::H264 { force_keyframe } => FromWorker::H264Done {
                             seq,
                             out: backend.finish_h264(&frame, force_keyframe),
+                            worker_us: elapsed_us(t0),
+                        },
+                        FinishAction::H264Planned(req) => FromWorker::H264Planned {
+                            seq,
+                            reply: backend.finish_h264_planned(&frame, &req),
                             worker_us: elapsed_us(t0),
                         },
                         FinishAction::Tile {

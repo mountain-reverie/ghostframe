@@ -215,6 +215,17 @@ impl IoBridge {
         );
     }
 
+    /// The client cannot decode H.264: stop offering it for this session. The
+    /// next HELLO sets the capability afresh.
+    pub(super) fn mark_h264_unavailable(&mut self) {
+        self.client_caps.supports_h264 = false;
+        self.adaptation_context.supports_h264 = false;
+        self.adaptation_context.last_update_seq =
+            self.adaptation_context.last_update_seq.wrapping_add(1);
+        self.classifier
+            .set_adaptation_context(self.adaptation_context);
+    }
+
     /// Return the capabilities most recently advertised by the client via HELLO.
     /// Returns `ClientCapabilities::default()` until the first HELLO is received.
     pub fn current_client_caps(&self) -> crate::transport::client_caps::ClientCapabilities {

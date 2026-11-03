@@ -100,6 +100,9 @@ mod emit;
 
 #[path = "io_bridge/h264_rate.rs"]
 mod h264_rate;
+#[path = "io_bridge/h264_refs.rs"]
+mod h264_refs;
+pub use h264_refs::RefsReport;
 #[path = "io_bridge/h264_tx.rs"]
 mod h264_tx;
 use h264_tx::{H264Gate, H264Tx};
@@ -109,7 +112,8 @@ pub use h264_tx::{H264Report, H264Stats, IdrCause};
 mod frame_backend;
 pub use frame_backend::{
     AnalyseError, Analysed, Cdf53Encoded, Cdf53Tile, Control, EscalationSlot, FrameBackend,
-    GpuBackend, GpuDiag, H264Out, OwnedPalRle, PixelSource, TileOut, TileRequest, TileTimings,
+    GpuBackend, GpuDiag, H264Out, H264Reply, H264Request, OwnedPalRle, PixelSource, TileOut,
+    TileRequest, TileTimings,
 };
 
 #[path = "io_bridge/frame_worker.rs"]
@@ -1483,6 +1487,7 @@ impl IoBridge {
             h264: H264Tx {
                 gop: h264_gop,
                 fps: h264_fps,
+                refs_enabled: !lib_config.transport.h264_legacy,
                 ..H264Tx::default()
             },
             #[cfg(any(test, feature = "browserless-harness"))]
@@ -2157,6 +2162,39 @@ impl IoBridge {
         use ghostframe_protocol::feedback_stream::ResetReason;
 
         self.reset_requests_received = self.reset_requests_received.saturating_add(1);
+        // No decoder: an IDR cannot help. H.264 is unavailable for the rest of
+        // the session (the classifier falls back to the tile codec), whatever
+        // the policy.
+        if msg.reason == ResetReason::NoDecoder {
+            tracing::warn!(
+                frame_seq = msg.frame_seq,
+                "client has no H.264 decoder; H.264 is off for this session"
+            );
+            self.mark_h264_unavailable();
+            return;
+        }
+        // An acked-reference session serves the other reasons: each is a new
+        // plan epoch, which begins with an IDR. The same rate limit applies.
+        if self.h264_refs_live() {
+            let limited = self
+                .last_reset_request_idr_at
+                .is_some_and(|t| now.saturating_duration_since(t) < RESET_REQUEST_MIN_INTERVAL);
+            if limited {
+                self.reset_requests_rate_limited =
+                    self.reset_requests_rate_limited.saturating_add(1);
+                return;
+            }
+            self.last_reset_request_idr_at = Some(now);
+            self.reset_requests_honoured = self.reset_requests_honoured.saturating_add(1);
+            self.note_h264_reset_honoured(now);
+            tracing::info!(
+                frame_seq = msg.frame_seq,
+                reason = ?msg.reason,
+                "client reset request; starting a new H.264 plan epoch (IDR)"
+            );
+            self.h264_refs_client_reset(msg.reason);
+            return;
+        }
         match msg.reason {
             ResetReason::DecoderFailure => {
                 let limited = self
@@ -2181,10 +2219,6 @@ impl IoBridge {
                     "client reports H.264 decoder failure; requesting an IDR"
                 );
                 self.request_h264_idr(IdrCause::ClientReset, now);
-                #[cfg(feature = "browserless-harness")]
-                if let Some(p) = self.h264.pcm.as_mut() {
-                    p.client_reset();
-                }
             }
             ResetReason::Resolution | ResetReason::NoDecoder | ResetReason::GateReset => {
                 tracing::debug!(
@@ -2665,6 +2699,7 @@ impl IoBridge {
                 ledger_records: self.transmission_ledger.len(),
                 probe_cache_fragments: self.reliable_emitter.h264.len(),
                 stalled: self.h264.stalled,
+                refs: self.h264_refs_report(),
                 frame_acks_received: self.frame_acks_received,
                 frame_acks_malformed: self.frame_acks_malformed,
                 #[cfg(any(test, feature = "test-loss-injection"))]

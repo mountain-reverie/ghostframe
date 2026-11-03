@@ -249,6 +249,10 @@ pub struct TransportConfig {
     /// is the default ([`H264_GOP_SECS_DEFAULT`]). Already clamped to
     /// [`H264_GOP_SECS_MIN`]..=[`H264_GOP_SECS_MAX`].
     pub h264_gop_secs: Option<f64>,
+    /// Keep H.264 on the Phase A policy (GOP, loss IDR, parity, reopen) even for
+    /// clients and encoders that could recover by acked references. From
+    /// `GHOSTFRAME_H264_BACKEND=ffmpeg`.
+    pub h264_legacy: bool,
     /// The capture rate the H.264 encoder is fed at (frames per second), set
     /// by the server from its own configuration; 0 means unknown and is read
     /// as [`H264_DEFAULT_FPS`]. The encoder's per-frame budget is the rate
@@ -430,6 +434,10 @@ impl TransportConfig {
             ),
             model: ModelSettings::from_lookup(&get),
             h264_gop_secs: h264_gop_secs_from_lookup(&get),
+            h264_legacy: matches!(
+                get("GHOSTFRAME_H264_BACKEND").as_deref(),
+                Some("ffmpeg") | Some("legacy")
+            ),
             capture_fps: 0,
         }
     }

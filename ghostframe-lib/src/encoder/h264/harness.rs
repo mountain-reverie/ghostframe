@@ -8,26 +8,15 @@
 //!   when an IDR is made (session start, loss, hold timeout, scripted GOP) and
 //!   every P frame predicts from the frame sent before it, with the default
 //!   reference list. It is the baseline the acked-reference policy is
-//!   measured against.
-//! * [`PcmMode::RefManager`] runs the real `RefManager`: it decides every
-//!   frame's plan, the plan is written with the real slice-header writer, and
-//!   the harness feeds it what the transport sees (fragment acknowledgements,
-//!   loss verdicts) and what the client reports. Production does not use it
-//!   yet (B5).
-//!
-//! # The modelled frame ack (0x0A)
-//!
-//! No client sends 0x0A yet. A frame the transport has fully acknowledged is
-//! *not* a stand-in for "decoded": the real `ClientCore` withholds every P
-//! frame behind a lost reference, and `RefManager::frame_decoded` marks the
-//! whole target chain decoded, so a complete P6 would erase the loss of P5.
-//! The scene runner therefore models the ack from what the client really did:
-//! each access unit libavcodec decoded to the picture the encoder meant is a
-//! decoded bit, each one it failed on or showed wrongly a refused bit, and
-//! the resulting `frame_ack` reaches [`PcmSource::frame_ack`] one client ->
-//! server one-way delay after the client acted (applied directly to the
-//! bridge, not carried by a datagram, so it is not itself subject to the
-//! scene's ack loss). B5 replaces this with the real datagram.
+//!   measured against ([`PcmSource`]).
+//! * [`PcmMode::RefManager`] is production's acked-reference path with a
+//!   [`PcmBackend`] for an encoder: the bridge's `RefManager` plans every
+//!   frame, the backend writes the plan with the real slice-header writer, and
+//!   the bridge feeds the manager what the transport sees (fragment
+//!   acknowledgements, loss verdicts) and what the client reports (its own
+//!   0x0A datagrams and 0x09 reset requests), exactly as it does for the
+//!   libva-direct backend. Only the thread hop to the encode worker is
+//!   missing: the stepped harness cannot run one.
 //!
 //! Whatever the source, [`PcmLog`] records, for each frame sent, the picture a
 //! client that decoded the stream the encoder meant would show. The client
@@ -36,20 +25,18 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use ghostframe_protocol::protocol::{
-    FrameRefInfo, FRAME_FLAG_IDR, FRAME_FLAG_MARK_LT, FRAME_FLAG_NON_REF, FRAME_FLAG_TARGET_IS_LT,
-    REF_FRAME_NONE,
-};
 
 pub use super::pcm_decoder::{Decoded, FeedError, PcmDecoder, Strictness};
 pub use super::pcm_writer::{marker_cell, Picture};
 
+use super::backend::{
+    AuMeta, BackendCaps, BackendError, BackendFeedback, EncodedAu, H264Backend, Nv12View,
+    RateTarget, StreamConfig,
+};
 use super::pcm_writer::{access_unit, parameter_sets, pcm_params, FRAME_BYTES};
-use super::refs::{FramePlan, Plan, RefConfig, RefManager, RefTarget};
+use super::refs::{FramePlan, ResidentRef};
 use super::syntax::{SliceHeader, StreamParams};
-use super::tracker::{FrameState, PicKind};
+use super::tracker::PicKind;
 
 /// Bytes of a decoded I420 frame of the PCM writer's pictures. A function, not
 /// a constant: a `pub const` of this crate lands in the generated C header.
@@ -78,25 +65,9 @@ pub struct TruthEntry {
     pub non_ref: bool,
 }
 
-/// The `RefManager`'s counters, copied out for the scene's assertions.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct PcmRefCounters {
-    pub idr_session: u64,
-    pub idr_resolution: u64,
-    pub idr_client_reset: u64,
-    pub idr_encoder_fault: u64,
-    pub idr_reissued: u64,
-    pub p_healthy: u64,
-    pub p_recovery: u64,
-    pub idr_probes: u64,
-    pub reroots: u64,
-    pub candidates_marked: u64,
-    pub anchors_confirmed: u64,
-    pub recoveries: u64,
-    pub recovered: u64,
-    pub plan_mismatch: u64,
-    pub deadline_suspects: u64,
-}
+/// The `RefManager`'s counters (and the bridge's), copied out for the scene's
+/// assertions.
+pub type PcmRefCounters = crate::transport::io_bridge::RefsReport;
 
 /// Shared with the scene runner, which reads it after the scene.
 #[derive(Debug, Default, Clone)]
@@ -104,37 +75,20 @@ pub struct PcmLogInner {
     pub truth: BTreeMap<u32, TruthEntry>,
     /// Frame sequence numbers in the order the encoder produced them.
     pub order: Vec<u32>,
+    /// Published by the bridge as the manager hears things.
     pub refs: PcmRefCounters,
-    /// Frames the `RefManager` was asked to plan and answered `Hold`.
-    pub plan_holds: u64,
-    /// Verdicts and fully acknowledged frames the source was told about.
-    pub verdicts_seen: u64,
-    pub frames_completed: u64,
-    /// Modelled frame acks delivered, and client resets honoured.
-    pub frame_acks: u64,
-    pub client_resets: u64,
 }
 
 pub type PcmLog = Arc<Mutex<PcmLogInner>>;
 
-/// An encoded frame, ready for the send path.
-pub(crate) struct Encoded {
-    pub payload: Vec<u8>,
-    pub is_idr: bool,
-    pub info: FrameRefInfo,
+fn tag_of(seq: u32) -> u16 {
+    u16::try_from(seq).expect("a harness scene has fewer than 65536 frames")
 }
 
-/// A frame the `RefManager` planned: written, not yet reported sent.
-pub(crate) struct Planned {
-    pub encoded: Encoded,
-    plan: FramePlan,
-    header: SliceHeader,
-}
-
-impl Planned {
-    pub(crate) fn cause(&self) -> Option<super::refs::IdrCause> {
-        self.plan.idr_cause
-    }
+fn record(log: &PcmLog, seq: u32, entry: TruthEntry) {
+    let mut l = log.lock().expect("pcm log poisoned");
+    l.truth.insert(seq, entry);
+    l.order.push(seq);
 }
 
 #[derive(Debug)]
@@ -145,109 +99,30 @@ struct Prev {
     picture: Picture,
 }
 
+/// The Phase A stream: an IDR when the bridge asks for one, otherwise a P from
+/// the frame sent before it.
 pub(crate) struct PcmSource {
-    mode: PcmMode,
     params: StreamParams,
     log: PcmLog,
     prev: Option<Prev>,
     idr_pic_id: u32,
-    refm: Option<RefManager>,
     /// See `InjectedH264::pcm_wrong_ref_every`.
     wrong_ref_every: u32,
 }
 
-/// The wire's description of a plan (design 6.1).
-fn plan_info(plan: &FramePlan) -> FrameRefInfo {
-    let mut flags = 0u8;
-    let mut slots = 0u8;
-    if plan.kind == PicKind::Idr {
-        flags |= FRAME_FLAG_IDR;
-    }
-    if plan.nal_ref_idc == 0 {
-        flags |= FRAME_FLAG_NON_REF;
-    }
-    if let Some(k) = plan.mark {
-        flags |= FRAME_FLAG_MARK_LT;
-        slots |= k & 3;
-    }
-    if let Some(RefTarget::Long { slot, .. }) = plan.target {
-        flags |= FRAME_FLAG_TARGET_IS_LT;
-        slots |= (slot & 3) << 2;
-    }
-    FrameRefInfo {
-        flags,
-        slots,
-        ref_frame_seq: plan.ref_frame_seq().unwrap_or(REF_FRAME_NONE),
-    }
-}
-
-fn tag_of(seq: u32) -> u16 {
-    u16::try_from(seq).expect("a harness scene has fewer than 65536 frames")
-}
-
 impl PcmSource {
-    pub(crate) fn new(mode: PcmMode, log: PcmLog, frame_interval: Duration) -> Self {
-        let params = pcm_params();
-        let refm = (mode == PcmMode::RefManager).then(|| {
-            RefManager::new(RefConfig {
-                params,
-                frame_interval,
-                initial_srtt: frame_interval * 4,
-            })
-        });
+    pub(crate) fn new(log: PcmLog) -> Self {
         Self {
-            mode,
-            params,
+            params: pcm_params(),
             log,
             prev: None,
             idr_pic_id: 0,
-            refm,
             wrong_ref_every: 0,
         }
     }
 
     pub(crate) fn set_wrong_ref_every(&mut self, n: u32) {
         self.wrong_ref_every = n;
-    }
-
-    /// The tile codec handed the screen back (design 5.6).
-    pub(crate) fn mode_reentry(&mut self) {
-        if let Some(m) = self.refm.as_mut() {
-            m.mode_reentry();
-            self.publish_counters();
-        }
-    }
-
-    pub(crate) fn mode(&self) -> PcmMode {
-        self.mode
-    }
-
-    fn record(&self, seq: u32, entry: TruthEntry) {
-        let mut l = self.log.lock().expect("pcm log poisoned");
-        l.truth.insert(seq, entry);
-        l.order.push(seq);
-    }
-
-    fn publish_counters(&self) {
-        let Some(m) = &self.refm else { return };
-        let s = m.stats();
-        self.log.lock().expect("pcm log poisoned").refs = PcmRefCounters {
-            idr_session: s.idr_session,
-            idr_resolution: s.idr_resolution,
-            idr_client_reset: s.idr_client_reset,
-            idr_encoder_fault: s.idr_encoder_fault,
-            idr_reissued: s.idr_reissued,
-            p_healthy: s.p_healthy,
-            p_recovery: s.p_recovery,
-            idr_probes: s.idr_probes,
-            reroots: s.reroots,
-            candidates_marked: s.candidates_marked,
-            anchors_confirmed: s.anchors_confirmed,
-            recoveries: s.recoveries,
-            recovered: s.recovered,
-            plan_mismatch: s.plan_mismatch,
-            deadline_suspects: s.deadline_suspects,
-        };
     }
 
     /// The Phase A stream: an IDR when `is_idr`, otherwise a P from the frame
@@ -287,7 +162,8 @@ impl PcmSource {
             }
         };
         au.extend(access_unit(&self.params, &header, tag));
-        self.record(
+        record(
+            &self.log,
             seq,
             TruthEntry {
                 idr: ref_seq.is_none(),
@@ -305,26 +181,72 @@ impl PcmSource {
         (au, ref_seq.is_none())
     }
 
-    /// Ask the `RefManager` for the next frame. `None`: it holds the frame
-    /// (the epoch's IDR is still being delivered).
-    pub(crate) fn plan_frame(&mut self, seq: u32, now: Instant, srtt: Duration) -> Option<Planned> {
-        let m = self.refm.as_mut().expect("plan_frame needs the RefManager");
-        m.tick(now, srtt);
-        let plan = match m.plan_next(seq, now) {
-            Plan::Hold => {
-                self.log.lock().expect("pcm log poisoned").plan_holds += 1;
-                self.publish_counters();
-                return None;
-            }
-            Plan::Frame(p) => p,
-        };
+    pub(crate) fn session_reset(&mut self) {
+        self.prev = None;
+    }
+}
+
+/// A PCM-patch encoder behind the backend trait: it executes the
+/// `RefManager`'s plan with the real slice-header writer and records the
+/// picture the frame is meant to show. Frame sizes are set by the scene
+/// (`set_sizes`): the natural size of a PCM P frame is one datagram.
+pub(crate) struct PcmBackend {
+    params: StreamParams,
+    log: PcmLog,
+    /// Sizes the access units are padded to; 0 leaves the natural size.
+    idr_bytes: usize,
+    p_bytes: usize,
+    rate: Option<RateTarget>,
+}
+
+impl PcmBackend {
+    pub(crate) fn new(log: PcmLog) -> Self {
+        Self {
+            params: pcm_params(),
+            log,
+            idr_bytes: 0,
+            p_bytes: 0,
+            rate: None,
+        }
+    }
+
+    pub(crate) fn set_sizes(&mut self, idr_bytes: usize, p_bytes: usize) {
+        self.idr_bytes = idr_bytes;
+        self.p_bytes = p_bytes;
+    }
+}
+
+impl H264Backend for PcmBackend {
+    fn caps(&self) -> BackendCaps {
+        BackendCaps {
+            explicit_refs: true,
+            max_lt: 2,
+            max_ref_frames: self.params.max_num_ref_frames as u8,
+            vbr: true,
+        }
+    }
+
+    fn open(&mut self, cfg: &StreamConfig) -> Result<(), BackendError> {
+        self.rate = Some(cfg.rate);
+        Ok(())
+    }
+
+    fn encode(
+        &mut self,
+        _nv12: &Nv12View<'_>,
+        plan: &FramePlan,
+        _refs: &[ResidentRef],
+    ) -> Result<EncodedAu, BackendError> {
+        let seq = plan.frame_seq;
         let tag = tag_of(seq);
         let header = plan.slice_header(&self.params);
         let is_idr = plan.kind == PicKind::Idr;
         let (picture, ref_seq) = if is_idr {
             (Picture::idr(tag), None)
         } else {
-            let t = plan.ref_frame_seq().expect("a P plan names its target");
+            let t = plan
+                .ref_frame_seq()
+                .ok_or_else(|| BackendError::Plan("a P plan names its target".into()))?;
             let base = self
                 .log
                 .lock()
@@ -332,7 +254,7 @@ impl PcmSource {
                 .truth
                 .get(&t)
                 .map(|e| e.picture.clone())
-                .unwrap_or_else(|| panic!("frame {seq}: plan names {t}, which was never made"));
+                .ok_or_else(|| BackendError::Plan(format!("frame {seq}: {t} was never made")))?;
             (Picture::predicted(&base, tag), Some(t))
         };
         let mut payload = Vec::new();
@@ -340,7 +262,12 @@ impl PcmSource {
             payload.extend(parameter_sets(&self.params));
         }
         payload.extend(access_unit(&self.params, &header, tag));
-        self.record(
+        pad_to(
+            &mut payload,
+            if is_idr { self.idr_bytes } else { self.p_bytes },
+        );
+        record(
+            &self.log,
             seq,
             TruthEntry {
                 idr: is_idr,
@@ -349,77 +276,21 @@ impl PcmSource {
                 non_ref: plan.nal_ref_idc == 0,
             },
         );
-        Some(Planned {
-            encoded: Encoded {
-                payload,
-                is_idr,
-                info: plan_info(&plan),
+        Ok(EncodedAu {
+            payload,
+            meta: AuMeta {
+                idr: is_idr,
+                header: Some(header),
+                ref_seq,
             },
-            plan,
-            header,
         })
     }
 
-    /// The planned frame went on the wire as `frags_total` fragments.
-    pub(crate) fn plan_sent(&mut self, p: &Planned, frags_total: u16, now: Instant) {
-        let m = self.refm.as_mut().expect("plan_sent needs the RefManager");
-        m.frame_sent(&p.plan, &p.header, frags_total, now);
-        self.publish_counters();
+    fn set_rate(&mut self, rate: RateTarget) {
+        self.rate = Some(rate);
     }
 
-    pub(crate) fn frag_acked(&mut self, seq: u32, frag_idx: u16, now: Instant) {
-        if let Some(m) = self.refm.as_mut() {
-            m.frag_acked(seq, frag_idx, now);
-        }
-    }
-
-    /// Every fragment of the frame is acknowledged. Counted only: transport
-    /// completeness says nothing about decoding (see the module docs).
-    pub(crate) fn frame_complete(&mut self, _seq: u32) {
-        self.log.lock().expect("pcm log poisoned").frames_completed += 1;
-    }
-
-    /// The modelled 0x0A: bit `i` of each mask is frame `newest - i`.
-    pub(crate) fn frame_ack(&mut self, newest: u32, decoded: u64, refused: u64) {
-        self.log.lock().expect("pcm log poisoned").frame_acks += 1;
-        if let Some(m) = self.refm.as_mut() {
-            m.frame_ack(newest, decoded, refused);
-            self.publish_counters();
-        }
-    }
-
-    /// The server honoured a client reset request (0x09).
-    pub(crate) fn client_reset(&mut self) {
-        self.log.lock().expect("pcm log poisoned").client_resets += 1;
-        if let Some(m) = self.refm.as_mut() {
-            m.client_reset(super::refs::ResetReason::DecoderFailure);
-            self.publish_counters();
-        }
-    }
-
-    pub(crate) fn frame_suspect(&mut self, seq: u32) {
-        self.log.lock().expect("pcm log poisoned").verdicts_seen += 1;
-        if let Some(m) = self.refm.as_mut() {
-            m.frame_suspect(seq);
-            self.publish_counters();
-        }
-    }
-
-    pub(crate) fn session_reset(&mut self) {
-        self.prev = None;
-        if let Some(m) = self.refm.as_mut() {
-            m.session_reset();
-            self.publish_counters();
-        }
-    }
-
-    /// Whether the `RefManager` has lost faith in the frame.
-    pub(crate) fn frame_is_suspect(&self, seq: u32) -> bool {
-        self.refm
-            .as_ref()
-            .and_then(|m| m.frame_state(seq))
-            .is_some_and(|s| matches!(s, FrameState::Suspect | FrameState::Dead))
-    }
+    fn feedback(&mut self, _fb: BackendFeedback) {}
 }
 
 /// Grow an access unit to `target` bytes with a filler-data NAL unit (type 12),

@@ -17,6 +17,11 @@
 
 use std::time::{Duration, Instant};
 
+use ghostframe_protocol::protocol::{
+    FrameRefInfo, FRAME_FLAG_IDR, FRAME_FLAG_MARK_LT, FRAME_FLAG_NON_REF, FRAME_FLAG_TARGET_IS_LT,
+    REF_FRAME_NONE,
+};
+
 use super::syntax::{DecoderModel, Effective, Mmco, RefPic, Rplm, SliceHeader, StreamParams};
 use super::tracker::{seq_lt, FragAck, FrameRec, FrameState, FrameTable, PicKind};
 
@@ -93,6 +98,35 @@ impl FramePlan {
     /// `ref_frame_seq` for the frame header: the named picture, if any.
     pub(crate) fn ref_frame_seq(&self) -> Option<u32> {
         self.target.map(|t| t.seq())
+    }
+
+    /// The wire's description of this frame (design 6.1): IDR, non-ref, mark
+    /// and target-is-LT flags, the two slot indices, and the reference. The
+    /// reference is `ref_seq`, what the backend really put in
+    /// `RefPicList0[0]`, so the client gate checks the stream and not the
+    /// manager's belief; `None` falls back to the plan's.
+    pub(crate) fn wire_info(&self, ref_seq: Option<u32>) -> FrameRefInfo {
+        let mut flags = 0u8;
+        let mut slots = 0u8;
+        if self.kind == PicKind::Idr {
+            flags |= FRAME_FLAG_IDR;
+        }
+        if self.nal_ref_idc == 0 {
+            flags |= FRAME_FLAG_NON_REF;
+        }
+        if let Some(k) = self.mark {
+            flags |= FRAME_FLAG_MARK_LT;
+            slots |= k & 3;
+        }
+        if let Some(RefTarget::Long { slot, .. }) = self.target {
+            flags |= FRAME_FLAG_TARGET_IS_LT;
+            slots |= (slot & 3) << 2;
+        }
+        FrameRefInfo {
+            flags,
+            slots,
+            ref_frame_seq: ref_seq.or(self.ref_frame_seq()).unwrap_or(REF_FRAME_NONE),
+        }
     }
 }
 
@@ -351,6 +385,13 @@ impl RefManager {
         best
     }
 
+    /// How long ago the newest confirmed anchor was sent, if there is one.
+    pub(crate) fn anchor_age(&self, now: Instant) -> Option<Duration> {
+        let a = self.anchor()?;
+        let f = self.table.get(a.seq)?;
+        Some(now.saturating_duration_since(f.sent_at))
+    }
+
     /// Every reference the encoder-side DPB holds (short-term oldest first,
     /// then long-term by slot): the backend lists all of them on every frame.
     pub(crate) fn resident_refs(&self) -> Vec<ResidentRef> {
@@ -398,6 +439,22 @@ impl RefManager {
     pub(crate) fn session_reset(&mut self) {
         self.idr_backoff = 0;
         self.begin_epoch(IdrCause::SessionStart);
+    }
+
+    /// The backend failed (or its stream could not be followed): start over
+    /// with an IDR, counted as an encoder fault and not as a session start.
+    pub(crate) fn encoder_fault(&mut self) {
+        self.idr_backoff = 0;
+        self.begin_epoch(IdrCause::EncoderFault);
+    }
+
+    /// The stream left H.264 while the epoch's IDR was still being delivered:
+    /// the fragments were purged, so the IDR is dead and the return sends it
+    /// again at once instead of waiting out its timeout.
+    pub(crate) fn idr_abandoned(&mut self) {
+        if let Some(i) = self.idr_seq.filter(|&i| self.table.idr_incomplete(i)) {
+            self.table.set_dead(i);
+        }
     }
 
     pub(crate) fn resolution_change(&mut self) {

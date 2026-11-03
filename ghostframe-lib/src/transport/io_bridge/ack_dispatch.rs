@@ -546,21 +546,25 @@ impl IoBridge {
         self.reliable_emitter.on_nack(&entries, now_std());
     }
 
-    /// Handle an H.264 frame acknowledgement (datagram 0x0A). Phase A only
-    /// counts it: nothing consumes frame acks until the H.264 ledger lands, so
-    /// a malformed one is dropped and an accepted one is logged at debug.
+    #[cfg(test)]
+    pub(super) fn dispatch_frame_ack_for_test(&mut self, dg: Vec<u8>) {
+        self.dispatch_frame_ack_datagram(&dg);
+    }
+
+    /// Handle an H.264 frame acknowledgement (datagram 0x0A). An
+    /// acked-reference session feeds it to the `RefManager`; every session
+    /// counts it. A malformed one is dropped.
     fn dispatch_frame_ack_datagram(&mut self, dg: &[u8]) {
         match crate::transport::protocol::FrameAck::decode(dg) {
             Ok(ack) => {
                 self.frame_acks_received = self.frame_acks_received.saturating_add(1);
-                #[cfg(feature = "browserless-harness")]
-                self.pcm_frame_ack(ack.newest_seq, ack.decoded_mask, ack.refused_mask);
+                self.h264_refs_frame_ack(ack.newest_seq, ack.decoded_mask, ack.refused_mask);
                 tracing::debug!(
                     target: LOG_TARGET,
                     newest_seq = ack.newest_seq,
                     decoded_mask = format_args!("{:#018x}", ack.decoded_mask),
                     refused_mask = format_args!("{:#018x}", ack.refused_mask),
-                    "frame ack received (ignored until the H.264 ledger lands)"
+                    "frame ack received"
                 );
             }
             Err(e) => {

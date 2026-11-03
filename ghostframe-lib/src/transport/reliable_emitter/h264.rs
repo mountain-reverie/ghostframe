@@ -133,6 +133,20 @@ impl H264Cache {
         dropped
     }
 
+    /// Forget the one frame `frame_seq`. Returns the fragments dropped.
+    pub fn drop_frame(&mut self, frame_seq: u32) -> usize {
+        let Some(f) = self.frames.remove(&frame_seq) else {
+            return 0;
+        };
+        let mut dropped = 0;
+        for e in f.frags.into_values() {
+            dropped += 1;
+            self.bytes -= e.datagram.len();
+        }
+        self.entries -= dropped;
+        dropped
+    }
+
     /// Forget every frame from `frame_seq` on: they chain from a frame that
     /// will not be decoded, so nothing of them is worth probing. Returns the
     /// fragments dropped.
