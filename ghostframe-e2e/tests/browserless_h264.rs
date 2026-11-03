@@ -1058,6 +1058,10 @@ struct StepRun {
 const STEP_AT_US: u64 = 6_000_000;
 const STEP_FROM_BPS: u64 = 2_000_000;
 const STEP_TO_BPS: u64 = 6_000_000;
+/// The client-to-server variants the populations run: as it comes, one extra
+/// packet at once per delivery, and one 8 ms after it.
+const CHATTER: [Option<Duration>; 3] = [None, Some(Duration::ZERO), Some(CHATTER_LATE)];
+const CHATTER_LATE: Duration = Duration::from_millis(8);
 /// `2 x MIN_TIME_BETWEEN_ALR_PROBES + 1 s`, the D1 P6b bound (design 4.3).
 const T_UP_US: u64 = 11_000_000;
 /// The seeds the P-B gates run: the first six of the 24 timelines
@@ -1071,6 +1075,10 @@ async fn capacity_step(seed: u64) -> StepRun {
 }
 
 async fn capacity_step_with_jitter(seed: u64, jitter_us: u64) -> StepRun {
+    capacity_step_with(seed, jitter_us, None).await
+}
+
+async fn capacity_step_with(seed: u64, jitter_us: u64, ack_chatter: Option<Duration>) -> StepRun {
     let net = bottleneck_net(
         CapTimeline::step(STEP_FROM_BPS / 8, STEP_AT_US, STEP_TO_BPS / 8),
         20_000,
@@ -1079,7 +1087,10 @@ async fn capacity_step_with_jitter(seed: u64, jitter_us: u64) -> StepRun {
     );
     let r = run(
         scene(seed, 30, net, cbr_load(), DropPlan::default()),
-        RunOptions::default(),
+        RunOptions {
+            ack_chatter,
+            ..RunOptions::default()
+        },
     )
     .await
     .expect("scene");
@@ -1289,37 +1300,101 @@ async fn probe_bursts_cause_no_verdicts_on_a_jittery_link() {
     assert_eq!(in_probe, 0, "a verdict fell on a datagram of a probe burst");
 }
 
-/// The population behind `P_B_SEEDS`: 24 timelines, how many meet each bound.
-/// Ignored (it asserts nothing and takes a few seconds): run it to see the
-/// numbers, which are the honest account of how reliably the bound is met.
-/// Measured on this commit: 22 of 24 reach `0.8 x 6` Mbit/s within 11 s
-/// (slowest of those 10.6 s; one never does in 24 s, one takes 15.4 s) and all
-/// 24 keep the lower bound.
-#[tokio::test(start_paused = true)]
-#[ignore = "characterisation: prints the P-B outcome of 24 seeds"]
-async fn p_b_seed_population() {
-    let (mut up, mut low_ok) = (0, 0);
-    for i in 0..24u64 {
-        let seed = 0x6701 + i;
-        let st = capacity_step(seed).await;
-        let (reached, low) = step_outcome(&st);
-        println!("SEED {seed:#x} reached={reached:?} lowest/pre-min={low:.2}");
-        if low < 0.8 || reached.is_none_or(|t| t > T_UP_US) {
-            report("  dbg", &st.r);
-            println!("  dbg idr by cause: {:?}", st.r.h264.stats.idr_by_cause);
-            let ser: Vec<String> =
-                st.r.bwe_estimate_samples
-                    .iter()
-                    .filter(|(t, _)| *t >= STEP_AT_US - 1_000_000 && *t < STEP_AT_US + 8_000_000)
-                    .step_by(6)
-                    .map(|(t, b)| format!("{}:{}", t / 1000, b))
-                    .collect();
-            println!("  dbg est {}", ser.join(" "));
-        }
-        up += reached.is_some_and(|t| t <= T_UP_US) as u32;
-        low_ok += (low >= 0.8) as u32;
+/// One run of the capacity-step scene, reduced to what the population gates
+/// read.
+struct StepSummary {
+    seed: u64,
+    /// Time from the step to `0.8 x` the new capacity, if reached.
+    reached: Option<u64>,
+    /// Lowest estimate within `T_UP` of the step over the pre-step minimum.
+    low: f64,
+    /// Lowest estimate from the step to the end of the run over the pre-step
+    /// minimum: the link is lossless and only ever faster after the step, so
+    /// anything under half is the loop collapsing.
+    min_all: f64,
+    /// Share of the run's ceiling readings that found the sender saturated.
+    sat_share: f64,
+    /// The headroom guard let go in time (see
+    /// `the_headroom_guard_releases_in_h264_mode_on_a_capacity_step`).
+    guard_ok: bool,
+}
+
+impl StepSummary {
+    fn hit(&self) -> bool {
+        self.reached.is_some_and(|t| t <= T_UP_US)
     }
-    println!("within T_UP: {up}/24, lower bound kept: {low_ok}/24");
+    fn collapsed(&self) -> bool {
+        self.min_all < 0.5
+    }
+}
+
+/// `ack_chatter` adds one client-to-server packet per delivery (see
+/// `RunOptions::ack_chatter`): the same scene with the client-to-server timing
+/// earlier, which must not change what the estimate finds.
+async fn step_summary(seed: u64, ack_chatter: Option<Duration>) -> StepSummary {
+    let st = capacity_step_with(seed, 0, ack_chatter).await;
+    let (reached, low) = step_outcome(&st);
+    let min_all = st
+        .post
+        .iter()
+        .map(|x| x.1)
+        .min()
+        .expect("samples after the step");
+    let b = &st.r.transport.instr.bwe;
+    let (engaged, released) = guard_release(&st);
+    StepSummary {
+        seed,
+        reached,
+        low,
+        min_all: min_all as f64 / st.pre_min as f64,
+        sat_share: b.ceiling_saturated_reads as f64 / b.ceiling_reads.max(1) as f64,
+        guard_ok: engaged && released.is_some_and(|t| t <= T_UP_US + 2_000_000),
+    }
+}
+
+/// The population behind `P_B_SEEDS`: `GF_POP_N` timelines (24 by default)
+/// from `0x6701 + GF_POP_START`, each run as it comes and with one extra
+/// client packet per delivery, at once and 8 ms later, and how many meet each bound. Ignored (it asserts
+/// nothing and takes a minute per hundred seeds): run it to see the numbers,
+/// which are the honest account of how reliably the bounds are met.
+///
+/// Measured over the 192 timelines 0x6701..=0x6760, three times (see the rows):
+///
+/// | | reach 0.8 x 6 in 11 s | lower bound | collapses (< 0.5) |
+/// | before, as sent | 178/192 | 183/192 | 15 |
+/// | before, a packet at once | 181/192 | 172/192 | 27 |
+/// | before, a packet 8 ms later | 151/192 | 185/192 | 10 |
+#[tokio::test(start_paused = true)]
+#[ignore = "characterisation: prints the P-B outcome of GF_POP_N seeds, three times"]
+async fn p_b_seed_population() {
+    let n: u64 = std::env::var("GF_POP_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let start: u64 = std::env::var("GF_POP_START")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    for chatter in CHATTER {
+        let mut all = Vec::new();
+        for i in start..start + n {
+            let s = step_summary(0x6701 + i, chatter).await;
+            println!(
+                "SEED {:#x} chatter={chatter:?} reached={:?} lowest/pre-min={:.2} min/pre-min={:.2} saturated={:.2} guard_ok={}",
+                s.seed, s.reached, s.low, s.min_all, s.sat_share, s.guard_ok
+            );
+            all.push(s);
+        }
+        let count = |f: &dyn Fn(&StepSummary) -> bool| all.iter().filter(|s| f(s)).count();
+        println!(
+            "SUMMARY chatter={chatter:?} n={n}: within T_UP {}, lower bound kept {}, collapses {}, guard released {}, mean saturated share {:.2}",
+            count(&|s| s.hit()),
+            count(&|s| s.low >= 0.8),
+            count(&|s| s.collapsed()),
+            count(&|s| s.guard_ok),
+            all.iter().map(|s| s.sat_share).sum::<f64>() / all.len().max(1) as f64
+        );
+    }
 }
 
 /// IDRs per minute on a steady 2 Mbit/s link (60 s, 3 seeds): the cost of the
@@ -1355,6 +1430,39 @@ async fn idrs_per_minute_on_a_steady_two_megabit_link() {
     }
 }
 
+/// Replay the run's estimate through the classifier's headroom guard: whether
+/// it held H.264 before the step, and how long after the step it let go.
+fn guard_release(st: &StepRun) -> (bool, Option<u64>) {
+    use ghostframe_lib::config::ClassifierConfig;
+    use ghostframe_lib::tile::classifier::{AdaptationContext, Classifier};
+    use ghostframe_lib::tile::{CodecState, FrameMode};
+    let mut c = Classifier::new(ClassifierConfig::default());
+    let tentative = [CodecState::Solid];
+    let mut mode = FrameMode::TileCodec;
+    let mut engaged_before_step = false;
+    let mut released_at = None;
+    for (t_us, bps) in &st.r.bwe_estimate_samples {
+        c.set_adaptation_context(AdaptationContext {
+            supports_h264: true,
+            bwe_estimate_bps: *bps,
+            smoothed_rtt_us: 40_000.0,
+            loss_rate: 0.0,
+            suspended: false,
+            last_update_seq: 1,
+            ..Default::default()
+        });
+        let was_h264 = mode == FrameMode::H264;
+        mode = c.decide_frame_mode_at(*t_us, &tentative, mode);
+        if *t_us < STEP_AT_US && mode == FrameMode::H264 {
+            engaged_before_step = true;
+        }
+        if *t_us >= STEP_AT_US && was_h264 && mode == FrameMode::TileCodec {
+            released_at.get_or_insert(*t_us - STEP_AT_US);
+        }
+    }
+    (engaged_before_step, released_at)
+}
+
 /// The classifier's headroom guard keeps the session in H.264 while the
 /// estimate is under 2 Mbit/s and lets go after it has stayed over 3 Mbit/s for
 /// a second. A CBR stream at 0.8 x its estimate cannot raise the estimate by
@@ -1369,35 +1477,9 @@ async fn idrs_per_minute_on_a_steady_two_megabit_link() {
 /// reaches the exit line and this fails (the report lists it).
 #[tokio::test(start_paused = true)]
 async fn the_headroom_guard_releases_in_h264_mode_on_a_capacity_step() {
-    use ghostframe_lib::config::ClassifierConfig;
-    use ghostframe_lib::tile::classifier::{AdaptationContext, Classifier};
-    use ghostframe_lib::tile::{CodecState, FrameMode};
     for seed in [0x6701u64, 0x6702, 0x6703] {
         let st = capacity_step(seed).await;
-        let mut c = Classifier::new(ClassifierConfig::default());
-        let tentative = [CodecState::Solid];
-        let mut mode = FrameMode::TileCodec;
-        let mut engaged_before_step = false;
-        let mut released_at = None;
-        for (t_us, bps) in &st.r.bwe_estimate_samples {
-            c.set_adaptation_context(AdaptationContext {
-                supports_h264: true,
-                bwe_estimate_bps: *bps,
-                smoothed_rtt_us: 40_000.0,
-                loss_rate: 0.0,
-                suspended: false,
-                last_update_seq: 1,
-                ..Default::default()
-            });
-            let was_h264 = mode == FrameMode::H264;
-            mode = c.decide_frame_mode_at(*t_us, &tentative, mode);
-            if *t_us < STEP_AT_US && mode == FrameMode::H264 {
-                engaged_before_step = true;
-            }
-            if *t_us >= STEP_AT_US && was_h264 && mode == FrameMode::TileCodec {
-                released_at.get_or_insert(*t_us - STEP_AT_US);
-            }
-        }
+        let (engaged_before_step, released_at) = guard_release(&st);
         println!("guard seed {seed:#x}: engaged before step: {engaged_before_step}, released {released_at:?} us after it");
         assert!(
             engaged_before_step,
