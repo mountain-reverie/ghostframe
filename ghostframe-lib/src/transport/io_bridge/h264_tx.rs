@@ -254,6 +254,11 @@ pub struct H264Report {
     pub acks_blacked_out: u64,
     /// The `h264_stalled` flag as of the last evaluation.
     pub stalled: bool,
+    /// Frame acks (datagram 0x0A) that parsed, and ones that did not. Nothing
+    /// consumes them yet; a scene asserts the client's datagram reaches the
+    /// server intact.
+    pub frame_acks_received: u64,
+    pub frame_acks_malformed: u64,
 }
 
 /// One frame the tracker follows.
@@ -1076,10 +1081,12 @@ impl IoBridge {
         }
     }
 
-    /// The modelled frame ack (see [`crate::encoder::h264_harness`]): the
-    /// client's decoded and refused frames, as 0x0A masks.
+    /// A frame ack (0x0A) the client sent, for the `RefManager` source of a PCM
+    /// scene. Production only counts it (B5b will route it to the manager);
+    /// the PCM source is the manager behind the real send path, and it hears
+    /// the client's own datagram.
     #[cfg(feature = "browserless-harness")]
-    pub fn harness_frame_ack(&mut self, newest: u32, decoded: u64, refused: u64) {
+    pub(super) fn pcm_frame_ack(&mut self, newest: u32, decoded: u64, refused: u64) {
         if let Some(p) = self.h264.pcm.as_mut() {
             p.frame_ack(newest, decoded, refused);
         }

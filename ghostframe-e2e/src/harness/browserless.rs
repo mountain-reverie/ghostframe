@@ -68,6 +68,7 @@ use tokio::task::LocalSet;
 use tokio::time::Instant as TokioInstant;
 
 use ghostframe_client_core::Event as CoreEvent;
+use ghostframe_client_core::H264Outcome;
 use ghostframe_client_net::{ClientNet, ClientNetConfig, ClientNetEvent};
 use ghostframe_lib::encoder::h264_harness::PcmMode;
 use ghostframe_lib::transport::ghostbridge::encode_frame;
@@ -295,6 +296,11 @@ pub struct RunOptions {
     /// client-to-server path is touched (frame acks, feedback, QUIC itself).
     pub ack_blackout: Option<(Duration, Duration)>,
 }
+
+/// How long the harness's perfect decoder takes to answer for an access unit
+/// (a hardware decode plus the readback, about 8 ms). Zero would answer before
+/// the frame's own ack batch could be flushed, which a real decoder never does.
+pub const PERFECT_DECODER_LATENCY_US: u64 = 8_000;
 
 /// How a scene drives the server's `IoBridge`.
 ///
@@ -1144,7 +1150,7 @@ async fn run_inner(
     let mut framebuffer = FrameBuffer::new();
     let mut h264_display = match &scene.load {
         SceneLoad::H264(h) if h.pcm.is_some() => {
-            Some(crate::harness::h264_scene::H264Display::new().with_truth(pcm_log.clone()))
+            Some(crate::harness::h264_scene::H264Display::new())
         }
         _ => None,
     };
@@ -1512,7 +1518,8 @@ async fn drive_session(
     };
 
     let mut events: Vec<ClientNetEvent> = Vec::new();
-    let mut pending_frame_acks: std::collections::VecDeque<(u64, (u32, u64, u64))> =
+    // `(due_us, frame_seq)` of the access units the perfect decoder is working on.
+    let mut decode_queue: std::collections::VecDeque<(u64, u32)> =
         std::collections::VecDeque::new();
     let mut bytes_delivered: u64 = 0;
     let mut bytes_delivered_s2c: u64 = 0;
@@ -1752,6 +1759,15 @@ async fn drive_session(
 
         let new_events = client.take_events();
         for ev in &new_events {
+            // A scene without pictures has no decoder: a perfect one stands
+            // in, as the product's would be (no delay, never fails), so the
+            // client core's frame ack (0x0A) is exercised end to end in every
+            // H.264 scene.
+            if h264_display.is_none() {
+                if let ClientNetEvent::Core(CoreEvent::NeedsH264 { frame_seq, .. }) = ev {
+                    decode_queue.push_back((now_us(base) + PERFECT_DECODER_LATENCY_US, *frame_seq));
+                }
+            }
             if let ClientNetEvent::Core(CoreEvent::TileReady {
                 frame_seq,
                 tile_x,
@@ -1762,24 +1778,25 @@ async fn drive_session(
                 framebuffer.apply_tile_ready(*frame_seq, *tile_x, *tile_y, rgba.clone());
             }
         }
+        // The perfect decoder answers `PERFECT_DECODER_LATENCY_US` after the
+        // frame was handed to it, so the frame ack's ride on the ack batch is
+        // tested with a decoder that is not instantaneous.
+        while decode_queue
+            .front()
+            .is_some_and(|&(due, _)| due <= now_us(base))
+        {
+            let (_, seq) = decode_queue.pop_front().expect("checked");
+            client.h264_result(seq, H264Outcome::Decoded, now_us(base));
+            moved = true;
+        }
         if let Some(d) = h264_display.as_mut() {
-            // The legacy client decodes what the core hands it and, as the
-            // renderer does, asks for an IDR when the decoder fails. The
-            // modelled frame ack (0x0A) reaches the server one one-way delay
-            // later.
+            // A scene with pictures decodes what the gate feeds with
+            // libavcodec and reports each outcome to the core, as the renderer
+            // does: the frame ack and the reset request after a failure are
+            // the core's own.
             let t = now_us(base);
-            let rep = d.on_events(t, &new_events);
-            for seq in &rep.failed {
-                d.resets += 1;
-                client.request_reset(
-                    crate::harness::h264_scene::H264Display::RESET_REASON,
-                    *seq,
-                    t,
-                );
-            }
-            if let Some(ack) = rep.frame_ack() {
-                let c2s_delay = links.c2s.as_ref().unwrap_or(&scene.net).delay_us;
-                pending_frame_acks.push_back((t + c2s_delay, ack));
+            for (seq, outcome) in d.on_events(t, &new_events) {
+                client.h264_result(seq, outcome, t);
             }
         }
         events.extend(new_events);
@@ -1887,20 +1904,6 @@ async fn drive_session(
             }
         }
 
-        // The modelled frame acks that have arrived (stepped mode only: the
-        // concurrent bridge is a task this loop cannot reach).
-        if let Some(bridge) = bridge.as_deref_mut() {
-            while pending_frame_acks
-                .front()
-                .is_some_and(|&(due, _)| due <= now_us(base))
-            {
-                let (_, (newest, decoded, refused)) =
-                    pending_frame_acks.pop_front().expect("checked");
-                bridge.harness_frame_ack(newest, decoded, refused);
-                moved = true;
-            }
-        }
-
         // Stepped: one turn of the server's loop for everything now in its
         // pipe and its channel, run to the point where it has nothing ready.
         // This is the production loop body, stepped here rather than spawned,
@@ -1950,6 +1953,9 @@ async fn drive_session(
         let mut wake_at = overall_deadline;
         if let Some(d) = client.poll_timeout() {
             wake_at = wake_at.min(base + Duration::from_micros(d));
+        }
+        if let Some(&(due, _)) = decode_queue.front() {
+            wake_at = wake_at.min(base + Duration::from_micros(due));
         }
         if let Some(next) = in_flight.peek() {
             wake_at = wake_at.min(base + Duration::from_micros(next.at_us));

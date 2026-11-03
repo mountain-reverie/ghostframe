@@ -553,6 +553,8 @@ impl IoBridge {
         match crate::transport::protocol::FrameAck::decode(dg) {
             Ok(ack) => {
                 self.frame_acks_received = self.frame_acks_received.saturating_add(1);
+                #[cfg(feature = "browserless-harness")]
+                self.pcm_frame_ack(ack.newest_seq, ack.decoded_mask, ack.refused_mask);
                 tracing::debug!(
                     target: LOG_TARGET,
                     newest_seq = ack.newest_seq,

@@ -521,13 +521,10 @@ async fn the_ref_manager_source_runs_end_to_end_with_no_loss() {
 /// planning healthy frames off the lost one to the end of the scene
 /// (`refs_to_undisplayed` 262 of 272 with it, against a handful without).
 ///
-/// What the scene does not claim, because it is not true yet: that the
-/// stream recovers. The legacy ClientCore holds back every P frame whose
-/// `ref_frame_seq` is not the newest frame it delivered, and a recovery P names
-/// the anchor, so after the first real loss it shows nothing more (about 9 s
-/// frozen) and asks for an IDR the manager rightly does not make. That is the
-/// client-side gate (design 7.1) and the eviction change, both B5; the
-/// assertion that the client freezes is for B5 to invert.
+/// With the legacy ClientCore this scene froze for about 9 s after the first
+/// real loss: it held back every P frame whose `ref_frame_seq` was not the
+/// newest it had delivered, and a recovery P names the anchor. With the
+/// client gate (design 7.1) the stream recovers: no freeze, no wrong picture.
 #[tokio::test(start_paused = true)]
 async fn the_ref_manager_source_recovers_from_a_real_loss_not_a_transport_completion() {
     for seed in SEEDS {
@@ -542,7 +539,7 @@ async fn the_ref_manager_source_recovers_from_a_real_loss_not_a_transport_comple
         // manager.
         assert!(r.s2c_datagrams_dropped > 0, "{ctx}");
         assert!(r.h264.stats.verdicts_p_frag > 0, "{ctx}");
-        assert!(o.never_fed > 10, "{ctx}: no frame was lost for good");
+        assert!(o.never_fed > 0, "{ctx}: no frame was lost for good");
         assert!(run.truth.frame_acks > 0, "{ctx}");
         assert_eq!(o.unknown_to_truth, 0, "{ctx}");
         assert_eq!(o.header_ref_mismatches, 0, "{ctx}");
@@ -557,7 +554,28 @@ async fn the_ref_manager_source_recovers_from_a_real_loss_not_a_transport_comple
             o.refs_to_undisplayed,
             o.made
         );
-        // The known client-side limit (B5 inverts this).
-        assert!(o.freezes >= 1, "{ctx}");
+        // The client gate (design 7.1) is the real one now: a recovery P that
+        // names the anchor is fed, not held back, so the stream recovers where
+        // the legacy client froze for about 9 s. Everything the gate feeds
+        // decodes to the picture the plan named, no long frozen stretch, and the
+        // manager's recoveries all land (the last may be in flight).
+        assert_eq!(o.correct, o.fed, "{ctx}");
+        assert_eq!((o.rejected, o.no_picture, o.damaged), (0, 0, 0), "{ctx}");
+        // A freeze here is a gap over four frame periods; the longest across
+        // 16 seeds was 189 ms (the legacy client froze for about 9 s). The
+        // frame ack rides the next ack batch, so a recovery waits up to a frame
+        // longer than with an ack of its own.
+        assert!(
+            o.frozen_us < 200_000 && o.freezes <= 4,
+            "{ctx}: {} freezes, {} us",
+            o.freezes,
+            o.frozen_us
+        );
+        assert!(o.max_gap_us < 300_000, "{ctx}: gap {} us", o.max_gap_us);
+        assert!(c.recovered + 1 >= c.recoveries, "{ctx}: {c:?}");
+        assert!(
+            o.last_correct_us.unwrap_or(0) + 1_000_000 >= 10_000_000,
+            "{ctx}: dead at the end"
+        );
     }
 }
