@@ -8,12 +8,17 @@
 //! older than that is superseded and dropped, which loses nothing because it
 //! only overwrites pixels.
 //!
-//! CDF 5/3 entries are *never* dropped and are not asked about: they
-//! integrate into per-tile coefficient state, and refinement passes of one
-//! tile re-use a single `frame_seq` (see `dirty.rs`). They do count towards
-//! the newest `frame_seq`, so an older stateless draw under a newer pass is
-//! dropped, and the flush draws the lift first so a newer stateless draw lands
-//! on top of an older pass. Equal sequence numbers never supersede.
+//! CDF 5/3 entries are not asked about either, but they are not simply
+//! "never dropped" any more. A pass feeds `Cdf53GridState`, which may hold it
+//! back for a later flush (GPU budget), refuse it (older than a newer
+//! stateless tile or H.264 frame already drawn over the tile) or cancel it
+//! (superseded while waiting). A CDF 5/3 tile counts towards the newest
+//! `frame_seq` **only in the flush that lists it for drawing**, so a pass that
+//! is held back or draws nothing cannot make an older stateless draw
+//! disappear; once listed, an older stateless draw under it is dropped, and the
+//! grid is recorded first so that a newer stateless draw lands on top. Refinement
+//! passes of one tile re-use a single `frame_seq` (see `dirty.rs`). Equal
+//! sequence numbers never supersede.
 //!
 //! Comparisons are RFC 1982 serial arithmetic, so a `u32` wrap is safe.
 

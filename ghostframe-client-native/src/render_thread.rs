@@ -41,6 +41,17 @@ use crate::DebugFrameBytes;
 /// thread's job to decide what a client that didn't specify a count gets.
 const DEFAULT_EXPORT_BUFFER_COUNT: u32 = 3;
 
+/// What the render thread tells `connect` once it has a GPU context.
+pub(crate) struct GpuReady {
+    /// The write side of the upload slabs, if any could be made.
+    pub(crate) slots: Option<SlotAllocator>,
+    /// Whether CDF 5/3 tiles are reconstructed by the GPU grid: its start-up
+    /// self-test passed on this device and `GHOSTFRAME_CDF53_DECODE` does not
+    /// say `cpu`. Decided once; the decode thread forwards CDF 5/3 passes
+    /// undecoded when it is true and decodes them itself when it is not.
+    pub(crate) cdf53_on_gpu: bool,
+}
+
 pub(crate) enum RenderMsg {
     Core(CoreEvent),
     /// A `TileReady` whose pixels the decode thread already wrote into an
@@ -135,6 +146,7 @@ fn handle_core_event(
     open_h264_eagerly: bool,
     self_tx: &Sender<RenderMsg>,
     pool: Option<&UploadPool>,
+    cdf53_gpu: &mut Option<Cdf53Setup>,
 ) -> bool {
     // A bigger frame needs a bigger pool. Before the renderer sees the event:
     // the decode thread has already been decoding the new size's tiles.
@@ -173,6 +185,10 @@ fn handle_core_event(
                 }));
                 if let Some(pool) = pool {
                     r.attach_upload_pool(ctx, pool);
+                }
+                // The grid that passed the start-up probe, handed over once.
+                if let Some(setup) = cdf53_gpu.take() {
+                    r.enable_cdf53_gpu_with(ctx, setup.probed, setup.max_tiles);
                 }
                 *renderer = Some(r);
             }
@@ -463,6 +479,52 @@ impl EventTally {
 /// How the render thread asks the net thread to send a reset request.
 pub(crate) type ResetSink = Box<dyn Fn(ghostframe_client_core::ResetReason, u32) + Send>;
 
+/// A GPU CDF 5/3 grid that passed the start-up probe, waiting for the renderer.
+pub(crate) struct Cdf53Setup {
+    probed: ghostframe_client_gpu::pipelines::cdf53_grid::Probed,
+    /// Most tiles one submit may carry.
+    max_tiles: usize,
+}
+
+/// Where CDF 5/3 tiles are reconstructed, decided once per context:
+/// `GHOSTFRAME_CDF53_DECODE=cpu` says the CPU; otherwise the GPU grid, if it
+/// builds and its probe passes on this device. The reconstruct shader is
+/// sensitive to register allocation on panfrost -- a build that tips over it
+/// silently writes nothing -- so it is not trusted until it has drawn known
+/// tiles correctly; and a pipeline that fails to build comes back as an error
+/// here, not a panic. The probe also times a 256-tile dispatch, from which the
+/// renderer sizes a flush's share of tiles (a Mali is ~10x slower than a
+/// desktop GPU).
+///
+/// The cap on tiles per submit is a watchdog matter: panfrost/GL kills a job
+/// after ~500 ms, so GL keeps the 1000-tile cap; Vulkan drivers need none
+/// below the dispatch limit.
+fn choose_cdf53_decode(ctx: &WgpuContext) -> Option<Cdf53Setup> {
+    use ghostframe_client_gpu::config::Cdf53Decode;
+    if Cdf53Decode::from_env() == Cdf53Decode::Cpu {
+        tracing::info!("CDF 5/3 decode on the CPU (GHOSTFRAME_CDF53_DECODE=cpu)");
+        return None;
+    }
+    match ghostframe_client_gpu::pipelines::cdf53_grid::probe(&ctx.device, &ctx.queue) {
+        Ok(probed) => {
+            let gl = ctx.is_gl();
+            tracing::info!(
+                us_per_tile_k14 = probed.us_per_tile_k14,
+                gl,
+                "CDF 5/3 decode on the GPU (self-test passed)"
+            );
+            Some(Cdf53Setup {
+                probed,
+                max_tiles: if gl { 1000 } else { 60_000 },
+            })
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "CDF 5/3 GPU probe failed; decoding on the CPU");
+            None
+        }
+    }
+}
+
 /// Build the GPU context *on this thread*, then run the render loop.
 ///
 /// The context is constructed here rather than by the caller because a GL
@@ -481,7 +543,7 @@ pub(crate) type ResetSink = Box<dyn Fn(ghostframe_client_core::ResetReason, u32)
 /// built on changed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
-    ready: std::sync::mpsc::Sender<Result<Option<SlotAllocator>, crate::ClientError>>,
+    ready: std::sync::mpsc::Sender<Result<GpuReady, crate::ClientError>>,
     rx: Receiver<RenderMsg>,
     queue: Arc<EventQueue>,
     published: Arc<Mutex<Option<PublishedFrame>>>,
@@ -518,9 +580,14 @@ pub(crate) fn run(
                 }
             }
         };
+    let mut cdf53_gpu = choose_cdf53_decode(&ctx);
+    let cdf53_on_gpu = cdf53_gpu.is_some();
     // Ignore a send failure: it only means `connect` gave up first, and there
     // is nothing useful to do about it here.
-    let _ = ready.send(Ok(slot_allocator));
+    let _ = ready.send(Ok(GpuReady {
+        slots: slot_allocator,
+        cdf53_on_gpu,
+    }));
     let mut renderer: Option<Renderer> = None;
     let mut tally = EventTally::new();
     let mut export_dumps: u64 = 0;
@@ -591,6 +658,7 @@ pub(crate) fn run(
                         open_h264_eagerly,
                         &self_tx,
                         upload_pool.as_ref(),
+                        &mut cdf53_gpu,
                     );
                 }
                 RenderMsg::SlabTile {
@@ -674,6 +742,7 @@ pub(crate) fn run(
                         open_h264_eagerly,
                         &self_tx,
                         upload_pool.as_ref(),
+                        &mut cdf53_gpu,
                     );
                 }
                 Ok(RenderMsg::SlabTile {
@@ -779,6 +848,13 @@ pub(crate) fn run(
                     *published.lock().unwrap_or_else(|e| e.into_inner()) = Some(pf);
                     queue.push(ClientEvent::FrameReady { frame_id });
                 }
+                // CDF 5/3 tiles the GPU budget (or the refinement throttle)
+                // held back are drawn by a later flush; nothing else may
+                // arrive to ask for one, so ask for it here, one interval on.
+                if r.has_deferred_work() {
+                    render_due = true;
+                    wake_at = Some(std::time::Instant::now() + frame_interval);
+                }
             }
         }
 
@@ -803,6 +879,22 @@ pub(crate) fn run(
                     sync_calls = st.sync_calls,
                     slabs = ?st.slabs,
                     "upload pool (issued, consumed) per slab; totals since start"
+                );
+            }
+            if let Some((st, grid_frames)) = renderer.as_mut().and_then(|r| r.take_cdf53_stats()) {
+                tracing::debug!(
+                    passes = st.passes,
+                    listed = st.listed,
+                    deferred = st.deferred,
+                    throttled = st.throttled,
+                    skipped_no_magnitude = st.skipped_no_magnitude,
+                    skipped_same_k = st.skipped_same_k,
+                    skipped_no_pass0 = st.skipped_no_pass0,
+                    dropped_superseded = st.dropped_superseded,
+                    cancelled_superseded = st.cancelled_superseded,
+                    dropped_off_grid = st.dropped_off_grid,
+                    grid_frames,
+                    "render thread: cdf53 grid, 1s summary"
                 );
             }
             tally.flush_log();

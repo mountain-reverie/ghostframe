@@ -11,7 +11,10 @@
 use crate::export::ExportedImage;
 use crate::framebuffer::Framebuffer;
 use crate::paint_order::SeqLedger;
-use crate::pipelines::cdf53::{Cdf53PassEntry, Cdf53Pipeline};
+use crate::pipelines::cdf53_grid::Cdf53Grid;
+use crate::pipelines::cdf53_state::{
+    Cdf53GridState, Cdf53Stats, FLUSH_BUDGET_US, MAX_TILES_PER_FLUSH,
+};
 use crate::pipelines::palrle::PalRlePipeline;
 use crate::pipelines::rgba::RgbaPipeline;
 use crate::pipelines::rgba_slab::{RgbaSlabPipeline, SlabWork};
@@ -21,6 +24,8 @@ use crate::upload_pool::{SlotRef, UploadPool};
 use crate::wgpu_ctx::WgpuContext;
 use crate::GpuError;
 
+use ghostframe_client_core::cdf53_prevalidate::PrevalidatedCdf53;
+use ghostframe_client_core::cdf53_tile_state::Cdf53TileState;
 use ghostframe_client_core::{DecodeErrorCode, Event, TileData};
 use ghostframe_protocol::protocol::Codec;
 use ghostframe_protocol::tile::TILE_SIZE;
@@ -183,6 +188,15 @@ enum H264ImportPath {
     CpuCopy,
 }
 
+/// The GPU CDF 5/3 decoder and the host state that schedules it.
+struct Cdf53Gpu {
+    grid: Cdf53Grid,
+    state: Cdf53GridState,
+    /// Grid frames recorded since the stats were last taken.
+    frames: u64,
+    cpu_fallback_logged: bool,
+}
+
 /// Owns the framebuffer, the decode pipelines, and the export ring (which in
 /// turn owns the dirty history) for one client session.
 ///
@@ -199,14 +213,24 @@ pub struct Renderer {
     /// The slab-sourced twin of `rgba`; `Some` once a pool is attached.
     rgba_slab: Option<RgbaSlabPipeline>,
     upload_pool: Option<UploadPool>,
-    cdf53: Cdf53Pipeline,
+    /// GPU reconstruction of CDF 5/3 tiles; see [`Renderer::enable_cdf53_gpu`].
+    /// `None` until enabled.
+    cdf53_gpu: Option<Cdf53Gpu>,
+    /// The CPU decoder CDF 5/3 passes fall back to on the render thread when
+    /// the GPU one is not enabled or the frame is too large for its plane
+    /// store. (The native client's decode thread normally decodes on the CPU
+    /// before the renderer sees a pass, in which case neither is used.)
+    cdf53_cpu: Cdf53TileState,
+    /// Set while a flush runs only to put older work under an H.264 frame:
+    /// the grid then keeps its pending tiles instead of spending its budget on
+    /// pictures that are about to be covered.
+    cdf53_hold: bool,
 
     /// Every pending stateless entry carries the `frame_seq` it came from
     /// (first field); `batch_seq` holds the newest per tile. See
     /// [`crate::paint_order`].
     pending_solid: Vec<(u32, u8, u8, [u8; 4])>,
     pending_palrle: Vec<(u32, u8, u8, u8, u8, Vec<u8>)>,
-    pending_cdf53: Vec<Cdf53PassEntry>,
     /// `TileReady` tiles awaiting upload, batched by [`Renderer::flush`].
     pending_rgba: Vec<(u32, u8, u8, RgbaSrc)>,
     batch_seq: SeqLedger,
@@ -361,10 +385,6 @@ impl Renderer {
         let palrle = PalRlePipeline::new(&ctx.device);
         let rgba = RgbaPipeline::new(&ctx.device);
 
-        let mut cdf53 = Cdf53Pipeline::new(&ctx.device);
-        let (cols, rows) = tile_grid(width, height);
-        cdf53.resize(&ctx.device, &ctx.queue, cols, rows);
-
         // `open_h264_eagerly == false` behaves exactly as before this
         // task: lazy open on the first `NeedsH264` event, see `decode_h264`.
         let (h264_decoder, h264_unavailable) = if open_h264_eagerly {
@@ -407,10 +427,11 @@ impl Renderer {
             rgba,
             rgba_slab: None,
             upload_pool: None,
-            cdf53,
+            cdf53_gpu: None,
+            cdf53_cpu: Cdf53TileState::new(),
+            cdf53_hold: false,
             pending_solid: Vec::new(),
             pending_palrle: Vec::new(),
-            pending_cdf53: Vec::new(),
             pending_rgba: Vec::new(),
             batch_seq: SeqLedger::default(),
             upload_staging: UploadStaging::default(),
@@ -458,6 +479,7 @@ impl Renderer {
                 // -- so a full 1920x1080 repaint spent 363ms just issuing 2040
                 // of them. See `upload_pending_rgba`.
                 self.batch_seq.note(tile_x, tile_y, frame_seq);
+                self.note_stateless(tile_x, tile_y, frame_seq);
                 self.pending_rgba
                     .push((frame_seq, tile_x, tile_y, RgbaSrc::Pixels(rgba)));
                 self.ring.mark_dirty(tile_x as u32, tile_y as u32);
@@ -469,12 +491,12 @@ impl Renderer {
                 generation,
                 data,
             } => {
-                // Every codec counts towards the tile's newest frame_seq,
-                // CDF 5/3 included: see `crate::paint_order`.
-                self.batch_seq.note(tile_x, tile_y, frame_seq);
                 match data {
                     TileData::Solid(bgra) => {
+                        self.note_stateless(tile_x, tile_y, frame_seq);
+                        self.batch_seq.note(tile_x, tile_y, frame_seq);
                         self.pending_solid.push((frame_seq, tile_x, tile_y, bgra));
+                        self.ring.mark_dirty(tile_x as u32, tile_y as u32);
                     }
                     TileData::PalRle {
                         palette_id,
@@ -484,30 +506,30 @@ impl Renderer {
                         // from `count` and the indices themselves.
                         wire_flags: _,
                     } => {
+                        self.note_stateless(tile_x, tile_y, frame_seq);
+                        self.batch_seq.note(tile_x, tile_y, frame_seq);
                         self.pending_palrle
                             .push((frame_seq, tile_x, tile_y, palette_id, count, indices));
+                        self.ring.mark_dirty(tile_x as u32, tile_y as u32);
                     }
-                    // `new_generation` unused: cdf53_integrate.wgsl keys its
-                    // accumulation on the generation number alone (see
-                    // `TileData::Cdf53`).
                     TileData::Cdf53 {
                         pass_idx,
                         bit_planes,
                         present_passes,
-                        new_generation: _,
+                        new_generation,
                     } => {
-                        self.pending_cdf53.push((
+                        self.apply_cdf53_pass(
                             tile_x,
                             tile_y,
-                            generation,
-                            pass_idx,
-                            bit_planes,
-                            present_passes,
                             frame_seq,
-                        ));
+                            generation,
+                            new_generation,
+                            pass_idx,
+                            present_passes,
+                            bit_planes,
+                        );
                     }
                 }
-                self.ring.mark_dirty(tile_x as u32, tile_y as u32);
             }
             Event::FrameDimensions { width, height } => {
                 // Ignore a size the renderer would not have been built with:
@@ -533,15 +555,22 @@ impl Renderer {
                         p.drop_framebuffer_cache();
                     }
                     self.palrle.drop_framebuffer_cache();
-                    self.cdf53.drop_framebuffer_cache();
+                    if let Some(g) = self.cdf53_gpu.as_mut() {
+                        g.grid.drop_framebuffer_cache();
+                    }
                 }
                 if let Err(e) = self.ring.resize(ctx, width, height) {
                     tracing::error!(error = %e, width, height, "export ring resize failed");
                 }
                 self.solid
                     .set_canvas_size(&ctx.device, &ctx.queue, width, height);
+                self.resize_cdf53(ctx, width, height);
+                // The CPU accumulator keys its tiles by position, so a smaller
+                // grid drops the tiles outside it; planes of a tile that stays
+                // belong to the same picture.
                 let (cols, rows) = tile_grid(width, height);
-                self.cdf53.resize(&ctx.device, &ctx.queue, cols, rows);
+                self.cdf53_cpu
+                    .retain_tiles(|x, y| (x as u32) < cols && (y as u32) < rows);
             }
             Event::NeedsH264 {
                 frame_seq,
@@ -585,6 +614,208 @@ impl Renderer {
         Ok(())
     }
 
+    /// Turn on GPU reconstruction of CDF 5/3 tiles. Allocates the grid's plane
+    /// store for the current frame size. The caller is expected to have run
+    /// [`crate::pipelines::cdf53_grid::self_test`] on this device first: this
+    /// does not.
+    ///
+    /// A frame whose plane store the device cannot bind (about 8K) is decoded
+    /// on the CPU by this renderer instead, and the GPU is used again as soon
+    /// as a frame fits.
+    ///
+    /// Builds its own grid with the cost model of the Mali-T860 it was fitted
+    /// on (and the 1000-tile submit cap); the native client instead hands over
+    /// the grid it probed, with [`Renderer::enable_cdf53_gpu_with`].
+    pub fn enable_cdf53_gpu(&mut self, ctx: &WgpuContext) {
+        if self.cdf53_gpu.is_none() {
+            self.install_cdf53(ctx, Cdf53Grid::new(&ctx.device), None, MAX_TILES_PER_FLUSH);
+        }
+    }
+
+    /// [`Renderer::enable_cdf53_gpu`] with a grid that already passed
+    /// [`crate::pipelines::cdf53_grid::probe`] on this device, so the shaders
+    /// are compiled once, and with the per-flush budget calibrated from what
+    /// the probe measured. `max_tiles` caps one submit (the ~500 ms job
+    /// watchdog of panfrost/GL is the reason; Vulkan can take far more).
+    pub fn enable_cdf53_gpu_with(
+        &mut self,
+        ctx: &WgpuContext,
+        probed: crate::pipelines::cdf53_grid::Probed,
+        max_tiles: usize,
+    ) {
+        if self.cdf53_gpu.is_none() {
+            self.install_cdf53(ctx, probed.grid, Some(probed.us_per_tile_k14), max_tiles);
+        }
+    }
+
+    fn install_cdf53(
+        &mut self,
+        ctx: &WgpuContext,
+        grid: Cdf53Grid,
+        us_per_tile_k14: Option<f64>,
+        max_tiles: usize,
+    ) {
+        let mut state = Cdf53GridState::with_budget(FLUSH_BUDGET_US, max_tiles);
+        if let Some(us) = us_per_tile_k14 {
+            state.set_cost_per_tile_k14(us);
+        }
+        self.cdf53_gpu = Some(Cdf53Gpu {
+            grid,
+            state,
+            frames: 0,
+            cpu_fallback_logged: false,
+        });
+        let (w, h) = (self.fb.width, self.fb.height);
+        self.resize_cdf53(ctx, w, h);
+    }
+
+    /// Pretend the device's storage binding limit is `bytes`, from the next
+    /// resize on. For tests of the too-large-frame fallback.
+    #[doc(hidden)]
+    pub fn debug_set_cdf53_limit(&mut self, bytes: Option<u64>) {
+        if let Some(g) = self.cdf53_gpu.as_mut() {
+            g.grid.set_limit_for_test(bytes);
+        }
+    }
+
+    /// Size the CDF 5/3 grid and its host state for a `width` x `height` frame.
+    fn resize_cdf53(&mut self, ctx: &WgpuContext, width: u32, height: u32) {
+        let Some(g) = self.cdf53_gpu.as_mut() else {
+            return;
+        };
+        let (cols, rows) = tile_grid(width, height);
+        let was_gpu = g.grid.is_usable();
+        let result = g.grid.resize(&ctx.device, cols, rows);
+        if result.is_ok() != was_gpu {
+            // Switching sides. Whatever the side we leave had accumulated --
+            // planes, or a generation started there -- is of the old frame
+            // size and must not be completed by the other side: the server's
+            // full refresh after a resize re-sends every tile as a new
+            // generation, so starting both sides clean loses nothing.
+            self.cdf53_cpu.reset();
+        }
+        let g = self.cdf53_gpu.as_mut().expect("just used");
+        match result {
+            Ok(()) => {
+                g.state.resize(cols, rows);
+                g.cpu_fallback_logged = false;
+            }
+            Err(e) => {
+                g.state.resize(0, 0);
+                if !g.cpu_fallback_logged {
+                    g.cpu_fallback_logged = true;
+                    tracing::warn!(
+                        error = %e, width, height,
+                        "CDF 5/3 GPU decode unavailable for this frame size; \
+                         decoding on the render thread's CPU"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The GPU CDF 5/3 state, when enabled and the frame fits.
+    fn cdf53_gpu_mut(&mut self) -> Option<&mut Cdf53Gpu> {
+        self.cdf53_gpu.as_mut().filter(|g| g.grid.is_usable())
+    }
+
+    /// A Solid / PalRle / RGBA tile for the tile was applied: it may
+    /// supersede a CDF 5/3 draw still waiting.
+    fn note_stateless(&mut self, tile_x: u8, tile_y: u8, frame_seq: u32) {
+        if let Some(g) = self.cdf53_gpu_mut() {
+            g.state.stateless(tile_x, tile_y, frame_seq);
+        }
+    }
+
+    /// One CDF 5/3 pass. With the GPU grid it is only recorded: nothing is
+    /// drawn, noted in the paint-order ledger or marked dirty until
+    /// [`Renderer::flush`] lists the tile. Without it the pass is
+    /// reconstructed here, on the CPU, into a `TileReady`-style upload.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_cdf53_pass(
+        &mut self,
+        tile_x: u8,
+        tile_y: u8,
+        frame_seq: u32,
+        generation: u8,
+        new_generation: bool,
+        pass_idx: u8,
+        present_passes: Option<u16>,
+        bit_planes: Vec<u8>,
+    ) {
+        if let Some(g) = self.cdf53_gpu_mut() {
+            g.state.pass(
+                tile_x,
+                tile_y,
+                frame_seq,
+                generation,
+                new_generation,
+                pass_idx,
+                present_passes,
+                bit_planes,
+            );
+            return;
+        }
+        if new_generation {
+            self.cdf53_cpu.forget_tile(tile_x, tile_y);
+        }
+        let entry = PrevalidatedCdf53 {
+            generation,
+            pass_idx,
+            bit_planes,
+            present_passes,
+        };
+        self.batch_seq.note(tile_x, tile_y, frame_seq);
+        if let Some(rgba) = self.cdf53_cpu.integrate(tile_x, tile_y, &entry) {
+            self.pending_rgba
+                .push((frame_seq, tile_x, tile_y, RgbaSrc::Pixels(rgba)));
+            self.ring.mark_dirty(tile_x as u32, tile_y as u32);
+        }
+    }
+
+    /// Plan this flush's CDF 5/3 tiles and record the grid. See
+    /// [`Cdf53GridState::plan`] for what gets listed.
+    fn record_cdf53(&mut self, ctx: &WgpuContext, encoder: &mut wgpu::CommandEncoder) -> bool {
+        if self.cdf53_hold {
+            return false;
+        }
+        let Some(g) = self.cdf53_gpu.as_mut().filter(|g| g.grid.is_usable()) else {
+            return false;
+        };
+        let listed = g.state.plan();
+        if listed.is_empty() {
+            return false;
+        }
+        g.grid.begin_frame();
+        for t in &listed {
+            for (pass, plane) in &t.planes {
+                g.grid.push_plane(t.index, *pass, plane);
+            }
+            g.grid.push_tile(t.index, t.mask, t.k);
+            self.batch_seq.note(t.tile_x, t.tile_y, t.frame_seq);
+            self.ring.mark_dirty(t.tile_x as u32, t.tile_y as u32);
+        }
+        g.frames += 1;
+        g.grid.record(&ctx.device, &ctx.queue, encoder, &self.fb)
+    }
+
+    /// Whether CDF 5/3 tiles are waiting for a later flush (the GPU budget was
+    /// spent, or a partial tile is being throttled). The caller should flush
+    /// again soon even if no event arrives.
+    pub fn has_deferred_work(&self) -> bool {
+        self.cdf53_gpu
+            .as_ref()
+            .is_some_and(|g| g.grid.is_usable() && g.state.has_pending())
+    }
+
+    /// CDF 5/3 scheduling counters since the last call, and the number of
+    /// grid frames recorded; `None` when the GPU path is not enabled.
+    pub fn take_cdf53_stats(&mut self) -> Option<(Cdf53Stats, u64)> {
+        let g = self.cdf53_gpu.as_mut()?;
+        let frames = std::mem::take(&mut g.frames);
+        Some((g.state.take_stats(), frames))
+    }
+
     /// Let this renderer draw tiles from `pool`'s slabs
     /// ([`Renderer::apply_slot_tile`]). Without it such tiles are dropped.
     ///
@@ -619,6 +850,7 @@ impl Renderer {
             "slot {slot:?} arrived after its slab was recycled"
         );
         self.batch_seq.note(tile_x, tile_y, frame_seq);
+        self.note_stateless(tile_x, tile_y, frame_seq);
         self.pending_rgba
             .push((frame_seq, tile_x, tile_y, RgbaSrc::Slot(slot)));
         self.ring.mark_dirty(tile_x as u32, tile_y as u32);
@@ -709,19 +941,13 @@ impl Renderer {
         let mut recorded = false;
 
         // Order within a batch is by `frame_seq`, not by codec (see
-        // `crate::paint_order`). The CDF 5/3 lift goes first so that a newer
+        // `crate::paint_order`). The CDF 5/3 grid goes first so that a newer
         // stateless entry lands on top of an older pass; a stateless entry
         // older than anything else for its tile is dropped, so a newer pass
-        // is not covered either. Passes are never dropped.
-        if !self.pending_cdf53.is_empty() {
-            recorded |= self
-                .cdf53
-                .encode_integrate(&ctx.queue, &mut encoder, &self.pending_cdf53);
-            self.pending_cdf53.clear();
-            recorded |= self
-                .cdf53
-                .encode_inverse(&ctx.device, &ctx.queue, &mut encoder, &self.fb);
-        }
+        // is not covered either. Only tiles the grid is *drawing* this flush
+        // count towards a tile's newest `frame_seq`: a pass that is held back
+        // must not make an older Solid disappear.
+        recorded |= self.record_cdf53(ctx, &mut encoder);
 
         let ledger = &self.batch_seq;
         let solid: Vec<(u8, u8, [u8; 4])> = std::mem::take(&mut self.pending_solid)
@@ -1259,7 +1485,7 @@ impl Renderer {
         // produces -- would draw the H.264 frame first and then paint the
         // older, now-stale tiles over it when the batch's `flush` finally
         // runs.
-        self.flush(ctx)?;
+        self.flush_under_h264(ctx)?;
 
         if self.h264_pipeline.is_none() {
             self.h264_pipeline = Some(crate::pipelines::h264_nv12::H264Nv12Pipeline::new(
@@ -1353,6 +1579,27 @@ impl Renderer {
         Ok(())
     }
 
+    /// The flush that precedes an H.264 blit: Solid / PalRle / RGBA work lands
+    /// under the frame, as it always did, but CDF 5/3 tiles are held back. The
+    /// frame covers the screen, so drawing them first would only spend a
+    /// flush's GPU budget; and if the frame is then blitted they are
+    /// cancelled ([`Renderer::supersede_cdf53`]), where drawing them later
+    /// would put them on top of it.
+    fn flush_under_h264(&mut self, ctx: &WgpuContext) -> Result<(), GpuError> {
+        self.cdf53_hold = true;
+        let r = self.flush(ctx);
+        self.cdf53_hold = false;
+        r
+    }
+
+    /// An H.264 frame from `frame_seq` was blitted over the whole framebuffer:
+    /// cancel CDF 5/3 draws still waiting, and refuse older passes.
+    pub fn supersede_cdf53(&mut self, frame_seq: u32) {
+        if let Some(g) = self.cdf53_gpu.as_mut() {
+            g.state.supersede_all(frame_seq);
+        }
+    }
+
     /// Blit `frames` and mark the ring dirty if any landed.
     fn blit_h264_frames(
         &mut self,
@@ -1373,6 +1620,7 @@ impl Renderer {
         // would otherwise mark it dirty for nothing.
         if any_blitted {
             self.ring.mark_dirty_all();
+            self.supersede_cdf53(frame_seq);
         }
         any_blitted
     }
@@ -1415,7 +1663,7 @@ impl Renderer {
         }
         // Same ordering rule as `decode_h264`: batched tile work for the
         // older framebuffer state lands before the full-frame draw.
-        self.flush(ctx)?;
+        self.flush_under_h264(ctx)?;
         if self.h264_pipeline.is_none() {
             self.h264_pipeline = Some(crate::pipelines::h264_nv12::H264Nv12Pipeline::new(
                 &ctx.device,
@@ -1456,6 +1704,7 @@ impl Renderer {
                 }
                 if any_blitted {
                     self.ring.mark_dirty_all();
+                    self.supersede_cdf53(frame_seq);
                 }
             }
             Err(e) => tracing::warn!(error = %e, "H.264 finish (drain) failed"),

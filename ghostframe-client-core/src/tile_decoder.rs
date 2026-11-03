@@ -36,6 +36,10 @@ pub struct TileDecoder {
     /// Reconstructions a batch skipped because a later pass of the same tile
     /// arrived before the earlier one was drawn.
     cdf53_coalesced: u64,
+    /// Hand CDF 5/3 payloads on untouched, for a consumer that reconstructs
+    /// them itself (the native client's GPU grid). This decoder then keeps no
+    /// CDF 5/3 state, and the other codecs are unaffected.
+    cdf53_passthrough: bool,
 }
 
 /// A CDF 5/3 tile waiting for its one reconstruction in a batch.
@@ -93,7 +97,16 @@ impl TileDecoder {
             cdf53: Cdf53TileState::new(),
             pending: PendingCdf53::default(),
             cdf53_coalesced: 0,
+            cdf53_passthrough: false,
         }
+    }
+
+    /// A decoder that forwards `TileData::Cdf53` events as they are
+    /// (`Decoded::Event(Event::TilePayload)`), in order with everything else,
+    /// instead of reconstructing them. See [`TileDecoder::cdf53_passthrough`].
+    pub fn with_cdf53_passthrough(mut self, on: bool) -> Self {
+        self.cdf53_passthrough = on;
+        self
     }
 
     /// How many CDF 5/3 reconstructions [`Self::decode_batch_into`] has not
@@ -269,6 +282,28 @@ impl TileDecoder {
                         palette: self.palettes[palette_id as usize],
                         indices,
                     },
+                    TileData::Cdf53 {
+                        pass_idx,
+                        bit_planes,
+                        present_passes,
+                        new_generation,
+                    } if self.cdf53_passthrough => {
+                        return emit(
+                            sink,
+                            BatchStep::Out(Decoded::Event(Event::TilePayload {
+                                frame_seq,
+                                tile_x,
+                                tile_y,
+                                generation,
+                                data: TileData::Cdf53 {
+                                    pass_idx,
+                                    bit_planes,
+                                    present_passes,
+                                    new_generation,
+                                },
+                            })),
+                        );
+                    }
                     TileData::Cdf53 {
                         pass_idx,
                         bit_planes,
@@ -705,6 +740,50 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn passthrough_forwards_cdf53_in_order_and_leaves_other_codecs_alone() {
+        let solid = |seq| Event::TilePayload {
+            frame_seq: seq,
+            tile_x: 5,
+            tile_y: 0,
+            generation: 0,
+            data: TileData::Solid([1, 2, 3, 255]),
+        };
+        let mut events = vec![solid(1)];
+        events.extend(cdf_events(0, 1, true, 3, 10));
+        events.push(solid(99));
+        let want = events.clone();
+
+        // One at a time and as a batch must both hand back the CDF 5/3 events
+        // untouched and the Solid as pixels, in the order they came.
+        for batched in [false, true] {
+            let mut dec = TileDecoder::new().with_cdf53_passthrough(true);
+            let out = if batched {
+                dec.decode_batch(events.clone())
+            } else {
+                events
+                    .clone()
+                    .into_iter()
+                    .filter_map(|e| dec.decode(e))
+                    .collect()
+            };
+            assert_eq!(out.len(), want.len(), "batched {batched}");
+            for (got, sent) in out.iter().zip(&want) {
+                match sent {
+                    Event::TilePayload {
+                        data: TileData::Cdf53 { .. },
+                        ..
+                    } => assert_eq!(got, sent, "batched {batched}: not forwarded as it was"),
+                    _ => assert!(
+                        matches!(got, Event::TileReady { .. }),
+                        "batched {batched}: a Solid must still decode: {got:?}"
+                    ),
+                }
+            }
+            assert_eq!(dec.cdf53_coalesced(), 0, "no CDF 5/3 state kept");
+        }
     }
 
     /// What a tile output of either kind says: (frame_seq, tile_x, pixels).
