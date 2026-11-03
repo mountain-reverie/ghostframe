@@ -11,6 +11,9 @@ pub(crate) mod refs;
 pub(crate) mod syntax;
 pub(crate) mod tracker;
 pub(crate) mod va_sys;
+pub(crate) mod vaapi_direct;
 
 #[cfg(test)]
 mod refs_tests;
+#[cfg(test)]
+mod vaapi_direct_tests;
