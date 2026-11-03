@@ -5,7 +5,7 @@
 //! call traps — so one malformed datagram would end the session rather than
 //! drop a frame.
 
-use ghostframe_client_core::{ClientConfig, ClientCore, TileDelivery};
+use ghostframe_client_core::{ClientConfig, ClientCore, H264Outcome, TileDelivery};
 use wasm_bindgen::prelude::*;
 
 use crate::boundary::{WasmEvent, WasmPollOutput};
@@ -36,9 +36,11 @@ impl WasmClientCore {
         let config = ClientConfig {
             indices_raw_enabled,
             supports_h264,
-            // The browser does not send the v2 H.264 feedback (HELLO bit 2) in
-            // A2; H.264 itself is gated by `supports_h264` alone.
-            h264_acked_ref: false,
+            // The browser runs the same reference gate as the native client
+            // and sends the v2 feedback (HELLO bit 2): frame acks (0x0A) and
+            // reset requests (0x09). H.264 itself is gated by
+            // `supports_h264` alone.
+            h264_acked_ref: true,
             tile_delivery: if tile_delivery_payload {
                 TileDelivery::Payload
             } else {
@@ -62,6 +64,35 @@ impl WasmClientCore {
         if let Some(r) = ghostframe_client_core::ResetReason::from_u8(reason) {
             self.inner.request_reset(r, frame_seq);
         }
+    }
+
+    /// Report what the browser's decoder did with an H.264 access unit that a
+    /// `NeedsH264` event handed out. `outcome`: 0 = decoded (the decoder's
+    /// output callback fired for this frame's timestamp), 1 = not output
+    /// (dropped, or superseded by a later output), 2 = decode error, 3 = no
+    /// decoder. Anything else is ignored. The gate learns which frames
+    /// became references, the frame ack (0x0A) is queued (at most one per
+    /// 4 ms), and an error also queues the 0x09 IDR request (paced 2.2 s);
+    /// all of it leaves through `pollTransmit`.
+    #[wasm_bindgen(js_name = h264Result)]
+    pub fn h264_result(&mut self, frame_seq: u32, outcome: u8, now_us: u64) {
+        let outcome = match outcome {
+            0 => H264Outcome::Decoded,
+            1 => H264Outcome::NotOutput,
+            2 => H264Outcome::DecodeError,
+            3 => H264Outcome::NoDecoder,
+            _ => return,
+        };
+        self.inner.h264_result(frame_seq, outcome, now_us);
+    }
+
+    /// `[total, streak]`: access units the decoder consumed without a picture
+    /// for them, and the run since the last one that produced its own. A long
+    /// streak on a stream that plays is a decoder with output delay.
+    #[wasm_bindgen(js_name = h264NotOutputStats)]
+    pub fn h264_not_output_stats(&self) -> Vec<f64> {
+        let (total, streak) = self.inner.h264_not_output_stats();
+        vec![total as f64, streak as f64]
     }
 
     /// Feed one inbound datagram; returns the resulting events as an array.

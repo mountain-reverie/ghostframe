@@ -64,7 +64,10 @@ describe('protocol constants', () => {
     const core = new wasm.WasmClientCore(true, true, true, 0n);
     const hello = core.pollTransmit(0n);
     expect(hello.bytes[0]).toBe(p.helloMsgType);
-    expect(hello.bytes[1]).toBe(p.helloCapIndicesRaw | p.helloCapSupportsH264);
+    // The browser runs the reference gate: it sends 0x04 with H.264 (0x02).
+    expect(hello.bytes[1]).toBe(
+      p.helloCapIndicesRaw | p.helloCapSupportsH264 | p.helloCapH264AckedRef,
+    );
     expect(hello.bytes.length).toBe(p.helloSize);
   });
 
