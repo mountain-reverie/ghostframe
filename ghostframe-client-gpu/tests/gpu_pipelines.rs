@@ -1,12 +1,10 @@
 //! Real-WGSL pipeline tests. Requires a GPU; NOT named in any CI workflow.
 
-use ghostframe_client_core::cdf53_prevalidate::prevalidate_cdf53;
 use ghostframe_client_gpu::{
     framebuffer::Framebuffer,
-    pipelines::{cdf53::Cdf53Pipeline, palrle::PalRlePipeline, solid::SolidPipeline},
+    pipelines::{palrle::PalRlePipeline, solid::SolidPipeline},
     wgpu_ctx::WgpuContext,
 };
-use ghostframe_protocol::codec::cdf53 as cdf53_codec;
 
 fn px(fb_bytes: &[u8], fb_w: u32, x: u32, y: u32) -> [u8; 4] {
     let o = ((y * fb_w + x) * 4) as usize;
@@ -306,157 +304,6 @@ fn palrle_errors_do_not_leak_between_decodes() {
             .expect("gpu ok")
             .is_empty(),
         "stale error leaked"
-    );
-}
-
-/// One tile's worth of wire-accurate CDF 5/3 passes for a flat tile of grey
-/// `level`, built with the real CPU encoder
-/// (`ghostframe_protocol::codec::cdf53`) so the fixture cannot drift from
-/// the wire format. Independent of tile coordinates and generation --
-/// [`entries_at_gen`] applies those.
-fn cdf53_fixture_for(level: u8) -> Vec<(u8, Vec<u8>, Option<u16>)> {
-    let bgra = [level, level, level, 0xFF].repeat(32 * 32);
-    let coeffs = cdf53_codec::forward(&bgra);
-    let (present, sparse) = cdf53_codec::encode_passes_sparse(&coeffs);
-    sparse
-        .iter()
-        .map(|(pass_idx, payload)| {
-            let pre = prevalidate_cdf53(payload, 1, *pass_idx).expect("wire payload prevalidates");
-            let present_passes = if *pass_idx == 0 { Some(present) } else { None };
-            (*pass_idx, pre.bit_planes, present_passes)
-        })
-        .collect()
-}
-
-/// Turn a [`cdf53_fixture_for`] fixture into the entry vector `integrate`
-/// expects, for one tile at one generation.
-fn entries_at_gen(
-    fixture: &[(u8, Vec<u8>, Option<u16>)],
-    tile_x: u8,
-    tile_y: u8,
-    generation: u8,
-) -> Vec<ghostframe_client_gpu::pipelines::cdf53::Cdf53PassEntry> {
-    fixture
-        .iter()
-        .map(|(pass_idx, bit_planes, present_passes)| {
-            (
-                tile_x,
-                tile_y,
-                generation,
-                *pass_idx,
-                bit_planes.clone(),
-                *present_passes,
-                0,
-            )
-        })
-        .collect()
-}
-
-#[test]
-fn cdf53_flat_tile_reconstructs_its_flat_colour() {
-    let ctx = WgpuContext::new().expect("wgpu context");
-    let mut fb = Framebuffer::new(&ctx.device, 64, 64);
-    fb.debug_fill(&ctx.device, &ctx.queue, [0, 0, 0, 0xFF]);
-
-    let mut pipe = Cdf53Pipeline::new(&ctx.device);
-    pipe.resize(&ctx.device, &ctx.queue, 2, 2);
-
-    let fixture = cdf53_fixture_for(0x80);
-    let tiles = entries_at_gen(&fixture, 0, 0, 1);
-
-    pipe.integrate(&ctx.device, &ctx.queue, &tiles);
-    pipe.inverse(&ctx.device, &ctx.queue, &fb);
-    ctx.device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .expect("poll");
-
-    let b = fb.debug_read(&ctx.device, &ctx.queue);
-    // EXACT, not approximate. CDF 5/3 is an integer-reversible lifting
-    // transform and the inverse shaders use only i32; with every pass
-    // delivered, reconstruction is lossless by construction. A tolerance
-    // here would let a systematic reconstruction error hide -- and a
-    // systematic error is exactly the failure mode this pipeline has
-    // historically had.
-    assert_eq!(
-        px(&b, 64, 4, 4),
-        [0x80, 0x80, 0x80, 0xFF],
-        "flat tile did not reconstruct losslessly"
-    );
-    // A corner too: a partial inverse can be right in the tile interior
-    // and wrong at the boundary, where the lifting filter needs its
-    // symmetric extension.
-    assert_eq!(
-        px(&b, 64, 31, 31),
-        [0x80, 0x80, 0x80, 0xFF],
-        "flat tile wrong at the far corner"
-    );
-}
-
-#[test]
-fn cdf53_generation_bump_discards_the_previous_generation() {
-    // The integrate shader OR-integrates bit planes into a persistent
-    // per-tile buffer. If a generation bump does not clear that buffer, the
-    // new generation's planes land on top of the old one's and the tile
-    // reconstructs as a blend of two different images -- a stale region
-    // that looks plausible, which is the hardest kind of bug to notice.
-    let ctx = WgpuContext::new().expect("wgpu context");
-    let mut fb = Framebuffer::new(&ctx.device, 64, 64);
-    fb.debug_fill(&ctx.device, &ctx.queue, [0, 0, 0, 0xFF]);
-
-    let mut pipe = Cdf53Pipeline::new(&ctx.device);
-    pipe.resize(&ctx.device, &ctx.queue, 2, 2);
-
-    // Generation 1: a dark tile, fully delivered.
-    let gen1 = cdf53_fixture_for(0x20);
-    pipe.integrate(&ctx.device, &ctx.queue, &entries_at_gen(&gen1, 0, 0, 1));
-    pipe.inverse(&ctx.device, &ctx.queue, &fb);
-    ctx.device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .expect("poll");
-    assert_eq!(
-        px(&fb.debug_read(&ctx.device, &ctx.queue), 64, 4, 4),
-        [0x20, 0x20, 0x20, 0xFF],
-        "generation 1 did not reconstruct"
-    );
-
-    // Generation 2: a bright tile, same coordinates, fully delivered.
-    let gen2 = cdf53_fixture_for(0xC0);
-    pipe.integrate(&ctx.device, &ctx.queue, &entries_at_gen(&gen2, 0, 0, 2));
-    pipe.inverse(&ctx.device, &ctx.queue, &fb);
-    ctx.device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .expect("poll");
-
-    // EXACT. Any residue of generation 1 shows up here.
-    assert_eq!(
-        px(&fb.debug_read(&ctx.device, &ctx.queue), 64, 4, 4),
-        [0xC0, 0xC0, 0xC0, 0xFF],
-        "generation 2 is contaminated by generation 1"
-    );
-}
-
-#[test]
-fn cdf53_multiple_passes_at_a_new_generation_do_not_clear_each_other() {
-    // A batch can contain several passes for the same tile at the same new
-    // generation. Clearing on each would wipe the passes already integrated
-    // in this very batch.
-    let ctx = WgpuContext::new().expect("wgpu context");
-    let fb = Framebuffer::new(&ctx.device, 64, 64);
-    let mut pipe = Cdf53Pipeline::new(&ctx.device);
-    pipe.resize(&ctx.device, &ctx.queue, 2, 2);
-
-    // All passes for a flat tile, delivered as ONE batch at generation 7.
-    let f = cdf53_fixture_for(0x80);
-    pipe.integrate(&ctx.device, &ctx.queue, &entries_at_gen(&f, 0, 0, 7));
-    pipe.inverse(&ctx.device, &ctx.queue, &fb);
-    ctx.device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .expect("poll");
-
-    assert_eq!(
-        px(&fb.debug_read(&ctx.device, &ctx.queue), 64, 4, 4),
-        [0x80, 0x80, 0x80, 0xFF],
-        "in-batch clear wiped passes from the same batch"
     );
 }
 

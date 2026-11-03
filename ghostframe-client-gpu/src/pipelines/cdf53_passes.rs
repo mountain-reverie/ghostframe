@@ -1,7 +1,13 @@
-//! The sparse-K pass-resolution rule shared by every Cdf53 inverse pipeline.
+//! The sparse-K pass-resolution rule of the web client's Cdf53 pipeline.
 //!
 //! Ported line-for-line from `computePassesProcessed` in
 //! `ghostframe-web-client/src/webgpu/cdf53.ts`. The two must not drift.
+//!
+//! The native client no longer uses it: its grid
+//! ([`super::cdf53_state::Cdf53GridState`]) takes the rule from the CPU
+//! decoder, `ghostframe_client_core::cdf53_tile_state::resolved_prefix`, which
+//! (unlike the `max(prev, pass + 1)` fallback below) draws nothing before
+//! pass 0 has arrived. Kept as the reference the web client is tested against.
 
 /// Bit-plane passes a CDF 5/3 tile can carry.
 pub const MAX_PASSES: u32 = 14;

@@ -119,6 +119,24 @@ pub struct WgpuContext {
 }
 
 impl WgpuContext {
+    /// `base` with the buffer-size limits set to what `adapter` offers (more
+    /// than the portable defaults on desktop GPUs; asking for more than the
+    /// adapter has would fail `request_device`). Nothing else changes, so
+    /// shaders are still checked against the portable limits.
+    fn with_adapter_buffer_limits(base: wgpu::Limits, adapter: &wgpu::Limits) -> wgpu::Limits {
+        wgpu::Limits {
+            max_storage_buffer_binding_size: adapter.max_storage_buffer_binding_size,
+            max_buffer_size: adapter.max_buffer_size,
+            ..base
+        }
+    }
+
+    /// Whether the device runs on the GL/GLES backend (panfrost and kin),
+    /// where a long submit trips the driver's job watchdog.
+    pub fn is_gl(&self) -> bool {
+        self.adapter.get_info().backend == wgpu::Backend::Gl
+    }
+
     #[cfg(feature = "vulkan")]
     pub fn new() -> Result<Self, GpuError> {
         // NB: wgpu 30 takes the descriptor by value. `InstanceDescriptor`
@@ -173,14 +191,20 @@ impl WgpuContext {
             // the portable 256 that palrle_decode.wgsl was designed around,
             // so a limit the browser would not have is not silently
             // available here. It also caps maxStorageBuffersPerShaderStage
-            // at 4, which is BELOW the WebGPU spec's own default of 8 --
-            // cdf53_integrate.wgsl binds 7 storage buffers (a real WebGPU
-            // layout every browser must support), so raise just that one
-            // limit back up to the spec default rather than the
-            // downlevel-conservative value.
+            // at 4, which is BELOW the WebGPU spec's own default of 8; the
+            // web client's cdf53_integrate.wgsl binds 7, and a few native
+            // pipelines bind more than 4, so raise that one limit back up to
+            // the spec default.
+            //
+            // The storage binding size is raised to what this adapter offers
+            // (downlevel says 128 MiB, which would send an 8K frame's CDF 5/3
+            // plane store -- 174 MB -- to the CPU on a GPU that could hold it).
             required_limits: wgpu::Limits {
                 max_storage_buffers_per_shader_stage: 8,
-                ..wgpu::Limits::downlevel_defaults()
+                ..Self::with_adapter_buffer_limits(
+                    wgpu::Limits::downlevel_defaults(),
+                    &adapter.limits(),
+                )
             },
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
@@ -402,15 +426,17 @@ impl WgpuContext {
             // 128 here and
             // `shader_validation.rs::MAX_WORKGROUP_INVOCATIONS` must agree:
             // this is what the device is asked for, that is what the shaders
-            // are checked against. The storage-buffer bump is the same as the
-            // Vulkan path's and for the same reason (cdf53_integrate.wgsl
-            // binds 7).
+            // are checked against. The storage-buffer bumps are the same as the
+            // Vulkan path's and for the same reasons.
             required_limits: wgpu::Limits {
                 max_storage_buffers_per_shader_stage: 8,
                 max_compute_invocations_per_workgroup: 128,
                 max_compute_workgroup_size_x: 128,
                 max_compute_workgroup_size_y: 128,
-                ..wgpu::Limits::downlevel_defaults()
+                ..Self::with_adapter_buffer_limits(
+                    wgpu::Limits::downlevel_defaults(),
+                    &adapter.limits(),
+                )
             },
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,

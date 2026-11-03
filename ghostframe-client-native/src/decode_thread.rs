@@ -101,6 +101,9 @@ struct Pump {
     slots: Option<SlotAllocator>,
     render_tx: Sender<RenderMsg>,
     render_gone: bool,
+    /// CDF 5/3 passes travel to the render thread as they are (its GPU grid
+    /// reconstructs them), so none is "heavy" here and none is batched.
+    cdf53_on_gpu: bool,
 }
 
 /// What the render thread is sent for a decoded result.
@@ -183,13 +186,14 @@ impl Pump {
         }
         // A CDF 5/3 pass takes milliseconds to decode; don't make what is
         // already finished wait for it.
-        let heavy = matches!(
-            &ev,
-            CoreEvent::TilePayload {
-                data: TileData::Cdf53 { .. },
-                ..
-            }
-        );
+        let heavy = !self.cdf53_on_gpu
+            && matches!(
+                &ev,
+                CoreEvent::TilePayload {
+                    data: TileData::Cdf53 { .. },
+                    ..
+                }
+            );
         if heavy {
             self.release_if_held();
             if self.render_gone {
@@ -237,15 +241,16 @@ impl Pump {
             return None;
         }
         let started = clock();
-        let heavy = events.iter().any(|ev| {
-            matches!(
-                ev,
-                CoreEvent::TilePayload {
-                    data: TileData::Cdf53 { .. },
-                    ..
-                }
-            )
-        });
+        let heavy = !self.cdf53_on_gpu
+            && events.iter().any(|ev| {
+                matches!(
+                    ev,
+                    CoreEvent::TilePayload {
+                        data: TileData::Cdf53 { .. },
+                        ..
+                    }
+                )
+            });
         if heavy {
             self.release_if_held();
             if self.render_gone {
@@ -260,6 +265,7 @@ impl Pump {
             slots,
             render_tx,
             render_gone,
+            cdf53_on_gpu: _,
         } = self;
         match slots.as_mut() {
             Some(slots) => decoder.decode_batch_into(events.drain(..), slots, |slots, step| {
@@ -323,12 +329,17 @@ impl Pump {
 /// [`RenderMsg::SlabTile`]; without it, or whenever every slab is busy, they
 /// travel as `Vec`s in [`RenderMsg::Core`] exactly as before. Never blocks
 /// waiting for a slot.
+///
+/// `cdf53_on_gpu`: CDF 5/3 passes are forwarded undecoded for the render
+/// thread's GPU grid (`GHOSTFRAME_CDF53_DECODE`, decided once at start-up by
+/// the render thread's self-test). Everything else decodes here as before.
 pub(crate) fn run(
     rx: Receiver<CoreEvent>,
     render_tx: Sender<RenderMsg>,
     slots: Option<SlotAllocator>,
+    cdf53_on_gpu: bool,
 ) {
-    run_batched(rx, render_tx, slots, BATCH_MAX)
+    run_batched(rx, render_tx, slots, BATCH_MAX, cdf53_on_gpu)
 }
 
 /// [`run`] with the batch bound chosen, so that a test can cross it cheaply.
@@ -337,13 +348,15 @@ fn run_batched(
     render_tx: Sender<RenderMsg>,
     slots: Option<SlotAllocator>,
     batch_max: usize,
+    cdf53_on_gpu: bool,
 ) {
     let mut pump = Pump {
-        decoder: TileDecoder::new(),
+        decoder: TileDecoder::new().with_cdf53_passthrough(cdf53_on_gpu),
         outbox: Outbox::default(),
         slots,
         render_tx,
         render_gone: false,
+        cdf53_on_gpu,
     };
     let mut stats = Stats::new();
     let mut batch = Vec::with_capacity(batch_max.min(256));
@@ -531,7 +544,7 @@ mod tests {
             }
         }
         drop(tx);
-        run(rx, render_tx, Some(alloc));
+        run(rx, render_tx, Some(alloc), false);
         assert_eq!(drain(&render_rx), want);
         // The measurement was not vacuous: both kinds occurred.
         assert!(want.iter().any(|s| matches!(s, Seen::Slab(_))));
@@ -581,6 +594,7 @@ mod tests {
             slots: Some(alloc),
             render_tx,
             render_gone: false,
+            cdf53_on_gpu: false,
         };
         // A palette update is absorbed by the decoder: no output.
         let nothing = || CoreEvent::PaletteUpdated {
@@ -613,7 +627,7 @@ mod tests {
             tx.send(solid(seq)).unwrap();
         }
         drop(tx);
-        run(rx, render_tx, Some(alloc));
+        run(rx, render_tx, Some(alloc), false);
         // The first release (on the cap, or the age if the machine is slow)
         // fails; every event after it is drained undecoded.
         let issued = pool.stats().slabs[0].0 as usize;
@@ -630,7 +644,7 @@ mod tests {
             tx.send(solid(seq)).unwrap();
         }
         drop(tx);
-        run(rx, render_tx, None);
+        run(rx, render_tx, None, false);
         assert_eq!(drain(&render_rx), (0..5).map(Seen::Vec).collect::<Vec<_>>());
     }
 
@@ -694,6 +708,61 @@ mod tests {
         out
     }
 
+    /// With the GPU grid on, a burst of CDF 5/3 passes reaches the render
+    /// thread as the passes themselves, every one, in order and undecoded --
+    /// no pictures, nothing coalesced -- both when handled one at a time and
+    /// as a queued batch; the CPU mode's behaviour is the tests around this.
+    #[test]
+    fn with_the_gpu_grid_cdf53_passes_are_forwarded_undecoded_in_order() {
+        let events = cdf_burst(4);
+        let want: Vec<(u8, u8)> = events
+            .iter()
+            .map(|ev| match ev {
+                CoreEvent::TilePayload {
+                    tile_x,
+                    data: TileData::Cdf53 { pass_idx, .. },
+                    ..
+                } => (*tile_x, *pass_idx),
+                _ => unreachable!(),
+            })
+            .collect();
+        let passes = |rx: &mpsc::Receiver<RenderMsg>| -> Vec<(u8, u8)> {
+            let mut out = Vec::new();
+            while let Ok(m) = rx.try_recv() {
+                match m {
+                    RenderMsg::Core(CoreEvent::TilePayload {
+                        tile_x,
+                        data: TileData::Cdf53 { pass_idx, .. },
+                        ..
+                    }) => out.push((tile_x, pass_idx)),
+                    other => panic!("unexpected {:?}", std::mem::discriminant(&other)),
+                }
+            }
+            out
+        };
+        for batched in [false, true] {
+            let (render_tx, render_rx) = mpsc::channel();
+            let mut pump = Pump {
+                decoder: TileDecoder::new().with_cdf53_passthrough(true),
+                outbox: Outbox::default(),
+                slots: None,
+                render_tx,
+                render_gone: false,
+                cdf53_on_gpu: true,
+            };
+            if batched {
+                let mut batch = events.clone();
+                pump.handle_batch(&mut batch, &mut Instant::now);
+            } else {
+                for ev in events.clone() {
+                    pump.handle(ev, Instant::now());
+                }
+            }
+            assert_eq!(passes(&render_rx), want, "batched {batched}");
+            assert_eq!(pump.decoder.cdf53_coalesced(), 0);
+        }
+    }
+
     /// A burst already queued is decoded together: one picture per tile, the
     /// same pixels the one-at-a-time path ends with.
     #[test]
@@ -708,6 +777,7 @@ mod tests {
             slots: None,
             render_tx,
             render_gone: false,
+            cdf53_on_gpu: false,
         };
         for ev in events.iter().cloned() {
             one_by_one.handle(ev, Instant::now());
@@ -721,7 +791,7 @@ mod tests {
             tx.send(ev).unwrap();
         }
         drop(tx);
-        run(rx, render_tx, None);
+        run(rx, render_tx, None, false);
         let batched = vec_tiles(&render_rx);
         let mut xs: Vec<u8> = batched.iter().map(|(x, _)| *x).collect();
         xs.sort();
@@ -754,7 +824,7 @@ mod tests {
             tx.send(ev).unwrap();
         }
         drop(tx);
-        run_batched(rx, render_tx, None, bound);
+        run_batched(rx, render_tx, None, bound, false);
         let got = vec_tiles(&render_rx);
         // A tile drawn twice means the bound split it across batches (one
         // batch would draw each once); coalescing still beat one at a time.
@@ -783,7 +853,7 @@ mod tests {
             tx.send(ev).unwrap();
         }
         drop(tx);
-        run(rx, render_tx, Some(alloc));
+        run(rx, render_tx, Some(alloc), false);
         let slabs = render_rx.try_iter().count();
         assert_eq!(slabs, 4);
         assert_eq!(pool.stats().slabs[0].0, 4, "four slots issued");
@@ -807,6 +877,7 @@ mod tests {
             slots: Some(alloc),
             render_tx,
             render_gone: false,
+            cdf53_on_gpu: false,
         };
         // A slab tile first, then enough passes to cross several ticks.
         let mut events = vec![CoreEvent::TilePayload {
@@ -859,6 +930,7 @@ mod tests {
             slots: Some(alloc),
             render_tx,
             render_gone: false,
+            cdf53_on_gpu: false,
         };
         let mut events = cdf_burst(3);
         // A Solid for another tile, after the passes: decoded in place
@@ -885,5 +957,190 @@ mod tests {
         assert_eq!(log.len(), 6, "{log:?}");
         assert_eq!(log[1], 0);
         assert_eq!(log[2], 1, "the solid was sent before the picture: {log:?}");
+    }
+
+    // ---- measurement ------------------------------------------------------
+
+    /// CPU time of the calling thread, in nanoseconds.
+    fn thread_cpu_ns() -> u64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid out-pointer for the call's duration.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        assert_eq!(rc, 0);
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+
+    /// A start-up burst for a `cols` x `rows` screen: pass 0 of every tile,
+    /// then pass 1 of every tile, and so on, from 24 distinct pictures.
+    fn screen_burst(cols: u8, rows: u8) -> Vec<CoreEvent> {
+        use ghostframe_client_core::cdf53_prevalidate::prevalidate_cdf53;
+        use ghostframe_protocol::codec::cdf53::{encode_passes_sparse, forward};
+        let pictures: Vec<Vec<_>> = (0..24u32)
+            .map(|id| {
+                let tile: Vec<u8> = (0..1024u32)
+                    .flat_map(|i| {
+                        let (px, py) = (i % 32, i / 32);
+                        let text = if (px / 3 + py / 5 + id) % 3 == 0 {
+                            0x20
+                        } else {
+                            0xE0
+                        };
+                        let ramp = (px * 5 + py * 3 + id * 11) as u8;
+                        let (b, g, r) = match id % 3 {
+                            0 => (text, text, text),
+                            1 => (ramp, ramp.wrapping_add(40), 255 - ramp),
+                            _ => (ramp ^ (py as u8 * 9), text, (px as u8) * 6),
+                        };
+                        [b, g, r, 255]
+                    })
+                    .collect();
+                let (_, passes) = encode_passes_sparse(&forward(&tile));
+                passes
+                    .into_iter()
+                    .map(|(idx, payload)| prevalidate_cdf53(&payload, 0, idx).unwrap())
+                    .collect()
+            })
+            .collect();
+        let mut events = Vec::new();
+        for layer in 0..14usize {
+            for ty in 0..rows {
+                for tx in 0..cols {
+                    let pic = &pictures[(tx as usize + ty as usize * 7) % pictures.len()];
+                    // Passes the picture does not have (sparse) are not sent.
+                    let Some(pre) = pic.iter().find(|p| p.pass_idx as usize == layer) else {
+                        continue;
+                    };
+                    events.push(CoreEvent::TilePayload {
+                        frame_seq: layer as u32,
+                        tile_x: tx,
+                        tile_y: ty,
+                        generation: 0,
+                        data: TileData::Cdf53 {
+                            pass_idx: pre.pass_idx,
+                            bit_planes: pre.bit_planes.clone(),
+                            present_passes: pre.present_passes,
+                            new_generation: layer == 0,
+                        },
+                    });
+                }
+            }
+        }
+        events
+    }
+
+    /// Decode-thread and render-thread CPU for a start-up burst, with CDF 5/3
+    /// decoded on the CPU (decode thread) and on the GPU (grid, render
+    /// thread): `cargo test -p ghostframe-client-native --no-default-features
+    /// --features gles,decode-gstreamer --release --lib -- --ignored
+    /// --nocapture cdf53_mode_cost`. Also checks that both end with the same
+    /// picture.
+    #[test]
+    #[ignore = "measurement, prints numbers"]
+    fn cdf53_mode_cost() {
+        use ghostframe_client_gpu::renderer::Renderer;
+        let ctx = WgpuContext::new().expect("wgpu context");
+        let (cols, rows) = (60u8, 34u8); // 1920 x 1080
+        let events = screen_burst(cols, rows);
+        let tiles = cols as usize * rows as usize;
+        println!("{} events for {tiles} tiles", events.len());
+        let mut pictures: Vec<Vec<u8>> = Vec::new();
+        for gpu in [false, true, false, true] {
+            let mut r = Renderer::new(
+                &ctx,
+                cols as u32 * 32,
+                rows as u32 * 32,
+                3,
+                &[],
+                false,
+                false,
+            )
+            .expect("renderer");
+            let (pool, alloc) = UploadPool::new(&ctx).expect("pool");
+            r.attach_upload_pool(&ctx, &pool);
+            if gpu {
+                r.enable_cdf53_gpu(&ctx);
+            }
+            let (tx, rx) = mpsc::channel();
+            let (render_tx, render_rx) = mpsc::channel();
+            for ev in events.iter().cloned() {
+                tx.send(ev).unwrap();
+            }
+            drop(tx);
+            let wall = Instant::now();
+            let decode = std::thread::spawn(move || {
+                let c0 = thread_cpu_ns();
+                run(rx, render_tx, Some(alloc), gpu);
+                thread_cpu_ns() - c0
+            });
+            let c0 = thread_cpu_ns();
+            let (mut flushes, mut msgs) = (0u32, 0u64);
+            let mut open = true;
+            while open || r.has_deferred_work() {
+                let mut got = 0;
+                if open {
+                    // Block for the first message, then take what is queued,
+                    // as the render loop does.
+                    match render_rx.recv() {
+                        Ok(m) => {
+                            apply(&mut r, &ctx, m);
+                            got += 1;
+                        }
+                        Err(_) => open = false,
+                    }
+                    while open && got < 2048 {
+                        match render_rx.try_recv() {
+                            Ok(m) => {
+                                apply(&mut r, &ctx, m);
+                                got += 1;
+                            }
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => open = false,
+                        }
+                    }
+                }
+                msgs += got;
+                r.flush(&ctx).expect("flush");
+                flushes += 1;
+            }
+            let render_cpu = thread_cpu_ns() - c0;
+            let decode_cpu = decode.join().unwrap();
+            // The read-back waits for the GPU, so the wall time includes it.
+            let picture = r.debug_read_framebuffer(&ctx);
+            #[allow(clippy::disallowed_methods, reason = "measuring real elapsed time")]
+            let wall_ms = wall.elapsed().as_secs_f64() * 1e3;
+            println!(
+                "{} : decode thread {:7.1} ms CPU, render thread {:7.1} ms CPU, wall {:7.1} ms, {flushes} flushes, {msgs} msgs",
+                if gpu { "gpu" } else { "cpu" },
+                decode_cpu as f64 / 1e6,
+                render_cpu as f64 / 1e6,
+                wall_ms
+            );
+            pictures.push(picture);
+        }
+        assert!(
+            pictures.iter().all(|p| p == &pictures[0]),
+            "the two modes ended with different pictures"
+        );
+        let drawn = pictures[0]
+            .chunks(4)
+            .filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
+            .count();
+        assert!(drawn > 1_000_000, "only {drawn} non-black pixels");
+    }
+
+    fn apply(r: &mut ghostframe_client_gpu::renderer::Renderer, ctx: &WgpuContext, m: RenderMsg) {
+        match m {
+            RenderMsg::Core(ev) => r.apply_event(ctx, ev).expect("apply"),
+            RenderMsg::SlabTile {
+                frame_seq,
+                tile_x,
+                tile_y,
+                slot,
+            } => assert!(r.apply_slot_tile(frame_seq, tile_x, tile_y, slot)),
+            _ => panic!("unexpected message"),
+        }
     }
 }

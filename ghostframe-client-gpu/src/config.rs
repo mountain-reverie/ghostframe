@@ -123,6 +123,54 @@ impl PublishConfig {
     }
 }
 
+/// Where the native client reconstructs CDF 5/3 tiles.
+///
+/// `GHOSTFRAME_CDF53_DECODE`:
+/// - unset, empty, `gpu` or `auto`: on the GPU
+///   ([`crate::pipelines::cdf53_grid`]), if a start-up self-test of the shaders
+///   passes on this device and the frame's plane store fits; otherwise on the
+///   decode thread's CPU, as before.
+/// - `cpu`: always the CPU. For A/B in one binary, and the escape hatch when a
+///   driver miscompiles the shader in a way the self-test does not see.
+///
+/// Anything else reads as the default; [`Cdf53Decode::from_env`] says so in the
+/// log, once per call (the native client calls it once).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Cdf53Decode {
+    #[default]
+    Auto,
+    Cpu,
+}
+
+impl Cdf53Decode {
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        match get("GHOSTFRAME_CDF53_DECODE").as_deref() {
+            Some(v) if v.eq_ignore_ascii_case("cpu") => Cdf53Decode::Cpu,
+            _ => Cdf53Decode::Auto,
+        }
+    }
+
+    /// Whether `get` holds a value this knows nothing about.
+    pub fn is_unrecognised(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+        get("GHOSTFRAME_CDF53_DECODE").filter(|v| {
+            !["", "auto", "gpu", "cpu"]
+                .iter()
+                .any(|ok| v.eq_ignore_ascii_case(ok))
+        })
+    }
+
+    pub fn from_env() -> Self {
+        let get = |k: &str| std::env::var(k).ok();
+        if let Some(v) = Self::is_unrecognised(get) {
+            tracing::warn!(
+                value = %v,
+                "GHOSTFRAME_CDF53_DECODE: unrecognised value, expected `cpu`, `gpu` or `auto`; using auto"
+            );
+        }
+        Self::from_lookup(get)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +234,36 @@ mod tests {
         assert_eq!(c.frame_prefix.as_deref(), Some("/tmp/f"));
         assert_eq!(c.export_prefix.as_deref(), Some("/tmp/e"));
         assert_eq!((c.every, c.count), (0, 1));
+    }
+
+    #[test]
+    fn cdf53_decode_is_auto_unless_cpu_is_asked_for() {
+        let mode = |pairs| Cdf53Decode::from_lookup(lookup(pairs));
+        assert_eq!(mode(&[]), Cdf53Decode::Auto);
+        assert_eq!(
+            mode(&[("GHOSTFRAME_CDF53_DECODE", "gpu")]),
+            Cdf53Decode::Auto
+        );
+        assert_eq!(
+            mode(&[("GHOSTFRAME_CDF53_DECODE", "cpu")]),
+            Cdf53Decode::Cpu
+        );
+        assert_eq!(
+            mode(&[("GHOSTFRAME_CDF53_DECODE", "CPU")]),
+            Cdf53Decode::Cpu
+        );
+        assert_eq!(mode(&[("GHOSTFRAME_CDF53_DECODE", "")]), Cdf53Decode::Auto);
+        let odd = |v: &str| {
+            let v = v.to_string();
+            Cdf53Decode::is_unrecognised(move |k| {
+                (k == "GHOSTFRAME_CDF53_DECODE").then(|| v.clone())
+            })
+        };
+        assert_eq!(odd("cpuu").as_deref(), Some("cpuu"));
+        assert_eq!(odd("1").as_deref(), Some("1"));
+        assert_eq!(odd("GPU"), None);
+        assert_eq!(odd("Cpu"), None);
+        assert_eq!(odd(""), None);
     }
 
     #[test]

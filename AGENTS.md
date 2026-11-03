@@ -238,6 +238,30 @@ Env-gated, off by default:
   be bound as a storage image, and per frame when the damage fills most of its
   bounding box; `ExportRing::uses_compute_copy` says which it got at creation.
 
+- `GHOSTFRAME_CDF53_DECODE=cpu` — native client only: reconstruct CDF 5/3
+  tiles on the decode thread's CPU (`Cdf53TileState`), as before the GPU grid.
+  Unset (or anything but `cpu`) means the GPU grid
+  (`ghostframe-client-gpu/src/pipelines/cdf53_grid.rs`) **if** a start-up
+  self-test on the render thread passes (it draws two known tiles and compares
+  them to the CPU codec; look for `CDF 5/3 decode on the GPU (self-test
+  passed)` or `... self-test failed; decoding on the CPU` in the log). The
+  choice is made once per process, before the decode thread starts; in GPU mode
+  the decode thread forwards `TileData::Cdf53` passes undecoded and the render
+  thread's `Cdf53GridState` schedules them (about 7 ms of GPU per flush, carry
+  over to the next flush, at most 1000 tiles per submit). A frame whose plane
+  store exceeds the device's storage binding limit (about 8K) falls back to
+  CPU decode on the render thread. With `RUST_LOG=ghostframe=debug` the
+  render thread logs `cdf53 grid, 1s summary`: `listed`, `deferred` (budget),
+  `throttled`, `skipped_no_magnitude`, `skipped_same_k`, `skipped_no_pass0`,
+  `dropped_superseded` and `grid_frames`. **The reconstruct shader is fragile on
+  panfrost:** when register allocation tips over (`MESA_SHADER_CACHE_DISABLE=true
+  MIDGARD_MESA_DEBUG=shaderdb` shows "0 registers" and hundreds of spills) the
+  dispatch silently writes nothing, with no error. After any edit to
+  `shaders/client/cdf53_reconstruct.wgsl`, run `cargo test -p ghostframe-client-gpu
+  --no-default-features --features gles,decode-gstreamer,test-support --release
+  --test cdf53_grid` and check the shaderdb line (about 930 instructions, 8
+  registers, ~21:57 spills is the shipped build).
+
 Tile XOR parity (k=10) is **off by default** (`TransportConfig::tile_fec`).
 `GHOSTFRAME_TILE_FEC=1` turns it back on; a browserless scene opts in with
 `RunOptions { tile_fec: true, .. }`. The client decodes parity either way, and

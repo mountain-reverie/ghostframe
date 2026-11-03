@@ -17,7 +17,9 @@ const W: u32 = 1920;
 const H: u32 = 1080;
 
 fn renderer(ctx: &WgpuContext) -> Renderer {
-    Renderer::new(ctx, W, H, 3, &[], false, false).expect("renderer")
+    let mut r = Renderer::new(ctx, W, H, 3, &[], false, false).expect("renderer");
+    r.enable_cdf53_gpu(ctx);
+    r
 }
 
 /// Solid, PalRle and CDF 5/3 payloads from the shared capture (tiles in the

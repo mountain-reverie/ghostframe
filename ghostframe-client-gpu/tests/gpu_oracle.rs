@@ -61,10 +61,17 @@ fn gpu_decode_matches_cpu_decode_for_solid_palrle_and_cdf53() {
     // GPU path, same capture.
     let ctx = WgpuContext::new().expect("wgpu context");
     let mut renderer = Renderer::new(&ctx, 64, 64, 3, &[], false, false).expect("renderer");
+    // The grid, not the renderer's CPU fallback.
+    renderer.enable_cdf53_gpu(&ctx);
     for ev in drain(&capture, TileDelivery::Payload) {
         renderer.apply_event(&ctx, ev).expect("gpu ok");
     }
     renderer.flush(&ctx).expect("gpu ok");
+    let (stats, frames) = renderer.take_cdf53_stats().expect("grid enabled");
+    assert!(
+        stats.listed >= 1 && frames >= 1,
+        "the Cdf53 tile did not go through the grid: {stats:?}, {frames} frames"
+    );
     let fb = renderer.debug_read_framebuffer(&ctx);
 
     let mut compared = 0usize;
@@ -78,11 +85,10 @@ fn gpu_decode_matches_cpu_decode_for_solid_palrle_and_cdf53() {
             // EXACT equality, no tolerance.
             //
             // CDF 5/3 is an integer-reversible lifting transform, and the
-            // inverse shaders (cdf53_inverse_l1/l2/l3) contain no floating
-            // point at all -- only i32. The sole f32 in the chain is
-            // cdf53_inverse_l1_pass2's final `/255.0` for textureStore into
-            // an rgba8unorm target, which round-trips integers 0..255
-            // exactly.
+            // reconstruct shader (cdf53_reconstruct.wgsl) contains no floating
+            // point in the transform -- only i32. The sole f32 in the chain is
+            // the final `/255.0` for textureStore into an rgba8unorm target,
+            // which round-trips integers 0..255 exactly.
             //
             // Both decoders also apply the same midpoint formula for an
             // incomplete pass set, so they must agree even mid-refinement.

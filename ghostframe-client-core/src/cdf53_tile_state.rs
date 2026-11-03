@@ -34,12 +34,35 @@ pub fn write_bgr_rows(bgr: &[u8], out: &mut TileOut<'_>) {
     }
 }
 
+/// Length of the contiguous prefix of *resolved* passes starting at pass 0.
+///
+/// A pass is resolved once its plane has arrived (`received` bit `i`), or the
+/// tile's `present_passes` bitmap says it is never coming (bit `i` clear) --
+/// but only once that bitmap is known, i.e. once pass 0 has arrived, so a tile
+/// without pass 0 has a prefix of 0 whatever else arrived. This is the one
+/// rule for "how much of the tile can be drawn", shared by the CPU accumulator
+/// below and the GPU scheduler (`ghostframe-client-gpu`'s `Cdf53GridState`),
+/// which holds no planes of its own to ask.
+pub fn resolved_prefix(received: u16, present_passes: Option<u16>) -> usize {
+    let resolved = match present_passes {
+        Some(present) => received | !present,
+        None => received,
+    };
+    (0..CDF53_PASS_COUNT)
+        .take_while(|&i| resolved & (1u16 << i) != 0)
+        .count()
+}
+
 #[derive(Clone, Default)]
 struct TileEntry {
     generation: u8,
     generation_set: bool,
     /// Decoded 384-byte bit-planes (B,G,R × 128 bytes), one slot per pass.
+    /// `None` for a pass that has not arrived, whether or not it is coming:
+    /// an absent plane reads as all-zero (see [`resolved_prefix`]).
     planes: [Option<Vec<u8>>; CDF53_PASS_COUNT],
+    /// Bit `i` set when `planes[i]` holds a plane that arrived.
+    received: u16,
     /// The tile's `present_passes` bitmap, learned from pass 0's payload.
     /// `None` until pass 0 arrives. See `integrate`'s doc comment for how
     /// this interacts with the "contiguous prefix" reconstruction rule.
@@ -53,7 +76,7 @@ struct TileEntry {
 impl TileEntry {
     /// Length of the contiguous prefix of resolved passes starting at 0.
     fn prefix_len(&self) -> usize {
-        self.planes.iter().take_while(|p| p.is_some()).count()
+        resolved_prefix(self.received, self.present_passes)
     }
 }
 
@@ -138,7 +161,7 @@ impl Cdf53TileState {
     }
 
     /// The cheap half of [`Self::integrate_bgr`]: store the pass, apply the
-    /// generation rule and the `present_passes` backfill, but run neither
+    /// generation rule and the `present_passes` bitmap, but run neither
     /// `decode_planes` nor `inverse`. Returns whether the contiguous prefix
     /// differs from the one last drawn, i.e. whether
     /// [`Self::reconstruct`] may have a picture to give. A `true` is not a
@@ -151,6 +174,7 @@ impl Cdf53TileState {
             tile.generation = entry.generation;
             tile.generation_set = true;
             tile.planes = Default::default();
+            tile.received = 0;
             tile.present_passes = None;
             tile.drawn_prefix = None;
         }
@@ -158,21 +182,14 @@ impl Cdf53TileState {
         let idx = entry.pass_idx as usize;
         if idx < CDF53_PASS_COUNT {
             tile.planes[idx] = Some(entry.bit_planes.clone());
+            tile.received |= 1u16 << idx;
         }
 
-        // Pass 0 just taught us (or re-confirmed) which passes exist for
-        // this generation. Backfill every known-absent slot that hasn't
-        // actually received data with an explicit all-zero plane -- the
-        // same content an "empty" pass would have produced had it been
-        // sent -- so the contiguous-prefix scan below doesn't stall on a
-        // pass that is never coming.
+        // Pass 0 teaches us which passes exist for this generation. A pass it
+        // says is never coming is resolved (as all-zero) without a plane, so
+        // the prefix does not stall on it; see `resolved_prefix`.
         if let Some(present) = entry.present_passes {
             tile.present_passes = Some(present);
-            for i in 0..CDF53_PASS_COUNT {
-                if present & (1u16 << i) == 0 && tile.planes[i].is_none() {
-                    tile.planes[i] = Some(vec![0u8; 384]);
-                }
-            }
         }
 
         tile.drawn_prefix != Some(tile.prefix_len())
@@ -189,9 +206,10 @@ impl Cdf53TileState {
             return None;
         }
 
+        const ZERO_PLANE: [u8; 384] = [0u8; 384];
         let plane_refs: Vec<&[u8]> = tile.planes[..prefix_len]
             .iter()
-            .map(|p| p.as_deref().expect("contiguous prefix"))
+            .map(|p| p.as_deref().unwrap_or(&ZERO_PLANE))
             .collect();
         let coefficients = decode_planes(&plane_refs);
         if prefix_len < CDF53_PASS_COUNT && coefficients.iter().all(|&c| c == 0) {
@@ -216,5 +234,35 @@ impl Cdf53TileState {
 impl Default for Cdf53TileState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nothing_is_drawable_before_pass_zero_whatever_else_arrived() {
+        // Passes 1..=13 are in, pass 0 is not: signs are missing, so 0.
+        assert_eq!(resolved_prefix(0x3FFE, None), 0);
+        assert_eq!(resolved_prefix(0x3FFE, Some(0x3FFF)), 0);
+        // Pass 0 arrived but its bitmap is what makes the rest resolvable.
+        assert_eq!(resolved_prefix(0x0001, None), 1);
+    }
+
+    #[test]
+    fn absent_passes_resolve_only_once_the_bitmap_is_known() {
+        // Bitmap says passes 0 and 5 exist; 0 arrived.
+        let present = Some(0b10_0001);
+        assert_eq!(resolved_prefix(0b1, present), 5, "stops at the missing 5");
+        assert_eq!(resolved_prefix(0b10_0001, present), 14);
+        // The same arrivals with no bitmap resolve nothing past pass 0.
+        assert_eq!(resolved_prefix(0b1, None), 1);
+    }
+
+    #[test]
+    fn a_gap_in_a_present_pass_stops_the_prefix() {
+        assert_eq!(resolved_prefix(0b1111_0111, Some(0x3FFF)), 3);
+        assert_eq!(resolved_prefix(0x3FFF, Some(0x3FFF)), 14);
     }
 }
