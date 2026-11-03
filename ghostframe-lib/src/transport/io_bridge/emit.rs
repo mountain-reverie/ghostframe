@@ -911,6 +911,13 @@ impl IoBridge {
             self.apply_injected_h264(inj.seq, inj.timestamp_us, h);
             return 0;
         }
+        // Tile work after H.264 frames is the classifier's H264 -> TileCodec
+        // flip (`classify_and_dispatch`): what was in flight is abandoned. An
+        // empty injection is a heartbeat, not a mode.
+        if !inj.work.is_empty() && self.frame_mode == crate::tile::FrameMode::H264 {
+            self.abandon_h264_inflight(inj.seq, now_std());
+            self.frame_mode = crate::tile::FrameMode::TileCodec;
+        }
         // The scheduler grid is normally sized by the real capture path
         // (`dispatch_dirty_tiles_via_scheduler`, keyed off the frame's
         // actual dimensions via `TileGrid`). Injected work bypasses that

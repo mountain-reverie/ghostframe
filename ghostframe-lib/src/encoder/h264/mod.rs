@@ -5,9 +5,12 @@
 //! per-frame state ring; `refs` is the `RefManager` that decides each frame's
 //! plan. `pcm_writer` and `pcm_decoder` write real streams from those plans
 //! and decode them with libavcodec; `pcm_oracle_tests` (test builds only) is
-//! design T2.
+//! design T2, and `harness` (the `browserless-harness` feature) runs them
+//! behind the transport for the browserless scenes (design T3).
 
 pub(crate) mod backend;
+#[cfg(feature = "browserless-harness")]
+pub mod harness;
 pub(crate) mod param_sets;
 pub(crate) mod refs;
 pub(crate) mod syntax;

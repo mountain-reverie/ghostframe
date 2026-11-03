@@ -1719,6 +1719,21 @@ impl IoBridge {
         seq: u32,
         max_dg_size: usize,
     ) {
+        self.send_h264_frame_described(encoded, frame, seq, max_dg_size, None);
+    }
+
+    /// [`Self::send_h264_frame`] with the frame's reference description given
+    /// instead of derived (`None`): what an encoder that controls references
+    /// says on the wire. Only the browserless harness's `RefManager` source
+    /// does, until the acked-reference encoder is wired in (B5).
+    pub(super) fn send_h264_frame_described(
+        &mut self,
+        encoded: H264Out,
+        frame: &FrameMeta,
+        seq: u32,
+        max_dg_size: usize,
+        described: Option<FrameRefInfo>,
+    ) {
         let now = now_std();
         // Fragment and send. `fragment_frame` chunks the payload at the
         // per-fragment payload limit (datagram size minus the frame
@@ -1732,7 +1747,8 @@ impl IoBridge {
         // frame names the previous H.264 frame this bridge sent, which is what
         // the ffmpeg encoder predicts from (one reference, no long-term
         // slots). With none sent yet it carries `REF_FRAME_NONE`, "unknown".
-        let ref_info = h264_ref_info(encoded.is_keyframe, self.last_h264_frame_seq);
+        let ref_info = described
+            .unwrap_or_else(|| h264_ref_info(encoded.is_keyframe, self.last_h264_frame_seq));
         self.last_h264_frame_seq = Some(seq);
         let datagrams = fragment_frame_ref(
             seq,
