@@ -8,7 +8,10 @@
 //! backpressure skip, pending IDR requests) and its real send path (fragments,
 //! ledger, admission, probe cache, XOR parity), and the "encoder" makes an IDR
 //! exactly when the bridge asked for one. Payloads are filler: the client
-//! reassembles (`NeedsH264`) and decodes nothing.
+//! reassembles (`NeedsH264`) and decodes nothing. The scenes in
+//! `browserless_h264/pcm_scenes.rs` (module `pcm_scenes` below) run the same
+//! path with real PCM-patch streams that the client decodes with libavcodec:
+//! they can say which picture was displayed.
 //!
 //! What this therefore covers: that H.264 datagrams are ledger transmissions
 //! (acknowledged or judged exactly once), that the bandwidth estimator learns
@@ -16,7 +19,8 @@
 //! for it, that an acknowledgement stall is not read as loss, and that the
 //! encoder is not run into a backed-up queue. What it cannot: anything about
 //! picture content or reference chains (the Phase B PCM writer), the ffmpeg
-//! encoder's own GOP and rate control, or the web client's decoder.
+//! encoder's own GOP and rate control, or the web client's decoder. (Picture
+//! content and reference chains are `pcm_scenes`.)
 //!
 //! Every scene states its premise as an assertion before the effect it is
 //! about: an effect asserted over a drop that never fired proves nothing.
@@ -1370,3 +1374,6 @@ async fn the_headroom_guard_releases_in_h264_mode_on_a_capacity_step() {
         );
     }
 }
+
+#[path = "browserless_h264/pcm_scenes.rs"]
+mod pcm_scenes;
