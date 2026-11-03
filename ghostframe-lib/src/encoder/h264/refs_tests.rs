@@ -62,6 +62,8 @@ struct Script {
     cumulative: bool,
     strip_rplm: bool,
     strip_mmco1: bool,
+    /// The client measures `frame_num` gaps the way libavcodec does.
+    lavc_gaps: bool,
     /// Fragments in an IDR; a lost-free IDR acknowledges them evenly between
     /// its first ack and its delivery.
     idr_frags: u16,
@@ -81,6 +83,7 @@ impl Script {
             cumulative: false,
             strip_rplm: false,
             strip_mmco1: false,
+            lavc_gaps: false,
             idr_frags: 1,
         }
     }
@@ -212,6 +215,13 @@ impl Sim {
             let eff = self.client.push(seq, header);
             self.max_client_peak = self.max_client_peak.max(eff.dpb_peak);
             if self.strict {
+                // Every MMCO 1 must name a picture the client really holds,
+                // not one a gap process may or may not have invented.
+                assert!(
+                    eff.forgotten.iter().all(|f| matches!(f, RefPic::Real(_))),
+                    "frame {seq} forgets {:?}: plan {plan:?}",
+                    eff.forgotten
+                );
                 assert!(
                     !eff.violations.any(),
                     "client violation at seq {seq}: {:?} plan {plan:?} client st {:?} lt0 {:?} lt1 {:?} marks {:?} slots {}",
@@ -287,6 +297,9 @@ impl Sim {
 
     fn run(&mut self, sc: &mut Script, strict: bool) {
         self.strict = strict;
+        if sc.lavc_gaps {
+            self.client = DecoderModel::new(params()).with_gap_mode(GapMode::Libavcodec);
+        }
         let p = params();
         let mut seq = 100u32;
         let mut last_ref_fn: Option<u32> = None;
@@ -621,6 +634,48 @@ fn a_mark_into_a_slot_the_client_may_lack_always_drops_the_oldest_short_term() {
 }
 
 #[test]
+fn a_mark_never_names_a_short_term_picture_the_client_lost() {
+    // Every frame but the IDR is lost for 80 steps. The client then holds the
+    // IDR and, at best, "non-existing" frames for the gaps, which decoders do
+    // not agree on (libavcodec invents none before a non-reference picture
+    // that follows a gap), so an MMCO 1 naming a lost frame fails there. The
+    // marks must wait for a picture that is not lost, and then resume.
+    let sc = Script::new(260, |step, plan| Fate {
+        lose: plan.kind != PicKind::Idr && (1..80).contains(&step),
+        ..Fate::default()
+    });
+    let sim = run_sim(sc);
+    let (mut named, mut named_after) = (0, 0);
+    for l in &sim.log {
+        for op in &l.plan.mmco {
+            let Mmco::ForgetShort(d) = *op else { continue };
+            // A mark that is itself lost never reaches a decoder.
+            if l.lost {
+                continue;
+            }
+            let fnum = (l.plan.frame_num + 128 - (d + 1)) % 128;
+            let victim = sim
+                .log
+                .iter()
+                .rev()
+                .find(|v| v.step < l.step && v.plan.nal_ref_idc != 0 && v.plan.frame_num == fnum)
+                .expect("the victim was sent");
+            assert!(
+                !victim.lost,
+                "step {} drops lost frame {} (step {})",
+                l.step, victim.plan.frame_seq, victim.step
+            );
+            named += 1;
+            named_after += usize::from(l.step >= 80);
+        }
+    }
+    assert!(
+        named >= 1 && named_after >= 1,
+        "premise: {named} drops, {named_after} after the loss"
+    );
+}
+
+#[test]
 fn no_rplm_diverges_exactly_where_the_default_list_differs() {
     let sim = run_sim(Script::lossless(80));
     assert!(sim.log.iter().all(|l| l.matched));
@@ -945,21 +1000,25 @@ fn late_decoded_bit_for_an_overwritten_candidate_is_ignored() {
     h.m.tick(h.at(step), STEP * 4);
     assert_eq!(h.m.frame_state(c1.frame_seq), Some(FrameState::Suspect));
     // C2 is marked into the same slot and also lost.
+    // A mark that must drop a short-term picture rides a healthy frame, so
+    // the re-root that leaves recovery is decoded first.
     let c2 = loop {
         let p = h.send(step);
         step += 1;
         if p.mark.is_some() {
             break p;
         }
+        h.m.frame_decoded(p.frame_seq);
+        assert!(step < 100, "no mark became due");
     };
     assert_eq!(
         c2.mark,
         Some(1),
         "same slot: the confirmed anchor sits in 0"
     );
-    let before = h.m.stats().late_confirm_ignored;
+    // Leaving recovery superseded C1 (dead) or the occupant rule ignores its
+    // bit: either way a late decoded bit must not move the anchor.
     h.m.frame_decoded(c1.frame_seq);
-    assert_eq!(h.m.stats().late_confirm_ignored, before + 1);
     assert_eq!(
         h.m.anchor(),
         Some(Anchor {
@@ -1350,7 +1409,7 @@ proptest! {
     /// once losses stop the stream settles to healthy frames the client
     /// decodes.
     #[test]
-    fn plans_match_effective_references_over_random_loss((delay, fates, loss_until, stride, cumulative, srtt_ms, slow_idr) in arb_script()) {
+    fn plans_match_effective_references_over_random_loss((delay, fates, loss_until, stride, cumulative, srtt_ms, slow_idr) in arb_script(), lavc in any::<bool>()) {
         let mut sc = Script::new(700, move |step, plan| {
             let slow = if plan.kind == PicKind::Idr && slow_idr > 0 {
                 Some(slow_idr)
@@ -1375,6 +1434,7 @@ proptest! {
             }
         });
         sc.delay = delay;
+        sc.lavc_gaps = lavc;
         sc.seq_stride = stride;
         sc.cumulative = cumulative;
         if slow_idr > 0 {
@@ -1403,6 +1463,35 @@ proptest! {
             prop_assert_eq!(l.plan.kind, PicKind::Healthy);
             prop_assert_eq!(l.fed, Some(true));
         }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1000))]
+
+    /// Startup epochs under heavy loss, half of it never reported by a
+    /// verdict (only the decode deadline finds it), with a client that infers
+    /// gap frames either way: the strict simulation asserts that every MMCO 1
+    /// names a picture the client really holds and that nothing overflows.
+    #[test]
+    fn startup_losses_never_make_a_mark_forget_a_missing_picture(
+        delay in 1usize..4,
+        fates in proptest::collection::vec((prop::bool::weighted(0.35), any::<bool>()), 30),
+        lavc in any::<bool>(),
+    ) {
+        let mut sc = Script::new(90, move |step, plan| {
+            let (lose, no_verdict) = fates[step % fates.len()];
+            Fate {
+                lose: lose && step < 30 && plan.kind != PicKind::Idr,
+                no_verdict,
+                ..Fate::default()
+            }
+        });
+        sc.delay = delay;
+        sc.lavc_gaps = lavc;
+        let mut sim = Sim::new();
+        sim.run(&mut sc, true);
+        prop_assert!(sim.max_client_peak <= 4);
     }
 }
 

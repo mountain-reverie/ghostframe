@@ -683,6 +683,8 @@ pub(crate) struct Effective {
     /// Reference frames resident right after the picture was added, before
     /// an overflow was repaired by discarding one (`dpb_len <= dpb_peak`).
     pub dpb_peak: usize,
+    /// The pictures MMCO 1 and 2 removed, as the decoder had them.
+    pub forgotten: Vec<RefPic>,
     pub violations: Violations,
 }
 
@@ -691,6 +693,19 @@ impl Effective {
     pub(crate) fn references(&self, seq: u32) -> bool {
         self.reference == Some(RefPic::Real(seq))
     }
+}
+
+/// How a decoder measures a `frame_num` gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GapMode {
+    /// The spec (8.2.5.2): against `PrevRefFrameNum`, so a non-reference
+    /// picture does not consume a `frame_num`.
+    Spec,
+    /// libavcodec: against the previous picture's `frame_num`, non-reference
+    /// pictures included, and at most `max_num_ref_frames` frames are
+    /// inferred. A lost reference frame that shares its `frame_num` with a
+    /// non-reference picture that arrived is never inferred.
+    Libavcodec,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -709,6 +724,9 @@ pub(crate) struct DecoderModel {
     params: StreamParams,
     pics: Vec<ModelPic>,
     prev_ref_frame_num: u32,
+    /// `frame_num` of the previous picture of any kind (`GapMode::Libavcodec`).
+    prev_pic_frame_num: u32,
+    gap_mode: GapMode,
     prev_poc_msb: i64,
     prev_poc_lsb: u32,
     /// MaxLongTermFrameIdx + 1; 0 is "no long-term frame indices".
@@ -721,10 +739,17 @@ impl DecoderModel {
             params,
             pics: Vec::new(),
             prev_ref_frame_num: 0,
+            prev_pic_frame_num: 0,
+            gap_mode: GapMode::Spec,
             prev_poc_msb: 0,
             prev_poc_lsb: 0,
             max_lt_idx_plus1: 0,
         }
+    }
+
+    pub(crate) fn with_gap_mode(mut self, gap_mode: GapMode) -> Self {
+        self.gap_mode = gap_mode;
+        self
     }
 
     /// What `h` would reference, without changing the model.
@@ -792,28 +817,45 @@ impl DecoderModel {
         let max_fn = self.params.max_frame_num();
         let max_lsb = 1i64 << self.params.log2_max_poc_lsb;
 
+        let mut forgotten = Vec::new();
+        let lavc = self.gap_mode == GapMode::Libavcodec;
         if h.idr {
             self.pics.clear();
             self.prev_ref_frame_num = 0;
+            self.prev_pic_frame_num = 0;
             self.prev_poc_msb = 0;
             self.prev_poc_lsb = 0;
-        } else if h.frame_num != self.prev_ref_frame_num
-            && h.frame_num != (self.prev_ref_frame_num + 1) % max_fn
-        {
-            if self.params.gaps_in_frame_num_allowed {
-                let mut unused = (self.prev_ref_frame_num + 1) % max_fn;
-                while unused != h.frame_num {
-                    self.sliding_window(unused, &mut v);
-                    self.pics.push(ModelPic {
-                        pic: RefPic::NonExisting,
-                        frame_num: unused,
-                        lt_idx: None,
-                    });
-                    self.prev_ref_frame_num = unused;
-                    unused = (unused + 1) % max_fn;
-                }
+        } else {
+            let mut base = if lavc {
+                self.prev_pic_frame_num
             } else {
-                v.gap_not_allowed = true;
+                self.prev_ref_frame_num
+            };
+            if lavc {
+                // libavcodec infers at most `max_num_ref_frames` frames.
+                let gap = (h.frame_num + max_fn - base) % max_fn;
+                let cap = self.params.max_num_ref_frames.max(1);
+                if gap > cap {
+                    base = (h.frame_num + max_fn - cap - 1) % max_fn;
+                }
+            }
+            if h.frame_num != base && h.frame_num != (base + 1) % max_fn {
+                if self.params.gaps_in_frame_num_allowed {
+                    let mut unused = (base + 1) % max_fn;
+                    while unused != h.frame_num {
+                        self.sliding_window(unused, &mut v);
+                        self.pics.push(ModelPic {
+                            pic: RefPic::NonExisting,
+                            frame_num: unused,
+                            lt_idx: None,
+                        });
+                        unused = (unused + 1) % max_fn;
+                    }
+                    // The spec resumes counting from the last inferred frame.
+                    self.prev_ref_frame_num = (h.frame_num + max_fn - 1) % max_fn;
+                } else {
+                    v.gap_not_allowed = true;
+                }
             }
         }
 
@@ -927,7 +969,7 @@ impl DecoderModel {
                                 let pic_num = i64::from(cur) - (i64::from(d) + 1);
                                 match self.find_short(pic_num, cur) {
                                     Some(i) => {
-                                        self.pics.remove(i);
+                                        forgotten.push(self.pics.remove(i).pic);
                                     }
                                     None => v.bad_pic_num = true,
                                 }
@@ -935,7 +977,7 @@ impl DecoderModel {
                             Mmco::ForgetLong(n) => {
                                 match self.pics.iter().position(|p| p.lt_idx == Some(n)) {
                                     Some(i) => {
-                                        self.pics.remove(i);
+                                        forgotten.push(self.pics.remove(i).pic);
                                     }
                                     None => v.bad_pic_num = true,
                                 }
@@ -989,6 +1031,9 @@ impl DecoderModel {
                 }
             }
         }
+        if !h.idr {
+            self.prev_pic_frame_num = cur_frame_num;
+        }
         if h.nal_ref_idc != 0 {
             self.prev_ref_frame_num = cur_frame_num;
             self.prev_poc_msb = msb;
@@ -1001,6 +1046,7 @@ impl DecoderModel {
             poc,
             dpb_len: self.pics.len(),
             dpb_peak: dpb_peak.unwrap_or(self.pics.len()),
+            forgotten,
             violations: v,
         }
     }
