@@ -46,6 +46,23 @@ const FOLLOW_TOLERANCE: f64 = 0.02;
 /// minimum, which errs towards lifting).
 const QUEUE_RTT_RATIO: f64 = 1.25;
 
+/// A gap in the acknowledgements is a stall when it is longer than this
+/// fraction of the reading window (and the round trip).
+const GAP_WINDOW_FRACTION: u64 = 4;
+
+/// ...and by at least this much: transient self-queueing (a burst of our own
+/// datagrams ahead of an acknowledged one) and jitter in quinn's round trip
+/// samples move its smoothed round trip by a few ms with no queue standing on
+/// the path. At a round trip of 4 ms the ratio alone calls that wander a queue
+/// (a quarter of 4 ms is 1 ms):
+/// measured on a 1 ms one-way link, 1 to 3 timelines in 96 collapsed and 80 -
+/// 87 % of a CBR stream's readings were saturated; with it none collapse and
+/// 74 - 80 % are. Swept 0, 2, 3, 4, 5, 6 ms against the step-down scene at 1
+/// and 2 ms one-way: backpressure skips are 130 at 0 - 3 ms and 91 - 104 from 4
+/// (master 105 and 121); the reaction time is bimodal at 0.4 or 1.2 s there at
+/// every value.
+const QUEUE_MIN_EXCESS_US: u64 = 5_000;
+
 /// Span of the minimum round trip: twice goog_cc's `MIN_TIME_BETWEEN_ALR_PROBES`
 /// (5 s), the longest it waits to re-measure a path, so a route change ages out
 /// of it on the same scale as everything else the estimator forgets.
@@ -315,7 +332,26 @@ impl GoogCcDriver {
             self.ceiling.read(now_us, srtt_us)
         };
         let standing_queue = self.standing_queue();
-        self.active_ceiling_bps = reading.and_then(|r| r.ceiling_bps).map(|c| c as u64);
+        // A window holding a stall in its acknowledgements (`ack_gap_is_stall`:
+        // a blackout, a pacer trickling out one big frame) measures the stall,
+        // not the path, unless the round trip shows the path slowed: a sender
+        // that resumes at a stale estimate after an idle builds a queue, and
+        // the low rate of the window is then the cut it needs. With no queue
+        // the stall has no other cause than itself, and the bound last read
+        // from a window without one stays. Taken at face value it published 5
+        // to 10 times too little, and the sender, paced to that and spending
+        // all of it, was then its own evidence: each window read what the
+        // last had allowed. `standing_queue` is true for up to ten seconds
+        // after the base round trip rose and under WiFi jitter: there this is
+        // the old behaviour, and the fix gives those paths nothing.
+        let held = reading.is_some_and(|r| {
+            r.ceiling_bps.is_some() && !standing_queue && self.ack_gap_is_stall(now_us, srtt_us)
+        });
+        if held {
+            self.stats.ceiling_reads_held += 1;
+        } else {
+            self.active_ceiling_bps = reading.and_then(|r| r.ceiling_bps).map(|c| c as u64);
+        }
         if let Some(r) = reading {
             self.payload_fraction = r.payload_fraction;
             self.stats.payload_fraction_ppm = (r.payload_fraction * 1e6) as u64;
@@ -330,15 +366,31 @@ impl GoogCcDriver {
         {
             self.stats.ceiling_binding_reads += 1;
         }
-        if let Some(r) = reading {
+        if let Some(r) = reading.filter(|_| !held) {
             self.follow_ceiling(now, now_us, srtt_us, r, standing_queue);
         }
     }
 
+    /// The window holds a stretch without acknowledgements that is a stall and
+    /// not the cadence of the traffic: longer than the round trip and longer
+    /// than a quarter of the window (37 ms at the window's 150 ms floor). A gap
+    /// under that still dilutes the window's rate, by at most a quarter of it.
+    /// The floor is what keeps a low-latency path honest: the client flushes
+    /// its acknowledgements every 5 ms and a CBR stream leaves most of a frame
+    /// interval (33 ms at 30 fps) idle, so against a round trip alone (2 ms)
+    /// every window holds a "gap" and the ceiling would never be read.
+    fn ack_gap_is_stall(&self, now_us: u64, srtt_us: u64) -> bool {
+        let floor = EstimateCeiling::window_us(srtt_us) / GAP_WINDOW_FRACTION;
+        self.ceiling.ack_gap_us(now_us, srtt_us) > srtt_us.max(floor)
+    }
+
     /// quinn's round trip is well above its minimum: a queue is standing.
-    fn standing_queue(&self) -> bool {
+    pub(crate) fn standing_queue(&self) -> bool {
         match (self.path_rtt, self.min_rtt.min()) {
-            (Some(rtt), Some(min)) => rtt.as_micros() as f64 > QUEUE_RTT_RATIO * min as f64,
+            (Some(rtt), Some(min)) => {
+                let rtt = rtt.as_micros() as u64;
+                rtt as f64 > QUEUE_RTT_RATIO * min as f64 && rtt >= min + QUEUE_MIN_EXCESS_US
+            }
             _ => false,
         }
     }
@@ -388,7 +440,7 @@ impl GoogCcDriver {
             // window's rate a measurement of the gap, not of the path: the
             // bound is still published (`bounded`), but goog_cc is not told
             // to continue from it.
-            if self.ceiling.ack_gap_us(now_us, srtt_us) > srtt_us {
+            if self.ack_gap_is_stall(now_us, srtt_us) {
                 self.stats.ceiling_reseeds_skipped_gap += 1;
                 return;
             }
@@ -989,6 +1041,78 @@ mod tests {
         before_silence
     }
 
+    /// A saturated sender on a path whose round trip is shorter than the
+    /// acknowledgement cadence: `rtt_ms` against batches every `period_ms`.
+    /// Every window holds a stretch longer than twice the round trip without
+    /// an acknowledgement, and none of them is a stall: the bound must be
+    /// published and the estimate lifted as on any other path.
+    fn drive_low_rtt(rtt_ms: u64, period_ms: u64) -> GoogCcDriver {
+        let t0 = Instant::now();
+        let mut d = GoogCcDriver::new(4_000_000, t0);
+        d.note_path_rtt(Duration::from_millis(rtt_ms));
+        let (mut granted, mut spent, mut offered) = (0.0f64, 0.0f64, 0.0f64);
+        let per_batch = (period_ms * 6) as u32; // 6 packets a millisecond
+        for step in 0..(12_000 / period_ms) as u32 {
+            let now = t0 + Duration::from_millis(period_ms * step as u64);
+            granted += 9.0e6 / 8.0 * period_ms as f64 / 1000.0;
+            spent += 9.0e6 / 8.0 * period_ms as f64 / 1000.0;
+            offered += per_batch as f64 * 1200.0 * 0.8;
+            let batch: Vec<AckArrival> = (0..per_batch)
+                .map(|i| {
+                    let emit_us = (period_ms * step as u64) * 1_000 + u64::from(i) * 100;
+                    AckArrival {
+                        server_emit_us: emit_us,
+                        client_arrival_ms_lo16: ((emit_us / 1_000 + rtt_ms / 2) & 0xFFFF) as u16,
+                        size_bytes: 960,
+                        probe: None,
+                    }
+                })
+                .collect();
+            d.note_offered(now, offered);
+            d.note_admission(now, granted, spent);
+            d.update(&batch, &[], now, 14_400);
+        }
+        d
+    }
+
+    /// Transient self-queueing and round trip jitter move quinn's smoothed
+    /// round trip by a few ms with no queue on the path: on a 4 ms path that
+    /// is not one, however large a share of the base it is.
+    #[test]
+    fn a_queue_needs_to_stand_a_few_ms_over_the_minimum() {
+        let mut d = drive_low_rtt(4, 5);
+        assert!(!d.standing_queue(), "premise: no queue at the base");
+        d.note_path_rtt(Duration::from_millis(8));
+        assert!(!d.standing_queue(), "2x the base but 4 ms over it: jitter");
+        d.note_path_rtt(Duration::from_millis(10));
+        assert!(d.standing_queue(), "6 ms over the base is a queue");
+    }
+
+    /// Mutation: measure the gap against the round trip alone and both cases
+    /// hold every reading (4738 of 4738 at 2 ms / 5 ms) and lift nothing.
+    #[test]
+    fn a_path_faster_than_its_acknowledgement_cadence_still_gets_a_ceiling() {
+        for (rtt_ms, period_ms) in [(2, 5), (4, 10)] {
+            let st = drive_low_rtt(rtt_ms, period_ms).snapshot().stats;
+            assert!(
+                st.ceiling_saturated_reads > 100,
+                "{rtt_ms}/{period_ms} ms: premise: readings were saturated ({st:?})"
+            );
+            assert_eq!(
+                st.ceiling_reads_held, 0,
+                "{rtt_ms}/{period_ms} ms: readings were set aside as stalls ({st:?})"
+            );
+            assert!(
+                st.ceiling_bps > 0,
+                "{rtt_ms}/{period_ms} ms: no bound published"
+            );
+            assert!(
+                st.ceiling_reseeds_up > 0,
+                "{rtt_ms}/{period_ms} ms: the estimate was never lifted ({st:?})"
+            );
+        }
+    }
+
     /// While the sender uses what it is granted, the published estimate and
     /// pacer rate stay within `HEADROOM x` what the path acknowledged, whatever
     /// goog_cc's own estimate is doing.
@@ -1054,18 +1178,24 @@ mod tests {
         );
     }
 
-    /// A stall inside the window: the bound is published, goog_cc is not told
-    /// to continue from a rate that is a measurement of the gap.
+    /// A stall inside the window, no queue standing: its rate is a measurement
+    /// of the gap, not of the path. The bound last taken from a full window
+    /// stays, and goog_cc is not told to continue from the gap's rate.
     #[test]
-    fn a_gap_in_the_acknowledgements_is_published_but_not_pushed_into_goog_cc() {
+    fn a_gap_in_the_acknowledgements_keeps_the_last_bound_and_is_not_pushed_into_goog_cc() {
         let t0 = Instant::now();
+        let mut steady = GoogCcDriver::new(4_000_000, t0);
+        drive_clean(&mut steady, t0, 8, 1.0);
+        let steady_bound = steady.snapshot().stats.ceiling_bps;
+        assert!(steady_bound > 0, "premise: a bound applies");
+
         let mut d = GoogCcDriver::new(4_000_000, t0);
         // 8 s of steady delivery, then 200 ms with one late batch (srtt 30 ms).
         let before = drive_clean_then_silence(&mut d, t0, 8, 1.0, 200, u64::MAX);
         assert!(before.ceiling_reseeds_down > 0, "premise: reseeds happen");
         let after = d.snapshot();
         assert!(
-            after.stats.ceiling_reseeds_skipped_gap > before.ceiling_reseeds_skipped_gap,
+            after.stats.ceiling_reads_held > before.ceiling_reads_held,
             "premise: the gap was met ({:?})",
             after.stats
         );
@@ -1073,9 +1203,44 @@ mod tests {
             after.stats.ceiling_reseeds_down, before.ceiling_reseeds_down,
             "goog_cc was handed a bound read across a stall"
         );
+        // The window across the stall holds one batch in eight: read at face
+        // value it is a bound of about an eighth of the path's.
+        assert!(
+            after.stats.ceiling_bps as f64 >= 0.5 * steady_bound as f64,
+            "the bound fell to {} across a stall, from {steady_bound}",
+            after.stats.ceiling_bps
+        );
         assert!(
             after.bitrate_bps as f64 <= after.stats.ceiling_bps as f64,
             "the bound is still published"
+        );
+    }
+
+    /// The same stall with the round trip doubled (a queue stands, as after a
+    /// resume at a stale estimate): the low rate of the window is then the
+    /// path's answer and is published, though goog_cc is still not handed it.
+    #[test]
+    fn a_gap_with_a_queue_standing_is_published_but_not_pushed_into_goog_cc() {
+        let t0 = Instant::now();
+        let mut steady = GoogCcDriver::new(4_000_000, t0);
+        drive_clean(&mut steady, t0, 8, 1.0);
+        let steady_bound = steady.snapshot().stats.ceiling_bps;
+
+        let mut d = GoogCcDriver::new(4_000_000, t0);
+        let before = drive_clean_then_silence(&mut d, t0, 8, 1.0, 200, 7_000);
+        let after = d.snapshot();
+        assert_eq!(
+            after.stats.ceiling_reseeds_down, before.ceiling_reseeds_down,
+            "goog_cc was handed a bound read across a stall"
+        );
+        assert_eq!(
+            after.stats.ceiling_reads_held, 0,
+            "a gap with a queue is not set aside"
+        );
+        assert!(
+            (after.stats.ceiling_bps as f64) < 0.5 * steady_bound as f64,
+            "the bound {} did not follow the window across the stall (steady {steady_bound})",
+            after.stats.ceiling_bps
         );
     }
 

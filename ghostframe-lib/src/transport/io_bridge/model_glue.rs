@@ -170,8 +170,14 @@ impl IoBridge {
     /// a 2 Mbit/s link) for as long as the window held the flow at the link
     /// rate, because the delay detector sees a flat queue as no trend.
     ///
-    /// So the tokens the bank held at the stop count as spent, and are dropped
-    /// from the bank, since quinn could not take them.
+    /// So the tokens the bank held at the stop are dropped from the bank,
+    /// since quinn could not take them, and count as spent, provided the round
+    /// trip shows a queue (`BweWrapper::standing_queue`). A window that binds with
+    /// the round trip at its base is the acknowledgement clock (acknowledgements
+    /// held back keep bytes in flight), not the link: counting it made nearly
+    /// every reading of a CBR stream saturated (95 %, against 37 % without), and
+    /// with it the ceiling's lifts and cuts, depend on when the client
+    /// acknowledges.
     pub(super) fn model_note_gated_pass(&mut self, bank_dropped: f64) {
         self.model.forfeited += bank_dropped;
     }
@@ -434,23 +440,38 @@ mod tests {
         bridge
     }
 
+    /// A bridge whose estimator has heard a 20 ms round trip, and then `rtt`:
+    /// the base round trip and the current one the pacer compares.
+    async fn grid_bridge_with_rtt(rtt: Duration) -> IoBridge {
+        let mut bridge = model_bridge_with_grid().await;
+        bridge.bwe.note_path_rtt(Duration::from_millis(20));
+        feed(&mut bridge, std::time::Instant::now());
+        bridge.bwe.note_path_rtt(rtt);
+        bridge
+    }
+
     /// A pass the depth gate stopped with work waiting was limited by quinn's
-    /// window, not by the rate: the bank is dropped and counted as spent, so
-    /// the estimate ceiling reads the sender as saturated. A pass that sent
-    /// everything it had forfeits nothing. Mutation: drop the
-    /// `model_note_gated_pass` call and the first assertion fails.
+    /// window, not by the rate: the bank is dropped, and counted as spent (so
+    /// the estimate ceiling reads the sender as saturated) only when the round
+    /// trip shows a queue, which is what makes it evidence about the link. A
+    /// pass that sent everything it had forfeits nothing. Mutation: drop the
+    /// `model_note_gated_pass` call and the first assertion fails; drop the
+    /// `standing_queue` test and the queue-free case fails.
     #[tokio::test(start_paused = true)]
-    async fn a_pass_the_window_stopped_counts_its_bank_as_spent() {
+    async fn a_pass_the_window_stopped_counts_its_bank_as_spent_when_a_queue_stands() {
         // Control: quinn takes everything, nothing is forfeited.
         let mut open = model_bridge_with_grid().await;
         queue_two_tiles(&mut open);
         open.pump_admission();
         assert_eq!(open.model_forfeited(), 0.0, "an open gate forfeits nothing");
 
-        // The FIFO stands at the gate: the pass cannot send, work is waiting.
-        let mut gated = model_bridge_with_grid().await;
+        // The FIFO stands at the gate: the pass cannot send, work is waiting,
+        // and the round trip is 1.4 x the base one and 8 ms over it: a queue.
+        let mut gated = grid_bridge_with_rtt(Duration::from_millis(28)).await;
         queue_two_tiles(&mut gated);
         gated.forced_fifo_depth_for_test = Some(10_000_000);
+        let cell = gated.model_cell_handle();
+        cell.note_rtts(Duration::from_millis(20), Duration::from_millis(28));
         gated.pump_admission();
         assert!(
             !gated.scheduler_peek_for_test().is_empty(),
@@ -460,12 +481,24 @@ mod tests {
         assert!(forfeited > 1_000.0, "the bank was counted ({forfeited} B)");
         assert_eq!(gated.admission.available(), 0, "and dropped");
 
-        // A round trip that has outgrown the window is not load: nothing counted.
-        let mut stale = model_bridge_with_grid().await;
+        // The same stop with the round trip at the base one: the window
+        // held the flow, the link showed nothing. Dropped, not counted.
+        let mut quiet = grid_bridge_with_rtt(Duration::from_millis(21)).await;
+        queue_two_tiles(&mut quiet);
+        quiet.forced_fifo_depth_for_test = Some(10_000_000);
+        let cell = quiet.model_cell_handle();
+        cell.note_rtts(Duration::from_millis(20), Duration::from_millis(21));
+        quiet.pump_admission();
+        assert_eq!(quiet.model_forfeited(), 0.0, "no queue: not saturation");
+        assert_eq!(quiet.admission.available(), 0, "but the bank is dropped");
+
+        // A round trip that has outgrown the window is not load: nothing
+        // counted, though the queue stands.
+        let mut stale = grid_bridge_with_rtt(Duration::from_millis(80)).await;
         queue_two_tiles(&mut stale);
         stale.forced_fifo_depth_for_test = Some(10_000_000);
         let cell = stale.model_cell_handle();
-        cell.note_rtts(Duration::from_millis(10), Duration::from_millis(80));
+        cell.note_rtts(Duration::from_millis(20), Duration::from_millis(80));
         stale.pump_admission();
         assert_eq!(stale.model_forfeited(), 0.0, "srtt 80 ms against 2 x 15 ms");
     }

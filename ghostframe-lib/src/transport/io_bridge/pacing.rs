@@ -368,11 +368,21 @@ impl IoBridge {
                 p.starved |= p.bytes_sent < p.min_bytes;
             }
         }
+        // The ceiling's queue test reads quinn's round trip: refreshed here,
+        // before the forfeit decision below and not only when feedback drains,
+        // or it is stale for a whole gap.
+        if let Some(rtt) = self.live_path_rtt() {
+            self.bwe.note_path_rtt(rtt);
+        }
         // What the bucket granted and what was spent of it, for the estimate
-        // ceiling: it applies only to a sender that used its grant.
+        // ceiling: it applies only to a sender that used its grant. A pass the
+        // window stopped forfeits its bank; it counts as spent only with a
+        // queue on the path.
         if stop == Stop::Depth && self.admission_backlog(now) && self.model_window_limit_is_load() {
             let dropped = self.admission.forfeit_bank();
-            self.model_note_gated_pass(dropped);
+            if self.bwe.standing_queue() {
+                self.model_note_gated_pass(dropped);
+            }
         }
         self.bwe.note_admission(
             now,
