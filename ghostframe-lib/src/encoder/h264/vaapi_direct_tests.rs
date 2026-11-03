@@ -97,15 +97,15 @@ fn view(data: &[u8], w: u32, h: u32) -> Nv12View<'_> {
 
 // ----------------------------------------------------------------- decoder
 
-struct Decoded {
+pub(crate) struct Decoded {
     /// Planar Y, U, V of each picture, cropped, by `pts` (= frame_seq).
-    frames: BTreeMap<u32, Vec<u8>>,
+    pub(crate) frames: BTreeMap<u32, Vec<u8>>,
     /// Pictures delivered by the call that consumed their own access unit.
-    same_call: BTreeSet<u32>,
-    errors: Vec<(u32, String)>,
+    pub(crate) same_call: BTreeSet<u32>,
+    pub(crate) errors: Vec<(u32, String)>,
 }
 
-fn decode(aus: &[(u32, &[u8])], explode: bool) -> Decoded {
+pub(crate) fn decode(aus: &[(u32, &[u8])], explode: bool) -> Decoded {
     FFMPEG_INIT.call_once(|| ffmpeg::init().expect("ffmpeg::init"));
     let codec = ffmpeg::decoder::find(ffmpeg::codec::Id::H264).expect("software h264 decoder");
     let mut ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
