@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import * as wasm from '../pkg-node/ghostframe_client_wasm.js';
 import {
   FullFrameDecoder,
+  codecStringFromSps,
   H264_DECODED,
   H264_DECODE_ERROR,
   H264_NOT_OUTPUT,
@@ -119,10 +120,14 @@ class FakeChunk {
 }
 
 let decoders: any[];
+let configured: string[];
+let refuseCodec: string | null;
 let errors: Array<(e: DOMException) => void>;
 
 beforeEach(() => {
   decoders = [];
+  configured = [];
+  refuseCodec = null;
   errors = [];
   (globalThis as any).EncodedVideoChunk = FakeChunk;
   // A decoder that answers later, like the real one: nothing comes out of
@@ -133,7 +138,10 @@ beforeEach(() => {
     constructor(init: { output: (f: any) => void; error: (e: DOMException) => void }) {
       this.out = init.output; errors.push(init.error); decoders.push(this);
     }
-    configure() {}
+    configure(c: { codec: string }) {
+      if (refuseCodec !== null && c.codec === refuseCodec) throw new TypeError('unsupported');
+      configured.push(c.codec);
+    }
     decode(_c: FakeChunk) {
       if (this.state === 'closed') throw new DOMException('closed', 'InvalidStateError');
     }
@@ -218,5 +226,59 @@ describe('FullFrameDecoder reports each chunk', () => {
     expect(decoders).toHaveLength(2);
     decoders[1].emit(9);
     expect(results.at(-1)).toEqual([9, H264_DECODED]);
+  });
+});
+
+describe('the decoder is configured from the stream', () => {
+  // Annex-B SPS: profile_idc, constraint flags, level_idc.
+  const sps = (p: number, c: number, l: number) =>
+    Uint8Array.from([0, 0, 0, 1, 0x67, p, c, l, 0xe9, 0x00]);
+  const idr = Uint8Array.from([0, 0, 1, 0x65, 0x88, 0x84]);
+
+  it('reads profile, constraints and level from the SPS', () => {
+    expect(codecStringFromSps(sps(0x64, 0x00, 0x2a))).toBe('avc1.64002a');
+    expect(codecStringFromSps(sps(0x4d, 0x40, 0x1e))).toBe('avc1.4d401e');
+    expect(codecStringFromSps(Uint8Array.from([...sps(0x64, 0, 0x2a), ...idr]))).toBe('avc1.64002a');
+  });
+
+  it('finds nothing in a delta frame or a truncated SPS', () => {
+    expect(codecStringFromSps(Uint8Array.from([0, 0, 1, 0x41, 1, 2, 3, 4]))).toBeNull();
+    expect(codecStringFromSps(Uint8Array.from([0, 0, 0, 1, 0x67, 0x64]))).toBeNull();
+    expect(codecStringFromSps(new Uint8Array(0))).toBeNull();
+  });
+
+  it('starts as High 4.2 and follows the stream when the IDR says otherwise', () => {
+    const { d } = harness();
+    expect(configured).toEqual(['avc1.64002a']);
+    // A High stream at the default: no reconfigure.
+    d.decode(Uint8Array.from([...sps(0x64, 0, 0x2a), ...idr]), true, 1);
+    expect(configured).toEqual(['avc1.64002a']);
+    // A Main stream (the ffmpeg encoder): the decoder follows it once.
+    d.decode(Uint8Array.from([...sps(0x4d, 0x40, 0x1f), ...idr]), true, 2);
+    d.decode(Uint8Array.from([...sps(0x4d, 0x40, 0x1f), ...idr]), true, 3);
+    expect(configured).toEqual(['avc1.64002a', 'avc1.4d401f']);
+    // A delta frame never changes it.
+    d.decode(Uint8Array.from([0, 0, 1, 0x41, 1, 2]), false, 4);
+    expect(configured).toEqual(['avc1.64002a', 'avc1.4d401f']);
+  });
+
+  it('keeps the previous string when configure() refuses the derived one', () => {
+    const { d } = harness();
+    refuseCodec = 'avc1.4d401f';
+    d.decode(Uint8Array.from([...sps(0x4d, 0x40, 0x1f), ...idr]), true, 1);
+    // The refused string never took; the default is reconfigured and used.
+    expect(configured).toEqual(['avc1.64002a', 'avc1.64002a']);
+    d.decode(Uint8Array.from([...sps(0x4d, 0x40, 0x1f), ...idr]), true, 2);
+    expect(configured.filter((c) => c === 'avc1.4d401f')).toEqual([]);
+  });
+
+  it('goes back once when the browser fails on the derived string before any picture', () => {
+    const { d } = harness();
+    d.decode(Uint8Array.from([...sps(0x4d, 0x40, 0x1f), ...idr]), true, 1);
+    expect(configured).toEqual(['avc1.64002a', 'avc1.4d401f']);
+    errors[0](new DOMException('unsupported', 'EncodingError'));
+    d.decode(Uint8Array.from([...sps(0x4d, 0x40, 0x1f), ...idr]), true, 2);
+    // The rebuild used the string before the derived one.
+    expect(configured[configured.length - 1]).toBe('avc1.64002a');
   });
 });
