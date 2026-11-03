@@ -88,6 +88,7 @@ pub mod nv12_reference;
 // `nv12_reference`, which only a `#[cfg(test)]` build of this crate's own
 // unit tests can see without a feature flag or a self-referencing
 // dev-dependency (both rejected -- see this module's own doc).
+mod h264_pending;
 #[cfg(test)]
 mod nv12_oracle_tests;
 pub(crate) mod paint_order;

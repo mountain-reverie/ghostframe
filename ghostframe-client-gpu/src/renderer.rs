@@ -290,12 +290,13 @@ pub struct Renderer {
     /// failure are not decoded (they would be concealed, and shown) and are
     /// reported `NotOutput`.
     h264_broken: bool,
-    /// Whether the "no picture for this access unit, but older ones come out"
-    /// warning has been logged this episode.
+    /// Whether the "decoder is far behind" warning has been logged this episode.
     h264_delay_warned: bool,
     /// Handed to the decoder whenever one is opened. See
     /// [`Renderer::set_h264_frame_ready_notify`].
     h264_ready_notify: Option<ghostframe_client_h264::FrameReadyNotify>,
+    /// Access units fed and not yet answered; see [`crate::h264_pending`].
+    h264_pending: crate::h264_pending::PendingFrames,
     /// Throttles the size-mismatch warning in [`Renderer::blit_h264_frame`]
     /// to its first occurrence per mismatch episode, so a persistent
     /// disagreement does not burst-log once per frame at 60fps. Cleared as
@@ -447,6 +448,7 @@ impl Renderer {
             h264_broken: false,
             h264_delay_warned: false,
             h264_ready_notify: None,
+            h264_pending: Default::default(),
             h264_size_mismatch_logged: false,
         })
     }
@@ -1455,8 +1457,9 @@ impl Renderer {
     /// the gate was reset): ffmpeg's H.264 decoder does not error on missing
     /// references, it conceals, so an IDR alone would not clear stale state.
     ///
-    /// The outcome is queued for [`Renderer::take_h264_results`]: decoded iff
-    /// a picture with this frame's pts came out of this same call.
+    /// Outcomes are queued for [`Renderer::take_h264_results`]: a frame is
+    /// decoded when a picture carrying its pts comes out, on this call or a
+    /// later one; units older than an output picture are refused.
     fn decode_h264(
         &mut self,
         ctx: &WgpuContext,
@@ -1536,6 +1539,9 @@ impl Renderer {
 
         self.h264_last_frame_seq = Some(frame_seq);
         if reset_decoder {
+            // Whatever the decoder still held is flushed with it: those
+            // access units will never produce a picture.
+            self.h264_results.extend(self.h264_pending.refuse_all());
             decoder.reset();
             self.h264_broken = false;
         }
@@ -1569,34 +1575,38 @@ impl Renderer {
                 // this access unit unknown. The gate resets, asks the server
                 // for an IDR (paced) and resets the decoder at it.
                 self.h264_broken = true;
+                // Older units still inside the decoder are lost with its
+                // state; refuse them first, then report the failure itself
+                // (the core refuses everything until the reset frame).
+                self.h264_results.extend(self.h264_pending.refuse_all());
                 self.h264_results
                     .push((frame_seq, H264Outcome::DecodeError));
                 return Ok(());
             }
         };
-        let produced = frames.iter().any(|f| f.pts() == Some(i64::from(frame_seq)));
-        if produced {
-            self.h264_delay_warned = false;
-        } else if !frames.is_empty() && !self.h264_delay_warned {
-            // Pictures come out, but not this access unit's: the decoder
-            // delays its output. Every frame is then reported refused although
-            // the stream plays (the core counts the run too).
-            self.h264_delay_warned = true;
-            tracing::warn!(
-                frame_seq,
-                pts = ?frames.first().and_then(|f| f.pts()),
-                "H.264 decoder returned older pictures but none for this access unit: \
-                 output delay, frames are reported not-output"
-            );
+        // Answer by picture, not by call: a decoder with output delay (the
+        // GStreamer backend returns a picture on the call after its access
+        // unit) still decoded every frame, just later.
+        self.h264_results.extend(self.h264_pending.fed(frame_seq));
+        for f in &frames {
+            let answers = self.h264_pending.output(f.pts());
+            self.h264_results.extend(answers);
         }
-        self.h264_results.push((
-            frame_seq,
-            if produced {
-                H264Outcome::Decoded
-            } else {
-                H264Outcome::NotOutput
-            },
-        ));
+        let pending = self.h264_pending.len();
+        if pending > crate::h264_pending::WARN_PENDING {
+            if !self.h264_delay_warned {
+                self.h264_delay_warned = true;
+                tracing::warn!(
+                    frame_seq,
+                    pending,
+                    "H.264 decoder is more than a few access units behind: \
+                     frames are acknowledged late, and refused once the backlog \
+                     reaches its bound"
+                );
+            }
+        } else if pending <= 1 {
+            self.h264_delay_warned = false;
+        }
         #[allow(
             clippy::disallowed_methods,
             reason = "measuring a real hardware H.264 decode stall for M3 §10's decode-thread decision, not a virtual-clock path"
@@ -1693,11 +1703,18 @@ impl Renderer {
                 // `decode_h264`: access units are refused until the gate
                 // resets it.
                 self.h264_broken = true;
+                self.h264_results.extend(self.h264_pending.refuse_all());
                 return Ok(false);
             }
         };
         if frames.is_empty() {
             return Ok(false);
+        }
+        // A picture that came out after the call that fed it: this is where
+        // its frame ack is owed.
+        for f in &frames {
+            let answers = self.h264_pending.output(f.pts());
+            self.h264_results.extend(answers);
         }
         // Same ordering rule as `decode_h264`: batched tile work for the
         // older framebuffer state lands before the full-frame draw.
