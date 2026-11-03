@@ -667,6 +667,76 @@ fn rle_encode(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Decode one RLE stream into `out` without allocating, and return how many
+/// bytes the stream expands to, capped at 129 (anything past 128 is an
+/// overrun and decoding stops there). Exactly 128 is a valid bit-plane.
+///
+/// Same tokens as [`rle_decode`], and the same quirk: a lone trailing `0x7F`
+/// (an escape with nothing after it) ends the stream silently. `out` is
+/// written only up to its 128 bytes and the bytes past the decoded length
+/// are left as the caller had them, so a caller that accepts short streams
+/// must pass zeroed storage.
+pub fn rle_decode_into(rle: &[u8], out: &mut [u8; 128]) -> usize {
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i < rle.len() {
+        let token = rle[i];
+        if token == 0x7F {
+            if i + 1 < rle.len() {
+                if n < 128 {
+                    out[n] = rle[i + 1];
+                }
+                n += 1;
+                i += 2;
+            } else {
+                break;
+            }
+        } else if token & 0x80 != 0 {
+            let run = (token & 0x7F) as usize + 1;
+            let end = (n + run).min(128);
+            if n < end {
+                out[n..end].fill(0);
+            }
+            n += run;
+            i += 1;
+        } else {
+            if n < 128 {
+                out[n] = token;
+            }
+            n += 1;
+            i += 1;
+        }
+        if n > 128 {
+            return 129;
+        }
+    }
+    n
+}
+
+/// [`rle_decode_into`] without the output: the capped expanded length of
+/// `rle` (129 means "more than 128"). For validating a stream that someone
+/// else will decode.
+pub fn rle_expanded_len(rle: &[u8]) -> usize {
+    // Branch-free per token: the cost on noisy planes is mispredicted
+    // branches, not the arithmetic. A token adds 1 (literal, escape) or
+    // (t & 0x7F) + 1 (zero run), and an escape also swallows the next byte.
+    // Totals cannot overflow (at most 128 per input byte), so the cap is
+    // applied once at the end; a decoder that stops early agrees on every
+    // value it can return.
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i < rle.len() {
+        let t = rle[i] as usize;
+        n += 1 + (t >> 7) * (t & 0x7F);
+        i += 1 + (t == 0x7F) as usize;
+    }
+    // An escape with nothing after it ends the stream without a byte.
+    if i > rle.len() {
+        n -= 1;
+    }
+    n.min(129)
+}
+
 pub fn rle_decode(rle: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -741,10 +811,14 @@ pub fn decode_passes(passes: &[&[u8]]) -> Vec<i16> {
             }
             let rle = &payload[offset..offset + len as usize];
             offset += len as usize;
-            let bit_plane = rle_decode(rle);
             let plane_offset = ch * (CDF53_COEFFS_PER_CHANNEL / 8);
-            let copy_len = bit_plane.len().min(CDF53_COEFFS_PER_CHANNEL / 8);
-            plane[plane_offset..plane_offset + copy_len].copy_from_slice(&bit_plane[..copy_len]);
+            let dst: &mut [u8; BIT_PLANE_BYTES_PER_CHANNEL] = (&mut plane
+                [plane_offset..plane_offset + BIT_PLANE_BYTES_PER_CHANNEL])
+                .try_into()
+                .expect("128-byte channel slice");
+            // `plane` starts zeroed, so a short stream leaves zeros, and an
+            // overlong one is cut at 128, as copying `rle_decode`'s output did.
+            rle_decode_into(rle, dst);
         }
         decoded_planes.push(plane);
     }
@@ -1344,6 +1418,80 @@ mod tests_pass_size_bound {
                 })
                 .collect();
             assert!(max_pass(&forward(&tile)) <= MAX_PASS_PAYLOAD);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_rle_into {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// What the allocating decoder says, in `rle_decode_into`'s terms.
+    fn reference(rle: &[u8]) -> (usize, [u8; 128]) {
+        let v = rle_decode(rle);
+        let mut out = [0u8; 128];
+        let n = v.len().min(128);
+        out[..n].copy_from_slice(&v[..n]);
+        (v.len().min(129), out)
+    }
+
+    #[test]
+    fn exact_stream_decodes() {
+        let mut out = [0xEEu8; 128];
+        assert_eq!(rle_decode_into(&[0x05, 0x7F, 0xC3, 0xFD], &mut out), 128);
+        assert_eq!(&out[..2], &[5, 0xC3]);
+        assert!(out[2..].iter().all(|&b| b == 0));
+        assert_eq!(rle_expanded_len(&[0x05, 0x7F, 0xC3, 0xFD]), 128);
+    }
+
+    #[test]
+    fn overrun_is_reported_and_never_writes_past_the_buffer() {
+        let rle = [0xFF, 0x01];
+        let mut out = [0u8; 128];
+        assert_eq!(rle_decode_into(&rle, &mut out), 129);
+        assert_eq!(rle_expanded_len(&rle), 129);
+        assert_eq!(rle_expanded_len(&[0xFFu8; 40]), 129);
+    }
+
+    #[test]
+    fn short_stream_reports_its_length() {
+        let mut out = [0u8; 128];
+        assert_eq!(rle_decode_into(&[0xFE], &mut out), 127);
+        assert_eq!(rle_expanded_len(&[]), 0);
+    }
+
+    #[test]
+    fn lone_trailing_escape_ends_the_stream_like_rle_decode() {
+        let mut out = [0u8; 128];
+        assert_eq!(rle_decode_into(&[0xFF, 0x7F], &mut out), 128);
+        assert_eq!(rle_expanded_len(&[0xFF, 0x7F]), 128);
+    }
+
+    proptest! {
+        #[test]
+        fn matches_rle_decode(rle in proptest::collection::vec(any::<u8>(), 0..400)) {
+            let (n, want) = reference(&rle);
+            let mut out = [0u8; 128];
+            prop_assert_eq!(rle_decode_into(&rle, &mut out), n);
+            prop_assert_eq!(rle_expanded_len(&rle), n);
+            prop_assert_eq!(out, want);
+        }
+
+        /// Streams that are mostly valid, so the exactly-128 case is hit.
+        #[test]
+        fn matches_rle_decode_on_encoded_planes(
+            plane in proptest::collection::vec(
+                prop_oneof![3 => Just(0u8), 1 => 1u8..0x7F, 1 => 0x7Fu8..=0xFF], 128),
+            tail in proptest::collection::vec(any::<u8>(), 0..3),
+        ) {
+            let mut rle = rle_encode(&plane);
+            rle.extend_from_slice(&tail);
+            let (n, want) = reference(&rle);
+            let mut out = [0u8; 128];
+            prop_assert_eq!(rle_decode_into(&rle, &mut out), n);
+            prop_assert_eq!(rle_expanded_len(&rle), n);
+            prop_assert_eq!(out, want);
         }
     }
 }

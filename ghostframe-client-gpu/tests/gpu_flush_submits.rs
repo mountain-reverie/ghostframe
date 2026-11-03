@@ -31,6 +31,7 @@ fn capture_events() -> Vec<Event> {
             supports_h264: false,
             h264_acked_ref: false,
             tile_delivery: TileDelivery::Payload,
+            cdf53_wire: false,
             display: None,
         },
         0,
@@ -73,7 +74,7 @@ fn every_codec_batch() -> Vec<Event> {
                 match data {
                     TileData::Solid(_) => solid = true,
                     TileData::PalRle { .. } => palrle = true,
-                    TileData::Cdf53 { .. } => cdf53 = true,
+                    TileData::Cdf53 { .. } | TileData::Cdf53Wire { .. } => cdf53 = true,
                 }
             }
         }

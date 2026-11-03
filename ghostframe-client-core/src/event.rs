@@ -70,6 +70,21 @@ pub enum TileData {
         /// new generation that reuses the held number from the held one.
         new_generation: bool,
     },
+    /// A validated but still RLE-coded CDF 5/3 pass, produced instead of
+    /// `Cdf53` when [`crate::ClientConfig::cdf53_wire`] is on, so the thread
+    /// that validates it need not expand it. Everything but the planes is as
+    /// in `Cdf53`; a [`crate::TileDecoder`] turns this into a `Cdf53`
+    /// (`crate::cdf53_prevalidate::decode_cdf53_wire`) before anything else
+    /// sees it. Never produced by default.
+    Cdf53Wire {
+        pass_idx: u8,
+        /// The three `[u16 BE len][rle]` channel blocks, B, G, R: pass 0's
+        /// bitmap prefix and any trailing bytes are cut. Each expands to
+        /// exactly 128 bytes, which validation checked.
+        streams: Vec<u8>,
+        present_passes: Option<u16>,
+        new_generation: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

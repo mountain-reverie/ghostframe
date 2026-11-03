@@ -101,8 +101,9 @@ struct Pump {
     slots: Option<SlotAllocator>,
     render_tx: Sender<RenderMsg>,
     render_gone: bool,
-    /// CDF 5/3 passes travel to the render thread as they are (its GPU grid
-    /// reconstructs them), so none is "heavy" here and none is batched.
+    /// CDF 5/3 passes travel to the render thread as expanded planes (its GPU
+    /// grid reconstructs them from those), so none is "heavy" here -- the
+    /// RLE expansion is cheap -- and none is coalesced.
     cdf53_on_gpu: bool,
 }
 
@@ -190,7 +191,7 @@ impl Pump {
             && matches!(
                 &ev,
                 CoreEvent::TilePayload {
-                    data: TileData::Cdf53 { .. },
+                    data: TileData::Cdf53 { .. } | TileData::Cdf53Wire { .. },
                     ..
                 }
             );
@@ -246,7 +247,7 @@ impl Pump {
                 matches!(
                     ev,
                     CoreEvent::TilePayload {
-                        data: TileData::Cdf53 { .. },
+                        data: TileData::Cdf53 { .. } | TileData::Cdf53Wire { .. },
                         ..
                     }
                 )
@@ -330,9 +331,11 @@ impl Pump {
 /// travel as `Vec`s in [`RenderMsg::Core`] exactly as before. Never blocks
 /// waiting for a slot.
 ///
-/// `cdf53_on_gpu`: CDF 5/3 passes are forwarded undecoded for the render
-/// thread's GPU grid (`GHOSTFRAME_CDF53_DECODE`, decided once at start-up by
-/// the render thread's self-test). Everything else decodes here as before.
+/// `cdf53_on_gpu`: CDF 5/3 passes are RLE-expanded here (a `Cdf53Wire` pass
+/// from the net thread) and forwarded as planes, not reconstructed, for the
+/// render thread's GPU grid (`GHOSTFRAME_CDF53_DECODE`, decided once at
+/// start-up by the render thread's self-test). Everything else decodes here
+/// as before.
 pub(crate) fn run(
     rx: Receiver<CoreEvent>,
     render_tx: Sender<RenderMsg>,
@@ -377,7 +380,11 @@ fn run_batched(
             // The usual case in steady state: exactly the one event, handled
             // as it always was. (The next turn asks again before waiting, so
             // an event that arrives during a slow decode joins a held outbox.)
-            Err(TryRecvError::Empty) => pump.handle(first, Instant::now()),
+            Err(TryRecvError::Empty) => {
+                stats.count(&first);
+                pump.handle(first, Instant::now());
+                stats.tick(&pump.decoder);
+            }
             Err(TryRecvError::Disconnected) => {
                 pump.handle(first, Instant::now());
                 break;
@@ -393,6 +400,7 @@ fn run_batched(
                         Err(_) => break,
                     }
                 }
+                batch.iter().for_each(|ev| stats.count(ev));
                 stats.batched(batch.len());
                 let first_out = pump.handle_batch(&mut batch, &mut Instant::now);
                 stats.first_out(first_out);
@@ -413,9 +421,27 @@ struct Stats {
     coalesced_before: u64,
     /// Longest from the start of a batch to its first result.
     worst_first_out: Duration,
+    /// CDF 5/3 passes received this second, as the net thread sent them:
+    /// still RLE-coded (`Cdf53Wire`) or expanded (`Cdf53`). A native client
+    /// should see only the first; a zero there with the second non-zero means
+    /// the flag was lost.
+    wire_in: u64,
+    planes_in: u64,
+    /// Whether the first failed wire expansion was already reported.
+    warned_wire_failure: bool,
 }
 
 impl Stats {
+    fn count(&mut self, ev: &CoreEvent) {
+        if let CoreEvent::TilePayload { data, .. } = ev {
+            match data {
+                TileData::Cdf53Wire { .. } => self.wire_in += 1,
+                TileData::Cdf53 { .. } => self.planes_in += 1,
+                _ => {}
+            }
+        }
+    }
+
     fn new() -> Self {
         Stats {
             since: Instant::now(),
@@ -423,6 +449,9 @@ impl Stats {
             batched_events: 0,
             coalesced_before: 0,
             worst_first_out: Duration::ZERO,
+            wire_in: 0,
+            planes_in: 0,
+            warned_wire_failure: false,
         }
     }
 
@@ -440,12 +469,23 @@ impl Stats {
             return;
         }
         let coalesced = decoder.cdf53_coalesced();
-        if self.batches > 0 {
+        let wire_failed = decoder.cdf53_wire_failed();
+        if wire_failed > 0 && !self.warned_wire_failure {
+            self.warned_wire_failure = true;
+            tracing::warn!(
+                cdf53_wire_failed = wire_failed,
+                "decode thread: a validated CDF 5/3 pass would not expand; dropped"
+            );
+        }
+        if self.batches > 0 || self.wire_in + self.planes_in > 0 || wire_failed > 0 {
             tracing::debug!(
                 batches = self.batches,
                 batched_events = self.batched_events,
                 cdf53_coalesced = coalesced - self.coalesced_before,
                 cdf53_coalesced_total = coalesced,
+                cdf53_wire_in = self.wire_in,
+                cdf53_planes_in = self.planes_in,
+                cdf53_wire_failed = wire_failed,
                 worst_first_out_us = self.worst_first_out.as_micros() as u64,
                 "decode thread: 1s summary"
             );
@@ -456,6 +496,9 @@ impl Stats {
             batched_events: 0,
             coalesced_before: coalesced,
             worst_first_out: Duration::ZERO,
+            wire_in: 0,
+            planes_in: 0,
+            warned_wire_failure: self.warned_wire_failure,
         };
     }
 }
@@ -651,7 +694,33 @@ mod tests {
     /// The passes of a real CDF 5/3 tile, round-robined across `tiles`
     /// columns the way a startup burst arrives.
     fn cdf_burst(tiles: u8) -> Vec<CoreEvent> {
-        use ghostframe_client_core::cdf53_prevalidate::prevalidate_cdf53;
+        cdf_burst_as(tiles, false)
+    }
+
+    /// One CDF 5/3 pass as the core emits it: expanded, or (`wire`) validated
+    /// and still RLE-coded, as the native net thread hands it up.
+    fn cdf_data(payload: &[u8], idx: u8, new_generation: bool, wire: bool) -> TileData {
+        use ghostframe_client_core::cdf53_prevalidate::{prevalidate_cdf53, validate_cdf53};
+        if wire {
+            let info = validate_cdf53(payload, idx).unwrap();
+            TileData::Cdf53Wire {
+                pass_idx: idx,
+                streams: payload[info.streams].to_vec(),
+                present_passes: info.present_passes,
+                new_generation,
+            }
+        } else {
+            let pre = prevalidate_cdf53(payload, 0, idx).unwrap();
+            TileData::Cdf53 {
+                pass_idx: pre.pass_idx,
+                bit_planes: pre.bit_planes,
+                present_passes: pre.present_passes,
+                new_generation,
+            }
+        }
+    }
+
+    fn cdf_burst_as(tiles: u8, wire: bool) -> Vec<CoreEvent> {
         use ghostframe_protocol::codec::cdf53::{encode_passes_sparse, forward};
         let per_tile: Vec<Vec<CoreEvent>> = (0..tiles)
             .map(|x| {
@@ -670,20 +739,12 @@ mod tests {
                 passes
                     .into_iter()
                     .enumerate()
-                    .map(|(i, (idx, payload))| {
-                        let pre = prevalidate_cdf53(&payload, 0, idx).unwrap();
-                        CoreEvent::TilePayload {
-                            frame_seq: i as u32,
-                            tile_x: x,
-                            tile_y: 0,
-                            generation: 0,
-                            data: TileData::Cdf53 {
-                                pass_idx: pre.pass_idx,
-                                bit_planes: pre.bit_planes,
-                                present_passes: pre.present_passes,
-                                new_generation: i == 0,
-                            },
-                        }
+                    .map(|(i, (idx, payload))| CoreEvent::TilePayload {
+                        frame_seq: i as u32,
+                        tile_x: x,
+                        tile_y: 0,
+                        generation: 0,
+                        data: cdf_data(&payload, idx, i == 0, wire),
                     })
                     .collect()
             })
@@ -760,6 +821,74 @@ mod tests {
             }
             assert_eq!(passes(&render_rx), want, "batched {batched}");
             assert_eq!(pump.decoder.cdf53_coalesced(), 0);
+        }
+    }
+
+    /// What the net thread now sends -- validated, still RLE-coded passes --
+    /// reaches the render thread in GPU mode as exactly the events the
+    /// expanded passes did, in order, one at a time and batched: the
+    /// renderer, grid and shaders never see the wire variant.
+    #[test]
+    fn with_the_gpu_grid_wire_passes_are_expanded_and_forwarded_in_order() {
+        let planes = cdf_burst_as(4, false);
+        let wire = cdf_burst_as(4, true);
+        assert!(wire.iter().all(|e| matches!(
+            e,
+            CoreEvent::TilePayload {
+                data: TileData::Cdf53Wire { .. },
+                ..
+            }
+        )));
+        for batched in [false, true] {
+            let run_one = |events: &[CoreEvent]| -> Vec<CoreEvent> {
+                let (render_tx, render_rx) = mpsc::channel();
+                let mut pump = Pump {
+                    decoder: TileDecoder::new().with_cdf53_passthrough(true),
+                    outbox: Outbox::default(),
+                    slots: None,
+                    render_tx,
+                    render_gone: false,
+                    cdf53_on_gpu: true,
+                };
+                if batched {
+                    pump.handle_batch(&mut events.to_vec(), &mut Instant::now);
+                } else {
+                    for ev in events.iter().cloned() {
+                        pump.handle(ev, Instant::now());
+                    }
+                }
+                render_rx
+                    .try_iter()
+                    .map(|m| match m {
+                        RenderMsg::Core(ev) => ev,
+                        other => panic!("unexpected {:?}", std::mem::discriminant(&other)),
+                    })
+                    .collect()
+            };
+            let got = run_one(&wire);
+            assert_eq!(got.len(), wire.len(), "batched {batched}: every pass");
+            assert_eq!(got, run_one(&planes), "batched {batched}");
+        }
+    }
+
+    /// CPU mode: wire passes end in the same pictures as expanded ones, with
+    /// and without the batching and coalescing of a queued burst.
+    #[test]
+    fn with_the_cpu_decode_wire_passes_give_the_same_pictures() {
+        for bound in [1usize, 64] {
+            let pictures = |wire: bool| {
+                let (tx, rx) = mpsc::channel();
+                let (render_tx, render_rx) = mpsc::channel();
+                for ev in cdf_burst_as(4, wire) {
+                    tx.send(ev).unwrap();
+                }
+                drop(tx);
+                run_batched(rx, render_tx, None, bound, false);
+                vec_tiles(&render_rx)
+            };
+            let (want, got) = (pictures(false), pictures(true));
+            assert!(!want.is_empty());
+            assert_eq!(got, want, "bound {bound}");
         }
     }
 
@@ -918,6 +1047,20 @@ mod tests {
     /// A held tile is also sent before a reconstruction, never waiting through it.
     #[test]
     fn what_is_held_is_sent_before_each_reconstruction() {
+        held_is_sent_before_each_reconstruction(false);
+    }
+
+    /// The same with the passes as the net thread sends them (RLE-coded):
+    /// they are as heavy as expanded ones in CPU mode.
+    #[test]
+    fn what_is_held_is_sent_before_each_reconstruction_of_wire_passes() {
+        held_is_sent_before_each_reconstruction(true);
+    }
+
+    /// `heavy` single-event path: a held slab tile is released before a CPU
+    /// reconstruction triggered by a wire pass.
+    #[test]
+    fn a_wire_pass_is_heavy_in_cpu_mode() {
         let Ok(ctx) = WgpuContext::new() else {
             eprintln!("SKIP: no GPU");
             return;
@@ -932,7 +1075,45 @@ mod tests {
             render_gone: false,
             cdf53_on_gpu: false,
         };
-        let mut events = cdf_burst(3);
+        let t0 = Instant::now();
+        // A held slab tile (slab tiles wait for their batch to fill or age).
+        pump.handle(
+            CoreEvent::TilePayload {
+                frame_seq: 9999,
+                tile_x: 250,
+                tile_y: 0,
+                generation: 0,
+                data: TileData::Solid([1, 2, 3, 255]),
+            },
+            t0,
+        );
+        assert_eq!(render_rx.try_iter().count(), 0, "held, not sent yet");
+        // The first pass of a wire tile: heavy, so what is held goes first.
+        let first = cdf_burst_as(1, true).remove(0);
+        pump.handle(first, t0);
+        assert_eq!(
+            render_rx.try_iter().count(),
+            1,
+            "the held tile was released"
+        );
+    }
+
+    fn held_is_sent_before_each_reconstruction(wire: bool) {
+        let Ok(ctx) = WgpuContext::new() else {
+            eprintln!("SKIP: no GPU");
+            return;
+        };
+        let (_pool, alloc) = UploadPool::with_slabs(&ctx, 1).expect("pool");
+        let (render_tx, render_rx) = mpsc::channel();
+        let mut pump = Pump {
+            decoder: TileDecoder::new(),
+            outbox: Outbox::default(),
+            slots: Some(alloc),
+            render_tx,
+            render_gone: false,
+            cdf53_on_gpu: false,
+        };
+        let mut events = cdf_burst_as(3, wire);
         // A Solid for another tile, after the passes: decoded in place
         // (held), then the end-of-batch flush has three pictures to make.
         events.push(CoreEvent::TilePayload {
@@ -975,8 +1156,7 @@ mod tests {
 
     /// A start-up burst for a `cols` x `rows` screen: pass 0 of every tile,
     /// then pass 1 of every tile, and so on, from 24 distinct pictures.
-    fn screen_burst(cols: u8, rows: u8) -> Vec<CoreEvent> {
-        use ghostframe_client_core::cdf53_prevalidate::prevalidate_cdf53;
+    fn screen_burst(cols: u8, rows: u8, wire: bool) -> Vec<CoreEvent> {
         use ghostframe_protocol::codec::cdf53::{encode_passes_sparse, forward};
         let pictures: Vec<Vec<_>> = (0..24u32)
             .map(|id| {
@@ -998,10 +1178,7 @@ mod tests {
                     })
                     .collect();
                 let (_, passes) = encode_passes_sparse(&forward(&tile));
-                passes
-                    .into_iter()
-                    .map(|(idx, payload)| prevalidate_cdf53(&payload, 0, idx).unwrap())
-                    .collect()
+                passes.into_iter().collect()
             })
             .collect();
         let mut events = Vec::new();
@@ -1010,7 +1187,8 @@ mod tests {
                 for tx in 0..cols {
                     let pic = &pictures[(tx as usize + ty as usize * 7) % pictures.len()];
                     // Passes the picture does not have (sparse) are not sent.
-                    let Some(pre) = pic.iter().find(|p| p.pass_idx as usize == layer) else {
+                    let Some((idx, payload)) = pic.iter().find(|(i, _)| *i as usize == layer)
+                    else {
                         continue;
                     };
                     events.push(CoreEvent::TilePayload {
@@ -1018,12 +1196,7 @@ mod tests {
                         tile_x: tx,
                         tile_y: ty,
                         generation: 0,
-                        data: TileData::Cdf53 {
-                            pass_idx: pre.pass_idx,
-                            bit_planes: pre.bit_planes.clone(),
-                            present_passes: pre.present_passes,
-                            new_generation: layer == 0,
-                        },
+                        data: cdf_data(payload, *idx, layer == 0, wire),
                     });
                 }
             }
@@ -1043,11 +1216,25 @@ mod tests {
         use ghostframe_client_gpu::renderer::Renderer;
         let ctx = WgpuContext::new().expect("wgpu context");
         let (cols, rows) = (60u8, 34u8); // 1920 x 1080
-        let events = screen_burst(cols, rows);
+        let plane_events = screen_burst(cols, rows, false);
+        let wire_events = screen_burst(cols, rows, true);
+        let events = &plane_events;
         let tiles = cols as usize * rows as usize;
         println!("{} events for {tiles} tiles", events.len());
         let mut pictures: Vec<Vec<u8>> = Vec::new();
-        for gpu in [false, true, false, true] {
+        // `wire`: the passes arrive RLE-coded (what the net thread now hands
+        // up) and the decode thread expands them, which is the cost moved off
+        // gf-net.
+        for (gpu, wire) in [
+            (false, false),
+            (true, false),
+            (false, true),
+            (true, true),
+            (false, false),
+            (true, false),
+            (false, true),
+            (true, true),
+        ] {
             let mut r = Renderer::new(
                 &ctx,
                 cols as u32 * 32,
@@ -1065,7 +1252,7 @@ mod tests {
             }
             let (tx, rx) = mpsc::channel();
             let (render_tx, render_rx) = mpsc::channel();
-            for ev in events.iter().cloned() {
+            for ev in if wire { &wire_events } else { events }.iter().cloned() {
                 tx.send(ev).unwrap();
             }
             drop(tx);
@@ -1112,8 +1299,9 @@ mod tests {
             #[allow(clippy::disallowed_methods, reason = "measuring real elapsed time")]
             let wall_ms = wall.elapsed().as_secs_f64() * 1e3;
             println!(
-                "{} : decode thread {:7.1} ms CPU, render thread {:7.1} ms CPU, wall {:7.1} ms, {flushes} flushes, {msgs} msgs",
+                "{} {} : decode thread {:7.1} ms CPU, render thread {:7.1} ms CPU, wall {:7.1} ms, {flushes} flushes, {msgs} msgs",
                 if gpu { "gpu" } else { "cpu" },
+                if wire { "wire  " } else { "planes" },
                 decode_cpu as f64 / 1e6,
                 render_cpu as f64 / 1e6,
                 wall_ms

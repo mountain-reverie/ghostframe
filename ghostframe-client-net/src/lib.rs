@@ -133,6 +133,20 @@ impl ClientNet {
         self
     }
 
+    /// In `Payload` mode, deliver CDF 5/3 passes validated but still
+    /// RLE-coded (`TileData::Cdf53Wire`), for a `TileDecoder` on another
+    /// thread to expand. See `ClientConfig::cdf53_wire`.
+    pub fn with_cdf53_wire(mut self, on: bool) -> Self {
+        self.core.set_cdf53_wire(on);
+        self
+    }
+
+    /// Whether CDF 5/3 passes are delivered as `TileData::Cdf53Wire`
+    /// (`Payload` delivery with [`ClientNet::with_cdf53_wire`] on).
+    pub fn delivers_cdf53_wire(&self) -> bool {
+        self.core.delivers_cdf53_wire()
+    }
+
     /// Offer no hybrid post-quantum group, so the handshake negotiates
     /// classical X25519, as a peer without ML-KEM would. The two handshakes
     /// differ in how many loop iterations they cost the server before the

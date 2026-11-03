@@ -18,11 +18,33 @@ use ghostframe_protocol::protocol::{
 };
 
 use crate::cdf53_coverage::apply_cdf53_arrival;
-use crate::cdf53_prevalidate::prevalidate_cdf53;
+use crate::cdf53_prevalidate::{prevalidate_cdf53, validate_cdf53};
 use crate::event::{Event, PollOutput, TileData};
 use crate::pal_rle_decode::prevalidate_pal_rle;
 use crate::{ClientCore, MAX_FRAME_DIMENSION};
 use ghostframe_protocol::tile::TILE_SIZE;
+
+/// A CDF 5/3 pass that passed validation, in the form it will be emitted.
+enum Cdf53Pass {
+    Planes {
+        bit_planes: Vec<u8>,
+        present_passes: Option<u16>,
+    },
+    Wire {
+        streams: Vec<u8>,
+        present_passes: Option<u16>,
+    },
+}
+
+impl Cdf53Pass {
+    fn present_passes(&self) -> Option<u16> {
+        match self {
+            Cdf53Pass::Planes { present_passes, .. } | Cdf53Pass::Wire { present_passes, .. } => {
+                *present_passes
+            }
+        }
+    }
+}
 
 /// Minimum bytes that carry a full tile header stack.
 const TILE_MIN: usize = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE; // 24
@@ -413,9 +435,24 @@ impl ClientCore {
                     }
                 }
 
-                let result = prevalidate_cdf53(payload, th.generation, th.pass);
+                // In wire mode (Payload delivery only) the expansion is left
+                // to the consumer: validate, and keep the framed streams.
+                let wire = self.delivers_cdf53_wire();
+                let result: Result<Cdf53Pass, _> = if wire {
+                    validate_cdf53(payload, th.pass).map(|info| Cdf53Pass::Wire {
+                        streams: payload[info.streams].to_vec(),
+                        present_passes: info.present_passes,
+                    })
+                } else {
+                    prevalidate_cdf53(payload, th.generation, th.pass).map(|pre| {
+                        Cdf53Pass::Planes {
+                            bit_planes: pre.bit_planes,
+                            present_passes: pre.present_passes,
+                        }
+                    })
+                };
                 let ok = result.is_ok();
-                let present_passes = result.as_ref().ok().and_then(|p| p.present_passes);
+                let present_passes = result.as_ref().ok().and_then(Cdf53Pass::present_passes);
                 let outcome = apply_cdf53_arrival(
                     prev,
                     th.generation,
@@ -444,20 +481,37 @@ impl ClientCore {
                     Ok(pre) => {
                         // No accumulation here: the pixel decode (CPU
                         // `TileDecoder` or cdf53_integrate.wgsl) does it.
+                        //
+                        // `new_generation`: the pixel decode keys its
+                        // accumulation on the 4-bit generation alone, so it
+                        // cannot see a new generation that reuses the number.
+                        let new_generation = outcome.new_generation;
+                        let data = match pre {
+                            Cdf53Pass::Planes {
+                                bit_planes,
+                                present_passes,
+                            } => TileData::Cdf53 {
+                                pass_idx: th.pass,
+                                bit_planes,
+                                present_passes,
+                                new_generation,
+                            },
+                            Cdf53Pass::Wire {
+                                streams,
+                                present_passes,
+                            } => TileData::Cdf53Wire {
+                                pass_idx: th.pass,
+                                streams,
+                                present_passes,
+                                new_generation,
+                            },
+                        };
                         events.push(Event::TilePayload {
                             frame_seq,
                             tile_x: tx,
                             tile_y: ty,
                             generation: th.generation,
-                            data: TileData::Cdf53 {
-                                pass_idx: pre.pass_idx,
-                                bit_planes: pre.bit_planes,
-                                present_passes: pre.present_passes,
-                                // The pixel decode keys its accumulation on
-                                // the 4-bit generation alone, so it cannot see
-                                // a new generation that reuses the number.
-                                new_generation: outcome.new_generation,
-                            },
+                            data,
                         });
                         // Deferred ACK — fires only after prevalidation success.
                         // Deliberately outside the match: it is protocol, not

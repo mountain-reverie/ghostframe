@@ -29,6 +29,7 @@ fn core() -> ClientCore {
             supports_h264: true,
             h264_acked_ref: false,
             tile_delivery: TileDelivery::Decoded,
+            cdf53_wire: false,
             display: None,
         },
         0,
