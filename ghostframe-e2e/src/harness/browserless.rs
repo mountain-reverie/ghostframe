@@ -300,6 +300,15 @@ pub struct RunOptions {
     /// Drop frame acks (0x0A) with this probability between the two offsets:
     /// the loss of the frame feedback alone (design scene 3).
     pub frame_ack_loss: Option<(f64, Duration, Duration)>,
+    /// Send a two-byte input message on the feedback stream this long after
+    /// the client has been handed server datagrams: one extra ack-eliciting
+    /// client-to-server packet per delivery, as its own packet. It changes
+    /// the timing on the client-to-server path (and, under jitter, the netsim's
+    /// draws), not what the client says: for scenes that must not depend on
+    /// either. A perturbation, not a model of the standalone frame acks of
+    /// the B5a client, which carry acknowledgements of their own. The bridge has no injector in the harness and drops the
+    /// message. `Some(ZERO)` sends it at once.
+    pub ack_chatter: Option<Duration>,
 }
 
 /// How long the harness's perfect decoder takes to answer for an access unit
@@ -1546,6 +1555,8 @@ async fn drive_session(
     let mut bytes_delivered_s2c: u64 = 0;
     let mut bytes_delivered_c2s: u64 = 0;
     let mut datagrams_delivered_s2c: u64 = 0;
+    let mut chatter_seen: u64 = 0;
+    let mut chatter_due: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
     let mut bytes_dropped: u64 = 0;
 
     // Per-tile generation counters for injected frames: a coordinate's
@@ -1777,6 +1788,16 @@ async fn drive_session(
         )
         .await
         .map_err(|e| anyhow!("seed {seed}: bridge send failed at iteration {iter}: {e}"))?;
+        if let Some(delay) = opts.ack_chatter {
+            if datagrams_delivered_s2c > chatter_seen {
+                chatter_seen = datagrams_delivered_s2c;
+                chatter_due.push_back(now_us(base) + delay.as_micros() as u64);
+            }
+            while chatter_due.front().is_some_and(|&t| t <= now_us(base)) {
+                chatter_due.pop_front();
+                client.send_input(vec![0x05, 0xff], now_us(base));
+            }
+        }
 
         let new_events = client.take_events();
         for ev in &new_events {
