@@ -599,11 +599,24 @@ impl RefManager {
             }
             None => 1,
         };
-        // Into a slot the client may lack the mark must drop a short-term
-        // picture (see `mark_ops`); with none in the encoder's DPB there is
-        // nothing safe to name, so the mark waits for one.
-        let forced = !self.slot_confirmed_once[usize::from(slot)];
-        (!forced || !self.dpb.st.is_empty()).then_some(slot)
+        Some(slot)
+    }
+
+    /// Whether a frame with this target can carry a mark into `slot`. A mark
+    /// that must drop a short-term picture names the frame's own target
+    /// (`mark_ops`), so it waits for a frame whose target is short-term.
+    fn mark_fits(&self, slot: u8, target: RefTarget) -> bool {
+        !self.mark_drops_st(slot) || matches!(target, RefTarget::Short { .. })
+    }
+
+    /// Whether marking into `slot` has to name a short-term picture to
+    /// forget: always into a slot the client may lack (its copy of the
+    /// candidate may never have arrived, leaving it a short-term picture
+    /// more than we count), else only when our own DPB would overfill.
+    fn mark_drops_st(&self, slot: u8) -> bool {
+        let lt_after = self.dpb.lt_count() + usize::from(self.dpb.lt[usize::from(slot)].is_none());
+        !self.slot_confirmed_once[usize::from(slot)]
+            || self.dpb.st.len() + lt_after > self.cfg.params.max_num_ref_frames as usize
     }
 
     fn resident(&self, seq: u32) -> bool {
@@ -648,25 +661,34 @@ impl RefManager {
         }
     }
 
-    /// MMCO 4 (max long-term idx 2), then MMCO 1 on the oldest short-term
-    /// picture when the mark could overfill a DPB, then MMCO 6.
+    /// MMCO 4 (max long-term idx 2), then MMCO 1 on the frame's own
+    /// short-term target when the mark could overfill a DPB, then MMCO 6.
     ///
     /// The client's slot may be empty where ours is not: a candidate it never
     /// received left it with a non-existing short-term picture instead, and
     /// marking then costs it one more reference than we count. Until a
     /// slot's occupant has been confirmed decoded, the mark assumes the
-    /// client's slot is empty and always drops the oldest short-term picture,
-    /// which the client certainly holds (it keeps at least as many).
-    fn mark_ops(&self, slot: u8, cur_frame_num: u32) -> Vec<Mmco> {
+    /// client's slot is empty and always drops a short-term picture.
+    ///
+    /// The picture it names must be a real one at every decoder. Pictures the
+    /// client never received exist there, if at all, as "non-existing" frames
+    /// from the `frame_num` gap process, and decoders disagree about which:
+    /// libavcodec measures a gap against the previous picture, non-reference
+    /// ones included, so it never infers a lost reference frame that shares
+    /// its `frame_num` with a non-reference picture that arrived, and naming
+    /// it fails with "unref short failure". The target of a healthy frame is
+    /// the one picture the client gate guarantees (it admits the frame only
+    /// if that picture is its newest reference), and nothing older is ever a
+    /// target, while the marked frame becomes the new `prev`.
+    fn mark_ops(&self, slot: u8, cur_frame_num: u32, target: RefTarget) -> Vec<Mmco> {
         let max_fn = self.cfg.params.max_frame_num();
         let mut ops = vec![Mmco::MaxLong(LT_SLOTS as u32)];
-        let lt_after = self.dpb.lt_count() + usize::from(self.dpb.lt[usize::from(slot)].is_none());
-        let forced = !self.slot_confirmed_once[usize::from(slot)];
-        if forced || self.dpb.st.len() + lt_after > self.cfg.params.max_num_ref_frames as usize {
-            if let Some(i) = self.dpb.oldest_st(cur_frame_num, max_fn) {
-                let d = (cur_frame_num + max_fn - self.dpb.st[i].1) % max_fn;
-                ops.push(Mmco::ForgetShort(d - 1));
-            }
+        if self.mark_drops_st(slot) {
+            let RefTarget::Short { frame_num, .. } = target else {
+                unreachable!("`mark_fits` keeps a dropping mark off long-term targets");
+            };
+            let d = (cur_frame_num + max_fn - frame_num) % max_fn;
+            ops.push(Mmco::ForgetShort(d - 1));
         }
         ops.push(Mmco::CurrentToLong(u32::from(slot)));
         ops
@@ -699,7 +721,7 @@ impl RefManager {
             poc: 2 * self.poc_count,
             target: Some(target),
             mark,
-            mmco: mark.map_or_else(Vec::new, |k| self.mark_ops(k, frame_num)),
+            mmco: mark.map_or_else(Vec::new, |k| self.mark_ops(k, frame_num, target)),
             rplm,
         }
     }
@@ -789,7 +811,7 @@ impl RefManager {
             }
         }
 
-        let mark = self.mark_slot_if_due(now);
+        let mark_due = self.mark_slot_if_due(now);
         let interval = self.srtt.max(self.cfg.frame_interval);
         let fresh_root = self.anchor();
         if let (Chain::Recovering { root, .. }, Some(a)) = (&mut self.chain, fresh_root) {
@@ -803,6 +825,7 @@ impl RefManager {
                 // client's slot can hold an older picture. The client gate's
                 // check of `ref_frame_seq` against its slot content is what
                 // makes that safe (design 7.1): it must not be weakened.
+                let mark = mark_due.filter(|&k| self.mark_fits(k, target));
                 self.p_plan(frame_seq, PicKind::Healthy, target, mark)
             }
             Chain::Recovering {
@@ -827,6 +850,7 @@ impl RefManager {
                     }
                 };
                 if due {
+                    let mark = mark_due.filter(|&k| self.mark_fits(k, target));
                     self.p_plan(frame_seq, PicKind::Reroot, target, mark)
                 } else {
                     self.p_plan(frame_seq, PicKind::Recovery, target, None)
