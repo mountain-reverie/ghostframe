@@ -1,5 +1,8 @@
 //! Tile encoding: converts raw BGRA tile data into compressed payloads.
 
+// Wired into the encoder and io_bridge by B5; until then only its tests call it.
+#[allow(dead_code)]
+mod h264;
 mod h264_tile;
 pub mod h264_vaapi;
 
