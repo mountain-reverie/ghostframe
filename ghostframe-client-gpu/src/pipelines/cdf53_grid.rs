@@ -15,8 +15,7 @@
 //!   copy. (An earlier revision also decoded RLE streams on the GPU, one
 //!   invocation per channel stream, for a "Phase 2" in which events carry the
 //!   raw wire payload; nothing sends that yet, so the code was removed rather
-//!   than compiled at start-up for nothing. It is in the history of this file,
-//!   with its tests, under `cdf53_unpack.wgsl`.)
+//!   than compiled at start-up for nothing; that shader was never committed.)
 //! - **Stage B** (`cdf53_reconstruct.wgsl`), one workgroup per listed tile,
 //!   builds the coefficients from the planes the tile's `plane_mask` names,
 //!   inverts them in workgroup memory and stores the pixels.
