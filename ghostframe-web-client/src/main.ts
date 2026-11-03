@@ -1,4 +1,4 @@
-import { FullFrameDecoder, ResetPacer } from './decoder.js';
+import { FullFrameDecoder, H264_DECODE_ERROR } from './decoder.js';
 import { WebGpuRenderer } from './webgpu/renderer.js';
 import { WebGpuUnavailableError } from './webgpu/init.js';
 import { attachInputCapture } from './input/wire';
@@ -294,7 +294,6 @@ async function main() {
 
   // Full-frame decoder state.
   let fullFrameDecoder: FullFrameDecoder | null = null;
-  const resetPacer = new ResetPacer();
 
   let firstTileRendered = false;
   let frameDimensionsKnown = false;
@@ -339,6 +338,7 @@ async function main() {
         ref_frame_seq: number;
         flags: number;
         slots: number;
+        reset_decoder: boolean;
         payload: Uint8Array;
       }
     | { kind: 'DecodeError'; codec: number; tile_x: number; tile_y: number; code: number }
@@ -502,16 +502,32 @@ async function main() {
 
       case 'NeedsH264': {
         if (!fullFrameDecoder) {
-          fullFrameDecoder = new FullFrameDecoder((frame: VideoFrame, frameSeq: number) => {
-            renderer.pushH264(frame, frameSeq);
-          }, 1920, 1080, (frameSeq: number) => {
-            // The decoder failed: ask the server for an IDR now rather than
-            // waiting out the GOP. ResetReason::DecoderFailure = 1.
-            if (resetPacer.allow(performance.now())) {
-              core.requestReset(1, frameSeq);
-              drainTransmit().catch((err) => console.warn('reset request write failed:', err));
+          // What the decoder did with each access unit goes back to the core:
+          // the reference gate, the frame ack (0x0A) and, after a failure, the
+          // paced IDR request (0x09) all hang off it.
+          const report = (frameSeq: number, outcome: number): void => {
+            // No drainTransmit here: the frame ack must leave behind the ack
+            // batch, which the rAF tick's onTimeout + drainTransmit flushes.
+            core.h264Result(frameSeq, outcome, nowUs());
+            // A decoder that delays its output answers every frame not-output
+            // while the stream plays; say so once when the run gets long.
+            const [total, streak] = core.h264NotOutputStats();
+            if (streak === 30) {
+              console.warn(
+                `H.264 decoder: no picture for 30 access units in a row (${total} in all); ` +
+                  'output delay? every one is reported refused in the frame ack',
+              );
             }
-          });
+          };
+          fullFrameDecoder = new FullFrameDecoder(
+            (frame: VideoFrame, frameSeq: number) => {
+              renderer.pushH264(frame, frameSeq);
+            },
+            1920,
+            1080,
+            (frameSeq: number) => report(frameSeq, H264_DECODE_ERROR),
+            report,
+          );
         }
         fullFrameDecoder.decode(ev.payload, ev.is_keyframe, ev.frame_seq);
 
