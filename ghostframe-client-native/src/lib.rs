@@ -401,14 +401,15 @@ impl Client {
         // request and the local VA-API probe (see its own doc), so a client
         // that never advertised the capability never pays this at all.
         let open_h264_eagerly = self.effective_h264;
-        // The render thread reports H.264 decode errors through the same
-        // command channel + wake eventfd the input path uses.
-        let reset_sink: render_thread::ResetSink = {
+        // The render thread reports what the decoder did with each H.264
+        // access unit through the same command channel + wake eventfd the
+        // input path uses.
+        let result_sink: render_thread::ResultSink = {
             let tx = net_cmd_tx.clone();
             let wake = Arc::clone(&wake_fd);
-            Box::new(move |reason, frame_seq| {
+            Box::new(move |frame_seq, outcome| {
                 if tx
-                    .send(NetCommand::RequestReset { reason, frame_seq })
+                    .send(NetCommand::H264Result { frame_seq, outcome })
                     .is_ok()
                 {
                     let one: u64 = 1;
@@ -437,7 +438,7 @@ impl Client {
                     host_visible,
                     preferred_modifiers,
                     open_h264_eagerly,
-                    reset_sink,
+                    result_sink,
                     render_self_tx,
                     frame_clock::DEFAULT_FRAME_INTERVAL,
                 )

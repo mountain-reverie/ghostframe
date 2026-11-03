@@ -476,8 +476,9 @@ impl EventTally {
     }
 }
 
-/// How the render thread asks the net thread to send a reset request.
-pub(crate) type ResetSink = Box<dyn Fn(ghostframe_client_core::ResetReason, u32) + Send>;
+/// How the render thread tells the net thread what the decoder did with an
+/// H.264 access unit (`frame_seq`, outcome).
+pub(crate) type ResultSink = Box<dyn Fn(u32, ghostframe_client_core::H264Outcome) + Send>;
 
 /// A GPU CDF 5/3 grid that passed the start-up probe, waiting for the renderer.
 pub(crate) struct Cdf53Setup {
@@ -551,7 +552,7 @@ pub(crate) fn run(
     host_visible: bool,
     preferred_modifiers: Vec<u64>,
     open_h264_eagerly: bool,
-    reset_sink: ResetSink,
+    result_sink: ResultSink,
     self_tx: Sender<RenderMsg>,
     frame_interval: std::time::Duration,
 ) {
@@ -775,9 +776,13 @@ pub(crate) fn run(
             }
         }
 
-        // A decode error in this batch asks the server for an IDR.
-        if let Some((reason, frame_seq)) = renderer.as_mut().and_then(|r| r.take_reset_request()) {
-            reset_sink(reason, frame_seq);
+        // What the decoder did with this batch's H.264 access units goes back
+        // to the core: the gate, the frame ack, and (after a decode error)
+        // the IDR request all hang off it.
+        if let Some(r) = renderer.as_mut() {
+            for (frame_seq, outcome) in r.take_h264_results() {
+                result_sink(frame_seq, outcome);
+            }
         }
 
         render_due |= got_event || (released && publish_pending);

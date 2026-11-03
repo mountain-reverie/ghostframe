@@ -113,6 +113,10 @@ pub enum Event {
         flags: u8,
         /// Long-term slot indices (bits 0-1 mark, bits 2-3 target).
         slots: u8,
+        /// The decoder must be reset before it decodes this access unit: it
+        /// is an IDR, or the gate was reset since the last frame it fed. The
+        /// gate is the only thing that asks for a decoder reset.
+        reset_decoder: bool,
         payload: Vec<u8>,
     },
     DecodeError {

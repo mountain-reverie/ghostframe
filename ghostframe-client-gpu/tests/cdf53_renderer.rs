@@ -364,6 +364,7 @@ fn a_real_h264_frame_is_not_painted_over_by_a_pending_cdf53_burst() {
                 ref_frame_seq: u32::MAX,
                 flags: 0,
                 slots: 0,
+                reset_decoder: i == 0,
                 payload: au.clone(),
             });
         }

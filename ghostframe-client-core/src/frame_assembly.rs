@@ -15,17 +15,10 @@ use std::collections::HashMap;
 
 use ghostframe_protocol::ack::AckEntry;
 use ghostframe_protocol::fec::decode_parity_payload;
-use ghostframe_protocol::feedback_stream::ResetReason;
-use ghostframe_protocol::protocol::{
-    decode_frame_datagram, FrameHeader, FRAME_FLAG_PAD, NO_ACK, REF_FRAME_NONE,
-};
-
-/// Reference-break reset requests are at least this far apart: the server
-/// answers one a second at most, and the native renderer paces its own decode
-/// failures the same way.
-const REF_RESET_MIN_INTERVAL_US: u64 = 2_200_000;
+use ghostframe_protocol::protocol::{decode_frame_datagram, FrameHeader, FRAME_FLAG_PAD, NO_ACK};
 
 use crate::event::Event;
+use crate::h264_gate::{RefuseCause, Verdict};
 use crate::{ClientCore, PollOutput, MAX_FRAME_FRAGMENTS, MAX_H264_ACCESS_UNIT_BYTES};
 
 /// How long an IDR assembly is exempt from the `latest - 2` window. The server
@@ -178,7 +171,8 @@ impl ClientCore {
         if !fh.is_parity()
             && !fh.is_keyframe()
             && self
-                .last_delivered_frame_seq
+                .h264_gate
+                .last_fed()
                 .is_some_and(|last| fh.frame_seq <= last)
         {
             return;
@@ -349,44 +343,33 @@ impl ClientCore {
                 Some(a) => a,
                 None => return,
             };
-            // A keyframe at or before a frame already delivered would make the
-            // decoder jump back (or decode the same picture twice): it is
-            // moot, drop it.
-            if asm.header.is_keyframe()
-                && self
-                    .last_delivered_frame_seq
-                    .is_some_and(|last| frame_seq <= last)
-            {
-                return;
-            }
-            if asm.header.is_keyframe() {
-                self.awaiting_idr = false;
-            } else {
-                // A P frame names the frame it predicts from. If that frame
-                // was never delivered (it was lost, or dropped as stale), the
-                // decoder has no reference for this one and every one after
-                // it: a 3 s GOP would leave the picture broken for seconds
-                // with nothing to say so. Do not hand such frames over; ask
-                // for an IDR (paced), and hold P frames until it arrives.
-                let reference = asm.header.ref_frame_seq;
-                let broken =
-                    reference != REF_FRAME_NONE && self.last_delivered_frame_seq != Some(reference);
-                if self.awaiting_idr || broken {
-                    self.awaiting_idr = true;
-                    let due = self
-                        .last_ref_reset_us
-                        .is_none_or(|t| now_us.saturating_sub(t) >= REF_RESET_MIN_INTERVAL_US);
-                    if due {
-                        self.last_ref_reset_us = Some(now_us);
-                        self.request_reset(ResetReason::GateReset, frame_seq);
+            // The gate decides (design 7.1). A frame it refuses is never
+            // decoded, and is reported as refused in the next frame ack.
+            let reset_decoder = match self.h264_gate.on_frame(&asm.header, now_us) {
+                Verdict::Feed { reset_decoder } => reset_decoder,
+                Verdict::Refuse(cause) => {
+                    // A copy of a frame already fed is stale, not refused: the
+                    // original has an answer coming, and a refusal now would
+                    // race it.
+                    let copy = cause == RefuseCause::Stale && self.h264_gate.was_fed(frame_seq);
+                    if !copy {
+                        self.frame_acks.record(frame_seq, false, now_us);
                     }
+                    self.after_gate();
                     return;
                 }
+            };
+            if reset_decoder {
+                // Results from before the reset are untrustworthy only if the
+                // decoder had failed. A reset on a healthy decoder (a GOP IDR)
+                // leaves frames still in flight valid: their answers may
+                // arrive after it.
+                if self.decoder_broken {
+                    self.decoder_epoch_start = Some(frame_seq);
+                }
+                self.decoder_broken = false;
             }
-            self.last_delivered_frame_seq = Some(
-                self.last_delivered_frame_seq
-                    .map_or(frame_seq, |last| last.max(frame_seq)),
-            );
+            self.after_gate();
             let mut out = Vec::new();
             for b in asm.fragments.iter().flatten() {
                 out.extend_from_slice(b);
@@ -398,6 +381,7 @@ impl ClientCore {
                 ref_frame_seq: asm.header.ref_frame_seq,
                 flags: asm.header.flags,
                 slots: asm.header.slots,
+                reset_decoder,
                 payload: out,
             });
         }

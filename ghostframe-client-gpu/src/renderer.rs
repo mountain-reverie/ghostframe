@@ -278,27 +278,24 @@ pub struct Renderer {
     /// the first frame; logged on every *change*, not just once ever -- see
     /// [`H264ImportPath`].
     h264_import_path: Option<H264ImportPath>,
-    /// `frame_seq` of the last access unit handed to `decode_h264`. For
-    /// logging only: it is the server's *capture* counter, which skips every
-    /// unchanged capture, so a jump in it says nothing about loss.
+    /// `frame_seq` of the last access unit handed to `decode_h264`.
     h264_last_frame_seq: Option<u32>,
-    /// Detects a lost reference picture from the stream's own `frame_num`.
-    /// See [`ghostframe_client_h264::bitstream`].
-    h264_continuity: ghostframe_client_h264::bitstream::RefContinuity,
+    /// What the decoder did with each access unit, for the embedder to report
+    /// to the client core (`ClientCore::h264_result`): the gate learns which
+    /// frames became references, and the server learns which were decoded.
+    /// Collected with [`Renderer::take_h264_results`].
+    h264_results: Vec<(u32, ghostframe_client_core::H264Outcome)>,
+    /// A decode failed and no access unit marked `reset_decoder` has arrived:
+    /// the decoder's state is unknown, so access units queued behind the
+    /// failure are not decoded (they would be concealed, and shown) and are
+    /// reported `NotOutput`.
+    h264_broken: bool,
+    /// Whether the "no picture for this access unit, but older ones come out"
+    /// warning has been logged this episode.
+    h264_delay_warned: bool,
     /// Handed to the decoder whenever one is opened. See
     /// [`Renderer::set_h264_frame_ready_notify`].
     h264_ready_notify: Option<ghostframe_client_h264::FrameReadyNotify>,
-    /// Set when a lost reference picture (or a hard decode error) means the
-    /// decoder may be holding state built on references that will never
-    /// arrive. Cleared by
-    /// `reset()` at the next keyframe -- an IDR needs no prior reference,
-    /// but the decoder itself does not know that until told: ffmpeg's H.264
-    /// decoder does not error on missing references, it conceals, silently
-    /// emitting frames built on stale state with no log and an `Ok` return.
-    h264_needs_reset: bool,
-    /// A reset request (feedback stream 0x09) waiting for the embedder to
-    /// collect it with [`Renderer::take_reset_request`]. Set by a decode error.
-    recovery: H264Recovery,
     /// Throttles the size-mismatch warning in [`Renderer::blit_h264_frame`]
     /// to its first occurrence per mismatch episode, so a persistent
     /// disagreement does not burst-log once per frame at 60fps. Cleared as
@@ -446,10 +443,10 @@ impl Renderer {
             h264_unavailable,
             h264_import_path: None,
             h264_last_frame_seq: None,
-            h264_continuity: ghostframe_client_h264::bitstream::RefContinuity::new(),
+            h264_results: Vec::new(),
+            h264_broken: false,
+            h264_delay_warned: false,
             h264_ready_notify: None,
-            h264_needs_reset: false,
-            recovery: H264Recovery::default(),
             h264_size_mismatch_logged: false,
         })
     }
@@ -608,9 +605,10 @@ impl Renderer {
                 frame_seq,
                 payload,
                 is_keyframe,
+                reset_decoder,
                 ..
             } => {
-                self.decode_h264(ctx, frame_seq, is_keyframe, &payload)?;
+                self.decode_h264(ctx, frame_seq, is_keyframe, reset_decoder, &payload)?;
             }
             Event::DecodeError {
                 codec,
@@ -1451,21 +1449,25 @@ impl Renderer {
     /// Decode one access unit and blit every frame the decoder has ready.
     /// Frames that finish later are collected by [`Renderer::poll_h264`].
     ///
-    /// Failures are logged, never fatal: a corrupt access unit (FEC failed
-    /// to recover one) must not take down the session. "The next keyframe
-    /// recovers" is made true here, not just asserted: a lost reference
-    /// picture (or a hard decode error) sets [`Renderer::h264_needs_reset`], and the
-    /// first keyframe after that resets the decoder before it is decoded --
-    /// see that field's doc for why an IDR alone does not already guarantee
-    /// this.
+    /// Failures are logged, never fatal: a corrupt access unit must not take
+    /// down the session. Whether to decode at all is the client core's gate;
+    /// `reset_decoder` is its instruction to reset first (an IDR, or after
+    /// the gate was reset): ffmpeg's H.264 decoder does not error on missing
+    /// references, it conceals, so an IDR alone would not clear stale state.
+    ///
+    /// The outcome is queued for [`Renderer::take_h264_results`]: decoded iff
+    /// a picture with this frame's pts came out of this same call.
     fn decode_h264(
         &mut self,
         ctx: &WgpuContext,
         frame_seq: u32,
         is_keyframe: bool,
+        reset_decoder: bool,
         au: &[u8],
     ) -> Result<(), GpuError> {
+        use ghostframe_client_core::H264Outcome;
         if self.h264_unavailable {
+            self.h264_results.push((frame_seq, H264Outcome::NoDecoder));
             return Ok(());
         }
         if self.h264_decoder.is_none() {
@@ -1502,6 +1504,7 @@ impl Renderer {
                          was advertised without hardware to back it"
                     );
                     self.h264_unavailable = true;
+                    self.h264_results.push((frame_seq, H264Outcome::NoDecoder));
                     return Ok(());
                 }
             }
@@ -1525,31 +1528,16 @@ impl Renderer {
             ));
         }
 
+        if self.h264_broken && !reset_decoder {
+            self.h264_results.push((frame_seq, H264Outcome::NotOutput));
+            return Ok(());
+        }
         let decoder = self.h264_decoder.as_mut().expect("just created");
 
-        // Detect a lost reference picture. `frame_assembly.rs` evicts an
-        // incomplete reassembly older than `latest-2` with no signal, and a
-        // jump in `frame_seq` cannot stand in for one: the server skips
-        // unchanged captures, so it jumps on nearly every access unit. Judged
-        // that way, every keyframe reset the decoder, discarding whatever
-        // frames the pipeline still held. The stream's `frame_num` is exact.
-        if let ghostframe_client_h264::bitstream::Continuity::Gap { expected, got } =
-            self.h264_continuity.observe(au)
-        {
-            if !self.h264_needs_reset {
-                tracing::warn!(
-                    frame_seq,
-                    expected_frame_num = expected,
-                    frame_num = got,
-                    "H.264 reference picture lost; decoder will reset at the next keyframe"
-                );
-                self.h264_needs_reset = true;
-            }
-        }
         self.h264_last_frame_seq = Some(frame_seq);
-        if self.h264_needs_reset && is_keyframe {
+        if reset_decoder {
             decoder.reset();
-            self.h264_needs_reset = false;
+            self.h264_broken = false;
         }
 
         // Timed at `debug` level so M3's decode-cost measurement (design doc
@@ -1573,27 +1561,42 @@ impl Renderer {
             reason = "measuring a real hardware H.264 decode stall for M3 §10's decode-thread decision, not a virtual-clock path"
         )]
         let decode_start = std::time::Instant::now();
-        let frames = match decoder.decode(au) {
+        let frames = match decoder.decode_pts(au, i64::from(frame_seq)) {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(frame_seq, is_keyframe, error = %e, "H.264 decode failed");
-                // A hard decode error leaves the decoder's internal state
-                // for this access unit unknown, same as a sequence gap:
-                // wait for the next keyframe and reset on it rather than
-                // trust whatever the decoder emits from here.
-                self.h264_needs_reset = true;
-                // Ask the server for an IDR rather than wait for its next
-                // periodic one. Paced: every frame behind a broken reference
-                // can fail the same way.
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "client-side pacing of a network request, not a virtual-clock path"
-                )]
-                let now = std::time::Instant::now();
-                self.recovery.on_decode_error(frame_seq, now);
+                // A hard decode error leaves the decoder's internal state for
+                // this access unit unknown. The gate resets, asks the server
+                // for an IDR (paced) and resets the decoder at it.
+                self.h264_broken = true;
+                self.h264_results
+                    .push((frame_seq, H264Outcome::DecodeError));
                 return Ok(());
             }
         };
+        let produced = frames.iter().any(|f| f.pts() == Some(i64::from(frame_seq)));
+        if produced {
+            self.h264_delay_warned = false;
+        } else if !frames.is_empty() && !self.h264_delay_warned {
+            // Pictures come out, but not this access unit's: the decoder
+            // delays its output. Every frame is then reported refused although
+            // the stream plays (the core counts the run too).
+            self.h264_delay_warned = true;
+            tracing::warn!(
+                frame_seq,
+                pts = ?frames.first().and_then(|f| f.pts()),
+                "H.264 decoder returned older pictures but none for this access unit: \
+                 output delay, frames are reported not-output"
+            );
+        }
+        self.h264_results.push((
+            frame_seq,
+            if produced {
+                H264Outcome::Decoded
+            } else {
+                H264Outcome::NotOutput
+            },
+        ));
         #[allow(
             clippy::disallowed_methods,
             reason = "measuring a real hardware H.264 decode stall for M3 §10's decode-thread decision, not a virtual-clock path"
@@ -1686,7 +1689,10 @@ impl Renderer {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(error = %e, "H.264 decode failed (late frame)");
-                self.h264_needs_reset = true;
+                // The decoder's state is unknown; same as a hard error in
+                // `decode_h264`: access units are refused until the gate
+                // resets it.
+                self.h264_broken = true;
                 return Ok(false);
             }
         };
@@ -1710,10 +1716,10 @@ impl Renderer {
         Ok(self.blit_h264_frames(ctx, frame_seq, frames))
     }
 
-    /// The reset request a decode error queued, if any; the embedder sends it
-    /// to the server (feedback stream 0x09). Returns each request once.
-    pub fn take_reset_request(&mut self) -> Option<(ghostframe_client_core::ResetReason, u32)> {
-        self.recovery.take()
+    /// What the decoder did with each access unit since the last call, in
+    /// order. The embedder reports each to `ClientCore::h264_result`.
+    pub fn take_h264_results(&mut self) -> Vec<(u32, ghostframe_client_core::H264Outcome)> {
+        std::mem::take(&mut self.h264_results)
     }
 
     /// Drain and blit any frames still buffered by B-frame reordering.
@@ -1985,102 +1991,4 @@ fn wait_for_submission(ctx: &WgpuContext, submission: wgpu::SubmissionIndex, fra
 
 fn log_decode_error(codec: Codec, tile_x: u8, tile_y: u8, code: DecodeErrorCode) {
     tracing::warn!(?codec, tile_x, tile_y, ?code, "tile decode error");
-}
-
-/// Shortest gap between two reset requests from this client. Slightly longer
-/// than the server's 2 s window: a retry sent exactly one window after the
-/// last honoured request can reach the server inside its window (network
-/// jitter, clock granularity) and be dropped, costing another full interval.
-const RESET_REQUEST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2200);
-
-/// Decides when a decode error becomes a reset request (feedback stream
-/// 0x09). A decode error on every frame behind a broken reference must not
-/// become a request per frame, so requests are spaced out; the request waits
-/// here until the embedder collects it with [`H264Recovery::take`]. Pure: no
-/// clock of its own, so the pacing is testable without a GPU.
-#[derive(Default)]
-pub struct H264Recovery {
-    last_sent: Option<std::time::Instant>,
-    pending: Option<(ghostframe_client_core::ResetReason, u32)>,
-}
-
-impl H264Recovery {
-    /// A decode of `frame_seq` failed at `now`. Queues a `DecoderFailure`
-    /// request unless one went out less than [`RESET_REQUEST_MIN_INTERVAL`]
-    /// ago (or one is already waiting).
-    pub fn on_decode_error(&mut self, frame_seq: u32, now: std::time::Instant) {
-        if self.pending.is_some() {
-            return;
-        }
-        if self
-            .last_sent
-            .is_some_and(|t| now.saturating_duration_since(t) < RESET_REQUEST_MIN_INTERVAL)
-        {
-            return;
-        }
-        self.last_sent = Some(now);
-        self.pending = Some((
-            ghostframe_client_core::ResetReason::DecoderFailure,
-            frame_seq,
-        ));
-    }
-
-    /// The queued request, once.
-    pub fn take(&mut self) -> Option<(ghostframe_client_core::ResetReason, u32)> {
-        self.pending.take()
-    }
-}
-
-#[cfg(test)]
-mod h264_recovery_tests {
-    use super::*;
-    use ghostframe_client_core::ResetReason;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn nothing_is_queued_without_a_decode_error() {
-        let mut r = H264Recovery::default();
-        assert_eq!(r.take(), None);
-    }
-
-    #[test]
-    fn a_decode_error_queues_one_decoder_failure_request_for_that_frame() {
-        let mut r = H264Recovery::default();
-        r.on_decode_error(42, Instant::now());
-        assert_eq!(r.take(), Some((ResetReason::DecoderFailure, 42)));
-        assert_eq!(r.take(), None, "each request is returned once");
-    }
-
-    #[test]
-    fn a_burst_of_errors_is_one_request_and_the_first_frame_wins() {
-        let t0 = Instant::now();
-        let mut r = H264Recovery::default();
-        r.on_decode_error(10, t0);
-        r.on_decode_error(11, t0 + Duration::from_millis(16));
-        assert_eq!(r.take(), Some((ResetReason::DecoderFailure, 10)));
-        r.on_decode_error(12, t0 + Duration::from_millis(33));
-        assert_eq!(r.take(), None, "still inside the interval after a take");
-    }
-
-    #[test]
-    fn requests_are_spaced_by_more_than_the_servers_two_second_window() {
-        const { assert!(RESET_REQUEST_MIN_INTERVAL.as_millis() > 2000) };
-        let t0 = Instant::now();
-        let mut r = H264Recovery::default();
-        r.on_decode_error(1, t0);
-        let _ = r.take();
-        r.on_decode_error(
-            2,
-            t0 + RESET_REQUEST_MIN_INTERVAL - Duration::from_millis(1),
-        );
-        assert_eq!(r.take(), None);
-        r.on_decode_error(3, t0 + RESET_REQUEST_MIN_INTERVAL);
-        assert_eq!(r.take(), Some((ResetReason::DecoderFailure, 3)));
-        // The window restarts from the request that went out.
-        r.on_decode_error(
-            4,
-            t0 + RESET_REQUEST_MIN_INTERVAL + Duration::from_millis(1),
-        );
-        assert_eq!(r.take(), None);
-    }
 }
