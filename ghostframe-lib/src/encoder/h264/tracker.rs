@@ -103,12 +103,17 @@ pub(crate) enum FragAck {
 
 pub(crate) struct FrameTable {
     ring: Vec<Option<FrameRec>>,
+    /// The epoch's IDR lives outside the ring: a slow link can take more than
+    /// 256 frame sequence numbers to deliver it, and losing its record would
+    /// lose the decoded bit that makes it the first anchor.
+    idr: Option<FrameRec>,
 }
 
 impl Default for FrameTable {
     fn default() -> Self {
         Self {
             ring: (0..TRACKER_RING).map(|_| None).collect(),
+            idr: None,
         }
     }
 }
@@ -119,20 +124,31 @@ impl FrameTable {
     }
 
     pub(crate) fn insert(&mut self, rec: FrameRec) {
+        if rec.kind == PicKind::Idr {
+            self.idr = Some(rec);
+            return;
+        }
         let s = Self::slot(rec.seq);
         self.ring[s] = Some(rec);
     }
 
     pub(crate) fn get(&self, seq: u32) -> Option<&FrameRec> {
+        if let Some(i) = self.idr.as_ref().filter(|f| f.seq == seq) {
+            return Some(i);
+        }
         self.ring[Self::slot(seq)].as_ref().filter(|f| f.seq == seq)
     }
 
     fn get_mut(&mut self, seq: u32) -> Option<&mut FrameRec> {
+        if self.idr.as_ref().is_some_and(|f| f.seq == seq) {
+            return self.idr.as_mut();
+        }
         self.ring[Self::slot(seq)].as_mut().filter(|f| f.seq == seq)
     }
 
     pub(crate) fn clear(&mut self) {
         self.ring.iter_mut().for_each(|s| *s = None);
+        self.idr = None;
     }
 
     pub(crate) fn state(&self, seq: u32) -> Option<FrameState> {
@@ -152,6 +168,23 @@ impl FrameTable {
         FragAck::Acked {
             complete: f.complete(),
         }
+    }
+
+    /// Restart a frame's deadline clock (an IDR, when its last fragment is
+    /// acknowledged).
+    pub(crate) fn restart_clock(&mut self, seq: u32, now: Instant) {
+        if let Some(f) = self.get_mut(seq) {
+            f.sent_at = now;
+        }
+    }
+
+    /// An IDR with unacknowledged fragments that is not known to be dead.
+    pub(crate) fn idr_incomplete(&self, seq: u32) -> bool {
+        self.get(seq).is_some_and(|f| {
+            f.kind == PicKind::Idr
+                && !f.complete()
+                && matches!(f.state, FrameState::Sent | FrameState::Suspect)
+        })
     }
 
     /// `Sent|Suspect -> Decoded`. Returns false when the frame is unknown or
@@ -192,7 +225,7 @@ impl FrameTable {
     /// Suspect frames older than `before` (by seq) become dead: the chain has
     /// moved past them.
     pub(crate) fn supersede_suspects(&mut self, before: u32) {
-        for f in self.ring.iter_mut().flatten() {
+        for f in self.ring.iter_mut().flatten().chain(self.idr.as_mut()) {
             if seq_lt(f.seq, before) && f.state == FrameState::Suspect {
                 f.state = FrameState::Dead;
             }
@@ -203,8 +236,12 @@ impl FrameTable {
     /// many changed. One scan per frame decision.
     pub(crate) fn suspect_overdue(&mut self, now: Instant, deadline: std::time::Duration) -> u32 {
         let mut n = 0;
-        for f in self.ring.iter_mut().flatten() {
-            if f.state == FrameState::Sent && now.saturating_duration_since(f.sent_at) > deadline {
+        for f in self.ring.iter_mut().flatten().chain(self.idr.as_mut()) {
+            // An IDR still being delivered has no decode deadline yet.
+            if f.state == FrameState::Sent
+                && (f.kind != PicKind::Idr || f.complete())
+                && now.saturating_duration_since(f.sent_at) > deadline
+            {
                 f.state = FrameState::Suspect;
                 n += 1;
             }
@@ -278,6 +315,20 @@ mod tests {
         t.set_dead(2);
         assert!(!t.usable(3));
         assert!(!t.set_decoded(2), "dead is a fact");
+    }
+
+    #[test]
+    fn the_idr_record_survives_the_ring_wrapping_over_its_slot() {
+        let now = Instant::now();
+        let mut t = FrameTable::default();
+        let mut idr = rec(7, None, now);
+        idr.kind = PicKind::Idr;
+        t.insert(idr);
+        t.insert(rec(7 + 256, None, now));
+        assert!(t.get(7).is_some_and(|f| f.kind == PicKind::Idr));
+        assert!(t.get(7 + 256).is_some());
+        assert!(t.set_decoded(7));
+        assert_eq!(t.state(7), Some(FrameState::Decoded));
     }
 
     #[test]

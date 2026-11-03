@@ -96,6 +96,27 @@ impl FramePlan {
     }
 }
 
+/// The answer to [`RefManager::plan_next`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Plan {
+    Frame(FramePlan),
+    /// Nothing to send yet: the epoch's IDR is still being delivered (design
+    /// 5.4: no P frame until every IDR fragment is transport-acked). The
+    /// caller skips the frame, as the Phase A hold does. Call again at the
+    /// next frame; the manager re-sends the IDR itself if delivery stalls.
+    Hold,
+}
+
+#[cfg(test)]
+impl Plan {
+    pub(crate) fn frame(self) -> FramePlan {
+        match self {
+            Self::Frame(p) => p,
+            Self::Hold => panic!("held"),
+        }
+    }
+}
+
 /// A confirmed anchor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Anchor {
@@ -239,6 +260,12 @@ pub(crate) struct RefManager {
     sent_count: u64,
     mismatch_run: u32,
     unknown_hw: Option<u32>,
+    /// The last time the IDR's delivery progressed (sent, or a fragment
+    /// acknowledged).
+    idr_progress_at: Option<Instant>,
+    /// IDRs re-sent for the same request without an anchor in between; each
+    /// doubles the time allowed (capped), so a slow link converges.
+    idr_backoff: u32,
     stats: RefStats,
 }
 
@@ -265,6 +292,8 @@ impl RefManager {
             sent_count: 0,
             mismatch_run: 0,
             unknown_hw: None,
+            idr_progress_at: None,
+            idr_backoff: 0,
             stats: RefStats::default(),
         };
         m.begin_epoch(IdrCause::SessionStart);
@@ -367,16 +396,19 @@ impl RefManager {
     }
 
     pub(crate) fn session_reset(&mut self) {
+        self.idr_backoff = 0;
         self.begin_epoch(IdrCause::SessionStart);
     }
 
     pub(crate) fn resolution_change(&mut self) {
+        self.idr_backoff = 0;
         self.begin_epoch(IdrCause::ResolutionChange);
     }
 
     /// A reset request from the client (0x09). `Resolution` is a resolution
     /// change; the others are a client reset. Rate limiting is the caller's.
     pub(crate) fn client_reset(&mut self, reason: ResetReason) {
+        self.idr_backoff = 0;
         self.begin_epoch(match reason {
             ResetReason::Resolution => IdrCause::ResolutionChange,
             ResetReason::DecoderFailure | ResetReason::NoDecoder | ResetReason::GateReset => {
@@ -412,12 +444,28 @@ impl RefManager {
         self.stats.deadline_suspects += u64::from(n);
     }
 
-    pub(crate) fn frag_acked(&mut self, seq: u32, frag_idx: u16) -> FragAck {
-        self.table.frag_acked(seq, frag_idx)
+    /// A transport ack for one fragment of a frame. Progress on the IDR keeps
+    /// it from being given up on; when its last fragment is acked the decode
+    /// deadline starts (a slow link spends longer than a deadline just
+    /// delivering a large IDR).
+    pub(crate) fn frag_acked(&mut self, seq: u32, frag_idx: u16, now: Instant) -> FragAck {
+        let r = self.table.frag_acked(seq, frag_idx);
+        if let (FragAck::Acked { complete }, true) = (r, Some(seq) == self.idr_seq) {
+            self.idr_progress_at = Some(now);
+            if complete {
+                self.table.restart_clock(seq, now);
+            }
+        }
+        r
     }
 
     /// A ledger verdict on any fragment of the frame.
     pub(crate) fn frame_suspect(&mut self, seq: u32) {
+        // An IDR still being delivered is not lost yet: the loss path
+        // retransmits its fragments.
+        if self.table.idr_incomplete(seq) {
+            return;
+        }
         self.table.set_suspect(seq);
     }
 
@@ -442,6 +490,7 @@ impl RefManager {
         if s.occupant == Some(seq) {
             if !s.confirmed {
                 s.confirmed = true;
+                self.idr_backoff = 0;
                 self.slot_confirmed_once[k] = true;
                 self.stats.anchors_confirmed += 1;
             }
@@ -499,6 +548,22 @@ impl RefManager {
 
     fn candidate_timeout(&self) -> Duration {
         (self.srtt * 4).max(Duration::from_millis(250))
+    }
+
+    /// How long the IDR may go without progress, or without a decoded bit
+    /// after it is delivered, before it is sent again: three decode
+    /// deadlines, doubled per earlier re-send (up to four times).
+    fn idr_timeout(&self) -> Duration {
+        self.candidate_timeout() * 3 * (1 << self.idr_backoff.min(2))
+    }
+
+    fn reissue_idr(&mut self, frame_seq: u32) -> FramePlan {
+        // The same IDR again: not a new cause.
+        self.stats.idr_reissued += 1;
+        let cause = self.idr_cause;
+        self.idr_backoff += 1;
+        self.begin_epoch(cause);
+        self.idr_plan(frame_seq, cause)
     }
 
     fn a_min(&self) -> u64 {
@@ -650,8 +715,9 @@ impl RefManager {
             None => true,
             Some(f) => match f.state {
                 FrameState::Dead => true,
+                // `sent_at` restarted when the last fragment was acked.
                 FrameState::Suspect => {
-                    now.saturating_duration_since(f.sent_at) > self.candidate_timeout() * 3
+                    now.saturating_duration_since(f.sent_at) > self.idr_timeout()
                 }
                 FrameState::Sent | FrameState::Decoded => false,
             },
@@ -667,13 +733,7 @@ impl RefManager {
                     None,
                 )
             }
-            _ => {
-                // The same IDR again: not a new cause.
-                self.stats.idr_reissued += 1;
-                let cause = self.idr_cause;
-                self.begin_epoch(cause);
-                self.idr_plan(frame_seq, cause)
-            }
+            _ => self.reissue_idr(frame_seq),
         }
     }
 
@@ -681,11 +741,24 @@ impl RefManager {
     /// effect only when [`frame_sent`](Self::frame_sent) or
     /// [`frame_dropped`](Self::frame_dropped) is called with it. (The chain
     /// state, derived from events, is refreshed here.)
-    pub(crate) fn plan_next(&mut self, frame_seq: u32, now: Instant) -> FramePlan {
+    pub(crate) fn plan_next(&mut self, frame_seq: u32, now: Instant) -> Plan {
         if let Some(cause) = self.pending_idr {
-            return self.idr_plan(frame_seq, cause);
+            return Plan::Frame(self.idr_plan(frame_seq, cause));
         }
+        // No P frame until every IDR fragment is acknowledged (design 5.4):
+        // the client window would evict an unfinished IDR. Delivery that makes
+        // no progress for a timeout is sent again.
+        if self.idr_seq.is_some_and(|i| self.table.idr_incomplete(i)) {
+            let since = self.idr_progress_at.unwrap_or(now);
+            if now.saturating_duration_since(since) <= self.idr_timeout() {
+                return Plan::Hold;
+            }
+            return Plan::Frame(self.reissue_idr(frame_seq));
+        }
+        Plan::Frame(self.plan_p(frame_seq, now))
+    }
 
+    fn plan_p(&mut self, frame_seq: u32, now: Instant) -> FramePlan {
         // Leave recovery once the newest re-root is decoded: it is then the
         // newest reference frame sent, which is what `prev` must be. Leaving
         // for an older decoded re-root while a newer one is outstanding (or
@@ -846,6 +919,7 @@ impl RefManager {
             self.slots[1] = Slot::EMPTY;
             self.slot_confirmed_once = [false; LT_SLOTS];
             self.idr_seq = Some(seq);
+            self.idr_progress_at = Some(now);
             self.prev = usable.then_some(seq);
             self.chain = Chain::Healthy;
             self.pending_idr = None;
