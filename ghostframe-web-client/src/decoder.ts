@@ -10,6 +10,28 @@ export const H264_DECODED = 0;
 export const H264_NOT_OUTPUT = 1;
 export const H264_DECODE_ERROR = 2;
 
+/**
+ * The WebCodecs codec string (`avc1.PPCCLL`) of an Annex-B access unit, read
+ * from its SPS: profile_idc, the constraint flags and level_idc. The encoder
+ * decides these (the libva-direct one writes High at level 4.2 or above by
+ * frame size and rate, the ffmpeg ones Main or Baseline), and a hardware
+ * decoder configured with a different profile may refuse the stream, so the
+ * decoder is configured from the stream, not from a constant. `null` when the
+ * unit carries no SPS (a delta frame).
+ */
+export function codecStringFromSps(au: Uint8Array): string | null {
+  for (let i = 0; i + 6 < au.length; i++) {
+    if (au[i] === 0 && au[i + 1] === 0 && au[i + 2] === 1 && (au[i + 3] & 0x1f) === 7) {
+      const hex = (b: number) => b.toString(16).padStart(2, '0');
+      return `avc1.${hex(au[i + 4])}${hex(au[i + 5])}${hex(au[i + 6])}`;
+    }
+  }
+  return null;
+}
+
+/** What a decoder is configured with before the first SPS says better. */
+const DEFAULT_CODEC = 'avc1.64002a';
+
 export class FullFrameDecoder {
   private decoder!: VideoDecoder;
   private latestFrame: VideoFrame | null = null;
@@ -31,6 +53,17 @@ export class FullFrameDecoder {
    * decode order, so one that never came out never will.
    */
   private pending: number[] = [];
+  /** The codec string the decoder is configured with. */
+  private codec = DEFAULT_CODEC;
+  /**
+   * The string in force before the SPS-derived one, to go back to once if the
+   * browser refuses the derived string (a configure() that throws, or an
+   * error before any picture came out). `null` once spent or when there is
+   * nothing to go back to.
+   */
+  private fallbackCodec: string | null = null;
+  /** A derived string the browser refused: not tried again. */
+  private refusedCodec: string | null = null;
 
   constructor(
     /** `frameSeq` is the value given to `decode()` for the chunk this frame came from. */
@@ -63,6 +96,7 @@ export class FullFrameDecoder {
         this.latestFrame = frame;
         // The chunk's timestamp carries its frame_seq through the decoder, so
         // the association survives a chunk that was rejected or dropped.
+        this.fallbackCodec = null; // the configured string works
         this.onFrame(frame, frame.timestamp);
         this.answer(frame.timestamp);
       },
@@ -70,6 +104,13 @@ export class FullFrameDecoder {
         console.error('Full-frame H264 decode error:', e.message);
         if (this.decoder === decoder) {
           this.awaitingKeyframe = true;
+          // A string derived from the SPS that the browser would not decode:
+          // the rebuild on the next key chunk uses the one before it, once.
+          if (this.fallbackCodec !== null) {
+            this.refusedCodec = this.codec;
+            this.codec = this.fallbackCodec;
+            this.fallbackCodec = null;
+          }
           // Everything in flight before the chunk that failed produced
           // nothing; the failed chunk itself is the failure.
           this.answerAll(H264_NOT_OUTPUT, this.lastFrameSeq);
@@ -78,8 +119,12 @@ export class FullFrameDecoder {
       },
     });
     this.decoder = decoder;
+    this.configure();
+  }
+
+  private configure(): void {
     this.decoder.configure({
-      codec: 'avc1.42001e',
+      codec: this.codec,
       codedWidth: this.width,
       codedHeight: this.height,
       optimizeForLatency: true,
@@ -120,6 +165,26 @@ export class FullFrameDecoder {
       this.answerAll(H264_NOT_OUTPUT);
       this.awaitingKeyframe = false;
       this.open();
+    }
+    if (isKeyframe) {
+      // The IDR says what the stream is. A decoder already configured for it
+      // is left alone; a key chunk is the place to change, since a configure()
+      // makes the next chunk decoded start from a key chunk anyway.
+      const codec = codecStringFromSps(nalData);
+      if (codec !== null && codec !== this.codec && codec !== this.refusedCodec) {
+        const before = this.codec;
+        this.codec = codec;
+        try {
+          this.configure();
+          this.fallbackCodec = before;
+        } catch (e) {
+          // Not a string the browser can configure: stay as we were.
+          console.warn('H264 codec string', codec, 'refused; keeping', before, e);
+          this.refusedCodec = codec;
+          this.codec = before;
+          this.configure();
+        }
+      }
     }
     this.lastFrameSeq = frameSeq;
     const chunk = new EncodedVideoChunk({
