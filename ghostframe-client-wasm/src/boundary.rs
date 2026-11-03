@@ -53,6 +53,9 @@ pub enum WasmEvent {
         flags: u8,
         /// Long-term slot indices (bits 0-1 mark, bits 2-3 target).
         slots: u8,
+        /// The decoder must be reset before this access unit: it is an IDR,
+        /// or the gate was reset since the last frame it fed.
+        reset_decoder: bool,
         #[serde(with = "serde_bytes")]
         payload: Vec<u8>,
     },
@@ -261,6 +264,7 @@ impl From<Event> for WasmEvent {
                 ref_frame_seq,
                 flags,
                 slots,
+                reset_decoder,
                 payload,
             } => WasmEvent::NeedsH264 {
                 frame_seq,
@@ -269,6 +273,7 @@ impl From<Event> for WasmEvent {
                 ref_frame_seq,
                 flags,
                 slots,
+                reset_decoder,
                 payload,
             },
             Event::DecodeError {

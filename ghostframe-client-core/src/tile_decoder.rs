@@ -1152,6 +1152,7 @@ mod tests {
                 ref_frame_seq: 0,
                 flags: 0,
                 slots: 0,
+                reset_decoder: false,
                 payload: vec![],
             },
             Event::DecodeError {

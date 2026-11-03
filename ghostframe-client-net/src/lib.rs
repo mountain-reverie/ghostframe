@@ -658,6 +658,32 @@ impl ClientNet {
         self.drain_connection_events(now_us);
     }
 
+    /// Report what the decoder did with an H.264 access unit; see
+    /// `ClientCore::h264_result`. The frame ack (0x0A) and any IDR request
+    /// it implies go out now.
+    pub fn h264_result(
+        &mut self,
+        frame_seq: u32,
+        outcome: ghostframe_client_core::H264Outcome,
+        now_us: u64,
+    ) {
+        self.core.h264_result(frame_seq, outcome, now_us);
+        // Logged once per run, as it crosses the threshold: a decoder that
+        // delays its output answers every frame not-output while the stream
+        // plays, and every frame is then reported refused.
+        let (total, streak) = self.core.h264_not_output_stats();
+        if streak == NOT_OUTPUT_WARN_STREAK {
+            tracing::warn!(
+                frame_seq,
+                total,
+                streak,
+                "the decoder has returned no picture for {NOT_OUTPUT_WARN_STREAK} access \
+                 units in a row: output delay? every one is reported refused in the frame ack"
+            );
+        }
+        self.drain_connection_events(now_us);
+    }
+
     /// Tell the server this client wants `width`x`height`.
     ///
     /// Unlike [`Self::send_input`], the encoded message is not pushed onto
@@ -672,6 +698,9 @@ impl ClientNet {
         self.drain_connection_events(now_us);
     }
 }
+
+/// Consecutive not-output frames after which `ClientNet::h264_result` warns.
+const NOT_OUTPUT_WARN_STREAK: u64 = 30;
 
 /// A quinn deadline as microseconds since `base`, rounded **up**.
 ///

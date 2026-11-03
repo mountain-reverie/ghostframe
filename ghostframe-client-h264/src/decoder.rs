@@ -40,6 +40,14 @@ impl HwFrame {
         self.frame
     }
 
+    /// The pts of the access unit this picture came from, as given to
+    /// [`H264Decoder::decode_pts`]; `None` if it carried none.
+    pub fn pts(&self) -> Option<i64> {
+        // SAFETY: `frame` is non-null and live for `self`'s lifetime.
+        let pts = unsafe { (*self.frame).pts };
+        (pts != ffi::AV_NOPTS_VALUE).then_some(pts)
+    }
+
     /// Download this surface to system memory as tightly packed NV12.
     ///
     /// The fallback when the dmabuf cannot be imported (tiled modifier,
@@ -447,7 +455,15 @@ impl H264Decoder {
     /// with nothing to tell the caller it happened. See
     /// [`Self::submit_with_retry`] for the shared mechanics.
     pub fn decode(&mut self, au: &[u8]) -> Result<Vec<HwFrame>, H264Error> {
-        self.submit_with_retry(Some(au))
+        self.submit_with_retry(Some(au), ffi::AV_NOPTS_VALUE)
+    }
+
+    /// [`Self::decode`] with a pts on the access unit, which comes back on
+    /// the picture it produces ([`HwFrame::pts`]). The client uses the
+    /// frame's `frame_seq`: a picture whose pts matches, returned by the same
+    /// call, is what "decoded" means to the frame ack.
+    pub fn decode_pts(&mut self, au: &[u8], pts: i64) -> Result<Vec<HwFrame>, H264Error> {
+        self.submit_with_retry(Some(au), pts)
     }
 
     /// Accepted for API parity with the GStreamer backend and never called:
@@ -474,7 +490,7 @@ impl H264Decoder {
     /// EOF signal is sent -- is drained and retried exactly like a normal
     /// access unit, rather than reported as a hard failure.
     pub fn finish(&mut self) -> Result<Vec<HwFrame>, H264Error> {
-        self.submit_with_retry(None)
+        self.submit_with_retry(None, ffi::AV_NOPTS_VALUE)
     }
 
     /// Send one packet to the decoder, or (`None`) the end-of-stream signal.
@@ -497,7 +513,7 @@ impl H264Decoder {
     /// silently swallow the access unit and return an empty `Ok` instead of
     /// the error `77cc743` exists to guarantee.
     /// See `decode_after_finish_without_reset_is_an_error`.
-    fn submit(&mut self, au: Option<&[u8]>) -> Result<bool, H264Error> {
+    fn submit(&mut self, au: Option<&[u8]>, pts: i64) -> Result<bool, H264Error> {
         let ret = match au {
             Some(au) => {
                 // SAFETY: `au` outlives the call, which copies what it needs
@@ -507,9 +523,11 @@ impl H264Decoder {
                 unsafe {
                     (*self.packet).data = au.as_ptr() as *mut u8;
                     (*self.packet).size = au.len() as i32;
+                    (*self.packet).pts = pts;
                     let ret = ffi::avcodec_send_packet(self.ctx, self.packet);
                     (*self.packet).data = ptr::null_mut();
                     (*self.packet).size = 0;
+                    (*self.packet).pts = ffi::AV_NOPTS_VALUE;
                     ret
                 }
             }
@@ -547,12 +565,16 @@ impl H264Decoder {
     /// -- including the final drain below, after a successful submit --
     /// since `Result` can carry the error or the frames but not both, so
     /// they're logged instead of vanishing without a trace.
-    fn submit_with_retry(&mut self, au: Option<&[u8]>) -> Result<Vec<HwFrame>, H264Error> {
-        let mut out = match self.submit(au) {
+    fn submit_with_retry(
+        &mut self,
+        au: Option<&[u8]>,
+        pts: i64,
+    ) -> Result<Vec<HwFrame>, H264Error> {
+        let mut out = match self.submit(au, pts) {
             Ok(true) => Vec::new(),
             Ok(false) => {
                 let out = self.drain()?;
-                match self.submit(au) {
+                match self.submit(au, pts) {
                     Ok(true) => out,
                     Ok(false) => {
                         warn_dropped(&out, "the decoder was still full after drain-and-retry");
