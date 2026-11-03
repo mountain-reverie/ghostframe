@@ -1,4 +1,4 @@
-//! A tiny software H.264 writer for the T2 oracle: real, decodable CAVLC
+//! A tiny software H.264 writer for the T2 oracle and the browserless harness: real, decodable CAVLC
 //! streams with no encoder and no GPU.
 //!
 //! Every picture is a 8x8 grid of macroblocks. An IDR is all I_PCM. A P
@@ -37,7 +37,7 @@ pub(crate) fn pcm_params() -> StreamParams {
 }
 
 /// Which macroblock a picture's marker lives in.
-pub(crate) fn marker_cell(frame_seq: u32) -> usize {
+pub fn marker_cell(frame_seq: u32) -> usize {
     frame_seq as usize % CELLS
 }
 
@@ -175,12 +175,12 @@ pub(crate) fn access_unit(p: &StreamParams, h: &SliceHeader, frame_seq: u16) -> 
 /// The analytic picture: for each macroblock, the `frame_seq` whose marker it
 /// shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Picture {
+pub struct Picture {
     pub cells: [u16; CELLS],
 }
 
 impl Picture {
-    pub(crate) fn idr(frame_seq: u16) -> Self {
+    pub fn idr(frame_seq: u16) -> Self {
         Self {
             cells: [frame_seq; CELLS],
         }
@@ -188,14 +188,14 @@ impl Picture {
 
     /// The picture a P frame decodes to: `reference` with the marker cell
     /// repainted.
-    pub(crate) fn predicted(reference: &Picture, frame_seq: u16) -> Self {
+    pub fn predicted(reference: &Picture, frame_seq: u16) -> Self {
         let mut p = reference.clone();
         p.cells[marker_cell(u32::from(frame_seq))] = frame_seq;
         p
     }
 
     /// The I420 frame a decoder returns for this picture.
-    pub(crate) fn render(&self) -> Vec<u8> {
+    pub fn render(&self) -> Vec<u8> {
         let mut out = vec![0u8; FRAME_BYTES];
         let (luma, chroma) = out.split_at_mut(WIDTH * HEIGHT);
         let (cb, cr) = chroma.split_at_mut(chroma.len() / 2);
@@ -217,7 +217,7 @@ impl Picture {
 
     /// Read the markers back from a decoded I420 frame. `None` when a
     /// macroblock is not a marker (its samples disagree with themselves).
-    pub(crate) fn read(yuv: &[u8]) -> Option<Self> {
+    pub fn read(yuv: &[u8]) -> Option<Self> {
         if yuv.len() != FRAME_BYTES {
             return None;
         }

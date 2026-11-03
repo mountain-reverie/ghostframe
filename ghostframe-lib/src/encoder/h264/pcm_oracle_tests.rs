@@ -13,88 +13,39 @@
 //! Frames the network lost or the gate refused are never fed: the decoder sees
 //! the `frame_num` gaps and POC jumps the real client would.
 
-extern crate ffmpeg_next as ffmpeg;
-
 use std::collections::BTreeMap;
 
-use ffmpeg::codec::{self, decoder};
-use ffmpeg_sys_next as ffi;
 use proptest::prelude::*;
 
-use super::pcm_writer::{
-    access_unit, parameter_sets, pcm_params, Picture, FRAME_BYTES, HEIGHT, WIDTH,
-};
+use super::pcm_decoder::{PcmDecoder, Strictness};
+use super::pcm_writer::{access_unit, parameter_sets, pcm_params, Picture, HEIGHT, WIDTH};
 use super::refs::RefTarget;
 use super::refs_tests::{arb_script, run_sim, script_from, Fate, Logged, Script, Sim, STEP};
 use super::syntax::{DecoderModel, GapMode, Mmco, RefPic, Rplm, SliceHeader};
 use super::tracker::PicKind;
 
 /// libavcodec as the oracle: software H.264, strict, no output delay allowed.
-struct Decoder(decoder::Video);
+struct Decoder(PcmDecoder);
 
 impl Decoder {
     fn new() -> Self {
-        ffmpeg::init().expect("ffmpeg init");
-        let codec = decoder::find(codec::Id::H264).expect("libavcodec has an H.264 decoder");
-        let mut ctx = codec::Context::new_with_codec(codec);
-        ctx.set_flags(codec::Flags::LOW_DELAY);
-        // SAFETY: the context is not opened yet and owned here.
-        unsafe {
-            (*ctx.as_mut_ptr()).err_recognition = ffi::AV_EF_EXPLODE
-                | ffi::AV_EF_CAREFUL
-                | ffi::AV_EF_COMPLIANT
-                | ffi::AV_EF_BITSTREAM;
-            (*ctx.as_mut_ptr()).thread_count = 1;
-        }
-        let video = ctx
-            .decoder()
-            .open_as(codec)
-            .and_then(|o| o.video())
-            .expect("open the H.264 decoder");
-        Self(video)
+        Self(PcmDecoder::new(Strictness::Strict))
     }
 
     /// Feed one access unit; the picture must come back from this very call
     /// with the same pts (design 3.5: zero output delay).
     fn feed(&mut self, au: &[u8], pts: i64) -> Result<Vec<u8>, String> {
-        let mut pkt = ffmpeg::Packet::copy(au);
-        pkt.set_pts(Some(pts));
-        pkt.set_dts(Some(pts));
-        self.0
-            .send_packet(&pkt)
-            .map_err(|e| format!("decoder rejected the access unit: {e}"))?;
-        let mut f = ffmpeg::frame::Video::empty();
-        self.0
-            .receive_frame(&mut f)
-            .map_err(|e| format!("no picture came out of the call that fed it: {e}"))?;
-        // SAFETY: `f` holds a decoded frame; the field is plain data.
-        let flags = unsafe { (*f.as_ptr()).decode_error_flags };
-        if flags != 0 || f.flags().contains(ffmpeg::frame::Flags::CORRUPT) {
-            return Err(format!(
-                "picture {pts} is flagged damaged (decode_error_flags {flags:#x})"
-            ));
+        let d = self.0.feed(au, pts).map_err(|e| e.to_string())?;
+        if d.damaged {
+            return Err(format!("picture {pts} is flagged damaged"));
         }
-        if f.pts() != Some(pts) {
-            return Err(format!("picture pts {:?}, fed {pts}", f.pts()));
+        if d.pts != Some(pts) {
+            return Err(format!("picture pts {:?}, fed {pts}", d.pts));
         }
-        if (f.width() as usize, f.height() as usize) != (WIDTH, HEIGHT) {
-            return Err(format!("picture is {}x{}", f.width(), f.height()));
+        if (d.width, d.height) != (WIDTH, HEIGHT) {
+            return Err(format!("picture is {}x{}", d.width, d.height));
         }
-        let mut out = Vec::with_capacity(FRAME_BYTES);
-        for (plane, (w, h)) in [
-            (WIDTH, HEIGHT),
-            (WIDTH / 2, HEIGHT / 2),
-            (WIDTH / 2, HEIGHT / 2),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let (data, stride) = (f.data(plane), f.stride(plane));
-            for y in 0..h {
-                out.extend_from_slice(&data[y * stride..y * stride + w]);
-            }
-        }
-        Ok(out)
+        Ok(d.yuv)
     }
 }
 
