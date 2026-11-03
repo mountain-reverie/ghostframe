@@ -772,6 +772,12 @@ impl ReliableTileEmitter {
         self.stats.h264_cache_dropped += self.h264.drop_from(frame_seq) as u64;
     }
 
+    /// One frame was found suspect: forget its cached fragments (a later frame
+    /// may still be decodable, so the others stay).
+    pub fn drop_h264_frame(&mut self, frame_seq: u32) {
+        self.stats.h264_cache_dropped += self.h264.drop_frame(frame_seq) as u64;
+    }
+
     /// Keep the probe cache to its newest [`H264_CACHE_FRAMES`] frames.
     ///
     /// The bound is a fixed 64 frames for now. It should follow the design's

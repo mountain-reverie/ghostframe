@@ -533,14 +533,14 @@ async fn the_ref_manager_source_recovers_from_a_real_loss_not_a_transport_comple
         let ctx = format!("refm-loss {seed:#x}");
         let run = r.h264_run().unwrap();
         let c = o.refs;
-        println!("   {c:?} acks={}", run.truth.frame_acks);
+        println!("   {c:?} acks={}", run.truth.refs.frame_acks_applied);
         // Premise: frames were really lost (not repaired by parity), the loss
         // path judged P fragments lost, and the client's acks reached the
         // manager.
         assert!(r.s2c_datagrams_dropped > 0, "{ctx}");
         assert!(r.h264.stats.verdicts_p_frag > 0, "{ctx}");
         assert!(o.never_fed > 0, "{ctx}: no frame was lost for good");
-        assert!(run.truth.frame_acks > 0, "{ctx}");
+        assert!(run.truth.refs.frame_acks_applied > 0, "{ctx}");
         assert_eq!(o.unknown_to_truth, 0, "{ctx}");
         assert_eq!(o.header_ref_mismatches, 0, "{ctx}");
         assert!(o.wrong.is_empty(), "{ctx}: {}", o.wrong_list(8));
@@ -561,17 +561,16 @@ async fn the_ref_manager_source_recovers_from_a_real_loss_not_a_transport_comple
         // manager's recoveries all land (the last may be in flight).
         assert_eq!(o.correct, o.fed, "{ctx}");
         assert_eq!((o.rejected, o.no_picture, o.damaged), (0, 0, 0), "{ctx}");
-        // A freeze here is a gap over four frame periods; the longest across
-        // 16 seeds was 189 ms (the legacy client froze for about 9 s). The
-        // frame ack rides the next ack batch, so a recovery waits up to a frame
-        // longer than with an ack of its own.
+        // A freeze here is a gap over four frame periods. The stream carries no
+        // parity now (an acked-reference stream repairs from its anchor), so
+        // every lost frame is a recovery, not a repair: bounded, not rare.
         assert!(
-            o.frozen_us < 200_000 && o.freezes <= 4,
+            o.frozen_us < 600_000 && o.freezes <= 16,
             "{ctx}: {} freezes, {} us",
             o.freezes,
             o.frozen_us
         );
-        assert!(o.max_gap_us < 300_000, "{ctx}: gap {} us", o.max_gap_us);
+        assert!(o.max_gap_us < 400_000, "{ctx}: gap {} us", o.max_gap_us);
         assert!(c.recovered + 1 >= c.recoveries, "{ctx}: {c:?}");
         assert!(
             o.last_correct_us.unwrap_or(0) + 1_000_000 >= 10_000_000,

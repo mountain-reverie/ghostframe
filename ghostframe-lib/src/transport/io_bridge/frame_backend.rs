@@ -41,6 +41,12 @@ use crate::capture::dmabuf::ReadbackFrame;
 use crate::capture::gpu_pipeline::{
     FrameAnalysis, FramePaletteEntryRaw, GpuFrameProcessor, TileAnalysis, UnchangedRefused,
 };
+use crate::encoder::h264::backend::{
+    BackendError, EncodedAu, H264Backend, Nv12View, RateTarget, StreamConfig,
+};
+use crate::encoder::h264::refs::{FramePlan, ResidentRef};
+use crate::encoder::h264::tracker::PicKind;
+use crate::encoder::h264::vaapi_direct::VaapiDirect;
 use crate::encoder::h264_vaapi::{FullFrameEncoder, RateParams};
 use crate::server::FrameSubmission;
 
@@ -189,6 +195,36 @@ pub struct H264Out {
     pub is_keyframe: bool,
 }
 
+/// A frame planned by the `RefManager` for a backend that executes plans
+/// (design 4.1). Opaque outside the crate.
+pub struct H264Request {
+    pub(crate) plan: FramePlan,
+    /// The encoder-side DPB before this frame: the backend lists all of it.
+    pub(crate) refs: Vec<ResidentRef>,
+    /// Frame rate and rate target the stream is opened with.
+    pub(crate) fps: u32,
+    pub(crate) bps: u32,
+}
+
+/// An access unit a plan-executing backend made, with what it parsed from it.
+pub struct CodedAu(pub(crate) EncodedAu);
+
+/// What [`FrameBackend::finish_h264_planned`] came back with.
+pub enum H264Reply {
+    /// The plan was executed.
+    Coded(CodedAu),
+    /// The backend does not execute plans (no libva-direct here, or it refused
+    /// this stream). Nothing was encoded for this frame; the caller returns
+    /// to the Phase A policy, which this backend serves through
+    /// [`FrameBackend::finish_h264`].
+    Unplanned,
+    /// Nothing was encoded: the frame's GPU outputs were gone.
+    Nothing,
+    /// The backend failed (or could not follow the plan). It is dropped and
+    /// reopens on the next IDR plan.
+    Failed,
+}
+
 /// The `fallback` tiles the GPU's own CDF 5/3 compact list does not already
 /// cover. `in_compact_list` holds the flat indices of that list.
 pub(super) fn fallback_not_in_compact_list(
@@ -245,6 +281,14 @@ pub trait FrameBackend: Send {
     /// is nothing to send (encoder unavailable, failed, or buffering).
     fn finish_h264(&mut self, frame: &FrameSubmission, force_keyframe: bool) -> Option<H264Out>;
 
+    /// H.264 arm for a session that recovers by acked references: execute the
+    /// `RefManager`'s plan. A backend without plan support answers
+    /// [`H264Reply::Unplanned`] and the caller falls back to `finish_h264`.
+    fn finish_h264_planned(&mut self, frame: &FrameSubmission, req: &H264Request) -> H264Reply {
+        let _ = (frame, req);
+        H264Reply::Unplanned
+    }
+
     /// Tile arm.
     fn finish_tile(&mut self, frame: &FrameSubmission, req: &TileRequest<'_>) -> TileOut;
 
@@ -260,11 +304,24 @@ pub trait FrameBackend: Send {
     fn forward_cdf53_tiles(&mut self, tiles: &[&[u8]]) -> Result<Vec<i16>, String>;
 }
 
+/// The plan-executing backend of acked-reference sessions: libva-direct, when
+/// the machine has it. `select_backend` with no fallback: the Phase A encoder
+/// is `GpuBackend`'s own `FullFrameEncoder`, reached through
+/// [`FrameBackend::finish_h264`], so a stream it carries never sees a plan.
+fn open_direct(cfg: &StreamConfig) -> Result<Box<dyn H264Backend>, BackendError> {
+    let mut b = VaapiDirect::new();
+    b.open(cfg)?;
+    Ok(Box::new(b))
+}
+
 /// The production backend: a Vulkan `GpuFrameProcessor` and, lazily, a
 /// VA-API (or software) `FullFrameEncoder`.
 pub struct GpuBackend {
     processor: GpuFrameProcessor,
     encoder: Option<FullFrameEncoder>,
+    /// The plan-executing backend of an acked-reference session, and the
+    /// frame size it was opened for. `None` until the first planned frame.
+    direct: Option<(Box<dyn H264Backend>, (u32, u32))>,
     /// The rate and GOP the encoder opens with, as the loop last set them.
     rate: RateParams,
     /// The GPU outputs of the frame in flight, between `analyse` and `finish_*`.
@@ -276,6 +333,7 @@ impl GpuBackend {
         Self {
             processor,
             encoder: None,
+            direct: None,
             rate: RateParams::default(),
             held: None,
         }
@@ -315,6 +373,9 @@ impl FrameBackend for GpuBackend {
             }
             Control::H264Rate { bps, fps, reopen } => {
                 self.rate = RateParams { bps, fps };
+                if let Some((b, _)) = self.direct.as_mut() {
+                    b.set_rate(RateTarget { bps });
+                }
                 if reopen {
                     // Dropped here, opened by the next `finish_h264` at the new
                     // rate: a fresh encoder's first frame is an IDR.
@@ -382,6 +443,9 @@ impl FrameBackend for GpuBackend {
 
     fn finish_h264(&mut self, frame: &FrameSubmission, force_keyframe: bool) -> Option<H264Out> {
         let analysis = self.held.take()?;
+        // One encoder session at a time: a stream that went back to the Phase A
+        // policy no longer holds the libva-direct one.
+        self.direct = None;
         let needs_init = match &self.encoder {
             Some(enc) => enc.width() != frame.width || enc.height() != frame.height,
             None => true,
@@ -421,6 +485,70 @@ impl FrameBackend for GpuBackend {
             Err(e) => {
                 tracing::warn!(target: LOG_TARGET, "NV12 encode failed: {e}");
                 None
+            }
+        }
+    }
+
+    fn finish_h264_planned(&mut self, frame: &FrameSubmission, req: &H264Request) -> H264Reply {
+        // The tests of this binary share one GPU: the lock is reentrant on this
+        // (the worker) thread, and no test thread may hold it while waiting for
+        // the worker.
+        #[cfg(test)]
+        let _gpu = crate::gpu_test_lock::lock();
+        let Some(analysis) = self.held.take() else {
+            return H264Reply::Nothing;
+        };
+        // And never two encoder sessions: the Phase A encoder is closed.
+        self.encoder = None;
+        let dims = (analysis.nv12_width, analysis.nv12_height);
+        if self.direct.as_ref().is_none_or(|(_, d)| *d != dims) {
+            // A stream starts, or changes size, on an IDR; anything else
+            // means the loop's plan outlived the backend it was made for.
+            if req.plan.kind != PicKind::Idr {
+                self.direct = None;
+                return H264Reply::Failed;
+            }
+            self.direct = None;
+            let cfg = StreamConfig::new(dims.0, dims.1, req.fps, req.bps);
+            match open_direct(&cfg) {
+                Ok(b) => self.direct = Some((b, dims)),
+                Err(e) => {
+                    tracing::info!(
+                        target: LOG_TARGET,
+                        "acked-reference H.264 unavailable, using the ffmpeg encoder: {e}"
+                    );
+                    return H264Reply::Unplanned;
+                }
+            }
+        }
+        let _ = frame;
+        // SAFETY: the pointer and strides are the GPU stage's, valid until the
+        // next `analyse`, which cannot run before this call returns; the span
+        // is the same one `FullFrameEncoder::encode_nv12_buffer` reads.
+        let data = unsafe {
+            std::slice::from_raw_parts(
+                analysis.nv12_data,
+                analysis.nv12_uv_offset as usize
+                    + analysis.nv12_uv_stride as usize * (dims.1 as usize).div_ceil(2),
+            )
+        };
+        let view = Nv12View {
+            data,
+            width: dims.0,
+            height: dims.1,
+            y_stride: analysis.nv12_y_stride as usize,
+            uv_stride: analysis.nv12_uv_stride as usize,
+            uv_offset: analysis.nv12_uv_offset as usize,
+        };
+        let Some((backend, _)) = self.direct.as_mut() else {
+            return H264Reply::Failed;
+        };
+        match backend.encode(&view, &req.plan, &req.refs) {
+            Ok(au) => H264Reply::Coded(CodedAu(au)),
+            Err(e) => {
+                tracing::warn!(target: LOG_TARGET, "acked-reference H.264 encode failed: {e}");
+                self.direct = None;
+                H264Reply::Failed
             }
         }
     }

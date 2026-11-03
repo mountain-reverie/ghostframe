@@ -486,11 +486,18 @@ impl IoBridge {
         }
         if self.active_probe.is_none() && !is_idr {
             let gop = self.h264.gop;
-            let idr_soon = self.h264.pending_idr.is_some()
-                || self
-                    .h264
-                    .last_idr_at
-                    .is_some_and(|t| now.saturating_duration_since(t) + PAD_IDR_LOOKAHEAD >= gop);
+            // An acked-reference stream has no scheduled IDR to be the burst.
+            let idr_soon = if self.h264_refs_live() {
+                self.h264
+                    .refs
+                    .as_ref()
+                    .is_some_and(|r| r.mgr.pending_idr().is_some())
+            } else {
+                self.h264.pending_idr.is_some()
+                    || self.h264.last_idr_at.is_some_and(|t| {
+                        now.saturating_duration_since(t) + PAD_IDR_LOOKAHEAD >= gop
+                    })
+            };
             if idr_soon {
                 return;
             }

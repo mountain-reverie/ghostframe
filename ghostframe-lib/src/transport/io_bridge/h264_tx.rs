@@ -33,6 +33,7 @@
 
 use super::h264_rate::ScriptedCbr;
 use super::*;
+use crate::encoder::h264::tracker::{FragAck, TRACKER_RING};
 use crate::transport::reliable_emitter::Content;
 use crate::transport::transmission_ledger::Transmission;
 
@@ -68,9 +69,6 @@ pub(super) fn stall_inflight_bound(srtt_us: f32) -> u32 {
     };
     STALL_INFLIGHT_FLOOR.max(frames_per_two_rtt.saturating_add(8))
 }
-
-/// Frames the tracker follows (`frame_seq % TRACKER_RING`, with a check).
-pub(super) const TRACKER_RING: usize = 256;
 
 /// Loss-triggered IDRs are made at most this often.
 pub(super) const LOSS_IDR_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -259,17 +257,22 @@ pub struct H264Report {
     /// server intact.
     pub frame_acks_received: u64,
     pub frame_acks_malformed: u64,
+    /// Acked-reference recovery: the manager's counters and the loop's.
+    pub refs: super::h264_refs::RefsReport,
 }
 
 /// One frame the tracker follows.
-struct TrackedFrame {
+pub(super) struct TrackedFrame {
     frame_seq: u32,
     is_idr: bool,
     frags_total: u16,
     /// One bit per fragment: acknowledged (through any transmission of it).
     acked: Vec<u64>,
     acked_count: u16,
-    suspect: bool,
+    pub(super) suspect: bool,
+    /// The client answered for the frame (a frame ack named it decoded or
+    /// refused): it is not in flight any more, whatever its fragments did.
+    resolved: bool,
     sent_at: std::time::Instant,
 }
 
@@ -283,17 +286,6 @@ impl TrackedFrame {
     fn complete(&self) -> bool {
         self.acked_count == self.frags_total
     }
-}
-
-/// What an acknowledgement did to the tracker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FragAck {
-    /// The frame is not tracked (left the ring, or never sent).
-    Unknown,
-    /// The fragment had been acknowledged already.
-    Duplicate,
-    /// Newly acknowledged; `complete` says it was the frame's last.
-    Acked { complete: bool },
 }
 
 /// Ring of the last [`TRACKER_RING`] frames sent: O(1) per datagram or
@@ -329,6 +321,7 @@ impl FrameTracker {
             acked: vec![0; (frags_total as usize).div_ceil(64)],
             acked_count: 0,
             suspect: false,
+            resolved: false,
             sent_at: now,
         });
     }
@@ -349,6 +342,7 @@ impl FrameTracker {
         for f in self.ring.iter().flatten() {
             if f.frame_seq < floor
                 || f.suspect
+                || f.resolved
                 || f.complete()
                 || doomed_from.is_some_and(|d| f.frame_seq >= d)
             {
@@ -360,13 +354,13 @@ impl FrameTracker {
         (count, oldest)
     }
 
-    fn get(&self, frame_seq: u32) -> Option<&TrackedFrame> {
+    pub(super) fn get(&self, frame_seq: u32) -> Option<&TrackedFrame> {
         self.ring[Self::slot(frame_seq)]
             .as_ref()
             .filter(|f| f.frame_seq == frame_seq)
     }
 
-    fn get_mut(&mut self, frame_seq: u32) -> Option<&mut TrackedFrame> {
+    pub(super) fn get_mut(&mut self, frame_seq: u32) -> Option<&mut TrackedFrame> {
         self.ring[Self::slot(frame_seq)]
             .as_mut()
             .filter(|f| f.frame_seq == frame_seq)
@@ -386,10 +380,11 @@ impl FrameTracker {
         }
     }
 
-    /// Fragments the frame was sent in, if it is still tracked.
-    #[cfg(feature = "browserless-harness")]
-    pub(super) fn frags_total(&self, frame_seq: u32) -> Option<u16> {
-        self.get(frame_seq).map(|f| f.frags_total)
+    /// The client answered for the frame (0x0A).
+    pub(super) fn resolve(&mut self, frame_seq: u32) {
+        if let Some(f) = self.get_mut(frame_seq) {
+            f.resolved = true;
+        }
     }
 
     #[cfg(test)]
@@ -471,9 +466,28 @@ pub(super) struct H264Tx {
     pub(super) last_cut_at: Option<std::time::Instant>,
     /// The harness's scripted CBR encoder, if the scene asked for one.
     pub(super) scripted: Option<super::h264_rate::ScriptedCbr>,
+    /// Acked-reference recovery (Phase B, `h264_refs`): whether it is allowed
+    /// at all, what the backend turned out to be, the live session's manager
+    /// and the loop's counters.
+    pub(super) refs_enabled: bool,
+    pub(super) refs_mode: super::h264_refs::RefsMode,
+    pub(super) refs: Option<super::h264_refs::RefsState>,
+    pub(super) refs_counters: super::h264_refs::RefsCounters,
+    /// Acked-reference sessions: when a frame was last newly decoded (or the
+    /// IDR last progressed), and when a frame was last sent. Frames sent since
+    /// the last decode, for 500 ms, are a stall (a client that only refuses
+    /// never decodes).
+    pub(super) decode_clock: Option<std::time::Instant>,
+    pub(super) last_sent_at: Option<std::time::Instant>,
+    /// The encoder behind the stream, for the `h264 refs` line.
+    pub(super) backend_kind: &'static str,
     /// The harness's PCM-patch source and the log the scene reads (design T3).
     #[cfg(feature = "browserless-harness")]
     pub(super) pcm: Option<crate::encoder::h264::harness::PcmSource>,
+    /// The PCM encoder the acked-reference path runs inline in a scene, in
+    /// place of the encode worker.
+    #[cfg(feature = "browserless-harness")]
+    pub(super) pcm_backend: Option<crate::encoder::h264::harness::PcmBackend>,
     #[cfg(feature = "browserless-harness")]
     pub(super) pcm_log: crate::encoder::h264_harness::PcmLog,
 }
@@ -502,6 +516,11 @@ impl H264Tx {
         self.rate.reset_session();
         self.last_idr_at = None;
         self.pad_template = None;
+        // The next session builds its own manager (and may be a client that
+        // does not send the v2 feedback at all).
+        self.refs = None;
+        self.decode_clock = None;
+        self.last_sent_at = None;
         #[cfg(feature = "browserless-harness")]
         if let Some(p) = self.pcm.as_mut() {
             p.session_reset();
@@ -638,7 +657,7 @@ impl IoBridge {
 
     /// Whether the emission queue holds more H.264 than
     /// `max(one frame period of the admission rate, two gate depths)`.
-    fn h264_backlog_exceeded(&self) -> bool {
+    pub(super) fn h264_backlog_exceeded(&self) -> bool {
         let rate = self.admission_rate().bytes_per_sec;
         let frame_period_s = SCHEDULER_TICK_INTERVAL_US / 1_000_000.0;
         let per_frame = (rate * frame_period_s) as usize;
@@ -651,17 +670,31 @@ impl IoBridge {
 
     /// An H.264 frame is out of the encoder: attribute it. Returns the cause
     /// when it is an IDR.
+    #[cfg(test)]
     pub(super) fn note_h264_encoded(
         &mut self,
         is_keyframe: bool,
         dims: (u32, u32),
+    ) -> Option<IdrCause> {
+        self.note_h264_encoded_as(is_keyframe, dims, None)
+    }
+
+    /// [`Self::note_h264_encoded`] for a frame whose plan named its IDR cause.
+    pub(super) fn note_h264_encoded_as(
+        &mut self,
+        is_keyframe: bool,
+        dims: (u32, u32),
+        planned: Option<IdrCause>,
     ) -> Option<IdrCause> {
         let dims_changed = self.h264.last_dims.is_some_and(|d| d != dims);
         self.h264.last_dims = Some(dims);
         if !is_keyframe {
             return None;
         }
-        let cause = self.h264.pending_idr.take().unwrap_or(if dims_changed {
+        // A plan names its own cause; the Phase A request (made by the session
+        // code, whatever the backend) is spent either way.
+        let pending = self.h264.pending_idr.take();
+        let cause = planned.or(pending).unwrap_or(if dims_changed {
             IdrCause::Resolution
         } else {
             IdrCause::GopPeriodic
@@ -757,18 +790,17 @@ impl IoBridge {
                 }
             }
             self.reliable_emitter.on_h264_ack(frame_seq, frag_idx);
-            #[cfg(feature = "browserless-harness")]
-            if let Some(p) = self.h264.pcm.as_mut() {
-                p.frag_acked(frame_seq, frag_idx, now);
+            // An IDR draining on a slow link is progress, as for Phase A.
+            if self.h264_refs_live() && self.reliable_emitter.h264.is_idr(frame_seq) == Some(true) {
+                self.h264.decode_clock = Some(now);
+            }
+            if let Some(st) = self.h264.refs.as_mut() {
+                st.mgr.frag_acked(frame_seq, frag_idx, now);
             }
             if let FragAck::Acked { complete: true } =
                 self.h264.tracker.on_frag_acked(frame_seq, frag_idx)
             {
                 self.on_h264_frame_acked(frame_seq, now);
-                #[cfg(feature = "browserless-harness")]
-                if let Some(p) = self.h264.pcm.as_mut() {
-                    p.frame_complete(frame_seq);
-                }
             }
         }
     }
@@ -815,20 +847,14 @@ impl IoBridge {
         if in_burst {
             self.h264.stats.p_verdicts_in_probe += 1;
         }
-        // The harness's `RefManager` source owns recovery: the verdict makes
-        // the frame suspect there and the interim loss IDR below is not made.
-        // (B5 deletes the interim path for explicit-reference backends.)
-        #[cfg(feature = "browserless-harness")]
-        if let Some(p) = self
-            .h264
-            .pcm
-            .as_mut()
-            .filter(|p| p.mode() == crate::encoder::h264_harness::PcmMode::RefManager)
-        {
-            p.frame_suspect(frame_seq);
+        // An acked-reference session recovers from its anchor: the verdict
+        // makes the frame suspect and the interim loss IDR below is not made.
+        let already_suspect = f.suspect;
+        if self.h264_refs_live() {
+            self.h264_refs_verdict(frame_seq, now);
             return;
         }
-        if f.suspect {
+        if already_suspect {
             return;
         }
         // A frame an IDR has superseded, or will (one is on its way), is
@@ -878,13 +904,25 @@ impl IoBridge {
         let (in_flight, oldest) = self.h264.tracker.unresolved(floor, self.h264.doomed_from);
         let bound = stall_inflight_bound(self.adaptation_context.smoothed_rtt_us);
         let over_bound = in_flight > bound;
-        let no_progress = oldest.is_some_and(|oldest| {
-            let since = self
-                .h264
-                .last_ack_progress
-                .map_or(oldest, |p| p.max(oldest));
-            now.saturating_duration_since(since) >= STALL_NO_PROGRESS
-        });
+        let no_progress = if self.h264_refs_live() {
+            // Frames were sent since the client last decoded one, and it has
+            // not for 500 ms: a client that refuses everything is stalled
+            // however well the transport delivers.
+            match (self.h264.decode_clock, self.h264.last_sent_at) {
+                (Some(d), Some(sent)) => {
+                    sent > d && now.saturating_duration_since(d) >= STALL_NO_PROGRESS
+                }
+                _ => false,
+            }
+        } else {
+            oldest.is_some_and(|oldest| {
+                let since = self
+                    .h264
+                    .last_ack_progress
+                    .map_or(oldest, |p| p.max(oldest));
+                now.saturating_duration_since(since) >= STALL_NO_PROGRESS
+            })
+        };
         let reset_storm = self.h264.reset_storm_until.is_some_and(|t| now < t);
         let stalled = over_bound || no_progress || reset_storm;
 
@@ -953,6 +991,13 @@ impl IoBridge {
         self.h264.ignore_before = self.h264.ignore_before.max(frame_seq);
         self.supersede_h264_before(frame_seq, now);
         self.end_h264_hold(now);
+        // An IDR that was still being delivered is gone with the purge: the
+        // manager sends it again at the return, not after its timeout.
+        if self.h264_refs_live() {
+            if let Some(st) = self.h264.refs.as_mut() {
+                st.mgr.idr_abandoned();
+            }
+        }
         // The rate side of H.264 lets go here too, in one place: the padding in
         // flight is forgotten and the application's probe cadence starts over
         // (`h264_reset_probing`), the rate policy's estimate restarts (the
@@ -996,10 +1041,17 @@ impl IoBridge {
         };
         let now = now_std();
         #[cfg(feature = "browserless-harness")]
-        self.note_injected_h264_mode();
+        let refs_scene = h.pcm == Some(crate::encoder::h264_harness::PcmMode::RefManager);
+        #[cfg(feature = "browserless-harness")]
+        self.note_injected_h264_mode(refs_scene);
         // The classifier is not in this scripted path; the flag still is.
         self.update_h264_stall(now);
         self.emit_frame_dimensions(seq, timestamp_us, h.width, h.height);
+        #[cfg(feature = "browserless-harness")]
+        if refs_scene {
+            self.apply_injected_pcm_refs(seq, timestamp_us, h, max_dg_size, now);
+            return;
+        }
         if self.h264_frame_gate(now) != H264Gate::Encode {
             // Skipped: the admission pass still runs, as it does for a frame
             // the production gate drops (the loop turns on regardless).
@@ -1007,8 +1059,8 @@ impl IoBridge {
             return;
         }
         #[cfg(feature = "browserless-harness")]
-        if let Some(mode) = h.pcm {
-            self.apply_injected_pcm(seq, timestamp_us, h, mode, max_dg_size, now);
+        if h.pcm.is_some() {
+            self.apply_injected_pcm(seq, timestamp_us, h, max_dg_size);
             return;
         }
         let (is_idr, len) = if let Some(cbr) = h.cbr {
@@ -1069,26 +1121,18 @@ impl IoBridge {
 
     /// The injected stream is in H.264 mode now. Coming back from a stretch of
     /// tile frames the next frame is a re-entry IDR, as on the capture path
-    /// (`finish_h264_arm`); the first H.264 frame of the scene is not one.
+    /// (`finish_h264_arm`), or a recovery P from the anchor on an
+    /// acked-reference stream (`refs_scene`); the first H.264 frame of the
+    /// scene is not one.
     #[cfg(feature = "browserless-harness")]
-    fn note_injected_h264_mode(&mut self) {
+    fn note_injected_h264_mode(&mut self, refs_scene: bool) {
         let prev = std::mem::replace(&mut self.frame_mode, crate::tile::FrameMode::H264);
         if prev == crate::tile::FrameMode::TileCodec && self.h264.stats.frames_sent > 0 {
-            self.name_reentry_idr();
-            if let Some(p) = self.h264.pcm.as_mut() {
-                p.mode_reentry();
+            if refs_scene {
+                self.h264_refs_reentry(now_std());
+            } else {
+                self.name_reentry_idr();
             }
-        }
-    }
-
-    /// A frame ack (0x0A) the client sent, for the `RefManager` source of a PCM
-    /// scene. Production only counts it (B5b will route it to the manager);
-    /// the PCM source is the manager behind the real send path, and it hears
-    /// the client's own datagram.
-    #[cfg(feature = "browserless-harness")]
-    pub(super) fn pcm_frame_ack(&mut self, newest: u32, decoded: u64, refused: u64) {
-        if let Some(p) = self.h264.pcm.as_mut() {
-            p.frame_ack(newest, decoded, refused);
         }
     }
 
@@ -1100,20 +1144,17 @@ impl IoBridge {
     }
 
     /// A scripted H.264 frame whose payload is a real PCM-patch stream (see
-    /// [`crate::encoder::h264_harness`]). Past the production gate, the frame
-    /// goes through the same `send_h264_frame` as every other.
+    /// [`crate::encoder::h264_harness`]), Phase A policy. Past the production
+    /// gate, the frame goes through the same `send_h264_frame` as every other.
     #[cfg(feature = "browserless-harness")]
     fn apply_injected_pcm(
         &mut self,
         seq: u32,
         timestamp_us: u32,
         h: InjectedH264,
-        mode: crate::encoder::h264_harness::PcmMode,
         max_dg_size: usize,
-        now: std::time::Instant,
     ) {
         use crate::encoder::h264::harness::{pad_to, PcmSource};
-        use crate::encoder::h264_harness::PcmMode;
         let meta = frame::FrameMeta {
             width: h.width,
             height: h.height,
@@ -1123,89 +1164,82 @@ impl IoBridge {
             unchanged: false,
         };
         let log = self.h264.pcm_log.clone();
-        let source = self.h264.pcm.get_or_insert_with(|| {
-            PcmSource::new(
-                mode,
-                log,
-                std::time::Duration::from_micros(h.pcm_cadence_us),
-            )
-        });
+        let source = self.h264.pcm.get_or_insert_with(|| PcmSource::new(log));
         source.set_wrong_ref_every(h.pcm_wrong_ref_every);
-        assert_eq!(
-            source.mode(),
-            mode,
-            "a scene does not change its PCM source midway"
+        let periodic = h.gop_frames > 0
+            && self
+                .h264
+                .stats
+                .frames_sent
+                .is_multiple_of(u64::from(h.gop_frames));
+        let asked = self.h264.pending_idr.is_some() || periodic || self.h264.stats.frames_sent == 0;
+        let (mut payload, is_idr) = source.legacy_frame(seq, asked);
+        pad_to(&mut payload, if is_idr { h.idr_bytes } else { h.p_bytes });
+        self.send_h264_frame(
+            H264Out {
+                payload,
+                is_keyframe: is_idr,
+            },
+            &meta,
+            seq,
+            max_dg_size,
         );
-        match mode {
-            PcmMode::Legacy => {
-                let periodic = h.gop_frames > 0
-                    && self
-                        .h264
-                        .stats
-                        .frames_sent
-                        .is_multiple_of(u64::from(h.gop_frames));
-                let asked =
-                    self.h264.pending_idr.is_some() || periodic || self.h264.stats.frames_sent == 0;
-                let (mut payload, is_idr) = source.legacy_frame(seq, asked);
-                pad_to(&mut payload, if is_idr { h.idr_bytes } else { h.p_bytes });
-                self.send_h264_frame(
-                    H264Out {
-                        payload,
-                        is_keyframe: is_idr,
-                    },
-                    &meta,
-                    seq,
-                    max_dg_size,
-                );
-            }
-            PcmMode::RefManager => {
-                let srtt = self.reliable_emitter.rtt.srtt();
-                let Some(mut planned) = source.plan_frame(seq, now, srtt) else {
-                    // The epoch's IDR is still being delivered.
-                    self.pump_admission();
-                    return;
-                };
-                pad_to(
-                    &mut planned.encoded.payload,
-                    if planned.encoded.is_idr {
-                        h.idr_bytes
-                    } else {
-                        h.p_bytes
-                    },
-                );
-                if planned.encoded.is_idr {
-                    // Attribute the IDR the manager decided on.
-                    let cause = match planned.cause() {
-                        Some(crate::encoder::h264::refs::IdrCause::ResolutionChange) => {
-                            IdrCause::Resolution
-                        }
-                        Some(crate::encoder::h264::refs::IdrCause::ClientReset) => {
-                            IdrCause::ClientReset
-                        }
-                        Some(crate::encoder::h264::refs::IdrCause::EncoderFault) => IdrCause::Loss,
-                        Some(crate::encoder::h264::refs::IdrCause::SessionStart) | None => {
-                            IdrCause::Session
-                        }
-                    };
-                    self.expect_h264_idr(cause);
-                }
-                let info = planned.encoded.info;
-                self.send_h264_frame_described(
-                    H264Out {
-                        payload: std::mem::take(&mut planned.encoded.payload),
-                        is_keyframe: planned.encoded.is_idr,
-                    },
-                    &meta,
-                    seq,
-                    max_dg_size,
-                    Some(info),
-                );
-                let frags = self.h264.tracker.frags_total(seq).unwrap_or(1);
-                if let Some(p) = self.h264.pcm.as_mut() {
-                    p.plan_sent(&planned, frags, now);
-                }
-            }
-        }
+    }
+
+    /// A scripted H.264 frame of an acked-reference session: production's
+    /// plan and commit (`h264_refs`) around a PCM encoder run inline, in place
+    /// of the encode worker. The stepped harness cannot run a worker thread;
+    /// everything else, the manager, the wire header, the send path, the
+    /// ledger feedback and the client's own 0x0A and 0x09, is production's.
+    #[cfg(feature = "browserless-harness")]
+    fn apply_injected_pcm_refs(
+        &mut self,
+        seq: u32,
+        timestamp_us: u32,
+        h: InjectedH264,
+        max_dg_size: usize,
+        now: std::time::Instant,
+    ) {
+        use crate::encoder::h264::backend::{H264Backend, Nv12View};
+        use crate::encoder::h264::harness::PcmBackend;
+        assert!(
+            self.h264_refs_active(),
+            "an acked-reference scene needs a client that sends HELLO 0x04"
+        );
+        let meta = frame::FrameMeta {
+            width: h.width,
+            height: h.height,
+            stride: h.width * 4,
+            timestamp_us,
+            capture_done_ns: 0,
+            unchanged: false,
+        };
+        self.h264.refs_mode = super::h264_refs::RefsMode::Explicit;
+        self.h264.backend_kind = "pcm";
+        let Some(req) = self.h264_refs_plan(seq, (h.width, h.height), now) else {
+            // Skipped, as the capture path drops a frame it holds back; the
+            // admission pass still runs.
+            self.pump_admission();
+            return;
+        };
+        let log = self.h264.pcm_log.clone();
+        let backend = self
+            .h264
+            .pcm_backend
+            .get_or_insert_with(|| PcmBackend::new(log));
+        backend.set_sizes(h.idr_bytes, h.p_bytes);
+        let nv12 = Nv12View {
+            data: &[],
+            width: 0,
+            height: 0,
+            y_stride: 0,
+            uv_stride: 0,
+            uv_offset: 0,
+        };
+        let au = backend
+            .encode(&nv12, &req.plan, &req.refs)
+            .expect("the PCM backend executes every plan");
+        self.h264_refs_commit(&req.plan, au, &meta, max_dg_size, now);
     }
 
     /// Forget the H.264 state of the session that ended: tracker, hold,
