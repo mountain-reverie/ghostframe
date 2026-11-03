@@ -95,12 +95,24 @@ The client rebuilds one missing fragment per group (`recover_group` in
 ### Frame ack, datagram 0x0A (client to server)
 
 `FrameAck`: `[0x0A][newest_seq u32 LE][decoded_mask u64 LE][refused_mask u64 LE]`,
-21 bytes, cumulative over the last 64 frames. **Nothing sends it today.** The
-codec exists and the server counts and drops it
-(`dispatch_frame_ack_datagram`, "ignored until the H.264 ledger lands";
-`frame_acks_received` in the `h264 client feedback` line). Server-side progress
-is read from the per-datagram 0x06 ack batches, which is how H.264 fragments
-are acknowledged (section 3). The frame ack is a Phase B input.
+21 bytes, cumulative over the last 64 frames: bit `i` is frame `newest_seq - i`.
+`newest_seq` is the newest frame the client *handled*, decoded or refused, so a
+run of refusals advances the window instead of falling off it. Both clients
+send it (native and web, HELLO 0x04). It covers every handled frame, but is
+only ever queued by `ClientCore::on_timeout`, right behind the 0x06 ack batch
+in the same drain, so both share a QUIC packet; at most one per 4 ms, on the
+client core's own clock. It has no deadline of its own: a frame ack that no
+batch has carried after 100 ms goes out alone (a decoder that answers after
+its own frame's batch rides the next frame's; only a quiet screen waits that
+long). A frame ack sent at frame completion instead would be an extra
+ack-eliciting packet that carries quinn's pending ACK frame to the server
+early, which changes the server's bandwidth loop (79 of 96 capacity-step seeds
+reached 0.8 x the new rate against 92 without). `FrameAckWindow` is in
+`ghostframe-client-core/src/h264_gate.rs`. The server counts and drops
+it (`dispatch_frame_ack_datagram`; `frame_acks_received` and
+`frame_acks_malformed` in the `h264 client feedback` line, and in the
+browserless `H264Report`). Server-side progress is still read from the
+per-datagram 0x06 ack batches (section 3); the frame ack is the Phase B input.
 
 ### Reset request, feedback stream 0x09 (client to server)
 
@@ -109,10 +121,10 @@ stream (`feedback_stream.rs`, `ResetRequest`).
 
 | Reason | Value | Sent by |
 |---|---|---|
-| `DecoderFailure` | 1 | decoder returned an error (web: WebCodecs error callback; native: render thread) |
-| `Resolution` | 2 | defined; nothing sends it yet |
-| `NoDecoder` | 3 | defined; nothing sends it yet |
-| `GateReset` | 4 | `client-core` `finish_frame_if_complete`: a P frame whose reference was never delivered |
+| `DecoderFailure` | 1 | the decoder failed (`H264Outcome::DecodeError`: web WebCodecs error callback; native decode error), through the gate, paced 2.2 s |
+| `Resolution` | 2 | defined; nothing sends it yet (the gate has the cause, an IDR answers it) |
+| `NoDecoder` | 3 | no decoder could be opened (`H264Outcome::NoDecoder`), through the gate, paced |
+| `GateReset` | 4 | the reference gate refused a P frame whose reference the client does not hold (section 7), paced 2.2 s |
 
 **The server acts on `DecoderFailure` only** (`IoBridge::handle_reset_request`):
 at most one per `RESET_REQUEST_MIN_INTERVAL` (2 s), then
@@ -129,14 +141,14 @@ GOP IDR.
 |---|---|---|
 | 0x01 | `HELLO_CAP_INDICES_RAW` | PalRLE `indices_raw` payloads |
 | 0x02 | `HELLO_CAP_SUPPORTS_H264` | client can decode and sample H.264. **This alone gates H.264.** |
-| 0x04 | `HELLO_CAP_H264_ACKED_REF` | client sends v2 feedback (0x09; 0x0A in later phases). Does not gate H.264 |
+| 0x04 | `HELLO_CAP_H264_ACKED_REF` | client sends v2 feedback (0x09 resets and 0x0A frame acks). Does not gate H.264 |
 | 0xF8 | reserved | server ignores |
 
-The web client sends 0x02 without 0x04 (`ghostframe-client-wasm` passes
-`h264_acked_ref: false`), yet still sends 0x09 requests; Chrome stays on H.264.
-The native client sets 0x04 whenever it supports H.264. The server records bit
-0x04 (`HELLO received` log line) but nothing branches on it yet. Every client
-reads the 22-byte header regardless.
+Both clients set 0x04 with 0x02: the native client whenever it supports H.264,
+the web client always (`ghostframe-client-wasm` passes `h264_acked_ref: true`
+and the browser runs the same gate through wasm). Chrome stays on H.264. The
+server records bit 0x04 (`HELLO received` log line) but nothing branches on it
+yet. Every client reads the 22-byte header regardless.
 
 ## 3. Server transport
 
@@ -354,15 +366,43 @@ clients):
   resends IDR fragments and holds P frames, so an IDR can complete after newer
   `frame_seq`s were seen. Only one is exempt, so a hostile stream of IDR
   fragments cannot park memory.
-- **Reference gate.** A P frame whose `ref_frame_seq` is not the last delivered
-  frame is not handed to the decoder; the client enters `awaiting_idr`, drops P
-  frames until an IDR completes, and sends `GateReset` (0x09) paced at 2.2 s
-  (`REF_RESET_MIN_INTERVAL_US`; the server's own limit is 2 s).
-- **Decode failure.** The web client's `FullFrameDecoder` drops deltas after an
-  async decode error until the next key chunk, rebuilds the decoder and reports
-  the failure; `main.ts` sends `DecoderFailure` through wasm `requestReset`,
-  gated by `ResetPacer` (first at once, then at least 2.2 s apart). The native
-  render thread paces the same way.
+- **Reference gate** (`ghostframe-client-core/src/h264_gate.rs`, pure; design
+  7.1). Every completed access unit passes `H264Gate::on_frame`, which feeds it
+  iff its `frame_seq` is newer than the last frame fed and it is an IDR or
+  names a picture the client really holds: a long-term target
+  (`FRAME_FLAG_TARGET_IS_LT`) must match the content of the named slot, a
+  short-term target must be a good frame and still the newest reference. A
+  refused frame never reaches a decoder; it is reported in the frame ack's
+  refused mask. An IDR resets the gate (`good={idr}`, `lt[0]=idr`) and tells
+  the decoder to reset (`Event::NeedsH264.reset_decoder`); the gate is the only
+  thing that does. A Phase A stream sets no flag and names the previous frame
+  sent, which is a short-term target on the newest reference, so the same rule
+  gives the old behaviour: a P whose reference never arrived, and everything
+  chained from it, is held back until an IDR, and `GateReset` (0x09) goes out
+  at once, paced 2.2 s (the server's own limit is 2 s). A P frame naming no
+  reference (`REF_FRAME_NONE`) is fed unless the gate is already waiting for an
+  IDR. A stream that has shown a non-ref, mark or long-term-target flag is an
+  acked-reference stream: its server repairs from an anchor on the refused bit,
+  so the gate only asks for an IDR after 2.2 s of refusing with nothing fed.
+- **Decoder results.** The consumer reports each fed frame once through
+  `ClientCore::h264_result`: `Decoded` (same-call output with the frame's pts;
+  native `decode_pts` / `HwFrame::pts`, web the `VideoDecoder` output callback
+  for the chunk's timestamp), `NotOutput` (consumed with no picture, or in web
+  overtaken by a later output), `DecodeError` or `NoDecoder`. A frame is usable
+  as a reference from the moment it is fed (a WebCodecs decoder answers
+  later). `NotOutput` is only a refused bit: a decoder with one frame of
+  output delay answers every frame so and still holds them all, so nothing is
+  evicted (the core counts the run, `h264_not_output_stats`, and the native
+  renderer warns when older pictures come out instead). `DecodeError` and
+  `NoDecoder` reset the gate and send `DecoderFailure` / `NoDecoder` (0x09).
+  All reset requests share one 2.2 s pacing slot, and `NoDecoder` is sent once.
+  After an error every result is refused until a frame fed with
+  `reset_decoder` (the native renderer also stops decoding until then). The native
+  render thread hands the results to the net thread (`NetCommand::H264Result`);
+  the web client calls wasm `h264Result` and drains the transmit queue.
+- **Web decoder.** `FullFrameDecoder` drops deltas after an async decode error
+  until the next key chunk, answering each as `NotOutput`, and rebuilds the
+  decoder at it. An IDR to a healthy decoder is just another key chunk.
 - Malformed input, oversize access units (`MAX_H264_ACCESS_UNIT_BYTES`) and
   large `frag_total` are refused without panics.
 
@@ -422,15 +462,21 @@ Environment variables (the classifier ones also accept their older
   30 to 40 spurious loss IDRs in a run (observed in the Phase A live checks,
   not asserted by a test). Each costs an IDR and a P hold.
 - **Reordered P frames cost a reset.** A P frame that completes before its
-  reference makes the client's reference gate fire, and the server does not
-  yet act on `GateReset`, so the picture waits for the next IDR.
+  reference is refused by the client's reference gate, and the server does not
+  yet act on `GateReset` or on the refused bit, so the picture waits for the
+  next IDR.
 - **Padding overhead,** roughly 5 to 8 % of the stream's bytes in the Phase A
   measurements.
 - **IDR rate at low bitrate.** Near the 300 kbit/s floor an IDR is many times
   a P frame, and rate drops, loss IDRs and the 3 s GOP each add one.
-- Frame acks (0x0A) are defined but unused; progress is inferred from 0x06
-  acknowledgements, which say a datagram arrived, not that a frame decoded.
-- Resolution and `NoDecoder` resets are defined but never sent.
+- Frame acks (0x0A) are sent by both clients but the server only counts them;
+  progress is inferred from 0x06 acknowledgements, which say a datagram
+  arrived, not that a frame decoded. The browserless H.264 scenes run a
+  perfect decoder with an 8 ms decode latency (`PERFECT_DECODER_LATENCY_US`), so
+  the frame acks are always on there and ride the ack batches as they do in
+  production.
+- Resolution resets are defined but never sent (an IDR answers a resolution
+  change).
 
 ## 10. What Phase B changes (future, not implemented)
 

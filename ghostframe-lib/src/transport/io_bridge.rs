@@ -2665,6 +2665,8 @@ impl IoBridge {
                 ledger_records: self.transmission_ledger.len(),
                 probe_cache_fragments: self.reliable_emitter.h264.len(),
                 stalled: self.h264.stalled,
+                frame_acks_received: self.frame_acks_received,
+                frame_acks_malformed: self.frame_acks_malformed,
                 #[cfg(any(test, feature = "test-loss-injection"))]
                 acks_blacked_out: self.acks_blacked_out,
                 #[cfg(not(any(test, feature = "test-loss-injection")))]

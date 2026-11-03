@@ -211,6 +211,27 @@ async fn a_healthy_h264_stream_is_acknowledged_and_feeds_the_estimator() {
     assert_eq!(d[0], (d[0].0, true), "the first frame delivered is the IDR");
     assert_eq!(s.frames_idr, 1, "and it is the only IDR");
     assert_eq!(s.idr_by_cause[IdrCause::Session.index()], 1);
+    // The client's frame acks (0x0A) reach the server and parse: one per
+    // handled frame at this cadence, never more than there are frames, and
+    // none malformed. (The harness's perfect decoder reports each frame
+    // decoded.)
+    assert!(
+        r.h264.frame_acks_received > 0,
+        "no frame ack reached the server"
+    );
+    assert_eq!(r.h264.frame_acks_malformed, 0);
+    assert!(
+        r.h264.frame_acks_received <= d.len() as u64,
+        "{} acks for {} frames: coalescing may merge, never multiply",
+        r.h264.frame_acks_received,
+        d.len()
+    );
+    assert!(
+        r.h264.frame_acks_received * 2 >= d.len() as u64,
+        "{} acks for {} frames",
+        r.h264.frame_acks_received,
+        d.len()
+    );
 }
 
 /// The IDR's fragments are lost (first transmissions of three of them, the
@@ -936,7 +957,20 @@ async fn cbr_follows_the_estimate_down_on_an_overdriven_link() {
             "seed {seed:#x}: {s:?}"
         );
         let d = delivered(&r);
-        assert!(d.len() as u64 + 3 >= s.frames_sent, "seed {seed:#x}");
+        // Every frame sent was delivered, is still in the bottleneck (a 3 s
+        // queue holds a few), or was purged from the send queue when an IDR
+        // superseded it. An undelivered frame has a fragment outstanding in the
+        // ledger or one purged, so those bound the undelivered ones. A flat
+        // slack of 3 was a guess at the queue depth that moves with when
+        // acknowledgements arrive.
+        assert!(
+            d.len() as u64 + r.h264.ledger_records as u64 + s.queue_purged >= s.frames_sent,
+            "seed {seed:#x}: {} delivered, {} outstanding, {} purged, {} sent",
+            d.len(),
+            r.h264.ledger_records,
+            s.queue_purged,
+            s.frames_sent
+        );
     }
     println!("skips (policy, of them for padding, control): {skip_ratios:?}");
     for (seed, skips, _, control) in skip_ratios {
