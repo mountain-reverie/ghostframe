@@ -447,6 +447,12 @@ pub struct InjectedH264 {
     /// one the encoder meant. 0 for none.
     #[cfg(feature = "browserless-harness")]
     pub pcm_wrong_ref_every: u32,
+    /// An acked-reference scene runs production's rate policy and the padding
+    /// it enables. Off, the encoder is not told a rate and nothing is padded
+    /// (probe padding behind a reordering path stalls the stream, on Phase A
+    /// as well; the scenes about loss and reordering keep it out of the way).
+    #[cfg(feature = "browserless-harness")]
+    pub pcm_rate_policy: bool,
     /// The scene's frame period, for the `RefManager`'s decode deadlines.
     #[cfg(feature = "browserless-harness")]
     pub pcm_cadence_us: u64,
@@ -612,6 +618,16 @@ pub struct IoBridge {
     /// Acknowledgement datagrams the blackout dropped.
     #[cfg(any(test, feature = "test-loss-injection"))]
     acks_blacked_out: u64,
+    /// Harness: frame acks (0x0A) are dropped with this injector's probability
+    /// between the two instants, and the number dropped.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub(crate) frame_ack_loss: Option<(
+        crate::transport::loss_injection::LossInjector,
+        std::time::Instant,
+        std::time::Instant,
+    )>,
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    frame_acks_dropped: u64,
     /// Test knob: drop every client tile NACK at the door, so the loss detector
     /// and the probe are measured without the client's own repair requests.
     #[cfg(any(test, feature = "test-loss-injection"))]
@@ -1430,6 +1446,10 @@ impl IoBridge {
             acks_blacked_out: 0,
             #[cfg(any(test, feature = "test-loss-injection"))]
             ignore_tile_nacks: false,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            frame_ack_loss: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            frame_acks_dropped: 0,
             #[cfg(any(test, feature = "test-loss-injection"))]
             outbound_bandwidth_cap: lib_config
                 .transport
@@ -2702,6 +2722,10 @@ impl IoBridge {
                 refs: self.h264_refs_report(),
                 frame_acks_received: self.frame_acks_received,
                 frame_acks_malformed: self.frame_acks_malformed,
+                #[cfg(any(test, feature = "test-loss-injection"))]
+                frame_acks_dropped: self.frame_acks_dropped,
+                #[cfg(not(any(test, feature = "test-loss-injection")))]
+                frame_acks_dropped: 0,
                 #[cfg(any(test, feature = "test-loss-injection"))]
                 acks_blacked_out: self.acks_blacked_out,
                 #[cfg(not(any(test, feature = "test-loss-injection")))]

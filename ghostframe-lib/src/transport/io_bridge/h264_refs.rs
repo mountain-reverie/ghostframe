@@ -72,6 +72,8 @@ pub(super) struct RefsCounters {
     pub(super) unplanned_fallbacks: u64,
     pub(super) client_resets: u64,
     pub(super) frame_acks_applied: u64,
+    pub(super) decoded_bits: u64,
+    pub(super) refused_bits: u64,
     pub(super) reentries: u64,
     pub(super) reentry_bytes: u64,
     pub(super) anchor_age_ms: u64,
@@ -129,6 +131,9 @@ pub struct RefsReport {
     /// Client reset requests honoured (0x09).
     pub client_resets: u64,
     pub frame_acks_applied: u64,
+    /// Frames the client reported decoded, and refused (each counted once).
+    pub frames_decoded_acked: u64,
+    pub frames_refused: u64,
     pub verdicts: u64,
     pub reentries: u64,
     /// Wire bytes of the first frame after each return from the tile codec,
@@ -154,6 +159,7 @@ pub struct RefsReport {
     pub plan_mismatch: u64,
     pub deadline_suspects: u64,
     pub acks_unknown: u64,
+    pub suspect_overridden: u64,
 }
 
 /// Which `IdrCause` an IDR the manager planned is counted under.
@@ -212,8 +218,11 @@ impl IoBridge {
         seq: u32,
         dims: (u32, u32),
         now: Instant,
+        rate_policy: bool,
     ) -> Option<Box<H264Request>> {
-        self.h264_rate_step_refs(now);
+        if rate_policy {
+            self.h264_rate_step_refs(now);
+        }
         let srtt = self.reliable_emitter.rtt.srtt();
         let st = self.refs_state();
         if st.dims.is_some_and(|d| d != dims) {
@@ -450,15 +459,22 @@ impl IoBridge {
         let Some(st) = self.h264.refs.as_mut() else {
             return;
         };
-        // A frame newly decoded: the masks are cumulative, so a bit seen again
-        // is not progress.
-        let newly_decoded = (0..64u32).any(|i| {
-            decoded >> i & 1 == 1
-                && matches!(
-                    st.mgr.frame_state(newest.wrapping_sub(i) & 0x7FFF_FFFF),
-                    Some(FrameState::Sent | FrameState::Suspect)
-                )
-        });
+        let decoded_before = self.h264.refs_counters.decoded_bits;
+        // Count each frame once: the masks are cumulative.
+        let c = &mut self.h264.refs_counters;
+        for i in 0..64u32 {
+            let seq = newest.wrapping_sub(i) & 0x7FFF_FFFF;
+            match st.mgr.frame_state(seq) {
+                Some(FrameState::Decoded | FrameState::Dead) | None => {}
+                Some(FrameState::Sent | FrameState::Suspect) => {
+                    if decoded >> i & 1 == 1 {
+                        c.decoded_bits += 1;
+                    } else if refused >> i & 1 == 1 {
+                        c.refused_bits += 1;
+                    }
+                }
+            }
+        }
         st.mgr.frame_ack(newest, decoded, refused);
         self.h264.refs_counters.frame_acks_applied += 1;
         // Frames the client answered for are not in flight, whether or not all
@@ -473,7 +489,7 @@ impl IoBridge {
         // Progress is a frame newly decoded, not a decoded bit: the mask is
         // cumulative and keeps a bit for 64 frames, so a client that refuses
         // everything from here on would otherwise look alive for two seconds.
-        if newly_decoded {
+        if self.h264.refs_counters.decoded_bits > decoded_before {
             self.h264.decode_clock = Some(now);
             self.h264.last_ack_progress = Some(now);
         }
@@ -610,6 +626,8 @@ impl IoBridge {
             unplanned_fallbacks: c.unplanned_fallbacks,
             client_resets: c.client_resets,
             frame_acks_applied: c.frame_acks_applied,
+            frames_decoded_acked: c.decoded_bits,
+            frames_refused: c.refused_bits,
             verdicts: c.verdicts,
             reentries: c.reentries,
             reentry_bytes: c.reentry_bytes,
@@ -632,6 +650,7 @@ impl IoBridge {
             plan_mismatch: s.plan_mismatch,
             deadline_suspects: s.deadline_suspects,
             acks_unknown: s.acks_unknown,
+            suspect_overridden: s.suspect_overridden,
         }
     }
 

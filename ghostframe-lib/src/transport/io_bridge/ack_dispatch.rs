@@ -555,6 +555,14 @@ impl IoBridge {
     /// acked-reference session feeds it to the `RefManager`; every session
     /// counts it. A malformed one is dropped.
     fn dispatch_frame_ack_datagram(&mut self, dg: &[u8]) {
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        if let Some((inj, from, until)) = self.frame_ack_loss.as_mut() {
+            let now = now_std();
+            if now >= *from && now < *until && inj.should_drop(dg) {
+                self.frame_acks_dropped += 1;
+                return;
+            }
+        }
         match crate::transport::protocol::FrameAck::decode(dg) {
             Ok(ack) => {
                 self.frame_acks_received = self.frame_acks_received.saturating_add(1);

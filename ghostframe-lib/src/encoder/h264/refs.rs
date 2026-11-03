@@ -197,6 +197,9 @@ pub(crate) struct RefStats {
     pub plan_mismatch: u64,
     pub deadline_suspects: u64,
     pub acks_unknown: u64,
+    /// A decoded bit for a frame already judged suspect: the ledger's
+    /// hypothesis lost to the client's word (design 5.2).
+    pub suspect_overridden: u64,
 }
 
 /// What [`RefManager::frame_sent`] found when it replayed the emitted header.
@@ -561,7 +564,8 @@ impl RefManager {
         match self.table.state(seq) {
             None => return self.note_unknown(seq),
             Some(FrameState::Decoded | FrameState::Dead) => return,
-            Some(FrameState::Sent | FrameState::Suspect) => {}
+            Some(FrameState::Suspect) => self.stats.suspect_overridden += 1,
+            Some(FrameState::Sent) => {}
         }
         self.mark_decoded(seq);
         // A decoded frame proves the picture it predicted from was decoded

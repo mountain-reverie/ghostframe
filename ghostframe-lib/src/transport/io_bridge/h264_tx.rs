@@ -257,6 +257,8 @@ pub struct H264Report {
     /// server intact.
     pub frame_acks_received: u64,
     pub frame_acks_malformed: u64,
+    /// Frame acks the harness's loss window dropped (0 in production).
+    pub frame_acks_dropped: u64,
     /// Acked-reference recovery: the manager's counters and the loop's.
     pub refs: super::h264_refs::RefsReport,
 }
@@ -1216,7 +1218,8 @@ impl IoBridge {
         };
         self.h264.refs_mode = super::h264_refs::RefsMode::Explicit;
         self.h264.backend_kind = "pcm";
-        let Some(req) = self.h264_refs_plan(seq, (h.width, h.height), now) else {
+        let Some(req) = self.h264_refs_plan(seq, (h.width, h.height), now, h.pcm_rate_policy)
+        else {
             // Skipped, as the capture path drops a frame it holds back; the
             // admission pass still runs.
             self.pump_admission();
