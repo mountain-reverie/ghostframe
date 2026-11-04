@@ -200,6 +200,9 @@ pub(crate) struct RefStats {
     /// A decoded bit for a frame already judged suspect: the ledger's
     /// hypothesis lost to the client's word (design 5.2).
     pub suspect_overridden: u64,
+    /// Anchors confirmed that were not the IDR (the IDR is candidate 0 and
+    /// every decoded IDR confirms it): the sign that P frames work.
+    pub p_anchors_confirmed: u64,
 }
 
 /// What [`RefManager::frame_sent`] found when it replayed the emitted header.
@@ -553,6 +556,9 @@ impl RefManager {
                 self.idr_backoff = 0;
                 self.slot_confirmed_once[k] = true;
                 self.stats.anchors_confirmed += 1;
+                if self.table.get(seq).is_some_and(|f| f.kind != PicKind::Idr) {
+                    self.stats.p_anchors_confirmed += 1;
+                }
             }
         } else {
             self.stats.late_confirm_ignored += 1;
