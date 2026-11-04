@@ -517,10 +517,16 @@ next capture is made whole), the 0x0A frame ack (`frame_ack`), and every 0x09
 reason but `NoDecoder` (`client_reset`, a new epoch that begins with an IDR;
 the 2 s limit and the reset-storm stall rule apply). A frame the client
 answered for stops counting as in flight for the stall flag. On these sessions
-progress for the no-progress rule is a frame *newly* decoded (or the IDR
-draining), not a decoded bit: the mask is cumulative, so a client that refuses
-everything after its IDR still shows a decoded bit for 64 frames. Frames sent
-for 500 ms since the last new decode raise `h264_stalled`.
+progress for the no-progress rule is a frame *newly* decoded, the IDR
+draining, or a P fragment acknowledged while the client has not refused
+anything since its last decode. A decoded *bit* is not progress: the mask is
+cumulative, so a client that refuses everything after its IDR still shows one
+for 64 frames; and a 0x0A blackout with the transport acks flowing is not a
+stall. Frames sent for 500 ms since the last progress raise `h264_stalled`. The
+clock starts with the first frame sent that nothing has decoded yet and is
+cleared when the stream leaves H.264 (`abandon_h264_inflight`), so a stall that
+sent the classifier to the tile codec, or an ordinary switch with an undecoded
+last frame, does not hold the flag for the tile stretch.
 
 A suspect frame's still-queued fragments are purged: its dependents are refused
 by the client's gate anyway, a recovery P is cheap, and reordering is covered
@@ -529,8 +535,10 @@ all overrides the suspicion until a recovery frame supersedes it.
 
 Encoder faults (a failed encode, an unparsable access unit, an IDR flag that
 disagrees with the plan) restart the stream with an IDR counted as an encoder
-fault; three in a row with no anchor confirmed between them give acked
-references up for the process (Phase A, logged at warn). Leaving H.264 while the
+fault, whether the encode failed or three plans in a row did not match the
+stream; three in a row with no *P-frame* anchor confirmed between them give
+acked references up for the process (Phase A, logged at warn). A decoded IDR
+does not count: it is candidate 0 of every epoch. Leaving H.264 while the
 epoch's IDR is still being delivered purges it and marks it dead, so the return
 sends it again at once.
 

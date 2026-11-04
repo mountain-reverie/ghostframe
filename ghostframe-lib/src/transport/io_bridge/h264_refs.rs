@@ -42,7 +42,7 @@ use crate::encoder::h264::refs::{
     FramePlan, IdrCause as RefIdrCause, Plan, RefConfig, RefManager, RefStats, ResetReason,
 };
 use crate::encoder::h264::syntax::StreamParams;
-use crate::encoder::h264::tracker::{FrameState, PicKind};
+use crate::encoder::h264::tracker::{seq_lt, FrameState, PicKind};
 
 /// Encoder-fault epochs in a row, with no anchor confirmed between them, after
 /// which acked references are given up on for the process (the Phase A encoder
@@ -90,7 +90,7 @@ pub(super) struct RefsState {
     /// `anchors_confirmed` count at the last fault (a confirmation since then
     /// clears the run).
     faults_without_anchor: u32,
-    anchors_at_fault: u64,
+    p_anchors_at_fault: u64,
     /// Set when the stream returns from the tile codec: the age (ms) of the
     /// anchor the first frame predicts from, until that frame is sent.
     reentry_anchor_age_ms: Option<u64>,
@@ -106,7 +106,7 @@ impl RefsState {
             }),
             dims: None,
             faults_without_anchor: 0,
-            anchors_at_fault: 0,
+            p_anchors_at_fault: 0,
             reentry_anchor_age_ms: None,
         }
     }
@@ -160,6 +160,7 @@ pub struct RefsReport {
     pub deadline_suspects: u64,
     pub acks_unknown: u64,
     pub suspect_overridden: u64,
+    pub p_anchors_confirmed: u64,
 }
 
 /// Which `IdrCause` an IDR the manager planned is counted under.
@@ -278,8 +279,17 @@ impl IoBridge {
         let Some(st) = self.h264.refs.as_mut() else {
             return false;
         };
+        // The decode clock starts (strictly after the last progress) with the first frame sent that nothing
+        // decoded yet: after idle, after a stretch of tile frames, at the start.
+        if self
+            .h264
+            .last_sent_at
+            .zip(self.h264.decode_clock)
+            .is_none_or(|(sent, decoded)| sent < decoded)
+        {
+            self.h264.decode_clock = Some(now);
+        }
         self.h264.last_sent_at = Some(now);
-        self.h264.decode_clock.get_or_insert(now);
         if plan.epoch != st.mgr.epoch() {
             self.h264.refs_counters.epoch_dropped += 1;
             return false;
@@ -313,8 +323,14 @@ impl IoBridge {
             max_dg_size,
             Some(described),
         );
+        let mut faulted = false;
         if let Some(st) = self.h264.refs.as_mut() {
+            let before = st.mgr.pending_idr();
             let _ = st.mgr.frame_sent(plan, &header, frags, now);
+            // Three plan mismatches in a row: the manager started an
+            // encoder-fault epoch itself.
+            faulted = st.mgr.pending_idr() == Some(RefIdrCause::EncoderFault)
+                && before != Some(RefIdrCause::EncoderFault);
             if let Some(age) = st.reentry_anchor_age_ms.take() {
                 let c = &mut self.h264.refs_counters;
                 c.reentries += 1;
@@ -329,6 +345,9 @@ impl IoBridge {
                     "h264 reentry from the tile codec"
                 );
             }
+        }
+        if faulted {
+            self.h264_refs_note_fault(now, false);
         }
         self.publish_refs_counters();
         true
@@ -403,17 +422,28 @@ impl IoBridge {
     pub(super) fn h264_refs_encoder_failed(&mut self, now: Instant) {
         self.h264.refs_counters.backend_failures += 1;
         self.ensure_baseline_invalidated();
+        self.h264_refs_note_fault(now, true);
+    }
+
+    /// Count an encoder-fault epoch. `start` begins it (a failed encode); a
+    /// plan-mismatch fault was begun by the manager already. The run clears
+    /// only when a P frame was confirmed as an anchor since the last fault: the
+    /// IDR is candidate 0, so a backend whose IDRs work and whose P frames fail
+    /// confirms an anchor every time and would otherwise never be given up on.
+    fn h264_refs_note_fault(&mut self, now: Instant, start: bool) {
         let Some(st) = self.h264.refs.as_mut() else {
             return;
         };
-        let anchors = st.mgr.stats().anchors_confirmed;
-        if anchors > st.anchors_at_fault {
+        let anchors = st.mgr.stats().p_anchors_confirmed;
+        if anchors > st.p_anchors_at_fault {
             st.faults_without_anchor = 0;
         }
-        st.anchors_at_fault = anchors;
+        st.p_anchors_at_fault = anchors;
         st.faults_without_anchor += 1;
         let given_up = st.faults_without_anchor >= MAX_BACKEND_FAILURES;
-        st.mgr.encoder_fault();
+        if start {
+            st.mgr.encoder_fault();
+        }
         if given_up {
             tracing::warn!(
                 target: "ghostframe::h264",
@@ -459,9 +489,11 @@ impl IoBridge {
         let Some(st) = self.h264.refs.as_mut() else {
             return;
         };
-        let decoded_before = self.h264.refs_counters.decoded_bits;
         // Count each frame once: the masks are cumulative.
         let c = &mut self.h264.refs_counters;
+        // Newest first: the first hit of each kind is the newest.
+        let mut newest_new_decoded: Option<u32> = None;
+        let mut newest_new_refused: Option<u32> = None;
         for i in 0..64u32 {
             let seq = newest.wrapping_sub(i) & 0x7FFF_FFFF;
             match st.mgr.frame_state(seq) {
@@ -469,8 +501,10 @@ impl IoBridge {
                 Some(FrameState::Sent | FrameState::Suspect) => {
                     if decoded >> i & 1 == 1 {
                         c.decoded_bits += 1;
+                        newest_new_decoded.get_or_insert(seq);
                     } else if refused >> i & 1 == 1 {
                         c.refused_bits += 1;
+                        newest_new_refused.get_or_insert(seq);
                     }
                 }
             }
@@ -489,9 +523,22 @@ impl IoBridge {
         // Progress is a frame newly decoded, not a decoded bit: the mask is
         // cumulative and keeps a bit for 64 frames, so a client that refuses
         // everything from here on would otherwise look alive for two seconds.
-        if self.h264.refs_counters.decoded_bits > decoded_before {
+        if let Some(seq) = newest_new_decoded {
             self.h264.decode_clock = Some(now);
             self.h264.last_ack_progress = Some(now);
+            self.h264.refused_since_decode = false;
+            let nd = &mut self.h264.newest_decoded;
+            if nd.is_none_or(|old| seq_lt(old, seq)) {
+                *nd = Some(seq);
+            }
+        }
+        // A refusal counts against the client only when it is newer than the
+        // newest decode: old refusals reported late, or in the same cumulative
+        // ack as a newer decode, say nothing about it being served now.
+        if let Some(seq) = newest_new_refused {
+            if self.h264.newest_decoded.is_none_or(|d| seq_lt(d, seq)) {
+                self.h264.refused_since_decode = true;
+            }
         }
         self.publish_refs_counters();
     }
@@ -651,6 +698,7 @@ impl IoBridge {
             deadline_suspects: s.deadline_suspects,
             acks_unknown: s.acks_unknown,
             suspect_overridden: s.suspect_overridden,
+            p_anchors_confirmed: s.p_anchors_confirmed,
         }
     }
 

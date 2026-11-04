@@ -8556,30 +8556,53 @@ async fn a_failed_or_inconsistent_encode_is_an_encoder_fault() {
 }
 
 /// Three encoder faults with no anchor confirmed between them give acked
-/// references up; a confirmed anchor in between clears the run.
+/// references up; a P frame confirmed as an anchor in between clears the run (a
+/// decoded IDR does not: it is candidate 0 of every epoch).
 #[tokio::test]
-async fn repeated_encoder_faults_without_an_anchor_fall_back_to_phase_a() {
+async fn repeated_encoder_faults_without_a_p_anchor_fall_back_to_phase_a() {
     let mut bridge = acked_refs_bridge();
     let now = now_std();
     plan_commit(&mut bridge, 0).expect("the IDR");
     ack_every_fragment(&mut bridge, 0);
     bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
     assert_eq!(bridge.h264_refs_report().anchors_confirmed, 1);
-    // Two faults, an anchor confirmed between them and the third: not yet.
+    // Two faults, then the IDR is decoded again: still not a P anchor.
     bridge.h264_refs_encoder_failed(now);
+    bridge.h264_refs_encoder_failed(now);
+    let mut seq = 1;
+    plan_commit(&mut bridge, seq).expect("the IDR for the fault");
+    ack_every_fragment(&mut bridge, seq);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(seq, 1, 0));
+    assert_eq!(bridge.h264_refs_report().p_anchors_confirmed, 0);
+    // A third fault gives up, the decoded IDR notwithstanding.
+    bridge.h264_refs_encoder_failed(now);
+    assert!(!bridge.h264_refs_active());
+
+    // The control: a confirmed P anchor between faults clears the run.
+    let mut bridge = acked_refs_bridge();
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    ack_every_fragment(&mut bridge, 0);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
+    bridge.h264_refs_encoder_failed(now);
+    bridge.h264_refs_encoder_failed(now);
+    seq = 1;
+    plan_commit(&mut bridge, seq).expect("the IDR for the fault");
+    ack_every_fragment(&mut bridge, seq);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(seq, 1, 0));
+    while bridge.h264_refs_report().p_anchors_confirmed == 0 {
+        seq += 1;
+        assert!(seq < 40, "no P candidate was ever confirmed");
+        plan_commit(&mut bridge, seq).expect("a P");
+        ack_every_fragment(&mut bridge, seq);
+        bridge.dispatch_frame_ack_for_test(frame_ack_datagram(seq, 1, 0));
+    }
+    bridge.h264_refs_encoder_failed(now);
+    assert!(
+        bridge.h264_refs_active(),
+        "a P anchor was confirmed between"
+    );
     bridge.h264_refs_encoder_failed(now);
     assert!(bridge.h264_refs_active());
-    let req = bridge
-        .h264_refs_plan(1, (64, 64), now, false)
-        .expect("an IDR");
-    assert!(bridge.h264_refs_commit(&req.plan, au_for(&req.plan), &refs_meta(), 1_200, now));
-    ack_every_fragment(&mut bridge, 1);
-    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(1, 1, 0));
-    assert_eq!(bridge.h264_refs_report().anchors_confirmed, 2);
-    bridge.h264_refs_encoder_failed(now);
-    assert!(bridge.h264_refs_active(), "an anchor was confirmed between");
-    // Three in a row with none: Phase A, asked for the Phase A way.
-    bridge.h264_refs_encoder_failed(now);
     bridge.pending_controls.clear();
     bridge.h264_refs_encoder_failed(now);
     assert!(!bridge.h264_refs_active());
@@ -8685,4 +8708,246 @@ async fn a_frame_the_worker_could_not_encode_is_planned_again() {
     refs_frame(&mut bridge, 2).await;
     assert!(log_has(&log, "finish_h264_planned seq=2 idr=true"));
     assert_eq!(bridge.h264_refs_report().backend_failures, 0);
+}
+
+// ---- the stall flag across mode switches, and the fault escalation ----------
+
+/// Drive a refusing client into the stall: the IDR decodes, every P is
+/// delivered and refused. Returns the last frame_seq sent.
+async fn refuse_until_stalled(bridge: &mut IoBridge) -> u32 {
+    plan_commit(bridge, 0).expect("the IDR");
+    ack_every_fragment(bridge, 0);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
+    let step = std::time::Duration::from_millis(33);
+    for seq in 1..60u32 {
+        tokio::time::advance(step).await;
+        if plan_commit(bridge, seq).is_none() {
+            continue;
+        }
+        ack_every_fragment(bridge, seq);
+        // The IDR's decoded bit rides along; this frame is refused.
+        bridge.dispatch_frame_ack_for_test(frame_ack_datagram(seq, 1u64 << seq, 1));
+        if bridge.update_h264_stall(now_std()) {
+            return seq;
+        }
+    }
+    panic!("the refusing client never stalled");
+}
+
+/// A stall sends the classifier to the tile codec; nothing is sent there, so no
+/// decode can clear the flag. Leaving H.264 must: the stalled frames are
+/// abandoned, and the return recovers.
+#[tokio::test(start_paused = true)]
+async fn leaving_h264_clears_the_refs_stall_and_the_return_recovers() {
+    let mut bridge = acked_refs_bridge();
+    let last = refuse_until_stalled(&mut bridge).await;
+    assert!(bridge.adaptation_context.h264_stalled);
+    bridge.abandon_h264_inflight(last + 1, now_std());
+    assert!(
+        !bridge.update_h264_stall(now_std()),
+        "only later frames count"
+    );
+    assert!(!bridge.adaptation_context.h264_stalled);
+    // A tile stretch of two seconds, then the return: a recovery P from the
+    // anchor, which the (now cooperative) client decodes.
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    assert!(!bridge.update_h264_stall(now_std()));
+    bridge.h264_refs_reentry(now_std());
+    let seq = last + 2;
+    let plan = plan_commit(&mut bridge, seq).expect("a recovery frame");
+    assert_ne!(plan.kind, crate::encoder::h264::tracker::PicKind::Idr);
+    assert!(
+        !bridge.update_h264_stall(now_std()),
+        "a fresh frame, fresh clock"
+    );
+    tokio::time::advance(std::time::Duration::from_millis(20)).await;
+    ack_every_fragment(&mut bridge, seq);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(seq, 1u64 << 0, 0));
+    tokio::time::advance(std::time::Duration::from_millis(700)).await;
+    assert!(
+        !bridge.update_h264_stall(now_std()),
+        "nothing outstanding, no stall"
+    );
+}
+
+/// A healthy H.264 to tile switch whose last frame never decoded (purged, or
+/// lost) does not raise the flag, and so does not re-arm the holdoff for the
+/// whole tile stretch.
+#[tokio::test(start_paused = true)]
+async fn a_healthy_switch_to_tiles_with_the_last_frame_undecoded_does_not_stall() {
+    let mut bridge = acked_refs_bridge();
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    ack_every_fragment(&mut bridge, 0);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
+    tokio::time::advance(std::time::Duration::from_millis(50)).await;
+    plan_commit(&mut bridge, 1).expect("a P");
+    // The last frame is sent, not acknowledged, and then the codec switches.
+    bridge.abandon_h264_inflight(2, now_std());
+    for _ in 0..30 {
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        assert!(!bridge.update_h264_stall(now_std()));
+    }
+}
+
+/// The frame feedback (0x0A) goes silent for 800 ms while the transport acks
+/// flow: the stream is served, so it is not a stall. Once the client is seen
+/// refusing, the same silence of progress is.
+#[tokio::test(start_paused = true)]
+async fn a_frame_ack_blackout_with_the_transport_acks_flowing_is_not_a_stall() {
+    let mut bridge = acked_refs_bridge();
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    ack_every_fragment(&mut bridge, 0);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
+    let step = std::time::Duration::from_millis(33);
+    let mut seq = 1;
+    for _ in 0..25 {
+        tokio::time::advance(step).await;
+        if plan_commit(&mut bridge, seq).is_some() {
+            ack_every_fragment(&mut bridge, seq);
+            seq += 1;
+        }
+        assert!(
+            !bridge.update_h264_stall(now_std()),
+            "stalled at frame {seq} with only the frame feedback missing"
+        );
+        assert!(!bridge.adaptation_context.h264_stalled);
+    }
+    // Now the client says it refused: no progress, and the flag follows.
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(seq - 1, 1u64 << (seq - 1), 1));
+    let mut stalled = false;
+    for _ in 0..25 {
+        tokio::time::advance(step).await;
+        if plan_commit(&mut bridge, seq).is_some() {
+            ack_every_fragment(&mut bridge, seq);
+            seq += 1;
+        }
+        stalled |= bridge.update_h264_stall(now_std());
+    }
+    assert!(stalled, "refusals with no decode must stall");
+    assert!(bridge.adaptation_context.h264_stalled);
+}
+
+/// A backend whose IDRs work and whose P frames all fail: each IDR is decoded
+/// and confirms candidate 0, but no P is ever an anchor, so the run is not
+/// cleared and Phase A takes over after the third fault.
+#[tokio::test]
+async fn a_backend_that_fails_every_p_frame_is_given_up_on() {
+    let mut bridge = acked_refs_bridge();
+    let mut seq = 0;
+    let mut faults = 0;
+    while bridge.h264_refs_active() && faults < 12 {
+        let now = now_std();
+        let Some(req) = bridge.h264_refs_plan(seq, (64, 64), now, false) else {
+            panic!("held at {seq}");
+        };
+        if req.plan.kind == crate::encoder::h264::tracker::PicKind::Idr {
+            assert!(bridge.h264_refs_commit(
+                &req.plan,
+                au_for(&req.plan),
+                &refs_meta(),
+                1_200,
+                now
+            ));
+            ack_every_fragment(&mut bridge, seq);
+            bridge.dispatch_frame_ack_for_test(frame_ack_datagram(seq, 1, 0));
+        } else {
+            bridge.h264_refs_encoder_failed(now);
+            faults += 1;
+        }
+        seq += 1;
+    }
+    assert!(!bridge.h264_refs_active(), "never given up on");
+    assert_eq!(faults, 3);
+    // Each fault but the last was answered by an IDR (counted as a loss IDR in
+    // the bridge's table; the manager is gone with the fallback).
+    assert_eq!(bridge.h264.stats.idr_by_cause[IdrCause::Loss.index()], 2);
+}
+
+/// A backend whose P frames never match their plan: three mismatches in a row
+/// make the manager start an encoder-fault epoch itself, and those epochs count.
+#[tokio::test]
+async fn a_backend_that_mismatches_every_p_frame_is_given_up_on() {
+    use crate::encoder::h264::syntax::Rplm;
+    let mut bridge = acked_refs_bridge();
+    let mut seq = 0;
+    while bridge.h264_refs_active() && seq < 80 {
+        let now = now_std();
+        let Some(req) = bridge.h264_refs_plan(seq, (64, 64), now, false) else {
+            panic!("held at {seq}");
+        };
+        let mut au = au_for(&req.plan);
+        if req.plan.kind == crate::encoder::h264::tracker::PicKind::Idr {
+            assert!(bridge.h264_refs_commit(&req.plan, au, &refs_meta(), 1_200, now));
+            ack_every_fragment(&mut bridge, seq);
+            bridge.dispatch_frame_ack_for_test(frame_ack_datagram(seq, 1, 0));
+        } else {
+            // The stream predicts from a long-term slot the plan never named.
+            au.meta.header.as_mut().unwrap().rplm = vec![Rplm::Long(1)];
+            bridge.h264_refs_commit(&req.plan, au, &refs_meta(), 1_200, now);
+        }
+        seq += 1;
+    }
+    assert!(
+        !bridge.h264_refs_active(),
+        "mismatch epochs were not counted"
+    );
+    assert!(
+        bridge.h264.stats.idr_by_cause[IdrCause::Loss.index()] >= 2,
+        "the mismatch epochs were IDRs for faults"
+    );
+}
+
+/// A cumulative 0x0A that reports old refusals together with a newer decode
+/// (the 0x0A that carried the refusals was lost) leaves the refusal flag clear
+/// and P-fragment acks still count as progress.
+#[tokio::test(start_paused = true)]
+async fn old_refusals_reported_with_a_newer_decode_do_not_raise_the_refusal_flag() {
+    let mut bridge = acked_refs_bridge();
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    ack_every_fragment(&mut bridge, 0);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
+    for seq in 1..=4u32 {
+        tokio::time::advance(std::time::Duration::from_millis(33)).await;
+        plan_commit(&mut bridge, seq).expect("a frame");
+    }
+    // Frames 1-3 refused, recovery frame 4 decoded, reported together.
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(4, 1 | 1 << 4, 0b1110));
+    assert!(
+        !bridge.h264.refused_since_decode,
+        "old refusals beside a newer decode"
+    );
+    // A late ack with only the old refusals changes nothing either.
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(3, 1 << 3, 0b111));
+    assert!(!bridge.h264.refused_since_decode);
+    // P-ack progress still counts: a 500 ms 0x0A blackout with the transport
+    // acks flowing is not a stall.
+    let step = std::time::Duration::from_millis(33);
+    let mut seq = 5;
+    for _ in 0..25 {
+        tokio::time::advance(step).await;
+        if plan_commit(&mut bridge, seq).is_some() {
+            ack_every_fragment(&mut bridge, seq);
+            seq += 1;
+        }
+        assert!(!bridge.update_h264_stall(now_std()), "stalled at {seq}");
+    }
+}
+
+/// A refusal newer than the last decode sets the flag, and a later decode
+/// clears it.
+#[tokio::test(start_paused = true)]
+async fn a_refusal_newer_than_the_last_decode_raises_the_refusal_flag() {
+    let mut bridge = acked_refs_bridge();
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    ack_every_fragment(&mut bridge, 0);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
+    assert!(!bridge.h264.refused_since_decode);
+    tokio::time::advance(std::time::Duration::from_millis(33)).await;
+    plan_commit(&mut bridge, 1).expect("a frame");
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(1, 0b10, 0b01));
+    assert!(bridge.h264.refused_since_decode);
+    tokio::time::advance(std::time::Duration::from_millis(33)).await;
+    plan_commit(&mut bridge, 2).expect("a frame");
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(2, 0b101, 0b10));
+    assert!(!bridge.h264.refused_since_decode);
 }

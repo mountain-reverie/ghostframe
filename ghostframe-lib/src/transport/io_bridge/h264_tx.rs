@@ -481,6 +481,14 @@ pub(super) struct H264Tx {
     /// never decodes).
     pub(super) decode_clock: Option<std::time::Instant>,
     pub(super) last_sent_at: Option<std::time::Instant>,
+    /// The client refused a frame after the last one it decoded: P-fragment
+    /// acknowledgements then say nothing about it being served.
+    pub(super) refused_since_decode: bool,
+    /// The newest frame the client has been counted as decoding. A refusal
+    /// only raises `refused_since_decode` when it is newer than this, so a
+    /// cumulative 0x0A that reports old refusals together with a newer decode
+    /// (or a late one with only the old refusals) leaves the flag alone.
+    pub(super) newest_decoded: Option<u32>,
     /// The encoder behind the stream, for the `h264 refs` line.
     pub(super) backend_kind: &'static str,
     /// The harness's PCM-patch source and the log the scene reads (design T3).
@@ -523,6 +531,8 @@ impl H264Tx {
         self.refs = None;
         self.decode_clock = None;
         self.last_sent_at = None;
+        self.refused_since_decode = false;
+        self.newest_decoded = None;
         #[cfg(feature = "browserless-harness")]
         if let Some(p) = self.pcm.as_mut() {
             p.session_reset();
@@ -793,7 +803,13 @@ impl IoBridge {
             }
             self.reliable_emitter.on_h264_ack(frame_seq, frag_idx);
             // An IDR draining on a slow link is progress, as for Phase A.
-            if self.h264_refs_live() && self.reliable_emitter.h264.is_idr(frame_seq) == Some(true) {
+            // A P frame's fragment acknowledged is progress too, until the client
+            // has refused something since it last decoded: a 0x0A blackout with
+            // the transport acks flowing is not a stall.
+            if self.h264_refs_live()
+                && (self.reliable_emitter.h264.is_idr(frame_seq) == Some(true)
+                    || !self.h264.refused_since_decode)
+            {
                 self.h264.decode_clock = Some(now);
             }
             if let Some(st) = self.h264.refs.as_mut() {
@@ -1000,6 +1016,13 @@ impl IoBridge {
                 st.mgr.idr_abandoned();
             }
         }
+        // Only frames sent after this count for the stall flag (the Phase A
+        // `ignore_before`): the last ones were purged or will never be
+        // answered, and nothing is sent while the tile codec has the screen.
+        self.h264.last_sent_at = None;
+        self.h264.decode_clock = None;
+        self.h264.refused_since_decode = false;
+        self.h264.newest_decoded = None;
         // The rate side of H.264 lets go here too, in one place: the padding in
         // flight is forgotten and the application's probe cadence starts over
         // (`h264_reset_probing`), the rate policy's estimate restarts (the
