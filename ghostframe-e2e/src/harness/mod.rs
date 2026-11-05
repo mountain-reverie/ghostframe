@@ -34,7 +34,11 @@ pub use browser::{
     run_input_dispatch_smoke, BrowserSession, ChromiumSession, FirefoxLaunch, FirefoxSession,
     KeyEventKind, PointerEventKind,
 };
-pub use cleanup::{cleanup_stale_xvfb_sockets, read_server_logs_stripped};
+pub use cleanup::{
+    acked_ref_evidence, acked_ref_outcome, cleanup_stale_xvfb_sockets, read_server_logs_stripped,
+    report_acked_ref_outcome, require_vaapi, wait_for_acked_ref_outcome, AckedRefEvidence,
+    AckedRefOutcome,
+};
 pub use containers::{create_preauth_key, docker_run_in_container, TestNode, NETWORK_NAME};
 pub use e2e_setup::{
     setup_e2e_server, setup_e2e_server_as, wait_for_frames, E2eServerSetup, E2eServerSpec,
