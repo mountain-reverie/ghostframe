@@ -218,6 +218,7 @@ RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install
     x11-utils \
     mesa-utils \
     libgl1-mesa-dri \
+    mesa-va-drivers \
     libvulkan1 \
     mesa-vulkan-drivers \
     vulkan-tools \
