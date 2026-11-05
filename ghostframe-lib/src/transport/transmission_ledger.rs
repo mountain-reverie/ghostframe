@@ -510,6 +510,22 @@ impl TransmissionLedger {
         true
     }
 
+    /// [`Self::forget_undeparted`], returning what the record said it carried,
+    /// for a caller that has to tell the content's owner. `None` if the record
+    /// is unknown or has departed.
+    pub fn take_undeparted(&mut self, wire_seq: u32) -> Option<Transmission> {
+        if self
+            .records
+            .get(&wire_seq)
+            .is_none_or(|r| r.departed.is_some())
+        {
+            return None;
+        }
+        let rec = self.records.remove(&wire_seq)?;
+        self.stats.forgotten_before_departure += 1;
+        Some(rec.tx)
+    }
+
     /// Forget one outstanding record, departed or not, with no verdict and no
     /// tombstone: its content is gone (an H.264 fragment trimmed from the
     /// probe cache or superseded by an IDR), so there is nothing to send again

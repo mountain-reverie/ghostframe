@@ -468,3 +468,104 @@ async fn the_same_seed_gives_byte_identical_counters() {
         "another seed must give another wire"
     );
 }
+
+/// The path MTU falls after discovery has raised it. quinn's discovery lifts
+/// the datagram size to about 1412; from 3 s on the path drops every packet
+/// longer than 1200 bytes, and quinn's black-hole detector, after a few lost
+/// large packets, puts the size back to its 1200-byte floor (a datagram of
+/// about 1160). Fragments built and queued or cached before that are larger
+/// than quinn takes: before the fix every offer of one was refused as
+/// `TooLarge`, the refused one went back to the head of the emission queue
+/// and stopped the drain, and the stream was dead (seed 0x7108 of the
+/// reordering scene wedged for 3 s the same way, by chance).
+#[tokio::test(start_paused = true)]
+async fn an_mtu_that_falls_after_discovery_does_not_wedge_the_stream() {
+    // `Pattern::Clean` draws nothing from the seed, so the seeds alone would
+    // repeat two or three runs. Each one therefore gets its own step instant
+    // and one-way delay, which moves the fall against the frame cadence and
+    // the IDR in flight: independent runs, not repeats.
+    let mut distinct = std::collections::HashSet::new();
+    for (k, seed) in (0x7101u64..=0x7108).enumerate() {
+        let k = k as u64;
+        let mut base = link_20ms();
+        base.delay_us += k * 1_300;
+        let (net, mut links) = Pattern::Clean.apply(base);
+        links.s2c_mtu_step = Some((3_000_000 + k * 37_000, 1_200));
+        let r = run_browserless_with_options(
+            scene(seed, SECS, net, legacy(), DropPlan::default()),
+            links,
+            RunOptions::default(),
+        )
+        .await
+        .expect("scene");
+        let o = r.h264_run().map(|x| x.analyse()).unwrap_or_default();
+        line("mtu_fall", seed, &r, &o);
+        let ctx = format!("mtu_fall {seed:#x}");
+        let s = &r.h264.stats;
+        distinct.insert(format!(
+            "{} oversize={} drops={}",
+            o.summary(),
+            s.oversize_h264,
+            r.s2c_datagrams_dropped
+        ));
+        // Premises: the link really black-holed large packets, and the fall
+        // caught fragments already built (otherwise this tests nothing).
+        assert!(
+            r.s2c_datagrams_dropped > 0,
+            "{ctx}: the link dropped nothing"
+        );
+        assert!(
+            s.oversize_h264 + s.send_too_large > 0,
+            "{ctx}: no stored fragment outgrew the connection"
+        );
+        // The fix: nothing stale reached quinn, the IDR for the new size was
+        // asked for under its own cause, and the stream lives.
+        assert_eq!(s.send_too_large, 0, "{ctx}: quinn refused a datagram");
+        assert!(s.idr_by_cause[IdrCause::MtuShrink.index()] >= 1, "{ctx}");
+        assert_sound(&ctx, &r, &o);
+        // The wedge showed 197 of ~280; the end-of-run and freeze bounds below
+        // are the real discriminators.
+        assert!(o.correct > 220, "{ctx}: {} frames shown", o.correct);
+        assert!(
+            o.last_correct_us.unwrap_or(0) + 500_000 >= SECS * 1_000_000,
+            "{ctx}: dead at the end: {:?}",
+            o.last_correct_us
+        );
+        // Bounded, not a target: the wedge froze the picture for 3 s and
+        // never recovered; the observed worst with the fix is 0.4 s.
+        assert!(o.frozen_us <= 1_500_000, "{ctx}: frozen {} us", o.frozen_us);
+        assert!(s.frames_skipped_backpressure < 45, "{ctx}");
+    }
+    println!("mtu_fall: {} distinct runs of 8", distinct.len());
+    assert!(distinct.len() >= 6, "the seeds are not independent runs");
+}
+
+/// Seed 0x7108 of the 8 ms reordering scene wedged on master with no MTU
+/// knob at all: quinn's own discovery raised the size and its black-hole
+/// detector took it back (280 `TooLarge` refusals, the picture frozen from
+/// 6.9 s to the end). Properties only: the chaotic path decides how many
+/// IDRs this makes.
+#[tokio::test(start_paused = true)]
+async fn reorder8_seed_7108_no_longer_wedges_on_an_mtu_shrink() {
+    let (r, o) = pcm_run(
+        0x7108,
+        SECS,
+        Pattern::Reorder { window_us: 8_000 },
+        legacy(),
+    )
+    .await;
+    line("reorder8", 0x7108, &r, &o);
+    // Premise: quinn's own MTU fall happened here, or the test proves nothing.
+    assert!(
+        r.h264.stats.oversize_h264 > 0,
+        "no stored fragment outgrew the connection: the shrink did not happen"
+    );
+    assert_eq!(r.h264.stats.send_too_large, 0);
+    assert_sound("reorder8 0x7108", &r, &o);
+    assert!(
+        o.last_correct_us.unwrap_or(0) + 500_000 >= SECS * 1_000_000,
+        "dead at the end: {:?}",
+        o.last_correct_us
+    );
+    assert!(o.frozen_us <= 1_500_000, "frozen {} us", o.frozen_us);
+}
