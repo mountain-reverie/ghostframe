@@ -49,7 +49,10 @@
 use std::time::{Duration, Instant};
 
 use ghostframe_client_native::{Client, Config, DebugFrameBytes};
-use ghostframe_e2e::harness::{read_server_logs_stripped, setup_e2e_server, E2eServerSpec};
+use ghostframe_e2e::harness::{
+    read_server_logs_stripped, report_acked_ref_outcome, setup_e2e_server,
+    wait_for_acked_ref_outcome, E2eServerSpec,
+};
 
 #[path = "common/client_wait.rs"]
 mod client_wait;
@@ -104,7 +107,10 @@ async fn h264_frames_from_the_server_render_into_the_dmabuf() {
 
     eprintln!("[phase] starting headscale + ghostframe-server containers (gpu capture)");
     let setup = setup_e2e_server(E2eServerSpec {
-        test_pattern_args: "--gradient --x11-sink",
+        // A gradient half and a moving half: the gradient alone paints once and
+        // goes quiet, and the server logs its stats lines (which the refs
+        // check reads) only every 60 frames.
+        test_pattern_args: "--x11-sink --mode-switch-cycle 3 --static-half gradient",
         // Pin H.264 rather than relying on the adaptation policy choosing
         // it. Sessions already start in H.264 (`io_bridge.rs:3435`), but
         // "already" is how a test comes to depend on a default nobody
@@ -253,16 +259,28 @@ async fn h264_frames_from_the_server_render_into_the_dmabuf() {
     // chained from it: there is no periodic IDR within the first 3 s to rescue
     // a missed one. The bit rate is whatever the estimate gave at the first
     // frame, so only its presence is asserted.
-    assert!(
-        server_logs.contains("FullFrameEncoder: using h264_vaapi hardware encoder (rate-capped VBR)")
-            || server_logs.contains("FullFrameEncoder: using libx264 software encoder (rate-capped)"),
-        "the full-frame encoder was not opened with the CBR parameters. server logs:\n{server_logs}"
-    );
-    assert!(
-        server_logs.contains("fps=30") && server_logs.contains("bps="),
-        "the encoder's open line does not show the capture rate (fps=30) and a bit rate. \
-         server logs:\n{server_logs}"
-    );
+    //
+    // On the acked-reference path (libva-direct) there is no `FullFrameEncoder`:
+    // the encode worker opens a libva-direct session instead, and the refs
+    // check after the frame assertions covers the rest. The ffmpeg fallback
+    // keeps the old open-line check.
+    let libva_direct = server_logs
+        .lines()
+        .any(|l| l.contains("libva-direct session open") && l.contains("width=1024"));
+    if !libva_direct {
+        assert!(
+            server_logs.contains(
+                "FullFrameEncoder: using h264_vaapi hardware encoder (rate-capped VBR)"
+            ) || server_logs
+                .contains("FullFrameEncoder: using libx264 software encoder (rate-capped)"),
+            "the full-frame encoder was not opened with the CBR parameters. server logs:\n{server_logs}"
+        );
+        assert!(
+            server_logs.contains("fps=30") && server_logs.contains("bps="),
+            "the encoder's open line does not show the capture rate (fps=30) and a bit rate. \
+             server logs:\n{server_logs}"
+        );
+    }
 
     // H.264 is lossy, so this test asserts non-flatness rather than exact
     // values -- a strictly weaker claim than "the frame is structurally
@@ -298,6 +316,16 @@ async fn h264_frames_from_the_server_render_into_the_dmabuf() {
     // spread at or below it means decode or colour conversion broke, not
     // ordinary lossy compression.
     eprintln!("[m3] red channel spans {lo}..{hi} across the decoded frame");
+
+    // The native client sends HELLO 0x04, so a server whose libva-direct
+    // probe passed must have run the acked-reference path (`RefManager`, no
+    // scheduled GOP IDR). Without VA-API (GitHub CI) the server falls back to
+    // ffmpeg and this says so loudly instead of passing silently; locally
+    // GHOSTFRAME_E2E_REQUIRE_VAAPI=1 turns that fallback into a failure. The
+    // stats lines come every 60 frames, so wait for them.
+    report_acked_ref_outcome(
+        wait_for_acked_ref_outcome(&setup.server_container_name, Duration::from_secs(60)).await,
+    );
 
     client.release_frame(frame.frame_id);
     client.disconnect().expect("disconnect");
