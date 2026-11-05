@@ -920,6 +920,10 @@ pub struct LinkOverrides {
     pub s2c: Option<NetProfile>,
     pub c2s_seed_salt: u64,
     pub s2c_seed_salt: u64,
+    /// Server -> client path MTU that falls: `(from_us, max_len)` drops every
+    /// datagram longer than `max_len` from `from_us` of virtual time on
+    /// (see [`NetSim::with_mtu_step`]).
+    pub s2c_mtu_step: Option<(u64, usize)>,
 }
 
 impl LinkOverrides {
@@ -1456,6 +1460,9 @@ async fn drive_session(
         links.s2c.clone().unwrap_or_else(|| scene.net.clone()),
         seed ^ 0xA5A5_A5A5_A5A5_A5A5 ^ links.s2c_seed_salt,
     );
+    if let Some((from_us, max_len)) = links.s2c_mtu_step {
+        net_s2c = net_s2c.with_mtu_step(from_us, max_len);
+    }
 
     // Datagrams `NetSim` has already ruled on whose propagation delay has
     // not yet elapsed. Delivery happens from the scene loop below, never

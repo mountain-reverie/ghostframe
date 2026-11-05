@@ -679,6 +679,17 @@ pub struct IoBridge {
     /// the gate saturated without a handshaked connection.
     #[cfg(test)]
     pub(crate) forced_fifo_depth_for_test: Option<usize>,
+    /// Unit tests only: the largest datagram payload the drain accepts. It
+    /// replaces the limit AFTER the WebTransport framing is subtracted from
+    /// quinn's size, so it bypasses that arithmetic; see
+    /// `forced_raw_datagram_size_for_test` to exercise it.
+    #[cfg(test)]
+    pub(crate) forced_datagram_limit_for_test: Option<usize>,
+    /// Unit tests only: what quinn's `datagrams().max_size()` reports (framing
+    /// included), so the drain's own `raw - framing` arithmetic runs without a
+    /// handshaked connection.
+    #[cfg(test)]
+    pub(crate) forced_raw_datagram_size_for_test: Option<usize>,
 
     /// Harness only: the tokio-clock instant at which the inbound arm took
     /// each packet off the socket, in order. Paired by position with the
@@ -1524,6 +1535,10 @@ impl IoBridge {
             sent_log_for_test: Vec::new(),
             #[cfg(test)]
             forced_fifo_depth_for_test: None,
+            #[cfg(test)]
+            forced_datagram_limit_for_test: None,
+            #[cfg(test)]
+            forced_raw_datagram_size_for_test: None,
             connected_session_count: watch::Sender::new(0),
             was_idle: true,
             input_injector: None,
