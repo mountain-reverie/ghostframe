@@ -95,6 +95,12 @@ pub struct NetSim {
     codel_drop_next_us: u64,
     codel_count: u32,
 
+    /// A path MTU that falls: from `.0` (virtual us) on, a datagram longer
+    /// than `.1` bytes is dropped, as a link that cannot carry it does. Kept
+    /// outside `NetProfile` (which many scenes build field by field) and
+    /// applied after every other verdict, so the RNG stream is untouched.
+    mtu_step: Option<(u64, usize)>,
+
     /// The seed used to construct this simulator; logged in test diagnostics.
     pub seed: u64,
 }
@@ -114,8 +120,17 @@ impl NetSim {
             codel_dropping: false,
             codel_drop_next_us: 0,
             codel_count: 0,
+            mtu_step: None,
             seed,
         }
+    }
+
+    /// From `from_us` on, drop every datagram longer than `max_len` bytes:
+    /// the path MTU falls after discovery has raised it, and the large
+    /// packets vanish without any ICMP (a black hole).
+    pub fn with_mtu_step(mut self, from_us: u64, max_len: usize) -> Self {
+        self.mtu_step = Some((from_us, max_len));
+        self
     }
 
     /// Queuing delay this datagram would incur at the bottleneck, or `None`
@@ -239,6 +254,14 @@ impl NetSim {
     /// last, after every draw above, and a profile merely *having* a cap
     /// (or not) never shifts what any draw above produces.
     pub fn decide(&mut self, len: usize, now_us: u64) -> Verdict {
+        let verdict = self.decide_profile(len, now_us);
+        match self.mtu_step {
+            Some((from_us, max_len)) if now_us >= from_us && len > max_len => Verdict::Drop,
+            _ => verdict,
+        }
+    }
+
+    fn decide_profile(&mut self, len: usize, now_us: u64) -> Verdict {
         // Token-bucket refill. No rng involved, so where this runs relative
         // to the draws below cannot affect the rng stream; it lives up front
         // for readability. An unlimited cap (bps == u64::MAX) short-circuits

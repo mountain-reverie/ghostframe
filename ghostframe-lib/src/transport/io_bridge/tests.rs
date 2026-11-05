@@ -7856,3 +7856,51 @@ async fn a_loss_idr_request_makes_the_next_capture_whole() {
     );
     assert_eq!(baseline(&bridge), 1, "{:?}", bridge.pending_controls);
 }
+
+/// A stored tile pass that no longer fits the connection is retired: never
+/// offered to quinn, forgotten in the ledger without a verdict, its cache
+/// entry and CDF 5/3 coverage dropped, and the baseline invalidated so the
+/// next capture is made whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tile_pass_that_outgrew_the_connection_is_retired() {
+    use crate::transport::reliable_emitter::EmitKey;
+    let (mut bridge, _peer) = bridge_with_backend(RecordingBackend::default());
+    bridge.forced_fifo_depth_for_test = Some(usize::MAX / 2);
+    let key = EmitKey::new(5, 3, 4, 0);
+    let t = std::time::Instant::now();
+    bridge
+        .reliable_emitter
+        .submit_one(key, bytes::Bytes::from(vec![0u8; 300]), t, None, t);
+    let cov: crate::transport::fragment_coverage::CoverageList =
+        smallvec::smallvec![crate::transport::fragment_coverage::FragmentCoverage {
+            tile_x: 3,
+            tile_y: 4,
+            generation: 1,
+            pass_idx: 0,
+            codec: crate::transport::protocol::Codec::Cdf53,
+            palette_id: None,
+            palette_bundled: false,
+        }];
+    bridge.fragment_coverage.record((5, 3, 4, 0), cov);
+    bridge.pending_controls.clear();
+    // Premises: the pass is stored, covered, and a drain would offer it.
+    assert!(bridge.reliable_emitter.has_cache_entries_for_tile(3, 4));
+    assert_eq!(bridge.fragment_coverage.len(), 1);
+    assert!(bridge.frame_pipeline.is_some());
+    let offered = bridge.sent_log_for_test.len();
+
+    bridge.forced_datagram_limit_for_test = Some(10);
+    let stop = bridge.drain_reliable_emitter(now_std());
+
+    assert!(matches!(stop, pacing::Stop::Empty));
+    assert_eq!(bridge.sent_log_for_test.len(), offered, "nothing offered");
+    assert_eq!(bridge.h264.stats.oversize_tile, 1);
+    assert_eq!(bridge.h264.stats.oversize_untracked, 0);
+    assert_eq!(bridge.h264.stats.tx_forgotten, 0, "not an H.264 fragment");
+    assert!(!bridge.reliable_emitter.has_cache_entries_for_tile(3, 4));
+    assert_eq!(bridge.fragment_coverage.len(), 0, "coverage dropped");
+    assert!(bridge.transmission_ledger.is_empty(), "forgotten");
+    assert!(bridge
+        .pending_controls
+        .contains(&Control::InvalidateBaseline(1)));
+}

@@ -104,10 +104,16 @@ pub enum IdrCause {
     RateRise,
     /// None of the above asked for it: the encoder's own GOP.
     GopPeriodic,
+    /// The path MTU fell below the size fragments already built were cut for
+    /// (quinn's black-hole detector, after discovery had raised it), so
+    /// stored H.264 fragments can no longer be sent. A transport event of the
+    /// same nature as a session start: the fragments are gone, and an IDR
+    /// sized for the connection as it is now is the only way to a picture.
+    MtuShrink,
 }
 
 impl IdrCause {
-    pub(crate) const COUNT: usize = 9;
+    pub(crate) const COUNT: usize = 10;
     pub const ALL: [IdrCause; Self::COUNT] = [
         IdrCause::Session,
         IdrCause::Loss,
@@ -118,6 +124,7 @@ impl IdrCause {
         IdrCause::RateDrop,
         IdrCause::RateRise,
         IdrCause::GopPeriodic,
+        IdrCause::MtuShrink,
     ];
 
     pub fn index(self) -> usize {
@@ -135,6 +142,7 @@ impl IdrCause {
             IdrCause::RateDrop => "rate_drop",
             IdrCause::RateRise => "rate_rise",
             IdrCause::GopPeriodic => "gop_periodic",
+            IdrCause::MtuShrink => "mtu_shrink",
         }
     }
 }
@@ -209,6 +217,17 @@ pub struct H264Stats {
     /// Frames not encoded, by why.
     pub frames_skipped_hold: u64,
     pub frames_skipped_backpressure: u64,
+    /// Datagrams quinn refused as larger than the connection's current
+    /// maximum (the path MTU fell after they were built).
+    pub send_too_large: u64,
+    /// Queued datagrams retired because they no longer fit the connection's
+    /// datagram size (it fell after they were built), by what they carried:
+    /// a tile pass, an H.264 fragment, probe padding, or something the ledger
+    /// does not track (XOR parity). None of them reached quinn.
+    pub oversize_tile: u64,
+    pub oversize_h264: u64,
+    pub oversize_pad: u64,
+    pub oversize_untracked: u64,
     /// Queued emissions removed because an IDR superseded their frame or a
     /// verdict made it suspect.
     pub queue_purged: u64,
@@ -688,8 +707,12 @@ impl IoBridge {
 
     pub(super) fn forget_purged(&mut self, wire_seqs: &[u32]) {
         for ws in wire_seqs {
-            if self.transmission_ledger.forget_undeparted(*ws) {
-                self.h264.stats.tx_forgotten += 1;
+            // Only an H.264 fragment is in the identity
+            // `tx_recorded >= acked + lost + forgotten`.
+            if let Some(tx) = self.transmission_ledger.take_undeparted(*ws) {
+                if matches!(tx.content, Content::H264Frag { .. }) {
+                    self.h264.stats.tx_forgotten += 1;
+                }
             }
             // A purged pad never left: its ring entry has no acknowledgement
             // to wait for.
@@ -1694,6 +1717,174 @@ mod tests {
             .get(H264_CACHE_FRAMES as u32 + 40, 0)
             .is_some());
         assert!(b.reliable_emitter.stats.h264_cache_dropped > 0);
+    }
+
+    /// The path MTU falls below the size queued fragments were cut for. They
+    /// are retired, not offered to quinn (which would refuse each as
+    /// `TooLarge` and, since a refusal re-queues, stop the drain at the first
+    /// one for good): the drain empties, the ledger forgets them without a
+    /// verdict, and an IDR for the new size is asked for under its own cause.
+    #[tokio::test(start_paused = true)]
+    async fn fragments_larger_than_the_connection_now_takes_are_retired_not_offered() {
+        let mut b = bridge().await;
+        // The gate holds everything back, as a standing FIFO does.
+        b.forced_fifo_depth_for_test = Some(usize::MAX / 2);
+        send(&mut b, 1, true);
+        send(&mut b, 2, false);
+        b.record_emitted_transmissions(now_std());
+        let queued = b.reliable_emitter.queued_h264_bytes();
+        let biggest = b
+            .reliable_emitter
+            .h264
+            .get(1, 0)
+            .map(|e| e.datagram.len())
+            .expect("fragment 0 of the IDR is cached");
+        // Premises: there is something to retire, and the ledger holds it.
+        assert!(queued > 0 && biggest > 100);
+        assert!(!b.transmission_ledger.is_empty());
+        let offered = b.sent_log_for_test.len();
+
+        b.forced_datagram_limit_for_test = Some(1);
+        let stop = b.drain_reliable_emitter(now_std());
+
+        assert!(
+            matches!(stop, pacing::Stop::Empty),
+            "an unsendable datagram must not stop the drain"
+        );
+        assert_eq!(b.sent_log_for_test.len(), offered, "nothing is offered");
+        assert_eq!(b.reliable_emitter.queued_h264_bytes(), 0);
+        assert!(b.h264.stats.oversize_h264 > 0);
+        assert_eq!(b.h264.stats.send_too_large, 0);
+        assert!(
+            b.transmission_ledger.is_empty(),
+            "forgotten, not left to be judged lost"
+        );
+        assert_eq!(b.h264.stats.tx_judged_lost, 0);
+        assert_eq!(b.h264.pending_idr, Some(IdrCause::MtuShrink));
+        assert!(b.reliable_emitter.h264.get(1, 0).is_none());
+
+        // The IDR for the new size supersedes what is left and holds in its
+        // own right; the retired hold is replaced, not waited on.
+        send(&mut b, 3, true);
+        assert_eq!(b.h264.stats.idr_by_cause[IdrCause::MtuShrink.index()], 1);
+        assert_eq!(b.h264.hold.map(|h| h.frame_seq), Some(3));
+        assert!(b.reliable_emitter.h264.get(2, 0).is_none());
+    }
+
+    /// The limit is derived from quinn's size as the drain really does it:
+    /// `raw - framing`. A datagram exactly at the limit goes; one byte over is
+    /// retired. (The forced limit of the tests above skips that subtraction.)
+    #[tokio::test(start_paused = true)]
+    async fn the_limit_is_quinns_size_less_the_framing() {
+        let mut b = bridge().await;
+        b.forced_fifo_depth_for_test = Some(usize::MAX / 2);
+        send(&mut b, 1, true);
+        b.record_emitted_transmissions(now_std());
+        let biggest = (0u16..)
+            .map_while(|i| b.reliable_emitter.h264.get(1, i).map(|e| e.datagram.len()))
+            .max()
+            .expect("the IDR is cached");
+        assert!(biggest > 100 && b.reliable_emitter.queued_h264_bytes() > 0);
+        let framing = b.live_framing_len();
+        assert!(framing >= 1);
+
+        // Exactly fits: nothing is retired.
+        b.forced_raw_datagram_size_for_test = Some(biggest + framing);
+        b.drain_reliable_emitter(now_std());
+        assert_eq!(b.h264.stats.oversize_h264, 0, "a datagram at the limit");
+        assert_eq!(b.h264.pending_idr, None);
+
+        // One byte less: the biggest no longer fits.
+        b.forced_raw_datagram_size_for_test = Some(biggest + framing - 1);
+        b.drain_reliable_emitter(now_std());
+        assert!(b.h264.stats.oversize_h264 > 0, "one byte over");
+        assert_eq!(b.h264.pending_idr, Some(IdrCause::MtuShrink));
+        assert_eq!(b.h264.stats.send_too_large, 0);
+    }
+
+    /// A fragment whose ledger record is gone (evicted by the cap) is still an
+    /// H.264 fragment: it is recovered the same way, not counted as untracked,
+    /// and no forgotten-count is made for a record that did not exist.
+    #[tokio::test(start_paused = true)]
+    async fn an_oversize_fragment_with_no_ledger_record_is_still_recovered() {
+        let mut b = bridge().await;
+        b.forced_fifo_depth_for_test = Some(usize::MAX / 2);
+        send(&mut b, 1, true);
+        b.record_emitted_transmissions(now_std());
+        let wss: Vec<u32> = (0u16..)
+            .map_while(|i| b.reliable_emitter.h264.get(1, i).map(|e| e.latest_ws))
+            .collect();
+        assert!(!wss.is_empty());
+        for ws in &wss {
+            assert!(b.transmission_ledger.forget_outstanding(*ws).is_some());
+        }
+        assert!(b.transmission_ledger.is_empty());
+
+        b.forced_datagram_limit_for_test = Some(1);
+        b.drain_reliable_emitter(now_std());
+
+        // Every fragment is recognised by its header (frame XOR parity has no
+        // content to recover and stays "untracked").
+        assert_eq!(b.h264.stats.oversize_h264, wss.len() as u64);
+        assert_eq!(b.h264.stats.tx_forgotten, 0);
+        assert_eq!(b.h264.pending_idr, Some(IdrCause::MtuShrink));
+        assert!(b.reliable_emitter.h264.get(1, 0).is_none());
+    }
+
+    /// A retired probe pad is not an H.264 fragment: it must not enter the
+    /// forgotten count of the fragment identity.
+    #[tokio::test(start_paused = true)]
+    async fn a_retired_pad_is_not_counted_as_a_forgotten_fragment() {
+        let mut b = bridge().await;
+        b.forced_fifo_depth_for_test = Some(usize::MAX / 2);
+        send(&mut b, 1, true);
+        let template = b
+            .reliable_emitter
+            .h264
+            .get(1, 0)
+            .map(|e| e.datagram.clone())
+            .expect("cached");
+        let tag = crate::transport::reliable_emitter::cache::ProbeTag {
+            id: 1,
+            min_probes: 1,
+            min_bytes: 1,
+            bytes_sent_before: 0,
+        };
+        b.reliable_emitter
+            .submit_h264_pad(&template, tag, now_std());
+        assert!(!b.reliable_emitter.pads.is_empty(), "the pad is held");
+        // Purge the fragments the usual way so only the pad remains queued
+        // beyond them, then retire everything.
+        b.forced_datagram_limit_for_test = Some(1);
+        b.drain_reliable_emitter(now_std());
+        assert_eq!(b.h264.stats.oversize_pad, 1);
+        let frags = b.h264.stats.oversize_h264;
+        assert!(frags > 0);
+        assert_eq!(
+            b.h264.stats.tx_forgotten, frags,
+            "only fragments are counted"
+        );
+        assert!(b.reliable_emitter.pads.is_empty(), "the pad is released");
+    }
+
+    /// Datagrams that still fit are sent as before, whatever else is retired.
+    #[tokio::test(start_paused = true)]
+    async fn a_limit_that_every_datagram_meets_retires_nothing() {
+        let mut b = bridge().await;
+        b.forced_fifo_depth_for_test = Some(usize::MAX / 2);
+        send(&mut b, 1, true);
+        b.record_emitted_transmissions(now_std());
+        let offered = b.sent_log_for_test.len();
+        b.forced_datagram_limit_for_test = Some(usize::MAX);
+        b.forced_fifo_depth_for_test = None;
+        b.pump_admission();
+        assert!(b.sent_log_for_test.len() > offered, "the fragments went");
+        assert_eq!(b.h264.stats.oversize_h264, 0);
+        assert_eq!(b.h264.pending_idr, None);
+        assert_eq!(
+            b.h264.stats.idr_requests_by_cause[IdrCause::MtuShrink.index()],
+            0
+        );
     }
 
     /// An IDR purges what the stale frames still have queued.

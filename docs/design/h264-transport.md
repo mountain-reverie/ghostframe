@@ -203,8 +203,25 @@ Phase B.
 
 **IDR causes** (`IdrCause`): `session`, `loss`, `client_reset`, `resolution`,
 `reentry` (tile to H.264; a still-pending loss request is credited to it),
-`hold_timeout`, `rate_drop`, `rate_rise`, `gop_periodic`. Requests coalesce:
-while one is pending the cause stays the first one's.
+`hold_timeout`, `rate_drop`, `rate_rise`, `gop_periodic`, `mtu_shrink`. Requests
+coalesce: while one is pending the cause stays the first one's.
+
+**MTU shrink.** Fragments are cut for the datagram size quinn reports when the
+frame is made, and are stored (emission queue, loss-path cache) at that size.
+quinn's MTU discovery can raise the size to about 1412 and its black-hole
+detector can put it back to the 1200-byte floor (about 1160 of datagram), so a
+stored fragment may no longer fit. Offering it fails `TooLarge`, and a refusal
+re-queues the datagram at the head of the emission queue, so the drain stops at
+it for good and the IDR is never delivered. The bridge's drain therefore checks
+every datagram against the size quinn takes now and retires one that does not
+fit: it is not offered, the ledger forgets it with no verdict, and its owner is
+told. For an H.264 fragment that is an IDR cut for the new size under cause
+`mtu_shrink`, which supersedes every older frame and replaces the hold on the
+IDR that cannot complete (the cause is a transport event, like a session start,
+not a decoder or loss event). A tile pass is dropped from the retransmit cache
+and the next capture is made whole; probe padding and parity are dropped.
+Counters: `oversize_h264`, `oversize_tile`, `oversize_pad`,
+`oversize_untracked`; `send_too_large` counts quinn refusals and must stay 0.
 
 **Frame skip.** The encoder is not run (the capture is dropped, the next frame
 is made fully dirty) while an IDR hold or deferred loss IDR is in force, or
@@ -414,7 +431,7 @@ cadence as `cumulative emit`; `io_bridge/frame.rs`). Fields:
 | Group | Fields |
 |---|---|
 | frames | `frames_sent`, `frames_idr`, `frames_acked`, `frames_suspect` |
-| IDRs by cause | `idr_session`, `idr_loss`, `idr_client_reset`, `idr_resolution`, `idr_reentry`, `idr_hold_timeout`, `idr_gop_periodic`, `idr_rate_drop`, `idr_rate_rise`, `loss_idr_rate_limited`, `idr_requests_coalesced` |
+| IDRs by cause | `idr_session`, `idr_loss`, `idr_client_reset`, `idr_resolution`, `idr_reentry`, `idr_hold_timeout`, `idr_gop_periodic`, `idr_rate_drop`, `idr_rate_rise`, `idr_mtu_shrink`, `send_too_large`, `oversize_h264`, `oversize_tile`, `oversize_pad`, `oversize_untracked`, `loss_idr_rate_limited`, `idr_requests_coalesced` |
 | rate and probing | `rate_reopens_gop`, `rate_target_bps`, `app_probes`, `probe_padding_windows`, `probe_padding_bytes`, `frames_skipped_pad` |
 | verdicts | `verdicts_idr_frag`, `verdicts_p_frag`, `verdicts_already_acked` |
 | resends | `idr_fragments_resent`, `probe_fragments_resent` |

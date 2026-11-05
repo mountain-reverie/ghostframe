@@ -28,11 +28,23 @@ impl IoBridge {
     pub(super) fn drain_reliable_emitter(&mut self, now: std::time::Instant) -> pacing::Stop {
         use crate::transport::admission::{admit_one, Admit, AdmitClass};
         use crate::transport::reliable_emitter::emission_queue::Emission;
+        // The largest datagram quinn takes now. It is not the size the
+        // queued datagrams were built for: it can fall after they were (see
+        // `retire_oversize`), and nothing inside a datagram can be refitted.
+        let fit_limit = self
+            .live_max_datagram_size_raw()
+            .map(|raw| raw.saturating_sub(self.live_framing_len()));
+        #[cfg(test)]
+        let fit_limit = self.forced_datagram_limit_for_test.or(fit_limit);
         while let Some(emission) = self.reliable_emitter.next_emission(now) {
             let (bytes, class) = match &emission {
                 Emission::Source(bytes, class) => (bytes.clone(), *class),
                 Emission::Parity(bytes, _) => (bytes.clone(), WireClass::Parity),
             };
+            if fit_limit.is_some_and(|limit| bytes.len() > limit) {
+                self.retire_oversize(&emission, now);
+                continue;
+            }
             let mut charged = 0usize;
             if let Some(gate) = self.gate {
                 if let Some(depth) = self.live_fifo_depth() {
@@ -91,6 +103,106 @@ impl IoBridge {
         pacing::Stop::Empty
     }
 
+    /// A queued datagram is larger than the connection now takes, because the
+    /// path MTU fell after it was built (discovery raised it, then quinn's
+    /// black-hole detector put it back to the floor). Sending it is refused
+    /// as `TooLarge` every time, and a refusal puts it back at the head of
+    /// the queue, so one such datagram stops the drain for good and every
+    /// resend of a stored one repeats the refusal. It is retired instead:
+    /// never offered to quinn, forgotten in the ledger (it never departed, so
+    /// no verdict and no loss signal), and its owner told, because what the
+    /// datagram carried is not delivered by any other means:
+    ///
+    /// - a tile pass: the tile's cache entries go and the next capture is
+    ///   made whole, so the tile is encoded again at the size that fits;
+    /// - an H.264 fragment: the frame cannot complete, nor can the fragments
+    ///   cached for the loss path, which are all the old size. Its cache
+    ///   entry goes and an IDR cut for the current size is requested
+    ///   ([`IdrCause::MtuShrink`]); it supersedes every older frame, queued
+    ///   or cached, and replaces the hold on the IDR that cannot complete;
+    /// - probe padding: owes the client nothing, dropped;
+    /// - XOR parity: its sources are the same size, so they are retired too.
+    fn retire_oversize(
+        &mut self,
+        emission: &crate::transport::reliable_emitter::emission_queue::Emission,
+        now: std::time::Instant,
+    ) {
+        use crate::transport::reliable_emitter::Content;
+        // The ledger must hold what the emitter has reported before it can
+        // forget any of it.
+        self.record_emitted_transmissions(now);
+        let tx = emission
+            .wire_seq()
+            .and_then(|ws| self.transmission_ledger.take_undeparted(ws));
+        let tracked = tx.is_some();
+        // A record evicted by the ledger's cap (or never made) does not make
+        // the datagram anonymous: its header says what it is.
+        let content = tx
+            .map(|t| t.content)
+            .or_else(|| Self::content_of_untracked(emission));
+        match content {
+            Some(Content::Tile(key)) => {
+                self.h264.stats.oversize_tile += 1;
+                // Pairs the emitter's cache with the CDF 5/3 coverage.
+                self.cancel_in_flight_for_tile(key.tile_x, key.tile_y);
+                self.ensure_baseline_invalidated();
+            }
+            Some(Content::H264Frag {
+                frame_seq,
+                frag_idx,
+            }) => {
+                // The ledger identity counts H.264 fragments only.
+                if tracked {
+                    self.h264.stats.tx_forgotten += 1;
+                }
+                self.h264.stats.oversize_h264 += 1;
+                self.reliable_emitter.h264.remove(frame_seq, frag_idx);
+                self.request_h264_idr(IdrCause::MtuShrink, now);
+                // As for a loss IDR: a screen that has stopped changing makes
+                // no capture with dirty tiles, so no frame to carry the IDR.
+                self.ensure_baseline_invalidated();
+            }
+            Some(Content::Pad(ws)) => {
+                self.h264.stats.oversize_pad += 1;
+                self.reliable_emitter.pads.remove(ws);
+            }
+            None => self.h264.stats.oversize_untracked += 1,
+        }
+    }
+
+    /// What a queued datagram with no ledger record carries, read from its
+    /// own header: an H.264 frame fragment (or its resend) or probe padding.
+    /// `None` for parity, tile passes (their key is not in the datagram) and
+    /// anything else.
+    fn content_of_untracked(
+        emission: &crate::transport::reliable_emitter::emission_queue::Emission,
+    ) -> Option<crate::transport::reliable_emitter::Content> {
+        use crate::transport::protocol::{FrameHeader, FRAME_FLAG_PAD, FRAME_HEADER_SIZE};
+        use crate::transport::reliable_emitter::emission_queue::Emission;
+        use crate::transport::reliable_emitter::Content;
+        let Emission::Source(bytes, class) = emission else {
+            return None;
+        };
+        // A tile datagram sets the top bit of its first byte.
+        if bytes.len() < FRAME_HEADER_SIZE
+            || bytes[0] & 0x80 != 0
+            || !matches!(class, WireClass::H264 | WireClass::LossRetransmit)
+        {
+            return None;
+        }
+        let h = FrameHeader::decode(bytes).ok()?;
+        if h.is_parity() {
+            return None;
+        }
+        if h.flags & FRAME_FLAG_PAD != 0 {
+            return Some(Content::Pad(h.wire_seq));
+        }
+        Some(Content::H264Frag {
+            frame_seq: h.frame_seq,
+            frag_idx: h.frag_idx,
+        })
+    }
+
     /// Give back what superseded PalRle work was holding on its palette.
     ///
     /// Every superseded item gives back the palette reference Phase A took.
@@ -131,6 +243,10 @@ impl IoBridge {
     /// connection, or datagrams unsupported. Pure lookup: callers keep their
     /// own side effects and arithmetic.
     pub(super) fn live_max_datagram_size_raw(&mut self) -> Option<usize> {
+        #[cfg(test)]
+        if let Some(raw) = self.forced_raw_datagram_size_for_test {
+            return Some(raw);
+        }
         let handle = self.live_send_handle()?;
         let conn = self.server.connections.get_mut(&handle)?;
         conn.datagrams().max_size()
@@ -240,6 +356,9 @@ impl IoBridge {
                 if let Err(e) = sent {
                     rejected = true;
                     self.datagram_send_errs = self.datagram_send_errs.saturating_add(1);
+                    if matches!(e, quinn_proto::SendDatagramError::TooLarge) {
+                        self.h264.stats.send_too_large += 1;
+                    }
                     if !self.datagram_send_err_first_logged {
                         self.datagram_send_err_first_logged = true;
                         tracing::warn!(
