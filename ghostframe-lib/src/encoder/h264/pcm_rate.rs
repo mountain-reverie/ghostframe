@@ -19,6 +19,11 @@
 //! | 5 | The cap is soft. A P frame may exceed it by `cap_overshoot` (1.0: hard; S2 saw 1.08 when the cap is reachable, 1.69 and 2.88 when it is not). An IDR exceeds it by up to 13 %. The excess is debt on the bucket, repaid by the frames after it. | (b) "P within ~8 %... overshoot of 1.7-2.9x when it is not achievable"; IDR -6 %..+13 % |
 //! | 6 | A re-send of the rate buffers on a P frame, a rate step or not (the backend starts the HRD at 40 % fullness on it, `P_RESEND_HRD_FULLNESS_PCT`), gives frames of `RESEND_PROFILE` times the average over the next three: 1.00, 0.56, 0.87 (a short dip of about 19 % of the bytes over three frames, no burst). The profile is the same for a pure re-send and for +-10 % steps, and for a rise or a fall, so it does not depend on the step. PROVISIONAL, from T4 `h264_direct_resend_fullness_sweep` on the RX 480 (2026-11-05; settled mean about 1.0 at every fullness): 30 %: 0.71 / 0.41 / 0.81; 40 %: 1.00 (0.99-1.00) / 0.56 / 0.87; 50 %: 1.32 / 0.69 / 0.88; 60 %: 1.40 / 0.92 / 0.97; 75 % (the earlier backend): 1.40 / ~1.08. The burst calibration of the earlier backend (a first frame `step_excess_up` 0.8 / `step_excess_down` 0.7 / `resend_excess` 0.4 over the average, settled on the second frame; T4 `small_rate_steps_first_frame_ratio`: rise 1.76-1.90x, fall 1.56-1.82x, pure re-send 1.40x) stays as [`PcmRateModel::with_burst_resend`], to characterise a backend that re-sends at 75 %. S2 (a) had 1.7-1.8x settling in 3-4 frames at a 100 ms HRD, which `with_s2_transient` still gives. `step_scaling` is the exponent of `(|new - old| / max / 0.75).min(1)` on the burst's excess: 0, flat, is what the data say; 1 is the earlier linear assumption (`with_linear_step_scaling`). | T4 on the RX 480; S2 (a) for the pessimistic reading |
 //! | 7 | A re-send of the rate buffers may reset the VCE's buffer level (`resend_resets_level`). S2 did not measure this (it re-sent rarely). Off by default; T4 `h264_direct_a_noisy_rate_sequence_at_4hz_tracks_without_a_burst` measured no burst from re-sends beyond the first-frame transient (worst 1 s window 1.11x the rates told, worst P 0.67x its cap), so it stays off. | not measured: the open question of review item 13 |
+//! | 8 | A probe window's rise (the rate goes up by more than 30 % of the new rate) gives frames of `RAISE_PROFILE` times the average at the window's rate: 1.00, 0.36, 0.83 (a mean yield of 0.73 of the bytes asked for; min 0.63, max 0.79 over the runs). Frame 2 is the small one (0.30-0.42). `raise_yield` scales it: 0.86 is the VCE's minimum, the pessimistic gate. | T4 `h264_direct_probe_raise_lever_b_at_40pct`, RX 480, 2026-11-06 |
+//! | 9 | The fall that ends a window (the first rate change after a raise, downwards) gives frames of `POST_RAISE_PROFILE`: 0.5, 0.5, then the settled rate. The restore is not free: two frames at half the rate's average. | the same T4 |
+//!
+//! `idr_fill` (3b) underestimates an IDR whose content is the limit: the VCE
+//! gave up to 1.15 x its budget there, where the model gives 0.6 of it.
 //!
 //! Not modelled, because S2 only observed it on content the model has no
 //! picture of: the first P after an IDR being "always big" (b), the QP-51
@@ -46,6 +51,17 @@ const RESEND_EXCESS: f64 = 0.4;
 /// `h264_direct_resend_fullness_sweep`, 2026-11-05: 1.00 / 0.56 / 0.87, the
 /// same for a pure re-send and for +-10 % steps). Provisional.
 const RESEND_PROFILE: [f64; 3] = [1.0, 0.56, 0.87];
+/// The frames of a probe window's rate (a rise of more than
+/// [`RAISE_STEP_MIN`]) as multiples of the average frame at the new rate: 1.00,
+/// then 0.36 (0.30-0.42 on the VCE) and 0.83 (0.6-1.0), a mean of 0.73 (min
+/// 0.63, max 0.79) against a 33.3 kB window-rate frame. T4
+/// `h264_direct_probe_raise_lever_b_at_40pct` on the RX 480, 2026-11-06. The
+/// 40 % re-send's own profile (above) is 0.81 and has a frame 2 of 0.56; the
+/// window's rise is a bigger step and the second frame is smaller.
+const RAISE_PROFILE: [f64; 3] = [1.0, 0.36, 0.83];
+/// The frames after the window, when the rate goes back down: a dip of about
+/// 0.5 x the average for two frames (T4 lever B), then the settled rate.
+const POST_RAISE_PROFILE: [f64; 3] = [0.5, 0.5, 1.0];
 /// The frames over which the excess decays to nothing (T4: frame 2 on is back
 /// at 0.9-1.05x). Provisional.
 const STEP_SETTLE_FRAMES: u32 = 1;
@@ -96,12 +112,13 @@ pub struct PcmRateModel {
     pub idr_fill: f64,
     /// Behaviour 8, the probe raise: the frames of a big rise of the rate (a
     /// step of more than [`RAISE_STEP_MIN`] of the new rate, which is what a
-    /// probe window's rate is) carry this fraction of what the 40 % re-send
-    /// profile gives them. 1.0: the profile as measured on the VCE. Under 1.0:
-    /// a pessimistic backend. The spike (T4, 75 % fullness) gave 51.0 / 28.9 /
-    /// 29.9 kB for a window rate of 33.3 kB a frame, 1.10 of the 100 kB asked
-    /// for; the 40 % profile (1.00 / 0.56 / 0.87) is 0.81 of it. To be
-    /// re-measured: `h264_direct_probe_raise_lever_b_at_40pct`.
+    /// probe window's rate is) follow [`RAISE_PROFILE`] (1.00 / 0.36 / 0.83, a
+    /// mean yield of 0.73 of the window's bytes) times this. 1.0: as measured
+    /// on the VCE (T4 `h264_direct_probe_raise_lever_b_at_40pct`: mean 0.73,
+    /// min 0.63, max 0.79). 0.86 gives the VCE's minimum (0.63), the
+    /// pessimistic gate; 0.7 is more pessimistic still. The 75 %-fullness
+    /// spike of the earlier backend gave 51.0 / 28.9 / 29.9 kB for a 33.3 kB
+    /// window-rate frame, 1.10 of the 100 kB asked for.
     pub raise_yield: f64,
 }
 
@@ -278,6 +295,10 @@ pub(crate) struct RateState {
     step_excess: f64,
     /// The step in progress is a big rise (see [`RAISE_STEP_MIN`]).
     raise_step: bool,
+    /// The step in progress is the fall that ends a raise window.
+    post_raise_step: bool,
+    /// The last step was a big rise: the next fall is its window ending.
+    after_raise: bool,
 }
 
 impl RateState {
@@ -307,6 +328,7 @@ impl RateState {
         if resent {
             self.step_excess = m.resend_excess;
             self.raise_step = false;
+            self.post_raise_step = false;
         } else if let (true, Some(l)) = (stepped, self.last) {
             let (old, new) = (f64::from(l.bps), bps);
             let rel = (new - old).abs() / old.max(new).max(1.0);
@@ -317,6 +339,9 @@ impl RateState {
             };
             self.step_excess = base * (rel / STEP_MEASURED).min(1.0).powf(m.step_scaling);
             self.raise_step = new > old && rel >= RAISE_STEP_MIN;
+            // The fall that follows a raise ends its window: the encoder dips.
+            self.post_raise_step = new < old && self.after_raise;
+            self.after_raise = self.raise_step;
         }
         self.frames_since_step = if stepped {
             0
@@ -332,7 +357,14 @@ impl RateState {
             && self.frames_since_step < settle
             && (!m.burst_resend || self.step_excess > 0.0);
         let factor = if in_transient && !m.burst_resend {
-            RESEND_PROFILE[self.frames_since_step as usize]
+            let profile = if self.raise_step {
+                &RAISE_PROFILE
+            } else if self.post_raise_step {
+                &POST_RAISE_PROFILE
+            } else {
+                &RESEND_PROFILE
+            };
+            profile[self.frames_since_step as usize]
         } else if in_transient {
             1.0 + self.step_excess
                 * (1.0 - f64::from(self.frames_since_step) / f64::from(m.settle_frames.max(1)))
@@ -555,7 +587,7 @@ mod tests {
         assert_eq!(hard.frames_over_cap, 0);
     }
 
-    /// Behaviour 6: a P re-send of the rate buffers, a rise, a fall or the same
+    /// Behaviour 6: a P re-send of the rate buffers, a fall, a small step or the same
     /// rate with only the cap moved, gives frames of 1.00, 0.56 and 0.87 times
     /// the average and is settled on the fourth (T4
     /// `h264_direct_resend_fullness_sweep`, HRD at 40 %).
@@ -574,13 +606,9 @@ mod tests {
             let r: Vec<f64> = sizes.iter().map(|&b| b as f64 / avg(to.bps)).collect();
             (r, stats)
         };
-        // A rise, a fall, a 10 % step and a pure re-send all give the profile.
-        for (from, to) in [
-            (&low, &high),
-            (&high, &low),
-            (&high, &small),
-            (&high, &nudged),
-        ] {
+        // A fall, a 10 % step and a pure re-send all give the profile (a big
+        // rise is a probe window's, and has its own: behaviour 8).
+        for (from, to) in [(&high, &low), (&high, &small), (&high, &nudged)] {
             let (r, stats) = steady_then(from, to);
             for (k, want) in RESEND_PROFILE.iter().enumerate() {
                 assert!((r[k] - want).abs() < 0.03, "{from:?} -> {to:?}: {r:?}");
@@ -780,5 +808,40 @@ mod tests {
                 "premise: the sequence stepped and made IDRs"
             );
         }
+    }
+
+    /// Behaviour 8: the frames of a probe window's rise follow the T4 profile
+    /// (1.00 / 0.36 / 0.83, a mean of 0.73), and the fall that ends it dips to
+    /// half for two frames, then is back at the rate's average.
+    #[test]
+    fn a_raise_window_follows_the_measured_profile_and_its_end_dips() {
+        let (base, raised) = (2_500_000u32, 8_000_000u32);
+        let m = model();
+        let mut st = RateState::default();
+        p_frames(&mut st, &m, &RateTarget::steady(base, FPS), 90);
+        let (win, _) = p_frames(&mut st, &m, &RateTarget::steady(raised, FPS), 3);
+        let (after, _) = p_frames(&mut st, &m, &RateTarget::steady(base, FPS), 6);
+        let rel = |v: &[usize], avg: f64| v.iter().map(|&b| b as f64 / avg).collect::<Vec<_>>();
+        let w = rel(&win, avg(raised));
+        for (got, want) in w.iter().zip(RAISE_PROFILE) {
+            assert!((got - want).abs() < 0.05, "window frames {w:?}");
+        }
+        let mean = w.iter().sum::<f64>() / 3.0;
+        assert!((0.70..=0.76).contains(&mean), "mean yield {mean:.2}");
+        let a = rel(&after, avg(base));
+        assert!(
+            a[0] < 0.6 && a[1] < 0.6,
+            "two frames at about half after the window: {a:?}"
+        );
+        assert!(
+            a[3..].iter().all(|&x| (x - 1.0).abs() < 0.05),
+            "then the rate's average: {a:?}"
+        );
+        // A fall that does not follow a raise is the plain re-send profile.
+        let mut st = RateState::default();
+        p_frames(&mut st, &m, &RateTarget::steady(raised, FPS), 90);
+        let (down, _) = p_frames(&mut st, &m, &RateTarget::steady(base, FPS), 3);
+        let d = rel(&down, avg(base));
+        assert!((d[1] - 0.56).abs() < 0.05, "a plain fall: {d:?}");
     }
 }
