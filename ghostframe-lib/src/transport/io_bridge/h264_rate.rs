@@ -457,7 +457,7 @@ impl RatePolicy {
         let since = self
             .last_apply
             .map_or(Duration::MAX, |t| now.saturating_duration_since(t));
-        if since < APPLY_MIN_INTERVAL || cand == applied {
+        if since < APPLY_MIN_INTERVAL {
             return None;
         }
         let band = if cand > applied {
@@ -465,7 +465,16 @@ impl RatePolicy {
         } else {
             APPLY_MOVE_FRACTION
         };
-        if relative_move(applied, cand) <= band {
+        if cand == applied || relative_move(applied, cand) <= band {
+            // The spike is over and its rate stays (the estimate caught up
+            // with it): the applied rate is the stream's own now, not a spike
+            // to give back from. Without this the flags outlive the spike and
+            // a later real fall is measured from the pre-spike rate, so it is
+            // not seen as a cut.
+            if !self.candidate_spiked && self.applied_spiked {
+                self.applied_spiked = false;
+                self.pre_spike_applied = None;
+            }
             return None;
         }
         while self
@@ -2135,6 +2144,53 @@ mod tests {
         assert!(
             steps.iter().all(|(_, a)| !a.cut),
             "no apply of a spike and its release is a cut: {steps:?}"
+        );
+    }
+
+    /// A spike that turns out to be the real path (the estimate stays up, the
+    /// smoothed estimate catches up, the hold ends inside the dead band) leaves
+    /// the applied rate as the stream's own: a later fall of over 30 % is a cut
+    /// measured from it, not from the pre-spike rate.
+    #[test]
+    fn in_place_a_spike_that_became_real_leaves_no_stale_pre_spike_reference() {
+        let t0 = Instant::now();
+        let est = |t: u64| match t {
+            0..3_000 => 5 * MBIT,
+            3_000..12_000 => 15 * MBIT,
+            _ => 6 * MBIT,
+        };
+        let mut p = RatePolicy::default();
+        // The path then goes quiet for 4 s (no estimate), and the next one is
+        // the fall: the smoothed estimate follows it in one step.
+        let mut steps = drive_with(&mut p, t0, 12_000, est, |_| false);
+        let mut t = 16_000;
+        while t < 20_000 {
+            if let Some(a) = p.step_in_place(ms(t0, t), est(t), false) {
+                steps.push((t, a));
+            }
+            t += 16;
+        }
+        let up = steps
+            .iter()
+            .find(|(t, a)| *t >= 3_000 && a.bps >= 11_000_000)
+            .expect("premise: the spike's rate was taken");
+        assert!(
+            steps.iter().all(|(t, _)| *t <= up.0 || *t >= 12_000),
+            "premise: the hold ended inside the dead band, nothing applied until the fall: {steps:?}"
+        );
+        let after: Vec<_> = steps.iter().filter(|(t, _)| *t >= 12_000).collect();
+        let low = after
+            .iter()
+            .map(|(_, a)| a.bps)
+            .min()
+            .expect("the fall is followed");
+        assert!(
+            f64::from(low) < f64::from(up.1.bps) * 0.7,
+            "premise: a fall of over 30 % from the rate that stayed"
+        );
+        assert!(
+            after.iter().any(|(_, a)| a.cut),
+            "the fall is a cut: {steps:?}"
         );
     }
 }
