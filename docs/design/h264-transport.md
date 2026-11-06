@@ -269,7 +269,7 @@ for an IDR:
   1 s; evaluated at most every 250 ms. A running rate within 10 % of the
   candidate is left alone.
 - A raw estimate more than 1.5 x the smoothed one is a spike and is held for
-  1 s, so the target can follow a probe that goog_cc pulls back faster than the
+  1 s (2 s, and releasable, on acked-reference sessions: section 10), so the target can follow a probe that goog_cc pulls back faster than the
   EWMA rises.
 - **Drop:** a candidate more than 30 % under the running rate reopens at once
   (`IdrCause::RateDrop`, with a P hold; the IDR is cheaper at the lower rate).
@@ -648,16 +648,37 @@ the HRD restarts at 40 % fullness, so the first frame after a re-send is about
 4 Hz of noisy re-sends is 0.97 of the rate told).
 
 - Candidate and target as in section 4 (`0.8 x` the smoothed estimate, a raw
-  jump held), but a jump is held for 2 s (`SPIKE_HOLD_IN_PLACE`): swept on the
-  96-seed step-up population (raise on), 0.5 s / 1 s / 2 s reached the headroom on
-  75 / 79 / 96 of 96 timelines and the p90 fell from 12.4 s to 5.5 s.
+  jump held), but a jump is held for 2 s (`SPIKE_HOLD_IN_PLACE`). A probe's
+  result is the estimate's peak for a few hundred milliseconds, and the stream
+  has to send at the rate it found for long enough for the acknowledgements to
+  confirm it, or goog_cc pulls the estimate back before the stream used it. At
+  1 s of hold the stream used the headroom on 28/16/18 of 96 timelines against
+  52/58/55 at 2 s (the sustained metric below).
+- The hold is **releasable**: it is let go when the raw estimate falls below
+  the smoothed estimate from before the spike (the path is worse than it was),
+  or below 0.85 of the spike while goog_cc reports a loss limit
+  (`LossState`). A queue on the path is not read as distress (a probe burst
+  builds one by design: with it the hold was let go on most step-ups and the
+  stream used the headroom on 12 of 96). goog_cc's delay detector state is not
+  exposed, so a delay-only overuse is seen as the estimate falling below the
+  pre-spike level, not as itself. A hold that cannot be let go keeps a stream
+  at three times its path for the rest of the 2 s after a drop that follows a
+  rise (scene 6C: 31-54 kB over the link in 3 s and 119-123 of 150 frames shown,
+  against 2-10 kB and 140-144).
 - An apply needs a 10 % fall or a 15 % rise from the running rate and is never
   closer than 250 ms to the last. Inside the band nothing is re-sent. There is
   no 2 s lock, so a drop shortly after a rise applies at once, and no confirmation
   count.
 - A **cut** (the 3 s quiet period without padding, `last_cut_at`) is a fall of
-  more than 30 % from the highest rate applied in the last second: a large fall
-  may arrive as several smaller steps.
+  more than 30 % from the highest rate applied *outside a spike* in the last
+  second, or from the rate in force before the spike. A spike is only
+  recognised above 1.5 x the smoothed estimate, so its give-back is always a
+  fall of over 30 %; counting it a cut silenced padding, the raise and the
+  application's probes for 3 s after every probe.
+- An expired spike is not re-armed by a later one (`observe` took the maximum
+  with the previous spike's value without asking whether it was still held: a
+  10 Mbit/s blip on a 6 Mbit/s path applied 8 Mbit/s on a 2 Mbit/s path
+  for 2.1 s, 17 s after the blip, on a 3.5 Mbit/s reading). Phase A shares the line and is fixed with it.
 - Every plan carries a `RateTarget`: `bps`, a P-frame cap of 3 average frames
   (`max_frame_bytes`, soft: the VCE overshoots it), the IDR budget `max(0.25 s of
   the rate, 32 kB)` (`idr_max_bytes`, an IDR is content-limited and lands within
@@ -665,45 +686,79 @@ the HRD restarts at 40 % fullness, so the first frame after a re-send is about
   budget on an IDR frame. The buffers (rate control, HRD, max frame size) are
   sent together; a change that only touches the cap is latched by a +-16 bps
   nudge of the rate. One writer: the planner's request, never the control
-  channel.
-- **Probe raise.** A probe window is made of real frames where it can be. While
-  a window is open (goog_cc's request or the application's own) each P frame is
-  planned at `RATE_SHARE x` the window's rate (about three frames of a 100 ms
-  window at 30 fps, at most 3), its fragments are tagged into the window, and the
-  estimate ceiling is held off for it (for any window real frames claim, IDRs
-  included). Padding stays, for the shortfall: on the first frame it is sized
-  for the cluster less what the frames still to come are expected to carry
-  (`RAISE_EXPECTED_YIELD`, half an average frame each), and the last frame
-  tops up the whole shortfall; padding late in the window runs past its end and
-  leaves at the pacer's rate, which measured worse than none. After the window the next
-  plan is at the normal rate again (a re-send that costs about nothing). The
-  raise keeps off within 3 s of a cut, behind a backlog, and for 5 s after a
-  late acknowledgement. `probe_raise_*` and `raised_frame_*` (below) account for
-  it.
+  channel. `rate_sends` / `rate_sends_10s` count every plan whose target differs
+  from the last one sent, so the probe raise's re-sends (entering a window,
+  leaving it) are counted with the policy's.
+- **Probe raise (off by default).** A probe window is made of real frames where
+  it can be. While a window is open (goog_cc's request or the application's
+  own) each P frame is planned at `RATE_SHARE x` the window's rate (up to three
+  frames of a 100 ms window at 30 fps, 2.1 on average), its fragments are
+  tagged into the window, and the estimate ceiling is held off for it (for any
+  window real frames claim, IDRs included, and for any tagged datagram: a
+  legacy-stream IDR that claims a window holds the ceiling too, which is
+  intended, its burst being the same burst). Padding stays, for the shortfall:
+  on the first frame it is sized for the cluster less what the frames still to
+  come are expected to carry (`RAISE_EXPECTED_YIELD`, half an average frame
+  each), and the last frame tops up the whole shortfall; padding late in the
+  window runs past its end and leaves at the pacer's rate, which measured worse
+  than none. After the window the next plan is at the normal rate again: a
+  re-send that costs a dip of about 0.5 of the average for two frames (T4 lever
+  B), not "about nothing".
+
+  The guards are checked for **every raised plan**, not only when a window
+  opens: a cut (3 s), a late acknowledgement (the memory is two checkpoints at
+  least 5 s apart, so it keeps the raise off for 5 to 10 s), a raised frame or
+  a probe pad judged lost (`RAISE_LOSS_PAUSE`, 10 s), and no padding yet sent
+  and judged (`RAISE_TRUST_AFTER`, 300 ms after the stream's first padding).
+  The backlog guard is the plan's own (a backed-up queue skips the frame before
+  the raise is considered).
+
+  **Why it is off.** A window's burst on a buffer shallower than the burst
+  drops the real frames queued behind the front of it (a padding-only window
+  loses padding, which costs nothing). Before the guards a median 6 raised
+  frames were lost per step-up run at a 60 ms buffer and 12 at 30 ms, against
+  none without the raise, and sustained use of the headroom was 25/48 and 12/48
+  against 35/48 and 26/48. With every guard above it is 31/48 and 31/48
+  (against 35 and 26), and on the 600 ms population 55/28/44 of 96 against
+  52/58/55 without it. The version without the "padding judged first" guard
+  found the headroom on 70/67/71 of 96 at 600 ms (the raise's real gain) and
+  paid for it at 60 ms (26/48 against 35/48) and 30 ms (22/48 against 26/48).
+  It stays behind a field (`H264State::probe_raise_on`, set by the harness
+  `InjectedH264::probe_raise`), measured by the `RefsRaise` rows and scene 9.
+  `probe_raise_*` and `raised_frame_*` (below) account for it.
 - **Measured** (browserless `p_b_seed_population`, `GF_POP_MODE`, 96 seeds, three
-  ack timings, the P-B capacity step 2 -> 6 Mbit/s, `T_UP` = 11 s; reached
-  `0.8 x 6` Mbit/s within `T_UP`, step-up p50 / p90; no collapse and the headroom
-  guard released on 96 of 96 in every row):
+  ack timings, the P-B capacity step 2 -> 6 Mbit/s, `T_UP` = 11 s, a 600 ms link
+  buffer, no collapse in any row). `reached` is the first estimate sample over
+  `0.8 x 6` Mbit/s, which a transient spike gives. `sus_est` is the first time
+  from which every estimate sample in the next second is over the line;
+  `sus_use` also needs the access units captured in that second to total at
+  least `0.8 x` the line (the stream uses what the estimate says). Hits within
+  `T_UP`, per ack timing, and the step-up p50 / p90 on `sus_use` (ms):
 
-  | | reached | step-up p50 / p90 (ms) |
-  |---|---|---|
-  | Phase A policy, no raise | 90/86/86 | 5500/7300, 5900/11800, 5700/10900 |
-  | in place, 1 s spike hold, raise off | 88/89/85 | 1900/10600, 1900/8600, 1900/12500 |
-  | in place, 2 s spike hold, raise off | 94/96/90 | 1900/6600, 1900/6000, 1900/7300 |
-  | **in place, 2 s spike hold, raise on** | **96/95/95** | **1200/5500, 1300/5400, 1300/5700** |
-  | the same at a model raise yield of 0.7 | 94/93/92 | 4600/6100, 4500/6600, 5500/6700 |
+  | | reached | sus_est | sus_use | step-up on sus_use |
+  |---|---|---|---|---|
+  | **shipped: in place, 2 s releasable hold, raise off** | 90/95/91 | 66/66/63 | **52/58/55** | 4100/16800, 4200/11100, 4300/6600 |
+  | the same, hold never released | 90/95/91 | 66/67/64 | 52/58/56 | 4700/17000, 4700/20400, 4800/14000 |
+  | the same, 1 s hold | 92/84/81 | 67/52/52 | 28/16/18 | 11100/17300, 11300/17900, 8300/22300 |
+  | Phase A policy | 90/81/85 | 74/61/55 | 60/48/43 | 10400/20500, 10600/17300, 10800/18100 |
+  | raise on, every guard | 95/92/93 | 74/63/64 | 55/28/44 | 5300/16900, 6600/20000, 6000/11800 |
+  | raise on, no "padding judged" guard | 96/96/95 | 85/89/85 | 70/67/71 | 4500/11000, 5200/9900, 4500/5500 |
 
-  The raise cuts padding per probe window to 61 % (69 % at yield 0.7) of its
-  no-raise figure (scene 9). Scene 6 (a capacity drop, with a drop shortly after a
-  rise) bounds the bytes coded at the rate in force in any 1 s window at 1.15 x
-  `RATE_SHARE x` the estimate, and the backpressure skips after the drop at half
-  those of a stream with no rate policy. The spike hold, not the raise, is what
-  fixed the tail: at 1 s of hold the raise cost 5 to 9 timelines of 96.
-- The model's raise yield is provisional until
-  `h264_direct_probe_raise_lever_b_at_40pct` (T4, owner-run) is read: the spike
-  at 75 % fullness gave 1.10 of a window's bytes, the 40 % profile alone 0.81.
-  `PcmRateModel::with_raise_yield(0.7)` is the pessimistic case the scenes also
-  pass.
+  Before this review's fixes the shipped row (2 s hold, raise on, the stale spike
+  re-armed, the earlier model) read 96/95/95 reached, 78/71/72 `sus_est` and
+  69/65/62 `sus_use`: "reached" was mostly a transient spike. Shallow buffers
+  (48 timelines, as sent): `sus_use` 26 / 35 of 48 at 30 / 60 ms without the
+  raise, 31 / 31 with every guard. Scene 6 (a capacity drop, with a drop shortly
+  after a rise, 6B, and one second after it, 6C) bounds the bytes coded at the
+  rate in force in any 1 s window at 1.15 x `RATE_SHARE x` the estimate, the
+  backpressure skips after the drop at half those of a stream with no rate
+  policy, and for 6C the bytes over the link, the frames shown and the latency.
+- The model's raise: frames of a window's rate follow 1.00 / 0.36 / 0.83 of the
+  average (mean yield 0.73, min 0.63, max 0.79 on the VCE, T4
+  `h264_direct_probe_raise_lever_b_at_40pct`), the fall that ends the window
+  dips to 0.5 for two frames, and the pessimistic gate runs at 0.86 of the
+  profile (the VCE's minimum). The model's `idr_fill` (0.6) underestimates an
+  IDR whose content is the limit (the VCE gave up to 1.15 x its budget).
 
 **Tile codec.** Leaving H.264 is unchanged. Returning is `mode_reentry`: the
 first frame is a recovery P from the newest confirmed anchor (an IDR only when
@@ -738,14 +793,16 @@ the real worker and libva-direct through a loss.
   FIFO ahead of the frames). The acked-reference loss and reordering scenes now
   run with the rate policy on (`refs_rated`): under 8 ms and 45 ms of
   reordering the stream makes at least 0.8 of the frames it makes without the
-  policy (measured 0.93 to 0.98), with one IDR. The raise keeps off for 5 s after
-  a late acknowledgement for the same reason.
+  policy (measured 0.93 to 0.98), with one IDR. The raise (off by default) keeps
+  off for 5 to 10 s after a late acknowledgement for the same reason.
 - Legacy sessions keep the Phase A encoder and policy (periodic IDR, loss IDR,
   parity, reopen on a rate change) until the ffmpeg path is removed.
-- The step-up population (`p_b_seed_population`) measures a transient: the first
-  sample over `0.8 x` the new capacity, which a probe's result gives for a few
-  hundred milliseconds. A stream that holds the headroom is not what it asks.
-- The raise's yield on the VCE is a model parameter (see above) until the T4 is
-  read; the P-frame cap is soft (`frames_over_cap` observes it).
+- The step-up population reports the first sample over `0.8 x` the new capacity
+  (`reached`) beside the sustained metric (`sus_est`, `sus_use`); the gates use
+  `sus_use`. `reached` counts a probe's transient spike.
+- The model's raise profile and post-window dip are one VCE's (the RX 480, T4);
+  the P-frame cap is soft (`frames_over_cap` observes it).
 - A raise in the window of a probe that fails (a real loss during it) costs the
-  frames' picture quality, not padding bytes; `raised_frame_lost` counts them.
+  frames' picture quality, not padding bytes; `raised_frame_lost` counts them,
+  and `pads_lost` (`h264 stats`) the probe pads the loss path judged lost, each
+  of which pauses the raise.

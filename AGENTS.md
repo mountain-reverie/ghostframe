@@ -178,26 +178,35 @@ off for a second around padding.
 An **acked-reference ("refs") session** (HELLO 0x04, the `h264 refs` line) moves
 the rate in place: no reopen, no IDR, no GOP (`RatePolicy::step_in_place`).
 `rate_updates`, `rate_applies_up` / `rate_applies_down` count the changes,
-`rate_sends` / `rate_sends_10s` the re-sends of the rate buffers (each costs a
-short dip of 1.00 / 0.56 / 0.87 times the average frame, T4, so the policy keeps
-a 250 ms floor between them, a 10 % band for a fall and 15 % for a rise, and
-never re-sends inside the band). A jump of the raw estimate is held for 2 s
-(`SPIKE_HOLD_IN_PLACE`; 1 s on Phase A). Every frame is planned under a
+`rate_sends` / `rate_sends_10s` the re-sends of the rate buffers, the probe
+raise's included (each costs a short dip of 1.00 / 0.56 / 0.87 times the average
+frame, T4; a probe window's end dips to about 0.5 for two frames; so the policy
+keeps a 250 ms floor between them, a 10 % band for a fall and 15 % for a rise,
+and never re-sends inside the band). A jump of the raw estimate is held for 2 s
+(`SPIKE_HOLD_IN_PLACE`; 1 s on Phase A), and let go early when the estimate
+falls below its pre-spike level or under 0.85 of the spike while goog_cc is
+loss-limited; the give-back is not a cut. Measure a step-up with `sus_use`
+(the estimate held over the line for a second *and* the stream sending at
+0.8 x the line), not `reached`, which counts a transient spike. Every frame is planned under a
 `RateTarget` (`bps`, a P-frame cap of 3 average frames `max_frame_bytes`, an IDR
 budget of 0.25 s of the rate with a 32 kB floor `idr_max_bytes`, and the VBV):
 `frame_cap_bytes` / `idr_cap_bytes` are the last plan's, `frames_over_cap` and
-`max_cap_ratio_pct` observe the (soft) cap and are never a gate. **Probe raise:**
-while a probe window is open (goog_cc's request or the application's own) the
+`max_cap_ratio_pct` observe the (soft) cap and are never a gate. **Probe raise
+(opt-in, off in production):** while a probe window is open (goog_cc's request or the application's own) the
 P frames are planned at `RATE_SHARE x` the window's rate and tagged into the
 window, so they carry part of the burst and padding tops up only the shortfall
 (on the first frame of the window, sized for what the frames still to come are
 expected to carry, and the whole shortfall on the last). `probe_raise_windows`,
 `probe_raise_frames`, `probe_raise_bytes` on the `h264 refs` line count it;
 `raised_frame_lost` (a verdict named a raised frame), `raised_frames_acked` and
-`raised_delivery_us_mean` / `_max` are its cost. It keeps off after a cut, behind
-a backlog, and for 5 s after a late acknowledgement (a reordering path reads a
-burst as loss). The mutation switch is the harness field
-`InjectedH264::probe_raise`, not an environment variable.
+`raised_delivery_us_mean` / `_max` are its cost. It is off because on links that
+buffer less than a window's burst (30 and 60 ms) it loses real frames and does
+not beat padding alone; every guard is re-checked on every raised plan (a cut,
+a late acknowledgement for 5 to 10 s, a raised frame or a probe pad judged lost
+for 10 s, `pads_lost` on `h264 stats`, and padding not yet judged). The switch is
+`H264State::probe_raise_on`, set from the harness field
+`InjectedH264::probe_raise`, not an environment variable; the measurements are
+in `docs/design/h264-transport.md` section 10.
 
 With `GHOSTFRAME_DAMAGE_MODE=shadow` or `on` the daemon also logs a cumulative
 `damage safety net` line every 5 s (target `ghostframe::server::damage`);
