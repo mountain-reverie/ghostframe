@@ -1721,13 +1721,24 @@ async fn p_b_population_never_collapses_and_finds_the_headroom_whenever_the_clie
 /// row, as allowed misses (the rows are n = 24/8/8/15/6/4, where a percentage
 /// says little): no collapse, the headroom found, the guard released.
 ///
-/// Measured at `GF_POP_N=96` (`p_b_seed_population`, `GF_POP_MODE`), misses
-/// out of 96 on the three chatter rows of the 20 ms path, in-place policy vs
-/// Phase A's (the 2 s lock): reached 0.8 x 6 Mbit/s in 11 s 86/95/93 vs
-/// 89/91/86, guard released 96/96/96 vs 96/96/96 (legacy 92/96/89), no
-/// collapse in either, step-up p50 1.9/2.0/2.0 s vs 1.9/2.0/5.3 s, p90
-/// 12.5/7.6/7.2 s vs 7.3/7.7/10.5 s. Premise: probes were padded and the
-/// policy moved the rate up in place on every seed.
+/// Measured at `GF_POP_N=96` (`p_b_seed_population`, `GF_POP_MODE`), rows as
+/// sent / a packet at once / a packet 8 ms later, on the 20 ms path. Reached
+/// 0.8 x 6 Mbit/s within 11 s, guard released, step-up p50/p90 (ms):
+///
+/// | mode | reached | guard | step-up |
+/// | legacy (scripted CBR) | 94/95/95 | 92/96/89 | 2100/7100, 2400/5600, 4200/7000 |
+/// | refs, bps-only model, in place | 86/95/93 | 96/96/96 | 1900/12500, 2000/7600, 2000/7200 |
+/// | refs, bps-only model, Phase A | 89/91/86 | 96/96/96 | 1900/7300, 2000/7700, 5300/10500 |
+/// | refs, full model, in place | 84/87/86 | 96/96/96 | 2000/11700, 2200/9700, 2300/10800 |
+/// | refs, full model, Phase A | 91/95/90 | 96/96/96 | 6300/9100, 2200/6700, 2200/7600 |
+/// | refs, full model, every step 1.8x | 96/95/96 | 96/96/96 | 2000/5200, 2400/6300, 2300/6000 |
+///
+/// No collapse in any. The twin never misses the guard (the 89/96 of the
+/// legacy gate is the legacy 8 ms row only). The full model is the gate's;
+/// its in-place policy reaches the headroom less often than Phase A's, which
+/// is what the later B6 steps are measured against. Premise: probes were
+/// padded, the policy moved the rate up in place and the model held frames to
+/// the rate on every seed.
 #[tokio::test(start_paused = true)]
 async fn p_b_population_refs_twin_never_collapses_and_finds_the_headroom() {
     population_gate(StepMode::Refs, Some(REFS_TWIN_ALLOWED_MISSES)).await;
