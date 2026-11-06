@@ -78,6 +78,9 @@ pub(super) struct RefsCounters {
     pub(super) reentry_bytes: u64,
     pub(super) anchor_age_ms: u64,
     pub(super) rate_updates: u64,
+    /// Of `rate_updates`, those that raised the rate, and those that lowered it.
+    pub(super) rate_applies_up: u64,
+    pub(super) rate_applies_down: u64,
     pub(super) verdicts: u64,
     /// Frames retired because a fragment outgrew the connection (`emit.rs`):
     /// counted at the first oversize fragment of each frame, the siblings
@@ -152,6 +155,8 @@ pub struct RefsReport {
     pub reentry_bytes: u64,
     pub anchor_age_ms: u64,
     pub rate_updates: u64,
+    pub rate_applies_up: u64,
+    pub rate_applies_down: u64,
     // The manager's own counters.
     pub idr_session: u64,
     pub idr_resolution: u64,
@@ -667,34 +672,36 @@ impl IoBridge {
     }
 
     /// The rate policy for a frame on an acked-reference session. The encoder
-    /// changes rate in place, so every decision the Phase A policy would have
-    /// made as a reopen is a plain rate update: no IDR, no reopen, no GOP.
+    /// changes rate in place, so a change is a plain rate update: no IDR, no
+    /// reopen, no GOP, and none of Phase A's reopen economics
+    /// ([`RatePolicy::step_in_place`]).
     fn h264_rate_step_refs(&mut self, now: Instant) {
-        use super::h264_rate::RateStep;
         let estimate = self.bwe.snapshot().bitrate_bps;
-        // `at_gop`: any move past the dead band is taken at once, since there
-        // is no scheduled IDR to wait for.
-        let step = self.h264.rate.step(now, estimate, true);
-        let fps = self.h264.fps;
-        let (bps, cut) = match step {
-            RateStep::Keep => return,
-            RateStep::Initial(bps) => (bps, false),
-            RateStep::Reopen { bps, urgent } => (bps, urgent),
-            RateStep::ReopenRise { bps } => (bps, false),
+        let before = self.h264.rate.applied();
+        let Some(apply) = self.h264.rate.step_in_place(now, estimate) else {
+            return;
         };
-        if !matches!(step, RateStep::Initial(_)) {
+        let bps = apply.bps;
+        if !apply.initial {
             self.h264.refs_counters.rate_updates += 1;
+            if before.is_some_and(|b| bps > b) {
+                self.h264.refs_counters.rate_applies_up += 1;
+            } else {
+                self.h264.refs_counters.rate_applies_down += 1;
+            }
             tracing::info!(
                 target: LOG_TARGET,
                 bps,
                 estimate_bps = estimate,
+                cut = apply.cut,
                 "H.264 rate: moved in place"
             );
         }
-        if cut {
+        if apply.cut {
             self.h264.last_cut_at = Some(now);
         }
         self.h264.stats.rate_target_bps = bps;
+        let fps = self.h264.fps;
         self.h264_control(Control::H264Rate {
             bps,
             fps,
@@ -730,6 +737,8 @@ impl IoBridge {
             reentry_bytes: c.reentry_bytes,
             anchor_age_ms: c.anchor_age_ms,
             rate_updates: c.rate_updates,
+            rate_applies_up: c.rate_applies_up,
+            rate_applies_down: c.rate_applies_down,
             idr_session: s.idr_session,
             idr_resolution: s.idr_resolution,
             idr_client_reset: s.idr_client_reset,

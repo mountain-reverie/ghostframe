@@ -2817,6 +2817,8 @@ impl IoBridge {
                     reentry_bytes = r.reentry_bytes,
                     anchor_age_ms = r.anchor_age_ms,
                     rate_updates = r.rate_updates,
+                    rate_applies_up = r.rate_applies_up,
+                    rate_applies_down = r.rate_applies_down,
                     "h264 refs (acked-reference recovery; cumulative)"
                 );
             }
