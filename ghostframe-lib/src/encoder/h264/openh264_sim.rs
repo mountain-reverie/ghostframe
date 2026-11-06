@@ -119,6 +119,32 @@ impl SimFrame {
             _ => None,
         })
     }
+
+    /// The frame a header describes, for an engine that is not the sim (the
+    /// library): its kind and mark shape, read from the header alone.
+    pub(crate) fn from_header(header: SliceHeader, recovery: bool) -> Self {
+        let mmco = header.mmco.clone().unwrap_or_default();
+        let mark = if mmco.iter().any(|m| matches!(m, Mmco::CurrentToLong(_))) {
+            MarkShape::Mmco6
+        } else if mmco.iter().any(|m| matches!(m, Mmco::ShortToLong(..))) {
+            MarkShape::Mmco3
+        } else {
+            MarkShape::None
+        };
+        let kind = if header.idr {
+            SimKind::Idr
+        } else if header.rplm.iter().any(|r| matches!(r, Rplm::Long(_))) {
+            SimKind::FromLt
+        } else {
+            SimKind::Chain
+        };
+        Self {
+            header,
+            kind,
+            mark,
+            recovery,
+        }
+    }
 }
 
 pub(crate) struct Openh264Sim {

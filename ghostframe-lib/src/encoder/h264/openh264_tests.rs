@@ -16,11 +16,16 @@ use sha2::{Digest, Sha256};
 use super::backend::{
     BackendError, BackendFeedback, EncodedAu, H264Backend, Nv12View, RateTarget, StreamConfig,
 };
+use super::observed_tests::{
+    assert_idr_accounting, assert_marks_resume, assert_recovered, cobatched, count_events,
+    has_cobatch, run_with, LoopEngine, Script,
+};
 use super::openh264::{nv12_to_i420, OpenH264Backend};
+use super::openh264_sim::{sim_params, MarkShape, Openh264Sim, SimFrame, SimPolicy};
 use super::openh264_sys::{Lib, LOW_COMPLEXITY, MEDIUM_COMPLEXITY};
 use super::pcm_decoder::{PcmDecoder, Strictness};
 use super::refs::{FramePlan, IdrCause, Intent};
-use super::syntax::{Mmco, SliceHeader};
+use super::syntax::{Mmco, Rplm, SliceHeader, StreamParams};
 use super::tracker::PicKind;
 
 // ---------------------------------------------------------------- content
@@ -986,4 +991,513 @@ fn openh264_timing_probe() {
             }
         }
     }
+}
+
+// ------------------------------------------- differential: library vs sim
+
+/// What the reference manager reads from a header, without slot indices or
+/// frame numbers: the properties the sim promises to share with the library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Shape {
+    idr: bool,
+    /// The list modification names a long-term index.
+    from_lt: bool,
+    nal_ref_idc: u8,
+    mark: MarkShape,
+    /// For a mark: whether it writes the same long-term index as the mark
+    /// before it in the IDR period (the IDR's own picture counts as index 0).
+    /// The absolute index is the library's choice; whether a failed mark is
+    /// made again into its own index, and a success moves on, is a rule.
+    same_slot: Option<bool>,
+}
+
+fn shape_of(h: &SliceHeader) -> Shape {
+    let mmco = h.mmco.clone().unwrap_or_default();
+    let mark = if mmco.iter().any(|m| matches!(m, Mmco::CurrentToLong(_))) {
+        MarkShape::Mmco6
+    } else if mmco.iter().any(|m| matches!(m, Mmco::ShortToLong(..))) {
+        MarkShape::Mmco3
+    } else {
+        MarkShape::None
+    };
+    Shape {
+        idr: h.idr,
+        from_lt: h.rplm.iter().any(|r| matches!(r, Rplm::Long(_))),
+        nal_ref_idc: h.nal_ref_idc,
+        mark,
+        same_slot: None,
+    }
+}
+
+/// The long-term index a header's marking writes.
+fn mark_index(h: &SliceHeader) -> Option<u32> {
+    SimFrame::from_header(h.clone(), false).mark_index()
+}
+
+/// The library, or the sim, behind one interface.
+trait Engine {
+    fn frame(&mut self, i: usize, scene: Scene, idr: bool) -> SliceHeader;
+    fn feedback(&mut self, fb: BackendFeedback);
+}
+
+struct RealEngine(Rig);
+
+impl Engine for RealEngine {
+    fn frame(&mut self, i: usize, scene: Scene, idr: bool) -> SliceHeader {
+        let nv12 = scene_nv12(i, 128, 128, scene);
+        self.0.step(&nv12, idr).header.clone()
+    }
+    fn feedback(&mut self, fb: BackendFeedback) {
+        self.0.be.feedback(fb);
+    }
+}
+
+struct SimEngine(Openh264Sim);
+
+impl Engine for SimEngine {
+    fn frame(&mut self, _i: usize, _scene: Scene, idr: bool) -> SliceHeader {
+        self.0.encode(idr).header
+    }
+    fn feedback(&mut self, fb: BackendFeedback) {
+        self.0.feedback(fb);
+    }
+}
+
+/// What the script did, for the premise.
+#[derive(Debug, Default, Clone, Copy)]
+struct Premise {
+    marks: usize,
+    mark_failed: usize,
+    recoveries: usize,
+    stale_requests: usize,
+    scene_change_frames: usize,
+    unknown_requests: usize,
+    marked_number_requests: usize,
+    idrs_after_first: usize,
+    cobatched: usize,
+}
+
+const DIFF_FRAMES: usize = 200;
+const R1: usize = 50;
+const R2: usize = 105;
+const STALE: usize = 112;
+const SCENE: usize = 125;
+const UNKNOWN: usize = 150;
+/// A request naming the MARKED picture of an MMCO 3 mark instead of its carrier.
+const MARKED_NUM: usize = 170;
+/// The first confirmation from here on is batched with a recovery request.
+const COBATCH_FROM: usize = 128;
+
+/// The event script of the differential test. Everything it does it decides
+/// from the headers it has seen, so the same code drives both engines: it
+/// feeds back each mark (two frames after its carrier), reports the second
+/// failed instead (three frames after), asks for a recovery from the newest
+/// fed-back mark twice (the second with a higher `current`), repeats a stale
+/// request, swaps the content for one frame (no IDR may follow), and names an
+/// unknown frame (a P, then an IDR).
+fn drive(e: &mut dyn Engine) -> (Vec<Shape>, Vec<SliceHeader>, Premise) {
+    let mut shapes = Vec::new();
+    let mut headers: Vec<SliceHeader> = Vec::new();
+    let mut p = Premise::default();
+    // (due, feedback), and the marks fed back: (carrier_fn, marked_fn).
+    let mut due: Vec<(usize, BackendFeedback)> = Vec::new();
+    let mut fed: Vec<(u32, u32)> = Vec::new();
+    let mut idr_pic_id = 0;
+    let mut marks_this_period = 0;
+    let mut prev_idx = 0;
+    let mut cobatch_done = false;
+    for i in 0..DIFF_FRAMES {
+        let (now, later): (Vec<_>, Vec<_>) = due.drain(..).partition(|(d, _)| *d <= i);
+        due = later;
+        let mut confirmed_now = false;
+        for (_, fb) in now {
+            if let BackendFeedback::LtrMarked { frame_num, .. } = fb {
+                if let Some(m) = headers
+                    .iter()
+                    .rev()
+                    .find(|h| {
+                        let s = shape_of(h);
+                        (s.mark == MarkShape::Mmco6 && h.frame_num == frame_num)
+                            || (s.mark == MarkShape::Mmco3
+                                && (h.frame_num + 0x7fff) & 0x7fff == frame_num)
+                    })
+                    .map(|h| h.frame_num)
+                {
+                    fed.push((m, frame_num));
+                    confirmed_now = true;
+                }
+            }
+            e.feedback(fb);
+        }
+        // A loss found in the very batch that confirms a mark: the library
+        // latches the confirmation for the next frame, so the recovery is
+        // answered from the older anchor, not from the mark just confirmed.
+        if confirmed_now && i >= COBATCH_FROM && !cobatch_done {
+            cobatch_done = true;
+            let newest = headers.last().map_or(0, |h| h.frame_num);
+            e.feedback(BackendFeedback::LtrRecover {
+                idr_pic_id,
+                last_correct_frame_num: fed.last().expect("just confirmed").0,
+                current_frame_num: newest,
+            });
+            p.cobatched += 1;
+        }
+        let newest = headers.last().map_or(0, |h| h.frame_num);
+        let newest_fed = fed.last().map(|m| m.0);
+        match i {
+            R1 | R2 => {
+                if let Some(c) = newest_fed {
+                    e.feedback(BackendFeedback::LtrRecover {
+                        idr_pic_id,
+                        last_correct_frame_num: c,
+                        current_frame_num: newest,
+                    });
+                    p.recoveries += 1;
+                }
+            }
+            STALE => {
+                if let Some(c) = newest_fed {
+                    e.feedback(BackendFeedback::LtrRecover {
+                        idr_pic_id,
+                        last_correct_frame_num: c,
+                        current_frame_num: 3,
+                    });
+                    p.stale_requests += 1;
+                }
+            }
+            MARKED_NUM => {
+                if let Some(&(c, m)) = fed.iter().rev().find(|(c, m)| c != m) {
+                    let _ = c;
+                    e.feedback(BackendFeedback::LtrRecover {
+                        idr_pic_id,
+                        last_correct_frame_num: m,
+                        current_frame_num: newest,
+                    });
+                    p.marked_number_requests += 1;
+                }
+            }
+            UNKNOWN => {
+                e.feedback(BackendFeedback::LtrRecover {
+                    idr_pic_id,
+                    last_correct_frame_num: newest + 5,
+                    current_frame_num: newest,
+                });
+                p.unknown_requests += 1;
+            }
+            _ => {}
+        }
+        let scene = if i == SCENE {
+            p.scene_change_frames += 1;
+            Scene::Other(9)
+        } else {
+            Scene::Calm
+        };
+        let h = e.frame(i, scene, i == 0);
+        let mut s = shape_of(&h);
+        if let Some(idx) = mark_index(&h) {
+            s.same_slot = Some(idx == prev_idx);
+            prev_idx = idx;
+        }
+        if h.idr {
+            if i > 0 {
+                p.idrs_after_first += 1;
+            }
+            idr_pic_id = h.idr_pic_id;
+            prev_idx = 0;
+            fed.clear();
+            fed.push((0, 0));
+            due.clear();
+            marks_this_period = 0;
+        }
+        if s.mark != MarkShape::None {
+            p.marks += 1;
+            marks_this_period += 1;
+            let marked = match s.mark {
+                MarkShape::Mmco6 => h.frame_num,
+                _ => (h.frame_num + 0x7fff) & 0x7fff,
+            };
+            if marks_this_period == 2 {
+                p.mark_failed += 1;
+                due.push((
+                    i + 3,
+                    BackendFeedback::LtrMarkFailed {
+                        idr_pic_id,
+                        frame_num: marked,
+                    },
+                ));
+            } else {
+                due.push((
+                    i + 2,
+                    BackendFeedback::LtrMarked {
+                        idr_pic_id,
+                        frame_num: marked,
+                    },
+                ));
+            }
+        }
+        shapes.push(s);
+        headers.push(h);
+    }
+    (shapes, headers, p)
+}
+
+/// The gate for the sim: the same event script on the real library and on the
+/// sim gives the same kind of frame at every position (IDR or not, from a
+/// long-term picture or the previous frame, the mark's shape), never
+/// comparing slot indices or frame numbers. A divergence is the sim being
+/// wrong about the library, and says where.
+#[test]
+fn openh264_the_sim_makes_the_same_kinds_of_frames_as_the_library() {
+    require_lib();
+    let mut real_rig = Rig::new(128, 128, 100_000);
+    real_rig.confirm_delay = None;
+    let (real, real_headers, p) = drive(&mut RealEngine(real_rig));
+    let (sim, _, ps) = drive(&mut SimEngine(Openh264Sim::new(SimPolicy::FAITHFUL)));
+    eprintln!("differential premise (library): {p:?}");
+    eprintln!("differential premise (sim):     {ps:?}");
+
+    // The premise: the script exercised what it claims to, on the library.
+    assert!(p.marks >= 4, "marks: {p:?}");
+    assert_eq!(p.mark_failed, 1, "{p:?}");
+    assert_eq!(p.recoveries, 2, "two recoveries asked for: {p:?}");
+    assert_eq!(p.stale_requests, 1);
+    assert_eq!(p.cobatched, 1, "{p:?}");
+    // The failed second mark was made again into its own index, and the next
+    // mark, after a success, moved on.
+    let rels: Vec<Option<bool>> = real.iter().filter_map(|s| s.same_slot.map(Some)).collect();
+    assert!(
+        rels.contains(&Some(true)) && rels.contains(&Some(false)),
+        "premise: both slot relations occur: {rels:?}"
+    );
+    assert_eq!(p.scene_change_frames, 1);
+    assert_eq!(p.unknown_requests, 1);
+    let recovery_frames = (1..real.len())
+        .filter(|&i| {
+            real[i].from_lt
+                && !real[i].idr
+                && !real[i - 1].idr
+                && real[i - 1].mark != MarkShape::Mmco6
+        })
+        .count();
+    assert!(
+        recovery_frames >= 2,
+        "premise: recovery frames: {recovery_frames}"
+    );
+    // A scene change is not an IDR; a request naming the marked picture's
+    // number is answered with one P from a long-term picture and then an IDR;
+    // a number that is nothing is one P from a long-term picture and no IDR.
+    assert!(!real[SCENE].idr && !real[SCENE + 1].idr, "scd is off");
+    assert_eq!(
+        p.idrs_after_first, 1,
+        "only the marked-number request's: {p:?}"
+    );
+    assert_eq!(p.marked_number_requests, 1);
+    let fallback_at = real
+        .iter()
+        .skip(1)
+        .position(|s| s.idr)
+        .map(|x| x + 1)
+        .unwrap();
+    assert_eq!(fallback_at, MARKED_NUM + 1, "a P, then an IDR");
+    assert!(real[MARKED_NUM].from_lt && !real[MARKED_NUM].idr);
+    assert!(real[UNKNOWN].from_lt && !real[UNKNOWN].idr && !real[UNKNOWN + 1].idr);
+
+    if real != sim {
+        let at = real.iter().zip(&sim).position(|(a, b)| a != b).unwrap();
+        let lo = at.saturating_sub(3);
+        let hi = (at + 4).min(real.len());
+        panic!(
+            "the sim diverges from the library at frame {at}\n library: {:?}\n sim:     {:?}\n headers: {:?}",
+            &real[lo..hi],
+            &sim[lo..hi],
+            &real_headers[lo..hi]
+        );
+    }
+}
+
+// ---------------------------- closed loop: manager, library, wire, client
+
+/// The library as the closed loop's encoder: the manager's plans go in, the
+/// access units come out, parsed.
+struct RealLoop {
+    be: OpenH264Backend,
+    i: usize,
+    params: Option<StreamParams>,
+}
+
+impl RealLoop {
+    fn boxed() -> Box<dyn LoopEngine> {
+        Box::new(Self {
+            be: open(128, 128, 100_000),
+            i: 0,
+            params: None,
+        })
+    }
+}
+
+impl LoopEngine for RealLoop {
+    fn feedback(&mut self, fb: BackendFeedback) {
+        self.be.feedback(fb);
+    }
+    fn encode(&mut self, _step: usize, plan: &FramePlan) -> SimFrame {
+        let nv12 = scene_nv12(self.i, 128, 128, Scene::Calm);
+        self.i += 1;
+        let au = self
+            .be
+            .encode(&view(&nv12, 128, 128), plan, &[])
+            .unwrap_or_else(|e| panic!("frame {}: {e}", self.i));
+        if au.meta.params.is_some() {
+            self.params = au.meta.params;
+        }
+        SimFrame::from_header(au.meta.header.expect("a parsed header"), false)
+    }
+    fn params(&self) -> StreamParams {
+        self.params.unwrap_or_else(sim_params)
+    }
+}
+
+/// Manager, library, a lossy and reordering wire, the client's `H264Gate` and a
+/// `DecoderModel`: the properties of the sim loop (a truthful wire, events that
+/// name what they should, no client violation, healing, IDR accounting), on the
+/// real library. The sim is advisory; this is where a manager that leans on
+/// the sim's choices would be found out.
+#[test]
+fn openh264_the_manager_heals_a_lossy_reordering_wire_in_a_closed_loop() {
+    require_lib();
+    // Loss bursts, with a stretch of reordered acknowledgements between.
+    let mut s = 0x2545_f491_4f6c_dd1du64;
+    let mut sc = Script::new(360, |step, _| {
+        (70..=74).contains(&step) || (140..=142).contains(&step) || (200..=203).contains(&step)
+    });
+    sc.ack_extra = Box::new(move |step| {
+        if (100..130).contains(&step) {
+            (xorshift(&mut s) % 4) as usize
+        } else {
+            0
+        }
+    });
+    let r = run_with(sc, RealLoop::boxed());
+    let st = r.mgr.stats();
+    assert!(
+        st.ltr_recoveries_requested >= 2,
+        "premise: recoveries: {st:?}"
+    );
+    assert!(st.reroots >= 2, "premise: re-roots: {st:?}");
+    assert!(
+        r.log.iter().filter(|l| l.lost).count() >= 12,
+        "premise: losses"
+    );
+    assert_eq!(r.idr_headers(), 1, "no IDR: {st:?}");
+    assert_eq!(st.plan_mismatch, 0, "{st:?}");
+    assert_recovered(&r, 203, 60);
+    assert_idr_accounting(&r);
+    assert!(
+        assert_marks_resume(&r, 360),
+        "premise: the run outlives the deadline"
+    );
+}
+
+/// The first mark's carrier is lost: the library re-makes the mark into its
+/// own index and no client ever lacks the index an MMCO 3 then writes.
+#[test]
+fn openh264_the_loop_survives_the_first_marks_carrier_being_lost() {
+    require_lib();
+    let mut lost_one = false;
+    let r = run_with(
+        Script::new(320, move |_, l| {
+            if l.sim.mark == MarkShape::Mmco6 && !l.sim.header.idr && !lost_one {
+                lost_one = true;
+                return true;
+            }
+            false
+        }),
+        RealLoop::boxed(),
+    );
+    let marks: Vec<_> = r
+        .log
+        .iter()
+        .filter(|l| l.sim.mark != MarkShape::None)
+        .collect();
+    assert!(
+        marks.len() >= 3 && marks[0].lost,
+        "premise: the first carrier was lost"
+    );
+    assert_eq!(
+        count_events(&r, |e| matches!(e, BackendFeedback::LtrMarkFailed { .. })),
+        1
+    );
+    assert_eq!(marks[1].sim.mark_index(), marks[0].sim.mark_index());
+    assert_eq!(r.idr_headers(), 1);
+    assert!(r.mgr.stats().p_anchors_confirmed >= 3);
+    assert!(assert_marks_resume(&r, 320));
+    assert_idr_accounting(&r);
+}
+
+/// A confirmation and a recovery in one batch: the library recovers from the
+/// older anchor and the manager takes that as the re-root, once.
+#[test]
+fn openh264_a_confirmation_and_a_recovery_in_one_batch_are_one_recovery() {
+    require_lib();
+    let mut found = 0;
+    for at in 34..40 {
+        let r = run_with(cobatched(at, 200), RealLoop::boxed());
+        if !has_cobatch(&r) {
+            continue;
+        }
+        found += 1;
+        let st = r.mgr.stats();
+        assert_eq!(
+            st.ltr_recoveries_requested, 1,
+            "at {at}: asked again: {st:?}"
+        );
+        assert!(st.reroots >= 1, "at {at}: {st:?}");
+        assert_eq!(r.idr_headers(), 1, "at {at}");
+        assert_recovered(&r, at + 1, 40);
+        assert_idr_accounting(&r);
+    }
+    assert!(
+        found >= 1,
+        "premise: a run batched the confirmation with the recovery"
+    );
+}
+
+/// The frame number wraps at 32768 frames, and with no periodic IDR a stream
+/// lives past it. The library compares frame numbers modulo `MaxFrameNum` and
+/// silently drops a recovery whose current is behind its last recovery's; the
+/// manager must keep naming the newest. 128x128 keeps the 33k frames to
+/// seconds.
+#[test]
+fn openh264_recoveries_after_the_frame_num_wrap_get_a_recovery_frame() {
+    require_lib();
+    const STEPS: usize = 33_100;
+    let r = run_with(
+        Script::new(STEPS, |step, _| {
+            [300, 32_700, 32_880, 32_890, 33_000]
+                .iter()
+                .any(|&at| (at..at + 3).contains(&step))
+        }),
+        RealLoop::boxed(),
+    );
+    let st = r.mgr.stats();
+    let currents: Vec<u32> = r
+        .events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            BackendFeedback::LtrRecover {
+                current_frame_num, ..
+            } => Some(*current_frame_num),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        currents.iter().any(|&c| c > 30_000)
+            && currents.iter().filter(|&&c| c < 1_000).count() >= 2,
+        "premise: requests either side of the wrap: {currents:?}"
+    );
+    // Every request was answered by a re-root (a frame from the long-term
+    // picture), none ignored, no IDR to repair it.
+    assert_eq!(r.idr_headers(), 1, "{st:?}");
+    assert!(st.reroots as usize >= currents.len(), "{currents:?} {st:?}");
+    assert_recovered(&r, 33_003, 60);
+    assert_idr_accounting(&r);
 }
