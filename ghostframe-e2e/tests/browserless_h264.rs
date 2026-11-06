@@ -1458,6 +1458,8 @@ struct StepSummary {
     /// Frames the rate model cut below the content's demand (the cap or the
     /// VBV decided): the premise that the stream was held to the rate.
     model_limited: u64,
+    /// Bytes the model gave the frames over the bytes the rates told allow.
+    bytes_vs_target: f64,
 }
 
 impl StepSummary {
@@ -1503,6 +1505,9 @@ async fn step_summary(
             .map_or(0, |x| x.analyse().refs.rate_applies_up),
         model_limited: st.r.h264_run().map_or(0, |x| {
             x.truth.model.frames_capped + x.truth.model.frames_bucket_empty
+        }),
+        bytes_vs_target: st.r.h264_run().map_or(0.0, |x| {
+            x.truth.model.bytes as f64 / x.truth.model.allowed_bytes.max(1) as f64
         }),
     }
 }
@@ -1569,20 +1574,21 @@ async fn p_b_seed_population() {
         for i in start..start + n {
             let s = step_summary(0x6701 + i, chatter, delay_us, mode).await;
             println!(
-                "SEED {:#x} {mode:?} chatter={chatter:?} reached={:?} guard={:?} lowest/pre-min={:.2} min/pre-min={:.2} saturated={:.2} guard_ok={} padding_windows={} applies_up={}",
+                "SEED {:#x} {mode:?} chatter={chatter:?} reached={:?} guard={:?} lowest/pre-min={:.2} min/pre-min={:.2} saturated={:.2} guard_ok={} padding_windows={} applies_up={} bytes_vs_target={:.3}",
                 s.seed, s.reached, s.guard_us, s.low, s.min_all, s.sat_share, s.guard_ok,
-                s.padding_windows, s.applies_up
+                s.padding_windows, s.applies_up, s.bytes_vs_target
             );
             all.push(s);
         }
         let count = |f: &dyn Fn(&StepSummary) -> bool| all.iter().filter(|s| f(s)).count();
         println!(
-            "SUMMARY {mode:?} chatter={chatter:?} n={n}: within T_UP {}, lower bound kept {}, collapses {}, guard released {}, mean saturated share {:.2}; step-up ms {}; guard ms {}",
+            "SUMMARY {mode:?} chatter={chatter:?} n={n}: within T_UP {}, lower bound kept {}, collapses {}, guard released {}, mean saturated share {:.2}; mean bytes/target {:.3}; step-up ms {}; guard ms {}",
             count(&|s| s.hit()),
             count(&|s| s.low >= 0.8),
             count(&|s| s.collapsed()),
             count(&|s| s.guard_ok),
             all.iter().map(|s| s.sat_share).sum::<f64>() / all.len().max(1) as f64,
+            all.iter().map(|s| s.bytes_vs_target).sum::<f64>() / all.len().max(1) as f64,
             percentiles_ms(all.iter().map(|s| s.reached)),
             percentiles_ms(all.iter().map(|s| s.guard_us)),
         );
@@ -1741,13 +1747,17 @@ async fn p_b_population_never_collapses_and_finds_the_headroom_whenever_the_clie
 /// | refs, S2-calibrated full model (superseded), in place | 84/87/86 | 96/96/96 | 2000/11700, 2200/9700, 2300/10800 |
 /// | refs, S2-calibrated full model (superseded), Phase A | 91/95/90 | 96/96/96 | 6300/9100, 2200/6700, 2200/7600 |
 /// | refs, S2-calibrated, every step 1.8x (`refs-full-transient`) | 96/95/96 | 96/96/96 | 2000/5200, 2400/6300, 2300/6000 |
-/// | refs, VCE-calibrated model (B6, 2026-11-05), in place | 90/90/92 | 96/96/96 | 5500/7900, 2200/10500, 5900/8400 |
-/// | refs, VCE-calibrated model, Phase A | 95/93/90 | 96/96/96 | 3900/6600, 5200/7400, 5700/8000 |
+/// | refs, first VCE calibration (1.47x, two frames), in place | 90/90/92 | 96/96/96 | 5500/7900, 2200/10500, 5900/8400 |
+/// | refs, first VCE calibration, Phase A | 95/93/90 | 96/96/96 | 3900/6600, 5200/7400, 5700/8000 |
+/// | refs, re-send-burst model (B6), in place, 15 % rise band, no refresh | 90/90/92 | 96/96/96 | 1900/9200, 2100/8100, 2000/7800 |
+/// | refs, re-send-burst model (B6), Phase A | 96/94/93 | 96/96/96 | 4200/6500, 2200/7100, 4000/7100 |
 ///
-/// The VCE-calibrated model (`pcm_rate.rs`, provisional: the first frame
-/// after a step 1.47x up / 1.32x down at every step size, settled in two
-/// frames, a raised IDR at 0.6 of its ceiling) is the gate's. Its step-size
-/// dependence is not measured; `refs-linear-step` is the optimistic reading.
+/// The re-send-burst model (`pcm_rate.rs`, provisional, from T4 on the VCE) is
+/// the gate's: every re-send of the rate buffers gives a first frame of 1.8x
+/// (rise) / 1.7x (fall) / 1.4x (same rate) whatever the size of the step,
+/// settled on the second frame, and a raised IDR reaches 0.6 of its ceiling.
+/// Mean bytes over the bytes the rates told allow: 1.019 in place, 1.013 Phase
+/// A. `refs-linear-step` is the optimistic reading of the step-size dependence.
 ///
 /// No collapse in any. The twin never misses the guard (the 89/96 of the
 /// legacy gate is the legacy 8 ms row only). The full model is the gate's;

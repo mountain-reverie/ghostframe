@@ -14,10 +14,10 @@
 //! | 1 | VBR: a frame is no bigger than the content demands. Nothing is stuffed (CBR stuffs a static screen, VBR does not). | (a) "CBR stuffs every frame": 25.0 KB per P against 11.9 KB for VBR on frozen content |
 //! | 2 | The VBV is a token bucket: capacity `vbv_bits / 8`, refilled by `bps / 8 / fps` a frame, 75 % full at the start. A small VBV cuts the first IDR. | (a) "VBV is settable": HRD 1.2 Mbit, initial fullness 75 % takes the first IDR from 166-198 KB to 103 KB |
 //! | 3 | An IDR is sent with the raised VBV (`max(vbv, idr_max_bytes * 8)`) and its HRD re-send carries the initial fullness, so the bucket holds at least 75 % of the raised capacity at an IDR. The P frame after it falls back to the P capacity. | the backend's choice (`rate_commands`); S2 only measured the fullness at open |
-//! | 3b | A raised IDR does not fill its ceiling: VBR codes the content, and the content at QP is smaller than the budget. A raised IDR is `idr_fill` (0.6) of what the budget and bucket allow. PROVISIONAL: one scene, one rate (3 Mbit/s: 55.9 and 56.7 KB against a 93.75 KB budget, 0.60x; 26.2 and 26.4 KB with no raise, so the raise helps 2.1x). The model's own unraised IDR (the 0.1 s VBV cut, 37.5 KB there) is not that small, so the model gives 1.5x, not 2.1x, for the raise. | T4 `h264_direct_the_idr_cap_and_vbv_are_honoured` on the RX 480 (2026-11-05); S2 (a) for the unraised cut |
+//! | 3b | A raised IDR does not fill its ceiling: VBR codes the content, and the content at QP is smaller than the budget. A raised IDR is `idr_fill` (0.6) of what the budget and bucket allow. PROVISIONAL: one scene, one rate (3 Mbit/s: 55.9 and 56.7 KB against a 93.75 KB budget, 0.60x; 26.2 and 26.4 KB with no raise, so the raise helps 2.1x; at 12 Mbit/s 140.9-141.4 KB against 99.4-103.4 KB, 1.4x and 0.38 of the budget: the fraction falls with the rate, the content limits it). The model's own unraised IDR (the 0.1 s VBV cut, 37.5 KB there) is not that small, so the model gives 1.5x, not 2.1x, for the raise. | T4 `h264_direct_the_idr_cap_and_vbv_are_honoured` on the RX 480 (2026-11-05); S2 (a) for the unraised cut |
 //! | 4 | `max_frame_bytes` is a ceiling, not a request: a frame is `min(demand, cap)` and never padded up to it. | (b) raising the cap 100 -> 200 KB gave a *smaller* first P (59.6 -> 49.0 KB) |
 //! | 5 | The cap is soft. A P frame may exceed it by `cap_overshoot` (1.0: hard; S2 saw 1.08 when the cap is reachable, 1.69 and 2.88 when it is not). An IDR exceeds it by up to 13 %. The excess is debt on the bucket, repaid by the frames after it. | (b) "P within ~8 %... overshoot of 1.7-2.9x when it is not achievable"; IDR -6 %..+13 % |
-//! | 6 | A rate step is not instant: the first frame after a step is above the new average by `step_excess_up` (0.47, a rise) or `step_excess_down` (0.32, a fall), and the excess decays linearly to nothing over `settle_frames` (2). PROVISIONAL: measured on the VCE (T4 `rate_tracks`: a fall to 3 Mbit/s gave 1.32, 1.09, 1.08, 1.24, 1.02, 0.94x of the average, a rise to 12 Mbit/s 1.47, 0.89, 0.92, 0.90, 0.89, 0.90x; `noisy_rate`, 27 random 3-10 Mbit/s steps re-sent every time: first frame mean 1.54x, max 2.01x). Smaller and faster than S2's 1.7-1.8x settling in 3-4 frames at a 100 ms HRD, which `with_s2_transient` still gives. How the excess depends on the size of the step is NOT known: `step_scaling` is the exponent of `(|new - old| / max / 0.75).min(1)` applied to it. The default 0 is flat, the most plausible reading: `noisy_rate`'s steps were mostly small (0.7-1.4x of the last, a relative step of 0.3 at most) and their first frames (1.54x) were no smaller than the big steps' (1.32, 1.47). 1 is the earlier linear assumption (`with_linear_step_scaling`). T4 `h264_direct_small_rate_steps_first_frame_ratio` is what sets it. | T4 on the RX 480 (2026-11-05), S2 (a) for the pessimistic reading |
+//! | 6 | A re-send of the rate buffers is a burst, a rate step or not: the first frame after it is above the average by `step_excess_up` (0.8, a rise), `step_excess_down` (0.7, a fall) or `resend_excess` (0.4, the same rate with only a cap or the 16 bps nudge changed), and the excess is gone on the second frame (`settle_frames` 1). PROVISIONAL, from T4 on the RX 480 (2026-11-05): `small_rate_steps_first_frame_ratio` at 6 Mbit/s, 4 steps of each of +-5/10/20/30 %: mean first frame 1.76-1.90x for a rise and 1.56-1.82x for a fall, individual values 1.3-2.08x, and the same at 5 % as at 30 %; frame 2 on 0.9-1.05x; a pure re-send (same rate, 16 bps nudge) 1.40x over 8, individually 1.29-1.51x. An earlier run (`rate_tracks`: x4 and x0.25) read 1.47 and 1.32 and `noisy_rate` 1.54 mean, 2.01 max: the first frame depends on more than the step (whole rotations sat near 2.0x, state or content phase). S2 (a) had 1.7-1.8x settling in 3-4 frames at a 100 ms HRD, which `with_s2_transient` still gives. `step_scaling` is the exponent of `(|new - old| / max / 0.75).min(1)` on the excess: 0, flat, is what the data say (T4 found no dependence on the size); 1 is the earlier linear assumption (`with_linear_step_scaling`). | T4 on the RX 480; S2 (a) for the pessimistic reading |
 //! | 7 | A re-send of the rate buffers may reset the VCE's buffer level (`resend_resets_level`). S2 did not measure this (it re-sent rarely). Off by default; T4 `h264_direct_a_noisy_rate_sequence_at_4hz_tracks_without_a_burst` measured no burst from re-sends beyond the first-frame transient (worst 1 s window 1.11x the rates told, worst P 0.67x its cap), so it stays off. | not measured: the open question of review item 13 |
 //!
 //! Not modelled, because S2 only observed it on content the model has no
@@ -35,13 +35,15 @@ const INITIAL_FULLNESS: f64 = 0.75;
 /// size at which the step's excess is taken as measured.
 const STEP_MEASURED: f64 = 0.75;
 /// The excess of the first frame after a rise over the new average frame
-/// (T4 `rate_tracks`: 1.47x; `noisy_rate` mean 1.54x). Provisional.
-const STEP_EXCESS_UP: f64 = 0.47;
-/// The same for a fall (T4 `rate_tracks`: 1.32x). Provisional.
-const STEP_EXCESS_DOWN: f64 = 0.32;
-/// The frames over which the excess decays to nothing (T4: back within about
-/// 10 % of the average by the second frame). Provisional.
-const STEP_SETTLE_FRAMES: u32 = 2;
+/// (T4 `small_rate_steps`: 1.76-1.90x, all sizes). Provisional.
+const STEP_EXCESS_UP: f64 = 0.8;
+/// The same for a fall (1.56-1.82x). Provisional.
+const STEP_EXCESS_DOWN: f64 = 0.7;
+/// The excess of a re-send at the same rate (1.40x over 8). Provisional.
+const RESEND_EXCESS: f64 = 0.4;
+/// The frames over which the excess decays to nothing (T4: frame 2 on is back
+/// at 0.9-1.05x). Provisional.
+const STEP_SETTLE_FRAMES: u32 = 1;
 /// S2's reading, used by [`PcmRateModel::with_s2_transient`]: 0.8 both ways,
 /// settling over four frames.
 const S2_STEP_EXCESS: f64 = 0.8;
@@ -75,6 +77,8 @@ pub struct PcmRateModel {
     /// average frames, and the frames it takes to settle.
     pub step_excess_up: f64,
     pub step_excess_down: f64,
+    /// The excess of a re-send at the same rate (a changed cap, the nudge).
+    pub resend_excess: f64,
     pub settle_frames: u32,
     /// Behaviour 6: the exponent of the relative step size on the excess. 0:
     /// every step gives the full excess; 1: linear in the step.
@@ -95,6 +99,7 @@ impl PcmRateModel {
             resend_resets_level: false,
             step_excess_up: STEP_EXCESS_UP,
             step_excess_down: STEP_EXCESS_DOWN,
+            resend_excess: RESEND_EXCESS,
             settle_frames: STEP_SETTLE_FRAMES,
             step_scaling: 0.0,
             idr_fill: IDR_FILL,
@@ -124,6 +129,7 @@ impl PcmRateModel {
         Self {
             step_excess_up: S2_STEP_EXCESS,
             step_excess_down: S2_STEP_EXCESS,
+            resend_excess: 0.0,
             settle_frames: S2_SETTLE_FRAMES,
             step_scaling: 0.0,
             ..self
@@ -174,6 +180,9 @@ pub(crate) struct FrameOutcome {
     pub over_cap: bool,
     /// The frame is inside a rate step's transient.
     pub in_transient: bool,
+    /// The frame's size, and the average frame at the rate it was sent under.
+    pub bytes: usize,
+    pub allowed_bytes: usize,
 }
 
 /// What the model did to the scene's frames, for the scene's premises.
@@ -191,6 +200,11 @@ pub struct PcmModelStats {
     pub frames_over_cap: u64,
     /// Frames inside a rate step's transient.
     pub frames_in_transient: u64,
+    /// Bytes the model gave the frames, and what the rates told allow
+    /// (`bps / 8 / fps` a frame): their ratio is how far the stream ran over
+    /// (or under) its target.
+    pub bytes: u64,
+    pub allowed_bytes: u64,
 }
 
 impl PcmModelStats {
@@ -204,6 +218,8 @@ impl PcmModelStats {
         }
         self.frames_over_cap += u64::from(o.over_cap);
         self.frames_in_transient += u64::from(o.in_transient);
+        self.bytes += o.bytes as u64;
+        self.allowed_bytes += o.allowed_bytes as u64;
     }
 }
 
@@ -235,8 +251,11 @@ impl RateState {
         } as f64;
 
         // The rate stepped (behaviour 6).
-        let stepped = self.last.is_some_and(|l| l.bps != rate.bps);
-        if let (true, Some(l)) = (stepped, self.last) {
+        let resent = self.last.is_some_and(|l| l.bps == rate.bps && l != *rate);
+        let stepped = resent || self.last.is_some_and(|l| l.bps != rate.bps);
+        if resent {
+            self.step_excess = m.resend_excess;
+        } else if let (true, Some(l)) = (stepped, self.last) {
             let (old, new) = (f64::from(l.bps), bps);
             let rel = (new - old).abs() / old.max(new).max(1.0);
             let base = if new > old {
@@ -324,6 +343,8 @@ impl RateState {
                 limit,
                 over_cap: cap.is_some_and(|c| size > c),
                 in_transient,
+                bytes: size as usize,
+                allowed_bytes: (bps / 8.0 / fps) as usize,
             },
         )
     }
@@ -433,10 +454,11 @@ mod tests {
         assert_eq!(hard.frames_over_cap, 0);
     }
 
-    /// Behaviour 6: a rise of x4 gives 1.47x on the first frame and a fall of
-    /// x0.25 1.32x, both settled in two frames (T4 `rate_tracks`).
+    /// Behaviour 6: a step gives 1.8x (a rise) or 1.7x (a fall) on the first
+    /// frame, whatever its size, and is settled on the second; a re-send at
+    /// the same rate gives 1.4x (T4 `small_rate_steps_first_frame_ratio`).
     #[test]
-    fn a_rate_step_gives_the_measured_first_frame_and_settles_in_two() {
+    fn a_rate_step_or_a_resend_gives_one_burst_frame_and_settles_in_one() {
         let m = model();
         let low = RateTarget::steady(3_000_000, FPS);
         let high = RateTarget::steady(12_000_000, FPS);
@@ -444,36 +466,43 @@ mod tests {
         p_frames(&mut st, &m, &low, 60);
         let (up, stats) = p_frames(&mut st, &m, &high, 8);
         let ratio: Vec<f64> = up.iter().map(|&b| b as f64 / avg(high.bps)).collect();
-        for (i, want) in [1.47, 1.235, 1.0].iter().enumerate() {
-            assert!((ratio[i] - want).abs() < 0.03, "frame {i}: {ratio:?}");
-        }
+        assert!((ratio[0] - 1.8).abs() < 0.03, "{ratio:?}");
         assert!(
-            ratio[2..].iter().all(|r| (r - 1.0).abs() < 0.03),
+            ratio[1..].iter().all(|r| (r - 1.0).abs() < 0.03),
             "{ratio:?}"
         );
-        assert_eq!(stats.frames_in_transient, 2, "premise: the transient ran");
-        // The same on the way down, smaller (direction-dependent).
+        assert_eq!(stats.frames_in_transient, 1, "premise: the transient ran");
         let (down, _) = p_frames(&mut st, &m, &low, 8);
         let first = down[0] as f64 / avg(low.bps);
-        assert!((first - 1.32).abs() < 0.03, "{first}");
-        assert!(down[7] as f64 / avg(low.bps) < 1.05);
-        // Provisional: a 10 % step gets the full excess by default, a tenth of
-        // it when scaled linearly, and S2's 1.8x (four frames) when asked.
+        assert!((first - 1.7).abs() < 0.03, "{first}");
+        assert!(down[1] as f64 / avg(low.bps) < 1.05);
+        // The size of the step does not matter (a 10 % step), unless asked to.
         let small = RateTarget::steady(13_200_000, FPS);
         let first = |m: &PcmRateModel| {
             let mut st = RateState::default();
             p_frames(&mut st, m, &high, 60);
             p_frames(&mut st, m, &small, 1).0[0] as f64 / avg(small.bps)
         };
-        assert!((first(&m) - 1.47).abs() < 0.03, "{}", first(&m));
+        assert!((first(&m) - 1.8).abs() < 0.03, "{}", first(&m));
         let lin = first(&m.with_linear_step_scaling());
         assert!((lin - 1.0).abs() < 0.12, "{lin}");
-        let s2 = first(&m.with_s2_transient());
-        assert!((s2 - 1.8).abs() < 0.03, "{s2}");
+        // S2's reading settles in four frames.
         let mut st = RateState::default();
         p_frames(&mut st, &m.with_s2_transient(), &low, 60);
         let (slow, _) = p_frames(&mut st, &m.with_s2_transient(), &high, 6);
         assert!(slow[3] as f64 / avg(high.bps) > 1.15, "S2 settles in four");
+        // A re-send at the same rate (only the cap moved) is a 1.4x frame.
+        let mut st = RateState::default();
+        p_frames(&mut st, &m, &high, 60);
+        let mut nudged = high;
+        nudged.max_frame_bytes += 1;
+        let (re, stats) = p_frames(&mut st, &m, &nudged, 3);
+        assert!((re[0] as f64 / avg(high.bps) - 1.4).abs() < 0.03, "{re:?}");
+        assert!((re[1] as f64 / avg(high.bps) - 1.0).abs() < 0.03, "{re:?}");
+        assert_eq!(stats.frames_in_transient, 1);
+        // The same target again is no re-send.
+        let (same, _) = p_frames(&mut st, &m, &nudged, 2);
+        assert!((same[0] as f64 / avg(high.bps) - 1.0).abs() < 0.03);
         // The bps-only baseline has no transient.
         let b = PcmRateModel::bps_only(300_000, 200_000, FPS);
         let mut st = RateState::default();
