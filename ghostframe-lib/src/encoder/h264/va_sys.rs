@@ -53,6 +53,7 @@ pub(crate) const VA_PACKED_HEADER_SLICE: u32 = 3;
 
 pub(crate) const VA_MISC_FRAME_RATE: u32 = 0;
 pub(crate) const VA_MISC_RATE_CONTROL: u32 = 1;
+pub(crate) const VA_MISC_MAX_FRAME_SIZE: u32 = 4;
 pub(crate) const VA_MISC_HRD: u32 = 5;
 
 pub(crate) const VA_PICTURE_H264_INVALID: u32 = 0x1;
@@ -268,6 +269,16 @@ pub(crate) struct VAEncMiscParameterHRD {
     pub va_reserved: [u32; VA_PADDING_LOW],
 }
 
+/// `VAEncMiscParameterBufferMaxFrameSize` (va.h): a deprecated `type` word
+/// first, which Mesa would otherwise read as the cap, then the cap in bits.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct VAEncMiscParameterBufferMaxFrameSize {
+    pub type_: u32,
+    pub max_frame_size: u32,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct VAEncMiscParameterFrameRate {
@@ -429,6 +440,11 @@ mod tests {
         assert_eq!(size_of::<VAEncMiscParameterRateControl>(), 60);
         assert_eq!(size_of::<VAEncMiscParameterHRD>(), 24);
         assert_eq!(size_of::<VAEncMiscParameterFrameRate>(), 24);
+        assert_eq!(size_of::<VAEncMiscParameterBufferMaxFrameSize>(), 24);
+        assert_eq!(
+            offset_of!(VAEncMiscParameterBufferMaxFrameSize, max_frame_size),
+            4
+        );
         assert_eq!(size_of::<VACodedBufferSegment>(), 48);
 
         assert_eq!(offset_of!(VAImage, buf), 52);

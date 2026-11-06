@@ -300,7 +300,7 @@ fn run(sc: &Scenario) -> Option<Run> {
         }
         if let Some((at, bps)) = sc.rate_change {
             if at == n {
-                backend.set_rate(RateTarget { bps });
+                backend.set_rate(RateTarget::steady(bps, 30));
             }
         }
         mgr.tick(now, sc.srtt);

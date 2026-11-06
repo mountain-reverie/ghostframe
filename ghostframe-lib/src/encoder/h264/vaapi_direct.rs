@@ -72,11 +72,107 @@ struct Session {
     sps: Vec<u8>,
     pps: Vec<u8>,
     rate: RateTarget,
-    /// HRD buffer, bits: about 100 ms of the rate at open, fixed (B6 tunes it).
-    vbv_bits: u32,
+    /// What the rate-control buffers last carried (nudge, cap latch).
+    sent: SentRate,
+    /// Counters the GPU tests read to prove the path ran.
+    rc_sends: u64,
+    cap_sends: u64,
+    nudges: u64,
     qp: u8,
     rate_dirty: bool,
     failed: bool,
+}
+
+/// What the rate-control buffers last carried.
+#[derive(Debug, Default, Clone, Copy)]
+struct SentRate {
+    /// `bits_per_second` as sent, nudge included.
+    bps: Option<u32>,
+    cap_bits: u32,
+    idr_values: bool,
+    /// Which way the next nudge goes.
+    nudge_down: bool,
+}
+
+/// The rate-control buffers for one frame.
+#[derive(Clone, Copy)]
+struct RateCommands {
+    rc: VAEncMiscParameterRateControl,
+    hrd: VAEncMiscParameterHRD,
+    max_frame: Option<VAEncMiscParameterBufferMaxFrameSize>,
+    nudged: bool,
+}
+
+const NUDGE_BPS: u32 = 16;
+
+/// What to send for a frame, or nothing. Pure, so the nudge and the IDR
+/// raise are testable without a GPU.
+///
+/// - IDR frames carry `idr_max_bytes` and a VBV that holds it; the first P
+///   after one re-sends the P values.
+/// - Mesa re-issues the VCE rate command only when the rate changes, so a
+///   changed cap or VBV latches only if `bits_per_second` differs from the
+///   last send (S2). When it would be equal it is moved by 16 bps.
+fn rate_commands(
+    rate: &RateTarget,
+    qp: u32,
+    idr: bool,
+    dirty: bool,
+    last: &mut SentRate,
+) -> Option<RateCommands> {
+    if !(idr || dirty || last.idr_values) {
+        return None;
+    }
+    let (cap_bytes, vbv) = if idr {
+        (
+            rate.idr_max_bytes,
+            rate.vbv_bits.max(rate.idr_max_bytes.saturating_mul(8)),
+        )
+    } else {
+        (rate.max_frame_bytes, rate.vbv_bits)
+    };
+    let mut bps = rate.bps;
+    let mut nudged = false;
+    if last.bps == Some(bps) {
+        bps = if last.nudge_down {
+            bps.saturating_sub(NUDGE_BPS).max(1)
+        } else {
+            bps.saturating_add(NUDGE_BPS)
+        };
+        last.nudge_down = !last.nudge_down;
+        nudged = true;
+    }
+    let mut rc: VAEncMiscParameterRateControl = zeroed();
+    rc.bits_per_second = bps;
+    rc.target_percentage = 100;
+    rc.window_size = 1000;
+    rc.initial_qp = qp;
+    let hrd = VAEncMiscParameterHRD {
+        initial_buffer_fullness: vbv / 4 * 3,
+        buffer_size: vbv,
+        va_reserved: [0; VA_PADDING_LOW],
+    };
+    let cap_bits = cap_bytes.saturating_mul(8);
+    // A cap that was set and is now gone must be cleared with a 0.
+    let max_frame =
+        (cap_bits != 0 || last.cap_bits != 0).then_some(VAEncMiscParameterBufferMaxFrameSize {
+            // The deprecated `type`, set as the spike does.
+            type_: VA_MISC_MAX_FRAME_SIZE,
+            max_frame_size: cap_bits,
+            va_reserved: [0; VA_PADDING_LOW],
+        });
+    *last = SentRate {
+        bps: Some(bps),
+        cap_bits,
+        idr_values: idr,
+        nudge_down: last.nudge_down,
+    };
+    Some(RateCommands {
+        rc,
+        hrd,
+        max_frame,
+        nudged,
+    })
 }
 
 fn check(va: &Va, call: &'static str, status: VAStatus) -> Result<(), BackendError> {
@@ -149,7 +245,10 @@ impl Session {
             sps: write_sps(&cfg.params, &seq),
             pps: write_pps(&cfg.params, qp),
             rate: cfg.rate,
-            vbv_bits: (cfg.rate.bps / 10).max(1),
+            sent: SentRate::default(),
+            rc_sends: 0,
+            cap_sends: 0,
+            nudges: 0,
             qp,
             rate_dirty: false,
             failed: false,
@@ -519,21 +618,24 @@ impl Session {
         sp
     }
 
-    /// The rate-control group: rate and HRD. The frame-size cap and VBV
-    /// changes belong to the rate-control PR (B6).
-    fn rate_buffers(&mut self, ids: &mut Vec<VABufferID>) -> Result<(), BackendError> {
-        let mut rc: VAEncMiscParameterRateControl = zeroed();
-        rc.bits_per_second = self.rate.bps;
-        rc.target_percentage = 100;
-        rc.window_size = 1000;
-        rc.initial_qp = u32::from(self.qp);
-        self.misc(ids, VA_MISC_RATE_CONTROL, &rc)?;
-        let hrd = VAEncMiscParameterHRD {
-            initial_buffer_fullness: self.vbv_bits / 4 * 3,
-            buffer_size: self.vbv_bits,
-            va_reserved: [0; VA_PADDING_LOW],
+    /// The rate-control group: rate, HRD and the frame-size cap, always
+    /// together (S2). Nothing goes out unless the target changed, the frame is
+    /// an IDR, or the last send carried IDR values.
+    fn rate_buffers(&mut self, ids: &mut Vec<VABufferID>, idr: bool) -> Result<(), BackendError> {
+        let dirty = std::mem::take(&mut self.rate_dirty);
+        let Some(c) = rate_commands(&self.rate, u32::from(self.qp), idr, dirty, &mut self.sent)
+        else {
+            return Ok(());
         };
-        self.misc(ids, VA_MISC_HRD, &hrd)
+        self.rc_sends += 1;
+        self.nudges += u64::from(c.nudged);
+        self.misc(ids, VA_MISC_RATE_CONTROL, &c.rc)?;
+        self.misc(ids, VA_MISC_HRD, &c.hrd)?;
+        if let Some(ms) = &c.max_frame {
+            self.cap_sends += 1;
+            self.misc(ids, VA_MISC_MAX_FRAME_SIZE, ms)?;
+        }
+        Ok(())
     }
 
     fn encode(
@@ -694,9 +796,8 @@ impl Session {
             self.packed(ids, VA_PACKED_HEADER_SEQUENCE, &sps)?;
             self.packed(ids, VA_PACKED_HEADER_PICTURE, &pps)?;
         }
-        if !cqp && (idr || self.rate_dirty) {
-            self.rate_buffers(ids)?;
-            self.rate_dirty = false;
+        if !cqp {
+            self.rate_buffers(ids, idr)?;
         }
         let pp = self.picture(surface, plan.poc, plan, resolved);
         self.typed(
@@ -1016,7 +1117,7 @@ impl H264Backend for VaapiDirect {
     }
 
     fn set_rate(&mut self, rate: RateTarget) {
-        // Bits per second only; RC and HRD go out on the next P frame.
+        // RC, HRD and the cap go out together on the next frame.
         let Some(s) = self.session.as_mut() else {
             return;
         };
@@ -1050,5 +1151,106 @@ mod tests {
                 "{w}x{h}@{fps}: {err}"
             );
         }
+    }
+
+    fn bits(c: &RateCommands) -> u32 {
+        c.rc.bits_per_second
+    }
+
+    #[test]
+    fn steady_target_table() {
+        // (bps, fps, cap, vbv bits, idr bytes)
+        for (bps, fps, cap, vbv, idr) in [
+            (6_000_000, 30, 75_000, 600_000, 187_500),
+            // Half the frame time: the cap halves, the VBV stays 0.1 s.
+            (6_000_000, 60, 37_500, 600_000, 187_500),
+            // Low rate: the IDR floor binds, the VBV still holds one cap.
+            (300_000, 30, 3_750, 30_000, 32 * 1024),
+        ] {
+            let r = RateTarget::steady(bps, fps);
+            assert_eq!(
+                (r.max_frame_bytes, r.vbv_bits, r.idr_max_bytes),
+                (cap, vbv, idr),
+                "{bps} bps at {fps} fps"
+            );
+            assert!(r.vbv_bits >= r.max_frame_bytes * 8, "one capped frame fits");
+        }
+    }
+
+    #[test]
+    fn rate_commands_idr_raises_cap_and_vbv_and_the_next_p_restores_them() {
+        let r = RateTarget::steady(6_000_000, 30);
+        let mut last = SentRate::default();
+        let idr = rate_commands(&r, 26, true, false, &mut last).expect("an IDR sends");
+        assert_eq!(
+            idr.max_frame.expect("cap sent").max_frame_size,
+            r.idr_max_bytes * 8
+        );
+        assert!(idr.hrd.buffer_size >= r.idr_max_bytes * 8);
+        assert!(
+            idr.hrd.buffer_size > r.vbv_bits,
+            "premise: the raise is real"
+        );
+        let p = rate_commands(&r, 26, false, false, &mut last).expect("P after IDR restores");
+        assert_eq!(
+            p.max_frame.expect("cap sent").max_frame_size,
+            r.max_frame_bytes * 8
+        );
+        assert_eq!(p.hrd.buffer_size, r.vbv_bits);
+        assert!(rate_commands(&r, 26, false, false, &mut last).is_none());
+    }
+
+    #[test]
+    fn rate_commands_cap_only_change_moves_bps_so_it_latches() {
+        let mut r = RateTarget::steady(6_000_000, 30);
+        let mut last = SentRate::default();
+        rate_commands(&r, 26, true, false, &mut last).unwrap();
+        let restore = rate_commands(&r, 26, false, false, &mut last).unwrap();
+        let mut sent = vec![bits(&restore)];
+        for i in 0..20 {
+            r.max_frame_bytes = 40_000 + i * 1000;
+            let c = rate_commands(&r, 26, false, true, &mut last).expect("dirty sends");
+            let b = bits(&c);
+            assert_ne!(
+                b,
+                *sent.last().unwrap(),
+                "send {i}: bps must differ from the last"
+            );
+            assert!(b.abs_diff(r.bps) <= 16);
+            assert_eq!(c.max_frame.unwrap().max_frame_size, r.max_frame_bytes * 8);
+            sent.push(b);
+        }
+    }
+
+    #[test]
+    fn rate_commands_rate_change_needs_no_nudge() {
+        let mut r = RateTarget::steady(6_000_000, 30);
+        let mut last = SentRate::default();
+        rate_commands(&r, 26, true, false, &mut last).unwrap();
+        rate_commands(&r, 26, false, false, &mut last).unwrap();
+        r = RateTarget::steady(3_000_000, 30);
+        let c = rate_commands(&r, 26, false, true, &mut last).unwrap();
+        assert!(!c.nudged);
+        assert_eq!(bits(&c), 3_000_000);
+        assert_eq!(c.hrd.buffer_size, r.vbv_bits, "the VBV follows the rate");
+    }
+
+    #[test]
+    fn rate_commands_cap_is_sent_cleared_and_not_before_one_exists() {
+        let mut r = RateTarget::steady(6_000_000, 30);
+        r.max_frame_bytes = 0;
+        r.idr_max_bytes = 0;
+        let mut last = SentRate::default();
+        let c = rate_commands(&r, 26, true, false, &mut last).unwrap();
+        assert!(c.max_frame.is_none(), "no cap, no MaxFrameSize buffer");
+        r.max_frame_bytes = 50_000;
+        let c = rate_commands(&r, 26, false, true, &mut last).unwrap();
+        assert_eq!(c.max_frame.unwrap().max_frame_size, 400_000);
+        r.max_frame_bytes = 0;
+        let c = rate_commands(&r, 26, false, true, &mut last).unwrap();
+        assert_eq!(c.max_frame.expect("clearing is sent").max_frame_size, 0);
+        r.bps += 1000;
+        let c = rate_commands(&r, 26, false, true, &mut last).unwrap();
+        assert!(c.max_frame.is_none());
     }
 }

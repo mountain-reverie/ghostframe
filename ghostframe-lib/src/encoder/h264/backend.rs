@@ -66,11 +66,44 @@ pub(crate) struct BackendCaps {
     pub vbr: bool,
 }
 
-/// The rate the stream is held to. Frame-size caps and VBV changes are the
-/// rate-control PR's (B6); the VBV is fixed at open from the first rate.
+/// A P frame may be this many average frames big (design 4.3).
+pub(crate) const FRAME_CAP_FRAMES: u32 = 3;
+/// The P-frame VBV holds at least this long at the rate.
+pub(crate) const VBV_SECS: f64 = 0.1;
+/// An IDR may take this long at the rate...
+pub(crate) const IDR_BUDGET_SECS: f64 = 0.25;
+/// ...but never less than this many bytes (unverified on the VCE, T4).
+pub(crate) const IDR_BUDGET_FLOOR_BYTES: u32 = 32 * 1024;
+
+/// What the stream is held to: the rate, a soft per-frame size cap and the
+/// VBV. A change of any field is a change of the rate-control buffers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RateTarget {
     pub bps: u32,
+    /// Cap on a P frame, bytes; 0 sends none. Soft on the VCE (S2).
+    pub max_frame_bytes: u32,
+    /// Cap on an IDR, bytes; 0 sends none.
+    pub idr_max_bytes: u32,
+    /// HRD buffer size for P frames, bits.
+    pub vbv_bits: u32,
+}
+
+impl RateTarget {
+    /// The steady-state target for `bps` at `fps`: cap = 3 average frames,
+    /// VBV = max(0.1 s of the rate, one cap), IDR budget = max(0.25 s of the
+    /// rate, 32 KB). Callers go through this so none can forget the VBV.
+    pub(crate) fn steady(bps: u32, fps: u32) -> Self {
+        let per_sec = u64::from(bps / 8);
+        let cap = (per_sec * u64::from(FRAME_CAP_FRAMES) / u64::from(fps.max(1))) as u32;
+        let vbv = ((f64::from(bps) * VBV_SECS) as u32).max(cap.saturating_mul(8));
+        let idr = ((per_sec as f64 * IDR_BUDGET_SECS) as u32).max(IDR_BUDGET_FLOOR_BYTES);
+        Self {
+            bps,
+            max_frame_bytes: cap,
+            idr_max_bytes: idr,
+            vbv_bits: vbv.max(1),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +123,7 @@ impl StreamConfig {
             width,
             height,
             fps,
-            rate: RateTarget { bps },
+            rate: RateTarget::steady(bps, fps),
             rc: RcMode::Vbr,
             params: StreamParams::writer(),
         }
