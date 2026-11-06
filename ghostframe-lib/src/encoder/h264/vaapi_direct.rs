@@ -83,7 +83,30 @@ struct Session {
     /// Move a re-sent rate by 16 bps when it equals the last one (the cap
     /// latch). Always on; a test turns it off to show what it is for.
     nudge: bool,
+    /// T4 only: which of the rate buffers a re-send carries.
+    #[cfg(test)]
+    resend_variant: ResendVariant,
     failed: bool,
+}
+
+/// T4's experiment on what a re-send of the rate buffers must carry (B6): the
+/// IDR always sends all of them, the variant applies to the P frames.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ResendVariant {
+    /// RC, HRD (75 % fullness) and MaxFrameSize, as production sends them.
+    #[default]
+    Full,
+    /// RC and MaxFrameSize, no HRD.
+    NoHrd,
+    /// RC, HRD at 100 % initial fullness, MaxFrameSize.
+    HrdFull,
+    /// RC, HRD at 25 % initial fullness, MaxFrameSize.
+    HrdLow,
+    /// RC only (the cap and the VBV stay as last sent).
+    RcOnly,
+    /// RC, HRD at this percentage initial fullness, MaxFrameSize.
+    HrdPct(u32),
 }
 
 /// What the rate-control buffers last carried.
@@ -256,6 +279,8 @@ impl Session {
             qp,
             rate_dirty: false,
             nudge: true,
+            #[cfg(test)]
+            resend_variant: ResendVariant::default(),
             failed: false,
         };
         // On error `s` drops and releases whatever was created.
@@ -640,9 +665,36 @@ impl Session {
         };
         self.rc_sends += 1;
         self.nudges += u64::from(c.nudged);
+        #[cfg(test)]
+        let variant = if idr {
+            ResendVariant::Full
+        } else {
+            self.resend_variant
+        };
+        #[cfg(test)]
+        let mut c = c;
+        #[cfg(test)]
+        match variant {
+            ResendVariant::HrdFull => c.hrd.initial_buffer_fullness = c.hrd.buffer_size,
+            ResendVariant::HrdLow => c.hrd.initial_buffer_fullness = c.hrd.buffer_size / 4,
+            ResendVariant::HrdPct(p) => {
+                c.hrd.initial_buffer_fullness =
+                    (u64::from(c.hrd.buffer_size) * u64::from(p) / 100) as u32;
+            }
+            _ => {}
+        }
+        #[cfg(test)]
+        let (send_hrd, send_cap) = (
+            !matches!(variant, ResendVariant::NoHrd | ResendVariant::RcOnly),
+            variant != ResendVariant::RcOnly,
+        );
+        #[cfg(not(test))]
+        let (send_hrd, send_cap) = (true, true);
         self.misc(ids, VA_MISC_RATE_CONTROL, &c.rc)?;
-        self.misc(ids, VA_MISC_HRD, &c.hrd)?;
-        if let Some(ms) = &c.max_frame {
+        if send_hrd {
+            self.misc(ids, VA_MISC_HRD, &c.hrd)?;
+        }
+        if let Some(ms) = c.max_frame.as_ref().filter(|_| send_cap) {
             self.cap_sends += 1;
             self.misc(ids, VA_MISC_MAX_FRAME_SIZE, ms)?;
         }
@@ -1164,6 +1216,12 @@ impl VaapiDirect {
 
     /// Turn the 16 bps nudge off (T4's control: a cap-only change then does
     /// not latch).
+    pub(crate) fn set_resend_variant_for_test(&mut self, v: ResendVariant) {
+        if let Some(s) = self.session.as_mut() {
+            s.resend_variant = v;
+        }
+    }
+
     pub(crate) fn set_nudge_for_test(&mut self, on: bool) {
         if let Some(s) = self.session.as_mut() {
             s.nudge = on;
