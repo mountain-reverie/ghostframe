@@ -201,9 +201,12 @@ pub struct H264Request {
     pub(crate) plan: FramePlan,
     /// The encoder-side DPB before this frame: the backend lists all of it.
     pub(crate) refs: Vec<ResidentRef>,
-    /// Frame rate and rate target the stream is opened with.
+    /// Frame rate the stream is opened with, and the rate target this frame
+    /// is coded under: the rate with its frame caps and VBV, made by the
+    /// planner so the worker applies exactly what the budget was measured
+    /// against (`RateTarget::steady`).
     pub(crate) fps: u32,
-    pub(crate) bps: u32,
+    pub(crate) rate: RateTarget,
 }
 
 /// An access unit a plan-executing backend made, with what it parsed from it.
@@ -509,7 +512,10 @@ impl FrameBackend for GpuBackend {
                 return H264Reply::Failed;
             }
             self.direct = None;
-            let cfg = StreamConfig::new(dims.0, dims.1, req.fps, req.bps);
+            let cfg = StreamConfig {
+                rate: req.rate,
+                ..StreamConfig::new(dims.0, dims.1, req.fps, req.rate.bps)
+            };
             match open_direct(&cfg) {
                 Ok(b) => self.direct = Some((b, dims)),
                 Err(e) => {
@@ -543,7 +549,7 @@ impl FrameBackend for GpuBackend {
         let Some((backend, _)) = self.direct.as_mut() else {
             return H264Reply::Failed;
         };
-        backend.set_rate(RateTarget::steady(req.bps, req.fps));
+        backend.set_rate(req.rate);
         match backend.encode(&view, &req.plan, &req.refs) {
             Ok(au) => H264Reply::Coded(CodedAu(au)),
             Err(e) => {
