@@ -400,6 +400,8 @@ pub fn pcm_load(mode: ghostframe_lib::encoder::h264_harness::PcmMode) -> H264Loa
         pcm: Some(mode),
         pcm_wrong_ref_every: 0,
         pcm_rate_policy: false,
+        pcm_rate_model: None,
+        pcm_phase_a_rate: false,
         tile_phases: [None, None],
     }
 }

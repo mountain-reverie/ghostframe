@@ -182,6 +182,10 @@ pub struct H264Load {
     pub pcm_wrong_ref_every: u32,
     /// See `InjectedH264::pcm_rate_policy`.
     pub pcm_rate_policy: bool,
+    /// See `InjectedH264::pcm_rate_model`.
+    pub pcm_rate_model: Option<ghostframe_lib::encoder::h264_harness::PcmRateModel>,
+    /// See `InjectedH264::pcm_phase_a_rate`.
+    pub pcm_phase_a_rate: bool,
     /// Frame index ranges `[from, to)` in which the screen is drawn by the
     /// tile codec instead: one solid tile changes per frame. Entering one
     /// abandons the H.264 frames in flight, leaving it is a re-entry.
@@ -1542,6 +1546,8 @@ async fn drive_session(
             pcm: h.pcm,
             pcm_wrong_ref_every: h.pcm_wrong_ref_every,
             pcm_rate_policy: h.pcm_rate_policy,
+            pcm_rate_model: h.pcm_rate_model,
+            pcm_phase_a_rate: h.pcm_phase_a_rate,
             pcm_cadence_us: h.cadence_us,
         }),
         SceneLoad::Script(_) | SceneLoad::Profile(_) => None,

@@ -53,6 +53,8 @@ fn load(idr_bytes: usize, p_bytes: usize) -> H264Load {
         pcm: None,
         pcm_wrong_ref_every: 0,
         pcm_rate_policy: false,
+        pcm_rate_model: None,
+        pcm_phase_a_rate: false,
         tile_phases: [None, None],
     }
 }
@@ -1072,6 +1074,60 @@ const T_UP_US: u64 = 11_000_000;
 /// the first six, and the population says how the other 18 fare.
 const P_B_SEEDS: [u64; 6] = [0x6701, 0x6702, 0x6703, 0x6704, 0x6705, 0x6706];
 
+/// Which stream the capacity-step scene runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepMode {
+    /// Phase A: the scripted CBR encoder behind the legacy rate policy.
+    Legacy,
+    /// An acked-reference session (`refs_cbr_load`), rate moved in place.
+    Refs,
+    /// The same session with Phase A's rate policy (the 2 s lock): the
+    /// baseline `step_in_place` is measured against.
+    RefsPhaseA,
+}
+
+impl StepMode {
+    /// `GF_POP_MODE=refs|refs-phase-a|legacy` (default legacy).
+    fn from_env() -> Self {
+        match std::env::var("GF_POP_MODE").as_deref() {
+            Ok("refs") => Self::Refs,
+            Ok("refs-phase-a") => Self::RefsPhaseA,
+            _ => Self::Legacy,
+        }
+    }
+
+    fn load(self) -> H264Load {
+        match self {
+            Self::Legacy => cbr_load(),
+            Self::Refs => refs_cbr_load(),
+            Self::RefsPhaseA => {
+                let mut l = refs_cbr_load();
+                l.pcm_phase_a_rate = true;
+                l
+            }
+        }
+    }
+}
+
+/// An acked-reference stream under production's rate policy, and a PCM
+/// encoder that sizes its frames from the rate it is told. The content
+/// demands more than any rate the step scene reaches (40 kB a P frame is 9.6
+/// Mbit/s at 30 fps), so the stream is held to the rate and rate control is
+/// what the scene measures: `pcm_load`'s 3 kB frames are 0.72 Mbit/s, below
+/// every rate here, and would show nothing.
+fn refs_cbr_load() -> H264Load {
+    let mut l = ghostframe_e2e::harness::h264_scene::pcm_load(
+        ghostframe_lib::encoder::h264_harness::PcmMode::RefManager,
+    );
+    l.pcm_rate_policy = true;
+    l.pcm_rate_model = Some(ghostframe_lib::encoder::h264_harness::PcmRateModel {
+        demand_p_bytes: 40_000,
+        demand_idr_bytes: 120_000,
+        fps: FPS,
+    });
+    l
+}
+
 async fn capacity_step(seed: u64) -> StepRun {
     capacity_step_with_jitter(seed, 0).await
 }
@@ -1081,7 +1137,14 @@ async fn capacity_step_with_jitter(seed: u64, jitter_us: u64) -> StepRun {
 }
 
 async fn capacity_step_with(seed: u64, jitter_us: u64, ack_chatter: Option<Duration>) -> StepRun {
-    capacity_step_on(seed, jitter_us, ack_chatter, NORMAL_DELAY_US).await
+    capacity_step_on(
+        seed,
+        jitter_us,
+        ack_chatter,
+        NORMAL_DELAY_US,
+        StepMode::Legacy,
+    )
+    .await
 }
 
 /// One-way delay of the scenes' links (a 40 ms round trip), and of the
@@ -1096,6 +1159,7 @@ async fn capacity_step_on(
     jitter_us: u64,
     ack_chatter: Option<Duration>,
     delay_us: u64,
+    mode: StepMode,
 ) -> StepRun {
     let net = bottleneck_net(
         CapTimeline::step(STEP_FROM_BPS / 8, STEP_AT_US, STEP_TO_BPS / 8),
@@ -1104,7 +1168,7 @@ async fn capacity_step_on(
         600,
     );
     let r = run(
-        scene(seed, 30, net, cbr_load(), DropPlan::default()),
+        scene(seed, 30, net, mode.load(), DropPlan::default()),
         RunOptions {
             ack_chatter,
             ..RunOptions::default()
@@ -1358,6 +1422,14 @@ struct StepSummary {
     /// The headroom guard let go in time (see
     /// `the_headroom_guard_releases_in_h264_mode_on_a_capacity_step`).
     guard_ok: bool,
+    /// Time from the step to the guard letting go, if it did.
+    guard_us: Option<u64>,
+    /// Probe-padding windows the run filled: the premise that the stream is
+    /// not application-limited and the probes had something to fill.
+    padding_windows: u64,
+    /// Frames the rate model cut below the content's demand are not counted
+    /// here; `rate_applies_up` is: the policy moved the rate up in place.
+    applies_up: u64,
 }
 
 impl StepSummary {
@@ -1372,8 +1444,13 @@ impl StepSummary {
 /// `ack_chatter` adds one client-to-server packet per delivery (see
 /// `RunOptions::ack_chatter`): the same scene with the client-to-server timing
 /// earlier, which must not change what the estimate finds.
-async fn step_summary(seed: u64, ack_chatter: Option<Duration>, delay_us: u64) -> StepSummary {
-    let st = capacity_step_on(seed, 0, ack_chatter, delay_us).await;
+async fn step_summary(
+    seed: u64,
+    ack_chatter: Option<Duration>,
+    delay_us: u64,
+    mode: StepMode,
+) -> StepSummary {
+    let st = capacity_step_on(seed, 0, ack_chatter, delay_us, mode).await;
     let (reached, low) = step_outcome(&st);
     let min_all = st
         .post
@@ -1390,7 +1467,32 @@ async fn step_summary(seed: u64, ack_chatter: Option<Duration>, delay_us: u64) -
         min_all: min_all as f64 / st.pre_min as f64,
         sat_share: b.ceiling_saturated_reads as f64 / b.ceiling_reads.max(1) as f64,
         guard_ok: engaged && released.is_some_and(|t| t <= T_UP_US + 2_000_000),
+        guard_us: released,
+        padding_windows: st.r.h264.stats.probe_padding_windows,
+        applies_up: st
+            .r
+            .h264_run()
+            .map_or(0, |x| x.analyse().refs.rate_applies_up),
     }
+}
+
+/// Median and 90th percentile of the times that exist, and how many seeds had
+/// none (never reached), as `p50=.. p90=.. none=..` in milliseconds.
+fn percentiles_ms(times: impl Iterator<Item = Option<u64>>) -> String {
+    let mut t: Vec<u64> = Vec::new();
+    let mut none = 0;
+    for x in times {
+        match x {
+            Some(v) => t.push(v),
+            None => none += 1,
+        }
+    }
+    t.sort_unstable();
+    if t.is_empty() {
+        return format!("p50=- p90=- none={none}");
+    }
+    let at = |q: usize| t[(t.len() * q / 100).min(t.len() - 1)] / 1000;
+    format!("p50={} p90={} none={none}", at(50), at(90))
 }
 
 /// The population behind `P_B_SEEDS`: `GF_POP_N` timelines (24 by default)
@@ -1410,6 +1512,10 @@ async fn step_summary(seed: u64, ack_chatter: Option<Duration>, delay_us: u64) -
 /// | after, as sent | 185/192 | 189/192 | 0 |
 /// | after, a packet at once | 185/192 | 192/192 | 0 |
 /// | after, a packet 8 ms later | 187/192 | 190/192 | 0 |
+///
+/// `GF_POP_MODE=refs` runs the acked-reference twin of the scene (a PCM
+/// encoder that sizes frames from the rate, the in-place rate policy),
+/// `refs-phase-a` the same session under Phase A's rate policy.
 #[tokio::test(start_paused = true)]
 #[ignore = "characterisation: prints the P-B outcome of GF_POP_N seeds, three times"]
 async fn p_b_seed_population() {
@@ -1426,24 +1532,28 @@ async fn p_b_seed_population() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(NORMAL_DELAY_US);
+    let mode = StepMode::from_env();
     for chatter in CHATTER {
         let mut all = Vec::new();
         for i in start..start + n {
-            let s = step_summary(0x6701 + i, chatter, delay_us).await;
+            let s = step_summary(0x6701 + i, chatter, delay_us, mode).await;
             println!(
-                "SEED {:#x} chatter={chatter:?} reached={:?} lowest/pre-min={:.2} min/pre-min={:.2} saturated={:.2} guard_ok={}",
-                s.seed, s.reached, s.low, s.min_all, s.sat_share, s.guard_ok
+                "SEED {:#x} {mode:?} chatter={chatter:?} reached={:?} guard={:?} lowest/pre-min={:.2} min/pre-min={:.2} saturated={:.2} guard_ok={} padding_windows={} applies_up={}",
+                s.seed, s.reached, s.guard_us, s.low, s.min_all, s.sat_share, s.guard_ok,
+                s.padding_windows, s.applies_up
             );
             all.push(s);
         }
         let count = |f: &dyn Fn(&StepSummary) -> bool| all.iter().filter(|s| f(s)).count();
         println!(
-            "SUMMARY chatter={chatter:?} n={n}: within T_UP {}, lower bound kept {}, collapses {}, guard released {}, mean saturated share {:.2}",
+            "SUMMARY {mode:?} chatter={chatter:?} n={n}: within T_UP {}, lower bound kept {}, collapses {}, guard released {}, mean saturated share {:.2}; step-up ms {}; guard ms {}",
             count(&|s| s.hit()),
             count(&|s| s.low >= 0.8),
             count(&|s| s.collapsed()),
             count(&|s| s.guard_ok),
-            all.iter().map(|s| s.sat_share).sum::<f64>() / all.len().max(1) as f64
+            all.iter().map(|s| s.sat_share).sum::<f64>() / all.len().max(1) as f64,
+            percentiles_ms(all.iter().map(|s| s.reached)),
+            percentiles_ms(all.iter().map(|s| s.guard_us)),
         );
     }
 }
@@ -1580,6 +1690,39 @@ async fn drop_and_quiet_population() {
 /// acked at once, and more).
 #[tokio::test(start_paused = true)]
 async fn p_b_population_never_collapses_and_finds_the_headroom_whenever_the_client_acks() {
+    population_gate(StepMode::Legacy, None).await;
+}
+
+/// The acked-reference twin of the gate above: the same rows and seeds on an
+/// acked-reference session (`refs_cbr_load`: a PCM encoder that sizes its
+/// frames from the rate it is told, the in-place rate policy). Tightened per
+/// row, as allowed misses (the rows are n = 24/8/8/15/6/4, where a percentage
+/// says little): no collapse, the headroom found, the guard released.
+///
+/// Measured at `GF_POP_N=96` (`p_b_seed_population`, `GF_POP_MODE`), misses
+/// out of 96 on the three chatter rows of the 20 ms path, in-place policy vs
+/// Phase A's (the 2 s lock): reached 0.8 x 6 Mbit/s in 11 s 86/95/93 vs
+/// 89/91/86, guard released 96/96/96 vs 96/96/96 (legacy 92/96/89), no
+/// collapse in either, step-up p50 1.9/2.0/2.0 s vs 1.9/2.0/5.3 s, p90
+/// 12.5/7.6/7.2 s vs 7.3/7.7/10.5 s. Premise: probes were padded and the
+/// policy moved the rate up in place on every seed.
+#[tokio::test(start_paused = true)]
+async fn p_b_population_refs_twin_never_collapses_and_finds_the_headroom() {
+    population_gate(StepMode::Refs, Some(REFS_TWIN_ALLOWED_MISSES)).await;
+}
+
+/// Misses allowed per gate row: `(reaching the headroom, releasing the guard)`.
+const REFS_TWIN_ALLOWED_MISSES: [(usize, usize); 6] =
+    [(2, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)];
+
+/// The gate's rows: seeds, ack chatter and one-way delay.
+type PopulationRow = (Option<Duration>, &'static [u64], u64);
+
+/// The gate over the rows of `p_b_population_never_collapses_and_finds_the_headroom_whenever_the_client_acks`
+/// for `mode`. `allowed_misses` is `None` for the legacy percentages, or, per
+/// row, the misses tolerated for reaching the headroom and for the guard (rows
+/// are n = 24/8/8/15/6/4, so a percentage means little on the small ones).
+async fn population_gate(mode: StepMode, allowed_misses: Option<[(usize, usize); 6]>) {
     const AS_SENT: [u64; 24] = [
         0x6701, 0x6702, 0x6703, 0x6704, 0x6705, 0x6706, 0x6707, 0x6708, 0x6709, 0x670a, 0x670b,
         0x670c, 0x670d, 0x670e, 0x670f, 0x6710, 0x6715, 0x6720, 0x6724, 0x6727, 0x673a, 0x6746,
@@ -1598,26 +1741,38 @@ async fn p_b_population_never_collapses_and_finds_the_headroom_whenever_the_clie
     ];
     const LOW_AT_ONCE: [u64; 6] = [0x6703, 0x6704, 0x6708, 0x670d, 0x670e, 0x6716];
     const LOW_LATE: [u64; 4] = [0x6701, 0x6703, 0x6715, 0x671a];
-    for (chatter, seeds, delay_us) in [
+    let rows: [PopulationRow; 6] = [
         (None, &AS_SENT[..], NORMAL_DELAY_US),
         (Some(Duration::ZERO), &ACKED_AT_ONCE[..], NORMAL_DELAY_US),
         (Some(CHATTER_LATE), &ACKED_AT_ONCE[..], NORMAL_DELAY_US),
         (None, &LOW_AS_SENT[..], LOW_DELAY_US),
         (Some(Duration::ZERO), &LOW_AT_ONCE[..], LOW_DELAY_US),
         (Some(CHATTER_LATE), &LOW_LATE[..], LOW_DELAY_US),
-    ] {
+    ];
+    for (row, (chatter, seeds, delay_us)) in rows.into_iter().enumerate() {
         let mut all = Vec::new();
         for &seed in seeds {
-            all.push(step_summary(seed, chatter, delay_us).await);
+            all.push(step_summary(seed, chatter, delay_us, mode).await);
         }
         let n = all.len();
         let hits = all.iter().filter(|s| s.hit()).count();
         let released = all.iter().filter(|s| s.guard_ok).count();
         let share = all.iter().map(|s| s.sat_share).sum::<f64>() / n as f64;
         println!(
-            "population chatter={chatter:?} delay {delay_us} us: n={n} hits={hits} guard={released} saturated share {share:.2} min/pre-min {:.2}",
-            all.iter().map(|s| s.min_all).fold(f64::MAX, f64::min)
+            "population {mode:?} chatter={chatter:?} delay {delay_us} us: n={n} hits={hits} guard={released} saturated share {share:.2} min/pre-min {:.2}; step-up ms {}; guard ms {}",
+            all.iter().map(|s| s.min_all).fold(f64::MAX, f64::min),
+            percentiles_ms(all.iter().map(|s| s.reached)),
+            percentiles_ms(all.iter().map(|s| s.guard_us)),
         );
+        if mode != StepMode::Legacy {
+            for s in &all {
+                assert!(
+                    s.padding_windows > 0 && s.applies_up > 0,
+                    "seed {:#x} {mode:?}: premise: probes were padded ({}) and the rate moved up in place ({})",
+                    s.seed, s.padding_windows, s.applies_up
+                );
+            }
+        }
         for s in &all {
             assert!(
                 !s.collapsed(),
@@ -1625,10 +1780,18 @@ async fn p_b_population_never_collapses_and_finds_the_headroom_whenever_the_clie
                 s.seed, s.min_all
             );
         }
-        assert!(
-            hits * 100 >= n * 80,
-            "chatter={chatter:?}: only {hits} of {n} timelines reached the headroom"
-        );
+        match allowed_misses {
+            None => assert!(
+                hits * 100 >= n * 80,
+                "chatter={chatter:?}: only {hits} of {n} timelines reached the headroom"
+            ),
+            Some(a) => assert!(
+                n - hits <= a[row].0,
+                "{mode:?} row {row}: {} of {n} timelines missed the headroom (allowed {})",
+                n - hits,
+                a[row].0
+            ),
+        }
         // 6 of 8, not 7: the H.264 step-up ramp is slow and non-monotonic
         // (pre-existing; the saturation fix does not worsen it), and some
         // timelines release the guard just past T_UP + 2 s (0x670e and 0x6725
@@ -1637,12 +1800,27 @@ async fn p_b_population_never_collapses_and_finds_the_headroom_whenever_the_clie
         // master without the fix (with 2 collapses). Follow-up: the slow,
         // erratic H.264 step-up ramp (B6 rate control). The collapse and
         // reached-headroom criteria stay strict.
-        assert!(
-            released * 100 >= n * 75,
-            "chatter={chatter:?}: the headroom guard released on only {released} of {n}"
-        );
+        match allowed_misses {
+            None => assert!(
+                released * 100 >= n * 75,
+                "chatter={chatter:?}: the headroom guard released on only {released} of {n}"
+            ),
+            Some(a) => assert!(
+                n - released <= a[row].1,
+                "{mode:?} row {row}: the guard missed on {} of {n} (allowed {})",
+                n - released,
+                a[row].1
+            ),
+        }
         // On the low-latency path the stream is saturated more often whatever
         // counts (0.74 - 0.80 here, 0.80 - 0.89 on master): no bound there.
+        // The twin's stream is held to the rate it is told (the model's
+        // bucket), so on the 20 ms path it is rarely saturated: 0.02 - 0.04
+        // measured, 0.33 when the model ignores the rate.
+        assert!(
+            mode == StepMode::Legacy || delay_us == LOW_DELAY_US || share < 0.15,
+            "{mode:?} row {row}: {share:.2} of the readings found the stream saturated: the rate is not what sizes the frames"
+        );
         assert!(
             share < 0.6 || delay_us == LOW_DELAY_US,
             "chatter={chatter:?}: {share:.2} of the readings of a CBR stream found it saturated"

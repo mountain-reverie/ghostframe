@@ -453,6 +453,16 @@ pub struct InjectedH264 {
     /// as well; the scenes about loss and reordering keep it out of the way).
     #[cfg(feature = "browserless-harness")]
     pub pcm_rate_policy: bool,
+    /// An acked-reference scene sizes its frames from the rate the encoder was
+    /// told (see [`crate::encoder::h264_harness::PcmRateModel`]) instead of
+    /// from `idr_bytes` and `p_bytes`. `None`: fixed sizes.
+    #[cfg(feature = "browserless-harness")]
+    pub pcm_rate_model: Option<crate::encoder::h264_harness::PcmRateModel>,
+    /// Baseline and mutation, with `pcm_rate_policy`: move the rate with Phase
+    /// A's policy (`RatePolicy::step`, the 2 s reopen lock) instead of the
+    /// in-place one, to measure what the in-place policy changed.
+    #[cfg(feature = "browserless-harness")]
+    pub pcm_phase_a_rate: bool,
     /// The scene's frame period, for the `RefManager`'s decode deadlines.
     #[cfg(feature = "browserless-harness")]
     pub pcm_cadence_us: u64,
