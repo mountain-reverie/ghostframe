@@ -4,7 +4,12 @@
 #[command(
     name = "ghostframe-server",
     version,
-    about = "Serve this user's X session to ghostframe clients over a Tailscale tailnet"
+    about = "Serve this user's X session to ghostframe clients over a Tailscale tailnet",
+    after_help = "H.264: GHOSTFRAME_H264_BACKEND=auto|vaapi|openh264|ffmpeg picks the encoder \
+        (auto: VA-API when the machine has it, else the OpenH264 library if installed; \
+        vaapi never loads it). OpenH264 Video Codec provided by Cisco Systems, Inc. \
+        Cisco's patent grant covers only the binary Cisco distributes; a distribution-built \
+        library carries none, and patent licensing is the operator's. See NOTICE."
 )]
 pub struct Cli {
     #[command(subcommand)]

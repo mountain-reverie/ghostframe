@@ -14,6 +14,20 @@ test-unit:
     cargo test --workspace --lib
     cargo test --workspace --bins
 
+# The openh264 lib tests and browserless scenes against ONE libopenh264, named
+# by its absolute path (GHOSTFRAME_H264_OPENH264_LIB, which the tests and the
+# scenes read as the daemon does). Without a path they use the system's. CI runs
+# Ubuntu's 2.4.1 and a developer machine may have 2.6.x, so run it against the
+# other layout before touching `openh264_sys.rs`; DEVELOPERS.md says how to get
+# a 2.4.x without installing it.
+test-openh264 lib="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -n "{{lib}}" ]]; then export GHOSTFRAME_H264_OPENH264_LIB="$(realpath "{{lib}}")"; fi
+    cargo test --release -p ghostframe-lib --lib -- openh264 observed \
+        --skip h264_direct_ --skip dmabuf_real_ --skip encoder::h264_vaapi --skip gpu_pipeline::
+    cargo test --release -p ghostframe-e2e --test browserless_h264 openh264_ -- --test-threads=1
+
 # --- Native client only -----------------------------------------------
 #
 # The `ghostframe` binary and the crates beneath it. None of this touches
