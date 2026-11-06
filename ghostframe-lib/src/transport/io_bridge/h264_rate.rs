@@ -50,6 +50,14 @@ const SPIKE_RATIO: f64 = 1.5;
 /// A jump is held (the target is computed from it, not from the smoothed
 /// estimate) for this long, enough for the evaluation interval to see it.
 const SPIKE_HOLD: Duration = Duration::from_secs(1);
+/// The same hold on a session whose rate moves in place. A probe's result is
+/// the estimate's peak for a few hundred milliseconds, and the stream has to
+/// be sent at the rate it found for long enough for the acknowledgements to
+/// confirm it, or goog_cc pulls the estimate back before the stream uses it.
+/// Swept on the 96-seed step-up population (`GF_POP_MODE=refs`, 2026-11-06): 0.5
+/// s reached the headroom on 75/81/77 of 96, 1 s on 79/80/80, 2 s on 96/95/95,
+/// and the p90 step-up fell from 12.4 s to 5.5 s.
+pub(crate) const SPIKE_HOLD_IN_PLACE: Duration = Duration::from_secs(2);
 /// A candidate is looked at no more often than this.
 const EVAL_MIN_INTERVAL: Duration = Duration::from_millis(250);
 /// A candidate is adopted at least this often, however little it moved.
@@ -233,13 +241,13 @@ impl RatePolicy {
         t as u32
     }
 
-    fn observe(&mut self, now: Instant, estimate_bps: u64) {
+    fn observe(&mut self, now: Instant, estimate_bps: u64, spike_hold: Duration) {
         let est = estimate_bps as f64;
         match (self.ewma_bps, self.last_obs) {
             (Some(e), Some(t)) => {
                 let dt = now.saturating_duration_since(t).as_secs_f64();
                 if est > e * SPIKE_RATIO {
-                    let until = now + SPIKE_HOLD;
+                    let until = now + spike_hold;
                     self.spike = Some((est.max(self.spike.map_or(0.0, |s| s.0)), until));
                 }
                 let alpha = 1.0 - (-dt / EWMA_TAU.as_secs_f64()).exp();
@@ -260,7 +268,7 @@ impl RatePolicy {
     /// the frame about to be encoded. `at_gop` is whether that frame is the
     /// scheduled GOP IDR.
     pub(crate) fn step(&mut self, now: Instant, estimate_bps: u64, at_gop: bool) -> RateStep {
-        self.observe(now, estimate_bps);
+        self.observe(now, estimate_bps, SPIKE_HOLD);
         let Some(applied) = self.applied else {
             let t = self.target(now);
             self.applied = Some(t);
@@ -328,7 +336,7 @@ impl RatePolicy {
     /// for a fall), never twice within [`APPLY_MIN_INTERVAL`]. A rate inside
     /// the band is not re-sent: each re-send of the rate buffers costs a dip.
     pub(crate) fn step_in_place(&mut self, now: Instant, estimate_bps: u64) -> Option<RateApply> {
-        self.observe(now, estimate_bps);
+        self.observe(now, estimate_bps, SPIKE_HOLD_IN_PLACE);
         let Some(applied) = self.applied else {
             let t = self.target(now);
             self.applied = Some(t);
@@ -954,12 +962,12 @@ mod tests {
         p.step(t0, 10 * MBIT, false);
         // One observation 250 ms after a step to 20 Mbit/s: 1 - 1/e = 63.2 %
         // of the way.
-        p.observe(ms(t0, 250), 20 * MBIT);
+        p.observe(ms(t0, 250), 20 * MBIT, SPIKE_HOLD);
         let e = p.ewma_bps.unwrap();
         let want = 10e6 + (1.0 - (-1.0f64).exp()) * 10e6;
         assert!((e - want).abs() < 1.0, "{e} vs {want}");
         // And a long gap converges on the new value.
-        p.observe(ms(t0, 10_250), 20 * MBIT);
+        p.observe(ms(t0, 10_250), 20 * MBIT, SPIKE_HOLD);
         assert!((p.ewma_bps.unwrap() - 20e6).abs() < 1e3);
     }
 
@@ -1661,10 +1669,12 @@ mod tests {
     fn in_place_a_drop_shortly_after_a_rise_is_not_locked_out() {
         let t0 = Instant::now();
         let mut p = RatePolicy::default();
+        // The rise is under the spike ratio (a spike is held for the in-place
+        // hold, which would keep the fall back: `in_place_a_spike_is_held...`).
         let steps = drive(&mut p, t0, 0, 6_000, |t| match t {
             0..=2_999 => 5 * MBIT,
-            3_000..=3_499 => 10 * MBIT,
-            _ => 4 * MBIT,
+            3_000..=3_499 => 7 * MBIT,
+            _ => 3 * MBIT,
         });
         let rise = steps
             .iter()
@@ -1688,16 +1698,16 @@ mod tests {
     fn in_place_applies_are_never_closer_than_the_minimum_interval() {
         let t0 = Instant::now();
         let mut p = RatePolicy::default();
-        // A deterministic noisy estimate, 3 to 9 Mbit/s, new value every frame.
-        let mut x = 12345u64;
-        let mut noise = vec![0u64; 30_000 / 16 + 2];
-        for n in &mut noise {
-            x = x
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            *n = 3 * MBIT + (x >> 33) % (6 * MBIT);
-        }
-        let steps = drive(&mut p, t0, 0, 30_000, |t| noise[(t / 16) as usize]);
+        // A square estimate, 4.2 and 6.0 Mbit/s every 300 ms (under the spike
+        // ratio: a held spike would make the policy quiet): the policy wants
+        // to move at every edge, and the interval is what stops it.
+        let steps = drive(&mut p, t0, 0, 30_000, |t| {
+            if (t / 300) % 2 == 0 {
+                4_200_000
+            } else {
+                6_000_000
+            }
+        });
         assert!(steps.len() > 10, "premise: it applied ({})", steps.len());
         for w in steps.windows(2) {
             assert!(
@@ -1760,7 +1770,7 @@ mod tests {
     }
 
     #[test]
-    fn in_place_a_spike_is_held_for_a_second() {
+    fn in_place_a_spike_is_held_for_the_in_place_hold() {
         let t0 = Instant::now();
         let mut p = RatePolicy::default();
         let steps = drive(&mut p, t0, 0, 7_000, |t| {
@@ -1778,12 +1788,22 @@ mod tests {
             .iter()
             .find(|(t, a)| *t > up.0 && a.bps < 6_000_000)
             .expect("and given back");
+        let hold = SPIKE_HOLD_IN_PLACE.as_millis() as u64;
         assert!(
-            down.0 >= 4_000,
+            hold > SPIKE_HOLD.as_millis() as u64,
+            "premise: the in-place hold is the longer one"
+        );
+        // Let go one evaluation after the hold ends, not before, not much later.
+        assert!(
+            down.0 >= 3_000 + hold - 250,
             "the spike was let go after {} ms",
             down.0 - 3_000
         );
-        assert!(down.0 < 5_000, "but not held forever: {} ms", down.0);
+        assert!(
+            down.0 < 3_000 + hold + 1_500,
+            "but not held forever: {} ms",
+            down.0
+        );
     }
 
     #[test]

@@ -1127,8 +1127,10 @@ impl StepMode {
             Self::Legacy => cbr_load(),
             Self::Refs => refs_cbr_load(),
             Self::RefsPhaseA => {
+                // The pre-B6 baseline: Phase A's policy, and no probe raise.
                 let mut l = refs_cbr_load();
                 l.pcm_phase_a_rate = true;
+                l.probe_raise = false;
                 l
             }
             Self::RefsFullTransient => {
@@ -1799,6 +1801,11 @@ async fn p_b_population_never_collapses_and_finds_the_headroom_whenever_the_clie
 /// | refs, 40 %-fullness re-send model (T4 sweep), in place, 10 % rise band | 87/87/77 | 96/96/96 | 1900/10300, 2000/10600, 2100/12900 |
 /// | refs, 40 %-fullness re-send model, in place, 15 % rise band (shipped) | 88/89/85 | 96/96/96 | 1900/10600, 1900/8600, 1900/12500 |
 /// | refs, 40 %-fullness re-send model, Phase A | 90/86/86 | 96/96/96 | 5500/7300, 5900/11800, 5700/10900 |
+/// | refs, 1 s spike hold, probe raise on | 79/80/80 | 96/96/96 | 1200/12600, 1300/12400, 1300/12300 |
+/// | refs, 2 s spike hold, raise off | 94/96/90 | 96/96/96 | 1900/6600, 1900/6000, 1900/7300 |
+/// | refs, 2 s spike hold, raise on (shipped) | 96/95/95 | 96/96/96 | 1200/5500, 1300/5400, 1300/5700 |
+/// | refs, 2 s spike hold, raise on, model yield 0.7 | 94/93/92 | 96/96/96 | 4600/6100, 4500/6600, 5500/6700 |
+/// | refs, Phase A policy, raise off (the pre-B6 policy) | 90/86/86 | 96/96/96 | 5500/7300, 5900/11800, 5700/10900 |
 ///
 /// The gate's model is the 40 %-fullness re-send (`pcm_rate.rs`, provisional,
 /// from T4 `h264_direct_resend_fullness_sweep` on the VCE): a P re-send of the
@@ -1808,6 +1815,12 @@ async fn p_b_population_never_collapses_and_finds_the_headroom_whenever_the_clie
 /// frame, the backend re-sending the HRD at 75 %) is `GF_POP_MODE=refs-burst`.
 /// Mean bytes over the bytes the rates told allow: 0.993 in place (burst
 /// model: 1.019), 0.996 Phase A (1.013). `refs-linear-step` is the optimistic reading of the step-size dependence.
+///
+/// With the 2 s spike hold of the in-place policy and the probe raise (the
+/// shipped rows) the twin reaches the headroom on 96/95/95 of 96 timelines in a
+/// median 1.2-1.3 s and a p90 of 5.4-5.7 s, under `T_UP`, with no collapse and
+/// the guard released on all; the raise cuts the padding per probe window to
+/// 61 % of its no-raise figure (scene 9).
 ///
 /// No collapse in any. The twin never misses the guard (the 89/96 of the
 /// legacy gate is the legacy 8 ms row only). The full model is the gate's;
@@ -1822,10 +1835,9 @@ async fn p_b_population_refs_twin_never_collapses_and_finds_the_headroom() {
 }
 
 /// The same gate with the probe raise off (`InjectedH264::probe_raise`): padding
-/// alone fills the windows, as before the raise. It holds the bound the twin had
-/// before the raise (one miss in each of the first three rows), so the raise's
-/// cost on the headroom proxy is the difference of the two gates, and the
-/// no-raise path stays what it was.
+/// alone fills the windows, as before the raise. The raise's effect on the
+/// headroom proxy is the difference of the two gates, and the no-raise path
+/// stays a path that works.
 #[tokio::test(start_paused = true)]
 async fn p_b_population_refs_twin_without_the_probe_raise_keeps_its_bound() {
     population_gate(
@@ -1849,27 +1861,20 @@ async fn p_b_population_refs_twin_with_a_pessimistic_raise_yield() {
 }
 
 /// Misses allowed per gate row: `(reaching the headroom, releasing the guard)`,
-/// raise on. Measured (2026-11-06), not tuned: 7 of 24, 3 of 8 and 2 of 8
-/// timelines miss the headroom in the first three rows and none in the rest;
-/// the guard is always released. The same rows without the raise miss 1, 1, 1
-/// ([`REFS_TWIN_NO_RAISE_ALLOWED_MISSES`]): the proxy (an estimate sample over
-/// 0.8 x the new capacity within `T_UP`) counts a spike of the first probe
-/// after the step, which is twice the estimate, and the raise ramps about 11 %
-/// lower in the seconds after (mean estimate over the 4 s to 14 s after the
-/// step, 48 seeds: 4.13 against 4.63 Mbit/s) for 40 % fewer padding bytes.
+/// raise on, at the 2 s spike hold of the in-place policy
+/// (`SPIKE_HOLD_IN_PLACE`). Measured (2026-11-06), not tuned: the rows are
+/// n = 24/8/8/15/6/4 and one timeline of the second misses; the guard is
+/// always released. At 1 s of hold the same rows missed 7, 3 and 2.
 const REFS_TWIN_ALLOWED_MISSES: [(usize, usize); 6] =
-    [(7, 0), (3, 0), (2, 0), (0, 0), (0, 0), (0, 0)];
+    [(0, 0), (1, 0), (0, 0), (0, 0), (0, 0), (0, 0)];
 
-/// The same rows at a raise yield of 0.7: 9, 4 and 2 misses in the first three
-/// rows, none in the rest, the guard always released.
+/// The same rows at a raise yield of 0.7: one miss in the first row.
 const REFS_TWIN_PESSIMISTIC_ALLOWED_MISSES: [(usize, usize); 6] =
-    [(9, 0), (4, 0), (2, 0), (0, 0), (0, 0), (0, 0)];
+    [(1, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)];
 
-/// The same rows with the raise off: measured on the 40 %-fullness re-send
-/// model, one miss in each of the first three rows; the burst model needed 5
-/// and 2 in the first two rows and none in the third.
+/// The same rows with the raise off: one miss in the first row.
 const REFS_TWIN_NO_RAISE_ALLOWED_MISSES: [(usize, usize); 6] =
-    [(1, 0), (1, 0), (1, 0), (0, 0), (0, 0), (0, 0)];
+    [(1, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)];
 
 /// The gate's rows: seeds, ack chatter and one-way delay.
 type PopulationRow = (Option<Duration>, &'static [u64], u64);
@@ -2139,3 +2144,115 @@ async fn the_headroom_guard_releases_in_h264_mode_on_a_capacity_step() {
 mod pcm_scenes;
 #[path = "browserless_h264/refs_scenes.rs"]
 mod refs_scenes;
+
+/// What scene 9 adds up over its seeds for one mode.
+#[derive(Debug, Default)]
+struct RaiseTotals {
+    padding_bytes: u64,
+    windows: u64,
+    raise_bytes: u64,
+    raise_windows: u64,
+    raised_lost: u64,
+    raised_frames: u64,
+    delivery_max_us: u64,
+    abandoned: u64,
+    min_raise_bytes_per_run: u64,
+}
+
+impl RaiseTotals {
+    fn padding_per_window(&self) -> f64 {
+        self.padding_bytes as f64 / self.windows.max(1) as f64
+    }
+}
+
+async fn raise_totals(mode: StepMode, seeds: u64) -> RaiseTotals {
+    let mut t = RaiseTotals {
+        min_raise_bytes_per_run: u64::MAX,
+        ..RaiseTotals::default()
+    };
+    for i in 0..seeds {
+        let st = capacity_step_on(0x6701 + i, 0, None, NORMAL_DELAY_US, mode).await;
+        let (h, refs) = (&st.r.h264, &st.r.h264.refs);
+        t.padding_bytes += h.stats.probe_padding_bytes;
+        t.windows += st.r.transport.instr.probe_windows_closed;
+        t.raise_bytes += refs.probe_raise_bytes;
+        t.raise_windows += refs.probe_raise_windows;
+        t.raised_lost += refs.raised_frame_lost;
+        t.raised_frames += refs.probe_raise_frames;
+        t.delivery_max_us = t.delivery_max_us.max(refs.raised_delivery_us_max);
+        t.abandoned += st.r.probes_abandoned;
+        t.min_raise_bytes_per_run = t.min_raise_bytes_per_run.min(refs.probe_raise_bytes);
+    }
+    t
+}
+
+/// Scene 9, probe step-up 2 -> 6 Mbit/s (design T3): the probe raise carries
+/// part of each probe window, so padding fills less of it.
+///
+/// A property gate over 12 timelines of the P-B capacity step (`refs_cbr_load`):
+/// the padding bytes per probe window with the raise are at most 75 % of those
+/// without it (`probe_raise` off), and at most 80 % with a pessimistic model
+/// (a raise yields 0.7 of what the VCE's re-send profile gives it). Measured
+/// over 24 timelines, 2026-11-06: 133 kB a window without the raise, 82 kB
+/// with it (61 %), 92 kB at yield 0.7 (69 %). The share is not a design number:
+/// padding is sized for the shortfall after what the frames still to come are
+/// expected to carry (half an average frame each, `RAISE_EXPECTED_YIELD`), so a
+/// 100 ms window of three frames leaves about 60 to 70 % for padding, and the
+/// bound has the room that timeline-to-timeline variation needs.
+///
+/// Also bounded: the raised frames' cost to the stream on a lossless link: no
+/// raised frame is named by a loss verdict, the longest a raised frame took to
+/// be fully acknowledged is under the link's buffer (600 ms) and a second
+/// (measured 583 ms), and the windows complete (abandoned under 2 %).
+///
+/// Premises: the raise ran in every timeline (`probe_raise_bytes > 0`), and
+/// without it never did, and padding was sent in both.
+///
+/// Mutation: with the raise off in the "with" run the share is 100 % and the
+/// premise fails.
+#[tokio::test(start_paused = true)]
+async fn the_probe_raise_cuts_padding_per_window_without_costing_the_raised_frames() {
+    const SEEDS: u64 = 12;
+    let off = raise_totals(StepMode::RefsNoRaise, SEEDS).await;
+    let on = raise_totals(StepMode::Refs, SEEDS).await;
+    let pess = raise_totals(StepMode::RefsPessRaise, SEEDS).await;
+    println!("scene 9: without {off:?}\n  with {on:?}\n  pessimistic {pess:?}");
+    assert!(
+        off.padding_bytes > 0 && off.raise_bytes == 0,
+        "premise: padding without the raise, and no raise: {off:?}"
+    );
+    for (name, t, share) in [("measured yield", &on, 0.75), ("yield 0.7", &pess, 0.80)] {
+        assert!(
+            t.min_raise_bytes_per_run > 0 && t.raise_windows > 0 && t.padding_bytes > 0,
+            "{name}: premise: the raise ran in every timeline: {t:?}"
+        );
+        let got = t.padding_per_window() / off.padding_per_window();
+        println!(
+            "scene 9 {name}: padding per window {:.0} B against {:.0} B without = {:.0} %",
+            t.padding_per_window(),
+            off.padding_per_window(),
+            got * 100.0
+        );
+        assert!(
+            got <= share,
+            "{name}: padding per window is {:.0} % of the no-raise figure (bound {:.0} %)",
+            got * 100.0,
+            share * 100.0
+        );
+        assert_eq!(
+            t.raised_lost, 0,
+            "{name}: a raised frame was named by a verdict: {t:?}"
+        );
+        assert!(
+            t.raised_frames > 0 && t.delivery_max_us <= 600_000 + 400_000,
+            "{name}: a raised frame took {} us to be acknowledged",
+            t.delivery_max_us
+        );
+        assert!(
+            t.abandoned * 50 <= t.windows,
+            "{name}: {} of {} windows were abandoned",
+            t.abandoned,
+            t.windows
+        );
+    }
+}
