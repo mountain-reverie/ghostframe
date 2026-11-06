@@ -1255,6 +1255,91 @@ fn h264_direct_probe_raise_spike_prints_p_frame_sizes() {
     }
 }
 
+/// Probe raise, lever B, re-measured on the backend as it is now (the HRD
+/// restarts at 40 % fullness on a P re-send of the rate buffers; the spike
+/// `h264_direct_probe_raise_spike_prints_p_frame_sizes` ran at 75 % and gave
+/// 51.0 / 28.9 / 29.9 kB for a window-rate frame of 33.3 kB, 110 kB for a
+/// 100 kB target). At 2.5 Mbit/s with content above the floor, eight times:
+/// the rate goes to the window rate (8 Mbit/s, a 100 ms window is 100 kB) for
+/// three frames, then back. Printed: the three frames and the three after the
+/// window, as bytes and as multiples of the window-rate average frame, their
+/// sum against the window's 100 kB, and the mean of that ratio, which is what
+/// [`PcmRateModel::raise_yield`] stands for (the model's profile alone is
+/// 1.00 / 0.56 / 0.87 of the average, a ratio of 0.81 of the target). Also
+/// printed: the stream's own average frame in the settled stretch before each
+/// window (the 10.4 kB of the spike) and the dip after the window.
+///
+/// Asserted: it codes and decodes, the buffers went out for every raise and
+/// every restore, and a loose sanity band on the mean ratio (0.3 to 2.5).
+/// Take the number to `PcmRateModel::with_raise_yield` and to scene 9.
+///
+/// Run: `GF_ALLOW_VAAPI=1 cargo test -p ghostframe-lib --lib
+/// h264_direct_probe_raise_lever_b_at_40pct -- --test-threads=1 --nocapture`
+/// on the GPU lock like the other T4 tests.
+#[test]
+fn h264_direct_probe_raise_lever_b_at_40pct() {
+    let _gpu = crate::gpu_test_lock::lock();
+    const BASE_BPS: u32 = 2_500_000;
+    const WINDOW_BPS: u32 = 8_000_000;
+    const RAISES: u32 = 8;
+    const SPACING: u32 = 30;
+    const FIRST: u32 = 40;
+    const WINDOW_BYTES: f64 = WINDOW_BPS as f64 / 8.0 * 0.1;
+    let base = RateTarget::steady(BASE_BPS, 30);
+    let raised_at =
+        |n: u32| n >= FIRST && (n - FIRST) % SPACING < 3 && (n - FIRST) / SPACING < RAISES;
+    let target = |n: u32| {
+        if raised_at(n) {
+            RateTarget::steady(WINDOW_BPS, 30)
+        } else {
+            base
+        }
+    };
+    let frames = FIRST + RAISES * SPACING;
+    let Some(r) = run_rates("probe_raise_40", frames, BASE_BPS, &target, &[], true) else {
+        return;
+    };
+    r.assert_decoded("probe_raise_40");
+    // One send of the buffers into the window, one out of it, per raise.
+    assert!(
+        r.counters.rc_sends as u32 >= 2 * RAISES,
+        "premise: every raise and every restore re-sent the buffers: {:?}",
+        r.counters
+    );
+    let avg_w = avg_frame(WINDOW_BPS);
+    let mut ratios = Vec::new();
+    for k in 0..RAISES {
+        let at = (FIRST + k * SPACING) as usize;
+        let win = &r.sizes[at..at + 3];
+        let after = &r.sizes[at + 3..at + 6];
+        let before = mean(&r.sizes[at - 10..at]);
+        let sum: usize = win.iter().sum();
+        let ratio = sum as f64 / WINDOW_BYTES;
+        ratios.push(ratio);
+        eprintln!(
+            "probe_raise_40 #{k}: window {} B ({:.2}x avg each) = {sum} B = {ratio:.2} of the {WINDOW_BYTES:.0} B asked; after {} B; stream avg before {before:.0} B",
+            win.iter().map(|b| b.to_string()).collect::<Vec<_>>().join("/"),
+            mean(win) / avg_w,
+            after.iter().map(|b| b.to_string()).collect::<Vec<_>>().join("/"),
+        );
+    }
+    let mean_ratio = ratios.iter().sum::<f64>() / ratios.len() as f64;
+    eprintln!(
+        "probe_raise_40: mean yield {mean_ratio:.2} (min {:.2}, max {:.2}); the model's profile alone is 0.81; first frame mean {:.2}x the window-rate average; counters {:?}",
+        ratios.iter().copied().fold(f64::MAX, f64::min),
+        ratios.iter().copied().fold(0.0, f64::max),
+        (0..RAISES)
+            .map(|k| r.sizes[(FIRST + k * SPACING) as usize] as f64 / avg_w)
+            .sum::<f64>()
+            / f64::from(RAISES),
+        r.counters
+    );
+    assert!(
+        (0.3..=2.5).contains(&mean_ratio),
+        "yield {mean_ratio:.2} outside the sanity band"
+    );
+}
+
 /// How the first frame after a rate step depends on the size of the step, and
 /// whether a re-send alone does it (B6's open question: it decides whether the
 /// in-place rate policy can move the rate in small steps). At 720p, 30 fps,
