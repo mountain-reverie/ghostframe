@@ -70,6 +70,19 @@ const RISE_FRACTION: f64 = 0.30;
 /// A rise needs the raw estimate over the line on this many consecutive
 /// evaluations (at least [`EVAL_MIN_INTERVAL`] apart): about half a second.
 const RISE_CONFIRMATIONS: u32 = 2;
+/// In-place rate changes (acked-reference sessions) are at least this far
+/// apart: a change costs no IDR there, so only the encoder's settling time
+/// (3-4 frames, S2) limits them.
+pub(crate) const APPLY_MIN_INTERVAL: Duration = Duration::from_millis(250);
+/// The rate is re-applied at least this often when it moved at all, so a slowly
+/// drifting estimate is followed inside the dead band.
+pub(crate) const APPLY_REFRESH: Duration = Duration::from_secs(1);
+/// A candidate this far (fraction) from the running rate is applied at once.
+pub(crate) const APPLY_MOVE_FRACTION: f64 = 0.10;
+/// A cut is a fall of more than [`DROP_FRACTION`] from the highest rate
+/// applied within this long: a large fall may arrive as several smaller
+/// in-place steps.
+pub(crate) const CUT_LOOKBACK: Duration = Duration::from_secs(1);
 /// Reopens are at least this far apart.
 pub(crate) const MIN_REOPEN_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -137,6 +150,17 @@ pub(crate) enum RateStep {
     ReopenRise { bps: u32 },
 }
 
+/// An in-place rate change (see [`RatePolicy::step_in_place`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RateApply {
+    pub bps: u32,
+    /// The first rate of the stream.
+    pub initial: bool,
+    /// A fall of more than 30 % from the highest rate applied in the last
+    /// [`CUT_LOOKBACK`].
+    pub cut: bool,
+}
+
 /// The pure rate policy. See the module docs.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RatePolicy {
@@ -155,6 +179,9 @@ pub(crate) struct RatePolicy {
     candidate_at: Option<Instant>,
     last_eval: Option<Instant>,
     last_reopen: Option<Instant>,
+    /// Rates applied in place within [`CUT_LOOKBACK`].
+    recent_applies: std::collections::VecDeque<(Instant, u32)>,
+    last_apply: Option<Instant>,
 }
 
 fn relative_move(from: u32, to: u32) -> f64 {
@@ -274,6 +301,79 @@ impl RatePolicy {
             };
         }
         RateStep::Keep
+    }
+
+    /// The rate policy for a session whose encoder changes rate in place (no
+    /// IDR, no reopen): the same estimate handling as [`step`](Self::step)
+    /// without Phase A's reopen economics. No 2 s lock, no rise
+    /// confirmations, no GOP wait; a change is applied when the candidate left
+    /// the dead band ([`APPLY_MOVE_FRACTION`]) or [`APPLY_REFRESH`] passed,
+    /// never twice within [`APPLY_MIN_INTERVAL`].
+    pub(crate) fn step_in_place(&mut self, now: Instant, estimate_bps: u64) -> Option<RateApply> {
+        self.observe(now, estimate_bps);
+        let Some(applied) = self.applied else {
+            let t = self.target(now);
+            self.applied = Some(t);
+            self.candidate = Some(t);
+            self.candidate_at = Some(now);
+            self.last_eval = Some(now);
+            self.last_apply = Some(now);
+            self.recent_applies.push_back((now, t));
+            return Some(RateApply {
+                bps: t,
+                initial: true,
+                cut: false,
+            });
+        };
+        if self
+            .last_eval
+            .is_none_or(|t| now.saturating_duration_since(t) >= EVAL_MIN_INTERVAL)
+        {
+            self.last_eval = Some(now);
+            let target = self.target(now);
+            let adopt = match (self.candidate, self.candidate_at) {
+                (Some(c), Some(at)) => {
+                    relative_move(c, target) > MOVE_FRACTION
+                        || now.saturating_duration_since(at) >= CANDIDATE_REFRESH
+                }
+                _ => true,
+            };
+            if adopt {
+                self.candidate = Some(target);
+                self.candidate_at = Some(now);
+            }
+        }
+        let cand = self.candidate.unwrap_or(applied);
+        let since = self
+            .last_apply
+            .map_or(Duration::MAX, |t| now.saturating_duration_since(t));
+        if since < APPLY_MIN_INTERVAL || cand == applied {
+            return None;
+        }
+        if relative_move(applied, cand) <= APPLY_MOVE_FRACTION && since < APPLY_REFRESH {
+            return None;
+        }
+        while self
+            .recent_applies
+            .front()
+            .is_some_and(|&(t, _)| now.saturating_duration_since(t) > CUT_LOOKBACK)
+        {
+            self.recent_applies.pop_front();
+        }
+        let high = self
+            .recent_applies
+            .iter()
+            .map(|&(_, b)| b)
+            .fold(applied, u32::max);
+        let cut = f64::from(cand) < f64::from(high) * (1.0 - DROP_FRACTION);
+        self.applied = Some(cand);
+        self.last_apply = Some(now);
+        self.recent_applies.push_back((now, cand));
+        Some(RateApply {
+            bps: cand,
+            initial: false,
+            cut,
+        })
     }
 }
 
@@ -1410,5 +1510,190 @@ mod tests {
         );
         assert_eq!(b.h264.pending_idr, Some(IdrCause::RateDrop));
         assert!(b.h264.last_cut_at.is_some());
+    }
+
+    // ---- step_in_place (acked-reference sessions) ----
+
+    /// Drive `step_in_place` at 60 Hz, the estimate a function of the time in
+    /// ms; every apply with its time.
+    fn drive(
+        p: &mut RatePolicy,
+        t0: Instant,
+        from_ms: u64,
+        to_ms: u64,
+        est: impl Fn(u64) -> u64,
+    ) -> Vec<(u64, RateApply)> {
+        let mut out = Vec::new();
+        let mut t = from_ms;
+        while t < to_ms {
+            if let Some(a) = p.step_in_place(ms(t0, t), est(t)) {
+                out.push((t, a));
+            }
+            t += 16;
+        }
+        out
+    }
+
+    #[test]
+    fn in_place_a_step_up_applies_within_one_interval() {
+        let t0 = Instant::now();
+        let mut p = RatePolicy::default();
+        let steps = drive(&mut p, t0, 0, 5_000, |t| {
+            if t < 3_000 {
+                2 * MBIT
+            } else {
+                7_500_000
+            }
+        });
+        assert_eq!(steps[0].1.bps, 1_600_000);
+        assert!(steps[0].1.initial);
+        let up = steps
+            .iter()
+            .find(|(t, a)| *t >= 3_000 && a.bps > 5_000_000)
+            .expect("the stream follows the step");
+        assert!(
+            up.0 <= 3_000 + 250 + 16,
+            "applied {} ms after the step",
+            up.0 - 3_000
+        );
+        assert!(!up.1.cut);
+    }
+
+    #[test]
+    fn in_place_a_drop_shortly_after_a_rise_is_not_locked_out() {
+        let t0 = Instant::now();
+        let mut p = RatePolicy::default();
+        let steps = drive(&mut p, t0, 0, 6_000, |t| match t {
+            0..=2_999 => 5 * MBIT,
+            3_000..=3_499 => 10 * MBIT,
+            _ => 4 * MBIT,
+        });
+        let rise = steps
+            .iter()
+            .find(|(t, a)| *t >= 3_000 && !a.initial && a.bps > 5_000_000)
+            .expect("the rise applies");
+        let rise_bps = rise.1.bps;
+        let fall = steps
+            .iter()
+            .find(|(t, a)| *t >= 3_500 && a.bps < rise_bps * 9 / 10)
+            .expect("the fall applies");
+        // Well inside Phase A's 2 s lock after the rise.
+        assert!(
+            fall.0 - rise.0 < MIN_REOPEN_INTERVAL.as_millis() as u64,
+            "rise at {} ms, fall at {} ms",
+            rise.0,
+            fall.0
+        );
+    }
+
+    #[test]
+    fn in_place_applies_are_never_closer_than_the_minimum_interval() {
+        let t0 = Instant::now();
+        let mut p = RatePolicy::default();
+        // A deterministic noisy estimate, 3 to 9 Mbit/s, new value every frame.
+        let mut x = 12345u64;
+        let mut noise = vec![0u64; 30_000 / 16 + 2];
+        for n in &mut noise {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *n = 3 * MBIT + (x >> 33) % (6 * MBIT);
+        }
+        let steps = drive(&mut p, t0, 0, 30_000, |t| noise[(t / 16) as usize]);
+        assert!(steps.len() > 10, "premise: it applied ({})", steps.len());
+        for w in steps.windows(2) {
+            assert!(
+                w[1].0 - w[0].0 >= APPLY_MIN_INTERVAL.as_millis() as u64,
+                "{} -> {} ms",
+                w[0].0,
+                w[1].0
+            );
+        }
+    }
+
+    #[test]
+    fn in_place_a_small_drift_is_applied_at_the_refresh_not_before() {
+        let t0 = Instant::now();
+        let mut p = RatePolicy::default();
+        // 10 -> 10.6 Mbit/s: inside the dead band of the applied 8 Mbit/s.
+        let steps = drive(&mut p, t0, 0, 4_000, |t| {
+            if t < 100 {
+                10 * MBIT
+            } else {
+                10_600_000
+            }
+        });
+        let later: Vec<_> = steps.iter().filter(|(_, a)| !a.initial).collect();
+        assert!(!later.is_empty(), "premise: the refresh applied something");
+        let first = later[0];
+        assert!(
+            first.0 >= APPLY_REFRESH.as_millis() as u64,
+            "applied at {} ms, inside the refresh",
+            first.0
+        );
+        assert!(relative_move(8_000_000, first.1.bps) <= APPLY_MOVE_FRACTION);
+        assert!(!first.1.cut);
+    }
+
+    #[test]
+    fn in_place_a_spike_is_held_for_a_second() {
+        let t0 = Instant::now();
+        let mut p = RatePolicy::default();
+        let steps = drive(&mut p, t0, 0, 7_000, |t| {
+            if (3_000..3_100).contains(&t) {
+                15 * MBIT
+            } else {
+                5 * MBIT
+            }
+        });
+        let up = steps
+            .iter()
+            .find(|(t, a)| *t >= 3_000 && a.bps >= 9_000_000)
+            .expect("the spike's headroom is taken");
+        let down = steps
+            .iter()
+            .find(|(t, a)| *t > up.0 && a.bps < 6_000_000)
+            .expect("and given back");
+        assert!(
+            down.0 >= 4_000,
+            "the spike was let go after {} ms",
+            down.0 - 3_000
+        );
+        assert!(down.0 < 5_000, "but not held forever: {} ms", down.0);
+    }
+
+    #[test]
+    fn in_place_a_stepped_fall_counts_as_a_cut_a_slow_drift_does_not() {
+        let t0 = Instant::now();
+        // Falls of 25 % per 300 ms: no single apply is a 30 % fall, together
+        // they are a cut.
+        let mut p = RatePolicy::default();
+        let steps = drive(&mut p, t0, 0, 4_000, |t| {
+            let k = (t.saturating_sub(2_000) / 300).min(5);
+            (10.0 * MBIT as f64 * 0.75f64.powi(k as i32)) as u64
+        });
+        let falls: Vec<_> = steps
+            .iter()
+            .filter(|(t, a)| *t > 2_000 && !a.initial)
+            .collect();
+        let mut prev = steps.iter().find(|(t, _)| *t <= 2_000).unwrap().1.bps;
+        let mut single_30 = false;
+        for (_, a) in &steps[1..] {
+            single_30 |= f64::from(a.bps) < f64::from(prev) * 0.7;
+            prev = a.bps;
+        }
+        assert!(falls.len() >= 2, "premise: several steps ({})", falls.len());
+        assert!(!single_30, "premise: no single apply is itself a 30 % fall");
+        assert!(
+            falls.iter().any(|(_, a)| a.cut),
+            "the stepped fall is a cut"
+        );
+
+        let mut p = RatePolicy::default();
+        let steps = drive(&mut p, t0, 0, 20_000, |t| {
+            (10.0 * MBIT as f64 * (1.0 - 0.025 * t as f64 / 1000.0)) as u64
+        });
+        assert!(steps.len() > 4, "premise: it followed the drift");
+        assert!(steps.iter().all(|(_, a)| !a.cut), "{steps:?}");
     }
 }
