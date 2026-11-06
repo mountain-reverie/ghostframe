@@ -9,8 +9,8 @@ use ghostframe_client_core::h264_gate::{
 };
 use ghostframe_client_core::ResetReason;
 use ghostframe_protocol::protocol::{
-    FrameHeader, FRAME_FLAG_IDR, FRAME_FLAG_MARK_LT, FRAME_FLAG_NON_REF, FRAME_FLAG_TARGET_IS_LT,
-    NO_ACK, REF_FRAME_NONE,
+    FrameHeader, FRAME_FLAG_IDR, FRAME_FLAG_MARK_LT, FRAME_FLAG_MARK_TARGET, FRAME_FLAG_NON_REF,
+    FRAME_FLAG_TARGET_IS_LT, NO_ACK, REF_FRAME_NONE,
 };
 use proptest::prelude::*;
 
@@ -39,6 +39,12 @@ fn st(seq: u32, reference: u32) -> FrameHeader {
 /// A healthy P that also marks itself into long-term slot `mark`.
 fn st_mark(seq: u32, reference: u32, mark: u8) -> FrameHeader {
     hdr(seq, FRAME_FLAG_MARK_LT, mark, reference)
+}
+
+/// A healthy P whose marking (MMCO 3) makes the frame it predicts from,
+/// `reference`, the long-term picture of slot `mark`.
+fn st_mark_target(seq: u32, reference: u32, mark: u8) -> FrameHeader {
+    hdr(seq, FRAME_FLAG_MARK_TARGET, mark, reference)
 }
 
 /// A recovery P (non-reference) predicting from long-term `slot`.
@@ -113,6 +119,85 @@ fn a_mark_moves_a_frame_into_its_slot_and_a_later_target_finds_it() {
     assert!(fed(g.on_frame(&recovery(4, 1, 2), 0)));
     // Slot 0 still has the IDR.
     assert!(fed(g.on_frame(&recovery(5, 0, 1), 0)));
+}
+
+#[test]
+fn a_target_mark_puts_the_predecessor_not_the_carrier_into_its_slot() {
+    let mut g = H264Gate::new();
+    g.on_frame(&idr(1), 0);
+    assert!(fed(g.on_frame(&st(2, 1), 0)));
+    assert_eq!(g.long_term(1), None, "premise: slot 1 is empty");
+    // 3 carries the mark and predicts from 2: 2 becomes long-term.
+    assert!(fed(g.on_frame(&st_mark_target(3, 2, 1), 0)));
+    assert_eq!(g.long_term(1), Some(2));
+    assert_eq!(g.long_term(0), Some(1), "the other slot is untouched");
+    // The carrier is not the long-term picture.
+    assert_eq!(
+        g.on_frame(&reroot(4, 1, 3), 0),
+        Verdict::Refuse(RefuseCause::NoReference)
+    );
+    assert!(fed(g.on_frame(&reroot(5, 1, 2), 0)));
+}
+
+#[test]
+fn a_target_mark_needs_its_target_to_be_the_newest_reference() {
+    let mut g = H264Gate::new();
+    g.on_frame(&idr(1), 0);
+    assert!(fed(g.on_frame(&st(2, 1), 0)));
+    assert!(fed(g.on_frame(&st(3, 2), 0)));
+    // The usual rule: 2 is good but not the newest reference.
+    assert_eq!(
+        g.on_frame(&st_mark_target(4, 2, 1), 0),
+        Verdict::Refuse(RefuseCause::NoReference)
+    );
+    assert_eq!(g.long_term(1), None, "a refused frame marks nothing");
+    assert_eq!(g.long_term(0), Some(1));
+}
+
+#[test]
+fn a_target_mark_means_nothing_on_a_frame_that_cannot_carry_it() {
+    let mut g = H264Gate::new();
+    g.on_frame(&idr(1), 0);
+    assert!(fed(g.on_frame(&st(2, 1), 0)));
+    // Predicting from a long-term picture: no short-term target to mark.
+    // Slot 0 holds the IDR (1); the mark bits name slot 1, which must stay empty.
+    let lt_target = hdr(3, FRAME_FLAG_MARK_TARGET | FRAME_FLAG_TARGET_IS_LT, 1, 1);
+    assert!(fed(g.on_frame(&lt_target, 0)));
+    assert_eq!(g.long_term(1), None);
+    // A non-reference carrier cannot hold an MMCO.
+    let non_ref = hdr(4, FRAME_FLAG_MARK_TARGET | FRAME_FLAG_NON_REF, 1, 3);
+    assert!(fed(g.on_frame(&non_ref, 0)));
+    assert_eq!(g.long_term(1), None);
+}
+
+#[test]
+fn a_target_mark_names_one_slot_and_excludes_the_carrier_mark() {
+    let mut g = H264Gate::new();
+    g.on_frame(&idr(1), 0);
+    assert!(fed(g.on_frame(&st(2, 1), 0)));
+    assert_eq!(
+        g.on_frame(&st_mark_target(3, 2, 2), 0),
+        Verdict::Refuse(RefuseCause::BadSlot)
+    );
+    let both = hdr(4, FRAME_FLAG_MARK_TARGET | FRAME_FLAG_MARK_LT, 1, 2);
+    assert_eq!(g.on_frame(&both, 0), Verdict::Refuse(RefuseCause::BadSlot));
+    assert_eq!((g.long_term(0), g.long_term(1)), (Some(1), None));
+}
+
+#[test]
+fn a_target_mark_alone_makes_a_stream_an_acked_reference_stream() {
+    let mut g = H264Gate::new();
+    g.on_frame(&idr(1), 0);
+    assert!(!g.is_acked_ref_stream(), "premise: an IDR does not");
+    assert!(fed(g.on_frame(&st_mark_target(2, 1, 1), 0)));
+    assert!(g.is_acked_ref_stream());
+    // And so a refusal waits for the server's repair instead of asking for
+    // an IDR at once, as it would on a legacy stream.
+    assert_eq!(
+        g.on_frame(&st_mark_target(4, 3, 1), 10),
+        Verdict::Refuse(RefuseCause::NoReference)
+    );
+    assert_eq!(g.take_request(), None);
 }
 
 #[test]

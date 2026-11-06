@@ -18,8 +18,8 @@
 use std::time::{Duration, Instant};
 
 use ghostframe_protocol::protocol::{
-    FrameRefInfo, FRAME_FLAG_IDR, FRAME_FLAG_MARK_LT, FRAME_FLAG_NON_REF, FRAME_FLAG_TARGET_IS_LT,
-    REF_FRAME_NONE,
+    FrameRefInfo, FRAME_FLAG_IDR, FRAME_FLAG_MARK_LT, FRAME_FLAG_MARK_TARGET, FRAME_FLAG_NON_REF,
+    FRAME_FLAG_TARGET_IS_LT, REF_FRAME_NONE,
 };
 
 use super::syntax::{DecoderModel, Effective, Mmco, RefPic, Rplm, SliceHeader, StreamParams};
@@ -80,6 +80,10 @@ pub(crate) struct FramePlan {
     pub target: Option<RefTarget>,
     /// The long-term slot this frame is marked into (candidate anchor).
     pub mark: Option<u8>,
+    /// The mark in `mark` lands on the short-term picture this frame predicts
+    /// from, not on this frame (an MMCO 3 marking). Reaches the client as
+    /// `FRAME_FLAG_MARK_TARGET` in place of `FRAME_FLAG_MARK_LT`.
+    pub mark_target: bool,
     pub mmco: Vec<Mmco>,
     pub rplm: Vec<Rplm>,
 }
@@ -119,7 +123,11 @@ impl FramePlan {
             flags |= FRAME_FLAG_NON_REF;
         }
         if let Some(k) = self.mark {
-            flags |= FRAME_FLAG_MARK_LT;
+            flags |= if self.mark_target {
+                FRAME_FLAG_MARK_TARGET
+            } else {
+                FRAME_FLAG_MARK_LT
+            };
             slots |= k & 3;
         }
         if let Some(RefTarget::Long { slot, .. }) = self.target {
@@ -758,6 +766,7 @@ impl RefManager {
             poc: 0,
             target: None,
             mark: Some(0),
+            mark_target: false,
             mmco: Vec::new(),
             rplm: Vec::new(),
         }
@@ -823,6 +832,7 @@ impl RefManager {
             poc: 2 * self.poc_count,
             target: Some(target),
             mark,
+            mark_target: false,
             mmco: mark.map_or_else(Vec::new, |k| self.mark_ops(k, frame_num, target)),
             rplm,
         }

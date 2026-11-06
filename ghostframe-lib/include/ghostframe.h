@@ -333,6 +333,18 @@
 #define FRAME_FLAG_PAD 16
 
 /**
+ * Frame flag bit 5: the long-term mark in `slots` bits 0-1 applies to the
+ * short-term picture this frame predicts from (`ref_frame_seq`), not to this
+ * frame. An encoder that marks with MMCO 3 (openh264) makes the carrier's
+ * predecessor the long-term picture, where MMCO 6 (`FRAME_FLAG_MARK_LT`)
+ * marks the carrier. Set instead of `FRAME_FLAG_MARK_LT`, never with it (a
+ * receiver refuses the frame). A receiver ignores it on a frame that is
+ * non-reference or predicts from a long-term picture: neither can carry such
+ * a marking.
+ */
+#define FRAME_FLAG_MARK_TARGET 32
+
+/**
  * Envelope discriminator byte for the tile-FEC parity datagram.
  */
 #define TILE_PARITY_ENVELOPE 4
