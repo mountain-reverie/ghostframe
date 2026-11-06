@@ -244,6 +244,10 @@ impl PcmBackend {
 }
 
 impl H264Backend for PcmBackend {
+    fn name(&self) -> &'static str {
+        "pcm"
+    }
+
     fn caps(&self) -> BackendCaps {
         BackendCaps {
             explicit_refs: true,

@@ -268,6 +268,10 @@ pub(crate) fn nv12_to_i420(src: &Nv12View<'_>, dst: &mut Vec<u8>) {
 }
 
 impl H264Backend for OpenH264Backend {
+    fn name(&self) -> &'static str {
+        "openh264"
+    }
+
     fn caps(&self) -> BackendCaps {
         BackendCaps {
             explicit_refs: false,

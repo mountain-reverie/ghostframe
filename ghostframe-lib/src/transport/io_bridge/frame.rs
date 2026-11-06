@@ -2738,9 +2738,17 @@ impl IoBridge {
             {
                 let h = &self.h264.stats;
                 let em = &self.reliable_emitter.stats;
+                let refs = self.h264_refs_report();
                 tracing::info!(
                     target: "ghostframe::h264",
                     frame_seq = seq,
+                    backend = refs.backend,
+                    idr_backend_fallback = refs.idr_backend_fallback,
+                    marks_observed = refs.marks_observed,
+                    mark_unrepresentable = refs.mark_unrepresentable,
+                    ltr_recoveries_requested = refs.ltr_recoveries_requested,
+                    ltr_mark_failed_sent = refs.ltr_mark_failed_sent,
+                    backend_demotions = refs.backend_demotions,
                     frames_sent = h.frames_sent,
                     frames_idr = h.frames_idr,
                     frames_acked = h.frames_acked,

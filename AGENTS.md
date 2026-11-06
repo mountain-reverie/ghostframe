@@ -218,6 +218,15 @@ With `GHOSTFRAME_DAMAGE_MODE=shadow` or `on` the daemon also logs a cumulative
 (design note section 3.4, "As landed (PR 4)").
 
 `h264 stats` also carries `rate_target_bps` and the stall counters.
+It names the `backend` (`libva-direct`, `openh264`, `pcm`) and, for a backend
+with its own reference structure (openh264: the manager runs in observed mode),
+`idr_backend_fallback` (an IDR the backend made unasked, or a stream moved down
+a step), `marks_observed`, `mark_unrepresentable`, `ltr_recoveries_requested`,
+`ltr_mark_failed_sent` and `backend_demotions` (libva-direct at its fault limit,
+moved to openh264 with `auto`). A non-zero `idr_backend_fallback` outside a
+demotion is the library's own fallback (an unknown recovery frame, scene-change
+detection left on) and worth a look. `GHOSTFRAME_H264_BACKEND` is
+`auto|vaapi|openh264|ffmpeg`. Full docs land in B7-6.
 `GHOSTFRAME_H264_GOP_SECONDS` (default 3, clamped 2..5) sets the scheduled IDR
 interval; `GHOSTFRAME_LOSS_OVERRIDE=1` turns the off-by-default loss override
 back on. Every field and both variables are explained in

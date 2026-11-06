@@ -218,8 +218,9 @@ pub struct H264Request {
     pub(crate) openh264_lib: Option<std::sync::Arc<std::path::Path>>,
 }
 
-/// An access unit a plan-executing backend made, with what it parsed from it.
-pub struct CodedAu(pub(crate) EncodedAu);
+/// An access unit a plan-executing backend made, and the name of the backend
+/// that made it (`H264Backend::name`).
+pub struct CodedAu(pub(crate) EncodedAu, pub(crate) &'static str);
 
 /// What [`FrameBackend::finish_h264_planned`] came back with.
 pub enum H264Reply {
@@ -326,47 +327,59 @@ fn open_direct(cfg: &StreamConfig) -> Result<Box<dyn H264Backend>, BackendError>
     Ok(Box::new(b))
 }
 
-/// Whether the planned path may hand a stream to the openh264 backend. It
-/// runs its own references, which the reference manager can only follow in
-/// observed mode (B7-3); until that lands the backend is built and tested but
-/// not routed, so `openh264` (explicit or by `auto`) falls back to the Phase A
-/// encoder exactly as a machine without libva-direct does today.
-const OPENH264_ROUTED: bool = false;
-
 fn open_openh264(
     cfg: &StreamConfig,
     lib: Option<&std::path::Path>,
 ) -> Result<Box<dyn H264Backend>, BackendError> {
-    if !OPENH264_ROUTED {
-        return Err(BackendError::Unavailable(
-            "openh264 is not routed into the planned path yet (needs the observed-mode \
-             reference manager)"
-                .into(),
-        ));
-    }
     let mut b = OpenH264Backend::new(lib.map(std::path::Path::to_path_buf));
     b.open(cfg)?;
     Ok(Box::new(b))
 }
 
+/// Why libva-direct cannot serve this process, once a probe found out: the
+/// next stream does not probe again (each IDR would otherwise open and fail
+/// the same way). Per process, like the machine it describes.
+pub(crate) static DIRECT_PROBE_FAILURE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// Open the backend a session runs on: libva-direct, then openh264 for
 /// `auto`; one of them alone when the operator chose it. `Err` means neither
-/// is available and the caller falls back to the Phase A encoder.
+/// is available and the caller falls back to the Phase A encoder (B7a; the
+/// process-wide "H.264 unavailable" latch replaces that in B7b).
+///
+/// A libva-direct open that fails as *unavailable* (no device, driver or
+/// entrypoint) is a probe result about the machine and is remembered in
+/// `probe`; later calls go straight to the next backend. *Incapable* is about
+/// the stream asked for (a picture under 128x128, a rate-control mode the
+/// driver lacks for this configuration), so a later, larger stream can still
+/// open: it is not remembered, and neither is a fault at run time.
 pub(crate) fn open_backend(
     choice: H264BackendChoice,
     cfg: &StreamConfig,
     direct: impl FnOnce(&StreamConfig) -> Result<Box<dyn H264Backend>, BackendError>,
     openh264: impl FnOnce(&StreamConfig) -> Result<Box<dyn H264Backend>, BackendError>,
+    probe: &std::sync::OnceLock<String>,
 ) -> Result<Box<dyn H264Backend>, BackendError> {
+    let try_direct = |cfg: &StreamConfig| -> Result<Box<dyn H264Backend>, BackendError> {
+        if let Some(why) = probe.get() {
+            return Err(BackendError::Unavailable(why.clone()));
+        }
+        direct(cfg).inspect_err(|e| {
+            if matches!(e, BackendError::Unavailable(_)) {
+                let _ = probe.set(e.to_string());
+            }
+        })
+    };
     match choice {
-        H264BackendChoice::Vaapi => direct(cfg),
+        H264BackendChoice::Vaapi => try_direct(cfg),
         H264BackendChoice::Openh264 => openh264(cfg),
         H264BackendChoice::Ffmpeg => Err(BackendError::Unavailable(
             "GHOSTFRAME_H264_BACKEND selects the ffmpeg encoder".into(),
         )),
-        H264BackendChoice::Auto => match direct(cfg) {
+        H264BackendChoice::Auto => match try_direct(cfg) {
             Ok(b) => Ok(b),
             Err(first) => {
+                // Said once: afterwards the cached probe makes this the same
+                // line on every IDR.
                 tracing::info!(
                     target: LOG_TARGET,
                     "libva-direct H.264 unavailable ({first}); trying openh264"
@@ -392,14 +405,19 @@ pub(crate) fn encode_planned(
     backend.encode(view, &req.plan, &req.refs)
 }
 
+/// A plan-executing backend, the frame size and the choice it was opened for.
+type OpenedBackend = (Box<dyn H264Backend>, (u32, u32), H264BackendChoice);
+
 /// The production backend: a Vulkan `GpuFrameProcessor` and, lazily, a
 /// VA-API (or software) `FullFrameEncoder`.
 pub struct GpuBackend {
     processor: GpuFrameProcessor,
     encoder: Option<FullFrameEncoder>,
-    /// The plan-executing backend of an acked-reference session, and the
-    /// frame size it was opened for. `None` until the first planned frame.
-    direct: Option<(Box<dyn H264Backend>, (u32, u32))>,
+    /// The plan-executing backend of an acked-reference session, the frame
+    /// size it was opened for and the choice that opened it (a demotion
+    /// changes the choice, which reopens at the next IDR). `None` until the
+    /// first planned frame.
+    direct: Option<OpenedBackend>,
     /// The rate and GOP the encoder opens with, as the loop last set them.
     rate: RateParams,
     /// The GPU outputs of the frame in flight, between `analyse` and `finish_*`.
@@ -579,7 +597,11 @@ impl FrameBackend for GpuBackend {
         // And never two encoder sessions: the Phase A encoder is closed.
         self.encoder = None;
         let dims = (analysis.nv12_width, analysis.nv12_height);
-        if self.direct.as_ref().is_none_or(|(_, d)| *d != dims) {
+        if self
+            .direct
+            .as_ref()
+            .is_none_or(|(_, d, c)| *d != dims || *c != req.backend)
+        {
             // A stream starts, or changes size, on an IDR; anything else
             // means the loop's plan outlived the backend it was made for.
             if req.plan.kind != PicKind::Idr {
@@ -592,8 +614,14 @@ impl FrameBackend for GpuBackend {
                 ..StreamConfig::new(dims.0, dims.1, req.fps, req.rate.bps)
             };
             let lib = req.openh264_lib.as_deref();
-            match open_backend(req.backend, &cfg, open_direct, |c| open_openh264(c, lib)) {
-                Ok(b) => self.direct = Some((b, dims)),
+            match open_backend(
+                req.backend,
+                &cfg,
+                open_direct,
+                |c| open_openh264(c, lib),
+                &DIRECT_PROBE_FAILURE,
+            ) {
+                Ok(b) => self.direct = Some((b, dims, req.backend)),
                 Err(e) => {
                     tracing::info!(
                         target: LOG_TARGET,
@@ -622,11 +650,11 @@ impl FrameBackend for GpuBackend {
             uv_stride: analysis.nv12_uv_stride as usize,
             uv_offset: analysis.nv12_uv_offset as usize,
         };
-        let Some((backend, _)) = self.direct.as_mut() else {
+        let Some((backend, _, _)) = self.direct.as_mut() else {
             return H264Reply::Failed;
         };
         match encode_planned(backend.as_mut(), &view, req) {
-            Ok(au) => H264Reply::Coded(CodedAu(au)),
+            Ok(au) => H264Reply::Coded(CodedAu(au, backend.name())),
             Err(e) => {
                 tracing::warn!(target: LOG_TARGET, "acked-reference H.264 encode failed: {e}");
                 self.direct = None;
@@ -855,6 +883,9 @@ mod backend_choice_tests {
     }
 
     impl H264Backend for Recorder {
+        fn name(&self) -> &'static str {
+            "recorder"
+        }
         fn caps(&self) -> BackendCaps {
             BackendCaps {
                 explicit_refs: false,
@@ -948,6 +979,7 @@ mod backend_choice_tests {
                         Err(unavailable("openh264", &calls))
                     }
                 },
+                &std::sync::OnceLock::new(),
             );
             assert_eq!(
                 *calls.borrow(),
@@ -958,23 +990,119 @@ mod backend_choice_tests {
         }
     }
 
-    /// While the reference manager has no observed mode, production never
-    /// hands a stream to openh264, whatever the operator asked for. B7-3
-    /// flips `OPENH264_ROUTED` and replaces this test.
+    /// `auto` is libva-direct, then openh264, and only then the Phase A
+    /// encoder (B7a; B7b makes that "H.264 unavailable"). openh264 is routed
+    /// now that the manager has an observed mode.
     #[test]
-    fn openh264_is_not_routed_into_the_planned_path_yet() {
-        for choice in [H264BackendChoice::Auto, H264BackendChoice::Openh264] {
+    fn openh264_is_routed_into_the_planned_path_when_libva_direct_is_not_there() {
+        let calls = RefCell::new(Vec::new());
+        let r = open_backend(
+            H264BackendChoice::Auto,
+            &cfg(),
+            |_| Err(unavailable("direct", &calls)),
+            |_| Ok(rec("openh264", &calls)),
+            &std::sync::OnceLock::new(),
+        );
+        assert!(r.is_ok(), "{:?}", r.err());
+        assert_eq!(*calls.borrow(), ["direct", "openh264"]);
+        // With neither, the caller gets an Err naming both (and uses Phase A).
+        let calls = RefCell::new(Vec::new());
+        let r = open_backend(
+            H264BackendChoice::Auto,
+            &cfg(),
+            |_| Err(unavailable("direct", &calls)),
+            |_| Err(unavailable("openh264", &calls)),
+            &std::sync::OnceLock::new(),
+        );
+        let Err(BackendError::Unavailable(why)) = r else {
+            panic!("neither opens: {r:?}", r = r.is_ok());
+        };
+        assert!(why.contains("direct") && why.contains("openh264"), "{why}");
+    }
+
+    /// A libva-direct probe that failed is not run again on the next IDR (the
+    /// cached result is per process); a fault at run time is not a probe
+    /// result; openh264 alone never probes it.
+    #[test]
+    fn a_failed_libva_direct_probe_is_not_repeated() {
+        let probe = std::sync::OnceLock::new();
+        let calls = RefCell::new(Vec::new());
+        for round in 0..3 {
             let r = open_backend(
-                choice,
+                H264BackendChoice::Auto,
                 &cfg(),
-                |_| Err(BackendError::Unavailable("no VA".into())),
-                |c| open_openh264(c, None),
+                |_| Err(unavailable("direct", &calls)),
+                |_| Ok(rec("openh264", &calls)),
+                &probe,
             );
-            assert!(
-                matches!(r, Err(BackendError::Unavailable(_))),
-                "{choice:?} must fall back to the Phase A encoder"
-            );
+            assert!(r.is_ok(), "round {round}");
         }
+        assert_eq!(
+            *calls.borrow(),
+            ["direct", "openh264", "openh264", "openh264"],
+            "the probe ran once; openh264 served every IDR"
+        );
+        assert!(probe
+            .get()
+            .is_some_and(|w| w.contains("direct is not here")));
+        // `vaapi` alone also reads the cache.
+        let calls2 = RefCell::new(Vec::new());
+        let r = open_backend(
+            H264BackendChoice::Vaapi,
+            &cfg(),
+            |_| Ok(rec("direct", &calls2)),
+            |_| Ok(rec("openh264", &calls2)),
+            &probe,
+        );
+        assert!(r.is_err() && calls2.borrow().is_empty());
+        // A driver fault is not the machine's answer.
+        let fresh = std::sync::OnceLock::new();
+        let _ = open_backend(
+            H264BackendChoice::Vaapi,
+            &cfg(),
+            |_| {
+                Err(BackendError::Driver {
+                    call: "x",
+                    detail: "y".into(),
+                })
+            },
+            |_| unreachable!(),
+            &fresh,
+        );
+        assert!(fresh.get().is_none());
+    }
+
+    /// `Incapable` is a statement about one configuration: a small first
+    /// stream must not turn libva-direct off for the process.
+    #[test]
+    fn an_incapable_libva_direct_open_does_not_disable_it_for_later_streams() {
+        let probe = std::sync::OnceLock::new();
+        let calls = RefCell::new(Vec::new());
+        let small = StreamConfig::new(64, 64, 30, 1_000_000);
+        let r = open_backend(
+            H264BackendChoice::Auto,
+            &small,
+            |c| {
+                assert_eq!((c.width, c.height), (64, 64));
+                calls.borrow_mut().push("direct");
+                Err(BackendError::Incapable("frame smaller than 128x128".into()))
+            },
+            |_| Ok(rec("openh264", &calls)),
+            &probe,
+        );
+        assert!(r.is_ok());
+        assert!(probe.get().is_none(), "{:?}", probe.get());
+        // The next stream is 720p and libva-direct takes it.
+        let big = StreamConfig::new(1280, 720, 30, 1_000_000);
+        let r = open_backend(
+            H264BackendChoice::Auto,
+            &big,
+            |_| Ok(rec("direct", &calls)),
+            |_| unreachable!("libva-direct opens"),
+            &probe,
+        );
+        assert!(r.is_ok());
+        assert_eq!(*calls.borrow(), ["direct", "openh264", "direct"]);
     }
 
     /// The rate, then the receiver's feedback in order, then the picture.

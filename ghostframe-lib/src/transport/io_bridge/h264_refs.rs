@@ -107,6 +107,8 @@ pub(super) struct RefsCounters {
     pub(super) mtu_retired: u64,
     /// Of those, frames that were the IDR in flight (abandoned, not suspect).
     pub(super) mtu_retired_idr: u64,
+    /// Streams moved from libva-direct to openh264 after its fault limit.
+    pub(super) backend_demotions: u64,
 }
 
 /// The loop-side state of one live session's acked references.
@@ -224,6 +226,8 @@ pub struct RefsReport {
     /// which `mtu_retired_idr` were the IDR in flight.
     pub mtu_retired: u64,
     pub mtu_retired_idr: u64,
+    /// libva-direct streams moved to openh264 after its fault limit.
+    pub backend_demotions: u64,
     pub reentries: u64,
     /// Wire bytes of the first frame after each return from the tile codec,
     /// summed; and the age of the anchor it predicted from, last.
@@ -271,6 +275,12 @@ pub struct RefsReport {
     pub acks_unknown: u64,
     pub suspect_overridden: u64,
     pub p_anchors_confirmed: u64,
+    // Observed mode (openh264).
+    pub idr_backend_fallback: u64,
+    pub marks_observed: u64,
+    pub mark_unrepresentable: u64,
+    pub ltr_recoveries_requested: u64,
+    pub ltr_mark_failed_sent: u64,
 }
 
 /// Which `IdrCause` an IDR the manager planned is counted under.
@@ -368,6 +378,10 @@ impl IoBridge {
             }
         };
         let refs = st.mgr.resident_refs();
+        // What the receiver's word produced for a backend that keeps its own
+        // long-term bookkeeping (observed mode); empty otherwise. Taken with
+        // the plan, so it belongs to the plan's epoch.
+        let feedback = st.mgr.take_backend_feedback();
         let is_idr = plan.kind == PicKind::Idr;
         // The frame's budget: an IDR gets its own (a quarter second of the
         // rate), a P frame the cap of a few average frames. A P frame planned
@@ -399,9 +413,7 @@ impl IoBridge {
             refs,
             fps,
             rate,
-            // No producer yet: the reference manager's observed mode (B7-3)
-            // is what fills this.
-            feedback: Vec::new(),
+            feedback,
             backend: self.h264.backend,
             openh264_lib: self.h264.openh264_lib.clone(),
         }))
@@ -549,20 +561,36 @@ impl IoBridge {
             self.h264.refs_counters.epoch_dropped += 1;
             return false;
         }
+        // A backend with its own stream (openh264) says so with the parameters
+        // of its IDR: from here the manager reads the emitted headers.
+        if let Some(params) = au.meta.params {
+            st.mgr.adopt_stream_params(params);
+        }
+        let observed = st.mgr.is_observed();
         // A stream that does not parse, or whose IDR flag disagrees with the
-        // plan, cannot be followed: the backend failed.
+        // plan, cannot be followed: the backend failed. In observed mode an
+        // IDR nobody asked for is the backend's own fallback and is adopted
+        // (a new epoch); a plan for an IDR the backend did not make is not.
+        let planned_idr = plan.kind == PicKind::Idr;
         let header = au
             .meta
             .header
             .clone()
-            .filter(|_| au.meta.idr == (plan.kind == PicKind::Idr));
+            .filter(|_| au.meta.idr == planned_idr || (observed && au.meta.idr));
         let Some(header) = header else {
             self.h264_refs_encoder_failed(now);
             return false;
         };
+        // The plan as the stream executed it: in observed mode read from the
+        // header (reference, marking, an unrequested IDR), else the plan.
+        let executed = if observed {
+            st.mgr.observe(plan, &header)
+        } else {
+            plan.clone()
+        };
         let described = frame::Described {
-            info: plan.wire_info(au.meta.ref_seq),
-            idr_cause: plan
+            info: executed.wire_info(au.meta.ref_seq),
+            idr_cause: executed
                 .idr_cause
                 .map(|c| bridge_idr_cause(Some(c)))
                 .filter(|_| au.meta.idr),
@@ -625,11 +653,9 @@ impl IoBridge {
         let m = inflight.meta;
         let now = now_std();
         match reply {
-            H264Reply::Coded(CodedAu(au)) => {
+            H264Reply::Coded(CodedAu(au, backend)) => {
                 self.h264.refs_mode = RefsMode::Explicit;
-                if self.h264.backend_kind.is_empty() {
-                    self.h264.backend_kind = "libva-direct";
-                }
+                self.h264.backend_kind = backend;
                 let Some(max_dg_size) = max_dg_size else {
                     // The session changed (the manager started a new epoch
                     // with it, so the result is stale) or has no path: the
@@ -701,6 +727,9 @@ impl IoBridge {
         if start {
             st.mgr.encoder_fault();
         }
+        if given_up && self.h264_demote_libva_direct() {
+            return;
+        }
         if given_up {
             tracing::warn!(
                 target: "ghostframe::h264",
@@ -709,6 +738,34 @@ impl IoBridge {
             );
             self.h264_refs_give_up(now);
         }
+    }
+
+    /// libva-direct hit its fault limit: with `auto` the stream moves one
+    /// step down to openh264, with a `backend_fallback` IDR, and libva-direct
+    /// is not tried again this process. This is not the "H.264 unavailable"
+    /// latch (that is for openh264 giving up). Returns whether it demoted.
+    fn h264_demote_libva_direct(&mut self) -> bool {
+        use crate::config::H264BackendChoice;
+        if self.h264.backend != H264BackendChoice::Auto || self.h264.backend_kind != "libva-direct"
+        {
+            return false;
+        }
+        let Some(st) = self.h264.refs.as_mut() else {
+            return false;
+        };
+        tracing::warn!(
+            target: "ghostframe::h264",
+            "libva-direct faulted {MAX_BACKEND_FAILURES} times with no anchor confirmed \
+             between: moving this process to openh264"
+        );
+        st.faults_without_anchor = 0;
+        st.mgr.backend_fallback();
+        self.h264.backend = H264BackendChoice::Openh264;
+        self.h264.backend_kind = "";
+        self.h264.refs_counters.backend_demotions += 1;
+        self.ensure_baseline_invalidated();
+        self.publish_refs_counters();
+        true
     }
 
     /// Acked references are over for this process: the Phase A encoder serves
@@ -732,6 +789,13 @@ impl IoBridge {
         }
         if let Some(h) = au.meta.header.as_ref() {
             st.mgr.frame_dropped(plan, h, now);
+        }
+        if st.mgr.is_observed() {
+            // The backend's chain has the frame and the client never will:
+            // that is a loss like any other. The next plan asks for a
+            // recovery from the confirmed long-term picture, not an IDR.
+            self.publish_refs_counters();
+            return;
         }
         st.mgr.session_reset();
         self.ensure_baseline_invalidated();
@@ -1027,6 +1091,7 @@ impl IoBridge {
             verdicts: c.verdicts,
             mtu_retired: c.mtu_retired,
             mtu_retired_idr: c.mtu_retired_idr,
+            backend_demotions: c.backend_demotions,
             reentries: c.reentries,
             reentry_bytes: c.reentry_bytes,
             anchor_age_ms: c.anchor_age_ms,
@@ -1062,6 +1127,11 @@ impl IoBridge {
             acks_unknown: s.acks_unknown,
             suspect_overridden: s.suspect_overridden,
             p_anchors_confirmed: s.p_anchors_confirmed,
+            idr_backend_fallback: s.idr_backend_fallback,
+            marks_observed: s.marks_observed,
+            mark_unrepresentable: s.mark_unrepresentable,
+            ltr_recoveries_requested: s.ltr_recoveries_requested,
+            ltr_mark_failed_sent: s.ltr_mark_failed_sent,
         }
     }
 
