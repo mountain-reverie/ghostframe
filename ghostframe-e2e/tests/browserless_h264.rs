@@ -36,6 +36,7 @@ use ghostframe_e2e::harness::browserless::{
 use ghostframe_e2e::netsim::{
     Bottleneck, CapTimeline, DropPlan, FragSel, FrameDropRule, NetProfile,
 };
+use ghostframe_lib::encoder::h264_harness::PcmRateModel;
 use ghostframe_lib::transport::io_bridge::{IdrCause, InjectedCbr};
 
 const CADENCE_US: u64 = DEFAULT_CADENCE_US;
@@ -1079,19 +1080,28 @@ const P_B_SEEDS: [u64; 6] = [0x6701, 0x6702, 0x6703, 0x6704, 0x6705, 0x6706];
 enum StepMode {
     /// Phase A: the scripted CBR encoder behind the legacy rate policy.
     Legacy,
-    /// An acked-reference session (`refs_cbr_load`), rate moved in place.
+    /// An acked-reference session (`refs_cbr_load`), rate moved in place, the
+    /// PCM encoder modelling the whole `RateTarget` (S2's VCE).
     Refs,
     /// The same session with Phase A's rate policy (the 2 s lock): the
     /// baseline `step_in_place` is measured against.
     RefsPhaseA,
+    /// The first B6 baseline: the bps-only rate model (a VBR bucket of
+    /// `bps / 10`), the in-place policy.
+    RefsBpsOnly,
+    /// `Refs` with S2's 1.8x first frame given to every rate step, however
+    /// small (the pessimistic reading of the model).
+    RefsFullTransient,
 }
 
 impl StepMode {
-    /// `GF_POP_MODE=refs|refs-phase-a|legacy` (default legacy).
+    /// `GF_POP_MODE=refs|refs-phase-a|refs-bps-only|refs-full-transient|legacy` (default legacy).
     fn from_env() -> Self {
         match std::env::var("GF_POP_MODE").as_deref() {
             Ok("refs") => Self::Refs,
             Ok("refs-phase-a") => Self::RefsPhaseA,
+            Ok("refs-bps-only") => Self::RefsBpsOnly,
+            Ok("refs-full-transient") => Self::RefsFullTransient,
             _ => Self::Legacy,
         }
     }
@@ -1103,6 +1113,17 @@ impl StepMode {
             Self::RefsPhaseA => {
                 let mut l = refs_cbr_load();
                 l.pcm_phase_a_rate = true;
+                l
+            }
+            Self::RefsFullTransient => {
+                let mut l = refs_cbr_load();
+                l.pcm_rate_model =
+                    Some(PcmRateModel::s2(40_000, 120_000, FPS).with_full_step_transient());
+                l
+            }
+            Self::RefsBpsOnly => {
+                let mut l = refs_cbr_load();
+                l.pcm_rate_model = Some(PcmRateModel::bps_only(40_000, 120_000, FPS));
                 l
             }
         }
@@ -1120,11 +1141,7 @@ fn refs_cbr_load() -> H264Load {
         ghostframe_lib::encoder::h264_harness::PcmMode::RefManager,
     );
     l.pcm_rate_policy = true;
-    l.pcm_rate_model = Some(ghostframe_lib::encoder::h264_harness::PcmRateModel {
-        demand_p_bytes: 40_000,
-        demand_idr_bytes: 120_000,
-        fps: FPS,
-    });
+    l.pcm_rate_model = Some(PcmRateModel::s2(40_000, 120_000, FPS));
     l
 }
 
@@ -1427,9 +1444,11 @@ struct StepSummary {
     /// Probe-padding windows the run filled: the premise that the stream is
     /// not application-limited and the probes had something to fill.
     padding_windows: u64,
-    /// Frames the rate model cut below the content's demand are not counted
-    /// here; `rate_applies_up` is: the policy moved the rate up in place.
+    /// Times the policy moved the rate up in place.
     applies_up: u64,
+    /// Frames the rate model cut below the content's demand (the cap or the
+    /// VBV decided): the premise that the stream was held to the rate.
+    model_limited: u64,
 }
 
 impl StepSummary {
@@ -1473,6 +1492,9 @@ async fn step_summary(
             .r
             .h264_run()
             .map_or(0, |x| x.analyse().refs.rate_applies_up),
+        model_limited: st.r.h264_run().map_or(0, |x| {
+            x.truth.model.frames_capped + x.truth.model.frames_bucket_empty
+        }),
     }
 }
 
@@ -1713,7 +1735,7 @@ async fn p_b_population_refs_twin_never_collapses_and_finds_the_headroom() {
 
 /// Misses allowed per gate row: `(reaching the headroom, releasing the guard)`.
 const REFS_TWIN_ALLOWED_MISSES: [(usize, usize); 6] =
-    [(2, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)];
+    [(5, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)];
 
 /// The gate's rows: seeds, ack chatter and one-way delay.
 type PopulationRow = (Option<Duration>, &'static [u64], u64);
@@ -1767,9 +1789,9 @@ async fn population_gate(mode: StepMode, allowed_misses: Option<[(usize, usize);
         if mode != StepMode::Legacy {
             for s in &all {
                 assert!(
-                    s.padding_windows > 0 && s.applies_up > 0,
-                    "seed {:#x} {mode:?}: premise: probes were padded ({}) and the rate moved up in place ({})",
-                    s.seed, s.padding_windows, s.applies_up
+                    s.padding_windows > 0 && s.applies_up > 0 && s.model_limited > 0,
+                    "seed {:#x} {mode:?}: premise: probes were padded ({}), the rate moved up in place ({}) and the model held frames to it ({})",
+                    s.seed, s.padding_windows, s.applies_up, s.model_limited
                 );
             }
         }

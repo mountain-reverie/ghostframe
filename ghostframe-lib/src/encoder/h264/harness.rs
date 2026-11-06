@@ -27,12 +27,14 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 pub use super::pcm_decoder::{Decoded, FeedError, PcmDecoder, Strictness};
+pub use super::pcm_rate::{PcmModelStats, PcmRateModel};
 pub use super::pcm_writer::{marker_cell, Picture};
 
 use super::backend::{
     AuMeta, BackendCaps, BackendError, BackendFeedback, EncodedAu, H264Backend, Nv12View,
     RateTarget, StreamConfig,
 };
+use super::pcm_rate::RateState;
 use super::pcm_writer::{access_unit, parameter_sets, pcm_params, FRAME_BYTES};
 use super::refs::{FramePlan, ResidentRef};
 use super::syntax::{SliceHeader, StreamParams};
@@ -77,6 +79,8 @@ pub struct PcmLogInner {
     pub order: Vec<u32>,
     /// Published by the bridge as the manager hears things.
     pub refs: PcmRefCounters,
+    /// What the rate model did to the frame sizes (zero without a model).
+    pub model: PcmModelStats,
 }
 
 pub type PcmLog = Arc<Mutex<PcmLogInner>>;
@@ -186,49 +190,6 @@ impl PcmSource {
     }
 }
 
-/// What the PCM encoder's rate model is asked to produce, and how it limits
-/// it. Without a model a scene fixes the frame sizes (`set_sizes`), so the
-/// rate the backend is told changes nothing: a stream under a rate policy then
-/// proves nothing about rate control.
-///
-/// This is the bps-only baseline: a VBR bucket of `bps / 10` (0.1 s of the
-/// rate), refilled by `bps / 8 / fps` for each frame and starting 75 % full. A
-/// frame is `min(demand, bucket)`, so a scene whose demand is above the rate is
-/// held to the rate it was told, and one below it is not stuffed.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PcmRateModel {
-    /// What the content would cost with no limit, bytes.
-    pub demand_p_bytes: usize,
-    pub demand_idr_bytes: usize,
-    /// The scene's frame rate (the bucket refills once per frame).
-    pub fps: u32,
-}
-
-/// The model's state: the bucket level, bytes.
-#[derive(Debug, Clone, Copy, Default)]
-struct RateBucket {
-    level: Option<f64>,
-}
-
-impl RateBucket {
-    /// The size of the next access unit under `rate`.
-    fn frame_bytes(&mut self, m: &PcmRateModel, is_idr: bool, rate: &RateTarget) -> usize {
-        let bps = f64::from(rate.bps);
-        let capacity = bps / 10.0 / 8.0;
-        let refill = bps / 8.0 / f64::from(m.fps.max(1));
-        let level = self.level.unwrap_or(capacity * 0.75);
-        let level = (level + refill).min(capacity);
-        let demand = if is_idr {
-            m.demand_idr_bytes
-        } else {
-            m.demand_p_bytes
-        };
-        let size = (demand as f64).min(level);
-        self.level = Some(level - size);
-        size as usize
-    }
-}
-
 /// A PCM-patch encoder behind the backend trait: it executes the
 /// `RefManager`'s plan with the real slice-header writer and records the
 /// picture the frame is meant to show. Frame sizes are set by the scene
@@ -243,7 +204,7 @@ pub(crate) struct PcmBackend {
     /// Sizes frames from the rate the backend was told, instead of
     /// `idr_bytes` and `p_bytes`.
     model: Option<PcmRateModel>,
-    bucket: RateBucket,
+    rate_state: RateState,
 }
 
 impl PcmBackend {
@@ -255,7 +216,7 @@ impl PcmBackend {
             p_bytes: 0,
             rate: None,
             model: None,
-            bucket: RateBucket::default(),
+            rate_state: RateState::default(),
         }
     }
 
@@ -316,7 +277,15 @@ impl H264Backend for PcmBackend {
         }
         payload.extend(access_unit(&self.params, &header, tag));
         let target = match (&self.model, &self.rate) {
-            (Some(m), Some(rate)) => self.bucket.frame_bytes(m, is_idr, rate),
+            (Some(m), Some(rate)) => {
+                let (bytes, outcome) = self.rate_state.frame_bytes(m, is_idr, rate);
+                self.log
+                    .lock()
+                    .expect("pcm log poisoned")
+                    .model
+                    .note(is_idr, outcome);
+                bytes
+            }
             _ if is_idr => self.idr_bytes,
             _ => self.p_bytes,
         };
@@ -360,61 +329,4 @@ pub(crate) fn pad_to(au: &mut Vec<u8>, target: usize) {
     au.extend_from_slice(&[0, 0, 0, 1, 0x0C]);
     au.extend(std::iter::repeat_n(0xFF, fill));
     au.push(0x80);
-}
-
-#[cfg(test)]
-mod rate_model_tests {
-    use super::*;
-
-    fn model() -> PcmRateModel {
-        PcmRateModel {
-            demand_p_bytes: 40_000,
-            demand_idr_bytes: 120_000,
-            fps: 30,
-        }
-    }
-
-    /// Sizes of `n` P frames at `bps`, after an IDR.
-    fn run(bucket: &mut RateBucket, bps: u32, n: usize, demand_p: usize) -> Vec<usize> {
-        let m = PcmRateModel {
-            demand_p_bytes: demand_p,
-            ..model()
-        };
-        let rate = RateTarget::steady(bps, 30);
-        (0..n)
-            .map(|_| bucket.frame_bytes(&m, false, &rate))
-            .collect()
-    }
-
-    #[test]
-    fn a_demanding_stream_is_held_to_the_rate_it_was_told() {
-        let mut b = RateBucket::default();
-        let sizes = run(&mut b, 3_000_000, 90, 40_000);
-        // Past the initial fullness, a frame is the rate's share of a frame.
-        let tail: usize = sizes[30..].iter().sum();
-        let want = 3_000_000 / 8 / 30 * 60;
-        assert!(tail.abs_diff(want) <= want / 50, "{tail} vs {want}");
-        assert!(sizes[0] > sizes[89], "the first frames spend the bucket");
-    }
-
-    #[test]
-    fn a_rate_change_moves_the_next_frame() {
-        let mut b = RateBucket::default();
-        run(&mut b, 6_000_000, 60, 40_000);
-        let low = run(&mut b, 1_500_000, 40, 40_000);
-        let steady_low: usize = low[20..].iter().sum::<usize>() / 20;
-        assert_eq!(steady_low, 1_500_000 / 8 / 30);
-        assert!(
-            low[0] < 6_000_000 / 8 / 30 / 2 + 1_500_000 / 8 / 10,
-            "the very next frame is already bounded by the smaller bucket: {}",
-            low[0]
-        );
-    }
-
-    #[test]
-    fn content_cheaper_than_the_rate_is_not_stuffed() {
-        let mut b = RateBucket::default();
-        let sizes = run(&mut b, 6_000_000, 60, 3_000);
-        assert!(sizes.iter().all(|&s| s == 3_000), "{sizes:?}");
-    }
 }

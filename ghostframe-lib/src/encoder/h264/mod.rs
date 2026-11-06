@@ -23,6 +23,8 @@ pub(crate) mod pcm_decoder;
 #[cfg(test)]
 mod pcm_oracle_tests;
 #[cfg(any(test, feature = "browserless-harness"))]
+pub(crate) mod pcm_rate;
+#[cfg(any(test, feature = "browserless-harness"))]
 pub(crate) mod pcm_writer;
 #[cfg(test)]
 mod refs_tests;
