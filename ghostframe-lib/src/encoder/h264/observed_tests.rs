@@ -104,6 +104,9 @@ pub(super) struct Script {
     pub lose: LoseFn,
     /// The library makes an IDR at the frame made at these steps.
     pub own_idr_at: Vec<usize>,
+    /// Frames made at these steps are encoded and then dropped locally
+    /// (`frame_dropped`): the library's chain has them, the client never will.
+    pub dropped_at: Vec<usize>,
     /// Frames to delay each acknowledgement by, on top of `DELAY`.
     pub ack_extra: Box<dyn FnMut(usize) -> usize>,
     pub lose_idr: bool,
@@ -119,6 +122,7 @@ impl Script {
             policy: SimPolicy::FAITHFUL,
             lose: Box::new(lose),
             own_idr_at: Vec::new(),
+            dropped_at: Vec::new(),
             ack_extra: Box::new(|_| 0),
             lose_idr: false,
             verdict_only: None,
@@ -219,17 +223,23 @@ pub(super) fn run_with(sc: Script, engine: Box<dyn LoopEngine>) -> Run {
             r.mgr.adopt_stream_params(r.engine.params());
         }
         let observed = r.mgr.observe(&plan, &header);
-        let report = r
-            .mgr
-            .frame_sent(&plan, &header, 1, now)
-            .expect("a plan from the current epoch");
-        assert!(
-            report.matched,
-            "step {step}: {:?} did not match: {:?}",
-            frame.kind, report.effective
-        );
-        assert_eq!(report.plan, observed, "observe is what frame_sent applies");
-        let eff = report.plan;
+        let dropped = sc.dropped_at.contains(&step) && !header.idr;
+        let eff = if dropped {
+            r.mgr.frame_dropped(&plan, &header, now);
+            observed
+        } else {
+            let report = r
+                .mgr
+                .frame_sent(&plan, &header, 1, now)
+                .expect("a plan from the current epoch");
+            assert!(
+                report.matched,
+                "step {step}: {:?} did not match: {:?}",
+                frame.kind, report.effective
+            );
+            assert_eq!(report.plan, observed, "observe is what frame_sent applies");
+            report.plan
+        };
         let unrequested_idr = header.idr && !requested_idr;
         let mut l = Logged {
             step,
@@ -240,7 +250,7 @@ pub(super) fn run_with(sc: Script, engine: Box<dyn LoopEngine>) -> Run {
             lost: false,
             fed: None,
         };
-        l.lost = (sc.lose)(step, &l) && (!header.idr || sc.lose_idr);
+        l.lost = ((sc.lose)(step, &l) && (!header.idr || sc.lose_idr)) || dropped;
         let lost = l.lost;
         let is_idr = header.idr;
         let verdict_only = !lost && sc.verdict_only.as_mut().is_some_and(|f| f(&l));
@@ -643,6 +653,23 @@ fn feedback_of_an_old_epoch_never_reaches_the_library() {
     m.backend_fallback();
     assert!(m.take_backend_feedback().is_empty());
     assert!(!m.is_observed(), "the next backend says what it is");
+}
+
+/// `h264_refs_frame_lost` in observed mode: the frame the bridge could not
+/// send is a loss. The manager asks the library for a recovery from the
+/// confirmed long-term picture; it does not start over with an IDR.
+#[test]
+fn a_frame_encoded_and_dropped_locally_is_recovered_not_restarted() {
+    let mut sc = Script::new(240, |_, _| false);
+    sc.dropped_at = vec![100, 101];
+    let r = run(sc);
+    let st = r.mgr.stats();
+    assert!(r.log.iter().filter(|l| l.lost).count() == 2, "premise");
+    assert!(st.ltr_recoveries_requested >= 1, "{st:?}");
+    assert!(st.reroots >= 1);
+    assert_eq!(r.idr_headers(), 1, "no IDR: {st:?}");
+    assert_recovered(&r, 102, 40);
+    assert_idr_accounting(&r);
 }
 
 #[test]

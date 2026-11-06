@@ -1160,6 +1160,10 @@ impl VaapiDirect {
 }
 
 impl H264Backend for VaapiDirect {
+    fn name(&self) -> &'static str {
+        "libva-direct"
+    }
+
     fn caps(&self) -> BackendCaps {
         BackendCaps {
             explicit_refs: true,

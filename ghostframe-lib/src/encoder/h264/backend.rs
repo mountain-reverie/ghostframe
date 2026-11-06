@@ -241,6 +241,9 @@ pub(crate) enum BackendFeedback {
 }
 
 pub(crate) trait H264Backend: Send {
+    /// What the `h264 stats` line calls this backend.
+    fn name(&self) -> &'static str;
+
     fn caps(&self) -> BackendCaps;
 
     fn open(&mut self, cfg: &StreamConfig) -> Result<(), BackendError>;
@@ -318,6 +321,10 @@ impl LegacyFfmpegBackend {
 }
 
 impl H264Backend for LegacyFfmpegBackend {
+    fn name(&self) -> &'static str {
+        "ffmpeg"
+    }
+
     fn caps(&self) -> BackendCaps {
         BackendCaps {
             explicit_refs: false,
