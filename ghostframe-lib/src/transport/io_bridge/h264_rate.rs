@@ -168,10 +168,6 @@ pub(super) const PAD_CEILING_HOLD: Duration = Duration::from_millis(1000);
 const RAISE_EXPECTED_YIELD: f64 = 0.5;
 /// At most this many frames are coded at one window's rate.
 const RAISE_MAX_FRAMES: u32 = 3;
-/// The raise waits this long after the stream's first padding, so that the
-/// loss path has judged it (a pad lost pauses the raise, see
-/// [`RAISE_LOSS_PAUSE`](super::h264_refs::RAISE_LOSS_PAUSE)).
-const RAISE_TRUST_AFTER: Duration = Duration::from_millis(300);
 /// An IDR this close is the burst of the window; no padding.
 const PAD_IDR_LOOKAHEAD: Duration = Duration::from_millis(150);
 
@@ -602,7 +598,6 @@ impl IoBridge {
     /// padding in flight.
     pub(super) fn h264_reset_probing(&mut self) {
         self.h264.app_probe = AppProbe::default();
-        self.h264.first_pad_at = None;
         self.h264.queue_since = None;
         self.reliable_emitter.pads.clear();
     }
@@ -700,6 +695,20 @@ impl IoBridge {
         self.open_probe_cluster(now, id, target, duration, APP_PROBE_MIN_PROBES, min_bytes);
     }
 
+    /// Whether the probe raise runs. Always, in production; the browserless
+    /// harness and the unit tests can switch it off as a mutation
+    /// (`InjectedH264::no_probe_raise`).
+    pub(super) fn h264_raise_enabled(&self) -> bool {
+        #[cfg(any(test, feature = "browserless-harness"))]
+        {
+            !self.h264.raise_mutated_off
+        }
+        #[cfg(not(any(test, feature = "browserless-harness")))]
+        {
+            true
+        }
+    }
+
     /// The rate a P frame is coded at while a probe window is open, if it is
     /// to be raised: `(bps, window id)`.
     ///
@@ -721,13 +730,15 @@ impl IoBridge {
     /// Not while the rate has been cut, while the path has shown reordering
     /// lately (a burst reads as loss there), within `RAISE_LOSS_PAUSE` of a
     /// raised frame or a probe pad judged lost (the burst overran the path's
-    /// buffer), before padding has gone out and been judged, or when the
-    /// window's rate is no more than a rise band over the normal one. Each is
-    /// checked for every raised plan, not only when a window opens. Off unless
-    /// `probe_raise_on` (see its doc). The estimate ceiling is held off for
-    /// any window the raise uses.
+    /// buffer), or when the window's rate is no more than a rise band over the
+    /// normal one. Each is checked for every raised plan, not only when a
+    /// window opens. Always on for an acked-reference stream (see
+    /// [`Self::h264_raise_enabled`]); there is no "padding judged first" wait,
+    /// which cost more headroom found than the losses it spared (design note,
+    /// section 10). The estimate ceiling is held off for any window the raise
+    /// uses.
     pub(super) fn h264_probe_raise(&mut self, now: Instant, base_bps: u32) -> Option<(u32, i32)> {
-        if !self.h264.probe_raise_on || !self.h264_refs_live() {
+        if !self.h264_raise_enabled() || !self.h264_refs_live() {
             return None;
         }
         // The guards are looked at for every raised plan, not only when a
@@ -737,13 +748,6 @@ impl IoBridge {
         if self.h264_cut_recent(now)
             || self.h264_reordering_lately(now)
             || self.h264.raise_paused_until.is_some_and(|t| now < t)
-            // No raise until padding has gone out and had the time to be
-            // judged: a burst of real frames is only as safe as the burst of
-            // padding that has already crossed the path.
-            || self
-                .h264
-                .first_pad_at
-                .is_none_or(|t| now.saturating_duration_since(t) < RAISE_TRUST_AFTER)
         {
             return None;
         }
@@ -903,7 +907,6 @@ impl IoBridge {
         // path for the window plus what the queue it builds and a round trip
         // can add.
         self.bwe.hold_ceiling(now, PAD_CEILING_HOLD);
-        self.h264.first_pad_at.get_or_insert(now);
         self.h264.stats.probe_padding_windows += 1;
         self.h264.stats.probe_padding_datagrams += n as u64;
         self.h264.stats.probe_padding_bytes += bytes;

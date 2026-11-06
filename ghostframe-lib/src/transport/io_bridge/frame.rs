@@ -1885,7 +1885,7 @@ impl IoBridge {
         // A P frame of an acked-reference stream sent while a probe window is
         // open is part of its burst (it was coded at the window's rate, see
         // `h264_probe_raise`); on any other stream only an IDR is.
-        let tag_p = acked_ref && self.h264.probe_raise_on;
+        let tag_p = acked_ref && self.h264_raise_enabled();
         let mut tagged = false;
         for (i, dg) in datagrams.into_iter().enumerate() {
             let probe = self

@@ -189,8 +189,8 @@ pub struct H264Load {
     pub pcm_rate_model: Option<ghostframe_lib::encoder::h264_harness::PcmRateModel>,
     /// See `InjectedH264::pcm_phase_a_rate`.
     pub pcm_phase_a_rate: bool,
-    /// See `InjectedH264::probe_raise`.
-    pub probe_raise: bool,
+    /// See `InjectedH264::no_probe_raise`.
+    pub no_probe_raise: bool,
     /// See `InjectedH264::spike_tune`.
     pub spike_tune: Option<(u64, bool)>,
     /// Frame index ranges `[from, to)` in which the screen is drawn by the
@@ -1556,7 +1556,7 @@ async fn drive_session(
             pcm_rate_model: h.pcm_rate_model,
             pcm_phase_a_rate: h.pcm_phase_a_rate,
             pcm_cadence_us: h.cadence_us,
-            probe_raise: h.probe_raise,
+            no_probe_raise: h.no_probe_raise,
             spike_tune: h.spike_tune,
         }),
         SceneLoad::Script(_) | SceneLoad::Profile(_) => None,

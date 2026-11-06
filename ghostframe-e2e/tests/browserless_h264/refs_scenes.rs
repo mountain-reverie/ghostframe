@@ -995,9 +995,9 @@ async fn refs_scene_6_a_capacity_drop_is_followed_by_the_encoder() {
 ///
 /// Mutation, asserted: `spike_tune: Some((2000, false))`, the hold that is never
 /// let go early, must fail two of the bounds: more than `SCENE6C_OVER_BYTES`
-/// over the link summed over the seeds (144 kB against the shipped 98 kB), and
-/// fewer than `SCENE6C_SHOWN` frames shown on at least two seeds (114, 115 of
-/// three; the third, 140, passes). It does not fail the latency bound.
+/// over the link summed over the seeds (115 kB against the shipped 55 kB), and
+/// fewer than `SCENE6C_SHOWN` frames shown on at least two seeds (133, 132 and
+/// 128 of three, against the shipped 143, 143 and 139). It does not fail the latency bound.
 #[tokio::test(start_paused = true)]
 async fn refs_scene_6c_a_drop_right_after_a_spike_is_followed_early() {
     let (mut over, mut fixed_over, mut fixed_short) = (0, 0, 0);
@@ -1040,11 +1040,12 @@ async fn refs_scene_6c_a_drop_right_after_a_spike_is_followed_early() {
     );
 }
 
-const SCENE6C_OVER_BYTES: u64 = 120_000;
-/// Per seed: shipped 129, 146, 138 frames; never let go 114, 140, 115.
-/// Over the link, summed over the seeds: shipped 98 kB, never let go 144 kB,
-/// bound `SCENE6C_OVER_BYTES`.
-const SCENE6C_SHOWN: usize = 125;
+const SCENE6C_OVER_BYTES: u64 = 85_000;
+/// Per seed (2026-11-06, with the probe raise on): shipped 143, 143, 139
+/// frames; never let go 133, 132, 128.
+/// Over the link, summed over the seeds: shipped 55 kB, never let go 115 kB,
+/// bound `SCENE6C_OVER_BYTES` (30 kB either side).
+const SCENE6C_SHOWN: usize = 136;
 /// The longest capture-to-shown time. Not a discriminator in the twin (both
 /// holds reach 410 to 500 ms); a regression guard against the 689 ms review 2
 /// measured on the real stack.

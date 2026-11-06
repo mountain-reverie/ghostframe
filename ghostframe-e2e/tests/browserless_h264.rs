@@ -56,7 +56,7 @@ fn load(idr_bytes: usize, p_bytes: usize) -> H264Load {
         pcm_rate_policy: false,
         pcm_rate_model: None,
         pcm_phase_a_rate: false,
-        probe_raise: false,
+        no_probe_raise: false,
         spike_tune: None,
         tile_phases: [None, None],
     }
@@ -1100,10 +1100,10 @@ enum StepMode {
     /// `Refs` on the earlier burst calibration of a re-send (a backend that
     /// re-sends the HRD at 75 % fullness): the first frame 1.4-1.8x.
     RefsBurst,
-    /// The refs twin with the opt-in probe raise on (`Refs` has it off: padding
-    /// alone fills the windows).
-    RefsRaise,
-    /// `RefsRaise` with a pessimistic model: a window's frames yield 0.86 of
+    /// The refs twin with the probe raise mutated off (`Refs` has it, as
+    /// production does): padding alone fills the windows. A control.
+    RefsNoRaise,
+    /// `Refs` with a pessimistic model: a window's frames yield 0.86 of
     /// what the VCE's profile gives them, its minimum (mean yield 0.63).
     RefsPessRaise,
     /// The refs twin with a 1 s spike hold (still let go early on a fall).
@@ -1114,7 +1114,7 @@ enum StepMode {
 }
 
 impl StepMode {
-    /// `GF_POP_MODE=refs|refs-raise|refs-pess-raise|refs-hold-1s|refs-hold-fixed|refs-phase-a|refs-bps-only|refs-full-transient|refs-linear-step|refs-burst|legacy` (default legacy).
+    /// `GF_POP_MODE=refs|refs-no-raise|refs-pess-raise|refs-hold-1s|refs-hold-fixed|refs-phase-a|refs-bps-only|refs-full-transient|refs-linear-step|refs-burst|legacy` (default legacy).
     fn from_env() -> Self {
         match std::env::var("GF_POP_MODE").as_deref() {
             Ok("refs") => Self::Refs,
@@ -1123,7 +1123,7 @@ impl StepMode {
             Ok("refs-full-transient") => Self::RefsFullTransient,
             Ok("refs-linear-step") => Self::RefsLinearStep,
             Ok("refs-burst") => Self::RefsBurst,
-            Ok("refs-raise") => Self::RefsRaise,
+            Ok("refs-no-raise") => Self::RefsNoRaise,
             Ok("refs-pess-raise") => Self::RefsPessRaise,
             Ok("refs-hold-1s") => Self::RefsHold1s,
             Ok("refs-hold-fixed") => Self::RefsHoldFixed,
@@ -1139,7 +1139,7 @@ impl StepMode {
                 // The pre-B6 baseline: Phase A's policy, and no probe raise.
                 let mut l = refs_cbr_load();
                 l.pcm_phase_a_rate = true;
-                l.probe_raise = false;
+                l.no_probe_raise = true;
                 l
             }
             Self::RefsFullTransient => {
@@ -1161,14 +1161,13 @@ impl StepMode {
                 l.pcm_rate_model = Some(PcmRateModel::s2(40_000, 120_000, FPS).with_burst_resend());
                 l
             }
-            Self::RefsRaise => {
+            Self::RefsNoRaise => {
                 let mut l = refs_cbr_load();
-                l.probe_raise = true;
+                l.no_probe_raise = true;
                 l
             }
             Self::RefsPessRaise => {
                 let mut l = refs_cbr_load();
-                l.probe_raise = true;
                 l.pcm_rate_model =
                     Some(PcmRateModel::s2(40_000, 120_000, FPS).with_raise_yield(0.86));
                 l
@@ -1958,12 +1957,14 @@ async fn p_b_population_never_collapses_and_finds_the_headroom_whenever_the_clie
 /// timing; `sus_use` step-up p50/p90 in ms):
 ///
 /// | mode | reached/sus_est/sus_use | sus_use step-up |
-/// | refs, 2 s releasable hold, raise off (shipped) | 90/66/52, 95/66/58, 91/63/55 | 4100/16800, 4200/11100, 4300/6600 |
+/// | refs, 2 s releasable hold, raise on (shipped) | 96/85/70, 96/89/67, 95/85/71 | 4500/11000, 5200/9900, 4500/5500 |
+/// | the same, raise mutated off (`refs-no-raise`, was the shipped row) | 90/66/51, 95/66/58, 91/63/55 | 4100/16800, 4200/11000, 4300/6600 |
+/// | the same, raise at the pessimistic yield 0.86 (`refs-pess-raise`) | 96/79/57, 94/53/36, 92/37/21 | 4800/10700, 4400/18500, 6200/17800 |
 /// | refs, 2 s hold never released (`refs-hold-fixed`) | 90/66/52, 95/67/58, 91/64/56 | 4700/17000, 4700/20400, 4800/14000 |
-/// | refs, 1 s hold (`refs-hold-1s`) | 92/67/28, 84/52/16, 81/52/18 | 11100/17300, 11300/17900, 8300/22300 |
+/// | refs, 1 s hold, raise off (before the raise was shipped) | 92/67/28, 84/52/16, 81/52/18 | 11100/17300, 11300/17900, 8300/22300 |
+/// | refs, 1 s hold, raise on (`refs-hold-1s`, the should_panic gate) | 66/23/13, 45/11/3, 67/27/21 | 14400/21400, 14900/21700, 12600/16000 |
 /// | refs, Phase A policy (`refs-phase-a`) | 90/74/60, 81/61/48, 85/55/43 | 10400/20500, 10600/17300, 10800/18100 |
-/// | refs, raise on with every guard (`refs-raise`) | 95/74/55, 92/63/28, 93/64/44 | 5300/16900, 6600/20000, 6000/11800 |
-/// | refs, raise on, no "padding judged" guard (removed) | 96/85/70, 96/89/67, 95/85/71 | 4500/11000, 5200/9900, 4500/5500 |
+/// | refs, raise on with the "padding judged" guard (removed) | 95/74/55, 92/63/28, 93/64/44 | 5300/16900, 6600/20000, 6000/11800 |
 /// | refs before review 2 (stale spike, 2 s hold, raise on) | 96/78/69, 95/71/65, 95/72/62 | 4400/8300, 4400/10900, 4400/11300 |
 ///
 /// The gate's model is the 40 %-fullness re-send (`pcm_rate.rs`, provisional,
@@ -1976,10 +1977,11 @@ async fn p_b_population_never_collapses_and_finds_the_headroom_whenever_the_clie
 /// model: 1.019), 0.996 Phase A (1.013). `refs-linear-step` is the optimistic reading of the step-size dependence.
 ///
 /// With the 2 s spike hold of the in-place policy and the probe raise (the
-/// shipped rows) the twin reaches the headroom on 96/95/95 of 96 timelines in a
-/// median 1.2-1.3 s and a p90 of 5.4-5.7 s, under `T_UP`, with no collapse and
-/// the guard released on all; the raise cuts the padding per probe window to
-/// 61 % of its no-raise figure (scene 9).
+/// shipped rows) the twin reaches the headroom (first sample) on 96/96/95 of 96
+/// timelines, no collapse and the guard released on all, and uses it
+/// (`sus_use`) on 70/67/71; the raise cuts the padding per probe window to
+/// 66 % of its no-raise figure (scene 9). On links that buffer less than a
+/// window's burst it costs headroom found (scene 9, shallow).
 ///
 /// No collapse in any. The twin never misses the guard (the 89/96 of the
 /// legacy gate is the legacy 8 ms row only). The full model is the gate's;
@@ -1991,13 +1993,6 @@ async fn p_b_population_never_collapses_and_finds_the_headroom_whenever_the_clie
 #[tokio::test(start_paused = true)]
 async fn p_b_population_refs_twin_never_collapses_and_finds_the_headroom() {
     population_gate(StepMode::Refs, Some(REFS_TWIN_ALLOWED_MISSES)).await;
-}
-
-/// The same gate with the opt-in probe raise on (`InjectedH264::probe_raise`):
-/// the raise is kept measured though it is not shipped.
-#[tokio::test(start_paused = true)]
-async fn p_b_population_refs_twin_with_the_probe_raise_keeps_its_bound() {
-    population_gate(StepMode::RefsRaise, Some(REFS_TWIN_RAISE_ALLOWED_MISSES)).await;
 }
 
 /// The twin with a pessimistic raise: the model gives a raise 0.86 of the bytes
@@ -2032,23 +2027,24 @@ async fn p_b_population_refs_twin_gate_fails_a_one_second_spike_hold() {
 /// Rows are n = 24/8/8/15/6/4.
 ///
 /// Measured (2026-11-06) on the shipped twin (`StepMode::Refs`, the 2 s
-/// releasable hold, raise off): 13, 5, 4, 8, 3, 3 misses; the guard is always
-/// released. The allowance is that plus a margin of 1 to 3 timelines, because
-/// the stepped harness is chaotic (one timing tweak moves a timeline across the
-/// line); it is not equal to the measurement. The margin is bounded by what the
-/// gate must still catch: the 1 s hold misses 19, 7, 7, 8, 3, 4
-/// (`p_b_population_refs_twin_gate_fails_a_one_second_spike_hold`).
+/// releasable hold, the probe raise on): 9, 3, 3, 7, 0, 0 misses; the guard is
+/// always released. The allowance is that plus a margin of 2 timelines (the
+/// rows of 6 and 4 timelines get 2 on a measured 0), because the stepped
+/// harness is chaotic (one timing tweak moves a timeline across the line); it is
+/// not equal to the measurement. The margin is bounded by what the gate must
+/// still catch: the 1 s hold misses 20 of the first row's 24
+/// (`p_b_population_refs_twin_gate_fails_a_one_second_spike_hold`), against the
+/// 11 allowed.
 const REFS_TWIN_ALLOWED_MISSES: [(usize, usize); 6] =
-    [(16, 0), (6, 0), (5, 0), (10, 0), (5, 0), (4, 0)];
-
-/// The same rows with the opt-in probe raise on: 9, 5, 2, 2, 0, 0 measured.
-const REFS_TWIN_RAISE_ALLOWED_MISSES: [(usize, usize); 6] =
-    [(12, 0), (6, 0), (4, 0), (4, 0), (2, 0), (2, 0)];
+    [(11, 0), (5, 0), (5, 0), (9, 0), (2, 0), (2, 0)];
 
 /// The same rows with the raise at the pessimistic yield (0.86, the VCE's
-/// minimum): 12, 5, 4, 0, 0, 1 measured.
+/// minimum): 12, 6, 5, 2, 0, 1 measured. The raise at that yield finds the
+/// headroom on fewer timelines than the raise off does (96-seed population,
+/// `sus_use` 57/36/21 against 51/58/55): a bound that it does not collapse and
+/// does not lose more than this, not a claim that it gains.
 const REFS_TWIN_PESSIMISTIC_ALLOWED_MISSES: [(usize, usize); 6] =
-    [(15, 0), (6, 0), (6, 0), (3, 0), (2, 0), (3, 0)];
+    [(14, 0), (7, 0), (7, 0), (4, 0), (2, 0), (3, 0)];
 
 /// The gate's rows: seeds, ack chatter and one-way delay.
 type PopulationRow = (Option<Duration>, &'static [u64], u64);
@@ -2107,7 +2103,7 @@ async fn population_gate(mode: StepMode, allowed_misses: Option<[(usize, usize);
                     "seed {:#x} {mode:?}: premise: probes were padded ({}), the rate moved up in place ({}) and the model held frames to it ({})",
                     s.seed, s.padding_windows, s.applies_up, s.model_limited
                 );
-                if matches!(mode, StepMode::RefsRaise | StepMode::RefsPessRaise) {
+                if !matches!(mode, StepMode::RefsNoRaise | StepMode::RefsPhaseA) {
                     assert!(
                         s.raise_windows > 0 && s.raise_bytes > 0,
                         "seed {:#x} {mode:?}: premise: frames were coded at a probe window's rate ({} windows, {} bytes)",
@@ -2365,13 +2361,12 @@ async fn raise_totals(mode: StepMode, seeds: u64) -> RaiseTotals {
 /// part of each probe window, so padding fills less of it.
 ///
 /// A property gate over 12 timelines of the P-B capacity step (`refs_cbr_load`):
-/// the padding bytes per probe window with the raise (`RefsRaise`, opt-in) are
-/// at most 75 % of those without it (`Refs`), and at most 80 % with a
+/// the padding bytes per probe window with the raise (`Refs`, as shipped) are
+/// at most 75 % of those without it (`RefsNoRaise`), and at most 80 % with a
 /// pessimistic model (a raise yields 0.86 of what the VCE's profile gives it,
-/// its minimum). Measured, before the guards (the figures below are the
-/// unguarded raise's; the bounds are re-measured in the test's output)
-/// over 24 timelines, 2026-11-06: 133 kB a window without the raise, 82 kB
-/// with it (61 %), 92 kB at yield 0.7 (69 %). The share is not a design number:
+/// its minimum). Measured over these 12 timelines, 2026-11-06, as shipped (no
+/// "padding judged" wait): 134 kB a window without the raise, 89 kB with it
+/// (66 %), 93 kB at yield 0.86 (70 %); the bounds leave 9 and 10 points. The share is not a design number:
 /// padding is sized for the shortfall after what the frames still to come are
 /// expected to carry (half an average frame each, `RAISE_EXPECTED_YIELD`), so a
 /// 100 ms window of three frames leaves about 60 to 70 % for padding, and the
@@ -2390,8 +2385,8 @@ async fn raise_totals(mode: StepMode, seeds: u64) -> RaiseTotals {
 #[tokio::test(start_paused = true)]
 async fn the_probe_raise_cuts_padding_per_window_without_costing_the_raised_frames() {
     const SEEDS: u64 = 12;
-    let off = raise_totals(StepMode::Refs, SEEDS).await;
-    let on = raise_totals(StepMode::RefsRaise, SEEDS).await;
+    let off = raise_totals(StepMode::RefsNoRaise, SEEDS).await;
+    let on = raise_totals(StepMode::Refs, SEEDS).await;
     let pess = raise_totals(StepMode::RefsPessRaise, SEEDS).await;
     println!("scene 9: without {off:?}\n  with {on:?}\n  pessimistic {pess:?}");
     assert!(
@@ -2434,41 +2429,51 @@ async fn the_probe_raise_cuts_padding_per_window_without_costing_the_raised_fram
     }
 }
 
-/// Scene 9, shallow buffers (review 2): the probe raise puts real frames where
-/// padding was, so a buffer shallower than the window's burst tail-drops them.
-/// The scene above runs on a lossless 600 ms buffer, where nothing can be
-/// lost; this one runs the P-B step on links that buffer 30 and 60 ms and
-/// holds the raise to two bounds against the raise off, on the same seeds:
+/// Scene 9, shallow buffers: the probe raise puts real frames where padding was,
+/// so a buffer shallower than the window's burst tail-drops them. The scene
+/// above runs on a lossless 600 ms buffer, where nothing can be lost; this one
+/// runs the P-B step on links that buffer 30 and 60 ms. This is the trade the
+/// raise is shipped with (it finds the headroom on 70/67/71 of 96 timelines at
+/// 600 ms against 52/58/55 without it), so the bounds are those of a cost, not
+/// of parity: against the raise off (`RefsNoRaise`), on the same 16 seeds,
 ///
-///  * it finds the headroom no less often (`sus_use` hits, with `margin` of
-///    the seeds for the chaos of the stepped harness);
-///  * it loses no more than `LOST_PER_RUN` raised frames a run on average.
+///  * `sus_use` hits at least half the raise-off figure (it is lower: the raise
+///    loses frames there; measured 0.60 and 0.64 of it);
+///  * the raised frames lost average at most `LOST_PER_RUN` a run (bounded, not
+///    zero: a burst on a buffer smaller than itself loses the frames behind its
+///    front).
 ///
-/// Premises: the burst does overrun these buffers (padding was judged lost
-/// somewhere, or the raise stayed off), and the raise-off runs lose none.
+/// Premises: the raise engaged (`windows > 0`) and did lose frames at 30 ms
+/// (the burst does overrun that buffer), and the raise-off runs lose none.
 ///
-/// Measured before the guards (the raise opened a window on a pad it had not
-/// seen judged), over 16 seeds: 60 ms lost a median 6 raised frames a run (max
-/// 9) and found the headroom 8 of 16 against 11; 30 ms lost 12 and found it 4
-/// of 16 against 10. With them: 30 ms 9 of 16 against 10, 9 raised frames lost
-/// in all (0.56 a run); 60 ms 11 against 11, 7 lost (0.44 a run).
+/// Measured (2026-11-06, shipped, these 16 seeds, as sent): 30 ms `sus_use`
+/// 6 against 10 raise off, 60 raised frames lost (3.75 a run) in 30 raise
+/// windows; 60 ms 7 against 11, 37 lost (2.3 a run) in 102 windows. On 48
+/// timelines (16 seeds, three ack timings): 26 against 30 at 30 ms, 23 against 31
+/// at 60 ms.
 ///
-/// Mutation: no pad-judged gate (`RAISE_TRUST_AFTER` zero, a first pad
-/// assumed) and no pause (`RAISE_LOSS_PAUSE` zero) bring the losses back above
-/// the bound (see the numbers printed).
+/// Mutations: no pause after a lost raised frame or pad (`RAISE_LOSS_PAUSE`
+/// zero) brings the losses above `LOST_PER_RUN` (see the numbers printed); the
+/// guards are also tested per plan in the lib
+/// (`the_raise_checks_its_guards_for_every_raised_plan_and_pauses_after_a_loss`).
 #[tokio::test(start_paused = true)]
-async fn the_probe_raise_on_a_shallow_buffer_costs_no_more_than_the_raise_off() {
+async fn the_probe_raise_on_a_shallow_buffer_costs_a_bounded_share_of_the_raise_off() {
     const SEEDS: u64 = 16;
-    const MARGIN: usize = 2;
-    const LOST_PER_RUN: f64 = 1.0;
+    const LOST_PER_RUN: f64 = 5.5;
     for buffer_ms in [30u64, 60] {
         let (mut on_hits, mut off_hits, mut lost, mut off_lost, mut windows) = (0, 0, 0, 0, 0);
         for i in 0..SEEDS {
             let seed = 0x6701 + i;
-            let on = step_summary_deep(seed, None, NORMAL_DELAY_US, StepMode::RefsRaise, buffer_ms)
-                .await;
-            let off =
+            let on =
                 step_summary_deep(seed, None, NORMAL_DELAY_US, StepMode::Refs, buffer_ms).await;
+            let off = step_summary_deep(
+                seed,
+                None,
+                NORMAL_DELAY_US,
+                StepMode::RefsNoRaise,
+                buffer_ms,
+            )
+            .await;
             on_hits += usize::from(on.hit());
             off_hits += usize::from(off.hit());
             lost += on.raised_lost;
@@ -2482,9 +2487,15 @@ async fn the_probe_raise_on_a_shallow_buffer_costs_no_more_than_the_raise_off() 
             windows > 0,
             "{buffer_ms} ms: premise: the raise engaged on no run"
         );
+        if buffer_ms == 30 {
+            assert!(
+                lost > 0,
+                "{buffer_ms} ms: premise: the burst overruns the buffer and loses a raised frame"
+            );
+        }
         assert_eq!(off_lost, 0, "{buffer_ms} ms: premise: nothing is raised");
         assert!(
-            on_hits + MARGIN >= off_hits,
+            on_hits * 2 >= off_hits,
             "{buffer_ms} ms: the raise found the headroom on {on_hits} of {SEEDS}, the raise off on {off_hits}"
         );
         assert!(
