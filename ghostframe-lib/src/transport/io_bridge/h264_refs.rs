@@ -79,6 +79,12 @@ pub(super) struct RefsCounters {
     pub(super) anchor_age_ms: u64,
     pub(super) rate_updates: u64,
     pub(super) verdicts: u64,
+    /// Frames retired because a fragment outgrew the connection (`emit.rs`):
+    /// counted at the first oversize fragment of each frame, the siblings
+    /// being purged with it.
+    pub(super) mtu_retired: u64,
+    /// Of those, frames that were the IDR in flight (abandoned, not suspect).
+    pub(super) mtu_retired_idr: u64,
 }
 
 /// The loop-side state of one live session's acked references.
@@ -135,6 +141,11 @@ pub struct RefsReport {
     pub frames_decoded_acked: u64,
     pub frames_refused: u64,
     pub verdicts: u64,
+    /// Frames retired unsent because the path MTU fell below a fragment's
+    /// size (counted once per frame, at its first oversize fragment); of
+    /// which `mtu_retired_idr` were the IDR in flight.
+    pub mtu_retired: u64,
+    pub mtu_retired_idr: u64,
     pub reentries: u64,
     /// Wire bytes of the first frame after each return from the tile codec,
     /// summed; and the age of the anchor it predicted from, last.
@@ -146,6 +157,7 @@ pub struct RefsReport {
     pub idr_resolution: u64,
     pub idr_client_reset: u64,
     pub idr_encoder_fault: u64,
+    pub idr_mtu_shrink: u64,
     pub idr_reissued: u64,
     pub idr_probes: u64,
     pub p_healthy: u64,
@@ -171,6 +183,7 @@ fn bridge_idr_cause(c: Option<RefIdrCause>) -> IdrCause {
         // Counted as a loss IDR in the bridge's table; the manager's own
         // `idr_encoder_fault` says what it was.
         Some(RefIdrCause::EncoderFault) => IdrCause::Loss,
+        Some(RefIdrCause::MtuShrink) => IdrCause::MtuShrink,
         Some(RefIdrCause::SessionStart) | None => IdrCause::Session,
     }
 }
@@ -576,6 +589,41 @@ impl IoBridge {
         self.publish_refs_counters();
     }
 
+    /// A fragment of an acked-reference session's frame outgrew the
+    /// connection and was retired unsent (`retire_oversize`). Not an IDR
+    /// request: the frame is treated as the loss path would treat a lost one.
+    /// A P frame is suspect and the manager recovers from its anchor with
+    /// frames fragmented at the new size; the IDR in flight is abandoned and
+    /// sent again at that size (counted `idr_mtu_shrink`). Either way the
+    /// frame's other queued and cached fragments (the same old size) go, and
+    /// nothing is left waiting on content that can no longer be sent: a
+    /// suspect frame is superseded by the recovery or timed out by the
+    /// manager, a dead IDR is re-planned at once.
+    pub(super) fn h264_refs_oversize(&mut self, frame_seq: u32, now: Instant) {
+        let Some(st) = self.h264.refs.as_mut() else {
+            return;
+        };
+        let was_idr = st.mgr.frame_oversize(frame_seq);
+        self.h264.refs_counters.mtu_retired += 1;
+        if was_idr {
+            self.h264.refs_counters.mtu_retired_idr += 1;
+        }
+        if let Some(f) = self.h264.tracker.get_mut(frame_seq) {
+            if !f.suspect {
+                f.suspect = true;
+                self.h264.stats.frames_suspect += 1;
+            }
+        }
+        self.record_emitted_transmissions(now);
+        let before = self.reliable_emitter.stats.h264_queue_purged;
+        let wire_seqs = self.reliable_emitter.purge_queued_h264(|f| f == frame_seq);
+        self.h264.stats.queue_purged += self.reliable_emitter.stats.h264_queue_purged - before;
+        self.forget_purged(&wire_seqs);
+        self.reliable_emitter.drop_h264_frame(frame_seq);
+        self.ensure_baseline_invalidated();
+        self.publish_refs_counters();
+    }
+
     /// A client reset request (0x09) on an acked-reference session: a new plan
     /// epoch, which begins with an IDR. Rate limiting is the caller's.
     pub(super) fn h264_refs_client_reset(
@@ -676,6 +724,8 @@ impl IoBridge {
             frames_decoded_acked: c.decoded_bits,
             frames_refused: c.refused_bits,
             verdicts: c.verdicts,
+            mtu_retired: c.mtu_retired,
+            mtu_retired_idr: c.mtu_retired_idr,
             reentries: c.reentries,
             reentry_bytes: c.reentry_bytes,
             anchor_age_ms: c.anchor_age_ms,
@@ -684,6 +734,7 @@ impl IoBridge {
             idr_resolution: s.idr_resolution,
             idr_client_reset: s.idr_client_reset,
             idr_encoder_fault: s.idr_encoder_fault,
+            idr_mtu_shrink: s.idr_mtu_shrink,
             idr_reissued: s.idr_reissued,
             idr_probes: s.idr_probes,
             p_healthy: s.p_healthy,

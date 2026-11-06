@@ -224,10 +224,20 @@ fit: it is not offered, the ledger forgets it with no verdict, and its owner is
 told. For an H.264 fragment that is an IDR cut for the new size under cause
 `mtu_shrink`, which supersedes every older frame and replaces the hold on the
 IDR that cannot complete (the cause is a transport event, like a session start,
-not a decoder or loss event). A tile pass is dropped from the retransmit cache
-and the next capture is made whole; probe padding and parity are dropped.
-Counters: `oversize_h264`, `oversize_tile`, `oversize_pad`,
+not a decoder or loss event). On an acked-reference ("refs") session the
+manager is told instead and no IDR is requested for a P frame: the P frame
+becomes suspect, as if the ledger had judged it lost, and the manager recovers
+from the anchor with frames cut at the new size. Only an incomplete in-flight
+IDR is abandoned and sent again, cut at the new size, under `mtu_shrink` (the
+re-send does not back the IDR timeout off: a retirement is not a slow link,
+though it still counts in `idr_reissued`). A tile pass is dropped from the
+retransmit cache and the next capture is made whole; probe padding and parity
+are dropped. Counters: `oversize_h264`, `oversize_tile`, `oversize_pad`,
 `oversize_untracked`; `send_too_large` counts quinn refusals and must stay 0.
+On a refs session `mtu_retired` counts frames (the first oversize fragment of
+each; its siblings are purged with it), `mtu_retired_idr` those of them that
+were the IDR in flight, and the manager's `idr_mtu_shrink` the IDRs actually
+sent again for it (counted when sent, not when abandoned).
 
 **Frame skip.** The encoder is not run (the capture is dropped, the next frame
 is made fully dirty) while an IDR hold or deferred loss IDR is in force, or

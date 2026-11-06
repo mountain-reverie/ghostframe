@@ -9,7 +9,7 @@
 //! recovered) before the effect, and asserts properties (bounded, no wrong
 //! picture) rather than numbers that only hold for one fixture.
 use super::*;
-use ghostframe_e2e::harness::h264_scene::{pcm_load, H264Outcome, Pattern};
+use ghostframe_e2e::harness::h264_scene::{capacity_step_net, pcm_load, H264Outcome, Pattern};
 use ghostframe_lib::encoder::h264_harness::PcmMode;
 
 const SEEDS: [u64; 3] = [0x7101, 0x7102, 0x7103];
@@ -569,5 +569,84 @@ async fn refs_loss_scenes_hold_with_the_rate_policy_on() {
             line(name, seed, &r, &o);
             assert_recovers(&format!("{name} {seed:#x}"), SECS, &r, &o);
         }
+    }
+}
+
+/// The path MTU falls after discovery has raised it (see the legacy scene in
+/// `pcm_scenes`), on an acked-reference session. Fragments cut for the larger
+/// size and queued or cached outgrow the connection and are retired. The
+/// Phase A answer (an IDR for the new size) is not this policy's: the manager
+/// treats each retired frame as lost and recovers from its anchor, with
+/// frames cut for the new size; only the IDR still in flight, which cannot
+/// complete, is cut again. So: the stream lives, no wrong picture is shown,
+/// the manager recovered, and the IDR count stays bounded.
+#[tokio::test(start_paused = true)]
+async fn refs_an_mtu_that_falls_after_discovery_recovers_from_the_anchor() {
+    for (k, seed) in SEEDS.into_iter().enumerate() {
+        // `Pattern::Clean` draws nothing from the seed: each run gets its own
+        // fall instant and delay, so the fall meets the cadence differently.
+        let k = k as u64;
+        let (net, mut links) = Pattern::Clean.apply(capacity_step_net(
+            500_000,
+            3_500_000 + k * 11_000,
+            60_000,
+            20_000 + k * 1_300,
+            300,
+        ));
+        links.s2c_mtu_step = Some((4_000_000 + k * 37_000, 1_200));
+        let load = refs();
+        let r = run_browserless_with_options(
+            scene(seed, SECS, net, load, DropPlan::default()),
+            links,
+            RunOptions::default(),
+        )
+        .await
+        .expect("scene");
+        let o = r.h264_run().map(|x| x.analyse()).unwrap_or_default();
+        line("refs-mtu-fall", seed, &r, &o);
+        let c = &o.refs;
+        let s = &r.h264.stats;
+        println!(
+            "refs-mtu-fall {seed:#x}: oversize_h264={} mtu_retired={}/{} idr_mtu_shrink={} \
+             frozen_ms={} idr_made={} recov={} correct={}",
+            s.oversize_h264,
+            c.mtu_retired,
+            c.mtu_retired_idr,
+            c.idr_mtu_shrink,
+            o.frozen_us / 1000,
+            o.idr_made,
+            c.recoveries,
+            o.correct
+        );
+        let ctx = format!("refs-mtu-fall {seed:#x}");
+        // Premises: the link black-holed large packets, the fall caught
+        // fragments already built, and the retirement went to the manager.
+        assert!(r.s2c_datagrams_dropped > 0, "{ctx}: nothing was dropped");
+        assert!(s.oversize_h264 > 0, "{ctx}: no fragment outgrew the MTU");
+        assert!(c.active, "{ctx}: not an acked-reference session");
+        assert!(c.mtu_retired > 0, "{ctx}: the manager was told of nothing");
+        // Nothing stale reached quinn, and the Phase A request was not made.
+        assert_eq!(s.send_too_large, 0, "{ctx}");
+        assert_eq!(
+            s.idr_requests_by_cause[IdrCause::MtuShrink.index()],
+            0,
+            "{ctx}: the Phase A MTU IDR was requested"
+        );
+        // No wedge, no wrong picture, alive at the end.
+        assert_sound(&ctx, SECS, &r, &o);
+        assert!(o.correct > 150, "{ctx}: {} frames shown", o.correct);
+        assert!(o.frozen_us <= 1_500_000, "{ctx}: frozen {} us", o.frozen_us);
+        // This scene proves routing (`mtu_retired > 0`, no Phase A MtuShrink
+        // request, `send_too_large == 0`) and harmlessness. `recoveries` is
+        // also satisfied by ordinary black-hole loss, so it does not tie to
+        // the retirement; the suspect-then-recover link is proved by the
+        // P-fragment unit test in io_bridge/tests.rs.
+        // The manager recovered, and the IDRs are the session's, the
+        // abandoned IDR in flight (if the fall caught it) and nothing else.
+        assert!(c.recoveries >= 1, "{ctx}: {c:?}");
+        assert!(c.recovered + 1 >= c.recoveries, "{ctx}: {c:?}");
+        assert_eq!(c.idr_session, 1, "{ctx}");
+        assert!(c.idr_mtu_shrink <= c.mtu_retired_idr, "{ctx}: {c:?}");
+        assert!(o.idr_made <= 3, "{ctx}: {} IDRs", o.idr_made);
     }
 }

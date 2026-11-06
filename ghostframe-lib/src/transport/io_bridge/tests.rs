@@ -8952,6 +8952,159 @@ async fn a_refusal_newer_than_the_last_decode_raises_the_refusal_flag() {
     assert!(!bridge.h264.refused_since_decode);
 }
 
+/// Drain the emission queue with a datagram limit nothing fits under (the
+/// path MTU fell below what the queued fragments were cut for). Asserts the
+/// drain empties and nothing is offered; returns the datagrams offered so far.
+fn refs_oversize_drain(bridge: &mut IoBridge) -> usize {
+    let offered = bridge.sent_log_for_test.len();
+    bridge.forced_datagram_limit_for_test = Some(1);
+    let stop = bridge.drain_reliable_emitter(now_std());
+    assert!(
+        matches!(stop, pacing::Stop::Empty),
+        "an unsendable datagram must not stop the drain"
+    );
+    assert_eq!(bridge.sent_log_for_test.len(), offered, "nothing offered");
+    bridge.forced_datagram_limit_for_test = None;
+    offered
+}
+
+/// On an acked-reference session a retired P-frame fragment is a lost frame
+/// to the manager: suspect, then a recovery from the anchor at the new size.
+/// It is not the Phase A MtuShrink IDR request, and no IDR is cut.
+#[tokio::test(start_paused = true)]
+async fn refs_session_oversize_p_fragment_is_suspect_and_recovers_from_the_anchor() {
+    use crate::encoder::h264::tracker::{FrameState, PicKind};
+    let mut bridge = acked_refs_bridge();
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    ack_every_fragment(&mut bridge, 0);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
+    assert_eq!(bridge.h264_refs_report().anchors_confirmed, 1, "premise");
+    bridge.forced_fifo_depth_for_test = Some(usize::MAX / 2);
+    tokio::time::advance(std::time::Duration::from_millis(33)).await;
+    plan_commit(&mut bridge, 1).expect("a P");
+    bridge.record_emitted_transmissions(now_std());
+    assert!(bridge.reliable_emitter.queued_h264_bytes() > 0, "premise");
+    assert!(bridge.h264_refs_live(), "premise");
+    let before = bridge.h264_refs_report();
+
+    refs_oversize_drain(&mut bridge);
+
+    let r = bridge.h264_refs_report();
+    assert!(bridge.h264.stats.oversize_h264 > 0);
+    assert_eq!(r.mtu_retired, 1, "{r:?}");
+    assert_eq!(r.mtu_retired_idr, 0);
+    assert_eq!(
+        bridge.h264.refs.as_ref().unwrap().mgr.frame_state(1),
+        Some(FrameState::Suspect)
+    );
+    assert_eq!(bridge.reliable_emitter.queued_h264_bytes(), 0);
+    assert!(bridge.transmission_ledger.is_empty(), "forgotten");
+    assert_eq!(bridge.h264.stats.tx_judged_lost, 0);
+    // Not the Phase A request.
+    assert_eq!(bridge.h264.pending_idr, None);
+    assert_eq!(
+        bridge.h264.stats.idr_requests_by_cause[IdrCause::MtuShrink.index()],
+        0
+    );
+    assert_eq!(bridge.h264.stats.send_too_large, 0);
+
+    tokio::time::advance(std::time::Duration::from_millis(33)).await;
+    let plan = plan_commit(&mut bridge, 2).expect("a frame, not a hold");
+    assert_ne!(plan.kind, PicKind::Idr, "a recovery, not an IDR");
+    let r = bridge.h264_refs_report();
+    assert_eq!(r.recoveries, before.recoveries + 1, "{r:?}");
+    assert_eq!(r.idr_mtu_shrink, 0);
+    assert_eq!(
+        bridge.h264.stats.idr_by_cause[IdrCause::MtuShrink.index()],
+        0
+    );
+    assert_eq!(r.idr_session, 1, "only the first IDR");
+}
+
+/// The IDR in flight is the frame whose fragments outgrow the connection: it
+/// cannot complete, so the manager abandons it and sends it again, cut for the
+/// new size, counted as an MtuShrink IDR. No Phase A request, no wait on the
+/// dead IDR's timeout.
+#[tokio::test(start_paused = true)]
+async fn refs_session_oversize_idr_fragment_abandons_the_idr_and_sends_it_again() {
+    use crate::encoder::h264::tracker::{FrameState, PicKind};
+    let mut bridge = acked_refs_bridge();
+    bridge.forced_fifo_depth_for_test = Some(usize::MAX / 2);
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    bridge.record_emitted_transmissions(now_std());
+    assert!(bridge.reliable_emitter.queued_h264_bytes() > 0, "premise");
+    // Premise: while the IDR is in flight the manager holds.
+    assert!(bridge
+        .h264_refs_plan(1, (64, 64), now_std(), false)
+        .is_none());
+
+    let timeout = bridge.h264.refs.as_ref().unwrap().mgr.idr_timeout();
+    refs_oversize_drain(&mut bridge);
+
+    let r = bridge.h264_refs_report();
+    assert_eq!((r.mtu_retired, r.mtu_retired_idr), (1, 1), "{r:?}");
+    assert_eq!(
+        bridge.h264.refs.as_ref().unwrap().mgr.frame_state(0),
+        Some(FrameState::Dead)
+    );
+    assert_eq!(bridge.h264.pending_idr, None, "not the Phase A path");
+    assert_eq!(
+        bridge.h264.stats.idr_requests_by_cause[IdrCause::MtuShrink.index()],
+        0
+    );
+    assert_eq!(r.idr_mtu_shrink, 0, "counted when it is sent");
+
+    // At once, not after the IDR's timeout, and cut for the new size (the
+    // connection now takes `NEW_DG`, which the commit reads).
+    const NEW_DG: usize = 1_000;
+    bridge.test_commit_dg_size = Some(NEW_DG);
+    tokio::time::advance(std::time::Duration::from_millis(33)).await;
+    let now = now_std();
+    let req = bridge
+        .h264_refs_plan(1, (64, 64), now, false)
+        .expect("the IDR again, not a hold");
+    assert_eq!(req.plan.kind, PicKind::Idr);
+    assert!(bridge.h264_refs_commit(&req.plan, au_for(&req.plan), &refs_meta(), NEW_DG, now));
+    let r = bridge.h264_refs_report();
+    assert_eq!((r.idr_mtu_shrink, r.idr_reissued), (1, 1), "{r:?}");
+    assert_eq!(
+        bridge.h264.refs.as_ref().unwrap().mgr.idr_timeout(),
+        timeout,
+        "a retirement for size is not a slow link: no back-off"
+    );
+    // Every datagram of the new IDR fits the new size: drain with that limit
+    // and nothing more is retired.
+    let retired = bridge.h264.stats.oversize_h264;
+    let offered = bridge.sent_log_for_test.len();
+    bridge.record_emitted_transmissions(now_std());
+    bridge.forced_datagram_limit_for_test = Some(NEW_DG);
+    bridge.forced_fifo_depth_for_test = None;
+    bridge.pump_admission();
+    bridge.forced_datagram_limit_for_test = None;
+    assert_eq!(bridge.reliable_emitter.queued_h264_bytes(), 0, "all sent");
+    let sent = &bridge.sent_log_for_test[offered..];
+    assert!(
+        sent.len() > 1,
+        "the IDR went out in fragments: {}",
+        sent.len()
+    );
+    assert!(
+        sent.iter().all(|d| d.len() <= NEW_DG),
+        "a datagram outgrew {NEW_DG}: {:?}",
+        sent.iter().map(Vec::len).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        bridge.h264.stats.oversize_h264, retired,
+        "nothing more retired"
+    );
+    let r = bridge.h264_refs_report();
+    assert_eq!((r.mtu_retired, r.mtu_retired_idr), (1, 1), "{r:?}");
+    assert_eq!(
+        bridge.h264.stats.idr_by_cause[IdrCause::MtuShrink.index()],
+        1
+    );
+}
+
 /// A stored tile pass that no longer fits the connection is retired: never
 /// offered to quinn, forgotten in the ledger without a verdict, its cache
 /// entry and CDF 5/3 coverage dropped, and the baseline invalidated so the
