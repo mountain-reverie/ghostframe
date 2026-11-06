@@ -249,15 +249,78 @@ pub struct TransportConfig {
     /// is the default ([`H264_GOP_SECS_DEFAULT`]). Already clamped to
     /// [`H264_GOP_SECS_MIN`]..=[`H264_GOP_SECS_MAX`].
     pub h264_gop_secs: Option<f64>,
-    /// Keep H.264 on the Phase A policy (GOP, loss IDR, parity, reopen) even for
-    /// clients and encoders that could recover by acked references. From
-    /// `GHOSTFRAME_H264_BACKEND=ffmpeg`.
-    pub h264_legacy: bool,
+    /// Which H.264 encoder backends may open, from `GHOSTFRAME_H264_BACKEND`
+    /// (`auto` | `vaapi` | `openh264` | `ffmpeg` | `legacy`). `auto` is the
+    /// default; `ffmpeg` (alias `legacy`) keeps H.264 on the Phase A policy
+    /// (GOP, loss IDR, parity, reopen) even for clients and encoders that could
+    /// recover by acked references, until B7b removes it.
+    pub h264_backend: H264BackendChoice,
+    /// The openh264 library to load, from `GHOSTFRAME_H264_OPENH264_LIB`: an
+    /// absolute path. `None` (the default) tries the system sonames. openh264
+    /// is neither shipped nor linked.
+    pub openh264_lib: Option<std::path::PathBuf>,
     /// The capture rate the H.264 encoder is fed at (frames per second), set
     /// by the server from its own configuration; 0 means unknown and is read
     /// as [`H264_DEFAULT_FPS`]. The encoder's per-frame budget is the rate
     /// divided by it.
     pub capture_fps: u32,
+}
+
+/// Which H.264 encoder backends the daemon may open
+/// (`GHOSTFRAME_H264_BACKEND`). Choosing one that excludes openh264 is the
+/// off switch Cisco's patent-grant conditions ask for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum H264BackendChoice {
+    /// libva-direct when the machine has it, then openh264.
+    #[default]
+    Auto,
+    /// libva-direct only.
+    Vaapi,
+    /// openh264 only.
+    Openh264,
+    /// The Phase A ffmpeg encoder and policy (`ffmpeg` or `legacy`).
+    Ffmpeg,
+}
+
+impl H264BackendChoice {
+    /// An unset variable is `auto`; an unrecognised value is ignored with a
+    /// warning.
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            None | Some("") | Some("auto") => Self::Auto,
+            Some("vaapi") => Self::Vaapi,
+            Some("openh264") => Self::Openh264,
+            Some("ffmpeg") | Some("legacy") => Self::Ffmpeg,
+            Some(other) => {
+                tracing::warn!(
+                    target: "ghostframe::config",
+                    value = %other,
+                    "GHOSTFRAME_H264_BACKEND is not auto|vaapi|openh264|ffmpeg|legacy: using auto"
+                );
+                Self::Auto
+            }
+        }
+    }
+}
+
+/// `GHOSTFRAME_H264_OPENH264_LIB`: an absolute path, else ignored with a
+/// warning (a relative one would be searched for by the loader).
+fn openh264_lib_from_lookup(get: &impl Fn(&str) -> Option<String>) -> Option<std::path::PathBuf> {
+    let raw = get("GHOSTFRAME_H264_OPENH264_LIB")?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let p = std::path::PathBuf::from(raw);
+    if !p.is_absolute() {
+        tracing::warn!(
+            target: "ghostframe::config",
+            value = %raw,
+            "GHOSTFRAME_H264_OPENH264_LIB is not an absolute path: using the system library"
+        );
+        return None;
+    }
+    Some(p)
 }
 
 /// H.264 GOP length: default, and the range `GHOSTFRAME_H264_GOP_SECONDS` may
@@ -434,12 +497,15 @@ impl TransportConfig {
             ),
             model: ModelSettings::from_lookup(&get),
             h264_gop_secs: h264_gop_secs_from_lookup(&get),
-            h264_legacy: matches!(
-                get("GHOSTFRAME_H264_BACKEND").as_deref(),
-                Some("ffmpeg") | Some("legacy")
-            ),
+            h264_backend: H264BackendChoice::parse(get("GHOSTFRAME_H264_BACKEND").as_deref()),
+            openh264_lib: openh264_lib_from_lookup(&get),
             capture_fps: 0,
         }
+    }
+
+    /// Phase A policy forced (`GHOSTFRAME_H264_BACKEND=ffmpeg|legacy`).
+    pub fn h264_legacy(&self) -> bool {
+        self.h264_backend == H264BackendChoice::Ffmpeg
     }
 
     /// The H.264 GOP: the time between IDRs when nothing else asks for one.
@@ -1523,6 +1589,33 @@ mod tests {
         );
         assert_eq!(gop(&[("GHOSTFRAME_H264_GOP_SECONDS", "nan")]), 3.0);
         assert_eq!(gop(&[("GHOSTFRAME_H264_GOP_SECONDS", "soon")]), 3.0);
+    }
+
+    #[test]
+    fn the_h264_backend_choice_and_the_openh264_path() {
+        let cfg = |v: &[(&str, &str)]| TransportConfig::from_lookup(lookup(v));
+        let choice = |v: &str| cfg(&[("GHOSTFRAME_H264_BACKEND", v)]).h264_backend;
+        assert_eq!(cfg(&[]).h264_backend, H264BackendChoice::Auto);
+        assert_eq!(
+            TransportConfig::default().h264_backend,
+            H264BackendChoice::Auto
+        );
+        assert_eq!(choice("auto"), H264BackendChoice::Auto);
+        assert_eq!(choice("vaapi"), H264BackendChoice::Vaapi);
+        assert_eq!(choice("openh264"), H264BackendChoice::Openh264);
+        assert_eq!(choice("ffmpeg"), H264BackendChoice::Ffmpeg);
+        assert_eq!(choice("legacy"), H264BackendChoice::Ffmpeg);
+        assert!(cfg(&[("GHOSTFRAME_H264_BACKEND", "legacy")]).h264_legacy());
+        assert!(!cfg(&[("GHOSTFRAME_H264_BACKEND", "openh264")]).h264_legacy());
+        assert_eq!(choice("nonsense"), H264BackendChoice::Auto, "ignored");
+        let lib = |v: &str| cfg(&[("GHOSTFRAME_H264_OPENH264_LIB", v)]).openh264_lib;
+        assert_eq!(cfg(&[]).openh264_lib, None);
+        assert_eq!(
+            lib("/opt/cisco/libopenh264.so.8"),
+            Some("/opt/cisco/libopenh264.so.8".into())
+        );
+        assert_eq!(lib("libopenh264.so.8"), None, "relative: ignored");
+        assert_eq!(lib(""), None);
     }
 
     #[test]

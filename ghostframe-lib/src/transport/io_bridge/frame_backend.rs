@@ -41,9 +41,11 @@ use crate::capture::dmabuf::ReadbackFrame;
 use crate::capture::gpu_pipeline::{
     FrameAnalysis, FramePaletteEntryRaw, GpuFrameProcessor, TileAnalysis, UnchangedRefused,
 };
+use crate::config::H264BackendChoice;
 use crate::encoder::h264::backend::{
-    BackendError, EncodedAu, H264Backend, Nv12View, RateTarget, StreamConfig,
+    BackendError, BackendFeedback, EncodedAu, H264Backend, Nv12View, RateTarget, StreamConfig,
 };
+use crate::encoder::h264::openh264::OpenH264Backend;
 use crate::encoder::h264::refs::{FramePlan, ResidentRef};
 use crate::encoder::h264::tracker::PicKind;
 use crate::encoder::h264::vaapi_direct::VaapiDirect;
@@ -207,6 +209,13 @@ pub struct H264Request {
     /// against (`RateTarget::steady`).
     pub(crate) fps: u32,
     pub(crate) rate: RateTarget,
+    /// What the stream's receiver told the reference manager since the last
+    /// plan, for a backend that keeps its own long-term bookkeeping: applied
+    /// before the frame is encoded, in order.
+    pub(crate) feedback: Vec<BackendFeedback>,
+    /// Which backends may open, and the openh264 library to load.
+    pub(crate) backend: H264BackendChoice,
+    pub(crate) openh264_lib: Option<std::sync::Arc<std::path::Path>>,
 }
 
 /// An access unit a plan-executing backend made, with what it parsed from it.
@@ -315,6 +324,72 @@ fn open_direct(cfg: &StreamConfig) -> Result<Box<dyn H264Backend>, BackendError>
     let mut b = VaapiDirect::new();
     b.open(cfg)?;
     Ok(Box::new(b))
+}
+
+/// Whether the planned path may hand a stream to the openh264 backend. It
+/// runs its own references, which the reference manager can only follow in
+/// observed mode (B7-3); until that lands the backend is built and tested but
+/// not routed, so `openh264` (explicit or by `auto`) falls back to the Phase A
+/// encoder exactly as a machine without libva-direct does today.
+const OPENH264_ROUTED: bool = false;
+
+fn open_openh264(
+    cfg: &StreamConfig,
+    lib: Option<&std::path::Path>,
+) -> Result<Box<dyn H264Backend>, BackendError> {
+    if !OPENH264_ROUTED {
+        return Err(BackendError::Unavailable(
+            "openh264 is not routed into the planned path yet (needs the observed-mode \
+             reference manager)"
+                .into(),
+        ));
+    }
+    let mut b = OpenH264Backend::new(lib.map(std::path::Path::to_path_buf));
+    b.open(cfg)?;
+    Ok(Box::new(b))
+}
+
+/// Open the backend a session runs on: libva-direct, then openh264 for
+/// `auto`; one of them alone when the operator chose it. `Err` means neither
+/// is available and the caller falls back to the Phase A encoder.
+pub(crate) fn open_backend(
+    choice: H264BackendChoice,
+    cfg: &StreamConfig,
+    direct: impl FnOnce(&StreamConfig) -> Result<Box<dyn H264Backend>, BackendError>,
+    openh264: impl FnOnce(&StreamConfig) -> Result<Box<dyn H264Backend>, BackendError>,
+) -> Result<Box<dyn H264Backend>, BackendError> {
+    match choice {
+        H264BackendChoice::Vaapi => direct(cfg),
+        H264BackendChoice::Openh264 => openh264(cfg),
+        H264BackendChoice::Ffmpeg => Err(BackendError::Unavailable(
+            "GHOSTFRAME_H264_BACKEND selects the ffmpeg encoder".into(),
+        )),
+        H264BackendChoice::Auto => match direct(cfg) {
+            Ok(b) => Ok(b),
+            Err(first) => {
+                tracing::info!(
+                    target: LOG_TARGET,
+                    "libva-direct H.264 unavailable ({first}); trying openh264"
+                );
+                openh264(cfg)
+                    .map_err(|second| BackendError::Unavailable(format!("{first}; {second}")))
+            }
+        },
+    }
+}
+
+/// One planned frame through `backend`: the rate, the receiver's feedback in
+/// order, then the picture.
+pub(crate) fn encode_planned(
+    backend: &mut dyn H264Backend,
+    view: &Nv12View<'_>,
+    req: &H264Request,
+) -> Result<EncodedAu, BackendError> {
+    backend.set_rate(req.rate);
+    for fb in &req.feedback {
+        backend.feedback(*fb);
+    }
+    backend.encode(view, &req.plan, &req.refs)
 }
 
 /// The production backend: a Vulkan `GpuFrameProcessor` and, lazily, a
@@ -516,7 +591,8 @@ impl FrameBackend for GpuBackend {
                 rate: req.rate,
                 ..StreamConfig::new(dims.0, dims.1, req.fps, req.rate.bps)
             };
-            match open_direct(&cfg) {
+            let lib = req.openh264_lib.as_deref();
+            match open_backend(req.backend, &cfg, open_direct, |c| open_openh264(c, lib)) {
                 Ok(b) => self.direct = Some((b, dims)),
                 Err(e) => {
                     tracing::info!(
@@ -549,8 +625,7 @@ impl FrameBackend for GpuBackend {
         let Some((backend, _)) = self.direct.as_mut() else {
             return H264Reply::Failed;
         };
-        backend.set_rate(req.rate);
-        match backend.encode(&view, &req.plan, &req.refs) {
+        match encode_planned(backend.as_mut(), &view, req) {
             Ok(au) => H264Reply::Coded(CodedAu(au)),
             Err(e) => {
                 tracing::warn!(target: LOG_TARGET, "acked-reference H.264 encode failed: {e}");
@@ -762,5 +837,200 @@ impl FrameBackend for GpuBackend {
 
     fn finish_discard(&mut self) {
         self.held = None;
+    }
+}
+
+#[cfg(test)]
+mod backend_choice_tests {
+    use std::cell::RefCell;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::encoder::h264::backend::{AuMeta, BackendCaps};
+    use crate::encoder::h264::refs::{FramePlan, IdrCause};
+
+    /// Records the calls a backend gets, in order.
+    struct Recorder {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl H264Backend for Recorder {
+        fn caps(&self) -> BackendCaps {
+            BackendCaps {
+                explicit_refs: false,
+                max_lt: 2,
+                max_ref_frames: 3,
+                vbr: true,
+            }
+        }
+        fn open(&mut self, _cfg: &StreamConfig) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn encode(
+            &mut self,
+            _nv12: &Nv12View<'_>,
+            plan: &FramePlan,
+            _refs: &[ResidentRef],
+        ) -> Result<EncodedAu, BackendError> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("encode {}", plan.frame_seq));
+            Ok(EncodedAu {
+                payload: vec![0, 0, 0, 1],
+                meta: AuMeta {
+                    idr: false,
+                    header: None,
+                    ref_seq: None,
+                },
+            })
+        }
+        fn set_rate(&mut self, rate: RateTarget) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("set_rate {}", rate.bps));
+        }
+        fn feedback(&mut self, fb: BackendFeedback) {
+            self.log.lock().unwrap().push(format!("feedback {fb:?}"));
+        }
+    }
+
+    fn cfg() -> StreamConfig {
+        StreamConfig::new(128, 128, 30, 1_000_000)
+    }
+
+    fn rec(tag: &'static str, calls: &RefCell<Vec<&'static str>>) -> Box<dyn H264Backend> {
+        calls.borrow_mut().push(tag);
+        Box::new(Recorder {
+            log: Arc::default(),
+        })
+    }
+
+    fn unavailable(tag: &'static str, calls: &RefCell<Vec<&'static str>>) -> BackendError {
+        calls.borrow_mut().push(tag);
+        BackendError::Unavailable(format!("{tag} is not here"))
+    }
+
+    /// Which openers each choice reaches, and in what order.
+    #[test]
+    fn the_choice_decides_which_backends_are_tried() {
+        use H264BackendChoice::*;
+        // (choice, direct opens, openh264 opens) -> openers called, success
+        let cases: [(H264BackendChoice, bool, bool, &[&str], bool); 9] = [
+            (Auto, true, true, &["direct"], true),
+            (Auto, false, true, &["direct", "openh264"], true),
+            (Auto, false, false, &["direct", "openh264"], false),
+            (Vaapi, true, true, &["direct"], true),
+            (Vaapi, false, true, &["direct"], false),
+            (Openh264, true, true, &["openh264"], true),
+            (Openh264, true, false, &["openh264"], false),
+            (Ffmpeg, true, true, &[], false),
+            (Ffmpeg, false, false, &[], false),
+        ];
+        for (choice, direct_ok, oh_ok, want_calls, want_ok) in cases {
+            let calls = RefCell::new(Vec::new());
+            let got = open_backend(
+                choice,
+                &cfg(),
+                |_| {
+                    if direct_ok {
+                        Ok(rec("direct", &calls))
+                    } else {
+                        Err(unavailable("direct", &calls))
+                    }
+                },
+                |_| {
+                    if oh_ok {
+                        Ok(rec("openh264", &calls))
+                    } else {
+                        Err(unavailable("openh264", &calls))
+                    }
+                },
+            );
+            assert_eq!(
+                *calls.borrow(),
+                want_calls,
+                "{choice:?} direct={direct_ok} openh264={oh_ok}"
+            );
+            assert_eq!(got.is_ok(), want_ok, "{choice:?} {direct_ok} {oh_ok}");
+        }
+    }
+
+    /// While the reference manager has no observed mode, production never
+    /// hands a stream to openh264, whatever the operator asked for. B7-3
+    /// flips `OPENH264_ROUTED` and replaces this test.
+    #[test]
+    fn openh264_is_not_routed_into_the_planned_path_yet() {
+        for choice in [H264BackendChoice::Auto, H264BackendChoice::Openh264] {
+            let r = open_backend(
+                choice,
+                &cfg(),
+                |_| Err(BackendError::Unavailable("no VA".into())),
+                |c| open_openh264(c, None),
+            );
+            assert!(
+                matches!(r, Err(BackendError::Unavailable(_))),
+                "{choice:?} must fall back to the Phase A encoder"
+            );
+        }
+    }
+
+    /// The rate, then the receiver's feedback in order, then the picture.
+    #[test]
+    fn feedback_reaches_the_backend_before_the_frame_is_encoded() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut b = Recorder { log: log.clone() };
+        let plan = FramePlan {
+            epoch: 0,
+            frame_seq: 7,
+            kind: PicKind::Healthy,
+            idr_cause: None::<IdrCause>,
+            nal_ref_idc: 3,
+            frame_num: 1,
+            poc: 2,
+            target: None,
+            mark: None,
+            mark_target: false,
+            mmco: Vec::new(),
+            rplm: Vec::new(),
+        };
+        let marked = BackendFeedback::LtrMarked {
+            idr_pic_id: 1,
+            frame_num: 4,
+        };
+        let recover = BackendFeedback::LtrRecover {
+            idr_pic_id: 1,
+            last_correct_frame_num: 5,
+            current_frame_num: 9,
+        };
+        let req = H264Request {
+            plan,
+            refs: Vec::new(),
+            fps: 30,
+            rate: RateTarget::steady(1_000_000, 30),
+            feedback: vec![marked, recover],
+            backend: H264BackendChoice::Auto,
+            openh264_lib: None,
+        };
+        let data = vec![0u8; 128 * 128 * 3 / 2];
+        let view = Nv12View {
+            data: &data,
+            width: 128,
+            height: 128,
+            y_stride: 128,
+            uv_stride: 128,
+            uv_offset: 128 * 128,
+        };
+        encode_planned(&mut b, &view, &req).unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                "set_rate 1000000".to_string(),
+                format!("feedback {marked:?}"),
+                format!("feedback {recover:?}"),
+                "encode 7".to_string(),
+            ]
+        );
     }
 }
