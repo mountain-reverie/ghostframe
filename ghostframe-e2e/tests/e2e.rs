@@ -751,8 +751,97 @@ async fn e2e_h264_forced_solid_red() -> Result<()> {
         &[("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "h264")],
     )
     .await?;
+    assert_h264_solid_red(&setup).await
+}
 
-    // 5 s: covers QUIC slow-start, libx264 GOP startup, and at least
+/// Motion through the real browser's WebCodecs decoder on the openh264
+/// stream (`GHOSTFRAME_H264_BACKEND=openh264`: the GPU harness binds /dev/dri,
+/// so without the switch `auto` may pick libva-direct and the software path
+/// would go unexercised on a machine that has a GPU). The spinner changes the
+/// screen all along, so the picture the browser shows can only follow if it
+/// decodes the library's P frames (its LTR marks and recovery references
+/// included), not just the IDR; the server's own counters say the stream was
+/// the library's, in observed mode: an `h264 refs` line with `backend` openh264
+/// and `plans > 0`, and `marks_observed > 0` on `h264 stats`.
+/// Needs libopenh264 in the server image (`libopenh264-7`); GPU-gated like its
+/// twin, so CI skips it (`ci/skip-list.txt`): WebCodecs on the observed stream
+/// is exercised locally only.
+///
+/// Run as: `just containers-build` then
+/// `cargo test -p ghostframe-e2e --test e2e e2e_h264_openh264_motion -- --test-threads=1`
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_h264_openh264_motion() -> Result<()> {
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--solid-red --spinner",
+        &[
+            ("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "h264"),
+            ("GHOSTFRAME_H264_BACKEND", "openh264"),
+        ],
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // The corner is outside the spinner (it is red) and the spinner region
+    // (100,100)-(164,164) is not static: two samples two seconds apart differ.
+    let corner_js = r#"
+        (async () => {
+            const d = await window.__readPixelRect(8, 8, 4, 4);
+            return [d[0], d[1], d[2]];
+        })()
+    "#;
+    let corner: Vec<u8> = setup.page().evaluate(corner_js).await?.into_value()?;
+    assert!(
+        corner[0] > 150 && corner[1] < 100 && corner[2] < 100,
+        "the openh264 stream's static corner is not red: {corner:?}"
+    );
+    let sample_js = r#"
+        (async () => {
+            const data = await window.__readPixelRect(116, 116, 32, 32);
+            let hash = 0;
+            for (let i = 0; i < data.length; i++) {
+                hash = ((hash << 5) - hash + data[i]) | 0;
+            }
+            return hash;
+        })()
+    "#;
+    let snap_a: i64 = setup.page().evaluate(sample_js).await?.into_value()?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let snap_b: i64 = setup.page().evaluate(sample_js).await?.into_value()?;
+    assert_ne!(
+        snap_a, snap_b,
+        "the spinner did not move on screen: the P frames were not decoded"
+    );
+
+    // The stats lines come every 60 frames: wait for one that shows the
+    // library's observed-mode session.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let logs = helpers::read_server_logs_stripped(&setup.server.server_container_name);
+        assert!(
+            !logs.contains("libva-direct session open"),
+            "libva-direct served the stream despite GHOSTFRAME_H264_BACKEND=openh264"
+        );
+        match helpers::acked_ref_evidence_for(&logs, &["openh264"]) {
+            Ok(ev) => {
+                assert!(
+                    logs.contains("openh264 session open"),
+                    "no `openh264 session open` line: {}",
+                    ev.refs_line
+                );
+                eprintln!("[b7] {}\n[b7] {}", ev.refs_line, ev.stats_line);
+                return Ok(());
+            }
+            Err(why) if std::time::Instant::now() >= deadline => {
+                panic!("the openh264 observed-mode path did not run: {why}\nserver logs:\n{logs}")
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    }
+}
+
+/// The pixel check of the forced-H.264 solid-red test.
+async fn assert_h264_solid_red(setup: &E2eSetup) -> Result<()> {
+    // 5 s: covers QUIC slow-start, encoder startup, and at least
     // a few decoded H.264 frames landing in the framebuffer.
     tokio::time::sleep(Duration::from_secs(5)).await;
 

@@ -2,9 +2,10 @@ Ghostframe
 Third-party notices
 
 This repository had no NOTICE or third-party licences file before D1 PR-6b;
-this one is new. It lists code that was copied or ported into the tree. It
-does not list crates.io dependencies, which carry their own licences and are
-resolved through Cargo.lock.
+this one is new. It lists code that was copied or ported into the tree, and
+a library the daemon loads at run time without carrying it. It does not list
+crates.io dependencies, which carry their own licences and are resolved
+through Cargo.lock.
 
 --------------------------------------------------------------------------
 Tencent TQUIC (Apache License 2.0)
@@ -44,3 +45,36 @@ Tencent TQUIC (Apache License 2.0)
   one accessor is added. The estimator arithmetic is unchanged.
   ghostframe-lib/src/transport/testdata/delivery_rate_tquic_938e90a.txt holds
   readings produced by running the upstream file at the commit above.
+
+--------------------------------------------------------------------------
+Cisco OpenH264 (BSD 2-Clause for the source; binary licence for Cisco's
+builds). Loaded at run time, never shipped, linked or downloaded.
+
+  Source:   https://github.com/cisco/openh264
+  Used by:  ghostframe-lib/src/encoder/h264/openh264.rs and openh264_sys.rs,
+            which `dlopen` libopenh264 (libopenh264.so.8 for 2.6.x,
+            libopenh264.so.7 for 2.4.x and 2.5.x, then libopenh264.so, or the
+            absolute path in GHOSTFRAME_H264_OPENH264_LIB) and call its
+            public C API. The structure layouts in openh264_sys.rs are
+            written from the public headers (codec_api.h, codec_app_def.h),
+            which are not copied here.
+
+  OpenH264 Video Codec provided by Cisco Systems, Inc.
+
+  Ghostframe contains no OpenH264 code or binary. A machine that runs the
+  server with the library installed uses it for software H.264 encoding when
+  no hardware encoder serves the stream, or when GHOSTFRAME_H264_BACKEND is
+  openh264. Whether that use is covered by a patent licence is the
+  operator's to decide:
+
+    * Cisco's patent grant covers only the binary Cisco itself builds and
+      distributes (https://www.openh264.org/BINARY_LICENSE.txt), under
+      conditions including that the user can turn the codec off and that the
+      attribution above is shown. Ghostframe meets the second by logging the
+      sentence when a session opens ("openh264 session open") and the first
+      with GHOSTFRAME_H264_BACKEND=vaapi (libva-direct only) or ffmpeg, either
+      of which never loads the library.
+    * A library built by a distribution from the source (Debian and Ubuntu's
+      libopenh264-7, Fedora's own build) carries no such grant. The operator
+      who installs one, or who pulls Cisco's binary from Cisco's repository,
+      is the licensee; this project fetches nothing.

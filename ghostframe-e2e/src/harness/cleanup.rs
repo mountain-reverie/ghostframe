@@ -138,25 +138,33 @@ fn log_field_u64(line: &str, name: &str) -> Option<u64> {
     None
 }
 
-/// Check server logs for proof that the acked-reference path ran: a
-/// `h264 refs` line whose `backend` is `libva-direct` (the field is only set
-/// once the `RefManager` planned a frame that the libva-direct worker coded)
-/// with `plans > 0`, and an `h264 stats` line showing no scheduled GOP IDR
-/// (a refs session has none). The `h264 refs` line is logged only for a
-/// session that has a `RefManager` (or had planned a frame), so its mere
-/// presence with a non-zero `plans` rules out the ffmpeg path.
+/// Check server logs for proof that the acked-reference path ran, whichever
+/// encoder carried it: see [`acked_ref_evidence_for`].
 pub fn acked_ref_evidence(logs: &str) -> Result<AckedRefEvidence, String> {
+    acked_ref_evidence_for(logs, &["libva-direct", "openh264"])
+}
+
+/// Check server logs for proof that the acked-reference path ran on one of
+/// `backends`: a `h264 refs` line whose `backend` is one of them (the field is
+/// only set once the `RefManager` planned a frame that the backend's worker
+/// coded) with `plans > 0`, and an `h264 stats` line showing no scheduled GOP
+/// IDR (a refs session has none). For openh264 (observed mode) that line must
+/// also show `marks_observed > 0`: the library marked a long-term picture and
+/// the manager read it. (Those counters are on `h264 stats`, not `h264 refs`.)
+/// The `h264 refs` line is logged only for a session that has a `RefManager`
+/// (or had planned a frame), so its mere presence with a non-zero `plans`
+/// rules out the ffmpeg path.
+pub fn acked_ref_evidence_for(logs: &str, backends: &[&str]) -> Result<AckedRefEvidence, String> {
     let refs_line = logs
         .lines()
         .rfind(|l| l.contains("h264 refs (acked-reference recovery"))
         .ok_or(
             "no `h264 refs` line: the RefManager path never ran (or no stats cadence elapsed)",
         )?;
-    if !refs_line.contains(r#"backend="libva-direct""#) {
-        return Err(format!(
-            "`h264 refs` backend is not libva-direct: {refs_line}"
-        ));
-    }
+    let backend = backends
+        .iter()
+        .find(|b| refs_line.contains(&format!(r#"backend="{b}""#)))
+        .ok_or_else(|| format!("`h264 refs` backend is not one of {backends:?}: {refs_line}"))?;
     let plans = log_field_u64(refs_line, "plans").ok_or("no plans= on the refs line")?;
     if plans == 0 {
         return Err(format!("`h264 refs` shows plans=0: {refs_line}"));
@@ -172,6 +180,11 @@ pub fn acked_ref_evidence(logs: &str) -> Result<AckedRefEvidence, String> {
             "a scheduled GOP IDR was emitted (idr_gop_periodic={idr_gop_periodic}); a refs session has none: {stats_line}"
         ));
     }
+    if *backend == "openh264" && log_field_u64(stats_line, "marks_observed").unwrap_or(0) == 0 {
+        return Err(format!(
+            "openh264 ran but the manager observed no long-term mark (marks_observed): {stats_line}"
+        ));
+    }
     Ok(AckedRefEvidence {
         refs_line: refs_line.to_string(),
         stats_line: stats_line.to_string(),
@@ -183,27 +196,32 @@ pub fn acked_ref_evidence(logs: &str) -> Result<AckedRefEvidence, String> {
 /// What a run showed about the acked-reference path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AckedRefOutcome {
-    /// The libva-direct probe passed and the refs path ran.
+    /// The refs path ran: on libva-direct (its probe passed) or, where it did
+    /// not, on openh264 in observed mode.
     Verified(AckedRefEvidence),
     /// The probe failed and the server logged the ffmpeg fallback: the refs
-    /// path was NOT exercised (a runner with no VA-API driver).
+    /// path was NOT exercised (a runner with neither VA-API nor openh264).
     FallbackNotExercised(String),
 }
 
-/// `GHOSTFRAME_E2E_REQUIRE_VAAPI=1` (any non-empty value but `0`): a failed
-/// libva-direct probe is a test failure. Unset on GitHub CI, which has no GPU.
+/// `GHOSTFRAME_E2E_REQUIRE_VAAPI=1` (any non-empty value but `0`): the stream
+/// must be libva-direct's; a failed probe is a test failure, and so is a
+/// session that openh264 carried. Unset on GitHub CI, which has no GPU.
 pub fn require_vaapi() -> bool {
     std::env::var("GHOSTFRAME_E2E_REQUIRE_VAAPI").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
-/// Strict when the probe succeeded (or `require_vaapi`): the refs path must
-/// have run. When the probe failed and VA-API is not required, the fallback
-/// line must be there, and the outcome says loudly that nothing was proved.
+/// Strict when the probe succeeded (or `require_vaapi`, which accepts nothing
+/// but libva-direct): the refs path must have run. When the probe failed and
+/// VA-API is not required, an openh264 session that ran the refs path counts
+/// as the acked-reference outcome (the server image carries libopenh264, so
+/// `auto` takes it); failing that the fallback line must be there, and the
+/// outcome says loudly that nothing was proved.
 pub fn acked_ref_outcome(logs: &str, require_vaapi: bool) -> Result<AckedRefOutcome, String> {
     let probe_ok = logs
         .lines()
         .any(|l| l.contains("libva-direct capability probe") && l.contains("ok=true"));
-    if probe_ok || require_vaapi {
+    if require_vaapi {
         if !probe_ok {
             return Err(
                 "GHOSTFRAME_E2E_REQUIRE_VAAPI is set but the libva-direct capability probe did \
@@ -211,12 +229,21 @@ pub fn acked_ref_outcome(logs: &str, require_vaapi: bool) -> Result<AckedRefOutc
                     .into(),
             );
         }
+        return acked_ref_evidence_for(logs, &["libva-direct"]).map(AckedRefOutcome::Verified);
+    }
+    if probe_ok {
         return acked_ref_evidence(logs).map(AckedRefOutcome::Verified);
+    }
+    if let Ok(ev) = acked_ref_evidence_for(logs, &["openh264"]) {
+        return Ok(AckedRefOutcome::Verified(ev));
     }
     let fallback = logs
         .lines()
         .find(|l| l.contains("acked-reference H.264 unavailable, using the ffmpeg encoder"))
-        .ok_or("the libva-direct probe did not pass and no fallback line was logged")?;
+        .ok_or(
+            "the libva-direct probe did not pass, openh264 did not run the refs path and no \
+             fallback line was logged",
+        )?;
     Ok(AckedRefOutcome::FallbackNotExercised(fallback.to_string()))
 }
 
@@ -228,9 +255,9 @@ pub fn report_acked_ref_outcome(outcome: Result<AckedRefOutcome, String>) {
             eprintln!("[b5b] {}\n[b5b] {}", ev.refs_line, ev.stats_line)
         }
         Ok(AckedRefOutcome::FallbackNotExercised(line)) => eprintln!(
-            "[b5b] WARNING: THE ACKED-REFERENCE PATH WAS NOT EXERCISED (no libva-direct on this \
-             machine; the server fell back to ffmpeg: {line}). Set GHOSTFRAME_E2E_REQUIRE_VAAPI=1 \
-             to make this a failure."
+            "[b5b] WARNING: THE ACKED-REFERENCE PATH WAS NOT EXERCISED (neither libva-direct nor \
+             openh264 on this machine; the server fell back to ffmpeg: {line}). Set \
+             GHOSTFRAME_E2E_REQUIRE_VAAPI=1 to make this a failure."
         ),
         Err(why) => panic!("the acked-reference path did not run: {why}"),
     }
@@ -291,6 +318,34 @@ mod acked_ref_tests {
         assert!(acked_ref_outcome(&logs, true).is_err());
         // Probe failed and no fallback line: failure even when lenient.
         assert!(acked_ref_outcome(&format!("{bad}\n{STATS}"), false).is_err());
+    }
+
+    #[test]
+    fn an_openh264_session_is_an_acked_reference_outcome_unless_vaapi_is_required() {
+        use super::{acked_ref_outcome, AckedRefOutcome};
+        let bad = "DEBUG vaapi_direct: libva-direct capability probe ms=10 ok=false";
+        let refs = REFS.replace("libva-direct", "openh264");
+        let stats = format!("{STATS} marks_observed=4");
+        let logs = format!("{bad}\n{refs}\n{stats}");
+        // No libva-direct on the host, openh264 carried the stream: verified.
+        assert!(matches!(
+            acked_ref_outcome(&logs, false),
+            Ok(AckedRefOutcome::Verified(_))
+        ));
+        // The same with no probe line at all (the probe is DEBUG-level).
+        assert!(matches!(
+            acked_ref_outcome(&format!("{refs}\n{stats}"), false),
+            Ok(AckedRefOutcome::Verified(_))
+        ));
+        // REQUIRE_VAAPI means libva-direct, whatever else ran.
+        assert!(acked_ref_outcome(&logs, true).is_err());
+        let ok = "DEBUG vaapi_direct: libva-direct capability probe ms=10 ok=true";
+        assert!(acked_ref_outcome(&format!("{ok}\n{refs}\n{stats}"), true).is_err());
+        // An openh264 session that the manager never saw mark anything did not
+        // run the observed-mode path: not a verified outcome.
+        let unmarked = STATS.to_string() + " marks_observed=0";
+        let no_fallback = format!("{bad}\n{refs}\n{unmarked}");
+        assert!(acked_ref_outcome(&no_fallback, false).is_err());
     }
 
     #[test]

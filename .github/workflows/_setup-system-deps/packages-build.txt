@@ -18,6 +18,15 @@
 # is needed at link time instead -- the `xkbcommon` crate's `x11`
 # feature carries `#[link(name = "xkbcommon-x11")]`, and only the
 # -dev package ships the unversioned .so the linker resolves.
+#
+# libopenh264-7 is the runtime library only (no -dev): ghostframe loads
+# libopenh264 with dlopen and never links it, so the `openh264_*` lib tests
+# and the browserless openh264 scenes find it by soname. ubuntu-24.04 (noble,
+# universe) carries 2.4.1+dfsg-1, which is libopenh264.so.7 and the 40-byte
+# SLayerBSInfo layout; the developer machines on 2.6.0 (libopenh264.so.8) use
+# the 56-byte one. Both are exercised: CI runs the former. Distribution builds
+# carry no patent grant from Cisco; installing one on a machine that runs the
+# server is the operator's decision (NOTICE).
 build-essential
 pkg-config
 clang
@@ -28,6 +37,7 @@ libavutil-dev
 libswscale-dev
 libavdevice-dev
 libx264-dev
+libopenh264-7
 libx11-dev
 libxext-dev
 libxdamage-dev
