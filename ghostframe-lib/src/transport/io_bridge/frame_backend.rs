@@ -373,9 +373,9 @@ impl FrameBackend for GpuBackend {
             }
             Control::H264Rate { bps, fps, reopen } => {
                 self.rate = RateParams { bps, fps };
-                if let Some((b, _)) = self.direct.as_mut() {
-                    b.set_rate(RateTarget { bps });
-                }
+                // The direct backend's rate is not set here: it travels with
+                // each plan (`finish_h264_planned`), the one writer, so the
+                // cap and VBV cannot disagree with the frame they apply to.
                 if reopen {
                     // Dropped here, opened by the next `finish_h264` at the new
                     // rate: a fresh encoder's first frame is an IDR.
@@ -543,6 +543,7 @@ impl FrameBackend for GpuBackend {
         let Some((backend, _)) = self.direct.as_mut() else {
             return H264Reply::Failed;
         };
+        backend.set_rate(RateTarget::steady(req.bps, req.fps));
         match backend.encode(&view, &req.plan, &req.refs) {
             Ok(au) => H264Reply::Coded(CodedAu(au)),
             Err(e) => {
