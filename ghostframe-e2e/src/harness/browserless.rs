@@ -191,6 +191,8 @@ pub struct H264Load {
     pub pcm_phase_a_rate: bool,
     /// See `InjectedH264::probe_raise`.
     pub probe_raise: bool,
+    /// See `InjectedH264::spike_tune`.
+    pub spike_tune: Option<(u64, bool)>,
     /// Frame index ranges `[from, to)` in which the screen is drawn by the
     /// tile codec instead: one solid tile changes per frame. Entering one
     /// abandons the H.264 frames in flight, leaving it is a re-entry.
@@ -1555,6 +1557,7 @@ async fn drive_session(
             pcm_phase_a_rate: h.pcm_phase_a_rate,
             pcm_cadence_us: h.cadence_us,
             probe_raise: h.probe_raise,
+            spike_tune: h.spike_tune,
         }),
         SceneLoad::Script(_) | SceneLoad::Profile(_) => None,
     };

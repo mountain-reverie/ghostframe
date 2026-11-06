@@ -9226,6 +9226,9 @@ fn raise_bridge() -> (IoBridge, u32) {
     // The first IDR may have claimed a window; start from none.
     bridge.active_probe = None;
     bridge.h264.app_probe.next_at = Some(now + std::time::Duration::from_secs(3600));
+    // The raise is opt-in; padding has gone out and been judged (it waits for that).
+    bridge.h264.probe_raise_on = true;
+    bridge.h264.first_pad_at = Some(now - std::time::Duration::from_secs(5));
     let bps = bridge.h264.rate.applied().expect("a rate is in force");
     (bridge, bps)
 }
@@ -9248,12 +9251,12 @@ fn commit_p(bridge: &mut IoBridge, req: &frame_backend::H264Request, bytes: usiz
 /// window's rate, for every frame the window lasts; the frames are tagged into
 /// the window, the window counts once, the ceiling is held, and after the
 /// window the next plan is back at the normal rate. With the raise off
-/// (`probe_raise_off`) none of it happens.
+/// (`probe_raise_on` false) none of it happens.
 #[tokio::test(start_paused = true)]
 async fn p_frames_in_a_probe_window_are_coded_at_the_windows_rate() {
     for raise_on in [true, false] {
         let (mut b, base) = raise_bridge();
-        b.h264.probe_raise_off = !raise_on;
+        b.h264.probe_raise_on = raise_on;
         let t = now_std();
         let window_bps = u64::from(base) * 4;
         b.open_probe_cluster(
@@ -9265,6 +9268,7 @@ async fn p_frames_in_a_probe_window_are_coded_at_the_windows_rate() {
             40_000,
         );
         let want = (window_bps as f64 * h264_rate::RATE_SHARE) as u32;
+        let sends_before = b.h264_refs_report().rate_sends;
         for seq in 1..=3u32 {
             let req = plan_p(&mut b, seq);
             if raise_on {
@@ -9314,6 +9318,86 @@ async fn p_frames_in_a_probe_window_are_coded_at_the_windows_rate() {
         b.poll_probe_window(now_std());
         let req = plan_p(&mut b, 4);
         assert_eq!(req.rate.bps, base, "restored after the window");
+        // Entering the window and leaving it are two re-sends of the rate
+        // buffers, and counted as the policy's own are.
+        let r = b.h264_refs_report();
+        let sends = r.rate_sends - sends_before;
+        assert_eq!(sends, if raise_on { 2 } else { 0 }, "{r:?}");
+        assert_eq!(
+            r.rate_sends_10s - sends_before.min(r.rate_sends_10s),
+            sends,
+            "and in the 10 s window: {r:?}"
+        );
+    }
+}
+
+/// A raise that is on at a window's open is re-checked for every raised
+/// plan: a cut, a late acknowledgement or a lost raised frame inside the
+/// window ends it for the frames still to come (the one already raised
+/// stays), and a lost raised frame keeps the raise off for
+/// `RAISE_LOSS_PAUSE`, after which it is back.
+#[tokio::test(start_paused = true)]
+async fn the_raise_checks_its_guards_for_every_raised_plan_and_pauses_after_a_loss() {
+    for case in ["clear", "cut", "reordering", "loss"] {
+        let (mut b, base) = raise_bridge();
+        let t = now_std();
+        let window_bps = u64::from(base) * 4;
+        b.open_probe_cluster(
+            t,
+            90,
+            window_bps,
+            std::time::Duration::from_millis(100),
+            5,
+            40_000,
+        );
+        let first = plan_p(&mut b, 1);
+        assert!(first.rate.bps > base, "{case}: premise: frame 1 is raised");
+        commit_p(&mut b, &first, 3_000);
+        match case {
+            "cut" => b.h264.last_cut_at = Some(now_std()),
+            "reordering" => {
+                b.h264.stats.tx_acked_late += 1;
+            }
+            "loss" => b.note_h264_verdict(1, 0, now_std()),
+            _ => {}
+        }
+        ack_every_fragment(&mut b, 1);
+        b.dispatch_frame_ack_for_test(frame_ack_datagram(1, 2, 0));
+        tokio::time::advance(std::time::Duration::from_millis(30)).await;
+        let second = plan_p(&mut b, 2);
+        if case == "clear" {
+            assert!(second.rate.bps > base, "premise: the window goes on");
+        } else {
+            assert_eq!(second.rate.bps, base, "{case}: the window's raise ends");
+        }
+        if case == "loss" {
+            // Off for the pause, on again after it, for a window of its own.
+            commit_p(&mut b, &second, 3_000);
+            ack_every_fragment(&mut b, 2);
+            b.dispatch_frame_ack_for_test(frame_ack_datagram(2, 4, 0));
+            tokio::time::advance(std::time::Duration::from_millis(200)).await;
+            b.poll_probe_window(now_std());
+            b.open_probe_cluster(
+                now_std(),
+                91,
+                window_bps,
+                std::time::Duration::from_millis(100),
+                5,
+                40_000,
+            );
+            assert_eq!(plan_p(&mut b, 3).rate.bps, base, "paused after a loss");
+            tokio::time::advance(super::h264_refs::RAISE_LOSS_PAUSE).await;
+            b.poll_probe_window(now_std());
+            b.open_probe_cluster(
+                now_std(),
+                92,
+                window_bps,
+                std::time::Duration::from_millis(100),
+                5,
+                40_000,
+            );
+            assert!(plan_p(&mut b, 4).rate.bps > base, "back after the pause");
+        }
     }
 }
 
@@ -9349,7 +9433,15 @@ async fn a_raised_frame_is_followed_to_its_acknowledgement_or_its_loss() {
 /// with none of those it does (the premise of each case).
 #[tokio::test(start_paused = true)]
 async fn the_raise_opens_no_window_after_a_cut_behind_a_backlog_or_on_a_reordering_path() {
-    for case in ["clear", "cut", "backlog", "reordering"] {
+    for case in [
+        "clear",
+        "cut",
+        "backlog",
+        "reordering",
+        "no padding yet",
+        "padding just sent",
+        "pad lost",
+    ] {
         let (mut b, _base) = raise_bridge();
         // The application's own probe is due now.
         b.h264.app_probe.next_at = Some(now_std());
@@ -9373,6 +9465,21 @@ async fn the_raise_opens_no_window_after_a_cut_behind_a_backlog_or_on_a_reorderi
             "reordering" => {
                 assert!(!b.h264_reordering_lately(now_std()), "premise: quiet path");
                 b.h264.stats.tx_acked_late += 1;
+            }
+            "no padding yet" => b.h264.first_pad_at = None,
+            "padding just sent" => b.h264.first_pad_at = Some(now_std()),
+            "pad lost" => {
+                // The loss path judges a probe pad lost: the burst overran
+                // the path.
+                let tx = crate::transport::transmission_ledger::Transmission {
+                    emit_us: 0,
+                    wire_bytes: 1200,
+                    content: crate::transport::reliable_emitter::Content::Pad(5),
+                    depart_us: None,
+                    dep_idx: None,
+                };
+                b.note_h264_verdicts(&[(5, tx)], now_std());
+                assert_eq!(b.h264.stats.pads_lost, 1);
             }
             _ => {}
         }

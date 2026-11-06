@@ -1885,7 +1885,7 @@ impl IoBridge {
         // A P frame of an acked-reference stream sent while a probe window is
         // open is part of its burst (it was coded at the window's rate, see
         // `h264_probe_raise`); on any other stream only an IDR is.
-        let tag_p = acked_ref && !self.h264.probe_raise_off;
+        let tag_p = acked_ref && self.h264.probe_raise_on;
         let mut tagged = false;
         for (i, dg) in datagrams.into_iter().enumerate() {
             let probe = self
@@ -1919,6 +1919,9 @@ impl IoBridge {
         if tagged {
             // Real frames spend the grant before any of it is acknowledged,
             // as padding does: keep the ceiling from reading it as saturation.
+            // This holds it for any tagged datagram, a legacy-stream IDR
+            // that claimed a window included (intended: its burst is the same
+            // burst; before the raise only padding held the ceiling).
             self.bwe.hold_ceiling(now, h264_rate::PAD_CEILING_HOLD);
         }
         // A probe window an IDR claimed, or one a P frame may claim, is
@@ -2767,6 +2770,7 @@ impl IoBridge {
                     frames_skipped_pad = h.frames_skipped_pad,
                     probe_padding_windows = h.probe_padding_windows,
                     probe_padding_bytes = h.probe_padding_bytes,
+                    pads_lost = h.pads_lost,
                     loss_idr_rate_limited = h.loss_idr_rate_limited,
                     idr_requests_coalesced = h.idr_requests_coalesced,
                     verdicts_idr_frag = h.verdicts_idr_frag,
