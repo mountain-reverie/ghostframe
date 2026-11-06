@@ -18,6 +18,8 @@ pub(crate) mod tracker;
 pub(crate) mod va_sys;
 pub(crate) mod vaapi_direct;
 
+#[cfg(test)]
+mod openh264_fixture_tests;
 #[cfg(any(test, feature = "browserless-harness"))]
 pub(crate) mod pcm_decoder;
 #[cfg(test)]
