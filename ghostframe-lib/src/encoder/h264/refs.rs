@@ -34,6 +34,10 @@ pub(crate) enum IdrCause {
     ClientReset,
     /// Three plans in a row did not match what the encoder emitted.
     EncoderFault,
+    /// The path MTU fell below the size the epoch's IDR was fragmented for:
+    /// its queued fragments were retired and the IDR is cut again for the
+    /// size the connection takes now (see `frame_oversize`).
+    MtuShrink,
 }
 
 /// Why the client asked for a reset (feedback stream 0x09).
@@ -180,6 +184,7 @@ pub(crate) struct RefStats {
     pub idr_resolution: u64,
     pub idr_client_reset: u64,
     pub idr_encoder_fault: u64,
+    pub idr_mtu_shrink: u64,
     /// An IDR sent again because the first never became an anchor.
     pub idr_reissued: u64,
     pub p_healthy: u64,
@@ -306,6 +311,9 @@ pub(crate) struct RefManager {
     /// IDRs re-sent for the same request without an anchor in between; each
     /// doubles the time allowed (capped), so a slow link converges.
     idr_backoff: u32,
+    /// The IDR died because the path MTU fell below its fragments, not for
+    /// want of progress: its one re-send does not back the timeout off.
+    idr_mtu_dead: bool,
     stats: RefStats,
 }
 
@@ -334,6 +342,7 @@ impl RefManager {
             unknown_hw: None,
             idr_progress_at: None,
             idr_backoff: 0,
+            idr_mtu_dead: false,
             stats: RefStats::default(),
         };
         m.begin_epoch(IdrCause::SessionStart);
@@ -439,6 +448,7 @@ impl RefManager {
         self.poc_count = 0;
         self.mismatch_run = 0;
         self.idr_cause = cause;
+        self.idr_mtu_dead = false;
         self.pending_idr = Some(cause);
     }
 
@@ -461,6 +471,27 @@ impl RefManager {
         if let Some(i) = self.idr_seq.filter(|&i| self.table.idr_incomplete(i)) {
             self.table.set_dead(i);
         }
+    }
+
+    /// A fragment of `seq` outgrew the connection (the path MTU fell after it
+    /// was built) and was retired unsent. Returns whether `seq` is the IDR
+    /// still being delivered.
+    ///
+    /// The IDR cannot complete: its fragments are all the old size. It is
+    /// abandoned as [`idr_abandoned`](Self::idr_abandoned) does (dead, so the
+    /// next plan sends it again, with no anchor to recover from) and the
+    /// resend is counted under [`IdrCause::MtuShrink`]. Any other frame is
+    /// treated as one the ledger judged lost: suspect, and the next plan
+    /// recovers from the anchor, fragmented at the new size.
+    pub(crate) fn frame_oversize(&mut self, seq: u32) -> bool {
+        if self.idr_seq == Some(seq) && self.table.idr_incomplete(seq) {
+            self.table.set_dead(seq);
+            self.idr_cause = IdrCause::MtuShrink;
+            self.idr_mtu_dead = true;
+            return true;
+        }
+        self.frame_suspect(seq);
+        false
     }
 
     pub(crate) fn resolution_change(&mut self) {
@@ -620,7 +651,7 @@ impl RefManager {
     /// How long the IDR may go without progress, or without a decoded bit
     /// after it is delivered, before it is sent again: three decode
     /// deadlines, doubled per earlier re-send (up to four times).
-    fn idr_timeout(&self) -> Duration {
+    pub(crate) fn idr_timeout(&self) -> Duration {
         self.candidate_timeout() * 3 * (1 << self.idr_backoff.min(2))
     }
 
@@ -628,7 +659,11 @@ impl RefManager {
         // The same IDR again: not a new cause.
         self.stats.idr_reissued += 1;
         let cause = self.idr_cause;
-        self.idr_backoff += 1;
+        // A retirement for size is not evidence of a slow link: only a
+        // re-send for want of progress doubles the time allowed.
+        if !std::mem::take(&mut self.idr_mtu_dead) {
+            self.idr_backoff += 1;
+        }
         self.begin_epoch(cause);
         self.idr_plan(frame_seq, cause)
     }
@@ -1019,6 +1054,7 @@ impl RefManager {
                 Some(IdrCause::ResolutionChange) => self.stats.idr_resolution += 1,
                 Some(IdrCause::ClientReset) => self.stats.idr_client_reset += 1,
                 Some(IdrCause::EncoderFault) => self.stats.idr_encoder_fault += 1,
+                Some(IdrCause::MtuShrink) => self.stats.idr_mtu_shrink += 1,
                 None => {}
             }
         } else {

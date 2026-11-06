@@ -119,7 +119,10 @@ impl IoBridge {
     ///   cached for the loss path, which are all the old size. Its cache
     ///   entry goes and an IDR cut for the current size is requested
     ///   ([`IdrCause::MtuShrink`]); it supersedes every older frame, queued
-    ///   or cached, and replaces the hold on the IDR that cannot complete;
+    ///   or cached, and replaces the hold on the IDR that cannot complete.
+    ///   On an acked-reference session the manager is told instead
+    ///   (`h264_refs_oversize`): a recovery from its anchor, or, for the IDR in
+    ///   flight, the IDR sent again at the new size;
     /// - probe padding: owes the client nothing, dropped;
     /// - XOR parity: its sources are the same size, so they are retired too.
     fn retire_oversize(
@@ -157,6 +160,13 @@ impl IoBridge {
                 }
                 self.h264.stats.oversize_h264 += 1;
                 self.reliable_emitter.h264.remove(frame_seq, frag_idx);
+                if self.h264_refs_live() {
+                    // Acked references have no Phase A IDR request: the
+                    // frame is lost as far as the manager is concerned, and
+                    // it picks the recovery.
+                    self.h264_refs_oversize(frame_seq, now);
+                    return;
+                }
                 self.request_h264_idr(IdrCause::MtuShrink, now);
                 // As for a loss IDR: a screen that has stopped changing makes
                 // no capture with dirty tiles, so no frame to carry the IDR.
