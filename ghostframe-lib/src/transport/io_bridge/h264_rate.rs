@@ -248,7 +248,9 @@ impl RatePolicy {
                 let dt = now.saturating_duration_since(t).as_secs_f64();
                 if est > e * SPIKE_RATIO {
                     let until = now + spike_hold;
-                    self.spike = Some((est.max(self.spike.map_or(0.0, |s| s.0)), until));
+                    // An expired spike is gone: only a live one is carried into the new one.
+                    let live = self.spike.filter(|s| now < s.1).map_or(0.0, |s| s.0);
+                    self.spike = Some((est.max(live), until));
                 }
                 let alpha = 1.0 - (-dt / EWMA_TAU.as_secs_f64()).exp();
                 self.ewma_bps = Some(e + alpha * (est - e));
@@ -1839,5 +1841,34 @@ mod tests {
         });
         assert!(steps.len() > 4, "premise: it followed the drift");
         assert!(steps.iter().all(|(_, a)| !a.cut), "{steps:?}");
+    }
+
+    /// A spike that expired is not carried into a later one: a 10 Mbit/s blip
+    /// on a 6 Mbit/s path, a fall to 2 Mbit/s, and much later a 3.5 Mbit/s
+    /// reading (a jump over 1.5 x the 2 Mbit/s average) must be followed at
+    /// 0.8 x 3.5, not at 0.8 x the long-dead 10.
+    #[test]
+    fn in_place_an_expired_spike_is_not_rearmed_by_a_later_one() {
+        let t0 = Instant::now();
+        let mut p = RatePolicy::default();
+        let est = |t: u64| match t {
+            0..3_000 => 6 * MBIT,
+            3_000..3_100 => 10 * MBIT,
+            3_100..10_000 => 6 * MBIT,
+            10_000..20_000 => 2 * MBIT,
+            20_000..20_100 => 3_500_000,
+            _ => 2 * MBIT,
+        };
+        let steps = drive(&mut p, t0, 0, 24_000, est);
+        let after: Vec<_> = steps.iter().filter(|(t, _)| *t >= 19_000).collect();
+        assert!(
+            after.iter().any(|(t, _)| *t >= 20_000),
+            "premise: the 3.5 Mbit/s reading moved the rate ({after:?})"
+        );
+        let worst = after.iter().map(|(_, a)| a.bps).max().unwrap();
+        assert!(
+            worst <= (0.8 * 3_500_000.0 * 1.01) as u32,
+            "the stale 10 Mbit/s spike came back: applied {worst}"
+        );
     }
 }
