@@ -550,6 +550,9 @@ pub(super) struct H264Tx {
     /// place of the encode worker.
     #[cfg(feature = "browserless-harness")]
     pub(super) pcm_backend: Option<crate::encoder::h264::harness::PcmBackend>,
+    /// Harness: the openh264 source of a `PcmMode::OpenH264` scene.
+    #[cfg(feature = "browserless-harness")]
+    pub(super) oh_source: Option<crate::encoder::h264::harness::Openh264Source>,
     #[cfg(feature = "browserless-harness")]
     pub(super) pcm_log: crate::encoder::h264_harness::PcmLog,
     /// See `InjectedH264::pcm_phase_a_rate`.
@@ -1131,7 +1134,13 @@ impl IoBridge {
         };
         let now = now_std();
         #[cfg(feature = "browserless-harness")]
-        let refs_scene = h.pcm == Some(crate::encoder::h264_harness::PcmMode::RefManager);
+        let refs_scene = matches!(
+            h.pcm,
+            Some(
+                crate::encoder::h264_harness::PcmMode::RefManager
+                    | crate::encoder::h264_harness::PcmMode::OpenH264 { .. }
+            )
+        );
         #[cfg(feature = "browserless-harness")]
         self.note_injected_h264_mode(refs_scene);
         // The classifier is not in this scripted path; the flag still is.
@@ -1305,7 +1314,14 @@ impl IoBridge {
             unchanged: false,
         };
         self.h264.refs_mode = super::h264_refs::RefsMode::Explicit;
-        self.h264.backend_kind = "pcm";
+        self.h264.backend_kind = if matches!(
+            h.pcm,
+            Some(crate::encoder::h264_harness::PcmMode::OpenH264 { .. })
+        ) {
+            "openh264"
+        } else {
+            "pcm"
+        };
         self.h264.phase_a_rate_step = h.pcm_phase_a_rate;
         self.h264.raise_mutated_off = h.no_probe_raise;
         let (hold_ms, releasable) = h.spike_tune.map_or((None, true), |(ms, r)| (Some(ms), r));
@@ -1319,6 +1335,22 @@ impl IoBridge {
             self.pump_admission();
             return;
         };
+        if let Some(crate::encoder::h264_harness::PcmMode::OpenH264 {
+            scene_change_every,
+            churn_every,
+            stale_every,
+        }) = h.pcm
+        {
+            self.apply_injected_openh264(
+                seq,
+                (scene_change_every, churn_every, stale_every),
+                &req,
+                &meta,
+                max_dg_size,
+                now,
+            );
+            return;
+        }
         let log = self.h264.pcm_log.clone();
         let backend = self
             .h264
@@ -1351,6 +1383,62 @@ impl IoBridge {
                 raised: self.h264.rate.applied().is_some_and(|a| a != req.rate.bps),
             });
         self.h264_refs_commit(&req.plan, au, &meta, max_dg_size, now);
+    }
+
+    /// The `PcmMode::OpenH264` arm of [`apply_injected_pcm_refs`]: the real
+    /// library encodes the frame's canvas inline, where the encode worker
+    /// would, and the bridge commits the access unit it made. The truth log
+    /// gets the reference the stream really names.
+    #[cfg(feature = "browserless-harness")]
+    fn apply_injected_openh264(
+        &mut self,
+        seq: u32,
+        canvas: (u32, u32, u32),
+        req: &super::frame_backend::H264Request,
+        meta: &frame::FrameMeta,
+        max_dg_size: usize,
+        now: std::time::Instant,
+    ) {
+        use crate::encoder::h264::harness::Openh264Source;
+        let log = self.h264.pcm_log.clone();
+        let src = self
+            .h264
+            .oh_source
+            .get_or_insert_with(|| Openh264Source::new(log, canvas));
+        let is_idr = req.plan.kind == crate::encoder::h264::tracker::PicKind::Idr;
+        src.ensure_open(
+            req.openh264_lib
+                .as_deref()
+                .map(std::path::Path::to_path_buf),
+            req.rate,
+            req.fps,
+            is_idr,
+        )
+        .expect(
+            "the openh264 library opens (install libopenh264 or set GHOSTFRAME_H264_OPENH264_LIB)",
+        );
+        let picture = src.paint(seq);
+        let (view, backend) = src.parts().expect("opened just above");
+        let au = super::frame_backend::encode_planned(backend, &view, req)
+            .expect("openh264 encodes every plan");
+        let ref_seq = au.meta.header.as_ref().and_then(|hdr| {
+            let st = self.h264.refs.as_ref()?;
+            st.mgr.observe(&req.plan, hdr).ref_frame_seq()
+        });
+        let src = self.h264.oh_source.as_ref().expect("created above");
+        src.record(seq, picture, &au, ref_seq);
+        self.h264
+            .pcm_log
+            .lock()
+            .expect("pcm log poisoned")
+            .au_log
+            .push(crate::encoder::h264::harness::AuRecord {
+                timestamp_us: meta.timestamp_us,
+                bytes: au.payload.len(),
+                idr: au.meta.idr,
+                raised: self.h264.rate.applied().is_some_and(|a| a != req.rate.bps),
+            });
+        self.h264_refs_commit(&req.plan, au, meta, max_dg_size, now);
     }
 
     /// Forget the H.264 state of the session that ended: tracker, hold,

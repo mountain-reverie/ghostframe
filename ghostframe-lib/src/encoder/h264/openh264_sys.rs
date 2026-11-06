@@ -506,6 +506,15 @@ impl Lib {
         entry.as_ref().map_err(String::as_str)
     }
 
+    /// The library this process is configured to use
+    /// (`GHOSTFRAME_H264_OPENH264_LIB`, read through `config` like the
+    /// daemon's), for tests and the browserless harness, so that they load
+    /// what the daemon would: the same path into [`Lib::get`], no second search.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub(crate) fn configured_path() -> Option<PathBuf> {
+        crate::config::TransportConfig::from_env().openh264_lib
+    }
+
     pub(crate) fn create_encoder(&'static self) -> Result<Encoder, String> {
         let mut raw: EncoderPtr = std::ptr::null_mut();
         // SAFETY: the symbol is WelsCreateSVCEncoder.
