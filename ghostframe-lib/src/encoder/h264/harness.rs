@@ -67,6 +67,17 @@ pub struct TruthEntry {
     pub non_ref: bool,
 }
 
+/// An access unit the encoder made: the frame's timestamp (scene time, from the
+/// scene's cadence), its coded size and whether it was an IDR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuRecord {
+    pub timestamp_us: u32,
+    pub bytes: usize,
+    pub idr: bool,
+    /// Coded at a probe window's rate (the probe raise), not at the rate in force.
+    pub raised: bool,
+}
+
 /// The `RefManager`'s counters (and the bridge's), copied out for the scene's
 /// assertions.
 pub type PcmRefCounters = crate::transport::io_bridge::RefsReport;
@@ -81,6 +92,8 @@ pub struct PcmLogInner {
     pub refs: PcmRefCounters,
     /// What the rate model did to the frame sizes (zero without a model).
     pub model: PcmModelStats,
+    /// The access units an acked-reference scene's encoder made, in order.
+    pub au_log: Vec<AuRecord>,
 }
 
 pub type PcmLog = Arc<Mutex<PcmLogInner>>;
