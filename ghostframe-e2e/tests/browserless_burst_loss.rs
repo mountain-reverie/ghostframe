@@ -215,7 +215,7 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
          ledger[declared={} flushed={} overflowed={} late_before_flush={} late_after_flush={} \
          late_unreported={} unknown_acks={} tombstone_evictions={} expired_before_departure={} \
          departures_stamped={} evicted_before_departure={}] \
-         loss[pkt={} time={} pto={} k_pkt={} k_raises={} spurious_ledger={} loss_retx={} probe_retx={} pto_fires={} \
+         loss[pkt={} time={} pto={} k_pkt={} k_raises={} reo_wnd_us={} reo_raises={} spurious_ledger={} loss_retx={} probe_retx={} pto_fires={} \
          verdict_no_retx[gone={} newer={} queued={}] spurious_loss={} spurious_pto={}] \
          ecn[ect0={} unmarked={} last_marked={}] loss_path_resends={} loss_path_resends_spurious={} loss_path_resends_useful={} \
          generation_replacements={} loss_path_resends_superseded={} \
@@ -277,6 +277,8 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
         i.loss_by_pto,
         i.k_pkt,
         i.k_pkt_raises,
+        i.reo_wnd_us,
+        i.reo_wnd_raises,
         i.ledger_spurious_losses,
         i.loss_retransmits,
         i.pto_probe_retransmits,

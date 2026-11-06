@@ -208,10 +208,45 @@ async fn lost_acknowledgements_alone_cost_the_legacy_policy_idrs() {
 #[tokio::test(start_paused = true)]
 async fn scene_4_reordering_shows_no_wrong_picture() {
     let mut late_acks = 0;
-    for seed in SEEDS {
+    let mut reo_raised = 0;
+    let (mut learned_packet, mut learned_time) = (0, 0);
+    // Eight seeds: the scene is cheap, and the spurious-verdict count it
+    // bounds varied from 1 to 6 per seed before the reordering window.
+    for seed in (0x7101..=0x7108).collect::<Vec<u64>>() {
         let (r, o) = pcm_run(seed, SECS, Pattern::Reorder { window_us: 8_000 }, legacy()).await;
         line("reorder8", seed, &r, &o);
         let ctx = format!("reorder8 {seed:#x}");
+        let i = &r.transport.instr;
+        println!(
+            "reorder8 {seed:#x} ledger: k_pkt={} k_raises={} reo_wnd_us={} reo_raises={} \
+             learned pkt={} time={} spurious={} disp_max={} gap_us_max={} by_rule pkt={} time={}",
+            i.k_pkt,
+            i.k_pkt_raises,
+            i.reo_wnd_us,
+            i.reo_wnd_raises,
+            i.reo_learned_packet,
+            i.reo_learned_time,
+            i.ledger_spurious_losses,
+            i.spurious_disp_max,
+            i.spurious_gap_us_max,
+            i.loss_by_packet_threshold,
+            i.loss_by_time_threshold
+        );
+        reo_raised += i.reo_wnd_raises;
+        learned_packet += i.reo_learned_packet;
+        learned_time += i.reo_learned_time;
+        // The loss IDR count alone does not see the window: Phase A answers
+        // a burst of spurious verdicts with one IDR. The verdicts do. Only the
+        // batch before the window is learned may be spurious: the first
+        // contradicted verdict cannot be avoided, and it arrives with its
+        // neighbours (0 to 3 per seed measured; 11 to 15 packet verdicts per
+        // seed, nearly all spurious, before the window). Four is that batch
+        // plus one of margin; a window that is not holding makes tens.
+        assert!(
+            i.ledger_spurious_losses <= 4,
+            "{ctx}: {} spurious verdicts",
+            i.ledger_spurious_losses
+        );
         assert_sound(&ctx, &r, &o);
         // An MtuShrink IDR is the answer to Quinn's MTU fall-back (datagrams
         // that outgrew the path), not to reordering: leave it out.
@@ -220,13 +255,19 @@ async fn scene_4_reordering_shows_no_wrong_picture() {
         // from a spurious verdict. With the bandwidth estimate held at the
         // path's ~2 Mbit/s, frames are bigger and leave in back-to-back bursts
         // (56 to 58 % of datagrams under 1 ms apart); inside a burst the 8 ms
-        // reordering moves datagrams more than K_PKT = 3 places, and the
-        // ledger's packet-threshold rule declares them lost. Phase A turns each
-        // verdict into a loss IDR (seeds 0x7101..0x7108 make 3, 1, 4, 2, 6, 2,
-        // 3, 4). The bound is 6, not a target; the cause is burst depth against
-        // K_PKT, tracked as the follow-up "reorder-tolerant packet threshold".
+        // reordering moves datagrams up to 24 places, past any K_PKT (at most
+        // 8, and raised only after 32 verdicts, of which the scene makes about
+        // a dozen). Before the ledger's reordering window, seeds 0x7101..0x7108
+        // made 3, 1, 4, 2, 6, 2, 3, 4 IDRs beyond the MtuShrink ones. The
+        // window is learned from the first contradicted verdict, which cannot
+        // be avoided: the bound is the session IDR plus that one loss IDR.
+        // Kept at 2, not 3: it is that argument and not a fitted number (per
+        // seed 0x7101..0x7108: 2, 1, 2, 2, 2, 2, 2, 2 IDRs, 0 to 3 spurious
+        // verdicts in the one batch that teaches the window, no MtuShrink).
+        // A second loss IDR would mean a second batch of spurious verdicts
+        // after the window was learned, which is what this gate is for.
         assert!(
-            o.idr_made - mtu <= 6,
+            o.idr_made - mtu <= 2,
             "{ctx}: {} IDRs, {mtu} of them MtuShrink",
             o.idr_made
         );
@@ -248,6 +289,18 @@ async fn scene_4_reordering_shows_no_wrong_picture() {
     assert!(
         late_acks > 0,
         "reorder8: no verdict was ever acknowledged late"
+    );
+    // Premise of the bound: the reordering window was learned in this scene.
+    assert!(reo_raised > 0, "reorder8: reo_wnd was never raised");
+    // And it was taught by both kinds of contradicted verdict across the
+    // seeds, not only by the clock (earlier, every seed's window was opened by
+    // a time verdict).
+    println!(
+        "reorder8: learned from packet verdicts {learned_packet}, time verdicts {learned_time}"
+    );
+    assert!(
+        learned_packet > 0,
+        "reorder8: no contradicted packet verdict taught the window"
     );
     for seed in SEEDS {
         let (r, o) = pcm_run(seed, SECS, Pattern::Reorder { window_us: 45_000 }, legacy()).await;
@@ -585,13 +638,18 @@ async fn an_mtu_that_falls_after_discovery_does_not_wedge_the_stream() {
     assert!(distinct.len() >= 6, "the seeds are not independent runs");
 }
 
-/// Seed 0x7108 of the 8 ms reordering scene wedged on master with no MTU
-/// knob at all: quinn's own discovery raised the size and its black-hole
-/// detector took it back (280 `TooLarge` refusals, the picture frozen from
-/// 6.9 s to the end). Properties only: the chaotic path decides how many
-/// IDRs this makes.
+/// Seed 0x7108 of the 8 ms reordering scene wedged on master: quinn's own
+/// discovery raised the datagram size and its black-hole detector took it
+/// back (280 `TooLarge` refusals, the picture frozen from 6.9 s to the end).
+/// The shrink followed that seed's spurious loss verdicts; with the ledger's
+/// reordering window it may not happen at all, so this is a liveness check on
+/// the same path (properties only, the chaotic path decides the IDR count) and
+/// prints `oversize_h264` to say whether the shrink happened. The wedge, with
+/// its premises, is
+/// `an_mtu_that_falls_after_discovery_does_not_wedge_the_stream` above, which
+/// forces the fall.
 #[tokio::test(start_paused = true)]
-async fn reorder8_seed_7108_no_longer_wedges_on_an_mtu_shrink() {
+async fn reorder8_seed_7108_stays_live() {
     let (r, o) = pcm_run(
         0x7108,
         SECS,
@@ -600,10 +658,9 @@ async fn reorder8_seed_7108_no_longer_wedges_on_an_mtu_shrink() {
     )
     .await;
     line("reorder8", 0x7108, &r, &o);
-    // Premise: quinn's own MTU fall happened here, or the test proves nothing.
-    assert!(
-        r.h264.stats.oversize_h264 > 0,
-        "no stored fragment outgrew the connection: the shrink did not happen"
+    println!(
+        "reorder8 0x7108: oversize_h264={} send_too_large={}",
+        r.h264.stats.oversize_h264, r.h264.stats.send_too_large
     );
     assert_eq!(r.h264.stats.send_too_large, 0);
     assert_sound("reorder8 0x7108", &r, &o);
