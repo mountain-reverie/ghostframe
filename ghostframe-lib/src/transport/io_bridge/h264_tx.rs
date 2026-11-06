@@ -503,6 +503,8 @@ pub(super) struct H264Tx {
     pub(super) refs_mode: super::h264_refs::RefsMode,
     pub(super) refs: Option<super::h264_refs::RefsState>,
     pub(super) refs_counters: super::h264_refs::RefsCounters,
+    /// When the rate buffers were last sent (the last 10 s).
+    pub(super) rate_send_times: std::collections::VecDeque<std::time::Instant>,
     /// Acked-reference sessions: when a frame was last newly decoded (or the
     /// IDR last progressed), and when a frame was last sent. Frames sent since
     /// the last decode, for 500 ms, are a stall (a client that only refuses

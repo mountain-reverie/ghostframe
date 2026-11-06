@@ -74,11 +74,15 @@ const RISE_CONFIRMATIONS: u32 = 2;
 /// apart: a change costs no IDR there, so only the encoder's settling time
 /// (3-4 frames, S2) limits them.
 pub(crate) const APPLY_MIN_INTERVAL: Duration = Duration::from_millis(250);
-/// The rate is re-applied at least this often when it moved at all, so a slowly
-/// drifting estimate is followed inside the dead band.
-pub(crate) const APPLY_REFRESH: Duration = Duration::from_secs(1);
-/// A candidate this far (fraction) from the running rate is applied at once.
+/// A fall this far (fraction) under the running rate is applied at once: a cut
+/// stays prompt.
 pub(crate) const APPLY_MOVE_FRACTION: f64 = 0.10;
+/// A rise needs to be this far over the running rate. Every re-send of the
+/// rate buffers costs a first frame of about 1.4-1.9x the average, whatever the
+/// size of the step (T4 on the VCE), so a small rise is not worth one; a rise
+/// that does not clear this is left until the candidate does. There is no
+/// periodic refresh: a rate inside the band is never re-sent to follow a drift.
+pub(crate) const APPLY_RISE_FRACTION: f64 = 0.15;
 /// A cut is a fall of more than [`DROP_FRACTION`] from the highest rate
 /// applied within this long: a large fall may arrive as several smaller
 /// in-place steps.
@@ -307,8 +311,9 @@ impl RatePolicy {
     /// IDR, no reopen): the same estimate handling as [`step`](Self::step)
     /// without Phase A's reopen economics. No 2 s lock, no rise
     /// confirmations, no GOP wait; a change is applied when the candidate left
-    /// the dead band ([`APPLY_MOVE_FRACTION`]) or [`APPLY_REFRESH`] passed,
-    /// never twice within [`APPLY_MIN_INTERVAL`].
+    /// the dead band ([`APPLY_RISE_FRACTION`] for a rise, [`APPLY_MOVE_FRACTION`]
+    /// for a fall), never twice within [`APPLY_MIN_INTERVAL`]. A rate inside
+    /// the band is not re-sent: each re-send of the rate buffers is a burst.
     pub(crate) fn step_in_place(&mut self, now: Instant, estimate_bps: u64) -> Option<RateApply> {
         self.observe(now, estimate_bps);
         let Some(applied) = self.applied else {
@@ -350,7 +355,12 @@ impl RatePolicy {
         if since < APPLY_MIN_INTERVAL || cand == applied {
             return None;
         }
-        if relative_move(applied, cand) <= APPLY_MOVE_FRACTION && since < APPLY_REFRESH {
+        let band = if cand > applied {
+            APPLY_RISE_FRACTION
+        } else {
+            APPLY_MOVE_FRACTION
+        };
+        if relative_move(applied, cand) <= band {
             return None;
         }
         while self
@@ -1611,28 +1621,54 @@ mod tests {
         }
     }
 
+    /// A rate inside the band is never re-sent, however long it stays there
+    /// (each re-send is a burst); a rise needs 15 %, a fall 10 %.
     #[test]
-    fn in_place_a_small_drift_is_applied_at_the_refresh_not_before() {
+    fn in_place_a_drift_inside_the_band_is_never_resent_a_wider_one_is() {
+        let t0 = Instant::now();
+        // The initial rate is 0.8 x the estimate: 10 Mbit/s -> 8 Mbit/s.
+        let run = |from: u64, to: u64| {
+            let mut p = RatePolicy::default();
+            let steps = drive(&mut p, t0, 0, 10_000, |t| if t < 100 { from } else { to });
+            steps
+                .into_iter()
+                .filter(|(_, a)| !a.initial)
+                .collect::<Vec<_>>()
+        };
+        // +12 % (target 8.96): a rise inside the 15 % band. Silence for 10 s.
+        let up_in = run(10 * MBIT, 11_200_000);
+        assert!(up_in.is_empty(), "{up_in:?}");
+        // -8 %: a fall inside the 10 % band.
+        let down_in = run(10 * MBIT, 9_200_000);
+        assert!(down_in.is_empty(), "{down_in:?}");
+        // +20 % and -15 % clear their bands, once each.
+        let up = run(10 * MBIT, 12 * MBIT);
+        assert_eq!(up.len(), 1, "premise: the rise is applied once: {up:?}");
+        assert!(up[0].1.bps > 8_800_000, "{up:?}");
+        let down = run(10 * MBIT, 8_500_000);
+        assert_eq!(down.len(), 1, "premise: the fall is applied once: {down:?}");
+        assert!(!down[0].1.cut);
+        // A fall between the two bands (12 %) is applied, a rise of the same
+        // size (below 15 %) is not: cuts stay prompt.
+        assert_eq!(run(10 * MBIT, 8_800_000).len(), 1);
+        assert!(run(10 * MBIT, 11_200_000).is_empty());
+    }
+
+    /// An estimate wandering by +-8 % costs no re-send at all.
+    #[test]
+    fn in_place_a_wandering_estimate_inside_the_band_sends_nothing() {
         let t0 = Instant::now();
         let mut p = RatePolicy::default();
-        // 10 -> 10.6 Mbit/s: inside the dead band of the applied 8 Mbit/s.
-        let steps = drive(&mut p, t0, 0, 4_000, |t| {
-            if t < 100 {
-                10 * MBIT
-            } else {
-                10_600_000
-            }
-        });
-        let later: Vec<_> = steps.iter().filter(|(_, a)| !a.initial).collect();
-        assert!(!later.is_empty(), "premise: the refresh applied something");
-        let first = later[0];
-        assert!(
-            first.0 >= APPLY_REFRESH.as_millis() as u64,
-            "applied at {} ms, inside the refresh",
-            first.0
-        );
-        assert!(relative_move(8_000_000, first.1.bps) <= APPLY_MOVE_FRACTION);
-        assert!(!first.1.cut);
+        let mut x = 99u64;
+        let mut noise = vec![0u64; 60_000 / 16 + 2];
+        for n in &mut noise {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *n = 10 * MBIT + (x >> 33) % (800_000);
+        }
+        let steps = drive(&mut p, t0, 0, 60_000, |t| noise[(t / 16) as usize]);
+        assert_eq!(steps.len(), 1, "only the initial rate: {steps:?}");
     }
 
     #[test]
