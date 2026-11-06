@@ -611,6 +611,71 @@ still resends IDR fragments), the reopen on a rate change, and H.264 XOR parity
 IDR is not the probe burst any more; padding and the application's probe
 clusters (section 5) are the only probing.
 
+**Rate control (B6).** The policy of section 4 is Phase A's; on these sessions
+`RatePolicy::step_in_place` replaces its reopen economics, because a change of
+rate is a re-send of the rate buffers on a P frame, not an IDR (T4, the RX 480:
+the HRD restarts at 40 % fullness, so the first frame after a re-send is about
+1.00 of the average, then a short dip of 0.56 and 0.87; the worst 1 s window at
+4 Hz of noisy re-sends is 0.97 of the rate told).
+
+- Candidate and target as in section 4 (`0.8 x` the smoothed estimate, a raw
+  jump held), but a jump is held for 2 s (`SPIKE_HOLD_IN_PLACE`): swept on the
+  96-seed step-up population (raise on), 0.5 s / 1 s / 2 s reached the headroom on
+  75 / 79 / 96 of 96 timelines and the p90 fell from 12.4 s to 5.5 s.
+- An apply needs a 10 % fall or a 15 % rise from the running rate and is never
+  closer than 250 ms to the last. Inside the band nothing is re-sent. There is
+  no 2 s lock, so a drop shortly after a rise applies at once, and no confirmation
+  count.
+- A **cut** (the 3 s quiet period without padding, `last_cut_at`) is a fall of
+  more than 30 % from the highest rate applied in the last second: a large fall
+  may arrive as several smaller steps.
+- Every plan carries a `RateTarget`: `bps`, a P-frame cap of 3 average frames
+  (`max_frame_bytes`, soft: the VCE overshoots it), the IDR budget `max(0.25 s of
+  the rate, 32 kB)` (`idr_max_bytes`, an IDR is content-limited and lands within
+  1.15 of it), and a VBV of `max(0.1 s of the rate, one cap)`, raised to the IDR
+  budget on an IDR frame. The buffers (rate control, HRD, max frame size) are
+  sent together; a change that only touches the cap is latched by a +-16 bps
+  nudge of the rate. One writer: the planner's request, never the control
+  channel.
+- **Probe raise.** A probe window is made of real frames where it can be. While
+  a window is open (goog_cc's request or the application's own) each P frame is
+  planned at `RATE_SHARE x` the window's rate (about three frames of a 100 ms
+  window at 30 fps, at most 3), its fragments are tagged into the window, and the
+  estimate ceiling is held off for it (for any window real frames claim, IDRs
+  included). Padding stays, for the shortfall: on the first frame it is sized
+  for the cluster less what the frames still to come are expected to carry
+  (`RAISE_EXPECTED_YIELD`, half an average frame each), and the last frame
+  tops up the whole shortfall; padding late in the window runs past its end and
+  leaves at the pacer's rate, which measured worse than none. After the window the next
+  plan is at the normal rate again (a re-send that costs about nothing). The
+  raise keeps off within 3 s of a cut, behind a backlog, and for 5 s after a
+  late acknowledgement. `probe_raise_*` and `raised_frame_*` (below) account for
+  it.
+- **Measured** (browserless `p_b_seed_population`, `GF_POP_MODE`, 96 seeds, three
+  ack timings, the P-B capacity step 2 -> 6 Mbit/s, `T_UP` = 11 s; reached
+  `0.8 x 6` Mbit/s within `T_UP`, step-up p50 / p90; no collapse and the headroom
+  guard released on 96 of 96 in every row):
+
+  | | reached | step-up p50 / p90 (ms) |
+  |---|---|---|
+  | Phase A policy, no raise | 90/86/86 | 5500/7300, 5900/11800, 5700/10900 |
+  | in place, 1 s spike hold, raise off | 88/89/85 | 1900/10600, 1900/8600, 1900/12500 |
+  | in place, 2 s spike hold, raise off | 94/96/90 | 1900/6600, 1900/6000, 1900/7300 |
+  | **in place, 2 s spike hold, raise on** | **96/95/95** | **1200/5500, 1300/5400, 1300/5700** |
+  | the same at a model raise yield of 0.7 | 94/93/92 | 4600/6100, 4500/6600, 5500/6700 |
+
+  The raise cuts padding per probe window to 61 % (69 % at yield 0.7) of its
+  no-raise figure (scene 9). Scene 6 (a capacity drop, with a drop shortly after a
+  rise) bounds the bytes coded at the rate in force in any 1 s window at 1.15 x
+  `RATE_SHARE x` the estimate, and the backpressure skips after the drop at half
+  those of a stream with no rate policy. The spike hold, not the raise, is what
+  fixed the tail: at 1 s of hold the raise cost 5 to 9 timelines of 96.
+- The model's raise yield is provisional until
+  `h264_direct_probe_raise_lever_b_at_40pct` (T4, owner-run) is read: the spike
+  at 75 % fullness gave 1.10 of a window's bytes, the 40 % profile alone 0.81.
+  `PcmRateModel::with_raise_yield(0.7)` is the pessimistic case the scenes also
+  pass.
+
 **Tile codec.** Leaving H.264 is unchanged. Returning is `mode_reentry`: the
 first frame is a recovery P from the newest confirmed anchor (an IDR only when
 there is none), logged as `reentry_bytes` and `anchor_age_ms`. `frame_seq` is
@@ -620,7 +685,12 @@ shared with tile frames, so nothing here assumes +1.
 `cumulative emit` cadence) carries the backend, plans, holds, the manager's
 counters (recoveries, reroots, anchors confirmed, candidates marked, plan
 mismatches, deadline suspects, `suspect_overridden`), the client's decoded and
-refused counts, client resets, `reentry_bytes` and `anchor_age_ms`.
+refused counts, client resets, `reentry_bytes` and `anchor_age_ms`, the rate
+(`rate_updates`, `rate_applies_up` / `_down`, `rate_sends`, `rate_sends_10s`)
+and the probe raise (`probe_raise_windows` / `_frames` / `_bytes`,
+`raised_frame_lost`, `raised_frames_acked`, `raised_delivery_us_max` / `_mean`).
+`h264 stats` carries the plan's budget: `frame_cap_bytes`, `idr_cap_bytes`,
+`frames_over_cap`, `max_cap_ratio_pct`.
 
 **Client.** The web decoder reads profile, constraint flags and level from the
 IDR's SPS (`codecStringFromSps`) and reconfigures on a key chunk when they
@@ -633,13 +703,20 @@ the real worker and libva-direct through a loss.
 
 ### Known limits
 
-- Probe padding stalls a reordering path: with the rate policy running and
-  8 ms of reordering on a 20 ms link, the Phase A scripted CBR stream sent 39
+- Probe padding stalls a reordering path on Phase A: with the rate policy
+  running and 8 ms of reordering on a 20 ms link, the scripted CBR stream sent 39
   frames in 6 s against 164 on a clean path (the padding cluster fills quinn's
-  FIFO ahead of the frames). The acked-reference loss and reordering scenes
-  turn the rate policy off (`InjectedH264::pcm_rate_policy`) to keep it out of
-  the way.
+  FIFO ahead of the frames). The acked-reference loss and reordering scenes now
+  run with the rate policy on (`refs_rated`): under 8 ms and 45 ms of
+  reordering the stream makes at least 0.8 of the frames it makes without the
+  policy (measured 0.93 to 0.98), with one IDR. The raise keeps off for 5 s after
+  a late acknowledgement for the same reason.
 - Legacy sessions keep the Phase A encoder and policy (periodic IDR, loss IDR,
   parity, reopen on a rate change) until the ffmpeg path is removed.
-- Rate control still reuses the Phase A policy (smoothing, 2 s between
-  changes); the frame-size cap, VBV and the probe-cap raise are B6.
+- The step-up population (`p_b_seed_population`) measures a transient: the first
+  sample over `0.8 x` the new capacity, which a probe's result gives for a few
+  hundred milliseconds. A stream that holds the headroom is not what it asks.
+- The raise's yield on the VCE is a model parameter (see above) until the T4 is
+  read; the P-frame cap is soft (`frames_over_cap` observes it).
+- A raise in the window of a probe that fails (a real loss during it) costs the
+  frames' picture quality, not padding bytes; `raised_frame_lost` counts them.
