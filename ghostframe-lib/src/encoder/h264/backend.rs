@@ -207,13 +207,32 @@ pub(crate) struct EncodedAu {
     pub meta: AuMeta,
 }
 
+/// What the stream's receiver (through the reference manager) tells a backend
+/// that keeps its own long-term bookkeeping (openh264). The explicit-ref
+/// backends ignore all of it. Frame numbers are H.264 `frame_num`s; an
+/// `idr_pic_id` names the IDR period they belong to (a stale one is ignored).
+#[allow(clippy::enum_variant_names)] // the names are openh264's LTR vocabulary
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackendFeedback {
-    /// The client decoded an anchor candidate (for backends that keep their
-    /// own long-term bookkeeping; the explicit-ref ones ignore it).
-    AnchorConfirmed { seq: u32 },
-    /// A frame is suspect or lost.
-    FrameLost { seq: u32 },
+    /// The client decoded the carrier of a long-term mark. `frame_num` is the
+    /// MARKED picture's number (for an MMCO 3 mark: the carrier's
+    /// predecessor).
+    LtrMarked { idr_pic_id: u32, frame_num: u32 },
+    /// The carrier of a mark was lost or refused: the mark did not happen.
+    /// Without this the library never marks again.
+    LtrMarkFailed { idr_pic_id: u32, frame_num: u32 },
+    /// Predict the next frame from a long-term picture the client holds.
+    /// `last_correct_frame_num` is the CARRIER's `frame_num` (the picture that
+    /// carried the mark: for an MMCO 3 mark, the marked picture's successor;
+    /// the marked picture's own number is taken as an unknown reference and
+    /// answered with an IDR). `current_frame_num` is the NEWEST `frame_num`
+    /// encoded, not the oldest suspect: a request whose current is below the
+    /// last recovery's is silently ignored.
+    LtrRecover {
+        idr_pic_id: u32,
+        last_correct_frame_num: u32,
+        current_frame_num: u32,
+    },
 }
 
 pub(crate) trait H264Backend: Send {

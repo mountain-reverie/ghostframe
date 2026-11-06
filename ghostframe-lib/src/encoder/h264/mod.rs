@@ -11,6 +11,8 @@
 pub(crate) mod backend;
 #[cfg(feature = "browserless-harness")]
 pub mod harness;
+pub(crate) mod openh264;
+pub(crate) mod openh264_sys;
 pub(crate) mod param_sets;
 pub(crate) mod refs;
 pub(crate) mod syntax;
@@ -20,6 +22,8 @@ pub(crate) mod vaapi_direct;
 
 #[cfg(test)]
 mod openh264_fixture_tests;
+#[cfg(test)]
+mod openh264_tests;
 #[cfg(any(test, feature = "browserless-harness"))]
 pub(crate) mod pcm_decoder;
 #[cfg(test)]
