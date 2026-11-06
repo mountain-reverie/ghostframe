@@ -1882,18 +1882,28 @@ impl IoBridge {
         let h264_wire_bytes: u32 = datagrams.iter().map(|dg| dg.len() as u32).sum();
         let frag_count = datagrams.len() as u16;
         let queued_at = now;
+        // A P frame of an acked-reference stream sent while a probe window is
+        // open is part of its burst (it was coded at the window's rate, see
+        // `h264_probe_raise`); on any other stream only an IDR is.
+        let tag_p = acked_ref && !self.h264.probe_raise_off;
+        let mut tagged = false;
         for (i, dg) in datagrams.into_iter().enumerate() {
-            let probe = self.active_probe.as_mut().filter(|_| is_idr).map(|p| {
-                let tag = crate::transport::reliable_emitter::cache::ProbeTag {
-                    id: p.id,
-                    min_probes: p.min_probes,
-                    min_bytes: p.min_bytes,
-                    bytes_sent_before: p.bytes_sent,
-                };
-                p.bytes_sent = p.bytes_sent.saturating_add(dg.len() as i64);
-                p.packets_sent = p.packets_sent.saturating_add(1);
-                tag
-            });
+            let probe = self
+                .active_probe
+                .as_mut()
+                .filter(|p| is_idr || tag_p && now < p.ends_at)
+                .map(|p| {
+                    tagged = true;
+                    let tag = crate::transport::reliable_emitter::cache::ProbeTag {
+                        id: p.id,
+                        min_probes: p.min_probes,
+                        min_bytes: p.min_bytes,
+                        bytes_sent_before: p.bytes_sent,
+                    };
+                    p.bytes_sent = p.bytes_sent.saturating_add(dg.len() as i64);
+                    p.packets_sent = p.packets_sent.saturating_add(1);
+                    tag
+                });
             self.reliable_emitter.submit_h264_fragment(
                 crate::transport::reliable_emitter::h264::H264Submit {
                     frame_seq: seq,
@@ -1905,6 +1915,11 @@ impl IoBridge {
                 },
                 now,
             );
+        }
+        if tagged {
+            // Real frames spend the grant before any of it is acknowledged,
+            // as padding does: keep the ceiling from reading it as saturation.
+            self.bwe.hold_ceiling(now, h264_rate::PAD_CEILING_HOLD);
         }
         // A probe window an IDR claimed, or one a P frame may claim, is
         // filled up to the cluster with padding (see `h264_probe_pad`).
@@ -2825,6 +2840,13 @@ impl IoBridge {
                     rate_applies_down = r.rate_applies_down,
                     rate_sends = r.rate_sends,
                     rate_sends_10s = r.rate_sends_10s,
+                    probe_raise_windows = r.probe_raise_windows,
+                    probe_raise_frames = r.probe_raise_frames,
+                    probe_raise_bytes = r.probe_raise_bytes,
+                    raised_frame_lost = r.raised_frame_lost,
+                    raised_frames_acked = r.raised_frames_acked,
+                    raised_delivery_us_max = r.raised_delivery_us_max,
+                    raised_delivery_us_mean = r.raised_delivery_us_sum / r.raised_frames_acked.max(1),
                     "h264 refs (acked-reference recovery; cumulative)"
                 );
             }

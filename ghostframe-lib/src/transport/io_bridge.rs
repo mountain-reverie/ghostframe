@@ -466,6 +466,11 @@ pub struct InjectedH264 {
     /// The scene's frame period, for the `RefManager`'s decode deadlines.
     #[cfg(feature = "browserless-harness")]
     pub pcm_cadence_us: u64,
+    /// Mutation switch, with `pcm_rate_policy`: `false` turns the probe raise
+    /// off (frames are not coded at a probe window's rate, nor tagged into
+    /// it), so a window is filled by padding alone, as before the raise.
+    #[cfg(feature = "browserless-harness")]
+    pub probe_raise: bool,
 }
 
 /// The scripted CBR encoder of [`InjectedH264::cbr`]: a P frame is

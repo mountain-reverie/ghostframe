@@ -56,6 +56,7 @@ fn load(idr_bytes: usize, p_bytes: usize) -> H264Load {
         pcm_rate_policy: false,
         pcm_rate_model: None,
         pcm_phase_a_rate: false,
+        probe_raise: true,
         tile_phases: [None, None],
     }
 }
@@ -1098,6 +1099,11 @@ enum StepMode {
     /// `Refs` on the earlier burst calibration of a re-send (a backend that
     /// re-sends the HRD at 75 % fullness): the first frame 1.4-1.8x.
     RefsBurst,
+    /// The refs twin with the probe raise off (padding alone fills the windows).
+    RefsNoRaise,
+    /// The refs twin with a pessimistic raise: the model gives a probe raise
+    /// 0.7 of the bytes the VCE's profile does.
+    RefsPessRaise,
 }
 
 impl StepMode {
@@ -1110,6 +1116,8 @@ impl StepMode {
             Ok("refs-full-transient") => Self::RefsFullTransient,
             Ok("refs-linear-step") => Self::RefsLinearStep,
             Ok("refs-burst") => Self::RefsBurst,
+            Ok("refs-no-raise") => Self::RefsNoRaise,
+            Ok("refs-pess-raise") => Self::RefsPessRaise,
             _ => Self::Legacy,
         }
     }
@@ -1140,6 +1148,17 @@ impl StepMode {
             Self::RefsBurst => {
                 let mut l = refs_cbr_load();
                 l.pcm_rate_model = Some(PcmRateModel::s2(40_000, 120_000, FPS).with_burst_resend());
+                l
+            }
+            Self::RefsNoRaise => {
+                let mut l = refs_cbr_load();
+                l.probe_raise = false;
+                l
+            }
+            Self::RefsPessRaise => {
+                let mut l = refs_cbr_load();
+                l.pcm_rate_model =
+                    Some(PcmRateModel::s2(40_000, 120_000, FPS).with_raise_yield(0.7));
                 l
             }
             Self::RefsBpsOnly => {
@@ -1472,6 +1491,14 @@ struct StepSummary {
     model_limited: u64,
     /// Bytes the model gave the frames over the bytes the rates told allow.
     bytes_vs_target: f64,
+    /// Padding bytes sent, probe windows the raise used, bytes of the frames
+    /// coded at a window's rate, raised frames a verdict named, and the
+    /// longest a raised frame took to be fully acknowledged.
+    padding_bytes: u64,
+    raise_windows: u64,
+    raise_bytes: u64,
+    raised_lost: u64,
+    raised_delay_max_us: u64,
 }
 
 impl StepSummary {
@@ -1521,6 +1548,11 @@ async fn step_summary(
         bytes_vs_target: st.r.h264_run().map_or(0.0, |x| {
             x.truth.model.bytes as f64 / x.truth.model.allowed_bytes.max(1) as f64
         }),
+        padding_bytes: st.r.h264.stats.probe_padding_bytes,
+        raise_windows: st.r.h264.refs.probe_raise_windows,
+        raise_bytes: st.r.h264.refs.probe_raise_bytes,
+        raised_lost: st.r.h264.refs.raised_frame_lost,
+        raised_delay_max_us: st.r.h264.refs.raised_delivery_us_max,
     }
 }
 
@@ -1586,9 +1618,10 @@ async fn p_b_seed_population() {
         for i in start..start + n {
             let s = step_summary(0x6701 + i, chatter, delay_us, mode).await;
             println!(
-                "SEED {:#x} {mode:?} chatter={chatter:?} reached={:?} guard={:?} lowest/pre-min={:.2} min/pre-min={:.2} saturated={:.2} guard_ok={} padding_windows={} applies_up={} bytes_vs_target={:.3}",
+                "SEED {:#x} {mode:?} chatter={chatter:?} reached={:?} guard={:?} lowest/pre-min={:.2} min/pre-min={:.2} saturated={:.2} guard_ok={} padding_windows={} applies_up={} bytes_vs_target={:.3} padding_bytes={} raise_windows={} raise_bytes={} raised_lost={} raised_delay_max_ms={}",
                 s.seed, s.reached, s.guard_us, s.low, s.min_all, s.sat_share, s.guard_ok,
-                s.padding_windows, s.applies_up, s.bytes_vs_target
+                s.padding_windows, s.applies_up, s.bytes_vs_target, s.padding_bytes,
+                s.raise_windows, s.raise_bytes, s.raised_lost, s.raised_delay_max_us / 1000
             );
             all.push(s);
         }
@@ -1788,11 +1821,54 @@ async fn p_b_population_refs_twin_never_collapses_and_finds_the_headroom() {
     population_gate(StepMode::Refs, Some(REFS_TWIN_ALLOWED_MISSES)).await;
 }
 
-/// Misses allowed per gate row: `(reaching the headroom, releasing the guard)`.
-/// Measured on the 40 %-fullness re-send model, not tuned: one miss in each of
-/// the first three rows; the burst model needed 5 and 2 in the first two rows
-/// and none in the third.
+/// The same gate with the probe raise off (`InjectedH264::probe_raise`): padding
+/// alone fills the windows, as before the raise. It holds the bound the twin had
+/// before the raise (one miss in each of the first three rows), so the raise's
+/// cost on the headroom proxy is the difference of the two gates, and the
+/// no-raise path stays what it was.
+#[tokio::test(start_paused = true)]
+async fn p_b_population_refs_twin_without_the_probe_raise_keeps_its_bound() {
+    population_gate(
+        StepMode::RefsNoRaise,
+        Some(REFS_TWIN_NO_RAISE_ALLOWED_MISSES),
+    )
+    .await;
+}
+
+/// The twin with a pessimistic raise: the model gives a raise 0.7 of the bytes
+/// the VCE's profile does (`PcmRateModel::raise_yield`). Same bound as the
+/// raise at the measured yield: the stream does not collapse and does not lose
+/// the headroom for a backend that yields less.
+#[tokio::test(start_paused = true)]
+async fn p_b_population_refs_twin_with_a_pessimistic_raise_yield() {
+    population_gate(
+        StepMode::RefsPessRaise,
+        Some(REFS_TWIN_PESSIMISTIC_ALLOWED_MISSES),
+    )
+    .await;
+}
+
+/// Misses allowed per gate row: `(reaching the headroom, releasing the guard)`,
+/// raise on. Measured (2026-11-06), not tuned: 7 of 24, 3 of 8 and 2 of 8
+/// timelines miss the headroom in the first three rows and none in the rest;
+/// the guard is always released. The same rows without the raise miss 1, 1, 1
+/// ([`REFS_TWIN_NO_RAISE_ALLOWED_MISSES`]): the proxy (an estimate sample over
+/// 0.8 x the new capacity within `T_UP`) counts a spike of the first probe
+/// after the step, which is twice the estimate, and the raise ramps about 11 %
+/// lower in the seconds after (mean estimate over the 4 s to 14 s after the
+/// step, 48 seeds: 4.13 against 4.63 Mbit/s) for 40 % fewer padding bytes.
 const REFS_TWIN_ALLOWED_MISSES: [(usize, usize); 6] =
+    [(7, 0), (3, 0), (2, 0), (0, 0), (0, 0), (0, 0)];
+
+/// The same rows at a raise yield of 0.7: 9, 4 and 2 misses in the first three
+/// rows, none in the rest, the guard always released.
+const REFS_TWIN_PESSIMISTIC_ALLOWED_MISSES: [(usize, usize); 6] =
+    [(9, 0), (4, 0), (2, 0), (0, 0), (0, 0), (0, 0)];
+
+/// The same rows with the raise off: measured on the 40 %-fullness re-send
+/// model, one miss in each of the first three rows; the burst model needed 5
+/// and 2 in the first two rows and none in the third.
+const REFS_TWIN_NO_RAISE_ALLOWED_MISSES: [(usize, usize); 6] =
     [(1, 0), (1, 0), (1, 0), (0, 0), (0, 0), (0, 0)];
 
 /// The gate's rows: seeds, ack chatter and one-way delay.
@@ -1851,6 +1927,13 @@ async fn population_gate(mode: StepMode, allowed_misses: Option<[(usize, usize);
                     "seed {:#x} {mode:?}: premise: probes were padded ({}), the rate moved up in place ({}) and the model held frames to it ({})",
                     s.seed, s.padding_windows, s.applies_up, s.model_limited
                 );
+                if matches!(mode, StepMode::Refs | StepMode::RefsPessRaise) {
+                    assert!(
+                        s.raise_windows > 0 && s.raise_bytes > 0,
+                        "seed {:#x} {mode:?}: premise: frames were coded at a probe window's rate ({} windows, {} bytes)",
+                        s.seed, s.raise_windows, s.raise_bytes
+                    );
+                }
             }
         }
         for s in &all {

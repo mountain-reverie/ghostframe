@@ -188,6 +188,12 @@ impl GoogCcDriver {
         self.ceiling_hold_until_us = self.ceiling_hold_until_us.max(until);
     }
 
+    /// Whether the ceiling is held off at `now` (see [`Self::hold_ceiling`]).
+    #[cfg(test)]
+    pub(crate) fn ceiling_held(&self, now: Instant) -> bool {
+        self.micros_since_base(now) < self.ceiling_hold_until_us
+    }
+
     /// goog_cc is never given a `NetworkStateEstimate` (the model controller
     /// feeds no capacity hint), so `ProbeController::time_for_network_state_probe`
     /// returns false at its first check: every network-state path needs one.
