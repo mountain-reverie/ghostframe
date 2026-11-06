@@ -202,7 +202,19 @@ Env-gated, off by default:
   its cause: a verdict or the probe), ledger verdict (`lost_ws`, with its
   rule), acknowledgement, late acknowledgement and resolve miss. The `loss
   path` journal event (same cadence as `cumulative emit`) carries `k_pkt`,
-  verdicts by rule, `spurious_*`, `pto_fires` and the retransmission causes.
+  `reo_wnd_us` / `reo_wnd_raises` (the RACK-style departure-gap window: zero until
+  a packet or time verdict was contradicted by a late acknowledgement, then a
+  packet verdict also needs the newest acked departure to be that much later,
+  or, inside the window, a count of learned depth; the time rule's threshold
+  grows by it; back to zero after 16 quiet loss episodes), `reo_learned_packet` /
+  `reo_learned_time` (contradicted verdicts it learned from, by rule) and
+  `spurious_disp_max` / `spurious_gap_us_max` (how far past a contradicted
+  verdict the newest acked departure was, in departures and microseconds),
+  `reo_depth` (the in-window count depth, saturating at 64), `reo_judged_depth` /
+  `reo_judged_quiet` (packet verdicts judged inside the window by depth, and by
+  the stream going quiet), `reo_stall_skips` (late acknowledgements that taught
+  nothing: no acknowledgement advanced the reference since the verdict and the
+  gap was a time threshold, i.e. a stalled ack path), verdicts by rule, `spurious_*`, `pto_fires` and the retransmission causes.
 - `GHOSTFRAME_BLOCKING_PUBLISH=1` — native client: wait for the GPU after every
   export publish, as the ring did before it stopped. The default hands the
   buffer over while the blit is still running (GLES relies on Mesa's implicit

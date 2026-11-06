@@ -504,6 +504,33 @@ loss path is firing on P fragments; `tx_recorded` is at least the sum of
 its three outcomes; the gap is the outstanding count (not logged), exact only
 within one session and without ledger capacity evictions.
 
+The reordering window (`reo_wnd`, `transmission_ledger.rs`) is on the `loss
+path` line (same target and cadence as
+`cumulative emit`), not on `h264 stats`: `reo_wnd_us`, `reo_wnd_raises`, `reo_learned_packet`, `reo_learned_time`,
+`spurious_disp_max`, `spurious_gap_us_max`, `reo_depth`, `reo_judged_depth`, `reo_judged_quiet`, `reo_stall_skips`. It is zero until a verdict has been
+contradicted by a late acknowledgement (a packet or time verdict; a
+probe-timeout verdict followed by a late ack says the path stalled, not that it
+reorders). From then on a packet-threshold verdict also needs the newest
+acknowledged departure to have left at least `reo_wnd` after the datagram (RFC
+8985 section 6.2), and the time rule's threshold grows by `reo_wnd`. Inside the
+window, which includes every datagram stamped with the same departure (a frame
+burst), the count rule stays but at the depth the path was seen to displace a
+datagram by plus one, saturating at 64 (one outlier, or the inflation a batch of
+acknowledgements adds, does not switch the rule off). `reo_wnd` is also clamped
+at use to half the current time threshold, so a window learned on a slow path
+does not outlive a move to a fast one. A late acknowledgement that follows an
+ack-path stall (nothing newer was acknowledged since the verdict, and a time
+threshold has passed) teaches nothing (`reo_stall_skips`); neither does one
+while `min_rtt` is unknown. `reo_wnd` grows by `min_rtt / 8` per
+contradicted round trip towards the departure gap measured at the verdict, at
+most `min(min_rtt / 2, 50 ms)`, and returns to zero after 16 quiet loss
+episodes (an episode is a verdict batch past the previous episode's recovery
+point). A real loss on such a session is judged by whichever comes first: the
+packet rule once the newest acknowledged departure is `reo_wnd` later than it
+(about one frame later) or `depth` datagrams later in its own burst, or the time
+rule, which is `reo_wnd` (at most 50 ms) later than it would have been. A path
+that never reorders keeps it at zero and judges as before.
+
 Environment variables (the classifier ones also accept their older
 `GHOSTFRAME_TEST_*` names, e.g. `GHOSTFRAME_TEST_HEADROOM_MIN_BPUS`):
 
@@ -527,7 +554,9 @@ Environment variables (the classifier ones also accept their older
 - **Shared loss path, spurious loss IDRs.** H.264 fragments are judged by the
   same loss path as tiles. At about 2 ms of path jitter it produces roughly
   30 to 40 spurious loss IDRs in a run (observed in the Phase A live checks,
-  not asserted by a test). Each costs an IDR and a P hold.
+  not asserted by a test). Each costs an IDR and a P hold. Since the
+  reordering window (section 8) a path that reorders stops producing them after
+  its first few contradicted verdicts.
 - **Reordered P frames cost a reset.** A P frame that completes before its
   reference is refused by the client's reference gate, and the server does not
   yet act on `GateReset` or on the refused bit, so the picture waits for the

@@ -44,6 +44,20 @@ pub struct Transmission {
     pub dep_idx: Option<u64>,
 }
 
+/// Which rule judged a packet-threshold verdict, with respect to the
+/// reordering window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReoBranch {
+    /// The window was closed, or the newest acknowledged departure left at
+    /// least `reo_wnd` after the transmission: the ordinary count rule.
+    Open,
+    /// Inside the window, at the learned depth.
+    Depth,
+    /// Inside the window, at the ordinary count, once the stream of later
+    /// departures had been quiet for `reo_wnd`.
+    Quiet,
+}
+
 /// Why a transmission was declared lost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LossReason {
@@ -69,6 +83,43 @@ const ADAPT_WINDOW: u64 = 64;
 /// Verdicts the window must hold before `K_PKT` may be raised: a share of a
 /// handful is no evidence.
 const ADAPT_MIN_VERDICTS: u64 = 32;
+/// The reordering window RFC 8985 section 6.2 calls `reo_wnd`, here a
+/// departure-time gap. A packet-threshold verdict also needs the newest
+/// acknowledged departure to have left at least this long after the
+/// transmission. Zero until a spurious packet or time verdict (a late
+/// acknowledgement) shows the path reorders; the time rule's threshold also
+/// grows by it. It learns the departure gap a contradicted packet or time
+/// verdict showed, in steps of [`REO_STEP_DIVISOR`]th of `min_rtt` at most one
+/// per round trip (departures of one `drain_outbound` turn share a stamp, so
+/// the measured gap of a datagram displaced inside a burst is zero, and one
+/// outlier must not open the window to its cap).
+const REO_STEP_DIVISOR: u32 = 8;
+/// Inside the window (the newest acknowledged departure left less than
+/// `reo_wnd` after a transmission, which includes everything stamped with the
+/// same departure) the count rule stays, at the depth the path was seen to
+/// displace a datagram by (plus one). A displacement past this saturates the
+/// depth here (one outlier must not switch the rule off for the session: the
+/// acknowledgement batching inflates a displacement, a whole frame can resolve
+/// in one batch before detection runs). 64 and not 32: the bursty replay (40
+/// datagram frames, 8 ms of reordering) makes 0.068 spurious verdicts per
+/// datagram at a depth of 32 (0.022 with batched acknowledgements) and none
+/// at 40 or more.
+const REO_DEPTH_MAX: u64 = 64;
+/// Step and ceiling when no `min_rtt` is known (tests).
+const REO_STEP_FALLBACK: Duration = Duration::from_millis(5);
+const REO_CAP_FALLBACK: Duration = Duration::from_millis(50);
+/// The ceiling is `min_rtt / REO_CAP_DIVISOR`, never above [`REO_CAP_FALLBACK`].
+const REO_CAP_DIVISOR: u32 = 2;
+/// Quiet loss episodes (a verdict batch past the previous episode's recovery
+/// point, with no late acknowledgement for two time thresholds before it)
+/// after which `reo_wnd` returns to zero. RFC
+/// 8985 section 6.2 keeps it for 16 loss recoveries.
+const REO_PERSIST: u32 = 16;
+/// An episode only counts toward that reset when no verdict has been
+/// contradicted for this long: a path that reorders in bursts, with seconds
+/// of calm between them, must not lose its window (and pay to learn it again,
+/// on the legacy H.264 path a spurious loss IDR) after sixteen lossy frames.
+const REO_QUIET_SPAN: Duration = Duration::from_secs(30);
 /// Hard cap on the parity departures remembered. The real bound is time (the
 /// caller's `retain`, at least 600 ms): at 200 Mbit/s and 1,200-byte datagrams
 /// that is about 12,500 groups, so the cap is a backstop for rates beyond that,
@@ -125,6 +176,15 @@ struct Tombstone {
     /// Number of the packet-threshold verdict, for the adaptation window.
     /// `None` for time-threshold and probe verdicts, which do not adapt it.
     packet_verdict_no: Option<u64>,
+    /// Why it was declared lost: only packet and time verdicts say anything
+    /// about reordering (a probe-timeout verdict is a stall).
+    reason: LossReason,
+    /// The newest acknowledged departure when the verdict was issued: how
+    /// far past this transmission the verdict thought the path had moved, free
+    /// of what the acknowledgement batching added before the late ack.
+    largest_idx_at_verdict: Option<u64>,
+    largest_at_at_verdict: Option<Instant>,
+    largest_arrival_at_verdict: Option<Instant>,
     departed: Option<Instant>,
     /// The delivery-rate mark the record carried, so a late acknowledgement
     /// is still a delivery sample (D1 PR-6b).
@@ -188,6 +248,28 @@ pub struct LedgerStats {
     /// The packet threshold now (3 to 8) and how often it has been raised.
     pub k_pkt: u64,
     pub k_pkt_raises: u64,
+    /// The reordering window now (microseconds) and how often it was raised.
+    pub reo_wnd_us: u64,
+    pub reo_wnd_raises: u64,
+    /// Contradicted verdicts the window learned from, by the rule that made
+    /// them (a probe-timeout verdict never teaches it).
+    pub reo_learned_packet: u64,
+    pub reo_learned_time: u64,
+    /// Largest displacement, in departures, and in departure time, between the
+    /// newest acknowledged departure and a transmission whose verdict a late
+    /// acknowledgement contradicted. Measurement only.
+    pub spurious_disp_max: u64,
+    pub spurious_gap_us_max: u64,
+    /// The depth of the in-window count rule now (0: none learned).
+    pub reo_depth: u64,
+    /// Late acknowledgements that taught nothing because they followed an
+    /// ack-path stall (no acknowledgement advanced the reference since the
+    /// verdict, and the gap was at least a time threshold).
+    pub reo_stall_skips: u64,
+    /// Packet verdicts judged inside the window at the learned depth, and by
+    /// the stream going quiet.
+    pub reo_judged_depth: u64,
+    pub reo_judged_quiet: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -239,6 +321,32 @@ pub struct TransmissionLedger {
     /// is only ever judged against this, never against the clock, so a queue
     /// that delays everything in order cannot produce a verdict (F4).
     largest_acked: Option<u64>,
+    /// When `largest_acked` left quinn's FIFO.
+    largest_acked_at: Option<Instant>,
+    /// When the acknowledgement that last advanced `largest_acked` arrived
+    /// (`None` without arrival times): the stream of later departures going
+    /// quiet is what ends the wait inside the reordering window.
+    largest_acked_arrival: Option<Instant>,
+    /// See [`REO_STEP_DIVISOR`].
+    reo_wnd: Duration,
+    freeze_reo_wnd: bool,
+    /// Quiet loss episodes since `reo_wnd` was last raised or a late
+    /// acknowledgement was seen.
+    reo_recoveries: u32,
+    /// `next_dep_idx` when the last episode was counted: verdicts on earlier
+    /// departures are the same recovery.
+    reo_recovery_point: u64,
+    /// Displacement (departures) a contradicted verdict showed, plus one, at
+    /// most [`REO_DEPTH_MAX`].
+    reo_depth: u64,
+    /// The time threshold the last loss query used: what a stalled ack path
+    /// is told from reordering by.
+    last_time_threshold: Option<Duration>,
+    /// Which branch judged each packet verdict (the replay reads and clears it).
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    verdict_branches: Vec<(u32, ReoBranch)>,
+    last_reo_raise: Option<Instant>,
+    last_spurious_ack: Option<Instant>,
     /// When each group's parity left quinn's FIFO, by `group_first_wire_seq`.
     /// Bounded by time (see [`Self::note_parity_departed`]) and, as a
     /// backstop, by [`PARITY_RING_CAP`].
@@ -271,6 +379,18 @@ impl TransmissionLedger {
             next_dep_idx: 0,
             probe_bursts: VecDeque::new(),
             largest_acked: None,
+            largest_acked_at: None,
+            largest_acked_arrival: None,
+            reo_wnd: Duration::ZERO,
+            freeze_reo_wnd: false,
+            reo_recoveries: 0,
+            reo_recovery_point: 0,
+            reo_depth: 0,
+            last_time_threshold: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            verdict_branches: Vec::new(),
+            last_reo_raise: None,
+            last_spurious_ack: None,
             parity_departed: HashMap::new(),
             parity_order: VecDeque::new(),
             k_pkt: K_PKT_INITIAL,
@@ -288,8 +408,73 @@ impl TransmissionLedger {
         self.freeze_k_pkt = true;
     }
 
+    /// Keep the reordering window at zero. The mutation the reorder-window
+    /// gates are shown against.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub fn freeze_reo_wnd(&mut self) {
+        self.freeze_reo_wnd = true;
+    }
+
+    pub fn reo_wnd(&self) -> Duration {
+        self.reo_wnd
+    }
+
+    /// Which branch judged each packet verdict since the last call.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub fn take_verdict_branches(&mut self) -> Vec<(u32, ReoBranch)> {
+        std::mem::take(&mut self.verdict_branches)
+    }
+
+    fn advance_largest_acked(&mut self, idx: u64, at: Instant, arrival: Option<Instant>) {
+        if self.largest_acked.is_none_or(|l| idx > l) {
+            self.largest_acked = Some(idx);
+            self.largest_acked_at = Some(at);
+            self.largest_acked_arrival = arrival;
+        }
+    }
+
+    /// A late acknowledgement contradicted a packet or time verdict that is
+    /// not an FEC recovery: the path reorders by at least what this one
+    /// showed (`extent` in departure time, `disp` in departures, both as of
+    /// the verdict). The window grows one step per round trip towards the
+    /// extent, within its cap.
+    fn learn_reordering(
+        &mut self,
+        now: Option<Instant>,
+        min_rtt: Option<Duration>,
+        extent: Duration,
+        disp: u64,
+    ) {
+        self.reo_recoveries = 0;
+        self.last_spurious_ack = now;
+        if self.freeze_reo_wnd {
+            return;
+        }
+        self.reo_depth = self.reo_depth.max((disp + 1).min(REO_DEPTH_MAX));
+        let step = min_rtt.map_or(REO_STEP_FALLBACK, |m| m / REO_STEP_DIVISOR);
+        let cap = min_rtt.map_or(REO_CAP_FALLBACK, |m| {
+            (m / REO_CAP_DIVISOR).min(REO_CAP_FALLBACK)
+        });
+        let target = extent.max(step).min(cap);
+        let round = min_rtt.unwrap_or(step * REO_STEP_DIVISOR);
+        let due = match (self.last_reo_raise, now) {
+            (Some(prev), Some(n)) => n.saturating_duration_since(prev) >= round,
+            _ => true,
+        };
+        // Whole steps only (the last one stops at the cap), so a measurement
+        // a hair above the window is a step and the raises stay few.
+        let next = (self.reo_wnd + step).min(cap);
+        if target >= self.reo_wnd + step / 2 && due {
+            self.reo_wnd = next;
+            self.last_reo_raise = now;
+            self.stats.reo_wnd_raises += 1;
+        }
+    }
+
     pub fn stats(&self) -> LedgerStats {
         LedgerStats {
+            reo_wnd_us: self.reo_wnd.as_micros() as u64,
+            reo_depth: self.reo_depth,
             k_pkt: self.k_pkt,
             ..self.stats
         }
@@ -605,6 +790,15 @@ impl TransmissionLedger {
         self.next_dep_idx = 0;
         self.probe_bursts.clear();
         self.largest_acked = None;
+        self.largest_acked_at = None;
+        self.largest_acked_arrival = None;
+        self.reo_wnd = Duration::ZERO;
+        self.reo_recoveries = 0;
+        self.reo_recovery_point = 0;
+        self.reo_depth = 0;
+        self.last_time_threshold = None;
+        self.last_reo_raise = None;
+        self.last_spurious_ack = None;
         self.parity_departed.clear();
         self.parity_order.clear();
         self.departed_bytes = 0;
@@ -640,10 +834,8 @@ impl TransmissionLedger {
             // that overtakes a real datagram on a jittery path would make the
             // real one look like a hole.
             let is_pad = matches!(rec.tx.content, Content::Pad(_));
-            if let (Some(idx), Some(_), false) = (rec.tx.dep_idx, rec.departed, is_pad) {
-                if self.largest_acked.is_none_or(|l| idx > l) {
-                    self.largest_acked = Some(idx);
-                }
+            if let (Some(idx), Some(at), false) = (rec.tx.dep_idx, rec.departed, is_pad) {
+                self.advance_largest_acked(idx, at, ack.map(|a| a.0));
             }
             self.leave(&rec);
             return Some(Resolution::Live(rec.tx));
@@ -654,20 +846,63 @@ impl TransmissionLedger {
             let tx = t.tx;
             // An acknowledgement of a departure newer than any acknowledged so
             // far moves the reference the thresholds are judged against.
-            if let (Some(idx), Some(_), false) = (
+            let is_pad = matches!(tx.content, Content::Pad(_));
+            // How far the newest acknowledged departure was past this one when
+            // the verdict was issued, in departures and in departure time.
+            let (disp, extent) = match (
+                t.largest_idx_at_verdict,
                 tx.dep_idx,
+                t.largest_at_at_verdict,
                 t.departed,
-                matches!(tx.content, Content::Pad(_)),
             ) {
-                if self.largest_acked.is_none_or(|l| idx > l) {
-                    self.largest_acked = Some(idx);
+                (Some(l), Some(i), Some(la), Some(d)) => {
+                    (l.saturating_sub(i), la.saturating_duration_since(d))
                 }
+                _ => (0, Duration::ZERO),
+            };
+            // And how long after the acknowledgement that overtook it this one
+            // came (includes the client's acknowledgement batching).
+            let lag = match (ack, t.largest_arrival_at_verdict) {
+                (Some((now, _)), Some(a)) => now.saturating_duration_since(a),
+                _ => Duration::ZERO,
+            };
+            // No acknowledgement advanced the reference since the verdict, and
+            // the late one came a time threshold after the one that overtook
+            // it: a stalled ack path, not reordering.
+            let stalled = self.largest_acked == t.largest_idx_at_verdict
+                && self
+                    .last_time_threshold
+                    .is_some_and(|thr| !thr.is_zero() && lag >= thr);
+            if let (Some(idx), Some(at), false) = (tx.dep_idx, t.departed, is_pad) {
+                self.advance_largest_acked(idx, at, ack.map(|a| a.0));
             }
             let fec_possible = self.fec_possible(wire_seq, ack);
             if fec_possible {
                 self.stats.late_acks_fec_possible += 1;
-            } else if let Some(n) = t.packet_verdict_no {
-                self.note_spurious(n);
+            } else {
+                self.stats.spurious_disp_max = self.stats.spurious_disp_max.max(disp);
+                self.stats.spurious_gap_us_max = self
+                    .stats
+                    .spurious_gap_us_max
+                    .max(extent.as_micros() as u64);
+                // A zero `min_rtt` is none known: nothing to size a step by.
+                let min_rtt = ack.map(|a| a.1);
+                let known = min_rtt.is_none_or(|m| !m.is_zero());
+                if !is_pad && t.reason != LossReason::Pto && known {
+                    if stalled {
+                        self.stats.reo_stall_skips += 1;
+                    } else {
+                        if t.reason == LossReason::Packet {
+                            self.stats.reo_learned_packet += 1;
+                        } else {
+                            self.stats.reo_learned_time += 1;
+                        }
+                        self.learn_reordering(ack.map(|a| a.0), min_rtt, extent.max(lag), disp);
+                    }
+                }
+                if let Some(n) = t.packet_verdict_no {
+                    self.note_spurious(n);
+                }
             }
             return Some(Resolution::Late { tx, fec_possible });
         }
@@ -703,9 +938,17 @@ impl TransmissionLedger {
         time_threshold: std::time::Duration,
     ) -> Vec<(u32, Transmission, LossReason)> {
         let mut lost = Vec::new();
+        self.last_time_threshold = Some(time_threshold);
         let Some(largest_idx) = self.largest_acked else {
             return lost;
         };
+        let largest_at = self.largest_acked_at;
+        // At use, not when learned: `min_rtt` is a lifetime minimum, so a
+        // window learned on a slow path must not outlive a move to a fast one.
+        let reo = self.reo_wnd.min(time_threshold / 2);
+        let quiet = self
+            .largest_acked_arrival
+            .is_none_or(|a| now.saturating_duration_since(a) >= reo);
         // Walk the departure order. A record that is not yet lost normally ends
         // the walk (everything behind it departed later, so cannot be lost if
         // it is not). A *patient* one (probe material that departed inside a
@@ -746,9 +989,33 @@ impl TransmissionLedger {
             } else {
                 time_threshold
             };
-            let reason = if idx + self.k_pkt <= largest_idx {
+            // RFC 8985: the newest acknowledged departure must have left
+            // `reo_wnd` after this one. Inside the window (one burst shares a
+            // stamp) the count rule stays, as deep as displacement was seen.
+            let inside = !reo.is_zero()
+                && largest_at.is_none_or(|la| la.saturating_duration_since(at) < reo);
+            // The count rule at the learned depth, or at the ordinary one once
+            // the stream of later departures has been quiet for `reo_wnd`: a
+            // straggler of a reordered burst has arrived by then.
+            let branch = if !inside {
+                (idx + self.k_pkt <= largest_idx).then_some(ReoBranch::Open)
+            } else if idx.saturating_add(self.k_pkt.max(self.reo_depth)) <= largest_idx {
+                Some(ReoBranch::Depth)
+            } else if idx + self.k_pkt <= largest_idx && quiet {
+                Some(ReoBranch::Quiet)
+            } else {
+                None
+            };
+            let reason = if let Some(b) = branch {
+                match b {
+                    ReoBranch::Depth => self.stats.reo_judged_depth += 1,
+                    ReoBranch::Quiet => self.stats.reo_judged_quiet += 1,
+                    ReoBranch::Open => {}
+                }
+                #[cfg(any(test, feature = "test-loss-injection"))]
+                self.verdict_branches.push((ws, b));
                 LossReason::Packet
-            } else if at + threshold <= now {
+            } else if at + threshold + reo <= now {
                 LossReason::Time
             } else if patient && stepped < PATIENT_SCAN_LIMIT {
                 stepped += 1;
@@ -763,6 +1030,30 @@ impl TransmissionLedger {
                 i += 1;
             }
             self.declare_lost(ws, reason, &mut lost);
+        }
+        if !self.reo_wnd.is_zero() {
+            // A loss episode on a path that has been quiet of late
+            // acknowledgements is one loss recovery (RFC 8985 section 6.2).
+            // Verdicts on departures before the previous episode's recovery
+            // point belong to that recovery: one burst is one episode however
+            // many event-loop turns it takes to judge.
+            let past = lost
+                .iter()
+                .filter_map(|(_, tx, _)| tx.dep_idx)
+                .any(|i| i >= self.reo_recovery_point);
+            let quiet = self.last_spurious_ack.is_none_or(|t| {
+                now.saturating_duration_since(t) >= REO_QUIET_SPAN.max(time_threshold * 2)
+            });
+            if past && quiet {
+                self.reo_recoveries += 1;
+                self.reo_recovery_point = self.next_dep_idx;
+                if self.reo_recoveries >= REO_PERSIST {
+                    self.reo_wnd = Duration::ZERO;
+                    self.reo_depth = 0;
+                    self.reo_recoveries = 0;
+                    self.last_reo_raise = None;
+                }
+            }
         }
         self.compact_if_sparse();
         lost
@@ -785,7 +1076,9 @@ impl TransmissionLedger {
     /// departures is found at about 9/8 of a round trip and not at the probe
     /// timeout. Drops resolved entries at the front to find out.
     pub fn next_loss_time(&mut self, time_threshold: std::time::Duration) -> Option<Instant> {
+        self.last_time_threshold = Some(time_threshold);
         let largest_idx = self.largest_acked?;
+        let reo = self.reo_wnd.min(time_threshold / 2);
         let mut best: Option<Instant> = None;
         let mut i = 0usize;
         let mut stepped = 0usize;
@@ -810,7 +1103,16 @@ impl TransmissionLedger {
                     } else {
                         time_threshold
                     };
-                    let due = at + threshold;
+                    // The count rule's `reo_wnd` hold ends at the time rule's
+                    // deadline at the latest, which carries `reo_wnd` too.
+                    let mut due = at + threshold + reo;
+                    // Held back by the window but past the count: the stream
+                    // of later departures going quiet ends the wait.
+                    if idx + self.k_pkt <= largest_idx {
+                        if let (false, Some(a)) = (reo.is_zero(), self.largest_acked_arrival) {
+                            due = due.min(a + reo);
+                        }
+                    }
                     best = Some(best.map_or(due, |b| b.min(due)));
                     // An ordinary record ends the walk; a patient one is
                     // stepped over, as `detect_losses_at` does.
@@ -982,6 +1284,10 @@ impl TransmissionLedger {
             Tombstone {
                 tx,
                 packet_verdict_no,
+                reason,
+                largest_idx_at_verdict: self.largest_acked,
+                largest_at_at_verdict: self.largest_acked_at,
+                largest_arrival_at_verdict: self.largest_acked_arrival,
                 departed: rec.departed,
                 rate: rec.rate,
             },
@@ -1366,6 +1672,9 @@ mod tests {
         assert_eq!(quiet.k_pkt(), 3);
 
         let mut l = TransmissionLedger::new(8192);
+        // This is about the count threshold alone: the departure-gap window
+        // would hold these single-stamp windows back.
+        l.freeze_reo_wnd();
         let mut seen = vec![l.k_pkt()];
         let mut base = 0;
         for _ in 0..12 {
@@ -1580,6 +1889,7 @@ mod tests {
     fn a_new_session_starts_with_an_empty_ledger_and_the_initial_threshold() {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(8192);
+        l.freeze_reo_wnd();
         let mut base = 0;
         for _ in 0..4 {
             window(&mut l, t0, base, 15);
@@ -1929,5 +2239,448 @@ mod tests {
         assert_eq!((m.pkt_num, at), (2, t0));
         assert!(matches!(l.resolve(2), Some(Resolution::Late { .. })));
         assert!(l.rate_mark(2).is_none(), "taken with the tombstone");
+    }
+
+    // ---- the reordering window (RFC 8985 section 6.2) ----
+
+    /// `n` datagrams from `first`, all stamped `at` (one drain turn).
+    fn burst(l: &mut TransmissionLedger, first: u32, n: u32, at: Instant) {
+        for ws in first..first + n {
+            send(l, ws, at);
+        }
+    }
+
+    fn ack(l: &mut TransmissionLedger, ws: u32, now: Instant) {
+        assert!(l.resolve_at(ws, Some((now, RTT))).is_some());
+    }
+
+    /// A ledger that has seen one burst deep-reordered: `0..10` left together,
+    /// `9` arrived first (so 0..=6 were judged lost) and `0` arrived late.
+    /// Returns it with `reo_wnd` raised.
+    fn learned(t0: Instant) -> TransmissionLedger {
+        let mut l = TransmissionLedger::new(256);
+        burst(&mut l, 0, 10, t0);
+        ack(&mut l, 9, t0 + 40 * MS);
+        assert_eq!(l.detect_losses_at(t0 + 40 * MS, FAR).len(), 7);
+        assert_eq!(l.reo_wnd(), Duration::ZERO, "premise: not yet learned");
+        ack(&mut l, 0, t0 + 44 * MS);
+        // 7 and 8 were never judged; they arrive.
+        ack(&mut l, 7, t0 + 45 * MS);
+        ack(&mut l, 8, t0 + 45 * MS);
+        l
+    }
+
+    #[test]
+    fn the_window_is_learned_from_a_contradicted_verdict_and_bounded() {
+        let t0 = Instant::now();
+        let l = learned(t0);
+        // min_rtt / 8 on a zero measured gap (one stamp for the whole burst).
+        assert_eq!(l.reo_wnd(), RTT / 8);
+        assert_eq!(l.stats().reo_wnd_raises, 1);
+        assert_eq!(l.stats().spurious_disp_max, 9);
+        // A gap far past the ceiling does not open the window at once: one
+        // step per round trip, up to min_rtt / 2. Four early departures, each
+        // judged by count against a much later one.
+        let mut l = TransmissionLedger::new(64);
+        for i in 0..4u32 {
+            send(&mut l, i, t0 + 500 * MS * i);
+        }
+        burst(&mut l, 4, 3, t0 + 2000 * MS);
+        ack(&mut l, 6, t0 + 2040 * MS);
+        assert_eq!(l.detect_losses_at(t0 + 2040 * MS, FAR).len(), 4);
+        let s0 = t0 + 2100 * MS;
+        ack(&mut l, 0, s0);
+        assert_eq!(l.reo_wnd(), RTT / 8, "one outlier is one step");
+        assert_eq!(l.stats().spurious_gap_us_max, 2_000_000);
+        // Same round trip: no second step.
+        ack(&mut l, 1, s0 + 10 * MS);
+        assert_eq!(l.reo_wnd(), RTT / 8);
+        // A round trip later the next contradicted verdict steps again.
+        ack(&mut l, 2, s0 + 50 * MS);
+        assert_eq!(l.reo_wnd(), RTT / 4);
+        ack(&mut l, 3, s0 + 100 * MS);
+        assert_eq!(l.reo_wnd(), RTT / 8 * 3);
+    }
+
+    #[test]
+    fn a_probe_timeout_verdict_followed_by_a_late_ack_leaves_the_window_closed() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        burst(&mut l, 0, 3, t0);
+        assert!(l.declare_lost_by_pto(0).is_some());
+        ack(&mut l, 0, t0 + 300 * MS);
+        assert_eq!(l.stats().spurious_losses, 1, "premise: a late ack");
+        assert_eq!(l.reo_wnd(), Duration::ZERO);
+        assert_eq!(l.stats().reo_wnd_raises, 0);
+    }
+
+    #[test]
+    fn inside_the_window_the_count_rule_stays_at_the_depth_the_path_showed() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(256);
+        // A burst of six, the last acknowledged first: 0..=2 judged by count,
+        // then 0 arrives. Displacement 5, so depth 6.
+        burst(&mut l, 0, 6, t0);
+        ack(&mut l, 5, t0 + 40 * MS);
+        assert_eq!(l.detect_losses_at(t0 + 40 * MS, FAR).len(), 3);
+        ack(&mut l, 0, t0 + 44 * MS);
+        ack(&mut l, 3, t0 + 45 * MS);
+        ack(&mut l, 4, t0 + 45 * MS);
+        assert!(l.reo_wnd() > Duration::ZERO);
+        // Another burst of ten, one stamp, ws 10 truly lost: judged when 6
+        // later departures of its own burst are acknowledged, not 3 and not
+        // only when the next burst comes.
+        let b = t0 + 100 * MS;
+        burst(&mut l, 10, 10, b);
+        for ws in 11..=15 {
+            ack(&mut l, ws, b + 40 * MS);
+        }
+        assert!(
+            l.detect_losses_at(b + 40 * MS, FAR).is_empty(),
+            "five behind is inside the depth"
+        );
+        ack(&mut l, 16, b + 40 * MS);
+        assert_eq!(lost_ws(&l.detect_losses_at(b + 40 * MS, FAR)), vec![10]);
+    }
+
+    #[test]
+    fn one_loss_burst_judged_over_several_turns_is_one_episode() {
+        let t0 = Instant::now();
+        let mut l = learned(t0);
+        let thr = 100 * MS;
+        let at = t0 + Duration::from_secs(40);
+        // Five datagrams 2 ms apart (inside the window), then one that is
+        // acknowledged. The time rule finds them one turn at a time.
+        for i in 0..5u32 {
+            send(&mut l, 10 + i, at + 2 * MS * i);
+        }
+        send(&mut l, 15, at + 10 * MS);
+        ack(&mut l, 15, at + 50 * MS);
+        let mut judged = 0;
+        for i in 0..5u32 {
+            let now = at + thr + l.reo_wnd() + 2 * MS * i;
+            judged += l.detect_losses_at(now, thr).len();
+        }
+        assert_eq!(judged, 5, "premise: five verdicts over several turns");
+        assert_eq!(l.reo_recoveries, 1);
+        assert!(l.reo_wnd() > Duration::ZERO);
+        // A new loss on later departures is a second episode.
+        let at = t0 + Duration::from_secs(50);
+        send(&mut l, 20, at);
+        send(&mut l, 21, at + 30 * MS);
+        ack(&mut l, 21, at + 60 * MS);
+        assert_eq!(l.detect_losses_at(at + 200 * MS, thr).len(), 1);
+        assert_eq!(l.reo_recoveries, 2);
+    }
+
+    #[test]
+    fn a_reordered_burst_is_not_judged_lost_once_the_window_is_learned() {
+        let t0 = Instant::now();
+        let b = t0 + 100 * MS;
+        let mut l = learned(t0);
+        burst(&mut l, 10, 10, b);
+        ack(&mut l, 19, b + 40 * MS);
+        // 10..=16 are 3+ places behind 19 but left with it.
+        assert!(l.detect_losses_at(b + 40 * MS, FAR).is_empty());
+        // The same burst on a ledger that never learns: seven verdicts.
+        let mut m = TransmissionLedger::new(256);
+        m.freeze_reo_wnd();
+        let mut m = {
+            burst(&mut m, 0, 10, t0);
+            ack(&mut m, 9, t0 + 40 * MS);
+            m.detect_losses_at(t0 + 40 * MS, FAR);
+            ack(&mut m, 0, t0 + 44 * MS);
+            ack(&mut m, 7, t0 + 45 * MS);
+            ack(&mut m, 8, t0 + 45 * MS);
+            burst(&mut m, 10, 10, b);
+            ack(&mut m, 19, b + 40 * MS);
+            m
+        };
+        assert_eq!(m.reo_wnd(), Duration::ZERO);
+        assert_eq!(m.detect_losses_at(b + 40 * MS, FAR).len(), 7);
+    }
+
+    #[test]
+    fn a_real_loss_after_reordering_is_still_judged_by_the_next_burst_or_the_timer() {
+        let t0 = Instant::now();
+        let b = t0 + 100 * MS;
+        let thr = 45 * MS;
+        // Next burst 100 ms later acknowledges: gap >= reo_wnd, so the packet
+        // rule judges the whole of the first.
+        let mut l = learned(t0);
+        burst(&mut l, 10, 10, b);
+        ack(&mut l, 19, b + 40 * MS);
+        burst(&mut l, 20, 10, b + 100 * MS);
+        ack(&mut l, 29, b + 140 * MS);
+        let lost = l.detect_losses_at(b + 140 * MS, FAR);
+        assert!(lost.iter().all(|(_, _, r)| *r == LossReason::Packet));
+        // 20..=26 left with the acknowledged 29 and are held back.
+        assert_eq!(lost_ws(&lost), (10..=18).collect::<Vec<_>>());
+
+        // With nothing after it, the stream of later departures going quiet
+        // for `reo_wnd` judges it (the timer is armed for that).
+        let mut l = learned(t0);
+        burst(&mut l, 10, 10, b);
+        ack(&mut l, 19, b + 40 * MS);
+        let due = l
+            .next_loss_time(thr)
+            .expect("a held-back tail has a deadline");
+        assert_eq!(due, b + 40 * MS + l.reo_wnd());
+        assert!(l.detect_losses_at(due - MS, thr).is_empty());
+        let lost = l.detect_losses_at(due, thr);
+        // 17 and 18 are under `k_pkt` places behind 19: the clock's.
+        assert_eq!(lost_ws(&lost), (10..=16).collect::<Vec<_>>());
+        assert!(lost.iter().all(|(_, _, r)| *r == LossReason::Packet));
+    }
+
+    #[test]
+    fn a_tail_too_short_for_the_count_is_judged_by_the_clock_plus_the_window() {
+        let t0 = Instant::now();
+        let b = t0 + 100 * MS;
+        let thr = 45 * MS;
+        let mut l = learned(t0);
+        // Three datagrams of one burst, the last acknowledged: 10 and 11 are
+        // under `k_pkt` places behind it, so only the clock can judge them.
+        burst(&mut l, 10, 3, b);
+        ack(&mut l, 12, b + 40 * MS);
+        let due = l.next_loss_time(thr).expect("deadline");
+        assert_eq!(due, b + thr + l.reo_wnd());
+        assert!(l.detect_losses_at(due - MS, thr).is_empty());
+        let lost = l.detect_losses_at(due, thr);
+        assert_eq!(lost_ws(&lost), vec![10, 11]);
+        assert!(lost.iter().all(|(_, _, r)| *r == LossReason::Time));
+    }
+
+    #[test]
+    fn the_window_returns_to_zero_after_sixteen_quiet_loss_episodes() {
+        let t0 = Instant::now();
+        let mut l = learned(t0);
+        assert!(l.reo_wnd() > Duration::ZERO);
+        let thr = 100 * MS;
+        let mut ws = 10u32;
+        for n in 0..REO_PERSIST {
+            assert!(l.reo_wnd() > Duration::ZERO, "episode {n}");
+            // One datagram, then one far enough behind and later to clear
+            // the window and the count: a real loss, never acknowledged.
+            let at = t0 + Duration::from_secs(40 + n as u64);
+            send(&mut l, ws, at);
+            burst(&mut l, ws + 1, 4, at + 30 * MS);
+            ack(&mut l, ws + 4, at + 70 * MS);
+            let lost = l.detect_losses_at(at + 70 * MS, thr);
+            assert_eq!(lost_ws(&lost), vec![ws], "episode {n}");
+            for w in ws + 1..ws + 4 {
+                ack(&mut l, w, at + 71 * MS);
+            }
+            ws += 5;
+        }
+        assert_eq!(l.reo_wnd(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_late_acknowledgement_restarts_the_recovery_count() {
+        let t0 = Instant::now();
+        let mut l = learned(t0);
+        let thr = 100 * MS;
+        let mut ws = 10u32;
+        for n in 0..REO_PERSIST - 1 {
+            let at = t0 + Duration::from_secs(40 + n as u64);
+            send(&mut l, ws, at);
+            burst(&mut l, ws + 1, 4, at + 30 * MS);
+            ack(&mut l, ws + 4, at + 70 * MS);
+            assert_eq!(l.detect_losses_at(at + 70 * MS, thr).len(), 1);
+            for w in ws + 1..ws + 4 {
+                ack(&mut l, w, at + 71 * MS);
+            }
+            ws += 5;
+        }
+        // The last verdict is contradicted: 15 episodes do not count. (A newer
+        // datagram was acknowledged since: that is reordering, not a stall.)
+        send(&mut l, ws + 100, t0 + Duration::from_secs(59));
+        ack(&mut l, ws + 100, t0 + Duration::from_secs(59) + 40 * MS);
+        ack(&mut l, ws - 5, t0 + Duration::from_secs(60));
+        let at = t0 + Duration::from_secs(100);
+        send(&mut l, ws, at);
+        burst(&mut l, ws + 1, 4, at + 30 * MS);
+        ack(&mut l, ws + 4, at + 70 * MS);
+        assert_eq!(l.detect_losses_at(at + 70 * MS, thr).len(), 1);
+        assert!(l.reo_wnd() > Duration::ZERO, "one episode is not sixteen");
+    }
+
+    #[test]
+    fn a_new_session_forgets_the_window() {
+        let t0 = Instant::now();
+        let mut l = learned(t0);
+        assert!(l.reo_wnd() > Duration::ZERO, "premise");
+        l.reset_session();
+        assert_eq!(l.reo_wnd(), Duration::ZERO);
+        // Judged by the count alone again: 0 and 1 left with 4, 2 and 3 too.
+        burst(&mut l, 0, 5, t0);
+        ack(&mut l, 4, t0 + 40 * MS);
+        assert_eq!(l.detect_losses_at(t0 + 40 * MS, FAR).len(), 2);
+    }
+
+    #[test]
+    fn without_reordering_the_window_stays_zero_and_verdicts_are_unchanged() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        burst(&mut l, 0, 10, t0);
+        // 3 is lost on the wire; the rest arrive in order.
+        for ws in (0..10).filter(|w| *w != 3) {
+            ack(&mut l, ws, t0 + 40 * MS);
+        }
+        assert_eq!(lost_ws(&l.detect_losses_at(t0 + 40 * MS, FAR)), vec![3]);
+        assert_eq!(l.reo_wnd(), Duration::ZERO);
+        assert_eq!(l.stats().reo_wnd_raises, 0);
+        assert_eq!(l.next_loss_time(45 * MS), None);
+    }
+
+    #[test]
+    fn a_displacement_past_the_depth_limit_saturates_instead_of_switching_the_rule_off() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(512);
+        // A frame of 100 in one batch: the last resolves first, 0 comes back
+        // late. Displacement 99, past REO_DEPTH_MAX.
+        burst(&mut l, 0, 100, t0);
+        ack(&mut l, 99, t0 + 40 * MS);
+        assert_eq!(l.detect_losses_at(t0 + 40 * MS, FAR).len(), 97);
+        ack(&mut l, 0, t0 + 44 * MS);
+        ack(&mut l, 97, t0 + 45 * MS);
+        ack(&mut l, 98, t0 + 45 * MS);
+        assert_eq!(l.stats().spurious_disp_max, 99, "premise");
+        assert!(l.reo_wnd() > Duration::ZERO, "premise");
+        assert_eq!(l.stats().reo_depth, REO_DEPTH_MAX);
+        // Another frame: 200 truly lost; the datagrams after it are
+        // acknowledged. At the saturated depth that is a verdict once
+        // REO_DEPTH_MAX are behind it; with the rule off it would wait for the
+        // stream to go quiet or the next frame.
+        let b = t0 + 100 * MS;
+        burst(&mut l, 200, 100, b);
+        for ws in 201..=200 + REO_DEPTH_MAX as u32 - 1 {
+            ack(&mut l, ws, b + 40 * MS);
+        }
+        assert!(
+            l.detect_losses_at(b + 40 * MS, FAR).is_empty(),
+            "inside the depth"
+        );
+        ack(&mut l, 200 + REO_DEPTH_MAX as u32, b + 40 * MS);
+        assert_eq!(lost_ws(&l.detect_losses_at(b + 40 * MS, FAR)), vec![200]);
+        assert_eq!(l.stats().reo_judged_depth, 1);
+    }
+
+    #[test]
+    fn a_window_learned_on_a_slow_path_is_clamped_when_the_path_gets_fast() {
+        let t0 = Instant::now();
+        let slow = 400 * MS;
+        let mut l = TransmissionLedger::new(256);
+        burst(&mut l, 0, 10, t0);
+        l.resolve_at(9, Some((t0 + 40 * MS, slow)));
+        assert_eq!(l.detect_losses_at(t0 + 40 * MS, FAR).len(), 7);
+        l.resolve_at(0, Some((t0 + 44 * MS, slow)));
+        assert_eq!(l.reo_wnd(), 50 * MS, "premise: a 50 ms window");
+        for ws in [7, 8] {
+            l.resolve_at(ws, Some((t0 + 45 * MS, slow)));
+        }
+        // Now a 5 ms path (time threshold 6 ms): one datagram, the next
+        // acknowledged 10 ms later. The window may not exceed half the
+        // threshold, 3 ms.
+        let thr = 6 * MS;
+        let at = t0 + Duration::from_secs(10);
+        send(&mut l, 20, at);
+        send(&mut l, 21, at + 10 * MS);
+        l.resolve_at(21, Some((at + 11 * MS, 5 * MS)));
+        assert_eq!(l.next_loss_time(thr), Some(at + thr + thr / 2));
+        assert!(l
+            .detect_losses_at(at + 9 * MS - Duration::from_micros(1), thr)
+            .is_empty());
+        let lost = l.detect_losses_at(at + 9 * MS, thr);
+        assert_eq!(lost_ws(&lost), vec![20]);
+        assert_eq!(
+            l.reo_wnd(),
+            50 * MS,
+            "the learned value is kept, only use is clamped"
+        );
+    }
+
+    #[test]
+    fn a_late_ack_after_an_ack_path_stall_teaches_nothing() {
+        let t0 = Instant::now();
+        let thr = 45 * MS;
+        let mut l = TransmissionLedger::new(256);
+        burst(&mut l, 0, 10, t0);
+        ack(&mut l, 9, t0 + 40 * MS);
+        assert_eq!(l.detect_losses_at(t0 + 40 * MS, thr).len(), 7);
+        // The client stops acknowledging; 0 is acknowledged 200 ms later with
+        // nothing newer in between.
+        ack(&mut l, 0, t0 + 240 * MS);
+        assert_eq!(l.stats().spurious_losses, 1, "premise: a late ack");
+        assert_eq!(l.reo_wnd(), Duration::ZERO);
+        assert_eq!(l.stats().reo_wnd_raises, 0);
+        assert_eq!(l.stats().reo_stall_skips, 1);
+        // The same gap with a newer datagram acknowledged in between is
+        // reordering and teaches.
+        let mut l = TransmissionLedger::new(256);
+        burst(&mut l, 0, 10, t0);
+        ack(&mut l, 9, t0 + 40 * MS);
+        assert_eq!(l.detect_losses_at(t0 + 40 * MS, thr).len(), 7);
+        send(&mut l, 10, t0 + 100 * MS);
+        ack(&mut l, 10, t0 + 140 * MS);
+        ack(&mut l, 0, t0 + 240 * MS);
+        assert!(l.reo_wnd() > Duration::ZERO);
+        assert_eq!(l.stats().reo_stall_skips, 0);
+    }
+
+    #[test]
+    fn an_unknown_min_rtt_teaches_nothing() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(256);
+        burst(&mut l, 0, 10, t0);
+        l.resolve_at(9, Some((t0 + 40 * MS, Duration::ZERO)));
+        assert_eq!(l.detect_losses_at(t0 + 40 * MS, FAR).len(), 7);
+        l.resolve_at(0, Some((t0 + 44 * MS, Duration::ZERO)));
+        assert_eq!(l.stats().spurious_losses, 1, "premise: a late ack");
+        assert_eq!(l.reo_wnd(), Duration::ZERO);
+        assert_eq!(l.stats().reo_wnd_raises, 0);
+        assert_eq!(l.stats().reo_depth, 0);
+        assert_eq!(l.stats().reo_learned_packet, 0);
+    }
+
+    #[test]
+    fn loss_episodes_do_not_close_the_window_while_reordering_is_recent() {
+        // 20 loss episodes a second apart, the last contradicted verdict
+        // under 30 s ago: none is a quiet episode, so the window stays.
+        // (Without REO_QUIET_SPAN the two-threshold floor alone would count
+        // them and the 16th would close it.)
+        let t0 = Instant::now();
+        let mut l = learned(t0);
+        let thr = 100 * MS;
+        let mut ws = 10u32;
+        for n in 0..20u64 {
+            let at = t0 + Duration::from_secs(1 + n);
+            send(&mut l, ws, at);
+            burst(&mut l, ws + 1, 4, at + 30 * MS);
+            ack(&mut l, ws + 4, at + 70 * MS);
+            let lost = l.detect_losses_at(at + 70 * MS, thr);
+            assert_eq!(lost_ws(&lost), vec![ws], "episode {n}");
+            for w in ws + 1..ws + 4 {
+                ack(&mut l, w, at + 71 * MS);
+            }
+            ws += 5;
+        }
+        assert!(l.reo_wnd() > Duration::ZERO);
+        assert_eq!(l.reo_recoveries, 0);
+    }
+
+    #[test]
+    fn a_fec_recovery_does_not_open_the_window() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        send_group(&mut l, 0, t0, t0 + 2 * MS);
+        for ws in 1..10 {
+            ack(&mut l, ws, t0 + 40 * MS);
+        }
+        let _ = l.detect_losses_at(t0 + 40 * MS, FAR);
+        // 0 comes back a round trip after its parity left: a recovery.
+        assert!(late(&mut l, 0, t0 + 2 * MS + RTT));
+        assert_eq!(l.reo_wnd(), Duration::ZERO);
     }
 }

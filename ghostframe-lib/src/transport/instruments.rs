@@ -622,6 +622,20 @@ pub struct InstrumentSummary {
     pub ledger_spurious_losses: u64,
     pub k_pkt: u64,
     pub k_pkt_raises: u64,
+    /// The reordering window now (microseconds), its raises, and the largest
+    /// departure gap (microseconds) and count a contradicted verdict showed.
+    pub reo_wnd_us: u64,
+    pub reo_wnd_raises: u64,
+    pub reo_learned_packet: u64,
+    pub reo_learned_time: u64,
+    pub spurious_gap_us_max: u64,
+    pub spurious_disp_max: u64,
+    /// The in-window count depth, stall-skipped late acks, and packet verdicts
+    /// judged inside the window by depth and by quiet.
+    pub reo_depth: u64,
+    pub reo_stall_skips: u64,
+    pub reo_judged_depth: u64,
+    pub reo_judged_quiet: u64,
     pub loss_retx_requested: u64,
     pub nack_miss_pending: u64,
     pub nack_miss_not_owed: u64,
