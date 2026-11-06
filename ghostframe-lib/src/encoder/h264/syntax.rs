@@ -9,8 +9,10 @@
 //! `AuMeta` check) feeds parsed headers to [`DecoderModel`] and compares the
 //! effective reference with the plan's.
 //!
-//! Scope: frame coding (no fields, no MBAFF), P and I slices, POC type 0, no
-//! weighted prediction, one slice per picture's header of interest.
+//! Scope: frame coding (no fields, no MBAFF), P and I slices, POC type 0 or 2
+//! (the writer only writes type 0), no weighted prediction, one slice per
+//! picture's header of interest. [`StreamParams::from_sps_pps`] reads the
+//! stream parameters out of a real encoder's SPS and PPS.
 
 /// Stream parameters the header syntax depends on (SPS and PPS fields).
 ///
@@ -21,7 +23,10 @@
 pub(crate) struct StreamParams {
     /// `log2_max_frame_num_minus4 + 4`. Mesa forces 7 (MaxFrameNum 128).
     pub log2_max_frame_num: u32,
-    /// `log2_max_pic_order_cnt_lsb_minus4 + 4`.
+    /// `pic_order_cnt_type`: 0, or 2 (output order is decode order, no
+    /// `pic_order_cnt_lsb` in the slice header). Only 0 can be written.
+    pub poc_type: u8,
+    /// `log2_max_pic_order_cnt_lsb_minus4 + 4`; unused for type 2.
     pub log2_max_poc_lsb: u32,
     pub max_num_ref_frames: u32,
     pub gaps_in_frame_num_allowed: bool,
@@ -46,6 +51,7 @@ impl StreamParams {
     pub(crate) fn writer() -> Self {
         Self {
             log2_max_frame_num: 7,
+            poc_type: 0,
             log2_max_poc_lsb: 16,
             max_num_ref_frames: 4,
             gaps_in_frame_num_allowed: true,
@@ -372,6 +378,10 @@ pub(crate) fn write_slice_header(params: &StreamParams, h: &SliceHeader) -> Head
         !params.unsupported_flag(),
         "PPS flags that add slice-header syntax are not supported"
     );
+    assert!(
+        params.poc_type == 0,
+        "the slice-header writer writes POC type 0 only"
+    );
     let mut w = BitWriter::default();
     w.put_ue(h.first_mb_in_slice);
     w.put_ue(match h.slice_type {
@@ -513,7 +523,11 @@ pub(crate) fn parse_slice_header(
     let pps_id = r.ue()?;
     let frame_num = r.bits(params.log2_max_frame_num)? as u32;
     let idr_pic_id = if idr { r.ue()? } else { 0 };
-    let poc_lsb = r.bits(params.log2_max_poc_lsb)? as u32;
+    let poc_lsb = if params.poc_type == 0 {
+        r.bits(params.log2_max_poc_lsb)? as u32
+    } else {
+        0
+    };
     let mut num_ref_idx_override = None;
     let mut rplm = Vec::new();
     if slice_type == SliceType::P {
@@ -630,6 +644,234 @@ pub(crate) fn parse_access_unit(
     Err(ParseError::NotASlice)
 }
 
+// ------------------------------------------------------- SPS / PPS parsing
+
+/// The SPS fields the slice-header syntax and the DPB model depend on, plus
+/// what a test or a log line wants to know about the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Sps {
+    pub profile_idc: u8,
+    pub level_idc: u8,
+    pub sps_id: u32,
+    pub log2_max_frame_num: u32,
+    pub poc_type: u8,
+    /// Meaningful for POC type 0 only (4 + `log2_max_pic_order_cnt_lsb_minus4`
+    /// is parsed regardless of the type it applies to; 0 for type 2).
+    pub log2_max_poc_lsb: u32,
+    pub max_num_ref_frames: u32,
+    pub gaps_in_frame_num_allowed: bool,
+    /// Visible size, after cropping.
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The PPS fields the slice-header syntax depends on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Pps {
+    pub pps_id: u32,
+    pub sps_id: u32,
+    pub cabac: bool,
+    pub bottom_field_pic_order_in_frame_present: bool,
+    pub num_ref_idx_l0_default: u32,
+    pub weighted_pred: bool,
+    pub deblocking_control_present: bool,
+    pub redundant_pic_cnt_present: bool,
+}
+
+pub(crate) const NAL_SPS: u8 = 7;
+pub(crate) const NAL_PPS: u8 = 8;
+
+/// Skip one `scaling_list()` of `size` entries (7.3.2.1.1.1).
+fn skip_scaling_list(r: &mut BitReader<'_>, size: usize) -> Result<(), ParseError> {
+    let (mut last, mut next) = (8i32, 8i32);
+    for _ in 0..size {
+        if next != 0 {
+            next = (last + r.se()? + 256).rem_euclid(256);
+        }
+        if next != 0 {
+            last = next;
+        }
+    }
+    Ok(())
+}
+
+/// Parse an SPS NAL unit (header byte, escaped RBSP, no start code).
+pub(crate) fn parse_sps(nal: &[u8]) -> Result<Sps, ParseError> {
+    match nal.first() {
+        None => return Err(ParseError::Truncated),
+        Some(b) if b & 0x1f != NAL_SPS => return Err(ParseError::Unsupported("not an SPS")),
+        Some(_) => {}
+    }
+    let rbsp = unescape_nal(&nal[1..]);
+    let mut r = BitReader {
+        bytes: &rbsp,
+        pos: 0,
+    };
+    let profile_idc = r.bits(8)? as u8;
+    r.bits(8)?; // constraint flags and reserved bits
+    let level_idc = r.bits(8)? as u8;
+    let sps_id = r.ue()?;
+    let mut chroma_format_idc = 1;
+    if matches!(
+        profile_idc,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    ) {
+        chroma_format_idc = r.ue()?;
+        if chroma_format_idc == 3 && r.bit()? {
+            return Err(ParseError::Unsupported("separate colour planes"));
+        }
+        r.ue()?; // bit_depth_luma_minus8
+        r.ue()?; // bit_depth_chroma_minus8
+        r.bit()?; // qpprime_y_zero_transform_bypass_flag
+        if r.bit()? {
+            let lists = if chroma_format_idc == 3 { 12 } else { 8 };
+            for i in 0..lists {
+                if r.bit()? {
+                    skip_scaling_list(&mut r, if i < 6 { 16 } else { 64 })?;
+                }
+            }
+        }
+    }
+    if chroma_format_idc != 1 {
+        return Err(ParseError::Unsupported("chroma format other than 4:2:0"));
+    }
+    let log2_max_frame_num = r
+        .ue()?
+        .checked_add(4)
+        .filter(|&n| n <= 16)
+        .ok_or(ParseError::Unsupported("log2_max_frame_num_minus4"))?;
+    let poc_type = match r.ue()? {
+        0 => 0,
+        2 => 2,
+        _ => return Err(ParseError::Unsupported("pic_order_cnt_type")),
+    };
+    let mut log2_max_poc_lsb = 0;
+    if poc_type == 0 {
+        log2_max_poc_lsb = r
+            .ue()?
+            .checked_add(4)
+            .filter(|&n| n <= 16)
+            .ok_or(ParseError::Unsupported("log2_max_pic_order_cnt_lsb_minus4"))?;
+    }
+    let max_num_ref_frames = r.ue()?;
+    let gaps_in_frame_num_allowed = r.bit()?;
+    let mb_w = r.ue()?.saturating_add(1);
+    let map_units_h = r.ue()?.saturating_add(1);
+    if !r.bit()? {
+        return Err(ParseError::Unsupported("interlaced coding"));
+    }
+    r.bit()?; // direct_8x8_inference_flag
+    let (mut left, mut right, mut top, mut bottom) = (0u32, 0u32, 0u32, 0u32);
+    if r.bit()? {
+        left = r.ue()?;
+        right = r.ue()?;
+        top = r.ue()?;
+        bottom = r.ue()?;
+    }
+    // 4:2:0, frame_mbs_only: the crop unit is two luma samples both ways.
+    let crop = |lo: u32, hi: u32, total: u32| {
+        lo.checked_add(hi)
+            .and_then(|c| c.checked_mul(2))
+            .and_then(|c| total.checked_sub(c))
+            .ok_or(ParseError::Unsupported(
+                "frame cropping larger than the picture",
+            ))
+    };
+    let width = crop(left, right, mb_w.saturating_mul(16))?;
+    let height = crop(top, bottom, map_units_h.saturating_mul(16))?;
+    Ok(Sps {
+        profile_idc,
+        level_idc,
+        sps_id,
+        log2_max_frame_num,
+        poc_type,
+        log2_max_poc_lsb,
+        max_num_ref_frames,
+        gaps_in_frame_num_allowed,
+        width,
+        height,
+    })
+}
+
+/// Parse a PPS NAL unit (header byte, escaped RBSP, no start code).
+pub(crate) fn parse_pps(nal: &[u8]) -> Result<Pps, ParseError> {
+    match nal.first() {
+        None => return Err(ParseError::Truncated),
+        Some(b) if b & 0x1f != NAL_PPS => return Err(ParseError::Unsupported("not a PPS")),
+        Some(_) => {}
+    }
+    let rbsp = unescape_nal(&nal[1..]);
+    let mut r = BitReader {
+        bytes: &rbsp,
+        pos: 0,
+    };
+    let pps_id = r.ue()?;
+    let sps_id = r.ue()?;
+    let cabac = r.bit()?;
+    let bottom_field_pic_order_in_frame_present = r.bit()?;
+    if r.ue()? != 0 {
+        return Err(ParseError::Unsupported("slice groups"));
+    }
+    let num_ref_idx_l0_default = r
+        .ue()?
+        .checked_add(1)
+        .ok_or(ParseError::Unsupported("num_ref_idx_l0_default_active"))?;
+    r.ue()?; // num_ref_idx_l1_default_active_minus1
+    let weighted_pred = r.bit()?;
+    r.bits(2)?; // weighted_bipred_idc
+    r.se()?; // pic_init_qp_minus26
+    r.se()?; // pic_init_qs_minus26
+    r.se()?; // chroma_qp_index_offset
+    let deblocking_control_present = r.bit()?;
+    r.bit()?; // constrained_intra_pred_flag
+    let redundant_pic_cnt_present = r.bit()?;
+    Ok(Pps {
+        pps_id,
+        sps_id,
+        cabac,
+        bottom_field_pic_order_in_frame_present,
+        num_ref_idx_l0_default,
+        weighted_pred,
+        deblocking_control_present,
+        redundant_pic_cnt_present,
+    })
+}
+
+impl StreamParams {
+    /// The slice-header parameters a decoder derives from an SPS and a PPS
+    /// NAL unit (header byte, escaped RBSP, no start code). The two must
+    /// belong together (`seq_parameter_set_id`).
+    pub(crate) fn from_sps_pps(sps: &[u8], pps: &[u8]) -> Result<Self, ParseError> {
+        let (sps, pps) = (parse_sps(sps)?, parse_pps(pps)?);
+        if pps.sps_id != sps.sps_id {
+            return Err(ParseError::Unsupported("the PPS names another SPS"));
+        }
+        Ok(Self {
+            log2_max_frame_num: sps.log2_max_frame_num,
+            poc_type: sps.poc_type,
+            log2_max_poc_lsb: sps.log2_max_poc_lsb,
+            max_num_ref_frames: sps.max_num_ref_frames,
+            gaps_in_frame_num_allowed: sps.gaps_in_frame_num_allowed,
+            num_ref_idx_l0_default: pps.num_ref_idx_l0_default,
+            cabac: pps.cabac,
+            deblocking_control_present: pps.deblocking_control_present,
+            bottom_field_pic_order_in_frame_present: pps.bottom_field_pic_order_in_frame_present,
+            redundant_pic_cnt_present: pps.redundant_pic_cnt_present,
+            weighted_pred: pps.weighted_pred,
+        })
+    }
+
+    /// The same, from the first SPS and PPS in an Annex-B access unit.
+    pub(crate) fn from_annexb(annexb: &[u8]) -> Result<Self, ParseError> {
+        let nals = split_annexb(annexb);
+        let find = |t: u8| nals.iter().find(|n| n[0] & 0x1f == t).copied();
+        Self::from_sps_pps(
+            find(NAL_SPS).ok_or(ParseError::Unsupported("no SPS in the access unit"))?,
+            find(NAL_PPS).ok_or(ParseError::Unsupported("no PPS in the access unit"))?,
+        )
+    }
+}
+
 // ------------------------------------------------- effective-reference model
 
 /// What a reference slot holds, as a decoder knows it.
@@ -729,6 +971,8 @@ pub(crate) struct DecoderModel {
     gap_mode: GapMode,
     prev_poc_msb: i64,
     prev_poc_lsb: u32,
+    /// `FrameNumOffset` of the previous picture (POC type 2).
+    prev_frame_num_offset: i64,
     /// MaxLongTermFrameIdx + 1; 0 is "no long-term frame indices".
     max_lt_idx_plus1: u32,
 }
@@ -743,6 +987,7 @@ impl DecoderModel {
             gap_mode: GapMode::Spec,
             prev_poc_msb: 0,
             prev_poc_lsb: 0,
+            prev_frame_num_offset: 0,
             max_lt_idx_plus1: 0,
         }
     }
@@ -825,6 +1070,7 @@ impl DecoderModel {
             self.prev_pic_frame_num = 0;
             self.prev_poc_msb = 0;
             self.prev_poc_lsb = 0;
+            self.prev_frame_num_offset = 0;
         } else {
             let mut base = if lavc {
                 self.prev_pic_frame_num
@@ -859,7 +1105,7 @@ impl DecoderModel {
             }
         }
 
-        // POC type 0 (8.2.1.1).
+        // POC type 0 (8.2.1.1) or type 2 (8.2.1.3).
         let lsb = i64::from(h.poc_lsb);
         let prev_lsb = i64::from(self.prev_poc_lsb);
         let msb = if lsb < prev_lsb && prev_lsb - lsb >= max_lsb / 2 {
@@ -869,7 +1115,22 @@ impl DecoderModel {
         } else {
             self.prev_poc_msb
         };
-        let poc = msb + lsb;
+        let mut frame_num_offset = self.prev_frame_num_offset;
+        let poc = if self.params.poc_type == 2 {
+            if h.idr {
+                frame_num_offset = 0;
+            } else if self.prev_pic_frame_num > h.frame_num {
+                frame_num_offset += i64::from(max_fn);
+            }
+            let temp = 2 * (frame_num_offset + i64::from(h.frame_num));
+            if h.nal_ref_idc == 0 {
+                temp - 1
+            } else {
+                temp
+            }
+        } else {
+            msb + lsb
+        };
 
         // Reference list for P slices (8.2.4).
         let cur = h.frame_num;
@@ -1034,6 +1295,7 @@ impl DecoderModel {
         if !h.idr {
             self.prev_pic_frame_num = cur_frame_num;
         }
+        self.prev_frame_num_offset = if v.mmco5 { 0 } else { frame_num_offset };
         if h.nal_ref_idc != 0 {
             self.prev_ref_frame_num = cur_frame_num;
             self.prev_poc_msb = msb;
