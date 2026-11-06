@@ -1671,3 +1671,59 @@ fn a_slow_idr_survives_more_than_a_ring_of_frame_sequence_numbers() {
     assert!(st.anchors_confirmed > 0);
     assert!(sim.mgr.is_healthy());
 }
+
+/// `FramePlan::wire_info` names the picture a mark lands on: the frame
+/// (MMCO 6, `MARK_LT`) or the frame it predicts from (MMCO 3, `MARK_TARGET`).
+#[test]
+fn wire_info_flags_a_target_mark_apart_from_a_carrier_mark() {
+    use ghostframe_protocol::protocol::{
+        FRAME_FLAG_MARK_LT, FRAME_FLAG_MARK_TARGET, FRAME_FLAG_TARGET_IS_LT,
+    };
+    let plan = FramePlan {
+        epoch: 1,
+        frame_seq: 9,
+        kind: PicKind::Healthy,
+        idr_cause: None,
+        nal_ref_idc: 2,
+        frame_num: 5,
+        poc: 10,
+        target: Some(RefTarget::Short {
+            seq: 8,
+            frame_num: 4,
+        }),
+        mark: Some(1),
+        mark_target: false,
+        mmco: Vec::new(),
+        rplm: Vec::new(),
+    };
+    let carrier = plan.wire_info(None);
+    assert_eq!(carrier.flags, FRAME_FLAG_MARK_LT);
+    assert_eq!((carrier.slots, carrier.ref_frame_seq), (1, 8));
+
+    let target = FramePlan {
+        mark_target: true,
+        ..plan.clone()
+    }
+    .wire_info(None);
+    assert_eq!(target.flags, FRAME_FLAG_MARK_TARGET);
+    assert_eq!((target.slots, target.ref_frame_seq), (1, 8));
+
+    // No mark, no bit, whatever `mark_target` says.
+    let none = FramePlan {
+        mark: None,
+        mark_target: true,
+        ..plan.clone()
+    }
+    .wire_info(None);
+    assert_eq!(none.flags, 0);
+
+    // It travels with a long-term target flag unchanged.
+    let lt = FramePlan {
+        mark_target: true,
+        target: Some(RefTarget::Long { slot: 0, seq: 3 }),
+        ..plan
+    }
+    .wire_info(None);
+    assert_eq!(lt.flags, FRAME_FLAG_MARK_TARGET | FRAME_FLAG_TARGET_IS_LT);
+    assert_eq!(lt.slots, 1);
+}

@@ -508,8 +508,23 @@ pub const FRAME_FLAG_TARGET_IS_LT: u8 = 0x08;
 /// receiver acknowledges it (that is the measurement) and discards it without
 /// touching any frame assembly.
 pub const FRAME_FLAG_PAD: u8 = 0x10;
+/// Frame flag bit 5: the long-term mark in `slots` bits 0-1 applies to the
+/// short-term picture this frame predicts from (`ref_frame_seq`), not to this
+/// frame. An encoder that marks with MMCO 3 (openh264) makes the carrier's
+/// predecessor the long-term picture, where MMCO 6 (`FRAME_FLAG_MARK_LT`)
+/// marks the carrier. Set instead of `FRAME_FLAG_MARK_LT`, never with it (a
+/// receiver refuses the frame). A receiver ignores it on a frame that is
+/// non-reference or predicts from a long-term picture: neither can carry such
+/// a marking.
+pub const FRAME_FLAG_MARK_TARGET: u8 = 0x20;
 
 /// The per-frame reference description carried by every fragment of a frame.
+///
+/// `flags` holds the `FRAME_FLAG_*` bits. A long-term mark is either
+/// `FRAME_FLAG_MARK_LT` (this frame becomes the picture in slot
+/// `slots & 3`) or `FRAME_FLAG_MARK_TARGET` (the picture this frame predicts
+/// from, `ref_frame_seq`, becomes it); the slot index is in `slots` bits 0-1
+/// either way.
 ///
 /// Parity datagrams carry NO reference information: their `flags` hold only
 /// the idr bit, `slots` is 0 and `ref_frame_seq` is `REF_FRAME_NONE`. Read the

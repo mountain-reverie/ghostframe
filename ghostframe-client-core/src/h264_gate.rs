@@ -15,6 +15,11 @@
 //!   must contain `ref_frame_seq`; for a short-term target `ref_frame_seq`
 //!   must be a good frame and still the newest reference.
 //!
+//! A long-term mark (`slots` bits 0-1) lands on this frame
+//! (`FRAME_FLAG_MARK_LT`, MMCO 6) or, with `FRAME_FLAG_MARK_TARGET` (MMCO 3), on
+//! the short-term picture it predicts from; the latter only counts once the
+//! frame itself is fed.
+//!
 //! The header's `ref_frame_seq` is the sender's belief (filled from the
 //! encoder's DPB). Checking it against the client's own slot contents turns a
 //! server belief error into a refusal instead of silent drift.
@@ -40,8 +45,8 @@ use std::collections::VecDeque;
 
 use ghostframe_protocol::feedback_stream::ResetReason;
 use ghostframe_protocol::protocol::{
-    FrameAck, FrameHeader, FRAME_FLAG_MARK_LT, FRAME_FLAG_NON_REF, FRAME_FLAG_TARGET_IS_LT,
-    REF_FRAME_NONE,
+    FrameAck, FrameHeader, FRAME_FLAG_MARK_LT, FRAME_FLAG_MARK_TARGET, FRAME_FLAG_NON_REF,
+    FRAME_FLAG_TARGET_IS_LT, REF_FRAME_NONE,
 };
 
 /// Reset requests of one reason are at least this far apart: the server honours
@@ -96,7 +101,8 @@ pub enum RefuseCause {
     Stale,
     /// The reference it names is not one the client holds.
     NoReference,
-    /// A long-term slot index outside the two the stream has.
+    /// A long-term slot index outside the two the stream has, or a frame that
+    /// asks for both kinds of mark.
     BadSlot,
 }
 
@@ -207,7 +213,13 @@ impl H264Gate {
     /// Decide one completed access unit. Updates the gate on `Feed`.
     pub fn on_frame(&mut self, h: &FrameHeader, now_us: u64) -> Verdict {
         let seq = h.frame_seq;
-        if h.flags & (FRAME_FLAG_NON_REF | FRAME_FLAG_MARK_LT | FRAME_FLAG_TARGET_IS_LT) != 0 {
+        if h.flags
+            & (FRAME_FLAG_NON_REF
+                | FRAME_FLAG_MARK_LT
+                | FRAME_FLAG_MARK_TARGET
+                | FRAME_FLAG_TARGET_IS_LT)
+            != 0
+        {
             self.acked_ref_stream = true;
         }
         if self.last_fed.is_some_and(|l| !seq_after(seq, l)) {
@@ -230,7 +242,17 @@ impl H264Gate {
 
         let marks = h.flags & FRAME_FLAG_MARK_LT != 0 && h.flags & FRAME_FLAG_NON_REF == 0;
         let mark_slot = usize::from(h.slots & 0b11);
-        if marks && mark_slot >= LT_SLOTS {
+        // The mark names the picture this frame predicts from. Neither a
+        // non-reference frame nor one predicting from a long-term picture
+        // (the long-term picture is already marked; there is no short-term
+        // target) can carry it, so the bit means nothing there.
+        let marks_target = h.flags & FRAME_FLAG_MARK_TARGET != 0
+            && h.flags & (FRAME_FLAG_NON_REF | FRAME_FLAG_TARGET_IS_LT) == 0;
+        if (marks || marks_target) && mark_slot >= LT_SLOTS {
+            return self.refuse(RefuseCause::BadSlot, seq, now_us);
+        }
+        if marks && h.flags & FRAME_FLAG_MARK_TARGET != 0 {
+            // One slot cannot take two pictures.
             return self.refuse(RefuseCause::BadSlot, seq, now_us);
         }
         let held = if h.flags & FRAME_FLAG_TARGET_IS_LT != 0 {
@@ -259,6 +281,11 @@ impl H264Gate {
             if marks {
                 self.lt[mark_slot] = Some(seq);
             }
+        }
+        if marks_target && h.ref_frame_seq != REF_FRAME_NONE {
+            // Fed with a short-term target: `held` established that the
+            // target is the newest reference this client holds.
+            self.lt[mark_slot] = Some(h.ref_frame_seq);
         }
         self.refusing_since_us = None;
         Verdict::Feed {
