@@ -19,7 +19,7 @@ use super::backend::{
 use super::openh264::{nv12_to_i420, OpenH264Backend};
 use super::openh264_sys::{Lib, LOW_COMPLEXITY, MEDIUM_COMPLEXITY};
 use super::pcm_decoder::{PcmDecoder, Strictness};
-use super::refs::{FramePlan, IdrCause};
+use super::refs::{FramePlan, IdrCause, Intent};
 use super::syntax::{Mmco, SliceHeader};
 use super::tracker::PicKind;
 
@@ -135,6 +135,7 @@ fn plan(seq: u32, idr: bool) -> FramePlan {
         frame_num: 0,
         poc: 0,
         target: None,
+        intent: Intent::Executed,
         mark: None,
         mark_target: false,
         mmco: Vec::new(),

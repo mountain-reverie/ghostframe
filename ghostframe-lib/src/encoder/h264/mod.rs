@@ -21,7 +21,11 @@ pub(crate) mod va_sys;
 pub(crate) mod vaapi_direct;
 
 #[cfg(test)]
+mod observed_tests;
+#[cfg(test)]
 mod openh264_fixture_tests;
+#[cfg(test)]
+mod openh264_sim;
 #[cfg(test)]
 mod openh264_tests;
 #[cfg(any(test, feature = "browserless-harness"))]

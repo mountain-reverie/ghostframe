@@ -180,6 +180,7 @@ impl RefsState {
                 params: StreamParams::writer(),
                 frame_interval,
                 initial_srtt: srtt,
+                observed: false,
             }),
             dims: None,
             faults_without_anchor: 0,
@@ -281,6 +282,7 @@ fn bridge_idr_cause(c: Option<RefIdrCause>) -> IdrCause {
         // `idr_encoder_fault` says what it was.
         Some(RefIdrCause::EncoderFault) => IdrCause::Loss,
         Some(RefIdrCause::MtuShrink) => IdrCause::MtuShrink,
+        Some(RefIdrCause::BackendFallback) => IdrCause::BackendFallback,
         Some(RefIdrCause::SessionStart) | None => IdrCause::Session,
     }
 }

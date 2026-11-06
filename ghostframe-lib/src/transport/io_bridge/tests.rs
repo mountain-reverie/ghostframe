@@ -1080,6 +1080,7 @@ impl FrameBackend for RecordingBackend {
                     idr: req.plan.kind == crate::encoder::h264::tracker::PicKind::Idr,
                     header: Some(req.plan.slice_header(&StreamParams::writer())),
                     ref_seq: req.plan.ref_frame_seq(),
+                    params: None,
                 },
             })),
         }
@@ -8261,6 +8262,7 @@ fn h264_direct_worker_path_survives_a_loss_bit_exact() {
         params: StreamParams::writer(),
         frame_interval: step,
         initial_srtt: srtt,
+        observed: false,
     });
     let recv = |p: &mut FramePipeline| p.rx.blocking_recv().expect("the worker answers");
     let t0 = Instant::now();
@@ -8404,6 +8406,7 @@ fn au_for(
             idr: plan.kind == PicKind::Idr,
             header: Some(plan.slice_header(&crate::encoder::h264::syntax::StreamParams::writer())),
             ref_seq: plan.ref_frame_seq(),
+            params: None,
         },
     }
 }

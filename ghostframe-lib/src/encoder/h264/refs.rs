@@ -22,6 +22,7 @@ use ghostframe_protocol::protocol::{
     FRAME_FLAG_TARGET_IS_LT, REF_FRAME_NONE,
 };
 
+use super::backend::BackendFeedback;
 use super::syntax::{DecoderModel, Effective, Mmco, RefPic, Rplm, SliceHeader, StreamParams};
 use super::tracker::{seq_lt, FragAck, FrameRec, FrameState, FrameTable, PicKind};
 
@@ -38,6 +39,10 @@ pub(crate) enum IdrCause {
     /// its queued fragments were retired and the IDR is cut again for the
     /// size the connection takes now (see `frame_oversize`).
     MtuShrink,
+    /// The backend made an IDR nobody asked for (observed mode: the library's
+    /// own fallback, e.g. an unknown recovery frame), or the stream moved to a
+    /// different backend after a fault. A new epoch, adopted as such.
+    BackendFallback,
 }
 
 /// Why the client asked for a reset (feedback stream 0x09).
@@ -78,6 +83,11 @@ pub(crate) struct FramePlan {
     /// carries its low bits.
     pub poc: u32,
     pub target: Option<RefTarget>,
+    /// What the caller asked of the backend. `Executed`: the backend executes
+    /// `target`, `mark`, `mmco` and `rplm` (explicit mode). In observed mode
+    /// those fields are empty on a plan and filled in from the emitted header
+    /// by [`RefManager::observe`].
+    pub intent: Intent,
     /// The long-term slot this frame is marked into (candidate anchor).
     pub mark: Option<u8>,
     /// The mark in `mark` lands on the short-term picture this frame predicts
@@ -86,6 +96,19 @@ pub(crate) struct FramePlan {
     pub mark_target: bool,
     pub mmco: Vec<Mmco>,
     pub rplm: Vec<Rplm>,
+}
+
+/// What a plan asks of the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Intent {
+    /// The plan's references, marking and list modification are executed as
+    /// written (explicit mode).
+    Executed,
+    /// Observed mode: continue the backend's own chain.
+    Healthy,
+    /// Observed mode: predict from the confirmed long-term picture `root`
+    /// (the bridge sends the backend an `LtrRecover` for it).
+    Recover { root: Anchor },
 }
 
 impl FramePlan {
@@ -184,6 +207,11 @@ pub(crate) struct RefConfig {
     pub params: StreamParams,
     pub frame_interval: Duration,
     pub initial_srtt: Duration,
+    /// The backend keeps its own reference structure (openh264): the plan is
+    /// an intent and the manager reads what the stream did from each emitted
+    /// header. `params` are replaced by the stream's own at its first IDR
+    /// ([`RefManager::adopt_stream_params`]).
+    pub observed: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +244,19 @@ pub(crate) struct RefStats {
     /// Anchors confirmed that were not the IDR (the IDR is candidate 0 and
     /// every decoded IDR confirms it): the sign that P frames work.
     pub p_anchors_confirmed: u64,
+    /// Observed mode: IDRs the backend made that nobody asked for, and
+    /// streams moved to another backend (each a new epoch).
+    pub idr_backend_fallback: u64,
+    /// Observed mode: long-term marks seen in the emitted headers.
+    pub marks_observed: u64,
+    /// Marks that the wire cannot describe (neither the frame itself nor the
+    /// picture it predicts from): counted, never an anchor candidate.
+    pub mark_unrepresentable: u64,
+    /// `LtrRecover` requests made.
+    pub ltr_recoveries_requested: u64,
+    /// `LtrMarkFailed` sent: for lost or refused carriers, and for marks the
+    /// wire cannot describe (`mark_unrepresentable`).
+    pub ltr_mark_failed_sent: u64,
 }
 
 /// What [`RefManager::frame_sent`] found when it replayed the emitted header.
@@ -224,13 +265,26 @@ pub(crate) struct SentReport {
     /// The header's effective reference is the plan's and nothing broke a rule.
     pub matched: bool,
     pub effective: Effective,
+    /// The plan as the stream executed it: in observed mode the plan with
+    /// its reference, marking and kind read from the header; otherwise the
+    /// plan given.
+    pub plan: FramePlan,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Slot {
-    /// The last frame sent with MMCO 6 into this slot.
+    /// The picture last marked into this slot (explicit mode: the frame that
+    /// carried an MMCO 6; observed mode: also the picture an MMCO 3 named).
     occupant: Option<u32>,
+    /// The frame whose decoded bit confirms the mark: the marked picture
+    /// itself for MMCO 6, the frame that carried the MMCO 3 otherwise.
+    carrier: Option<u32>,
+    /// `frame_num` of the marked picture, and of the carrier.
+    marked_fn: u32,
+    carrier_fn: u32,
     confirmed: bool,
+    /// `LtrMarkFailed` was sent for this mark: it is void.
+    failed_sent: bool,
     sent_idx: u64,
     sent_at: Option<Instant>,
 }
@@ -238,7 +292,11 @@ struct Slot {
 impl Slot {
     const EMPTY: Self = Self {
         occupant: None,
+        carrier: None,
+        marked_fn: 0,
+        carrier_fn: 0,
         confirmed: false,
+        failed_sent: false,
         sent_idx: 0,
         sent_at: None,
     };
@@ -257,7 +315,7 @@ enum Chain {
 
 /// The encoder-side picture of the client's DPB, assuming every frame the
 /// encoder produced was decoded. Driven by the emitted slice headers.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct EncDpb {
     /// Short-term pictures (seq, frame_num), oldest first.
     st: Vec<(u32, u32)>,
@@ -278,6 +336,24 @@ impl EncDpb {
     fn oldest_st(&self, cur_frame_num: u32, max_fn: u32) -> Option<usize> {
         (0..self.st.len()).max_by_key(|&i| (cur_frame_num + max_fn - self.st[i].1) % max_fn)
     }
+}
+
+/// A long-term mark a header made: the slot, and the picture marked.
+#[derive(Debug, Clone, Copy)]
+struct MarkSeen {
+    slot: u8,
+    marked_seq: u32,
+    marked_fn: u32,
+}
+
+/// What an emitted header says (observed mode).
+struct Observed {
+    plan: FramePlan,
+    mark: Option<MarkSeen>,
+    /// `frame_num`s of the pictures marked that the wire cannot describe.
+    unrepresentable: Vec<u32>,
+    /// An IDR the plan did not ask for.
+    unsolicited: bool,
 }
 
 /// Whether a frame the encoder produced went on the wire.
@@ -323,6 +399,16 @@ pub(crate) struct RefManager {
     /// want of progress: its one re-send does not back the timeout off.
     idr_mtu_dead: bool,
     stats: RefStats,
+    // ---- observed mode
+    /// `idr_pic_id` of the epoch's IDR: feedback names the IDR period.
+    idr_pic_id: u32,
+    /// Feedback for the backend, in the order it arose.
+    events: Vec<BackendFeedback>,
+    /// When the last recovery was asked for (at most one per `srtt` while the
+    /// last re-root is unusable).
+    last_intent_at: Option<Instant>,
+    /// The newest `frame_num` the encoder produced in this epoch.
+    newest_fn: u32,
 }
 
 impl RefManager {
@@ -352,6 +438,10 @@ impl RefManager {
             idr_backoff: 0,
             idr_mtu_dead: false,
             stats: RefStats::default(),
+            idr_pic_id: 0,
+            events: Vec::new(),
+            last_intent_at: None,
+            newest_fn: 0,
         };
         m.begin_epoch(IdrCause::SessionStart);
         m
@@ -408,6 +498,12 @@ impl RefManager {
         best
     }
 
+    fn is_confirmed_anchor(&self, seq: u32) -> bool {
+        self.slots
+            .iter()
+            .any(|s| s.confirmed && s.occupant == Some(seq))
+    }
+
     /// How long ago the newest confirmed anchor was sent, if there is one.
     pub(crate) fn anchor_age(&self, now: Instant) -> Option<Duration> {
         let a = self.anchor()?;
@@ -458,6 +554,47 @@ impl RefManager {
         self.idr_cause = cause;
         self.idr_mtu_dead = false;
         self.pending_idr = Some(cause);
+        self.idr_pic_id = 0;
+        self.events.clear();
+        self.last_intent_at = None;
+        self.newest_fn = 0;
+    }
+
+    // ------------------------------------------------------- observed mode
+
+    pub(crate) fn is_observed(&self) -> bool {
+        self.cfg.observed
+    }
+
+    /// The backend's stream parameters, read from the SPS/PPS of an IDR access
+    /// unit it made. Switches the manager to observed mode and models the
+    /// stream with them. Call before [`frame_sent`](Self::frame_sent) for that
+    /// IDR (the model is replaced; an IDR resets it anyway).
+    pub(crate) fn adopt_stream_params(&mut self, params: StreamParams) {
+        self.cfg.observed = true;
+        if self.cfg.params != params {
+            self.cfg.params = params;
+        }
+        self.enc_model = DecoderModel::new(self.cfg.params);
+    }
+
+    /// The stream leaves this backend (a fault limit, a demotion): a new
+    /// epoch that begins with an IDR from whichever backend serves it next,
+    /// counted as a backend fallback and not as a session start. The next
+    /// access unit says whether the manager runs observed.
+    pub(crate) fn backend_fallback(&mut self) {
+        self.idr_backoff = 0;
+        self.cfg.observed = false;
+        self.cfg.params = StreamParams::writer();
+        self.begin_epoch(IdrCause::BackendFallback);
+    }
+
+    /// Feedback the receiver's word produced for a backend that keeps its own
+    /// long-term bookkeeping, in order. Empty in explicit mode. Events of an
+    /// earlier epoch are gone (a new epoch clears them; the backend would
+    /// ignore their stale `idr_pic_id` anyway).
+    pub(crate) fn take_backend_feedback(&mut self) -> Vec<BackendFeedback> {
+        std::mem::take(&mut self.events)
     }
 
     pub(crate) fn session_reset(&mut self) {
@@ -589,7 +726,7 @@ impl RefManager {
         };
         let k = usize::from(slot);
         let s = &mut self.slots[k];
-        if s.occupant == Some(seq) {
+        if s.carrier == Some(seq) && s.occupant.is_some() {
             if !s.confirmed {
                 s.confirmed = true;
                 self.idr_backoff = 0;
@@ -597,6 +734,15 @@ impl RefManager {
                 self.stats.anchors_confirmed += 1;
                 if self.table.get(seq).is_some_and(|f| f.kind != PicKind::Idr) {
                     self.stats.p_anchors_confirmed += 1;
+                    if self.cfg.observed {
+                        // The mark happened at the client: tell the library,
+                        // which keeps the picture usable for recovery only
+                        // from here.
+                        self.events.push(BackendFeedback::LtrMarked {
+                            idr_pic_id: self.idr_pic_id,
+                            frame_num: s.marked_fn,
+                        });
+                    }
                 }
             }
         } else {
@@ -765,6 +911,7 @@ impl RefManager {
             frame_num: 0,
             poc: 0,
             target: None,
+            intent: Intent::Executed,
             mark: Some(0),
             mark_target: false,
             mmco: Vec::new(),
@@ -831,6 +978,7 @@ impl RefManager {
             frame_num,
             poc: 2 * self.poc_count,
             target: Some(target),
+            intent: Intent::Executed,
             mark,
             mark_target: false,
             mmco: mark.map_or_else(Vec::new, |k| self.mark_ops(k, frame_num, target)),
@@ -889,10 +1037,10 @@ impl RefManager {
             }
             return Plan::Frame(self.reissue_idr(frame_seq));
         }
-        Plan::Frame(self.plan_p(frame_seq, now))
+        self.plan_p(frame_seq, now)
     }
 
-    fn plan_p(&mut self, frame_seq: u32, now: Instant) -> FramePlan {
+    fn plan_p(&mut self, frame_seq: u32, now: Instant) -> Plan {
         // Leave recovery once the newest re-root is decoded: it is then the
         // newest reference frame sent, which is what `prev` must be. Leaving
         // for an older decoded re-root while a newer one is outstanding (or
@@ -901,8 +1049,16 @@ impl RefManager {
         // reference, which the gate refuses.
         if let Chain::Recovering { reroots, .. } = &self.chain {
             if let Some(&last) = reroots.last() {
-                if self.table.state(last) == Some(FrameState::Decoded) && self.resident(last) {
-                    self.prev = Some(last);
+                // Observed: the re-root need not stay resident (the library
+                // keeps one short-term picture), only be decoded.
+                if self.table.state(last) == Some(FrameState::Decoded)
+                    && (self.cfg.observed || self.resident(last))
+                {
+                    // Observed: the backend's chain runs on from its newest
+                    // frame, which `prev` already is.
+                    if !self.cfg.observed {
+                        self.prev = Some(last);
+                    }
                     self.chain = Chain::Healthy;
                     self.stats.recovered += 1;
                     self.table.supersede_suspects(last);
@@ -919,8 +1075,12 @@ impl RefManager {
                     };
                     self.stats.recoveries += 1;
                 }
-                None => return self.no_anchor_plan(frame_seq, now),
+                None if self.cfg.observed => return self.no_anchor_observed(frame_seq, now),
+                None => return Plan::Frame(self.no_anchor_plan(frame_seq, now)),
             }
+        }
+        if self.cfg.observed {
+            return Plan::Frame(self.plan_observed(frame_seq, now));
         }
 
         let mark_due = self.mark_slot_if_due(now);
@@ -938,7 +1098,7 @@ impl RefManager {
                 // check of `ref_frame_seq` against its slot content is what
                 // makes that safe (design 7.1): it must not be weakened.
                 let mark = mark_due.filter(|&k| self.mark_fits(k, target));
-                self.p_plan(frame_seq, PicKind::Healthy, target, mark)
+                Plan::Frame(self.p_plan(frame_seq, PicKind::Healthy, target, mark))
             }
             Chain::Recovering {
                 root,
@@ -963,12 +1123,355 @@ impl RefManager {
                 };
                 if due {
                     let mark = mark_due.filter(|&k| self.mark_fits(k, target));
-                    self.p_plan(frame_seq, PicKind::Reroot, target, mark)
+                    Plan::Frame(self.p_plan(frame_seq, PicKind::Reroot, target, mark))
                 } else {
-                    self.p_plan(frame_seq, PicKind::Recovery, target, None)
+                    Plan::Frame(self.p_plan(frame_seq, PicKind::Recovery, target, None))
                 }
             }
         }
+    }
+
+    // ------------------------------------------------- observed-mode planning
+
+    /// A plan with only an intent: the backend picks the reference, the
+    /// marking and the list modification, the header says which.
+    fn observed_plan(&self, frame_seq: u32, kind: PicKind, intent: Intent) -> FramePlan {
+        let max_fn = self.cfg.params.max_frame_num();
+        FramePlan {
+            epoch: self.epoch,
+            frame_seq,
+            kind,
+            idr_cause: None,
+            nal_ref_idc: 3,
+            frame_num: (self.prev_ref_frame_num + 1) % max_fn,
+            poc: 2 * self.poc_count,
+            target: None,
+            intent,
+            mark: None,
+            mark_target: false,
+            mmco: Vec::new(),
+            rplm: Vec::new(),
+        }
+    }
+
+    /// No confirmed anchor and the chain is broken. There are no non-reference
+    /// probes to make here, so the frame waits for the IDR to be decoded; an
+    /// IDR that is dead or silent for its timeout is sent again.
+    fn no_anchor_observed(&mut self, frame_seq: u32, now: Instant) -> Plan {
+        let give_up = match self.idr_seq.and_then(|s| self.table.get(s)) {
+            None => true,
+            Some(f) => match f.state {
+                FrameState::Dead => true,
+                FrameState::Suspect => {
+                    now.saturating_duration_since(f.sent_at) > self.idr_timeout()
+                }
+                FrameState::Sent | FrameState::Decoded => false,
+            },
+        };
+        if give_up {
+            Plan::Frame(self.reissue_idr(frame_seq))
+        } else {
+            Plan::Hold
+        }
+    }
+
+    /// `LtrMarkFailed` for every mark whose carrier is refused, dropped, gone
+    /// from the table, or has been suspect for `candidate_timeout`: the
+    /// library marks nothing again until it is told. The slot's content is no
+    /// longer an anchor candidate.
+    ///
+    /// A carrier that is merely suspect is not reported: the ledger's verdict
+    /// is a hypothesis, most of them under loss are datagrams still queued,
+    /// and a decoded acknowledgement that follows confirms the mark (as in
+    /// explicit mode). The report is irreversible, so it waits.
+    fn judge_marks(&mut self, now: Instant) {
+        let patience = self.candidate_timeout();
+        for k in 0..LT_SLOTS {
+            let s = self.slots[k];
+            let (Some(_), Some(c), false, false) =
+                (s.occupant, s.carrier, s.confirmed, s.failed_sent)
+            else {
+                continue;
+            };
+            let rec = self.table.get(c);
+            if rec.is_some_and(|f| f.kind == PicKind::Idr) {
+                continue;
+            }
+            let lost = rec.is_none_or(|f| match f.state {
+                FrameState::Dead => true,
+                FrameState::Suspect => now.saturating_duration_since(f.sent_at) > patience,
+                FrameState::Sent | FrameState::Decoded => false,
+            });
+            if lost {
+                self.events.push(BackendFeedback::LtrMarkFailed {
+                    idr_pic_id: self.idr_pic_id,
+                    frame_num: s.marked_fn,
+                });
+                self.stats.ltr_mark_failed_sent += 1;
+                self.slots[k] = Slot {
+                    failed_sent: true,
+                    ..Slot::EMPTY
+                };
+            }
+        }
+    }
+
+    fn plan_observed(&mut self, frame_seq: u32, now: Instant) -> FramePlan {
+        self.judge_marks(now);
+        let interval = self.srtt.max(self.cfg.frame_interval);
+        let fresh_root = self.anchor();
+        if let (Chain::Recovering { root, .. }, Some(a)) = (&mut self.chain, fresh_root) {
+            *root = a;
+        }
+        let Chain::Recovering { root, reroots, .. } = &self.chain else {
+            return self.observed_plan(frame_seq, PicKind::Healthy, Intent::Healthy);
+        };
+        let root = *root;
+        // One recovery at a time: the next only once the previous re-root is
+        // unusable, and at most one per round trip.
+        let due = reroots.last().is_none_or(|&r| !self.table.usable(r))
+            && self
+                .last_intent_at
+                .is_none_or(|t| now.saturating_duration_since(t) >= interval);
+        if !due {
+            // Frames after a re-root depend on it; they are sent, and they
+            // die with it if it dies.
+            return self.observed_plan(frame_seq, PicKind::Healthy, Intent::Healthy);
+        }
+        let slot = &self.slots[usize::from(root.slot)];
+        // The newest frame number encoded, as it stands: the library compares
+        // frame numbers modulo `MaxFrameNum` and ignores a request whose
+        // current is behind its last recovery's, so a number remembered
+        // across the wrap (a `max`) would be behind it for good.
+        let current = self.newest_fn;
+        self.events.push(BackendFeedback::LtrRecover {
+            idr_pic_id: self.idr_pic_id,
+            // The carrier's number: the marked picture's own is an unknown
+            // frame to the library.
+            last_correct_frame_num: slot.carrier_fn,
+            current_frame_num: current,
+        });
+        self.last_intent_at = Some(now);
+        self.stats.ltr_recoveries_requested += 1;
+        self.observed_plan(frame_seq, PicKind::Reroot, Intent::Recover { root })
+    }
+
+    /// The plan as the stream executed it, read from the emitted header
+    /// (observed mode). Pure.
+    pub(crate) fn observe(&self, plan: &FramePlan, au: &SliceHeader) -> FramePlan {
+        self.observe_inner(plan, au).plan
+    }
+
+    fn observe_inner(&self, plan: &FramePlan, au: &SliceHeader) -> Observed {
+        let seq = plan.frame_seq;
+        if au.idr {
+            let (cause, unsolicited) = match (plan.kind, plan.idr_cause) {
+                (PicKind::Idr, c) => (c, false),
+                _ => (Some(IdrCause::BackendFallback), true),
+            };
+            let mut p = self.idr_plan(seq, cause.unwrap_or(self.idr_cause));
+            if unsolicited {
+                // `frame_sent` starts this epoch before it adopts the frame.
+                p.epoch = self.epoch + 1;
+            }
+            p.intent = Intent::Healthy;
+            p.nal_ref_idc = au.nal_ref_idc;
+            p.mark = au.long_term_reference_flag.then_some(0);
+            return Observed {
+                plan: p,
+                mark: au.long_term_reference_flag.then_some(MarkSeen {
+                    slot: 0,
+                    marked_seq: seq,
+                    marked_fn: 0,
+                }),
+                unrepresentable: Vec::new(),
+                unsolicited,
+            };
+        }
+        let eff = self.enc_model.peek(seq, au);
+        let target = match eff.reference {
+            Some(RefPic::Real(s)) => self.locate(s),
+            _ => None,
+        };
+        let kind = match (au.nal_ref_idc, &self.chain, target) {
+            (0, ..) => PicKind::Recovery,
+            // A P from any confirmed anchor is a re-root: when the carrier's
+            // decoded ack and the loss reach the library in one batch it
+            // recovers from the older anchor (it latches mark feedback for
+            // the next frame), and that frame is as good.
+            (_, Chain::Recovering { .. }, Some(t)) if self.is_confirmed_anchor(t.seq()) => {
+                PicKind::Reroot
+            }
+            _ => PicKind::Healthy,
+        };
+        // The marking, from the change of long-term occupancy.
+        let mut dpb = self.dpb.clone();
+        Self::apply_au_to(&mut dpb, &self.cfg.params, seq, au);
+        let mut mark = None;
+        let mut unrepresentable = Vec::new();
+        for k in 0..LT_SLOTS {
+            let (before, after) = (self.dpb.lt[k], dpb.lt[k]);
+            let Some((marked_seq, marked_fn)) = after.filter(|&a| Some(a) != before) else {
+                continue;
+            };
+            let on_wire = marked_seq == seq || target.is_some_and(|t| t.seq() == marked_seq);
+            if on_wire && mark.is_none() {
+                mark = Some(MarkSeen {
+                    slot: k as u8,
+                    marked_seq,
+                    marked_fn,
+                });
+            } else {
+                unrepresentable.push(marked_fn);
+            }
+        }
+        let mut p = self.observed_plan(seq, kind, Intent::Healthy);
+        p.epoch = plan.epoch;
+        p.nal_ref_idc = au.nal_ref_idc;
+        p.frame_num = au.frame_num;
+        p.target = target;
+        p.mark = mark.map(|m| m.slot);
+        p.mark_target = mark.is_some_and(|m| m.marked_seq != seq);
+        p.mmco = au.mmco.clone().unwrap_or_default();
+        p.rplm = au.rplm.clone();
+        p.intent = plan.intent;
+        Observed {
+            plan: p,
+            mark,
+            unrepresentable,
+            unsolicited: false,
+        }
+    }
+
+    fn commit_observed(
+        &mut self,
+        plan: &FramePlan,
+        au: &SliceHeader,
+        frags_total: u16,
+        now: Instant,
+        fate: Fate,
+    ) -> Option<SentReport> {
+        let seq = plan.frame_seq;
+        let mut obs = self.observe_inner(plan, au);
+        if obs.unsolicited {
+            // The library made an IDR the manager did not ask for: a new
+            // epoch, with this frame as its IDR.
+            self.begin_epoch(IdrCause::BackendFallback);
+            obs = self.observe_inner(plan, au);
+            obs.plan.epoch = self.epoch;
+        }
+        let eff = obs.plan.clone();
+        let effective = self.enc_model.push(seq, au);
+        let matched = !effective.violations.any()
+            && (au.idr || matches!(effective.reference, Some(RefPic::Real(_))));
+        if fate == Fate::Sent && !matched {
+            self.stats.plan_mismatch += 1;
+        }
+        let usable = matched && fate == Fate::Sent;
+        self.apply_au(seq, au);
+        // A mark the client cannot be told about never gets a confirmation;
+        // the library marks nothing again until it hears the mark failed.
+        for &marked_fn in &obs.unrepresentable {
+            self.stats.mark_unrepresentable += 1;
+            self.stats.ltr_mark_failed_sent += 1;
+            self.events.push(BackendFeedback::LtrMarkFailed {
+                idr_pic_id: self.idr_pic_id,
+                frame_num: marked_fn,
+            });
+        }
+        // A slot the stream no longer holds a picture in is not an anchor.
+        for k in 0..LT_SLOTS {
+            if self.slots[k].occupant.is_some()
+                && self.slots[k].occupant != self.dpb.lt[k].map(|(s, _)| s)
+            {
+                self.slots[k] = Slot::EMPTY;
+            }
+        }
+        let mut rec = FrameRec::new(seq, eff.kind, frags_total, now, self.sent_count);
+        rec.target = eff.ref_frame_seq();
+        rec.reference = au.nal_ref_idc != 0;
+        rec.mark_slot = obs.mark.map(|m| m.slot);
+        rec.dep = match eff.kind {
+            PicKind::Healthy | PicKind::Recovery => rec.target,
+            PicKind::Idr | PicKind::Reroot => None,
+        };
+        if !usable {
+            rec.state = FrameState::Dead;
+        }
+        self.table.insert(rec);
+        if let Some(m) = obs.mark {
+            self.slots[usize::from(m.slot)] = Slot {
+                occupant: Some(m.marked_seq),
+                carrier: Some(seq),
+                marked_fn: m.marked_fn,
+                carrier_fn: au.frame_num,
+                confirmed: false,
+                failed_sent: false,
+                sent_idx: self.sent_count,
+                sent_at: Some(now),
+            };
+            if !au.idr {
+                self.stats.candidates_marked += 1;
+                self.stats.marks_observed += 1;
+            }
+        }
+        self.newest_fn = au.frame_num;
+        if au.idr {
+            self.slots[1] = if obs.mark.is_some_and(|m| m.slot == 1) {
+                self.slots[1]
+            } else {
+                Slot::EMPTY
+            };
+            self.slot_confirmed_once = [false; LT_SLOTS];
+            self.idr_seq = Some(seq);
+            self.idr_pic_id = au.idr_pic_id;
+            self.idr_progress_at = Some(now);
+            self.prev = usable.then_some(seq);
+            self.chain = Chain::Healthy;
+            self.pending_idr = None;
+            match eff.idr_cause {
+                Some(IdrCause::SessionStart) => self.stats.idr_session += 1,
+                Some(IdrCause::ResolutionChange) => self.stats.idr_resolution += 1,
+                Some(IdrCause::ClientReset) => self.stats.idr_client_reset += 1,
+                Some(IdrCause::EncoderFault) => self.stats.idr_encoder_fault += 1,
+                Some(IdrCause::MtuShrink) => self.stats.idr_mtu_shrink += 1,
+                // Only an IDR that reached the wire: the bridge counts the
+                // IDRs it sent, and a dropped one is not among them.
+                Some(IdrCause::BackendFallback) if fate == Fate::Sent => {
+                    self.stats.idr_backend_fallback += 1
+                }
+                Some(IdrCause::BackendFallback) | None => {}
+            }
+        } else {
+            if au.nal_ref_idc != 0 {
+                // The backend's chain continues from its newest reference
+                // frame, whether or not the client will get it.
+                self.prev = usable.then_some(seq);
+            }
+            match eff.kind {
+                PicKind::Healthy => self.stats.p_healthy += 1,
+                PicKind::Recovery => self.stats.p_recovery += 1,
+                PicKind::Reroot => {
+                    self.stats.reroots += 1;
+                    if let Chain::Recovering {
+                        last_reroot_at,
+                        reroots,
+                        ..
+                    } = &mut self.chain
+                    {
+                        *last_reroot_at = Some(now);
+                        reroots.push(seq);
+                    }
+                }
+                PicKind::Idr => {}
+            }
+        }
+        self.sent_count += 1;
+        Some(SentReport {
+            matched,
+            effective,
+            plan: eff,
+        })
     }
 
     // --------------------------------------------------------- frame events
@@ -1008,6 +1511,9 @@ impl RefManager {
         if plan.epoch != self.epoch {
             return None;
         }
+        if self.cfg.observed {
+            return self.commit_observed(plan, au, frags_total, now, fate);
+        }
         let seq = plan.frame_seq;
         let effective = self.enc_model.push(seq, au);
         let same = match (plan.ref_frame_seq(), effective.reference) {
@@ -1043,7 +1549,11 @@ impl RefManager {
         if let Some(k) = mark {
             self.slots[usize::from(k)] = Slot {
                 occupant: Some(seq),
+                carrier: Some(seq),
+                marked_fn: au.frame_num,
+                carrier_fn: au.frame_num,
                 confirmed: false,
+                failed_sent: false,
                 sent_idx: self.sent_count,
                 sent_at: Some(now),
             };
@@ -1065,6 +1575,7 @@ impl RefManager {
                 Some(IdrCause::ClientReset) => self.stats.idr_client_reset += 1,
                 Some(IdrCause::EncoderFault) => self.stats.idr_encoder_fault += 1,
                 Some(IdrCause::MtuShrink) => self.stats.idr_mtu_shrink += 1,
+                Some(IdrCause::BackendFallback) => self.stats.idr_backend_fallback += 1,
                 None => {}
             }
         } else {
@@ -1101,23 +1612,45 @@ impl RefManager {
         if self.mismatch_run >= 3 {
             self.begin_epoch(IdrCause::EncoderFault);
         }
-        Some(SentReport { matched, effective })
+        Some(SentReport {
+            matched,
+            effective,
+            plan: plan.clone(),
+        })
     }
 
     /// Apply an emitted header to the encoder-side DPB. Returns the long-term
     /// slot the picture was marked into.
     fn apply_au(&mut self, seq: u32, au: &SliceHeader) -> Option<u8> {
-        let max_fn = self.cfg.params.max_frame_num();
-        let max_refs = self.cfg.params.max_num_ref_frames as usize;
         self.poc_count = if au.idr { 1 } else { self.poc_count + 1 };
+        let mut dpb = std::mem::take(&mut self.dpb);
+        let mark = Self::apply_au_to(&mut dpb, &self.cfg.params, seq, au);
+        self.dpb = dpb;
         if au.idr {
-            self.dpb = EncDpb::default();
             self.prev_ref_frame_num = 0;
+        } else if au.nal_ref_idc != 0 {
+            self.prev_ref_frame_num = au.frame_num;
+        }
+        mark
+    }
+
+    /// The DPB after an emitted header (marking and sliding window), and the
+    /// long-term slot the picture itself was marked into.
+    fn apply_au_to(
+        dpb: &mut EncDpb,
+        params: &StreamParams,
+        seq: u32,
+        au: &SliceHeader,
+    ) -> Option<u8> {
+        let max_fn = params.max_frame_num();
+        let max_refs = params.max_num_ref_frames as usize;
+        if au.idr {
+            *dpb = EncDpb::default();
             if au.long_term_reference_flag {
-                self.dpb.lt[0] = Some((seq, 0));
+                dpb.lt[0] = Some((seq, 0));
                 return Some(0);
             }
-            self.dpb.st.push((seq, 0));
+            dpb.st.push((seq, 0));
             return None;
         }
         if au.nal_ref_idc == 0 {
@@ -1127,9 +1660,9 @@ impl RefManager {
         let mut mark = None;
         match &au.mmco {
             None => {
-                if self.dpb.len() >= max_refs {
-                    if let Some(i) = self.dpb.oldest_st(cur, max_fn) {
-                        self.dpb.st.remove(i);
+                if dpb.len() >= max_refs {
+                    if let Some(i) = dpb.oldest_st(cur, max_fn) {
+                        dpb.st.remove(i);
                     }
                 }
             }
@@ -1138,43 +1671,42 @@ impl RefManager {
                     match *op {
                         Mmco::ForgetShort(d) => {
                             let fnum = (cur + max_fn - ((d + 1) % max_fn)) % max_fn;
-                            self.dpb.st.retain(|&(_, f)| f != fnum);
+                            dpb.st.retain(|&(_, f)| f != fnum);
                         }
                         Mmco::ForgetLong(n) => {
-                            if let Some(s) = self.dpb.lt.get_mut(n as usize) {
+                            if let Some(s) = dpb.lt.get_mut(n as usize) {
                                 *s = None;
                             }
                         }
                         Mmco::ShortToLong(d, idx) => {
                             let fnum = (cur + max_fn - ((d + 1) % max_fn)) % max_fn;
-                            if let Some(i) = self.dpb.st.iter().position(|&(_, f)| f == fnum) {
-                                let p = self.dpb.st.remove(i);
-                                if let Some(s) = self.dpb.lt.get_mut(idx as usize) {
+                            if let Some(i) = dpb.st.iter().position(|&(_, f)| f == fnum) {
+                                let p = dpb.st.remove(i);
+                                if let Some(s) = dpb.lt.get_mut(idx as usize) {
                                     *s = Some(p);
                                 }
                             }
                         }
                         Mmco::MaxLong(p) => {
-                            for (k, s) in self.dpb.lt.iter_mut().enumerate() {
+                            for (k, s) in dpb.lt.iter_mut().enumerate() {
                                 if k as u32 >= p {
                                     *s = None;
                                 }
                             }
                         }
-                        Mmco::ClearAll => self.dpb = EncDpb::default(),
+                        Mmco::ClearAll => *dpb = EncDpb::default(),
                         Mmco::CurrentToLong(k) => mark = Some(k as u8),
                     }
                 }
             }
         }
-        match mark.and_then(|k| self.dpb.lt.get_mut(usize::from(k))) {
+        match mark.and_then(|k| dpb.lt.get_mut(usize::from(k))) {
             Some(s) => *s = Some((seq, cur)),
             None => {
                 mark = None;
-                self.dpb.st.push((seq, cur));
+                dpb.st.push((seq, cur));
             }
         }
-        self.prev_ref_frame_num = cur;
         mark
     }
 }
