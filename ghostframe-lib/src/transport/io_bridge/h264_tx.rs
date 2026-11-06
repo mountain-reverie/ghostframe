@@ -243,6 +243,15 @@ pub struct H264Stats {
     pub rate_reopens_rise: u64,
     /// The rate the encoder was last told to run at, bits per second.
     pub rate_target_bps: u32,
+    /// The per-frame budget of the last acked-reference plan, bytes: the cap
+    /// on a P frame and on an IDR (`RateTarget::steady`). Gauges.
+    pub frame_cap_bytes: u32,
+    pub idr_cap_bytes: u32,
+    /// Acked-reference frames bigger than 1.15 x the cap they were coded
+    /// under, and the biggest frame over its cap, in percent (100: at the
+    /// cap). The cap is soft on the VCE (S2): observed, never gated.
+    pub frames_over_cap: u64,
+    pub max_cap_ratio_pct: u32,
     /// Probe clusters the application started itself (see `h264_rate`).
     pub app_probes: u64,
     /// Probes not started because padding could not fill a cluster of the
@@ -1251,7 +1260,7 @@ impl IoBridge {
         max_dg_size: usize,
         now: std::time::Instant,
     ) {
-        use crate::encoder::h264::backend::{H264Backend, Nv12View, RateTarget};
+        use crate::encoder::h264::backend::{H264Backend, Nv12View};
         use crate::encoder::h264::harness::PcmBackend;
         assert!(
             self.h264_refs_active(),
@@ -1283,7 +1292,7 @@ impl IoBridge {
         backend.set_sizes(h.idr_bytes, h.p_bytes);
         backend.set_model(h.pcm_rate_model);
         // The rate travels with the plan, as the encode worker applies it.
-        backend.set_rate(RateTarget::steady(req.bps, req.fps));
+        backend.set_rate(req.rate);
         let nv12 = Nv12View {
             data: &[],
             width: 0,

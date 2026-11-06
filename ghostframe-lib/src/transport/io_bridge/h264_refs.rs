@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use super::frame::{stage_trace_enabled, InFlight, InFlightStage, Lap};
 use super::frame_backend::{CodedAu, H264Request};
 use super::*;
-use crate::encoder::h264::backend::EncodedAu;
+use crate::encoder::h264::backend::{EncodedAu, RateTarget};
 use crate::encoder::h264::refs::{
     FramePlan, IdrCause as RefIdrCause, Plan, RefConfig, RefManager, RefStats, ResetReason,
 };
@@ -91,6 +91,10 @@ pub(super) struct RefsCounters {
 }
 
 /// The loop-side state of one live session's acked references.
+/// A frame is over its cap past this many percent of it (S2: a P frame goes
+/// 8 % over a reachable cap).
+const OVER_CAP_PCT: u32 = 115;
+
 pub(super) struct RefsState {
     pub(super) mgr: RefManager,
     /// Frame size of the last plan: a change is a resolution change.
@@ -103,6 +107,9 @@ pub(super) struct RefsState {
     /// Set when the stream returns from the tile codec: the age (ms) of the
     /// anchor the first frame predicts from, until that frame is sent.
     reentry_anchor_age_ms: Option<u64>,
+    /// The frame in flight and the cap (bytes) its plan was coded under: the
+    /// budget travels with the request, and the commit holds the result to it.
+    inflight_cap: Option<(u32, u32)>,
 }
 
 impl RefsState {
@@ -117,6 +124,7 @@ impl RefsState {
             faults_without_anchor: 0,
             p_anchors_at_fault: 0,
             reentry_anchor_age_ms: None,
+            inflight_cap: None,
         }
     }
 }
@@ -274,13 +282,40 @@ impl IoBridge {
             }
         };
         let refs = st.mgr.resident_refs();
+        // The frame's budget: an IDR gets its own (a quarter second of the
+        // rate), a P frame the cap of a few average frames.
+        let rate = RateTarget::steady(bps, fps);
+        let cap = if plan.kind == PicKind::Idr {
+            rate.idr_max_bytes
+        } else {
+            rate.max_frame_bytes
+        };
+        st.inflight_cap = Some((plan.frame_seq, cap));
+        self.h264.stats.frame_cap_bytes = rate.max_frame_bytes;
+        self.h264.stats.idr_cap_bytes = rate.idr_max_bytes;
         self.h264.refs_counters.plans += 1;
         Some(Box::new(H264Request {
             plan,
             refs,
             fps,
-            bps,
+            rate,
         }))
+    }
+
+    /// Hold the frame to the cap its plan carried: counted, never acted on.
+    fn note_frame_cap(&mut self, seq: u32, len: usize) {
+        let cap = self
+            .h264
+            .refs
+            .as_mut()
+            .and_then(|st| st.inflight_cap.take())
+            .filter(|(s, c)| *s == seq && *c > 0);
+        let Some((_, cap)) = cap else {
+            return;
+        };
+        let pct = (len as u64 * 100 / u64::from(cap)).min(u64::from(u32::MAX)) as u32;
+        self.h264.stats.max_cap_ratio_pct = self.h264.stats.max_cap_ratio_pct.max(pct);
+        self.h264.stats.frames_over_cap += u64::from(pct > OVER_CAP_PCT);
     }
 
     /// The backend made `au` for `plan`: send it and tell the manager. Returns
@@ -331,6 +366,7 @@ impl IoBridge {
                 .filter(|_| au.meta.idr),
         };
         let len = au.payload.len();
+        self.note_frame_cap(seq, len);
         let frags = self.send_h264_frame_described(
             H264Out {
                 payload: au.payload,

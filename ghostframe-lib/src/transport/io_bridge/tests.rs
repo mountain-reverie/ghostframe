@@ -8312,7 +8312,7 @@ fn h264_direct_worker_path_survives_a_loss_bit_exact() {
             refs: mgr.resident_refs(),
             plan: plan.clone(),
             fps: 30,
-            bps: 3_000_000,
+            rate: crate::encoder::h264::backend::RateTarget::steady(3_000_000, 30),
         });
         assert!(pipeline.send(ToWorker::Finish {
             seq: n,
@@ -9151,4 +9151,57 @@ async fn a_tile_pass_that_outgrew_the_connection_is_retired() {
     assert!(bridge
         .pending_controls
         .contains(&Control::InvalidateBaseline(1)));
+}
+
+/// The frame's budget travels in the request (B6-4): the planner makes the
+/// rate target the worker applies, an IDR is held to its own cap (a quarter
+/// second of the rate), a P frame to the P cap, and a frame over 1.15 x its cap
+/// is counted, never refused.
+#[tokio::test]
+async fn a_planned_frame_carries_its_budget_and_the_commit_counts_frames_over_it() {
+    use crate::encoder::h264::backend::RateTarget;
+    let mut bridge = acked_refs_bridge();
+    let now = now_std();
+    let want = RateTarget::steady(super::h264_rate::RATE_INITIAL_BPS, bridge.h264.fps);
+    assert!(
+        want.idr_max_bytes as f64 > 1.3 * want.max_frame_bytes as f64,
+        "premise: the two caps differ enough to tell them apart"
+    );
+
+    let req = bridge
+        .h264_refs_plan(0, (64, 64), now, false)
+        .expect("an IDR");
+    assert_eq!(req.rate, want, "the request carries the rate target");
+    assert_eq!(bridge.h264.stats.frame_cap_bytes, want.max_frame_bytes);
+    assert_eq!(bridge.h264.stats.idr_cap_bytes, want.idr_max_bytes);
+    // An IDR of three quarters of its budget is over the P cap, not its own.
+    let mut au = au_for(&req.plan);
+    au.payload = vec![9; want.idr_max_bytes as usize * 3 / 4];
+    assert!(bridge.h264_refs_commit(&req.plan, au, &refs_meta(), 1_200, now));
+    assert_eq!(
+        bridge.h264.stats.frames_over_cap, 0,
+        "{:?}",
+        bridge.h264.stats
+    );
+    assert_eq!(bridge.h264.stats.max_cap_ratio_pct, 75);
+
+    ack_every_fragment(&mut bridge, 0);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
+    // A P frame at its cap is not over; one at 1.5 x is.
+    for (seq, pct, over) in [(1u32, 100usize, 0u64), (2, 150, 1)] {
+        let req = bridge
+            .h264_refs_plan(seq, (64, 64), now, false)
+            .expect("a P");
+        assert_eq!(req.rate, want);
+        let mut au = au_for(&req.plan);
+        au.payload = vec![9; want.max_frame_bytes as usize * pct / 100];
+        assert!(bridge.h264_refs_commit(&req.plan, au, &refs_meta(), 1_200, now));
+        assert_eq!(
+            bridge.h264.stats.frames_over_cap, over,
+            "frame {seq} at {pct}%"
+        );
+        ack_every_fragment(&mut bridge, seq);
+        bridge.dispatch_frame_ack_for_test(frame_ack_datagram(seq, 1, 0));
+    }
+    assert_eq!(bridge.h264.stats.max_cap_ratio_pct, 150);
 }
