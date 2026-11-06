@@ -192,21 +192,25 @@ loss-limited or has had a standing queue for 400 ms; the give-back is not a cut.
 budget of 0.25 s of the rate with a 32 kB floor `idr_max_bytes`, and the VBV):
 `frame_cap_bytes` / `idr_cap_bytes` are the last plan's, `frames_over_cap` and
 `max_cap_ratio_pct` observe the (soft) cap and are never a gate. **Probe raise
-(opt-in, off in production):** while a probe window is open (goog_cc's request or the application's own) the
+(always on for acked-reference streams):** while a probe window is open (goog_cc's request or the application's own) the
 P frames are planned at `RATE_SHARE x` the window's rate and tagged into the
 window, so they carry part of the burst and padding tops up only the shortfall
 (on the first frame of the window, sized for what the frames still to come are
 expected to carry, and the whole shortfall on the last). `probe_raise_windows`,
 `probe_raise_frames`, `probe_raise_bytes` on the `h264 refs` line count it;
 `raised_frame_lost` (a verdict named a raised frame), `raised_frames_acked` and
-`raised_delivery_us_mean` / `_max` are its cost. It is off because on links that
-buffer less than a window's burst (30 and 60 ms) it loses real frames and does
-not beat padding alone; every guard is re-checked on every raised plan (a cut,
-a late acknowledgement for 5 to 10 s, a raised frame or a probe pad judged lost
-for 10 s, `pads_lost` on `h264 stats`, and padding not yet judged). The switch is
-`H264State::probe_raise_on`, set from the harness field
-`InjectedH264::probe_raise`, not an environment variable; the measurements are
-in `docs/design/h264-transport.md` section 10.
+`raised_delivery_us_mean` / `_max` are its cost. It
+is on with no switch (no environment variable, no field): at a 600 ms buffer the
+step-up uses the headroom on 70/67/71 of 96 timelines against 52/58/55 with
+padding alone. The accepted cost is on links that buffer less than a window's
+burst (30 and 60 ms), where it loses real frames and does somewhat worse than
+padding alone: `sus_use` 26 / 23 of 48 against 30 / 31, about 2 to 4 raised
+frames lost per run. Every guard is re-checked on every raised plan (a cut, a
+late acknowledgement for 5 to 10 s, a raised frame or a probe pad judged lost
+for 10 s, `pads_lost` on `h264 stats`); there is no wait for padding to have
+been judged. The browserless harness can mutate it off
+(`InjectedH264::no_probe_raise`) as a control. Measurements are in
+`docs/design/h264-transport.md` section 10.
 
 With `GHOSTFRAME_DAMAGE_MODE=shadow` or `on` the daemon also logs a cumulative
 `damage safety net` line every 5 s (target `ghostframe::server::damage`);

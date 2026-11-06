@@ -693,7 +693,7 @@ the HRD restarts at 40 % fullness, so the first frame after a re-send is about
   channel. `rate_sends` / `rate_sends_10s` count every plan whose target differs
   from the last one sent, so the probe raise's re-sends (entering a window,
   leaving it) are counted with the policy's.
-- **Probe raise (off by default).** A probe window is made of real frames where
+- **Probe raise (always on).** A probe window is made of real frames where
   it can be. While a window is open (goog_cc's request or the application's
   own) each P frame is planned at `RATE_SHARE x` the window's rate (up to three
   frames of a 100 ms window at 30 fps, 2.1 on average), its fragments are
@@ -712,24 +712,33 @@ the HRD restarts at 40 % fullness, so the first frame after a re-send is about
   The guards are checked for **every raised plan**, not only when a window
   opens: a cut (3 s), a late acknowledgement (the memory is two checkpoints at
   least 5 s apart, so it keeps the raise off for 5 to 10 s), a raised frame or
-  a probe pad judged lost (`RAISE_LOSS_PAUSE`, 10 s), and no padding yet sent
-  and judged (`RAISE_TRUST_AFTER`, 300 ms after the stream's first padding).
-  The backlog guard is the plan's own (a backed-up queue skips the frame before
+  a probe pad judged lost (`RAISE_LOSS_PAUSE`, 10 s). There is no wait for
+  padding to be sent and judged first (tried as `RAISE_TRUST_AFTER`, 300 ms after
+  the stream's first padding; removed, see below). The backlog guard is the plan's own (a backed-up queue skips the frame before
   the raise is considered).
 
-  **Why it is off.** A window's burst on a buffer shallower than the burst
-  drops the real frames queued behind the front of it (a padding-only window
-  loses padding, which costs nothing). Before the guards a median 6 raised
-  frames were lost per step-up run at a 60 ms buffer and 12 at 30 ms, against
-  none without the raise, and sustained use of the headroom was 25/48 and 12/48
-  against 35/48 and 26/48. With every guard above it is 31/48 and 31/48
-  (against 35 and 26), and on the 600 ms population 55/28/44 of 96 against
-  52/58/55 without it. The version without the "padding judged first" guard
-  found the headroom on 70/67/71 of 96 at 600 ms (the raise's real gain) and
-  paid for it at 60 ms (26/48 against 35/48) and 30 ms (22/48 against 26/48).
-  It stays behind a field (`H264State::probe_raise_on`, set by the harness
-  `InjectedH264::probe_raise`), measured by the `RefsRaise` rows and scene 9.
-  `probe_raise_*` and `raised_frame_*` (below) account for it.
+  **It is on, and the trade.** The raise always runs on an acked-reference
+  stream; there is no switch (the browserless harness has a mutation,
+  `InjectedH264::no_probe_raise`, for the gates that compare with padding alone).
+  On a 600 ms buffer it is a gain: the P-B step-up (96 seeds, three ack timings)
+  used the headroom (`sus_use`) on 70/67/71 against 52/58/55 with padding alone,
+  and the p50 step-up on `sus_use` is 4.5-5.2 s against 4.1-4.3 s with a
+  better p90 on all three (11.0/9.9/5.5 s against 16.8/11.0/6.6 s). The cost is on links
+  that buffer less than a window's burst: it drops the real frames queued behind
+  the front of the burst (a padding-only window loses padding, which costs
+  nothing). On 16 seeds as sent: at 60 ms `sus_use` 7 against 11, 37 raised
+  frames lost (2.3 a run); at 30 ms 6 against 10, 60 lost (3.75 a run). On 48
+  timelines (16 seeds, three ack timings): 23 against 31 at 60 ms, 26 against 30
+  at 30 ms. A "padding judged first" wait (300 ms after the stream's first
+  padding) cut the early losses but cost more than it saved: 55/28/44 of 96 at
+  600 ms (its `sus_use`), and 31/48 at both shallow depths; it was removed. What
+  limits the damage on a shallow buffer is the 10 s pause after a lost raised
+  frame or a lost pad: without it 214 raised frames are lost in the 16 runs at
+  30 ms and `sus_use` falls to 1 of 16. With a pessimistic model (a window's
+  frames yield 0.86 of the profile) the raise finds the headroom less often than
+  padding alone (`sus_use` 57/36/21 against 51/58/55): the gain depends on the
+  encoder giving the window's bytes. `probe_raise_*` and `raised_frame_*`
+  (below) account for it.
 - **Measured** (browserless `p_b_seed_population`, `GF_POP_MODE`, 96 seeds, three
   ack timings, the P-B capacity step 2 -> 6 Mbit/s, `T_UP` = 11 s, a 600 ms link
   buffer, no collapse in any row). `reached` is the first estimate sample over
@@ -741,18 +750,20 @@ the HRD restarts at 40 % fullness, so the first frame after a re-send is about
 
   | | reached | sus_est | sus_use | step-up on sus_use |
   |---|---|---|---|---|
-  | **shipped: in place, 2 s releasable hold, raise off** | 90/95/91 | 66/66/63 | **52/58/55** | 4100/16800, 4200/11100, 4300/6600 |
+  | **shipped: in place, 2 s releasable hold, raise on** | 96/96/95 | 85/89/85 | **70/67/71** | 4500/11000, 5200/9900, 4500/5500 |
+  | the same, raise mutated off (padding alone; the earlier default) | 90/95/91 | 66/66/63 | 51/58/55 | 4100/16800, 4200/11000, 4300/6600 |
+  | the same, raise at the pessimistic yield 0.86 | 96/94/92 | 79/53/37 | 57/36/21 | 4800/10700, 4400/18500, 6200/17800 |
   | the same, hold never released | 90/95/91 | 66/67/64 | 52/58/56 | 4700/17000, 4700/20400, 4800/14000 |
-  | the same, 1 s hold | 92/84/81 | 67/52/52 | 28/16/18 | 11100/17300, 11300/17900, 8300/22300 |
+  | the same, 1 s hold (raise off) | 92/84/81 | 67/52/52 | 28/16/18 | 11100/17300, 11300/17900, 8300/22300 |
+  | the same, 1 s hold, raise on | 66/45/67 | 23/11/27 | 13/3/21 | 14400/21400, 14900/21700, 12600/16000 |
   | Phase A policy | 90/81/85 | 74/61/55 | 60/48/43 | 10400/20500, 10600/17300, 10800/18100 |
-  | raise on, every guard | 95/92/93 | 74/63/64 | 55/28/44 | 5300/16900, 6600/20000, 6000/11800 |
-  | raise on, no "padding judged" guard | 96/96/95 | 85/89/85 | 70/67/71 | 4500/11000, 5200/9900, 4500/5500 |
+  | raise on, with the "padding judged" wait (removed) | 95/92/93 | 74/63/64 | 55/28/44 | 5300/16900, 6600/20000, 6000/11800 |
 
   Before this review's fixes the shipped row (2 s hold, raise on, the stale spike
   re-armed, the earlier model) read 96/95/95 reached, 78/71/72 `sus_est` and
   69/65/62 `sus_use`: "reached" was mostly a transient spike. Shallow buffers
-  (48 timelines, as sent): `sus_use` 26 / 35 of 48 at 30 / 60 ms without the
-  raise, 31 / 31 with every guard. Scene 6 (a capacity drop, with a drop shortly
+  (48 timelines, as sent): `sus_use` 30 / 31 of 48 at 30 / 60 ms without the
+  raise, 26 / 23 with it as shipped. Scene 6 (a capacity drop, with a drop shortly
   after a rise, 6B, and 600 ms after the probe's spike, 6C) bounds the bytes coded at the
   rate in force in any 1 s window at 1.15 x `RATE_SHARE x` the estimate, the
   backpressure skips after the drop at half those of a stream with no rate
