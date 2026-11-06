@@ -131,6 +131,20 @@ struct RateCommands {
 
 const NUDGE_BPS: u32 = 16;
 
+/// The HRD's initial fullness (percent of the buffer) on an IDR: the encoder
+/// starts from it, so the picture gets most of the buffer.
+const IDR_HRD_FULLNESS_PCT: u32 = 75;
+
+/// The HRD's initial fullness on a P-frame re-send of the rate buffers. Every
+/// re-send resets the VCE's buffer level to this, and the level steers the next
+/// frames. Measured on the RX 480 (`h264_direct_resend_fullness_sweep`,
+/// 2026-11-05; frame 1 / 2 / 3 after the re-send as a multiple of the average
+/// frame, pure re-send and +-10 % steps alike): 30 %: 0.71 / 0.41 / 0.81; 40 %:
+/// 1.00 / 0.56 / 0.87; 50 %: 1.32 / 0.69 / 0.88; 60 %: 1.40 / 0.92 / 0.97; 75 %
+/// (the old value): 1.40 / 1.08. No HRD or RC only: 1.49 on frame 1. 40 % takes
+/// the burst peak away for a short dip of about 19 % of the bytes over 3 frames.
+const P_RESEND_HRD_FULLNESS_PCT: u32 = 40;
+
 /// What to send for a frame, or nothing. Pure, so the nudge and the IDR
 /// raise are testable without a GPU.
 ///
@@ -139,6 +153,8 @@ const NUDGE_BPS: u32 = 16;
 /// - Mesa re-issues the VCE rate command only when the rate changes, so a
 ///   changed cap or VBV latches only if `bits_per_second` differs from the
 ///   last send (S2). When it would be equal it is moved by 16 bps.
+/// - A P-frame re-send starts the HRD at [`P_RESEND_HRD_FULLNESS_PCT`], an IDR
+///   at [`IDR_HRD_FULLNESS_PCT`].
 fn rate_commands(
     rate: &RateTarget,
     qp: u32,
@@ -174,8 +190,13 @@ fn rate_commands(
     rc.target_percentage = 100;
     rc.window_size = 1000;
     rc.initial_qp = qp;
+    let fullness_pct = if idr {
+        IDR_HRD_FULLNESS_PCT
+    } else {
+        P_RESEND_HRD_FULLNESS_PCT
+    };
     let hrd = VAEncMiscParameterHRD {
-        initial_buffer_fullness: vbv / 4 * 3,
+        initial_buffer_fullness: (u64::from(vbv) * u64::from(fullness_pct) / 100) as u32,
         buffer_size: vbv,
         va_reserved: [0; VA_PADDING_LOW],
     };
@@ -1297,6 +1318,28 @@ mod tests {
         );
         assert_eq!(p.hrd.buffer_size, r.vbv_bits);
         assert!(rate_commands(&r, 26, false, false, true, &mut last).is_none());
+    }
+
+    #[test]
+    fn rate_commands_p_resend_starts_the_hrd_at_40_percent_and_the_idr_at_75() {
+        let r = RateTarget::steady(6_000_000, 30);
+        let mut last = SentRate::default();
+        let idr = rate_commands(&r, 26, true, false, true, &mut last).unwrap();
+        assert_eq!(
+            idr.hrd.initial_buffer_fullness,
+            idr.hrd.buffer_size / 4 * 3,
+            "the IDR keeps 75 %"
+        );
+        // The first P after the IDR and a dirty P are both P re-sends.
+        let p = rate_commands(&r, 26, false, false, true, &mut last).unwrap();
+        let dirty = rate_commands(&r, 26, false, true, true, &mut last).unwrap();
+        for c in [p, dirty] {
+            assert_eq!(c.hrd.buffer_size, r.vbv_bits);
+            assert_eq!(
+                u64::from(c.hrd.initial_buffer_fullness),
+                u64::from(r.vbv_bits) * 40 / 100
+            );
+        }
     }
 
     #[test]
