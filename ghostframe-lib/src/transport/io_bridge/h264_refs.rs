@@ -84,8 +84,9 @@ pub(super) struct RefsCounters {
     /// Of `rate_updates`, those that raised the rate, and those that lowered it.
     pub(super) rate_applies_up: u64,
     pub(super) rate_applies_down: u64,
-    /// Every send of the rate buffers the policy asked for (the initial one
-    /// included), and those in the last [`RATE_SEND_WINDOW`].
+    /// Every send of the rate buffers (the initial one included; the policy's
+    /// and the probe raise's, entering and leaving a window), and those in the
+    /// last [`RATE_SEND_WINDOW`].
     pub(super) rate_sends: u64,
     pub(super) rate_sends_window: u64,
     /// The probe raise (see [`IoBridge::h264_probe_raise`]): windows in which
@@ -153,9 +154,24 @@ struct RaisedFrame {
 
 /// How many raised frames are followed at once.
 const RAISED_TRACKED: usize = 64;
+/// A queue on the path counts as distress for a held spike once it has stood
+/// this long without a break (a probe burst's own queue drains well inside it).
+/// 400 ms and 800 ms cost the step-up population nothing (sus_use 51/58/55 and
+/// 52/58/55 of 96, against 52/58/55); 200 ms let go a spike's hold during
+/// ordinary bursts.
+pub(super) const SPIKE_QUEUE_PERSIST: Duration = Duration::from_millis(400);
 /// No raise for this long after a late acknowledgement (a spurious loss
-/// verdict): a path that reorders makes a burst look like loss.
+/// verdict): a path that reorders makes a burst look like loss. The memory is
+/// two checkpoints at least this far apart, so a late acknowledgement keeps
+/// the raise off for between this and twice this (5 to 10 s).
 const RAISE_REORDER_MEMORY: Duration = Duration::from_secs(5);
+/// No raise for this long after a raised frame was named lost, or a probe pad
+/// (the same burst, without a picture to lose) was. A window's
+/// burst on a buffer shallower than the burst tail-drops the frames queued
+/// behind it (review 2: a median 6 raised frames lost per step-up run at a 60
+/// ms buffer, 12 at 30 ms, against none with the raise off); padding alone
+/// fills the windows meanwhile, as before the raise.
+pub(super) const RAISE_LOSS_PAUSE: Duration = Duration::from_secs(10);
 
 impl RefsState {
     fn new(frame_interval: Duration, srtt: Duration) -> Self {
@@ -215,9 +231,11 @@ pub struct RefsReport {
     pub rate_updates: u64,
     pub rate_applies_up: u64,
     pub rate_applies_down: u64,
-    /// Rate-buffer re-sends the policy asked for, in total and in the last
-    /// 10 s (each one costs the encoder a first frame of 1.4-1.9x the
-    /// average, T4): divide the window by 10 for the per-second rate.
+    /// Rate-buffer re-sends (the policy's and the probe raise's, entering and
+    /// leaving a window), in total and in the last 10 s. Each costs the
+    /// encoder a dip over its next frames (T4: 1.00 / 0.56 / 0.87 of the
+    /// average after a re-send at 40 % fullness; a window's end dips to about
+    /// 0.5 for two frames): divide the window by 10 for the per-second rate.
     pub rate_sends: u64,
     pub rate_sends_10s: u64,
     /// The probe raise: windows in which P frames were coded at the window's
@@ -360,6 +378,9 @@ impl IoBridge {
                 raised = Some((plan.frame_seq, window));
             }
         }
+        if rate_policy {
+            self.note_rate_send(now, rate);
+        }
         let cap = if is_idr {
             rate.idr_max_bytes
         } else {
@@ -377,6 +398,21 @@ impl IoBridge {
             fps,
             rate,
         }))
+    }
+
+    /// Count a re-send of the rate buffers: the backend is told a target other
+    /// than the last it was told. That is a rate the policy moved, and also
+    /// the frame that enters a probe window (the window's rate) and the first
+    /// one after it (back to the normal rate), each of which costs the VCE a
+    /// first-frame dip.
+    fn note_rate_send(&mut self, now: Instant, rate: RateTarget) {
+        if self.h264.last_planned_rate == Some(rate) {
+            return;
+        }
+        self.h264.last_planned_rate = Some(rate);
+        self.h264.refs_counters.rate_sends += 1;
+        self.h264.rate_send_times.push_back(now);
+        self.h264.refs_counters.rate_sends_window = self.h264.rate_send_times.len() as u64;
     }
 
     /// A frame coded at a probe window's rate goes out: count it and follow it
@@ -428,7 +464,7 @@ impl IoBridge {
 
     /// A verdict named a fragment of a P frame: if it was a raised one, it is
     /// counted (once per frame).
-    pub(super) fn note_raised_lost(&mut self, frame_seq: u32) {
+    pub(super) fn note_raised_lost(&mut self, frame_seq: u32, now: Instant) {
         let Some(st) = self.h264.refs.as_mut() else {
             return;
         };
@@ -438,6 +474,7 @@ impl IoBridge {
             .find(|r| r.frame_seq == frame_seq && !r.lost)
         {
             r.lost = true;
+            self.h264.raise_paused_until = Some(now + RAISE_LOSS_PAUSE);
             self.h264.refs_counters.raised_frame_lost += 1;
         }
     }
@@ -880,23 +917,39 @@ impl IoBridge {
             self.h264.rate_send_times.pop_front();
         }
         self.h264.refs_counters.rate_sends_window = self.h264.rate_send_times.len() as u64;
-        let estimate = self.bwe.snapshot().bitrate_bps;
+        let snap = self.bwe.snapshot();
+        let estimate = snap.bitrate_bps;
+        // Distress: the congestion controller is limiting the estimate for
+        // loss, or a queue has stood on the path for `SPIKE_QUEUE_PERSIST`
+        // without a break. A held spike is let go early when the estimate
+        // falls with it. A queue alone is not enough: a probe burst builds one
+        // by design (releasing on the queue the moment it stood let the spike
+        // go on most step-ups and cut sustained use of the headroom from 69 to
+        // 12 of 96); one that outlasts the burst is the stream sending past the
+        // path.
+        let queue = self.bwe.standing_queue();
+        let since = &mut self.h264.queue_since;
+        if queue {
+            since.get_or_insert(now);
+        } else {
+            *since = None;
+        }
+        let queue_persists =
+            since.is_some_and(|t| now.saturating_duration_since(t) >= SPIKE_QUEUE_PERSIST);
+        let distress = snap.stats.loss_state.is_limited() || queue_persists;
         let before = self.h264.rate.applied();
         #[cfg(feature = "browserless-harness")]
         let apply = if self.h264.phase_a_rate_step {
             self.phase_a_apply(now, estimate)
         } else {
-            self.h264.rate.step_in_place(now, estimate)
+            self.h264.rate.step_in_place(now, estimate, distress)
         };
         #[cfg(not(feature = "browserless-harness"))]
-        let apply = self.h264.rate.step_in_place(now, estimate);
+        let apply = self.h264.rate.step_in_place(now, estimate, distress);
         let Some(apply) = apply else {
             return;
         };
         let bps = apply.bps;
-        self.h264.refs_counters.rate_sends += 1;
-        self.h264.rate_send_times.push_back(now);
-        self.h264.refs_counters.rate_sends_window = self.h264.rate_send_times.len() as u64;
         if !apply.initial {
             self.h264.refs_counters.rate_updates += 1;
             if before.is_some_and(|b| bps > b) {

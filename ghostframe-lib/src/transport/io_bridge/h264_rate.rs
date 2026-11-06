@@ -54,10 +54,24 @@ const SPIKE_HOLD: Duration = Duration::from_secs(1);
 /// the estimate's peak for a few hundred milliseconds, and the stream has to
 /// be sent at the rate it found for long enough for the acknowledgements to
 /// confirm it, or goog_cc pulls the estimate back before the stream uses it.
-/// Swept on the 96-seed step-up population (`GF_POP_MODE=refs`, 2026-11-06): 0.5
-/// s reached the headroom on 75/81/77 of 96, 1 s on 79/80/80, 2 s on 96/95/95,
-/// and the p90 step-up fell from 12.4 s to 5.5 s.
+/// Swept on the 96-seed step-up population (`GF_POP_MODE=refs-hold-1s` against
+/// `refs`, 2026-11-06, sustained metric: the estimate held over the line for a
+/// second and the stream sending at 0.8 x it): 1 s of hold used the headroom on
+/// 28/16/18 of 96 timelines, 2 s on 52/58/55. The hold can be let go early (see
+/// [`SPIKE_RELEASE_FRACTION`]).
 pub(crate) const SPIKE_HOLD_IN_PLACE: Duration = Duration::from_secs(2);
+/// A held spike is let go early when the raw estimate falls below the
+/// smoothed one from before the spike (the path is worse than it was: nothing
+/// is left to hold on to) ...
+///
+/// ... or below this fraction of the spike while the congestion controller
+/// reports distress (a loss-limited estimate or a queue standing on the path).
+/// A spike nobody uses decays on its own, faster than the hold ends; a fall
+/// the hold would ride out is what 2 s of hold costs: a stream 3x its path
+/// for as long (review 2, 2026-11-06: 42 KB over capacity in the 3 s after a
+/// drop at 7 s, 689 ms latency, 116 of 150 frames shown, against 0, about
+/// 270 ms and 142 for Phase A).
+const SPIKE_RELEASE_FRACTION: f64 = 0.85;
 /// A candidate is looked at no more often than this.
 const EVAL_MIN_INTERVAL: Duration = Duration::from_millis(250);
 /// A candidate is adopted at least this often, however little it moved.
@@ -148,12 +162,16 @@ pub(super) struct AppProbe {
 pub(super) const PAD_CEILING_HOLD: Duration = Duration::from_millis(1000);
 /// What the frames of a raised probe window still to come are expected to
 /// carry, as a fraction of an average frame at the window's rate, when padding
-/// is sized. The VCE's re-send profile after a rise is 1.00 / 0.56 / 0.87 of
-/// the average; the later frames are counted at about the lowest of them, so a
+/// is sized. The VCE's profile for a window's rise is 1.00 / 0.36 / 0.83 of
+/// the average (T4); the later frames are counted at about the middle, so a
 /// shortfall is made good by padding rather than left to the frames.
 const RAISE_EXPECTED_YIELD: f64 = 0.5;
 /// At most this many frames are coded at one window's rate.
 const RAISE_MAX_FRAMES: u32 = 3;
+/// The raise waits this long after the stream's first padding, so that the
+/// loss path has judged it (a pad lost pauses the raise, see
+/// [`RAISE_LOSS_PAUSE`](super::h264_refs::RAISE_LOSS_PAUSE)).
+const RAISE_TRUST_AFTER: Duration = Duration::from_millis(300);
 /// An IDR this close is the burst of the window; no padding.
 const PAD_IDR_LOOKAHEAD: Duration = Duration::from_millis(150);
 
@@ -186,6 +204,17 @@ pub(crate) struct RateApply {
     pub cut: bool,
 }
 
+/// A jump of the raw estimate being held.
+#[derive(Debug, Clone, Copy)]
+struct Spike {
+    /// The highest raw estimate of the jump.
+    value: f64,
+    /// When the hold ends.
+    until: Instant,
+    /// The smoothed estimate just before the jump began.
+    pre_ewma: f64,
+}
+
 /// The pure rate policy. See the module docs.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RatePolicy {
@@ -197,7 +226,20 @@ pub(crate) struct RatePolicy {
     /// over the rise line. A rise reopen needs [`RISE_CONFIRMATIONS`].
     rise_streak: u32,
     /// A jump of the raw estimate, and when its hold ends.
-    spike: Option<(f64, Instant)>,
+    spike: Option<Spike>,
+    /// Spike holds let go early (see [`SPIKE_RELEASE_FRACTION`]).
+    pub(crate) spike_releases: u64,
+    /// Harness only: the in-place hold, and whether it can be let go early
+    /// (`InjectedH264::spike_tune`). `None` / `false`: as shipped.
+    hold_override: Option<Duration>,
+    hold_unreleasable: bool,
+    /// The candidate was computed from a held spike.
+    candidate_spiked: bool,
+    /// The running rate was applied from a held spike.
+    applied_spiked: bool,
+    /// The highest rate applied from outside a spike before the spike
+    /// rate(s) now running: what a release is a fall from (not a cut).
+    pre_spike_applied: Option<u32>,
     /// The rate the encoder runs at, as last commanded.
     applied: Option<u32>,
     candidate: Option<u32>,
@@ -205,7 +247,8 @@ pub(crate) struct RatePolicy {
     last_eval: Option<Instant>,
     last_reopen: Option<Instant>,
     /// Rates applied in place within [`CUT_LOOKBACK`].
-    recent_applies: std::collections::VecDeque<(Instant, u32)>,
+    /// Each with whether it came from a held spike.
+    recent_applies: std::collections::VecDeque<(Instant, u32, bool)>,
     last_apply: Option<Instant>,
 }
 
@@ -231,26 +274,54 @@ impl RatePolicy {
     }
 
     fn target(&self, now: Instant) -> u32 {
+        self.target_spiked(now).0
+    }
+
+    /// The target, and whether a held spike raised it.
+    fn target_spiked(&self, now: Instant) -> (u32, bool) {
         let mut e = self.ewma_bps.unwrap_or(0.0);
-        if let Some((v, until)) = self.spike {
-            if now < until {
-                e = e.max(v);
+        let mut spiked = false;
+        if let Some(s) = self.spike.filter(|s| now < s.until) {
+            if s.value > e {
+                e = s.value;
+                spiked = true;
             }
         }
         let t = (RATE_SHARE * e).clamp(f64::from(RATE_FLOOR_BPS), f64::from(RATE_CAP_BPS));
-        t as u32
+        (t as u32, spiked)
     }
 
-    fn observe(&mut self, now: Instant, estimate_bps: u64, spike_hold: Duration) {
+    /// Fold in one raw estimate. `distress` is `Some` where a held spike can
+    /// be let go early (see [`SPIKE_RELEASE_FRACTION`]): whether the
+    /// congestion controller reports a loss limit or a queue on the path.
+    fn observe(
+        &mut self,
+        now: Instant,
+        estimate_bps: u64,
+        spike_hold: Duration,
+        distress: Option<bool>,
+    ) {
         let est = estimate_bps as f64;
         match (self.ewma_bps, self.last_obs) {
             (Some(e), Some(t)) => {
                 let dt = now.saturating_duration_since(t).as_secs_f64();
+                if let (Some(s), Some(distress)) = (self.spike.filter(|s| now < s.until), distress)
+                {
+                    if est < s.pre_ewma || (distress && est < SPIKE_RELEASE_FRACTION * s.value) {
+                        self.spike = None;
+                        self.spike_releases += 1;
+                    }
+                }
                 if est > e * SPIKE_RATIO {
                     let until = now + spike_hold;
-                    // An expired spike is gone: only a live one is carried into the new one.
-                    let live = self.spike.filter(|s| now < s.1).map_or(0.0, |s| s.0);
-                    self.spike = Some((est.max(live), until));
+                    // An expired spike is gone: only a live one is carried
+                    // into the new one.
+                    let live = self.spike.filter(|s| now < s.until);
+                    self.spike = Some(Spike {
+                        value: est.max(live.map_or(0.0, |s| s.value)),
+                        until,
+                        pre_ewma: live.map_or(e, |s| s.pre_ewma),
+                    });
                 }
                 let alpha = 1.0 - (-dt / EWMA_TAU.as_secs_f64()).exp();
                 self.ewma_bps = Some(e + alpha * (est - e));
@@ -270,7 +341,7 @@ impl RatePolicy {
     /// the frame about to be encoded. `at_gop` is whether that frame is the
     /// scheduled GOP IDR.
     pub(crate) fn step(&mut self, now: Instant, estimate_bps: u64, at_gop: bool) -> RateStep {
-        self.observe(now, estimate_bps, SPIKE_HOLD);
+        self.observe(now, estimate_bps, SPIKE_HOLD, None);
         let Some(applied) = self.applied else {
             let t = self.target(now);
             self.applied = Some(t);
@@ -337,8 +408,15 @@ impl RatePolicy {
     /// the dead band ([`APPLY_RISE_FRACTION`] for a rise, [`APPLY_MOVE_FRACTION`]
     /// for a fall), never twice within [`APPLY_MIN_INTERVAL`]. A rate inside
     /// the band is not re-sent: each re-send of the rate buffers costs a dip.
-    pub(crate) fn step_in_place(&mut self, now: Instant, estimate_bps: u64) -> Option<RateApply> {
-        self.observe(now, estimate_bps, SPIKE_HOLD_IN_PLACE);
+    pub(crate) fn step_in_place(
+        &mut self,
+        now: Instant,
+        estimate_bps: u64,
+        distress: bool,
+    ) -> Option<RateApply> {
+        let hold = self.hold_override.unwrap_or(SPIKE_HOLD_IN_PLACE);
+        let releasable = (!self.hold_unreleasable).then_some(distress);
+        self.observe(now, estimate_bps, hold, releasable);
         let Some(applied) = self.applied else {
             let t = self.target(now);
             self.applied = Some(t);
@@ -346,7 +424,7 @@ impl RatePolicy {
             self.candidate_at = Some(now);
             self.last_eval = Some(now);
             self.last_apply = Some(now);
-            self.recent_applies.push_back((now, t));
+            self.recent_applies.push_back((now, t, false));
             return Some(RateApply {
                 bps: t,
                 initial: true,
@@ -358,17 +436,21 @@ impl RatePolicy {
             .is_none_or(|t| now.saturating_duration_since(t) >= EVAL_MIN_INTERVAL)
         {
             self.last_eval = Some(now);
-            let target = self.target(now);
+            let (target, spiked) = self.target_spiked(now);
             let adopt = match (self.candidate, self.candidate_at) {
                 (Some(c), Some(at)) => {
                     relative_move(c, target) > MOVE_FRACTION
                         || now.saturating_duration_since(at) >= CANDIDATE_REFRESH
+                        // A spike that began or ended is a new candidate
+                        // whatever its size.
+                        || spiked != self.candidate_spiked
                 }
                 _ => true,
             };
             if adopt {
                 self.candidate = Some(target);
                 self.candidate_at = Some(now);
+                self.candidate_spiked = spiked;
             }
         }
         let cand = self.candidate.unwrap_or(applied);
@@ -389,24 +471,49 @@ impl RatePolicy {
         while self
             .recent_applies
             .front()
-            .is_some_and(|&(t, _)| now.saturating_duration_since(t) > CUT_LOOKBACK)
+            .is_some_and(|&(t, _, _)| now.saturating_duration_since(t) > CUT_LOOKBACK)
         {
             self.recent_applies.pop_front();
         }
+        // A cut is a fall from the rate the stream ran at outside a spike: the
+        // spike's own rate, and the give-back when its hold ends, are not the
+        // path shrinking (a spike is only recognised above 1.5 x the smoothed
+        // estimate, so its give-back is always a fall of over 30 %, and
+        // counting it a cut silences padding, the raise and the application's
+        // probes for 3 s: every cut in the step-up scene was this).
+        let spiked = self.candidate_spiked;
+        let own = if self.applied_spiked { 0 } else { applied };
         let high = self
             .recent_applies
             .iter()
-            .map(|&(_, b)| b)
-            .fold(applied, u32::max);
-        let cut = f64::from(cand) < f64::from(high) * (1.0 - DROP_FRACTION);
+            .filter(|&&(_, _, sp)| !sp)
+            .map(|&(_, b, _)| b)
+            .fold(own.max(self.pre_spike_applied.unwrap_or(0)), u32::max);
+        let cut = !spiked && f64::from(cand) < f64::from(high) * (1.0 - DROP_FRACTION);
+        if spiked {
+            if !self.applied_spiked {
+                self.pre_spike_applied = Some(applied);
+            }
+        } else {
+            self.pre_spike_applied = None;
+        }
         self.applied = Some(cand);
+        self.applied_spiked = spiked;
         self.last_apply = Some(now);
-        self.recent_applies.push_back((now, cand));
+        self.recent_applies.push_back((now, cand, spiked));
         Some(RateApply {
             bps: cand,
             initial: false,
             cut,
         })
+    }
+
+    /// Harness only: hold a spike for `hold` instead of
+    /// [`SPIKE_HOLD_IN_PLACE`], and `releasable` or not.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub(crate) fn tune_spike_for_harness(&mut self, hold: Option<Duration>, releasable: bool) {
+        self.hold_override = hold;
+        self.hold_unreleasable = !releasable;
     }
 }
 
@@ -486,7 +593,16 @@ impl IoBridge {
     /// padding in flight.
     pub(super) fn h264_reset_probing(&mut self) {
         self.h264.app_probe = AppProbe::default();
+        self.h264.first_pad_at = None;
+        self.h264.queue_since = None;
         self.reliable_emitter.pads.clear();
+    }
+
+    /// Whether the rate was cut within [`PAD_QUIET_AFTER_CUT`].
+    pub(super) fn h264_cut_recent(&self, now: Instant) -> bool {
+        self.h264
+            .last_cut_at
+            .is_some_and(|t| now.saturating_duration_since(t) < PAD_QUIET_AFTER_CUT)
     }
 
     /// Whether padding may be queued now (design: bounded, never in the way).
@@ -495,11 +611,7 @@ impl IoBridge {
     /// path is shrinking, probing it is the wrong moment, and it is also when
     /// the extra queue would cost frames.
     fn h264_pad_allowed(&self, now: Instant, own_bytes: usize) -> bool {
-        if self
-            .h264
-            .last_cut_at
-            .is_some_and(|t| now.saturating_duration_since(t) < PAD_QUIET_AFTER_CUT)
-        {
+        if self.h264_cut_recent(now) {
             return false;
         }
         self.reliable_emitter
@@ -590,23 +702,44 @@ impl IoBridge {
     /// price of the burst, not the path the cost of padding it carries. So the
     /// window is claimed *before* the frame is planned (goog_cc's request
     /// first, else the application's), and every P frame planned while it is
-    /// open gets the window's rate: about three frames of a 100 ms window at
-    /// 30 fps. Once the window is over, the next plan is at the normal rate
-    /// again, a re-send of the rate buffers that costs about nothing. What the
+    /// open gets the window's rate: up to three frames of a 100 ms window at
+    /// 30 fps, 2.1 on average. Once the window is over, the next plan is at the
+    /// normal rate again, a re-send of the rate buffers that costs a dip of
+    /// about 0.5 of the average for two frames (T4). What the
     /// frames do not carry is topped up with padding on the window's last frame
     /// (see [`Self::h264_probe_pad`]).
     ///
-    /// Not while the rate has been cut (the guards of opening a window, see
-    /// `h264_pad_allowed`), while the path has shown reordering lately (a burst
-    /// reads as loss there) or when the window's rate is no more than a rise
-    /// band over the normal one. The estimate ceiling is held off for any
-    /// window the raise uses.
+    /// Not while the rate has been cut, while the path has shown reordering
+    /// lately (a burst reads as loss there), within `RAISE_LOSS_PAUSE` of a
+    /// raised frame or a probe pad judged lost (the burst overran the path's
+    /// buffer), before padding has gone out and been judged, or when the
+    /// window's rate is no more than a rise band over the normal one. Each is
+    /// checked for every raised plan, not only when a window opens. Off unless
+    /// `probe_raise_on` (see its doc). The estimate ceiling is held off for
+    /// any window the raise uses.
     pub(super) fn h264_probe_raise(&mut self, now: Instant, base_bps: u32) -> Option<(u32, i32)> {
-        if self.h264.probe_raise_off || !self.h264_refs_live() {
+        if !self.h264.probe_raise_on || !self.h264_refs_live() {
+            return None;
+        }
+        // The guards are looked at for every raised plan, not only when a
+        // window opens: a cut, a late acknowledgement or a lost raised frame
+        // inside the window ends the raise for it (the frames already raised
+        // stay).
+        if self.h264_cut_recent(now)
+            || self.h264_reordering_lately(now)
+            || self.h264.raise_paused_until.is_some_and(|t| now < t)
+            // No raise until padding has gone out and had the time to be
+            // judged: a burst of real frames is only as safe as the burst of
+            // padding that has already crossed the path.
+            || self
+                .h264
+                .first_pad_at
+                .is_none_or(|t| now.saturating_duration_since(t) < RAISE_TRUST_AFTER)
+        {
             return None;
         }
         if self.active_probe.is_none() {
-            if self.h264_reordering_lately(now) || !self.h264_pad_allowed(now, 0) {
+            if !self.h264_pad_allowed(now, 0) {
                 return None;
             }
             self.open_probe_window_for_burst(now);
@@ -621,7 +754,7 @@ impl IoBridge {
             return None;
         }
         let id = p.id;
-        // The window's duration bounds the frames raised in it (about three at
+        // The window's duration bounds the frames raised in it (up to three at
         // 30 fps); `RAISE_MAX_FRAMES` bounds a long window.
         if self.h264.refs.as_ref().is_some_and(|r| {
             r.raise_window == Some(id) && r.raise_window_frames >= RAISE_MAX_FRAMES
@@ -761,6 +894,7 @@ impl IoBridge {
         // path for the window plus what the queue it builds and a round trip
         // can add.
         self.bwe.hold_ceiling(now, PAD_CEILING_HOLD);
+        self.h264.first_pad_at.get_or_insert(now);
         self.h264.stats.probe_padding_windows += 1;
         self.h264.stats.probe_padding_datagrams += n as u64;
         self.h264.stats.probe_padding_bytes += bytes;
@@ -964,12 +1098,12 @@ mod tests {
         p.step(t0, 10 * MBIT, false);
         // One observation 250 ms after a step to 20 Mbit/s: 1 - 1/e = 63.2 %
         // of the way.
-        p.observe(ms(t0, 250), 20 * MBIT, SPIKE_HOLD);
+        p.observe(ms(t0, 250), 20 * MBIT, SPIKE_HOLD, None);
         let e = p.ewma_bps.unwrap();
         let want = 10e6 + (1.0 - (-1.0f64).exp()) * 10e6;
         assert!((e - want).abs() < 1.0, "{e} vs {want}");
         // And a long gap converges on the new value.
-        p.observe(ms(t0, 10_250), 20 * MBIT, SPIKE_HOLD);
+        p.observe(ms(t0, 10_250), 20 * MBIT, SPIKE_HOLD, None);
         assert!((p.ewma_bps.unwrap() - 20e6).abs() < 1e3);
     }
 
@@ -1634,7 +1768,7 @@ mod tests {
         let mut out = Vec::new();
         let mut t = from_ms;
         while t < to_ms {
-            if let Some(a) = p.step_in_place(ms(t0, t), est(t)) {
+            if let Some(a) = p.step_in_place(ms(t0, t), est(t), false) {
                 out.push((t, a));
             }
             t += 16;
@@ -1850,14 +1984,18 @@ mod tests {
     #[test]
     fn in_place_an_expired_spike_is_not_rearmed_by_a_later_one() {
         let t0 = Instant::now();
+        // A hold that is never let go early (Phase A's, and the harness's
+        // mutation): a released spike is gone before it could be re-armed.
         let mut p = RatePolicy::default();
+        p.tune_spike_for_harness(None, false);
         let est = |t: u64| match t {
             0..3_000 => 6 * MBIT,
             3_000..3_100 => 10 * MBIT,
             3_100..10_000 => 6 * MBIT,
             10_000..20_000 => 2 * MBIT,
             20_000..20_100 => 3_500_000,
-            _ => 2 * MBIT,
+            // Back to a little under the reading, over the 2 Mbit/s before it.
+            _ => 3_200_000,
         };
         let steps = drive(&mut p, t0, 0, 24_000, est);
         let after: Vec<_> = steps.iter().filter(|(t, _)| *t >= 19_000).collect();
@@ -1869,6 +2007,134 @@ mod tests {
         assert!(
             worst <= (0.8 * 3_500_000.0 * 1.01) as u32,
             "the stale 10 Mbit/s spike came back: applied {worst}"
+        );
+    }
+
+    /// `drive` with the congestion controller's distress as a function of the
+    /// time, and the policy given.
+    fn drive_with(
+        p: &mut RatePolicy,
+        t0: Instant,
+        to_ms: u64,
+        est: impl Fn(u64) -> u64,
+        distress: impl Fn(u64) -> bool,
+    ) -> Vec<(u64, RateApply)> {
+        let mut out = Vec::new();
+        let mut t = 0;
+        while t < to_ms {
+            if let Some(a) = p.step_in_place(ms(t0, t), est(t), distress(t)) {
+                out.push((t, a));
+            }
+            t += 16;
+        }
+        out
+    }
+
+    /// The first apply at or after `from` that is under `below` bit/s.
+    fn first_under(steps: &[(u64, RateApply)], from: u64, below: u32) -> Option<&(u64, RateApply)> {
+        steps.iter().find(|(t, a)| *t >= from && a.bps < below)
+    }
+
+    /// A 5 Mbit/s path with a 15 Mbit/s spike at 3 s, the hold at 2 s.
+    fn spike_est(t: u64) -> u64 {
+        if (3_000..3_100).contains(&t) {
+            15 * MBIT
+        } else {
+            5 * MBIT
+        }
+    }
+
+    /// The hold is let go as soon as the raw estimate is under what it was
+    /// before the spike: the path got worse, there is no headroom to hold.
+    #[test]
+    fn in_place_a_spike_is_released_when_the_estimate_falls_below_its_pre_spike_level() {
+        let t0 = Instant::now();
+        let fall = |t: u64| if t >= 3_600 { 2 * MBIT } else { spike_est(t) };
+        let mut p = RatePolicy::default();
+        let steps = drive_with(&mut p, t0, 7_000, fall, |_| false);
+        assert!(
+            steps.iter().any(|(t, a)| *t >= 3_000 && a.bps >= 9_000_000),
+            "premise: the spike's headroom was taken"
+        );
+        let down = first_under(&steps, 3_300, 4_000_000).expect("the fall is followed");
+        assert!(
+            down.0 < 3_000 + 1_000,
+            "followed {} ms after the spike, inside the 2 s hold",
+            down.0 - 3_000
+        );
+        assert!(p.spike_releases >= 1);
+        assert!(down.1.cut, "a real fall right after a spike is a cut");
+        // Mutation: the hold that cannot be released rides the fall out.
+        let mut p = RatePolicy::default();
+        p.tune_spike_for_harness(None, false);
+        let steps = drive_with(&mut p, t0, 7_000, fall, |_| false);
+        let late = first_under(&steps, 3_300, 4_000_000).expect("followed in the end");
+        assert!(late.0 >= 3_000 + 1_800, "held until {} ms", late.0);
+    }
+
+    /// While the controller reports distress, an estimate under 0.85 x the
+    /// spike lets it go; without distress the hold rides out the decay.
+    #[test]
+    fn in_place_a_spike_is_released_on_distress_and_not_on_a_quiet_decay() {
+        let t0 = Instant::now();
+        // The estimate decays from the spike to 10 Mbit/s (0.67 x the spike,
+        // still over the 5 Mbit/s before it).
+        let decay = |t: u64| {
+            if t >= 3_600 {
+                10 * MBIT
+            } else {
+                spike_est(t)
+            }
+        };
+        let down_when = |distress: bool| {
+            let mut p = RatePolicy::default();
+            let steps = drive_with(&mut p, t0, 7_000, decay, |t| distress && t >= 3_700);
+            first_under(&steps, 3_300, 11_000_000).map(|x| x.0)
+        };
+        // 10 Mbit/s * 0.8 = 8 Mbit/s: the policy gives back the spike's 12.
+        let quiet = down_when(false).expect("the decayed estimate is followed");
+        let loud = down_when(true).expect("the decayed estimate is followed");
+        assert!(quiet >= 3_000 + 1_800, "quiet decay: held until {quiet} ms");
+        assert!(loud < 3_000 + 1_200, "distress: released at {loud} ms");
+    }
+
+    /// The give-back when a spike's hold ends, at the end of the hold or early
+    /// on distress, is not a cut (it would silence padding and probing for
+    /// 3 s); a fall after the spike is one.
+    #[test]
+    fn in_place_a_spike_release_is_not_a_cut() {
+        let t0 = Instant::now();
+        // Early: the estimate decays to 10 Mbit/s with distress, 0.5 s on.
+        let decay = |t: u64| if t >= 3_500 { 10 * MBIT } else { spike_est(t) };
+        let mut p = RatePolicy::default();
+        let steps = drive_with(&mut p, t0, 8_000, decay, |t| t >= 3_600);
+        let up = steps
+            .iter()
+            .find(|(t, a)| *t >= 3_000 && a.bps >= 11_000_000)
+            .expect("premise: the spike was taken");
+        let down = first_under(&steps, up.0 + 100, 11_000_000).expect("and given back early");
+        assert!(down.0 - up.0 < 1_000, "premise: within the cut lookback");
+        assert!(
+            steps.iter().all(|(_, a)| !a.cut),
+            "the early release is not a cut: {steps:?}"
+        );
+        // At the end of the hold.
+        let mut p = RatePolicy::default();
+        let steps = drive_with(&mut p, t0, 8_000, spike_est, |_| false);
+        let up = steps
+            .iter()
+            .find(|(t, a)| *t >= 3_000 && a.bps >= 9_000_000)
+            .expect("premise: the spike was taken");
+        let down = first_under(&steps, up.0 + 100, 6_000_000).expect("and given back");
+        assert!(
+            f64::from(down.1.bps) < f64::from(up.1.bps) * 0.7,
+            "premise: the give-back is a fall of over 30 %: {} -> {}",
+            up.1.bps,
+            down.1.bps
+        );
+        assert!(
+            steps.iter().all(|(_, a)| !a.cut),
+            "no apply of a spike and its release is a cut: {steps:?}"
         );
     }
 }

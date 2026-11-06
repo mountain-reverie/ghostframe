@@ -56,7 +56,8 @@ fn load(idr_bytes: usize, p_bytes: usize) -> H264Load {
         pcm_rate_policy: false,
         pcm_rate_model: None,
         pcm_phase_a_rate: false,
-        probe_raise: true,
+        probe_raise: false,
+        spike_tune: None,
         tile_phases: [None, None],
     }
 }
@@ -1099,15 +1100,21 @@ enum StepMode {
     /// `Refs` on the earlier burst calibration of a re-send (a backend that
     /// re-sends the HRD at 75 % fullness): the first frame 1.4-1.8x.
     RefsBurst,
-    /// The refs twin with the probe raise off (padding alone fills the windows).
-    RefsNoRaise,
-    /// The refs twin with a pessimistic raise: the model gives a probe raise
-    /// 0.7 of the bytes the VCE's profile does.
+    /// The refs twin with the opt-in probe raise on (`Refs` has it off: padding
+    /// alone fills the windows).
+    RefsRaise,
+    /// `RefsRaise` with a pessimistic model: a window's frames yield 0.86 of
+    /// what the VCE's profile gives them, its minimum (mean yield 0.63).
     RefsPessRaise,
+    /// The refs twin with a 1 s spike hold (still let go early on a fall).
+    RefsHold1s,
+    /// The refs twin with the 2 s hold that is never let go early (the hold
+    /// before review 2).
+    RefsHoldFixed,
 }
 
 impl StepMode {
-    /// `GF_POP_MODE=refs|refs-phase-a|refs-bps-only|refs-full-transient|refs-linear-step|refs-burst|legacy` (default legacy).
+    /// `GF_POP_MODE=refs|refs-raise|refs-pess-raise|refs-hold-1s|refs-hold-fixed|refs-phase-a|refs-bps-only|refs-full-transient|refs-linear-step|refs-burst|legacy` (default legacy).
     fn from_env() -> Self {
         match std::env::var("GF_POP_MODE").as_deref() {
             Ok("refs") => Self::Refs,
@@ -1116,8 +1123,10 @@ impl StepMode {
             Ok("refs-full-transient") => Self::RefsFullTransient,
             Ok("refs-linear-step") => Self::RefsLinearStep,
             Ok("refs-burst") => Self::RefsBurst,
-            Ok("refs-no-raise") => Self::RefsNoRaise,
+            Ok("refs-raise") => Self::RefsRaise,
             Ok("refs-pess-raise") => Self::RefsPessRaise,
+            Ok("refs-hold-1s") => Self::RefsHold1s,
+            Ok("refs-hold-fixed") => Self::RefsHoldFixed,
             _ => Self::Legacy,
         }
     }
@@ -1152,15 +1161,26 @@ impl StepMode {
                 l.pcm_rate_model = Some(PcmRateModel::s2(40_000, 120_000, FPS).with_burst_resend());
                 l
             }
-            Self::RefsNoRaise => {
+            Self::RefsRaise => {
                 let mut l = refs_cbr_load();
-                l.probe_raise = false;
+                l.probe_raise = true;
                 l
             }
             Self::RefsPessRaise => {
                 let mut l = refs_cbr_load();
+                l.probe_raise = true;
                 l.pcm_rate_model =
-                    Some(PcmRateModel::s2(40_000, 120_000, FPS).with_raise_yield(0.7));
+                    Some(PcmRateModel::s2(40_000, 120_000, FPS).with_raise_yield(0.86));
+                l
+            }
+            Self::RefsHold1s => {
+                let mut l = refs_cbr_load();
+                l.spike_tune = Some((1_000, true));
+                l
+            }
+            Self::RefsHoldFixed => {
+                let mut l = refs_cbr_load();
+                l.spike_tune = Some((2_000, false));
                 l
             }
             Self::RefsBpsOnly => {
@@ -1220,11 +1240,26 @@ async fn capacity_step_on(
     delay_us: u64,
     mode: StepMode,
 ) -> StepRun {
+    capacity_step_deep(seed, jitter_us, ack_chatter, delay_us, mode, LINK_BUFFER_MS).await
+}
+
+/// The scenes' link buffer, ms of the link's rate.
+const LINK_BUFFER_MS: u64 = 600;
+
+/// `capacity_step_on` on a link whose buffer holds `buffer_ms`.
+async fn capacity_step_deep(
+    seed: u64,
+    jitter_us: u64,
+    ack_chatter: Option<Duration>,
+    delay_us: u64,
+    mode: StepMode,
+    buffer_ms: u64,
+) -> StepRun {
     let net = bottleneck_net(
         CapTimeline::step(STEP_FROM_BPS / 8, STEP_AT_US, STEP_TO_BPS / 8),
         delay_us,
         jitter_us,
-        600,
+        buffer_ms,
     );
     let r = run(
         scene(seed, 30, net, mode.load(), DropPlan::default()),
@@ -1468,8 +1503,16 @@ async fn probe_bursts_cause_no_verdicts_on_a_jittery_link() {
 /// read.
 struct StepSummary {
     seed: u64,
-    /// Time from the step to `0.8 x` the new capacity, if reached.
+    /// Time from the step to the first estimate sample at `0.8 x` the new
+    /// capacity, if reached. Mostly a transient spike on an in-place stream:
+    /// the gates read `sus_use` there.
     reached: Option<u64>,
+    /// The sustained metric (see [`sustained`]); `sus_use` is `None` on a
+    /// stream with no access-unit log (the legacy scripted encoder), which is
+    /// judged on `reached`.
+    sus_est: Option<u64>,
+    sus_use: Option<u64>,
+    has_au_log: bool,
     /// Lowest estimate within `T_UP` of the step over the pre-step minimum.
     low: f64,
     /// Lowest estimate from the step to the end of the run over the pre-step
@@ -1501,11 +1544,28 @@ struct StepSummary {
     raise_bytes: u64,
     raised_lost: u64,
     raised_delay_max_us: u64,
+    /// Probe pads the loss path judged lost (each pauses the raise).
+    pads_lost: u64,
 }
 
 impl StepSummary {
+    /// Found the headroom within `T_UP`: sustained and used on an access-unit
+    /// logged stream, the first sample otherwise.
     fn hit(&self) -> bool {
-        self.reached.is_some_and(|t| t <= T_UP_US)
+        let t = if self.has_au_log {
+            self.sus_use
+        } else {
+            self.reached
+        };
+        t.is_some_and(|t| t <= T_UP_US)
+    }
+    /// The time `hit` reads.
+    fn step_up_us(&self) -> Option<u64> {
+        if self.has_au_log {
+            self.sus_use
+        } else {
+            self.reached
+        }
     }
     fn collapsed(&self) -> bool {
         self.min_all < 0.5
@@ -1521,8 +1581,19 @@ async fn step_summary(
     delay_us: u64,
     mode: StepMode,
 ) -> StepSummary {
-    let st = capacity_step_on(seed, 0, ack_chatter, delay_us, mode).await;
+    step_summary_deep(seed, ack_chatter, delay_us, mode, LINK_BUFFER_MS).await
+}
+
+async fn step_summary_deep(
+    seed: u64,
+    ack_chatter: Option<Duration>,
+    delay_us: u64,
+    mode: StepMode,
+    buffer_ms: u64,
+) -> StepSummary {
+    let st = capacity_step_deep(seed, 0, ack_chatter, delay_us, mode, buffer_ms).await;
     let (reached, low) = step_outcome(&st);
+    let (sus_est, sus_use, has_au_log) = sustained(&st);
     let min_all = st
         .post
         .iter()
@@ -1534,6 +1605,9 @@ async fn step_summary(
     StepSummary {
         seed,
         reached,
+        sus_est,
+        sus_use,
+        has_au_log,
         low,
         min_all: min_all as f64 / st.pre_min as f64,
         sat_share: b.ceiling_saturated_reads as f64 / b.ceiling_reads.max(1) as f64,
@@ -1555,7 +1629,63 @@ async fn step_summary(
         raise_bytes: st.r.h264.refs.probe_raise_bytes,
         raised_lost: st.r.h264.refs.raised_frame_lost,
         raised_delay_max_us: st.r.h264.refs.raised_delivery_us_max,
+        pads_lost: st.r.h264.stats.pads_lost,
     }
+}
+
+/// The sustained step-up metric (design 4.3 as reviewed): `(sus_est, sus_use)`,
+/// microseconds from the step.
+///
+///  * `sus_est`: the first `t` on a 100 ms grid such that every estimate sample
+///    in `[t, t + 1 s]` is at least `0.8 x` the new capacity;
+///  * `sus_use`: the same `t`, and the access units captured in `[t, t + 1 s)`
+///    total at least `0.8 x` that rate (the stream *uses* what the estimate
+///    says, so a spike nobody sent into is not a step-up).
+///
+/// "Reached" (the first sample over the line) counts a transient spike: it
+/// read 96/95/95 where `sus_use` reads 24/21/18 of 32 (review 2, 2026-11-06).
+/// `None` for `sus_use` without an access-unit log.
+fn sustained(st: &StepRun) -> (Option<u64>, Option<u64>, bool) {
+    let thr = STEP_TO_BPS * 8 / 10;
+    let aus: Vec<(u64, usize)> =
+        st.r.h264_run()
+            .map(|h| {
+                h.truth
+                    .au_log
+                    .iter()
+                    .map(|a| (u64::from(a.timestamp_us), a.bytes))
+                    .collect()
+            })
+            .unwrap_or_default();
+    let has_log = !aus.is_empty();
+    let enc_bps = |from: u64| -> f64 {
+        aus.iter()
+            .filter(|(t, _)| (from..from + 1_000_000).contains(t))
+            .map(|a| a.1)
+            .sum::<usize>() as f64
+            * 8.0
+    };
+    let end = st.post.last().map_or(STEP_AT_US, |x| x.0);
+    let (mut sus_est, mut sus_use) = (None, None);
+    let mut t = STEP_AT_US;
+    while t + 1_000_000 <= end {
+        let mut win = st
+            .post
+            .iter()
+            .filter(|(s, _)| (t..=t + 1_000_000).contains(s))
+            .map(|x| x.1)
+            .peekable();
+        let est_ok = win.peek().is_some() && win.all(|b| b >= thr);
+        if est_ok && sus_est.is_none() {
+            sus_est = Some(t - STEP_AT_US);
+        }
+        if est_ok && has_log && enc_bps(t) >= 0.8 * thr as f64 {
+            sus_use = Some(t - STEP_AT_US);
+            break;
+        }
+        t += 100_000;
+    }
+    (sus_est, sus_use, has_log)
 }
 
 /// Median and 90th percentile of the times that exist, and how many seeds had
@@ -1614,28 +1744,42 @@ async fn p_b_seed_population() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(NORMAL_DELAY_US);
+    // `GF_POP_BUFFER_MS`: the link buffer (default 600 ms of the link's rate).
+    let buffer_ms: u64 = std::env::var("GF_POP_BUFFER_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(LINK_BUFFER_MS);
     let mode = StepMode::from_env();
-    for chatter in CHATTER {
+    let only_row: Option<usize> = std::env::var("GF_POP_ROW")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    for (row, chatter) in CHATTER.into_iter().enumerate() {
+        if only_row.is_some_and(|r| r != row) {
+            continue;
+        }
         let mut all = Vec::new();
         for i in start..start + n {
-            let s = step_summary(0x6701 + i, chatter, delay_us, mode).await;
+            let s = step_summary_deep(0x6701 + i, chatter, delay_us, mode, buffer_ms).await;
             println!(
-                "SEED {:#x} {mode:?} chatter={chatter:?} reached={:?} guard={:?} lowest/pre-min={:.2} min/pre-min={:.2} saturated={:.2} guard_ok={} padding_windows={} applies_up={} bytes_vs_target={:.3} padding_bytes={} raise_windows={} raise_bytes={} raised_lost={} raised_delay_max_ms={}",
-                s.seed, s.reached, s.guard_us, s.low, s.min_all, s.sat_share, s.guard_ok,
+                "SEED {:#x} {mode:?} chatter={chatter:?} reached={:?} sus_est={:?} sus_use={:?} guard={:?} lowest/pre-min={:.2} min/pre-min={:.2} saturated={:.2} guard_ok={} padding_windows={} applies_up={} bytes_vs_target={:.3} padding_bytes={} raise_windows={} raise_bytes={} raised_lost={} raised_delay_max_ms={} pads_lost={}",
+                s.seed, s.reached, s.sus_est, s.sus_use, s.guard_us, s.low, s.min_all, s.sat_share, s.guard_ok,
                 s.padding_windows, s.applies_up, s.bytes_vs_target, s.padding_bytes,
-                s.raise_windows, s.raise_bytes, s.raised_lost, s.raised_delay_max_us / 1000
+                s.raise_windows, s.raise_bytes, s.raised_lost, s.raised_delay_max_us / 1000, s.pads_lost
             );
             all.push(s);
         }
         let count = |f: &dyn Fn(&StepSummary) -> bool| all.iter().filter(|s| f(s)).count();
         println!(
-            "SUMMARY {mode:?} chatter={chatter:?} n={n}: within T_UP {}, lower bound kept {}, collapses {}, guard released {}, mean saturated share {:.2}; mean bytes/target {:.3}; step-up ms {}; guard ms {}",
+            "SUMMARY {mode:?} chatter={chatter:?} n={n}: reached {}, sus_est {}, sus_use {} (hits), lower bound kept {}, collapses {}, guard released {}, mean saturated share {:.2}; mean bytes/target {:.3}; step-up ms {} (sus_use); reached-step-up ms {}; guard ms {}",
+            count(&|s| s.reached.is_some_and(|t| t <= T_UP_US)),
+            count(&|s| s.sus_est.is_some_and(|t| t <= T_UP_US)),
             count(&|s| s.hit()),
             count(&|s| s.low >= 0.8),
             count(&|s| s.collapsed()),
             count(&|s| s.guard_ok),
             all.iter().map(|s| s.sat_share).sum::<f64>() / all.len().max(1) as f64,
             all.iter().map(|s| s.bytes_vs_target).sum::<f64>() / all.len().max(1) as f64,
+            percentiles_ms(all.iter().map(|s| s.step_up_us())),
             percentiles_ms(all.iter().map(|s| s.reached)),
             percentiles_ms(all.iter().map(|s| s.guard_us)),
         );
@@ -1807,6 +1951,21 @@ async fn p_b_population_never_collapses_and_finds_the_headroom_whenever_the_clie
 /// | refs, 2 s spike hold, raise on, model yield 0.7 | 94/93/92 | 96/96/96 | 4600/6100, 4500/6600, 5500/6700 |
 /// | refs, Phase A policy, raise off (the pre-B6 policy) | 90/86/86 | 96/96/96 | 5500/7300, 5900/11800, 5700/10900 |
 ///
+/// Every row above counts the *first estimate sample* over the line, which a
+/// probe's transient spike gives; review 2 (2026-11-06) replaced it with the
+/// sustained metric (`sustained`: `sus_est`, `sus_use`), which the gates read.
+/// Re-measured on it, at `GF_POP_N=96` (`reached/sus_est/sus_use` hits per ack
+/// timing; `sus_use` step-up p50/p90 in ms):
+///
+/// | mode | reached/sus_est/sus_use | sus_use step-up |
+/// | refs, 2 s releasable hold, raise off (shipped) | 90/66/52, 95/66/58, 91/63/55 | 4100/16800, 4200/11100, 4300/6600 |
+/// | refs, 2 s hold never released (`refs-hold-fixed`) | 90/66/52, 95/67/58, 91/64/56 | 4700/17000, 4700/20400, 4800/14000 |
+/// | refs, 1 s hold (`refs-hold-1s`) | 92/67/28, 84/52/16, 81/52/18 | 11100/17300, 11300/17900, 8300/22300 |
+/// | refs, Phase A policy (`refs-phase-a`) | 90/74/60, 81/61/48, 85/55/43 | 10400/20500, 10600/17300, 10800/18100 |
+/// | refs, raise on with every guard (`refs-raise`) | 95/74/55, 92/63/28, 93/64/44 | 5300/16900, 6600/20000, 6000/11800 |
+/// | refs, raise on, no "padding judged" guard (removed) | 96/85/70, 96/89/67, 95/85/71 | 4500/11000, 5200/9900, 4500/5500 |
+/// | refs before review 2 (stale spike, 2 s hold, raise on) | 96/78/69, 95/71/65, 95/72/62 | 4400/8300, 4400/10900, 4400/11300 |
+///
 /// The gate's model is the 40 %-fullness re-send (`pcm_rate.rs`, provisional,
 /// from T4 `h264_direct_resend_fullness_sweep` on the VCE): a P re-send of the
 /// rate buffers gives frames of 1.00, 0.56 and 0.87 times the average, the
@@ -1834,21 +1993,16 @@ async fn p_b_population_refs_twin_never_collapses_and_finds_the_headroom() {
     population_gate(StepMode::Refs, Some(REFS_TWIN_ALLOWED_MISSES)).await;
 }
 
-/// The same gate with the probe raise off (`InjectedH264::probe_raise`): padding
-/// alone fills the windows, as before the raise. The raise's effect on the
-/// headroom proxy is the difference of the two gates, and the no-raise path
-/// stays a path that works.
+/// The same gate with the opt-in probe raise on (`InjectedH264::probe_raise`):
+/// the raise is kept measured though it is not shipped.
 #[tokio::test(start_paused = true)]
-async fn p_b_population_refs_twin_without_the_probe_raise_keeps_its_bound() {
-    population_gate(
-        StepMode::RefsNoRaise,
-        Some(REFS_TWIN_NO_RAISE_ALLOWED_MISSES),
-    )
-    .await;
+async fn p_b_population_refs_twin_with_the_probe_raise_keeps_its_bound() {
+    population_gate(StepMode::RefsRaise, Some(REFS_TWIN_RAISE_ALLOWED_MISSES)).await;
 }
 
-/// The twin with a pessimistic raise: the model gives a raise 0.7 of the bytes
-/// the VCE's profile does (`PcmRateModel::raise_yield`). Same bound as the
+/// The twin with a pessimistic raise: the model gives a raise 0.86 of the bytes
+/// the VCE's profile does (`PcmRateModel::raise_yield`), the VCE's minimum
+/// (mean yield 0.63, T4 lever B). Same bound as the
 /// raise at the measured yield: the stream does not collapse and does not lose
 /// the headroom for a backend that yields less.
 #[tokio::test(start_paused = true)]
@@ -1860,21 +2014,41 @@ async fn p_b_population_refs_twin_with_a_pessimistic_raise_yield() {
     .await;
 }
 
-/// Misses allowed per gate row: `(reaching the headroom, releasing the guard)`,
-/// raise on, at the 2 s spike hold of the in-place policy
-/// (`SPIKE_HOLD_IN_PLACE`). Measured (2026-11-06), not tuned: the rows are
-/// n = 24/8/8/15/6/4 and one timeline of the second misses; the guard is
-/// always released. At 1 s of hold the same rows missed 7, 3 and 2.
+/// The gate has power: the policy with a 1 s spike hold (which breaks the
+/// probe chain: every give-back reads as a cut, 28/16/18 of 96 reach and use
+/// the headroom against 52/58/55) misses it. A mutation test that stays: it
+/// fails if the gate's bounds are loosened until they pass the broken policy.
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "missed the headroom")]
+async fn p_b_population_refs_twin_gate_fails_a_one_second_spike_hold() {
+    population_gate(StepMode::RefsHold1s, Some(REFS_TWIN_ALLOWED_MISSES)).await;
+}
+
+/// Misses allowed per gate row: `(finding the headroom, releasing the guard)`,
+/// where finding it is `sus_use`: the estimate held at `0.8 x` the new
+/// capacity for a second *and* the stream sending at least `0.8 x` that in the
+/// same second, within `T_UP` (the first sample over the line, which a
+/// transient spike gives, read 96/95/95 of 96 for a stream that used 70/67/71).
+/// Rows are n = 24/8/8/15/6/4.
+///
+/// Measured (2026-11-06) on the shipped twin (`StepMode::Refs`, the 2 s
+/// releasable hold, raise off): 13, 5, 4, 8, 3, 3 misses; the guard is always
+/// released. The allowance is that plus a margin of 1 to 3 timelines, because
+/// the stepped harness is chaotic (one timing tweak moves a timeline across the
+/// line); it is not equal to the measurement. The margin is bounded by what the
+/// gate must still catch: the 1 s hold misses 19, 7, 7, 8, 3, 4
+/// (`p_b_population_refs_twin_gate_fails_a_one_second_spike_hold`).
 const REFS_TWIN_ALLOWED_MISSES: [(usize, usize); 6] =
-    [(0, 0), (1, 0), (0, 0), (0, 0), (0, 0), (0, 0)];
+    [(16, 0), (6, 0), (5, 0), (10, 0), (5, 0), (4, 0)];
 
-/// The same rows at a raise yield of 0.7: one miss in the first row.
+/// The same rows with the opt-in probe raise on: 9, 5, 2, 2, 0, 0 measured.
+const REFS_TWIN_RAISE_ALLOWED_MISSES: [(usize, usize); 6] =
+    [(12, 0), (6, 0), (4, 0), (4, 0), (2, 0), (2, 0)];
+
+/// The same rows with the raise at the pessimistic yield (0.86, the VCE's
+/// minimum): 12, 5, 4, 0, 0, 1 measured.
 const REFS_TWIN_PESSIMISTIC_ALLOWED_MISSES: [(usize, usize); 6] =
-    [(1, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)];
-
-/// The same rows with the raise off: one miss in the first row.
-const REFS_TWIN_NO_RAISE_ALLOWED_MISSES: [(usize, usize); 6] =
-    [(1, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)];
+    [(15, 0), (6, 0), (6, 0), (3, 0), (2, 0), (3, 0)];
 
 /// The gate's rows: seeds, ack chatter and one-way delay.
 type PopulationRow = (Option<Duration>, &'static [u64], u64);
@@ -1920,9 +2094,10 @@ async fn population_gate(mode: StepMode, allowed_misses: Option<[(usize, usize);
         let released = all.iter().filter(|s| s.guard_ok).count();
         let share = all.iter().map(|s| s.sat_share).sum::<f64>() / n as f64;
         println!(
-            "population {mode:?} chatter={chatter:?} delay {delay_us} us: n={n} hits={hits} guard={released} saturated share {share:.2} min/pre-min {:.2}; step-up ms {}; guard ms {}",
+            "population {mode:?} chatter={chatter:?} delay {delay_us} us: n={n} hits={hits} (reached {}) guard={released} saturated share {share:.2} min/pre-min {:.2}; step-up ms {}; guard ms {}",
+            all.iter().filter(|s| s.reached.is_some_and(|t| t <= T_UP_US)).count(),
             all.iter().map(|s| s.min_all).fold(f64::MAX, f64::min),
-            percentiles_ms(all.iter().map(|s| s.reached)),
+            percentiles_ms(all.iter().map(|s| s.step_up_us())),
             percentiles_ms(all.iter().map(|s| s.guard_us)),
         );
         if mode != StepMode::Legacy {
@@ -1932,7 +2107,7 @@ async fn population_gate(mode: StepMode, allowed_misses: Option<[(usize, usize);
                     "seed {:#x} {mode:?}: premise: probes were padded ({}), the rate moved up in place ({}) and the model held frames to it ({})",
                     s.seed, s.padding_windows, s.applies_up, s.model_limited
                 );
-                if matches!(mode, StepMode::Refs | StepMode::RefsPessRaise) {
+                if matches!(mode, StepMode::RefsRaise | StepMode::RefsPessRaise) {
                     assert!(
                         s.raise_windows > 0 && s.raise_bytes > 0,
                         "seed {:#x} {mode:?}: premise: frames were coded at a probe window's rate ({} windows, {} bytes)",
@@ -2190,9 +2365,11 @@ async fn raise_totals(mode: StepMode, seeds: u64) -> RaiseTotals {
 /// part of each probe window, so padding fills less of it.
 ///
 /// A property gate over 12 timelines of the P-B capacity step (`refs_cbr_load`):
-/// the padding bytes per probe window with the raise are at most 75 % of those
-/// without it (`probe_raise` off), and at most 80 % with a pessimistic model
-/// (a raise yields 0.7 of what the VCE's re-send profile gives it). Measured
+/// the padding bytes per probe window with the raise (`RefsRaise`, opt-in) are
+/// at most 75 % of those without it (`Refs`), and at most 80 % with a
+/// pessimistic model (a raise yields 0.86 of what the VCE's profile gives it,
+/// its minimum). Measured, before the guards (the figures below are the
+/// unguarded raise's; the bounds are re-measured in the test's output)
 /// over 24 timelines, 2026-11-06: 133 kB a window without the raise, 82 kB
 /// with it (61 %), 92 kB at yield 0.7 (69 %). The share is not a design number:
 /// padding is sized for the shortfall after what the frames still to come are
@@ -2213,15 +2390,15 @@ async fn raise_totals(mode: StepMode, seeds: u64) -> RaiseTotals {
 #[tokio::test(start_paused = true)]
 async fn the_probe_raise_cuts_padding_per_window_without_costing_the_raised_frames() {
     const SEEDS: u64 = 12;
-    let off = raise_totals(StepMode::RefsNoRaise, SEEDS).await;
-    let on = raise_totals(StepMode::Refs, SEEDS).await;
+    let off = raise_totals(StepMode::Refs, SEEDS).await;
+    let on = raise_totals(StepMode::RefsRaise, SEEDS).await;
     let pess = raise_totals(StepMode::RefsPessRaise, SEEDS).await;
     println!("scene 9: without {off:?}\n  with {on:?}\n  pessimistic {pess:?}");
     assert!(
         off.padding_bytes > 0 && off.raise_bytes == 0,
         "premise: padding without the raise, and no raise: {off:?}"
     );
-    for (name, t, share) in [("measured yield", &on, 0.75), ("yield 0.7", &pess, 0.80)] {
+    for (name, t, share) in [("measured yield", &on, 0.75), ("yield 0.86", &pess, 0.80)] {
         assert!(
             t.min_raise_bytes_per_run > 0 && t.raise_windows > 0 && t.padding_bytes > 0,
             "{name}: premise: the raise ran in every timeline: {t:?}"
@@ -2253,6 +2430,62 @@ async fn the_probe_raise_cuts_padding_per_window_without_costing_the_raised_fram
             "{name}: {} of {} windows were abandoned",
             t.abandoned,
             t.windows
+        );
+    }
+}
+
+/// Scene 9, shallow buffers (review 2): the probe raise puts real frames where
+/// padding was, so a buffer shallower than the window's burst tail-drops them.
+/// The scene above runs on a lossless 600 ms buffer, where nothing can be
+/// lost; this one runs the P-B step on links that buffer 30 and 60 ms and
+/// holds the raise to two bounds against the raise off, on the same seeds:
+///
+///  * it finds the headroom no less often (`sus_use` hits, with `margin` of
+///    the seeds for the chaos of the stepped harness);
+///  * it loses no more than `LOST_PER_RUN` raised frames a run on average.
+///
+/// Premises: the burst does overrun these buffers (padding was judged lost
+/// somewhere, or the raise stayed off), and the raise-off runs lose none.
+///
+/// Measured before the guards (the raise opened a window on a pad it had not
+/// seen judged), over 16 seeds: 60 ms lost a median 6 raised frames a run (max
+/// 9) and found the headroom 8 of 16 against 11; 30 ms lost 12 and found it 4
+/// of 16 against 10. With them: 30 ms 9 of 16 against 10, 9 raised frames lost
+/// in all (0.56 a run); 60 ms 11 against 11, 7 lost (0.44 a run).
+///
+/// Mutation: no pad-judged gate (`RAISE_TRUST_AFTER` zero, a first pad
+/// assumed) and no pause (`RAISE_LOSS_PAUSE` zero) bring the losses back above
+/// the bound (see the numbers printed).
+#[tokio::test(start_paused = true)]
+async fn the_probe_raise_on_a_shallow_buffer_costs_no_more_than_the_raise_off() {
+    const SEEDS: u64 = 16;
+    const MARGIN: usize = 2;
+    const LOST_PER_RUN: f64 = 1.0;
+    for buffer_ms in [30u64, 60] {
+        let (mut on_hits, mut off_hits, mut lost, mut off_lost, mut windows) = (0, 0, 0, 0, 0);
+        for i in 0..SEEDS {
+            let seed = 0x6701 + i;
+            let on = step_summary_deep(seed, None, NORMAL_DELAY_US, StepMode::RefsRaise, buffer_ms)
+                .await;
+            let off =
+                step_summary_deep(seed, None, NORMAL_DELAY_US, StepMode::Refs, buffer_ms).await;
+            on_hits += usize::from(on.hit());
+            off_hits += usize::from(off.hit());
+            lost += on.raised_lost;
+            off_lost += off.raised_lost;
+            windows += on.raise_windows;
+        }
+        println!(
+            "scene 9 shallow {buffer_ms} ms: sus_use hits {on_hits} of {SEEDS} (raise off {off_hits}); raised frames lost {lost} ({off_lost} off); raise windows {windows}"
+        );
+        assert_eq!(off_lost, 0, "{buffer_ms} ms: premise: nothing is raised");
+        assert!(
+            on_hits + MARGIN >= off_hits,
+            "{buffer_ms} ms: the raise found the headroom on {on_hits} of {SEEDS}, the raise off on {off_hits}"
+        );
+        assert!(
+            lost as f64 <= LOST_PER_RUN * SEEDS as f64,
+            "{buffer_ms} ms: {lost} raised frames lost over {SEEDS} runs"
         );
     }
 }

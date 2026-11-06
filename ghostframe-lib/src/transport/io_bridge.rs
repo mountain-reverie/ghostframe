@@ -466,11 +466,16 @@ pub struct InjectedH264 {
     /// The scene's frame period, for the `RefManager`'s decode deadlines.
     #[cfg(feature = "browserless-harness")]
     pub pcm_cadence_us: u64,
-    /// Mutation switch, with `pcm_rate_policy`: `false` turns the probe raise
-    /// off (frames are not coded at a probe window's rate, nor tagged into
-    /// it), so a window is filled by padding alone, as before the raise.
+    /// With `pcm_rate_policy`: `true` turns the probe raise on (frames are
+    /// coded at a probe window's rate and tagged into it). Off, a window is
+    /// filled by padding alone, as production runs (the raise is opt-in).
     #[cfg(feature = "browserless-harness")]
     pub probe_raise: bool,
+    /// Baseline and mutation, with `pcm_rate_policy`: the in-place policy's
+    /// spike hold, `(hold in ms, releasable)`. `None`: as shipped
+    /// (`SPIKE_HOLD_IN_PLACE`, let go early on a fall).
+    #[cfg(feature = "browserless-harness")]
+    pub spike_tune: Option<(u64, bool)>,
 }
 
 /// The scripted CBR encoder of [`InjectedH264::cbr`]: a P frame is

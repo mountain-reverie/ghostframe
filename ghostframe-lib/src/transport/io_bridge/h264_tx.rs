@@ -266,6 +266,8 @@ pub struct H264Stats {
     pub probe_padding_windows: u64,
     pub probe_padding_datagrams: u64,
     pub probe_padding_bytes: u64,
+    /// Probe pads the loss path judged lost: each pauses the probe raise.
+    pub pads_lost: u64,
 }
 
 /// What the harness reads back after a scene: the counters plus two gauges.
@@ -503,6 +505,13 @@ pub(super) struct H264Tx {
     pub(super) refs_mode: super::h264_refs::RefsMode,
     pub(super) refs: Option<super::h264_refs::RefsState>,
     pub(super) refs_counters: super::h264_refs::RefsCounters,
+    /// The probe raise stays off until then (see `RAISE_LOSS_PAUSE`).
+    pub(super) raise_paused_until: Option<std::time::Instant>,
+    /// When the stream first sent probe padding (the raise waits for it to be
+    /// judged).
+    pub(super) first_pad_at: Option<std::time::Instant>,
+    /// The rate target the backend was last planned with.
+    pub(super) last_planned_rate: Option<crate::encoder::h264::backend::RateTarget>,
     /// When the rate buffers were last sent (the last 10 s).
     pub(super) rate_send_times: std::collections::VecDeque<std::time::Instant>,
     /// Acked-reference sessions: when a frame was last newly decoded (or the
@@ -519,8 +528,14 @@ pub(super) struct H264Tx {
     /// cumulative 0x0A that reports old refusals together with a newer decode
     /// (or a late one with only the old refusals) leaves the flag alone.
     pub(super) newest_decoded: Option<u32>,
-    /// Harness only: the probe raise is off (see `InjectedH264::probe_raise`).
-    pub(super) probe_raise_off: bool,
+    /// The probe raise is on (see `h264_probe_raise`). Off by default: on
+    /// links that buffer less than a window's burst it loses real frames, and
+    /// with every guard it does not beat padding alone there (review 2,
+    /// 2026-11-06; numbers in `docs/design/h264-transport.md`). The harness
+    /// turns it on (`InjectedH264::probe_raise`) to keep it measured.
+    pub(super) probe_raise_on: bool,
+    /// Since when a queue has stood on the path, without a break.
+    pub(super) queue_since: Option<std::time::Instant>,
     /// The encoder behind the stream, for the `h264 refs` line.
     pub(super) backend_kind: &'static str,
     /// The harness's PCM-patch source and the log the scene reads (design T3).
@@ -908,7 +923,7 @@ impl IoBridge {
         // An acked-reference session recovers from its anchor: the verdict
         // makes the frame suspect and the interim loss IDR below is not made.
         let already_suspect = f.suspect;
-        self.note_raised_lost(frame_seq);
+        self.note_raised_lost(frame_seq, now);
         if self.h264_refs_live() {
             self.h264_refs_verdict(frame_seq, now);
             return;
@@ -1082,8 +1097,12 @@ impl IoBridge {
     ) {
         for (ws, tx) in lost {
             if let Content::Pad(pad_ws) = tx.content {
-                // A pad judged lost: its tag will not be read.
+                // A pad judged lost: its tag will not be read. The burst it was
+                // part of overran the path: a raise in its place would have
+                // lost real frames.
                 self.reliable_emitter.pads.remove(pad_ws);
+                self.h264.raise_paused_until = Some(now + super::h264_refs::RAISE_LOSS_PAUSE);
+                self.h264.stats.pads_lost += 1;
                 continue;
             }
             if let Content::H264Frag {
@@ -1283,7 +1302,11 @@ impl IoBridge {
         self.h264.refs_mode = super::h264_refs::RefsMode::Explicit;
         self.h264.backend_kind = "pcm";
         self.h264.phase_a_rate_step = h.pcm_phase_a_rate;
-        self.h264.probe_raise_off = !h.probe_raise;
+        self.h264.probe_raise_on = h.probe_raise;
+        let (hold_ms, releasable) = h.spike_tune.map_or((None, true), |(ms, r)| (Some(ms), r));
+        self.h264
+            .rate
+            .tune_spike_for_harness(hold_ms.map(std::time::Duration::from_millis), releasable);
         let Some(req) = self.h264_refs_plan(seq, (h.width, h.height), now, h.pcm_rate_policy)
         else {
             // Skipped, as the capture path drops a frame it holds back; the
