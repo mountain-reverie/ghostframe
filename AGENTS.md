@@ -159,20 +159,45 @@ healthy H.264 resets it). The headroom guard reads the bandwidth *estimate*
 estimate is back over 2 Mbit/s and the screen has been idle for 2 s);
 `loss_override` is off unless `GHOSTFRAME_LOSS_OVERRIDE=1`.
 
-The H.264 stream is CBR at `0.8 x` the bandwidth estimate (smoothed, floor
-300 kbit/s). The rate changes only by reopening the encoder at an IDR:
-`rate_target_bps` is the last rate it was told, `idr_rate_drop` the immediate
-reopens for a fall of more than 30 % (these hold P frames like a loss IDR),
-`rate_reopens_gop` the ones that waited for the scheduled IDR. The GOP is 3 s of
-frames; `GHOSTFRAME_H264_GOP_SECONDS` picks 2 to 5 (anything else is clamped
-with a warning). A stream at `0.8 x` the estimate is not application-limited to
-goog_cc's ALR detector, so the bridge declares it so (`alr_signalled`, the
-detector is shown a sent size halved) and fills the probe windows goog_cc then
-asks for with padding when no IDR is due: copies of an acknowledged P-frame
-fragment under new `wire_seq`s (`probe_padding_windows` / `probe_padding_bytes`;
-the client acknowledges and discards them). A rise of more than 30 % reopens at
-once (`idr_rate_rise`), a jump of the raw estimate is held for a second, and
-the estimate ceiling is held off for a second around padding.
+The H.264 stream of a **legacy (Phase A)** session is CBR at `0.8 x` the
+bandwidth estimate (smoothed, floor 300 kbit/s). The rate changes only by
+reopening the encoder at an IDR: `rate_target_bps` is the last rate it was told,
+`idr_rate_drop` the immediate reopens for a fall of more than 30 % (these hold
+P frames like a loss IDR), `rate_reopens_gop` the ones that waited for the
+scheduled IDR. The GOP is 3 s of frames; `GHOSTFRAME_H264_GOP_SECONDS` picks 2
+to 5 (anything else is clamped with a warning). A stream at `0.8 x` the
+estimate is not application-limited to goog_cc's ALR detector, so the bridge
+declares it so (`alr_signalled`, the detector is shown a sent size halved) and
+fills the probe windows goog_cc then asks for with padding when no IDR is due:
+copies of an acknowledged P-frame fragment under new `wire_seq`s
+(`probe_padding_windows` / `probe_padding_bytes`; the client acknowledges and
+discards them). A rise of more than 30 % reopens at once (`idr_rate_rise`), a
+jump of the raw estimate is held for a second, and the estimate ceiling is held
+off for a second around padding.
+
+An **acked-reference ("refs") session** (HELLO 0x04, the `h264 refs` line) moves
+the rate in place: no reopen, no IDR, no GOP (`RatePolicy::step_in_place`).
+`rate_updates`, `rate_applies_up` / `rate_applies_down` count the changes,
+`rate_sends` / `rate_sends_10s` the re-sends of the rate buffers (each costs a
+short dip of 1.00 / 0.56 / 0.87 times the average frame, T4, so the policy keeps
+a 250 ms floor between them, a 10 % band for a fall and 15 % for a rise, and
+never re-sends inside the band). A jump of the raw estimate is held for 2 s
+(`SPIKE_HOLD_IN_PLACE`; 1 s on Phase A). Every frame is planned under a
+`RateTarget` (`bps`, a P-frame cap of 3 average frames `max_frame_bytes`, an IDR
+budget of 0.25 s of the rate with a 32 kB floor `idr_max_bytes`, and the VBV):
+`frame_cap_bytes` / `idr_cap_bytes` are the last plan's, `frames_over_cap` and
+`max_cap_ratio_pct` observe the (soft) cap and are never a gate. **Probe raise:**
+while a probe window is open (goog_cc's request or the application's own) the
+P frames are planned at `RATE_SHARE x` the window's rate and tagged into the
+window, so they carry part of the burst and padding tops up only the shortfall
+(on the first frame of the window, sized for what the frames still to come are
+expected to carry, and the whole shortfall on the last). `probe_raise_windows`,
+`probe_raise_frames`, `probe_raise_bytes` on the `h264 refs` line count it;
+`raised_frame_lost` (a verdict named a raised frame), `raised_frames_acked` and
+`raised_delivery_us_mean` / `_max` are its cost. It keeps off after a cut, behind
+a backlog, and for 5 s after a late acknowledgement (a reordering path reads a
+burst as loss). The mutation switch is the harness field
+`InjectedH264::probe_raise`, not an environment variable.
 
 With `GHOSTFRAME_DAMAGE_MODE=shadow` or `on` the daemon also logs a cumulative
 `damage safety net` line every 5 s (target `ghostframe::server::damage`);
