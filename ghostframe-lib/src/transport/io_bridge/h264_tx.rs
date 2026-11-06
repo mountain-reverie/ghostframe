@@ -519,6 +519,9 @@ pub(super) struct H264Tx {
     pub(super) pcm_backend: Option<crate::encoder::h264::harness::PcmBackend>,
     #[cfg(feature = "browserless-harness")]
     pub(super) pcm_log: crate::encoder::h264_harness::PcmLog,
+    /// See `InjectedH264::pcm_phase_a_rate`.
+    #[cfg(feature = "browserless-harness")]
+    pub(super) phase_a_rate_step: bool,
 }
 
 impl H264Tx {
@@ -1248,7 +1251,7 @@ impl IoBridge {
         max_dg_size: usize,
         now: std::time::Instant,
     ) {
-        use crate::encoder::h264::backend::{H264Backend, Nv12View};
+        use crate::encoder::h264::backend::{H264Backend, Nv12View, RateTarget};
         use crate::encoder::h264::harness::PcmBackend;
         assert!(
             self.h264_refs_active(),
@@ -1264,6 +1267,7 @@ impl IoBridge {
         };
         self.h264.refs_mode = super::h264_refs::RefsMode::Explicit;
         self.h264.backend_kind = "pcm";
+        self.h264.phase_a_rate_step = h.pcm_phase_a_rate;
         let Some(req) = self.h264_refs_plan(seq, (h.width, h.height), now, h.pcm_rate_policy)
         else {
             // Skipped, as the capture path drops a frame it holds back; the
@@ -1277,6 +1281,9 @@ impl IoBridge {
             .pcm_backend
             .get_or_insert_with(|| PcmBackend::new(log));
         backend.set_sizes(h.idr_bytes, h.p_bytes);
+        backend.set_model(h.pcm_rate_model);
+        // The rate travels with the plan, as the encode worker applies it.
+        backend.set_rate(RateTarget::steady(req.bps, req.fps));
         let nv12 = Nv12View {
             data: &[],
             width: 0,

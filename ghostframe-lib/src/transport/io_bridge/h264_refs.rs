@@ -678,7 +678,15 @@ impl IoBridge {
     fn h264_rate_step_refs(&mut self, now: Instant) {
         let estimate = self.bwe.snapshot().bitrate_bps;
         let before = self.h264.rate.applied();
-        let Some(apply) = self.h264.rate.step_in_place(now, estimate) else {
+        #[cfg(feature = "browserless-harness")]
+        let apply = if self.h264.phase_a_rate_step {
+            self.phase_a_apply(now, estimate)
+        } else {
+            self.h264.rate.step_in_place(now, estimate)
+        };
+        #[cfg(not(feature = "browserless-harness"))]
+        let apply = self.h264.rate.step_in_place(now, estimate);
+        let Some(apply) = apply else {
             return;
         };
         let bps = apply.bps;
@@ -707,6 +715,25 @@ impl IoBridge {
             fps,
             reopen: false,
         });
+    }
+
+    /// Phase A's policy on an acked-reference session, as it ran before
+    /// `step_in_place` (the 2 s reopen lock, the rise confirmations), for the
+    /// harness to measure the baseline and to break the in-place policy.
+    #[cfg(feature = "browserless-harness")]
+    fn phase_a_apply(
+        &mut self,
+        now: Instant,
+        estimate: u64,
+    ) -> Option<super::h264_rate::RateApply> {
+        use super::h264_rate::{RateApply, RateStep};
+        let (bps, cut, initial) = match self.h264.rate.step(now, estimate, true) {
+            RateStep::Keep => return None,
+            RateStep::Initial(bps) => (bps, false, true),
+            RateStep::Reopen { bps, urgent } => (bps, urgent, false),
+            RateStep::ReopenRise { bps } => (bps, false, false),
+        };
+        Some(RateApply { bps, cut, initial })
     }
 
     /// The `RefManager`'s counters and the loop's, as one report.
