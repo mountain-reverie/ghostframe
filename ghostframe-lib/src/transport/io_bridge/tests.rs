@@ -8313,6 +8313,9 @@ fn h264_direct_worker_path_survives_a_loss_bit_exact() {
             plan: plan.clone(),
             fps: 30,
             rate: crate::encoder::h264::backend::RateTarget::steady(3_000_000, 30),
+            feedback: Vec::new(),
+            backend: Default::default(),
+            openh264_lib: None,
         });
         assert!(pipeline.send(ToWorker::Finish {
             seq: n,

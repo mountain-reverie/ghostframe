@@ -397,6 +397,11 @@ impl IoBridge {
             refs,
             fps,
             rate,
+            // No producer yet: the reference manager's observed mode (B7-3)
+            // is what fills this.
+            feedback: Vec::new(),
+            backend: self.h264.backend,
+            openh264_lib: self.h264.openh264_lib.clone(),
         }))
     }
 

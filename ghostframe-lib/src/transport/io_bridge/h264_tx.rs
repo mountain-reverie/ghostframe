@@ -502,6 +502,10 @@ pub(super) struct H264Tx {
     /// at all, what the backend turned out to be, the live session's manager
     /// and the loop's counters.
     pub(super) refs_enabled: bool,
+    /// Which backends the planned path may open, and the openh264 library
+    /// to load (`GHOSTFRAME_H264_BACKEND`, `GHOSTFRAME_H264_OPENH264_LIB`).
+    pub(super) backend: crate::config::H264BackendChoice,
+    pub(super) openh264_lib: Option<std::sync::Arc<std::path::Path>>,
     pub(super) refs_mode: super::h264_refs::RefsMode,
     pub(super) refs: Option<super::h264_refs::RefsState>,
     pub(super) refs_counters: super::h264_refs::RefsCounters,
