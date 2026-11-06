@@ -9226,9 +9226,6 @@ fn raise_bridge() -> (IoBridge, u32) {
     // The first IDR may have claimed a window; start from none.
     bridge.active_probe = None;
     bridge.h264.app_probe.next_at = Some(now + std::time::Duration::from_secs(3600));
-    // The raise is opt-in; padding has gone out and been judged (it waits for that).
-    bridge.h264.probe_raise_on = true;
-    bridge.h264.first_pad_at = Some(now - std::time::Duration::from_secs(5));
     let bps = bridge.h264.rate.applied().expect("a rate is in force");
     (bridge, bps)
 }
@@ -9250,13 +9247,13 @@ fn commit_p(bridge: &mut IoBridge, req: &frame_backend::H264Request, bytes: usiz
 /// While a probe window is open a P frame is coded at `RATE_SHARE` of the
 /// window's rate, for every frame the window lasts; the frames are tagged into
 /// the window, the window counts once, the ceiling is held, and after the
-/// window the next plan is back at the normal rate. With the raise off
-/// (`probe_raise_on` false) none of it happens.
+/// window the next plan is back at the normal rate. With the raise mutated
+/// off (`raise_mutated_off`) none of it happens.
 #[tokio::test(start_paused = true)]
 async fn p_frames_in_a_probe_window_are_coded_at_the_windows_rate() {
     for raise_on in [true, false] {
         let (mut b, base) = raise_bridge();
-        b.h264.probe_raise_on = raise_on;
+        b.h264.raise_mutated_off = !raise_on;
         let t = now_std();
         let window_bps = u64::from(base) * 4;
         b.open_probe_cluster(
@@ -9433,15 +9430,7 @@ async fn a_raised_frame_is_followed_to_its_acknowledgement_or_its_loss() {
 /// with none of those it does (the premise of each case).
 #[tokio::test(start_paused = true)]
 async fn the_raise_opens_no_window_after_a_cut_behind_a_backlog_or_on_a_reordering_path() {
-    for case in [
-        "clear",
-        "cut",
-        "backlog",
-        "reordering",
-        "no padding yet",
-        "padding just sent",
-        "pad lost",
-    ] {
+    for case in ["clear", "cut", "backlog", "reordering", "pad lost"] {
         let (mut b, _base) = raise_bridge();
         // The application's own probe is due now.
         b.h264.app_probe.next_at = Some(now_std());
@@ -9466,8 +9455,6 @@ async fn the_raise_opens_no_window_after_a_cut_behind_a_backlog_or_on_a_reorderi
                 assert!(!b.h264_reordering_lately(now_std()), "premise: quiet path");
                 b.h264.stats.tx_acked_late += 1;
             }
-            "no padding yet" => b.h264.first_pad_at = None,
-            "padding just sent" => b.h264.first_pad_at = Some(now_std()),
             "pad lost" => {
                 // The loss path judges a probe pad lost: the burst overran
                 // the path.
@@ -9490,6 +9477,12 @@ async fn the_raise_opens_no_window_after_a_cut_behind_a_backlog_or_on_a_reorderi
             continue;
         };
         if case == "clear" {
+            // No wait for padding to be sent and judged first: nothing has
+            // been padded, and the first window is raised.
+            assert_eq!(
+                b.h264.stats.probe_padding_windows, 0,
+                "premise: no padding yet"
+            );
             assert!(
                 b.active_probe.is_some(),
                 "premise: the app probe opened a window"

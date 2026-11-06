@@ -507,9 +507,6 @@ pub(super) struct H264Tx {
     pub(super) refs_counters: super::h264_refs::RefsCounters,
     /// The probe raise stays off until then (see `RAISE_LOSS_PAUSE`).
     pub(super) raise_paused_until: Option<std::time::Instant>,
-    /// When the stream first sent probe padding (the raise waits for it to be
-    /// judged).
-    pub(super) first_pad_at: Option<std::time::Instant>,
     /// The rate target the backend was last planned with.
     pub(super) last_planned_rate: Option<crate::encoder::h264::backend::RateTarget>,
     /// When the rate buffers were last sent (the last 10 s).
@@ -528,12 +525,11 @@ pub(super) struct H264Tx {
     /// cumulative 0x0A that reports old refusals together with a newer decode
     /// (or a late one with only the old refusals) leaves the flag alone.
     pub(super) newest_decoded: Option<u32>,
-    /// The probe raise is on (see `h264_probe_raise`). Off by default: on
-    /// links that buffer less than a window's burst it loses real frames, and
-    /// with every guard it does not beat padding alone there (review 2,
-    /// 2026-11-06; numbers in `docs/design/h264-transport.md`). The harness
-    /// turns it on (`InjectedH264::probe_raise`) to keep it measured.
-    pub(super) probe_raise_on: bool,
+    /// Harness mutation: the probe raise is off (`InjectedH264::no_probe_raise`).
+    /// Production has no switch: the raise always runs on acked-reference
+    /// streams (see `h264_probe_raise`).
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub(super) raise_mutated_off: bool,
     /// Since when a queue has stood on the path, without a break.
     pub(super) queue_since: Option<std::time::Instant>,
     /// The encoder behind the stream, for the `h264 refs` line.
@@ -1302,7 +1298,7 @@ impl IoBridge {
         self.h264.refs_mode = super::h264_refs::RefsMode::Explicit;
         self.h264.backend_kind = "pcm";
         self.h264.phase_a_rate_step = h.pcm_phase_a_rate;
-        self.h264.probe_raise_on = h.probe_raise;
+        self.h264.raise_mutated_off = h.no_probe_raise;
         let (hold_ms, releasable) = h.spike_tune.map_or((None, true), |(ms, r)| (Some(ms), r));
         self.h264
             .rate
