@@ -2823,6 +2823,8 @@ impl IoBridge {
                     rate_updates = r.rate_updates,
                     rate_applies_up = r.rate_applies_up,
                     rate_applies_down = r.rate_applies_down,
+                    rate_sends = r.rate_sends,
+                    rate_sends_10s = r.rate_sends_10s,
                     "h264 refs (acked-reference recovery; cumulative)"
                 );
             }

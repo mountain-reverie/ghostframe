@@ -61,6 +61,9 @@ pub(super) enum RefsMode {
     Legacy,
 }
 
+/// The window of `RefsReport::rate_sends_10s`.
+const RATE_SEND_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// What the loop counts of the acked-reference path itself (the manager counts
 /// the rest, see [`RefsReport`]).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +84,10 @@ pub(super) struct RefsCounters {
     /// Of `rate_updates`, those that raised the rate, and those that lowered it.
     pub(super) rate_applies_up: u64,
     pub(super) rate_applies_down: u64,
+    /// Every send of the rate buffers the policy asked for (the initial one
+    /// included), and those in the last [`RATE_SEND_WINDOW`].
+    pub(super) rate_sends: u64,
+    pub(super) rate_sends_window: u64,
     pub(super) verdicts: u64,
     /// Frames retired because a fragment outgrew the connection (`emit.rs`):
     /// counted at the first oversize fragment of each frame, the siblings
@@ -165,6 +172,11 @@ pub struct RefsReport {
     pub rate_updates: u64,
     pub rate_applies_up: u64,
     pub rate_applies_down: u64,
+    /// Rate-buffer re-sends the policy asked for, in total and in the last
+    /// 10 s (each one costs the encoder a first frame of 1.4-1.9x the
+    /// average, T4): divide the window by 10 for the per-second rate.
+    pub rate_sends: u64,
+    pub rate_sends_10s: u64,
     // The manager's own counters.
     pub idr_session: u64,
     pub idr_resolution: u64,
@@ -712,6 +724,15 @@ impl IoBridge {
     /// reopen, no GOP, and none of Phase A's reopen economics
     /// ([`RatePolicy::step_in_place`]).
     fn h264_rate_step_refs(&mut self, now: Instant) {
+        while self
+            .h264
+            .rate_send_times
+            .front()
+            .is_some_and(|&t| now.saturating_duration_since(t) > RATE_SEND_WINDOW)
+        {
+            self.h264.rate_send_times.pop_front();
+        }
+        self.h264.refs_counters.rate_sends_window = self.h264.rate_send_times.len() as u64;
         let estimate = self.bwe.snapshot().bitrate_bps;
         let before = self.h264.rate.applied();
         #[cfg(feature = "browserless-harness")]
@@ -726,6 +747,9 @@ impl IoBridge {
             return;
         };
         let bps = apply.bps;
+        self.h264.refs_counters.rate_sends += 1;
+        self.h264.rate_send_times.push_back(now);
+        self.h264.refs_counters.rate_sends_window = self.h264.rate_send_times.len() as u64;
         if !apply.initial {
             self.h264.refs_counters.rate_updates += 1;
             if before.is_some_and(|b| bps > b) {
@@ -802,6 +826,8 @@ impl IoBridge {
             rate_updates: c.rate_updates,
             rate_applies_up: c.rate_applies_up,
             rate_applies_down: c.rate_applies_down,
+            rate_sends: c.rate_sends,
+            rate_sends_10s: c.rate_sends_window,
             idr_session: s.idr_session,
             idr_resolution: s.idr_resolution,
             idr_client_reset: s.idr_client_reset,
