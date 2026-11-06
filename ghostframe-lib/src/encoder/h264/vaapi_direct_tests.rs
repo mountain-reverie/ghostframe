@@ -924,16 +924,16 @@ fn run_rates(
     })
 }
 
-/// The IDR is held to its budget and the VBV it is sent under: within the
-/// soft cap's measured band, bigger than a P frame's cap (the raise is real)
-/// and far bigger than the IDR a plain 0.1 s VBV allows (S2: a small VBV cut
-/// the first IDR from 166-198 KB to 103 KB). P frames stay under 3x the
-/// P cap once the first ones after the IDR are past.
-///
-/// The IDR band's floor is 0.6, not the design's -10 %: the HRD is re-sent
-/// with 75 % initial fullness, so an IDR sent under a VBV equal to its budget
-/// may find the bucket only three quarters full. The ratio is printed; if it
-/// reads ~0.75, the backend should send a fuller IDR HRD.
+/// The IDR is held to its ceiling and the VBV it is sent under, and the raise
+/// is real. `MaxFrameSize` is a ceiling, not a target (S2 b), and VBR does not
+/// fill it: the IDR is limited by the content at its QP. Measured at 3 Mbit/s
+/// on the RX 480 (2026-11-05): a budget of 93750 B gave IDRs of 55.9 and
+/// 56.7 KB (0.60x), against 26.2 and 26.4 KB with no raise. So the asserts are
+/// the ones that hold for a ceiling: no more than 1.15x the budget (the soft
+/// cap's measured band), more than 1.5x the unraised IDR (the raised VBV
+/// matters), above the P frame cap (the raise is real). There is no floor tied
+/// to the budget. The ratios are printed: they are what the PCM model's
+/// `idr_fill` is set from.
 #[test]
 fn h264_direct_the_idr_cap_and_vbv_are_honoured() {
     let _gpu = crate::gpu_test_lock::lock();
@@ -971,8 +971,8 @@ fn h264_direct_the_idr_cap_and_vbv_are_honoured() {
         for &size in &r {
             let ratio = size as f64 / budget;
             assert!(
-                (0.6..=1.15).contains(&ratio),
-                "IDR {size} B = {ratio:.2} x its budget"
+                ratio <= 1.15,
+                "IDR {size} B = {ratio:.2} x its budget, over the ceiling"
             );
             assert!(
                 size > steady.max_frame_bytes as usize,
@@ -1234,4 +1234,127 @@ fn h264_direct_probe_raise_spike_prints_p_frame_sizes() {
             r.sizes[40..46].iter().max().unwrap()
         );
     }
+}
+
+/// How the first frame after a rate step depends on the size of the step, and
+/// whether a re-send alone does it (B6's open question: it decides whether the
+/// in-place rate policy can move the rate in small steps). At 720p, 30 fps,
+/// around 6 Mbit/s: steps of +-5, 10, 20 and 30 % (the relative change of the
+/// rate), four of each, each held 15 frames and then undone (a return step is
+/// a step too and is tabled apart), and a pure re-send: the same rate with the
+/// cap one byte different, so the RC and HRD buffers go out again with only
+/// the 16 bps nudge changed.
+///
+/// Printed per transition: the 4 frames after it as multiples of the new
+/// average frame, then per step size the mean of each of those four frames and
+/// the settled mean (frames 8-14 of the segment). If the first frame is the
+/// same at 5 % as at 30 %, and the re-send shows it too, the transient is per
+/// change, not per size. Asserted: every run codes and decodes, the buffers
+/// went out for the steps, and a loose sanity bound (a first frame below 4x
+/// and a settled segment within 0.5-1.6x of the average).
+///
+/// Run: `GF_ALLOW_VAAPI=1 cargo test -p ghostframe-lib --lib
+/// h264_direct_small_rate_steps_first_frame_ratio -- --test-threads=1
+/// --nocapture`, on the GPU lock like the other T4 tests.
+#[test]
+fn h264_direct_small_rate_steps_first_frame_ratio() {
+    let _gpu = crate::gpu_test_lock::lock();
+    const BASE: u32 = 6_000_000;
+    const SEG: u32 = 15;
+    const REPS: usize = 4;
+    const PCTS: [i32; 8] = [-30, -20, -10, -5, 5, 10, 20, 30];
+    // (rate told, kind) per segment: 0 is the warm-up, then out and back.
+    let mut segs: Vec<(u32, String)> = vec![(BASE, "warm".to_string()); 2];
+    for rep in 0..REPS {
+        // Rotate the sizes so none keeps a position in the stream.
+        for k in 0..PCTS.len() {
+            let pct = PCTS[(k + rep * 3) % PCTS.len()];
+            let bps = (f64::from(BASE) * (1.0 + f64::from(pct) / 100.0)) as u32;
+            segs.push((bps, format!("out {pct:+}%")));
+            segs.push((BASE, format!("back {pct:+}%")));
+        }
+    }
+    let frames = segs.len() as u32 * SEG;
+    let target = |n: u32| RateTarget::steady(segs[(n / SEG) as usize].0, 30);
+    let Some(r) = run_rates("small_steps", frames, BASE, &target, &[], true) else {
+        return;
+    };
+    r.assert_decoded("small_steps");
+    assert!(
+        r.counters.rc_sends as usize >= segs.len() - 4,
+        "premise: every step re-sent the buffers: {:?}",
+        r.counters
+    );
+    let mut groups: BTreeMap<String, Vec<[f64; 5]>> = BTreeMap::new();
+    for (i, (bps, kind)) in segs.iter().enumerate().skip(2) {
+        let at = i * SEG as usize;
+        let avg = avg_frame(*bps);
+        let row = |k: usize| r.sizes[at + k] as f64 / avg;
+        let settled = mean(&r.sizes[at + 8..at + SEG as usize]) / avg;
+        let f = [row(0), row(1), row(2), row(3), settled];
+        eprintln!(
+            "small_steps {kind} to {bps}: x avg {:.2} {:.2} {:.2} {:.2}, settled {settled:.2}",
+            f[0], f[1], f[2], f[3]
+        );
+        assert!(f[0] < 4.0, "{kind}: first frame x{:.2}", f[0]);
+        assert!(
+            (0.5..=1.6).contains(&settled),
+            "{kind}: settled x{settled:.2}"
+        );
+        groups.entry(kind.clone()).or_default().push(f);
+    }
+    for (kind, v) in &groups {
+        let m = |k: usize| v.iter().map(|f| f[k]).sum::<f64>() / v.len() as f64;
+        eprintln!(
+            "small_steps MEAN {kind:<10} n={}: x avg {:.2} {:.2} {:.2} {:.2}, settled {:.2}",
+            v.len(),
+            m(0),
+            m(1),
+            m(2),
+            m(3),
+            m(4)
+        );
+    }
+
+    // A pure re-send: the same rate, the cap one byte apart, every 15 frames.
+    let resend_segs = 10u32;
+    let cap_target = |n: u32| {
+        let mut t = RateTarget::steady(BASE, 30);
+        t.max_frame_bytes += (n / SEG) % 2;
+        t
+    };
+    let Some(rs) = run_rates(
+        "small_resend",
+        resend_segs * SEG,
+        BASE,
+        &cap_target,
+        &[],
+        true,
+    ) else {
+        return;
+    };
+    rs.assert_decoded("small_resend");
+    assert!(
+        rs.counters.nudges > 0,
+        "premise: the re-send carried the nudge: {:?}",
+        rs.counters
+    );
+    let avg = avg_frame(BASE);
+    let mut firsts = Vec::new();
+    for s in 2..resend_segs as usize {
+        let at = s * SEG as usize;
+        let f: Vec<f64> = (0..4).map(|k| rs.sizes[at + k] as f64 / avg).collect();
+        let settled = mean(&rs.sizes[at + 8..at + SEG as usize]) / avg;
+        eprintln!(
+            "small_steps RESEND {s}: x avg {:.2} {:.2} {:.2} {:.2}, settled {settled:.2}",
+            f[0], f[1], f[2], f[3]
+        );
+        assert!(f[0] < 4.0, "re-send: first frame x{:.2}", f[0]);
+        firsts.push(f[0]);
+    }
+    eprintln!(
+        "small_steps RESEND MEAN first frame x{:.2} over {}",
+        firsts.iter().sum::<f64>() / firsts.len() as f64,
+        firsts.len()
+    );
 }
