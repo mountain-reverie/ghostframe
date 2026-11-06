@@ -27,6 +27,7 @@ fn config() -> RefConfig {
         params: params(),
         frame_interval: STEP,
         initial_srtt: STEP * 4,
+        observed: false,
     }
 }
 
@@ -1691,6 +1692,7 @@ fn wire_info_flags_a_target_mark_apart_from_a_carrier_mark() {
             seq: 8,
             frame_num: 4,
         }),
+        intent: Intent::Executed,
         mark: Some(1),
         mark_target: false,
         mmco: Vec::new(),

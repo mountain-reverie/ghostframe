@@ -91,3 +91,4 @@ futures = "0.3"
 url = "2"
 proptest = "1"
 ghostframe-test-pattern = { path = "../ghostframe-test-pattern" }
+ghostframe-client-core = { path = "../ghostframe-client-core" }

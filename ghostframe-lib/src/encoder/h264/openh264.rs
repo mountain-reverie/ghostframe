@@ -526,6 +526,9 @@ impl OpenH264Backend {
         Ok(EncodedAu {
             meta: AuMeta {
                 idr: header.idr,
+                // The stream's own parameters, from the SPS/PPS read at each
+                // IDR: the reference manager models the stream with them.
+                params: header.idr.then_some(params),
                 header: Some(header),
                 ref_seq: None,
             },

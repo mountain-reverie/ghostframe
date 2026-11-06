@@ -178,6 +178,11 @@ pub(crate) struct AuMeta {
     /// The picture the backend passed as `RefPicList0[0]`, by `frame_seq`:
     /// the backend's own DPB truth (design 3.3).
     pub ref_seq: Option<u32>,
+    /// The stream parameters the backend's SPS/PPS carry, on an IDR access
+    /// unit of a backend whose stream is its own (openh264). The reference
+    /// manager adopts them and runs in observed mode. `None`: the stream is
+    /// the one the manager's configured parameters describe.
+    pub params: Option<StreamParams>,
 }
 
 impl AuMeta {
@@ -369,6 +374,7 @@ impl H264Backend for LegacyFfmpegBackend {
                 idr: is_keyframe_nal(&out.payload),
                 header: None,
                 ref_seq: None,
+                params: None,
             },
             payload: out.payload,
         })
@@ -456,6 +462,7 @@ mod tests {
             params: cfg.params,
             frame_interval: Duration::from_millis(33),
             initial_srtt: Duration::from_millis(66),
+            observed: false,
         });
         let super::super::refs::Plan::Frame(plan) = mgr.plan_next(0, Instant::now()) else {
             panic!("held");

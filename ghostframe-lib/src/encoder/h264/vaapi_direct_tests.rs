@@ -283,6 +283,7 @@ fn run(sc: &Scenario) -> Option<Run> {
         params,
         frame_interval: sc.step,
         initial_srtt: sc.srtt,
+        observed: false,
     });
     let t0 = Instant::now();
     let mut sent: Vec<Sent> = Vec::new();
@@ -700,6 +701,7 @@ fn h264_direct_refuses_a_plan_it_cannot_execute() {
         params: StreamParams::writer(),
         frame_interval: sc.step,
         initial_srtt: sc.srtt,
+        observed: false,
     });
     let now = Instant::now();
     let src = source(640, 360, 0);
@@ -767,6 +769,7 @@ fn h264_direct_an_omitted_reference_is_an_error() {
         params: StreamParams::writer(),
         frame_interval: sc.step,
         initial_srtt: sc.srtt,
+        observed: false,
     });
     let now = Instant::now();
     let src = source(640, 360, 0);
@@ -905,6 +908,7 @@ fn run_rates_with(
         params: StreamParams::writer(),
         frame_interval: sc.step,
         initial_srtt: sc.srtt,
+        observed: false,
     });
     let t0 = Instant::now();
     let mut aus: Vec<(u32, Vec<u8>)> = Vec::new();

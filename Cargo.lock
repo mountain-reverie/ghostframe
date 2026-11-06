@@ -1859,6 +1859,7 @@ dependencies = [
  "ffmpeg-next",
  "ffmpeg-sys-next",
  "futures",
+ "ghostframe-client-core",
  "ghostframe-protocol",
  "ghostframe-test-pattern",
  "ghostframe-tsnet",

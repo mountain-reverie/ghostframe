@@ -319,6 +319,7 @@ impl H264Backend for PcmBackend {
                 idr: is_idr,
                 header: Some(header),
                 ref_seq,
+                params: None,
             },
         })
     }

@@ -805,6 +805,7 @@ impl Session {
                         idr: header.idr,
                         header: Some(header),
                         ref_seq,
+                        params: None,
                     },
                     payload,
                 })
@@ -1078,6 +1079,7 @@ fn probe(cfg: &StreamConfig) -> Result<(), BackendError> {
         params: cfg.params,
         frame_interval: interval,
         initial_srtt: srtt,
+        observed: false,
     });
     let (y, uv) = ((SIZE * SIZE) as usize, (SIZE * SIZE / 2) as usize);
     let data: Vec<u8> = (0..y + uv).map(|i| (i * 7 % 251) as u8).collect();

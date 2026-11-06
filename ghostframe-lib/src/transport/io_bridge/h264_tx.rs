@@ -108,10 +108,13 @@ pub enum IdrCause {
     /// same nature as a session start: the fragments are gone, and an IDR
     /// sized for the connection as it is now is the only way to a picture.
     MtuShrink,
+    /// The backend made an IDR the manager did not plan (observed mode), or
+    /// the stream moved to another backend after a fault limit.
+    BackendFallback,
 }
 
 impl IdrCause {
-    pub(crate) const COUNT: usize = 10;
+    pub(crate) const COUNT: usize = 11;
     pub const ALL: [IdrCause; Self::COUNT] = [
         IdrCause::Session,
         IdrCause::Loss,
@@ -123,6 +126,7 @@ impl IdrCause {
         IdrCause::RateRise,
         IdrCause::GopPeriodic,
         IdrCause::MtuShrink,
+        IdrCause::BackendFallback,
     ];
 
     pub fn index(self) -> usize {
@@ -141,6 +145,7 @@ impl IdrCause {
             IdrCause::RateRise => "rate_rise",
             IdrCause::GopPeriodic => "gop_periodic",
             IdrCause::MtuShrink => "mtu_shrink",
+            IdrCause::BackendFallback => "backend_fallback",
         }
     }
 }

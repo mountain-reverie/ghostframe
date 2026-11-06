@@ -847,7 +847,7 @@ mod backend_choice_tests {
 
     use super::*;
     use crate::encoder::h264::backend::{AuMeta, BackendCaps};
-    use crate::encoder::h264::refs::{FramePlan, IdrCause};
+    use crate::encoder::h264::refs::{FramePlan, IdrCause, Intent};
 
     /// Records the calls a backend gets, in order.
     struct Recorder {
@@ -882,6 +882,7 @@ mod backend_choice_tests {
                     idr: false,
                     header: None,
                     ref_seq: None,
+                    params: None,
                 },
             })
         }
@@ -990,6 +991,7 @@ mod backend_choice_tests {
             frame_num: 1,
             poc: 2,
             target: None,
+            intent: Intent::Executed,
             mark: None,
             mark_target: false,
             mmco: Vec::new(),
