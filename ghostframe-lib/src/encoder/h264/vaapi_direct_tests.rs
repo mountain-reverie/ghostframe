@@ -876,10 +876,31 @@ fn run_rates(
     idr_at: &[u32],
     nudge: bool,
 ) -> Option<RateRun> {
+    run_rates_with(
+        name,
+        frames,
+        open_bps,
+        target,
+        idr_at,
+        nudge,
+        super::vaapi_direct::ResendVariant::Full,
+    )
+}
+
+fn run_rates_with(
+    name: &'static str,
+    frames: u32,
+    open_bps: u32,
+    target: &dyn Fn(u32) -> RateTarget,
+    idr_at: &[u32],
+    nudge: bool,
+    variant: super::vaapi_direct::ResendVariant,
+) -> Option<RateRun> {
     let mut sc = Scenario::new(name, RATE_W, RATE_H, frames);
     sc.bps = open_bps;
     let mut backend = open(&sc)?;
     backend.set_nudge_for_test(nudge);
+    backend.set_resend_variant_for_test(variant);
     let mut mgr = RefManager::new(RefConfig {
         params: StreamParams::writer(),
         frame_interval: sc.step,
@@ -930,9 +951,11 @@ fn run_rates(
 /// on the RX 480 (2026-11-05): a budget of 93750 B gave IDRs of 55.9 and
 /// 56.7 KB (0.60x), against 26.2 and 26.4 KB with no raise. So the asserts are
 /// the ones that hold for a ceiling: no more than 1.15x the budget (the soft
-/// cap's measured band), more than 1.5x the unraised IDR (the raised VBV
-/// matters), above the P frame cap (the raise is real). There is no floor tied
-/// to the budget. The ratios are printed: they are what the PCM model's
+/// cap's measured band), more than 1.2x the unraised IDR (the raised VBV
+/// matters: 2.1x at 3 Mbit/s, 1.4x at 12, where the unraised IDR is already
+/// near what the content costs). There is no floor tied to the budget, and no
+/// comparison with the P frame cap: at 12 Mbit/s the IDR is content-limited
+/// (141 KB) below the P cap (150 KB). The ratios are printed: they are what the PCM model's
 /// `idr_fill` is set from.
 #[test]
 fn h264_direct_the_idr_cap_and_vbv_are_honoured() {
@@ -974,14 +997,10 @@ fn h264_direct_the_idr_cap_and_vbv_are_honoured() {
                 ratio <= 1.15,
                 "IDR {size} B = {ratio:.2} x its budget, over the ceiling"
             );
-            assert!(
-                size > steady.max_frame_bytes as usize,
-                "the raise is not real"
-            );
         }
         for (a, b) in r.iter().zip(&u) {
             assert!(
-                *a as f64 > 1.5 * *b as f64,
+                *a as f64 > 1.2 * *b as f64,
                 "the raised VBV did not matter: {a} against {b}"
             );
         }
@@ -1357,4 +1376,181 @@ fn h264_direct_small_rate_steps_first_frame_ratio() {
         firsts.iter().sum::<f64>() / firsts.len() as f64,
         firsts.len()
     );
+}
+
+/// What a re-send of the rate buffers must carry (B6). T4 measured that every
+/// re-send, a rate step of any size or the same rate with the 16 bps nudge, costs
+/// a first frame of 1.4-1.9x the average. The hypothesis: the burst comes from
+/// the HRD re-send resetting the VCE's buffer level to its initial fullness
+/// (75 %), not from the RC change. At 6 Mbit/s, 720p, 30 fps, each variant
+/// runs two streams, 15 frames to a segment:
+///   - pure: 10 segments, the same rate, the cap one byte apart (so only the
+///     16 bps nudge changes);
+///   - steps: 16 segments of 6.0, 6.6, 6.0, 5.4 Mbit/s repeated (+-10 %).
+///
+/// Variants: (i) RC + HRD + MaxFrameSize as production sends them, (ii) RC +
+/// MaxFrameSize, no HRD, (iii) HRD at 100 % initial fullness, (iv) HRD at 25 %,
+/// (v) RC only (the cap and VBV stay as last sent; a step's cap goes stale).
+/// An IDR always carries everything. Per variant it prints the first frame
+/// after each re-send as a multiple of the new average frame, the mean and max,
+/// the mean of frame 2 and the settled mean (frames 8-14). Asserted: every run
+/// codes and decodes and no first frame is above 4x.
+///
+/// Run: `GF_ALLOW_VAAPI=1 cargo test -p ghostframe-lib --lib
+/// h264_direct_resend_variants_first_frame -- --test-threads=1 --nocapture`
+/// on the GPU lock like the other T4 tests.
+#[test]
+fn h264_direct_resend_variants_first_frame() {
+    use super::vaapi_direct::ResendVariant as V;
+    let _gpu = crate::gpu_test_lock::lock();
+    const BASE: u32 = 6_000_000;
+    const SEG: u32 = 15;
+    let variants = [
+        ("i  RC+HRD75+Max (today)", V::Full),
+        ("ii RC+Max, no HRD", V::NoHrd),
+        ("iii RC+HRD100+Max", V::HrdFull),
+        ("iv RC+HRD25+Max", V::HrdLow),
+        ("v  RC only", V::RcOnly),
+    ];
+    let step_rates = [6.0, 6.6, 6.0, 5.4];
+    let step_segs = 16u32;
+    let step_bps = |seg: u32| (f64::from(BASE) * step_rates[(seg % 4) as usize] / 6.0) as u32;
+    let pure = |n: u32| {
+        let mut t = RateTarget::steady(BASE, 30);
+        t.max_frame_bytes += (n / SEG) % 2;
+        t
+    };
+    let steps = |n: u32| RateTarget::steady(step_bps(n / SEG), 30);
+    for (label, v) in variants {
+        for (kind, segs) in [("pure", 10u32), ("steps", step_segs)] {
+            let target: &dyn Fn(u32) -> RateTarget = if kind == "pure" { &pure } else { &steps };
+            let Some(r) = run_rates_with("resend_variants", segs * SEG, BASE, target, &[], true, v)
+            else {
+                return;
+            };
+            r.assert_decoded(label);
+            assert!(
+                r.counters.rc_sends as u32 >= segs - 3,
+                "premise: every segment re-sent: {:?}",
+                r.counters
+            );
+            // (first frame, direction) per re-send, from segment 2 on.
+            let (mut up, mut down, mut same) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut second, mut settled) = (Vec::new(), Vec::new());
+            for s in 2..segs {
+                let at = (s * SEG) as usize;
+                let bps = target(s * SEG).bps;
+                let avg = avg_frame(bps);
+                let first = r.sizes[at] as f64 / avg;
+                assert!(first < 4.0, "{label} {kind}: first frame x{first:.2}");
+                match bps.cmp(&target(s * SEG - 1).bps) {
+                    std::cmp::Ordering::Greater => up.push(first),
+                    std::cmp::Ordering::Less => down.push(first),
+                    std::cmp::Ordering::Equal => same.push(first),
+                }
+                second.push(r.sizes[at + 1] as f64 / avg);
+                settled.push(mean(&r.sizes[at + 8..at + SEG as usize]) / avg);
+            }
+            let m = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+            let fmt = |v: &[f64]| {
+                format!(
+                    "n={} mean {:.2} max {:.2} [{}]",
+                    v.len(),
+                    m(v),
+                    v.iter().copied().fold(0.0, f64::max),
+                    v.iter()
+                        .map(|x| format!("{x:.2}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            };
+            eprintln!(
+                "resend_variants {label} / {kind}: up {} | down {} | same-rate {} | frame 2 mean {:.2} | settled mean {:.2}",
+                fmt(&up),
+                fmt(&down),
+                fmt(&same),
+                m(&second),
+                m(&settled)
+            );
+        }
+    }
+}
+
+/// B6: which initial HRD fullness makes a re-send of RC+HRD+Max neutral. Every
+/// fullness is re-sent as a pure re-send (same rate) and as +-10 % steps, about
+/// eight of each at 720p, 30 fps around 6 Mbit/s. Prints frames 1, 2 and 3
+/// after the re-send as multiples of the average frame (n, mean, min, max) and
+/// the settled mean. Asserted: the runs decode, and no mean is above 4x.
+///
+/// Run: `GF_ALLOW_VAAPI=1 cargo test -p ghostframe-lib --lib
+/// h264_direct_resend_fullness_sweep -- --test-threads=1 --nocapture` on the
+/// GPU lock like the other T4 tests.
+#[test]
+fn h264_direct_resend_fullness_sweep() {
+    use super::vaapi_direct::ResendVariant as V;
+    let _gpu = crate::gpu_test_lock::lock();
+    const BASE: u32 = 6_000_000;
+    const SEG: u32 = 15;
+    let step_rates = [6.0, 6.6, 6.0, 5.4];
+    let step_bps = |seg: u32| (f64::from(BASE) * step_rates[(seg % 4) as usize] / 6.0) as u32;
+    let pure = |n: u32| {
+        let mut t = RateTarget::steady(BASE, 30);
+        t.max_frame_bytes += (n / SEG) % 2;
+        t
+    };
+    let steps = |n: u32| RateTarget::steady(step_bps(n / SEG), 30);
+    for pct in [30u32, 40, 50, 60] {
+        for (kind, segs) in [("pure", 10u32), ("steps", 10u32)] {
+            let target: &dyn Fn(u32) -> RateTarget = if kind == "pure" { &pure } else { &steps };
+            let Some(r) = run_rates_with(
+                "resend_sweep",
+                segs * SEG,
+                BASE,
+                target,
+                &[],
+                true,
+                V::HrdPct(pct),
+            ) else {
+                return;
+            };
+            r.assert_decoded("resend_sweep");
+            assert!(
+                r.counters.rc_sends as u32 >= segs - 3,
+                "premise: every segment re-sent: {:?}",
+                r.counters
+            );
+            let mut after: [Vec<f64>; 3] = Default::default();
+            let mut settled = Vec::new();
+            for s in 2..segs {
+                let at = (s * SEG) as usize;
+                let avg = avg_frame(target(s * SEG).bps);
+                for (k, v) in after.iter_mut().enumerate() {
+                    v.push(r.sizes[at + k] as f64 / avg);
+                }
+                settled.push(mean(&r.sizes[at + 8..at + SEG as usize]) / avg);
+            }
+            let m = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+            let fmt = |v: &[f64]| {
+                format!(
+                    "n={} mean {:.2} min {:.2} max {:.2}",
+                    v.len(),
+                    m(v),
+                    v.iter().copied().fold(f64::MAX, f64::min),
+                    v.iter().copied().fold(0.0, f64::max)
+                )
+            };
+            eprintln!(
+                "resend_sweep HRD{pct} / {kind}: frame 1 {} | frame 2 {} | frame 3 {} | settled mean {:.2}",
+                fmt(&after[0]),
+                fmt(&after[1]),
+                fmt(&after[2]),
+                m(&settled)
+            );
+            assert!(
+                m(&after[0]) < 4.0,
+                "HRD{pct} {kind}: frame 1 mean x{:.2}",
+                m(&after[0])
+            );
+        }
+    }
 }
