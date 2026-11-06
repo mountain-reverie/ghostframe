@@ -979,11 +979,11 @@ async fn refs_scene_6_a_capacity_drop_is_followed_by_the_encoder() {
 /// and falls back to 2 Mbit/s 600 ms after the probe's spike, while the policy still holds
 /// the probe's spike (the 2 s hold of `SPIKE_HOLD_IN_PLACE`). A hold that
 /// cannot be let go rides the estimate's fall out and keeps the stream at the
-/// spike's rate for the rest of the hold: 42 KB over the link in the 3 s after
-/// the drop, a latency near 700 ms and 116 of the 150 frames of the 5 s shown,
-/// against nothing over, about 270 ms and 142 for Phase A (review 2, on the real stack;
-/// 2026-11-06; scene 6 A and B do not see it: A drops from a settled 6 Mbit/s
-/// and B falls 1.5 s after its rise). The twin's spike lands at 7.4 s on every
+/// spike's rate for the rest of the hold. On the real stack (review 2,
+/// 2026-11-06): 42 KB over the link in the 3 s after the drop, a latency near
+/// 700 ms and 116 of the 150 frames of the 5 s shown, against nothing over,
+/// about 270 ms and 142 for Phase A (scene 6 A and B do not see it: A drops
+/// from a settled 6 Mbit/s and B falls 1.5 s after its rise). The twin's spike lands at 7.4 s on every
 /// seed (the first estimate over 3 Mbit/s after the rise), so the drop is
 /// placed 600 ms after it, found by a first run without a drop.
 ///
@@ -993,11 +993,14 @@ async fn refs_scene_6_a_capacity_drop_is_followed_by_the_encoder() {
 /// time. Premises: the drop is seen, the spike was taken (the policy applied
 /// the rise) and the encoder gate skipped frames.
 ///
-/// Mutation: `spike_tune: Some((2000, false))`, the hold that is never let go
-/// early, fails every bound (see `scene6c_numbers`, printed).
+/// Mutation, asserted: `spike_tune: Some((2000, false))`, the hold that is never
+/// let go early, must fail two of the bounds: more than `SCENE6C_OVER_BYTES`
+/// over the link summed over the seeds (144 kB against the shipped 98 kB), and
+/// fewer than `SCENE6C_SHOWN` frames shown on at least two seeds (114, 115 of
+/// three; the third, 140, passes). It does not fail the latency bound.
 #[tokio::test(start_paused = true)]
 async fn refs_scene_6c_a_drop_right_after_a_spike_is_followed_early() {
-    let mut over = 0;
+    let (mut over, mut fixed_over, mut fixed_short) = (0, 0, 0);
     for seed in SEEDS {
         let ctx = format!("scene6c {seed:#x}");
         let (shipped, fixed) = (
@@ -1008,6 +1011,8 @@ async fn refs_scene_6c_a_drop_right_after_a_spike_is_followed_early() {
         assert!(shipped.premise_ok, "{ctx}: premise: {shipped:?}");
         assert!(fixed.premise_ok, "{ctx}: premise (mutation): {fixed:?}");
         over += shipped.over_bytes;
+        fixed_over += fixed.over_bytes;
+        fixed_short += usize::from(fixed.shown < SCENE6C_SHOWN);
         assert!(
             shipped.shown >= SCENE6C_SHOWN,
             "{ctx}: {} of 150 frames shown in the 5 s after the drop (bound {SCENE6C_SHOWN})",
@@ -1023,10 +1028,22 @@ async fn refs_scene_6c_a_drop_right_after_a_spike_is_followed_early() {
         over <= SCENE6C_OVER_BYTES,
         "{over} bytes over the link in the 3 s after the drops (bound {SCENE6C_OVER_BYTES})"
     );
+    // The mutation is load-bearing: the hold that is never let go breaks the
+    // bounds the shipped hold keeps.
+    assert!(
+        fixed_over > SCENE6C_OVER_BYTES,
+        "the never-released hold put {fixed_over} bytes over the link: not over the bound {SCENE6C_OVER_BYTES}, so the bound does not discriminate"
+    );
+    assert!(
+        fixed_short >= 2,
+        "the never-released hold showed fewer than {SCENE6C_SHOWN} frames on {fixed_short} seeds, need 2"
+    );
 }
 
 const SCENE6C_OVER_BYTES: u64 = 120_000;
 /// Per seed: shipped 129, 146, 138 frames; never let go 114, 140, 115.
+/// Over the link, summed over the seeds: shipped 98 kB, never let go 144 kB,
+/// bound `SCENE6C_OVER_BYTES`.
 const SCENE6C_SHOWN: usize = 125;
 /// The longest capture-to-shown time. Not a discriminator in the twin (both
 /// holds reach 410 to 500 ms); a regression guard against the 689 ms review 2

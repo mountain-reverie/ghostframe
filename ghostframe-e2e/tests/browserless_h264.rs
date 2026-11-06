@@ -2478,6 +2478,10 @@ async fn the_probe_raise_on_a_shallow_buffer_costs_no_more_than_the_raise_off() 
         println!(
             "scene 9 shallow {buffer_ms} ms: sus_use hits {on_hits} of {SEEDS} (raise off {off_hits}); raised frames lost {lost} ({off_lost} off); raise windows {windows}"
         );
+        assert!(
+            windows > 0,
+            "{buffer_ms} ms: premise: the raise engaged on no run"
+        );
         assert_eq!(off_lost, 0, "{buffer_ms} ms: premise: nothing is raised");
         assert!(
             on_hits + MARGIN >= off_hits,
