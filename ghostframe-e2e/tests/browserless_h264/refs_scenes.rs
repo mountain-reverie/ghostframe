@@ -24,6 +24,15 @@ fn refs() -> H264Load {
     pcm_load(PcmMode::RefManager)
 }
 
+/// [`refs`] under production's rate policy, and the padding and probe raise it
+/// brings: the loss and reordering scenes run with it, since that is the stream
+/// they are about.
+fn refs_rated() -> H264Load {
+    let mut l = refs();
+    l.pcm_rate_policy = true;
+    l
+}
+
 async fn run_on(
     seed: u64,
     secs: u64,
@@ -42,12 +51,21 @@ async fn run_on(
 }
 
 async fn run_pattern(seed: u64, secs: u64, pattern: Pattern) -> (BrowserlessResult, H264Outcome) {
+    run_pattern_with(seed, secs, pattern, refs_rated()).await
+}
+
+async fn run_pattern_with(
+    seed: u64,
+    secs: u64,
+    pattern: Pattern,
+    load: H264Load,
+) -> (BrowserlessResult, H264Outcome) {
     run_on(
         seed,
         secs,
         link_20ms(),
         pattern,
-        refs(),
+        load,
         DropPlan::default(),
         RunOptions::default(),
     )
@@ -142,7 +160,7 @@ fn assert_recovers(ctx: &str, secs: u64, r: &BrowserlessResult, o: &H264Outcome)
 #[tokio::test(start_paused = true)]
 async fn refs_clean_stream_shows_every_frame_right_with_one_idr() {
     for seed in SEEDS {
-        let (r, o) = run_pattern(seed, 6, Pattern::Clean).await;
+        let (r, o) = run_pattern_with(seed, 6, Pattern::Clean, refs()).await;
         line("refs-clean", seed, &r, &o);
         let ctx = format!("refs-clean {seed:#x}");
         assert_sound(&ctx, 6, &r, &o);
@@ -256,6 +274,7 @@ async fn refs_scene_4_reordering_refuses_late_frames_and_never_drifts() {
         assert_sound(&ctx, SECS, &r, &o);
         assert_eq!(o.idr_made, 1, "{ctx}");
         assert!(o.correct > 200, "{ctx}");
+        assert_rated_reorder(&ctx, seed, 8_000, &r, &o).await;
     }
     for seed in SEEDS {
         let (r, o) = run_pattern(seed, SECS, Pattern::Reorder { window_us: 45_000 }).await;
@@ -291,7 +310,48 @@ async fn refs_scene_4_reordering_refuses_late_frames_and_never_drifts() {
             o.refs_to_undisplayed,
             o.made
         );
+        assert_rated_reorder(&ctx, seed, 45_000, &r, &o).await;
     }
+}
+
+/// The reordering scenes run under the rate policy (and its padding and probe
+/// raise). What that must not do: starve the stream (frames made at least 0.8 x
+/// those of the same scene with the policy off), or turn the path's lateness
+/// into more than it was (the loss path still judged P fragments lost, nothing
+/// was dropped). Premise: the policy ran (a rate was told) and probed.
+async fn assert_rated_reorder(
+    ctx: &str,
+    seed: u64,
+    window_us: u64,
+    r: &BrowserlessResult,
+    o: &H264Outcome,
+) {
+    let (r_off, o_off) = run_pattern_with(seed, SECS, Pattern::Reorder { window_us }, refs()).await;
+    assert_eq!(
+        r_off.h264.stats.rate_target_bps, 0,
+        "{ctx}: premise: off is off"
+    );
+    assert!(
+        r.h264.stats.rate_target_bps > 0
+            && (r.h264.stats.probe_padding_windows > 0 || r.h264.refs.probe_raise_windows > 0),
+        "{ctx}: premise: the policy ran and probed"
+    );
+    assert_eq!(r.s2c_datagrams_dropped, 0, "{ctx}");
+    assert!(r.h264.stats.verdicts_p_frag > 0, "{ctx}");
+    assert!(
+        o.made * 10 >= o_off.made * 8,
+        "{ctx}: {} frames made with the policy, {} without",
+        o.made,
+        o_off.made
+    );
+    println!(
+        "{ctx}: policy on made {} (verdicts {}, padding windows {}, raise windows {}), off made {}",
+        o.made,
+        r.h264.stats.verdicts_p_frag,
+        r.h264.stats.probe_padding_windows,
+        r.h264.refs.probe_raise_windows,
+        o_off.made
+    );
 }
 
 /// Scene 5: H.264 -> tile -> H.264 -> tile -> H.264. A return is a recovery P
@@ -648,5 +708,269 @@ async fn refs_an_mtu_that_falls_after_discovery_recovers_from_the_anchor() {
         assert_eq!(c.idr_session, 1, "{ctx}");
         assert!(c.idr_mtu_shrink <= c.mtu_retired_idr, "{ctx}: {c:?}");
         assert!(o.idr_made <= 3, "{ctx}: {} IDRs", o.idr_made);
+    }
+}
+
+/// The share of the estimate the stream may spend (`h264_rate::RATE_SHARE`,
+/// pinned by a lib test).
+const RATE_SHARE: f64 = 0.8;
+
+/// How far the encoder's rate may lag the estimate it follows: the policy
+/// evaluates every 250 ms on a 250 ms EWMA, and the estimate it read may have
+/// been half a second old.
+const POLICY_LAG_US: u64 = 500_000;
+
+/// Capacity-drop timelines of scene 6, `(name, link points in bytes/s, run
+/// length in seconds, when the capacity drops in us)`. A is a drop from 6 to 2
+/// Mbit/s on a settled stream; B rises 2 -> 6 Mbit/s and drops back to 2 1.5 s
+/// later, the drop the old 2 s reopen lock would have held off.
+type Timeline = (&'static str, Vec<(u64, u64)>, u64, u64);
+
+fn scene6_timelines() -> [Timeline; 2] {
+    [
+        (
+            "A",
+            vec![(0, 750_000), (12_000_000, 250_000)],
+            24,
+            12_000_000,
+        ),
+        (
+            "B",
+            vec![(0, 250_000), (6_000_000, 750_000), (7_500_000, 250_000)],
+            20,
+            7_500_000,
+        ),
+    ]
+}
+
+/// What scene 6 reads off a run, from the encoder's own decisions.
+struct DropRun {
+    r: BrowserlessResult,
+    /// Coded access units: `(scene time us, bytes, raised)`.
+    aus: Vec<(u64, usize, bool)>,
+    secs: u64,
+    /// Frames the encoder gate skipped (injected, not made), per scene time.
+    injected: Vec<u64>,
+}
+
+impl DropRun {
+    async fn new(
+        seed: u64,
+        points: &[(u64, u64)],
+        secs: u64,
+        tweak: impl FnOnce(&mut H264Load),
+    ) -> Self {
+        let net = super::bottleneck_net(
+            super::CapTimeline {
+                points: points.to_vec(),
+            },
+            20_000,
+            0,
+            600,
+        );
+        let mut l = super::refs_cbr_load();
+        tweak(&mut l);
+        let (r, _) = run_on(
+            seed,
+            secs,
+            net,
+            Pattern::Clean,
+            l,
+            DropPlan::default(),
+            RunOptions::default(),
+        )
+        .await;
+        let aus = r
+            .h264_run()
+            .expect("an H.264 scene")
+            .truth
+            .au_log
+            .iter()
+            .map(|a| (u64::from(a.timestamp_us), a.bytes, a.raised))
+            .collect();
+        let injected = r
+            .injections
+            .iter()
+            .filter(|(_, heartbeat)| !heartbeat)
+            .map(|(t, _)| *t)
+            .collect();
+        Self {
+            r,
+            aus,
+            secs,
+            injected,
+        }
+    }
+
+    /// Bytes of the access units coded at the rate in force (not the probe
+    /// raise) in `[from, from + 1 s)`.
+    fn bytes_in(&self, from: u64) -> usize {
+        self.aus
+            .iter()
+            .filter(|(t, _, raised)| !raised && (from..from + 1_000_000).contains(t))
+            .map(|a| a.1)
+            .sum()
+    }
+
+    /// The highest estimate in `[from - lag, from + 1 s)`.
+    fn estimate_max(&self, from: u64) -> u64 {
+        self.r
+            .bwe_estimate_samples
+            .iter()
+            .filter(|(t, _)| *t + POLICY_LAG_US >= from && *t < from + 1_000_000)
+            .map(|x| x.1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Windows `[t, t + 1 s)` every 100 ms from `from` to the end of the run.
+    fn windows(&self, from: u64) -> impl Iterator<Item = u64> + '_ {
+        (from..=self.secs * 1_000_000 - 1_000_000).step_by(100_000)
+    }
+
+    /// The worst ratio of coded bytes to `RATE_SHARE x` the estimate, over the
+    /// windows from `from`.
+    fn worst_ratio(&self, from: u64) -> (f64, u64) {
+        self.windows(from)
+            .map(|t| {
+                let est = self.estimate_max(t).max(1) as f64;
+                (self.bytes_in(t) as f64 * 8.0 / (RATE_SHARE * est), t)
+            })
+            .fold((0.0, 0), |a, b| if b.0 > a.0 { b } else { a })
+    }
+
+    fn skips_after(&self, from: u64, len: u64) -> usize {
+        self.injected
+            .iter()
+            .filter(|t| (from..from + len).contains(*t))
+            .count()
+            .saturating_sub(
+                self.aus
+                    .iter()
+                    .filter(|(t, _, _)| (from..from + len).contains(t))
+                    .count(),
+            )
+    }
+
+    /// The longest a frame took from its capture to the client showing it,
+    /// for frames captured from `from`.
+    fn max_latency_us(&self, from: u64) -> u64 {
+        self.r
+            .h264_run()
+            .expect("an H.264 scene")
+            .display
+            .iter()
+            .filter(|d| u64::from(d.frame_seq) * DEFAULT_CADENCE_US >= from)
+            .map(|d| {
+                d.at_us
+                    .saturating_sub(u64::from(d.frame_seq) * DEFAULT_CADENCE_US)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// Scene 6, rate control on an acked-reference stream: a capacity drop.
+///
+/// The stream is `refs_cbr_load` (a PCM encoder that sizes its frames from the
+/// rate it is told, content that wants more than any rate here) under the
+/// in-place policy, on a link that falls from 6 to 2 Mbit/s (A), or rises
+/// 2 -> 6 and falls back 1.5 s later (B: the drop shortly after a rise). The
+/// assertions are about the encoder's decisions, not the wire (the pacer holds
+/// the wire to the estimate whatever the encoder does):
+///  * the access units coded at the rate in force (not the probe raise, which
+///    is a burst by design) never exceed `1.15 x RATE_SHARE x` the estimate in
+///    any 1 s window from one RTT after the drop, the estimate being the
+///    highest in the window and the half second before it (the policy's lag);
+///  * backpressure skips after the drop are at most half those of the control
+///    (the same scene with no rate policy) in the 10 s after the drop, and at
+///    most a third of the control's from 2 s to 10 s;
+///  * the frame queue delay (capture to shown) stays within the link's buffer
+///    and a second.
+///
+/// Premises: the link's fall is seen (the estimate fell by 30 %), the policy
+/// moved the rate down (and up, on B) in place, the encoder gate skipped
+/// frames for the queue, and the rate model held frames to the rate.
+///
+/// Mutations: no rate policy (`pcm_rate_policy` off) fails the premise and the
+/// skip bound; Phase A's 2 s lock (`pcm_phase_a_rate`) and a soft cap at 1.7
+/// (`with_cap_overshoot`) do not fail these windows, which do not reach the
+/// cap or the lock (the lock is caught by `in_place_a_drop_shortly_after_a_rise_is_not_locked_out`
+/// in the policy's tests).
+#[tokio::test(start_paused = true)]
+async fn refs_scene_6_a_capacity_drop_is_followed_by_the_encoder() {
+    for (name, points, secs, drop_at) in scene6_timelines() {
+        for seed in SEEDS {
+            let run = DropRun::new(seed, &points, secs, |_| {}).await;
+            let control = DropRun::new(seed, &points, secs, |l| l.pcm_rate_policy = false).await;
+            let ctx = format!("scene6 {name} {seed:#x}");
+            let refs = &run.r.h264.refs;
+            let model = &run.r.h264_run().expect("an H.264 scene").truth.model;
+            // Premises.
+            let before = run
+                .r
+                .bwe_estimate_samples
+                .iter()
+                .filter(|(t, _)| *t < drop_at)
+                .map(|x| x.1)
+                .max()
+                .unwrap_or(0);
+            let after = run
+                .r
+                .bwe_estimate_samples
+                .iter()
+                .filter(|(t, _)| *t >= drop_at + 500_000)
+                .map(|x| x.1)
+                .min()
+                .unwrap_or(u64::MAX);
+            assert!(
+                after as f64 <= 0.7 * before as f64,
+                "{ctx}: premise: the estimate fell by 30 %: {before} -> {after}"
+            );
+            assert!(refs.rate_applies_down >= 1, "{ctx}: premise: {refs:?}");
+            assert!(
+                name == "A" || refs.rate_applies_up >= 1,
+                "{ctx}: premise: B rises in place first"
+            );
+            assert!(
+                run.r.h264.stats.frames_skipped_backpressure > 0,
+                "{ctx}: premise: the gate skipped for the queue"
+            );
+            assert!(
+                model.frames_bucket_empty > 0,
+                "{ctx}: premise: the model held frames to the rate"
+            );
+            // The encoder follows the estimate.
+            let (ratio, at) = run.worst_ratio(drop_at + RTT_US);
+            // Skips.
+            let skips = run.skips_after(drop_at, 10_000_000);
+            let control_skips = control.skips_after(drop_at, 10_000_000);
+            let latency = run.max_latency_us(drop_at + RTT_US);
+            println!(
+                "{ctx}: worst coded/(0.8 est) {ratio:.2} at {:+.1} s; skips in 10 s {skips} (control {control_skips}); max latency {} ms; applies up {} down {}",
+                (at as f64 - drop_at as f64) / 1e6,
+                latency / 1000,
+                refs.rate_applies_up,
+                refs.rate_applies_down
+            );
+            assert!(
+                ratio <= 1.15,
+                "{ctx}: coded {ratio:.2} x {RATE_SHARE} x the estimate in the 1 s from {at}"
+            );
+            assert!(
+                skips * 2 <= control_skips,
+                "{ctx}: {skips} skips in 10 s against the control's {control_skips}"
+            );
+            let settled = run.skips_after(drop_at + 2_000_000, 8_000_000);
+            let control_settled = control.skips_after(drop_at + 2_000_000, 8_000_000);
+            assert!(
+                settled * 3 <= control_settled,
+                "{ctx}: {settled} skips from 2 s to 10 s after the drop against the control's {control_settled}"
+            );
+            assert!(
+                latency <= 600_000 + 1_000_000,
+                "{ctx}: a frame took {latency} us to be shown"
+            );
+        }
     }
 }

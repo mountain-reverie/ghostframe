@@ -1311,6 +1311,17 @@ impl IoBridge {
         let au = backend
             .encode(&nv12, &req.plan, &req.refs)
             .expect("the PCM backend executes every plan");
+        self.h264
+            .pcm_log
+            .lock()
+            .expect("pcm log poisoned")
+            .au_log
+            .push(crate::encoder::h264::harness::AuRecord {
+                timestamp_us,
+                bytes: au.payload.len(),
+                idr: au.meta.idr,
+                raised: self.h264.rate.applied().is_some_and(|a| a != req.rate.bps),
+            });
         self.h264_refs_commit(&req.plan, au, &meta, max_dg_size, now);
     }
 
