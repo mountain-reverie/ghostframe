@@ -1095,10 +1095,13 @@ enum StepMode {
     /// `Refs` with the first-frame excess scaled linearly with the size of the
     /// step (the optimistic reading: small steps are nearly free).
     RefsLinearStep,
+    /// `Refs` on the earlier burst calibration of a re-send (a backend that
+    /// re-sends the HRD at 75 % fullness): the first frame 1.4-1.8x.
+    RefsBurst,
 }
 
 impl StepMode {
-    /// `GF_POP_MODE=refs|refs-phase-a|refs-bps-only|refs-full-transient|refs-linear-step|legacy` (default legacy).
+    /// `GF_POP_MODE=refs|refs-phase-a|refs-bps-only|refs-full-transient|refs-linear-step|refs-burst|legacy` (default legacy).
     fn from_env() -> Self {
         match std::env::var("GF_POP_MODE").as_deref() {
             Ok("refs") => Self::Refs,
@@ -1106,6 +1109,7 @@ impl StepMode {
             Ok("refs-bps-only") => Self::RefsBpsOnly,
             Ok("refs-full-transient") => Self::RefsFullTransient,
             Ok("refs-linear-step") => Self::RefsLinearStep,
+            Ok("refs-burst") => Self::RefsBurst,
             _ => Self::Legacy,
         }
     }
@@ -1126,8 +1130,16 @@ impl StepMode {
             }
             Self::RefsLinearStep => {
                 let mut l = refs_cbr_load();
-                l.pcm_rate_model =
-                    Some(PcmRateModel::s2(40_000, 120_000, FPS).with_linear_step_scaling());
+                l.pcm_rate_model = Some(
+                    PcmRateModel::s2(40_000, 120_000, FPS)
+                        .with_burst_resend()
+                        .with_linear_step_scaling(),
+                );
+                l
+            }
+            Self::RefsBurst => {
+                let mut l = refs_cbr_load();
+                l.pcm_rate_model = Some(PcmRateModel::s2(40_000, 120_000, FPS).with_burst_resend());
                 l
             }
             Self::RefsBpsOnly => {
@@ -1751,18 +1763,24 @@ async fn p_b_population_never_collapses_and_finds_the_headroom_whenever_the_clie
 /// | refs, first VCE calibration, Phase A | 95/93/90 | 96/96/96 | 3900/6600, 5200/7400, 5700/8000 |
 /// | refs, re-send-burst model (B6), in place, 15 % rise band, no refresh | 90/90/92 | 96/96/96 | 1900/9200, 2100/8100, 2000/7800 |
 /// | refs, re-send-burst model (B6), Phase A | 96/94/93 | 96/96/96 | 4200/6500, 2200/7100, 4000/7100 |
+/// | refs, 40 %-fullness re-send model (T4 sweep), in place, 10 % rise band | 87/87/77 | 96/96/96 | 1900/10300, 2000/10600, 2100/12900 |
+/// | refs, 40 %-fullness re-send model, in place, 15 % rise band (shipped) | 88/89/85 | 96/96/96 | 1900/10600, 1900/8600, 1900/12500 |
+/// | refs, 40 %-fullness re-send model, Phase A | 90/86/86 | 96/96/96 | 5500/7300, 5900/11800, 5700/10900 |
 ///
-/// The re-send-burst model (`pcm_rate.rs`, provisional, from T4 on the VCE) is
-/// the gate's: every re-send of the rate buffers gives a first frame of 1.8x
-/// (rise) / 1.7x (fall) / 1.4x (same rate) whatever the size of the step,
-/// settled on the second frame, and a raised IDR reaches 0.6 of its ceiling.
-/// Mean bytes over the bytes the rates told allow: 1.019 in place, 1.013 Phase
-/// A. `refs-linear-step` is the optimistic reading of the step-size dependence.
+/// The gate's model is the 40 %-fullness re-send (`pcm_rate.rs`, provisional,
+/// from T4 `h264_direct_resend_fullness_sweep` on the VCE): a P re-send of the
+/// rate buffers gives frames of 1.00, 0.56 and 0.87 times the average, the
+/// same for a rise, a fall and a pure re-send, and a raised IDR reaches 0.6 of
+/// its ceiling. The burst model it replaces (1.8x / 1.7x / 1.4x on the first
+/// frame, the backend re-sending the HRD at 75 %) is `GF_POP_MODE=refs-burst`.
+/// Mean bytes over the bytes the rates told allow: 0.993 in place (burst
+/// model: 1.019), 0.996 Phase A (1.013). `refs-linear-step` is the optimistic reading of the step-size dependence.
 ///
 /// No collapse in any. The twin never misses the guard (the 89/96 of the
 /// legacy gate is the legacy 8 ms row only). The full model is the gate's;
-/// its in-place policy reaches the headroom less often than Phase A's, which
-/// is what the later B6 steps are measured against. Premise: probes were
+/// its in-place policy now reaches the headroom as often as Phase A's (88/89/85
+/// against 90/86/86) and in a median 1.9 s against 5.5-5.9 s; the tail (p90
+/// 8.6-12.5 s against 7.3-11.8 s) is no better. Premise: probes were
 /// padded, the policy moved the rate up in place and the model held frames to
 /// the rate on every seed.
 #[tokio::test(start_paused = true)]
@@ -1771,11 +1789,11 @@ async fn p_b_population_refs_twin_never_collapses_and_finds_the_headroom() {
 }
 
 /// Misses allowed per gate row: `(reaching the headroom, releasing the guard)`.
-/// Row 1 allows 2: on the re-send-burst model the in-place policy misses the
-/// headroom on two of the eight at-once timelines (6 of 8; Phase A's 94/96 on
-/// the population is the comparison), measured not tuned.
+/// Measured on the 40 %-fullness re-send model, not tuned: one miss in each of
+/// the first three rows; the burst model needed 5 and 2 in the first two rows
+/// and none in the third.
 const REFS_TWIN_ALLOWED_MISSES: [(usize, usize); 6] =
-    [(5, 0), (2, 0), (0, 0), (0, 0), (0, 0), (0, 0)];
+    [(1, 0), (1, 0), (1, 0), (0, 0), (0, 0), (0, 0)];
 
 /// The gate's rows: seeds, ack chatter and one-way delay.
 type PopulationRow = (Option<Duration>, &'static [u64], u64);

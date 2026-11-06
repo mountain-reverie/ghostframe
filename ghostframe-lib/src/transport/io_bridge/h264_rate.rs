@@ -77,11 +77,16 @@ pub(crate) const APPLY_MIN_INTERVAL: Duration = Duration::from_millis(250);
 /// A fall this far (fraction) under the running rate is applied at once: a cut
 /// stays prompt.
 pub(crate) const APPLY_MOVE_FRACTION: f64 = 0.10;
-/// A rise needs to be this far over the running rate. Every re-send of the
-/// rate buffers costs a first frame of about 1.4-1.9x the average, whatever the
-/// size of the step (T4 on the VCE), so a small rise is not worth one; a rise
-/// that does not clear this is left until the candidate does. There is no
-/// periodic refresh: a rate inside the band is never re-sent to follow a drift.
+/// A rise needs to be this far over the running rate. A re-send of the rate
+/// buffers on a P frame no longer bursts (the HRD restarts at 40 % fullness:
+/// T4 `h264_direct_resend_fullness_sweep`, 1.00 of the average, then a dip of
+/// 0.56 and 0.87), so the band could be the fall's 0.10, and was tried: on the
+/// 96-seed population (`GF_POP_MODE=refs`, 2026-11-06) 0.10 reached 0.8 x 6
+/// Mbit/s on 87/87/77 of 96 (as sent / at once / 8 ms) and 0.15 on 88/89/85,
+/// so the wider band stays: each re-send still costs its dip, and a dip is
+/// bytes the bandwidth estimate does not see. A rise that does not clear this
+/// is left until the candidate does. There is no periodic refresh: a rate
+/// inside the band is never re-sent to follow a drift.
 pub(crate) const APPLY_RISE_FRACTION: f64 = 0.15;
 /// A cut is a fall of more than [`DROP_FRACTION`] from the highest rate
 /// applied within this long: a large fall may arrive as several smaller
@@ -313,7 +318,7 @@ impl RatePolicy {
     /// confirmations, no GOP wait; a change is applied when the candidate left
     /// the dead band ([`APPLY_RISE_FRACTION`] for a rise, [`APPLY_MOVE_FRACTION`]
     /// for a fall), never twice within [`APPLY_MIN_INTERVAL`]. A rate inside
-    /// the band is not re-sent: each re-send of the rate buffers is a burst.
+    /// the band is not re-sent: each re-send of the rate buffers costs a dip.
     pub(crate) fn step_in_place(&mut self, now: Instant, estimate_bps: u64) -> Option<RateApply> {
         self.observe(now, estimate_bps);
         let Some(applied) = self.applied else {
@@ -1622,7 +1627,7 @@ mod tests {
     }
 
     /// A rate inside the band is never re-sent, however long it stays there
-    /// (each re-send is a burst); a rise needs 15 %, a fall 10 %.
+    /// (each re-send costs a dip); a rise needs 15 %, a fall 10 %.
     #[test]
     fn in_place_a_drift_inside_the_band_is_never_resent_a_wider_one_is() {
         let t0 = Instant::now();
