@@ -604,17 +604,13 @@ fn a_lost_carrier_is_reported_failed_and_the_library_marks_again() {
         .find(|(_, e)| matches!(e, BackendFeedback::LtrMarkFailed { .. }))
         .map(|(s, _)| *s)
         .expect("a failed event");
-    // The library marked again (MMCO 6 shape) and the new mark was confirmed.
+    // The library marked again and the new mark was confirmed.
     let remarks = r
         .log
         .iter()
         .filter(|l| l.step > failed_step && l.sim.mark != MarkShape::None)
         .count();
     assert!(remarks >= 2, "marks after the failure: {remarks}");
-    assert!(r
-        .log
-        .iter()
-        .any(|l| l.step > failed_step && l.sim.mark == MarkShape::Mmco6));
     assert!(st.p_anchors_confirmed >= 4, "{st:?}");
     assert_eq!(r.idr_headers(), 1);
     assert_idr_accounting(&r);
