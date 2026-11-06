@@ -218,15 +218,44 @@ With `GHOSTFRAME_DAMAGE_MODE=shadow` or `on` the daemon also logs a cumulative
 (design note section 3.4, "As landed (PR 4)").
 
 `h264 stats` also carries `rate_target_bps` and the stall counters.
-It names the `backend` (`libva-direct`, `openh264`, `pcm`) and, for a backend
-with its own reference structure (openh264: the manager runs in observed mode),
-`idr_backend_fallback` (an IDR the backend made unasked, or a stream moved down
-a step), `marks_observed`, `mark_unrepresentable`, `ltr_recoveries_requested`,
-`ltr_mark_failed_sent` and `backend_demotions` (libva-direct at its fault limit,
-moved to openh264 with `auto`). A non-zero `idr_backend_fallback` outside a
-demotion is the library's own fallback (an unknown recovery frame, scene-change
-detection left on) and worth a look. `GHOSTFRAME_H264_BACKEND` is
-`auto|vaapi|openh264|ffmpeg`. Full docs land in B7-6.
+`h264 stats` names the `backend` (`libva-direct`, `openh264`, `pcm`; the
+`h264 refs` line has `backend` too, but none of the rest) and, for a backend
+with its own reference structure (openh264: the manager runs in observed mode,
+reading each access unit's slice header), `idr_backend_fallback`
+(an IDR the backend made unasked, or a stream moved down a step), `marks_observed`,
+`mark_unrepresentable`, `ltr_recoveries_requested`, `ltr_mark_failed_sent` and
+`backend_demotions` (libva-direct at its fault limit, moved to openh264 with
+`auto`). A non-zero `idr_backend_fallback` outside a demotion is the library's
+own fallback (an unknown recovery frame, scene-change detection left on) and
+worth a look. openh264 has no per-frame size cap: a scene change shows as
+`frames_over_cap` and `max_cap_ratio_pct` on `h264 stats`, absorbed by the
+pacer.
+
+`GHOSTFRAME_H264_BACKEND` is `auto|vaapi|openh264|ffmpeg` (`legacy` = `ffmpeg`;
+a misspelt value warns and means `auto`): `auto` tries libva-direct, then
+openh264, then the ffmpeg encoder (which B7b removes); `vaapi` and `openh264`
+try only that one; anything but `auto`/`openh264` never loads libopenh264, which
+is the "user can turn it off" condition of Cisco's licence. The library is
+loaded at run time and never shipped: `libopenh264.so.8` (2.6.x), `.so.7`
+(2.4.x/2.5.x, e.g. Ubuntu 24.04's `libopenh264-7`), then `.so`, or the absolute path in
+`GHOSTFRAME_H264_OPENH264_LIB` (optional; a configured path that fails is an
+error, not a hint). An unsupported version is refused with one line naming what
+was found. Pictures above 1920x1080 or `CAPTURE_FPS` above 30 are refused with one
+warning and served by the next choice. Patent licensing of a distribution-built
+library is the operator's decision (`NOTICE`); install the library on the
+session machine like any other runtime dependency. Two traps in
+`OpenH264Backend::params_for`: screen-content usage silently turns long-term
+references off, and scene-change detection makes IDRs nobody asked for; both
+are covered by browserless scenes that go red if they are flipped. The
+`openh264_*` lib tests and the `openh264_scenes` browserless scenes fail with
+an install hint when no library is present (CI installs `libopenh264-7`: 2.4.1,
+the 40-byte `SLayerBSInfo` layout; a developer machine on 2.6.0 has the 56-byte
+one). `just test-openh264 <path>` runs them against one library (the same
+variable, read through `config`; DEVELOPERS.md says how to get the other
+layout). `e2e_h264_openh264_motion` forces the backend with the GPU harness and
+checks a moving spinner through the browser's WebCodecs decoder; it is local
+only (every H.264 e2e is in `ci/skip-list.txt`), so CI never decodes the
+observed-mode stream in a browser.
 `GHOSTFRAME_H264_GOP_SECONDS` (default 3, clamped 2..5) sets the scheduled IDR
 interval; `GHOSTFRAME_LOSS_OVERRIDE=1` turns the off-by-default loss override
 back on. Every field and both variables are explained in

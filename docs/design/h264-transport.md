@@ -44,9 +44,12 @@ static P frame is about 126 bytes. The price is that VBR undershoots busy
 content (section 9). Several comments and the `RateParams` doc in the encoder
 and `h264_rate.rs` still say "CBR"; they predate that switch.
 
-Neither backend has reference control. Recovery from loss is an IDR. The
-encoder's own GOP is set to about 9 hours (`ENCODER_OWN_GOP`); the bridge asks
-for every IDR itself.
+Neither of those backends has reference control. Recovery from loss is an IDR.
+The encoder's own GOP is set to about 9 hours (`ENCODER_OWN_GOP`); the bridge
+asks for every IDR itself. Sessions whose client sends HELLO 0x04 use instead
+one of the two plan-executing backends of section 10 (libva-direct, then
+OpenH264), and recover without an IDR; the ffmpeg encoder remains the
+`GHOSTFRAME_H264_BACKEND=ffmpeg` choice and the fallback when neither opens.
 
 ## 2. Wire v2 (`ghostframe-protocol`)
 
@@ -536,6 +539,8 @@ Environment variables (the classifier ones also accept their older
 
 | Variable | Effect | Default |
 |---|---|---|
+| `GHOSTFRAME_H264_BACKEND` | encoder: `auto` (libva-direct, then openh264, then the ffmpeg encoder), `vaapi` (libva-direct only), `openh264` (openh264 only), `ffmpeg` or `legacy` (the Phase A encoder and policy). An unrecognised value warns and means `auto`. Anything that excludes openh264 never loads the library | `auto` |
+| `GHOSTFRAME_H264_OPENH264_LIB` | absolute path of the libopenh264 to load (a relative one warns and is ignored). Optional: unset, the loader's cache is searched (section 10, "OpenH264 and observed mode") | unset |
 | `GHOSTFRAME_H264_GOP_SECONDS` | scheduled IDR interval | 3, clamped 2..5 |
 | `CAPTURE_FPS` | encoder frame rate | 30 |
 | `GHOSTFRAME_LOSS_OVERRIDE` | enable `loss_override` (`1`, `true`, `yes`, `on`) | off |
@@ -579,11 +584,12 @@ Environment variables (the classifier ones also accept their older
 A session recovers from loss without an IDR when the client sent HELLO 0x04
 (`h264_acked_ref`), acked references are not switched off
 (`GHOSTFRAME_H264_BACKEND=ffmpeg` does), and the encode worker's backend
-executes plans: libva-direct, when the machine has it. Anything else is the
-Phase A policy of sections 3 and 4, unchanged. The decision is made on the
-first planned frame: a worker whose backend answers `H264Reply::Unplanned` (no
-libva-direct, or it refused the stream) puts the process back on Phase A, and
-three failed encodes in a row do the same.
+executes plans: libva-direct, when the machine has it, else openh264
+(the subsection "OpenH264 and observed mode" on how it differs). Anything else is the Phase A policy of
+sections 3 and 4, unchanged. The decision is made on the first planned frame:
+a worker whose backends all answer `H264Reply::Unplanned` (no libva-direct, no
+usable libopenh264, or both refused the stream) puts the process back on
+Phase A, and three failed encodes in a row do the same.
 
 **Per frame** the loop owns the `RefManager` (`encoder/h264/refs.rs`) and
 calls `plan_next(frame_seq, now)` with the plan epoch; `Plan::Hold` skips the
@@ -797,8 +803,145 @@ differ; libva-direct writes High at level 4.2 or above by frame size and rate.
 
 **Tests.** `browserless_h264` `refs_scenes` run design T3 scenes 1 to 5, 7, 8
 and 10 on this path with a PCM backend (`encoder/h264/harness.rs`) in place of
-the encoder; `h264_direct_worker_path_*` (`io_bridge/tests.rs`, local, GPU) runs
+the encoder, and `openh264_scenes` run the observed-mode counterparts with the
+real library (below); `h264_direct_worker_path_*` (`io_bridge/tests.rs`, local, GPU) runs
 the real worker and libva-direct through a loss.
+
+### OpenH264 and observed mode (B7)
+
+**Backend choice.** `auto` opens libva-direct if the machine has it and the
+stream fits, else openh264, else (B7a) the ffmpeg encoder; `vaapi` and
+`openh264` try only that one; `ffmpeg` (or `legacy`) keeps the Phase A policy.
+A libva-direct open that fails because the machine lacks the device, driver or
+entrypoint is remembered for the process; one that is *incapable* for this
+stream (a picture under 128x128, a rate-control mode) is not, so a later stream
+can still use it. libva-direct at its fault limit under `auto` demotes the
+stream to openh264 (a `backend_fallback` IDR, `backend_demotions`); openh264
+giving up is the Phase A fallback above. openh264 is offered pictures of even
+sides, at least 64 on each, with no more pixels than 1920x1080 (the limit is on
+the area, so 2560x800 passes), at up to 30 fps; a larger picture or a higher
+`CAPTURE_FPS` is refused with one warning naming the size and rate, and the
+stream is served as if the backend were absent.
+
+**Loading.** The library is never linked, shipped or downloaded: `dlopen` by
+soname through the loader cache, in order `libopenh264.so.8` (2.6.x),
+`libopenh264.so.7` (2.4.x and 2.5.x: e.g. Ubuntu 24.04's `libopenh264-7`),
+then `libopenh264.so`, or only the absolute path in
+`GHOSTFRAME_H264_OPENH264_LIB` (an explicit choice that fails is an error, not
+a hint). Each candidate is confirmed with `WelsGetCodecVersion`; 2.4 and 2.5
+share a 40-byte `SLayerBSInfo`, 2.6 has 56, and any other version is refused
+with one line naming what was found. A missing library is one line listing
+every candidate and why it failed, then the next backend.
+
+**Settings** (`OpenH264Backend::params_for`), each a trap: camera usage,
+because long-term references are silently off under screen-content usage;
+scene-change detection off, because it answers a scene change with an IDR nobody
+asked for (counted as `idr_backend_fallback`); frame skip off, so `frame_seq`
+and `frame_num` stay in step; `CONSTANT_ID` so SPS/PPS ids do not alternate;
+one thread and one slice, so an access unit has one slice header; complexity
+LOW (about 45 % faster than MEDIUM per P frame at the same bytes); QP floor 20,
+because after a quiet stretch the rate control codes a scene change at QP 0 into
+a frame larger than the library's output buffer; the LTR cycle is two pictures
+marked every 30 frames. Rate changes go to spatial layer 0 only, and a change
+under 5 % is not passed on (each `SetOption` restarts the rate control). There
+is no per-frame size cap: a scene change codes in one frame well over the cap
+(`frames_over_cap`, `max_cap_ratio_pct` count it), and the pacer and the
+backpressure skip absorb it.
+
+**Observed mode.** openh264 chooses its own references and marks; the manager's
+plan is only an IDR request. The first IDR's SPS and PPS are parsed into the
+manager's `StreamParams`, which switches it to observed mode: every access
+unit's slice header is read (`RefManager::observe`) to learn the reference and
+any marking it made, the wire header describes what the stream did
+(`FRAME_FLAG_MARK_TARGET` says the long-term mark is on the frame's
+*predecessor*, which is what a delayed mark is), and the client's gate checks
+that. The receiver's word becomes the library's feedback, in order, before each
+encode: a carrier decoded gives `LtrMarked` (with the *marked* picture's
+`frame_num`), a carrier refused, or judged lost, or suspect for longer than the candidate
+timeout, gives `LtrMarkFailed` (a merely suspect one does not: a later decoded
+ack still confirms it), and a loss
+gives `LtrRecover` naming the confirmed anchor (with the *carrier's*
+`frame_num`; the marked number makes the library log an invalid mark and send
+an IDR). A recovery request names only a mark whose `LtrMarked` has already
+gone out. An IDR the library made unasked is adopted as a new epoch and
+counted as `idr_backend_fallback`; P frames wait for it to be acknowledged as
+for any IDR. The manager models the stream with its `DecoderModel` (POC type 2
+included), and a P from any confirmed anchor counts as a re-root, so a
+`LtrMarked` and a `LtrRecover` that reach the library in one batch (it
+recovers from the older anchor then) cost no second request.
+
+The `h264 stats` line carries the `backend`, `idr_backend_fallback`,
+`marks_observed`, `mark_unrepresentable` (a mark the wire cannot describe: it is
+reported failed so the library marks again), `ltr_recoveries_requested`,
+`ltr_mark_failed_sent` and `backend_demotions` (the `h264 refs` line has the
+`backend` too, and the manager's own counters). A non-zero
+`idr_backend_fallback` outside a demotion is the library's own fallback and
+worth a look.
+
+**Licence.** "OpenH264 Video Codec provided by Cisco Systems, Inc." is logged
+when a session opens (`openh264 session open`). Cisco's patent grant covers
+only the binary Cisco itself builds and distributes, under conditions including
+that the user can turn the codec off (`GHOSTFRAME_H264_BACKEND=vaapi` or
+`ffmpeg` never loads it) and that this attribution is shown. A library built by
+a distribution from the source carries no grant; patent licensing is the
+operator's decision, and ghostframe fetches no binary. `NOTICE`, the README and
+`ghostframe-server --help` say so.
+
+**Tests.** `openh264_*` lib tests need a library (`libopenh264-7` on
+Debian/Ubuntu); they fail with the install hint, by design, when it is missing.
+They and the scenes load the library the daemon would
+(`GHOSTFRAME_H264_OPENH264_LIB` through `config`, else the system's), so
+`just test-openh264 /abs/path/libopenh264.so.2.4.1` runs both against one
+layout (DEVELOPERS.md says how to unpack 2.4.x without installing it). CI's
+`ubuntu-24.04` runner installs 2.4.1, so CI runs the 40-byte layout and
+developer machines on 2.6.0 the 56-byte one; the scenes were run on both, with
+the same numbers except where the library differs by a frame or two.
+`Openh264Sim` is a model of the library's marking and recovery behaviour,
+checked against the real library by a differential test and by a closed loop
+(encoder, manager, client gate and decoder model, loss and reorder).
+
+`browserless_h264` `openh264_scenes` run design T3 on the real library, in
+`PcmMode::OpenH264`: each frame's canvas (a marker per 16x16 cell as nine flat
+4x4 blocks, one bit each, 192 levels apart, in the middle of a noisy border) is
+encoded inline and the client's picture is read back by the nearest level of
+each block, so a lossy codec is not a wrong picture and a drifted cell is. The
+oracle is the comparison with the canvas the source painted: a deliberately
+stale paint is a wrong picture (a scene asserts that), and the reader's margin
+is asserted (no block farther than 8 from its level, 4 at baseline; the two
+scenes that starve the rate control on purpose, 6 and 9, allow up to the 64 at
+which the reader calls a block ambiguous, against a halfway point of 96). The
+truth log's reference of a frame is the manager's own reading of the stream,
+so `header_ref_mismatches` and `refs_to_undisplayed` are not oracles for
+correctness here. The freeze bounds are absolute (two recoveries and the
+freeze allowance: 573 ms; at most 700 ms frozen in all), not scaled by how much
+was lost, so a slower recovery cannot raise them. Scenes: clean, iid 1 and 5 %
+loss, bursts, lost 0x0A frame feedback, reordering, tile re-entry, a lost IDR,
+a capacity drop (3 to 0.8 Mbit/s, with a steady load of new texture so the
+library's rate control is what holds it: the stream must stay within 1.2 x the
+share of the estimate in every second, and at least 0.6 x on average), a heavy
+scene change. Scenes that need explicit references (the slot-overwrite race,
+non-reference probe P frames) remain `refs_scenes` only.
+
+**Recovery latency against the RefManager twin** (5 % independent loss, 10 s,
+three seeds, `refs_scene_1` against `openh264_scene_1`; 2.6.0 and 2.4.1 gave
+the same openh264 figures). Longest stretch without a correct picture: openh264 233,
+234, 134 ms; twin 193, 255, 199 ms. Time frozen beyond the allowance:
+openh264 136, 136, 2 ms; twin 193, 125, 102 ms. Recoveries made: openh264 11,
+12, 15; twin 23, 30, 28. Pictures the encoder never got to show: openh264 38,
+41, 46; twin 72, 77, 73. The two are in the same range, openh264 slightly
+better on frozen time and recoveries. It is not a like-for-like comparison:
+the twin's PCM frames are larger, it marks every frame (about 100 anchors
+against openh264's 8 to 10, a mark every 30 frames).
+
+**What is not covered in CI.** Every H.264 end-to-end test (`e2e_mode_switch*`,
+`e2e_h264_*`, the headroom guard and loss override) is in `ci/skip-list.txt`, so
+CI never decodes an openh264 stream in a browser: WebCodecs on the observed
+stream (MMCO 3, POC type 2) is checked locally by `e2e_h264_openh264_motion`
+(forces the backend with the GPU harness, moves a spinner, and checks the
+server's `h264 refs` / `h264 stats` lines show the library's session and
+`marks_observed`). `e2e_mode_switch_chromium` and `tests/h264.rs` count an
+openh264 session as an acked-reference outcome when libva-direct is absent;
+`GHOSTFRAME_E2E_REQUIRE_VAAPI=1` still means libva-direct.
 
 ### Known limits
 
