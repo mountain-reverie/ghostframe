@@ -19,7 +19,8 @@
 use ghostframe_client_core::{Event as CoreEvent, H264Outcome as CoreOutcome};
 use ghostframe_client_net::ClientNetEvent;
 use ghostframe_lib::encoder::h264_harness::{
-    frame_bytes, Decoded, FeedError, PcmDecoder, PcmLogInner, PcmRefCounters, Picture, Strictness,
+    frame_bytes, read_lossy, Decoded, FeedError, PcmDecoder, PcmLogInner, PcmRefCounters, Picture,
+    Strictness,
 };
 use ghostframe_protocol::protocol::REF_FRAME_NONE;
 
@@ -57,6 +58,19 @@ pub struct H264Display {
     pub records: Vec<DisplayRecord>,
     /// Decode errors reported to the core (it sends the reset request).
     pub resets: u32,
+    /// Read pictures as a lossy canvas (an openh264 scene), not as PCM markers.
+    lossy: bool,
+    /// Lossy reads: cells sampled, cells too far from any level to be sure of,
+    /// and the largest distance of a sample from the level it was read as.
+    pub lossy_cells: LossyCells,
+}
+
+/// What the lossy reader saw, over a scene.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LossyCells {
+    pub read: u64,
+    pub ambiguous: u64,
+    pub max_err: u32,
 }
 
 impl Default for H264Display {
@@ -71,6 +85,17 @@ impl H264Display {
             decoder: PcmDecoder::new(Strictness::Lenient),
             records: Vec::new(),
             resets: 0,
+            lossy: false,
+            lossy_cells: LossyCells::default(),
+        }
+    }
+
+    /// A display for a real encoder's stream (openh264): pictures are read
+    /// from the canvas's levels, nearest first.
+    pub fn lossy() -> Self {
+        Self {
+            lossy: true,
+            ..Self::new()
         }
     }
 
@@ -98,6 +123,18 @@ impl H264Display {
                 self.decoder.reset();
             }
             let outcome = match self.decoder.feed(payload, i64::from(*frame_seq)) {
+                Ok(Decoded { yuv, damaged, .. }) if self.lossy => {
+                    let picture = read_lossy(&yuv).and_then(|r| {
+                        let c = &mut self.lossy_cells;
+                        c.read += r.picture.cells.len() as u64;
+                        c.ambiguous += r.ambiguous as u64;
+                        c.max_err = c.max_err.max(r.max_err);
+                        // A frame with a cell that cannot be told apart is not
+                        // a canvas: shown, and wrong.
+                        (r.ambiguous == 0).then_some(r.picture)
+                    });
+                    DisplayOutcome::Shown { picture, damaged }
+                }
                 Ok(Decoded { yuv, damaged, .. }) => DisplayOutcome::Shown {
                     picture: (yuv.len() == frame_bytes())
                         .then(|| Picture::read(&yuv))
@@ -144,6 +181,8 @@ pub struct H264Run {
     /// `[from, to)` in virtual time during which the tile codec carried the
     /// screen: no H.264 picture is expected, so it is not a freeze.
     pub tile_windows: Vec<(u64, u64)>,
+    /// The lossy reader's tally (zero for a PCM scene).
+    pub lossy_cells: LossyCells,
 }
 
 /// A frame the client displayed that was not the picture the encoder meant.
@@ -152,8 +191,9 @@ pub struct WrongPicture {
     pub at_us: u64,
     pub frame_seq: u32,
     /// The frame the decoder really predicted from, found by matching the
-    /// shown picture against every earlier meant picture; `None` when no
-    /// single reference explains it (or the picture is not made of markers).
+    /// shown picture against every earlier meant picture (for a lossy canvas:
+    /// the earlier frame whose canvas it is); `None` when no single reference
+    /// explains it (or the picture is not made of markers).
     pub effective_ref: Option<u32>,
     /// The frame the encoder meant it to predict from.
     pub meant_ref: Option<u32>,
@@ -223,6 +263,7 @@ impl H264Run {
             refs: self.truth.refs,
             ..Default::default()
         };
+        let lossy = self.lossy_cells.read > 0;
         let mut fed_seqs = std::collections::BTreeSet::new();
         let mut good_at: Vec<u64> = Vec::new();
         for rec in &self.display {
@@ -250,7 +291,16 @@ impl H264Run {
                             truth
                                 .range(..rec.frame_seq)
                                 .rev()
-                                .find(|(_, t)| Picture::predicted(&t.picture, tag) == *p)
+                                .find(|(_, t)| {
+                                    // A lossy canvas is not built from its
+                                    // ancestry: a stale picture is an earlier
+                                    // frame's canvas as it was.
+                                    if lossy {
+                                        t.picture == *p
+                                    } else {
+                                        Picture::predicted(&t.picture, tag) == *p
+                                    }
+                                })
                                 .map(|(s, _)| *s)
                         });
                         o.wrong.push(WrongPicture {

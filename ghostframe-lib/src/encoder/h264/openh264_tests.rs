@@ -149,7 +149,7 @@ fn plan(seq: u32, idr: bool) -> FramePlan {
 }
 
 fn require_lib() {
-    if let Err(e) = Lib::get(None) {
+    if let Err(e) = Lib::get(Lib::configured_path().as_deref()) {
         panic!(
             "{e}\nthese tests need libopenh264 2.4.x-2.6.x: Debian/Ubuntu `apt install \
              libopenh264-7`, Fedora the Cisco repository (or run them with \
@@ -164,7 +164,7 @@ fn config(w: usize, h: usize, bps: u32) -> StreamConfig {
 
 fn open(w: usize, h: usize, bps: u32) -> OpenH264Backend {
     require_lib();
-    let mut be = OpenH264Backend::new(None);
+    let mut be = OpenH264Backend::new(Lib::configured_path());
     be.open(&config(w, h, bps)).expect("open");
     be
 }
@@ -366,12 +366,17 @@ fn decode_indexed(
 #[test]
 fn openh264_library_loads_and_reports_a_supported_version() {
     require_lib();
-    let lib = Lib::get(None).unwrap();
+    let configured = Lib::configured_path();
+    let lib = Lib::get(configured.as_deref()).unwrap();
     eprintln!(
         "openh264 {} ({:?} layout) from {}",
         lib.version, lib.layout, lib.origin
     );
-    assert!(lib.origin.starts_with("libopenh264.so"));
+    // The configured file when there is one, else a soname the loader found.
+    match configured {
+        Some(path) => assert_eq!(std::path::Path::new(&lib.origin), path),
+        None => assert!(lib.origin.starts_with("libopenh264.so")),
+    }
 }
 
 /// Test 2: the stream the backend makes is decodable, carries marks of both
@@ -477,7 +482,7 @@ fn openh264_scene_change_detection_is_off() {
     require_lib();
     let off = run(open(128, 128, 100_000));
     assert_eq!(off.idr_count_after_first(), 0, "scd off: no IDR on a swap");
-    let mut on_be = OpenH264Backend::new(None).with_scene_change_detect();
+    let mut on_be = OpenH264Backend::new(Lib::configured_path()).with_scene_change_detect();
     on_be.open(&config(128, 128, 100_000)).unwrap();
     let on = run(on_be);
     assert!(
@@ -963,7 +968,7 @@ fn openh264_timing_probe() {
         );
         for (name, scene) in [("calm", Scene::Calm), ("busy", Scene::Busy(12))] {
             for (cname, c) in [("LOW", LOW_COMPLEXITY), ("MEDIUM", MEDIUM_COMPLEXITY)] {
-                let mut be = OpenH264Backend::new(None).with_complexity(c);
+                let mut be = OpenH264Backend::new(Lib::configured_path()).with_complexity(c);
                 be.open(&config(w, h, 4_000_000)).unwrap();
                 let frames: Vec<Vec<u8>> = (0..61).map(|i| scene_nv12(i, w, h, scene)).collect();
                 let mut p_time = Duration::ZERO;

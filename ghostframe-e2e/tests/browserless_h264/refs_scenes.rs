@@ -12,28 +12,28 @@ use super::*;
 use ghostframe_e2e::harness::h264_scene::{capacity_step_net, pcm_load, H264Outcome, Pattern};
 use ghostframe_lib::encoder::h264_harness::PcmMode;
 
-const SEEDS: [u64; 3] = [0x7101, 0x7102, 0x7103];
-const SECS: u64 = 10;
+pub(super) const SEEDS: [u64; 3] = [0x7101, 0x7102, 0x7103];
+pub(super) const SECS: u64 = 10;
 /// One-way delay of `link_20ms`, doubled.
-const RTT_US: u64 = 40_000;
+pub(super) const RTT_US: u64 = 40_000;
 /// The loss path's verdict latency on this link (time threshold plus the
 /// reordering allowance), generously.
-const VERDICT_US: u64 = 100_000;
+pub(super) const VERDICT_US: u64 = 100_000;
 
-fn refs() -> H264Load {
+pub(super) fn refs() -> H264Load {
     pcm_load(PcmMode::RefManager)
 }
 
 /// [`refs`] under production's rate policy, and the padding and probe raise it
 /// brings: the loss and reordering scenes run with it, since that is the stream
 /// they are about.
-fn refs_rated() -> H264Load {
+pub(super) fn refs_rated() -> H264Load {
     let mut l = refs();
     l.pcm_rate_policy = true;
     l
 }
 
-async fn run_on(
+pub(super) async fn run_on(
     seed: u64,
     secs: u64,
     base: NetProfile,
@@ -713,7 +713,7 @@ async fn refs_an_mtu_that_falls_after_discovery_recovers_from_the_anchor() {
 
 /// The share of the estimate the stream may spend (`h264_rate::RATE_SHARE`,
 /// pinned by a lib test).
-const RATE_SHARE: f64 = 0.8;
+pub(super) const RATE_SHARE: f64 = 0.8;
 
 /// How far the encoder's rate may lag the estimate it follows: the policy
 /// evaluates every 250 ms on a 250 ms EWMA, and the estimate it read may have
@@ -744,20 +744,32 @@ fn scene6_timelines() -> [Timeline; 2] {
 }
 
 /// What scene 6 reads off a run, from the encoder's own decisions.
-struct DropRun {
-    r: BrowserlessResult,
+pub(super) struct DropRun {
+    pub(super) r: BrowserlessResult,
     /// Coded access units: `(scene time us, bytes, raised)`.
-    aus: Vec<(u64, usize, bool)>,
-    secs: u64,
+    pub(super) aus: Vec<(u64, usize, bool)>,
+    pub(super) secs: u64,
     /// Frames the encoder gate skipped (injected, not made), per scene time.
-    injected: Vec<u64>,
+    pub(super) injected: Vec<u64>,
 }
 
 impl DropRun {
-    async fn new(
+    pub(super) async fn new(
         seed: u64,
         points: &[(u64, u64)],
         secs: u64,
+        tweak: impl FnOnce(&mut H264Load),
+    ) -> Self {
+        Self::with_jitter(seed, points, secs, 0, tweak).await
+    }
+
+    /// As [`new`](Self::new) on a link with `jitter_us` of jitter, which is
+    /// what makes the seeds differ on a path that drops nothing.
+    pub(super) async fn with_jitter(
+        seed: u64,
+        points: &[(u64, u64)],
+        secs: u64,
+        jitter_us: u64,
         tweak: impl FnOnce(&mut H264Load),
     ) -> Self {
         let net = super::bottleneck_net(
@@ -765,7 +777,7 @@ impl DropRun {
                 points: points.to_vec(),
             },
             20_000,
-            0,
+            jitter_us,
             600,
         );
         let mut l = super::refs_cbr_load();
@@ -804,7 +816,7 @@ impl DropRun {
 
     /// Bytes of the access units coded at the rate in force (not the probe
     /// raise) in `[from, from + 1 s)`.
-    fn bytes_in(&self, from: u64) -> usize {
+    pub(super) fn bytes_in(&self, from: u64) -> usize {
         self.aus
             .iter()
             .filter(|(t, _, raised)| !raised && (from..from + 1_000_000).contains(t))
@@ -813,7 +825,7 @@ impl DropRun {
     }
 
     /// The highest estimate in `[from - lag, from + 1 s)`.
-    fn estimate_max(&self, from: u64) -> u64 {
+    pub(super) fn estimate_max(&self, from: u64) -> u64 {
         self.r
             .bwe_estimate_samples
             .iter()
@@ -824,13 +836,13 @@ impl DropRun {
     }
 
     /// Windows `[t, t + 1 s)` every 100 ms from `from` to the end of the run.
-    fn windows(&self, from: u64) -> impl Iterator<Item = u64> + '_ {
+    pub(super) fn windows(&self, from: u64) -> impl Iterator<Item = u64> + '_ {
         (from..=self.secs * 1_000_000 - 1_000_000).step_by(100_000)
     }
 
     /// The worst ratio of coded bytes to `RATE_SHARE x` the estimate, over the
     /// windows from `from`.
-    fn worst_ratio(&self, from: u64) -> (f64, u64) {
+    pub(super) fn worst_ratio(&self, from: u64) -> (f64, u64) {
         self.windows(from)
             .map(|t| {
                 let est = self.estimate_max(t).max(1) as f64;
@@ -839,7 +851,21 @@ impl DropRun {
             .fold((0.0, 0), |a, b| if b.0 > a.0 { b } else { a })
     }
 
-    fn skips_after(&self, from: u64, len: u64) -> usize {
+    /// The mean over the windows from `from` of the ratio of coded bytes to
+    /// `RATE_SHARE x` the estimate.
+    pub(super) fn mean_ratio(&self, from: u64) -> f64 {
+        let ratios: Vec<f64> = self
+            .windows(from)
+            .map(|t| {
+                let est = self.estimate_max(t).max(1) as f64;
+                self.bytes_in(t) as f64 * 8.0 / (RATE_SHARE * est)
+            })
+            .collect();
+        assert!(!ratios.is_empty(), "no window from {from}");
+        ratios.iter().sum::<f64>() / ratios.len() as f64
+    }
+
+    pub(super) fn skips_after(&self, from: u64, len: u64) -> usize {
         self.injected
             .iter()
             .filter(|t| (from..from + len).contains(*t))
@@ -854,7 +880,7 @@ impl DropRun {
 
     /// The longest a frame took from its capture to the client showing it,
     /// for frames captured from `from`.
-    fn max_latency_us(&self, from: u64) -> u64 {
+    pub(super) fn max_latency_us(&self, from: u64) -> u64 {
         self.r
             .h264_run()
             .expect("an H.264 scene")

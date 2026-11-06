@@ -81,6 +81,14 @@ impl IoBridge {
         self.install_model_controller(settings);
     }
 
+    /// The openh264 library an injected `PcmMode::OpenH264` scene opens (what
+    /// the daemon gets from `LibConfig`; the harness's bridge is built
+    /// without one). `None`: the system's.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn set_openh264_lib_for_test(&mut self, lib: Option<std::path::PathBuf>) {
+        self.h264.openh264_lib = lib.as_deref().map(std::sync::Arc::<std::path::Path>::from);
+    }
+
     /// Replace the QUIC peer gate, for a test that needs a specific policy
     /// or a background identity source.
     #[cfg(any(test, feature = "browserless-harness"))]

@@ -1144,6 +1144,7 @@ async fn run_inner(
         );
     }
     let env_transport = ghostframe_lib::config::TransportConfig::from_env();
+    bridge.set_openh264_lib_for_test(env_transport.openh264_lib.clone());
     bridge.use_model_controller_for_test(opts.model.unwrap_or(env_transport.model));
     if let Some(floor) = scene.tick_budget_floor_bytes {
         bridge.set_tick_budget_floor_bytes(floor);
@@ -1186,6 +1187,9 @@ async fn run_inner(
 
     let mut framebuffer = FrameBuffer::new();
     let mut h264_display = match &scene.load {
+        SceneLoad::H264(h) if matches!(h.pcm, Some(PcmMode::OpenH264 { .. })) => {
+            Some(crate::harness::h264_scene::H264Display::lossy())
+        }
         SceneLoad::H264(h) if h.pcm.is_some() => {
             Some(crate::harness::h264_scene::H264Display::new())
         }
@@ -1274,6 +1278,7 @@ async fn run_inner(
         crate::harness::h264_scene::H264Run {
             truth,
             decoder_resets: d.resets,
+            lossy_cells: d.lossy_cells,
             display: d.records,
             duration_us: scene.duration.as_micros() as u64,
             tile_windows: match &scene.load {

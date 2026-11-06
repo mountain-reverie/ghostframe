@@ -2311,6 +2311,8 @@ async fn the_headroom_guard_releases_in_h264_mode_on_a_capacity_step() {
     }
 }
 
+#[path = "browserless_h264/openh264_scenes.rs"]
+mod openh264_scenes;
 #[path = "browserless_h264/pcm_scenes.rs"]
 mod pcm_scenes;
 #[path = "browserless_h264/refs_scenes.rs"]

@@ -18,6 +18,10 @@
 //!   libva-direct backend. Only the thread hop to the encode worker is
 //!   missing: the stepped harness cannot run one.
 //!
+//! * [`PcmMode::OpenH264`] is the same manager over the real openh264 library
+//!   in observed mode ([`Openh264Source`]): the library's own reference
+//!   structure, its own rate control, lossy pictures.
+//!
 //! Whatever the source, [`PcmLog`] records, for each frame sent, the picture a
 //! client that decoded the stream the encoder meant would show. The client
 //! side compares what libavcodec really produced against it: a difference is
@@ -28,14 +32,16 @@ use std::sync::{Arc, Mutex};
 
 pub use super::pcm_decoder::{Decoded, FeedError, PcmDecoder, Strictness};
 pub use super::pcm_rate::{PcmModelStats, PcmRateModel};
-pub use super::pcm_writer::{marker_cell, Picture};
+pub use super::pcm_writer::{
+    canvas_cell, canvas_picture, marker_cell, read_lossy, LossyRead, Picture,
+};
 
 use super::backend::{
     AuMeta, BackendCaps, BackendError, BackendFeedback, EncodedAu, H264Backend, Nv12View,
     RateTarget, StreamConfig,
 };
 use super::pcm_rate::RateState;
-use super::pcm_writer::{access_unit, parameter_sets, pcm_params, FRAME_BYTES};
+use super::pcm_writer::{access_unit, canvas_nv12, parameter_sets, pcm_params, FRAME_BYTES};
 use super::refs::{FramePlan, ResidentRef};
 use super::syntax::{SliceHeader, StreamParams};
 use super::tracker::PicKind;
@@ -54,6 +60,22 @@ pub enum PcmMode {
     Legacy,
     /// The `RefManager`'s plans.
     RefManager,
+    /// The real openh264 library behind the observed-mode manager: each frame's
+    /// canvas ([`canvas_nv12`]) is encoded inline, as the encode worker does,
+    /// and the client's picture is read back lossily ([`read_lossy`]). Every
+    /// `scene_change_every` frames (0: never) the whole canvas changes; with
+    /// `churn_every` not 0 the texture around each cell is also repainted
+    /// every `churn_every` frames, staggered by cell (a steady load).
+    /// `stale_every` (0: never) is a test of the measurement: every
+    /// `stale_every`-th frame (from the 7th) is *painted* from the previous
+    /// frame's canvas while the truth log keeps the right one, so a source
+    /// that shows a frame late is a wrong picture and a reader that cannot
+    /// tell must fail the scene that expects one.
+    OpenH264 {
+        scene_change_every: u32,
+        churn_every: u32,
+        stale_every: u32,
+    },
 }
 
 /// What the encoder meant a frame to be.
@@ -347,4 +369,116 @@ pub(crate) fn pad_to(au: &mut Vec<u8>, target: usize) {
     au.extend_from_slice(&[0, 0, 0, 1, 0x0C]);
     au.extend(std::iter::repeat_n(0xFF, fill));
     au.push(0x80);
+}
+
+/// The source of [`PcmMode::OpenH264`] scenes: the canvas of each frame, the
+/// openh264 session that encodes it, and the truth log entry for it. The
+/// bridge runs it inline where the encode worker would, with the same
+/// feedback-then-picture order (`encode_planned`).
+pub(crate) struct Openh264Source {
+    log: PcmLog,
+    scene_change_every: u32,
+    churn_every: u32,
+    stale_every: u32,
+    backend: Option<Box<dyn H264Backend>>,
+    nv12: Vec<u8>,
+}
+
+impl Openh264Source {
+    pub(crate) fn new(log: PcmLog, canvas: (u32, u32, u32)) -> Self {
+        let (scene_change_every, churn_every, stale_every) = canvas;
+        Self {
+            log,
+            scene_change_every,
+            churn_every,
+            stale_every,
+            backend: None,
+            nv12: Vec::new(),
+        }
+    }
+
+    /// Open the session the first time (a stream starts on an IDR, as in
+    /// production). `Err` carries why.
+    pub(crate) fn ensure_open(
+        &mut self,
+        lib: Option<std::path::PathBuf>,
+        rate: RateTarget,
+        fps: u32,
+        idr: bool,
+    ) -> Result<(), BackendError> {
+        if self.backend.is_some() {
+            return Ok(());
+        }
+        if !idr {
+            return Err(BackendError::Plan("a stream starts on an IDR".into()));
+        }
+        let cfg = StreamConfig {
+            rate,
+            ..StreamConfig::new(
+                super::pcm_writer::WIDTH as u32,
+                super::pcm_writer::HEIGHT as u32,
+                fps,
+                rate.bps,
+            )
+        };
+        let mut b = super::openh264::OpenH264Backend::new(lib);
+        b.open(&cfg)?;
+        self.backend = Some(Box::new(b));
+        Ok(())
+    }
+
+    /// Paint frame `seq`'s canvas; the picture a decoder with everything it
+    /// needs shows.
+    pub(crate) fn paint(&mut self, seq: u32) -> Picture {
+        let stale =
+            seq > 0 && self.stale_every != 0 && seq % self.stale_every == 7 % self.stale_every;
+        let painted = if stale { seq - 1 } else { seq };
+        canvas_nv12(
+            painted,
+            self.scene_change_every,
+            self.churn_every,
+            &mut self.nv12,
+        );
+        super::pcm_writer::canvas_picture(seq, self.scene_change_every)
+    }
+
+    /// The NV12 view of the canvas [`paint`](Self::paint) made, and the backend.
+    pub(crate) fn parts(&mut self) -> Option<(Nv12View<'_>, &mut dyn H264Backend)> {
+        let w = super::pcm_writer::WIDTH;
+        let view = Nv12View {
+            data: &self.nv12,
+            width: w as u32,
+            height: super::pcm_writer::HEIGHT as u32,
+            y_stride: w,
+            uv_stride: w,
+            uv_offset: w * super::pcm_writer::HEIGHT,
+        };
+        let b = self.backend.as_mut()?;
+        Some((view, b.as_mut()))
+    }
+
+    /// Log what frame `seq` is meant to show and what it predicts from.
+    pub(crate) fn record(&self, seq: u32, picture: Picture, au: &EncodedAu, ref_seq: Option<u32>) {
+        record(
+            &self.log,
+            seq,
+            TruthEntry {
+                idr: au.meta.idr,
+                ref_seq,
+                picture,
+                non_ref: au.meta.header.as_ref().is_some_and(|h| h.nal_ref_idc == 0),
+            },
+        );
+    }
+}
+
+/// The openh264 library the scenes will run on, `origin version`; `Err` says
+/// what was found instead. It is the library the bridge will open: the one
+/// `GHOSTFRAME_H264_OPENH264_LIB` names (through `config`, as the daemon reads
+/// it) or else the system's. A scene calls this first, so a missing library is
+/// one clear failure and not a stalled harness.
+pub fn openh264_library() -> Result<String, String> {
+    super::openh264_sys::Lib::get(super::openh264_sys::Lib::configured_path().as_deref())
+        .map(|l| format!("{} {}", l.origin, l.version))
+        .map_err(str::to_string)
 }
