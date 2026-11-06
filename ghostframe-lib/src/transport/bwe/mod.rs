@@ -268,6 +268,12 @@ impl BweWrapper {
         self.driver.hold_ceiling(now, hold);
     }
 
+    /// Whether the ceiling is held off at `now`.
+    #[cfg(test)]
+    pub(crate) fn ceiling_held(&self, now: Instant) -> bool {
+        self.driver.ceiling_held(now)
+    }
+
     /// Whether quinn's round trip is well above its least over the last ten
     /// seconds: a queue stands on the path.
     pub fn standing_queue(&self) -> bool {

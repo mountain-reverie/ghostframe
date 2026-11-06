@@ -402,6 +402,7 @@ pub fn pcm_load(mode: ghostframe_lib::encoder::h264_harness::PcmMode) -> H264Loa
         pcm_rate_policy: false,
         pcm_rate_model: None,
         pcm_phase_a_rate: false,
+        probe_raise: true,
         tile_phases: [None, None],
     }
 }

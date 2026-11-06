@@ -94,7 +94,20 @@ pub struct PcmRateModel {
     pub step_scaling: f64,
     /// Behaviour 3b: the fraction of its ceiling a raised IDR reaches.
     pub idr_fill: f64,
+    /// Behaviour 8, the probe raise: the frames of a big rise of the rate (a
+    /// step of more than [`RAISE_STEP_MIN`] of the new rate, which is what a
+    /// probe window's rate is) carry this fraction of what the 40 % re-send
+    /// profile gives them. 1.0: the profile as measured on the VCE. Under 1.0:
+    /// a pessimistic backend. The spike (T4, 75 % fullness) gave 51.0 / 28.9 /
+    /// 29.9 kB for a window rate of 33.3 kB a frame, 1.10 of the 100 kB asked
+    /// for; the 40 % profile (1.00 / 0.56 / 0.87) is 0.81 of it. To be
+    /// re-measured: `h264_direct_probe_raise_lever_b_at_40pct`.
+    pub raise_yield: f64,
 }
+
+/// A rise of the target this large (fraction of the new rate) is the probe
+/// raise, for [`PcmRateModel::raise_yield`].
+pub(crate) const RAISE_STEP_MIN: f64 = 0.30;
 
 impl PcmRateModel {
     /// The bps-only baseline (see [`honour_target`](Self::honour_target)).
@@ -113,6 +126,7 @@ impl PcmRateModel {
             burst_resend: false,
             step_scaling: 0.0,
             idr_fill: IDR_FILL,
+            raise_yield: 1.0,
         }
     }
 
@@ -170,6 +184,15 @@ impl PcmRateModel {
     pub fn with_step_scaling(self, exponent: f64) -> Self {
         Self {
             step_scaling: exponent.max(0.0),
+            ..self
+        }
+    }
+
+    /// A big rise of the rate (a probe raise) yields only this fraction of the
+    /// profile's bytes (behaviour 8); `1.0` is the profile as measured.
+    pub fn with_raise_yield(self, raise_yield: f64) -> Self {
+        Self {
+            raise_yield: raise_yield.clamp(0.0, 1.0),
             ..self
         }
     }
@@ -253,6 +276,8 @@ pub(crate) struct RateState {
     frames_since_step: u32,
     /// The first frame's excess of the step in progress, in average frames.
     step_excess: f64,
+    /// The step in progress is a big rise (see [`RAISE_STEP_MIN`]).
+    raise_step: bool,
 }
 
 impl RateState {
@@ -281,6 +306,7 @@ impl RateState {
         let stepped = resent || self.last.is_some_and(|l| l.bps != rate.bps);
         if resent {
             self.step_excess = m.resend_excess;
+            self.raise_step = false;
         } else if let (true, Some(l)) = (stepped, self.last) {
             let (old, new) = (f64::from(l.bps), bps);
             let rel = (new - old).abs() / old.max(new).max(1.0);
@@ -290,6 +316,7 @@ impl RateState {
                 m.step_excess_down
             };
             self.step_excess = base * (rel / STEP_MEASURED).min(1.0).powf(m.step_scaling);
+            self.raise_step = new > old && rel >= RAISE_STEP_MIN;
         }
         self.frames_since_step = if stepped {
             0
@@ -311,6 +338,11 @@ impl RateState {
                 * (1.0 - f64::from(self.frames_since_step) / f64::from(m.settle_frames.max(1)))
         } else {
             1.0
+        };
+        let factor = if in_transient && self.raise_step {
+            factor * m.raise_yield
+        } else {
+            factor
         };
 
         // The bucket and the cap this frame is sent under (behaviours 2, 3).
@@ -409,6 +441,46 @@ mod tests {
             })
             .collect();
         (sizes, stats)
+    }
+
+    /// Behaviour 8: a probe raise (a rate step of over 30 %) yields the profile
+    /// times `raise_yield`; a small step, or a fall, is not touched by it; the
+    /// frames after the transient are the settled rate whatever the yield.
+    #[test]
+    fn a_raise_yields_the_profile_scaled_and_only_a_big_rise_is_scaled() {
+        let (base, raised) = (2_500_000u32, 8_000_000u32);
+        // Content that fills any bucket: the frames are bucket-limited.
+        let run = |m: PcmRateModel, from: u32, to: u32| {
+            let mut st = RateState::default();
+            p_frames(&mut st, &m, &RateTarget::steady(from, FPS), 90);
+            let (sizes, _) = p_frames(&mut st, &m, &RateTarget::steady(to, FPS), 3);
+            let (after, _) = p_frames(&mut st, &m, &RateTarget::steady(to, FPS), 20);
+            (sizes, after)
+        };
+        let full = run(model(), base, raised).0;
+        let pess = run(model().with_raise_yield(0.7), base, raised).0;
+        let total = |v: &[usize]| v.iter().sum::<usize>() as f64;
+        assert!(
+            total(&full) > avg(raised) * 1.5,
+            "premise: a raise gives bytes: {full:?}"
+        );
+        let ratio = total(&pess) / total(&full);
+        assert!(
+            (0.65..=0.75).contains(&ratio),
+            "yield 0.7 gives about 0.7 of the bytes: {ratio:.2} ({pess:?} vs {full:?})"
+        );
+        // Not a big rise: untouched.
+        let small_full = run(model(), base, base + 200_000);
+        let small_pess = run(model().with_raise_yield(0.7), base, base + 200_000);
+        assert_eq!(small_full, small_pess, "a 8 % step is no probe raise");
+        let fall_full = run(model(), raised, base);
+        let fall_pess = run(model().with_raise_yield(0.7), raised, base);
+        assert_eq!(fall_full, fall_pess, "a fall is no raise");
+        // The settled frames after the transient are the same.
+        assert_eq!(
+            run(model(), base, raised).1,
+            run(model().with_raise_yield(0.7), base, raised).1
+        );
     }
 
     #[test]

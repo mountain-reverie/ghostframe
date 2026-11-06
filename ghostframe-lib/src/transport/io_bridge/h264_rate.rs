@@ -128,7 +128,7 @@ const APP_PROBE_ID_BASE: i32 = 1_000_000_000;
 /// The application's own probing (see `h264_start_app_probe`).
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct AppProbe {
-    next_at: Option<Instant>,
+    pub(super) next_at: Option<Instant>,
     last_target: Option<u64>,
     chain_len: u32,
     counter: u32,
@@ -137,7 +137,15 @@ pub(super) struct AppProbe {
 /// How long after padding the estimate ceiling stays off: the 100 ms window,
 /// the queue the burst builds on the path (up to about 0.3 s on the scenes'
 /// links) and the round trip of the acknowledgements.
-const PAD_CEILING_HOLD: Duration = Duration::from_millis(1000);
+pub(super) const PAD_CEILING_HOLD: Duration = Duration::from_millis(1000);
+/// What the frames of a raised probe window still to come are expected to
+/// carry, as a fraction of an average frame at the window's rate, when padding
+/// is sized. The VCE's re-send profile after a rise is 1.00 / 0.56 / 0.87 of
+/// the average; the later frames are counted at about the lowest of them, so a
+/// shortfall is made good by padding rather than left to the frames.
+const RAISE_EXPECTED_YIELD: f64 = 0.5;
+/// At most this many frames are coded at one window's rate.
+const RAISE_MAX_FRAMES: u32 = 3;
 /// An IDR this close is the burst of the window; no padding.
 const PAD_IDR_LOOKAHEAD: Duration = Duration::from_millis(150);
 
@@ -561,6 +569,59 @@ impl IoBridge {
         self.open_probe_cluster(now, id, target, duration, APP_PROBE_MIN_PROBES, min_bytes);
     }
 
+    /// The rate a P frame is coded at while a probe window is open, if it is
+    /// to be raised: `(bps, window id)`.
+    ///
+    /// A probe cluster measures the path only if the burst in its window
+    /// arrives at the window's rate. Padding makes that burst out of nothing;
+    /// the real frames of the window can be it instead, if the encoder codes
+    /// them at the window's rate (`RATE_SHARE` of it, as every frame is coded
+    /// at that share of the estimate): the stream then pays the picture-quality
+    /// price of the burst, not the path the cost of padding it carries. So the
+    /// window is claimed *before* the frame is planned (goog_cc's request
+    /// first, else the application's), and every P frame planned while it is
+    /// open gets the window's rate: about three frames of a 100 ms window at
+    /// 30 fps. Once the window is over, the next plan is at the normal rate
+    /// again, a re-send of the rate buffers that costs about nothing. What the
+    /// frames do not carry is topped up with padding on the window's last frame
+    /// (see [`Self::h264_probe_pad`]).
+    ///
+    /// Not while the rate has been cut (the guards of opening a window, see
+    /// `h264_pad_allowed`), while the path has shown reordering lately (a burst
+    /// reads as loss there) or when the window's rate is no more than a rise
+    /// band over the normal one. The estimate ceiling is held off for any
+    /// window the raise uses.
+    pub(super) fn h264_probe_raise(&mut self, now: Instant, base_bps: u32) -> Option<(u32, i32)> {
+        if self.h264.probe_raise_off || !self.h264_refs_live() {
+            return None;
+        }
+        if self.active_probe.is_none() {
+            if self.h264_reordering_lately(now) || !self.h264_pad_allowed(now, 0) {
+                return None;
+            }
+            self.open_probe_window_for_burst(now);
+            if self.active_probe.is_none() {
+                self.h264_start_app_probe(now);
+            }
+        }
+        let p = self.active_probe.as_ref().filter(|p| now < p.ends_at)?;
+        let raised =
+            ((p.target_rate_bps as f64 * RATE_SHARE) as u64).min(u64::from(RATE_CAP_BPS)) as u32;
+        if f64::from(raised) < f64::from(base_bps) * (1.0 + APPLY_RISE_FRACTION) {
+            return None;
+        }
+        let id = p.id;
+        // The window's duration bounds the frames raised in it (about three at
+        // 30 fps); `RAISE_MAX_FRAMES` bounds a long window.
+        if self.h264.refs.as_ref().is_some_and(|r| {
+            r.raise_window == Some(id) && r.raise_window_frames >= RAISE_MAX_FRAMES
+        }) {
+            return None;
+        }
+        self.bwe.hold_ceiling(now, PAD_CEILING_HOLD);
+        Some((raised, id))
+    }
+
     /// Fill a probe window for a frame that was just sent, without forcing
     /// an IDR (design 4.3). `own_bytes` is the wire size of that frame.
     ///
@@ -627,8 +688,30 @@ impl IoBridge {
         let Some(p) = self.active_probe.as_mut().filter(|p| now < p.ends_at) else {
             return;
         };
+        // A window the raise is using is carried partly by its frames still to
+        // come: padding is sized for the shortfall after what they are expected
+        // to carry ([`RAISE_EXPECTED_YIELD`] of an average frame at the
+        // window's rate), and goes out at once, because a burst sent late in
+        // the window runs past its end and leaves at the pacer's rate. On the
+        // last frame that fits the window nothing is expected and the top-up is
+        // the whole shortfall. A quarter of a frame period of slack: the frame
+        // clock jitters.
+        let mut expected_later = 0i64;
+        if !is_idr
+            && self
+                .h264
+                .refs
+                .as_ref()
+                .is_some_and(|r| r.raise_window == Some(p.id))
+        {
+            let period = 1.0 / f64::from(self.h264.fps.max(1));
+            let left = p.ends_at.saturating_duration_since(now).as_secs_f64();
+            let later = (left / period - 0.25).floor().max(0.0);
+            let avg_frame = p.target_rate_bps as f64 * RATE_SHARE / 8.0 * period;
+            expected_later = (later * avg_frame * RAISE_EXPECTED_YIELD) as i64;
+        }
         let len = template.len() as i64;
-        let want_bytes = (p.min_bytes as f64 * PAD_MARGIN) as i64;
+        let want_bytes = (p.min_bytes as f64 * PAD_MARGIN) as i64 - expected_later;
         if p.bytes_sent >= want_bytes && p.packets_sent >= p.min_probes {
             return;
         }

@@ -88,6 +88,17 @@ pub(super) struct RefsCounters {
     /// included), and those in the last [`RATE_SEND_WINDOW`].
     pub(super) rate_sends: u64,
     pub(super) rate_sends_window: u64,
+    /// The probe raise (see [`IoBridge::h264_probe_raise`]): windows in which
+    /// P frames were coded at the window's rate, those frames, and their bytes.
+    pub(super) probe_raise_windows: u64,
+    pub(super) probe_raise_frames: u64,
+    pub(super) probe_raise_bytes: u64,
+    /// Raised frames a verdict named a fragment of, frames fully acknowledged,
+    /// and the time they took from being sent to being fully acknowledged.
+    pub(super) raised_frame_lost: u64,
+    pub(super) raised_frames_acked: u64,
+    pub(super) raised_delivery_us_sum: u64,
+    pub(super) raised_delivery_us_max: u64,
     pub(super) verdicts: u64,
     /// Frames retired because a fragment outgrew the connection (`emit.rs`):
     /// counted at the first oversize fragment of each frame, the siblings
@@ -117,7 +128,34 @@ pub(super) struct RefsState {
     /// The frame in flight and the cap (bytes) its plan was coded under: the
     /// budget travels with the request, and the commit holds the result to it.
     inflight_cap: Option<(u32, u32)>,
+    /// The frame in flight was coded at a probe window's rate, and the window.
+    inflight_raised: Option<(u32, i32)>,
+    /// The window the last raised frame belonged to.
+    pub(super) raise_window: Option<i32>,
+    /// Frames raised in `raise_window` so far.
+    pub(super) raise_window_frames: u32,
+    /// Raised frames sent and not yet resolved (oldest first, bounded).
+    raised: std::collections::VecDeque<RaisedFrame>,
+    /// Late acknowledgements seen at two checkpoints at least
+    /// [`RAISE_REORDER_MEMORY`] apart: the raise stays off while any came in
+    /// since the older one (the path reorders, and a probe burst on it reads
+    /// as loss).
+    late_ckpt: [Option<(Instant, u64)>; 2],
 }
+
+/// A frame coded at a probe window's rate.
+#[derive(Debug, Clone, Copy)]
+struct RaisedFrame {
+    frame_seq: u32,
+    sent_at: Instant,
+    lost: bool,
+}
+
+/// How many raised frames are followed at once.
+const RAISED_TRACKED: usize = 64;
+/// No raise for this long after a late acknowledgement (a spurious loss
+/// verdict): a path that reorders makes a burst look like loss.
+const RAISE_REORDER_MEMORY: Duration = Duration::from_secs(5);
 
 impl RefsState {
     fn new(frame_interval: Duration, srtt: Duration) -> Self {
@@ -132,6 +170,11 @@ impl RefsState {
             p_anchors_at_fault: 0,
             reentry_anchor_age_ms: None,
             inflight_cap: None,
+            inflight_raised: None,
+            raise_window: None,
+            raise_window_frames: 0,
+            raised: std::collections::VecDeque::new(),
+            late_ckpt: [None, None],
         }
     }
 }
@@ -177,6 +220,17 @@ pub struct RefsReport {
     /// average, T4): divide the window by 10 for the per-second rate.
     pub rate_sends: u64,
     pub rate_sends_10s: u64,
+    /// The probe raise: windows in which P frames were coded at the window's
+    /// rate, those frames and their bytes; of them, frames a verdict named a
+    /// fragment of, frames fully acknowledged, and the sum and the maximum of
+    /// the time from sending to the full acknowledgement (microseconds).
+    pub probe_raise_windows: u64,
+    pub probe_raise_frames: u64,
+    pub probe_raise_bytes: u64,
+    pub raised_frame_lost: u64,
+    pub raised_frames_acked: u64,
+    pub raised_delivery_us_sum: u64,
+    pub raised_delivery_us_max: u64,
     // The manager's own counters.
     pub idr_session: u64,
     pub idr_resolution: u64,
@@ -294,15 +348,26 @@ impl IoBridge {
             }
         };
         let refs = st.mgr.resident_refs();
+        let is_idr = plan.kind == PicKind::Idr;
         // The frame's budget: an IDR gets its own (a quarter second of the
-        // rate), a P frame the cap of a few average frames.
-        let rate = RateTarget::steady(bps, fps);
-        let cap = if plan.kind == PicKind::Idr {
+        // rate), a P frame the cap of a few average frames. A P frame planned
+        // while a probe window is open is coded at the window's rate instead.
+        let mut rate = RateTarget::steady(bps, fps);
+        let mut raised = None;
+        if rate_policy && !is_idr {
+            if let Some((raised_bps, window)) = self.h264_probe_raise(now, bps) {
+                rate = RateTarget::steady(raised_bps, fps);
+                raised = Some((plan.frame_seq, window));
+            }
+        }
+        let cap = if is_idr {
             rate.idr_max_bytes
         } else {
             rate.max_frame_bytes
         };
+        let st = self.refs_state();
         st.inflight_cap = Some((plan.frame_seq, cap));
+        st.inflight_raised = raised;
         self.h264.stats.frame_cap_bytes = rate.max_frame_bytes;
         self.h264.stats.idr_cap_bytes = rate.idr_max_bytes;
         self.h264.refs_counters.plans += 1;
@@ -312,6 +377,87 @@ impl IoBridge {
             fps,
             rate,
         }))
+    }
+
+    /// A frame coded at a probe window's rate goes out: count it and follow it
+    /// to its acknowledgement or its first verdict.
+    fn note_raised_sent(&mut self, seq: u32, len: usize, now: Instant) {
+        let Some(st) = self.h264.refs.as_mut() else {
+            return;
+        };
+        let Some((s, window)) = st.inflight_raised.take() else {
+            return;
+        };
+        if s != seq {
+            return;
+        }
+        let c = &mut self.h264.refs_counters;
+        if st.raise_window != Some(window) {
+            st.raise_window = Some(window);
+            st.raise_window_frames = 0;
+            c.probe_raise_windows += 1;
+        }
+        st.raise_window_frames += 1;
+        c.probe_raise_frames += 1;
+        c.probe_raise_bytes += len as u64;
+        if st.raised.len() >= RAISED_TRACKED {
+            st.raised.pop_front();
+        }
+        st.raised.push_back(RaisedFrame {
+            frame_seq: seq,
+            sent_at: now,
+            lost: false,
+        });
+    }
+
+    /// A raised frame was fully acknowledged.
+    pub(super) fn note_raised_acked(&mut self, frame_seq: u32, now: Instant) {
+        let Some(st) = self.h264.refs.as_mut() else {
+            return;
+        };
+        let Some(i) = st.raised.iter().position(|r| r.frame_seq == frame_seq) else {
+            return;
+        };
+        let r = st.raised.remove(i).expect("position just found");
+        let us = now.saturating_duration_since(r.sent_at).as_micros() as u64;
+        let c = &mut self.h264.refs_counters;
+        c.raised_frames_acked += 1;
+        c.raised_delivery_us_sum += us;
+        c.raised_delivery_us_max = c.raised_delivery_us_max.max(us);
+    }
+
+    /// A verdict named a fragment of a P frame: if it was a raised one, it is
+    /// counted (once per frame).
+    pub(super) fn note_raised_lost(&mut self, frame_seq: u32) {
+        let Some(st) = self.h264.refs.as_mut() else {
+            return;
+        };
+        if let Some(r) = st
+            .raised
+            .iter_mut()
+            .find(|r| r.frame_seq == frame_seq && !r.lost)
+        {
+            r.lost = true;
+            self.h264.refs_counters.raised_frame_lost += 1;
+        }
+    }
+
+    /// Whether the path has shown reordering lately (a late acknowledgement
+    /// within [`RAISE_REORDER_MEMORY`] or twice that): the raise keeps off.
+    pub(super) fn h264_reordering_lately(&mut self, now: Instant) -> bool {
+        let late = self.h264.stats.tx_acked_late;
+        let Some(st) = self.h264.refs.as_mut() else {
+            return false;
+        };
+        match st.late_ckpt[1] {
+            Some((t, _)) if now.saturating_duration_since(t) < RAISE_REORDER_MEMORY => {}
+            None => st.late_ckpt = [Some((now, late)); 2],
+            _ => {
+                st.late_ckpt[0] = st.late_ckpt[1];
+                st.late_ckpt[1] = Some((now, late));
+            }
+        }
+        st.late_ckpt[0].is_some_and(|(_, n)| late > n)
     }
 
     /// Hold the frame to the cap its plan carried: counted, never acted on.
@@ -379,6 +525,7 @@ impl IoBridge {
         };
         let len = au.payload.len();
         self.note_frame_cap(seq, len);
+        self.note_raised_sent(seq, len, now);
         let frags = self.send_h264_frame_described(
             H264Out {
                 payload: au.payload,
@@ -828,6 +975,13 @@ impl IoBridge {
             rate_applies_down: c.rate_applies_down,
             rate_sends: c.rate_sends,
             rate_sends_10s: c.rate_sends_window,
+            probe_raise_windows: c.probe_raise_windows,
+            probe_raise_frames: c.probe_raise_frames,
+            probe_raise_bytes: c.probe_raise_bytes,
+            raised_frame_lost: c.raised_frame_lost,
+            raised_frames_acked: c.raised_frames_acked,
+            raised_delivery_us_sum: c.raised_delivery_us_sum,
+            raised_delivery_us_max: c.raised_delivery_us_max,
             idr_session: s.idr_session,
             idr_resolution: s.idr_resolution,
             idr_client_reset: s.idr_client_reset,

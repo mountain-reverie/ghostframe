@@ -9205,3 +9205,223 @@ async fn a_planned_frame_carries_its_budget_and_the_commit_counts_frames_over_it
     }
     assert_eq!(bridge.h264.stats.max_cap_ratio_pct, 150);
 }
+
+// ---- the probe raise (B6-5) -------------------------------------------------
+
+/// A bridge with an acknowledged IDR (frame 0), a rate in force, and a quiet
+/// goog_cc (its start-up ladder is not under test): the next plan is a P frame.
+/// Returns the bridge and the rate in force.
+fn raise_bridge() -> (IoBridge, u32) {
+    let mut bridge = acked_refs_bridge();
+    bridge.h264.fps = 30;
+    let now = now_std();
+    let req = bridge
+        .h264_refs_plan(0, (64, 64), now, true)
+        .expect("the IDR");
+    let au = au_for(&req.plan);
+    assert!(bridge.h264_refs_commit(&req.plan, au, &refs_meta(), 1_200, now));
+    ack_every_fragment(&mut bridge, 0);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
+    while bridge.bwe.take_probe_request().is_some() {}
+    // The first IDR may have claimed a window; start from none.
+    bridge.active_probe = None;
+    bridge.h264.app_probe.next_at = Some(now + std::time::Duration::from_secs(3600));
+    let bps = bridge.h264.rate.applied().expect("a rate is in force");
+    (bridge, bps)
+}
+
+fn plan_p(bridge: &mut IoBridge, seq: u32) -> Box<frame_backend::H264Request> {
+    let req = bridge
+        .h264_refs_plan(seq, (64, 64), now_std(), true)
+        .expect("a P frame");
+    assert_ne!(req.plan.kind, crate::encoder::h264::tracker::PicKind::Idr);
+    req
+}
+
+fn commit_p(bridge: &mut IoBridge, req: &frame_backend::H264Request, bytes: usize) {
+    let mut au = au_for(&req.plan);
+    au.payload = vec![9; bytes];
+    assert!(bridge.h264_refs_commit(&req.plan, au, &refs_meta(), 1_200, now_std()));
+}
+
+/// While a probe window is open a P frame is coded at `RATE_SHARE` of the
+/// window's rate, for every frame the window lasts; the frames are tagged into
+/// the window, the window counts once, the ceiling is held, and after the
+/// window the next plan is back at the normal rate. With the raise off
+/// (`probe_raise_off`) none of it happens.
+#[tokio::test(start_paused = true)]
+async fn p_frames_in_a_probe_window_are_coded_at_the_windows_rate() {
+    for raise_on in [true, false] {
+        let (mut b, base) = raise_bridge();
+        b.h264.probe_raise_off = !raise_on;
+        let t = now_std();
+        let window_bps = u64::from(base) * 4;
+        b.open_probe_cluster(
+            t,
+            77,
+            window_bps,
+            std::time::Duration::from_millis(100),
+            5,
+            40_000,
+        );
+        let want = (window_bps as f64 * h264_rate::RATE_SHARE) as u32;
+        for seq in 1..=3u32 {
+            let req = plan_p(&mut b, seq);
+            if raise_on {
+                assert_eq!(
+                    req.rate.bps, want,
+                    "frame {seq} is coded at the window's rate"
+                );
+                assert!(req.rate.max_frame_bytes > 0);
+            } else {
+                assert_eq!(req.rate.bps, base, "no raise: the normal rate");
+            }
+            let before = b.active_probe.as_ref().map_or(0, |p| p.bytes_sent);
+            commit_p(&mut b, &req, 3_000);
+            let after = b.active_probe.as_ref().map_or(0, |p| p.bytes_sent);
+            if raise_on {
+                assert!(
+                    after - before >= 3_000,
+                    "frame {seq}: tagged into the window"
+                );
+            }
+            if seq == 1 {
+                // No P fragment has been acknowledged yet, so there is no
+                // padding template: the hold is the raise's own.
+                assert_eq!(
+                    b.bwe.ceiling_held(now_std()),
+                    raise_on,
+                    "the ceiling is held for a window real frames claimed"
+                );
+            }
+            tokio::time::advance(std::time::Duration::from_millis(30)).await;
+            // Acknowledge, so the next P has its reference.
+            ack_every_fragment(&mut b, seq);
+            b.dispatch_frame_ack_for_test(frame_ack_datagram(seq, 1u64 << seq, 0));
+        }
+        let r = b.h264_refs_report();
+        if raise_on {
+            assert_eq!(r.probe_raise_windows, 1, "one window, three frames: {r:?}");
+            assert_eq!(r.probe_raise_frames, 3);
+            assert_eq!(r.probe_raise_bytes, 9_000);
+            assert_eq!(r.raised_frames_acked, 3, "delivery is followed: {r:?}");
+            assert!(r.raised_delivery_us_max >= r.raised_delivery_us_sum / 3);
+        } else {
+            assert_eq!(r.probe_raise_frames, 0);
+        }
+        // Past the window, the normal rate again.
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        b.poll_probe_window(now_std());
+        let req = plan_p(&mut b, 4);
+        assert_eq!(req.rate.bps, base, "restored after the window");
+    }
+}
+
+/// A raised frame a verdict names counts once as lost; one that is
+/// acknowledged counts its delivery time.
+#[tokio::test(start_paused = true)]
+async fn a_raised_frame_is_followed_to_its_acknowledgement_or_its_loss() {
+    let (mut b, base) = raise_bridge();
+    let t = now_std();
+    b.open_probe_cluster(
+        t,
+        78,
+        u64::from(base) * 4,
+        std::time::Duration::from_millis(100),
+        5,
+        40_000,
+    );
+    let req = plan_p(&mut b, 1);
+    commit_p(&mut b, &req, 3_000);
+    b.note_h264_verdict(1, 0, now_std());
+    b.note_h264_verdict(1, 1, now_std());
+    let r = b.h264_refs_report();
+    assert_eq!(
+        (r.probe_raise_frames, r.raised_frame_lost),
+        (1, 1),
+        "once per frame: {r:?}"
+    );
+    assert_eq!(r.raised_frames_acked, 0);
+}
+
+/// The raise opens no window of its own after a cut of the rate, behind a
+/// backlog, or while the path has reordered lately (late acknowledgements);
+/// with none of those it does (the premise of each case).
+#[tokio::test(start_paused = true)]
+async fn the_raise_opens_no_window_after_a_cut_behind_a_backlog_or_on_a_reordering_path() {
+    for case in ["clear", "cut", "backlog", "reordering"] {
+        let (mut b, _base) = raise_bridge();
+        // The application's own probe is due now.
+        b.h264.app_probe.next_at = Some(now_std());
+        match case {
+            "cut" => b.h264.last_cut_at = Some(now_std()),
+            "backlog" => {
+                let dgs =
+                    crate::transport::protocol::fragment_frame(99, 0, false, &[1u8; 800], 1200);
+                b.reliable_emitter.submit_h264_fragment(
+                    crate::transport::reliable_emitter::h264::H264Submit {
+                        frame_seq: 99,
+                        frag_idx: 0,
+                        is_idr: false,
+                        bytes: bytes::Bytes::from(dgs[0].clone()),
+                        queued_at: now_std(),
+                        probe: None,
+                    },
+                    now_std(),
+                );
+            }
+            "reordering" => {
+                assert!(!b.h264_reordering_lately(now_std()), "premise: quiet path");
+                b.h264.stats.tx_acked_late += 1;
+            }
+            _ => {}
+        }
+        let before = b.h264.rate.applied().expect("a rate");
+        let Some(req) = b.h264_refs_plan(1, (64, 64), now_std(), true) else {
+            // A backlog skips the frame outright, which is no raise either.
+            assert_eq!(case, "backlog");
+            continue;
+        };
+        if case == "clear" {
+            assert!(
+                b.active_probe.is_some(),
+                "premise: the app probe opened a window"
+            );
+            assert!(
+                req.rate.bps > before,
+                "and the frame is raised: {} vs {before}",
+                req.rate.bps
+            );
+        } else {
+            assert!(b.active_probe.is_none(), "{case}: no window");
+            assert_eq!(req.rate.bps, before, "{case}: no raise");
+        }
+    }
+}
+
+/// An IDR that claims a probe window holds the estimate ceiling off too, not
+/// only padding: it spends the grant before its acknowledgements are due. (An
+/// IDR that opens a hold is never padded, so the hold is the tagging's own.)
+#[tokio::test(start_paused = true)]
+async fn an_idr_that_claims_a_probe_window_holds_the_ceiling() {
+    let mut bridge = acked_refs_bridge();
+    let t = now_std();
+    bridge.open_probe_cluster(
+        t,
+        80,
+        8_000_000,
+        std::time::Duration::from_millis(100),
+        5,
+        40_000,
+    );
+    assert!(!bridge.bwe.ceiling_held(t), "premise: not held before");
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    assert!(
+        bridge
+            .active_probe
+            .as_ref()
+            .is_some_and(|p| p.bytes_sent > 0),
+        "premise: the IDR was tagged into the window"
+    );
+    assert!(bridge.bwe.ceiling_held(now_std()));
+}

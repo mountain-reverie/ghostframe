@@ -127,6 +127,9 @@ pub struct FrameScript {
 }
 
 /// Where a scene's frames come from.
+// One value per scene: the H.264 load carries the whole PCM rate model, and
+// boxing it would touch every scene's construction for no gain.
+#[allow(clippy::large_enum_variant)]
 pub enum SceneLoad {
     /// An explicit list, drained in order. Right for small deterministic
     /// scenes that assert on specific pixels.
@@ -186,6 +189,8 @@ pub struct H264Load {
     pub pcm_rate_model: Option<ghostframe_lib::encoder::h264_harness::PcmRateModel>,
     /// See `InjectedH264::pcm_phase_a_rate`.
     pub pcm_phase_a_rate: bool,
+    /// See `InjectedH264::probe_raise`.
+    pub probe_raise: bool,
     /// Frame index ranges `[from, to)` in which the screen is drawn by the
     /// tile codec instead: one solid tile changes per frame. Entering one
     /// abandons the H.264 frames in flight, leaving it is a re-entry.
@@ -1549,6 +1554,7 @@ async fn drive_session(
             pcm_rate_model: h.pcm_rate_model,
             pcm_phase_a_rate: h.pcm_phase_a_rate,
             pcm_cadence_us: h.cadence_us,
+            probe_raise: h.probe_raise,
         }),
         SceneLoad::Script(_) | SceneLoad::Profile(_) => None,
     };

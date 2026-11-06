@@ -519,6 +519,8 @@ pub(super) struct H264Tx {
     /// cumulative 0x0A that reports old refusals together with a newer decode
     /// (or a late one with only the old refusals) leaves the flag alone.
     pub(super) newest_decoded: Option<u32>,
+    /// Harness only: the probe raise is off (see `InjectedH264::probe_raise`).
+    pub(super) probe_raise_off: bool,
     /// The encoder behind the stream, for the `h264 refs` line.
     pub(super) backend_kind: &'static str,
     /// The harness's PCM-patch source and the log the scene reads (design T3).
@@ -793,6 +795,7 @@ impl IoBridge {
     /// The frame is fully acknowledged.
     fn on_h264_frame_acked(&mut self, frame_seq: u32, now: std::time::Instant) {
         self.h264.stats.frames_acked += 1;
+        self.note_raised_acked(frame_seq, now);
         if self.h264.hold.is_some_and(|h| h.frame_seq == frame_seq) {
             self.end_h264_hold(now);
         }
@@ -905,6 +908,7 @@ impl IoBridge {
         // An acked-reference session recovers from its anchor: the verdict
         // makes the frame suspect and the interim loss IDR below is not made.
         let already_suspect = f.suspect;
+        self.note_raised_lost(frame_seq);
         if self.h264_refs_live() {
             self.h264_refs_verdict(frame_seq, now);
             return;
@@ -1279,6 +1283,7 @@ impl IoBridge {
         self.h264.refs_mode = super::h264_refs::RefsMode::Explicit;
         self.h264.backend_kind = "pcm";
         self.h264.phase_a_rate_step = h.pcm_phase_a_rate;
+        self.h264.probe_raise_off = !h.probe_raise;
         let Some(req) = self.h264_refs_plan(seq, (h.width, h.height), now, h.pcm_rate_policy)
         else {
             // Skipped, as the capture path drops a frame it holds back; the
