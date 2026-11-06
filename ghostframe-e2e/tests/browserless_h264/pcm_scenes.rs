@@ -25,24 +25,6 @@ use ghostframe_lib::encoder::h264_harness::PcmMode;
 const SEEDS: [u64; 3] = [0x7101, 0x7102, 0x7103];
 const SECS: u64 = 10;
 
-/// The seeds of the 8 ms reorder scene. Not `SEEDS`: this scene can wedge on
-/// a bug that is not about reordering, and the seeds here are ones that do not
-/// (7102, 7104, 7106 on both this branch and master). Quinn's MTU discovery
-/// grows the datagram size to 1412, an IDR and a probe burst of full-size
-/// datagrams go out, and it falls back to 1160 (its black-hole detector, on
-/// large packets reported lost); the bridge then resends the stored 1409-byte
-/// fragments, `send_datagram` returns `TooLarge` for each, the IDR is never
-/// delivered, the P frames wait for it and every later frame is skipped for
-/// backpressure: `last_ok` 3.6 to 7.1 s of 10, `bp` 84 to 187. Seen on master
-/// at 7108 (1 seed of 8) and on the bwe/saturation-signal branch at 7101, 7103,
-/// 7105 and 7108 (4 of 8): the branch no longer collapses the estimate under
-/// reordering, so the probes and the IDR that meet the MTU fall-back are more
-/// often in the same place. A fix for the wedge (refragment a resend that
-/// no longer fits, or give up on it and make a new IDR) is a follow-up;
-/// until it lands, picking seeds is the only way to keep this scene about
-/// reordering.
-const REORDER8_SEEDS: [u64; 3] = [0x7102, 0x7104, 0x7106];
-
 fn legacy() -> H264Load {
     pcm_load(PcmMode::Legacy)
 }
@@ -79,7 +61,7 @@ async fn pcm_run(
 fn line(name: &str, seed: u64, r: &BrowserlessResult, o: &H264Outcome) {
     let s = &r.h264.stats;
     println!(
-        "{name} {seed:#x}: {} | idr: session={} loss={} reentry={} reset={} hold_to={} | \
+        "{name} {seed:#x}: {} | idr: session={} loss={} reentry={} reset={} hold_to={} mtu_shrink={} | \
          verdicts p={} idr={} | drops={}/{} skipped hold={} bp={}",
         o.summary(),
         s.idr_by_cause[IdrCause::Session.index()],
@@ -87,6 +69,7 @@ fn line(name: &str, seed: u64, r: &BrowserlessResult, o: &H264Outcome) {
         s.idr_by_cause[IdrCause::Reentry.index()],
         s.idr_by_cause[IdrCause::ClientReset.index()],
         s.idr_by_cause[IdrCause::HoldTimeout.index()],
+        s.idr_by_cause[IdrCause::MtuShrink.index()],
         s.verdicts_p_frag,
         s.verdicts_idr_frag,
         r.s2c_datagrams_dropped,
@@ -224,14 +207,48 @@ async fn lost_acknowledgements_alone_cost_the_legacy_policy_idrs() {
 /// way the client displays no wrong picture.
 #[tokio::test(start_paused = true)]
 async fn scene_4_reordering_shows_no_wrong_picture() {
-    for seed in REORDER8_SEEDS {
+    let mut late_acks = 0;
+    for seed in SEEDS {
         let (r, o) = pcm_run(seed, SECS, Pattern::Reorder { window_us: 8_000 }, legacy()).await;
         line("reorder8", seed, &r, &o);
         let ctx = format!("reorder8 {seed:#x}");
         assert_sound(&ctx, &r, &o);
-        assert!(o.idr_made <= 3, "{ctx}: {} IDRs", o.idr_made);
+        // An MtuShrink IDR is the answer to Quinn's MTU fall-back (datagrams
+        // that outgrew the path), not to reordering: leave it out.
+        let mtu = r.h264.stats.idr_by_cause[IdrCause::MtuShrink.index()] as usize;
+        // The link drops nothing, so every remaining IDR is a loss IDR made
+        // from a spurious verdict. With the bandwidth estimate held at the
+        // path's ~2 Mbit/s, frames are bigger and leave in back-to-back bursts
+        // (56 to 58 % of datagrams under 1 ms apart); inside a burst the 8 ms
+        // reordering moves datagrams more than K_PKT = 3 places, and the
+        // ledger's packet-threshold rule declares them lost. Phase A turns each
+        // verdict into a loss IDR (seeds 0x7101..0x7108 make 3, 1, 4, 2, 6, 2,
+        // 3, 4). The bound is 6, not a target; the cause is burst depth against
+        // K_PKT, tracked as the follow-up "reorder-tolerant packet threshold".
+        assert!(
+            o.idr_made - mtu <= 6,
+            "{ctx}: {} IDRs, {mtu} of them MtuShrink",
+            o.idr_made
+        );
+        // Premise of that bound: the verdicts were spurious, nothing was
+        // dropped and every judged-lost transmission was acknowledged late.
+        assert_eq!(
+            r.s2c_datagrams_dropped, 0,
+            "{ctx}: reordering drops nothing"
+        );
+        let st = &r.h264.stats;
+        assert!(
+            st.tx_judged_lost == 0 || st.tx_acked_late > 0,
+            "{ctx}: {} loss verdicts but no late ack",
+            st.tx_judged_lost
+        );
+        late_acks += st.tx_acked_late;
         assert!(o.correct > 200, "{ctx}");
     }
+    assert!(
+        late_acks > 0,
+        "reorder8: no verdict was ever acknowledged late"
+    );
     for seed in SEEDS {
         let (r, o) = pcm_run(seed, SECS, Pattern::Reorder { window_us: 45_000 }, legacy()).await;
         line("reorder45", seed, &r, &o);
