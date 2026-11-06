@@ -35,9 +35,9 @@ pub use browser::{
     KeyEventKind, PointerEventKind,
 };
 pub use cleanup::{
-    acked_ref_evidence, acked_ref_outcome, cleanup_stale_xvfb_sockets, read_server_logs_stripped,
-    report_acked_ref_outcome, require_vaapi, wait_for_acked_ref_outcome, AckedRefEvidence,
-    AckedRefOutcome,
+    acked_ref_evidence, acked_ref_evidence_for, acked_ref_outcome, cleanup_stale_xvfb_sockets,
+    read_server_logs_stripped, report_acked_ref_outcome, require_vaapi, wait_for_acked_ref_outcome,
+    AckedRefEvidence, AckedRefOutcome,
 };
 pub use containers::{create_preauth_key, docker_run_in_container, TestNode, NETWORK_NAME};
 pub use e2e_setup::{

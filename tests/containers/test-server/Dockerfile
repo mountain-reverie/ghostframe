@@ -228,6 +228,7 @@ RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install
     libswscale7 \
     libswresample4 \
     libx264-164 \
+    libopenh264-7 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/ghostframe-server /usr/local/bin/ghostframe-server
