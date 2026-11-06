@@ -826,3 +826,412 @@ fn h264_direct_probe_result_is_cached() {
     eprintln!("probe_cache: first open {cold:?}, cached open {warm:?}");
     assert!(warm < cold);
 }
+
+// ------------------------------------------------------------ rate control
+//
+// B6 (design 4.3): the rate path against the real VCE. Local only, serial on
+// the GPU lock like every T4 test. The content is `source` at 720p, full
+// motion: about 1.7 Mbit/s is its QP 51 floor (S2), so every rate here is
+// above that. Each test states its premises (the rate buffers really went
+// out, the AUs decoded) before the effect, and the ones that measure print
+// what they measured: a number the model in `pcm_rate.rs` is built from.
+
+const RATE_W: u32 = 1280;
+const RATE_H: u32 = 720;
+
+/// Bytes of an average frame at `bps`, 30 fps.
+fn avg_frame(bps: u32) -> f64 {
+    f64::from(bps) / 8.0 / 30.0
+}
+
+fn mean(v: &[usize]) -> f64 {
+    v.iter().sum::<usize>() as f64 / v.len().max(1) as f64
+}
+
+struct RateRun {
+    sizes: Vec<usize>,
+    idr: Vec<bool>,
+    counters: super::vaapi_direct::RateCounters,
+    /// Pictures the full stream decoded to, and decoder errors.
+    decoded: usize,
+    errors: usize,
+}
+
+impl RateRun {
+    /// The frames the stream is judged on decoded, every one of them.
+    fn assert_decoded(&self, name: &str) {
+        assert_eq!(self.errors, 0, "{name}: decoder errors");
+        assert_eq!(self.decoded, self.sizes.len(), "{name}: decoded != sent");
+    }
+}
+
+/// A healthy chain (every frame acknowledged two frames later) coded under
+/// `target(n)` for frame `n`, with an IDR at 0 and at each of `idr_at` (the
+/// manager's resolution-change epoch). `None`: no encoder here.
+fn run_rates(
+    name: &'static str,
+    frames: u32,
+    open_bps: u32,
+    target: &dyn Fn(u32) -> RateTarget,
+    idr_at: &[u32],
+    nudge: bool,
+) -> Option<RateRun> {
+    let mut sc = Scenario::new(name, RATE_W, RATE_H, frames);
+    sc.bps = open_bps;
+    let mut backend = open(&sc)?;
+    backend.set_nudge_for_test(nudge);
+    let mut mgr = RefManager::new(RefConfig {
+        params: StreamParams::writer(),
+        frame_interval: sc.step,
+        initial_srtt: sc.srtt,
+    });
+    let t0 = Instant::now();
+    let mut aus: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut idr = Vec::new();
+    for n in 0..frames {
+        let now = t0 + sc.step * n;
+        if n >= sc.ack_delay {
+            mgr.frame_decoded(n - sc.ack_delay);
+        }
+        if idr_at.contains(&n) {
+            mgr.resolution_change();
+        }
+        backend.set_rate(target(n));
+        mgr.tick(now, sc.srtt);
+        let Plan::Frame(plan) = mgr.plan_next(n, now) else {
+            panic!("{name}: unexpected hold at frame {n}");
+        };
+        let refs = mgr.resident_refs();
+        let src = source(RATE_W, RATE_H, n as i32);
+        let au = backend
+            .encode(&view(&src, RATE_W, RATE_H), &plan, &refs)
+            .unwrap_or_else(|e| panic!("{name}: frame {n}: {e}"));
+        let header: &SliceHeader = au.meta.header.as_ref().expect("direct AU is parsed");
+        mgr.frame_sent(&plan, header, 1, now)
+            .expect("plan is from the current epoch");
+        mgr.frag_acked(n, 0, now);
+        idr.push(au.meta.idr);
+        aus.push((n, au.payload));
+    }
+    let all: Vec<(u32, &[u8])> = aus.iter().map(|(s, a)| (*s, a.as_slice())).collect();
+    let full = decode(&all, true);
+    Some(RateRun {
+        sizes: aus.iter().map(|(_, a)| a.len()).collect(),
+        idr,
+        counters: backend.rate_counters(),
+        decoded: full.frames.len(),
+        errors: full.errors.len(),
+    })
+}
+
+/// The IDR is held to its budget and the VBV it is sent under: within the
+/// soft cap's measured band, bigger than a P frame's cap (the raise is real)
+/// and far bigger than the IDR a plain 0.1 s VBV allows (S2: a small VBV cut
+/// the first IDR from 166-198 KB to 103 KB). P frames stay under 3x the
+/// P cap once the first ones after the IDR are past.
+///
+/// The IDR band's floor is 0.6, not the design's -10 %: the HRD is re-sent
+/// with 75 % initial fullness, so an IDR sent under a VBV equal to its budget
+/// may find the bucket only three quarters full. The ratio is printed; if it
+/// reads ~0.75, the backend should send a fuller IDR HRD.
+#[test]
+fn h264_direct_the_idr_cap_and_vbv_are_honoured() {
+    let _gpu = crate::gpu_test_lock::lock();
+    for bps in [3_000_000u32, 12_000_000] {
+        let steady = RateTarget::steady(bps, 30);
+        let name = "idr_cap";
+        let Some(raised) = run_rates(name, 40, bps, &|_| steady, &[20], true) else {
+            return;
+        };
+        let mut plain = steady;
+        plain.idr_max_bytes = 0;
+        let Some(unraised) = run_rates(name, 40, bps, &|_| plain, &[20], true) else {
+            return;
+        };
+        raised.assert_decoded("raised");
+        unraised.assert_decoded("unraised");
+        // Premise: the buffers went out, the cap among them, and the stream
+        // really had the two IDRs.
+        assert!(raised.counters.cap_sends > 0, "{:?}", raised.counters);
+        assert_eq!(raised.idr.iter().filter(|&&i| i).count(), 2);
+        let idrs = |r: &RateRun| -> Vec<usize> {
+            (0..r.sizes.len())
+                .filter(|&i| r.idr[i])
+                .map(|i| r.sizes[i])
+                .collect()
+        };
+        let budget = steady.idr_max_bytes as f64;
+        let (r, u) = (idrs(&raised), idrs(&unraised));
+        eprintln!(
+            "idr_cap {bps}: budget {budget:.0} B, IDRs {r:?} (x{:.2}, x{:.2}), no raise {u:?}, P cap {} B",
+            r[0] as f64 / budget,
+            r[1] as f64 / budget,
+            steady.max_frame_bytes
+        );
+        for &size in &r {
+            let ratio = size as f64 / budget;
+            assert!(
+                (0.6..=1.15).contains(&ratio),
+                "IDR {size} B = {ratio:.2} x its budget"
+            );
+            assert!(
+                size > steady.max_frame_bytes as usize,
+                "the raise is not real"
+            );
+        }
+        for (a, b) in r.iter().zip(&u) {
+            assert!(
+                *a as f64 > 1.5 * *b as f64,
+                "the raised VBV did not matter: {a} against {b}"
+            );
+        }
+        // P frames, once the IDR's first few are past.
+        let late: Vec<usize> = (0..40)
+            .filter(|&i| !raised.idr[i] && i % 20 >= 4)
+            .map(|i| raised.sizes[i])
+            .collect();
+        let worst = *late.iter().max().unwrap() as f64 / f64::from(steady.max_frame_bytes);
+        eprintln!(
+            "idr_cap {bps}: P mean {:.0} B ({:.2} x avg), worst P {worst:.2} x cap",
+            mean(&late),
+            mean(&late) / avg_frame(bps)
+        );
+        assert!(worst <= 3.0, "a P frame at {worst:.2} x the cap");
+    }
+}
+
+/// The rate follows `set_rate` mid-stream with no IDR (S2 a: x0.25 and x4):
+/// each settled segment averages the rate it was told, and the new rate is
+/// there within four frames. The first frames after each change are printed.
+#[test]
+fn h264_direct_the_rate_tracks_set_rate_mid_stream_without_an_idr() {
+    let _gpu = crate::gpu_test_lock::lock();
+    let target = |n: u32| {
+        RateTarget::steady(
+            match n {
+                0..45 => 12_000_000,
+                45..90 => 3_000_000,
+                _ => 12_000_000,
+            },
+            30,
+        )
+    };
+    let Some(r) = run_rates("rate_tracks", 135, 12_000_000, &target, &[], true) else {
+        return;
+    };
+    r.assert_decoded("rate_tracks");
+    assert!(r.counters.rc_sends >= 3, "premise: {:?}", r.counters);
+    assert_eq!(
+        r.idr.iter().filter(|&&i| i).count(),
+        1,
+        "an IDR for a rate change"
+    );
+    for (change, bps) in [(45usize, 3_000_000u32), (90, 12_000_000)] {
+        let first: Vec<String> = r.sizes[change..change + 6]
+            .iter()
+            .map(|&s| format!("{:.2}", s as f64 / avg_frame(bps)))
+            .collect();
+        eprintln!("rate_tracks: after the change to {bps}: x avg {first:?}");
+        let settled = mean(&r.sizes[change + 4..change + 8]) / avg_frame(bps);
+        assert!(
+            (0.6..=1.5).contains(&settled),
+            "frames 4-7 after the change: x{settled:.2}"
+        );
+    }
+    for (a, b, bps) in [
+        (10, 45, 12_000_000u32),
+        (51, 90, 3_000_000),
+        (96, 135, 12_000_000),
+    ] {
+        let ratio = mean(&r.sizes[a..b]) / avg_frame(bps);
+        eprintln!("rate_tracks: {a}..{b} at {bps}: x{ratio:.2} of the average frame");
+        assert!((0.7..=1.45).contains(&ratio), "{a}..{b}: x{ratio:.2}");
+    }
+}
+
+/// The noisy rate sequence a policy applying every 250 ms produces (4 Hz,
+/// each step a random 0.7-1.4x of the last, 3-10 Mbit/s), RC and HRD re-sent
+/// every time at 75 % initial fullness. If each re-send reset the VCE's buffer
+/// level, every step would start with a burst of up to three quarters of the
+/// VBV; the stream must track with none: any one second at most 1.35 x what
+/// the rates told allow, no P frame over twice its cap, and the first frame
+/// after a change inside S2's step transient. The per-step ratios are printed:
+/// they answer the question the PCM model's `resend_resets_level` leaves open.
+#[test]
+fn h264_direct_a_noisy_rate_sequence_at_4hz_tracks_without_a_burst() {
+    let _gpu = crate::gpu_test_lock::lock();
+    const STEP: u32 = 8;
+    let mut rates = vec![6_000_000u32];
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    for _ in 0..40 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let f = 0.7 + (x % 1000) as f64 / 1000.0 * 0.7;
+        let last = *rates.last().unwrap();
+        rates.push(((f64::from(last) * f) as u32).clamp(3_000_000, 10_000_000));
+    }
+    let bps_at = |n: u32| rates[(n / STEP) as usize];
+    let target = |n: u32| RateTarget::steady(bps_at(n), 30);
+    let frames = 240;
+    let Some(r) = run_rates("noisy_rate", frames, rates[0], &target, &[], true) else {
+        return;
+    };
+    r.assert_decoded("noisy_rate");
+    let steps = u64::from(frames / STEP);
+    assert!(
+        r.counters.rc_sends >= steps - 2,
+        "premise: every step re-sent the buffers: {:?}",
+        r.counters
+    );
+    assert_eq!(r.idr.iter().filter(|&&i| i).count(), 1);
+    let mut worst_window = 0.0f64;
+    for a in 5..(frames - 30) as usize {
+        let got: usize = r.sizes[a..a + 30].iter().sum();
+        let allowed: f64 = (a..a + 30).map(|n| avg_frame(bps_at(n as u32))).sum();
+        worst_window = worst_window.max(got as f64 / allowed);
+    }
+    let firsts: Vec<f64> = (1..steps as u32)
+        .filter(|s| bps_at(s * STEP) != bps_at(s * STEP - 1))
+        .map(|s| r.sizes[(s * STEP) as usize] as f64 / avg_frame(bps_at(s * STEP)))
+        .collect();
+    let worst_p = (1..frames as usize)
+        .map(|n| r.sizes[n] as f64 / f64::from(target(n as u32).max_frame_bytes))
+        .fold(0.0, f64::max);
+    eprintln!(
+        "noisy_rate: worst 1 s window x{worst_window:.2} of the rates told, first frame after a \
+         step x avg: mean {:.2} max {:.2} over {} steps, worst P {worst_p:.2} x cap",
+        firsts.iter().sum::<f64>() / firsts.len() as f64,
+        firsts.iter().copied().fold(0.0, f64::max),
+        firsts.len()
+    );
+    assert!(firsts.len() > 15, "premise: the sequence stepped");
+    assert!(
+        worst_window <= 1.35,
+        "a burst: x{worst_window:.2} in one second"
+    );
+    assert!(worst_p <= 2.0, "a P frame at {worst_p:.2} x its cap");
+    assert!(
+        firsts.iter().sum::<f64>() / (firsts.len() as f64) <= 1.8,
+        "the first frame after a step is above S2's transient"
+    );
+}
+
+/// A cap-only change latches because the re-sent rate buffers carry a
+/// bits_per_second 16 bps away from the last (S2 b), and does not without
+/// the nudge. At 6 Mbit/s the cap falls from three average frames to 60 % of
+/// one at frame 30; the mean P afterwards must fall with the nudge and stay
+/// with it off.
+#[test]
+fn h264_direct_the_16_bps_nudge_latches_a_cap_only_change() {
+    let _gpu = crate::gpu_test_lock::lock();
+    let bps = 6_000_000;
+    let target = |n: u32| {
+        let mut t = RateTarget::steady(bps, 30);
+        if n >= 30 {
+            t.max_frame_bytes = (avg_frame(bps) * 0.6) as u32;
+        }
+        t
+    };
+    let tail = |r: &RateRun| (mean(&r.sizes[5..30]), mean(&r.sizes[40..90]));
+    let Some(with) = run_rates("nudge_on", 90, bps, &target, &[], true) else {
+        return;
+    };
+    let Some(without) = run_rates("nudge_off", 90, bps, &target, &[], false) else {
+        return;
+    };
+    with.assert_decoded("nudge_on");
+    without.assert_decoded("nudge_off");
+    assert!(with.counters.nudges > 0, "premise: {:?}", with.counters);
+    assert_eq!(
+        without.counters.nudges, 0,
+        "premise: {:?}",
+        without.counters
+    );
+    assert!(
+        with.counters.cap_sends >= 2 && without.counters.cap_sends >= 2,
+        "premise: the new cap was sent in both runs: {:?} {:?}",
+        with.counters,
+        without.counters
+    );
+    let (b_on, a_on) = tail(&with);
+    let (b_off, a_off) = tail(&without);
+    eprintln!(
+        "nudge: mean P before/after the cap change: with {b_on:.0}/{a_on:.0} B, \
+         without {b_off:.0}/{a_off:.0} B (average frame {:.0} B, new cap {:.0} B)",
+        avg_frame(bps),
+        avg_frame(bps) * 0.6
+    );
+    assert!(a_on < 0.85 * b_on, "the cap did not latch with the nudge");
+    assert!(
+        a_off > 0.9 * b_off,
+        "the cap latched without the nudge: it is not what latches it"
+    );
+}
+
+/// Probe-raise spike (B6-5's gate, a measurement). Can the VCE be made to
+/// code a probe-sized P frame (S2: MaxFrameSize is a ceiling, a x4 rate step
+/// gave 1.8x on the first frame and settled in 3-4)? At 2.5 Mbit/s, content
+/// above the floor, three tries at frame 40, each printed per frame as bytes
+/// and as a multiple of the average frame:
+///   (a) MaxFrameSize raised to 8x, the VBV raised for one frame;
+///   (b) the rate bumped to the window rate (8 Mbit/s) for three frames;
+///   (c) the control: nothing changes.
+/// Nothing is asserted but that every run codes and decodes.
+#[test]
+fn h264_direct_probe_raise_spike_prints_p_frame_sizes() {
+    let _gpu = crate::gpu_test_lock::lock();
+    let base_bps = 2_500_000u32;
+    let base = RateTarget::steady(base_bps, 30);
+    let window_bps = 8_000_000u32;
+    let raised = |n: u32| {
+        let mut t = base;
+        if n == 40 {
+            t.max_frame_bytes *= 8;
+            t.vbv_bits *= 8;
+        }
+        t
+    };
+    let bumped = |n: u32| {
+        if (40..43).contains(&n) {
+            RateTarget::steady(window_bps, 30)
+        } else {
+            base
+        }
+    };
+    let control = |_: u32| base;
+    let tries: [(&str, &dyn Fn(u32) -> RateTarget); 3] = [
+        ("a: cap x8 + VBV x8 for one frame", &raised),
+        ("b: window rate for three frames", &bumped),
+        ("c: control", &control),
+    ];
+    eprintln!(
+        "probe_raise: average frame at {base_bps} bit/s {:.0} B, P cap {} B, window-rate frame {:.0} B",
+        avg_frame(base_bps),
+        base.max_frame_bytes,
+        avg_frame(window_bps)
+    );
+    for (label, target) in tries {
+        let Some(r) = run_rates("probe_raise", 60, base_bps, target, &[], true) else {
+            return;
+        };
+        r.assert_decoded(label);
+        let shown: Vec<String> = (36..52)
+            .map(|n| {
+                format!(
+                    "{n}:{}B({:.1}x)",
+                    r.sizes[n],
+                    r.sizes[n] as f64 / avg_frame(base_bps)
+                )
+            })
+            .collect();
+        eprintln!("probe_raise {label}: {}", shown.join(" "));
+        eprintln!(
+            "probe_raise {label}: rc_sends {} cap_sends {} nudges {}; biggest frame in 40..46: {} B",
+            r.counters.rc_sends,
+            r.counters.cap_sends,
+            r.counters.nudges,
+            r.sizes[40..46].iter().max().unwrap()
+        );
+    }
+}
