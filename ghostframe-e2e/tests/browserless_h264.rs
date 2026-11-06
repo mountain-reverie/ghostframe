@@ -1089,19 +1089,23 @@ enum StepMode {
     /// The first B6 baseline: the bps-only rate model (a VBR bucket of
     /// `bps / 10`), the in-place policy.
     RefsBpsOnly,
-    /// `Refs` with S2's 1.8x first frame given to every rate step, however
-    /// small (the pessimistic reading of the model).
+    /// `Refs` with S2's 1.8x first frame, settling in four, given to every
+    /// rate step, however small (the pessimistic reading of the model).
     RefsFullTransient,
+    /// `Refs` with the first-frame excess scaled linearly with the size of the
+    /// step (the optimistic reading: small steps are nearly free).
+    RefsLinearStep,
 }
 
 impl StepMode {
-    /// `GF_POP_MODE=refs|refs-phase-a|refs-bps-only|refs-full-transient|legacy` (default legacy).
+    /// `GF_POP_MODE=refs|refs-phase-a|refs-bps-only|refs-full-transient|refs-linear-step|legacy` (default legacy).
     fn from_env() -> Self {
         match std::env::var("GF_POP_MODE").as_deref() {
             Ok("refs") => Self::Refs,
             Ok("refs-phase-a") => Self::RefsPhaseA,
             Ok("refs-bps-only") => Self::RefsBpsOnly,
             Ok("refs-full-transient") => Self::RefsFullTransient,
+            Ok("refs-linear-step") => Self::RefsLinearStep,
             _ => Self::Legacy,
         }
     }
@@ -1117,8 +1121,13 @@ impl StepMode {
             }
             Self::RefsFullTransient => {
                 let mut l = refs_cbr_load();
+                l.pcm_rate_model = Some(PcmRateModel::s2(40_000, 120_000, FPS).with_s2_transient());
+                l
+            }
+            Self::RefsLinearStep => {
+                let mut l = refs_cbr_load();
                 l.pcm_rate_model =
-                    Some(PcmRateModel::s2(40_000, 120_000, FPS).with_full_step_transient());
+                    Some(PcmRateModel::s2(40_000, 120_000, FPS).with_linear_step_scaling());
                 l
             }
             Self::RefsBpsOnly => {
@@ -1729,9 +1738,16 @@ async fn p_b_population_never_collapses_and_finds_the_headroom_whenever_the_clie
 /// | legacy (scripted CBR) | 94/95/95 | 92/96/89 | 2100/7100, 2400/5600, 4200/7000 |
 /// | refs, bps-only model, in place | 86/95/93 | 96/96/96 | 1900/12500, 2000/7600, 2000/7200 |
 /// | refs, bps-only model, Phase A | 89/91/86 | 96/96/96 | 1900/7300, 2000/7700, 5300/10500 |
-/// | refs, full model, in place | 84/87/86 | 96/96/96 | 2000/11700, 2200/9700, 2300/10800 |
-/// | refs, full model, Phase A | 91/95/90 | 96/96/96 | 6300/9100, 2200/6700, 2200/7600 |
-/// | refs, full model, every step 1.8x | 96/95/96 | 96/96/96 | 2000/5200, 2400/6300, 2300/6000 |
+/// | refs, S2-calibrated full model (superseded), in place | 84/87/86 | 96/96/96 | 2000/11700, 2200/9700, 2300/10800 |
+/// | refs, S2-calibrated full model (superseded), Phase A | 91/95/90 | 96/96/96 | 6300/9100, 2200/6700, 2200/7600 |
+/// | refs, S2-calibrated, every step 1.8x (`refs-full-transient`) | 96/95/96 | 96/96/96 | 2000/5200, 2400/6300, 2300/6000 |
+/// | refs, VCE-calibrated model (B6, 2026-11-05), in place | 90/90/92 | 96/96/96 | 5500/7900, 2200/10500, 5900/8400 |
+/// | refs, VCE-calibrated model, Phase A | 95/93/90 | 96/96/96 | 3900/6600, 5200/7400, 5700/8000 |
+///
+/// The VCE-calibrated model (`pcm_rate.rs`, provisional: the first frame
+/// after a step 1.47x up / 1.32x down at every step size, settled in two
+/// frames, a raised IDR at 0.6 of its ceiling) is the gate's. Its step-size
+/// dependence is not measured; `refs-linear-step` is the optimistic reading.
 ///
 /// No collapse in any. The twin never misses the guard (the 89/96 of the
 /// legacy gate is the legacy 8 ms row only). The full model is the gate's;
