@@ -628,14 +628,18 @@ the HRD restarts at 40 % fullness, so the first frame after a re-send is about
 - The hold is **releasable**: it is let go when the raw estimate falls below
   the smoothed estimate from before the spike (the path is worse than it was),
   or below 0.85 of the spike while goog_cc reports a loss limit
-  (`LossState`). A queue on the path is not read as distress (a probe burst
-  builds one by design: with it the hold was let go on most step-ups and the
-  stream used the headroom on 12 of 96). goog_cc's delay detector state is not
+  (`LossState`) or a standing queue (the queue estimate non-zero for
+  `SPIKE_QUEUE_PERSIST`, 400 ms). A queue seen for less than that is not
+  read as distress (a probe burst builds one by design: with the queue read
+  at once the hold was let go on most step-ups and the stream used the
+  headroom on 12 of 96). goog_cc's delay detector state is not
   exposed, so a delay-only overuse is seen as the estimate falling below the
   pre-spike level, not as itself. A hold that cannot be let go keeps a stream
   at three times its path for the rest of the 2 s after a drop that follows a
-  rise (scene 6C: 31-54 kB over the link in 3 s and 119-123 of 150 frames shown,
-  against 2-10 kB and 140-144).
+  rise (scene 6C, the drop 600 ms after the spike, three seeds: 144 kB over the
+  link in the 3 s after it in all, against 98 kB, and 114 / 140 / 115 of 150
+  frames shown against 129 / 146 / 138; the twin's latency does not tell them
+  apart, 410-500 ms in both).
 - An apply needs a 10 % fall or a 15 % rise from the running rate and is never
   closer than 250 ms to the last. Inside the band nothing is re-sent. There is
   no 2 s lock, so a drop shortly after a rise applies at once, and no confirmation
@@ -720,7 +724,7 @@ the HRD restarts at 40 % fullness, so the first frame after a re-send is about
   69/65/62 `sus_use`: "reached" was mostly a transient spike. Shallow buffers
   (48 timelines, as sent): `sus_use` 26 / 35 of 48 at 30 / 60 ms without the
   raise, 31 / 31 with every guard. Scene 6 (a capacity drop, with a drop shortly
-  after a rise, 6B, and one second after it, 6C) bounds the bytes coded at the
+  after a rise, 6B, and 600 ms after the probe's spike, 6C) bounds the bytes coded at the
   rate in force in any 1 s window at 1.15 x `RATE_SHARE x` the estimate, the
   backpressure skips after the drop at half those of a stream with no rate
   policy, and for 6C the bytes over the link, the frames shown and the latency.

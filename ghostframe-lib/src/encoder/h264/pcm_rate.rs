@@ -340,6 +340,10 @@ impl RateState {
             self.step_excess = base * (rel / STEP_MEASURED).min(1.0).powf(m.step_scaling);
             self.raise_step = new > old && rel >= RAISE_STEP_MIN;
             // The fall that follows a raise ends its window: the encoder dips.
+            // Any fall right after a big rise gets the dip, a spike's give-back
+            // included: the model cannot tell them apart from the rates, and a
+            // give-back is a fall from a probe-window-sized rate like the
+            // window's own end.
             self.post_raise_step = new < old && self.after_raise;
             self.after_raise = self.raise_step;
         }

@@ -185,7 +185,7 @@ keeps a 250 ms floor between them, a 10 % band for a fall and 15 % for a rise,
 and never re-sends inside the band). A jump of the raw estimate is held for 2 s
 (`SPIKE_HOLD_IN_PLACE`; 1 s on Phase A), and let go early when the estimate
 falls below its pre-spike level or under 0.85 of the spike while goog_cc is
-loss-limited; the give-back is not a cut. Measure a step-up with `sus_use`
+loss-limited or has had a standing queue for 400 ms; the give-back is not a cut. Measure a step-up with `sus_use`
 (the estimate held over the line for a second *and* the stream sending at
 0.8 x the line), not `reached`, which counts a transient spike. Every frame is planned under a
 `RateTarget` (`bps`, a P-frame cap of 3 average frames `max_frame_bytes`, an IDR
