@@ -25,9 +25,12 @@
 //!
 //! Comparisons are RFC 1982 serial arithmetic, so a `u32` wrap is safe.
 
-/// True when `a` is strictly newer than `b`.
+/// True when `a` is strictly newer than `b`: the 31-bit serial arithmetic the
+/// core uses for the wire's `frame_seq` (bit 31 is the tile-datagram flag).
+/// A tile left unpainted for 2^30 frames (about 207 days at 60 fps) would
+/// compare wrongly; that is accepted.
 pub(crate) fn seq_newer(a: u32, b: u32) -> bool {
-    (a.wrapping_sub(b) as i32) > 0
+    ghostframe_client_core::cdf53_coverage::frame_seq_is_newer(a, b)
 }
 
 /// Tile coordinates are `u8` on the wire, so a flat table of this many entries
@@ -65,6 +68,13 @@ impl SeqLedger {
         }
         let slot = &mut self.newest[ty as usize * 256 + tx as usize];
         *slot = newest_of(*slot, seq);
+        self.max_tile = newest_of(self.max_tile, seq);
+    }
+
+    /// Record a CDF 5/3 pass from `seq` that is waiting to be drawn. It does
+    /// not enter any tile's entry (so it cannot make an older stateless draw
+    /// disappear before it is listed), but a picture older than it is stale.
+    pub(crate) fn note_pending(&mut self, seq: u32) {
         self.max_tile = newest_of(self.max_tile, seq);
     }
 
@@ -117,10 +127,15 @@ mod tests {
     #[test]
     fn newest_wins_regardless_of_note_order_and_across_a_wrap() {
         let mut l = SeqLedger::default();
-        l.note(0, 0, u32::MAX);
+        // The wire's frame_seq is 31 bits: the wrap is 0x7FFF_FFFF -> 0.
+        l.note(0, 0, 0x7FFF_FFFF);
         l.note(0, 0, 2);
-        l.note(0, 0, u32::MAX - 1);
-        assert!(l.superseded(0, 0, u32::MAX));
+        l.note(0, 0, 0x7FFF_FFFE);
+        assert!(l.superseded(0, 0, 0x7FFF_FFFF));
+        assert!(
+            !l.h264_stale(2) && l.h264_stale(0x7FFF_FFFE),
+            "max_tile follows"
+        );
         assert!(!l.superseded(0, 0, 2));
     }
 
@@ -135,6 +150,14 @@ mod tests {
         assert!(l.superseded(0, 0, 10), "any tile: the picture covers it");
         assert!(!l.superseded(0, 0, 11));
         assert!(l.h264_stale(10), "an older picture than the one drawn");
+    }
+
+    #[test]
+    fn a_waiting_cdf53_pass_makes_an_older_picture_stale_but_not_an_older_stateless_tile() {
+        let mut l = SeqLedger::default();
+        l.note_pending(301);
+        assert!(l.h264_stale(300));
+        assert!(!l.superseded(0, 0, 300), "not in any tile's entry");
     }
 
     #[test]

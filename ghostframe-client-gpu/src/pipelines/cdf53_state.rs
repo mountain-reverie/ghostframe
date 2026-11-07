@@ -347,14 +347,16 @@ impl Cdf53GridState {
         }
     }
 
-    /// An H.264 frame from `frame_seq` covers the screen: every pending draw is
-    /// older than it and would land on top of it, so cancel them all, and
-    /// refuse passes older than it. (Tiles the grid already drew are under the
+    /// An H.264 frame from `frame_seq` covers the screen: every pending draw
+    /// not newer than it would land on top of it, so cancel those, and refuse
+    /// passes older than it. A pending tile whose newest pass is newer than
+    /// the frame stays: a late picture (the decoder delays its output) must not
+    /// cancel the tiles of a later frame. (Tiles the grid already drew are under the
     /// frame; the flush that preceded the blit saw to that.)
     pub fn supersede_all(&mut self, frame_seq: u32) {
         for &i in &self.dirty {
             let t = &mut self.tiles[i as usize];
-            if t.pending {
+            if t.pending && !seq_newer(t.newest_seq, frame_seq) {
                 t.pending = false;
                 self.stats.cancelled_superseded += 1;
             }
@@ -899,6 +901,22 @@ mod tests {
             feed(&mut s, 3, p, 0x3FFF, 50, 0);
         }
         assert_eq!(s.plan().len(), 1);
+    }
+
+    #[test]
+    fn a_late_picture_does_not_cancel_the_pending_tiles_of_a_later_frame() {
+        let mut s = Cdf53GridState::with_budget(tile_cost_us(14), 1000);
+        s.resize(8, 4);
+        // Tile 0 from frame 301 (after the picture), tile 1 from frame 299.
+        for p in 0..14 {
+            feed(&mut s, 0, p, 0x3FFF, 301, 0);
+            feed(&mut s, 1, p, 0x3FFF, 299, 0);
+        }
+        s.supersede_all(300);
+        let listed = s.plan();
+        assert_eq!(listed.len(), 1, "only the later frame's tile survives");
+        assert_eq!(listed[0].frame_seq, 301);
+        assert_eq!(s.take_stats().cancelled_superseded, 1);
     }
 
     #[test]
