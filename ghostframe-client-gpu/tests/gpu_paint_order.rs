@@ -89,3 +89,74 @@ fn arrival_order_does_not_matter_and_equal_seq_is_not_dropped() {
     // A tile whose only entry has the batch's newest seq is painted.
     assert_ne!(centre(vec![solid(6, RED)]), [0, 0, 0, 0]);
 }
+
+/// Centre pixel of tile (2,3) after applying each group of `ticks` and
+/// flushing after every group: the later groups arrive in a later flush.
+fn centre_over_flushes(ticks: Vec<Vec<Event>>) -> [u8; 4] {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut r = renderer(&ctx);
+    for events in ticks {
+        for ev in events {
+            r.apply_event(&ctx, ev).expect("gpu ok");
+        }
+        r.flush(&ctx).expect("gpu ok");
+    }
+    let fb = r.debug_read_framebuffer(&ctx);
+    let (x, y) = (2 * TILE_SIZE + TILE_SIZE / 2, 3 * TILE_SIZE + TILE_SIZE / 2);
+    let i = ((y * W + x) * 4) as usize;
+    [fb[i], fb[i + 1], fb[i + 2], fb[i + 3]]
+}
+
+#[test]
+fn an_older_stateless_tile_in_a_later_flush_does_not_cover_a_newer_one() {
+    let newer = centre(vec![solid(6, RED)]);
+    assert_ne!(
+        newer,
+        centre(vec![solid(5, BLUE)]),
+        "fixture must discriminate"
+    );
+
+    // Solid then Solid.
+    assert_eq!(
+        centre_over_flushes(vec![vec![solid(6, RED)], vec![solid(5, BLUE)]]),
+        newer
+    );
+    // Solid then TileReady (also the CPU CDF 5/3 route).
+    assert_eq!(
+        centre_over_flushes(vec![
+            vec![solid(6, RED)],
+            vec![tile_ready(5, [0xFF, 0, 0, 0xFF])]
+        ]),
+        newer
+    );
+    // Equal seq, a later flush: still painted (refinement shares a seq).
+    assert_ne!(
+        centre_over_flushes(vec![vec![solid(6, RED)], vec![solid(6, BLUE)]]),
+        newer
+    );
+}
+
+#[test]
+fn the_ledger_is_forgotten_when_the_framebuffer_is_resized() {
+    // A resize starts a new picture; a stream that restarts its sequence
+    // after it must not be locked out by the old one.
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut r = renderer(&ctx);
+    r.apply_event(&ctx, solid(600, RED)).unwrap();
+    r.flush(&ctx).unwrap();
+    r.apply_event(
+        &ctx,
+        Event::FrameDimensions {
+            width: 1280,
+            height: 720,
+        },
+    )
+    .unwrap();
+    r.apply_event(&ctx, solid(1, BLUE)).unwrap();
+    r.flush(&ctx).unwrap();
+    let fb = r.debug_read_framebuffer(&ctx);
+    let (x, y) = (2 * TILE_SIZE + TILE_SIZE / 2, 3 * TILE_SIZE + TILE_SIZE / 2);
+    let i = ((y * 1280 + x) * 4) as usize;
+    // The readback is RGBA; BLUE is given as BGRA.
+    assert_eq!([fb[i], fb[i + 1], fb[i + 2], fb[i + 3]], [0, 0, 0xFF, 0xFF]);
+}
