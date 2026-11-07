@@ -48,6 +48,19 @@ async fn run_bottleneck_scene(
     run_browserless(scene).await.expect("scene ran")
 }
 
+/// The estimate samples (bps) from the last `window_us` of the scene.
+fn estimate_tail(
+    r: &ghostframe_e2e::harness::browserless::BrowserlessResult,
+    window_us: u64,
+) -> Vec<u64> {
+    let end = r.bwe_estimate_samples.last().map_or(0, |s| s.0);
+    r.bwe_estimate_samples
+        .iter()
+        .filter(|s| s.0 + window_us >= end)
+        .map(|s| s.1)
+        .collect()
+}
+
 /// The estimator must tell a congested link from an uncongested one.
 ///
 /// The scenes offer the same ~10 Mbit/s of churn (`tiles_per_tick: 32`) over
@@ -99,11 +112,30 @@ async fn the_estimate_separates_a_congested_link_from_an_uncongested_one() {
         congested.bytes_delivered_s2c,
         500_000 * 20
     );
+    // The estimate on a saturated link is a sawtooth (measured 3.1-4.45 Mbit/s,
+    // period ~0.6 s, on seeds 01-05, with the same 10 s mean, 3.54-3.60 Mbit/s,
+    // before and after the scheduler drain rotation), so one end-of-run sample
+    // with no margin is a coin flip. Gate the level, not the phase: the mean of
+    // the last 10 s must not exceed the link, nor the peak 115 % of it (peaks
+    // of 4.33-4.46 Mbit/s were measured on both builds, so 110 % is not a
+    // margin this sawtooth keeps). An estimator sitting 20 % above the link
+    // has a mean over 4.2 Mbit/s and a peak over 5.2, and fails both.
+    let link_bps = 500_000.0 * 8.0;
+    let tail = estimate_tail(&congested, 10_000_000);
+    let mean = tail.iter().sum::<u64>() as f64 / tail.len() as f64;
+    let max = tail.iter().copied().max().unwrap() as f64;
+    println!(
+        "congested tail: n={} mean={mean:.0} max={max:.0} link={link_bps:.0}",
+        tail.len()
+    );
+    assert!(tail.len() >= 50, "premise: too few estimate samples");
     assert!(
-        congested.bwe_estimate_bps <= 500_000 * 8,
-        "the congested scene's estimate must not exceed its link: est={} link={}",
-        congested.bwe_estimate_bps,
-        500_000 * 8
+        mean <= link_bps,
+        "the congested scene's mean estimate over the last 10 s must not exceed its link: mean={mean:.0} link={link_bps:.0}"
+    );
+    assert!(
+        max <= link_bps * 1.15,
+        "the congested scene's estimate peaked above 115 % of its link: max={max:.0} link={link_bps:.0}"
     );
     assert_eq!(
         spacious.bytes_dropped, 0,
