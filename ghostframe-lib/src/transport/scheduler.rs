@@ -143,6 +143,19 @@ impl RefinementDeficit {
     }
 }
 
+/// What one refinement bucket was pushed since the last drain.
+///
+/// `start` is the bucket's length when the first push happened: everything
+/// from there on is new, everything before it is older pending work.
+/// `cursor_pushed` says the tile the last drain stopped at was queued again,
+/// i.e. the screen was re-enqueued and the bucket needs rotating. Together
+/// they let the drain rotate only the new run, and only when there is one.
+#[derive(Clone, Copy, Default)]
+struct FreshRun {
+    start: Option<usize>,
+    cursor_pushed: bool,
+}
+
 pub struct Scheduler {
     cols: u32,
     rows: u32,
@@ -162,6 +175,8 @@ pub struct Scheduler {
     /// The next drain starts after it when the bucket has been refilled from
     /// the top; see `rotate_past_cursor`.
     refinement_cursor: [Option<(u8, u8)>; PASS_SLOTS],
+    /// Per bucket, what was pushed since the last drain; see `FreshRun`.
+    refinement_fresh: [FreshRun; PASS_SLOTS],
     /// Items in `work` whose state is `Pending`, in either queue. Maintained
     /// at every transition into and out of `Pending` so that
     /// `has_pending_work` is O(1); `pending_items_recomputed` is the scan it
@@ -232,6 +247,7 @@ impl Scheduler {
             priority_order: VecDeque::new(),
             refinement_order: std::array::from_fn(|_| VecDeque::new()),
             refinement_cursor: [None; PASS_SLOTS],
+            refinement_fresh: [FreshRun::default(); PASS_SLOTS],
             pending_items: 0,
             refinement_deficit: RefinementDeficit::new(cols, rows),
             retry_after: Duration::from_millis(40),
@@ -261,6 +277,7 @@ impl Scheduler {
             q.clear();
         }
         self.refinement_cursor = [None; PASS_SLOTS];
+        self.refinement_fresh = [FreshRun::default(); PASS_SLOTS];
         self.refinement_deficit.reset(cols, rows);
         self.slots.resize(cols, rows);
     }
@@ -277,6 +294,7 @@ impl Scheduler {
             q.clear();
         }
         self.refinement_cursor = [None; PASS_SLOTS];
+        self.refinement_fresh = [FreshRun::default(); PASS_SLOTS];
         self.refinement_deficit.reset(self.cols, self.rows);
         // Only queued handles are dropped; generations and ACK state are
         // kept for the same reason they always were — a late ACK on a
@@ -485,7 +503,7 @@ impl Scheduler {
         let h = self.work.insert(work);
         self.pending_items += 1;
         self.slots.set_handle(tx, ty, pass, Some(h));
-        self.refinement_order[(pass as usize).min(PASS_SLOTS - 1)].push_back(h);
+        self.push_refinement(pass, h, (tx, ty).0, (tx, ty).1);
         self.refinement_deficit.push(tx, ty);
     }
 
@@ -927,6 +945,7 @@ impl Scheduler {
             &mut self.refinement_order,
             &mut self.refinement_deficit,
             &mut self.refinement_cursor,
+            &mut self.refinement_fresh,
             refinement_budget,
             now,
             self.item_overhead,
@@ -1007,7 +1026,19 @@ impl Scheduler {
         }
     }
 
-    /// Start a bucket after the tile the last drain stopped at.
+    /// File `h` at the back of its pass bucket, noting that the bucket has
+    /// new work and whether it is the tile the last drain stopped at.
+    fn push_refinement(&mut self, pass: u8, h: Handle, tile_x: u8, tile_y: u8) {
+        let b = (pass as usize).min(PASS_SLOTS - 1);
+        let fresh = &mut self.refinement_fresh[b];
+        fresh.start.get_or_insert(self.refinement_order[b].len());
+        fresh.cursor_pushed |= self.refinement_cursor[b] == Some((tile_x, tile_y));
+        self.refinement_order[b].push_back(h);
+    }
+
+    /// Drop terminal entries from a bucket and, if the screen was queued
+    /// again since the last drain, start the new run after the tile the last
+    /// drain stopped at.
     ///
     /// A screen that changes faster than the link can carry it supersedes
     /// every queued pass and enqueues the whole screen again, in the same
@@ -1016,26 +1047,59 @@ impl Scheduler {
     /// every change, and the rest of the screen never receives a byte.
     ///
     /// The tile the last drain sent from this bucket is gone from it (a sent
-    /// pass leaves the queue) unless the screen changed and queued it again.
-    /// If it is queued again, the bucket was refilled from the top: rotate it
-    /// so the tile after that one leads, and the sweep carries on where it
-    /// stopped. If it is not there, the bucket is a continuation (or the
-    /// tile did not change) and is left alone.
+    /// pass leaves the queue) unless the screen changed and queued it again
+    /// (`FreshRun::cursor_pushed`). Only then is the bucket rotated, and only
+    /// its new run: older pending work (a backlog from an earlier change)
+    /// stays at the front in age order, so a region that is re-sent every
+    /// frame cannot push it back. Otherwise the bucket is a continuation and
+    /// is left alone. No scan happens without a refill.
+    ///
+    /// If the tile the last drain stopped at has not changed (it is static),
+    /// it is not queued again, no rotation happens, and that refill starts at
+    /// the top. The cursor moves on with the next send, so this corrects
+    /// itself on the following refill.
     ///
     /// Positions come from the queue's own order, not from coordinates, so
     /// this holds for whatever order the enqueuer walks the screen in.
-    fn rotate_past_cursor(
-        work: &Slab<TileWork>,
+    fn prune_and_rotate(
+        work: &mut Slab<TileWork>,
         bucket: &mut VecDeque<Handle>,
+        deficit: &mut RefinementDeficit,
         cursor: Option<(u8, u8)>,
+        fresh: FreshRun,
     ) {
-        let Some((cx, cy)) = cursor else { return };
-        let at = bucket.iter().position(|h| {
+        let mut idx = 0usize;
+        let mut removed_before_fresh = 0usize;
+        bucket.retain(|&h| {
+            let i = idx;
+            idx += 1;
+            let keep = match work.get(h) {
+                Some(w) if matches!(w.state, WorkState::Superseded | WorkState::Acked) => {
+                    deficit.pop(w.tile_x, w.tile_y);
+                    work.remove(h);
+                    false
+                }
+                Some(_) => true,
+                None => {
+                    debug_assert!(false, "orphaned refinement handle: deficit would drift");
+                    false
+                }
+            };
+            if !keep && fresh.start.is_some_and(|f| i < f) {
+                removed_before_fresh += 1;
+            }
+            keep
+        });
+        let (Some(start), true, Some((cx, cy))) = (fresh.start, fresh.cursor_pushed, cursor) else {
+            return;
+        };
+        let run = &mut bucket.make_contiguous()[start - removed_before_fresh..];
+        let at = run.iter().position(|h| {
             work.get(*h)
                 .is_some_and(|w| w.tile_x == cx && w.tile_y == cy)
         });
         if let Some(i) = at {
-            bucket.rotate_left(i + 1);
+            run.rotate_left(i + 1);
         }
     }
 
@@ -1051,6 +1115,7 @@ impl Scheduler {
         order: &mut [VecDeque<Handle>; PASS_SLOTS],
         deficit: &mut RefinementDeficit,
         cursor: &mut [Option<(u8, u8)>; PASS_SLOTS],
+        fresh: &mut [FreshRun; PASS_SLOTS],
         budget: usize,
         now: Instant,
         item_overhead: usize,
@@ -1064,24 +1129,13 @@ impl Scheduler {
         // Pending->Superseded entries that re-emit on the next tick with
         // old gen values — corrupting the client integrator (which clears
         // its tile state on gen change).
-        for bucket in order.iter_mut() {
-            bucket.retain(|&h| match work.get(h) {
-                Some(w) if matches!(w.state, WorkState::Superseded | WorkState::Acked) => {
-                    deficit.pop(w.tile_x, w.tile_y);
-                    work.remove(h);
-                    false
-                }
-                Some(_) => true,
-                None => {
-                    debug_assert!(false, "orphaned refinement handle: deficit would drift");
-                    false
-                }
-            });
+        for ((bucket, cursor), fresh) in order.iter_mut().zip(cursor.iter()).zip(fresh.iter_mut()) {
+            Self::prune_and_rotate(work, bucket, deficit, *cursor, *fresh);
+            *fresh = FreshRun::default();
         }
 
         let mut spent = 0usize;
         for (bucket, cursor) in order.iter_mut().zip(cursor.iter_mut()) {
-            Self::rotate_past_cursor(work, bucket, *cursor);
             while let Some(&h) = bucket.front() {
                 let cost = match work.get(h) {
                     Some(w) => w.payload.len() + item_overhead,
@@ -1215,7 +1269,7 @@ impl Scheduler {
             let h = self.work.insert(w);
             self.pending_items += 1;
             self.slots.set_handle(tile_x, tile_y, pass_idx, Some(h));
-            self.refinement_order[(pass_idx as usize).min(PASS_SLOTS - 1)].push_back(h);
+            self.push_refinement(pass_idx, h, (tile_x, tile_y).0, (tile_x, tile_y).1);
             self.refinement_deficit.push(tile_x, tile_y);
         }
     }
@@ -1288,7 +1342,7 @@ impl Scheduler {
             let h = self.work.insert(w);
             self.pending_items += 1;
             self.slots.set_handle(tile_x, tile_y, pass_idx, Some(h));
-            self.refinement_order[(pass_idx as usize).min(PASS_SLOTS - 1)].push_back(h);
+            self.push_refinement(pass_idx, h, (tile_x, tile_y).0, (tile_x, tile_y).1);
             self.refinement_deficit.push(tile_x, tile_y);
         }
     }
@@ -2457,6 +2511,36 @@ mod tests {
 
     /// Cursor past the last tile: the sweep wraps and the next one starts at
     /// the top, not nowhere.
+    /// A region that is re-enqueued every frame must not push older pending
+    /// work behind itself. Row 0 is the region; row 5 is a backlog queued
+    /// before the region's latest refill, as a window move leaves. The drain
+    /// serves the backlog first, as it did before rotation existed.
+    #[test]
+    fn rotation_leaves_older_pending_work_ahead_of_the_refilled_run() {
+        let mut s = Scheduler::new(8, 8);
+        let row = |s: &mut Scheduler, y: u8, gen: u8| {
+            for x in 0..8u8 {
+                s.enqueue_refinement(x, y, gen, vec![vec![0u8; 100]]);
+            }
+        };
+        row(&mut s, 0, 0);
+        assert_eq!(s.tick(3 * 100).len(), 3, "premise: the cursor is set");
+        row(&mut s, 5, 0);
+        // A drain that affords nothing: the backlog is now older than the
+        // refill that follows.
+        assert!(s.tick(0).is_empty());
+        row(&mut s, 0, 1);
+        let out = s.tick(3 * 100);
+        assert_eq!(out.len(), 3, "premise: the budget affords three tiles");
+        assert!(
+            out.iter().all(|w| w.tile_y == 5),
+            "the older backlog must drain before the refilled region: {:?}",
+            out.iter().map(|w| (w.tile_x, w.tile_y)).collect::<Vec<_>>()
+        );
+    }
+
+    /// An off-by-one guard on the wrap, not a test of the fix: a drain that
+    /// ignored the cursor passes it too.
     #[test]
     fn the_sweep_wraps_after_the_last_tile() {
         let mut s = Scheduler::new(4, 4);
