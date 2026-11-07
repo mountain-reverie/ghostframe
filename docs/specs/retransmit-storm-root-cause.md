@@ -230,10 +230,9 @@ were re-measured on 2026-11-07 in the browserless harness
   No longer true.** Admission is a token bucket refilled by elapsed time
   (`transport::admission`, `pump_admission`), run after every drain and on a
   timer wake, with the floor at one datagram. `base_budget_bytes` no longer
-  exists. Over a 20 s run at 2 Mbit the server offered **105 to 107 %** of
-  what the bandwidth estimate allowed in that time (seeds E4_0001..3; the
-  excess is the payload fraction and retransmissions). Nothing to change;
-  `browserless_overload` pins the share at 80 % or more.
+  exists. Over a 20 s run the server delivered **91 to 95 %** of the link
+  (2 and 1 Mbit, seeds E4_0001..3), and master delivers the same.
+  Nothing to change; `browserless_overload` pins delivery at 80 % or more.
 - **Pass-major drain restarted at the same tile after every supersede.
   True, and fixed.** A change supersedes every queued pass and enqueues the
   whole screen again in the same order, so each drain spent its budget on

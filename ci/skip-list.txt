@@ -136,7 +136,7 @@ e2e_input_forwarding_firefox
 #
 # What it shows now is the same unreachable premise, with both of the
 # defects it once exposed gone: admission is billed by elapsed time (the
-# server offers 105-107% of the estimate, `browserless_overload`), and the
+# server delivers 91-95% of the link, `browserless_overload`), and the
 # pass-major drain rotates past the tile it last sent, so a screen that
 # changes faster than the link spreads the bytes over every tile instead of
 # the first ~790 in drain order (`sustained_supersede_still_reaches_every_tile`).

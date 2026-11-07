@@ -177,6 +177,10 @@ pub struct Scheduler {
     refinement_cursor: [Option<(u8, u8)>; PASS_SLOTS],
     /// Per bucket, what was pushed since the last drain; see `FreshRun`.
     refinement_fresh: [FreshRun; PASS_SLOTS],
+    /// Harness-only: every tile that ever had a pass 0 leave the refinement
+    /// queue. Shared so a harness can read it after the bridge task is gone.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pass0_sent: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(u8, u8)>>>,
     /// Items in `work` whose state is `Pending`, in either queue. Maintained
     /// at every transition into and out of `Pending` so that
     /// `has_pending_work` is O(1); `pending_items_recomputed` is the scan it
@@ -248,6 +252,8 @@ impl Scheduler {
             refinement_order: std::array::from_fn(|_| VecDeque::new()),
             refinement_cursor: [None; PASS_SLOTS],
             refinement_fresh: [FreshRun::default(); PASS_SLOTS],
+            #[cfg(any(test, feature = "browserless-harness"))]
+            pass0_sent: Default::default(),
             pending_items: 0,
             refinement_deficit: RefinementDeficit::new(cols, rows),
             retry_after: Duration::from_millis(40),
@@ -946,6 +952,8 @@ impl Scheduler {
             &mut self.refinement_deficit,
             &mut self.refinement_cursor,
             &mut self.refinement_fresh,
+            #[cfg(any(test, feature = "browserless-harness"))]
+            &self.pass0_sent,
             refinement_budget,
             now,
             self.item_overhead,
@@ -1024,6 +1032,14 @@ impl Scheduler {
             spent = spent.saturating_add(w.payload.len() + item_overhead);
             out.push(w.clone());
         }
+    }
+
+    /// Harness-only: the set of tiles that have had a pass 0 sent.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn pass0_sent_handle(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(u8, u8)>>> {
+        self.pass0_sent.clone()
     }
 
     /// File `h` at the back of its pass bucket, noting that the bucket has
@@ -1116,6 +1132,9 @@ impl Scheduler {
         deficit: &mut RefinementDeficit,
         cursor: &mut [Option<(u8, u8)>; PASS_SLOTS],
         fresh: &mut [FreshRun; PASS_SLOTS],
+        #[cfg(any(test, feature = "browserless-harness"))] pass0_sent: &std::sync::Mutex<
+            std::collections::HashSet<(u8, u8)>,
+        >,
         budget: usize,
         now: Instant,
         item_overhead: usize,
@@ -1163,6 +1182,10 @@ impl Scheduler {
                     w.state = WorkState::InFlight;
                     spent += cost;
                     *cursor = Some((w.tile_x, w.tile_y));
+                    #[cfg(any(test, feature = "browserless-harness"))]
+                    if w.pass_idx == 0 {
+                        pass0_sent.lock().unwrap().insert((w.tile_x, w.tile_y));
+                    }
                     out.push(w);
                 }
             }

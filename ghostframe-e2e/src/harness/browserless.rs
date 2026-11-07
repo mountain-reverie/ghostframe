@@ -614,6 +614,9 @@ pub struct BrowserlessResult {
     /// scene — which is different from, and should not be read as, "probing
     /// ran and found nothing to report".
     pub probes_completed: u64,
+    /// Distinct tiles that had a pass 0 leave the server's scheduler over
+    /// the scene (`Scheduler::pass0_sent_handle`).
+    pub tiles_with_pass0_sent: usize,
     /// Cumulative count of probe windows that closed *without* meeting both
     /// thresholds. Per the design's "No padding" section this is the
     /// **expected** outcome on an idle link, not a bug — see
@@ -1102,6 +1105,7 @@ async fn run_inner(
     // Stage 2.4) — see `probe_stats_publish`'s doc comment in
     // `io_bridge.rs`.
     let probe_stats_cell = bridge.probe_stats_publish_handle();
+    let pass0_cell = bridge.pass0_sent_handle();
     let transport_probe_cell = bridge.transport_probe_publish_handle();
     let send_errs_cell = bridge.send_errs_publish_handle();
     let h264_cell = bridge.h264_stats_publish_handle();
@@ -1247,6 +1251,7 @@ async fn run_inner(
         .lock()
         .expect("transport_probe_publish mutex poisoned");
     let send_datagram_errs = *send_errs_cell.lock().expect("send_errs mutex poisoned");
+    let tiles_with_pass0_sent = pass0_cell.lock().unwrap().len();
     let (probes_completed, probes_abandoned) = *probe_stats_cell
         .lock()
         .expect("probe_stats_publish mutex poisoned");
@@ -1387,6 +1392,7 @@ async fn run_inner(
         queued_refinement_latency_max_us: queued_refinement_latency.max_us,
         queued_refinement_latency_buckets: queued_refinement_latency.buckets,
         probes_completed,
+        tiles_with_pass0_sent,
         probes_abandoned,
         drops_fired,
         frame_drops_fired,
