@@ -50,7 +50,7 @@ Status at 2026-10-11.
 | Web renderer paints in fixed codec order with no `frame_seq` in its queues: two frames in one rAF can leave an older Solid/H.264 draw over a newer CDF53 tile | PR #131 review | WS-C7 `web/render-queue-frame-seq` |
 | Web dimension clamp rejects 8K (32 400 tiles > 65 535-workgroup L1 dispatch needs chunking) | PR #131 | unscheduled |
 | `HELLO_DEADLINE` is 20 s armed at accept; arming at session-ready would allow a short one | PR #129 | owner decision; candidate for WS-B1 |
-| quinn endpoint slab entry leaks for connections removed before `Drained`; PalRLE GPU counts unclamped; connect/HELLO/close loop not rate-limited | PR #129 review | unscheduled |
+| quinn endpoint slab entry leaked for every connection the server dropped (fixed: `Drained` now reaches the endpoint on both removal paths); PalRLE GPU counts unclamped; connect/HELLO/close loop not rate-limited | PR #129 review | unscheduled |
 
 ## Wave B
 

@@ -661,4 +661,69 @@ mod tests {
         assert!(left_behind, "quinn never left a datagram in the FIFO");
         assert!(tr.stamped_total() > 0, "nothing ever departed");
     }
+
+    // -----------------------------------------------------------------------
+    // The endpoint must forget a connection once the server has dropped it
+    // -----------------------------------------------------------------------
+
+    /// Run the clock past every closing timer, polling the application events
+    /// the way the bridge does (a loss removes the connection there).
+    fn run_out_the_clock(pair: &mut Pair) -> bool {
+        let mut lost = false;
+        for _ in 0..400 {
+            pair.step_all(Duration::from_millis(50));
+            while let Some((_, ev)) = pair.server.poll_events() {
+                lost |= matches!(ev, quinn_proto::Event::ConnectionLost { .. });
+            }
+        }
+        lost
+    }
+
+    /// The peer closes: the server learns it as `ConnectionLost`, which removes
+    /// the connection from the table. quinn-proto's endpoint keeps a slab entry
+    /// and the connection-ID index entries until it is told `Drained`, and the
+    /// connection the server just dropped can no longer say so.
+    #[test]
+    fn a_connection_lost_to_the_peers_close_is_forgotten_by_the_endpoint() {
+        let mut pair = Pair::new(65536);
+        assert_eq!(pair.server.endpoint.open_connections(), 1, "precondition");
+        let now = pair.now;
+        pair.client.close(
+            now,
+            quinn_proto::VarInt::from_u32(7),
+            Bytes::from_static(b"bye"),
+        );
+        assert!(
+            run_out_the_clock(&mut pair),
+            "precondition: the loss surfaced"
+        );
+        assert!(pair.server.connections.is_empty());
+        assert_eq!(
+            pair.server.endpoint.open_connections(),
+            0,
+            "the endpoint still holds the dropped connection"
+        );
+    }
+
+    /// The server closes (a missed HELLO deadline, an eviction, a revoked
+    /// peer): the closed connection is reaped by `handle_timeout` once its
+    /// drain timer fires, and that reaping must reach the endpoint too.
+    #[test]
+    fn a_connection_the_server_closed_is_forgotten_by_the_endpoint() {
+        let mut pair = Pair::new(65536);
+        assert_eq!(pair.server.endpoint.open_connections(), 1, "precondition");
+        let now = pair.now;
+        pair.server_conn().close(
+            now,
+            quinn_proto::VarInt::from_u32(9),
+            Bytes::from_static(b"no HELLO"),
+        );
+        run_out_the_clock(&mut pair);
+        assert!(pair.server.connections.is_empty(), "precondition: reaped");
+        assert_eq!(
+            pair.server.endpoint.open_connections(),
+            0,
+            "the endpoint still holds the reaped connection"
+        );
+    }
 }
