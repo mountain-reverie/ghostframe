@@ -2,6 +2,16 @@
 # Stage 1a: toolchain base shared by the planner and builder stages.
 FROM ubuntu:24.04 AS base
 
+# The ffmpeg development packages (and clang, for ffmpeg-sys-next's bindgen) are
+# a BUILD dependency only: ghostframe-test-pattern reaches ghostframe-lib's
+# browserless harness through ghostframe-bench, and the harness links ffmpeg
+# as its independent decoder oracle. The daemon has no ffmpeg dependency
+# (ci/check-release-features.sh), and neither binary needs libav* or x264 at
+# run time: the runtime stage below carries none of them.
+# libva2 and libva-drm2 are listed in the runtime stage on their own:
+# libva-direct dlopens libva.so.2 and libva-drm.so.2, so ldd cannot show
+# them, and libavcodec60 used to pull them in.
+
 # rsync is required by ghostbridge/Makefile's sync-dist target. It sits in
 # this first apt layer, not in a RUN after the source COPYs: down there it was
 # re-run (apt-get update and a mirror round trip) on every source change.
@@ -18,7 +28,6 @@ RUN apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::Retrie
     libavdevice-dev \
     libclang-dev \
     clang \
-    libx264-dev \
     libx11-dev \
     libxext-dev \
     libxdamage-dev \
@@ -219,15 +228,11 @@ RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install
     mesa-utils \
     libgl1-mesa-dri \
     mesa-va-drivers \
+    libva2 \
+    libva-drm2 \
     libvulkan1 \
     mesa-vulkan-drivers \
     vulkan-tools \
-    libavcodec60 \
-    libavdevice60 \
-    libavutil58 \
-    libswscale7 \
-    libswresample4 \
-    libx264-164 \
     libopenh264-7 \
     && rm -rf /var/lib/apt/lists/*
 
