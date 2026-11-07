@@ -491,6 +491,85 @@ pub(crate) fn run(args: NetThreadArgs) {
 
         arm_timer(timer_fd.as_raw_fd(), client_net.poll_timeout(), base);
     }
+
+    close_and_flush(
+        &mut client_net,
+        udp_raw,
+        &mut frame_buf,
+        base,
+        CLOSE_FLUSH_BUDGET,
+    );
+}
+
+/// Total time the closing packet may spend waiting for the tsnet socket.
+const CLOSE_FLUSH_BUDGET: Duration = Duration::from_millis(100);
+
+/// Leaving on purpose (duration, Ctrl-C/SIGTERM through the CLI's quit flag,
+/// window close): tell the server, so it forgets the session now instead of
+/// at its idle timeout. One best-effort CONNECTION_CLOSE is sent and never
+/// retransmitted; if it is lost, the server's idle timeout covers it. The
+/// write gives up silently after `budget`, because `disconnect()` joins this
+/// thread before it drops the bridge, and a stalled reader must not hang it.
+fn close_and_flush(
+    client_net: &mut ghostframe_client_net::ClientNet,
+    fd: RawFd,
+    frame: &mut Vec<u8>,
+    base: Instant,
+    budget: Duration,
+) {
+    client_net.close(
+        ghostframe_client_net::CLOSE_CODE_CLIENT_GONE,
+        b"client closed",
+        Instant::now().duration_since(base).as_micros() as u64,
+    );
+    let give_up = Instant::now() + budget;
+    while let Some(out) = client_net.poll_transmit() {
+        ghostframe_tsnet::encode_frame_into(frame, &out.payload, &out.destination);
+        if !write_all_until(fd, frame, give_up) {
+            tracing::debug!("close flush abandoned: tsnet socket not writable in time");
+            break;
+        }
+    }
+}
+
+/// Write all of `buf` to a non-blocking `fd`, waiting for `POLLOUT` only
+/// until `give_up`. False if it could not finish.
+fn write_all_until(fd: RawFd, buf: &[u8], give_up: Instant) -> bool {
+    let mut off = 0;
+    while off < buf.len() {
+        // SAFETY: `fd` is valid and open; the slice is valid for its length.
+        let n = unsafe {
+            libc::write(
+                fd,
+                buf[off..].as_ptr() as *const libc::c_void,
+                buf.len() - off,
+            )
+        };
+        if n > 0 {
+            off += n as usize;
+            continue;
+        }
+        match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock => {
+                let left = give_up.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: single-element array, valid for the call.
+                unsafe {
+                    libc::poll(&mut pfd, 1, left.as_millis().max(1) as i32);
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -653,6 +732,81 @@ mod tests {
                 assert!(expected, "an unrecognized reason is still an eviction");
             }
             other => panic!("expected Disconnected, got {other:?}"),
+        }
+    }
+
+    fn socketpair() -> (RawFd, RawFd) {
+        let mut fds = [0i32; 2];
+        // SAFETY: valid 2-element array.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0);
+        (fds[0], fds[1])
+    }
+
+    fn connecting_client() -> (ghostframe_client_net::ClientNet, Instant) {
+        let cfg = ghostframe_client_net::ClientNetConfig {
+            server_name: "localhost".into(),
+            server_cert_sha256: [0; 32],
+            indices_raw_enabled: false,
+            supports_h264: false,
+            display: None,
+        };
+        let mut c = ghostframe_client_net::ClientNet::new(cfg, 0).unwrap();
+        c.connect("[::1]:443".parse().unwrap(), 0).unwrap();
+        (c, Instant::now())
+    }
+
+    #[test]
+    fn close_and_flush_writes_a_frame_to_the_socket() {
+        let (rd, wr) = socketpair();
+        let (mut c, base) = connecting_client();
+        // Drop the Initial so only what close_and_flush emits is counted.
+        while c.poll_transmit().is_some() {}
+        let mut buf = Vec::new();
+        close_and_flush(&mut c, wr, &mut buf, base, Duration::from_millis(100));
+        let mut got = [0u8; 8];
+        // SAFETY: valid fd and buffer.
+        let n = unsafe { libc::read(rd, got.as_mut_ptr().cast(), got.len()) };
+        assert!(n > 0, "a close frame must reach the socket");
+        // SAFETY: fds from socketpair.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+    }
+
+    #[test]
+    fn close_and_flush_gives_up_when_the_socket_is_full() {
+        let (rd, wr) = socketpair();
+        // Fill the buffer; the peer never reads.
+        let junk = [0u8; 4096];
+        loop {
+            // SAFETY: valid fd and buffer.
+            let n = unsafe { libc::write(wr, junk.as_ptr().cast(), junk.len()) };
+            if n < 0 {
+                break;
+            }
+        }
+        let (mut c, base) = connecting_client();
+        let mut buf = Vec::new();
+        let t = Instant::now();
+        close_and_flush(&mut c, wr, &mut buf, base, Duration::from_millis(100));
+        assert!(
+            Instant::now().duration_since(t) < Duration::from_millis(500),
+            "{:?}",
+            Instant::now().duration_since(t)
+        );
+        // SAFETY: fds from socketpair.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
         }
     }
 }

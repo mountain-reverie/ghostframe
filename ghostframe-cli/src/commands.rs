@@ -382,9 +382,13 @@ pub fn connect(
     // rather than from process start, so it times the session and not however
     // long the tailnet took to come up.
     let deadline = opts.duration.map(|d| Instant::now() + d);
-    let mut should_quit = move || match deadline {
-        Some(at) => Instant::now() >= at,
-        None => false,
+    install_quit_signals();
+    let mut should_quit = move || {
+        QUIT_SIGNALLED.load(std::sync::atomic::Ordering::Relaxed)
+            || match deadline {
+                Some(at) => Instant::now() >= at,
+                None => false,
+            }
     };
 
     let result = match backend.as_mut() {
@@ -406,6 +410,29 @@ pub fn connect(
     }
 
     result
+}
+
+static QUIT_SIGNALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_quit_signal(_: libc::c_int) {
+    QUIT_SIGNALLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Make SIGINT/SIGTERM end the session through the normal path, so the
+/// client sends its CONNECTION_CLOSE. No `SA_RESTART`, so `poll` returns
+/// at once; `SA_RESETHAND` makes a second signal kill the process.
+fn install_quit_signals() {
+    // SAFETY: the handler only stores to an atomic (async-signal-safe); the
+    // sigaction struct is zero-initialised and fully set before the call.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_quit_signal as extern "C" fn(libc::c_int) as usize;
+        sa.sa_flags = libc::SA_RESETHAND;
+        libc::sigemptyset(&mut sa.sa_mask);
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
 }
 
 /// How long one `poll(2)` call waits for either fd before looping again.

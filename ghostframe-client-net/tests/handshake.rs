@@ -1,7 +1,8 @@
 mod common;
 
 use common::{
-    admitting_server, client_ip, connected_session, install_gate, owner_identity, pinned_hash, pump,
+    admitting_server, client_ip, connected_session, install_gate, owner_identity, pinned_hash,
+    pump, shuttle,
 };
 use ghostframe_client_net::{ClientNet, ClientNetConfig, ClientNetEvent};
 use ghostframe_lib::transport::peer_auth::{PeerIdentity, PeerLookup, WhoIsError};
@@ -239,4 +240,60 @@ fn held_connections_are_bounded_per_peer() {
     assert!(server.held_overflow() > 0, "the rest were dropped");
     assert_eq!(server.take_peer_lookups().len(), 1, "still one lookup");
     assert!(server.connections.is_empty());
+}
+
+/// Step the pair for `micros` of virtual time; whether the server saw the
+/// connection end.
+fn server_sees_loss_within(
+    client: &mut ClientNet,
+    server: &mut QuicServer,
+    base: Instant,
+    now_us: &mut u64,
+    micros: u64,
+) -> bool {
+    let deadline = *now_us + micros;
+    let mut lost = false;
+    while *now_us < deadline && !lost {
+        let now = base + std::time::Duration::from_micros(*now_us);
+        shuttle(client, server, now, *now_us);
+        while let Some((_, ev)) = server.poll_events() {
+            lost |= matches!(ev, quinn_proto::Event::ConnectionLost { .. });
+        }
+        *now_us += 1_000;
+    }
+    lost
+}
+
+/// Negative control, and the behaviour before the fix: a client that merely
+/// stops (what `--duration` did) is invisible to the server for a second.
+#[test]
+fn client_that_just_stops_is_not_seen_by_the_server() {
+    let (mut client, mut server, _wt, mut now_us, base) = connected_session();
+    assert!(!server_sees_loss_within(
+        &mut client,
+        &mut server,
+        base,
+        &mut now_us,
+        1_000_000
+    ));
+}
+
+/// A client that leaves on purpose must tell the server: the server's
+/// connection reaches `ConnectionLost` within a second, not at its idle
+/// timeout. The native net thread calls `close` on every exit.
+#[test]
+fn client_close_is_seen_by_the_server_promptly() {
+    let (mut client, mut server, _wt, mut now_us, base) = connected_session();
+    client.close(
+        ghostframe_client_net::CLOSE_CODE_CLIENT_GONE,
+        b"test",
+        now_us,
+    );
+    assert!(server_sees_loss_within(
+        &mut client,
+        &mut server,
+        base,
+        &mut now_us,
+        1_000_000
+    ));
 }
