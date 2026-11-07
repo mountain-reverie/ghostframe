@@ -43,9 +43,18 @@ export interface SeqTile {
   frameSeq: number;
 }
 
-/** True when `a` is strictly newer than `b` (RFC 1982 serial arithmetic). */
+/** The wire's `frame_seq` is 31 bits: bit 31 is the tile-datagram flag. */
+const SEQ_MASK = 0x7fffffff;
+
+/**
+ * True when `a` is strictly newer than `b`: RFC 1982 serial arithmetic on the
+ * 31-bit wire `frame_seq`, as the core compares it (`frame_seq_is_newer`).
+ * A tile left unpainted for 2^30 frames (about 207 days at 60 fps) would
+ * compare wrongly; that is accepted.
+ */
 export function seqNewer(a: number, b: number): boolean {
-  return ((a - b) | 0) > 0;
+  const forward = (a - b) & SEQ_MASK;
+  return forward !== 0 && forward < 0x40000000;
 }
 
 function tileKey(t: { tileX: number; tileY: number }): number {

@@ -313,14 +313,47 @@ describe('newest frame_seq wins a tile across ticks', () => {
     expect(tl.screen(0, 0)).toBe(6);
   });
   it('compares frame_seq as serial numbers across a wrap', () => {
-    r.pushSolid(solid(0xfffffffe));
+    // The wire's frame_seq is 31 bits: the wrap is 0x7fffffff -> 0.
+    r.pushSolid(solid(0x7fffffff));
     present();
     r.pushSolid(solid(1));
     present();
     expect(tl.screen(0, 0)).toBe(1);
-    r.pushSolid(solid(0xfffffffd));
+    r.pushH264(h264(0), 0);
+    present();
+    expect(tl.ops.some((o) => o.kind === 'h264')).toBe(false);
+    r.pushSolid(solid(0x7ffffffe));
     present();
     expect(tl.screen(0, 0)).toBe(1);
+  });
+  it('a framebuffer resize forgets the ledger', () => {
+    const r2 = r as any;
+    r2.canvas = { width: 64, height: 64 };
+    r2.gpu.context.configure = () => {};
+    r2.gpu.presentFormat = 'bgra8unorm';
+    r2.framebuffer.resize = () => {};
+    r2.solidPipeline.updateCanvasSize = () => {};
+    r2.palrlePipeline.resize = () => {};
+    r2.cdf53Pipeline.resize = () => {};
+    r.pushSolid(solid(600));
+    present();
+    // 128x128 is 16 tiles in 4 columns: the ledger arrays keep their shape,
+    // so only the explicit reset can forget.
+    r.resize(128, 128);
+    r.pushSolid(solid(1));
+    present();
+    expect(tl.screen(0, 0)).toBe(1);
+  });
+  it('two entries for a tile in one tick leave the newest in the ledger', () => {
+    uploads();
+    r.pushCdf53(cdf(6));
+    r.pushCdf53(cdf(4));
+    present();
+    r.pushSolid(solid(5));
+    present();
+    // The fake draws the pass queue in order, so the tile shows 4; what
+    // matters is that Solid 5 is older than the 6 in the ledger and is dropped.
+    expect(tl.screen(0, 0)).not.toBe(5);
   });
   it('a session reset forgets the ledger', () => {
     r.pushSolid(solid(600));
