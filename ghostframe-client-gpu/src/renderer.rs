@@ -33,6 +33,16 @@ use ghostframe_protocol::tile::TILE_SIZE;
 /// Whether `width x height` is a size this renderer will allocate for.
 /// The same bound `ClientCore` enforces; repeated here because the renderer
 /// is a public API and must not trust that every caller went through it.
+/// The `frame_seq` a decoded picture belongs to: the pts it was fed with (a
+/// picture may come out on a later call than the access unit that made it),
+/// or `fallback` when the decoder lost it.
+fn h264_picture_seq(frame: &ghostframe_client_h264::decoder::HwFrame, fallback: u32) -> u32 {
+    frame
+        .pts()
+        .and_then(|p| u32::try_from(p).ok())
+        .unwrap_or(fallback)
+}
+
 fn dimensions_valid(width: u32, height: u32) -> bool {
     let range = 1..=ghostframe_client_core::MAX_FRAME_DIMENSION;
     range.contains(&width) && range.contains(&height)
@@ -233,6 +243,7 @@ pub struct Renderer {
     pending_palrle: Vec<(u32, u8, u8, u8, u8, Vec<u8>)>,
     /// `TileReady` tiles awaiting upload, batched by [`Renderer::flush`].
     pending_rgba: Vec<(u32, u8, u8, RgbaSrc)>,
+    /// Not cleared by a flush: it orders paints across flushes too.
     batch_seq: SeqLedger,
     /// Staging for `TileReady` pixel uploads; see [`UploadStaging`].
     upload_staging: UploadStaging,
@@ -578,6 +589,9 @@ impl Renderer {
                 let epoch = self.fb.epoch();
                 self.fb.resize(&ctx.device, &ctx.queue, width, height);
                 if self.fb.epoch() != epoch {
+                    // A new picture: what was painted on the old one says
+                    // nothing about this one.
+                    self.batch_seq.clear();
                     // The cached bind groups hold the old texture; drop them
                     // now rather than when each codec next draws, or the old
                     // framebuffer outlives the resize.
@@ -1002,7 +1016,6 @@ impl Renderer {
             }
             keep
         });
-        self.batch_seq.clear();
 
         recorded |= self
             .solid
@@ -1653,9 +1666,21 @@ impl Renderer {
         frames: Vec<ghostframe_client_h264::decoder::HwFrame>,
     ) -> bool {
         let mut any_blitted = false;
+        let mut blitted_seq: Option<u32> = None;
         for frame in frames {
-            if self.blit_h264_frame(ctx, frame_seq, &frame) {
+            let seq = h264_picture_seq(&frame, frame_seq);
+            if self.batch_seq.h264_stale(seq) {
+                // Older than a paint already on screen (a tile of a later
+                // frame, or a newer picture): it covers every tile, so
+                // drawing it would undo that paint. The access unit was
+                // decoded and answered; only its picture is dropped.
+                tracing::debug!(seq, "H.264 picture older than what is on screen: not drawn");
+                continue;
+            }
+            if self.blit_h264_frame(ctx, seq, &frame) {
                 any_blitted = true;
+                self.batch_seq.note_h264(seq);
+                blitted_seq = Some(seq);
             }
         }
         // Once after the loop, not once per frame inside it: an access unit
@@ -1663,9 +1688,9 @@ impl Renderer {
         // otherwise mark the ring dirty redundantly, and an access unit
         // that completed none (every frame dropped on a size mismatch)
         // would otherwise mark it dirty for nothing.
-        if any_blitted {
+        if let Some(seq) = blitted_seq {
             self.ring.mark_dirty_all();
-            self.supersede_cdf53(frame_seq);
+            self.supersede_cdf53(seq);
         }
         any_blitted
     }
@@ -1751,15 +1776,20 @@ impl Renderer {
         let frame_seq = self.h264_last_frame_seq.unwrap_or(0);
         match decoder.finish() {
             Ok(frames) => {
-                let mut any_blitted = false;
+                let mut blitted_seq: Option<u32> = None;
                 for frame in &frames {
-                    if self.blit_h264_frame(ctx, frame_seq, frame) {
-                        any_blitted = true;
+                    let seq = h264_picture_seq(frame, frame_seq);
+                    if self.batch_seq.h264_stale(seq) {
+                        continue;
+                    }
+                    if self.blit_h264_frame(ctx, seq, frame) {
+                        self.batch_seq.note_h264(seq);
+                        blitted_seq = Some(seq);
                     }
                 }
-                if any_blitted {
+                if let Some(seq) = blitted_seq {
                     self.ring.mark_dirty_all();
-                    self.supersede_cdf53(frame_seq);
+                    self.supersede_cdf53(seq);
                 }
             }
             Err(e) => tracing::warn!(error = %e, "H.264 finish (drain) failed"),
