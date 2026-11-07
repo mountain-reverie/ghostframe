@@ -180,6 +180,9 @@ pub(crate) struct AuMeta {
     /// manager adopts them and runs in observed mode. `None`: the stream is
     /// the one the manager's configured parameters describe.
     pub params: Option<StreamParams>,
+    /// How long the backend took to code the frame, microseconds, as
+    /// measured around the call (`encode_planned`); 0 where nothing coded it.
+    pub encode_us: u32,
 }
 
 impl AuMeta {

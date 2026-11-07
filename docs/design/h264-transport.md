@@ -476,6 +476,9 @@ cadence as `cumulative emit`; `io_bridge/frame.rs`). Fields:
 | skips | `frames_skipped_hold`, `frames_skipped_backpressure`, `queue_purged`, `queued_bytes`, `cache_fragments` |
 | stall | `h264_stalled_ms`, `stalls_inflight`, `stalls_no_progress`, `stalls_reset` |
 | ledger | `tx_recorded`, `tx_acked_live`, `tx_judged_lost`, `tx_forgotten`, `tx_acked_late`, `bwe_samples_seen` |
+| plan budget | `frame_cap_bytes`, `idr_cap_bytes`, `frames_over_cap`, `max_cap_ratio_pct` (section 10) |
+| probe pads | `pads_lost`, `probe_padding_windows`, `probe_padding_bytes` |
+| observed mode | `idr_backend_fallback`, `marks_observed`, `mark_unrepresentable`, `ltr_recoveries_requested`, `ltr_mark_failed_sent`, `backend_demotions`, `openh264_rate_refused` (section 10, "OpenH264 and observed mode") |
 
 `H264Stats` also holds `app_probes_skipped`, `p_verdicts_in_probe`,
 `verdicts_unknown_frame`, `probe_padding_datagrams`, which the log line omits
@@ -489,6 +492,46 @@ stalls also log one event each (`H.264 rate: moved in place`,
 `frames_idr` against `frames_sent` is the IDR tax; `tx_recorded` is at least the sum of
 its three outcomes; the gap is the outstanding count (not logged), exact only
 within one session and without ledger capacity evictions.
+
+The `h264 refs` line (same target and cadence) is the acked-reference
+manager's and the loop's view of the session. Counters are cumulative since the
+process started, except the manager's, which restart with each session (the
+manager is rebuilt); `*_p50` / `*_p95` / `*_p99` are over the last 256 samples
+and read 0 until 32 have been taken.
+
+| Group | Fields |
+|---|---|
+| plans | `frame_seq` (the frame the line was logged at), `backend`, `plans`, `holds` (frames the manager held for an IDR being delivered), `epoch_dropped`, `backend_failures`, `plan_mismatch` (an emitted header that did not match its plan; three in a row start an encoder-fault epoch) |
+| frame kinds | `p_healthy`, `p_recovery`, `recoveries` (episodes entered), `recovered` (left), `reroots`, `deadline_suspects` |
+| IDRs | `idr_session`, `idr_resolution`, `idr_client_reset`, `idr_encoder_fault`, `idr_mtu_shrink`, `idr_reissued`, `idr_probes`, `mtu_retired`, `mtu_retired_idr`, `client_resets` |
+| anchors | `candidates_marked`, `anchors_confirmed`, `late_confirm_ignored`, `mark_to_ack_ms_p50` / `_p95` (send to decoded, P-frame candidates only) |
+| client answers | `frame_acks_applied`, `frames_decoded_acked`, `frames_refused`, `suspect_overridden`, `verdicts`, `frames_dead` (refused, or suspect and then superseded by a decoded recovery) |
+| recovery cost | `dead_chain_ms_max` (the longest recovery episode, ms, from the frame decision that found no usable reference to the decoded re-root, or to the IDR that replaced it; a return from the tile codec starts a new episode), `reentries`, `reentry_bytes`, `anchor_age_ms` (at the last return from the tile codec) |
+| encoder | `encode_us_p50` / `_p99` (the backend call, measured by the encode path; 0 for the PCM test backend) |
+| rate | `rate_updates`, `rate_applies_up` / `_down`, `rate_sends`, `rate_sends_10s` |
+| probe raise | `probe_raise_windows` / `_frames` / `_bytes`, `raised_frame_lost`, `raised_frames_acked`, `raised_delivery_us_max` / `_mean` |
+
+The names the design note (section 9) gave, against what the code has:
+
+| Design name | Now |
+|---|---|
+| `idr_unexpected` | obsolete: the IDR causes are a closed list and every one is counted by name; an IDR the backend made unasked is `idr_backend_fallback`, a header that disagrees with its plan is `plan_mismatch` |
+| `frames_dead` | `frames_dead` (h264 refs) |
+| `verdict_overridden_by_decoded` | `suspect_overridden` |
+| `occupant_ignored` | `late_confirm_ignored` |
+| `fragments_retransmitted` | `idr_fragments_resent` + `probe_fragments_resent` (h264 stats); P fragments are never retransmitted by design, the loss path's total is `loss_retransmits` on the `loss path` line |
+| `probe_cap_raises` | `probe_raise_windows` / `_frames` / `_bytes` |
+| `max_frame_cap_hits` | `frames_over_cap`, `max_cap_ratio_pct` |
+| `dead_chain_ms_max` | `dead_chain_ms_max` |
+| mark-to-ack p50/p95 | `mark_to_ack_ms_p50`, `mark_to_ack_ms_p95` |
+| `encode_us` p50/p99 | `encode_us_p50`, `encode_us_p99` |
+| `anchor_age_frames/ms` | `anchor_age_ms` only (a time rule; the frame count is derived from it) |
+| `frames_single_frag_hit` | not kept: a suspect frame stops being counted at its first verdict, so it cannot say how many fragments it lost. `verdicts_p_frag / frames_suspect` is the mean fragments judged per hit frame (near 1: single-fragment hits) |
+| `reentry_bytes`, `plan_mismatch`, `p_healthy`, `p_recovery`, `reroots`, `recoveries`, `frames_refused`, `frames_decoded_acked`, `anchors_confirmed`, `rate_updates`, `h264_stalled_ms`, `frames_skipped_backpressure` | same names |
+| `idr_hold_ms` | `holds` (h264 refs), `frames_skipped_hold` (h264 stats): counts of frames, not time |
+| `encoder_bps_actual` / `_target` | `rate_target_bps`; the actual rate is not logged (bytes per frame are `frame_cap_bytes` bounded) |
+| `bwe_estimate_bps` | the `bwe periodic snapshot` line |
+| Phase A causes (`gop_periodic`, `loss_interim`) | gone with Phase A (B7b) |
 
 The reordering window (`reo_wnd`, `transmission_ledger.rs`) is on the `loss
 path` line (same target and cadence as

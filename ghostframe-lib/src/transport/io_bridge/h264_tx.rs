@@ -387,6 +387,9 @@ pub(super) struct H264Tx {
     pub(super) availability: super::h264_refs::H264Availability,
     pub(super) refs: Option<super::h264_refs::RefsState>,
     pub(super) refs_counters: super::h264_refs::RefsCounters,
+    /// Encode time of the last 256 frames coded, us (`encode_us` p50/p99 on
+    /// the `h264 refs` line). Survives the session like the counters.
+    pub(super) encode_us: crate::transport::ack_latency::AckLatencyTracker,
     /// The probe raise stays off until then (see `RAISE_LOSS_PAUSE`).
     pub(super) raise_paused_until: Option<std::time::Instant>,
     /// The rate target the backend was last planned with.

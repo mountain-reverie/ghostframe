@@ -301,6 +301,18 @@ pub struct RefsReport {
     pub mark_unrepresentable: u64,
     pub ltr_recoveries_requested: u64,
     pub ltr_mark_failed_sent: u64,
+    /// Frames that became dead (refused, or suspect and superseded), and the
+    /// longest recovery episode, ms.
+    pub frames_dead: u64,
+    pub dead_chain_ms_max: u64,
+    /// Send-to-decoded time of anchor-carrying P frames, ms, p50 and p95 over
+    /// the last 256; 0 until 32 have been confirmed.
+    pub mark_to_ack_ms_p50: u64,
+    pub mark_to_ack_ms_p95: u64,
+    /// Time the backend took to code a frame, us, p50 and p99 over the last
+    /// 256; 0 until 32 frames were timed.
+    pub encode_us_p50: u64,
+    pub encode_us_p99: u64,
 }
 
 /// Which `IdrCause` an IDR the manager planned is counted under.
@@ -612,6 +624,9 @@ impl IoBridge {
                 .filter(|_| au.meta.idr),
         };
         let len = au.payload.len();
+        if au.meta.encode_us > 0 {
+            self.h264.encode_us.record(u64::from(au.meta.encode_us));
+        }
         self.note_frame_cap(seq, len);
         self.note_raised_sent(seq, len, now);
         let frags = self.send_h264_frame(
@@ -890,7 +905,7 @@ impl IoBridge {
                 }
             }
         }
-        st.mgr.frame_ack(newest, decoded, refused);
+        st.mgr.frame_ack(newest, decoded, refused, now);
         self.h264.refs_counters.frame_acks_applied += 1;
         // Frames the client answered for are not in flight, whether or not all
         // their fragments were acknowledged, and an answer is progress.
@@ -1027,7 +1042,7 @@ impl IoBridge {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let had_idr_pending = st.mgr.pending_idr().is_some();
-        st.mgr.mode_reentry();
+        st.mgr.mode_reentry(now);
         if !had_idr_pending {
             st.reentry_anchor_age_ms = Some(age);
         }
@@ -1103,6 +1118,16 @@ impl IoBridge {
             .as_ref()
             .map(|r| r.mgr.stats())
             .unwrap_or_default();
+        let m2a = self
+            .h264
+            .refs
+            .as_ref()
+            .map_or([0; 2], |r| r.mgr.mark_to_ack_ms([50, 95]));
+        let enc = self
+            .h264
+            .encode_us
+            .percentiles([50, 99])
+            .map(|d| d.map_or(0, |d| d.as_micros() as u64));
         RefsReport {
             active: self.h264_refs_live(),
             backend: self.h264.backend_kind,
@@ -1159,6 +1184,12 @@ impl IoBridge {
             mark_unrepresentable: s.mark_unrepresentable,
             ltr_recoveries_requested: s.ltr_recoveries_requested,
             ltr_mark_failed_sent: s.ltr_mark_failed_sent,
+            frames_dead: s.frames_dead,
+            dead_chain_ms_max: s.dead_chain_ms_max,
+            mark_to_ack_ms_p50: m2a[0],
+            mark_to_ack_ms_p95: m2a[1],
+            encode_us_p50: enc[0],
+            encode_us_p99: enc[1],
         }
     }
 

@@ -315,7 +315,7 @@ impl Sim {
                 self.mgr.client_reset(ResetReason::DecoderFailure);
             }
             if sc.reentry_at.contains(&step) {
-                self.mgr.mode_reentry();
+                self.mgr.mode_reentry(now);
             }
             // Due events, in due order (stable: ties keep scheduling order).
             let mut due: Vec<(usize, Ev)> = Vec::new();
@@ -340,7 +340,7 @@ impl Sim {
                         newest,
                         decoded,
                         refused,
-                    } => self.mgr.frame_ack(newest, decoded, refused),
+                    } => self.mgr.frame_ack(newest, decoded, refused, now),
                     Ev::Verdict(s) => self.mgr.frame_suspect(s),
                     Ev::FragAck(s, i) => {
                         self.mgr.frag_acked(s, i, now);
@@ -1098,7 +1098,7 @@ fn frame_ack_applies_cumulative_masks_idempotently_and_counts_unknown_once() {
     let decoded = 0b110 | (1 << 20);
     let refused = 0b1;
     let was = h.m.stats().acks_unknown;
-    h.m.frame_ack(newest, decoded, refused);
+    h.m.frame_ack(newest, decoded, refused, Instant::now());
     let st = |h: &Hand, i: usize| h.m.frame_state(seqs[i]);
     assert_eq!(st(&h, 5), Some(FrameState::Dead));
     assert_eq!(st(&h, 4), Some(FrameState::Decoded));
@@ -1110,10 +1110,15 @@ fn frame_ack_applies_cumulative_masks_idempotently_and_counts_unknown_once() {
     );
     assert_eq!(st(&h, 0), Some(FrameState::Decoded));
     assert_eq!(h.m.stats().acks_unknown, was + 1);
+    assert_eq!(
+        h.m.stats().frames_dead,
+        1,
+        "the refused frame, counted once"
+    );
     // The same cumulative ack again changes nothing, not even the counter.
     let before = h.m.stats();
     for _ in 0..3 {
-        h.m.frame_ack(newest, decoded, refused);
+        h.m.frame_ack(newest, decoded, refused, Instant::now());
     }
     assert_eq!(h.m.stats(), before);
 }
@@ -1199,7 +1204,7 @@ fn tile_to_h264_reentry_is_a_reroot_from_the_anchor_or_the_idr_path() {
     // Without one (the IDR is still unconfirmed): probe it, no new IDR cause.
     let mut h = Hand::new();
     h.send(0);
-    h.m.mode_reentry();
+    h.m.mode_reentry(h.at(0));
     let p = h.send(1);
     assert_eq!(p.kind, PicKind::Recovery);
 }
@@ -1728,4 +1733,99 @@ fn wire_info_flags_a_target_mark_apart_from_a_carrier_mark() {
     .wire_info(None);
     assert_eq!(lt.flags, FRAME_FLAG_MARK_TARGET | FRAME_FLAG_TARGET_IS_LT);
     assert_eq!(lt.slots, 1);
+}
+
+#[test]
+fn a_lost_frame_costs_a_timed_recovery_and_a_dead_frame() {
+    let mut lost = false;
+    let sc = Script::new(200, move |step, plan| {
+        let mut f = Fate::default();
+        if step >= 60 && !lost && plan.kind == PicKind::Healthy {
+            lost = true;
+            f.lose = true;
+        }
+        f
+    });
+    let steps = sc.steps;
+    let sim = run_sim(sc);
+    let st = sim.mgr.stats();
+    assert_eq!(st.recovered, 1, "{st:?}");
+    // The episode is bounded by the run and is not instantaneous: the verdict
+    // and the re-root's ack take round trips.
+    assert!(st.dead_chain_ms_max > 0, "{st:?}");
+    assert!(
+        st.dead_chain_ms_max <= (steps as u64) * STEP.as_millis() as u64,
+        "{st:?}"
+    );
+    assert!(
+        st.frames_dead >= 1,
+        "frames died (refused or superseded): {st:?}"
+    );
+}
+
+#[test]
+fn anchor_candidates_are_timed_from_send_to_decoded() {
+    let mut sc = Script::new(1500, |_, _| Fate::default());
+    sc.cumulative = true;
+    let sim = run_sim(sc);
+    let st = sim.mgr.stats();
+    assert!(st.p_anchors_confirmed >= 32, "too few samples: {st:?}");
+    let [p50, p95] = sim.mgr.mark_to_ack_ms([50, 95]);
+    assert!(p50 > 0, "the percentile never moved");
+    assert!(p95 >= p50 && p95 <= 1000, "p50 {p50} p95 {p95}");
+}
+
+#[test]
+fn a_suspect_frame_the_recovery_supersedes_is_counted_dead() {
+    let mut h = Hand::new();
+    let idr = h.send(0);
+    h.m.frame_decoded(idr.frame_seq);
+    let lost = h.send(1);
+    h.m.frame_suspect(lost.frame_seq);
+    let r = h.send(2);
+    assert_eq!(r.kind, PicKind::Reroot);
+    assert_eq!(h.m.stats().frames_dead, 0, "suspect is a hypothesis");
+    // The re-root is decoded; the next plan leaves recovery and the suspect
+    // frame behind it is no longer waited for.
+    h.m.frame_decoded(r.frame_seq);
+    let _ = h.send(30);
+    assert_eq!(h.m.frame_state(lost.frame_seq), Some(FrameState::Dead));
+    assert_eq!(h.m.stats().frames_dead, 1);
+    assert_eq!(h.m.stats().dead_chain_ms_max, 300 - 20);
+}
+
+/// A loss, then the tile codec for a while, then the return: the episode is
+/// timed from the return, not from the loss.
+#[test]
+fn a_recovery_episode_excludes_the_time_spent_in_the_tile_codec() {
+    let mut h = Hand::new();
+    let idr = h.send(0);
+    h.m.frame_decoded(idr.frame_seq);
+    let lost = h.send(1);
+    h.m.frame_suspect(lost.frame_seq);
+    let r1 = h.send(2); // the episode begins at 20 ms
+    assert_eq!(r1.kind, PicKind::Reroot);
+    // H.264 is left; the stream returns at 1000 ms.
+    h.m.mode_reentry(h.at(100));
+    let r2 = h.send(101);
+    h.m.frame_decoded(r2.frame_seq);
+    let _ = h.send(110); // leaves recovery at 1100 ms
+    assert_eq!(h.m.stats().recovered, 1);
+    assert_eq!(h.m.stats().dead_chain_ms_max, 100, "{:?}", h.m.stats());
+}
+
+/// An episode healed by an IDR is the longest freeze there is, and counts.
+#[test]
+fn an_episode_healed_by_an_idr_is_timed() {
+    let mut h = Hand::new();
+    let idr = h.send(0);
+    h.m.frame_decoded(idr.frame_seq);
+    let lost = h.send(1);
+    h.m.frame_suspect(lost.frame_seq);
+    let r = h.send(2); // the episode begins at 20 ms
+    assert_eq!(r.kind, PicKind::Reroot);
+    h.m.client_reset(ResetReason::DecoderFailure);
+    let i = h.send(50); // the IDR leaves at 500 ms
+    assert_eq!(i.kind, PicKind::Idr);
+    assert_eq!(h.m.stats().dead_chain_ms_max, 480, "{:?}", h.m.stats());
 }
