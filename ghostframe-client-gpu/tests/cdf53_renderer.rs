@@ -551,3 +551,60 @@ fn a_tile_drawn_by_a_later_flush_reaches_the_published_damage() {
         "tiles drawn later never reached the damage"
     );
 }
+
+#[test]
+fn a_late_h264_picture_does_not_cancel_the_cdf53_tiles_of_a_later_frame() {
+    // H.264 -> tiles at frame 301: its passes wait for a flush. Picture 300
+    // comes out late (the decoder delays its output).
+    let mut rig = Rig::new(32, 32);
+    let w = wire(2, 1, 1);
+    for i in 0..w.passes.len() {
+        rig.apply(pass_event(&w, i, 0, 0, 301, true));
+    }
+    // The picture is older than a waiting pass: not drawn at all...
+    assert!(!rig.r.debug_accept_h264_picture(300));
+    // ...and were it drawn, it must not cancel the later frame's tile.
+    rig.r.supersede_cdf53(300);
+    assert!(rig.r.has_deferred_work(), "the 301 tile was cancelled");
+    rig.flush();
+    let fb = rig.r.debug_read_framebuffer(&rig.ctx);
+    assert_eq!(
+        rig.tile(&fb, 0, 0),
+        cpu_picture(&w, w.passes.len()).unwrap(),
+        "the tiles of frame 301 were cancelled by picture 300"
+    );
+}
+
+#[test]
+fn an_h264_picture_older_than_a_tile_on_screen_is_not_drawn_and_a_newer_one_is() {
+    let mut rig = Rig::new(32, 32);
+    rig.apply(solid_event(0, 0, 301, [10, 20, 30, 255]));
+    rig.flush();
+    assert!(
+        !rig.r.debug_accept_h264_picture(300),
+        "stale: tile 301 is on screen"
+    );
+    assert!(rig.r.debug_accept_h264_picture(301), "equal is drawn");
+    assert!(
+        !rig.r.debug_accept_h264_picture(300),
+        "older than the picture drawn"
+    );
+}
+
+#[test]
+fn h264_pictures_and_tiles_are_ordered_across_the_31_bit_wrap() {
+    let mut rig = Rig::new(32, 32);
+    rig.apply(solid_event(0, 0, 0x7FFF_FFFF, [10, 20, 30, 255]));
+    rig.flush();
+    assert!(rig.r.debug_accept_h264_picture(0x7FFF_FFFF));
+    assert!(
+        rig.r.debug_accept_h264_picture(0),
+        "a post-wrap picture is newer"
+    );
+    assert!(!rig.r.debug_accept_h264_picture(0x7FFF_FFFE));
+    // A post-wrap tile paints over the pre-wrap one, and is not dropped.
+    rig.apply(solid_event(0, 0, 1, [1, 2, 3, 255]));
+    rig.flush();
+    let fb = rig.r.debug_read_framebuffer(&rig.ctx);
+    assert!(rig.tile(&fb, 0, 0).chunks(4).all(|p| p == [3, 2, 1, 255]));
+}
