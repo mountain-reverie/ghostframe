@@ -134,8 +134,20 @@ impl AckLatencyTracker {
     /// `Vec`) — see the module doc for why that's an acceptable query-time
     /// cost.
     pub fn p95(&self) -> Option<Duration> {
+        self.percentile(95)
+    }
+
+    /// The `pct`th percentile (1..=100) of the window by the same
+    /// nearest-rank rule as [`Self::p95`], and `None` under the same
+    /// [`MIN_SAMPLES`] condition. For the `h264 stats` and `h264 refs` lines.
+    pub fn percentile(&self, pct: u64) -> Option<Duration> {
+        self.percentiles([pct])[0]
+    }
+
+    /// Several percentiles from one sort of the window.
+    pub fn percentiles<const N: usize>(&self, pcts: [u64; N]) -> [Option<Duration>; N] {
         if self.len < MIN_SAMPLES {
-            return None;
+            return [None; N];
         }
         let mut buf = [0u64; WINDOW];
         buf[..self.len].copy_from_slice(&self.samples[..self.len]);
@@ -143,10 +155,12 @@ impl AckLatencyTracker {
         sorted.sort_unstable();
 
         let n = self.len as u64;
-        // ceil(0.95 * n), 1-indexed rank into the sorted sample.
-        let rank = (95 * n).div_ceil(100);
-        let idx = (rank.saturating_sub(1) as usize).min(self.len - 1);
-        Some(Duration::from_micros(sorted[idx]))
+        pcts.map(|pct| {
+            // ceil(pct/100 * n), 1-indexed rank into the sorted sample.
+            let rank = (pct.clamp(1, 100) * n).div_ceil(100);
+            let idx = (rank.saturating_sub(1) as usize).min(self.len - 1);
+            Some(Duration::from_micros(sorted[idx]))
+        })
     }
 }
 
@@ -266,5 +280,21 @@ mod tests {
             b.record(v);
         }
         assert_eq!(a.p95(), b.p95());
+    }
+
+    #[test]
+    fn percentiles_are_ordered_and_p95_is_the_95th() {
+        let mut t = AckLatencyTracker::new();
+        for v in 1..=100u64 {
+            t.record(v);
+        }
+        assert_eq!(t.percentile(50), Some(Duration::from_micros(50)));
+        assert_eq!(t.percentile(99), Some(Duration::from_micros(99)));
+        assert_eq!(t.percentile(95), t.p95());
+        assert_eq!(t.percentile(100), Some(Duration::from_micros(100)));
+        assert_eq!(
+            t.percentiles([50, 99]),
+            [t.percentile(50), t.percentile(99)]
+        );
     }
 }

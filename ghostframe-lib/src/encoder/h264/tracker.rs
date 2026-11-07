@@ -224,12 +224,16 @@ impl FrameTable {
 
     /// Suspect frames older than `before` (by seq) become dead: the chain has
     /// moved past them.
-    pub(crate) fn supersede_suspects(&mut self, before: u32) {
+    /// Returns how many changed.
+    pub(crate) fn supersede_suspects(&mut self, before: u32) -> u32 {
+        let mut n = 0;
         for f in self.ring.iter_mut().flatten().chain(self.idr.as_mut()) {
             if seq_lt(f.seq, before) && f.state == FrameState::Suspect {
                 f.state = FrameState::Dead;
+                n += 1;
             }
         }
+        n
     }
 
     /// Mark every `Sent` frame older than `deadline` as suspect; returns how

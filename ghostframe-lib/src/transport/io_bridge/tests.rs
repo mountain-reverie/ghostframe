@@ -1091,6 +1091,7 @@ impl FrameBackend for RecordingBackend {
                             header: Some(f.header),
                             ref_seq: None,
                             params,
+                            encode_us: 0,
                         },
                     },
                     "openh264",
@@ -1117,6 +1118,7 @@ impl FrameBackend for RecordingBackend {
                         header: Some(req.plan.slice_header(&StreamParams::writer())),
                         ref_seq: req.plan.ref_frame_seq(),
                         params: None,
+                        encode_us: 0,
                     },
                 },
                 "libva-direct",
@@ -8268,6 +8270,7 @@ fn au_for(
             header: Some(plan.slice_header(&crate::encoder::h264::syntax::StreamParams::writer())),
             ref_seq: plan.ref_frame_seq(),
             params: None,
+            encode_us: 0,
         },
     }
 }
@@ -9780,4 +9783,40 @@ async fn an_encoded_frame_that_cannot_be_sent_is_recovered_in_observed_mode() {
     );
     let r = bridge.h264_refs_report();
     assert_eq!((r.idr_session, r.ltr_recoveries_requested), (1, 1), "{r:?}");
+}
+
+/// The `h264 refs` line's `encode_us` percentiles come from the time the
+/// encode path stamped on each access unit, and a refusal is a dead frame.
+#[tokio::test]
+async fn the_refs_report_carries_encode_time_percentiles_and_dead_frames() {
+    let mut bridge = acked_refs_bridge();
+    plan_commit(&mut bridge, 1).expect("the IDR");
+    ack_every_fragment(&mut bridge, 1);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(1, 1, 0));
+    let mut sent = vec![1u32];
+    for seq in 2..=80u32 {
+        let now = now_std();
+        let Some(req) = bridge.h264_refs_plan(seq, (64, 64), now, false) else {
+            continue;
+        };
+        let mut au = au_for(&req.plan);
+        au.meta.encode_us = 1_000 + seq * 10;
+        if bridge.h264_refs_commit(&req.plan, au, &refs_meta(), 1_200, now) {
+            sent.push(seq);
+        }
+    }
+    let r = bridge.h264_refs_report();
+    assert!(
+        r.encode_us_p50 >= 1_000 && r.encode_us_p99 >= r.encode_us_p50,
+        "p50 {} p99 {}",
+        r.encode_us_p50,
+        r.encode_us_p99
+    );
+    assert!(r.encode_us_p99 <= 1_000 + 80 * 10, "{}", r.encode_us_p99);
+    assert_eq!(r.frames_dead, 0, "premise: nothing refused yet");
+    // The newest frame sent is refused (bit 0 of the refused mask).
+    let newest = *sent.last().expect("frames were sent");
+    ack_every_fragment(&mut bridge, newest);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(newest, 0, 1));
+    assert_eq!(bridge.h264_refs_report().frames_dead, 1);
 }

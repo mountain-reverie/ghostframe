@@ -257,6 +257,13 @@ pub(crate) struct RefStats {
     /// `LtrMarkFailed` sent: for lost or refused carriers, and for marks the
     /// wire cannot describe (`mark_unrepresentable`).
     pub ltr_mark_failed_sent: u64,
+    /// Frames that became dead: refused by the client, or suspect and
+    /// superseded by a recovery that was decoded (a loss the chain healed).
+    pub frames_dead: u64,
+    /// The longest a recovery episode lasted, ms: from the frame decision that
+    /// found no usable `prev` to the one that saw the re-root decoded. How long
+    /// the picture was frozen or repaired by recovery frames.
+    pub dead_chain_ms_max: u64,
 }
 
 /// What [`RefManager::frame_sent`] found when it replayed the emitted header.
@@ -399,6 +406,14 @@ pub(crate) struct RefManager {
     /// want of progress: its one re-send does not back the timeout off.
     idr_mtu_dead: bool,
     stats: RefStats,
+    /// When the current recovery episode began (the frame decision that found
+    /// no usable `prev`); `None` while healthy.
+    recovering_since: Option<Instant>,
+    /// The clock of the frame ack being applied (`frame_ack`), so a decoded
+    /// anchor candidate can be timed against its send.
+    ack_now: Option<Instant>,
+    /// Send-to-decoded time of the P frames that carried an anchor mark, us.
+    mark_to_ack: crate::transport::ack_latency::AckLatencyTracker,
     // ---- observed mode
     /// `idr_pic_id` of the epoch's IDR: feedback names the IDR period.
     idr_pic_id: u32,
@@ -438,6 +453,9 @@ impl RefManager {
             idr_backoff: 0,
             idr_mtu_dead: false,
             stats: RefStats::default(),
+            recovering_since: None,
+            ack_now: None,
+            mark_to_ack: Default::default(),
             idr_pic_id: 0,
             events: Vec::new(),
             last_intent_at: None,
@@ -451,6 +469,14 @@ impl RefManager {
 
     pub(crate) fn epoch(&self) -> u32 {
         self.epoch
+    }
+
+    /// Percentiles of the send-to-decoded time of anchor candidates (P
+    /// frames), ms; 0 until 32 have been confirmed.
+    pub(crate) fn mark_to_ack_ms(&self, pcts: [u64; 2]) -> [u64; 2] {
+        self.mark_to_ack
+            .percentiles(pcts)
+            .map(|d| d.map_or(0, |d| d.as_millis() as u64))
     }
 
     pub(crate) fn stats(&self) -> RefStats {
@@ -542,6 +568,8 @@ impl RefManager {
         self.epoch += 1;
         self.table.clear();
         self.chain = Chain::Healthy;
+        // `recovering_since` stays: the IDR this epoch begins with ends the
+        // episode when it is sent (the longest freezes are healed that way).
         self.prev = None;
         self.dpb = EncDpb::default();
         self.enc_model = DecoderModel::new(self.cfg.params);
@@ -660,7 +688,7 @@ impl RefManager {
     /// frame is a re-root P from the newest confirmed anchor, whatever the
     /// healthy chain was; with no anchor the generic path probes or re-sends
     /// the IDR.
-    pub(crate) fn mode_reentry(&mut self) {
+    pub(crate) fn mode_reentry(&mut self, now: Instant) {
         if self.pending_idr.is_some() {
             return;
         }
@@ -672,6 +700,17 @@ impl RefManager {
                 last_reroot_at: None,
                 reroots: Vec::new(),
             };
+            // The episode starts here: the time spent in the tile codec was
+            // not a frozen H.264 picture.
+            self.recovering_since = Some(now);
+        }
+    }
+
+    /// A recovery episode ended at `now`: fold its length into the maximum.
+    fn end_recovery_episode(&mut self, now: Instant) {
+        if let Some(t) = self.recovering_since.take() {
+            let ms = now.saturating_duration_since(t).as_millis() as u64;
+            self.stats.dead_chain_ms_max = self.stats.dead_chain_ms_max.max(ms);
         }
     }
 
@@ -732,7 +771,13 @@ impl RefManager {
                 self.idr_backoff = 0;
                 self.slot_confirmed_once[k] = true;
                 self.stats.anchors_confirmed += 1;
-                if self.table.get(seq).is_some_and(|f| f.kind != PicKind::Idr) {
+                if let Some(f) = self.table.get(seq).filter(|f| f.kind != PicKind::Idr) {
+                    // An IDR's clock restarts when it is delivered, so only a
+                    // P candidate says how long a mark takes to be confirmed.
+                    if let Some(now) = self.ack_now {
+                        let us = now.saturating_duration_since(f.sent_at).as_micros();
+                        self.mark_to_ack.record(us.min(u128::from(u64::MAX)) as u64);
+                    }
                     self.stats.p_anchors_confirmed += 1;
                     if self.cfg.observed {
                         // The mark happened at the client: tell the library,
@@ -780,12 +825,21 @@ impl RefManager {
         if self.table.get(seq).is_none() {
             return self.note_unknown(seq);
         }
-        self.table.set_dead(seq);
+        if self.table.set_dead(seq) {
+            self.stats.frames_dead += 1;
+        }
     }
 
     /// The 0x0A frame ack: bit `i` of each mask is frame `newest_seq - i`.
     /// Cumulative, so repeats are expected and harmless.
-    pub(crate) fn frame_ack(&mut self, newest_seq: u32, decoded_mask: u64, refused_mask: u64) {
+    pub(crate) fn frame_ack(
+        &mut self,
+        newest_seq: u32,
+        decoded_mask: u64,
+        refused_mask: u64,
+        now: Instant,
+    ) {
+        self.ack_now = Some(now);
         for i in 0..64u32 {
             let seq = newest_seq.wrapping_sub(i) & 0x7FFF_FFFF;
             if decoded_mask >> i & 1 == 1 {
@@ -794,6 +848,7 @@ impl RefManager {
                 self.frame_refused(seq);
             }
         }
+        self.ack_now = None;
     }
 
     // ------------------------------------------------------------ planning
@@ -1061,7 +1116,8 @@ impl RefManager {
                     }
                     self.chain = Chain::Healthy;
                     self.stats.recovered += 1;
-                    self.table.supersede_suspects(last);
+                    self.end_recovery_episode(now);
+                    self.stats.frames_dead += u64::from(self.table.supersede_suspects(last));
                 }
             }
         }
@@ -1074,6 +1130,7 @@ impl RefManager {
                         reroots: Vec::new(),
                     };
                     self.stats.recoveries += 1;
+                    self.recovering_since = Some(now);
                 }
                 None if self.cfg.observed => return self.no_anchor_observed(frame_seq, now),
                 None => return Plan::Frame(self.no_anchor_plan(frame_seq, now)),
@@ -1428,6 +1485,7 @@ impl RefManager {
             self.idr_progress_at = Some(now);
             self.prev = usable.then_some(seq);
             self.chain = Chain::Healthy;
+            self.end_recovery_episode(now);
             self.pending_idr = None;
             match eff.idr_cause {
                 Some(IdrCause::SessionStart) => self.stats.idr_session += 1,
@@ -1568,6 +1626,7 @@ impl RefManager {
             self.idr_progress_at = Some(now);
             self.prev = usable.then_some(seq);
             self.chain = Chain::Healthy;
+            self.end_recovery_episode(now);
             self.pending_idr = None;
             match plan.idr_cause {
                 Some(IdrCause::SessionStart) => self.stats.idr_session += 1,

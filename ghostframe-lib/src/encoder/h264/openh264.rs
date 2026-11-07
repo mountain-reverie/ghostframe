@@ -564,6 +564,7 @@ impl OpenH264Backend {
                 params: header.idr.then_some(params),
                 header: Some(header),
                 ref_seq: None,
+                encode_us: 0,
             },
             payload,
         })

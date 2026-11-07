@@ -160,6 +160,16 @@ healthy H.264 resets it). The headroom guard reads the bandwidth *estimate*
 estimate is back over 2 Mbit/s and the screen has been idle for 2 s);
 `loss_override` is off unless `GHOSTFRAME_LOSS_OVERRIDE=1`.
 
+The `h264 refs` line (same target and cadence) is the manager's side: `plans`,
+`holds`, `p_healthy` / `p_recovery`, `recoveries` / `recovered`, anchors
+(`candidates_marked`, `anchors_confirmed`, `late_confirm_ignored`,
+`mark_to_ack_ms_p50` / `_p95`), what the client answered (`frames_decoded_acked`,
+`frames_refused`, `suspect_overridden`, `frames_dead`), and the cost of a loss:
+`dead_chain_ms_max` (longest recovery episode; the longest the picture was
+repaired rather than current), `reentry_bytes`, and `encode_us_p50` / `_p99`
+(the encode call). Percentiles read 0 until 32 samples. Every field is listed in
+`docs/design/h264-transport.md` section 8.
+
 Every H.264 session is an **acked-reference ("refs") session** (HELLO 0x04; a
 client without it is served the tile codec): the `RefManager` plans each frame
 and recovers from loss from an acknowledged anchor, not an IDR. The only IDRs
@@ -233,7 +243,7 @@ With `GHOSTFRAME_DAMAGE_MODE=shadow` or `on` the daemon also logs a cumulative
 
 `h264 stats` also carries `rate_target_bps` and the stall counters.
 `h264 stats` names the `backend` (`libva-direct`, `openh264`, `pcm`; the
-`h264 refs` line has `backend` too, but none of the rest) and, for a backend
+`h264 refs` line has `backend` too, and the manager's own counters) and, for a backend
 with its own reference structure (openh264: the manager runs in observed mode,
 reading each access unit's slice header), `idr_backend_fallback`
 (an IDR the backend made unasked, or a stream moved down a step), `marks_observed`,

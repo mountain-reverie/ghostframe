@@ -243,6 +243,7 @@ impl H264Backend for PcmBackend {
                 header: Some(header),
                 ref_seq,
                 params: None,
+                encode_us: 0,
             },
         })
     }

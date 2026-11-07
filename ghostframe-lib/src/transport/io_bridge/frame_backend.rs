@@ -422,7 +422,11 @@ pub(crate) fn encode_planned(
     for fb in &req.feedback {
         backend.feedback(*fb);
     }
-    backend.encode(view, &req.plan, &req.refs)
+    let t = std::time::Instant::now();
+    let mut au = backend.encode(view, &req.plan, &req.refs)?;
+    let took = std::time::Instant::now().saturating_duration_since(t);
+    au.meta.encode_us = took.as_micros().min(u128::from(u32::MAX)) as u32;
+    Ok(au)
 }
 
 /// A plan-executing backend, the frame size and the choice it was opened for.
@@ -838,6 +842,8 @@ mod backend_choice_tests {
                 .lock()
                 .unwrap()
                 .push(format!("encode {}", plan.frame_seq));
+            // Long enough for the stamp around the call to read non-zero.
+            std::thread::sleep(std::time::Duration::from_millis(2));
             Ok(EncodedAu {
                 payload: vec![0, 0, 0, 1],
                 meta: AuMeta {
@@ -845,6 +851,7 @@ mod backend_choice_tests {
                     header: None,
                     ref_seq: None,
                     params: None,
+                    encode_us: 0,
                 },
             })
         }
@@ -1170,7 +1177,12 @@ mod backend_choice_tests {
             uv_stride: 128,
             uv_offset: 128 * 128,
         };
-        encode_planned(&mut b, &view, &req).unwrap();
+        let au = encode_planned(&mut b, &view, &req).unwrap();
+        assert!(
+            au.meta.encode_us >= 1_000,
+            "the encode time was not stamped: {}",
+            au.meta.encode_us
+        );
         assert_eq!(
             *log.lock().unwrap(),
             vec![

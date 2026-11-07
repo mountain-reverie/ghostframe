@@ -815,6 +815,7 @@ impl Session {
                         header: Some(header),
                         ref_seq,
                         params: None,
+                        encode_us: 0,
                     },
                     payload,
                 })
