@@ -432,6 +432,15 @@ impl IoBridge {
         self.probe_stats_publish.clone()
     }
 
+    /// Clone of the scheduler's record of tiles that have had a pass 0 sent.
+    /// Call before moving `self` into a task; read after aborting it.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn pass0_sent_handle(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(u8, u8)>>> {
+        self.scheduler.pass0_sent_handle()
+    }
+
     /// Drive exactly one injected frame: enqueue its work, then attempt the
     /// drain. Returns the number of items `apply_injected_frame` actually
     /// enqueued into the scheduler — NOT the number of items submitted in
