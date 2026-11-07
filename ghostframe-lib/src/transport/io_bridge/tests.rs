@@ -7976,7 +7976,7 @@ async fn a_machine_with_no_h264_encoder_latches_h264_off_for_the_process() {
     assert!(bridge.adaptation_context.h264_encoder_unavailable);
     assert!(
         !log_has(&log, "finish_h264 "),
-        "there is no Phase A to fall back to"
+        "there is no other H.264 path to fall back to"
     );
     // Not a session matter: a new session, and a different picture size, leave
     // the latch where it is.
@@ -8289,7 +8289,7 @@ fn acked_refs_bridge() -> IoBridge {
 
 /// A manager left over from a session with 0x04 must not serve the next
 /// session's client, which sends no v2 feedback: that client's reset requests
-/// and verdicts reach no manager (and there is no Phase A to answer them).
+/// and verdicts reach no manager (and nothing else answers them).
 #[tokio::test]
 async fn a_later_client_without_the_v2_feedback_is_not_served_by_the_old_manager() {
     use ghostframe_protocol::feedback_stream::{ResetReason, ResetRequest};
@@ -8778,7 +8778,7 @@ async fn a_frame_ack_blackout_with_the_transport_acks_flowing_is_not_a_stall() {
 
 /// A backend whose IDRs work and whose P frames all fail: each IDR is decoded
 /// and confirms candidate 0, but no P is ever an anchor, so the run is not
-/// cleared and Phase A takes over after the third fault.
+/// cleared and H.264 is made unavailable after the third fault.
 #[tokio::test]
 async fn a_backend_that_fails_every_p_frame_is_given_up_on() {
     let mut bridge = acked_refs_bridge();
@@ -8922,7 +8922,7 @@ fn refs_oversize_drain(bridge: &mut IoBridge) -> usize {
 
 /// On an acked-reference session a retired P-frame fragment is a lost frame
 /// to the manager: suspect, then a recovery from the anchor at the new size.
-/// It is not the Phase A MtuShrink IDR request, and no IDR is cut.
+/// No IDR is cut.
 #[tokio::test(start_paused = true)]
 async fn refs_session_oversize_p_fragment_is_suspect_and_recovers_from_the_anchor() {
     use crate::encoder::h264::tracker::{FrameState, PicKind};
@@ -8969,7 +8969,7 @@ async fn refs_session_oversize_p_fragment_is_suspect_and_recovers_from_the_ancho
 
 /// The IDR in flight is the frame whose fragments outgrow the connection: it
 /// cannot complete, so the manager abandons it and sends it again, cut for the
-/// new size, counted as an MtuShrink IDR. No Phase A request, no wait on the
+/// new size, counted as an MtuShrink IDR, with no wait on the
 /// dead IDR's timeout.
 #[tokio::test(start_paused = true)]
 async fn refs_session_oversize_idr_fragment_abandons_the_idr_and_sends_it_again() {

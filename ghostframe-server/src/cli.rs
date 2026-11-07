@@ -5,9 +5,10 @@
     name = "ghostframe-server",
     version,
     about = "Serve this user's X session to ghostframe clients over a Tailscale tailnet",
-    after_help = "H.264: GHOSTFRAME_H264_BACKEND=auto|vaapi|openh264|ffmpeg picks the encoder \
+    after_help = "H.264: GHOSTFRAME_H264_BACKEND=auto|vaapi|openh264 picks the encoder \
         (auto: VA-API when the machine has it, else the OpenH264 library if installed; \
-        vaapi never loads it). OpenH264 Video Codec provided by Cisco Systems, Inc. \
+        vaapi never loads it). With neither, or past OpenH264's 1920x1080 at 30 fps with no \
+        VA-API, the session stays on the lossless tile codec. OpenH264 Video Codec provided by Cisco Systems, Inc. \
         Cisco's patent grant covers only the binary Cisco distributes; a distribution-built \
         library carries none, and patent licensing is the operator's. See NOTICE."
 )]

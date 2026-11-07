@@ -29,9 +29,11 @@ use crate::transport::transmission_ledger::Transmission;
 /// beyond `max(this, ceil(2 * srtt / frame interval) + 8)` mean the path has
 /// stopped carrying the stream.
 pub(super) const STALL_INFLIGHT_FLOOR: u32 = 32;
-/// `h264_stalled` (b): no H.264 fragment acknowledged for this long while
-/// frames are in flight. (A large IDR on a slow link takes seconds to drain;
-/// a fragment at a time is progress, a whole frame is not the right unit.)
+/// `h264_stalled` (b): a frame was sent after the client last made progress
+/// (the decode clock: a frame newly decoded, an IDR fragment acknowledged, a P
+/// fragment acknowledged while the client is not refusing) and this long has
+/// passed since. (A large IDR on a slow link takes seconds to drain; a
+/// fragment at a time is progress, a whole frame is not the right unit.)
 pub(super) const STALL_NO_PROGRESS: std::time::Duration = std::time::Duration::from_millis(500);
 /// `h264_stalled` (c): honoured client reset requests (each one an IDR the
 /// server made) that raise the flag: this many within [`STALL_RESET_WINDOW`].
@@ -623,10 +625,11 @@ impl IoBridge {
     /// just before the classifier runs.
     ///
     /// Raised by any of: (a) unresolved frames beyond
-    /// [`stall_inflight_bound`]; (b) frames in flight and none fully
-    /// acknowledged for [`STALL_NO_PROGRESS`] (Phase A: progress is any H.264
-    /// fragment the 0x06 acknowledgements name; the frame-ack datagram does
-    /// not exist yet); (c) [`STALL_RESET_COUNT`] honoured client reset
+    /// [`stall_inflight_bound`]; (b) a frame sent after the last progress, and
+    /// [`STALL_NO_PROGRESS`] since (progress is the decode clock:
+    /// a frame newly decoded per the 0x0A frame ack, an IDR fragment
+    /// acknowledged, or a P fragment acknowledged unless the client has refused
+    /// a frame since its last decode); (c) [`STALL_RESET_COUNT`] honoured client reset
     /// requests within [`STALL_RESET_WINDOW`] (see
     /// [`Self::note_h264_reset_honoured`]).
     pub(super) fn update_h264_stall(&mut self, now: std::time::Instant) -> bool {
@@ -720,7 +723,7 @@ impl IoBridge {
                 st.mgr.idr_abandoned();
             }
         }
-        // Only frames sent after this count for the stall flag (the Phase A
+        // Only frames sent after this count for the stall flag (and see
         // `ignore_before`): the last ones were purged or will never be
         // answered, and nothing is sent while the tile codec has the screen.
         self.h264.last_sent_at = None;

@@ -899,8 +899,8 @@ pub(crate) fn emitter_config() -> &'static EmitterConfig {
 /// `None` when unset or blank. Cached: a device that changed mid-process would
 /// make one session's contexts disagree with each other.
 ///
-/// **Wired:** `encoder::vaapi_device::vaapi_device_path()` applies it at the
-/// three `h264_vaapi` context-creation sites.
+/// **Wired:** `encoder::h264::vaapi_direct::vaapi_device_path()` applies it
+/// where libva-direct opens its device.
 pub(crate) fn vaapi_device_override() -> Option<&'static str> {
     static DEV: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     DEV.get_or_init(|| vaapi_device_from_lookup(|k| std::env::var(k).ok()))

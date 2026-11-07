@@ -29,8 +29,9 @@
 //!
 //! Not on these sessions: the periodic GOP IDR, the loss-triggered IDR, the
 //! IDR hold (the manager's own `Plan::Hold`), the rate-change reopen (the rate
-//! moves in place) and the H.264 XOR parity. A client without 0x04, or a
-//! backend that cannot execute plans, keeps the Phase A policy (`h264_tx`).
+//! moves in place) and the H.264 XOR parity. A client without 0x04 is served the
+//! tile codec; a worker whose backends all refuse answers
+//! `H264Reply::Unavailable` and the bridge latches H.264 off (`H264Availability`).
 
 use std::time::{Duration, Instant};
 
@@ -1035,8 +1036,7 @@ impl IoBridge {
 
     /// The rate policy for a frame on an acked-reference session. The encoder
     /// changes rate in place, so a change is a plain rate update: no IDR, no
-    /// reopen, no GOP, and none of Phase A's reopen economics
-    /// ([`RatePolicy::step_in_place`]).
+    /// reopen, no GOP ([`RatePolicy::step_in_place`]).
     fn h264_rate_step_refs(&mut self, now: Instant) {
         while self
             .h264

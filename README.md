@@ -44,8 +44,8 @@ serves the stream (or `GHOSTFRAME_H264_BACKEND=openh264`), the server encodes
 H.264 in software with Cisco's OpenH264, loaded at run time from the system:
 `libopenh264.so.8` (2.6.x), then `libopenh264.so.7` (2.4.x and 2.5.x; e.g. Ubuntu 24.04's
 `libopenh264-7`), then `libopenh264.so`, or
-the absolute path in `GHOSTFRAME_H264_OPENH264_LIB`. Without a library the
-ffmpeg encoder serves the stream as before. OpenH264 serves pictures of up to 1920x1080 pixels at
+the absolute path in `GHOSTFRAME_H264_OPENH264_LIB`. Without a library (and
+without VA-API) the session stays on the lossless tile codec. OpenH264 serves pictures of up to 1920x1080 pixels at
 30 fps. OpenH264 Video Codec provided by Cisco Systems, Inc. Cisco's patent grant
 covers only the binary Cisco distributes; a library your distribution built
 from the source carries none, and whether to install one is your decision as

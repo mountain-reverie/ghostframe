@@ -72,8 +72,8 @@ builds). Loaded at run time, never shipped, linked or downloaded.
       conditions including that the user can turn the codec off and that the
       attribution above is shown. Ghostframe meets the second by logging the
       sentence when a session opens ("openh264 session open") and the first
-      with GHOSTFRAME_H264_BACKEND=vaapi (libva-direct only) or ffmpeg, either
-      of which never loads the library.
+      with GHOSTFRAME_H264_BACKEND=vaapi (libva-direct only), which never
+      loads the library.
     * A library built by a distribution from the source (Debian and Ubuntu's
       libopenh264-7, Fedora's own build) carries no such grant. The operator
       who installs one, or who pulls Cisco's binary from Cisco's repository,

@@ -141,10 +141,11 @@ directory, so stop the service before `logout`. A node counts as joined when
 `capture` exits 2 and the unit does not restart it.
 
 In H.264 mode the same cadence also logs `h264 stats` (target
-`ghostframe::h264`): IDRs by cause (`idr_session`, `idr_loss`,
-`idr_client_reset`, `idr_reentry`, `idr_gop_periodic`, ...), verdicts on IDR and
-P fragments, `p_hold_ms` (time P frames waited for an IDR to be acknowledged),
-`frames_skipped_hold` / `frames_skipped_backpressure`, and the ledger identity
+`ghostframe::h264`): `h264_unavailable` (empty, `"this_size"` or `"process"`),
+IDRs by cause (`idr_session`, `idr_client_reset`, `idr_reentry`,
+`idr_mtu_shrink`, `idr_encoder_fault`, ...), verdicts on IDR and P fragments,
+`frames_skipped_hold` (the manager held for an IDR) /
+`frames_skipped_backpressure`, and the ledger identity
 `tx_recorded >= tx_acked_live + tx_judged_lost + tx_forgotten` (the gap is still
 outstanding and not logged; exact only within one session, without ledger
 capacity evictions). An
@@ -159,31 +160,44 @@ healthy H.264 resets it). The headroom guard reads the bandwidth *estimate*
 estimate is back over 2 Mbit/s and the screen has been idle for 2 s);
 `loss_override` is off unless `GHOSTFRAME_LOSS_OVERRIDE=1`.
 
-The H.264 stream of a **legacy (Phase A)** session is CBR at `0.8 x` the
-bandwidth estimate (smoothed, floor 300 kbit/s). The rate changes only by
-reopening the encoder at an IDR: `rate_target_bps` is the last rate it was told,
-`idr_rate_drop` the immediate reopens for a fall of more than 30 % (these hold
-P frames like a loss IDR), `rate_reopens_gop` the ones that waited for the
-scheduled IDR. The GOP is 3 s of frames; `GHOSTFRAME_H264_GOP_SECONDS` picks 2
-to 5 (anything else is clamped with a warning). A stream at `0.8 x` the
+Every H.264 session is an **acked-reference ("refs") session** (HELLO 0x04; a
+client without it is served the tile codec): the `RefManager` plans each frame
+and recovers from loss from an acknowledged anchor, not an IDR. The only IDRs
+are the session's, a resolution change, a client decoder failure (0x09), an MTU
+shrink, a re-issue of an IDR still in flight, an encoder fault and
+`backend_fallback` (`idr_session`, `idr_client_reset`, `idr_mtu_shrink`,
+`idr_encoder_fault`, ... on `h264 stats`). The fallback ladder is libva-direct,
+then (after its fault limit: a demotion, one `backend_fallback` IDR, no latch)
+openh264, then **H.264 unavailable**, and the session stays on the lossless tile
+codec. Two scopes. A **process-wide latch** when every backend tried said it is not
+here (no VA-API device, no libopenh264, or `vaapi`/`openh264` alone chosen and
+absent) or openh264 hit its fault limit: one warn line ("H.264 is unavailable for
+the rest of this process, staying on the tile codec: ..."), `h264_unavailable="process"`
+on `h264 stats`, classifier reason `h264_encoder_unavailable`. It is not re-armed
+per session: **H.264 stays off until the daemon restarts**
+(`systemctl --user restart ghostframe-server`). **That picture size only**
+(`"this_size"`, one info line, cleared when the size changes) when any backend
+refused the configuration or failed at open, whatever the other said: libva-direct
+refusing a dual-4K mode with no libopenh264 installed does not shut 1080p out.
+
+The rate target is `0.8 x` the bandwidth estimate (smoothed, floor 300 kbit/s)
+and `rate_target_bps` is the last rate it was told. A stream at `0.8 x` the
 estimate is not application-limited to goog_cc's ALR detector, so the bridge
 declares it so (`alr_signalled`, the detector is shown a sent size halved) and
 fills the probe windows goog_cc then asks for with padding when no IDR is due:
 copies of an acknowledged P-frame fragment under new `wire_seq`s
 (`probe_padding_windows` / `probe_padding_bytes`; the client acknowledges and
-discards them). A rise of more than 30 % reopens at once (`idr_rate_rise`), a
-jump of the raw estimate is held for a second, and the estimate ceiling is held
-off for a second around padding.
+discards them). A jump of the raw estimate is held, and the estimate ceiling is
+held off for a second around padding.
 
-An **acked-reference ("refs") session** (HELLO 0x04, the `h264 refs` line) moves
-the rate in place: no reopen, no IDR, no GOP (`RatePolicy::step_in_place`).
+The rate moves in place: no reopen, no IDR, no GOP (`RatePolicy::step_in_place`).
 `rate_updates`, `rate_applies_up` / `rate_applies_down` count the changes,
 `rate_sends` / `rate_sends_10s` the re-sends of the rate buffers, the probe
 raise's included (each costs a short dip of 1.00 / 0.56 / 0.87 times the average
 frame, T4; a probe window's end dips to about 0.5 for two frames; so the policy
 keeps a 250 ms floor between them, a 10 % band for a fall and 15 % for a rise,
 and never re-sends inside the band). A jump of the raw estimate is held for 2 s
-(`SPIKE_HOLD_IN_PLACE`; 1 s on Phase A), and let go early when the estimate
+(`SPIKE_HOLD_IN_PLACE`), and let go early when the estimate
 falls below its pre-spike level or under 0.85 of the spike while goog_cc is
 loss-limited or has had a standing queue for 400 ms; the give-back is not a cut. Measure a step-up with `sus_use`
 (the estimate held over the line for a second *and* the stream sending at
@@ -231,9 +245,9 @@ worth a look. openh264 has no per-frame size cap: a scene change shows as
 `frames_over_cap` and `max_cap_ratio_pct` on `h264 stats`, absorbed by the
 pacer.
 
-`GHOSTFRAME_H264_BACKEND` is `auto|vaapi|openh264|ffmpeg` (`legacy` = `ffmpeg`;
-a misspelt value warns and means `auto`): `auto` tries libva-direct, then
-openh264, then the ffmpeg encoder (which B7b removes); `vaapi` and `openh264`
+`GHOSTFRAME_H264_BACKEND` is `auto|vaapi|openh264` (the removed `ffmpeg` and
+`legacy`, like a misspelt value, warn and mean `auto`): `auto` tries libva-direct,
+then openh264, then H.264 is unavailable (above); `vaapi` and `openh264`
 try only that one; anything but `auto`/`openh264` never loads libopenh264, which
 is the "user can turn it off" condition of Cisco's licence. The library is
 loaded at run time and never shipped: `libopenh264.so.8` (2.6.x), `.so.7`
@@ -241,7 +255,8 @@ loaded at run time and never shipped: `libopenh264.so.8` (2.6.x), `.so.7`
 `GHOSTFRAME_H264_OPENH264_LIB` (optional; a configured path that fails is an
 error, not a hint). An unsupported version is refused with one line naming what
 was found. Pictures above 1920x1080 or `CAPTURE_FPS` above 30 are refused with one
-warning and served by the next choice. Patent licensing of a distribution-built
+warning and served by the next choice: libva-direct if it can, else (there is no
+next encoder) the tile codec for that picture size. Patent licensing of a distribution-built
 library is the operator's decision (`NOTICE`); install the library on the
 session machine like any other runtime dependency. Two traps in
 `OpenH264Backend::params_for`: screen-content usage silently turns long-term
@@ -256,9 +271,8 @@ layout). `e2e_h264_openh264_motion` forces the backend with the GPU harness and
 checks a moving spinner through the browser's WebCodecs decoder; it is local
 only (every H.264 e2e is in `ci/skip-list.txt`), so CI never decodes the
 observed-mode stream in a browser.
-`GHOSTFRAME_H264_GOP_SECONDS` (default 3, clamped 2..5) sets the scheduled IDR
-interval; `GHOSTFRAME_LOSS_OVERRIDE=1` turns the off-by-default loss override
-back on. Every field and both variables are explained in
+`GHOSTFRAME_LOSS_OVERRIDE=1` turns the off-by-default loss override back on.
+Every field and the variable are explained in
 [docs/design/h264-transport.md](docs/design/h264-transport.md). A zero
 `frame_acks_received` is expected (no client sends the 0x0A frame ack yet); it
 is on the separate `h264 client feedback` line, target
@@ -362,8 +376,8 @@ the e2e-side injection variables.
 
 ## Known flakes
 
-- `encoder::h264_vaapi::tests::full_frame_keyframe_interval` — VA-API
-  contention under parallel test load. Re-run with `--test-threads=1`.
+- `encoder::h264::vaapi_direct` tests that open a real VA-API device can contend
+  under parallel test load. Re-run with `--test-threads=1`.
 - The browserless suite can bail with `.expect("scene ran")` rather than an
   assertion. That is a harness stall, not a protocol failure; it is
   load-dependent. **Capture the failing test name before re-running** — it is
