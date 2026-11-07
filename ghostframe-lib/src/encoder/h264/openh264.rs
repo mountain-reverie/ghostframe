@@ -287,7 +287,11 @@ impl H264Backend for OpenH264Backend {
         Self::check_dims(cfg)?;
         let lib = Lib::get(self.lib_path.as_deref())
             .map_err(|e| BackendError::Unavailable(e.to_string()))?;
-        let mut enc = lib.create_encoder().map_err(BackendError::Unavailable)?;
+        let mut enc = lib.create_encoder().map_err(|why| {
+            // The library is here: an allocation failure is this stream's, not
+            // the machine's.
+            BackendError::Incapable(why)
+        })?;
         enc.install_trace();
         #[cfg(test)]
         let scd = self.scene_change_detect;

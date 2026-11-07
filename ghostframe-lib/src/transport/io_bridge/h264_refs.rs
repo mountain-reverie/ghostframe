@@ -45,20 +45,38 @@ use crate::encoder::h264::syntax::StreamParams;
 use crate::encoder::h264::tracker::{seq_lt, FrameState, PicKind};
 
 /// Encoder-fault epochs in a row, with no anchor confirmed between them, after
-/// which acked references are given up on for the process (the Phase A encoder
-/// takes over).
+/// which the backend is given up on: libva-direct is demoted to openh264,
+/// anything else makes H.264 unavailable for the process.
 const MAX_BACKEND_FAILURES: u32 = 3;
 
-/// Whether this process's backend executes plans, as far as the loop knows.
+impl H264Availability {
+    /// What the `h264 stats` line says: empty while H.264 is available.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Available => "",
+            Self::Config { .. } => "this_size",
+            Self::Process => "process",
+        }
+    }
+}
+
+/// Whether any encoder can code H.264 here, as far as the loop knows. The
+/// classifier reads it (`AdaptationContext::h264_encoder_unavailable`): while
+/// it is not `Available` the stream stays on the lossless tile codec.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RefsMode {
-    /// No H.264 frame has been planned yet.
+pub(super) enum H264Availability {
     #[default]
-    Unknown,
-    /// The backend answered a plan with a coded access unit.
-    Explicit,
-    /// The backend does not execute plans: Phase A for the rest of the process.
-    Legacy,
+    Available,
+    /// A backend refused this picture size's configuration, or failed at open,
+    /// and none could code it (libva-direct above its level or at an odd width
+    /// with no libopenh264, openh264's 1920x1080 at 30 fps ceiling with
+    /// libva-direct absent). Cleared when the stream's size changes, so a
+    /// later, smaller stream is not shut out by an earlier, larger one.
+    Config { dims: (u32, u32) },
+    /// The machine cannot: every backend tried is absent (no device, no
+    /// library), or openh264 gave up. A latch for the rest of the process: H.264
+    /// stays off until the daemon restarts.
+    Process,
 }
 
 /// The window of `RefsReport::rate_sends_10s`.
@@ -72,7 +90,6 @@ pub(super) struct RefsCounters {
     pub(super) holds: u64,
     pub(super) epoch_dropped: u64,
     pub(super) backend_failures: u64,
-    pub(super) unplanned_fallbacks: u64,
     pub(super) client_resets: u64,
     pub(super) frame_acks_applied: u64,
     pub(super) decoded_bits: u64,
@@ -109,6 +126,8 @@ pub(super) struct RefsCounters {
     pub(super) mtu_retired_idr: u64,
     /// Streams moved from libva-direct to openh264 after its fault limit.
     pub(super) backend_demotions: u64,
+    /// Times H.264 was declared unavailable (process-wide or for one size).
+    pub(super) unavailable_events: u64,
 }
 
 /// The loop-side state of one live session's acked references.
@@ -212,8 +231,8 @@ pub struct RefsReport {
     /// Results of an older plan epoch, dropped.
     pub epoch_dropped: u64,
     pub backend_failures: u64,
-    /// Plans a backend could not execute: the process went back to Phase A.
-    pub unplanned_fallbacks: u64,
+    /// Times no backend could code the stream (see `H264Availability`).
+    pub unavailable_events: u64,
     /// Client reset requests honoured (0x09).
     pub client_resets: u64,
     pub frame_acks_applied: u64,
@@ -312,9 +331,7 @@ impl IoBridge {
     /// the v2 feedback, acked references are not switched off, and the backend
     /// has not turned out unable to execute plans.
     pub(super) fn h264_refs_active(&self) -> bool {
-        self.h264.refs_enabled
-            && self.client_caps.h264_acked_ref
-            && self.h264.refs_mode != RefsMode::Legacy
+        self.client_caps.h264_acked_ref && self.h264.availability == H264Availability::Available
     }
 
     /// Whether this session's frames are planned by a live manager: the
@@ -578,7 +595,7 @@ impl IoBridge {
             .clone()
             .filter(|_| au.meta.idr == planned_idr || (observed && au.meta.idr));
         let Some(header) = header else {
-            self.h264_refs_encoder_failed(now);
+            self.h264_refs_encoder_failed();
             return false;
         };
         // The plan as the stream executed it: in observed mode read from the
@@ -632,7 +649,7 @@ impl IoBridge {
             }
         }
         if faulted {
-            self.h264_refs_note_fault(now, false);
+            self.h264_refs_note_fault(false);
         }
         self.publish_refs_counters();
         true
@@ -654,7 +671,6 @@ impl IoBridge {
         let now = now_std();
         match reply {
             H264Reply::Coded(CodedAu(au, backend)) => {
-                self.h264.refs_mode = RefsMode::Explicit;
                 self.h264.backend_kind = backend;
                 let Some(max_dg_size) = max_dg_size else {
                     // The session changed (the manager started a new epoch
@@ -675,17 +691,11 @@ impl IoBridge {
                     "[BRIDGE] frame.stages"
                 );
             }
-            H264Reply::Unplanned => {
-                // No plan-executing backend here: the Phase A encoder serves
-                // the stream from the next frame on. This frame was never
-                // encoded; the next is made whole and is an IDR (a fresh
-                // encoder's first frame).
-                tracing::info!(
-                    target: "ghostframe::h264",
-                    "h264 acked references unavailable on this machine: using the Phase A policy"
-                );
-                self.h264.refs_counters.unplanned_fallbacks += 1;
-                self.h264_refs_give_up(now);
+            H264Reply::Unavailable { process_wide, why } => {
+                // No backend can code this stream. This frame was never
+                // encoded; the classifier takes the stream to the tile codec
+                // from the next frame on, which repaints the screen.
+                self.h264_declare_unavailable(process_wide, (m.width, m.height), &why);
                 self.emit_frame_dimensions(inflight.seq, m.timestamp_us, m.width, m.height);
             }
             H264Reply::Nothing => {
@@ -693,7 +703,7 @@ impl IoBridge {
                 self.emit_frame_dimensions(inflight.seq, m.timestamp_us, m.width, m.height);
             }
             H264Reply::Failed => {
-                self.h264_refs_encoder_failed(now);
+                self.h264_refs_encoder_failed();
                 self.emit_frame_dimensions(inflight.seq, m.timestamp_us, m.width, m.height);
             }
         }
@@ -702,10 +712,10 @@ impl IoBridge {
     /// The backend failed, or made a stream that is not the plan: the next
     /// frame reopens it with an IDR, counted as an encoder fault. A run of
     /// them with no anchor confirmed between gives acked references up.
-    pub(super) fn h264_refs_encoder_failed(&mut self, now: Instant) {
+    pub(super) fn h264_refs_encoder_failed(&mut self) {
         self.h264.refs_counters.backend_failures += 1;
         self.ensure_baseline_invalidated();
-        self.h264_refs_note_fault(now, true);
+        self.h264_refs_note_fault(true);
     }
 
     /// Count an encoder-fault epoch. `start` begins it (a failed encode); a
@@ -713,10 +723,11 @@ impl IoBridge {
     /// only when a P frame was confirmed as an anchor since the last fault: the
     /// IDR is candidate 0, so a backend whose IDRs work and whose P frames fail
     /// confirms an anchor every time and would otherwise never be given up on.
-    fn h264_refs_note_fault(&mut self, now: Instant, start: bool) {
+    fn h264_refs_note_fault(&mut self, start: bool) {
         let Some(st) = self.h264.refs.as_mut() else {
             return;
         };
+        let dims = st.dims.unwrap_or_default();
         let anchors = st.mgr.stats().p_anchors_confirmed;
         if anchors > st.p_anchors_at_fault {
             st.faults_without_anchor = 0;
@@ -731,12 +742,15 @@ impl IoBridge {
             return;
         }
         if given_up {
-            tracing::warn!(
-                target: "ghostframe::h264",
-                "h264 acked-reference encoder faulted {MAX_BACKEND_FAILURES} times with no \
-                 anchor confirmed between: using the Phase A policy for this process"
+            self.h264_declare_unavailable(
+                true,
+                dims,
+                &format!(
+                    "the {} encoder faulted {MAX_BACKEND_FAILURES} times with no anchor \
+                     confirmed between",
+                    self.h264.backend_kind
+                ),
             );
-            self.h264_refs_give_up(now);
         }
     }
 
@@ -768,13 +782,60 @@ impl IoBridge {
         true
     }
 
-    /// Acked references are over for this process: the Phase A encoder serves
-    /// the stream from the next frame, and asks for its IDR the Phase A way.
-    fn h264_refs_give_up(&mut self, now: Instant) {
-        self.h264.refs_mode = RefsMode::Legacy;
+    /// No encoder can code the stream. `process_wide` is a latch for the rest
+    /// of the process (one warn line); otherwise it is about this picture
+    /// size only and the next size gets a fresh try (`h264_availability_for`).
+    /// Either way the classifier is told, the stream goes to the tile codec
+    /// and the manager is dropped with the session it served.
+    pub(super) fn h264_declare_unavailable(
+        &mut self,
+        process_wide: bool,
+        dims: (u32, u32),
+        why: &str,
+    ) {
+        // Said once: frames already in flight when the first reply lands
+        // are classified H.264 too, and each gets the same answer.
+        if matches!(self.h264.availability, H264Availability::Process)
+            || self.h264.availability == (H264Availability::Config { dims })
+        {
+            return;
+        }
+        self.h264.refs_counters.unavailable_events += 1;
+        if process_wide {
+            tracing::warn!(
+                target: "ghostframe::h264",
+                "H.264 is unavailable for the rest of this process, staying on the tile codec: {why}"
+            );
+            self.h264.availability = H264Availability::Process;
+        } else {
+            tracing::info!(
+                target: "ghostframe::h264",
+                width = dims.0,
+                height = dims.1,
+                "H.264 is unavailable for this picture size, staying on the tile codec: {why}"
+            );
+            self.h264.availability = H264Availability::Config { dims };
+        }
         self.h264.refs = None;
-        self.request_h264_idr(IdrCause::Session, now);
+        self.set_h264_encoder_unavailable(true);
         self.ensure_baseline_invalidated();
+        self.publish_refs_counters();
+    }
+
+    /// A per-size "unavailable" ends when the picture size changes.
+    pub(super) fn h264_availability_for(&mut self, dims: (u32, u32)) {
+        if let H264Availability::Config { dims: was } = self.h264.availability {
+            if was != dims {
+                tracing::info!(
+                    target: "ghostframe::h264",
+                    width = dims.0,
+                    height = dims.1,
+                    "picture size changed: H.264 is offered again"
+                );
+                self.h264.availability = H264Availability::Available;
+                self.set_h264_encoder_unavailable(false);
+            }
+        }
     }
 
     /// An access unit the backend made could not be sent. The encoder's chain
@@ -1083,7 +1144,7 @@ impl IoBridge {
             holds: c.holds,
             epoch_dropped: c.epoch_dropped,
             backend_failures: c.backend_failures,
-            unplanned_fallbacks: c.unplanned_fallbacks,
+            unavailable_events: c.unavailable_events,
             client_resets: c.client_resets,
             frame_acks_applied: c.frame_acks_applied,
             frames_decoded_acked: c.decoded_bits,

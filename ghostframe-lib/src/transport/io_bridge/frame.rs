@@ -1570,7 +1570,9 @@ impl IoBridge {
         // every other deadline in this file.
         let now = now_std();
         let now_us = now.duration_since(self.epoch).as_micros() as u64;
-        // The H.264 transport's stall flag is an input of this decision.
+        // The H.264 transport's stall flag and the encoder latch are inputs of
+        // this decision. A per-size "unavailable" ends with the size.
+        self.h264_availability_for((frame.width, frame.height));
         self.update_h264_stall(now);
         let new_mode = self
             .classifier
@@ -2743,6 +2745,7 @@ impl IoBridge {
                     target: "ghostframe::h264",
                     frame_seq = seq,
                     backend = refs.backend,
+                    h264_unavailable = self.h264.availability.label(),
                     idr_backend_fallback = refs.idr_backend_fallback,
                     marks_observed = refs.marks_observed,
                     mark_unrepresentable = refs.mark_unrepresentable,
