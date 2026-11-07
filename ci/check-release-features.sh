@@ -19,3 +19,12 @@ if grep -Eq "\"($forbidden)\"" <<<"$resolved"; then
     echo "::error::the release daemon resolves a test-only ghostframe-lib feature (see ci/check-release-features.sh)"
     exit 1
 fi
+
+# ffmpeg is the harness's independent decoder oracle (pcm_decoder.rs), never an
+# encoder or a dependency of the daemon: the H.264 encoders are libva-direct and
+# a runtime-loaded openh264. A path from the daemon to ffmpeg-next means a test
+# dependency leaked into a normal one.
+if cargo tree -p ghostframe-server -e normal | grep -q 'ffmpeg'; then
+    echo "::error::the daemon's normal dependency tree names ffmpeg (dev-only: the harness decoder oracle; see ci/check-release-features.sh)"
+    exit 1
+fi

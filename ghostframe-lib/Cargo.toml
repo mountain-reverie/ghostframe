@@ -28,7 +28,10 @@ test-loss-injection = []
 # `send_to_all_sessions` live behind `test-loss-injection` alongside
 # `outbound_loss`. Without the implication, enabling this feature alone leaves
 # the setter referring to a field that does not exist.
-browserless-harness = ["test-loss-injection", "tokio/test-util"]
+browserless-harness = ["test-loss-injection", "tokio/test-util", "ffmpeg-oracle"]
+# The libavcodec decoder oracle (`encoder::h264::pcm_decoder`). Implied by the
+# harness; never part of the daemon.
+ffmpeg-oracle = ["dep:ffmpeg-next", "dep:ffmpeg-sys-next"]
 # Cdf53 GPU-vs-CPU diagnostic instrumentation: GHOSTFRAME_CDF53_DIFF_TILE
 # one-shot diff log on the io_bridge encode path, GHOSTFRAME_CDF53_SKIP_L2_L3
 # / GHOSTFRAME_CDF53_SKIP_L3 env-var gates on the GPU forward pipeline, and
@@ -76,8 +79,11 @@ hex = { workspace = true }
 libc = { workspace = true }
 time = { workspace = true }
 ash = { workspace = true }
-ffmpeg-next = { workspace = true }
-ffmpeg-sys-next = { workspace = true }
+# Dev-only: the harness's independent libavcodec decoder (the oracle for the
+# streams our own writers make). No encoder path of the daemon uses it, and
+# `ci/check-release-features.sh` fails if the daemon's dependency tree names it.
+ffmpeg-next = { workspace = true, optional = true }
+ffmpeg-sys-next = { workspace = true, optional = true }
 
 [build-dependencies]
 cbindgen = { workspace = true }
@@ -92,3 +98,6 @@ url = "2"
 proptest = "1"
 ghostframe-test-pattern = { path = "../ghostframe-test-pattern" }
 ghostframe-client-core = { path = "../ghostframe-client-core" }
+# The decoder oracle of the unit tests (`pcm_decoder`, the libva-direct tests).
+ffmpeg-next = { workspace = true }
+ffmpeg-sys-next = { workspace = true }
