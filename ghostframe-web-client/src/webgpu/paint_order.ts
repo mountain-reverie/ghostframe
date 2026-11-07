@@ -20,15 +20,22 @@
 //    lift (stale CDF53 under it) unless some CDF53 entry is newer than it, in
 //    which case it is drawn before the lift.
 //
+// Across ticks (the renderer keeps what it painted, see `PriorPaint`):
+//  - Any entry (stateless or CDF53) older than the newest frame_seq already
+//    painted on its tile, or than the last H.264 frame drawn, is dropped. The
+//    server has superseded that content; a CDF53 pass is dropped too because
+//    what it would integrate into is no longer on screen. Equal never drops
+//    (refinement passes share their generation's frame_seq).
+//  - An H.264 frame is dropped when it is older than a previous H.264 frame
+//    or than any tile painted in an earlier tick: it covers every tile, so
+//    drawing it would undo the newer paint. Decoder output is asynchronous,
+//    which is how it can arrive that late.
+//
 // Known limits:
 //  - An H.264 frame with CDF53 entries both older and newer than it in ONE tick
 //    cannot be honoured: the lift is a single dispatch, so the older lift lands
 //    over the H.264 frame. One mode switch plus a late CDF53 retransmit of
 //    another tile is enough to hit it.
-//  - Ordering is resolved within a tick only. H.264 output is asynchronous, so
-//    a frame can arrive a tick after newer tiles were painted, and a late CDF53
-//    retransmit keeps its old frame_seq. Closing that needs a last-painted seq
-//    kept across ticks.
 
 export interface SeqTile {
   tileX: number;
@@ -54,34 +61,75 @@ function newestByTile(into: Map<number, number>, entries: readonly SeqTile[]): v
   }
 }
 
-export interface PaintPlanInput<S extends SeqTile, P extends SeqTile> {
-  solid: readonly S[];
-  palRle: readonly P[];
-  cdf53: readonly SeqTile[];
-  /** frame_seq of each queued H.264 frame, in arrival order. */
-  h264Seqs: readonly number[];
+/** What earlier ticks painted. Lookups are O(1): flat typed arrays. */
+export interface PriorPaint {
+  /** Newest frame_seq painted on the tile, or undefined if nothing was. */
+  tile(tileX: number, tileY: number): number | undefined;
+  /** frame_seq of the newest H.264 frame drawn. */
+  h264Floor: number | undefined;
+  /** Newest frame_seq painted on any tile. */
+  maxTile: number | undefined;
 }
 
-export interface PaintPlan<S, P> {
+export interface PaintPlanInput<S extends SeqTile, P extends SeqTile, C extends SeqTile = SeqTile> {
+  solid: readonly S[];
+  palRle: readonly P[];
+  cdf53: readonly C[];
+  /** frame_seq of each queued H.264 frame, in arrival order. */
+  h264Seqs: readonly number[];
+  /** Omit to order within the tick only. */
+  prior?: PriorPaint;
+}
+
+export interface PaintPlan<S, P, C = SeqTile> {
   solid: S[];
   palRle: P[];
+  /** CDF53 entries to integrate; fewer than queued only via `prior`. */
+  cdf53: C[];
+  /** Index-aligned with `h264Seqs`: whether that frame is drawn. */
+  h264Keep: boolean[];
   /** Draw the H.264 frames before the CDF53 lift instead of after it. */
   h264BeforeCdf53: boolean;
 }
 
-export function planPaint<S extends SeqTile, P extends SeqTile>(
-  input: PaintPlanInput<S, P>,
-): PaintPlan<S, P> {
+export function planPaint<S extends SeqTile, P extends SeqTile, C extends SeqTile = SeqTile>(
+  input: PaintPlanInput<S, P, C>,
+): PaintPlan<S, P, C> {
+  const prior = input.prior;
+  const olderThanPrior = (e: SeqTile): boolean => {
+    if (!prior) return false;
+    const t = prior.tile(e.tileX, e.tileY);
+    if (t !== undefined && seqNewer(t, e.frameSeq)) return true;
+    return prior.h264Floor !== undefined && seqNewer(prior.h264Floor, e.frameSeq);
+  };
+  const cdf53Entries = prior ? input.cdf53.filter((e) => !olderThanPrior(e)) : input.cdf53;
+  const solidIn = prior ? input.solid.filter((e) => !olderThanPrior(e)) : input.solid;
+  const palRleIn = prior ? input.palRle.filter((e) => !olderThanPrior(e)) : input.palRle;
+
+  // An H.264 frame covers every tile: it is stale when a previous frame or any
+  // earlier tile paint is newer, or when a newer frame is queued with it.
+  let queuedNewest: number | undefined;
+  for (const s of input.h264Seqs) {
+    if (queuedNewest === undefined || seqNewer(s, queuedNewest)) queuedNewest = s;
+  }
+  const h264Keep = input.h264Seqs.map((s) => {
+    if (queuedNewest !== undefined && seqNewer(queuedNewest, s)) return false;
+    if (!prior) return true;
+    if (prior.h264Floor !== undefined && seqNewer(prior.h264Floor, s)) return false;
+    return !(prior.maxTile !== undefined && seqNewer(prior.maxTile, s));
+  });
+
   const stateless = new Map<number, number>();
-  newestByTile(stateless, input.solid);
-  newestByTile(stateless, input.palRle);
+  newestByTile(stateless, solidIn);
+  newestByTile(stateless, palRleIn);
   const cdf53 = new Map<number, number>();
-  newestByTile(cdf53, input.cdf53);
+  newestByTile(cdf53, cdf53Entries);
 
   let h264Newest: number | undefined;
-  for (const s of input.h264Seqs) {
+  input.h264Seqs.forEach((s, i) => {
+    if (!h264Keep[i]) return;
     if (h264Newest === undefined || seqNewer(s, h264Newest)) h264Newest = s;
-  }
+  });
 
   const keep = <T extends SeqTile>(e: T): boolean => {
     const k = tileKey(e);
@@ -95,7 +143,7 @@ export function planPaint<S extends SeqTile, P extends SeqTile>(
 
   let h264BeforeCdf53 = false;
   if (h264Newest !== undefined) {
-    for (const e of input.cdf53) {
+    for (const e of cdf53Entries) {
       if (seqNewer(e.frameSeq, h264Newest)) {
         h264BeforeCdf53 = true;
         break;
@@ -104,8 +152,10 @@ export function planPaint<S extends SeqTile, P extends SeqTile>(
   }
 
   return {
-    solid: input.solid.filter(keep),
-    palRle: input.palRle.filter(keep),
+    solid: solidIn.filter(keep),
+    palRle: palRleIn.filter(keep),
+    cdf53: [...cdf53Entries],
+    h264Keep,
     h264BeforeCdf53,
   };
 }
