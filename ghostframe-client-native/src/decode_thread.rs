@@ -68,8 +68,12 @@ struct Outbox {
 }
 
 impl Outbox {
-    fn push(&mut self, msg: RenderMsg) {
-        self.since.get_or_insert_with(Instant::now);
+    /// `now` stamps the first held message. It must come from the same clock
+    /// [`Outbox::due_at`] is later judged against: stamping with the wall
+    /// clock here made an injected clock that lags real time (a test's, or a
+    /// slow decode under load) see the age saturate to zero and never expire.
+    fn push(&mut self, msg: RenderMsg, now: Instant) {
+        self.since.get_or_insert(now);
         self.held.push(msg);
     }
 
@@ -154,7 +158,7 @@ fn deliver(
     }
     let msg = render_msg(decoded);
     let waits = !outbox.held.is_empty() || matches!(msg, RenderMsg::SlabTile { .. });
-    outbox.push(msg);
+    outbox.push(msg, now);
     if !waits || outbox.due_at(now) {
         release_outbox(outbox, slots, render_tx, render_gone);
     }
@@ -601,7 +605,7 @@ mod tests {
         let msg = || RenderMsg::Core(marker(0));
         let mut o = Outbox::default();
         assert!(!o.due_at(Instant::now()), "empty");
-        o.push(msg());
+        o.push(msg(), Instant::now());
         let t0 = o.since.expect("set by the first push");
         assert!(!o.due_at(t0), "a fresh message is not due");
         assert!(!o.due_at(t0 + OUTBOX_MAX_AGE / 2));
@@ -613,11 +617,11 @@ mod tests {
         assert!(o.release(None, &tx));
         assert!(o.since.is_none() && o.held.is_empty());
         for _ in 0..OUTBOX_MAX - 1 {
-            o.push(msg());
+            o.push(msg(), t0);
         }
         let t0 = o.since.unwrap();
         assert!(!o.due_at(t0), "one short of the cap");
-        o.push(msg());
+        o.push(msg(), t0);
         assert!(o.due_at(t0), "enough messages");
     }
 
@@ -1027,11 +1031,13 @@ mod tests {
         };
         pump.handle_batch(&mut events, &mut clock);
         assert!(events.is_empty(), "the batch Vec is left empty for reuse");
-        // Readings: the batch start, the solid's result, then one per tick
-        // (400 us apart, so the solid becomes overdue at the first or second
-        // tick). It is not sent by its own reading or the first tick's, and
-        // is by the third tick: before any picture, which could only have
-        // sent it by the other rule, at the first reading after the last pass.
+        // Readings: 0 the batch start, 1 the solid's result (the hold is
+        // stamped with it, 800 us in), then one per tick, 400 us apart. The
+        // age limit (1 ms) is first met at the third tick (reading 4, 1.2 ms
+        // after the stamp), so the tile reaches the channel just after that
+        // reading and is counted at reading 5. Not before: the first two
+        // ticks are 0.4 and 0.8 ms old. And before any picture, which could
+        // only have sent it by the other rule, at the end of the batch.
         let seen: Vec<usize> = seen_at_reading
             .iter()
             .scan(0, |acc, n| {
@@ -1039,9 +1045,9 @@ mod tests {
                 Some(*acc)
             })
             .collect();
-        assert!(seen.len() >= 5, "{seen_at_reading:?}");
-        assert_eq!(seen[2], 0, "{seen_at_reading:?}");
-        assert!(seen[4] >= 1, "{seen_at_reading:?}");
+        assert!(seen.len() >= 6, "{seen_at_reading:?}");
+        assert_eq!(seen[4], 0, "{seen_at_reading:?}");
+        assert!(seen[5] >= 1, "{seen_at_reading:?}");
     }
 
     /// A held tile is also sent before a reconstruction, never waiting through it.
