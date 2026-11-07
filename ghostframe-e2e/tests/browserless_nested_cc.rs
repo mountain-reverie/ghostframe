@@ -397,6 +397,16 @@ async fn slow_start(name: &str, cap_mbit: u64, q: Queue, seed: u64) {
     )
     .await;
     assert_premises(&r, name, 100);
+    if name == "s1_c10_droptail" {
+        // The 1.39 resends per loss seen on 2026-10-29 no longer reproduces:
+        // nothing is dropped and nothing is retransmitted here.
+        assert!(
+            r.s2c_datagrams_dropped == 0 && r.retransmit_attempts_total == 0,
+            "{name}: real_drops={} retransmit_attempts={}",
+            r.s2c_datagrams_dropped,
+            r.retransmit_attempts_total
+        );
+    }
     let s = &r.bwe_estimate_samples;
     let end = s.last().unwrap().0 + 1;
     metric(
