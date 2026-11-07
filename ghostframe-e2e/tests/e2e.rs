@@ -2295,11 +2295,11 @@ async fn e2e_production_scale_with_loss_converges() -> Result<()> {
 ///   tiles=786 complete=0 partial=786 gave_up=550 pass-hist{1:786}
 ///
 /// and it will keep failing, because the screen changes faster than the
-/// link can carry one change. What is left to learn from it is in
-/// `docs/specs/retransmit-storm-root-cause.md`: the scheduler's budget is
-/// granted per frame rather than per unit of time, and the pass-major drain
-/// restarts at the same tile after every supersede, so the ~1250 tiles
-/// outside that count never receive a pass.
+/// link can carry one change. The two defects it once exposed (a scheduler
+/// budget granted per frame, and a pass-major drain that restarted at the
+/// same tile after every supersede) are gone; see
+/// `docs/specs/retransmit-storm-root-cause.md`, "What the overload scene
+/// shows now". The numbers above are from before that.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_saturated_link_starves_tiles_into_giving_up() -> Result<()> {
     use ghostframe_e2e::harness::net_shape::NetShape;
