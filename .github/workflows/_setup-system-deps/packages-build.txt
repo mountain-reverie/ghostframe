@@ -27,6 +27,11 @@
 # the 56-byte one. Both are exercised: CI runs the former. Distribution builds
 # carry no patent grant from Cisco; installing one on a machine that runs the
 # server is the operator's decision (NOTICE).
+# The ffmpeg dev libraries (and clang, for ffmpeg-sys-next's bindgen) build the
+# harness's libavcodec decoder oracle and the native client's decoder; the
+# daemon encodes with libva-direct or a runtime-loaded openh264, never ffmpeg.
+# libx264 stays for the client-h264 test clip (an encoder used to make a
+# stream to decode), not for the server.
 build-essential
 pkg-config
 clang
