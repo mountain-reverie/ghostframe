@@ -131,10 +131,12 @@ pub enum TileDelivery {
 pub struct ClientConfig {
     pub indices_raw_enabled: bool,
     pub supports_h264: bool,
-    /// The client sends the v2 H.264 feedback (reset requests; frame acks in
-    /// later phases): advertised as HELLO bit 2. It does not gate H.264 --
-    /// `supports_h264` does. Defaults to `false`; the web client does not set
-    /// it yet.
+    /// The client sends the v2 H.264 feedback (reset requests and frame
+    /// acks): advertised as HELLO bit 2 (0x04). **Required for H.264**
+    /// together with `supports_h264`: the server serves a client without it
+    /// the tile codec, so an embedder that sets only `supports_h264: true`
+    /// silently gets no H.264. Defaults to `false`; the web client and the
+    /// native client (when it supports H.264) set it.
     pub h264_acked_ref: bool,
     /// See [`TileDelivery`]. Defaults to `Decoded`.
     pub tile_delivery: TileDelivery,

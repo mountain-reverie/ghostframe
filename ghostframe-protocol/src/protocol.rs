@@ -711,6 +711,11 @@ pub fn max_frame_fragment_payload(max_datagram_size: usize) -> usize {
 /// `TooLarge`, and every group holding a full-size fragment -- all of them
 /// but, at best, a frame's last -- goes out unprotected. Measured: 13 of 52
 /// H.264 datagrams in one session, every one a parity.
+///
+/// Vestigial for H.264: the server sends no H.264 parity since B7b, but still
+/// cuts fragments with this room (about 0.25 % of a 1200-byte datagram), because
+/// fixtures and the MTU-retire arithmetic pin the fragment counts. Drop it
+/// together with the client's H.264 parity decode.
 pub fn max_fec_frame_fragment_payload(max_datagram_size: usize) -> usize {
     max_frame_fragment_payload(max_datagram_size).saturating_sub(crate::fec::PARITY_HEADER_SIZE)
 }

@@ -26,7 +26,7 @@
 //!
 //! # Legacy streams
 //!
-//! A server that does not plan references (Phase A) sets no flag on a P frame
+//! A server that does not plan references (the removed Phase A policy) sets no flag on a P frame
 //! and names the previous H.264 frame it sent in `ref_frame_seq`. That is a
 //! short-term target on the newest reference, so the same rule gives today's
 //! behaviour: a P whose reference never arrived is held back, and so is every

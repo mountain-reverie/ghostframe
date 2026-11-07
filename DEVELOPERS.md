@@ -57,6 +57,12 @@ are building):
 - **`cbindgen`** for FFI header generation: `cargo install cbindgen`
 - **Docker** for the end-to-end test containers (test-server + headscale).
 - **`just`** — every common task is in the `Justfile`.
+- **ffmpeg development libraries** (`libavcodec-dev` and friends) to build the
+  test tree: `ffmpeg-next` is the harness's independent libavcodec **decoder**
+  oracle (`ffmpeg-oracle`, implied by `browserless-harness`; a dev-dependency
+  otherwise). It is never an encoder and never part of the daemon:
+  `ci/check-release-features.sh` fails if `cargo tree -p ghostframe-server -e
+  normal` names it.
 - **libopenh264** (runtime library only) for the `openh264_*` tests in
   `ghostframe-lib` and the `openh264_scenes` of `browserless_h264`, which fail
   with an install hint without it: Ubuntu/Debian `libopenh264-7`, Arch

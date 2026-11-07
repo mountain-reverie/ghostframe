@@ -325,7 +325,7 @@ fn resolution_and_idr_causes_ask_for_nothing() {
     assert!(!g.is_good(1));
 }
 
-// --- legacy (Phase A) streams ------------------------------------------------
+// --- legacy (removed Phase A) streams ------------------------------------------------
 
 #[test]
 fn a_legacy_stream_is_fed_in_order_and_a_missing_reference_asks_for_an_idr_at_once() {
