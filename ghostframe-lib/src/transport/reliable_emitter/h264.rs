@@ -537,21 +537,12 @@ mod emitter_tests {
         let mut e = ReliableTileEmitter::new(t);
         submit(&mut e, 1, true, 2, t);
         submit(&mut e, 2, false, 2, t);
-        e.queue_untracked(
-            Bytes::from(crate::transport::protocol::build_frame_parity_datagram(
-                2, 0, false, 2, &[0u8; 10],
-            )),
-            WireClass::Parity,
-        );
         // One datagram has already left the queue (frame 1, fragment 0).
         let first = e.next_emission(t).expect("queued");
         let first_ws = stamped(&first);
         let all = e.take_transmissions();
         let queued_before = e.queued_h264_bytes();
-        assert_eq!(
-            queued_before,
-            3 * (FRAME_HEADER_SIZE + FRAG) + FRAME_HEADER_SIZE + 10
-        );
+        assert_eq!(queued_before, 3 * (FRAME_HEADER_SIZE + FRAG));
 
         // An IDR at frame 3 supersedes frames 1 and 2.
         let removed = e.supersede_h264_before(3);
@@ -565,33 +556,13 @@ mod emitter_tests {
         );
         assert!(!removed.contains(&first_ws));
         assert_eq!(e.h264.len(), 0, "the cache forgot both frames");
-        assert_eq!(
-            e.queued_h264_bytes(),
-            0,
-            "the queue holds none, parity included"
-        );
+        assert_eq!(e.queued_h264_bytes(), 0, "the queue holds none");
         assert!(e.next_emission(t).is_none());
         assert_eq!(
-            e.stats.h264_queue_purged, 4,
-            "three fragments and the parity"
+            e.stats.h264_queue_purged, 3,
+            "the three fragments still queued"
         );
         assert_eq!(e.stats.h264_cache_dropped, 4);
-    }
-
-    #[test]
-    fn the_untracked_parity_names_no_transmission() {
-        let t = Instant::now();
-        let mut e = ReliableTileEmitter::new(t);
-        e.queue_untracked(
-            Bytes::from(crate::transport::protocol::build_frame_parity_datagram(
-                9, 0, false, 2, &[1u8; 10],
-            )),
-            WireClass::Parity,
-        );
-        let em = e.next_emission(t).expect("queued");
-        assert_eq!(em.class(), WireClass::Parity);
-        assert_eq!(em.wire_seq(), None, "NO_ACK is not a wire_seq");
-        assert!(e.take_transmissions().is_empty(), "and is not reported");
     }
 
     #[test]

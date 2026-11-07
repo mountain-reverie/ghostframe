@@ -42,7 +42,7 @@ use crate::transport::peer_auth::{
     AccessPolicy, DenialLog, PeerGate, PeerLookup, SessionRechecker, TsnetWhoIs, WhoIsError,
 };
 use crate::transport::protocol::{
-    encode_tile_datagram, fragment_frame_ref, max_fec_frame_fragment_payload, max_fragment_payload,
+    encode_tile_datagram, fragment_frame_ref, max_fragment_payload, max_frame_fragment_payload,
     Codec, FrameRefInfo, TileFragmentInputs, MAX_TILE_PAYLOAD, PING_PAYLOAD, PONG_PAYLOAD,
     TILE_DATAGRAM_FLAG,
 };
@@ -1105,7 +1105,7 @@ pub struct IoBridge {
     /// Cumulative bytes of CDF53 refinement-tier (passes 4-13) datagrams
     /// emitted since startup. Same semantics as `bytes_emitted_critical`.
     bytes_emitted_refinement: u64,
-    /// Wire bytes of H.264 frames (fragments and parity) sent since startup.
+    /// Wire bytes of H.264 frames (fragments) sent since startup.
     /// Cumulative like the tile counters above, which are tile-only.
     bytes_emitted_h264: u64,
     /// Per-tier ACK round-trip latency stats (BWE Stage 2.0 baseline

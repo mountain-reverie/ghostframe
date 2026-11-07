@@ -70,7 +70,7 @@ struct Entry {
     cum_end: u64,
     enqueued_at: Instant,
     /// The transmission this datagram carries, if it is one the ledger
-    /// tracks. Datagrams that are not (H.264, control, parity) are mirrored
+    /// tracks. Datagrams that are not (H.264, control, tile parity) are mirrored
     /// all the same so the FIFO order is complete, but name no transmission.
     wire_seq: Option<u32>,
     /// For a parity datagram, the first `wire_seq` of the group it covers.

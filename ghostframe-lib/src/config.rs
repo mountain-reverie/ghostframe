@@ -177,7 +177,7 @@ impl ClassifierConfig {
             // for `GHOSTFRAME_FORCE_FRAME_MODE=tile`. Used by the
             // `e2e_lossless_golden_png` test to bypass the H.264 forced-
             // start at session entry so the cdf53 first-paint burst gets
-            // exercised (H.264 has its own FEC + parity + NACK and renders
+            // exercised (H.264 has its own retransmission and recovery and renders
             // fully even under wire loss, masking tile-codec regressions).
             force_frame_mode: get("GHOSTFRAME_FORCE_TILECODEC")
                 .filter(|s| s == "1" || s == "true")
@@ -240,8 +240,7 @@ pub struct TransportConfig {
     /// Emit the tile XOR parity (k=10 groups, one parity datagram per group).
     /// Off by default: it recovered at most 0.8 % of datagrams and cost about
     /// 11 to 14 % of the bytes (13 % typical). From `GHOSTFRAME_TILE_FEC=1|true`. The client
-    /// decodes parity whenever it arrives, whatever this says. H.264 parity is
-    /// separate and unaffected.
+    /// decodes parity whenever it arrives, whatever this says. H.264 has no parity.
     pub tile_fec: bool,
     /// The model controller's settings, from `GHOSTFRAME_CC_*`.
     pub model: ModelSettings,

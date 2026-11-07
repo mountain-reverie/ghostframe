@@ -788,12 +788,6 @@ impl ReliableTileEmitter {
         self.stats.h264_cache_dropped += self.h264.trim_to(H264_CACHE_FRAMES) as u64;
     }
 
-    /// Queue a frame datagram the ledger does not track (XOR parity, whose
-    /// `wire_seq` is `NO_ACK`), to go through admission like any other.
-    pub fn queue_untracked(&mut self, bytes: Bytes, class: WireClass) {
-        self.queue.push_source(bytes, class);
-    }
-
     /// Wire bytes of H.264 frame datagrams waiting in the emission queue.
     pub fn queued_h264_bytes(&self) -> usize {
         self.queue.frame_bytes()

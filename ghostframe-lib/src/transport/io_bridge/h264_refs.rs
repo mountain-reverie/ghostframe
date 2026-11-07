@@ -29,8 +29,8 @@
 //!
 //! Not on these sessions: the periodic GOP IDR, the loss-triggered IDR, the
 //! IDR hold (the manager's own `Plan::Hold`), the rate-change reopen (the rate
-//! moves in place) and the H.264 XOR parity. A client without 0x04 is served the
-//! tile codec; a worker whose backends all refuse answers
+//! moves in place). There is no H.264 XOR parity any more. A client without 0x04
+//! is served the tile codec; a worker whose backends all refuse answers
 //! `H264Reply::Unavailable` and the bridge latches H.264 off (`H264Availability`).
 
 use std::time::{Duration, Instant};

@@ -58,7 +58,7 @@ pub(super) struct Enqueued {
     /// The transmission it carries (its `wire_seq`), when the ledger tracks it.
     pub(super) wire_seq: Option<u32>,
     /// For a tile parity datagram, the first `wire_seq` of the group it covers.
-    /// `None` for everything else, H.264 frame parity included.
+    /// `None` for everything else.
     pub(super) parity_group: Option<u32>,
     /// The session's cumulative accepted bytes including this one.
     pub(super) cum_enqueued: u64,

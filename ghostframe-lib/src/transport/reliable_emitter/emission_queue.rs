@@ -90,8 +90,8 @@ impl Emission {
         match self {
             Emission::Source(b, _) if b.len() >= 12 => {
                 let ws = u32::from_be_bytes([b[8], b[9], b[10], b[11]]);
-                // `NO_ACK` marks a datagram the ledger does not track (XOR
-                // parity of an H.264 frame): it names no transmission.
+                // `NO_ACK` marks a datagram the ledger does not track (an H.264
+                // fragment sent without a ledger record): it names no transmission.
                 (ws != crate::transport::protocol::NO_ACK).then_some(ws)
             }
             Emission::Source(..) | Emission::Parity(..) => None,

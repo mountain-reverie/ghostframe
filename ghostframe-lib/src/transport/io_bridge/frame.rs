@@ -19,6 +19,14 @@
 
 use super::*;
 
+/// Bytes every H.264 fragment is cut short of the datagram limit. It was the
+/// room for the XOR parity's group header; the parity is gone, but the number
+/// stays because the population gates in `browserless_h264` are knife-edge
+/// to fragment sizes (dropping these 3 bytes flipped four of them at once,
+/// with no change in the scenes). Remove it on its own, with those gates
+/// re-measured.
+const H264_FRAGMENT_RESERVE: usize = 3;
+
 /// Which Phase B path started a Cdf53 generation; selects the bump
 /// counter and the `source` field of the `cdf53.emit` log line.
 #[derive(Clone, Copy)]
@@ -1667,8 +1675,7 @@ impl IoBridge {
     /// fragments are dropped. The `RefManager` holds the P frames behind it
     /// (`Plan::Hold`) until its own fragments are acknowledged. There is no
     /// XOR parity: an acked-reference stream repairs from its anchor (design
-    /// D2) and the client tolerates a stream without it. Returns the number of
-    /// fragments.
+    /// D2). Returns the number of fragments.
     pub(super) fn send_h264_frame(
         &mut self,
         encoded: H264Out,
@@ -1688,7 +1695,7 @@ impl IoBridge {
             frame.timestamp_us,
             described.info,
             &encoded.payload,
-            max_fec_frame_fragment_payload(max_dg_size),
+            max_frame_fragment_payload(max_dg_size).saturating_sub(H264_FRAGMENT_RESERVE),
         );
 
         let is_idr = encoded.is_keyframe;
