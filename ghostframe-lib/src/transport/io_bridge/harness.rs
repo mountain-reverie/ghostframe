@@ -118,6 +118,7 @@ impl IoBridge {
     pub(super) fn hold_injected_frame(&mut self, inj: InjectedFrame, cost: std::time::Duration) {
         let started = now_std();
         self.held = Some(HeldFrame {
+            #[cfg(any(test, feature = "browserless-harness"))]
             started,
             until: started + cost,
             frame: inj,
