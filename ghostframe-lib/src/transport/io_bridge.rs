@@ -464,6 +464,8 @@ enum LoopArm {
 
 /// An injected frame waiting out its `cost`. See `IoBridge::held`.
 struct HeldFrame {
+    /// Read only by the hold log of the tests and the browserless harness.
+    #[cfg(any(test, feature = "browserless-harness"))]
     started: std::time::Instant,
     until: std::time::Instant,
     frame: InjectedFrame,

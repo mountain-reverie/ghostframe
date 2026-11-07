@@ -221,6 +221,7 @@ impl IoBridge {
     /// drop) has left the host as far as the transport is concerned: it is on
     /// the wire and lost. It departs now, so later acknowledgements can find the
     /// loss rather than never.
+    #[cfg(any(test, feature = "test-loss-injection"))]
     pub(super) fn departed_without_quinn(&mut self, wire_seq: Option<u32>) {
         let Some(ws) = wire_seq else { return };
         let now = super::now_std();
