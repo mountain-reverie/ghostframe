@@ -36,7 +36,16 @@ use super::syntax::{
 };
 use super::tracker::PicKind;
 use super::va_sys::*;
-use crate::encoder::vaapi_device::vaapi_device_path;
+
+/// Default VA-API render device path. Use [`vaapi_device_path`] to open one:
+/// it honours the `GHOSTFRAME_VAAPI_DEVICE` override.
+pub const VAAPI_DEVICE: &str = "/dev/dri/renderD128";
+
+/// The render node to open: `GHOSTFRAME_VAAPI_DEVICE` if set, else
+/// [`VAAPI_DEVICE`].
+pub fn vaapi_device_path() -> &'static str {
+    crate::config::vaapi_device_override().unwrap_or(VAAPI_DEVICE)
+}
 
 /// `pic_init_qp` for VBR, where the rate control moves it from there.
 const VBR_INIT_QP: u8 = 26;

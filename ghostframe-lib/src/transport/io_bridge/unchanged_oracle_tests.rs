@@ -193,10 +193,6 @@ impl FrameBackend for ScreenBackend {
         })
     }
 
-    fn finish_h264(&mut self, _f: &FrameSubmission, _k: bool) -> Option<H264Out> {
-        None
-    }
-
     fn finish_tile(&mut self, frame: &FrameSubmission, req: &TileRequest<'_>) -> TileOut {
         let up = self.upload.clone().unwrap();
         let mut seen = self.seen.lock().unwrap();

@@ -3,7 +3,7 @@
 //! it with what the encoder meant, loss patterns and a capacity step.
 //!
 //! The server side is `ghostframe_lib::encoder::h264_harness`: a PCM-patch
-//! source (Phase A's policy, or the `RefManager`) behind the bridge's real
+//! source (the `RefManager`'s plans) behind the bridge's real
 //! send path, and a log of the picture each frame was meant to show. Every
 //! picture carries markers (`Picture`), so a decoded one says which frames it
 //! was built from.
@@ -442,16 +442,12 @@ pub fn pcm_load(mode: ghostframe_lib::encoder::h264_harness::PcmMode) -> H264Loa
         cadence_us: crate::harness::browserless::DEFAULT_CADENCE_US,
         idr_bytes: 40_000,
         p_bytes: 3_000,
-        gop_frames: 0,
         width: 1280,
         height: 720,
         quiet: None,
-        cbr: None,
-        pcm: Some(mode),
-        pcm_wrong_ref_every: 0,
+        pcm: mode,
         pcm_rate_policy: false,
         pcm_rate_model: None,
-        pcm_phase_a_rate: false,
         no_probe_raise: false,
         spike_tune: None,
         tile_phases: [None, None],

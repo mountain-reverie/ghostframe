@@ -1,29 +1,18 @@
-//! H.264 frames as members of the transport: the per-frame tracker, the IDR
-//! hold, the IDR request policy (and its rate limit), and the encoder's
-//! backpressure.
+//! H.264 frames as members of the transport: the per-frame tracker, the
+//! stall flag the classifier reads, the bridge's IDR accounting and the
+//! encoder's backpressure. What recovers from loss is the `RefManager`
+//! (`h264_refs`), not an IDR.
 //!
-//! Phase A of the H.264 rework (the design's sections 4.3 and 5): the ffmpeg
-//! encoder has no reference control, so recovery from a loss is an IDR. What
-//! changes from a side channel is that every fragment is a ledger
-//! transmission (`ReliableTileEmitter::submit_h264_fragment`), so it is
-//! acknowledged or judged exactly once, charged to the admission bucket, and
-//! fed to the estimators.
+//! Every fragment is a ledger transmission
+//! (`ReliableTileEmitter::submit_h264_fragment`), so it is acknowledged or
+//! judged exactly once, charged to the admission bucket, and fed to the
+//! estimators.
 //!
-//! Policy implemented here:
-//!
-//! * **Interim loss-triggered IDR.** A loss verdict on a fragment of a P frame
-//!   that is not already acknowledged marks the frame suspect, purges the
-//!   queued fragments of every frame from it on (they chain from a picture the
-//!   client does not have), and asks the encoder for an IDR, at most one per
-//!   [`LOSS_IDR_MIN_INTERVAL`]. A request the limit turned away is remembered
-//!   and made when the interval has passed. Deleted when acked-reference
-//!   recovery lands (Phase B).
 //! * **IDR fragments are repaired, P frames are held.** A verdict on an IDR
-//!   fragment resends it (the emitter does that); until every fragment of the
-//!   newest IDR is acknowledged no P frame is encoded, because the client
+//!   fragment resends it (the emitter does that); the manager plans no P frame
+//!   until every fragment of the newest IDR is acknowledged, because the client
 //!   evicts what is older than `latest - 2` and P frames behind an unfinished
-//!   IDR would push it out. The hold has a ceiling ([`IDR_HOLD_MAX`]): past it
-//!   the hold is dropped and a fresh IDR is requested.
+//!   IDR would push it out.
 //! * **Frame skip.** The encoder is not run while the emission queue holds more
 //!   H.264 bytes than a frame period of the admission rate (or two gate
 //!   depths): a skipped capture loses nothing, every frame being a whole
@@ -31,7 +20,6 @@
 //!   fresh frame. Fragments of a frame an IDR supersedes are purged from the
 //!   queue.
 
-use super::h264_rate::ScriptedCbr;
 use super::*;
 use crate::encoder::h264::tracker::{FragAck, TRACKER_RING};
 use crate::transport::reliable_emitter::Content;
@@ -70,38 +58,18 @@ pub(super) fn stall_inflight_bound(srtt_us: f32) -> u32 {
     STALL_INFLIGHT_FLOOR.max(frames_per_two_rtt.saturating_add(8))
 }
 
-/// Loss-triggered IDRs are made at most this often.
-pub(super) const LOSS_IDR_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// The longest P frames wait for an IDR without any of its fragments being
-/// acknowledged (a no-progress timeout: each acknowledged fragment restarts
-/// it). Retransmission and the probe normally settle an IDR in a few round
-/// trips; a client whose acknowledgements never arrive must not freeze the
-/// H.264 stream for good.
-pub(super) const IDR_HOLD_MAX: std::time::Duration = std::time::Duration::from_secs(3);
-
 /// Why an IDR was made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdrCause {
     /// A new live session (first frame, or after a takeover or reconnect).
     Session,
-    /// A loss verdict on a P-frame fragment (interim, Phase A).
-    Loss,
     /// The client asked (feedback stream 0x09).
     ClientReset,
     /// The frame size changed and the encoder was reopened.
     Resolution,
-    /// The classifier returned from the tile codec to H.264.
+    /// The classifier returned from the tile codec to H.264 with no usable
+    /// anchor.
     Reentry,
-    /// The previous IDR was never fully acknowledged and the hold gave up.
-    HoldTimeout,
-    /// The rate fell by more than 30 % and the encoder was reopened at once
-    /// (a rate change that waits for the scheduled GOP IDR is `GopPeriodic`).
-    RateDrop,
-    /// The rate rose by more than 30 % and the encoder was reopened at once.
-    RateRise,
-    /// None of the above asked for it: the encoder's own GOP.
-    GopPeriodic,
     /// The path MTU fell below the size fragments already built were cut for
     /// (quinn's black-hole detector, after discovery had raised it), so
     /// stored H.264 fragments can no longer be sent. A transport event of the
@@ -111,22 +79,20 @@ pub enum IdrCause {
     /// The backend made an IDR the manager did not plan (observed mode), or
     /// the stream moved to another backend after a fault limit.
     BackendFallback,
+    /// The backend failed or made a stream that is not the plan.
+    EncoderFault,
 }
 
 impl IdrCause {
-    pub(crate) const COUNT: usize = 11;
+    pub(crate) const COUNT: usize = 7;
     pub const ALL: [IdrCause; Self::COUNT] = [
         IdrCause::Session,
-        IdrCause::Loss,
         IdrCause::ClientReset,
         IdrCause::Resolution,
         IdrCause::Reentry,
-        IdrCause::HoldTimeout,
-        IdrCause::RateDrop,
-        IdrCause::RateRise,
-        IdrCause::GopPeriodic,
         IdrCause::MtuShrink,
         IdrCause::BackendFallback,
+        IdrCause::EncoderFault,
     ];
 
     pub fn index(self) -> usize {
@@ -136,29 +102,14 @@ impl IdrCause {
     pub fn name(self) -> &'static str {
         match self {
             IdrCause::Session => "session",
-            IdrCause::Loss => "loss",
             IdrCause::ClientReset => "client_reset",
             IdrCause::Resolution => "resolution",
             IdrCause::Reentry => "reentry",
-            IdrCause::HoldTimeout => "hold_timeout",
-            IdrCause::RateDrop => "rate_drop",
-            IdrCause::RateRise => "rate_rise",
-            IdrCause::GopPeriodic => "gop_periodic",
             IdrCause::MtuShrink => "mtu_shrink",
             IdrCause::BackendFallback => "backend_fallback",
+            IdrCause::EncoderFault => "encoder_fault",
         }
     }
-}
-
-/// What the encoder gate decided for a frame the classifier put in H.264 mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum H264Gate {
-    /// Encode it.
-    Encode,
-    /// An IDR is not fully acknowledged yet: no P frame.
-    SkipHold,
-    /// The emission queue holds more H.264 than a frame period carries.
-    SkipBackpressure,
 }
 
 /// Cumulative H.264 transport counters. Published to the harness and logged
@@ -201,22 +152,8 @@ pub struct H264Stats {
     pub verdicts_already_acked: u64,
     /// The frame had left the tracker.
     pub verdicts_unknown_frame: u64,
-    /// A P-frame fragment's verdict that an IDR already sent or pending
-    /// supersedes: no request, no purge (the IDR does both).
-    pub verdicts_superseded: u64,
     /// IDRs made, by cause (`IdrCause::index`).
     pub idr_by_cause: [u64; IdrCause::COUNT],
-    /// IDR requests made, by cause, and the loss requests the rate limit turned
-    /// away (they are made later, see `deferred_loss_idr`).
-    pub idr_requests_by_cause: [u64; IdrCause::COUNT],
-    pub loss_idr_rate_limited: u64,
-    /// Requests that found one already pending.
-    pub idr_requests_coalesced: u64,
-    /// Time P frames were held for an IDR, ms, and how many holds there were
-    /// and how many gave up.
-    pub p_hold_ms: u64,
-    pub p_holds: u64,
-    pub hold_timeouts: u64,
     /// Frames not encoded, by why.
     pub frames_skipped_hold: u64,
     pub frames_skipped_backpressure: u64,
@@ -241,11 +178,6 @@ pub struct H264Stats {
     pub stalls_inflight: u64,
     pub stalls_no_progress: u64,
     pub stalls_reset: u64,
-    /// Encoder reopens made to change the rate: at once for a fall of more
-    /// than 30 % (`IdrCause::RateDrop`), or at the scheduled GOP IDR.
-    pub rate_reopens_drop: u64,
-    pub rate_reopens_gop: u64,
-    pub rate_reopens_rise: u64,
     /// The rate the encoder was last told to run at, bits per second.
     pub rate_target_bps: u32,
     /// The per-frame budget of the last acked-reference plan, bytes: the cap
@@ -310,7 +242,6 @@ pub(super) struct TrackedFrame {
     /// The client answered for the frame (a frame ack named it decoded or
     /// refused): it is not in flight any more, whatever its fragments did.
     resolved: bool,
-    sent_at: std::time::Instant,
 }
 
 impl TrackedFrame {
@@ -344,13 +275,7 @@ impl FrameTracker {
         frame_seq as usize % TRACKER_RING
     }
 
-    pub(super) fn on_frame_sent(
-        &mut self,
-        frame_seq: u32,
-        is_idr: bool,
-        frags_total: u16,
-        now: std::time::Instant,
-    ) {
+    pub(super) fn on_frame_sent(&mut self, frame_seq: u32, is_idr: bool, frags_total: u16) {
         self.ring[Self::slot(frame_seq)] = Some(TrackedFrame {
             frame_seq,
             is_idr,
@@ -359,36 +284,19 @@ impl FrameTracker {
             acked_count: 0,
             suspect: false,
             resolved: false,
-            sent_at: now,
         });
     }
 
     /// The frames the stall flag counts as in flight: sent, not fully
     /// acknowledged, not judged lost, at or after `floor` (older ones are
-    /// superseded by an IDR or abandoned with H.264 mode) and before
-    /// `doomed_from` (frames after a suspect one chain from it and will never
-    /// be resolved). Returns their number and the send time of the oldest.
-    /// A scan of the ring, once per frame decision, not per datagram.
-    pub(super) fn unresolved(
-        &self,
-        floor: u32,
-        doomed_from: Option<u32>,
-    ) -> (u32, Option<std::time::Instant>) {
-        let mut count = 0u32;
-        let mut oldest: Option<std::time::Instant> = None;
-        for f in self.ring.iter().flatten() {
-            if f.frame_seq < floor
-                || f.suspect
-                || f.resolved
-                || f.complete()
-                || doomed_from.is_some_and(|d| f.frame_seq >= d)
-            {
-                continue;
-            }
-            count += 1;
-            oldest = Some(oldest.map_or(f.sent_at, |o| o.min(f.sent_at)));
-        }
-        (count, oldest)
+    /// superseded by an IDR or abandoned with H.264 mode). A scan of the ring,
+    /// once per frame decision, not per datagram.
+    pub(super) fn unresolved(&self, floor: u32) -> u32 {
+        self.ring
+            .iter()
+            .flatten()
+            .filter(|f| f.frame_seq >= floor && !f.suspect && !f.resolved && !f.complete())
+            .count() as u32
     }
 
     pub(super) fn get(&self, frame_seq: u32) -> Option<&TrackedFrame> {
@@ -434,46 +342,17 @@ impl FrameTracker {
     }
 }
 
-/// The IDR whose fragments P frames wait for.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct IdrHold {
-    pub(super) frame_seq: u32,
-    /// When the hold began (for the time P frames waited).
-    pub(super) since: std::time::Instant,
-    /// The last time a fragment of the held IDR was acknowledged, or the
-    /// start. The ceiling is a no-progress timeout measured from here, so a
-    /// large IDR on a slow link that takes longer than [`IDR_HOLD_MAX`] to
-    /// drain is not given up on while it is still being delivered.
-    pub(super) last_progress: std::time::Instant,
-}
-
 /// The bridge's H.264 transport state. Everything here belongs to one live
 /// session and is cleared by [`H264Tx::reset_session`]; the counters survive.
 #[derive(Default)]
 pub(super) struct H264Tx {
     pub(super) tracker: FrameTracker,
-    pub(super) hold: Option<IdrHold>,
-    /// An IDR asked for and not yet made, and who asked first. While set,
-    /// further requests are coalesced into it.
-    pub(super) pending_idr: Option<IdrCause>,
-    /// When the last loss-triggered IDR was requested.
-    pub(super) last_loss_idr_at: Option<std::time::Instant>,
-    /// A loss-triggered IDR the rate limit turned away; made when it can be.
-    pub(super) deferred_loss_idr: bool,
-    /// Frame size of the last frame encoded, to tell a reopen from a GOP.
-    pub(super) last_dims: Option<(u32, u32)>,
     /// `frame_seq` of the newest IDR sent: every older frame is superseded.
     pub(super) last_idr_seq: Option<u32>,
-    /// Whether any H.264 fragment has been acknowledged in this session, and
-    /// whether the "client does not acknowledge" warning was given.
-    pub(super) acked_any: bool,
-    pub(super) warned_no_acks: bool,
     pub(super) stats: H264Stats,
     /// Frames older than this are not in flight as far as the stall flag is
     /// concerned (set when the session leaves H.264 mode).
     pub(super) ignore_before: u32,
-    /// The oldest frame a loss verdict made suspect since the last IDR.
-    pub(super) doomed_from: Option<u32>,
     /// When an H.264 fragment was last acknowledged.
     pub(super) last_ack_progress: Option<std::time::Instant>,
     /// When the last [`STALL_RESET_COUNT`] client reset requests were
@@ -486,14 +365,8 @@ pub(super) struct H264Tx {
     pub(super) stall_eval_at: Option<std::time::Instant>,
     /// The rate policy (see `h264_rate`).
     pub(super) rate: super::h264_rate::RatePolicy,
-    /// The GOP: an IDR is made when this long has passed since the last one,
-    /// whatever caused that one.
-    pub(super) gop: std::time::Duration,
     /// The frame rate the encoder is opened for.
     pub(super) fps: u32,
-    /// When the last IDR was made; `None` until one. The bridge's clock for
-    /// "the next frame is the scheduled GOP IDR".
-    pub(super) last_idr_at: Option<std::time::Instant>,
     /// A recently acknowledged P-frame fragment's datagram: the padding of a
     /// probe window (see `h264_rate`).
     pub(super) pad_template: Option<bytes::Bytes>,
@@ -501,8 +374,6 @@ pub(super) struct H264Tx {
     pub(super) app_probe: super::h264_rate::AppProbe,
     /// When the encoder's rate was last cut by a reopen (padding keeps quiet).
     pub(super) last_cut_at: Option<std::time::Instant>,
-    /// The harness's scripted CBR encoder, if the scene asked for one.
-    pub(super) scripted: Option<super::h264_rate::ScriptedCbr>,
     /// Acked-reference recovery (Phase B, `h264_refs`): the live session's
     /// manager and the loop's counters.
     /// Which backends the planned path may open, and the openh264 library
@@ -543,9 +414,6 @@ pub(super) struct H264Tx {
     pub(super) queue_since: Option<std::time::Instant>,
     /// The encoder behind the stream, for the `h264 refs` line.
     pub(super) backend_kind: &'static str,
-    /// The harness's PCM-patch source and the log the scene reads (design T3).
-    #[cfg(feature = "browserless-harness")]
-    pub(super) pcm: Option<crate::encoder::h264::harness::PcmSource>,
     /// The PCM encoder the acked-reference path runs inline in a scene, in
     /// place of the encode worker.
     #[cfg(feature = "browserless-harness")]
@@ -553,36 +421,25 @@ pub(super) struct H264Tx {
     /// Harness: the openh264 source of a `PcmMode::OpenH264` scene.
     #[cfg(feature = "browserless-harness")]
     pub(super) oh_source: Option<crate::encoder::h264::harness::Openh264Source>,
+    /// The log the scene reads (design T3).
     #[cfg(feature = "browserless-harness")]
     pub(super) pcm_log: crate::encoder::h264_harness::PcmLog,
-    /// See `InjectedH264::pcm_phase_a_rate`.
-    #[cfg(feature = "browserless-harness")]
-    pub(super) phase_a_rate_step: bool,
 }
 
 impl H264Tx {
-    /// Forget the session's state (tracker, hold, pending request, rate limit).
+    /// Forget the session's state (tracker, stall bookkeeping, rate policy).
     /// Quinn reuses connection handles and the next session starts with an
     /// IDR, so none of this may carry over.
     pub(super) fn reset_session(&mut self) {
         self.tracker.clear();
-        self.hold = None;
-        self.pending_idr = None;
-        self.last_loss_idr_at = None;
-        self.deferred_loss_idr = false;
-        self.last_dims = None;
         self.last_idr_seq = None;
-        self.acked_any = false;
-        self.warned_no_acks = false;
         self.ignore_before = 0;
-        self.doomed_from = None;
         self.last_ack_progress = None;
         self.honoured_resets.clear();
         self.reset_storm_until = None;
         self.stalled = false;
         self.stall_eval_at = None;
         self.rate.reset_session();
-        self.last_idr_at = None;
         self.pad_template = None;
         // The next session builds its own manager (and may be a client that
         // does not send the v2 feedback at all).
@@ -591,140 +448,10 @@ impl H264Tx {
         self.last_sent_at = None;
         self.refused_since_decode = false;
         self.newest_decoded = None;
-        #[cfg(feature = "browserless-harness")]
-        if let Some(p) = self.pcm.as_mut() {
-            p.session_reset();
-        }
     }
 }
 
 impl IoBridge {
-    /// The newest-IDR hold is over (the IDR is acknowledged, or the hold gave
-    /// up, or a newer IDR replaced it): account for how long P frames waited.
-    pub(super) fn end_h264_hold(&mut self, now: std::time::Instant) {
-        if let Some(h) = self.h264.hold.take() {
-            self.h264.stats.p_hold_ms += now.saturating_duration_since(h.since).as_millis() as u64;
-        }
-    }
-
-    /// Ask the encoder for an IDR. Returns whether this started a request (as
-    /// opposed to joining one already pending).
-    ///
-    /// The encoder's keyframe flag is idempotent, so the control is always
-    /// sent; what coalesces is the attribution: while a request is pending
-    /// (made, and no IDR out yet) the cause stays the first one's. Loss
-    /// requests are limited to one per [`LOSS_IDR_MIN_INTERVAL`]; one turned
-    /// away is made later by [`Self::h264_frame_gate`].
-    pub(super) fn request_h264_idr(&mut self, cause: IdrCause, now: std::time::Instant) -> bool {
-        if cause == IdrCause::Loss {
-            let limited = self
-                .h264
-                .last_loss_idr_at
-                .is_some_and(|t| now.saturating_duration_since(t) < LOSS_IDR_MIN_INTERVAL);
-            if limited {
-                self.h264.stats.loss_idr_rate_limited += 1;
-                self.h264.deferred_loss_idr = true;
-                // The IDR is still owed (see `h264_frame_gate`): the next
-                // capture must be whole when it is made.
-                self.ensure_baseline_invalidated();
-                return false;
-            }
-            self.h264.last_loss_idr_at = Some(now);
-            self.h264.deferred_loss_idr = false;
-        }
-        if cause == IdrCause::Loss {
-            // On a screen that has stopped changing there would be no capture
-            // with dirty tiles, so no H.264 frame, so no IDR: make the next
-            // capture whole.
-            self.ensure_baseline_invalidated();
-        }
-        self.backend_apply(Control::RequestKeyframe);
-        if self.h264.pending_idr.is_some() {
-            self.h264.stats.idr_requests_coalesced += 1;
-            return false;
-        }
-        self.h264.pending_idr = Some(cause);
-        self.h264.stats.idr_requests_by_cause[cause.index()] += 1;
-        true
-    }
-
-    /// Record that the next frame is an IDR for `cause` without sending the
-    /// encoder a request: it will make one on its own (a fresh encoder, a
-    /// forced keyframe on re-entry).
-    pub(super) fn expect_h264_idr(&mut self, cause: IdrCause) {
-        if self.h264.pending_idr.is_none() {
-            self.h264.pending_idr = Some(cause);
-            self.h264.stats.idr_requests_by_cause[cause.index()] += 1;
-        }
-    }
-
-    /// The next frame is the re-entry IDR from the tile codec. A loss request
-    /// still pending was made before the tile stretch (and the tile codec
-    /// repainted the screen since): the IDR is credited to the re-entry, which
-    /// is what made it necessary now. Any other pending cause stays.
-    pub(super) fn name_reentry_idr(&mut self) {
-        match self.h264.pending_idr {
-            None => self.expect_h264_idr(IdrCause::Reentry),
-            Some(IdrCause::Loss) => {
-                self.h264.pending_idr = Some(IdrCause::Reentry);
-                self.h264.stats.idr_requests_by_cause[IdrCause::Reentry.index()] += 1;
-            }
-            Some(_) => {}
-        }
-    }
-
-    /// Whether the encoder may run for this frame. See the module docs.
-    pub(crate) fn h264_frame_gate(&mut self, now: std::time::Instant) -> H264Gate {
-        if self.h264.deferred_loss_idr {
-            // A loss IDR the rate limit turned away: due now?
-            let due = self
-                .h264
-                .last_loss_idr_at
-                .is_none_or(|t| now.saturating_duration_since(t) >= LOSS_IDR_MIN_INTERVAL);
-            if due {
-                self.request_h264_idr(IdrCause::Loss, now);
-            }
-        }
-        if let Some(h) = self.h264.hold {
-            if now.saturating_duration_since(h.last_progress) >= IDR_HOLD_MAX {
-                self.h264.stats.hold_timeouts += 1;
-                if !self.h264.acked_any && !self.h264.warned_no_acks {
-                    self.h264.warned_no_acks = true;
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        frame_seq = h.frame_seq,
-                        "H.264 IDR hold timed out and this session has never acknowledged \
-                         an H.264 fragment: the client does not acknowledge H.264"
-                    );
-                }
-                self.end_h264_hold(now);
-                self.request_h264_idr(IdrCause::HoldTimeout, now);
-            }
-        }
-        // An IDR on its way supersedes what is held or queued.
-        if self.h264.pending_idr.is_some() {
-            return H264Gate::Encode;
-        }
-        // A loss IDR the rate limit is still holding back: the P frames that
-        // would be encoded now chain from the suspect frame and are doomed.
-        if self.h264.deferred_loss_idr {
-            self.h264.stats.frames_skipped_hold += 1;
-            return H264Gate::SkipHold;
-        }
-        if self.h264.hold.is_some() {
-            self.h264.stats.frames_skipped_hold += 1;
-            return H264Gate::SkipHold;
-        }
-        if self.h264_backlog_exceeded() {
-            self.h264.stats.frames_skipped_backpressure += 1;
-            if !self.reliable_emitter.pads.is_empty() {
-                self.h264.stats.frames_skipped_pad += 1;
-            }
-            return H264Gate::SkipBackpressure;
-        }
-        H264Gate::Encode
-    }
-
     /// Whether the emission queue holds more H.264 than
     /// `max(one frame period of the admission rate, two gate depths)`.
     pub(super) fn h264_backlog_exceeded(&self) -> bool {
@@ -738,41 +465,15 @@ impl IoBridge {
         self.reliable_emitter.queued_h264_bytes() > limit
     }
 
-    /// An H.264 frame is out of the encoder: attribute it. Returns the cause
-    /// when it is an IDR.
-    #[cfg(test)]
-    pub(super) fn note_h264_encoded(
-        &mut self,
-        is_keyframe: bool,
-        dims: (u32, u32),
-    ) -> Option<IdrCause> {
-        self.note_h264_encoded_as(is_keyframe, dims, None)
-    }
-
-    /// [`Self::note_h264_encoded`] for a frame whose plan named its IDR cause.
-    pub(super) fn note_h264_encoded_as(
-        &mut self,
-        is_keyframe: bool,
-        dims: (u32, u32),
-        planned: Option<IdrCause>,
-    ) -> Option<IdrCause> {
-        let dims_changed = self.h264.last_dims.is_some_and(|d| d != dims);
-        self.h264.last_dims = Some(dims);
+    /// An H.264 frame is out of the encoder: count it. The plan names the
+    /// cause of an IDR; one nobody planned is a session's.
+    pub(super) fn note_h264_encoded_as(&mut self, is_keyframe: bool, planned: Option<IdrCause>) {
         if !is_keyframe {
-            return None;
+            return;
         }
-        // A plan names its own cause; the Phase A request (made by the session
-        // code, whatever the backend) is spent either way.
-        let pending = self.h264.pending_idr.take();
-        let cause = planned.or(pending).unwrap_or(if dims_changed {
-            IdrCause::Resolution
-        } else {
-            IdrCause::GopPeriodic
-        });
+        let cause = planned.unwrap_or(IdrCause::Session);
         self.h264.stats.idr_by_cause[cause.index()] += 1;
         self.h264.stats.frames_idr += 1;
-        self.h264.last_idr_at = Some(now_std());
-        Some(cause)
     }
 
     /// An IDR at `frame_seq` is about to be sent: everything older is
@@ -804,24 +505,10 @@ impl IoBridge {
         }
     }
 
-    /// Open the hold for the IDR at `frame_seq`, replacing an older one.
-    pub(super) fn begin_h264_hold(&mut self, frame_seq: u32, now: std::time::Instant) {
-        self.end_h264_hold(now);
-        self.h264.hold = Some(IdrHold {
-            frame_seq,
-            since: now,
-            last_progress: now,
-        });
-        self.h264.stats.p_holds += 1;
-    }
-
     /// The frame is fully acknowledged.
     fn on_h264_frame_acked(&mut self, frame_seq: u32, now: std::time::Instant) {
         self.h264.stats.frames_acked += 1;
         self.note_raised_acked(frame_seq, now);
-        if self.h264.hold.is_some_and(|h| h.frame_seq == frame_seq) {
-            self.end_h264_hold(now);
-        }
     }
 
     /// Resolved acknowledgements that named H.264 fragments: release their
@@ -850,11 +537,7 @@ impl IoBridge {
             } else {
                 self.h264.stats.tx_acked_live += 1;
             }
-            self.h264.acked_any = true;
             self.h264.last_ack_progress = Some(now);
-            if let Some(h) = self.h264.hold.as_mut().filter(|h| h.frame_seq == frame_seq) {
-                h.last_progress = now;
-            }
             // Keep a small P-frame fragment's bytes for probe padding before
             // the acknowledgement releases it.
             if self.reliable_emitter.h264.is_idr(frame_seq) == Some(false) {
@@ -865,7 +548,7 @@ impl IoBridge {
                 }
             }
             self.reliable_emitter.on_h264_ack(frame_seq, frag_idx);
-            // An IDR draining on a slow link is progress, as for Phase A.
+            // An IDR draining on a slow link is progress.
             // A P frame's fragment acknowledged is progress too, until the client
             // has refused something since it last decoded: a 0x0A blackout with
             // the transport acks flowing is not a stall.
@@ -888,9 +571,8 @@ impl IoBridge {
 
     /// A transmission of an H.264 fragment was judged lost (by a threshold or
     /// by the probe's content-gone rule). An IDR fragment was sent again by the
-    /// loss path already. A P-frame fragment makes its frame suspect: nothing
-    /// that chains from it can be decoded, so the queued fragments of it and
-    /// of every later frame are purged, and an IDR is requested.
+    /// loss path already. A P-frame fragment makes its frame suspect and the
+    /// manager plans the recovery.
     #[cfg(test)]
     pub(super) fn note_h264_verdict(
         &mut self,
@@ -928,43 +610,12 @@ impl IoBridge {
         if in_burst {
             self.h264.stats.p_verdicts_in_probe += 1;
         }
-        // An acked-reference session recovers from its anchor: the verdict
-        // makes the frame suspect and the interim loss IDR below is not made.
-        let already_suspect = f.suspect;
+        // The session recovers from its anchor: the verdict makes the frame
+        // suspect (the client's decoded bit overrides it).
         self.note_raised_lost(frame_seq, now);
         if self.h264_refs_live() {
             self.h264_refs_verdict(frame_seq, now);
-            return;
         }
-        if already_suspect {
-            return;
-        }
-        // A frame an IDR has superseded, or will (one is on its way), is
-        // doomed already: asking again would make a second IDR for the same
-        // loss once the interval passed.
-        if self.h264.pending_idr.is_some() || self.h264.last_idr_seq.is_some_and(|i| frame_seq < i)
-        {
-            self.h264.stats.verdicts_superseded += 1;
-            return;
-        }
-        if let Some(f) = self.h264.tracker.get_mut(frame_seq) {
-            f.suspect = true;
-        }
-        self.h264.doomed_from = Some(
-            self.h264
-                .doomed_from
-                .map_or(frame_seq, |d| d.min(frame_seq)),
-        );
-        self.h264.stats.frames_suspect += 1;
-        self.record_emitted_transmissions(now);
-        let before = self.reliable_emitter.stats.h264_queue_purged;
-        let wire_seqs = self.reliable_emitter.purge_queued_h264(|f| f >= frame_seq);
-        self.h264.stats.queue_purged += self.reliable_emitter.stats.h264_queue_purged - before;
-        self.forget_purged(&wire_seqs);
-        // And the probe cache: entries for bytes that never left would keep
-        // the probe timer and bytes-in-flight counting them.
-        self.reliable_emitter.drop_h264_from(frame_seq);
-        self.request_h264_idr(IdrCause::Loss, now);
     }
 
     /// Evaluate the `h264_stalled` flag at `now`, publish it to the
@@ -983,27 +634,17 @@ impl IoBridge {
             .h264
             .ignore_before
             .max(self.h264.last_idr_seq.unwrap_or(0));
-        let (in_flight, oldest) = self.h264.tracker.unresolved(floor, self.h264.doomed_from);
+        let in_flight = self.h264.tracker.unresolved(floor);
         let bound = stall_inflight_bound(self.adaptation_context.smoothed_rtt_us);
         let over_bound = in_flight > bound;
-        let no_progress = if self.h264_refs_live() {
-            // Frames were sent since the client last decoded one, and it has
-            // not for 500 ms: a client that refuses everything is stalled
-            // however well the transport delivers.
-            match (self.h264.decode_clock, self.h264.last_sent_at) {
-                (Some(d), Some(sent)) => {
-                    sent > d && now.saturating_duration_since(d) >= STALL_NO_PROGRESS
-                }
-                _ => false,
+        // Frames were sent since the client last decoded one, and it has not
+        // for 500 ms: a client that refuses everything is stalled however well
+        // the transport delivers.
+        let no_progress = match (self.h264.decode_clock, self.h264.last_sent_at) {
+            (Some(d), Some(sent)) => {
+                sent > d && now.saturating_duration_since(d) >= STALL_NO_PROGRESS
             }
-        } else {
-            oldest.is_some_and(|oldest| {
-                let since = self
-                    .h264
-                    .last_ack_progress
-                    .map_or(oldest, |p| p.max(oldest));
-                now.saturating_duration_since(since) >= STALL_NO_PROGRESS
-            })
+            _ => false,
         };
         let reset_storm = self.h264.reset_storm_until.is_some_and(|t| now < t);
         let stalled = over_bound || no_progress || reset_storm;
@@ -1072,7 +713,6 @@ impl IoBridge {
     pub(super) fn abandon_h264_inflight(&mut self, frame_seq: u32, now: std::time::Instant) {
         self.h264.ignore_before = self.h264.ignore_before.max(frame_seq);
         self.supersede_h264_before(frame_seq, now);
-        self.end_h264_hold(now);
         // An IDR that was still being delivered is gone with the purge: the
         // manager sends it again at the return, not after its timeout.
         if self.h264_refs_live() {
@@ -1089,12 +729,10 @@ impl IoBridge {
         self.h264.newest_decoded = None;
         // The rate side of H.264 lets go here too, in one place: the padding in
         // flight is forgotten and the application's probe cadence starts over
-        // (`h264_reset_probing`), the rate policy's estimate restarts (the
-        // encoder keeps its rate), and the GOP clock is cleared (the return is
-        // an IDR, which starts it again).
+        // (`h264_reset_probing`), and the rate policy's estimate restarts (the
+        // encoder keeps its rate).
         self.h264_reset_probing();
         self.h264.rate.reset_session();
-        self.h264.last_idr_at = None;
     }
 
     /// Route the loss verdicts of a pass of the loss path to the H.264 policy.
@@ -1124,114 +762,37 @@ impl IoBridge {
         }
     }
 
-    /// The browserless harness's scripted H.264 frame (see [`InjectedH264`]):
-    /// the production gate and send path with a scripted encoder in place of
-    /// the GPU and ffmpeg. Nothing is sent without a live session, as the tile
-    /// injection path.
+    /// The browserless harness's scripted H.264 frame (see [`InjectedH264`]).
+    /// Nothing is sent without a live session, as the tile injection path.
+    #[cfg(feature = "browserless-harness")]
     pub(super) fn apply_injected_h264(&mut self, seq: u32, timestamp_us: u32, h: InjectedH264) {
         let Some(max_dg_size) = self.compute_max_datagram_size() else {
             return;
         };
         let now = now_std();
-        #[cfg(feature = "browserless-harness")]
-        let refs_scene = matches!(
-            h.pcm,
-            Some(
-                crate::encoder::h264_harness::PcmMode::RefManager
-                    | crate::encoder::h264_harness::PcmMode::OpenH264 { .. }
-            )
-        );
-        #[cfg(feature = "browserless-harness")]
-        self.note_injected_h264_mode(refs_scene);
+        self.note_injected_h264_mode();
         // The classifier is not in this scripted path; the flag still is.
         self.update_h264_stall(now);
         self.emit_frame_dimensions(seq, timestamp_us, h.width, h.height);
-        #[cfg(feature = "browserless-harness")]
-        if refs_scene {
-            self.apply_injected_pcm_refs(seq, timestamp_us, h, max_dg_size, now);
-            return;
-        }
-        if self.h264_frame_gate(now) != H264Gate::Encode {
-            // Skipped: the admission pass still runs, as it does for a frame
-            // the production gate drops (the loop turns on regardless).
-            self.pump_admission();
-            return;
-        }
-        #[cfg(feature = "browserless-harness")]
-        if h.pcm.is_some() {
-            self.apply_injected_pcm(seq, timestamp_us, h, max_dg_size);
-            return;
-        }
-        let (is_idr, len) = if let Some(cbr) = h.cbr {
-            // A CBR encoder: the real rate policy runs, and the scripted
-            // encoder takes its controls (see `h264_rate`).
-            let gop = cbr.gop.unwrap_or(self.h264.gop);
-            self.h264
-                .scripted
-                .get_or_insert_with(|| ScriptedCbr::new(cbr));
-            self.h264_rate_step(now, gop, cbr.fps);
-            let requested = self.h264.pending_idr.is_some();
-            self.h264
-                .scripted
-                .as_mut()
-                .expect("created just above")
-                .next_frame(requested)
-        } else {
-            let periodic = h.gop_frames > 0
-                && self
-                    .h264
-                    .stats
-                    .frames_sent
-                    .is_multiple_of(u64::from(h.gop_frames));
-            // The scripted encoder makes an IDR exactly when the bridge asked
-            // for one, on its GOP, and for the first frame of a stream.
-            let is_idr =
-                self.h264.pending_idr.is_some() || periodic || self.h264.stats.frames_sent == 0;
-            (is_idr, if is_idr { h.idr_bytes } else { h.p_bytes })
-        };
-        // Deterministic, incompressible-looking filler; the content is not read.
-        let mut x = seq.wrapping_mul(0x9E37_79B1) | 1;
-        let payload: Vec<u8> = (0..len)
-            .map(|_| {
-                x ^= x << 13;
-                x ^= x >> 17;
-                x ^= x << 5;
-                x as u8
-            })
-            .collect();
-        let meta = frame::FrameMeta {
-            width: h.width,
-            height: h.height,
-            stride: h.width * 4,
-            timestamp_us,
-            capture_done_ns: 0,
-            unchanged: false,
-        };
-        self.send_h264_frame(
-            H264Out {
-                payload,
-                is_keyframe: is_idr,
-            },
-            &meta,
-            seq,
-            max_dg_size,
-        );
+        self.apply_injected_pcm_refs(seq, timestamp_us, h, max_dg_size, now);
+    }
+
+    /// Without the harness there is nothing to inject: the encoder behind a
+    /// scripted frame is the harness's.
+    #[cfg(not(feature = "browserless-harness"))]
+    pub(super) fn apply_injected_h264(&mut self, seq: u32, timestamp_us: u32, h: InjectedH264) {
+        let _ = (seq, timestamp_us, h);
     }
 
     /// The injected stream is in H.264 mode now. Coming back from a stretch of
-    /// tile frames the next frame is a re-entry IDR, as on the capture path
-    /// (`finish_h264_arm`), or a recovery P from the anchor on an
-    /// acked-reference stream (`refs_scene`); the first H.264 frame of the
-    /// scene is not one.
+    /// tile frames the next frame is a recovery P from the anchor
+    /// (`h264_refs_reentry`); the first H.264 frame of the scene is not a
+    /// return.
     #[cfg(feature = "browserless-harness")]
-    fn note_injected_h264_mode(&mut self, refs_scene: bool) {
+    fn note_injected_h264_mode(&mut self) {
         let prev = std::mem::replace(&mut self.frame_mode, crate::tile::FrameMode::H264);
         if prev == crate::tile::FrameMode::TileCodec && self.h264.stats.frames_sent > 0 {
-            if refs_scene {
-                self.h264_refs_reentry(now_std());
-            } else {
-                self.name_reentry_idr();
-            }
+            self.h264_refs_reentry(now_std());
         }
     }
 
@@ -1242,55 +803,17 @@ impl IoBridge {
         self.h264.pcm_log.clone()
     }
 
-    /// A scripted H.264 frame whose payload is a real PCM-patch stream (see
-    /// [`crate::encoder::h264_harness`]), Phase A policy. Past the production
-    /// gate, the frame goes through the same `send_h264_frame` as every other.
+    /// A scripted H.264 frame: production's plan and commit (`h264_refs`)
+    /// around a PCM encoder or the real openh264 library run inline, in place
+    /// of the encode worker. The stepped harness cannot run a worker thread;
+    /// everything else, the manager, the wire header, the send path, the
+    /// ledger feedback and the client's own 0x0A and 0x09, is production's.
     #[cfg(feature = "browserless-harness")]
-    fn apply_injected_pcm(
-        &mut self,
-        seq: u32,
-        timestamp_us: u32,
-        h: InjectedH264,
-        max_dg_size: usize,
-    ) {
-        use crate::encoder::h264::harness::{pad_to, PcmSource};
-        let meta = frame::FrameMeta {
-            width: h.width,
-            height: h.height,
-            stride: h.width * 4,
-            timestamp_us,
-            capture_done_ns: 0,
-            unchanged: false,
-        };
-        let log = self.h264.pcm_log.clone();
-        let source = self.h264.pcm.get_or_insert_with(|| PcmSource::new(log));
-        source.set_wrong_ref_every(h.pcm_wrong_ref_every);
-        let periodic = h.gop_frames > 0
-            && self
-                .h264
-                .stats
-                .frames_sent
-                .is_multiple_of(u64::from(h.gop_frames));
-        let asked = self.h264.pending_idr.is_some() || periodic || self.h264.stats.frames_sent == 0;
-        let (mut payload, is_idr) = source.legacy_frame(seq, asked);
-        pad_to(&mut payload, if is_idr { h.idr_bytes } else { h.p_bytes });
-        self.send_h264_frame(
-            H264Out {
-                payload,
-                is_keyframe: is_idr,
-            },
-            &meta,
-            seq,
-            max_dg_size,
-        );
-    }
-
     /// A scripted H.264 frame of an acked-reference session: production's
     /// plan and commit (`h264_refs`) around a PCM encoder run inline, in place
     /// of the encode worker. The stepped harness cannot run a worker thread;
     /// everything else, the manager, the wire header, the send path, the
     /// ledger feedback and the client's own 0x0A and 0x09, is production's.
-    #[cfg(feature = "browserless-harness")]
     fn apply_injected_pcm_refs(
         &mut self,
         seq: u32,
@@ -1315,13 +838,12 @@ impl IoBridge {
         };
         self.h264.backend_kind = if matches!(
             h.pcm,
-            Some(crate::encoder::h264_harness::PcmMode::OpenH264 { .. })
+            crate::encoder::h264_harness::PcmMode::OpenH264 { .. }
         ) {
             "openh264"
         } else {
             "pcm"
         };
-        self.h264.phase_a_rate_step = h.pcm_phase_a_rate;
         self.h264.raise_mutated_off = h.no_probe_raise;
         let (hold_ms, releasable) = h.spike_tune.map_or((None, true), |(ms, r)| (Some(ms), r));
         self.h264
@@ -1334,11 +856,11 @@ impl IoBridge {
             self.pump_admission();
             return;
         };
-        if let Some(crate::encoder::h264_harness::PcmMode::OpenH264 {
+        if let crate::encoder::h264_harness::PcmMode::OpenH264 {
             scene_change_every,
             churn_every,
             stale_every,
-        }) = h.pcm
+        } = h.pcm
         {
             self.apply_injected_openh264(
                 seq,
@@ -1462,7 +984,7 @@ mod tests {
     #[test]
     fn the_tracker_completes_a_frame_exactly_once_and_ignores_duplicates() {
         let mut t = FrameTracker::default();
-        t.on_frame_sent(7, true, 70, now_std());
+        t.on_frame_sent(7, true, 70);
         for i in 0..69 {
             assert_eq!(t.on_frag_acked(7, i), FragAck::Acked { complete: false });
         }
@@ -1477,8 +999,8 @@ mod tests {
     #[test]
     fn a_slot_reused_by_a_newer_frame_does_not_answer_for_the_old_one() {
         let mut t = FrameTracker::default();
-        t.on_frame_sent(5, false, 2, now_std());
-        t.on_frame_sent(5 + TRACKER_RING as u32, false, 2, now_std());
+        t.on_frame_sent(5, false, 2);
+        t.on_frame_sent(5 + TRACKER_RING as u32, false, 2);
         assert_eq!(t.on_frag_acked(5, 0), FragAck::Unknown);
         assert!(t.get(5).is_none());
         assert_eq!(
@@ -1490,7 +1012,7 @@ mod tests {
     #[test]
     fn clearing_forgets_every_frame() {
         let mut t = FrameTracker::default();
-        t.on_frame_sent(1, true, 1, now_std());
+        t.on_frame_sent(1, true, 1);
         t.clear();
         assert_eq!(t.on_frag_acked(1, 0), FragAck::Unknown);
     }
@@ -1516,6 +1038,18 @@ mod tests {
     const PAYLOAD: usize = 4000;
     const DG: usize = 1200;
 
+    /// A bridge whose live session is served by a `RefManager` (the client
+    /// sends the v2 feedback and one plan was made), which is what reset
+    /// requests act on.
+    async fn refs_live_bridge() -> IoBridge {
+        let mut b = bridge().await;
+        b.client_caps.supports_h264 = true;
+        b.client_caps.h264_acked_ref = true;
+        let _ = b.h264_refs_plan(0, (64, 64), now_std(), false);
+        assert!(b.h264_refs_live(), "premise: a manager serves the session");
+        b
+    }
+
     async fn bridge() -> IoBridge {
         let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
         let server = QuicServer::new().expect("QuicServer::new");
@@ -1533,12 +1067,16 @@ mod tests {
         }
     }
 
-    /// Send a frame. An IDR is a requested one (the session's) unless the test
-    /// has named another cause: the encoder's own periodic IDR holds nothing.
+    /// Send a frame; an IDR is the session's.
     fn send(b: &mut IoBridge, seq: u32, idr: bool) {
-        if idr && b.h264.pending_idr.is_none() {
-            b.h264.pending_idr = Some(IdrCause::Session);
-        }
+        let described = frame::Described {
+            info: if idr {
+                FrameRefInfo::IDR
+            } else {
+                FrameRefInfo::predicted(seq.wrapping_sub(1))
+            },
+            idr_cause: idr.then_some(IdrCause::Session),
+        };
         b.send_h264_frame(
             H264Out {
                 payload: vec![seq as u8; PAYLOAD],
@@ -1547,6 +1085,7 @@ mod tests {
             &meta(),
             seq,
             DG,
+            described,
         );
     }
 
@@ -1597,13 +1136,6 @@ mod tests {
     fn h264_outstanding(b: &IoBridge) -> usize {
         b.transmission_ledger
             .count_outstanding(|c| matches!(c, Content::H264Frag { .. }))
-    }
-
-    /// IDR requests made so far (a request that joined a pending one counts).
-    /// The control that reaches the encoder is covered with a recording
-    /// backend in `tests.rs`; this bridge has no frame worker.
-    fn idr_requests(b: &IoBridge) -> u64 {
-        b.h264.stats.idr_requests_by_cause.iter().sum::<u64>() + b.h264.stats.idr_requests_coalesced
     }
 
     /// Every H.264 transmission with a real wire_seq has a ledger record, and
@@ -1674,176 +1206,23 @@ mod tests {
         );
     }
 
-    /// P frames are held from the moment an IDR is sent until every one of its
-    /// fragments is acknowledged.
-    #[tokio::test(start_paused = true)]
-    async fn p_frames_are_held_until_every_idr_fragment_is_acknowledged() {
-        let mut b = bridge().await;
-        send(&mut b, 1, true);
-        let sent = tracked_sent(&b, 0);
-        assert!(sent.len() >= 4);
-        depart(&mut b, &sent);
-        assert!(b.h264.hold.is_some());
-        assert_eq!(b.h264_frame_gate(now_std()), H264Gate::SkipHold);
-        // All but one acknowledged: still held.
-        let ws: Vec<u32> = sent.iter().map(|x| x.0).collect();
-        ack(&mut b, &ws[..ws.len() - 1]);
-        assert_eq!(b.h264_frame_gate(now_std()), H264Gate::SkipHold);
-        tokio::time::advance(Duration::from_millis(40)).await;
-        ack(&mut b, &ws[ws.len() - 1..]);
-        assert!(
-            b.h264.hold.is_none(),
-            "released by the last acknowledgement"
-        );
-        assert_eq!(b.h264_frame_gate(now_std()), H264Gate::Encode);
-        assert!(
-            b.h264.stats.p_hold_ms >= 40,
-            "the time P frames waited is accounted: {}",
-            b.h264.stats.p_hold_ms
-        );
-        assert_eq!(b.h264.stats.frames_skipped_hold, 2);
-    }
-
-    /// An IDR the client never finishes acknowledging does not freeze the
-    /// stream for good: the hold gives up and a fresh IDR is asked for.
-    #[tokio::test(start_paused = true)]
-    async fn the_idr_hold_gives_up_and_asks_for_a_new_idr() {
-        let mut b = bridge().await;
-        send(&mut b, 1, true);
-        tokio::time::advance(IDR_HOLD_MAX - Duration::from_millis(1)).await;
-        assert_eq!(b.h264_frame_gate(now_std()), H264Gate::SkipHold);
-        tokio::time::advance(Duration::from_millis(2)).await;
-        assert_eq!(b.h264_frame_gate(now_std()), H264Gate::Encode);
-        assert_eq!(b.h264.stats.hold_timeouts, 1);
-        assert_eq!(b.h264.pending_idr, Some(IdrCause::HoldTimeout));
-        assert!(
-            b.h264.warned_no_acks,
-            "a hold that timed out on a session that never acknowledged anything is called out"
-        );
-        assert_eq!(idr_requests(&b), 1);
-        assert!(b.h264.hold.is_none());
-    }
-
-    /// A loss verdict on a P fragment makes one IDR request, purges the
-    /// frames that chain from it, and a second inside the interval is turned
-    /// away and made when the interval has passed.
-    #[tokio::test(start_paused = true)]
-    async fn a_p_fragment_verdict_requests_one_idr_per_interval_and_purges_the_queue() {
-        let mut b = bridge().await;
-        send(&mut b, 1, true);
-        let idr = tracked_sent(&b, 0);
-        depart(&mut b, &idr);
-        let ws: Vec<u32> = idr.iter().map(|x| x.0).collect();
-        ack(&mut b, &ws);
-        assert_eq!(b.h264_frame_gate(now_std()), H264Gate::Encode);
-        // P frames 2 and 3 are queued (the FIFO is at the gate), 4 is not.
-        b.forced_fifo_depth_for_test = Some(usize::MAX / 2);
-        send(&mut b, 2, false);
-        send(&mut b, 3, false);
-        let queued_before = b.reliable_emitter.queued_h264_bytes();
-        assert!(queued_before > 0);
-        b.h264.pending_idr = None; // the IDR above was made; ask afresh
-        let t0 = now_std();
-        b.note_h264_verdict(2, 0, t0);
-        assert_eq!(b.h264.pending_idr, Some(IdrCause::Loss));
-        assert_eq!(idr_requests(&b), 1);
-        assert_eq!(b.h264.stats.frames_suspect, 1);
-        assert_eq!(
-            b.reliable_emitter.queued_h264_bytes(),
-            0,
-            "frames 2 and 3 chain from the lost one and are purged"
-        );
-        assert!(b.h264.stats.queue_purged > 0);
-        // The probe cache goes too: nothing of frames 2 and 3 will be probed,
-        // and the bytes-in-flight figure must not count bytes that never left.
-        assert!(b.reliable_emitter.h264.is_empty());
-        assert_eq!(b.reliable_emitter.bytes_in_flight(), 0);
-        assert!(b.reliable_emitter.pto_deadline().is_none());
-        // A second fragment of the same frame is the same suspicion.
-        b.note_h264_verdict(2, 1, t0);
-        assert_eq!(b.h264.stats.frames_suspect, 1);
-        assert_eq!(b.h264.stats.verdicts_p_frag, 2);
-
-        // The IDR is made; a new loss 500 ms later is turned away, remembered,
-        // and made once the second is up.
-        assert_eq!(b.note_h264_encoded(true, (64, 64)), Some(IdrCause::Loss));
-        let base = idr_requests(&b);
-        tokio::time::advance(Duration::from_millis(500)).await;
-        send(&mut b, 4, false);
-        b.note_h264_verdict(4, 0, now_std());
-        assert_eq!(b.h264.pending_idr, None, "inside the interval: no request");
-        assert_eq!(idr_requests(&b), base);
-        assert_eq!(b.h264.stats.loss_idr_rate_limited, 1);
-        assert!(b.h264.deferred_loss_idr);
-        b.h264.hold = None;
-        // While the IDR is owed, the P frames that would be encoded chain from
-        // the suspect frame: they are not encoded.
-        assert_eq!(b.h264_frame_gate(now_std()), H264Gate::SkipHold);
-        assert_eq!(b.h264.pending_idr, None, "still inside the interval");
-        tokio::time::advance(Duration::from_millis(500)).await;
-        b.h264_frame_gate(now_std());
-        assert_eq!(b.h264.pending_idr, Some(IdrCause::Loss), "due: made now");
-        assert_eq!(idr_requests(&b), base + 1);
-        assert!(!b.h264.deferred_loss_idr);
-    }
-
-    /// A verdict on a frame an IDR has superseded (or is about to) asks for
-    /// nothing, and does not leave a request waiting for the rate limit.
-    #[tokio::test(start_paused = true)]
-    async fn a_verdict_on_a_frame_an_idr_already_covers_asks_for_nothing() {
-        let mut b = bridge().await;
-        send(&mut b, 1, true);
-        let idr = tracked_sent(&b, 0);
-        depart(&mut b, &idr);
-        let ws: Vec<u32> = idr.iter().map(|x| x.0).collect();
-        ack(&mut b, &ws);
-        b.h264.pending_idr = None;
-        send(&mut b, 2, false);
-        send(&mut b, 3, false);
-        let sent = tracked_sent(&b, 0);
-        depart(&mut b, &sent);
-        let t = now_std();
-        b.note_h264_verdict(2, 0, t);
-        assert_eq!(b.h264.pending_idr, Some(IdrCause::Loss));
-        let base = idr_requests(&b);
-        // Frame 3 chains from the lost one; the IDR on its way covers it.
-        b.note_h264_verdict(3, 0, t + Duration::from_millis(10));
-        assert_eq!(b.h264.stats.verdicts_superseded, 1);
-        assert_eq!(idr_requests(&b), base, "no second request");
-        assert!(!b.h264.deferred_loss_idr, "and none waiting for the limit");
-        assert_eq!(b.h264.stats.loss_idr_rate_limited, 0);
-        // The IDR goes out as frame 4: a late verdict on frame 3 is moot.
-        send(&mut b, 4, true);
-        assert_eq!(b.h264.pending_idr, None, "the IDR consumed the request");
-        b.note_h264_verdict(3, 1, t + Duration::from_millis(20));
-        assert_eq!(b.h264.stats.verdicts_superseded, 2);
-        assert!(!b.h264.deferred_loss_idr);
-        tokio::time::advance(LOSS_IDR_MIN_INTERVAL * 2).await;
-        b.h264.hold = None;
-        b.h264_frame_gate(now_std());
-        assert_eq!(
-            b.h264.pending_idr, None,
-            "nothing was left to be made later"
-        );
-    }
-
     /// An IDR fragment is repaired by the loss path, not by a new IDR. A
     /// verdict on a fragment another transmission already delivered is
     /// spurious and does nothing.
     #[tokio::test(start_paused = true)]
-    async fn idr_and_spurious_verdicts_request_no_idr() {
+    async fn idr_and_spurious_verdicts_make_no_frame_suspect() {
         let mut b = bridge().await;
         send(&mut b, 1, true);
         let idr = tracked_sent(&b, 0);
         depart(&mut b, &idr);
-        b.h264.pending_idr = None;
         b.note_h264_verdict(1, 0, now_std());
         assert_eq!(b.h264.stats.verdicts_idr_frag, 1);
-        assert_eq!(b.h264.pending_idr, None);
-        assert_eq!(idr_requests(&b), 0);
+        assert_eq!(
+            b.h264.stats.frames_suspect, 0,
+            "an IDR fragment is repaired"
+        );
 
         // A P frame whose fragment was acknowledged through a probe copy.
-        b.h264.hold = None;
         send(&mut b, 2, false);
         let sent = tracked_sent(&b, 0);
         depart(&mut b, &sent);
@@ -1851,49 +1230,34 @@ mod tests {
         ack(&mut b, &[ws]);
         b.note_h264_verdict(f, i, now_std());
         assert_eq!(b.h264.stats.verdicts_already_acked, 1);
-        assert_eq!(b.h264.pending_idr, None);
-        assert_eq!(idr_requests(&b), 0);
+        assert_eq!(b.h264.stats.frames_suspect, 0);
         // And a frame the tracker no longer follows.
         b.note_h264_verdict(9_999, 0, now_std());
         assert_eq!(b.h264.stats.verdicts_unknown_frame, 1);
     }
 
-    /// The encoder is not run while the queue holds more H.264 than a frame
-    /// period carries; a pending IDR runs it anyway.
+    /// The backlog test of the frame skip: the encoder is not run while the
+    /// queue holds more H.264 than a frame period carries (the plan side of it,
+    /// and the IDR that runs past it, are in `tests.rs`).
     #[tokio::test(start_paused = true)]
-    async fn the_encoder_skips_frames_while_the_queue_is_backed_up() {
+    async fn the_backlog_predicate_closes_while_the_queue_is_backed_up_and_reopens() {
         let mut b = bridge().await;
-        // Start from a settled stream: the IDR is out and acknowledged.
         send(&mut b, 1, true);
         let idr = tracked_sent(&b, 0);
         depart(&mut b, &idr);
         let ws: Vec<u32> = idr.iter().map(|x| x.0).collect();
         ack(&mut b, &ws);
-        b.h264.pending_idr = None;
-        assert_eq!(
-            b.h264_frame_gate(now_std()),
-            H264Gate::Encode,
-            "empty queue"
-        );
+        assert!(!b.h264_backlog_exceeded(), "empty queue");
 
         // The FIFO is at the gate: frames pile up in the queue.
         b.forced_fifo_depth_for_test = Some(usize::MAX / 2);
         let mut seq = 2;
-        while b.h264_frame_gate(now_std()) == H264Gate::Encode {
+        while !b.h264_backlog_exceeded() {
             send(&mut b, seq, false);
             seq += 1;
-            assert!(seq < 200, "the gate never closed");
+            assert!(seq < 200, "the backlog never closed the gate");
         }
-        assert!(
-            seq > 2,
-            "the first frame after an empty queue is always encoded"
-        );
-        assert!(b.h264.stats.frames_skipped_backpressure >= 1);
-        let skipped = b.h264.stats.frames_skipped_backpressure;
-        // A pending IDR supersedes the backlog.
-        b.h264.pending_idr = Some(IdrCause::ClientReset);
-        assert_eq!(b.h264_frame_gate(now_std()), H264Gate::Encode);
-        b.h264.pending_idr = None;
+        assert!(seq > 2, "the first frame after an empty queue is encoded");
         // The queue drains: frames are encoded again.
         b.forced_fifo_depth_for_test = None;
         b.pump_admission();
@@ -1902,8 +1266,7 @@ mod tests {
             0,
             "premise: drained"
         );
-        assert_eq!(b.h264_frame_gate(now_std()), H264Gate::Encode);
-        assert_eq!(b.h264.stats.frames_skipped_backpressure, skipped);
+        assert!(!b.h264_backlog_exceeded());
     }
 
     /// With no acknowledgement ever arriving, the probe cache and the tracker
@@ -1913,10 +1276,7 @@ mod tests {
         use crate::transport::reliable_emitter::h264::H264_CACHE_FRAMES;
         let mut b = bridge().await;
         for seq in 1..=(H264_CACHE_FRAMES as u32 + 40) {
-            // A pending IDR runs the encoder past the hold and the backlog.
-            b.h264.pending_idr = Some(IdrCause::ClientReset);
             send(&mut b, seq, seq == 1);
-            b.h264.hold = None;
         }
         assert_eq!(b.reliable_emitter.h264.frames(), H264_CACHE_FRAMES);
         assert!(b.reliable_emitter.h264.get(1, 0).is_none());
@@ -1969,14 +1329,10 @@ mod tests {
             "forgotten, not left to be judged lost"
         );
         assert_eq!(b.h264.stats.tx_judged_lost, 0);
-        assert_eq!(b.h264.pending_idr, Some(IdrCause::MtuShrink));
         assert!(b.reliable_emitter.h264.get(1, 0).is_none());
 
-        // The IDR for the new size supersedes what is left and holds in its
-        // own right; the retired hold is replaced, not waited on.
+        // The IDR for the new size supersedes what is left.
         send(&mut b, 3, true);
-        assert_eq!(b.h264.stats.idr_by_cause[IdrCause::MtuShrink.index()], 1);
-        assert_eq!(b.h264.hold.map(|h| h.frame_seq), Some(3));
         assert!(b.reliable_emitter.h264.get(2, 0).is_none());
     }
 
@@ -2001,13 +1357,11 @@ mod tests {
         b.forced_raw_datagram_size_for_test = Some(biggest + framing);
         b.drain_reliable_emitter(now_std());
         assert_eq!(b.h264.stats.oversize_h264, 0, "a datagram at the limit");
-        assert_eq!(b.h264.pending_idr, None);
 
         // One byte less: the biggest no longer fits.
         b.forced_raw_datagram_size_for_test = Some(biggest + framing - 1);
         b.drain_reliable_emitter(now_std());
         assert!(b.h264.stats.oversize_h264 > 0, "one byte over");
-        assert_eq!(b.h264.pending_idr, Some(IdrCause::MtuShrink));
         assert_eq!(b.h264.stats.send_too_large, 0);
     }
 
@@ -2036,7 +1390,6 @@ mod tests {
         // content to recover and stays "untracked").
         assert_eq!(b.h264.stats.oversize_h264, wss.len() as u64);
         assert_eq!(b.h264.stats.tx_forgotten, 0);
-        assert_eq!(b.h264.pending_idr, Some(IdrCause::MtuShrink));
         assert!(b.reliable_emitter.h264.get(1, 0).is_none());
     }
 
@@ -2089,11 +1442,6 @@ mod tests {
         b.pump_admission();
         assert!(b.sent_log_for_test.len() > offered, "the fragments went");
         assert_eq!(b.h264.stats.oversize_h264, 0);
-        assert_eq!(b.h264.pending_idr, None);
-        assert_eq!(
-            b.h264.stats.idr_requests_by_cause[IdrCause::MtuShrink.index()],
-            0
-        );
     }
 
     /// An IDR purges what the stale frames still have queued.
@@ -2128,31 +1476,20 @@ mod tests {
         b.forced_fifo_depth_for_test = Some(usize::MAX / 2);
         send(&mut b, 1, true);
         send(&mut b, 2, false);
-        b.h264.last_loss_idr_at = Some(now_std());
-        b.h264.deferred_loss_idr = true;
-        b.h264.pending_idr = Some(IdrCause::Loss);
         // Premises: all of it is populated.
-        assert!(b.h264.hold.is_some() && b.reliable_emitter.queued_h264_bytes() > 0);
+        assert!(b.reliable_emitter.queued_h264_bytes() > 0);
         assert!(!b.reliable_emitter.h264.is_empty());
         assert_eq!(b.h264.tracker.is_complete(1), Some(false));
         let counted = b.h264.stats.frames_sent;
 
         b.fire_session_reset(ConnectionHandle(0));
 
-        assert!(b.h264.hold.is_none(), "hold");
-        assert!(b.h264.last_loss_idr_at.is_none(), "rate limiter");
-        assert!(!b.h264.deferred_loss_idr, "deferred request");
         assert_eq!(b.h264.tracker.is_complete(1), None, "frame tracker");
         assert!(b.reliable_emitter.h264.is_empty(), "probe cache");
         assert_eq!(
             b.reliable_emitter.queued_h264_bytes(),
             0,
             "queued fragments"
-        );
-        assert_eq!(
-            b.h264.pending_idr,
-            Some(IdrCause::Session),
-            "the new session asks for its own IDR, not the old one's cause"
         );
         assert_eq!(b.h264.stats.frames_sent, counted, "counters are cumulative");
     }
@@ -2166,57 +1503,11 @@ mod tests {
         b.last_hello_from = Some(h);
         b.forced_fifo_depth_for_test = Some(usize::MAX / 2);
         send(&mut b, 1, true);
-        b.h264.last_loss_idr_at = Some(now_std());
-        assert!(b.h264.hold.is_some() && !b.reliable_emitter.h264.is_empty());
+        assert!(!b.reliable_emitter.h264.is_empty());
         b.forget_session(h);
-        assert!(b.h264.hold.is_none());
-        assert!(b.h264.last_loss_idr_at.is_none());
         assert!(b.reliable_emitter.h264.is_empty());
         assert_eq!(b.reliable_emitter.queued_h264_bytes(), 0);
         assert_eq!(b.h264.tracker.is_complete(1), None);
-    }
-
-    /// IDR causes are attributed from what asked for them.
-    #[tokio::test(start_paused = true)]
-    async fn idr_causes_follow_what_asked_for_them() {
-        let mut b = bridge().await;
-        let now = now_std();
-        // The first session: a fresh encoder starts with an IDR on its own.
-        b.expect_h264_idr(IdrCause::Session);
-        assert_eq!(b.note_h264_encoded(true, (64, 64)), Some(IdrCause::Session));
-        // A P frame is no IDR.
-        assert_eq!(b.note_h264_encoded(false, (64, 64)), None);
-        // Nothing asked: the encoder's own GOP.
-        assert_eq!(
-            b.note_h264_encoded(true, (64, 64)),
-            Some(IdrCause::GopPeriodic)
-        );
-        // The frame size changed: the encoder was reopened.
-        assert_eq!(
-            b.note_h264_encoded(true, (128, 64)),
-            Some(IdrCause::Resolution)
-        );
-        // Re-entry from the tile codec, a client reset, and the first cause of
-        // several coalesced requests.
-        b.expect_h264_idr(IdrCause::Reentry);
-        assert_eq!(
-            b.note_h264_encoded(true, (128, 64)),
-            Some(IdrCause::Reentry)
-        );
-        b.request_h264_idr(IdrCause::ClientReset, now);
-        b.request_h264_idr(IdrCause::Loss, now);
-        assert_eq!(b.h264.stats.idr_requests_coalesced, 1);
-        assert_eq!(
-            b.note_h264_encoded(true, (128, 64)),
-            Some(IdrCause::ClientReset)
-        );
-        let by = b.h264.stats.idr_by_cause;
-        assert_eq!(by[IdrCause::Session.index()], 1);
-        assert_eq!(by[IdrCause::GopPeriodic.index()], 1);
-        assert_eq!(by[IdrCause::Resolution.index()], 1);
-        assert_eq!(by[IdrCause::Reentry.index()], 1);
-        assert_eq!(by[IdrCause::ClientReset.index()], 1);
-        assert_eq!(b.h264.stats.frames_idr, 5);
     }
 
     /// An acknowledged H.264 fragment is a BWE sample, in the critical tier,
@@ -2242,257 +1533,11 @@ mod tests {
         assert_eq!(b.h264.tracker.is_complete(1), Some(true));
     }
 
-    /// A new session's first H.264 frame is an IDR named for the session, on
-    /// the first HELLO (where a fresh encoder makes it unasked) and on a
-    /// takeover (where the bridge asks for it), and the previous session's
-    /// rate limit and deferred request are not carried into it.
+    /// The fragments of an IDR burst and of a P frame coded at an open window's
+    /// rate (the probe raise) are tagged for the window; a P frame sent after
+    /// the window ended is not.
     #[tokio::test(start_paused = true)]
-    async fn a_hello_names_the_sessions_first_idr_and_a_takeover_asks_for_it() {
-        use crate::transport::client_caps::{ClientCapabilities, HelloMsg};
-        use crate::transport::webtransport::WebTransportServer;
-        let (a, b) = (ConnectionHandle(0), ConnectionHandle(1));
-        let mut bridge = bridge().await;
-        for h in [a, b] {
-            let mut wt = WebTransportServer::default();
-            wt.test_set_connected(true);
-            bridge.wt_sessions.insert(h, wt);
-        }
-        let hello = HelloMsg {
-            caps: ClientCapabilities {
-                indices_raw_enabled: false,
-                supports_h264: true,
-                h264_acked_ref: false,
-            },
-        };
-        assert_eq!(bridge.h264.pending_idr, None);
-        bridge.apply_hello(a, hello);
-        assert_eq!(
-            bridge.h264.pending_idr,
-            Some(IdrCause::Session),
-            "the first session's IDR is named"
-        );
-        // Its IDR is made; later the limiter and a deferred request are live.
-        assert_eq!(
-            bridge.note_h264_encoded(true, (64, 64)),
-            Some(IdrCause::Session)
-        );
-        bridge.h264.last_loss_idr_at = Some(now_std());
-        bridge.h264.deferred_loss_idr = true;
-        // A takeover starts clean and asks for its own IDR.
-        bridge.apply_hello(b, hello);
-        assert_eq!(bridge.h264.pending_idr, Some(IdrCause::Session));
-        assert!(bridge.h264.last_loss_idr_at.is_none());
-        assert!(!bridge.h264.deferred_loss_idr);
-    }
-
-    /// The hold is a no-progress timeout: an IDR that takes longer than the
-    /// ceiling to drain, but whose fragments keep being acknowledged, is not
-    /// given up on; one that goes the ceiling with no acknowledgement is.
-    #[tokio::test(start_paused = true)]
-    async fn the_idr_hold_is_a_no_progress_timeout() {
-        let big = |b: &mut IoBridge| {
-            b.h264.pending_idr = Some(IdrCause::Session);
-            b.send_h264_frame(
-                H264Out {
-                    payload: vec![1; 40_000],
-                    is_keyframe: true,
-                },
-                &meta(),
-                1,
-                DG,
-            );
-        };
-        // Steady progress for more than twice the ceiling.
-        let mut b = bridge().await;
-        big(&mut b);
-        let sent = tracked_sent(&b, 0);
-        depart(&mut b, &sent);
-        assert!(sent.len() >= 31, "premise: a big IDR ({})", sent.len());
-        let start = now_std();
-        for (ws, _, _) in &sent {
-            tokio::time::advance(Duration::from_millis(200)).await;
-            assert_eq!(b.h264_frame_gate(now_std()), H264Gate::SkipHold);
-            ack(&mut b, &[*ws]);
-        }
-        assert!(
-            now_std().duration_since(start) > IDR_HOLD_MAX * 2,
-            "premise: it took longer than twice the ceiling"
-        );
-        assert_eq!(b.h264.stats.hold_timeouts, 0, "progress never timed out");
-        assert!(
-            b.h264.hold.is_none(),
-            "and the last acknowledgement ended it"
-        );
-        assert!(!b.h264.warned_no_acks, "acknowledgements were seen");
-
-        // A few acknowledgements, then silence: the ceiling counts from the last.
-        let mut b = bridge().await;
-        big(&mut b);
-        let sent = tracked_sent(&b, 0);
-        depart(&mut b, &sent);
-        for (ws, _, _) in &sent[..3] {
-            tokio::time::advance(Duration::from_millis(200)).await;
-            ack(&mut b, &[*ws]);
-        }
-        tokio::time::advance(IDR_HOLD_MAX - Duration::from_millis(1)).await;
-        assert_eq!(b.h264_frame_gate(now_std()), H264Gate::SkipHold);
-        tokio::time::advance(Duration::from_millis(2)).await;
-        assert_eq!(b.h264_frame_gate(now_std()), H264Gate::Encode);
-        assert_eq!(b.h264.stats.hold_timeouts, 1);
-        assert!(!b.h264.warned_no_acks, "it did acknowledge some");
-    }
-
-    /// The encoder's own periodic IDR holds nothing, supersedes older frames,
-    /// and ends a hold whose IDR it superseded (that IDR's acknowledgements
-    /// will never complete).
-    #[tokio::test(start_paused = true)]
-    async fn a_periodic_idr_holds_no_p_frames() {
-        let mut b = bridge().await;
-        send(&mut b, 1, true); // the session's IDR: held
-        assert!(b.h264.hold.is_some());
-        b.forced_fifo_depth_for_test = Some(usize::MAX / 2);
-        send(&mut b, 2, false);
-        // Nothing asked for the next IDR: it is the encoder's own GOP.
-        assert_eq!(b.h264.pending_idr, None);
-        b.send_h264_frame(
-            H264Out {
-                payload: vec![9; PAYLOAD],
-                is_keyframe: true,
-            },
-            &meta(),
-            3,
-            DG,
-        );
-        assert_eq!(
-            b.h264.stats.idr_by_cause[IdrCause::GopPeriodic.index()],
-            1,
-            "premise: attributed to the GOP"
-        );
-        assert!(b.h264.hold.is_none(), "no hold, and the old one is over");
-        assert_eq!(
-            b.h264.last_idr_seq,
-            Some(3),
-            "but older frames are superseded"
-        );
-        assert!(b.reliable_emitter.h264.get(1, 0).is_none());
-        assert_eq!(b.h264_frame_gate(now_std()), H264Gate::Encode);
-        assert_eq!(b.h264.stats.p_holds, 1, "only the session's IDR held");
-    }
-
-    /// A rate-change reopen at the scheduled GOP IDR is a periodic IDR in
-    /// every respect (no hold); one forced by a fall of more than 30 % is
-    /// named for the rate and holds P frames like any IDR the client must get.
-    /// The scripted encoder takes the same controls as the real backend, so
-    /// the IDR it makes is the reopen's.
-    #[tokio::test(start_paused = true)]
-    async fn a_rate_drop_idr_holds_p_frames_and_a_gop_rate_change_does_not() {
-        use super::super::h264_rate::{RateStep, ScriptedCbr};
-        let cbr = InjectedCbr {
-            fps: 30,
-            idr_over_p: 5,
-            gop: None,
-        };
-        let enc_frame = |b: &mut IoBridge| {
-            let requested = b.h264.pending_idr.is_some();
-            b.h264.scripted.as_mut().unwrap().next_frame(requested)
-        };
-        for urgent in [true, false] {
-            let mut b = bridge().await;
-            b.h264.scripted = Some(ScriptedCbr::new(cbr));
-            b.h264_apply_rate_step(RateStep::Initial(2_400_000), 5_000_000, 30);
-            // The session's IDR and a P frame.
-            let (idr, _) = enc_frame(&mut b);
-            assert!(idr);
-            send(&mut b, 1, true);
-            b.end_h264_hold(now_std());
-            let (idr, p_len) = enc_frame(&mut b);
-            assert!(!idr && p_len == 10_000, "premise: a P frame at 2.4 Mbit/s");
-            send(&mut b, 2, false);
-            let holds = b.h264.stats.p_holds;
-
-            b.h264_apply_rate_step(
-                RateStep::Reopen {
-                    bps: 1_200_000,
-                    urgent,
-                },
-                1_500_000,
-                30,
-            );
-            assert_eq!(
-                b.h264.pending_idr,
-                urgent.then_some(IdrCause::RateDrop),
-                "only the urgent reopen is named"
-            );
-            let (idr, len) = enc_frame(&mut b);
-            assert!(idr, "a reopen is an IDR");
-            assert_eq!(len, 25_000, "at the new rate: 5 x 5 000");
-            let seq_sent = b.h264.stats.frames_sent as u32 + 1;
-            b.send_h264_frame(
-                H264Out {
-                    payload: vec![0; PAYLOAD],
-                    is_keyframe: true,
-                },
-                &meta(),
-                seq_sent,
-                DG,
-            );
-            let cause = if urgent {
-                IdrCause::RateDrop
-            } else {
-                IdrCause::GopPeriodic
-            };
-            assert_eq!(
-                b.h264.stats.idr_by_cause[cause.index()],
-                1,
-                "urgent={urgent}"
-            );
-            if urgent {
-                assert_eq!(b.h264.stats.p_holds, holds + 1, "the rate drop IDR holds");
-                assert_eq!(b.h264_frame_gate(now_std()), H264Gate::SkipHold);
-                assert_eq!(b.h264.stats.rate_reopens_drop, 1);
-            } else {
-                assert_eq!(b.h264.stats.p_holds, holds, "a GOP IDR holds nothing");
-                assert_eq!(b.h264_frame_gate(now_std()), H264Gate::Encode);
-                assert_eq!(b.h264.stats.rate_reopens_gop, 1);
-            }
-            assert_eq!(b.h264.stats.rate_target_bps, 1_200_000);
-        }
-    }
-
-    /// The GOP is a time since the last IDR of any cause, kept by the bridge:
-    /// the encoder has no periodic IDR of its own to fire first.
-    #[tokio::test(start_paused = true)]
-    async fn the_gop_is_a_time_since_the_last_idr_of_any_cause() {
-        let gop = Duration::from_secs(3);
-        let mut b = bridge().await;
-        // The first rate step: no IDR yet, so no GOP due, and nothing asked.
-        b.h264_rate_step(now_std(), gop, 30);
-        assert_eq!(b.h264.pending_idr, None);
-        b.note_h264_encoded(true, (64, 64));
-        assert!(b.h264.last_idr_at.is_some());
-        tokio::time::advance(Duration::from_millis(2_900)).await;
-        b.h264_rate_step(now_std(), gop, 30);
-        assert_eq!(b.h264.pending_idr, None, "not yet: 2.9 s since the IDR");
-        // A loss IDR in between restarts the clock.
-        b.note_h264_encoded(true, (64, 64));
-        tokio::time::advance(Duration::from_millis(2_900)).await;
-        b.h264_rate_step(now_std(), gop, 30);
-        assert_eq!(b.h264.pending_idr, None, "the loss IDR restarted the GOP");
-        tokio::time::advance(Duration::from_millis(200)).await;
-        b.h264_rate_step(now_std(), gop, 30);
-        assert_eq!(
-            b.h264.pending_idr,
-            Some(IdrCause::GopPeriodic),
-            "3.1 s since the last IDR: the bridge asks for the scheduled one"
-        );
-        b.reset_h264_session();
-        assert!(b.h264.last_idr_at.is_none());
-    }
-
-    /// A probe window is claimed, and fragments tagged, for an IDR burst and
-    /// not for a P frame.
-    #[tokio::test(start_paused = true)]
-    async fn only_an_idr_burst_is_probe_material() {
+    async fn an_idr_burst_and_a_p_frame_inside_the_window_are_probe_material() {
         let mut b = bridge().await;
         let now = now_std();
         b.active_probe = Some(ActiveProbe {
@@ -2510,44 +1555,21 @@ mod tests {
         let after_idr = b.active_probe.as_ref().unwrap().packets_sent;
         assert!(after_idr > 0, "premise: the IDR's fragments were tagged");
         assert!(b.reliable_emitter.h264.get(1, 0).unwrap().probe.is_some());
-        b.h264.hold = None;
         send(&mut b, 2, false);
-        assert_eq!(b.active_probe.as_ref().unwrap().packets_sent, after_idr);
-        assert!(b.reliable_emitter.h264.get(2, 0).unwrap().probe.is_none());
-    }
-
-    /// While the rate limit holds a loss IDR back, the P frames that would be
-    /// encoded chain from the suspect frame and are not encoded.
-    #[tokio::test(start_paused = true)]
-    async fn p_frames_are_not_encoded_while_a_loss_idr_is_deferred() {
-        let mut b = bridge().await;
-        b.h264.deferred_loss_idr = true;
-        b.h264.last_loss_idr_at = Some(now_std());
-        assert_eq!(b.h264_frame_gate(now_std()), H264Gate::SkipHold);
-        assert_eq!(b.h264.stats.frames_skipped_hold, 1);
-        tokio::time::advance(LOSS_IDR_MIN_INTERVAL).await;
-        assert_eq!(
-            b.h264_frame_gate(now_std()),
-            H264Gate::Encode,
-            "due: the IDR is requested and the frame is it"
+        assert!(
+            b.active_probe.as_ref().unwrap().packets_sent > after_idr,
+            "a P frame inside the window is part of its burst"
         );
-        assert_eq!(b.h264.pending_idr, Some(IdrCause::Loss));
-    }
-
-    /// A loss IDR left pending across a tile stretch is credited to the
-    /// re-entry that finally makes it; another pending cause is kept.
-    #[tokio::test(start_paused = true)]
-    async fn a_stale_loss_request_is_credited_to_the_reentry_idr() {
-        let mut b = bridge().await;
-        b.h264.pending_idr = Some(IdrCause::Loss);
-        b.name_reentry_idr();
-        assert_eq!(b.h264.pending_idr, Some(IdrCause::Reentry));
-        b.h264.pending_idr = Some(IdrCause::ClientReset);
-        b.name_reentry_idr();
-        assert_eq!(b.h264.pending_idr, Some(IdrCause::ClientReset));
-        b.h264.pending_idr = None;
-        b.name_reentry_idr();
-        assert_eq!(b.h264.pending_idr, Some(IdrCause::Reentry));
+        assert!(b.reliable_emitter.h264.get(2, 0).unwrap().probe.is_some());
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let before = b.active_probe.as_ref().unwrap().packets_sent;
+        send(&mut b, 3, false);
+        assert_eq!(
+            b.active_probe.as_ref().unwrap().packets_sent,
+            before,
+            "after the window's end nothing is tagged"
+        );
+        assert!(b.reliable_emitter.h264.get(3, 0).unwrap().probe.is_none());
     }
 
     // ---- h264_stalled (A5) ----
@@ -2610,47 +1632,6 @@ mod tests {
         );
     }
 
-    /// (b): frames in flight and none fully acknowledged for 500 ms.
-    #[tokio::test(start_paused = true)]
-    async fn no_frame_progress_for_500ms_raises_the_stall_flag() {
-        let mut b = bridge().await;
-        let t0 = now_std();
-        // Nothing in flight: no stall, however long.
-        assert!(!b.update_h264_stall(t0 + Duration::from_secs(60)));
-        send(&mut b, 1, true);
-        assert!(!b.update_h264_stall(t0 + Duration::from_millis(499)));
-        assert!(b.update_h264_stall(t0 + Duration::from_millis(500)));
-        assert_eq!(b.h264.stats.stalls_no_progress, 1);
-        assert_eq!(b.h264.stats.stalls_inflight, 0);
-        assert!(ctx_flag(&b));
-    }
-
-    /// A stream that keeps completing frames never stalls, however long it
-    /// runs, and the flag clears when progress resumes.
-    #[tokio::test(start_paused = true)]
-    async fn completing_frames_is_progress() {
-        let mut b = bridge().await;
-        send(&mut b, 1, true);
-        complete(&mut b, 1);
-        let mut seq = 2;
-        for _ in 0..20 {
-            tokio::time::advance(Duration::from_millis(300)).await;
-            send(&mut b, seq, false);
-            assert!(!b.update_h264_stall(now_std()), "stalled at frame {seq}");
-            complete(&mut b, seq);
-            seq += 1;
-        }
-        // Now the acknowledgements stop ...
-        send(&mut b, seq, false);
-        tokio::time::advance(Duration::from_millis(500)).await;
-        assert!(b.update_h264_stall(now_std()));
-        assert!(ctx_flag(&b));
-        // ... and resume: the stalled frame completes, the flag drops.
-        complete(&mut b, seq);
-        assert!(!b.update_h264_stall(now_std()));
-        assert!(!ctx_flag(&b));
-    }
-
     /// One frame stuck (its verdict not in yet) while later frames complete is
     /// a path that is alive: any frame completing is progress.
     #[tokio::test(start_paused = true)]
@@ -2670,39 +1651,11 @@ mod tests {
         assert_eq!(b.h264.stats.stalls_no_progress, 0);
     }
 
-    /// Frames a loss verdict doomed (the suspect one and every later one) are
-    /// not "in flight": an IDR is on its way and nothing will resolve them.
-    /// A fragment verdict must not read as a stall.
-    #[tokio::test(start_paused = true)]
-    async fn frames_a_verdict_doomed_are_not_in_flight() {
-        let mut b = bridge().await;
-        send(&mut b, 1, true);
-        complete(&mut b, 1);
-        send(&mut b, 2, false);
-        send(&mut b, 3, false);
-        b.note_h264_verdict(2, 0, now_std());
-        assert_eq!(
-            b.h264.stats.frames_suspect, 1,
-            "premise: frame 2 is suspect"
-        );
-        tokio::time::advance(Duration::from_secs(2)).await;
-        assert!(
-            !b.update_h264_stall(now_std()),
-            "frames 2 and 3 chain from a lost fragment and are not awaited"
-        );
-        // A frame sent before the verdict's IDR is superseded by it too.
-        send(&mut b, 4, false);
-        send(&mut b, 5, true);
-        complete(&mut b, 5);
-        tokio::time::advance(Duration::from_secs(2)).await;
-        assert!(!b.update_h264_stall(now_std()));
-    }
-
     /// (c): three honoured client reset requests within 10 s.
     #[tokio::test(start_paused = true)]
     async fn three_honoured_reset_requests_in_ten_seconds_raise_the_stall_flag() {
         use ghostframe_protocol::feedback_stream::{ResetReason, ResetRequest};
-        let mut b = bridge().await;
+        let mut b = refs_live_bridge().await;
         let t0 = now_std();
         let req = ResetRequest {
             reason: ResetReason::DecoderFailure,
@@ -2737,14 +1690,14 @@ mod tests {
         let ms = Duration::from_millis;
         // Two, 2.2 s apart, and again 2.35 s apart.
         for gap in [2_200, 2_350] {
-            let mut b = bridge().await;
+            let mut b = refs_live_bridge().await;
             let t0 = now_std();
             b.handle_reset_request(req, t0);
             b.handle_reset_request(req, t0 + ms(gap));
             assert!(!b.update_h264_stall(t0 + ms(gap)), "gap {gap}");
         }
         // One every 5.1 s: the third is 10.2 s after the first.
-        let mut b = bridge().await;
+        let mut b = refs_live_bridge().await;
         let t0 = now_std();
         for i in 0..6u64 {
             let t = t0 + ms(i * 5_100);
@@ -2753,62 +1706,13 @@ mod tests {
         }
         assert_eq!(b.reset_requests_honoured, 6, "premise: all honoured");
         // A burst inside the 2 s limit makes one IDR, not three.
-        let mut b = bridge().await;
+        let mut b = refs_live_bridge().await;
         let t0 = now_std();
         for i in 0..5u64 {
             b.handle_reset_request(req, t0 + ms(i * 100));
         }
         assert_eq!(b.reset_requests_honoured, 1, "premise: one honoured");
         assert!(!b.update_h264_stall(t0 + ms(400)));
-    }
-
-    /// One large IDR draining over a slow link, a fragment at a time, is
-    /// progress: it must not read as a stall, however long the drain takes.
-    /// (A 40 KB IDR of 35 fragments, one acknowledged every 25 ms: the whole
-    /// frame is not complete for 875 ms.)
-    #[tokio::test(start_paused = true)]
-    async fn a_large_idr_draining_a_fragment_at_a_time_is_not_a_stall() {
-        let mut b = bridge().await;
-        b.h264.pending_idr = Some(IdrCause::Session);
-        b.send_h264_frame(
-            H264Out {
-                payload: vec![0xA5; 40_000],
-                is_keyframe: true,
-            },
-            &meta(),
-            1,
-            DG,
-        );
-        b.pump_admission();
-        let sent = tracked_sent(&b, 0);
-        assert!(
-            sent.len() >= 33,
-            "premise: a many-fragment IDR: {}",
-            sent.len()
-        );
-        depart(&mut b, &sent);
-        let mut stalled_at = None;
-        for (i, (ws, _, _)) in sent.iter().enumerate() {
-            tokio::time::advance(Duration::from_millis(25)).await;
-            ack(&mut b, &[*ws]);
-            if b.update_h264_stall(now_std()) && stalled_at.is_none() {
-                stalled_at = Some(i);
-            }
-        }
-        assert!(
-            b.h264.tracker.is_complete(1) == Some(true),
-            "premise: the frame completed"
-        );
-        assert!(
-            sent.len() as u64 * 25 > 500,
-            "premise: the drain outlasts the 500 ms bound"
-        );
-        assert_eq!(stalled_at, None, "stalled while the IDR was draining");
-        assert_eq!(b.h264.stats.stalls_no_progress, 0);
-        // And a real stall is still found: the next frame's acks stop.
-        send(&mut b, 2, false);
-        tokio::time::advance(Duration::from_millis(500)).await;
-        assert!(b.update_h264_stall(now_std()));
     }
 
     /// Leaving H.264 mode abandons what was in flight, so the flag clears and
@@ -2856,7 +1760,6 @@ mod tests {
             "premise: queued"
         );
         assert!(!b.reliable_emitter.h264.is_empty(), "premise: cached");
-        assert!(b.h264.hold.is_some(), "premise: P hold open");
         let analysed = crate::transport::io_bridge::frame_backend::Analysed::default();
         let (_, prev, new) = b.classify_dirty_tiles(&analysed, &meta(), 4, 4, 100);
         assert_eq!((prev, new), (FrameMode::H264, FrameMode::TileCodec));
@@ -2864,7 +1767,6 @@ mod tests {
         // The abandoned H.264 does not compete with the tile repaint.
         assert_eq!(b.reliable_emitter.queued_h264_bytes(), 0, "queue purged");
         assert!(b.reliable_emitter.h264.is_empty(), "probe cache dropped");
-        assert!(b.h264.hold.is_none(), "P hold ended");
         assert_eq!(b.h264.stats.stalls_inflight, 1);
         // The next decision: the abandoned frames no longer count, so the
         // flag is down; the classifier still holds H264 off.
@@ -2920,27 +1822,5 @@ mod tests {
             800_000,
             "0.1 B/us is 800 kbit/s"
         );
-    }
-
-    /// The time the flag was up is accounted, in whole milliseconds between
-    /// evaluations that saw it up.
-    #[tokio::test(start_paused = true)]
-    async fn stalled_time_is_accounted() {
-        let mut b = bridge().await;
-        let t0 = now_std();
-        send(&mut b, 1, true);
-        assert!(b.update_h264_stall(t0 + Duration::from_millis(600)));
-        assert!(b.update_h264_stall(t0 + Duration::from_millis(900)));
-        assert!(b.update_h264_stall(t0 + Duration::from_millis(1_400)));
-        assert_eq!(b.h264.stats.h264_stalled_ms, 800);
-        b.abandon_h264_inflight(2, now_std());
-        assert!(!b.update_h264_stall(t0 + Duration::from_millis(1_500)));
-        assert_eq!(
-            b.h264.stats.h264_stalled_ms, 900,
-            "the last interval counts"
-        );
-        assert!(!b.update_h264_stall(t0 + Duration::from_millis(9_000)));
-        assert_eq!(b.h264.stats.h264_stalled_ms, 900);
-        assert_eq!(b.h264.stats.stalls_no_progress, 1, "one rising edge");
     }
 }

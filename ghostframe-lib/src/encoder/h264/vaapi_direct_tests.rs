@@ -38,7 +38,7 @@ use super::refs::{FramePlan, Plan, RefConfig, RefManager, RefStats};
 use super::syntax::{Mmco, SliceHeader, StreamParams};
 use super::tracker::PicKind;
 use super::vaapi_direct::VaapiDirect;
-use crate::encoder::h264_vaapi::FFMPEG_INIT;
+static FFMPEG_INIT: std::sync::Once = std::sync::Once::new();
 
 // ------------------------------------------------------------------ source
 

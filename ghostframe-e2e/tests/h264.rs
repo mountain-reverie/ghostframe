@@ -252,35 +252,21 @@ async fn h264_frames_from_the_server_render_into_the_dmabuf() {
          server logs:\n{server_logs}"
     );
 
-    // The encoder was opened for constant bit rate at the capture rate (30
-    // fps by default), with no GOP of its own: the bridge makes the periodic
-    // IDR, 3 s after the last one (`GHOSTFRAME_H264_GOP_SECONDS` unset). The
-    // decode above therefore rests on the session's IDR and the P frames
-    // chained from it: there is no periodic IDR within the first 3 s to rescue
-    // a missed one. The bit rate is whatever the estimate gave at the first
-    // frame, so only its presence is asserted.
-    //
-    // On the acked-reference path (libva-direct) there is no `FullFrameEncoder`:
-    // the encode worker opens a libva-direct session instead, and the refs
-    // check after the frame assertions covers the rest. The ffmpeg fallback
-    // keeps the old open-line check.
-    let libva_direct = server_logs
-        .lines()
-        .any(|l| l.contains("libva-direct session open") && l.contains("width=1024"));
-    if !libva_direct {
-        assert!(
-            server_logs.contains(
-                "FullFrameEncoder: using h264_vaapi hardware encoder (rate-capped VBR)"
-            ) || server_logs
-                .contains("FullFrameEncoder: using libx264 software encoder (rate-capped)"),
-            "the full-frame encoder was not opened with the CBR parameters. server logs:\n{server_logs}"
-        );
-        assert!(
-            server_logs.contains("fps=30") && server_logs.contains("bps="),
-            "the encoder's open line does not show the capture rate (fps=30) and a bit rate. \
-             server logs:\n{server_logs}"
-        );
-    }
+    // An encoder session was opened at the capture size: libva-direct where
+    // the machine has VA-API, else the OpenH264 library (this image has no
+    // /dev/dri and carries libopenh264). There is no other H.264 encoder, so
+    // an open line of neither kind means the frame sampled above was not an
+    // H.264 frame of this server. The stream's recovery is the manager's, and
+    // the refs check after the frame assertions covers the rest.
+    let session_opened = server_logs.lines().any(|l| {
+        (l.contains("openh264 session open") || l.contains("libva-direct session open"))
+            && l.contains("width=1024")
+    });
+    assert!(
+        session_opened,
+        "neither `openh264 session open` nor `libva-direct session open` (width=1024) was \
+         logged: no encoder carried the stream. server logs:\n{server_logs}"
+    );
 
     // H.264 is lossy, so this test asserts non-flatness rather than exact
     // values -- a strictly weaker claim than "the frame is structurally
@@ -317,11 +303,10 @@ async fn h264_frames_from_the_server_render_into_the_dmabuf() {
     // ordinary lossy compression.
     eprintln!("[m3] red channel spans {lo}..{hi} across the decoded frame");
 
-    // The native client sends HELLO 0x04, so a server whose libva-direct
-    // probe passed must have run the acked-reference path (`RefManager`, no
-    // scheduled GOP IDR). Without VA-API (GitHub CI) the server falls back to
-    // ffmpeg and this says so loudly instead of passing silently; locally
-    // GHOSTFRAME_E2E_REQUIRE_VAAPI=1 turns that fallback into a failure. The
+    // The native client sends HELLO 0x04, so the stream ran the acked-reference
+    // path (`RefManager`): on libva-direct where its probe passed, else on
+    // openh264 (GitHub CI has no VA-API). Locally
+    // GHOSTFRAME_E2E_REQUIRE_VAAPI=1 accepts nothing but libva-direct. The
     // stats lines come every 60 frames, so wait for them.
     report_acked_ref_outcome(
         wait_for_acked_ref_outcome(&setup.server_container_name, Duration::from_secs(60)).await,

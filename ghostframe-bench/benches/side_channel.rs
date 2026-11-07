@@ -136,4 +136,5 @@ pub fn compute_ssim(original_bgra: &[u8], reconstructed_bgra: &[u8], w: u32, h: 
 // Bench harness entry point (no-op). This file is used as a support module
 // via `#[path = "side_channel.rs"] mod side_channel;` in other benches;
 // the `[[bench]]` entry exists solely so `cargo check --benches` compiles it.
+#[allow(dead_code)] // unused when this file is a module of another bench
 fn main() {}

@@ -4,11 +4,6 @@
 //!
 //! Two sources, one truth log.
 //!
-//! * [`PcmMode::Legacy`] is the Phase A policy's stream: the bridge decides
-//!   when an IDR is made (session start, loss, hold timeout, scripted GOP) and
-//!   every P frame predicts from the frame sent before it, with the default
-//!   reference list. It is the baseline the acked-reference policy is
-//!   measured against ([`PcmSource`]).
 //! * [`PcmMode::RefManager`] is production's acked-reference path with a
 //!   [`PcmBackend`] for an encoder: the bridge's `RefManager` plans every
 //!   frame, the backend writes the plan with the real slice-header writer, and
@@ -43,7 +38,7 @@ use super::backend::{
 use super::pcm_rate::RateState;
 use super::pcm_writer::{access_unit, canvas_nv12, parameter_sets, pcm_params, FRAME_BYTES};
 use super::refs::{FramePlan, ResidentRef};
-use super::syntax::{SliceHeader, StreamParams};
+use super::syntax::StreamParams;
 use super::tracker::PicKind;
 
 /// Bytes of a decoded I420 frame of the PCM writer's pictures. A function, not
@@ -55,9 +50,6 @@ pub fn frame_bytes() -> usize {
 /// Where a scene's H.264 frames come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcmMode {
-    /// The Phase A policy: the bridge's IDR decisions, each P from the frame
-    /// before it.
-    Legacy,
     /// The `RefManager`'s plans.
     RefManager,
     /// The real openh264 library behind the observed-mode manager: each frame's
@@ -128,101 +120,6 @@ fn record(log: &PcmLog, seq: u32, entry: TruthEntry) {
     let mut l = log.lock().expect("pcm log poisoned");
     l.truth.insert(seq, entry);
     l.order.push(seq);
-}
-
-#[derive(Debug)]
-struct Prev {
-    seq: u32,
-    frame_num: u32,
-    poc: u32,
-    picture: Picture,
-}
-
-/// The Phase A stream: an IDR when the bridge asks for one, otherwise a P from
-/// the frame sent before it.
-pub(crate) struct PcmSource {
-    params: StreamParams,
-    log: PcmLog,
-    prev: Option<Prev>,
-    idr_pic_id: u32,
-    /// See `InjectedH264::pcm_wrong_ref_every`.
-    wrong_ref_every: u32,
-}
-
-impl PcmSource {
-    pub(crate) fn new(log: PcmLog) -> Self {
-        Self {
-            params: pcm_params(),
-            log,
-            prev: None,
-            idr_pic_id: 0,
-            wrong_ref_every: 0,
-        }
-    }
-
-    pub(crate) fn set_wrong_ref_every(&mut self, n: u32) {
-        self.wrong_ref_every = n;
-    }
-
-    /// The Phase A stream: an IDR when `is_idr`, otherwise a P from the frame
-    /// sent before this one. Its wire description is the bridge's own
-    /// (`h264_ref_info`). Returns the payload and whether it is an IDR: the
-    /// first frame of a stream is one whatever was asked.
-    pub(crate) fn legacy_frame(&mut self, seq: u32, is_idr: bool) -> (Vec<u8>, bool) {
-        let tag = tag_of(seq);
-        let mut au = Vec::new();
-        let (header, picture, ref_seq, frame_num, poc) = match (&self.prev, is_idr) {
-            (Some(prev), false) => {
-                let frame_num = (prev.frame_num + 1) % self.params.max_frame_num();
-                let poc = prev.poc + 2;
-                let lsb = poc & ((1 << self.params.log2_max_poc_lsb) - 1);
-                // The defect under test: written as a non-reference picture,
-                // recorded as the reference of the next frame.
-                let defect = self.wrong_ref_every > 0 && seq.is_multiple_of(self.wrong_ref_every);
-                (
-                    SliceHeader::p(frame_num, lsb, if defect { 0 } else { 2 }),
-                    Picture::predicted(&prev.picture, tag),
-                    Some(prev.seq),
-                    frame_num,
-                    poc,
-                )
-            }
-            _ => {
-                // The first frame of a stream is an IDR whatever was asked.
-                self.idr_pic_id = (self.idr_pic_id + 1) & 0xffff;
-                au.extend(parameter_sets(&self.params));
-                (
-                    SliceHeader::idr(self.idr_pic_id, false),
-                    Picture::idr(tag),
-                    None,
-                    0,
-                    0,
-                )
-            }
-        };
-        au.extend(access_unit(&self.params, &header, tag));
-        record(
-            &self.log,
-            seq,
-            TruthEntry {
-                idr: ref_seq.is_none(),
-                ref_seq,
-                picture: picture.clone(),
-                non_ref: false,
-            },
-        );
-        self.prev = Some(Prev {
-            seq,
-            frame_num,
-            poc,
-            picture,
-        });
-        (au, ref_seq.is_none())
-    }
-
-    pub(crate) fn session_reset(&mut self) {
-        self.prev = None;
-    }
 }
 
 /// A PCM-patch encoder behind the backend trait: it executes the
