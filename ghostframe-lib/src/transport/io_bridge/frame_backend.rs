@@ -226,11 +226,15 @@ pub struct CodedAu(pub(crate) EncodedAu, pub(crate) &'static str);
 pub enum H264Reply {
     /// The plan was executed.
     Coded(CodedAu),
-    /// The backend does not execute plans (no libva-direct here, or it refused
-    /// this stream). Nothing was encoded for this frame; the caller returns
-    /// to the Phase A policy, which this backend serves through
-    /// [`FrameBackend::finish_h264`].
-    Unplanned,
+    /// No backend can code this stream: libva-direct is not here (or refused
+    /// it) and openh264 is not here either, or is outside its limits.
+    /// Nothing was encoded for this frame; the caller stops offering H.264.
+    /// `process_wide` says whether that is a fact about the machine (every
+    /// backend tried is absent: no device, no library; or a backend gave up)
+    /// or only about this picture size (a backend refused the configuration or
+    /// failed at open: `Incapable`, `Driver`), in which case a later,
+    /// different size may still open (see [`unavailable_scope`]).
+    Unavailable { process_wide: bool, why: String },
     /// Nothing was encoded: the frame's GPU outputs were gone.
     Nothing,
     /// The backend failed (or could not follow the plan). It is dropped and
@@ -296,10 +300,13 @@ pub trait FrameBackend: Send {
 
     /// H.264 arm for a session that recovers by acked references: execute the
     /// `RefManager`'s plan. A backend without plan support answers
-    /// [`H264Reply::Unplanned`] and the caller falls back to `finish_h264`.
+    /// [`H264Reply::Unavailable`].
     fn finish_h264_planned(&mut self, frame: &FrameSubmission, req: &H264Request) -> H264Reply {
         let _ = (frame, req);
-        H264Reply::Unplanned
+        H264Reply::Unavailable {
+            process_wide: true,
+            why: "this frame backend executes no plans".into(),
+        }
     }
 
     /// Tile arm.
@@ -343,8 +350,11 @@ pub(crate) static DIRECT_PROBE_FAILURE: std::sync::OnceLock<String> = std::sync:
 
 /// Open the backend a session runs on: libva-direct, then openh264 for
 /// `auto`; one of them alone when the operator chose it. `Err` means neither
-/// is available and the caller falls back to the Phase A encoder (B7a; the
-/// process-wide "H.264 unavailable" latch replaces that in B7b).
+/// is available and the caller stops offering H.264 (see
+/// [`H264Reply::Unavailable`]): `Unavailable` only if every backend tried
+/// said it is not here (the machine); `Incapable` or `Driver` if any of them
+/// refused or failed on this stream's configuration (see
+/// [`unavailable_scope`]).
 ///
 /// A libva-direct open that fails as *unavailable* (no device, driver or
 /// entrypoint) is a probe result about the machine and is remembered in
@@ -372,9 +382,6 @@ pub(crate) fn open_backend(
     match choice {
         H264BackendChoice::Vaapi => try_direct(cfg),
         H264BackendChoice::Openh264 => openh264(cfg),
-        H264BackendChoice::Ffmpeg => Err(BackendError::Unavailable(
-            "GHOSTFRAME_H264_BACKEND selects the ffmpeg encoder".into(),
-        )),
         H264BackendChoice::Auto => match try_direct(cfg) {
             Ok(b) => Ok(b),
             Err(first) => {
@@ -384,10 +391,40 @@ pub(crate) fn open_backend(
                     target: LOG_TARGET,
                     "libva-direct H.264 unavailable ({first}); trying openh264"
                 );
-                openh264(cfg)
-                    .map_err(|second| BackendError::Unavailable(format!("{first}; {second}")))
+                openh264(cfg).map_err(|second| {
+                    let both = format!("{first}; {second}");
+                    // "Unavailable" is the machine, and only when every
+                    // backend tried said so (no device, no library). If any
+                    // of them refused this configuration or failed at open,
+                    // that is about this stream: a later, smaller one may
+                    // still open.
+                    if matches!(first, BackendError::Unavailable(_))
+                        && matches!(second, BackendError::Unavailable(_))
+                    {
+                        BackendError::Unavailable(both)
+                    } else {
+                        BackendError::Incapable(both)
+                    }
+                })
             }
         },
+    }
+}
+
+/// Whether an open failure is a fact about the machine (a latch for the
+/// process) rather than about one stream's configuration (picture size, level,
+/// frame rate) or a transient driver failure, which a later, different stream
+/// may not share. Only `Unavailable` (no device, no library) is the machine.
+pub(crate) fn unavailable_scope(e: &BackendError) -> bool {
+    matches!(e, BackendError::Unavailable(_))
+}
+
+/// What a failed open becomes: "H.264 unavailable", with the scope
+/// [`unavailable_scope`] gives it.
+pub(crate) fn open_failure_reply(e: &BackendError) -> H264Reply {
+    H264Reply::Unavailable {
+        process_wide: unavailable_scope(e),
+        why: e.to_string(),
     }
 }
 
@@ -622,13 +659,7 @@ impl FrameBackend for GpuBackend {
                 &DIRECT_PROBE_FAILURE,
             ) {
                 Ok(b) => self.direct = Some((b, dims, req.backend)),
-                Err(e) => {
-                    tracing::info!(
-                        target: LOG_TARGET,
-                        "acked-reference H.264 unavailable, using the ffmpeg encoder: {e}"
-                    );
-                    return H264Reply::Unplanned;
-                }
+                Err(e) => return open_failure_reply(&e),
             }
         }
         let _ = frame;
@@ -949,7 +980,7 @@ mod backend_choice_tests {
     fn the_choice_decides_which_backends_are_tried() {
         use H264BackendChoice::*;
         // (choice, direct opens, openh264 opens) -> openers called, success
-        let cases: [(H264BackendChoice, bool, bool, &[&str], bool); 9] = [
+        let cases: [(H264BackendChoice, bool, bool, &[&str], bool); 7] = [
             (Auto, true, true, &["direct"], true),
             (Auto, false, true, &["direct", "openh264"], true),
             (Auto, false, false, &["direct", "openh264"], false),
@@ -957,8 +988,6 @@ mod backend_choice_tests {
             (Vaapi, false, true, &["direct"], false),
             (Openh264, true, true, &["openh264"], true),
             (Openh264, true, false, &["openh264"], false),
-            (Ffmpeg, true, true, &[], false),
-            (Ffmpeg, false, false, &[], false),
         ];
         for (choice, direct_ok, oh_ok, want_calls, want_ok) in cases {
             let calls = RefCell::new(Vec::new());
@@ -990,9 +1019,8 @@ mod backend_choice_tests {
         }
     }
 
-    /// `auto` is libva-direct, then openh264, and only then the Phase A
-    /// encoder (B7a; B7b makes that "H.264 unavailable"). openh264 is routed
-    /// now that the manager has an observed mode.
+    /// `auto` is libva-direct, then openh264, and only then "H.264
+    /// unavailable".
     #[test]
     fn openh264_is_routed_into_the_planned_path_when_libva_direct_is_not_there() {
         let calls = RefCell::new(Vec::new());
@@ -1005,7 +1033,7 @@ mod backend_choice_tests {
         );
         assert!(r.is_ok(), "{:?}", r.err());
         assert_eq!(*calls.borrow(), ["direct", "openh264"]);
-        // With neither, the caller gets an Err naming both (and uses Phase A).
+        // With neither, the caller gets an Err naming both.
         let calls = RefCell::new(Vec::new());
         let r = open_backend(
             H264BackendChoice::Auto,
@@ -1018,6 +1046,96 @@ mod backend_choice_tests {
             panic!("neither opens: {r:?}", r = r.is_ok());
         };
         assert!(why.contains("direct") && why.contains("openh264"), "{why}");
+    }
+
+    /// The scope of "unavailable": process-wide only when every backend tried
+    /// said it is not here (no library, no device). A backend that refused
+    /// this configuration or failed at open makes it a per-size answer, so a
+    /// later, smaller stream can still open.
+    #[test]
+    fn the_scope_of_unavailable_is_the_machine_only_when_every_backend_is_absent() {
+        let scope = |choice, direct: BackendError, oh: BackendError| {
+            let r = open_backend(
+                choice,
+                &cfg(),
+                |_| Err(direct),
+                |_| Err(oh),
+                &std::sync::OnceLock::new(),
+            );
+            unavailable_scope(&r.err().expect("neither opens"))
+        };
+        let gone = || BackendError::Unavailable("not here".into());
+        let big = || BackendError::Incapable("above 1920x1080".into());
+        let driver = || BackendError::Driver {
+            call: "vaCreateContext",
+            detail: "refused".into(),
+        };
+        use H264BackendChoice::*;
+        assert!(scope(Auto, gone(), gone()), "no library: the machine");
+        assert!(!scope(Auto, gone(), big()), "the ceiling: this size only");
+        assert!(!scope(Auto, big(), big()));
+        assert!(
+            !scope(Auto, big(), gone()),
+            "VA-API refused this size, no libopenh264: this size only"
+        );
+        assert!(
+            !scope(Auto, driver(), gone()),
+            "a driver failure at open is not the machine"
+        );
+        assert!(!scope(Auto, gone(), driver()));
+        assert!(scope(Openh264, gone(), gone()));
+        assert!(!scope(Openh264, gone(), big()));
+        assert!(
+            scope(Vaapi, gone(), big()),
+            "libva-direct alone is not there"
+        );
+        assert!(!scope(Vaapi, big(), gone()));
+        assert!(!scope(Vaapi, driver(), gone()));
+    }
+
+    /// VA-API present, no libopenh264: libva-direct refuses a dual-4K stream,
+    /// which is that stream's answer, and the 1080p stream after it opens.
+    #[test]
+    fn a_refused_4k_stream_without_openh264_does_not_shut_1080p_out() {
+        let probe = std::sync::OnceLock::new();
+        let uhd = StreamConfig::new(7680, 2160, 30, 8_000_000);
+        let r = open_backend(
+            H264BackendChoice::Auto,
+            &uhd,
+            |_| Err(BackendError::Incapable("above level 5.2".into())),
+            |_| Err(BackendError::Unavailable("no libopenh264".into())),
+            &probe,
+        );
+        let e = r.err().expect("4K is refused");
+        assert!(!unavailable_scope(&e), "{e}");
+        assert!(probe.get().is_none(), "Incapable is not remembered");
+        let calls = RefCell::new(Vec::new());
+        let hd = StreamConfig::new(1920, 1080, 30, 4_000_000);
+        let r = open_backend(
+            H264BackendChoice::Auto,
+            &hd,
+            |_| Ok(rec("direct", &calls)),
+            |_| Err(BackendError::Unavailable("no libopenh264".into())),
+            &probe,
+        );
+        assert!(r.is_ok());
+        assert_eq!(*calls.borrow(), ["direct"]);
+    }
+
+    /// `GpuBackend` turns an open failure into its reply through
+    /// `open_failure_reply`: nothing but "not here" is a latch.
+    #[test]
+    fn only_an_absent_backend_is_a_process_wide_open_failure() {
+        let process_wide = |e: BackendError| match open_failure_reply(&e) {
+            H264Reply::Unavailable { process_wide, .. } => process_wide,
+            _ => panic!("an open failure is an Unavailable reply"),
+        };
+        assert!(process_wide(BackendError::Unavailable("x".into())));
+        assert!(!process_wide(BackendError::Incapable("x".into())));
+        assert!(!process_wide(BackendError::Driver {
+            call: "x",
+            detail: "y".into()
+        }));
     }
 
     /// A libva-direct probe that failed is not run again on the next IDR (the

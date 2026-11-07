@@ -250,10 +250,8 @@ pub struct TransportConfig {
     /// [`H264_GOP_SECS_MIN`]..=[`H264_GOP_SECS_MAX`].
     pub h264_gop_secs: Option<f64>,
     /// Which H.264 encoder backends may open, from `GHOSTFRAME_H264_BACKEND`
-    /// (`auto` | `vaapi` | `openh264` | `ffmpeg` | `legacy`). `auto` is the
-    /// default; `ffmpeg` (alias `legacy`) keeps H.264 on the Phase A policy
-    /// (GOP, loss IDR, parity, reopen) even for clients and encoders that could
-    /// recover by acked references, until B7b removes it.
+    /// (`auto` | `vaapi` | `openh264`). `auto` is the default; any other value
+    /// (the removed `ffmpeg` and `legacy` included) warns and means `auto`.
     pub h264_backend: H264BackendChoice,
     /// The openh264 library to load, from `GHOSTFRAME_H264_OPENH264_LIB`: an
     /// absolute path. `None` (the default) tries the system sonames. openh264
@@ -278,8 +276,6 @@ pub enum H264BackendChoice {
     Vaapi,
     /// openh264 only.
     Openh264,
-    /// The Phase A ffmpeg encoder and policy (`ffmpeg` or `legacy`).
-    Ffmpeg,
 }
 
 impl H264BackendChoice {
@@ -290,12 +286,11 @@ impl H264BackendChoice {
             None | Some("") | Some("auto") => Self::Auto,
             Some("vaapi") => Self::Vaapi,
             Some("openh264") => Self::Openh264,
-            Some("ffmpeg") | Some("legacy") => Self::Ffmpeg,
             Some(other) => {
                 tracing::warn!(
                     target: "ghostframe::config",
                     value = %other,
-                    "GHOSTFRAME_H264_BACKEND is not auto|vaapi|openh264|ffmpeg|legacy: using auto"
+                    "GHOSTFRAME_H264_BACKEND is not auto|vaapi|openh264: using auto"
                 );
                 Self::Auto
             }
@@ -501,11 +496,6 @@ impl TransportConfig {
             openh264_lib: openh264_lib_from_lookup(&get),
             capture_fps: 0,
         }
-    }
-
-    /// Phase A policy forced (`GHOSTFRAME_H264_BACKEND=ffmpeg|legacy`).
-    pub fn h264_legacy(&self) -> bool {
-        self.h264_backend == H264BackendChoice::Ffmpeg
     }
 
     /// The H.264 GOP: the time between IDRs when nothing else asks for one.
@@ -1603,10 +1593,9 @@ mod tests {
         assert_eq!(choice("auto"), H264BackendChoice::Auto);
         assert_eq!(choice("vaapi"), H264BackendChoice::Vaapi);
         assert_eq!(choice("openh264"), H264BackendChoice::Openh264);
-        assert_eq!(choice("ffmpeg"), H264BackendChoice::Ffmpeg);
-        assert_eq!(choice("legacy"), H264BackendChoice::Ffmpeg);
-        assert!(cfg(&[("GHOSTFRAME_H264_BACKEND", "legacy")]).h264_legacy());
-        assert!(!cfg(&[("GHOSTFRAME_H264_BACKEND", "openh264")]).h264_legacy());
+        // The removed values are unknown ones now: a warning and `auto`.
+        assert_eq!(choice("ffmpeg"), H264BackendChoice::Auto);
+        assert_eq!(choice("legacy"), H264BackendChoice::Auto);
         assert_eq!(choice("nonsense"), H264BackendChoice::Auto, "ignored");
         let lib = |v: &str| cfg(&[("GHOSTFRAME_H264_OPENH264_LIB", v)]).openh264_lib;
         assert_eq!(cfg(&[]).openh264_lib, None);

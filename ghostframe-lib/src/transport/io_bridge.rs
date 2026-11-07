@@ -1435,8 +1435,7 @@ impl IoBridge {
             lib_config.transport.h264_gop(),
             lib_config.transport.h264_fps(),
         );
-        let (h264_legacy, h264_backend, openh264_lib) = (
-            lib_config.transport.h264_legacy(),
+        let (h264_backend, openh264_lib) = (
             lib_config.transport.h264_backend,
             lib_config
                 .transport
@@ -1547,7 +1546,6 @@ impl IoBridge {
             h264: H264Tx {
                 gop: h264_gop,
                 fps: h264_fps,
-                refs_enabled: !h264_legacy,
                 backend: h264_backend,
                 openh264_lib,
                 ..H264Tx::default()

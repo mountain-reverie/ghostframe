@@ -503,15 +503,15 @@ pub(super) struct H264Tx {
     pub(super) last_cut_at: Option<std::time::Instant>,
     /// The harness's scripted CBR encoder, if the scene asked for one.
     pub(super) scripted: Option<super::h264_rate::ScriptedCbr>,
-    /// Acked-reference recovery (Phase B, `h264_refs`): whether it is allowed
-    /// at all, what the backend turned out to be, the live session's manager
-    /// and the loop's counters.
-    pub(super) refs_enabled: bool,
+    /// Acked-reference recovery (Phase B, `h264_refs`): the live session's
+    /// manager and the loop's counters.
     /// Which backends the planned path may open, and the openh264 library
     /// to load (`GHOSTFRAME_H264_BACKEND`, `GHOSTFRAME_H264_OPENH264_LIB`).
     pub(super) backend: crate::config::H264BackendChoice,
     pub(super) openh264_lib: Option<std::sync::Arc<std::path::Path>>,
-    pub(super) refs_mode: super::h264_refs::RefsMode,
+    /// Whether any encoder can code H.264 (see `H264Availability`). Not part
+    /// of a session: [`H264Tx::reset_session`] leaves it alone.
+    pub(super) availability: super::h264_refs::H264Availability,
     pub(super) refs: Option<super::h264_refs::RefsState>,
     pub(super) refs_counters: super::h264_refs::RefsCounters,
     /// The probe raise stays off until then (see `RAISE_LOSS_PAUSE`).
@@ -1313,7 +1313,6 @@ impl IoBridge {
             capture_done_ns: 0,
             unchanged: false,
         };
-        self.h264.refs_mode = super::h264_refs::RefsMode::Explicit;
         self.h264.backend_kind = if matches!(
             h.pcm,
             Some(crate::encoder::h264_harness::PcmMode::OpenH264 { .. })

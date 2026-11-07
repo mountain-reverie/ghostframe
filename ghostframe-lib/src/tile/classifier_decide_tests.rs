@@ -1164,6 +1164,72 @@ mod a5_guard {
         assert!(c.guard.headroom_active);
     }
 
+    /// The encoder latch: with no encoder available the classifier never picks
+    /// H.264, whatever pushes toward it, and the decision names the latch.
+    #[test]
+    fn an_unavailable_encoder_keeps_the_stream_on_tiles_whatever_pushes_toward_h264() {
+        let mut c = Classifier::new(ClassifierConfig::default());
+        let h = heavy_motion();
+        let low = AdaptationContext {
+            bwe_estimate_bps: 500_000,
+            ..ctx()
+        };
+        // Premise: without the latch this context reaches H.264.
+        c.set_adaptation_context(low);
+        let (m, r) = run(&mut c, 0, 1_000_000, &h, FrameMode::TileCodec);
+        assert_eq!((m, r), (FrameMode::H264, "headroom_guard"));
+
+        c.set_adaptation_context(AdaptationContext {
+            h264_encoder_unavailable: true,
+            ..low
+        });
+        let t = 1_100_000;
+        assert_eq!(
+            step(&mut c, t, &h, FrameMode::H264),
+            (FrameMode::TileCodec, "h264_encoder_unavailable")
+        );
+        // Not re-entered: no holdoff, no dwell, however long the pressure.
+        let (m, r) = run(&mut c, t, t + 60_000_000, &h, FrameMode::TileCodec);
+        assert_eq!((m, r), (FrameMode::TileCodec, "h264_encoder_unavailable"));
+
+        // Clearing the flag (a per-configuration latch, on a size change)
+        // lets the same pressure back in.
+        c.set_adaptation_context(low);
+        let (m, _) = run(
+            &mut c,
+            t + 61_000_000,
+            t + 64_000_000,
+            &h,
+            FrameMode::TileCodec,
+        );
+        assert_eq!(m, FrameMode::H264);
+    }
+
+    /// The latch beats the mode pin: a pinned H.264 with no encoder would
+    /// classify every frame as H.264 and discard it, a frozen screen.
+    #[test]
+    fn the_encoder_latch_beats_the_h264_mode_pin() {
+        let mut c = Classifier::new(ClassifierConfig {
+            force_frame_mode: Some(FrameMode::H264),
+            ..Default::default()
+        });
+        let h = heavy_motion();
+        // Premise: the pin alone holds H.264.
+        c.set_adaptation_context(ctx());
+        assert_eq!(
+            step(&mut c, 0, &h, FrameMode::TileCodec),
+            (FrameMode::H264, "test_force")
+        );
+        c.set_adaptation_context(AdaptationContext {
+            h264_encoder_unavailable: true,
+            ..ctx()
+        });
+        assert_eq!(
+            step(&mut c, 20_000, &h, FrameMode::H264),
+            (FrameMode::TileCodec, "h264_encoder_unavailable")
+        );
+    }
+
     #[test]
     fn stalled_goes_to_tile_then_holds_h264_off_for_the_reentry_time() {
         let mut c = Classifier::new(ClassifierConfig::default());

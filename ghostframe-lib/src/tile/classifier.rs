@@ -157,6 +157,13 @@ pub struct AdaptationContext {
     /// network stall: it beats every other override, and H.264 is not
     /// re-entered until a holdoff (starting at [`H264_STALL_REENTRY_US`], doubling per repeated stall) after it clears.
     pub h264_stalled: bool,
+    /// No H.264 encoder can serve the stream: the bridge latched it (openh264
+    /// gave up, no library loads) or found the stream outside every
+    /// available backend's limits. Unlike `h264_stalled` there is no way back
+    /// until the bridge clears it (a process-wide latch is never cleared; a
+    /// per-configuration one is, when the picture size changes): the
+    /// classifier stays on the lossless tile codec.
+    pub h264_encoder_unavailable: bool,
 }
 
 impl Default for AdaptationContext {
@@ -170,6 +177,7 @@ impl Default for AdaptationContext {
             supports_h264: true,
             bwe_estimate_bps: 0,
             h264_stalled: false,
+            h264_encoder_unavailable: false,
         }
     }
 }
@@ -687,6 +695,14 @@ impl Classifier {
         tentative_states: &[CodecState],
         prev_mode: FrameMode,
     ) -> (FrameMode, &'static str) {
+        // No encoder can produce H.264 at all. This beats even the mode pin:
+        // a pinned H.264 with no encoder would classify every frame as H.264
+        // and discard it (a frozen screen). The stall machinery has nothing to
+        // say about a stream that does not exist.
+        if self.adaptation_context.h264_encoder_unavailable {
+            self.state = ClassifierHysteresis::default();
+            return (FrameMode::TileCodec, "h264_encoder_unavailable");
+        }
         // Mode pin: when GHOSTFRAME_FORCE_FRAME_MODE (or the older
         // GHOSTFRAME_TEST_FORCE_FRAME_MODE) is set, return that mode every
         // call without running the cost model or hysteresis. Lets tests

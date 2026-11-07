@@ -226,6 +226,15 @@ impl IoBridge {
             .set_adaptation_context(self.adaptation_context);
     }
 
+    /// Tell the classifier whether any H.264 encoder can serve the stream.
+    pub(super) fn set_h264_encoder_unavailable(&mut self, unavailable: bool) {
+        self.adaptation_context.h264_encoder_unavailable = unavailable;
+        self.adaptation_context.last_update_seq =
+            self.adaptation_context.last_update_seq.wrapping_add(1);
+        self.classifier
+            .set_adaptation_context(self.adaptation_context);
+    }
+
     /// Return the capabilities most recently advertised by the client via HELLO.
     /// Returns `ClientCapabilities::default()` until the first HELLO is received.
     pub fn current_client_caps(&self) -> crate::transport::client_caps::ClientCapabilities {

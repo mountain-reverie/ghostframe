@@ -982,7 +982,10 @@ async fn iobridge_holds_scheduler_zero_sized_on_construction() {
 enum PlannedMode {
     /// Execute the plan: an access unit whose header is the plan's.
     Coded,
-    Unplanned,
+    /// No backend can code the stream: the machine's fault.
+    Unavailable,
+    /// No backend can code this picture size.
+    Incapable,
     Failed,
     /// The frame's GPU outputs were gone: nothing encoded.
     Nothing,
@@ -1103,7 +1106,14 @@ impl FrameBackend for RecordingBackend {
             }
         }
         match mode {
-            None | Some(PlannedMode::Unplanned) => H264Reply::Unplanned,
+            None | Some(PlannedMode::Unavailable) => H264Reply::Unavailable {
+                process_wide: true,
+                why: "recording backend: no library".into(),
+            },
+            Some(PlannedMode::Incapable) => H264Reply::Unavailable {
+                process_wide: false,
+                why: "recording backend: above the ceiling".into(),
+            },
             Some(PlannedMode::Observed) => unreachable!("answered above"),
             Some(PlannedMode::Failed) => H264Reply::Failed,
             Some(PlannedMode::Nothing) => H264Reply::Nothing,
@@ -8198,22 +8208,84 @@ async fn a_result_of_an_older_plan_epoch_is_dropped() {
     assert_eq!(bridge.h264_refs_report().epoch_dropped, 1);
 }
 
-/// A backend that executes no plans puts the process back on the Phase A
-/// policy: this frame is dropped, the next is an ordinary Phase A frame.
+/// No backend at all (no library loads) latches H.264 off for the process: the
+/// classifier is told, the manager is dropped, and a later session, a later
+/// size and a later HELLO do not bring it back.
 #[tokio::test]
-async fn a_backend_without_plans_returns_the_stream_to_phase_a() {
-    let (mut bridge, log, _peer) = refs_bridge(PlannedMode::Unplanned).await;
+async fn a_machine_with_no_h264_encoder_latches_h264_off_for_the_process() {
+    let (mut bridge, log, _peer) = refs_bridge(PlannedMode::Unavailable).await;
     refs_frame(&mut bridge, 1).await;
     assert!(log_has(&log, "finish_h264_planned seq=1"));
     assert!(!bridge.h264_refs_active());
-    assert_eq!(bridge.h264_refs_report().unplanned_fallbacks, 1);
+    assert_eq!(bridge.h264_refs_report().unavailable_events, 1);
     assert!(bridge.h264.refs.is_none());
-    refs_frame(&mut bridge, 2).await;
-    assert!(log_has(&log, "finish_h264 force_keyframe"));
+    assert_eq!(
+        bridge.h264.availability,
+        h264_refs::H264Availability::Process
+    );
+    assert!(bridge.adaptation_context.h264_encoder_unavailable);
+    assert!(
+        !log_has(&log, "finish_h264 "),
+        "there is no Phase A to fall back to"
+    );
+    // Not a session matter: a new session, and a different picture size, leave
+    // the latch where it is.
+    bridge.reset_h264_session();
+    bridge.h264_availability_for((64, 64));
+    bridge.h264_availability_for((640, 360));
+    assert_eq!(
+        bridge.h264.availability,
+        h264_refs::H264Availability::Process
+    );
+    assert!(bridge.adaptation_context.h264_encoder_unavailable);
+    assert!(!bridge.h264_refs_active());
 }
 
-/// A backend that fails is reopened with an IDR; three failures in a row give
-/// the stream to Phase A.
+/// A stream outside every backend's limits (openh264's ceiling, no libva-direct)
+/// is unavailable for that picture size only: the next, smaller one is offered
+/// H.264 again, and the classifier hears both. The clear runs through the
+/// frame decision (`classify_dirty_tiles`), not a hand call.
+#[tokio::test]
+async fn a_picture_size_no_encoder_codes_is_unavailable_for_that_size_only() {
+    let (mut bridge, _log, _peer) = refs_bridge(PlannedMode::Incapable).await;
+    refs_frame(&mut bridge, 1).await;
+    assert_eq!(
+        bridge.h264.availability,
+        h264_refs::H264Availability::Config { dims: (64, 64) }
+    );
+    assert!(bridge.adaptation_context.h264_encoder_unavailable);
+    assert!(!bridge.h264_refs_active());
+    assert_eq!(bridge.h264_refs_report().unavailable_events, 1);
+    // Pipelined frames that were classified H.264 before the flag got the
+    // same answer: counted once.
+    bridge.h264_declare_unavailable(false, (64, 64), "second reply");
+    assert_eq!(bridge.h264_refs_report().unavailable_events, 1);
+    let analysed = frame_backend::Analysed::default();
+    let meta_of = |w: u32, h: u32| frame::FrameMeta {
+        width: w,
+        height: h,
+        stride: w * 4,
+        timestamp_us: 0,
+        capture_done_ns: 0,
+        unchanged: false,
+    };
+    // The same size stays off (and a new session does not change that).
+    bridge.reset_h264_session();
+    bridge.classify_dirty_tiles(&analysed, &meta_of(64, 64), 1, 1, 2);
+    assert!(bridge.adaptation_context.h264_encoder_unavailable);
+    assert!(!bridge.h264_refs_active());
+    // A frame of a different size clears it, through the real decision.
+    bridge.classify_dirty_tiles(&analysed, &meta_of(32, 32), 1, 1, 3);
+    assert_eq!(
+        bridge.h264.availability,
+        h264_refs::H264Availability::Available
+    );
+    assert!(!bridge.adaptation_context.h264_encoder_unavailable);
+    assert!(bridge.h264_refs_active());
+}
+
+/// A backend that fails is reopened with an IDR; three failures in a row make
+/// H.264 unavailable.
 #[tokio::test]
 async fn a_failing_backend_restarts_with_an_idr_and_is_given_up_on_after_three() {
     let (mut bridge, _log, _peer) = refs_bridge(PlannedMode::Failed).await;
@@ -8601,23 +8673,22 @@ async fn a_failed_or_inconsistent_encode_is_an_encoder_fault() {
 /// references up; a P frame confirmed as an anchor in between clears the run (a
 /// decoded IDR does not: it is candidate 0 of every epoch).
 #[tokio::test]
-async fn repeated_encoder_faults_without_a_p_anchor_fall_back_to_phase_a() {
+async fn repeated_encoder_faults_without_a_p_anchor_make_h264_unavailable() {
     let mut bridge = acked_refs_bridge();
-    let now = now_std();
     plan_commit(&mut bridge, 0).expect("the IDR");
     ack_every_fragment(&mut bridge, 0);
     bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
     assert_eq!(bridge.h264_refs_report().anchors_confirmed, 1);
     // Two faults, then the IDR is decoded again: still not a P anchor.
-    bridge.h264_refs_encoder_failed(now);
-    bridge.h264_refs_encoder_failed(now);
+    bridge.h264_refs_encoder_failed();
+    bridge.h264_refs_encoder_failed();
     let mut seq = 1;
     plan_commit(&mut bridge, seq).expect("the IDR for the fault");
     ack_every_fragment(&mut bridge, seq);
     bridge.dispatch_frame_ack_for_test(frame_ack_datagram(seq, 1, 0));
     assert_eq!(bridge.h264_refs_report().p_anchors_confirmed, 0);
     // A third fault gives up, the decoded IDR notwithstanding.
-    bridge.h264_refs_encoder_failed(now);
+    bridge.h264_refs_encoder_failed();
     assert!(!bridge.h264_refs_active());
 
     // The control: a confirmed P anchor between faults clears the run.
@@ -8625,8 +8696,8 @@ async fn repeated_encoder_faults_without_a_p_anchor_fall_back_to_phase_a() {
     plan_commit(&mut bridge, 0).expect("the IDR");
     ack_every_fragment(&mut bridge, 0);
     bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
-    bridge.h264_refs_encoder_failed(now);
-    bridge.h264_refs_encoder_failed(now);
+    bridge.h264_refs_encoder_failed();
+    bridge.h264_refs_encoder_failed();
     seq = 1;
     plan_commit(&mut bridge, seq).expect("the IDR for the fault");
     ack_every_fragment(&mut bridge, seq);
@@ -8638,19 +8709,22 @@ async fn repeated_encoder_faults_without_a_p_anchor_fall_back_to_phase_a() {
         ack_every_fragment(&mut bridge, seq);
         bridge.dispatch_frame_ack_for_test(frame_ack_datagram(seq, 1, 0));
     }
-    bridge.h264_refs_encoder_failed(now);
+    bridge.h264_refs_encoder_failed();
     assert!(
         bridge.h264_refs_active(),
         "a P anchor was confirmed between"
     );
-    bridge.h264_refs_encoder_failed(now);
+    bridge.h264_refs_encoder_failed();
     assert!(bridge.h264_refs_active());
     bridge.pending_controls.clear();
-    bridge.h264_refs_encoder_failed(now);
+    bridge.h264_refs_encoder_failed();
     assert!(!bridge.h264_refs_active());
     assert!(bridge.h264.refs.is_none());
-    assert_eq!(bridge.h264.pending_idr, Some(IdrCause::Session));
-    assert_eq!(keyframe_controls(&bridge), 1, "the encoder is asked for it");
+    assert_eq!(
+        bridge.h264.availability,
+        h264_refs::H264Availability::Process
+    );
+    assert!(bridge.adaptation_context.h264_encoder_unavailable);
 }
 
 /// Further verdicts on a frame already suspect do nothing more.
@@ -8893,7 +8967,7 @@ async fn a_backend_that_fails_every_p_frame_is_given_up_on() {
             ack_every_fragment(&mut bridge, seq);
             bridge.dispatch_frame_ack_for_test(frame_ack_datagram(seq, 1, 0));
         } else {
-            bridge.h264_refs_encoder_failed(now);
+            bridge.h264_refs_encoder_failed();
             faults += 1;
         }
         seq += 1;
@@ -9785,12 +9859,13 @@ async fn libva_direct_at_its_fault_limit_demotes_to_openh264() {
         crate::config::H264BackendChoice::Openh264
     );
     assert!(bridge.h264_refs_active(), "refs are not given up on");
-    assert_eq!(r.unplanned_fallbacks, 0);
-    assert_ne!(
-        bridge.h264.refs_mode,
-        h264_refs::RefsMode::Legacy,
+    assert_eq!(r.unavailable_events, 0);
+    assert_eq!(
+        bridge.h264.availability,
+        h264_refs::H264Availability::Available,
         "the latch is not set"
     );
+    assert!(!bridge.adaptation_context.h264_encoder_unavailable);
     // The next frame is the demotion's IDR, from openh264, asked for openh264.
     refs_frame(&mut bridge, 5).await;
     let r = bridge.h264_refs_report();
@@ -9814,10 +9889,10 @@ async fn libva_direct_at_its_fault_limit_demotes_to_openh264() {
     assert!(bridge.h264.refs.as_ref().unwrap().mgr.is_observed());
 }
 
-/// openh264 failing at its own limit is not a demotion: B7a hands the process
-/// to Phase A, as a machine without libva-direct does today.
+/// openh264 failing at its own limit is not a demotion: nothing is left to
+/// move to, so H.264 is unavailable for the process.
 #[tokio::test]
-async fn openh264_at_its_fault_limit_gives_the_stream_to_phase_a() {
+async fn openh264_at_its_fault_limit_latches_h264_off() {
     use PlannedMode::*;
     let (mut bridge, _log, _script, _sim, _peer) =
         observed_bridge(&[Observed, Failed, Failed, Failed]).await;
@@ -9829,7 +9904,13 @@ async fn openh264_at_its_fault_limit_gives_the_stream_to_phase_a() {
     }
     let r = bridge.h264_refs_report();
     assert_eq!(r.backend_demotions, 0, "{r:?}");
-    assert!(!bridge.h264_refs_active(), "Phase A from here");
+    assert!(!bridge.h264_refs_active(), "unavailable from here");
+    assert_eq!(
+        bridge.h264.availability,
+        h264_refs::H264Availability::Process
+    );
+    assert!(bridge.adaptation_context.h264_encoder_unavailable);
+    assert_eq!(r.unavailable_events, 1, "{r:?}");
 }
 
 /// A frame the worker encoded and the loop could not send (the session moved
