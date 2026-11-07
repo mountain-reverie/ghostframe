@@ -201,8 +201,6 @@ pub struct ClientCore {
     pub(crate) decoder_epoch_start: Option<u32>,
     pub(crate) h264_not_output_total: u64,
     pub(crate) h264_not_output_streak: u64,
-    /// H.264 fragments rebuilt from XOR parity (cumulative).
-    pub(crate) h264_fragments_recovered: u64,
     /// Coverage NACKs awaiting the debounce window before being handed to
     /// `nack_batcher` (main.ts `pendingNacks` / `queuePassNack`).
     /// Keyed `(pass_idx, tile_y, tile_x)`, so iteration order IS send order:
@@ -255,7 +253,6 @@ impl ClientCore {
             decoder_epoch_start: None,
             h264_not_output_total: 0,
             h264_not_output_streak: 0,
-            h264_fragments_recovered: 0,
             pending_nacks: std::collections::BTreeMap::new(),
             pending_nack_deadline_us: None,
             next_tail_sweep_us: now_us + TAIL_SWEEP_INTERVAL_US,
@@ -434,11 +431,6 @@ impl ClientCore {
             deadline = deadline.min(d);
         }
         Some(deadline)
-    }
-
-    /// H.264 fragments rebuilt from XOR parity since the core was created.
-    pub fn h264_fragments_recovered(&self) -> u64 {
-        self.h264_fragments_recovered
     }
 
     /// Pre-FEC loss, loss-run lengths and FEC recoveries measured from

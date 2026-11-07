@@ -1,14 +1,12 @@
 //! Throughput of CPU-only pipeline primitives that run on every frame:
 //!  * `DirtyTracker::update` (tile diff)
 //!  * `protocol::fragment_tile` and `fragment_frame` (MTU split)
-//!  * `fec::xor_payloads` (FEC parity generation across a fragment group)
 //!
 //! These have no GPU dependency, so they run on every CI machine.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use ghostframe_lib::tile::{DirtyTracker, BPP, TILE_SIZE};
-use ghostframe_lib::transport::fec;
 use ghostframe_lib::transport::protocol::{
     fragment_frame, fragment_tile, max_fragment_payload, Codec, TileFragmentInputs,
 };
@@ -95,36 +93,10 @@ fn bench_fragment_frame(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_fec_parity(c: &mut Criterion) {
-    let mut group = c.benchmark_group("fec_parity");
-
-    // Simulate a frame split across 64 fragments of 1186 bytes each.
-    // K values track production: fec_group_size(true) = I-frame K,
-    // fec_group_size(false) = P-frame K. Benching production constants
-    // means the numbers stay representative if those defaults change.
-    let frags: Vec<Vec<u8>> = (0..64).map(|_| vec![0u8; 1186]).collect();
-    let total_bytes: u64 = frags.iter().map(|f| f.len() as u64).sum();
-
-    for (label, is_keyframe) in [("iframe", true), ("pframe", false)] {
-        let k = fec::fec_group_size(is_keyframe);
-        group.throughput(Throughput::Bytes(total_bytes));
-        group.bench_with_input(BenchmarkId::from_parameter(label), &k, |b, &k| {
-            b.iter(|| {
-                for chunk in frags.chunks(k) {
-                    let refs: Vec<&[u8]> = chunk.iter().map(|v| v.as_slice()).collect();
-                    black_box(fec::xor_payloads(&refs, 1186));
-                }
-            });
-        });
-    }
-    group.finish();
-}
-
 criterion_group!(
     benches,
     bench_dirty_tracker,
     bench_fragment_tile,
-    bench_fragment_frame,
-    bench_fec_parity
+    bench_fragment_frame
 );
 criterion_main!(benches);

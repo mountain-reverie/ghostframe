@@ -4,12 +4,12 @@
 //! The server records every H.264 fragment it sends in its transmission
 //! ledger under a real `wire_seq` and judges it lost unless the client
 //! acknowledges that `wire_seq`. These tests pin what the client owes: one
-//! acknowledgement per received source fragment, none for `NO_ACK`, parity or
+//! acknowledgement per received source fragment, none for `NO_ACK` or
 //! anything malformed; and that a late IDR still completes.
 
 use ghostframe_client_core::{ClientConfig, ClientCore, Event, PollOutput};
 use ghostframe_protocol::ack::AckBatch;
-use ghostframe_protocol::protocol::{build_frame_parity_datagram, fragment_frame, NO_ACK};
+use ghostframe_protocol::protocol::{fragment_frame, NO_ACK};
 
 fn core() -> ClientCore {
     let mut core = ClientCore::new(
@@ -77,10 +77,13 @@ fn a_fragment_marked_no_ack_is_not_acknowledged() {
 }
 
 #[test]
-fn parity_and_malformed_fragments_are_not_acknowledged() {
+fn malformed_fragments_are_not_acknowledged() {
     let mut c = core();
-    let parity = stamp(build_frame_parity_datagram(9, 1, false, 3, &[1u8; 20]), 500);
-    c.handle_datagram(&parity, 1_000);
+    // A fragment index at or past the total: the shape the retired XOR parity
+    // datagram had, and no source fragment.
+    let mut past_end = stamp(fragment_frame(9, 1, false, &[7u8; 10], 1200).remove(0), 500);
+    past_end[4..6].copy_from_slice(&1u16.to_be_bytes());
+    c.handle_datagram(&past_end, 1_000);
     // A fragment claiming more fragments than any access unit has is refused
     // before the acknowledgement, like an invalid tile.
     let mut bad = stamp(fragment_frame(9, 1, false, &[7u8; 10], 1200).remove(0), 501);

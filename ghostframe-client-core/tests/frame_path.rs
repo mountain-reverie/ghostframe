@@ -53,7 +53,7 @@ fn h264_frame_reassembles_to_needs_h264() {
 }
 
 #[test]
-fn h264_parity_fragments_are_dropped_not_counted() {
+fn a_malformed_fragment_index_is_dropped_not_counted() {
     let mut core = test_core();
     // Frame datagrams need only the 22-byte FrameHeader (the 24-byte floor is
     // for tiles); these fragments are 22B + 12B payload each.
@@ -61,15 +61,15 @@ fn h264_parity_fragments_are_dropped_not_counted() {
     let dgs = fragment_frame(3, 0, false, &payload, 12);
     assert_eq!(dgs.len(), 2); // 24 bytes / 12-byte fragments -> 2 frags
 
-    // Synthesize a parity fragment (frag_idx >= frag_total) for this frame:
-    // reuse the header bytes but bump frag_idx past frag_total.
-    let mut parity = dgs[0].clone();
-    parity[4] = 0x00;
-    parity[5] = 0x02; // frag_idx = 2 == frag_total (2) -> parity, must be skipped
-    let evs = core.handle_datagram(&parity, 0);
+    // Synthesize a fragment with frag_idx >= frag_total for this frame: reuse
+    // the header bytes but bump frag_idx up to frag_total.
+    let mut bad = dgs[0].clone();
+    bad[4] = 0x00;
+    bad[5] = 0x02; // frag_idx = 2 == frag_total (2) -> malformed, must be skipped
+    let evs = core.handle_datagram(&bad, 0);
     assert!(
         evs.is_empty(),
-        "parity fragment must not be counted or emit events"
+        "a malformed fragment must not be counted or emit events"
     );
 
     // Now deliver both real fragments; frame should still complete cleanly.

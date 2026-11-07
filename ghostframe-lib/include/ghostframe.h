@@ -158,13 +158,6 @@
 
 #define EVICTION_SENTINEL_Y 254
 
-/**
- * Size of the parity packet header in bytes:
- *   - group_start: u16 BE (2 bytes)
- *   - group_len:   u8    (1 byte)
- */
-#define PARITY_HEADER_SIZE 3
-
 #define FEEDBACK_SIZE 18
 
 /**
@@ -247,7 +240,7 @@
 
 /**
  * Sentinel `wire_seq` value meaning "not yet stamped by the emitter".
- * Used at construction sites (`fragment_tile`, `build_parity_datagrams`)
+ * Used at construction sites (`fragment_tile`)
  * to make the convention named and greppable. The `ReliableTileEmitter`
  * overwrites this with a real per-session monotonic value at submit time.
  */

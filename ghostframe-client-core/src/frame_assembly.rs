@@ -11,10 +11,7 @@
 //! pipeline, so it cannot grow unboundedly under a flood of distinct
 //! `frame_seq` values.
 
-use std::collections::HashMap;
-
 use ghostframe_protocol::ack::AckEntry;
-use ghostframe_protocol::fec::decode_parity_payload;
 use ghostframe_protocol::protocol::{decode_frame_datagram, FrameHeader, FRAME_FLAG_PAD, NO_ACK};
 
 use crate::event::Event;
@@ -39,85 +36,6 @@ pub(crate) struct FrameAssembly {
     pub received: usize,
     /// Payload bytes buffered so far (bounded by `MAX_H264_ACCESS_UNIT_BYTES`).
     pub bytes: usize,
-    /// XOR parities held for groups that still have a fragment missing,
-    /// keyed by `group_start`: `(group_len, xor)`. Kept so a source that
-    /// arrives after its parity can still complete the group; dropped as soon
-    /// as the group is complete. NOT charged to `bytes`: parity must never be
-    /// able to push a real frame over the access-unit budget. Bounded by
-    /// count (see `MAX_XOR_GROUP`, and the per-frame cap at the call site).
-    pub parities: HashMap<u16, (u8, Vec<u8>)>,
-}
-
-/// Largest XOR group the client will read. The server uses 2 and 5; the cap
-/// bounds the per-fragment parity lookup.
-const MAX_XOR_GROUP: u8 = 16;
-
-fn group_missing(asm: &FrameAssembly, group_start: u16, group_len: u8) -> usize {
-    let (start, end) = (
-        group_start as usize,
-        group_start as usize + group_len as usize,
-    );
-    if end > asm.fragments.len() {
-        return 0;
-    }
-    asm.fragments[start..end]
-        .iter()
-        .filter(|f| f.is_none())
-        .count()
-}
-
-/// Rebuild the one missing fragment of `group_start..group_start+group_len`
-/// from the group's XOR parity, if exactly one is missing. Returns the index
-/// of the fragment rebuilt.
-///
-/// Every source but the frame's last is full-size, so the parity (as long as
-/// the group's longest source) is the missing fragment's exact length. The
-/// last fragment is short and comes back zero-padded; a NAL ends in a
-/// non-zero byte (RBSP stop bit, or an emulation-prevention 0x03), so its
-/// trailing zeros are padding and are stripped.
-fn recover_group(
-    asm: &mut FrameAssembly,
-    group_start: u16,
-    group_len: u8,
-    xor: &[u8],
-) -> Option<usize> {
-    let start = group_start as usize;
-    let end = start + group_len as usize;
-    if !(2..=MAX_XOR_GROUP).contains(&group_len) || end > asm.fragments.len() {
-        return None;
-    }
-    let mut missing = None;
-    for i in start..end {
-        if asm.fragments[i].is_none() {
-            if missing.is_some() {
-                return None;
-            }
-            missing = Some(i);
-        }
-    }
-    let missing = missing?;
-    let mut out = xor.to_vec();
-    for f in asm.fragments[start..end].iter().flatten() {
-        // A source longer than the parity cannot belong to this group.
-        if f.len() > out.len() {
-            return None;
-        }
-        for (o, b) in out.iter_mut().zip(f) {
-            *o ^= b;
-        }
-    }
-    if missing == asm.fragments.len() - 1 {
-        while out.last() == Some(&0) {
-            out.pop();
-        }
-    }
-    if out.is_empty() || asm.bytes + out.len() > MAX_H264_ACCESS_UNIT_BYTES {
-        return None;
-    }
-    asm.bytes += out.len();
-    asm.fragments[missing] = Some(out);
-    asm.received += 1;
-    Some(missing)
 }
 
 impl ClientCore {
@@ -140,26 +58,23 @@ impl ClientCore {
         // with the frame (decode, refuse, drop it as stale) is no part of it.
         // Anything the wire format cannot express as a fragment is dropped
         // first, so it is not acknowledged, like an invalid tile.
-        if !fh.is_parity() {
-            // (`frag_total == 0` is a parity by `is_parity`, not reached here.)
-            if fh.frag_idx >= fh.frag_total || fh.frag_total > MAX_FRAME_FRAGMENTS {
-                return;
-            }
-            if fh.wire_seq != NO_ACK {
-                self.wire_loss.on_received(fh.wire_seq);
-                let entry = AckEntry {
-                    wire_seq: fh.wire_seq,
-                    arrival_time_ms_lo16: ((now_us / 1000) & 0xFFFF) as u16,
-                };
-                if let Some(dg) = self.ack_batcher.add(entry, now_us) {
-                    self.outbox.push_back(PollOutput::Datagram(dg));
-                }
+        if fh.frag_idx >= fh.frag_total || fh.frag_total > MAX_FRAME_FRAGMENTS {
+            return;
+        }
+        if fh.wire_seq != NO_ACK {
+            self.wire_loss.on_received(fh.wire_seq);
+            let entry = AckEntry {
+                wire_seq: fh.wire_seq,
+                arrival_time_ms_lo16: ((now_us / 1000) & 0xFFFF) as u16,
+            };
+            if let Some(dg) = self.ack_batcher.add(entry, now_us) {
+                self.outbox.push_back(PollOutput::Datagram(dg));
             }
         }
 
         // Probe padding is acknowledged (above) and nothing else: it names a
         // frame the receiver has already seen and must not touch its assembly.
-        if !fh.is_parity() && fh.flags & FRAME_FLAG_PAD != 0 {
+        if fh.flags & FRAME_FLAG_PAD != 0 {
             return;
         }
         // A P-frame fragment of a frame at or before the newest one delivered
@@ -168,8 +83,7 @@ impl ClientCore {
         // complete it a second time and be decoded again. An IDR is judged
         // when it completes (below), because its late fragments are kept on
         // purpose (`IDR_EXEMPT_US`).
-        if !fh.is_parity()
-            && !fh.is_keyframe()
+        if !fh.is_keyframe()
             && self
                 .h264_gate
                 .last_fed()
@@ -184,42 +98,6 @@ impl ClientCore {
         {
             return;
         }
-        if fh.is_parity() {
-            if fh.frag_idx != fh.frag_total {
-                return; // a different parity scheme: not ours to read
-            }
-            let Some((group_start, group_len, xor)) = decode_parity_payload(payload) else {
-                return;
-            };
-            let Some(asm) = self.frame_assemblies.get_mut(&fh.frame_seq) else {
-                return;
-            };
-            if fh.frag_total as usize != asm.fragments.len() {
-                return;
-            }
-            // Bound what a hostile peer can park here: one parity per group,
-            // at most one per two fragments.
-            if asm.parities.contains_key(&group_start)
-                || asm.parities.len() > asm.fragments.len() / 2
-            {
-                return;
-            }
-            if recover_group(asm, group_start, group_len, xor).is_some() {
-                self.h264_fragments_recovered += 1;
-            } else if group_missing(asm, group_start, group_len) > 0
-                && (2..=MAX_XOR_GROUP).contains(&group_len)
-            {
-                // Two or more missing: wait for a late source. A complete
-                // group (nothing missing) has nothing to wait for.
-                asm.parities.insert(group_start, (group_len, xor.to_vec()));
-            }
-            self.finish_frame_if_complete(fh.frame_seq, now_us, events);
-            return;
-        }
-        if fh.frag_idx >= fh.frag_total {
-            return;
-        }
-
         if fh.frame_seq > self.latest_full_frame_seq {
             self.latest_full_frame_seq = fh.frame_seq;
         }
@@ -245,7 +123,6 @@ impl ClientCore {
                 fragments: vec![None; fh.frag_total as usize],
                 received: 0,
                 bytes: 0,
-                parities: HashMap::new(),
             });
         // A new IDR assembly supersedes the older ones: they go now, not at
         // the next datagram, so the map is never more than the window plus one.
@@ -268,24 +145,6 @@ impl ClientCore {
             asm.bytes += payload.len();
             asm.fragments[fi] = Some(payload.to_vec());
             asm.received += 1;
-            // A parity that arrived earlier may now have exactly one missing.
-            for g in fi.saturating_sub(MAX_XOR_GROUP as usize - 1)..=fi {
-                let Ok(g16) = u16::try_from(g) else { break };
-                let Some(&(l, _)) = asm.parities.get(&g16) else {
-                    continue;
-                };
-                if fi >= g + l as usize {
-                    continue;
-                }
-                let Some((_, xor)) = asm.parities.remove(&g16) else {
-                    continue;
-                };
-                if recover_group(asm, g16, l, &xor).is_some() {
-                    self.h264_fragments_recovered += 1;
-                } else if group_missing(asm, g16, l) > 0 {
-                    asm.parities.insert(g16, (l, xor));
-                }
-            }
         }
         self.finish_frame_if_complete(fh.frame_seq, now_us, events);
     }
@@ -319,7 +178,7 @@ impl ClientCore {
     /// to the newest IDR, which either has an assembly inside its exemption
     /// already, or is newer than any IDR assembly held and may start one.
     fn idr_fragment_is_exempt(&self, fh: &FrameHeader, now_us: u64) -> bool {
-        if !fh.is_keyframe() || fh.is_parity() {
+        if !fh.is_keyframe() {
             return false;
         }
         match self.frame_assemblies.get(&fh.frame_seq) {
