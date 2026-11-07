@@ -213,7 +213,7 @@ impl IoBridge {
     /// Only a *bundled* one raised `in_flight_carrying`, so only it lowers it.
     /// The emissions in flight are still acknowledged later, and that
     /// acknowledgement would give the same count and reference back again, so
-    /// the tile's PalRle coverage is unbundled here: a double release drives
+    /// the tile's PalRle coverage is settled here: a double release drives
     /// the count below the number of bundled emissions really outstanding.
     pub(super) fn settle_superseded_palettes(
         &mut self,
@@ -221,12 +221,12 @@ impl IoBridge {
         tile_y: u8,
         superseded: &[crate::transport::scheduler::ResolvedTileWork],
     ) {
-        let mut any_bundled = false;
+        let mut any_palette = false;
         for s in superseded {
             let Some(pid) = s.palette_id else { continue };
             let pid_usize = pid as usize;
+            any_palette = true;
             if s.palette_bundled {
-                any_bundled = true;
                 let cnt = self.palette_table.in_flight_carrying[pid_usize];
                 self.palette_table.in_flight_carrying[pid_usize] = cnt.saturating_sub(1);
             }
@@ -236,7 +236,7 @@ impl IoBridge {
                 self.palette_table.release(pid);
             }
         }
-        if any_bundled {
+        if any_palette {
             self.fragment_coverage
                 .unbundle_palrle_for_tile(tile_x, tile_y);
         }
@@ -866,6 +866,9 @@ impl IoBridge {
                         codec: work.codec,
                         palette_id,
                         palette_bundled,
+                        // `acquire_or_allocate` took a reference for this
+                        // emission whether or not it carries the palette.
+                        palette_held: palette_id.is_some(),
                     }];
                 let key = (frame_seq_with_flag, work.tile_x, work.tile_y, work.pass_idx);
                 self.fragment_coverage.record(key, coverage);

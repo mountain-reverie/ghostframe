@@ -81,6 +81,11 @@ pub struct FragmentCoverage {
     /// up, which underflows and — worse — drops a `release` against an
     /// `acquire` that never happened.
     pub palette_bundled: bool,
+    /// Whether this PalRle emission still holds the palette reference taken
+    /// when it was encoded (`acquire_or_allocate` takes one for every
+    /// emission, thin or bundled). Cleared when supersession gives it back;
+    /// the acknowledgement of a still-holding emission gives it back too.
+    pub palette_held: bool,
 }
 
 /// Inline capacity for the coverage list per key.
@@ -274,7 +279,8 @@ impl FragmentCoverageMap {
         self.compact_order();
     }
 
-    /// Mark every PalRle record of a tile as no longer carrying a palette.
+    /// Mark every PalRle record of a tile as no longer carrying or holding a
+    /// palette.
     ///
     /// Called when the tile's in-flight work is superseded: the supersession
     /// has already given back each bundled emission's `in_flight_carrying`
@@ -289,6 +295,7 @@ impl FragmentCoverageMap {
             for c in r.coverage.iter_mut() {
                 if c.codec == Codec::PalRle {
                     c.palette_bundled = false;
+                    c.palette_held = false;
                 }
             }
         }
@@ -331,6 +338,7 @@ mod tests {
             codec: Codec::Cdf53,
             palette_id: None,
             palette_bundled: false,
+            palette_held: false,
         };
         assert_eq!(c.tile_x, 5);
         assert_eq!(c.tile_y, 7);
@@ -350,6 +358,7 @@ mod tests {
             codec: Codec::PalRle,
             palette_id: Some(42),
             palette_bundled: false,
+            palette_held: false,
         };
         assert_eq!(c.palette_id, Some(42));
     }
@@ -365,6 +374,7 @@ mod tests {
             codec: Codec::Solid,
             palette_id: None,
             palette_bundled: false,
+            palette_held: false,
         }];
         // key: (frame_seq=100, tile_x=1, tile_y=2, pass_idx=0)
         m.record((100, 1, 2, 0), cov.clone());
@@ -407,6 +417,7 @@ mod tests {
                 codec: Codec::Cdf53,
                 palette_id: None,
                 palette_bundled: false,
+                palette_held: false,
             }]
         };
         // Same tile (5,3) spread across two frames and two passes (4 entries).
@@ -454,6 +465,7 @@ mod tests {
                 codec,
                 palette_id,
                 palette_bundled: palette_id.is_some(),
+                palette_held: palette_id.is_some(),
             }]
         };
         m.record((10, 4, 4, 0), one(Codec::Solid, None));
@@ -485,6 +497,7 @@ mod tests {
             codec: Codec::Cdf53,
             palette_id: None,
             palette_bundled: false,
+            palette_held: false,
         }];
         m.record((0, 1, 1, 0), cdf53.clone());
         m.record((0, 2, 2, 0), cdf53.clone());
@@ -519,6 +532,7 @@ mod tests {
                 codec: Codec::Cdf53,
                 palette_id: None,
                 palette_bundled: false,
+                palette_held: false,
             }]
         };
         // Record all 14 passes of tile (5,3) in frame 42 — no collision.
@@ -542,6 +556,7 @@ mod tests {
             codec,
             palette_id: None,
             palette_bundled: false,
+            palette_held: false,
         }]
     }
 

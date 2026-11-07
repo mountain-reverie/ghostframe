@@ -1717,6 +1717,7 @@ async fn dispatch_ack_datagram_cdf53_increments_counter() {
             codec: crate::transport::protocol::Codec::Cdf53,
             palette_id: None,
             palette_bundled: false,
+            palette_held: false,
         }];
     // Key: (frame_seq=100, tile_x=7, tile_y=9, pass_idx=0)
     bridge.fragment_coverage.record((100, 7, 9, 0), cov);
@@ -2165,14 +2166,13 @@ fn populate_gpu_metrics_skips_non_dirty_tiles() {
     );
 }
 
-/// A *thin* PalRle emission must not decrement `in_flight_carrying`, and
-/// must not release a palette acquire.
+/// A *thin* PalRle emission must not decrement `in_flight_carrying`, but
+/// does give back the palette acquire it took.
 ///
-/// Both the counter bump and the acquire are taken only on the bundled
-/// path, next to `acquire_or_allocate`. Undoing them for a thin emission
-/// takes down a count that was never put up — which underflows — and
-/// releases a reference that was never taken, which can free a palette
-/// slot another tile is still using.
+/// Only the bundled path raises the counter; undoing it for a thin emission
+/// takes down a count that was never put up, which underflows. The acquire
+/// is taken for every emission (`acquire_or_allocate`), so a thin emission's
+/// ack releases it or the slot is held forever.
 ///
 /// This fired 602 times in a single live session while the same log showed
 /// none in the preceding week, with the warning text naming itself an
@@ -2223,12 +2223,14 @@ async fn ack_for_a_thin_palrle_tile_leaves_the_carry_count_alone() {
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
     let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
 
-    // One bundled emission is outstanding, holding one acquire.
-    bridge.palette_table.ref_count[9] = 1;
+    // One bundled emission is outstanding, holding one acquire, and so is
+    // the thin one about to be acknowledged: every emission takes one.
+    bridge.palette_table.ref_count[9] = 2;
+    bridge.palette_table.slot_state[9] = crate::encoder::pal_rle::SlotState::Held;
     bridge.palette_table.in_flight_carrying[9] = 1;
 
     // A *thin* emission of the same palette is acknowledged. It carried no
-    // palette, so it took neither the count nor the acquire.
+    // palette, so it never raised the count, but it did take the acquire.
     let cov: crate::transport::fragment_coverage::CoverageList =
         smallvec::smallvec![crate::transport::fragment_coverage::FragmentCoverage {
             tile_x: 2,
@@ -2238,6 +2240,7 @@ async fn ack_for_a_thin_palrle_tile_leaves_the_carry_count_alone() {
             codec: crate::transport::protocol::Codec::PalRle,
             palette_id: Some(9),
             palette_bundled: false,
+            palette_held: true,
         }];
     bridge.fragment_coverage.record((301, 2, 3, 0), cov);
     bridge.seed_transmission_for_test(
@@ -2258,7 +2261,7 @@ async fn ack_for_a_thin_palrle_tile_leaves_the_carry_count_alone() {
     );
     assert_eq!(
         bridge.palette_table.ref_count[9], 1,
-        "a thin emission must not release an acquire it never took"
+        "a thin emission gives back exactly its own acquire, not the bundled one's"
     );
     assert!(
         bridge.palette_table.delivered.contains(9),
@@ -2496,6 +2499,7 @@ async fn ack_for_palrle_tile_sets_delivered_and_decrements_in_flight() {
             codec: crate::transport::protocol::Codec::PalRle,
             palette_id: Some(7),
             palette_bundled: true,
+            palette_held: true,
         }];
     // Key: (frame_seq=200, tile_x=0, tile_y=0, pass_idx=0)
     bridge.fragment_coverage.record((200, 0, 0, 0), cov);
@@ -2547,6 +2551,7 @@ async fn ack_for_palrle_tile_releases_ref_count() {
             codec: crate::transport::protocol::Codec::PalRle,
             palette_id: Some(5),
             palette_bundled: true,
+            palette_held: true,
         }];
     // Key: (frame_seq=201, tile_x=0, tile_y=0, pass_idx=0)
     bridge.fragment_coverage.record((201, 0, 0, 0), cov);
@@ -6189,6 +6194,7 @@ async fn acking_a_superseded_bundled_emission_does_not_release_its_palette_twice
             codec: Codec::PalRle,
             palette_id: Some(9),
             palette_bundled: true,
+            palette_held: true,
         }];
     bridge.fragment_coverage.record((301, 2, 3, 0), cov);
     bridge.seed_transmission_for_test(
@@ -9069,6 +9075,7 @@ async fn a_tile_pass_that_outgrew_the_connection_is_retired() {
             codec: crate::transport::protocol::Codec::Cdf53,
             palette_id: None,
             palette_bundled: false,
+            palette_held: false,
         }];
     bridge.fragment_coverage.record((5, 3, 4, 0), cov);
     bridge.pending_controls.clear();

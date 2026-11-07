@@ -141,7 +141,7 @@ Every item was reproduced before it was fixed, or closed with the reason it coul
 | T4 | fixed: a late ACK now withdraws the pending loss too. Caveat for WS-D1: a late-ACKed stall now reads as neither loss nor delay to the estimator. nested_cc `s2_idle8s_c10`, 12 runs a side, final estimate median 5.24 → 5.51 Mbps, no regression | #146 |
 | T5 | fixed (estimator send times past the 71.6 min wrap; boundary vectors in #147); `AckArrival::wire_seq` deleted | #146, #147, #154 |
 | T6, T7, T8, T9, T10 | deleted or cleaned (T7: the emitter drain no longer goes through a raw pointer). With T8, `TransportConfig::fec_k`, `GHOSTFRAME_FEC_K` and `e2e_fec_parity_enabled` deleted (owner's call) | #154 |
-| T12 | fixed: a superseded bundled PalRle emission lowered the palette carry count twice. Open: thin emissions take a palette reference the ACK path never releases | #157 |
+| T12 | fixed: a superseded bundled PalRle emission lowered the palette carry count twice. Then: thin emissions took a palette reference the ACK path never released; the ack now gives it back (`palette_held`), once | #157 |
 | T13 | not-reproduced: the `msg_type=64` bytes are the bidirectional-stream prefix. A prefix coalesced with HELLO would lose HELLO until `HELLO_DEADLINE` (inferred, untested) | — |
 | T14 | fixed: the GPU-written PalRle compact list is validated before use | #154 |
 | G1, G2 | fixed | #150 |
