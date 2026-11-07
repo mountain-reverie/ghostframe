@@ -79,6 +79,12 @@ pub struct QuicServer {
     /// field. journald rate-limits a burst like that and drops a window of
     /// unrelated lines with it -- so the flood does not merely add noise, it
     /// destroys the log around the very event being diagnosed.
+    ///
+    /// Undercounts since `remove_connection` tells the endpoint a lost
+    /// connection is `Drained` at once: the endpoint no longer routes that
+    /// connection's late packets here, it answers them with a stateless reset
+    /// (or ignores them), so only strays that race a removal in the same turn
+    /// land in this counter. Absence of warnings is not absence of strays.
     unknown_conn_events: u64,
     /// Handles accepted since the bridge last asked. The bridge arms its
     /// never-HELLO deadline from this at accept time rather than on
@@ -908,6 +914,11 @@ impl QuicServer {
                 conn.handle_timeout(now);
             }
         }
+        // Hand the endpoint the connections' events *before* pruning: a
+        // connection whose drain timer just fired queued `Drained` for the
+        // endpoint, and pruning it first would leave its slab entry and
+        // connection-ID routes in the endpoint for good.
+        self.drain_endpoint_events();
         // Prune drained connections.
         let mut reaped = Vec::new();
         self.connections.retain(|handle, conn| {
@@ -919,8 +930,6 @@ impl QuicServer {
                 true
             }
         });
-        // Drain endpoint events produced by handle_timeout on connections.
-        self.drain_endpoint_events();
         reaped
     }
 
@@ -935,13 +944,45 @@ impl QuicServer {
                     tracing::trace!(?handle, ?event, "poll_events: event found");
                     let lost = matches!(event, Event::ConnectionLost { .. });
                     if lost {
-                        self.connections.remove(&handle);
+                        self.remove_connection(handle);
                     }
                     return Some((handle, event));
                 }
             }
         }
         None
+    }
+
+    /// Drop a connection the application is finished with (it surfaced
+    /// `ConnectionLost`), telling the endpoint so.
+    ///
+    /// quinn-proto's endpoint keeps a slab entry and the connection-ID routes
+    /// of a connection until it is told `Drained`, which the connection only
+    /// reports once its drain timer has fired. A connection removed from the
+    /// table here never gets to say so, so the endpoint is told in its place
+    /// (`EndpointEvent::drained` exists for exactly this). The peer's packets
+    /// for it afterwards meet an unknown connection ID, as they would from a
+    /// connection we had already forgotten.
+    fn remove_connection(&mut self, handle: ConnectionHandle) {
+        let Some(mut conn) = self.connections.remove(&handle) else {
+            return;
+        };
+        let mut drained = false;
+        while let Some(ev) = conn.poll_endpoint_events() {
+            drained |= ev.is_drained();
+            // Events for a connection on its way out need no answer.
+            let _ = self.endpoint.handle_event(handle, ev);
+        }
+        // A connection that went `Drained` while processing a packet (a
+        // stateless reset, the AEAD limit) had its event forwarded by
+        // `drain_endpoint_events` already, and the endpoint has dropped it; a
+        // second one is a bug report in quinn's log ("unknown connection
+        // drained") and could free a reused slab slot.
+        if !drained && !conn.is_drained() {
+            let _ = self
+                .endpoint
+                .handle_event(handle, quinn_proto::EndpointEvent::drained());
+        }
     }
 
     /// Drain `EndpointEvent`s from every connection and feed them back into the
