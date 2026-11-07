@@ -44,6 +44,7 @@ function makeRenderer(tl: Timeline) {
     createCommandEncoder: mkEncoder,
     queue: {
       submit: (bufs: Array<{ ops: Op[] }>) => { for (const b of bufs) tl.ops.push(...b.ops); },
+      writeBuffer() {},
       writeTexture: (_d: unknown, data: Uint8Array, _l: unknown, _s: unknown) => {
         // Direct uploads carry their frame_seq in every byte.
         tl.ops.push({ kind: 'write', seq: data[0], tile: [0, 0] });
@@ -55,7 +56,8 @@ function makeRenderer(tl: Timeline) {
     solidQueue: [], palRleQueue: [], cdf53Queue: [], h264Queue: [], h264Seqs: [],
     videoFramesToClose: [], framebufferDirty: false, submitCount: 0, errorsReadbackInFlight: false,
     h264DropWarned: false,
-    paintTick: 0, tileCols: 0, tileCodec: new Uint8Array(0), tileSeq: new Uint32Array(0), tileTick: new Uint32Array(0),
+    paintTick: 0, tileCols: 4, tileCodec: new Uint8Array(16), tileSeq: new Uint32Array(16), tileTick: new Uint32Array(16),
+    h264Floor: undefined, maxTileSeq: undefined,
     gpu: { device, context: { getCurrentTexture: () => ({ createView: () => ({}) }) } },
     framebuffer: { texture: {}, view: {}, width: 64, height: 64, encodePresentBlit() {} },
     solidPipeline: {
@@ -69,6 +71,7 @@ function makeRenderer(tl: Timeline) {
       encodeDispatch: (enc: { ops: Op[] }) => {
         for (const t of pendingPal) enc.ops.push({ kind: 'palrle', seq: t.frameSeq, tile: [t.tileX, t.tileY] });
       },
+      paletteAtlas: {},
       encodeErrorsReadback() {},
       zeroErrors() {},
       // A drained PalRle batch starts an errors readback; it never resolves here.
@@ -80,6 +83,7 @@ function makeRenderer(tl: Timeline) {
     },
     cdf53Pipeline: {
       uploadBatch: (t: typeof pendingCdf) => { pendingCdf = [...t]; return t.length; },
+      clearAllState() {},
       encodeIntegrate() {},
       encodeInverse: (enc: { ops: Op[] }) => {
         for (const t of pendingCdf) enc.ops.push({ kind: 'cdf53', seq: t.frameSeq, tile: [t.tileX, t.tileY] });
@@ -190,6 +194,142 @@ describe('newest frame_seq wins a tile within one tick', () => {
     r.pushCdf53(cdf(4));
     present();
     expect(uploaded).toBe(2);
+  });
+});
+
+// Ordering across ticks. The renderer remembers what it painted; an entry, or
+// an H.264 frame, older than that must not be painted over it. A tick here is
+// one encodeAndPresentFrame, as a requestAnimationFrame is in the browser.
+describe('newest frame_seq wins a tile across ticks', () => {
+  const uploads = () => {
+    const seen: number[] = [];
+    (r as any).cdf53Pipeline.uploadBatch = (t: Array<{ frameSeq: number }>) => {
+      for (const e of t) seen.push(e.frameSeq);
+      (r as any).__pending = [...t];
+      return t.length;
+    };
+    (r as any).cdf53Pipeline.encodeInverse = (enc: { ops: Op[] }) => {
+      for (const t of (r as any).__pending ?? []) enc.ops.push({ kind: 'cdf53', seq: t.frameSeq, tile: [0, 0] });
+    };
+    return seen;
+  };
+
+  it('an older Solid in a later tick does not cover a newer Solid', () => {
+    r.pushSolid(solid(6));
+    present();
+    r.pushSolid(solid(5));
+    present();
+    expect(tl.screen(0, 0)).toBe(6);
+  });
+  it('an older PalRle in a later tick does not cover a newer Solid', () => {
+    r.pushSolid(solid(6));
+    present();
+    r.pushPalRle(pal(5));
+    present();
+    expect(tl.screen(0, 0)).toBe(6);
+  });
+  it('an old-frame CDF53 retransmit does not repaint over a newer Solid', () => {
+    const up = uploads();
+    r.pushSolid(solid(6));
+    present();
+    r.pushCdf53(cdf(5));
+    present();
+    expect(up).toEqual([]);
+    expect(tl.screen(0, 0)).toBe(6);
+  });
+  it('an older Solid does not cover a CDF53 tile painted in an earlier tick', () => {
+    uploads();
+    r.pushCdf53(cdf(6));
+    present();
+    r.pushSolid(solid(5));
+    present();
+    expect(tl.screen(0, 0)).toBe(6);
+  });
+  it('equal frame_seq is painted: refinement passes share their generation\'s seq', () => {
+    const up = uploads();
+    r.pushCdf53(cdf(6));
+    present();
+    r.pushCdf53(cdf(6));
+    present();
+    r.pushSolid(solid(6));
+    present();
+    expect(up).toEqual([6, 6]);
+    expect(tl.screen(0, 0)).toBe(6);
+  });
+  it('a newer entry is painted, and other tiles are not affected', () => {
+    r.pushSolid(solid(6));
+    present();
+    r.pushSolid(solid(7));
+    r.pushSolid({ ...solid(5), tileX: 1 });
+    present();
+    expect(tl.screen(0, 0)).toBe(7);
+    expect(tl.screen(1, 0)).toBe(5);
+  });
+  it('a late H.264 frame does not repaint over tiles painted after it was sent', () => {
+    r.pushSolid(solid(6));
+    present();
+    r.pushH264(h264(5), 5);
+    present();
+    expect(tl.screen(0, 0)).toBe(6);
+    expect(tl.ops.some((o) => o.kind === 'h264')).toBe(false);
+  });
+  it('the late H.264 frame is still closed, not leaked', () => {
+    let closed = 0;
+    r.pushSolid(solid(6));
+    present();
+    r.pushH264({ seq: 5, close() { closed++; } } as unknown as VideoFrame, 5);
+    present();
+    present();
+    expect(closed).toBe(1);
+  });
+  it('a newer H.264 frame is drawn, and covers older tiles', () => {
+    r.pushSolid(solid(6));
+    present();
+    r.pushH264(h264(7), 7);
+    present();
+    expect(tl.screen(0, 0)).toBe(7);
+  });
+  it('after an H.264 frame, older tiles and passes are dropped, older frames too', () => {
+    const up = uploads();
+    r.pushH264(h264(8), 8);
+    present();
+    r.pushSolid(solid(7));
+    r.pushPalRle(pal(7));
+    r.pushCdf53(cdf(7));
+    r.pushH264(h264(7), 7);
+    present();
+    expect(up).toEqual([]);
+    expect(tl.screen(0, 0)).toBe(8);
+    expect(tl.ops.filter((o) => o.kind === 'h264')).toHaveLength(1);
+    // A tile from the next frame lands on top of the frame.
+    r.pushSolid(solid(9));
+    present();
+    expect(tl.screen(0, 0)).toBe(9);
+  });
+  it('an older frame queued with a newer one in the same tick is not drawn over it', () => {
+    r.pushH264(h264(6), 6);
+    r.pushH264(h264(5), 5);
+    present();
+    expect(tl.screen(0, 0)).toBe(6);
+  });
+  it('compares frame_seq as serial numbers across a wrap', () => {
+    r.pushSolid(solid(0xfffffffe));
+    present();
+    r.pushSolid(solid(1));
+    present();
+    expect(tl.screen(0, 0)).toBe(1);
+    r.pushSolid(solid(0xfffffffd));
+    present();
+    expect(tl.screen(0, 0)).toBe(1);
+  });
+  it('a session reset forgets the ledger', () => {
+    r.pushSolid(solid(600));
+    r.pushH264(h264(601), 601);
+    present();
+    r.onSessionReset();
+    r.pushSolid(solid(1));
+    present();
+    expect(tl.screen(0, 0)).toBe(1);
   });
 });
 

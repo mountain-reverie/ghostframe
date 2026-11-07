@@ -7,7 +7,7 @@ import { Cdf53Pipeline, type PrevalidatedCdf53 } from './cdf53.js';
 import { shouldSkipEncodePresent } from './idle_skip.js';
 import { protocol } from '../protocol_constants.js';
 import { health } from '../health.js';
-import { planPaint } from './paint_order.js';
+import { planPaint, seqNewer, type PriorPaint } from './paint_order.js';
 
 /** A prevalidated CDF53 pass tagged with the server frame it came from. */
 export type QueuedCdf53 = PrevalidatedCdf53 & { frameSeq: number };
@@ -65,6 +65,11 @@ export class WebGpuRenderer {
   private tileCodec = new Uint8Array(0);
   private tileSeq = new Uint32Array(0);
   private tileTick = new Uint32Array(0);
+  // Paint order across ticks: `tileCodec` (0 = never painted) and `tileSeq`
+  // are the per-tile ledger; these two are the screen-wide parts. See
+  // paint_order.ts and `priorPaint`.
+  private h264Floor: number | undefined = undefined;
+  private maxTileSeq: number | undefined = undefined;
   // Held until next tick so they aren't closed before drawing.
   private videoFramesToClose: VideoFrame[] = [];
 
@@ -146,6 +151,10 @@ export class WebGpuRenderer {
         alphaMode: 'opaque',
       });
     }
+    if (this.framebuffer.width !== width || this.framebuffer.height !== height) {
+      // A new picture: what was painted on the old one says nothing about it.
+      this.resetPaintLedger();
+    }
     this.framebuffer.resize(width, height);
     this.solidPipeline.updateCanvasSize(width, height);
     const ts = protocol().tileSize;
@@ -159,6 +168,26 @@ export class WebGpuRenderer {
       this.tileSeq = new Uint32Array(maxTiles);
       this.tileTick = new Uint32Array(maxTiles);
     }
+  }
+
+  private resetPaintLedger(): void {
+    this.tileCodec.fill(0);
+    this.h264Floor = undefined;
+    this.maxTileSeq = undefined;
+  }
+
+  /** What earlier ticks painted, for `planPaint`. */
+  private priorPaint(): PriorPaint {
+    const cols = this.tileCols;
+    const n = this.tileCodec.length;
+    return {
+      tile: (tx, ty) => {
+        const i = ty * cols + tx;
+        return tx < cols && i < n && this.tileCodec[i] !== 0 ? this.tileSeq[i] : undefined;
+      },
+      h264Floor: this.h264Floor,
+      maxTile: this.maxTileSeq,
+    };
   }
 
   /**
@@ -187,6 +216,8 @@ export class WebGpuRenderer {
     }
     this.h264Queue.length = 0;
     this.h264Seqs.length = 0;
+    // A new session restarts nothing the ledger can compare against.
+    this.resetPaintLedger();
 
     const zeros = new Uint8Array(16 * 1024);
     this.device.queue.writeBuffer(this.palrlePipeline.paletteAtlas, 0, zeros);
@@ -240,9 +271,15 @@ export class WebGpuRenderer {
     for (const e of entries) {
       const i = e.tileY * cols + e.tileX;
       if (e.tileX >= cols || i >= n) continue;
-      this.tileCodec[i] = codec;
-      this.tileSeq[i] = e.frameSeq >>> 0;
-      this.tileTick[i] = this.paintTick;
+      const seq = e.frameSeq >>> 0;
+      // The ledger holds the newest seq of the tile: two entries of one tick
+      // (a CDF53 pass is never dropped in-tick) must not leave the older one.
+      if (this.tileCodec[i] === 0 || !seqNewer(this.tileSeq[i], seq)) {
+        this.tileCodec[i] = codec;
+        this.tileSeq[i] = seq;
+        this.tileTick[i] = this.paintTick;
+      }
+      if (this.maxTileSeq === undefined || seqNewer(seq, this.maxTileSeq)) this.maxTileSeq = seq;
     }
   }
 
@@ -314,18 +351,19 @@ export class WebGpuRenderer {
       palRle: this.palRleQueue,
       cdf53: this.cdf53Queue,
       h264Seqs: drawH264 ? this.h264Seqs : [],
+      prior: this.priorPaint(),
     });
 
     // Upload the Cdf53 batch first. The queues are cleared even if
     // uploadBatch throws (capacity overflow after a long hidden-tab period):
     // otherwise they keep growing and every later tick throws again. The
     // H.264 queue and its seqs are left alone here so they stay index-aligned.
-    this.notePainted(this.cdf53Queue, 3);
+    this.notePainted(plan.cdf53, 3);
     this.notePainted(plan.palRle, 2);
     this.notePainted(plan.solid, 1);
     let cdf53Count = 0;
     try {
-      cdf53Count = this.cdf53Pipeline.uploadBatch(this.cdf53Queue);
+      cdf53Count = this.cdf53Pipeline.uploadBatch(plan.cdf53);
     } catch (e) {
       health.record('cdf53.uploadBatch', e);
       throw e;
@@ -350,7 +388,7 @@ export class WebGpuRenderer {
       this.h264DropWarned = true;
     }
     const drawH264Frames = (): void => {
-      if (!drawH264 || this.h264Queue.length === 0) return;
+      if (!drawH264 || !plan.h264Keep.some(Boolean)) return;
       const pass = encoder.beginRenderPass({
         colorAttachments: [{
           view: this.framebuffer.view,
@@ -358,9 +396,13 @@ export class WebGpuRenderer {
           storeOp: 'store',
         }],
       });
-      for (const frame of this.h264Queue) {
+      this.h264Queue.forEach((frame, i) => {
+        // A frame planPaint found stale is closed with the rest, not drawn.
+        if (!plan.h264Keep[i]) return;
         this.h264Pipeline!.drawFullFrame(pass, frame, this.framebuffer.width, this.framebuffer.height);
-      }
+        const seq = this.h264Seqs[i] >>> 0;
+        if (this.h264Floor === undefined || seqNewer(seq, this.h264Floor)) this.h264Floor = seq;
+      });
       pass.end();
     };
     const liftCdf53 = (): void => {
@@ -376,7 +418,7 @@ export class WebGpuRenderer {
       liftCdf53();
       drawH264Frames();
     }
-    const h264Count = drawH264 ? this.h264Queue.length : 0;
+    const h264Count = drawH264 ? plan.h264Keep.filter(Boolean).length : 0;
     // Stage the VideoFrames for next-tick cleanup; the importExternalTexture
     // references are scoped to this submit. (Still need to close dropped
     // frames so they don't leak GPU memory in the WebCodecs decoder.)
