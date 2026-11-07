@@ -2571,6 +2571,7 @@ impl IoBridge {
                     h264_unavailable = self.h264.availability.label(),
                     idr_backend_fallback = refs.idr_backend_fallback,
                     marks_observed = refs.marks_observed,
+                    openh264_rate_refused = crate::encoder::h264::openh264::rate_refusals(),
                     mark_unrepresentable = refs.mark_unrepresentable,
                     ltr_recoveries_requested = refs.ltr_recoveries_requested,
                     ltr_mark_failed_sent = refs.ltr_mark_failed_sent,

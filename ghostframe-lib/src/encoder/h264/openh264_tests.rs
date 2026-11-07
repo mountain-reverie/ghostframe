@@ -755,6 +755,41 @@ fn openh264_set_rate_takes_effect_without_an_idr() {
     assert_eq!(be.stats().rate_sets, 1, "hysteresis");
 }
 
+/// A rise is accepted and the stream follows it up; a fall follows it down.
+/// The library checks the layer's maximum against its target on every
+/// `BITRATE` set (2.4.x), so raising the target first is refused.
+#[test]
+fn openh264_rate_rise_is_accepted_and_followed() {
+    let (w, h) = (1280, 720);
+    let mut be = open(w, h, 500_000);
+    let mut sizes = Vec::new();
+    // Phases of 40 frames: 0.5 Mbit, 2 Mbit (4x), 0.5 Mbit.
+    let rates = [500_000u32, 2_000_000, 500_000];
+    for i in 0..120usize {
+        if i % 40 == 0 {
+            be.set_rate(RateTarget::steady(rates[i / 40], 30));
+        }
+        let nv = scene_nv12(i, w, h, Scene::Busy(24));
+        let au = be
+            .encode(&view(&nv, w, h), &plan(i as u32, i == 0), &[])
+            .unwrap();
+        sizes.push(au.payload.len());
+        if i % 40 == 0 {
+            let st = be.stats();
+            assert_eq!(st.rate_refused, 0, "frame {i}: the library refused: {st:?}");
+        }
+    }
+    let st = be.stats();
+    assert_eq!(st.rate_sets, 2, "{st:?}");
+    assert_eq!(st.rate_refused, 0, "{st:?}");
+    // Skip each phase's first 15 frames: the rate control settles.
+    let phase = |k: usize| sizes[40 * k + 15..40 * k + 40].iter().sum::<usize>();
+    let (low, high, low2) = (phase(0), phase(1), phase(2));
+    eprintln!("rate 0.5 -> 2 -> 0.5 Mbit: {low} B, {high} B, {low2} B per 25 frames");
+    assert!(high * 10 >= low * 20, "bytes rise >= 2x: {low} -> {high}");
+    assert!(high * 10 >= low2 * 20, "bytes fall >= 2x: {high} -> {low2}");
+}
+
 #[test]
 fn openh264_probe_raise_pattern_is_two_rate_sets_per_window() {
     // The bridge raises the rate for up to three frames of a probe window and

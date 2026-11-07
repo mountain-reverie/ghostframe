@@ -369,6 +369,13 @@ impl Openh264Source {
     }
 }
 
+/// Rate changes the openh264 backend has had refused so far in this process
+/// (the `openh264_rate_refused` field of `h264 stats`); a scene reads it
+/// before and after its run.
+pub fn openh264_rate_refusals() -> u64 {
+    super::openh264::rate_refusals()
+}
+
 /// The openh264 library the scenes will run on, `origin version`; `Err` says
 /// what was found instead. It is the library the bridge will open: the one
 /// `GHOSTFRAME_H264_OPENH264_LIB` names (through `config`, as the daemon reads
