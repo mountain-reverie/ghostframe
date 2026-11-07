@@ -41,6 +41,9 @@ use handshake::{ConnectOutcome, WebTransportHandshake};
 
 pub use event::{ClientNetError, ClientNetEvent, UdpOut};
 
+/// Application close code a client sends when it leaves on purpose.
+pub const CLOSE_CODE_CLIENT_GONE: u32 = 0x6710;
+
 #[derive(Debug, Clone)]
 pub struct ClientNetConfig {
     /// SNI name presented in the TLS handshake.
@@ -591,6 +594,16 @@ impl ClientNet {
     /// not to miss one.
     pub fn take_events(&mut self) -> Vec<ClientNetEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    /// Close the connection with an application error and queue the
+    /// CONNECTION_CLOSE for `poll_transmit`. The caller must send what
+    /// `poll_transmit` yields before dropping the socket, or the server only
+    /// learns of the departure at its idle timeout.
+    pub fn close(&mut self, code: u32, reason: &'static [u8], now_us: u64) {
+        let now = self.instant(now_us);
+        self.endpoint.close(now, code, reason);
+        self.connected = false;
     }
 
     pub fn poll_transmit(&mut self) -> Option<UdpOut> {

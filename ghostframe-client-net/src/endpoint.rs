@@ -181,6 +181,18 @@ impl ClientEndpoint {
         self.outbound.pop_front()
     }
 
+    /// Application-close the connection and queue the CONNECTION_CLOSE.
+    pub(crate) fn close(&mut self, now: Instant, code: u32, reason: &'static [u8]) {
+        if let Some((_, conn)) = self.conn.as_mut() {
+            conn.close(
+                now,
+                quinn_proto::VarInt::from_u32(code),
+                Bytes::from_static(reason),
+            );
+        }
+        self.drive_outgoing(now);
+    }
+
     pub(crate) fn connection(&mut self) -> Option<&mut Connection> {
         self.conn.as_mut().map(|(_, conn)| conn)
     }
