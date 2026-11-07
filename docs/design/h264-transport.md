@@ -78,7 +78,7 @@ All big-endian.
 | Offset | Field | Notes |
 |---|---|---|
 | 0..4 | `frame_seq` u32 | bit 31 always 0 (bit 31 set means a tile datagram) |
-| 4..6 | `frag_idx` u16 | `frag_idx >= frag_total` marks a parity datagram |
+| 4..6 | `frag_idx` u16 | `frag_idx >= frag_total` is malformed: the client drops it unacknowledged |
 | 6..8 | `frag_total` u16 | client refuses above `MAX_FRAME_FRAGMENTS` |
 | 8..12 | `wire_seq` u32 | ledger identity; `NO_ACK` (0xFFFFFFFF) is untracked |
 | 12..16 | `timestamp_us` u32 | |
@@ -96,23 +96,19 @@ Flags:
 | 0x08 | `FRAME_FLAG_TARGET_IS_LT` | set by acked-reference sessions (`slots` bits 2-3 name the slot) |
 | 0x10 | `FRAME_FLAG_PAD` | probe padding (section 5) |
 
-Every frame names its reference from the manager's plan (`Described`); the
-server no longer sends parity (a client still reads it if it arrives). Parity
-datagrams carry no reference information (flags hold only the IDR bit,
-`ref_frame_seq` is `REF_FRAME_NONE`); read the reference from a source
-fragment, never from a parity.
+Every frame names its reference from the manager's plan (`Described`).
 
-### Fragmentation and parity
+### Fragmentation
 
 `fragment_frame_ref` cuts the access unit into fragments that fit
-`max_fec_frame_fragment_payload(max_dg_size)` (room is left for the parity
-header). Every source fragment is a ledger transmission with a real
-`wire_seq`. The server sends no H.264 XOR parity (removed in B7b); the
-header room stays reserved (about 0.25 % of a datagram) and the client still
-decodes parity (`ghostframe-protocol/src/fec.rs`), which it never receives from
-this server. Tile parity is separate (`GHOSTFRAME_TILE_FEC`, off by default).
-The client rebuilds one missing fragment per group (`recover_group` in
-`ghostframe-client-core/src/frame_assembly.rs`).
+`max_frame_fragment_payload(max_dg_size)` less `H264_FRAGMENT_RESERVE` (3
+bytes, the old parity header room, kept so the knife-edge population gates
+keep their fragment sizes). Every fragment is a ledger
+transmission with a real `wire_seq`. There is no H.264 XOR parity: it was
+removed in B7b from the server and later from the protocol and both clients;
+a lost fragment is repaired by a retransmission or, failing that, a recovery
+from the acknowledged anchor. Tile parity is separate (`GHOSTFRAME_TILE_FEC`,
+off by default).
 
 ### Frame ack, datagram 0x0A (client to server)
 
@@ -236,7 +232,7 @@ from the anchor with frames cut at the new size. Only an incomplete in-flight
 IDR is abandoned and sent again, cut at the new size, under `mtu_shrink` (the
 re-send does not back the IDR timeout off: a retirement is not a slow link,
 though it still counts in `idr_reissued`). A tile pass is dropped from the
-retransmit cache and the next capture is made whole; probe padding and parity
+retransmit cache and the next capture is made whole; probe padding and tile parity
 are dropped. Counters: `oversize_h264`, `oversize_tile`, `oversize_pad`,
 `oversize_untracked`; `send_too_large` counts quinn refusals and must stay 0.
 On a refs session `mtu_retired` counts frames (the first oversize fragment of
@@ -352,7 +348,8 @@ the cut that the stalled window used to deliver waits for the first
 acknowledgement (`p8e`: a short second dip after the restore, up to 200 ms on
 two seeds of fourteen, one in fourteen before).
 
-Where the stalls come from: an IDR is followed by its parity (K = 2, so 38
+Where the stalls came from (historical; the parity is gone): an IDR was
+followed by its parity (K = 2, so 38
 datagrams for a 77-fragment IDR, 54 kB), queued behind the fragments and
 unacknowledged by design. Paced at the estimate that is a quarter second or
 more with no acknowledgement at all, and the P frame queued behind it waits as
@@ -614,7 +611,8 @@ sends it again at once.
 
 **There is no** periodic GOP IDR, loss-triggered IDR, IDR hold other than the
 manager's `Plan::Hold` (the loss path still resends IDR fragments), reopen on a
-rate change, or H.264 XOR parity. The rate moves in place. The IDR is not the
+rate change, or H.264 XOR parity (the datagram format and the client's recovery are gone
+too). The rate moves in place. The IDR is not the
 probe burst; padding and the application's probe clusters (section 5) are the
 only probing.
 
