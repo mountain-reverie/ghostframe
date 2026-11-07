@@ -116,7 +116,8 @@ fn emit_palrle(
     other_bundled: u32,
 ) -> Vec<(u32, EmitKey)> {
     let carrying = other_bundled + u32::from(bundled);
-    b.palette_table.ref_count[PID as usize] = carrying as _;
+    // Every emission, thin or bundled, took one reference.
+    b.palette_table.ref_count[PID as usize] = (other_bundled + 1) as _;
     b.palette_table.in_flight_carrying[PID as usize] = carrying as _;
     b.palette_table.slot_state[PID as usize] = crate::encoder::pal_rle::SlotState::Held;
     let gen = b.scheduler.generation_for(TX, TY);
@@ -257,13 +258,13 @@ async fn acking_a_bundled_palrle_tile_releases_its_carry_and_reference() {
     assert!(b.palette_table.delivered.contains(PID));
 }
 
-/// A thin PalRle emission took neither: delivery is recorded, the counts are
-/// left alone.
+/// A thin PalRle emission took a reference but no carry: delivery is
+/// recorded, its reference is given back and the carry count is left alone.
 #[tokio::test(start_paused = true)]
-async fn acking_a_thin_palrle_tile_records_delivery_and_leaves_the_counts() {
+async fn acking_a_thin_palrle_tile_records_delivery_and_releases_only_its_reference() {
     let mut b = bridge();
     let sent = emit_palrle(&mut b, 10, false, 1);
-    assert_eq!((carry(&b), refs(&b)), (1, 1), "precondition");
+    assert_eq!((carry(&b), refs(&b)), (1, 2), "precondition");
 
     ack(&mut b, &[sent[0].0]);
 
@@ -313,15 +314,21 @@ async fn a_superseded_bundled_palrle_ack_proves_delivery_without_a_second_releas
     );
 }
 
-/// A thin emission superseded and then acknowledged: delivery only.
+/// A thin emission superseded and then acknowledged: delivery only. The
+/// supersession gave its reference back, so the ack must not.
 #[tokio::test(start_paused = true)]
 async fn a_superseded_thin_palrle_ack_still_proves_delivery() {
     let mut b = bridge();
     let sent = emit_palrle(&mut b, 10, false, 1);
+    assert_eq!((carry(&b), refs(&b)), (1, 2), "precondition");
     dirty_the_tile(&mut b, 11);
-    let (c, r) = (carry(&b), refs(&b));
+    assert_eq!(
+        (carry(&b), refs(&b)),
+        (1, 1),
+        "precondition: supersession gave the thin reference back"
+    );
     ack(&mut b, &[sent[0].0]);
-    assert_eq!((carry(&b), refs(&b)), (c, r));
+    assert_eq!((carry(&b), refs(&b)), (1, 1), "no second release");
     assert!(b.palette_table.delivered.contains(PID));
 }
 
@@ -441,14 +448,15 @@ async fn an_ack_after_the_cache_was_cleared_still_completes_its_bookkeeping() {
     assert!(b.palette_table.delivered.contains(PID));
 }
 
-/// Re-committing a Cdf53 tile (which cancels the emitter and bumps the
-/// generation but settles no palettes) while a bundled PalRle emission of the
-/// same tile is in flight leaves that emission's acknowledgement as the only
-/// thing that gives its carry and reference back.
+/// Re-committing a Cdf53 tile while a bundled PalRle emission of the same
+/// tile is in flight supersedes it: the carry and reference come back at the
+/// commit, with no acknowledgement needed, and a late ack gives nothing back
+/// a second time.
 #[tokio::test(start_paused = true)]
-async fn a_cdf53_commit_leaves_a_bundled_palrle_ack_to_release_its_carry() {
+async fn a_cdf53_commit_settles_a_bundled_palrle_emission_once() {
     let mut b = bridge();
     let sent = emit_palrle(&mut b, 10, true, 1);
+    assert_eq!((carry(&b), refs(&b)), (2, 2), "precondition");
     b.enqueue_cdf53_generation(
         TX,
         TY,
@@ -458,15 +466,68 @@ async fn a_cdf53_commit_leaves_a_bundled_palrle_ack_to_release_its_carry() {
     );
     assert_eq!(
         (carry(&b), refs(&b)),
-        (2, 2),
-        "precondition: nothing settled it"
+        (1, 1),
+        "the commit gave this emission's carry and reference back"
     );
     assert!(b.reliable_emitter.cache.get(&sent[0].1).is_none());
 
     ack(&mut b, &[sent[0].0]);
 
-    assert_eq!((carry(&b), refs(&b)), (1, 1));
+    assert_eq!((carry(&b), refs(&b)), (1, 1), "no second release");
     assert!(b.palette_table.delivered.contains(PID));
+}
+
+/// A PalRle emission is lost and the tile turns photographic: the Cdf53
+/// commit supersedes it and no acknowledgement ever comes, thin or bundled.
+/// Every reference it took must still come back, and a later supersession of
+/// the same tile must not find anything left to give back.
+#[tokio::test(start_paused = true)]
+async fn a_cdf53_commit_releases_an_unacked_palrle_emission_thin_or_bundled() {
+    for bundled in [false, true] {
+        let mut b = bridge();
+        let _ = emit_palrle(&mut b, 10, bundled, 1);
+        b.enqueue_cdf53_generation(
+            TX,
+            TY,
+            0b1,
+            vec![(0, vec![7; 50])],
+            frame::Cdf53Source::Dirty,
+        );
+        assert_eq!(
+            (carry(&b), refs(&b)),
+            (1, 1),
+            "bundled={bundled}: back to the other emission's share"
+        );
+        dirty_the_tile(&mut b, 11);
+        assert_eq!(
+            (carry(&b), refs(&b)),
+            (1, 1),
+            "bundled={bundled}: once only"
+        );
+    }
+}
+
+/// A thin emission that is never acknowledged and never superseded: the next
+/// session's reset zeroes the table. An emission the new session makes under
+/// the same key must then be released exactly once, whichever ack arrives.
+#[tokio::test(start_paused = true)]
+async fn a_session_reset_forgets_an_unacked_thin_emission_without_a_double_release() {
+    let mut b = bridge();
+    let old = emit_palrle(&mut b, 10, false, 0);
+    assert_eq!(refs(&b), 1, "precondition");
+    b.palette_table.on_session_reset(false);
+    assert_eq!(refs(&b), 0, "the reset zeroed the reference");
+
+    // The new session emits under the same key, next to one other holder.
+    let new = emit_palrle(&mut b, 10, false, 1);
+    assert_eq!(refs(&b), 2, "precondition");
+    ack(&mut b, &[old[0].0, new[0].0]);
+
+    assert_eq!(
+        refs(&b),
+        1,
+        "the new emission gave its reference back once, the old one nothing"
+    );
 }
 
 /// A retired Solid emission that arrives after all is still marked acked, so
@@ -514,4 +575,77 @@ async fn a_retired_cdf53_ack_still_credits_the_pass() {
 
     assert_eq!(b.scheduler.cdf53_passes_acked_for_test(TX, TY, gen), 1);
     assert_eq!(b.scheduler.delivery_window_acked_for_test(), before + 1);
+}
+
+// ---- a long session of palette emissions ----
+
+/// Take a palette the way the encoder does (`acquire_or_allocate`, a carry
+/// only when the receiver does not have it yet), record the emission's
+/// coverage as the emit path does, and acknowledge it.
+fn palrle_round_trip(b: &mut IoBridge, palette: &crate::encoder::pal_rle::PaletteEntry, n: u32) {
+    use crate::transport::fragment_coverage::FragmentCoverage;
+    let id = b
+        .palette_table
+        .acquire_or_allocate(palette)
+        .expect("a table whose references are all given back always has a slot");
+    let bundled = !b.palette_table.delivered.contains(id);
+    if bundled {
+        b.palette_table.in_flight_carrying[id as usize] += 1;
+    }
+    let key = (1000 + n, TX, TY, 0);
+    b.fragment_coverage.record(
+        key,
+        smallvec::smallvec![FragmentCoverage {
+            tile_x: TX,
+            tile_y: TY,
+            generation: 0,
+            pass_idx: 0,
+            codec: Codec::PalRle,
+            palette_id: Some(id),
+            palette_bundled: bundled,
+            palette_held: true,
+        }],
+    );
+    let wire_seq = 50_000 + n;
+    b.seed_transmission_for_test(wire_seq, EmitKey::new(key.0, TX, TY, 0));
+    ack(b, &[wire_seq]);
+}
+
+fn palette_n(n: u32) -> crate::encoder::pal_rle::PaletteEntry {
+    let mut p = crate::encoder::pal_rle::PaletteEntry::default();
+    p.colors[0] = n.to_le_bytes();
+    p.count = 1;
+    p
+}
+
+/// Every reference an emission takes is given back by its acknowledgement,
+/// thin or bundled. Emitting more distinct palettes than the table has slots
+/// is only possible if each ack frees its slot for eviction.
+#[tokio::test(start_paused = true)]
+async fn a_long_session_of_acked_palette_emissions_returns_the_table_to_baseline() {
+    let mut b = bridge();
+    // Distinct palettes: three times the 256 slots. Each emission is bundled
+    // the first time (the receiver has never seen it).
+    for n in 0..768u32 {
+        palrle_round_trip(&mut b, &palette_n(n), n);
+        assert_eq!(
+            b.palette_table.ref_count.iter().sum::<u32>(),
+            0,
+            "palette {n}: its ack left a reference behind"
+        );
+        assert_eq!(b.palette_table.in_flight_carrying.iter().sum::<u32>(), 0);
+    }
+    // The same palette, now delivered, re-emitted thin many times.
+    for n in 0..2000u32 {
+        palrle_round_trip(&mut b, &palette_n(767), 10_000 + n);
+    }
+    assert_eq!(b.palette_table.ref_count.iter().sum::<u32>(), 0);
+    assert_eq!(b.palette_table.in_flight_carrying.iter().sum::<u32>(), 0);
+    assert!(
+        b.palette_table
+            .slot_state
+            .iter()
+            .all(|s| *s != crate::encoder::pal_rle::SlotState::Held),
+        "no slot may stay Held once everything emitted was acknowledged"
+    );
 }

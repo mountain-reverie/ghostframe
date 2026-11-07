@@ -523,7 +523,11 @@ impl IoBridge {
         // dispatch_dirty_tiles_via_scheduler for the
         // dangling-pointer rationale).
         self.reliable_emitter.cancel_for_tile(tile_x, tile_y);
-        let gen = self.scheduler.bump_generation(tile_x, tile_y);
+        // Collect what the bump supersedes so a PalRle emission still in
+        // flight gives back its palette reference and carry count: with no
+        // ACK coming they would otherwise stay held until session reset.
+        let (gen, superseded) = self.scheduler.bump_generation_collecting(tile_x, tile_y);
+        self.settle_superseded_palettes(tile_x, tile_y, &superseded);
         let counter = match source {
             Cdf53Source::Dirty => &mut self.bump_count_accumulator.cdf53_dirty_path,
             Cdf53Source::Escalation => &mut self.bump_count_accumulator.cdf53_escalation_path,

@@ -449,15 +449,14 @@ impl IoBridge {
                             if !self.palette_table.delivered.contains(pid) {
                                 self.palette_table.delivered.insert(pid);
                             }
-                            // The counter and the acquire are about
-                            // this *emission* carrying a palette, and
-                            // only a bundled emission does. Both are
-                            // taken on the bundled path at encode time
-                            // (`in_flight_carrying += 1` next to
-                            // `acquire_or_allocate`), so undoing them
-                            // for a thin emission takes down a count
-                            // that was never put up and releases an
-                            // acquire that never happened.
+                            // Two different things were taken at encode time.
+                            // The reference (`acquire_or_allocate`) was taken
+                            // for every emission, thin or bundled; without
+                            // giving it back the slot never returns to
+                            // `FreeButCached` and the table fills. The carry
+                            // count was raised only for a bundled emission.
+                            // Supersession already gave both back and cleared
+                            // these flags.
                             if entry.palette_bundled {
                                 let cnt = self.palette_table.in_flight_carrying[pid_usize];
                                 self.palette_table.in_flight_carrying[pid_usize] =
@@ -469,9 +468,9 @@ impl IoBridge {
                                         "in_flight_carrying underflow — enqueue/ack pairing bug",
                                     );
                                 }
-                                if self.palette_table.ref_count[pid_usize] > 0 {
-                                    self.palette_table.release(pid);
-                                }
+                            }
+                            if entry.palette_held && self.palette_table.ref_count[pid_usize] > 0 {
+                                self.palette_table.release(pid);
                             }
                         }
                     }

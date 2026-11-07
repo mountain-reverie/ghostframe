@@ -2224,6 +2224,7 @@ mod tests {
                     codec: crate::transport::protocol::Codec::Cdf53,
                     palette_id: None,
                     palette_bundled: false,
+                    palette_held: false,
                 },
             )
             .collect();
