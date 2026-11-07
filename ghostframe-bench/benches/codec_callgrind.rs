@@ -15,7 +15,6 @@
 
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 
-use ghostframe_lib::transport::fec;
 use ghostframe_lib::transport::protocol::{
     fragment_frame, fragment_tile, max_fragment_payload, Codec, DatagramHeader, FrameHeader,
     TileFragmentInputs, TileHeader, DATAGRAM_HEADER_SIZE, FRAME_HEADER_SIZE, TILE_HEADER_SIZE,
@@ -90,13 +89,6 @@ fn fragment_frame_64kb() {
     std::hint::black_box(fragment_frame(0u32, 0u32, false, &payload, 1186));
 }
 
-#[library_benchmark]
-fn fec_parity_k4() {
-    let frags: Vec<Vec<u8>> = (0..4).map(|i| vec![i as u8; 1186]).collect();
-    let refs: Vec<&[u8]> = frags.iter().map(|f| f.as_slice()).collect();
-    std::hint::black_box(fec::xor_payloads(&refs, 1186));
-}
-
 library_benchmark_group!(
     name = protocol;
     benchmarks =
@@ -105,7 +97,6 @@ library_benchmark_group!(
         tile_header_encode_decode,
         fragment_tile_4kb,
         fragment_frame_64kb,
-        fec_parity_k4
 );
 
 main!(library_benchmark_groups = protocol);

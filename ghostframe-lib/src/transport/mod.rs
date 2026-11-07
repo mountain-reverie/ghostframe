@@ -7,7 +7,6 @@ pub mod delivery_rate;
 pub mod delivery_sampler;
 pub mod departure;
 pub mod display;
-pub use ghostframe_protocol::fec;
 pub use ghostframe_protocol::feedback;
 pub mod fragment_coverage;
 pub mod input_inject;

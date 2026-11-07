@@ -25,7 +25,7 @@ pub const DATAGRAM_HEADER_SIZE: usize = 16;
 pub const TILE_HEADER_SIZE: usize = 8;
 
 /// Sentinel `wire_seq` value meaning "not yet stamped by the emitter".
-/// Used at construction sites (`fragment_tile`, `build_parity_datagrams`)
+/// Used at construction sites (`fragment_tile`)
 /// to make the convention named and greppable. The `ReliableTileEmitter`
 /// overwrites this with a real per-session monotonic value at submit time.
 pub const UNSTAMPED_WIRE_SEQ: u32 = 0;
@@ -109,8 +109,8 @@ pub struct DatagramHeader {
     /// retransmission as the distinct source it is.
     ///
     /// Convention: `0` means "not yet stamped". All call sites that build
-    /// a header before the emitter sees it (`fragment_tile`,
-    /// `build_parity_datagrams`) initialize `wire_seq = 0`; the
+    /// a header before the emitter sees it (`fragment_tile`)
+    /// initialize `wire_seq = 0`; the
     /// `ReliableTileEmitter` overwrites the field at submit time before
     /// the datagram hits the wire. A `0` observed on the wire therefore
     /// indicates either a bug in the emitter or a synthetic test datagram.
@@ -159,12 +159,6 @@ impl DatagramHeader {
             wire_seq: u32::from_be_bytes(data[8..12].try_into().unwrap()),
             timestamp_us: u32::from_be_bytes(data[12..16].try_into().unwrap()),
         })
-    }
-
-    /// Returns `true` if this datagram is a parity (FEC) fragment.
-    /// Parity fragments have `frag_idx >= frag_total`.
-    pub fn is_parity(&self) -> bool {
-        self.frag_idx >= self.frag_total
     }
 }
 
@@ -306,58 +300,6 @@ pub fn decode_tile_datagram(
     let th = TileHeader::decode(rest)?;
     let payload = &rest[TILE_HEADER_SIZE..];
     Ok((dh, th, payload))
-}
-
-// ---------------------------------------------------------------------------
-// build_parity_datagrams
-// ---------------------------------------------------------------------------
-
-/// Build parity datagrams for a tile's source fragments.
-///
-/// `frag_total` is the number of source fragments (from `fragment_tile`).
-/// `parities` is the output of `fec::generate_parity`: `(group_start, parity_payload)` pairs.
-///
-/// Parity datagrams have `frag_idx` starting at `frag_total` (so they sort after source fragments)
-/// and `frag_total` set to the source fragment count (so the receiver knows how many source
-/// fragments to expect).
-pub fn build_parity_datagrams(
-    frame_seq: u32,
-    tile_x: u8,
-    tile_y: u8,
-    codec: Codec,
-    timestamp_us: u32,
-    frag_total: u16,
-    parities: &[(u16, Vec<u8>)],
-) -> Vec<Vec<u8>> {
-    parities
-        .iter()
-        .enumerate()
-        .map(|(parity_idx, (_group_start, parity_payload))| {
-            let dh = DatagramHeader {
-                frame_seq,
-                frag_idx: frag_total + parity_idx as u16,
-                frag_total,
-                // Emitter stamps the real value at submit time.
-                wire_seq: UNSTAMPED_WIRE_SEQ,
-                timestamp_us,
-            };
-            let th = TileHeader {
-                tile_x,
-                tile_y,
-                codec,
-                lz4: false,
-                generation: 0,
-                pass: 0,
-                payload_len: 0, // not meaningful for parity
-            };
-            let mut buf =
-                Vec::with_capacity(DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE + parity_payload.len());
-            dh.encode(&mut buf);
-            th.encode(&mut buf);
-            buf.extend_from_slice(parity_payload);
-            buf
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -526,11 +468,6 @@ pub const FRAME_FLAG_MARK_TARGET: u8 = 0x20;
 /// from, `ref_frame_seq`, becomes it); the slot index is in `slots` bits 0-1
 /// either way.
 ///
-/// Parity datagrams carry NO reference information: their `flags` hold only
-/// the idr bit, `slots` is 0 and `ref_frame_seq` is `REF_FRAME_NONE`. Read the
-/// reference from a source fragment, never from a parity (Phase B must not
-/// trust these fields on a parity datagram).
-///
 /// cbindgen:ignore
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameRefInfo {
@@ -598,12 +535,6 @@ impl FrameHeader {
             slots: data[17],
             ref_frame_seq: u32::from_be_bytes(data[18..22].try_into().unwrap()),
         })
-    }
-
-    /// Returns `true` if this datagram is a parity (FEC) fragment.
-    /// Parity fragments have `frag_idx >= frag_total`.
-    pub fn is_parity(&self) -> bool {
-        self.frag_idx >= self.frag_total
     }
 
     /// Returns `true` if the IDR flag (bit 0) is set.
@@ -699,57 +630,6 @@ pub fn decode_frame_datagram(data: &[u8]) -> Result<(FrameHeader, &[u8]), Protoc
 /// Returns the maximum frame payload bytes that fit in one datagram of `max_datagram_size`.
 pub fn max_frame_fragment_payload(max_datagram_size: usize) -> usize {
     max_datagram_size.saturating_sub(FRAME_HEADER_SIZE)
-}
-
-/// As [`max_frame_fragment_payload`], for a frame whose fragments will be
-/// covered by FEC parity.
-///
-/// A parity datagram carries the XOR of its group's payloads, as long as the
-/// longest of them, behind its own [`crate::fec::PARITY_HEADER_SIZE`]-byte
-/// group header. Fragments cut to fill a datagram exactly therefore yield a
-/// parity that is three bytes too big to send: quinn refuses it as
-/// `TooLarge`, and every group holding a full-size fragment -- all of them
-/// but, at best, a frame's last -- goes out unprotected. Measured: 13 of 52
-/// H.264 datagrams in one session, every one a parity.
-///
-/// Vestigial for H.264: the server sends no H.264 parity since B7b, but still
-/// cuts fragments with this room (about 0.25 % of a 1200-byte datagram), because
-/// fixtures and the MTU-retire arithmetic pin the fragment counts. Drop it
-/// together with the client's H.264 parity decode.
-pub fn max_fec_frame_fragment_payload(max_datagram_size: usize) -> usize {
-    max_frame_fragment_payload(max_datagram_size).saturating_sub(crate::fec::PARITY_HEADER_SIZE)
-}
-
-// ---------------------------------------------------------------------------
-// build_frame_parity_datagram
-// ---------------------------------------------------------------------------
-
-/// Builds a parity datagram for a frame's source fragments.
-///
-/// The parity datagram uses `frag_idx = frag_total` to signal it is a parity fragment.
-/// `frag_total` is the number of source fragments (from `fragment_frame`).
-pub fn build_frame_parity_datagram(
-    frame_seq: u32,
-    timestamp_us: u32,
-    is_keyframe: bool,
-    frag_total: u16,
-    parity_payload: &[u8],
-) -> Vec<u8> {
-    let flags: u8 = if is_keyframe { FRAME_FLAG_IDR } else { 0x00 };
-    let fh = FrameHeader {
-        frame_seq,
-        frag_idx: frag_total, // signals parity
-        frag_total,
-        wire_seq: NO_ACK,
-        timestamp_us,
-        flags,
-        slots: 0,
-        ref_frame_seq: REF_FRAME_NONE,
-    };
-    let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + parity_payload.len());
-    fh.encode(&mut buf);
-    buf.extend_from_slice(parity_payload);
-    buf
 }
 
 // ---------------------------------------------------------------------------
@@ -1352,85 +1232,6 @@ mod tests {
     }
 
     #[test]
-    fn is_parity_datagram() {
-        // Source fragment: frag_idx < frag_total
-        let source = DatagramHeader {
-            frame_seq: 1,
-            frag_idx: 2,
-            frag_total: 8,
-            wire_seq: 0,
-            timestamp_us: 0,
-        };
-        assert!(!source.is_parity());
-
-        // Parity fragment: frag_idx >= frag_total
-        let parity = DatagramHeader {
-            frame_seq: 1,
-            frag_idx: 8,
-            frag_total: 8,
-            wire_seq: 0,
-            timestamp_us: 0,
-        };
-        assert!(parity.is_parity());
-    }
-
-    #[test]
-    fn fragment_tile_with_parity_roundtrip() {
-        use crate::fec;
-
-        let payload: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
-        let max_frag = 1200;
-        let k = 4;
-
-        // Generate source datagrams
-        let source_dgs = fragment_tile(
-            &TileFragmentInputs {
-                frame_seq: 7,
-                tile_x: 2,
-                tile_y: 3,
-                codec: Codec::H264,
-                generation: 0,
-                pass: 0,
-                timestamp_us: 999,
-            },
-            &payload,
-            max_frag,
-        );
-        let frag_total = source_dgs.len();
-        assert_eq!(frag_total, 4); // ceil(4096/1200) = 4
-
-        // Extract source payloads (bytes after headers)
-        let source_payloads: Vec<&[u8]> = source_dgs
-            .iter()
-            .map(|dg| &dg[DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE..])
-            .collect();
-
-        // Generate parity
-        let parities = fec::generate_parity(&source_payloads, k);
-        assert_eq!(parities.len(), 1); // 4 frags / K=4 = 1 parity group
-
-        // Build parity datagrams using the helper
-        let parity_dgs =
-            build_parity_datagrams(7, 2, 3, Codec::H264, 999, frag_total as u16, &parities);
-        assert_eq!(parity_dgs.len(), 1);
-
-        // Decode the parity datagram
-        let (dh, th, parity_payload) = decode_tile_datagram(&parity_dgs[0]).unwrap();
-        assert!(dh.is_parity());
-        assert_eq!(dh.frag_idx, frag_total as u16); // first parity index
-        assert_eq!(dh.frag_total, frag_total as u16); // source fragment count preserved
-        assert_eq!(th.codec, Codec::H264);
-        assert_eq!(th.tile_x, 2);
-        assert_eq!(th.tile_y, 3);
-
-        // Verify parity payload has the parity header
-        let (group_start, group_len, _xor_data) =
-            fec::decode_parity_payload(parity_payload).unwrap();
-        assert_eq!(group_start, 0);
-        assert_eq!(group_len, 4);
-    }
-
-    #[test]
     fn frame_header_roundtrip() {
         let original = FrameHeader {
             frame_seq: 0x0000_1234,
@@ -1448,7 +1249,6 @@ mod tests {
         let decoded = FrameHeader::decode(&buf).unwrap();
         assert_eq!(decoded, original);
         assert!(decoded.is_keyframe());
-        assert!(!decoded.is_parity());
     }
 
     #[test]
@@ -1612,36 +1412,6 @@ mod tests {
         );
     }
 
-    /// Everything a FEC-protected frame puts on the wire has to fit the
-    /// datagram limit -- the parity too, which is the one that did not.
-    #[test]
-    fn a_protected_frames_parity_fits_the_datagram_limit() {
-        let max_datagram = 1198;
-        let payload = vec![0xA5u8; 10_000];
-        let datagrams = fragment_frame(
-            7,
-            0,
-            true,
-            &payload,
-            max_fec_frame_fragment_payload(max_datagram),
-        );
-        assert!(datagrams.len() > 2);
-        let sources: Vec<&[u8]> = datagrams.iter().map(|d| &d[FRAME_HEADER_SIZE..]).collect();
-        let parities = crate::fec::generate_parity(&sources, 4);
-        assert!(!parities.is_empty());
-        for (_, parity) in &parities {
-            let dg = build_frame_parity_datagram(7, 0, true, datagrams.len() as u16, parity);
-            assert!(
-                dg.len() <= max_datagram,
-                "parity datagram is {} bytes, limit {max_datagram}",
-                dg.len()
-            );
-        }
-        // And nothing was left on the table: the largest parity fills it.
-        let largest = parities.iter().map(|(_, p)| p.len()).max().unwrap();
-        assert_eq!(FRAME_HEADER_SIZE + largest, max_datagram);
-    }
-
     #[test]
     fn fragment_frame_single() {
         let payload = vec![0xCDu8; 500];
@@ -1654,7 +1424,6 @@ mod tests {
         assert_eq!(fh.frag_total, 1);
         assert_eq!(fh.timestamp_us, 8000);
         assert!(fh.is_keyframe());
-        assert!(!fh.is_parity());
         assert_eq!(frag_payload, payload.as_slice());
     }
 
