@@ -195,14 +195,9 @@ impl IoBridge {
         // only) the backend control is a no-op.
         self.force_dirty_frames = 20;
         self.backend_apply(Control::InvalidateBaseline(20));
-        // Force IDR on the existing encoder so the new client
-        // gets a fresh anchor. Without this, a client connecting
-        // mid-stream may receive P-frames referencing GOPs from
-        // the prior session and decode garbage until the next
-        // natural keyframe (up to a GOP, 3 s by default, later). The
-        // first-time-only escape (lazy `FullFrameEncoder::new`
-        // with pts=0 → IDR) only covers cold start.
-        self.request_h264_idr(IdrCause::Session, std::time::Instant::now());
+        // The new client's first H.264 frame is an IDR whatever the encoder
+        // was doing: the manager's plan epoch (`reset_session`) says so.
+        //
         // info, not debug: this is the line that says a reconnecting client is
         // getting a clean slate rather than resuming, and at debug it was
         // invisible in exactly the production logs where that matters.
@@ -320,10 +315,6 @@ impl IoBridge {
         if incumbent != Some(from) {
             if self.has_seen_prior_session {
                 self.fire_session_reset(from);
-            } else {
-                // The very first session: a fresh encoder starts with an IDR
-                // on its own, so there is nothing to ask for, only to name.
-                self.expect_h264_idr(IdrCause::Session);
             }
             self.has_seen_prior_session = true;
         }
@@ -333,7 +324,9 @@ impl IoBridge {
         // classifier's hard override sees it on the very next decision —
         // without this push, the classifier would still think the client
         // supports H.264 until the next path-stats / feedback ingest.
-        self.adaptation_context.supports_h264 = msg.caps.supports_h264;
+        // A client without the v2 feedback (HELLO 0x04) cannot be served: the
+        // only H.264 path recovers by acked references, so it gets tiles.
+        self.adaptation_context.supports_h264 = msg.caps.supports_h264 && msg.caps.h264_acked_ref;
         self.adaptation_context.last_update_seq =
             self.adaptation_context.last_update_seq.wrapping_add(1);
         self.classifier

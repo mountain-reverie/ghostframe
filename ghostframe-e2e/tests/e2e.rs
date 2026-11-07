@@ -3353,10 +3353,10 @@ async fn e2e_mode_switch_chromium() -> Result<()> {
         !logs.contains("TooLarge"),
         "the server built a datagram too large to send"
     );
-    // The web client sends HELLO 0x04 (B5a): with a passing libva-direct
-    // probe its H.264 stretches ran the acked-reference path. Without VA-API
-    // (GitHub CI) this prints that nothing was proved; locally
-    // GHOSTFRAME_E2E_REQUIRE_VAAPI=1 makes that a failure.
+    // The web client sends HELLO 0x04 (B5a): its H.264 stretches ran the
+    // acked-reference path, on libva-direct where the probe passed, else on
+    // openh264 (GitHub CI has no VA-API). Locally
+    // GHOSTFRAME_E2E_REQUIRE_VAAPI=1 accepts nothing but libva-direct.
     helpers::report_acked_ref_outcome(helpers::acked_ref_outcome(&logs, helpers::require_vaapi()));
     let decisions = mode_decisions(&logs);
     eprintln!("mode decisions: {decisions:?}");

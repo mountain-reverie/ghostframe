@@ -186,39 +186,12 @@ pub(super) struct StageTrace {
     pub(super) classify_us: u64,
 }
 
-/// The wire-v2 reference description of an H.264 frame from the ffmpeg
-/// encoder: an IDR names no reference; a P frame names the previous H.264
-/// frame sent (`last`), or `REF_FRAME_NONE` ("unknown") when none was.
-pub(super) fn h264_ref_info(is_keyframe: bool, last: Option<u32>) -> FrameRefInfo {
-    if is_keyframe {
-        FrameRefInfo::IDR
-    } else {
-        FrameRefInfo::predicted(last.unwrap_or(REF_FRAME_NONE))
-    }
-}
-
-/// How an acked-reference frame describes itself to `send_h264_frame_described`:
+/// How a frame describes itself to `send_h264_frame`:
 /// the wire header's reference fields, and why it is an IDR if it is one.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Described {
     pub(super) info: FrameRefInfo,
     pub(super) idr_cause: Option<IdrCause>,
-}
-
-/// What to tell the worker for a frame the classifier put in H.264 mode: nothing
-/// when no tile changed, otherwise encode, forcing an IDR when the previous
-/// frame was on the tile path (a fresh anchor for the client).
-pub(super) fn h264_finish_action(
-    dirty_is_empty: bool,
-    prev_mode: crate::tile::FrameMode,
-) -> FinishAction {
-    if dirty_is_empty {
-        FinishAction::Discard
-    } else {
-        FinishAction::H264 {
-            force_keyframe: prev_mode == crate::tile::FrameMode::TileCodec,
-        }
-    }
 }
 
 /// The frame the worker holds, and what the loop needs to finish it.
@@ -236,10 +209,7 @@ pub(super) enum InFlightStage {
     Analysing {
         pre_us: u64,
     },
-    FinishingH264 {
-        trace: StageTrace,
-    },
-    /// An acked-reference H.264 frame, with the plan the worker executes.
+    /// An H.264 frame, with the plan the worker executes.
     FinishingH264Planned {
         trace: StageTrace,
         plan: Box<crate::encoder::h264::refs::FramePlan>,
@@ -779,7 +749,7 @@ impl IoBridge {
     /// 2. [`Self::on_analysed`] when the worker answers: dimensions, the
     ///    classifier, the sweep and the mode decision (all loop state), then the
     ///    worker is told what to finish with;
-    /// 3. [`Self::on_h264_done`] / [`Self::on_tile_done`]: commit the results to
+    /// 3. [`Self::on_h264_planned_done`] / [`Self::on_tile_done`]: commit the results to
     ///    the scheduler, palette table and wire.
     ///
     /// Between the steps the loop serves the network, timers and everything
@@ -935,7 +905,6 @@ impl IoBridge {
         let seq = match &msg {
             FromWorker::Analysed { seq, .. }
             | FromWorker::AnalyseFailed { seq, .. }
-            | FromWorker::H264Done { seq, .. }
             | FromWorker::H264Planned { seq, .. }
             | FromWorker::TileDone { seq, .. }
             | FromWorker::Discarded { seq } => *seq,
@@ -981,9 +950,6 @@ impl IoBridge {
                     );
                 }
             }
-            FromWorker::H264Done { out, worker_us, .. } => {
-                self.on_h264_done(inflight, out, worker_us)
-            }
             FromWorker::H264Planned {
                 reply, worker_us, ..
             } => self.on_h264_planned_done(inflight, reply, worker_us),
@@ -1010,8 +976,7 @@ impl IoBridge {
         } = inflight;
         let pre_us = match inflight.stage {
             InFlightStage::Analysing { pre_us } => pre_us,
-            InFlightStage::FinishingH264 { .. }
-            | InFlightStage::FinishingH264Planned { .. }
+            InFlightStage::FinishingH264Planned { .. }
             | InFlightStage::FinishingTile { .. }
             | InFlightStage::FinishingDiscard => 0,
         };
@@ -1078,7 +1043,7 @@ impl IoBridge {
         // matching the row-major layout used by MetricsTracker / TileGrid.
         let cols = meta.width.div_ceil(crate::tile::TILE_SIZE);
         let rows = meta.height.div_ceil(crate::tile::TILE_SIZE);
-        let (dirty_xy, prev_mode, new_mode) =
+        let (dirty_xy, _prev_mode, new_mode) =
             self.classify_dirty_tiles(&analysis, &meta, cols, rows, seq);
 
         // ---- M3.3c: PixelPerfect transition sweep ----
@@ -1111,8 +1076,7 @@ impl IoBridge {
         //    queue stagnates and the wizard never finishes refining.
         match new_mode {
             FrameMode::H264 => {
-                let action = h264_finish_action(dirty_xy.is_empty(), prev_mode);
-                self.finish_h264_arm(inflight, action, trace);
+                self.finish_h264_arm(inflight, dirty_xy.is_empty(), trace);
             }
             FrameMode::TileCodec => {
                 let max_frag = max_fragment_payload(max_dg_size);
@@ -1234,73 +1198,40 @@ impl IoBridge {
             .collect()
     }
 
-    /// The H.264 arm of step 2: tell the worker what to finish the frame with.
-    /// An empty frame is discarded. Otherwise the encoder gate decides (see
-    /// `h264_frame_gate`): a frame it turns away is dropped, not queued, and
-    /// the next one is made whole.
+    /// The H.264 arm of step 2: the `RefManager` plans the frame (see
+    /// `h264_refs`) and the plan goes to the worker. Coming back from the tile
+    /// codec is not an IDR either; the manager was told at the mode switch.
+    /// A frame with no dirty tile is discarded; one the manager holds back (an
+    /// IDR still being delivered, or the emission queue is backed up) is
+    /// dropped, not queued: every frame is a whole screen, so the next one
+    /// carries what this one would have, and it is made whole.
     pub(super) fn finish_h264_arm(
         &mut self,
         inflight: InFlight,
-        action: FinishAction,
+        no_dirty_tiles: bool,
         trace: StageTrace,
     ) {
         let (seq, m) = (inflight.seq, inflight.meta);
-        if matches!(action, FinishAction::Discard) {
+        if no_dirty_tiles {
             // Nothing will be committed for this frame, so its dimensions go
             // out now.
             self.emit_frame_dimensions(seq, m.timestamp_us, m.width, m.height);
-            self.send_finish(inflight, action, InFlightStage::FinishingDiscard);
+            self.send_finish(
+                inflight,
+                FinishAction::Discard,
+                InFlightStage::FinishingDiscard,
+            );
             return;
         }
-        // A session that recovers by acked references: the `RefManager` plans
-        // the frame (see `h264_refs`). Coming back from the tile codec is not
-        // an IDR there either; the manager was told at the mode switch.
-        if self.h264_refs_active() {
-            self.finish_h264_refs_arm(inflight, trace);
-            return;
-        }
-        // Coming back from the tile codec the client has no H.264 anchor: this
-        // frame is an IDR whether or not it is encoded now (a skipped one must
-        // not lose the demand, since the next frame sees H.264 as its previous
-        // mode). Naming it as pending also lets it past the gate.
-        if matches!(
-            action,
-            FinishAction::H264 {
-                force_keyframe: true
-            }
-        ) {
-            self.name_reentry_idr();
-        }
-        match self.h264_frame_gate(now_std()) {
-            H264Gate::Encode => {
-                // The rate for this frame; a reopen goes to the worker ahead
-                // of the finish, which therefore encodes an IDR.
-                let (gop, fps) = (self.h264.gop, self.h264.fps);
-                self.h264_rate_step(now_std(), gop, fps);
-                self.send_finish(inflight, action, InFlightStage::FinishingH264 { trace });
-            }
-            H264Gate::SkipHold | H264Gate::SkipBackpressure => {
-                // The capture is dropped, not queued: every frame is a whole
-                // screen, so the next one carries what this one would have.
-                // Make that next frame fully dirty, or a screen that stops
-                // changing right now would never be sent.
-                self.ensure_baseline_invalidated();
-                self.emit_frame_dimensions(seq, m.timestamp_us, m.width, m.height);
-                self.send_finish(
-                    inflight,
-                    FinishAction::Discard,
-                    InFlightStage::FinishingDiscard,
-                );
-            }
-        }
-    }
-
-    /// The H.264 arm for an acked-reference session: plan the frame and hand
-    /// the plan to the worker, or skip the frame (held for an IDR, or the
-    /// emission queue is backed up).
-    fn finish_h264_refs_arm(&mut self, inflight: InFlight, trace: StageTrace) {
-        let (seq, m) = (inflight.seq, inflight.meta);
-        match self.h264_refs_plan(seq, (m.width, m.height), now_std(), true) {
+        // A client without the v2 feedback is never offered H.264 (the
+        // classifier is told at its HELLO), so this is a plan the loop cannot
+        // make: drop the frame like a held one.
+        let planned = if self.h264_refs_active() {
+            self.h264_refs_plan(seq, (m.width, m.height), now_std(), true)
+        } else {
+            None
+        };
+        match planned {
             Some(req) => {
                 let plan = Box::new(req.plan.clone());
                 self.send_finish(
@@ -1310,8 +1241,6 @@ impl IoBridge {
                 );
             }
             None => {
-                // The capture is dropped, not queued: every frame is a whole
-                // screen, so the next one carries what this one would have.
                 self.ensure_baseline_invalidated();
                 self.emit_frame_dimensions(seq, m.timestamp_us, m.width, m.height);
                 self.send_finish(
@@ -1321,43 +1250,6 @@ impl IoBridge {
                 );
             }
         }
-    }
-
-    /// Step 3 for an H.264 frame: fragment and send what the worker encoded.
-    pub(super) fn on_h264_done(
-        &mut self,
-        inflight: InFlight,
-        out: Option<H264Out>,
-        worker_us: u64,
-    ) {
-        // The session changed while the encode ran. The encoder's reference
-        // chain advanced past this frame, so the next one must be an IDR or the
-        // client decodes garbage until the next GOP.
-        let Some(max_dg_size) = self.commit_max_datagram_size(&inflight) else {
-            self.request_h264_idr(IdrCause::Session, now_std());
-            return;
-        };
-        let InFlightStage::FinishingH264 { trace } = inflight.stage else {
-            return;
-        };
-        // The frame's dimensions go out with the frame, not before the worker
-        // has finished it: on a resolution change the client resizes its canvas
-        // on them, and the finish can take a second.
-        let m = inflight.meta;
-        self.emit_frame_dimensions(inflight.seq, m.timestamp_us, m.width, m.height);
-        let Some(encoded) = out else {
-            return;
-        };
-        let mut lap = Lap::new(stage_trace_enabled());
-        self.send_h264_frame(encoded, &inflight.meta, inflight.seq, max_dg_size);
-        let emit_us = lap.lap();
-        tracing::trace!(
-            target: "ghostframe::io_bridge::diag",
-            seq = inflight.seq, mode = "h264",
-            pre_us = trace.pre_us, gpu_us = trace.gpu_us, classify_us = trace.classify_us,
-            worker_finish_us = worker_us, emit_us,
-            "[BRIDGE] frame.stages"
-        );
     }
 
     /// Step 3 for a tile frame: commit what the worker produced.
@@ -1394,7 +1286,7 @@ impl IoBridge {
             cdf53_fallback,
             timings,
         } = out;
-        // The frame's dimensions go out with the frame (see `on_h264_done`).
+        // The frame's dimensions go out with the frame (see `on_h264_planned_done`).
         let m = inflight.meta;
         self.emit_frame_dimensions(inflight.seq, m.timestamp_us, m.width, m.height);
         // The path MTU can shrink while the worker runs; fragment for the
@@ -1764,88 +1656,46 @@ impl IoBridge {
     /// H.264 arm: fragment the frame the worker encoded from the GPU's NV12
     /// output and hand every fragment to the reliable emitter, which gives it a
     /// `wire_seq` and a ledger record, caches it for the loss path and the
-    /// probe, and queues it behind the admission gate (the XOR parity is
-    /// queued untracked, billed as parity).
+    /// probe, and queues it behind the admission gate. The frame names its own
+    /// reference and, for an IDR, why it was made (`described`).
     ///
     /// An IDR first supersedes every older frame: their cached and queued
-    /// fragments are dropped, and P frames are held until its own fragments
-    /// are all acknowledged (see `h264_tx`).
+    /// fragments are dropped. The `RefManager` holds the P frames behind it
+    /// (`Plan::Hold`) until its own fragments are acknowledged. There is no
+    /// XOR parity: an acked-reference stream repairs from its anchor (design
+    /// D2) and the client tolerates a stream without it. Returns the number of
+    /// fragments.
     pub(super) fn send_h264_frame(
         &mut self,
         encoded: H264Out,
         frame: &FrameMeta,
         seq: u32,
         max_dg_size: usize,
-    ) {
-        self.send_h264_frame_described(encoded, frame, seq, max_dg_size, None);
-    }
-
-    /// [`Self::send_h264_frame`] with the frame's reference description given
-    /// instead of derived (`None`): what an encoder that controls references
-    /// says on the wire. Such a frame belongs to an acked-reference session
-    /// (`h264_refs`): it is sent without the Phase A IDR hold (the manager
-    /// holds its own P frames) and without XOR parity. Returns the number of
-    /// fragments.
-    pub(super) fn send_h264_frame_described(
-        &mut self,
-        encoded: H264Out,
-        frame: &FrameMeta,
-        seq: u32,
-        max_dg_size: usize,
-        described: Option<Described>,
+        described: Described,
     ) -> u16 {
         let now = now_std();
-        let acked_ref = described.is_some();
         // Fragment and send. `fragment_frame` chunks the payload at the
         // per-fragment payload limit (datagram size minus the frame
-        // header), not the raw datagram size — otherwise the on-wire
+        // header), not the raw datagram size, otherwise the on-wire
         // datagram (header + chunk) overshoots the MTU and WebTransport
         // returns TooLarge, dropping every H.264 datagram silently.
-        // And the limit leaves room for the parity's own header, or
-        // it is the parity that overshoots instead.
-        //
-        // Reference description (wire v2): an IDR names no reference; a P
-        // frame names the previous H.264 frame this bridge sent, which is what
-        // the ffmpeg encoder predicts from (one reference, no long-term
-        // slots). With none sent yet it carries `REF_FRAME_NONE`, "unknown".
-        let planned_cause = described.and_then(|d| d.idr_cause);
-        let ref_info = described
-            .map(|d| d.info)
-            .unwrap_or_else(|| h264_ref_info(encoded.is_keyframe, self.last_h264_frame_seq));
-        self.last_h264_frame_seq = Some(seq);
         let datagrams = fragment_frame_ref(
             seq,
             frame.timestamp_us,
-            ref_info,
+            described.info,
             &encoded.payload,
             max_fec_frame_fragment_payload(max_dg_size),
         );
 
         let is_idr = encoded.is_keyframe;
-        let cause = self.note_h264_encoded_as(is_idr, (frame.width, frame.height), planned_cause);
+        self.note_h264_encoded_as(is_idr, described.idr_cause);
         if is_idr {
             self.supersede_h264_before(seq, now);
             self.h264.last_idr_seq = Some(seq);
-            // Whatever a verdict doomed is superseded by this IDR.
-            self.h264.doomed_from = None;
-            if acked_ref {
-                // The manager holds the P frames behind this IDR itself
-                // (`Plan::Hold`), and retransmission of its fragments is the
-                // loss path's, as for any IDR.
-                self.end_h264_hold(now);
-            } else if cause == Some(IdrCause::GopPeriodic) {
-                // The encoder's own periodic IDR: the client already has a
-                // picture, P frames after it only chain from it, and a lost
-                // one becomes a loss IDR through its verdicts anyway. No hold
-                // (and an earlier hold is over: its IDR was just superseded).
-                self.end_h264_hold(now);
-            } else {
-                self.begin_h264_hold(seq, now);
-            }
         }
         self.h264
             .tracker
-            .on_frame_sent(seq, is_idr, datagrams.len() as u16, now);
+            .on_frame_sent(seq, is_idr, datagrams.len() as u16);
         self.h264.stats.frames_sent += 1;
 
         self.cumulative_datagrams_emitted.h264 = self
@@ -1860,34 +1710,13 @@ impl IoBridge {
             self.open_probe_window_for_burst(now);
         }
 
-        // Parity is built from the payloads before the fragments move.
-        let fec_k = fec_group_size(is_idr);
-        let mut parity_datagrams: Vec<Vec<u8>> = Vec::new();
-        // An acked-reference stream repairs from its anchor, not from parity
-        // (design D2); the client tolerates a stream without it.
-        if datagrams.len() > 1 && !acked_ref {
-            let source_payloads: Vec<&[u8]> = datagrams
-                .iter()
-                .map(|dg| &dg[FRAME_HEADER_SIZE..])
-                .collect();
-            for (_group_start, parity_payload) in &fec::generate_parity(&source_payloads, fec_k) {
-                parity_datagrams.push(build_frame_parity_datagram(
-                    seq,
-                    frame.timestamp_us,
-                    is_idr,
-                    datagrams.len() as u16,
-                    parity_payload,
-                ));
-            }
-        }
-
         let h264_wire_bytes: u32 = datagrams.iter().map(|dg| dg.len() as u32).sum();
         let frag_count = datagrams.len() as u16;
         let queued_at = now;
         // A P frame of an acked-reference stream sent while a probe window is
         // open is part of its burst (it was coded at the window's rate, see
         // `h264_probe_raise`); on any other stream only an IDR is.
-        let tag_p = acked_ref && self.h264_raise_enabled();
+        let tag_p = self.h264_raise_enabled();
         let mut tagged = false;
         for (i, dg) in datagrams.into_iter().enumerate() {
             let probe = self
@@ -1928,14 +1757,8 @@ impl IoBridge {
         }
         // A probe window an IDR claimed, or one a P frame may claim, is
         // filled up to the cluster with padding (see `h264_probe_pad`).
-        self.h264_probe_pad(now, cause.filter(|_| is_idr), h264_wire_bytes as usize);
+        self.h264_probe_pad(now, is_idr, h264_wire_bytes as usize);
         self.reliable_emitter.expire_h264_pad(now);
-        let mut parity_bytes = 0u64;
-        for parity_dg in parity_datagrams {
-            parity_bytes += parity_dg.len() as u64;
-            self.reliable_emitter
-                .queue_untracked(bytes::Bytes::from(parity_dg), WireClass::Parity);
-        }
         self.reliable_emitter.trim_h264_cache();
         // Through the admission gate: what the bucket and quinn's FIFO depth
         // allow goes now, the rest waits in the queue for a later pass.
@@ -1944,7 +1767,7 @@ impl IoBridge {
         // M3.5 bench telemetry: H264 frame completed — all fragments handed on.
         self.bytes_emitted_h264 = self
             .bytes_emitted_h264
-            .saturating_add(u64::from(h264_wire_bytes) + parity_bytes);
+            .saturating_add(u64::from(h264_wire_bytes));
         tracing::info!(
             target: "ghostframe::bench",
             frame_seq = seq,
@@ -2732,8 +2555,8 @@ impl IoBridge {
                 "h264 client feedback (frame acks and reset requests; cumulative)"
             );
 
-            // The H.264 transport (Phase A): IDRs by cause, how the loss path
-            // treated H.264 fragments, what the encoder gate held back, and
+            // The H.264 transport: IDRs by cause, how the loss path treated
+            // H.264 fragments, what the backpressure skip held back, and
             // the ledger accounting (`tx_recorded` = acked live + judged lost
             // + forgotten + still outstanding). A cumulative line at the
             // `cumulative emit` cadence.
@@ -2757,21 +2580,16 @@ impl IoBridge {
                     frames_acked = h.frames_acked,
                     frames_suspect = h.frames_suspect,
                     idr_session = h.idr_by_cause[IdrCause::Session.index()],
-                    idr_loss = h.idr_by_cause[IdrCause::Loss.index()],
                     idr_client_reset = h.idr_by_cause[IdrCause::ClientReset.index()],
                     idr_resolution = h.idr_by_cause[IdrCause::Resolution.index()],
                     idr_reentry = h.idr_by_cause[IdrCause::Reentry.index()],
-                    idr_hold_timeout = h.idr_by_cause[IdrCause::HoldTimeout.index()],
-                    idr_gop_periodic = h.idr_by_cause[IdrCause::GopPeriodic.index()],
                     idr_mtu_shrink = h.idr_by_cause[IdrCause::MtuShrink.index()],
+                    idr_encoder_fault = h.idr_by_cause[IdrCause::EncoderFault.index()],
                     send_too_large = h.send_too_large,
                     oversize_h264 = h.oversize_h264,
                     oversize_tile = h.oversize_tile,
                     oversize_pad = h.oversize_pad,
                     oversize_untracked = h.oversize_untracked,
-                    idr_rate_drop = h.idr_by_cause[IdrCause::RateDrop.index()],
-                    rate_reopens_gop = h.rate_reopens_gop,
-                    idr_rate_rise = h.idr_by_cause[IdrCause::RateRise.index()],
                     rate_target_bps = h.rate_target_bps,
                     frame_cap_bytes = h.frame_cap_bytes,
                     idr_cap_bytes = h.idr_cap_bytes,
@@ -2782,16 +2600,11 @@ impl IoBridge {
                     probe_padding_windows = h.probe_padding_windows,
                     probe_padding_bytes = h.probe_padding_bytes,
                     pads_lost = h.pads_lost,
-                    loss_idr_rate_limited = h.loss_idr_rate_limited,
-                    idr_requests_coalesced = h.idr_requests_coalesced,
                     verdicts_idr_frag = h.verdicts_idr_frag,
                     verdicts_p_frag = h.verdicts_p_frag,
                     verdicts_already_acked = h.verdicts_already_acked,
                     idr_fragments_resent = em.h264_idr_resends,
                     probe_fragments_resent = em.h264_probe_resends,
-                    p_hold_ms = h.p_hold_ms,
-                    p_holds = h.p_holds,
-                    hold_timeouts = h.hold_timeouts,
                     frames_skipped_hold = h.frames_skipped_hold,
                     frames_skipped_backpressure = h.frames_skipped_backpressure,
                     queue_purged = h.queue_purged,
@@ -2807,7 +2620,7 @@ impl IoBridge {
                     tx_forgotten = h.tx_forgotten,
                     tx_acked_late = h.tx_acked_late,
                     bwe_samples_seen = self.bwe.snapshot().samples_seen,
-                    "h264 stats (IDR causes, verdicts, hold, frame skips, ledger accounting; cumulative)"
+                    "h264 stats (IDR causes, verdicts, frame skips, ledger accounting; cumulative)"
                 );
             }
             // Acked-reference recovery (Phase B): what the manager planned and

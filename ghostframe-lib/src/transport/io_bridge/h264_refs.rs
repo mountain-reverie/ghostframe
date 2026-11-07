@@ -307,9 +307,7 @@ fn bridge_idr_cause(c: Option<RefIdrCause>) -> IdrCause {
     match c {
         Some(RefIdrCause::ResolutionChange) => IdrCause::Resolution,
         Some(RefIdrCause::ClientReset) => IdrCause::ClientReset,
-        // Counted as a loss IDR in the bridge's table; the manager's own
-        // `idr_encoder_fault` says what it was.
-        Some(RefIdrCause::EncoderFault) => IdrCause::Loss,
+        Some(RefIdrCause::EncoderFault) => IdrCause::EncoderFault,
         Some(RefIdrCause::MtuShrink) => IdrCause::MtuShrink,
         Some(RefIdrCause::BackendFallback) => IdrCause::BackendFallback,
         Some(RefIdrCause::SessionStart) | None => IdrCause::Session,
@@ -615,7 +613,7 @@ impl IoBridge {
         let len = au.payload.len();
         self.note_frame_cap(seq, len);
         self.note_raised_sent(seq, len, now);
-        let frags = self.send_h264_frame_described(
+        let frags = self.send_h264_frame(
             H264Out {
                 payload: au.payload,
                 is_keyframe: au.meta.idr,
@@ -623,7 +621,7 @@ impl IoBridge {
             meta,
             seq,
             max_dg_size,
-            Some(described),
+            described,
         );
         let mut faulted = false;
         if let Some(st) = self.h264.refs.as_mut() {
@@ -1070,13 +1068,6 @@ impl IoBridge {
             since.is_some_and(|t| now.saturating_duration_since(t) >= SPIKE_QUEUE_PERSIST);
         let distress = snap.stats.loss_state.is_limited() || queue_persists;
         let before = self.h264.rate.applied();
-        #[cfg(feature = "browserless-harness")]
-        let apply = if self.h264.phase_a_rate_step {
-            self.phase_a_apply(now, estimate)
-        } else {
-            self.h264.rate.step_in_place(now, estimate, distress)
-        };
-        #[cfg(not(feature = "browserless-harness"))]
         let apply = self.h264.rate.step_in_place(now, estimate, distress);
         let Some(apply) = apply else {
             return;
@@ -1101,31 +1092,6 @@ impl IoBridge {
             self.h264.last_cut_at = Some(now);
         }
         self.h264.stats.rate_target_bps = bps;
-        let fps = self.h264.fps;
-        self.h264_control(Control::H264Rate {
-            bps,
-            fps,
-            reopen: false,
-        });
-    }
-
-    /// Phase A's policy on an acked-reference session, as it ran before
-    /// `step_in_place` (the 2 s reopen lock, the rise confirmations), for the
-    /// harness to measure the baseline and to break the in-place policy.
-    #[cfg(feature = "browserless-harness")]
-    fn phase_a_apply(
-        &mut self,
-        now: Instant,
-        estimate: u64,
-    ) -> Option<super::h264_rate::RateApply> {
-        use super::h264_rate::{RateApply, RateStep};
-        let (bps, cut, initial) = match self.h264.rate.step(now, estimate, true) {
-            RateStep::Keep => return None,
-            RateStep::Initial(bps) => (bps, false, true),
-            RateStep::Reopen { bps, urgent } => (bps, urgent, false),
-            RateStep::ReopenRise { bps } => (bps, false, false),
-        };
-        Some(RateApply { bps, cut, initial })
     }
 
     /// The `RefManager`'s counters and the loop's, as one report.

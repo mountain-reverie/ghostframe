@@ -1,64 +1,26 @@
 //! Encode latency per codec × content class.
 //!
-//! Pre-M3, only H.264 is real. Future codecs (PalRle, CDF53, Solid)
-//! plug in by adding a new `BenchEncoder` impl below.
+//! The tile codecs (PalRle, CDF53, Solid) plug in as `BenchEncoder` impls
+//! below. H.264 has no per-tile row: it is a whole-frame stream
+//! (libva-direct, openh264) with its own tests, not a tile codec.
 
 use criterion::{criterion_group, criterion_main, Criterion};
 
-#[cfg(any(feature = "gpu-bench", feature = "m3"))]
+#[cfg(feature = "m3")]
 use ghostframe_bench::fixtures;
 
-#[cfg(any(feature = "gpu-bench", feature = "m3"))]
+#[cfg(feature = "m3")]
 use fixtures::BenchEncoder;
 
-#[cfg(any(feature = "gpu-bench", feature = "m3"))]
+#[cfg(all(feature = "gpu-bench", feature = "m3"))]
 #[path = "side_channel.rs"]
 mod side_channel;
 
-// ── H.264 (per-tile) ───────────────────────────────────────────────────────
-//
-// `H264VaapiEncoder` encodes a single 32×32 BGRA tile per call. The encoder
-// internally pads to the VA-API minimum, so per-tile latency is dominated
-// by VA-API submission overhead, not pixel count. That's still informative.
-
-#[cfg(feature = "gpu-bench")]
+#[cfg(all(feature = "gpu-bench", feature = "m3"))]
 use criterion::{black_box, BenchmarkId};
 
-#[cfg(feature = "gpu-bench")]
+#[cfg(all(feature = "gpu-bench", feature = "m3"))]
 use fixtures::{ContentClass, Lz4Wrapper, TILE_BYTES};
-
-#[cfg(feature = "gpu-bench")]
-struct H264TileEncoder {
-    inner: ghostframe_lib::encoder::h264_vaapi::H264VaapiEncoder,
-}
-
-#[cfg(feature = "gpu-bench")]
-impl H264TileEncoder {
-    fn new() -> Option<Self> {
-        ghostframe_lib::encoder::h264_vaapi::H264VaapiEncoder::new()
-            .ok()
-            .map(|inner| Self { inner })
-    }
-}
-
-#[cfg(feature = "gpu-bench")]
-impl BenchEncoder for H264TileEncoder {
-    fn name(&self) -> &'static str {
-        "h264"
-    }
-    fn encode(&mut self, tile: &[u8]) -> Vec<u8> {
-        // Loop on Ok(None) — VA-API may buffer the first frame; without
-        // looping, the buffered iteration would record a near-zero time
-        // and drag the mean down. Looping records the cost honestly.
-        loop {
-            match self.inner.encode(tile) {
-                Ok(Some(enc)) => return enc.payload,
-                Ok(None) => continue,
-                Err(_) => return Vec::new(),
-            }
-        }
-    }
-}
 
 // ── M3 placeholders ─────────────────────────────────────────────────────────
 
@@ -132,6 +94,7 @@ impl BenchEncoder for PalRleEncoder {
 // ── Solid encoder ────────────────────────────────────────────────────────────
 
 #[cfg(feature = "m3")]
+#[allow(dead_code)]
 struct SolidEncoder;
 
 #[cfg(feature = "m3")]
@@ -152,6 +115,7 @@ impl BenchEncoder for SolidEncoder {
 // ── CDF 5/3 encoder ──────────────────────────────────────────────────────────
 
 #[cfg(feature = "m3")]
+#[allow(dead_code)]
 struct Cdf53Encoder;
 
 #[cfg(feature = "m3")]
@@ -181,6 +145,7 @@ impl BenchEncoder for Cdf53Encoder {
 // ── CDF 5/3 per-pass encoder ─────────────────────────────────────────────────
 
 #[cfg(feature = "m3")]
+#[allow(dead_code)]
 struct Cdf53PerPassEncoder {
     passes_kept: u8,
 }
@@ -214,7 +179,7 @@ impl BenchEncoder for Cdf53PerPassEncoder {
 // is fine; for absolute single-frame numbers, see the codec_callgrind
 // bench (Task 6) or future per-frame-type harnesses.
 
-#[cfg(feature = "gpu-bench")]
+#[cfg(all(feature = "gpu-bench", feature = "m3"))]
 fn bench_codec(c: &mut Criterion, encoder: &mut dyn BenchEncoder) {
     let group_name = if encoder.lz4() {
         format!("{}+lz4", encoder.name())
@@ -228,7 +193,7 @@ fn bench_codec(c: &mut Criterion, encoder: &mut dyn BenchEncoder) {
         assert_eq!(tile.len(), TILE_BYTES);
 
         // Record compressed size OUTSIDE the criterion timing loop.
-        #[cfg(any(feature = "gpu-bench", feature = "m3"))]
+        #[cfg(all(feature = "gpu-bench", feature = "m3"))]
         {
             let encoded = encoder.encode(&tile);
             side_channel::record_compressed_bytes(
@@ -247,25 +212,6 @@ fn bench_codec(c: &mut Criterion, encoder: &mut dyn BenchEncoder) {
 }
 
 fn run_codecs(c: &mut Criterion) {
-    #[cfg(feature = "gpu-bench")]
-    {
-        if let Some(mut h264) = H264TileEncoder::new() {
-            // Warm up — discard the first encode result to flush any
-            // VA-API initial-buffer state before measurement begins.
-            let warmup = ContentClass::Motion.tile();
-            let _ = h264.encode(&warmup);
-            bench_codec(c, &mut h264);
-
-            // Re-create for the LZ4 wrapper to isolate state from the prior run.
-            if let Some(h264_again) = H264TileEncoder::new() {
-                let mut wrapped = Lz4Wrapper::new(h264_again);
-                let _ = wrapped.encode(&warmup);
-                bench_codec(c, &mut wrapped);
-            }
-        } else {
-            eprintln!("h264: VA-API encoder unavailable, skipping");
-        }
-    }
     #[cfg(all(feature = "gpu-bench", feature = "m3"))]
     {
         // PalRle bench (CPU-side encode).
@@ -340,12 +286,12 @@ fn run_codecs(c: &mut Criterion) {
             }
         }
     }
-    #[cfg(not(feature = "gpu-bench"))]
+    #[cfg(not(all(feature = "gpu-bench", feature = "m3")))]
     {
         let _ = c;
         eprintln!("codec_latency: built without --features gpu-bench, no codecs to bench");
     }
-    #[cfg(any(feature = "gpu-bench", feature = "m3"))]
+    #[cfg(all(feature = "gpu-bench", feature = "m3"))]
     {
         side_channel::flush().expect("side_channel flush");
     }

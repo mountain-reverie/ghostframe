@@ -1,9 +1,9 @@
-//! Headless GPU integration test: DMA-BUF → SAD dirty detection + NV12 conversion → H.264 encode → fragment.
+//! Headless GPU integration test: DMA-BUF → SAD dirty detection + NV12 conversion → fragment.
 //!
 //! Exercises the GPU pipeline without Docker, X11, or a browser.
 //! Uses real dma-bufs (udmabuf, see `support/dmabuf_fixture.rs`). A plain
 //! memfd is not a dma-buf, so these tests FAIL, never skip, when the GPU or
-//! the dma-buf cannot be set up. Only a missing H.264 encoder skips. CI
+//! the dma-buf cannot be set up. CI
 //! excludes the `dmabuf_real_*` tests by name (no GPU/udmabuf there).
 //!
 //! Run: cargo test --test gpu_pipeline
@@ -13,7 +13,6 @@ mod dmabuf_fixture;
 
 use dmabuf_fixture::{udmabuf_frame, udmabuf_solid, TestDmabuf};
 use ghostframe_lib::capture::gpu_pipeline::{GpuFrameProcessor, IngestTier};
-use ghostframe_lib::encoder::h264_vaapi::{FullFrameEncoded, FullFrameEncoder};
 use ghostframe_lib::transport::protocol::{decode_frame_datagram, fragment_frame};
 
 const NEEDS_GPU: &str =
@@ -126,93 +125,26 @@ fn dmabuf_real_gpu_pipeline_dirty_detection() {
 // Test 2: Full-frame encode from a dma-buf
 // ---------------------------------------------------------------------------
 
-/// Verify FullFrameEncoder produces H.264 output from a real dma-buf.
-/// Skips only if no encoder is available.
-#[test]
-fn dmabuf_real_gpu_pipeline_full_frame_encode() {
-    let width = 128u32;
-    let height = 128u32;
-    let stride = width * 4;
-
-    let mut encoder = match FullFrameEncoder::new(width, height) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("Skipping gpu_pipeline_full_frame_encode (no encoder): {e}");
-            return;
-        }
-    };
-
-    // Solid green frame
-    let d = create_solid_dmabuf(width, height, 0, 255, 0); // B=0, G=255, R=0
-
-    // Encode — VA-API may buffer the first frame; try up to 3 frames.
-    let mut got_output = false;
-    let mut got_keyframe = false;
-    for _ in 0..3 {
-        match encoder
-            .encode_frame(d.raw(), width, height, stride)
-            .expect("encode_frame on a real dma-buf failed")
-        {
-            Some(encoded) => {
-                assert!(
-                    !encoded.payload.is_empty(),
-                    "encoded payload must not be empty"
-                );
-                if encoded.is_keyframe {
-                    got_keyframe = true;
-                }
-                got_output = true;
-                break;
-            }
-            None => continue,
-        }
-    }
-
-    // Encode a second frame (same dma-buf is fine — static content)
-    if got_output {
-        match encoder.encode_frame(d.raw(), width, height, stride) {
-            Ok(Some(_)) | Ok(None) => {}
-            Err(e) => {
-                eprintln!("Second encode_frame error (non-fatal): {e}");
-            }
-        }
-    }
-
-    assert!(
-        got_output,
-        "encoder should have produced output within 3 frames"
-    );
-    assert!(got_keyframe, "first output should be a keyframe");
-}
-
 // ---------------------------------------------------------------------------
 // Test 3: Full pipeline end-to-end
 // ---------------------------------------------------------------------------
 
-/// Full pipeline: DMA-BUF → GPU process_frame (SAD + NV12) → encode_nv12_buffer → fragment.
-/// This is the production path using HOST_VISIBLE NV12 output from the GPU compute shader.
+/// Full pipeline: DMA-BUF → GPU process_frame (SAD + NV12) → fragment. The
+/// NV12 output stands in for the access unit: the encoders (libva-direct,
+/// openh264) are exercised by their own tests, this one is the GPU stage and
+/// the fragmenter.
 #[test]
 fn dmabuf_real_gpu_pipeline_end_to_end() {
     let width = 256u32;
     let height = 256u32;
     let stride = width * 4;
 
-    // 1. Create both components. A missing GPU is a failure; a missing
-    //    encoder is the only skip.
     let mut processor = GpuFrameProcessor::new(512).expect(NEEDS_GPU);
 
-    let mut encoder = match FullFrameEncoder::new(width, height) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("Skipping gpu_pipeline_end_to_end (no encoder): {e}");
-            return;
-        }
-    };
-
-    // 2. First frame: solid cyan
+    // 1. First frame: solid cyan
     let d1 = create_solid_dmabuf(width, height, 255, 255, 0); // B=255, G=255, R=0
 
-    // 3. process_frame → dirty tiles + NV12 data
+    // 2. process_frame → dirty tiles + NV12 data
     let analysis = processor
         .process_frame(d1.raw(), width, height, stride)
         .expect("process_frame on a real dma-buf failed");
@@ -226,51 +158,28 @@ fn dmabuf_real_gpu_pipeline_end_to_end() {
         "NV12 data should not be null"
     );
 
-    // 4. Encode via encode_nv12_buffer — try up to 3 attempts for VA-API buffering.
-    let mut frame_output: Option<FullFrameEncoded> = None;
-    for _ in 0..3 {
-        match encoder
-            .encode_nv12_buffer(
-                analysis.nv12_data,
-                analysis.nv12_width,
-                analysis.nv12_height,
-                analysis.nv12_y_stride,
-                analysis.nv12_uv_stride,
-                analysis.nv12_uv_offset,
-            )
-            .expect("encode_nv12_buffer failed")
-        {
-            Some(enc) => {
-                frame_output = Some(enc);
-                break;
-            }
-            None => continue,
-        }
-    }
+    // 3. Fragment the NV12 bytes (MTU = 1200, max_fragment_payload = 1200 - 14
+    //    header bytes) and read the first datagram's header back.
+    let nv12_len = (analysis.nv12_uv_offset as usize)
+        + analysis.nv12_uv_stride as usize * (analysis.nv12_height as usize).div_ceil(2);
+    // SAFETY: the pointer and strides are the GPU stage's, valid until the next
+    // `process_frame`.
+    let nv12 = unsafe { std::slice::from_raw_parts(analysis.nv12_data, nv12_len) }.to_vec();
+    let max_payload = 1200usize.saturating_sub(14);
+    let datagrams = fragment_frame(1, 0, true, &nv12, max_payload);
+    assert!(
+        !datagrams.is_empty(),
+        "fragmentation should produce at least one datagram"
+    );
+    let (hdr, _payload) =
+        decode_frame_datagram(&datagrams[0]).expect("first datagram should be decodable");
+    assert_eq!(hdr.frame_seq, 1, "frame_seq should be 1");
+    assert!(
+        hdr.is_keyframe(),
+        "first datagram should be marked keyframe"
+    );
 
-    if let Some(enc) = frame_output {
-        assert!(enc.is_keyframe, "first output frame should be a keyframe");
-        assert!(!enc.payload.is_empty(), "encoded payload must not be empty");
-
-        // Fragment it (MTU = 1200, max_fragment_payload = 1200 - 14 header bytes)
-        let max_payload = 1200usize.saturating_sub(14);
-        let datagrams = fragment_frame(1, 0, enc.is_keyframe, &enc.payload, max_payload);
-        assert!(
-            !datagrams.is_empty(),
-            "fragmentation should produce at least one datagram"
-        );
-
-        // Verify we can decode the first datagram header back
-        let (hdr, _payload) =
-            decode_frame_datagram(&datagrams[0]).expect("first datagram should be decodable");
-        assert_eq!(hdr.frame_seq, 1, "frame_seq should be 1");
-        assert!(
-            hdr.is_keyframe(),
-            "first datagram should be marked keyframe"
-        );
-    }
-
-    // 5. Second frame: same content → no dirty tiles expected
+    // 4. Second frame: same content → no dirty tiles expected
     let analysis2 = processor
         .process_frame(d1.raw(), width, height, stride)
         .expect("second process_frame failed");
@@ -280,7 +189,7 @@ fn dmabuf_real_gpu_pipeline_end_to_end() {
         analysis2.dirty_tiles
     );
 
-    // 6. Third frame: change one tile → process_frame detects change → encode
+    // 5. Third frame: change one tile → process_frame detects change
     let d2 = create_changed_dmabuf(ChangedDmabufParams {
         width,
         height,
@@ -301,21 +210,6 @@ fn dmabuf_real_gpu_pipeline_end_to_end() {
         !analysis3.dirty_tiles.is_empty(),
         "changed frame must have at least one dirty tile"
     );
-
-    // P-frame encode
-    match encoder.encode_nv12_buffer(
-        analysis3.nv12_data,
-        analysis3.nv12_width,
-        analysis3.nv12_height,
-        analysis3.nv12_y_stride,
-        analysis3.nv12_uv_stride,
-        analysis3.nv12_uv_offset,
-    ) {
-        Ok(Some(_)) | Ok(None) => {}
-        Err(e) => {
-            eprintln!("Third encode_nv12_buffer error (non-fatal): {e}");
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

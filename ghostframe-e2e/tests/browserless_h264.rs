@@ -1,26 +1,17 @@
-//! H.264 as a member of the transport (design PR A3), in the stepped
-//! browserless harness.
+//! H.264 as a member of the transport, in the stepped browserless harness.
 //!
-//! What runs: the real `IoBridge` event loop, a real `ClientNet` that
-//! advertises H.264 and acknowledges the fragments it receives, a seeded netsim
-//! between them. What is scripted: the encoder. `SceneLoad::H264` injects one
-//! frame per tick; the bridge puts it through its real H.264 gate (IDR hold,
-//! backpressure skip, pending IDR requests) and its real send path (fragments,
-//! ledger, admission, probe cache, XOR parity), and the "encoder" makes an IDR
-//! exactly when the bridge asked for one. Payloads are filler: the client
-//! reassembles (`NeedsH264`) and decodes nothing. The scenes in
-//! `browserless_h264/pcm_scenes.rs` (module `pcm_scenes` below) run the same
-//! path with real PCM-patch streams that the client decodes with libavcodec:
-//! they can say which picture was displayed.
+//! What runs: the real `IoBridge` event loop (the `RefManager` plans every
+//! frame, the commit and send path, the ledger feedback), a real `ClientNet`
+//! that advertises H.264 and acknowledges the fragments it receives and
+//! decodes them with libavcodec, a seeded netsim between them. What is
+//! scripted: the encoder, a PCM-patch writer executing the manager's plans or
+//! the real openh264 library. Every picture carries markers, so the client
+//! side can say which picture it displayed and compare it with the one the
+//! encoder meant (see `ghostframe_e2e::harness::h264_scene`).
 //!
-//! What this therefore covers: that H.264 datagrams are ledger transmissions
-//! (acknowledged or judged exactly once), that the bandwidth estimator learns
-//! in H.264 mode, that an IDR's lost fragments are repaired and P frames wait
-//! for it, that an acknowledgement stall is not read as loss, and that the
-//! encoder is not run into a backed-up queue. What it cannot: anything about
-//! picture content or reference chains (the Phase B PCM writer), the ffmpeg
-//! encoder's own GOP and rate control, or the web client's decoder. (Picture
-//! content and reference chains are `pcm_scenes`.)
+//! This file holds the capacity-step scenes (rate control, the estimator and
+//! the headroom guard in H.264 mode); the loss, reordering, MTU and recovery
+//! scenes are `refs_scenes`, those with the real library `openh264_scenes`.
 //!
 //! Every scene states its premise as an assertion before the effect it is
 //! about: an effect asserted over a drop that never fired proves nothing.
@@ -37,30 +28,9 @@ use ghostframe_e2e::netsim::{
     Bottleneck, CapTimeline, DropPlan, FragSel, FrameDropRule, NetProfile,
 };
 use ghostframe_lib::encoder::h264_harness::PcmRateModel;
-use ghostframe_lib::transport::io_bridge::{IdrCause, InjectedCbr};
+use ghostframe_lib::transport::io_bridge::IdrCause;
 
 const CADENCE_US: u64 = DEFAULT_CADENCE_US;
-
-fn load(idr_bytes: usize, p_bytes: usize) -> H264Load {
-    H264Load {
-        cadence_us: CADENCE_US,
-        idr_bytes,
-        p_bytes,
-        gop_frames: 0,
-        width: 1280,
-        height: 720,
-        quiet: None,
-        cbr: None,
-        pcm: None,
-        pcm_wrong_ref_every: 0,
-        pcm_rate_policy: false,
-        pcm_rate_model: None,
-        pcm_phase_a_rate: false,
-        no_probe_raise: false,
-        spike_tune: None,
-        tile_phases: [None, None],
-    }
-}
 
 fn scene(
     seed: u64,
@@ -113,17 +83,15 @@ fn delivered(r: &BrowserlessResult) -> Vec<(u32, bool)> {
 fn report(name: &str, r: &BrowserlessResult) {
     let s = &r.h264.stats;
     println!(
-        "{name}: sent={} idr={} (session={} loss={} hold_timeout={} gop={}) acked={} suspect={} \
+        "{name}: sent={} idr={} (session={} fault={}) acked={} suspect={} \
          tx rec={} live={} lost={} forgot={} late={} outstanding={} \
-         verdicts idr={} p={} spurious={} skipped hold={} bp={} p_hold_ms={} purged={} \
+         verdicts idr={} p={} spurious={} skipped hold={} bp={} purged={} \
          bwe_samples={} bwe_bps={} pto_fires={} loss_by_pto={} idr_resends={} probe_resends={} \
          delivered={} s2c_drop={}/{}",
         s.frames_sent,
         s.frames_idr,
         s.idr_by_cause[IdrCause::Session.index()],
-        s.idr_by_cause[IdrCause::Loss.index()],
-        s.idr_by_cause[IdrCause::HoldTimeout.index()],
-        s.idr_by_cause[IdrCause::GopPeriodic.index()],
+        s.idr_by_cause[IdrCause::EncoderFault.index()],
         s.frames_acked,
         s.frames_suspect,
         s.tx_recorded,
@@ -137,7 +105,6 @@ fn report(name: &str, r: &BrowserlessResult) {
         s.verdicts_already_acked,
         s.frames_skipped_hold,
         s.frames_skipped_backpressure,
-        s.p_hold_ms,
         s.queue_purged,
         r.bwe_samples_seen,
         r.bwe_estimate_bps,
@@ -150,167 +117,13 @@ fn report(name: &str, r: &BrowserlessResult) {
         r.s2c_datagrams_offered,
     );
     println!(
-        "  rate idr: drop={} rise={}; reopens drop={} gop={} rise={}; app_probes={}; padding \
-         windows={} datagrams={} bytes={}; skipped for padding={}",
-        s.idr_by_cause[IdrCause::RateDrop.index()],
-        s.idr_by_cause[IdrCause::RateRise.index()],
-        s.rate_reopens_drop,
-        s.rate_reopens_gop,
-        s.rate_reopens_rise,
+        "  app_probes={}; padding windows={} datagrams={} bytes={}; skipped for padding={}",
         s.app_probes,
         s.probe_padding_windows,
         s.probe_padding_datagrams,
         s.probe_padding_bytes,
         s.frames_skipped_pad,
     );
-}
-
-/// A healthy stream: every H.264 datagram is acknowledged, none is judged
-/// lost, the books balance, and the estimator has samples (it had none before
-/// H.264 joined the ledger).
-#[tokio::test(start_paused = true)]
-async fn a_healthy_h264_stream_is_acknowledged_and_feeds_the_estimator() {
-    let r = run(
-        scene(
-            0x1101,
-            6,
-            link_20ms(),
-            load(40_000, 3_000),
-            DropPlan::default(),
-        ),
-        RunOptions::default(),
-    )
-    .await
-    .expect("scene");
-    report("healthy", &r);
-    let s = &r.h264.stats;
-    // Premises.
-    assert!(s.frames_sent > 100, "the stream ran: {}", s.frames_sent);
-    assert!(s.tx_recorded > 300, "and had fragments: {}", s.tx_recorded);
-    // Every recorded transmission has exactly one outcome.
-    assert_eq!(
-        s.tx_recorded,
-        s.tx_acked_live + s.tx_judged_lost + s.tx_forgotten + r.h264.ledger_records as u64,
-        "{s:?}"
-    );
-    assert_eq!(s.tx_judged_lost, 0, "nothing is lost on a perfect link");
-    assert!(
-        r.h264.ledger_records < 40,
-        "and little is outstanding at the end: {}",
-        r.h264.ledger_records
-    );
-    // The estimator learns in H.264 mode.
-    assert!(
-        r.bwe_samples_seen as u64 >= s.tx_acked_live / 2,
-        "samples_seen {} vs acked {}",
-        r.bwe_samples_seen,
-        s.tx_acked_live
-    );
-    // The client reassembled the stream, starting from the IDR.
-    let d = delivered(&r);
-    assert!(
-        d.len() as u64 + 3 >= s.frames_sent,
-        "{} of {}",
-        d.len(),
-        s.frames_sent
-    );
-    assert_eq!(d[0], (d[0].0, true), "the first frame delivered is the IDR");
-    assert_eq!(s.frames_idr, 1, "and it is the only IDR");
-    assert_eq!(s.idr_by_cause[IdrCause::Session.index()], 1);
-    // The client's frame acks (0x0A) reach the server and parse: one per
-    // handled frame at this cadence, never more than there are frames, and
-    // none malformed. (The harness's perfect decoder reports each frame
-    // decoded.)
-    assert!(
-        r.h264.frame_acks_received > 0,
-        "no frame ack reached the server"
-    );
-    assert_eq!(r.h264.frame_acks_malformed, 0);
-    assert!(
-        r.h264.frame_acks_received <= d.len() as u64,
-        "{} acks for {} frames: coalescing may merge, never multiply",
-        r.h264.frame_acks_received,
-        d.len()
-    );
-    assert!(
-        r.h264.frame_acks_received * 2 >= d.len() as u64,
-        "{} acks for {} frames",
-        r.h264.frame_acks_received,
-        d.len()
-    );
-}
-
-/// The IDR's fragments are lost (first transmissions of three of them, the
-/// resend of one, and the last fragment, which is found only once the resends
-/// behind it are acknowledged: nothing else follows it while P frames are
-/// held). The loss path sends them again, P frames wait for the IDR, and the
-/// client's first frame is the IDR.
-#[tokio::test(start_paused = true)]
-async fn a_lost_idr_is_repaired_and_p_frames_wait_for_it() {
-    for seed in [0x2201u64, 0x2202, 0x2203] {
-        let mut net = link_20ms();
-        net.jitter_us = 2_000;
-        let drops = DropPlan::default().with_frame_rules(vec![
-            FrameDropRule {
-                frame_seq: 0,
-                frag: FragSel::Index(3),
-                occurrences: vec![0, 1],
-            },
-            FrameDropRule {
-                frame_seq: 0,
-                frag: FragSel::Index(10),
-                occurrences: vec![0],
-            },
-            FrameDropRule {
-                frame_seq: 0,
-                frag: FragSel::Last,
-                occurrences: vec![0],
-            },
-        ]);
-        let r = run(
-            scene(seed, 6, net, load(40_000, 3_000), drops),
-            RunOptions::default(),
-        )
-        .await
-        .expect("scene");
-        report(&format!("lost-idr {seed:#x}"), &r);
-        let s = &r.h264.stats;
-        // Premises: every rule fired (the index-3 rule twice: the resend was
-        // lost too), the loss path resent, and P frames were held back.
-        assert_eq!(r.frame_drops_fired, vec![2, 1, 1], "seed {seed:#x}");
-        assert!(r.emitter_stats.h264_idr_resends >= 3, "seed {seed:#x}");
-        assert!(
-            s.frames_skipped_hold >= 1,
-            "seed {seed:#x}: nothing was held"
-        );
-        // The IDR is the client's first frame, and nothing else was needed
-        // for it: no second IDR, no hold timeout.
-        let d = delivered(&r);
-        assert_eq!(d.first(), Some(&(0, true)), "seed {seed:#x}: {d:?}");
-        assert_eq!(s.frames_idr, 1, "seed {seed:#x}");
-        assert_eq!(
-            s.hold_timeouts, 0,
-            "seed {seed:#x}: repaired, not timed out"
-        );
-        assert_eq!(s.verdicts_p_frag, 0, "seed {seed:#x}: no P frame was sent");
-        // The stream then runs: P frames are delivered in order after it.
-        // The interim policy's price at 3 % loss: a loss IDR owed to the rate
-        // limit holds the stream (the P frames would chain from the suspect
-        // frame), up to a second per IDR, and there is about one a second. The
-        // stream keeps running at a fraction of the frames (100 to 166 of ~290
-        // here); the bound only says it does not stall for good.
-        assert!(d.len() > 60, "seed {seed:#x}: {}", d.len());
-        assert!(
-            d.windows(2).all(|w| w[0].0 < w[1].0),
-            "seed {seed:#x}: in order"
-        );
-        // The hold ended well inside the ceiling.
-        assert!(
-            s.p_hold_ms < 2_000,
-            "seed {seed:#x}: held {} ms",
-            s.p_hold_ms
-        );
-    }
 }
 
 /// The estimate a scene should end above: half of what it was before the
@@ -336,490 +149,10 @@ fn estimate_at(r: &BrowserlessResult, at_us: u64) -> u64 {
         .expect("a sample before the stall")
 }
 
-/// An acknowledgement stall on a screen that has gone quiet: the last frames'
-/// acknowledgements are lost, nothing new is sent, so the probe timeout is the
-/// only thing running. It must send the newest fragments again (new
-/// wire_seqs, a real probe) and declare nothing lost on its own authority.
-///
-/// The stall is 800 ms against a probe timeout of about 100 ms on this 40 ms
-/// path, i.e. more than twice the PTO: the timer fires and backs off at least
-/// three times (asserted: `pto_fires >= 3`).
-#[tokio::test(start_paused = true)]
-async fn an_acknowledgement_stall_on_a_quiet_screen_is_probed_not_declared_lost() {
-    for seed in [0x3301u64, 0x3302, 0x3303] {
-        let mut l = load(40_000, 3_000);
-        // Frame 89 is the last before the screen goes quiet (t = 3.097 s);
-        // the acknowledgements stop at 3.10 s and come back at 3.90 s.
-        l.quiet = Some((90, 130));
-        let opts = RunOptions {
-            ack_blackout: Some((Duration::from_millis(3_100), Duration::from_millis(3_900))),
-            ..RunOptions::default()
-        };
-        let mut net = link_20ms();
-        net.jitter_us = 2_000;
-        let r = run(scene(seed, 7, net, l, DropPlan::default()), opts)
-            .await
-            .expect("scene");
-        report(&format!("quiet-stall {seed:#x}"), &r);
-        let s = &r.h264.stats;
-        // Premises: acknowledgements were really dropped, the probe timeout
-        // fired repeatedly, and what it sent was fragments.
-        assert!(r.h264.acks_blacked_out > 0, "seed {seed:#x}");
-        assert!(r.emitter_stats.pto_fires >= 3, "seed {seed:#x}");
-        assert!(r.emitter_stats.h264_probe_resends >= 3, "seed {seed:#x}");
-        // The property: no fragment was declared lost by the probe's
-        // content-gone rule. (Verdicts after the stall come from the packet
-        // threshold, below.)
-        assert_eq!(r.transport.instr.loss_by_pto, 0, "seed {seed:#x}");
-        // The stall was on the acknowledgement path only: the client got every frame.
-        let d = delivered(&r);
-        assert!(d.len() as u64 + 3 >= s.frames_sent, "seed {seed:#x}");
-        // IDRs: the session's, and at most the one the verdict burst after the
-        // stall asks for (verdicts on frames that request covers ask for
-        // nothing: `verdicts_superseded`).
-        assert!(s.verdicts_p_frag > 0, "seed {seed:#x}: premise");
-        assert!(s.frames_idr <= 2, "seed {seed:#x}: {} IDRs", s.frames_idr);
-        assert!(
-            s.idr_by_cause[IdrCause::Loss.index()] <= 1,
-            "seed {seed:#x}"
-        );
-        // The estimate was not collapsed.
-        let pre = estimate_at(&r, 3_100_000);
-        let floor = estimate_floor(pre);
-        println!(
-            "  ratio end/pre {:.2}",
-            r.bwe_estimate_bps as f64 / pre as f64
-        );
-        assert!(
-            r.bwe_estimate_bps >= floor,
-            "seed {seed:#x}: pre-stall {pre}, floor {floor}, end {}",
-            r.bwe_estimate_bps
-        );
-        // Frames kept being acknowledged: the ones that never complete are
-        // those with a fragment whose acknowledgement was lost for good (each
-        // such fragment is a verdict), plus what is still in flight.
-        assert!(
-            s.frames_acked + s.verdicts_p_frag + 6 >= s.frames_sent,
-            "seed {seed:#x}: {s:?}"
-        );
-        assert!(
-            s.frames_acked * 10 >= s.frames_sent * 8,
-            "seed {seed:#x}: {s:?}"
-        );
-        // And the books balance.
-        assert_eq!(
-            s.tx_recorded,
-            s.tx_acked_live + s.tx_judged_lost + s.tx_forgotten + r.h264.ledger_records as u64,
-            "seed {seed:#x}: {s:?}"
-        );
-    }
-}
-
-/// An acknowledgement stall under a continuous stream: nothing is lost, but
-/// for a while the server hears nothing, then hears of later datagrams and
-/// judges the silent ones lost by the packet threshold. Those verdicts are
-/// spurious; what they may cost is bounded by the IDR rate limit and by
-/// ignoring verdicts an IDR already covers: one IDR, not one per frame (64
-/// verdicts, 22 suspect frames).
-#[tokio::test(start_paused = true)]
-async fn an_acknowledgement_stall_under_a_busy_stream_costs_one_idr() {
-    for seed in [0x4401u64, 0x4402, 0x4403] {
-        let opts = RunOptions {
-            ack_blackout: Some((Duration::from_millis(3_000), Duration::from_millis(3_800))),
-            ..RunOptions::default()
-        };
-        let mut net = link_20ms();
-        net.jitter_us = 2_000;
-        let r = run(
-            scene(seed, 7, net, load(40_000, 3_000), DropPlan::default()),
-            opts,
-        )
-        .await
-        .expect("scene");
-        report(&format!("busy-stall {seed:#x}"), &r);
-        let s = &r.h264.stats;
-        // Premises: acknowledgements were dropped, and many verdicts followed.
-        assert!(r.h264.acks_blacked_out > 10, "seed {seed:#x}");
-        assert!(
-            s.verdicts_p_frag >= 20,
-            "seed {seed:#x}: {}",
-            s.verdicts_p_frag
-        );
-        // The stall does not make the stream stop or the client miss frames.
-        let d = delivered(&r);
-        assert!(d.len() as u64 + 3 >= s.frames_sent, "seed {seed:#x}");
-        // One IDR for the whole verdict burst, none per suspect frame. Design
-        // section 5.2 (T3 scene 8) wants a total of 1, the session's: the loss
-        // IDR here answers verdicts on datagrams that did arrive, because
-        // their acknowledgements were lost. That gap closes in Phase B, when
-        // a 0x0A `decoded` bit overrides a verdict; until then the interim
-        // policy pays one IDR per stall, and this gate keeps it at that.
-        assert_eq!(s.idr_by_cause[IdrCause::Loss.index()], 1, "seed {seed:#x}");
-        assert_eq!(s.frames_idr, 2, "seed {seed:#x}");
-        assert!(
-            s.verdicts_superseded > 0,
-            "seed {seed:#x}: the burst was covered"
-        );
-        let pre = estimate_at(&r, 3_000_000);
-        let floor = estimate_floor(pre);
-        println!(
-            "  ratio end/pre {:.2}",
-            r.bwe_estimate_bps as f64 / pre as f64
-        );
-        assert!(
-            r.bwe_estimate_bps >= floor,
-            "seed {seed:#x}: pre-stall {pre}, floor {floor}, end {}",
-            r.bwe_estimate_bps
-        );
-        assert_eq!(
-            s.tx_recorded,
-            s.tx_acked_live + s.tx_judged_lost + s.tx_forgotten + r.h264.ledger_records as u64,
-            "seed {seed:#x}: {s:?}"
-        );
-    }
-}
-
-/// An acknowledgement blackout long enough that no frame completes for much
-/// more than the 500 ms progress bound: the bridge raises `h264_stalled` (the
-/// classifier's way out of H.264, which the scripted encoder path does not
-/// run, so the flag is what is observable here), keeps it up through the
-/// blackout, and drops it when frames complete again. A healthy stretch before
-/// it raises nothing.
-#[tokio::test(start_paused = true)]
-async fn a_long_acknowledgement_blackout_raises_h264_stalled_and_recovery_clears_it() {
-    const BLACKOUT_MS: (u64, u64) = (3_000, 5_000);
-    for seed in [0x5501u64, 0x5502, 0x5503] {
-        let opts = RunOptions {
-            ack_blackout: Some((
-                Duration::from_millis(BLACKOUT_MS.0),
-                Duration::from_millis(BLACKOUT_MS.1),
-            )),
-            ..RunOptions::default()
-        };
-        let r = run(
-            scene(
-                seed,
-                9,
-                link_20ms(),
-                load(40_000, 3_000),
-                DropPlan::default(),
-            ),
-            opts,
-        )
-        .await
-        .expect("scene");
-        report(&format!("long-blackout {seed:#x}"), &r);
-        let s = &r.h264.stats;
-        println!(
-            "  stalls inflight={} no_progress={} reset={} stalled_ms={} at_end={}",
-            s.stalls_inflight,
-            s.stalls_no_progress,
-            s.stalls_reset,
-            s.h264_stalled_ms,
-            r.h264.stalled
-        );
-        // Premises: acknowledgements were dropped, and frames were sent
-        // before, during and after.
-        assert!(r.h264.acks_blacked_out > 10, "seed {seed:#x}");
-        assert!(s.frames_acked > 30, "seed {seed:#x}: {}", s.frames_acked);
-        // The stall: raised (once, for the blackout), accounted for roughly
-        // as long as the blackout minus the progress bound, and not still up.
-        assert!(
-            s.stalls_inflight + s.stalls_no_progress >= 1,
-            "seed {seed:#x}: {s:?}"
-        );
-        assert!(
-            s.h264_stalled_ms >= 1_000 && s.h264_stalled_ms <= 3_000,
-            "seed {seed:#x}: stalled {} ms for a 2000 ms blackout",
-            s.h264_stalled_ms
-        );
-        assert!(!r.h264.stalled, "seed {seed:#x}: still stalled at the end");
-    }
-}
-
-/// And a healthy run never raises it: the flag is not a side effect of load.
-#[tokio::test(start_paused = true)]
-async fn a_healthy_h264_stream_never_stalls() {
-    for seed in [0x5601u64, 0x5602] {
-        let r = run(
-            scene(
-                seed,
-                6,
-                link_20ms(),
-                load(40_000, 3_000),
-                DropPlan::default(),
-            ),
-            RunOptions::default(),
-        )
-        .await
-        .expect("scene");
-        report(&format!("healthy-stall {seed:#x}"), &r);
-        let s = &r.h264.stats;
-        assert!(s.frames_acked > 100, "premise, seed {seed:#x}: {s:?}");
-        assert_eq!(
-            (
-                s.stalls_inflight,
-                s.stalls_no_progress,
-                s.stalls_reset,
-                s.h264_stalled_ms
-            ),
-            (0, 0, 0, 0),
-            "seed {seed:#x}"
-        );
-    }
-}
-
-/// A ~100 KB first IDR over a 1 Mbit/s link takes 0.8 s to drain, longer than
-/// the 500 ms no-progress bound, with no whole frame complete until the end.
-/// Fragments are acknowledged all the while: that is progress, not a stall
-/// (a whole-frame notion of progress flapped the session tile <-> H.264 every
-/// few seconds on a starved link).
-#[tokio::test(start_paused = true)]
-async fn a_large_idr_on_a_slow_link_is_not_a_stall() {
-    const LINK_BYTES_PER_S: u64 = 125_000;
-    const IDR_BYTES: usize = 100_000;
-    for seed in [0x5701u64, 0x5702, 0x5703] {
-        let net = NetProfile {
-            delay_us: 20_000,
-            cap: CapTimeline::constant(LINK_BYTES_PER_S),
-            bottleneck: Some(Bottleneck {
-                depth_ms: 3_000,
-                aqm: None,
-            }),
-            ..NetProfile::perfect()
-        };
-        let r = run(
-            scene(seed, 8, net, load(IDR_BYTES, 1_500), DropPlan::default()),
-            RunOptions::default(),
-        )
-        .await
-        .expect("scene");
-        report(&format!("slow-idr {seed:#x}"), &r);
-        let s = &r.h264.stats;
-        // Premises: the IDR alone takes longer than the bound to cross the
-        // link, and it did cross (the stream went on).
-        assert!(
-            IDR_BYTES as u64 * 1000 / LINK_BYTES_PER_S > 500,
-            "seed {seed:#x}: the IDR must outlast the 500 ms bound"
-        );
-        assert!(s.frames_acked >= 10, "seed {seed:#x}: {s:?}");
-        assert_eq!(
-            (s.stalls_inflight, s.stalls_no_progress, s.stalls_reset),
-            (0, 0, 0),
-            "seed {seed:#x}: {s:?}"
-        );
-        assert_eq!(s.h264_stalled_ms, 0, "seed {seed:#x}");
-    }
-}
-
-/// A link that carries a fifth of what the encoder produces (1 Mbit/s against
-/// 20 KB P frames at 30 fps), behind a buffer deep enough that nothing is
-/// dropped. The encoder is not run into a queue it cannot drain: frames are
-/// skipped, the queue and the delay stay bounded, and every captured frame is
-/// either sent or skipped.
-#[tokio::test(start_paused = true)]
-async fn an_overdriven_link_skips_frames_instead_of_queueing_them() {
-    const LINK_BYTES_PER_S: u64 = 125_000;
-    const P_BYTES: usize = 20_000;
-    for seed in [0x5501u64, 0x5502, 0x5503] {
-        let net = NetProfile {
-            delay_us: 10_000,
-            jitter_us: 1_000,
-            // Bytes per second despite the name.
-            cap: CapTimeline::constant(LINK_BYTES_PER_S),
-            // Deep enough that nothing is dropped: the queue the encoder's
-            // frame skip must keep short would otherwise hide in tail drops.
-            bottleneck: Some(Bottleneck {
-                depth_ms: 3_000,
-                aqm: None,
-            }),
-            ..NetProfile::perfect()
-        };
-        let r = run(
-            scene(seed, 10, net, load(10_000, P_BYTES), DropPlan::default()),
-            RunOptions::default(),
-        )
-        .await
-        .expect("scene");
-        report(&format!("overdriven {seed:#x}"), &r);
-        let s = &r.h264.stats;
-        // Premises: nothing was dropped, the encoder produced far more than the
-        // link carries, and frames were skipped for the queue.
-        assert_eq!(r.s2c_datagrams_dropped, 0, "seed {seed:#x}");
-        assert!(s.frames_skipped_backpressure > 100, "seed {seed:#x}: {s:?}");
-        // Every captured frame was sent or skipped; none vanished.
-        let injected = r.injections.iter().filter(|(_, hb)| !hb).count() as u64;
-        assert_eq!(
-            s.frames_sent + s.frames_skipped_hold + s.frames_skipped_backpressure,
-            injected,
-            "seed {seed:#x}: {s:?}"
-        );
-        // The queue the gate allows: one frame period of the highest estimate
-        // seen, two gate depths (10 ms of it each), plus the one frame that
-        // is encoded when the queue is just under the limit (and its parity,
-        // 20 % on a P frame). At the link's rate that is the queueing delay.
-        let est_max = r.bwe_estimate_samples.iter().map(|x| x.1).max().unwrap() as f64 / 8.0;
-        let limit = est_max / 30.0 + 2.0 * 0.010 * est_max;
-        let frame = P_BYTES as f64 * 1.25;
-        let bound_bytes = limit + frame;
-        let bound_delay_us = (bound_bytes / LINK_BYTES_PER_S as f64 * 1e6) as u64;
-        let mut queue_us: Vec<u64> = r
-            .s2c_transit_samples
-            .iter()
-            .map(|x| x.1.saturating_sub(10_000))
-            .collect();
-        queue_us.sort_unstable();
-        let p95 = queue_us[queue_us.len() * 95 / 100];
-        assert!(
-            p95 <= bound_delay_us + 50_000,
-            "seed {seed:#x}: p95 queueing {p95} us, bound {bound_delay_us} us (+50 ms)"
-        );
-        assert!(
-            r.emission_queue_peak as f64 <= bound_bytes / 1_100.0 + 10.0,
-            "seed {seed:#x}: emitter queue peaked at {} datagrams, bound {}",
-            r.emission_queue_peak,
-            bound_bytes / 1_100.0
-        );
-        // The stream still moves: frames are delivered to the end of the scene.
-        let d = delivered(&r);
-        assert!(d.len() as u64 + 3 >= s.frames_sent, "seed {seed:#x}");
-        assert!(d.len() >= 20, "seed {seed:#x}: {}", d.len());
-    }
-}
-
-/// Independent loss on the stream: the books balance, every IDR is repaired
-/// and delivered, and loss-triggered IDRs keep to one per second.
-#[tokio::test(start_paused = true)]
-async fn under_random_loss_the_books_balance_and_idrs_keep_to_the_rate_limit() {
-    const SECS: u64 = 10;
-    for seed in [0x6601u64, 0x6602, 0x6603] {
-        let net = NetProfile {
-            loss: 0.03,
-            delay_us: 20_000,
-            jitter_us: 2_000,
-            ..NetProfile::perfect()
-        };
-        let r = run(
-            scene(seed, SECS, net, load(15_000, 3_000), DropPlan::default()),
-            RunOptions::default(),
-        )
-        .await
-        .expect("scene");
-        report(&format!("loss3% {seed:#x}"), &r);
-        let s = &r.h264.stats;
-        // Premises: the network dropped datagrams, verdicts followed on P
-        // fragments, and the loss path sent IDR fragments again.
-        assert!(r.s2c_datagrams_dropped > 20, "seed {seed:#x}");
-        assert!(s.verdicts_p_frag > 0, "seed {seed:#x}: {s:?}");
-        // Every transmission has exactly one outcome.
-        assert_eq!(
-            s.tx_recorded,
-            s.tx_acked_live + s.tx_judged_lost + s.tx_forgotten + r.h264.ledger_records as u64,
-            "seed {seed:#x}: {s:?}"
-        );
-        // The estimator keeps learning.
-        assert!(
-            r.bwe_samples_seen as u64 >= s.tx_acked_live / 2,
-            "seed {seed:#x}"
-        );
-        // Loss-triggered IDRs: at most one per second over the scene.
-        let loss_idrs = s.idr_by_cause[IdrCause::Loss.index()];
-        assert!(
-            loss_idrs >= 1,
-            "seed {seed:#x}: loss never triggered an IDR"
-        );
-        assert!(
-            loss_idrs <= SECS + 1,
-            "seed {seed:#x}: {loss_idrs} loss IDRs"
-        );
-        // Every IDR but one still in flight reached the client, and the hold
-        // never gave up (the loss path repaired each one).
-        let delivered_idrs = delivered(&r).iter().filter(|(_, k)| *k).count() as u64;
-        assert!(
-            delivered_idrs + 1 >= s.frames_idr,
-            "seed {seed:#x}: {delivered_idrs} of {}",
-            s.frames_idr
-        );
-        assert_eq!(s.hold_timeouts, 0, "seed {seed:#x}");
-        // Frames are in order on the wire as the client sees them.
-        let d = delivered(&r);
-        // The interim policy's price at 3 % loss: a loss IDR owed to the rate
-        // limit holds the stream (the P frames would chain from the suspect
-        // frame), up to a second per IDR, and there is about one a second. The
-        // stream keeps running at a fraction of the frames (100 to 166 of ~290
-        // here); the bound only says it does not stall for good.
-        assert!(d.len() > 60, "seed {seed:#x}: {}", d.len());
-    }
-}
-
-/// The encoder is still on its own GOP of 11 until A4: its periodic IDRs hold
-/// nothing. On a healthy link the only hold is the session's IDR, so P frames
-/// are skipped for hold only while that one drains.
-///
-/// The bound: the session IDR is 8 KB sent at the initial 2 Mbit/s estimate,
-/// about 32 ms plus a 40 ms round trip, i.e. 3 frame periods at 30 fps; the
-/// assertion allows 6 (200 ms). Holding on every periodic IDR as well would
-/// cost about that again at each of the ~16 IDRs of the 6 s scene, 50 frames
-/// or more.
-#[tokio::test(start_paused = true)]
-async fn periodic_idrs_hold_no_p_frames() {
-    for seed in [0x7701u64, 0x7702, 0x7703] {
-        let mut l = load(8_000, 2_000);
-        l.gop_frames = 11;
-        let mut net = link_20ms();
-        net.jitter_us = 2_000;
-        let r = run(
-            scene(seed, 6, net, l, DropPlan::default()),
-            RunOptions::default(),
-        )
-        .await
-        .expect("scene");
-        report(&format!("gop11 {seed:#x}"), &r);
-        let s = &r.h264.stats;
-        // Premises: the GOP really produced periodic IDRs, all delivered.
-        let gop = s.idr_by_cause[IdrCause::GopPeriodic.index()];
-        assert!(gop >= 10, "seed {seed:#x}: {gop} periodic IDRs");
-        assert_eq!(
-            s.idr_by_cause[IdrCause::Session.index()],
-            1,
-            "seed {seed:#x}"
-        );
-        let delivered_idrs = delivered(&r).iter().filter(|(_, k)| *k).count() as u64;
-        assert!(delivered_idrs + 1 >= s.frames_idr, "seed {seed:#x}");
-        // The property.
-        assert_eq!(s.p_holds, 1, "seed {seed:#x}: only the session's IDR holds");
-        assert!(
-            s.frames_skipped_hold <= 6,
-            "seed {seed:#x}: {} frames skipped for hold",
-            s.frames_skipped_hold
-        );
-    }
-}
-
 // ---- rate control (design PR A4) --------------------------------------------
 
 /// Frames per second of the harness cadence (33.3 ms).
 const FPS: u32 = 30;
-
-/// A CBR scripted encoder on the harness's 30 fps cadence. A P frame is 1/30 s
-/// of the rate the bridge sets. An IDR is `IDR_OVER_P` P frames, i.e. 0.2 s of
-/// the rate: under the one-second VBV the real encoder is opened with, and
-/// the value at which the loop is stable on these 2 and 1 Mbit/s links (12 P
-/// frames, 0.4 s of the rate, a 52 kB burst into a 2 Mbit/s link, collapsed
-/// the estimate to its floor in exploratory runs; see the report on PR A4).
-/// The GOP is 3 s of those frames, as in production (180 frames at the
-/// encoder's 60 fps; the harness runs at 30).
-const IDR_OVER_P: u32 = 6;
-
-fn cbr_load() -> H264Load {
-    let mut l = load(0, 0);
-    l.cbr = Some(InjectedCbr {
-        fps: FPS,
-        idr_over_p: IDR_OVER_P,
-        gop: Some(Duration::from_secs(3)),
-    });
-    l
-}
 
 fn bottleneck_net(
     cap_bytes_per_s: CapTimeline,
@@ -837,207 +170,6 @@ fn bottleneck_net(
             aqm: None,
         }),
         ..NetProfile::perfect()
-    }
-}
-
-/// Scene 6, rate-control variant (design T3 and 4.3): an overdriven link, and
-/// the CBR stream follows the estimate down instead of being skipped into
-/// submission.
-///
-/// The link carries 1 Mbit/s. The first rate is 0.8 x the 2 Mbit/s seed, 1.6
-/// Mbit/s, and with parity and framing that is about 2.2 Mbit/s on the wire,
-/// more than twice the link. The control run keeps that rate (fixed frame
-/// sizes, no policy) and the encoder gate skips frames for the whole scene.
-/// With the policy the rate falls to 0.8 x the estimate within seconds and the
-/// skips stop.
-///
-/// Properties, none a magic number:
-///  * premise: the control skips for the queue in more than a third of its
-///    frames, so the link really was overdriven;
-///  * the policy acted: it reopened the encoder, never more than the 2 s rule
-///    allows (`1 + duration / 2 s`);
-///  * the rate it ends on is at most `0.8 x` the highest estimate of the run
-///    (the share is the definition of the target) and at least the floor;
-///  * the skips are bounded: at most a third of the control's. Measured 0.18
-///    to 0.26 of it: the seconds before the first cut, plus the queue each
-///    padded probe window leaves on a 1 Mbit/s link (`frames_skipped_pad`, 31
-///    to 42 of them, fell while padding was in flight);
-///  * every captured frame was sent or skipped, and the client got what was sent.
-///
-/// Mutation: with the policy's `step` returning `Keep` (the rate never leaves
-/// its initial value) the "acted" premise fails.
-#[tokio::test(start_paused = true)]
-async fn cbr_follows_the_estimate_down_on_an_overdriven_link() {
-    const SECS: u64 = 20;
-    const LINK_BYTES_PER_S: u64 = 125_000;
-    let mut skip_ratios = Vec::new();
-    for seed in [0x6601u64, 0x6602, 0x6603] {
-        let net = || {
-            bottleneck_net(
-                CapTimeline::constant(LINK_BYTES_PER_S),
-                10_000,
-                1_000,
-                3_000,
-            )
-        };
-        // The control: the initial rate's frame sizes, no rate control.
-        let p_bytes = (1_600_000 / 8 / FPS) as usize;
-        let control = run(
-            scene(
-                seed,
-                SECS,
-                net(),
-                load(IDR_OVER_P as usize * p_bytes, p_bytes),
-                DropPlan::default(),
-            ),
-            RunOptions::default(),
-        )
-        .await
-        .expect("control scene");
-        let r = run(
-            scene(seed, SECS, net(), cbr_load(), DropPlan::default()),
-            RunOptions::default(),
-        )
-        .await
-        .expect("scene");
-        report(&format!("cbr overdriven {seed:#x}"), &r);
-        println!(
-            "  padding {} B of {} B delivered ({:.1} %), {} windows",
-            r.h264.stats.probe_padding_bytes,
-            r.bytes_delivered_s2c,
-            100.0 * r.h264.stats.probe_padding_bytes as f64 / r.bytes_delivered_s2c as f64,
-            r.h264.stats.probe_padding_windows
-        );
-        let (s, c) = (&r.h264.stats, &control.h264.stats);
-        println!(
-            "  rate={} reopens drop={} gop={} skips bp={} (control {}) est_end={}",
-            s.rate_target_bps,
-            s.rate_reopens_drop,
-            s.rate_reopens_gop,
-            s.frames_skipped_backpressure,
-            c.frames_skipped_backpressure,
-            r.bwe_estimate_bps
-        );
-        let injected =
-            |r: &BrowserlessResult| r.injections.iter().filter(|(_, hb)| !hb).count() as u64;
-        // Premises.
-        assert!(
-            c.frames_skipped_backpressure * 3 > injected(&control),
-            "seed {seed:#x}: the control skipped only {} of {} frames; the link was not overdriven",
-            c.frames_skipped_backpressure,
-            injected(&control)
-        );
-        let reopens = s.rate_reopens_drop + s.rate_reopens_gop + s.rate_reopens_rise;
-        assert!(
-            reopens >= 1,
-            "seed {seed:#x}: the policy never acted: {s:?}"
-        );
-        assert_eq!(
-            r.s2c_datagrams_dropped, 0,
-            "seed {seed:#x}: nothing may be dropped"
-        );
-        // Properties.
-        assert!(
-            reopens <= 1 + SECS / 2,
-            "seed {seed:#x}: {reopens} reopens in {SECS} s breaks the one-per-2-s rule"
-        );
-        let est_max = r.bwe_estimate_samples.iter().map(|x| x.1).max().unwrap();
-        assert!(
-            u64::from(s.rate_target_bps) <= (est_max as f64 * 0.8) as u64 + 1,
-            "seed {seed:#x}: rate {} over 0.8 x the highest estimate {est_max}",
-            s.rate_target_bps
-        );
-        assert!(
-            s.rate_target_bps >= 300_000,
-            "seed {seed:#x}: under the floor"
-        );
-        skip_ratios.push((
-            seed,
-            s.frames_skipped_backpressure,
-            s.frames_skipped_pad,
-            c.frames_skipped_backpressure,
-        ));
-        assert_eq!(
-            s.frames_sent + s.frames_skipped_hold + s.frames_skipped_backpressure,
-            injected(&r),
-            "seed {seed:#x}: {s:?}"
-        );
-        let d = delivered(&r);
-        // Every frame sent was delivered, is still in the bottleneck (a 3 s
-        // queue holds a few), or was purged from the send queue when an IDR
-        // superseded it. An undelivered frame has a fragment outstanding in the
-        // ledger or one purged, so those bound the undelivered ones. A flat
-        // slack of 3 was a guess at the queue depth that moves with when
-        // acknowledgements arrive.
-        assert!(
-            d.len() as u64 + r.h264.ledger_records as u64 + s.queue_purged >= s.frames_sent,
-            "seed {seed:#x}: {} delivered, {} outstanding, {} purged, {} sent",
-            d.len(),
-            r.h264.ledger_records,
-            s.queue_purged,
-            s.frames_sent
-        );
-    }
-    println!("skips (policy, of them for padding, control): {skip_ratios:?}");
-    for (seed, skips, _, control) in skip_ratios {
-        assert!(
-            skips * 3 <= control,
-            "seed {seed:#x}: skips {skips} against the control's {control}"
-        );
-    }
-}
-
-/// The cost of probing: padding is a bounded share of a steady CBR stream.
-///
-/// A healthy 4 Mbit/s link, 30 s, the stream settled at about 0.8 of the
-/// estimate. Padding fills a window only when goog_cc asks for a probe: the
-/// start-up ladder (5 s of them, one a second) and then one ALR probe chain
-/// every 5 s. Bound: a window pads at most `min(1.2 x cluster, 0.3 s of the
-/// estimate)`, and a chain is a handful of windows, so over 30 s the padding is
-/// at most 6 chains x ~4 windows x 0.3 s = 7 s of estimate, against 30 s x
-/// ~0.8 of it carried: about 30 % in the worst case; the measured share is
-/// asserted at 15 %, and the stream itself is asserted undisturbed (no loss
-/// IDR; the link has no jitter, see `StepRun` for why).
-#[tokio::test(start_paused = true)]
-async fn padding_is_a_bounded_share_of_a_steady_cbr_stream() {
-    for seed in [0x6801u64, 0x6802, 0x6803] {
-        let net = bottleneck_net(CapTimeline::constant(500_000), 20_000, 0, 600);
-        let r = run(
-            scene(seed, 30, net, cbr_load(), DropPlan::default()),
-            RunOptions::default(),
-        )
-        .await
-        .expect("scene");
-        report(&format!("steady cbr {seed:#x}"), &r);
-        let s = &r.h264.stats;
-        let share = s.probe_padding_bytes as f64 / r.bytes_delivered_s2c as f64;
-        println!(
-            "  padding {} B of {} B ({:.1} %) in {} windows; app_probes={}",
-            s.probe_padding_bytes,
-            r.bytes_delivered_s2c,
-            100.0 * share,
-            s.probe_padding_windows,
-            s.app_probes
-        );
-        assert!(
-            s.probe_padding_windows > 0,
-            "seed {seed:#x}: premise: padding was used"
-        );
-        assert!(
-            share <= 0.15,
-            "seed {seed:#x}: padding is {:.1} % of the bytes",
-            100.0 * share
-        );
-        assert_eq!(s.idr_by_cause[IdrCause::Loss.index()], 0, "seed {seed:#x}");
-        let d = delivered(&r);
-        // Every frame the server saw acknowledged was handed to the decoder
-        // (the ones the IDR superseded in the queue were never sent, so they
-        // are neither): the client's reference check dropped nothing.
-        assert!(d.len() as u64 + 3 >= s.frames_acked, "seed {seed:#x}");
-        assert!(
-            r.h264.stats.idr_by_cause[IdrCause::ClientReset.index()] == 0,
-            "seed {seed:#x}: the client asked for no IDR on a clean stream"
-        );
     }
 }
 
@@ -1080,14 +212,9 @@ const P_B_SEEDS: [u64; 6] = [0x6701, 0x6702, 0x6703, 0x6704, 0x6705, 0x6706];
 /// Which stream the capacity-step scene runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StepMode {
-    /// Phase A: the scripted CBR encoder behind the legacy rate policy.
-    Legacy,
     /// An acked-reference session (`refs_cbr_load`), rate moved in place, the
     /// PCM encoder modelling the whole `RateTarget` (S2's VCE).
     Refs,
-    /// The same session with Phase A's rate policy (the 2 s lock): the
-    /// baseline `step_in_place` is measured against.
-    RefsPhaseA,
     /// The first B6 baseline: the bps-only rate model (a VBR bucket of
     /// `bps / 10`), the in-place policy.
     RefsBpsOnly,
@@ -1114,11 +241,10 @@ enum StepMode {
 }
 
 impl StepMode {
-    /// `GF_POP_MODE=refs|refs-no-raise|refs-pess-raise|refs-hold-1s|refs-hold-fixed|refs-phase-a|refs-bps-only|refs-full-transient|refs-linear-step|refs-burst|legacy` (default legacy).
+    /// `GF_POP_MODE=refs|refs-no-raise|refs-pess-raise|refs-hold-1s|refs-hold-fixed|refs-bps-only|refs-full-transient|refs-linear-step|refs-burst` (default refs).
     fn from_env() -> Self {
         match std::env::var("GF_POP_MODE").as_deref() {
             Ok("refs") => Self::Refs,
-            Ok("refs-phase-a") => Self::RefsPhaseA,
             Ok("refs-bps-only") => Self::RefsBpsOnly,
             Ok("refs-full-transient") => Self::RefsFullTransient,
             Ok("refs-linear-step") => Self::RefsLinearStep,
@@ -1127,21 +253,13 @@ impl StepMode {
             Ok("refs-pess-raise") => Self::RefsPessRaise,
             Ok("refs-hold-1s") => Self::RefsHold1s,
             Ok("refs-hold-fixed") => Self::RefsHoldFixed,
-            _ => Self::Legacy,
+            _ => Self::Refs,
         }
     }
 
     fn load(self) -> H264Load {
         match self {
-            Self::Legacy => cbr_load(),
             Self::Refs => refs_cbr_load(),
-            Self::RefsPhaseA => {
-                // The pre-B6 baseline: Phase A's policy, and no probe raise.
-                let mut l = refs_cbr_load();
-                l.pcm_phase_a_rate = true;
-                l.no_probe_raise = true;
-                l
-            }
             Self::RefsFullTransient => {
                 let mut l = refs_cbr_load();
                 l.pcm_rate_model = Some(PcmRateModel::s2(40_000, 120_000, FPS).with_s2_transient());
@@ -1220,7 +338,7 @@ async fn capacity_step_with(seed: u64, jitter_us: u64, ack_chatter: Option<Durat
         jitter_us,
         ack_chatter,
         NORMAL_DELAY_US,
-        StepMode::Legacy,
+        StepMode::Refs,
     )
     .await
 }
@@ -1422,7 +540,7 @@ async fn a_capacity_step_up_is_found_within_t_up_in_h264_mode() {
 /// scene made 5, 6 and 0 loss IDRs on these seeds before them (the reviewer's
 /// figures); now 2, 0, 2, none of them near a probe.
 #[tokio::test(start_paused = true)]
-async fn a_capacity_step_up_with_jitter_costs_no_loss_idr() {
+async fn a_capacity_step_up_with_jitter_costs_no_extra_idr() {
     let (mut loss_total, mut in_probe, mut found) = (0, 0, 0usize);
     let seeds: Vec<u64> = (0x6701u64..=0x6708).collect();
     for &seed in &seeds {
@@ -1432,8 +550,8 @@ async fn a_capacity_step_up_with_jitter_costs_no_loss_idr() {
         let s = &st.r.h264.stats;
         println!("  reached {reached:?} us, lowest/pre-min {low:.2}");
         println!(
-            "  loss idrs={} verdicts p={} time={} pkt={}",
-            s.idr_by_cause[IdrCause::Loss.index()],
+            "  extra idrs={} verdicts p={} time={} pkt={}",
+            s.frames_idr.saturating_sub(1),
             s.verdicts_p_frag,
             st.r.transport.instr.loss_by_time_threshold,
             st.r.transport.instr.loss_by_packet_threshold
@@ -1447,7 +565,7 @@ async fn a_capacity_step_up_with_jitter_costs_no_loss_idr() {
             st.r.s2c_datagrams_dropped, 0,
             "seed {seed:#x}: premise: nothing dropped"
         );
-        loss_total += s.idr_by_cause[IdrCause::Loss.index()];
+        loss_total += s.frames_idr.saturating_sub(1);
         in_probe += s.p_verdicts_in_probe;
         assert!(low >= 0.8, "seed {seed:#x}: lowest/pre-min {low:.2}");
         found += reached.is_some_and(|t| t <= T_UP_US) as usize;
@@ -1486,8 +604,8 @@ async fn probe_bursts_cause_no_verdicts_on_a_jittery_link() {
         let st = capacity_step_with_jitter(seed, 2_000).await;
         let s = &st.r.h264.stats;
         println!(
-            "jitter 2 ms {seed:#x}: loss idrs={} verdicts in a probe burst={} padding windows={}",
-            s.idr_by_cause[IdrCause::Loss.index()],
+            "jitter 2 ms {seed:#x}: extra idrs={} verdicts in a probe burst={} padding windows={}",
+            s.frames_idr.saturating_sub(1),
             s.p_verdicts_in_probe,
             s.probe_padding_windows
         );
@@ -1725,8 +843,8 @@ fn percentiles_ms(times: impl Iterator<Item = Option<u64>>) -> String {
 /// | after, a packet 8 ms later | 187/192 | 190/192 | 0 |
 ///
 /// `GF_POP_MODE=refs` runs the acked-reference twin of the scene (a PCM
-/// encoder that sizes frames from the rate, the in-place rate policy),
-/// `refs-phase-a` the same session under Phase A's rate policy.
+/// encoder that sizes frames from the rate, the in-place rate policy; the
+/// default).
 #[tokio::test(start_paused = true)]
 #[ignore = "characterisation: prints the P-B outcome of GF_POP_N seeds, three times"]
 async fn p_b_seed_population() {
@@ -1787,7 +905,6 @@ async fn p_b_seed_population() {
 
 /// What a capacity drop 6 -> 2 Mbit/s costs a CBR stream.
 struct DropSummary {
-    seed: u64,
     /// Time from the drop to the first estimate within 1.2 x the new capacity.
     reacted_us: Option<u64>,
     /// Frames skipped for backpressure over the run (the queue the stale
@@ -1804,7 +921,7 @@ async fn step_down_summary(seed: u64, delay_us: u64) -> DropSummary {
         600,
     );
     let r = run(
-        scene(seed, 24, net, cbr_load(), DropPlan::default()),
+        scene(seed, 24, net, refs_cbr_load(), DropPlan::default()),
         RunOptions::default(),
     )
     .await
@@ -1815,7 +932,6 @@ async fn step_down_summary(seed: u64, delay_us: u64) -> DropSummary {
         .find(|(t, b)| *t >= DOWN_AT_US && *b <= STEP_FROM_BPS * 12 / 10)
         .map(|(t, _)| t - DOWN_AT_US);
     DropSummary {
-        seed,
         reacted_us,
         skips: r.h264.stats.frames_skipped_backpressure,
     }
@@ -1824,7 +940,7 @@ async fn step_down_summary(seed: u64, delay_us: u64) -> DropSummary {
 /// The quiet screen of the stall scene on a link with the given one-way delay:
 /// `(lowest estimate from the end of the stall, estimate at the end)`.
 async fn quiet_screen(seed: u64, chatter: Option<Duration>, delay_us: u64) -> (u64, u64) {
-    let mut l = load(40_000, 3_000);
+    let mut l = refs_cbr_load();
     l.quiet = Some((90, 130));
     let opts = RunOptions {
         ack_blackout: Some((Duration::from_millis(3_100), Duration::from_millis(3_900))),
@@ -1845,79 +961,6 @@ async fn quiet_screen(seed: u64, chatter: Option<Duration>, delay_us: u64) -> (u
         .min()
         .expect("samples after the stall");
     (lowest_after, r.bwe_estimate_bps)
-}
-
-/// Reaction to a capacity drop and the quiet screen, over `GF_POP_N` seeds at
-/// the one-way delay `GF_POP_DELAY_US`: run it at 1000 and 20000 on this
-/// branch and on master to compare.
-#[tokio::test(start_paused = true)]
-#[ignore = "characterisation: step-down reaction and quiet screen over GF_POP_N seeds"]
-async fn drop_and_quiet_population() {
-    let n: u64 = std::env::var("GF_POP_N")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(16);
-    let delay_us: u64 = std::env::var("GF_POP_DELAY_US")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(NORMAL_DELAY_US);
-    let (mut reacted, mut skips, mut slowest) = (Vec::new(), 0, 0);
-    for i in 0..n {
-        let d = step_down_summary(0x6A01 + i, delay_us).await;
-        println!(
-            "DROP {:#x} reacted={:?} skips={}",
-            d.seed, d.reacted_us, d.skips
-        );
-        skips += d.skips;
-        if let Some(t) = d.reacted_us {
-            reacted.push(t);
-            slowest = slowest.max(t);
-        }
-    }
-    reacted.sort_unstable();
-    println!(
-        "DROPSUM delay={delay_us}: reacted {}/{n}, median {:?} us, slowest {slowest} us, mean skips {:.1}",
-        reacted.len(),
-        reacted.get(reacted.len() / 2),
-        skips as f64 / n as f64
-    );
-    let mut low = 0;
-    let mut lowest = u64::MAX;
-    for i in 0..n {
-        let (lowest_after, end) = quiet_screen(0x3301 + i, None, delay_us).await;
-        println!(
-            "QUIET {:#x} lowest_after={lowest_after} end={end}",
-            0x3301 + i
-        );
-        low += (lowest_after < BWE_START_BPS * 4 / 5 || end < BWE_START_BPS * 4 / 5) as u32;
-        lowest = lowest.min(lowest_after);
-    }
-    println!("QUIETSUM delay={delay_us}: {low}/{n} below 0.8 x the start rate, lowest {lowest}");
-}
-
-/// The gate behind `p_b_seed_population`, sized for CI. A capacity step
-/// 2 -> 6 Mbit/s on a lossless link must never take the estimate under half of
-/// its pre-step minimum (the faster link is no reason to fall), whenever the
-/// client's acknowledgements come, and must still find the headroom.
-///
-/// The seeds: the first sixteen timelines, as they come, and the ones that
-/// collapsed before the fix (a ceiling reading taken across a gap in the
-/// acknowledgements published about a tenth of the path's rate for seconds,
-/// and the sender, paced to it, then read its own rate back as the path's:
-/// 0.13 to 0.19 x the pre-step minimum), sent as they are and with the
-/// acknowledgements at once. Not a sample of the population's rate: the
-/// population says that (96 % reach the headroom). Bounds that do not
-/// depend on which seeds land where: no collapse at all, a floor for the rate
-/// well under what it measures, and the saturation share of a CBR stream at
-/// `0.8 x` its estimate, which the window's idle spend used to put at 95 %.
-///
-/// Mutation: counting a window-bound pass as spent without a queue puts the
-/// share back at 0.95; publishing the rate of a window that holds a gap
-/// brings the collapses back (0x6720 and 0x6724 as sent, 0x6715 and 0x671f
-/// acked at once, and more).
-#[tokio::test(start_paused = true)]
-async fn p_b_population_never_collapses_and_finds_the_headroom_whenever_the_client_acks() {
-    population_gate(StepMode::Legacy, None).await;
 }
 
 /// The acked-reference twin of the gate above: the same rows and seeds on an
@@ -2096,14 +1139,14 @@ async fn population_gate(mode: StepMode, allowed_misses: Option<[(usize, usize);
             percentiles_ms(all.iter().map(|s| s.step_up_us())),
             percentiles_ms(all.iter().map(|s| s.guard_us)),
         );
-        if mode != StepMode::Legacy {
+        {
             for s in &all {
                 assert!(
                     s.padding_windows > 0 && s.applies_up > 0 && s.model_limited > 0,
                     "seed {:#x} {mode:?}: premise: probes were padded ({}), the rate moved up in place ({}) and the model held frames to it ({})",
                     s.seed, s.padding_windows, s.applies_up, s.model_limited
                 );
-                if !matches!(mode, StepMode::RefsNoRaise | StepMode::RefsPhaseA) {
+                if mode != StepMode::RefsNoRaise {
                     assert!(
                         s.raise_windows > 0 && s.raise_bytes > 0,
                         "seed {:#x} {mode:?}: premise: frames were coded at a probe window's rate ({} windows, {} bytes)",
@@ -2157,7 +1200,7 @@ async fn population_gate(mode: StepMode, allowed_misses: Option<[(usize, usize);
         // bucket), so on the 20 ms path it is rarely saturated: 0.02 - 0.04
         // measured, 0.33 when the model ignores the rate.
         assert!(
-            mode == StepMode::Legacy || delay_us == LOW_DELAY_US || share < 0.15,
+            delay_us == LOW_DELAY_US || share < 0.15,
             "{mode:?} row {row}: {share:.2} of the readings found the stream saturated: the rate is not what sizes the frames"
         );
         assert!(
@@ -2213,39 +1256,6 @@ async fn the_quiet_screen_estimate_is_not_locked_below_the_start_rate() {
                 );
             }
         }
-    }
-}
-
-/// IDRs per minute on a steady 2 Mbit/s link (60 s, 3 seeds): the cost of the
-/// rate policy and the probing when nothing changes. Prints the figures; the
-/// bound is the 3 s GOP (20 a minute) plus a reopen per 2 s at the very worst.
-#[tokio::test(start_paused = true)]
-async fn idrs_per_minute_on_a_steady_two_megabit_link() {
-    for seed in [0x6901u64, 0x6902, 0x6903] {
-        let net = bottleneck_net(CapTimeline::constant(250_000), 20_000, 0, 600);
-        let r = run(
-            scene(seed, 60, net, cbr_load(), DropPlan::default()),
-            RunOptions::default(),
-        )
-        .await
-        .expect("scene");
-        report(&format!("steady 2M {seed:#x}"), &r);
-        let s = &r.h264.stats;
-        println!(
-            "  IDRs/min: total={} gop={} rate_drop={} rate_rise={} loss={}",
-            s.frames_idr,
-            s.idr_by_cause[IdrCause::GopPeriodic.index()],
-            s.idr_by_cause[IdrCause::RateDrop.index()],
-            s.idr_by_cause[IdrCause::RateRise.index()],
-            s.idr_by_cause[IdrCause::Loss.index()],
-        );
-        assert!(
-            s.frames_idr >= 15,
-            "premise: the GOP made IDRs ({})",
-            s.frames_idr
-        );
-        // 20 GOP IDRs in the minute, and a rate IDR at most every 2 s on top.
-        assert!(s.frames_idr <= 20 + 30, "{} IDRs in a minute", s.frames_idr);
     }
 }
 
@@ -2313,8 +1323,6 @@ async fn the_headroom_guard_releases_in_h264_mode_on_a_capacity_step() {
 
 #[path = "browserless_h264/openh264_scenes.rs"]
 mod openh264_scenes;
-#[path = "browserless_h264/pcm_scenes.rs"]
-mod pcm_scenes;
 #[path = "browserless_h264/refs_scenes.rs"]
 mod refs_scenes;
 

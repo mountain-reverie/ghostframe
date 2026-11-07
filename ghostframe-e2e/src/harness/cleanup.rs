@@ -113,8 +113,6 @@ pub struct AckedRefEvidence {
     pub stats_line: String,
     /// `plans` on the refs line: frames the `RefManager` planned.
     pub plans: u64,
-    /// `idr_gop_periodic` on the stats line.
-    pub idr_gop_periodic: u64,
 }
 
 /// Value of the numeric field `name=<digits>` on a log line.
@@ -147,13 +145,12 @@ pub fn acked_ref_evidence(logs: &str) -> Result<AckedRefEvidence, String> {
 /// Check server logs for proof that the acked-reference path ran on one of
 /// `backends`: a `h264 refs` line whose `backend` is one of them (the field is
 /// only set once the `RefManager` planned a frame that the backend's worker
-/// coded) with `plans > 0`, and an `h264 stats` line showing no scheduled GOP
-/// IDR (a refs session has none). For openh264 (observed mode) that line must
+/// coded) with `plans > 0`, and an `h264 stats` line that does not say H.264
+/// was given up on (`h264_unavailable`). For openh264 (observed mode) that line must
 /// also show `marks_observed > 0`: the library marked a long-term picture and
 /// the manager read it. (Those counters are on `h264 stats`, not `h264 refs`.)
 /// The `h264 refs` line is logged only for a session that has a `RefManager`
-/// (or had planned a frame), so its mere presence with a non-zero `plans`
-/// rules out the ffmpeg path.
+/// (or had planned a frame).
 pub fn acked_ref_evidence_for(logs: &str, backends: &[&str]) -> Result<AckedRefEvidence, String> {
     let refs_line = logs
         .lines()
@@ -173,11 +170,11 @@ pub fn acked_ref_evidence_for(logs: &str, backends: &[&str]) -> Result<AckedRefE
         .lines()
         .rfind(|l| l.contains("h264 stats (IDR causes"))
         .ok_or("no `h264 stats` line")?;
-    let idr_gop_periodic = log_field_u64(stats_line, "idr_gop_periodic")
-        .ok_or("no idr_gop_periodic= on the stats line")?;
-    if idr_gop_periodic != 0 {
+    if stats_line.contains(r#"h264_unavailable="process""#)
+        || stats_line.contains(r#"h264_unavailable="this_size""#)
+    {
         return Err(format!(
-            "a scheduled GOP IDR was emitted (idr_gop_periodic={idr_gop_periodic}); a refs session has none: {stats_line}"
+            "no encoder could code the stream (h264_unavailable is set): {stats_line}"
         ));
     }
     if *backend == "openh264" && log_field_u64(stats_line, "marks_observed").unwrap_or(0) == 0 {
@@ -189,7 +186,6 @@ pub fn acked_ref_evidence_for(logs: &str, backends: &[&str]) -> Result<AckedRefE
         refs_line: refs_line.to_string(),
         stats_line: stats_line.to_string(),
         plans,
-        idr_gop_periodic,
     })
 }
 
@@ -199,9 +195,6 @@ pub enum AckedRefOutcome {
     /// The refs path ran: on libva-direct (its probe passed) or, where it did
     /// not, on openh264 in observed mode.
     Verified(AckedRefEvidence),
-    /// The probe failed and the server logged the ffmpeg fallback: the refs
-    /// path was NOT exercised (a runner with neither VA-API nor openh264).
-    FallbackNotExercised(String),
 }
 
 /// `GHOSTFRAME_E2E_REQUIRE_VAAPI=1` (any non-empty value but `0`): the stream
@@ -215,8 +208,8 @@ pub fn require_vaapi() -> bool {
 /// but libva-direct): the refs path must have run. When the probe failed and
 /// VA-API is not required, an openh264 session that ran the refs path counts
 /// as the acked-reference outcome (the server image carries libopenh264, so
-/// `auto` takes it); failing that the fallback line must be there, and the
-/// outcome says loudly that nothing was proved.
+/// `auto` takes it); failing that, there is no outcome: no encoder carried
+/// the stream, and the test fails.
 pub fn acked_ref_outcome(logs: &str, require_vaapi: bool) -> Result<AckedRefOutcome, String> {
     let probe_ok = logs
         .lines()
@@ -234,31 +227,21 @@ pub fn acked_ref_outcome(logs: &str, require_vaapi: bool) -> Result<AckedRefOutc
     if probe_ok {
         return acked_ref_evidence(logs).map(AckedRefOutcome::Verified);
     }
-    if let Ok(ev) = acked_ref_evidence_for(logs, &["openh264"]) {
-        return Ok(AckedRefOutcome::Verified(ev));
-    }
-    let fallback = logs
-        .lines()
-        .find(|l| l.contains("acked-reference H.264 unavailable, using the ffmpeg encoder"))
-        .ok_or(
-            "the libva-direct probe did not pass, openh264 did not run the refs path and no \
-             fallback line was logged",
-        )?;
-    Ok(AckedRefOutcome::FallbackNotExercised(fallback.to_string()))
+    acked_ref_evidence_for(logs, &["openh264"])
+        .map(AckedRefOutcome::Verified)
+        .map_err(|why| {
+            format!(
+                "the libva-direct probe did not pass and openh264 did not run the refs path: {why}"
+            )
+        })
 }
 
-/// Report an outcome: print the evidence, or shout that the refs path was not
-/// exercised. Panics on error.
+/// Report an outcome: print the evidence. Panics on error.
 pub fn report_acked_ref_outcome(outcome: Result<AckedRefOutcome, String>) {
     match outcome {
         Ok(AckedRefOutcome::Verified(ev)) => {
             eprintln!("[b5b] {}\n[b5b] {}", ev.refs_line, ev.stats_line)
         }
-        Ok(AckedRefOutcome::FallbackNotExercised(line)) => eprintln!(
-            "[b5b] WARNING: THE ACKED-REFERENCE PATH WAS NOT EXERCISED (neither libva-direct nor \
-             openh264 on this machine; the server fell back to ffmpeg: {line}). Set \
-             GHOSTFRAME_E2E_REQUIRE_VAAPI=1 to make this a failure."
-        ),
         Err(why) => panic!("the acked-reference path did not run: {why}"),
     }
 }
@@ -289,12 +272,12 @@ mod acked_ref_tests {
     use super::acked_ref_evidence;
 
     const REFS: &str = r#"INFO ghostframe::h264: h264 refs (acked-reference recovery; cumulative) frame_seq=120 backend="libva-direct" plans=118 holds=0"#;
-    const STATS: &str = "INFO ghostframe::h264: h264 stats (IDR causes, verdicts, hold, frame skips, ledger accounting; cumulative) frame_seq=120 idr_session=1 idr_gop_periodic=0";
+    const STATS: &str = r#"INFO ghostframe::h264: h264 stats (IDR causes, verdicts, frame skips, ledger accounting; cumulative) frame_seq=120 h264_unavailable="" idr_session=1"#;
 
     #[test]
     fn accepts_a_refs_session() {
         let ev = acked_ref_evidence(&format!("{REFS}\n{STATS}\n")).expect("evidence");
-        assert_eq!((ev.plans, ev.idr_gop_periodic), (118, 0));
+        assert_eq!(ev.plans, 118);
     }
 
     #[test]
@@ -302,22 +285,17 @@ mod acked_ref_tests {
         use super::{acked_ref_outcome, AckedRefOutcome};
         let ok = "DEBUG vaapi_direct: libva-direct capability probe ms=10 ok=true";
         let bad = "DEBUG vaapi_direct: libva-direct capability probe ms=10 ok=false";
-        let fb = "INFO io_bridge: acked-reference H.264 unavailable, using the ffmpeg encoder: x";
         // Probe passed but no refs line: failure.
         assert!(acked_ref_outcome(&format!("{ok}\n{STATS}"), false).is_err());
         assert!(matches!(
             acked_ref_outcome(&format!("{ok}\n{REFS}\n{STATS}"), false),
             Ok(AckedRefOutcome::Verified(_))
         ));
-        // Probe failed: lenient with the fallback line, failure when required.
-        let logs = format!("{bad}\n{fb}\n{STATS}");
-        assert!(matches!(
-            acked_ref_outcome(&logs, false),
-            Ok(AckedRefOutcome::FallbackNotExercised(_))
-        ));
+        // Probe failed and nothing else ran the refs path: a failure, whether
+        // or not VA-API is required (there is no fallback encoder to excuse it).
+        let logs = format!("{bad}\n{STATS}");
+        assert!(acked_ref_outcome(&logs, false).is_err());
         assert!(acked_ref_outcome(&logs, true).is_err());
-        // Probe failed and no fallback line: failure even when lenient.
-        assert!(acked_ref_outcome(&format!("{bad}\n{STATS}"), false).is_err());
     }
 
     #[test]
@@ -349,13 +327,13 @@ mod acked_ref_tests {
     }
 
     #[test]
-    fn rejects_the_ffmpeg_path_and_a_gop_idr() {
+    fn rejects_a_session_with_no_plans_or_no_encoder() {
         assert!(acked_ref_evidence(STATS).is_err(), "no refs line");
-        let ffmpeg = REFS.replace("libva-direct", "pcm");
-        assert!(acked_ref_evidence(&format!("{ffmpeg}\n{STATS}")).is_err());
+        let other = REFS.replace("libva-direct", "pcm");
+        assert!(acked_ref_evidence(&format!("{other}\n{STATS}")).is_err());
         let zero = REFS.replace("plans=118", "plans=0");
         assert!(acked_ref_evidence(&format!("{zero}\n{STATS}")).is_err());
-        let gop = STATS.replace("idr_gop_periodic=0", "idr_gop_periodic=2");
-        assert!(acked_ref_evidence(&format!("{REFS}\n{gop}")).is_err());
+        let given_up = STATS.replace(r#"h264_unavailable="""#, r#"h264_unavailable="process""#);
+        assert!(acked_ref_evidence(&format!("{REFS}\n{given_up}")).is_err());
     }
 }

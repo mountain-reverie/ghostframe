@@ -14,7 +14,7 @@
 //!                        <--   Analysed | AnalyseFailed
 //! (classify, decide)
 //! Finish{H264|Tile|Discard} --> backend.finish_*          (encode / readback)
-//!                        <--   H264Done | TileDone | Discarded
+//!                        <--   H264Planned | TileDone | Discarded
 //! (commit, dispatch)
 //! ```
 //!
@@ -59,7 +59,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::frame_backend::{
-    AnalyseError, Analysed, Control, EscalationSlot, FrameBackend, H264Out, H264Reply, H264Request,
+    AnalyseError, Analysed, Control, EscalationSlot, FrameBackend, H264Reply, H264Request,
     PixelSource, TileOut, TileRequest,
 };
 use crate::frame_pool::FrameBuf;
@@ -76,11 +76,7 @@ pub(super) const SHUTDOWN_JOIN: Duration = Duration::from_millis(1500);
 
 /// What the loop wants done after it has classified a frame.
 pub(super) enum FinishAction {
-    H264 {
-        force_keyframe: bool,
-    },
-    /// An H.264 frame of an acked-reference session: the backend executes the
-    /// `RefManager`'s plan.
+    /// An H.264 frame: the backend executes the `RefManager`'s plan.
     H264Planned(Box<H264Request>),
     Tile {
         cols: u32,
@@ -125,11 +121,6 @@ pub(super) enum FromWorker {
     AnalyseFailed {
         seq: u32,
         error: AnalyseError,
-    },
-    H264Done {
-        seq: u32,
-        out: Option<H264Out>,
-        worker_us: u64,
     },
     /// The answer to `FinishAction::H264Planned`.
     H264Planned {
@@ -390,11 +381,6 @@ fn run_worker(
                         backend.apply(c);
                     }
                     match action {
-                        FinishAction::H264 { force_keyframe } => FromWorker::H264Done {
-                            seq,
-                            out: backend.finish_h264(&frame, force_keyframe),
-                            worker_us: elapsed_us(t0),
-                        },
                         FinishAction::H264Planned(req) => FromWorker::H264Planned {
                             seq,
                             reply: backend.finish_h264_planned(&frame, &req),

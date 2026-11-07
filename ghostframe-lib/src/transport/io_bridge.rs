@@ -33,8 +33,6 @@ use smallvec::smallvec;
 use crate::capture::gpu_pipeline::GpuFrameProcessor;
 use crate::server::FrameSubmission;
 use crate::tile::{DirtyTracker, TileGrid};
-use crate::transport::fec;
-use crate::transport::fec::fec_group_size;
 use crate::transport::feedback::ReceiverFeedback;
 use crate::transport::ghostbridge::{
     encode_frame, encode_frame_append, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle,
@@ -44,9 +42,8 @@ use crate::transport::peer_auth::{
     AccessPolicy, DenialLog, PeerGate, PeerLookup, SessionRechecker, TsnetWhoIs, WhoIsError,
 };
 use crate::transport::protocol::{
-    build_frame_parity_datagram, encode_tile_datagram, fragment_frame_ref,
-    max_fec_frame_fragment_payload, max_fragment_payload, Codec, FrameRefInfo, TileFragmentInputs,
-    FRAME_HEADER_SIZE, MAX_TILE_PAYLOAD, PING_PAYLOAD, PONG_PAYLOAD, REF_FRAME_NONE,
+    encode_tile_datagram, fragment_frame_ref, max_fec_frame_fragment_payload, max_fragment_payload,
+    Codec, FrameRefInfo, TileFragmentInputs, MAX_TILE_PAYLOAD, PING_PAYLOAD, PONG_PAYLOAD,
     TILE_DATAGRAM_FLAG,
 };
 use crate::transport::quic::QuicServer;
@@ -105,7 +102,7 @@ mod h264_refs;
 pub use h264_refs::RefsReport;
 #[path = "io_bridge/h264_tx.rs"]
 mod h264_tx;
-use h264_tx::{H264Gate, H264Tx};
+use h264_tx::H264Tx;
 pub use h264_tx::{H264Report, H264Stats, IdrCause};
 
 #[path = "io_bridge/frame_backend.rs"]
@@ -409,60 +406,34 @@ pub struct InjectedFrame {
 
 /// A scripted H.264 frame: the browserless harness's stand-in for the encoder.
 ///
-/// The frame goes through the bridge's real H.264 policy (`h264_frame_gate`:
-/// IDR hold, backpressure skip, pending IDR requests) and its real send path
-/// (`send_h264_frame`: fragments, ledger, admission, probe cache, parity), but
-/// nothing is encoded: the payload is `idr_bytes` or `p_bytes` of
-/// deterministic filler and the "encoder" makes an IDR exactly when the bridge
-/// asked for one (or on the optional scripted GOP). The client reassembles
-/// and reports `NeedsH264`. With `pcm` unset the payload is filler and nothing
-/// can be said about picture content; with `pcm` set it is a real stream that
-/// a decoder shows (design T3).
+/// The frame goes through the bridge's real H.264 path: the `RefManager`
+/// plans it (`h264_refs`), an encoder run inline executes the plan (a PCM
+/// writer, or the real openh264 library), and the commit and send path
+/// (`send_h264_frame`: fragments, ledger, admission, probe cache) are
+/// production's. The client reassembles and decodes what it is given, and the
+/// result carries the truth log (design T3).
 #[derive(Debug, Clone, Copy)]
 pub struct InjectedH264 {
-    /// Payload bytes of an IDR and of a P frame.
+    /// Padded frame sizes of an IDR and of a P frame (0 for the natural size).
     pub idr_bytes: usize,
     pub p_bytes: usize,
-    /// Every this many frames sent the scripted encoder makes an IDR on its
-    /// own (the ffmpeg encoder's GOP); 0 for none.
-    pub gop_frames: u32,
     /// Frame size, for the dimensions datagram and resolution attribution.
     pub width: u32,
     pub height: u32,
-    /// A scripted CBR encoder instead of fixed sizes: the bridge's real rate
-    /// policy runs and frame sizes follow the rate it sets (`idr_bytes`,
-    /// `p_bytes` and `gop_frames` are then unused). `None` for the fixed-size
-    /// scripted encoder.
-    pub cbr: Option<InjectedCbr>,
-    /// Real PCM-patch streams in place of filler (see
-    /// [`crate::encoder::h264_harness`]): the payload decodes, and the bridge's
-    /// frame sizes are `idr_bytes` and `p_bytes` (padded with filler NAL units
-    /// up to them; 0 for the natural size). Not combined with `cbr`.
+    /// Where the frames come from.
     #[cfg(feature = "browserless-harness")]
-    pub pcm: Option<crate::encoder::h264_harness::PcmMode>,
-    /// A deliberate defect in the `Legacy` PCM source, for proving the client
-    /// side notices: every this many frames a P frame is written as a
-    /// non-reference picture while the truth log still counts it as the next
-    /// frame's reference, so the stream predicts from another picture than the
-    /// one the encoder meant. 0 for none.
-    #[cfg(feature = "browserless-harness")]
-    pub pcm_wrong_ref_every: u32,
+    pub pcm: crate::encoder::h264_harness::PcmMode,
     /// An acked-reference scene runs production's rate policy and the padding
     /// it enables. Off, the encoder is not told a rate and nothing is padded
-    /// (probe padding behind a reordering path stalls the stream, on Phase A
-    /// as well; the scenes about loss and reordering keep it out of the way).
+    /// (probe padding behind a reordering path stalls the stream; the scenes
+    /// about loss and reordering keep it out of the way).
     #[cfg(feature = "browserless-harness")]
     pub pcm_rate_policy: bool,
-    /// An acked-reference scene sizes its frames from the rate the encoder was
-    /// told (see [`crate::encoder::h264_harness::PcmRateModel`]) instead of
-    /// from `idr_bytes` and `p_bytes`. `None`: fixed sizes.
+    /// A scene sizes its frames from the rate the encoder was told (see
+    /// [`crate::encoder::h264_harness::PcmRateModel`]) instead of from
+    /// `idr_bytes` and `p_bytes`. `None`: fixed sizes.
     #[cfg(feature = "browserless-harness")]
     pub pcm_rate_model: Option<crate::encoder::h264_harness::PcmRateModel>,
-    /// Baseline and mutation, with `pcm_rate_policy`: move the rate with Phase
-    /// A's policy (`RatePolicy::step`, the 2 s reopen lock) instead of the
-    /// in-place one, to measure what the in-place policy changed.
-    #[cfg(feature = "browserless-harness")]
-    pub pcm_phase_a_rate: bool,
     /// The scene's frame period, for the `RefManager`'s decode deadlines.
     #[cfg(feature = "browserless-harness")]
     pub pcm_cadence_us: u64,
@@ -476,19 +447,6 @@ pub struct InjectedH264 {
     /// (`SPIKE_HOLD_IN_PLACE`, let go early on a fall).
     #[cfg(feature = "browserless-harness")]
     pub spike_tune: Option<(u64, bool)>,
-}
-
-/// The scripted CBR encoder of [`InjectedH264::cbr`]: a P frame is
-/// `rate / 8 / fps` bytes, an IDR is `idr_over_p` of them, and an IDR is made
-/// on a reopen, on a request, and for the first frame, exactly as the real
-/// encoder: the periodic IDR is the bridge's (a time since the last IDR), not
-/// the encoder's.
-#[derive(Debug, Clone, Copy)]
-pub struct InjectedCbr {
-    pub fps: u32,
-    pub idr_over_p: u32,
-    /// The GOP the bridge's clock uses; `None` for the configured one.
-    pub gop: Option<std::time::Duration>,
 }
 
 /// An arm of the `select!` in `IoBridge::run`. See `IoBridge::loop_arm_trace`.
@@ -1431,10 +1389,7 @@ impl IoBridge {
         bwe: crate::transport::bwe::BweWrapper,
     ) -> Self {
         let (peer_lookup_tx, peer_lookup_rx) = mpsc::unbounded_channel();
-        let (h264_gop, h264_fps) = (
-            lib_config.transport.h264_gop(),
-            lib_config.transport.h264_fps(),
-        );
+        let h264_fps = lib_config.transport.h264_fps();
         let (h264_backend, openh264_lib) = (
             lib_config.transport.h264_backend,
             lib_config
@@ -1544,7 +1499,6 @@ impl IoBridge {
             frame_acks_malformed: 0,
             last_h264_frame_seq: None,
             h264: H264Tx {
-                gop: h264_gop,
                 fps: h264_fps,
                 backend: h264_backend,
                 openh264_lib,
@@ -2213,11 +2167,10 @@ impl IoBridge {
 
     /// Handle a client reset request (feedback stream 0x09).
     ///
-    /// Phase A of the H.264 rework: a `DecoderFailure` asks the existing
-    /// ffmpeg encoder for an IDR, at most one per
-    /// [`RESET_REQUEST_MIN_INTERVAL`]; the other reasons are counted and
-    /// logged only. Requests inside the window are dropped, not queued: the
-    /// IDR already on its way answers them.
+    /// On an acked-reference session every reason but `NoDecoder` starts a new
+    /// plan epoch, which begins with an IDR, at most one per
+    /// [`RESET_REQUEST_MIN_INTERVAL`]. Requests inside the window are dropped,
+    /// not queued: the IDR already on its way answers them.
     pub(crate) fn handle_reset_request(
         &mut self,
         msg: ghostframe_protocol::feedback_stream::ResetRequest,
@@ -2259,39 +2212,14 @@ impl IoBridge {
             self.h264_refs_client_reset(msg.reason);
             return;
         }
-        match msg.reason {
-            ResetReason::DecoderFailure => {
-                let limited = self
-                    .last_reset_request_idr_at
-                    .is_some_and(|t| now.saturating_duration_since(t) < RESET_REQUEST_MIN_INTERVAL);
-                if limited {
-                    self.reset_requests_rate_limited =
-                        self.reset_requests_rate_limited.saturating_add(1);
-                    tracing::debug!(
-                        frame_seq = msg.frame_seq,
-                        "reset request (decoder_failure) rate-limited"
-                    );
-                    return;
-                }
-                self.last_reset_request_idr_at = Some(now);
-                self.reset_requests_honoured = self.reset_requests_honoured.saturating_add(1);
-                // Several honoured requests in a short while: the IDRs are not
-                // helping. Tell the classifier (see `update_h264_stall`).
-                self.note_h264_reset_honoured(now);
-                tracing::info!(
-                    frame_seq = msg.frame_seq,
-                    "client reports H.264 decoder failure; requesting an IDR"
-                );
-                self.request_h264_idr(IdrCause::ClientReset, now);
-            }
-            ResetReason::Resolution | ResetReason::NoDecoder | ResetReason::GateReset => {
-                tracing::debug!(
-                    reason = ?msg.reason,
-                    frame_seq = msg.frame_seq,
-                    "reset request noted; only decoder_failure acts in this version"
-                );
-            }
-        }
+        // Nothing to restart: there is no acked-reference session to give a
+        // new plan epoch (a client without the v2 feedback is not served
+        // H.264 at all).
+        tracing::debug!(
+            reason = ?msg.reason,
+            frame_seq = msg.frame_seq,
+            "reset request with no acked-reference session; ignored"
+        );
     }
 
     /// Recover which palette_id was last emitted for the tile by consulting

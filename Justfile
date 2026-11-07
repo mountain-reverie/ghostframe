@@ -25,7 +25,7 @@ test-openh264 lib="":
     set -euo pipefail
     if [[ -n "{{lib}}" ]]; then export GHOSTFRAME_H264_OPENH264_LIB="$(realpath "{{lib}}")"; fi
     cargo test --release -p ghostframe-lib --lib -- openh264 observed \
-        --skip h264_direct_ --skip dmabuf_real_ --skip encoder::h264_vaapi --skip gpu_pipeline::
+        --skip h264_direct_ --skip dmabuf_real_ --skip gpu_pipeline::
     cargo test --release -p ghostframe-e2e --test browserless_h264 openh264_ -- --test-threads=1
 
 # --- Native client only -----------------------------------------------

@@ -1,7 +1,6 @@
 //! T3 scenes on the real acked-reference policy (design 10, B5b).
 //!
-//! The same scenes, seeds and client as `pcm_scenes` (the legacy baseline), but
-//! the stream is planned by production's `RefManager` path: the manager, the
+//! The stream is planned by production's `RefManager` path: the manager, the
 //! wire header from the plan, the send path, the ledger feedback and the
 //! client's own 0x0A and 0x09 are all production's; the PCM backend stands in
 //! for the encoder (`encoder::h264_harness`). Every scene runs three seeds,
@@ -178,11 +177,7 @@ async fn refs_clean_stream_shows_every_frame_right_with_one_idr() {
             "{ctx}: {c:?}"
         );
         // No parity on the wire, no GOP: every frame past the first is a P.
-        assert_eq!(
-            r.h264.stats.idr_by_cause[IdrCause::GopPeriodic.index()],
-            0,
-            "{ctx}"
-        );
+        assert_eq!(r.h264.stats.frames_idr, 1, "{ctx}");
     }
 }
 
@@ -527,6 +522,198 @@ async fn refs_scene_8_an_ack_stall_costs_no_idr_and_a_decoded_bit_beats_a_verdic
     }
 }
 
+/// A healthy acked-reference stream never raises `h264_stalled`: the flag is
+/// not a side effect of load.
+#[tokio::test(start_paused = true)]
+async fn refs_a_healthy_stream_never_stalls() {
+    for seed in SEEDS {
+        let (r, o) = run_pattern_with(seed, 6, Pattern::Clean, refs()).await;
+        line("refs-healthy-stall", seed, &r, &o);
+        let ctx = format!("refs-healthy-stall {seed:#x}");
+        let s = &r.h264.stats;
+        // Premise: a long stream whose frames were acknowledged.
+        assert!(s.frames_acked > 100, "{ctx}: {s:?}");
+        assert!(o.refs.frames_decoded_acked > 100, "{ctx}: {:?}", o.refs);
+        assert_eq!(
+            (
+                s.stalls_inflight,
+                s.stalls_no_progress,
+                s.stalls_reset,
+                s.h264_stalled_ms
+            ),
+            (0, 0, 0, 0),
+            "{ctx}: {s:?}"
+        );
+        assert!(!r.h264.stalled, "{ctx}");
+    }
+}
+
+/// An acknowledgement blackout (the transport acks and the client's frame
+/// feedback both gone) long enough that nothing is decoded for much more than
+/// the 500 ms progress bound: the bridge raises `h264_stalled`, keeps it up
+/// through the blackout, and drops it when the client's answers come back.
+#[tokio::test(start_paused = true)]
+async fn refs_a_long_ack_blackout_raises_h264_stalled_and_recovery_clears_it() {
+    let (from, to) = (Duration::from_millis(3_000), Duration::from_millis(5_000));
+    for seed in SEEDS {
+        let opts = RunOptions {
+            ack_blackout: Some((from, to)),
+            frame_ack_loss: Some((1.0, from, to)),
+            ..RunOptions::default()
+        };
+        let (r, o) = run_on(
+            seed,
+            9,
+            link_20ms(),
+            Pattern::Clean,
+            refs(),
+            DropPlan::default(),
+            opts,
+        )
+        .await;
+        line("refs-blackout", seed, &r, &o);
+        let ctx = format!("refs-blackout {seed:#x}");
+        let s = &r.h264.stats;
+        println!(
+            "  stalls inflight={} no_progress={} reset={} stalled_ms={} at_end={}",
+            s.stalls_inflight,
+            s.stalls_no_progress,
+            s.stalls_reset,
+            s.h264_stalled_ms,
+            r.h264.stalled
+        );
+        // Premises: answers were dropped, and frames were acknowledged before
+        // and after.
+        assert!(r.h264.acks_blacked_out > 10, "{ctx}");
+        assert!(s.frames_acked > 30, "{ctx}: {}", s.frames_acked);
+        assert!(o.refs.frames_decoded_acked > 30, "{ctx}: {:?}", o.refs);
+        // Raised for the blackout, accounted for roughly as long as the
+        // blackout minus the progress bound, and not still up.
+        assert!(
+            s.stalls_inflight + s.stalls_no_progress >= 1,
+            "{ctx}: {s:?}"
+        );
+        assert!(
+            s.h264_stalled_ms >= 1_000 && s.h264_stalled_ms <= 3_000,
+            "{ctx}: stalled {} ms for a 2000 ms blackout",
+            s.h264_stalled_ms
+        );
+        assert!(!r.h264.stalled, "{ctx}: still stalled at the end");
+    }
+}
+
+/// A link that carries a fifth of what the encoder produces (1 Mbit/s against
+/// 20 KB P frames at 30 fps), behind a buffer deep enough that nothing is
+/// dropped. The encoder is not run into a queue it cannot drain: frames are
+/// skipped, the queue and the delay stay bounded, and every captured frame is
+/// either sent or skipped.
+#[tokio::test(start_paused = true)]
+async fn refs_an_overdriven_link_skips_frames_instead_of_queueing_them() {
+    const LINK_BYTES_PER_S: u64 = 125_000;
+    const P_BYTES: usize = 20_000;
+    for seed in SEEDS {
+        let net = NetProfile {
+            delay_us: 10_000,
+            jitter_us: 1_000,
+            cap: CapTimeline::constant(LINK_BYTES_PER_S),
+            // Deep enough that nothing is dropped: the queue the frame skip
+            // must keep short would otherwise hide in tail drops.
+            bottleneck: Some(Bottleneck {
+                depth_ms: 3_000,
+                aqm: None,
+            }),
+            ..NetProfile::perfect()
+        };
+        let mut load = refs();
+        load.idr_bytes = 10_000;
+        load.p_bytes = P_BYTES;
+        let (r, o) = run_on(
+            seed,
+            10,
+            net,
+            Pattern::Clean,
+            load,
+            DropPlan::default(),
+            RunOptions::default(),
+        )
+        .await;
+        line("refs-overdriven", seed, &r, &o);
+        let ctx = format!("refs-overdriven {seed:#x}");
+        let s = &r.h264.stats;
+        // Premises: nothing was dropped, the encoder produced far more than
+        // the link carries, and frames were skipped for the queue.
+        assert_eq!(r.s2c_datagrams_dropped, 0, "{ctx}");
+        assert!(s.frames_skipped_backpressure > 100, "{ctx}: {s:?}");
+        // Every captured frame was sent or skipped; none vanished.
+        let injected = r.injections.iter().filter(|(_, hb)| !hb).count() as u64;
+        assert_eq!(
+            s.frames_sent + s.frames_skipped_hold + s.frames_skipped_backpressure,
+            injected,
+            "{ctx}: {s:?}"
+        );
+        // The queue the gate allows: one frame period of the highest estimate
+        // seen, two gate depths (10 ms of it each), plus the one frame that is
+        // encoded when the queue is just under the limit. At the link's rate
+        // that is the queueing delay.
+        let est_max = r.bwe_estimate_samples.iter().map(|x| x.1).max().unwrap() as f64 / 8.0;
+        let limit = est_max / 30.0 + 2.0 * 0.010 * est_max;
+        let bound_bytes = limit + P_BYTES as f64;
+        let bound_delay_us = (bound_bytes / LINK_BYTES_PER_S as f64 * 1e6) as u64;
+        let mut queue_us: Vec<u64> = r
+            .s2c_transit_samples
+            .iter()
+            .map(|x| x.1.saturating_sub(10_000))
+            .collect();
+        queue_us.sort_unstable();
+        let p95 = queue_us[queue_us.len() * 95 / 100];
+        assert!(
+            p95 <= bound_delay_us + 50_000,
+            "{ctx}: p95 queueing {p95} us, bound {bound_delay_us} us (+50 ms)"
+        );
+        assert!(
+            r.emission_queue_peak as f64 <= bound_bytes / 1_100.0 + 10.0,
+            "{ctx}: emitter queue peaked at {} datagrams, bound {}",
+            r.emission_queue_peak,
+            bound_bytes / 1_100.0
+        );
+        // The stream still moves: frames reach the client to the end.
+        assert!(o.fed >= 20, "{ctx}: {}", o.fed);
+        assert!(
+            o.last_correct_us.unwrap_or(0) + 1_000_000 >= 10_000_000,
+            "{ctx}: dead at the end"
+        );
+    }
+}
+
+/// Independent loss: every transmission has exactly one outcome (the ledger's
+/// books balance) and the estimator keeps learning.
+#[tokio::test(start_paused = true)]
+async fn refs_under_random_loss_the_books_balance() {
+    for seed in SEEDS {
+        let (r, o) = run_pattern(seed, SECS, Pattern::Iid(0.03)).await;
+        line("refs-books", seed, &r, &o);
+        let ctx = format!("refs-books {seed:#x}");
+        let s = &r.h264.stats;
+        // Premises: the network dropped datagrams and the ledger judged some
+        // transmissions lost, acknowledged others.
+        assert!(r.s2c_datagrams_dropped > 20, "{ctx}");
+        assert!(
+            s.tx_judged_lost > 0 && s.tx_acked_live > 100,
+            "{ctx}: {s:?}"
+        );
+        assert_eq!(
+            s.tx_recorded,
+            s.tx_acked_live + s.tx_judged_lost + s.tx_forgotten + r.h264.ledger_records as u64,
+            "{ctx}: {s:?}"
+        );
+        assert!(
+            r.bwe_samples_seen >= s.tx_acked_live / 2,
+            "{ctx}: the estimator stopped learning"
+        );
+        assert_recovers(&ctx, SECS, &r, &o);
+    }
+}
+
 /// Scene 10: the slot-overwrite race. The frame feedback comes back late and
 /// shuffled (up to 600 ms), so a candidate can be given up on and its slot
 /// reused before its decoded bit arrives; with loss on top, a recovery may be
@@ -592,7 +779,6 @@ async fn refs_probing_works_without_a_periodic_idr() {
         assert_sound(&ctx, 20, &r, &o);
         let s = &r.h264.stats;
         assert_eq!(o.idr_made, 1, "{ctx}: no periodic IDR in 20 s");
-        assert_eq!(s.idr_by_cause[IdrCause::GopPeriodic.index()], 0, "{ctx}");
         assert!(s.app_probes > 0, "{ctx}: the application never probed");
         assert!(s.probe_padding_windows > 0, "{ctx}: nothing was padded");
     }
@@ -632,11 +818,10 @@ async fn refs_loss_scenes_hold_with_the_rate_policy_on() {
     }
 }
 
-/// The path MTU falls after discovery has raised it (see the legacy scene in
-/// `pcm_scenes`), on an acked-reference session. Fragments cut for the larger
+/// The path MTU falls after discovery has raised it, on an acked-reference
+/// session. Fragments cut for the larger
 /// size and queued or cached outgrow the connection and are retired. The
-/// Phase A answer (an IDR for the new size) is not this policy's: the manager
-/// treats each retired frame as lost and recovers from its anchor, with
+/// manager treats each retired frame as lost and recovers from its anchor, with
 /// frames cut for the new size; only the IDR still in flight, which cannot
 /// complete, is cut again. So: the stream lives, no wrong picture is shown,
 /// the manager recovered, and the IDR count stays bounded.
@@ -685,19 +870,14 @@ async fn refs_an_mtu_that_falls_after_discovery_recovers_from_the_anchor() {
         assert!(s.oversize_h264 > 0, "{ctx}: no fragment outgrew the MTU");
         assert!(c.active, "{ctx}: not an acked-reference session");
         assert!(c.mtu_retired > 0, "{ctx}: the manager was told of nothing");
-        // Nothing stale reached quinn, and the Phase A request was not made.
+        // Nothing stale reached quinn.
         assert_eq!(s.send_too_large, 0, "{ctx}");
-        assert_eq!(
-            s.idr_requests_by_cause[IdrCause::MtuShrink.index()],
-            0,
-            "{ctx}: the Phase A MTU IDR was requested"
-        );
         // No wedge, no wrong picture, alive at the end.
         assert_sound(&ctx, SECS, &r, &o);
         assert!(o.correct > 150, "{ctx}: {} frames shown", o.correct);
         assert!(o.frozen_us <= 1_500_000, "{ctx}: frozen {} us", o.frozen_us);
-        // This scene proves routing (`mtu_retired > 0`, no Phase A MtuShrink
-        // request, `send_too_large == 0`) and harmlessness. `recoveries` is
+        // This scene proves routing (`mtu_retired > 0`, `send_too_large == 0`)
+        // and harmlessness. `recoveries` is
         // also satisfied by ordinary black-hole loss, so it does not tie to
         // the retirement; the suspect-then-recover link is proved by the
         // P-fragment unit test in io_bridge/tests.rs.
@@ -1145,4 +1325,117 @@ async fn scene6c(seed: u64, spike_tune: Option<(u64, bool)>) -> Scene6c {
         shown,
         latency_us: run.max_latency_us(drop_at),
     }
+}
+
+/// Same seed, same behaviour: two runs of a lossy scene agree on everything
+/// the scenes read (the transport's counters, what each frame was meant to
+/// show, every delivery and its instant, what the client decoded), and another
+/// seed does not (so the agreement is not an empty scene).
+///
+/// The wire digest is held to the same standard only on a link with no netsim
+/// randomness (the loss is the harness's own, `DropPlan`). With the netsim's
+/// i.i.d. loss, or with jitter, the server's handshake flight differs in
+/// length by a few bytes between two same-seed runs (seed 0x7201, 5 % loss:
+/// datagram 13, 180 ms in, lengths 709 to 714), with no difference in
+/// behaviour: every counter, delivery and instant above is identical. The
+/// cause is the server's TLS identity: a fresh ECDSA P-256 certificate per run
+/// (`rcgen::KeyPair::generate` in `transport/quic.rs`) and ECDSA signatures
+/// with a random nonce, whose DER encoding is 70 to 72 bytes. The Handshake
+/// packets that carry them are not padded, so the length shows. A fixed key
+/// pair would not remove it (the signature stays random), so it is only
+/// documented; the scripted scenes show it equally.
+#[tokio::test(start_paused = true)]
+async fn the_same_seed_gives_byte_identical_counters() {
+    let one = |seed| async move {
+        let (r, o) = run_pattern_with(seed, 8, Pattern::Iid(0.05), refs_rated()).await;
+        let run = r.h264_run().unwrap().clone();
+        (
+            format!("{:?}", r.h264.stats),
+            format!("{:?}", run.truth),
+            format!("{:?}", run.display),
+            format!("{o:?}"),
+            format!("{:?}", r.emitter_stats),
+            r.s2c_datagrams_dropped,
+            r.bytes_delivered_c2s,
+            r.wire_datagrams,
+        )
+    };
+    let a = one(0x7201).await;
+    let b = one(0x7201).await;
+    assert!(
+        a.5 > 0 && a.2.len() > 1000,
+        "premise: loss fired, frames decoded"
+    );
+    assert_eq!(a, b, "same seed, different counters");
+    let c = one(0x7202).await;
+    assert_ne!(a.2, c.2, "another seed must give another run");
+
+    // The wire itself, with the harness's own loss (scene 7's).
+    let wire = |seed| async move {
+        let drops = DropPlan::default().with_frame_rules(vec![
+            FrameDropRule {
+                frame_seq: 0,
+                frag: FragSel::Index(3),
+                occurrences: vec![0, 1],
+            },
+            FrameDropRule {
+                frame_seq: 0,
+                frag: FragSel::Last,
+                occurrences: vec![0],
+            },
+        ]);
+        let (r, _) = run_on(
+            seed,
+            4,
+            link_20ms(),
+            Pattern::Clean,
+            refs(),
+            drops,
+            RunOptions::default(),
+        )
+        .await;
+        assert_eq!(r.frame_drops_fired, vec![2, 1], "premise");
+        (
+            r.wire_digest,
+            r.wire_datagrams,
+            r.bytes_delivered_s2c,
+            format!("{:?}", r.h264_run().unwrap().display),
+        )
+    };
+    let (a, b) = (wire(0x7203).await, wire(0x7203).await);
+    assert_eq!(a, b, "same seed, different wire");
+    assert_ne!(
+        a.0,
+        wire(0x7204).await.0,
+        "another seed must give another wire"
+    );
+}
+
+/// Seed 0x7108 of the 8 ms reordering scene wedged on master: quinn's own
+/// discovery raised the datagram size and its black-hole detector took it
+/// back (280 `TooLarge` refusals, the picture frozen from 6.9 s to the end).
+/// The shrink followed that seed's spurious loss verdicts; with the ledger's
+/// reordering window it may not happen at all, so this is a liveness check on
+/// the same path (properties only, the chaotic path decides the IDR count) and
+/// prints `oversize_h264` to say whether the shrink happened. The wedge, with
+/// its premises, is
+/// `an_mtu_that_falls_after_discovery_does_not_wedge_the_stream` above, which
+/// forces the fall.
+#[tokio::test(start_paused = true)]
+async fn reorder8_seed_7108_stays_live() {
+    let (r, o) =
+        run_pattern_with(0x7108, SECS, Pattern::Reorder { window_us: 8_000 }, refs()).await;
+    line("reorder8", 0x7108, &r, &o);
+    println!(
+        "reorder8 0x7108: oversize_h264={} send_too_large={}",
+        r.h264.stats.oversize_h264, r.h264.stats.send_too_large
+    );
+    assert_eq!(r.h264.stats.send_too_large, 0);
+    assert_sound("reorder8 0x7108", SECS, &r, &o);
+    assert!(
+        o.last_correct_us.unwrap_or(0) + 500_000 >= SECS * 1_000_000,
+        "dead at the end: {:?}",
+        o.last_correct_us
+    );
+    assert!(o.frozen_us <= 1_500_000, "frozen {} us", o.frozen_us);
 }

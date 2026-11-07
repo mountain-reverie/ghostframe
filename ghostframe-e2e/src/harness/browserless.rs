@@ -73,7 +73,7 @@ use ghostframe_client_net::{ClientNet, ClientNetConfig, ClientNetEvent};
 use ghostframe_lib::encoder::h264_harness::PcmMode;
 use ghostframe_lib::transport::ghostbridge::encode_frame;
 use ghostframe_lib::transport::io_bridge::{
-    mem_stream_pair, H264Report, InjectedCbr, InjectedFrame, InjectedH264, IoBridge, MemStream,
+    mem_stream_pair, H264Report, InjectedFrame, InjectedH264, IoBridge, MemStream,
 };
 use ghostframe_lib::transport::quic::QuicServer;
 
@@ -148,11 +148,11 @@ pub enum SceneLoad {
     /// which very much do still need it.
     Profile(crate::harness::load_profile::LoadProfile),
     /// A scripted H.264 stream: one frame per `cadence_us` for the scene's
-    /// whole duration, through the bridge's real H.264 gate and send path with
-    /// a scripted encoder (see [`ghostframe_lib::transport::io_bridge::InjectedH264`]).
-    /// The client is a real `ClientNet` that advertises H.264 and
-    /// acknowledges fragments; it reassembles frames (`NeedsH264` events) and
-    /// decodes nothing.
+    /// whole duration, through the bridge's real plan, commit and send path
+    /// with an encoder run inline (see
+    /// [`ghostframe_lib::transport::io_bridge::InjectedH264`]). The client is a
+    /// real `ClientNet` that advertises H.264 and acknowledges fragments; it
+    /// reassembles and decodes the frames.
     H264(H264Load),
 }
 
@@ -160,35 +160,25 @@ pub enum SceneLoad {
 #[derive(Debug, Clone, Copy)]
 pub struct H264Load {
     pub cadence_us: u64,
-    /// Payload bytes of an IDR and of a P frame.
+    /// Padded payload bytes of an IDR and of a P frame (0 for the natural
+    /// size).
     pub idr_bytes: usize,
     pub p_bytes: usize,
-    /// The scripted encoder's own GOP (an IDR every this many frames sent);
-    /// 0 for none: IDRs then come only when the bridge asks.
-    pub gop_frames: u32,
     pub width: u32,
     pub height: u32,
     /// Frame indexes `[from, to)` in which the screen is static: no H.264 frame
     /// is produced (the tick is an empty heartbeat). A tail probe only fires
     /// when the sender goes quiet, so a scene about the probe needs this.
     pub quiet: Option<(usize, usize)>,
-    /// A scripted CBR encoder in place of the fixed sizes: the bridge's real
-    /// rate policy runs and frame sizes follow the rate it sets
-    /// (`idr_bytes`, `p_bytes` and `gop_frames` are then unused).
-    pub cbr: Option<InjectedCbr>,
-    /// Real PCM-patch streams in place of filler, from this source (design
-    /// T3). The client then decodes what it is given and the result carries
-    /// the truth log and the client's records ([`BrowserlessResult::h264_pcm`]).
-    /// `idr_bytes` and `p_bytes` become padded frame sizes.
-    pub pcm: Option<PcmMode>,
-    /// See `InjectedH264::pcm_wrong_ref_every`: a deliberate defect.
-    pub pcm_wrong_ref_every: u32,
+    /// Where the frames come from: PCM-patch streams planned by the
+    /// `RefManager`, or the real openh264 library (design T3). The client
+    /// decodes what it is given and the result carries the truth log and the
+    /// client's records ([`BrowserlessResult::h264_pcm`]).
+    pub pcm: PcmMode,
     /// See `InjectedH264::pcm_rate_policy`.
     pub pcm_rate_policy: bool,
     /// See `InjectedH264::pcm_rate_model`.
     pub pcm_rate_model: Option<ghostframe_lib::encoder::h264_harness::PcmRateModel>,
-    /// See `InjectedH264::pcm_phase_a_rate`.
-    pub pcm_phase_a_rate: bool,
     /// See `InjectedH264::no_probe_raise`.
     pub no_probe_raise: bool,
     /// See `InjectedH264::spike_tune`.
@@ -1187,12 +1177,10 @@ async fn run_inner(
 
     let mut framebuffer = FrameBuffer::new();
     let mut h264_display = match &scene.load {
-        SceneLoad::H264(h) if matches!(h.pcm, Some(PcmMode::OpenH264 { .. })) => {
+        SceneLoad::H264(h) if matches!(h.pcm, PcmMode::OpenH264 { .. }) => {
             Some(crate::harness::h264_scene::H264Display::lossy())
         }
-        SceneLoad::H264(h) if h.pcm.is_some() => {
-            Some(crate::harness::h264_scene::H264Display::new())
-        }
+        SceneLoad::H264(_) => Some(crate::harness::h264_scene::H264Display::new()),
         _ => None,
     };
     let mut s2c_loss = S2cLoss::default();
@@ -1551,15 +1539,11 @@ async fn drive_session(
         SceneLoad::H264(h) => Some(InjectedH264 {
             idr_bytes: h.idr_bytes,
             p_bytes: h.p_bytes,
-            gop_frames: h.gop_frames,
             width: h.width,
             height: h.height,
-            cbr: h.cbr,
             pcm: h.pcm,
-            pcm_wrong_ref_every: h.pcm_wrong_ref_every,
             pcm_rate_policy: h.pcm_rate_policy,
             pcm_rate_model: h.pcm_rate_model,
-            pcm_phase_a_rate: h.pcm_phase_a_rate,
             pcm_cadence_us: h.cadence_us,
             no_probe_raise: h.no_probe_raise,
             spike_tune: h.spike_tune,

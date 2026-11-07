@@ -3,7 +3,7 @@
 //!
 //! A [`FrameBackend`] that sleeps stands in for the Vulkan processor and the
 //! hardware encoder: `analyse` sleeps 250 ms (the fence wait) and
-//! `finish_tile`/`finish_h264` sleep 250 ms (readback, pass encode, H.264).
+//! `finish_tile` sleeps 250 ms (readback, pass encode).
 //! While a frame is in either sleep, a Version Negotiation probe is sent
 //! every 7 ms; quinn answers it from the loop's inbound arm, so the time to
 //! the reply is how long the loop took to turn.
@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use ghostframe_client_net::{ClientNet, ClientNetConfig, ClientNetEvent};
 use ghostframe_e2e::netsim::SocketPairPump;
 use ghostframe_lib::transport::io_bridge::{
-    AnalyseError, Analysed, Cdf53Encoded, Control, FrameBackend, H264Out, IoBridge, OwnedPalRle,
+    AnalyseError, Analysed, Cdf53Encoded, Control, FrameBackend, IoBridge, OwnedPalRle,
     PixelSource, TileOut, TileRequest, TileTimings,
 };
 use ghostframe_lib::transport::quic::QuicServer;
@@ -63,14 +63,6 @@ impl FrameBackend for SleepyBackend {
             dirty_tiles: vec![0, 1, 2, 3],
             dirty_analysis: vec![None; 4],
             ..Default::default()
-        })
-    }
-
-    fn finish_h264(&mut self, _frame: &FrameSubmission, _force_keyframe: bool) -> Option<H264Out> {
-        self.busy("finish");
-        Some(H264Out {
-            payload: vec![0u8; 800],
-            is_keyframe: true,
         })
     }
 

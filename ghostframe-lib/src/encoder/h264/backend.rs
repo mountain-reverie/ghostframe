@@ -1,19 +1,16 @@
-//! The H.264 encoder backend trait (design 4.1) and the legacy backend.
+//! The H.264 encoder backend trait (design 4.1).
 //!
 //! A backend turns one NV12 picture and one [`FramePlan`] into one access
 //! unit. Backends with `explicit_refs` (libva-direct) execute the plan:
 //! the reference picture, the marking and the list modification are exactly
 //! what the plan says, and the AU they return is parsed so the caller can
-//! check it (`RefManager::frame_sent`). The legacy ffmpeg backend ignores
-//! the plan except for IDR and runs in observed mode.
+//! check it (`RefManager::frame_sent`). openh264 has its own reference
+//! structure and runs in observed mode.
 
-use crate::encoder::nal_parser::is_keyframe_nal;
 use thiserror::Error;
 
 use super::refs::{FramePlan, ResidentRef};
 use super::syntax::{SliceHeader, StreamParams};
-use super::tracker::PicKind;
-use crate::encoder::h264_vaapi::{FullFrameEncoder, RateParams};
 
 #[derive(Debug, Error)]
 pub(crate) enum BackendError {
@@ -268,160 +265,6 @@ pub(crate) trait H264Backend: Send {
     fn feedback(&mut self, fb: BackendFeedback);
 }
 
-// ------------------------------------------------------------ legacy backend
-
-/// The Phase A encoder (`h264_vaapi` or libx264 through ffmpeg) behind the
-/// trait, with Phase A semantics kept until the openh264 backend replaces
-/// libx264 (B7). It has its own reference handling: the plan is observed,
-/// only an IDR is asked for, and a new rate is applied by reopening at the
-/// next IDR.
-pub(crate) struct LegacyFfmpegBackend {
-    /// Skip h264_vaapi and use libx264 (tests, and machines without VA-API
-    /// that would otherwise probe for it).
-    software_only: bool,
-    enc: Option<FullFrameEncoder>,
-    cfg: Option<StreamConfig>,
-    rate: Option<RateTarget>,
-}
-
-impl LegacyFfmpegBackend {
-    pub(crate) fn new() -> Self {
-        Self {
-            software_only: false,
-            enc: None,
-            cfg: None,
-            rate: None,
-        }
-    }
-
-    /// libx264 only.
-    pub(crate) fn software() -> Self {
-        Self {
-            software_only: true,
-            ..Self::new()
-        }
-    }
-
-    fn open_encoder(
-        &self,
-        cfg: &StreamConfig,
-        rate: RateTarget,
-    ) -> Result<FullFrameEncoder, BackendError> {
-        let params = RateParams {
-            bps: rate.bps,
-            fps: cfg.fps,
-        };
-        if self.software_only {
-            FullFrameEncoder::with_params_software(cfg.width, cfg.height, params)
-        } else {
-            FullFrameEncoder::with_params(cfg.width, cfg.height, params)
-        }
-        .map_err(|e| BackendError::Unavailable(format!("ffmpeg encoder: {e}")))
-    }
-}
-
-impl H264Backend for LegacyFfmpegBackend {
-    fn name(&self) -> &'static str {
-        "ffmpeg"
-    }
-
-    fn caps(&self) -> BackendCaps {
-        BackendCaps {
-            explicit_refs: false,
-            max_lt: 0,
-            max_ref_frames: 1,
-            vbr: true,
-        }
-    }
-
-    fn open(&mut self, cfg: &StreamConfig) -> Result<(), BackendError> {
-        self.enc = Some(self.open_encoder(cfg, cfg.rate)?);
-        self.cfg = Some(*cfg);
-        self.rate = Some(cfg.rate);
-        Ok(())
-    }
-
-    fn encode(
-        &mut self,
-        nv12: &Nv12View<'_>,
-        plan: &FramePlan,
-        _refs: &[ResidentRef],
-    ) -> Result<EncodedAu, BackendError> {
-        let (Some(cfg), Some(rate)) = (self.cfg, self.rate) else {
-            return Err(BackendError::Failed);
-        };
-        if !nv12.is_complete() {
-            return Err(BackendError::Plan("NV12 buffer too small".into()));
-        }
-        let idr = plan.kind == PicKind::Idr;
-        let reopen = idr && self.enc.as_ref().is_none_or(|e| e.params().bps != rate.bps);
-        if reopen {
-            self.enc = Some(self.open_encoder(&cfg, rate)?);
-        }
-        let enc = self.enc.as_mut().ok_or(BackendError::Failed)?;
-        if idr {
-            enc.request_keyframe();
-        }
-        let out = enc
-            .encode_nv12_buffer(
-                nv12.data.as_ptr(),
-                nv12.width,
-                nv12.height,
-                nv12.y_stride as u32,
-                nv12.uv_stride as u32,
-                nv12.uv_offset as u32,
-            )
-            .map_err(|e| BackendError::Driver {
-                call: "encode_nv12_buffer",
-                detail: e.to_string(),
-            })?
-            .ok_or(BackendError::Buffered)?;
-        Ok(EncodedAu {
-            meta: AuMeta {
-                idr: is_keyframe_nal(&out.payload),
-                header: None,
-                ref_seq: None,
-                params: None,
-            },
-            payload: out.payload,
-        })
-    }
-
-    fn set_rate(&mut self, rate: RateTarget) {
-        self.rate = Some(rate);
-    }
-
-    fn feedback(&mut self, _fb: BackendFeedback) {}
-}
-
-/// Open the first backend that works: libva-direct when `try_direct` yields
-/// one (it probes the driver), else the legacy ffmpeg backend, which has its
-/// own software path. With no VA-API at all that is libx264.
-pub(crate) fn select_backend(
-    cfg: &StreamConfig,
-    try_direct: impl FnOnce(&StreamConfig) -> Result<Box<dyn H264Backend>, BackendError>,
-) -> Result<Box<dyn H264Backend>, BackendError> {
-    select_with(cfg, try_direct, LegacyFfmpegBackend::new())
-}
-
-fn select_with(
-    cfg: &StreamConfig,
-    try_direct: impl FnOnce(&StreamConfig) -> Result<Box<dyn H264Backend>, BackendError>,
-    mut legacy: LegacyFfmpegBackend,
-) -> Result<Box<dyn H264Backend>, BackendError> {
-    match try_direct(cfg) {
-        Ok(b) => return Ok(b),
-        Err(e @ BackendError::Unavailable(_)) => {
-            tracing::info!(err = %e, "h264: direct libva backend unavailable, using ffmpeg");
-        }
-        Err(e) => {
-            tracing::warn!(err = %e, "h264: direct libva backend failed, using ffmpeg");
-        }
-    }
-    legacy.open(cfg)?;
-    Ok(Box::new(legacy))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,50 +290,5 @@ mod tests {
         .is_complete());
         // The UV plane may not overlap the Y plane.
         assert!(!Nv12View { uv_offset: 64, ..v }.is_complete());
-    }
-
-    /// A direct backend that does not open: the legacy ffmpeg backend is
-    /// selected and encodes an IDR through the trait (libx264).
-    #[test]
-    fn falls_back_to_the_legacy_backend() {
-        use super::super::refs::{RefConfig, RefManager};
-        use std::time::{Duration, Instant};
-
-        let cfg = StreamConfig::new(256, 128, 30, 2_000_000);
-        // libx264 only: this test must not touch a GPU anywhere.
-        let mut b = select_with(
-            &cfg,
-            |_| Err(BackendError::Incapable("probe said no".into())),
-            LegacyFfmpegBackend::software(),
-        )
-        .expect("legacy backend opens");
-        assert!(!b.caps().explicit_refs);
-        let mut mgr = RefManager::new(RefConfig {
-            params: cfg.params,
-            frame_interval: Duration::from_millis(33),
-            initial_srtt: Duration::from_millis(66),
-            observed: false,
-        });
-        let super::super::refs::Plan::Frame(plan) = mgr.plan_next(0, Instant::now()) else {
-            panic!("held");
-        };
-        let data = vec![128u8; 256 * 128 * 3 / 2];
-        let view = Nv12View {
-            data: &data,
-            width: 256,
-            height: 128,
-            y_stride: 256,
-            uv_stride: 256,
-            uv_offset: 256 * 128,
-        };
-        let au = (0..3)
-            .find_map(|_| match b.encode(&view, &plan, &[]) {
-                Ok(au) => Some(au),
-                Err(BackendError::Buffered) => None,
-                Err(e) => panic!("{e}"),
-            })
-            .expect("output within three pictures");
-        assert!(au.meta.idr && au.meta.header.is_none());
-        assert!(!au.payload.is_empty());
     }
 }

@@ -161,16 +161,10 @@ impl IoBridge {
                 self.h264.stats.oversize_h264 += 1;
                 self.reliable_emitter.h264.remove(frame_seq, frag_idx);
                 if self.h264_refs_live() {
-                    // Acked references have no Phase A IDR request: the
-                    // frame is lost as far as the manager is concerned, and
-                    // it picks the recovery.
+                    // The frame is lost as far as the manager is concerned,
+                    // and it picks the recovery.
                     self.h264_refs_oversize(frame_seq, now);
-                    return;
                 }
-                self.request_h264_idr(IdrCause::MtuShrink, now);
-                // As for a loss IDR: a screen that has stopped changing makes
-                // no capture with dirty tiles, so no frame to carry the IDR.
-                self.ensure_baseline_invalidated();
             }
             Some(Content::Pad(ws)) => {
                 self.h264.stats.oversize_pad += 1;

@@ -13,7 +13,7 @@
 //!
 //! 1. [`FrameBackend::analyse`]: GPU submit and fence wait. Returns an owned
 //!    [`Analysed`]; the backend keeps the raw GPU outputs for step 2.
-//! 2. one of [`FrameBackend::finish_h264`], [`FrameBackend::finish_tile`] or
+//! 2. one of [`FrameBackend::finish_h264_planned`], [`FrameBackend::finish_tile`] or
 //!    [`FrameBackend::finish_discard`], chosen by the loop once it has
 //!    classified the frame. This releases the GPU outputs.
 //!
@@ -49,7 +49,6 @@ use crate::encoder::h264::openh264::OpenH264Backend;
 use crate::encoder::h264::refs::{FramePlan, ResidentRef};
 use crate::encoder::h264::tracker::PicKind;
 use crate::encoder::h264::vaapi_direct::VaapiDirect;
-use crate::encoder::h264_vaapi::{FullFrameEncoder, RateParams};
 use crate::server::FrameSubmission;
 
 use super::frame::{clamp_gpu_tile_count, palrle_index_slice};
@@ -63,14 +62,6 @@ pub enum Control {
     /// Drop the GPU's previous-frame baseline and report the next `n` frames
     /// as fully dirty.
     InvalidateBaseline(u32),
-    /// The next H.264 frame is an IDR.
-    RequestKeyframe,
-    /// The H.264 encoder's rate and frame rate. The next time the encoder opens it
-    /// opens with these; with `reopen` it is closed now, so the next frame
-    /// opens a fresh encoder and is an IDR. The rate cannot change in place
-    /// (the ffmpeg encoder would reset its rate control), which is why a new
-    /// rate costs an IDR (see `h264_rate`).
-    H264Rate { bps: u32, fps: u32, reopen: bool },
     /// A frame that named only some tile rows was dropped before the GPU
     /// stage saw it: upload and compare the next frame whole.
     ForgetDamage,
@@ -294,12 +285,7 @@ pub trait FrameBackend: Send {
         want_diag: bool,
     ) -> Result<Analysed, AnalyseError>;
 
-    /// H.264 arm. Creates or resizes the encoder as needed. `None` when there
-    /// is nothing to send (encoder unavailable, failed, or buffering).
-    fn finish_h264(&mut self, frame: &FrameSubmission, force_keyframe: bool) -> Option<H264Out>;
-
-    /// H.264 arm for a session that recovers by acked references: execute the
-    /// `RefManager`'s plan. A backend without plan support answers
+    /// H.264 arm: execute the `RefManager`'s plan. A backend without plan support answers
     /// [`H264Reply::Unavailable`].
     fn finish_h264_planned(&mut self, frame: &FrameSubmission, req: &H264Request) -> H264Reply {
         let _ = (frame, req);
@@ -324,10 +310,7 @@ pub trait FrameBackend: Send {
     fn forward_cdf53_tiles(&mut self, tiles: &[&[u8]]) -> Result<Vec<i16>, String>;
 }
 
-/// The plan-executing backend of acked-reference sessions: libva-direct, when
-/// the machine has it. `select_backend` with no fallback: the Phase A encoder
-/// is `GpuBackend`'s own `FullFrameEncoder`, reached through
-/// [`FrameBackend::finish_h264`], so a stream it carries never sees a plan.
+/// The first rung of the ladder: libva-direct, when the machine has it.
 fn open_direct(cfg: &StreamConfig) -> Result<Box<dyn H264Backend>, BackendError> {
     let mut b = VaapiDirect::new();
     b.open(cfg)?;
@@ -445,18 +428,14 @@ pub(crate) fn encode_planned(
 /// A plan-executing backend, the frame size and the choice it was opened for.
 type OpenedBackend = (Box<dyn H264Backend>, (u32, u32), H264BackendChoice);
 
-/// The production backend: a Vulkan `GpuFrameProcessor` and, lazily, a
-/// VA-API (or software) `FullFrameEncoder`.
+/// The production backend: a Vulkan `GpuFrameProcessor` and, lazily, the
+/// H.264 backend the ladder picked.
 pub struct GpuBackend {
     processor: GpuFrameProcessor,
-    encoder: Option<FullFrameEncoder>,
-    /// The plan-executing backend of an acked-reference session, the frame
-    /// size it was opened for and the choice that opened it (a demotion
-    /// changes the choice, which reopens at the next IDR). `None` until the
-    /// first planned frame.
+    /// The plan-executing backend, the frame size it was opened for and the
+    /// choice that opened it (a demotion changes the choice, which reopens at
+    /// the next IDR). `None` until the first planned frame.
     direct: Option<OpenedBackend>,
-    /// The rate and GOP the encoder opens with, as the loop last set them.
-    rate: RateParams,
     /// The GPU outputs of the frame in flight, between `analyse` and `finish_*`.
     held: Option<FrameAnalysis>,
 }
@@ -465,22 +444,9 @@ impl GpuBackend {
     pub fn new(processor: GpuFrameProcessor) -> Self {
         Self {
             processor,
-            encoder: None,
             direct: None,
-            rate: RateParams::default(),
             held: None,
         }
-    }
-
-    /// Test seam: has the encoder been asked for a keyframe and not yet made one?
-    #[cfg(test)]
-    pub(crate) fn encoder_keyframe_pending(&self) -> Option<bool> {
-        self.encoder.as_ref().map(|e| e.keyframe_pending())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_encoder_for_test(&mut self, enc: FullFrameEncoder) {
-        self.encoder = Some(enc);
     }
 }
 
@@ -499,22 +465,6 @@ impl FrameBackend for GpuBackend {
         match control {
             Control::InvalidateBaseline(n) => self.processor.invalidate_baseline(n),
             Control::ForgetDamage => self.processor.forget_damage(),
-            Control::RequestKeyframe => {
-                if let Some(enc) = self.encoder.as_mut() {
-                    enc.request_keyframe();
-                }
-            }
-            Control::H264Rate { bps, fps, reopen } => {
-                self.rate = RateParams { bps, fps };
-                // The direct backend's rate is not set here: it travels with
-                // each plan (`finish_h264_planned`), the one writer, so the
-                // cap and VBV cannot disagree with the frame they apply to.
-                if reopen {
-                    // Dropped here, opened by the next `finish_h264` at the new
-                    // rate: a fresh encoder's first frame is an IDR.
-                    self.encoder = None;
-                }
-            }
         }
     }
 
@@ -574,54 +524,6 @@ impl FrameBackend for GpuBackend {
         Ok(out)
     }
 
-    fn finish_h264(&mut self, frame: &FrameSubmission, force_keyframe: bool) -> Option<H264Out> {
-        let analysis = self.held.take()?;
-        // One encoder session at a time: a stream that went back to the Phase A
-        // policy no longer holds the libva-direct one.
-        self.direct = None;
-        let needs_init = match &self.encoder {
-            Some(enc) => enc.width() != frame.width || enc.height() != frame.height,
-            None => true,
-        };
-        if needs_init {
-            match FullFrameEncoder::with_params(frame.width, frame.height, self.rate) {
-                Ok(enc) => self.encoder = Some(enc),
-                Err(e) => {
-                    tracing::warn!(target: LOG_TARGET, "Full-frame encoder init failed: {e}");
-                    return None;
-                }
-            }
-        }
-
-        // Re-entry into H264: force IDR for a fresh client anchor.
-        if force_keyframe {
-            if let Some(enc) = self.encoder.as_mut() {
-                enc.request_keyframe();
-            }
-        }
-
-        // Encode from the GPU-computed NV12 HOST_VISIBLE buffer.
-        let encoder = self.encoder.as_mut()?;
-        match encoder.encode_nv12_buffer(
-            analysis.nv12_data,
-            analysis.nv12_width,
-            analysis.nv12_height,
-            analysis.nv12_y_stride,
-            analysis.nv12_uv_stride,
-            analysis.nv12_uv_offset,
-        ) {
-            Ok(Some(enc)) => Some(H264Out {
-                payload: enc.payload,
-                is_keyframe: enc.is_keyframe,
-            }),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(target: LOG_TARGET, "NV12 encode failed: {e}");
-                None
-            }
-        }
-    }
-
     fn finish_h264_planned(&mut self, frame: &FrameSubmission, req: &H264Request) -> H264Reply {
         // The tests of this binary share one GPU: the lock is reentrant on this
         // (the worker) thread, and no test thread may hold it while waiting for
@@ -631,8 +533,6 @@ impl FrameBackend for GpuBackend {
         let Some(analysis) = self.held.take() else {
             return H264Reply::Nothing;
         };
-        // And never two encoder sessions: the Phase A encoder is closed.
-        self.encoder = None;
         let dims = (analysis.nv12_width, analysis.nv12_height);
         if self
             .direct
@@ -665,7 +565,7 @@ impl FrameBackend for GpuBackend {
         let _ = frame;
         // SAFETY: the pointer and strides are the GPU stage's, valid until the
         // next `analyse`, which cannot run before this call returns; the span
-        // is the same one `FullFrameEncoder::encode_nv12_buffer` reads.
+        // is the Y plane's rows plus the UV plane's.
         let data = unsafe {
             std::slice::from_raw_parts(
                 analysis.nv12_data,
