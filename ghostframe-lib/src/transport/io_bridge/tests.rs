@@ -6697,8 +6697,8 @@ async fn ungated_accepts_at_or_above_the_depth_target_are_counted() {
 }
 
 /// A tile parity datagram is tagged with its group on the way into the
-/// departure tracker, so the ledger learns when it left; H.264 frame parity,
-/// which travels under the same wire class, is not. (The full chain through a
+/// departure tracker, so the ledger learns when it left; a datagram of the same
+/// wire class with no group is not. (The full chain through a
 /// live quinn connection is covered by the browserless `FECORACLE` report; the
 /// lib has no in-process connection fixture.)
 #[tokio::test(start_paused = true)]
@@ -6719,7 +6719,7 @@ async fn only_tile_parity_reaches_the_departure_tracker_tagged() {
         cum_enqueued: cum,
         queued: cum,
     };
-    // A 4K keyframe's H.264 parity: many datagrams, no group.
+    // Many datagrams of the class with no group.
     for i in 0..88u64 {
         bridge.note_enqueued(h, e(102 * (i + 1), None));
     }
@@ -6730,7 +6730,7 @@ async fn only_tile_parity_reaches_the_departure_tracker_tagged() {
     assert_eq!(
         bridge.departures.take_departed_parity(),
         vec![4_000],
-        "the tile group, and none of the 88 H.264 parity datagrams"
+        "the tile group, and none of the 88 untagged datagrams"
     );
 }
 

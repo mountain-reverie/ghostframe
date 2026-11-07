@@ -78,7 +78,7 @@ pub enum FragSel {
 /// order they reach the plan, zero-based. With `FragSel::Index(k)` that is
 /// the k-th fragment's first transmission, its resend, and so on; with
 /// `FragSel::All` it runs over the fragments in turn, so `vec![0, 1, 2]` drops
-/// the frame's first three fragments. XOR parity (`frag_idx >= frag_total`)
+/// the frame's first three fragments. a malformed index (`frag_idx >= frag_total`)
 /// never matches: the rule is for the datagrams the ledger tracks.
 #[derive(Debug, Clone)]
 pub struct FrameDropRule {

@@ -56,9 +56,8 @@ impl IoBridge {
                         WireClass::Refinement => AdmitClass::Refinement,
                         // First sends and the scheduler's own retry are the
                         // scheduler's critical tier as far as the bucket is
-                        // concerned, and so are the H.264 fragments (frame
-                        // XOR parity comes as `Parity`); control datagrams
-                        // never come through the emitter.
+                        // concerned, and so are the H.264 fragments; control
+                        // datagrams never come through the emitter.
                         WireClass::Critical
                         | WireClass::SchedulerRetry
                         | WireClass::H264
@@ -124,7 +123,7 @@ impl IoBridge {
     ///   (`h264_refs_oversize`): a recovery from its anchor, or, for the IDR in
     ///   flight, the IDR sent again at the new size;
     /// - probe padding: owes the client nothing, dropped;
-    /// - XOR parity: its sources are the same size, so they are retired too.
+    /// - tile parity: its sources are the same size, so they are retired too.
     fn retire_oversize(
         &mut self,
         emission: &crate::transport::reliable_emitter::emission_queue::Emission,
@@ -195,9 +194,6 @@ impl IoBridge {
             return None;
         }
         let h = FrameHeader::decode(bytes).ok()?;
-        if h.is_parity() {
-            return None;
-        }
         if h.flags & FRAME_FLAG_PAD != 0 {
             return Some(Content::Pad(h.wire_seq));
         }

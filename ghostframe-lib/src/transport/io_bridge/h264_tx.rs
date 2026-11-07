@@ -165,7 +165,7 @@ pub struct H264Stats {
     /// Queued datagrams retired because they no longer fit the connection's
     /// datagram size (it fell after they were built), by what they carried:
     /// a tile pass, an H.264 fragment, probe padding, or something the ledger
-    /// does not track (XOR parity). None of them reached quinn.
+    /// does not track (tile XOR parity). None of them reached quinn.
     pub oversize_tile: u64,
     pub oversize_h264: u64,
     pub oversize_pad: u64,
@@ -1389,8 +1389,7 @@ mod tests {
         b.forced_datagram_limit_for_test = Some(1);
         b.drain_reliable_emitter(now_std());
 
-        // Every fragment is recognised by its header (frame XOR parity has no
-        // content to recover and stays "untracked").
+        // Every fragment is recognised by its header, not counted as untracked.
         assert_eq!(b.h264.stats.oversize_h264, wss.len() as u64);
         assert_eq!(b.h264.stats.tx_forgotten, 0);
         assert!(b.reliable_emitter.h264.get(1, 0).is_none());
