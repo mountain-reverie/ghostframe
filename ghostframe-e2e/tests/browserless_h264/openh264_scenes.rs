@@ -27,7 +27,7 @@
 use super::refs_scenes::{run_on, DropRun, RTT_US, SECS, SEEDS, VERDICT_US};
 use super::*;
 use ghostframe_e2e::harness::h264_scene::{pcm_load, H264Outcome, Pattern, FREEZE_GAP_FRAMES};
-use ghostframe_lib::encoder::h264_harness::{openh264_library, PcmMode};
+use ghostframe_lib::encoder::h264_harness::{openh264_library, openh264_rate_refusals, PcmMode};
 
 fn oh(scene_change_every: u32) -> H264Load {
     oh_canvas(scene_change_every, 0, 0)
@@ -701,6 +701,90 @@ async fn openh264_scene_6_the_library_follows_the_estimate_down() {
             latency <= 600_000 + 1_000_000,
             "{ctx}: a frame took {latency} us to be shown"
         );
+    }
+}
+
+/// The link of scene 6b before and after its rise (bytes a second): 0.8 and
+/// 3 Mbit/s.
+const SCENE6B_LINK: [(u64, u64); 2] = [(0, 100_000), (5_000_000, 375_000)];
+
+/// Scene 6b, the rise: the link rises from 0.8 to 3 Mbit/s at 5 s and the
+/// estimate follows it. The library must accept the new rate (openh264 2.4.x
+/// refused every rise: its layer maximum, set after the target, was still the
+/// opening rate) and the stream must carry more: the coded bytes of the
+/// seconds after the rise settle are at least 2 x those before the rise (the
+/// estimate rose about 3 x; the content wants about 1.3 Mbit/s, which caps the
+/// stream well under the rate told).
+///
+/// Premises: the estimate rose to at least 1.5 x its level in the 1.5 s
+/// before the rise, the policy
+/// moved the rate up in place (`rate_applies_up`), a rate was told, the
+/// content wanted more than the stream carried before the rise.
+#[tokio::test(start_paused = true)]
+async fn openh264_scene_6b_the_library_follows_the_estimate_up() {
+    let rise_at = SCENE6B_LINK[1].0;
+    for seed in SEEDS {
+        require_lib();
+        let refused_before = openh264_rate_refusals();
+        let run = DropRun::with_jitter(seed, &SCENE6B_LINK, 16, 2_000, |l| {
+            *l = oh_canvas(0, CHURN, 0)
+        })
+        .await;
+        let o = run.r.h264_run().expect("an H.264 scene").analyse();
+        let ctx = format!("oh-caprise {seed:#x}");
+        let refs = &run.r.h264.refs;
+        let before = run
+            .r
+            .bwe_estimate_samples
+            .iter()
+            .filter(|(t, _)| (rise_at - 1_500_000..rise_at).contains(t))
+            .map(|x| x.1)
+            .max()
+            .unwrap_or(0);
+        let after = run
+            .r
+            .bwe_estimate_samples
+            .iter()
+            .filter(|(t, _)| *t >= rise_at)
+            .map(|x| x.1)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            before > 0 && after * 2 >= before * 3,
+            "{ctx}: premise: the estimate rose by 1.5 x: {before} -> {after}"
+        );
+        let told = run.r.h264.stats.rate_target_bps;
+        assert!(told > 0, "{ctx}: premise: a rate was told");
+        // The library takes every rate it is told, the rises included (a
+        // refused rise is retried at the next frame, so the bytes alone
+        // would hide it).
+        assert_eq!(
+            openh264_rate_refusals() - refused_before,
+            0,
+            "{ctx}: openh264 refused a rate change"
+        );
+        assert!(refs.rate_applies_up >= 1, "{ctx}: premise: {refs:?}");
+        // Coded bits a second, the stream at the rate in force.
+        let mean_bps = |from: u64, to: u64| {
+            let n = (to - from) / 100_000;
+            (0..n)
+                .map(|k| run.bytes_in(from + 100_000 * k))
+                .sum::<usize>() as f64
+                * 8.0
+                / n as f64
+        };
+        let low = mean_bps(2_000_000, rise_at);
+        let high = mean_bps(rise_at + 5_000_000, 15_000_000);
+        println!(
+            "{ctx}: est {before} -> {after}; told {told}; coded {low:.0} -> {high:.0} bit/s; \
+             applies up {} down {}",
+            refs.rate_applies_up, refs.rate_applies_down,
+        );
+        assert!(
+            high >= 2.0 * low,
+            "{ctx}: the stream did not follow the rise up: {low:.0} -> {high:.0} bit/s"
+        );
+        assert_sound(&ctx, 16, &run.r, &o, MAX_ERR_STARVED);
     }
 }
 

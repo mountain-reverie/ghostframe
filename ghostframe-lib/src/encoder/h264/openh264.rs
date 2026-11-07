@@ -21,6 +21,7 @@
 
 use std::ffi::c_int;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::backend::{
     AuMeta, BackendCaps, BackendError, BackendFeedback, EncodedAu, H264Backend, Nv12View,
@@ -69,6 +70,16 @@ const MIN_QP: c_int = 20;
 /// `openh264_timing_probe` test.
 const COMPLEXITY: c_int = LOW_COMPLEXITY;
 
+/// Rate changes openh264 refused, process-wide, for the `h264 stats` line
+/// (`openh264_rate_refused`): a stream that cannot change its rate is
+/// otherwise silent apart from one warning per attempt.
+static RATE_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// See [`RATE_REFUSED`].
+pub(crate) fn rate_refusals() -> u64 {
+    RATE_REFUSED.load(Ordering::Relaxed)
+}
+
 /// What the backend counted, for tests.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +88,8 @@ pub(crate) struct Openh264Stats {
     pub idr_forced: u64,
     /// `SetOption(BITRATE)` calls made (each with a `MAX_BITRATE` twin).
     pub rate_sets: u64,
+    /// Rate changes the library refused (either option).
+    pub rate_refused: u64,
     pub feedback_applied: u64,
     pub feedback_rejected: u64,
 }
@@ -220,7 +233,17 @@ impl OpenH264Backend {
         // The one spatial layer, by index: with `SPATIAL_LAYER_ALL` a raise
         // above the opening maximum is refused (the maximum is raised, the
         // target then is not).
-        let order = [ENCODER_OPTION_BITRATE, ENCODER_OPTION_MAX_BITRATE];
+        //
+        // The library checks the layer's maximum against its target on every
+        // `BITRATE` set (2.4.x: "MaxSpatialBitrate should be larger than
+        // SpatialBitrate", error), so the order matters: on a rise the
+        // maximum goes first, on a fall the target does. The other way round
+        // every rise is refused and the stream never leaves its opening rate.
+        let order = if bps > s.rate_bps {
+            [ENCODER_OPTION_MAX_BITRATE, ENCODER_OPTION_BITRATE]
+        } else {
+            [ENCODER_OPTION_BITRATE, ENCODER_OPTION_MAX_BITRATE]
+        };
         let mut rcs = [0; 2];
         for (rc, option) in rcs.iter_mut().zip(order) {
             *rc = s.enc.set_option(
@@ -232,6 +255,8 @@ impl OpenH264Backend {
             );
         }
         if rcs != [0, 0] {
+            RATE_REFUSED.fetch_add(1, Ordering::Relaxed);
+            s.stats.rate_refused += 1;
             tracing::warn!(target: LOG_TARGET, ?rcs, bps, "openh264 refused a rate change");
             return;
         }
