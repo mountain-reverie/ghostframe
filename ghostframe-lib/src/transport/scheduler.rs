@@ -158,6 +158,10 @@ pub struct Scheduler {
     /// (`drain_refinement_pass_major`) is a walk over buckets rather than a
     /// repeated `min()` over the whole queue.
     refinement_order: [VecDeque<Handle>; PASS_SLOTS],
+    /// Per bucket, the tile (row-major key) the drain last sent from it.
+    /// The next drain starts after it when the bucket has been refilled from
+    /// the top; see `rotate_past_cursor`.
+    refinement_cursor: [Option<(u8, u8)>; PASS_SLOTS],
     /// Items in `work` whose state is `Pending`, in either queue. Maintained
     /// at every transition into and out of `Pending` so that
     /// `has_pending_work` is O(1); `pending_items_recomputed` is the scan it
@@ -227,6 +231,7 @@ impl Scheduler {
             work: Slab::new(),
             priority_order: VecDeque::new(),
             refinement_order: std::array::from_fn(|_| VecDeque::new()),
+            refinement_cursor: [None; PASS_SLOTS],
             pending_items: 0,
             refinement_deficit: RefinementDeficit::new(cols, rows),
             retry_after: Duration::from_millis(40),
@@ -255,6 +260,7 @@ impl Scheduler {
         for q in self.refinement_order.iter_mut() {
             q.clear();
         }
+        self.refinement_cursor = [None; PASS_SLOTS];
         self.refinement_deficit.reset(cols, rows);
         self.slots.resize(cols, rows);
     }
@@ -270,6 +276,7 @@ impl Scheduler {
         for q in self.refinement_order.iter_mut() {
             q.clear();
         }
+        self.refinement_cursor = [None; PASS_SLOTS];
         self.refinement_deficit.reset(self.cols, self.rows);
         // Only queued handles are dropped; generations and ACK state are
         // kept for the same reason they always were — a late ACK on a
@@ -919,6 +926,7 @@ impl Scheduler {
             &mut self.work,
             &mut self.refinement_order,
             &mut self.refinement_deficit,
+            &mut self.refinement_cursor,
             refinement_budget,
             now,
             self.item_overhead,
@@ -999,14 +1007,50 @@ impl Scheduler {
         }
     }
 
+    /// Start a bucket after the tile the last drain stopped at.
+    ///
+    /// A screen that changes faster than the link can carry it supersedes
+    /// every queued pass and enqueues the whole screen again, in the same
+    /// tile order, behind nothing. A drain that always starts at the front
+    /// then spends its budget on the first few hundred tiles of that order,
+    /// every change, and the rest of the screen never receives a byte.
+    ///
+    /// The tile the last drain sent from this bucket is gone from it (a sent
+    /// pass leaves the queue) unless the screen changed and queued it again.
+    /// If it is queued again, the bucket was refilled from the top: rotate it
+    /// so the tile after that one leads, and the sweep carries on where it
+    /// stopped. If it is not there, the bucket is a continuation (or the
+    /// tile did not change) and is left alone.
+    ///
+    /// Positions come from the queue's own order, not from coordinates, so
+    /// this holds for whatever order the enqueuer walks the screen in.
+    fn rotate_past_cursor(
+        work: &Slab<TileWork>,
+        bucket: &mut VecDeque<Handle>,
+        cursor: Option<(u8, u8)>,
+    ) {
+        let Some((cx, cy)) = cursor else { return };
+        let at = bucket.iter().position(|h| {
+            work.get(*h)
+                .is_some_and(|w| w.tile_x == cx && w.tile_y == cy)
+        });
+        if let Some(i) = at {
+            bucket.rotate_left(i + 1);
+        }
+    }
+
     /// Drain refinement work in pass-major order: every tile's pass 0 before
     /// any tile's pass 1. `refinement_order` is already bucketed by
     /// `pass_idx`, so this is a walk over the buckets in order rather than a
     /// repeated `min()` scan over a flat queue.
+    // The drain's state arrives as separate borrows of `Scheduler`'s fields;
+    // a bundling struct would be used once.
+    #[allow(clippy::too_many_arguments)]
     fn drain_refinement_pass_major(
         work: &mut Slab<TileWork>,
         order: &mut [VecDeque<Handle>; PASS_SLOTS],
         deficit: &mut RefinementDeficit,
+        cursor: &mut [Option<(u8, u8)>; PASS_SLOTS],
         budget: usize,
         now: Instant,
         item_overhead: usize,
@@ -1036,7 +1080,8 @@ impl Scheduler {
         }
 
         let mut spent = 0usize;
-        for bucket in order.iter_mut() {
+        for (bucket, cursor) in order.iter_mut().zip(cursor.iter_mut()) {
+            Self::rotate_past_cursor(work, bucket, *cursor);
             while let Some(&h) = bucket.front() {
                 let cost = match work.get(h) {
                     Some(w) => w.payload.len() + item_overhead,
@@ -1063,6 +1108,7 @@ impl Scheduler {
                     w.last_sent_at = Some(now);
                     w.state = WorkState::InFlight;
                     spent += cost;
+                    *cursor = Some((w.tile_x, w.tile_y));
                     out.push(w);
                 }
             }
@@ -2339,6 +2385,87 @@ mod tests {
             s.record_cdf53_ack(0, 0, 1, p);
         }
         assert_eq!(s.cdf53_unacked_pass_mask(0, 0, 2, 0x3FFF), 0x3FFF);
+    }
+
+    /// Enqueue pass 0 of every tile of a `cols x rows` screen at `gen`, in
+    /// row-major order: what a full-screen change hands the scheduler.
+    fn enqueue_whole_screen(s: &mut Scheduler, cols: u8, rows: u8, gen: u8) {
+        for y in 0..rows {
+            for x in 0..cols {
+                s.enqueue_refinement(x, y, gen, vec![vec![0u8; 100]]);
+            }
+        }
+    }
+
+    /// The same screen walked column by column, as the browserless harness
+    /// does: the rotation must not depend on the walk being row-major.
+    fn enqueue_whole_screen_by_column(s: &mut Scheduler, cols: u8, rows: u8, gen: u8) {
+        for x in 0..cols {
+            for y in 0..rows {
+                s.enqueue_refinement(x, y, gen, vec![vec![0u8; 100]]);
+            }
+        }
+    }
+
+    /// A screen that changes faster than the link carries it supersedes every
+    /// queued pass and enqueues the lot again. Each tick affords ten tiles of
+    /// 64: if the drain restarts at the front every time, tiles 10..63 never
+    /// receive a pass. The property is reach, not order: every tile gets one.
+    #[test]
+    fn sustained_supersede_still_reaches_every_tile() {
+        for by_column in [false, true] {
+            let mut s = Scheduler::new(8, 8);
+            let mut reached = std::collections::HashSet::new();
+            for round in 0..16u8 {
+                if by_column {
+                    enqueue_whole_screen_by_column(&mut s, 8, 8, round);
+                } else {
+                    enqueue_whole_screen(&mut s, 8, 8, round);
+                }
+                for w in s.tick(10 * 100) {
+                    reached.insert((w.tile_x, w.tile_y));
+                }
+            }
+            assert_eq!(
+                reached.len(),
+                64,
+                "by_column={by_column}: only {} of 64 tiles ever received a pass \
+                 under sustained supersede",
+                reached.len()
+            );
+        }
+    }
+
+    /// The rotation must not disturb a drain that is simply working through
+    /// a queue: with no supersede, every tile is sent exactly once, in order.
+    #[test]
+    fn a_partly_drained_bucket_is_not_rotated() {
+        let mut s = Scheduler::new(8, 8);
+        enqueue_whole_screen(&mut s, 8, 8, 0);
+        let mut order = Vec::new();
+        for _ in 0..10 {
+            for w in s.tick(10 * 100) {
+                order.push((w.tile_y, w.tile_x));
+            }
+        }
+        let mut sorted = order.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(order.len(), 64, "each tile exactly once");
+        assert_eq!(order, sorted, "in the order they were queued");
+    }
+
+    /// Cursor past the last tile: the sweep wraps and the next one starts at
+    /// the top, not nowhere.
+    #[test]
+    fn the_sweep_wraps_after_the_last_tile() {
+        let mut s = Scheduler::new(4, 4);
+        enqueue_whole_screen(&mut s, 4, 4, 0);
+        assert_eq!(s.tick(usize::MAX).len(), 16);
+        enqueue_whole_screen(&mut s, 4, 4, 1);
+        let first = s.tick(100);
+        assert_eq!(first.len(), 1);
+        assert_eq!((first[0].tile_y, first[0].tile_x), (0, 0));
     }
 
     #[test]
