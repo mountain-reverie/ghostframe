@@ -222,19 +222,35 @@ With the loop reading the network, that scene reaches its real assertion:
     tiles=786 complete=0 partial=786 gave_up=550 pass-hist{1:786}
 
 It cannot pass -- the screen changes four times a second and each change is
-ten seconds of link -- but two things in how it fails are worth fixing and
-are **not** fixed here:
+ten seconds of link. Two things in how it failed were worth fixing; they
+were re-measured on 2026-11-07 in the browserless harness
+(`browserless_overload`: 60x34 tiles, every tile changing 4 Hz, 1 % loss).
 
-- **The scheduler's budget is per frame, not per unit of time.** One 33 ms
-  slice of the estimate is granted per frame processed. At 550 ms per frame
-  that is 6% of the link. `base_budget_bytes` records that elapsed-time
-  billing was tried and "changed nothing", which was true while a 256 KiB
-  floor dominated the expression; the floor has since been reduced to one
-  datagram, so that measurement no longer holds and wants repeating.
-- **Pass-major drain restarts at the same tile after every supersede.**
-  Under sustained overload the first ~790 tiles in drain order receive pass
-  0 every frame and the remaining ~1250 receive nothing at all, ever. A
-  rotating start would spread the same bytes over the whole screen.
+- **The scheduler's budget was said to be per frame, not per unit of time.
+  No longer true.** Admission is a token bucket refilled by elapsed time
+  (`transport::admission`, `pump_admission`), run after every drain and on a
+  timer wake, with the floor at one datagram. `base_budget_bytes` no longer
+  exists. Over a 20 s run at 2 Mbit the server offered **105 to 107 %** of
+  what the bandwidth estimate allowed in that time (seeds E4_0001..3; the
+  excess is the payload fraction and retransmissions). Nothing to change;
+  `browserless_overload` pins the share at 80 % or more.
+- **Pass-major drain restarted at the same tile after every supersede.
+  True, and fixed.** A change supersedes every queued pass and enqueues the
+  whole screen again in the same order, so each drain spent its budget on
+  the head of that order. Measured as distinct tiles that ever received a
+  pass 0 over 20 s, of 2040:
+
+  | link | before (3 seeds) | after (3 seeds) |
+  |---|---|---|
+  | 2 Mbit | 857, 858, 857 | 2040, 2040, 2040 |
+  | 1 Mbit | 736, 736, 736 | 2040, 2040, 2040 |
+
+  (At 8 Mbit pass 0 of the whole screen fits between changes, and both
+  versions reach 2040: the starvation needs a link slower than pass 0 of a
+  screen per change.) The scheduler now remembers, per pass bucket, the tile
+  it last sent, and when that tile is queued again starts the bucket after
+  it (`Scheduler::rotate_past_cursor`). The order of the queue is the
+  enqueuer's; the rotation does not assume rows or columns.
 
 Still open from the converge scene: the client's tail sweep requests every
 missing pass of every stalled tile, including passes the server has not yet

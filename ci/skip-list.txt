@@ -134,11 +134,13 @@ e2e_input_forwarding_firefox
 # and the server read no acknowledgements at all. That was a defect, is
 # fixed, and is pinned by `inbound_is_read_before_a_waiting_frame`.
 #
-# What it shows now is the next limit, and that one is real and open: the
-# scheduler is ticked once per frame with a 33 ms budget, so at 550 ms per
-# frame it offers ~6% of the estimate, and the estimate itself sits at its
-# one-datagram floor. Only the first ~790 tiles in drain order ever receive
-# a pass. See docs/specs/retransmit-storm-root-cause.md, "What the overload
-# scene shows now".
+# What it shows now is the same unreachable premise, with both of the
+# defects it once exposed gone: admission is billed by elapsed time (the
+# server offers 105-107% of the estimate, `browserless_overload`), and the
+# pass-major drain rotates past the tile it last sent, so a screen that
+# changes faster than the link spreads the bytes over every tile instead of
+# the first ~790 in drain order (`sustained_supersede_still_reaches_every_tile`).
+# See docs/specs/retransmit-storm-root-cause.md, "What the overload scene
+# shows now".
 e2e_saturated_link_starves_tiles_into_giving_up
 

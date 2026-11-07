@@ -137,6 +137,7 @@ jobs:
       - run: cargo test --test browserless_bwe_capacity -- --test-threads=1
       - run: cargo test --test browserless_determinism -- --test-threads=1
       - run: cargo test --test browserless_queue_latency -- --test-threads=1
+      - run: cargo test --test browserless_overload -- --test-threads=1
       - run: cargo test --test browserless_blocked_path -- --test-threads=1
       - run: cargo test --test browserless_loop_stall -- --test-threads=1
       # H.264 in the transport (design PR A3): ledger accounting, lost-IDR
