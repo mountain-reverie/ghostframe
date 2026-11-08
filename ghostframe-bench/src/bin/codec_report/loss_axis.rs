@@ -3,7 +3,7 @@
 //! Default scene is the existing mode_switch alternating cycle at a
 //! comfortable bandwidth point — the classifier has clear flips to
 //! make, and the loss axis varies how often loss_override fires vs
-//! cost_comparison.
+//! the bandwidth rule.
 
 pub struct LossPoint {
     pub label: &'static str,
@@ -37,7 +37,7 @@ pub const LOSS_VALUES: &[LossPoint] = &[
     },
 ];
 
-/// 12-second halves match the bias_sweep default for consistency. The
+/// 12-second halves match the headroom_sweep default for consistency. The
 /// loss axis doesn't strictly need refinement convergence to fire (the
 /// loss_override path triggers independently), but longer scenes give
 /// more opportunities for the smoothed loss_rate to cross the threshold

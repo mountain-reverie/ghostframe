@@ -379,8 +379,7 @@ impl Scheduler {
 
     /// Count of unique (tile_x, tile_y) coordinates with outstanding
     /// refinement work -- tiles that have an entry in `refinement_order`.
-    /// Consumed by M3.6b's classifier refinement-deficit bias (see
-    /// `tile/classifier.rs::REFINEMENT_BIAS_PER_TILE_US`). O(1): kept
+    /// Logged per frame (the classifier no longer reads it). O(1): kept
     /// incrementally (see `RefinementDeficit`); this runs once per frame.
     pub fn refinement_deficit_tiles(&self) -> u32 {
         self.refinement_deficit.tiles

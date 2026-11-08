@@ -1278,6 +1278,7 @@ fn guard_release(st: &StepRun) -> (bool, Option<u64>) {
             loss_rate: 0.0,
             suspended: false,
             last_update_seq: 1,
+            estimate_known: true,
             ..Default::default()
         });
         let was_h264 = mode == FrameMode::H264;
