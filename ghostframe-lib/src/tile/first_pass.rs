@@ -41,25 +41,33 @@ impl FirstPassKind {
 /// Starting per-tile sizes (Solid, PalRle, Cdf53), bytes: the old
 /// `CostModel::estimated_tile_bytes`. Calibration replaces them.
 pub(crate) const PRIOR_BYTES: [f64; 3] = [4.0, 200.0, 1300.0];
-/// EWMA weight of one observed emission batch.
+/// EWMA weight of one calibration chunk.
 pub(crate) const CALIBRATION_WEIGHT: f64 = 1.0 / 16.0;
+/// A chunk this many pass-0 tiles big is one calibration sample, so bytes of
+/// later passes that arrive without their tile are averaged in, not divided
+/// by a decaying count.
+pub(crate) const CALIBRATION_CHUNK_TILES: u32 = 16;
 
 /// Per-kind first-pass bytes per tile, calibrated from what tile mode sends.
 ///
-/// Two averages per kind, of bytes and of new tiles per batch; their ratio is
-/// bytes per tile even when a tile's critical passes straddle batches. Both
-/// start at (prior, 1), so the prior holds until data arrives.
+/// Emission batches accumulate into a pending chunk per kind. When a chunk
+/// holds [`CALIBRATION_CHUNK_TILES`] pass-0 tiles, its bytes divided by its
+/// tiles is one EWMA sample of `per_tile`. A run of batches with bytes but no
+/// new tile therefore only grows the pending chunk; it never shrinks the
+/// price. Every kind starts at its prior.
 #[derive(Debug, Clone, Copy)]
 pub struct FirstPassModel {
-    bytes: [f64; 3],
-    tiles: [f64; 3],
+    per_tile: [f64; 3],
+    pending_bytes: [u64; 3],
+    pending_tiles: [u32; 3],
 }
 
 impl Default for FirstPassModel {
     fn default() -> Self {
         Self {
-            bytes: PRIOR_BYTES,
-            tiles: [1.0; 3],
+            per_tile: PRIOR_BYTES,
+            pending_bytes: [0; 3],
+            pending_tiles: [0; 3],
         }
     }
 }
@@ -71,22 +79,21 @@ impl FirstPassModel {
     }
 
     fn tile_bytes(&self, kind: FirstPassKind) -> f64 {
-        let i = kind.index();
-        if self.tiles[i] < 1e-6 {
-            return PRIOR_BYTES[i];
-        }
-        self.bytes[i] / self.tiles[i]
+        self.per_tile[kind.index()]
     }
 
     /// One emission batch's first-pass wire bytes of `kind` (no
     /// retransmissions) and how many of them were a tile's pass 0.
     pub fn observe(&mut self, kind: FirstPassKind, bytes: u64, tiles: u32) {
-        if bytes == 0 && tiles == 0 {
-            return;
-        }
         let i = kind.index();
-        self.bytes[i] += CALIBRATION_WEIGHT * (bytes as f64 - self.bytes[i]);
-        self.tiles[i] += CALIBRATION_WEIGHT * (f64::from(tiles) - self.tiles[i]);
+        self.pending_bytes[i] += bytes;
+        self.pending_tiles[i] += tiles;
+        if self.pending_tiles[i] >= CALIBRATION_CHUNK_TILES {
+            let sample = self.pending_bytes[i] as f64 / f64::from(self.pending_tiles[i]);
+            self.per_tile[i] += CALIBRATION_WEIGHT * (sample - self.per_tile[i]);
+            self.pending_bytes[i] = 0;
+            self.pending_tiles[i] = 0;
+        }
     }
 }
 
