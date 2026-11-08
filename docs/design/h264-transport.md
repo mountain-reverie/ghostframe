@@ -26,7 +26,9 @@ order:
 | `headroom_guard` | bandwidth estimate too low for the tile codec: force H.264 |
 | `loss_override` | loss rate above 10 %: force H.264. **Off by default**; `GHOSTFRAME_LOSS_OVERRIDE=1` enables it, `GHOSTFRAME_LOSS_OVERRIDE_THRESHOLD` moves the line. One lost fragment kills a whole H.264 frame, so "H.264 rides through loss" no longer holds |
 | `suspension` | WiFi suspension detected: force H.264 |
-| `cost_comparison` | per-frame cost model with enter/exit hysteresis |
+| `bandwidth_short` | the tile codec's first-pass demand stayed above 0.70 x the bandwidth estimate for 500 ms: enter H.264 |
+| `bandwidth_fits` | first-pass demand below 0.40 x the estimate for 1 s, and the exit repaint drains within 1 s: leave H.264 |
+| `estimate_unknown` | the estimate has not moved since the session reset: hold the mode |
 | `hysteresis_clamp` | the cost model wants to switch but the dwell has not elapsed: keep the previous mode |
 
 The frame mode only switches the codec. Both modes share one transmission
@@ -572,7 +574,8 @@ Environment variables (the classifier ones also accept their older
 | `GHOSTFRAME_LOSS_OVERRIDE_THRESHOLD` | loss rate that triggers it | 0.10 |
 | `GHOSTFRAME_HEADROOM_MIN_BPUS` | headroom guard enter threshold | 0.25 (2 Mbit/s) |
 | `GHOSTFRAME_FORCE_FRAME_MODE` | pin the frame mode (tests) | unset |
-| `GHOSTFRAME_COST_H264_FRAME_US`, `GHOSTFRAME_COST_H264_FRAME_BYTES` | classifier cost model | compiled in |
+| `GHOSTFRAME_MODE_ENTER_SHARE`, `GHOSTFRAME_MODE_EXIT_SHARE` | classifier: H.264 when the tile codec's first pass stays above the enter share of the estimate (0.70), back when below the exit share (0.40) | compiled in |
+| `GHOSTFRAME_COST_SOLID_US`, `_PALRLE_US`, `_CDF53_US`, `_H264_FRAME_US`, `_H264_FRAME_BYTES`, `_BYTES_PER_US`, `GHOSTFRAME_REFINEMENT_BIAS_US` (and its `GHOSTFRAME_TEST_` alias) | removed: warned once and ignored | none |
 | `GHOSTFRAME_RTO_PROBE=1` | one line per loss-path retransmission and verdict | off |
 
 ## 9. Known limitations
