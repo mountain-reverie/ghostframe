@@ -294,6 +294,15 @@ dead**: `rx{...}` and `cdf53-coverage` read `window.__tileCounts` /
 they always read zero. `fec-coverage` says `n/a(wasm-internal)` explicitly.
 `Δdrain` and `nack_sent` are live. Do not diagnose from the dead ones.
 
+The frame mode follows the bandwidth estimate: `mode.decision` reasons
+`bandwidth_short` (the tile codec's first pass stayed above 0.70 x the
+estimate for 500 ms) and `bandwidth_fits` (below 0.40 x for 1 s, with the
+exit repaint drainable in 1 s). Until the estimate has moved since the
+session reset the reason is `estimate_unknown` and the session stays in
+H.264. `first_pass_demand_bps` on the same line is the demand it compared.
+`GHOSTFRAME_MODE_ENTER_SHARE` and `GHOSTFRAME_MODE_EXIT_SHARE` move the two
+shares (values in (0, 1]; the exit must be below the enter, or both are ignored).
+
 ## Diagnostic probes
 
 Env-gated, off by default:
