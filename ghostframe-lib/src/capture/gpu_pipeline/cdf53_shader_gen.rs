@@ -44,7 +44,11 @@ fn gen_lift(n: usize) -> String {
         // Deinterleave: L0 L1 .. then H0 H1 ..
         for j in 0..n / 2 {
             s += &format!("    A[base + {}u] = v{};\n", j * stride, 2 * j);
-            s += &format!("    A[base + {}u] = v{};\n", (j + n / 2) * stride, 2 * j + 1);
+            s += &format!(
+                "    A[base + {}u] = v{};\n",
+                (j + n / 2) * stride,
+                2 * j + 1
+            );
         }
         s += "}\n";
     }
