@@ -42,24 +42,49 @@ fn passes_split_across_batches_still_average_per_tile() {
     // A tile's critical passes may go out in a later batch than its pass 0:
     // bytes with no new tile, then a tile with fewer bytes. The ratio of the
     // two averages is still bytes per tile.
+    // 2000 pairs = 125 chunks: enough for the prior's 300 B excess to decay
+    // below the tolerance.
     let mut m = FirstPassModel::default();
-    for _ in 0..400 {
+    for _ in 0..2000 {
         m.observe(FirstPassKind::Cdf53, 600, 1);
         m.observe(FirstPassKind::Cdf53, 400, 0);
     }
-    // An EWMA of an alternating input oscillates around its mean; ending on
-    // the low half leaves the ratio about 3 % high.
     let got = m.state_bytes(CDF53);
-    assert!((got - 1000.0).abs() < 50.0, "{got}");
+    assert!((got - 1000.0).abs() < 20.0, "{got}");
 }
 
 #[test]
-fn an_empty_observation_changes_nothing() {
+fn bytes_without_tiles_do_not_move_the_price_until_a_chunk_completes() {
     let mut m = FirstPassModel::default();
-    m.observe(FirstPassKind::PalRle, 0, 0);
-    assert_eq!(
-        m.state_bytes(CodecState::PalRle { palette_id: 0 }),
-        PRIOR_BYTES[1]
+    for _ in 0..100 {
+        m.observe(FirstPassKind::Cdf53, 1_000_000, 0);
+    }
+    assert_eq!(m.state_bytes(CDF53), PRIOR_BYTES[2]);
+    // The 100 MB pending chunk completes with 16 tiles: its sample is
+    // (100 * 1e6 + 8000) / 16 = 6_250_500 B/tile, moved in at 1/16.
+    m.observe(FirstPassKind::Cdf53, 16 * 500, 16);
+    let got = m.state_bytes(CDF53);
+    let expected = PRIOR_BYTES[2] + (6_250_500.0 - PRIOR_BYTES[2]) / 16.0;
+    assert!(got.is_finite());
+    assert!((got - expected).abs() < 1.0, "{got} vs {expected}");
+    assert!(got > 500.0);
+}
+
+#[test]
+fn a_run_of_refinement_only_batches_cannot_inflate_the_price() {
+    let mut m = FirstPassModel::default();
+    for _ in 0..200 {
+        m.observe(FirstPassKind::Cdf53, 40 * 500, 40);
+    }
+    assert!((m.state_bytes(CDF53) - 500.0).abs() < 5.0);
+    for _ in 0..50 {
+        m.observe(FirstPassKind::Cdf53, 500, 0);
+    }
+    m.observe(FirstPassKind::Cdf53, 40 * 500, 40);
+    assert!(
+        m.state_bytes(CDF53) < 1.5 * 500.0,
+        "{}",
+        m.state_bytes(CDF53)
     );
 }
 
