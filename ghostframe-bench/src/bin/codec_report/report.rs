@@ -73,7 +73,7 @@ pub fn write(
         f,
         "| Scene | egress Mbps | CPU mean % | CPU peak % | RSS max MB | VmHWM max MB |"
     )?;
-    writeln!(f, "|---|---:|---:|---:|---:|---:|---:|---:|")?;
+    writeln!(f, "|---|---:|---:|---:|---:|---:|")?;
     for (name, s) in &state.scenes {
         writeln!(
             f,
