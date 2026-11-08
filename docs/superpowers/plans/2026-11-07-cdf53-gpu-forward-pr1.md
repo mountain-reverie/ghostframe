@@ -42,6 +42,7 @@
   ```
   Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
   ```
+- **Formatting.** The plan's Rust is not guaranteed rustfmt-clean: run `cargo fmt --all` before every commit (CI's fmt job checks the tip).
 - **Safety.** Never kill processes. Stop if `df -h /home` > 88 % or `/tmp` > 85 %.
 - **What proves correctness.** A green GPU test only counts if it would have failed on broken code; Task 6 proves that for these gates. Treat `cargo clippy --workspace --all-targets -- -D warnings` as the compile gate, not the test summary (AGENTS.md).
 
