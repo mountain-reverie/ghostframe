@@ -201,7 +201,8 @@ containers-build:
     docker build -t ghostframe/test-server -f tests/containers/test-server/Dockerfile .
     docker build -t ghostframe/test-headscale -f tests/containers/headscale/Dockerfile tests/containers/headscale/
 
-# Regenerate cdf53_encode.comp's lifting block and compile its variants.
+# Regenerate cdf53_encode.comp's lifting block and compile it (today the
+# forward-only variant; the GPU encode variants come with that work).
 # The .spv files are checked in; the build never runs glslc. Run after any
 # edit to the shader or to gpu_pipeline/cdf53_shader_gen.rs.
 shaders-cdf53:
