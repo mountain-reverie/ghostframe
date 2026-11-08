@@ -38,15 +38,15 @@ pub struct SceneSummary {
     /// Count of `h264` ↔ `tile` mode flips in the server-telemetry timeline.
     pub mode_switch_count: u32,
     /// Count of mode.decision events per reason.
-    /// Keys: "cost_comparison", "headroom_guard", "loss_override",
-    /// "suspension", "hysteresis_clamp".
+    /// Keys: "bandwidth_short", "bandwidth_fits", "estimate_unknown",
+    /// "headroom_guard", "loss_override", "suspension", "hysteresis_clamp".
     pub mode_decision_counts: std::collections::BTreeMap<String, u32>,
 
     // M3.7a additions
     pub pixelperfect_count: u32,
     pub decode_error_count: u32,
     /// When this scene was part of a M3.7 sweep, the label of the swept
-    /// value (e.g. "bias_10us" or "loss_5pct"). None for non-sweep runs.
+    /// value (e.g. "loss_5pct"). None for non-sweep runs.
     pub sweep_axis_label: Option<String>,
 }
 

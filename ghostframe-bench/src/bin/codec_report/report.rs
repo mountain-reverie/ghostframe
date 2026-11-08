@@ -73,7 +73,7 @@ pub fn write(
         f,
         "| Scene | egress Mbps | CPU mean % | CPU peak % | RSS max MB | VmHWM max MB |"
     )?;
-    writeln!(f, "|---|---:|---:|---:|---:|---:|")?;
+    writeln!(f, "|---|---:|---:|---:|---:|---:|---:|---:|")?;
     for (name, s) in &state.scenes {
         writeln!(
             f,
@@ -312,7 +312,9 @@ pub fn write(
         writeln!(f, "| Reason | Count |")?;
         writeln!(f, "|---|---:|")?;
         for reason in &[
-            "cost_comparison",
+            "bandwidth_short",
+            "bandwidth_fits",
+            "estimate_unknown",
             "headroom_guard",
             "loss_override",
             "suspension",
@@ -337,15 +339,17 @@ pub fn write(
                 }
             }
         }
-        writeln!(f, "| Cap | cost_comparison | headroom_guard | loss_override | suspension | hysteresis_clamp |")?;
-        writeln!(f, "|---|---:|---:|---:|---:|---:|")?;
+        writeln!(f, "| Cap | bandwidth_short | bandwidth_fits | estimate_unknown | headroom_guard | loss_override | suspension | hysteresis_clamp |")?;
+        writeln!(f, "|---|---:|---:|---:|---:|---:|---:|---:|")?;
         for (bw, counts) in &by_bw {
             let g = |k: &str| counts.get(k).copied().unwrap_or(0);
             writeln!(
                 f,
-                "| {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} | {} |",
                 bw,
-                g("cost_comparison"),
+                g("bandwidth_short"),
+                g("bandwidth_fits"),
+                g("estimate_unknown"),
                 g("headroom_guard"),
                 g("loss_override"),
                 g("suspension"),
@@ -354,51 +358,6 @@ pub fn write(
         }
     }
     writeln!(f)?;
-
-    // ---- Section 11: M3.7a Bias sweep ----
-    {
-        let mut rows: Vec<(&String, &SceneSummary)> = state
-            .scenes
-            .iter()
-            .filter(|(_, s)| {
-                s.sweep_axis_label
-                    .as_deref()
-                    .map(|l| l.starts_with("bias_"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        rows.sort_by_key(|(name, _)| name.as_str());
-
-        if !rows.is_empty() {
-            writeln!(f, "## 11. Bias sweep (REFINEMENT_BIAS_PER_TILE_US) — M3.7a")?;
-            writeln!(f)?;
-            writeln!(
-                f,
-                "| Bias µs | PixelPerfect | Mode switches | Capture→paint p50 ms | Drop % |"
-            )?;
-            writeln!(f, "|---|---:|---:|---:|---:|")?;
-            for (_, s) in &rows {
-                let bias_label = s.sweep_axis_label.as_deref().unwrap_or("?");
-                let bias_us: f32 = bias_label
-                    .strip_prefix("bias_")
-                    .and_then(|s| s.strip_suffix("us"))
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(f32::NAN); // surfaces label-format drift in the report
-                writeln!(
-                    f,
-                    "| {:.1} | {} | {} | {:.2} | {:.1} |",
-                    bias_us,
-                    s.pixelperfect_count,
-                    s.mode_switch_count,
-                    s.client_interval_median_ms,
-                    s.drop_rate_percent,
-                )?;
-            }
-            writeln!(f)?;
-            writeln!(f, "_Verdict rule: pick the bias with highest PixelPerfect/switches ratio whose latency p50 isn't > 10% above the lowest-swept value._")?;
-            writeln!(f)?;
-        }
-    }
 
     // ---- Section 12: M3.7a Loss axis ----
     {
@@ -577,8 +536,11 @@ mod tests {
                         ..Default::default()
                     };
                     *s.mode_decision_counts
-                        .entry("cost_comparison".into())
+                        .entry("bandwidth_short".into())
                         .or_default() += 3;
+                    *s.mode_decision_counts
+                        .entry("bandwidth_fits".into())
+                        .or_default() += 2;
                     *s.mode_decision_counts
                         .entry("headroom_guard".into())
                         .or_default() += 1;
@@ -593,8 +555,14 @@ mod tests {
                 ..Default::default()
             };
             *s.mode_decision_counts
-                .entry("cost_comparison".into())
+                .entry("bandwidth_short".into())
                 .or_default() += 5;
+            *s.mode_decision_counts
+                .entry("bandwidth_fits".into())
+                .or_default() += 4;
+            *s.mode_decision_counts
+                .entry("estimate_unknown".into())
+                .or_default() += 1;
             state.scenes.insert("solid".into(), s);
         }
         state
@@ -622,10 +590,17 @@ mod tests {
         assert!(text.contains("| Reason | Count |"), "table 10 headers");
         // h264_dwell_us = 3_000_000 → 3.00 s
         assert!(text.contains("3.00"), "h264 dwell seconds present");
-        // cost_comparison count = 5
         assert!(
-            text.contains("| `cost_comparison` | 5 |"),
-            "cost_comparison count"
+            text.contains("| `bandwidth_short` | 5 |"),
+            "bandwidth_short count"
+        );
+        assert!(
+            text.contains("| `bandwidth_fits` | 4 |"),
+            "bandwidth_fits count"
+        );
+        assert!(
+            text.contains("| `estimate_unknown` | 1 |"),
+            "estimate_unknown count"
         );
     }
 
@@ -651,22 +626,21 @@ mod tests {
         // 10Mbps / solid has mode_switch_count=7 > 5 → [thrash]
         assert!(text.contains("[thrash]"), "[thrash] annotation present");
         // Table 10 matrix: bw rows
-        assert!(text.contains("cost_comparison"), "cost_comparison column");
+        assert!(text.contains("bandwidth_short"), "bandwidth_short column");
+        assert!(text.contains("bandwidth_fits"), "bandwidth_fits column");
+        assert!(text.contains("estimate_unknown"), "estimate_unknown column");
+        // 10Mbps: 2 scenes x 3 short, x 2 fits
+        assert!(
+            text.contains("| 10Mbps | 6 | 4 | 0 | 2 |"),
+            "matrix row counts"
+        );
     }
 
     #[test]
-    fn write_emits_sections_11_and_12_when_sweep_labels_present() {
+    fn write_emits_section_12_when_sweep_labels_present() {
         use std::collections::BTreeMap;
         let args = Cli::parse_from(["codec_report"]);
         let mut state = ReportState::new(&args);
-        // Inject one scene per sweep family.
-        let bias_summary = SceneSummary {
-            sweep_axis_label: Some("bias_10us".into()),
-            pixelperfect_count: 42,
-            mode_switch_count: 3,
-            ..Default::default()
-        };
-        state.scenes.insert("bias_10us/text".into(), bias_summary);
         let mut loss_summary = SceneSummary {
             sweep_axis_label: Some("loss_5pct".into()),
             decode_error_count: 7,
@@ -682,9 +656,7 @@ mod tests {
         let mut buf = Vec::new();
         write(&mut buf, &state, None).unwrap();
         let text = String::from_utf8(buf).unwrap();
-        assert!(text.contains("## 11. Bias sweep"), "section 11 header");
         assert!(text.contains("## 12. Loss axis"), "section 12 header");
-        assert!(text.contains("| 10.0 |"), "bias row formatted");
         assert!(text.contains("| 5 |"), "loss row formatted");
     }
 
@@ -698,7 +670,6 @@ mod tests {
             gpu_name: "test".into(),
             reuse_criterion_json: "/tmp/dummy.json".into(),
             bandwidth_matrix: false,
-            bias_sweep: false,
             loss_axis: false,
             shaping_matrix: false,
             headroom_sweep: false,

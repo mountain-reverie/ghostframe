@@ -1245,7 +1245,8 @@ async fn e2e_palrle_oob_index() -> Result<()> {
 /// Closure path:
 /// - `fire_session_reset` forces `frame_mode = H264` + `request_keyframe`
 ///   for the initial post-reset burst (lossy IDR + P-frames).
-/// - After `exit_sustain_frames = 30` of static content, the classifier
+/// - Once the estimate is known and the first pass fits (at least 1 s and
+///   30 frames), the classifier
 ///   transitions H264 → TileCodec. The mode-flip handoff invalidates
 ///   the GPU SAD baseline via `invalidate_baseline(1)`, so the next
 ///   TileCodec frame reports all tiles dirty and PalRle emissions
@@ -1328,9 +1329,10 @@ async fn e2e_palrle_session_reset_body<B: helpers::BrowserSession>(
     // Protocol-layer: post-reset codec stream should include PalRle.
     //
     // PalRle only arrives after the H.264 -> TileCodec handoff, which needs
-    // `exit_sustain_frames = 30` static frames. At the 2 fps this test pins
-    // for CDP responsiveness that is ~15 s, not the ~1 s the 4 s wait above
-    // assumes, so poll rather than read once.
+    // the estimate known and the first pass fitting for at least 1 s and 30
+    // frames. At the 2 fps this test pins for CDP responsiveness that is
+    // ~15 s (30 frames is the longer of the two), not the ~1 s the 4 s wait
+    // above assumes, so poll rather than read once.
     let mut codec_list: Vec<u8> = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(40);
     while std::time::Instant::now() < deadline {
@@ -1683,7 +1685,7 @@ async fn e2e_multi_tile_grid() -> Result<()> {
 ///   gradient (smooth image)  -> Codec::Cdf53
 ///
 /// No spinner, so the classifier is not chasing motion and cannot flip the
-/// frame to H264 on cost grounds; `GHOSTFRAME_FORCE_TILECODEC=1` pins that
+/// frame to H264 on bandwidth grounds; `GHOSTFRAME_FORCE_TILECODEC=1` pins that
 /// besides. Everything after the first frames is pure delivery and
 /// refinement over a shaped link.
 ///
@@ -2270,7 +2272,7 @@ async fn e2e_production_scale_with_loss_converges() -> Result<()> {
 ///    and every assertion passed vacuously. The premise check caught it.
 /// 2. It then reported `gave_up=768` -- every tile -- which looked like a
 ///    total stranding. The server log showed why: `mode.decision
-///    from=TileCodec to=H264 reason="cost_comparison"` fired 15 ms after the
+///    from=TileCodec to=H264 reason="bandwidth_short"` fired 15 ms after the
 ///    last `cdf53.emit`. Cdf53 emission stops by design on that switch and
 ///    the coverage map freezes wherever it was, which is indistinguishable
 ///    from stranding in the client's view. `GHOSTFRAME_FORCE_TILECODEC=1`
@@ -2451,12 +2453,12 @@ async fn e2e_production_shaped_session_strands_no_tiles() -> Result<()> {
             ("CAPTURE_FPS", "2"),
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
             // Pin the frame mode. Without this the classifier may switch to
-            // H264 mid-scene on cost grounds, Cdf53 emission stops, and the
+            // H264 mid-scene on bandwidth grounds, Cdf53 emission stops, and the
             // client's Cdf53 coverage freezes mid-refinement -- which reads
             // as "every tile stranded" while nothing is actually stranded.
             // Measured: a drifting-photo scene flipped at
-            // reason="cost_comparison" with refinement_deficit_tiles=768,
-            // 15 ms after the last cdf53.emit.
+            // reason="bandwidth_short" (then "cost_comparison", since
+            // replaced), 15 ms after the last cdf53.emit.
             ("GHOSTFRAME_FORCE_TILECODEC", "1"),
             // Production scale. VKMS prefers 1024x768 (32x24 = 768 tiles);
             // a real session is 1920x1080 (60x34 = 2040), so these scenes
@@ -3253,7 +3255,7 @@ async fn e2e_mode_switch_body<B: helpers::BrowserSession>(browser: &mut B) -> Re
     // most of the phase, identifiable by a high count of H.264 frame
     // datagrams (which only flow when frame_mode == H264). 150 is comfortably
     // above the residual frame-datagram count seen in non-H264 phases
-    // (typically 35-67 from the exit_sustain tail) and well below what a
+    // (typically 35-67 from the exit-hold tail) and well below what a
     // motion phase produces (typically 474-503 in 3-second motion windows).
     // Replaces the prior ratio-based "frame_dominated" check, which was
     // invalidated by the H264 → TileCodec mode-flip handoff producing
@@ -3329,7 +3331,7 @@ async fn e2e_mode_switch_body<B: helpers::BrowserSession>(browser: &mut B) -> Re
 //
 // `--motion video`: the motion half must be content H.264 is the right
 // answer to. The default bands are a screen of Solid tiles, which the tile
-// codec carries for less than one H.264 frame costs, so the cost model
+// codec carries for less than one H.264 frame costs, so the bandwidth rule
 // rightly never leaves TileCodec for them. This test nonetheless passed on
 // bands for months, because the client's suspension detector mistook every
 // quiet static half for a network stall and the server answers that by
@@ -3363,15 +3365,15 @@ async fn e2e_mode_switch_chromium() -> Result<()> {
         .filter(|d| d.from == "TileCodec" && d.to == "H264")
         .map(|d| d.reason.as_str())
         .collect();
-    // At least twice on the cost model's own judgement. A network override
+    // At least twice on the bandwidth rule's own judgement. A network override
     // may account for other entries -- a client that stalls for 100 ms
     // raises `suspension` legitimately -- but it must not be what the test
     // is counting, which is how it passed before.
-    let by_cost = entered.iter().filter(|r| **r == "cost_comparison").count();
+    let by_bandwidth = entered.iter().filter(|r| **r == "bandwidth_short").count();
     assert!(
-        by_cost >= 2,
-        "expected the cost model to choose H264 for video motion at least twice, \
-         got {by_cost}; decisions: {decisions:?}"
+        by_bandwidth >= 2,
+        "expected the bandwidth rule to choose H264 for video motion at least twice, \
+         got {by_bandwidth}; decisions: {decisions:?}"
     );
     assert!(
         decisions
@@ -3449,7 +3451,7 @@ async fn sample_mode_dominance(
 /// bandwidth estimate of 0.1 B/us = 800 kbit/s, below the 2 Mbit/s enter
 /// threshold), the classifier's headroom_guard override must force H264 mode
 /// -- once the estimate has stayed that low for the 500 ms hold -- even for
-/// content the M3.5 cost comparison alone would assign to TileCodec.
+/// content the first-pass-versus-estimate rule alone would assign to TileCodec.
 ///
 /// Uses `--x11-sink --mode-switch-cycle 2` (alternating static/motion)
 /// so the classifier has a mix of content; the headroom_guard override
@@ -3509,8 +3511,8 @@ async fn e2e_headroom_guard_forces_h264() -> Result<()> {
 /// loss injection -> unacknowledged transmissions -> the ledger's loss
 /// rate -> AdaptationContext -> loss_override -> H264.
 ///
-/// The content is all-Solid motion, which the cost model keeps in TileCodec
-/// (four bytes a tile), so the cost comparison cannot explain H.264 here.
+/// The content is all-Solid motion, which the bandwidth rule keeps in TileCodec
+/// (four bytes a tile), so the bandwidth rule cannot explain H.264 here.
 /// And every tile is a single datagram, which is the case the client's own
 /// loss count is blind to: nothing is ever *partly* received.
 ///
@@ -3735,8 +3737,8 @@ async fn e2e_decode_error_thin_uncached() -> Result<()> {
     // default capture rate. Not `--solid-per-tile`: since 9bfaff2 its
     // motion tiles are single-colour per frame and take Solid, so no palette
     // is ever delivered. Not CAPTURE_FPS=2 either: a session reset
-    // puts the server in H.264 until `exit_sustain_frames = 30` static frames
-    // have passed (15 s at 2 fps, 1 s at 30), and thin PalRle can only be
+    // puts the server in H.264 until the estimate is known and the first pass
+    // has fitted for 1 s and 30 frames (15 s at 2 fps, 1 s at 30), and thin PalRle can only be
     // emitted after that handoff. Phase 3 below waits 6 s. The test does
     // only ~10 evaluate() calls, so 30 fps does not saturate CDP here.
     let setup = setup_e2e_webgpu_gpu_with_env(
@@ -5170,9 +5172,9 @@ async fn e2e_cdf53_server_gpu_vs_cpu_diff() -> Result<()> {
 /// Cdf53) and the post-mode-flip refinement window in cycle 1.
 ///
 /// Setup requirements:
-/// - `CAPTURE_FPS=30` so `exit_sustain_frames` (=30) maps to ~1 s wallclock.
-///   Without this override the entrypoint defaults to 2 fps (= 15 s exit
-///   sustain), so the classifier never leaves `FrameMode::H264` during the
+/// - `CAPTURE_FPS=30` so the exit's 30 frames map to ~1 s wallclock (the
+///   exit also needs 1 s). Without this override the entrypoint defaults to
+///   2 fps (= 15 s exit sustain), so the classifier never leaves `FrameMode::H264` during the
 ///   static half — the Cdf53 Phase B + escalation + PixelPerfect sweep all
 ///   live inside the `FrameMode::TileCodec` arm and would never run, making
 ///   the SSIM convergence claim measure H.264 steady-state rather than CDF

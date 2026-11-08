@@ -71,8 +71,8 @@ pub struct ModeDecisionRecord {
     /// Frame sequence number (0 if unset by the event).
     pub frame_seq: u64,
     /// The `reason` field from the classifier event.
-    /// One of: "cost_comparison", "headroom_guard", "loss_override",
-    /// "suspension", "hysteresis_clamp".
+    /// One of: "bandwidth_short", "bandwidth_fits", "estimate_unknown",
+    /// "headroom_guard", "loss_override", "suspension", "hysteresis_clamp".
     pub reason: String,
     /// Destination mode of the transition ("H264" or "TileCodec").
     pub to_mode: String,
@@ -240,7 +240,7 @@ pub(crate) async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioSt
     // var to a sweep dispatch without adding it here causes the sweep
     // to silently run with production defaults (no error). This is the
     // exact bug that caused the M3.7a v4 "near-identical mode_switch
-    // counts" regression — bench was sweeping bias values but the
+    // counts" regression — bench was sweeping values but the
     // overrides never reached the container.
     for var in [
         "GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP",
@@ -251,8 +251,7 @@ pub(crate) async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioSt
         // these per swept value; without forwarding they'd silently
         // never reach ghostframe-server and every swept value would behave
         // identically (the bug that produced near-identical mode_switch
-        // counts across bias_sweep / loss_axis runs in v4).
-        "GHOSTFRAME_TEST_REFINEMENT_BIAS_US",
+        // counts across loss_axis runs in v4).
         "GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD",
         // The override is off unless this is set (loss-axis sweeps need it).
         "GHOSTFRAME_LOSS_OVERRIDE",

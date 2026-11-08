@@ -3,7 +3,7 @@
 //! the threshold matters. At 10+ Mbps the override never fires; below
 //! 1 Mbps the link is unusable for either codec.
 //!
-//! Default scene matches the M3.7a bias_sweep / loss_axis conventions:
+//! Default scene matches the M3.7a loss_axis conventions:
 //! `--mode-switch-cycle 12` (proven content that produces PixelPerfect
 //! reliably; see M3.7a final bench results).
 
@@ -59,7 +59,7 @@ pub const HEADROOM_SHAPING_POINTS: &[HeadroomShapingPoint] = &[
     },
 ];
 
-// Kept symmetric with the loss_axis and bias_sweep modules even when not directly referenced.
+// Kept symmetric with the loss_axis module even when not directly referenced.
 #[allow(dead_code)]
 pub const DEFAULT_SCENE_NAME: &str = "mode_switch_12s";
 pub const DEFAULT_TEST_PATTERN_ARGS: &[&str] = &["--mode-switch-cycle", "12"];

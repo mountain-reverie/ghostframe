@@ -6,7 +6,6 @@
 
 mod aggregate;
 mod bandwidth_matrix;
-mod bias_sweep;
 mod cli;
 mod headroom_sweep;
 mod loss_axis;
@@ -96,62 +95,6 @@ async fn main() -> anyhow::Result<()> {
             std::env::remove_var("SHAPE_BANDWIDTH_KBPS");
             std::env::remove_var("SHAPE_DELAY_MS");
             std::env::remove_var("SHAPE_LOSS_PCT");
-        }
-        std::env::remove_var("GHOSTFRAME_ENABLE_CDF53");
-        std::env::remove_var("CAPTURE_FPS");
-    } else if args.bias_sweep {
-        use ghostframe_e2e::harness::{FrameMode, SceneSpec};
-        // Required for CDF53 refinement to fire at all — without this
-        // env var the codec is disabled in ghostframe-server and the PixelPerfect
-        // outcome metric stays at zero regardless of bias value.
-        std::env::set_var("GHOSTFRAME_ENABLE_CDF53", "1");
-        // 30 fps gives the refinement loop enough ticks per second to
-        // complete all 14 passes for a tile within a 12-second static
-        // half (matches e2e_progressive_refinement which observes 720+).
-        std::env::set_var("CAPTURE_FPS", "30");
-        for point in bias_sweep::BIAS_VALUES_US {
-            std::env::set_var(
-                "GHOSTFRAME_TEST_REFINEMENT_BIAS_US",
-                point.value_us.to_string(),
-            );
-            std::env::set_var(
-                "GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP",
-                bias_sweep::DEFAULT_BANDWIDTH_BYTES_PER_SEC.to_string(),
-            );
-            if bias_sweep::DEFAULT_LOSS_PROBABILITY > 0.0 {
-                std::env::set_var(
-                    "GHOSTFRAME_INBOUND_LOSS_PROBABILITY",
-                    bias_sweep::DEFAULT_LOSS_PROBABILITY.to_string(),
-                );
-                std::env::set_var("GHOSTFRAME_INBOUND_LOSS_SEED", "42");
-                std::env::set_var("GHOSTFRAME_INBOUND_LOSS_PREDICATE", "tile");
-            }
-            let labeled_name = format!("{}/{}", point.label, bias_sweep::DEFAULT_SCENE_NAME);
-            let spec = SceneSpec {
-                name: Box::leak(labeled_name.clone().into_boxed_str()),
-                test_pattern_args: bias_sweep::DEFAULT_TEST_PATTERN_ARGS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-                duration: args.scene_duration,
-                initial_mode: FrameMode::TileCodec,
-            };
-            tracing::info!(
-                bias_us = point.value_us,
-                scene = bias_sweep::DEFAULT_SCENE_NAME,
-                "bias-sweep run"
-            );
-            if let Err(e) = runner::run_one_scene(&spec, &mut state).await {
-                tracing::warn!(bias_us = point.value_us, error = %e, "bias-sweep scene failed, continuing");
-            }
-            if let Some(summary) = state.scenes.get_mut(&labeled_name) {
-                summary.sweep_axis_label = Some(point.label.to_string());
-            }
-            std::env::remove_var("GHOSTFRAME_TEST_REFINEMENT_BIAS_US");
-            std::env::remove_var("GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP");
-            std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_PROBABILITY");
-            std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_SEED");
-            std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_PREDICATE");
         }
         std::env::remove_var("GHOSTFRAME_ENABLE_CDF53");
         std::env::remove_var("CAPTURE_FPS");

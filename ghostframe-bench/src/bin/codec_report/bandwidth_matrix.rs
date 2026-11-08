@@ -37,7 +37,7 @@ pub const BANDWIDTH_POINTS: &[BandwidthPoint] = &[
         bytes_per_sec: 3_750_000,
         loss_probability: 0.01,
     },
-    // 100 Mbps LAN clean — pure cost_comparison baseline.
+    // 100 Mbps LAN clean — pure bandwidth_fits baseline.
     BandwidthPoint {
         label: "100mbps_lan",
         bytes_per_sec: 12_500_000,

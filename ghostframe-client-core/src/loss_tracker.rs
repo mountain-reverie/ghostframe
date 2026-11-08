@@ -74,7 +74,7 @@ impl LossTracker {
     /// gap and re-raised the flag; when the classifier did get out, the
     /// first tile datagram of the new mode arrived a full H.264 dwell after
     /// the last and sent it straight back. That is the `suspension` /
-    /// `cost_comparison` flip every ~1.2 s seen on any changing content.
+    /// enter/leave flip (a `bandwidth_short` entry) every ~1.2 s seen on any changing content.
     ///
     /// A stamp older than the baseline is a datagram overtaken by newer
     /// traffic. It is counted and otherwise ignored: its lateness is its
