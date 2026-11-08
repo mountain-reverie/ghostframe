@@ -248,6 +248,36 @@ def build_timeline(demand, C, spec, rho, rng):
             s_commit.append(t)
             sids.append(sid)
         unit_src[(kind, unit)] = sids
+        if fam == "split":
+            # split_sim.py: spec["plan"](k, rho) -> [(source positions, r, code)] per H.264 frame;
+            # tile bursts get plain RS blocks of <= kmax. Repairs queue after the sources of the
+            # unit, round-robin across blocks (so a loss burst on the tail hits different blocks).
+            if kind == 'f':
+                for s in sids:
+                    queue.append(('s', s))
+                bids, rs = [], []
+                for idxs, r, code in spec["plan"](len(sids), rho):
+                    bids.append(new_block([sids[i] for i in idxs], code))
+                    rs.append(r)
+                for j in range(max(rs, default=0)):
+                    for bid, r in zip(bids, rs):
+                        if j < r:
+                            queue.append(('r', bid))
+            else:
+                m = len(sids)
+                nb = math.ceil(m / kmax)
+                base, extra = divmod(m, nb)
+                pos = 0
+                for j in range(nb):
+                    sz = base + (1 if j < extra else 0)
+                    part = sids[pos:pos + sz]
+                    pos += sz
+                    bid = new_block(part, "rs")
+                    for s in part:
+                        queue.append(('s', s))
+                    for _ in range(nrep(sz)):
+                        queue.append(('r', bid))
+            return
         embed = (fam == "rq") or (fam == "perclass" and kind == 'f')
         if embed:
             code = "rq" if (fam == "rq" and not spec.get("mds")) else "rs"
