@@ -273,4 +273,4 @@ e2e-firefox-doctor:
 
 # Run only the Firefox slice of the e2e suite.
 e2e-firefox: containers-build
-    cargo test --test e2e -- _firefox
+    cargo test --test e2e -- _firefox --test-threads=1
