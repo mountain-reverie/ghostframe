@@ -47,10 +47,6 @@ pub struct ClassifierConfig {
     /// Overrides `EXIT_SHARE`. `GHOSTFRAME_MODE_EXIT_SHARE`, `(0.0, 1.0]`,
     /// and below the enter share (see `from_lookup`).
     pub exit_share: Option<f32>,
-    /// Overrides `REFINEMENT_BIAS_PER_TILE_US`. Fed by
-    /// `GHOSTFRAME_REFINEMENT_BIAS_US` (alias
-    /// `GHOSTFRAME_TEST_REFINEMENT_BIAS_US`); accepts any value `> 0.0`.
-    pub refinement_bias_us: Option<f32>,
     /// Overrides the headroom guard's enter threshold (the exit threshold
     /// keeps its 3:2 ratio to it), in bytes per microsecond of bandwidth
     /// estimate (`0.25` = 2 Mbit/s). Fed by
@@ -67,33 +63,6 @@ pub struct ClassifierConfig {
     /// `GHOSTFRAME_LOSS_OVERRIDE=1|true|yes|on` (any case; alias
     /// `GHOSTFRAME_TEST_LOSS_OVERRIDE`).
     pub loss_override_enabled: bool,
-    /// Per-codec encode-cost overrides. See `CostModelConfig`.
-    pub cost: CostModelConfig,
-}
-
-/// Overrides for the classifier's encode-cost model (`tile::CostModel`).
-///
-/// The defaults were bench-tuned on one machine (see
-/// `docs/specs/m3-codec-bench-results.md`); on other hardware the cost
-/// comparison mis-classifies. Each field is `None` for the compiled-in value;
-/// every accepted value must be finite and `> 0.0`, anything else is ignored.
-///
-/// All fields are **wired**: `Classifier::new` builds its `CostModel` from
-/// them.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct CostModelConfig {
-    /// `GHOSTFRAME_COST_SOLID_US` (compiled-in 0.05).
-    pub solid_us: Option<f32>,
-    /// `GHOSTFRAME_COST_PALRLE_US` (compiled-in 8.0).
-    pub palrle_us: Option<f32>,
-    /// `GHOSTFRAME_COST_CDF53_US` (compiled-in 90.0).
-    pub cdf53_us: Option<f32>,
-    /// `GHOSTFRAME_COST_H264_FRAME_US` (compiled-in 3000.0).
-    pub h264_frame_us: Option<f32>,
-    /// `GHOSTFRAME_COST_H264_FRAME_BYTES` (compiled-in 12000); a `u32 > 0`.
-    pub h264_frame_bytes: Option<u32>,
-    /// `GHOSTFRAME_COST_BYTES_PER_US` (compiled-in 12.5).
-    pub bytes_per_us: Option<f32>,
 }
 
 /// First variable of `names` that `get` can see. Used for env-name aliases:
@@ -128,19 +97,9 @@ fn positive_f32(raw: Option<String>) -> Option<f32> {
         .filter(|v| v.is_finite() && *v > 0.0)
 }
 
-impl CostModelConfig {
-    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
-        Self {
-            solid_us: positive_f32(get("GHOSTFRAME_COST_SOLID_US")),
-            palrle_us: positive_f32(get("GHOSTFRAME_COST_PALRLE_US")),
-            cdf53_us: positive_f32(get("GHOSTFRAME_COST_CDF53_US")),
-            h264_frame_us: positive_f32(get("GHOSTFRAME_COST_H264_FRAME_US")),
-            h264_frame_bytes: get("GHOSTFRAME_COST_H264_FRAME_BYTES")
-                .and_then(|s| s.parse::<u32>().ok())
-                .filter(|v| *v > 0),
-            bytes_per_us: positive_f32(get("GHOSTFRAME_COST_BYTES_PER_US")),
-        }
-    }
+fn share(raw: Option<String>) -> Option<f32> {
+    raw.and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1.0)
 }
 
 impl ClassifierConfig {
@@ -149,16 +108,47 @@ impl ClassifierConfig {
     /// state. Keeping the parsing here means the crate reads the process
     /// environment in exactly one place.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let enter = share(get("GHOSTFRAME_MODE_ENTER_SHARE"));
+        let exit = share(get("GHOSTFRAME_MODE_EXIT_SHARE"));
+        let enter_eff = enter.map_or(crate::tile::classifier::ENTER_SHARE, f64::from);
+        let exit_eff = exit.map_or(crate::tile::classifier::EXIT_SHARE, f64::from);
+        let (enter_share, exit_share) = if exit_eff < enter_eff {
+            (enter, exit)
+        } else {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    target: "ghostframe::config",
+                    "GHOSTFRAME_MODE_EXIT_SHARE ({exit_eff}) must be below \
+                     GHOSTFRAME_MODE_ENTER_SHARE ({enter_eff}); ignoring both"
+                );
+            });
+            (None, None)
+        };
+        const REMOVED: [&str; 8] = [
+            "GHOSTFRAME_COST_SOLID_US",
+            "GHOSTFRAME_COST_PALRLE_US",
+            "GHOSTFRAME_COST_CDF53_US",
+            "GHOSTFRAME_COST_H264_FRAME_US",
+            "GHOSTFRAME_COST_H264_FRAME_BYTES",
+            "GHOSTFRAME_COST_BYTES_PER_US",
+            "GHOSTFRAME_REFINEMENT_BIAS_US",
+            "GHOSTFRAME_TEST_REFINEMENT_BIAS_US",
+        ];
+        if let Some(name) = REMOVED.iter().find(|n| get(n).is_some()) {
+            static WARNED_REMOVED: std::sync::Once = std::sync::Once::new();
+            WARNED_REMOVED.call_once(|| {
+                tracing::warn!(
+                    target: "ghostframe::config",
+                    "{name} was removed and is ignored: the frame mode follows \
+                     the bandwidth estimate (GHOSTFRAME_MODE_ENTER_SHARE / \
+                     GHOSTFRAME_MODE_EXIT_SHARE)"
+                );
+            });
+        }
         Self {
-            enter_share: None,
-            exit_share: None,
-            refinement_bias_us: positive_f32(get_first(
-                &get,
-                &[
-                    "GHOSTFRAME_REFINEMENT_BIAS_US",
-                    "GHOSTFRAME_TEST_REFINEMENT_BIAS_US",
-                ],
-            )),
+            enter_share,
+            exit_share,
             loss_override_threshold: get_first(
                 &get,
                 &[
@@ -205,7 +195,6 @@ impl ClassifierConfig {
                         _ => None,
                     })
                 }),
-            cost: CostModelConfig::from_lookup(&get),
         }
     }
 
@@ -1021,7 +1010,6 @@ mod tests {
     fn defaults_are_production_inert() {
         let cfg = LibConfig::default();
         assert!(cfg.classifier.force_frame_mode.is_none());
-        assert!(cfg.classifier.refinement_bias_us.is_none());
         assert!(cfg.classifier.headroom_min_bpus.is_none());
         assert!(cfg.classifier.loss_override_threshold.is_none());
         assert!(cfg.transport.outbound_loss.is_none());
@@ -1167,40 +1155,71 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Un-gated classifier overrides, CostModelConfig, EmitterConfig
+    // Un-gated classifier overrides, EmitterConfig
     // -----------------------------------------------------------------
 
     #[test]
     fn classifier_config_accepts_new_names_and_old_aliases() {
         let c = ClassifierConfig::from_lookup(lookup(&[
-            ("GHOSTFRAME_REFINEMENT_BIAS_US", "7.5"),
             ("GHOSTFRAME_HEADROOM_MIN_BPUS", "0.5"),
             ("GHOSTFRAME_LOSS_OVERRIDE_THRESHOLD", "0.2"),
             ("GHOSTFRAME_FORCE_FRAME_MODE", "h264"),
         ]));
-        assert_eq!(c.refinement_bias_us, Some(7.5));
         assert_eq!(c.headroom_min_bpus, Some(0.5));
         assert_eq!(c.loss_override_threshold, Some(0.2));
         assert_eq!(c.force_frame_mode, Some(FrameMode::H264));
 
         // The names the e2e and bench crates still set.
         let c = ClassifierConfig::from_lookup(lookup(&[
-            ("GHOSTFRAME_TEST_REFINEMENT_BIAS_US", "1000"),
             ("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS", "0.05"),
             ("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD", "0.5"),
             ("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "tile"),
         ]));
-        assert_eq!(c.refinement_bias_us, Some(1000.0));
         assert_eq!(c.headroom_min_bpus, Some(0.05));
         assert_eq!(c.loss_override_threshold, Some(0.5));
         assert_eq!(c.force_frame_mode, Some(FrameMode::TileCodec));
 
         // New name wins when both are set.
         let c = ClassifierConfig::from_lookup(lookup(&[
-            ("GHOSTFRAME_TEST_REFINEMENT_BIAS_US", "1"),
-            ("GHOSTFRAME_REFINEMENT_BIAS_US", "2"),
+            ("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS", "1"),
+            ("GHOSTFRAME_HEADROOM_MIN_BPUS", "2"),
         ]));
-        assert_eq!(c.refinement_bias_us, Some(2.0));
+        assert_eq!(c.headroom_min_bpus, Some(2.0));
+    }
+
+    #[test]
+    fn mode_shares_parse_and_an_inverted_pair_is_ignored() {
+        let c = ClassifierConfig::from_lookup(lookup(&[
+            ("GHOSTFRAME_MODE_ENTER_SHARE", "0.8"),
+            ("GHOSTFRAME_MODE_EXIT_SHARE", "0.3"),
+        ]));
+        assert_eq!((c.enter_share, c.exit_share), (Some(0.8), Some(0.3)));
+
+        // Exit at or above enter would flap: both are dropped.
+        let c = ClassifierConfig::from_lookup(lookup(&[
+            ("GHOSTFRAME_MODE_ENTER_SHARE", "0.5"),
+            ("GHOSTFRAME_MODE_EXIT_SHARE", "0.5"),
+        ]));
+        assert_eq!((c.enter_share, c.exit_share), (None, None));
+
+        // One alone is checked against the other's default.
+        let c = ClassifierConfig::from_lookup(lookup(&[("GHOSTFRAME_MODE_EXIT_SHARE", "0.9")]));
+        assert_eq!((c.enter_share, c.exit_share), (None, None));
+
+        for bad in ["0", "-0.1", "1.5", "nan", "x"] {
+            let c = ClassifierConfig::from_lookup(lookup(&[("GHOSTFRAME_MODE_ENTER_SHARE", bad)]));
+            assert_eq!(c.enter_share, None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_removed_cost_variables_are_ignored() {
+        // They parse to nothing; the warning is logged once per process.
+        let c = ClassifierConfig::from_lookup(lookup(&[
+            ("GHOSTFRAME_COST_CDF53_US", "10"),
+            ("GHOSTFRAME_REFINEMENT_BIAS_US", "5"),
+        ]));
+        assert_eq!(c, ClassifierConfig::default());
     }
 
     #[test]
