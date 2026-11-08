@@ -1,0 +1,464 @@
+#version 450
+// cdf53_encode.comp -- the CDF 5/3 tile transform on the server GPU.
+//
+// One workgroup of 96 invocations per listed tile. Invocation l works on
+// channel l / 32 (0 = B, 1 = G, 2 = R) and line l % 32 of it. The tile is
+// loaded into workgroup memory, then three levels of integer 5/3 lifting
+// run with one invocation per line, the whole line held in locals by the
+// generated lift_* functions, and one barrier between a row pass and a
+// column pass. Bit-exact against `cdf53::forward` (ghostframe-protocol),
+// the oracle: same predict/update rounding, same mirror boundary, same
+// coefficient layout.
+//
+// Variants (glslc -D):
+//   CDF53_FORWARD_ONLY=1  write CDF53_TOTAL_COEFFS i32 per list slot
+//                         (cdf53_forward.spv)
+//
+// Rebuild after any edit: `just shaders-cdf53` (regenerates the lifting
+// block, then compiles every variant).
+
+layout(local_size_x = 96, local_size_y = 1, local_size_z = 1) in;
+
+// Binding 0: the frame, a B8G8R8A8 storage image, read as the old L1 did.
+layout(set = 0, binding = 0, rgba8) readonly uniform image2D current_frame;
+
+// Binding 1: tile list; workgroup N transforms tile tile_indices[N].
+layout(set = 0, binding = 1, std430) readonly buffer Cdf53TileList {
+    uint tile_indices[];
+};
+
+// Binding 2: 3 x 1024 i32 per list slot: B, G, R, each in the layout
+// LL3 HL3 LH3 HH3 (16 each), HL2 LH2 HH2 (64 each), HL1 LH1 HH1 (256 each).
+layout(set = 0, binding = 2, std430) writeonly buffer Cdf53Coefficients {
+    int coefficients[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint cols;
+    uint rows;
+};
+
+const uint ROW = 33u;          // padded row stride, words (no bank conflicts on columns)
+const uint CHS = 32u * ROW;    // channel stride, words
+
+// The tile, one 32 x 33 plane per channel; transformed in place.
+shared int A[3u * CHS];
+
+// BEGIN GENERATED LIFTING (cdf53_shader_gen.rs; `just shaders-cdf53`)
+void lift_rows_32(uint base) {
+    int v0 = A[base + 0u];
+    int v1 = A[base + 1u];
+    int v2 = A[base + 2u];
+    int v3 = A[base + 3u];
+    int v4 = A[base + 4u];
+    int v5 = A[base + 5u];
+    int v6 = A[base + 6u];
+    int v7 = A[base + 7u];
+    int v8 = A[base + 8u];
+    int v9 = A[base + 9u];
+    int v10 = A[base + 10u];
+    int v11 = A[base + 11u];
+    int v12 = A[base + 12u];
+    int v13 = A[base + 13u];
+    int v14 = A[base + 14u];
+    int v15 = A[base + 15u];
+    int v16 = A[base + 16u];
+    int v17 = A[base + 17u];
+    int v18 = A[base + 18u];
+    int v19 = A[base + 19u];
+    int v20 = A[base + 20u];
+    int v21 = A[base + 21u];
+    int v22 = A[base + 22u];
+    int v23 = A[base + 23u];
+    int v24 = A[base + 24u];
+    int v25 = A[base + 25u];
+    int v26 = A[base + 26u];
+    int v27 = A[base + 27u];
+    int v28 = A[base + 28u];
+    int v29 = A[base + 29u];
+    int v30 = A[base + 30u];
+    int v31 = A[base + 31u];
+    v1 -= (v0 + v2) >> 1;
+    v3 -= (v2 + v4) >> 1;
+    v5 -= (v4 + v6) >> 1;
+    v7 -= (v6 + v8) >> 1;
+    v9 -= (v8 + v10) >> 1;
+    v11 -= (v10 + v12) >> 1;
+    v13 -= (v12 + v14) >> 1;
+    v15 -= (v14 + v16) >> 1;
+    v17 -= (v16 + v18) >> 1;
+    v19 -= (v18 + v20) >> 1;
+    v21 -= (v20 + v22) >> 1;
+    v23 -= (v22 + v24) >> 1;
+    v25 -= (v24 + v26) >> 1;
+    v27 -= (v26 + v28) >> 1;
+    v29 -= (v28 + v30) >> 1;
+    v31 -= (v30 + v30) >> 1;
+    v0 += (v1 + v1 + 2) >> 2;
+    v2 += (v1 + v3 + 2) >> 2;
+    v4 += (v3 + v5 + 2) >> 2;
+    v6 += (v5 + v7 + 2) >> 2;
+    v8 += (v7 + v9 + 2) >> 2;
+    v10 += (v9 + v11 + 2) >> 2;
+    v12 += (v11 + v13 + 2) >> 2;
+    v14 += (v13 + v15 + 2) >> 2;
+    v16 += (v15 + v17 + 2) >> 2;
+    v18 += (v17 + v19 + 2) >> 2;
+    v20 += (v19 + v21 + 2) >> 2;
+    v22 += (v21 + v23 + 2) >> 2;
+    v24 += (v23 + v25 + 2) >> 2;
+    v26 += (v25 + v27 + 2) >> 2;
+    v28 += (v27 + v29 + 2) >> 2;
+    v30 += (v29 + v31 + 2) >> 2;
+    A[base + 0u] = v0;
+    A[base + 16u] = v1;
+    A[base + 1u] = v2;
+    A[base + 17u] = v3;
+    A[base + 2u] = v4;
+    A[base + 18u] = v5;
+    A[base + 3u] = v6;
+    A[base + 19u] = v7;
+    A[base + 4u] = v8;
+    A[base + 20u] = v9;
+    A[base + 5u] = v10;
+    A[base + 21u] = v11;
+    A[base + 6u] = v12;
+    A[base + 22u] = v13;
+    A[base + 7u] = v14;
+    A[base + 23u] = v15;
+    A[base + 8u] = v16;
+    A[base + 24u] = v17;
+    A[base + 9u] = v18;
+    A[base + 25u] = v19;
+    A[base + 10u] = v20;
+    A[base + 26u] = v21;
+    A[base + 11u] = v22;
+    A[base + 27u] = v23;
+    A[base + 12u] = v24;
+    A[base + 28u] = v25;
+    A[base + 13u] = v26;
+    A[base + 29u] = v27;
+    A[base + 14u] = v28;
+    A[base + 30u] = v29;
+    A[base + 15u] = v30;
+    A[base + 31u] = v31;
+}
+void lift_cols_32(uint base) {
+    int v0 = A[base + 0u];
+    int v1 = A[base + 33u];
+    int v2 = A[base + 66u];
+    int v3 = A[base + 99u];
+    int v4 = A[base + 132u];
+    int v5 = A[base + 165u];
+    int v6 = A[base + 198u];
+    int v7 = A[base + 231u];
+    int v8 = A[base + 264u];
+    int v9 = A[base + 297u];
+    int v10 = A[base + 330u];
+    int v11 = A[base + 363u];
+    int v12 = A[base + 396u];
+    int v13 = A[base + 429u];
+    int v14 = A[base + 462u];
+    int v15 = A[base + 495u];
+    int v16 = A[base + 528u];
+    int v17 = A[base + 561u];
+    int v18 = A[base + 594u];
+    int v19 = A[base + 627u];
+    int v20 = A[base + 660u];
+    int v21 = A[base + 693u];
+    int v22 = A[base + 726u];
+    int v23 = A[base + 759u];
+    int v24 = A[base + 792u];
+    int v25 = A[base + 825u];
+    int v26 = A[base + 858u];
+    int v27 = A[base + 891u];
+    int v28 = A[base + 924u];
+    int v29 = A[base + 957u];
+    int v30 = A[base + 990u];
+    int v31 = A[base + 1023u];
+    v1 -= (v0 + v2) >> 1;
+    v3 -= (v2 + v4) >> 1;
+    v5 -= (v4 + v6) >> 1;
+    v7 -= (v6 + v8) >> 1;
+    v9 -= (v8 + v10) >> 1;
+    v11 -= (v10 + v12) >> 1;
+    v13 -= (v12 + v14) >> 1;
+    v15 -= (v14 + v16) >> 1;
+    v17 -= (v16 + v18) >> 1;
+    v19 -= (v18 + v20) >> 1;
+    v21 -= (v20 + v22) >> 1;
+    v23 -= (v22 + v24) >> 1;
+    v25 -= (v24 + v26) >> 1;
+    v27 -= (v26 + v28) >> 1;
+    v29 -= (v28 + v30) >> 1;
+    v31 -= (v30 + v30) >> 1;
+    v0 += (v1 + v1 + 2) >> 2;
+    v2 += (v1 + v3 + 2) >> 2;
+    v4 += (v3 + v5 + 2) >> 2;
+    v6 += (v5 + v7 + 2) >> 2;
+    v8 += (v7 + v9 + 2) >> 2;
+    v10 += (v9 + v11 + 2) >> 2;
+    v12 += (v11 + v13 + 2) >> 2;
+    v14 += (v13 + v15 + 2) >> 2;
+    v16 += (v15 + v17 + 2) >> 2;
+    v18 += (v17 + v19 + 2) >> 2;
+    v20 += (v19 + v21 + 2) >> 2;
+    v22 += (v21 + v23 + 2) >> 2;
+    v24 += (v23 + v25 + 2) >> 2;
+    v26 += (v25 + v27 + 2) >> 2;
+    v28 += (v27 + v29 + 2) >> 2;
+    v30 += (v29 + v31 + 2) >> 2;
+    A[base + 0u] = v0;
+    A[base + 528u] = v1;
+    A[base + 33u] = v2;
+    A[base + 561u] = v3;
+    A[base + 66u] = v4;
+    A[base + 594u] = v5;
+    A[base + 99u] = v6;
+    A[base + 627u] = v7;
+    A[base + 132u] = v8;
+    A[base + 660u] = v9;
+    A[base + 165u] = v10;
+    A[base + 693u] = v11;
+    A[base + 198u] = v12;
+    A[base + 726u] = v13;
+    A[base + 231u] = v14;
+    A[base + 759u] = v15;
+    A[base + 264u] = v16;
+    A[base + 792u] = v17;
+    A[base + 297u] = v18;
+    A[base + 825u] = v19;
+    A[base + 330u] = v20;
+    A[base + 858u] = v21;
+    A[base + 363u] = v22;
+    A[base + 891u] = v23;
+    A[base + 396u] = v24;
+    A[base + 924u] = v25;
+    A[base + 429u] = v26;
+    A[base + 957u] = v27;
+    A[base + 462u] = v28;
+    A[base + 990u] = v29;
+    A[base + 495u] = v30;
+    A[base + 1023u] = v31;
+}
+void lift_rows_16(uint base) {
+    int v0 = A[base + 0u];
+    int v1 = A[base + 1u];
+    int v2 = A[base + 2u];
+    int v3 = A[base + 3u];
+    int v4 = A[base + 4u];
+    int v5 = A[base + 5u];
+    int v6 = A[base + 6u];
+    int v7 = A[base + 7u];
+    int v8 = A[base + 8u];
+    int v9 = A[base + 9u];
+    int v10 = A[base + 10u];
+    int v11 = A[base + 11u];
+    int v12 = A[base + 12u];
+    int v13 = A[base + 13u];
+    int v14 = A[base + 14u];
+    int v15 = A[base + 15u];
+    v1 -= (v0 + v2) >> 1;
+    v3 -= (v2 + v4) >> 1;
+    v5 -= (v4 + v6) >> 1;
+    v7 -= (v6 + v8) >> 1;
+    v9 -= (v8 + v10) >> 1;
+    v11 -= (v10 + v12) >> 1;
+    v13 -= (v12 + v14) >> 1;
+    v15 -= (v14 + v14) >> 1;
+    v0 += (v1 + v1 + 2) >> 2;
+    v2 += (v1 + v3 + 2) >> 2;
+    v4 += (v3 + v5 + 2) >> 2;
+    v6 += (v5 + v7 + 2) >> 2;
+    v8 += (v7 + v9 + 2) >> 2;
+    v10 += (v9 + v11 + 2) >> 2;
+    v12 += (v11 + v13 + 2) >> 2;
+    v14 += (v13 + v15 + 2) >> 2;
+    A[base + 0u] = v0;
+    A[base + 8u] = v1;
+    A[base + 1u] = v2;
+    A[base + 9u] = v3;
+    A[base + 2u] = v4;
+    A[base + 10u] = v5;
+    A[base + 3u] = v6;
+    A[base + 11u] = v7;
+    A[base + 4u] = v8;
+    A[base + 12u] = v9;
+    A[base + 5u] = v10;
+    A[base + 13u] = v11;
+    A[base + 6u] = v12;
+    A[base + 14u] = v13;
+    A[base + 7u] = v14;
+    A[base + 15u] = v15;
+}
+void lift_cols_16(uint base) {
+    int v0 = A[base + 0u];
+    int v1 = A[base + 33u];
+    int v2 = A[base + 66u];
+    int v3 = A[base + 99u];
+    int v4 = A[base + 132u];
+    int v5 = A[base + 165u];
+    int v6 = A[base + 198u];
+    int v7 = A[base + 231u];
+    int v8 = A[base + 264u];
+    int v9 = A[base + 297u];
+    int v10 = A[base + 330u];
+    int v11 = A[base + 363u];
+    int v12 = A[base + 396u];
+    int v13 = A[base + 429u];
+    int v14 = A[base + 462u];
+    int v15 = A[base + 495u];
+    v1 -= (v0 + v2) >> 1;
+    v3 -= (v2 + v4) >> 1;
+    v5 -= (v4 + v6) >> 1;
+    v7 -= (v6 + v8) >> 1;
+    v9 -= (v8 + v10) >> 1;
+    v11 -= (v10 + v12) >> 1;
+    v13 -= (v12 + v14) >> 1;
+    v15 -= (v14 + v14) >> 1;
+    v0 += (v1 + v1 + 2) >> 2;
+    v2 += (v1 + v3 + 2) >> 2;
+    v4 += (v3 + v5 + 2) >> 2;
+    v6 += (v5 + v7 + 2) >> 2;
+    v8 += (v7 + v9 + 2) >> 2;
+    v10 += (v9 + v11 + 2) >> 2;
+    v12 += (v11 + v13 + 2) >> 2;
+    v14 += (v13 + v15 + 2) >> 2;
+    A[base + 0u] = v0;
+    A[base + 264u] = v1;
+    A[base + 33u] = v2;
+    A[base + 297u] = v3;
+    A[base + 66u] = v4;
+    A[base + 330u] = v5;
+    A[base + 99u] = v6;
+    A[base + 363u] = v7;
+    A[base + 132u] = v8;
+    A[base + 396u] = v9;
+    A[base + 165u] = v10;
+    A[base + 429u] = v11;
+    A[base + 198u] = v12;
+    A[base + 462u] = v13;
+    A[base + 231u] = v14;
+    A[base + 495u] = v15;
+}
+void lift_rows_8(uint base) {
+    int v0 = A[base + 0u];
+    int v1 = A[base + 1u];
+    int v2 = A[base + 2u];
+    int v3 = A[base + 3u];
+    int v4 = A[base + 4u];
+    int v5 = A[base + 5u];
+    int v6 = A[base + 6u];
+    int v7 = A[base + 7u];
+    v1 -= (v0 + v2) >> 1;
+    v3 -= (v2 + v4) >> 1;
+    v5 -= (v4 + v6) >> 1;
+    v7 -= (v6 + v6) >> 1;
+    v0 += (v1 + v1 + 2) >> 2;
+    v2 += (v1 + v3 + 2) >> 2;
+    v4 += (v3 + v5 + 2) >> 2;
+    v6 += (v5 + v7 + 2) >> 2;
+    A[base + 0u] = v0;
+    A[base + 4u] = v1;
+    A[base + 1u] = v2;
+    A[base + 5u] = v3;
+    A[base + 2u] = v4;
+    A[base + 6u] = v5;
+    A[base + 3u] = v6;
+    A[base + 7u] = v7;
+}
+void lift_cols_8(uint base) {
+    int v0 = A[base + 0u];
+    int v1 = A[base + 33u];
+    int v2 = A[base + 66u];
+    int v3 = A[base + 99u];
+    int v4 = A[base + 132u];
+    int v5 = A[base + 165u];
+    int v6 = A[base + 198u];
+    int v7 = A[base + 231u];
+    v1 -= (v0 + v2) >> 1;
+    v3 -= (v2 + v4) >> 1;
+    v5 -= (v4 + v6) >> 1;
+    v7 -= (v6 + v6) >> 1;
+    v0 += (v1 + v1 + 2) >> 2;
+    v2 += (v1 + v3 + 2) >> 2;
+    v4 += (v3 + v5 + 2) >> 2;
+    v6 += (v5 + v7 + 2) >> 2;
+    A[base + 0u] = v0;
+    A[base + 132u] = v1;
+    A[base + 33u] = v2;
+    A[base + 165u] = v3;
+    A[base + 66u] = v4;
+    A[base + 198u] = v5;
+    A[base + 99u] = v6;
+    A[base + 231u] = v7;
+}
+// END GENERATED LIFTING
+
+// Work-area position of coefficient `i` (0..1023) of one channel's layout.
+uint lay2pos(uint i) {
+    uint y, x;
+    if (i < 64u) {
+        // LL3, HL3, LH3, HH3: 4 x 4 each.
+        uint b = i >> 4, j = i & 15u;
+        y = (j >> 2) + ((b >> 1) << 2);
+        x = (j & 3u) + ((b & 1u) << 2);
+    } else if (i < 256u) {
+        // HL2, LH2, HH2: 8 x 8 each.
+        uint k = i - 64u;
+        uint b = k >> 6, j = k & 63u;
+        y = (j >> 3) + (b >= 1u ? 8u : 0u);
+        x = (j & 7u) + (b != 1u ? 8u : 0u);
+    } else {
+        // HL1, LH1, HH1: 16 x 16 each.
+        uint k = i - 256u;
+        uint b = k >> 8, j = k & 255u;
+        y = (j >> 4) + (b >= 1u ? 16u : 0u);
+        x = (j & 15u) + (b != 1u ? 16u : 0u);
+    }
+    return y * ROW + x;
+}
+
+void main() {
+    const uint l = gl_LocalInvocationIndex;
+    const uint ch = l / 32u;
+    const uint line = l % 32u;
+    const uint slot = gl_WorkGroupID.x;
+    const uint tile = tile_indices[slot];
+    const uint tx = tile % cols;
+    const uint ty = tile / cols;
+
+    // Load: 1024 pixels, coalesced along x; imageLoad of rgba8 returns
+    // [0, 1] floats, so round back to the byte.
+    for (uint p = l; p < 1024u; p += 96u) {
+        uint x = p & 31u, y = p >> 5;
+        vec4 px = imageLoad(current_frame, ivec2(int(tx * 32u + x), int(ty * 32u + y)));
+        A[0u * CHS + y * ROW + x] = int(round(px.b * 255.0));
+        A[1u * CHS + y * ROW + x] = int(round(px.g * 255.0));
+        A[2u * CHS + y * ROW + x] = int(round(px.r * 255.0));
+    }
+    barrier();
+
+    // Three levels; each a row pass then a column pass on the LL quadrant.
+    const uint cb = ch * CHS;
+    lift_rows_32(cb + line * ROW);
+    barrier();
+    lift_cols_32(cb + line);
+    barrier();
+    if (line < 16u) { lift_rows_16(cb + line * ROW); }
+    barrier();
+    if (line < 16u) { lift_cols_16(cb + line); }
+    barrier();
+    if (line < 8u) { lift_rows_8(cb + line * ROW); }
+    barrier();
+    if (line < 8u) { lift_cols_8(cb + line); }
+    barrier();
+
+#if CDF53_FORWARD_ONLY
+    for (uint u = l; u < 3072u; u += 96u) {
+        coefficients[slot * 3072u + u] = A[(u >> 10) * CHS + lay2pos(u & 1023u)];
+    }
+#else
+#error "only the forward-only variant exists (CDF53_FORWARD_ONLY=1)"
+#endif
+}

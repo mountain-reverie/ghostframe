@@ -201,6 +201,15 @@ containers-build:
     docker build -t ghostframe/test-server -f tests/containers/test-server/Dockerfile .
     docker build -t ghostframe/test-headscale -f tests/containers/headscale/Dockerfile tests/containers/headscale/
 
+# Regenerate cdf53_encode.comp's lifting block and compile its variants.
+# The .spv files are checked in; the build never runs glslc. Run after any
+# edit to the shader or to gpu_pipeline/cdf53_shader_gen.rs.
+shaders-cdf53:
+    cargo test -p ghostframe-lib --lib cdf53_shader_gen::regenerate -- --ignored
+    glslc -O --target-env=vulkan1.1 -DCDF53_FORWARD_ONLY=1 \
+        -o ghostframe-lib/src/capture/shaders/cdf53_forward.spv \
+        ghostframe-lib/src/capture/shaders/cdf53_encode.comp
+
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo clippy -p ghostframe-lib --all-targets --features cdf53-diag -- -D warnings
