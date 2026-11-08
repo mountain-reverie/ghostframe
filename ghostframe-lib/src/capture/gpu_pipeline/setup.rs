@@ -125,9 +125,8 @@ const fn derive_pool_need() -> (u32, u32, u32) {
 }
 
 const POOL_NEED: (u32, u32, u32) = derive_pool_need();
-/// Slack kept on top of the derived need. Deliberate: it preserves the
-/// pre-derivation pool sizes exactly, and leaves room for a stage or two
-/// without touching the pool.
+/// Slack kept on top of the derived need: one image and three sets, room for
+/// a stage or two without touching the pool.
 const POOL_IMAGE_HEADROOM: u32 = 1;
 const POOL_SET_HEADROOM: u32 = 3;
 const POOL_STORAGE_IMAGES: u32 = POOL_NEED.0 + POOL_IMAGE_HEADROOM;

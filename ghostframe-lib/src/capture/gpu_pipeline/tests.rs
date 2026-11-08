@@ -1812,7 +1812,7 @@ unsafe fn golden_surfaces(
     rows.push(("folded_into", f_fold.0));
     rows.push(("index_buffer", f_idx.0));
 
-    // CDF 5/3 forward (L1+L2+L3) for the compact tiles, sorted by tile.
+    // CDF 5/3 forward (all three levels) for the compact tiles, sorted by tile.
     let cn = *p.cdf53_compact_count_ptr as usize;
     stats.cdf_max = stats.cdf_max.max(cn);
     let clist = std::slice::from_raw_parts(p.cdf53_compact_list_ptr, cn);
