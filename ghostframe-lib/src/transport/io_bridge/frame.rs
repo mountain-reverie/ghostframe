@@ -412,6 +412,10 @@ impl IoBridge {
         let no_commit = self.force_dirty_frames > 0;
         if no_commit {
             self.force_dirty_frames -= 1;
+            // Every cushion frame is a repaint, however slowly frames come:
+            // at 2 fps the 20 frames outlast the one-off 1 s grace.
+            let now_us = now_std().duration_since(self.epoch).as_micros() as u64;
+            self.classifier.note_repaint(now_us);
         }
 
         // Determine dirty tiles (only after confirming we have a connected session).
@@ -848,7 +852,19 @@ impl IoBridge {
     /// the next message runs. No-op without a frame worker.
     pub(super) fn backend_apply(&mut self, control: Control) {
         if self.frame_pipeline.is_some() {
+            if let Control::InvalidateBaseline(n) = control {
+                self.gpu_cushion_left = self.gpu_cushion_left.max(n);
+            }
             self.pending_controls.push(control);
+        }
+    }
+
+    /// One classified GPU-path frame: while the worker's baseline cushion
+    /// runs, the frame is a repaint, not demand (see `gpu_cushion_left`).
+    pub(super) fn note_gpu_cushion_frame(&mut self, now_us: u64) {
+        if self.gpu_cushion_left > 0 {
+            self.gpu_cushion_left -= 1;
+            self.classifier.note_repaint(now_us);
         }
     }
 
@@ -1473,6 +1489,7 @@ impl IoBridge {
         let now_us = now.duration_since(self.epoch).as_micros() as u64;
         // The H.264 transport's stall flag and the encoder latch are inputs of
         // this decision. A per-size "unavailable" ends with the size.
+        self.note_gpu_cushion_frame(now_us);
         self.h264_availability_for((frame.width, frame.height));
         self.update_h264_stall(now);
         // What a full repaint would cost in the tile codec, summed only while
@@ -1588,6 +1605,14 @@ impl IoBridge {
                     seq,
                     "H264→TileCodec handoff: invalidate_baseline(1) — lossless repaint"
                 );
+            } // No frame worker (the CPU path): the baseline is untouched, but
+              // the first tile frames after H.264 still re-send what changed
+              // while it ran; mark them as a repaint all the same.
+            if prev_mode == FrameMode::H264
+                && new_mode == FrameMode::TileCodec
+                && self.frame_pipeline.is_none()
+            {
+                self.classifier.note_repaint(now_us);
             }
         }
 
