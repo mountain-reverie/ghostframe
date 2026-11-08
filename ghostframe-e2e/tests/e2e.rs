@@ -2637,6 +2637,14 @@ async fn e2e_text_clarity() -> Result<()> {
 /// 256-slot table must reuse via overwrite-eligible (delivered=true) slots.
 //
 // Shared body for `e2e_palette_eviction_chromium` and `e2e_palette_eviction_firefox`.
+/// The palette-churn pattern for both `e2e_palette_eviction` variants.
+/// 5000 palettes, not 300: the X11 paint loop must still be running when the
+/// test samples. At 300 × 96 ms = 28.8 s it can finish first, and the pattern
+/// process exits on its last wipe to black, so the test reads black. At
+/// 5000 × 96 ms ≈ 8 min it is mid-iteration whatever the browser's setup
+/// latency (Firefox's is longer than Chromium's, and hit this).
+const PALETTE_CHURN_ARGS: &str = "--palette-churn 5000";
+
 async fn e2e_palette_eviction_body<B: helpers::BrowserSession>(browser: &mut B) -> Result<()> {
     // ~8s for the pattern to play out at ~5 frames per region × 300.
     tokio::time::sleep(Duration::from_secs(8)).await;
@@ -2838,13 +2846,8 @@ async fn e2e_palette_eviction_body<B: helpers::BrowserSession>(browser: &mut B) 
 
 #[tokio::test]
 async fn e2e_palette_eviction_chromium() -> Result<()> {
-    // Count bumped from 300 → 5000 so the X11 paint loop CANNOT complete
-    // during the test's wait window (300 × 96 ms = 28.8 s ≈ test duration,
-    // causing the pattern process to exit on its last wipe-to-black and
-    // leaving X11 black when the test samples).  At 5000 × 96 ms ≈ 8 min
-    // we're guaranteed to be mid-iteration regardless of test latency.
     let mut setup = setup_e2e_webgpu_gpu_with_env(
-        "--palette-churn 5000",
+        PALETTE_CHURN_ARGS,
         &[("GHOSTFRAME_CAPTURE_DUMP_DIR", "/tmp/captures")],
     )
     .await?;
@@ -2857,7 +2860,7 @@ async fn e2e_palette_eviction_chromium() -> Result<()> {
 
 #[tokio::test]
 async fn e2e_palette_eviction_firefox() -> Result<()> {
-    let mut setup = setup_e2e_webgpu_gpu_firefox("--palette-churn 300").await?;
+    let mut setup = setup_e2e_webgpu_gpu_firefox(PALETTE_CHURN_ARGS).await?;
     e2e_palette_eviction_body(&mut setup.browser).await?;
     setup.browser.close().await
 }
