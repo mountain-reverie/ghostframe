@@ -130,18 +130,34 @@ and `AGENTS.md` are updated where they name the old reason.
   0.40, no flip inside the band, both holds, the unknown-estimate hold, the
   repaint-drain gate, calibration converging to a measured per-tile size.
   Each test is checked by mutating its gate out and watching it fail.
-- Browserless scenes:
-  - LAN-rate link (100 Mbit/s), intermittent motion: exactly one
-    H.264 to tile transition per session (the start), none after.
-  - 2-5 Mbit/s link, sustained full-screen motion: enters H.264 and stays.
-  - A link stepping between the two: enters and leaves once per step, not per
+- Timeline tests (deterministic, classifier level, 30 fps frames with a
+  scripted estimate). The browserless harness cannot host these: its tile
+  scenes advertise no H.264 and its H.264 scenes inject frames past the mode
+  decision.
+  - LAN-rate estimate (100 Mbit/s), intermittent motion bursts: exactly one
+    H.264 to tile transition (the start), none after.
+  - 3 Mbit/s estimate, sustained full-screen motion: enters H.264 and stays.
+  - An estimate stepping between the two: one transition per step, not one per
     motion burst.
-  Reported over 3+ seeds.
+- A bridge test that `estimate_known` stays false until a feedback sample
+  arrives after the session reset, even with a carried-over estimate.
 - Existing tests asserting `cost_comparison`, `enter_factor` or the motion fast
   path are rewritten against the new rule, not deleted.
+- Live check on evangeline with the native-client test script: count
+  `mode.decision` lines per session; the expected count is one (the start)
+  on a static or lightly animated desktop.
 - Threshold sweep: `ENTER_SHARE` in {0.6, 0.7, 0.8} x `EXIT_SHARE` in
-  {0.3, 0.4, 0.5} over the stepping scene; record flips and time in H.264 per
-  setting in the PR body before fixing the constants.
+  {0.3, 0.4, 0.5} over the stepping timeline test (flips, time in H.264), in
+  the PR body, before fixing the constants.
+
+### 2.4 Repaint frames are not demand
+
+A full-screen repaint (session start, the exit handoff, a stuck-entry
+re-dirty) would read as a burst of demand and could push the session straight
+back into H.264. The bridge calls `Classifier::note_repaint(now_us)` whenever
+it requests one; for `REPAINT_GRACE_US` (1 s) after it, a frame whose dirty
+set covers at least 90 % of the screen's tiles adds nothing to the demand
+window.
 
 ## Out of scope
 
