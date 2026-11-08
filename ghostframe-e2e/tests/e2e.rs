@@ -2457,8 +2457,8 @@ async fn e2e_production_shaped_session_strands_no_tiles() -> Result<()> {
             // client's Cdf53 coverage freezes mid-refinement -- which reads
             // as "every tile stranded" while nothing is actually stranded.
             // Measured: a drifting-photo scene flipped at
-            // reason="bandwidth_short" (then "cost_comparison", since
-            // replaced), 15 ms after the last cdf53.emit.
+            // reason="cost_comparison" (the old cost path; the reason is
+            // now "bandwidth_short"), 15 ms after the last cdf53.emit.
             ("GHOSTFRAME_FORCE_TILECODEC", "1"),
             // Production scale. VKMS prefers 1024x768 (32x24 = 768 tiles);
             // a real session is 1920x1080 (60x34 = 2040), so these scenes
