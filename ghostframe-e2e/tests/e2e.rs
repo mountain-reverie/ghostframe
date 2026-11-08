@@ -3158,194 +3158,37 @@ async fn e2e_multi_pattern() -> Result<()> {
     Ok(())
 }
 
-/// M3.0: Verify the classifier switches between TileCodec and H264 frame
-/// modes in response to alternating static/motion content.
-///
-/// The test pattern toggles every 3 seconds (--mode-switch-cycle 3): static,
-/// then motion, then static, etc. We sample the web client's per-mode datagram
-/// counters every 250 ms over ~20 seconds. Because the test pattern starts on
-/// its own clock inside the container, we anchor the timeline to the FIRST
-/// sample with non-zero datagrams, then bin subsequent deltas into 3-second
-/// "phases" relative to that anchor.
-///
-/// Assertions:
-/// - both datagram kinds must be observed (basic precondition: tile_seen && frame_seen),
-/// - at least one phase must contain TileCodec datagrams,
-/// - **at least 2 distinct H264-active phases must be observed.** An H264-active
-///   phase has H.264 frame-datagram count ≥ `MIN_FRAME_COUNT_FOR_H264_PHASE`,
-///   which only happens when the classifier is in H.264 mode for most of the
-///   phase. Two distinct H264-active phases prove the classifier ENTERED
-///   H264 (phase A), EXITED it (else the later phase wouldn't be distinct),
-///   and RE-ENTERED H264 (phase B). Both directions exercised transitively.
-///
-/// Prior assertion shape (`frame > 5 * tile`) was invalidated by the
-/// H264 → TileCodec mode-flip handoff added 2026-05-25: that handoff fires
-/// `invalidate_baseline(1)` on every classifier exit from H.264, producing a
-/// 768-tile burst per transition. Tile counts in motion phases are now in the
-/// thousands (multiple oscillations per phase × 768 tiles each), so a
-/// ratio-based assertion no longer cleanly identifies H.264 mode. The
-/// absolute-frame-count threshold (≥ 150 H.264 datagrams) directly measures
-/// "classifier was in H.264 mode this phase" without relying on tile counts.
-///
-/// Generic over `BrowserSession` so a Firefox variant could be added in the
-/// future (see `e2e_mode_switch_chromium` for the H.264-exclusion rationale).
-async fn e2e_mode_switch_body<B: helpers::BrowserSession>(browser: &mut B) -> Result<()> {
-    // 20 seconds: covers three full 6-second cycles plus startup settle.
-    // The shorter 14s window occasionally hits a startup race where most
-    // sampling lands on static halves and frame_seen flakes false.
-    let total = Duration::from_secs(20);
-    let interval = Duration::from_millis(250);
-    let started = tokio::time::Instant::now();
-    let mut samples: Vec<(u64, u64, u64)> = Vec::new(); // (elapsed_ms, tile, frame)
-
-    while tokio::time::Instant::now() - started < total {
-        let v: serde_json::Value = browser
-            .evaluate(
-                "(() => { const s = window.__ghostframeStats || {tileDatagrams:0, frameDatagrams:0}; return {t: s.tileDatagrams, f: s.frameDatagrams}; })()",
-            )
-            .await?;
-        let elapsed_ms = (tokio::time::Instant::now() - started).as_millis() as u64;
-        let tile = v["t"].as_u64().unwrap_or(0);
-        let frame = v["f"].as_u64().unwrap_or(0);
-        samples.push((elapsed_ms, tile, frame));
-        tokio::time::sleep(interval).await;
-    }
-
-    // Compute per-sample deltas (events per 250 ms window).
-    let deltas: Vec<(u64, i64, i64)> = samples
-        .windows(2)
-        .map(|w| {
-            (
-                w[1].0,
-                w[1].1 as i64 - w[0].1 as i64,
-                w[1].2 as i64 - w[0].2 as i64,
-            )
-        })
-        .collect();
-
-    let tile_seen = deltas.iter().any(|(_, dt, _)| *dt > 0);
-    let frame_seen = deltas.iter().any(|(_, _, df)| *df > 0);
-
-    // Anchor timeline to the first non-zero delta — that's our best estimate
-    // of when the test pattern began streaming.
-    let t_first_data = deltas
-        .iter()
-        .find(|(_, dt, df)| *dt > 0 || *df > 0)
-        .map(|(t, _, _)| *t);
-
-    // Bin into 3-second phases relative to t_first_data.
-    // PHASE_MS matches --mode-switch-cycle 3 (3000 ms per static/motion half).
-    const PHASE_MS: u64 = 3000;
-    let mut phases: Vec<(i64, i64)> = Vec::new(); // (tile_total, frame_total)
-    if let Some(anchor) = t_first_data {
-        for (t, dt, df) in &deltas {
-            if *t < anchor {
-                continue;
-            }
-            let phase_idx = ((*t - anchor) / PHASE_MS) as usize;
-            while phases.len() <= phase_idx {
-                phases.push((0, 0));
-            }
-            phases[phase_idx].0 += *dt;
-            phases[phase_idx].1 += *df;
-        }
-    }
-
-    // H264-active phase: phase where the classifier was in H.264 mode for
-    // most of the phase, identifiable by a high count of H.264 frame
-    // datagrams (which only flow when frame_mode == H264). 150 is comfortably
-    // above the residual frame-datagram count seen in non-H264 phases
-    // (typically 35-67 from the exit-hold tail) and well below what a
-    // motion phase produces (typically 474-503 in 3-second motion windows).
-    // Replaces the prior ratio-based "frame_dominated" check, which was
-    // invalidated by the H264 → TileCodec mode-flip handoff producing
-    // visible tile bursts during motion phases.
-    const MIN_FRAME_COUNT_FOR_H264_PHASE: i64 = 150;
-    let is_h264_active_phase =
-        |(_t, f): &(i64, i64)| -> bool { *f >= MIN_FRAME_COUNT_FOR_H264_PHASE };
-    let h264_active_phases: Vec<usize> = phases
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| is_h264_active_phase(p))
-        .map(|(i, _)| i)
-        .collect();
-
-    // Tile presence is harder to isolate because H.264 cooldown frames may
-    // overlap static phases. Just require non-zero tile emission in any phase.
-    let tile_present_phase = phases.iter().any(|(t, _)| *t > 0);
-
-    eprintln!("--- per-phase totals ---");
-    for (i, (t, f)) in phases.iter().enumerate() {
-        let marker = if is_h264_active_phase(&(*t, *f)) {
-            " <H264-ACTIVE>"
-        } else {
-            ""
-        };
-        eprintln!("phase {i}  tile={t:>5}  frame={f:>5}{marker}");
-    }
-
-    // Extra detail on failure: per-sample deltas + summary line.
-    let pass = tile_seen && frame_seen && tile_present_phase && h264_active_phases.len() >= 2;
-    if !pass {
-        eprintln!("--- per-sample deltas (anchor={:?}) ---", t_first_data);
-        for (ms, dt, df) in &deltas {
-            eprintln!("t={ms:>5}ms  +tile={dt:>4}  +frame={df:>4}");
-        }
-        eprintln!(
-            "tile_seen={tile_seen} frame_seen={frame_seen} tile_present_phase={tile_present_phase} h264_active_phases={h264_active_phases:?}"
-        );
-    }
-
-    assert!(
-        tile_seen,
-        "expected at least one tile datagram during the test (TileCodec mode); none observed"
-    );
-    assert!(
-        frame_seen,
-        "expected at least one frame datagram during the test (H264 mode); none observed"
-    );
-    assert!(tile_present_phase,
-        "expected at least one phase containing TileCodec datagrams; classifier may be stuck in H264");
-    // Load-bearing assertion: 2+ distinct H264-active phases proves the
-    // classifier entered H264, *left it* (else the later phase wouldn't be a
-    // distinct entry), and re-entered. Both directions exercised transitively
-    // via the H.264-frame-datagram-count signal — H.264 datagrams flow only
-    // when frame_mode == H264, so a high count means the classifier was
-    // actively in H.264 mode for that phase.
-    assert!(
-        h264_active_phases.len() >= 2,
-        "expected at least 2 distinct H264-active phases (proves classifier flipped both \
-         directions: H264 → exit → H264). Observed H264-active phase indices: {:?}",
-        h264_active_phases
-    );
-
-    Ok(())
-}
-
-// Chromium-only: this scenario transitions through H.264 mode, which Firefox
-// cannot render (TEXTURE_EXTERNAL capability missing). The body is generic
-// over BrowserSession so a Firefox variant *could* be added once the HELLO
-// h264Supported bit is plumbed and the server is gated against selecting
-// H.264 for Firefox clients — but until then, asserting on H.264-mode
-// telemetry would always fail on Firefox.
+// The bandwidth rule, end to end: H.264 is entered with `bandwidth_short`
+// when the tile codec's first pass does not fit the estimate, and left with
+// `bandwidth_fits` when it does.
 //
-// `--motion video`: the motion half must be content H.264 is the right
-// answer to. The default bands are a screen of Solid tiles, which the tile
-// codec carries for less than one H.264 frame costs, so the bandwidth rule
-// rightly never leaves TileCodec for them. This test nonetheless passed on
-// bands for months, because the client's suspension detector mistook every
-// quiet static half for a network stall and the server answers that by
-// forcing H.264.
+// The estimate is pinned (`GHOSTFRAME_TEST_FORCE_BYTES_PER_US=0.45`, 3.6
+// Mbit/s) just above the headroom guard's 3 Mbit/s release, so the guard
+// stays out of it and the rule alone decides. On loopback the real estimate
+// is 7-10 Mbit/s, where this content's first pass (~1-2.5 Mbit/s) rightly
+// fits and the classifier stays on tiles; pinning the line low is what makes
+// the motion half not fit, deterministically, without shaping the network.
+// `--motion video` is a screenful of Cdf53 tiles repainted every frame (a
+// first pass well over 0.70 x 3.6 Mbit/s); the default `solid` static half
+// is cheap, so its repaint drains well inside a second and the demand falls
+// under 0.40 x the estimate. The test asserts the classifier's reasons, not
+// datagram counts, which swing with machine load.
+//
+// Chromium-only: Firefox cannot render H.264 mode (TEXTURE_EXTERNAL missing).
 #[tokio::test]
 async fn e2e_mode_switch_chromium() -> Result<()> {
-    let mut setup = setup_e2e_webgpu_gpu_with_env(
+    let setup = setup_e2e_webgpu_gpu_with_env(
         "--x11-sink --mode-switch-cycle 3 --motion video",
-        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
+        &[
+            ("GHOSTFRAME_ENABLE_CDF53", "1"),
+            ("GHOSTFRAME_TEST_FORCE_BYTES_PER_US", "0.45"),
+        ],
     )
     .await?;
-    e2e_mode_switch_body(&mut setup.browser).await?;
+    // Three full 6 s cycles plus start-up settle.
+    tokio::time::sleep(Duration::from_secs(20)).await;
 
-    // The datagram counts say the mode flipped; only the server can say why.
+    // Only the server can say why the mode flipped.
     let logs = helpers::read_server_logs_stripped("ghostframe-server");
     // Every datagram of an H.264 frame has to fit the path; a datagram the
     // path refuses is otherwise visible only as this one log line.
@@ -3360,26 +3203,43 @@ async fn e2e_mode_switch_chromium() -> Result<()> {
     helpers::report_acked_ref_outcome(helpers::acked_ref_outcome(&logs, helpers::require_vaapi()));
     let decisions = mode_decisions(&logs);
     eprintln!("mode decisions: {decisions:?}");
+    // The numbers behind each decision (demand, estimate, repaint drain), for
+    // whoever has to retune the rule.
+    for line in logs
+        .lines()
+        .filter(|l| l.contains("event=\"mode.decision\""))
+    {
+        eprintln!("{line}");
+    }
     let entered: Vec<&str> = decisions
         .iter()
         .filter(|d| d.from == "TileCodec" && d.to == "H264")
         .map(|d| d.reason.as_str())
         .collect();
-    // At least twice on the bandwidth rule's own judgement. A network override
-    // may account for other entries -- a client that stalls for 100 ms
-    // raises `suspension` legitimately -- but it must not be what the test
-    // is counting, which is how it passed before.
+    // The motion half does not fit the pinned line: entered on the rule's own
+    // judgement at least twice (a network override must not be what is counted).
     let by_bandwidth = entered.iter().filter(|r| **r == "bandwidth_short").count();
     assert!(
         by_bandwidth >= 2,
-        "expected the bandwidth rule to choose H264 for video motion at least twice, \
+        "expected `bandwidth_short` to choose H264 for the motion half at least twice, \
          got {by_bandwidth}; decisions: {decisions:?}"
     );
+    // The static half fits: left by the rule, not by a timeout or an override.
+    let left_by_fit = decisions
+        .iter()
+        .filter(|d| d.from == "H264" && d.to == "TileCodec" && d.reason == "bandwidth_fits")
+        .count();
     assert!(
-        decisions
+        left_by_fit >= 1,
+        "expected `bandwidth_fits` to take the classifier back to TileCodec; \
+         decisions: {decisions:?}"
+    );
+    // Neither the headroom guard nor the unknown-estimate hold is in play.
+    assert!(
+        !decisions
             .iter()
-            .any(|d| d.from == "H264" && d.to == "TileCodec"),
-        "expected the classifier to leave H264 for the static half; decisions: {decisions:?}"
+            .any(|d| d.reason == "headroom_guard" || d.reason == "estimate_unknown"),
+        "the estimate is pinned above the guard; decisions: {decisions:?}"
     );
     setup.browser.close().await
 }
