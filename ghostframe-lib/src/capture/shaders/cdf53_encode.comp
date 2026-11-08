@@ -35,7 +35,7 @@ layout(set = 0, binding = 2, std430) writeonly buffer Cdf53Coefficients {
 
 layout(push_constant) uniform PushConstants {
     uint cols;
-    uint rows;
+    uint rows;   // unused; keeps the 8-byte push range the stage was built with
 };
 
 const uint ROW = 33u;          // padded row stride, words (no bank conflicts on columns)

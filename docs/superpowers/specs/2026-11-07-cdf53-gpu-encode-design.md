@@ -211,7 +211,7 @@ damaged frame. Measure it in PR 2's report before considering it.
 
 ## 8. Testing
 
-All GPU tests are `#[ignore]`d on CI hosts without a GPU, per the existing skip list, and are run locally through
+All GPU tests run in a local `cargo test`; CI, which has no GPU, skips their modules by name in `.github/workflows/ci.yml` (the workflow exempts itself, never `#[ignore]` or a runtime self-skip). They are run locally through
 `gf-gpu-run`.
 
 - **Oracle gate, the main test.** For each variant (`forward`, `_sg`, `_wg`, with `_sg` forced only where 4.4 allows),

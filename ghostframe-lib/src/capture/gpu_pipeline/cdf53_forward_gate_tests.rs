@@ -10,7 +10,9 @@ use crate::encoder::cdf53;
 const NEEDS_GPU: &str =
     "GpuFrameProcessor::new failed: this test needs a Vulkan GPU and must not skip";
 
-/// One 32x32 BGRA tile of pattern `kind` (0..=7), with `seed` varying the noise.
+/// One 32x32 BGRA tile of pattern `kind` (0..=7); `seed` varies the noise, the
+/// impulse's corner and the gradient's phase (the flat and striped patterns do
+/// not depend on it).
 /// The patterns hit the transform's edges: flat extremes, maximal
 /// high-pass energy (checkerboard, stripes), a lone corner impulse
 /// (mirror boundary), full-range noise and a gradient.
@@ -29,12 +31,38 @@ fn pattern(kind: u32, seed: u64) -> Vec<u8> {
             t[i * 4 + c] = match kind {
                 0 => 0,
                 1 => 255,
-                2 => if (x + y + c) % 2 == 0 { 255 } else { 0 },
-                3 => if x % 2 == 0 { 255 } else { 0 },
-                4 => if y % 2 == 0 { 255 } else { 0 },
-                5 => if x == 31 && y == 31 { 255 } else { 0 },
+                2 => {
+                    if (x + y + c) % 2 == 0 {
+                        255
+                    } else {
+                        0
+                    }
+                }
+                3 => {
+                    if x % 2 == 0 {
+                        255
+                    } else {
+                        0
+                    }
+                }
+                4 => {
+                    if y % 2 == 0 {
+                        255
+                    } else {
+                        0
+                    }
+                }
+                5 => {
+                    // A lone impulse in one corner per seed: both mirror ends.
+                    let (cx, cy) = [(0, 0), (31, 0), (0, 31), (31, 31)][(seed % 4) as usize];
+                    if x == cx && y == cy {
+                        255
+                    } else {
+                        0
+                    }
+                }
                 6 => rnd() as u8,
-                _ => ((x * 8 + y * 3 + c * 40) % 256) as u8,
+                _ => ((x * 8 + y * 3 + c * 40 + seed as usize * 17) % 256) as u8,
             };
         }
         t[i * 4 + 3] = 255;
@@ -55,7 +83,10 @@ fn adversarial_tiles_match_the_cpu_forward_exactly() {
     let bad: Vec<usize> = (0..tiles.len())
         .filter(|&i| got[i * n..(i + 1) * n] != cdf53::forward(&tiles[i])[..])
         .collect();
-    assert!(bad.is_empty(), "tiles differing from the CPU forward: {bad:?}");
+    assert!(
+        bad.is_empty(),
+        "tiles differing from the CPU forward: {bad:?}"
+    );
 }
 
 #[test]
@@ -91,14 +122,17 @@ fn a_full_noise_frame_matches_the_cpu_forward_on_every_listed_tile() {
         let mut tile = vec![0u8; 4096];
         for r in 0..32u32 {
             let src = (((ty * 32 + r) * w + tx * 32) * 4) as usize;
-            tile[(r * 128) as usize..(r * 128 + 128) as usize]
-                .copy_from_slice(&px[src..src + 128]);
+            tile[(r * 128) as usize..(r * 128 + 128) as usize].copy_from_slice(&px[src..src + 128]);
         }
-        let have = unsafe { std::slice::from_raw_parts(gpu.cdf53_coefficients_ptr.add(slot * n), n) };
+        let have =
+            unsafe { std::slice::from_raw_parts(gpu.cdf53_coefficients_ptr.add(slot * n), n) };
         let want = cdf53::forward(&tile);
         if have.iter().zip(&want).any(|(&g, &c)| g as i16 != c) {
             bad += 1;
         }
     }
-    assert_eq!(bad, 0, "{bad}/{count} listed tiles differ from the CPU forward");
+    assert_eq!(
+        bad, 0,
+        "{bad}/{count} listed tiles differ from the CPU forward"
+    );
 }
