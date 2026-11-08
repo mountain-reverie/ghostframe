@@ -187,8 +187,14 @@ pub async fn setup_e2e_server_as(
 
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
     let test_node = Arc::new(TestNode::join(client_key, client_control_url).await?);
-    let upstream = test_node.dial("ghostframe-server:443")?;
-    let forwarder = start_forwarder("127.0.0.1:0", upstream).await?;
+    let forwarder = start_forwarder(
+        "127.0.0.1:0",
+        crate::harness::transport::tailnet_udp_dialer(
+            test_node.clone(),
+            "ghostframe-server:443".into(),
+        ),
+    )
+    .await?;
 
     let tcp_bind = format!("127.0.0.1:{}", forwarder.port());
     let tcp_forwarder = start_tcp_forwarder(

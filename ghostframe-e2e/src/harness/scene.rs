@@ -291,8 +291,14 @@ pub(crate) async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioSt
     let test_node = std::sync::Arc::new(
         crate::harness::containers::TestNode::join(client_key, client_control_url).await?,
     );
-    let udp_upstream = test_node.dial("ghostframe-server:443")?;
-    let forwarder = crate::harness::transport::start_forwarder("127.0.0.1:0", udp_upstream).await?;
+    let forwarder = crate::harness::transport::start_forwarder(
+        "127.0.0.1:0",
+        crate::harness::transport::tailnet_udp_dialer(
+            test_node.clone(),
+            "ghostframe-server:443".into(),
+        ),
+    )
+    .await?;
 
     // TCP forwarder shares the loopback port number with the UDP forwarder
     // (TCP and UDP are independent transports). Chrome's WebTransport
