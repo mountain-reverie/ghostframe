@@ -37,7 +37,7 @@ Files added by this revision:
     - 7–10 % at T = 5 ms;
     - 0.9–1.5 % at T = 25 ms;
     - 0.7–1.6 % for RaptorQ with one block per frame.
-  - At 100 Mbit/s, k_max = 64 binds (64 bundles last about 6 ms), so k_max must rise toward the GF(2^8) limit of k + r ≤ 256 **[E]**.
+  - At 100–200 Mbit/s, k_max = 64 binds (64 bundles last 3–6 ms): 13–19 % of frames are late at mean burst 8. Above about 70 Mbit/s a frame exceeds one GF(2^8) block, so it is split into interleaved blocks, which leave 0.4–1.8 % late, indistinguishable from one ideal block (§8.1) **[E]**.
 - **Codec.** A systematic GF(2^8) Cauchy RS with repair row 0 = XOR, run on `rusty_erasure` 0.4.3 with our own matrix and our own e×e decoder.
   - Wasm cost: +9 to +12 KB gzip with `+simd128`.
   - About 3 µs in wasm to rebuild one loss at k ≤ 40 **[M]**.
@@ -47,7 +47,7 @@ Files added by this revision:
   - a decode floor of about 270 µs in wasm (measured at k = 10);
   - one spare symbol per block.
 
-  Above about 70 Mbit/s a 30 fps frame exceeds 256 bundles. A frame-spanning block there needs GF(2^16) or two blocks per frame (§8, item 4).
+  Above about 70 Mbit/s a 30 fps frame exceeds 256 bundles. Splitting it into interleaved GF(2^8) blocks matches one ideal GF(2^16) block, and matches RaptorQ per frame, within the seed spread (§8.1) **[E]**. So no large-field code is needed.
 - **Sliding window: deferred.**
   - For: it is the latency winner under i.i.d. loss from 30 Mbit/s up **[E]**:
     - p95 3.1 / 0.9 ms at 30 / 100 Mbit/s, against 13–17 ms for time-capped RS;
@@ -223,7 +223,9 @@ All numbers in this table are **[M]**.
 
 Used as one block per tile burst, its recovery p95 is 0.16–9.7 s **[E]**.
 
-**Where RaptorQ, or another large-field code, would come back.** Above about 70 Mbit/s, a 30 fps frame is more than 256 bundles. A block that spans a whole frame then needs GF(2^16): RaptorQ, or `reed-solomon-simd` (Leopard). Its decode cost is fixed, about 0.9 ms in wasm (rev 5 §4.2). The cheaper alternative is to split each frame into two or more interleaved RS blocks. §8 item 4 asks which; it matters only above about 70 Mbit/s with measured bursts.
+**Large-field codes are not needed above 70 Mbit/s either.** Above about 70 Mbit/s a 30 fps frame is more than 256 bundles, so one GF(2^8) block cannot span it.
+- Splitting the frame into m interleaved GF(2^8) blocks gives the same late-frame rate as one ideal GF(2^16) block and as RaptorQ per frame. The 5-seed means are within 0.09 point at 100–200 Mbit/s under burst-8 loss **[E]**, §8.1.
+- A contiguous split without interleaving is clearly worse.
 
 **The sliding-window code is the one real alternative.** The uniform design is what makes it attractive: it has no block boundaries, and boundaries are the hard part of §4.
 
@@ -312,8 +314,14 @@ Each repair is recorded in the ledger as a transmission (rev 5 §4.9.1).
   - At a fixed 20 %, a 3 MB first paint at 10 Mbit/s would pay 0.5 s **[E]**.
 - **Bursts widen blocks before they add parity.**
   - When the fitted mean burst exceeds about 1.5, T rises toward the frame interval and k_max toward 256 − r.
-  - The cost is recovery latency: a few ms at most rates, up to one frame interval at low rate.
-  - Only when k_max is at its limit does r rise instead. Above about 70 Mbit/s that is where §8 item 4 applies.
+  - **Above about 70 Mbit/s, blocks span a frame by splitting it** into m = ceil((k + r)/256) interleaved blocks (§8.1).
+    - The small-block default is not enough there.
+    - With 5 seeds at 100–200 Mbit/s and 20 % overhead, k_max = 64 leaves 4–5 % of frames late at mean burst 3 and 13–19 % at burst 8. Frame-spanning blocks leave 0.4–1.8 % at burst 8 (`sim-rev6/FINDINGS.md` §6) **[E]**.
+  - **The cost is recovery latency for what is not an H.264 frame.**
+    - Frame-spanning blocks put a lost source's recovery after the frame's last symbol: p95 62–70 ms at 100–200 Mbit/s, against 10–20 ms for small blocks **[E]**.
+    - For H.264 that costs nothing. A frame cannot be decoded before all its fragments are there, and frame lateness is the metric above.
+    - For tiles in the same block it is real latency. Under measured bursts it is still well under ARQ's RTT + detection.
+  - Only when the span is at its limit (a frame) does r rise instead.
 - **Clean link: no FEC.**
   - Below a measured pre-FEC loss floor, r = 0 and traffic goes in PLAIN frames (§6). r_min = 1 alone would cost at least 1/k: about 17 % at 2 Mbit/s with no loss.
   - Above the floor, r = 1 at the first measured loss.
@@ -431,7 +439,7 @@ The validation plans of rev 5 §4.6 and §4.9.8 apply: every property test comes
 
 ## 8. Decisions for the owner
 
-**Decided 2026-11-07:** items 1, 2, 5, 7, 8 and 9 as recommended below. Items 4 and 6 are open, pending the analysis in §8.1 and §8.2.
+**Decided 2026-11-07:** items 1, 2, 5, 7, 8 and 9 as recommended below. Items 4 and 6 have a recommendation with analysis in §8.1 and §8.2, and await the owner's confirmation.
 
 1. **Codec: `rusty_erasure` with our matrix and the e×e decoder.** **Decided: pinned `=0.4.3`**, with `gf256` as the permanent differential oracle.
    - Vendoring (about 5 000 lines) was the alternative.
@@ -442,7 +450,7 @@ The validation plans of rev 5 §4.6 and §4.9.8 apply: every property test comes
    - (a) two or more interleaved GF(2^8) blocks per frame;
    - (b) a GF(2^16) code for large blocks, RaptorQ or Leopard, with about 0.3–0.9 ms of wasm decode per block.
 
-   **Open:** see §8.1. A simulation comparing the two is in progress.
+   **Recommended, on simulation (§8.1): (a), interleaved.** Awaiting the owner's confirmation.
 5. **Clean-link floor** (§5): the measured pre-FEC loss below which r = 0. **Decided: 0.1 %**, with r = 1 restored at the first loss above it. Revision 5 used 0.3 % where a repair round fits, and r = 1 at any loss where none does.
 6. **The last bundle of a pass.** Pad it to `max_size()`, or accept that quinn occasionally puts two short bundles in one packet. **Open:** see §8.2.
 7. **Negotiation.** **Decided: the framing is unconditional.** There is no HELLO bit, and every s→c datagram of every session is framed (§6.1). There are no deployments to stay compatible with (owner, 2026-10-15). This removes a compatibility matrix and the pre-HELLO ambiguity.
@@ -475,7 +483,23 @@ The validation plans of rev 5 §4.6 and §4.9.8 apply: every property test comes
   - No XOR fast path: one loss costs the same as many.
   - Leopard needs even shard sizes; RaptorQ needs a spare symbol.
 
-**What would decide it:** the residual gap between (a) and (b) at 70–200 Mbit/s under burst loss. That is not simulated yet, and is being added to `sim-rev6`. Until then the lean is (a): no new code. Choose (b) only if (a) leaves a gap of more than a point or so of late frames.
+**Simulated** (`sim-rev6/split_sim.py`, `FINDINGS.md` §6) **[E]**:
+- **Grid:** 70–200 Mbit/s; H.264 only and the mix; i.i.d. 1–2 % and Gilbert-Elliott 2 % with mean burst 3, 8 and 16; overhead 10–30 %. 5 seeds for the burst-3 and burst-8 cells at 100 and 200 Mbit/s.
+- **Interleaved (a) and ideal MDS (b) cannot be told apart:**
+  - the 5-seed means differ by at most 0.09 point, inside the seed spread (0.1–0.4);
+  - the sign varies from cell to cell;
+  - no cell of the full grid differs by more than 1 point.
+- **RaptorQ per frame matches (b)** in every cell.
+- **The contiguous split** (control, no interleave) is clearly worse under bursts: 2.1 % of frames late at burst 8, against 0.4–1.2 %. Interleaving is what keeps (a) at MDS level.
+- **Typical numbers** (H.264, burst 8, 20 % overhead, 5-seed means; late frames for (a) / (b)):
+  - 100 Mbit/s: 1.23 / 1.22 %;
+  - 200 Mbit/s: 0.40 / 0.49 %.
+
+**Recommendation: (a)**, with m = ceil((k + r)/256), bundle i in block i mod m, and r = ceil(R/m).
+- It needs no second codec and no second oracle.
+- It has no fixed 0.9 ms wasm decode per lossy frame.
+- It keeps the XOR fast path.
+- The model leaves out CPU cost and time-correlated loss. Both favour (a).
 
 ### 8.2 Item 6: pad the last bundle of a pass, or accept coalescing
 
