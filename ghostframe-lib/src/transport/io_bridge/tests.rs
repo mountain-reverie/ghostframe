@@ -953,12 +953,13 @@ fn classifier_reset_clears_streaks() {
     let mut c = Classifier::new(crate::config::ClassifierConfig::default());
     c.set_adaptation_context(crate::tile::classifier::AdaptationContext {
         supports_h264: true,
-        bwe_estimate_bps: 20_000_000,
+        bwe_estimate_bps: 3_000_000,
         estimate_known: true,
         ..Default::default()
     });
     c.set_screen(2040, 0);
-    // A full screen of first passes: over 0.7 x 20 Mbit/s.
+    // A full screen of first passes: over 0.7 x 3 Mbit/s from the first frame
+    // (2040 x 154 B x 8 = 2.5 Mbit in the window).
     let busy: Vec<CodecState> = vec![
         CodecState::Cdf53 {
             passes_sent: 0,
@@ -9905,4 +9906,27 @@ async fn the_estimate_is_unknown_until_a_sample_follows_the_session_reset() {
     assert!(bridge.bwe.snapshot().samples_seen > snap.samples_seen);
     bridge.apply_path_stats_snapshot(1_000.0);
     assert!(bridge.adaptation_context.estimate_known);
+}
+
+/// The GPU path's slow-start cushion is a repaint for every one of its frames,
+/// not only for the first second: at 2 fps the 20 frames last 10 s, and the
+/// classifier's one-off grace would end after two.
+#[tokio::test]
+async fn every_gpu_cushion_frame_extends_the_repaint_grace() {
+    let (mut bridge, _peer, _log) = recording_bridge();
+    bridge.backend_apply(super::frame_backend::Control::InvalidateBaseline(20));
+    let step_us = 500_000; // 2 fps
+    for k in 0..20u64 {
+        let now_us = k * step_us;
+        bridge.note_gpu_cushion_frame(now_us);
+        let until = bridge.classifier.repaint_grace_until_us();
+        assert!(
+            until.is_some_and(|t| t > now_us),
+            "frame {k}: grace {until:?} does not cover {now_us}"
+        );
+    }
+    // The cushion is spent: the next frame does not extend the grace.
+    let last = bridge.classifier.repaint_grace_until_us();
+    bridge.note_gpu_cushion_frame(20 * step_us);
+    assert_eq!(bridge.classifier.repaint_grace_until_us(), last);
 }

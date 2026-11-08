@@ -453,6 +453,12 @@ impl Classifier {
         self.repaint_grace_until_us = Some(now_us.saturating_add(REPAINT_GRACE_US));
     }
 
+    /// When the current repaint grace ends, if one was noted.
+    #[cfg(test)]
+    pub(crate) fn repaint_grace_until_us(&self) -> Option<u64> {
+        self.repaint_grace_until_us
+    }
+
     /// One emission batch's first-pass bytes of `kind` (see
     /// `FirstPassModel::observe`).
     pub fn observe_first_pass(&mut self, kind: FirstPassKind, bytes: u64, tiles: u32) {

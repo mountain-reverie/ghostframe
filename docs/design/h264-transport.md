@@ -29,7 +29,7 @@ order:
 | `bandwidth_short` | the tile codec's first-pass demand stayed above 0.70 x the bandwidth estimate for 500 ms: enter H.264 |
 | `bandwidth_fits` | first-pass demand below 0.40 x the estimate for 1 s, and the exit repaint drains within 1 s: leave H.264 |
 | `estimate_unknown` | the estimate has not moved since the session reset: hold the mode |
-| `hysteresis_clamp` | the cost model wants to switch but the dwell has not elapsed: keep the previous mode |
+| `hysteresis_clamp` | the reason on every frame that does not switch: the bandwidth rule's condition has not held long enough, or does not hold at all: keep the previous mode |
 
 The frame mode only switches the codec. Both modes share one transmission
 ledger, one admission bucket and one bandwidth estimator.
@@ -562,8 +562,10 @@ packet rule once the newest acknowledged departure is `reo_wnd` later than it
 rule, which is `reo_wnd` (at most 50 ms) later than it would have been. A path
 that never reorders keeps it at zero and judges as before.
 
-Environment variables (the classifier ones also accept their older
-`GHOSTFRAME_TEST_*` names, e.g. `GHOSTFRAME_TEST_HEADROOM_MIN_BPUS`):
+Environment variables (some of the classifier ones also accept an older
+`GHOSTFRAME_TEST_*` name, e.g. `GHOSTFRAME_TEST_HEADROOM_MIN_BPUS`; the two
+share variables, `GHOSTFRAME_MODE_ENTER_SHARE` and `GHOSTFRAME_MODE_EXIT_SHARE`,
+have none):
 
 | Variable | Effect | Default |
 |---|---|---|

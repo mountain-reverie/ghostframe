@@ -705,6 +705,11 @@ pub struct IoBridge {
     /// QUIC slow-start can only deliver a fraction of tiles in the first burst;
     /// forcing dirty for several frames lets the congestion window open.
     force_dirty_frames: u32,
+    /// The GPU path's copy of the baseline cushion that lives on the frame
+    /// worker (`GpuFrameProcessor::force_all_dirty_remaining`): set to the
+    /// longest `InvalidateBaseline` queued, counted down once per classified
+    /// frame, so each cushion frame can be marked a repaint.
+    gpu_cushion_left: u32,
     /// Consecutive frames the GPU backend failed to analyse; reset on success.
     /// Only used to keep the warning from flooding the journal.
     gpu_analyse_failures: u32,
@@ -1471,6 +1476,7 @@ impl IoBridge {
             tick_budget_floor_bytes: None,
             last_max_datagram_size: None,
             force_dirty_frames: 0,
+            gpu_cushion_left: 0,
             gpu_analyse_failures: 0,
             stuck_sweep_counter: 0,
             admission: crate::transport::admission::AdmissionBucket::new(),
