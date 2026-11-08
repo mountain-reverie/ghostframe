@@ -1,10 +1,24 @@
 use super::*;
 use crate::config::ClassifierConfig;
 
-fn h264_states(n: u32) -> Vec<CodecState> {
-    (0..n)
-        .map(|i| CodecState::H264 { frames_in_h264: i })
-        .collect()
+fn cdf53_states(n: u32) -> Vec<CodecState> {
+    vec![
+        CodecState::Cdf53 {
+            passes_sent: 0,
+            present_passes: 0x3FFF,
+        };
+        n as usize
+    ]
+}
+
+/// A context with a known estimate, for tests that exercise the bandwidth rule.
+fn known(estimate_bps: u64) -> crate::tile::classifier::AdaptationContext {
+    crate::tile::classifier::AdaptationContext {
+        supports_h264: true,
+        bwe_estimate_bps: estimate_bps,
+        estimate_known: true,
+        ..Default::default()
+    }
 }
 
 fn solid_states(n: u32) -> Vec<CodecState> {
@@ -20,57 +34,32 @@ fn switch_frame(dwell_us: u64, frame_interval_us: u64) -> u32 {
 }
 
 #[test]
-fn enters_h264_after_sustain_frames_via_motion_fastpath() {
+fn enter_streak_resets_on_a_frame_that_fits() {
+    // 20 Mbit/s: one frame of 2040 tiles (21 Mbit over the window) is over
+    // 0.7 x 20; the window then drains, so a long run of empty frames puts
+    // the demand back under it and the enter hold restarts.
     let mut c = Classifier::new(ClassifierConfig::default());
-    let states = h264_states(20); // 20 dirty tiles, all H264 → 100% > 20%, ≥ 8 absolute
-                                  // enter_sustain_micros = 50_000 µs ≈ 3 frames at 60 fps (16_667 µs/frame).
-                                  // Frames 0..switch_frame-1 must return TileCodec; frame switch_frame returns H264.
-    let sw = switch_frame(c.enter_sustain_micros, 16_667); // 3
-    for frame in 0..sw {
-        assert_eq!(
-            c.decide_frame_mode_at((frame as u64) * 16_667, &states, FrameMode::TileCodec),
-            FrameMode::TileCodec,
-            "should not enter before sustain elapsed (frame {frame})",
-        );
-    }
-    assert_eq!(
-        c.decide_frame_mode_at((sw as u64) * 16_667, &states, FrameMode::TileCodec),
-        FrameMode::H264
-    );
-}
-
-#[test]
-fn motion_fastpath_blocked_by_min_absolute_floor() {
-    let mut c = Classifier::new(ClassifierConfig::default());
-    let states = h264_states(2); // only 2 H264 tiles — 100% but below floor of 8
-                                 // Time can advance freely; floor means enter_now is always false → no switch.
-    for frame in 0..10u32 {
-        assert_eq!(
-            c.decide_frame_mode_at((frame as u64) * 16_667, &states, FrameMode::TileCodec),
-            FrameMode::TileCodec,
-            "min-absolute floor must prevent fast-path on tiny dirty sets",
-        );
-    }
-}
-
-#[test]
-fn enter_streak_resets_on_quiet_frame() {
-    let mut c = Classifier::new(ClassifierConfig::default());
-    let busy = h264_states(20);
-    let quiet = solid_states(1);
-    // Build dwell to just before the switch point (sw-1 frames at 60 fps < dwell threshold).
-    // enter_sustain_micros = 50_000; switch_frame = 3.
-    let sw = switch_frame(c.enter_sustain_micros, 16_667); // 3
+    c.set_adaptation_context(known(20_000_000));
+    let busy = cdf53_states(2040);
     let mut t = 0u64;
-    for _ in 0..(sw - 1) {
-        c.decide_frame_mode_at(t, &busy, FrameMode::TileCodec);
+    // Busy for just under the 500 ms enter hold.
+    while t < c.enter_sustain_micros - 17_000 {
+        assert_eq!(
+            c.decide_frame_mode_at(t, &busy, FrameMode::TileCodec),
+            FrameMode::TileCodec
+        );
         t += 16_667;
     }
-    // A quiet frame resets the enter timer (enter_started_us becomes None).
-    c.decide_frame_mode_at(t, &quiet, FrameMode::TileCodec);
+    // A long quiet gap drains the window: the demand falls under the share
+    // and the enter timer is reset.
+    t += 1_100_000;
+    assert_eq!(
+        c.decide_frame_mode_at(t, &[], FrameMode::TileCodec),
+        FrameMode::TileCodec
+    );
+    // The first busy frame after the reset restarts the hold: still tiles,
+    // even though the old timer started more than the hold ago.
     t += 16_667;
-    // First busy frame after reset: enter timer restarted at this t.
-    // now_us - started_us = 0 (same frame) < dwell → must still be TileCodec.
     assert_eq!(
         c.decide_frame_mode_at(t, &busy, FrameMode::TileCodec),
         FrameMode::TileCodec
@@ -78,11 +67,12 @@ fn enter_streak_resets_on_quiet_frame() {
 }
 
 #[test]
-fn exits_h264_after_sustain_frames_when_costs_drop() {
+fn exits_h264_after_sustain_frames_when_demand_drops() {
     let mut c = Classifier::new(ClassifierConfig::default());
-    let cheap = solid_states(2); // tile-codec cost trivial → < h264 * 0.6
-                                 // exit_sustain_micros = 500_000 µs; switch_frame at 60 fps = ceil(500_000/16_667) = 30.
-    let sw = switch_frame(c.exit_sustain_micros, 16_667); // 30
+    c.set_adaptation_context(known(100_000_000));
+    let cheap = solid_states(2); // demand trivial, under 0.4 x the estimate
+                                 // exit_sustain_micros = 1_000_000 µs; at 60 fps that is 60 frames.
+    let sw = switch_frame(c.exit_sustain_micros, 16_667);
     for frame in 0..sw {
         assert_eq!(
             c.decide_frame_mode_at((frame as u64) * 16_667, &cheap, FrameMode::H264),
@@ -97,39 +87,14 @@ fn exits_h264_after_sustain_frames_when_costs_drop() {
 }
 
 #[test]
-fn deadband_keeps_h264_mode_between_thresholds() {
-    // Inflate exit_factor to make all our tile-codec costs land in the deadband.
-    let mut c = Classifier {
-        exit_factor: 0.0001,
-        ..Default::default()
-    };
-    let states = h264_states(4); // some cost, but exit_factor makes exit unreachable
-                                 // time can advance freely; exit_now is always false → stays H264.
-    for frame in 0..50u32 {
-        assert_eq!(
-            c.decide_frame_mode_at((frame as u64) * 16_667, &states, FrameMode::H264),
-            FrameMode::H264
-        );
-    }
-}
-
-#[test]
-fn enters_h264_after_sustain_frames_via_cost_path_only() {
-    // 200 Cdf53 tiles: cost = 200*90 µs + 200*1300 B/12.5 B/µs = 18_000 + 20_800 = 38_800 µs.
-    // > h264_cost (3960) × enter_factor (1.3) = 5148 → cost_enter = true.
-    // h264_tile_count = 0 < motion_tile_min_absolute (8) → motion_enter = false.
-    // This is the cost-only enter path — exercises a code branch the other
-    // enter-path tests don't reach (they hit motion_enter simultaneously).
+fn enters_h264_after_the_enter_hold_when_the_first_pass_does_not_fit() {
+    // 2040 Cdf53 tiles per frame: 21 Mbit in the window after one frame, over
+    // 0.7 x 20 Mbit/s from the first frame on.
     let mut c = Classifier::new(ClassifierConfig::default());
-    let states = vec![
-        CodecState::Cdf53 {
-            passes_sent: 0,
-            present_passes: 0x3FFF,
-        };
-        200
-    ];
-    // enter_sustain_micros = 50_000 µs; switch_frame at 60 fps = 3.
-    let sw = switch_frame(c.enter_sustain_micros, 16_667); // 3
+    c.set_adaptation_context(known(20_000_000));
+    let states = cdf53_states(2040);
+    // enter_sustain_micros = 500_000 µs; at 60 fps that is 30 frames.
+    let sw = switch_frame(c.enter_sustain_micros, 16_667);
     for frame in 0..sw {
         assert_eq!(
             c.decide_frame_mode_at((frame as u64) * 16_667, &states, FrameMode::TileCodec),
@@ -146,62 +111,22 @@ fn enters_h264_after_sustain_frames_via_cost_path_only() {
 #[test]
 fn empty_tentative_in_h264_drives_exit_streak_to_completion() {
     let mut c = Classifier::new(ClassifierConfig::default());
-    // Pre-establish H264 mode by feeding enough enter-triggering frames.
-    // enter_sustain_micros = 50_000 µs; switch_frame at 60 fps = 3.
-    let busy = h264_states(20);
-    let enter_sw = switch_frame(c.enter_sustain_micros, 16_667); // 3
-    let mut t = 0u64;
-    for _ in 0..=enter_sw {
-        c.decide_frame_mode_at(t, &busy, FrameMode::TileCodec);
-        t += 16_667;
-    }
-    // Now classifier has seen H264 mode — caller would have set self.frame_mode = H264.
-
-    // Simulate frames with no dirty tiles (static content).
-    // exit_sustain_micros = 500_000 µs; switch_frame at 60 fps = 30.
+    c.set_adaptation_context(known(100_000_000));
+    // Frames with no dirty tiles (static content): zero demand.
+    // exit_sustain_micros = 1_000_000 µs; at 60 fps that is 60 frames.
     let empty: Vec<CodecState> = Vec::new();
-    let exit_sw = switch_frame(c.exit_sustain_micros, 16_667); // 30
-    let exit_t0 = t;
+    let exit_sw = switch_frame(c.exit_sustain_micros, 16_667);
     for frame in 0..exit_sw {
         assert_eq!(
-            c.decide_frame_mode_at(exit_t0 + (frame as u64) * 16_667, &empty, FrameMode::H264),
+            c.decide_frame_mode_at((frame as u64) * 16_667, &empty, FrameMode::H264),
             FrameMode::H264,
             "should not exit before sustain elapsed (frame {frame})",
         );
     }
     assert_eq!(
-        c.decide_frame_mode_at(exit_t0 + (exit_sw as u64) * 16_667, &empty, FrameMode::H264),
+        c.decide_frame_mode_at((exit_sw as u64) * 16_667, &empty, FrameMode::H264),
         FrameMode::TileCodec,
         "empty dirty tiles for exit_sustain_micros must flip H264 → TileCodec",
-    );
-}
-
-#[test]
-fn motion_fastpath_at_min_absolute_boundary() {
-    // n=7 (just below floor=8): must NOT trip even at 100% motion fraction.
-    let mut c = Classifier::new(ClassifierConfig::default());
-    let n7 = h264_states(7);
-    for frame in 0..10u32 {
-        assert_eq!(
-            c.decide_frame_mode_at((frame as u64) * 16_667, &n7, FrameMode::TileCodec),
-            FrameMode::TileCodec
-        );
-    }
-    // n=8 (at floor): must trip after sustain.
-    // enter_sustain_micros = 50_000 µs; switch_frame at 60 fps = 3.
-    let mut c = Classifier::new(ClassifierConfig::default());
-    let n8 = h264_states(8);
-    let sw = switch_frame(c.enter_sustain_micros, 16_667); // 3
-    for frame in 0..sw {
-        assert_eq!(
-            c.decide_frame_mode_at((frame as u64) * 16_667, &n8, FrameMode::TileCodec),
-            FrameMode::TileCodec,
-            "should not enter before sustain elapsed (frame {frame})",
-        );
-    }
-    assert_eq!(
-        c.decide_frame_mode_at((sw as u64) * 16_667, &n8, FrameMode::TileCodec),
-        FrameMode::H264
     );
 }
 
@@ -219,71 +144,8 @@ fn empty_tentative_in_tilecodec_stays_tilecodec() {
 }
 
 #[test]
-fn refinement_bias_promotes_tilecodec_under_headroom() {
-    use crate::tile::classifier::{AdaptationContext, Classifier};
-    use crate::tile::{CodecState, FrameMode};
-
-    // At 100 B/µs bandwidth, 40 Cdf53 tiles produce:
-    //   tile_codec_cost = 40 * 90.0 + 40 * 1300 / 100.0 = 3600 + 520 = 4120 µs
-    //   h264_cost (no bias) = 3000 + 12000/100 = 3120 µs
-    //   enter threshold (no bias) = 3120 * 1.3 = 4056 µs  → 4120 > 4056 → enters H264
-    //
-    //   With deficit=40 and REFINEMENT_BIAS_PER_TILE_US=5.0:
-    //   h264_cost (with bias) = 3120 + 40*5 = 3320 µs
-    //   enter threshold (with bias) = 3320 * 1.3 = 4316 µs → 4120 ≤ 4316 → stays TileCodec
-    //
-    // Plenty of bandwidth: 100 B/µs (≈ 800 Mbps).
-    let ctx = AdaptationContext {
-        supports_h264: true,
-        bytes_per_us: 100.0,
-        smoothed_rtt_us: 5_000.0,
-        loss_rate: 0.0,
-        suspended: false,
-        last_update_seq: 1,
-        ..Default::default()
-    };
-    let tentative: Vec<CodecState> = (0..40)
-        .map(|_| CodecState::Cdf53 {
-            passes_sent: 3,
-            present_passes: 0x3FFF,
-        })
-        .collect();
-
-    // With bias: even well past enter_sustain_micros, cost_enter is false
-    // (tile_codec_cost ≤ h264_cost_biased * enter_factor), so TileCodec is held.
-    // Drive 10 frames (≈ 166_670 µs >> 50_000 µs dwell) to ensure no switch occurs.
-    let mut c = Classifier::new(ClassifierConfig::default());
-    c.set_adaptation_context(ctx);
-    c.set_refinement_deficit_tiles(40);
-    let mut mode = FrameMode::TileCodec;
-    for frame in 0..10u32 {
-        mode = c.decide_frame_mode_at((frame as u64) * 16_667, &tentative, mode);
-    }
-    assert_eq!(mode, FrameMode::TileCodec, "bias should hold TileCodec");
-
-    // Without bias: tile_codec_cost > h264_cost * enter_factor → H264 after sustain.
-    // enter_sustain_micros = 50_000 µs; switch_frame at 60 fps = 3.
-    // Drive to frame switch_frame(50_000, 16_667) = 3 to confirm H264.
-    let sw = switch_frame(50_000, 16_667); // 3
-    let mut c2 = Classifier::new(ClassifierConfig::default());
-    c2.set_adaptation_context(ctx);
-    c2.set_refinement_deficit_tiles(0);
-    let mut mode2 = FrameMode::TileCodec;
-    for frame in 0..=sw {
-        mode2 = c2.decide_frame_mode_at((frame as u64) * 16_667, &tentative, mode2);
-    }
-    assert_eq!(
-        mode2,
-        FrameMode::H264,
-        "without deficit, cost comparison picks H264 (bias is zero)"
-    );
-
-    // Sanity: bias > 0 (checked at compile time by type system via pub const = 5.0).
-}
-
-#[test]
 fn headroom_guard_forces_h264_below_threshold() {
-    use crate::tile::classifier::{AdaptationContext, Classifier};
+    use crate::tile::classifier::Classifier;
     use crate::tile::{CodecState, FrameMode};
     let mut c = Classifier::new(ClassifierConfig::default());
     // Below threshold: 1 Mbit/s of estimate.
@@ -340,7 +202,7 @@ fn loss_override_forces_h264_above_threshold() {
 
 #[test]
 fn suspension_override_forces_h264() {
-    use crate::tile::classifier::{AdaptationContext, Classifier};
+    use crate::tile::classifier::Classifier;
     use crate::tile::{CodecState, FrameMode};
     let mut c = Classifier::new(ClassifierConfig::default());
     let ctx = AdaptationContext {
@@ -364,12 +226,12 @@ fn suspension_override_forces_h264() {
 fn hysteresis_micros_holds_dwell_across_frame_rate() {
     use crate::tile::classifier::Classifier;
     use crate::tile::{CodecState, FrameMode};
-    // Construct a "force enter H264" workload: many tiles at high
-    // Cdf53 cost. Reuses the Task 7 calibration: 40 tiles at the default
-    // bandwidth pushes tile_codec_cost above enter_factor * h264_cost.
-    let make_tentative = || -> Vec<CodecState> {
+    // Same first-pass rate at both frame rates: the window sums per frame, so
+    // the 60 fps run dirties half the tiles per frame. 12.5 Mbit/s against a
+    // 10 Mbit/s estimate is over the 0.7 enter share.
+    let make_tentative = |n: usize| -> Vec<CodecState> {
         let present_passes: u16 = 0x3FFF;
-        (0..40)
+        (0..n)
             .map(|_| CodecState::Cdf53 {
                 passes_sent: 0,
                 present_passes,
@@ -378,10 +240,11 @@ fn hysteresis_micros_holds_dwell_across_frame_rate() {
     };
 
     let mut c60 = Classifier::new(ClassifierConfig::default());
+    c60.set_adaptation_context(known(10_000_000));
     let mut switch_at_60 = None;
     for frame in 0..1000u32 {
         let now_us = (frame as u64) * 16_667; // 60 fps
-        let mode = c60.decide_frame_mode_at(now_us, &make_tentative(), FrameMode::TileCodec);
+        let mode = c60.decide_frame_mode_at(now_us, &make_tentative(20), FrameMode::TileCodec);
         if mode == FrameMode::H264 {
             switch_at_60 = Some(now_us);
             break;
@@ -389,10 +252,11 @@ fn hysteresis_micros_holds_dwell_across_frame_rate() {
     }
 
     let mut c30 = Classifier::new(ClassifierConfig::default());
+    c30.set_adaptation_context(known(10_000_000));
     let mut switch_at_30 = None;
     for frame in 0..1000u32 {
         let now_us = (frame as u64) * 33_333; // 30 fps
-        let mode = c30.decide_frame_mode_at(now_us, &make_tentative(), FrameMode::TileCodec);
+        let mode = c30.decide_frame_mode_at(now_us, &make_tentative(40), FrameMode::TileCodec);
         if mode == FrameMode::H264 {
             switch_at_30 = Some(now_us);
             break;
@@ -411,7 +275,7 @@ fn hysteresis_micros_holds_dwell_across_frame_rate() {
 
 #[test]
 fn mode_decision_event_emitted_only_on_transition() {
-    use crate::tile::classifier::{AdaptationContext, Classifier};
+    use crate::tile::classifier::Classifier;
     use crate::tile::{CodecState, FrameMode};
 
     // This is mostly a behavioral / no-panic guard: tracing events are
@@ -450,83 +314,6 @@ fn mode_decision_event_emitted_only_on_transition() {
 }
 
 #[test]
-fn env_var_override_refinement_bias_us() {
-    use crate::config::ClassifierConfig;
-    use crate::tile::classifier::{AdaptationContext, Classifier, REFINEMENT_BIAS_PER_TILE_US};
-    use crate::tile::{CodecState, FrameMode};
-
-    let ctx = AdaptationContext {
-        supports_h264: true,
-        bytes_per_us: 100.0,
-        smoothed_rtt_us: 5_000.0,
-        loss_rate: 0.0,
-        suspended: false,
-        last_update_seq: 1,
-        ..Default::default()
-    };
-    let present_passes: u16 = 0x3FFF;
-    let tentative: Vec<CodecState> = (0..40)
-        .map(|_| CodecState::Cdf53 {
-            passes_sent: 0,
-            present_passes,
-        })
-        .collect();
-
-    // Helper: drive decide_frame_mode_at for 200 ms simulated wall clock at
-    // 60 fps frame cadence, starting from TileCodec. Returns the final mode.
-    // `deficit` is the refinement_deficit_tiles count to set each frame.
-    let drive = |c: &mut Classifier, deficit: u32| -> FrameMode {
-        c.set_adaptation_context(ctx);
-        c.set_refinement_deficit_tiles(deficit);
-        let mut mode = FrameMode::TileCodec;
-        for frame in 0..12u32 {
-            let now_us = (frame as u64) * 16_667;
-            mode = c.decide_frame_mode_at(now_us, &tentative, mode);
-        }
-        mode
-    };
-
-    // Both cases use deficit=1. This is the critical parameter:
-    //
-    //   tile_codec_cost = 40*90 + 40*1300/100.0 = 3600 + 520 = 4120 µs
-    //   h264_base = 3000 + 12000/100.0 = 3120 µs
-    //
-    //   Default bias (5.0 µs/tile), deficit=1:
-    //     h264_cost = 3120 + 1*5.0 = 3125 µs
-    //     enter threshold = 3125 * 1.3 = 4062.5 µs
-    //     4120 > 4062.5 → cost_enter = true → H264 after dwell
-    //
-    //   Override (1000.0 µs/tile), deficit=1:
-    //     h264_cost = 3120 + 1*1000.0 = 4120 µs
-    //     enter threshold = 4120 * 1.3 = 5356 µs
-    //     4120 ≤ 5356 → cost_enter = false → TileCodec holds
-
-    // Case 1: no override. Default bias = 5.0 µs/tile, threshold = 4062 µs <
-    // tile_codec_cost (4120 µs) → cost_enter = true → H264 after enter dwell.
-    let mut c_default = Classifier::new(ClassifierConfig::default());
-    assert_eq!(
-        drive(&mut c_default, 1),
-        FrameMode::H264,
-        "without override, default bias (5 µs × 1 tile = 5 µs) lets cost path flip to H264"
-    );
-
-    // Case 2: with override = 1000.0 µs/tile, threshold = 5356 µs >
-    // tile_codec_cost (4120 µs) → cost_enter = false → TileCodec across the dwell.
-    let mut c_override = Classifier::new(ClassifierConfig {
-        refinement_bias_us: Some(1000.0),
-        ..Default::default()
-    });
-    assert_eq!(
-        drive(&mut c_override, 1),
-        FrameMode::TileCodec,
-        "with override = 1000 µs/tile (1 tile), threshold 5356 µs > tile_codec_cost → TileCodec holds"
-    );
-
-    // Sanity: default constant unchanged.
-    assert_eq!(REFINEMENT_BIAS_PER_TILE_US, 5.0);
-}
-
-#[test]
 fn env_var_override_loss_override_threshold() {
     use crate::config::ClassifierConfig;
     use crate::tile::classifier::{AdaptationContext, Classifier, LOSS_OVERRIDE_THRESHOLD};
@@ -562,7 +349,7 @@ fn env_var_override_loss_override_threshold() {
 #[test]
 fn env_var_override_headroom_min_bpus() {
     use crate::config::ClassifierConfig;
-    use crate::tile::classifier::{AdaptationContext, Classifier};
+    use crate::tile::classifier::Classifier;
     use crate::tile::{CodecState, FrameMode};
 
     // Lower the enter threshold to 0.05 B/us (400 kbit/s) -- below the test
@@ -623,7 +410,7 @@ fn env_var_force_frame_mode_h264_pins_classifier() {
 #[test]
 fn env_var_force_frame_mode_tile_pins_classifier() {
     use crate::config::ClassifierConfig;
-    use crate::tile::classifier::{AdaptationContext, Classifier};
+    use crate::tile::classifier::Classifier;
     use crate::tile::{CodecState, FrameMode};
 
     let mut c = Classifier::new(ClassifierConfig {
@@ -662,7 +449,7 @@ fn env_var_force_frame_mode_tile_pins_classifier() {
 #[test]
 fn env_var_force_tilecodec_pins_classifier() {
     use crate::config::ClassifierConfig;
-    use crate::tile::classifier::{AdaptationContext, Classifier};
+    use crate::tile::classifier::Classifier;
     use crate::tile::{CodecState, FrameMode};
 
     // `GHOSTFRAME_FORCE_TILECODEC=1` collapses to this same override in
@@ -739,24 +526,17 @@ fn classifier_takes_its_overrides_from_config_not_env() {
 /// flip to H264 during what should be a static half, canceling refinement.
 #[test]
 fn hybrid_hysteresis_wall_clock_jump_without_streak_does_not_flip() {
-    use crate::tile::classifier::{AdaptationContext, Classifier};
+    use crate::tile::classifier::Classifier;
     use crate::tile::{CodecState, FrameMode};
 
     let mut c = Classifier::new(ClassifierConfig::default());
-    let ctx = AdaptationContext {
-        supports_h264: true,
-        bytes_per_us: 100.0,
-        smoothed_rtt_us: 5_000.0,
-        loss_rate: 0.0,
-        suspended: false,
-        last_update_seq: 1,
-        ..Default::default()
-    };
-    c.set_adaptation_context(ctx);
+    // 20 Mbit/s: one 2000-tile frame (20.8 Mbit in the window) is over the
+    // enter share from the first call on.
+    c.set_adaptation_context(known(20_000_000));
 
-    // Construct a workload that triggers enter_now=true (cost path picks H264).
+    // Construct a workload that triggers enter_now=true (bandwidth rule picks H264).
     let present_passes: u16 = 0x3FFF;
-    let tentative: Vec<CodecState> = (0..200)
+    let tentative: Vec<CodecState> = (0..2000)
         .map(|_| CodecState::Cdf53 {
             passes_sent: 0,
             present_passes,
@@ -771,60 +551,51 @@ fn hybrid_hysteresis_wall_clock_jump_without_streak_does_not_flip() {
         "frame 1: streak=1 < 3, should stay"
     );
 
-    // Call 2 simulates a docker preemption pause: now_us jumps 200ms past
-    // the 50ms enter_sustain_micros. Pre-fix code would have computed
-    // elapsed = 200_000 - 0 = 200_000 >= 50_000 and flipped. Hybrid: streak
+    // Call 2 simulates a docker preemption pause: now_us jumps 600ms past
+    // the 500ms enter_sustain_micros. Pre-fix code would have computed
+    // elapsed = 600_000 - 0 = 600_000 >= 500_000 and flipped. Hybrid: streak
     // is only 2 < enter_sustain_frames_min (3), so we still stay.
-    let m2 = c.decide_frame_mode_at(200_000, &tentative, m1);
+    let m2 = c.decide_frame_mode_at(600_000, &tentative, m1);
     assert_eq!(
         m2,
         FrameMode::TileCodec,
-        "frame 2 after 200ms preemption-like jump: streak=2 < 3, must NOT flip \
+        "frame 2 after 600ms preemption-like jump: streak=2 < 3, must NOT flip \
          despite wall-clock elapsed past threshold (this was the 7e3e041 regression)"
     );
 
     // Call 3: still enter_now, streak reaches 3, BOTH conditions satisfied.
-    let m3 = c.decide_frame_mode_at(250_000, &tentative, m2);
+    let m3 = c.decide_frame_mode_at(650_000, &tentative, m2);
     assert_eq!(
         m3,
         FrameMode::H264,
-        "frame 3: streak=3 + elapsed=250ms — both conditions satisfied, now flip"
+        "frame 3: streak=3 + elapsed=650ms — both conditions satisfied, now flip"
     );
 }
 
 /// Symmetric regression test for the exit dwell.
 #[test]
 fn hybrid_hysteresis_exit_wall_clock_jump_without_streak_does_not_flip() {
-    use crate::tile::classifier::{AdaptationContext, Classifier};
+    use crate::tile::classifier::Classifier;
     use crate::tile::{CodecState, FrameMode};
 
     let mut c = Classifier::new(ClassifierConfig::default());
-    let ctx = AdaptationContext {
-        supports_h264: true,
-        bytes_per_us: 100.0,
-        smoothed_rtt_us: 5_000.0,
-        loss_rate: 0.0,
-        suspended: false,
-        last_update_seq: 1,
-        ..Default::default()
-    };
-    c.set_adaptation_context(ctx);
+    c.set_adaptation_context(known(100_000_000));
 
-    // Empty tentative → tile_codec_cost = 0 → exit_now = true (well below
-    // h264_cost * 0.6).
+    // Empty tentative → demand = 0 → exit_now = true (well below
+    // 0.4 x the estimate).
     let tentative: Vec<CodecState> = Vec::new();
 
     // Start in H264. Call 1: exit_now=true, started=0, streak=1.
     let m1 = c.decide_frame_mode_at(0, &tentative, FrameMode::H264);
     assert_eq!(m1, FrameMode::H264, "frame 1: streak=1 < 30, should stay");
 
-    // Simulate a 1-second preemption jump (>> 500ms exit_sustain_micros).
+    // Simulate a 2-second preemption jump (>> 1s exit_sustain_micros: use 2s).
     // Streak only reaches 2, far below exit_sustain_frames_min = 30.
-    let m2 = c.decide_frame_mode_at(1_000_000, &tentative, m1);
+    let m2 = c.decide_frame_mode_at(2_000_000, &tentative, m1);
     assert_eq!(
         m2,
         FrameMode::H264,
-        "frame 2 after 1s preemption-like jump: streak=2 < 30, must NOT flip"
+        "frame 2 after 2s preemption-like jump: streak=2 < 30, must NOT flip"
     );
 }
 
@@ -929,6 +700,8 @@ mod a5_guard {
             supports_h264: true,
             bytes_per_us: 100.0,
             smoothed_rtt_us: 20_000.0,
+            bwe_estimate_bps: 100_000_000,
+            estimate_known: true,
             ..Default::default()
         }
     }
@@ -962,9 +735,9 @@ mod a5_guard {
     }
 
     fn heavy_motion() -> Vec<CodecState> {
-        // 40 Cdf53 tiles at 100 B/us: cost comparison keeps H264 (see
-        // `refinement_deficit_biases_h264_cost_upward`).
-        (0..40)
+        // 2040 Cdf53 tiles per frame: 636 Mbit/s of first pass, over 0.7 x
+        // any estimate this module uses (at most 100 Mbit/s).
+        (0..2040)
             .map(|_| CodecState::Cdf53 {
                 passes_sent: 3,
                 present_passes: 0x3FFF,
@@ -975,7 +748,7 @@ mod a5_guard {
     /// The sequence that stuck in H.264 on master: the probe-inclusive rate
     /// (`bytes_per_us`) sits under 0.25 B/us (2 Mbit/s) while the estimate is
     /// fine and the screen is idle. Master forced H264 on every evaluation;
-    /// now the guard does not engage and the cost path leaves H264.
+    /// now the guard does not engage and the bandwidth rule leaves H264.
     #[test]
     fn a_low_model_rate_with_a_healthy_estimate_no_longer_sticks_in_h264() {
         let mut c = Classifier::new(ClassifierConfig::default());
@@ -1159,7 +932,11 @@ mod a5_guard {
         });
         run(&mut c, 5_100_000, 6_100_000, &[], FrameMode::TileCodec);
         assert!(c.guard.headroom_active);
-        c.set_adaptation_context(ctx());
+        c.set_adaptation_context(AdaptationContext {
+            bwe_estimate_bps: 0,
+            estimate_known: false,
+            ..ctx()
+        });
         run(&mut c, 6_200_000, 12_000_000, &[], FrameMode::H264);
         assert!(c.guard.headroom_active);
     }
@@ -1270,10 +1047,10 @@ mod a5_guard {
         assert_eq!((m, r), (FrameMode::H264, "headroom_guard"));
     }
 
-    /// The cost path's re-entry after the holdoff goes through its own
-    /// hysteresis (3 evaluations and 50 ms), not at once.
+    /// The bandwidth rule's re-entry after the holdoff goes through its own
+    /// hysteresis (3 evaluations and 500 ms), not at once.
     #[test]
-    fn after_the_holdoff_the_cost_path_still_needs_its_own_dwell() {
+    fn after_the_holdoff_the_bandwidth_path_still_needs_its_own_dwell() {
         let mut c = Classifier::new(ClassifierConfig::default());
         let h = heavy_motion();
         c.set_adaptation_context(AdaptationContext {
@@ -1285,7 +1062,7 @@ mod a5_guard {
         let t = REENTRY_US;
         let (m, r) = step(&mut c, t, &h, FrameMode::TileCodec);
         assert_eq!((m, r), (FrameMode::TileCodec, "hysteresis_clamp"));
-        let (m, r) = run(&mut c, t + FRAME_US, t + 200_000, &h, FrameMode::TileCodec);
+        let (m, r) = run(&mut c, t + FRAME_US, t + 700_000, &h, FrameMode::TileCodec);
         assert_eq!(m, FrameMode::H264, "{r}");
     }
 
@@ -1598,5 +1375,244 @@ mod a5_guard {
         }
         assert!(stalls >= 4, "premise: it kept stalling: {stalls}");
         assert!(stalls <= 6, "{stalls} stalls in a minute");
+    }
+}
+
+/// The bandwidth rule (design 2026-11-07): H.264 only when the first pass
+/// does not fit the estimate.
+mod bandwidth_fit {
+    use super::*;
+
+    const FRAME_US: u64 = 33_333; // 30 fps
+    const CDF53: CodecState = CodecState::Cdf53 {
+        passes_sent: 0,
+        present_passes: 0x3FFF,
+    };
+
+    fn ctx(estimate_bps: u64) -> AdaptationContext {
+        AdaptationContext {
+            supports_h264: true,
+            bwe_estimate_bps: estimate_bps,
+            estimate_known: true,
+            smoothed_rtt_us: 1_000.0,
+            ..Default::default()
+        }
+    }
+
+    /// `n` CDF 5/3 tiles at the 1300 B prior: `n * 1300 * 8 * 30` bit/s.
+    fn tiles(n: usize) -> Vec<CodecState> {
+        vec![CDF53; n]
+    }
+
+    fn classifier(estimate_bps: u64) -> Classifier {
+        let mut c = Classifier::new(ClassifierConfig::default());
+        c.set_adaptation_context(ctx(estimate_bps));
+        c.set_screen(2040, 0);
+        c
+    }
+
+    /// Run frames from `from_us` for `dur_us`, returning the last decision
+    /// and every transition `(time, to, reason)`.
+    fn drive(
+        c: &mut Classifier,
+        from_us: u64,
+        dur_us: u64,
+        t: &[CodecState],
+        prev: &mut FrameMode,
+        flips: &mut Vec<(u64, FrameMode, &'static str)>,
+    ) {
+        let mut now = from_us;
+        while now < from_us + dur_us {
+            let (m, r) = c.decide_inner(now, t, *prev);
+            if m != *prev {
+                flips.push((now, m, r));
+            }
+            *prev = m;
+            now += FRAME_US;
+        }
+    }
+
+    #[test]
+    fn a_first_pass_over_the_enter_share_enters_h264_after_the_hold() {
+        // 10 Mbit/s estimate; 40 tiles = 12.5 Mbit/s > 0.7 x 10.
+        let mut c = classifier(10_000_000);
+        let mut prev = FrameMode::TileCodec;
+        let mut flips = Vec::new();
+        drive(&mut c, 0, 2_000_000, &tiles(40), &mut prev, &mut flips);
+        assert_eq!(flips.len(), 1, "{flips:?}");
+        let (at, to, reason) = flips[0];
+        assert_eq!((to, reason), (FrameMode::H264, "bandwidth_short"));
+        assert!(at >= 500_000, "entered before the hold: {at}");
+    }
+
+    #[test]
+    fn a_first_pass_under_the_enter_share_stays_on_tiles() {
+        // 100 Mbit/s; the same 40 tiles are 12.5 % of it.
+        let mut c = classifier(100_000_000);
+        let mut prev = FrameMode::TileCodec;
+        let mut flips = Vec::new();
+        drive(&mut c, 0, 5_000_000, &tiles(40), &mut prev, &mut flips);
+        assert!(flips.is_empty(), "{flips:?}");
+    }
+
+    #[test]
+    fn a_first_pass_under_the_exit_share_leaves_h264_after_the_hold() {
+        let mut c = classifier(100_000_000);
+        let mut prev = FrameMode::H264;
+        let mut flips = Vec::new();
+        drive(&mut c, 0, 3_000_000, &tiles(40), &mut prev, &mut flips);
+        assert_eq!(flips.len(), 1, "{flips:?}");
+        let (at, to, reason) = flips[0];
+        assert_eq!((to, reason), (FrameMode::TileCodec, "bandwidth_fits"));
+        assert!(at >= 1_000_000, "left before the hold: {at}");
+    }
+
+    #[test]
+    fn between_the_shares_neither_mode_moves() {
+        // 20 Mbit/s; 40 tiles = 12.5 Mbit/s = 62 %: under enter, over exit.
+        for start in [FrameMode::TileCodec, FrameMode::H264] {
+            let mut c = classifier(20_000_000);
+            let mut prev = start;
+            let mut flips = Vec::new();
+            drive(&mut c, 0, 5_000_000, &tiles(40), &mut prev, &mut flips);
+            assert!(flips.is_empty(), "{start:?}: {flips:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_estimate_holds_h264_whatever_the_demand() {
+        let mut c = classifier(100_000_000);
+        c.set_adaptation_context(AdaptationContext {
+            estimate_known: false,
+            ..ctx(100_000_000)
+        });
+        let mut prev = FrameMode::H264;
+        let mut flips = Vec::new();
+        drive(&mut c, 0, 5_000_000, &[], &mut prev, &mut flips);
+        assert!(flips.is_empty(), "{flips:?}");
+        let (m, r) = c.decide_inner(5_000_000, &[], FrameMode::H264);
+        assert_eq!((m, r), (FrameMode::H264, "estimate_unknown"));
+    }
+
+    #[test]
+    fn a_repaint_that_cannot_drain_in_time_keeps_a_static_screen_in_h264() {
+        // 2040 tiles x 1300 B = 2.65 MB: 7 s at 3 Mbit/s, under 0.25 s at
+        // 100 Mbit/s. A static screen has no demand at all.
+        let mut slow = classifier(3_000_000);
+        slow.set_screen(2040, 2040 * 1300);
+        let mut prev = FrameMode::H264;
+        let mut flips = Vec::new();
+        drive(&mut slow, 0, 5_000_000, &[], &mut prev, &mut flips);
+        assert!(flips.is_empty(), "{flips:?}");
+
+        let mut fast = classifier(100_000_000);
+        fast.set_screen(2040, 2040 * 1300);
+        let mut prev = FrameMode::H264;
+        let mut flips = Vec::new();
+        drive(&mut fast, 0, 5_000_000, &[], &mut prev, &mut flips);
+        assert_eq!(flips.len(), 1, "{flips:?}");
+    }
+
+    #[test]
+    fn a_repaint_frame_after_note_repaint_is_not_demand() {
+        // 25 Mbit/s: a 2040-tile repaint frame alone is 21 Mbit/s over the
+        // window, over 0.7 x 25. Noted as a repaint, it must not count.
+        let mut c = classifier(25_000_000);
+        c.note_repaint(0);
+        let full = tiles(2040);
+        let mut prev = FrameMode::TileCodec;
+        let (m, _) = c.decide_inner(0, &full, prev);
+        prev = m;
+        let mut flips = Vec::new();
+        drive(
+            &mut c,
+            FRAME_US,
+            2_000_000,
+            &tiles(4),
+            &mut prev,
+            &mut flips,
+        );
+        assert!(flips.is_empty(), "{flips:?}");
+    }
+
+    #[test]
+    fn a_full_screen_frame_outside_the_grace_is_demand() {
+        let mut c = classifier(25_000_000);
+        c.note_repaint(0);
+        let full = tiles(2040);
+        let mut prev = FrameMode::TileCodec;
+        let mut flips = Vec::new();
+        // Full-screen motion starting after the 1 s grace.
+        drive(&mut c, 1_100_000, 2_000_000, &full, &mut prev, &mut flips);
+        assert_eq!(
+            flips.first().map(|f| f.1),
+            Some(FrameMode::H264),
+            "{flips:?}"
+        );
+    }
+
+    /// The live 2026-11-07 symptom: a LAN estimate and bursts of motion
+    /// (40 tiles for 1.5 s, quiet for 2 s). Starting in H.264 as a session
+    /// does, the only transition is the start.
+    #[test]
+    fn intermittent_motion_on_a_lan_flips_once() {
+        let mut c = classifier(150_000_000);
+        let mut prev = FrameMode::H264;
+        let mut flips = Vec::new();
+        let mut t = 0;
+        for _ in 0..8 {
+            drive(&mut c, t, 1_500_000, &tiles(40), &mut prev, &mut flips);
+            t += 1_500_000;
+            drive(&mut c, t, 2_000_000, &[], &mut prev, &mut flips);
+            t += 2_000_000;
+        }
+        assert_eq!(flips.len(), 1, "{flips:?}");
+        assert_eq!(flips[0].1, FrameMode::TileCodec);
+    }
+
+    #[test]
+    fn sustained_full_screen_motion_on_a_slow_link_stays_in_h264() {
+        let mut c = classifier(3_000_000);
+        let mut prev = FrameMode::H264;
+        let mut flips = Vec::new();
+        drive(&mut c, 0, 10_000_000, &tiles(2040), &mut prev, &mut flips);
+        assert!(flips.is_empty(), "{flips:?}");
+    }
+
+    /// An estimate stepping between 3 and 150 Mbit/s every 5 s under
+    /// steady 150-tile motion (47 Mbit/s: under 0.4 x 150, over 0.7 x 3):
+    /// one transition per step.
+    #[test]
+    fn a_stepping_estimate_flips_once_per_step() {
+        let mut c = classifier(150_000_000);
+        let mut prev = FrameMode::TileCodec;
+        let mut flips = Vec::new();
+        let mut t = 0;
+        for step in 0..6 {
+            let est = if step % 2 == 0 {
+                150_000_000
+            } else {
+                3_000_000
+            };
+            c.set_adaptation_context(ctx(est));
+            drive(&mut c, t, 5_000_000, &tiles(150), &mut prev, &mut flips);
+            t += 5_000_000;
+        }
+        // Steps 1..=5 each change which side of the band the demand is on.
+        assert_eq!(flips.len(), 5, "{flips:?}");
+    }
+
+    #[test]
+    fn calibration_moves_the_threshold() {
+        // 40 tiles at the 1300 B prior is 12.5 Mbit/s: over 0.7 x 15.
+        // Calibrated to 300 B per tile it is 2.9 Mbit/s: under.
+        let mut c = classifier(15_000_000);
+        for _ in 0..400 {
+            c.observe_first_pass(crate::tile::first_pass::FirstPassKind::Cdf53, 40 * 300, 40);
+        }
+        let mut prev = FrameMode::TileCodec;
+        let mut flips = Vec::new();
+        drive(&mut c, 0, 3_000_000, &tiles(40), &mut prev, &mut flips);
+        assert!(flips.is_empty(), "{flips:?}");
     }
 }

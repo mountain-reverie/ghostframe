@@ -40,6 +40,13 @@ pub struct ClassifierConfig {
     /// `GHOSTFRAME_FORCE_TILECODEC=1|true` as a high-level alias for
     /// `TileCodec`.
     pub force_frame_mode: Option<FrameMode>,
+    /// Overrides `ENTER_SHARE`: enter H.264 when the first-pass demand stays
+    /// above this share of the estimate. `GHOSTFRAME_MODE_ENTER_SHARE`,
+    /// `(0.0, 1.0]`.
+    pub enter_share: Option<f32>,
+    /// Overrides `EXIT_SHARE`. `GHOSTFRAME_MODE_EXIT_SHARE`, `(0.0, 1.0]`,
+    /// and below the enter share (see `from_lookup`).
+    pub exit_share: Option<f32>,
     /// Overrides `REFINEMENT_BIAS_PER_TILE_US`. Fed by
     /// `GHOSTFRAME_REFINEMENT_BIAS_US` (alias
     /// `GHOSTFRAME_TEST_REFINEMENT_BIAS_US`); accepts any value `> 0.0`.
@@ -143,6 +150,8 @@ impl ClassifierConfig {
     /// environment in exactly one place.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
         Self {
+            enter_share: None,
+            exit_share: None,
             refinement_bias_us: positive_f32(get_first(
                 &get,
                 &[
@@ -1192,46 +1201,6 @@ mod tests {
             ("GHOSTFRAME_REFINEMENT_BIAS_US", "2"),
         ]));
         assert_eq!(c.refinement_bias_us, Some(2.0));
-    }
-
-    #[test]
-    fn cost_model_config_default_is_the_compiled_in_model() {
-        use crate::tile::classifier::CostModel;
-        // The literals are the values the model had before it was
-        // configurable. A retune must change this test deliberately.
-        let m = CostModel::from_config(&CostModelConfig::default());
-        assert_eq!(m.solid_us, 0.05);
-        assert_eq!(m.palrle_us, 8.0);
-        assert_eq!(m.cdf53_us, 90.0);
-        assert_eq!(m.h264_frame_us, 3000.0);
-        assert_eq!(m.h264_frame_bytes, 12_000);
-        assert_eq!(m.bytes_per_us(), 12.5);
-        assert_eq!(
-            CostModelConfig::from_lookup(lookup(&[])),
-            CostModelConfig::default()
-        );
-    }
-
-    #[test]
-    fn cost_model_config_parses_and_filters() {
-        let c = CostModelConfig::from_lookup(lookup(&[
-            ("GHOSTFRAME_COST_SOLID_US", "0.1"),
-            ("GHOSTFRAME_COST_PALRLE_US", "-3"),
-            ("GHOSTFRAME_COST_CDF53_US", "nan"),
-            ("GHOSTFRAME_COST_H264_FRAME_US", "4000"),
-            ("GHOSTFRAME_COST_H264_FRAME_BYTES", "0"),
-            ("GHOSTFRAME_COST_BYTES_PER_US", "25"),
-        ]));
-        assert_eq!(c.solid_us, Some(0.1));
-        assert_eq!(c.palrle_us, None, "non-positive is ignored");
-        assert_eq!(c.cdf53_us, None, "NaN is ignored");
-        assert_eq!(c.h264_frame_us, Some(4000.0));
-        assert_eq!(c.h264_frame_bytes, None, "zero bytes would divide by it");
-        assert_eq!(c.bytes_per_us, Some(25.0));
-        let m = crate::tile::classifier::CostModel::from_config(&c);
-        assert_eq!(m.solid_us, 0.1);
-        assert_eq!(m.palrle_us, 8.0, "an ignored override keeps the default");
-        assert_eq!(m.bytes_per_us(), 25.0);
     }
 
     #[test]

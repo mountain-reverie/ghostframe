@@ -1462,8 +1462,6 @@ impl IoBridge {
         let prev_mode = self.frame_mode;
 
         // Always evaluate mode — empty tentative drives the exit-sustain counter.
-        let deficit = self.scheduler.refinement_deficit_tiles();
-        self.classifier.set_refinement_deficit_tiles(deficit);
         // `decide_frame_mode` (no `_at`) reads `Classifier`'s own
         // `Instant::now()`-seeded epoch via `.elapsed()` — a 14th time
         // source invisible to this file, and one that saturates to 0 (or
