@@ -1,0 +1,5 @@
+uniform_sim_out.txt
+uniform_sim_frames_out.txt
+uniform_sim_arq_out.txt
+uniform_sim_classes_out.txt
+__pycache__/

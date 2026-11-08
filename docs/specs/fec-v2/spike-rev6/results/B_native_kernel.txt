@@ -1,0 +1,1 @@
+rusty_erasure kernel set: x86_64/avx2
