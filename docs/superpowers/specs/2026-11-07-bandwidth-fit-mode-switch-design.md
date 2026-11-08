@@ -78,12 +78,13 @@ first-pass is sent, so a measurement alone could never say when to leave.
 frame timestamps, expressed in bit/s (a frame-count-independent rate, so the
 capture rate does not matter).
 
-`c[state]` starts at today's `estimated_tile_bytes` (Solid 4, PalRle 200,
-Cdf53 1300) and is calibrated in tile mode by an EWMA (weight 1/16) of the
+`c[state]` starts at a measured prior in wire bytes (tile datagram header 24 B plus
+payload 4 / 100 / 130 for Solid / PalRle / Cdf53) and is calibrated in tile mode by an EWMA (weight 1/16) of the
 measured pass-0 bytes per tile, per state, taken where `bytes_emitted_critical`
 is counted. Calibration only updates from tile-mode frames and never from
-retransmissions. The calibrated values survive mode switches and are reset
-with the classifier on a session reset.
+retransmissions. The calibrated values survive mode switches and session
+resets (they describe this server's content, not the client) and are reset only
+when the process starts.
 
 #### 2.3 The exit repaint
 

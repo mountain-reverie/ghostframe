@@ -38,9 +38,22 @@ impl FirstPassKind {
     }
 }
 
-/// Starting per-tile sizes (Solid, PalRle, Cdf53), bytes: the old
-/// `CostModel::estimated_tile_bytes`. Calibration replaces them.
-pub(crate) const PRIOR_BYTES: [f64; 3] = [4.0, 200.0, 1300.0];
+/// Wire bytes of a tile datagram before its payload: the datagram header plus
+/// the tile header. Calibration observes `tile_wire_bytes_total`, which
+/// counts datagram lengths including these.
+const TILE_DATAGRAM_HEADER: usize =
+    crate::transport::protocol::DATAGRAM_HEADER_SIZE + crate::transport::protocol::TILE_HEADER_SIZE;
+
+/// Starting per-tile sizes (Solid, PalRle, Cdf53), wire bytes. Calibration
+/// replaces them. Measured in an e2e run on 2026-11-07: a CDF 5/3 tile's
+/// pass 0 payload averaged 26 B (all 14 passes about 570 B); 130 B leaves
+/// margin for natural images until calibration replaces it. The old 1300 B
+/// was the full-lossless upper bound and overstated first-pass demand 20-50x.
+pub(crate) const PRIOR_BYTES: [f64; 3] = [
+    (TILE_DATAGRAM_HEADER + 4) as f64,
+    (TILE_DATAGRAM_HEADER + 100) as f64,
+    (TILE_DATAGRAM_HEADER + 130) as f64,
+];
 /// EWMA weight of one calibration chunk.
 pub(crate) const CALIBRATION_WEIGHT: f64 = 1.0 / 16.0;
 /// A chunk this many pass-0 tiles big is one calibration sample, so bytes of
@@ -76,6 +89,11 @@ impl FirstPassModel {
     /// Bytes one tile in `state` costs on its first pass.
     pub fn state_bytes(&self, state: CodecState) -> f64 {
         FirstPassKind::of(state).map_or(0.0, |k| self.tile_bytes(k))
+    }
+
+    /// The calibrated (or prior) wire bytes of one first-pass tile of `kind`.
+    pub fn tile_bytes_of(&self, kind: FirstPassKind) -> f64 {
+        self.tile_bytes(kind)
     }
 
     fn tile_bytes(&self, kind: FirstPassKind) -> f64 {

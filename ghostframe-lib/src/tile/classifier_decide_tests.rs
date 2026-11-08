@@ -88,10 +88,10 @@ fn exits_h264_after_sustain_frames_when_demand_drops() {
 
 #[test]
 fn enters_h264_after_the_enter_hold_when_the_first_pass_does_not_fit() {
-    // 2040 Cdf53 tiles per frame: 21 Mbit in the window after one frame, over
-    // 0.7 x 20 Mbit/s from the first frame on.
+    // 2040 Cdf53 tiles per frame at the prior (154 B): 2.5 Mbit in the window
+    // after one frame, over 0.7 x 3 Mbit/s from the first frame on.
     let mut c = Classifier::new(ClassifierConfig::default());
-    c.set_adaptation_context(known(20_000_000));
+    c.set_adaptation_context(known(3_000_000));
     let states = cdf53_states(2040);
     // enter_sustain_micros = 500_000 µs; at 60 fps that is 30 frames.
     let sw = switch_frame(c.enter_sustain_micros, 16_667);
@@ -227,8 +227,9 @@ fn hysteresis_micros_holds_dwell_across_frame_rate() {
     use crate::tile::classifier::Classifier;
     use crate::tile::{CodecState, FrameMode};
     // Same first-pass rate at both frame rates: the window sums per frame, so
-    // the 60 fps run dirties half the tiles per frame. 12.5 Mbit/s against a
-    // 10 Mbit/s estimate is over the 0.7 enter share.
+    // the 60 fps run dirties half the tiles per frame. 338 tiles at 30 fps
+    // (169 at 60 fps) are 12.5 Mbit/s at the prior, against a 10 Mbit/s
+    // estimate: over the 0.7 enter share.
     let make_tentative = |n: usize| -> Vec<CodecState> {
         let present_passes: u16 = 0x3FFF;
         (0..n)
@@ -244,7 +245,7 @@ fn hysteresis_micros_holds_dwell_across_frame_rate() {
     let mut switch_at_60 = None;
     for frame in 0..1000u32 {
         let now_us = (frame as u64) * 16_667; // 60 fps
-        let mode = c60.decide_frame_mode_at(now_us, &make_tentative(20), FrameMode::TileCodec);
+        let mode = c60.decide_frame_mode_at(now_us, &make_tentative(169), FrameMode::TileCodec);
         if mode == FrameMode::H264 {
             switch_at_60 = Some(now_us);
             break;
@@ -256,7 +257,7 @@ fn hysteresis_micros_holds_dwell_across_frame_rate() {
     let mut switch_at_30 = None;
     for frame in 0..1000u32 {
         let now_us = (frame as u64) * 33_333; // 30 fps
-        let mode = c30.decide_frame_mode_at(now_us, &make_tentative(40), FrameMode::TileCodec);
+        let mode = c30.decide_frame_mode_at(now_us, &make_tentative(338), FrameMode::TileCodec);
         if mode == FrameMode::H264 {
             switch_at_30 = Some(now_us);
             break;
@@ -530,9 +531,9 @@ fn hybrid_hysteresis_wall_clock_jump_without_streak_does_not_flip() {
     use crate::tile::{CodecState, FrameMode};
 
     let mut c = Classifier::new(ClassifierConfig::default());
-    // 20 Mbit/s: one 2000-tile frame (20.8 Mbit in the window) is over the
-    // enter share from the first call on.
-    c.set_adaptation_context(known(20_000_000));
+    // 3 Mbit/s: one 2000-tile frame (2.5 Mbit in the window at the prior) is
+    // over the enter share from the first call on.
+    c.set_adaptation_context(known(3_000_000));
 
     // Construct a workload that triggers enter_now=true (bandwidth rule picks H264).
     let present_passes: u16 = 0x3FFF;
@@ -735,9 +736,10 @@ mod a5_guard {
     }
 
     fn heavy_motion() -> Vec<CodecState> {
-        // 2040 Cdf53 tiles per frame: 636 Mbit/s of first pass, over 0.7 x
-        // any estimate this module uses (at most 100 Mbit/s).
-        (0..2040)
+        // 8 x 2040 Cdf53 tiles per frame: about 600 Mbit/s of first pass at
+        // the prior, over 0.7 x any estimate this module uses (at most
+        // 100 Mbit/s).
+        (0..8 * 2040)
             .map(|_| CodecState::Cdf53 {
                 passes_sent: 3,
                 present_passes: 0x3FFF,
@@ -1382,6 +1384,7 @@ mod a5_guard {
 /// does not fit the estimate.
 mod bandwidth_fit {
     use super::*;
+    use crate::tile::first_pass::PRIOR_BYTES;
 
     const FRAME_US: u64 = 33_333; // 30 fps
     const CDF53: CodecState = CodecState::Cdf53 {
@@ -1399,9 +1402,14 @@ mod bandwidth_fit {
         }
     }
 
-    /// `n` CDF 5/3 tiles at the 1300 B prior: `n * 1300 * 8 * 30` bit/s.
+    /// `n` CDF 5/3 tiles at the prior: `n * PRIOR_BYTES[2] * 8 * 30` bit/s.
     fn tiles(n: usize) -> Vec<CodecState> {
         vec![CDF53; n]
+    }
+
+    /// The tile count whose first pass, at the prior and 30 fps, is `bps`.
+    fn tiles_at_bps(bps: u64) -> Vec<CodecState> {
+        tiles((bps as f64 / (PRIOR_BYTES[2] * 8.0 * 30.0)).round() as usize)
     }
 
     fn classifier(estimate_bps: u64) -> Classifier {
@@ -1434,11 +1442,18 @@ mod bandwidth_fit {
 
     #[test]
     fn a_first_pass_over_the_enter_share_enters_h264_after_the_hold() {
-        // 10 Mbit/s estimate; 40 tiles = 12.5 Mbit/s > 0.7 x 10.
+        // 10 Mbit/s estimate; 12.5 Mbit/s of tiles > 0.7 x 10.
         let mut c = classifier(10_000_000);
         let mut prev = FrameMode::TileCodec;
         let mut flips = Vec::new();
-        drive(&mut c, 0, 2_000_000, &tiles(40), &mut prev, &mut flips);
+        drive(
+            &mut c,
+            0,
+            2_000_000,
+            &tiles_at_bps(12_500_000),
+            &mut prev,
+            &mut flips,
+        );
         assert_eq!(flips.len(), 1, "{flips:?}");
         let (at, to, reason) = flips[0];
         assert_eq!((to, reason), (FrameMode::H264, "bandwidth_short"));
@@ -1447,11 +1462,18 @@ mod bandwidth_fit {
 
     #[test]
     fn a_first_pass_under_the_enter_share_stays_on_tiles() {
-        // 100 Mbit/s; the same 40 tiles are 12.5 % of it.
+        // 100 Mbit/s; the same 12.5 Mbit/s of tiles is 12.5 % of it.
         let mut c = classifier(100_000_000);
         let mut prev = FrameMode::TileCodec;
         let mut flips = Vec::new();
-        drive(&mut c, 0, 5_000_000, &tiles(40), &mut prev, &mut flips);
+        drive(
+            &mut c,
+            0,
+            5_000_000,
+            &tiles_at_bps(12_500_000),
+            &mut prev,
+            &mut flips,
+        );
         assert!(flips.is_empty(), "{flips:?}");
     }
 
@@ -1460,7 +1482,14 @@ mod bandwidth_fit {
         let mut c = classifier(100_000_000);
         let mut prev = FrameMode::H264;
         let mut flips = Vec::new();
-        drive(&mut c, 0, 3_000_000, &tiles(40), &mut prev, &mut flips);
+        drive(
+            &mut c,
+            0,
+            3_000_000,
+            &tiles_at_bps(12_500_000),
+            &mut prev,
+            &mut flips,
+        );
         assert_eq!(flips.len(), 1, "{flips:?}");
         let (at, to, reason) = flips[0];
         assert_eq!((to, reason), (FrameMode::TileCodec, "bandwidth_fits"));
@@ -1469,12 +1498,19 @@ mod bandwidth_fit {
 
     #[test]
     fn between_the_shares_neither_mode_moves() {
-        // 20 Mbit/s; 40 tiles = 12.5 Mbit/s = 62 %: under enter, over exit.
+        // 20 Mbit/s; 12.5 Mbit/s of tiles = 62 %: under enter, over exit.
         for start in [FrameMode::TileCodec, FrameMode::H264] {
             let mut c = classifier(20_000_000);
             let mut prev = start;
             let mut flips = Vec::new();
-            drive(&mut c, 0, 5_000_000, &tiles(40), &mut prev, &mut flips);
+            drive(
+                &mut c,
+                0,
+                5_000_000,
+                &tiles_at_bps(12_500_000),
+                &mut prev,
+                &mut flips,
+            );
             assert!(flips.is_empty(), "{start:?}: {flips:?}");
         }
     }
@@ -1496,17 +1532,19 @@ mod bandwidth_fit {
 
     #[test]
     fn a_repaint_that_cannot_drain_in_time_keeps_a_static_screen_in_h264() {
-        // 2040 tiles x 1300 B = 2.65 MB: 7 s at 3 Mbit/s, under 0.25 s at
-        // 100 Mbit/s. A static screen has no demand at all.
+        // A 2.65 MB repaint (a size handed in, not a prior): 7 s at
+        // 3 Mbit/s, under 0.25 s at 100 Mbit/s. A static screen has no
+        // demand at all.
+        const REPAINT_BYTES: u64 = 2_652_000;
         let mut slow = classifier(3_000_000);
-        slow.set_screen(2040, 2040 * 1300);
+        slow.set_screen(2040, REPAINT_BYTES);
         let mut prev = FrameMode::H264;
         let mut flips = Vec::new();
         drive(&mut slow, 0, 5_000_000, &[], &mut prev, &mut flips);
         assert!(flips.is_empty(), "{flips:?}");
 
         let mut fast = classifier(100_000_000);
-        fast.set_screen(2040, 2040 * 1300);
+        fast.set_screen(2040, REPAINT_BYTES);
         let mut prev = FrameMode::H264;
         let mut flips = Vec::new();
         drive(&mut fast, 0, 5_000_000, &[], &mut prev, &mut flips);
@@ -1515,9 +1553,10 @@ mod bandwidth_fit {
 
     #[test]
     fn a_repaint_frame_after_note_repaint_is_not_demand() {
-        // 25 Mbit/s: a 2040-tile repaint frame alone is 21 Mbit/s over the
-        // window, over 0.7 x 25. Noted as a repaint, it must not count.
-        let mut c = classifier(25_000_000);
+        // 3 Mbit/s: a 2040-tile repaint frame alone is 2.5 Mbit over the
+        // window (2040 x PRIOR_BYTES[2] x 8), over 0.7 x 3. Noted as a
+        // repaint, it must not count.
+        let mut c = classifier(3_000_000);
         c.note_repaint(0);
         let full = tiles(2040);
         let mut prev = FrameMode::TileCodec;
@@ -1537,7 +1576,7 @@ mod bandwidth_fit {
 
     #[test]
     fn a_full_screen_frame_outside_the_grace_is_demand() {
-        let mut c = classifier(25_000_000);
+        let mut c = classifier(3_000_000);
         c.note_repaint(0);
         let full = tiles(2040);
         let mut prev = FrameMode::TileCodec;
@@ -1552,7 +1591,7 @@ mod bandwidth_fit {
     }
 
     /// The live 2026-11-07 symptom: a LAN estimate and bursts of motion
-    /// (40 tiles for 1.5 s, quiet for 2 s). Starting in H.264 as a session
+    /// (12.5 Mbit/s of tiles for 1.5 s, quiet for 2 s). Starting in H.264 as a session
     /// does, the only transition is the start.
     #[test]
     fn intermittent_motion_on_a_lan_flips_once() {
@@ -1561,7 +1600,14 @@ mod bandwidth_fit {
         let mut flips = Vec::new();
         let mut t = 0;
         for _ in 0..8 {
-            drive(&mut c, t, 1_500_000, &tiles(40), &mut prev, &mut flips);
+            drive(
+                &mut c,
+                t,
+                1_500_000,
+                &tiles_at_bps(12_500_000),
+                &mut prev,
+                &mut flips,
+            );
             t += 1_500_000;
             drive(&mut c, t, 2_000_000, &[], &mut prev, &mut flips);
             t += 2_000_000;
@@ -1580,7 +1626,7 @@ mod bandwidth_fit {
     }
 
     /// An estimate stepping between 3 and 150 Mbit/s every 5 s under
-    /// steady 150-tile motion (47 Mbit/s: under 0.4 x 150, over 0.7 x 3):
+    /// steady 47 Mbit/s of tile motion (under 0.4 x 150, over 0.7 x 3):
     /// one transition per step.
     #[test]
     fn a_stepping_estimate_flips_once_per_step() {
@@ -1595,7 +1641,14 @@ mod bandwidth_fit {
                 3_000_000
             };
             c.set_adaptation_context(ctx(est));
-            drive(&mut c, t, 5_000_000, &tiles(150), &mut prev, &mut flips);
+            drive(
+                &mut c,
+                t,
+                5_000_000,
+                &tiles_at_bps(46_800_000),
+                &mut prev,
+                &mut flips,
+            );
             t += 5_000_000;
         }
         // Steps 1..=5 each change which side of the band the demand is on.
@@ -1604,15 +1657,43 @@ mod bandwidth_fit {
 
     #[test]
     fn calibration_moves_the_threshold() {
-        // 40 tiles at the 1300 B prior is 12.5 Mbit/s: over 0.7 x 15.
-        // Calibrated to 300 B per tile it is 2.9 Mbit/s: under.
+        // 12.5 Mbit/s of tiles at the prior is over 0.7 x 15. Calibrated to
+        // a quarter of the prior per tile it is 3.1 Mbit/s: under.
         let mut c = classifier(15_000_000);
+        let n = tiles_at_bps(12_500_000).len() as u64;
+        let quarter = (PRIOR_BYTES[2] / 4.0).round() as u64;
         for _ in 0..400 {
-            c.observe_first_pass(crate::tile::first_pass::FirstPassKind::Cdf53, 40 * 300, 40);
+            c.observe_first_pass(
+                crate::tile::first_pass::FirstPassKind::Cdf53,
+                n * quarter,
+                n as u32,
+            );
         }
         let mut prev = FrameMode::TileCodec;
         let mut flips = Vec::new();
-        drive(&mut c, 0, 3_000_000, &tiles(40), &mut prev, &mut flips);
+        drive(
+            &mut c,
+            0,
+            3_000_000,
+            &tiles_at_bps(12_500_000),
+            &mut prev,
+            &mut flips,
+        );
         assert!(flips.is_empty(), "{flips:?}");
+    }
+
+    #[test]
+    fn calibration_survives_a_session_reset() {
+        let mut c = classifier(15_000_000);
+        for _ in 0..400 {
+            c.observe_first_pass(crate::tile::first_pass::FirstPassKind::Cdf53, 40 * 60, 40);
+        }
+        let learned = c.first_pass().state_bytes(CDF53);
+        assert!(
+            (learned - 60.0).abs() < 2.0,
+            "premise: calibrated: {learned}"
+        );
+        c.reset();
+        assert_eq!(c.first_pass().state_bytes(CDF53), learned);
     }
 }

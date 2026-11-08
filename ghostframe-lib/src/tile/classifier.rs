@@ -415,11 +415,13 @@ impl Classifier {
     /// Clear hysteresis state so the next `decide_frame_mode` starts fresh.
     /// Call this when a new client session connects (so prior session's
     /// streak counters don't influence the decision for the new client).
+    /// Clears the demand window, repaint state and hysteresis; keeps the
+    /// first-pass calibration, which describes this server's content, not
+    /// the client, and is reset only when the process starts.
     pub fn reset(&mut self) {
         self.state = ClassifierHysteresis::default();
         self.guard = GuardState::default();
         self.demand.clear();
-        self.first_pass = FirstPassModel::default();
         self.last_demand_bps = 0;
         self.repaint_bytes = 0;
         self.repaint_grace_until_us = None;
@@ -492,6 +494,9 @@ impl Classifier {
                 bwe_estimate_bps = ctx.bwe_estimate_bps,
                 first_pass_demand_bps = self.last_demand_bps,
                 estimate_known = ctx.estimate_known,
+                fp_solid_bytes = self.first_pass.tile_bytes_of(FirstPassKind::Solid).round() as u32,
+                fp_palrle_bytes = self.first_pass.tile_bytes_of(FirstPassKind::PalRle).round() as u32,
+                fp_cdf53_bytes = self.first_pass.tile_bytes_of(FirstPassKind::Cdf53).round() as u32,
                 repaint_drain_ms = self.repaint_drain_us().min(u64::MAX / 2) / 1000,
                 "mode decision"
             );
