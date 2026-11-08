@@ -42,7 +42,7 @@ void main() {
     // The legacy comment here claimed the opposite, which routed red
     // input through the blue YUV coefficients, producing the documented
     // H.264 frame-mode R↔B-swap bug. Same convention as
-    // `cdf53_forward_l1.comp`.
+    // `cdf53_encode.comp`.
     float R = bgra.r;
     float G = bgra.g;
     float B = bgra.b;

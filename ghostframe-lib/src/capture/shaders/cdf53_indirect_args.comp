@@ -1,6 +1,6 @@
 // cdf53_indirect_args.comp
 // Stage 4b: convert cdf53_compact_count into vkCmdDispatchIndirect args
-// for the subsequent Stage 4c (cdf53_forward_l1/l2/l3) dispatches.
+// for the subsequent Stage 4c (cdf53_encode.comp, cdf53_forward.spv) dispatch.
 // Dispatch: 1 workgroup, 1 thread.
 //
 // All three forward levels reuse the SAME indirect args buffer because they
