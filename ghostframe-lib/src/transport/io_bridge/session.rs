@@ -150,14 +150,16 @@ impl IoBridge {
         // Initialize frame_mode to H264 so the first frame
         // emits a single compact IDR (~50 datagrams) instead
         // of an all-tiles raw burst (~8000 datagrams) that
-        // QUIC slow-start would mostly drop. Classifier exits
-        // back to TileCodec naturally after exit_sustain frames
-        // of empty dirty (Task 17).
+        // QUIC slow-start would mostly drop. The classifier leaves H.264
+        // once the estimate is known and the tile codec's first pass fits
+        // it (design 2026-11-07).
         // A frame the worker is still on belongs to the session being reset.
         self.session_epoch += 1;
         self.dirty_tracker.reset();
         self.metrics_tracker.reset();
         self.classifier.reset();
+        self.bwe_samples_at_session_reset = self.bwe.snapshot().samples_seen;
+        self.adaptation_context.estimate_known = false;
         self.scheduler.clear();
         #[cfg(any(test, feature = "test-loss-injection"))]
         let preserve_delivered = self.skip_palette_session_reset;
@@ -195,6 +197,9 @@ impl IoBridge {
         // only) the backend control is a no-op.
         self.force_dirty_frames = 20;
         self.backend_apply(Control::InvalidateBaseline(20));
+        // The cushion's all-dirty frames are a repaint, not demand.
+        let now_us = now_std().duration_since(self.epoch).as_micros() as u64;
+        self.classifier.note_repaint(now_us);
         // The new client's first H.264 frame is an IDR whatever the encoder
         // was doing: the manager's plan epoch (`reset_session`) says so.
         //

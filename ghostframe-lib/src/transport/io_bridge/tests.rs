@@ -951,9 +951,21 @@ async fn process_frame_no_panic_on_empty_pixels_no_dmabuf_no_session() {
 fn classifier_reset_clears_streaks() {
     use crate::tile::{Classifier, CodecState, FrameMode};
     let mut c = Classifier::new(crate::config::ClassifierConfig::default());
-    let busy: Vec<CodecState> = (0..20)
-        .map(|i| CodecState::H264 { frames_in_h264: i })
-        .collect();
+    c.set_adaptation_context(crate::tile::classifier::AdaptationContext {
+        supports_h264: true,
+        bwe_estimate_bps: 20_000_000,
+        estimate_known: true,
+        ..Default::default()
+    });
+    c.set_screen(2040, 0);
+    // A full screen of first passes: over 0.7 x 20 Mbit/s.
+    let busy: Vec<CodecState> = vec![
+        CodecState::Cdf53 {
+            passes_sent: 0,
+            present_passes: 0x3FFF,
+        };
+        2040
+    ];
     // Build partial enter streak.
     c.decide_frame_mode(&busy, FrameMode::TileCodec);
     c.decide_frame_mode(&busy, FrameMode::TileCodec);
@@ -3455,13 +3467,21 @@ async fn frame_mode_exit_dwell_tracks_virtual_time_via_bridge_epoch() {
     // Fixed path: same `Classifier` state the bridge owns, driven with
     // the same `now_us` expression the `process_frame_gpu` call site
     // uses. Empty `tentative_states` under `FrameMode::H264` drives the
-    // exit-sustain timer (cost is 0, below `exit_factor * h264_cost`).
-    // 30 calls satisfies `exit_sustain_frames_min`; spacing them 20ms
-    // apart in virtual time crosses `exit_sustain_micros` (500_000us)
-    // by the last call.
+    // exit-sustain timer (demand is 0, under the exit share of a known
+    // estimate). The 51st call, 1.0 s of virtual time after the first at 20 ms
+    // apart, is the first to satisfy both `exit_sustain_micros` and
+    // `exit_sustain_frames_min`; the loop stops there (a later call would
+    // restart the hold).
+    let known = crate::tile::classifier::AdaptationContext {
+        supports_h264: true,
+        bwe_estimate_bps: 100_000_000,
+        estimate_known: true,
+        ..Default::default()
+    };
     let mut fixed = bridge.classifier.clone();
+    fixed.set_adaptation_context(known);
     let mut fixed_mode = FrameMode::H264;
-    for _ in 0..30 {
+    for _ in 0..51 {
         let now_us = super::now_std().duration_since(epoch).as_micros() as u64;
         fixed_mode = fixed.decide_frame_mode_at(now_us, &[], FrameMode::H264);
         tokio::time::advance(std::time::Duration::from_millis(20)).await;
@@ -3480,8 +3500,9 @@ async fn frame_mode_exit_dwell_tracks_virtual_time_via_bridge_epoch() {
     // the exact bug Commit 1 fixes at the `process_frame_gpu` call
     // site.
     let mut broken = Classifier::new(crate::config::ClassifierConfig::default());
+    broken.set_adaptation_context(known);
     let mut broken_mode = FrameMode::H264;
-    for _ in 0..30 {
+    for _ in 0..51 {
         broken_mode = broken.decide_frame_mode(&[], FrameMode::H264);
         tokio::time::advance(std::time::Duration::from_millis(20)).await;
     }
@@ -9819,4 +9840,50 @@ async fn the_refs_report_carries_encode_time_percentiles_and_dead_frames() {
     ack_every_fragment(&mut bridge, newest);
     bridge.dispatch_frame_ack_for_test(frame_ack_datagram(newest, 0, 1));
     assert_eq!(bridge.h264_refs_report().frames_dead, 1);
+}
+
+/// A session reset carries the previous session's estimate, so the value
+/// alone cannot say the path is known: it takes a feedback sample after the
+/// reset.
+#[tokio::test(start_paused = true)]
+async fn the_estimate_is_unknown_until_a_sample_follows_the_session_reset() {
+    let (our_end, _peer) = UnixStream::pair().expect("pair");
+    let server = QuicServer::new().expect("server");
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+    let t0 = now_std();
+    // The previous session's estimate, off the initial value, with samples
+    // behind it; then the reset.
+    let records: Vec<crate::transport::bwe::AckArrival> = (0..12u32)
+        .map(|i| crate::transport::bwe::AckArrival {
+            server_emit_us: i as u64 * 1_000,
+            client_arrival_ms_lo16: (i + 15) as u16,
+            size_bytes: 1_200,
+            probe: None,
+        })
+        .collect();
+    bridge.bwe.update(
+        &records,
+        &[],
+        t0 + std::time::Duration::from_millis(20),
+        14_400,
+    );
+    bridge
+        .bwe
+        .restart_from(t0 + std::time::Duration::from_millis(20), 12_000_000);
+    let snap = bridge.bwe.snapshot();
+    assert!(snap.samples_seen > 0, "the fixture fed no samples");
+    assert_ne!(
+        snap.bitrate_bps,
+        crate::transport::bwe::BweWrapper::INITIAL_BPS,
+        "the fixture left the estimate at its initial value"
+    );
+    bridge.bwe_samples_at_session_reset = snap.samples_seen;
+    bridge.apply_path_stats_snapshot(1_000.0);
+    assert!(!bridge.adaptation_context.estimate_known);
+
+    // One sample after the reset.
+    bridge.bwe_samples_at_session_reset = snap.samples_seen - 1;
+    bridge.apply_path_stats_snapshot(1_000.0);
+    assert!(bridge.adaptation_context.estimate_known);
 }

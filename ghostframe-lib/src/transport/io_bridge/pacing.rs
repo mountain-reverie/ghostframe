@@ -494,6 +494,9 @@ impl IoBridge {
             );
             self.force_dirty_frames = self.force_dirty_frames.max(2);
             self.backend_apply(Control::InvalidateBaseline(2));
+            // The forced repaint is not demand.
+            let now_us = tick_now.duration_since(self.epoch).as_micros() as u64;
+            self.classifier.note_repaint(now_us);
         }
     }
 

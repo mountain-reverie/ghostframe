@@ -1445,8 +1445,7 @@ impl IoBridge {
             apply_gpu_metrics(&mut self.metrics_tracker, tx, ty, entry.as_ref());
         }
 
-        // Classify each dirty tile. Empty dirty_xy → empty tentative — that's
-        // the no-motion signal the classifier needs to exit H264 after exit_sustain.
+        // Classify each dirty tile. An empty dirty set adds no demand.
         use crate::tile::{classifier::classify_tile, FrameMode};
         let tentative: Vec<crate::tile::CodecState> = dirty_xy
             .iter()
@@ -1476,6 +1475,19 @@ impl IoBridge {
         // this decision. A per-size "unavailable" ends with the size.
         self.h264_availability_for((frame.width, frame.height));
         self.update_h264_stall(now);
+        // What a full repaint would cost in the tile codec, summed only while
+        // in H.264 (once per frame, not per-tile dispatch work).
+        let repaint_bytes = if prev_mode == FrameMode::H264 {
+            let fp = self.classifier.first_pass();
+            self.metrics_tracker
+                .metrics()
+                .iter()
+                .map(|m| fp.state_bytes(crate::tile::first_pass::repaint_state(m)))
+                .sum::<f64>() as u64
+        } else {
+            0
+        };
+        self.classifier.set_screen(cols * rows, repaint_bytes);
         let new_mode = self
             .classifier
             .decide_frame_mode_at(now_us, &tentative, prev_mode);
@@ -1570,6 +1582,7 @@ impl IoBridge {
                 && self.frame_pipeline.is_some()
             {
                 self.backend_apply(Control::InvalidateBaseline(1));
+                self.classifier.note_repaint(now_us);
                 tracing::info!(
                     target: LOG_TARGET,
                     seq,
