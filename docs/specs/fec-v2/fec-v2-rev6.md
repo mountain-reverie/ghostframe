@@ -439,7 +439,7 @@ The validation plans of rev 5 §4.6 and §4.9.8 apply: every property test comes
 
 ## 8. Decisions for the owner
 
-**Decided 2026-11-07:** items 1, 2, 5, 7, 8 and 9 as recommended below. Items 4 and 6 have a recommendation with analysis in §8.1 and §8.2, and await the owner's confirmation.
+**Decided 2026-11-07:** every item except 3 is decided as recommended below; items 4 and 6 follow the analysis in §8.1 and §8.2. Item 3 (RS now, a sliding window later) stands as recommended.
 
 1. **Codec: `rusty_erasure` with our matrix and the e×e decoder.** **Decided: pinned `=0.4.3`**, with `gf256` as the permanent differential oracle.
    - Vendoring (about 5 000 lines) was the alternative.
@@ -450,9 +450,9 @@ The validation plans of rev 5 §4.6 and §4.9.8 apply: every property test comes
    - (a) two or more interleaved GF(2^8) blocks per frame;
    - (b) a GF(2^16) code for large blocks, RaptorQ or Leopard, with about 0.3–0.9 ms of wasm decode per block.
 
-   **Recommended, on simulation (§8.1): (a), interleaved.** Awaiting the owner's confirmation.
+   **Decided: (a), interleaved** (§8.1).
 5. **Clean-link floor** (§5): the measured pre-FEC loss below which r = 0. **Decided: 0.1 %**, with r = 1 restored at the first loss above it. Revision 5 used 0.3 % where a repair round fits, and r = 1 at any loss where none does.
-6. **The last bundle of a pass.** Pad it to `max_size()`, or accept that quinn occasionally puts two short bundles in one packet. **Open:** see §8.2.
+6. **The last bundle of a pass.** Pad it to `max_size()`, or accept that quinn occasionally puts two short bundles in one packet. **Decided: accept coalescing and don't pad**; count it in R6-c (§8.2).
 7. **Negotiation.** **Decided: the framing is unconditional.** There is no HELLO bit, and every s→c datagram of every session is framed (§6.1). There are no deployments to stay compatible with (owner, 2026-10-15). This removes a compatibility matrix and the pre-HELLO ambiguity.
 8. **Remove H.264 retransmission** (R6-f). **Decided:** decide on LOSS_REPORT data after R6-e.
 9. **The web client's rAF batching** puts up to 16.7 ms under browser recovery below about 18 Mbit/s (§2.2). **Decided:** a separate work item, worth doing for its own sake.
@@ -495,7 +495,7 @@ The validation plans of rev 5 §4.6 and §4.9.8 apply: every property test comes
   - 100 Mbit/s: 1.23 / 1.22 %;
   - 200 Mbit/s: 0.40 / 0.49 %.
 
-**Recommendation: (a)**, with m = ceil((k + r)/256), bundle i in block i mod m, and r = ceil(R/m).
+**Decided: (a)**, with m = ceil((k + r)/256), bundle i in block i mod m, and r = ceil(R/m).
 - It needs no second codec and no second oracle.
 - It has no fixed 0.9 ms wasm decode per lossy frame.
 - It keeps the XOR fast path.
@@ -527,6 +527,6 @@ The validation plans of rev 5 §4.6 and §4.9.8 apply: every property test comes
 
 **A third option** is to hold a short bundle briefly so the next pass can fill it. It is rejected: it adds latency, which is the one thing this design must not do.
 
-**Recommendation: accept coalescing and don't pad.**
+**Decided: accept coalescing and don't pad.**
 - Count it in R6-c. The server sees it without quinn's help: a short bundle handed to quinn while its datagram queue already holds a short bundle can share.
 - Pad only if that count shows a real rate of shared packets *and* LOSS_REPORT shows the 2-bursts costing residual.
