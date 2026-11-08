@@ -1,0 +1,13 @@
+[package]
+name = "spike_native"
+version = "0.1.0"
+edition = "2021"
+[workspace]
+[dependencies]
+rusty_erasure = "=0.4.3"
+raptorq = "2"
+cu-fec = "1"
+rand = "0.8"
+[profile.release]
+opt-level = 3
+debug = false

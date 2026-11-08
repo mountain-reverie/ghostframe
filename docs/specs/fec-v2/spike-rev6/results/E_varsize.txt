@@ -1,0 +1,11 @@
+rusty_erasure encode with unequal lengths: Err(ShardLength { index: 9, expected: 1180, got: 100 })
+cu-fec push_source(100 B) into a 1180 B config: Some(SymbolSizeMismatch)
+rusty_erasure padded block (9 x 1180 B + 100 B): short symbol + 1 other lost, 9/9 recover with exact length
+rusty-ours k=10 r=2 all-1180: encode 1.17 us, decode(2 lost, warm) 2.40 us
+rusty-ours k=10 r=2 short-last(100): encode 1.17 us, decode(2 lost, warm) 2.40 us
+rusty-ours k=10 r=2 random-100..1180: encode 1.16 us, decode(2 lost, warm) 2.41 us
+pad one 100 B datagram into a 1182 B shard (alloc + zero + copy): 0.050 us
+raptorq: 15 packets for a 10720 B object; packet payload sizes: {1180}
+raptorq decode of the short-last object (2 sources lost): len Some(10720), exact=true
+raptorq all-1180 k=10 r=2: encode 42.1 us, decode(2 lost) 36.2 us
+raptorq short-last k=10 r=2: encode 42.9 us, decode(2 lost) 36.1 us

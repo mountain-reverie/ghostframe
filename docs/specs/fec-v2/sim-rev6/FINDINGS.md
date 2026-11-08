@@ -1,0 +1,127 @@
+# Revision 6 simulation: block closing and code family
+
+**Every number here is a model estimate [E], not a measurement.** Emission timing comes from the code (`TIMING.md`, with file:line). Loss, the link and the receiver are modelled.
+
+## Method
+- **Script and runtime.** `python3 -I uniform_sim.py` takes about 100 s on 12 cores. Self-checks are in `selftest.py`; a deliberately broken scheme is caught. Seed spread is in `seedcheck.py`.
+- **Sender.** It is paced at {2, 10, 30, 100} Mbit/s. Bundles are 1 180 B, one per QUIC packet. Passes follow the code's cadence: token bucket, `D_target` = 10 ms of rate, and passes at least 1 ms apart with a backlog (`TIMING.md` §2).
+- **Traffic mixes:**
+  - H.264 at 30 fps, with P frames of about rate/30 and occasional IDRs;
+  - tile bursts separated by idle gaps;
+  - both together (tiles are 31 % of the bytes).
+- **Loss models.** Per packet: i.i.d. 0.5, 1, 2 and 5 %; Gilbert-Elliott 2 % with mean burst 2, 3 and 8.
+- **Reported delays.** Absolute latencies carry a 15–30 ms offset from a standing bottleneck queue, so the tables report:
+  - the **excess** recovery delay: lost source's departure → decodable, minus its loss-free arrival;
+  - **frame lateness**: H.264 frame completion beyond 33 ms (1 frame) and 66 ms (2 frames) past the loss-free completion.
+- **ARQ comparison.** It is analytic: RTT + detection (¼ RTT + 5 ms ACK batching). That is 17.5 / 55 / 105 ms beyond the bundle's own arrival at one-way delays of 5 / 20 / 40 ms. FEC's excess delay does not depend on the one-way delay, so the delays were not run separately.
+- **Seeds.** Each cell is one seed of about 60k bundles. Under Gilbert-Elliott loss, residuals move by up to ±40 % between seeds (`seedcheck_out.txt`), so schemes are ranked only where they differ by more than that.
+- **Not modelled:**
+  - CPU cost (that is the codec spike, `../spike-rev6/RESULTS.md`);
+  - extra admission passes triggered by ACKs;
+  - time-correlated loss;
+  - reordering;
+  - lost feedback.
+
+## Timing that drives everything (`TIMING.md`)
+- The median number of bundles per admission pass is **1 at 2 and 10 Mbit/s, 2 at 30, and 9 at 100.** A block closed at the end of each pass is therefore tiny except at 100 Mbit/s.
+- quinn's pacer runs at about 2.5× the rate, so it does not smooth the passes.
+
+## Answers (H.264 at 20 % nominal overhead and i.i.d. 2 % loss, unless noted)
+
+### 1. Closing an RS block at the end of each drain: rejected at 30 Mbit/s and below
+- **Real overhead.** With r_min 1 it is 100 / 69 / 45 / 22 % at 2 / 10 / 30 / 100 Mbit/s. With r_min 2 it is 200 / 131 / 169 / 22 %.
+  - At 2–10 Mbit/s a block is one bundle, so this is a repetition code. Latency is excellent (1–9 ms excess), but the cost is not acceptable.
+- **At 100 Mbit/s** it works for i.i.d. loss: 22 % overhead, residual 0.00 %. With mean-burst-3 loss, 45–50 % of losses still need ARQ and about 30 % of frames are late.
+- **Settings.** k_max 64 with r_min 1 is the better choice, but neither setting rescues the rule, and interleaving does not either.
+
+### 2. A time cap is needed
+- **T = 5 ms** reaches the nominal overhead from 10 Mbit/s up (21–23 %, recovery p95 13–17 ms). At 2 Mbit/s it still costs 68 %, because one slot is 4.7 ms.
+- **T ≈ max(5 ms, 6 slots)**, bounded by one frame interval. At 2 Mbit/s that is 25–33 ms, for 27–32 % overhead.
+- **Bursts need larger blocks.** With mean-burst-3 loss at 30 Mbit/s, late frames fall from 4–9 % at T = 5 ms to 0.1 % at T = 25 ms.
+
+### 3. RaptorQ, one large block per frame (Kyber's approach)
+- **H.264 frames.** It wins under bursts because the block is large compared with the burst. Late frames with burst-3 loss are 0.0 / 0.3 / 2.2 / 1.9 % at 100 / 30 / 10 / 2 Mbit/s.
+  - **Per-frame RS with k + r ≤ 256 comes within 0.5 point of it.** The win comes from the block size, not from the code.
+  - Its reception overhead (one spare symbol) makes no visible difference.
+- **Tiles.** One block per burst is unusable: the recovered-bundle p95 is 9.7 s / 2.1 s / 0.74 s / 160 ms at 2 / 10 / 30 / 100 Mbit/s, against 55 ms for ARQ. Capped at k = 64 it behaves like RS.
+- **Cost.** r_min 2 gives 43 % overhead at 2 Mbit/s. The CPU and wasm costs are in the codec spike: 267–3 160 µs to decode in wasm, and +113 KB.
+
+### 4. Sliding-window RLC
+- **Latency and residual.** From 10 Mbit/s up it has the best of both at exactly the nominal overhead. Recovery p95 is 9.4 / 3.1 / 0.9 ms at 10 / 30 / 100 Mbit/s, against 13–17 ms for time-capped RS.
+- **Bursts need a window of 64.** With burst-3 loss on tiles, 1.2–2.8 % of losses still need ARQ at w = 64, against 18–24 % at w = 32. Late frames are 2.4 / 0.0 / 1.7 % at 10 / 30 / 100 Mbit/s.
+- **At 2 Mbit/s** it is slower (p95 42 ms) but costs 20 %, against 35–68 % for RS.
+- **Idle flush is essential.** It means sending the pending repair as soon as the sender goes idle.
+  - p99 recovery on tiles: 606 / 395 / 81 / 36 ms without it, 75 / 16 / 3.5 / 1.9 ms with it.
+  - For H.264 below 10 Mbit/s: 0.80 % late frames with it, 3.57 % without, at 2 Mbit/s and 10 % nominal overhead.
+  - It costs about 3 extra points of overhead on small frames there.
+- **Caveat.** This sim's RLC decoder is ideal (near-MDS, independent with probability 1 − 1/256). The codec spike measured cu-fec's real decoder at 126 µs to 4 ms in wasm.
+
+### 5. Uniform versus per-class
+- **H.264 is not hurt** by going uniform: the same code matches or beats per-frame RS.
+- **The cost is the tile bytes.**
+  - At 20 % nominal overhead the tiles add about 6 points of total traffic (they are 31 % of the mix). That buys a mean repair delay of 0.4–18 ms instead of 55 ms.
+  - ARQ costs about the loss rate (2 % of tile bytes), so FEC at 20 % costs 10× that.
+  - **Parity matched to the loss (about 1.5–2 × p) is enough.** At a fixed 20 %, a 3 MB first paint at 10 Mbit/s pays 0.5 s.
+- **At 2 Mbit/s** the per-class design is no cheaper: 26 % against 24.9 %.
+
+## What this means for the design (input to `../fec-v2-rev6.md` §4)
+- Close blocks on whichever comes first:
+  - k_max = 64;
+  - a time cap T = max(5 ms, 6 slots), bounded by the frame interval;
+  - the sender going idle (flush).
+- A per-pass close is never enough on its own.
+- r_min = 1. Size the parity from the measured loss, not a fixed percentage.
+- RS with this closing rule matches RaptorQ-per-frame on H.264, and is usable for tiles where RaptorQ-per-burst is not.
+- Sliding-window RLC is 4–15 ms better at p95 from 10 Mbit/s up, and cheaper at 2 Mbit/s. It needs a fast decoder that does not exist off the shelf.
+
+## Raw output
+Only `summary_out.txt` and `seedcheck_out.txt` are committed. The full per-cell tables (`uniform_sim_out.txt`, `uniform_sim_frames_out.txt`, `uniform_sim_arq_out.txt`, `uniform_sim_classes_out.txt`, about 3.3 MB) are regenerated by `python3 -I uniform_sim.py`.
+
+## 6. Item 4: split GF(2^8) blocks vs one GF(2^16) block (above 70 Mbit/s)
+
+**Every number is a model estimate [E].** Script `split_sim.py` (about 3 min on 12 cores, `python3 -I split_sim.py`; `--selftest` runs the checks); output `split_sim_out.txt` (full grid, seeds, gap list).
+
+### Method
+- **Reused.** Sender, bottleneck, Gilbert-Elliott loss, receiver and frame metrics are `uniform_sim.py`'s. The only change there is an additive `fam == "split"` branch in `enqueue_unit` (existing runs are unaffected). H.264 frames get the planned blocks. In the mix, tile bursts get plain RS blocks of at most 64 at the same overhead.
+- **Schemes at equal nominal overhead** (rho = R / k_frame, R = max(1, ceil(rho k))):
+  - **a_il:** m = ceil((k+R)/256) GF(2^8) RS blocks per frame (raised until every k_b + r_b ≤ 256), bundle i to block i mod m, r = ceil(R/m) each. The ceiling makes the real total up to m − 1 repairs above R (visible in `ovh`: 20.3 % against 20.2 % for one block).
+  - **a_contig:** same m and r, contiguous assignment (control).
+  - **b_mds:** one ideal MDS block over the frame, r = R. It stands for Leopard / GF(2^16); no decode cost is modelled.
+  - **c_rq:** RaptorQ per frame, r = R.
+  - **d_T5, d_T33:** the rev-6 default, time-capped RS, k_max 64, T = 5 ms and T = frame interval (`rs_time`).
+  - The repairs of a frame queue behind its sources, round-robin across blocks.
+- **Grid** (one seed, 4 000 frames = 133 s of video per cell): 70 / 100 / 150 / 200 Mbit/s, H.264-only and mix, iid 1 % and 2 %, GE 2 % with mean burst 3 / 8 / 16, rho 10 / 20 / 30 %. That is 144 timelines.
+- **Seeds.** 5 seeds of 4 000 frames (demand, timeline and loss all re-drawn) for GE b3 and b8 at 100 and 200 Mbit/s, rho 20 %, both mixes. The grid is single-seed; at 1 point of late frames one cell is about 40 frames, and GE cells move by tens of percent between seeds, so grid differences below about 0.5 point are noise.
+- **Metrics.** Late frames (> 33 ms / > 66 ms after the loss-free completion, or never complete), residual source loss and recovery-wait p95. The last two are over H.264 source bundles only.
+- **Self-test** (`--selftest`): block structure (cover, ≤ 256, total repairs in [R, R + m)), and a deliberately broken (a) with r = 0 on one block. At 100 Mbit/s, rho 20 %, iid 2 %: residual 0.478 % against 0.000 %, late frames 35.7 % against 0.0 %. GE b3: 0.523 % against 0.000 %, 32.9 % against 0.0 %.
+
+### Key table: late frames > 33 ms (%), mean (min–max) over 5 seeds, rho 20 %
+
+| Mbit/s | mix | loss | a_il | a_contig | b_mds | c_rq | d_T5 | d_T33 |
+|---|---|---|---|---|---|---|---|---|
+| 100 | h264 | ge2b3 | 0.16 (0.05-0.22) | 0.18 (0.05-0.25) | 0.17 (0.07-0.25) | 0.18 (0.07-0.25) | 4.27 (3.80-4.67) | 2.14 (1.98-2.25) |
+| 100 | h264 | ge2b8 | 1.23 (1.04-1.33) | 2.10 (1.98-2.27) | 1.22 (1.14-1.36) | 1.22 (1.14-1.36) | 13.90 (12.94-14.72) | 11.17 (10.59-11.75) |
+| 200 | h264 | ge2b3 | 0.01 (0.00-0.05) | 0.03 (0.00-0.05) | 0.03 (0.00-0.07) | 0.03 (0.00-0.07) | 4.55 (4.30-4.91) | 4.14 (3.93-4.27) |
+| 200 | h264 | ge2b8 | 0.40 (0.27-0.54) | 2.09 (1.78-2.32) | 0.49 (0.37-0.64) | 0.49 (0.37-0.64) | 19.41 (18.44-20.54) | 19.22 (18.35-19.85) |
+| 100 | mix | ge2b3 | 0.39 (0.32-0.47) | 0.39 (0.32-0.47) | 0.39 (0.27-0.47) | 0.39 (0.27-0.47) | 2.88 (2.17-3.28) | 1.48 (1.36-1.78) |
+| 100 | mix | ge2b8 | 1.75 (1.38-1.98) | 2.24 (1.95-2.54) | 1.80 (1.75-1.83) | 1.81 (1.75-1.85) | 9.50 (8.40-10.12) | 7.72 (7.04-8.10) |
+| 200 | mix | ge2b3 | 0.09 (0.07-0.10) | 0.11 (0.10-0.12) | 0.11 (0.05-0.17) | 0.11 (0.05-0.17) | 3.36 (2.89-3.75) | 2.63 (2.10-3.11) |
+| 200 | mix | ge2b8 | 0.95 (0.89-0.99) | 1.97 (1.88-2.05) | 0.87 (0.64-1.09) | 0.87 (0.64-1.11) | 13.66 (12.77-14.62) | 13.36 (12.57-14.12) |
+
+Residual source loss follows the same ordering (for example 100 Mbit/s h264 b8: 0.121 / 0.249 / 0.127 % for a_il / a_contig / b_mds; seeds in `split_sim_out.txt`).
+
+### Answer
+- **(a) interleaved against (b) one MDS block: no measurable gap.**
+  - On the 5-seed cells the means differ by at most 0.09 point of late frames (0.02 for GE b3, 0.09 for b8), inside the seed spread of 0.1–0.4 point. The sign is not consistent: a_il is lower in 5 of 8 cells, equal in 1 and higher in 2.
+  - Over all 120 grid cells (single seed), the largest a_il − b_mds is +0.74 point (70 Mbit/s mix, rho 10 %, b8), the largest negative −0.96. **Nowhere does the gap exceed 1 point** (0 of 120). The point is not a decision threshold the data approaches.
+  - Where a_il is slightly better than b_mds it is not a real advantage: both have the same R, so MDS dominates cell for cell. The differences come from a different number of packets, hence a different alignment to the same loss process.
+- **Contiguous split (no interleave) is clearly worse under bursts:** 2.1 against 1.2 % (100 Mbit/s b8), 2.1 against 0.4 % (200 Mbit/s b8), and up to 6.5 % at 150 Mbit/s b16. Interleaving is what keeps (a) near MDS; it is not optional.
+- **(c) RaptorQ equals (b) in every cell** (identical to two decimals in most). The spare-symbol failure probability never shows at r ≥ 10, so it does not argue for or against it.
+- **(d) the rev-6 default is far behind at these rates:** 4–5 % late frames at b3 and 13–19 % at b8 (T = 5 ms and T = 33 ms alike). At 100 Mbit/s a k_max of 64 is about 6 ms of traffic, so the block is shorter than a burst. This is a larger effect than (a) against (b) by an order of magnitude.
+- **Cost of the per-frame codes (a, b, c).** Repairs follow the whole frame, so the recovery-wait p95 is about 62–70 ms for all three (and 72–100 ms at b16) against 10–20 ms for time-capped RS (`w95` column). This is equal across (a), (b) and (c) and so does not change the choice. It is the price of the span, and it makes late frames the metric where (d) loses.
+- **Not in the model:** the CPU cost of (b) (about 0.9 ms per lossy frame in wasm, §8.1), the second codec, and a hybrid in which a frame's repairs are sent progressively.
+
+### Consequence for §8.1
+The condition "choose (b) only if (a) leaves a gap of more than a point or so of late frames" is not met anywhere in the grid, with the interleaved assignment. Recommendation: (a), m = ceil((k + R)/256), interleaved assignment i mod m, r = ceil(R/m). The contiguous variant must not be used. The larger finding is that, above 70 Mbit/s, the frame-spanning blocks of (a) beat the current time-capped default by 4–19 points of late frames under bursts.
+
+Caveats: single-seed grid; 70 Mbit/s mostly fits one block (m = 1, so (a) = (b) by construction); the loss model is per packet with no time correlation; ideal MDS decode.
