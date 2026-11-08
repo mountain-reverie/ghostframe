@@ -39,7 +39,7 @@ Same as PR 1's plan, "Ground rules":
 - explicit `git add`, never push, `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`;
 - never kill processes; disk limits.
 
-Every task ends with `cargo clippy --workspace --all-targets -- -D warnings` and `cargo clippy -p ghostframe-lib --all-targets --features cdf53-diag -- -D warnings` clean. A non-compiling test target vanishes from `cargo test`'s summary, so clippy is the gate.
+Run `cargo fmt --all` before every commit: the plan's Rust is not guaranteed rustfmt-clean, and CI's fmt job checks the tip. Every task ends with `cargo clippy --workspace --all-targets -- -D warnings` and `cargo clippy -p ghostframe-lib --all-targets --features cdf53-diag -- -D warnings` clean. A non-compiling test target vanishes from `cargo test`'s summary, so clippy is the gate.
 
 ## Decisions this plan makes (the spec left them open)
 
