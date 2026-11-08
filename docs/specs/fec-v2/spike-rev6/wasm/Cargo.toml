@@ -1,0 +1,25 @@
+[package]
+name = "spike_wasm"
+version = "0.1.0"
+edition = "2021"
+[workspace]
+[lib]
+crate-type = ["cdylib"]
+[features]
+# no feature = baseline: the same glue with a plain XOR codec (r = 1), so size deltas are codec-only
+rusty = ["dep:rusty_erasure"]
+# smallest rusty_erasure build: our matrix + generic recover only (no built-in Cauchy, no e x e path)
+lean = ["rusty"]
+gf = []
+rq = ["dep:raptorq"]
+rlc = ["dep:cu-fec"]
+[dependencies]
+rusty_erasure = { version = "=0.4.3", optional = true }
+raptorq = { version = "2", default-features = false, optional = true }
+cu-fec = { version = "1", optional = true }
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
