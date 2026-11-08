@@ -994,3 +994,6 @@ mod fallback_tests;
 
 #[cfg(test)]
 mod cdf53_shader_gen;
+
+#[cfg(test)]
+mod cdf53_forward_gate_tests;
