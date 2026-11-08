@@ -24,13 +24,9 @@ drop() { grep -v "$@" || true; }
 drop_e() { grep -vE "$@" || true; }
 code_only() { drop_e ':[0-9]+: *(//|///|//!)'; }
 
-# ghostframe-lib. gpu_pipeline/frame.rs is exempt: its three cdf53-diag reads
-# sit in the Vulkan dispatch path, where threading config through is a much
-# larger change. They are feature-gated and race nothing; tracked as deferred
-# work in docs/superpowers/plans/2026-09-08-lib-config.md.
+# ghostframe-lib: config.rs only.
 hits=$(scan 'env::var' ghostframe-lib/src \
     | drop '^ghostframe-lib/src/config.rs' \
-    | drop '^ghostframe-lib/src/capture/gpu_pipeline/frame.rs' \
     | code_only)
 if [[ -n "$hits" ]]; then
     echo "$hits"

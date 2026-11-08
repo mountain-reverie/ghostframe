@@ -1912,17 +1912,7 @@ impl IoBridge {
                 if tile_x as u32 == target_x && tile_y as u32 == target_y {
                     let tile_bgra =
                         grid.extract_tile(pixels, frame.stride, tile_x as u32, tile_y as u32);
-                    // Pick CPU reference based on which dispatches were skipped:
-                    // SKIP_L2_L3 → L1-only; SKIP_L3 → L2-only; otherwise full.
-                    let skip_l2_l3 = self.diagnostics.cdf53_skip_l2_l3;
-                    let skip_l3 = self.diagnostics.cdf53_skip_l3;
-                    let cpu_coeffs = if skip_l2_l3 {
-                        crate::encoder::cdf53::forward_level1_only(&tile_bgra)
-                    } else if skip_l3 {
-                        crate::encoder::cdf53::forward_level2_only(&tile_bgra)
-                    } else {
-                        crate::encoder::cdf53::forward(&tile_bgra)
-                    };
+                    let cpu_coeffs = crate::encoder::cdf53::forward(&tile_bgra);
                     // B↔R swap hypothesis: build a fake tile where B and R are
                     // swapped in the BGRA buffer, then CPU-forward it. If the GPU
                     // result matches THIS, the shader's rgba8/bgra8 mismatch is

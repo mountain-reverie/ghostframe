@@ -94,8 +94,7 @@ ENV RUST_MIN_STACK=16777216
 # Enable the lib's `test-loss-injection` feature so e2e tests can drive
 # deterministic packet/ACK drops via GHOSTFRAME_{OUTBOUND,INBOUND}_LOSS_*
 # env vars. Also enable `cdf53-diag` so e2e tests can drive the GPU vs CPU
-# cdf53 forward diff log (GHOSTFRAME_CDF53_DIFF_TILE=X,Y) and the
-# GHOSTFRAME_CDF53_SKIP_L2_L3 / SKIP_L3 stage gates. Production builds
+# cdf53 forward diff log (GHOSTFRAME_CDF53_DIFF_TILE=X,Y). Production builds
 # (separate Dockerfile or release pipeline) do NOT enable these features.
 # `allow-software-vulkan` is the same kind of flag: this image has no /dev/dri,
 # so its daemon runs on llvmpipe, which production refuses. The grep below
