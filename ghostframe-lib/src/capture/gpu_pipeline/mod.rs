@@ -991,3 +991,6 @@ mod damage_tests;
 
 #[cfg(test)]
 mod fallback_tests;
+
+#[cfg(test)]
+mod cdf53_shader_gen;
