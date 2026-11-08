@@ -342,7 +342,7 @@ pub struct GpuFrameProcessor {
 
     // M3.3c — idle-escalation second-dispatch resources. CPU writes the
     // escalation list + count via host-coherent buffer; second invocation of
-    // the cdf53_forward_l{1,2,3} shaders reads them and writes coefficients
+    // the cdf53_forward shader reads them and writes coefficients
     // into the dedicated escalation_coefficients_buffer. K = MAX_ESCALATION_PER_FRAME
     // bounds the dispatch + the buffer sizes.
     /// CPU writes tile-idx values via this pointer (host-coherent).
@@ -361,14 +361,9 @@ pub struct GpuFrameProcessor {
     cdf53_fallback_list: HostBuffer<u32>,
     cdf53_fallback_coefficients: HostBuffer<i32>,
 
-    // Cdf53 forward L1 pipeline (Stage 4c-L1, added M3.3a Task 7)
-    cdf53_forward_l1: ComputeStage,
-
-    // Cdf53 forward L2 pipeline (Stage 4c-L2, added M3.3a Task 7)
-    cdf53_forward_l2: ComputeStage,
-
-    // Cdf53 forward L3 pipeline (Stage 4c-L3, added M3.3a Task 7)
-    cdf53_forward_l3: ComputeStage,
+    // Cdf53 forward pipeline (Stage 4c): all three levels in one dispatch,
+    // `cdf53_encode.comp` built with CDF53_FORWARD_ONLY=1.
+    cdf53_forward: ComputeStage,
 
     // PalRLE indirect-args pipeline (Stage 1.5b)
     palrle_indirect_args: ComputeStage,
@@ -924,14 +919,8 @@ impl Drop for GpuFrameProcessor {
             self.device
                 .free_memory(self.cdf53_escalation_coefficients_memory, None);
 
-            // Cdf53 forward L1 pipeline (Stage 4c-L1)
-            self.cdf53_forward_l1.destroy(&self.device);
-
-            // Cdf53 forward L2 pipeline (Stage 4c-L2)
-            self.cdf53_forward_l2.destroy(&self.device);
-
-            // Cdf53 forward L3 pipeline (Stage 4c-L3)
-            self.cdf53_forward_l3.destroy(&self.device);
+            // Cdf53 forward pipeline (Stage 4c)
+            self.cdf53_forward.destroy(&self.device);
 
             // PalRLE indirect-args pipeline
             self.palrle_indirect_args.destroy(&self.device);

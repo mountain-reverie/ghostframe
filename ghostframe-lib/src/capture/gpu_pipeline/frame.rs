@@ -998,7 +998,7 @@ impl GpuFrameProcessor {
         //    sad_ds_guard, nv12_ds_guard, analysis_ds_guard,
         //    palrle_compact_ds_guard, palrle_indirect_args_ds_guard,
         //    cdf53_compact_ds_guard, cdf53_indirect_args_ds_guard,
-        //    cdf53_forward_l1/l2/l3_ds_guard, _cdf53_escalation_ds_guards,
+        //    cdf53_forward_ds_guard, cdf53_escalation_ds_guard,
         //    palette_fold_ds_guard, palette_subset_fold_init_ds_guard,
         //    palette_subset_fold_ds_guard, and pal_rle_index_ds_guard are
         //    dropped explicitly before step 9 to
@@ -2347,225 +2347,44 @@ impl GpuFrameProcessor {
         )
     }
 
-    /// Stage 4c-L1 — CDF 5/3 forward wavelet, level 1.
+    /// Stage 4c — CDF 5/3 forward wavelet, all three levels in one dispatch.
     ///
-    /// Reads the current frame image (STORAGE_IMAGE) and compact list
-    /// (STORAGE_BUFFER), writes coefficient buffer (STORAGE_BUFFER).
-    /// Dispatches via `cmd_dispatch_indirect` from `cdf53_dispatch_args_buffer`.
-    ///
-    /// Caller must:
-    ///   - Ensure `current_view` is in `GENERAL` layout (same state as for SAD/NV12).
-    ///   - Ensure `cdf53_dispatch_args_buffer` is barriered for `INDIRECT_COMMAND_READ`.
-    ///   - Add a SHADER_WRITE → SHADER_READ barrier on `cdf53_coefficients_buffer`
-    ///     after this call before dispatching L2.
-    ///   - Hold the returned guard alive until after `wait_for_fences`.
-    unsafe fn run_cdf53_forward_l1_stage<'a>(
-        &'a self,
-        cmd: vk::CommandBuffer,
-        current_view: vk::ImageView,
-        cols: u32,
-        rows: u32,
-    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        // cdf53_dispatch_args_buffer already barriered for INDIRECT_COMMAND_READ
-        // by the preceding cdf53_indirect_args stage barrier in the orchestrator.
-        self.record_stage(
-            cmd,
-            &self.cdf53_forward_l1,
-            &[
-                StageBinding::Image(current_view),
-                StageBinding::Buffer(self.cdf53_compact_list_buffer),
-                StageBinding::Buffer(self.cdf53_coefficients_buffer),
-            ],
-            &[cols, rows],
-            StageDispatch::Indirect(self.cdf53_dispatch_args.buffer),
-        )
-    }
-
-    /// Stage 4c-L2 — CDF 5/3 forward wavelet, level 2.
-    ///
-    /// Reads LL1 from `cdf53_coefficients_buffer[0..256]` (per channel),
-    /// overwrites those offsets with LL2/HL2/LH2/HH2.
-    /// Dispatches via `cmd_dispatch_indirect` from `cdf53_dispatch_args_buffer`.
+    /// One 96-invocation workgroup per list slot (`cdf53_encode.comp`,
+    /// forward-only variant): reads the frame image and `list_buffer`,
+    /// writes `CDF53_TOTAL_COEFFS` i32 coefficients per slot into
+    /// `coeff_buffer`, in the layout `cdf53::forward` produces. Used for the
+    /// frame's compact list (indirect), the escalation list and the fallback
+    /// tiles (direct).
     ///
     /// Caller must:
-    ///   - Ensure a SHADER_WRITE → SHADER_READ barrier on `cdf53_coefficients_buffer`
-    ///     was issued after L1.
-    ///   - Add a SHADER_WRITE → SHADER_READ barrier on `cdf53_coefficients_buffer`
-    ///     after this call before dispatching L3.
+    ///   - Ensure `current_view` is in `GENERAL` layout.
+    ///   - For `StageDispatch::Indirect`, ensure the args buffer is barriered
+    ///     for `INDIRECT_COMMAND_READ`.
+    ///   - Add a SHADER_WRITE → HOST_READ barrier on `coeff_buffer` before
+    ///     the host reads it.
     ///   - Hold the returned guard alive until after `wait_for_fences`.
-    unsafe fn run_cdf53_forward_l2_stage<'a>(
-        &'a self,
-        cmd: vk::CommandBuffer,
-        cols: u32,
-        rows: u32,
-    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        self.record_stage(
-            cmd,
-            &self.cdf53_forward_l2,
-            &[
-                StageBinding::Buffer(self.cdf53_compact_list_buffer),
-                StageBinding::Buffer(self.cdf53_coefficients_buffer),
-            ],
-            &[cols, rows],
-            StageDispatch::Indirect(self.cdf53_dispatch_args.buffer),
-        )
-    }
-
-    /// Stage 4c-L3 — CDF 5/3 forward wavelet, level 3.
-    ///
-    /// Reads LL2 from `cdf53_coefficients_buffer[0..64]` (per channel),
-    /// overwrites those offsets with LL3/HL3/LH3/HH3.
-    /// Dispatches via `cmd_dispatch_indirect` from `cdf53_dispatch_args_buffer`.
-    ///
-    /// Caller must:
-    ///   - Ensure a SHADER_WRITE → SHADER_READ barrier on `cdf53_coefficients_buffer`
-    ///     was issued after L2.
-    ///   - Add a SHADER_WRITE → HOST_READ barrier on `cdf53_coefficients_buffer`
-    ///     after this call for Phase B readback.
-    ///   - Hold the returned guard alive until after `wait_for_fences`.
-    unsafe fn run_cdf53_forward_l3_stage<'a>(
-        &'a self,
-        cmd: vk::CommandBuffer,
-        cols: u32,
-        rows: u32,
-    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        self.record_stage(
-            cmd,
-            &self.cdf53_forward_l3,
-            &[
-                StageBinding::Buffer(self.cdf53_compact_list_buffer),
-                StageBinding::Buffer(self.cdf53_coefficients_buffer),
-            ],
-            &[cols, rows],
-            StageDispatch::Indirect(self.cdf53_dispatch_args.buffer),
-        )
-    }
-
-    /// Run the L1→L2→L3 CDF 5/3 forward chain a SECOND time, against the
-    /// escalation buffers. The image binding still points at `current_view`
-    /// (escalation reads pixel data from the same source). The compact list
-    /// and coefficient output are the dedicated escalation buffers.
-    ///
-    /// Uses `cmd_dispatch(count, 1, 1)` — the count is known on the CPU so no
-    /// indirect-args buffer is needed.
-    ///
-    /// SAFETY:
-    ///   - `count` MUST equal the number of entries the host wrote to
-    ///     `cdf53_escalation_list_buffer` (`set_escalation_candidates`).
-    ///   - The `cdf53_escalation_list_buffer` MUST be filled with `count` valid
-    ///     tile-idx values before the dispatch (host writeBuffer is ordered
-    ///     before the subsequent submit, so this happens naturally).
-    ///   - Holds three `ScopedDescriptorSets` until after `wait_for_fences`.
-    ///   - If `count == 0`, returns an error (callers should skip this entirely).
     #[allow(clippy::too_many_arguments)]
-    unsafe fn run_cdf53_forward_escalation_stages<'a>(
+    unsafe fn run_cdf53_forward_stage<'a>(
         &'a self,
         cmd: vk::CommandBuffer,
         current_view: vk::ImageView,
         cols: u32,
         rows: u32,
-        count: u32,
         list_buffer: vk::Buffer,
         coeff_buffer: vk::Buffer,
-    ) -> Result<
-        (
-            ScopedDescriptorSets<'a>,
-            ScopedDescriptorSets<'a>,
-            ScopedDescriptorSets<'a>,
-        ),
-        Box<dyn std::error::Error>,
-    > {
-        if count == 0 {
-            return Err("escalation dispatch called with count=0".into());
-        }
-
-        // ── L1 stage ─────────────────────────────────────────────────────────
-        // Binding 0: current frame STORAGE_IMAGE (same layout as dirty L1)
-        // Binding 1: cdf53_escalation_list_buffer  (replaces cdf53_compact_list_buffer)
-        // Binding 2: cdf53_escalation_coefficients_buffer  (replaces cdf53_coefficients_buffer)
-        let l1_guard = self.record_stage(
+        dispatch: StageDispatch<'_>,
+    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
+        self.record_stage(
             cmd,
-            &self.cdf53_forward_l1,
+            &self.cdf53_forward,
             &[
                 StageBinding::Image(current_view),
                 StageBinding::Buffer(list_buffer),
                 StageBinding::Buffer(coeff_buffer),
             ],
             &[cols, rows],
-            StageDispatch::Direct(count, 1, 1),
-        )?;
-
-        // Barrier L1 → L2: escalation coefficient writes from L1 must be
-        // visible to L2.
-        let buf_barrier_esc_l1_to_l2 = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(coeff_buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE);
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_esc_l1_to_l2),
-            &[],
-        );
-
-        // ── L2 stage ─────────────────────────────────────────────────────────
-        // Binding 0: cdf53_escalation_list_buffer  (read-only)
-        // Binding 1: cdf53_escalation_coefficients_buffer  (read LL1, write L2 subbands)
-        let l2_guard = self.record_stage(
-            cmd,
-            &self.cdf53_forward_l2,
-            &[
-                StageBinding::Buffer(list_buffer),
-                StageBinding::Buffer(coeff_buffer),
-            ],
-            &[cols, rows],
-            StageDispatch::Direct(count, 1, 1),
-        )?;
-
-        // Barrier L2 → L3: escalation coefficient writes from L2 must be
-        // visible to L3.
-        let buf_barrier_esc_l2_to_l3 = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(coeff_buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE);
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_esc_l2_to_l3),
-            &[],
-        );
-
-        // ── L3 stage ─────────────────────────────────────────────────────────
-        // Binding 0: cdf53_escalation_list_buffer  (read-only)
-        // Binding 1: cdf53_escalation_coefficients_buffer  (read LL2, write L3 subbands)
-        let l3_guard = self.record_stage(
-            cmd,
-            &self.cdf53_forward_l3,
-            &[
-                StageBinding::Buffer(list_buffer),
-                StageBinding::Buffer(coeff_buffer),
-            ],
-            &[cols, rows],
-            StageDispatch::Direct(count, 1, 1),
-        )?;
-
-        // The L3 -> HOST_READ barrier for the escalation coefficients is
-        // recorded once, by the caller, after this returns.
-        Ok((l1_guard, l2_guard, l3_guard))
+            dispatch,
+        )
     }
 
     /// Snapshot copy: `current_image` (GENERAL) -> `dst_image`, then restore
@@ -2941,55 +2760,20 @@ impl GpuFrameProcessor {
         );
 
         // ============================================================
-        // Stage 4c: cdf53_forward L1 → L2 → L3 (per-tile wavelet transform)
+        // Stage 4c: cdf53_forward, all three levels in one dispatch
         // ============================================================
-
-        // Stage 4c-L1: 32×32 BGRA tile → 4 × 16×16 subbands.
-        let cdf53_forward_l1_ds_guard =
-            self.run_cdf53_forward_l1_stage(cmd, current_view, cols, rows)?;
-
-        // Barrier L1 → L2: coefficient writes from L1 must be visible to L2.
-        let buf_barrier_l1_to_l2 = buf_barrier(
-            self.cdf53_coefficients_buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            vk::WHOLE_SIZE,
-        );
-        self.device.cmd_pipeline_barrier(
+        let cdf53_forward_ds_guard = self.run_cdf53_forward_stage(
             cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_l1_to_l2),
-            &[],
-        );
-
-        // Stage 4c-L2: 16×16 LL1 → 4 × 8×8 subbands.
-        let cdf53_forward_l2_ds_guard = self.run_cdf53_forward_l2_stage(cmd, cols, rows)?;
-
-        // Barrier L2 → L3: coefficient writes from L2 must be visible to L3.
-        let buf_barrier_l2_to_l3 = buf_barrier(
+            current_view,
+            cols,
+            rows,
+            self.cdf53_compact_list_buffer,
             self.cdf53_coefficients_buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            vk::WHOLE_SIZE,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_l2_to_l3),
-            &[],
-        );
+            StageDispatch::Indirect(self.cdf53_dispatch_args.buffer),
+        )?;
 
-        // Stage 4c-L3: 8×8 LL2 → 4 × 4×4 subbands. Final wavelet coefficients.
-        let cdf53_forward_l3_ds_guard = self.run_cdf53_forward_l3_stage(cmd, cols, rows)?;
-
-        // Barrier L3 → HOST_READ: Phase B reads coefficient buffer after fence.
-        let buf_barrier_l3_host = buf_barrier(
+        // Barrier → HOST_READ: Phase B reads the coefficient buffer after the fence.
+        let buf_barrier_forward_host = buf_barrier(
             self.cdf53_coefficients_buffer,
             vk::AccessFlags::SHADER_WRITE,
             vk::AccessFlags::HOST_READ,
@@ -3001,24 +2785,24 @@ impl GpuFrameProcessor {
             vk::PipelineStageFlags::HOST,
             vk::DependencyFlags::empty(),
             &[],
-            std::slice::from_ref(&buf_barrier_l3_host),
+            std::slice::from_ref(&buf_barrier_forward_host),
             &[],
         );
 
         // ============================================================
         // Stage 4d: cdf53_forward escalation (idle-escalation candidates)
         // ============================================================
-        let cdf53_escalation_ds_guards = if escalation_count > 0 {
-            let guards = self.run_cdf53_forward_escalation_stages(
+        let cdf53_escalation_ds_guard = if escalation_count > 0 {
+            let guard = self.run_cdf53_forward_stage(
                 cmd,
                 current_view,
                 cols,
                 rows,
-                escalation_count,
                 self.cdf53_escalation_list.buffer,
                 self.cdf53_escalation_coefficients_buffer,
+                StageDispatch::Direct(escalation_count, 1, 1),
             )?;
-            // L3 → HOST_READ barrier so Phase B can read after fence.
+            // → HOST_READ so Phase B can read after the fence.
             let buf_barrier_esc_host = buf_barrier(
                 self.cdf53_escalation_coefficients_buffer,
                 vk::AccessFlags::SHADER_WRITE,
@@ -3034,7 +2818,7 @@ impl GpuFrameProcessor {
                 std::slice::from_ref(&buf_barrier_esc_host),
                 &[],
             );
-            Some(guards)
+            Some(guard)
         } else {
             None
         };
@@ -3221,10 +3005,8 @@ impl GpuFrameProcessor {
             palrle_indirect_args_ds_guard,
             cdf53_compact_ds_guard,
             cdf53_indirect_args_ds_guard,
-            cdf53_forward_l1_ds_guard,
-            cdf53_forward_l2_ds_guard,
-            cdf53_forward_l3_ds_guard,
-            cdf53_escalation_ds_guards,
+            cdf53_forward_ds_guard,
+            cdf53_escalation_ds_guard,
             palette_fold_ds_guard,
             palette_subset_fold_init_ds_guard,
             palette_subset_fold_ds_guard,
@@ -3246,14 +3028,8 @@ struct SharedStageGuards<'a> {
     palette_subset_fold_ds_guard: ScopedDescriptorSets<'a>,
     palette_subset_fold_init_ds_guard: ScopedDescriptorSets<'a>,
     palette_fold_ds_guard: ScopedDescriptorSets<'a>,
-    cdf53_escalation_ds_guards: Option<(
-        ScopedDescriptorSets<'a>,
-        ScopedDescriptorSets<'a>,
-        ScopedDescriptorSets<'a>,
-    )>,
-    cdf53_forward_l3_ds_guard: ScopedDescriptorSets<'a>,
-    cdf53_forward_l2_ds_guard: ScopedDescriptorSets<'a>,
-    cdf53_forward_l1_ds_guard: ScopedDescriptorSets<'a>,
+    cdf53_escalation_ds_guard: Option<ScopedDescriptorSets<'a>>,
+    cdf53_forward_ds_guard: ScopedDescriptorSets<'a>,
     cdf53_indirect_args_ds_guard: ScopedDescriptorSets<'a>,
     cdf53_compact_ds_guard: ScopedDescriptorSets<'a>,
     palrle_indirect_args_ds_guard: ScopedDescriptorSets<'a>,
@@ -3271,10 +3047,8 @@ impl SharedStageGuards<'_> {
             palrle_indirect_args_ds_guard,
             cdf53_compact_ds_guard,
             cdf53_indirect_args_ds_guard,
-            cdf53_forward_l1_ds_guard,
-            cdf53_forward_l2_ds_guard,
-            cdf53_forward_l3_ds_guard,
-            cdf53_escalation_ds_guards,
+            cdf53_forward_ds_guard,
+            cdf53_escalation_ds_guard,
             palette_fold_ds_guard,
             palette_subset_fold_init_ds_guard,
             palette_subset_fold_ds_guard,
@@ -3285,10 +3059,8 @@ impl SharedStageGuards<'_> {
         drop(palrle_indirect_args_ds_guard);
         drop(cdf53_compact_ds_guard);
         drop(cdf53_indirect_args_ds_guard);
-        drop(cdf53_forward_l1_ds_guard);
-        drop(cdf53_forward_l2_ds_guard);
-        drop(cdf53_forward_l3_ds_guard);
-        drop(cdf53_escalation_ds_guards);
+        drop(cdf53_forward_ds_guard);
+        drop(cdf53_escalation_ds_guard);
         drop(palette_fold_ds_guard);
         drop(palette_subset_fold_init_ds_guard);
         drop(palette_subset_fold_ds_guard);
@@ -3296,17 +3068,15 @@ impl SharedStageGuards<'_> {
     }
 
     /// Free in reverse creation order (the first-frame path's scope-end
-    /// order). The escalation triple still frees l1, l2, l3 as a tuple.
+    /// order).
     fn release_reverse(self) {
         let Self {
             palrle_compact_ds_guard,
             palrle_indirect_args_ds_guard,
             cdf53_compact_ds_guard,
             cdf53_indirect_args_ds_guard,
-            cdf53_forward_l1_ds_guard,
-            cdf53_forward_l2_ds_guard,
-            cdf53_forward_l3_ds_guard,
-            cdf53_escalation_ds_guards,
+            cdf53_forward_ds_guard,
+            cdf53_escalation_ds_guard,
             palette_fold_ds_guard,
             palette_subset_fold_init_ds_guard,
             palette_subset_fold_ds_guard,
@@ -3317,10 +3087,8 @@ impl SharedStageGuards<'_> {
         drop(palette_subset_fold_ds_guard);
         drop(palette_subset_fold_init_ds_guard);
         drop(palette_fold_ds_guard);
-        drop(cdf53_escalation_ds_guards);
-        drop(cdf53_forward_l3_ds_guard);
-        drop(cdf53_forward_l2_ds_guard);
-        drop(cdf53_forward_l1_ds_guard);
+        drop(cdf53_escalation_ds_guard);
+        drop(cdf53_forward_ds_guard);
         drop(cdf53_indirect_args_ds_guard);
         drop(cdf53_compact_ds_guard);
         drop(palrle_indirect_args_ds_guard);
@@ -3414,7 +3182,7 @@ impl GpuFrameProcessor {
     ///
     /// `tiles` are 32x32 BGRA tiles, 4096 bytes each, in the order the
     /// caller wants the coefficients back. They are laid out in a small
-    /// transient image so the existing forward shaders run unchanged with an
+    /// transient image so the forward shader runs with an
     /// identity tile list; nothing here depends on the frame's own image,
     /// which is gone once `process_frame` returns. One GPU round trip (one
     /// submit and fence wait) per chunk of `MAX_ESCALATION_PER_FRAME` tiles.
@@ -3498,14 +3266,14 @@ impl GpuFrameProcessor {
                 &[],
                 std::slice::from_ref(&barrier),
             );
-            let guards = self.run_cdf53_forward_escalation_stages(
+            let guard = self.run_cdf53_forward_stage(
                 cmd,
                 current.view,
                 cols,
                 rows,
-                n as u32,
                 self.cdf53_fallback_list.buffer,
                 self.cdf53_fallback_coefficients.buffer,
+                StageDispatch::Direct(n as u32, 1, 1),
             )?;
             let host_barrier = buf_barrier(
                 self.cdf53_fallback_coefficients.buffer,
@@ -3530,7 +3298,7 @@ impl GpuFrameProcessor {
             );
             out.extend(coeffs.iter().map(|&v| v as i16));
             // The descriptor sets were in use until the wait above.
-            drop(guards);
+            drop(guard);
             Ok(())
         })();
         self.destroy_prev_frame(current);

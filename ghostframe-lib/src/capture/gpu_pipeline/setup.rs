@@ -58,18 +58,10 @@ const PAL_RLE_INDEX_BINDINGS: [BindingSpec; 6] = [
     BindingSpec::storage_buffer(4),
     BindingSpec::storage_buffer(5),
 ];
-const CDF53_FORWARD_L1_BINDINGS: [BindingSpec; 3] = [
+const CDF53_FORWARD_BINDINGS: [BindingSpec; 3] = [
     BindingSpec::storage_image(0),
     BindingSpec::storage_buffer(1),
     BindingSpec::storage_buffer(2),
-];
-const CDF53_FORWARD_L2_BINDINGS: [BindingSpec; 2] = [
-    BindingSpec::storage_buffer(0),
-    BindingSpec::storage_buffer(1),
-];
-const CDF53_FORWARD_L3_BINDINGS: [BindingSpec; 2] = [
-    BindingSpec::storage_buffer(0),
-    BindingSpec::storage_buffer(1),
 ];
 const CDF53_INDIRECT_ARGS_BINDINGS: [BindingSpec; 2] = [
     BindingSpec::storage_buffer(0),
@@ -91,8 +83,8 @@ const PALETTE_SUBSET_FOLD_BINDINGS: [BindingSpec; 2] = [
 
 /// Number of `record_stage` descriptor sets each stage holds at once, i.e.
 /// how many times a stage's layout is allocated from the shared pool per
-/// frame. The cdf53 forward stages run twice (refinement and escalation).
-const STAGE_POOL_USES: [(&[BindingSpec], u32); 14] = [
+/// frame. The cdf53 forward stage runs twice (refinement and escalation).
+const STAGE_POOL_USES: [(&[BindingSpec], u32); 12] = [
     (&SAD_BINDINGS, 1),
     (&NV12_BINDINGS, 1),
     (&ANALYSIS_BINDINGS, 1),
@@ -100,9 +92,7 @@ const STAGE_POOL_USES: [(&[BindingSpec], u32); 14] = [
     (&CDF53_COMPACT_BINDINGS, 1),
     (&PALRLE_INDIRECT_ARGS_BINDINGS, 1),
     (&PAL_RLE_INDEX_BINDINGS, 1),
-    (&CDF53_FORWARD_L1_BINDINGS, 2),
-    (&CDF53_FORWARD_L2_BINDINGS, 2),
-    (&CDF53_FORWARD_L3_BINDINGS, 2),
+    (&CDF53_FORWARD_BINDINGS, 2),
     (&CDF53_INDIRECT_ARGS_BINDINGS, 1),
     (&PALETTE_FOLD_BINDINGS, 1),
     (&PALETTE_SUBSET_FOLD_INIT_BINDINGS, 1),
@@ -419,80 +409,30 @@ impl GpuFrameProcessor {
             pal_rle_index_shader_module,
         )?;
 
-        // --- Cdf53 forward L1 shader module (Stage 4c-L1) ---
-        let cdf53_forward_l1_spv = include_bytes!("../shaders/cdf53_forward_l1.spv");
-        let cdf53_forward_l1_spv_words =
-            ash::util::read_spv(&mut std::io::Cursor::new(cdf53_forward_l1_spv.as_slice()))?;
-        let cdf53_forward_l1_shader_ci =
-            vk::ShaderModuleCreateInfo::default().code(&cdf53_forward_l1_spv_words);
-        let cdf53_forward_l1_shader_module =
-            device.create_shader_module(&cdf53_forward_l1_shader_ci, None)?;
+        // --- Cdf53 forward (Stage 4c): all three levels, one dispatch ---
+        // `cdf53_encode.comp` built with CDF53_FORWARD_ONLY=1 (`just shaders-cdf53`).
+        let cdf53_forward_spv = include_bytes!("../shaders/cdf53_forward.spv");
+        let cdf53_forward_spv_words =
+            ash::util::read_spv(&mut std::io::Cursor::new(cdf53_forward_spv.as_slice()))?;
+        let cdf53_forward_shader_ci =
+            vk::ShaderModuleCreateInfo::default().code(&cdf53_forward_spv_words);
+        let cdf53_forward_shader_module =
+            device.create_shader_module(&cdf53_forward_shader_ci, None)?;
 
-        // --- Cdf53 forward L1 compute pipeline ---
         // Bindings:
         //   0: STORAGE_IMAGE  (current_frame, read-only)
-        //   1: STORAGE_BUFFER (cdf53_compact_list, read-only)
-        //   2: STORAGE_BUFFER (cdf53_coefficients, read-write)
-        // Push constants: 2 × u32 = 8 bytes (cols, rows).
+        //   1: STORAGE_BUFFER (tile list, read-only)
+        //   2: STORAGE_BUFFER (coefficients, write-only)
+        // Push constants: 2 x u32 = 8 bytes (cols, rows).
         let (
-            cdf53_forward_l1_descriptor_set_layout,
-            cdf53_forward_l1_pipeline_layout,
-            cdf53_forward_l1_pipeline,
+            cdf53_forward_descriptor_set_layout,
+            cdf53_forward_pipeline_layout,
+            cdf53_forward_pipeline,
         ) = pipeline_builder::build_compute_pipeline(
             &device,
-            &CDF53_FORWARD_L1_BINDINGS,
+            &CDF53_FORWARD_BINDINGS,
             8,
-            cdf53_forward_l1_shader_module,
-        )?;
-
-        // --- Cdf53 forward L2 shader module (Stage 4c-L2) ---
-        let cdf53_forward_l2_spv = include_bytes!("../shaders/cdf53_forward_l2.spv");
-        let cdf53_forward_l2_spv_words =
-            ash::util::read_spv(&mut std::io::Cursor::new(cdf53_forward_l2_spv.as_slice()))?;
-        let cdf53_forward_l2_shader_ci =
-            vk::ShaderModuleCreateInfo::default().code(&cdf53_forward_l2_spv_words);
-        let cdf53_forward_l2_shader_module =
-            device.create_shader_module(&cdf53_forward_l2_shader_ci, None)?;
-
-        // --- Cdf53 forward L2 compute pipeline ---
-        // Bindings:
-        //   0: STORAGE_BUFFER (cdf53_compact_list, read-only)
-        //   1: STORAGE_BUFFER (cdf53_coefficients, read-write)
-        // Push constants: 2 × u32 = 8 bytes (cols, rows).
-        let (
-            cdf53_forward_l2_descriptor_set_layout,
-            cdf53_forward_l2_pipeline_layout,
-            cdf53_forward_l2_pipeline,
-        ) = pipeline_builder::build_compute_pipeline(
-            &device,
-            &CDF53_FORWARD_L2_BINDINGS,
-            8,
-            cdf53_forward_l2_shader_module,
-        )?;
-
-        // --- Cdf53 forward L3 shader module (Stage 4c-L3) ---
-        let cdf53_forward_l3_spv = include_bytes!("../shaders/cdf53_forward_l3.spv");
-        let cdf53_forward_l3_spv_words =
-            ash::util::read_spv(&mut std::io::Cursor::new(cdf53_forward_l3_spv.as_slice()))?;
-        let cdf53_forward_l3_shader_ci =
-            vk::ShaderModuleCreateInfo::default().code(&cdf53_forward_l3_spv_words);
-        let cdf53_forward_l3_shader_module =
-            device.create_shader_module(&cdf53_forward_l3_shader_ci, None)?;
-
-        // --- Cdf53 forward L3 compute pipeline ---
-        // Bindings:
-        //   0: STORAGE_BUFFER (cdf53_compact_list, read-only)
-        //   1: STORAGE_BUFFER (cdf53_coefficients, read-write)
-        // Push constants: 2 × u32 = 8 bytes (cols, rows).
-        let (
-            cdf53_forward_l3_descriptor_set_layout,
-            cdf53_forward_l3_pipeline_layout,
-            cdf53_forward_l3_pipeline,
-        ) = pipeline_builder::build_compute_pipeline(
-            &device,
-            &CDF53_FORWARD_L3_BINDINGS,
-            8,
-            cdf53_forward_l3_shader_module,
+            cdf53_forward_shader_module,
         )?;
 
         // --- Descriptor pool ---
@@ -990,23 +930,11 @@ impl GpuFrameProcessor {
                 memory: fb_coeff_memory,
                 ptr: fb_coeff_ptr,
             },
-            cdf53_forward_l1: ComputeStage {
-                module: cdf53_forward_l1_shader_module,
-                pipeline: cdf53_forward_l1_pipeline,
-                layout: cdf53_forward_l1_pipeline_layout,
-                dsl: cdf53_forward_l1_descriptor_set_layout,
-            },
-            cdf53_forward_l2: ComputeStage {
-                module: cdf53_forward_l2_shader_module,
-                pipeline: cdf53_forward_l2_pipeline,
-                layout: cdf53_forward_l2_pipeline_layout,
-                dsl: cdf53_forward_l2_descriptor_set_layout,
-            },
-            cdf53_forward_l3: ComputeStage {
-                module: cdf53_forward_l3_shader_module,
-                pipeline: cdf53_forward_l3_pipeline,
-                layout: cdf53_forward_l3_pipeline_layout,
-                dsl: cdf53_forward_l3_descriptor_set_layout,
+            cdf53_forward: ComputeStage {
+                module: cdf53_forward_shader_module,
+                pipeline: cdf53_forward_pipeline,
+                layout: cdf53_forward_pipeline_layout,
+                dsl: cdf53_forward_descriptor_set_layout,
             },
             palrle_indirect_args: ComputeStage {
                 module: palrle_indirect_args_shader_module,
@@ -1101,10 +1029,10 @@ mod pool_tests {
 
     #[test]
     fn pool_sizes_follow_the_stage_binding_table() {
-        assert_eq!(POOL_NEED, (7, 41, 17));
+        assert_eq!(POOL_NEED, (7, 33, 13));
         assert_eq!(
             (POOL_STORAGE_IMAGES, POOL_STORAGE_BUFFERS, POOL_MAX_SETS),
-            (8, 41, 20)
+            (8, 33, 16)
         );
         assert!(POOL_STORAGE_IMAGES >= POOL_NEED.0);
         assert!(POOL_STORAGE_BUFFERS >= POOL_NEED.1);
