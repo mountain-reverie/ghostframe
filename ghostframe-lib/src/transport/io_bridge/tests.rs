@@ -943,10 +943,10 @@ async fn process_frame_no_panic_on_empty_pixels_no_dmabuf_no_session() {
 //   - transport::scheduler::tests::* — scheduler behavior in isolation.
 //   - tests/e2e.rs::e2e_solid_color (Task 15) — full pipeline with client.
 
-/// `Classifier::reset` must zero hysteresis streaks, so a single busy
-/// frame after reset can NOT promote to H264 (it needs `enter_sustain_micros`
-/// of dwell period). Without reset, a partial enter streak from a
-/// prior session would leak into the new session and trigger early promotion.
+/// `Classifier::reset` must zero hysteresis streaks: a partial enter streak
+/// from a prior session must not let the new session's first busy frame
+/// promote to H264. Explicit `now_us` so the dwell is under the test's
+/// control: without the reset the same frame promotes (control).
 #[test]
 fn classifier_reset_clears_streaks() {
     use crate::tile::{Classifier, CodecState, FrameMode};
@@ -966,15 +966,31 @@ fn classifier_reset_clears_streaks() {
         };
         2040
     ];
-    // Build partial enter streak.
-    c.decide_frame_mode(&busy, FrameMode::TileCodec);
-    c.decide_frame_mode(&busy, FrameMode::TileCodec);
-    // Reset clears it.
+    // Build an enter streak for ~400 ms, under the 500 ms hold.
+    let mut t = 0u64;
+    while t <= 400_000 {
+        assert_eq!(
+            c.decide_frame_mode_at(t, &busy, FrameMode::TileCodec),
+            FrameMode::TileCodec
+        );
+        t += 33_333;
+    }
+    let mut control = c.clone();
+    let ctx = c.adaptation_context();
     c.reset();
-    // After reset, one busy frame must NOT promote (streak was zeroed).
+    c.set_adaptation_context(ctx);
+    c.set_screen(2040, 0);
+    // The next frame is past the 500 ms hold, on a continued streak.
+    let t = 500_000;
     assert_eq!(
-        c.decide_frame_mode(&busy, FrameMode::TileCodec),
-        FrameMode::TileCodec
+        control.decide_frame_mode_at(t, &busy, FrameMode::TileCodec),
+        FrameMode::H264,
+        "control: without a reset the streak promotes"
+    );
+    assert_eq!(
+        c.decide_frame_mode_at(t, &busy, FrameMode::TileCodec),
+        FrameMode::TileCodec,
+        "after a reset the streak starts over"
     );
 }
 
@@ -9878,12 +9894,15 @@ async fn the_estimate_is_unknown_until_a_sample_follows_the_session_reset() {
         crate::transport::bwe::BweWrapper::INITIAL_BPS,
         "the fixture left the estimate at its initial value"
     );
-    bridge.bwe_samples_at_session_reset = snap.samples_seen;
+    // The real session reset takes its baseline from the samples so far.
+    bridge.fire_session_reset(ConnectionHandle(0));
     bridge.apply_path_stats_snapshot(1_000.0);
     assert!(!bridge.adaptation_context.estimate_known);
 
-    // One sample after the reset.
-    bridge.bwe_samples_at_session_reset = snap.samples_seen - 1;
+    // One more sample after the reset.
+    let t1 = t0 + std::time::Duration::from_millis(40);
+    bridge.bwe.update(&records, &[], t1, 14_400);
+    assert!(bridge.bwe.snapshot().samples_seen > snap.samples_seen);
     bridge.apply_path_stats_snapshot(1_000.0);
     assert!(bridge.adaptation_context.estimate_known);
 }

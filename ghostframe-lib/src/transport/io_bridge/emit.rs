@@ -148,6 +148,9 @@ impl IoBridge {
                 // Pairs the emitter's cache with the CDF 5/3 coverage.
                 self.cancel_in_flight_for_tile(key.tile_x, key.tile_y);
                 self.ensure_baseline_invalidated();
+                // The whole baseline is gone: the repaint is not demand.
+                let now_us = now.duration_since(self.epoch).as_micros() as u64;
+                self.classifier.note_repaint(now_us);
             }
             Some(Content::H264Frag {
                 frame_seq,
@@ -489,6 +492,8 @@ impl IoBridge {
                     // Report the whole GPU baseline as stale so the next frame
                     // marks these tiles dirty again and they are retried.
                     self.backend_apply(super::frame_backend::Control::InvalidateBaseline(1));
+                    let now_us = super::now_std().duration_since(self.epoch).as_micros() as u64;
+                    self.classifier.note_repaint(now_us);
                     None
                 }
                 #[cfg(test)]
