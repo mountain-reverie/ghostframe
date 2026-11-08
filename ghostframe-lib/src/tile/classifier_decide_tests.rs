@@ -1575,6 +1575,31 @@ mod bandwidth_fit {
     }
 
     #[test]
+    fn one_marked_repaint_frame_exempts_exactly_one_full_screen_frame() {
+        let mut c = classifier(3_000_000);
+        let full = tiles(2040);
+        c.note_repaint_frame();
+        c.decide_inner(0, &full, FrameMode::H264);
+        assert_eq!(c.last_demand_bps, 0, "the marked frame is a repaint");
+        c.decide_inner(FRAME_US, &full, FrameMode::H264);
+        assert!(c.last_demand_bps > 0, "the next full frame is demand");
+    }
+
+    #[test]
+    fn a_marked_frame_that_is_not_full_screen_still_spends_the_mark() {
+        let mut c = classifier(3_000_000);
+        c.note_repaint_frame();
+        c.decide_inner(0, &tiles(4), FrameMode::H264);
+        let small = c.last_demand_bps;
+        c.decide_inner(FRAME_US, &tiles(2040), FrameMode::H264);
+        assert!(
+            c.last_demand_bps > small * 100,
+            "the mark did not outlive its frame: {small} -> {}",
+            c.last_demand_bps
+        );
+    }
+
+    #[test]
     fn a_full_screen_frame_outside_the_grace_is_demand() {
         let mut c = classifier(3_000_000);
         c.note_repaint(0);

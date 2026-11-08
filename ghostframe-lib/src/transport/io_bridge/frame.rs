@@ -413,9 +413,9 @@ impl IoBridge {
         if no_commit {
             self.force_dirty_frames -= 1;
             // Every cushion frame is a repaint, however slowly frames come:
-            // at 2 fps the 20 frames outlast the one-off 1 s grace.
-            let now_us = now_std().duration_since(self.epoch).as_micros() as u64;
-            self.classifier.note_repaint(now_us);
+            // at 2 fps the 20 frames outlast the one-off 1 s grace. Marked
+            // one at a time: a 1 s window would hide real motion.
+            self.classifier.note_repaint_frame();
         }
 
         // Determine dirty tiles (only after confirming we have a connected session).
@@ -861,10 +861,10 @@ impl IoBridge {
 
     /// One classified GPU-path frame: while the worker's baseline cushion
     /// runs, the frame is a repaint, not demand (see `gpu_cushion_left`).
-    pub(super) fn note_gpu_cushion_frame(&mut self, now_us: u64) {
+    pub(super) fn note_gpu_cushion_frame(&mut self) {
         if self.gpu_cushion_left > 0 {
             self.gpu_cushion_left -= 1;
-            self.classifier.note_repaint(now_us);
+            self.classifier.note_repaint_frame();
         }
     }
 
@@ -1489,7 +1489,7 @@ impl IoBridge {
         let now_us = now.duration_since(self.epoch).as_micros() as u64;
         // The H.264 transport's stall flag and the encoder latch are inputs of
         // this decision. A per-size "unavailable" ends with the size.
-        self.note_gpu_cushion_frame(now_us);
+        self.note_gpu_cushion_frame();
         self.h264_availability_for((frame.width, frame.height));
         self.update_h264_stall(now);
         // What a full repaint would cost in the tile codec, summed only while
