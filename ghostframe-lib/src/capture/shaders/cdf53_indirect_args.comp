@@ -3,8 +3,8 @@
 // for the subsequent Stage 4c (cdf53_encode.comp, cdf53_forward.spv) dispatch.
 // Dispatch: 1 workgroup, 1 thread.
 //
-// All three forward levels reuse the SAME indirect args buffer because they
-// all dispatch one workgroup per Cdf53-eligible tile (count from compact_count).
+// The forward dispatch uses one workgroup per Cdf53-eligible tile (count from
+// compact_count).
 
 #version 450
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;

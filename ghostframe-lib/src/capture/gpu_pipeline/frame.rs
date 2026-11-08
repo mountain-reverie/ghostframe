@@ -2723,7 +2723,7 @@ impl GpuFrameProcessor {
         let cdf53_indirect_args_ds_guard = self.run_cdf53_indirect_args_stage(cmd)?;
 
         // Barrier: dispatch_args SHADER_WRITE → INDIRECT_COMMAND_READ | SHADER_READ
-        // for Stage 4c (cdf53_forward, Task 7) via vkCmdDispatchIndirect.
+        // for Stage 4c (cdf53_forward) via vkCmdDispatchIndirect.
         let buf_barrier_cdf53_args = buf_barrier(
             self.cdf53_dispatch_args.buffer,
             vk::AccessFlags::SHADER_WRITE,
@@ -2731,10 +2731,12 @@ impl GpuFrameProcessor {
             12,
         );
         // Barrier: compact_list + compact_count → HOST_READ (CPU readback after fence).
+        // HOST_READ for Phase B, and SHADER_READ for Stage 4c, which reads
+        // the list (the dst stage mask below includes COMPUTE_SHADER).
         let buf_barrier_cdf53_list_host = buf_barrier(
             self.cdf53_compact_list_buffer,
             vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::HOST_READ,
+            vk::AccessFlags::HOST_READ | vk::AccessFlags::SHADER_READ,
             vk::WHOLE_SIZE,
         );
         let buf_barrier_cdf53_count_host = buf_barrier(
@@ -3182,8 +3184,8 @@ impl GpuFrameProcessor {
     ///
     /// `tiles` are 32x32 BGRA tiles, 4096 bytes each, in the order the
     /// caller wants the coefficients back. They are laid out in a small
-    /// transient image so the forward shader runs with an
-    /// identity tile list; nothing here depends on the frame's own image,
+    /// transient image so the forward shader runs with an identity tile
+    /// list; nothing here depends on the frame's own image,
     /// which is gone once `process_frame` returns. One GPU round trip (one
     /// submit and fence wait) per chunk of `MAX_ESCALATION_PER_FRAME` tiles.
     ///
