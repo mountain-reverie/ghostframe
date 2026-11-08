@@ -2289,6 +2289,10 @@ impl IoBridge {
                 cumulative_bytes_critical = self.bytes_emitted_critical,
                 cumulative_bytes_refinement = self.bytes_emitted_refinement,
                 cumulative_bytes_h264 = self.bytes_emitted_h264,
+                // The classifier's learned first-pass wire bytes per tile.
+                fp_solid_bytes = self.classifier.first_pass().tile_bytes_of(crate::tile::first_pass::FirstPassKind::Solid).round() as u32,
+                fp_palrle_bytes = self.classifier.first_pass().tile_bytes_of(crate::tile::first_pass::FirstPassKind::PalRle).round() as u32,
+                fp_cdf53_bytes = self.classifier.first_pass().tile_bytes_of(crate::tile::first_pass::FirstPassKind::Cdf53).round() as u32,
                 "bwe periodic snapshot"
             );
         }
