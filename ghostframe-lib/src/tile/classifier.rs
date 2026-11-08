@@ -335,6 +335,9 @@ pub struct Classifier {
     /// A repaint was requested; until then a near-full-screen frame is not
     /// demand.
     repaint_grace_until_us: Option<u64>,
+    /// The next frame is one slow-start cushion repaint (see
+    /// `note_repaint_frame`); cleared by the next decision.
+    repaint_frame_pending: bool,
     /// `ENTER_SHARE` / `EXIT_SHARE`, or their `ClassifierConfig` overrides.
     enter_share: f64,
     exit_share: f64,
@@ -399,6 +402,7 @@ impl Classifier {
             screen_tiles: 0,
             repaint_bytes: 0,
             repaint_grace_until_us: None,
+            repaint_frame_pending: false,
             enter_share: config.enter_share.map_or(ENTER_SHARE, f64::from),
             exit_share: config.exit_share.map_or(EXIT_SHARE, f64::from),
             loss_override_threshold_override: config.loss_override_threshold,
@@ -425,6 +429,7 @@ impl Classifier {
         self.last_demand_bps = 0;
         self.repaint_bytes = 0;
         self.repaint_grace_until_us = None;
+        self.repaint_frame_pending = false;
     }
 
     /// Push a live `AdaptationContext` from the transport layer.
@@ -451,6 +456,21 @@ impl Classifier {
     /// dirtying at least 90 % of the screen is that repaint, not demand.
     pub fn note_repaint(&mut self, now_us: u64) {
         self.repaint_grace_until_us = Some(now_us.saturating_add(REPAINT_GRACE_US));
+    }
+
+    /// The next frame is a repaint: one slow-start cushion frame. Unlike
+    /// `note_repaint` it opens no window; the next decision treats its frame as
+    /// zero demand if it dirties at least 90 % of the screen, then forgets,
+    /// whatever the frame was. Routine baseline invalidations during H.264 mark
+    /// frames this way, so they cannot hide a second of real motion.
+    pub fn note_repaint_frame(&mut self) {
+        self.repaint_frame_pending = true;
+    }
+
+    /// The last decision's first-pass demand over the window, bit/s.
+    #[cfg(test)]
+    pub(crate) fn last_demand_bps(&self) -> u64 {
+        self.last_demand_bps
     }
 
     /// When the current repaint grace ends, if one was noted.
@@ -592,7 +612,7 @@ impl Classifier {
     /// returns a static `&'static str` naming the cause:
     /// "headroom_guard", "loss_override", "suspension", "bandwidth_short",
     /// "bandwidth_fits", "estimate_unknown" or "hysteresis_clamp".
-    fn decide_inner(
+    pub(crate) fn decide_inner(
         &mut self,
         now_us: u64,
         tentative_states: &[CodecState],
@@ -603,7 +623,8 @@ impl Classifier {
             .map(|s| self.first_pass.state_bytes(*s))
             .sum();
         let in_grace = self.repaint_grace_until_us.is_some_and(|t| now_us < t);
-        let is_repaint = in_grace
+        let marked = std::mem::take(&mut self.repaint_frame_pending);
+        let is_repaint = (in_grace || marked)
             && self.screen_tiles > 0
             && (tentative_states.len() as u64) * 10 >= u64::from(self.screen_tiles) * 9;
         self.last_demand_bps = self

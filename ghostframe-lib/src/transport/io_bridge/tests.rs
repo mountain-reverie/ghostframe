@@ -9908,25 +9908,35 @@ async fn the_estimate_is_unknown_until_a_sample_follows_the_session_reset() {
     assert!(bridge.adaptation_context.estimate_known);
 }
 
-/// The GPU path's slow-start cushion is a repaint for every one of its frames,
-/// not only for the first second: at 2 fps the 20 frames last 10 s, and the
-/// classifier's one-off grace would end after two.
+/// A routine `InvalidateBaseline(1)` (a held frame, a loss verdict) in H.264
+/// marks one frame as a repaint; it does not open the classifier's 1 s grace,
+/// which would hide full-screen motion on a lossy link.
 #[tokio::test]
-async fn every_gpu_cushion_frame_extends_the_repaint_grace() {
+async fn a_routine_baseline_invalidation_marks_one_frame_not_a_grace() {
+    use crate::tile::{CodecState, FrameMode};
     let (mut bridge, _peer, _log) = recording_bridge();
-    bridge.backend_apply(super::frame_backend::Control::InvalidateBaseline(20));
-    let step_us = 500_000; // 2 fps
-    for k in 0..20u64 {
-        let now_us = k * step_us;
-        bridge.note_gpu_cushion_frame(now_us);
-        let until = bridge.classifier.repaint_grace_until_us();
-        assert!(
-            until.is_some_and(|t| t > now_us),
-            "frame {k}: grace {until:?} does not cover {now_us}"
-        );
-    }
-    // The cushion is spent: the next frame does not extend the grace.
-    let last = bridge.classifier.repaint_grace_until_us();
-    bridge.note_gpu_cushion_frame(20 * step_us);
-    assert_eq!(bridge.classifier.repaint_grace_until_us(), last);
+    bridge.backend_apply(super::frame_backend::Control::InvalidateBaseline(1));
+    bridge.note_gpu_cushion_frame();
+    assert_eq!(
+        bridge.classifier.repaint_grace_until_us(),
+        None,
+        "a cushion frame must not open the 1 s grace"
+    );
+    let full = vec![
+        CodecState::Cdf53 {
+            passes_sent: 0,
+            present_passes: 0x3FFF,
+        };
+        2040
+    ];
+    bridge.classifier.set_screen(2040, 0);
+    bridge.classifier.decide_inner(0, &full, FrameMode::H264);
+    assert_eq!(bridge.classifier.last_demand_bps(), 0, "the marked frame");
+    bridge
+        .classifier
+        .decide_inner(33_333, &full, FrameMode::H264);
+    assert!(
+        bridge.classifier.last_demand_bps() > 0,
+        "the frames after it are demand"
+    );
 }
