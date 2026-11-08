@@ -3489,16 +3489,30 @@ async fn e2e_headroom_guard_forces_h264() -> Result<()> {
         "the forced headroom should be what put this content in H264; decisions: {decisions:?}"
     );
 
-    // headroom_guard forces H264 ⇒ frame datagrams must be substantial.
-    // Threshold mirrors e2e_mode_switch MIN_FRAME_COUNT_FOR_H264_PHASE=150
-    // scaled to the 5s window vs 3s. We do NOT assert frame > tile: with
-    // cdf53 enabled, refinement tile floods accumulate even while the
-    // classifier is in H264 mode (ratio assertions don't survive the tile
-    // burst from H264→TileCodec handoff invalidations).
+    // What this test owns is the decision, not a datagram count: how many
+    // H.264 datagrams fit in a 5 s window swings from 129 to 316 with
+    // machine load, so any threshold on it is marginal. Assert instead that
+    // H.264 frames were delivered at all, and that once the guard had engaged
+    // nothing took the classifier back out (the estimate is pinned at
+    // 800 kbit/s, so the guard never releases). Tile/frame ratios do not
+    // survive refinement bursts, so none is asserted.
     assert!(
-        frame_total >= 250,
-        "headroom_guard override should drive H264 — \
-         observed frame_total={frame_total} (expected >= 250)"
+        frame_total > 0,
+        "the headroom guard engaged but no H.264 frame datagram reached the client; \
+         decisions: {decisions:?}"
+    );
+    let engaged = decisions
+        .iter()
+        .position(|d| d.to == "H264")
+        .expect("checked above");
+    let left: Vec<&ModeDecision> = decisions[engaged..]
+        .iter()
+        .filter(|d| d.from == "H264")
+        .collect();
+    assert!(
+        left.is_empty(),
+        "a decision left H264 after the headroom guard engaged: {left:?}; \
+         decisions: {decisions:?}"
     );
 
     Ok(())
