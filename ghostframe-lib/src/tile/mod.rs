@@ -129,7 +129,7 @@ pub use metrics_tracker::MetricsTracker;
 
 pub mod classifier;
 pub mod first_pass;
-pub use classifier::{Classifier, CostModel};
+pub use classifier::Classifier;
 
 pub mod escalation;
 pub use escalation::detect_escalation_candidates;

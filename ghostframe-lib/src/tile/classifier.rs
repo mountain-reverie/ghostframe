@@ -1,116 +1,10 @@
-//! Per-tile classifier and cost-aware frame-mode decision.
+//! Per-tile classifier and bandwidth-fit frame-mode decision.
 //!
 //! See `docs/superpowers/specs/2026-04-28-m3-codec-suite-design.md` Phase M3.0
 //! and `docs/specs/ghostframe-initial-spec.md` §4.2 / §4.3.
 
-use super::{CodecState, FrameMode, TileMetrics, TILE_BYTES};
-
-/// Hardcoded encoding-cost model in microseconds per call, plus a bandwidth
-/// weighting expressed as bytes per microsecond. Values rounded from the
-/// source spec's GPU compute claims; M3.5 retunes from real measurements.
-#[derive(Debug, Clone, Copy)]
-pub struct CostModel {
-    pub solid_us: f32,      // ~0.5  µs (4-byte memcpy)
-    pub palrle_us: f32,     // ~5    µs (nibble-pack 1024 px)
-    pub cdf53_us: f32,      // ~50   µs (Vulkan compute, dispatched)
-    pub h264_frame_us: f32, // ~3000 µs (VA-API full-frame encode @ 1080p)
-    /// Estimated bytes for a full-frame H.264 emission. Conservative default
-    /// (1080p, ~6 Mbit/s @ 60 fps → ~12 KB / frame). Updated alongside
-    /// `bytes_per_us` when the source spec §6.5 estimator lands (M4+).
-    pub h264_frame_bytes: u32,
-    /// Bandwidth weighting; placeholder until source spec §6.5 estimator lands.
-    /// Default value matches a typical home-LAN link (100 Mbps → ~12.5 B/µs).
-    /// Private — accessed via `bytes_per_us()` per design D17 so the §6.5
-    /// estimator wire-up is a one-call change later.
-    bytes_per_us: f32,
-}
-
-impl Default for CostModel {
-    fn default() -> Self {
-        // Per-codec µs values retuned from M3.5b bench measurements (see
-        // docs/specs/m3-codec-bench-results.md Section 4). The bench
-        // measures per-tile `encoder.encode()` cost via criterion; the
-        // values below are the median across the 6 content classes,
-        // rounded conservatively:
-        //
-        //   solid_us:    measured 0.015 µs (4-byte memcpy); use 0.05 for
-        //                3× headroom on slow runs
-        //   palrle_us:   measured 3-12 µs across feasible classes
-        //                (gradient/photo/motion return the empty-Vec fast
-        //                path at 0.1 µs because >16 colors); use 8.0 as a
-        //                conservative upper bound covering flat_ui's
-        //                11.7 µs worst case
-        //   cdf53_us:    measured 52-149 µs; use 90.0 as a robust median
-        //                (motion = 79, text = 73, flat_ui = 96, photo =
-        //                149)
-        //   h264_frame_us: per-tile-H264 bench (~750 µs) measures the
-        //                dead-code path; the classifier's actual cost is
-        //                full-frame H264, not benched here, so the
-        //                3000 µs placeholder stays until M4 wires the
-        //                §6.5 estimator
-        //   h264_frame_bytes / bytes_per_us: unchanged — same §6.5
-        //                reasoning
-        Self {
-            solid_us: 0.05,
-            palrle_us: 8.0,
-            cdf53_us: 90.0,
-            h264_frame_us: 3000.0,
-            h264_frame_bytes: 12_000,
-            bytes_per_us: 12.5,
-        }
-    }
-}
-
-impl CostModel {
-    /// The compiled-in model with any `CostModelConfig` overrides applied.
-    /// With `CostModelConfig::default()` this is exactly `CostModel::default()`.
-    pub fn from_config(config: &crate::config::CostModelConfig) -> Self {
-        let base = Self::default();
-        Self {
-            solid_us: config.solid_us.unwrap_or(base.solid_us),
-            palrle_us: config.palrle_us.unwrap_or(base.palrle_us),
-            cdf53_us: config.cdf53_us.unwrap_or(base.cdf53_us),
-            h264_frame_us: config.h264_frame_us.unwrap_or(base.h264_frame_us),
-            h264_frame_bytes: config.h264_frame_bytes.unwrap_or(base.h264_frame_bytes),
-            bytes_per_us: config.bytes_per_us.unwrap_or(base.bytes_per_us),
-        }
-    }
-
-    /// Bandwidth weighting in B/µs. Currently a hardcoded placeholder
-    /// (~12.5 = 100 Mbps). Will be wired to the source-spec §6.5 estimator
-    /// in M4+; this single accessor is the swap-in point (per design D17).
-    pub fn bytes_per_us(&self) -> f32 {
-        self.bytes_per_us
-    }
-
-    /// Update the bandwidth weighting (call from §6.5 estimator).
-    pub fn set_bytes_per_us(&mut self, value: f32) {
-        self.bytes_per_us = value;
-    }
-
-    /// Estimated emission size in bytes for a tile assigned to `state`.
-    pub fn estimated_tile_bytes(&self, state: CodecState) -> u32 {
-        match state {
-            CodecState::Skip => 0,
-            CodecState::Solid => 4,
-            CodecState::PalRle { .. } => 200, // §5.3: typical text 100–200 B; upper bound
-            CodecState::Cdf53 { .. } => 1300, // §4.4: 1.0–1.3 KB to lossless; upper bound
-            CodecState::PixelPerfect => 0,
-            CodecState::H264 { .. } => TILE_BYTES as u32, // upper bound; classified-as-H264 tile
-        }
-    }
-
-    /// Estimated encode cost in microseconds for one tile assigned to `state`.
-    pub fn estimated_tile_us(&self, state: CodecState) -> f32 {
-        match state {
-            CodecState::Skip | CodecState::PixelPerfect => 0.0,
-            CodecState::Solid => self.solid_us,
-            CodecState::PalRle { .. } => self.palrle_us,
-            CodecState::Cdf53 { .. } => self.cdf53_us,
-            CodecState::H264 { .. } => self.h264_frame_us,
-        }
-    }
-}
+use super::first_pass::{DemandWindow, FirstPassKind, FirstPassModel};
+use super::{CodecState, FrameMode, TileMetrics};
 
 /// Live signal vector consumed by `Classifier::decide_frame_mode`.
 ///
@@ -125,8 +19,10 @@ impl CostModel {
 #[derive(Debug, Clone, Copy)]
 pub struct AdaptationContext {
     /// Smoothed throughput estimate, bytes per µs. Sourced from
-    /// `min(cwnd/rtt, recent_emit_bytes/window)`. `0.0` means "no estimate
-    /// yet" — `Classifier` falls back to its prior `bytes_per_us`.
+    /// `min(cwnd/rtt, recent_emit_bytes/window)`. The classifier no longer
+    /// reads it (the bandwidth rule uses `bwe_estimate_bps`); it is the
+    /// bridge's probe-inclusive model rate, kept for the bridge's own tests
+    /// and logs.
     pub bytes_per_us: f32,
     /// Smoothed one-way RTT, µs. Sourced from QUIC `path_stats.rtt`.
     pub smoothed_rtt_us: f32,
@@ -151,6 +47,11 @@ pub struct AdaptationContext {
     /// probe-inclusive and not a token rate: it is what the headroom guard
     /// reads, so a probe window opening cannot hide a starved link.
     pub bwe_estimate_bps: u64,
+    /// The bridge has seen feedback about this session's path: the estimate
+    /// is off goog_cc's initial value and moved by at least one sample since
+    /// the session reset. Until then the bandwidth rule holds the mode
+    /// (`estimate_unknown`). `false` in `Default`.
+    pub estimate_known: bool,
     /// The bridge's H.264 transport has stalled (frames in flight beyond the
     /// bound, no frame acknowledged for too long, or the client's reset
     /// requests over their rate limit). The only H264 -> tile path from a
@@ -176,15 +77,12 @@ impl Default for AdaptationContext {
             last_update_seq: 0,
             supports_h264: true,
             bwe_estimate_bps: 0,
+            estimate_known: false,
             h264_stalled: false,
             h264_encoder_unavailable: false,
         }
     }
 }
-
-#[cfg(test)]
-#[path = "classifier_cost_tests.rs"]
-mod cost_tests;
 
 /// Pure classifier: maps current per-tile metrics + previous codec state to a
 /// next codec state. Rules from source spec §4.2 evaluated in order.
@@ -308,14 +206,20 @@ pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
 #[path = "classifier_classify_tests.rs"]
 mod classify_tests;
 
-/// Per-tile bias added to the H264 comparand when refinement passes are
-/// outstanding. Pulls the cost comparison toward TileCodec when there's
-/// PixelPerfect work left to deliver and bandwidth headroom permits.
-/// Retuned in M3.6c from the bandwidth × scene matrix.
-pub(crate) const REFINEMENT_BIAS_PER_TILE_US: f32 = 5.0;
+/// Enter H.264 when the first-pass demand stays above this share of the
+/// estimate. Below the 0.8 the H.264 rate targets, so H.264 has headroom.
+pub(crate) const ENTER_SHARE: f64 = 0.70;
+/// Leave H.264 when the demand stays below this share of the estimate.
+pub(crate) const EXIT_SHARE: f64 = 0.40;
+/// Leaving H.264 repaints the whole screen; leave only if that repaint's
+/// first pass drains within this long at the estimate.
+pub(crate) const REPAINT_DRAIN_MAX_US: u64 = 1_000_000;
+/// After a repaint is requested, a frame covering most of the screen is the
+/// repaint, not demand, for this long.
+pub(crate) const REPAINT_GRACE_US: u64 = 1_000_000;
 
 /// Headroom guard: the bandwidth *estimate* below which the classifier
-/// forces H264 regardless of the cost comparison, held for
+/// forces H264 regardless of the bandwidth rule, held for
 /// [`HEADROOM_ENTER_HOLD_US`] before it engages. Below ~2 Mbit/s the tile
 /// codec cannot keep up with the frame rate.
 pub(crate) const HEADROOM_ENTER_BPS: u64 = 2_000_000;
@@ -401,17 +305,12 @@ struct ClassifierHysteresis {
 /// Tunable decision parameters; defaults reflect the design doc M3.0 values.
 #[derive(Debug, Clone)]
 pub struct Classifier {
-    pub cost: CostModel,
-    pub enter_factor: f32,             // default 1.3
-    pub exit_factor: f32,              // default 0.6
-    pub motion_tile_threshold: f32,    // default 0.20 (fraction of dirty tiles)
-    pub motion_tile_min_absolute: u32, // default 8 (absolute floor)
     /// Wall-clock µs the enter condition must hold before transitioning
-    /// to H264. Default 50_000 µs (≈ 3 frames at 60 fps). Hybrid: this
+    /// to H264. Default 500_000 µs. Hybrid: this
     /// AND `enter_sustain_frames_min` must both be satisfied to flip.
     pub enter_sustain_micros: u64,
     /// Wall-clock µs the exit condition must hold before transitioning
-    /// back to TileCodec. Default 500_000 µs (≈ 30 frames at 60 fps).
+    /// back to TileCodec. Default 1_000_000 µs.
     /// Hybrid: this AND `exit_sustain_frames_min` must both be satisfied.
     pub exit_sustain_micros: u64,
     /// Minimum consecutive calls (frame-rate-independent floor) where
@@ -423,11 +322,22 @@ pub struct Classifier {
     state: ClassifierHysteresis,
     guard: GuardState,
     adaptation_context: AdaptationContext,
-    refinement_deficit_tiles: u32,
-    /// M3.7a env-var override: when `Some`, `decide_inner` uses this
-    /// instead of `REFINEMENT_BIAS_PER_TILE_US`. Populated from
-    /// `ClassifierConfig` in `Classifier::new`; `None` unless configured.
-    refinement_bias_us_override: Option<f32>,
+    /// Calibrated first-pass size per tile.
+    first_pass: FirstPassModel,
+    /// First-pass bytes of the last second of frames.
+    demand: DemandWindow,
+    /// The demand at the last decision, bit/s (logged).
+    last_demand_bps: u64,
+    /// Tiles on the screen, and the predicted first-pass bytes of
+    /// repainting all of them (0 when unknown or not in H.264).
+    screen_tiles: u32,
+    repaint_bytes: u64,
+    /// A repaint was requested; until then a near-full-screen frame is not
+    /// demand.
+    repaint_grace_until_us: Option<u64>,
+    /// `ENTER_SHARE` / `EXIT_SHARE`, or their `ClassifierConfig` overrides.
+    enter_share: f64,
+    exit_share: f64,
     /// M3.7a env-var override: when `Some`, `decide_inner` uses this
     /// instead of `LOSS_OVERRIDE_THRESHOLD`. Populated from
     /// `ClassifierConfig` in `Classifier::new`.
@@ -476,20 +386,21 @@ impl Classifier {
     /// to avoid racing other threads' `std::env::set_var` calls.
     pub fn new(config: crate::config::ClassifierConfig) -> Self {
         Self {
-            cost: CostModel::from_config(&config.cost),
-            enter_factor: 1.3,
-            exit_factor: 0.6,
-            motion_tile_threshold: 0.20,
-            motion_tile_min_absolute: 8,
-            enter_sustain_micros: 50_000,
-            exit_sustain_micros: 500_000,
+            enter_sustain_micros: 500_000,
+            exit_sustain_micros: 1_000_000,
             enter_sustain_frames_min: 3,
             exit_sustain_frames_min: 30,
             state: ClassifierHysteresis::default(),
             guard: GuardState::default(),
             adaptation_context: AdaptationContext::default(),
-            refinement_deficit_tiles: 0,
-            refinement_bias_us_override: config.refinement_bias_us,
+            first_pass: FirstPassModel::default(),
+            demand: DemandWindow::default(),
+            last_demand_bps: 0,
+            screen_tiles: 0,
+            repaint_bytes: 0,
+            repaint_grace_until_us: None,
+            enter_share: config.enter_share.map_or(ENTER_SHARE, f64::from),
+            exit_share: config.exit_share.map_or(EXIT_SHARE, f64::from),
             loss_override_threshold_override: config.loss_override_threshold,
             loss_override_enabled: config.loss_override_enabled,
             headroom_min_bpus_override: config.headroom_min_bpus,
@@ -507,23 +418,16 @@ impl Classifier {
     pub fn reset(&mut self) {
         self.state = ClassifierHysteresis::default();
         self.guard = GuardState::default();
+        self.demand.clear();
+        self.first_pass = FirstPassModel::default();
+        self.last_demand_bps = 0;
+        self.repaint_bytes = 0;
+        self.repaint_grace_until_us = None;
     }
 
     /// Push a live `AdaptationContext` from the transport layer.
-    ///
-    /// When `ctx.bytes_per_us > 0.0`, that value is mirrored to
-    /// `cost.bytes_per_us` so the existing M3.5 cost comparison
-    /// transparently uses it. Zero / negative `bytes_per_us` is treated as
-    /// "no estimate yet" and leaves the existing `cost.bytes_per_us`
-    /// unchanged.
-    ///
-    /// M3.6a wires every field but `decide_frame_mode` only consumes
-    /// `bytes_per_us`. M3.6b extends the consumer.
     pub fn set_adaptation_context(&mut self, ctx: AdaptationContext) {
         self.adaptation_context = ctx;
-        if ctx.bytes_per_us > 0.0 {
-            self.cost.set_bytes_per_us(ctx.bytes_per_us);
-        }
     }
 
     /// Snapshot of the most recent `AdaptationContext` pushed via
@@ -532,33 +436,40 @@ impl Classifier {
         self.adaptation_context
     }
 
-    /// Number of tiles currently in `Cdf53 { passes_sent < present_passes.count_ones() }`.
-    /// Caller (io_bridge) updates this each frame from the per-tile state.
-    /// Used by M3.6b's refinement-deficit bias term in `decide_frame_mode`.
-    pub fn set_refinement_deficit_tiles(&mut self, count: u32) {
-        self.refinement_deficit_tiles = count;
+    /// The screen's tile count and the predicted first-pass bytes of
+    /// repainting it (see `first_pass::repaint_state`). The bridge calls this
+    /// every frame; `repaint_bytes` may be 0 outside H.264.
+    pub fn set_screen(&mut self, screen_tiles: u32, repaint_bytes: u64) {
+        self.screen_tiles = screen_tiles;
+        self.repaint_bytes = repaint_bytes;
     }
 
-    /// Apply per-tile rules across all dirty tiles, then decide whole-frame
-    /// mode based on cost + sustained-motion fast-path with wall-clock hysteresis.
+    /// A full-screen repaint was requested at `now_us` (session start, the
+    /// H.264 exit, a stuck-entry re-dirty): for `REPAINT_GRACE_US` a frame
+    /// dirtying at least 90 % of the screen is that repaint, not demand.
+    pub fn note_repaint(&mut self, now_us: u64) {
+        self.repaint_grace_until_us = Some(now_us.saturating_add(REPAINT_GRACE_US));
+    }
+
+    /// One emission batch's first-pass bytes of `kind` (see
+    /// `FirstPassModel::observe`).
+    pub fn observe_first_pass(&mut self, kind: FirstPassKind, bytes: u64, tiles: u32) {
+        self.first_pass.observe(kind, bytes, tiles);
+    }
+
+    /// The calibrated per-tile model, for the bridge's repaint estimate.
+    pub fn first_pass(&self) -> FirstPassModel {
+        self.first_pass
+    }
+
+    /// Decide the whole-frame mode on bandwidth, with wall-clock hysteresis.
     ///
     /// `now_us` is the current wall-clock time in microseconds (monotonic or
     /// system time). `tentative_states` is the per-dirty-tile output of
     /// `classify_tile()`. `prev_mode` is what the previous frame emitted.
     ///
-    /// Empty `tentative_states` is valid — it represents a frame with no dirty
-    /// tiles. In H264 mode, this contributes toward the exit-sustain timer
-    /// (cost is 0, below exit threshold).
-    ///
-    /// **M3.0 caveat:** `MetricsTracker::record_frame` doesn't populate
-    /// `change_magnitude` (the value comes from GPU SAD output that lands in
-    /// M3.1+). With magnitude permanently 0.0, `classify_tile` never returns
-    /// H264 from Rule 2 on real frames — so the motion fast-path's
-    /// `motion_tile_min_absolute` and `motion_tile_threshold` thresholds are
-    /// dormant in production and the cost path is the only entry trigger.
-    /// Unit tests construct H264 tile states directly to exercise the
-    /// fast-path; this stays exercised by tests until M3.1+ wires real
-    /// magnitude.
+    /// Empty `tentative_states` is valid: a frame with no dirty tiles adds no
+    /// demand.
     pub fn decide_frame_mode_at(
         &mut self,
         now_us: u64,
@@ -574,13 +485,14 @@ impl Classifier {
                 from = ?prev_mode,
                 to = ?next_mode,
                 reason = reason,
-                bytes_per_us = ctx.bytes_per_us,
                 smoothed_rtt_us = ctx.smoothed_rtt_us,
                 loss_rate = ctx.loss_rate,
                 suspended = ctx.suspended,
                 h264_stalled = ctx.h264_stalled,
                 bwe_estimate_bps = ctx.bwe_estimate_bps,
-                refinement_deficit_tiles = self.refinement_deficit_tiles,
+                first_pass_demand_bps = self.last_demand_bps,
+                estimate_known = ctx.estimate_known,
+                repaint_drain_ms = self.repaint_drain_us().min(u64::MAX / 2) / 1000,
                 "mode decision"
             );
             self.last_emitted_mode = Some(next_mode);
@@ -667,14 +579,25 @@ impl Classifier {
 
     /// Pure decision logic returning `(mode, reason)`. Each branch
     /// returns a static `&'static str` naming the cause:
-    /// "headroom_guard", "loss_override", "suspension", "cost_comparison",
-    /// or "hysteresis_clamp".
+    /// "headroom_guard", "loss_override", "suspension", "bandwidth_short",
+    /// "bandwidth_fits", "estimate_unknown" or "hysteresis_clamp".
     fn decide_inner(
         &mut self,
         now_us: u64,
         tentative_states: &[CodecState],
         prev_mode: FrameMode,
     ) -> (FrameMode, &'static str) {
+        let frame_bytes: f64 = tentative_states
+            .iter()
+            .map(|s| self.first_pass.state_bytes(*s))
+            .sum();
+        let in_grace = self.repaint_grace_until_us.is_some_and(|t| now_us < t);
+        let is_repaint = in_grace
+            && self.screen_tiles > 0
+            && (tentative_states.len() as u64) * 10 >= u64::from(self.screen_tiles) * 9;
+        self.last_demand_bps = self
+            .demand
+            .push(now_us, if is_repaint { 0.0 } else { frame_bytes });
         let out = self.decide_core(now_us, tentative_states, prev_mode);
         // H.264 that has run for a while without a stall earns the short
         // re-entry holdoff back.
@@ -789,44 +712,17 @@ impl Classifier {
             return (FrameMode::H264, "suspension");
         }
 
-        // Cost path. H264-classified tiles are excluded from the per-tile µs
-        // sum because `estimated_tile_us(H264)` returns the full-frame VA-API
-        // cost (`h264_frame_us`), which can't be summed per-tile coherently —
-        // those tiles are accounted for separately by the motion fast-path.
-        // All tiles' byte costs ARE summed so any non-empty dirty set carries
-        // non-zero tile-codec cost, keeping the deadband effective.
-        let non_h264_us: f32 = tentative_states
-            .iter()
-            .filter(|s| !matches!(s, CodecState::H264 { .. }))
-            .map(|s| self.cost.estimated_tile_us(*s))
-            .sum();
-        let all_tile_bytes: u32 = tentative_states
-            .iter()
-            .map(|s| self.cost.estimated_tile_bytes(*s))
-            .sum();
-        let bytes_per_us = self.cost.bytes_per_us();
-        let tile_codec_cost = non_h264_us + (all_tile_bytes as f32) / bytes_per_us;
-        let per_tile_bias = self
-            .refinement_bias_us_override
-            .unwrap_or(REFINEMENT_BIAS_PER_TILE_US);
-        let refinement_bias_us = self.refinement_deficit_tiles as f32 * per_tile_bias;
-        let h264_cost = self.cost.h264_frame_us
-            + (self.cost.h264_frame_bytes as f32) / bytes_per_us
-            + refinement_bias_us;
-
-        // Motion fast-path: count tentatively-H.264 tiles
-        let h264_tile_count = tentative_states
-            .iter()
-            .filter(|s| matches!(s, CodecState::H264 { .. }))
-            .count() as u32;
-        let dirty_count = tentative_states.len() as u32;
-        let motion_fraction = h264_tile_count as f32 / dirty_count.max(1) as f32;
-
-        let cost_enter = tile_codec_cost > h264_cost * self.enter_factor;
-        let motion_enter = h264_tile_count >= self.motion_tile_min_absolute
-            && motion_fraction > self.motion_tile_threshold;
-        let enter_now = cost_enter || motion_enter;
-        let exit_now = tile_codec_cost < h264_cost * self.exit_factor;
+        // Bandwidth path (design 2026-11-07): H.264 only when the tile codec's
+        // first pass does not fit the estimate.
+        if !ctx.estimate_known || ctx.bwe_estimate_bps == 0 {
+            self.state = ClassifierHysteresis::default();
+            return (prev_mode, "estimate_unknown");
+        }
+        let estimate = ctx.bwe_estimate_bps as f64;
+        let demand = self.last_demand_bps as f64;
+        let enter_now = demand > self.enter_share * estimate;
+        let exit_now =
+            demand < self.exit_share * estimate && self.repaint_drain_us() <= REPAINT_DRAIN_MAX_US;
 
         // Hybrid hysteresis: a transition requires BOTH the wall-clock
         // dwell AND the consecutive-call streak. The streak is preemption-
@@ -846,7 +742,7 @@ impl Classifier {
                     if micros_elapsed && frames_elapsed {
                         self.state.enter_started_us = None;
                         self.state.enter_streak = 0;
-                        return (FrameMode::H264, "cost_comparison");
+                        return (FrameMode::H264, "bandwidth_short");
                     }
                 } else {
                     self.state.enter_started_us = None;
@@ -866,7 +762,7 @@ impl Classifier {
                     if micros_elapsed && frames_elapsed {
                         self.state.exit_started_us = None;
                         self.state.exit_streak = 0;
-                        return (FrameMode::TileCodec, "cost_comparison");
+                        return (FrameMode::TileCodec, "bandwidth_fits");
                     }
                 } else {
                     self.state.exit_started_us = None;
@@ -877,8 +773,17 @@ impl Classifier {
         }
     }
 
+    /// How long repainting the screen's first pass takes at the estimate, µs.
+    fn repaint_drain_us(&self) -> u64 {
+        let est = self.adaptation_context.bwe_estimate_bps;
+        if est == 0 {
+            return u64::MAX;
+        }
+        ((self.repaint_bytes as f64) * 8.0 * 1e6 / est as f64) as u64
+    }
+
     /// Apply per-tile rules across all dirty tiles, then decide whole-frame
-    /// mode based on cost + sustained-motion fast-path with hysteresis.
+    /// mode on bandwidth with hysteresis.
     ///
     /// This is a thin wrapper around [`decide_frame_mode_at`] that reads
     /// `self.epoch`'s wall-clock elapsed time. `IoBridge` (the only
