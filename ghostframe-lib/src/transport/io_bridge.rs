@@ -1017,6 +1017,9 @@ pub struct IoBridge {
     /// load excess samples are dropped (the consumer doesn't need
     /// every single sample for a useful estimate).
     bwe_samples_buffer: Vec<BweSample>,
+    /// `bwe` samples seen when the current session was reset; `estimate_known`
+    /// needs one more.
+    bwe_samples_at_session_reset: u64,
     /// Bandwidth-estimator wrapper. Phase 1: runs in PASSIVE mode — we
     /// feed it ACK arrivals and read its estimate for the periodic log,
     /// but the estimate doesn't drive emission yet. Phase 2 will plug
@@ -1563,6 +1566,7 @@ impl IoBridge {
                 e.set_tile_fec(lib_config.transport.tile_fec);
                 e
             },
+            bwe_samples_at_session_reset: 0,
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
             bwe,
             active_probe: None,

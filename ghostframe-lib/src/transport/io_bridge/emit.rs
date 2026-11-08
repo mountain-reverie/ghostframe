@@ -792,6 +792,9 @@ impl IoBridge {
         )> = Vec::with_capacity(drained.len());
         let mut retry_flags: Vec<bool> = Vec::with_capacity(drained.len());
         let mut next_retry = 0usize;
+        // First-pass calibration for the classifier: (wire bytes, tiles) of
+        // first emissions, per Solid, PalRle, Cdf53 critical pass.
+        let mut fp_obs = [(0u64, 0u32); 3];
         for (pos, work) in drained.into_iter().enumerate() {
             let is_retry = retry_positions.get(next_retry) == Some(&pos);
             if is_retry {
@@ -896,6 +899,22 @@ impl IoBridge {
                 total_wire_bytes_sent =
                     total_wire_bytes_sent.saturating_add(tile_wire_bytes as usize);
             }
+            if !is_retry {
+                let slot = match work.codec {
+                    Codec::Solid => Some(0),
+                    Codec::PalRle => Some(1),
+                    Codec::Cdf53 if matches!(pass_tier(work.pass_idx), PassTier::Critical) => {
+                        Some(2)
+                    }
+                    Codec::Cdf53 | Codec::H264 | Codec::Skip => None,
+                };
+                if let Some(i) = slot {
+                    fp_obs[i].0 += u64::from(tile_wire_bytes_total);
+                    if work.pass_idx == 0 {
+                        fp_obs[i].1 += 1;
+                    }
+                }
+            }
             // Cumulative per-codec emit counter — bumped once per
             // datagram fragment so the cadence matches the client's
             // per-datagram `rx{...}` accounting. Counted before send so
@@ -979,6 +998,13 @@ impl IoBridge {
                 });
                 items.push((key, bytes::Bytes::from(dg), work.queued_at, probe_tag));
                 retry_flags.push(is_retry);
+            }
+        }
+        {
+            use crate::tile::first_pass::FirstPassKind as K;
+            for (i, kind) in [K::Solid, K::PalRle, K::Cdf53].into_iter().enumerate() {
+                let (bytes, tiles) = fp_obs[i];
+                self.classifier.observe_first_pass(kind, bytes, tiles);
             }
         }
         // Submit the batch (stamps wire_seq, caches, queues parity).

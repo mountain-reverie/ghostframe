@@ -631,15 +631,25 @@ impl IoBridge {
         let bytes_per_us = (self.model_rate_bytes_per_s() / 1e6) as f32;
         // The headroom guard reads the estimate itself, not the
         // probe-inclusive model rate.
-        let bwe_estimate_bps = self.bwe.snapshot().bitrate_bps;
+        let snap = self.bwe.snapshot();
+        let bwe_estimate_bps = snap.bitrate_bps;
+        // The estimate counts as measured once it has left its initial value
+        // and a feedback sample has arrived since the session reset.
+        let mut estimate_known = snap.bitrate_bps != crate::transport::bwe::BweWrapper::INITIAL_BPS
+            && snap.samples_seen > self.bwe_samples_at_session_reset;
         // The test override replaces the *classifier's* view of the headroom.
         #[cfg(any(test, feature = "test-loss-injection"))]
         let (bytes_per_us, bwe_estimate_bps) = match self.test_force_bytes_per_us {
-            Some(forced) => (forced, (f64::from(forced) * 8e6) as u64),
+            Some(forced) => {
+                // A pinned rate stands for a measured one.
+                estimate_known = true;
+                (forced, (f64::from(forced) * 8e6) as u64)
+            }
             None => (bytes_per_us, bwe_estimate_bps),
         };
         self.adaptation_context.bytes_per_us = bytes_per_us;
         self.adaptation_context.bwe_estimate_bps = bwe_estimate_bps;
+        self.adaptation_context.estimate_known = estimate_known;
         self.adaptation_context.smoothed_rtt_us = smoothed_rtt_us;
         self.adaptation_context.last_update_seq =
             self.adaptation_context.last_update_seq.wrapping_add(1);
