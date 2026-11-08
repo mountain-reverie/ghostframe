@@ -2730,7 +2730,8 @@ impl GpuFrameProcessor {
             vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
             12,
         );
-        // Barrier: compact_list + compact_count → HOST_READ (CPU readback after fence).
+        // Barrier: compact_list + compact_count → HOST_READ (CPU readback after
+        // fence); the list also → SHADER_READ for Stage 4c.
         // HOST_READ for Phase B, and SHADER_READ for Stage 4c, which reads
         // the list (the dst stage mask below includes COMPUTE_SHADER).
         let buf_barrier_cdf53_list_host = buf_barrier(

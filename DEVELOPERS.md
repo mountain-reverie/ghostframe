@@ -56,6 +56,9 @@ are building):
 
 - **`cbindgen`** for FFI header generation: `cargo install cbindgen`
 - **Docker** for the end-to-end test containers (test-server + headscale).
+- **`glslc`** (shaderc) only to rebuild server shaders: the `.spv` files are
+  checked in and the build never compiles GLSL. After editing
+  `cdf53_encode.comp` (or its lifting generator), run `just shaders-cdf53`.
 - **`just`** — every common task is in the `Justfile`.
 - **ffmpeg development libraries** (`libavcodec-dev` and friends) to build the
   test tree: `ffmpeg-next` is the harness's independent libavcodec **decoder**

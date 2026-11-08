@@ -3,9 +3,6 @@ name = "ghostframe-protocol"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-cdf53-diag = []
-
 [dependencies]
 thiserror = { workspace = true }
 smallvec = "1"

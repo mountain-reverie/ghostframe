@@ -15,11 +15,12 @@
 //                         (cdf53_forward.spv)
 //
 // Rebuild after any edit: `just shaders-cdf53` (regenerates the lifting
-// block, then compiles every variant).
+// block, then compiles the variants above).
 
 layout(local_size_x = 96, local_size_y = 1, local_size_z = 1) in;
 
-// Binding 0: the frame, a B8G8R8A8 storage image, read as the old L1 did.
+// Binding 0: the frame, a B8G8R8A8 storage image; imageLoad's .b/.g/.r are
+// the B/G/R bytes (the rgba8 qualifier only sets the read format).
 layout(set = 0, binding = 0, rgba8) readonly uniform image2D current_frame;
 
 // Binding 1: tile list; workgroup N transforms tile tile_indices[N].
