@@ -403,7 +403,12 @@ PLAIN    [0] 0x03  [1..5] bundle_seq u32 LE  [5..] records    no block: pong, ev
 **The coded symbol of a source** is `len u16 LE ‖ bundle_seq ‖ records`, zero-padded to the block's longest coded symbol.
 - `block_id` and `idx` are left out: the receiver knows them from the block and position it is rebuilding.
 - A rebuilt source therefore carries its exact length and its `bundle_seq`. There is no `lens` array (spike E).
-- **Systematic decoding works before k is known.** Source bytes do not depend on k. Each repair's coefficients are fixed by the (k, repair_idx) it carries.
+- **Systematic decoding works before k is known.** Source bytes do not depend on k.
+- **Repair coefficients depend only on (repair_idx, idx_in_block).** They do not depend on k or on the planned r: `coef(i, j) = c(i, j) / c(0, j)` with `c(i, j) = 1 / (x_i + y_j)`, `x_i = 255 − i` and `y_j = j` over GF(2^8)/0x11d.
+  - Every block is a submatrix of one 256-point Cauchy matrix, so it is MDS whenever k + (largest repair_idx + 1) ≤ 256.
+  - Row 0 is all ones (XOR).
+  - This is what lets the server fold each source into the repair rows as it is sent (`Coder::update`), and lets requested and padding rows (repair_idx ≥ r) belong to the same code.
+  - The spike's matrix (`x_i = i`, `y_j = r + j`) depended on r, so it could do neither.
 - **Sizes.** For a source with R bytes of records, the frame is 9 + R bytes and its coded symbol 6 + R. The largest repair of the block is therefore 17 + R_max. The packer caps R at `max_size() − 17`, which wastes 8 bytes on a full source bundle.
 
 **Bounds.**
