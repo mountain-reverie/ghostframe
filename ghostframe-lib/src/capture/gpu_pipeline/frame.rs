@@ -79,8 +79,7 @@ enum StageBinding {
     Buffer(vk::Buffer),
 }
 
-/// How `GpuFrameProcessor::record_stage` dispatches. `Skip` still binds
-/// and pushes (used by the cdf53-diag skip logic).
+/// How `GpuFrameProcessor::record_stage` dispatches.
 #[derive(Clone, Copy)]
 enum StageDispatch<'a> {
     Direct(u32, u32, u32),
@@ -95,7 +94,6 @@ enum StageDispatch<'a> {
         limit: u32,
     },
     Indirect(vk::Buffer),
-    Skip,
 }
 
 /// Largest descriptor-binding count of any compute stage (palette_fold,
@@ -1925,7 +1923,6 @@ impl GpuFrameProcessor {
                 }
             }
             StageDispatch::Indirect(buffer) => self.device.cmd_dispatch_indirect(cmd, buffer, 0),
-            StageDispatch::Skip => {}
         }
 
         Ok(guard)
@@ -2402,20 +2399,6 @@ impl GpuFrameProcessor {
         cols: u32,
         rows: u32,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        // M3.3b diagnostic: GHOSTFRAME_CDF53_SKIP_L2_L3=1 skips this stage's
-        // dispatch (descriptor set is still bound). Leaves L1's LL1 output in
-        // place at coefficients[0..256] so the host-side diff can verify L1
-        // in isolation. Gated behind `cdf53-diag` feature so production builds
-        // skip the env-var check.
-        #[cfg(feature = "cdf53-diag")]
-        let skip_l2 = std::env::var("GHOSTFRAME_CDF53_SKIP_L2_L3").is_ok();
-        #[cfg(not(feature = "cdf53-diag"))]
-        let skip_l2 = false;
-        let dispatch = if skip_l2 {
-            StageDispatch::Skip
-        } else {
-            StageDispatch::Indirect(self.cdf53_dispatch_args.buffer)
-        };
         self.record_stage(
             cmd,
             &self.cdf53_forward_l2,
@@ -2424,7 +2407,7 @@ impl GpuFrameProcessor {
                 StageBinding::Buffer(self.cdf53_coefficients_buffer),
             ],
             &[cols, rows],
-            dispatch,
+            StageDispatch::Indirect(self.cdf53_dispatch_args.buffer),
         )
     }
 
@@ -2446,21 +2429,6 @@ impl GpuFrameProcessor {
         cols: u32,
         rows: u32,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        // M3.3b diagnostic: GHOSTFRAME_CDF53_SKIP_L2_L3=1 or
-        // GHOSTFRAME_CDF53_SKIP_L3=1 skips this stage's dispatch (descriptor
-        // set is still bound). With SKIP_L3 only, L2's output is preserved at
-        // coefficients[0..256] (LL2 region) and the host can verify L2.
-        // Gated behind `cdf53-diag` feature so production skips env-var checks.
-        #[cfg(feature = "cdf53-diag")]
-        let skip_l3 = std::env::var("GHOSTFRAME_CDF53_SKIP_L2_L3").is_ok()
-            || std::env::var("GHOSTFRAME_CDF53_SKIP_L3").is_ok();
-        #[cfg(not(feature = "cdf53-diag"))]
-        let skip_l3 = false;
-        let dispatch = if skip_l3 {
-            StageDispatch::Skip
-        } else {
-            StageDispatch::Indirect(self.cdf53_dispatch_args.buffer)
-        };
         self.record_stage(
             cmd,
             &self.cdf53_forward_l3,
@@ -2469,7 +2437,7 @@ impl GpuFrameProcessor {
                 StageBinding::Buffer(self.cdf53_coefficients_buffer),
             ],
             &[cols, rows],
-            dispatch,
+            StageDispatch::Indirect(self.cdf53_dispatch_args.buffer),
         )
     }
 

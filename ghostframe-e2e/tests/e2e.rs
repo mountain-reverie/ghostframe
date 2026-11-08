@@ -5118,21 +5118,10 @@ async fn e2e_cdf53_inverse_gradient_tile() -> Result<()> {
 ///                  client-side must be elsewhere (re-investigate H4).
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_cdf53_server_gpu_vs_cpu_diff() -> Result<()> {
-    // Per env-var: when GHOSTFRAME_CDF53_VERIFY_L1_ONLY=1 in the test process,
-    // also set GHOSTFRAME_CDF53_SKIP_L2_L3=1 on the server so L1's LL1 output
-    // stays in coefficients[0..256] and the diagnostic compares L1 to CPU L1
-    // instead of full forward to CPU forward.
-    let verify_l1_only = std::env::var("GHOSTFRAME_CDF53_VERIFY_L1_ONLY").is_ok();
-    let verify_l2_only = std::env::var("GHOSTFRAME_CDF53_VERIFY_L2_ONLY").is_ok();
-    let mut env: Vec<(&str, &str)> = vec![
+    let env: Vec<(&str, &str)> = vec![
         ("GHOSTFRAME_ENABLE_CDF53", "1"),
         ("GHOSTFRAME_CDF53_DIFF_TILE", "18,5"),
     ];
-    if verify_l1_only {
-        env.push(("GHOSTFRAME_CDF53_SKIP_L2_L3", "1"));
-    } else if verify_l2_only {
-        env.push(("GHOSTFRAME_CDF53_SKIP_L3", "1"));
-    }
     let _setup = setup_e2e_webgpu_gpu_with_env("--gradient --x11-sink", &env).await?;
     // 5s is plenty: gradient is static and the server emits cdf53 once per
     // gen-bump; the one-shot diff log fires on the next cdf53 batch.
