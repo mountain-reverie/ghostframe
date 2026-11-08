@@ -2018,10 +2018,6 @@ const GOLDEN_EXPECTED: &[(usize, &str, u64)] = &[
 
 #[test]
 fn golden_from_pixels_sequence() {
-    // The `cdf53-diag` skip variables (GHOSTFRAME_CDF53_SKIP_*) change the
-    // coefficients, so a run with one set fails below as a golden mismatch.
-    // They are not checked here: this crate reads the environment only in
-    // config.rs, and CI enforces that on test code too.
     let mut p = match GpuFrameProcessor::new(64) {
         Ok(p) => p,
         Err(e) => {

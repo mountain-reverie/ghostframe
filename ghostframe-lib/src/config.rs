@@ -597,7 +597,7 @@ pub struct DiagnosticsConfig {
     /// `cdf53-diag` feature.
     pub cdf53_diff_tile: Option<(u32, u32)>,
     /// From `GHOSTFRAME_CDF53_DUMP_PENDING`; presence, not value, is the
-    /// signal (`.is_ok()` semantics, as with the two fields below). Only
+    /// signal (`.is_ok()` semantics). Only
     /// consumed under the `cdf53-diag` feature.
     pub cdf53_dump_pending: bool,
 }
@@ -617,9 +617,8 @@ impl DiagnosticsConfig {
     /// `dump_frame_path` (`GHOSTFRAME_DUMP_FRAME`) parses only under
     /// `cfg(any(test, feature = "test-loss-injection"))`: it writes raw screen
     /// contents to a path the environment names, which a release daemon must
-    /// never do. `cdf53_diff_tile` /
-    /// `cdf53_dump_pending` only
-    /// parse under the `cdf53-diag` feature, mirroring the `#[cfg]` that
+    /// never do. `cdf53_diff_tile` / `cdf53_dump_pending` only parse under
+    /// the `cdf53-diag` feature, mirroring the `#[cfg]` that
     /// gates their `io_bridge.rs` call sites; a build without the feature
     /// leaves them at `Default`.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
