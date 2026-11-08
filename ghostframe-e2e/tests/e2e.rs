@@ -3234,12 +3234,20 @@ async fn e2e_mode_switch_chromium() -> Result<()> {
         "expected `bandwidth_fits` to take the classifier back to TileCodec; \
          decisions: {decisions:?}"
     );
-    // Neither the headroom guard nor the unknown-estimate hold is in play.
+    // The headroom guard is not in play. The unknown-estimate hold may be the
+    // very first decision (a frame classified before the pinned rate applies),
+    // but never after a bandwidth decision.
     assert!(
-        !decisions
-            .iter()
-            .any(|d| d.reason == "headroom_guard" || d.reason == "estimate_unknown"),
+        !decisions.iter().any(|d| d.reason == "headroom_guard"),
         "the estimate is pinned above the guard; decisions: {decisions:?}"
+    );
+    let late_unknown = decisions
+        .iter()
+        .skip_while(|d| !d.reason.starts_with("bandwidth_"))
+        .any(|d| d.reason == "estimate_unknown");
+    assert!(
+        !late_unknown,
+        "`estimate_unknown` after a bandwidth decision; decisions: {decisions:?}"
     );
     setup.browser.close().await
 }
