@@ -82,7 +82,7 @@ Files added by this revision:
 | §4.1 per-class blocks: H.264 per frame, tile bundles in running blocks, refinement passes unprotected | one stream of bundles and one block sequence; every bundle is protected while r > 0 (§2, §4) |
 | §4.3 / §4.8.4 per-class adaptation, NACK-first at low RTT | one adaptation loop sized for first-shot recovery; burst protection by block span (§5) |
 | §4.5 BUNDLE 0x09 / REPAIR 0x0A as new first bytes; H.264 frame parity at `frag_idx = n+1+j` | every s→c datagram is a frame of the FEC framing (§6.1). There are no free first bytes on master |
-| HELLO caps bit 2 | bit 2 is `HELLO_CAP_H264_ACKED_REF` on master (`ghostframe-protocol/src/feedback_stream.rs:65`). Rev 6 uses **bit 3**, or no bit (§8, item 7) |
+| HELLO caps bit 2 | bit 2 is `HELLO_CAP_H264_ACKED_REF` on master (`ghostframe-protocol/src/feedback_stream.rs:65`). Rev 6 uses **no bit**: the framing is unconditional (§8, item 7, decided) |
 | REPAIR_REQUEST 0x0B and DECLINED: `class u8`, `block_id u32` (H.264: `frame_seq`) | same numbers; **the bodies change**: no class, `block_id u16` (§6.2) |
 | ACK 0x06 retired only for FEC-v2 traffic; fragment and coverage NACKs kept for unprotected traffic (rev 5 §4.8.2 step 5) | ACK 0x06 retired; **TILE_NACK 0x05 kept** for tile content carried in PLAIN frames (§6.2) |
 | §4.9.5: H.264 fragments carry no `bundle_seq` and get no RECOVERED | H.264 fragments travel in bundles like everything else; a rebuilt fragment's RECOVERED feeds the acked-reference manager (§5.3) |
@@ -372,7 +372,7 @@ Rev 6 therefore separates transport from content for H.264, as rev 5 did for til
 - bit 31 marks a tile;
 - 0x04 is the parity envelope (`protocol.rs:404-436, :648`).
 
-So once the framing is on, **every** s→c datagram of the session is one of the frames below, and the old discriminators live only inside records. If the framing is negotiated (HELLO bit 3), the server must send nothing unframed after HELLO, and nothing at all before it. Otherwise a legacy first byte of 0x01–0x03 would parse as a frame. That is one argument for item 7 of §8.
+**The framing is unconditional** (owner, 2026-11-07, §8 item 7). **Every** s→c datagram of every session is one of the frames below, from the first datagram on. There is no HELLO bit and no unframed path, and the old discriminators live only inside records.
 
 ```
 SOURCE   [0] 0x01  [1] scheme | flags     scheme (low 4 bits): 0 = RS GF(2^8) Cauchy, row 0 XOR;
@@ -431,18 +431,78 @@ The validation plans of rev 5 §4.6 and §4.9.8 apply: every property test comes
 
 ## 8. Decisions for the owner
 
-1. **Codec: `rusty_erasure` with our matrix and the e×e decoder.** *Recommended*: pinned `=0.4.3`, with `gf256` as the permanent differential oracle.
-   - Vendoring (about 5 000 lines) is the alternative to pinning.
-   - The in-house code alone is the fallback, with multi-repair encode 6–12× slower.
-2. **Build the web client with `+simd128`.** It is supported by every evergreen browser. Without it, the client-side gain over the in-house code is small. *Recommend yes*, after measuring the whole bundle.
+**Decided 2026-11-07:** items 1, 2, 5, 7, 8 and 9 as recommended below. Items 4 and 6 are open, pending the analysis in §8.1 and §8.2.
+
+1. **Codec: `rusty_erasure` with our matrix and the e×e decoder.** **Decided: pinned `=0.4.3`**, with `gf256` as the permanent differential oracle.
+   - Vendoring (about 5 000 lines) was the alternative.
+   - The in-house code alone remains the fallback, with multi-repair encode 6–12× slower.
+2. **Build the web client with `+simd128`.** It is supported by every evergreen browser. **Decided: yes.** Measure the whole bundle when it is switched on.
 3. **RS blocks now, a sliding window later** (§3.3). *Recommend RS.* The scheme byte keeps the door open.
 4. **Frame-spanning blocks above about 70 Mbit/s** (§3.3). The choice is between:
    - (a) two or more interleaved GF(2^8) blocks per frame;
    - (b) a GF(2^16) code for large blocks, RaptorQ or Leopard, with about 0.3–0.9 ms of wasm decode per block.
 
-   *Recommend (a)*, and only if LOSS_REPORT shows bursts at those rates.
-5. **Clean-link floor** (§5): the measured pre-FEC loss below which r = 0. *Recommend 0.1 %*, with r = 1 restored at the first loss above it. Revision 5 used 0.3 % where a repair round fits, and r = 1 at any loss where none does. Low latency argues for the lower value.
-6. **The last bundle of a pass.** Either pad it to `max_size()` so quinn never puts two bundles in one packet, which costs bytes on small passes, or accept occasional coalescing, which correlates loss. *Recommend measuring the rate in R6-c first.*
-7. **Negotiation.** HELLO bit 3, or make the framing unconditional, since there are no deployments to stay compatible with (owner, 2026-10-15). *Recommend unconditional:* it removes a compatibility matrix and the pre-HELLO ambiguity (§6.1).
-8. **Remove H.264 retransmission** (R6-f). *Recommend deciding on LOSS_REPORT data after R6-e.*
-9. **The web client's rAF batching** puts up to 16.7 ms under browser recovery below about 18 Mbit/s (§2.2). It is a separate work item, worth doing for its own sake.
+   **Open:** see §8.1. A simulation comparing the two is in progress.
+5. **Clean-link floor** (§5): the measured pre-FEC loss below which r = 0. **Decided: 0.1 %**, with r = 1 restored at the first loss above it. Revision 5 used 0.3 % where a repair round fits, and r = 1 at any loss where none does.
+6. **The last bundle of a pass.** Pad it to `max_size()`, or accept that quinn occasionally puts two short bundles in one packet. **Open:** see §8.2.
+7. **Negotiation.** **Decided: the framing is unconditional.** There is no HELLO bit, and every s→c datagram of every session is framed (§6.1). There are no deployments to stay compatible with (owner, 2026-10-15). This removes a compatibility matrix and the pre-HELLO ambiguity.
+8. **Remove H.264 retransmission** (R6-f). **Decided:** decide on LOSS_REPORT data after R6-e.
+9. **The web client's rAF batching** puts up to 16.7 ms under browser recovery below about 18 Mbit/s (§2.2). **Decided:** a separate work item, worth doing for its own sake.
+
+### 8.1 Item 4: blocks that span a frame above about 70 Mbit/s
+
+**The problem.** A 30 fps frame at 100 Mbit/s is about 350 bundles. GF(2^8) caps a block at k + r ≤ 256. Below about 70 Mbit/s a frame fits in one block and nothing needs deciding.
+
+**(a) Two or more GF(2^8) blocks per frame, interleaved** (bundle i goes to block i mod m).
+- **For:**
+  - Same codec, same wire format, same fast decoder, no new dependency.
+  - Interleaving splits a burst of b losses across the m blocks, about b/m each, so burst protection is largely kept.
+  - All m blocks still end with the frame, so no delay is added.
+  - Each block's decode stays in the µs range.
+- **Against:**
+  - Not MDS over the frame. The same total repair R, split R/m per block, fails when the losses split unevenly, even if their total is ≤ R.
+  - The penalty grows with the burst length relative to m, and the residual at the same overhead is somewhat higher than one block.
+  - The k_max and T logic gains a "split" mode.
+
+**(b) One GF(2^16) block over the frame**, using Leopard (`reed-solomon-simd`, MDS) or RaptorQ (not MDS).
+- **For:**
+  - One block whose code is optimal over the whole frame: the lowest residual for a given overhead.
+  - Leopard encodes fast natively (62 µs at k = 200, rev 5 §4.2).
+- **Against:**
+  - A second codec in the client: +10 KB (Leopard) or +113 KB (RaptorQ).
+  - A second differential oracle to maintain.
+  - A fixed decode cost per lossy block of about 0.9 ms in wasm for Leopard, whose wasm SIMD support is still an unmerged pull request. At 30 fps that is about 3 % of the main thread per lossy frame.
+  - No XOR fast path: one loss costs the same as many.
+  - Leopard needs even shard sizes; RaptorQ needs a spare symbol.
+
+**What would decide it:** the residual gap between (a) and (b) at 70–200 Mbit/s under burst loss. That is not simulated yet, and is being added to `sim-rev6`. Until then the lean is (a): no new code. Choose (b) only if (a) leaves a gap of more than a point or so of late frames.
+
+### 8.2 Item 6: pad the last bundle of a pass, or accept coalescing
+
+**When two bundles share a packet in practice.**
+- quinn-proto puts DATAGRAM frames into one packet only while the *next* one fits (§2.1). A full bundle never shares.
+- In a pass "full, full, short", the short bundle is followed by the next pass's first bundle, usually full, so it does not share either.
+- Two bundles share a packet only when both are short and both sit in quinn's queue at once:
+  - tiny passes back to back (a cursor-sized tile update, a small P-frame at idle, a pong);
+  - a short bundle behind a backlog at high rate.
+- At 2–10 Mbit/s quinn's queue is nearly empty between passes (`D_target` is 2–10 datagrams), so it should be rare **[E]**. At high rate with a standing queue it is more likely, but there the passes fill bundles, so few are short **[E]**.
+
+**What sharing costs when it happens.**
+- A lost packet erases two symbols, usually of the same block: a burst of 2 for RS to absorb.
+- It is a protection loss, not a correctness problem:
+  - every symbol is still decodable from k others;
+  - the client's pre-FEC loss measurement sees the 2-burst, so the adaptation raises protection for it automatically, if a little pessimistically.
+- Congestion control is unaffected: two bundles lost together are two `bundle_seq` losses, as two datagrams in one packet are today.
+
+**What padding costs.**
+- Every short final bundle is grown to about 1 200 B.
+- That is the worst case at low rate and small damage, exactly where most passes are a single short bundle. Small updates could cost 2–10× their bytes:
+  - a 150 B cursor-area update becomes 1 200 B;
+  - at 2 Mbit/s that is wasted capacity, billed to the pacer like any other byte.
+- It also delays nothing, but it does take tokens that the next frame would have used.
+
+**A third option** is to hold a short bundle briefly so the next pass can fill it. It is rejected: it adds latency, which is the one thing this design must not do.
+
+**Recommendation: accept coalescing and don't pad.**
+- Count it in R6-c. The server sees it without quinn's help: a short bundle handed to quinn while its datagram queue already holds a short bundle can share.
+- Pad only if that count shows a real rate of shared packets *and* LOSS_REPORT shows the 2-bursts costing residual.
