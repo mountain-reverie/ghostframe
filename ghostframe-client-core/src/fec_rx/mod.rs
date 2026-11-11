@@ -103,9 +103,12 @@ impl FecRx {
         )]));
     }
 
-    pub fn on_timeout(&mut self, now_us: u64) {
+    /// Fire the due deadlines. True when an ACK v4 batch was flushed by it.
+    pub fn on_timeout(&mut self, now_us: u64) -> bool {
+        let mut ack_flushed = false;
         if let Some(d) = self.acks.on_timeout(now_us) {
             self.datagrams.push_back(d);
+            ack_flushed = true;
         }
         let mut asks: Vec<RepairAsk> = Vec::new();
         for action in self.blocks.on_timeout(now_us) {
@@ -136,6 +139,7 @@ impl FecRx {
             );
         }
         self.maybe_report(now_us);
+        ack_flushed
     }
 
     /// Earliest of the ACK flush, the block windows and the next LOSS_REPORT.
@@ -159,6 +163,12 @@ impl FecRx {
             return None;
         }
         Some(std::mem::take(&mut self.status))
+    }
+
+    /// The loss reporter's cumulative wire statistics (pre-FEC loss from
+    /// `bundle_seq` gaps). Measurement only.
+    pub fn wire_loss_stats(&self) -> crate::wire_loss::WireLossStats {
+        self.loss.wire_stats()
     }
 
     pub fn stats(&self) -> BlockStats {

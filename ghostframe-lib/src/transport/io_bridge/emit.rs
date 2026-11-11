@@ -46,15 +46,10 @@ impl IoBridge {
             if let Some(gate) = self.gate {
                 if let Some(depth) = self.live_fifo_depth() {
                     let depth = depth + self.unsent_bundle_bytes();
-                    // With framing a record costs its length prefix here; the
-                    // frame header and the QUIC framing are charged once per
-                    // bundle (`note_bundle_enqueued`).
-                    let wire = bytes.len()
-                        + if self.fec_framing {
-                            ghostframe_protocol::fec::frame::FEC_RECORD_LEN_PREFIX
-                        } else {
-                            self.live_framing_len()
-                        };
+                    // A record costs its length prefix here; the frame header
+                    // and the QUIC framing are charged once per bundle
+                    // (`note_bundle_enqueued`).
+                    let wire = bytes.len() + ghostframe_protocol::fec::frame::FEC_RECORD_LEN_PREFIX;
                     let admit_class = match class {
                         WireClass::NackRepair => AdmitClass::NackRepair,
                         WireClass::LossRetransmit => AdmitClass::Retransmit,
@@ -84,7 +79,7 @@ impl IoBridge {
                     }
                 }
             }
-            let outcome = self.send_counted(&bytes, class, true, emission.wire_seq());
+            let outcome = self.send_counted(&bytes, class, emission.wire_seq());
             if matches!(
                 outcome,
                 crate::transport::reliable_emitter::traits::SendOutcome::Rejected
@@ -280,13 +275,11 @@ impl IoBridge {
         dg: &[u8],
         class: WireClass,
     ) -> crate::transport::reliable_emitter::traits::SendOutcome {
-        self.send_counted(dg, class, false, None)
+        self.send_counted(dg, class, None)
     }
 
-    /// [`Self::send_to_all_sessions`], saying whether the datagram came
-    /// through the admission gate (`gated`: it was charged to the bucket
-    /// before it got here) or bypassed it (a control datagram, billed to the
-    /// bucket afterwards).
+    /// [`Self::send_to_all_sessions`] for a datagram of `class`: a record
+    /// goes into the packer, a control datagram leaves as a lone PLAIN frame.
     ///
     /// `wire_seq` names the transmission the datagram carries, when it is one
     /// the ledger tracks; it ties the datagram's departure from quinn's FIFO
@@ -296,32 +289,19 @@ impl IoBridge {
         &mut self,
         dg: &[u8],
         class: WireClass,
-        gated: bool,
         wire_seq: Option<u32>,
     ) -> crate::transport::reliable_emitter::traits::SendOutcome {
-        use crate::transport::reliable_emitter::traits::SendOutcome;
         #[cfg(test)]
         self.sent_log_for_test.push(dg.to_vec());
-        // With the rev 6 framing the bandwidth cap models the link, so it
-        // runs on sealed bundles (`bundle_tx`); the two hooks below model
-        // content loss and stay per record, before packing.
-        #[cfg(any(test, feature = "test-loss-injection"))]
-        if !self.fec_framing {
-            if let Some(cap) = self.outbound_bandwidth_cap.as_mut() {
-                if !cap.try_consume(dg.len()) {
-                    // A harness-injected drop *consumes* the datagram. Reporting
-                    // `Rejected` here would make the emitter re-queue the same
-                    // bytes forever and the injected loss would never happen.
-                    self.departed_without_quinn(wire_seq);
-                    return SendOutcome::Sent;
-                }
-            }
-        }
+        // The bandwidth cap models the link, so it runs on sealed bundles
+        // (`bundle_tx`); the two hooks below model content loss and stay per
+        // record, before packing.
         #[cfg(any(test, feature = "test-loss-injection"))]
         if let Some(inj) = self.outbound_loss.as_mut() {
             if inj.should_drop(dg) {
                 self.consumed_before_wire(wire_seq, dg.len());
-                return SendOutcome::Sent; // injected loss: consumed, see above
+                return crate::transport::reliable_emitter::traits::SendOutcome::Sent;
+                // injected loss: consumed, see above
             }
         }
         #[cfg(any(test, feature = "test-loss-injection"))]
@@ -332,43 +312,11 @@ impl IoBridge {
                 .should_drop(dg)
             {
                 self.consumed_before_wire(wire_seq, dg.len());
-                return SendOutcome::Sent; // injected drop: consumed, see above
+                return crate::transport::reliable_emitter::traits::SendOutcome::Sent;
+                // injected drop: consumed, see above
             }
         }
-        if self.fec_framing {
-            return self.send_counted_framed(dg, class, wire_seq);
-        }
-        // Every datagram goes to every connected session, so one refusal
-        // means re-queue. With more than one session that re-sends to the
-        // ones that accepted; the duplicate is wasted bandwidth rather than
-        // corruption -- the client dedups on wire_seq and tile reassembly is
-        // idempotent per frag_idx. Production runs a single session.
-        match self.offer_to_live(dg) {
-            // No connected session counts as sent, not rejected: re-queueing a
-            // datagram with nowhere to go would spin the drain forever.
-            super::bundle_tx::Offer::NoSession => SendOutcome::Sent,
-            super::bundle_tx::Offer::Taken {
-                handle,
-                cum,
-                framing,
-                queued,
-            } => {
-                self.note_enqueued(
-                    handle,
-                    Enqueued {
-                        class,
-                        gated,
-                        dg_len: dg.len(),
-                        framing_len: framing,
-                        wire_seq,
-                        cum_enqueued: cum,
-                        queued,
-                    },
-                );
-                SendOutcome::Sent
-            }
-            super::bundle_tx::Offer::Refused(_) => SendOutcome::Rejected,
-        }
+        self.send_counted_framed(dg, class, wire_seq)
     }
 
     /// Emit the frame-dimensions datagram on the first frame of each session and
@@ -395,7 +343,7 @@ impl IoBridge {
             // stands at `D_target` whenever a frame arrives, so a gated send
             // would starve for as long as the link stays saturated while
             // tiles were admitted regardless. It is soft-charged to the
-            // bucket (`note_enqueued`), so the classes that can wait pay.
+            // bucket (`note_bundle_enqueued`), so the classes that can wait pay.
             let dg = crate::transport::protocol::build_frame_dimensions_datagram(
                 seq,
                 timestamp_us,

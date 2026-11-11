@@ -129,7 +129,7 @@ fn core_with_passes(passes: &[u8]) -> ClientCore {
             valid_cdf53_payload()
         };
         let dgs = tile_datagrams(1, 2, 3, Codec::Cdf53, p, &payload, 1200);
-        core.handle_datagram(&dgs[0], 0);
+        core.handle_datagram(&ghostframe_client_core::frame_one(&dgs[0]), 0);
     }
     core.on_timeout(100_000);
     drain_datagrams(&mut core);
@@ -200,7 +200,7 @@ fn tail_sweep_unknown_bitmap_asks_for_pass_zero_only_once_something_arrived() {
     // itself; the unit tests on `gap_evidence_mask` do.)
     let mut core = test_core();
     let dgs = tile_datagrams(1, 2, 3, Codec::Cdf53, 3, &valid_cdf53_payload(), 1200);
-    core.handle_datagram(&dgs[0], 0);
+    core.handle_datagram(&ghostframe_client_core::frame_one(&dgs[0]), 0);
     core.on_timeout(100_000);
     drain_datagrams(&mut core);
     drain_stream(&mut core);
@@ -216,7 +216,7 @@ fn a_later_frame_replaces_the_entry_so_no_nack_names_the_older_frame() {
     // fetch a stale pass. The entry is the new frame's, with no evidence.
     let mut core = core_with_passes(&[0, 1, 2, 3, 4, 6]);
     let dgs = tile_datagrams(2, 2, 3, Codec::Cdf53, 0, &valid_cdf53_pass0_payload(), 1200);
-    core.handle_datagram(&dgs[0], 200_000);
+    core.handle_datagram(&ghostframe_client_core::frame_one(&dgs[0]), 200_000);
     core.on_timeout(300_000);
     drain_datagrams(&mut core);
     drain_stream(&mut core);
@@ -242,14 +242,14 @@ fn coverage_nack_debounce_suppresses_pass_that_arrives_in_window() {
     let mut core = test_core();
     // Pass 0 valid at t=0.
     let dgs0 = tile_datagrams(1, 5, 6, Codec::Cdf53, 0, &valid_cdf53_pass0_payload(), 1200);
-    core.handle_datagram(&dgs0[0], 0);
+    core.handle_datagram(&ghostframe_client_core::frame_one(&dgs0[0]), 0);
     drain_datagrams(&mut core);
     drain_stream(&mut core);
 
     // Pass 2 arrives next (gap-detection: pass 1 missing -> queued for
     // debounced NACK).
     let dgs2 = tile_datagrams(1, 5, 6, Codec::Cdf53, 2, &valid_cdf53_payload(), 1200);
-    core.handle_datagram(&dgs2[0], 1_000);
+    core.handle_datagram(&ghostframe_client_core::frame_one(&dgs2[0]), 1_000);
     // No NACK datagram before the debounce window closes.
     assert!(
         drain_datagrams(&mut core).into_iter().all(|d| d[0] != 0x05),
@@ -258,7 +258,7 @@ fn coverage_nack_debounce_suppresses_pass_that_arrives_in_window() {
 
     // Pass 1 arrives validly within the 50ms debounce window.
     let dgs1 = tile_datagrams(1, 5, 6, Codec::Cdf53, 1, &valid_cdf53_payload(), 1200);
-    core.handle_datagram(&dgs1[0], 10_000);
+    core.handle_datagram(&ghostframe_client_core::frame_one(&dgs1[0]), 10_000);
     drain_datagrams(&mut core);
     drain_stream(&mut core);
 
@@ -275,13 +275,13 @@ fn coverage_nack_debounce_suppresses_pass_that_arrives_in_window() {
 fn coverage_nack_debounce_sends_pass_that_never_arrives() {
     let mut core = test_core();
     let dgs0 = tile_datagrams(1, 7, 8, Codec::Cdf53, 0, &valid_cdf53_pass0_payload(), 1200);
-    core.handle_datagram(&dgs0[0], 0);
+    core.handle_datagram(&ghostframe_client_core::frame_one(&dgs0[0]), 0);
     drain_datagrams(&mut core);
     drain_stream(&mut core);
 
     // Pass 2 arrives; gap detection queues pass 1 for debounced NACK.
     let dgs2 = tile_datagrams(1, 7, 8, Codec::Cdf53, 2, &valid_cdf53_payload(), 1200);
-    core.handle_datagram(&dgs2[0], 1_000);
+    core.handle_datagram(&ghostframe_client_core::frame_one(&dgs2[0]), 1_000);
     drain_datagrams(&mut core);
     drain_stream(&mut core);
 

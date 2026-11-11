@@ -34,13 +34,13 @@ fn capture_events() -> Vec<Event> {
             tile_delivery: TileDelivery::Payload,
             cdf53_wire: false,
             display: None,
-            fec_framing: false,
         },
         0,
     );
     let mut events = Vec::new();
     for (i, d) in testdata::mixed_codec_capture().iter().enumerate() {
-        events.extend(core.handle_datagram(d, i as u64 * 1_000));
+        events
+            .extend(core.handle_datagram(&ghostframe_client_core::frame_one(d), i as u64 * 1_000));
     }
     events
 }

@@ -43,7 +43,6 @@ pub fn client_config(
         },
         cdf53_wire: false,
         display: None,
-        fec_framing: false, // R6-b B5 wires this
     }
 }
 
@@ -129,14 +128,10 @@ impl WasmClientCore {
         supports_h264: bool,
         tile_delivery_payload: bool,
         now_us: u64,
-        fec_framing: bool,
     ) -> WasmClientCore {
         WasmClientCore {
             inner: Rc::new(RefCell::new(new_client_core(
-                ClientConfig {
-                    fec_framing,
-                    ..client_config(indices_raw_enabled, supports_h264, tile_delivery_payload)
-                },
+                client_config(indices_raw_enabled, supports_h264, tile_delivery_payload),
                 now_us,
             ))),
         }

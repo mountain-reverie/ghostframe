@@ -101,11 +101,6 @@ pub struct ClientNetConfig {
     /// `ClientCore::new` queue a `DisplayInfo` Hello payload -- see that
     /// type's doc for why scale (not millimetres) is authoritative.
     pub display: Option<ClientDisplay>,
-    /// Receive the rev 6 FEC framing (forwarded to `ClientConfig::fec_framing`).
-    /// Off by default on the wire until the server turns it on too; when on,
-    /// the client's repair status (RECOVERED / CONTENT_REJECTED / DECLINED)
-    /// goes out on a second client-opened bidi stream.
-    pub fec_framing: bool,
 }
 
 pub struct ClientNet {
@@ -267,7 +262,6 @@ impl ClientNet {
                 // requests, so it asks for H.264 whenever it can decode it.
                 h264_acked_ref: config.supports_h264,
                 display: config.display,
-                fec_framing: config.fec_framing,
                 ..Default::default()
             },
             now_us,
@@ -566,7 +560,9 @@ impl ClientNet {
                         PollOutput::Stream(bytes) => {
                             self.pending_stream_out.push_back(bytes);
                         }
-                        // Never produced while `fec_framing` is off.
+                        // The repair status (RECOVERED / CONTENT_REJECTED /
+                        // DECLINED) goes out on a second client-opened bidi
+                        // stream.
                         PollOutput::RepairStatus(bytes) => {
                             let queued: usize =
                                 self.pending_repair_status_out.iter().map(Vec::len).sum();

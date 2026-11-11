@@ -137,7 +137,6 @@ async fn a_frame_in_the_backend_does_not_hold_the_event_loop() {
             indices_raw_enabled: true,
             supports_h264: false,
             display: None,
-            fec_framing: false,
         },
         us(()),
     )

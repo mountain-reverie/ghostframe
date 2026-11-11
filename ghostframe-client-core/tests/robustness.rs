@@ -67,7 +67,7 @@ proptest! {
     #[test]
     fn arbitrary_bytes_never_panic(data in proptest::collection::vec(any::<u8>(), 0..2000)) {
         let mut core = test_core();
-        let _ = core.handle_datagram(&data, 0);
+        let _ = core.handle_datagram(&ghostframe_client_core::frame_one(&data), 0);
         while core.poll_transmit(0).is_some() {}
         drive_timers(&mut core);
     }
@@ -77,7 +77,7 @@ proptest! {
         let dg = valid_cdf53_datagram();
         let cut = cut.min(dg.len());
         let mut core = test_core();
-        let _ = core.handle_datagram(&dg[..cut], 0);
+        let _ = core.handle_datagram(&ghostframe_client_core::frame_one(&dg[..cut]), 0);
         while core.poll_transmit(0).is_some() {}
         drive_timers(&mut core);
     }
@@ -89,7 +89,7 @@ proptest! {
         dg[pos] ^= 1 << bit;
 
         let mut core = test_core();
-        let evs = core.handle_datagram(&dg, 0);
+        let evs = core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 0);
         for e in &evs {
             if let ghostframe_client_core::Event::TileReady { rgba, .. } = e {
                 // Flipping a bit inside the TileHeader's packed codec/lz4 byte

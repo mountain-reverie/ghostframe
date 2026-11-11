@@ -31,10 +31,10 @@ fn h264_frame_reassembles_to_needs_h264() {
     // Deliver out of order except the last one.
     let mut evs = Vec::new();
     for dg in &dgs[1..] {
-        evs.extend(core.handle_datagram(dg, 0));
+        evs.extend(core.handle_datagram(&ghostframe_client_core::frame_one(dg), 0));
     }
     assert!(evs.is_empty(), "assembly incomplete without fragment 0");
-    evs.extend(core.handle_datagram(&dgs[0], 0));
+    evs.extend(core.handle_datagram(&ghostframe_client_core::frame_one(&dgs[0]), 0));
 
     match &evs[..] {
         [Event::NeedsH264 {
@@ -67,15 +67,15 @@ fn a_malformed_fragment_index_is_dropped_not_counted() {
     let mut bad = dgs[0].clone();
     bad[4] = 0x00;
     bad[5] = 0x02; // frag_idx = 2 == frag_total (2) -> malformed, must be skipped
-    let evs = core.handle_datagram(&bad, 0);
+    let evs = core.handle_datagram(&ghostframe_client_core::frame_one(&bad), 0);
     assert!(
         evs.is_empty(),
         "a malformed fragment must not be counted or emit events"
     );
 
     // Now deliver both real fragments; frame should still complete cleanly.
-    let mut evs = core.handle_datagram(&dgs[0], 0);
-    evs.extend(core.handle_datagram(&dgs[1], 0));
+    let mut evs = core.handle_datagram(&ghostframe_client_core::frame_one(&dgs[0]), 0);
+    evs.extend(core.handle_datagram(&ghostframe_client_core::frame_one(&dgs[1]), 0));
     match &evs[..] {
         [Event::NeedsH264 {
             frame_seq: 3,
@@ -96,18 +96,20 @@ fn h264_stale_frame_dropped_after_eviction_window() {
     let payload1: Vec<u8> = (0..20u8).collect();
     let f1 = fragment_frame(1, 0, false, &payload1, 10);
     assert_eq!(f1.len(), 2);
-    assert!(core.handle_datagram(&f1[0], 0).is_empty());
+    assert!(core
+        .handle_datagram(&ghostframe_client_core::frame_one(&f1[0]), 0)
+        .is_empty());
 
     // Frames 2, 3, 4 (single-fragment each) advance latest_full_frame_seq.
     for seq in 2..=4u32 {
         let d = fragment_frame(seq, 0, false, &[9u8; 10], 100);
         assert_eq!(d.len(), 1);
-        let _ = core.handle_datagram(&d[0], 0);
+        let _ = core.handle_datagram(&ghostframe_client_core::frame_one(&d[0]), 0);
     }
 
     // Frame 1's remaining fragment now arrives late; frame is stale
     // (1 < latest(4) - 2 = 2), dropped before insertion, so no event.
-    let evs = core.handle_datagram(&f1[1], 0);
+    let evs = core.handle_datagram(&ghostframe_client_core::frame_one(&f1[1]), 0);
     assert!(
         evs.is_empty(),
         "stale frame-1 fragment must be dropped: {evs:?}"
@@ -122,7 +124,7 @@ fn h264_malformed_datagram_does_not_panic() {
     // zero -> frag_idx = 0, frag_total = 0) must be dropped, not panic on
     // `vec![None; 0]` indexing.
     let zero_total = vec![0u8; 24];
-    let evs = core.handle_datagram(&zero_total, 0);
+    let evs = core.handle_datagram(&ghostframe_client_core::frame_one(&zero_total), 0);
     assert!(evs.is_empty());
 }
 
@@ -139,13 +141,13 @@ fn h264_v2_reference_info_reaches_the_event() {
     // The reference (frame 41) was delivered: a P frame whose reference never
     // was is held back (`ref_break.rs`).
     for dg in fragment_frame(41, 0, true, &[1u8; 10], 1000) {
-        core.handle_datagram(&dg, 0);
+        core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 0);
     }
     let dgs = fragment_frame_ref(42, 7, info, &payload, 1000);
     assert_eq!(dgs.len(), 3);
     let mut evs = Vec::new();
     for dg in &dgs {
-        evs.extend(core.handle_datagram(dg, 0));
+        evs.extend(core.handle_datagram(&ghostframe_client_core::frame_one(dg), 0));
     }
     match &evs[..] {
         [Event::NeedsH264 {
@@ -181,7 +183,7 @@ fn h264_final_fragment_with_zero_or_one_payload_bytes_completes_the_frame() {
         }
         let mut evs = Vec::new();
         for dg in &dgs {
-            evs.extend(core.handle_datagram(dg, 0));
+            evs.extend(core.handle_datagram(&ghostframe_client_core::frame_one(dg), 0));
         }
         match &evs[..] {
             [Event::NeedsH264 {
@@ -203,7 +205,7 @@ fn h264_empty_access_unit_single_fragment_is_delivered() {
         dgs[0].len(),
         ghostframe_protocol::protocol::FRAME_HEADER_SIZE
     );
-    let evs = core.handle_datagram(&dgs[0], 0);
+    let evs = core.handle_datagram(&ghostframe_client_core::frame_one(&dgs[0]), 0);
     assert!(
         matches!(&evs[..], [Event::NeedsH264 { frame_seq: 12, payload, .. }] if payload.is_empty()),
         "{evs:?}"

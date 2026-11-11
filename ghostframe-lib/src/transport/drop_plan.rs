@@ -287,7 +287,7 @@ mod tests {
 
     /// The tile-flag guard, isolated from the length guard.
     ///
-    /// An ACK batch (`ACK_BATCH_MSG_TYPE` = 0x06, 7-byte entries) runs well
+    /// An ACK v4 batch (`FEC_ACK_V4_MSG_TYPE` = 0x08) runs well
     /// past byte 17, and whatever entry bytes land there are arbitrary — they
     /// can equal any tile coordinate. Without the flag check a plan would
     /// silently eat acknowledgements, corrupting the very feedback path these
@@ -300,7 +300,7 @@ mod tests {
             occurrences: vec![0],
         }]);
         let mut ack = vec![0u8; 32];
-        ack[0] = 0x06;
+        ack[0] = 0x08;
         ack[TILE_X_OFFSET] = 6;
         ack[TILE_Y_OFFSET] = 0;
         assert!(

@@ -820,8 +820,7 @@ pub enum InboundKind {
     Empty,
     Unknown,
     Hello,         // FEEDBACK_MSG_TYPE (0x01)
-    AckBatchV1,    // superseded ACK revisions (0x02, 0x03) — decoder rejects them
-    AckBatch,      // ACK_BATCH_MSG_TYPE (0x04)
+    AckBatchV1,    // superseded ACK revisions (0x02..=0x04 and 0x06): dropped
     TileNack,      // TILE_NACK_ENVELOPE (0x05)
     FrameAck,      // FRAME_ACK_ENVELOPE (0x0A)
     LossReport,    // fec::feedback::FEC_LOSS_REPORT_MSG_TYPE (0x07)
@@ -841,20 +840,15 @@ pub enum InboundKind {
 /// a new type cannot be wired into the classifier without being registered,
 /// and therefore cannot collide with an existing type unnoticed.
 ///
-/// Superseded revisions (0x02, 0x03) are deliberately absent: they classify
-/// as `AckBatchV1`, which the tests treat as "not routed anywhere that
-/// matters" — the decoder rejects them outright.
+/// Superseded revisions (0x02..=0x04 and 0x06) are deliberately absent: they
+/// classify as `AckBatchV1`, which the tests treat as "not routed anywhere
+/// that matters" — the server counts and drops them.
 #[cfg(test)]
 const INBOUND_DISCRIMINATORS: &[(&str, u8, InboundKind)] = &[
     (
         "feedback/hello",
         crate::feedback::FEEDBACK_MSG_TYPE,
         InboundKind::Hello,
-    ),
-    (
-        "ack batch",
-        crate::ack::ACK_BATCH_MSG_TYPE,
-        InboundKind::AckBatch,
     ),
     ("tile nack", TILE_NACK_ENVELOPE, InboundKind::TileNack),
     ("frame ack", FRAME_ACK_ENVELOPE, InboundKind::FrameAck),
@@ -881,14 +875,11 @@ pub fn classify_inbound(data: &[u8]) -> InboundKind {
     };
     match first {
         crate::feedback::FEEDBACK_MSG_TYPE => InboundKind::Hello,
-        // Superseded ACK envelope revisions. `AckBatch::decode` rejects all
-        // of them with `WrongMsgType`, so they are named here only so an old
-        // client shows up as an old client rather than as `Unknown`. 0x04 was
-        // the rev2 tile-pass format, retired in favour of transmission
-        // identity.
-        0x02..=0x04 => InboundKind::AckBatchV1,
-        // The current ACK envelope.
-        crate::ack::ACK_BATCH_MSG_TYPE => InboundKind::AckBatch,
+        // Superseded ACK envelope revisions, named only so an old client shows
+        // up as an old client rather than as `Unknown`. 0x04 was the rev2
+        // tile-pass format; 0x06 the per-transmission batch, replaced by ACK
+        // v4 (0x08, per bundle) when the rev 6 framing became unconditional.
+        0x02..=0x04 | 0x06 => InboundKind::AckBatchV1,
         TILE_NACK_ENVELOPE => InboundKind::TileNack,
         FRAME_ACK_ENVELOPE => InboundKind::FrameAck,
         crate::fec::feedback::FEC_LOSS_REPORT_MSG_TYPE => InboundKind::LossReport,
@@ -1283,7 +1274,10 @@ mod tests {
     #[test]
     fn frame_ack_classifies_and_is_not_a_frame_fragment() {
         assert_eq!(classify_inbound(&[0x0A]), InboundKind::FrameAck);
-        assert_ne!(FRAME_ACK_ENVELOPE, crate::ack::ACK_BATCH_MSG_TYPE);
+        assert_ne!(
+            FRAME_ACK_ENVELOPE,
+            crate::fec::feedback::FEC_ACK_V4_MSG_TYPE
+        );
         assert_ne!(FRAME_ACK_ENVELOPE, TILE_NACK_ENVELOPE);
     }
 
@@ -1538,9 +1532,14 @@ mod tests {
         // 0x04 is the superseded rev2 ACK format: inbound it means an old client.
         assert_eq!(classify_inbound(&[0x04]), InboundKind::AckBatchV1);
         assert_eq!(
-            classify_inbound(&[crate::ack::ACK_BATCH_MSG_TYPE]),
-            InboundKind::AckBatch,
-            "the current ACK revision routes to the ACK handler"
+            classify_inbound(&[0x06]),
+            InboundKind::AckBatchV1,
+            "the per-transmission ACK of the unframed protocol is superseded"
+        );
+        assert_eq!(
+            classify_inbound(&[crate::fec::feedback::FEC_ACK_V4_MSG_TYPE]),
+            InboundKind::AckBatchV4,
+            "the current ACK revision routes to the ACK v4 handler"
         );
         assert_eq!(
             classify_inbound(&[TILE_NACK_ENVELOPE]),
@@ -1551,17 +1550,9 @@ mod tests {
     }
 
     #[test]
-    fn ack_batch_is_not_misrouted_to_another_handler() {
-        // The current ACK envelope must classify as an ACK. This is written
-        // against `ACK_BATCH_MSG_TYPE` rather than a literal precisely
-        // because the literal is what drifted: `classify_inbound` was not
-        // updated when the envelope went 0x03 -> 0x04 in 2026-06-27.
-        assert_eq!(
-            classify_inbound(&[crate::ack::ACK_BATCH_MSG_TYPE]),
-            InboundKind::AckBatch
-        );
+    fn ack_v4_is_not_misrouted_to_another_handler() {
         assert_ne!(
-            classify_inbound(&[crate::ack::ACK_BATCH_MSG_TYPE]),
+            classify_inbound(&[crate::fec::feedback::FEC_ACK_V4_MSG_TYPE]),
             InboundKind::TileNack
         );
     }

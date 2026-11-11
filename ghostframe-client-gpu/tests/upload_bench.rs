@@ -518,7 +518,6 @@ fn mixed_batch_flush_and_publish() {
             tile_delivery: TileDelivery::Payload,
             cdf53_wire: false,
             display: None,
-            fec_framing: false,
         },
         0,
     );
@@ -527,7 +526,7 @@ fn mixed_batch_flush_and_publish() {
         .iter()
         .enumerate()
     {
-        cdf.extend(core.handle_datagram(d, i as u64 * 1_000));
+        cdf.extend(core.handle_datagram(&ghostframe_client_core::frame_one(d), i as u64 * 1_000));
     }
 
     let at = |i: u32, row0: u32| (i % 60, row0 + i / 60);

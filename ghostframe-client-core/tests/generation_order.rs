@@ -5,7 +5,7 @@
 //! The 4-bit generation wraps at 16 and its "newer" test only separates
 //! generations less than 8 apart. A pass 9..=15 generations late used to read
 //! as *newer*: the client rewound the tile to that old generation, then
-//! dropped every pass of the real current one as stale, un-acked, leaving the
+//! dropped every pass of the real current one as stale, leaving the
 //! tile on old content. These tests drive `ClientCore::handle_datagram` so
 //! both consumers of the rule (coverage bookkeeping and the integrator gate in
 //! `reassembly`) are covered.
@@ -14,9 +14,11 @@
 //! of that generation's first datagram, so a generation's label is fixed and
 //! later generations carry larger ones. Fixtures follow that.
 
-use ghostframe_client_core::{ClientConfig, ClientCore, Event, PollOutput, TileDelivery};
-use ghostframe_protocol::ack::AckBatch;
+use ghostframe_client_core::{
+    frame_plain, ClientConfig, ClientCore, Event, PollOutput, TileDelivery,
+};
 use ghostframe_protocol::codec::cdf53;
+use ghostframe_protocol::fec::feedback::BundleAckBatch;
 use ghostframe_protocol::protocol::{fragment_tile, Codec, TileFragmentInputs, TILE_DATAGRAM_FLAG};
 use proptest::prelude::*;
 
@@ -32,7 +34,22 @@ fn core() -> ClientCore {
             tile_delivery: TileDelivery::Decoded,
             cdf53_wire: false,
             display: None,
-            fec_framing: false,
+        },
+        0,
+    );
+    while c.poll_transmit(0).is_some() {}
+    c
+}
+
+fn probe_core() -> ClientCore {
+    let mut c = ClientCore::new(
+        ClientConfig {
+            indices_raw_enabled: true,
+            supports_h264: true,
+            h264_acked_ref: false,
+            tile_delivery: TileDelivery::Payload,
+            cdf53_wire: false,
+            display: None,
         },
         0,
     );
@@ -146,10 +163,12 @@ fn model_render(g: &Generation) -> Vec<u8> {
 
 /// What one delivered datagram did.
 struct Effect {
-    /// The pass reached the integrator. Observed as its ACK: a stale pass is
-    /// dropped before integration and never acknowledged, an accepted one is
-    /// acknowledged right after. (Not as a `TileReady`: a pass that does not
-    /// change the picture -- pass 0 alone, a duplicate -- draws nothing.)
+    /// The pass reached the integrator. Observed as a `TilePayload` from a
+    /// second core fed the same datagrams in `Payload` mode: a stale pass is
+    /// dropped before integration and produces none, an accepted one does.
+    /// (Not as a `TileReady`: a pass that does not change the picture -- pass
+    /// 0 alone, a duplicate -- draws nothing. Not as an ACK: the bundle that
+    /// carried a stale pass is acknowledged all the same, it arrived.)
     accepted: bool,
     /// Pixels of the `TileReady` it produced, if it drew anything.
     rgba: Option<Vec<u8>>,
@@ -157,6 +176,8 @@ struct Effect {
 
 struct Rig {
     core: ClientCore,
+    /// Sees the same datagrams in `Payload` mode, to tell acceptance.
+    probe: ClientCore,
     now_us: u64,
     next_wire_seq: u32,
 }
@@ -165,24 +186,26 @@ impl Rig {
     fn new() -> Self {
         Self {
             core: core(),
+            probe: probe_core(),
             now_us: 0,
             next_wire_seq: 1000,
         }
     }
 
-    /// Deliver pass `pass` of `g` as a fresh transmission and report whether
-    /// it was accepted and acknowledged.
+    /// Deliver pass `pass` of `g` in a bundle of its own and report whether it
+    /// was accepted and whether its bundle was acknowledged.
     fn deliver(&mut self, g: &Generation, pass: u8) -> (Effect, bool) {
         let wire_seq = self.next_wire_seq;
         self.next_wire_seq += 1;
         self.deliver_bytes(datagram(g, pass, wire_seq), wire_seq)
     }
 
-    /// Deliver an already-built datagram that carries transmission id
-    /// `wire_seq`.
+    /// Deliver an already-built datagram in the PLAIN bundle `wire_seq`.
     fn deliver_bytes(&mut self, bytes: Vec<u8>, wire_seq: u32) -> (Effect, bool) {
         self.now_us += 1000;
-        let events = self.core.handle_datagram(&bytes, self.now_us);
+        let frame = frame_plain(wire_seq, &[&bytes]);
+        let events = self.core.handle_datagram(&frame, self.now_us);
+        let payloads = self.probe.handle_datagram(&frame, self.now_us);
         let mut effect = Effect {
             accepted: false,
             rgba: None,
@@ -200,18 +223,22 @@ impl Rig {
                 }
             }
         }
-        // Flush the ACK batcher and look for this transmission.
+        effect.accepted = payloads.iter().any(|ev| {
+            matches!(ev, Event::TilePayload { tile_x, tile_y, .. }
+                if (*tile_x, *tile_y) == (TILE_X, TILE_Y))
+        });
+        // Flush the ACK batcher and look for this bundle.
         self.now_us += 100_000;
         let _ = self.core.on_timeout(self.now_us);
         let mut acked = false;
         while let Some(out) = self.core.poll_transmit(self.now_us) {
             if let PollOutput::Datagram(dg) = out {
-                if let Ok(batch) = AckBatch::decode(&dg) {
-                    acked |= batch.entries.iter().any(|e| e.wire_seq == wire_seq);
+                if let Ok(batch) = BundleAckBatch::decode(&dg) {
+                    acked |= batch.entries.iter().any(|e| e.bundle_seq == wire_seq);
                 }
             }
         }
-        effect.accepted = acked;
+        // The probe core is never polled: only this one answers.
         (effect, acked)
     }
 }
@@ -241,7 +268,10 @@ fn a_late_pass_of_an_old_generation_does_not_replace_the_current_one() {
             !e.accepted,
             "k={k}: a {k}-generations-old pass was accepted"
         );
-        assert!(!acked, "k={k}: a stale pass was acknowledged");
+        assert!(
+            acked,
+            "k={k}: the bundle of a stale pass is still acknowledged"
+        );
         // Everything else of the current generation must still be accepted
         // and acknowledged, and render the current content.
         let mut last = None;
@@ -324,7 +354,8 @@ fn a_garbage_datagram_with_a_far_label_does_not_freeze_the_tile() {
     let ws = rig.next_wire_seq;
     rig.next_wire_seq += 1;
     let (e, acked) = rig.deliver_bytes(garbage_datagram(2, 1_000_100, 0, ws), ws);
-    assert!(!e.accepted && !acked, "garbage must not be accepted");
+    assert!(!e.accepted, "garbage must not be accepted");
+    assert!(acked, "but its bundle arrived");
 
     let last = deliver_all(&mut rig, &g3, 0..14);
     assert_eq!(last.unwrap(), model_render(&g3));
@@ -394,7 +425,8 @@ fn an_aliased_generation_with_a_newer_label_renders_the_new_content_exactly() {
 
     // And a late pass of the old content is stale, though its number matches.
     let (e, acked) = rig.deliver(&old, 7);
-    assert!(!e.accepted && !acked, "old content merged into the new");
+    assert!(!e.accepted, "old content merged into the new");
+    assert!(acked, "but its bundle arrived");
 }
 
 /// CDF 5/3, then ten generations of PalRle/Solid that do not touch the CDF
@@ -532,7 +564,7 @@ proptest! {
                 gi, g.generation, g.label, pass, effect.accepted,
                 newest_seen, all[newest_seen].generation, all[newest_seen].label
             );
-            prop_assert_eq!(acked, expect, "ack disagrees with acceptance");
+            prop_assert!(acked, "every arrived bundle is acknowledged, accepted or not");
             if *gi == newest {
                 last_newest_rgba = effect.rgba.or(last_newest_rgba);
             }
