@@ -1779,7 +1779,9 @@ impl IoBridge {
                         min_bytes: p.min_bytes,
                         bytes_sent_before: p.bytes_sent,
                     };
-                    p.bytes_sent = p.bytes_sent.saturating_add(dg.len() as i64);
+                    p.bytes_sent = p.bytes_sent.saturating_add(
+                        crate::transport::fec_tx::packer::Packer::lone_bundle_len(dg.len()) as i64,
+                    );
                     p.packets_sent = p.packets_sent.saturating_add(1);
                     tag
                 });
@@ -2647,6 +2649,7 @@ impl IoBridge {
                     idr_reentry = h.idr_by_cause[IdrCause::Reentry.index()],
                     idr_mtu_shrink = h.idr_by_cause[IdrCause::MtuShrink.index()],
                     idr_encoder_fault = h.idr_by_cause[IdrCause::EncoderFault.index()],
+                    idr_content_rejected = h.idr_by_cause[IdrCause::ContentRejected.index()],
                     send_too_large = h.send_too_large,
                     oversize_h264 = h.oversize_h264,
                     oversize_tile = h.oversize_tile,
@@ -2709,6 +2712,7 @@ impl IoBridge {
                     idr_resolution = r.idr_resolution,
                     idr_client_reset = r.idr_client_reset,
                     idr_encoder_fault = r.idr_encoder_fault,
+                    idr_content_rejected = r.idr_content_rejected,
                     idr_mtu_shrink = r.idr_mtu_shrink,
                     mtu_retired = r.mtu_retired,
                     mtu_retired_idr = r.mtu_retired_idr,

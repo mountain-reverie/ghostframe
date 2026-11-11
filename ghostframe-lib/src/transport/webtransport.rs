@@ -145,6 +145,10 @@ pub struct WebTransportServer {
     /// the repair-status tag: the FEC v2 rev 6 client-to-server status stream.
     /// The tag byte is consumed; everything after it is status records.
     repair_status_streams: std::collections::HashSet<StreamId>,
+    /// Repair-status streams the peer finished or reset since the last
+    /// [`Self::drain_ended_status_streams`]: the bridge frees the reader it
+    /// keeps for each, or a client could never reopen one.
+    ended_status_streams: Vec<StreamId>,
     /// Streams whose first payload byte said "ordinary feedback": not looked
     /// at again.
     feedback_classified: std::collections::HashSet<StreamId>,
@@ -168,6 +172,7 @@ impl WebTransportServer {
             stats_stream: None,
             stats_tail: Vec::new(),
             repair_status_streams: std::collections::HashSet::new(),
+            ended_status_streams: Vec::new(),
             feedback_classified: std::collections::HashSet::new(),
             abandoned_streams: std::collections::HashSet::new(),
             origin_policy: Arc::new(OriginPolicy::default()),
@@ -335,8 +340,23 @@ impl WebTransportServer {
         self.stream_bufs.remove(&sid);
         self.abandoned_streams.remove(&sid);
         self.wt_header_stripped.remove(&sid);
-        self.repair_status_streams.remove(&sid);
+        if self.repair_status_streams.remove(&sid) {
+            self.ended_status_streams.push(sid);
+        }
         self.feedback_classified.remove(&sid);
+    }
+
+    /// The repair-status streams that ended since the last call. Call after
+    /// [`Self::drain_feedback_routed`]: bytes read before the end are in that
+    /// queue, and the reader must outlive them.
+    pub fn drain_ended_status_streams(&mut self) -> Vec<StreamId> {
+        std::mem::take(&mut self.ended_status_streams)
+    }
+
+    /// Unit tests: the peer finished `sid`.
+    #[cfg(test)]
+    pub(crate) fn test_end_stream(&mut self, sid: StreamId) {
+        self.stream_ended(sid);
     }
 
     /// Called when quinn-proto reports `StreamEvent::Readable { id }`.

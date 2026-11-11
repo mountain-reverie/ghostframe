@@ -35,6 +35,12 @@ impl IoBridge {
         let fit_limit = self.live_max_dg().map(|max_dg| self.inner_limit(max_dg));
         #[cfg(test)]
         let fit_limit = self.forced_datagram_limit_for_test.or(fit_limit);
+        // A sealed bundle quinn refused stands in front of everything: no
+        // record is taken from the queue until it is accepted (nothing is
+        // admitted into a full send buffer, and nothing is sent out of order).
+        if !self.pending_bundles.is_empty() && !self.drive_pending_bundles() {
+            return pacing::Stop::Rejected;
+        }
         while let Some(emission) = self.reliable_emitter.next_emission() {
             let Emission::Source(bytes, class) = &emission;
             let (bytes, class) = (bytes.clone(), *class);
@@ -92,6 +98,11 @@ impl IoBridge {
             if !self.reliable_emitter.settle_emission(emission, outcome) {
                 return pacing::Stop::Rejected;
             }
+            // The record is in a bundle that quinn just refused: stop before
+            // offering the next one rather than after.
+            if !self.pending_bundles.is_empty() {
+                return pacing::Stop::Rejected;
+            }
         }
         pacing::Stop::Empty
     }
@@ -136,6 +147,23 @@ impl IoBridge {
             Some(t) => t.records().map(|(_, c)| Some(c)).collect(),
             None => vec![Self::content_of_untracked(emission)],
         };
+        self.retire_oversize_contents(contents, tracked, now);
+    }
+
+    /// What retiring an oversize datagram does for each thing it carried: a
+    /// tile is re-encoded fresh, an H.264 fragment is removed and its frame
+    /// treated as lost (`h264_refs_oversize`), padding is dropped. `tracked`:
+    /// the ledger held the transmission, so each H.264 record is counted
+    /// `tx_forgotten`. Shared by a datagram retired from the emission queue
+    /// and a sealed bundle the path no longer carries.
+    pub(super) fn retire_oversize_contents(
+        &mut self,
+        contents: Vec<Option<crate::transport::reliable_emitter::Content>>,
+        tracked: bool,
+        now: std::time::Instant,
+    ) {
+        use crate::transport::reliable_emitter::Content;
+        let mut retired_frames: smallvec::SmallVec<[u32; 4]> = smallvec::SmallVec::new();
         for content in contents {
             match content {
                 Some(Content::Tile(key)) => {
@@ -157,9 +185,10 @@ impl IoBridge {
                     }
                     self.h264.stats.oversize_h264 += 1;
                     self.reliable_emitter.h264.remove(frame_seq, frag_idx);
-                    if self.h264_refs_live() {
-                        // The frame is lost as far as the manager is concerned,
-                        // and it picks the recovery.
+                    // The frame is lost as far as the manager is concerned,
+                    // and it picks the recovery; once per frame.
+                    if self.h264_refs_live() && !retired_frames.contains(&frame_seq) {
+                        retired_frames.push(frame_seq);
                         self.h264_refs_oversize(frame_seq, now);
                     }
                 }
@@ -179,10 +208,18 @@ impl IoBridge {
     fn content_of_untracked(
         emission: &crate::transport::reliable_emitter::emission_queue::Emission,
     ) -> Option<crate::transport::reliable_emitter::Content> {
-        use crate::transport::protocol::{FrameHeader, FRAME_FLAG_PAD, FRAME_HEADER_SIZE};
         use crate::transport::reliable_emitter::emission_queue::Emission;
-        use crate::transport::reliable_emitter::Content;
         let Emission::Source(bytes, class) = emission;
+        Self::content_of_datagram(bytes, *class)
+    }
+
+    /// [`Self::content_of_untracked`] for a datagram already in hand.
+    pub(super) fn content_of_datagram(
+        bytes: &[u8],
+        class: WireClass,
+    ) -> Option<crate::transport::reliable_emitter::Content> {
+        use crate::transport::protocol::{FrameHeader, FRAME_FLAG_PAD, FRAME_HEADER_SIZE};
+        use crate::transport::reliable_emitter::Content;
         // A tile datagram sets the top bit of its first byte.
         if bytes.len() < FRAME_HEADER_SIZE
             || bytes[0] & 0x80 != 0
@@ -903,7 +940,8 @@ impl IoBridge {
                 // cluster's running total *before* this datagram (goog_cc's
                 // `probe_cluster_bytes_sent` semantics), so it must be read
                 // before `bytes_sent` is advanced by this datagram's size.
-                let dg_len = dg.len() as i64;
+                let dg_len =
+                    crate::transport::fec_tx::packer::Packer::lone_bundle_len(dg.len()) as i64;
                 let probe_tag = self.active_probe.as_mut().map(|p| {
                     let tag = crate::transport::reliable_emitter::cache::ProbeTag {
                         id: p.id,

@@ -7,7 +7,7 @@
 //! sample buffer), not on a mock.
 
 use super::*;
-use crate::transport::reliable_emitter::{Content, EmitKey, RetxCause};
+use crate::transport::reliable_emitter::{Content, EmitKey};
 use ghostframe_protocol::fec::feedback::{
     BundleAck, BundleAckBatch, LossReport, RepairAsk, RepairRequest,
 };
@@ -296,20 +296,16 @@ async fn recovered_does_not_touch_the_loss_window() {
 }
 
 #[tokio::test]
-async fn content_rejected_of_a_live_tile_record_queues_a_retransmit() {
+async fn content_rejected_of_a_live_tile_record_leaves_the_bundle_alone() {
     let mut b = bridge();
     let ws = seed(&mut b, 2);
-    assert_eq!(b.reliable_emitter.stats.loss_path_resends, 0);
     b.handle_status_record(StatusRecord::ContentRejected(vec![(ws[1], 0)]));
     assert_eq!(b.fec_in.content_rejected_rx, 1);
     assert_eq!(b.fec_in.content_rejected_unknown, 0);
-    let mut n = 0;
-    b.reliable_emitter
-        .tick_loss_budgeted(now_std(), usize::MAX, usize::MAX, &mut n);
-    assert_eq!(n, 1, "exactly the rejected pass is sent again");
-    assert_eq!(b.reliable_emitter.stats.loss_path_resends, 1);
-    // The acknowledged-nothing ledger entry is untouched: a rejection is not a
-    // verdict on the bundle.
+    assert_eq!(b.fec_in.content_rejected_tile, 1);
+    // A rejection is not a verdict on the bundle, and nothing is resent from
+    // the cache: the tile is re-encoded fresh.
+    assert_eq!(b.reliable_emitter.stats.loss_path_resends, 0);
     assert!(b.transmission_ledger.peek(ws[1]).is_some());
 }
 
@@ -332,11 +328,8 @@ async fn content_rejected_after_the_ack_is_found_in_the_recent_ring() {
     assert_eq!(b.recent_bundles.len(), 1);
     b.handle_status_record(StatusRecord::ContentRejected(vec![(ws[0], 0)]));
     assert_eq!(b.fec_in.content_rejected_rx, 1);
-    assert_eq!(
-        b.fec_in.content_rejected_unknown, 0,
-        "found in the ring (its content was released by the ack, so nothing is queued)"
-    );
-    assert_eq!(b.reliable_emitter.stats.verdict_content_gone, 1);
+    assert_eq!(b.fec_in.content_rejected_unknown, 0, "found in the ring");
+    assert_eq!(b.fec_in.content_rejected_tile, 1);
 }
 
 #[tokio::test]
@@ -535,8 +528,45 @@ async fn status_records_from_a_session_that_is_not_live_are_dropped_and_forget_c
 }
 
 #[tokio::test]
-async fn an_unused_content_variant_keeps_the_rejected_cause_distinct() {
-    // `Rejected` must not alias `Loss` in the cause the emitter queues.
-    assert_ne!(RetxCause::Rejected, RetxCause::Loss);
-    let _ = Content::Pad(0);
+async fn a_finished_status_stream_frees_its_slot_so_the_client_can_reopen_one() {
+    let mut b = bridge();
+    let ws = seed(&mut b, 1);
+    let stream = |i| StreamId::new(Side::Client, Dir::Bi, i);
+    let mut tagged = vec![FEC_REPAIR_STATUS_STREAM_TAG];
+    tagged.extend(status_bytes(&[StatusRecord::Recovered(vec![ws[0]])]));
+    for i in 0..8 {
+        feed(&mut b, stream(i), &tagged);
+    }
+    assert_eq!(
+        b.status_streams.len(),
+        8,
+        "premise: the per-handle cap is full"
+    );
+    let mut late = vec![FEC_REPAIR_STATUS_STREAM_TAG];
+    late.extend(status_bytes(&[StatusRecord::ContentRejected(vec![(
+        ws[0], 0,
+    )])]));
+    feed(&mut b, stream(9), &late);
+    assert_eq!(
+        b.fec_in.content_rejected_rx, 0,
+        "premise: a ninth stream is refused while eight are held"
+    );
+
+    // The client finished its first stream.
+    b.wt_sessions
+        .get_mut(&H)
+        .unwrap()
+        .test_end_stream(stream(0));
+    b.dispatch_drained_feedback();
+    assert_eq!(
+        b.status_streams.len(),
+        7,
+        "the closed stream's slot is freed"
+    );
+
+    feed(&mut b, stream(10), &late);
+    assert_eq!(
+        b.fec_in.content_rejected_rx, 1,
+        "a reopened stream is served"
+    );
 }

@@ -27,7 +27,13 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct OfferedBytes {
     pub bytes: [u64; WireClass::COUNT],
+    /// Billing entries per class: one per record, and one `Control` entry per
+    /// bundle for its frame header. Not the number of datagrams quinn took;
+    /// that is `bundles`.
     pub datagrams: [u64; WireClass::COUNT],
+    /// Bundles accepted by quinn: one datagram each, and one departure-tracker
+    /// entry each.
+    pub bundles: u64,
     /// WebTransport framing added in front of every datagram.
     pub overhead: u64,
 }
@@ -624,6 +630,10 @@ pub struct InstrumentSummary {
     pub loss_by_time_threshold: u64,
     pub loss_by_pto: u64,
     pub ledger_spurious_losses: u64,
+    /// Records in the transmissions the ledger declared lost, and in those
+    /// later contradicted (see `LedgerStats::lost_records`).
+    pub ledger_lost_records: u64,
+    pub ledger_spurious_lost_records: u64,
     pub k_pkt: u64,
     pub k_pkt_raises: u64,
     /// The reordering window now (microseconds), its raises, and the largest

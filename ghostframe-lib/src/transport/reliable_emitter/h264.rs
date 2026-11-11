@@ -509,38 +509,6 @@ mod emitter_tests {
     }
 
     #[test]
-    fn a_rejection_is_treated_like_a_verdict_idr_resent_p_not() {
-        let t = Instant::now();
-        let mut e = ReliableTileEmitter::new(t);
-        submit(&mut e, 1, true, 2, t);
-        submit(&mut e, 2, false, 2, t);
-        let ws: Vec<u32> = e.take_transmissions().iter().map(|x| x.wire_seq).collect();
-        let idr = Content::H264Frag {
-            frame_seq: 1,
-            frag_idx: 0,
-        };
-        let p = Content::H264Frag {
-            frame_seq: 2,
-            frag_idx: 0,
-        };
-        assert_eq!(
-            e.request_retransmit(p, ws[2], RetxCause::Rejected),
-            RetxRequest::NotRetransmitted,
-            "the manager recovers a refused P fragment, as for a loss"
-        );
-        assert_eq!(e.stats.h264_p_verdicts_not_resent, 1);
-        assert_eq!(
-            e.request_retransmit(idr, ws[0], RetxCause::Rejected),
-            RetxRequest::Queued
-        );
-        let mut n = 0;
-        e.tick_loss_budgeted(t, usize::MAX, usize::MAX, &mut n);
-        assert_eq!(n, 1);
-        assert_eq!(e.stats.h264_idr_resends, 1);
-        assert_eq!(e.stats.h264_p_verdicts_not_resent, 1, "only the P one");
-    }
-
-    #[test]
     fn an_acknowledgement_releases_the_fragment_once_whichever_transmission_it_named() {
         let t = Instant::now();
         let mut e = ReliableTileEmitter::new(t);
