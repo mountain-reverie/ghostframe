@@ -620,6 +620,14 @@ impl IoBridge {
             // rejects them by design -- that rejection is the intended
             // handling, not a fallthrough.
             K::AckBatchV1 => self.dispatch_ack_datagram(dg),
+            // FEC v2 rev 6 client feedback (docs/specs/fec-v2/fec-v2-rev6.md
+            // §6.2). No client sends these until the framing lands (R6-c);
+            // until then they are counted as unroutable, as they were when
+            // they classified as `Unknown`.
+            K::LossReport | K::AckBatchV4 | K::RepairRequest => {
+                self.unroutable_inbound_datagrams =
+                    self.unroutable_inbound_datagrams.saturating_add(1);
+            }
             K::Empty
             | K::Unknown
             | K::Hello
