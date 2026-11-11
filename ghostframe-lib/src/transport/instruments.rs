@@ -501,6 +501,10 @@ pub struct AdmissionCounters {
     /// is expected while video plays; the bound P2a states is for the gated
     /// classes.
     pub ungated_at_depth: u64,
+    /// Short bundles (`len + 64 < max_dg`) quinn accepted while its FIFO was
+    /// non-empty and the previous accepted bundle was short too: the pairs
+    /// that can share one QUIC packet and so one loss. Observability only.
+    pub short_bundle_shared_risk: u64,
 }
 
 // ---------------------------------------------------------------------------
