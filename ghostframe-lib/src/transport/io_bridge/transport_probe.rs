@@ -157,6 +157,12 @@ impl IoBridge {
         // estimator, and its adapted threshold would carry over.
         self.transmission_ledger.reset_session();
         self.recent_bundles.clear();
+        // Rev 6 framing: the packer's open bundle and sequence, the bundles
+        // quinn has not taken and the parked record meta are the old
+        // session's too.
+        self.packer.reset();
+        self.pending_bundles.clear();
+        self.emitted_meta.clear();
         // And what was waiting to be reported about it: a loss of the old
         // path handed to the new connection's estimator at its first
         // acknowledgement, and the late-ack marks that name the old session's
@@ -185,6 +191,12 @@ impl IoBridge {
                 crate::transport::reliable_emitter::Content::H264Frag { .. }
             ) {
                 self.h264.stats.tx_recorded += 1;
+            }
+            if self.fec_framing {
+                // The ledger is keyed by bundle: the record waits here for
+                // the packer (see `bundle_tx`).
+                self.park_emitted(e);
+                continue;
             }
             self.transmission_ledger.record(
                 e.wire_seq,
