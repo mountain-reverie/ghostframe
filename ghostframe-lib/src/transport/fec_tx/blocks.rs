@@ -43,6 +43,8 @@ struct Open {
     bundle_seqs: Vec<u32>,
     kinds: Vec<SourceKind>,
     first_sealed_at_us: u64,
+    /// Longest coded symbol so far, kept so the MTU test is O(1) per send.
+    longest: usize,
 }
 
 #[derive(Debug, Default)]
@@ -73,10 +75,12 @@ impl BlockBuilder {
                 bundle_seqs: Vec::new(),
                 kinds: Vec::new(),
                 first_sealed_at_us: now_us,
+                longest: 0,
             });
             self.next_id = self.next_id.wrapping_add(1);
         }
         let o = self.open.as_mut().expect("just opened");
+        o.longest = o.longest.max(symbol.len());
         o.symbols.push(symbol);
         o.bundle_seqs.push(bundle_seq);
         o.kinds.push(kind);
@@ -96,10 +100,14 @@ impl BlockBuilder {
 
     /// A repair of the open block's longest symbol no longer fits `max_dg`.
     pub(crate) fn outgrown_by(&self, max_dg: usize) -> bool {
-        self.open.as_ref().is_some_and(|o| {
-            let longest = o.symbols.iter().map(Vec::len).max().unwrap_or(0);
-            longest + FEC_REPAIR_HEADER_LEN > max_dg
-        })
+        self.open
+            .as_ref()
+            .is_some_and(|o| o.longest + FEC_REPAIR_HEADER_LEN > max_dg)
+    }
+
+    /// When the open block's first source was sealed (microseconds).
+    pub(crate) fn first_sealed_at_us(&self) -> Option<u64> {
+        self.open.as_ref().map(|o| o.first_sealed_at_us)
     }
 
     /// Closes the open block, if it has sources.

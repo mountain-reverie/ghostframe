@@ -436,6 +436,7 @@ fn sized_bundle(len: usize) -> crate::transport::fec_tx::packer::SealedBundle {
         records: Default::default(),
         emit_us: 0,
         kind: crate::transport::fec_tx::packer::BundleKind::Plain,
+        block: None,
     }
 }
 
@@ -628,6 +629,7 @@ fn repair_bundle(
         records: Default::default(),
         emit_us: 0,
         kind: crate::transport::fec_tx::packer::BundleKind::Repair,
+        block: None,
     }
 }
 
