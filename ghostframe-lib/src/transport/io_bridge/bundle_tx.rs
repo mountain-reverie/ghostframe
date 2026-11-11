@@ -23,7 +23,7 @@
 //!    `Control`, so `offered_total == quinn_bytes_enqueued` holds.
 
 use super::*;
-use crate::transport::fec_tx::packer::{Packer, RecordMeta, SealedBundle};
+use crate::transport::fec_tx::packer::{BundleKind, Packer, RecordMeta, SealedBundle};
 use crate::transport::reliable_emitter::emitter::EmittedDatagram;
 use crate::transport::reliable_emitter::traits::SendOutcome;
 use crate::transport::reliable_emitter::Content;
@@ -473,16 +473,23 @@ impl IoBridge {
         } else if over {
             self.instr.admission.ungated_at_depth += 1;
         }
-        self.admission.charge(control_wire);
-        self.instr.admission.soft_charged_bytes += control_wire as u64;
+        // A REPAIR frame paid its whole length when it was admitted
+        // (`AdmitClass::Critical`), so only the QUIC framing is charged here.
+        let repair = b.kind == BundleKind::Repair;
+        let soft_charge = if repair { framing } else { control_wire };
+        self.admission.charge(soft_charge);
+        self.instr.admission.soft_charged_bytes += soft_charge as u64;
         for r in &b.records {
             self.instr
                 .offered
                 .bill(r.class, r.len + FEC_RECORD_LEN_PREFIX, 0);
         }
-        self.instr
-            .offered
-            .bill(WireClass::Control, control_dg, framing);
+        let (class, dg) = if repair {
+            (WireClass::Repair, b.bytes.len())
+        } else {
+            (WireClass::Control, control_dg)
+        };
+        self.instr.offered.bill(class, dg, framing);
         self.instr.offered.bundles += 1;
         self.instr.fifo_peak_at_enqueue = self.instr.fifo_peak_at_enqueue.max(queued);
         // Short bundles back to back in a non-empty FIFO can share a QUIC

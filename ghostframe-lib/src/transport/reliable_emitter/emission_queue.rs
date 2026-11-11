@@ -28,10 +28,12 @@ pub enum WireClass {
     H264,
     /// Datagrams that are no tile pass: frame dimensions, pongs, eviction.
     Control,
+    /// A FEC REPAIR frame (a bundle with no records), billed whole.
+    Repair,
 }
 
 impl WireClass {
-    pub(crate) const COUNT: usize = 7;
+    pub(crate) const COUNT: usize = 8;
     #[cfg(test)]
     pub(crate) const ALL: [WireClass; Self::COUNT] = [
         WireClass::Critical,
@@ -41,6 +43,7 @@ impl WireClass {
         WireClass::SchedulerRetry,
         WireClass::H264,
         WireClass::Control,
+        WireClass::Repair,
     ];
 
     pub const fn index(self) -> usize {

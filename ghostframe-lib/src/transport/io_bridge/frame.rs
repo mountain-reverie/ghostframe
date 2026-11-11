@@ -2531,6 +2531,7 @@ impl IoBridge {
                 offered_scheduler_retry_B = ins.offered.of(WireClass::SchedulerRetry),
                 offered_h264_B = ins.offered.of(WireClass::H264),
                 offered_control_B = ins.offered.of(WireClass::Control),
+                offered_repair_B = ins.offered.of(WireClass::Repair),
                 offered_overhead_B = ins.offered.overhead,
                 offered_total_B = ins.offered.total(),
                 quinn_bytes_enqueued = ins.quinn_bytes_enqueued,
