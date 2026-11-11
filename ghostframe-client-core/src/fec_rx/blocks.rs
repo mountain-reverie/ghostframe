@@ -61,6 +61,8 @@ pub struct BlockStats {
     pub repair_wasted: u64,
     pub rejected_symbols: u64,
     pub malformed: u64,
+    /// SOURCE frames of a block too old to track: declined or released long ago, not dispatched.
+    pub stale_dropped: u64,
     pub blocks_closed_complete: u64,
     pub blocks_unrecoverable: u64,
     pub requests: u64,
@@ -179,7 +181,7 @@ impl Default for BlockStore {
 /// `id` is no newer than `newest` by more than the window (wrapping).
 fn too_old(newest: u16, id: u16) -> bool {
     let behind = newest.wrapping_sub(id);
-    behind > FEC_RX_BLOCK_WINDOW && behind < 0x8000
+    (FEC_RX_BLOCK_WINDOW..0x8000).contains(&behind)
 }
 
 fn ahead(id: u16, newest: u16) -> bool {
@@ -347,8 +349,14 @@ impl BlockStore {
     fn on_source(&mut self, f: SourceFrame<'_>, now_us: u64, out: &mut RxOutcome) {
         let Some(bi) = self.block_index(f.block_id, now_us) else {
             // Closed or stale block. A block that closed complete has delivered
-            // every source already; otherwise the records are new to us.
-            if self.closed_state(f.block_id) != Some(true) {
+            // every source already; otherwise the records are new to us, unless
+            // the block is so old that it was declined or released long ago and
+            // the content would paint stale pixels.
+            if self.blocks.iter().all(|b| b.id != f.block_id)
+                && self.newest.is_some_and(|n| too_old(n, f.block_id))
+            {
+                self.stats.stale_dropped += 1;
+            } else if self.closed_state(f.block_id) != Some(true) {
                 dispatch(
                     f.records,
                     f.bundle_seq,
@@ -367,6 +375,8 @@ impl BlockStore {
         let b = &mut self.blocks[bi];
         let last_k = f.last.then(|| u16::from(f.idx) + 1);
         let conflict = match (b.k, last_k) {
+            // idx 255 with LAST would make k 256, which no block can have.
+            (_, Some(256)) => true,
             (Some(k), Some(l)) => u16::from(k) != l,
             (Some(k), None) => f.idx >= k,
             (None, Some(l)) => b.sources.len() > usize::from(l),
@@ -507,7 +517,7 @@ impl BlockStore {
             let k_known = b.k.map(usize::from);
             if b.unrecoverable {
                 self.give_up(i, DeclineReason::InvalidSymbol);
-            } else if b.requested || k_known.is_some_and(|k| b.held() >= k) {
+            } else if b.requested || b.sticky.is_some() || k_known.is_some_and(|k| b.held() >= k) {
                 self.give_up(i, sticky);
             } else {
                 let (have, missing) = match k_known {
@@ -724,17 +734,10 @@ mod tests {
         let o = s.on_datagram(&rep(9, 3, 4, 1, 0, &sym), T); // k = 4: disagrees
         assert_eq!(o.arrival, Some(9));
         assert_eq!(s.stats().rejected_symbols, 1);
-        // Close: first a request (k known = 3, have 2, missing 1), then the mismatch.
+        // A marked block declines at its first close, with no request first.
         let a = s.on_timeout(T + WINDOW);
         assert_eq!(a.len(), 1);
-        match a[0] {
-            CloseAction::Request(ask) => {
-                assert_eq!((ask.block_id, ask.have, ask.missing), (3, 2, 1));
-                assert_eq!(ask.first_new_idx, 0);
-            }
-            other => panic!("{other:?}"),
-        }
-        let a = s.on_timeout(T + 2 * WINDOW + 1);
+        assert_eq!(s.stats().requests, 0);
         match a[0] {
             CloseAction::Decline {
                 block_id,
@@ -756,8 +759,7 @@ mod tests {
         s.on_datagram(&rep(9, 3, 5, 2, 0, &[0u8; 20]), T);
         s.on_datagram(&rep(10, 3, 5, 2, 1, &[0u8; 21]), T);
         assert_eq!(s.stats().rejected_symbols, 1);
-        s.on_timeout(T + WINDOW);
-        let a = s.on_timeout(T + 2 * WINDOW + 1);
+        let a = s.on_timeout(T + WINDOW);
         assert!(matches!(
             a[0],
             CloseAction::Decline {
@@ -1044,5 +1046,37 @@ mod tests {
                 let _ = s.on_timeout(now + 50_000);
             }
         }
+    }
+
+    #[test]
+    fn block_exactly_one_window_behind_is_stale_and_not_dispatched() {
+        let w = FEC_RX_BLOCK_WINDOW;
+        let mut s = BlockStore::new();
+        let newest = 2000u16;
+        s.on_datagram(&src(1, newest, 0, false, &recs(&[b"n"])), T);
+        // One short of the window: still tracked, dispatched.
+        let o = s.on_datagram(&src(2, newest - (w - 1), 0, false, &recs(&[b"a"])), T);
+        assert_eq!(o.records.len(), 1);
+        assert_eq!(s.stats().stale_dropped, 0);
+        // Exactly the window behind: its ring slot is the newest block's.
+        let o = s.on_datagram(&src(3, newest - w, 0, false, &recs(&[b"b"])), T);
+        assert_eq!(o.arrival, Some(3));
+        assert!(o.records.is_empty());
+        assert_eq!(s.stats().stale_dropped, 1);
+    }
+
+    #[test]
+    fn last_source_at_idx_255_is_a_header_mismatch() {
+        let mut s = BlockStore::new();
+        s.on_datagram(&src(1, 3, 255, true, &recs(&[b"z"])), T);
+        assert_eq!(s.stats().rejected_symbols, 1);
+        let acts = s.on_timeout(T + WINDOW);
+        assert!(matches!(
+            acts[..],
+            [CloseAction::Decline {
+                reason: DeclineReason::HeaderMismatch,
+                ..
+            }]
+        ));
     }
 }
