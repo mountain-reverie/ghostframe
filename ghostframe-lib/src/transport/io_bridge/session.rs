@@ -527,37 +527,33 @@ impl IoBridge {
         // Rev 6 framing: what the live session's packer still holds goes out
         // before the notice, and the notice is a lone PLAIN frame (framed by
         // a throwaway packer when `handle` is no longer the live session).
-        let framed_live = self.fec_framing && self.last_hello_from == Some(handle);
+        let framed_live = self.last_hello_from == Some(handle);
         if framed_live {
             self.flush_bundles();
         }
         if let Some(conn) = self.server.connections.get_mut(&handle) {
             if let Some(wt) = self.wt_sessions.get_mut(&handle) {
                 for _ in 0..EVICTION_REPEATS {
-                    let frame: std::borrow::Cow<[u8]> = if self.fec_framing {
-                        let Some(max_dg) = conn
-                            .datagrams()
-                            .max_size()
-                            .map(|raw| raw.saturating_sub(wt.datagram_framing_len()))
-                            .filter(|&m| m > 0)
-                        else {
-                            break;
-                        };
-                        let mut scratch;
-                        let packer = if framed_live {
-                            &mut self.packer
-                        } else {
-                            scratch = crate::transport::fec_tx::packer::Packer::new();
-                            &mut scratch
-                        };
-                        let bundles = packer.lone(&datagram, max_dg);
-                        match bundles.into_iter().next_back() {
-                            Some(b) => std::borrow::Cow::Owned(b.bytes),
-                            None => break,
-                        }
-                    } else {
-                        std::borrow::Cow::Borrowed(&datagram[..])
+                    let Some(max_dg) = conn
+                        .datagrams()
+                        .max_size()
+                        .map(|raw| raw.saturating_sub(wt.datagram_framing_len()))
+                        .filter(|&m| m > 0)
+                    else {
+                        break;
                     };
+                    let mut scratch;
+                    let packer = if framed_live {
+                        &mut self.packer
+                    } else {
+                        scratch = crate::transport::fec_tx::packer::Packer::new();
+                        &mut scratch
+                    };
+                    let bundles = packer.lone(&datagram, max_dg);
+                    let Some(b) = bundles.into_iter().next_back() else {
+                        break;
+                    };
+                    let frame = b.bytes;
                     // Deliberately discarded: `Disabled` means the session
                     // is already gone (the outcome we are driving towards)
                     // and `Blocked` means quinn's send buffer is full,

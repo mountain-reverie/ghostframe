@@ -758,7 +758,6 @@ mod tests {
             indices_raw_enabled: false,
             supports_h264: false,
             display: None,
-            fec_framing: false,
         };
         let mut c = ghostframe_client_net::ClientNet::new(cfg, 0).unwrap();
         c.connect("[::1]:443".parse().unwrap(), 0).unwrap();

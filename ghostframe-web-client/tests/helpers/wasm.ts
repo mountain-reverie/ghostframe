@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Datagram-builder helpers shared by the suites that drive WasmClientCore's
 // tile reassembly directly (tile_assembly.test.ts, cdf53_globals.test.ts,
-// eviction.test.ts).
+// eviction.test.ts), plus the framing wrappers they feed the core through.
 //
 // This file used to also hold Clock/AckHarness/NackHarness/
 // parseNackEnvelopeNested, adapting the wasm ACK/NACK batchers' poll-and-
@@ -10,7 +10,33 @@
 // duplicated ghostframe-client-core's oracle_*.rs tests), so that adapter
 // code went with them — fragmentTile is the only survivor.
 
+import * as wasm from '../../pkg-node/ghostframe_client_wasm.js';
+
 const TILE_DATAGRAM_FLAG = 0x80000000;
+
+/**
+ * One rev 6 PLAIN frame carrying `records` as bundle `bundleSeq`. Every
+ * datagram a `WasmClientCore` accepts is a frame, so a suite that feeds it a
+ * bare record wraps it with this (built by the Rust `frame_plain`, through
+ * `framePlainForTest`, so the framing is never re-implemented here).
+ */
+export function framePlain(bundleSeq: number, records: Uint8Array[]): Uint8Array {
+  const total = records.reduce((n, r) => n + r.length, 0);
+  const concat = new Uint8Array(total);
+  let off = 0;
+  for (const r of records) {
+    concat.set(r, off);
+    off += r.length;
+  }
+  return wasm.framePlainForTest(bundleSeq, concat, Uint32Array.from(records.map((r) => r.length)));
+}
+
+let nextBundleSeq = 0;
+
+/** [`framePlain`] with one record and a fresh `bundle_seq` per call. */
+export function frameOne(record: Uint8Array): Uint8Array {
+  return framePlain(nextBundleSeq++, [record]);
+}
 
 function u32be(n: number): number[] {
   return [(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff];

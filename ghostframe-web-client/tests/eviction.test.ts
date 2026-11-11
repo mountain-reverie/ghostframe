@@ -7,19 +7,19 @@
 // ghostframe-client-core/src/reassembly.rs's `is_eviction_sentinel` routing.
 import { describe, it, expect } from 'vitest';
 import * as wasm from '../pkg-node/ghostframe_client_wasm.js';
-import { fragmentTile, buildEvictionDatagram } from './helpers/wasm.js';
+import { fragmentTile, buildEvictionDatagram, frameOne } from './helpers/wasm.js';
 
 const EVICTION_REASON_DISPLACED = 1; // EvictionReason::DisplacedByNewSession::to_byte()
 const SOLID_CODEC = 3; // ghostframe_protocol::protocol::Codec::Solid
 
 function newCore(): InstanceType<typeof wasm.WasmClientCore> {
-  return new wasm.WasmClientCore(false, false, false, 0n, false);
+  return new wasm.WasmClientCore(false, false, false, 0n);
 }
 
 describe('eviction notice', () => {
   it('surfaces as an Evicted event carrying the reason code', () => {
     const core = newCore();
-    const events = core.handleDatagram(buildEvictionDatagram(EVICTION_REASON_DISPLACED), 0n) as any[];
+    const events = core.handleDatagram(frameOne(buildEvictionDatagram(EVICTION_REASON_DISPLACED)), 0n) as any[];
     const evicted = events.filter((e) => e.kind === 'Evicted');
     expect(evicted).toHaveLength(1);
     expect(evicted[0].reason).toBe(EVICTION_REASON_DISPLACED);
@@ -30,7 +30,7 @@ describe('eviction notice', () => {
     // disconnect the client.
     const core = newCore();
     for (const f of fragmentTile(7, 3, 4, SOLID_CODEC, 1, 0, new Uint8Array(4), 8)) {
-      expect((core.handleDatagram(f, 0n) as any[]).filter((e) => e.kind === 'Evicted')).toHaveLength(0);
+      expect((core.handleDatagram(frameOne(f), 0n) as any[]).filter((e) => e.kind === 'Evicted')).toHaveLength(0);
     }
   });
 });

@@ -1,4 +1,4 @@
-//! The packer at `send_counted` (`TransportConfig::fec_framing`, R6-c task C5).
+//! The packer at `send_counted` (R6-c task C5).
 //!
 //! A unit bridge has no quinn connection, so the sends go to
 //! `IoBridge::test_wire`, which accepts or refuses whole frames; everything
@@ -24,7 +24,6 @@ fn framed_bridge() -> IoBridge {
     let mut b = IoBridge::new_with_stream_for_test(ours, server);
     b.wt_sessions.insert(H, WebTransportServer::default());
     b.last_hello_from = Some(H);
-    b.set_fec_framing(true);
     b.test_wire = Some(bundle_tx::TestWire::default());
     b.forced_raw_datagram_size_for_test = Some(RAW);
     b
@@ -401,13 +400,10 @@ async fn forgetting_the_live_session_resets_the_packer() {
 }
 
 #[tokio::test]
-async fn record_limit_sizes_the_drain_and_the_frame_path_when_framing_is_on() {
+async fn record_limit_sizes_the_drain_and_the_frame_path() {
     let mut b = framed_bridge();
     let limit = ghostframe_lib_packer_limit(RAW - 1);
     assert_eq!(b.inner_limit(RAW - 1), limit);
-    b.set_fec_framing(false);
-    assert_eq!(b.inner_limit(RAW - 1), RAW - 1);
-    b.set_fec_framing(true);
     // A record just over the limit is retired, not packed.
     let now = now_std();
     let mut dg = vec![0u8; limit + 1];

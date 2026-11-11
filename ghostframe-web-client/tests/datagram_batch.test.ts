@@ -5,13 +5,13 @@
 // change rather than a cost change.
 import { describe, it, expect } from 'vitest';
 import * as wasm from '../pkg-node/ghostframe_client_wasm.js';
-import { fragmentTile } from './helpers/wasm.js';
+import { fragmentTile, framePlain } from './helpers/wasm.js';
 import { protocol } from '../src/protocol_constants';
 
 function newCore() {
   // Decoded delivery: CDF 5/3 tiles complete as TileReady events (the point
   // here is event identity and order, not pixel content).
-  return new wasm.WasmClientCore(false, false, false, 0n, false);
+  return new wasm.WasmClientCore(false, false, false, 0n);
 }
 
 function scene(): Uint8Array[] {
@@ -32,7 +32,8 @@ function scene(): Uint8Array[] {
   }
   // Interleave: round-robin over the per-tile fragment lists is enough to
   // vary arrival order versus generation order.
-  return out.reverse();
+  // Every datagram travels in a PLAIN frame of its own.
+  return out.reverse().map((d, i) => framePlain(i, [d]));
 }
 
 function concat(dgs: Uint8Array[]): { bytes: Uint8Array; lens: Uint32Array } {

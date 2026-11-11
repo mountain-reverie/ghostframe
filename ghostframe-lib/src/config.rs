@@ -251,10 +251,6 @@ pub struct TransportConfig {
     /// as [`H264_DEFAULT_FPS`]. The encoder's per-frame budget is the rate
     /// divided by it.
     pub capture_fps: u32,
-    /// Send every datagram inside the FEC v2 rev 6 framing (PLAIN bundles,
-    /// bundle-keyed ledger). Off by default: the client must speak it too
-    /// (`ClientConfig::fec_framing`). No environment variable.
-    pub fec_framing: bool,
 }
 
 /// Which H.264 encoder backends the daemon may open
@@ -450,7 +446,6 @@ impl TransportConfig {
             h264_backend: H264BackendChoice::parse(get("GHOSTFRAME_H264_BACKEND").as_deref()),
             openh264_lib: openh264_lib_from_lookup(&get),
             capture_fps: 0,
-            fec_framing: false,
         }
     }
 
@@ -501,9 +496,9 @@ fn loss_injector_from_lookup(
     fn predicate_tile(dg: &[u8]) -> bool {
         !dg.is_empty() && (dg[0] & 0x80) != 0
     }
-    // ACK_BATCH_MSG_TYPE = 0x02 (see transport/ack.rs).
+    // ACK v4 (0x08), the only ACK the server decodes.
     fn predicate_ack(dg: &[u8]) -> bool {
-        dg.first().copied() == Some(crate::transport::ack::ACK_BATCH_MSG_TYPE)
+        dg.first().copied() == Some(ghostframe_protocol::fec::feedback::FEC_ACK_V4_MSG_TYPE)
     }
     // PalRle tile datagrams: tile datagram flag set, codec field = PalRle (2),
     // payload byte 0 has bundle flag set (0x01).

@@ -27,14 +27,6 @@ import init, {
 /** Microsecond clock for every `now_us` parameter WasmClientCore expects. */
 const nowUs = (): bigint => BigInt(Math.round(performance.now() * 1000));
 
-/**
- * FEC v2 rev 6 framing (bundle_seq datagram framing, repair-status stream).
- * Drives both the core's `fec_framing` constructor argument and the receive
- * loop's short-datagram guard. Stays false until R6-c turns the server and
- * the client on together.
- */
-const FEC_FRAMING = false;
-
 const statusEl = document.getElementById('status')!;
 const logEl = document.getElementById('log')!;
 const canvasEl = document.getElementById('canvas') as HTMLCanvasElement;
@@ -189,7 +181,7 @@ async function main() {
   // validated-but-undecoded payloads for the GPU (TileDelivery::Payload).
   // Passing false would silently route tiles down the native Decoded path
   // and hand back RGBA instead — wrong, and it would look like it worked.
-  const core = new WasmClientCore(true, renderer.h264Supported, true, nowUs(), FEC_FRAMING);
+  const core = new WasmClientCore(true, renderer.h264Supported, true, nowUs());
 
   // Per-tile Cdf53 coverage, for e2e assertions.
   //
@@ -813,30 +805,15 @@ async function main() {
   // Receive datagrams. Ping/pong text, frame-level H.264 reassembly and
   // tile-level reassembly all used to be hand-routed here; the wasm core
   // now owns reassembly for both, so the
-  // loop reduces to a length guard, the ping/pong backward-compat carve-out
-  // (which predates the tile protocol and the core has no concept of it —
-  // it must run before handleDatagram ever sees the bytes), and rendering
-  // whatever events come back.
+  // loop reduces to an empty-datagram guard and rendering whatever events
+  // come back. Every datagram is a rev 6 FEC frame; a pong is one too, and
+  // the core ignores its record.
   const reader = transport.datagrams.readable.getReader();
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
 
     if (!value || value.byteLength === 0) continue;
-
-    // Backward compat: small text datagrams (ping/pong). NOT protocol —
-    // this predates the tile protocol and the core has no concept of it,
-    // so it must be handled before handleDatagram ever sees the bytes.
-    // Under framing every datagram goes to the core (no text carve-out).
-    if (!FEC_FRAMING && value.byteLength < 20) {
-      const text = new TextDecoder().decode(value);
-      log(`Received: ${text} (${value.byteLength} bytes)`);
-      if (text === 'pong') {
-        statusEl.textContent = 'Ping/Pong successful!';
-        log('M0 COMPLETE: Ping/Pong datagram round-trip verified!');
-      }
-      continue;
-    }
 
     // Queue, don't process: the batch crosses into wasm once per rAF tick
     // (or sooner under backlog) instead of once per datagram. See

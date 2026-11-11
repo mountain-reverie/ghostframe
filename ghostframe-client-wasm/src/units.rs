@@ -8,7 +8,6 @@
 //! Nothing in `main.ts` should use these — it drives `WasmClientCore`.
 
 use ghostframe_client_core::{
-    ack_batcher::AckBatcher,
     cdf53_coverage::{self, CoverageEntry},
     cdf53_prevalidate,
     decode_error_batcher::{DecodeErrorBatcher, DECODE_ERROR_MSG_TYPE},
@@ -18,12 +17,11 @@ use ghostframe_client_core::{
     palette_shadow::PaletteShadow,
     DecodeErrorCode,
 };
-use ghostframe_protocol::ack::{AckBatch, AckEntry};
 use ghostframe_protocol::protocol::{Codec, TileNackEnvelope};
 use wasm_bindgen::prelude::*;
 
 use crate::boundary::{
-    WasmAckEntry, WasmArrivalOutcome, WasmNackEntry, WasmPrevalidatedCdf53, WasmPrevalidatedPalRle,
+    WasmArrivalOutcome, WasmNackEntry, WasmPrevalidatedCdf53, WasmPrevalidatedPalRle,
 };
 
 // `Option<Vec<u8>>` crosses the boundary as `Uint8Array | undefined`, so the
@@ -56,74 +54,20 @@ fn decode_error_code_from_u8(v: u8) -> Option<DecodeErrorCode> {
     })
 }
 
-#[wasm_bindgen]
-pub struct WasmAckBatcher {
-    inner: AckBatcher,
-}
-
-#[wasm_bindgen]
-impl WasmAckBatcher {
-    #[wasm_bindgen(constructor)]
-    pub fn new() -> WasmAckBatcher {
-        WasmAckBatcher {
-            inner: AckBatcher::new(),
-        }
+/// One rev 6 PLAIN frame (`bundle_seq`, then records), for the vitest suites
+/// that feed datagrams to `WasmClientCore`: every datagram the core accepts is
+/// a frame. `records_concat` is the records back to back and `lens` their
+/// lengths, in order.
+#[wasm_bindgen(js_name = framePlainForTest)]
+pub fn frame_plain_for_test(bundle_seq: u32, records_concat: &[u8], lens: &[u32]) -> Vec<u8> {
+    let mut at = 0usize;
+    let mut records: Vec<&[u8]> = Vec::with_capacity(lens.len());
+    for &len in lens {
+        let end = at + len as usize;
+        records.push(&records_concat[at..end]);
+        at = end;
     }
-
-    /// Returns the encoded datagram when the fresh-entry cap forces an
-    /// immediate flush, otherwise `undefined`.
-    pub fn add(
-        &mut self,
-        wire_seq: u32,
-        arrival_time_ms_lo16: u16,
-        now_us: u64,
-    ) -> Option<Vec<u8>> {
-        self.inner.add(
-            AckEntry {
-                wire_seq,
-                arrival_time_ms_lo16,
-            },
-            now_us,
-        )
-    }
-
-    #[wasm_bindgen(js_name = pollTimeout)]
-    pub fn poll_timeout(&self) -> Option<u64> {
-        self.inner.poll_timeout()
-    }
-
-    #[wasm_bindgen(js_name = onTimeout)]
-    pub fn on_timeout(&mut self, now_us: u64) -> Option<Vec<u8>> {
-        self.inner.on_timeout(now_us)
-    }
-
-    pub fn flush(&mut self) -> Option<Vec<u8>> {
-        self.inner.flush()
-    }
-}
-
-impl Default for WasmAckBatcher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Decodes an ACK envelope — the replacement for the TS suite's
-/// `parseAckEnvelopeForTest`. Returns an array of entries with named fields,
-/// or `undefined` on a malformed envelope — `serde_wasm_bindgen` maps
-/// `Option::None` to `undefined`, matching every other export here.
-///
-/// The TS `parseAckEnvelopeForTest` it replaces *throws* instead. Returning
-/// a value is deliberate: it lets a suite assert rejection without
-/// `expect(...).toThrow`. No existing test depends on either behaviour —
-/// every TS call site passes a well-formed envelope the batcher just
-/// produced, so the malformed path is currently unexercised.
-#[wasm_bindgen(js_name = parseAckEnvelope)]
-pub fn parse_ack_envelope(bytes: &[u8]) -> Result<JsValue, JsValue> {
-    let entries: Option<Vec<WasmAckEntry>> = AckBatch::decode(bytes)
-        .ok()
-        .map(|b| b.entries.iter().map(WasmAckEntry::from).collect());
-    serde_wasm_bindgen::to_value(&entries).map_err(|e| JsValue::from_str(&e.to_string()))
+    ghostframe_client_core::frame_plain(bundle_seq, &records)
 }
 
 #[wasm_bindgen]
@@ -170,7 +114,7 @@ impl WasmNackBatcher {
     }
 
     /// Flushes pending entries immediately, bypassing the deadline.
-    /// `undefined` when nothing is queued. Mirrors `WasmAckBatcher::flush`
+    /// `undefined` when nothing is queued. Mirrors `flush` of the other batchers
     /// and the TS `flushNow`.
     pub fn flush(&mut self) -> Option<Vec<u8>> {
         self.inner.flush()

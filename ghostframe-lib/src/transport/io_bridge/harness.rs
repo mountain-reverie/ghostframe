@@ -353,13 +353,6 @@ impl IoBridge {
         ));
     }
 
-    /// Send every datagram inside the rev 6 framing (see
-    /// `TransportConfig::fec_framing`). Call before the first datagram is built.
-    #[cfg(any(test, feature = "browserless-harness"))]
-    pub fn set_fec_framing(&mut self, on: bool) {
-        self.fec_framing = on;
-    }
-
     /// Drop every client tile NACK at the door (see `ignore_tile_nacks`).
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn set_ignore_tile_nacks(&mut self, ignore: bool) {

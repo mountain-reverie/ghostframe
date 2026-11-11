@@ -11,7 +11,6 @@ fuzz_target!(|data: &[u8]| {
         indices_raw_enabled: true,
         supports_h264: false,
         display: None,
-        fec_framing: false,
     };
     let mut client = ClientNet::new(cfg, 0).expect("new");
     let from = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 443);

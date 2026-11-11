@@ -12,7 +12,7 @@
 // calls, against `pkg-node`, rather than duplicating its logic.
 import { describe, it, expect } from 'vitest';
 import * as wasm from '../pkg-node/ghostframe_client_wasm.js';
-import { fragmentTile } from './helpers/wasm.js';
+import { fragmentTile, frameOne } from './helpers/wasm.js';
 import { recordProtocolEvent, type ProtocolGlobals, type Cdf53ErrorCodes } from '../src/cdf53_globals.js';
 
 const CDF53_CODEC = 5; // ghostframe_protocol::protocol::Codec::Cdf53
@@ -46,7 +46,7 @@ function validCdf53PassPayload(): Uint8Array {
  * true` is what makes arrivals surface as `TilePayload`/`DecodeError`
  * instead of `TileReady`. */
 function newPayloadCore(): InstanceType<typeof wasm.WasmClientCore> {
-  return new wasm.WasmClientCore(true, true, true, 0n, false);
+  return new wasm.WasmClientCore(true, true, true, 0n);
 }
 
 describe('protocol-derived test globals move (docs/specs/wasm-cutover-main-ts-map.md Part 3)', () => {
@@ -76,7 +76,7 @@ describe('protocol-derived test globals move (docs/specs/wasm-cutover-main-ts-ma
     // the 9-byte payload is well under the 1200-byte MTU budget.
     const validFrags = fragmentTile(1, 3, 4, CDF53_CODEC, /*gen*/ 1, /*pass*/ 0, validCdf53PassPayload(), 1200);
     expect(validFrags.length).toBe(1);
-    const validEvents = core.handleDatagram(validFrags[0], 0n) as any[];
+    const validEvents = core.handleDatagram(frameOne(validFrags[0]), 0n) as any[];
     expect(validEvents.some((e) => e.kind === 'TilePayload' && e.data.codec === 'Cdf53')).toBe(true);
     for (const ev of validEvents) recordProtocolEvent(globals, ev, codes, 1);
 
@@ -93,7 +93,7 @@ describe('protocol-derived test globals move (docs/specs/wasm-cutover-main-ts-ma
     // Err(Cdf53BadPass) }`) -> DecodeError{codec: Cdf53, code:
     // ERR_CDF53_BAD_PASS}.
     const badFrags = fragmentTile(2, 3, 4, CDF53_CODEC, /*gen*/ 1, /*pass*/ 14, validCdf53PassPayload(), 1200);
-    const badEvents = core.handleDatagram(badFrags[0], 0n) as any[];
+    const badEvents = core.handleDatagram(frameOne(badFrags[0]), 0n) as any[];
     expect(badEvents.some((e) => e.kind === 'DecodeError' && e.codec === CDF53_CODEC)).toBe(true);
     for (const ev of badEvents) recordProtocolEvent(globals, ev, codes, 2);
 

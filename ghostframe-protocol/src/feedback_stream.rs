@@ -16,12 +16,10 @@
 //! ## What is *not* in this namespace
 //!
 //! Datagram envelopes ([`crate::protocol::TILE_NACK_ENVELOPE`] = 0x05 and
-//! [`crate::ack::ACK_BATCH_MSG_TYPE`] = 0x06) travel as QUIC datagrams, a
+//! [`crate::fec::feedback::FEC_ACK_V4_MSG_TYPE`] = 0x08) travel as QUIC datagrams, a
 //! different channel, and are routed by a different dispatcher. NACK already
 //! reuses a byte value that means something else here (0x05); that is
 //! harmless only because the channels never share a dispatcher. Never route a byte from one channel through the other's.
-//! (The ACK batch moved 0x04 -> 0x06 for an entry-format change, skipping
-//! 0x05 so it could not alias the NACK envelope.)
 
 /// Receiver loss/suspension report (see [`crate::feedback::ReceiverFeedback`]).
 pub const FEEDBACK_MSG_TYPE: u8 = 0x01;
@@ -143,7 +141,6 @@ pub const FEEDBACK_STREAM_MSG_TYPES: [u8; 8] = [
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ack::ACK_BATCH_MSG_TYPE;
 
     #[test]
     fn stream_message_types_are_distinct() {
@@ -155,13 +152,6 @@ mod tests {
             );
         }
         assert_eq!(seen.len(), FEEDBACK_STREAM_MSG_TYPES.len());
-    }
-
-    #[test]
-    fn ack_batch_does_not_alias_any_stream_type() {
-        // The ACK batch is a datagram, but keep its byte off the stream
-        // namespace anyway so a dump of either channel is unambiguous.
-        assert!(!FEEDBACK_STREAM_MSG_TYPES.contains(&ACK_BATCH_MSG_TYPE));
     }
 
     #[test]

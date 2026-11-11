@@ -41,7 +41,6 @@ impl WasmClientCore {
         supports_h264: bool,
         tile_delivery_payload: bool,
         now_us: u64,
-        fec_framing: bool,
     ) -> WasmClientCore {
         let config = ClientConfig {
             indices_raw_enabled,
@@ -58,7 +57,6 @@ impl WasmClientCore {
             },
             cdf53_wire: false,
             display: None,
-            fec_framing,
         };
         let mut core = ClientCore::new(config, now_us);
         core.set_client_version(crate::CLIENT_VERSION);

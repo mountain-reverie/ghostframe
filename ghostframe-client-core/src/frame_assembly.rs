@@ -12,12 +12,11 @@
 //! pipeline, so it cannot grow unboundedly under a flood of distinct
 //! `frame_seq` values.
 
-use ghostframe_protocol::ack::AckEntry;
-use ghostframe_protocol::protocol::{decode_frame_datagram, FrameHeader, FRAME_FLAG_PAD, NO_ACK};
+use ghostframe_protocol::protocol::{decode_frame_datagram, FrameHeader, FRAME_FLAG_PAD};
 
 use crate::event::Event;
 use crate::h264_gate::{RefuseCause, Verdict};
-use crate::{ClientCore, PollOutput, MAX_FRAME_FRAGMENTS, MAX_H264_ACCESS_UNIT_BYTES};
+use crate::{ClientCore, MAX_FRAME_FRAGMENTS, MAX_H264_ACCESS_UNIT_BYTES};
 
 /// How long an IDR assembly is exempt from the `latest - 2` window. The server
 /// sends an IDR's fragments again on a loss verdict and holds its P frames back
@@ -51,35 +50,19 @@ impl ClientCore {
         let (fh, payload) = match decode_frame_datagram(bytes) {
             Ok(x) => x,
             Err(_) => {
-                // Pre-ACK refusal: unframed, this fragment is not acknowledged.
                 self.reject_current_record();
                 return;
             }
         };
 
-        // A source fragment is acknowledged on receipt, whatever becomes of it:
-        // the acknowledgement says the datagram arrived, which is all the
-        // server's ledger and loss path ask of it. What the client then does
-        // with the frame (decode, refuse, drop it as stale) is no part of it.
-        // Anything the wire format cannot express as a fragment is dropped
-        // first, so it is not acknowledged, like an invalid tile.
+        // The bundle carrying a fragment is acknowledged on arrival
+        // (`FecRx`), whatever becomes of the fragment. Anything the wire format
+        // cannot express as a fragment is refused (CONTENT_REJECTED).
         if fh.frag_idx >= fh.frag_total || fh.frag_total > MAX_FRAME_FRAGMENTS {
             self.reject_current_record();
             return;
         }
-        // Under framing `FecRx` ACKs per bundle and owns loss accounting.
-        if fh.wire_seq != NO_ACK && self.current_record.is_none() {
-            self.wire_loss.on_received(fh.wire_seq);
-            let entry = AckEntry {
-                wire_seq: fh.wire_seq,
-                arrival_time_ms_lo16: ((now_us / 1000) & 0xFFFF) as u16,
-            };
-            if let Some(dg) = self.ack_batcher.add(entry, now_us) {
-                self.outbox.push_back(PollOutput::Datagram(dg));
-            }
-        }
-
-        // Probe padding is acknowledged (above) and nothing else: it names a
+        // Probe padding is acknowledged (with its bundle) and nothing else: it names a
         // frame the receiver has already seen and must not touch its assembly.
         if fh.flags & FRAME_FLAG_PAD != 0 {
             return;

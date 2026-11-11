@@ -1,8 +1,8 @@
-//! The rev 6 framing on the send side (`TransportConfig::fec_framing`): every
+//! The rev 6 framing on the send side: every
 //! datagram leaves inside a PLAIN bundle built by the per-session
 //! [`Packer`](crate::transport::fec_tx::packer::Packer).
 //!
-//! How a record travels, with framing on:
+//! How a record travels:
 //!
 //! 1. The emitter builds it (allocating its `wire_seq`, which is now a record
 //!    id) and reports `(wire_seq, content, emit_us)`. `record_emitted_transmissions`
@@ -63,7 +63,7 @@ pub(super) enum Offer {
 
 impl IoBridge {
     /// Offer `dg` to the live session's quinn connection, counting and
-    /// logging a refusal. Shared by the unframed and framed send paths.
+    /// logging a refusal.
     pub(super) fn offer_to_live(&mut self, dg: &[u8]) -> Offer {
         #[cfg(test)]
         if self.live_send_handle().is_none() {
@@ -127,9 +127,6 @@ impl IoBridge {
     /// and the sealed ones quinn has not taken. The depth gate counts them, or
     /// records admitted while a bundle fills would overshoot `D_target`.
     pub(super) fn unsent_bundle_bytes(&self) -> usize {
-        if !self.fec_framing {
-            return 0;
-        }
         self.packer.open_bytes()
             + self
                 .pending_bundles
@@ -155,13 +152,9 @@ impl IoBridge {
     }
 
     /// The longest inner datagram for a path datagram of `max_dg` bytes: the
-    /// packer's record limit with framing on, `max_dg` itself without.
+    /// packer's record limit.
     pub(super) fn inner_limit(&self, max_dg: usize) -> usize {
-        if self.fec_framing {
-            Packer::record_limit(max_dg)
-        } else {
-            max_dg
-        }
+        Packer::record_limit(max_dg)
     }
 
     /// Move what the emitter built into `emitted_meta`.
@@ -177,12 +170,8 @@ impl IoBridge {
         self.emitted_meta.insert(e.wire_seq, e);
     }
 
-    /// [`TransmissionLedger::take_undeparted`] for a record id: with framing on
-    /// a record has no ledger entry of its own, only its parked meta.
+    /// A record has no ledger entry of its own, only its parked meta.
     pub(super) fn take_undeparted_record(&mut self, wire_seq: u32) -> Option<Transmission> {
-        if !self.fec_framing {
-            return self.transmission_ledger.take_undeparted(wire_seq);
-        }
         let e = self.emitted_meta.remove(&wire_seq)?;
         Some(Transmission::single(
             e.emit_us,
@@ -195,19 +184,14 @@ impl IoBridge {
     }
 
     /// A record consumed before it reached the wire by a harness hook (the
-    /// loss injector, the drop plan). Without framing it departs and is lost.
-    /// With it the record becomes a transmission of its own, keyed by a
+    /// loss injector, the drop plan). The record becomes a transmission of its own, keyed by a
     /// `bundle_seq` taken from the packer (the client sees the gap and counts
     /// a pre-FEC loss, which is what it is), and departs now without ever
     /// being offered to quinn: the loss path declares it lost and
-    /// retransmits it, as it does an unframed datagram. Like the unframed
-    /// path it bills nothing here; the drain already admitted the record.
+    /// retransmits it. It bills nothing here; the drain already admitted the
+    /// record.
     #[cfg(any(test, feature = "test-loss-injection"))]
     pub(super) fn consumed_before_wire(&mut self, wire_seq: Option<u32>, dg_len: usize) {
-        if !self.fec_framing {
-            self.departed_without_quinn(wire_seq);
-            return;
-        }
         let Some(ws) = wire_seq else { return };
         let now = now_std();
         self.record_emitted_transmissions(now);
@@ -347,9 +331,6 @@ impl IoBridge {
     /// Seal the open bundle and offer every pending one to quinn. True when
     /// none is left standing.
     pub(super) fn flush_bundles(&mut self) -> bool {
-        if !self.fec_framing {
-            return true;
-        }
         if let Some(b) = self.packer.flush() {
             self.queue_bundles(SmallVec::from_elem(b, 1));
         }

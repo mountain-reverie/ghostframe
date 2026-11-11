@@ -57,39 +57,17 @@
 #define CACHE_CAPACITY 32768
 
 /**
- * ACK envelope wire-format version. Bumped 0x04 → 0x06 in 2026-09-17 when
- * entries switched from naming a tile-pass to naming a transmission.
- * 0x05 is skipped: it is `TILE_NACK_ENVELOPE`, and an ACK batch landing in
- * the NACK handler would be silently dropped by the wrong decoder — a
- * collision this project has already shipped once and caught late.
- *
- * Old clients/servers are not wire-compatible with new; both sides ship in
- * lockstep, and the bumped byte makes a stale binary fail loud with
- * `WrongMsgType` rather than mis-parse.
- */
-#define ACK_BATCH_MSG_TYPE 6
-
-/**
  * Maximum number of *fresh* entries the client packs into one batch
- * before flushing (mirrors `MAX_ACK_ENTRIES` in ack.ts). Used for the
- * roundtrip-size tests; the wire-acceptance cap is below.
+ * before flushing.
  */
 #define MAX_FRESH_ENTRIES_PER_BATCH 64
 
 /**
- * Trailing overlap count the client appends to each batch (mirrors
- * `ACK_OVERLAP_COUNT` in ack.ts). A single dropped ACK batch
- * therefore needs ACK_OVERLAP_COUNT + 1 consecutive drops to lose
+ * Trailing overlap count the client appends to each batch. A single dropped
+ * ACK batch therefore needs ACK_OVERLAP_COUNT + 1 consecutive drops to lose
  * any entry.
  */
 #define ACK_OVERLAP_COUNT 8
-
-/**
- * Wire-acceptance cap for one ACK batch: fresh + overlap.
- */
-#define MAX_ACK_ENTRIES_PER_BATCH (MAX_FRESH_ENTRIES_PER_BATCH + ACK_OVERLAP_COUNT)
-
-#define ACK_ENTRY_SIZE 6
 
 /**
  * Number of progressive passes emitted per Cdf53 tile.

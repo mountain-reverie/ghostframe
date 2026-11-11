@@ -14,7 +14,6 @@
 //! `#[allow]` with a reason, so every exception is a decision on the record.
 #![cfg_attr(not(test), warn(clippy::wildcard_enum_match_arm))]
 
-pub mod ack_batcher;
 pub mod cdf53_coverage;
 pub mod cdf53_prevalidate;
 pub mod cdf53_tile_state;
@@ -46,7 +45,6 @@ pub use wire_loss::WireLossStats;
 
 use std::collections::{HashMap, VecDeque};
 
-use ack_batcher::AckBatcher;
 use decode_error_batcher::DecodeErrorBatcher;
 use frame_assembly::FrameAssembly;
 use loss_tracker::LossTracker;
@@ -149,9 +147,6 @@ pub struct ClientConfig {
     /// What the client knows about its own display. `None` if the client
     /// cannot determine it, in which case no DisplayInfo message is sent.
     pub display: Option<ClientDisplay>,
-    /// rev 6 framing: every incoming datagram is an FEC frame. Off until the
-    /// server sends it (R6-c), then removed.
-    pub fec_framing: bool,
 }
 
 /// What the client knows about its own display. Deliberately NOT named
@@ -169,7 +164,7 @@ pub struct ClientDisplay {
     pub mm_height: u16,
 }
 
-/// Where the record being dispatched came from, while framing is on.
+/// Where the record being dispatched came from.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RecordCtx {
     pub(crate) bundle_seq: u32,
@@ -177,17 +172,47 @@ pub(crate) struct RecordCtx {
     pub(crate) rebuilt: bool,
 }
 
+/// Test support: one rev 6 PLAIN frame carrying `records` as `bundle_seq`.
+/// Every datagram a `ClientCore` accepts is a frame, so a test that feeds the
+/// core a bare record wraps it with this.
+#[doc(hidden)]
+pub fn frame_plain(bundle_seq: u32, records: &[&[u8]]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for r in records {
+        ghostframe_protocol::fec::frame::push_record(&mut body, r);
+    }
+    ghostframe_protocol::fec::frame::PlainFrame {
+        bundle_seq,
+        records: &body,
+    }
+    .encode()
+}
+
+/// Test support: [`frame_plain`] with one record and a `bundle_seq` taken from
+/// a per-thread counter, for tests that feed the core one bare record at a
+/// time and do not care which bundle it travelled in.
+#[doc(hidden)]
+pub fn frame_one(record: impl AsRef<[u8]>) -> Vec<u8> {
+    thread_local! {
+        static NEXT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    let seq = NEXT.with(|n| {
+        let v = n.get();
+        n.set(v.wrapping_add(1));
+        v
+    });
+    frame_plain(seq, &[record.as_ref()])
+}
+
 pub struct ClientCore {
-    /// rev 6 framing state; `Some` when `ClientConfig::fec_framing` is set.
-    pub(crate) fec: Option<fec_rx::FecRx>,
-    /// The record `handle_datagram_payloads` is currently handling (framing only).
+    /// rev 6 framing state: every incoming datagram is an FEC frame.
+    pub(crate) fec: fec_rx::FecRx,
+    /// The record `handle_datagram_payloads` is currently handling.
     pub(crate) current_record: Option<RecordCtx>,
     pub(crate) outbox: VecDeque<PollOutput>,
     /// Frame size last accepted from the server, if any. Tile coordinates
     /// are validated against the grid it implies.
     pub(crate) frame_dims: Option<(u32, u32)>,
-    pub(crate) wire_loss: wire_loss::WireLossTracker,
-    pub(crate) ack_batcher: AckBatcher,
     pub(crate) nack_batcher: NackBatcher,
     pub(crate) decode_error_batcher: DecodeErrorBatcher,
     pub(crate) loss_tracker: LossTracker,
@@ -248,12 +273,10 @@ pub struct ClientCore {
 impl ClientCore {
     pub fn new(config: ClientConfig, now_us: u64) -> Self {
         let mut core = ClientCore {
-            fec: config.fec_framing.then(fec_rx::FecRx::new),
+            fec: fec_rx::FecRx::new(),
             current_record: None,
             outbox: VecDeque::new(),
             frame_dims: None,
-            wire_loss: wire_loss::WireLossTracker::new(),
-            ack_batcher: AckBatcher::new(),
             nack_batcher: NackBatcher::new(),
             decode_error_batcher: DecodeErrorBatcher::new(),
             loss_tracker: LossTracker::new(),
@@ -479,20 +502,17 @@ impl ClientCore {
 
     /// Earliest deadline (µs) at which `on_timeout` must be called.
     ///
-    /// = min(ack batcher, nack batcher, coverage-NACK debounce, next
+    /// = min(FEC receiver (ACK v4 flush, blocks, report), nack batcher, coverage-NACK debounce, next
     /// tail sweep, next feedback emit, next local stats sample). The
     /// tail sweep and feedback deadlines are always armed (mirroring
     /// main.ts's always-running rAF loop / 100ms `setInterval`), so this
     /// is never `None` once the core has been constructed.
     pub fn poll_timeout(&self) -> Option<u64> {
         let mut deadline = self.next_tail_sweep_us.min(self.next_feedback_us);
-        if let Some(a) = self.ack_batcher.poll_timeout() {
-            deadline = deadline.min(a);
-        }
         if let Some(n) = self.nack_batcher.poll_timeout() {
             deadline = deadline.min(n);
         }
-        if let Some(f) = self.fec.as_ref().and_then(|f| f.poll_timeout()) {
+        if let Some(f) = self.fec.poll_timeout() {
             deadline = deadline.min(f);
         }
         if let Some(d) = self.pending_nack_deadline_us {
@@ -509,10 +529,10 @@ impl ClientCore {
         Some(deadline)
     }
 
-    /// Pre-FEC loss, loss-run lengths and FEC recoveries measured from
-    /// `wire_seq` gaps. Measurement only.
+    /// Pre-FEC loss and loss-run lengths measured from `bundle_seq` gaps (the
+    /// loss reporter's cumulative statistics). Measurement only.
     pub fn wire_loss_stats(&self) -> WireLossStats {
-        self.wire_loss.stats()
+        self.fec.wire_loss_stats()
     }
 
     /// Reassembly occupancy, for diagnostics and tests.
@@ -766,15 +786,18 @@ impl ClientCore {
     /// deadlines may be due in a single call. Returns no render events
     /// (`handle_datagram` is the sole source of `Event`s).
     pub fn on_timeout(&mut self, now_us: u64) -> Vec<Event> {
-        if let Some(dg) = self.ack_batcher.on_timeout(now_us) {
-            self.outbox.push_back(PollOutput::Datagram(dg));
-            if self.send_frame_acks {
-                if let Some(ack) = self.frame_acks.take_due(now_us) {
-                    self.push_frame_ack(ack);
-                }
-            }
-        } else if self.send_frame_acks {
-            if let Some(ack) = self.frame_acks.take_overdue(now_us) {
+        // `FecRx` flushes the ACK v4 batch (and the reports and repair
+        // requests) first: a frame ack goes out right behind a batch that left
+        // now, sharing its packet, and on its own once overdue.
+        let ack_flushed = self.fec.on_timeout(now_us);
+        self.drain_fec();
+        if self.send_frame_acks {
+            let ack = if ack_flushed {
+                self.frame_acks.take_due(now_us)
+            } else {
+                self.frame_acks.take_overdue(now_us)
+            };
+            if let Some(ack) = ack {
                 self.push_frame_ack(ack);
             }
         }
@@ -795,21 +818,16 @@ impl ClientCore {
             self.outbox.push_back(PollOutput::Stream(msg));
             self.next_feedback_us = now_us + FEEDBACK_INTERVAL_US;
         }
-        if let Some(fec) = self.fec.as_mut() {
-            fec.on_timeout(now_us);
-        }
-        self.drain_fec();
         Vec::new()
     }
 
     /// Move what `FecRx` queued (ACK v4, reports, repair requests, repair-status
     /// bytes) into the outbox.
     pub(crate) fn drain_fec(&mut self) {
-        let Some(fec) = self.fec.as_mut() else { return };
-        while let Some(d) = fec.take_datagram() {
+        while let Some(d) = self.fec.take_datagram() {
             self.outbox.push_back(PollOutput::Datagram(d));
         }
-        while let Some(b) = fec.take_status_bytes() {
+        while let Some(b) = self.fec.take_status_bytes() {
             self.outbox.push_back(PollOutput::RepairStatus(b));
         }
     }

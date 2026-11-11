@@ -1,4 +1,4 @@
-//! `ClientConfig::fec_framing`: datagrams arrive as rev 6 FEC frames, are
+//! The rev 6 framing: datagrams arrive as rev 6 FEC frames, are
 //! unbundled by `FecRx` and the records go through the ordinary tile path.
 
 use ghostframe_client_core::{ClientConfig, ClientCore, Event, PollOutput};
@@ -11,11 +11,10 @@ use ghostframe_protocol::protocol::{
     fragment_frame, fragment_tile, Codec, TileFragmentInputs, TILE_DATAGRAM_FLAG,
 };
 
-fn core(framing: bool) -> ClientCore {
+fn core() -> ClientCore {
     let mut c = ClientCore::new(
         ClientConfig {
             indices_raw_enabled: true,
-            fec_framing: framing,
             ..Default::default()
         },
         0,
@@ -80,21 +79,16 @@ fn only_tiles(evs: &[Event]) -> Vec<&Event> {
 }
 
 #[test]
-fn framed_tiles_match_unframed_and_ack_v4_only() {
+fn framed_tiles_are_delivered_and_ack_v4_only() {
     // A solid tile and a second solid tile at another position.
     let a = solid(3, 4);
     let b = solid(5, 6);
 
-    let mut plain = core(false);
-    let mut want = plain.handle_datagram(&a, 1_000);
-    want.extend(plain.handle_datagram(&b, 1_000));
-    assert_eq!(only_tiles(&want).len(), 2);
-
-    let mut framed = core(true);
+    let mut framed = core();
     let recs = records(&[&a, &b]);
     let dg = source(10, 1, 0, true, &recs).encode();
     let got = framed.handle_datagram(&dg, 1_000);
-    assert_eq!(got, want);
+    assert_eq!(only_tiles(&got).len(), 2);
 
     // Let the ACK batcher fire.
     let mut outs = drain(&mut framed, 1_000);
@@ -153,7 +147,7 @@ fn rebuilt_tile_is_delivered_and_recovered_is_reported() {
     }
     .encode();
 
-    let mut c = core(true);
+    let mut c = core();
     let mut evs = c.handle_datagram(&srcs[0].encode(), 1_000);
     evs.extend(c.handle_datagram(&srcs[2].encode(), 1_001));
     evs.extend(c.handle_datagram(&repair, 1_002));
@@ -187,7 +181,7 @@ fn rejected_cdf53_pass_reports_content_rejected() {
     // Truncated CDF 5/3 pass: fails prevalidation.
     let bad = tile(2, 4, 5, Codec::Cdf53, &[0x00, 0x01, 0xFF]);
     let recs = records(&[&good, &bad]);
-    let mut c = core(true);
+    let mut c = core();
     let evs = c.handle_datagram(&source(33, 2, 0, true, &recs).encode(), 1_000);
     assert!(evs.iter().any(|e| matches!(e, Event::DecodeError { .. })));
     let status: Vec<u8> = drain(&mut c, 1_000)
@@ -278,7 +272,7 @@ fn rebuilt_bundle_with_a_bad_pass_rejects_before_it_recovers() {
         payload: &rep[0],
     }
     .encode();
-    let mut c = core(true);
+    let mut c = core();
     c.handle_datagram(&srcs[0].encode(), 1_000);
     c.handle_datagram(&repair, 1_001);
     assert_eq!(
@@ -298,7 +292,7 @@ fn out_of_grid_tile_in_a_source_is_content_rejected() {
     let sentinel = tile(1, 0xFF, 0xFF, Codec::Solid, &dims);
     let outside = solid(200, 200);
     let recs = records(&[&sentinel, &outside]);
-    let mut c = core(true);
+    let mut c = core();
     let evs = c.handle_datagram(&source(50, 3, 0, true, &recs).encode(), 1_000);
     assert!(only_tiles(&evs).is_empty());
     assert_eq!(
@@ -311,14 +305,7 @@ fn out_of_grid_tile_in_a_source_is_content_rejected() {
 fn h264_fragment_under_framing_is_acked_once_in_v4_only() {
     let mut dg = fragment_frame(4, 0, true, &[7u8; 100], 1200).remove(0);
     dg[8..12].copy_from_slice(&5u32.to_be_bytes()); // a tracked wire_seq
-    let mut plain = core(false);
-    plain.handle_datagram(&dg, 1_000);
-    assert!(
-        ack_types(&mut plain, 1_000).contains(&0x06),
-        "control: unframed ACKs it as v3"
-    );
-
-    let mut c = core(true);
+    let mut c = core();
     c.handle_datagram(&source(60, 1, 0, true, &records(&[&dg])).encode(), 1_000);
     let types = ack_types(&mut c, 1_000);
     assert!(!types.contains(&0x06), "{types:?}");
@@ -329,7 +316,7 @@ fn h264_fragment_under_framing_is_acked_once_in_v4_only() {
 fn h264_fragment_with_bad_index_in_a_source_is_content_rejected() {
     let mut dg = fragment_frame(4, 0, true, &[7u8; 100], 1200).remove(0);
     dg[4..6].copy_from_slice(&1u16.to_be_bytes()); // frag_idx 1 >= frag_total 1
-    let mut c = core(true);
+    let mut c = core();
     c.handle_datagram(&source(70, 2, 0, true, &records(&[&dg])).encode(), 1_000);
     assert_eq!(
         status_records(&mut c, 1_000),
@@ -342,7 +329,7 @@ fn h264_fragment_dropped_after_the_ack_point_is_not_rejected() {
     // A probe pad is acknowledged and then ignored: not a refusal.
     let mut dg = fragment_frame(4, 0, true, &[7u8; 100], 1200).remove(0);
     dg[16] |= 0x10; // FRAME_FLAG_PAD
-    let mut c = core(true);
+    let mut c = core();
     c.handle_datagram(&source(71, 2, 0, true, &records(&[&dg])).encode(), 1_000);
     assert!(status_records(&mut c, 1_000).is_empty());
 }
@@ -355,7 +342,7 @@ fn good_cdf53_pass_under_framing_is_neither_v3_acked_nor_rejected() {
         p.extend_from_slice(&[0x00, 0x01, 0xFF]);
     }
     let t = tile_pass(3, 1, 1, 0, &p);
-    let mut c = core(true);
+    let mut c = core();
     let evs = c.handle_datagram(&source(70, 1, 0, true, &records(&[&t])).encode(), 1_000);
     assert!(!evs.iter().any(|e| matches!(e, Event::DecodeError { .. })));
     assert!(status_records(&mut c, 1_000).is_empty());
@@ -385,7 +372,7 @@ fn late_original_after_a_rebuild_is_acked_but_not_delivered_twice() {
         payload: &rep[0],
     }
     .encode();
-    let mut c = core(true);
+    let mut c = core();
     c.handle_datagram(&srcs[0].encode(), 1_000);
     c.handle_datagram(&srcs[2].encode(), 1_001);
     let evs = c.handle_datagram(&repair, 1_002);

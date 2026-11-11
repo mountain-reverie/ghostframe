@@ -23,7 +23,7 @@
 //     directly in Rust, no string parsing involved)
 import { describe, it, expect } from 'vitest';
 import * as wasm from '../pkg-node/ghostframe_client_wasm.js';
-import { fragmentTile } from './helpers/wasm.js';
+import { fragmentTile, frameOne } from './helpers/wasm.js';
 
 const CDF53_CODEC = 5; // ghostframe_protocol::protocol::Codec::Cdf53
 
@@ -48,11 +48,11 @@ function planes(lits: [number, number, number]): Uint8Array {
  * `TilePayload` whose `bit_planes` mirror the payload bytes directly, so the
  * assertions below compare real content, not a decode that could be constant. */
 function newCore(): InstanceType<typeof wasm.WasmClientCore> {
-  return new wasm.WasmClientCore(false, false, true, 0n, false);
+  return new wasm.WasmClientCore(false, false, true, 0n);
 }
 
 function payloadEvents(core: InstanceType<typeof wasm.WasmClientCore>, dg: Uint8Array): any[] {
-  return (core.handleDatagram(dg, 0n) as any[]).filter((e) => e.kind === 'TilePayload');
+  return (core.handleDatagram(frameOne(dg), 0n) as any[]).filter((e) => e.kind === 'TilePayload');
 }
 
 describe('tiles are one datagram', () => {

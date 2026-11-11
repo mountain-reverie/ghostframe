@@ -4,6 +4,7 @@
 // state and the paced IDR request (0x09) -- the same ClientCore as native.
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as wasm from '../pkg-node/ghostframe_client_wasm.js';
+import { frameOne } from './helpers/wasm.js';
 import {
   FullFrameDecoder,
   codecStringFromSps,
@@ -26,7 +27,7 @@ function frame(seq: number, idr: boolean, ref: number): Uint8Array {
 }
 
 function newCore() {
-  const core = new wasm.WasmClientCore(true, true, true, 0n, false);
+  const core = new wasm.WasmClientCore(true, true, true, 0n);
   const hello: any[] = [];
   for (let o = core.pollTransmit(0n); o !== undefined; o = core.pollTransmit(0n)) hello.push(o);
   return { core, hello };
@@ -64,18 +65,18 @@ describe('the wasm core sends the v2 H.264 feedback', () => {
 
   it('acks a decoded frame, little-endian, and a refused one in the refused mask', () => {
     const { core } = newCore();
-    const ev = core.handleDatagram(frame(1, true, 0), 1_000n) as any[];
+    const ev = core.handleDatagram(frameOne(frame(1, true, 0)), 1_000n) as any[];
     expect(ev.find((e) => e.kind === 'NeedsH264').reset_decoder).toBe(true);
     expect(frameAcks(core, 1_000n).acks).toEqual([]); // fed, not yet decoded
     core.h264Result(1, H264_DECODED, 2_000n);
     // The ack rides the ack batch: nothing before the batch is due, then the
-    // batch (0x06) and the frame ack (0x0A) in one drain.
+    // batch (0x08, ACK v4) and the frame ack (0x0A) in one drain.
     expect(frameAcks(core, 2_000n).order).toEqual([]);
     const first = frameAcks(core, 6_000n);
-    expect(first.order).toEqual([0x06, 0x0a]);
+    expect(first.order).toEqual([0x08, 0x0a]);
     expect(first.acks).toEqual([{ newest: 1, decoded: 1n, refused: 0n }]);
     // Frame 2 never arrives; 3 names it: refused at the gate, no decoder involved.
-    const ev3 = core.handleDatagram(frame(3, false, 2), 10_000n) as any[];
+    const ev3 = core.handleDatagram(frameOne(frame(3, false, 2)), 10_000n) as any[];
     expect(ev3.some((e) => e.kind === 'NeedsH264')).toBe(false);
     const { acks, resets } = frameAcks(core, 16_000n);
     expect(acks).toEqual([{ newest: 3, decoded: 0b100n, refused: 0b001n }]);
@@ -84,9 +85,9 @@ describe('the wasm core sends the v2 H.264 feedback', () => {
 
   it('turns a decode error into one paced decoder-failure request', () => {
     const { core } = newCore();
-    core.handleDatagram(frame(1, true, 0), 0n);
+    core.handleDatagram(frameOne(frame(1, true, 0)), 0n);
     core.h264Result(1, H264_DECODED, 0n);
-    core.handleDatagram(frame(2, false, 1), 1_000n);
+    core.handleDatagram(frameOne(frame(2, false, 1)), 1_000n);
     core.h264Result(2, H264_DECODE_ERROR, 1_000n);
     expect(frameAcks(core, 1_000n).resets).toEqual([[1, 2]]);
     core.h264Result(3, H264_DECODE_ERROR, 2_000n);
@@ -95,19 +96,19 @@ describe('the wasm core sends the v2 H.264 feedback', () => {
 
   it('counts access units that came out with no picture of their own', () => {
     const { core } = newCore();
-    core.handleDatagram(frame(1, true, 0), 0n);
+    core.handleDatagram(frameOne(frame(1, true, 0)), 0n);
     core.h264Result(1, H264_NOT_OUTPUT, 0n);
-    core.handleDatagram(frame(2, false, 1), 1_000n);
+    core.handleDatagram(frameOne(frame(2, false, 1)), 1_000n);
     core.h264Result(2, H264_NOT_OUTPUT, 1_000n);
     expect(Array.from(core.h264NotOutputStats())).toEqual([2, 2]);
-    core.handleDatagram(frame(3, false, 2), 2_000n);
+    core.handleDatagram(frameOne(frame(3, false, 2)), 2_000n);
     core.h264Result(3, H264_DECODED, 2_000n);
     expect(Array.from(core.h264NotOutputStats())).toEqual([2, 0]);
   });
 
   it('ignores an outcome it does not know', () => {
     const { core } = newCore();
-    core.handleDatagram(frame(1, true, 0), 0n);
+    core.handleDatagram(frameOne(frame(1, true, 0)), 0n);
     core.h264Result(1, 99, 0n);
     expect(frameAcks(core, 5_000n).acks).toEqual([]);
   });
