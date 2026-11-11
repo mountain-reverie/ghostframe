@@ -3,20 +3,20 @@
 //! All integers are little-endian. `parse` checks the header only; the
 //! records inside a frame are walked (and checked) by [`records`].
 
-pub const FRAME_SOURCE: u8 = 0x01;
-pub const FRAME_REPAIR: u8 = 0x02;
-pub const FRAME_PLAIN: u8 = 0x03;
-pub const SCHEME_RS_CAUCHY: u8 = 0;
-pub const FLAG_LAST: u8 = 0x80;
-pub const SOURCE_HEADER_LEN: usize = 9;
-pub const REPAIR_HEADER_LEN: usize = 11;
-pub const PLAIN_HEADER_LEN: usize = 5;
-pub const RECORD_LEN_PREFIX: usize = 2;
+pub const FEC_FRAME_SOURCE: u8 = 0x01;
+pub const FEC_FRAME_REPAIR: u8 = 0x02;
+pub const FEC_FRAME_PLAIN: u8 = 0x03;
+pub const FEC_SCHEME_RS_CAUCHY: u8 = 0;
+pub const FEC_FLAG_LAST: u8 = 0x80;
+pub const FEC_SOURCE_HEADER_LEN: usize = 9;
+pub const FEC_REPAIR_HEADER_LEN: usize = 11;
+pub const FEC_PLAIN_HEADER_LEN: usize = 5;
+pub const FEC_RECORD_LEN_PREFIX: usize = 2;
 /// len u16 + bundle_seq u32 in front of the records in a coded symbol.
-pub const SYMBOL_OVERHEAD: usize = 6;
-/// A bundle's record bytes must be <= max_datagram - RECORDS_HEADROOM so the
-/// block's repair (REPAIR_HEADER_LEN + SYMBOL_OVERHEAD + records) still fits.
-pub const RECORDS_HEADROOM: usize = REPAIR_HEADER_LEN + SYMBOL_OVERHEAD;
+pub const FEC_SYMBOL_OVERHEAD: usize = 6;
+/// A bundle's record bytes must be <= max_datagram - FEC_RECORDS_HEADROOM so the
+/// block's repair (FEC_REPAIR_HEADER_LEN + FEC_SYMBOL_OVERHEAD + records) still fits.
+pub const FEC_RECORDS_HEADROOM: usize = FEC_REPAIR_HEADER_LEN + FEC_SYMBOL_OVERHEAD;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceFrame<'a> {
@@ -68,6 +68,8 @@ pub enum FrameError {
     RecordOverrun { at: usize },
     #[error("coded symbol of {0} bytes is shorter than its header")]
     SymbolTooShort(usize),
+    #[error("coded symbol declares a length of {0}, below its 4-byte minimum")]
+    SymbolDeclaredTooShort(usize),
     #[error("coded symbol declares {declared} bytes but holds {available}")]
     SymbolLength { declared: usize, available: usize },
 }
@@ -82,9 +84,9 @@ pub fn parse(dg: &[u8]) -> Result<Frame<'_>, FrameError> {
         return Err(FrameError::Empty);
     };
     let need = match kind {
-        FRAME_SOURCE => SOURCE_HEADER_LEN,
-        FRAME_REPAIR => REPAIR_HEADER_LEN,
-        FRAME_PLAIN => PLAIN_HEADER_LEN,
+        FEC_FRAME_SOURCE => FEC_SOURCE_HEADER_LEN,
+        FEC_FRAME_REPAIR => FEC_REPAIR_HEADER_LEN,
+        FEC_FRAME_PLAIN => FEC_PLAIN_HEADER_LEN,
         other => return Err(FrameError::UnknownKind(other)),
     };
     if dg.len() < need {
@@ -94,26 +96,26 @@ pub fn parse(dg: &[u8]) -> Result<Frame<'_>, FrameError> {
         });
     }
     match kind {
-        FRAME_SOURCE => {
+        FEC_FRAME_SOURCE => {
             let flags = dg[1];
             let scheme = flags & 0x0f;
-            if scheme != SCHEME_RS_CAUCHY {
+            if scheme != FEC_SCHEME_RS_CAUCHY {
                 return Err(FrameError::UnknownScheme(scheme));
             }
-            if flags & !(FLAG_LAST | 0x0f) != 0 {
+            if flags & !(FEC_FLAG_LAST | 0x0f) != 0 {
                 return Err(FrameError::ReservedBits(flags));
             }
             Ok(Frame::Source(SourceFrame {
-                last: flags & FLAG_LAST != 0,
+                last: flags & FEC_FLAG_LAST != 0,
                 bundle_seq: u32_at(dg, 2),
                 block_id: u16::from_le_bytes([dg[6], dg[7]]),
                 idx: dg[8],
-                records: &dg[SOURCE_HEADER_LEN..],
+                records: &dg[FEC_SOURCE_HEADER_LEN..],
             }))
         }
-        FRAME_REPAIR => {
+        FEC_FRAME_REPAIR => {
             let scheme = dg[1];
-            if scheme != SCHEME_RS_CAUCHY {
+            if scheme != FEC_SCHEME_RS_CAUCHY {
                 return Err(FrameError::UnknownScheme(scheme));
             }
             let (k, r, repair_idx) = (dg[8], dg[9], dg[10]);
@@ -130,22 +132,22 @@ pub fn parse(dg: &[u8]) -> Result<Frame<'_>, FrameError> {
                 k,
                 r,
                 repair_idx,
-                payload: &dg[REPAIR_HEADER_LEN..],
+                payload: &dg[FEC_REPAIR_HEADER_LEN..],
             }))
         }
         // `kind` was matched above; PLAIN is the remaining frame kind.
         _ => Ok(Frame::Plain(PlainFrame {
             bundle_seq: u32_at(dg, 1),
-            records: &dg[PLAIN_HEADER_LEN..],
+            records: &dg[FEC_PLAIN_HEADER_LEN..],
         })),
     }
 }
 
 impl SourceFrame<'_> {
     pub fn encode(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(SOURCE_HEADER_LEN + self.records.len());
-        v.push(FRAME_SOURCE);
-        v.push(SCHEME_RS_CAUCHY | if self.last { FLAG_LAST } else { 0 });
+        let mut v = Vec::with_capacity(FEC_SOURCE_HEADER_LEN + self.records.len());
+        v.push(FEC_FRAME_SOURCE);
+        v.push(FEC_SCHEME_RS_CAUCHY | if self.last { FEC_FLAG_LAST } else { 0 });
         v.extend_from_slice(&self.bundle_seq.to_le_bytes());
         v.extend_from_slice(&self.block_id.to_le_bytes());
         v.push(self.idx);
@@ -155,8 +157,12 @@ impl SourceFrame<'_> {
 
     /// `len u16 | bundle_seq u32 | records`, unpadded (the codec pads).
     pub fn coded_symbol(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(SYMBOL_OVERHEAD + self.records.len());
-        v.extend_from_slice(&((4 + self.records.len()) as u16).to_le_bytes());
+        let mut v = Vec::with_capacity(FEC_SYMBOL_OVERHEAD + self.records.len());
+        v.extend_from_slice(
+            &u16::try_from(4 + self.records.len())
+                .expect("records fit a u16 length")
+                .to_le_bytes(),
+        );
         v.extend_from_slice(&self.bundle_seq.to_le_bytes());
         v.extend_from_slice(self.records);
         v
@@ -165,9 +171,9 @@ impl SourceFrame<'_> {
 
 impl RepairFrame<'_> {
     pub fn encode(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(REPAIR_HEADER_LEN + self.payload.len());
-        v.push(FRAME_REPAIR);
-        v.push(SCHEME_RS_CAUCHY);
+        let mut v = Vec::with_capacity(FEC_REPAIR_HEADER_LEN + self.payload.len());
+        v.push(FEC_FRAME_REPAIR);
+        v.push(FEC_SCHEME_RS_CAUCHY);
         v.extend_from_slice(&self.bundle_seq.to_le_bytes());
         v.extend_from_slice(&self.block_id.to_le_bytes());
         v.extend_from_slice(&[self.k, self.r, self.repair_idx]);
@@ -178,8 +184,8 @@ impl RepairFrame<'_> {
 
 impl PlainFrame<'_> {
     pub fn encode(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(PLAIN_HEADER_LEN + self.records.len());
-        v.push(FRAME_PLAIN);
+        let mut v = Vec::with_capacity(FEC_PLAIN_HEADER_LEN + self.records.len());
+        v.push(FEC_FRAME_PLAIN);
         v.extend_from_slice(&self.bundle_seq.to_le_bytes());
         v.extend_from_slice(self.records);
         v
@@ -188,14 +194,14 @@ impl PlainFrame<'_> {
 
 /// Records of a rebuilt source: reads the len prefix, ignores the zero padding.
 pub fn source_from_symbol(sym: &[u8]) -> Result<(u32, &[u8]), FrameError> {
-    if sym.len() < SYMBOL_OVERHEAD {
+    if sym.len() < FEC_SYMBOL_OVERHEAD {
         return Err(FrameError::SymbolTooShort(sym.len()));
     }
     let declared = usize::from(u16::from_le_bytes([sym[0], sym[1]]));
     if declared < 4 {
-        return Err(FrameError::SymbolTooShort(declared));
+        return Err(FrameError::SymbolDeclaredTooShort(declared));
     }
-    let available = sym.len() - RECORD_LEN_PREFIX;
+    let available = sym.len() - FEC_RECORD_LEN_PREFIX;
     if declared > available {
         return Err(FrameError::SymbolLength {
             declared,
@@ -204,7 +210,7 @@ pub fn source_from_symbol(sym: &[u8]) -> Result<(u32, &[u8]), FrameError> {
     }
     Ok((
         u32_at(sym, 2),
-        &sym[SYMBOL_OVERHEAD..RECORD_LEN_PREFIX + declared],
+        &sym[FEC_SYMBOL_OVERHEAD..FEC_RECORD_LEN_PREFIX + declared],
     ))
 }
 
@@ -242,12 +248,12 @@ impl<'a> Iterator for Records<'a> {
             [a, b, ..] => usize::from(u16::from_le_bytes([*a, *b])),
             _ => usize::MAX,
         };
-        let end = RECORD_LEN_PREFIX.saturating_add(len);
+        let end = FEC_RECORD_LEN_PREFIX.saturating_add(len);
         if end > self.rest.len() {
             self.done = true;
             return Some(Err(FrameError::RecordOverrun { at }));
         }
-        let rec = &self.rest[RECORD_LEN_PREFIX..end];
+        let rec = &self.rest[FEC_RECORD_LEN_PREFIX..end];
         self.rest = &self.rest[end..];
         self.offset += end;
         Some(Ok(rec))
@@ -323,7 +329,7 @@ mod tests {
             records: &r,
         };
         let mut sym = f.coded_symbol();
-        assert_eq!(sym.len(), SYMBOL_OVERHEAD + r.len());
+        assert_eq!(sym.len(), FEC_SYMBOL_OVERHEAD + r.len());
         sym.resize(1180, 0); // the codec pads to the block's longest symbol
         assert_eq!(source_from_symbol(&sym), Ok((42, &r[..])));
     }
@@ -331,7 +337,7 @@ mod tests {
     #[test]
     fn repair_fits_when_records_respect_the_headroom() {
         let max = 1200usize;
-        let r = vec![0u8; max - RECORDS_HEADROOM];
+        let r = vec![0u8; max - FEC_RECORDS_HEADROOM];
         let src = SourceFrame {
             last: false,
             bundle_seq: 0,
@@ -404,6 +410,10 @@ mod tests {
             Some(Err(FrameError::RecordOverrun { at: 0 }))
         );
         assert_eq!(source_from_symbol(&[1]), Err(FrameError::SymbolTooShort(1)));
+        assert_eq!(
+            source_from_symbol(&[2, 0, 0, 0, 0, 0]),
+            Err(FrameError::SymbolDeclaredTooShort(2))
+        );
         assert_eq!(
             source_from_symbol(&[9, 0, 0, 0, 0, 0]),
             Err(FrameError::SymbolLength {

@@ -160,6 +160,60 @@
 
 #define EVICTION_SENTINEL_Y 254
 
+/**
+ * Most symbols (sources + repair rows) one block can address.
+ */
+#define FEC_MAX_SYMBOLS 256
+
+#define FEC_LOSS_REPORT_MSG_TYPE 7
+
+#define FEC_ACK_V4_MSG_TYPE 8
+
+#define FEC_REPAIR_REQUEST_MSG_TYPE 11
+
+#define FEC_LOSS_REPORT_LEN 64
+
+#define FEC_MAX_REPAIR_REQUEST_ENTRIES 16
+
+#define FEC_MAX_ACK_V4_ENTRIES 72
+
+#define FEC_FRAME_SOURCE 1
+
+#define FEC_FRAME_REPAIR 2
+
+#define FEC_FRAME_PLAIN 3
+
+#define FEC_SCHEME_RS_CAUCHY 0
+
+#define FEC_FLAG_LAST 128
+
+#define FEC_SOURCE_HEADER_LEN 9
+
+#define FEC_REPAIR_HEADER_LEN 11
+
+#define FEC_PLAIN_HEADER_LEN 5
+
+#define FEC_RECORD_LEN_PREFIX 2
+
+/**
+ * len u16 + bundle_seq u32 in front of the records in a coded symbol.
+ */
+#define FEC_SYMBOL_OVERHEAD 6
+
+/**
+ * A bundle's record bytes must be <= max_datagram - FEC_RECORDS_HEADROOM so the
+ * block's repair (FEC_REPAIR_HEADER_LEN + FEC_SYMBOL_OVERHEAD + records) still fits.
+ */
+#define FEC_RECORDS_HEADROOM (FEC_REPAIR_HEADER_LEN + FEC_SYMBOL_OVERHEAD)
+
+#define FEC_STATUS_RECOVERED 16
+
+#define FEC_STATUS_CONTENT_REJECTED 17
+
+#define FEC_STATUS_DECLINED 18
+
+#define FEC_STATUS_MAX_RECORD_BODY 1020
+
 #define FEEDBACK_SIZE 18
 
 /**
