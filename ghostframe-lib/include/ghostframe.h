@@ -54,14 +54,6 @@
  */
 #define FRAGMENT_COVERAGE_CAPACITY 60000
 
-#define FEC_GROUP_SIZE_K 10
-
-#define FEC_PARITY_PER_GROUP_R 1
-
-#define PARITY_INTERLEAVE_OFFSET (uint32_t)(2 * FEC_GROUP_SIZE_K)
-
-#define END_OF_STREAM_PARITY_FLUSH_MS 5
-
 #define CACHE_CAPACITY 32768
 
 /**
@@ -413,17 +405,6 @@
  * a marking.
  */
 #define FRAME_FLAG_MARK_TARGET 32
-
-/**
- * Envelope discriminator byte for the tile-FEC parity datagram.
- */
-#define TILE_PARITY_ENVELOPE 4
-
-/**
- * Size of the fixed-length part of the header, preceding the `source_lens`
- * table and `parity_payload`.
- */
-#define TILE_PARITY_HEADER_SIZE (((1 + 4) + 1) + 1)
 
 /**
  * Envelope discriminator byte for the per-pass NACK datagram

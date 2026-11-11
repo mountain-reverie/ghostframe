@@ -28,7 +28,7 @@ use ghostframe_protocol::feedback_stream::{
 use ghostframe_protocol::protocol::{
     Codec, DATAGRAM_HEADER_SIZE, FRAME_ACK_ENVELOPE, FRAME_DIMENSIONS_SENTINEL_X,
     FRAME_DIMENSIONS_SENTINEL_Y, FRAME_HEADER_SIZE, TILE_DATAGRAM_FLAG, TILE_HEADER_SIZE,
-    TILE_NACK_ENVELOPE, TILE_PARITY_ENVELOPE,
+    TILE_NACK_ENVELOPE,
 };
 use ghostframe_protocol::tile::{TILE_BYTES, TILE_SIZE};
 use wasm_bindgen::prelude::*;
@@ -81,13 +81,6 @@ export_const!(
     NACK_FLUSH_INTERVAL_US / 1000
 );
 export_const!("nackBatchMax", nack_batch_max, usize, NACK_BATCH_MAX);
-
-export_const!(
-    "tileParityEnvelope",
-    tile_parity_envelope,
-    u8,
-    TILE_PARITY_ENVELOPE
-);
 
 export_const!("inputMsgType", input_msg_type, u8, INPUT_MSG_TYPE);
 export_const!("helloMsgType", hello_msg_type, u8, HELLO_MSG_TYPE);

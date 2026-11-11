@@ -15,10 +15,10 @@
 use super::*;
 
 impl IoBridge {
-    /// Put what the reliable emitter has queued (source and parity) on the
+    /// Put what the reliable emitter has queued on the
     /// wire, through the admission gate: a datagram goes only while quinn's
     /// FIFO holds less than `D_target` and the bucket can afford its wire
-    /// bytes, parity included. The first one that cannot go is put back at
+    /// bytes. The first one that cannot go is put back at
     /// the head, untouched, and the drain stops; it is sent by a later pass.
     /// No borrow of the emitter is held across a send: the emission is taken
     /// out first and its outcome handed back afterwards.
@@ -37,11 +37,9 @@ impl IoBridge {
             .map(|raw| raw.saturating_sub(self.live_framing_len()));
         #[cfg(test)]
         let fit_limit = self.forced_datagram_limit_for_test.or(fit_limit);
-        while let Some(emission) = self.reliable_emitter.next_emission(now) {
-            let (bytes, class) = match &emission {
-                Emission::Source(bytes, class) => (bytes.clone(), *class),
-                Emission::Parity(bytes, _) => (bytes.clone(), WireClass::Parity),
-            };
+        while let Some(emission) = self.reliable_emitter.next_emission() {
+            let Emission::Source(bytes, class) = &emission;
+            let (bytes, class) = (bytes.clone(), *class);
             if fit_limit.is_some_and(|limit| bytes.len() > limit) {
                 self.retire_oversize(&emission, now);
                 continue;
@@ -53,7 +51,6 @@ impl IoBridge {
                     let admit_class = match class {
                         WireClass::NackRepair => AdmitClass::NackRepair,
                         WireClass::LossRetransmit => AdmitClass::Retransmit,
-                        WireClass::Parity => AdmitClass::Parity,
                         WireClass::Refinement => AdmitClass::Refinement,
                         // First sends and the scheduler's own retry are the
                         // scheduler's critical tier as far as the bucket is
@@ -80,13 +77,7 @@ impl IoBridge {
                     }
                 }
             }
-            let outcome = self.send_counted(
-                &bytes,
-                class,
-                true,
-                emission.wire_seq(),
-                emission.parity_group(),
-            );
+            let outcome = self.send_counted(&bytes, class, true, emission.wire_seq());
             if matches!(
                 outcome,
                 crate::transport::reliable_emitter::traits::SendOutcome::Rejected
@@ -124,7 +115,6 @@ impl IoBridge {
     ///   (`h264_refs_oversize`): a recovery from its anchor, or, for the IDR in
     ///   flight, the IDR sent again at the new size;
     /// - probe padding: owes the client nothing, dropped;
-    /// - tile parity: its sources are the same size, so they are retired too.
     fn retire_oversize(
         &mut self,
         emission: &crate::transport::reliable_emitter::emission_queue::Emission,
@@ -179,17 +169,15 @@ impl IoBridge {
 
     /// What a queued datagram with no ledger record carries, read from its
     /// own header: an H.264 frame fragment (or its resend) or probe padding.
-    /// `None` for parity, tile passes (their key is not in the datagram) and
-    /// anything else.
+    /// `None` for tile passes (their key is not in the datagram) and anything
+    /// else.
     fn content_of_untracked(
         emission: &crate::transport::reliable_emitter::emission_queue::Emission,
     ) -> Option<crate::transport::reliable_emitter::Content> {
         use crate::transport::protocol::{FrameHeader, FRAME_FLAG_PAD, FRAME_HEADER_SIZE};
         use crate::transport::reliable_emitter::emission_queue::Emission;
         use crate::transport::reliable_emitter::Content;
-        let Emission::Source(bytes, class) = emission else {
-            return None;
-        };
+        let Emission::Source(bytes, class) = emission;
         // A tile datagram sets the top bit of its first byte.
         if bytes.len() < FRAME_HEADER_SIZE
             || bytes[0] & 0x80 != 0
@@ -282,7 +270,7 @@ impl IoBridge {
         dg: &[u8],
         class: WireClass,
     ) -> crate::transport::reliable_emitter::traits::SendOutcome {
-        self.send_counted(dg, class, false, None, None)
+        self.send_counted(dg, class, false, None)
     }
 
     /// [`Self::send_to_all_sessions`], saying whether the datagram came
@@ -300,7 +288,6 @@ impl IoBridge {
         class: WireClass,
         gated: bool,
         wire_seq: Option<u32>,
-        parity_group: Option<u32>,
     ) -> crate::transport::reliable_emitter::traits::SendOutcome {
         use crate::transport::reliable_emitter::traits::SendOutcome;
         #[cfg(test)]
@@ -390,7 +377,6 @@ impl IoBridge {
                     dg_len: dg.len(),
                     framing_len: framing,
                     wire_seq,
-                    parity_group,
                     cum_enqueued: cum,
                     queued,
                 },
@@ -787,7 +773,7 @@ impl IoBridge {
         let mut total_wire_bytes_sent: usize = 0;
         // Build per-fragment (EmitKey, Bytes) items for the reliable
         // emitter. The emitter stamps wire_seq into bytes[8..12], caches
-        // for retransmit, and queues parity per FEC group.
+        // for retransmit.
         // The actual wire write happens in `drain_reliable_emitter(now)`
         // below.
         let mut items: Vec<(
@@ -1013,7 +999,7 @@ impl IoBridge {
                 self.classifier.observe_first_pass(kind, bytes, tiles);
             }
         }
-        // Submit the batch (stamps wire_seq, caches, queues parity).
+        // Submit the batch (stamps wire_seq, caches).
         self.reliable_emitter
             .submit_batch_marking_retries(items, &retry_flags, now);
         self.drain_reliable_emitter(now);

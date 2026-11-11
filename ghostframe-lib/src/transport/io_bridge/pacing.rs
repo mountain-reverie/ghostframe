@@ -27,7 +27,7 @@
 //! Must not: decode ACKs or feedback, update the loss signal, or decide session lifetime.
 
 use super::*;
-use crate::transport::admission::{depth_target, pull_in_priority, source_budget, AdmitClass};
+use crate::transport::admission::{depth_target, pull_in_priority, AdmitClass};
 use crate::transport::instruments::BudgetTerm;
 
 // ---------------------------------------------------------------------------
@@ -212,7 +212,7 @@ impl IoBridge {
     /// * `f` is the payload fraction (`BweSnapshot::payload_fraction`, 0.8 to
     ///   0.9 here): the countable share of the bytes the bucket bills. `E` and
     ///   `probe_target` are rates of the bytes goog_cc counts; the bucket
-    ///   bills parity, framing and control datagrams too, so the token rate
+    ///   bills framing and control datagrams too, so the token rate
     ///   that carries a countable rate is that rate over `f`.
     ///
     /// There is no `cwnd / srtt` term: quinn's window is derived from this
@@ -257,9 +257,7 @@ impl IoBridge {
     ///
     /// The order inside a pass is the priority order: NACK repair, then the
     /// timer's retransmissions, then the scheduler (critical tier before
-    /// refinement), each against what the ones before left. Parity is not
-    /// pulled; it is built by the emitter as sources are sent and is charged
-    /// when it is emitted, so `source_budget` leaves it a share.
+    /// refinement), each against what the ones before left.
     ///
     /// Work that cannot be admitted stays where it was built: in the
     /// scheduler (where a newer frame supersedes it), in the NACK list or in
@@ -307,10 +305,9 @@ impl IoBridge {
             }
             // Room under the gate, at least one datagram so a refinement pass
             // (which the scheduler admits whole) is never starved by a small
-            // remainder; tokens, less the parity the sources will owe, but
-            // never less than a datagram when a datagram is affordable.
+            // remainder.
             let room = (d_target - depth).max(mtu);
-            let budget = source_budget(tokens).max(tokens.min(mtu)).min(room);
+            let budget = tokens.min(room);
             let pulled =
                 pull_in_priority(
                     budget,
@@ -352,7 +349,7 @@ impl IoBridge {
                             }
                             None => 0,
                         },
-                        AdmitClass::Refinement | AdmitClass::Parity => 0,
+                        AdmitClass::Refinement => 0,
                     },
                 );
             stop = self.drain_reliable_emitter(now);

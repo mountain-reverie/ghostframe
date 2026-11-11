@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Injectable boundaries for unit/integration testing.
 
-/// The emitter calls `send` for every datagram (source or parity) it
+/// The emitter calls `send` for every datagram it
 /// wants on the wire. Real code passes a wrapper around
 /// `IoBridge::send_to_all_sessions`; tests pass a `Vec<Bytes>` collector
 /// or a lossy mock.
@@ -16,7 +16,7 @@
 /// buffer and the admission pass refills after every drain.
 ///
 /// It has to be reported because this trait is the single funnel every
-/// datagram passes through -- source, parity and retransmit alike. While
+/// datagram passes through -- source and retransmit alike. While
 /// `send` returned unit, a rejection was counted and the datagram discarded,
 /// and by then the scheduler had already popped the work
 /// (`drain_refinement_pass_major` removes rather than retaining), so the only

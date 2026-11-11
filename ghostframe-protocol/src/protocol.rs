@@ -93,8 +93,7 @@ pub struct DatagramHeader {
     pub frame_seq: u32,
     pub frag_idx: u16,
     pub frag_total: u16,
-    /// FEC group key, used by the client to deduplicate retransmits and
-    /// correlate parity datagrams to their source group.
+    /// Transmission id, used by the client to deduplicate retransmits.
     ///
     /// Scope: per QUIC session lifetime — restarts at 0 (or any value the
     /// emitter chooses to begin with) on every fresh session. Within a
@@ -106,8 +105,7 @@ pub struct DatagramHeader {
     ///
     /// Retransmissions used to reuse the original value. Duplicate suppression
     /// does not depend on that: tile assembly is idempotent per
-    /// `(TileKey, frag_idx)`, and the parity window simply records a
-    /// retransmission as the distinct source it is.
+    /// `(TileKey, frag_idx)`.
     ///
     /// Convention: `0` means "not yet stamped". All call sites that build
     /// a header before the emitter sees it (`fragment_tile`)
@@ -634,96 +632,6 @@ pub fn max_frame_fragment_payload(max_datagram_size: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// TILE_PARITY envelope (0x04)
-//
-// Wire format (spec §5.2):
-//   [0]         discriminator:        u8  (= TILE_PARITY_ENVELOPE = 0x04)
-//   [1..5]      group_first_wire_seq: u32 BE
-//   [5]         k:                    u8  (number of source datagrams covered)
-//   [6]         parity_idx:           u8  (0-indexed within group's R parities)
-//   [7..7+2k]   source_lens:          k x u16 BE
-//   [7+2k..]    parity_payload            (XOR of K sources, left-padded)
-// ---------------------------------------------------------------------------
-
-/// Envelope discriminator byte for the tile-FEC parity datagram.
-pub const TILE_PARITY_ENVELOPE: u8 = 0x04;
-
-/// Header of a parity datagram (envelope `0x04`). Covers K source datagrams
-/// starting at `group_first_wire_seq`. The `parity_payload` is the XOR of
-/// the K sources' full byte buffers, left-padded to the longest source's
-/// length.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TileParityEnvelope {
-    pub group_first_wire_seq: u32,
-    pub k: u8,
-    /// Index of this parity within the group's R parities. v1 always emits
-    /// R=1 parity per group, so `parity_idx` is always 0.
-    pub parity_idx: u8,
-    /// Byte length of each of the group's `k` sources, in `wire_seq` order
-    /// starting at `group_first_wire_seq`. The decoder needs every one: XOR
-    /// left-pads to the group's longest source, so a recovered source must
-    /// be trimmed to its own length or it arrives with leading zeros.
-    pub source_lens: Vec<u16>,
-    pub parity_payload: Vec<u8>,
-}
-
-/// Size of the fixed-length part of the header, preceding the `source_lens`
-/// table and `parity_payload`.
-pub const TILE_PARITY_HEADER_SIZE: usize = 1 + 4 + 1 + 1; // = 7
-
-impl TileParityEnvelope {
-    pub fn encode(&self, buf: &mut Vec<u8>) {
-        buf.push(TILE_PARITY_ENVELOPE);
-        buf.extend_from_slice(&self.group_first_wire_seq.to_be_bytes());
-        buf.push(self.k);
-        buf.push(self.parity_idx);
-        for len in &self.source_lens {
-            buf.extend_from_slice(&len.to_be_bytes());
-        }
-        buf.extend_from_slice(&self.parity_payload);
-    }
-
-    pub fn decode(data: &[u8]) -> Result<Self, ProtocolError> {
-        if data.len() < TILE_PARITY_HEADER_SIZE {
-            return Err(ProtocolError::TooShort {
-                expected: TILE_PARITY_HEADER_SIZE,
-                got: data.len(),
-            });
-        }
-        if data[0] != TILE_PARITY_ENVELOPE {
-            return Err(ProtocolError::UnknownEnvelope(data[0]));
-        }
-        let group_first_wire_seq = u32::from_be_bytes(data[1..5].try_into().unwrap());
-        let k = data[5];
-        let parity_idx = data[6];
-
-        // `k` is wire-supplied and may be hostile or corrupt: verify the
-        // buffer actually holds the full length table before slicing into
-        // it, so a bogus `k` cannot index past the end of `data`.
-        let table_end = TILE_PARITY_HEADER_SIZE + 2 * k as usize;
-        if data.len() < table_end {
-            return Err(ProtocolError::TooShort {
-                expected: table_end,
-                got: data.len(),
-            });
-        }
-
-        let mut source_lens = Vec::with_capacity(k as usize);
-        for chunk in data[TILE_PARITY_HEADER_SIZE..table_end].chunks_exact(2) {
-            source_lens.push(u16::from_be_bytes(chunk.try_into().unwrap()));
-        }
-        let parity_payload = data[table_end..].to_vec();
-        Ok(Self {
-            group_first_wire_seq,
-            k,
-            parity_idx,
-            source_lens,
-            parity_payload,
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
 // TILE_NACK envelope (0x05)
 //
 // Wire format (spec §5.3):
@@ -911,13 +819,9 @@ impl FrameAck {
 pub enum InboundKind {
     Empty,
     Unknown,
-    Hello,      // FEEDBACK_MSG_TYPE (0x01)
-    AckBatchV1, // superseded ACK revisions (0x02, 0x03) — decoder rejects them
-    AckBatch,   // ACK_BATCH_MSG_TYPE (0x04)
-    /// Server -> client only, so this never classifies an inbound datagram.
-    /// Retained because the enum names message kinds, not just the ones this
-    /// direction can carry.
-    TileParity,
+    Hello,         // FEEDBACK_MSG_TYPE (0x01)
+    AckBatchV1,    // superseded ACK revisions (0x02, 0x03) — decoder rejects them
+    AckBatch,      // ACK_BATCH_MSG_TYPE (0x04)
     TileNack,      // TILE_NACK_ENVELOPE (0x05)
     FrameAck,      // FRAME_ACK_ENVELOPE (0x0A)
     LossReport,    // fec::feedback::FEC_LOSS_REPORT_MSG_TYPE (0x07)
@@ -981,22 +885,9 @@ pub fn classify_inbound(data: &[u8]) -> InboundKind {
         // of them with `WrongMsgType`, so they are named here only so an old
         // client shows up as an old client rather than as `Unknown`. 0x04 was
         // the rev2 tile-pass format, retired in favour of transmission
-        // identity; it is also `TILE_PARITY_ENVELOPE`, which travels
-        // server -> client only and so never arrives on this path.
+        // identity.
         0x02..=0x04 => InboundKind::AckBatchV1,
-        // The current ACK envelope. This arm used to read
-        // `TILE_PARITY_ENVELOPE => TileParity`, which shares the value 0x04:
-        // when the ACK envelope was bumped 0x03 -> 0x04 in 2026-06-27 this
-        // function was not updated, so every live ACK batch classified as
-        // `TileParity`. Nothing broke only because the one caller
-        // (`IoBridge`'s inbound datagram dispatch) special-cases `TileNack`
-        // and routes everything else to the ACK handler, which re-checks the
-        // first byte itself. Adding any second special case to that match
-        // would have silently swallowed every ACK.
-        //
-        // Parity travels server -> client only (`ReliableTileEmitter` is the
-        // sole producer), so 0x04 arriving inbound is unambiguously an ACK
-        // and there is no inbound parity arm to conflict with.
+        // The current ACK envelope.
         crate::ack::ACK_BATCH_MSG_TYPE => InboundKind::AckBatch,
         TILE_NACK_ENVELOPE => InboundKind::TileNack,
         FRAME_ACK_ENVELOPE => InboundKind::FrameAck,
@@ -1579,74 +1470,6 @@ mod tests {
     }
 
     #[test]
-    fn tile_parity_envelope_roundtrip() {
-        let parity_payload = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
-        let source_lens: Vec<u16> = (0..10).map(|_| 512).collect();
-        let envelope = TileParityEnvelope {
-            group_first_wire_seq: 1000,
-            k: 10,
-            parity_idx: 0,
-            source_lens: source_lens.clone(),
-            parity_payload: parity_payload.clone(),
-        };
-        let mut buf = Vec::new();
-        envelope.encode(&mut buf);
-        assert_eq!(buf[0], TILE_PARITY_ENVELOPE);
-        let parsed = TileParityEnvelope::decode(&buf).expect("decode");
-        assert_eq!(parsed.group_first_wire_seq, 1000);
-        assert_eq!(parsed.k, 10);
-        assert_eq!(parsed.parity_idx, 0);
-        assert_eq!(parsed.source_lens, source_lens);
-        assert_eq!(parsed.parity_payload, parity_payload);
-    }
-
-    #[test]
-    fn parity_envelope_round_trips_every_source_length() {
-        let env = TileParityEnvelope {
-            group_first_wire_seq: 0xDEAD_BEEF,
-            k: 3,
-            parity_idx: 0,
-            source_lens: vec![20, 4, 17],
-            parity_payload: vec![1, 2, 3, 4, 5],
-        };
-        let mut buf = Vec::new();
-        env.encode(&mut buf);
-        let back = TileParityEnvelope::decode(&buf).expect("round trip");
-        assert_eq!(back.source_lens, vec![20, 4, 17]);
-        assert_eq!(back.group_first_wire_seq, 0xDEAD_BEEF);
-        assert_eq!(back.k, 3);
-        assert_eq!(back.parity_payload, vec![1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn a_parity_envelope_whose_length_table_is_truncated_is_rejected() {
-        let env = TileParityEnvelope {
-            group_first_wire_seq: 1,
-            k: 4,
-            parity_idx: 0,
-            source_lens: vec![8, 8, 8, 8],
-            parity_payload: vec![9; 8],
-        };
-        let mut buf = Vec::new();
-        env.encode(&mut buf);
-        // Truncate inside the length table: k says 4 entries, bytes stop short.
-        buf.truncate(7 + 2 * 3);
-        assert!(
-            TileParityEnvelope::decode(&buf).is_err(),
-            "a k that overruns the buffer must be rejected, not indexed past the end"
-        );
-    }
-
-    #[test]
-    fn tile_parity_envelope_rejects_wrong_discriminator() {
-        let mut buf = vec![0x99, 0, 0, 0, 0, 10, 0, 0, 0];
-        assert!(TileParityEnvelope::decode(&buf).is_err());
-        buf[0] = TILE_PARITY_ENVELOPE;
-        // still too short for header
-        assert!(TileParityEnvelope::decode(&buf[..3]).is_err());
-    }
-
-    #[test]
     fn tile_nack_envelope_roundtrip() {
         let entries = vec![
             TileNackEntry {
@@ -1712,14 +1535,8 @@ mod tests {
 
         // Envelopes
         assert_eq!(classify_inbound(&[0x03]), InboundKind::AckBatchV1);
-        // 0x04 is the superseded rev2 ACK format, so inbound it means an old
-        // client rather than parity — parity travels server -> client only
-        // and never arrives on the path this function classifies. It shares
-        // the value with `TILE_PARITY_ENVELOPE` for that reason, harmlessly.
-        assert_eq!(
-            classify_inbound(&[TILE_PARITY_ENVELOPE]),
-            InboundKind::AckBatchV1
-        );
+        // 0x04 is the superseded rev2 ACK format: inbound it means an old client.
+        assert_eq!(classify_inbound(&[0x04]), InboundKind::AckBatchV1);
         assert_eq!(
             classify_inbound(&[crate::ack::ACK_BATCH_MSG_TYPE]),
             InboundKind::AckBatch,
@@ -1746,10 +1563,6 @@ mod tests {
         assert_ne!(
             classify_inbound(&[crate::ack::ACK_BATCH_MSG_TYPE]),
             InboundKind::TileNack
-        );
-        assert_ne!(
-            classify_inbound(&[crate::ack::ACK_BATCH_MSG_TYPE]),
-            InboundKind::TileParity
         );
     }
 

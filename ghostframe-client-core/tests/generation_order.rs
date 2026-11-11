@@ -330,47 +330,6 @@ fn a_garbage_datagram_with_a_far_label_does_not_freeze_the_tile() {
     assert_eq!(last.unwrap(), model_render(&g3));
 }
 
-/// The same fault from the other source: a datagram rebuilt from parity of
-/// the wrong group is arbitrary bytes, and can parse as a valid pass with a
-/// far label. Only the labels off the wire can vouch for a label.
-#[test]
-fn a_rebuilt_datagram_with_a_far_label_does_not_freeze_the_tile() {
-    use ghostframe_protocol::protocol::TileParityEnvelope;
-    let g1 = generation(1, 100, 3);
-    let g3 = generation(3, 110, 9);
-    // Same payload bytes, so the two sources are the same length; a valid
-    // pass, so prevalidation cannot be what stops it.
-    let far = generation(2, 1_000_100, 3);
-    let mut rig = Rig::new();
-    deliver_all(&mut rig, &g1, 0..4);
-
-    let (ws_a, ws_b) = (7000u32, 7001u32);
-    let a = datagram(&g1, 4, ws_a);
-    let b = datagram(&far, 4, ws_b);
-    let parity_payload: Vec<u8> = a.iter().zip(&b).map(|(x, y)| x ^ y).collect();
-    let mut parity = Vec::new();
-    TileParityEnvelope {
-        group_first_wire_seq: ws_a,
-        k: 2,
-        parity_idx: 0,
-        source_lens: vec![a.len() as u16; 2],
-        parity_payload,
-    }
-    .encode(&mut parity);
-    rig.deliver_bytes(a, ws_a);
-    // Completes the group: `b` is rebuilt and replayed.
-    let events = rig.core.handle_datagram(&parity, rig.now_us + 1000);
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, Event::TileReady { frame_seq, .. } if *frame_seq == far.label)),
-        "a rebuilt datagram labelled 1M frames ahead was accepted"
-    );
-
-    let last = deliver_all(&mut rig, &g3, 0..14);
-    assert_eq!(last.unwrap(), model_render(&g3));
-}
-
 /// With nothing received yet there is no yardstick: the first datagram of a
 /// session is believed whatever its label.
 #[test]

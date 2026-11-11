@@ -2333,7 +2333,6 @@ impl IoBridge {
                 emitted_cdf53 = c.cdf53,
                 emitted_h264 = c.h264,
                 send_datagram_errs_total = self.datagram_send_errs,
-                fec_parity_emitted = es.parity_emitted,
                 loss_path_resends = es.loss_path_resends,
                 // Split, not summed. This was logged as a single
                 // `nack_received = nack_hit + nack_miss`, which cannot
@@ -2525,7 +2524,6 @@ impl IoBridge {
                 offered_nack_repair_B = ins.offered.of(WireClass::NackRepair),
                 offered_loss_retransmit_B = ins.offered.of(WireClass::LossRetransmit),
                 offered_scheduler_retry_B = ins.offered.of(WireClass::SchedulerRetry),
-                offered_parity_B = ins.offered.of(WireClass::Parity),
                 offered_h264_B = ins.offered.of(WireClass::H264),
                 offered_control_B = ins.offered.of(WireClass::Control),
                 offered_overhead_B = ins.offered.overhead,
@@ -2755,7 +2753,6 @@ impl IoBridge {
                 spurious_loss = ins.spurious_loss,
                 spurious_pto = ins.spurious_pto,
                 spurious_ledger = ins.ledger_spurious_losses,
-                late_acks_fec_possible = ins.late_acks_fec_possible,
                 loss_retransmits = ins.loss_retransmits,
                 pto_fires = ins.pto_fires,
                 pto_probe_retransmits = ins.pto_probe_retransmits,

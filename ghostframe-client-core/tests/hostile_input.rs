@@ -99,8 +99,8 @@ fn a_tile_claiming_other_than_one_fragment_is_dropped() {
 
 #[test]
 fn a_tile_claiming_a_fragment_index_other_than_zero_is_dropped() {
-    // frag_total 1 with a nonzero index is the old tile-level parity shape
-    // (`frag_idx >= frag_total`) or plain nonsense. Either way there is
+    // frag_total 1 with a nonzero index has `frag_idx >= frag_total`: it is
+    // nonsense. There is
     // nothing to assemble, so it must neither decode nor be ACKed.
     let mut core = test_core();
     for idx in [1u16, 2, 64, u16::MAX] {

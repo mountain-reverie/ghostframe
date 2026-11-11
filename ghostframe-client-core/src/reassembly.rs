@@ -13,9 +13,8 @@
 
 use ghostframe_protocol::ack::AckEntry;
 use ghostframe_protocol::protocol::{
-    decode_tile_datagram, is_tile_datagram, Codec, TileHeader, TileParityEnvelope,
-    DATAGRAM_HEADER_SIZE, FRAME_DIMENSIONS_SENTINEL_X, FRAME_DIMENSIONS_SENTINEL_Y,
-    TILE_DATAGRAM_FLAG, TILE_HEADER_SIZE, TILE_PARITY_ENVELOPE,
+    decode_tile_datagram, is_tile_datagram, Codec, TileHeader, DATAGRAM_HEADER_SIZE,
+    FRAME_DIMENSIONS_SENTINEL_X, FRAME_DIMENSIONS_SENTINEL_Y, TILE_DATAGRAM_FLAG, TILE_HEADER_SIZE,
 };
 
 use crate::cdf53_coverage::apply_cdf53_arrival;
@@ -55,7 +54,7 @@ const TILE_MIN: usize = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE; // 24
 enum Provenance {
     /// It came off the wire, just now.
     Received,
-    /// It was reconstructed from FEC parity and the rest of its group.
+    /// It was rebuilt by FEC from the rest of its bundle.
     Rebuilt,
 }
 
@@ -205,23 +204,6 @@ impl ClientCore {
             return events;
         }
 
-        // TILE_PARITY (0x04) envelope — routed before the ping/pong guard.
-        // A tile datagram has bit 31 of the first u32 set (first byte
-        // >= 0x80), so 0x04 can never collide with one, but we still guard.
-        if bytes[0] == TILE_PARITY_ENVELOPE && !is_tile_datagram(bytes) {
-            // Under framing the legacy XOR parity is not in use; replaying a
-            // source through it could name the wrong record in a rejection.
-            if self.current_record.is_some() {
-                return events;
-            }
-            if let Ok(env) = TileParityEnvelope::decode(bytes) {
-                if let Some(recovered) = self.parity_decoder.receive_parity(&env) {
-                    self.handle_source_tile(&recovered, now_us, Provenance::Rebuilt, &mut events);
-                }
-            }
-            return events;
-        }
-
         // 2. Ping/pong (< 20 bytes) -> ignore.
         if bytes.len() < 20 {
             return events;
@@ -247,15 +229,8 @@ impl ClientCore {
             return events;
         }
 
-        // 4. Tile datagram: feed the parity window (may replay a recovered
-        //    source), then process this datagram.
+        // 4. Tile datagram.
         self.datagrams_tile = self.datagrams_tile.saturating_add(1);
-        let wire_seq = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        if self.current_record.is_none() {
-            if let Some(replayed) = self.parity_decoder.record_source(wire_seq, bytes) {
-                self.handle_source_tile(&replayed, now_us, Provenance::Rebuilt, &mut events);
-            }
-        }
         self.handle_source_tile(bytes, now_us, Provenance::Received, &mut events);
 
         events
@@ -304,10 +279,9 @@ impl ClientCore {
         // clock in `timestamp_us`, not the emit stamp tile datagrams do, so
         // their spacing means nothing next to a tile datagram's.
         //
-        // A datagram rebuilt from parity carries a real emit stamp but has
-        // no arrival to set against it: `now_us` is when the last piece of
-        // its group turned up, which can be a whole quiet spell after it
-        // was sent.
+        // A datagram rebuilt by FEC carries a real emit stamp but has no
+        // arrival to set against it: `now_us` is when the repair turned up,
+        // which can be a whole quiet spell after it was sent.
         if is_sentinel || provenance == Provenance::Rebuilt {
             self.loss_tracker.on_datagram(now_us);
         } else {
@@ -355,15 +329,6 @@ impl ClientCore {
             // back to the tile-pass through its ledger, so every delivery
             // consumer downstream is unchanged.
             //
-            // A FEC-recovered replay reaches here carrying the *original*
-            // `wire_seq`, so acknowledging it reports a transmission that did
-            // not actually arrive — the parity did. That slightly
-            // under-reports loss, bounded by the FEC recovery rate, and is
-            // taken deliberately: the alternative leaves recovered content
-            // unacknowledged, so the server retransmits data the client
-            // already has. Exact accounting here would mean acknowledging
-            // parity envelopes in their own right, which is a larger change
-            // than it is worth today.
             let entry = AckEntry {
                 wire_seq: dh.wire_seq,
                 arrival_time_ms_lo16: ((now_us / 1000) & 0xFFFF) as u16,
@@ -624,9 +589,7 @@ impl ClientCore {
                         // decoding, and must happen in both modes.
                         //
                         // The pass is one datagram, so one entry names the
-                        // transmission it arrived on. A pass rebuilt from
-                        // FEC parity carries the original `wire_seq`; see the
-                        // note on the ACK-on-receipt path above.
+                        // transmission it arrived on.
                         if self.current_record.is_none() {
                             let entry = AckEntry {
                                 wire_seq,

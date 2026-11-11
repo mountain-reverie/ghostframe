@@ -80,8 +80,8 @@ fn a_fragment_marked_no_ack_is_not_acknowledged() {
 #[test]
 fn malformed_fragments_are_not_acknowledged() {
     let mut c = core();
-    // A fragment index at or past the total: the shape the retired XOR parity
-    // datagram had, and no source fragment.
+    // A fragment index at or past the total: a malformed fragment, not a
+    // source fragment.
     let mut past_end = stamp(fragment_frame(9, 1, false, &[7u8; 10], 1200).remove(0), 500);
     past_end[4..6].copy_from_slice(&1u16.to_be_bytes());
     c.handle_datagram(&past_end, 1_000);

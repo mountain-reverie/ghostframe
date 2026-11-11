@@ -78,7 +78,7 @@ pub struct BweSnapshot {
     /// rate) is deliberately not surfaced here at all.
     pub pacer_rate_bps: Option<u64>,
     /// Countable bytes per token the admission bucket spends: how much of
-    /// what is billed (parity, framing, control datagrams) goog_cc is told
+    /// what is billed (framing, control datagrams) goog_cc is told
     /// of. The estimate and `pacer_rate_bps` are rates of countable bytes, so
     /// the token rate that carries them is `rate / payload_fraction`. In
     /// `(0.5, 1.0]`; `1.0` until there is spend to measure it on.

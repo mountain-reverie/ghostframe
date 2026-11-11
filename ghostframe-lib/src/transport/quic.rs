@@ -234,7 +234,7 @@ pub(crate) fn count_from_source(remotes: impl Iterator<Item = SocketAddr>, ip: I
 /// # Since admission (D1 F1)
 ///
 /// The clamp and `RTO_RETRANSMITS_PER_TICK` above are gone. Every datagram,
-/// retransmissions and parity included, is billed to one bucket and admitted
+/// retransmissions included, is billed to one bucket and admitted
 /// only while quinn's queue holds less than about 10 ms of the sending rate
 /// (`transport::admission`), so the queue stays far below this size and the
 /// unclamped retransmit path this paragraph blamed no longer exists. The
