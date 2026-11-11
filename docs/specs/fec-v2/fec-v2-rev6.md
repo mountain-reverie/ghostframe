@@ -400,7 +400,7 @@ PLAIN    [0] 0x03  [1..5] bundle_seq u32 LE  [5..] records    no block: pong, ev
                                                               and the ARQ fallback
 ```
 
-**The coded symbol of a source** is `len u16 LE ‖ bundle_seq ‖ records`, zero-padded to the block's longest coded symbol.
+**The coded symbol of a source** is `len u16 LE ‖ bundle_seq ‖ records`, where `len` = 4 + the records' length (it counts `bundle_seq` and the records, not itself), zero-padded to the block's longest coded symbol.
 - `block_id` and `idx` are left out: the receiver knows them from the block and position it is rebuilding.
 - A rebuilt source therefore carries its exact length and its `bundle_seq`. There is no `lens` array (spike E).
 - **Systematic decoding works before k is known.** Source bytes do not depend on k.
@@ -420,7 +420,15 @@ PLAIN    [0] 0x03  [1..5] bundle_seq u32 LE  [5..] records    no block: pong, ev
 
 ### 6.2 Client → server
 - **ACK v4 0x08** (arrivals by `bundle_seq`), **LOSS_REPORT 0x07** and **REPAIR_REQUEST 0x0B** keep their revision-5 numbers. All three are free on master (`classify_inbound`, `protocol.rs:955-987`).
-- **REPAIR_REQUEST and DECLINED bodies change:** the `class` byte is dropped, and `block_id` becomes u16 to match §6.1. H.264 is no longer addressed by `frame_seq`.
+- **REPAIR_REQUEST, DECLINED and LOSS_REPORT bodies change** (normative layouts in `ghostframe-protocol/src/fec/feedback.rs` and `repair_status.rs`):
+  - **REPAIR_REQUEST:** the `class` byte is dropped and `block_id` becomes u16 to match §6.1. H.264 is no longer addressed by `frame_seq`.
+  - **DECLINED:** one block per record, `{ block_id u16, reason u8, k u8, missing bitmap ceil(k/8) bytes }`. Blocks can now hold up to 255 sources, so rev 5's u64 bitmap is too small.
+  - **LOSS_REPORT** (version 1, 64 bytes):
+    - rev 5's per-class H.264 fragment counters go, since there are no classes; `h264_frames_lost` stays, as the last field;
+    - the §4.8.5 tail fields move into the base layout;
+    - `repair_symbols_received_useful` is dropped, because `repair_used` already counts it.
+
+    Nothing shipped with rev 5's layout, so the version stays 1.
 - **The repair-status stream** carries RECOVERED, CONTENT_REJECTED and DECLINED, as in revision 5. Its record types 0x10–0x12 are not used on master's feedback stream, whose types are 0x01, 0x03–0x05 and 0x07–0x09 (`feedback_stream.rs:28-50`).
 - **0x0A is FRAME_ACK** on master (`protocol.rs:844`). Revision 5's REPAIR 0x0A went server→client and is frame kind 0x02 above, so nothing collides.
 - **ACK 0x06 is retired** under the framing. **TILE_NACK 0x05 stays** for tile content in PLAIN frames, the unprotected traffic of rev 5 §4.8.2 step 5. Content in a block uses REPAIR_REQUEST and DECLINED instead.
