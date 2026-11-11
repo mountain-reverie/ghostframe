@@ -22,6 +22,7 @@ fn drain(datagrams: &[Vec<u8>], delivery: TileDelivery) -> Vec<Event> {
             tile_delivery: delivery,
             cdf53_wire: false,
             display: None,
+            fec_framing: false,
         },
         0,
     );
