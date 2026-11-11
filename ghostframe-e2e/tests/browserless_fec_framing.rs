@@ -168,3 +168,57 @@ async fn under_framing_a_solid_tile_whose_only_datagram_is_dropped_is_still_repa
          exists. Only a sender-side repair can recover this."
     );
 }
+
+/// The knob on: the same churning scene, with blocks. Every datagram is still
+/// billed exactly, and repairs left (billed as `WireClass::Repair`).
+#[tokio::test(start_paused = true)]
+async fn a_churning_scene_with_blocks_on_sends_and_bills_repairs() {
+    use ghostframe_lib::config::FecBlockParams;
+    use ghostframe_lib::transport::reliable_emitter::emission_queue::WireClass;
+    let scene = BrowserlessScene {
+        seed: 0xB0_B057,
+        tick_budget_floor_bytes: None,
+        datagram_send_buffer_bytes: None,
+        load: SceneLoad::Profile(LoadProfile {
+            cadence_us: PRODUCTION_CADENCE_US,
+            churn: Churn::Region { tiles_per_tick: 32 },
+        }),
+        cadence_us: PRODUCTION_CADENCE_US,
+        net: NetProfile {
+            delay_us: 10_000,
+            ..NetProfile::perfect()
+        },
+        drops: Default::default(),
+        duration: Duration::from_secs(4),
+        grid_cols: 16,
+        grid_rows: 16,
+    };
+    let opts = RunOptions {
+        fec_blocks: Some(FecBlockParams {
+            k_max: 64,
+            t_ms: 5,
+            r: 2,
+        }),
+        ..framed()
+    };
+    let r = run_browserless_with_options(scene, LinkOverrides::default(), opts)
+        .await
+        .expect("scene ran");
+    let i = &r.transport.instr;
+    let repair_b = i.offered.of(WireClass::Repair);
+    println!(
+        "BLOCKS offered_total={} quinn={} repair_B={} bundles={} send_errs={}",
+        i.offered.total(),
+        i.quinn_bytes_enqueued,
+        repair_b,
+        i.offered.bundles,
+        r.send_datagram_errs
+    );
+    assert!(repair_b > 0, "repairs left the server");
+    assert_eq!(i.offered.total(), i.quinn_bytes_enqueued);
+    assert_eq!(r.send_datagram_errs, 0);
+    assert!(
+        r.framebuffer.tile_rgba(0, 0).is_some() || r.framebuffer.tile_rgba(8, 8).is_some(),
+        "tiles reached the client framebuffer"
+    );
+}
