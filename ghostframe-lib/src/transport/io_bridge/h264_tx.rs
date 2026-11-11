@@ -500,7 +500,7 @@ impl IoBridge {
         for ws in wire_seqs {
             // Only an H.264 fragment is in the identity
             // `tx_recorded >= acked + lost + forgotten`.
-            if let Some(tx) = self.transmission_ledger.take_undeparted(*ws) {
+            if let Some(tx) = self.take_undeparted_record(*ws) {
                 for (_, content) in tx.records() {
                     if matches!(content, Content::H264Frag { .. }) {
                         self.h264.stats.tx_forgotten += 1;

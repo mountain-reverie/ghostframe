@@ -251,6 +251,10 @@ pub struct TransportConfig {
     /// as [`H264_DEFAULT_FPS`]. The encoder's per-frame budget is the rate
     /// divided by it.
     pub capture_fps: u32,
+    /// Send every datagram inside the FEC v2 rev 6 framing (PLAIN bundles,
+    /// bundle-keyed ledger). Off by default: the client must speak it too
+    /// (`ClientConfig::fec_framing`). No environment variable.
+    pub fec_framing: bool,
 }
 
 /// Which H.264 encoder backends the daemon may open
@@ -446,6 +450,7 @@ impl TransportConfig {
             h264_backend: H264BackendChoice::parse(get("GHOSTFRAME_H264_BACKEND").as_deref()),
             openh264_lib: openh264_lib_from_lookup(&get),
             capture_fps: 0,
+            fec_framing: false,
         }
     }
 

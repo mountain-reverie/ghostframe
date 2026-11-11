@@ -32,9 +32,7 @@ impl IoBridge {
         // The largest datagram quinn takes now. It is not the size the
         // queued datagrams were built for: it can fall after they were (see
         // `retire_oversize`), and nothing inside a datagram can be refitted.
-        let fit_limit = self
-            .live_max_datagram_size_raw()
-            .map(|raw| raw.saturating_sub(self.live_framing_len()));
+        let fit_limit = self.live_max_dg().map(|max_dg| self.inner_limit(max_dg));
         #[cfg(test)]
         let fit_limit = self.forced_datagram_limit_for_test.or(fit_limit);
         while let Some(emission) = self.reliable_emitter.next_emission() {
@@ -47,7 +45,16 @@ impl IoBridge {
             let mut charged = 0usize;
             if let Some(gate) = self.gate {
                 if let Some(depth) = self.live_fifo_depth() {
-                    let wire = bytes.len() + self.live_framing_len();
+                    let depth = depth + self.unsent_bundle_bytes();
+                    // With framing a record costs its length prefix here; the
+                    // frame header and the QUIC framing are charged once per
+                    // bundle (`note_bundle_enqueued`).
+                    let wire = bytes.len()
+                        + if self.fec_framing {
+                            ghostframe_protocol::fec::frame::FEC_RECORD_LEN_PREFIX
+                        } else {
+                            self.live_framing_len()
+                        };
                     let admit_class = match class {
                         WireClass::NackRepair => AdmitClass::NackRepair,
                         WireClass::LossRetransmit => AdmitClass::Retransmit,
@@ -126,7 +133,7 @@ impl IoBridge {
         self.record_emitted_transmissions(now);
         let tx = emission
             .wire_seq()
-            .and_then(|ws| self.transmission_ledger.take_undeparted(ws));
+            .and_then(|ws| self.take_undeparted_record(ws));
         let tracked = tx.is_some();
         // A record evicted by the ledger's cap (or never made) does not make
         // the datagram anonymous: its header says what it is.
@@ -255,7 +262,7 @@ impl IoBridge {
         self.refresh_connected_session_count();
         let min_size = self
             .live_max_datagram_size_raw()
-            .map(|sz| sz.saturating_sub(Self::WT_VARINT_OVERHEAD));
+            .map(|sz| self.inner_limit(sz.saturating_sub(Self::WT_VARINT_OVERHEAD)));
         let out = min_size.filter(|&sz| sz > 0);
         // Cached so `tick_budget_floor` can size itself in datagrams from
         // `&self`. Calling `compute_max_datagram_size` there instead would
@@ -295,20 +302,25 @@ impl IoBridge {
         use crate::transport::reliable_emitter::traits::SendOutcome;
         #[cfg(test)]
         self.sent_log_for_test.push(dg.to_vec());
+        // With the rev 6 framing the bandwidth cap models the link, so it
+        // runs on sealed bundles (`bundle_tx`); the two hooks below model
+        // content loss and stay per record, before packing.
         #[cfg(any(test, feature = "test-loss-injection"))]
-        if let Some(cap) = self.outbound_bandwidth_cap.as_mut() {
-            if !cap.try_consume(dg.len()) {
-                // A harness-injected drop *consumes* the datagram. Reporting
-                // `Rejected` here would make the emitter re-queue the same
-                // bytes forever and the injected loss would never happen.
-                self.departed_without_quinn(wire_seq);
-                return SendOutcome::Sent;
+        if !self.fec_framing {
+            if let Some(cap) = self.outbound_bandwidth_cap.as_mut() {
+                if !cap.try_consume(dg.len()) {
+                    // A harness-injected drop *consumes* the datagram. Reporting
+                    // `Rejected` here would make the emitter re-queue the same
+                    // bytes forever and the injected loss would never happen.
+                    self.departed_without_quinn(wire_seq);
+                    return SendOutcome::Sent;
+                }
             }
         }
         #[cfg(any(test, feature = "test-loss-injection"))]
         if let Some(inj) = self.outbound_loss.as_mut() {
             if inj.should_drop(dg) {
-                self.departed_without_quinn(wire_seq);
+                self.consumed_before_wire(wire_seq);
                 return SendOutcome::Sent; // injected loss: consumed, see above
             }
         }
@@ -319,79 +331,43 @@ impl IoBridge {
                 .expect("drop_plan mutex poisoned")
                 .should_drop(dg)
             {
-                self.departed_without_quinn(wire_seq);
+                self.consumed_before_wire(wire_seq);
                 return SendOutcome::Sent; // injected drop: consumed, see above
             }
+        }
+        if self.fec_framing {
+            return self.send_counted_framed(dg, class, wire_seq);
         }
         // Every datagram goes to every connected session, so one refusal
         // means re-queue. With more than one session that re-sends to the
         // ones that accepted; the duplicate is wasted bandwidth rather than
         // corruption -- the client dedups on wire_seq and tile reassembly is
         // idempotent per frag_idx. Production runs a single session.
-        let mut rejected = false;
-        // (cum bytes accepted, framing, FIFO depth) after quinn took it.
-        let mut accepted: Option<(u64, usize, u64)> = None;
-        let send_capacity = self.server.datagram_send_buffer();
-        // Only the HELLO'd session receives stream data.
-        let live = self.live_send_handle();
-        if let Some(handle) = live.as_ref() {
-            if let (Some(wt), Some(conn)) = (
-                self.wt_sessions.get_mut(handle),
-                self.server.connections.get_mut(handle),
-            ) {
-                let sent = wt.send_datagram(conn, dg);
-                if sent.is_ok() {
-                    accepted = Some((
-                        wt.datagram_bytes_enqueued(),
-                        wt.datagram_framing_len(),
-                        send_capacity.saturating_sub(conn.datagrams().send_buffer_space()) as u64,
-                    ));
-                }
-                if let Err(e) = sent {
-                    rejected = true;
-                    self.datagram_send_errs = self.datagram_send_errs.saturating_add(1);
-                    if matches!(e, quinn_proto::SendDatagramError::TooLarge) {
-                        self.h264.stats.send_too_large += 1;
-                    }
-                    if !self.datagram_send_err_first_logged {
-                        self.datagram_send_err_first_logged = true;
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            ?handle,
-                            error = ?e,
-                            payload_len = dg.len(),
-                            "first send_datagram Err — QUIC backpressure or limit; \
-                             subsequent send failures will log at debug and a running \
-                             total appears in the per-frame `dispatch returned` log"
-                        );
-                    } else {
-                        tracing::debug!(target: LOG_TARGET, ?handle, error = ?e, "datagram send failed");
-                    }
-                }
-            }
-        }
-
-        if let (Some(handle), Some((cum, framing, queued))) = (live, accepted) {
-            self.note_enqueued(
+        match self.offer_to_live(dg) {
+            // No connected session counts as sent, not rejected: re-queueing a
+            // datagram with nowhere to go would spin the drain forever.
+            super::bundle_tx::Offer::NoSession => SendOutcome::Sent,
+            super::bundle_tx::Offer::Taken {
                 handle,
-                Enqueued {
-                    class,
-                    gated,
-                    dg_len: dg.len(),
-                    framing_len: framing,
-                    wire_seq,
-                    cum_enqueued: cum,
-                    queued,
-                },
-            );
-        }
-
-        // No connected session counts as sent, not rejected: re-queueing a
-        // datagram with nowhere to go would spin the drain forever.
-        if rejected {
-            SendOutcome::Rejected
-        } else {
-            SendOutcome::Sent
+                cum,
+                framing,
+                queued,
+            } => {
+                self.note_enqueued(
+                    handle,
+                    Enqueued {
+                        class,
+                        gated,
+                        dg_len: dg.len(),
+                        framing_len: framing,
+                        wire_seq,
+                        cum_enqueued: cum,
+                        queued,
+                    },
+                );
+                SendOutcome::Sent
+            }
+            super::bundle_tx::Offer::Refused(_) => SendOutcome::Rejected,
         }
     }
 

@@ -311,6 +311,10 @@ pub struct RunOptions {
     /// unsubscribes. `None` runs none, and `BrowserlessResult::client_stats`
     /// is then empty.
     pub stats: Option<crate::harness::stats_tap::StatsPlan>,
+    /// Both ends speak the FEC v2 rev 6 framing: the server packs every
+    /// datagram into PLAIN bundles (`IoBridge::set_fec_framing`) and the
+    /// client reads them (`ClientNetConfig::fec_framing`). Off by default.
+    pub fec_framing: bool,
 }
 
 /// How long the harness's perfect decoder takes to answer for an access unit
@@ -1125,6 +1129,7 @@ async fn run_inner(
         std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut scene.drops)));
     bridge.set_drop_plan(drop_plan_cell.clone());
     bridge.set_ignore_tile_nacks(opts.ignore_client_nacks);
+    bridge.set_fec_framing(opts.fec_framing);
     // The scene's time origin. Nothing below awaits before the original
     // definition site (the bridge is only moved or stored), so this is the
     // same instant it was when it was taken further down.
@@ -1180,7 +1185,7 @@ async fn run_inner(
         indices_raw_enabled: true,
         supports_h264: matches!(scene.load, SceneLoad::H264(_)),
         display: None,
-        fec_framing: false,
+        fec_framing: opts.fec_framing,
     };
 
     let mut framebuffer = FrameBuffer::new();

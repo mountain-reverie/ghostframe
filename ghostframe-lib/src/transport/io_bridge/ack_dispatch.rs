@@ -430,7 +430,6 @@ impl IoBridge {
                 continue;
             };
             let content = &content;
-            let tile_key = content.tile();
             // `queued_at` and the probe tag come from whichever cache holds the
             // content: the tile cache, or the H.264 probe cache.
             let cache_entry: Option<(std::time::Instant, Option<_>)> = match content {
@@ -462,7 +461,16 @@ impl IoBridge {
                 })
                 .unwrap_or(server_emit_us);
             // A frame fragment is first-send, latency-critical traffic.
-            let tier = tile_key.map_or(PassTier::Critical, |k| pass_tier(k.pass_idx));
+            // The most urgent tier among the records (plan decision 6): any
+            // non-tile record, or a critical-pass tile, makes it Critical.
+            let tier = if tx.records.iter().any(|(_, c)| {
+                c.tile()
+                    .is_none_or(|k| pass_tier(k.pass_idx) == PassTier::Critical)
+            }) {
+                PassTier::Critical
+            } else {
+                PassTier::Refinement
+            };
             let emit_lo16 = ((server_emit_us / 1000) & 0xFFFF) as u16;
             let owd_ms_lo16 = arrival_lo16.wrapping_sub(emit_lo16);
             let probe = cache_entry.and_then(|(_, probe)| probe);
