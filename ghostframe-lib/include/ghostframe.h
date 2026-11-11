@@ -214,6 +214,14 @@
 
 #define FEC_STATUS_MAX_RECORD_BODY 1020
 
+/**
+ * First byte of the repair-status bidi stream, before the first record. The
+ * server routes every client-opened bidi stream to its feedback handler, so
+ * this tag tells it which stream it is looking at. No feedback-stream message
+ * type is >= 0x80, so a feedback stream never begins with it.
+ */
+#define FEC_REPAIR_STATUS_STREAM_TAG 245
+
 #define FEEDBACK_SIZE 18
 
 /**
