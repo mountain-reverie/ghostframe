@@ -235,6 +235,20 @@ impl IoBridge {
             }
             self.emitted_meta.remove(&ws)
         });
+        // A record whose parked meta is gone (the table was cleared, or a hook
+        // took it) is still a record: its header says what it carries, so it
+        // is ledgered as that rather than billed as a content-less control
+        // frame. A tile pass names no key in its datagram and cannot be.
+        let meta = meta.or_else(|| {
+            let ws = wire_seq?;
+            let content = Self::content_of_datagram(dg, class)?;
+            Some(EmittedDatagram {
+                wire_seq: ws,
+                content,
+                emit_us: self.reliable_emitter.emit_us64(now),
+                wire_bytes: dg.len(),
+            })
+        });
         let sealed = match meta {
             Some(e) => {
                 let meta = RecordMeta {
@@ -464,6 +478,7 @@ impl IoBridge {
         self.instr
             .offered
             .bill(WireClass::Control, control_dg, framing);
+        self.instr.offered.bundles += 1;
         self.instr.fifo_peak_at_enqueue = self.instr.fifo_peak_at_enqueue.max(queued);
         // Short bundles back to back in a non-empty FIFO can share a QUIC
         // packet; `queued` includes this bundle, so the FIFO before it is

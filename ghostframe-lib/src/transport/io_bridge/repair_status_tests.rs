@@ -526,3 +526,47 @@ async fn status_records_from_a_session_that_is_not_live_are_dropped_and_forget_c
         "forget_session clears the readers"
     );
 }
+
+#[tokio::test]
+async fn a_finished_status_stream_frees_its_slot_so_the_client_can_reopen_one() {
+    let mut b = bridge();
+    let ws = seed(&mut b, 1);
+    let stream = |i| StreamId::new(Side::Client, Dir::Bi, i);
+    let mut tagged = vec![FEC_REPAIR_STATUS_STREAM_TAG];
+    tagged.extend(status_bytes(&[StatusRecord::Recovered(vec![ws[0]])]));
+    for i in 0..8 {
+        feed(&mut b, stream(i), &tagged);
+    }
+    assert_eq!(
+        b.status_streams.len(),
+        8,
+        "premise: the per-handle cap is full"
+    );
+    let mut late = vec![FEC_REPAIR_STATUS_STREAM_TAG];
+    late.extend(status_bytes(&[StatusRecord::ContentRejected(vec![(
+        ws[0], 0,
+    )])]));
+    feed(&mut b, stream(9), &late);
+    assert_eq!(
+        b.fec_in.content_rejected_rx, 0,
+        "premise: a ninth stream is refused while eight are held"
+    );
+
+    // The client finished its first stream.
+    b.wt_sessions
+        .get_mut(&H)
+        .unwrap()
+        .test_end_stream(stream(0));
+    b.dispatch_drained_feedback();
+    assert_eq!(
+        b.status_streams.len(),
+        7,
+        "the closed stream's slot is freed"
+    );
+
+    feed(&mut b, stream(10), &late);
+    assert_eq!(
+        b.fec_in.content_rejected_rx, 1,
+        "a reopened stream is served"
+    );
+}

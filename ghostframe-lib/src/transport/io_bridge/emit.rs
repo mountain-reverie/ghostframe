@@ -208,10 +208,18 @@ impl IoBridge {
     fn content_of_untracked(
         emission: &crate::transport::reliable_emitter::emission_queue::Emission,
     ) -> Option<crate::transport::reliable_emitter::Content> {
-        use crate::transport::protocol::{FrameHeader, FRAME_FLAG_PAD, FRAME_HEADER_SIZE};
         use crate::transport::reliable_emitter::emission_queue::Emission;
-        use crate::transport::reliable_emitter::Content;
         let Emission::Source(bytes, class) = emission;
+        Self::content_of_datagram(bytes, *class)
+    }
+
+    /// [`Self::content_of_untracked`] for a datagram already in hand.
+    pub(super) fn content_of_datagram(
+        bytes: &[u8],
+        class: WireClass,
+    ) -> Option<crate::transport::reliable_emitter::Content> {
+        use crate::transport::protocol::{FrameHeader, FRAME_FLAG_PAD, FRAME_HEADER_SIZE};
+        use crate::transport::reliable_emitter::Content;
         // A tile datagram sets the top bit of its first byte.
         if bytes.len() < FRAME_HEADER_SIZE
             || bytes[0] & 0x80 != 0
