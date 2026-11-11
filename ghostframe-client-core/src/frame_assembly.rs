@@ -62,7 +62,8 @@ impl ClientCore {
         if fh.frag_idx >= fh.frag_total || fh.frag_total > MAX_FRAME_FRAGMENTS {
             return;
         }
-        if fh.wire_seq != NO_ACK {
+        // Under framing `FecRx` ACKs per bundle and owns loss accounting.
+        if fh.wire_seq != NO_ACK && self.current_record.is_none() {
             self.wire_loss.on_received(fh.wire_seq);
             let entry = AckEntry {
                 wire_seq: fh.wire_seq,

@@ -518,6 +518,7 @@ fn mixed_batch_flush_and_publish() {
             tile_delivery: TileDelivery::Payload,
             cdf53_wire: false,
             display: None,
+            fec_framing: false,
         },
         0,
     );
