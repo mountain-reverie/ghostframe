@@ -251,6 +251,56 @@ pub struct TransportConfig {
     /// as [`H264_DEFAULT_FPS`]. The encoder's per-frame budget is the rate
     /// divided by it.
     pub capture_fps: u32,
+    /// The FEC block knob, from `GHOSTFRAME_FEC_BLOCKS=k_max,t_ms,r`. `None`
+    /// (unset, `off` or `0`) is the default: every bundle is a plain frame.
+    pub fec_blocks: Option<FecBlockParams>,
+}
+
+/// The fixed `(k_max, T, r)` of the FEC block knob (`GHOSTFRAME_FEC_BLOCKS`):
+/// a block closes at `k_max` source symbols, at `t_ms` after its first
+/// source, or at Empty, and carries `r` repair symbols.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FecBlockParams {
+    /// Source symbols per block at most. Valid in `1..=255 - r`.
+    pub k_max: u8,
+    /// Block duration in milliseconds. Valid in `1..=20`: the client's
+    /// recovery window is fixed at 43 ms, and a block must end well inside it.
+    pub t_ms: u8,
+    /// Repair symbols per block. Valid in `1..=32`.
+    pub r: u8,
+}
+
+impl FecBlockParams {
+    /// Parse `k_max,t_ms,r`. `None` for anything out of range or malformed.
+    fn parse(raw: &str) -> Option<Self> {
+        let mut fields = raw.split(',').map(|f| f.trim().parse::<u8>().ok());
+        let (k_max, t_ms, r) = (fields.next()??, fields.next()??, fields.next()??);
+        if fields.next().is_some() {
+            return None;
+        }
+        let valid =
+            (1..=32).contains(&r) && (1..=255 - r).contains(&k_max) && (1..=20).contains(&t_ms);
+        valid.then_some(Self { k_max, t_ms, r })
+    }
+}
+
+/// `GHOSTFRAME_FEC_BLOCKS`: unset, empty, `off` or `0` is off. A value that
+/// does not parse or is out of range warns and is off.
+fn fec_blocks_from_lookup(get: &impl Fn(&str) -> Option<String>) -> Option<FecBlockParams> {
+    let raw = get("GHOSTFRAME_FEC_BLOCKS")?;
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "off" || raw == "0" {
+        return None;
+    }
+    let parsed = FecBlockParams::parse(raw);
+    if parsed.is_none() {
+        tracing::warn!(
+            target: "ghostframe::config",
+            value = %raw,
+            "GHOSTFRAME_FEC_BLOCKS is not k_max,t_ms,r with r in 1..=32, k_max in 1..=255-r, t_ms in 1..=20: FEC blocks are off"
+        );
+    }
+    parsed
 }
 
 /// Which H.264 encoder backends the daemon may open
@@ -446,6 +496,7 @@ impl TransportConfig {
             h264_backend: H264BackendChoice::parse(get("GHOSTFRAME_H264_BACKEND").as_deref()),
             openh264_lib: openh264_lib_from_lookup(&get),
             capture_fps: 0,
+            fec_blocks: fec_blocks_from_lookup(&get),
         }
     }
 
@@ -1417,6 +1468,64 @@ mod tests {
             !TransportConfig::from_lookup(lookup(&[])).skip_palette_session_reset,
             "unset must yield false"
         );
+    }
+
+    #[test]
+    fn fec_blocks_parses_the_triple_and_is_off_otherwise() {
+        let parse = |v: &str| {
+            TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_FEC_BLOCKS", v)])).fec_blocks
+        };
+        let on = Some(FecBlockParams {
+            k_max: 64,
+            t_ms: 5,
+            r: 2,
+        });
+        assert_eq!(parse("64,5,2"), on);
+        assert_eq!(
+            parse(" 64, 5, 2 "),
+            on,
+            "whitespace around fields is ignored"
+        );
+        assert_eq!(
+            parse("253,20,2"),
+            Some(FecBlockParams {
+                k_max: 253,
+                t_ms: 20,
+                r: 2
+            }),
+            "k_max = 255 - r is the bound"
+        );
+        assert_eq!(
+            parse("1,1,32"),
+            Some(FecBlockParams {
+                k_max: 1,
+                t_ms: 1,
+                r: 32
+            })
+        );
+        for off in ["", "off", "0"] {
+            assert_eq!(parse(off), None, "{off:?} is off");
+        }
+        assert_eq!(
+            TransportConfig::from_lookup(lookup(&[])).fec_blocks,
+            None,
+            "unset is off"
+        );
+        for bad in [
+            "64,5,0",   // r = 0
+            "64,5,33",  // r over 32
+            "254,5,2",  // k_max over 255 - r
+            "64,0,2",   // t_ms 0
+            "64,34,2",  // t_ms over 20
+            "0,5,2",    // k_max 0
+            "64,5",     // missing field
+            "64,5,2,1", // extra field
+            "x,y,z",    // garbage
+            "64,5,-1",  // negative
+            "300,5,2",  // does not fit u8
+        ] {
+            assert_eq!(parse(bad), None, "{bad:?} must be refused");
+        }
     }
 
     #[test]
