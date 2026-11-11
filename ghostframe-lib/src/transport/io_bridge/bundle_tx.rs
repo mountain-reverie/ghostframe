@@ -435,6 +435,17 @@ impl IoBridge {
             .offered
             .bill(WireClass::Control, control_dg, framing);
         self.instr.fifo_peak_at_enqueue = self.instr.fifo_peak_at_enqueue.max(queued);
+        // Short bundles back to back in a non-empty FIFO can share a QUIC
+        // packet; `queued` includes this bundle, so the FIFO before it is
+        // `queued - wire`.
+        let short = self
+            .live_max_dg()
+            .is_some_and(|max_dg| b.bytes.len() + 64 < max_dg);
+        let fifo_before = queued.saturating_sub(wire as u64);
+        if short && self.last_enqueued_was_short && fifo_before > 0 {
+            self.instr.admission.short_bundle_shared_risk += 1;
+        }
+        self.last_enqueued_was_short = short;
         self.track_enqueue(handle, Some(b.bundle_seq), cum);
     }
 }

@@ -143,6 +143,7 @@ impl IoBridge {
         // session's too.
         self.packer.reset();
         self.pending_bundles.clear();
+        self.last_enqueued_was_short = false;
         self.emitted_meta.clear();
         // And what was waiting to be reported about it: a loss of the old
         // path handed to the new connection's estimator at its first
