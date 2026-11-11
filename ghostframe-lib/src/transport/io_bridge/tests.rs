@@ -9965,3 +9965,43 @@ async fn content_rejected_after_the_ack_requests_a_new_idr() {
         1
     );
 }
+
+/// A sealed bundle the path no longer carries (`TooLarge` at quinn) gives its
+/// H.264 records what an oversize datagram gets: the IDR is dead and is sent
+/// again, and each fragment is counted forgotten.
+#[tokio::test(start_paused = true)]
+async fn a_sealed_bundle_refused_as_too_large_abandons_its_idr() {
+    use crate::encoder::h264::tracker::FrameState;
+    let mut bridge = acked_refs_bridge();
+    // Hold the fragments in the emitter until the wire refuses.
+    bridge.forced_fifo_depth_for_test = Some(usize::MAX / 2);
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    bridge.record_emitted_transmissions(now_std());
+    bridge.forced_fifo_depth_for_test = None;
+    bridge.test_wire.as_mut().unwrap().too_large = true;
+    bridge.drain_reliable_emitter(now_std());
+    bridge.flush_bundles();
+
+    assert_eq!(
+        bridge.test_wire.as_ref().unwrap().cum,
+        0,
+        "premise: none sent"
+    );
+    assert!(
+        bridge.h264.stats.oversize_h264 > 0,
+        "premise: fragments retired"
+    );
+    assert!(bridge.transmission_ledger.is_empty(), "forgotten");
+    assert!(
+        bridge.h264.stats.tx_forgotten >= bridge.h264.stats.oversize_h264,
+        "each retired H.264 record is counted forgotten: {:?}",
+        bridge.h264.stats
+    );
+    let r = bridge.h264_refs_report();
+    assert!(r.mtu_retired >= 1 && r.mtu_retired_idr == 1, "{r:?}");
+    assert_eq!(
+        bridge.h264.refs.as_ref().unwrap().mgr.frame_state(0),
+        Some(FrameState::Dead)
+    );
+    assert_eq!(bridge.reliable_emitter.queued_h264_bytes(), 0);
+}

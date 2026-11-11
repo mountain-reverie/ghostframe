@@ -460,3 +460,27 @@ async fn short_bundles_back_to_back_in_a_busy_fifo_are_counted() {
     accept_bundle(&mut b, &mut fifo, 300);
     assert_eq!(b.instr.admission.short_bundle_shared_risk, 0);
 }
+
+#[tokio::test]
+async fn a_sealed_bundle_refused_as_too_large_gives_its_tiles_and_pad_back() {
+    let mut b = framed_bridge();
+    submit_tiles(&mut b, 2);
+    let template = bytes::Bytes::from(vec![0u8; 100]);
+    let probe = ProbeTag {
+        id: 1,
+        min_probes: 1,
+        min_bytes: 1,
+        bytes_sent_before: 0,
+    };
+    b.reliable_emitter
+        .submit_h264_pad(&template, probe, now_std());
+    b.test_wire.as_mut().unwrap().too_large = true;
+    b.drain_reliable_emitter(now_std());
+    b.flush_bundles();
+
+    assert_eq!(b.test_wire.as_ref().unwrap().cum, 0, "premise: none sent");
+    assert!(b.pending_bundles.is_empty(), "the bundles are consumed");
+    assert!(b.transmission_ledger.is_empty(), "forgotten, not judged");
+    assert_eq!(b.h264.stats.oversize_tile, 2, "each tile record is retired");
+    assert_eq!(b.h264.stats.oversize_pad, 1);
+}

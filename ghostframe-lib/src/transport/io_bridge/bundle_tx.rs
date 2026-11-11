@@ -42,6 +42,8 @@ const EMITTED_META_CAP: usize = 1 << 17;
 pub(crate) struct TestWire {
     /// Refuse every bundle (`Blocked`).
     pub(crate) blocked: bool,
+    /// Refuse every bundle as `TooLarge` (the path shrank).
+    pub(crate) too_large: bool,
     /// Accepted bytes, frame plus one byte of framing each.
     pub(crate) cum: u64,
 }
@@ -68,6 +70,9 @@ impl IoBridge {
         #[cfg(test)]
         if self.live_send_handle().is_none() {
             if let Some(w) = self.test_wire.as_mut() {
+                if w.too_large {
+                    return Offer::Refused(quinn_proto::SendDatagramError::TooLarge);
+                }
                 if w.blocked {
                     return Offer::Refused(quinn_proto::SendDatagramError::Blocked(
                         bytes::Bytes::new(),
@@ -379,15 +384,20 @@ impl IoBridge {
             }
             Offer::Refused(quinn_proto::SendDatagramError::TooLarge) => {
                 // The path shrank under a bundle sealed for the old size. It
-                // can never go; its records are recovered by the loss path
-                // as if they had never been built.
+                // can never go, and it will never be acknowledged or judged,
+                // so nothing would ever tell the owners of its content: each
+                // record gets what an oversize datagram retired from the
+                // emission queue gets (a tile re-encoded, an H.264 frame lost
+                // to the manager, padding dropped).
                 tracing::warn!(
                     target: LOG_TARGET,
                     bundle_seq = b.bundle_seq,
                     len = b.bytes.len(),
                     "dropping a sealed bundle the path no longer carries"
                 );
-                self.transmission_ledger.forget_undeparted(b.bundle_seq);
+                let tracked = self.transmission_ledger.forget_undeparted(b.bundle_seq);
+                let contents = b.records.iter().map(|r| Some(r.content)).collect();
+                self.retire_oversize_contents(contents, tracked, now_std());
                 true
             }
             Offer::Refused(_) => false,
