@@ -434,7 +434,7 @@ mod emitter_tests {
         }
         // What the queue hands the wire carries exactly the reported wire_seq.
         for tx in &sent {
-            let em = e.next_emission(t).expect("queued");
+            let em = e.next_emission().expect("queued");
             assert!(matches!(em, Emission::Source(_, WireClass::H264)));
             assert_eq!(stamped(&em), tx.wire_seq);
         }
@@ -494,7 +494,7 @@ mod emitter_tests {
         );
         // Both resends are in the queue behind the 4 originals, as loss resends.
         let mut classes = Vec::new();
-        while let Some(em) = e.next_emission(t) {
+        while let Some(em) = e.next_emission() {
             classes.push(em.class());
         }
         assert_eq!(classes[4..], [WireClass::LossRetransmit; 2]);
@@ -539,7 +539,7 @@ mod emitter_tests {
         submit(&mut e, 1, true, 2, t);
         submit(&mut e, 2, false, 2, t);
         // One datagram has already left the queue (frame 1, fragment 0).
-        let first = e.next_emission(t).expect("queued");
+        let first = e.next_emission().expect("queued");
         let first_ws = stamped(&first);
         let all = e.take_transmissions();
         let queued_before = e.queued_h264_bytes();
@@ -558,7 +558,7 @@ mod emitter_tests {
         assert!(!removed.contains(&first_ws));
         assert_eq!(e.h264.len(), 0, "the cache forgot both frames");
         assert_eq!(e.queued_h264_bytes(), 0, "the queue holds none");
-        assert!(e.next_emission(t).is_none());
+        assert!(e.next_emission().is_none());
         assert_eq!(
             e.stats.h264_queue_purged, 3,
             "the three fragments still queued"
@@ -573,7 +573,7 @@ mod emitter_tests {
         submit(&mut e, 1, false, 2, t);
         let per = FRAME_HEADER_SIZE + FRAG;
         assert_eq!(e.queued_h264_bytes(), 2 * per);
-        let em = e.next_emission(t).unwrap();
+        let em = e.next_emission().unwrap();
         assert_eq!(e.queued_h264_bytes(), per);
         e.hold_emission(em);
         assert_eq!(
@@ -608,60 +608,6 @@ mod emitter_tests {
         let _ = Duration::ZERO;
     }
 
-    /// H.264 fragments take wire_seqs from the same counter as tile passes but
-    /// are not tile XOR group members: a tile group they interrupt is
-    /// abandoned (no parity with a false membership), and a later contiguous
-    /// run of tile passes still forms a group of its own.
-    #[test]
-    fn h264_fragments_do_not_join_tile_parity_groups() {
-        use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K};
-        let t = Instant::now();
-        let tile = |e: &mut ReliableTileEmitter, i: u32| {
-            e.submit_one(
-                EmitKey::new(i, 0, 0, 0),
-                Bytes::from(vec![0x80u8; 25]),
-                t,
-                None,
-                t,
-            );
-        };
-        let parity_groups = |e: &mut ReliableTileEmitter| {
-            let mut now = t;
-            let mut groups = Vec::new();
-            for _ in 0..50 {
-                now += Duration::from_millis(1);
-                while let Some(em) = e.next_emission(now) {
-                    if let Some(g) = em.parity_group() {
-                        groups.push(g);
-                    }
-                }
-            }
-            groups
-        };
-        let mut e = ReliableTileEmitter::new(t);
-        e.set_tile_fec(true);
-        let half = FEC_GROUP_SIZE_K as u32 / 2;
-        for i in 0..half {
-            tile(&mut e, i);
-        }
-        submit(&mut e, 99, false, 1, t); // one H.264 fragment in the run
-        for i in half..FEC_GROUP_SIZE_K as u32 - 1 {
-            tile(&mut e, i);
-        }
-        assert!(
-            parity_groups(&mut e).is_empty(),
-            "K - 1 tile passes and a fragment are not a group of K"
-        );
-        // The run restarts after the fragment: the tile passes that follow it
-        // (wire_seq half + 1 onwards, contiguous) form one group of K at their
-        // own start, never one that begins before the fragment.
-        let after_fragment = half + 1;
-        for i in 100..100 + FEC_GROUP_SIZE_K as u32 {
-            tile(&mut e, i);
-        }
-        assert_eq!(parity_groups(&mut e), vec![after_fragment]);
-    }
-
     #[test]
     fn padding_is_flagged_tagged_billed_in_flight_and_never_sent_again() {
         use crate::transport::protocol::FRAME_FLAG_PAD;
@@ -690,10 +636,8 @@ mod emitter_tests {
             Content::Pad(ws),
             "named by its own wire_seq"
         );
-        let em = e.next_emission(t).expect("queued");
-        let Emission::Source(bytes, _) = &em else {
-            panic!("a source emission")
-        };
+        let em = e.next_emission().expect("queued");
+        let Emission::Source(bytes, _) = &em;
         assert_eq!(
             bytes[16] & FRAME_FLAG_PAD,
             FRAME_FLAG_PAD,

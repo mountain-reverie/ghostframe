@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Output queue that interleaves source datagrams with FEC parity
-//! datagrams offset by PARITY_INTERLEAVE_OFFSET wire_seqs behind the
-//! group's first source — so the parity is well-separated from its
-//! sources in the kernel UDP write window.
+//! Output queue of datagrams waiting to be handed to the transport.
 
-use crate::transport::reliable_emitter::END_OF_STREAM_PARITY_FLUSH_MS;
-use crate::transport::reliable_emitter::PARITY_INTERLEAVE_OFFSET;
 use bytes::Bytes;
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
-use std::time::{Duration, Instant};
+use std::collections::VecDeque;
 
 /// Highest `pass_idx` of the critical tier (passes 0-3); everything above is
 /// refinement. The single definition behind `pass_tier` and [`WireClass`].
@@ -31,8 +24,6 @@ pub enum WireClass {
     /// holding (`Scheduler::drain_priority_queue`'s fallback retry). It goes
     /// through `submit_one` like a first send, so it is labelled here.
     SchedulerRetry,
-    /// FEC parity (tile groups and H.264 frames).
-    Parity,
     /// H.264 frame fragments.
     H264,
     /// Datagrams that are no tile pass: frame dimensions, pongs, eviction.
@@ -40,7 +31,7 @@ pub enum WireClass {
 }
 
 impl WireClass {
-    pub(crate) const COUNT: usize = 8;
+    pub(crate) const COUNT: usize = 7;
     #[cfg(test)]
     pub(crate) const ALL: [WireClass; Self::COUNT] = [
         WireClass::Critical,
@@ -48,7 +39,6 @@ impl WireClass {
         WireClass::NackRepair,
         WireClass::LossRetransmit,
         WireClass::SchedulerRetry,
-        WireClass::Parity,
         WireClass::H264,
         WireClass::Control,
     ];
@@ -71,22 +61,11 @@ impl WireClass {
 pub enum Emission {
     /// A source datagram and the reason it is on the wire.
     Source(Bytes, WireClass),
-    /// Parity datagram of the tile group starting at the given `wire_seq`.
-    Parity(Bytes, u32),
 }
 
 impl Emission {
-    /// For a tile parity datagram, the first `wire_seq` of the group it covers.
-    pub fn parity_group(&self) -> Option<u32> {
-        match self {
-            Emission::Parity(_, g) => Some(*g),
-            Emission::Source(..) => None,
-        }
-    }
-
     /// The `wire_seq` a source datagram carries (stamped at bytes 8..12 by the
-    /// emitter), which names the transmission in the ledger. Parity is not a
-    /// tracked transmission.
+    /// emitter), which names the transmission in the ledger.
     pub fn wire_seq(&self) -> Option<u32> {
         match self {
             Emission::Source(b, _) if b.len() >= 12 => {
@@ -95,29 +74,21 @@ impl Emission {
                 // fragment sent without a ledger record): it names no transmission.
                 (ws != crate::transport::protocol::NO_ACK).then_some(ws)
             }
-            Emission::Source(..) | Emission::Parity(..) => None,
+            Emission::Source(..) => None,
         }
     }
 
     pub fn class(&self) -> WireClass {
         match self {
             Emission::Source(_, c) => *c,
-            Emission::Parity(..) => WireClass::Parity,
         }
     }
 }
 
 pub struct EmissionQueue {
     queue: VecDeque<Emission>,
-    /// Bytes of the frame datagrams in `queue` (H.264 fragments, resends and
-    /// parity): the backlog the encoder's backpressure reads.
+    /// Bytes of the frame datagrams in `queue` (H.264 fragments and resends): the backlog the encoder's backpressure reads.
     frame_bytes: usize,
-    /// (Reverse(emit_after_wire_seq), parity_bytes). BinaryHeap is max-heap
-    /// by default; Reverse turns it into a min-heap by emit_after.
-    pending_parity: BinaryHeap<Reverse<(u32, Vec<u8>)>>,
-    /// Set when the queue runs dry with parity still pending. After
-    /// END_OF_STREAM_PARITY_FLUSH_MS the pending parity is force-flushed.
-    end_of_stream_idle_since: Option<Instant>,
 }
 
 impl Default for EmissionQueue {
@@ -135,7 +106,7 @@ fn is_frame_datagram(bytes: &[u8]) -> bool {
 fn frame_len(e: &Emission) -> usize {
     match e {
         Emission::Source(b, _) if is_frame_datagram(b) => b.len(),
-        Emission::Source(..) | Emission::Parity(..) => 0,
+        Emission::Source(..) => 0,
     }
 }
 
@@ -144,8 +115,6 @@ impl EmissionQueue {
         Self {
             queue: VecDeque::new(),
             frame_bytes: 0,
-            pending_parity: BinaryHeap::new(),
-            end_of_stream_idle_since: None,
         }
     }
 
@@ -164,7 +133,7 @@ impl EmissionQueue {
     /// For the case where the transport refused the datagram. Safe precisely
     /// because a queued `Emission` is a byte blob that has not left yet:
     /// `submit_one` has already allocated the wire_seq, baked it into these
-    /// bytes, inserted the retransmit-cache entry and fed the FEC group, so
+    /// bytes, inserted the retransmit-cache entry, so
     /// there is nothing to roll back and the transmission simply happens
     /// later under the sequence it already holds.
     ///
@@ -173,70 +142,25 @@ impl EmissionQueue {
     pub fn push_front(&mut self, emission: Emission) {
         self.frame_bytes += frame_len(&emission);
         self.queue.push_front(emission);
-        self.end_of_stream_idle_since = None;
     }
 
     pub fn push_source(&mut self, bytes: Bytes, class: WireClass) {
         let e = Emission::Source(bytes, class);
         self.frame_bytes += frame_len(&e);
         self.queue.push_back(e);
-        self.end_of_stream_idle_since = None;
     }
 
-    /// Schedule a parity datagram to be emitted when the upstream allocator
-    /// has advanced to `emit_after_wire_seq`.
-    pub fn schedule_parity(&mut self, emit_after_wire_seq: u32, bytes: Vec<u8>) {
-        self.pending_parity
-            .push(Reverse((emit_after_wire_seq, bytes)));
-    }
-
-    /// Pop the next emission given the next wire_seq the allocator will hand
-    /// out for a new source and the current time.
-    pub fn pop(&mut self, next_wire_seq: u32, now: Instant) -> Option<Emission> {
-        // Promote any parity whose emit_after_wire_seq is reached.
-        while let Some(Reverse((after, _))) = self.pending_parity.peek() {
-            if *after > next_wire_seq {
-                break;
-            }
-            let Reverse((after, bytes)) = self.pending_parity.pop().unwrap();
-            self.queue.push_back(Emission::Parity(
-                Bytes::from(bytes),
-                after.wrapping_sub(PARITY_INTERLEAVE_OFFSET),
-            ));
-        }
-        // Check end-of-stream flush.
-        self.maybe_flush_pending(now);
+    /// Pop the next emission.
+    pub fn pop(&mut self) -> Option<Emission> {
         let popped = self.queue.pop_front();
         if let Some(e) = &popped {
             self.frame_bytes -= frame_len(e);
         }
-        if popped.is_some() {
-            self.end_of_stream_idle_since = None;
-        } else if !self.pending_parity.is_empty() && self.end_of_stream_idle_since.is_none() {
-            self.end_of_stream_idle_since = Some(now);
-        }
         popped
     }
 
-    fn maybe_flush_pending(&mut self, now: Instant) {
-        let Some(idle_since) = self.end_of_stream_idle_since else {
-            return;
-        };
-        if now.duration_since(idle_since) < Duration::from_millis(END_OF_STREAM_PARITY_FLUSH_MS) {
-            return;
-        }
-        // Flush every pending parity unconditionally.
-        while let Some(Reverse((after, bytes))) = self.pending_parity.pop() {
-            self.queue.push_back(Emission::Parity(
-                Bytes::from(bytes),
-                after.wrapping_sub(PARITY_INTERLEAVE_OFFSET),
-            ));
-        }
-        self.end_of_stream_idle_since = None;
-    }
-
     pub fn is_empty(&self) -> bool {
-        self.queue.is_empty() && self.pending_parity.is_empty()
+        self.queue.is_empty()
     }
 
     /// Bytes of H.264 frame datagrams waiting to be sent.
@@ -246,15 +170,13 @@ impl EmissionQueue {
 
     /// Remove every queued frame datagram whose frame `doomed` names.
     /// Returns how many were removed and the `wire_seq`s of those that carried
-    /// one (parity does not).
+    /// one.
     pub fn purge_frames(&mut self, doomed: impl Fn(u32) -> bool) -> (usize, Vec<u32>) {
         let mut wire_seqs = Vec::new();
         let mut removed = 0usize;
         let mut freed = 0usize;
         self.queue.retain(|e| {
-            let Emission::Source(b, _) = e else {
-                return true;
-            };
+            let Emission::Source(b, _) = e;
             if !is_frame_datagram(b) {
                 return true;
             }
@@ -277,51 +199,14 @@ impl EmissionQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::reliable_emitter::PARITY_INTERLEAVE_OFFSET;
-
-    fn epoch() -> Instant {
-        // A fixed Instant we can deterministically compare against.
-        Instant::now()
-    }
 
     #[test]
     fn source_only_pops_in_order() {
         let mut q = EmissionQueue::new();
-        let t = epoch();
         q.push_source(Bytes::from_static(&[1]), WireClass::Critical);
         q.push_source(Bytes::from_static(&[2]), WireClass::Critical);
-        assert!(matches!(q.pop(2, t), Some(Emission::Source(..))));
-        assert!(matches!(q.pop(2, t), Some(Emission::Source(..))));
-        assert!(q.pop(2, t).is_none());
-    }
-
-    #[test]
-    fn parity_emits_after_offset_wire_seq() {
-        let mut q = EmissionQueue::new();
-        let t = epoch();
-        q.push_source(Bytes::from_static(&[0]), WireClass::Critical); // wire_seq 0
-        q.schedule_parity(PARITY_INTERLEAVE_OFFSET, vec![0xAA]); // emit after wire_seq 20
-                                                                 // next_wire_seq = 1 (allocator about to hand out 1): parity not yet
-        let e = q.pop(1, t).unwrap();
-        assert!(matches!(e, Emission::Source(..)));
-        // Still no parity at next=5 — queue is now empty (source already popped above)
-        assert!(q.pop(5, t).is_none());
-        // At next=20 the parity becomes ready
-        let e = q.pop(20, t).unwrap();
-        assert!(matches!(e, Emission::Parity(b, 0) if b == vec![0xAA]));
-    }
-
-    #[test]
-    fn end_of_stream_flush_releases_parity_after_idle() {
-        let mut q = EmissionQueue::new();
-        let t0 = Instant::now();
-        q.schedule_parity(PARITY_INTERLEAVE_OFFSET, vec![0xBB]);
-        // No sources to advance wire_seq → parity blocked normally.
-        assert!(q.pop(0, t0).is_none());
-        // Advance time past flush window
-        let t1 = t0 + Duration::from_millis(END_OF_STREAM_PARITY_FLUSH_MS + 1);
-        let e = q.pop(0, t1).expect("flushed");
-        assert!(matches!(e, Emission::Parity(..)));
-        assert!(q.is_empty());
+        assert!(matches!(q.pop(), Some(Emission::Source(b, _)) if b[0] == 1));
+        assert!(matches!(q.pop(), Some(Emission::Source(b, _)) if b[0] == 2));
+        assert!(q.pop().is_none());
     }
 }

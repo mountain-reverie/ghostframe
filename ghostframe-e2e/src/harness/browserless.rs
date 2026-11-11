@@ -280,10 +280,6 @@ pub struct RunOptions {
     /// left to advance the paused clock. `inject_frame` now bounds that send
     /// so it fails instead of hanging.
     pub frame_cost: Option<Duration>,
-    /// Emit the tile XOR parity, as `GHOSTFRAME_TILE_FEC=1` does in
-    /// production. Off by default, like the product, so a scene that does not
-    /// ask for it sees no parity datagram.
-    pub tile_fec: bool,
     /// The model controller's settings. `None` follows `GHOSTFRAME_CC_*`.
     pub model: Option<ghostframe_lib::config::ModelSettings>,
     /// How the server's event loop is driven. See [`HarnessMode`].
@@ -1129,7 +1125,6 @@ async fn run_inner(
         std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut scene.drops)));
     bridge.set_drop_plan(drop_plan_cell.clone());
     bridge.set_ignore_tile_nacks(opts.ignore_client_nacks);
-    bridge.set_tile_fec(opts.tile_fec);
     // The scene's time origin. Nothing below awaits before the original
     // definition site (the bridge is only moved or stored), so this is the
     // same instant it was when it was taken further down.

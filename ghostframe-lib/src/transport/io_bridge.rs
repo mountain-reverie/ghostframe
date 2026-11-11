@@ -1020,7 +1020,7 @@ pub struct IoBridge {
     /// Phase B escalation line 2711).
     bump_count_accumulator: BumpCountAccumulator,
     /// Reliable tile emitter — owns wire_seq allocation, retransmit
-    /// caching, FEC parity scheduling, and RTO bookkeeping. Fed by
+    /// caching, and RTO bookkeeping. Fed by
     /// `drain_scheduler_into_quinn` via `submit_batch`; drained to the
     /// wire by `drain_reliable_emitter`, through
     /// `send_to_all_sessions`. Cancellation on bump_generation is wired
@@ -1588,11 +1588,9 @@ impl IoBridge {
             last_cumulative_emit_log_frame: 0,
             color_histogram_accumulator: UniqueColorHistogram::default(),
             bump_count_accumulator: BumpCountAccumulator::default(),
-            reliable_emitter: {
-                let mut e = crate::transport::reliable_emitter::ReliableTileEmitter::new(now_std());
-                e.set_tile_fec(lib_config.transport.tile_fec);
-                e
-            },
+            reliable_emitter: crate::transport::reliable_emitter::ReliableTileEmitter::new(
+                now_std(),
+            ),
             bwe_samples_at_session_reset: 0,
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
             bwe,

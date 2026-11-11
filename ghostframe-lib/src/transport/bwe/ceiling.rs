@@ -75,7 +75,7 @@
 //!   counted and gapped readings published. The fix gives those paths nothing.
 //!
 //! The reading also carries the **payload fraction**, countable bytes per
-//! token spent: admission bills parity, framing and control datagrams that no
+//! token spent: admission bills framing and control datagrams that no
 //! acknowledgement names, so a sender paced at the estimate offers goog_cc
 //! `fraction x` it (0.82 to 0.86 measured). Admission divides the estimate by it. The
 //! units matter for the ceiling too: without the division `K x A` fell under
@@ -108,8 +108,7 @@ const _: () = assert!(SATURATION > AIMD_BACKOFF);
 /// a handful of datagrams is all rounding.
 const MIN_SPEND_FOR_FRACTION: f64 = 8_000.0;
 
-/// The payload fraction is never read below this: parity alone is `1/11` and
-/// framing a few percent, so a reading under it is a window that straddled a
+/// The payload fraction is never read below this: framing is a few percent, so a reading under it is a window that straddled a
 /// burst of control traffic, not the sender's overhead.
 const MIN_PAYLOAD_FRACTION: f64 = 0.5;
 
@@ -183,7 +182,7 @@ pub(crate) struct CeilingReading {
     /// second: what the sender put on the books, to set `acked_bps` against.
     pub(crate) offered_bps: f64,
     /// Countable bytes (what goog_cc is told of) per token spent, over the
-    /// shifted window: below 1 by the parity, framing and control bytes that
+    /// shifted window: below 1 by the framing and control bytes that
     /// admission bills and no acknowledgement names. `1.0` while there is
     /// too little spend to say.
     pub(crate) payload_fraction: f64,

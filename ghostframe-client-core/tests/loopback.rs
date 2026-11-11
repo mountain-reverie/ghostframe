@@ -14,8 +14,7 @@ use ghostframe_protocol::codec::cdf53;
 use ghostframe_protocol::codec::pal_rle::{encode_pal_rle_payload, PaletteEntry};
 use ghostframe_protocol::codec::solid::encode_solid;
 use ghostframe_protocol::protocol::{
-    fragment_tile, Codec, TileFragmentInputs, TileNackEnvelope, TileParityEnvelope,
-    TILE_DATAGRAM_FLAG,
+    fragment_tile, Codec, TileFragmentInputs, TileNackEnvelope, TILE_DATAGRAM_FLAG,
 };
 
 const TILE_DIM: usize = 32;
@@ -61,19 +60,6 @@ fn tile_datagrams(
         mtu_payload,
     )
 }
-
-/// Stamp `wire_seq` (bytes 8..12, big-endian) into a fragment produced by
-/// `fragment_tile`, matching what the real `ReliableTileEmitter` does at
-/// submit time (`fragment_tile` always leaves `wire_seq = UNSTAMPED_WIRE_SEQ`).
-fn stamp_wire_seq(datagram: &mut [u8], wire_seq: u32) {
-    datagram[8..12].copy_from_slice(&wire_seq.to_be_bytes());
-}
-
-// Tests that don't call `stamp_wire_seq` deliver datagrams with
-// `wire_seq == UNSTAMPED_WIRE_SEQ == 0` for every fragment, which the
-// wire-sequence parity window (`ParityDecoder`) treats as repeated
-// duplicates of "sequence 0" rather than distinct entries; this is
-// intentional here since those tests aren't exercising FEC/parity recovery.
 
 /// One tile's role in the synthetic test frame.
 #[derive(Clone, Copy)]
@@ -527,139 +513,6 @@ fn loss_with_nack_replay_converges() {
             "tile ({tx},{ty}) mismatch after NACK replay"
         );
     }
-}
-
-#[test]
-fn parity_group_recovers_without_retransmit() {
-    let mut core = test_core();
-    let frame_seq = 3u32;
-
-    // 10 single-fragment Solid tiles at distinct (tx, ty), one fragment
-    // each (fits well under MTU_PAYLOAD).
-    let coords: Vec<(u8, u8)> = (0..10u8).map(|i| (i, 0u8)).collect();
-    let mut fragments: Vec<Vec<u8>> = Vec::new();
-    let mut expecteds: Vec<Vec<u8>> = Vec::new();
-    for &(tx, ty) in &coords {
-        let color = [tx.wrapping_mul(17), ty, 0x55, 0xFF];
-        let kind = TileKind::Solid(color);
-        let bgra = tile_bgra(kind, tx, ty);
-        let payload = encode_solid(&bgra);
-        let mut dgs = tile_datagrams(frame_seq, tx, ty, Codec::Solid, 1, 0, &payload, MTU_PAYLOAD);
-        assert_eq!(dgs.len(), 1, "expected single-fragment tile");
-        fragments.push(dgs.remove(0));
-        expecteds.push(expected_rgba(kind, tx, ty));
-    }
-
-    // Re-stamp bytes 8..12 (wire_seq, BE) with consecutive values, as the
-    // real ReliableTileEmitter would at submit time (fragment_tile leaves
-    // wire_seq == UNSTAMPED_WIRE_SEQ == 0).
-    let base_wire_seq = 1000u32;
-    for (i, dg) in fragments.iter_mut().enumerate() {
-        stamp_wire_seq(dg, base_wire_seq + i as u32);
-    }
-
-    // Build one XOR-parity TileParityEnvelope covering all 10 wire_seqs.
-    let k = fragments.len();
-    let target_len = fragments.iter().map(|f| f.len()).max().unwrap();
-    let mut parity_payload = vec![0u8; target_len];
-    for f in &fragments {
-        let pad = target_len - f.len();
-        for (i, b) in f.iter().enumerate() {
-            parity_payload[pad + i] ^= b;
-        }
-    }
-    let envelope = TileParityEnvelope {
-        group_first_wire_seq: base_wire_seq,
-        k: k as u8,
-        parity_idx: 0,
-        source_lens: fragments.iter().map(|f| f.len() as u16).collect(),
-        parity_payload,
-    };
-    let mut parity_bytes = Vec::new();
-    envelope.encode(&mut parity_bytes);
-
-    // Drop exactly one source datagram (index 4); deliver the rest, plus
-    // the parity datagram.
-    let dropped_idx = 4usize;
-    let mut last_ready: HashMap<(u8, u8), Vec<u8>> = HashMap::new();
-    let mut t = 0u64;
-    for (i, dg) in fragments.iter().enumerate() {
-        if i == dropped_idx {
-            t += 1;
-            continue;
-        }
-        let evs = core.handle_datagram(dg, t);
-        for e in evs {
-            if let Event::TileReady {
-                tile_x,
-                tile_y,
-                rgba,
-                ..
-            } = e
-            {
-                last_ready.insert((tile_x, tile_y), rgba);
-            }
-        }
-        t += 1;
-    }
-    let evs = core.handle_datagram(&parity_bytes, t);
-    for e in evs {
-        if let Event::TileReady {
-            tile_x,
-            tile_y,
-            rgba,
-            ..
-        } = e
-        {
-            last_ready.insert((tile_x, tile_y), rgba);
-        }
-    }
-    t += 1;
-
-    assert_eq!(
-        last_ready.len(),
-        coords.len(),
-        "expected all 10 tiles ready"
-    );
-    for (i, &(tx, ty)) in coords.iter().enumerate() {
-        let got = last_ready
-            .get(&(tx, ty))
-            .unwrap_or_else(|| panic!("missing TileReady for tile {i} ({tx},{ty})"));
-        assert_eq!(
-            got, &expecteds[i],
-            "tile {i} ({tx},{ty}) pixel mismatch after FEC recovery"
-        );
-    }
-
-    // Trigger periodic feedback and inspect datagrams_recovered_fec. Both
-    // recovery paths count: a datagram rebuilt from a wire-seq
-    // `TileParityEnvelope` that had really not arrived bumps it (this path
-    // used to be uncounted, which left the field zero on the wire).
-    if let Some(deadline) = core.poll_timeout() {
-        t = t.max(deadline).max(100_000);
-        core.on_timeout(t);
-    }
-    let mut fb: Option<Vec<u8>> = None;
-    while let Some(out) = core.poll_transmit(t) {
-        if let PollOutput::Stream(b) = out {
-            if b.first() == Some(&0x01) && b.len() == 18 {
-                fb = Some(b);
-            }
-        }
-    }
-    let fb = fb.expect("expected a ReceiverFeedback stream message");
-    // ReceiverFeedback layout: [0]=type, [1..9]=timestamp_ns,
-    // [9..13]=datagrams_received, [13..17]=datagrams_recovered_fec,
-    // [17]=suspension_detected.
-    // (Matches the byte layout asserted in tests/reassembly.rs, shifted by
-    // the leading type byte relative to that test's fb[12..16] offsets
-    // which start counting after an 8-byte timestamp with no type byte —
-    // recompute directly from the encoder instead of hardcoding offsets.)
-    let recovered_fec = u32::from_be_bytes([fb[13], fb[14], fb[15], fb[16]]);
-    assert_eq!(
-        recovered_fec, 1,
-        "exactly one datagram was lost and rebuilt from parity; got {recovered_fec}"
-    );
 }
 
 /// A tiny deterministic SplitMix64 PRNG, used only to shuffle test-input

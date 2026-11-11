@@ -85,8 +85,8 @@
 //! The per-datagram chain remains available as
 //! [`GilbertElliott::from_rate_and_burst_per_datagram`] (and as the raw
 //! `NetProfile` fields with `burst_quantum_us == 0`) for analyses that
-//! reason about runs of consecutive datagrams by index
-//! (`fec_burst_analysis`) and for the netsim mechanics tests. Never drive a
+//! reason about runs of consecutive datagrams by index and for the netsim
+//! mechanics tests. Never drive a
 //! real sender with it: it reintroduces the stranding artifact above.
 //!
 //! # Env protocol (harness layer: QUIC packets, browserless only)
@@ -188,8 +188,7 @@ impl GilbertElliott {
     /// rarely, and each rare datagram still advances the chain one step, so a
     /// "burst" outlasts the sender's recovery timers and strands it (the
     /// harness artifact this module's docs describe). Keep it for analyses
-    /// that reason about runs by datagram index (`fec_burst_analysis`) and
-    /// for the raw-field mechanics tests in `tests/netsim.rs`.
+    /// that reason about runs by datagram index and for the raw-field mechanics tests in `tests/netsim.rs`.
     pub fn from_rate_and_burst_per_datagram(
         avg_loss: f64,
         mean_burst_len: f64,
