@@ -344,6 +344,52 @@ async fn the_bandwidth_cap_runs_on_bundles_and_the_drop_plan_on_records() {
 }
 
 #[tokio::test]
+async fn a_record_dropped_by_the_plan_is_a_lost_transmission_and_is_retransmitted() {
+    use crate::transport::drop_plan::{DropPlan, DropRule};
+    let mut b = framed_bridge();
+    // Every test tile is at (0, 0); drop the second occurrence.
+    b.drop_plan = Some(std::sync::Arc::new(std::sync::Mutex::new(DropPlan::new(
+        vec![DropRule {
+            tile_x: 0,
+            tile_y: 0,
+            occurrences: vec![1],
+        }],
+    ))));
+    submit_tiles(&mut b, 15);
+    send_all(&mut b);
+    let sent: Vec<Vec<u8>> = b.sent_frames_for_test.clone();
+    let seqs: Vec<u32> = sent.iter().map(|f| frame_seq(f)).collect();
+    let in_bundles: usize = sent.iter().map(|f| frame_records(f).len()).sum();
+    assert_eq!(in_bundles, 14, "premise: one record never reached a bundle");
+    let gap: Vec<u32> = (0..=*seqs.iter().max().unwrap())
+        .filter(|s| !seqs.contains(s))
+        .collect();
+    assert_eq!(gap.len(), 1, "one bundle_seq is the dropped record's");
+    let dropped = gap[0];
+    assert_eq!(
+        b.transmission_ledger.departed(dropped),
+        Some(true),
+        "the dropped record is on the books and departed"
+    );
+    for s in &seqs {
+        b.stamp_departure(*s, now_std());
+    }
+    // Everything after it is acknowledged: the packet threshold fires.
+    let later: Vec<u32> = seqs.iter().copied().filter(|s| *s > dropped).collect();
+    assert!(later.len() >= 3, "premise: enough later bundles {later:?}");
+    ack_v4(&mut b, &later);
+    b.expire_transmissions(now_std());
+    assert!(
+        b.instr.loss_retx_requested >= 1,
+        "the dropped record is retransmitted"
+    );
+    let mut n = 0;
+    b.reliable_emitter
+        .tick_loss_budgeted(now_std(), usize::MAX, usize::MAX, &mut n);
+    assert!(n >= 1);
+}
+
+#[tokio::test]
 async fn forgetting_the_live_session_resets_the_packer() {
     let mut b = framed_bridge();
     submit_tiles(&mut b, 2);
