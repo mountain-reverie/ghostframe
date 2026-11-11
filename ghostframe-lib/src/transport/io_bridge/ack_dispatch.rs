@@ -260,8 +260,9 @@ impl IoBridge {
                                 self.reliable_emitter.note_ack_origin(k, record_ws);
                             }
                         }
-                        // One loss-window sample per transmission.
-                        self.loss_window.record(tx.emit_us as u32, false);
+                        // One loss-window sample per record the transmission carried.
+                        self.loss_window
+                            .record(tx.emit_us as u32, false, tx.records.len() as u32);
                         self.recent_bundles.remember(id, &tx);
                         Some((tx, arrival_lo16, false))
                     }
@@ -283,7 +284,8 @@ impl IoBridge {
                                 now_for_samples,
                             );
                         }
-                        self.loss_window.retract(tx.emit_us as u32);
+                        self.loss_window
+                            .retract(tx.emit_us as u32, tx.records.len() as u32);
                         self.recent_bundles.remember(id, &tx);
                         // Observability: was goog_cc already told this was
                         // lost?
