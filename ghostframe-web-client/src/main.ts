@@ -27,6 +27,14 @@ import init, {
 /** Microsecond clock for every `now_us` parameter WasmClientCore expects. */
 const nowUs = (): bigint => BigInt(Math.round(performance.now() * 1000));
 
+/**
+ * FEC v2 rev 6 framing (bundle_seq datagram framing, repair-status stream).
+ * Drives both the core's `fec_framing` constructor argument and the receive
+ * loop's short-datagram guard. Stays false until R6-c turns the server and
+ * the client on together.
+ */
+const FEC_FRAMING = false;
+
 const statusEl = document.getElementById('status')!;
 const logEl = document.getElementById('log')!;
 const canvasEl = document.getElementById('canvas') as HTMLCanvasElement;
@@ -181,7 +189,7 @@ async function main() {
   // validated-but-undecoded payloads for the GPU (TileDelivery::Payload).
   // Passing false would silently route tiles down the native Decoded path
   // and hand back RGBA instead — wrong, and it would look like it worked.
-  const core = new WasmClientCore(true, renderer.h264Supported, true, nowUs());
+  const core = new WasmClientCore(true, renderer.h264Supported, true, nowUs(), FEC_FRAMING);
 
   // Per-tile Cdf53 coverage, for e2e assertions.
   //
@@ -209,7 +217,28 @@ async function main() {
   // matching. See docs/specs/wasm-cutover-main-ts-map.md Part 3.
   const cdf53ErrorCodes = errorCodes() as unknown as Cdf53ErrorCodes;
 
-  type WasmPollOutput = { kind: 'Datagram' | 'Stream'; bytes: Uint8Array };
+  type WasmPollOutput = {
+    kind: 'Datagram' | 'Stream' | 'RepairStatus';
+    bytes: Uint8Array;
+  };
+
+  // Second reliable bidi stream (RECOVERED / CONTENT_REJECTED / DECLINED),
+  // opened lazily on the first RepairStatus output so a non-framing session
+  // never opens it. Null once an open attempt has failed (not retried).
+  let repairStatusWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
+  let repairStatusOpenTried = false;
+  async function writeRepairStatus(bytes: Uint8Array): Promise<void> {
+    if (!repairStatusOpenTried) {
+      repairStatusOpenTried = true;
+      try {
+        const bidi = await transport.createBidirectionalStream();
+        repairStatusWriter = bidi.writable.getWriter();
+      } catch {
+        console.warn('Could not open repair-status stream');
+      }
+    }
+    await repairStatusWriter?.write(bytes);
+  }
 
   /** Drain every pending outbound buffer, routing it to the right wire. */
   async function drainTransmit(): Promise<void> {
@@ -229,6 +258,8 @@ async function main() {
             ackWriteLogged = true;
           }
         });
+      } else if (out.kind === 'RepairStatus') {
+        await writeRepairStatus(out.bytes);
       } else {
         await feedbackWriter?.write(out.bytes);
       }
@@ -790,7 +821,8 @@ async function main() {
     // Backward compat: small text datagrams (ping/pong). NOT protocol —
     // this predates the tile protocol and the core has no concept of it,
     // so it must be handled before handleDatagram ever sees the bytes.
-    if (value.byteLength < 20) {
+    // Under framing every datagram goes to the core (no text carve-out).
+    if (!FEC_FRAMING && value.byteLength < 20) {
       const text = new TextDecoder().decode(value);
       log(`Received: ${text} (${value.byteLength} bytes)`);
       if (text === 'pong') {

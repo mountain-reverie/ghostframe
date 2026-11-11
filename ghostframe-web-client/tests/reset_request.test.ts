@@ -7,7 +7,7 @@ import * as wasm from '../pkg-node/ghostframe_client_wasm.js';
 
 describe('requestReset through the wasm core', () => {
   it('queues a 0x09 decoder-failure request on the stream', () => {
-    const core = new wasm.WasmClientCore(true, true, true, 0n);
+    const core = new wasm.WasmClientCore(true, true, true, 0n, false);
     // Drain the HELLO.
     while (core.pollTransmit(0n) !== undefined) {}
     core.requestReset(1, 0x01020304);
@@ -20,7 +20,7 @@ describe('requestReset through the wasm core', () => {
   });
 
   it('ignores a reason it does not know', () => {
-    const core = new wasm.WasmClientCore(true, true, true, 0n);
+    const core = new wasm.WasmClientCore(true, true, true, 0n, false);
     while (core.pollTransmit(0n) !== undefined) {}
     core.requestReset(200, 1);
     expect(core.pollTransmit(0n)).toBeUndefined();

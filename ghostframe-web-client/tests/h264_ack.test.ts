@@ -53,7 +53,7 @@ function ackedWireSeqs(core: any, nowUs: bigint): number[] {
 
 describe('H.264 fragments through the wasm core', () => {
   it('are acknowledged by wire_seq, and a NO_ACK fragment is not', () => {
-    const core = new wasm.WasmClientCore(true, true, true, 0n);
+    const core = new wasm.WasmClientCore(true, true, true, 0n, false);
     while (core.pollTransmit(0n) !== undefined) { /* drain the HELLO */ }
     const events: any[] = [];
     events.push(...(core.handleDatagram(frameDatagram(7, 0, 2, 41, true, [1, 2, 3]), 1_000n) as any[]));
@@ -66,7 +66,7 @@ describe('H.264 fragments through the wasm core', () => {
   });
 
   it('a fragment older than the window is still acknowledged', () => {
-    const core = new wasm.WasmClientCore(true, true, true, 0n);
+    const core = new wasm.WasmClientCore(true, true, true, 0n, false);
     while (core.pollTransmit(0n) !== undefined) { /* drain the HELLO */ }
     core.handleDatagram(frameDatagram(50, 0, 1, 1, false, [1]), 1_000n);
     const stale = core.handleDatagram(frameDatagram(10, 0, 1, 2, false, [1]), 2_000n) as any[];

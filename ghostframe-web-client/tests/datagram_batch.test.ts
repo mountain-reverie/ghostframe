@@ -11,7 +11,7 @@ import { protocol } from '../src/protocol_constants';
 function newCore() {
   // Decoded delivery: CDF 5/3 tiles complete as TileReady events (the point
   // here is event identity and order, not pixel content).
-  return new wasm.WasmClientCore(false, false, false, 0n);
+  return new wasm.WasmClientCore(false, false, false, 0n, false);
 }
 
 function scene(): Uint8Array[] {

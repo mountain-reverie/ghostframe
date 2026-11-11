@@ -26,7 +26,7 @@ function frame(seq: number, idr: boolean, ref: number): Uint8Array {
 }
 
 function newCore() {
-  const core = new wasm.WasmClientCore(true, true, true, 0n);
+  const core = new wasm.WasmClientCore(true, true, true, 0n, false);
   const hello: any[] = [];
   for (let o = core.pollTransmit(0n); o !== undefined; o = core.pollTransmit(0n)) hello.push(o);
   return { core, hello };

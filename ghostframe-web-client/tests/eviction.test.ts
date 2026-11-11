@@ -13,7 +13,7 @@ const EVICTION_REASON_DISPLACED = 1; // EvictionReason::DisplacedByNewSession::t
 const SOLID_CODEC = 3; // ghostframe_protocol::protocol::Codec::Solid
 
 function newCore(): InstanceType<typeof wasm.WasmClientCore> {
-  return new wasm.WasmClientCore(false, false, false, 0n);
+  return new wasm.WasmClientCore(false, false, false, 0n, false);
 }
 
 describe('eviction notice', () => {
