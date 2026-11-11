@@ -32,6 +32,7 @@ use quinn_proto::{Connection, Dir, SendDatagramError, StreamId};
 use web_transport_proto::{ConnectRequest, ConnectResponse, Settings, VarInt};
 
 use crate::transport::origin::OriginPolicy;
+use ghostframe_protocol::fec::repair_status::FEC_REPAIR_STATUS_STREAM_TAG;
 
 /// VarInt signalling a client-initiated WebTransport bidirectional data stream
 /// (draft-ietf-webtrans-http3). Encodes on the wire as the two bytes `40 41`.
@@ -111,7 +112,10 @@ pub struct WebTransportServer {
     pending_bidi_streams: Vec<StreamId>,
     /// Data received on non-session bidi streams after the session is established.
     /// Used for ReceiverFeedback messages from the client.
-    feedback_queue: Vec<Vec<u8>>,
+    /// `(stream, is_repair_status, bytes)` per read. The flag is decided when
+    /// the bytes are queued, so a stream that ends before the queue is drained
+    /// does not lose its classification.
+    feedback_queue: Vec<(StreamId, bool, Vec<u8>)>,
     /// Streams abandoned for exceeding [`MAX_HELD_STREAM_BYTES`]. Their later
     /// bytes are read (to keep flow control moving) and discarded, rather than
     /// starting a fresh buffer that would mis-parse as a new message.
@@ -137,6 +141,13 @@ pub struct WebTransportServer {
     /// The unwritten end of a stats frame quinn accepted only a prefix of.
     /// Written first on the next call, so a frame is never left torn.
     stats_tail: Vec<u8>,
+    /// Streams whose first payload byte (after any WebTransport header) was
+    /// the repair-status tag: the FEC v2 rev 6 client-to-server status stream.
+    /// The tag byte is consumed; everything after it is status records.
+    repair_status_streams: std::collections::HashSet<StreamId>,
+    /// Streams whose first payload byte said "ordinary feedback": not looked
+    /// at again.
+    feedback_classified: std::collections::HashSet<StreamId>,
 }
 
 impl WebTransportServer {
@@ -156,6 +167,8 @@ impl WebTransportServer {
             last_feedback_stream: None,
             stats_stream: None,
             stats_tail: Vec::new(),
+            repair_status_streams: std::collections::HashSet::new(),
+            feedback_classified: std::collections::HashSet::new(),
             abandoned_streams: std::collections::HashSet::new(),
             origin_policy: Arc::new(OriginPolicy::default()),
             datagram_bytes_enqueued: 0,
@@ -322,6 +335,8 @@ impl WebTransportServer {
         self.stream_bufs.remove(&sid);
         self.abandoned_streams.remove(&sid);
         self.wt_header_stripped.remove(&sid);
+        self.repair_status_streams.remove(&sid);
+        self.feedback_classified.remove(&sid);
     }
 
     /// Called when quinn-proto reports `StreamEvent::Readable { id }`.
@@ -500,7 +515,16 @@ impl WebTransportServer {
     }
 
     /// Drain all queued feedback data received on non-session bidi streams.
-    pub fn drain_feedback(&mut self) -> Vec<Vec<u8>> {
+    pub fn drain_feedback(&mut self) -> Vec<(StreamId, Vec<u8>)> {
+        std::mem::take(&mut self.feedback_queue)
+            .into_iter()
+            .map(|(sid, _, data)| (sid, data))
+            .collect()
+    }
+
+    /// [`Self::drain_feedback`] with each read's classification: `true` when
+    /// it came from a repair-status stream (tag byte already consumed).
+    pub fn drain_feedback_routed(&mut self) -> Vec<(StreamId, bool, Vec<u8>)> {
         std::mem::take(&mut self.feedback_queue)
     }
 
@@ -655,6 +679,18 @@ impl WebTransportServer {
                 self.pending_bidi_streams.retain(|&s| s != sid);
                 return;
             };
+            // The native client's repair-status stream has no WebTransport
+            // header and opens with the tag byte, 0xF5. Look for it before
+            // any VarInt decode: 0xF5 starts an 8-byte VarInt, and waiting
+            // for those bytes would stall a stream that never sends them.
+            // (No feedback message type, and no WebTransport stream signal,
+            // starts with 0xF5.)
+            if buf.as_slice().first() == Some(&FEC_REPAIR_STATUS_STREAM_TAG) {
+                buf.advance(1);
+                self.repair_status_streams.insert(sid);
+                self.wt_header_stripped.insert(sid);
+                return self.queue_stream_bytes(sid);
+            }
             // Decode the stream type ALONE first. A stream that is not a
             // WebTransport data stream (the native client's HELLO is
             // `03 <caps>`) must be passed through at once: waiting for a
@@ -709,14 +745,40 @@ impl WebTransportServer {
             self.wt_header_stripped.insert(sid);
         }
 
+        self.queue_stream_bytes(sid);
+    }
+
+    /// Classify the stream if it is not yet (the first payload byte decides:
+    /// the repair-status tag or ordinary feedback), then queue what is
+    /// buffered. A stream with nothing buffered yet (a header-only read) stays
+    /// unclassified: the tag check must see a payload byte, not guess.
+    fn queue_stream_bytes(&mut self, sid: StreamId) {
+        self.pending_bidi_streams.retain(|&s| s != sid);
+        if !self.repair_status_streams.contains(&sid) && !self.feedback_classified.contains(&sid) {
+            let Some(buf) = self.stream_bufs.get_mut(&sid) else {
+                return;
+            };
+            match buf.as_slice().first() {
+                None => return,
+                Some(&FEC_REPAIR_STATUS_STREAM_TAG) => {
+                    buf.advance(1);
+                    self.repair_status_streams.insert(sid);
+                }
+                Some(_) => {
+                    self.feedback_classified.insert(sid);
+                }
+            }
+        }
         if let Some(buf) = self.stream_bufs.remove(&sid) {
             let data = buf.as_slice().to_vec();
             if !data.is_empty() {
-                self.last_feedback_stream = Some(sid);
-                self.feedback_queue.push(data);
+                let status = self.repair_status_streams.contains(&sid);
+                if !status {
+                    self.last_feedback_stream = Some(sid);
+                }
+                self.feedback_queue.push((sid, status, data));
             }
         }
-        self.pending_bidi_streams.retain(|&s| s != sid);
     }
 
     /// Try to decode a WebTransport CONNECT request from the buffered data for `sid`.
@@ -998,6 +1060,11 @@ mod tests {
 
     // ── WebTransport stream header stripping ─────────────────────────────────
 
+    /// Every queued read's bytes, stream ids dropped.
+    fn payloads(wt: &mut WebTransportServer) -> Vec<Vec<u8>> {
+        wt.drain_feedback().into_iter().map(|(_, d)| d).collect()
+    }
+
     /// The 3-byte preamble a client-initiated WT bidi stream opens with:
     /// VarInt(0x41) encodes as `40 41`, then the session id VarInt.
     fn wt_bidi_header(session_id: u64) -> Vec<u8> {
@@ -1016,7 +1083,7 @@ mod tests {
         wt.connected = true;
         wt.stream_bufs.entry(sid).or_default().extend(bytes);
         wt.route_stream_to_feedback(sid);
-        let q = wt.drain_feedback();
+        let q = payloads(&mut wt);
         (wt, q)
     }
 
@@ -1054,7 +1121,7 @@ mod tests {
         wt.stream_bufs.entry(sid).or_default().extend(&full[..1]);
         wt.route_stream_to_feedback(sid);
         assert!(
-            wt.drain_feedback().is_empty(),
+            payloads(&mut wt).is_empty(),
             "a partial header must not be queued"
         );
 
@@ -1065,7 +1132,7 @@ mod tests {
         wt.stream_bufs.entry(sid).or_default().extend(&rest);
         wt.route_stream_to_feedback(sid);
         assert_eq!(
-            wt.drain_feedback(),
+            payloads(&mut wt),
             vec![payload.to_vec()],
             "the buffer must be retained across reads, not dropped"
         );
@@ -1083,7 +1150,7 @@ mod tests {
             .or_default()
             .extend(&wt_bidi_header(0));
         wt.route_stream_to_feedback(sid);
-        assert!(wt.drain_feedback().is_empty());
+        assert!(payloads(&mut wt).is_empty());
 
         // Deliberately starts with the header's own bytes. A payload starting
         // with anything else is NOT a test: VarInt::decode would read a
@@ -1095,7 +1162,7 @@ mod tests {
         wt.stream_bufs.entry(sid).or_default().extend(&second);
         wt.route_stream_to_feedback(sid);
         assert_eq!(
-            wt.drain_feedback(),
+            payloads(&mut wt),
             vec![second.to_vec()],
             "a second read must pass through untouched"
         );
@@ -1108,9 +1175,9 @@ mod tests {
         let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
         let mut wt = WebTransportServer::new();
         wt.test_feed_feedback_stream(sid, &wt_bidi_header(0));
-        assert!(wt.drain_feedback().is_empty());
+        assert!(payloads(&mut wt).is_empty());
         wt.test_feed_feedback_stream(sid, &[0x03, 0x01]);
-        assert_eq!(wt.drain_feedback(), vec![vec![0x03, 0x01]]);
+        assert_eq!(payloads(&mut wt), vec![vec![0x03, 0x01]]);
     }
 
     #[test]
@@ -1120,9 +1187,9 @@ mod tests {
         let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
         let mut wt = WebTransportServer::new();
         wt.test_feed_feedback_stream(sid, &[0x03, 0x01]);
-        assert_eq!(wt.drain_feedback(), vec![vec![0x03, 0x01]]);
+        assert_eq!(payloads(&mut wt), vec![vec![0x03, 0x01]]);
         wt.test_feed_feedback_stream(sid, &[0x01, 0x02, 0x03]);
-        assert_eq!(wt.drain_feedback(), vec![vec![0x01, 0x02, 0x03]]);
+        assert_eq!(payloads(&mut wt), vec![vec![0x01, 0x02, 0x03]]);
     }
 
     #[test]
@@ -1136,10 +1203,10 @@ mod tests {
         let mut wire_b = wt_bidi_header(0);
         wire_b.extend_from_slice(&[0x03, 0x01]);
         wt.test_feed_feedback_stream(b, &wire_b);
-        assert_eq!(wt.drain_feedback(), vec![vec![0x03, 0x01]]);
+        assert_eq!(payloads(&mut wt), vec![vec![0x03, 0x01]]);
         let again = wt_bidi_header(0);
         wt.test_feed_feedback_stream(a, &again);
-        assert_eq!(wt.drain_feedback(), vec![again]);
+        assert_eq!(payloads(&mut wt), vec![again]);
     }
 
     #[test]
@@ -1161,11 +1228,7 @@ mod tests {
             let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
             let mut wt = WebTransportServer::new();
             wt.test_feed_feedback_stream(sid, &[0x03, caps]);
-            assert_eq!(
-                wt.drain_feedback(),
-                vec![vec![0x03, caps]],
-                "caps={caps:#x}"
-            );
+            assert_eq!(payloads(&mut wt), vec![vec![0x03, caps]], "caps={caps:#x}");
         }
     }
 
@@ -1185,7 +1248,7 @@ mod tests {
             for b in header.iter().chain(payload.iter()) {
                 wt.test_feed_feedback_stream(sid, &[*b]);
             }
-            let got: Vec<u8> = wt.drain_feedback().concat();
+            let got: Vec<u8> = payloads(&mut wt).concat();
             assert_eq!(got, payload, "header {header:02x?}");
         }
     }
@@ -1326,5 +1389,123 @@ mod tests {
                 "expected UnexpectedEnd or InvalidSize for prefix_len={prefix_len}, got {result:?}"
             );
         }
+    }
+
+    // ── repair-status stream tagging ─────────────────────────────────────────
+
+    fn routed(wt: &mut WebTransportServer) -> Vec<(StreamId, bool, Vec<u8>)> {
+        wt.drain_feedback_routed()
+    }
+
+    #[test]
+    fn a_native_status_stream_starting_with_the_tag_is_marked_and_the_tag_consumed() {
+        // No WebTransport header: the first byte is 0xF5, which a VarInt
+        // decode would read as an 8-byte integer and wait for seven more.
+        let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let mut wt = WebTransportServer::new();
+        wt.test_feed_feedback_stream(sid, &[FEC_REPAIR_STATUS_STREAM_TAG]);
+        assert!(routed(&mut wt).is_empty(), "the tag alone is no payload");
+        wt.test_feed_feedback_stream(sid, &[0x10, 0x04, 0x00, 1, 0, 0, 0]);
+        assert_eq!(
+            routed(&mut wt),
+            vec![(sid, true, vec![0x10, 0x04, 0x00, 1, 0, 0, 0])],
+            "records arrive flagged, without the tag, after a tag-only read"
+        );
+        // Later reads stay status.
+        wt.test_feed_feedback_stream(sid, &[0x11]);
+        assert_eq!(routed(&mut wt), vec![(sid, true, vec![0x11])]);
+    }
+
+    #[test]
+    fn a_tag_and_records_in_one_native_read_are_split_correctly() {
+        let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let mut wt = WebTransportServer::new();
+        wt.test_feed_feedback_stream(sid, &[0xF5, 0x10, 0x04, 0x00, 9, 0, 0, 0]);
+        assert_eq!(
+            routed(&mut wt),
+            vec![(sid, true, vec![0x10, 0x04, 0x00, 9, 0, 0, 0])]
+        );
+    }
+
+    #[test]
+    fn a_short_native_status_stream_is_not_held_for_an_eight_byte_varint() {
+        // 0xF5 as a VarInt prefix announces 8 bytes. A stream that has sent
+        // fewer than 8 (the tag and the first bytes of a record) must still be
+        // delivered, not buffered until eight arrive.
+        let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let mut wt = WebTransportServer::new();
+        wt.test_feed_feedback_stream(sid, &[0xF5, 0x12, 0x05]);
+        assert_eq!(routed(&mut wt), vec![(sid, true, vec![0x12, 0x05])]);
+    }
+
+    #[test]
+    fn a_wt_header_then_the_tag_in_separate_reads_is_classified_on_the_tag() {
+        // Header alone: no payload byte yet, so the stream is not decided (the
+        // tag check must wait for one), then the tag, then a record.
+        let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let mut wt = WebTransportServer::new();
+        wt.test_feed_feedback_stream(sid, &wt_bidi_header(0));
+        assert!(routed(&mut wt).is_empty());
+        assert!(!wt.repair_status_streams.contains(&sid));
+        assert!(!wt.feedback_classified.contains(&sid), "still undecided");
+        wt.test_feed_feedback_stream(sid, &[0xF5]);
+        assert!(routed(&mut wt).is_empty());
+        assert!(wt.repair_status_streams.contains(&sid));
+        wt.test_feed_feedback_stream(sid, &[0x12, 0x05, 0x00]);
+        assert_eq!(routed(&mut wt), vec![(sid, true, vec![0x12, 0x05, 0x00])]);
+    }
+
+    #[test]
+    fn a_wt_header_with_the_tag_and_record_in_one_read() {
+        let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let mut wt = WebTransportServer::new();
+        let mut wire = wt_bidi_header(0);
+        wire.extend_from_slice(&[0xF5, 0x11, 0x05, 0x00, 1, 0, 0, 0, 2]);
+        wt.test_feed_feedback_stream(sid, &wire);
+        assert_eq!(
+            routed(&mut wt),
+            vec![(sid, true, vec![0x11, 0x05, 0x00, 1, 0, 0, 0, 2])]
+        );
+    }
+
+    #[test]
+    fn a_feedback_stream_next_to_a_status_stream_is_unaffected() {
+        let status = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let fb = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 2);
+        let mut wt = WebTransportServer::new();
+        wt.test_feed_feedback_stream(status, &[0xF5, 0x10, 0x04, 0x00, 1, 0, 0, 0]);
+        let mut wire = wt_bidi_header(0);
+        wire.extend_from_slice(&[0x03, 0x01]);
+        wt.test_feed_feedback_stream(fb, &wire);
+        wt.test_feed_feedback_stream(fb, &[0x05, 0x01]);
+        let got = routed(&mut wt);
+        assert_eq!(
+            got,
+            vec![
+                (status, true, vec![0x10, 0x04, 0x00, 1, 0, 0, 0]),
+                (fb, false, vec![0x03, 0x01]),
+                (fb, false, vec![0x05, 0x01]),
+            ]
+        );
+        // The plain drain still hands everything over, flags dropped.
+        wt.test_feed_feedback_stream(fb, &[0x07]);
+        assert_eq!(wt.drain_feedback(), vec![(fb, vec![0x07])]);
+    }
+
+    #[test]
+    fn an_ended_status_stream_leaves_no_record_and_queued_bytes_keep_their_flag() {
+        let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let mut wt = WebTransportServer::new();
+        wt.test_feed_feedback_stream(sid, &[0xF5, 0x10, 0x04, 0x00, 1, 0, 0, 0]);
+        assert!(wt.repair_status_streams.contains(&sid), "premise");
+        wt.stream_ended(sid);
+        assert!(wt.repair_status_streams.is_empty());
+        assert!(wt.feedback_classified.is_empty());
+        let got = routed(&mut wt);
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].1,
+            "classified when queued, so the end does not undo it"
+        );
     }
 }
