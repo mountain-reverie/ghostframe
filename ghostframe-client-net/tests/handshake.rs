@@ -20,6 +20,7 @@ fn quic_handshake_completes_against_the_real_server() {
         indices_raw_enabled: true,
         supports_h264: false,
         display: None,
+        fec_framing: false,
     };
     let base = Instant::now();
     let mut now_us = 0u64;
@@ -58,6 +59,7 @@ fn handshake_negotiates_x25519mlkem768_on_both_ends() {
         indices_raw_enabled: true,
         supports_h264: false,
         display: None,
+        fec_framing: false,
     };
     let base = Instant::now();
     let mut now_us = 0u64;
@@ -105,6 +107,7 @@ fn client_for(server: &QuicServer) -> (ClientNet, Instant, u64) {
         indices_raw_enabled: true,
         supports_h264: false,
         display: None,
+        fec_framing: false,
     };
     let mut client = ClientNet::new(cfg, 0).expect("ClientNet::new");
     client

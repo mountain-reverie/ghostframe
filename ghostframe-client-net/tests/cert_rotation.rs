@@ -33,6 +33,7 @@ fn connects(server: &mut QuicServer, pins: Vec<[u8; 32]>) -> bool {
         indices_raw_enabled: true,
         supports_h264: false,
         display: None,
+        fec_framing: false,
     };
     let base = Instant::now();
     let mut now_us = 0u64;
@@ -88,6 +89,7 @@ fn extra_pins_reach_the_verifier_set() {
         indices_raw_enabled: true,
         supports_h264: false,
         display: None,
+        fec_framing: false,
     };
     let client = ClientNet::new(cfg, 0)
         .expect("ClientNet::new")

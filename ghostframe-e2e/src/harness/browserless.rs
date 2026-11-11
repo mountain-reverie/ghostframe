@@ -1185,6 +1185,7 @@ async fn run_inner(
         indices_raw_enabled: true,
         supports_h264: matches!(scene.load, SceneLoad::H264(_)),
         display: None,
+        fec_framing: false,
     };
 
     let mut framebuffer = FrameBuffer::new();

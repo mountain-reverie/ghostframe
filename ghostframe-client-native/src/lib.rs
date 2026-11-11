@@ -372,6 +372,7 @@ impl Client {
             indices_raw_enabled: self.config.indices_raw,
             supports_h264: self.effective_h264,
             display: self.config.display,
+            fec_framing: false,
         };
         let mut client_net =
             payload_delivery(ClientNet::new(net_config, 0)?.with_extra_cert_pins(cert_hashes));
@@ -791,6 +792,7 @@ mod delivery_tests {
                 indices_raw_enabled: false,
                 supports_h264: false,
                 display: None,
+                fec_framing: false,
             },
             0,
         )
