@@ -24,6 +24,15 @@ use ghostframe_protocol::fec::repair_status::{
 /// RECOVERED ids per record: 4 bytes each, body at most 1020.
 const MAX_RECOVERED_PER_RECORD: usize = FEC_STATUS_MAX_RECORD_BODY / 4;
 
+/// What `FecRx::on_datagram` hands back.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RxBatch {
+    /// Records to dispatch, in order.
+    pub records: Vec<RxRecord>,
+    /// bundle_seqs of sources this datagram let us rebuild.
+    pub rebuilt: Vec<u32>,
+}
+
 /// The one object `ClientCore` holds for the rev 6 framing: block store, ACK v4
 /// batcher, loss reporter, and the two output queues (datagrams, and bytes for
 /// the repair-status stream).
@@ -53,9 +62,12 @@ impl FecRx {
         }
     }
 
-    /// Absorb one datagram; returns the records to dispatch. Queues the arrival
-    /// ACK and RECOVERED records. A rebuilt source is never an ACK arrival.
-    pub fn on_datagram(&mut self, dg: &[u8], now_us: u64) -> Vec<RxRecord> {
+    /// Absorb one datagram; returns the records to dispatch and the bundle_seqs
+    /// rebuilt. Queues the arrival ACK. A rebuilt source is never an ACK
+    /// arrival. RECOVERED is not queued here: call [`FecRx::recovered`] once the
+    /// records are dispatched, so a CONTENT_REJECTED raised while dispatching
+    /// precedes it on the status stream.
+    pub fn on_datagram(&mut self, dg: &[u8], now_us: u64) -> RxBatch {
         let out = self.blocks.on_datagram(dg, now_us);
         if let Some(seq) = out.arrival {
             self.started = true;
@@ -71,9 +83,17 @@ impl FecRx {
         for &seq in &out.rebuilt {
             self.loss.on_rebuilt(seq);
         }
-        self.queue_recovered(&out.rebuilt);
         self.maybe_report(now_us);
-        out.records
+        RxBatch {
+            records: out.records,
+            rebuilt: out.rebuilt,
+        }
+    }
+
+    /// Release the rebuilt bundles `ids` (RECOVERED). After the dispatch of the
+    /// batch that rebuilt them.
+    pub fn recovered(&mut self, ids: &[u32]) {
+        self.queue_recovered(ids);
     }
 
     /// The client found a record it cannot use (CDF 5/3 prevalidation).
@@ -152,7 +172,8 @@ impl FecRx {
         if let Some(d) = self.loss.maybe_report(now_us, &self.blocks.stats()) {
             self.datagrams.push_back(d);
             self.next_report_us = now_us + LOSS_REPORT_INTERVAL_US;
-        } else if self.next_report_us == 0 {
+        } else if self.next_report_us == 0 || now_us >= self.next_report_us {
+            // Nothing to report (idle): do not leave a deadline in the past.
             self.next_report_us = now_us + LOSS_REPORT_INTERVAL_US;
         }
     }
@@ -258,13 +279,14 @@ mod tests {
         let mut dispatched = 0;
         for (i, d) in srcs.iter().enumerate() {
             if !lost.contains(&i) {
-                dispatched += f.on_datagram(d, T).len();
+                dispatched += f.on_datagram(d, T).records.len();
                 arrived.push(1000 + i as u32);
             }
         }
         for (i, d) in reps.iter().enumerate() {
-            let recs = f.on_datagram(d, T + 100);
-            dispatched += recs.len();
+            let b = f.on_datagram(d, T + 100);
+            dispatched += b.records.len();
+            f.recovered(&b.rebuilt);
             arrived.push(1100 + i as u32);
         }
         assert_eq!(dispatched, 10, "7 originals + 3 rebuilt, one record each");
@@ -364,5 +386,32 @@ mod tests {
         f.on_timeout(T + 250_000);
         let got = drain_datagrams(&mut f);
         assert!(got.iter().any(|d| LossReport::decode(d).is_ok()));
+    }
+
+    #[test]
+    fn idle_report_deadline_moves_into_the_future() {
+        let mut f = FecRx::new();
+        let dg = SourceFrame {
+            last: true,
+            bundle_seq: 1,
+            block_id: 1,
+            idx: 0,
+            records: &recs(&[b"x"]),
+        }
+        .encode();
+        f.on_datagram(&dg, T);
+        let t = T + 250_000;
+        f.on_timeout(t);
+        assert!(drain_datagrams(&mut f)
+            .iter()
+            .any(|d| LossReport::decode(d).is_ok()));
+        // Idle from here: no arrival, so the next due time has nothing to report.
+        let t = t + LOSS_REPORT_INTERVAL_US;
+        f.on_timeout(t);
+        f.on_timeout(t);
+        assert!(drain_datagrams(&mut f).is_empty());
+        let next = f.poll_timeout().expect("a deadline");
+        assert!(next > t, "deadline {next} is not past {t}");
+        assert!(next <= t + LOSS_REPORT_INTERVAL_US);
     }
 }
