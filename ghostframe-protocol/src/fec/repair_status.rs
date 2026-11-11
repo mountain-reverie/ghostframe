@@ -2,10 +2,10 @@
 //! `[type u8][len u16 LE][body]`, `len` <= 1020. Any violation is a protocol
 //! error; the caller closes the stream.
 
-pub const RECOVERED: u8 = 0x10;
-pub const CONTENT_REJECTED: u8 = 0x11;
-pub const DECLINED: u8 = 0x12;
-pub const MAX_RECORD_BODY: usize = 1020;
+pub const FEC_STATUS_RECOVERED: u8 = 0x10;
+pub const FEC_STATUS_CONTENT_REJECTED: u8 = 0x11;
+pub const FEC_STATUS_DECLINED: u8 = 0x12;
+pub const FEC_STATUS_MAX_RECORD_BODY: usize = 1020;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeclineReason {
@@ -42,7 +42,7 @@ pub enum StatusRecord {
 }
 
 impl StatusRecord {
-    /// Panics if the body would exceed `MAX_RECORD_BODY` or a list is empty.
+    /// Panics if the body would exceed `FEC_STATUS_MAX_RECORD_BODY` or a list is empty.
     pub fn encode(&self, out: &mut Vec<u8>) {
         let mut body = Vec::new();
         let kind = match self {
@@ -51,7 +51,7 @@ impl StatusRecord {
                 for s in v {
                     body.extend_from_slice(&s.to_le_bytes());
                 }
-                RECOVERED
+                FEC_STATUS_RECOVERED
             }
             Self::ContentRejected(v) => {
                 assert!(!v.is_empty());
@@ -59,7 +59,7 @@ impl StatusRecord {
                     body.extend_from_slice(&s.to_le_bytes());
                     body.push(*idx);
                 }
-                CONTENT_REJECTED
+                FEC_STATUS_CONTENT_REJECTED
             }
             Self::Declined {
                 block_id,
@@ -67,21 +67,27 @@ impl StatusRecord {
                 k,
                 missing,
             } => {
+                debug_assert_eq!(missing.len(), usize::from(*k).div_ceil(8));
+                debug_assert!(
+                    (usize::from(*k)..missing.len() * 8)
+                        .all(|i| missing[i / 8] >> (i % 8) & 1 == 0),
+                    "bit set beyond k"
+                );
                 body.extend_from_slice(&block_id.to_le_bytes());
                 body.push(*reason as u8);
                 body.push(*k);
                 body.extend_from_slice(missing);
-                DECLINED
+                FEC_STATUS_DECLINED
             }
         };
-        assert!(body.len() <= MAX_RECORD_BODY);
+        assert!(body.len() <= FEC_STATUS_MAX_RECORD_BODY);
         out.push(kind);
         out.extend_from_slice(&(body.len() as u16).to_le_bytes());
         out.extend_from_slice(&body);
     }
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum StatusError {
     #[error("unknown record type 0x{0:02x}")]
     UnknownType(u8),
@@ -93,11 +99,12 @@ pub enum StatusError {
 
 fn check_len(kind: u8, len: usize) -> Result<(), StatusError> {
     let ok = match kind {
-        RECOVERED => len.is_multiple_of(4),
-        CONTENT_REJECTED => len.is_multiple_of(5),
-        _ => len >= 5,
+        FEC_STATUS_RECOVERED => len.is_multiple_of(4),
+        FEC_STATUS_CONTENT_REJECTED => len.is_multiple_of(5),
+        // 4 + ceil(k/8), k in 1..=255
+        _ => (5..=36).contains(&len),
     };
-    if len == 0 || len > MAX_RECORD_BODY || !ok {
+    if len == 0 || len > FEC_STATUS_MAX_RECORD_BODY || !ok {
         return Err(StatusError::BadLength { kind, len });
     }
     Ok(())
@@ -105,12 +112,12 @@ fn check_len(kind: u8, len: usize) -> Result<(), StatusError> {
 
 fn decode_body(kind: u8, body: &[u8]) -> Result<StatusRecord, StatusError> {
     match kind {
-        RECOVERED => Ok(StatusRecord::Recovered(
+        FEC_STATUS_RECOVERED => Ok(StatusRecord::Recovered(
             body.chunks_exact(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         )),
-        CONTENT_REJECTED => Ok(StatusRecord::ContentRejected(
+        FEC_STATUS_CONTENT_REJECTED => Ok(StatusRecord::ContentRejected(
             body.chunks_exact(5)
                 .map(|c| (u32::from_le_bytes([c[0], c[1], c[2], c[3]]), c[4]))
                 .collect(),
@@ -144,18 +151,39 @@ fn decode_body(kind: u8, body: &[u8]) -> Result<StatusRecord, StatusError> {
 #[derive(Debug, Default)]
 pub struct StatusReader {
     buf: Vec<u8>,
+    failed: Option<StatusError>,
 }
 
 impl StatusReader {
     /// Append stream bytes; return every complete record, keep a partial tail.
+    ///
+    /// After an error the reader is failed for good: every later call returns
+    /// the same error without touching the buffer. Records decoded earlier in
+    /// the failing call are discarded; the caller must close the stream.
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<StatusRecord>, StatusError> {
+        if let Some(e) = &self.failed {
+            return Err(e.clone());
+        }
+        match self.push_inner(bytes) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                self.failed = Some(e.clone());
+                Err(e)
+            }
+        }
+    }
+
+    fn push_inner(&mut self, bytes: &[u8]) -> Result<Vec<StatusRecord>, StatusError> {
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
         let mut pos = 0;
         while self.buf.len() - pos >= 3 {
             let kind = self.buf[pos];
             let len = usize::from(u16::from_le_bytes([self.buf[pos + 1], self.buf[pos + 2]]));
-            if !matches!(kind, RECOVERED | CONTENT_REJECTED | DECLINED) {
+            if !matches!(
+                kind,
+                FEC_STATUS_RECOVERED | FEC_STATUS_CONTENT_REJECTED | FEC_STATUS_DECLINED
+            ) {
                 return Err(StatusError::UnknownType(kind));
             }
             check_len(kind, len)?;
@@ -269,6 +297,28 @@ mod tests {
                 Err(StatusError::BadDecline(_))
             ),
             "len != 4 + ceil(k/8)"
+        );
+    }
+
+    #[test]
+    fn reader_is_sticky_failed() {
+        let mut rd = StatusReader::default();
+        let e = rd.push(&[0x13, 4, 0]).unwrap_err();
+        assert_eq!(e, StatusError::UnknownType(0x13));
+        let mut ok = Vec::new();
+        StatusRecord::Recovered(vec![1]).encode(&mut ok);
+        assert_eq!(rd.push(&ok), Err(e));
+    }
+
+    #[test]
+    fn declined_len_bound_is_immediate() {
+        let mut rd = StatusReader::default();
+        assert_eq!(
+            rd.push(&[0x12, 37, 0]),
+            Err(StatusError::BadLength {
+                kind: 0x12,
+                len: 37
+            })
         );
     }
 }

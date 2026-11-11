@@ -14,15 +14,15 @@
 use rusty_erasure::gf;
 
 /// Most symbols (sources + repair rows) one block can address.
-pub const MAX_SYMBOLS: usize = 256;
+pub const FEC_MAX_SYMBOLS: usize = 256;
 
 /// Highest repair row a block of `k` sources may use (`k + row + 1 <= 256`),
 /// or `None` when `k` is 0 or leaves no row.
 pub fn max_row_for(k: usize) -> Option<u8> {
-    if k == 0 || k >= MAX_SYMBOLS {
+    if k == 0 || k >= FEC_MAX_SYMBOLS {
         return None;
     }
-    u8::try_from(MAX_SYMBOLS - 1 - k).ok()
+    u8::try_from(FEC_MAX_SYMBOLS - 1 - k).ok()
 }
 
 /// Coefficient of source `j` in repair row `i`.

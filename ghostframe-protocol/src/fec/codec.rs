@@ -18,6 +18,10 @@ use std::borrow::Cow;
 pub enum FecError {
     #[error("block has no sources")]
     NoSources,
+    #[error("block has {0} sources; at most 255 fit with a repair row")]
+    TooManySources(usize),
+    #[error("repair submatrix is singular")]
+    Singular,
     #[error("repair row {row} is outside a block of {k} sources (k + row + 1 > 256)")]
     RowOutOfRange { k: usize, row: u8 },
     #[error("repair row {0} given twice")]
@@ -31,6 +35,9 @@ pub enum FecError {
 }
 
 fn check_rows(k: usize, rows: impl Iterator<Item = u8>) -> Result<(), FecError> {
+    if k >= 256 {
+        return Err(FecError::TooManySources(k));
+    }
     let max = max_row_for(k).ok_or(FecError::NoSources)?;
     let mut seen = [false; 256];
     for row in rows {
@@ -153,9 +160,7 @@ pub fn recover(
         .map(|x| (0..e).map(|y| u8::from(x == y)).collect())
         .collect();
     for c in 0..e {
-        let p = (c..e)
-            .find(|&x| a[x][c] != 0)
-            .ok_or_else(|| FecError::Coder("singular repair submatrix".into()))?;
+        let p = (c..e).find(|&x| a[x][c] != 0).ok_or(FecError::Singular)?;
         a.swap(c, p);
         iv.swap(c, p);
         let s = gf::inv(a[c][c]);
@@ -353,6 +358,10 @@ mod tests {
         let s: &[u8] = &[1u8; 8];
         assert_eq!(encode_repairs(&[], &[0]), Err(FecError::NoSources));
         assert_eq!(
+            encode_repairs(&[s; 256], &[0]),
+            Err(FecError::TooManySources(256))
+        );
+        assert_eq!(
             encode_repairs(&[s; 200], &[56]),
             Err(FecError::RowOutOfRange { k: 200, row: 56 })
         );
@@ -368,6 +377,60 @@ mod tests {
                 got: 9
             })
         );
+    }
+
+    fn rec_exact(k: usize, len: usize, rows: &[u8], erase: &[usize], order: &[usize]) {
+        let srcs = block(k, len, 9);
+        let refs: Vec<&[u8]> = srcs.iter().map(|v| v.as_slice()).collect();
+        let reps = encode_repairs(&refs, rows).unwrap();
+        let mut have: Vec<Option<&[u8]>> = refs.iter().map(|s| Some(*s)).collect();
+        for &j in erase {
+            have[j] = None;
+        }
+        let rin: Vec<(u8, &[u8])> = order
+            .iter()
+            .map(|&x| (rows[x], reps[x].as_slice()))
+            .collect();
+        let got = recover(&have, &rin).unwrap();
+        assert_eq!(got.len(), erase.len());
+        for (j, bytes) in got {
+            assert_eq!(bytes, srcs[j]);
+        }
+    }
+
+    #[test]
+    fn repairs_out_of_order_and_surplus() {
+        rec_exact(20, 40, &[0, 5, 9], &[3, 17], &[2, 1, 0]);
+    }
+
+    #[test]
+    fn sparse_rows_with_surplus() {
+        rec_exact(10, 40, &[2, 7, 11], &[4], &[2, 0, 1]);
+    }
+
+    #[test]
+    fn full_256_symbol_block() {
+        let rows: Vec<u8> = (0..128).collect();
+        let erase: Vec<usize> = (0..128).collect();
+        let order: Vec<usize> = (0..128).collect();
+        rec_exact(128, 64, &rows, &erase, &order);
+    }
+
+    #[test]
+    fn xor_fast_path_with_short_known_sources() {
+        let lens = [100usize, 30, 1180, 7];
+        let srcs: Vec<Vec<u8>> = lens
+            .iter()
+            .map(|&l| block(1, l, l as u8).remove(0))
+            .collect();
+        let refs: Vec<&[u8]> = srcs.iter().map(|v| v.as_slice()).collect();
+        let reps = encode_repairs(&refs, &[0]).unwrap();
+        let have: Vec<Option<&[u8]>> = vec![None, Some(refs[1]), Some(refs[2]), Some(refs[3])];
+        let got = recover(&have, &[(0, &reps[0])]).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, 0);
+        assert_eq!(&got[0].1[..100], &srcs[0][..]);
+        assert!(got[0].1[100..].iter().all(|&b| b == 0));
     }
 
     proptest! {
