@@ -17,7 +17,7 @@ fn hello_reaches_the_server_on_the_feedback_stream() {
 
     let feedback = wt.drain_feedback();
     assert!(
-        feedback.iter().any(|m| m.first() == Some(&0x03)),
+        feedback.iter().any(|(_, m)| m.first() == Some(&0x03)),
         "server must receive the Hello message (type 0x03), got {feedback:?}"
     );
 }
@@ -59,7 +59,11 @@ fn input_sent_before_the_session_is_ready_does_not_precede_the_hello() {
     pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 128);
     assert!(wt.is_connected(), "server must accept the CONNECT");
 
-    let first: Vec<u8> = wt.drain_feedback().into_iter().flatten().collect();
+    let first: Vec<u8> = wt
+        .drain_feedback()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
     assert_eq!(
         first.first(),
         Some(&0x03),
@@ -79,7 +83,11 @@ fn input_sent_after_the_session_is_ready_reaches_the_server() {
     client.send_input(motion.clone(), now_us);
     pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 32);
 
-    let got: Vec<u8> = wt.drain_feedback().into_iter().flatten().collect();
+    let got: Vec<u8> = wt
+        .drain_feedback()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
     assert!(
         got.windows(motion.len()).any(|w| w == motion.as_slice()),
         "input after SessionReady must reach the server, got {got:02x?}"
@@ -98,7 +106,11 @@ fn a_reset_request_reaches_the_server_on_the_feedback_stream() {
     client.request_reset(ResetReason::DecoderFailure, 0x0102_0304, now_us);
     pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 32);
 
-    let got: Vec<u8> = wt.drain_feedback().into_iter().flatten().collect();
+    let got: Vec<u8> = wt
+        .drain_feedback()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
     let want = [0x09, 0x01, 0x04, 0x03, 0x02, 0x01];
     assert!(
         got.windows(want.len()).any(|w| w == want),
@@ -134,7 +146,11 @@ fn an_h264_client_advertises_both_h264_hello_bits() {
         .expect("connect");
     pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 128);
 
-    let got: Vec<u8> = wt.drain_feedback().into_iter().flatten().collect();
+    let got: Vec<u8> = wt
+        .drain_feedback()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
     assert_eq!(&got[..2], &[0x03, 0x07], "Hello caps, got {got:02x?}");
 }
 
@@ -369,9 +385,9 @@ fn recovered_status_reaches_the_server_on_a_second_tagged_stream() {
     pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 32);
 
     // Nothing to report yet: no second stream, only the Hello's stream.
-    let before: Vec<Vec<u8>> = wt.drain_feedback();
+    let before = wt.drain_feedback_routed();
     assert!(
-        before.iter().all(|m| m.first() != Some(&0xF5)),
+        before.iter().all(|(_, status, _)| !status),
         "no repair-status bytes before any framed datagram, got {before:?}"
     );
 
@@ -413,9 +429,12 @@ fn recovered_status_reaches_the_server_on_a_second_tagged_stream() {
     }
     pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 64);
 
-    let got = wt.drain_feedback();
+    // The server consumes the 0xF5 tag and marks the stream: what it queues
+    // is the status records themselves, first a RECOVERED (type 0x10).
+    let got = wt.drain_feedback_routed();
     assert!(
-        got.iter().any(|m| m.first() == Some(&0xF5)),
-        "a RECOVERED record on a tagged second stream must reach the server, got {got:02x?}"
+        got.iter()
+            .any(|(_, status, d)| *status && d.first() == Some(&0x10)),
+        "a RECOVERED record on a tagged second stream must reach the server as status bytes, got {got:02x?}"
     );
 }

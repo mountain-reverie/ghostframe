@@ -2595,6 +2595,26 @@ impl IoBridge {
                 "h264 client feedback (frame acks and reset requests; cumulative)"
             );
 
+            // FEC v2 rev 6 inbound feedback (repair-status stream, REPAIR_REQUEST,
+            // LOSS_REPORT). A separate event at the `cumulative emit` cadence: that
+            // statement is at tracing's field limit. `client_*` are the last
+            // LOSS_REPORT's counts (datagrams lost before repair, rebuilt, lost after).
+            tracing::info!(
+                target: LOG_TARGET,
+                frame_seq = seq,
+                content_rejected_rx = self.fec_in.content_rejected_rx,
+                content_rejected_unknown = self.fec_in.content_rejected_unknown,
+                recovered_rx = self.fec_in.recovered_rx,
+                declined_rx = self.fec_in.declined_rx,
+                repair_requests_rx = self.fec_in.repair_requests_rx,
+                repair_status_malformed = self.fec_in.repair_status_malformed,
+                loss_reports_rx = self.fec_in.loss_reports_rx,
+                client_lost_pre_fec = tp.report_lost_pre_fec,
+                client_recovered = tp.report_recovered,
+                client_residual = tp.report_residual,
+                "fec v2 inbound (status stream, repair requests, last loss report; cumulative)"
+            );
+
             // The H.264 transport: IDRs by cause, how the loss path treated
             // H.264 fragments, what the backpressure skip held back, and
             // the ledger accounting (`tx_recorded` = acked live + judged lost
