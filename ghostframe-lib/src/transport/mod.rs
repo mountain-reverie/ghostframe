@@ -27,6 +27,7 @@ pub(crate) mod quic_pair;
 /// the C API keep working.
 pub use ghostframe_tsnet as ghostbridge;
 pub(crate) mod admission;
+pub(crate) mod fec_tx;
 pub mod reliable_emitter;
 pub mod rtt_estimator;
 pub mod scheduler;
