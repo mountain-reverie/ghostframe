@@ -282,6 +282,9 @@ pub struct RunOptions {
     pub frame_cost: Option<Duration>,
     /// The model controller's settings. `None` follows `GHOSTFRAME_CC_*`.
     pub model: Option<ghostframe_lib::config::ModelSettings>,
+    /// The FEC block knob. `None` follows `GHOSTFRAME_FEC_BLOCKS`, which is
+    /// off by default.
+    pub fec_blocks: Option<ghostframe_lib::config::FecBlockParams>,
     /// How the server's event loop is driven. See [`HarnessMode`].
     pub mode: HarnessMode,
     /// The client offers no hybrid post-quantum group, so the handshake
@@ -1143,6 +1146,7 @@ async fn run_inner(
     let env_transport = ghostframe_lib::config::TransportConfig::from_env();
     bridge.set_openh264_lib_for_test(env_transport.openh264_lib.clone());
     bridge.use_model_controller_for_test(opts.model.unwrap_or(env_transport.model));
+    bridge.set_fec_blocks_for_test(opts.fec_blocks.or(env_transport.fec_blocks));
     if let Some(floor) = scene.tick_budget_floor_bytes {
         bridge.set_tick_budget_floor_bytes(floor);
     }
