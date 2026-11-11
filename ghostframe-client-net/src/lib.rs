@@ -59,6 +59,11 @@ pub struct ClientNetConfig {
     /// `ClientCore::new` queue a `DisplayInfo` Hello payload -- see that
     /// type's doc for why scale (not millimetres) is authoritative.
     pub display: Option<ClientDisplay>,
+    /// Receive the rev 6 FEC framing (forwarded to `ClientConfig::fec_framing`).
+    /// Off by default on the wire until the server turns it on too; when on,
+    /// the client's repair status (RECOVERED / CONTENT_REJECTED / DECLINED)
+    /// goes out on a second client-opened bidi stream.
+    pub fec_framing: bool,
 }
 
 pub struct ClientNet {
@@ -96,6 +101,13 @@ pub struct ClientNet {
     /// `webtransport.rs:362-372`), so no further handshake is needed on
     /// this stream — the first write is itself the signal.
     feedback_stream: Option<StreamId>,
+    /// `PollOutput::RepairStatus` bytes waiting for `repair_status_stream`.
+    pending_repair_status_out: Vec<Vec<u8>>,
+    /// The second client-opened bidi stream, opened on first use. Its first
+    /// byte is `FEC_REPAIR_STATUS_STREAM_TAG`, put there by the core.
+    repair_status_stream: Option<StreamId>,
+    /// `open` returned `None` for the repair-status stream; warned already.
+    repair_status_open_warned: bool,
     endpoint: ClientEndpoint,
     handshake: WebTransportHandshake,
     /// Sans-IO tile decode / H.264 frame reassembly state machine. Datagram payloads
@@ -209,6 +221,7 @@ impl ClientNet {
                 // requests, so it asks for H.264 whenever it can decode it.
                 h264_acked_ref: config.supports_h264,
                 display: config.display,
+                fec_framing: config.fec_framing,
                 ..Default::default()
             },
             now_us,
@@ -222,6 +235,9 @@ impl ClientNet {
             datagrams_read: 0,
             pending_stream_out: Vec::new(),
             feedback_stream: None,
+            pending_repair_status_out: Vec::new(),
+            repair_status_stream: None,
+            repair_status_open_warned: false,
             endpoint: ClientEndpoint::new(rng_seed),
             handshake: WebTransportHandshake::new(),
             core,
@@ -501,9 +517,10 @@ impl ClientNet {
                         PollOutput::Stream(bytes) => {
                             self.pending_stream_out.push(bytes);
                         }
-                        // R6-b B5/B6 wire this: the repair-status stream. Never
-                        // produced while `fec_framing` is off.
-                        PollOutput::RepairStatus(_) => {}
+                        // Never produced while `fec_framing` is off.
+                        PollOutput::RepairStatus(bytes) => {
+                            self.pending_repair_status_out.push(bytes);
+                        }
                     }
                 }
             }
@@ -529,6 +546,31 @@ impl ClientNet {
                 for bytes in self.pending_stream_out.drain(..) {
                     if let Err(e) = conn.send_stream(sid).write(&bytes) {
                         tracing::warn!(error = ?e, "feedback stream write failed");
+                    }
+                }
+            }
+
+            // The repair-status stream is opened only when there is
+            // something to say, so a client without framing never opens it.
+            if !self.pending_repair_status_out.is_empty() {
+                if self.repair_status_stream.is_none() {
+                    match conn.streams().open(Dir::Bi) {
+                        Some(sid) => self.repair_status_stream = Some(sid),
+                        None if !self.repair_status_open_warned => {
+                            self.repair_status_open_warned = true;
+                            tracing::warn!(
+                                "stream limit reached opening the repair-status stream; \
+                                 status records will queue until one frees up"
+                            );
+                        }
+                        None => {}
+                    }
+                }
+                if let Some(sid) = self.repair_status_stream {
+                    for bytes in self.pending_repair_status_out.drain(..) {
+                        if let Err(e) = conn.send_stream(sid).write(&bytes) {
+                            tracing::warn!(error = ?e, "repair-status stream write failed");
+                        }
                     }
                 }
             }
