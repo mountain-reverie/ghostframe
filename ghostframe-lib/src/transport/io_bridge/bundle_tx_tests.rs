@@ -484,3 +484,45 @@ async fn a_sealed_bundle_refused_as_too_large_gives_its_tiles_and_pad_back() {
     assert_eq!(b.h264.stats.oversize_tile, 2, "each tile record is retired");
     assert_eq!(b.h264.stats.oversize_pad, 1);
 }
+
+/// A standing refusal is one refusal of one bundle, however often the drain
+/// and the pump's flush look at it again, and the drain takes no record from
+/// the queue while a bundle waits.
+#[tokio::test]
+async fn a_standing_refusal_is_counted_once_and_stops_the_drain_before_the_next_record() {
+    let mut b = framed_bridge();
+    submit_tiles(&mut b, 12);
+    b.test_wire.as_mut().unwrap().blocked = true;
+
+    let stop = b.drain_reliable_emitter(now_std());
+    assert!(matches!(stop, pacing::Stop::Rejected));
+    assert_eq!(b.datagram_send_errs, 1, "premise: the refusal was counted");
+    b.flush_bundles(); // seals the open bundle behind the refused one
+    let waiting = b.pending_bundles.len();
+    let queued = b.reliable_emitter.emission_queue_len();
+    assert!(
+        waiting > 0 && queued > 0,
+        "premise: a bundle waits, work remains"
+    );
+    for _ in 0..4 {
+        assert!(matches!(
+            b.drain_reliable_emitter(now_std()),
+            pacing::Stop::Rejected
+        ));
+        b.flush_bundles();
+    }
+    assert_eq!(b.datagram_send_errs, 1, "the same refusal, counted once");
+    assert_eq!(b.pending_bundles.len(), waiting);
+    assert_eq!(
+        b.reliable_emitter.emission_queue_len(),
+        queued,
+        "no record is taken while a bundle waits"
+    );
+
+    // A refusal of the next bundle is a second one.
+    b.test_wire.as_mut().unwrap().blocked = false;
+    assert!(b.flush_bundles(), "the wire takes the waiting bundle");
+    b.test_wire.as_mut().unwrap().blocked = true;
+    b.drain_reliable_emitter(now_std());
+    assert_eq!(b.datagram_send_errs, 2);
+}

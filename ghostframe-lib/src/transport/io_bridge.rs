@@ -963,6 +963,8 @@ pub struct IoBridge {
     /// the receiver-side `loss_rate` doesn't include datagrams that
     /// never left the host.
     datagram_send_errs: u64,
+    /// The bundle quinn last refused, so a refusal that stands is one count.
+    last_refused_bundle: Option<u32>,
     /// Whether we've already logged a `warn!` for the first send-datagram
     /// error of the process's life. Subsequent errors increment the
     /// counter but log at `debug` to avoid 30 Hz warn-spam under
@@ -1607,6 +1609,7 @@ impl IoBridge {
             #[cfg(test)]
             test_wire: None,
             datagram_send_errs: 0,
+            last_refused_bundle: None,
             datagram_send_err_first_logged: false,
             offered_wire_bytes: 0.0,
             model,
