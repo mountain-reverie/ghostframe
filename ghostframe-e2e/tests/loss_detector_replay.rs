@@ -212,13 +212,14 @@ fn replay_shaped(
             ledger.record(
                 i,
                 at,
-                Transmission {
-                    emit_us: shape.send_us(i),
-                    wire_bytes: 1200,
-                    content: EmitKey::new(i, 0, 0, 0).into(),
-                    depart_us: None,
-                    dep_idx: None,
-                },
+                Transmission::single(
+                    shape.send_us(i),
+                    1200,
+                    i,
+                    EmitKey::new(i, 0, 0, 0).into(),
+                    None,
+                    None,
+                ),
             );
             ledger.mark_departed(i, at, shape.send_us(i));
             next_send += 1;

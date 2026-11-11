@@ -948,20 +948,23 @@ mod tests {
         let pad_tx = crate::transport::transmission_ledger::Transmission {
             emit_us: 0,
             wire_bytes: 1200,
-            content: crate::transport::reliable_emitter::Content::Pad(5),
+            records: smallvec::smallvec![(5, crate::transport::reliable_emitter::Content::Pad(5))],
             depart_us: None,
             dep_idx: None,
         };
-        b.apply_h264_acks(&[(pad_tx.content, pad_tx, 0, false)], now);
+        b.apply_h264_acks(&[(pad_tx.clone(), 0, false)], now);
         assert!(b.h264.last_ack_progress.is_none(), "a pad is no progress");
         let frag_tx = crate::transport::transmission_ledger::Transmission {
-            content: crate::transport::reliable_emitter::Content::H264Frag {
-                frame_seq: 1,
-                frag_idx: 0,
-            },
+            records: smallvec::smallvec![(
+                6,
+                crate::transport::reliable_emitter::Content::H264Frag {
+                    frame_seq: 1,
+                    frag_idx: 0,
+                }
+            )],
             ..pad_tx
         };
-        b.apply_h264_acks(&[(frag_tx.content, frag_tx, 0, false)], now);
+        b.apply_h264_acks(&[(frag_tx, 0, false)], now);
         assert_eq!(b.h264.last_ack_progress, Some(now), "a fragment is");
     }
 
@@ -1058,7 +1061,10 @@ mod tests {
         let lost_tx = crate::transport::transmission_ledger::Transmission {
             emit_us: 0,
             wire_bytes: 1200,
-            content: crate::transport::reliable_emitter::Content::Pad(oldest),
+            records: smallvec::smallvec![(
+                oldest,
+                crate::transport::reliable_emitter::Content::Pad(oldest)
+            )],
             depart_us: None,
             dep_idx: None,
         };

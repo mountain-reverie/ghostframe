@@ -501,8 +501,10 @@ impl IoBridge {
             // Only an H.264 fragment is in the identity
             // `tx_recorded >= acked + lost + forgotten`.
             if let Some(tx) = self.transmission_ledger.take_undeparted(*ws) {
-                if matches!(tx.content, Content::H264Frag { .. }) {
-                    self.h264.stats.tx_forgotten += 1;
+                for (_, content) in tx.records() {
+                    if matches!(content, Content::H264Frag { .. }) {
+                        self.h264.stats.tx_forgotten += 1;
+                    }
                 }
             }
             // A purged pad never left: its ring entry has no acknowledgement
@@ -521,20 +523,23 @@ impl IoBridge {
     /// cache entries and tell the tracker.
     pub(super) fn apply_h264_acks(
         &mut self,
-        resolved: &[(Content, Transmission, u16, bool)],
+        resolved: &[(Transmission, u16, bool)],
         now: std::time::Instant,
     ) {
-        for (content, _, _, late) in resolved {
+        for (late, content) in resolved
+            .iter()
+            .flat_map(|(tx, _, late)| tx.records().map(move |(_, c)| (late, c)))
+        {
             if let Content::Pad(ws) = content {
                 // Padding: its probe tag has been read (before this); the
                 // entry has nothing more to do.
-                self.reliable_emitter.pads.remove(*ws);
+                self.reliable_emitter.pads.remove(ws);
                 continue;
             }
             let Content::H264Frag {
                 frame_seq,
                 frag_idx,
-            } = *content
+            } = content
             else {
                 continue;
             };
@@ -749,22 +754,24 @@ impl IoBridge {
         now: std::time::Instant,
     ) {
         for (ws, tx) in lost {
-            if let Content::Pad(pad_ws) = tx.content {
-                // A pad judged lost: its tag will not be read. The burst it was
-                // part of overran the path: a raise in its place would have
-                // lost real frames.
-                self.reliable_emitter.pads.remove(pad_ws);
-                self.h264.raise_paused_until = Some(now + super::h264_refs::RAISE_LOSS_PAUSE);
-                self.h264.stats.pads_lost += 1;
-                continue;
-            }
-            if let Content::H264Frag {
-                frame_seq,
-                frag_idx,
-            } = tx.content
-            {
-                let in_burst = self.transmission_ledger.declared_lost_in_burst(*ws);
-                self.note_h264_verdict_in(frame_seq, frag_idx, now, in_burst);
+            for (_, content) in tx.records() {
+                if let Content::Pad(pad_ws) = content {
+                    // A pad judged lost: its tag will not be read. The burst it was
+                    // part of overran the path: a raise in its place would have
+                    // lost real frames.
+                    self.reliable_emitter.pads.remove(pad_ws);
+                    self.h264.raise_paused_until = Some(now + super::h264_refs::RAISE_LOSS_PAUSE);
+                    self.h264.stats.pads_lost += 1;
+                    continue;
+                }
+                if let Content::H264Frag {
+                    frame_seq,
+                    frag_idx,
+                } = content
+                {
+                    let in_burst = self.transmission_ledger.declared_lost_in_burst(*ws);
+                    self.note_h264_verdict_in(frame_seq, frag_idx, now, in_burst);
+                }
             }
         }
     }

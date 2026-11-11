@@ -602,7 +602,7 @@ impl IoBridge {
             crate::transport::transmission_ledger::Transmission {
                 emit_us: 0,
                 wire_bytes: 1200,
-                content: key.into(),
+                records: smallvec::smallvec![(wire_seq, key.into())],
                 depart_us: None,
                 dep_idx: None,
             },
