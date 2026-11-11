@@ -77,6 +77,9 @@ mod stats_service;
 #[path = "io_bridge/bundle_tx.rs"]
 mod bundle_tx;
 
+#[path = "io_bridge/block_tx.rs"]
+mod block_tx;
+
 #[path = "io_bridge/ack_dispatch.rs"]
 mod ack_dispatch;
 #[cfg(test)]
@@ -945,6 +948,11 @@ pub struct IoBridge {
     /// framing on `record_emitted_transmissions` fills this instead of the
     /// ledger (the ledger is keyed by bundle).
     emitted_meta: HashMap<u32, crate::transport::reliable_emitter::emitter::EmittedDatagram>,
+    /// Server-side block state (R6-d); empty with the knob off.
+    block_table: crate::transport::fec_tx::block_table::BlockTable,
+    /// Encoded REPAIR frames waiting for admission, oldest first.
+    pending_repairs: std::collections::VecDeque<block_tx::RepairJob>,
+    block_tx: block_tx::BlockTxStats,
     /// Sealed bundles quinn has not taken yet, oldest first. Their ledger
     /// records exist; they are sent before anything newer.
     pending_bundles: std::collections::VecDeque<crate::transport::fec_tx::packer::SealedBundle>,
@@ -1605,9 +1613,16 @@ impl IoBridge {
             status_streams: HashMap::new(),
             fec_in: Default::default(),
             recent_bundles: Default::default(),
-            packer: Default::default(),
+            packer: {
+                let mut p = crate::transport::fec_tx::packer::Packer::default();
+                p.set_blocks(lib_config.transport.fec_blocks);
+                p
+            },
             emitted_meta: HashMap::new(),
             pending_bundles: Default::default(),
+            block_table: Default::default(),
+            pending_repairs: Default::default(),
+            block_tx: Default::default(),
             last_enqueued_was_short: false,
             #[cfg(test)]
             sent_frames_for_test: Vec::new(),
@@ -2225,8 +2240,10 @@ impl IoBridge {
         // backed-off deadline.
         let deferred = self.reliable_emitter.next_deferred_due();
         let stats = self.stats_next_due();
+        // The T close of the open FEC block (none with the knob off).
+        let block_t = self.block_t_deadline();
         [
-            quic, display, close, recheck, admission, pto, loss_time, deferred, stats,
+            quic, display, close, recheck, admission, pto, loss_time, deferred, stats, block_t,
         ]
         .into_iter()
         .flatten()
@@ -2638,6 +2655,7 @@ impl IoBridge {
         self.record_emitted_transmissions(ledger_now);
         self.expire_transmissions(ledger_now);
         self.poll_pto(ledger_now);
+        self.service_blocks(ledger_now);
         // quinn has just emptied what it could of its FIFO; feed it again
         // (and drain again) while the bucket and the gate allow, so it is not
         // left idle until the next turn.
@@ -3034,6 +3052,9 @@ mod coverage_pin_tests;
 #[path = "io_bridge/repair_status_tests.rs"]
 mod repair_status_tests;
 
+#[cfg(test)]
+#[path = "io_bridge/block_tx_tests.rs"]
+mod block_tx_tests;
 #[cfg(test)]
 #[path = "io_bridge/bundle_tx_tests.rs"]
 mod bundle_tx_tests;

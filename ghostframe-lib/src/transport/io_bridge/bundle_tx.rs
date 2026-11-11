@@ -130,7 +130,7 @@ impl IoBridge {
     }
 
     /// Whether a send to the live session can happen at all.
-    fn framed_sink_present(&self) -> bool {
+    pub(super) fn framed_sink_present(&self) -> bool {
         #[cfg(test)]
         if self.test_wire.is_some() {
             return true;
@@ -230,6 +230,10 @@ impl IoBridge {
                 return SendOutcome::Sent;
             }
         };
+        // A path that shrank closes the open block at its current size.
+        if self.packer.close_for_mtu(max_dg) {
+            self.process_closed_blocks(Some(block_tx::CloseWhy::Mtu));
+        }
         let meta = wire_seq.and_then(|ws| {
             if !self.emitted_meta.contains_key(&ws) {
                 self.record_emitted_transmissions(now);
@@ -260,8 +264,12 @@ impl IoBridge {
                     is_pad: matches!(e.content, Content::Pad(_)),
                     is_probe: self.probe_tag_of(&e.content).is_some(),
                     len: dg.len(),
-                    // Blocks are not wired in yet (R6-d D4).
-                    protect: false,
+                    // First sends are protected; retransmissions and pads
+                    // are PLAIN (plan decision 2).
+                    protect: matches!(
+                        class,
+                        WireClass::Critical | WireClass::Refinement | WireClass::H264
+                    ),
                 };
                 self.packer.push(dg, meta, max_dg, now_us)
             }
@@ -269,6 +277,8 @@ impl IoBridge {
             None => self.packer.lone(dg, max_dg, now_us),
         };
         self.queue_bundles(sealed);
+        // Repairs of a block this record closed follow its last source.
+        self.service_pending_repairs();
         self.drive_pending_bundles();
         SendOutcome::Sent
     }
@@ -314,8 +324,10 @@ impl IoBridge {
     pub(super) fn queue_bundles(&mut self, sealed: SmallVec<[SealedBundle; 2]>) {
         for b in sealed {
             self.record_bundle(&b);
+            self.note_source_sealed(&b);
             self.pending_bundles.push_back(b);
         }
+        self.process_closed_blocks(None);
     }
 
     /// One ledger transmission for the bundle, keyed by `bundle_seq`.
