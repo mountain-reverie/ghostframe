@@ -810,9 +810,9 @@ async function main() {
     drainTransmit().catch((e) => console.warn('flushDatagrams(): drainTransmit failed', e));
   }
 
-  // Receive datagrams. Parity envelopes, ping/pong text, frame-level H.264
-  // reassembly and tile-level reassembly all used to be hand-routed here;
-  // the wasm core now owns parity recovery and reassembly for both, so the
+  // Receive datagrams. Ping/pong text, frame-level H.264 reassembly and
+  // tile-level reassembly all used to be hand-routed here; the wasm core
+  // now owns reassembly for both, so the
   // loop reduces to a length guard, the ping/pong backward-compat carve-out
   // (which predates the tile protocol and the core has no concept of it —
   // it must run before handleDatagram ever sees the bytes), and rendering

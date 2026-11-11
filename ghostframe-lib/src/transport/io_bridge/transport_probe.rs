@@ -58,9 +58,6 @@ pub(super) struct Enqueued {
     pub(super) framing_len: usize,
     /// The transmission it carries (its `wire_seq`), when the ledger tracks it.
     pub(super) wire_seq: Option<u32>,
-    /// For a tile parity datagram, the first `wire_seq` of the group it covers.
-    /// `None` for everything else.
-    pub(super) parity_group: Option<u32>,
     /// The session's cumulative accepted bytes including this one.
     pub(super) cum_enqueued: u64,
     /// quinn's queued bytes after it.
@@ -100,7 +97,6 @@ pub(super) struct Instruments {
     /// pass is no longer owed.
     pub(super) nack_miss_pending: u64,
     pub(super) nack_miss_not_owed: u64,
-    pub(super) late_acks_fec_possible: u64,
     pub(super) pto_probes_requested: u64,
     pub(super) losses_flushed: u64,
     /// Declared lost but dropped from the pending list by its cap.
@@ -303,7 +299,6 @@ impl IoBridge {
             dg_len,
             framing_len,
             wire_seq,
-            parity_group,
             cum_enqueued,
             queued,
         } = e;
@@ -334,11 +329,6 @@ impl IoBridge {
         i.offered.bill(class, dg_len, framing_len);
         i.fifo_peak_at_enqueue = i.fifo_peak_at_enqueue.max(queued);
         self.track_enqueue(handle, wire_seq, cum_enqueued);
-        // The ledger wants to know when a group's parity leaves (see
-        // `Resolution::Late::fec_possible`).
-        if let Some(first) = parity_group {
-            self.departures.tag_last_as_parity(first);
-        }
     }
 
     /// After a `poll_transmit` batch, stamp the datagrams that left quinn's
@@ -374,12 +364,6 @@ impl IoBridge {
                     stamp_departure_in(ledger, emitter, sampler, pacer_limited, ws, now);
                 }
             });
-        let retain =
-            (self.reliable_emitter.rtt.srtt() * 2).max(crate::transport::loss_window::SETTLE);
-        for group_first in self.departures.take_departed_parity() {
-            self.transmission_ledger
-                .note_parity_departed(group_first, now, retain);
-        }
         // App-limited, in the delivery-rate draft's sense: these departures
         // left nothing behind in admission and nothing queued in quinn, so
         // the sender, not the path, ran out of work. `queued` is the FIFO
@@ -436,7 +420,6 @@ impl IoBridge {
             loss_retx_requested: i.loss_retx_requested,
             nack_miss_pending: i.nack_miss_pending,
             nack_miss_not_owed: i.nack_miss_not_owed,
-            late_acks_fec_possible: i.late_acks_fec_possible,
             pto_probes_requested: i.pto_probes_requested,
             pto_fires: self.reliable_emitter.stats.pto_fires,
             loss_retransmits: self.reliable_emitter.stats.loss_retransmits,

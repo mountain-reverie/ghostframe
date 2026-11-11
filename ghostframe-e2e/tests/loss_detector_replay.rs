@@ -89,10 +89,6 @@ struct Replay {
     spurious: u64,
     /// The same, among the datagrams of the last quarter of the trace.
     spurious_last_quarter: u64,
-    /// Late acknowledgements the ledger took for FEC recoveries (not retracted,
-    /// not counted as reordering). The trace has no parity loss recovery in it,
-    /// so every one is a misreading.
-    taken_for_fec: u64,
     verdicts_last_quarter: u64,
     k_pkt_at_end: u64,
     reo_wnd_at_end_us: u64,
@@ -195,7 +191,7 @@ fn replay_shaped(
     };
     // Departures happen in send order, one per datagram, interleaved with the
     // arrivals in time: a datagram has departed only once its send time has
-    // come (the ledger's FEC-distance rule reads how many departures followed).
+    // come.
     let mut next_send = 0u32;
     // The ordinary round trip, here the one-way delay: the replay returns the
     // acknowledgement at once.
@@ -225,11 +221,6 @@ fn replay_shaped(
                 },
             );
             ledger.mark_departed(i, at, shape.send_us(i));
-            // The group's parity leaves right behind the datagram that
-            // allocates `first + 20`, i.e. after `first + 19` has left.
-            if i % 10 == 9 && i >= 19 {
-                ledger.note_parity_departed(i - 19, at, Duration::from_millis(600));
-            }
             next_send += 1;
         }
         let now = t0 + Duration::from_micros(at_us);
@@ -256,9 +247,8 @@ fn replay_shaped(
         }
         for &(_, _, ws) in &arrivals[g..end] {
             match ledger.resolve_at(ws, Some((now, min_rtt))) {
-                Some(Resolution::Late { fec_possible, .. }) => {
+                Some(Resolution::Late { .. }) => {
                     out.spurious += 1;
-                    out.taken_for_fec += u64::from(fec_possible);
                     if ws >= quarter {
                         out.spurious_last_quarter += 1;
                     }
@@ -374,36 +364,20 @@ fn the_adaptive_threshold_stops_being_wrong_about_deep_reordering() {
     );
 }
 
-/// Reordering as deep as the interleave itself: a window of 16 intervals
-/// displaces a datagram by up to 15 places. A single group member delayed by
-/// 19 - p intervals or more (p its position in the group) acknowledges exactly
-/// when a parity recovery of it would, and nothing the server can see tells the
-/// two apart without a wire flag, so some of those are taken for recoveries.
-/// What the group-aware test does buy is the case of several members of one
-/// group displaced together (two cannot both be rebuilt), which halves the
-/// misreading here.
+/// Reordering 16 intervals deep displaces a datagram by up to 15 places. The
+/// late acknowledgements that follow drive the packet threshold up from its
+/// floor, whatever depth they come from.
 ///
-/// What is asserted is the property, not the number: the misread share stays
-/// a minority (the sibling test removed, it is 40 %), and the late
-/// acknowledgements that are not taken for recoveries still drive the
-/// threshold to its ceiling. Exact for the fixed seed; see the comment on
-/// `Provenance::Rebuilt` in the PR body for the wire-flag follow-up that
-/// closes the rest.
+/// What is asserted is the property, not a number: late acknowledgements and
+/// real losses both exist in quantity in the trace (the premises, so the
+/// threshold's rise is not a vacuous pass), and the threshold adapts.
 #[test]
-fn deep_reordering_is_mostly_not_mistaken_for_parity_recovery() {
+fn deep_reordering_drives_the_packet_threshold_up() {
     let t = trace(profile(16.0, 0.02), 0x5EED);
     let adaptive = replay(&t, false);
     println!("P5B 16-interval: {adaptive:?}");
-    // Premises: late acknowledgements exist in quantity, and there are
-    // real losses in the trace.
     assert!(adaptive.spurious > 200, "premise: {adaptive:?}");
     assert!(adaptive.real_losses > 100, "premise: {adaptive:?}");
-    assert!(
-        adaptive.taken_for_fec * 4 <= adaptive.spurious,
-        "late acknowledgements taken for parity recoveries: {} of {}",
-        adaptive.taken_for_fec,
-        adaptive.spurious
-    );
     assert!(adaptive.k_pkt_at_end > 3, "adapts: {adaptive:?}");
 }
 

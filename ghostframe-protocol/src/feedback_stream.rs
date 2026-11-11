@@ -15,13 +15,11 @@
 //!
 //! ## What is *not* in this namespace
 //!
-//! Datagram envelopes ([`crate::protocol::TILE_PARITY_ENVELOPE`] = 0x04,
-//! [`crate::protocol::TILE_NACK_ENVELOPE`] = 0x05, and
+//! Datagram envelopes ([`crate::protocol::TILE_NACK_ENVELOPE`] = 0x05 and
 //! [`crate::ack::ACK_BATCH_MSG_TYPE`] = 0x06) travel as QUIC datagrams, a
-//! different channel, and are routed by a different dispatcher. Parity and
-//! NACK already reuse byte values that mean something else here (0x04 and
-//! 0x05); that is harmless only because the channels never share a
-//! dispatcher. Never route a byte from one channel through the other's.
+//! different channel, and are routed by a different dispatcher. NACK already
+//! reuses a byte value that means something else here (0x05); that is
+//! harmless only because the channels never share a dispatcher. Never route a byte from one channel through the other's.
 //! (The ACK batch moved 0x04 -> 0x06 for an entry-format change, skipping
 //! 0x05 so it could not alias the NACK envelope.)
 

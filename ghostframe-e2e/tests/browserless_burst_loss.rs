@@ -188,16 +188,6 @@ fn report(name: &str, r: &BrowserlessResult) {
         r.client_wire_loss.dup_rebuilt,
         r.client_rx_datagrams,
     );
-    // Report-only oracle for the server's FEC recognition: late acks the
-    // ledger took for parity recoveries against what the client says it
-    // rebuilt from parity. The server sees only late acks of transmissions it
-    // had already declared lost, so it is a subset of the client's count.
-    println!(
-        "FECORACLE {name}: late_acks_fec_possible={} ledger_late_acks={} client_recovered={}",
-        r.transport.instr.late_acks_fec_possible,
-        r.transport.instr.ledger_spurious_losses,
-        r.client_wire_loss.recovered,
-    );
 }
 
 /// The D1 instruments, one line per run (see `ghostframe_lib::transport::instruments`).
@@ -207,7 +197,7 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
     println!(
         "D1INSTR {name}: window_ms={} fifo_samples={} fifo_max_B={} fifo_peak_at_enqueue_B={} \
          fifo_mean_B={} fifo_slope_last_quarter_Bps={} quinn_limited[turns={:.3} time={:.3}] \
-         offered_Bps[crit={:.0} refine={:.0} nack={:.0} loss={:.0} sched_retry={:.0} parity={:.0} h264={:.0} \
+         offered_Bps[crit={:.0} refine={:.0} nack={:.0} loss={:.0} sched_retry={:.0} h264={:.0} \
          control={:.0} overhead={:.0}] offered_total_B={} quinn_enqueued_B={} \
          quinn_departed_Bps={:.0} lag_us[n={} p50={} p95={} max={}] mirror_len={} \
          mirror_overflowed={} budget_passes[pacer={} floor={} probe={}] gate_stops[depth={} tokens={} rejected={}] \
@@ -234,7 +224,6 @@ fn report_instruments(name: &str, r: &BrowserlessResult) {
         i.per_second(i.offered.of(W::NackRepair)),
         i.per_second(i.offered.of(W::LossRetransmit)),
         i.per_second(i.offered.of(W::SchedulerRetry)),
-        i.per_second(i.offered.of(W::Parity)),
         i.per_second(i.offered.of(W::H264)),
         i.per_second(i.offered.of(W::Control)),
         i.per_second(i.offered.overhead),
@@ -385,16 +374,6 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
     for c in [W::Critical, W::Refinement, W::Control] {
         assert!(i.offered.of(c) > 0, "{n}: {c:?} never billed");
     }
-    // Tile parity is off by default (C3-3): none may be billed. That every
-    // other class is billed above, and that an opted-in run does bill parity
-    // (`tile_fec_is_billed_only_when_opted_in`), is what makes this zero mean
-    // something.
-    assert_eq!(
-        i.offered.of(W::Parity),
-        0,
-        "{n}: tile parity billed on a default run (WireClass::Parity also counts H.264 parity, \
-         which these scenes never send)"
-    );
     assert!(i.offered.overhead > 0, "{n}: no framing overhead billed");
     assert_eq!(
         i.offered.total(),
@@ -408,7 +387,7 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
         i.quinn_bytes_enqueued
     );
     // Departure tracker: every datagram quinn accepted for the live session
-    // (tiles, parity, H.264, dimensions, pongs) is either stamped or still
+    // (tiles, H.264, dimensions, pongs) is either stamped or still
     // queued. Eviction notices are the one exception and none are sent here.
     let all: u64 = i.offered.datagrams.iter().sum();
     assert!(i.lag_samples > 0, "{n}: no departure was stamped");
@@ -489,66 +468,6 @@ fn assert_established(name: &str, r: &BrowserlessResult) {
         "{name}: session never established"
     );
     assert!(r.s2c_datagrams_offered > 0, "{name}: no s2c traffic at all");
-}
-
-/// C3-3: tile parity is billed, sent and consumed only when asked for. The
-/// same lossy scene is run both ways, so a zero on the default run cannot be a
-/// scene too short or too clean to complete a parity group, and the opted-in
-/// run proves the whole path (emitter, wire, client decoder) is still alive.
-#[tokio::test(start_paused = true)]
-async fn tile_fec_is_billed_only_when_opted_in() {
-    use ghostframe_lib::transport::reliable_emitter::emission_queue::WireClass as W;
-    let run = |fec: bool| async move {
-        run_browserless_with_options(
-            scene(0xB0_B057, 8),
-            s2c_only(|p| p.loss = RATE),
-            RunOptions {
-                tile_fec: fec,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("scene ran")
-    };
-    let on = run(true).await;
-    let off = run(false).await;
-    for (n, r) in [("tile_fec on", &on), ("tile_fec off", &off)] {
-        assert_established(n, r);
-        assert!(
-            r.s2c_datagrams_dropped > 0,
-            "{n}: premise: the scene lost nothing"
-        );
-    }
-    println!(
-        "C33 on: parity_B={} client_recovered={} s2c_bytes={} | off: parity_B={} client_recovered={} s2c_bytes={}",
-        on.transport.instr.offered.of(W::Parity),
-        on.client_wire_loss.recovered,
-        on.bytes_delivered_s2c,
-        off.transport.instr.offered.of(W::Parity),
-        off.client_wire_loss.recovered,
-        off.bytes_delivered_s2c,
-    );
-    assert!(
-        on.transport.instr.offered.of(W::Parity) > 0,
-        "opted in, no parity was billed"
-    );
-    assert_eq!(
-        off.transport.instr.offered.of(W::Parity),
-        0,
-        "default: tile parity billed (these scenes send no H.264 parity)"
-    );
-    assert!(
-        on.client_wire_loss.recovered > 0,
-        "opted in, the client rebuilt nothing from parity: the decoder path is not proven"
-    );
-    assert_eq!(
-        off.client_wire_loss.recovered, 0,
-        "default: the client rebuilt a datagram from parity that was never sent"
-    );
-    assert_eq!(
-        off.transport.instr.late_acks_fec_possible, 0,
-        "default: a late ack was taken for a parity recovery with no parity sent"
-    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1335,7 +1254,7 @@ async fn p5a(ignore_client_nacks: bool) -> (u64, u64, u64, u64) {
             realised(&n, P5_RATE, &r);
             println!(
                 "P5A{} {n}: lost_datagrams={} retransmits={} (loss={} probe={} nack={}) ratio={:.3} \
-                 cache_left={} tiles={} stale={} verdicts={} spurious={} fec_possible={} k_pkt={} pto_fires={} \
+                 cache_left={} tiles={} stale={} verdicts={} spurious={} k_pkt={} pto_fires={} \
                  critical_lat_mean_us={} max_us={} queued_crit_mean_us={}",
                 if ignore_client_nacks { "_ALONE" } else { "" },
                 b.lost_datagrams,
@@ -1349,7 +1268,6 @@ async fn p5a(ignore_client_nacks: bool) -> (u64, u64, u64, u64) {
                 r.stale_generation_tiles,
                 r.transport.instr.loss_by_packet_threshold + r.transport.instr.loss_by_time_threshold,
                 r.transport.instr.ledger_spurious_losses,
-                r.transport.instr.late_acks_fec_possible,
                 r.transport.instr.k_pkt,
                 r.transport.instr.pto_fires,
                 r.critical_latency_mean_us,

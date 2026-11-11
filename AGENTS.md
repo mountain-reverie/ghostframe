@@ -462,11 +462,7 @@ Env-gated, off by default:
   --test cdf53_grid` and check the shaderdb line (about 930 instructions, 8
   registers, ~21:57 spills is the shipped build).
 
-Tile XOR parity (k=10) is **off by default** (`TransportConfig::tile_fec`).
-`GHOSTFRAME_TILE_FEC=1` turns it back on; a browserless scene opts in with
-`RunOptions { tile_fec: true, .. }`. The client decodes parity either way. (H.264
-has no parity; it was removed.) A counter that reads zero (`parity`,
-`client_recovered`, `late_acks_fec_possible`) on a default run is the switch, not a broken probe.
+Tile XOR parity was removed by FEC v2 rev 6; the framing's Reed-Solomon replaces it.
 
 See also `reference_e2e_loss_injection` and `reference_e2e_diagnose` notes for
 the e2e-side injection variables.

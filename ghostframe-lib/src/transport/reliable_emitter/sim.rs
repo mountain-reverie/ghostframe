@@ -61,14 +61,13 @@ fn fake_source(seq: u32) -> Bytes {
 }
 
 /// Decode the EmitKey from a tile datagram's header bytes. Returns None
-/// for parity envelopes (which have a different first byte).
+/// for a datagram that is not a tile pass.
 fn key_from_datagram(dg: &[u8]) -> Option<EmitKey> {
     if dg.len() < 20 {
         return None;
     }
     let fs = u32::from_be_bytes(dg[0..4].try_into().ok()?);
-    // Parity envelopes start with 0x04 in the first byte; tile datagrams
-    // carry the TILE_DATAGRAM_FLAG (bit 31) and have frame_seq otherwise.
+    // Tile datagrams carry the TILE_DATAGRAM_FLAG (bit 31).
     if fs & 0x8000_0000 == 0 {
         return None;
     }

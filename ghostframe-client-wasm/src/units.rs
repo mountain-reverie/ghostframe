@@ -16,16 +16,14 @@ use ghostframe_client_core::{
     nack_batcher::{NackBatcher, NackEntry},
     pal_rle_decode,
     palette_shadow::PaletteShadow,
-    parity_decoder::ParityDecoder,
     DecodeErrorCode,
 };
 use ghostframe_protocol::ack::{AckBatch, AckEntry};
-use ghostframe_protocol::protocol::{Codec, TileNackEnvelope, TileParityEnvelope};
+use ghostframe_protocol::protocol::{Codec, TileNackEnvelope};
 use wasm_bindgen::prelude::*;
 
 use crate::boundary::{
-    WasmAckEntry, WasmArrivalOutcome, WasmNackEntry, WasmParityEnvelope, WasmPrevalidatedCdf53,
-    WasmPrevalidatedPalRle,
+    WasmAckEntry, WasmArrivalOutcome, WasmNackEntry, WasmPrevalidatedCdf53, WasmPrevalidatedPalRle,
 };
 
 // `Option<Vec<u8>>` crosses the boundary as `Uint8Array | undefined`, so the
@@ -272,45 +270,6 @@ impl WasmPaletteShadow {
 }
 
 #[wasm_bindgen]
-pub struct WasmParityDecoder {
-    inner: ParityDecoder,
-}
-
-#[wasm_bindgen]
-impl WasmParityDecoder {
-    #[wasm_bindgen(constructor)]
-    pub fn new(window_capacity: usize) -> WasmParityDecoder {
-        WasmParityDecoder {
-            inner: ParityDecoder::new(window_capacity),
-        }
-    }
-
-    #[wasm_bindgen(js_name = hasSource)]
-    pub fn has_source(&self, wire_seq: u32) -> bool {
-        self.inner.has_source(wire_seq)
-    }
-
-    /// Returns a recovered source datagram if this arrival unlocked a
-    /// buffered parity, otherwise `undefined`.
-    #[wasm_bindgen(js_name = recordSource)]
-    pub fn record_source(&mut self, wire_seq: u32, bytes: &[u8]) -> Option<Vec<u8>> {
-        self.inner.record_source(wire_seq, bytes)
-    }
-
-    /// Takes the raw envelope bytes and parses internally, mirroring the TS
-    /// suite's `parseParityEnvelope` + `receiveParity` pairing.
-    ///
-    /// Returns `undefined` both for a malformed envelope and for a
-    /// well-formed one that recovers nothing — the suite distinguishes those
-    /// by also asserting on `hasSource`.
-    #[wasm_bindgen(js_name = receiveParity)]
-    pub fn receive_parity(&mut self, envelope_bytes: &[u8]) -> Option<Vec<u8>> {
-        let env = TileParityEnvelope::decode(envelope_bytes).ok()?;
-        self.inner.receive_parity(&env)
-    }
-}
-
-#[wasm_bindgen]
 pub struct WasmLossTracker {
     inner: LossTracker,
 }
@@ -414,44 +373,6 @@ pub fn parse_nack_envelope(bytes: &[u8]) -> Result<JsValue, JsValue> {
         .ok()
         .map(|env| env.entries.iter().map(WasmNackEntry::from).collect());
     serde_wasm_bindgen::to_value(&entries).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-/// Decodes a parity envelope; `undefined` if malformed.
-#[wasm_bindgen(js_name = parseParityEnvelope)]
-pub fn parse_parity_envelope(bytes: &[u8]) -> Result<JsValue, JsValue> {
-    let env: Option<WasmParityEnvelope> = TileParityEnvelope::decode(bytes)
-        .ok()
-        .as_ref()
-        .map(WasmParityEnvelope::from);
-    serde_wasm_bindgen::to_value(&env).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-/// Builds a parity envelope — the counterpart of the TS
-/// `encodeParityEnvelopeForTest`.
-///
-/// Note: the TS parity branch and its `parity_decoder.test.ts` were removed
-/// when recovery moved inside `WasmClientCore::handle_datagram`, and nothing
-/// in the web client calls this or `parseParityEnvelope` any more. Both are
-/// kept for now because deleting a `wasm_bindgen` export is a wider change
-/// than this one; they are candidates for removal.
-#[wasm_bindgen(js_name = encodeParityEnvelope)]
-pub fn encode_parity_envelope(
-    group_first_wire_seq: u32,
-    k: u8,
-    parity_idx: u8,
-    source_lens: &[u16],
-    parity_payload: &[u8],
-) -> Vec<u8> {
-    let env = TileParityEnvelope {
-        group_first_wire_seq,
-        k,
-        parity_idx,
-        source_lens: source_lens.to_vec(),
-        parity_payload: parity_payload.to_vec(),
-    };
-    let mut out = Vec::new();
-    env.encode(&mut out);
-    out
 }
 
 /// `[HELLO_MSG_TYPE, caps]`; caps bit0 = indices_raw, bit1 = supports_h264.

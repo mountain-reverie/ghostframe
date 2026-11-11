@@ -5,7 +5,6 @@ pub mod cache;
 pub mod emission_queue;
 pub mod emitter;
 pub mod h264;
-pub mod parity;
 pub mod pto;
 pub mod traits;
 pub mod wire_seq;
@@ -74,10 +73,6 @@ impl From<EmitKey> for Content {
 }
 
 // ---- Knob constants (spec §9) ----
-pub const FEC_GROUP_SIZE_K: usize = 10;
-pub const FEC_PARITY_PER_GROUP_R: usize = 1;
-pub const PARITY_INTERLEAVE_OFFSET: u32 = (2 * FEC_GROUP_SIZE_K) as u32;
-pub const END_OF_STREAM_PARITY_FLUSH_MS: u64 = 5;
 // Historical sizing of the retransmit cache, kept only as the scale the cache
 // tests exercise. The cache no longer has a capacity: an LRU bound of 8 K
 // evicted ~16 K entries of a first-paint burst at 48 % wire loss and left
@@ -119,9 +114,6 @@ mod tests {
     #[test]
     fn knob_invariants() {
         const {
-            assert!(FEC_GROUP_SIZE_K >= 2);
-            assert!(FEC_PARITY_PER_GROUP_R >= 1);
-            assert!(PARITY_INTERLEAVE_OFFSET == 20);
             assert!(CACHE_CAPACITY.is_power_of_two() || CACHE_CAPACITY >= 1024);
         }
     }

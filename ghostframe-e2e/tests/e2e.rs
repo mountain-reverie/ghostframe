@@ -4088,8 +4088,7 @@ async fn e2e_cdf53_lossless_buildup_firefox() -> Result<()> {
 /// after that.
 ///
 /// Reproduces by dropping 25% of tile datagrams deterministically (seed
-/// 42). FEC parity datagrams are not dropped (predicate matches only
-/// source tile datagrams). With the emitter now retransmitting
+/// 42). With the emitter now retransmitting
 /// indefinitely (no MAX_RETRANSMITS retirement, RTO backoff capped at
 /// 5 s, cache never LRU-evicts) every un-ACKed tile-pass eventually
 /// lands, and per-pass ACK bitmaps prevent the AckBatcher overlap from
@@ -5032,7 +5031,7 @@ async fn e2e_stats_panel_subscribe_samples_unsubscribe() -> Result<()> {
 /// Closes a gap the existing e2e suite misses: every other pixel test
 /// runs with the classifier's H.264 forced-start active at session
 /// entry, so any cdf53 tile-pass lost on the wire is masked by H.264's
-/// independent FEC + parity + NACK path. This test sets
+/// independent FEC + NACK path. This test sets
 /// `GHOSTFRAME_FORCE_TILECODEC=1` to bypass the H.264 force, then polls
 /// the full framebuffer until **every** pixel matches the static
 /// `--lossless-golden` test-pattern source bytes, generated server- and

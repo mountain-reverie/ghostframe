@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Central facade that ties cache, emission queue, allocator, group
-//! builder, the loss-path queue and the probe timer into one struct.
+//! Central facade that ties cache, emission queue, allocator, the loss-path queue and the probe timer into one struct.
 //! Per-session.
 
-use crate::transport::protocol::TileParityEnvelope;
 use crate::transport::reliable_emitter::cache::{CacheEntry, ProbeTag, RetransmitCache};
 use crate::transport::reliable_emitter::emission_queue::{Emission, EmissionQueue, WireClass};
 use crate::transport::reliable_emitter::h264::{
     H264Cache, H264Submit, PadEntry, PadRing, H264_CACHE_FRAMES,
 };
-use crate::transport::reliable_emitter::parity::GroupBuilder;
 use crate::transport::reliable_emitter::pto::pto_for_attempt;
 use crate::transport::reliable_emitter::traits::{DatagramSender, SendOutcome};
 use crate::transport::reliable_emitter::wire_seq::WireSeqAllocator;
-use crate::transport::reliable_emitter::{
-    Content, EmitKey, FEC_GROUP_SIZE_K, PARITY_INTERLEAVE_OFFSET,
-};
+use crate::transport::reliable_emitter::{Content, EmitKey};
 use crate::transport::rtt_estimator::RttEstimator;
 use bytes::{Bytes, BytesMut};
 use std::cmp::Reverse;
@@ -43,10 +38,6 @@ pub struct ReliableTileEmitter {
     pub(crate) pads: PadRing,
     pub(crate) alloc: WireSeqAllocator,
     pub(crate) queue: EmissionQueue,
-    pub(crate) group: GroupBuilder,
-    /// Whether source datagrams feed the XOR parity group builder. Off by
-    /// default; see `TransportConfig::tile_fec`.
-    tile_fec: bool,
     /// Per pass the loss path resent and that is not acknowledged yet: the
     /// first retransmission's `wire_seq`, how many times it was resent and by
     /// whom (a verdict or the probe). Resolved by
@@ -142,7 +133,6 @@ pub struct EmittedDatagram {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EmitterStats {
     pub source_emitted: u64,
-    pub parity_emitted: u64,
     /// Retransmissions made by the loss path: `loss_retransmits` plus
     /// `pto_probe_retransmits`. (Formerly `rto_fired`, from the per-pass timer, which
     /// is gone.)
@@ -239,7 +229,7 @@ pub struct EmitterStats {
     /// IDR, or trimmed to the newest frames.
     pub h264_cache_dropped: u64,
     /// Queued emissions removed before they left (superseded by an IDR, or a
-    /// suspect frame's), fragments and parity.
+    /// suspect frame's) and fragments.
     pub h264_queue_purged: u64,
     pub verdict_newer_in_flight: u64,
     pub verdict_already_queued: u64,
@@ -382,8 +372,6 @@ impl ReliableTileEmitter {
             pads: PadRing::default(),
             alloc: WireSeqAllocator::new(),
             queue: EmissionQueue::new(),
-            group: GroupBuilder::new(FEC_GROUP_SIZE_K),
-            tile_fec: false,
             resend_origin: HashMap::new(),
             latest_tile_generation: HashMap::new(),
             rtt: RttEstimator::new(),
@@ -400,13 +388,6 @@ impl ReliableTileEmitter {
             wire_overhead: 0,
             stats: EmitterStats::default(),
         }
-    }
-
-    /// Turn tile XOR parity on or off. Off at construction. Turn it on before
-    /// the first submit: a group needs contiguous `wire_seq`s, so enabling it
-    /// mid-stream makes the first group short and it never completes.
-    pub fn set_tile_fec(&mut self, on: bool) {
-        self.tile_fec = on;
     }
 
     /// Bill `bytes` more than each retransmitted datagram's length against
@@ -537,7 +518,7 @@ impl ReliableTileEmitter {
                 self.stats.generation_replacements += 1;
             }
         }
-        // One allocation from here on: the cache, the FEC group and the
+        // One allocation from here on: the cache and the
         // emission queue share it by reference count.
         let bytes: Bytes = bytes.freeze();
         self.transmissions.push(EmittedDatagram {
@@ -557,8 +538,6 @@ impl ReliableTileEmitter {
             probe,
         };
         self.cache.insert(key, entry);
-        // Feed group builder; on K-th source build & schedule parity envelope.
-        self.feed_group(wire_seq, bytes.clone());
         self.note_emission_queue_depth();
         // Enqueue the source itself.
         let class = if scheduler_retry {
@@ -621,10 +600,6 @@ impl ReliableTileEmitter {
                 probe,
             },
         );
-        // Not fed to the tile XOR group builder: a fragment takes a wire_seq,
-        // which breaks the run of a tile group in progress, and the builder
-        // abandons a group at a gap rather than emit a parity whose
-        // membership is a lie.
         self.note_emission_queue_depth();
         self.queue.push_source(bytes, WireClass::H264);
         self.stats.h264_fragments_submitted += 1;
@@ -758,7 +733,7 @@ impl ReliableTileEmitter {
         self.purge_queued_h264(|f| f < frame_seq)
     }
 
-    /// Remove the queued frame datagrams (fragments, resends and parity) of
+    /// Remove the queued frame datagrams (fragments and resends) of
     /// the frames `doomed` names. Returns the `wire_seq`s of the tracked ones.
     pub fn purge_queued_h264(&mut self, doomed: impl Fn(u32) -> bool) -> Vec<u32> {
         let (removed, wire_seqs) = self.queue.purge_frames(doomed);
@@ -792,41 +767,6 @@ impl ReliableTileEmitter {
     /// Wire bytes of H.264 frame datagrams waiting in the emission queue.
     pub fn queued_h264_bytes(&self) -> usize {
         self.queue.frame_bytes()
-    }
-
-    /// Feed one freshly on-the-wire source datagram into the FEC group
-    /// builder and, when it completes a group, build the parity envelope
-    /// and hand it to the emission queue.
-    ///
-    /// Every site that allocates a `wire_seq` for a source transmission —
-    /// `submit_one`, `tick`'s loss-path retransmit, and `on_nack` — must route
-    /// through here rather than each building its own envelope. The
-    /// decoder reconstructs a group's membership as a contiguous run of
-    /// `k` wire_seqs starting at `group_first_wire_seq`, so if any
-    /// allocated `wire_seq` skipped the group builder (which is exactly
-    /// the bug this helper fixes: `tick` and `on_nack` used to allocate
-    /// `wire_seq`s that never joined a group), the decoder would treat a
-    /// `wire_seq` that was never a source as a missing one and fabricate
-    /// a datagram that was never sent.
-    fn feed_group(&mut self, wire_seq: u32, bytes: Bytes) {
-        if !self.tile_fec {
-            return;
-        }
-        if let Some(result) = self.group.add(wire_seq, bytes) {
-            let envelope = TileParityEnvelope {
-                group_first_wire_seq: result.group_first_wire_seq,
-                k: result.k,
-                parity_idx: 0,
-                source_lens: result.source_lens,
-                parity_payload: result.parity,
-            };
-            let mut env_bytes = Vec::new();
-            envelope.encode(&mut env_bytes);
-            let emit_after = result
-                .group_first_wire_seq
-                .wrapping_add(PARITY_INTERLEAVE_OFFSET);
-            self.queue.schedule_parity(emit_after, env_bytes);
-        }
     }
 
     /// [`Self::submit_batch`], with `retry[i]` true where item `i` is a
@@ -1065,12 +1005,6 @@ impl ReliableTileEmitter {
                 wire_bytes: bytes.len(),
                 content: Content::Tile(key),
             });
-            // A NACK retransmit allocates its own `wire_seq` above; it must
-            // join the FEC group exactly as a first transmission does (see
-            // `feed_group`'s doc comment).
-            if bytes.len() >= 12 {
-                self.feed_group(ws, bytes.clone());
-            }
             spent += bytes.len() + self.wire_overhead;
             self.queue.push_source(bytes, WireClass::NackRepair);
             self.stats.retransmit_attempts_total += 1;
@@ -1225,14 +1159,6 @@ impl ReliableTileEmitter {
                 wire_bytes: bytes.len(),
                 content: Content::Tile(key),
             });
-            // A retransmit allocates its own `wire_seq` above; it must
-            // join the FEC group exactly as a first transmission does
-            // (see `feed_group`'s doc comment), or the group builder's
-            // membership range no longer matches what was actually put
-            // on the wire.
-            if bytes.len() >= 12 {
-                self.feed_group(ws, bytes.clone());
-            }
             spent += bytes.len() + self.wire_overhead;
             self.queue.push_source(bytes, WireClass::LossRetransmit);
             self.stats.loss_path_resends += 1;
@@ -1612,11 +1538,9 @@ impl ReliableTileEmitter {
     }
 
     pub fn drain<S: DatagramSender>(&mut self, sender: &mut S, now: Instant) {
-        while let Some(emission) = self.next_emission(now) {
-            let outcome = match &emission {
-                Emission::Source(bytes, _) => sender.send(bytes),
-                Emission::Parity(bytes, _) => sender.send(bytes),
-            };
+        while let Some(emission) = self.next_emission() {
+            let Emission::Source(bytes, _) = &emission;
+            let outcome = sender.send(bytes);
             // A `DatagramSender` is the wire as far as this method is
             // concerned (a test's collector, the simulator's link), so what it
             // accepted has departed. The bridge does not come through here: it
@@ -1642,9 +1566,8 @@ impl ReliableTileEmitter {
     /// caller whose sender needs `&mut` access to the structure that owns this
     /// emitter can send between the halves, with no borrow of the emitter live
     /// across the send.
-    pub(crate) fn next_emission(&mut self, now: Instant) -> Option<Emission> {
-        let next = self.alloc.peek();
-        self.queue.pop(next, now)
+    pub(crate) fn next_emission(&mut self) -> Option<Emission> {
+        self.queue.pop()
     }
 
     /// Put an emission the admission gate refused back at the head of the
@@ -1658,12 +1581,7 @@ impl ReliableTileEmitter {
     /// Returns false when the caller must stop draining.
     pub(crate) fn settle_emission(&mut self, emission: Emission, outcome: SendOutcome) -> bool {
         match outcome {
-            SendOutcome::Sent => {
-                if matches!(emission, Emission::Parity(..)) {
-                    self.stats.parity_emitted += 1;
-                }
-                true
-            }
+            SendOutcome::Sent => true,
             SendOutcome::Rejected => {
                 self.queue.push_front(emission);
                 self.stats.send_rejected += 1;
@@ -1835,19 +1753,13 @@ mod tests {
     fn cache_and_queue_share_one_allocation() {
         let now = Instant::now();
         let mut e = ReliableTileEmitter::new(now);
-        e.set_tile_fec(true);
         let key = EmitKey::new(1, 0, 0, 0);
         e.submit_one(key, fake_source(1, 0, 0xAA), now, None, now);
         let cached_ptr = e.cache.get(&key).unwrap().datagram.as_ptr();
-        let Some(Emission::Source(queued, _)) = e.next_emission(now) else {
+        let Some(Emission::Source(queued, _)) = e.next_emission() else {
             panic!("expected the source emission");
         };
         assert_eq!(queued.as_ptr(), cached_ptr, "queue holds its own copy");
-        assert_eq!(
-            e.group.sources[0].as_ptr(),
-            cached_ptr,
-            "the FEC group holds its own copy"
-        );
     }
 
     #[test]
@@ -1971,83 +1883,6 @@ mod tests {
         let ws1 = u32::from_be_bytes(s1[8..12].try_into().unwrap());
         assert_eq!(ws0, 0);
         assert_eq!(ws1, 1);
-    }
-
-    /// Tile parity is opt-in. The same stream is run with and without it, so
-    /// the zero cannot be a stream too short to complete a group.
-    #[test]
-    fn no_tile_parity_is_emitted_unless_asked_for() {
-        let run = |fec: bool| {
-            let mut e = ReliableTileEmitter::new(Instant::now());
-            if fec {
-                e.set_tile_fec(true);
-            }
-            let mut sender = CollectSender::default();
-            let now = Instant::now();
-            for i in 0..(FEC_GROUP_SIZE_K as u32 * 5) {
-                e.submit_one(
-                    EmitKey::new(i, 0, 0, 0),
-                    fake_source(i, 0, 0),
-                    now,
-                    None,
-                    now,
-                );
-            }
-            e.drain(&mut sender, now);
-            (e.stats.parity_emitted, sender.sent.len())
-        };
-        let (on_parity, on_sent) = run(true);
-        let (off_parity, off_sent) = run(false);
-        assert!(on_parity > 0, "premise: opt-in emits parity ({on_parity})");
-        assert_eq!(off_parity, 0, "default emits no parity");
-        assert_eq!(
-            off_sent as u64 + on_parity,
-            on_sent as u64,
-            "the only difference is the parity datagrams"
-        );
-    }
-
-    #[test]
-    fn submit_k_sources_emits_one_parity_after_offset() {
-        use crate::transport::reliable_emitter::FEC_GROUP_SIZE_K;
-        let mut e = ReliableTileEmitter::new(Instant::now());
-        e.set_tile_fec(true);
-        let mut sender = CollectSender::default();
-        let now = Instant::now();
-        // Submit K sources for group 0, then K sources for group 1 (so the
-        // offset-interleaved parity for group 0 is reachable).
-        for i in 0..(FEC_GROUP_SIZE_K as u32 * 2) {
-            e.submit_one(
-                EmitKey::new(i, 0, 0, 0),
-                fake_source(i, 0, 0),
-                now,
-                None,
-                now,
-            );
-        }
-        // Drain past wire_seq 20 by submitting one more source so allocator's
-        // peek advances.
-        e.submit_one(
-            EmitKey::new(99, 0, 0, 0),
-            fake_source(99, 0, 0),
-            now,
-            None,
-            now,
-        );
-        e.drain(&mut sender, now);
-        // At least one parity datagram should have been emitted
-        assert_eq!(
-            e.stats.parity_emitted, 1,
-            "exactly one parity for first K sources"
-        );
-        // Total emitted: 2K+1 source + 1 parity
-        assert_eq!(
-            sender.sent.len(),
-            (FEC_GROUP_SIZE_K as u32 * 2 + 1 + 1) as usize
-        );
-        // The parity datagram starts with TILE_PARITY_ENVELOPE (0x04)
-        let parities: Vec<&Vec<u8>> = sender.sent.iter().filter(|b| b[0] == 0x04).collect();
-        assert_eq!(parities.len(), 1);
     }
 
     #[test]
@@ -2369,26 +2204,23 @@ mod tests {
 
     /// Offered-load accounting: every datagram handed to the transport is
     /// billed to exactly one class, so the classes (plus framing) sum to the
-    /// bytes handed over. A scripted run that exercises all five emitter
+    /// bytes handed over. A scripted run that exercises all four emitter
     /// classes; the premise asserts each is non-zero, so a class the emitter
     /// stopped labelling (or an unbilled one) cannot hide behind a sum that
     /// still balances.
     #[test]
     fn offered_bytes_by_class_sum_to_the_bytes_handed_to_the_transport() {
         use crate::transport::instruments::OfferedBytes;
-        use crate::transport::reliable_emitter::FEC_GROUP_SIZE_K;
 
         let mut e = ReliableTileEmitter::new(Instant::now());
-        e.set_tile_fec(true);
         let mut offered = OfferedBytes::default();
         let mut handed = 0u64;
         let t0 = Instant::now();
         let mut hand_over = |e: &mut ReliableTileEmitter, now: Instant| {
-            while let Some(em) = e.next_emission(now) {
+            while let Some(em) = e.next_emission() {
                 let class = em.class();
-                let len = match &em {
-                    Emission::Source(b, _) | Emission::Parity(b, _) => b.len(),
-                };
+                let Emission::Source(b, _) = &em;
+                let len = b.len();
                 // A 2-byte framing prefix per datagram, as the WebTransport
                 // layer adds a varint.
                 offered.bill(class, len, 2);
@@ -2402,9 +2234,8 @@ mod tests {
             }
         };
 
-        // First sends: critical (pass 0) and refinement (pass 5), enough of
-        // them to complete FEC groups and release parity.
-        let n = FEC_GROUP_SIZE_K as u32 * 2 + 1;
+        // First sends: critical (pass 0) and refinement (pass 5).
+        let n = 21u32;
         for i in 0..n {
             let pass = if i % 3 == 0 { 5 } else { 0 };
             e.submit_one(
@@ -2436,20 +2267,17 @@ mod tests {
             WireClass::Refinement,
             WireClass::NackRepair,
             WireClass::LossRetransmit,
-            WireClass::Parity,
         ] {
             assert!(offered.of(class) > 0, "{class:?} never billed");
         }
         assert!(e.stats.loss_path_resends > 0 && e.stats.retransmit_by_nack > 0);
-        assert!(e.stats.parity_emitted > 0);
         assert_eq!(
             offered.total(),
             handed,
             "classes + framing must account for every byte handed over"
         );
         // Labels, checked against sizes known independently of the billing:
-        // every source datagram here is 25 bytes and the parity envelope is
-        // recognised by its first byte, not by its class.
+        // every source datagram here is 25 bytes.
         let src = 25u64;
         let crit_sends = (0..n).filter(|i| i % 3 != 0).count() as u64;
         let refine_sends = (0..n).filter(|i| i % 3 == 0).count() as u64;
@@ -2463,15 +2291,11 @@ mod tests {
             offered.of(WireClass::LossRetransmit),
             e.stats.loss_path_resends * src
         );
-        assert_eq!(
-            offered.datagrams[WireClass::Parity.index()],
-            e.stats.parity_emitted
-        );
         // And per datagram, not just in aggregate.
         let datagrams: u64 = offered.datagrams.iter().sum();
         assert_eq!(
             datagrams,
-            e.stats.source_emitted + e.stats.retransmit_attempts_total + e.stats.parity_emitted
+            e.stats.source_emitted + e.stats.retransmit_attempts_total
         );
     }
 
@@ -2484,7 +2308,7 @@ mod tests {
         let item = |i| (EmitKey::new(i, 0, 0, 0), fake_source(i, 0, 0), t0, None);
         e.submit_batch_marking_retries(vec![item(1), item(2), item(3)], &[false, true, false], t0);
         let mut classes = Vec::new();
-        while let Some(em) = e.next_emission(t0) {
+        while let Some(em) = e.next_emission() {
             classes.push(em.class());
             assert!(e.settle_emission(em, SendOutcome::Sent));
         }
@@ -3092,18 +2916,14 @@ mod tests {
         e.submit_one(EmitKey::new(1, 0, 0, 0), fake_source(1, 0, 0), t0, None, t0);
         e.submit_one(EmitKey::new(1, 1, 0, 0), fake_source(2, 0, 0), t0, None, t0);
         assert_eq!(e.emission_queue_len(), 2);
-        let first = e.next_emission(t0).unwrap();
-        let first_bytes = match &first {
-            Emission::Source(b, _) => b.clone(),
-            Emission::Parity(b, _) => b.clone(),
-        };
+        let first = e.next_emission().unwrap();
+        let Emission::Source(first_bytes, _) = &first;
+        let first_bytes = first_bytes.clone();
         e.hold_emission(first);
         assert_eq!(e.emission_queue_len(), 2);
         assert_eq!(e.stats.send_rejected, 0);
-        match e.next_emission(t0).unwrap() {
-            Emission::Source(b, _) => assert_eq!(b, first_bytes, "same datagram, same place"),
-            Emission::Parity(..) => panic!("parity ahead of its sources"),
-        }
+        let Emission::Source(b, _) = e.next_emission().unwrap();
+        assert_eq!(b, first_bytes, "same datagram, same place");
     }
 
     /// The client repeats a request until the pass arrives. Requests that
@@ -3445,7 +3265,6 @@ mod tests {
         // tick(t, budget) must fire at most `budget` retransmits per call,
         // leaving the rest still due in the heap for the next call.
         let mut e = ReliableTileEmitter::new(Instant::now());
-        e.set_tile_fec(true);
         let now = Instant::now();
         for i in 0..1000u32 {
             let k = EmitKey::new(i, 0, 0, 0);
@@ -3480,23 +3299,8 @@ mod tests {
             64,
             "first tick must fire exactly the budget"
         );
-        // Counted from `loss_path_resends` above rather than `sink.len()`: since a
-        // retransmission allocates its own `wire_seq`, and (as of the fix
-        // that feeds every allocated `wire_seq` into the FEC group builder)
-        // that `wire_seq` is now a genuine group member, 64 contiguous
-        // retransmit wire_seqs complete floor(64/10) = 6 new groups, each
-        // scheduling a parity envelope. Those newly-scheduled parities —
-        // plus whichever single not-yet-promoted parity was left over from
-        // the initial 1000 submissions — become promotable in this same
-        // drain because the allocator's `next` value has advanced past
-        // their `emit_after` threshold. So the drain sees 64 retransmitted
-        // sources plus 6 parities: 70.
-        assert_eq!(
-            sink.len(),
-            70,
-            "64 retransmits + 6 newly-completed FEC groups' parities, got {}",
-            sink.len()
-        );
+        // A retransmission allocates its own `wire_seq` and is one datagram.
+        assert_eq!(sink.len(), 64, "got {}", sink.len());
 
         // Second tick at same instant: another 64 should fire (936 still due).
         sink.clear();
@@ -3508,13 +3312,7 @@ mod tests {
             64,
             "second tick fires another batch"
         );
-        // Same shape as the first batch: the group builder carries a
-        // 4-source remainder from the first batch (64 is not a multiple of
-        // the group size 10), so this batch again completes 6 full groups
-        // (using that remainder plus 56 of its own 64) whose parities are
-        // promoted alongside the one left pending from the first batch's
-        // drain.
-        assert_eq!(sink.len(), 70, "got {}", sink.len());
+        assert_eq!(sink.len(), 64, "got {}", sink.len());
 
         // After many ticks at budget=64, all 1000 entries should be popped
         // (each pop takes the entry off the timer, so subsequent ticks
@@ -3700,40 +3498,5 @@ mod tests {
              of its `now` argument",
             delta,
         );
-    }
-
-    /// A tile group's parity emission carries the group's first `wire_seq`,
-    /// whether it leaves at the interleave offset or by the end-of-stream flush.
-    #[test]
-    fn a_parity_emission_names_its_groups_first_wire_seq() {
-        let t0 = Instant::now();
-        let mut e = ReliableTileEmitter::new(t0);
-        e.set_tile_fec(true);
-        let n = FEC_GROUP_SIZE_K as u32;
-        let mut first_ws = Vec::new();
-        for i in 0..n {
-            e.submit_one(
-                EmitKey::new(i, 0, 0, 0),
-                Bytes::from(vec![0x80u8; 25]),
-                t0,
-                None,
-                t0,
-            );
-        }
-        for em in e.take_transmissions() {
-            first_ws.push(em.wire_seq);
-        }
-        // Not yet at the interleave offset: the end-of-stream flush releases it.
-        let mut groups = Vec::new();
-        let mut now = t0;
-        for _ in 0..200 {
-            now += Duration::from_millis(1);
-            while let Some(em) = e.next_emission(now) {
-                if let Some(g) = em.parity_group() {
-                    groups.push(g);
-                }
-            }
-        }
-        assert_eq!(groups, vec![first_ws[0]], "{groups:?} vs {first_ws:?}");
     }
 }

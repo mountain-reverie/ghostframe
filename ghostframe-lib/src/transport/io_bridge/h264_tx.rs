@@ -166,7 +166,7 @@ pub struct H264Stats {
     /// Queued datagrams retired because they no longer fit the connection's
     /// datagram size (it fell after they were built), by what they carried:
     /// a tile pass, an H.264 fragment, probe padding, or something the ledger
-    /// does not track (tile XOR parity). None of them reached quinn.
+    /// does not track. None of them reached quinn.
     pub oversize_tile: u64,
     pub oversize_h264: u64,
     pub oversize_pad: u64,
