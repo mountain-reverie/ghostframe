@@ -19,6 +19,7 @@ pub mod cdf53_coverage;
 pub mod cdf53_prevalidate;
 pub mod cdf53_tile_state;
 pub mod decode_error_batcher;
+pub mod fec_rx;
 mod event;
 mod frame_assembly;
 pub mod h264_gate;
