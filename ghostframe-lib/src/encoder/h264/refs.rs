@@ -44,6 +44,21 @@ pub(crate) enum IdrCause {
     /// own fallback, e.g. an unknown recovery frame), or the stream moved to a
     /// different backend after a fault. A new epoch, adopted as such.
     BackendFallback,
+    /// The client received a fragment of the epoch's IDR and refused its
+    /// content (CONTENT_REJECTED): the IDR is of no use to it, so a new epoch
+    /// begins with a fresh one.
+    ContentRejected,
+}
+
+/// What [`RefManager::frame_content_rejected`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rejected {
+    /// A new epoch, beginning with an IDR.
+    Idr,
+    /// The IDR is already decoded: nothing to do.
+    IdrDecoded,
+    /// A P frame, now suspect.
+    P,
 }
 
 /// Why the client asked for a reset (feedback stream 0x09).
@@ -222,6 +237,7 @@ pub(crate) struct RefStats {
     pub idr_client_reset: u64,
     pub idr_encoder_fault: u64,
     pub idr_mtu_shrink: u64,
+    pub idr_content_rejected: u64,
     /// An IDR sent again because the first never became an anchor.
     pub idr_reissued: u64,
     pub p_healthy: u64,
@@ -666,6 +682,29 @@ impl RefManager {
         }
         self.frame_suspect(seq);
         false
+    }
+
+    /// The client refused the content of a fragment of `seq` (CONTENT_REJECTED)
+    /// after the transport had already acknowledged it. Returns what became of
+    /// it: `None` when the frame is not (or no longer) in the table, so a
+    /// repeated or late rejection is a no-op.
+    ///
+    /// An IDR the client has not decoded starts a new epoch (a fresh IDR,
+    /// counted under [`IdrCause::ContentRejected`]); a decoded one is a
+    /// decoder-side matter and is left alone. Any other frame is suspect, as a
+    /// ledger verdict would make it, and the next plan recovers.
+    pub(crate) fn frame_content_rejected(&mut self, seq: u32) -> Option<Rejected> {
+        let rec = self.table.get(seq)?;
+        if rec.kind == PicKind::Idr {
+            if rec.state == FrameState::Decoded {
+                return Some(Rejected::IdrDecoded);
+            }
+            self.idr_backoff = 0;
+            self.begin_epoch(IdrCause::ContentRejected);
+            return Some(Rejected::Idr);
+        }
+        self.table.set_suspect(seq);
+        Some(Rejected::P)
     }
 
     pub(crate) fn resolution_change(&mut self) {
@@ -1494,6 +1533,7 @@ impl RefManager {
                 Some(IdrCause::ClientReset) => self.stats.idr_client_reset += 1,
                 Some(IdrCause::EncoderFault) => self.stats.idr_encoder_fault += 1,
                 Some(IdrCause::MtuShrink) => self.stats.idr_mtu_shrink += 1,
+                Some(IdrCause::ContentRejected) => self.stats.idr_content_rejected += 1,
                 // Only an IDR that reached the wire: the bridge counts the
                 // IDRs it sent, and a dropped one is not among them.
                 Some(IdrCause::BackendFallback) if fate == Fate::Sent => {
@@ -1635,6 +1675,7 @@ impl RefManager {
                 Some(IdrCause::ClientReset) => self.stats.idr_client_reset += 1,
                 Some(IdrCause::EncoderFault) => self.stats.idr_encoder_fault += 1,
                 Some(IdrCause::MtuShrink) => self.stats.idr_mtu_shrink += 1,
+                Some(IdrCause::ContentRejected) => self.stats.idr_content_rejected += 1,
                 Some(IdrCause::BackendFallback) => self.stats.idr_backend_fallback += 1,
                 None => {}
             }

@@ -84,10 +84,13 @@ pub enum IdrCause {
     BackendFallback,
     /// The backend failed or made a stream that is not the plan.
     EncoderFault,
+    /// The client refused the content of a fragment of the IDR
+    /// (CONTENT_REJECTED).
+    ContentRejected,
 }
 
 impl IdrCause {
-    pub(crate) const COUNT: usize = 7;
+    pub(crate) const COUNT: usize = 8;
     pub const ALL: [IdrCause; Self::COUNT] = [
         IdrCause::Session,
         IdrCause::ClientReset,
@@ -96,6 +99,7 @@ impl IdrCause {
         IdrCause::MtuShrink,
         IdrCause::BackendFallback,
         IdrCause::EncoderFault,
+        IdrCause::ContentRejected,
     ];
 
     pub fn index(self) -> usize {
@@ -111,6 +115,7 @@ impl IdrCause {
             IdrCause::MtuShrink => "mtu_shrink",
             IdrCause::BackendFallback => "backend_fallback",
             IdrCause::EncoderFault => "encoder_fault",
+            IdrCause::ContentRejected => "content_rejected",
         }
     }
 }

@@ -281,6 +281,7 @@ pub struct RefsReport {
     pub idr_client_reset: u64,
     pub idr_encoder_fault: u64,
     pub idr_mtu_shrink: u64,
+    pub idr_content_rejected: u64,
     pub idr_reissued: u64,
     pub idr_probes: u64,
     pub p_healthy: u64,
@@ -323,6 +324,7 @@ fn bridge_idr_cause(c: Option<RefIdrCause>) -> IdrCause {
         Some(RefIdrCause::ClientReset) => IdrCause::ClientReset,
         Some(RefIdrCause::EncoderFault) => IdrCause::EncoderFault,
         Some(RefIdrCause::MtuShrink) => IdrCause::MtuShrink,
+        Some(RefIdrCause::ContentRejected) => IdrCause::ContentRejected,
         Some(RefIdrCause::BackendFallback) => IdrCause::BackendFallback,
         Some(RefIdrCause::SessionStart) | None => IdrCause::Session,
     }
@@ -1008,6 +1010,48 @@ impl IoBridge {
         self.publish_refs_counters();
     }
 
+    /// CONTENT_REJECTED for a fragment of `frame_seq`, after the bundle's
+    /// acknowledgement released the content. Returns false when the frame is
+    /// not known to the manager (a repeat, or an epoch ago).
+    pub(super) fn h264_refs_content_rejected(&mut self, frame_seq: u32, now: Instant) -> bool {
+        use crate::encoder::h264::refs::Rejected;
+        if !self.h264_refs_live() {
+            return false;
+        }
+        let Some(st) = self.h264.refs.as_mut() else {
+            return false;
+        };
+        match st.mgr.frame_content_rejected(frame_seq) {
+            None => false,
+            Some(Rejected::IdrDecoded) => true,
+            Some(Rejected::Idr) => {
+                // The IDR owed is a new epoch's: its old fragments go.
+                self.reliable_emitter.drop_h264_frame(frame_seq);
+                self.ensure_baseline_invalidated();
+                self.publish_refs_counters();
+                true
+            }
+            Some(Rejected::P) => {
+                // The tracker's suspect flag and the counters are the
+                // verdict path's; the manager has already been told.
+                self.h264.refs_counters.verdicts += 1;
+                if let Some(f) = self.h264.tracker.get_mut(frame_seq) {
+                    if !f.suspect {
+                        f.suspect = true;
+                        self.h264.stats.frames_suspect += 1;
+                    }
+                }
+                self.record_emitted_transmissions(now);
+                let wire_seqs = self.reliable_emitter.purge_queued_h264(|f| f == frame_seq);
+                self.forget_purged(&wire_seqs);
+                self.reliable_emitter.drop_h264_frame(frame_seq);
+                self.ensure_baseline_invalidated();
+                self.publish_refs_counters();
+                true
+            }
+        }
+    }
+
     /// A client reset request (0x09) on an acked-reference session: a new plan
     /// epoch, which begins with an IDR. Rate limiting is the caller's.
     pub(super) fn h264_refs_client_reset(
@@ -1165,6 +1209,7 @@ impl IoBridge {
             idr_client_reset: s.idr_client_reset,
             idr_encoder_fault: s.idr_encoder_fault,
             idr_mtu_shrink: s.idr_mtu_shrink,
+            idr_content_rejected: s.idr_content_rejected,
             idr_reissued: s.idr_reissued,
             idr_probes: s.idr_probes,
             p_healthy: s.p_healthy,
