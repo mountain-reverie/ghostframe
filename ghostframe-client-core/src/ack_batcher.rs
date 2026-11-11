@@ -17,7 +17,7 @@ pub const FLUSH_INTERVAL_US: u64 = 5_000;
 
 /// How many recent fresh entries to retain for overlap purposes (4x
 /// ACK_OVERLAP_COUNT, mirroring `maxRecent` in ack.ts).
-const MAX_RECENT: usize = ACK_OVERLAP_COUNT * 4;
+pub(crate) const MAX_RECENT: usize = ACK_OVERLAP_COUNT * 4;
 
 pub struct AckBatcher {
     entries: Vec<AckEntry>,
