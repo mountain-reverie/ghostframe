@@ -67,6 +67,7 @@ impl IoBridge {
                         WireClass::Critical
                         | WireClass::SchedulerRetry
                         | WireClass::H264
+                        | WireClass::Repair
                         | WireClass::Control => AdmitClass::Critical,
                     };
                     match admit_one(&mut self.admission, admit_class, wire, depth, gate.d_target) {
