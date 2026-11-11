@@ -944,6 +944,9 @@ pub struct IoBridge {
     /// Sealed bundles quinn has not taken yet, oldest first. Their ledger
     /// records exist; they are sent before anything newer.
     pending_bundles: std::collections::VecDeque<crate::transport::fec_tx::packer::SealedBundle>,
+    /// Whether the last bundle quinn accepted was short (see
+    /// `note_bundle_enqueued`). Cleared with the packer.
+    last_enqueued_was_short: bool,
     /// Unit tests only: every bundle handed to quinn (or the test wire).
     #[cfg(test)]
     pub(crate) sent_frames_for_test: Vec<Vec<u8>>,
@@ -1598,6 +1601,7 @@ impl IoBridge {
             packer: Default::default(),
             emitted_meta: HashMap::new(),
             pending_bundles: Default::default(),
+            last_enqueued_was_short: false,
             #[cfg(test)]
             sent_frames_for_test: Vec::new(),
             #[cfg(test)]

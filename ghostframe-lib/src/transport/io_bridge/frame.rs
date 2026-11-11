@@ -2551,6 +2551,7 @@ impl IoBridge {
                 admit_charged_bytes = ins.admission.charged_bytes,
                 admit_soft_charged_bytes = ins.admission.soft_charged_bytes,
                 admit_ungated_at_depth = ins.admission.ungated_at_depth,
+                admit_short_bundle_shared_risk = ins.admission.short_bundle_shared_risk,
                 ledger_losses_declared = ins.ledger_losses_declared,
                 ledger_losses_flushed = ins.ledger_losses_flushed,
                 ledger_losses_overflowed = ins.ledger_losses_overflowed,
