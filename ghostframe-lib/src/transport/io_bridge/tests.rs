@@ -5977,6 +5977,7 @@ fn control_bundle(len: usize) -> crate::transport::fec_tx::packer::SealedBundle 
         records: Default::default(),
         emit_us: 0,
         kind: crate::transport::fec_tx::packer::BundleKind::Plain,
+        block: None,
     }
 }
 

@@ -57,6 +57,8 @@ pub(crate) struct SealedBundle {
     /// Earliest emit time among `records` (0 when it has none).
     pub emit_us: u64,
     pub kind: BundleKind,
+    /// `(block_id, idx)` of a SOURCE, `None` otherwise.
+    pub block: Option<(u16, u8)>,
 }
 
 #[derive(Debug, Default)]
@@ -139,6 +141,7 @@ impl Packer {
     ) -> SealedBundle {
         let bundle_seq = self.alloc_seq();
         let emit_us = records.iter().map(|r| r.emit_us).min().unwrap_or(0);
+        let mut block = None;
         let (bytes, kind) = match self.blocks.filter(|_| protect) {
             None => (
                 PlainFrame {
@@ -150,6 +153,7 @@ impl Packer {
             ),
             Some(params) => {
                 let (block_id, idx) = self.builder.peek();
+                block = Some((block_id, idx));
                 let last = closing || usize::from(idx) + 1 >= usize::from(params.k_max);
                 let frame = SourceFrame {
                     last,
@@ -180,6 +184,7 @@ impl Packer {
             records,
             emit_us,
             kind,
+            block,
         }
     }
 
@@ -255,6 +260,21 @@ impl Packer {
             return false;
         }
         self.close_now()
+    }
+
+    /// When the open block's T elapses, in the same microseconds as `now_us`.
+    pub(crate) fn t_close_at_us(&self) -> Option<u64> {
+        let p = self.blocks?;
+        Some(
+            self.builder
+                .first_sealed_at_us()?
+                .saturating_add(u64::from(p.t_ms) * 1_000),
+        )
+    }
+
+    /// The knob this packer runs with.
+    pub(crate) fn params(&self) -> Option<FecBlockParams> {
+        self.blocks
     }
 
     /// MTU shrink: a repair of the open block's longest symbol no longer fits

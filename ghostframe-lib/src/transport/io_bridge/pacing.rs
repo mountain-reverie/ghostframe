@@ -249,6 +249,7 @@ impl IoBridge {
             || self.reliable_emitter.pending_nack_count() > 0
             || self.reliable_emitter.pending_loss_count() > 0
             || self.reliable_emitter.pto_due(now)
+            || !self.pending_repairs.is_empty()
             || (self.last_drain_frame_context.is_some() && self.scheduler.has_pending_work())
     }
 
@@ -359,9 +360,30 @@ impl IoBridge {
                 break;
             }
         }
-        // Rev 6 framing: every pump ends with no open bundle.
-        self.flush_bundles();
-        out.admitted = (self.instr.admission.datagrams_admitted - admitted_before) as usize;
+        // Rev 6 framing: every pump ends with no open bundle. With blocks on,
+        // a pump that ran dry (nothing built, held back or queued) closes the
+        // open block: its last bundle is LAST and the repairs follow.
+        let repairs_before = self.block_tx.repairs_sent;
+        if self.fec_blocks.is_some() {
+            let dry = stop == Stop::Empty
+                && !self.admission_backlog(now)
+                && self.pending_bundles.is_empty();
+            if dry {
+                self.close_block_on_empty();
+            } else {
+                self.flush_bundles();
+            }
+            // Refused for Tokens or Depth after an Empty pump, that is why
+            // this pump stopped, and the wake below is sized to the repair.
+            let s = self.service_pending_repairs();
+            if s != Stop::Empty {
+                stop = s;
+            }
+        } else {
+            self.flush_bundles();
+        }
+        out.admitted = (self.instr.admission.datagrams_admitted - admitted_before) as usize
+            + (self.block_tx.repairs_sent - repairs_before) as usize;
         // A pass that ran out of work before the cluster was full: the frame
         // was smaller than the probe, and a short fill says nothing about the
         // rate.
@@ -403,7 +425,9 @@ impl IoBridge {
                     self.instr.budget.gate_tokens += 1;
                     // The bucket refills by time alone; nothing else will
                     // wake the loop for it.
-                    let need = if self.reliable_emitter.emission_queue_len() > 0 {
+                    let need = if let Some(j) = self.pending_repairs.front() {
+                        j.bytes.len() + framing
+                    } else if self.reliable_emitter.emission_queue_len() > 0 {
                         mtu
                     } else {
                         MIN_PULL_BYTES

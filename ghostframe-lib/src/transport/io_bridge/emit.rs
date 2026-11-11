@@ -41,6 +41,12 @@ impl IoBridge {
         if !self.pending_bundles.is_empty() && !self.drive_pending_bundles() {
             return pacing::Stop::Rejected;
         }
+        // Repairs that could not go when their block closed go before any
+        // new record.
+        let repairs = self.service_pending_repairs();
+        if repairs != pacing::Stop::Empty {
+            return repairs;
+        }
         while let Some(emission) = self.reliable_emitter.next_emission() {
             let Emission::Source(bytes, class) = &emission;
             let (bytes, class) = (bytes.clone(), *class);
@@ -943,7 +949,7 @@ impl IoBridge {
                 // before `bytes_sent` is advanced by this datagram's size.
                 let dg_len = crate::transport::fec_tx::packer::Packer::lone_bundle_len(
                     dg.len(),
-                    crate::transport::fec_tx::packer::BundleKind::Plain,
+                    self.probe_bundle_kind(),
                 ) as i64;
                 let probe_tag = self.active_probe.as_mut().map(|p| {
                     let tag = crate::transport::reliable_emitter::cache::ProbeTag {

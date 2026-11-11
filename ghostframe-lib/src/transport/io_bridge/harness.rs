@@ -95,6 +95,7 @@ impl IoBridge {
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn set_fec_blocks_for_test(&mut self, params: Option<crate::config::FecBlockParams>) {
         self.fec_blocks = params;
+        self.packer.set_blocks(params);
     }
 
     /// Replace the QUIC peer gate, for a test that needs a specific policy
