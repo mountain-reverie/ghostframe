@@ -320,7 +320,7 @@ impl IoBridge {
         #[cfg(any(test, feature = "test-loss-injection"))]
         if let Some(inj) = self.outbound_loss.as_mut() {
             if inj.should_drop(dg) {
-                self.consumed_before_wire(wire_seq);
+                self.consumed_before_wire(wire_seq, dg.len());
                 return SendOutcome::Sent; // injected loss: consumed, see above
             }
         }
@@ -331,7 +331,7 @@ impl IoBridge {
                 .expect("drop_plan mutex poisoned")
                 .should_drop(dg)
             {
-                self.consumed_before_wire(wire_seq);
+                self.consumed_before_wire(wire_seq, dg.len());
                 return SendOutcome::Sent; // injected drop: consumed, see above
             }
         }
