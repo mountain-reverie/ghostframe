@@ -1873,7 +1873,7 @@ async fn ack_routes_through_emitter_dropping_cache() {
             crate::transport::transmission_ledger::Transmission {
                 emit_us: e.emit_us,
                 wire_bytes: e.wire_bytes,
-                content: e.content,
+                records: smallvec::smallvec![(e.wire_seq, e.content)],
                 depart_us: None,
                 dep_idx: None,
             },
@@ -1912,13 +1912,16 @@ async fn the_classifiers_loss_rate_is_the_ledgers_verdict() {
             crate::transport::transmission_ledger::Transmission {
                 emit_us: bridge.reliable_emitter.emit_us64(now),
                 wire_bytes: 25,
-                content: crate::transport::reliable_emitter::EmitKey::new(
+                records: smallvec::smallvec![(
                     wire_seq,
-                    (wire_seq % 64) as u8,
-                    0,
-                    0,
-                )
-                .into(),
+                    crate::transport::reliable_emitter::EmitKey::new(
+                        wire_seq,
+                        (wire_seq % 64) as u8,
+                        0,
+                        0,
+                    )
+                    .into()
+                )],
                 depart_us: None,
                 dep_idx: None,
             },
@@ -3623,7 +3626,7 @@ async fn bwe_estimate_advances_through_bridge_production_wiring() {
                 crate::transport::transmission_ledger::Transmission {
                     emit_us: e.emit_us,
                     wire_bytes: e.wire_bytes,
-                    content: e.content,
+                    records: smallvec::smallvec![(e.wire_seq, e.content)],
                     depart_us: None,
                     dep_idx: None,
                 },
@@ -5126,7 +5129,7 @@ fn seed_unacked_entry(
             crate::transport::transmission_ledger::Transmission {
                 emit_us: e.emit_us,
                 wire_bytes: e.wire_bytes,
-                content: e.content,
+                records: smallvec::smallvec![(e.wire_seq, e.content)],
                 depart_us: None,
                 dep_idx: None,
             },
@@ -5734,7 +5737,10 @@ fn ledger_tx(
     crate::transport::transmission_ledger::Transmission {
         emit_us,
         wire_bytes: bytes,
-        content: crate::transport::reliable_emitter::EmitKey::new(frame_seq, 1, 2, 0).into(),
+        records: smallvec::smallvec![(
+            frame_seq,
+            crate::transport::reliable_emitter::EmitKey::new(frame_seq, 1, 2, 0).into()
+        )],
         depart_us: None,
         dep_idx: None,
     }
@@ -6028,7 +6034,7 @@ async fn bwe_sample_send_time_is_not_the_wrapped_emit_clock() {
         crate::transport::transmission_ledger::Transmission {
             emit_us: sent[0].emit_us,
             wire_bytes: sent[0].wire_bytes,
-            content: sent[0].content,
+            records: smallvec::smallvec![(sent[0].wire_seq, sent[0].content)],
             depart_us: None,
             dep_idx: None,
         },
@@ -6083,7 +6089,7 @@ async fn pending_loss_send_time_is_not_the_wrapped_emit_clock() {
             crate::transport::transmission_ledger::Transmission {
                 emit_us: e.emit_us,
                 wire_bytes: e.wire_bytes,
-                content: e.content,
+                records: smallvec::smallvec![(e.wire_seq, e.content)],
                 depart_us: None,
                 dep_idx: None,
             },
@@ -6127,7 +6133,7 @@ async fn pre_wrap_sample_send_time_equals_the_emitted_stamp() {
         crate::transport::transmission_ledger::Transmission {
             emit_us: e.emit_us,
             wire_bytes: e.wire_bytes,
-            content: e.content,
+            records: smallvec::smallvec![(e.wire_seq, e.content)],
             depart_us: None,
             dep_idx: None,
         },
@@ -7133,7 +7139,7 @@ async fn the_probe_timeout_is_a_wake_deadline() {
             crate::transport::transmission_ledger::Transmission {
                 emit_us: e.emit_us,
                 wire_bytes: e.wire_bytes,
-                content: e.content,
+                records: smallvec::smallvec![(e.wire_seq, e.content)],
                 depart_us: None,
                 dep_idx: None,
             },
@@ -9347,7 +9353,10 @@ async fn the_raise_opens_no_window_after_a_cut_behind_a_backlog_or_on_a_reorderi
                 let tx = crate::transport::transmission_ledger::Transmission {
                     emit_us: 0,
                     wire_bytes: 1200,
-                    content: crate::transport::reliable_emitter::Content::Pad(5),
+                    records: smallvec::smallvec![(
+                        5,
+                        crate::transport::reliable_emitter::Content::Pad(5)
+                    )],
                     depart_us: None,
                     dep_idx: None,
                 };

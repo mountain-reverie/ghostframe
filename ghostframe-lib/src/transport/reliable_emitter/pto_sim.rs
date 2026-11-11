@@ -143,7 +143,7 @@ pub(super) fn run_script(sc: Script) -> Run {
                 Transmission {
                     emit_us: em.emit_us,
                     wire_bytes: em.wire_bytes,
-                    content: em.content,
+                    records: smallvec::smallvec![(em.wire_seq, em.content)],
                     depart_us: None,
                     dep_idx: None,
                 },
@@ -209,19 +209,23 @@ pub(super) fn run_script(sc: Script) -> Run {
                 Some(Resolution::Live(tx)) => {
                     let rtt = t - departed;
                     run.max_rtt = run.max_rtt.max(rtt);
-                    e.note_ack_origin(tx.content.tile().unwrap(), ws);
-                    e.on_ack(&[tx.content.tile().unwrap()]);
+                    for (record_ws, c) in tx.records() {
+                        e.note_ack_origin(c.tile().unwrap(), record_ws);
+                        e.on_ack(&[c.tile().unwrap()]);
+                        passes_acked.insert(c.tile().unwrap());
+                    }
                     e.rtt.on_sample(rtt);
                     e.note_ack(now);
-                    passes_acked.insert(tx.content.tile().unwrap());
                     run.finished_at = t;
                 }
                 Some(Resolution::Late { tx, .. }) => {
-                    e.note_ack_origin(tx.content.tile().unwrap(), ws);
-                    e.on_ack(&[tx.content.tile().unwrap()]);
+                    for (record_ws, c) in tx.records() {
+                        e.note_ack_origin(c.tile().unwrap(), record_ws);
+                        e.on_ack(&[c.tile().unwrap()]);
+                        passes_acked.insert(c.tile().unwrap());
+                    }
                     e.rtt.on_sample(t - departed);
                     e.note_ack(now);
-                    passes_acked.insert(tx.content.tile().unwrap());
                     run.finished_at = t;
                 }
                 None => {}
@@ -407,7 +411,7 @@ mod tests {
                     Transmission {
                         emit_us: 0,
                         wire_bytes: em.wire_bytes,
-                        content: em.content,
+                        records: smallvec::smallvec![(em.wire_seq, em.content)],
                         depart_us: None,
                         dep_idx: None,
                     },

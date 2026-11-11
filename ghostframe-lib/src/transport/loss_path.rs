@@ -56,8 +56,14 @@ pub(crate) fn detect(
     let thr = time_threshold(&emitter.rtt);
     let mut out = Outcome::default();
     for (ws, tx, _reason) in ledger.detect_losses_at(now, thr) {
-        if emitter.request_retransmit(tx.content, ws, RetxCause::Loss) == RetxRequest::Queued {
-            out.retx_queued += 1;
+        // Each record is repaired under its own wire_seq (what the emitter's
+        // `latest_ws` / `judged_ws` know it by), not the ledger key.
+        for (record_ws, content) in tx.records() {
+            if emitter.request_retransmit(content, record_ws, RetxCause::Loss)
+                == RetxRequest::Queued
+            {
+                out.retx_queued += 1;
+            }
         }
         out.lost.push((ws, tx));
     }
@@ -108,36 +114,45 @@ pub(crate) fn probe(
             if out.retx_queued as usize >= PROBE_COUNT {
                 break 'rounds;
             }
-            match emitter.request_retransmit(tx.content, ws, RetxCause::Probe) {
-                RetxRequest::Queued => {
-                    out.retx_queued += 1;
+            // One request per record, under the record's own wire_seq. The
+            // transmission is only forgotten or declared lost when every
+            // record's content is gone.
+            let mut queued = 0u64;
+            let mut gone = 0usize;
+            let mut gone_h264 = false;
+            for (record_ws, content) in tx.records() {
+                match emitter.request_retransmit(content, record_ws, RetxCause::Probe) {
+                    RetxRequest::Queued => queued += 1,
+                    RetxRequest::ContentGone => {
+                        gone += 1;
+                        // An H.264 fragment whose cache entry is gone was
+                        // trimmed by the cache bound or superseded by an IDR:
+                        // it was not necessarily lost, and no one will send
+                        // it again. Forget it; a verdict would report a loss
+                        // to goog_cc that nothing observed.
+                        gone_h264 |= matches!(
+                            content,
+                            crate::transport::reliable_emitter::Content::H264Frag { .. }
+                        );
+                    }
+                    RetxRequest::NewerInFlight
+                    | RetxRequest::AlreadyQueued
+                    | RetxRequest::Deferred
+                    | RetxRequest::NotRetransmitted
+                    | RetxRequest::Disabled => {}
                 }
-                // An H.264 fragment whose cache entry is gone was trimmed by the
-                // cache bound or superseded by an IDR: it was not necessarily
-                // lost, and no one will send it again. Forget it; a verdict
-                // would report a loss to goog_cc that nothing observed.
-                RetxRequest::ContentGone
-                    if matches!(
-                        tx.content,
-                        crate::transport::reliable_emitter::Content::H264Frag { .. }
-                    ) =>
-                {
+            }
+            out.retx_queued += queued;
+            if queued == 0 && gone == tx.records.len() && gone > 0 {
+                if gone_h264 {
                     if ledger.forget_outstanding(ws).is_some() {
                         out.forgotten.push(ws);
                         removed = true;
                     }
+                } else if let Some(tx) = ledger.declare_lost_by_pto(ws) {
+                    out.lost.push((ws, tx));
+                    removed = true;
                 }
-                RetxRequest::ContentGone => {
-                    if let Some(tx) = ledger.declare_lost_by_pto(ws) {
-                        out.lost.push((ws, tx));
-                        removed = true;
-                    }
-                }
-                RetxRequest::NewerInFlight
-                | RetxRequest::AlreadyQueued
-                | RetxRequest::Deferred
-                | RetxRequest::NotRetransmitted
-                | RetxRequest::Disabled => {}
             }
         }
         if !removed {
@@ -178,7 +193,7 @@ mod tests {
                     Transmission {
                         emit_us: 0,
                         wire_bytes: em.wire_bytes,
-                        content: key.into(),
+                        records: smallvec::smallvec![(em.wire_seq, key.into())],
                         depart_us: None,
                         dep_idx: None,
                     },
@@ -266,7 +281,7 @@ mod deferred_tests {
                 Transmission {
                     emit_us: 0,
                     wire_bytes: em.wire_bytes,
-                    content: em.content,
+                    records: smallvec::smallvec![(em.wire_seq, em.content)],
                     depart_us: None,
                     dep_idx: None,
                 },
@@ -291,7 +306,8 @@ mod deferred_tests {
         for _ in 0..lost_times {
             let ws = e.cache.get(&key).unwrap().latest_ws;
             assert_eq!(
-                l.declare_lost_by_pto(ws).and_then(|x| x.content.tile()),
+                l.declare_lost_by_pto(ws)
+                    .and_then(|x| x.records().next().and_then(|(_, c)| c.tile())),
                 Some(key)
             );
             assert_eq!(
@@ -502,7 +518,7 @@ mod h264_tests {
                 Transmission {
                     emit_us: 0,
                     wire_bytes: em.wire_bytes,
-                    content: em.content,
+                    records: smallvec::smallvec![(em.wire_seq, em.content)],
                     depart_us: None,
                     dep_idx: None,
                 },
