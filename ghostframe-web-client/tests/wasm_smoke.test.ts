@@ -34,12 +34,12 @@ describe('wasm module', () => {
   });
 
   it('loads and constructs a core', () => {
-    const core = new wasm.WasmClientCore(false, false, true, 0n);
+    const core = new wasm.WasmClientCore(false, false, true, 0n, false);
     expect(core).toBeDefined();
   });
 
   it('emits the Hello message on the stream at construction', () => {
-    const core = new wasm.WasmClientCore(true, true, true, 0n);
+    const core = new wasm.WasmClientCore(true, true, true, 0n, false);
     const out = core.pollTransmit(0n);
     expect(out).toBeDefined();
     expect(out.kind).toBe('Stream');

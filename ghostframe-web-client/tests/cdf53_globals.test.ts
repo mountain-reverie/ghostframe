@@ -46,7 +46,7 @@ function validCdf53PassPayload(): Uint8Array {
  * true` is what makes arrivals surface as `TilePayload`/`DecodeError`
  * instead of `TileReady`. */
 function newPayloadCore(): InstanceType<typeof wasm.WasmClientCore> {
-  return new wasm.WasmClientCore(true, true, true, 0n);
+  return new wasm.WasmClientCore(true, true, true, 0n, false);
 }
 
 describe('protocol-derived test globals move (docs/specs/wasm-cutover-main-ts-map.md Part 3)', () => {
