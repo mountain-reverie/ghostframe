@@ -106,6 +106,7 @@ pub fn quic_handshake(
             indices_raw_enabled: false,
             supports_h264: false,
             display: None,
+            fec_framing: false,
         },
         0,
     )

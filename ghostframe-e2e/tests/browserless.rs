@@ -105,6 +105,7 @@ mod recheck_wiring {
                         indices_raw_enabled: true,
                         supports_h264: false,
                         display: None,
+                        fec_framing: false,
                     },
                     us(),
                     [9; 32],

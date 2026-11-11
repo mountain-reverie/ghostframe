@@ -227,6 +227,7 @@ pub fn connected_session() -> (ClientNet, QuicServer, WebTransportServer, u64, I
         indices_raw_enabled: true,
         supports_h264: false,
         display: None,
+        fec_framing: false,
     };
     let base = Instant::now();
     let mut now_us = 0u64;
