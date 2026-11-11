@@ -359,6 +359,9 @@ def build_timeline(demand, C, spec, rho, rng):
                     charge_debt(n)
         elif fam == "rs_time":
             T = spec["T"]
+            if T == "formula":
+                # fec-v2-rev6.md section 4 rule 2: min(max(5 ms, 6 bundle slots), frame interval)
+                T = min(max(5.0, 6.0 * pkt_ms), FRAME_MS)
             out = list(items)
             closed_now = []
             for s in popped_src:
@@ -379,6 +382,20 @@ def build_timeline(demand, C, spec, rho, rng):
                 out += [('r', bid)] * n
                 charge_debt(n)
                 blocks[bid]["closed"] = True
+            # rule 3, Empty: the content queue is empty at the end of the pass (the code's
+            # Stop::Empty, as opposed to Tokens/Depth with content still queued). The open block
+            # closes and its repairs go out in this drain, charged like sources.
+            # spec["empty_kmin"]: do not close on Empty below this k (wait for k_max or T);
+            # spec["empty_rmin"]: minimum repairs for an Empty-closed block.
+            if spec.get("empty") and not queue and open_blk["b"] is not None:
+                bid = open_blk["b"]
+                if blocks[bid]["k"] >= spec.get("empty_kmin", 1):
+                    n = max(spec.get("empty_rmin", rmin), nrep(blocks[bid]["k"]))
+                    out += [('r', bid)] * n
+                    charge_debt(n)
+                    blocks[bid]["closed"] = True
+                    blocks[bid]["by"] = "empty"
+                    open_blk["b"] = None
         elif fam == "rlc":
             out = []
             for k, v in items:
