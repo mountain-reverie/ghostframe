@@ -7,6 +7,7 @@
 //! sources (`coef`, `codec`). The client reports arrivals, loss and content
 //! release with the messages in `feedback` and `repair_status`.
 
+pub mod codec;
 pub mod coef;
 #[cfg(test)]
 pub(crate) mod oracle;
