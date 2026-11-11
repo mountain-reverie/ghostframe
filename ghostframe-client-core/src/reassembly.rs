@@ -167,10 +167,11 @@ impl ClientCore {
     /// rev 6 framing: unbundle through `FecRx`, dispatch each record as a
     /// today-format datagram, then drain what `FecRx` queued.
     fn handle_framed_datagram(&mut self, bytes: &[u8], now_us: u64) -> Vec<Event> {
-        let records = match self.fec.as_mut() {
+        let batch = match self.fec.as_mut() {
             Some(fec) => fec.on_datagram(bytes, now_us),
             None => return Vec::new(),
         };
+        let (records, rebuilt) = (batch.records, batch.rebuilt);
         let mut events = Vec::new();
         // One FEC recovery per rebuilt bundle, not per record.
         let mut counted: Vec<u32> = Vec::new();
@@ -186,6 +187,11 @@ impl ClientCore {
             });
             events.extend(self.handle_datagram_payloads(&rec.bytes, now_us));
             self.current_record = None;
+        }
+        // After the dispatch loop: a record refused above has queued its
+        // CONTENT_REJECTED, which must precede the RECOVERED for its bundle.
+        if let Some(fec) = self.fec.as_mut() {
+            fec.recovered(&rebuilt);
         }
         self.drain_fec();
         events
@@ -203,6 +209,11 @@ impl ClientCore {
         // A tile datagram has bit 31 of the first u32 set (first byte
         // >= 0x80), so 0x04 can never collide with one, but we still guard.
         if bytes[0] == TILE_PARITY_ENVELOPE && !is_tile_datagram(bytes) {
+            // Under framing the legacy XOR parity is not in use; replaying a
+            // source through it could name the wrong record in a rejection.
+            if self.current_record.is_some() {
+                return events;
+            }
             if let Ok(env) = TileParityEnvelope::decode(bytes) {
                 if let Some(recovered) = self.parity_decoder.receive_parity(&env) {
                     self.handle_source_tile(&recovered, now_us, Provenance::Rebuilt, &mut events);
@@ -240,8 +251,10 @@ impl ClientCore {
         //    source), then process this datagram.
         self.datagrams_tile = self.datagrams_tile.saturating_add(1);
         let wire_seq = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        if let Some(replayed) = self.parity_decoder.record_source(wire_seq, bytes) {
-            self.handle_source_tile(&replayed, now_us, Provenance::Rebuilt, &mut events);
+        if self.current_record.is_none() {
+            if let Some(replayed) = self.parity_decoder.record_source(wire_seq, bytes) {
+                self.handle_source_tile(&replayed, now_us, Provenance::Rebuilt, &mut events);
+            }
         }
         self.handle_source_tile(bytes, now_us, Provenance::Received, &mut events);
 
@@ -263,11 +276,15 @@ impl ClientCore {
             _ => provenance,
         };
         if bytes.len() < TILE_MIN {
+            self.reject_current_record();
             return;
         }
         let (dh, th, payload) = match decode_tile_datagram(bytes) {
             Ok(x) => x,
-            Err(_) => return,
+            Err(_) => {
+                self.reject_current_record();
+                return;
+            }
         };
         let frame_seq = dh.frame_seq & !TILE_DATAGRAM_FLAG;
 
@@ -325,6 +342,9 @@ impl ClientCore {
         if !is_sentinel
             && (dh.frag_total != 1 || dh.frag_idx != 0 || !self.tile_in_grid(th.tile_x, th.tile_y))
         {
+            // Without framing the withheld ACK is what makes the server
+            // retransmit; under framing the bundle is ACKed, so say so.
+            self.reject_current_record();
             return;
         }
 
@@ -392,6 +412,13 @@ impl ClientCore {
         }
 
         self.deliver_tile(frame_seq, &th, dh.wire_seq, payload, now_us, events);
+    }
+
+    /// Under framing, tell the server the record being dispatched is unusable.
+    fn reject_current_record(&mut self) {
+        if let (Some(ctx), Some(fec)) = (self.current_record, self.fec.as_mut()) {
+            fec.content_rejected(ctx.bundle_seq, ctx.record_idx);
+        }
     }
 
     /// Decode one tile pass and hand it up, dispatching by codec.
@@ -495,6 +522,8 @@ impl ClientCore {
                 // entry that has aged out is treated as absent. See
                 // `label_runs_ahead` and `label_expired`.
                 if crate::cdf53_coverage::label_runs_ahead(frame_seq, self.newest_received_label) {
+                    // Withholds the ACK without framing (the server resends).
+                    self.reject_current_record();
                     return;
                 }
                 let prev = self.cdf53_coverage.get(&(tx, ty)).copied().filter(|e| {
@@ -609,9 +638,7 @@ impl ClientCore {
                         }
                     }
                     Err(code) => {
-                        if let (Some(ctx), Some(fec)) = (self.current_record, self.fec.as_mut()) {
-                            fec.content_rejected(ctx.bundle_seq, ctx.record_idx);
-                        }
+                        self.reject_current_record();
                         if let Some(msg) =
                             self.decode_error_batcher
                                 .report(Codec::Cdf53, tx, ty, code, now_us)
