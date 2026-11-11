@@ -236,11 +236,6 @@ pub struct TransportConfig {
     /// Overrides `sample_all_path_stats`'s `bytes_per_us`. From
     /// `GHOSTFRAME_TEST_FORCE_BYTES_PER_US`; accepts any value `> 0.0`.
     pub test_force_bytes_per_us: Option<f32>,
-    /// Emit the tile XOR parity (k=10 groups, one parity datagram per group).
-    /// Off by default: it recovered at most 0.8 % of datagrams and cost about
-    /// 11 to 14 % of the bytes (13 % typical). From `GHOSTFRAME_TILE_FEC=1|true`. The client
-    /// decodes parity whenever it arrives, whatever this says. H.264 has no parity.
-    pub tile_fec: bool,
     /// The model controller's settings, from `GHOSTFRAME_CC_*`.
     pub model: ModelSettings,
     /// Which H.264 encoder backends may open, from `GHOSTFRAME_H264_BACKEND`
@@ -447,10 +442,6 @@ impl TransportConfig {
                 .filter(|v| *v > 0.0),
             #[cfg(not(any(test, feature = "test-loss-injection")))]
             test_force_bytes_per_us: None,
-            tile_fec: matches!(
-                get("GHOSTFRAME_TILE_FEC").as_deref(),
-                Some("1") | Some("true")
-            ),
             model: ModelSettings::from_lookup(&get),
             h264_backend: H264BackendChoice::parse(get("GHOSTFRAME_H264_BACKEND").as_deref()),
             openh264_lib: openh264_lib_from_lookup(&get),
@@ -1504,15 +1495,6 @@ mod tests {
         assert_eq!(t.h264_fps(), 30);
         t.capture_fps = 60;
         assert_eq!(t.h264_fps(), 60);
-    }
-
-    #[test]
-    fn tile_fec_is_off_unless_the_env_asks() {
-        assert!(!TransportConfig::from_lookup(lookup(&[])).tile_fec);
-        assert!(!TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_TILE_FEC", "0")])).tile_fec);
-        assert!(TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_TILE_FEC", "1")])).tile_fec);
-        assert!(TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_TILE_FEC", "true")])).tile_fec);
-        assert!(!TransportConfig::default().tile_fec);
     }
 
     #[test]

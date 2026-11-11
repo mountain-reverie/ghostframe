@@ -120,8 +120,7 @@ fn mean_burst_duration_matches_configured_burst_in_time() {
 
 #[test]
 fn per_datagram_model_still_has_its_mean_run_in_datagrams() {
-    // The legacy chain, kept for fec_burst_analysis: run length is in
-    // datagrams, with no time scale.
+    // The legacy chain: run length is in datagrams, with no time scale.
     for &(avg, len) in &[(0.05, 1.0), (0.05, 12.0), (0.1, 20.0)] {
         let (_, mean, runs) = stats(&mask(ge_profile_per_datagram(avg, len, 1.0), 3, N));
         assert!(runs > 1000);

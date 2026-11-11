@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::cache::{CacheEntry, RetransmitCache};
-use super::parity::xor_payloads;
 use super::wire_seq::WireSeqAllocator;
 use super::EmitKey;
 use bytes::Bytes;
@@ -10,22 +9,6 @@ use proptest::prelude::*;
 use std::time::Instant;
 
 proptest! {
-    #[test]
-    fn xor_round_trip(sources in proptest::collection::vec(any::<Vec<u8>>(), 1..10)) {
-        let refs: Vec<&[u8]> = sources.iter().map(|v| v.as_slice()).collect();
-        let parity = xor_payloads(&refs);
-        // Remove the first source and recover it from parity + the rest.
-        let mut without_first: Vec<&[u8]> = vec![&parity];
-        for s in &sources[1..] { without_first.push(s.as_slice()); }
-        let recovered = xor_payloads(&without_first);
-        // The recovered value equals the first source, padded to the
-        // maximum length with leading zeros.
-        let max_len = sources.iter().map(|s| s.len()).max().unwrap();
-        let expected_pad = max_len - sources[0].len();
-        let expected: Vec<u8> = std::iter::repeat_n(0, expected_pad).chain(sources[0].iter().copied()).collect();
-        prop_assert_eq!(recovered, expected);
-    }
-
     #[test]
     fn wire_seq_strictly_increasing(steps in 1usize..1000) {
         let mut a = WireSeqAllocator::new();

@@ -6,7 +6,7 @@
 //!
 //! Nothing used to read how much was already waiting in quinn's datagram
 //! queue. The scheduler's budget was a rate per call, retransmission had a
-//! half-billed allowance of its own, parity was unbilled, and the queue was
+//! half-billed allowance of its own, and the queue was
 //! 16 MiB deep, so any excess integrated: under 2 % random loss the (then Cubic)
 //! window shrank, the scheduler kept enqueuing, and the FIFO stood at 2-5 MB
 //! with a median enqueue-to-departure lag over a second. The sender's own
@@ -18,11 +18,10 @@
 //!
 //! - **One bucket**, refilled by elapsed time at the sending rate `R`. Every
 //!   datagram that leaves for quinn is charged its wire bytes (payload,
-//!   headers and the WebTransport framing). Parity is charged when it is
-//!   emitted. Idle time never banks more than the burst cap
+//!   headers and the WebTransport framing). Idle time never banks more than the burst cap
 //!   (`max(2 x MTU, R x one tick)`), which is `RetransmitPacer`'s rule, kept.
 //! - **Strict class priority**: NACK-requested repair, then retransmission by
-//!   timer, then the critical tier, then the refinement tier, then parity. A
+//!   timer, then the critical tier, then the refinement tier. A
 //!   class that cannot afford its next datagram stops; the classes below it
 //!   do not jump ahead ([`pull_in_priority`]).
 //! - **The depth gate**: a datagram is admitted only while quinn's FIFO holds
@@ -49,11 +48,6 @@ const _: () = assert!(QUEUE_TARGET.as_micros() <= QUEUE_BOUND.as_micros());
 /// How much of the rate may be banked as a burst: one scheduler tick.
 pub(crate) const BURST_WINDOW: Duration = Duration::from_micros(33_333);
 
-/// FEC parity is one datagram per this many sources (the group size `K`), so
-/// a puller that spends every token on sources would leave the parity those
-/// sources owe nothing to be emitted with.
-pub(crate) const PARITY_RESERVE_GROUP: usize = crate::transport::reliable_emitter::FEC_GROUP_SIZE_K;
-
 /// The byte classes, in strict priority order: the first is served first, and
 /// a class is served only once every class before it has nothing left that it
 /// can afford.
@@ -67,18 +61,15 @@ pub(crate) enum AdmitClass {
     Critical,
     /// First transmissions of the refinement tier (passes 4 and up).
     Refinement,
-    /// FEC parity.
-    Parity,
 }
 
 impl AdmitClass {
     /// Highest priority first.
-    pub(crate) const PRIORITY: [AdmitClass; 5] = [
+    pub(crate) const PRIORITY: [AdmitClass; 4] = [
         AdmitClass::NackRepair,
         AdmitClass::Retransmit,
         AdmitClass::Critical,
         AdmitClass::Refinement,
-        AdmitClass::Parity,
     ];
 }
 
@@ -98,12 +89,6 @@ pub(crate) fn depth_target(rate: f64, mtu: usize) -> usize {
 /// that one of the largest size can always be afforded and a second follow it.
 pub(crate) fn burst_cap(rate: f64, mtu: usize) -> f64 {
     ((2 * mtu) as f64).max(rate.max(0.0) * BURST_WINDOW.as_secs_f64())
-}
-
-/// Bytes to pull for new sources given the bucket's `tokens`: all of them
-/// but the share the parity those sources owe will cost when it is emitted.
-pub(crate) fn source_budget(tokens: usize) -> usize {
-    tokens * PARITY_RESERVE_GROUP / (PARITY_RESERVE_GROUP + 1)
 }
 
 /// The token bucket. See the module documentation.
@@ -269,10 +254,10 @@ pub(crate) enum Admit {
     Tokens,
 }
 
-/// The rule every datagram bound for quinn passes, parity included: the
+/// The rule every datagram bound for quinn passes: the
 /// depth gate first (so a blocked datagram costs nothing), then the charge for
 /// its `wire_len` bytes. `class` is not consulted: nothing is exempt from the
-/// bucket, and a parity datagram is charged exactly as a source is.
+/// bucket.
 pub(crate) fn admit_one(
     bucket: &mut AdmissionBucket,
     _class: AdmitClass,
@@ -320,7 +305,7 @@ mod tests {
 
     /// A queue of datagram lengths per class, drained head first: the model
     /// the priority property is stated against.
-    type ClassQueues = [VecDeque<usize>; 5];
+    type ClassQueues = [VecDeque<usize>; 4];
 
     const MTU: usize = 1_200;
 
@@ -407,10 +392,10 @@ mod tests {
         assert_eq!(b.time_until(1_200, 0.0), None);
     }
 
-    /// A parity datagram is charged exactly as a source is. Skipping the
-    /// charge for `Parity` in `admit_one` makes this fail.
+    /// Every class is charged for what it sends. Skipping the charge for any
+    /// class in `admit_one` makes this fail.
     #[test]
-    fn parity_spends_tokens() {
+    fn every_class_spends_tokens() {
         for class in AdmitClass::PRIORITY {
             let mut b = AdmissionBucket::new();
             b.refill(Instant::now(), 1_000_000.0, MTU);
@@ -448,12 +433,6 @@ mod tests {
         // Below 120 kB/s the floor is one datagram.
         assert_eq!(depth_target(50_000.0, MTU), MTU);
         assert_eq!(depth_target(0.0, MTU), MTU);
-    }
-
-    #[test]
-    fn the_parity_reserve_is_one_part_in_k_plus_one() {
-        assert_eq!(source_budget(11_000), 10_000);
-        assert_eq!(source_budget(0), 0);
     }
 
     /// Strict priority on a fixed example, so a failure is readable: with
@@ -571,7 +550,7 @@ mod tests {
         /// spent, and the order of service is the priority order.
         #[test]
         fn classes_are_served_in_strict_priority(
-            lens in proptest::collection::vec(proptest::collection::vec(1usize..=1_200, 0..8), 5),
+            lens in proptest::collection::vec(proptest::collection::vec(1usize..=1_200, 0..8), 4),
             budget in 0usize..12_000,
         ) {
             let mut q: ClassQueues = Default::default();

@@ -16,7 +16,7 @@ use ghostframe_client_core::{
     Event, PollOutput, TileData,
 };
 use ghostframe_protocol::ack::AckEntry;
-use ghostframe_protocol::protocol::{TileNackEntry, TileParityEnvelope};
+use ghostframe_protocol::protocol::TileNackEntry;
 use serde::Serialize;
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -483,33 +483,6 @@ impl From<&TileNackEntry> for WasmNackEntry {
             tile_x: e.tile_x,
             tile_y: e.tile_y,
             pass_idx: e.pass_idx,
-        }
-    }
-}
-
-/// Parity envelope header. `parity_payload` is included because
-/// `parity_decoder.test.ts` round-trips envelopes it built itself.
-#[derive(Debug, Serialize, PartialEq)]
-pub struct WasmParityEnvelope {
-    pub group_first_wire_seq: u32,
-    pub k: u8,
-    pub parity_idx: u8,
-    /// Byte length of each of the group's `k` sources, in `wire_seq` order.
-    /// The decoder needs every one: the XOR left-pads to the group's longest
-    /// source, so a recovered source must be trimmed to its own length.
-    pub source_lens: Vec<u16>,
-    #[serde(with = "serde_bytes")]
-    pub parity_payload: Vec<u8>,
-}
-
-impl From<&TileParityEnvelope> for WasmParityEnvelope {
-    fn from(e: &TileParityEnvelope) -> Self {
-        WasmParityEnvelope {
-            group_first_wire_seq: e.group_first_wire_seq,
-            k: e.k,
-            parity_idx: e.parity_idx,
-            source_lens: e.source_lens.clone(),
-            parity_payload: e.parity_payload.clone(),
         }
     }
 }

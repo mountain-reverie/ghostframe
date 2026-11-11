@@ -26,10 +26,8 @@ pub mod h264_gate;
 pub mod input;
 pub mod loss_tracker;
 pub mod nack_batcher;
-mod ordered_map;
 pub mod pal_rle_decode;
 pub mod palette_shadow;
-pub mod parity_decoder;
 mod reassembly;
 pub mod stats;
 mod stats_local;
@@ -54,10 +52,6 @@ use frame_assembly::FrameAssembly;
 use loss_tracker::LossTracker;
 use nack_batcher::{NackBatcher, NackEntry};
 use palette_shadow::PaletteShadow;
-use parity_decoder::ParityDecoder;
-
-/// Wire-sequence FEC window size (mirrors `new ParityDecoder(40)` in main.ts).
-const PARITY_WINDOW: usize = 40;
 
 /// Coverage-NACK debounce window (main.ts:806, `NACK_DEBOUNCE_MS`).
 const NACK_DEBOUNCE_US: u64 = 50_000;
@@ -128,7 +122,7 @@ pub enum TileDelivery {
     /// what every existing consumer expects.
     #[default]
     Decoded,
-    /// Stop after reassembly, parity recovery, prevalidation and generation
+    /// Stop after reassembly, prevalidation and generation
     /// checks; emit the undecoded bytes instead.
     Payload,
 }
@@ -192,7 +186,6 @@ pub struct ClientCore {
     /// Frame size last accepted from the server, if any. Tile coordinates
     /// are validated against the grid it implies.
     pub(crate) frame_dims: Option<(u32, u32)>,
-    pub(crate) parity_decoder: ParityDecoder,
     pub(crate) wire_loss: wire_loss::WireLossTracker,
     pub(crate) ack_batcher: AckBatcher,
     pub(crate) nack_batcher: NackBatcher,
@@ -201,7 +194,7 @@ pub struct ClientCore {
     pub(crate) palette_shadow: PaletteShadow,
     pub(crate) cdf53_coverage: HashMap<(u8, u8), CoverageEntry>,
     /// Newest `frame_seq` label on a tile datagram that came off the wire
-    /// (not one rebuilt from parity). The yardstick for judging a label
+    /// (not one rebuilt by FEC). The yardstick for judging a label
     /// plausible; see `cdf53_coverage::label_runs_ahead`.
     pub(crate) newest_received_label: Option<u32>,
     pub(crate) latest_frame_seq: u32,
@@ -244,7 +237,7 @@ pub struct ClientCore {
     ///
     /// Counted here rather than in the browser because the browser cannot
     /// classify them without duplicating that dispatch, and a second copy of
-    /// a discriminator is exactly how one drifts. Parity and NACK envelopes
+    /// a discriminator is exactly how one drifts. NACK envelopes
     /// are in neither count -- see [`ClientCore::datagram_counts`].
     pub(crate) datagrams_tile: u64,
     pub(crate) datagrams_frame: u64,
@@ -259,7 +252,6 @@ impl ClientCore {
             current_record: None,
             outbox: VecDeque::new(),
             frame_dims: None,
-            parity_decoder: ParityDecoder::new(PARITY_WINDOW),
             wire_loss: wire_loss::WireLossTracker::new(),
             ack_batcher: AckBatcher::new(),
             nack_batcher: NackBatcher::new(),
@@ -639,9 +631,7 @@ impl ClientCore {
     /// The split is the one `handle_datagram` actually dispatches on, so the
     /// counts cannot disagree with the path a datagram took. Deliberately
     /// excluded: ping/pong (not protocol), datagrams too short to carry a
-    /// header, and parity/NACK envelopes -- a parity datagram carries
-    /// recovered tile bytes but is not itself a tile datagram, and counting
-    /// it as one would inflate the tile side only on FEC-enabled sessions.
+    /// header, and NACK envelopes.
     ///
     /// This exists because `window.__ghostframeStats` was fed by the
     /// TypeScript receive loop that the wasm cutover deleted. `main.ts` kept

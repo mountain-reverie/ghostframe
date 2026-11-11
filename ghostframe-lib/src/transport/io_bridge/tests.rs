@@ -5944,7 +5944,6 @@ async fn a_forgotten_session_does_not_leak_its_mirror_into_a_reused_handle() {
             dg_len: 100,
             framing_len: 2,
             wire_seq: None,
-            parity_group: None,
             cum_enqueued: 102,
             queued: 102,
         },
@@ -5957,7 +5956,6 @@ async fn a_forgotten_session_does_not_leak_its_mirror_into_a_reused_handle() {
             dg_len: 100,
             framing_len: 2,
             wire_seq: None,
-            parity_group: None,
             cum_enqueued: 204,
             queued: 204,
         },
@@ -5979,7 +5977,6 @@ async fn a_forgotten_session_does_not_leak_its_mirror_into_a_reused_handle() {
             dg_len: 100,
             framing_len: 2,
             wire_seq: None,
-            parity_group: None,
             cum_enqueued: 102,
             queued: 102,
         },
@@ -6729,7 +6726,6 @@ async fn ungated_accepts_at_or_above_the_depth_target_are_counted() {
         dg_len: 1_000,
         framing_len: 2,
         wire_seq: None,
-        parity_group: None,
         cum_enqueued: queued,
         queued,
     };
@@ -6741,44 +6737,6 @@ async fn ungated_accepts_at_or_above_the_depth_target_are_counted() {
     assert_eq!(bridge.instr.admission.ungated_at_depth, 1);
     assert_eq!(bridge.instr.admission.depth_violations, 0);
     assert_eq!(bridge.instr.admission.soft_charged_bytes, 2_004);
-}
-
-/// A tile parity datagram is tagged with its group on the way into the
-/// departure tracker, so the ledger learns when it left; a datagram of the same
-/// wire class with no group is not. (The full chain through a
-/// live quinn connection is covered by the browserless `FECORACLE` report; the
-/// lib has no in-process connection fixture.)
-#[tokio::test(start_paused = true)]
-async fn only_tile_parity_reaches_the_departure_tracker_tagged() {
-    use super::transport_probe::Enqueued;
-    let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
-    let server = QuicServer::new().expect("QuicServer::new");
-    let (_tx, rx) = mpsc::channel(8);
-    let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
-    let h = ConnectionHandle(0);
-    let e = |cum: u64, parity_group: Option<u32>| Enqueued {
-        class: WireClass::Parity,
-        gated: false,
-        dg_len: 100,
-        framing_len: 2,
-        wire_seq: None,
-        parity_group,
-        cum_enqueued: cum,
-        queued: cum,
-    };
-    // Many datagrams of the class with no group.
-    for i in 0..88u64 {
-        bridge.note_enqueued(h, e(102 * (i + 1), None));
-    }
-    // One tile group's parity.
-    bridge.note_enqueued(h, e(102 * 89, Some(4_000)));
-    let now = super::now_std();
-    bridge.departures.on_poll(102 * 89, 0, now, |_, _| {});
-    assert_eq!(
-        bridge.departures.take_departed_parity(),
-        vec![4_000],
-        "the tile group, and none of the 88 untagged datagrams"
-    );
 }
 
 // ---- F3: the loss clock and the estimator's send times start at departure ----
@@ -7136,7 +7094,7 @@ async fn a_spurious_verdict_is_retracted_and_its_round_trip_is_not_a_sample() {
     assert_eq!(bridge.pending_losses_retracted, 1);
     assert_eq!(bridge.reliable_emitter.rtt.pto_count(), 0, "backoff reset");
     // The late round trip is NOT a sample: it includes the time the verdict
-    // beat it by (and a recovered datagram's reflects the parity).
+    // beat it by.
     assert_eq!(
         bridge.reliable_emitter.rtt.srtt(),
         srtt_before,
@@ -7209,65 +7167,6 @@ async fn the_probe_timeout_is_a_wake_deadline() {
     );
 }
 
-/// The client acks a datagram it rebuilt from parity under its original
-/// `wire_seq`, a round trip after the group's parity left and with no other
-/// member missing. That is a loss that happened: it stays in the pending list
-/// and the loss window and is counted apart. The same acknowledgement sooner
-/// than a round trip after the parity cannot be one and is retracted
-/// (`a_spurious_verdict_is_retracted_...`).
-#[tokio::test(start_paused = true)]
-async fn an_acknowledgement_a_round_trip_after_the_parity_is_an_fec_recovery_and_not_retracted() {
-    use crate::transport::ack::{AckBatch, AckEntry};
-    for (wait_ms, recovery) in [(50u64, true), (30, false)] {
-        let mut bridge = make_bridge_for_test().await;
-        bridge
-            .reliable_emitter
-            .rtt
-            .on_sample(std::time::Duration::from_millis(40));
-        let now = super::now_std();
-        for ws in 0..10u32 {
-            bridge
-                .transmission_ledger
-                .record_departed(ws, now, ledger_tx(1_000, 1_200, ws));
-        }
-        // The group's parity has left, through the tracker as in production.
-        let _ = bridge.departures.on_enqueue(None, 100, now);
-        bridge.departures.tag_last_as_parity(0);
-        bridge.departures.on_poll(100, 0, now, |_, _| {});
-        for g in bridge.departures.take_departed_parity() {
-            bridge.transmission_ledger.note_parity_departed(
-                g,
-                now,
-                std::time::Duration::from_secs(1),
-            );
-        }
-        for ws in (0..10u32).filter(|w| *w != 3) {
-            assert!(bridge.transmission_ledger.resolve(ws).is_some());
-        }
-        bridge.declare_lost_for_test(&[3]);
-        assert_eq!(bridge.pending_losses.len(), 1, "premise: declared lost");
-        tokio::time::advance(std::time::Duration::from_millis(wait_ms)).await;
-        let batch = AckBatch {
-            entries: vec![AckEntry {
-                wire_seq: 3,
-                arrival_time_ms_lo16: 1,
-            }],
-        };
-        bridge.dispatch_ack_datagram(&batch.encode());
-        bridge.retract_late_acked_losses();
-        assert_eq!(
-            (
-                bridge.instr.late_acks_fec_possible,
-                bridge.pending_losses.len(),
-                bridge.pending_losses_retracted,
-            ),
-            if recovery { (1, 1, 0) } else { (0, 0, 1) },
-            "{wait_ms} ms after the parity"
-        );
-        assert_eq!(bridge.reliable_emitter.rtt.samples(), 1, "never a sample");
-    }
-}
-
 /// A hole with too few departures behind it for the packet rule is found by
 /// the time rule, and the event loop wakes for it: `next_wake_deadline` carries
 /// the loss time, so it is declared at about 9/8 of a round trip and not at
@@ -7317,10 +7216,7 @@ async fn the_loss_path_counters_reach_the_instrument_summary() {
         (s.loss_by_packet_threshold, s.loss_by_time_threshold),
         (0, 0)
     );
-    assert_eq!(
-        (s.spurious_loss, s.spurious_pto, s.late_acks_fec_possible),
-        (0, 0, 0)
-    );
+    assert_eq!((s.spurious_loss, s.spurious_pto), (0, 0));
 }
 
 /// The compare's verdict reaches the feedback sink under the frame's own

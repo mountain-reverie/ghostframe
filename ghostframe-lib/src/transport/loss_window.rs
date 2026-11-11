@@ -29,10 +29,7 @@
 //! transmissions expired that way, in two episodes, reading as 83% and 12%
 //! loss. `loss_override` bypasses hysteresis, so it must not act on a verdict
 //! that is about to be withdrawn. Hence [`SETTLE`], and `retract` for the
-//! acknowledgement that arrives inside it. (A late acknowledgement that
-//! may be an FEC recovery, one a round trip after its group's parity left with
-//! no other member of the group missing, is not retracted: see
-//! `Resolution::Late`.)
+//! acknowledgement that arrives inside it.
 
 use std::collections::VecDeque;
 
@@ -40,9 +37,7 @@ use std::collections::VecDeque;
 ///
 /// A verdict is made about one round trip after the send (the acknowledgement of
 /// a later datagram, plus a few departures), and a prompt contradiction follows
-/// within another round trip; a late acknowledgement a round trip after its
-/// group's parity left, with no other member missing, may be an FEC recovery
-/// and is not retracted (`Resolution::Late`). So the window
+/// within another round trip. So the window
 /// must cover about two round trips: 600 ms covers paths up to roughly 250 ms,
 /// beyond the tailnet paths measured (20-150 ms). It was the old horizon's
 /// ceiling; it is kept because nothing measured argues for a different value,

@@ -198,43 +198,33 @@ impl IoBridge {
                         self.loss_window.record(tx.emit_us as u32, false);
                         Some((tx.content, tx, e.arrival_time_ms_lo16, false))
                     }
-                    Some(Resolution::Late { tx, fec_possible }) => {
+                    Some(Resolution::Late { tx }) => {
                         self.reliable_emitter.note_ack(now_for_samples);
                         if let Some(k) = tx.content.tile() {
                             self.reliable_emitter.note_ack_origin(k, e.wire_seq);
                         }
                         let was_flushed = self.instr.flushed.take(e.wire_seq);
-                        if fec_possible {
-                            // May be the client acking a datagram it rebuilt
-                            // from parity: a loss that happened. Not
-                            // retracted, not counted as one goog_cc was wrongly
-                            // told of.
-                            self.instr.late_acks_fec_possible += 1;
-                        } else {
-                            // The network did deliver it, only late: its
-                            // bytes count as delivered for the rate sample.
-                            // (Not when it may be an FEC recovery: then the
-                            // network did not.)
-                            if let Some((mark, departed)) = rate {
-                                self.delivery_sampler.on_acked(
-                                    &mark,
-                                    departed,
-                                    tx.wire_bytes,
-                                    now_for_samples,
-                                );
-                            }
-                            self.loss_window.retract(tx.emit_us as u32);
-                            // Observability: was goog_cc already told this was
-                            // lost?
-                            if was_flushed {
-                                self.instr.late_acked_after_flush += 1;
-                            }
-                            // Withdrawn from `pending_losses` once per turn
-                            // (see `retract_late_acked_losses`); only worth
-                            // noting when something is waiting there.
-                            if !self.pending_losses.is_empty() {
-                                self.late_acked.insert(e.wire_seq);
-                            }
+                        // The network did deliver it, only late: its bytes count
+                        // as delivered for the rate sample.
+                        if let Some((mark, departed)) = rate {
+                            self.delivery_sampler.on_acked(
+                                &mark,
+                                departed,
+                                tx.wire_bytes,
+                                now_for_samples,
+                            );
+                        }
+                        self.loss_window.retract(tx.emit_us as u32);
+                        // Observability: was goog_cc already told this was
+                        // lost?
+                        if was_flushed {
+                            self.instr.late_acked_after_flush += 1;
+                        }
+                        // Withdrawn from `pending_losses` once per turn
+                        // (see `retract_late_acked_losses`); only worth
+                        // noting when something is waiting there.
+                        if !self.pending_losses.is_empty() {
+                            self.late_acked.insert(e.wire_seq);
                         }
                         if crate::transport::reliable_emitter::rto_probe_enabled() {
                             eprintln!(
@@ -321,8 +311,7 @@ impl IoBridge {
                 // It is still an acknowledgement (the PTO backoff ended at
                 // dispatch, in `resolve_ack_entries`), but its round trip is
                 // not a sample: it includes the time the verdict beat it by,
-                // and a recovered datagram's reflects the parity, not the
-                // path. srtt, rttvar and the latest round trip stay as the
+                // srtt, rttvar and the latest round trip stay as the
                 // live acknowledgements made them.
                 continue;
             }
@@ -628,12 +617,7 @@ impl IoBridge {
                 self.unroutable_inbound_datagrams =
                     self.unroutable_inbound_datagrams.saturating_add(1);
             }
-            K::Empty
-            | K::Unknown
-            | K::Hello
-            | K::TileParity
-            | K::FrameFragment
-            | K::TileFragment => {
+            K::Empty | K::Unknown | K::Hello | K::FrameFragment | K::TileFragment => {
                 self.unroutable_inbound_datagrams =
                     self.unroutable_inbound_datagrams.saturating_add(1);
             }

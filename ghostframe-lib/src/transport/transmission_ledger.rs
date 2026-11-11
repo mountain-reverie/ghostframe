@@ -121,12 +121,6 @@ const REO_PERSIST: u32 = 16;
 /// of calm between them, must not lose its window (and pay to learn it again,
 /// on the legacy H.264 path a spurious loss IDR) after sixteen lossy frames.
 const REO_QUIET_SPAN: Duration = Duration::from_secs(30);
-/// Hard cap on the parity departures remembered. The real bound is time (the
-/// caller's `retain`, at least 600 ms): at 200 Mbit/s and 1,200-byte datagrams
-/// that is about 12,500 groups, so the cap is a backstop for rates beyond that,
-/// not a rate-dependent limit on ordinary operation.
-const PARITY_RING_CAP: usize = 16_384;
-
 /// Resolved entries `scan_outstanding` steps over per call.
 pub(crate) const SCAN_DEAD_BUDGET: usize = 4_096;
 /// Spurious share of the window above which `K_PKT` goes up by one: 10 %.
@@ -146,28 +140,7 @@ pub enum Resolution {
     /// **not** be fed to the estimator — that transmission has already been
     /// accounted for as a loss, and counting it again would report the same
     /// bytes twice.
-    Late {
-        tx: Transmission,
-        /// This acknowledgement may be the client acking a datagram it
-        /// rebuilt from parity under its original `wire_seq`: a real network
-        /// loss, not a premature verdict. Nothing on the wire says which, so
-        /// the ledger asks what would have to be true of a recovery, from
-        /// what the server itself did:
-        ///
-        /// - the group's parity departed at least `min_rtt` before this
-        ///   acknowledgement (the parity has to cross the path and the
-        ///   acknowledgement come back), and
-        /// - no other member of the group is outstanding or declared lost
-        ///   (XOR parity with k = 10 rebuilds exactly one).
-        ///
-        /// Both are facts about departures and acknowledgements, so the test
-        /// does not depend on the send rate or on how the group's parity came
-        /// to leave (full interleave or the end-of-stream flush). Treated as
-        /// a loss that happened (no retraction, no threshold adaptation) and
-        /// counted apart. A late acknowledgement failing either test cannot
-        /// be a recovery.
-        fec_possible: bool,
-    },
+    Late { tx: Transmission },
 }
 
 /// A verdict kept so a late acknowledgement can be recognised.
@@ -242,10 +215,6 @@ pub struct LedgerStats {
     /// being declared lost. Equal to `acked_after_declared_lost` (a tombstone
     /// resolves once); kept under the Eifel name.
     pub spurious_losses: u64,
-    /// Of `spurious_losses`, those that arrived late enough to be an FEC
-    /// recovery (see [`Resolution::Late`]). They do not retract the loss or
-    /// adapt `K_PKT`.
-    pub late_acks_fec_possible: u64,
     /// The packet threshold now (3 to 8) and how often it has been raised.
     pub k_pkt: u64,
     pub k_pkt_raises: u64,
@@ -348,12 +317,6 @@ pub struct TransmissionLedger {
     verdict_branches: Vec<(u32, ReoBranch)>,
     last_reo_raise: Option<Instant>,
     last_spurious_ack: Option<Instant>,
-    /// When each group's parity left quinn's FIFO, by `group_first_wire_seq`.
-    /// Bounded by time (see [`Self::note_parity_departed`]) and, as a
-    /// backstop, by [`PARITY_RING_CAP`].
-    parity_departed: HashMap<u32, Instant>,
-    /// The same entries in departure order, for pruning.
-    parity_order: VecDeque<(u32, Instant)>,
     /// Current packet threshold, and what it adapts from: verdicts issued so
     /// far, and one bit per recent verdict (by verdict number modulo 64) set
     /// when that verdict was contradicted by a late acknowledgement.
@@ -392,8 +355,6 @@ impl TransmissionLedger {
             verdict_branches: Vec::new(),
             last_reo_raise: None,
             last_spurious_ack: None,
-            parity_departed: HashMap::new(),
-            parity_order: VecDeque::new(),
             k_pkt: K_PKT_INITIAL,
             freeze_k_pkt: false,
             verdicts: 0,
@@ -479,51 +440,6 @@ impl TransmissionLedger {
             k_pkt: self.k_pkt,
             ..self.stats
         }
-    }
-
-    /// A group's parity datagram left quinn's FIFO at `at`. `group_first` is
-    /// the first `wire_seq` of the group it covers (the parity envelope's own
-    /// field). Entries older than `retain` are forgotten: a recovery's
-    /// acknowledgement comes about a round trip after the parity, so the
-    /// caller passes a few round trips (never less than the loss window's
-    /// settle time), whatever the send rate.
-    pub fn note_parity_departed(&mut self, group_first: u32, at: Instant, retain: Duration) {
-        while let Some(&(g, t)) = self.parity_order.front() {
-            if self.parity_order.len() <= PARITY_RING_CAP
-                && at.saturating_duration_since(t) <= retain
-            {
-                break;
-            }
-            self.parity_order.pop_front();
-            // A newer departure of the same group first replaces it.
-            if self.parity_departed.get(&g) == Some(&t) {
-                self.parity_departed.remove(&g);
-            }
-        }
-        self.parity_departed.insert(group_first, at);
-        self.parity_order.push_back((group_first, at));
-    }
-
-    /// Could a late acknowledgement of `wire_seq` be an FEC recovery? See
-    /// [`Resolution::Late::fec_possible`]. `ack` is `(now, min_rtt)`; `None`
-    /// skips the parity-age test. O(group size).
-    fn fec_possible(&self, wire_seq: u32, ack: Option<(Instant, Duration)>) -> bool {
-        let k = crate::transport::reliable_emitter::FEC_GROUP_SIZE_K as u32;
-        let Some((first, left)) = (0..k)
-            .map(|i| wire_seq.wrapping_sub(i))
-            .find_map(|first| self.parity_departed.get(&first).map(|t| (first, *t)))
-        else {
-            return false;
-        };
-        if let Some((now, min_rtt)) = ack {
-            if now.saturating_duration_since(left) < min_rtt {
-                return false;
-            }
-        }
-        (0..k)
-            .map(|i| first.wrapping_add(i))
-            .filter(|m| *m != wire_seq)
-            .all(|m| !self.records.contains_key(&m) && !self.tombstones.contains_key(&m))
     }
 
     pub fn k_pkt(&self) -> u64 {
@@ -800,8 +716,6 @@ impl TransmissionLedger {
         self.last_time_threshold = None;
         self.last_reo_raise = None;
         self.last_spurious_ack = None;
-        self.parity_departed.clear();
-        self.parity_order.clear();
         self.departed_bytes = 0;
         self.k_pkt = K_PKT_INITIAL;
         self.verdicts = 0;
@@ -823,7 +737,7 @@ impl TransmissionLedger {
     }
 
     /// [`Self::resolve`] with the acknowledgement's arrival time and the
-    /// path's `min_rtt`, which the FEC test needs (`None` skips its age test).
+    /// path's `min_rtt`, which the reordering window is learned from.
     pub fn resolve_at(
         &mut self,
         wire_seq: u32,
@@ -877,35 +791,30 @@ impl TransmissionLedger {
             if let (Some(idx), Some(at), false) = (tx.dep_idx, t.departed, is_pad) {
                 self.advance_largest_acked(idx, at, ack.map(|a| a.0));
             }
-            let fec_possible = self.fec_possible(wire_seq, ack);
-            if fec_possible {
-                self.stats.late_acks_fec_possible += 1;
-            } else {
-                self.stats.spurious_disp_max = self.stats.spurious_disp_max.max(disp);
-                self.stats.spurious_gap_us_max = self
-                    .stats
-                    .spurious_gap_us_max
-                    .max(extent.as_micros() as u64);
-                // A zero `min_rtt` is none known: nothing to size a step by.
-                let min_rtt = ack.map(|a| a.1);
-                let known = min_rtt.is_none_or(|m| !m.is_zero());
-                if !is_pad && t.reason != LossReason::Pto && known {
-                    if stalled {
-                        self.stats.reo_stall_skips += 1;
+            self.stats.spurious_disp_max = self.stats.spurious_disp_max.max(disp);
+            self.stats.spurious_gap_us_max = self
+                .stats
+                .spurious_gap_us_max
+                .max(extent.as_micros() as u64);
+            // A zero `min_rtt` is none known: nothing to size a step by.
+            let min_rtt = ack.map(|a| a.1);
+            let known = min_rtt.is_none_or(|m| !m.is_zero());
+            if !is_pad && t.reason != LossReason::Pto && known {
+                if stalled {
+                    self.stats.reo_stall_skips += 1;
+                } else {
+                    if t.reason == LossReason::Packet {
+                        self.stats.reo_learned_packet += 1;
                     } else {
-                        if t.reason == LossReason::Packet {
-                            self.stats.reo_learned_packet += 1;
-                        } else {
-                            self.stats.reo_learned_time += 1;
-                        }
-                        self.learn_reordering(ack.map(|a| a.0), min_rtt, extent.max(lag), disp);
+                        self.stats.reo_learned_time += 1;
                     }
-                }
-                if let Some(n) = t.packet_verdict_no {
-                    self.note_spurious(n);
+                    self.learn_reordering(ack.map(|a| a.0), min_rtt, extent.max(lag), disp);
                 }
             }
-            return Some(Resolution::Late { tx, fec_possible });
+            if let Some(n) = t.packet_verdict_no {
+                self.note_spurious(n);
+            }
+            return Some(Resolution::Late { tx });
         }
         self.stats.unknown_acks += 1;
         None
@@ -1628,7 +1537,7 @@ mod tests {
         assert!(l.resolve(4).is_some());
         assert_eq!(l.detect_losses(FAR).len(), 2);
         assert!(
-            matches!(l.resolve(0), Some(Resolution::Late { tx: t, .. }) if t.content == Content::Tile(EmitKey::new(0, 0, 0, 0)))
+            matches!(l.resolve(0), Some(Resolution::Late { tx: t }) if t.content == Content::Tile(EmitKey::new(0, 0, 0, 0)))
         );
         assert_eq!(l.stats().acked_after_declared_lost, 1);
         assert_eq!(l.stats().spurious_losses, 1);
@@ -1639,8 +1548,7 @@ mod tests {
 
     /// 70 sent, the last acknowledged: all but the last `K_PKT` are lost. Then
     /// the newest `spurious` of the verdicts are contradicted at once, so each
-    /// late acknowledgement is of a transmission whose group's parity has not
-    /// left (so it cannot be an FEC recovery).
+    /// late acknowledgement is of one of those verdicts.
     fn window(l: &mut TransmissionLedger, t0: Instant, base: u32, spurious: usize) {
         for ws in base..base + 70 {
             send(l, ws, t0);
@@ -1652,13 +1560,7 @@ mod tests {
         assert!(lost.len() as u64 >= 70 - l.k_pkt(), "{}", lost.len());
         let n = spurious.min(19 - l.k_pkt() as usize);
         for (ws, _, _) in lost.iter().rev().take(n) {
-            assert!(matches!(
-                l.resolve(*ws),
-                Some(Resolution::Late {
-                    fec_possible: false,
-                    ..
-                })
-            ));
+            assert!(matches!(l.resolve(*ws), Some(Resolution::Late { .. })));
         }
     }
 
@@ -1696,169 +1598,6 @@ mod tests {
     }
 
     const RTT: Duration = Duration::from_millis(40);
-    const KEEP: Duration = Duration::from_millis(600);
-
-    /// Send `first..first + 10` as one group, then its parity at `parity_at`.
-    fn send_group(l: &mut TransmissionLedger, first: u32, t0: Instant, parity_at: Instant) {
-        for ws in first..first + 10 {
-            send(l, ws, t0);
-        }
-        l.note_parity_departed(first, parity_at, KEEP);
-    }
-
-    fn late(l: &mut TransmissionLedger, ws: u32, at: Instant) -> bool {
-        match l.resolve_at(ws, Some((at, RTT))) {
-            Some(Resolution::Late { fec_possible, .. }) => fec_possible,
-            other => panic!("{other:?}"),
-        }
-    }
-
-    /// The client acks a datagram it rebuilt from parity under its original
-    /// `wire_seq`, which can only be a round trip after the group's parity
-    /// left, and only when it was the one member missing. That is a loss that
-    /// happened, so it neither retracts nor adapts anything.
-    #[test]
-    fn a_loss_recovered_by_parity_does_not_raise_the_packet_threshold() {
-        let t0 = Instant::now();
-        let mut l = TransmissionLedger::new(8192);
-        // 12 windows of 7 groups: every member acked live but one per group
-        // (position 3), the last acked, the holes declared lost by the
-        // threshold, then acked late a round trip after their parity.
-        let mut base = 0u32;
-        for _ in 0..12 {
-            for g in 0..7 {
-                send_group(&mut l, base + g * 10, t0, t0);
-            }
-            for ws in base..base + 70 {
-                if ws % 10 != 3 {
-                    assert!(l.resolve(ws).is_some());
-                }
-            }
-            let lost = l.detect_losses(FAR);
-            assert!(lost.len() >= 6, "{}", lost.len());
-            for (ws, _, _) in lost.iter() {
-                assert!(late(&mut l, *ws, t0 + RTT), "ws {ws}");
-            }
-            base += 70;
-        }
-        assert_eq!(l.k_pkt(), 3, "parity recoveries are not reordering");
-        assert_eq!(l.stats().k_pkt_raises, 0);
-        assert!(l.stats().late_acks_fec_possible >= 12 * 6);
-        // They are still counted as late acknowledgements.
-        assert_eq!(l.stats().spurious_losses, l.stats().late_acks_fec_possible);
-    }
-
-    /// The age test, at every position in the group and on both sides of its
-    /// boundary: the acknowledgement of a rebuilt datagram comes at least
-    /// `min_rtt` after the parity left, whichever member it is. The group's
-    /// parity leaves 10 to 19 departures after member p at a steady rate, a
-    /// spread no count of departures can hold a line through.
-    #[test]
-    fn a_late_ack_is_a_possible_recovery_only_a_round_trip_after_the_parity() {
-        for p in [0u32, 5, 8, 9] {
-            let t0 = Instant::now();
-            let mut l = TransmissionLedger::new(8192);
-            send_group(&mut l, 0, t0, t0);
-            for ws in (0..10).filter(|w| *w != p) {
-                assert!(l.resolve(ws).is_some());
-            }
-            let _ = l.declare_lost_by_pto(p);
-            let early = late(&mut l, p, t0 + RTT - Duration::from_micros(1));
-            assert!(!early, "member {p}: a microsecond short of the round trip");
-            // A tombstone resolves once; do the other side on a fresh ledger.
-            let mut l = TransmissionLedger::new(8192);
-            send_group(&mut l, 0, t0, t0);
-            for ws in (0..10).filter(|w| *w != p) {
-                assert!(l.resolve(ws).is_some());
-            }
-            let _ = l.declare_lost_by_pto(p);
-            assert!(
-                late(&mut l, p, t0 + RTT),
-                "member {p}: exactly a round trip"
-            );
-        }
-    }
-
-    /// Parity rebuilds one member. If another is outstanding or lost, the late
-    /// acknowledgement is a premature verdict (reordering), whatever the
-    /// timing.
-    #[test]
-    fn a_late_ack_beside_another_missing_member_is_not_a_recovery() {
-        let t0 = Instant::now();
-        let after = t0 + RTT * 4;
-        for other_lost in [false, true] {
-            let mut l = TransmissionLedger::new(8192);
-            send_group(&mut l, 0, t0, t0);
-            for ws in 0..10 {
-                if ws != 3 && ws != 6 {
-                    assert!(l.resolve(ws).is_some());
-                }
-            }
-            let _ = l.declare_lost_by_pto(3);
-            if other_lost {
-                let _ = l.declare_lost_by_pto(6);
-            }
-            assert!(!late(&mut l, 3, after), "other_lost={other_lost}");
-        }
-    }
-
-    /// The memory of when parity left is bounded by time, not by a count of
-    /// groups: at 200 Mbit/s a thousand groups leave in 5 ms, and a recovery on
-    /// an 80 ms path is acknowledged 80 ms after its parity, thousands of groups
-    /// later. And an entry older than `retain` is forgotten.
-    #[test]
-    fn the_parity_memory_is_a_span_of_time_not_a_number_of_groups() {
-        let t0 = Instant::now();
-        let mut l = TransmissionLedger::new(1 << 16);
-        let rtt = Duration::from_millis(80);
-        // Group 0 is the one under test: nine members acked, one lost.
-        for ws in 0..10u32 {
-            send(&mut l, ws, t0);
-        }
-        l.note_parity_departed(0, t0, KEEP);
-        for ws in 1..10 {
-            assert!(l.resolve(ws).is_some());
-        }
-        let _ = l.declare_lost_by_pto(0);
-        // 15,000 further groups' parity in the next 75 ms (5 us apart).
-        for g in 1..15_000u32 {
-            l.note_parity_departed(g * 10, t0 + Duration::from_micros(g as u64 * 5), KEEP);
-        }
-        let late_ack = |l: &mut TransmissionLedger| match l.resolve_at(0, Some((t0 + rtt, rtt))) {
-            Some(Resolution::Late { fec_possible, .. }) => fec_possible,
-            other => panic!("{other:?}"),
-        };
-        assert!(late_ack(&mut l), "15,000 groups later, still remembered");
-
-        // And forgotten past the retention.
-        let mut l = TransmissionLedger::new(1 << 16);
-        for ws in 0..10u32 {
-            send(&mut l, ws, t0);
-        }
-        l.note_parity_departed(0, t0, KEEP);
-        for ws in 1..10 {
-            assert!(l.resolve(ws).is_some());
-        }
-        let _ = l.declare_lost_by_pto(0);
-        l.note_parity_departed(10, t0 + KEEP + Duration::from_millis(1), KEEP);
-        assert!(!late_ack(&mut l), "older than the retention");
-    }
-
-    /// The end-of-stream flush sends a frame's last groups' parity a few
-    /// milliseconds after their members, far fewer than 20 departures later.
-    /// The recovery is still a round trip after the parity left.
-    #[test]
-    fn a_flushed_group_is_judged_by_its_parity_not_by_a_departure_count() {
-        let t0 = Instant::now();
-        let mut l = TransmissionLedger::new(8192);
-        // 10 members, then 5 ms of quiet, then the flushed parity.
-        send_group(&mut l, 0, t0, t0 + Duration::from_millis(5));
-        for ws in 1..10 {
-            assert!(l.resolve(ws).is_some());
-        }
-        let _ = l.declare_lost_by_pto(0);
-        assert!(late(&mut l, 0, t0 + Duration::from_millis(5) + RTT));
-    }
 
     /// Only a packet-threshold verdict says anything about reordering depth: a
     /// time or probe verdict contradicted soon after does not move the
@@ -1871,14 +1610,8 @@ mod tests {
             let base = round * 2;
             send(&mut l, base, t0);
             let _ = l.declare_lost_by_pto(base);
-            // A prompt contradiction, well inside the FEC distance.
-            assert!(matches!(
-                l.resolve(base),
-                Some(Resolution::Late {
-                    fec_possible: false,
-                    ..
-                })
-            ));
+            // A prompt contradiction.
+            assert!(matches!(l.resolve(base), Some(Resolution::Late { .. })));
         }
         assert_eq!(l.k_pkt(), 3);
         assert_eq!(l.stats().spurious_losses, 100);
@@ -2669,19 +2402,5 @@ mod tests {
         }
         assert!(l.reo_wnd() > Duration::ZERO);
         assert_eq!(l.reo_recoveries, 0);
-    }
-
-    #[test]
-    fn a_fec_recovery_does_not_open_the_window() {
-        let t0 = Instant::now();
-        let mut l = TransmissionLedger::new(64);
-        send_group(&mut l, 0, t0, t0 + 2 * MS);
-        for ws in 1..10 {
-            ack(&mut l, ws, t0 + 40 * MS);
-        }
-        let _ = l.detect_losses_at(t0 + 40 * MS, FAR);
-        // 0 comes back a round trip after its parity left: a recovery.
-        assert!(late(&mut l, 0, t0 + 2 * MS + RTT));
-        assert_eq!(l.reo_wnd(), Duration::ZERO);
     }
 }

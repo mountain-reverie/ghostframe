@@ -491,8 +491,7 @@ pub struct AdmissionCounters {
     /// while admission held work and the tokens to send it. Zero when the
     /// FIFO is refilled after every drain.
     pub starved_turns: u64,
-    /// Wire bytes charged to the bucket by the gate (every gated datagram,
-    /// parity included).
+    /// Wire bytes charged to the bucket by the gate (every gated datagram).
     pub charged_bytes: u64,
     /// Wire bytes charged without being asked (H.264 frames).
     pub soft_charged_bytes: u64,
@@ -640,9 +639,6 @@ pub struct InstrumentSummary {
     pub loss_retx_requested: u64,
     pub nack_miss_pending: u64,
     pub nack_miss_not_owed: u64,
-    /// Late acknowledgements that arrived far enough after their verdict to be
-    /// an FEC recovery (not retracted, not adapted to).
-    pub late_acks_fec_possible: u64,
     pub pto_probes_requested: u64,
     pub pto_fires: u64,
     pub loss_retransmits: u64,
