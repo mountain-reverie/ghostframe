@@ -130,40 +130,43 @@ impl IoBridge {
         let tracked = tx.is_some();
         // A record evicted by the ledger's cap (or never made) does not make
         // the datagram anonymous: its header says what it is.
-        let content = tx
-            .map(|t| t.content)
-            .or_else(|| Self::content_of_untracked(emission));
-        match content {
-            Some(Content::Tile(key)) => {
-                self.h264.stats.oversize_tile += 1;
-                // Pairs the emitter's cache with the CDF 5/3 coverage.
-                self.cancel_in_flight_for_tile(key.tile_x, key.tile_y);
-                self.ensure_baseline_invalidated();
-                // The whole baseline is gone: the repaint is not demand.
-                let now_us = now.duration_since(self.epoch).as_micros() as u64;
-                self.classifier.note_repaint(now_us);
-            }
-            Some(Content::H264Frag {
-                frame_seq,
-                frag_idx,
-            }) => {
-                // The ledger identity counts H.264 fragments only.
-                if tracked {
-                    self.h264.stats.tx_forgotten += 1;
+        let contents: Vec<Option<Content>> = match tx {
+            Some(t) => t.records().map(|(_, c)| Some(c)).collect(),
+            None => vec![Self::content_of_untracked(emission)],
+        };
+        for content in contents {
+            match content {
+                Some(Content::Tile(key)) => {
+                    self.h264.stats.oversize_tile += 1;
+                    // Pairs the emitter's cache with the CDF 5/3 coverage.
+                    self.cancel_in_flight_for_tile(key.tile_x, key.tile_y);
+                    self.ensure_baseline_invalidated();
+                    // The whole baseline is gone: the repaint is not demand.
+                    let now_us = now.duration_since(self.epoch).as_micros() as u64;
+                    self.classifier.note_repaint(now_us);
                 }
-                self.h264.stats.oversize_h264 += 1;
-                self.reliable_emitter.h264.remove(frame_seq, frag_idx);
-                if self.h264_refs_live() {
-                    // The frame is lost as far as the manager is concerned,
-                    // and it picks the recovery.
-                    self.h264_refs_oversize(frame_seq, now);
+                Some(Content::H264Frag {
+                    frame_seq,
+                    frag_idx,
+                }) => {
+                    // The ledger identity counts H.264 fragments only.
+                    if tracked {
+                        self.h264.stats.tx_forgotten += 1;
+                    }
+                    self.h264.stats.oversize_h264 += 1;
+                    self.reliable_emitter.h264.remove(frame_seq, frag_idx);
+                    if self.h264_refs_live() {
+                        // The frame is lost as far as the manager is concerned,
+                        // and it picks the recovery.
+                        self.h264_refs_oversize(frame_seq, now);
+                    }
                 }
+                Some(Content::Pad(ws)) => {
+                    self.h264.stats.oversize_pad += 1;
+                    self.reliable_emitter.pads.remove(ws);
+                }
+                None => self.h264.stats.oversize_untracked += 1,
             }
-            Some(Content::Pad(ws)) => {
-                self.h264.stats.oversize_pad += 1;
-                self.reliable_emitter.pads.remove(ws);
-            }
-            None => self.h264.stats.oversize_untracked += 1,
         }
     }
 

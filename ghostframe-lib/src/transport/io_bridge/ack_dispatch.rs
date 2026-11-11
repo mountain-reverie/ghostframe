@@ -28,11 +28,10 @@ pub(crate) fn handle_datagram_payload(payload: &[u8]) -> Option<&'static [u8]> {
     }
 }
 
-/// One resolved ACK entry: what the transmission carried, the transmission,
+/// One resolved ACK entry: the transmission (which carries its records' content),
 /// the client arrival stamp, and whether it was already reported lost (so no
 /// timing sample).
 type ResolvedAck = (
-    crate::transport::reliable_emitter::Content,
     crate::transport::transmission_ledger::Transmission,
     u16,
     bool,
@@ -108,7 +107,8 @@ impl IoBridge {
                 // its transmission was declared lost.
                 let emit_keys: Vec<crate::transport::reliable_emitter::EmitKey> = resolved
                     .iter()
-                    .filter_map(|(c, _, _, _)| c.tile())
+                    .flat_map(|(tx, _, _)| tx.records())
+                    .filter_map(|(_, c)| c.tile())
                     .collect();
                 // Samples come from the ledger record, not the cache entry.
                 // `Transmission::emit_us` is the stamp *this* datagram
@@ -192,16 +192,22 @@ impl IoBridge {
                                 now_for_samples,
                             );
                         }
-                        if let Some(k) = tx.content.tile() {
-                            self.reliable_emitter.note_ack_origin(k, e.wire_seq);
+                        // Per record, under the record's own wire_seq.
+                        for (record_ws, content) in tx.records() {
+                            if let Some(k) = content.tile() {
+                                self.reliable_emitter.note_ack_origin(k, record_ws);
+                            }
                         }
+                        // One loss-window sample per transmission.
                         self.loss_window.record(tx.emit_us as u32, false);
-                        Some((tx.content, tx, e.arrival_time_ms_lo16, false))
+                        Some((tx, e.arrival_time_ms_lo16, false))
                     }
                     Some(Resolution::Late { tx }) => {
                         self.reliable_emitter.note_ack(now_for_samples);
-                        if let Some(k) = tx.content.tile() {
-                            self.reliable_emitter.note_ack_origin(k, e.wire_seq);
+                        for (record_ws, content) in tx.records() {
+                            if let Some(k) = content.tile() {
+                                self.reliable_emitter.note_ack_origin(k, record_ws);
+                            }
                         }
                         let was_flushed = self.instr.flushed.take(e.wire_seq);
                         // The network did deliver it, only late: its bytes count
@@ -235,7 +241,7 @@ impl IoBridge {
                                     .wrapping_sub(tx.emit_us as u32)
                             );
                         }
-                        Some((tx.content, tx, e.arrival_time_ms_lo16, true))
+                        Some((tx, e.arrival_time_ms_lo16, true))
                     }
                     None => None,
                 };
@@ -275,21 +281,23 @@ impl IoBridge {
         }
         if crate::transport::reliable_emitter::rto_probe_enabled() {
             let ack_us = self.reliable_emitter.emit_us(now_for_samples) as i64;
-            for (c, tx, _, _) in resolved.iter() {
-                let Some(k) = c.tile() else { continue };
-                let codec = self
-                    .reliable_emitter
-                    .cache
-                    .get(&k)
-                    .and_then(|e| e.datagram.get(18).copied())
-                    .map(|b| b >> 1)
-                    .unwrap_or(255);
-                eprintln!(
-                    "RTOPROBE ack codec={} pass={} latency_us={}",
-                    codec,
-                    k.pass_idx,
-                    ack_us.wrapping_sub(tx.emit_us as u32 as i64) as i32 as i64
-                );
+            for (tx, _, _) in resolved.iter() {
+                for (_, c) in tx.records() {
+                    let Some(k) = c.tile() else { continue };
+                    let codec = self
+                        .reliable_emitter
+                        .cache
+                        .get(&k)
+                        .and_then(|e| e.datagram.get(18).copied())
+                        .map(|b| b >> 1)
+                        .unwrap_or(255);
+                    eprintln!(
+                        "RTOPROBE ack codec={} pass={} latency_us={}",
+                        codec,
+                        k.pass_idx,
+                        ack_us.wrapping_sub(tx.emit_us as u32 as i64) as i32 as i64
+                    );
+                }
             }
         }
     }
@@ -301,7 +309,7 @@ impl IoBridge {
         resolved: &[ResolvedAck],
         now_for_samples: std::time::Instant,
     ) {
-        for (content, tx, arrival_lo16, late) in resolved.iter() {
+        for (tx, arrival_lo16, late) in resolved.iter() {
             if *late {
                 // Declared lost when it expired: either already reported to
                 // the estimator (feeding its timing now would report the same
@@ -318,6 +326,13 @@ impl IoBridge {
             if self.bwe_samples_buffer.len() >= BWE_SAMPLES_BUFFER_CAPACITY {
                 break;
             }
+            // One sample per transmission. `tile_key` / `content` read its
+            // first record (the only one today); with several records the tier
+            // and the cache read follow the plan's decision 6.
+            let Some(&(_, content)) = tx.records.first() else {
+                continue;
+            };
+            let content = &content;
             let tile_key = content.tile();
             // `queued_at` and the probe tag come from whichever cache holds the
             // content: the tile cache, or the H.264 probe cache.
@@ -371,7 +386,7 @@ impl IoBridge {
     /// Release fragment coverage, scheduler and palette state for each
     /// acknowledged tile-pass.
     fn apply_ack_coverage(&mut self, resolved: &[ResolvedAck]) {
-        for (content, _, _, _) in resolved.iter() {
+        for (_, content) in resolved.iter().flat_map(|(tx, _, _)| tx.records()) {
             let Some(emit_key) = content.tile() else {
                 continue;
             };

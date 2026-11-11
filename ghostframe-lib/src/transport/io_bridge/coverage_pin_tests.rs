@@ -61,7 +61,7 @@ fn record_transmissions(b: &mut IoBridge) -> Vec<(u32, EmitKey)> {
             crate::transport::transmission_ledger::Transmission {
                 emit_us: e.emit_us,
                 wire_bytes: e.wire_bytes,
-                content: e.content,
+                records: smallvec::smallvec![(e.wire_seq, e.content)],
                 depart_us: None,
                 dep_idx: None,
             },
