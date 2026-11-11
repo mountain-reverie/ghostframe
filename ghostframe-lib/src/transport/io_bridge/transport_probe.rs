@@ -182,13 +182,14 @@ impl IoBridge {
             self.transmission_ledger.record(
                 e.wire_seq,
                 now,
-                crate::transport::transmission_ledger::Transmission {
-                    emit_us: e.emit_us,
-                    wire_bytes: e.wire_bytes,
-                    content: e.content,
-                    depart_us: None,
-                    dep_idx: None,
-                },
+                crate::transport::transmission_ledger::Transmission::single(
+                    e.emit_us,
+                    e.wire_bytes,
+                    e.wire_seq,
+                    e.content,
+                    None,
+                    None,
+                ),
             );
         }
         if recorded {

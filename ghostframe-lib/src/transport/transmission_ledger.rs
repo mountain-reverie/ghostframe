@@ -17,19 +17,25 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use smallvec::{smallvec, SmallVec};
+
 use crate::transport::delivery_sampler::RateMark;
 use crate::transport::reliable_emitter::Content;
 
 /// What was sent, and what it was sent for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transmission {
     /// Clock-relative microseconds, the same value stamped into the datagram
     /// header — so the estimator sees the epoch its other inputs use.
     pub emit_us: u64,
     pub wire_bytes: usize,
-    /// What this transmission carried: a tile pass or an H.264 fragment. The
-    /// consumers that think in tile passes read [`Content::tile`].
-    pub content: Content,
+    /// What this transmission carried, one `(record wire_seq, content)` per
+    /// inner datagram: a tile pass or an H.264 fragment each. The consumers
+    /// that think in tile passes read [`Content::tile`]. The record's
+    /// `wire_seq` is what the emitter's caches (`latest_ws`, `judged_ws`)
+    /// know it by; the ledger key is the transmission's own id (today equal
+    /// to its only record's `wire_seq`).
+    pub records: SmallVec<[(u32, Content); 4]>,
     /// The emitter-clock microseconds (the clock `emit_us` is on) at which
     /// this transmission left quinn's FIFO for the wire. `None` while it is
     /// still queued, in the emitter or in quinn. `emit_us` is when it was
@@ -43,6 +49,36 @@ pub struct Transmission {
     /// cannot say which of two such datagrams went first; this can, and loss
     /// detection counts in it.
     pub dep_idx: Option<u64>,
+}
+
+impl Transmission {
+    /// A transmission of exactly one record.
+    pub fn single(
+        emit_us: u64,
+        wire_bytes: usize,
+        wire_seq: u32,
+        content: Content,
+        depart_us: Option<u64>,
+        dep_idx: Option<u64>,
+    ) -> Self {
+        Self {
+            emit_us,
+            wire_bytes,
+            records: smallvec![(wire_seq, content)],
+            depart_us,
+            dep_idx,
+        }
+    }
+
+    /// The `(record wire_seq, content)` pairs this transmission carried.
+    pub fn records(&self) -> impl Iterator<Item = (u32, Content)> + '_ {
+        self.records.iter().copied()
+    }
+
+    /// True when any record's content satisfies `pred`.
+    pub fn any_content(&self, pred: impl Fn(&Content) -> bool) -> bool {
+        self.records.iter().any(|(_, c)| pred(c))
+    }
 }
 
 /// Which rule judged a packet-threshold verdict, with respect to the
@@ -144,7 +180,7 @@ pub enum Resolution {
 }
 
 /// A verdict kept so a late acknowledgement can be recognised.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Tombstone {
     tx: Transmission,
     /// Number of the packet-threshold verdict, for the adaptation window.
@@ -242,7 +278,7 @@ pub struct LedgerStats {
     pub reo_judged_quiet: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Record {
     /// When the ledger was told of it (enqueue). Identity and capacity order
     /// only: loss is judged on departure (`departed`, `dep_idx`).
@@ -590,8 +626,8 @@ impl TransmissionLedger {
     pub(crate) fn count_outstanding(&self, pred: impl Fn(&Content) -> bool) -> usize {
         self.records
             .values()
-            .filter(|r| pred(&r.tx.content))
-            .count()
+            .map(|r| r.tx.records.iter().filter(|(_, c)| pred(c)).count())
+            .sum()
     }
 
     /// Forget one record that has not departed: its datagram was taken out of
@@ -680,7 +716,7 @@ impl TransmissionLedger {
     /// departed inside a marked burst. Tile datagrams are judged as ever even
     /// when a probe window of the tile path is open.
     fn is_patient(&self, tx: &Transmission, departed: Instant) -> bool {
-        !matches!(tx.content, Content::Tile(_)) && self.in_probe_burst(departed)
+        tx.any_content(|c| !matches!(c, Content::Tile(_))) && self.in_probe_burst(departed)
     }
 
     /// Whether the verdict on `wire_seq` fell on a datagram that is probe
@@ -748,7 +784,7 @@ impl TransmissionLedger {
             // moves the reference real datagrams are judged against: a pad
             // that overtakes a real datagram on a jittery path would make the
             // real one look like a hole.
-            let is_pad = matches!(rec.tx.content, Content::Pad(_));
+            let is_pad = rec.tx.any_content(|c| matches!(c, Content::Pad(_)));
             if let (Some(idx), Some(at), false) = (rec.tx.dep_idx, rec.departed, is_pad) {
                 self.advance_largest_acked(idx, at, ack.map(|a| a.0));
             }
@@ -761,7 +797,7 @@ impl TransmissionLedger {
             let tx = t.tx;
             // An acknowledgement of a departure newer than any acknowledged so
             // far moves the reference the thresholds are judged against.
-            let is_pad = matches!(tx.content, Content::Pad(_));
+            let is_pad = tx.any_content(|c| matches!(c, Content::Pad(_)));
             // How far the newest acknowledged departure was past this one when
             // the verdict was issued, in departures and in departure time.
             let (disp, extent) = match (
@@ -1100,7 +1136,7 @@ impl TransmissionLedger {
                     ..
                 }) => {
                     live_seen += 1;
-                    out.push((*ws, *tx));
+                    out.push((*ws, tx.clone()));
                 }
                 _ => dead_seen += 1,
             }
@@ -1192,7 +1228,7 @@ impl TransmissionLedger {
         self.tombstones.insert(
             wire_seq,
             Tombstone {
-                tx,
+                tx: tx.clone(),
                 packet_verdict_no,
                 reason,
                 largest_idx_at_verdict: self.largest_acked,
@@ -1249,7 +1285,7 @@ mod tests {
         Transmission {
             emit_us: n as u64 * 1000,
             wire_bytes: 1200,
-            content: Content::Tile(EmitKey::new(n, 0, 0, 0)),
+            records: smallvec![(n, Content::Tile(EmitKey::new(n, 0, 0, 0)))],
             depart_us: None,
             dep_idx: None,
         }
@@ -1305,7 +1341,7 @@ mod tests {
         send(&mut l, 1, t0); // real, will be reordered behind the pad
                              // The pad departs after it.
         let mut pad = tx(2);
-        pad.content = Content::Pad(2);
+        pad.records = smallvec![(2, Content::Pad(2))];
         l.record(2, t0, pad);
         assert!(l.mark_departed(2, t0, 2));
         assert!(
@@ -1324,7 +1360,7 @@ mod tests {
 
     fn send_content(l: &mut TransmissionLedger, ws: u32, at: Instant, content: Content) {
         let mut t = tx(ws);
-        t.content = content;
+        t.records = smallvec![(ws, content)];
         l.record(ws, at, t);
         assert!(l.mark_departed(ws, at, ws as u64));
     }
@@ -1537,7 +1573,7 @@ mod tests {
         assert!(l.resolve(4).is_some());
         assert_eq!(l.detect_losses(FAR).len(), 2);
         assert!(
-            matches!(l.resolve(0), Some(Resolution::Late { tx: t }) if t.content == Content::Tile(EmitKey::new(0, 0, 0, 0)))
+            matches!(l.resolve(0), Some(Resolution::Late { tx: t }) if t.records[..] == [(0, Content::Tile(EmitKey::new(0, 0, 0, 0)))])
         );
         assert_eq!(l.stats().acked_after_declared_lost, 1);
         assert_eq!(l.stats().spurious_losses, 1);
@@ -1703,8 +1739,9 @@ mod tests {
         let mut l = TransmissionLedger::new(64);
         send(&mut l, 1, t0);
         assert_eq!(
-            l.declare_lost_by_pto(1).map(|t| t.content),
-            Some(Content::Tile(EmitKey::new(1, 0, 0, 0)))
+            l.declare_lost_by_pto(1)
+                .map(|t| t.records().map(|(_, c)| c).collect::<Vec<_>>()),
+            Some(vec![Content::Tile(EmitKey::new(1, 0, 0, 0))])
         );
         assert_eq!(l.stats().lost_pto, 1);
         assert!(l.declare_lost_by_pto(1).is_none());
