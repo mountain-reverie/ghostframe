@@ -1780,7 +1780,10 @@ impl IoBridge {
                         bytes_sent_before: p.bytes_sent,
                     };
                     p.bytes_sent = p.bytes_sent.saturating_add(
-                        crate::transport::fec_tx::packer::Packer::lone_bundle_len(dg.len()) as i64,
+                        crate::transport::fec_tx::packer::Packer::lone_bundle_len(
+                            dg.len(),
+                            crate::transport::fec_tx::packer::BundleKind::Plain,
+                        ) as i64,
                     );
                     p.packets_sent = p.packets_sent.saturating_add(1);
                     tag
