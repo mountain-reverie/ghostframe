@@ -542,6 +542,7 @@ impl IoBridge {
                     else {
                         break;
                     };
+                    let now_us = self.reliable_emitter.emit_us64(now_std());
                     let mut scratch;
                     let packer = if framed_live {
                         &mut self.packer
@@ -549,7 +550,7 @@ impl IoBridge {
                         scratch = crate::transport::fec_tx::packer::Packer::new();
                         &mut scratch
                     };
-                    let bundles = packer.lone(&datagram, max_dg);
+                    let bundles = packer.lone(&datagram, max_dg, now_us);
                     let Some(b) = bundles.into_iter().next_back() else {
                         break;
                     };
