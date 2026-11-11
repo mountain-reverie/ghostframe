@@ -920,6 +920,9 @@ pub enum InboundKind {
     TileParity,
     TileNack,      // TILE_NACK_ENVELOPE (0x05)
     FrameAck,      // FRAME_ACK_ENVELOPE (0x0A)
+    LossReport,    // fec::feedback::LOSS_REPORT_MSG_TYPE (0x07)
+    AckBatchV4,    // fec::feedback::ACK_V4_MSG_TYPE (0x08)
+    RepairRequest, // fec::feedback::REPAIR_REQUEST_MSG_TYPE (0x0B)
     FrameFragment, // first byte 0x10..=0x7F
     TileFragment,  // first byte 0x80..=0xFF (TILE_DATAGRAM_FLAG bit set)
 }
@@ -951,6 +954,21 @@ const INBOUND_DISCRIMINATORS: &[(&str, u8, InboundKind)] = &[
     ),
     ("tile nack", TILE_NACK_ENVELOPE, InboundKind::TileNack),
     ("frame ack", FRAME_ACK_ENVELOPE, InboundKind::FrameAck),
+    (
+        "loss report",
+        crate::fec::feedback::LOSS_REPORT_MSG_TYPE,
+        InboundKind::LossReport,
+    ),
+    (
+        "ack batch v4",
+        crate::fec::feedback::ACK_V4_MSG_TYPE,
+        InboundKind::AckBatchV4,
+    ),
+    (
+        "repair request",
+        crate::fec::feedback::REPAIR_REQUEST_MSG_TYPE,
+        InboundKind::RepairRequest,
+    ),
 ];
 
 pub fn classify_inbound(data: &[u8]) -> InboundKind {
@@ -982,6 +1000,9 @@ pub fn classify_inbound(data: &[u8]) -> InboundKind {
         crate::ack::ACK_BATCH_MSG_TYPE => InboundKind::AckBatch,
         TILE_NACK_ENVELOPE => InboundKind::TileNack,
         FRAME_ACK_ENVELOPE => InboundKind::FrameAck,
+        crate::fec::feedback::LOSS_REPORT_MSG_TYPE => InboundKind::LossReport,
+        crate::fec::feedback::ACK_V4_MSG_TYPE => InboundKind::AckBatchV4,
+        crate::fec::feedback::REPAIR_REQUEST_MSG_TYPE => InboundKind::RepairRequest,
         b if b < 0x10 => InboundKind::Unknown,
         b if b < 0x80 => InboundKind::FrameFragment,
         _ => InboundKind::TileFragment,
@@ -1373,6 +1394,18 @@ mod tests {
         assert_eq!(classify_inbound(&[0x0A]), InboundKind::FrameAck);
         assert_ne!(FRAME_ACK_ENVELOPE, crate::ack::ACK_BATCH_MSG_TYPE);
         assert_ne!(FRAME_ACK_ENVELOPE, TILE_NACK_ENVELOPE);
+    }
+
+    #[test]
+    fn fec_v2_feedback_discriminators_classify() {
+        assert_eq!(classify_inbound(&[0x07]), InboundKind::LossReport);
+        assert_eq!(classify_inbound(&[0x08]), InboundKind::AckBatchV4);
+        assert_eq!(classify_inbound(&[0x0B]), InboundKind::RepairRequest);
+        assert_eq!(
+            classify_inbound(&[0x09]),
+            InboundKind::Unknown,
+            "0x09 stays free"
+        );
     }
 
     #[test]
