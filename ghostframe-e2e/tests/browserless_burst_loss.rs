@@ -1194,7 +1194,7 @@ fn p5_scene(seed: u64, secs: u64) -> BrowserlessScene {
 
 /// What one lossy run cost, from the counters that name the cause.
 struct RepairBill {
-    lost_datagrams: u64,
+    lost_records: u64,
     retransmits: u64,
     by_loss: u64,
     by_probe: u64,
@@ -1211,7 +1211,10 @@ fn repair_bill(r: &BrowserlessResult) -> RepairBill {
         // transmission it declared lost; the ones a late acknowledgement
         // contradicted were not lost and are taken out, so an over-eager
         // verdict still shows up as retransmissions with nothing missing.
-        lost_datagrams: i.ledger_lost_records - i.ledger_spurious_lost_records,
+        // Superseded records (`verdict_content_gone`) are in the verdicts but
+        // are owed nothing, so they come out of the denominator too.
+        lost_records: (i.ledger_lost_records - i.ledger_spurious_lost_records)
+            .saturating_sub(i.verdict_content_gone),
         retransmits: r.retransmit_attempts_total,
         by_loss: i.loss_retransmits,
         by_probe: i.pto_probe_retransmits,
@@ -1232,7 +1235,7 @@ fn repair_bill(r: &BrowserlessResult) -> RepairBill {
 ///   ever.
 /// - **Margin-argued**: retransmissions per datagram the client saw missing
 ///   (records in lost bundles, net of verdicts a late acknowledgement
-///   contradicted: see `repair_bill`) is at most `RATIO_BOUND` (measured 1.033 pooled, 1.097 worst run).
+///   contradicted: see `repair_bill`) is at most `RATIO_BOUND` (measured 1.014 pooled, 1.067 worst run, 1.007 pooled with client NACKs dropped; superseded records come out of the owed count and the scenes assert no tombstone was evicted).
 ///
 /// Re-measured baselines on the sweep scene family (15 runs per row, sweep
 /// `burst_loss_report_over_three_seeds`): the PR-3 base 0.86, PR-4 1.03 (RTO
@@ -1270,21 +1273,29 @@ async fn p5a(ignore_client_nacks: bool) -> (u64, u64, u64, u64) {
             assert_established(&n, &r);
             let b = repair_bill(&r);
             realised(&n, P5_RATE, &r);
+            // Premise: every wrong verdict was seen to be wrong. A tombstone
+            // evicted before its late acknowledgement leaves a spurious
+            // verdict uncounted and inflates the bill.
+            assert_eq!(
+                r.transport.instr.ledger_tombstone_evictions, 0,
+                "{n}: premise: tombstones were evicted"
+            );
             println!(
-                "P5A{} {n}: lost_datagrams={} retransmits={} (loss={} probe={} nack={}) ratio={:.3} \
+                "P5A{} {n}: lost_records={} retransmits={} (loss={} probe={} nack={}) ratio={:.3} \
                  cache_left={} tiles={} stale={} verdicts={} spurious={} k_pkt={} pto_fires={} \
                  critical_lat_mean_us={} max_us={} queued_crit_mean_us={}",
                 if ignore_client_nacks { "_ALONE" } else { "" },
-                b.lost_datagrams,
+                b.lost_records,
                 b.retransmits,
                 b.by_loss,
                 b.by_probe,
                 b.by_nack,
-                b.retransmits as f64 / b.lost_datagrams.max(1) as f64,
+                b.retransmits as f64 / b.lost_records.max(1) as f64,
                 r.emitter_cache_entries,
                 tiles_present(&r),
                 r.stale_generation_tiles,
-                r.transport.instr.loss_by_packet_threshold + r.transport.instr.loss_by_time_threshold,
+                r.transport.instr.loss_by_packet_threshold
+                    + r.transport.instr.loss_by_time_threshold,
                 r.transport.instr.ledger_spurious_losses,
                 r.transport.instr.k_pkt,
                 r.transport.instr.pto_fires,
@@ -1301,7 +1312,7 @@ async fn p5a(ignore_client_nacks: bool) -> (u64, u64, u64, u64) {
                 r.emitter_cache_entries, 0,
                 "{n}: passes left in the retransmit cache: sent, never acknowledged"
             );
-            lost += b.lost_datagrams;
+            lost += b.lost_records;
             retx += b.retransmits;
             loss_repairs += b.by_loss;
             by_nack += b.by_nack;
@@ -1314,8 +1325,8 @@ async fn p5a(ignore_client_nacks: bool) -> (u64, u64, u64, u64) {
 async fn p5a_a_lost_datagram_is_repaired_about_once_and_nothing_is_stranded() {
     let (lost, retx, loss_repairs, _) = p5a(false).await;
     let ratio = retx as f64 / lost as f64;
-    println!("P5A pooled: retransmits={retx} lost_datagrams={lost} ratio={ratio:.3}");
-    assert!(lost >= 500, "premise: only {lost} missing datagrams");
+    println!("P5A pooled: retransmits={retx} lost_records={lost} ratio={ratio:.3}");
+    assert!(lost >= 500, "premise: only {lost} missing records");
     // Who repaired it. Measured with the detector on: 1302 of 1445
     // retransmissions (90 %) are the detector's; off, 0.
     assert!(
@@ -1324,7 +1335,7 @@ async fn p5a_a_lost_datagram_is_repaired_about_once_and_nothing_is_stranded() {
     );
     assert!(
         ratio <= RATIO_BOUND,
-        "{retx} retransmissions for {lost} missing datagrams: {ratio:.3} > {RATIO_BOUND}"
+        "{retx} retransmissions for {lost} missing records: {ratio:.3} > {RATIO_BOUND}"
     );
 }
 
@@ -1338,17 +1349,17 @@ async fn p5a_alone_the_detector_and_the_probe_repair_everything_without_the_clie
     let (lost, retx, loss_repairs, by_nack) = p5a(true).await;
     let ratio = retx as f64 / lost as f64;
     println!(
-        "P5A_ALONE pooled: retransmits={retx} lost_datagrams={lost} ratio={ratio:.3} detector={loss_repairs}"
+        "P5A_ALONE pooled: retransmits={retx} lost_records={lost} ratio={ratio:.3} detector={loss_repairs}"
     );
     assert_eq!(by_nack, 0, "premise: the client's NACKs were dropped");
-    assert!(lost >= 500, "premise: only {lost} missing datagrams");
+    assert!(lost >= 500, "premise: only {lost} missing records");
     assert!(
         loss_repairs * 100 >= retx * 90,
         "the detector made {loss_repairs} of {retx} retransmissions"
     );
     assert!(
         ratio <= RATIO_BOUND,
-        "{retx} retransmissions for {lost} missing datagrams: {ratio:.3} > {RATIO_BOUND}"
+        "{retx} retransmissions for {lost} missing records: {ratio:.3} > {RATIO_BOUND}"
     );
 }
 
@@ -1693,8 +1704,9 @@ async fn p5_seed_0x22_converges_once_the_churn_stops() {
 /// one probe per backoff period.
 #[tokio::test(start_paused = true)]
 async fn p5_a_burst_longer_than_the_pto_is_recovered_from() {
+    const PROBE_REPAIRED_RUNS_MIN: usize = 2;
     let ge = GilbertElliott::from_rate_and_burst_us(0.30, 1_500_000.0, 1.0).expect("feasible");
-    let (mut repaired_runs, mut pto_runs) = (0, 0);
+    let mut probe_repaired_runs = 0usize;
     for seed in (0..8u64).map(|i| 0xB0_B057 ^ (i * 0x100)) {
         let mut sc = scene(seed, 30);
         let profile = LoadProfile {
@@ -1707,17 +1719,20 @@ async fn p5_a_burst_longer_than_the_pto_is_recovered_from() {
             .await
             .expect("scene ran");
         println!(
-            "P5LONGBURST seed={seed:#x}: offered={} dropped={} retx={} cache_left={} tiles={} pto_fires={}",
+            "P5LONGBURST seed={seed:#x}: offered={} dropped={} retx={} cache_left={} tiles={} pto_fires={} probe_retx={}",
             r.s2c_datagrams_offered,
             r.s2c_datagrams_dropped,
             r.retransmit_attempts_total,
             r.emitter_cache_entries,
             tiles_present(&r),
-            r.transport.instr.pto_fires
+            r.transport.instr.pto_fires,
+            r.transport.instr.pto_probe_retransmits
         );
         assert!(r.s2c_datagrams_dropped > 0, "{seed:#x}: premise: no loss");
-        repaired_runs += usize::from(r.retransmit_attempts_total > 0);
-        pto_runs += usize::from(r.transport.instr.pto_fires > 0);
+        // The runs where the probe itself repaired something: a retransmission
+        // the probe timeout asked for, not just a PTO firing with nothing owed
+        // and not a repair some other path made.
+        probe_repaired_runs += usize::from(r.transport.instr.pto_probe_retransmits > 0);
         assert_eq!(
             r.emitter_cache_entries, 0,
             "{seed:#x}: passes still owed after the burst ended"
@@ -1733,12 +1748,8 @@ async fn p5_a_burst_longer_than_the_pto_is_recovered_from() {
         );
     }
     assert!(
-        pto_runs >= 4,
-        "premise: the PTO fired in only {pto_runs} of 8 runs"
-    );
-    assert!(
-        repaired_runs >= 3,
-        "premise: only {repaired_runs} of 8 runs needed a repair"
+        probe_repaired_runs >= PROBE_REPAIRED_RUNS_MIN,
+        "the probe repaired something in only {probe_repaired_runs} of 8 runs"
     );
 }
 
