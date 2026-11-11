@@ -125,3 +125,53 @@ Residual source loss follows the same ordering (for example 100 Mbit/s h264 b8: 
 The condition "choose (b) only if (a) leaves a gap of more than a point or so of late frames" is not met anywhere in the grid, with the interleaved assignment. Recommendation: (a), m = ceil((k + R)/256), interleaved assignment i mod m, r = ceil(R/m). The contiguous variant must not be used. The larger finding is that, above 70 Mbit/s, the frame-spanning blocks of (a) beat the current time-capped default by 4–19 points of late frames under bursts.
 
 Caveats: single-seed grid; 70 Mbit/s mostly fits one block (m = 1, so (a) = (b) by construction); the loss model is per packet with no time correlation; ideal MDS decode.
+
+## 7. Rule 3 (Empty close) for RS blocks
+
+**Every number is a model estimate [E].** Script `empty_sim.py` (about 10 s, `python3 -I empty_sim.py`), output `empty_sim_out.txt` (full table and block structure).
+
+### Method
+- **Simulator change.** `uniform_sim.py`, family `rs_time`, gets two switches (existing runs are unaffected):
+  - `T = "formula"` is the design's `min(max(5 ms, 6 bundle slots), frame interval)`: 28.3 / 5.7 / 5 / 5 ms at 2 / 10 / 30 / 100 Mbit/s.
+  - `"empty": True` adds rule 3. At the end of a pass (`do_pass`), if the content queue is empty, the open block closes and its repairs go out in that pass, charged like sources. That is what `Stop::Empty` sees: tokens or depth ending the pass with content still queued does not close.
+  - `empty_kmin` (no Empty close below this k) and `empty_rmin` (minimum repairs at an Empty close) are the two parameter changes tried.
+- **Grid.** Variants: `kT` (k_max 64 and T), `kT+empty`, `kT+empty r2` (r at least 2 on an Empty close), `kT+empty k>=4` and `k>=8`. Rates 2 / 10 / 30 / 100 Mbit/s; H.264 and tiles-only traffic; i.i.d. 1 % and 5 %, and Gilbert-Elliott 2 % with mean burst 3; nominal overhead 20 %, r_min 1; 5 seeds (demand and loss re-drawn), 60 000 source bundles each.
+- **Metrics.** Late frames (> 33 ms after the loss-free completion, H.264), tile recovery wait p95 / p99 over all lost bundles, and `c0` p95: the same for lost bundles in bursts of 1-6 bundles (55 % of bursts), the case rule 3 targets. Overhead is repair / source bundles; k is the mean block size.
+
+### Result (mean of 5 seeds; late frames with seed min-max)
+
+| Mbit/s | variant | H.264 late %, iid 5 % | H.264 late %, GE b3 | tiles p95 / p99 ms, iid 1 % | tiles c0 p95 ms, iid 1 % / GE b3 | ovh % | mean k |
+|---|---|---|---|---|---|---|---|
+| 2 | kT | 1.03 (0.9-1.1) | 2.62 (2.5-2.8) | 33.0 / 47.2 | 30.2 / 28.3 | 31.1 | 5.6 |
+| 2 | kT+empty | 1.09 (0.9-1.2) | 2.57 (2.4-2.8) | 33.0 / 49.1 | 24.5 / 30.2 | 31.3 | 5.4 |
+| 2 | kT+empty r2 | 0.70 (0.6-0.8) | 2.48 (2.3-2.7) | 33.0 / 45.3 | 29.3 / 34.0 | 37.2 | 5.4 |
+| 10 | kT | 2.72 (2.5-3.0) | 7.74 (7.4-8.1) | 8.5 / 17.2 | 7.7 / 6.2 | 27.9 | 7.9 |
+| 10 | kT+empty | 2.46 (2.1-2.8) | 7.86 (7.7-8.2) | 9.1 / 18.1 | 5.9 / 6.0 | 27.9 | 7.9 |
+| 30 | kT | 2.26 (1.9-2.7) | 8.59 (8.0-9.0) | 13.2 / 18.8 | 6.2 / 5.1 | 21.9 | 20.8 |
+| 30 | kT+empty | 1.98 (1.0-2.6) | 8.61 (8.1-9.1) | 13.2 / 18.9 | 4.0 / 3.4 | 21.9 | 20.7 |
+| 100 | kT | 0.27 (0.0-1.0) | 3.22 (2.4-4.1) | 12.3 / 14.9 | 6.7 / 8.3 | 20.6 | 52.4 |
+| 100 | kT+empty | 0.14 (0.0-0.3) | 3.29 (2.1-4.1) | 12.1 / 14.9 | 3.0 / 3.7 | 20.6 | 52.2 |
+
+(ovh and k are for the H.264 mix at GE b3; the tiles rows differ by at most 1 point.)
+
+### Block size at low rate (the design's caveat)
+Share of blocks closed on Empty, their mean k, and the share of source bundles in blocks with k <= 3 (H.264, `kT` -> `kT+empty`):
+
+| Mbit/s | closed on Empty | k of those | sources in k <= 3 blocks |
+|---|---|---|---|
+| 2 | 43 % | 3.9 | 7.0 -> 8.7 % |
+| 10 | 14 % | 8.7 | 0.6 -> 0.7 % |
+| 30 | 16 % | 25.5 | 0.1 -> 0.1 % |
+| 100 | 14 % | 31 | 0.0 -> 0.0 % |
+
+### Conclusion
+- **Rule 3 holds for RS: it costs nothing measurable and helps small tile bursts.**
+  - Overhead moves by at most 0.2 point in every row, and mean k by at most 0.2 on H.264 (1.6 of 45 on 100 Mbit/s tiles). Late frames and tile p95 / p99 differ by less than the seed spread in every row.
+  - It cuts the p95 recovery of small tile bursts (1-6 bundles) by 2-4 ms from 30 Mbit/s up (6.7 -> 3.0 ms at 100 Mbit/s, 6.2 -> 4.0 at 30). Below that it does nothing: at 2 and 10 Mbit/s the queue is rarely empty while a big tile burst drains, and the c0 gain is 0-2 ms and not consistent across loss models.
+  - It does not move H.264 late frames. A lost bundle waits for the end of its block, which T or k_max set; Empty only shortens the last block of each frame, by less than T, and that is far under the 33 ms threshold.
+- **The design's caveat is real but is T's doing, not rule 3's.** At 2 Mbit/s 43 % of H.264 blocks close on Empty with mean k 3.9, but `kT` alone already gives k 5.6 and 31 % overhead (T = 28 ms is one frame). Adding Empty raises the share of sources in k <= 3 blocks from 7.0 to 8.7 % and the late frames under burst-3 loss do not change (2.62 -> 2.57 %). The cost of small blocks is paid with or without rule 3, and the burst span lost is inside the seed spread.
+- **Parameter changes.**
+  - `empty_kmin` 4 or 8: no effect at all (rows identical to `kT+empty` or `kT`). Not needed.
+  - `empty_rmin` 2 helps only where blocks are tiny: at 2 Mbit/s i.i.d. 5 % late frames fall from 1.03 to 0.70 %, for +6 points of overhead (31 -> 37 %); at 10 Mbit/s and up nothing. Not recommended as a default. If wanted, apply it only when the advertised T is the frame interval (about 2 Mbit/s).
+  - No change to rules 1-4. Keep rule 3 as written.
+- **Not modelled:** the real emitter's queue also holds retransmissions and control content, which would make Empty rarer; tile bursts and frames share one queue here, as in the sender model, with no priorities.
