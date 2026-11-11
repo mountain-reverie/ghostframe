@@ -419,3 +419,44 @@ async fn record_limit_sizes_the_drain_and_the_frame_path() {
 fn ghostframe_lib_packer_limit(max_dg: usize) -> usize {
     crate::transport::fec_tx::packer::Packer::record_limit(max_dg)
 }
+
+/// A sealed bundle of `len` bytes and no records: only its length matters
+/// to the short-bundle rule.
+fn sized_bundle(len: usize) -> crate::transport::fec_tx::packer::SealedBundle {
+    crate::transport::fec_tx::packer::SealedBundle {
+        bundle_seq: 0,
+        bytes: vec![0; len],
+        records: Default::default(),
+        emit_us: 0,
+    }
+}
+
+/// quinn accepts `len` bytes (one byte of framing) on top of a FIFO of
+/// `fifo` bytes; `fifo` is what it holds afterwards.
+fn accept_bundle(b: &mut IoBridge, fifo: &mut u64, len: usize) {
+    let sb = sized_bundle(len);
+    *fifo += len as u64 + 1;
+    b.note_bundle_enqueued(H, &sb, 1, *fifo, *fifo);
+}
+
+#[tokio::test]
+async fn short_bundles_back_to_back_in_a_busy_fifo_are_counted() {
+    // RAW is 1000, so a 300-byte bundle is short and a 990-byte one is not.
+    let mut b = framed_bridge();
+    let mut fifo = 0u64;
+    accept_bundle(&mut b, &mut fifo, 300);
+    assert_eq!(
+        b.instr.admission.short_bundle_shared_risk, 0,
+        "the FIFO was empty before the first"
+    );
+    accept_bundle(&mut b, &mut fifo, 300);
+    assert_eq!(b.instr.admission.short_bundle_shared_risk, 1);
+
+    // A full-size bundle between two short ones breaks the pair.
+    let mut b = framed_bridge();
+    let mut fifo = 0u64;
+    accept_bundle(&mut b, &mut fifo, 300);
+    accept_bundle(&mut b, &mut fifo, 990);
+    accept_bundle(&mut b, &mut fifo, 300);
+    assert_eq!(b.instr.admission.short_bundle_shared_risk, 0);
+}
