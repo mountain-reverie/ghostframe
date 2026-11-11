@@ -17,6 +17,13 @@ pub(crate) struct RecordMeta {
     pub emit_us: u64,
     pub class: WireClass,
     pub is_pad: bool,
+    /// The record carries a probe-cluster tag. The server counts a cluster's
+    /// packets and bytes as it tags records, and goog_cc counts what it is
+    /// acknowledged, one sample per bundle: a tagged record is therefore one
+    /// packet of its own (alone in its bundle, like a pad), so that the
+    /// cluster's size, `bytes_sent_before` and packet count mean the same to
+    /// both. Untagged records still share bundles.
+    pub is_probe: bool,
     /// The record's own length (the inner datagram), for billing.
     pub len: usize,
 }
@@ -54,6 +61,13 @@ impl Packer {
         max_dg
             .saturating_sub(FEC_RECORDS_HEADROOM)
             .saturating_sub(FEC_RECORD_LEN_PREFIX)
+    }
+
+    /// Bytes of the PLAIN bundle that carries one record of `rec_len` alone:
+    /// what goog_cc is told it received (`BweSample::size_bytes`), and so the
+    /// unit a probe cluster's tagged bytes are counted in.
+    pub(crate) fn lone_bundle_len(rec_len: usize) -> usize {
+        FEC_PLAIN_HEADER_LEN + FEC_RECORD_LEN_PREFIX + rec_len
     }
 
     pub(crate) fn alloc_seq(&mut self) -> u32 {
@@ -106,8 +120,9 @@ impl Packer {
             Self::record_limit(max_dg),
             max_dg
         );
-        // A pad is always alone: seal what is open, then seal the pad.
-        if meta.is_pad {
+        // A pad or a probe-tagged record is always alone: seal what is open,
+        // then seal it.
+        if meta.is_pad || meta.is_probe {
             out.extend(self.seal());
             let mut body = Vec::with_capacity(rec.len() + FEC_RECORD_LEN_PREFIX);
             push_record(&mut body, rec);
@@ -171,6 +186,7 @@ mod tests {
             emit_us,
             class: WireClass::H264,
             is_pad,
+            is_probe: false,
             len: 0,
         }
     }
@@ -248,6 +264,30 @@ mod tests {
         let b = p.flush().unwrap();
         assert_eq!(b.records.len(), 1);
         assert_eq!(b.bundle_seq, 2);
+    }
+
+    #[test]
+    fn a_probe_tagged_record_is_alone_and_untagged_ones_still_share() {
+        let mut p = Packer::new();
+        let probe = |ws| RecordMeta {
+            is_probe: true,
+            ..meta(ws, 1, false)
+        };
+        let mut sealed = Vec::new();
+        sealed.extend(p.push(&rec(10, 1), meta(1, 1, false), 1200));
+        sealed.extend(p.push(&rec(10, 2), probe(2), 1200));
+        sealed.extend(p.push(&rec(10, 3), probe(3), 1200));
+        sealed.extend(p.push(&rec(10, 4), meta(4, 1, false), 1200));
+        sealed.extend(p.push(&rec(10, 5), meta(5, 1, false), 1200));
+        sealed.extend(p.flush());
+        let shape: Vec<Vec<u32>> = sealed
+            .iter()
+            .map(|b| b.records.iter().map(|r| r.wire_seq).collect())
+            .collect();
+        assert_eq!(shape, vec![vec![1], vec![2], vec![3], vec![4, 5]]);
+        // The unit a cluster's bytes are counted in is the bundle goog_cc is
+        // told about.
+        assert_eq!(sealed[1].bytes.len(), Packer::lone_bundle_len(10));
     }
 
     #[test]

@@ -42,6 +42,8 @@ const EMITTED_META_CAP: usize = 1 << 17;
 pub(crate) struct TestWire {
     /// Refuse every bundle (`Blocked`).
     pub(crate) blocked: bool,
+    /// Refuse every bundle as `TooLarge` (the path shrank).
+    pub(crate) too_large: bool,
     /// Accepted bytes, frame plus one byte of framing each.
     pub(crate) cum: u64,
 }
@@ -62,12 +64,14 @@ pub(super) enum Offer {
 }
 
 impl IoBridge {
-    /// Offer `dg` to the live session's quinn connection, counting and
-    /// logging a refusal.
+    /// Offer `dg` (a sealed bundle) to the live session's quinn connection.
     pub(super) fn offer_to_live(&mut self, dg: &[u8]) -> Offer {
         #[cfg(test)]
         if self.live_send_handle().is_none() {
             if let Some(w) = self.test_wire.as_mut() {
+                if w.too_large {
+                    return Offer::Refused(quinn_proto::SendDatagramError::TooLarge);
+                }
                 if w.blocked {
                     return Offer::Refused(quinn_proto::SendDatagramError::Blocked(
                         bytes::Bytes::new(),
@@ -99,40 +103,30 @@ impl IoBridge {
                 framing: wt.datagram_framing_len(),
                 queued: send_capacity.saturating_sub(conn.datagrams().send_buffer_space()) as u64,
             },
-            Err(e) => {
-                self.datagram_send_errs = self.datagram_send_errs.saturating_add(1);
-                if matches!(e, quinn_proto::SendDatagramError::TooLarge) {
-                    self.h264.stats.send_too_large += 1;
-                }
-                if !self.datagram_send_err_first_logged {
-                    self.datagram_send_err_first_logged = true;
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        ?handle,
-                        error = ?e,
-                        payload_len = dg.len(),
-                        "first send_datagram Err — QUIC backpressure or limit; \
-                         subsequent send failures will log at debug and a running \
-                         total appears in the per-frame `dispatch returned` log"
-                    );
-                } else {
-                    tracing::debug!(target: LOG_TARGET, ?handle, error = ?e, "datagram send failed");
-                }
-                Offer::Refused(e)
-            }
+            Err(e) => Offer::Refused(e),
         }
     }
 
-    /// Bytes that are admitted but not yet in quinn's FIFO: the open bundle
-    /// and the sealed ones quinn has not taken. The depth gate counts them, or
-    /// records admitted while a bundle fills would overshoot `D_target`.
+    /// Wire bytes that are admitted but not yet in quinn's FIFO: the open
+    /// bundle and the sealed ones quinn has not taken, each with its frame
+    /// header and the QUIC framing it will carry. The depth gate counts them,
+    /// or records admitted while a bundle fills would overshoot `D_target`;
+    /// and it counts them as the FIFO will (`queued` in
+    /// `note_bundle_enqueued`), or a short bundle's header would let the FIFO
+    /// stand at `D_target` when the next one is accepted.
     pub(super) fn unsent_bundle_bytes(&self) -> usize {
-        self.packer.open_bytes()
-            + self
-                .pending_bundles
-                .iter()
-                .map(|b| b.bytes.len())
-                .sum::<usize>()
+        let framing = self.live_framing_len();
+        let open = self.packer.open_bytes();
+        let open = if open == 0 {
+            0
+        } else {
+            open + ghostframe_protocol::fec::frame::FEC_PLAIN_HEADER_LEN + framing
+        };
+        open + self
+            .pending_bundles
+            .iter()
+            .map(|b| b.bytes.len() + framing)
+            .sum::<usize>()
     }
 
     /// Whether a send to the live session can happen at all.
@@ -241,6 +235,20 @@ impl IoBridge {
             }
             self.emitted_meta.remove(&ws)
         });
+        // A record whose parked meta is gone (the table was cleared, or a hook
+        // took it) is still a record: its header says what it carries, so it
+        // is ledgered as that rather than billed as a content-less control
+        // frame. A tile pass names no key in its datagram and cannot be.
+        let meta = meta.or_else(|| {
+            let ws = wire_seq?;
+            let content = Self::content_of_datagram(dg, class)?;
+            Some(EmittedDatagram {
+                wire_seq: ws,
+                content,
+                emit_us: self.reliable_emitter.emit_us64(now),
+                wire_bytes: dg.len(),
+            })
+        });
         let sealed = match meta {
             Some(e) => {
                 let meta = RecordMeta {
@@ -249,6 +257,7 @@ impl IoBridge {
                     emit_us: e.emit_us,
                     class,
                     is_pad: matches!(e.content, Content::Pad(_)),
+                    is_probe: self.probe_tag_of(&e.content).is_some(),
                     len: dg.len(),
                 };
                 self.packer.push(dg, meta, max_dg)
@@ -378,19 +387,55 @@ impl IoBridge {
                 true
             }
             Offer::Refused(quinn_proto::SendDatagramError::TooLarge) => {
+                self.note_bundle_refused(b, &quinn_proto::SendDatagramError::TooLarge);
                 // The path shrank under a bundle sealed for the old size. It
-                // can never go; its records are recovered by the loss path
-                // as if they had never been built.
+                // can never go, and it will never be acknowledged or judged,
+                // so nothing would ever tell the owners of its content: each
+                // record gets what an oversize datagram retired from the
+                // emission queue gets (a tile re-encoded, an H.264 frame lost
+                // to the manager, padding dropped).
                 tracing::warn!(
                     target: LOG_TARGET,
                     bundle_seq = b.bundle_seq,
                     len = b.bytes.len(),
                     "dropping a sealed bundle the path no longer carries"
                 );
-                self.transmission_ledger.forget_undeparted(b.bundle_seq);
+                let tracked = self.transmission_ledger.forget_undeparted(b.bundle_seq);
+                let contents = b.records.iter().map(|r| Some(r.content)).collect();
+                self.retire_oversize_contents(contents, tracked, now_std());
                 true
             }
-            Offer::Refused(_) => false,
+            Offer::Refused(e) => {
+                self.note_bundle_refused(b, &e);
+                false
+            }
+        }
+    }
+
+    /// Count and log quinn's refusal of a bundle. A bundle that stays refused
+    /// is one refusal, however often it is offered again: the count is what
+    /// quinn's backpressure cost, not how often the loop looked.
+    fn note_bundle_refused(&mut self, b: &SealedBundle, e: &quinn_proto::SendDatagramError) {
+        if matches!(e, quinn_proto::SendDatagramError::TooLarge) {
+            self.h264.stats.send_too_large += 1;
+        }
+        if self.last_refused_bundle == Some(b.bundle_seq) {
+            return;
+        }
+        self.last_refused_bundle = Some(b.bundle_seq);
+        self.datagram_send_errs = self.datagram_send_errs.saturating_add(1);
+        if !self.datagram_send_err_first_logged {
+            self.datagram_send_err_first_logged = true;
+            tracing::warn!(
+                target: LOG_TARGET,
+                error = ?e,
+                payload_len = b.bytes.len(),
+                "first send_datagram Err — QUIC backpressure or limit; \
+                 subsequent send failures will log at debug and a running \
+                 total appears in the per-frame `dispatch returned` log"
+            );
+        } else {
+            tracing::debug!(target: LOG_TARGET, error = ?e, "datagram send failed");
         }
     }
 
@@ -434,6 +479,7 @@ impl IoBridge {
         self.instr
             .offered
             .bill(WireClass::Control, control_dg, framing);
+        self.instr.offered.bundles += 1;
         self.instr.fifo_peak_at_enqueue = self.instr.fifo_peak_at_enqueue.max(queued);
         // Short bundles back to back in a non-empty FIFO can share a QUIC
         // packet; `queued` includes this bundle, so the FIFO before it is

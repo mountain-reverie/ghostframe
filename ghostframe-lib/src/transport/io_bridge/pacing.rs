@@ -293,7 +293,9 @@ impl IoBridge {
         let mut passes = 0;
         while stop == Stop::Empty && passes < MAX_PASSES_PER_PUMP {
             passes += 1;
-            let depth = self.live_fifo_depth().unwrap_or(0);
+            // The FIFO as it will stand once the bundles still waiting for
+            // quinn are in it: the same reading the per-datagram gate uses.
+            let depth = self.live_fifo_depth().unwrap_or(0) + self.unsent_bundle_bytes();
             if depth >= d_target {
                 stop = Stop::Depth;
                 break;

@@ -362,6 +362,47 @@ impl IoBridge {
         }
     }
 
+    /// `queued_at` and the probe tag of `content`, from whichever cache holds
+    /// it: the tile cache, the H.264 probe cache or the pad ring.
+    pub(super) fn cached_queued_at_and_probe(
+        &self,
+        content: &crate::transport::reliable_emitter::Content,
+    ) -> Option<(
+        std::time::Instant,
+        Option<crate::transport::reliable_emitter::cache::ProbeTag>,
+    )> {
+        use crate::transport::reliable_emitter::Content;
+        match content {
+            Content::Tile(k) => self
+                .reliable_emitter
+                .cache
+                .get(k)
+                .map(|e| (e.queued_at, e.probe)),
+            Content::H264Frag {
+                frame_seq,
+                frag_idx,
+            } => self
+                .reliable_emitter
+                .h264
+                .get(*frame_seq, *frag_idx)
+                .map(|e| (e.queued_at, e.probe)),
+            Content::Pad(ws) => self
+                .reliable_emitter
+                .pads
+                .get(*ws)
+                .map(|e| (e.queued_at, Some(e.probe))),
+        }
+    }
+
+    /// The probe cluster `content` was tagged for at emit time, if any.
+    pub(super) fn probe_tag_of(
+        &self,
+        content: &crate::transport::reliable_emitter::Content,
+    ) -> Option<crate::transport::reliable_emitter::cache::ProbeTag> {
+        self.cached_queued_at_and_probe(content)
+            .and_then(|(_, probe)| probe)
+    }
+
     /// Turn resolved ACKs into BWE samples. Must run before `on_ack`, which
     /// removes the cache entries the `queued_at` and probe reads need.
     fn record_ack_bwe_samples(
@@ -383,38 +424,61 @@ impl IoBridge {
                 // live acknowledgements made them.
                 continue;
             }
+            // BWE Stage 2.1: `queued_at -> ACK`, one sample per acknowledged
+            // record, not per transmission. A bundle carries several records
+            // that were queued at different moments, and the statistic is
+            // per-tile queueing delay: recording the first record alone
+            // would drop the others and make the delay of a bundle's
+            // followers invisible. Always >= the emit -> ACK latency of the
+            // same record. A record with no cache entry (a retired one) falls
+            // back to the departure's emit time. A lone control bundle has no
+            // record and so no sample: this is per-tile queueing.
+            {
+                let now_us = now_for_samples
+                    .saturating_duration_since(self.bwe_epoch)
+                    .as_micros() as u64;
+                let mut queued: SmallVec<[(PassTier, u64); 4]> = SmallVec::new();
+                for &(_, content) in tx.records.iter() {
+                    let tier = if content
+                        .tile()
+                        .is_none_or(|k| pass_tier(k.pass_idx) == PassTier::Critical)
+                    {
+                        PassTier::Critical
+                    } else {
+                        PassTier::Refinement
+                    };
+                    let since_us = self
+                        .cached_queued_at_and_probe(&content)
+                        .map(|(q, _)| {
+                            q.saturating_duration_since(self.bwe_epoch).as_micros() as u64
+                        })
+                        .unwrap_or(tx.emit_us);
+                    queued.push((tier, since_us));
+                }
+                for (tier, since_us) in queued {
+                    let latency = now_us.saturating_sub(since_us);
+                    match tier {
+                        PassTier::Critical => self.queued_critical_latency_stats.record(latency),
+                        PassTier::Refinement => {
+                            self.queued_refinement_latency_stats.record(latency)
+                        }
+                    }
+                }
+            }
             if self.bwe_samples_buffer.len() >= BWE_SAMPLES_BUFFER_CAPACITY {
                 break;
             }
             // One sample per transmission. `tile_key` / `content` read its
             // first record (the only one today); with several records the tier
             // and the cache read follow the plan's decision 6.
-            let Some(&(_, content)) = tx.records.first() else {
-                continue;
-            };
-            let content = &content;
+            // A lone control bundle (frame dimensions, a pong) has no record
+            // and no cache entry, but it was sent and it is acknowledged: it
+            // is a sample like any other (it is reported lost otherwise, and
+            // a delivery that goes unreported against it skews the estimate).
+            let first = tx.records.first().map(|&(_, content)| content);
             // `queued_at` and the probe tag come from whichever cache holds the
             // content: the tile cache, or the H.264 probe cache.
-            let cache_entry: Option<(std::time::Instant, Option<_>)> = match content {
-                crate::transport::reliable_emitter::Content::Tile(k) => self
-                    .reliable_emitter
-                    .cache
-                    .get(k)
-                    .map(|e| (e.queued_at, e.probe)),
-                crate::transport::reliable_emitter::Content::H264Frag {
-                    frame_seq,
-                    frag_idx,
-                } => self
-                    .reliable_emitter
-                    .h264
-                    .get(*frame_seq, *frag_idx)
-                    .map(|e| (e.queued_at, e.probe)),
-                crate::transport::reliable_emitter::Content::Pad(ws) => self
-                    .reliable_emitter
-                    .pads
-                    .get(*ws)
-                    .map(|e| (e.queued_at, Some(e.probe))),
-            };
+            let cache_entry = first.and_then(|content| self.cached_queued_at_and_probe(&content));
             let server_emit_us = tx.emit_us;
             let queued_since_epoch_us = cache_entry
                 .map(|(queued_at, _)| {
@@ -426,10 +490,11 @@ impl IoBridge {
             // A frame fragment is first-send, latency-critical traffic.
             // The most urgent tier among the records (plan decision 6): any
             // non-tile record, or a critical-pass tile, makes it Critical.
-            let tier = if tx.records.iter().any(|(_, c)| {
-                c.tile()
-                    .is_none_or(|k| pass_tier(k.pass_idx) == PassTier::Critical)
-            }) {
+            let tier = if tx.records.is_empty()
+                || tx.records.iter().any(|(_, c)| {
+                    c.tile()
+                        .is_none_or(|k| pass_tier(k.pass_idx) == PassTier::Critical)
+                }) {
                 PassTier::Critical
             } else {
                 PassTier::Refinement

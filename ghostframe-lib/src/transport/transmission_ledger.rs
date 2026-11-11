@@ -251,6 +251,12 @@ pub struct LedgerStats {
     /// being declared lost. Equal to `acked_after_declared_lost` (a tombstone
     /// resolves once); kept under the Eifel name.
     pub spurious_losses: u64,
+    /// Records (not transmissions) in the transmissions declared lost, by any
+    /// rule, and in those later contradicted. A bundle carries several records
+    /// and each is retransmitted on its own, so retransmissions per loss are
+    /// counted against these; their difference is the records really lost.
+    pub lost_records: u64,
+    pub spurious_lost_records: u64,
     /// The packet threshold now (3 to 8) and how often it has been raised.
     pub k_pkt: u64,
     pub k_pkt_raises: u64,
@@ -808,6 +814,7 @@ impl TransmissionLedger {
             self.stats.acked_after_declared_lost += 1;
             self.stats.spurious_losses += 1;
             let tx = t.tx;
+            self.stats.spurious_lost_records += tx.records.len() as u64;
             // An acknowledgement of a departure newer than any acknowledged so
             // far moves the reference the thresholds are judged against.
             let is_pad = tx.any_content(|c| matches!(c, Content::Pad(_)));
@@ -1230,6 +1237,7 @@ impl TransmissionLedger {
             eprintln!("RTOPROBE lost_ws ws={} reason={:?}", wire_seq, reason);
         }
         let tx = rec.tx;
+        self.stats.lost_records += tx.records.len() as u64;
         // Only packet-threshold verdicts adapt the packet threshold: a time or
         // probe verdict says nothing about reordering depth.
         let packet_verdict_no = (reason == LossReason::Packet).then(|| {

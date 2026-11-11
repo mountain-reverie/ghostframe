@@ -963,6 +963,8 @@ pub struct IoBridge {
     /// the receiver-side `loss_rate` doesn't include datagrams that
     /// never left the host.
     datagram_send_errs: u64,
+    /// The bundle quinn last refused, so a refusal that stands is one count.
+    last_refused_bundle: Option<u32>,
     /// Whether we've already logged a `warn!` for the first send-datagram
     /// error of the process's life. Subsequent errors increment the
     /// counter but log at `debug` to avoid 30 Hz warn-spam under
@@ -1607,6 +1609,7 @@ impl IoBridge {
             #[cfg(test)]
             test_wire: None,
             datagram_send_errs: 0,
+            last_refused_bundle: None,
             datagram_send_err_first_logged: false,
             offered_wire_bytes: 0.0,
             model,
@@ -2727,21 +2730,6 @@ impl IoBridge {
                 self.reliable_emitter
                     .rtt
                     .on_sample(std::time::Duration::from_micros(rtt_us));
-                // BWE Stage 2.1: `queued_at -> ACK`, alongside (not
-                // instead of) the `last_sent_at -> ACK` pair above.
-                // Starts earlier (when the work was queued rather than
-                // when it last left the wire), so this is always >=
-                // `ack_latency_us` for the same sample.
-                let queued_latency_us =
-                    elapsed_since_epoch_us.saturating_sub(s.queued_since_epoch_us);
-                match s.tier {
-                    PassTier::Critical => {
-                        self.queued_critical_latency_stats.record(queued_latency_us)
-                    }
-                    PassTier::Refinement => self
-                        .queued_refinement_latency_stats
-                        .record(queued_latency_us),
-                }
                 records.push(s.ack_arrival());
             }
             // quinn already measures path RTT for the scheduler; reuse it

@@ -26,6 +26,9 @@ pub(super) struct FecInboundStats {
     /// or record this server no longer (or never) held.
     pub(super) content_rejected_rx: u64,
     pub(super) content_rejected_unknown: u64,
+    /// The share handled as a tile re-encode and as an H.264 frame repair.
+    pub(super) content_rejected_tile: u64,
+    pub(super) content_rejected_h264: u64,
     /// RECOVERED ids received, and the share with no ledger record left.
     pub(super) recovered_rx: u64,
     pub(super) recovered_unknown: u64,
@@ -68,12 +71,26 @@ impl IoBridge {
                     .map(move |(sid, status, d)| (handle, sid, status, d))
             })
             .collect();
+        // Read after the bytes were taken: what a stream said before it ended
+        // is still in `feedback_data`, and is dispatched before its reader goes.
+        let ended: Vec<(ConnectionHandle, StreamId)> = self
+            .wt_sessions
+            .iter_mut()
+            .flat_map(|(&handle, wt)| {
+                wt.drain_ended_status_streams()
+                    .into_iter()
+                    .map(move |sid| (handle, sid))
+            })
+            .collect();
         for (handle, sid, status, data) in &feedback_data {
             if *status {
                 self.dispatch_status_bytes(*handle, *sid, data);
             } else {
                 self.dispatch_feedback_bytes(*handle, data);
             }
+        }
+        for key in ended {
+            self.status_streams.remove(&key);
         }
     }
 
@@ -173,11 +190,16 @@ impl IoBridge {
     }
 
     /// CONTENT_REJECTED `(bundle_seq, record_idx)`: the client received the
-    /// bundle and refused that record's content. Ask for it again as a loss
-    /// would (tile: queued; H.264 P fragment: the reference manager recovers;
-    /// IDR fragment: sent again). The bundle is read from the ledger, else from
-    /// the recent-bundle ring.
+    /// bundle and refused that record's content. Handled without the cache
+    /// entry (spec 4.9.3): the bundle's ACK may already have released it, and
+    /// re-sending cached bytes could fail prevalidation again. A tile is
+    /// re-encoded fresh (the oversize path: cancel in flight, invalidate the
+    /// baseline); an H.264 P fragment makes its frame suspect, as a loss
+    /// verdict does; an IDR fragment starts a new epoch. Congestion state is
+    /// untouched. The bundle is read from the ledger, else from the
+    /// recent-bundle ring.
     fn on_content_rejected(&mut self, id: u32, idx: u8) {
+        use crate::transport::reliable_emitter::Content;
         self.fec_in.content_rejected_rx += 1;
         let record = self
             .transmission_ledger
@@ -189,15 +211,26 @@ impl IoBridge {
                     .map(|r| r.get(usize::from(idx)).copied())
             })
             .flatten();
-        let Some((record_ws, content)) = record else {
+        let Some((_, content)) = record else {
             self.fec_in.content_rejected_unknown += 1;
             return;
         };
-        self.reliable_emitter.request_retransmit(
-            content,
-            record_ws,
-            crate::transport::reliable_emitter::RetxCause::Rejected,
-        );
+        match content {
+            Content::Tile(key) => {
+                self.fec_in.content_rejected_tile += 1;
+                self.cancel_in_flight_for_tile(key.tile_x, key.tile_y);
+                self.ensure_baseline_invalidated();
+            }
+            Content::H264Frag { frame_seq, .. } => {
+                if self.h264_refs_content_rejected(frame_seq, now_std()) {
+                    self.fec_in.content_rejected_h264 += 1;
+                } else {
+                    self.fec_in.content_rejected_unknown += 1;
+                }
+            }
+            // Padding carries nothing the picture needs.
+            Content::Pad(_) => self.fec_in.content_rejected_unknown += 1,
+        }
     }
 
     /// RECOVERED: the client rebuilt these bundles from repair symbols. Their

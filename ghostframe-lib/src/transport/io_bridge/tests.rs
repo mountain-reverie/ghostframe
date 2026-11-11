@@ -9835,3 +9835,173 @@ async fn a_routine_baseline_invalidation_marks_one_frame_not_a_grace() {
         "the frames after it are demand"
     );
 }
+
+// ---------------------------------------------------------------------------
+// CONTENT_REJECTED after the bundle's ACK v4 (spec 4.9.3: handled without the
+// cache entry, in either order)
+// ---------------------------------------------------------------------------
+
+/// The `(bundle_seq, record_idx)` of the record of `frame_seq`'s bundle that
+/// is an H.264 fragment, read from the recent-bundle ring (the ACK has resolved
+/// the ledger).
+fn rejected_h264_target(bridge: &IoBridge, ids: &[u32], frame_seq: u32) -> (u32, u8) {
+    use crate::transport::reliable_emitter::Content;
+    for id in ids {
+        let recs = bridge.recent_bundles.get(*id).expect("ring holds it");
+        for (i, (_, c)) in recs.iter().enumerate() {
+            if matches!(c, Content::H264Frag { frame_seq: f, .. } if *f == frame_seq) {
+                return (*id, i as u8);
+            }
+        }
+    }
+    panic!("no record of frame {frame_seq}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn content_rejected_after_the_ack_re_encodes_the_tile() {
+    use crate::transport::reliable_emitter::{Content, EmitKey};
+    use ghostframe_protocol::fec::repair_status::StatusRecord;
+    let (mut bridge, _peer) = bridge_with_backend(RecordingBackend::default());
+    crate::transport::io_bridge::test_ack::attach_test_wire(&mut bridge);
+    let now = now_std();
+    let key = EmitKey::new(100, 1, 2, 0);
+    let mut frag = vec![0u8; 20];
+    frag[12..16].copy_from_slice(&1_000_000u32.to_be_bytes());
+    bridge
+        .reliable_emitter
+        .submit_one(key, bytes::Bytes::from(frag), now, None, now);
+    let e = bridge.reliable_emitter.take_transmissions().remove(0);
+    assert_eq!(e.content, Content::Tile(key), "premise");
+    bridge.transmission_ledger.record_departed(
+        e.wire_seq,
+        now,
+        crate::transport::transmission_ledger::Transmission {
+            emit_us: e.emit_us,
+            wire_bytes: e.wire_bytes,
+            records: smallvec::smallvec![(e.wire_seq, e.content)],
+            depart_us: None,
+            dep_idx: None,
+        },
+    );
+    crate::transport::io_bridge::test_ack::ack_bundles(&mut bridge, &[e.wire_seq]);
+    assert!(
+        bridge.transmission_ledger.peek(e.wire_seq).is_none(),
+        "premise: acked"
+    );
+    bridge.pending_controls.clear();
+
+    bridge.handle_status_record(StatusRecord::ContentRejected(vec![(e.wire_seq, 0)]));
+
+    assert!(
+        bridge
+            .pending_controls
+            .contains(&Control::InvalidateBaseline(1)),
+        "the tile is re-encoded fresh: {:?}",
+        bridge.pending_controls
+    );
+    assert_eq!(bridge.fec_in.content_rejected_tile, 1);
+    assert_eq!(bridge.fec_in.content_rejected_unknown, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn content_rejected_after_the_ack_makes_a_p_frame_suspect() {
+    use crate::encoder::h264::tracker::FrameState;
+    use ghostframe_protocol::fec::repair_status::StatusRecord;
+    let mut bridge = acked_refs_bridge();
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    ack_every_fragment(&mut bridge, 0);
+    bridge.dispatch_frame_ack_for_test(frame_ack_datagram(0, 1, 0));
+    tokio::time::advance(std::time::Duration::from_millis(33)).await;
+    plan_commit(&mut bridge, 1).expect("a P");
+    bridge.record_emitted_transmissions(now_std());
+    let ids = crate::transport::io_bridge::test_ack::bundles_of_h264_frame(&mut bridge, 1);
+    crate::transport::io_bridge::test_ack::depart_bundles(&mut bridge, &ids);
+    crate::transport::io_bridge::test_ack::ack_bundles(&mut bridge, &ids);
+    let state = |b: &IoBridge| b.h264.refs.as_ref().unwrap().mgr.frame_state(1);
+    assert_eq!(
+        state(&bridge),
+        Some(FrameState::Sent),
+        "premise: acked, not suspect"
+    );
+    let (id, idx) = rejected_h264_target(&bridge, &ids, 1);
+
+    bridge.handle_status_record(StatusRecord::ContentRejected(vec![(id, idx)]));
+
+    assert_eq!(state(&bridge), Some(FrameState::Suspect));
+    assert_eq!(bridge.fec_in.content_rejected_h264, 1);
+    // A repeat is idempotent.
+    bridge.handle_status_record(StatusRecord::ContentRejected(vec![(id, idx)]));
+    assert_eq!(state(&bridge), Some(FrameState::Suspect));
+}
+
+#[tokio::test(start_paused = true)]
+async fn content_rejected_after_the_ack_requests_a_new_idr() {
+    use crate::encoder::h264::refs::IdrCause as RefIdrCause;
+    use ghostframe_protocol::fec::repair_status::StatusRecord;
+    let mut bridge = acked_refs_bridge();
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    bridge.record_emitted_transmissions(now_std());
+    let ids = crate::transport::io_bridge::test_ack::bundles_of_h264_frame(&mut bridge, 0);
+    crate::transport::io_bridge::test_ack::depart_bundles(&mut bridge, &ids);
+    crate::transport::io_bridge::test_ack::ack_bundles(&mut bridge, &ids);
+    let (id, idx) = rejected_h264_target(&bridge, &ids, 0);
+    assert_eq!(
+        bridge.h264.refs.as_ref().unwrap().mgr.pending_idr(),
+        None,
+        "premise"
+    );
+
+    bridge.handle_status_record(StatusRecord::ContentRejected(vec![(id, idx)]));
+
+    assert_eq!(
+        bridge.h264.refs.as_ref().unwrap().mgr.pending_idr(),
+        Some(RefIdrCause::ContentRejected)
+    );
+    tokio::time::advance(std::time::Duration::from_millis(33)).await;
+    plan_commit(&mut bridge, 1).expect("the new IDR");
+    assert_eq!(bridge.h264_refs_report().idr_content_rejected, 1);
+    assert_eq!(
+        bridge.h264.stats.idr_by_cause[IdrCause::ContentRejected.index()],
+        1
+    );
+}
+
+/// A sealed bundle the path no longer carries (`TooLarge` at quinn) gives its
+/// H.264 records what an oversize datagram gets: the IDR is dead and is sent
+/// again, and each fragment is counted forgotten.
+#[tokio::test(start_paused = true)]
+async fn a_sealed_bundle_refused_as_too_large_abandons_its_idr() {
+    use crate::encoder::h264::tracker::FrameState;
+    let mut bridge = acked_refs_bridge();
+    // Hold the fragments in the emitter until the wire refuses.
+    bridge.forced_fifo_depth_for_test = Some(usize::MAX / 2);
+    plan_commit(&mut bridge, 0).expect("the IDR");
+    bridge.record_emitted_transmissions(now_std());
+    bridge.forced_fifo_depth_for_test = None;
+    bridge.test_wire.as_mut().unwrap().too_large = true;
+    bridge.drain_reliable_emitter(now_std());
+    bridge.flush_bundles();
+
+    assert_eq!(
+        bridge.test_wire.as_ref().unwrap().cum,
+        0,
+        "premise: none sent"
+    );
+    assert!(
+        bridge.h264.stats.oversize_h264 > 0,
+        "premise: fragments retired"
+    );
+    assert!(bridge.transmission_ledger.is_empty(), "forgotten");
+    assert!(
+        bridge.h264.stats.tx_forgotten >= bridge.h264.stats.oversize_h264,
+        "each retired H.264 record is counted forgotten: {:?}",
+        bridge.h264.stats
+    );
+    let r = bridge.h264_refs_report();
+    assert!(r.mtu_retired >= 1 && r.mtu_retired_idr == 1, "{r:?}");
+    assert_eq!(
+        bridge.h264.refs.as_ref().unwrap().mgr.frame_state(0),
+        Some(FrameState::Dead)
+    );
+    assert_eq!(bridge.reliable_emitter.queued_h264_bytes(), 0);
+}
