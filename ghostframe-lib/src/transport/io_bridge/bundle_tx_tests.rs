@@ -200,6 +200,13 @@ async fn offered_bytes_equal_what_quinn_accepted_under_framing() {
         cum,
         "records + 2, the frame header and the framing as Control"
     );
+    // One bundle is one datagram, however many records (and billing
+    // entries) it carries.
+    assert_eq!(b.instr.offered.bundles, b.sent_frames_for_test.len() as u64);
+    assert!(
+        b.instr.offered.datagrams.iter().sum::<u64>() > b.instr.offered.bundles,
+        "premise: bundles hold several records"
+    );
     // Every byte billed to the bucket is a byte offered: records at the
     // drain (not run under a gate here), the rest as soft charges.
     let recs: u64 = [WireClass::Critical, WireClass::H264, WireClass::Control]
@@ -525,4 +532,74 @@ async fn a_standing_refusal_is_counted_once_and_stops_the_drain_before_the_next_
     b.test_wire.as_mut().unwrap().blocked = true;
     b.drain_reliable_emitter(now_std());
     assert_eq!(b.datagram_send_errs, 2);
+}
+
+/// A record with a `wire_seq` but no parked meta (the meta table was cleared)
+/// is ledgered as what its header says it is and billed as its class, not
+/// sent as a content-less control frame.
+#[tokio::test]
+async fn a_record_without_parked_meta_is_ledgered_from_its_header() {
+    use ghostframe_protocol::protocol::FrameHeader;
+    let mut b = framed_bridge();
+    let mut dg = Vec::new();
+    FrameHeader {
+        frame_seq: 5,
+        frag_idx: 2,
+        frag_total: 4,
+        wire_seq: 77,
+        timestamp_us: 0,
+        flags: 0,
+        slots: 0,
+        ref_frame_seq: 0,
+    }
+    .encode(&mut dg);
+    dg.resize(120, 0);
+    assert!(b.emitted_meta.is_empty(), "premise: no parked meta");
+
+    b.send_counted_framed(&dg, WireClass::H264, Some(77));
+    assert!(b.flush_bundles());
+
+    let id = frame_seq(&b.sent_frames_for_test[0]);
+    let tx = b.transmission_ledger.peek(id).expect("ledgered");
+    assert_eq!(
+        tx.records.as_slice(),
+        &[(
+            77,
+            Content::H264Frag {
+                frame_seq: 5,
+                frag_idx: 2
+            }
+        )]
+    );
+    assert!(
+        b.instr.offered.of(WireClass::H264) >= 120,
+        "billed as its class"
+    );
+}
+
+/// A lone control bundle (frame dimensions, a pong) carries no record, but its
+/// acknowledgement is still a delivery: one Critical sample, no probe.
+#[tokio::test(start_paused = true)]
+async fn an_acknowledged_lone_control_bundle_is_a_bwe_sample() {
+    use crate::transport::io_bridge::bwe_glue::PassTier;
+    let mut b = framed_bridge();
+    b.emit_frame_dimensions(1, 0, 160, 96);
+    b.flush_bundles();
+    let id = frame_seq(&b.sent_frames_for_test[0]);
+    assert!(
+        b.transmission_ledger
+            .peek(id)
+            .expect("ledgered")
+            .records
+            .is_empty(),
+        "premise: no record"
+    );
+    b.stamp_departure(id, now_std());
+    ack_v4(&mut b, &[id]);
+
+    assert_eq!(b.bwe_samples_buffer.len(), 1);
+    let s = &b.bwe_samples_buffer[0];
+    assert_eq!(s.tier, PassTier::Critical);
+    assert!(s.probe.is_none());
+    assert_eq!(s.size_bytes as usize, b.sent_frames_for_test[0].len());
 }

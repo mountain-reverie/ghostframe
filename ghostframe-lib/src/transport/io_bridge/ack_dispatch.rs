@@ -389,32 +389,34 @@ impl IoBridge {
             // One sample per transmission. `tile_key` / `content` read its
             // first record (the only one today); with several records the tier
             // and the cache read follow the plan's decision 6.
-            let Some(&(_, content)) = tx.records.first() else {
-                continue;
-            };
-            let content = &content;
+            // A lone control bundle (frame dimensions, a pong) has no record
+            // and no cache entry, but it was sent and it is acknowledged: it
+            // is a sample like any other (it is reported lost otherwise, and
+            // a delivery that goes unreported against it skews the estimate).
+            let first = tx.records.first().map(|&(_, content)| content);
             // `queued_at` and the probe tag come from whichever cache holds the
             // content: the tile cache, or the H.264 probe cache.
-            let cache_entry: Option<(std::time::Instant, Option<_>)> = match content {
-                crate::transport::reliable_emitter::Content::Tile(k) => self
-                    .reliable_emitter
-                    .cache
-                    .get(k)
-                    .map(|e| (e.queued_at, e.probe)),
-                crate::transport::reliable_emitter::Content::H264Frag {
-                    frame_seq,
-                    frag_idx,
-                } => self
-                    .reliable_emitter
-                    .h264
-                    .get(*frame_seq, *frag_idx)
-                    .map(|e| (e.queued_at, e.probe)),
-                crate::transport::reliable_emitter::Content::Pad(ws) => self
-                    .reliable_emitter
-                    .pads
-                    .get(*ws)
-                    .map(|e| (e.queued_at, Some(e.probe))),
-            };
+            let cache_entry: Option<(std::time::Instant, Option<_>)> =
+                first.and_then(|content| match &content {
+                    crate::transport::reliable_emitter::Content::Tile(k) => self
+                        .reliable_emitter
+                        .cache
+                        .get(k)
+                        .map(|e| (e.queued_at, e.probe)),
+                    crate::transport::reliable_emitter::Content::H264Frag {
+                        frame_seq,
+                        frag_idx,
+                    } => self
+                        .reliable_emitter
+                        .h264
+                        .get(*frame_seq, *frag_idx)
+                        .map(|e| (e.queued_at, e.probe)),
+                    crate::transport::reliable_emitter::Content::Pad(ws) => self
+                        .reliable_emitter
+                        .pads
+                        .get(*ws)
+                        .map(|e| (e.queued_at, Some(e.probe))),
+                });
             let server_emit_us = tx.emit_us;
             let queued_since_epoch_us = cache_entry
                 .map(|(queued_at, _)| {
@@ -426,10 +428,11 @@ impl IoBridge {
             // A frame fragment is first-send, latency-critical traffic.
             // The most urgent tier among the records (plan decision 6): any
             // non-tile record, or a critical-pass tile, makes it Critical.
-            let tier = if tx.records.iter().any(|(_, c)| {
-                c.tile()
-                    .is_none_or(|k| pass_tier(k.pass_idx) == PassTier::Critical)
-            }) {
+            let tier = if tx.records.is_empty()
+                || tx.records.iter().any(|(_, c)| {
+                    c.tile()
+                        .is_none_or(|k| pass_tier(k.pass_idx) == PassTier::Critical)
+                }) {
                 PassTier::Critical
             } else {
                 PassTier::Refinement

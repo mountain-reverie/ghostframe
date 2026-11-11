@@ -27,7 +27,13 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct OfferedBytes {
     pub bytes: [u64; WireClass::COUNT],
+    /// Billing entries per class: one per record, and one `Control` entry per
+    /// bundle for its frame header. Not the number of datagrams quinn took;
+    /// that is `bundles`.
     pub datagrams: [u64; WireClass::COUNT],
+    /// Bundles accepted by quinn: one datagram each, and one departure-tracker
+    /// entry each.
+    pub bundles: u64,
     /// WebTransport framing added in front of every datagram.
     pub overhead: u64,
 }

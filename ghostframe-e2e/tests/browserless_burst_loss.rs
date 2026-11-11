@@ -358,9 +358,17 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
         "{n}: the peak at enqueue cannot be below the post-drain maximum"
     );
     assert!(i.fifo_depth_mean > 0, "{n}: time-weighted mean is zero");
+    // The slope is an integer of bytes/s over a FIFO that stands empty on
+    // all but ~2 % of turns, so a flat last quarter legitimately reads 0 (and
+    // reads 0, 3 or 4 from run to run of the same scene): it is not a probe
+    // of whether the series ran. `fifo_samples` and `fifo_depth_max` above are.
+    // What is a property is that it stays inside what the depth could do: the
+    // whole maximum within a millisecond.
     assert!(
-        i.fifo_depth_slope_last_quarter_bps != 0,
-        "{n}: slope is zero"
+        i.fifo_depth_slope_last_quarter_bps.unsigned_abs() <= i.fifo_depth_max * 1000,
+        "{n}: slope {} B/s outside what a depth of {} B allows",
+        i.fifo_depth_slope_last_quarter_bps,
+        i.fifo_depth_max
     );
     assert!(i.quinn_limited_turns > 0, "{n}: no quinn-limited turn");
     assert!(i.quinn_limited_turns <= i.fifo_samples);
@@ -387,14 +395,17 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
         i.quinn_bytes_enqueued
     );
     // Departure tracker: every datagram quinn accepted for the live session
-    // (tiles, H.264, dimensions, pongs) is either stamped or still
-    // queued. Eviction notices are the one exception and none are sent here.
-    let all: u64 = i.offered.datagrams.iter().sum();
+    // is either stamped or still queued. Since rev 6 framing a datagram is a
+    // bundle, and the tracker holds one entry per bundle, not per record
+    // (`offered.datagrams` counts records and a header entry per bundle, so
+    // it is no longer the unit: this compares bundles with bundles).
+    // Eviction notices are the one exception and none are sent here.
+    let all: u64 = i.offered.bundles;
     assert!(i.lag_samples > 0, "{n}: no departure was stamped");
     assert_eq!(
         i.lag_samples + i.mirror_len,
         all,
-        "{n}: tracker lost track of datagrams: stamped {} + queued {}",
+        "{n}: tracker lost track of bundles: stamped {} + queued {}",
         i.lag_samples,
         i.mirror_len
     );

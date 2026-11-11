@@ -71,12 +71,26 @@ impl IoBridge {
                     .map(move |(sid, status, d)| (handle, sid, status, d))
             })
             .collect();
+        // Read after the bytes were taken: what a stream said before it ended
+        // is still in `feedback_data`, and is dispatched before its reader goes.
+        let ended: Vec<(ConnectionHandle, StreamId)> = self
+            .wt_sessions
+            .iter_mut()
+            .flat_map(|(&handle, wt)| {
+                wt.drain_ended_status_streams()
+                    .into_iter()
+                    .map(move |sid| (handle, sid))
+            })
+            .collect();
         for (handle, sid, status, data) in &feedback_data {
             if *status {
                 self.dispatch_status_bytes(*handle, *sid, data);
             } else {
                 self.dispatch_feedback_bytes(*handle, data);
             }
+        }
+        for key in ended {
+            self.status_streams.remove(&key);
         }
     }
 

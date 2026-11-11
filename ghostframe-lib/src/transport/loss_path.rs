@@ -40,6 +40,9 @@ pub(crate) struct Outcome {
     /// Outstanding H.264 fragments the probe found with no content to send
     /// (trimmed or superseded): forgotten with no verdict, so not in `lost`.
     pub forgotten: Vec<u32>,
+    /// The H.264 fragments among the records of those transmissions: the
+    /// ledger identity counts fragments, not bundles.
+    pub forgotten_h264_records: u64,
 }
 
 /// Declare lost what the acknowledgements so far put out of contention (packet
@@ -147,6 +150,15 @@ pub(crate) fn probe(
                 if gone_h264 {
                     if ledger.forget_outstanding(ws).is_some() {
                         out.forgotten.push(ws);
+                        out.forgotten_h264_records += tx
+                            .records()
+                            .filter(|(_, c)| {
+                                matches!(
+                                    c,
+                                    crate::transport::reliable_emitter::Content::H264Frag { .. }
+                                )
+                            })
+                            .count() as u64;
                         removed = true;
                     }
                 } else if let Some(tx) = ledger.declare_lost_by_pto(ws) {
@@ -600,6 +612,51 @@ mod h264_tests {
             e.request_retransmit(copy.content, orig, RetxCause::Loss),
             RetxRequest::ContentGone
         );
+    }
+
+    /// The ledger identity counts H.264 fragments, so a bundle of several
+    /// forgotten by the probe counts once per fragment, not once.
+    #[test]
+    fn a_forgotten_bundle_counts_each_of_its_h264_fragments() {
+        use crate::transport::reliable_emitter::Content;
+        let t0 = Instant::now();
+        let (mut e, _l, _sent) = sent_frames(5, 8, t0);
+        e.h264.clear();
+        e.submit_one(
+            crate::transport::reliable_emitter::EmitKey::new(99, 0, 0, 0),
+            pass(99),
+            t0,
+            None,
+            t0,
+        );
+        e.on_departed(0, t0);
+        let mut l = TransmissionLedger::new(4096);
+        let records: smallvec::SmallVec<[(u32, Content); 4]> = (0..3u32)
+            .map(|i| {
+                (
+                    900 + i,
+                    Content::H264Frag {
+                        frame_seq: 7,
+                        frag_idx: i as u16,
+                    },
+                )
+            })
+            .collect();
+        l.record_departed(
+            1000,
+            t0,
+            Transmission {
+                emit_us: 0,
+                wire_bytes: 3000,
+                records,
+                depart_us: None,
+                dep_idx: None,
+            },
+        );
+        let due = e.pto_deadline().expect("armed");
+        let out = probe(&mut l, &mut e, due).expect("due");
+        assert_eq!(out.forgotten.len(), 1, "one bundle");
+        assert_eq!(out.forgotten_h264_records, 3, "three fragments");
     }
 
     /// Fragments the emitter holds no entry for (trimmed, or superseded) are
