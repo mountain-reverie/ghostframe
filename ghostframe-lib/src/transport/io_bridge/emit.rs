@@ -940,8 +940,10 @@ impl IoBridge {
                 // cluster's running total *before* this datagram (goog_cc's
                 // `probe_cluster_bytes_sent` semantics), so it must be read
                 // before `bytes_sent` is advanced by this datagram's size.
-                let dg_len =
-                    crate::transport::fec_tx::packer::Packer::lone_bundle_len(dg.len()) as i64;
+                let dg_len = crate::transport::fec_tx::packer::Packer::lone_bundle_len(
+                    dg.len(),
+                    crate::transport::fec_tx::packer::BundleKind::Plain,
+                ) as i64;
                 let probe_tag = self.active_probe.as_mut().map(|p| {
                     let tag = crate::transport::reliable_emitter::cache::ProbeTag {
                         id: p.id,

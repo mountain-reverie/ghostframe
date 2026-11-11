@@ -402,7 +402,7 @@ async fn forgetting_the_live_session_resets_the_packer() {
     b.drain_reliable_emitter(now_std());
     assert!(b.sent_frames_for_test.is_empty(), "records are open");
     b.forget_session(H);
-    assert!(b.packer.flush().is_none(), "the open bundle is gone");
+    assert!(b.packer.flush(0).is_none(), "the open bundle is gone");
     assert!(b.pending_bundles.is_empty());
 }
 
@@ -435,6 +435,7 @@ fn sized_bundle(len: usize) -> crate::transport::fec_tx::packer::SealedBundle {
         bytes: vec![0; len],
         records: Default::default(),
         emit_us: 0,
+        kind: crate::transport::fec_tx::packer::BundleKind::Plain,
     }
 }
 
@@ -602,4 +603,67 @@ async fn an_acknowledged_lone_control_bundle_is_a_bwe_sample() {
     assert_eq!(s.tier, PassTier::Critical);
     assert!(s.probe.is_none());
     assert_eq!(s.size_bytes as usize, b.sent_frames_for_test[0].len());
+}
+
+const GOLDEN_FRAMES: usize = 12;
+const GOLDEN_DIGEST: u64 = 0x7ca8_58bd_97c7_010f;
+
+/// FNV-1a over every sent frame, length-prefixed. Bytes 12..16 of a record
+/// are the datagram header's wall-clock `timestamp_us`; they are zeroed so the
+/// digest does not depend on when the test ran.
+fn frames_digest(frames: &[Vec<u8>]) -> (usize, u64) {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for &x in bytes {
+            h ^= u64::from(x);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    for f in frames {
+        let mut f = f.clone();
+        if let Frame::Plain(p) = parse(&f).expect("a frame") {
+            let base = f.as_ptr() as usize;
+            let spans: Vec<(usize, usize)> = records(p.records)
+                .map(|r| {
+                    let r = r.unwrap();
+                    (r.as_ptr() as usize - base, r.len())
+                })
+                .collect();
+            for (off, len) in spans {
+                if len >= 16 {
+                    f[off + 12..off + 16].fill(0);
+                }
+            }
+        }
+        eat(&(f.len() as u32).to_be_bytes());
+        eat(&f);
+    }
+    (frames.len(), h)
+}
+
+/// Knob-off byte identity (R6-d D2 step 0). The scene is scripted and the
+/// digest was recorded at the R6-c tip (d494b094), before any block code
+/// existed. With the knob off every later step must reproduce it exactly.
+#[tokio::test]
+async fn knob_off_sent_frames_match_the_r6c_golden() {
+    let mut b = framed_bridge();
+    submit_tiles(&mut b, 10);
+    let now = now_std();
+    let template = bytes::Bytes::from(vec![7u8; 100]);
+    let probe = ProbeTag {
+        id: 1,
+        min_probes: 1,
+        min_bytes: 1,
+        bytes_sent_before: 0,
+    };
+    b.reliable_emitter.submit_h264_pad(&template, probe, now);
+    submit_tiles(&mut b, 4);
+    send_all(&mut b);
+    b.emit_frame_dimensions(3, 0, 160, 96);
+    b.send_pong_framed(H, &[0x05, 1, 2, 3]);
+    submit_tiles(&mut b, 7);
+    send_all(&mut b);
+    let (n, digest) = frames_digest(&b.sent_frames_for_test);
+    println!("GOLDEN frames={n} digest={digest:#018x}");
+    assert_eq!((n, digest), (GOLDEN_FRAMES, GOLDEN_DIGEST));
 }

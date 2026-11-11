@@ -219,6 +219,7 @@ impl IoBridge {
             return SendOutcome::Rejected;
         }
         let now = now_std();
+        let now_us = self.reliable_emitter.emit_us64(now);
         let max_dg = match self.live_max_dg() {
             Some(m) if self.framed_sink_present() => m,
             _ => {
@@ -259,11 +260,13 @@ impl IoBridge {
                     is_pad: matches!(e.content, Content::Pad(_)),
                     is_probe: self.probe_tag_of(&e.content).is_some(),
                     len: dg.len(),
+                    // Blocks are not wired in yet (R6-d D4).
+                    protect: false,
                 };
-                self.packer.push(dg, meta, max_dg)
+                self.packer.push(dg, meta, max_dg, now_us)
             }
             // A control datagram (frame dimensions): a lone PLAIN frame.
-            None => self.packer.lone(dg, max_dg),
+            None => self.packer.lone(dg, max_dg, now_us),
         };
         self.queue_bundles(sealed);
         self.drive_pending_bundles();
@@ -301,7 +304,7 @@ impl IoBridge {
             return false;
         };
         let mut ok = false;
-        for b in Packer::new().lone(dg, max_dg) {
+        for b in Packer::new().lone(dg, max_dg, 0) {
             ok = wt.send_datagram(conn, &b.bytes).is_ok();
         }
         ok
@@ -340,7 +343,8 @@ impl IoBridge {
     /// Seal the open bundle and offer every pending one to quinn. True when
     /// none is left standing.
     pub(super) fn flush_bundles(&mut self) -> bool {
-        if let Some(b) = self.packer.flush() {
+        let now_us = self.reliable_emitter.emit_us64(now_std());
+        if let Some(b) = self.packer.flush(now_us) {
             self.queue_bundles(SmallVec::from_elem(b, 1));
         }
         self.drive_pending_bundles()
