@@ -1766,6 +1766,7 @@ impl IoBridge {
         // `h264_probe_raise`); on any other stream only an IDR is.
         let tag_p = self.h264_raise_enabled();
         let mut tagged = false;
+        let lone_kind = self.probe_bundle_kind();
         for (i, dg) in datagrams.into_iter().enumerate() {
             let probe = self
                 .active_probe
@@ -1782,7 +1783,7 @@ impl IoBridge {
                     p.bytes_sent = p.bytes_sent.saturating_add(
                         crate::transport::fec_tx::packer::Packer::lone_bundle_len(
                             dg.len(),
-                            crate::transport::fec_tx::packer::BundleKind::Plain,
+                            lone_kind,
                         ) as i64,
                     );
                     p.packets_sent = p.packets_sent.saturating_add(1);
@@ -2621,6 +2622,30 @@ impl IoBridge {
                 client_residual = tp.report_residual,
                 "fec v2 inbound (status stream, repair requests, last loss report; cumulative)"
             );
+
+            // FEC v2 rev 6 block send side (R6-d): closes by cause, repairs.
+            if self.fec_blocks.is_some() {
+                let bt = self.block_tx;
+                let closed = bt.closed_kmax + bt.closed_time + bt.closed_empty + bt.closed_mtu;
+                tracing::info!(
+                    target: LOG_TARGET,
+                    frame_seq = seq,
+                    blocks_closed_kmax = bt.closed_kmax,
+                    blocks_closed_time = bt.closed_time,
+                    blocks_closed_empty = bt.closed_empty,
+                    blocks_closed_mtu = bt.closed_mtu,
+                    block_k_mean = if closed > 0 { bt.k_sum as f64 / closed as f64 } else { 0.0 },
+                    repairs_sent = bt.repairs_sent,
+                    repair_bytes = bt.repair_bytes,
+                    repairs_queued_peak = bt.repairs_queued_peak,
+                    repairs_dropped_mtu = bt.repairs_dropped_mtu,
+                    repair_encode_failed = bt.encode_failed,
+                    blocks_open = self.block_table.open_blocks(),
+                    block_evicted = self.block_table.stats().block_evicted,
+                    block_actions_dropped = bt.actions_dropped,
+                    "fec v2 blocks (closes by cause, repairs sent; cumulative)"
+                );
+            }
 
             // The H.264 transport: IDRs by cause, how the loss path treated
             // H.264 fragments, what the backpressure skip held back, and

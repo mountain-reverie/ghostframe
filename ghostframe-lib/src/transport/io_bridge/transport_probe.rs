@@ -142,6 +142,8 @@ impl IoBridge {
         // quinn has not taken and the parked record meta are the old
         // session's too.
         self.packer.reset();
+        self.block_table.reset();
+        self.pending_repairs.clear();
         self.pending_bundles.clear();
         self.last_refused_bundle = None;
         self.last_enqueued_was_short = false;
