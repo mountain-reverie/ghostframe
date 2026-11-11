@@ -56,7 +56,7 @@ impl Packer {
             .saturating_sub(FEC_RECORD_LEN_PREFIX)
     }
 
-    fn alloc_seq(&mut self) -> u32 {
+    pub(crate) fn alloc_seq(&mut self) -> u32 {
         if self.next_seq == NO_ACK {
             self.next_seq = 0;
         }

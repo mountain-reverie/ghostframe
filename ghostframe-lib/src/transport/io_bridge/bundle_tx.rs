@@ -195,19 +195,36 @@ impl IoBridge {
     }
 
     /// A record consumed before it reached the wire by a harness hook (the
-    /// loss injector, the drop plan). Without framing it departs and is lost;
-    /// with it the record is simply not in any bundle (a content loss, not a
-    /// network one: the bundle it would have shared still departs).
+    /// loss injector, the drop plan). Without framing it departs and is lost.
+    /// With it the record becomes a transmission of its own, keyed by a
+    /// `bundle_seq` taken from the packer (the client sees the gap and counts
+    /// a pre-FEC loss, which is what it is), and departs now without ever
+    /// being offered to quinn: the loss path declares it lost and
+    /// retransmits it, as it does an unframed datagram. Like the unframed
+    /// path it bills nothing here; the drain already admitted the record.
     #[cfg(any(test, feature = "test-loss-injection"))]
-    pub(super) fn consumed_before_wire(&mut self, wire_seq: Option<u32>) {
+    pub(super) fn consumed_before_wire(&mut self, wire_seq: Option<u32>, dg_len: usize) {
         if !self.fec_framing {
             self.departed_without_quinn(wire_seq);
             return;
         }
-        if let Some(ws) = wire_seq {
-            self.record_emitted_transmissions(now_std());
-            self.emitted_meta.remove(&ws);
-        }
+        let Some(ws) = wire_seq else { return };
+        let now = now_std();
+        self.record_emitted_transmissions(now);
+        let Some(e) = self.emitted_meta.remove(&ws) else {
+            return;
+        };
+        let bundle_seq = self.packer.alloc_seq();
+        let wire_bytes = dg_len
+            + ghostframe_protocol::fec::frame::FEC_PLAIN_HEADER_LEN
+            + FEC_RECORD_LEN_PREFIX
+            + self.live_framing_len();
+        self.transmission_ledger.record(
+            bundle_seq,
+            now,
+            Transmission::single(e.emit_us, wire_bytes, e.wire_seq, e.content, None, None),
+        );
+        self.stamp_departure(bundle_seq, now);
     }
 
     /// The framed half of `send_counted`. The record (or control datagram,
