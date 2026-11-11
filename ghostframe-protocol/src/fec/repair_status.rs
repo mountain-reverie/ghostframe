@@ -6,6 +6,11 @@ pub const FEC_STATUS_RECOVERED: u8 = 0x10;
 pub const FEC_STATUS_CONTENT_REJECTED: u8 = 0x11;
 pub const FEC_STATUS_DECLINED: u8 = 0x12;
 pub const FEC_STATUS_MAX_RECORD_BODY: usize = 1020;
+/// First byte of the repair-status bidi stream, before the first record. The
+/// server routes every client-opened bidi stream to its feedback handler, so
+/// this tag tells it which stream it is looking at. No feedback-stream message
+/// type is >= 0x80, so a feedback stream never begins with it.
+pub const FEC_REPAIR_STATUS_STREAM_TAG: u8 = 0xF5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeclineReason {
