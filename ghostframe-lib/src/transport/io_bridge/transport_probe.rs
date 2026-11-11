@@ -340,6 +340,8 @@ impl IoBridge {
             loss_by_time_threshold: self.transmission_ledger.stats().lost_time_threshold,
             loss_by_pto: self.transmission_ledger.stats().lost_pto,
             ledger_spurious_losses: self.transmission_ledger.stats().spurious_losses,
+            ledger_lost_records: self.transmission_ledger.stats().lost_records,
+            ledger_spurious_lost_records: self.transmission_ledger.stats().spurious_lost_records,
             k_pkt: self.transmission_ledger.stats().k_pkt,
             k_pkt_raises: self.transmission_ledger.stats().k_pkt_raises,
             reo_wnd_us: self.transmission_ledger.stats().reo_wnd_us,

@@ -630,6 +630,10 @@ pub struct InstrumentSummary {
     pub loss_by_time_threshold: u64,
     pub loss_by_pto: u64,
     pub ledger_spurious_losses: u64,
+    /// Records in the transmissions the ledger declared lost, and in those
+    /// later contradicted (see `LedgerStats::lost_records`).
+    pub ledger_lost_records: u64,
+    pub ledger_spurious_lost_records: u64,
     pub k_pkt: u64,
     pub k_pkt_raises: u64,
     /// The reordering window now (microseconds), its raises, and the largest
