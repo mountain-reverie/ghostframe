@@ -47,6 +47,12 @@ bytes = { version = "=1.11.1" }
 # thiserror 2.0.18 — latest stable 2.x
 thiserror = { version = "=2.0.18" }
 
+# rusty_erasure 0.4.3 — GF(2^8) Reed-Solomon (ISA-L port, MIT OR Apache-2.0).
+# Pinned: owner decision 2026-11-07 (docs/specs/fec-v2/fec-v2-rev6.md §8 item 1).
+# A young crate with one maintainer; ghostframe-protocol's fec::oracle is the
+# differential check that it still computes our code.
+rusty_erasure = { version = "=0.4.3" }
+
 # tracing 0.1.44 — latest stable 0.1.x
 tracing = { version = "=0.1.44" }
 
