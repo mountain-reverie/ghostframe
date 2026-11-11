@@ -852,6 +852,10 @@ pub struct IoBridge {
     /// H.264 as a member of the transport: frame tracker, IDR hold and
     /// request policy, counters. See `h264_tx`.
     h264: H264Tx,
+    /// The FEC block knob (`GHOSTFRAME_FEC_BLOCKS`). Nothing reads it yet:
+    /// the block packer that does lands in R6-d D2.
+    #[allow(dead_code)]
+    fec_blocks: Option<crate::config::FecBlockParams>,
     /// Shared cell the browserless harness reads the final H.264 counters
     /// from; same read-after-abort pattern as `emitter_stats_publish`.
     #[cfg(any(test, feature = "browserless-harness"))]
@@ -1571,6 +1575,7 @@ impl IoBridge {
                 openh264_lib,
                 ..H264Tx::default()
             },
+            fec_blocks: lib_config.transport.fec_blocks,
             #[cfg(any(test, feature = "browserless-harness"))]
             h264_stats_publish: std::sync::Arc::new(std::sync::Mutex::new(H264Report::default())),
             last_reset_request_idr_at: None,
