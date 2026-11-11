@@ -224,20 +224,26 @@ async function main() {
 
   // Second reliable bidi stream (RECOVERED / CONTENT_REJECTED / DECLINED),
   // opened lazily on the first RepairStatus output so a non-framing session
-  // never opens it. Null once an open attempt has failed (not retried).
-  let repairStatusWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
-  let repairStatusOpenTried = false;
+  // never opens it. The writer is a promise created once, synchronously, on
+  // first use: `drainTransmit` runs as overlapping floating promises, and
+  // awaits on one promise resume in order, so write order is preserved while
+  // the stream is still opening. A failed open is not retried.
+  let repairStatusWriterP: Promise<WritableStreamDefaultWriter<Uint8Array>> | null = null;
+  let repairStatusOpenFailed = false;
   async function writeRepairStatus(bytes: Uint8Array): Promise<void> {
-    if (!repairStatusOpenTried) {
-      repairStatusOpenTried = true;
-      try {
-        const bidi = await transport.createBidirectionalStream();
-        repairStatusWriter = bidi.writable.getWriter();
-      } catch {
-        console.warn('Could not open repair-status stream');
+    repairStatusWriterP ??= transport
+      .createBidirectionalStream()
+      .then((b) => b.writable.getWriter());
+    try {
+      const w = await repairStatusWriterP;
+      await w.write(bytes);
+    } catch (err) {
+      if (!repairStatusOpenFailed) {
+        repairStatusOpenFailed = true;
+        console.warn('Repair-status stream unavailable:', err);
       }
+      health.tally('repair-status:write-dropped');
     }
-    await repairStatusWriter?.write(bytes);
   }
 
   /** Drain every pending outbound buffer, routing it to the right wire. */

@@ -326,6 +326,28 @@ fn h264_fragment_under_framing_is_acked_once_in_v4_only() {
 }
 
 #[test]
+fn h264_fragment_with_bad_index_in_a_source_is_content_rejected() {
+    let mut dg = fragment_frame(4, 0, true, &[7u8; 100], 1200).remove(0);
+    dg[4..6].copy_from_slice(&1u16.to_be_bytes()); // frag_idx 1 >= frag_total 1
+    let mut c = core(true);
+    c.handle_datagram(&source(70, 2, 0, true, &records(&[&dg])).encode(), 1_000);
+    assert_eq!(
+        status_records(&mut c, 1_000),
+        vec![StatusRecord::ContentRejected(vec![(70, 0)])]
+    );
+}
+
+#[test]
+fn h264_fragment_dropped_after_the_ack_point_is_not_rejected() {
+    // A probe pad is acknowledged and then ignored: not a refusal.
+    let mut dg = fragment_frame(4, 0, true, &[7u8; 100], 1200).remove(0);
+    dg[16] |= 0x10; // FRAME_FLAG_PAD
+    let mut c = core(true);
+    c.handle_datagram(&source(71, 2, 0, true, &records(&[&dg])).encode(), 1_000);
+    assert!(status_records(&mut c, 1_000).is_empty());
+}
+
+#[test]
 fn good_cdf53_pass_under_framing_is_neither_v3_acked_nor_rejected() {
     // Pass 0: present-passes bitmap with bit 0 set, then three empty planes.
     let mut p = vec![0x00, 0x41];
