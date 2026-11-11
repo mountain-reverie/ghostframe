@@ -45,6 +45,7 @@ fn input_sent_before_the_session_is_ready_does_not_precede_the_hello() {
         indices_raw_enabled: true,
         supports_h264: false,
         display: None,
+        fec_framing: false,
     };
     let base = Instant::now();
     let mut now_us = 0u64;
@@ -123,6 +124,7 @@ fn an_h264_client_advertises_both_h264_hello_bits() {
         indices_raw_enabled: true,
         supports_h264: true,
         display: None,
+        fec_framing: false,
     };
     let base = Instant::now();
     let mut now_us = 0u64;
@@ -328,4 +330,92 @@ fn a_held_tail_is_flushed_without_another_frame() {
     }
     assert_eq!(wt.stats_tail_len(), 0, "the tail was written");
     assert_eq!(reader.buffered(), 0, "the reader holds no half frame");
+
+/// Under `fec_framing` a block rebuilt from repair makes the core emit a
+/// RECOVERED status record. It must reach the server on a *second*
+/// client-opened bidi stream (not the feedback stream), whose first byte is
+/// `FEC_REPAIR_STATUS_STREAM_TAG`. Driven through the real path: framed
+/// datagrams from the server side, one source withheld.
+#[test]
+fn recovered_status_reaches_the_server_on_a_second_tagged_stream() {
+    use common::{admitting_server, pinned_hash};
+    use ghostframe_client_net::{ClientNet, ClientNetConfig};
+    use ghostframe_lib::transport::webtransport::WebTransportServer;
+    use ghostframe_protocol::fec::codec::encode_repairs;
+    use ghostframe_protocol::fec::frame::{push_record, RepairFrame, SourceFrame};
+    use ghostframe_protocol::fec::repair_status::FEC_REPAIR_STATUS_STREAM_TAG;
+    use std::net::{Ipv6Addr, SocketAddr};
+    use std::time::Instant;
+
+    assert_eq!(FEC_REPAIR_STATUS_STREAM_TAG, 0xF5);
+    let mut server = admitting_server();
+    let mut wt = WebTransportServer::new();
+    let cfg = ClientNetConfig {
+        server_name: "localhost".into(),
+        server_cert_sha256: pinned_hash(&server),
+        indices_raw_enabled: true,
+        supports_h264: false,
+        display: None,
+        fec_framing: true,
+    };
+    let base = Instant::now();
+    let mut now_us = 0u64;
+    let mut client = ClientNet::new(cfg, now_us).expect("ClientNet::new");
+    client
+        .connect(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 443), now_us)
+        .expect("connect");
+    pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 128);
+    assert!(wt.is_connected(), "server must accept the CONNECT");
+    pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 32);
+
+    // Nothing to report yet: no second stream, only the Hello's stream.
+    let before: Vec<Vec<u8>> = wt.drain_feedback();
+    assert!(
+        before.iter().all(|m| m.first() != Some(&0xF5)),
+        "no repair-status bytes before any framed datagram, got {before:?}"
+    );
+
+    // One block, k = 2; source 0 is lost, source 1 and one repair arrive.
+    let mut r0 = Vec::new();
+    push_record(&mut r0, b"first record");
+    let mut r1 = Vec::new();
+    push_record(&mut r1, b"second record");
+    let s0 = SourceFrame {
+        last: false,
+        bundle_seq: 10,
+        block_id: 7,
+        idx: 0,
+        records: &r0,
+    };
+    let s1 = SourceFrame {
+        last: true,
+        bundle_seq: 11,
+        block_id: 7,
+        idx: 1,
+        records: &r1,
+    };
+    let syms = [s0.coded_symbol(), s1.coded_symbol()];
+    let refs: Vec<&[u8]> = syms.iter().map(|s| s.as_slice()).collect();
+    let reps = encode_repairs(&refs, &[0]).expect("encode_repairs");
+    let repair = RepairFrame {
+        bundle_seq: 12,
+        block_id: 7,
+        k: 2,
+        r: 1,
+        repair_idx: 0,
+        payload: &reps[0],
+    };
+    {
+        let conn = server.connections.values_mut().next().unwrap();
+        wt.send_datagram(conn, &s1.encode()).expect("send source");
+        wt.send_datagram(conn, &repair.encode())
+            .expect("send repair");
+    }
+    pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 64);
+
+    let got = wt.drain_feedback();
+    assert!(
+        got.iter().any(|m| m.first() == Some(&0xF5)),
+        "a RECOVERED record on a tagged second stream must reach the server, got {got:02x?}"
+    );
 }

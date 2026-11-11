@@ -163,6 +163,7 @@ async fn scenario(name: &str, w: u32, h: u32, dirty_frac: f64) {
             indices_raw_enabled: true,
             supports_h264: false,
             display: None,
+            fec_framing: false,
         },
         us(()),
     )
