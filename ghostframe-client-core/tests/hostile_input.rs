@@ -83,13 +83,15 @@ fn a_tile_claiming_other_than_one_fragment_is_dropped() {
     let mut core = test_core();
     // Positive control: the same datagram with frag_total 1 completes.
     assert_eq!(
-        tile_ready_count(&core.handle_datagram(&solid_dg(1, 0, 0), 0)),
+        tile_ready_count(
+            &core.handle_datagram(&ghostframe_client_core::frame_one(solid_dg(1, 0, 0)), 0)
+        ),
         1
     );
     for total in [0u16, 2, 3, 64, 65, u16::MAX] {
         let mut dg = solid_dg(2, 0, 0);
         forge_frag_total(&mut dg, total);
-        let evs = core.handle_datagram(&dg, 0);
+        let evs = core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 0);
         assert!(
             evs.is_empty(),
             "frag_total {total} must be dropped: {evs:?}"
@@ -100,27 +102,31 @@ fn a_tile_claiming_other_than_one_fragment_is_dropped() {
 #[test]
 fn a_tile_claiming_a_fragment_index_other_than_zero_is_dropped() {
     // frag_total 1 with a nonzero index has `frag_idx >= frag_total`: it is
-    // nonsense. There is
-    // nothing to assemble, so it must neither decode nor be ACKed.
+    // nonsense. There is nothing to assemble, so it must not decode, and the
+    // server is told the record is unusable.
     let mut core = test_core();
     for idx in [1u16, 2, 64, u16::MAX] {
         let mut dg = solid_dg(2, 0, 0);
         forge_frag_idx(&mut dg, idx);
-        let evs = core.handle_datagram(&dg, 0);
+        let evs = core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 0);
         assert!(evs.is_empty(), "frag_idx {idx} must be dropped: {evs:?}");
     }
-    assert!(
-        !queued_datagram(&mut core),
-        "a refused tile must not be ACKed"
-    );
-    // Positive control: the same tile with index 0 decodes and is ACKed.
     assert_eq!(
-        tile_ready_count(&core.handle_datagram(&solid_dg(2, 0, 0), 0)),
+        sent(&mut core),
+        (true, true),
+        "a refused tile: its bundle is ACKed and the record CONTENT_REJECTED"
+    );
+    // Positive control: the same tile with index 0 decodes, nothing refused.
+    assert_eq!(
+        tile_ready_count(
+            &core.handle_datagram(&ghostframe_client_core::frame_one(solid_dg(2, 0, 0)), 0)
+        ),
         1
     );
-    assert!(
-        queued_datagram(&mut core),
-        "control: an accepted tile must be ACKed"
+    assert_eq!(
+        sent(&mut core),
+        (true, false),
+        "control: an accepted tile is ACKed and not rejected"
     );
 }
 
@@ -156,7 +162,7 @@ fn the_largest_cdf53_pass_is_one_datagram_and_completes() {
         ghostframe_protocol::protocol::MAX_TILE_PAYLOAD,
     );
     assert_eq!(dgs.len(), 1, "it must not need fragmenting");
-    let evs = core.handle_datagram(&dgs[0], 0);
+    let evs = core.handle_datagram(&ghostframe_client_core::frame_one(&dgs[0]), 0);
     assert!(
         evs.iter().any(|e| matches!(
             e,
@@ -170,41 +176,51 @@ fn the_largest_cdf53_pass_is_one_datagram_and_completes() {
     );
 }
 
-/// True if the core queues any outgoing datagram (ACK or NACK) after
-/// `handle_datagram` calls.
-fn queued_datagram(core: &mut ClientCore) -> bool {
+/// What the core queued after `handle_datagram` calls: `(acked, rejected)`,
+/// whether an ACK v4 datagram went out for the bundles and whether a
+/// CONTENT_REJECTED was queued for a record in them.
+fn sent(core: &mut ClientCore) -> (bool, bool) {
     core.on_timeout(10_000_000);
-    let mut any = false;
+    let (mut acked, mut rejected) = (false, false);
     while let Some(out) = core.poll_transmit(10_000_000) {
-        if matches!(out, PollOutput::Datagram(_)) {
-            any = true;
+        match out {
+            PollOutput::Datagram(d) if d.first() == Some(&0x08) => acked = true,
+            PollOutput::RepairStatus(_) => rejected = true,
+            _ => {}
         }
     }
-    any
+    (acked, rejected)
 }
 
 #[test]
-fn accepted_tile_is_acked_but_refused_ones_are_not() {
+fn accepted_tile_is_not_rejected_but_refused_ones_are() {
     // Positive control first, or "no ACK" below proves nothing.
     let mut core = test_core();
-    core.handle_datagram(&tile_dgs(1, 0, 0, 0, &[1u8; 64], 64)[0], 0);
-    assert!(
-        queued_datagram(&mut core),
-        "control: an accepted tile must be ACKed"
+    core.handle_datagram(
+        &ghostframe_client_core::frame_one(&tile_dgs(1, 0, 0, 0, &[1u8; 64], 64)[0]),
+        0,
+    );
+    assert_eq!(
+        sent(&mut core),
+        (true, false),
+        "control: an accepted tile is ACKed and not rejected"
     );
 
-    // More than one fragment, off the grid: refused before the ACK, so the
-    // server retransmits instead of counting them delivered.
+    // More than one fragment, off the grid: refused, so the server
+    // retransmits the record instead of counting it delivered.
     let mut core = test_core();
     let mut dg = tile_dgs(1, 0, 0, 0, &[1u8; 64], 64).remove(0);
     forge_frag_total(&mut dg, 2);
-    core.handle_datagram(&dg, 0);
-    assert!(!queued_datagram(&mut core), "multi-fragment tile ACKed");
+    core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 0);
+    assert!(sent(&mut core).1, "multi-fragment tile not rejected");
 
     let mut core = test_core();
     dims_events(&mut core, 640, 480);
-    core.handle_datagram(&tile_dgs(1, 30, 0, 0, &[1u8; 64], 64)[0], 0);
-    assert!(!queued_datagram(&mut core), "off-grid tile ACKed");
+    core.handle_datagram(
+        &ghostframe_client_core::frame_one(&tile_dgs(1, 30, 0, 0, &[1u8; 64], 64)[0]),
+        0,
+    );
+    assert!(sent(&mut core).1, "off-grid tile not rejected");
 }
 
 #[test]
@@ -212,10 +228,10 @@ fn h264_frag_total_above_cap_allocates_nothing() {
     let mut core = test_core();
     let mut dg = fragment_frame(7, 0, true, &[1u8; 64], 64).remove(0);
     forge_frag_total(&mut dg, u16::MAX);
-    core.handle_datagram(&dg, 0);
+    core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 0);
     assert_eq!(stats(&core).frame_assemblies, 0);
     forge_frag_total(&mut dg, MAX_FRAME_FRAGMENTS + 1);
-    core.handle_datagram(&dg, 0);
+    core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 0);
     assert_eq!(stats(&core).frame_assemblies, 0);
 }
 
@@ -224,7 +240,7 @@ fn h264_frag_total_at_cap_is_accepted() {
     let mut core = test_core();
     let mut dg = fragment_frame(7, 0, true, &[1u8; 64], 64).remove(0);
     forge_frag_total(&mut dg, MAX_FRAME_FRAGMENTS);
-    core.handle_datagram(&dg, 0);
+    core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 0);
     assert_eq!(stats(&core).frame_assemblies, 1);
 }
 
@@ -243,11 +259,15 @@ fn frame_fragment(frame_seq: u32, idx: u16, total: u16, payload_len: usize) -> V
 #[test]
 fn h264_access_unit_over_the_byte_cap_is_abandoned() {
     let mut core = test_core();
-    let chunk = 1024 * 1024;
+    // A record is length-prefixed with a u16, so fragments stay below 64 KiB.
+    let chunk = 32 * 1024;
     let n = MAX_H264_ACCESS_UNIT_BYTES / chunk + 1;
     let mut evs = Vec::new();
     for i in 0..n {
-        evs.extend(core.handle_datagram(&frame_fragment(3, i as u16, n as u16, chunk), 0));
+        evs.extend(core.handle_datagram(
+            &ghostframe_client_core::frame_one(frame_fragment(3, i as u16, n as u16, chunk)),
+            0,
+        ));
     }
     assert!(evs.is_empty(), "oversize access unit must not be delivered");
     assert_eq!(
@@ -260,11 +280,15 @@ fn h264_access_unit_over_the_byte_cap_is_abandoned() {
 #[test]
 fn h264_access_unit_exactly_at_the_cap_is_delivered() {
     let mut core = test_core();
-    let chunk = 1024 * 1024;
+    // A record is length-prefixed with a u16, so fragments stay below 64 KiB.
+    let chunk = 32 * 1024;
     let n = MAX_H264_ACCESS_UNIT_BYTES / chunk;
     let mut evs = Vec::new();
     for i in 0..n {
-        evs.extend(core.handle_datagram(&frame_fragment(3, i as u16, n as u16, chunk), 0));
+        evs.extend(core.handle_datagram(
+            &ghostframe_client_core::frame_one(frame_fragment(3, i as u16, n as u16, chunk)),
+            0,
+        ));
     }
     match &evs[..] {
         [Event::NeedsH264 { payload, .. }] => assert_eq!(payload.len(), MAX_H264_ACCESS_UNIT_BYTES),
@@ -277,13 +301,16 @@ fn h264_access_unit_exactly_at_the_cap_is_delivered() {
 // ---------------------------------------------------------------------------
 
 fn dims_events(core: &mut ClientCore, w: u32, h: u32) -> Vec<(u32, u32)> {
-    core.handle_datagram(&build_frame_dimensions_datagram(1, 0, w, h), 0)
-        .into_iter()
-        .filter_map(|e| match e {
-            Event::FrameDimensions { width, height } => Some((width, height)),
-            _ => None,
-        })
-        .collect()
+    core.handle_datagram(
+        &ghostframe_client_core::frame_one(build_frame_dimensions_datagram(1, 0, w, h)),
+        0,
+    )
+    .into_iter()
+    .filter_map(|e| match e {
+        Event::FrameDimensions { width, height } => Some((width, height)),
+        _ => None,
+    })
+    .collect()
 }
 
 #[test]
@@ -321,7 +348,9 @@ fn a_dropped_dimensions_message_does_not_change_the_grid() {
     assert_eq!(dims_events(&mut core, 640, 480).len(), 1);
     assert!(dims_events(&mut core, u32::MAX, u32::MAX).is_empty());
     // Grid is still 20x15: a tile at x=30 is refused.
-    assert!(core.handle_datagram(&solid_dg(2, 30, 0), 0).is_empty());
+    assert!(core
+        .handle_datagram(&ghostframe_client_core::frame_one(solid_dg(2, 30, 0)), 0)
+        .is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -335,12 +364,12 @@ fn tiles_outside_the_grid_are_refused_and_edge_tiles_are_not() {
     assert_eq!(dims_events(&mut core, 650, 490).len(), 1);
 
     for (x, y) in [(21u8, 0u8), (0, 16), (200, 200), (253, 253)] {
-        let evs = core.handle_datagram(&solid_dg(2, x, y), 0);
+        let evs = core.handle_datagram(&ghostframe_client_core::frame_one(solid_dg(2, x, y)), 0);
         assert_eq!(tile_ready_count(&evs), 0, "({x},{y}) is off the grid");
     }
     // The last row/column are partial tiles but legitimate.
     for (x, y) in [(20u8, 15u8), (0, 0), (20, 0), (0, 15)] {
-        let evs = core.handle_datagram(&solid_dg(2, x, y), 0);
+        let evs = core.handle_datagram(&ghostframe_client_core::frame_one(solid_dg(2, x, y)), 0);
         assert_eq!(tile_ready_count(&evs), 1, "({x},{y}) is on the grid");
     }
 }
@@ -350,6 +379,6 @@ fn before_any_dimensions_tiles_are_not_refused() {
     // The dimensions datagram is unreliable; tiles that beat it must not be
     // treated as hostile.
     let mut core = test_core();
-    let evs = core.handle_datagram(&solid_dg(2, 100, 60), 0);
+    let evs = core.handle_datagram(&ghostframe_client_core::frame_one(solid_dg(2, 100, 60)), 0);
     assert_eq!(tile_ready_count(&evs), 1);
 }

@@ -1,13 +1,19 @@
-//! ACK v4 batcher: the behaviour of `AckBatcher` (flush at 64 fresh entries
-//! or 5 ms after the first queued one, last 8 fresh entries appended as
-//! overlap), naming `bundle_seq` and encoding a `BundleAckBatch` (0x08).
+//! ACK v4 batcher: flush at 64 fresh entries or 5 ms after the first queued
+//! one, last 8 fresh entries appended as overlap; entries name `bundle_seq` and
+//! the batch is a `BundleAckBatch` (0x08).
 
 use std::collections::VecDeque;
 
 use ghostframe_protocol::ack::{ACK_OVERLAP_COUNT, MAX_FRESH_ENTRIES_PER_BATCH};
 use ghostframe_protocol::fec::feedback::{BundleAck, BundleAckBatch};
 
-use crate::ack_batcher::{FLUSH_INTERVAL_US, MAX_RECENT};
+/// Flush deadline: 5ms in microseconds after the first entry of a pending
+/// batch is queued.
+pub const FLUSH_INTERVAL_US: u64 = 5_000;
+
+/// How many recent fresh entries to retain for overlap purposes (4x
+/// `ACK_OVERLAP_COUNT`).
+pub(crate) const MAX_RECENT: usize = ACK_OVERLAP_COUNT * 4;
 
 pub struct AckV4Batcher {
     entries: Vec<BundleAck>,
@@ -130,5 +136,30 @@ mod tests {
         assert_eq!(batch.entries[0], ack(100));
         let tail: Vec<u32> = batch.entries[1..].iter().map(|e| e.bundle_seq).collect();
         assert_eq!(tail, (56..64).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn overlap_is_capped_at_eight_after_twenty_single_entry_flushes() {
+        let mut b = AckV4Batcher::new();
+        for i in 0..20u32 {
+            b.add(ack(i), 0);
+            b.flush();
+        }
+        b.add(ack(100), 0);
+        let batch = BundleAckBatch::decode(&b.flush().unwrap()).unwrap();
+        assert_eq!(batch.entries.len(), 1 + ACK_OVERLAP_COUNT);
+        assert_eq!(batch.entries[0], ack(100));
+        let tail: Vec<u32> = batch.entries[1..].iter().map(|e| e.bundle_seq).collect();
+        assert_eq!(tail, (12..20).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn the_first_batch_has_no_overlap_and_an_empty_flush_sends_nothing() {
+        let mut b = AckV4Batcher::new();
+        assert!(b.flush().is_none());
+        b.add(ack(42), 0);
+        let batch = BundleAckBatch::decode(&b.flush().unwrap()).unwrap();
+        assert_eq!(batch.entries, vec![ack(42)]);
+        assert!(b.flush().is_none(), "nothing queued after a flush");
     }
 }

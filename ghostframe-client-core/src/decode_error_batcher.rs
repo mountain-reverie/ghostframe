@@ -23,7 +23,7 @@ const GLOBAL_CAP: usize = 32;
 /// Decode-error report, sent on the feedback stream. Wire layout
 /// `[DECODE_ERROR_MSG_TYPE, codec, tile_x, tile_y, code]`.
 ///
-/// Shared the value 0x04 with `ACK_BATCH_MSG_TYPE` until that moved to 0x06
+/// Shared the value 0x04 with the ACK batch envelope until that moved to 0x06
 /// for transmission-identity entries; the reasoning below stands regardless,
 /// since the two ride different channels and were never disambiguated by the
 /// byte alone. Kept as written because it is the channel separation, not the

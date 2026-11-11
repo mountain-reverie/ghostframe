@@ -13,7 +13,6 @@ fn core_with(delivery: TileDelivery) -> ClientCore {
             tile_delivery: delivery,
             cdf53_wire: false,
             display: None,
-            fec_framing: false,
         },
         0,
     );
@@ -54,7 +53,7 @@ fn drive_one_tile(delivery: TileDelivery, codec: Codec, payload: &[u8]) -> Vec<E
     let dgs = tile_datagrams(1, 0, 0, codec, 0, payload, 1200);
     let mut events = Vec::new();
     for dg in &dgs {
-        events.extend(core.handle_datagram(dg, 0));
+        events.extend(core.handle_datagram(&ghostframe_client_core::frame_one(dg), 0));
     }
     events
 }
@@ -63,7 +62,7 @@ fn drive_one_tile(delivery: TileDelivery, codec: Codec, payload: &[u8]) -> Vec<E
 /// The Cdf53 deferred ACK is a `PollOutput`, not an `Event`, so a test that
 /// only inspects events cannot see whether it fired.
 ///
-/// A single ACK entry does not flush `AckBatcher` immediately — it only
+/// A single ACK entry does not flush the ACK v4 batcher immediately — it only
 /// flushes at `MAX_FRESH_ENTRIES_PER_BATCH` entries or 5ms after the first
 /// queued entry (`FLUSH_INTERVAL_US`), same as every other codec's
 /// on-receipt ACK. So this advances time past that debounce window with
@@ -77,7 +76,7 @@ fn drive_one_tile_with_outputs(
     let mut core = core_with(delivery);
     let mut events = Vec::new();
     for dg in tile_datagrams(1, 0, 0, codec, 0, payload, 1200) {
-        events.extend(core.handle_datagram(&dg, 0));
+        events.extend(core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 0));
     }
     core.on_timeout(10_000);
     let mut outputs = Vec::new();
@@ -350,7 +349,7 @@ fn payload_mode_really_stores_the_palette_not_just_reports_it() {
     let bundled = encode_pal_rle_payload(&packed, &entry, 5, true);
     let mut events = Vec::new();
     for dg in tile_datagrams(1, 0, 0, Codec::PalRle, 0, &bundled, 1200) {
-        events.extend(core.handle_datagram(&dg, 0));
+        events.extend(core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 0));
     }
     assert!(
         events
@@ -364,7 +363,7 @@ fn payload_mode_really_stores_the_palette_not_just_reports_it() {
     let thin = encode_pal_rle_payload(&packed, &entry, 5, false);
     let mut events2 = Vec::new();
     for dg in tile_datagrams(2, 1, 0, Codec::PalRle, 0, &thin, 1200) {
-        events2.extend(core.handle_datagram(&dg, 0));
+        events2.extend(core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 0));
     }
 
     assert!(
@@ -429,14 +428,14 @@ fn bundled_palette_precedes_thin_tile_payload_in_event_order() {
     // Wire order: Bundled tile establishing palette 5 first...
     let bundled = encode_pal_rle_payload(&packed, &entry, 5, true);
     for dg in tile_datagrams(1, 0, 0, Codec::PalRle, 0, &bundled, 1200) {
-        events.extend(core.handle_datagram(&dg, 0));
+        events.extend(core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 0));
     }
 
     // ...then a thin tile referencing palette 5, carrying no colours of its
     // own.
     let thin = encode_pal_rle_payload(&packed, &entry, 5, false);
     for dg in tile_datagrams(2, 1, 0, Codec::PalRle, 0, &thin, 1200) {
-        events.extend(core.handle_datagram(&dg, 0));
+        events.extend(core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 0));
     }
 
     let palette_updated_pos = events
@@ -507,13 +506,13 @@ fn palette_then_thin_reversed_order_fails_with_thin_uncached_palette() {
     // shadow is still empty...
     let thin = encode_pal_rle_payload(&packed, &entry, 5, false);
     for dg in tile_datagrams(1, 0, 0, Codec::PalRle, 0, &thin, 1200) {
-        events.extend(core.handle_datagram(&dg, 0));
+        events.extend(core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 0));
     }
 
     // ...then the Bundled tile that would have installed it.
     let bundled = encode_pal_rle_payload(&packed, &entry, 5, true);
     for dg in tile_datagrams(2, 1, 0, Codec::PalRle, 0, &bundled, 1200) {
-        events.extend(core.handle_datagram(&dg, 0));
+        events.extend(core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 0));
     }
 
     assert!(

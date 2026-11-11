@@ -63,7 +63,6 @@ fn core() -> ClientCore {
             tile_delivery: TileDelivery::Decoded,
             cdf53_wire: false,
             display: None,
-            fec_framing: false,
         },
         0,
     );
@@ -175,7 +174,10 @@ fn run(schedule: &[Dg]) -> Option<Vec<u8>> {
     let mut c = core();
     let mut last = None;
     for (i, dg) in schedule.iter().enumerate() {
-        for ev in c.handle_datagram(&dg.bytes, i as u64 * 1000) {
+        for ev in c.handle_datagram(
+            &ghostframe_client_core::frame_one(&dg.bytes),
+            i as u64 * 1000,
+        ) {
             if let Event::TileReady {
                 tile_x,
                 tile_y,

@@ -38,7 +38,7 @@
 use std::time::{Duration, Instant};
 
 /// The client's acknowledgement flush deadline
-/// (`ghostframe_client_core::ack_batcher`, 5 ms): the longest an
+/// (`ghostframe_client_core::fec_rx::AckV4Batcher`, 5 ms): the longest an
 /// acknowledgement can be held back on purpose. RFC 9002's `max_ack_delay`.
 pub(crate) const MAX_ACK_DELAY: Duration = Duration::from_millis(5);
 

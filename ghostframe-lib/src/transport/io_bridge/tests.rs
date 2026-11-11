@@ -1758,13 +1758,13 @@ async fn dispatch_ack_datagram_cdf53_increments_counter() {
         1000,
         crate::transport::reliable_emitter::EmitKey::new(100, 7, 9, 0),
     );
-    let batch = crate::transport::ack::AckBatch {
-        entries: vec![crate::transport::ack::AckEntry {
+    let batch = crate::transport::io_bridge::test_ack::AckBatch {
+        entries: vec![crate::transport::io_bridge::test_ack::AckEntry {
             wire_seq: 1000,
             arrival_time_ms_lo16: 0,
         }],
     };
-    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.dispatch_ack_v4_datagram(&batch.encode());
 
     assert_eq!(
         bridge.scheduler.cdf53_passes_acked_for_test(7, 9, 1),
@@ -1783,31 +1783,66 @@ async fn dispatch_ack_datagram_missing_coverage_is_noop() {
         1001,
         crate::transport::reliable_emitter::EmitKey::new(999, 9, 5, 3),
     );
-    let batch = crate::transport::ack::AckBatch {
-        entries: vec![crate::transport::ack::AckEntry {
+    let batch = crate::transport::io_bridge::test_ack::AckBatch {
+        entries: vec![crate::transport::io_bridge::test_ack::AckEntry {
             wire_seq: 1001,
             arrival_time_ms_lo16: 0,
         }],
     };
     // Should not panic, should not modify any state.
-    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.dispatch_ack_v4_datagram(&batch.encode());
     assert_eq!(bridge.scheduler.cdf53_passes_acked_for_test(0, 0, 0), 0,);
 }
 
-/// dispatch_ack_datagram silently ignores datagrams whose first byte
-/// isn't ACK_BATCH_MSG_TYPE.
+/// `dispatch_ack_v4_datagram` ignores datagrams that are not ACK v4 (it only
+/// decodes 0x08) without panicking or resolving anything.
 #[tokio::test(flavor = "multi_thread")]
-async fn dispatch_ack_datagram_ignores_unknown_msg_types() {
+async fn dispatch_ack_v4_datagram_ignores_other_msg_types() {
     let (our_end, _peer) = UnixStream::pair().expect("pair");
     let server = QuicServer::new().expect("server");
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
     let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
-    // Non-0x03 first byte → silently dropped.
-    bridge.dispatch_ack_datagram(&[0xFF, 0, 0, 0, 0, 0]);
-    bridge.dispatch_ack_datagram(&[0x01, 1, 0, 0]); // OLD FEEDBACK type; not us
-                                                    // Empty.
-    bridge.dispatch_ack_datagram(&[]);
+    bridge.dispatch_ack_v4_datagram(&[0xFF, 0, 0, 0, 0, 0]);
+    bridge.dispatch_ack_v4_datagram(&[0x01, 1, 0, 0]); // OLD FEEDBACK type; not us
+    bridge.dispatch_ack_v4_datagram(&[]);
     // No panic; nothing to assert beyond reaching this line.
+}
+
+/// The per-transmission ACK batch of the unframed protocol (0x06) and the
+/// older revisions (0x02..=0x04) are superseded: the server has no decoder for
+/// them, so one naming a live transmission resolves nothing. It is counted as
+/// unroutable and dropped; the same entry as ACK v4 resolves it (control).
+#[tokio::test(start_paused = true)]
+async fn a_superseded_ack_revision_resolves_nothing_and_is_counted() {
+    for old in [0x02u8, 0x03, 0x04, 0x06] {
+        let mut bridge = make_bridge_for_test().await;
+        crate::transport::io_bridge::test_ack::attach_test_wire(&mut bridge);
+        let live = crate::transport::io_bridge::test_ack::LIVE;
+        bridge
+            .transmission_ledger
+            .record_departed(7, now_std(), ledger_tx(1_000, 1_200, 7));
+        // [type, count 1, id 7 (LE), arrival 0 (LE)]: the 0x06 layout.
+        let stale = [old, 1, 7, 0, 0, 0, 0, 0];
+        bridge.dispatch_inbound_datagram(live, &stale);
+        assert_eq!(
+            bridge.unroutable_inbound_datagrams, 1,
+            "0x{old:02x} is counted"
+        );
+        assert_eq!(bridge.transmission_ledger.len(), 1, "0x{old:02x} resolved");
+
+        // Control: the same entry as ACK v4 releases it.
+        let v4 = crate::transport::io_bridge::test_ack::AckBatch {
+            entries: vec![crate::transport::io_bridge::test_ack::AckEntry {
+                wire_seq: 7,
+                arrival_time_ms_lo16: 0,
+            }],
+        }
+        .encode();
+        assert_eq!(v4[0], 0x08);
+        bridge.dispatch_inbound_datagram(live, &v4);
+        assert_eq!(bridge.unroutable_inbound_datagrams, 1);
+        assert_eq!(bridge.transmission_ledger.len(), 0, "ACK v4 resolves it");
+    }
 }
 
 /// An inbound TILE_NACK (0x05) envelope routes each entry into
@@ -1879,13 +1914,13 @@ async fn ack_routes_through_emitter_dropping_cache() {
             },
         );
     }
-    let ack_env = crate::transport::ack::AckBatch {
-        entries: vec![crate::transport::ack::AckEntry {
+    let ack_env = crate::transport::io_bridge::test_ack::AckBatch {
+        entries: vec![crate::transport::io_bridge::test_ack::AckEntry {
             wire_seq: emitted[0].wire_seq,
             arrival_time_ms_lo16: 0,
         }],
     };
-    bridge.dispatch_ack_datagram(&ack_env.encode());
+    bridge.dispatch_ack_v4_datagram(&ack_env.encode());
     assert_eq!(bridge.reliable_emitter.stats.ack_hit, 1);
     assert!(bridge.reliable_emitter.cache.get(&key).is_none());
 }
@@ -1927,7 +1962,7 @@ async fn the_classifiers_loss_rate_is_the_ledgers_verdict() {
             },
         );
         if !wire_seq.is_multiple_of(5) {
-            acked.push(crate::transport::ack::AckEntry {
+            acked.push(crate::transport::io_bridge::test_ack::AckEntry {
                 wire_seq,
                 arrival_time_ms_lo16: 0,
             });
@@ -1935,10 +1970,10 @@ async fn the_classifiers_loss_rate_is_the_ledgers_verdict() {
         tokio::time::advance(std::time::Duration::from_millis(1)).await;
     }
     for batch in acked.chunks(32) {
-        let env = crate::transport::ack::AckBatch {
+        let env = crate::transport::io_bridge::test_ack::AckBatch {
             entries: batch.to_vec(),
         };
-        bridge.dispatch_ack_datagram(&env.encode());
+        bridge.dispatch_ack_v4_datagram(&env.encode());
     }
     // Acknowledgements alone say nothing about loss.
     assert_eq!(bridge.adaptation_context.loss_rate, 0.0);
@@ -1951,13 +1986,13 @@ async fn the_classifiers_loss_rate_is_the_ledgers_verdict() {
 
     // One of them turns up after all: the last unacknowledged one (fewer
     // than an FEC distance of departures later, so it cannot be a recovery).
-    let late = crate::transport::ack::AckBatch {
-        entries: vec![crate::transport::ack::AckEntry {
+    let late = crate::transport::io_bridge::test_ack::AckBatch {
+        entries: vec![crate::transport::io_bridge::test_ack::AckEntry {
             wire_seq: 395,
             arrival_time_ms_lo16: 0,
         }],
     };
-    bridge.dispatch_ack_datagram(&late.encode());
+    bridge.dispatch_ack_v4_datagram(&late.encode());
 
     tokio::time::advance(crate::transport::loss_window::SETTLE).await;
     bridge.expire_transmissions(now_std());
@@ -2282,13 +2317,13 @@ async fn ack_for_a_thin_palrle_tile_leaves_the_carry_count_alone() {
         2001,
         crate::transport::reliable_emitter::EmitKey::new(301, 2, 3, 0),
     );
-    let batch = crate::transport::ack::AckBatch {
-        entries: vec![crate::transport::ack::AckEntry {
+    let batch = crate::transport::io_bridge::test_ack::AckBatch {
+        entries: vec![crate::transport::io_bridge::test_ack::AckEntry {
             wire_seq: 2001,
             arrival_time_ms_lo16: 0,
         }],
     };
-    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.dispatch_ack_v4_datagram(&batch.encode());
 
     assert_eq!(
         bridge.palette_table.in_flight_carrying[9], 1,
@@ -2543,13 +2578,13 @@ async fn ack_for_palrle_tile_sets_delivered_and_decrements_in_flight() {
         1003,
         crate::transport::reliable_emitter::EmitKey::new(200, 0, 0, 0),
     );
-    let batch = crate::transport::ack::AckBatch {
-        entries: vec![crate::transport::ack::AckEntry {
+    let batch = crate::transport::io_bridge::test_ack::AckBatch {
+        entries: vec![crate::transport::io_bridge::test_ack::AckEntry {
             wire_seq: 1003,
             arrival_time_ms_lo16: 0,
         }],
     };
-    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.dispatch_ack_v4_datagram(&batch.encode());
 
     assert!(bridge.palette_table.delivered.contains(7));
     assert_eq!(bridge.palette_table.in_flight_carrying[7], 0);
@@ -2595,13 +2630,13 @@ async fn ack_for_palrle_tile_releases_ref_count() {
         1004,
         crate::transport::reliable_emitter::EmitKey::new(201, 0, 0, 0),
     );
-    let batch = crate::transport::ack::AckBatch {
-        entries: vec![crate::transport::ack::AckEntry {
+    let batch = crate::transport::io_bridge::test_ack::AckBatch {
+        entries: vec![crate::transport::io_bridge::test_ack::AckEntry {
             wire_seq: 1004,
             arrival_time_ms_lo16: 0,
         }],
     };
-    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.dispatch_ack_v4_datagram(&batch.encode());
 
     assert_eq!(
         bridge.palette_table.ref_count[5], 0,
@@ -3567,7 +3602,7 @@ async fn frame_mode_exit_dwell_tracks_virtual_time_via_bridge_epoch() {
 /// carry over to GoogCC.
 #[tokio::test(start_paused = true)]
 async fn bwe_estimate_advances_through_bridge_production_wiring() {
-    use crate::transport::ack::{AckBatch, AckEntry};
+    use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
     use crate::transport::reliable_emitter::EmitKey;
     use tokio::io::AsyncWriteExt;
 
@@ -3638,7 +3673,7 @@ async fn bwe_estimate_advances_through_bridge_production_wiring() {
         }
         let batch = AckBatch { entries };
         // Real production entry point for inbound ACK_BATCH datagrams.
-        bridge.dispatch_ack_datagram(&batch.encode());
+        bridge.dispatch_ack_v4_datagram(&batch.encode());
 
         peer.write_all(&BOGUS_FRAME)
             .await
@@ -5142,8 +5177,8 @@ fn seed_unacked_entry(
 async fn gate_ack_datagram_only_from_the_live_session() {
     let (mut bridge, live, other) = live_and_other().await;
     let (key, wire_seq) = seed_unacked_entry(&mut bridge, 1);
-    let dg = crate::transport::ack::AckBatch {
-        entries: vec![crate::transport::ack::AckEntry {
+    let dg = crate::transport::io_bridge::test_ack::AckBatch {
+        entries: vec![crate::transport::io_bridge::test_ack::AckEntry {
             wire_seq,
             arrival_time_ms_lo16: 0,
         }],
@@ -5599,8 +5634,8 @@ async fn ack_batch_received_is_a_trace_event() {
         }
     }
 
-    let batch = crate::transport::ack::AckBatch {
-        entries: vec![crate::transport::ack::AckEntry {
+    let batch = crate::transport::io_bridge::test_ack::AckBatch {
+        entries: vec![crate::transport::io_bridge::test_ack::AckEntry {
             wire_seq: 1,
             arrival_time_ms_lo16: 0,
         }],
@@ -5615,7 +5650,7 @@ async fn ack_batch_received_is_a_trace_event() {
             .with_max_level(max)
             .with_writer(sink.clone())
             .finish();
-        tracing::subscriber::with_default(sub, || bridge.dispatch_ack_datagram(&wire));
+        tracing::subscriber::with_default(sub, || bridge.dispatch_ack_v4_datagram(&wire));
         let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
         out
     };
@@ -5752,7 +5787,7 @@ fn ledger_tx(
 /// left to reach the estimator as a loss of a packet that arrived.
 #[tokio::test]
 async fn a_late_ack_retracts_the_pending_loss_it_contradicts() {
-    use crate::transport::ack::{AckBatch, AckEntry};
+    use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
     let mut bridge = make_bridge_for_test().await;
     let t0 = super::now_std();
     bridge
@@ -5771,7 +5806,7 @@ async fn a_late_ack_retracts_the_pending_loss_it_contradicts() {
             arrival_time_ms_lo16: 7,
         }],
     };
-    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.dispatch_ack_v4_datagram(&batch.encode());
     bridge.retract_late_acked_losses();
 
     let left: Vec<u32> = bridge.pending_losses.iter().map(|l| l.wire_seq).collect();
@@ -5788,7 +5823,7 @@ async fn a_late_ack_retracts_the_pending_loss_it_contradicts() {
 /// one withdraws that one, not whichever matches first.
 #[tokio::test]
 async fn a_late_ack_withdraws_its_own_loss_among_identical_twins() {
-    use crate::transport::ack::{AckBatch, AckEntry};
+    use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
     let mut bridge = make_bridge_for_test().await;
     let t0 = super::now_std();
     for ws in [10, 11, 12] {
@@ -5803,7 +5838,7 @@ async fn a_late_ack_withdraws_its_own_loss_among_identical_twins() {
             arrival_time_ms_lo16: 1,
         }],
     };
-    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.dispatch_ack_v4_datagram(&batch.encode());
     bridge.retract_late_acked_losses();
     let left: Vec<u32> = bridge.pending_losses.iter().map(|l| l.wire_seq).collect();
     assert_eq!(left, vec![10, 12]);
@@ -5813,7 +5848,7 @@ async fn a_late_ack_withdraws_its_own_loss_among_identical_twins() {
 /// it is a no-op and leaves nothing behind.
 #[tokio::test]
 async fn a_late_ack_for_an_already_flushed_loss_is_a_no_op() {
-    use crate::transport::ack::{AckBatch, AckEntry};
+    use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
     let mut bridge = make_bridge_for_test().await;
     let t0 = super::now_std();
     bridge
@@ -5830,7 +5865,7 @@ async fn a_late_ack_for_an_already_flushed_loss_is_a_no_op() {
             arrival_time_ms_lo16: 1,
         }],
     };
-    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.dispatch_ack_v4_datagram(&batch.encode());
     bridge.retract_late_acked_losses();
     assert_eq!(bridge.pending_losses.len(), 1);
     assert_eq!(bridge.pending_losses_retracted, 0);
@@ -5843,7 +5878,7 @@ async fn a_late_ack_for_an_already_flushed_loss_is_a_no_op() {
 /// if `post_turn` stops calling it.
 #[tokio::test]
 async fn post_turn_withdraws_the_loss_of_a_late_acked_transmission() {
-    use crate::transport::ack::{AckBatch, AckEntry};
+    use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
     let mut bridge = make_bridge_for_test().await;
     let long_ago = super::now_std()
         .checked_sub(std::time::Duration::from_secs(60))
@@ -5869,7 +5904,7 @@ async fn post_turn_withdraws_the_loss_of_a_late_acked_transmission() {
             arrival_time_ms_lo16: 7,
         }],
     };
-    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.dispatch_ack_v4_datagram(&batch.encode());
     bridge.post_turn().await.expect("post_turn");
 
     let left: Vec<u32> = bridge.pending_losses.iter().map(|l| l.wire_seq).collect();
@@ -5884,7 +5919,7 @@ async fn post_turn_withdraws_the_loss_of_a_late_acked_transmission() {
 /// expire, flush on a live acknowledgement, then acknowledge the "lost" one.
 #[tokio::test]
 async fn a_late_ack_after_the_flush_is_counted_apart_from_one_before_it() {
-    use crate::transport::ack::{AckBatch, AckEntry};
+    use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
     let ack = |ws: u32| {
         AckBatch {
             entries: vec![AckEntry {
@@ -5915,13 +5950,13 @@ async fn a_late_ack_after_the_flush_is_counted_apart_from_one_before_it() {
     bridge
         .transmission_ledger
         .record_departed(3, super::now_std(), ledger_tx(3_000, 1_200, 3));
-    bridge.dispatch_ack_datagram(&ack(3));
+    bridge.dispatch_ack_v4_datagram(&ack(3));
     bridge.post_turn().await.expect("post_turn");
     assert!(bridge.pending_losses.is_empty(), "flushed to goog_cc");
     assert_eq!(bridge.instr.losses_flushed, 2);
 
     // Now the first "lost" transmission turns out to have arrived.
-    bridge.dispatch_ack_datagram(&ack(1));
+    bridge.dispatch_ack_v4_datagram(&ack(1));
     bridge.post_turn().await.expect("post_turn");
     let s = bridge.instrument_summary();
     assert_eq!(
@@ -5934,6 +5969,16 @@ async fn a_late_ack_after_the_flush_is_counted_apart_from_one_before_it() {
     );
 }
 
+/// A sealed bundle that carries no record (a lone control frame) of `len` bytes.
+fn control_bundle(len: usize) -> crate::transport::fec_tx::packer::SealedBundle {
+    crate::transport::fec_tx::packer::SealedBundle {
+        bundle_seq: 0,
+        bytes: vec![0; len],
+        records: Default::default(),
+        emit_us: 0,
+    }
+}
+
 /// quinn reuses connection handles. The session-scoped instruments must not
 /// carry one connection's departure tracker (or its billing) into the next one
 /// that is given the same handle, or its first lags are stamped against
@@ -5942,30 +5987,8 @@ async fn a_late_ack_after_the_flush_is_counted_apart_from_one_before_it() {
 async fn a_forgotten_session_does_not_leak_its_mirror_into_a_reused_handle() {
     let h = ConnectionHandle(7);
     let mut bridge = test_bridge_with_sessions(&[h]).await;
-    bridge.note_enqueued(
-        h,
-        Enqueued {
-            class: WireClass::Critical,
-            gated: true,
-            dg_len: 100,
-            framing_len: 2,
-            wire_seq: None,
-            cum_enqueued: 102,
-            queued: 102,
-        },
-    );
-    bridge.note_enqueued(
-        h,
-        Enqueued {
-            class: WireClass::Critical,
-            gated: true,
-            dg_len: 100,
-            framing_len: 2,
-            wire_seq: None,
-            cum_enqueued: 204,
-            queued: 204,
-        },
-    );
+    bridge.note_bundle_enqueued(h, &control_bundle(100), 2, 102, 102);
+    bridge.note_bundle_enqueued(h, &control_bundle(100), 2, 204, 204);
     assert_eq!(bridge.departures.len(), 2);
     assert_eq!(bridge.instr.offered.total(), 204);
 
@@ -5975,18 +5998,7 @@ async fn a_forgotten_session_does_not_leak_its_mirror_into_a_reused_handle() {
     assert_eq!(bridge.departures_handle, None);
 
     // The same handle, a new connection whose counter starts again.
-    bridge.note_enqueued(
-        h,
-        Enqueued {
-            class: WireClass::Critical,
-            gated: true,
-            dg_len: 100,
-            framing_len: 2,
-            wire_seq: None,
-            cum_enqueued: 102,
-            queued: 102,
-        },
-    );
+    bridge.note_bundle_enqueued(h, &control_bundle(100), 2, 102, 102);
     assert_eq!(
         bridge.departures.len(),
         1,
@@ -6003,7 +6015,7 @@ async fn a_forgotten_session_does_not_leak_its_mirror_into_a_reused_handle() {
 /// real emitter, ledger and ACK path.
 #[tokio::test]
 async fn bwe_sample_send_time_is_not_the_wrapped_emit_clock() {
-    use crate::transport::ack::{AckBatch, AckEntry};
+    use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
     let mut bridge = make_bridge_for_test().await;
     let base = super::now_std()
         .checked_sub(std::time::Duration::from_secs(80 * 60))
@@ -6045,7 +6057,7 @@ async fn bwe_sample_send_time_is_not_the_wrapped_emit_clock() {
             arrival_time_ms_lo16: 1,
         }],
     };
-    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.dispatch_ack_v4_datagram(&batch.encode());
 
     assert_eq!(bridge.bwe_samples_buffer.len(), 1);
     let s = &bridge.bwe_samples_buffer[0];
@@ -6111,7 +6123,7 @@ async fn pending_loss_send_time_is_not_the_wrapped_emit_clock() {
 /// estimator's input for every session shorter than 71.6 minutes is unchanged.
 #[tokio::test]
 async fn pre_wrap_sample_send_time_equals_the_emitted_stamp() {
-    use crate::transport::ack::{AckBatch, AckEntry};
+    use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
     let mut bridge = make_bridge_for_test().await;
     let now = super::now_std();
     bridge.reliable_emitter.time_base = now - std::time::Duration::from_millis(1234);
@@ -6144,7 +6156,7 @@ async fn pre_wrap_sample_send_time_equals_the_emitted_stamp() {
             arrival_time_ms_lo16: 1,
         }],
     };
-    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.dispatch_ack_v4_datagram(&batch.encode());
     assert_eq!(bridge.bwe_samples_buffer[0].server_emit_us, 1_234_000);
 }
 
@@ -6262,13 +6274,13 @@ async fn acking_a_superseded_bundled_emission_does_not_release_its_palette_twice
     assert_eq!(bridge.palette_table.ref_count[9], 1);
 
     // The superseded datagram turns out to have arrived.
-    let batch = crate::transport::ack::AckBatch {
-        entries: vec![crate::transport::ack::AckEntry {
+    let batch = crate::transport::io_bridge::test_ack::AckBatch {
+        entries: vec![crate::transport::io_bridge::test_ack::AckEntry {
             wire_seq: 2001,
             arrival_time_ms_lo16: 0,
         }],
     };
-    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.dispatch_ack_v4_datagram(&batch.encode());
 
     assert_eq!(
         bridge.palette_table.in_flight_carrying[9], 1,
@@ -6719,27 +6731,21 @@ fn the_token_wake_floor_is_a_millisecond_or_a_datagram_at_the_rate() {
 /// is charged to the bucket. `depth_violations` stays for the gated classes.
 #[tokio::test(start_paused = true)]
 async fn ungated_accepts_at_or_above_the_depth_target_are_counted() {
-    use super::transport_probe::Enqueued;
     let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
     let server = QuicServer::new().expect("QuicServer::new");
     let (_tx, rx) = mpsc::channel(8);
     let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
     bridge.gate = Some(pacing::GateParams { d_target: 2_000 });
     let h = ConnectionHandle(0);
-    let e = |queued: u64| Enqueued {
-        class: WireClass::H264,
-        gated: false,
-        dg_len: 1_000,
-        framing_len: 2,
-        wire_seq: None,
-        cum_enqueued: queued,
-        queued,
-    };
+    // A lone control frame of 1,000 bytes: no records, so ungated.
+    let e = |queued: u64| (control_bundle(1_000), queued);
     // The FIFO stood at 500 before this one (1,502 after): below.
-    bridge.note_enqueued(h, e(1_502));
+    let (b, q) = e(1_502);
+    bridge.note_bundle_enqueued(h, &b, 2, q, q);
     assert_eq!(bridge.instr.admission.ungated_at_depth, 0);
     // It stood at 2,000 before (3,002 after): at the target.
-    bridge.note_enqueued(h, e(3_002));
+    let (b, q) = e(3_002);
+    bridge.note_bundle_enqueued(h, &b, 2, q, q);
     assert_eq!(bridge.instr.admission.ungated_at_depth, 1);
     assert_eq!(bridge.instr.admission.depth_violations, 0);
     assert_eq!(bridge.instr.admission.soft_charged_bytes, 2_004);
@@ -6801,7 +6807,7 @@ async fn a_queued_transmission_is_not_declared_lost_and_a_departed_one_is_report
 /// the FIFO; the latency statistics keep the build stamp.
 #[tokio::test]
 async fn an_acknowledged_transmission_reaches_the_estimator_at_its_departure_time() {
-    use crate::transport::ack::{AckBatch, AckEntry};
+    use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
     let mut bridge = make_bridge_for_test().await;
     let base = bridge.reliable_emitter.time_base;
     let now = super::now_std();
@@ -6816,7 +6822,7 @@ async fn an_acknowledged_transmission_reaches_the_estimator_at_its_departure_tim
             arrival_time_ms_lo16: 3,
         }],
     };
-    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.dispatch_ack_v4_datagram(&batch.encode());
     assert_eq!(bridge.bwe_samples_buffer.len(), 1);
     let s = &bridge.bwe_samples_buffer[0];
     assert_eq!(s.depart_us, 9_000, "the estimator's send time");
@@ -6840,7 +6846,7 @@ async fn an_acknowledged_transmission_reaches_the_estimator_at_its_departure_tim
 /// declared lost leaves the tally without feeding the sampler.
 #[tokio::test]
 async fn departures_are_marked_and_an_ack_batch_makes_one_rate_sample() {
-    use crate::transport::ack::{AckBatch, AckEntry};
+    use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
     let mut bridge = make_bridge_for_test().await;
     let now = super::now_std();
     let t0 = now - std::time::Duration::from_millis(40);
@@ -6869,7 +6875,7 @@ async fn departures_are_marked_and_an_ack_batch_makes_one_rate_sample() {
     // 4 is acknowledged ahead of 1..=3, which makes them holes; the time rule
     // (zero threshold) declares them lost. Their bytes leave the tally and
     // they are never sampled.
-    bridge.dispatch_ack_datagram(&ack(4..=4));
+    bridge.dispatch_ack_v4_datagram(&ack(4..=4));
     let lost = bridge.transmission_ledger.detect_losses_at(
         now + std::time::Duration::from_secs(60),
         std::time::Duration::ZERO,
@@ -6889,7 +6895,7 @@ async fn departures_are_marked_and_an_ack_batch_makes_one_rate_sample() {
     }
     assert_eq!(bridge.transmission_ledger.departed_bytes_in_flight(), 4_800);
 
-    bridge.dispatch_ack_datagram(&ack(11..=13));
+    bridge.dispatch_ack_v4_datagram(&ack(11..=13));
     let st = bridge.delivery_sampler.stats(super::now_std());
     assert_eq!(st.acked, 4);
     assert_eq!(st.samples, 2, "one sample per acknowledgement batch");
@@ -6897,7 +6903,7 @@ async fn departures_are_marked_and_an_ack_batch_makes_one_rate_sample() {
     assert_eq!(bridge.transmission_ledger.departed_bytes_in_flight(), 1_200);
 
     // A duplicate of the same batch resolves to nothing and samples nothing.
-    bridge.dispatch_ack_datagram(&ack(11..=13));
+    bridge.dispatch_ack_v4_datagram(&ack(11..=13));
     assert_eq!(bridge.delivery_sampler.stats(super::now_std()).samples, 2);
 }
 
@@ -6906,7 +6912,7 @@ async fn departures_are_marked_and_an_ack_batch_makes_one_rate_sample() {
 /// mark). One that may be an FEC recovery is not (nothing was delivered).
 #[tokio::test]
 async fn a_late_ack_of_a_declared_lost_transmission_is_still_sampled() {
-    use crate::transport::ack::{AckBatch, AckEntry};
+    use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
     let mut bridge = make_bridge_for_test().await;
     let now = super::now_std();
     let t0 = now - std::time::Duration::from_millis(40);
@@ -6925,7 +6931,7 @@ async fn a_late_ack_of_a_declared_lost_transmission_is_still_sampled() {
         }
         .encode()
     };
-    bridge.dispatch_ack_datagram(&ack(3));
+    bridge.dispatch_ack_v4_datagram(&ack(3));
     let lost = bridge.transmission_ledger.detect_losses_at(
         now + std::time::Duration::from_secs(60),
         std::time::Duration::ZERO,
@@ -6934,7 +6940,7 @@ async fn a_late_ack_of_a_declared_lost_transmission_is_still_sampled() {
     let before = bridge.delivery_sampler.stats(super::now_std());
     assert_eq!((before.acked, before.samples), (1, 1));
 
-    bridge.dispatch_ack_datagram(&ack(2));
+    bridge.dispatch_ack_v4_datagram(&ack(2));
     let after = bridge.delivery_sampler.stats(super::now_std());
     assert_eq!(after.acked, 2, "the late ack was folded in");
     assert_eq!(after.samples, 2, "and made a sample");
@@ -6950,7 +6956,7 @@ async fn a_late_ack_of_a_declared_lost_transmission_is_still_sampled() {
 /// be read against the fresh estimator.
 #[tokio::test]
 async fn a_session_change_replaces_the_delivery_sampler_and_drops_old_marks() {
-    use crate::transport::ack::{AckBatch, AckEntry};
+    use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
     let mut bridge = make_bridge_for_test().await;
     let now = super::now_std();
     let t0 = now - std::time::Duration::from_millis(40);
@@ -6969,7 +6975,7 @@ async fn a_session_change_replaces_the_delivery_sampler_and_drops_old_marks() {
         }
         .encode()
     };
-    bridge.dispatch_ack_datagram(&ack(1));
+    bridge.dispatch_ack_v4_datagram(&ack(1));
     let before = bridge.delivery_sampler.stats(super::now_std());
     assert_eq!(before.marked, 3);
     assert_eq!(before.samples, 1, "premise: the old sampler had state");
@@ -6983,7 +6989,7 @@ async fn a_session_change_replaces_the_delivery_sampler_and_drops_old_marks() {
     // (the same call resets both), so their acknowledgement is unknown and is
     // not sampled against the new sampler.
     assert_eq!(bridge.transmission_ledger.departed(2), None);
-    bridge.dispatch_ack_datagram(&ack(2));
+    bridge.dispatch_ack_v4_datagram(&ack(2));
     let st = bridge.delivery_sampler.stats(super::now_std());
     assert_eq!((st.acked, st.samples), (0, 0));
 }
@@ -7060,7 +7066,7 @@ async fn a_new_session_does_not_inherit_the_old_sessions_verdicts() {
 /// Skipping the retraction leaves the loss rate and the pending loss standing.
 #[tokio::test(start_paused = true)]
 async fn a_spurious_verdict_is_retracted_and_its_round_trip_is_not_a_sample() {
-    use crate::transport::ack::{AckBatch, AckEntry};
+    use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
     let mut bridge = make_bridge_for_test().await;
     bridge
         .reliable_emitter
@@ -7090,7 +7096,7 @@ async fn a_spurious_verdict_is_retracted_and_its_round_trip_is_not_a_sample() {
             arrival_time_ms_lo16: 1,
         }],
     };
-    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.dispatch_ack_v4_datagram(&batch.encode());
     bridge.retract_late_acked_losses();
 
     assert!(
@@ -7618,6 +7624,7 @@ async fn refs_bridge(
     };
     let log = backend.log.clone();
     let (mut bridge, peer) = bridge_with_backend(backend);
+    crate::transport::io_bridge::test_ack::attach_test_wire(&mut bridge);
     bridge.test_commit_dg_size = Some(1_200);
     bridge.client_caps.supports_h264 = true;
     bridge.client_caps.h264_acked_ref = true;
@@ -7655,29 +7662,15 @@ fn sent_frame_headers(bridge: &IoBridge) -> Vec<(u32, u16, u16, u8, u8, u32)> {
         .collect()
 }
 
+/// Every bundle that carried a fragment of `frame_seq` leaves quinn's FIFO and
+/// is acknowledged (ACK v4): the client received the frame.
 fn ack_every_fragment(bridge: &mut IoBridge, frame_seq: u32) {
-    let ws: Vec<u32> = bridge
-        .sent_log_for_test
-        .iter()
-        .filter(|d| d.len() >= 22 && d[0] & 0x80 == 0)
-        .filter(|d| u32::from_be_bytes(d[0..4].try_into().unwrap()) == frame_seq)
-        .map(|d| u32::from_be_bytes(d[8..12].try_into().unwrap()))
-        .filter(|w| *w != crate::transport::protocol::NO_ACK)
-        .collect();
-    bridge.record_emitted_transmissions(now_std());
-    for w in &ws {
-        bridge.transmission_ledger.mark_departed(*w, now_std(), 0);
-    }
-    let batch = ghostframe_protocol::ack::AckBatch {
-        entries: ws
-            .iter()
-            .map(|w| ghostframe_protocol::ack::AckEntry {
-                wire_seq: *w,
-                arrival_time_ms_lo16: 0,
-            })
-            .collect(),
+    use crate::transport::io_bridge::test_ack::{
+        ack_bundles, bundles_of_h264_frame, depart_bundles,
     };
-    bridge.dispatch_ack_datagram(&batch.encode());
+    let ids = bundles_of_h264_frame(bridge, frame_seq);
+    depart_bundles(bridge, &ids);
+    ack_bundles(bridge, &ids);
 }
 
 fn frame_ack_datagram(newest: u32, decoded: u64, refused: u64) -> Vec<u8> {
@@ -8231,6 +8224,7 @@ fn plan_commit(bridge: &mut IoBridge, seq: u32) -> Option<crate::encoder::h264::
 
 fn acked_refs_bridge() -> IoBridge {
     let (mut bridge, _peer) = bridge_with_backend(RecordingBackend::default());
+    crate::transport::io_bridge::test_ack::attach_test_wire(&mut bridge);
     bridge.test_commit_dg_size = Some(1_200);
     bridge.client_caps.supports_h264 = true;
     bridge.client_caps.h264_acked_ref = true;
@@ -8366,13 +8360,7 @@ async fn a_large_idr_draining_a_fragment_at_a_time_is_not_a_stall() {
     let mut stalled_at = None;
     for (i, w) in ws.iter().enumerate() {
         tokio::time::advance(step).await;
-        let batch = ghostframe_protocol::ack::AckBatch {
-            entries: vec![ghostframe_protocol::ack::AckEntry {
-                wire_seq: *w,
-                arrival_time_ms_lo16: 0,
-            }],
-        };
-        bridge.dispatch_ack_datagram(&batch.encode());
+        crate::transport::io_bridge::test_ack::ack_records(&mut bridge, &[*w]);
         if bridge.update_h264_stall(now_std()) && stalled_at.is_none() {
             stalled_at = Some(i);
         }
@@ -9451,6 +9439,7 @@ async fn observed_bridge(
     };
     let log = backend.log.clone();
     let (mut bridge, peer) = bridge_with_backend(backend);
+    crate::transport::io_bridge::test_ack::attach_test_wire(&mut bridge);
     bridge.test_commit_dg_size = Some(1_200);
     bridge.client_caps.supports_h264 = true;
     bridge.client_caps.h264_acked_ref = true;

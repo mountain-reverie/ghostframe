@@ -30,7 +30,7 @@ fn send(c: &mut ClientCore, seq: u32, idr: bool, reference: u32, now_us: u64) ->
     let mut delivered = false;
     for dg in fragment_frame_ref(seq, 0, info, &[seq as u8; 600], 1200) {
         delivered |= c
-            .handle_datagram(&dg, now_us)
+            .handle_datagram(&ghostframe_client_core::frame_one(&dg), now_us)
             .iter()
             .any(|e| matches!(e, Event::NeedsH264 { frame_seq, .. } if *frame_seq == seq));
     }

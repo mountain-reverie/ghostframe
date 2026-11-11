@@ -28,8 +28,10 @@ fn solid_tile_datagram_becomes_tile_ready() {
 
     {
         let conn = server.connections.values_mut().next().unwrap();
-        for dg in &datagrams {
-            wt.send_datagram(conn, dg).expect("send_datagram");
+        // Every datagram the client accepts is a rev 6 frame.
+        for (i, dg) in datagrams.iter().enumerate() {
+            let frame = ghostframe_client_core::frame_plain(i as u32, &[dg]);
+            wt.send_datagram(conn, &frame).expect("send_datagram");
         }
     }
     pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 32);

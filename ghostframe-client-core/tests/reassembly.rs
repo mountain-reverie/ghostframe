@@ -65,7 +65,7 @@ fn solid_tile_roundtrip_single_fragment() {
     // Solid payload is BGRA [0x11, 0x22, 0x33, 0xFF].
     let dgs = tile_datagrams(1, 3, 4, Codec::Solid, 0, &[0x11, 0x22, 0x33, 0xFF], 1200);
     assert_eq!(dgs.len(), 1);
-    let evs = core.handle_datagram(&dgs[0], 1_000);
+    let evs = core.handle_datagram(&ghostframe_client_core::frame_one(&dgs[0]), 1_000);
     match &evs[..] {
         [Event::TileReady {
             frame_seq: 1,
@@ -91,13 +91,15 @@ fn a_tile_split_over_several_datagrams_is_refused() {
     let dgs = tile_datagrams(5, 1, 2, Codec::Cdf53, 0, &payload, 4);
     assert_eq!(dgs.len(), 3);
     for dg in dgs.iter().rev() {
-        assert!(core.handle_datagram(dg, 100).is_empty());
+        assert!(core
+            .handle_datagram(&ghostframe_client_core::frame_one(dg), 100)
+            .is_empty());
     }
     // The same payload as one datagram completes.
     let one = tile_datagrams(5, 1, 2, Codec::Cdf53, 0, &payload, 1200);
     assert_eq!(one.len(), 1);
     assert!(core
-        .handle_datagram(&one[0], 101)
+        .handle_datagram(&ghostframe_client_core::frame_one(&one[0]), 101)
         .iter()
         .any(|e| matches!(e, Event::TileReady { frame_seq: 5, .. })));
 }
@@ -106,7 +108,7 @@ fn a_tile_split_over_several_datagrams_is_refused() {
 fn sentinel_emits_frame_dimensions() {
     let mut core = test_core();
     let dg = build_frame_dimensions_datagram(7, 0, 1920, 1080);
-    let evs = core.handle_datagram(&dg, 1_000);
+    let evs = core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 1_000);
     match &evs[..] {
         [Event::FrameDimensions {
             width: 1920,
@@ -123,7 +125,7 @@ fn an_eviction_datagram_becomes_an_event() {
         ghostframe_protocol::eviction::EvictionReason::DisplacedByNewSession,
     );
 
-    let events = core.handle_datagram(&dg, 1_000);
+    let events = core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 1_000);
 
     assert!(
         events.iter().any(|e| matches!(
@@ -138,35 +140,42 @@ fn an_eviction_datagram_becomes_an_event() {
 }
 
 #[test]
-fn an_eviction_datagram_is_not_acked_and_leaves_no_assembly_state() {
+fn an_eviction_datagram_is_not_rejected_and_leaves_no_assembly_state() {
     let mut core = test_core();
     let dg = ghostframe_protocol::eviction::build_eviction_datagram(
         ghostframe_protocol::eviction::EvictionReason::DisplacedByNewSession,
     );
 
-    let _ = core.handle_datagram(&dg, 1_000);
+    let _ = core.handle_datagram(&ghostframe_client_core::frame_plain(0, &[&dg]), 1_000);
 
-    // It must not be ACKed as though it were tile content: drive the ACK
-    // batcher's own deadline and confirm nothing is emitted.
+    // The bundle that carried it arrived, so it is acknowledged (ACK v4);
+    // the notice itself is a valid record: it must not be reported
+    // CONTENT_REJECTED, as it would be if it were mistaken for broken tile
+    // content.
     if let Some(t) = core.poll_timeout() {
         let _ = core.on_timeout(t);
     }
-    let mut saw_ack = false;
+    let (mut saw_ack, mut saw_rejected) = (false, false);
     while let Some(out) = core.poll_transmit(2_000) {
-        if let PollOutput::Datagram(b) = out {
-            if b.first() == Some(&ghostframe_protocol::ack::ACK_BATCH_MSG_TYPE) {
-                saw_ack = true;
+        match out {
+            PollOutput::Datagram(b)
+                if b.first() == Some(&ghostframe_protocol::fec::feedback::FEC_ACK_V4_MSG_TYPE) =>
+            {
+                saw_ack = true
             }
+            PollOutput::RepairStatus(_) => saw_rejected = true,
+            _ => {}
         }
     }
+    assert!(saw_ack, "control: the bundle is acknowledged");
     assert!(
-        !saw_ack,
-        "an eviction notice must not be ACKed as tile content"
+        !saw_rejected,
+        "an eviction notice must not be rejected as tile content"
     );
 
     // And it must not fall through into tile assembly as a Codec::Skip tile
     // at the eviction sentinel coordinates (254, 254).
-    let evs = core.handle_datagram(&dg, 2_000);
+    let evs = core.handle_datagram(&ghostframe_client_core::frame_one(&dg), 2_000);
     assert!(
         !evs.iter().any(|e| matches!(e, Event::TileReady { .. })),
         "eviction sentinel must never reach tile assembly: {evs:?}"
@@ -183,7 +192,7 @@ fn cdf53_ack_deferred_until_prevalidation() {
 
     // No ACK datagram is emitted synchronously during handle_datagram (the
     // ACK batcher buffers a single entry until its deadline).
-    let evs = core.handle_datagram(&dgs[0], 1_000);
+    let evs = core.handle_datagram(&ghostframe_client_core::frame_one(&dgs[0]), 1_000);
     assert!(
         evs.iter().any(|e| matches!(e, Event::TileReady { .. })),
         "valid cdf53 must produce TileReady: {evs:?}"
@@ -201,11 +210,11 @@ fn cdf53_ack_deferred_until_prevalidation() {
         .poll_transmit(deadline)
         .expect("ACK datagram after deadline");
     match ack {
-        // AckBatch (ACK_BATCH_MSG_TYPE) rides the Datagram channel as 0x06;
+        // The bundle's ACK v4 batch rides the Datagram channel as 0x08;
         // decode-error messages ride the Stream channel.
         PollOutput::Datagram(buf) => assert_eq!(
             buf[0],
-            ghostframe_protocol::ack::ACK_BATCH_MSG_TYPE,
+            ghostframe_protocol::fec::feedback::FEC_ACK_V4_MSG_TYPE,
             "expected AckBatch datagram"
         ),
         other => panic!("expected ACK datagram, got {other:?}"),
@@ -217,7 +226,7 @@ fn cdf53_ack_deferred_until_prevalidation() {
     // prevalidation fails: a Stream decode-error message is emitted and NO
     // ACK entry is queued for it.
     let corrupt = tile_datagrams(2, 4, 5, Codec::Cdf53, 0, &[0x00, 0x01, 0xFF], 1200);
-    let evs = core.handle_datagram(&corrupt[0], 2_000);
+    let evs = core.handle_datagram(&ghostframe_client_core::frame_one(&corrupt[0]), 2_000);
     assert!(
         evs.iter().any(|e| matches!(e, Event::DecodeError { .. })),
         "corrupt cdf53 must produce DecodeError event: {evs:?}"
@@ -230,7 +239,7 @@ fn cdf53_ack_deferred_until_prevalidation() {
         match out {
             PollOutput::Stream(b) if b.first() == Some(&0x04) => saw_stream_error = true,
             PollOutput::Datagram(b)
-                if b.first() == Some(&ghostframe_protocol::ack::ACK_BATCH_MSG_TYPE) =>
+                if b.first() == Some(&ghostframe_protocol::fec::feedback::FEC_ACK_V4_MSG_TYPE) =>
             {
                 saw_ack = true
             }
@@ -287,7 +296,7 @@ fn datagram_counts_split_tile_and_frame_as_the_dispatch_does() {
         "tile payload should span multiple datagrams"
     );
     for dg in &tile {
-        core.handle_datagram(dg, 0);
+        core.handle_datagram(&ghostframe_client_core::frame_one(dg), 0);
     }
     assert_eq!(
         core.datagram_counts(),
@@ -301,7 +310,7 @@ fn datagram_counts_split_tile_and_frame_as_the_dispatch_does() {
         "frame payload should span multiple datagrams"
     );
     for dg in &frame {
-        core.handle_datagram(dg, 0);
+        core.handle_datagram(&ghostframe_client_core::frame_one(dg), 0);
     }
     assert_eq!(
         core.datagram_counts(),
@@ -318,11 +327,11 @@ fn datagram_counts_split_tile_and_frame_as_the_dispatch_does() {
 fn datagram_counts_ignore_non_protocol_traffic() {
     let mut core = test_core();
 
-    core.handle_datagram(b"", 0);
-    core.handle_datagram(b"pong", 0);
+    core.handle_datagram(&ghostframe_client_core::frame_one(b""), 0);
+    core.handle_datagram(&ghostframe_client_core::frame_one(b"pong"), 0);
     // Long enough to pass the ping/pong guard, one byte short of a frame
     // header (22): neither a tile nor a frame datagram.
-    core.handle_datagram(&[0u8; 21], 0);
+    core.handle_datagram(&ghostframe_client_core::frame_one([0u8; 21]), 0);
     assert_eq!(
         core.datagram_counts(),
         (0, 0),
@@ -355,19 +364,28 @@ fn suspension_reported(core: &mut ClientCore, now_us: u64) -> bool {
 #[test]
 fn content_after_an_idle_screen_is_not_reported_as_a_suspension() {
     let mut core = test_core();
-    core.handle_datagram(&stamped_solid(1, 0, 1_000_000), 50_000);
+    core.handle_datagram(
+        &ghostframe_client_core::frame_one(stamped_solid(1, 0, 1_000_000)),
+        50_000,
+    );
     // The sender was quiet for 9.4 s; so, therefore, was the link.
-    core.handle_datagram(&stamped_solid(2, 1, 10_400_000), 9_450_000);
+    core.handle_datagram(
+        &ghostframe_client_core::frame_one(stamped_solid(2, 1, 10_400_000)),
+        9_450_000,
+    );
     assert!(!suspension_reported(&mut core, 9_500_000));
 
     // A frame-dimensions sentinel arriving late carries the capture clock,
     // not an emit stamp, and must not be read as one.
     let sentinel = ghostframe_protocol::protocol::build_frame_dimensions_datagram(3, 7, 64, 64);
-    core.handle_datagram(&sentinel, 12_000_000);
+    core.handle_datagram(&ghostframe_client_core::frame_one(&sentinel), 12_000_000);
     assert!(!suspension_reported(&mut core, 12_050_000));
 
     // Whereas the path sitting on a datagram is still reported: sent 10 ms
     // after the last tile datagram, delivered 3 s after it.
-    core.handle_datagram(&stamped_solid(4, 2, 10_410_000), 12_450_000);
+    core.handle_datagram(
+        &ghostframe_client_core::frame_one(stamped_solid(4, 2, 10_410_000)),
+        12_450_000,
+    );
     assert!(suspension_reported(&mut core, 12_500_000));
 }

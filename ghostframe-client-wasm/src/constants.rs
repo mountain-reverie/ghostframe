@@ -8,14 +8,10 @@
 //! `wasm-bindgen` cannot export a `const`, so each is a getter.
 
 use ghostframe_client_core::{
-    ack_batcher::FLUSH_INTERVAL_US as ACK_FLUSH_INTERVAL_US,
     decode_error_batcher::{DECODE_ERROR_MSG_TYPE, DECODE_ERROR_SIZE},
     input::INPUT_MSG_TYPE,
     loss_tracker::{HELLO_MSG_TYPE, HELLO_SIZE},
     nack_batcher::{FLUSH_INTERVAL_US as NACK_FLUSH_INTERVAL_US, NACK_BATCH_MAX},
-};
-use ghostframe_protocol::ack::{
-    ACK_BATCH_MSG_TYPE, ACK_ENTRY_SIZE, ACK_OVERLAP_COUNT, MAX_FRESH_ENTRIES_PER_BATCH,
 };
 use ghostframe_protocol::codec::cdf53::CDF53_PASS_COUNT;
 use ghostframe_protocol::codec::pal_rle::palette_fingerprint_bgra;
@@ -41,32 +37,6 @@ macro_rules! export_const {
         }
     };
 }
-
-export_const!(
-    "ackBatchMsgType",
-    ack_batch_msg_type,
-    u8,
-    ACK_BATCH_MSG_TYPE
-);
-export_const!("ackEntrySize", ack_entry_size, usize, ACK_ENTRY_SIZE);
-export_const!(
-    "ackOverlapCount",
-    ack_overlap_count,
-    usize,
-    ACK_OVERLAP_COUNT
-);
-export_const!(
-    "maxAckEntries",
-    max_ack_entries,
-    usize,
-    MAX_FRESH_ENTRIES_PER_BATCH
-);
-export_const!(
-    "ackFlushIntervalMs",
-    ack_flush_interval_ms,
-    u64,
-    ACK_FLUSH_INTERVAL_US / 1000
-);
 
 export_const!(
     "tileNackEnvelope",

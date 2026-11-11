@@ -103,10 +103,10 @@ fn effects(b: &IoBridge) -> Effects {
     }
 }
 
-/// One scenario, acknowledged through either format: five passes, one of them
-/// already declared lost (so its acknowledgement is a late one), and an id
-/// nobody recorded.
-fn run_ack(v4: bool) -> Effects {
+/// One scenario, acknowledged by ACK v4: five passes, one of them already
+/// declared lost (so its acknowledgement is a late one), and an id nobody
+/// recorded.
+fn run_ack() -> Effects {
     let mut b = bridge();
     let ws = seed(&mut b, 5);
     b.declare_lost_for_test(&[ws[4]]);
@@ -117,55 +117,36 @@ fn run_ack(v4: bool) -> Effects {
     );
     let ids = [ws[0], ws[2], ws[4], 0x00AB_CDEF];
     let stamps = [1_500u16, 1_510, 1_520, 1_530];
-    if v4 {
-        let dg = BundleAckBatch {
-            entries: ids
-                .iter()
-                .zip(stamps)
-                .map(|(&bundle_seq, arrival_time_ms_lo16)| BundleAck {
-                    bundle_seq,
-                    arrival_time_ms_lo16,
-                })
-                .collect(),
-        }
-        .encode();
-        b.dispatch_inbound_datagram(H, &dg);
-    } else {
-        let dg = crate::transport::ack::AckBatch {
-            entries: ids
-                .iter()
-                .zip(stamps)
-                .map(
-                    |(&wire_seq, arrival_time_ms_lo16)| crate::transport::ack::AckEntry {
-                        wire_seq,
-                        arrival_time_ms_lo16,
-                    },
-                )
-                .collect(),
-        }
-        .encode();
-        b.dispatch_inbound_datagram(H, &dg);
+    let dg = BundleAckBatch {
+        entries: ids
+            .iter()
+            .zip(stamps)
+            .map(|(&bundle_seq, arrival_time_ms_lo16)| BundleAck {
+                bundle_seq,
+                arrival_time_ms_lo16,
+            })
+            .collect(),
     }
+    .encode();
+    b.dispatch_inbound_datagram(H, &dg);
     effects(&b)
 }
 
+/// The scenario moves every consumer (live, late and unknown entries), so the
+/// effects are not an untouched structure.
 #[tokio::test]
-async fn an_ack_v4_batch_has_the_effects_of_the_same_0x06_batch() {
-    let v1 = run_ack(false);
-    let v4 = run_ack(true);
-    // The premise: the scenario moves every consumer, so equality is not
-    // two untouched structures comparing equal.
-    assert_eq!(v1.ack_hit, 3, "{v1:?}");
-    assert_eq!(v1.ledger_records, 2, "{v1:?}");
-    assert_eq!(v1.ledger_unknown_acks, 1, "{v1:?}");
-    assert_eq!(v1.ledger_acked_after_lost, 1, "{v1:?}");
+async fn an_ack_v4_batch_moves_every_ack_consumer() {
+    let v4 = run_ack();
+    assert_eq!(v4.ack_hit, 3, "{v4:?}");
+    assert_eq!(v4.ledger_records, 2, "{v4:?}");
+    assert_eq!(v4.ledger_unknown_acks, 1, "{v4:?}");
+    assert_eq!(v4.ledger_acked_after_lost, 1, "{v4:?}");
     assert_eq!(
-        v1.bwe_samples.len(),
+        v4.bwe_samples.len(),
         2,
         "live acks sample, the late one does not"
     );
-    assert_eq!(v1.cache_entries, 2, "{v1:?}");
-    assert_eq!(v1, v4);
+    assert_eq!(v4.cache_entries, 2, "{v4:?}");
 }
 
 #[tokio::test]

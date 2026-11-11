@@ -22,13 +22,13 @@ fn drain(datagrams: &[Vec<u8>], delivery: TileDelivery) -> Vec<Event> {
             tile_delivery: delivery,
             cdf53_wire: false,
             display: None,
-            fec_framing: false,
         },
         0,
     );
     let mut events = Vec::new();
     for (i, d) in datagrams.iter().enumerate() {
-        events.extend(core.handle_datagram(d, i as u64 * 1_000));
+        events
+            .extend(core.handle_datagram(&ghostframe_client_core::frame_one(d), i as u64 * 1_000));
     }
     events
 }

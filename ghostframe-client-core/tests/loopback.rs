@@ -323,7 +323,7 @@ fn solid_palrle_cdf53_full_frame_converges_pixel_exact() {
 
     let mut last_ready: HashMap<(u8, u8), Vec<u8>> = HashMap::new();
     for (t, dg) in all_datagrams.iter().enumerate() {
-        let evs = core.handle_datagram(dg, t as u64);
+        let evs = core.handle_datagram(&ghostframe_client_core::frame_one(dg), t as u64);
         for e in evs {
             if let Event::TileReady {
                 tile_x,
@@ -409,7 +409,7 @@ fn loss_with_nack_replay_converges() {
             t += 1;
             continue;
         }
-        let evs = core.handle_datagram(dg, t);
+        let evs = core.handle_datagram(&ghostframe_client_core::frame_one(dg), t);
         for e in evs {
             if let Event::TileReady {
                 tile_x,
@@ -460,7 +460,7 @@ fn loss_with_nack_replay_converges() {
     for (fs, tx, ty, pass_idx) in &nack_entries {
         // A pass is one datagram: fragment 0 of 1.
         if let Some(dg) = by_key.get(&(*fs, *tx, *ty, *pass_idx, 0u16)) {
-            let evs = core.handle_datagram(dg, t);
+            let evs = core.handle_datagram(&ghostframe_client_core::frame_one(dg), t);
             for e in evs {
                 if let Event::TileReady {
                     tile_x,
@@ -487,7 +487,7 @@ fn loss_with_nack_replay_converges() {
     // NACK rounds this particular timer schedule triggered.
     for (i, dg) in all_datagrams.iter().enumerate() {
         if i % 3 == 2 {
-            let evs = core.handle_datagram(dg, t);
+            let evs = core.handle_datagram(&ghostframe_client_core::frame_one(dg), t);
             for e in evs {
                 if let Event::TileReady {
                     tile_x,
@@ -563,7 +563,7 @@ fn duplicated_and_reordered_delivery_is_idempotent() {
     let mut baseline_core = test_core();
     let mut baseline_ready: HashMap<(u8, u8), Vec<u8>> = HashMap::new();
     for (i, dg) in baseline_datagrams.iter().enumerate() {
-        let evs = baseline_core.handle_datagram(dg, i as u64);
+        let evs = baseline_core.handle_datagram(&ghostframe_client_core::frame_one(dg), i as u64);
         for e in evs {
             if let Event::TileReady {
                 tile_x,
@@ -593,7 +593,7 @@ fn duplicated_and_reordered_delivery_is_idempotent() {
     let mut ready: HashMap<(u8, u8), Vec<u8>> = HashMap::new();
     let mut ready_count = 0usize;
     for (i, dg) in delivery.iter().enumerate() {
-        let evs = core.handle_datagram(dg, i as u64);
+        let evs = core.handle_datagram(&ghostframe_client_core::frame_one(dg), i as u64);
         for e in evs {
             if let Event::TileReady {
                 tile_x,
