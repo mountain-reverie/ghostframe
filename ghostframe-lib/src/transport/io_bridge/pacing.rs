@@ -357,6 +357,8 @@ impl IoBridge {
                 break;
             }
         }
+        // Rev 6 framing: every pump ends with no open bundle.
+        self.flush_bundles();
         out.admitted = (self.instr.admission.datagrams_admitted - admitted_before) as usize;
         // A pass that ran out of work before the cluster was full: the frame
         // was smaller than the probe, and a short fill says nothing about the

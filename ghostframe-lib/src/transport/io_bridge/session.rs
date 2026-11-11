@@ -524,9 +524,40 @@ impl IoBridge {
 
         let datagram = build_eviction_datagram(reason);
         let mut notices_sent = 0usize;
+        // Rev 6 framing: what the live session's packer still holds goes out
+        // before the notice, and the notice is a lone PLAIN frame (framed by
+        // a throwaway packer when `handle` is no longer the live session).
+        let framed_live = self.fec_framing && self.last_hello_from == Some(handle);
+        if framed_live {
+            self.flush_bundles();
+        }
         if let Some(conn) = self.server.connections.get_mut(&handle) {
             if let Some(wt) = self.wt_sessions.get_mut(&handle) {
                 for _ in 0..EVICTION_REPEATS {
+                    let frame: std::borrow::Cow<[u8]> = if self.fec_framing {
+                        let Some(max_dg) = conn
+                            .datagrams()
+                            .max_size()
+                            .map(|raw| raw.saturating_sub(wt.datagram_framing_len()))
+                            .filter(|&m| m > 0)
+                        else {
+                            break;
+                        };
+                        let mut scratch;
+                        let packer = if framed_live {
+                            &mut self.packer
+                        } else {
+                            scratch = crate::transport::fec_tx::packer::Packer::new();
+                            &mut scratch
+                        };
+                        let bundles = packer.lone(&datagram, max_dg);
+                        match bundles.into_iter().next_back() {
+                            Some(b) => std::borrow::Cow::Owned(b.bytes),
+                            None => break,
+                        }
+                    } else {
+                        std::borrow::Cow::Borrowed(&datagram[..])
+                    };
                     // Deliberately discarded: `Disabled` means the session
                     // is already gone (the outcome we are driving towards)
                     // and `Blocked` means quinn's send buffer is full,
@@ -537,7 +568,7 @@ impl IoBridge {
                     // likely state, not the exotic one (see the
                     // `datagram_send_errs` field note: these failures are
                     // overwhelmingly `Blocked`).
-                    if wt.send_datagram(conn, &datagram).is_ok() {
+                    if wt.send_datagram(conn, &frame).is_ok() {
                         notices_sent += 1;
                         // Not put in the departure tracker, though it is in
                         // quinn's FIFO: this session is forgotten just below,
@@ -550,12 +581,12 @@ impl IoBridge {
                             let framing = wt.datagram_framing_len();
                             self.instr
                                 .offered
-                                .bill(WireClass::Control, datagram.len(), framing);
+                                .bill(WireClass::Control, frame.len(), framing);
                             // Billed to the bucket after the fact, like every
                             // datagram that does not wait in a queue.
-                            self.admission.charge(datagram.len() + framing);
+                            self.admission.charge(frame.len() + framing);
                             self.instr.admission.soft_charged_bytes +=
-                                (datagram.len() + framing) as u64;
+                                (frame.len() + framing) as u64;
                         }
                     }
                 }

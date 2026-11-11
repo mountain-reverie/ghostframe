@@ -11,13 +11,14 @@ use crate::transport::reliable_emitter::Content;
 
 /// What the ledger and billing need to know about one record in a bundle.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields read by the ledger and billing in C5
 pub(crate) struct RecordMeta {
     pub wire_seq: u32,
     pub content: Content,
     pub emit_us: u64,
     pub class: WireClass,
     pub is_pad: bool,
+    /// The record's own length (the inner datagram), for billing.
+    pub len: usize,
 }
 
 /// One finished bundle: the datagram bytes and the records it carries.
@@ -41,6 +42,11 @@ pub(crate) struct Packer {
 impl Packer {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Bytes of the open bundle's records (its frame header not counted).
+    pub(crate) fn open_bytes(&self) -> usize {
+        self.body.len()
     }
 
     /// Longest inner datagram for a `max_dg` (plan decision 3).
@@ -165,6 +171,7 @@ mod tests {
             emit_us,
             class: WireClass::H264,
             is_pad,
+            len: 0,
         }
     }
 
