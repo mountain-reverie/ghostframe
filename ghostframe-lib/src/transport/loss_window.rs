@@ -96,8 +96,17 @@ impl LossWindow {
         at
     }
 
-    /// File the verdict on one transmission sent at `sent_us`.
-    pub fn record(&mut self, sent_us: u32, lost: bool) {
+    /// File the verdict on one transmission sent at `sent_us`, which carried
+    /// `records` records.
+    ///
+    /// The unit is the record (a tile pass, an H.264 fragment): one datagram
+    /// before bundles, and still what a drop of one of them costs. A real
+    /// network loses a whole bundle and so `records` records together, which
+    /// reads the same rate; the loss injector consumes single records, each
+    /// a transmission of its own, and counting those once against bundles
+    /// that carry several would read their share several times too high.
+    pub fn record(&mut self, sent_us: u32, lost: bool, records: u32) {
+        let records = records.max(1);
         let index = self.unwrap(sent_us) / BUCKET_US;
         // Verdicts arrive nearly in send order, so the bucket is at or near
         // the back.
@@ -121,21 +130,20 @@ impl LossWindow {
         };
         let bucket = &mut self.buckets[slot];
         if lost {
-            bucket.lost += 1;
+            bucket.lost = bucket.lost.saturating_add(records);
         } else {
-            bucket.delivered += 1;
+            bucket.delivered = bucket.delivered.saturating_add(records);
         }
     }
 
     /// Withdraw a loss verdict: the transmission sent at `sent_us` was
     /// acknowledged after all. Late, but delivered.
-    pub fn retract(&mut self, sent_us: u32) {
+    pub fn retract(&mut self, sent_us: u32, records: u32) {
         let index = self.unwrap(sent_us) / BUCKET_US;
         if let Some(bucket) = self.buckets.iter_mut().rfind(|b| b.index == index) {
-            if bucket.lost > 0 {
-                bucket.lost -= 1;
-                bucket.delivered += 1;
-            }
+            let n = records.max(1).min(bucket.lost);
+            bucket.lost -= n;
+            bucket.delivered = bucket.delivered.saturating_add(n);
         }
     }
 
@@ -182,7 +190,7 @@ mod tests {
         let mut t = from_us;
         while t < to_us {
             n += 1;
-            w.record(t, lose_every != 0 && n.is_multiple_of(lose_every));
+            w.record(t, lose_every != 0 && n.is_multiple_of(lose_every), 1);
             t += step_us;
         }
     }
@@ -193,6 +201,28 @@ mod tests {
         send(&mut w, 0, 1_000_000, 1_000, 5);
         let rate = w.rate(1_000_000 + SETTLE_US);
         assert!((rate - 0.20).abs() < 0.01, "got {rate}");
+    }
+
+    /// Single-record losses (the injector's) against delivered bundles of
+    /// four records each: 15% of the records lost is 15%, not the 41% that
+    /// counting a bundle as one sample would read.
+    #[test]
+    fn the_unit_is_the_record_not_the_transmission() {
+        let mut w = LossWindow::new();
+        let mut t = 0;
+        // Per 20 records: 3 lost singly, 17 delivered in bundles of 4 (~4).
+        while t < 1_000_000 {
+            w.record(t, true, 1);
+            w.record(t + 1, true, 1);
+            w.record(t + 2, true, 1);
+            for i in 0..4 {
+                w.record(t + 3 + i, false, 4);
+            }
+            w.record(t + 7, false, 1);
+            t += 10_000;
+        }
+        let rate = w.rate(1_000_000 + SETTLE_US);
+        assert!((rate - 3.0 / 20.0).abs() < 0.01, "got {rate}");
     }
 
     /// The case the client's own count could not see: every tile is a single
@@ -227,11 +257,11 @@ mod tests {
         let mut w = LossWindow::new();
         send(&mut w, 0, 1_000_000, 1_000, 1);
         for t in (0..1_000_000u32).step_by(1_000) {
-            w.retract(t);
+            w.retract(t, 1);
         }
         assert_eq!(w.rate(1_000_000 + SETTLE_US), 0.0);
         // Nothing to withdraw twice.
-        w.retract(0);
+        w.retract(0, 1);
         assert_eq!(w.rate(1_000_000 + SETTLE_US), 0.0);
     }
 
@@ -249,11 +279,11 @@ mod tests {
             if n.is_multiple_of(50) {
                 losses.push(t);
             } else {
-                w.record(t, false);
+                w.record(t, false, 1);
             }
         }
         for t in losses {
-            w.record(t, true);
+            w.record(t, true, 1);
         }
         let rate = w.rate(1_000_000 + SETTLE_US);
         assert!((rate - 0.02).abs() < 0.001, "got {rate}");
@@ -307,7 +337,7 @@ mod tests {
         let mut n = 0u32;
         for i in 0..1_000u32 {
             n += 1;
-            w.record(start.wrapping_add(i * 1_000), n.is_multiple_of(5));
+            w.record(start.wrapping_add(i * 1_000), n.is_multiple_of(5), 1);
         }
         let now = start.wrapping_add(1_000_000 + SETTLE_US);
         let rate = w.rate(now);

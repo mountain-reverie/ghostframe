@@ -531,7 +531,8 @@ impl IoBridge {
             emit_us: tx.depart_us.unwrap_or(tx.emit_us),
             wire_bytes: tx.wire_bytes,
         });
-        self.loss_window.record(tx.emit_us as u32, true);
+        self.loss_window
+            .record(tx.emit_us as u32, true, tx.records.len() as u32);
         // CONTENT_REJECTED may still name it once its tombstone is gone.
         self.recent_bundles.remember(wire_seq, &tx);
     }
