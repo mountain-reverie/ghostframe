@@ -9,6 +9,8 @@
 
 pub mod codec;
 pub mod coef;
+pub mod feedback;
 pub mod frame;
 #[cfg(test)]
 pub(crate) mod oracle;
+pub mod repair_status;
