@@ -317,11 +317,15 @@ pub enum WasmPollOutput {
     },
 }
 
-impl From<PollOutput> for WasmPollOutput {
-    fn from(out: PollOutput) -> Self {
+impl WasmPollOutput {
+    /// `None` for outputs the JS boundary does not carry yet.
+    pub fn from_output(out: PollOutput) -> Option<Self> {
         match out {
-            PollOutput::Datagram(bytes) => WasmPollOutput::Datagram { bytes },
-            PollOutput::Stream(bytes) => WasmPollOutput::Stream { bytes },
+            PollOutput::Datagram(bytes) => Some(WasmPollOutput::Datagram { bytes }),
+            PollOutput::Stream(bytes) => Some(WasmPollOutput::Stream { bytes }),
+            // R6-b B5/B6 wire this: the repair-status stream. Never produced
+            // while `fec_framing` is off.
+            PollOutput::RepairStatus(_) => None,
         }
     }
 }

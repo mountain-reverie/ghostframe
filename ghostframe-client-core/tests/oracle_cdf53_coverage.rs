@@ -498,6 +498,7 @@ fn incomplete_tiles_names_the_tile_and_the_passes_it_is_owed() {
             tile_delivery: TileDelivery::Decoded,
             cdf53_wire: false,
             display: None,
+            fec_framing: false,
         },
         0,
     );
@@ -566,6 +567,7 @@ fn incomplete_tiles_is_empty_when_every_present_pass_arrived() {
             tile_delivery: TileDelivery::Decoded,
             cdf53_wire: false,
             display: None,
+            fec_framing: false,
         },
         0,
     );

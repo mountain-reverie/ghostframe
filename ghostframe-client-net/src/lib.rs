@@ -501,6 +501,9 @@ impl ClientNet {
                         PollOutput::Stream(bytes) => {
                             self.pending_stream_out.push(bytes);
                         }
+                        // R6-b B5/B6 wire this: the repair-status stream. Never
+                        // produced while `fec_framing` is off.
+                        PollOutput::RepairStatus(_) => {}
                     }
                 }
             }

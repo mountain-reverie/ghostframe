@@ -114,7 +114,11 @@ impl ClientCore {
     /// `TileDelivery::Decoded` mode they are then decoded to pixels here,
     /// by the same [`crate::TileDecoder`] a consumer can run elsewhere.
     pub fn handle_datagram(&mut self, bytes: &[u8], now_us: u64) -> Vec<Event> {
-        let events = self.handle_datagram_payloads(bytes, now_us);
+        let events = if self.fec.is_some() {
+            self.handle_framed_datagram(bytes, now_us)
+        } else {
+            self.handle_datagram_payloads(bytes, now_us)
+        };
         self.stats.local.counters.rx_bytes = self
             .stats
             .local
@@ -158,6 +162,33 @@ impl ClientCore {
                 | Event::Evicted { .. } => {}
             }
         }
+    }
+
+    /// rev 6 framing: unbundle through `FecRx`, dispatch each record as a
+    /// today-format datagram, then drain what `FecRx` queued.
+    fn handle_framed_datagram(&mut self, bytes: &[u8], now_us: u64) -> Vec<Event> {
+        let records = match self.fec.as_mut() {
+            Some(fec) => fec.on_datagram(bytes, now_us),
+            None => return Vec::new(),
+        };
+        let mut events = Vec::new();
+        // One FEC recovery per rebuilt bundle, not per record.
+        let mut counted: Vec<u32> = Vec::new();
+        for rec in records {
+            if rec.rebuilt && !counted.contains(&rec.bundle_seq) {
+                counted.push(rec.bundle_seq);
+                self.loss_tracker.on_fec_recovery();
+            }
+            self.current_record = Some(crate::RecordCtx {
+                bundle_seq: rec.bundle_seq,
+                record_idx: rec.record_idx,
+                rebuilt: rec.rebuilt,
+            });
+            events.extend(self.handle_datagram_payloads(&rec.bytes, now_us));
+            self.current_record = None;
+        }
+        self.drain_fec();
+        events
     }
 
     fn handle_datagram_payloads(&mut self, bytes: &[u8], now_us: u64) -> Vec<Event> {
@@ -225,6 +256,12 @@ impl ClientCore {
         provenance: Provenance,
         events: &mut Vec<Event>,
     ) {
+        // Under framing the bundle, not the record, is what was rebuilt.
+        let framed = self.current_record.is_some();
+        let provenance = match self.current_record {
+            Some(c) if c.rebuilt => Provenance::Rebuilt,
+            _ => provenance,
+        };
         if bytes.len() < TILE_MIN {
             return;
         }
@@ -264,7 +301,8 @@ impl ClientCore {
         // Wire-level loss accounting (measurement only). A rebuilt datagram
         // that had really been lost is what `datagrams_recovered_fec` in the
         // receiver feedback has always promised and never counted on this path.
-        if !is_sentinel {
+        // Under framing `FecRx`'s loss reporter owns this.
+        if !is_sentinel && !framed {
             match provenance {
                 Provenance::Received => self.wire_loss.on_received(dh.wire_seq),
                 Provenance::Rebuilt => {
@@ -291,7 +329,8 @@ impl ClientCore {
         }
 
         // ACK on receipt unless sentinel or Cdf53 (main.ts:1118-1145).
-        if !is_sentinel && th.codec != Codec::Cdf53 {
+        // Under framing `FecRx` ACKs per bundle instead.
+        if !is_sentinel && th.codec != Codec::Cdf53 && !framed {
             // Names the transmission, not the content. The server maps it
             // back to the tile-pass through its ledger, so every delivery
             // consumer downstream is unchanged.
@@ -559,15 +598,20 @@ impl ClientCore {
                         // transmission it arrived on. A pass rebuilt from
                         // FEC parity carries the original `wire_seq`; see the
                         // note on the ACK-on-receipt path above.
-                        let entry = AckEntry {
-                            wire_seq,
-                            arrival_time_ms_lo16: ((now_us / 1000) & 0xFFFF) as u16,
-                        };
-                        if let Some(dg) = self.ack_batcher.add(entry, now_us) {
-                            self.outbox.push_back(PollOutput::Datagram(dg));
+                        if self.current_record.is_none() {
+                            let entry = AckEntry {
+                                wire_seq,
+                                arrival_time_ms_lo16: ((now_us / 1000) & 0xFFFF) as u16,
+                            };
+                            if let Some(dg) = self.ack_batcher.add(entry, now_us) {
+                                self.outbox.push_back(PollOutput::Datagram(dg));
+                            }
                         }
                     }
                     Err(code) => {
+                        if let (Some(ctx), Some(fec)) = (self.current_record, self.fec.as_mut()) {
+                            fec.content_rejected(ctx.bundle_seq, ctx.record_idx);
+                        }
                         if let Some(msg) =
                             self.decode_error_batcher
                                 .report(Codec::Cdf53, tx, ty, code, now_us)

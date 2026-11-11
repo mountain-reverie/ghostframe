@@ -19,8 +19,8 @@ pub mod cdf53_coverage;
 pub mod cdf53_prevalidate;
 pub mod cdf53_tile_state;
 pub mod decode_error_batcher;
-pub mod fec_rx;
 mod event;
+pub mod fec_rx;
 mod frame_assembly;
 pub mod h264_gate;
 pub mod input;
@@ -155,6 +155,9 @@ pub struct ClientConfig {
     /// What the client knows about its own display. `None` if the client
     /// cannot determine it, in which case no DisplayInfo message is sent.
     pub display: Option<ClientDisplay>,
+    /// rev 6 framing: every incoming datagram is an FEC frame. Off until the
+    /// server sends it (R6-c), then removed.
+    pub fec_framing: bool,
 }
 
 /// What the client knows about its own display. Deliberately NOT named
@@ -172,7 +175,19 @@ pub struct ClientDisplay {
     pub mm_height: u16,
 }
 
+/// Where the record being dispatched came from, while framing is on.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecordCtx {
+    pub(crate) bundle_seq: u32,
+    pub(crate) record_idx: u8,
+    pub(crate) rebuilt: bool,
+}
+
 pub struct ClientCore {
+    /// rev 6 framing state; `Some` when `ClientConfig::fec_framing` is set.
+    pub(crate) fec: Option<fec_rx::FecRx>,
+    /// The record `handle_datagram_payloads` is currently handling (framing only).
+    pub(crate) current_record: Option<RecordCtx>,
     pub(crate) outbox: VecDeque<PollOutput>,
     /// Frame size last accepted from the server, if any. Tile coordinates
     /// are validated against the grid it implies.
@@ -240,6 +255,8 @@ pub struct ClientCore {
 impl ClientCore {
     pub fn new(config: ClientConfig, now_us: u64) -> Self {
         let mut core = ClientCore {
+            fec: config.fec_framing.then(fec_rx::FecRx::new),
+            current_record: None,
             outbox: VecDeque::new(),
             frame_dims: None,
             parity_decoder: ParityDecoder::new(PARITY_WINDOW),
@@ -482,6 +499,9 @@ impl ClientCore {
         }
         if let Some(n) = self.nack_batcher.poll_timeout() {
             deadline = deadline.min(n);
+        }
+        if let Some(f) = self.fec.as_ref().and_then(|f| f.poll_timeout()) {
+            deadline = deadline.min(f);
         }
         if let Some(d) = self.pending_nack_deadline_us {
             deadline = deadline.min(d);
@@ -785,7 +805,23 @@ impl ClientCore {
             self.outbox.push_back(PollOutput::Stream(msg));
             self.next_feedback_us = now_us + FEEDBACK_INTERVAL_US;
         }
+        if let Some(fec) = self.fec.as_mut() {
+            fec.on_timeout(now_us);
+        }
+        self.drain_fec();
         Vec::new()
+    }
+
+    /// Move what `FecRx` queued (ACK v4, reports, repair requests, repair-status
+    /// bytes) into the outbox.
+    pub(crate) fn drain_fec(&mut self) {
+        let Some(fec) = self.fec.as_mut() else { return };
+        while let Some(d) = fec.take_datagram() {
+            self.outbox.push_back(PollOutput::Datagram(d));
+        }
+        while let Some(b) = fec.take_status_bytes() {
+            self.outbox.push_back(PollOutput::RepairStatus(b));
+        }
     }
 
     /// Encode + queue-worthy `ReceiverFeedback` (used by the host to send

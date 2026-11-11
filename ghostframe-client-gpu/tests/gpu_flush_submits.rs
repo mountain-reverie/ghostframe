@@ -34,6 +34,7 @@ fn capture_events() -> Vec<Event> {
             tile_delivery: TileDelivery::Payload,
             cdf53_wire: false,
             display: None,
+            fec_framing: false,
         },
         0,
     );
