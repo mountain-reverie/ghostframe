@@ -315,6 +315,12 @@ pub enum WasmPollOutput {
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
+    /// The repair-status stream (RECOVERED / CONTENT_REJECTED / DECLINED);
+    /// only produced when `fec_framing` is on.
+    RepairStatus {
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
 }
 
 impl WasmPollOutput {
@@ -323,9 +329,7 @@ impl WasmPollOutput {
         match out {
             PollOutput::Datagram(bytes) => Some(WasmPollOutput::Datagram { bytes }),
             PollOutput::Stream(bytes) => Some(WasmPollOutput::Stream { bytes }),
-            // R6-b B5/B6 wire this: the repair-status stream. Never produced
-            // while `fec_framing` is off.
-            PollOutput::RepairStatus(_) => None,
+            PollOutput::RepairStatus(bytes) => Some(WasmPollOutput::RepairStatus { bytes }),
         }
     }
 }

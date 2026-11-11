@@ -62,7 +62,7 @@ describe('protocol constants', () => {
     expect(caps.reduce((a, b) => a + b, 0)).toBe(0x07); // disjoint
     expect(p.helloCapsReservedMask | 0x07).toBe(0xff);
     // Cross-check against what the core actually puts on the wire.
-    const core = new wasm.WasmClientCore(true, true, true, 0n);
+    const core = new wasm.WasmClientCore(true, true, true, 0n, false);
     const hello = core.pollTransmit(0n);
     expect(hello.bytes[0]).toBe(p.helloMsgType);
     // The browser runs the reference gate: it sends 0x04 with H.264 (0x02).
