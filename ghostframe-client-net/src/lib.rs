@@ -27,6 +27,7 @@ mod event;
 mod handshake;
 pub mod tls;
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +36,47 @@ use bytes::{Bytes, BytesMut};
 use ghostframe_client_core::{ClientConfig, ClientCore, ClientDisplay, PollOutput, TileDelivery};
 use quinn_proto::{Dir, StreamId, TransportConfig};
 use web_transport_proto::VarInt;
+
+/// Most bytes `pending_repair_status_out` may hold before new chunks are refused.
+const MAX_REPAIR_STATUS_QUEUE: usize = 1 << 20;
+
+/// Why a stream write wrote nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteErrorKind {
+    /// Flow control: try again later; nothing was consumed.
+    Blocked,
+    /// The stream is gone; the queue is dropped.
+    Failed,
+}
+
+/// Write queued chunks to a stream in order without ever losing or
+/// reordering a byte: a partial write leaves the unwritten tail at the front
+/// of the queue, `Blocked` leaves the chunk whole, and any other failure
+/// drops the queue (returning `Failed`).
+fn drain_into(
+    queue: &mut VecDeque<Vec<u8>>,
+    mut write: impl FnMut(&[u8]) -> Result<usize, WriteErrorKind>,
+) -> Result<(), WriteErrorKind> {
+    while let Some(mut chunk) = queue.pop_front() {
+        match write(&chunk) {
+            Ok(n) if n >= chunk.len() => {}
+            Ok(n) => {
+                chunk.drain(..n);
+                queue.push_front(chunk);
+                return Ok(());
+            }
+            Err(WriteErrorKind::Blocked) => {
+                queue.push_front(chunk);
+                return Err(WriteErrorKind::Blocked);
+            }
+            Err(WriteErrorKind::Failed) => {
+                queue.clear();
+                return Err(WriteErrorKind::Failed);
+            }
+        }
+    }
+    Ok(())
+}
 
 use clock::Instant;
 use endpoint::ClientEndpoint;
@@ -92,7 +134,7 @@ pub struct ClientNet {
     /// produces is itself triggered by post-session traffic — but the
     /// buffer stays generic so any output racing the stream-open is still
     /// carried rather than dropped.
-    pending_stream_out: Vec<Vec<u8>>,
+    pending_stream_out: VecDeque<Vec<u8>>,
     /// Bidirectional stream carrying every `PollOutput::Stream` payload
     /// (Hello, ReceiverFeedback, DecodeError) to the server. Opened once,
     /// right after `SessionReady`: the server routes data arriving on any
@@ -102,7 +144,11 @@ pub struct ClientNet {
     /// this stream — the first write is itself the signal.
     feedback_stream: Option<StreamId>,
     /// `PollOutput::RepairStatus` bytes waiting for `repair_status_stream`.
-    pending_repair_status_out: Vec<Vec<u8>>,
+    pending_repair_status_out: VecDeque<Vec<u8>>,
+    /// Chunks refused because `pending_repair_status_out` was full.
+    repair_status_dropped: u64,
+    repair_status_overflow_warned: bool,
+    repair_status_write_warned: bool,
     /// The second client-opened bidi stream, opened on first use. Its first
     /// byte is `FEC_REPAIR_STATUS_STREAM_TAG`, put there by the core.
     repair_status_stream: Option<StreamId>,
@@ -233,9 +279,12 @@ impl ClientNet {
             connected: false,
             session_ready: false,
             datagrams_read: 0,
-            pending_stream_out: Vec::new(),
+            pending_stream_out: VecDeque::new(),
             feedback_stream: None,
-            pending_repair_status_out: Vec::new(),
+            pending_repair_status_out: VecDeque::new(),
+            repair_status_dropped: 0,
+            repair_status_overflow_warned: false,
+            repair_status_write_warned: false,
             repair_status_stream: None,
             repair_status_open_warned: false,
             endpoint: ClientEndpoint::new(rng_seed),
@@ -515,11 +564,26 @@ impl ClientNet {
                             }
                         }
                         PollOutput::Stream(bytes) => {
-                            self.pending_stream_out.push(bytes);
+                            self.pending_stream_out.push_back(bytes);
                         }
                         // Never produced while `fec_framing` is off.
                         PollOutput::RepairStatus(bytes) => {
-                            self.pending_repair_status_out.push(bytes);
+                            let queued: usize =
+                                self.pending_repair_status_out.iter().map(Vec::len).sum();
+                            // Dropping an old chunk would corrupt the record
+                            // framing; refuse the new one instead.
+                            if queued + bytes.len() > MAX_REPAIR_STATUS_QUEUE {
+                                self.repair_status_dropped += 1;
+                                if !self.repair_status_overflow_warned {
+                                    self.repair_status_overflow_warned = true;
+                                    tracing::warn!(
+                                        "repair-status queue over {MAX_REPAIR_STATUS_QUEUE} bytes; \
+                                         dropping new status records"
+                                    );
+                                }
+                            } else {
+                                self.pending_repair_status_out.push_back(bytes);
+                            }
                         }
                     }
                 }
@@ -543,11 +607,16 @@ impl ClientNet {
                 }
             }
             if let Some(sid) = self.feedback_stream {
-                for bytes in self.pending_stream_out.drain(..) {
-                    if let Err(e) = conn.send_stream(sid).write(&bytes) {
+                let mut stream = conn.send_stream(sid);
+                // A failed stream drops the queue inside the helper.
+                let _ = drain_into(&mut self.pending_stream_out, |b| match stream.write(b) {
+                    Ok(n) => Ok(n),
+                    Err(quinn_proto::WriteError::Blocked) => Err(WriteErrorKind::Blocked),
+                    Err(e) => {
                         tracing::warn!(error = ?e, "feedback stream write failed");
+                        Err(WriteErrorKind::Failed)
                     }
-                }
+                });
             }
 
             // The repair-status stream is opened only when there is
@@ -567,11 +636,21 @@ impl ClientNet {
                     }
                 }
                 if let Some(sid) = self.repair_status_stream {
-                    for bytes in self.pending_repair_status_out.drain(..) {
-                        if let Err(e) = conn.send_stream(sid).write(&bytes) {
-                            tracing::warn!(error = ?e, "repair-status stream write failed");
+                    let mut stream = conn.send_stream(sid);
+                    let warned = &mut self.repair_status_write_warned;
+                    let _ = drain_into(&mut self.pending_repair_status_out, |b| {
+                        match stream.write(b) {
+                            Ok(n) => Ok(n),
+                            Err(quinn_proto::WriteError::Blocked) => Err(WriteErrorKind::Blocked),
+                            Err(e) => {
+                                if !*warned {
+                                    *warned = true;
+                                    tracing::warn!(error = ?e, "repair-status stream write failed");
+                                }
+                                Err(WriteErrorKind::Failed)
+                            }
                         }
-                    }
+                    });
                 }
             }
         }
@@ -700,7 +779,7 @@ impl ClientNet {
             );
             return;
         }
-        self.pending_stream_out.push(bytes);
+        self.pending_stream_out.push_back(bytes);
         self.drain_connection_events(now_us);
     }
 
@@ -882,5 +961,52 @@ mod deadline_tests {
                 "ns={ns}: and never more than a microsecond late"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    #[test]
+    fn partial_and_blocked_writes_preserve_every_byte_in_order() {
+        let original: Vec<Vec<u8>> = vec![
+            (0u8..10).collect(),
+            (10..14).collect(),
+            vec![],
+            (14..30).collect(),
+        ];
+        let expect: Vec<u8> = original.iter().flatten().copied().collect();
+        let mut q: VecDeque<Vec<u8>> = original.into();
+        let mut got = Vec::new();
+        let mut calls = 0;
+        let mut rounds = 0;
+        while !q.is_empty() {
+            rounds += 1;
+            assert!(rounds < 100, "no progress");
+            let mut budget = 3usize; // accepts 3 bytes, then Blocked
+            let _ = drain_into(&mut q, |b| {
+                calls += 1;
+                if budget == 0 {
+                    return Err(WriteErrorKind::Blocked);
+                }
+                let n = b.len().min(budget);
+                budget -= n;
+                got.extend_from_slice(&b[..n]);
+                Ok(n)
+            });
+        }
+        assert_eq!(got, expect);
+        assert!(rounds > 3 && calls > rounds, "partial path was exercised");
+    }
+
+    #[test]
+    fn failure_drops_the_queue() {
+        let mut q: VecDeque<Vec<u8>> = vec![vec![1], vec![2]].into();
+        assert_eq!(
+            drain_into(&mut q, |_| Err(WriteErrorKind::Failed)),
+            Err(WriteErrorKind::Failed)
+        );
+        assert!(q.is_empty());
     }
 }

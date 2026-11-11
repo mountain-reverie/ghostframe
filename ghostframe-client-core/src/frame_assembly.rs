@@ -50,7 +50,11 @@ impl ClientCore {
     ) {
         let (fh, payload) = match decode_frame_datagram(bytes) {
             Ok(x) => x,
-            Err(_) => return,
+            Err(_) => {
+                // Pre-ACK refusal: unframed, this fragment is not acknowledged.
+                self.reject_current_record();
+                return;
+            }
         };
 
         // A source fragment is acknowledged on receipt, whatever becomes of it:
@@ -60,6 +64,7 @@ impl ClientCore {
         // Anything the wire format cannot express as a fragment is dropped
         // first, so it is not acknowledged, like an invalid tile.
         if fh.frag_idx >= fh.frag_total || fh.frag_total > MAX_FRAME_FRAGMENTS {
+            self.reject_current_record();
             return;
         }
         // Under framing `FecRx` ACKs per bundle and owns loss accounting.

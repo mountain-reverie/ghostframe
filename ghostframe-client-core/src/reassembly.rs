@@ -415,7 +415,7 @@ impl ClientCore {
     }
 
     /// Under framing, tell the server the record being dispatched is unusable.
-    fn reject_current_record(&mut self) {
+    pub(crate) fn reject_current_record(&mut self) {
         if let (Some(ctx), Some(fec)) = (self.current_record, self.fec.as_mut()) {
             fec.content_rejected(ctx.bundle_seq, ctx.record_idx);
         }
