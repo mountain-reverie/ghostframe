@@ -2,12 +2,12 @@
 //! `bundle_seq`), LOSS_REPORT (0x07) and REPAIR_REQUEST (0x0B).
 //! All integers are little-endian.
 
-pub const LOSS_REPORT_MSG_TYPE: u8 = 0x07;
-pub const ACK_V4_MSG_TYPE: u8 = 0x08;
-pub const REPAIR_REQUEST_MSG_TYPE: u8 = 0x0B;
-pub const LOSS_REPORT_LEN: usize = 64;
-pub const MAX_REPAIR_REQUEST_ENTRIES: usize = 16;
-const MAX_ACK_ENTRIES: usize = 72;
+pub const FEC_LOSS_REPORT_MSG_TYPE: u8 = 0x07;
+pub const FEC_ACK_V4_MSG_TYPE: u8 = 0x08;
+pub const FEC_REPAIR_REQUEST_MSG_TYPE: u8 = 0x0B;
+pub const FEC_LOSS_REPORT_LEN: usize = 64;
+pub const FEC_MAX_REPAIR_REQUEST_ENTRIES: usize = 16;
+pub const FEC_MAX_ACK_V4_ENTRIES: usize = 72;
 const LOSS_REPORT_VERSION: u8 = 1;
 const REPAIR_REQUEST_VERSION: u8 = 1;
 
@@ -46,9 +46,9 @@ pub struct BundleAckBatch {
 impl BundleAckBatch {
     /// Panics if `entries` is empty or longer than 72.
     pub fn encode(&self) -> Vec<u8> {
-        assert!((1..=MAX_ACK_ENTRIES).contains(&self.entries.len()));
+        assert!((1..=FEC_MAX_ACK_V4_ENTRIES).contains(&self.entries.len()));
         let mut out = Vec::with_capacity(2 + 6 * self.entries.len());
-        out.push(ACK_V4_MSG_TYPE);
+        out.push(FEC_ACK_V4_MSG_TYPE);
         out.push(self.entries.len() as u8);
         for e in &self.entries {
             out.extend_from_slice(&e.bundle_seq.to_le_bytes());
@@ -61,11 +61,11 @@ impl BundleAckBatch {
         if dg.len() < 2 {
             return Err(FeedbackError::TooShort(dg.len()));
         }
-        if dg[0] != ACK_V4_MSG_TYPE {
+        if dg[0] != FEC_ACK_V4_MSG_TYPE {
             return Err(FeedbackError::WrongMsgType(dg[0]));
         }
         let n = dg[1];
-        if n == 0 || usize::from(n) > MAX_ACK_ENTRIES {
+        if n == 0 || usize::from(n) > FEC_MAX_ACK_V4_ENTRIES {
             return Err(FeedbackError::InvalidCount(n));
         }
         let want = 2 + 6 * usize::from(n);
@@ -114,8 +114,8 @@ pub struct LossReport {
 
 impl LossReport {
     pub fn encode(&self) -> Vec<u8> {
-        let mut o = Vec::with_capacity(LOSS_REPORT_LEN);
-        o.push(LOSS_REPORT_MSG_TYPE);
+        let mut o = Vec::with_capacity(FEC_LOSS_REPORT_LEN);
+        o.push(FEC_LOSS_REPORT_MSG_TYPE);
         o.push(LOSS_REPORT_VERSION);
         o.extend_from_slice(&self.interval_ms.to_le_bytes());
         o.extend_from_slice(&self.first_bundle_seq.to_le_bytes());
@@ -149,17 +149,17 @@ impl LossReport {
         ] {
             o.extend_from_slice(&v.to_le_bytes());
         }
-        debug_assert_eq!(o.len(), LOSS_REPORT_LEN);
+        debug_assert_eq!(o.len(), FEC_LOSS_REPORT_LEN);
         o
     }
 
     /// Accepts any datagram of at least 64 bytes; trailing bytes belong to a
     /// later version and are ignored.
     pub fn decode(dg: &[u8]) -> Result<Self, FeedbackError> {
-        if dg.len() < LOSS_REPORT_LEN {
+        if dg.len() < FEC_LOSS_REPORT_LEN {
             return Err(FeedbackError::TooShort(dg.len()));
         }
-        if dg[0] != LOSS_REPORT_MSG_TYPE {
+        if dg[0] != FEC_LOSS_REPORT_MSG_TYPE {
             return Err(FeedbackError::WrongMsgType(dg[0]));
         }
         if dg[1] != LOSS_REPORT_VERSION {
@@ -212,9 +212,9 @@ pub struct RepairRequest {
 impl RepairRequest {
     /// Panics if `entries` is empty or longer than 16.
     pub fn encode(&self) -> Vec<u8> {
-        assert!((1..=MAX_REPAIR_REQUEST_ENTRIES).contains(&self.entries.len()));
+        assert!((1..=FEC_MAX_REPAIR_REQUEST_ENTRIES).contains(&self.entries.len()));
         let mut o = Vec::with_capacity(3 + 5 * self.entries.len());
-        o.push(REPAIR_REQUEST_MSG_TYPE);
+        o.push(FEC_REPAIR_REQUEST_MSG_TYPE);
         o.push(REPAIR_REQUEST_VERSION);
         o.push(self.entries.len() as u8);
         for e in &self.entries {
@@ -228,14 +228,14 @@ impl RepairRequest {
         if dg.len() < 3 {
             return Err(FeedbackError::TooShort(dg.len()));
         }
-        if dg[0] != REPAIR_REQUEST_MSG_TYPE {
+        if dg[0] != FEC_REPAIR_REQUEST_MSG_TYPE {
             return Err(FeedbackError::WrongMsgType(dg[0]));
         }
         if dg[1] != REPAIR_REQUEST_VERSION {
             return Err(FeedbackError::BadVersion(dg[1]));
         }
         let n = dg[2];
-        if n == 0 || usize::from(n) > MAX_REPAIR_REQUEST_ENTRIES {
+        if n == 0 || usize::from(n) > FEC_MAX_REPAIR_REQUEST_ENTRIES {
             return Err(FeedbackError::InvalidCount(n));
         }
         let want = 3 + 5 * usize::from(n);
@@ -319,7 +319,7 @@ mod tests {
             ..Default::default()
         };
         let dg = r.encode();
-        assert_eq!(dg.len(), LOSS_REPORT_LEN);
+        assert_eq!(dg.len(), FEC_LOSS_REPORT_LEN);
         assert_eq!(&dg[..4], &[0x07, 1, 250, 0]);
         assert_eq!(&dg[26..28], &5u16.to_le_bytes());
         assert_eq!(&dg[62..64], &3u16.to_le_bytes());
