@@ -9,7 +9,7 @@
 //! Everything is read on the loop side (`sample_all_path_stats` already holds
 //! the live connection); the frame worker never touches it.
 
-use super::{IoBridge, WireClass};
+use super::IoBridge;
 use crate::transport::instruments::{
     AdmissionCounters, BudgetBinding, EcnObservation, FifoSeries, InstrumentSummary, OfferedBytes,
 };
@@ -49,25 +49,6 @@ pub struct TransportProbe {
     /// The D1 instruments (see [`crate::transport::instruments`]). Filled when
     /// the probe is published to the harness; zero in the live copy.
     pub instr: InstrumentSummary,
-}
-
-/// A datagram quinn just accepted, as `note_enqueued` is told of it.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Enqueued {
-    pub(super) class: WireClass,
-    /// It passed the admission gate (and was charged to the bucket before
-    /// it got here) rather than bypassing it.
-    pub(super) gated: bool,
-    /// The datagram as handed to the WebTransport layer.
-    pub(super) dg_len: usize,
-    /// What that layer added.
-    pub(super) framing_len: usize,
-    /// The transmission it carries (its `wire_seq`), when the ledger tracks it.
-    pub(super) wire_seq: Option<u32>,
-    /// The session's cumulative accepted bytes including this one.
-    pub(super) cum_enqueued: u64,
-    /// quinn's queued bytes after it.
-    pub(super) queued: u64,
 }
 
 /// The mutable state behind [`InstrumentSummary`]. Measurement only: nothing
@@ -192,24 +173,9 @@ impl IoBridge {
             ) {
                 self.h264.stats.tx_recorded += 1;
             }
-            if self.fec_framing {
-                // The ledger is keyed by bundle: the record waits here for
-                // the packer (see `bundle_tx`).
-                self.park_emitted(e);
-                continue;
-            }
-            self.transmission_ledger.record(
-                e.wire_seq,
-                now,
-                crate::transport::transmission_ledger::Transmission::single(
-                    e.emit_us,
-                    e.wire_bytes,
-                    e.wire_seq,
-                    e.content,
-                    None,
-                    None,
-                ),
-            );
+            // The ledger is keyed by bundle: the record waits here for the
+            // packer (see `bundle_tx`).
+            self.park_emitted(e);
         }
         if recorded {
             self.bwe.note_offered(now, self.offered_wire_bytes);
@@ -232,18 +198,6 @@ impl IoBridge {
             wire_seq,
             at,
         );
-    }
-
-    /// A datagram that was consumed before quinn saw it (a harness-injected
-    /// drop) has left the host as far as the transport is concerned: it is on
-    /// the wire and lost. It departs now, so later acknowledgements can find the
-    /// loss rather than never.
-    #[cfg(any(test, feature = "test-loss-injection"))]
-    pub(super) fn departed_without_quinn(&mut self, wire_seq: Option<u32>) {
-        let Some(ws) = wire_seq else { return };
-        let now = super::now_std();
-        self.record_emitted_transmissions(now);
-        self.stamp_departure(ws, now);
     }
 
     /// Mirror a datagram quinn just accepted into the departure tracker.
@@ -308,47 +262,6 @@ impl IoBridge {
         p.queue_bytes = capacity.saturating_sub(space);
         p.max_queue_bytes = p.max_queue_bytes.max(p.queue_bytes);
         p.samples += 1;
-    }
-
-    /// Note a datagram quinn just accepted: bill its class and wire bytes,
-    /// put it in the departure tracker and track the FIFO's peak depth.
-    pub(super) fn note_enqueued(&mut self, handle: ConnectionHandle, e: Enqueued) {
-        let Enqueued {
-            class,
-            gated,
-            dg_len,
-            framing_len,
-            wire_seq,
-            cum_enqueued,
-            queued,
-        } = e;
-        let wire = dg_len + framing_len;
-        if gated {
-            // Read off quinn's own queue, not the gate's bookkeeping: a
-            // datagram accepted while the FIFO already stood at `D_target`
-            // means something bypassed the gate.
-            if let Some(g) = self.gate {
-                if queued.saturating_sub(wire as u64) >= g.d_target as u64 {
-                    self.instr.admission.depth_violations += 1;
-                }
-            }
-            self.instr.admission.datagrams_admitted += 1;
-        } else {
-            // Control datagrams have no queue to hold them back, so they are
-            // billed to the bucket after the fact and the classes that can
-            // wait pay for them. (H.264 fragments are admitted like tiles.)
-            self.admission.charge(wire);
-            self.instr.admission.soft_charged_bytes += wire as u64;
-            if let Some(g) = self.gate {
-                if queued.saturating_sub(wire as u64) >= g.d_target as u64 {
-                    self.instr.admission.ungated_at_depth += 1;
-                }
-            }
-        }
-        let i = &mut self.instr;
-        i.offered.bill(class, dg_len, framing_len);
-        i.fifo_peak_at_enqueue = i.fifo_peak_at_enqueue.max(queued);
-        self.track_enqueue(handle, wire_seq, cum_enqueued);
     }
 
     /// After a `poll_transmit` batch, stamp the datagrams that left quinn's

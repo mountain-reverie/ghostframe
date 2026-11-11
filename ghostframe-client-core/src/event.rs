@@ -162,6 +162,6 @@ pub enum PollOutput {
     Stream(Vec<u8>),
     /// Bytes for the second, tagged bidirectional stream (rev 6 repair status:
     /// RECOVERED / CONTENT_REJECTED / DECLINED). The first chunk starts with
-    /// `FEC_REPAIR_STATUS_STREAM_TAG`. Only produced under `fec_framing`.
+    /// `FEC_REPAIR_STATUS_STREAM_TAG`.
     RepairStatus(Vec<u8>),
 }

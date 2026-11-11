@@ -11,7 +11,6 @@
 //! All header decodes are fallible and short-circuit; all indexing goes
 //! through `get`/bounds checks; no `unwrap` touches attacker-controlled data.
 
-use ghostframe_protocol::ack::AckEntry;
 use ghostframe_protocol::protocol::{
     decode_tile_datagram, is_tile_datagram, Codec, TileHeader, DATAGRAM_HEADER_SIZE,
     FRAME_DIMENSIONS_SENTINEL_X, FRAME_DIMENSIONS_SENTINEL_Y, TILE_DATAGRAM_FLAG, TILE_HEADER_SIZE,
@@ -113,11 +112,7 @@ impl ClientCore {
     /// `TileDelivery::Decoded` mode they are then decoded to pixels here,
     /// by the same [`crate::TileDecoder`] a consumer can run elsewhere.
     pub fn handle_datagram(&mut self, bytes: &[u8], now_us: u64) -> Vec<Event> {
-        let events = if self.fec.is_some() {
-            self.handle_framed_datagram(bytes, now_us)
-        } else {
-            self.handle_datagram_payloads(bytes, now_us)
-        };
+        let events = self.handle_framed_datagram(bytes, now_us);
         self.stats.local.counters.rx_bytes = self
             .stats
             .local
@@ -166,10 +161,7 @@ impl ClientCore {
     /// rev 6 framing: unbundle through `FecRx`, dispatch each record as a
     /// today-format datagram, then drain what `FecRx` queued.
     fn handle_framed_datagram(&mut self, bytes: &[u8], now_us: u64) -> Vec<Event> {
-        let batch = match self.fec.as_mut() {
-            Some(fec) => fec.on_datagram(bytes, now_us),
-            None => return Vec::new(),
-        };
+        let batch = self.fec.on_datagram(bytes, now_us);
         let (records, rebuilt) = (batch.records, batch.rebuilt);
         let mut events = Vec::new();
         // One FEC recovery per rebuilt bundle, not per record.
@@ -189,9 +181,7 @@ impl ClientCore {
         }
         // After the dispatch loop: a record refused above has queued its
         // CONTENT_REJECTED, which must precede the RECOVERED for its bundle.
-        if let Some(fec) = self.fec.as_mut() {
-            fec.recovered(&rebuilt);
-        }
+        self.fec.recovered(&rebuilt);
         self.drain_fec();
         events
     }
@@ -244,8 +234,7 @@ impl ClientCore {
         provenance: Provenance,
         events: &mut Vec<Event>,
     ) {
-        // Under framing the bundle, not the record, is what was rebuilt.
-        let framed = self.current_record.is_some();
+        // The bundle, not the record, is what was rebuilt.
         let provenance = match self.current_record {
             Some(c) if c.rebuilt => Provenance::Rebuilt,
             _ => provenance,
@@ -289,21 +278,6 @@ impl ClientCore {
                 .on_datagram_sent_at(now_us, dh.timestamp_us);
         }
 
-        // Wire-level loss accounting (measurement only). A rebuilt datagram
-        // that had really been lost is what `datagrams_recovered_fec` in the
-        // receiver feedback has always promised and never counted on this path.
-        // Under framing `FecRx`'s loss reporter owns this.
-        if !is_sentinel && !framed {
-            match provenance {
-                Provenance::Received => self.wire_loss.on_received(dh.wire_seq),
-                Provenance::Rebuilt => {
-                    if self.wire_loss.on_rebuilt(dh.wire_seq) {
-                        self.loss_tracker.on_fec_recovery();
-                    }
-                }
-            }
-        }
-
         // Validate what the wire claims before it can size anything. These
         // drop before the ACK on purpose: a tile refused here (for example
         // one from a larger frame whose dimensions datagram has not arrived
@@ -316,27 +290,12 @@ impl ClientCore {
         if !is_sentinel
             && (dh.frag_total != 1 || dh.frag_idx != 0 || !self.tile_in_grid(th.tile_x, th.tile_y))
         {
-            // Without framing the withheld ACK is what makes the server
-            // retransmit; under framing the bundle is ACKed, so say so.
+            // The bundle is ACKed, so tell the server the record is unusable.
             self.reject_current_record();
             return;
         }
 
-        // ACK on receipt unless sentinel or Cdf53 (main.ts:1118-1145).
-        // Under framing `FecRx` ACKs per bundle instead.
-        if !is_sentinel && th.codec != Codec::Cdf53 && !framed {
-            // Names the transmission, not the content. The server maps it
-            // back to the tile-pass through its ledger, so every delivery
-            // consumer downstream is unchanged.
-            //
-            let entry = AckEntry {
-                wire_seq: dh.wire_seq,
-                arrival_time_ms_lo16: ((now_us / 1000) & 0xFFFF) as u16,
-            };
-            if let Some(dg) = self.ack_batcher.add(entry, now_us) {
-                self.outbox.push_back(PollOutput::Datagram(dg));
-            }
-        }
+        // `FecRx` ACKs per bundle on arrival; there is no per-record ACK.
 
         // The newest label the wire has delivered. Only datagrams QUIC
         // authenticated count: a rebuilt one is derived from them and is what
@@ -376,13 +335,13 @@ impl ClientCore {
             return;
         }
 
-        self.deliver_tile(frame_seq, &th, dh.wire_seq, payload, now_us, events);
+        self.deliver_tile(frame_seq, &th, payload, now_us, events);
     }
 
-    /// Under framing, tell the server the record being dispatched is unusable.
+    /// Tell the server the record being dispatched is unusable.
     pub(crate) fn reject_current_record(&mut self) {
-        if let (Some(ctx), Some(fec)) = (self.current_record, self.fec.as_mut()) {
-            fec.content_rejected(ctx.bundle_seq, ctx.record_idx);
+        if let Some(ctx) = self.current_record {
+            self.fec.content_rejected(ctx.bundle_seq, ctx.record_idx);
         }
     }
 
@@ -391,7 +350,6 @@ impl ClientCore {
         &mut self,
         frame_seq: u32,
         th: &TileHeader,
-        wire_seq: u32,
         payload: &[u8],
         now_us: u64,
         events: &mut Vec<Event>,
@@ -584,21 +542,6 @@ impl ClientCore {
                             generation: th.generation,
                             data,
                         });
-                        // Deferred ACK — fires only after prevalidation success.
-                        // Deliberately outside the match: it is protocol, not
-                        // decoding, and must happen in both modes.
-                        //
-                        // The pass is one datagram, so one entry names the
-                        // transmission it arrived on.
-                        if self.current_record.is_none() {
-                            let entry = AckEntry {
-                                wire_seq,
-                                arrival_time_ms_lo16: ((now_us / 1000) & 0xFFFF) as u16,
-                            };
-                            if let Some(dg) = self.ack_batcher.add(entry, now_us) {
-                                self.outbox.push_back(PollOutput::Datagram(dg));
-                            }
-                        }
                     }
                     Err(code) => {
                         self.reject_current_record();

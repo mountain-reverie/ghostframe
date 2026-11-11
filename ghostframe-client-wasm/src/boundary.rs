@@ -15,7 +15,6 @@ use ghostframe_client_core::{
     pal_rle_decode::{PalRleVariant, PrevalidatedPalRle},
     Event, PollOutput, TileData,
 };
-use ghostframe_protocol::ack::AckEntry;
 use ghostframe_protocol::protocol::TileNackEntry;
 use serde::Serialize;
 
@@ -315,8 +314,7 @@ pub enum WasmPollOutput {
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
-    /// The repair-status stream (RECOVERED / CONTENT_REJECTED / DECLINED);
-    /// only produced when `fec_framing` is on.
+    /// The repair-status stream (RECOVERED / CONTENT_REJECTED / DECLINED).
     RepairStatus {
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
@@ -330,22 +328,6 @@ impl WasmPollOutput {
             PollOutput::Datagram(bytes) => Some(WasmPollOutput::Datagram { bytes }),
             PollOutput::Stream(bytes) => Some(WasmPollOutput::Stream { bytes }),
             PollOutput::RepairStatus(bytes) => Some(WasmPollOutput::RepairStatus { bytes }),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, PartialEq)]
-pub struct WasmAckEntry {
-    /// Names a transmission, not a tile-pass — see `AckEntry::wire_seq`.
-    pub wire_seq: u32,
-    pub arrival_time_ms_lo16: u16,
-}
-
-impl From<&AckEntry> for WasmAckEntry {
-    fn from(e: &AckEntry) -> Self {
-        WasmAckEntry {
-            wire_seq: e.wire_seq,
-            arrival_time_ms_lo16: e.arrival_time_ms_lo16,
         }
     }
 }

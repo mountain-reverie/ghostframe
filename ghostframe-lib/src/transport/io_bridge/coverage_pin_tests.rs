@@ -15,7 +15,7 @@
 //! what it was.
 
 use super::*;
-use crate::transport::ack::{AckBatch, AckEntry};
+use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
 use crate::transport::protocol::Codec;
 use crate::transport::reliable_emitter::EmitKey;
 use crate::transport::scheduler::{TileWork, WorkState};
@@ -88,7 +88,7 @@ fn ack(b: &mut IoBridge, wire_seqs: &[u32]) {
             })
             .collect(),
     };
-    b.dispatch_ack_datagram(&batch.encode());
+    b.dispatch_ack_v4_datagram(&batch.encode());
 }
 
 /// Emit one Cdf53 pass for the tile at the tile's next generation. Returns

@@ -1,5 +1,4 @@
-//! Both ends on the rev 6 framing (`RunOptions::fec_framing`): a clean scene
-//! still delivers, over bundles.
+//! Both ends on the rev 6 framing: a clean scene still delivers, over bundles.
 
 use std::time::Duration;
 
@@ -13,10 +12,7 @@ use ghostframe_e2e::harness::scene_tiles::TileSpec;
 use ghostframe_e2e::netsim::{DropPlan, DropRule, NetProfile};
 
 fn framed() -> RunOptions {
-    RunOptions {
-        fec_framing: true,
-        ..RunOptions::default()
-    }
+    RunOptions::default()
 }
 
 #[tokio::test(start_paused = true)]

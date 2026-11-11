@@ -45,7 +45,6 @@ fn input_sent_before_the_session_is_ready_does_not_precede_the_hello() {
         indices_raw_enabled: true,
         supports_h264: false,
         display: None,
-        fec_framing: false,
     };
     let base = Instant::now();
     let mut now_us = 0u64;
@@ -136,7 +135,6 @@ fn an_h264_client_advertises_both_h264_hello_bits() {
         indices_raw_enabled: true,
         supports_h264: true,
         display: None,
-        fec_framing: false,
     };
     let base = Instant::now();
     let mut now_us = 0u64;
@@ -346,8 +344,9 @@ fn a_held_tail_is_flushed_without_another_frame() {
     }
     assert_eq!(wt.stats_tail_len(), 0, "the tail was written");
     assert_eq!(reader.buffered(), 0, "the reader holds no half frame");
+}
 
-/// Under `fec_framing` a block rebuilt from repair makes the core emit a
+/// A block rebuilt from repair makes the core emit a
 /// RECOVERED status record. It must reach the server on a *second*
 /// client-opened bidi stream (not the feedback stream), whose first byte is
 /// `FEC_REPAIR_STATUS_STREAM_TAG`. Driven through the real path: framed
@@ -372,7 +371,6 @@ fn recovered_status_reaches_the_server_on_a_second_tagged_stream() {
         indices_raw_enabled: true,
         supports_h264: false,
         display: None,
-        fec_framing: true,
     };
     let base = Instant::now();
     let mut now_us = 0u64;

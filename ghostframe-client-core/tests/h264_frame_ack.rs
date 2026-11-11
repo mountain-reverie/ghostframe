@@ -38,7 +38,7 @@ fn send(c: &mut ClientCore, seq: u32, idr: bool, reference: u32, now_us: u64) ->
     for mut dg in fragment_frame_ref(seq, 0, info, &[seq as u8; 600], 1200) {
         dg[8..12].copy_from_slice(&seq.to_be_bytes());
         fed |= c
-            .handle_datagram(&dg, now_us)
+            .handle_datagram(&ghostframe_client_core::frame_one(&dg), now_us)
             .iter()
             .any(|e| matches!(e, Event::NeedsH264 { frame_seq, .. } if *frame_seq == seq));
     }
@@ -82,7 +82,7 @@ fn a_frame_ack_leaves_right_behind_the_ack_batch_and_never_before_it() {
     let out = drain(&mut c);
     assert_eq!(
         out.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
-        vec![0x06, 0x0a],
+        vec![0x08, 0x0a],
         "the batch, then the frame ack in the same drain"
     );
     let a = out[1].1.unwrap();
@@ -269,7 +269,7 @@ fn an_idr_event_tells_the_decoder_to_reset_and_a_p_frame_does_not() {
             FrameRefInfo::predicted(r)
         };
         for dg in fragment_frame_ref(seq, 0, info, &[1u8; 50], 1200) {
-            for e in c.handle_datagram(&dg, 0) {
+            for e in c.handle_datagram(&ghostframe_client_core::frame_one(&dg), 0) {
                 if let Event::NeedsH264 { reset_decoder, .. } = e {
                     flags.push(reset_decoder);
                 }

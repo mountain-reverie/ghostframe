@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! A copy of a fragment the client already holds (server probe padding, or any
-//! duplicate) must be acknowledged and must never decode a frame twice.
+//! duplicate; a pad rides alone in its bundle) must be acknowledged and must never decode a frame twice.
 
-use ghostframe_client_core::{ClientConfig, ClientCore, Event, PollOutput};
-use ghostframe_protocol::ack::AckBatch;
+use ghostframe_client_core::{frame_plain, ClientConfig, ClientCore, Event, PollOutput};
+use ghostframe_protocol::fec::feedback::BundleAckBatch;
 use ghostframe_protocol::protocol::{fragment_frame, FRAME_FLAG_PAD};
 
 fn core() -> ClientCore {
@@ -37,25 +37,25 @@ fn delivered_three() -> (ClientCore, Vec<u8>) {
     assert_eq!(p2.len(), 1, "premise: a single-fragment P frame");
     let mut n = 0;
     for dg in idr.iter().chain(&p2).chain(&p3) {
-        n += needs(&c.handle_datagram(dg, 0)).len();
+        n += needs(&c.handle_datagram(&ghostframe_client_core::frame_one(dg), 0)).len();
     }
     assert_eq!(n, 3, "premise: all three delivered");
     (c, p2[0].clone())
 }
 
-/// The wire_seqs acknowledged so far, once the batch timer has run.
+/// The bundle_seqs acknowledged so far, once the batch timer has run.
 fn acked(core: &mut ClientCore, now_us: u64) -> Vec<u32> {
     core.on_timeout(now_us);
     let mut out = Vec::new();
     while let Some(o) = core.poll_transmit(now_us) {
         if let PollOutput::Datagram(d) = o {
-            if d.first() == Some(&0x06) {
+            if d.first() == Some(&0x08) {
                 out.extend(
-                    AckBatch::decode(&d)
+                    BundleAckBatch::decode(&d)
                         .unwrap()
                         .entries
                         .iter()
-                        .map(|e| e.wire_seq),
+                        .map(|e| e.bundle_seq),
                 );
             }
         }
@@ -69,7 +69,7 @@ fn an_unflagged_copy_of_a_delivered_frame_is_not_decoded_again() {
     let (mut c, p2) = delivered_three();
     let mut copy = p2;
     copy[8..12].copy_from_slice(&777u32.to_be_bytes());
-    let evs = c.handle_datagram(&copy, 1000);
+    let evs = c.handle_datagram(&ghostframe_client_core::frame_one(&copy), 1000);
     assert!(needs(&evs).is_empty(), "re-emitted {:?}", needs(&evs));
 }
 
@@ -80,13 +80,13 @@ fn a_flagged_pad_is_acknowledged_and_touches_nothing() {
     let mut c = core();
     let idr = fragment_frame(1, 0, true, &[1u8; 900], 1200);
     for dg in &idr {
-        c.handle_datagram(dg, 0);
+        c.handle_datagram(&ghostframe_client_core::frame_one(dg), 0);
     }
     let p4 = fragment_frame(4, 0, false, &[4u8; 900], 1200);
     let mut pad = p4[0].clone();
     pad[8..12].copy_from_slice(&778u32.to_be_bytes());
     pad[16] |= FRAME_FLAG_PAD;
-    let evs = c.handle_datagram(&pad, 1000);
+    let evs = c.handle_datagram(&frame_plain(778, &[&pad]), 1000);
     assert!(needs(&evs).is_empty(), "a pad completed a frame");
     assert!(
         acked(&mut c, 1_000_000).contains(&778),
@@ -94,7 +94,7 @@ fn a_flagged_pad_is_acknowledged_and_touches_nothing() {
     );
     // And frame 4 still arrives normally afterwards (the pad created no
     // assembly that would swallow it).
-    let evs = c.handle_datagram(&p4[0], 2000);
+    let evs = c.handle_datagram(&ghostframe_client_core::frame_one(&p4[0]), 2000);
     assert_eq!(needs(&evs), vec![4]);
 }
 
@@ -105,7 +105,7 @@ fn a_pad_is_acknowledged_even_when_it_is_discarded() {
     let mut pad = p2;
     pad[8..12].copy_from_slice(&779u32.to_be_bytes());
     pad[16] |= FRAME_FLAG_PAD;
-    c.handle_datagram(&pad, 10_000_000);
+    c.handle_datagram(&frame_plain(779, &[&pad]), 10_000_000);
     assert!(
         acked(&mut c, 20_000_000).contains(&779),
         "the pad must be acknowledged: the acknowledgement is the measurement"
@@ -116,10 +116,13 @@ fn a_pad_is_acknowledged_even_when_it_is_discarded() {
 fn a_duplicate_of_the_newest_delivered_idr_is_not_decoded_again() {
     let mut c = core();
     let idr = fragment_frame(1, 0, true, &[1u8; 900], 1200);
-    assert_eq!(needs(&c.handle_datagram(&idr[0], 0)), vec![1]);
+    assert_eq!(
+        needs(&c.handle_datagram(&ghostframe_client_core::frame_one(&idr[0]), 0)),
+        vec![1]
+    );
     // The same IDR again (a resend that crossed its acknowledgement): the
     // decoder must not restart from it.
     let mut copy = idr[0].clone();
     copy[8..12].copy_from_slice(&900u32.to_be_bytes());
-    assert!(needs(&c.handle_datagram(&copy, 1_000)).is_empty());
+    assert!(needs(&c.handle_datagram(&ghostframe_client_core::frame_one(&copy), 1_000)).is_empty());
 }

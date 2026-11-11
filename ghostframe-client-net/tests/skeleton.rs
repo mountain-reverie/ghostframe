@@ -9,7 +9,6 @@ fn new_client_has_nothing_to_transmit_before_connect() {
         indices_raw_enabled: true,
         supports_h264: false,
         display: None,
-        fec_framing: false,
     };
     let mut client = ClientNet::new(cfg, 0).expect("ClientNet::new");
     assert!(client.poll_transmit().is_none());

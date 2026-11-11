@@ -6,9 +6,13 @@
 
 use ghostframe_client_core::cdf53_prevalidate::decode_cdf53_wire;
 use ghostframe_client_core::{
-    ClientConfig, ClientCore, DecodeErrorCode, Event, PollOutput, TileData, TileDelivery,
+    frame_plain, ClientConfig, ClientCore, DecodeErrorCode, Event, PollOutput, TileData,
+    TileDelivery,
 };
 use ghostframe_protocol::codec::cdf53::{encode_passes_sparse, forward};
+use ghostframe_protocol::fec::repair_status::{
+    StatusReader, StatusRecord, FEC_REPAIR_STATUS_STREAM_TAG,
+};
 use ghostframe_protocol::protocol::{fragment_tile, Codec, TileFragmentInputs, TILE_DATAGRAM_FLAG};
 
 fn core(delivery: TileDelivery, wire: bool) -> ClientCore {
@@ -59,7 +63,9 @@ fn tile_passes() -> Vec<(u8, Vec<u8>)> {
 fn run(mut c: ClientCore, datagrams: &[Vec<u8>]) -> (Vec<Event>, Vec<PollOutput>) {
     let mut events = Vec::new();
     for (i, d) in datagrams.iter().enumerate() {
-        events.extend(c.handle_datagram(d, i as u64 * 100));
+        // The same bundle_seq on both routes, so their outputs compare equal.
+        let frame = frame_plain(i as u32, &[d]);
+        events.extend(c.handle_datagram(&frame, i as u64 * 100));
     }
     // Past the ACK debounce, the NACK debounce and the tail sweep.
     let mut out = Vec::new();
@@ -239,9 +245,20 @@ fn a_rejected_pass_gets_the_decode_error_and_no_wire_event() {
             ..
         }]
     ));
-    assert!(
-        !out.iter().any(|o| matches!(o, PollOutput::Datagram(d) if d.first() == Some(&ghostframe_protocol::ack::ACK_BATCH_MSG_TYPE))),
-        "no ACK for a rejected pass"
+    // The bundle arrived, so it is acknowledged; the pass in it is refused.
+    let status: Vec<u8> = out
+        .iter()
+        .filter_map(|o| match o {
+            PollOutput::RepairStatus(b) => Some(b.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(status[0], FEC_REPAIR_STATUS_STREAM_TAG);
+    assert_eq!(
+        StatusReader::default().push(&status[1..]).unwrap(),
+        vec![StatusRecord::ContentRejected(vec![(0, 0)])],
+        "a rejected pass is CONTENT_REJECTED"
     );
 }
 
@@ -354,7 +371,9 @@ fn net_side_cost() {
         let t = Instant::now();
         let mut events = 0usize;
         for (i, d) in dgs.iter().enumerate() {
-            events += c.handle_datagram(d, i as u64 * 10).len();
+            events += c
+                .handle_datagram(&ghostframe_client_core::frame_one(d), i as u64 * 10)
+                .len();
         }
         let ms = t.elapsed().as_secs_f64() * 1e3;
         println!(

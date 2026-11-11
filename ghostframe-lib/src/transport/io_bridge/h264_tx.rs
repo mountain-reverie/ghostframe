@@ -1064,7 +1064,6 @@ mod tests {
 
     use crate::transport::protocol::NO_ACK;
     use crate::transport::reliable_emitter::Content;
-    use ghostframe_protocol::ack::{AckBatch, AckEntry};
     use std::time::Duration;
 
     const PAYLOAD: usize = 4000;
@@ -1082,10 +1081,14 @@ mod tests {
         b
     }
 
+    use crate::transport::io_bridge::test_ack::{ack_records, attach_test_wire, depart_records};
+
     async fn bridge() -> IoBridge {
         let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
         let server = QuicServer::new().expect("QuicServer::new");
-        IoBridge::new_with_stream_for_test(ours, server)
+        let mut b = IoBridge::new_with_stream_for_test(ours, server);
+        attach_test_wire(&mut b);
+        b
     }
 
     fn meta() -> frame::FrameMeta {
@@ -1140,29 +1143,15 @@ mod tests {
             .collect()
     }
 
-    /// What quinn would do with what was sent: the datagrams leave its FIFO.
+    /// What quinn would do with what was sent: the bundles leave its FIFO.
     fn depart(b: &mut IoBridge, sent: &[(u32, u32, u16)]) {
-        let now = now_std();
-        b.record_emitted_transmissions(now);
-        for (ws, _, _) in sent {
-            b.transmission_ledger.mark_departed(*ws, now, 0);
-            b.reliable_emitter.on_departed(*ws, now);
-        }
+        let wss: Vec<u32> = sent.iter().map(|x| x.0).collect();
+        depart_records(b, &wss);
     }
 
+    /// Acknowledge the bundles that carried the records `wire_seqs`.
     fn ack(b: &mut IoBridge, wire_seqs: &[u32]) {
-        for chunk in wire_seqs.chunks(64) {
-            let batch = AckBatch {
-                entries: chunk
-                    .iter()
-                    .map(|ws| AckEntry {
-                        wire_seq: *ws,
-                        arrival_time_ms_lo16: 0,
-                    })
-                    .collect(),
-            };
-            b.dispatch_ack_datagram(&batch.encode());
-        }
+        ack_records(b, wire_seqs);
     }
 
     fn h264_outstanding(b: &IoBridge) -> usize {
@@ -1340,9 +1329,10 @@ mod tests {
             .get(1, 0)
             .map(|e| e.datagram.len())
             .expect("fragment 0 of the IDR is cached");
-        // Premises: there is something to retire, and the ledger holds it.
+        // Premises: there is something to retire, and the records' bookkeeping
+        // waits for the packer (the ledger is keyed by bundle).
         assert!(queued > 0 && biggest > 100);
-        assert!(!b.transmission_ledger.is_empty());
+        assert!(!b.emitted_meta.is_empty());
         let offered = b.sent_log_for_test.len();
 
         b.forced_datagram_limit_for_test = Some(1);
@@ -1357,7 +1347,7 @@ mod tests {
         assert!(b.h264.stats.oversize_h264 > 0);
         assert_eq!(b.h264.stats.send_too_large, 0);
         assert!(
-            b.transmission_ledger.is_empty(),
+            b.emitted_meta.is_empty() && b.transmission_ledger.is_empty(),
             "forgotten, not left to be judged lost"
         );
         assert_eq!(b.h264.stats.tx_judged_lost, 0);
@@ -1369,8 +1359,9 @@ mod tests {
     }
 
     /// The limit is derived from quinn's size as the drain really does it:
-    /// `raw - framing`. A datagram exactly at the limit goes; one byte over is
-    /// retired. (The forced limit of the tests above skips that subtraction.)
+    /// `raw - framing - FEC_RECORDS_HEADROOM - FEC_RECORD_LEN_PREFIX` (the
+    /// packer's record limit). A datagram exactly at the limit goes; one byte
+    /// over is retired. (The forced limit of the tests above skips that.)
     #[tokio::test(start_paused = true)]
     async fn the_limit_is_quinns_size_less_the_framing() {
         let mut b = bridge().await;
@@ -1385,21 +1376,24 @@ mod tests {
         let framing = b.live_framing_len();
         assert!(framing >= 1);
 
+        use ghostframe_protocol::fec::frame::{FEC_RECORDS_HEADROOM, FEC_RECORD_LEN_PREFIX};
+        let raw = biggest + framing + FEC_RECORDS_HEADROOM + FEC_RECORD_LEN_PREFIX;
         // Exactly fits: nothing is retired.
-        b.forced_raw_datagram_size_for_test = Some(biggest + framing);
+        b.forced_raw_datagram_size_for_test = Some(raw);
         b.drain_reliable_emitter(now_std());
         assert_eq!(b.h264.stats.oversize_h264, 0, "a datagram at the limit");
 
         // One byte less: the biggest no longer fits.
-        b.forced_raw_datagram_size_for_test = Some(biggest + framing - 1);
+        b.forced_raw_datagram_size_for_test = Some(raw - 1);
         b.drain_reliable_emitter(now_std());
         assert!(b.h264.stats.oversize_h264 > 0, "one byte over");
         assert_eq!(b.h264.stats.send_too_large, 0);
     }
 
-    /// A fragment whose ledger record is gone (evicted by the cap) is still an
-    /// H.264 fragment: it is recovered the same way, not counted as untracked,
-    /// and no forgotten-count is made for a record that did not exist.
+    /// A fragment whose bookkeeping is gone (the record's parked meta, cleared
+    /// when the table passes its cap) is still an H.264 fragment: it is
+    /// recovered the same way, not counted as untracked, and no forgotten-count
+    /// is made for a record that did not exist.
     #[tokio::test(start_paused = true)]
     async fn an_oversize_fragment_with_no_ledger_record_is_still_recovered() {
         let mut b = bridge().await;
@@ -1411,9 +1405,9 @@ mod tests {
             .collect();
         assert!(!wss.is_empty());
         for ws in &wss {
-            assert!(b.transmission_ledger.forget_outstanding(*ws).is_some());
+            assert!(b.emitted_meta.remove(ws).is_some());
         }
-        assert!(b.transmission_ledger.is_empty());
+        assert!(b.emitted_meta.is_empty());
 
         b.forced_datagram_limit_for_test = Some(1);
         b.drain_reliable_emitter(now_std());

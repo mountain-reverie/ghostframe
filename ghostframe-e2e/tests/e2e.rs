@@ -3501,7 +3501,7 @@ async fn e2e_loss_override_forces_h264() -> Result<()> {
 /// M3.1 Task 19: Server survives sustained 100% ACK drop without retry storm.
 ///
 /// `GHOSTFRAME_INBOUND_LOSS_PROBABILITY=1.0` + predicate `ack` drops every
-/// inbound `ACK_BATCH_MSG_TYPE (0x02)` datagram at the server boundary.
+/// inbound ACK v4 (0x08) datagram at the server boundary.
 /// Server tile-codec emissions never get their ACKs, so the Scheduler holds
 /// InFlight work and retries every 2×RTT — but `bump_generation` supersedes
 /// stale entries on the next dirty frame, keeping the queue bounded.
@@ -4613,13 +4613,13 @@ async fn e2e_ack_telemetry_no_waste() -> Result<()> {
 
     assert!(
         ack_batches > 0,
-        "no ack_batch_received lines — client AckBatcher is not sending"
+        "no ack_batch_received lines — client ACK v4 batcher is not sending"
     );
     assert_eq!(
         pixelperfect, 0,
         "Solid-only pattern produced unexpected Cdf53 PixelPerfect transitions"
     );
-    // Each AckBatcher.flush() appends up to ACK_OVERLAP_COUNT=8
+    // Each ACK v4 batcher flush appends up to ACK_OVERLAP_COUNT=8
     // previously-acked entries to the new batch (see ack.ts:63), and
     // the reliable-tile emitter RTO-retransmits any fragment whose
     // first emission isn't ACKed within ~50 ms.  Both mechanisms

@@ -79,6 +79,8 @@ mod bundle_tx;
 
 #[path = "io_bridge/ack_dispatch.rs"]
 mod ack_dispatch;
+#[cfg(test)]
+pub(crate) mod test_ack;
 pub(crate) use ack_dispatch::handle_datagram_payload;
 
 #[path = "io_bridge/bwe_glue.rs"]
@@ -125,7 +127,6 @@ pub use frame_backend::{
 mod frame_worker;
 mod transport_probe;
 use frame_worker::{FinishAction, FramePipeline, FromWorker, ToWorker};
-use transport_probe::Enqueued;
 pub use transport_probe::TransportProbe;
 
 #[path = "io_bridge/frame.rs"]
@@ -933,10 +934,7 @@ pub struct IoBridge {
     fec_in: repair_status::FecInboundStats,
     /// The last bundles that left the ledger, for a late CONTENT_REJECTED.
     recent_bundles: ack_dispatch::RecentBundles,
-    /// Rev 6 framing on: every datagram leaves inside a PLAIN bundle
-    /// (`TransportConfig::fec_framing`).
-    fec_framing: bool,
-    /// The live session's packer (framing on only).
+    /// The live session's packer.
     packer: crate::transport::fec_tx::packer::Packer,
     /// Per-record facts the emitter reported at build time, by record
     /// `wire_seq`, until `send_counted` hands the record to the packer. With
@@ -1597,7 +1595,6 @@ impl IoBridge {
             status_streams: HashMap::new(),
             fec_in: Default::default(),
             recent_bundles: Default::default(),
-            fec_framing: lib_config.transport.fec_framing,
             packer: Default::default(),
             emitted_meta: HashMap::new(),
             pending_bundles: Default::default(),
@@ -2916,58 +2913,20 @@ impl IoBridge {
                     // wt+conn borrows). Defer ACK/etc. dispatch to a second pass
                     // because dispatch_ack_datagram takes `&mut self`.
                     let mut to_dispatch: Vec<Vec<u8>> = Vec::new();
-                    // Session counter after each pong accepted for the live
-                    // session, for the departure tracker (below).
-                    let mut control_cums: Vec<u64> = Vec::new();
-                    // Pongs to frame (rev 6 framing only).
+                    // Pongs to frame.
                     let mut pongs: Vec<Vec<u8>> = Vec::new();
                     if let Some(wt) = self.wt_sessions.get_mut(&handle) {
                         if let Some(conn) = self.server.connections.get_mut(&handle) {
                             while let Some(payload) = wt.recv_datagram(conn) {
                                 if let Some(response) = handle_datagram_payload(&payload) {
-                                    if self.fec_framing {
-                                        // Framed after the borrows end, as a
-                                        // lone PLAIN bundle.
-                                        pongs.push(response.to_vec());
-                                        continue;
-                                    }
-                                    // Not behind the depth gate: a pong is a
-                                    // few bytes, and withholding it while the
-                                    // FIFO stands at its bound (the steady
-                                    // state of a cwnd-limited link) would
-                                    // starve the client's RTT measurement. It
-                                    // is soft-charged below, like eviction.
-                                    let live = self.last_hello_from == Some(handle);
-                                    tracing::trace!(?handle, "ping received, sending pong");
-                                    match wt.send_datagram(conn, response) {
-                                        // Only the live session's sends are billed.
-                                        Ok(()) if live => {
-                                            let framing = wt.datagram_framing_len();
-                                            control_cums.push(wt.datagram_bytes_enqueued());
-                                            self.instr.offered.bill(
-                                                WireClass::Control,
-                                                response.len(),
-                                                framing,
-                                            );
-                                            // No queue to hold it back, so it is billed
-                                            // to the bucket after the fact.
-                                            self.admission.charge(response.len() + framing);
-                                            self.instr.admission.soft_charged_bytes +=
-                                                (response.len() + framing) as u64;
-                                        }
-                                        Ok(()) => {}
-                                        Err(e) => {
-                                            tracing::warn!(?handle, error = ?e, "failed to send pong");
-                                        }
-                                    }
+                                    // Framed after the borrows end, as a
+                                    // lone PLAIN bundle.
+                                    pongs.push(response.to_vec());
                                 } else {
                                     to_dispatch.push(payload);
                                 }
                             }
                         }
-                    }
-                    for cum in control_cums {
-                        self.track_enqueue(handle, None, cum);
                     }
                     for pong in pongs {
                         self.send_pong_framed(handle, &pong);

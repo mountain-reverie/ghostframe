@@ -84,7 +84,7 @@ impl RecentBundles {
 }
 
 impl IoBridge {
-    /// The test hooks every ACK datagram (0x06 and 0x08) passes first: the
+    /// The test hooks every ACK datagram (0x08, and a superseded 0x06) passes first: the
     /// inbound loss injector and the ACK blackout. True when the datagram is
     /// swallowed (or empty).
     fn ack_datagram_filtered(&mut self, data: &[u8]) -> bool {
@@ -100,8 +100,7 @@ impl IoBridge {
         #[cfg(any(test, feature = "test-loss-injection"))]
         if let Some((from, until)) = self.ack_blackout {
             let now = now_std();
-            if (data[0] == crate::transport::ack::ACK_BATCH_MSG_TYPE
-                || data[0] == ghostframe_protocol::fec::feedback::FEC_ACK_V4_MSG_TYPE)
+            if data[0] == ghostframe_protocol::fec::feedback::FEC_ACK_V4_MSG_TYPE
                 && now >= from
                 && now < until
             {
@@ -112,10 +111,8 @@ impl IoBridge {
         false
     }
 
-    /// Handle an ACK v4 datagram (0x08): the same chain as an 0x06 batch, with
-    /// the entries naming bundles (`bundle_seq`) instead of datagrams. Both
-    /// formats funnel into [`Self::apply_ack_entries`], so the consumers
-    /// cannot drift apart.
+    /// Handle an ACK v4 datagram (0x08): the entries name bundles
+    /// (`bundle_seq`) and go through [`Self::apply_ack_entries`].
     pub(crate) fn dispatch_ack_v4_datagram(&mut self, data: &[u8]) {
         if self.ack_datagram_filtered(data) {
             return;
@@ -127,6 +124,11 @@ impl IoBridge {
                     .iter()
                     .map(|e| (e.bundle_seq, e.arrival_time_ms_lo16))
                     .collect();
+                tracing::trace!(
+                    target: "ghostframe::cdf53",
+                    entry_count = entries.len(),
+                    "ack_batch_received"
+                );
                 self.apply_ack_entries(&entries);
             }
             Err(e) => {
@@ -200,11 +202,11 @@ impl IoBridge {
         self.apply_ack_coverage(&resolved);
     }
 
-    /// Route a single inbound datagram into the appropriate handler.
-    /// Currently dispatches ACK_BATCH_MSG_TYPE; future M3.x message types
-    /// can be added here. Unknown discriminators are silently dropped
-    /// (forward-compatible).
-    pub(crate) fn dispatch_ack_datagram(&mut self, data: &[u8]) {
+    /// A superseded ACK revision (0x02..=0x04, 0x06): the per-transmission
+    /// batch of the unframed protocol. There is no decoder for it any more.
+    /// It passes the test hooks like any ACK datagram, is counted as
+    /// unroutable and dropped.
+    fn dispatch_superseded_ack_datagram(&mut self, data: &[u8]) {
         if self.ack_datagram_filtered(data) {
             return;
         }
@@ -212,48 +214,9 @@ impl IoBridge {
             target: "ghostframe::cdf53",
             first_byte = data[0],
             len = data.len(),
-            "ack_datagram_received"
+            "ack_datagram_superseded_revision"
         );
-        if data[0] == crate::transport::ack::ACK_BATCH_MSG_TYPE {
-            if let Ok(batch) = crate::transport::ack::AckBatch::decode(data) {
-                let entries: Vec<(u32, u16)> = batch
-                    .entries
-                    .iter()
-                    .map(|e| (e.wire_seq, e.arrival_time_ms_lo16))
-                    .collect();
-                tracing::trace!(
-                    target: "ghostframe::cdf53",
-                    entry_count = batch.entries.len(),
-                    "ack_batch_received"
-                );
-                self.apply_ack_entries(&entries);
-            } else {
-                // The first byte already said `ACK_BATCH_MSG_TYPE` so a
-                // decode failure here is a real protocol-level disagreement
-                // (count out of range, truncated payload, etc.) rather than
-                // a stray new message type. Surface it loudly — the
-                // overlap-batch-rejection bug (commit message of this fix)
-                // hid for weeks because the legacy code silently dropped
-                // these, so every overlap-bearing batch was discarded
-                // without any signal that ACK throughput had collapsed.
-                tracing::warn!(
-                    target: "ghostframe::cdf53",
-                    first_byte = data[0],
-                    len = data.len(),
-                    "ack_batch_decode_failed"
-                );
-            }
-        } else {
-            // Unknown first byte — possibly a future protocol message
-            // type. Forward-compat: log at debug so it's discoverable
-            // under verbose tracing but doesn't spam normal operation.
-            tracing::debug!(
-                target: "ghostframe::cdf53",
-                first_byte = data[0],
-                len = data.len(),
-                "ack_datagram_unknown_first_byte"
-            );
-        }
+        self.unroutable_inbound_datagrams = self.unroutable_inbound_datagrams.saturating_add(1);
     }
 
     /// Resolve each ACK entry against the transmission ledger, updating the
@@ -712,7 +675,7 @@ impl IoBridge {
             return;
         }
         // Route by discriminator. TileNack (`TILE_NACK_ENVELOPE`) routes into
-        // the reliable-tile emitter; ACK batches go to `dispatch_ack_datagram`.
+        // the reliable-tile emitter; ACK v4 goes to `dispatch_ack_v4_datagram`.
         // Other kinds (Hello, frame/tile fragments) are not dispatched on the
         // inbound server path.
         //
@@ -723,14 +686,11 @@ impl IoBridge {
         use crate::transport::protocol::InboundKind as K;
         match crate::transport::protocol::classify_inbound(dg) {
             K::TileNack => self.dispatch_tile_nack_datagram(dg),
-            K::AckBatch => self.dispatch_ack_datagram(dg),
             K::FrameAck => self.dispatch_frame_ack_datagram(dg),
-            // Superseded ACK revisions still reach the ACK decoder, which
-            // rejects them by design -- that rejection is the intended
-            // handling, not a fallthrough.
-            K::AckBatchV1 => self.dispatch_ack_datagram(dg),
+            // Superseded ACK revisions (0x02..=0x04, 0x06) have no decoder.
+            K::AckBatchV1 => self.dispatch_superseded_ack_datagram(dg),
             // FEC v2 rev 6 client feedback (docs/specs/fec-v2/fec-v2-rev6.md
-            // §6.2): ACK v4 resolves bundles through the same chain as 0x06;
+            // §6.2): ACK v4 resolves bundles;
             // the report and the repair request are in `repair_status`.
             K::AckBatchV4 => self.dispatch_ack_v4_datagram(dg),
             K::LossReport => self.dispatch_loss_report_datagram(dg),
