@@ -416,6 +416,7 @@ impl IoBridge {
         }
         self.wt_sessions.remove(&handle);
         self.feedback_recv_bufs.remove(&handle);
+        self.status_streams.retain(|(h, _), _| *h != handle);
         self.close_deadlines.remove(&handle);
         self.rechecker.forget(&handle);
         self.stats_sessions.remove(&handle);

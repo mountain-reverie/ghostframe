@@ -286,6 +286,11 @@ pub enum RetxCause {
     Loss,
     /// The probe timeout.
     Probe,
+    /// The client received the record's bundle but refused its content
+    /// (CONTENT_REJECTED on the repair-status stream). Handled like `Loss`:
+    /// a tile is queued again, an H.264 P-frame fragment is not (the
+    /// reference manager recovers), an IDR fragment is sent again.
+    Rejected,
 }
 
 /// Retransmissions of one pass after which a loss verdict stops resending it
@@ -699,7 +704,7 @@ impl ReliableTileEmitter {
         self.stats.loss_path_resends += 1;
         self.stats.retransmit_attempts_total += 1;
         match cause {
-            RetxCause::Loss => {
+            RetxCause::Loss | RetxCause::Rejected => {
                 self.stats.loss_retransmits += 1;
                 self.stats.h264_idr_resends += 1;
             }
@@ -1163,7 +1168,7 @@ impl ReliableTileEmitter {
             self.queue.push_source(bytes, WireClass::LossRetransmit);
             self.stats.loss_path_resends += 1;
             match cause {
-                RetxCause::Loss => self.stats.loss_retransmits += 1,
+                RetxCause::Loss | RetxCause::Rejected => self.stats.loss_retransmits += 1,
                 RetxCause::Probe => self.stats.pto_probe_retransmits += 1,
             }
             self.note_loss_path_resend(key, first_ws, cause == RetxCause::Probe);
@@ -1393,10 +1398,11 @@ impl ReliableTileEmitter {
         {
             return RetxRequest::AlreadyQueued;
         }
-        if is_p_frame && cause == RetxCause::Loss {
+        let loss_like = matches!(cause, RetxCause::Loss | RetxCause::Rejected);
+        if is_p_frame && loss_like {
             return RetxRequest::NotRetransmitted;
         }
-        if cause == RetxCause::Loss && loss_attempts >= LOSS_RETX_MAX_ATTEMPTS {
+        if loss_like && loss_attempts >= LOSS_RETX_MAX_ATTEMPTS {
             return RetxRequest::Deferred;
         }
         RetxRequest::Queued
@@ -2199,6 +2205,33 @@ mod tests {
                 e.stats.loss_path_resends
             ),
             (1, 1, 0)
+        );
+    }
+
+    #[test]
+    fn a_rejected_tile_is_queued_and_resent_like_a_verdict() {
+        let mut e = ReliableTileEmitter::new(Instant::now());
+        let mut sender = CollectSender::default();
+        let t0 = Instant::now();
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        e.drain(&mut sender, t0);
+        let ws = e.take_transmissions()[0].wire_seq;
+        assert_eq!(
+            e.request_retransmit(key, ws, RetxCause::Rejected),
+            RetxRequest::Queued
+        );
+        let mut n = 0;
+        e.tick_loss_budgeted(t0, usize::MAX, usize::MAX, &mut n);
+        assert_eq!(n, 1);
+        assert_eq!(e.stats.loss_path_resends, 1);
+        assert_eq!(e.stats.loss_retransmits, 1);
+        assert_eq!(e.stats.pto_probe_retransmits, 0);
+        // The resend is the newest transmission now; asking about the old one
+        // again is a stale request.
+        assert_eq!(
+            e.request_retransmit(key, ws, RetxCause::Rejected),
+            RetxRequest::NewerInFlight
         );
     }
 
