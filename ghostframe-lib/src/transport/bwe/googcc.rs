@@ -15,9 +15,38 @@ use goog_cc::transport::{
     NetworkAvailability, NetworkControlUpdate, PacedPacketInfo, PacketResult, ProbeClusterConfig,
     ProcessInterval, SentPacket, StreamsConfig, TargetRateConstraints, TransportPacketsFeedback,
 };
-use goog_cc::units::{DataRate, DataSize, Timestamp};
-use goog_cc::{GoogCcConfig, GoogCcNetworkController};
+use goog_cc::units::{DataRate, DataSize, TimeDelta, Timestamp};
+use goog_cc::{GoogCcConfig, GoogCcNetworkController, RobustThroughputEstimatorSettings};
 use std::time::{Duration, Instant};
+
+/// The acknowledged-rate window goog_cc reads its decrease and probing from,
+/// set by time.
+///
+/// goog_cc's `RobustThroughputEstimator` keeps the smallest window holding at
+/// least `window_packets` packets and the last `window_duration`, then caps it
+/// at `max_window_packets` (500) however short that makes it. The defaults
+/// assume packets of a video stream's size, and the cap meant a length of time
+/// only as long as the packets stayed small: with one record per datagram
+/// (about 120 bytes) it held the window to about 50 ms at 10 Mbit/s, while an
+/// MTU-sized bundle of 7 or 8 records is one packet and the same cap lets the
+/// window span about a second. After a stall (a send window that opened again
+/// after a rise of the round trip) that second still held the stalled flow:
+/// the delay detector read `0.85 x` an acknowledged rate of 3 Mbit/s on a
+/// 10 Mbit/s link and the estimate fell to it (p8e: back at 0.6 x the link after
+/// 11 s, where it took 2.3 s).
+///
+/// A window of the last 300 ms does not depend on the packet size. It is as
+/// long as the one-record-per-datagram window was at the rates where that
+/// mattered (50 ms there, but p_b_population's H.264 streams, a few hundred
+/// 1200-byte packets a second, need more than 100 ms of them: at 100 ms the
+/// step-up on its 20 ms row found the headroom on 8 of 24 timelines, at 300 ms
+/// on 16).
+fn acked_rate_window() -> RobustThroughputEstimatorSettings {
+    RobustThroughputEstimatorSettings {
+        window_duration: TimeDelta::from_millis(300),
+        ..RobustThroughputEstimatorSettings::default()
+    }
+}
 
 /// Floor and ceiling handed to the controller. The floor keeps a badly
 /// congested link usable rather than collapsing to nothing; the ceiling stops
@@ -253,7 +282,10 @@ impl GoogCcDriver {
                 enable_repeated_initial_probing: Some(true),
                 ..Default::default()
             },
-            field_trials: FieldTrials::default(),
+            field_trials: FieldTrials {
+                robust_throughput_estimator_settings: acked_rate_window(),
+                ..FieldTrials::default()
+            },
         };
         let mut ctl = GoogCcNetworkController::new(
             cfg,
