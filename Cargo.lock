@@ -2110,6 +2110,7 @@ name = "ghostframe-protocol"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "rusty_erasure",
  "smallvec",
  "thiserror 2.0.18",
  "tracing",
@@ -4959,6 +4960,31 @@ dependencies = [
  "tempfile",
  "wait-timeout",
 ]
+
+[[package]]
+name = "rusty_erasure"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed29bb151d36095306a705a97d4372175a400eba5db826ebd6f16108d303535b"
+dependencies = [
+ "rusty_erasure-accel",
+ "rusty_erasure-core",
+]
+
+[[package]]
+name = "rusty_erasure-accel"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f936d7453da2c1978e4c60c6eb66d2c27deda143f867fabe2310b3be45935667"
+dependencies = [
+ "rusty_erasure-core",
+]
+
+[[package]]
+name = "rusty_erasure-core"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b693e1dccb5b72487d60902e1294ab0ea19d7ce9696053f78b9ef3c97f9ae80f"
 
 [[package]]
 name = "ryu"
