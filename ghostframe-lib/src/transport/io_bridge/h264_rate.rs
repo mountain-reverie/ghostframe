@@ -674,7 +674,7 @@ impl IoBridge {
             let avg_frame = p.target_rate_bps as f64 * RATE_SHARE / 8.0 * period;
             expected_later = (later * avg_frame * RAISE_EXPECTED_YIELD) as i64;
         }
-        let len = template.len() as i64;
+        let len = crate::transport::fec_tx::packer::Packer::lone_bundle_len(template.len()) as i64;
         let want_bytes = (p.min_bytes as f64 * PAD_MARGIN) as i64 - expected_later;
         if p.bytes_sent >= want_bytes && p.packets_sent >= p.min_probes {
             return;

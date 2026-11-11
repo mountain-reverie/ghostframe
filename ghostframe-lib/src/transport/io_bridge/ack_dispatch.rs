@@ -362,6 +362,47 @@ impl IoBridge {
         }
     }
 
+    /// `queued_at` and the probe tag of `content`, from whichever cache holds
+    /// it: the tile cache, the H.264 probe cache or the pad ring.
+    pub(super) fn cached_queued_at_and_probe(
+        &self,
+        content: &crate::transport::reliable_emitter::Content,
+    ) -> Option<(
+        std::time::Instant,
+        Option<crate::transport::reliable_emitter::cache::ProbeTag>,
+    )> {
+        use crate::transport::reliable_emitter::Content;
+        match content {
+            Content::Tile(k) => self
+                .reliable_emitter
+                .cache
+                .get(k)
+                .map(|e| (e.queued_at, e.probe)),
+            Content::H264Frag {
+                frame_seq,
+                frag_idx,
+            } => self
+                .reliable_emitter
+                .h264
+                .get(*frame_seq, *frag_idx)
+                .map(|e| (e.queued_at, e.probe)),
+            Content::Pad(ws) => self
+                .reliable_emitter
+                .pads
+                .get(*ws)
+                .map(|e| (e.queued_at, Some(e.probe))),
+        }
+    }
+
+    /// The probe cluster `content` was tagged for at emit time, if any.
+    pub(super) fn probe_tag_of(
+        &self,
+        content: &crate::transport::reliable_emitter::Content,
+    ) -> Option<crate::transport::reliable_emitter::cache::ProbeTag> {
+        self.cached_queued_at_and_probe(content)
+            .and_then(|(_, probe)| probe)
+    }
+
     /// Turn resolved ACKs into BWE samples. Must run before `on_ack`, which
     /// removes the cache entries the `queued_at` and probe reads need.
     fn record_ack_bwe_samples(
@@ -396,27 +437,7 @@ impl IoBridge {
             let first = tx.records.first().map(|&(_, content)| content);
             // `queued_at` and the probe tag come from whichever cache holds the
             // content: the tile cache, or the H.264 probe cache.
-            let cache_entry: Option<(std::time::Instant, Option<_>)> =
-                first.and_then(|content| match &content {
-                    crate::transport::reliable_emitter::Content::Tile(k) => self
-                        .reliable_emitter
-                        .cache
-                        .get(k)
-                        .map(|e| (e.queued_at, e.probe)),
-                    crate::transport::reliable_emitter::Content::H264Frag {
-                        frame_seq,
-                        frag_idx,
-                    } => self
-                        .reliable_emitter
-                        .h264
-                        .get(*frame_seq, *frag_idx)
-                        .map(|e| (e.queued_at, e.probe)),
-                    crate::transport::reliable_emitter::Content::Pad(ws) => self
-                        .reliable_emitter
-                        .pads
-                        .get(*ws)
-                        .map(|e| (e.queued_at, Some(e.probe))),
-                });
+            let cache_entry = first.and_then(|content| self.cached_queued_at_and_probe(&content));
             let server_emit_us = tx.emit_us;
             let queued_since_epoch_us = cache_entry
                 .map(|(queued_at, _)| {

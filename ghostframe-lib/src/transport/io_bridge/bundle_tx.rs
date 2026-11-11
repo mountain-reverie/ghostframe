@@ -257,6 +257,7 @@ impl IoBridge {
                     emit_us: e.emit_us,
                     class,
                     is_pad: matches!(e.content, Content::Pad(_)),
+                    is_probe: self.probe_tag_of(&e.content).is_some(),
                     len: dg.len(),
                 };
                 self.packer.push(dg, meta, max_dg)
