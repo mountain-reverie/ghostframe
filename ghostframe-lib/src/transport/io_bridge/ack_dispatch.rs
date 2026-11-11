@@ -432,7 +432,9 @@ impl IoBridge {
             // followers invisible. Always >= the emit -> ACK latency of the
             // same record. A record with no cache entry (a retired one) falls
             // back to the departure's emit time. A lone control bundle has no
-            // record and so no sample: this is per-tile queueing.
+            // record and so no sample. Records are tile passes, H.264
+            // fragments and padding (the last two are recorded as Critical),
+            // so this is per-record queueing, not per-tile.
             {
                 let now_us = now_for_samples
                     .saturating_duration_since(self.bwe_epoch)
@@ -469,8 +471,9 @@ impl IoBridge {
                 break;
             }
             // One sample per transmission. `tile_key` / `content` read its
-            // first record (the only one today); with several records the tier
-            // and the cache read follow the plan's decision 6.
+            // first record only, though a bundle may carry several; the
+            // queueing samples above cover every record, and the tier and the
+            // cache read follow the plan's decision 6.
             // A lone control bundle (frame dimensions, a pong) has no record
             // and no cache entry, but it was sent and it is acknowledged: it
             // is a sample like any other (it is reported lost otherwise, and
