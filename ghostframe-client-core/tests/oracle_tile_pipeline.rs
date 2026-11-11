@@ -63,6 +63,7 @@ fn core() -> ClientCore {
             tile_delivery: TileDelivery::Decoded,
             cdf53_wire: false,
             display: None,
+            fec_framing: false,
         },
         0,
     );

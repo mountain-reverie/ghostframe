@@ -13,6 +13,7 @@ fn core_with(delivery: TileDelivery) -> ClientCore {
             tile_delivery: delivery,
             cdf53_wire: false,
             display: None,
+            fec_framing: false,
         },
         0,
     );

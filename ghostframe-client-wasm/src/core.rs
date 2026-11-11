@@ -43,6 +43,7 @@ pub fn client_config(
         },
         cdf53_wire: false,
         display: None,
+        fec_framing: false, // R6-b B5 wires this
     }
 }
 
@@ -258,10 +259,12 @@ impl WasmClientCore {
     /// Call until it returns `undefined`.
     #[wasm_bindgen(js_name = pollTransmit)]
     pub fn poll_transmit(&mut self, now_us: u64) -> Result<JsValue, JsValue> {
-        match self.inner.borrow_mut().poll_transmit(now_us) {
-            Some(out) => to_js(&WasmPollOutput::from(out)),
-            None => Ok(JsValue::UNDEFINED),
+        while let Some(out) = self.inner.borrow_mut().poll_transmit(now_us) {
+            if let Some(out) = WasmPollOutput::from_output(out) {
+                return to_js(&out);
+            }
         }
+        Ok(JsValue::UNDEFINED)
     }
 
     /// Earliest µs deadline at which `onTimeout` must be called.
