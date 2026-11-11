@@ -605,6 +605,114 @@ async fn an_acknowledged_lone_control_bundle_is_a_bwe_sample() {
     assert_eq!(s.size_bytes as usize, b.sent_frames_for_test[0].len());
 }
 
+/// A REPAIR frame of `payload_len` bytes as the bridge will build one in D4b:
+/// a sealed bundle of kind `Repair` with no records.
+fn repair_bundle(
+    bundle_seq: u32,
+    payload_len: usize,
+) -> crate::transport::fec_tx::packer::SealedBundle {
+    use ghostframe_protocol::fec::frame::RepairFrame;
+    let payload = vec![0x5a; payload_len];
+    let bytes = RepairFrame {
+        bundle_seq,
+        block_id: 7,
+        k: 4,
+        r: 2,
+        repair_idx: 0,
+        payload: &payload,
+    }
+    .encode();
+    crate::transport::fec_tx::packer::SealedBundle {
+        bundle_seq,
+        bytes,
+        records: Default::default(),
+        emit_us: 0,
+        kind: crate::transport::fec_tx::packer::BundleKind::Repair,
+    }
+}
+
+/// D4a: a repair bundle is one ledger transmission with no records, billed
+/// whole as `WireClass::Repair`, charged to the bucket for its framing only
+/// (it paid its length at admission), acknowledged as one BWE sample, never
+/// retransmitted on a verdict, and counted while queued.
+#[tokio::test(start_paused = true)]
+async fn a_repair_bundle_is_one_recordless_transmission_billed_as_repair() {
+    let mut b = framed_bridge();
+    b.admission.refill(now_std(), 1_000_000.0, 1_000);
+    let seq = b.packer.alloc_seq();
+    let rb = repair_bundle(seq, 200);
+    let len = rb.bytes.len();
+    let banked = b.admission.available();
+
+    b.queue_bundles(smallvec::smallvec![rb]);
+    assert_eq!(b.transmission_ledger.len(), 1, "one ledger transmission");
+    assert!(b.transmission_ledger.peek(seq).unwrap().records.is_empty());
+    assert_eq!(
+        b.unsent_bundle_bytes(),
+        len + b.live_framing_len(),
+        "a queued repair counts toward the depth gate"
+    );
+
+    assert!(b.drive_pending_bundles(), "the wire accepts");
+    assert!(b.pending_bundles.is_empty());
+    let cum = b.test_wire.as_ref().unwrap().cum;
+    assert!(cum > 0);
+    assert_eq!(b.instr.offered.of(WireClass::Repair), len as u64);
+    assert_eq!(
+        b.instr.offered.of(WireClass::Control),
+        0,
+        "not double billed"
+    );
+    assert_eq!(b.instr.offered.total(), cum, "offered == quinn enqueued");
+    assert_eq!(
+        banked - b.admission.available(),
+        b.live_framing_len(),
+        "the bucket is charged the framing only"
+    );
+    assert_eq!(
+        b.instr.admission.soft_charged_bytes,
+        b.live_framing_len() as u64
+    );
+
+    b.stamp_departure(seq, now_std());
+    ack_v4(&mut b, &[seq]);
+    assert_eq!(b.bwe_samples_buffer.len(), 1, "one BWE sample");
+    assert_eq!(b.bwe_samples_buffer[0].size_bytes as usize, len);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lost_repair_bundle_retransmits_nothing() {
+    let mut b = framed_bridge();
+    let seq = b.packer.alloc_seq();
+    b.queue_bundles(smallvec::smallvec![repair_bundle(seq, 100)]);
+    assert!(b.drive_pending_bundles());
+    submit_tiles(&mut b, 15);
+    send_all(&mut b);
+    let tile_seqs: Vec<u32> = b
+        .sent_frames_for_test
+        .iter()
+        .skip(1)
+        .map(|f| frame_seq(f))
+        .collect();
+    b.stamp_departure(seq, now_std());
+    for s in &tile_seqs {
+        b.stamp_departure(*s, now_std());
+    }
+    // The tiles after it arrive; the repair is overtaken by K_PKT of them.
+    ack_v4(&mut b, &tile_seqs);
+    let before = b.reliable_emitter.emission_queue_len();
+
+    b.expire_transmissions(now_std());
+
+    assert_eq!(b.instr.losses_declared, 1, "premise: the verdict happened");
+    assert_eq!(b.instr.loss_retx_requested, 0, "no record, no retransmit");
+    let mut n = 0;
+    b.reliable_emitter
+        .tick_loss_budgeted(now_std(), usize::MAX, usize::MAX, &mut n);
+    assert_eq!(n, 0);
+    assert_eq!(b.reliable_emitter.emission_queue_len(), before);
+}
+
 const GOLDEN_FRAMES: usize = 12;
 const GOLDEN_DIGEST: u64 = 0x7ca8_58bd_97c7_010f;
 
