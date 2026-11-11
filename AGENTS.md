@@ -200,6 +200,37 @@ verdicts and probes; called `rto_fired` before the per-pass timer was removed),
 `ack_misses`, `retransmit_attempts_total`, `cache_pending_entries`, and the
 latency tiers.
 
+Since FEC v2 rev 6 every server-to-client datagram is a framed **bundle**
+(SOURCE 0x01 or PLAIN 0x03 frames, `ghostframe-protocol/src/fec/frame.rs`)
+holding one or more records, and the ledger's unit is the bundle. On that line
+the `offered_*_B` byte fields are unchanged and still sum to
+`quinn_bytes_enqueued`, but the per-class datagram counts
+(`OfferedBytes::datagrams`) are billing entries, one per record plus one
+`Control` entry per bundle for its frame header; the number of datagrams quinn
+took is `offered.bundles`. A ledger verdict (`lost_by_packet` / `lost_by_time` /
+`lost_by_pto`, `spurious_ledger` on the `loss path` event) covers every record
+in the bundle, so it counts bundles; the records in those bundles are
+`ledger_lost_records` / `ledger_spurious_lost_records` (instruments only, not
+logged), and each record is retransmitted on its own.
+`admit_short_bundle_shared_risk` counts short bundles (`len + 64 < max_dg`)
+quinn accepted behind another short one with its FIFO non-empty: pairs that can
+share a QUIC packet and so one loss. It is observability only. The client's ACK
+is ACK v4 (0x08), one entry per `bundle_seq`; the 0x06 ACK is gone and a
+datagram of an older revision is dropped as superseded
+(`ack_datagram_superseded_revision`). In H.264 mode `tx_recorded`,
+`tx_acked_live`, `tx_judged_lost` and `tx_forgotten` still count H.264 fragment
+records, not bundles, so the identity holds as before.
+
+The `fec v2 inbound` line (same cadence) is the client's feedback:
+`recovered_rx` (RECOVERED ids), `content_rejected_rx` /
+`content_rejected_unknown` (CONTENT_REJECTED; unknown = no record held; handled
+as a tile re-encode or an H.264 frame repair), `declined_rx` (DECLINED),
+`repair_requests_rx`, `loss_reports_rx` and `client_recovered`. The first three
+arrive on the repair-status stream (tag 0xF5), not as datagrams. A
+`*_malformed` count above zero is a client or framing bug. The goog_cc
+acknowledged-rate window is 300 ms of acknowledgements, not a packet count
+(`acked_rate_window`).
+
 The service is `ghostframe-server.service` (`systemctl --user status
 ghostframe-server`); `login`, `logout` and the service share a lock on the state
 directory, so stop the service before `logout`. A node counts as joined when
@@ -462,7 +493,10 @@ Env-gated, off by default:
   --test cdf53_grid` and check the shaderdb line (about 930 instructions, 8
   registers, ~21:57 spills is the shipped build).
 
-Tile XOR parity was removed by FEC v2 rev 6; the framing's Reed-Solomon replaces it.
+Tile XOR parity is gone (`GHOSTFRAME_TILE_FEC`, `TransportConfig::tile_fec` and
+`RunOptions::tile_fec` no longer exist). FEC v2 repair (REPAIR frames, R6-d) is
+not implemented yet, so on this branch every bundle is an unprotected
+SOURCE/PLAIN one and loss is recovered by retransmission only.
 
 See also `reference_e2e_loss_injection` and `reference_e2e_diagnose` notes for
 the e2e-side injection variables.
