@@ -276,12 +276,14 @@ Against it:
 Each repair is recorded in the ledger as a transmission (rev 5 §4.9.1).
 
 **What the simulation does and does not support:**
-- **Time cap.** It supports one, but ran only fixed values (T = 2, 5, 10, 25, 33 ms). The formula above was not simulated.
-- **Empty close.** For RS it was not simulated. The simulator closes RS blocks only on k_max or the timer. Its evidence comes from the sliding-window runs:
-  - recovery p99 on tiles: 606 ms without a flush, 75 ms with one, at 2 Mbit/s;
-  - late H.264 frames: 3.57 % without, 0.80 % with.
+- **Time cap.** It supports one, but ran fixed values (T = 2, 5, 10, 25, 33 ms) and, in `FINDINGS.md` §7, the formula above (with and without rule 3).
+- **Empty close.** Simulated for RS (`FINDINGS.md` §7, `empty_sim.py`, 5 seeds, T from the formula above):
+  - overhead and mean k move by at most 0.2 point on H.264 at every rate;
+  - late H.264 frames and tile recovery p95 / p99 do not move beyond the seed spread, because Empty only shortens the last block of a frame;
+  - small tile bursts (1-6 bundles) recover 2-4 ms sooner at 30 Mbit/s and up (p95 6.7 to 3.0 ms at 100);
+  - at 2 Mbit/s 43 % of H.264 blocks close on Empty with mean k 3.9, but T alone already gives mean k 5.6. The small-block cost comes from T, not from rule 3.
 
-  Treat rule 3 as necessary but **unmeasured for RS**. Add it to `sim-rev6` before R6-d.
+  Rule 3 stays as written. A minimum k at Empty close changes nothing. r ≥ 2 at Empty close cuts late frames at 2 Mbit/s (1.03 to 0.70 % at i.i.d. 5 %) for 6 more points of overhead, and is not adopted.
 - **H.264 frames.** A frame is queued at commit (`frame.rs:1749`), and the emitter usually runs empty before the next one. Rules 2 and 3 therefore make a block roughly one frame's worth of traffic at low rate. Neither rule knows about frames **[E]**.
 - **Bursts need span.**
   - Mean-burst-3 loss at 30 Mbit/s, 5 seeds: late frames are 7.3–9.6 % at T = 5 ms and 0.9–1.5 % at T = 25 ms **[E]**.
