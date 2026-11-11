@@ -424,6 +424,47 @@ impl IoBridge {
                 // live acknowledgements made them.
                 continue;
             }
+            // BWE Stage 2.1: `queued_at -> ACK`, one sample per acknowledged
+            // record, not per transmission. A bundle carries several records
+            // that were queued at different moments, and the statistic is
+            // per-tile queueing delay: recording the first record alone
+            // would drop the others and make the delay of a bundle's
+            // followers invisible. Always >= the emit -> ACK latency of the
+            // same record. A record with no cache entry (a retired one) falls
+            // back to the departure's emit time. A lone control bundle has no
+            // record and so no sample: this is per-tile queueing.
+            {
+                let now_us = now_for_samples
+                    .saturating_duration_since(self.bwe_epoch)
+                    .as_micros() as u64;
+                let mut queued: SmallVec<[(PassTier, u64); 4]> = SmallVec::new();
+                for &(_, content) in tx.records.iter() {
+                    let tier = if content
+                        .tile()
+                        .is_none_or(|k| pass_tier(k.pass_idx) == PassTier::Critical)
+                    {
+                        PassTier::Critical
+                    } else {
+                        PassTier::Refinement
+                    };
+                    let since_us = self
+                        .cached_queued_at_and_probe(&content)
+                        .map(|(q, _)| {
+                            q.saturating_duration_since(self.bwe_epoch).as_micros() as u64
+                        })
+                        .unwrap_or(tx.emit_us);
+                    queued.push((tier, since_us));
+                }
+                for (tier, since_us) in queued {
+                    let latency = now_us.saturating_sub(since_us);
+                    match tier {
+                        PassTier::Critical => self.queued_critical_latency_stats.record(latency),
+                        PassTier::Refinement => {
+                            self.queued_refinement_latency_stats.record(latency)
+                        }
+                    }
+                }
+            }
             if self.bwe_samples_buffer.len() >= BWE_SAMPLES_BUFFER_CAPACITY {
                 break;
             }
