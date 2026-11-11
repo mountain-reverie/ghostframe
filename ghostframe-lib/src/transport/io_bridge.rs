@@ -74,6 +74,8 @@ use session::{
 
 #[path = "io_bridge/stats_service.rs"]
 mod stats_service;
+#[path = "io_bridge/bundle_tx.rs"]
+mod bundle_tx;
 
 #[path = "io_bridge/ack_dispatch.rs"]
 mod ack_dispatch;
@@ -104,10 +106,10 @@ mod h264_rate;
 #[path = "io_bridge/h264_refs.rs"]
 mod h264_refs;
 pub use h264_refs::RefsReport;
-#[path = "io_bridge/repair_status.rs"]
-mod repair_status;
 #[path = "io_bridge/h264_tx.rs"]
 mod h264_tx;
+#[path = "io_bridge/repair_status.rs"]
+mod repair_status;
 use h264_tx::H264Tx;
 pub use h264_tx::{H264Report, H264Stats, IdrCause};
 
@@ -931,6 +933,27 @@ pub struct IoBridge {
     fec_in: repair_status::FecInboundStats,
     /// The last bundles that left the ledger, for a late CONTENT_REJECTED.
     recent_bundles: ack_dispatch::RecentBundles,
+    /// Rev 6 framing on: every datagram leaves inside a PLAIN bundle
+    /// (`TransportConfig::fec_framing`).
+    fec_framing: bool,
+    /// The live session's packer (framing on only).
+    packer: crate::transport::fec_tx::packer::Packer,
+    /// Per-record facts the emitter reported at build time, by record
+    /// `wire_seq`, until `send_counted` hands the record to the packer. With
+    /// framing on `record_emitted_transmissions` fills this instead of the
+    /// ledger (the ledger is keyed by bundle).
+    emitted_meta: HashMap<u32, crate::transport::reliable_emitter::emitter::EmittedDatagram>,
+    /// Sealed bundles quinn has not taken yet, oldest first. Their ledger
+    /// records exist; they are sent before anything newer.
+    pending_bundles: std::collections::VecDeque<crate::transport::fec_tx::packer::SealedBundle>,
+    /// Unit tests only: every bundle handed to quinn (or the test wire).
+    #[cfg(test)]
+    pub(crate) sent_frames_for_test: Vec<Vec<u8>>,
+    /// Unit tests only: stands in for the quinn connection when framing is on
+    /// and a unit bridge has none: `blocked` refuses every bundle, `cum` is
+    /// the accepted byte counter (frame plus one byte of framing each).
+    #[cfg(test)]
+    pub(crate) test_wire: Option<bundle_tx::TestWire>,
     /// Lifetime counter of `send_datagram` Errs (Blocked / TooLarge /
     /// Disabled / UnsupportedByPeer). The Blocked case fires whenever the
     /// QUIC send buffer is full — at session start while cwnd is small,
@@ -1574,6 +1597,14 @@ impl IoBridge {
             status_streams: HashMap::new(),
             fec_in: Default::default(),
             recent_bundles: Default::default(),
+            fec_framing: lib_config.transport.fec_framing,
+            packer: Default::default(),
+            emitted_meta: HashMap::new(),
+            pending_bundles: Default::default(),
+            #[cfg(test)]
+            sent_frames_for_test: Vec::new(),
+            #[cfg(test)]
+            test_wire: None,
             datagram_send_errs: 0,
             datagram_send_err_first_logged: false,
             offered_wire_bytes: 0.0,
@@ -2888,10 +2919,18 @@ impl IoBridge {
                     // Session counter after each pong accepted for the live
                     // session, for the departure tracker (below).
                     let mut control_cums: Vec<u64> = Vec::new();
+                    // Pongs to frame (rev 6 framing only).
+                    let mut pongs: Vec<Vec<u8>> = Vec::new();
                     if let Some(wt) = self.wt_sessions.get_mut(&handle) {
                         if let Some(conn) = self.server.connections.get_mut(&handle) {
                             while let Some(payload) = wt.recv_datagram(conn) {
                                 if let Some(response) = handle_datagram_payload(&payload) {
+                                    if self.fec_framing {
+                                        // Framed after the borrows end, as a
+                                        // lone PLAIN bundle.
+                                        pongs.push(response.to_vec());
+                                        continue;
+                                    }
                                     // Not behind the depth gate: a pong is a
                                     // few bytes, and withholding it while the
                                     // FIFO stands at its bound (the steady
@@ -2929,6 +2968,9 @@ impl IoBridge {
                     }
                     for cum in control_cums {
                         self.track_enqueue(handle, None, cum);
+                    }
+                    for pong in pongs {
+                        self.send_pong_framed(handle, &pong);
                     }
                     for dg in to_dispatch {
                         self.dispatch_inbound_datagram(handle, &dg);
@@ -3035,6 +3077,10 @@ mod coverage_pin_tests;
 #[cfg(test)]
 #[path = "io_bridge/repair_status_tests.rs"]
 mod repair_status_tests;
+
+#[cfg(test)]
+#[path = "io_bridge/bundle_tx_tests.rs"]
+mod bundle_tx_tests;
 
 #[cfg(test)]
 mod write_batched_tests {
