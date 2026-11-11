@@ -40,6 +40,12 @@ pub struct TransportProbe {
     /// is the datagrams it rebuilt from FEC parity.
     pub client_received: u64,
     pub client_recovered: u64,
+    /// LOSS_REPORTs (0x07) received, and the key fields of the last one:
+    /// datagrams lost before repair, rebuilt by FEC, and lost after it.
+    pub loss_reports: u64,
+    pub report_lost_pre_fec: u16,
+    pub report_recovered: u16,
+    pub report_residual: u16,
     /// The D1 instruments (see [`crate::transport::instruments`]). Filled when
     /// the probe is published to the harness; zero in the live copy.
     pub instr: InstrumentSummary,
@@ -150,6 +156,7 @@ impl IoBridge {
         // session would otherwise be declared lost into the next connection's
         // estimator, and its adapted threshold would carry over.
         self.transmission_ledger.reset_session();
+        self.recent_bundles.clear();
         // And what was waiting to be reported about it: a loss of the old
         // path handed to the new connection's estimator at its first
         // acknowledgement, and the late-ack marks that name the old session's

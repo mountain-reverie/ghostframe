@@ -104,6 +104,8 @@ mod h264_rate;
 #[path = "io_bridge/h264_refs.rs"]
 mod h264_refs;
 pub use h264_refs::RefsReport;
+#[path = "io_bridge/repair_status.rs"]
+mod repair_status;
 #[path = "io_bridge/h264_tx.rs"]
 mod h264_tx;
 use h264_tx::H264Tx;
@@ -922,6 +924,13 @@ pub struct IoBridge {
     /// Keyed by sender: one connection's partial message must never be
     /// completed by another connection's bytes. Removed in `forget_session`.
     feedback_recv_bufs: HashMap<ConnectionHandle, Vec<u8>>,
+    /// One reader per repair-status stream (FEC v2 rev 6), keyed by the
+    /// connection and the stream. Removed in `forget_session`.
+    status_streams: HashMap<(ConnectionHandle, quinn_proto::StreamId), repair_status::StatusStream>,
+    /// Counters for the rev 6 inbound feedback.
+    fec_in: repair_status::FecInboundStats,
+    /// The last bundles that left the ledger, for a late CONTENT_REJECTED.
+    recent_bundles: ack_dispatch::RecentBundles,
     /// Lifetime counter of `send_datagram` Errs (Blocked / TooLarge /
     /// Disabled / UnsupportedByPeer). The Blocked case fires whenever the
     /// QUIC send buffer is full — at session start while cwnd is small,
@@ -1562,6 +1571,9 @@ impl IoBridge {
             display_scale_milli: DEFAULT_SCALE_MILLI,
             pending_display_mode: None,
             feedback_recv_bufs: HashMap::new(),
+            status_streams: HashMap::new(),
+            fec_in: Default::default(),
+            recent_bundles: Default::default(),
             datagram_send_errs: 0,
             datagram_send_err_first_logged: false,
             offered_wire_bytes: 0.0,
@@ -2984,14 +2996,7 @@ impl IoBridge {
         // why and either can reconnect. Narrow and self-recovering enough
         // that restructuring the batch isn't warranted; noted so a future
         // "sessions keep vanishing under load" report has a lead.
-        let feedback_data: Vec<(ConnectionHandle, Vec<u8>)> = self
-            .wt_sessions
-            .iter_mut()
-            .flat_map(|(&handle, wt)| wt.drain_feedback().into_iter().map(move |d| (handle, d)))
-            .collect();
-        for (handle, data) in &feedback_data {
-            self.dispatch_feedback_bytes(*handle, data);
-        }
+        self.dispatch_drained_feedback();
 
         // Bootstrap-deadlock guard: refresh the connected-session count so a
         // freshly established WT session unblocks ghostframe-server's capture gate
@@ -3027,6 +3032,9 @@ mod unchanged_oracle_tests;
 #[cfg(test)]
 #[path = "io_bridge/coverage_pin_tests.rs"]
 mod coverage_pin_tests;
+#[cfg(test)]
+#[path = "io_bridge/repair_status_tests.rs"]
+mod repair_status_tests;
 
 #[cfg(test)]
 mod write_batched_tests {

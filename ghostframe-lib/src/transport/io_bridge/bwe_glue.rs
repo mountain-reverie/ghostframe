@@ -532,6 +532,8 @@ impl IoBridge {
             wire_bytes: tx.wire_bytes,
         });
         self.loss_window.record(tx.emit_us as u32, true);
+        // CONTENT_REJECTED may still name it once its tombstone is gone.
+        self.recent_bundles.remember(wire_seq, &tx);
     }
 
     /// Declare `wire_seqs` lost as a verdict would, for a test that is about

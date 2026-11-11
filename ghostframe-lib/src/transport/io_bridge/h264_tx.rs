@@ -526,10 +526,28 @@ impl IoBridge {
         resolved: &[(Transmission, u16, bool)],
         now: std::time::Instant,
     ) {
-        for (late, content) in resolved
+        let items: Vec<(Content, Option<bool>)> = resolved
             .iter()
-            .flat_map(|(tx, _, late)| tx.records().map(move |(_, c)| (late, c)))
-        {
+            .flat_map(|(tx, _, late)| tx.records().map(move |(_, c)| (c, Some(*late))))
+            .collect();
+        self.release_h264_content(&items, now);
+    }
+
+    /// The content side of [`Self::apply_h264_acks`], for a record whose
+    /// transmission the ledger keeps (RECOVERED: the client rebuilt the bundle
+    /// from repair symbols, so the content is delivered but the transmission is
+    /// neither acknowledged nor lost yet). `late` is `Some` for an
+    /// acknowledgement, which also counts the transmission outcome
+    /// (`tx_acked_live` / `tx_acked_late`); `None` for a recovery, which must
+    /// not: the transmission is still outstanding in the ledger and its own
+    /// verdict will be counted when it comes.
+    pub(super) fn release_h264_content(
+        &mut self,
+        items: &[(Content, Option<bool>)],
+        now: std::time::Instant,
+    ) {
+        for (content, late) in items.iter() {
+            let (content, late) = (*content, *late);
             if let Content::Pad(ws) = content {
                 // Padding: its probe tag has been read (before this); the
                 // entry has nothing more to do.
@@ -543,10 +561,10 @@ impl IoBridge {
             else {
                 continue;
             };
-            if *late {
-                self.h264.stats.tx_acked_late += 1;
-            } else {
-                self.h264.stats.tx_acked_live += 1;
+            match late {
+                Some(true) => self.h264.stats.tx_acked_late += 1,
+                Some(false) => self.h264.stats.tx_acked_live += 1,
+                None => {}
             }
             self.h264.last_ack_progress = Some(now);
             // Keep a small P-frame fragment's bytes for probe padding before

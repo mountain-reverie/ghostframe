@@ -758,6 +758,19 @@ impl TransmissionLedger {
         self.spurious_bits = 0;
     }
 
+    /// The transmission `wire_seq` names, live or tombstoned (declared lost),
+    /// read without resolving or consuming it: no loss-detection reference
+    /// moves, nothing is counted, and a later acknowledgement still resolves
+    /// it. For the reports that release content without proving delivery
+    /// (RECOVERED, rev 5 section 4.9.1 rule 3). `None` once it was resolved,
+    /// evicted or never recorded.
+    pub fn peek(&self, wire_seq: u32) -> Option<&Transmission> {
+        self.records
+            .get(&wire_seq)
+            .map(|r| &r.tx)
+            .or_else(|| self.tombstones.get(&wire_seq).map(|t| &t.tx))
+    }
+
     /// Classify a transmission as received. Returns `None` if it is not
     /// outstanding and has no tombstone — already resolved, or the
     /// acknowledgement is unknown to this ledger entirely.

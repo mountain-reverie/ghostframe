@@ -399,7 +399,7 @@ async fn hello_coalesced_with_the_webtransport_header_makes_the_session_live() {
     wt.test_feed_feedback_stream(sid, &wire);
     let queued = wt.drain_feedback();
     assert_eq!(queued.len(), 1, "premise: the read reached the queue");
-    for d in &queued {
+    for (_, d) in &queued {
         bridge.dispatch_feedback_bytes(handle, d);
     }
     assert_eq!(bridge.last_hello_from(), Some(handle), "HELLO was dropped");

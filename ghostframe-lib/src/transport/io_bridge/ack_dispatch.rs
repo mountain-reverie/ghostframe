@@ -15,6 +15,9 @@
 //! it records what the peer acknowledged and hands the samples on.
 
 use super::*;
+use crate::transport::reliable_emitter::Content;
+use crate::transport::transmission_ledger::Transmission;
+use smallvec::SmallVec;
 
 /// Dispatch a raw WebTransport datagram payload.
 ///
@@ -37,28 +40,173 @@ type ResolvedAck = (
     bool,
 );
 
+/// How many resolved or lost bundles stay findable for a CONTENT_REJECTED that
+/// arrives after the ACK (plan decision 9).
+const RECENT_BUNDLES: usize = 4096;
+
+/// The last [`RECENT_BUNDLES`] bundles that left the ledger (acknowledged,
+/// acknowledged late, or declared lost), `id -> records`, oldest evicted first.
+/// CONTENT_REJECTED looks here once the ledger no longer holds the bundle.
+#[derive(Debug, Default)]
+pub(super) struct RecentBundles {
+    map: std::collections::HashMap<u32, SmallVec<[(u32, Content); 4]>>,
+    order: std::collections::VecDeque<u32>,
+}
+
+impl RecentBundles {
+    pub(super) fn remember(&mut self, id: u32, tx: &Transmission) {
+        if self.map.insert(id, tx.records.clone()).is_none() {
+            self.order.push_back(id);
+        }
+        while self.map.len() > RECENT_BUNDLES {
+            match self.order.pop_front() {
+                Some(old) => {
+                    self.map.remove(&old);
+                }
+                None => break,
+            }
+        }
+    }
+
+    pub(super) fn get(&self, id: u32) -> Option<&SmallVec<[(u32, Content); 4]>> {
+        self.map.get(&id)
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
 impl IoBridge {
+    /// The test hooks every ACK datagram (0x06 and 0x08) passes first: the
+    /// inbound loss injector and the ACK blackout. True when the datagram is
+    /// swallowed (or empty).
+    fn ack_datagram_filtered(&mut self, data: &[u8]) -> bool {
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        if let Some(inj) = self.inbound_loss.as_mut() {
+            if inj.should_drop(data) {
+                return true;
+            }
+        }
+        if data.is_empty() {
+            return true;
+        }
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        if let Some((from, until)) = self.ack_blackout {
+            let now = now_std();
+            if (data[0] == crate::transport::ack::ACK_BATCH_MSG_TYPE
+                || data[0] == ghostframe_protocol::fec::feedback::FEC_ACK_V4_MSG_TYPE)
+                && now >= from
+                && now < until
+            {
+                self.acks_blacked_out += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Handle an ACK v4 datagram (0x08): the same chain as an 0x06 batch, with
+    /// the entries naming bundles (`bundle_seq`) instead of datagrams. Both
+    /// formats funnel into [`Self::apply_ack_entries`], so the consumers
+    /// cannot drift apart.
+    pub(crate) fn dispatch_ack_v4_datagram(&mut self, data: &[u8]) {
+        if self.ack_datagram_filtered(data) {
+            return;
+        }
+        match ghostframe_protocol::fec::feedback::BundleAckBatch::decode(data) {
+            Ok(batch) => {
+                let entries: Vec<(u32, u16)> = batch
+                    .entries
+                    .iter()
+                    .map(|e| (e.bundle_seq, e.arrival_time_ms_lo16))
+                    .collect();
+                self.apply_ack_entries(&entries);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "ghostframe::cdf53",
+                    len = data.len(),
+                    error = %e,
+                    "ack_v4_decode_failed"
+                );
+            }
+        }
+    }
+
+    /// Apply acknowledged transmissions, `(transmission id, client arrival
+    /// stamp lo16)` each, to every consumer: the ledger, the BWE sample buffer,
+    /// the emitter's caches, the H.264 tracker and fragment coverage.
+    fn apply_ack_entries(&mut self, entries: &[(u32, u16)]) {
+        // Route every ACKed key into the reliable-tile emitter as
+        // well — it owns the retransmit cache and needs to drop the
+        // matching CacheEntry so nothing sends the pass again. Runs alongside the scheduler/coverage path below,
+        // which is not legacy: the coverage record outlives the
+        // cache entry in several cases, and `apply_ack_coverage`
+        // reads it for exactly those late ACKs (see the
+        // `fragment_coverage` module docs).
+        //
+        // Phase 1 Task 5: we ALSO extract OWD samples here, before
+        // on_ack removes the cache entries. The cache lookup below
+        // recovers the server's emit time from `CacheEntry::last_sent_at`
+        // (monotonic µs since `self.bwe_epoch`) and pairs it with the
+        // client's echoed arrival_time_ms_lo16 (u16 wall-clock-ms
+        // wrapped). Reading `last_sent_at` rather than the stamp
+        // baked into the cached datagram bytes matters on retransmit:
+        // `ReliableEmitter::tick` re-stamps the *copy* it re-sends but
+        // updates `last_sent_at` on the cache entry itself, so this is
+        // the only place that reflects the actual on-wire moment for a
+        // retransmitted pass. The BWE consumer uses relative deltas
+        // only, so clock skew is acceptable. Cache misses are silent
+        // (already ACKed by an overlapping batch, or retired).
+        let now_for_samples = now_std();
+        // Entries name transmissions now, so the ledger supplies both
+        // halves: the content identity every delivery consumer below
+        // expects, and the exact send time of *that* transmission —
+        // no longer inferred from a cache entry that a retransmission
+        // may have re-stamped since.
+        let resolved = self.resolve_ack_entries(entries, now_for_samples);
+        // Both Live and Late resolutions release their content --
+        // that release is the entire point of this phase, since
+        // nothing else ever clears a cache entry acknowledged after
+        // its transmission was declared lost.
+        let emit_keys: Vec<crate::transport::reliable_emitter::EmitKey> = resolved
+            .iter()
+            .flat_map(|(tx, _, _)| tx.records())
+            .filter_map(|(_, c)| c.tile())
+            .collect();
+        // Samples come from the ledger record, not the cache entry.
+        // `Transmission::emit_us` is the stamp *this* datagram
+        // carried, so a retransmission no longer borrows the send time
+        // of whichever transmission the cache happened to hold last —
+        // the ambiguity that made a Karn-style filter necessary.
+        //
+        // `queued_at` and the probe tag still come from the cache,
+        // which is content-scoped and may legitimately be gone if the
+        // tile was superseded. Absent, the sample is still recorded:
+        // its timing is what the estimator came for.
+        // [RTO-PROBE] temporary instrumentation: emit -> acknowledgement
+        // latency, measured on the same clock the probe timeout uses.
+        self.log_ack_probes(entries, &resolved, now_for_samples);
+        self.record_ack_bwe_samples(&resolved, now_for_samples);
+        self.reliable_emitter.on_ack(&emit_keys);
+        self.apply_h264_acks(&resolved, now_for_samples);
+        self.apply_ack_coverage(&resolved);
+    }
+
     /// Route a single inbound datagram into the appropriate handler.
     /// Currently dispatches ACK_BATCH_MSG_TYPE; future M3.x message types
     /// can be added here. Unknown discriminators are silently dropped
     /// (forward-compatible).
     pub(crate) fn dispatch_ack_datagram(&mut self, data: &[u8]) {
-        #[cfg(any(test, feature = "test-loss-injection"))]
-        if let Some(inj) = self.inbound_loss.as_mut() {
-            if inj.should_drop(data) {
-                return;
-            }
-        }
-        if data.is_empty() {
+        if self.ack_datagram_filtered(data) {
             return;
-        }
-        #[cfg(any(test, feature = "test-loss-injection"))]
-        if let Some((from, until)) = self.ack_blackout {
-            let now = now_std();
-            if data[0] == crate::transport::ack::ACK_BATCH_MSG_TYPE && now >= from && now < until {
-                self.acks_blacked_out += 1;
-                return;
-            }
         }
         tracing::debug!(
             target: "ghostframe::cdf53",
@@ -68,65 +216,17 @@ impl IoBridge {
         );
         if data[0] == crate::transport::ack::ACK_BATCH_MSG_TYPE {
             if let Ok(batch) = crate::transport::ack::AckBatch::decode(data) {
+                let entries: Vec<(u32, u16)> = batch
+                    .entries
+                    .iter()
+                    .map(|e| (e.wire_seq, e.arrival_time_ms_lo16))
+                    .collect();
                 tracing::trace!(
                     target: "ghostframe::cdf53",
                     entry_count = batch.entries.len(),
                     "ack_batch_received"
                 );
-                // Route every ACKed key into the reliable-tile emitter as
-                // well — it owns the retransmit cache and needs to drop the
-                // matching CacheEntry so nothing sends the pass again. Runs alongside the scheduler/coverage path below,
-                // which is not legacy: the coverage record outlives the
-                // cache entry in several cases, and `apply_ack_coverage`
-                // reads it for exactly those late ACKs (see the
-                // `fragment_coverage` module docs).
-                //
-                // Phase 1 Task 5: we ALSO extract OWD samples here, before
-                // on_ack removes the cache entries. The cache lookup below
-                // recovers the server's emit time from `CacheEntry::last_sent_at`
-                // (monotonic µs since `self.bwe_epoch`) and pairs it with the
-                // client's echoed arrival_time_ms_lo16 (u16 wall-clock-ms
-                // wrapped). Reading `last_sent_at` rather than the stamp
-                // baked into the cached datagram bytes matters on retransmit:
-                // `ReliableEmitter::tick` re-stamps the *copy* it re-sends but
-                // updates `last_sent_at` on the cache entry itself, so this is
-                // the only place that reflects the actual on-wire moment for a
-                // retransmitted pass. The BWE consumer uses relative deltas
-                // only, so clock skew is acceptable. Cache misses are silent
-                // (already ACKed by an overlapping batch, or retired).
-                let now_for_samples = now_std();
-                // Entries name transmissions now, so the ledger supplies both
-                // halves: the content identity every delivery consumer below
-                // expects, and the exact send time of *that* transmission —
-                // no longer inferred from a cache entry that a retransmission
-                // may have re-stamped since.
-                let resolved = self.resolve_ack_entries(&batch, now_for_samples);
-                // Both Live and Late resolutions release their content --
-                // that release is the entire point of this phase, since
-                // nothing else ever clears a cache entry acknowledged after
-                // its transmission was declared lost.
-                let emit_keys: Vec<crate::transport::reliable_emitter::EmitKey> = resolved
-                    .iter()
-                    .flat_map(|(tx, _, _)| tx.records())
-                    .filter_map(|(_, c)| c.tile())
-                    .collect();
-                // Samples come from the ledger record, not the cache entry.
-                // `Transmission::emit_us` is the stamp *this* datagram
-                // carried, so a retransmission no longer borrows the send time
-                // of whichever transmission the cache happened to hold last —
-                // the ambiguity that made a Karn-style filter necessary.
-                //
-                // `queued_at` and the probe tag still come from the cache,
-                // which is content-scoped and may legitimately be gone if the
-                // tile was superseded. Absent, the sample is still recorded:
-                // its timing is what the estimator came for.
-                // [RTO-PROBE] temporary instrumentation: emit -> acknowledgement
-                // latency, measured on the same clock the probe timeout uses.
-                self.log_ack_probes(&batch, &resolved, now_for_samples);
-                self.record_ack_bwe_samples(&resolved, now_for_samples);
-                self.reliable_emitter.on_ack(&emit_keys);
-                self.apply_h264_acks(&resolved, now_for_samples);
-                self.apply_ack_coverage(&resolved);
+                self.apply_ack_entries(&entries);
             } else {
                 // The first byte already said `ACK_BATCH_MSG_TYPE` so a
                 // decode failure here is a real protocol-level disagreement
@@ -160,7 +260,7 @@ impl IoBridge {
     /// loss window. Entries that resolve to nothing are dropped.
     fn resolve_ack_entries(
         &mut self,
-        batch: &crate::transport::ack::AckBatch,
+        entries: &[(u32, u16)],
         now_for_samples: std::time::Instant,
     ) -> Vec<ResolvedAck> {
         let min_rtt = self
@@ -168,16 +268,15 @@ impl IoBridge {
             .rtt
             .min_rtt()
             .unwrap_or(std::time::Duration::ZERO);
-        let resolved: Vec<ResolvedAck> = batch
-            .entries
+        let resolved: Vec<ResolvedAck> = entries
             .iter()
-            .filter_map(|e| {
+            .filter_map(|&(id, arrival_lo16)| {
                 use crate::transport::transmission_ledger::Resolution;
                 // Read before `resolve_at` removes the record or tombstone.
-                let rate = self.transmission_ledger.rate_mark(e.wire_seq);
+                let rate = self.transmission_ledger.rate_mark(id);
                 let r = match self
                     .transmission_ledger
-                    .resolve_at(e.wire_seq, Some((now_for_samples, min_rtt)))
+                    .resolve_at(id, Some((now_for_samples, min_rtt)))
                 {
                     Some(Resolution::Live(tx)) => {
                         // At dispatch, not when the samples are drained later
@@ -200,7 +299,8 @@ impl IoBridge {
                         }
                         // One loss-window sample per transmission.
                         self.loss_window.record(tx.emit_us as u32, false);
-                        Some((tx, e.arrival_time_ms_lo16, false))
+                        self.recent_bundles.remember(id, &tx);
+                        Some((tx, arrival_lo16, false))
                     }
                     Some(Resolution::Late { tx }) => {
                         self.reliable_emitter.note_ack(now_for_samples);
@@ -209,7 +309,7 @@ impl IoBridge {
                                 self.reliable_emitter.note_ack_origin(k, record_ws);
                             }
                         }
-                        let was_flushed = self.instr.flushed.take(e.wire_seq);
+                        let was_flushed = self.instr.flushed.take(id);
                         // The network did deliver it, only late: its bytes count
                         // as delivered for the rate sample.
                         if let Some((mark, departed)) = rate {
@@ -221,6 +321,7 @@ impl IoBridge {
                             );
                         }
                         self.loss_window.retract(tx.emit_us as u32);
+                        self.recent_bundles.remember(id, &tx);
                         // Observability: was goog_cc already told this was
                         // lost?
                         if was_flushed {
@@ -230,23 +331,23 @@ impl IoBridge {
                         // (see `retract_late_acked_losses`); only worth
                         // noting when something is waiting there.
                         if !self.pending_losses.is_empty() {
-                            self.late_acked.insert(e.wire_seq);
+                            self.late_acked.insert(id);
                         }
                         if crate::transport::reliable_emitter::rto_probe_enabled() {
                             eprintln!(
                                 "RTOPROBE late_ack ws={} age_us={}",
-                                e.wire_seq,
+                                id,
                                 self.reliable_emitter
                                     .emit_us(now_for_samples)
                                     .wrapping_sub(tx.emit_us as u32)
                             );
                         }
-                        Some((tx, e.arrival_time_ms_lo16, true))
+                        Some((tx, arrival_lo16, true))
                     }
                     None => None,
                 };
                 if r.is_none() && crate::transport::reliable_emitter::rto_probe_enabled() {
-                    eprintln!("RTOPROBE resolve_miss ws={}", e.wire_seq);
+                    eprintln!("RTOPROBE resolve_miss ws={}", id);
                 }
                 r
             })
@@ -259,7 +360,7 @@ impl IoBridge {
     /// Env-gated ACK instrumentation (ACKORDER and RTOPROBE).
     fn log_ack_probes(
         &self,
-        batch: &crate::transport::ack::AckBatch,
+        entries: &[(u32, u16)],
         resolved: &[ResolvedAck],
         now_for_samples: std::time::Instant,
     ) {
@@ -268,11 +369,7 @@ impl IoBridge {
             // compact: a real session produces thousands. Gated
             // independently of the RTO probe -- these answer different
             // questions and are enabled separately.
-            let seqs: Vec<String> = batch
-                .entries
-                .iter()
-                .map(|e| e.wire_seq.to_string())
-                .collect();
+            let seqs: Vec<String> = entries.iter().map(|(id, _)| id.to_string()).collect();
             tracing::info!(
                 target: "ghostframe::ackorder",
                 "ACKORDER {}",
@@ -385,7 +482,7 @@ impl IoBridge {
 
     /// Release fragment coverage, scheduler and palette state for each
     /// acknowledged tile-pass.
-    fn apply_ack_coverage(&mut self, resolved: &[ResolvedAck]) {
+    pub(super) fn apply_ack_coverage(&mut self, resolved: &[ResolvedAck]) {
         for (_, content) in resolved.iter().flat_map(|(tx, _, _)| tx.records()) {
             let Some(emit_key) = content.tile() else {
                 continue;
@@ -625,13 +722,11 @@ impl IoBridge {
             // handling, not a fallthrough.
             K::AckBatchV1 => self.dispatch_ack_datagram(dg),
             // FEC v2 rev 6 client feedback (docs/specs/fec-v2/fec-v2-rev6.md
-            // §6.2). No client sends these until the framing lands (R6-c);
-            // until then they are counted as unroutable, as they were when
-            // they classified as `Unknown`.
-            K::LossReport | K::AckBatchV4 | K::RepairRequest => {
-                self.unroutable_inbound_datagrams =
-                    self.unroutable_inbound_datagrams.saturating_add(1);
-            }
+            // §6.2): ACK v4 resolves bundles through the same chain as 0x06;
+            // the report and the repair request are in `repair_status`.
+            K::AckBatchV4 => self.dispatch_ack_v4_datagram(dg),
+            K::LossReport => self.dispatch_loss_report_datagram(dg),
+            K::RepairRequest => self.dispatch_repair_request_datagram(dg),
             K::Empty | K::Unknown | K::Hello | K::FrameFragment | K::TileFragment => {
                 self.unroutable_inbound_datagrams =
                     self.unroutable_inbound_datagrams.saturating_add(1);
