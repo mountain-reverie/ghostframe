@@ -35,6 +35,12 @@ impl IoBridge {
         let fit_limit = self.live_max_dg().map(|max_dg| self.inner_limit(max_dg));
         #[cfg(test)]
         let fit_limit = self.forced_datagram_limit_for_test.or(fit_limit);
+        // A sealed bundle quinn refused stands in front of everything: no
+        // record is taken from the queue until it is accepted (nothing is
+        // admitted into a full send buffer, and nothing is sent out of order).
+        if !self.pending_bundles.is_empty() && !self.drive_pending_bundles() {
+            return pacing::Stop::Rejected;
+        }
         while let Some(emission) = self.reliable_emitter.next_emission() {
             let Emission::Source(bytes, class) = &emission;
             let (bytes, class) = (bytes.clone(), *class);
@@ -90,6 +96,11 @@ impl IoBridge {
                 self.instr.admission.charged_bytes -= charged as u64;
             }
             if !self.reliable_emitter.settle_emission(emission, outcome) {
+                return pacing::Stop::Rejected;
+            }
+            // The record is in a bundle that quinn just refused: stop before
+            // offering the next one rather than after.
+            if !self.pending_bundles.is_empty() {
                 return pacing::Stop::Rejected;
             }
         }
