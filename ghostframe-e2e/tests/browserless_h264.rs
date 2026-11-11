@@ -1053,15 +1053,18 @@ async fn p_b_population_refs_twin_with_a_pessimistic_raise_yield() {
     .await;
 }
 
-/// The gate has power: the policy with a 1 s spike hold (which breaks the
-/// probe chain: every give-back reads as a cut, 28/16/18 of 96 reach and use
-/// the headroom against 52/58/55) misses it. A mutation test that stays: it
-/// fails if the gate's bounds are loosened until they pass the broken policy.
-#[tokio::test(start_paused = true)]
-#[should_panic(expected = "missed the headroom")]
-async fn p_b_population_refs_twin_gate_fails_a_one_second_spike_hold() {
-    population_gate(StepMode::RefsHold1s, Some(REFS_TWIN_ALLOWED_MISSES)).await;
-}
+// No control fails this gate any more. Until FEC v2 bundling, a 1 s spike
+// hold missed the headroom on 20 of the first row's 24 timelines, and a
+// `#[should_panic]` test kept the bounds tight enough to catch it. Its penalty
+// came from goog_cc's acknowledged-rate window: bundles made the 500-packet cap
+// span about a second, so a held spike's give-back read as a cut. With the
+// window at 300 ms (`acked_rate_window`, googcc.rs) the 1 s hold reaches the
+// headroom on 13/6/8/12/6/4 of the rows against the shipped 16/7/8/12/6/4, and
+// on 68/82/84 of a 96-timeline population against 74/83/96. A hold that is
+// never released, the 2 s hold without early release, and the bps-only model
+// all pass the bounds. Raise-off and the burst model miss by one or two
+// timelines on the 4 ms rows only, inside the shipped twin's own noise. A
+// control on that margin would be a flaky test, so there is none (2026-11-11).
 
 /// Misses allowed per gate row: `(finding the headroom, releasing the guard)`,
 /// where finding it is `sus_use`: the estimate held at `0.8 x` the new
@@ -1075,10 +1078,9 @@ async fn p_b_population_refs_twin_gate_fails_a_one_second_spike_hold() {
 /// always released. The allowance is that plus a margin of 2 timelines (the
 /// rows of 6 and 4 timelines get 2 on a measured 0), because the stepped
 /// harness is chaotic (one timing tweak moves a timeline across the line); it is
-/// not equal to the measurement. The margin is bounded by what the gate must
-/// still catch: the 1 s hold misses 20 of the first row's 24
-/// (`p_b_population_refs_twin_gate_fails_a_one_second_spike_hold`), against the
-/// 11 allowed.
+/// not equal to the measurement. Re-measured 2026-11-11 with the 300 ms
+/// acknowledged-rate window: 8, 1, 0, 3, 0, 0 misses. There is no longer a
+/// control the margin is bounded by (see the note above).
 const REFS_TWIN_ALLOWED_MISSES: [(usize, usize); 6] =
     [(11, 0), (5, 0), (5, 0), (9, 0), (2, 0), (2, 0)];
 
