@@ -6,3 +6,7 @@
 //! any block. Repair symbols are GF(2^8) Cauchy combinations of the block's
 //! sources (`coef`, `codec`). The client reports arrivals, loss and content
 //! release with the messages in `feedback` and `repair_status`.
+
+pub mod coef;
+#[cfg(test)]
+pub(crate) mod oracle;
