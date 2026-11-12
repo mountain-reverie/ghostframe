@@ -883,6 +883,8 @@ impl IoBridge {
                     }
                 }
             }
+            // The verdict is the ledger's last word on this bundle.
+            self.block_table.on_ledger_resolved(*ws);
         }
     }
 

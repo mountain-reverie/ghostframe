@@ -270,3 +270,27 @@ async fn note_raised_lost_runs_at_a_parked_verdict_and_a_frame_ack_clears_a_dead
     let st = b.h264.refs.as_ref().unwrap().mgr.stats();
     assert!(st.suspect_overridden >= 1, "the late ack overrode it");
 }
+
+/// An IDR fragment whose block gave up is sent again as a hand-off (nothing
+/// else repairs it) and the manager is not told: an IDR has no suspect state.
+#[tokio::test]
+async fn an_idr_fragment_a_block_gave_up_on_is_handed_off_not_reported_to_the_manager() {
+    let mut b = h264_blocks_bridge(20).await;
+    let idr = send(&mut b, 0, 3000);
+    stamp_all(&mut b);
+    assert_eq!(b.reliable_emitter.h264.is_idr(idr), Some(true), "premise");
+    let frags = sources(&b).iter().map(|s| s.2.len()).sum::<usize>();
+    assert!(frags >= 3, "premise: several fragments, got {frags}");
+    assert_eq!(b.reliable_emitter.stats.handoff_retransmits, 0);
+    // Nothing is acknowledged: the block's deadline releases every fragment.
+    b.service_blocks(now_std() + Duration::from_secs(60));
+    assert_eq!(b.h264.stats.content_lost_deadline as usize, frags);
+    assert_eq!(b.h264.stats.frames_suspect, 0, "the manager heard nothing");
+    let mut n = 0;
+    b.reliable_emitter
+        .tick_loss_budgeted(now_std(), usize::MAX, usize::MAX, &mut n);
+    assert_eq!(
+        b.reliable_emitter.stats.handoff_retransmits as usize, frags,
+        "every IDR fragment was sent again as a hand-off"
+    );
+}

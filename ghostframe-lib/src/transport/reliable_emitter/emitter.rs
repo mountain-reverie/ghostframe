@@ -1491,7 +1491,21 @@ impl ReliableTileEmitter {
         wire_seq: u32,
         cause: RetxCause,
     ) -> RetxRequest {
-        if crate::config::no_rto() {
+        self.request_retransmit_with(content, wire_seq, cause, crate::config::no_rto())
+    }
+
+    /// [`Self::request_retransmit`] with `GHOSTFRAME_NO_RTO` as an argument.
+    /// It turns off the loss path's and the probe timeout's retransmissions
+    /// only: a hand-off is the FEC block's own failure path, not a loss
+    /// verdict, and still goes through.
+    fn request_retransmit_with(
+        &mut self,
+        content: impl Into<Content>,
+        wire_seq: u32,
+        cause: RetxCause,
+        no_rto: bool,
+    ) -> RetxRequest {
+        if no_rto && !matches!(cause, RetxCause::Handoff) {
             return RetxRequest::Disabled;
         }
         let content = content.into();
@@ -3119,6 +3133,30 @@ mod tests {
             RetxRequest::Queued,
             "the probe still resends it"
         );
+    }
+
+    /// `GHOSTFRAME_NO_RTO=1` turns off the loss path and the probe timeout,
+    /// not the FEC hand-off (AGENTS.md).
+    #[test]
+    fn no_rto_disables_loss_and_probe_but_not_the_handoff() {
+        let (mut e, key, _t0) = one_sent_pass();
+        let ws = e.cache.get(&key).unwrap().latest_ws;
+        for cause in [RetxCause::Loss, RetxCause::Probe] {
+            assert_eq!(
+                e.request_retransmit_with(key, ws, cause, true),
+                RetxRequest::Disabled,
+                "{cause:?}"
+            );
+        }
+        assert!(
+            e.pending_loss.is_empty(),
+            "nothing queued by the disabled causes"
+        );
+        assert_eq!(
+            e.request_retransmit_with(key, ws, RetxCause::Handoff, true),
+            RetxRequest::Queued
+        );
+        assert_eq!(e.pending_loss.len(), 1);
     }
 
     // ---- the probe timeout (one per connection) ----

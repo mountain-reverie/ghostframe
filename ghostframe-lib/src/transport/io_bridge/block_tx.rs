@@ -26,12 +26,23 @@ pub(super) enum CloseWhy {
     Declined,
 }
 
-/// An encoded REPAIR frame waiting for admission. Its `bundle_seq` was
-/// allocated when its block closed.
+/// A repair row waiting for admission. Its `bundle_seq` is allocated only
+/// when it is handed to quinn: one allocated and never sent would be a
+/// permanent gap the client counts as lost.
 #[derive(Debug)]
 pub(super) struct RepairJob {
-    pub(super) bundle_seq: u32,
-    pub(super) bytes: Vec<u8>,
+    pub(super) block_id: BlockId,
+    pub(super) k: u8,
+    pub(super) r: u8,
+    pub(super) row: u8,
+    pub(super) payload: Vec<u8>,
+}
+
+impl RepairJob {
+    /// Bytes of the REPAIR frame it will become.
+    pub(super) fn len(&self) -> usize {
+        FEC_REPAIR_HEADER_LEN + self.payload.len()
+    }
 }
 
 /// Counters for the `cumulative emit` line.
@@ -132,7 +143,7 @@ impl IoBridge {
             self.block_tx.k_sum += u64::from(k);
             let r = params.r.min(255 - k);
             let fits = max_dg.is_some_and(|m| c.symbol_len() + FEC_REPAIR_HEADER_LEN <= m);
-            let mut repair_bundles = Vec::new();
+            let mut repairs_queued = 0;
             if r > 0 && !fits {
                 self.block_tx.repairs_dropped_mtu += u64::from(r);
             } else if r > 0 {
@@ -140,20 +151,15 @@ impl IoBridge {
                 let rows: Vec<u8> = (0..r).collect();
                 match ghostframe_protocol::fec::codec::encode_repairs(&refs, &rows) {
                     Ok(payloads) => {
-                        for (row, payload) in payloads.iter().enumerate() {
-                            let bundle_seq = self.packer.alloc_seq();
-                            let bytes = RepairFrame {
-                                bundle_seq,
+                        for (row, payload) in payloads.into_iter().enumerate() {
+                            self.pending_repairs.push_back(RepairJob {
                                 block_id: c.block_id,
                                 k,
                                 r,
-                                repair_idx: row as u8,
+                                row: row as u8,
                                 payload,
-                            }
-                            .encode();
-                            self.pending_repairs
-                                .push_back(RepairJob { bundle_seq, bytes });
-                            repair_bundles.push(bundle_seq);
+                            });
+                            repairs_queued += 1;
                         }
                         self.block_tx.repairs_queued_peak = self
                             .block_tx
@@ -172,7 +178,8 @@ impl IoBridge {
                     k,
                     r,
                     symbols: c.symbols,
-                    repair_bundles,
+                    repair_bundles: Vec::new(),
+                    repairs_queued,
                     last_sent: now,
                 },
                 now,
@@ -262,20 +269,14 @@ impl IoBridge {
                 return;
             }
         };
-        for (&row, payload) in rows.iter().zip(&payloads) {
-            let bundle_seq = self.packer.alloc_seq();
-            let bytes = RepairFrame {
-                bundle_seq,
+        for (&row, payload) in rows.iter().zip(payloads) {
+            self.pending_repairs.push_back(RepairJob {
                 block_id: id,
                 k,
                 r,
-                repair_idx: row,
+                row,
                 payload,
-            }
-            .encode();
-            self.pending_repairs
-                .push_back(RepairJob { bundle_seq, bytes });
-            self.block_table.register_repair(id, row, bundle_seq);
+            });
         }
         self.block_tx.repairs_queued_peak = self
             .block_tx
@@ -364,7 +365,7 @@ impl IoBridge {
     /// why it stopped: `Depth` or `Tokens` leave the job queued.
     pub(super) fn service_pending_repairs(&mut self) -> pacing::Stop {
         use crate::transport::admission::{admit_one, Admit, AdmitClass};
-        while let Some(len) = self.pending_repairs.front().map(|j| j.bytes.len()) {
+        while let Some(len) = self.pending_repairs.front().map(RepairJob::len) {
             let max_dg = match self.live_max_dg() {
                 Some(m) if self.framed_sink_present() => m,
                 _ => {
@@ -399,11 +400,24 @@ impl IoBridge {
                 }
             }
             let job = self.pending_repairs.pop_front().expect("front exists");
+            // Allocated here, when it is certain to be sealed and offered.
+            let bundle_seq = self.packer.alloc_seq();
+            let bytes = RepairFrame {
+                bundle_seq,
+                block_id: job.block_id,
+                k: job.k,
+                r: job.r,
+                repair_idx: job.row,
+                payload: &job.payload,
+            }
+            .encode();
+            self.block_table
+                .register_repair(job.block_id, job.row, bundle_seq);
             self.block_tx.repairs_sent += 1;
-            self.block_tx.repair_bytes += job.bytes.len() as u64;
+            self.block_tx.repair_bytes += bytes.len() as u64;
             let sealed = SealedBundle {
-                bundle_seq: job.bundle_seq,
-                bytes: job.bytes,
+                bundle_seq,
+                bytes,
                 records: Default::default(),
                 emit_us: 0,
                 kind: BundleKind::Repair,
@@ -419,11 +433,17 @@ impl IoBridge {
     }
 
     /// The Empty close at the tail of a pump: the last open bundle is sealed
-    /// as LAST and its block closes.
+    /// as LAST and its block closes; with no open bundle, an open block
+    /// (its sources sealed in earlier pumps) closes without LAST.
     pub(super) fn close_block_on_empty(&mut self) {
         let now_us = self.reliable_emitter.emit_us64(now_std());
         if let Some(b) = self.packer.flush_closing(now_us) {
             self.queue_bundles(smallvec::SmallVec::from_elem(b, 1));
+        } else if self.packer.close_now() {
+            // Every source of the block was sealed in an earlier pump: no
+            // bundle left to carry LAST, but the emitter has nothing more, so
+            // the block closes now (rev 6 4 rule 3), not on T.
+            self.process_closed_blocks(Some(CloseWhy::Empty));
         }
         self.drive_pending_bundles();
     }
@@ -449,7 +469,7 @@ impl IoBridge {
 
     /// The earliest block deadline (`T_lr`, release, alarms), for
     /// `next_wake_deadline`.
-    pub(super) fn block_release_deadline(&self) -> Option<std::time::Instant> {
+    pub(super) fn block_release_deadline(&mut self) -> Option<std::time::Instant> {
         self.block_table.next_deadline()
     }
 
