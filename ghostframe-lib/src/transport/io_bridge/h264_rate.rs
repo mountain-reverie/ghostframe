@@ -25,6 +25,14 @@ use std::time::{Duration, Instant};
 /// would shrink the estimate it is following.
 pub(crate) const RATE_SHARE: f64 = 0.8;
 const _: () = assert!(RATE_SHARE < crate::transport::bwe::SATURATION);
+/// The planned repair overhead `rho` (repair bytes over source bytes) is
+/// clamped here. `RATE_SHARE` is the share of the estimate the whole stream may
+/// spend, repairs included: the encoder is told `RATE_SHARE / (1 + rho)` and
+/// the repairs add `rho` times that, so the total stays at `RATE_SHARE`, under
+/// the ceiling's saturation, whatever `rho` is.
+pub(crate) const RHO_MAX: f64 = 0.5;
+const _: () =
+    assert!(RATE_SHARE / (1.0 + RHO_MAX) * (1.0 + RHO_MAX) < crate::transport::bwe::SATURATION);
 
 /// The target never goes under this (D4) ...
 pub(crate) const RATE_FLOOR_BPS: u32 = 300_000;
@@ -203,6 +211,13 @@ pub(crate) struct RatePolicy {
     /// Each with whether it came from a held spike.
     recent_applies: std::collections::VecDeque<(Instant, u32, bool)>,
     last_apply: Option<Instant>,
+    /// The planned repair overhead the emitted rate pays for (see
+    /// [`Self::set_overhead`]). Everything above is in unscaled units; only
+    /// the rate handed out is divided by `1 + rho`.
+    rho: f64,
+    /// The rate last handed out (scaled), and the `rho` it was scaled by.
+    emitted: Option<u32>,
+    emitted_rho: f64,
 }
 
 fn relative_move(from: u32, to: u32) -> f64 {
@@ -212,7 +227,23 @@ fn relative_move(from: u32, to: u32) -> f64 {
 impl RatePolicy {
     /// The rate the encoder was last told to run at.
     pub(crate) fn applied(&self) -> Option<u32> {
-        self.applied
+        self.emitted.or(self.applied)
+    }
+
+    /// The planned repair overhead. The media rate handed out is the policy's
+    /// rate divided by `1 + rho`; the estimate, the spike, the cut and the
+    /// dead band all stay in unscaled units, so engaging FEC is not read as a
+    /// fall of the estimate (it would release a held spike and set a cut,
+    /// which silences padding and the probe raise).
+    pub(crate) fn set_overhead(&mut self, rho: f64) {
+        self.rho = rho.clamp(0.0, RHO_MAX);
+    }
+
+    fn scaled(&self, bps: u32, rho: f64) -> u32 {
+        if rho <= 0.0 {
+            return bps;
+        }
+        ((f64::from(bps) / (1.0 + rho)) as u32).max(RATE_FLOOR_BPS.min(bps))
     }
 
     /// A new session: the estimate starts over; the encoder keeps its rate.
@@ -290,6 +321,41 @@ impl RatePolicy {
     /// fall), never twice within [`APPLY_MIN_INTERVAL`]. A rate inside the
     /// band is not re-sent: each re-send of the rate buffers costs a dip.
     pub(crate) fn step_in_place(
+        &mut self,
+        now: Instant,
+        estimate_bps: u64,
+        distress: bool,
+    ) -> Option<RateApply> {
+        let rho = self.rho;
+        if let Some(mut a) = self.step_unscaled(now, estimate_bps, distress) {
+            a.bps = self.scaled(a.bps, rho);
+            self.emitted = Some(a.bps);
+            self.emitted_rho = rho;
+            return Some(a);
+        }
+        // Only the overhead moved: re-send the same rate scaled, outside the
+        // band, never a cut, and no state of the policy above is touched.
+        let applied = self.applied?;
+        let since = self
+            .last_apply
+            .map_or(Duration::MAX, |t| now.saturating_duration_since(t));
+        let (from, to) = (1.0 / (1.0 + self.emitted_rho), 1.0 / (1.0 + rho));
+        if since < APPLY_MIN_INTERVAL || (to - from).abs() / from <= APPLY_MOVE_FRACTION {
+            return None;
+        }
+        let bps = self.scaled(applied, rho);
+        self.last_apply = Some(now);
+        self.emitted = Some(bps);
+        self.emitted_rho = rho;
+        Some(RateApply {
+            bps,
+            initial: false,
+            cut: false,
+        })
+    }
+
+    /// [`Self::step_in_place`] in unscaled units.
+    fn step_unscaled(
         &mut self,
         now: Instant,
         estimate_bps: u64,
@@ -1216,6 +1282,112 @@ mod tests {
         // size (below 15 %) is not: cuts stay prompt.
         assert_eq!(run(10 * MBIT, 8_800_000).len(), 1);
         assert!(run(10 * MBIT, 11_200_000).is_empty());
+    }
+
+    // ---- the repair overhead (plan E6) ----
+
+    /// A policy settled on `est` with a held spike in force, then `rho` set.
+    fn steady(t0: Instant, est: u64) -> RatePolicy {
+        let mut p = RatePolicy::default();
+        drive(&mut p, t0, 0, 4_000, |_| est);
+        p
+    }
+
+    #[test]
+    fn the_emitted_rate_is_the_unscaled_one_over_one_plus_rho() {
+        let t0 = Instant::now();
+        let mut plain = RatePolicy::default();
+        let mut paying = RatePolicy::default();
+        paying.set_overhead(0.25);
+        let a = plain.step_in_place(t0, 10 * MBIT, false).unwrap();
+        let b = paying.step_in_place(t0, 10 * MBIT, false).unwrap();
+        assert_eq!(a.bps, 8_000_000);
+        assert_eq!(b.bps, 6_400_000, "{b:?}");
+        assert_eq!(paying.applied(), Some(6_400_000));
+    }
+
+    /// Engaging FEC (rho 0 -> 0.25) is not a fall of the estimate: no cut, no
+    /// spike released, and the stream's own rate is what it was, scaled.
+    #[test]
+    fn engaging_fec_is_not_a_cut_and_releases_no_spike() {
+        let t0 = Instant::now();
+        let mut p = steady(t0, 10 * MBIT);
+        // A spike that is live while FEC engages.
+        let spiking = |t: u64| if t < 4_500 { 10 * MBIT } else { 20 * MBIT };
+        drive(&mut p, t0, 4_000, 4_600, spiking);
+        let releases = p.spike_releases;
+        p.set_overhead(0.25);
+        let steps = drive(&mut p, t0, 4_600, 5_400, |_| 20 * MBIT);
+        assert!(!steps.is_empty(), "premise: the overhead produced an apply");
+        assert!(steps.iter().all(|(_, a)| !a.cut), "{steps:?}");
+        assert_eq!(p.spike_releases, releases);
+        assert!(p.spike.is_some(), "the held spike is still held");
+    }
+
+    /// The same through the bridge: no `last_cut_at`, padding stays allowed.
+    #[tokio::test]
+    async fn engaging_fec_sets_no_last_cut_at_and_leaves_padding_allowed() {
+        let mut b = padding_bridge().await;
+        b.fec_live = Some(crate::config::FecBlockParams {
+            k_max: 64,
+            t_ms: 5,
+            r: 1,
+        });
+        let t = now_std();
+        let before = b.h264.rate.applied().expect("a rate is in force");
+        // Four seconds on, half of overhead has been sent.
+        let step = |b: &mut IoBridge, ms: u64, src: u64, rep: u64| {
+            b.block_tx.source_bytes = src;
+            b.block_tx.repair_bytes = rep;
+            b.h264_rate_step_refs(t + Duration::from_millis(ms));
+        };
+        for i in 1..=40u64 {
+            step(&mut b, i * 100, i * 100_000, i * 50_000);
+        }
+        let after = b.h264.rate.applied().expect("a rate");
+        assert!(after > 0 && after < before, "premise: {before} -> {after}");
+        assert!(b.h264.last_cut_at.is_none());
+        let end = t + Duration::from_millis(4_000);
+        assert!(!b.h264_cut_recent(end));
+        assert!(b.h264_pad_allowed(end, 0));
+    }
+
+    /// An overhead wandering inside the band re-sends nothing.
+    #[test]
+    fn a_rho_walk_inside_the_band_causes_no_rate_sends() {
+        let t0 = Instant::now();
+        let mut p = RatePolicy::default();
+        p.set_overhead(0.25);
+        let mut sends = 0;
+        let mut t = 0;
+        while t < 10_000 {
+            // 0.22 .. 0.28: the scale moves under 3 %.
+            p.set_overhead(0.25 + 0.03 * ((t / 16) as f64 * 0.7).sin());
+            if p.step_in_place(ms(t0, t), 10 * MBIT, false)
+                .is_some_and(|a| !a.initial)
+            {
+                sends += 1;
+            }
+            t += 16;
+        }
+        assert_eq!(sends, 0);
+    }
+
+    #[test]
+    fn a_rho_change_outside_the_band_is_one_apply_under_the_interval() {
+        let t0 = Instant::now();
+        let mut p = steady(t0, 10 * MBIT);
+        p.set_overhead(0.25);
+        let first = p.step_in_place(ms(t0, 4_100), 10 * MBIT, false);
+        assert_eq!(first.map(|a| (a.bps, a.cut)), Some((6_400_000, false)));
+        p.set_overhead(0.0);
+        assert_eq!(
+            p.step_in_place(ms(t0, 4_150), 10 * MBIT, false),
+            None,
+            "inside APPLY_MIN_INTERVAL"
+        );
+        let back = p.step_in_place(ms(t0, 4_400), 10 * MBIT, false);
+        assert_eq!(back.map(|a| a.bps), Some(8_000_000));
     }
 
     /// An estimate wandering by +-8 % costs no re-send at all.
