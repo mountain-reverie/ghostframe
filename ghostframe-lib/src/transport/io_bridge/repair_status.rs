@@ -113,11 +113,14 @@ impl IoBridge {
         }
     }
 
-    /// A REPAIR_REQUEST (0x0B): counted. There is nothing to serve until
-    /// blocks exist (R6-d).
+    /// A REPAIR_REQUEST (0x0B): counted, and each entry served from its
+    /// block (fresh rows, capped at `r + 4`).
     pub(crate) fn dispatch_repair_request_datagram(&mut self, dg: &[u8]) {
         match RepairRequest::decode(dg) {
-            Ok(_) => self.fec_in.repair_requests_rx += 1,
+            Ok(req) => {
+                self.fec_in.repair_requests_rx += 1;
+                self.blocks_on_repair_request(&req.entries);
+            }
             Err(e) => {
                 self.fec_in.repair_requests_malformed += 1;
                 tracing::debug!(target: LOG_TARGET, error = %e, "malformed repair request; dropped");
@@ -181,10 +184,14 @@ impl IoBridge {
                 }
             }
             StatusRecord::Declined {
-                block_id, reason, ..
+                block_id,
+                reason,
+                k,
+                missing,
             } => {
                 self.fec_in.declined_rx += 1;
                 tracing::debug!(target: LOG_TARGET, block_id, ?reason, "repair declined");
+                self.blocks_on_declined(block_id, k, &missing);
             }
         }
     }
@@ -263,5 +270,6 @@ impl IoBridge {
             .collect();
         self.release_h264_content(&items, now);
         self.apply_ack_coverage(&found);
+        self.blocks_on_recovered(ids);
     }
 }

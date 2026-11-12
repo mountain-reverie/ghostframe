@@ -2642,7 +2642,21 @@ impl IoBridge {
                     repair_encode_failed = bt.encode_failed,
                     blocks_open = self.block_table.open_blocks(),
                     block_evicted = self.block_table.stats().block_evicted,
-                    block_actions_dropped = bt.actions_dropped,
+                    blocks_closed_declined = bt.closed_declined,
+                    block_actions_dropped = bt.content_lost_h264_stub,
+                    block_handoffs = bt.handoffs,
+                    block_handoff_queued = bt.handoff_queued,
+                    block_requests_served = bt.requests_served,
+                    block_request_rows_sent = bt.request_rows_sent,
+                    block_declined_handled = bt.declined_handled,
+                    block_alarms = bt.alarms,
+                    block_t_lr_fired = self.block_table.stats().t_lr_fired,
+                    block_deferral_timeout = self.block_table.stats().deferral_alarm_h264,
+                    block_closed_late_trigger = self.block_table.stats().block_closed_late_trigger,
+                    block_request_unknown = self.block_table.stats().request_unknown,
+                    block_request_over_cap = self.block_table.stats().request_over_cap,
+                    block_have_mismatch = self.block_table.stats().have_mismatch,
+                    block_declined_k_mismatch = self.block_table.stats().declined_k_mismatch,
                     "fec v2 blocks (closes by cause, repairs sent; cumulative)"
                 );
             }

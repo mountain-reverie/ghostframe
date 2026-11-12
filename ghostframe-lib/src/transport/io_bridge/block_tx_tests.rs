@@ -287,3 +287,261 @@ async fn retransmissions_pads_and_control_are_plain_and_a_probe_record_is_a_lone
         crate::transport::fec_tx::packer::Packer::lone_bundle_len(TILE_LEN, b.probe_bundle_kind())
     );
 }
+
+// ---- D5: the receive side ------------------------------------------------
+
+use ghostframe_protocol::fec::feedback::{BundleAck, BundleAckBatch, RepairAsk, RepairRequest};
+use ghostframe_protocol::fec::repair_status::{DeclineReason, StatusRecord};
+use std::time::Duration;
+
+fn ack_ids(b: &mut IoBridge, ids: &[u32]) {
+    let dg = BundleAckBatch {
+        entries: ids
+            .iter()
+            .map(|&bundle_seq| BundleAck {
+                bundle_seq,
+                arrival_time_ms_lo16: 1_000,
+            })
+            .collect(),
+    }
+    .encode();
+    b.dispatch_inbound_datagram(H, &dg);
+}
+
+fn ask(b: &mut IoBridge, a: RepairAsk) {
+    b.dispatch_repair_request_datagram(&RepairRequest { entries: vec![a] }.encode());
+}
+
+/// `(block_id, source bundle_seqs, records per source)` of the first block.
+fn first_block(frames: &[Vec<u8>]) -> (u16, Vec<u32>, Vec<usize>) {
+    let mut id = 0;
+    let (mut seqs, mut counts) = (Vec::new(), Vec::new());
+    for f in frames {
+        if let Frame::Source(s) = parse(f).unwrap() {
+            id = s.block_id;
+            seqs.push(s.bundle_seq);
+            counts.push(ghostframe_protocol::fec::frame::records(s.records).count());
+        }
+    }
+    (id, seqs, counts)
+}
+
+fn repair_rows(frames: &[Vec<u8>]) -> Vec<u8> {
+    frames
+        .iter()
+        .filter_map(|f| match parse(f).unwrap() {
+            Frame::Repair(r) => Some(r.repair_idx),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What the pump does with queued loss-path work: turn it into emissions,
+/// then send them.
+fn send_retransmits(b: &mut IoBridge) {
+    let mut n = 0;
+    b.reliable_emitter
+        .tick_loss_budgeted(now_std(), usize::MAX, usize::MAX, &mut n);
+    b.drain_reliable_emitter(now_std());
+    b.flush_bundles();
+}
+
+fn converge_rtt(b: &mut IoBridge, ms: u64) {
+    for _ in 0..40 {
+        b.reliable_emitter.rtt.on_sample(Duration::from_millis(ms));
+    }
+}
+
+#[tokio::test]
+async fn a_repair_request_gets_fresh_rows_the_real_block_store_decodes() {
+    let mut b = blocks_bridge(64, 5, 2);
+    submit_tiles(&mut b, 10, None);
+    send_and_close(&mut b);
+    let frames = b.sent_frames_for_test.clone();
+    let (id, _, _) = first_block(&frames);
+    let want: std::collections::BTreeSet<Vec<u8>> =
+        b.sent_log_for_test.iter().map(|d| d.to_vec()).collect();
+    // The client holds source 0 and both planned repairs (3 of k = 4).
+    let mut store = BlockStore::new();
+    let mut got = std::collections::BTreeSet::new();
+    for i in [0usize, 4, 5] {
+        for r in store.on_datagram(&frames[i], 1_000).records {
+            got.insert(r.bytes);
+        }
+    }
+    assert_ne!(got, want, "premise: not yet decodable");
+    ask(
+        &mut b,
+        RepairAsk {
+            block_id: id,
+            have: 3,
+            missing: 1,
+            first_new_idx: 2,
+        },
+    );
+    b.service_pending_repairs();
+    let after = b.sent_frames_for_test.clone();
+    assert_eq!(repair_rows(&after[6..]), [2], "one fresh row, idx 2");
+    let Frame::Repair(r) = parse(&after[6]).unwrap() else {
+        panic!("repair")
+    };
+    assert_eq!((r.k, r.r), (4, 2), "the block's own k and r");
+    for rec in store.on_datagram(&after[6], 1_000).records {
+        got.insert(rec.bytes);
+    }
+    assert_eq!(got, want, "the extra row completed the block");
+    assert_eq!(b.block_tx.requests_served, 1);
+    assert_eq!(b.block_tx.request_rows_sent, 1);
+}
+
+#[tokio::test]
+async fn a_request_past_r_plus_4_rows_or_for_an_unknown_block_sends_nothing() {
+    let mut b = blocks_bridge(64, 5, 2);
+    submit_tiles(&mut b, 10, None);
+    send_and_close(&mut b);
+    let (id, _, _) = first_block(&b.sent_frames_for_test.clone());
+    ask(
+        &mut b,
+        RepairAsk {
+            block_id: id,
+            have: 1,
+            missing: 20,
+            first_new_idx: 0,
+        },
+    );
+    b.service_pending_repairs();
+    assert_eq!(b.block_tx.request_rows_sent, 6, "capped at r + 4");
+    assert_eq!(b.block_table.stats().request_over_cap, 1);
+    let sent = b.sent_frames_for_test.len();
+    ask(
+        &mut b,
+        RepairAsk {
+            block_id: id,
+            have: 1,
+            missing: 3,
+            first_new_idx: 0,
+        },
+    );
+    ask(
+        &mut b,
+        RepairAsk {
+            block_id: id.wrapping_add(500),
+            have: 1,
+            missing: 3,
+            first_new_idx: 0,
+        },
+    );
+    b.service_pending_repairs();
+    assert_eq!(b.sent_frames_for_test.len(), sent, "no more rows");
+    assert_eq!(b.block_table.stats().request_unknown, 1);
+}
+
+#[tokio::test]
+async fn declined_hands_off_every_unaccounted_source_whatever_the_bitmap_says() {
+    let mut b = blocks_bridge(64, 5, 2);
+    submit_tiles(&mut b, 10, None);
+    send_and_close(&mut b);
+    let frames = b.sent_frames_for_test.clone();
+    let (id, seqs, counts) = first_block(&frames);
+    ack_ids(&mut b, &seqs[..1]);
+    // An empty bitmap: the client did not know k, so it names nothing.
+    b.handle_status_record(StatusRecord::Declined {
+        block_id: id,
+        reason: DeclineReason::Pruned,
+        k: 4,
+        missing: vec![],
+    });
+    let owed: usize = counts[1..].iter().sum();
+    assert!(owed > 0, "premise");
+    assert_eq!(b.block_tx.handoffs as usize, owed);
+    assert_eq!(b.block_tx.handoff_queued as usize, owed);
+    assert_eq!(b.block_table.open_blocks(), 0);
+    // They leave as PLAIN frames through the ordinary drain.
+    send_retransmits(&mut b);
+    let plain = kinds(&b.sent_frames_for_test[6..])
+        .iter()
+        .filter(|k| **k == "P")
+        .count();
+    assert!(plain > 0, "hand-off retransmits are PLAIN frames");
+    assert_eq!(b.reliable_emitter.stats.handoff_retransmits as usize, owed);
+}
+
+#[tokio::test]
+async fn a_block_whose_symbols_all_vanish_hands_off_at_its_deadline() {
+    let mut b = blocks_bridge(64, 5, 2);
+    converge_rtt(&mut b, 20);
+    submit_tiles(&mut b, 10, None);
+    send_and_close(&mut b);
+    let (_, _, counts) = first_block(&b.sent_frames_for_test.clone());
+    let total: usize = counts.iter().sum();
+    let t0 = now_std();
+    b.service_blocks(t0 + Duration::from_millis(5));
+    assert_eq!(b.block_tx.handoffs, 0, "before the deadline nothing moves");
+    b.service_blocks(t0 + Duration::from_secs(2));
+    assert!(b.block_tx.handoffs > 0, "the release is alive");
+    assert_eq!(b.block_tx.handoffs as usize, total);
+    assert_eq!(b.block_table.open_blocks(), 0);
+    send_retransmits(&mut b);
+    let n_plain = kinds(&b.sent_frames_for_test)
+        .iter()
+        .filter(|k| **k == "P")
+        .count();
+    assert!(n_plain > 0, "the tiles went out again, PLAIN");
+}
+
+#[tokio::test]
+async fn t_lr_sends_one_repair_and_does_not_re_arm() {
+    let mut b = blocks_bridge(64, 5, 2);
+    converge_rtt(&mut b, 20);
+    submit_tiles(&mut b, 10, None);
+    send_and_close(&mut b);
+    let t0 = now_std();
+    b.service_blocks(t0 + Duration::from_millis(5));
+    assert_eq!(b.block_table.stats().t_lr_fired, 0);
+    b.service_blocks(t0 + Duration::from_millis(85));
+    assert_eq!(b.block_table.stats().t_lr_fired, 1);
+    assert_eq!(repair_rows(&b.sent_frames_for_test), [0, 1, 2]);
+    assert_eq!(b.block_tx.handoffs, 0, "still inside the deadline");
+    b.service_blocks(t0 + Duration::from_millis(90));
+    assert_eq!(repair_rows(&b.sent_frames_for_test), [0, 1, 2], "once only");
+}
+
+#[tokio::test]
+async fn declined_for_a_block_still_sending_closes_the_packers_open_block() {
+    let mut b = blocks_bridge(64, 5, 2);
+    submit_tiles(&mut b, 5, None);
+    b.drain_reliable_emitter(now_std());
+    b.flush_bundles();
+    let id = b.packer.open_block_id().expect("a block is open");
+    b.handle_status_record(StatusRecord::Declined {
+        block_id: id,
+        reason: DeclineReason::Pruned,
+        k: 0,
+        missing: vec![],
+    });
+    assert_eq!(b.packer.open_block_id(), None, "no later source joins it");
+    assert_eq!(b.block_tx.closed_declined, 1);
+    assert!(b.block_tx.handoffs > 0);
+    assert_eq!(b.block_tx.repairs_sent + b.pending_repairs.len() as u64, 0);
+    // A new source starts a new block.
+    submit_tiles(&mut b, 1, None);
+    b.drain_reliable_emitter(now_std());
+    assert_ne!(b.packer.open_block_id(), Some(id));
+}
+
+#[tokio::test]
+async fn an_mtu_close_with_no_repairs_hands_off_at_once() {
+    let mut b = blocks_bridge(64, 5, 2);
+    submit_tiles(&mut b, 6, None);
+    b.drain_reliable_emitter(now_std());
+    b.flush_bundles();
+    b.forced_raw_datagram_size_for_test = Some(200);
+    assert!(b.packer.close_now());
+    b.process_closed_blocks(Some(block_tx::CloseWhy::Mtu));
+    assert!(
+        b.block_tx.repairs_dropped_mtu > 0,
+        "premise: no repair fits"
+    );
+    assert!(b.block_tx.handoffs > 0, "nothing to wait for: handed off");
+    assert_eq!(b.block_table.open_blocks(), 0);
+}

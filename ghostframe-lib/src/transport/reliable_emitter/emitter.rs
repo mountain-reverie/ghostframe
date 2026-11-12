@@ -202,6 +202,9 @@ pub struct EmitterStats {
     /// Retransmissions made by the probe timeout: the newest one or two
     /// outstanding transmissions, when it expired.
     pub pto_probe_retransmits: u64,
+    /// Retransmissions made by an FEC block hand-off (deadline or DECLINED).
+    /// Counted in `loss_path_resends` too.
+    pub handoff_retransmits: u64,
     /// Times the probe timeout expired.
     pub pto_fires: u64,
     /// Verdicts with no retransmission, by why: the pass was no longer cached
@@ -286,6 +289,9 @@ pub enum RetxCause {
     Loss,
     /// The probe timeout.
     Probe,
+    /// An FEC block failed (deadline or DECLINED): its content goes to ARQ.
+    /// Not loss-like, so the attempt cap does not apply.
+    Handoff,
 }
 
 /// Retransmissions of one pass after which a loss verdict stops resending it
@@ -707,6 +713,7 @@ impl ReliableTileEmitter {
                 self.stats.pto_probe_retransmits += 1;
                 self.stats.h264_probe_resends += 1;
             }
+            RetxCause::Handoff => self.stats.handoff_retransmits += 1,
         }
         Some(sent)
     }
@@ -1165,6 +1172,7 @@ impl ReliableTileEmitter {
             match cause {
                 RetxCause::Loss => self.stats.loss_retransmits += 1,
                 RetxCause::Probe => self.stats.pto_probe_retransmits += 1,
+                RetxCause::Handoff => self.stats.handoff_retransmits += 1,
             }
             self.note_loss_path_resend(key, first_ws, cause == RetxCause::Probe);
             self.stats.retransmit_attempts_total += 1;

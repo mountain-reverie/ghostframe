@@ -141,6 +141,9 @@ impl RttEstimator {
     pub fn srtt(&self) -> Duration {
         self.srtt
     }
+    pub fn max_ack_delay(&self) -> Duration {
+        self.max_ack_delay
+    }
     pub fn rttvar(&self) -> Duration {
         self.rttvar
     }
