@@ -94,8 +94,9 @@ impl IoBridge {
         }
     }
 
-    /// A LOSS_REPORT (0x07): keep the last one's key fields for the log line.
-    /// Adaptation reads it in R6-e.
+    /// A LOSS_REPORT (0x07): keep the last one's key fields for the log line
+    /// and, in adaptive mode, hand it to the controller, which may change the
+    /// live block parameters at once (`adapt_step`).
     pub(crate) fn dispatch_loss_report_datagram(&mut self, dg: &[u8]) {
         match LossReport::decode(dg) {
             Ok(r) => {
@@ -105,6 +106,17 @@ impl IoBridge {
                 p.report_lost_pre_fec = r.lost_pre_fec;
                 p.report_recovered = r.recovered;
                 p.report_residual = r.residual_lost;
+                if self.fec_adapt.is_some() {
+                    let now_us = self.reliable_emitter.emit_us64(now_std());
+                    let (queue, events) = (
+                        self.bwe.standing_queue(),
+                        self.transport_probe.congestion_events,
+                    );
+                    if let Some(a) = self.fec_adapt.as_mut() {
+                        a.on_report(&r, queue, events, now_us);
+                    }
+                    self.adapt_step(now_us);
+                }
             }
             Err(e) => {
                 self.fec_in.loss_reports_malformed += 1;

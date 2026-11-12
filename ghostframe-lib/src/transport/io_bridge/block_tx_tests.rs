@@ -1045,3 +1045,154 @@ async fn fixed_mode_is_machinery_and_live_at_once() {
     assert_eq!(b.fec_live, b.fec_mode.initial_live());
     assert!(b.fec_live.is_some());
 }
+
+// ---- E5: the adaptive controller wired into the bridge ----
+
+fn send_report(b: &mut IoBridge, received: u16, lost: u16, hist: [u16; 8]) {
+    use ghostframe_protocol::fec::feedback::LossReport;
+    let lr = LossReport {
+        received,
+        lost_pre_fec: lost,
+        loss_run_hist: hist,
+        ..LossReport::default()
+    }
+    .encode();
+    b.dispatch_inbound_datagram(H, &lr);
+}
+
+fn count(frames: &[Vec<u8>], kind: &str) -> usize {
+    kinds(frames).iter().filter(|k| **k == kind).count()
+}
+
+#[tokio::test]
+async fn a_report_above_the_floor_makes_the_next_block_carry_r_for_k_repairs_the_store_decodes() {
+    let mut b = adaptive_bridge();
+    send_report(&mut b, 950, 50, [50, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(b.fec_adapt.as_ref().unwrap().estimator().reports_seen(), 1);
+    assert!(b.fec_live.is_some(), "engaged by a 5 % report");
+    submit_tiles(&mut b, 40, None);
+    send_and_close(&mut b);
+    let frames = b.sent_frames_for_test.clone();
+    let k = count(&frames, "S");
+    assert!(k > 4, "premise: a real block, k = {k}");
+    let est = b.fec_adapt.as_ref().unwrap().estimator();
+    let want = crate::transport::fec_tx::adapt_size::RSizer::new()
+        .r_for(k as u32, est.p_hat(), est.b_hat(), 0)
+        .r;
+    assert!(want >= 1);
+    assert_eq!(count(&frames, "R"), usize::from(want), "r_for(k) repairs");
+    let want_set: std::collections::BTreeSet<Vec<u8>> =
+        b.sent_log_for_test.iter().map(|d| d.to_vec()).collect();
+    let mut store = BlockStore::new();
+    let mut got = std::collections::BTreeSet::new();
+    for (i, f) in frames.iter().enumerate() {
+        if i == 0 {
+            continue;
+        }
+        for r in store.on_datagram(f, 1_000).records {
+            got.insert(r.bytes);
+        }
+    }
+    assert_eq!(got, want_set, "source 0 dropped: every record rebuilt");
+}
+
+#[tokio::test]
+async fn a_report_below_the_floor_leaves_every_frame_plain() {
+    let mut b = adaptive_bridge();
+    send_report(&mut b, 1000, 0, [0; 8]);
+    assert_eq!(b.fec_adapt.as_ref().unwrap().estimator().reports_seen(), 1);
+    assert!(b.fec_live.is_none());
+    submit_tiles(&mut b, 10, None);
+    send_and_close(&mut b);
+    let k = kinds(&b.sent_frames_for_test);
+    assert!(!k.is_empty() && k.iter().all(|x| *x == "P"), "{k:?}");
+}
+
+#[tokio::test]
+async fn a_change_applied_mid_block_loses_no_repair() {
+    let mut b = adaptive_bridge();
+    send_report(&mut b, 950, 50, [50, 0, 0, 0, 0, 0, 0, 0]);
+    assert!(b.fec_live.is_some(), "premise: engaged");
+    submit_tiles(&mut b, 10, None);
+    b.drain_reliable_emitter(now_std());
+    assert!(
+        b.packer.open_block_id().is_some(),
+        "premise: a block is open"
+    );
+    assert_eq!(
+        count(&b.sent_frames_for_test, "R"),
+        0,
+        "premise: no repair yet"
+    );
+    // The loss clears and the dwell passes: the floor releases to None while
+    // the block is open (the harshest change).
+    send_report(&mut b, 60_000, 0, [0; 8]);
+    send_report(&mut b, 60_000, 0, [0; 8]);
+    let now_us = b.reliable_emitter.emit_us64(now_std());
+    b.adapt_step(now_us + 5_100_000);
+    assert!(b.fec_live.is_none(), "released");
+    b.service_pending_repairs();
+    assert!(
+        count(&b.sent_frames_for_test, "R") >= 1,
+        "the open block closed under its old parameters and its repair left"
+    );
+}
+
+#[tokio::test]
+async fn adapt_tick_releases_on_a_quiet_link_after_the_dwell() {
+    let mut b = adaptive_bridge();
+    send_report(&mut b, 100, 5, [5, 0, 0, 0, 0, 0, 0, 0]);
+    assert!(b.fec_live.is_some(), "premise: engaged");
+    send_report(&mut b, 60_000, 0, [0; 8]);
+    send_report(&mut b, 60_000, 0, [0; 8]);
+    assert!(b.fec_live.is_some(), "inside the dwell the loss stays");
+    let now_us = b.reliable_emitter.emit_us64(now_std());
+    b.adapt_step(now_us + 1_000_000);
+    assert!(b.fec_live.is_some(), "still inside the dwell");
+    b.adapt_step(now_us + 5_100_000);
+    assert!(b.fec_live.is_none(), "released with no report");
+    assert_eq!(b.packer.open_block_id(), None);
+}
+
+#[tokio::test]
+async fn five_percent_loss_is_not_gated_without_a_queue_or_a_congestion_event_and_is_with_one() {
+    let mut a = adaptive_bridge();
+    send_report(&mut a, 1000, 0, [0; 8]);
+    send_report(&mut a, 950, 50, [50, 0, 0, 0, 0, 0, 0, 0]);
+    let ea = a.fec_adapt.as_ref().unwrap().estimator();
+    assert_eq!(ea.reports_seen(), 2);
+    assert_eq!(ea.congestion_skips(), 0);
+    assert!(a.fec_live.is_some(), "not gated: engaged");
+
+    let mut g = adaptive_bridge();
+    send_report(&mut g, 1000, 0, [0; 8]);
+    g.transport_probe.congestion_events += 1;
+    send_report(&mut g, 950, 50, [50, 0, 0, 0, 0, 0, 0, 0]);
+    let eg = g.fec_adapt.as_ref().unwrap().estimator();
+    assert_eq!(eg.reports_seen(), 2);
+    assert_eq!(eg.congestion_skips(), 1, "the rise gated the interval");
+    assert!(g.fec_live.is_none(), "gated: stays clean");
+}
+
+#[tokio::test]
+async fn declined_blocks_move_the_trim_and_nothing_else_does() {
+    use crate::transport::fec_tx::block_table::CloseReason;
+    let mut b = adaptive_bridge();
+    send_report(&mut b, 950, 50, [50, 0, 0, 0, 0, 0, 0, 0]);
+    let a = b.fec_adapt.as_mut().unwrap();
+    let before = a.r_for_block(64, 0);
+    a.tick(1, std::iter::repeat_n(CloseReason::Accounted, 250));
+    a.tick(
+        2,
+        [CloseReason::HandedOff, CloseReason::TimedOut]
+            .into_iter()
+            .chain([CloseReason::Accounted; 4]),
+    );
+    assert_eq!(
+        a.r_for_block(64, 2),
+        before,
+        "HandedOff and TimedOut never trim"
+    );
+    a.tick(3, std::iter::repeat_n(CloseReason::Declined, 10));
+    assert_eq!(a.r_for_block(64, 3), before + 1, "10/256 Declined trims");
+}

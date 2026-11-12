@@ -96,6 +96,8 @@ impl IoBridge {
     pub fn set_fec_mode_for_test(&mut self, mode: crate::config::FecMode) {
         self.fec_mode = mode;
         self.fec_live = mode.initial_live();
+        self.fec_adapt = (mode == crate::config::FecMode::Adaptive)
+            .then(crate::transport::fec_tx::adapt::FecAdapt::new);
         self.packer.set_blocks(self.fec_live);
     }
 

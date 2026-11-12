@@ -114,17 +114,60 @@ pub(crate) fn r_for_target(k: u32, p: f64, b: f64, target: f64) -> RDecision {
 /// Memoised `r_for`. The memo is cleared when the quantised `(p, b)` moves
 /// and evaluates at the `(p, b)` that opened the cell (0.5 % in `p`, 0.05 in
 /// `b`), so a lookup is O(1) once warm.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct RSizer {
     key: Option<(i32, i32)>,
     p: f64,
     b: f64,
     memo: HashMap<u32, RDecision>,
+    /// Per `k`: the `r` last handed out (0 = none) and when it last fell.
+    paced: [(u8, u64); 256],
+}
+
+impl Default for RSizer {
+    fn default() -> Self {
+        Self {
+            key: None,
+            p: 0.0,
+            b: 1.0,
+            memo: HashMap::new(),
+            paced: [(0, 0); 256],
+        }
+    }
 }
 
 impl RSizer {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Forget the step-limit memory (a fresh engagement starts from the
+    /// untouched sizing, not from an older, higher `r`).
+    pub(crate) fn reset_pacing(&mut self) {
+        self.paced = [(0, 0); 256];
+    }
+
+    /// [`Self::r_for`] under the step limit (plan decision 6): for a given
+    /// `k`, `r` may fall by at most 1 per [`FEC_ADAPT_NOTCH_DWELL_US`];
+    /// nothing limits a rise. `saturated` is the untrimmed, unpaced decision.
+    pub(crate) fn r_for_paced(
+        &mut self,
+        k: u32,
+        p: f64,
+        b: f64,
+        trim: u8,
+        now_us: u64,
+    ) -> RDecision {
+        let mut d = self.r_for(k, p, b, trim);
+        let slot = &mut self.paced[k.clamp(1, 254) as usize];
+        if slot.0 == 0 || d.r >= slot.0 {
+            slot.0 = d.r;
+        } else if now_us.saturating_sub(slot.1) >= FEC_ADAPT_NOTCH_DWELL_US {
+            slot.0 -= 1;
+            slot.1 = now_us;
+        }
+        d.r = slot.0;
+        d
     }
 
     /// `r` for a block of `k` sources, plus `trim` (0 or 1, from
@@ -478,6 +521,38 @@ mod tests {
         assert_eq!(t_base_ms(2_000_000, 1200), 20);
         assert_eq!(t_base_ms(1_000_000_000, 1200), 5);
         assert_eq!(t_base_ms(10_000_000, 1200), 6);
+    }
+
+    #[test]
+    fn r_falls_by_at_most_one_per_dwell_and_rises_at_once() {
+        let mut s = RSizer::new();
+        let k = 64;
+        let hi = s.r_for_paced(k, 0.05, 1.0, 0, 0).r;
+        assert!(hi >= 8, "premise: 5 % sizes a large r, got {hi}");
+        let lo = s.r_for(k, 0.002, 1.0, 0).r;
+        assert!(lo + 3 < hi, "premise: 0.2 % sizes far lower ({lo})");
+        let mut prev = hi;
+        let mut falls = 0;
+        // Ten dwells, polled every 100 ms: one step per dwell, never two.
+        for i in 1..=100u64 {
+            let t = i * 100_000;
+            let r = s.r_for_paced(k, 0.002, 1.0, 0, t).r;
+            assert!(r <= prev && prev - r <= 1, "t={t}: {prev} -> {r}");
+            if r < prev {
+                falls += 1;
+                assert!(
+                    t + 100_000 >= falls * FEC_ADAPT_NOTCH_DWELL_US,
+                    "fall {falls} at {t} came sooner than one per dwell"
+                );
+            }
+            prev = r;
+        }
+        assert!(
+            falls >= 3 && prev >= lo,
+            "it did fall ({falls}), toward {lo}"
+        );
+        // A rise is immediate.
+        assert_eq!(s.r_for_paced(k, 0.05, 1.0, 0, 10_100_000).r, hi);
     }
 
     #[test]

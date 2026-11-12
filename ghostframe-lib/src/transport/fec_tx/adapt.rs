@@ -17,6 +17,10 @@
 
 use ghostframe_protocol::fec::feedback::LossReport;
 
+use super::adapt_size::{DeclinedTrim, Ladder, RSizer};
+use super::block_table::CloseReason;
+use crate::config::FecBlockParams;
+
 /// Owner decision (rev 6 section 8 item 5): below 0.1 % loss the daemon sends
 /// no repair (r = 0, PLAIN). It is a rate the loss must be shown to reach.
 pub(crate) const FEC_LOSS_FLOOR: f64 = 0.001;
@@ -189,6 +193,97 @@ impl LossEstimator {
     }
     pub(crate) fn congestion_skips(&self) -> u64 {
         self.congestion_skips
+    }
+}
+
+/// The adaptive controller the bridge holds (plan E5): the estimator, the
+/// span ladder, the `r` sizer and the declined-share trim, behind four calls.
+/// Sans-IO; every call is O(1) amortised.
+#[derive(Debug)]
+pub(crate) struct FecAdapt {
+    est: LossEstimator,
+    ladder: Ladder,
+    sizer: RSizer,
+    trim: DeclinedTrim,
+    /// quinn's `congestion_events` at the previous report (`None` before the
+    /// first, which therefore never counts as a rise).
+    last_congestion_events: Option<u64>,
+    was_engaged: bool,
+}
+
+impl FecAdapt {
+    pub(crate) fn new() -> Self {
+        Self {
+            est: LossEstimator::new(),
+            ladder: Ladder::new(),
+            sizer: RSizer::new(),
+            trim: DeclinedTrim::new(),
+            last_congestion_events: None,
+            was_engaged: false,
+        }
+    }
+
+    /// Fold in a LOSS_REPORT. The interval is *congested* when a standing
+    /// queue holds or quinn's congestion events rose since the previous
+    /// report (plan decision 4). Never `is_limited()`: goog_cc is loss-limited
+    /// under plain random loss too.
+    pub(crate) fn on_report(
+        &mut self,
+        r: &LossReport,
+        standing_queue: bool,
+        congestion_events: u64,
+        now_us: u64,
+    ) {
+        let rose = self
+            .last_congestion_events
+            .is_some_and(|prev| congestion_events > prev);
+        self.last_congestion_events = Some(congestion_events);
+        self.est.on_report(r, standing_queue || rose, now_us);
+    }
+
+    /// Time passes: decay, re-check the release, and read the declined
+    /// closes the table logged.
+    pub(crate) fn tick(&mut self, now_us: u64, closes: impl IntoIterator<Item = CloseReason>) {
+        for c in closes {
+            self.trim.on_close(c);
+        }
+        self.est.tick(now_us);
+    }
+
+    /// The live parameters now: `None` while the floor is `Clean`. `r` in the
+    /// result is a placeholder (1); each block's `r` comes from
+    /// [`Self::r_for_block`] at its close, so a change of `r` alone never
+    /// reopens a block.
+    pub(crate) fn live_params(
+        &mut self,
+        rate_bps: u64,
+        max_dg: usize,
+        now_us: u64,
+    ) -> Option<FecBlockParams> {
+        let engaged = self.est.state() == FloorState::Engaged;
+        if engaged && !self.was_engaged {
+            self.sizer.reset_pacing();
+        }
+        self.was_engaged = engaged;
+        if !engaged {
+            return None;
+        }
+        let span = self.ladder.step(self.est.b_hat(), rate_bps, max_dg, now_us);
+        Some(FecBlockParams {
+            k_max: span.k_max,
+            t_ms: span.t_ms,
+            r: 1,
+        })
+    }
+
+    /// `r` for a block that closed with `k` sources.
+    pub(crate) fn r_for_block(&mut self, k: u32, now_us: u64) -> u8 {
+        let (p, b, trim) = (self.est.p_hat(), self.est.b_hat(), self.trim.trim());
+        self.sizer.r_for_paced(k, p, b, trim, now_us).r
+    }
+
+    pub(crate) fn estimator(&self) -> &LossEstimator {
+        &self.est
     }
 }
 
