@@ -777,3 +777,30 @@ async fn knob_off_sent_frames_match_the_r6c_golden() {
     println!("GOLDEN frames={n} digest={digest:#018x}");
     assert_eq!((n, digest), (GOLDEN_FRAMES, GOLDEN_DIGEST));
 }
+
+/// Adaptive mode with nothing live is the knob off, byte for byte.
+#[tokio::test]
+async fn adaptive_with_no_live_params_matches_the_r6c_golden() {
+    let mut b = framed_bridge();
+    b.set_fec_mode_for_test(crate::config::FecMode::Adaptive);
+    assert!(b.fec_machinery() && b.fec_live.is_none(), "premise");
+    submit_tiles(&mut b, 10);
+    let now = now_std();
+    let template = bytes::Bytes::from(vec![7u8; 100]);
+    let probe = ProbeTag {
+        id: 1,
+        min_probes: 1,
+        min_bytes: 1,
+        bytes_sent_before: 0,
+    };
+    b.reliable_emitter.submit_h264_pad(&template, probe, now);
+    submit_tiles(&mut b, 4);
+    send_all(&mut b);
+    b.emit_frame_dimensions(3, 0, 160, 96);
+    b.send_pong_framed(H, &[0x05, 1, 2, 3]);
+    submit_tiles(&mut b, 7);
+    send_all(&mut b);
+    let (n, digest) = frames_digest(&b.sent_frames_for_test);
+    println!("GOLDEN frames={n} digest={digest:#018x}");
+    assert_eq!((n, digest), (GOLDEN_FRAMES, GOLDEN_DIGEST));
+}

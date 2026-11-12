@@ -849,3 +849,199 @@ async fn the_pto_skips_a_deferred_block_and_counts_its_rows_against_the_cap() {
     send_retransmits(&mut b);
     assert_eq!(b.sent_frames_for_test.len(), before);
 }
+
+// ---- E2: machinery versus live parameters ----------------------------------
+
+use crate::config::FecMode;
+
+fn adaptive_bridge() -> IoBridge {
+    let mut b = blocks_bridge(64, 5, 2);
+    b.set_fec_mode_for_test(FecMode::Adaptive);
+    assert!(b.fec_machinery() && b.fec_live.is_none(), "premise");
+    b
+}
+
+/// Tokens for a pump, no queue-depth gate.
+fn open_gate(b: &mut IoBridge) {
+    b.forced_fifo_depth_for_test = Some(0);
+    b.admission.refill(now_std(), 1e7, 100_000);
+}
+
+#[tokio::test]
+async fn setting_live_none_while_a_block_is_open_still_sends_that_blocks_repairs() {
+    let mut b = blocks_bridge(64, 5, 2);
+    submit_tiles(&mut b, 10, None);
+    b.drain_reliable_emitter(now_std());
+    assert!(
+        b.packer.open_block_id().is_some(),
+        "premise: a block is open"
+    );
+    b.apply_fec_live(None);
+    b.service_pending_repairs();
+    let k = kinds(&b.sent_frames_for_test);
+    assert_eq!(k.iter().filter(|x| **x == "R").count(), 2, "{k:?}");
+    assert_eq!(b.block_tx.repairs_sent, 2);
+    assert!(b.fec_live.is_none() && b.fec_machinery());
+    // The next frame is PLAIN.
+    let n = b.sent_frames_for_test.len();
+    submit_tiles(&mut b, 3, None);
+    b.drain_reliable_emitter(now_std());
+    b.flush_bundles();
+    assert!(kinds(&b.sent_frames_for_test[n..])
+        .iter()
+        .all(|x| *x == "P"));
+}
+
+#[tokio::test]
+async fn with_live_none_and_machinery_on_a_probe_record_is_plain_and_a_pump_never_closes() {
+    let mut b = adaptive_bridge();
+    // The cluster's byte count (emit.rs and frame.rs read this) is the PLAIN
+    // bundle's while nothing is live, the SOURCE's once something is.
+    use crate::transport::fec_tx::packer::BundleKind;
+    assert_eq!(b.probe_bundle_kind(), BundleKind::Plain);
+    b.apply_fec_live(Some(FecBlockParams {
+        k_max: 64,
+        t_ms: 5,
+        r: 2,
+    }));
+    assert_eq!(b.probe_bundle_kind(), BundleKind::Source);
+    b.apply_fec_live(None);
+    assert_eq!(b.probe_bundle_kind(), BundleKind::Plain);
+    let tag = ProbeTag {
+        id: 2,
+        min_probes: 1,
+        min_bytes: 1,
+        bytes_sent_before: 0,
+    };
+    submit_tiles(&mut b, 1, Some(tag));
+    open_gate(&mut b);
+    for _ in 0..3 {
+        b.pump_admission();
+    }
+    assert_eq!(kinds(&b.sent_frames_for_test), ["P"]);
+    assert_eq!(
+        b.sent_frames_for_test[0].len(),
+        crate::transport::fec_tx::packer::Packer::lone_bundle_len(
+            TILE_LEN,
+            crate::transport::fec_tx::packer::BundleKind::Plain
+        ),
+        "the byte count of a probe cluster is the PLAIN one"
+    );
+    assert_eq!(b.block_tx.closed_empty, 0, "a pump never closes a block");
+    assert_eq!(b.block_table.open_blocks(), 0);
+}
+
+#[tokio::test]
+async fn a_repair_queued_before_the_switch_to_none_leaves_and_old_acks_are_still_handled() {
+    let mut b = blocks_bridge(64, 5, 2);
+    submit_tiles(&mut b, 10, None);
+    b.drain_reliable_emitter(now_std());
+    b.close_block_on_empty(); // repairs queued, not yet sent
+    assert!(!b.pending_repairs.is_empty(), "premise");
+    b.fec_live = None;
+    b.packer.set_blocks(None);
+    open_gate(&mut b);
+    b.pump_admission();
+    assert!(b.pending_repairs.is_empty(), "the repair left");
+    assert_eq!(repair_rows(&b.sent_frames_for_test).len(), 2);
+    // A late ACK of every source still closes the block.
+    let (_, seqs, _) = first_block(&b.sent_frames_for_test.clone());
+    assert_eq!(b.block_table.open_blocks(), 1, "premise");
+    ack_ids(&mut b, &seqs);
+    assert_eq!(b.block_table.open_blocks(), 0, "the ACK hook ran");
+}
+
+#[tokio::test]
+async fn a_declined_for_an_old_block_is_handled_with_live_none() {
+    let mut b = blocks_bridge(64, 5, 2);
+    submit_tiles(&mut b, 10, None);
+    send_and_close(&mut b);
+    let (id, _, counts) = first_block(&b.sent_frames_for_test.clone());
+    b.apply_fec_live(None);
+    b.handle_status_record(StatusRecord::Declined {
+        block_id: id,
+        reason: DeclineReason::Pruned,
+        k: 4,
+        missing: vec![],
+    });
+    let owed: usize = counts.iter().sum();
+    assert!(owed > 0, "premise");
+    assert_eq!(b.block_tx.handoffs as usize, owed);
+    assert_eq!(b.block_table.open_blocks(), 0);
+}
+
+/// What the pump tail does after a frame, minus the admission gate.
+fn pump_tail(b: &mut IoBridge) {
+    b.drain_reliable_emitter(now_std());
+    if b.fec_live.is_some() {
+        b.close_block_on_empty();
+    } else {
+        b.flush_bundles();
+    }
+    b.service_pending_repairs();
+}
+
+#[tokio::test]
+async fn adaptive_with_no_live_params_sends_the_bytes_the_knob_off_sends() {
+    let scene = |b: &mut IoBridge| {
+        let tag = ProbeTag {
+            id: 3,
+            min_probes: 1,
+            min_bytes: 1,
+            bytes_sent_before: 0,
+        };
+        submit_tiles(b, 10, Some(tag));
+        pump_tail(b);
+        submit_tiles(b, 7, None);
+        pump_tail(b);
+    };
+    let mut off = blocks_bridge(64, 5, 2);
+    off.set_fec_mode_for_test(FecMode::Off);
+    let mut ada = adaptive_bridge();
+    scene(&mut off);
+    scene(&mut ada);
+    // Bytes 12..16 of a record are a wall-clock timestamp.
+    let mask = |frames: &[Vec<u8>]| -> Vec<Vec<u8>> {
+        frames
+            .iter()
+            .map(|f| {
+                let mut f = f.clone();
+                if let Frame::Plain(p) = parse(&f).expect("a frame") {
+                    let base = f.as_ptr() as usize;
+                    let spans: Vec<(usize, usize)> =
+                        ghostframe_protocol::fec::frame::records(p.records)
+                            .map(|r| {
+                                let r = r.unwrap();
+                                (r.as_ptr() as usize - base, r.len())
+                            })
+                            .collect();
+                    for (off, len) in spans {
+                        if len >= 16 {
+                            f[off + 12..off + 16].fill(0);
+                        }
+                    }
+                }
+                f
+            })
+            .collect()
+    };
+    let (a, b) = (
+        mask(&off.sent_frames_for_test),
+        mask(&ada.sent_frames_for_test),
+    );
+    let (a, b) = (&a, &b);
+    assert!(a.len() >= 4, "premise: frames were sent, got {}", a.len());
+    assert!(kinds(a).iter().all(|k| *k == "P"));
+    assert_eq!(
+        a, b,
+        "adaptive with no live params is byte-identical to off"
+    );
+}
+
+#[tokio::test]
+async fn fixed_mode_is_machinery_and_live_at_once() {
+    let b = blocks_bridge(64, 5, 2);
+    assert!(b.fec_machinery());
+    assert_eq!(b.fec_live, b.fec_mode.initial_live());
+    assert!(b.fec_live.is_some());
+}

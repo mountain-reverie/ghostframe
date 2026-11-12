@@ -364,7 +364,10 @@ impl IoBridge {
         // a pump that ran dry (nothing built, held back or queued) closes the
         // open block: its last bundle is LAST and the repairs follow.
         let repairs_before = self.block_tx.repairs_sent;
-        if self.fec_blocks.is_some() {
+        // The Empty close follows the live parameters; the repair service
+        // follows the machinery (a repair queued before a switch to PLAIN
+        // must still leave).
+        if self.fec_live.is_some() {
             let dry = stop == Stop::Empty
                 && !self.admission_backlog(now)
                 && self.pending_bundles.is_empty();
@@ -373,14 +376,16 @@ impl IoBridge {
             } else {
                 self.flush_bundles();
             }
+        } else {
+            self.flush_bundles();
+        }
+        if self.fec_machinery() {
             // Refused for Tokens or Depth after an Empty pump, that is why
             // this pump stopped, and the wake below is sized to the repair.
             let s = self.service_pending_repairs();
             if s != Stop::Empty {
                 stop = s;
             }
-        } else {
-            self.flush_bundles();
         }
         out.admitted = (self.instr.admission.datagrams_admitted - admitted_before) as usize
             + (self.block_tx.repairs_sent - repairs_before) as usize;
