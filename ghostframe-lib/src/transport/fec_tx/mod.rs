@@ -10,3 +10,6 @@ pub(crate) mod packer;
 // Pure estimator; the bridge wiring is R6-e E5.
 #[allow(dead_code)]
 pub(crate) mod adapt;
+// Pure sizing; the bridge wiring is R6-e E5.
+#[allow(dead_code)]
+pub(crate) mod adapt_size;
