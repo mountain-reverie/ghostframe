@@ -271,6 +271,9 @@ pub struct FecBlockParams {
 }
 
 impl FecBlockParams {
+    /// The longest `t_ms` the knob accepts.
+    pub(crate) const T_MS_MAX: u8 = 20;
+
     /// Parse `k_max,t_ms,r`. `None` for anything out of range or malformed.
     fn parse(raw: &str) -> Option<Self> {
         let mut fields = raw.split(',').map(|f| f.trim().parse::<u8>().ok());
@@ -278,8 +281,9 @@ impl FecBlockParams {
         if fields.next().is_some() {
             return None;
         }
-        let valid =
-            (1..=32).contains(&r) && (1..=255 - r).contains(&k_max) && (1..=20).contains(&t_ms);
+        let valid = (1..=32).contains(&r)
+            && (1..=255 - r).contains(&k_max)
+            && (1..=Self::T_MS_MAX).contains(&t_ms);
         valid.then_some(Self { k_max, t_ms, r })
     }
 }

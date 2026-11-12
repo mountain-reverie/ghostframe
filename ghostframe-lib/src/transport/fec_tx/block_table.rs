@@ -1487,4 +1487,33 @@ mod tests {
             assert!(!t.is_open(id));
         }
     }
+
+    /// The server's picture of the client's recovery window must be the
+    /// client's own, and a block (knob `t_ms`) plus the queue it waits in must
+    /// end inside the advertised part of that window.
+    #[test]
+    fn the_server_and_the_client_agree_on_the_recovery_window() {
+        use ghostframe_client_core::fec_rx::{FEC_RX_ALLOWANCE_US, FEC_RX_DEFAULT_T_ADV_US};
+        assert_eq!(CLIENT_T_ADV.as_micros() as u64, FEC_RX_DEFAULT_T_ADV_US);
+        assert_eq!(CLIENT_ALLOWANCE.as_micros() as u64, FEC_RX_ALLOWANCE_US);
+        assert_eq!(
+            CLIENT_WINDOW.as_micros() as u64,
+            FEC_RX_DEFAULT_T_ADV_US + FEC_RX_ALLOWANCE_US
+        );
+        let t = Duration::from_millis(u64::from(crate::config::FecBlockParams::T_MS_MAX));
+        assert!(
+            t + crate::transport::admission::QUEUE_TARGET
+                < Duration::from_micros(FEC_RX_DEFAULT_T_ADV_US),
+            "a block's span plus the queue must leave jitter room inside T_adv"
+        );
+        // The deadlines are built on that window: neither may fall inside it.
+        let now = Instant::now();
+        let zero = Rtt {
+            srtt: Duration::ZERO,
+            rttvar: Duration::ZERO,
+            max_ack_delay: Duration::ZERO,
+        };
+        assert!(tile_deadline(now, zero) >= now + 2 * CLIENT_WINDOW);
+        assert!(h264_deadline(now, zero) >= now + 2 * CLIENT_T_ADV);
+    }
 }
