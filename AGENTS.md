@@ -385,6 +385,18 @@ Every field and the variable are explained in
 is on the separate `h264 client feedback` line, target
 `ghostframe_lib::transport::io_bridge`, not on `h264 stats`.
 
+FEC v2 blocks are off by default. `GHOSTFRAME_FEC_BLOCKS=k_max,t_ms,r` turns
+them on (`r` in 1..=32, `k_max` in 1..=255-r, `t_ms` in 1..=20; anything else
+logs one warning and leaves them off). The server groups bundles into blocks
+that close at `k_max` symbols, at `t_ms`, on Empty or on an MTU shrink, and
+sends REPAIR frames at close. The `fec v2 blocks` line (cumulative, same
+cadence) carries `blocks_closed_kmax` / `_time` / `_empty` / `_mtu`,
+`repairs_sent`, `repair_bytes`, `block_deferral_timeout` and `block_alarms`;
+the deferral timeout and the alarms must read 0. `h264 stats` carries
+`verdicts_parked_by_fec`: H.264 loss verdicts on sources of an open block,
+which wait for the block's content outcome instead of reaching the manager.
+A lost fragment that is then recovered no longer shows as a suspect frame.
+
 Client-side diagnostics are printed by the browser console. **Some of them are
 dead**: `rx{...}` and `cdf53-coverage` read `window.__tileCounts` /
 `window.__cdf53Coverage`, which nothing populates since the wasm cutover, so
@@ -495,8 +507,9 @@ Env-gated, off by default:
 
 Tile XOR parity is gone (`GHOSTFRAME_TILE_FEC`, `TransportConfig::tile_fec` and
 `RunOptions::tile_fec` no longer exist). FEC v2 repair (REPAIR frames, R6-d) is
-not implemented yet, so on this branch every bundle is an unprotected
-SOURCE/PLAIN one and loss is recovered by retransmission only.
+implemented behind `GHOSTFRAME_FEC_BLOCKS` (see "Reading a live session"). With
+the knob unset every bundle is an unprotected PLAIN one and loss is recovered
+by retransmission only.
 
 See also `reference_e2e_loss_injection` and `reference_e2e_diagnose` notes for
 the e2e-side injection variables.
