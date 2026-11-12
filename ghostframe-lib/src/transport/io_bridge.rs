@@ -130,7 +130,7 @@ pub use frame_backend::{
 mod frame_worker;
 mod transport_probe;
 use frame_worker::{FinishAction, FramePipeline, FromWorker, ToWorker};
-pub use transport_probe::TransportProbe;
+pub use transport_probe::{FecAdaptProbe, TransportProbe};
 
 #[path = "io_bridge/frame.rs"]
 mod frame;
@@ -2838,6 +2838,11 @@ impl IoBridge {
             );
             *self.transport_probe_publish.lock().unwrap() = TransportProbe {
                 instr: self.instrument_summary(),
+                adapt: self
+                    .fec_adapt
+                    .as_ref()
+                    .map(|a| a.probe())
+                    .unwrap_or_default(),
                 ..self.transport_probe
             };
             *self.probe_stats_publish.lock().unwrap() =

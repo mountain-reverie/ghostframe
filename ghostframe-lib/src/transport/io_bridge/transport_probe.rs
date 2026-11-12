@@ -15,6 +15,25 @@ use crate::transport::instruments::{
 };
 use quinn_proto::ConnectionHandle;
 
+/// Read-only view of the controller (log line, browserless harness).
+/// `saturated` counts closed blocks sized at the cap (the 1e-3 target
+/// unreachable for the link's burst), out of `blocks_sized`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FecAdaptProbe {
+    pub engaged: bool,
+    pub p_hat_ppm: u64,
+    pub b_hat_x100: u64,
+    pub k_max: u8,
+    pub t_ms: u8,
+    pub r_at_k8: u8,
+    pub r_at_k64: u8,
+    pub changes: u64,
+    pub congestion_skips: u64,
+    pub trim_steps: u64,
+    pub blocks_sized: u64,
+    pub saturated: u64,
+}
+
 /// Cumulative and latest transport readings for the live session.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TransportProbe {
@@ -44,8 +63,12 @@ pub struct TransportProbe {
     /// datagrams lost before repair, rebuilt by FEC, and lost after it.
     pub loss_reports: u64,
     pub report_lost_pre_fec: u16,
+    /// Sum of `lost_pre_fec` over every LOSS_REPORT received (cumulative).
+    pub report_lost_pre_fec_total: u64,
     pub report_recovered: u16,
     pub report_residual: u16,
+    /// The adaptive FEC controller (default, all zero, when not adaptive).
+    pub adapt: FecAdaptProbe,
     /// The D1 instruments (see [`crate::transport::instruments`]). Filled when
     /// the probe is published to the harness; zero in the live copy.
     pub instr: InstrumentSummary,

@@ -2662,6 +2662,25 @@ impl IoBridge {
                     block_declined_k_mismatch = self.block_table.stats().declined_k_mismatch,
                     "fec v2 blocks (closes by cause, repairs sent; cumulative)"
                 );
+                if let Some(a) = self.fec_adapt.as_ref().map(|a| a.probe()) {
+                    tracing::info!(
+                        target: LOG_TARGET,
+                        frame_seq = seq,
+                        adapt_state = if a.engaged { "engaged" } else { "clean" },
+                        adapt_p_hat_ppm = a.p_hat_ppm,
+                        adapt_b_hat_x100 = a.b_hat_x100,
+                        adapt_k_max = a.k_max,
+                        adapt_t_ms = a.t_ms,
+                        adapt_r_at_k8 = a.r_at_k8,
+                        adapt_r_at_k64 = a.r_at_k64,
+                        adapt_changes = a.changes,
+                        adapt_congestion_skips = a.congestion_skips,
+                        adapt_trim_steps = a.trim_steps,
+                        adapt_blocks_sized = a.blocks_sized,
+                        adapt_saturated = a.saturated,
+                        "fec v2 adapt (controller state and sizing; cumulative)"
+                    );
+                }
             }
 
             // The H.264 transport: IDRs by cause, how the loss path treated
