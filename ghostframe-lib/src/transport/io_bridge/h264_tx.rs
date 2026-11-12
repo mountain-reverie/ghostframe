@@ -23,6 +23,7 @@
 
 use super::*;
 use crate::encoder::h264::tracker::{FragAck, TRACKER_RING};
+use crate::transport::fec_tx::block_table::{LostCause, VerdictAction};
 use crate::transport::reliable_emitter::Content;
 use crate::transport::transmission_ledger::Transmission;
 
@@ -160,6 +161,16 @@ pub struct H264Stats {
     pub verdicts_already_acked: u64,
     /// The frame had left the tracker.
     pub verdicts_unknown_frame: u64,
+    /// FEC blocks on: a verdict on a source of an open block the manager was
+    /// not told about (its block owes the content outcome).
+    pub verdicts_parked_by_fec: u64,
+    /// Fragments the manager heard lost from a content outcome: the client's
+    /// DECLINED, or a block's deadline / deferral alarm.
+    pub content_lost_decline: u64,
+    pub content_lost_deadline: u64,
+    /// A content outcome for a fragment already delivered or gone from the
+    /// tracker: nothing to tell.
+    pub content_lost_moot: u64,
     /// IDRs made, by cause (`IdrCause::index`).
     pub idr_by_cause: [u64; IdrCause::COUNT],
     /// Frames not encoded, by why.
@@ -627,28 +638,90 @@ impl IoBridge {
         now: std::time::Instant,
         in_burst: bool,
     ) {
+        if self.note_h264_verdict_counted(frame_seq, frag_idx, now, in_burst) {
+            self.h264_frag_lost_to_manager(frame_seq, now);
+        }
+    }
+
+    /// The transport half of a verdict: the ledger outcome (`tx_judged_lost`)
+    /// and the probe-raise congestion guard (`note_raised_lost`), neither of
+    /// which is content state, so neither waits for a FEC block. Returns
+    /// whether the manager should now hear the fragment lost (an unacked
+    /// P-frame fragment).
+    fn note_h264_verdict_counted(
+        &mut self,
+        frame_seq: u32,
+        frag_idx: u16,
+        now: std::time::Instant,
+        in_burst: bool,
+    ) -> bool {
         self.h264.stats.tx_judged_lost += 1;
         let Some(f) = self.h264.tracker.get(frame_seq) else {
             self.h264.stats.verdicts_unknown_frame += 1;
-            return;
+            return false;
         };
         if f.complete() || f.frag_acked(frag_idx) {
             self.h264.stats.verdicts_already_acked += 1;
-            return;
+            return false;
         }
         if f.is_idr {
             self.h264.stats.verdicts_idr_frag += 1;
-            return;
+            return false;
         }
         self.h264.stats.verdicts_p_frag += 1;
         if in_burst {
             self.h264.stats.p_verdicts_in_probe += 1;
         }
-        // The session recovers from its anchor: the verdict makes the frame
-        // suspect (the client's decoded bit overrides it).
         self.note_raised_lost(frame_seq, now);
+        true
+    }
+
+    /// The session recovers from its anchor: the loss makes the frame suspect
+    /// (the client's decoded bit overrides it).
+    fn h264_frag_lost_to_manager(&mut self, frame_seq: u32, now: std::time::Instant) {
         if self.h264_refs_live() {
             self.h264_refs_verdict(frame_seq, now);
+        }
+    }
+
+    /// The content half, from a FEC block's outcome (DECLINED, or the
+    /// deadline) for fragment `(frame_seq, frag_idx)` carried by `wire_seq`.
+    /// Never touches `tx_judged_lost`: the ledger verdict is counted once, by
+    /// the transport half. A P fragment makes its frame suspect, once per
+    /// frame; an IDR fragment is sent again (nothing else repairs it); a
+    /// fragment already delivered, or whose frame left the tracker, is moot.
+    pub(super) fn h264_content_lost(
+        &mut self,
+        frame_seq: u32,
+        frag_idx: u16,
+        wire_seq: u32,
+        cause: LostCause,
+        now: std::time::Instant,
+    ) {
+        let Some(f) = self.h264.tracker.get(frame_seq) else {
+            self.h264.stats.content_lost_moot += 1;
+            return;
+        };
+        if f.complete() || f.frag_acked(frag_idx) {
+            self.h264.stats.content_lost_moot += 1;
+            return;
+        }
+        let is_idr = f.is_idr;
+        match cause {
+            LostCause::Decline => self.h264.stats.content_lost_decline += 1,
+            LostCause::Deadline => self.h264.stats.content_lost_deadline += 1,
+        }
+        if is_idr {
+            let _ = self.reliable_emitter.request_retransmit(
+                Content::H264Frag {
+                    frame_seq,
+                    frag_idx,
+                },
+                wire_seq,
+                crate::transport::reliable_emitter::RetxCause::Handoff,
+            );
+        } else {
+            self.h264_frag_lost_to_manager(frame_seq, now);
         }
     }
 
@@ -777,6 +850,10 @@ impl IoBridge {
         now: std::time::Instant,
     ) {
         for (ws, tx) in lost {
+            // One lookup per transmission: a source of an open FEC block owes
+            // its content outcome to the block (RECOVERED, DECLINED or its
+            // deadline), so the manager is not told yet. O(1).
+            let fec = self.block_table.on_verdict(*ws);
             for (_, content) in tx.records() {
                 if let Content::Pad(pad_ws) = content {
                     // A pad judged lost: its tag will not be read. The burst it was
@@ -793,7 +870,17 @@ impl IoBridge {
                 } = content
                 {
                     let in_burst = self.transmission_ledger.declared_lost_in_burst(*ws);
-                    self.note_h264_verdict_in(frame_seq, frag_idx, now, in_burst);
+                    match fec {
+                        VerdictAction::Pass => {
+                            self.note_h264_verdict_in(frame_seq, frag_idx, now, in_burst);
+                        }
+                        VerdictAction::Park | VerdictAction::Skip => {
+                            if fec == VerdictAction::Park {
+                                self.h264.stats.verdicts_parked_by_fec += 1;
+                            }
+                            self.note_h264_verdict_counted(frame_seq, frag_idx, now, in_burst);
+                        }
+                    }
                 }
             }
         }
