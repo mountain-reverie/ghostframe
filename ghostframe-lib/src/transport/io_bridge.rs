@@ -855,10 +855,14 @@ pub struct IoBridge {
     /// H.264 as a member of the transport: frame tracker, IDR hold and
     /// request policy, counters. See `h264_tx`.
     h264: H264Tx,
-    /// The FEC block knob (`GHOSTFRAME_FEC_BLOCKS`). Nothing reads it yet:
-    /// the block packer that does lands in R6-d D2.
-    #[allow(dead_code)]
-    fec_blocks: Option<crate::config::FecBlockParams>,
+    /// The FEC block mode (`GHOSTFRAME_FEC_BLOCKS`), fixed for the process.
+    /// `fec_mode.machinery()` says the block table, the ACK hooks and the
+    /// repair service run. See `block_tx` for which guard reads which.
+    fec_mode: crate::config::FecMode,
+    /// The block parameters in force now: what the packer closes by and what
+    /// `process_closed_blocks` sizes repairs from. `None` is PLAIN. Changed
+    /// only through `apply_fec_live`, at a block boundary.
+    fec_live: Option<crate::config::FecBlockParams>,
     /// Shared cell the browserless harness reads the final H.264 counters
     /// from; same read-after-abort pattern as `emitter_stats_publish`.
     #[cfg(any(test, feature = "browserless-harness"))]
@@ -1583,7 +1587,8 @@ impl IoBridge {
                 openh264_lib,
                 ..H264Tx::default()
             },
-            fec_blocks: lib_config.transport.fec_blocks,
+            fec_mode: lib_config.transport.fec_mode,
+            fec_live: lib_config.transport.fec_mode.initial_live(),
             #[cfg(any(test, feature = "browserless-harness"))]
             h264_stats_publish: std::sync::Arc::new(std::sync::Mutex::new(H264Report::default())),
             last_reset_request_idr_at: None,
@@ -1615,7 +1620,7 @@ impl IoBridge {
             recent_bundles: Default::default(),
             packer: {
                 let mut p = crate::transport::fec_tx::packer::Packer::default();
-                p.set_blocks(lib_config.transport.fec_blocks);
+                p.set_blocks(lib_config.transport.fec_mode.initial_live());
                 p
             },
             emitted_meta: HashMap::new(),

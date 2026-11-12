@@ -251,9 +251,46 @@ pub struct TransportConfig {
     /// as [`H264_DEFAULT_FPS`]. The encoder's per-frame budget is the rate
     /// divided by it.
     pub capture_fps: u32,
-    /// The FEC block knob, from `GHOSTFRAME_FEC_BLOCKS=k_max,t_ms,r`. `None`
-    /// (unset, `off` or `0`) is the default: every bundle is a plain frame.
-    pub fec_blocks: Option<FecBlockParams>,
+    /// The FEC block mode, from `GHOSTFRAME_FEC_BLOCKS` (`off`, `k_max,t_ms,r`
+    /// or `adaptive`). `Off` (unset, `off` or `0`) is the default: every
+    /// bundle is a plain frame.
+    pub fec_mode: FecMode,
+}
+
+/// What `GHOSTFRAME_FEC_BLOCKS` selects. The mode is fixed for the process;
+/// the parameters in force at a moment are the bridge's `fec_live`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FecMode {
+    /// No block machinery: every bundle is PLAIN.
+    #[default]
+    Off,
+    /// The block machinery with these parameters for the whole process.
+    Fixed(FecBlockParams),
+    /// The block machinery with parameters chosen at run time; none are live
+    /// (every bundle PLAIN) until a controller sets some.
+    Adaptive,
+}
+
+impl FecMode {
+    /// The parameters live from the first bundle: the knob for `Fixed`, none
+    /// for `Off` and `Adaptive`.
+    pub fn initial_live(self) -> Option<FecBlockParams> {
+        match self {
+            Self::Fixed(p) => Some(p),
+            Self::Off | Self::Adaptive => None,
+        }
+    }
+
+    /// The block table, ACK hooks and repair service run.
+    pub fn machinery(self) -> bool {
+        self != Self::Off
+    }
+}
+
+impl From<Option<FecBlockParams>> for FecMode {
+    fn from(p: Option<FecBlockParams>) -> Self {
+        p.map_or(Self::Off, Self::Fixed)
+    }
 }
 
 /// The fixed `(k_max, T, r)` of the FEC block knob (`GHOSTFRAME_FEC_BLOCKS`):
@@ -288,23 +325,28 @@ impl FecBlockParams {
     }
 }
 
-/// `GHOSTFRAME_FEC_BLOCKS`: unset, empty, `off` or `0` is off. A value that
-/// does not parse or is out of range warns and is off.
-fn fec_blocks_from_lookup(get: &impl Fn(&str) -> Option<String>) -> Option<FecBlockParams> {
-    let raw = get("GHOSTFRAME_FEC_BLOCKS")?;
+/// `GHOSTFRAME_FEC_BLOCKS`: unset, empty, `off` or `0` is off; `adaptive` is
+/// adaptive. A value that does not parse or is out of range warns and is off.
+fn fec_blocks_from_lookup(get: &impl Fn(&str) -> Option<String>) -> FecMode {
+    let Some(raw) = get("GHOSTFRAME_FEC_BLOCKS") else {
+        return FecMode::Off;
+    };
     let raw = raw.trim();
     if raw.is_empty() || raw == "off" || raw == "0" {
-        return None;
+        return FecMode::Off;
+    }
+    if raw == "adaptive" {
+        return FecMode::Adaptive;
     }
     let parsed = FecBlockParams::parse(raw);
     if parsed.is_none() {
         tracing::warn!(
             target: "ghostframe::config",
             value = %raw,
-            "GHOSTFRAME_FEC_BLOCKS is not k_max,t_ms,r with r in 1..=32, k_max in 1..=255-r, t_ms in 1..=20: FEC blocks are off"
+            "GHOSTFRAME_FEC_BLOCKS is not off, adaptive or k_max,t_ms,r with r in 1..=32, k_max in 1..=255-r, t_ms in 1..=20: FEC blocks are off"
         );
     }
-    parsed
+    parsed.into()
 }
 
 /// Which H.264 encoder backends the daemon may open
@@ -500,7 +542,7 @@ impl TransportConfig {
             h264_backend: H264BackendChoice::parse(get("GHOSTFRAME_H264_BACKEND").as_deref()),
             openh264_lib: openh264_lib_from_lookup(&get),
             capture_fps: 0,
-            fec_blocks: fec_blocks_from_lookup(&get),
+            fec_mode: fec_blocks_from_lookup(&get),
         }
     }
 
@@ -1476,8 +1518,15 @@ mod tests {
 
     #[test]
     fn fec_blocks_parses_the_triple_and_is_off_otherwise() {
-        let parse = |v: &str| {
-            TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_FEC_BLOCKS", v)])).fec_blocks
+        let parse =
+            |v: &str| match TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_FEC_BLOCKS", v)]))
+                .fec_mode
+            {
+                FecMode::Fixed(p) => Some(p),
+                FecMode::Off | FecMode::Adaptive => None,
+            };
+        let mode = |v: &str| {
+            TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_FEC_BLOCKS", v)])).fec_mode
         };
         let on = Some(FecBlockParams {
             k_max: 64,
@@ -1511,9 +1560,22 @@ mod tests {
             assert_eq!(parse(off), None, "{off:?} is off");
         }
         assert_eq!(
-            TransportConfig::from_lookup(lookup(&[])).fec_blocks,
-            None,
+            TransportConfig::from_lookup(lookup(&[])).fec_mode,
+            FecMode::Off,
             "unset is off"
+        );
+        assert_eq!(mode("adaptive"), FecMode::Adaptive);
+        assert_eq!(mode(" adaptive "), FecMode::Adaptive);
+        for off in ["", "off", "0", "Adaptive2", "x,y,z"] {
+            assert_eq!(mode(off), FecMode::Off, "{off:?} is off");
+        }
+        assert_eq!(
+            mode("64,5,2"),
+            FecMode::Fixed(FecBlockParams {
+                k_max: 64,
+                t_ms: 5,
+                r: 2
+            })
         );
         for bad in [
             "64,5,0",   // r = 0
