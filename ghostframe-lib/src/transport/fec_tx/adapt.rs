@@ -197,6 +197,59 @@ impl LossEstimator {
     }
 }
 
+/// Time constant of the overhead EWMA: it moves slowly, so the encoder target
+/// does not follow every block.
+const RHO_TAU_US: f64 = 2_000_000.0;
+/// No overhead is reported for this long after blocks went live: the first
+/// samples cover a handful of blocks.
+const RHO_WARMUP_US: u64 = 2_000_000;
+/// A sample spans at least this long.
+const RHO_SAMPLE_US: u64 = 250_000;
+
+/// The planned repair overhead `rho`: an EWMA of repair wire bytes over source
+/// wire bytes, read by the H.264 rate target (plan E6, decision 7). 0 while
+/// blocks are not live and in the first [`RHO_WARMUP_US`] after they are.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Rho {
+    ewma: Option<f64>,
+    live_since_us: Option<u64>,
+    last_us: u64,
+    last_source: u64,
+    last_repair: u64,
+}
+
+impl Rho {
+    /// Fold in the cumulative byte counters at `now_us`; the overhead now.
+    pub(crate) fn update(&mut self, now_us: u64, source: u64, repair: u64, live: bool) -> f64 {
+        if !live {
+            *self = Self::default();
+            return 0.0;
+        }
+        let since = *self.live_since_us.get_or_insert_with(|| {
+            self.last_us = now_us;
+            self.last_source = source;
+            self.last_repair = repair;
+            now_us
+        });
+        let dt = now_us.saturating_sub(self.last_us);
+        if dt >= RHO_SAMPLE_US && source > self.last_source {
+            let x =
+                (repair - self.last_repair.min(repair)) as f64 / (source - self.last_source) as f64;
+            self.ewma = Some(match self.ewma {
+                None => x,
+                Some(e) => e + (1.0 - (-(dt as f64) / RHO_TAU_US).exp()) * (x - e),
+            });
+            self.last_us = now_us;
+            self.last_source = source;
+            self.last_repair = repair;
+        }
+        if now_us.saturating_sub(since) < RHO_WARMUP_US {
+            return 0.0;
+        }
+        self.ewma.unwrap_or(0.0)
+    }
+}
+
 /// The adaptive controller the bridge holds (plan E5): the estimator, the
 /// span ladder, the `r` sizer and the declined-share trim, behind four calls.
 /// Sans-IO; every call is O(1) amortised.
@@ -338,6 +391,23 @@ impl FecAdapt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rho_is_zero_until_live_for_two_seconds_then_follows_the_byte_ratio() {
+        let mut r = Rho::default();
+        let (mut src, mut rep) = (0u64, 0u64);
+        let mut out = Vec::new();
+        for i in 0..=40u64 {
+            src += 100_000;
+            rep += 25_000;
+            out.push(r.update(i * 100_000, src, rep, true));
+        }
+        assert!(out[..20].iter().all(|&x| x == 0.0), "{:?}", &out[..20]);
+        assert!((out[40] - 0.25).abs() < 1e-9, "{}", out[40]);
+        // Not live: back to zero and forgotten.
+        assert_eq!(r.update(5_000_000, src, rep, false), 0.0);
+        assert_eq!(r.update(5_100_000, src + 1, rep, true), 0.0);
+    }
 
     fn rep(received: u16, lost: u16) -> LossReport {
         LossReport {

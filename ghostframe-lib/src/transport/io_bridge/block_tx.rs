@@ -55,6 +55,10 @@ pub(super) struct BlockTxStats {
     pub(super) k_sum: u64,
     pub(super) repairs_sent: u64,
     pub(super) repair_bytes: u64,
+    /// Wire bytes of SOURCE bundles sealed: the base of the repair overhead.
+    pub(super) source_bytes: u64,
+    /// The planned repair overhead the H.264 rate target pays for.
+    pub(super) rho: crate::transport::fec_tx::adapt::Rho,
     pub(super) repairs_queued_peak: u64,
     pub(super) repairs_dropped_mtu: u64,
     pub(super) encode_failed: u64,
@@ -160,6 +164,7 @@ impl IoBridge {
         let Some((block_id, idx)) = b.block else {
             return;
         };
+        self.block_tx.source_bytes += b.bytes.len() as u64;
         let records = b.records.iter().map(|r| (r.wire_seq, r.content)).collect();
         let actions = self
             .block_table
