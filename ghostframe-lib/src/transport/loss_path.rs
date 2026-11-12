@@ -43,6 +43,13 @@ pub(crate) struct Outcome {
     /// The H.264 fragments among the records of those transmissions: the
     /// ledger identity counts fragments, not bundles.
     pub forgotten_h264_records: u64,
+    /// Records of lost or probed transmissions that belong to an FEC block
+    /// still owed their content outcome: no retransmit was requested for them
+    /// (`protected_timer_suppressed`).
+    pub protected_suppressed: u64,
+    /// Blocks whose repair rows the probe wants in place of a source resend
+    /// (at most one per block per probe).
+    pub repair_asks: Vec<u16>,
 }
 
 /// Declare lost what the acknowledgements so far put out of contention (packet
@@ -51,17 +58,29 @@ pub(crate) struct Outcome {
 /// backed-off deadline has come (at most `PROBE_COUNT` a turn), so they do not
 /// wait for the connection's probe timer, which acknowledgements keep from
 /// expiring.
+///
+/// `protected(bundle_seq)` names the FEC block of a bundle whose content the
+/// block still owes an outcome (`BlockTable::protected_block`, i.e.
+/// `on_verdict` is `Park` or `Skip`). Such a transmission is declared lost, as
+/// congestion state, but its records are not retransmitted: the block's
+/// repairs, RECOVERED, DECLINED or its deadline decide.
 pub(crate) fn detect(
     ledger: &mut TransmissionLedger,
     emitter: &mut ReliableTileEmitter,
     now: Instant,
+    mut protected: impl FnMut(u32) -> Option<u16>,
 ) -> Outcome {
     let thr = time_threshold(&emitter.rtt);
     let mut out = Outcome::default();
     for (ws, tx, _reason) in ledger.detect_losses_at(now, thr) {
         // Each record is repaired under its own wire_seq (what the emitter's
         // `latest_ws` / `judged_ws` know it by), not the ledger key.
+        let is_protected = protected(ws).is_some();
         for (record_ws, content) in tx.records() {
+            if is_protected {
+                out.protected_suppressed += 1;
+                continue;
+            }
             if emitter.request_retransmit(content, record_ws, RetxCause::Loss)
                 == RetxRequest::Queued
             {
@@ -91,10 +110,16 @@ pub(crate) fn detect(
 ///
 /// The timer restarts at every expiry even when nothing was probed, so a timer
 /// with no candidates does not spin. Returns `None` while it is not due.
+///
+/// A candidate that `protected` puts in an FEC block is not sent again: the
+/// probe asks for one new repair row of that block instead
+/// (`Outcome::repair_asks`), a transmission of its own that draws the
+/// acknowledgement just the same.
 pub(crate) fn probe(
     ledger: &mut TransmissionLedger,
     emitter: &mut ReliableTileEmitter,
     now: Instant,
+    mut protected: impl FnMut(u32) -> Option<u16>,
 ) -> Option<Outcome> {
     if !emitter.pto_due(now) {
         return None;
@@ -114,8 +139,15 @@ pub(crate) fn probe(
         }
         let mut removed = false;
         for (ws, tx) in candidates {
-            if out.retx_queued as usize >= PROBE_COUNT {
+            if out.retx_queued as usize + out.repair_asks.len() >= PROBE_COUNT {
                 break 'rounds;
+            }
+            if let Some(block) = protected(ws) {
+                out.protected_suppressed += tx.records.len() as u64;
+                if !out.repair_asks.contains(&block) {
+                    out.repair_asks.push(block);
+                }
+                continue;
             }
             // One request per record, under the record's own wire_seq. The
             // transmission is only forgotten or declared lost when every
@@ -230,7 +262,7 @@ mod tests {
             e.on_ack(&[*key]);
         }
         let due = e.pto_deadline().expect("running");
-        let out = probe(&mut l, &mut e, due).expect("due");
+        let out = probe(&mut l, &mut e, due, |_| None).expect("due");
         assert_eq!(out.lost.len(), 100, "the dead tail is declared lost");
         assert_eq!(out.retx_queued, 2, "and the live passes behind it probed");
         const { assert!(100 > PROBE_SCAN) };
@@ -251,12 +283,12 @@ mod tests {
         let mut n = 0;
         e.tick_nacks_budgeted(t0, usize::MAX, usize::MAX, &mut n);
         let first = e.pto_deadline().expect("running");
-        let out = probe(&mut l, &mut e, first).expect("due");
+        let out = probe(&mut l, &mut e, first, |_| None).expect("due");
         assert_eq!(out.retx_queued, 0, "premise: nothing queued");
         let second = e.pto_deadline().expect("restarted");
         assert!(second > first, "the timer restarted");
         let interval1 = second.duration_since(first);
-        let out = probe(&mut l, &mut e, second).expect("due again");
+        let out = probe(&mut l, &mut e, second, |_| None).expect("due again");
         assert_eq!(out.retx_queued, 0);
         let third = e.pto_deadline().unwrap();
         assert!(
@@ -374,7 +406,7 @@ mod deferred_tests {
             if e.pto_due(t) {
                 probe_fired = true;
             }
-            let out = detect(&mut l, &mut e, t);
+            let out = detect(&mut l, &mut e, t, |_| None);
             if out.retx_queued > 0 && queued_at.is_none() {
                 queued_at = Some(t);
             }
@@ -558,7 +590,7 @@ mod h264_tests {
         let (mut e, mut l, sent) = sent_frames(5, 8, t0);
         assert_eq!(sent.len(), 40);
         let due = e.pto_deadline().expect("fragments are outstanding");
-        let out = probe(&mut l, &mut e, due).expect("due");
+        let out = probe(&mut l, &mut e, due, |_| None).expect("due");
         assert!(
             out.lost.is_empty(),
             "no fragment is declared lost by a stall: {:?}",
@@ -591,7 +623,7 @@ mod h264_tests {
         let t0 = Instant::now();
         let (mut e, mut l, sent) = sent_frames(1, 4, t0);
         let due = e.pto_deadline().unwrap();
-        probe(&mut l, &mut e, due).unwrap();
+        probe(&mut l, &mut e, due, |_| None).unwrap();
         let mut n = 0;
         e.tick_loss_budgeted(due, usize::MAX, usize::MAX, &mut n);
         let copy = e.take_transmissions().pop().expect("a probe copy");
@@ -654,7 +686,7 @@ mod h264_tests {
             },
         );
         let due = e.pto_deadline().expect("armed");
-        let out = probe(&mut l, &mut e, due).expect("due");
+        let out = probe(&mut l, &mut e, due, |_| None).expect("due");
         assert_eq!(out.forgotten.len(), 1, "one bundle");
         assert_eq!(out.forgotten_h264_records, 3, "three fragments");
     }
@@ -678,7 +710,7 @@ mod h264_tests {
         );
         e.on_departed(0, t0);
         let due = e.pto_deadline().expect("armed");
-        let out = probe(&mut l, &mut e, due).expect("due");
+        let out = probe(&mut l, &mut e, due, |_| None).expect("due");
         assert!(out.lost.is_empty(), "no verdict: {:?}", out.lost.len());
         assert_eq!(out.forgotten.len(), sent.len());
         assert_eq!(l.len(), 0, "and they left the ledger");

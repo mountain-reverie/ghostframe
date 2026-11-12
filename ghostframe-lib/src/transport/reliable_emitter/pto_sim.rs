@@ -232,9 +232,9 @@ pub(super) fn run_script(sc: Script) -> Run {
             }
         }
         // The loss path, exactly as the bridge runs it each turn.
-        let out = loss_path::detect(&mut ledger, &mut e, now);
+        let out = loss_path::detect(&mut ledger, &mut e, now, |_| None);
         let _ = out;
-        let _ = loss_path::probe(&mut ledger, &mut e, now);
+        let _ = loss_path::probe(&mut ledger, &mut e, now, |_| None);
         let before = e.stats.loss_path_resends;
         e.tick_budgeted(now, usize::MAX, usize::MAX);
         if e.stats.loss_path_resends > before && run.first_repair_after_drop.is_none() {
@@ -421,8 +421,13 @@ mod tests {
             }
         }
         let due = e.pto_deadline().expect("running");
-        assert!(loss_path::probe(&mut ledger, &mut e, due - Duration::from_millis(1)).is_none());
-        let out = loss_path::probe(&mut ledger, &mut e, due).expect("due");
+        assert!(
+            loss_path::probe(&mut ledger, &mut e, due - Duration::from_millis(1), |_| {
+                None
+            })
+            .is_none()
+        );
+        let out = loss_path::probe(&mut ledger, &mut e, due, |_| None).expect("due");
         assert_eq!(out.retx_queued, 2);
         let mut n = 0;
         e.tick_loss_budgeted(due, usize::MAX, usize::MAX, &mut n);
