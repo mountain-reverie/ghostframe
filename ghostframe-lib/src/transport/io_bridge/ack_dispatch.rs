@@ -319,6 +319,8 @@ impl IoBridge {
             .collect();
         // One rate sample per acknowledgement batch, as the draft has it.
         self.delivery_sampler.end_ack(now_for_samples);
+        // Blocks count arrivals, live or late, by bundle_seq.
+        self.blocks_on_arrivals(entries);
         resolved
     }
 

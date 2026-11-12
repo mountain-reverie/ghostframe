@@ -222,3 +222,84 @@ async fn a_churning_scene_with_blocks_on_sends_and_bills_repairs() {
         "tiles reached the client framebuffer"
     );
 }
+
+/// The knob on under 5 % loss on the server-to-client direction: the receive
+/// side runs (RECOVERED, REPAIR_REQUEST, DECLINED, the deadline release) and
+/// the tiles still arrive.
+#[tokio::test(start_paused = true)]
+async fn a_lossy_scene_with_blocks_on_runs_the_receive_side_and_converges() {
+    use ghostframe_lib::config::FecBlockParams;
+    let scene = BrowserlessScene {
+        seed: 0xB0_B058,
+        tick_budget_floor_bytes: None,
+        datagram_send_buffer_bytes: None,
+        load: SceneLoad::Profile(LoadProfile {
+            cadence_us: PRODUCTION_CADENCE_US,
+            churn: Churn::Region { tiles_per_tick: 32 },
+        }),
+        cadence_us: PRODUCTION_CADENCE_US,
+        net: NetProfile {
+            delay_us: 10_000,
+            ..NetProfile::perfect()
+        },
+        drops: Default::default(),
+        duration: Duration::from_secs(8),
+        grid_cols: 16,
+        grid_rows: 16,
+    };
+    let mut lossy = NetProfile {
+        delay_us: 10_000,
+        ..NetProfile::perfect()
+    };
+    lossy.loss = 0.05;
+    let opts = RunOptions {
+        fec_blocks: Some(FecBlockParams {
+            k_max: 16,
+            t_ms: 5,
+            r: 2,
+        }),
+        ..framed()
+    };
+    let r = run_browserless_with_options(
+        scene,
+        LinkOverrides {
+            s2c: Some(lossy),
+            ..Default::default()
+        },
+        opts,
+    )
+    .await
+    .expect("scene ran");
+    let i = &r.transport.instr;
+    println!(
+        "BLOCKSLOSS recovered_rx={} declined_rx={} handoffs={} handoff_queued={} \
+         requests_rx={} requests_served={} rows_sent={} t_lr={} deferral_timeout={} \
+         block_actions_dropped={} loss_path_resends={}",
+        i.fec_recovered_rx,
+        i.fec_declined_rx,
+        i.block_handoffs,
+        i.block_handoff_queued,
+        i.fec_repair_requests_rx,
+        i.block_requests_served,
+        i.block_request_rows_sent,
+        i.block_t_lr_fired,
+        i.block_deferral_timeout,
+        i.block_actions_dropped,
+        r.loss_path_resends
+    );
+    assert!(
+        r.s2c_datagrams_dropped > 0,
+        "premise: the link dropped datagrams"
+    );
+    assert!(i.fec_recovered_rx > 0, "the client rebuilt sources");
+    assert!(i.block_requests_served > 0, "requests were served");
+    assert!(i.block_handoffs > 0, "blocks that failed handed off");
+    assert_eq!(i.block_deferral_timeout, 0);
+    assert_eq!(i.block_actions_dropped, 0, "no H.264 here");
+    let present = (0..16u8)
+        .flat_map(|x| (0..16u8).map(move |y| (x, y)))
+        .filter(|&(x, y)| r.framebuffer.tile_rgba(x, y).is_some())
+        .count();
+    println!("BLOCKSLOSS tiles_present={present}/256");
+    assert!(present > 0, "tiles converged under loss");
+}

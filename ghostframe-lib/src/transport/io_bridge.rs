@@ -2242,8 +2242,20 @@ impl IoBridge {
         let stats = self.stats_next_due();
         // The T close of the open FEC block (none with the knob off).
         let block_t = self.block_t_deadline();
+        // And for a block's `T_lr` repair, deadline release and alarms.
+        let block_release = self.block_release_deadline();
         [
-            quic, display, close, recheck, admission, pto, loss_time, deferred, stats, block_t,
+            quic,
+            display,
+            close,
+            recheck,
+            admission,
+            pto,
+            loss_time,
+            deferred,
+            stats,
+            block_t,
+            block_release,
         ]
         .into_iter()
         .flatten()
