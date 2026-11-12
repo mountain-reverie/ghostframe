@@ -545,3 +545,230 @@ async fn an_mtu_close_with_no_repairs_hands_off_at_once() {
     assert!(b.block_tx.handoffs > 0, "nothing to wait for: handed off");
     assert_eq!(b.block_table.open_blocks(), 0);
 }
+
+// ---- D6: protected retransmit rules --------------------------------------
+
+/// Tiles at column `x`, so a second batch never supersedes the first.
+fn submit_tiles_at(b: &mut IoBridge, x: u8, n: u32) {
+    let now = now_std();
+    for i in 0..n {
+        let mut dg = vec![0u8; TILE_LEN];
+        dg[0] = 0x80;
+        dg[16..20].copy_from_slice(&i.to_be_bytes());
+        b.reliable_emitter
+            .submit_one(EmitKey::new(500 + i, x, 7, 0), dg.into(), now, None, now);
+    }
+}
+
+/// Every frame sent so far left for the wire (the ledger needs departures to
+/// judge a loss and the PTO needs one to arm).
+fn stamp_all(b: &mut IoBridge) {
+    let seqs: Vec<u32> = b
+        .sent_frames_for_test
+        .iter()
+        .map(|f| match parse(f).unwrap() {
+            Frame::Source(s) => s.bundle_seq,
+            Frame::Repair(r) => r.bundle_seq,
+            Frame::Plain(p) => p.bundle_seq,
+        })
+        .collect();
+    for q in seqs {
+        b.stamp_departure(q, now_std());
+    }
+}
+
+/// A closed block of 30 tiles in several sources; every source but the first
+/// is acknowledged, so the first is lost by the packet threshold (`expire`)
+/// and the block is neither complete nor deferred.
+fn block_with_one_lost_source() -> (IoBridge, u16, Vec<u32>) {
+    let mut b = blocks_bridge(64, 5, 2);
+    converge_rtt(&mut b, 20);
+    submit_tiles(&mut b, 30, None);
+    send_and_close(&mut b);
+    stamp_all(&mut b);
+    let (id, seqs, _) = first_block(&b.sent_frames_for_test.clone());
+    assert!(
+        seqs.len() >= 6,
+        "premise: several sources, got {}",
+        seqs.len()
+    );
+    ack_ids(&mut b, &seqs[1..]);
+    (b, id, seqs)
+}
+
+#[tokio::test]
+async fn a_lost_protected_tile_source_is_not_retransmitted_by_the_loss_path() {
+    let (mut b, _, seqs) = block_with_one_lost_source();
+    b.expire_transmissions(now_std() + Duration::from_millis(500));
+    assert!(
+        b.instr.losses_declared >= 1,
+        "premise: the source was declared lost"
+    );
+    assert_eq!(b.instr.loss_retx_requested, 0, "no loss-path retransmit");
+    assert!(b.block_tx.protected_timer_suppressed > 0);
+    assert_eq!(b.reliable_emitter.stats.handoff_retransmits, 0);
+    // The client's RECOVERED releases it; nothing was ever resent.
+    let before = b.sent_frames_for_test.len();
+    b.handle_status_record(StatusRecord::Recovered(vec![seqs[0]]));
+    send_retransmits(&mut b);
+    assert_eq!(
+        b.sent_frames_for_test.len(),
+        before,
+        "no retransmit ever went out"
+    );
+    assert_eq!(b.block_tx.handoffs, 0);
+}
+
+#[tokio::test]
+async fn with_the_repairs_lost_too_the_deadline_hands_off_and_a_lost_handoff_is_retransmitted() {
+    let (mut b, _, seqs) = block_with_one_lost_source();
+    let t0 = now_std();
+    b.expire_transmissions(t0 + Duration::from_millis(500));
+    assert_eq!(b.instr.loss_retx_requested, 0);
+    // The deadline: the unaccounted source goes to ARQ as a PLAIN hand-off.
+    b.service_blocks(t0 + Duration::from_secs(2));
+    assert!(b.block_tx.handoff_queued > 0, "the block handed off");
+    let before = b.sent_frames_for_test.len();
+    send_retransmits(&mut b);
+    stamp_all(&mut b);
+    let new = &b.sent_frames_for_test[before..];
+    assert!(kinds(new).contains(&"P"), "it arrived as a PLAIN frame");
+    let handoff_seq = match parse(
+        new.iter()
+            .find(|f| matches!(parse(f), Ok(Frame::Plain(_))))
+            .unwrap(),
+    )
+    .unwrap()
+    {
+        Frame::Plain(p) => p.bundle_seq,
+        _ => unreachable!(),
+    };
+    assert_ne!(handoff_seq, seqs[0]);
+    assert_eq!(
+        b.block_table.protected_block(handoff_seq),
+        None,
+        "no block, no protection"
+    );
+    // Later traffic is acknowledged past it: the hand-off is lost and the
+    // ordinary loss path retransmits it, per transmission.
+    submit_tiles_at(&mut b, 9, 30);
+    let from = b.sent_frames_for_test.len();
+    send_and_close(&mut b);
+    stamp_all(&mut b);
+    let later: Vec<u32> = b.sent_frames_for_test[from..]
+        .iter()
+        .filter_map(|f| match parse(f).unwrap() {
+            Frame::Source(s) => Some(s.bundle_seq),
+            _ => None,
+        })
+        .collect();
+    assert!(later.len() >= 5, "premise: enough later sources");
+    ack_ids(&mut b, &later);
+    let before_req = b.instr.loss_retx_requested;
+    b.expire_transmissions(t0 + Duration::from_secs(3));
+    assert!(
+        b.instr.loss_retx_requested > before_req,
+        "a lost hand-off is retransmitted by the loss path"
+    );
+}
+
+#[tokio::test]
+async fn a_lost_repair_retransmits_nothing() {
+    let mut b = blocks_bridge(64, 5, 2);
+    converge_rtt(&mut b, 20);
+    submit_tiles(&mut b, 30, None);
+    send_and_close(&mut b);
+    stamp_all(&mut b);
+    let frames = b.sent_frames_for_test.clone();
+    let (_, seqs, _) = first_block(&frames);
+    let repair_seq = frames
+        .iter()
+        .find_map(|f| match parse(f).unwrap() {
+            Frame::Repair(r) => Some(r.bundle_seq),
+            _ => None,
+        })
+        .expect("a repair");
+    // Everything but that one repair is acknowledged.
+    let mut ids = seqs.clone();
+    ids.extend(frames.iter().filter_map(|f| match parse(f).unwrap() {
+        Frame::Repair(r) if r.bundle_seq != repair_seq => Some(r.bundle_seq),
+        _ => None,
+    }));
+    // A newer bundle, acknowledged, to put the repair behind the threshold.
+    submit_tiles_at(&mut b, 9, 30);
+    let from = b.sent_frames_for_test.len();
+    send_and_close(&mut b);
+    stamp_all(&mut b);
+    ids.extend(
+        b.sent_frames_for_test[from..]
+            .iter()
+            .filter_map(|f| match parse(f).unwrap() {
+                Frame::Source(s) => Some(s.bundle_seq),
+                _ => None,
+            }),
+    );
+    ack_ids(&mut b, &ids);
+    let lost_before = b.instr.losses_declared;
+    b.expire_transmissions(now_std() + Duration::from_millis(500));
+    assert!(
+        b.instr.losses_declared > lost_before,
+        "premise: the repair was declared lost"
+    );
+    assert_eq!(b.instr.loss_retx_requested, 0, "and nothing was queued");
+    assert_eq!(b.reliable_emitter.stats.handoff_retransmits, 0);
+}
+
+#[tokio::test]
+async fn the_pto_answers_a_protected_candidate_with_a_repair_row_not_a_source() {
+    let mut b = blocks_bridge(64, 5, 2);
+    converge_rtt(&mut b, 20);
+    submit_tiles(&mut b, 30, None);
+    send_and_close(&mut b);
+    stamp_all(&mut b);
+    assert_eq!(repair_rows(&b.sent_frames_for_test), [0, 1]);
+    let before = b.sent_frames_for_test.len();
+    let t = now_std() + Duration::from_secs(2);
+    b.poll_pto(t);
+    assert_eq!(b.block_tx.pto_repair_rows, 1, "one block, one new row");
+    assert_eq!(b.instr.pto_probes_requested, 0, "no source was probed");
+    send_retransmits(&mut b);
+    b.service_pending_repairs();
+    b.flush_bundles();
+    let new = b.sent_frames_for_test[before..].to_vec();
+    assert_eq!(kinds(&new), ["R"], "a repair, and no source or plain frame");
+    assert_eq!(repair_rows(&new), [2], "the next unused row");
+    assert!(b.block_tx.protected_timer_suppressed > 0);
+}
+
+#[tokio::test]
+async fn the_pto_skips_a_deferred_block_and_counts_its_rows_against_the_cap() {
+    let mut b = blocks_bridge(64, 5, 2);
+    converge_rtt(&mut b, 20);
+    submit_tiles(&mut b, 30, None);
+    send_and_close(&mut b);
+    stamp_all(&mut b);
+    let frames = b.sent_frames_for_test.clone();
+    let (_, seqs, _) = first_block(&frames);
+    let k = seqs.len();
+    // k - 1 sources and one repair: held == k, one source missing: Deferred.
+    let repair_seq = frames
+        .iter()
+        .find_map(|f| match parse(f).unwrap() {
+            Frame::Repair(r) => Some(r.bundle_seq),
+            _ => None,
+        })
+        .unwrap();
+    let mut ids: Vec<u32> = seqs[1..].to_vec();
+    ids.push(repair_seq);
+    assert_eq!(ids.len(), k);
+    ack_ids(&mut b, &ids);
+    let before = b.sent_frames_for_test.len();
+    b.poll_pto(now_std() + Duration::from_secs(2));
+    assert_eq!(b.block_tx.pto_repair_rows, 0, "a deferred block is skipped");
+    assert_eq!(
+        b.instr.pto_probes_requested, 0,
+        "and its source is not resent"
+    );
+    send_retransmits(&mut b);
+    assert_eq!(b.sent_frames_for_test.len(), before);
+}

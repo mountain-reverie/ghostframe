@@ -274,7 +274,8 @@ async fn a_lossy_scene_with_blocks_on_runs_the_receive_side_and_converges() {
     println!(
         "BLOCKSLOSS recovered_rx={} declined_rx={} handoffs={} handoff_queued={} \
          requests_rx={} requests_served={} rows_sent={} t_lr={} deferral_timeout={} \
-         block_actions_dropped={} loss_path_resends={}",
+         block_actions_dropped={} loss_path_resends={} protected_suppressed={} \
+         pto_repair_rows={} nack_on_protected={}",
         i.fec_recovered_rx,
         i.fec_declined_rx,
         i.block_handoffs,
@@ -285,7 +286,10 @@ async fn a_lossy_scene_with_blocks_on_runs_the_receive_side_and_converges() {
         i.block_t_lr_fired,
         i.block_deferral_timeout,
         i.block_actions_dropped,
-        r.loss_path_resends
+        r.loss_path_resends,
+        i.block_protected_timer_suppressed,
+        i.block_pto_repair_rows,
+        i.block_nack_on_protected
     );
     assert!(
         r.s2c_datagrams_dropped > 0,
@@ -294,6 +298,14 @@ async fn a_lossy_scene_with_blocks_on_runs_the_receive_side_and_converges() {
     assert!(i.fec_recovered_rx > 0, "the client rebuilt sources");
     assert!(i.block_requests_served > 0, "requests were served");
     assert!(i.block_handoffs > 0, "blocks that failed handed off");
+    assert!(
+        i.block_handoff_queued > 0,
+        "hand-offs reach ARQ now that the loss path leaves protected content alone"
+    );
+    assert!(
+        i.block_protected_timer_suppressed > 0,
+        "the loss path saw protected sources and left them to their block"
+    );
     assert_eq!(i.block_deferral_timeout, 0);
     assert_eq!(i.block_actions_dropped, 0, "no H.264 here");
     let present = (0..16u8)

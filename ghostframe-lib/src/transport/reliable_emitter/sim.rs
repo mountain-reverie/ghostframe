@@ -151,8 +151,16 @@ impl Sim {
                 None => {}
             }
         }
-        let _ = crate::transport::loss_path::detect(&mut self.ledger, &mut self.emitter, self.t);
-        let _ = crate::transport::loss_path::probe(&mut self.ledger, &mut self.emitter, self.t);
+        let _ = crate::transport::loss_path::detect(
+            &mut self.ledger,
+            &mut self.emitter,
+            self.t,
+            |_| None,
+        );
+        let _ =
+            crate::transport::loss_path::probe(&mut self.ledger, &mut self.emitter, self.t, |_| {
+                None
+            });
     }
     fn submit_many(&mut self, n: u32) {
         for i in 0..n {

@@ -244,6 +244,9 @@ struct Entry {
 pub(crate) struct BlockTable {
     blocks: HashMap<BlockId, Block>,
     by_bundle: HashMap<u32, Entry>,
+    /// Newest source carrying each tile pass; stale values are checked
+    /// against `by_bundle` on lookup (key space is bounded by 256^2 x passes).
+    by_tile: HashMap<(u8, u8, u8), u32>,
     tombstones: VecDeque<u32>,
     closed: HashMap<BlockId, CloseReason>,
     closed_order: VecDeque<BlockId>,
@@ -283,6 +286,7 @@ impl BlockTable {
         BlockTable {
             blocks: HashMap::new(),
             by_bundle: HashMap::new(),
+            by_tile: HashMap::new(),
             tombstones: VecDeque::new(),
             closed: HashMap::new(),
             closed_order: VecDeque::new(),
@@ -398,6 +402,12 @@ impl BlockTable {
         });
         if b.born == born {
             self.next_born += 1;
+        }
+        for (_, c) in &records {
+            if let Content::Tile(k) = c {
+                self.by_tile
+                    .insert((k.tile_x, k.tile_y, k.pass_idx), bundle_seq);
+            }
         }
         b.sources.push(Src {
             idx,
@@ -638,6 +648,26 @@ impl BlockTable {
         }
     }
 
+    /// The block whose content outcome a source still owes (`on_verdict` is
+    /// `Park` or `Skip`): the loss path retransmits nothing for it. `None` for
+    /// a PLAIN bundle, a repair (it carries no records) or an unknown bundle.
+    pub(crate) fn protected_block(&self, bundle_seq: u32) -> Option<BlockId> {
+        match self.on_verdict(bundle_seq) {
+            VerdictAction::Pass => None,
+            VerdictAction::Park | VerdictAction::Skip => {
+                self.by_bundle.get(&bundle_seq).map(|e| e.block_id)
+            }
+        }
+    }
+
+    /// Whether the tile pass `(x, y, pass)` has a source still in flight in an
+    /// unaccounted block (a TILE_NACK for it is then likely redundant).
+    pub(crate) fn tile_protected(&self, x: u8, y: u8, pass: u8) -> bool {
+        self.by_tile
+            .get(&(x, y, pass))
+            .is_some_and(|&b| self.on_verdict(b) == VerdictAction::Park)
+    }
+
     /// Service timers: `T_lr`, deadlines, deferral alarms.
     pub(crate) fn on_timer(&mut self, now: Instant, rtt: Rtt) -> Vec<Action> {
         self.rtt = rtt;
@@ -776,6 +806,7 @@ impl BlockTable {
     pub(crate) fn reset(&mut self) {
         self.blocks.clear();
         self.by_bundle.clear();
+        self.by_tile.clear();
         self.tombstones.clear();
         self.closed.clear();
         self.closed_order.clear();

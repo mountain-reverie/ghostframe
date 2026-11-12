@@ -61,6 +61,14 @@ pub(super) struct BlockTxStats {
     /// Repair rows the table asked for whose block had no symbols left.
     pub(super) repair_rows_no_block: u64,
     pub(super) alarms: u64,
+    /// Records the loss path declined to retransmit because their block
+    /// still owes the content outcome.
+    pub(super) protected_timer_suppressed: u64,
+    /// PTO turns that named a block, and the repair rows the table gave.
+    pub(super) pto_repair_asks: u64,
+    pub(super) pto_repair_rows: u64,
+    /// TILE_NACKs honoured for a pass whose protected source is in flight.
+    pub(super) nack_on_protected: u64,
 }
 
 impl IoBridge {
