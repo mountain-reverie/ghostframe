@@ -336,6 +336,9 @@ struct Entry {
     resolved: bool,
 }
 
+/// Close reasons kept for the controller between two reads.
+const CLOSE_LOG_CAP: usize = 1024;
+
 #[derive(Debug)]
 pub(crate) struct BlockTable {
     blocks: HashMap<BlockId, Block>,
@@ -349,6 +352,8 @@ pub(crate) struct BlockTable {
     now: Instant,
     timers: [BinaryHeap<TimerEntry>; 5],
     closed: HashMap<BlockId, CloseReason>,
+    /// Close reasons not yet read by the adaptive controller (bounded).
+    close_log: Vec<CloseReason>,
     closed_order: VecDeque<BlockId>,
     cached_bytes: usize,
     next_born: u64,
@@ -396,6 +401,7 @@ impl BlockTable {
             now: Instant::now(),
             timers: Default::default(),
             closed: HashMap::new(),
+            close_log: Vec::new(),
             closed_order: VecDeque::new(),
             cached_bytes: 0,
             next_born: 0,
@@ -1088,6 +1094,12 @@ impl BlockTable {
         }
     }
 
+    /// Takes the close reasons since the last call, oldest first. Capped: an
+    /// unread log stops growing rather than growing without bound.
+    pub(crate) fn take_close_log(&mut self) -> Vec<CloseReason> {
+        std::mem::take(&mut self.close_log)
+    }
+
     fn finish(&mut self, id: BlockId, b: Block, why: CloseReason) {
         self.cached_bytes -= b.sym_bytes;
         for s in &b.sources {
@@ -1097,6 +1109,9 @@ impl BlockTable {
             self.tombstone(r);
         }
         self.closed.insert(id, why);
+        if self.close_log.len() < CLOSE_LOG_CAP {
+            self.close_log.push(why);
+        }
         self.closed_order.push_back(id);
         while self.closed_order.len() > self.max_blocks.max(1) {
             if let Some(old) = self.closed_order.pop_front() {

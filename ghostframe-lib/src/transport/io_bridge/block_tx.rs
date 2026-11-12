@@ -106,6 +106,40 @@ impl IoBridge {
         self.packer.set_blocks(params);
     }
 
+    /// One controller step (adaptive mode; a no-op otherwise): read the
+    /// table's closes, let the estimate decay and re-check the floor, then
+    /// move the live parameters to what the controller wants, at a block
+    /// boundary. Runs on every LOSS_REPORT and once per loop turn from
+    /// `service_blocks` (the release path when no report arrives). It needs no
+    /// wake deadline of its own: any loop turn runs it, and the dwell it waits
+    /// on is checked then.
+    ///
+    /// A new span that differs from the live one by at most 1 ms and 12.5 % of
+    /// `k_max` is not applied: the source-rate-derived span would otherwise
+    /// close the open block on every wobble of the bandwidth estimate.
+    pub(super) fn adapt_step(&mut self, now_us: u64) {
+        if self.fec_adapt.is_none() {
+            return;
+        }
+        let closes = self.block_table.take_close_log();
+        let rate = self.bwe.snapshot().bitrate_bps;
+        let max_dg = self.live_max_dg().unwrap_or(1200);
+        let live = self.fec_live;
+        let Some(a) = self.fec_adapt.as_mut() else {
+            return;
+        };
+        a.tick(now_us, closes);
+        let mut want = a.live_params(rate, max_dg, now_us);
+        if let (Some(w), Some(cur)) = (want, live) {
+            if w.t_ms.abs_diff(cur.t_ms) <= 1
+                && u16::from(w.k_max.abs_diff(cur.k_max)) * 8 <= u16::from(cur.k_max)
+            {
+                want = live;
+            }
+        }
+        self.apply_fec_live(want);
+    }
+
     /// Bundle kind of a probe-tagged first send: a lone SOURCE only while
     /// blocks are live (follows `fec_live`, else the cluster's byte count
     /// drifts by 4 bytes per packet).
@@ -166,7 +200,11 @@ impl IoBridge {
                 continue;
             }
             self.block_tx.k_sum += u64::from(k);
-            let r = params.r.min(255 - k);
+            let r = match self.fec_adapt.as_mut() {
+                Some(a) => a.r_for_block(u32::from(k), self.reliable_emitter.emit_us64(now)),
+                None => params.r,
+            }
+            .min(255 - k);
             let fits = max_dg.is_some_and(|m| c.symbol_len() + FEC_REPAIR_HEADER_LEN <= m);
             let mut repairs_queued = 0;
             if r > 0 && !fits {
@@ -480,6 +518,7 @@ impl IoBridge {
             return;
         }
         let now_us = self.reliable_emitter.emit_us64(now);
+        self.adapt_step(now_us);
         if self.packer.close_if_due(now_us) {
             self.process_closed_blocks(Some(CloseWhy::Time));
         }
