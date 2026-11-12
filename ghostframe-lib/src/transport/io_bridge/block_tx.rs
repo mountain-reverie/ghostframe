@@ -455,7 +455,7 @@ impl IoBridge {
 
     /// The earliest block deadline (`T_lr`, release, alarms), for
     /// `next_wake_deadline`.
-    pub(super) fn block_release_deadline(&self) -> Option<std::time::Instant> {
+    pub(super) fn block_release_deadline(&mut self) -> Option<std::time::Instant> {
         self.block_table.next_deadline()
     }
 
