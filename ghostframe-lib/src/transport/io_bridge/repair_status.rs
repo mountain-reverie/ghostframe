@@ -108,12 +108,9 @@ impl IoBridge {
                 p.report_residual = r.residual_lost;
                 if self.fec_adapt.is_some() {
                     let now_us = self.reliable_emitter.emit_us64(now_std());
-                    let (queue, events) = (
-                        self.bwe.standing_queue(),
-                        self.transport_probe.congestion_events,
-                    );
+                    let queue = self.bwe.standing_queue();
                     if let Some(a) = self.fec_adapt.as_mut() {
-                        a.on_report(&r, queue, events, now_us);
+                        a.on_report(&r, queue, now_us);
                     }
                     self.adapt_step(now_us);
                 }
