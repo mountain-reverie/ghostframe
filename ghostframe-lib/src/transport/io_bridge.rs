@@ -3065,6 +3065,9 @@ mod coverage_pin_tests;
 mod repair_status_tests;
 
 #[cfg(test)]
+#[path = "io_bridge/block_h264_tests.rs"]
+mod block_h264_tests;
+#[cfg(test)]
 #[path = "io_bridge/block_tx_tests.rs"]
 mod block_tx_tests;
 #[cfg(test)]

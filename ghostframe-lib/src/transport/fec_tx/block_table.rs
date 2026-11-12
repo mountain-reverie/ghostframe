@@ -120,6 +120,16 @@ pub(crate) enum VerdictAction {
     Pass,
 }
 
+/// Why the table tells the manager a fragment is lost (`h264 stats`:
+/// `content_lost_decline` / `content_lost_deadline`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LostCause {
+    /// The client said DECLINED (or the block was already given up on).
+    Decline,
+    /// A deadline, the deferral alarm, an eviction or an all-repairs-dropped hand-off.
+    Deadline,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AlarmKind {
     /// H.264 block stayed `Deferred` for `2 srtt + 100 ms`.
@@ -144,6 +154,10 @@ pub(crate) enum Action {
     ContentLostH264 {
         frame_seq: u32,
         frag_idx: u16,
+        /// The transmission that carried it (an IDR fragment is sent again
+        /// from here, as a `Handoff`).
+        wire_seq: u32,
+        cause: LostCause,
     },
     Alarm {
         block_id: BlockId,
@@ -368,7 +382,8 @@ impl BlockTable {
         let kind = kind_of(&records);
         let mut actions = Vec::new();
         if self.closed.contains_key(&block_id) {
-            let outcome = release_records(block_id, kind, &records, &mut actions);
+            let outcome =
+                release_records(block_id, kind, &records, LostCause::Decline, &mut actions);
             self.by_bundle.insert(
                 bundle_seq,
                 Entry {
@@ -459,7 +474,7 @@ impl BlockTable {
         if none_sent {
             // Nothing to wait for: hand off at once.
             self.stats.blocks_without_repairs += 1;
-            self.release_unresolved(c.block_id, &mut b, &mut actions);
+            self.release_unresolved(c.block_id, &mut b, LostCause::Deadline, &mut actions);
         }
         self.settle(c.block_id, b, now, &mut actions);
         actions
@@ -561,7 +576,7 @@ impl BlockTable {
     }
 
     fn decline(&mut self, id: BlockId, mut b: Block, _now: Instant, actions: &mut Vec<Action>) {
-        self.release_unresolved(id, &mut b, actions);
+        self.release_unresolved(id, &mut b, LostCause::Decline, actions);
         self.finish(id, b, CloseReason::Declined);
     }
 
@@ -699,7 +714,7 @@ impl BlockTable {
                             now >= d
                         })
                         .collect();
-                    self.release_idxs(id, &mut b, &due, &mut actions);
+                    self.release_idxs(id, &mut b, &due, LostCause::Deadline, &mut actions);
                 }
                 Phase::Deferred => {
                     let at = b.deferred_at.unwrap_or(now);
@@ -736,7 +751,7 @@ impl BlockTable {
                             kind: AlarmKind::TDef,
                         });
                     }
-                    self.release_idxs(id, &mut b, &due, &mut actions);
+                    self.release_idxs(id, &mut b, &due, LostCause::Deadline, &mut actions);
                 }
             }
             self.settle(id, b, now, &mut actions);
@@ -796,7 +811,7 @@ impl BlockTable {
             };
             let mut b = self.blocks.remove(&id).expect("just found");
             self.stats.block_evicted += 1;
-            self.release_unresolved(id, &mut b, &mut actions);
+            self.release_unresolved(id, &mut b, LostCause::Deadline, &mut actions);
             self.finish(id, b, CloseReason::HandedOff);
         }
         actions
@@ -821,11 +836,17 @@ impl BlockTable {
             .is_some_and(|e| e.outcome.is_none())
     }
 
-    fn release_unresolved(&mut self, id: BlockId, b: &mut Block, actions: &mut Vec<Action>) {
+    fn release_unresolved(
+        &mut self,
+        id: BlockId,
+        b: &mut Block,
+        cause: LostCause,
+        actions: &mut Vec<Action>,
+    ) {
         let all: Vec<usize> = (0..b.sources.len())
             .filter(|&i| self.src_open(b, i))
             .collect();
-        self.release_idxs(id, b, &all, actions);
+        self.release_idxs(id, b, &all, cause, actions);
     }
 
     fn release_idxs(
@@ -833,11 +854,12 @@ impl BlockTable {
         id: BlockId,
         b: &mut Block,
         idxs: &[usize],
+        cause: LostCause,
         actions: &mut Vec<Action>,
     ) {
         for &i in idxs {
             let s = &b.sources[i];
-            let o = release_records(id, s.kind, &s.records, actions);
+            let o = release_records(id, s.kind, &s.records, cause, actions);
             if let Some(e) = self.by_bundle.get_mut(&s.bundle_seq) {
                 e.outcome = Some(o);
             }
@@ -914,6 +936,7 @@ fn release_records(
     block_id: BlockId,
     kind: Kind,
     records: &[SourceRecord],
+    cause: LostCause,
     actions: &mut Vec<Action>,
 ) -> Outcome {
     let mut tile = Vec::new();
@@ -926,6 +949,8 @@ fn release_records(
             } => actions.push(Action::ContentLostH264 {
                 frame_seq,
                 frag_idx,
+                wire_seq: ws,
+                cause,
             }),
             Content::Pad(_) => {}
         }

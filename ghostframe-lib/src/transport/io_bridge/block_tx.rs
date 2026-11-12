@@ -48,9 +48,9 @@ pub(super) struct BlockTxStats {
     pub(super) repairs_dropped_mtu: u64,
     pub(super) encode_failed: u64,
     pub(super) closed_declined: u64,
-    /// `ContentLostH264` actions: D7 makes them real, until then counted and
-    /// dropped (never a ledger verdict).
-    pub(super) content_lost_h264_stub: u64,
+    /// `ContentLostH264` actions executed: each tells the manager (or, for an
+    /// IDR fragment, the emitter) once; never a ledger verdict.
+    pub(super) content_lost_h264: u64,
     /// Tile records handed to ARQ, and the share the emitter queued.
     pub(super) handoffs: u64,
     pub(super) handoff_queued: u64,
@@ -186,7 +186,7 @@ impl IoBridge {
 
     /// Runs what the table decided: encodes repair rows (one call per block),
     /// hands tile content to ARQ as PLAIN `Handoff` retransmits, tells the
-    /// H.264 manager (D7; a counted stub until then), logs alarms.
+    /// H.264 manager, logs alarms.
     pub(super) fn execute_block_actions(&mut self, actions: Vec<Action>) {
         if actions.is_empty() {
             return;
@@ -213,7 +213,15 @@ impl IoBridge {
                         }
                     }
                 }
-                Action::ContentLostH264 { .. } => self.block_tx.content_lost_h264_stub += 1,
+                Action::ContentLostH264 {
+                    frame_seq,
+                    frag_idx,
+                    wire_seq,
+                    cause,
+                } => {
+                    self.block_tx.content_lost_h264 += 1;
+                    self.h264_content_lost(frame_seq, frag_idx, wire_seq, cause, now_std());
+                }
                 Action::Alarm { block_id, kind } => {
                     self.block_tx.alarms += 1;
                     match kind {

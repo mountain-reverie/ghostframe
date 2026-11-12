@@ -197,6 +197,16 @@ const RAISE_REORDER_MEMORY: Duration = Duration::from_secs(5);
 pub(super) const RAISE_LOSS_PAUSE: Duration = Duration::from_secs(10);
 
 impl RefsState {
+    /// A raised frame, as the probe raise records it (tests).
+    #[cfg(test)]
+    pub(super) fn raised_for_test(&mut self, frame_seq: u32, now: Instant) {
+        self.raised.push_back(RaisedFrame {
+            frame_seq,
+            sent_at: now,
+            lost: false,
+        });
+    }
+
     fn new(frame_interval: Duration, srtt: Duration) -> Self {
         Self {
             mgr: RefManager::new(RefConfig {
