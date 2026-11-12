@@ -93,7 +93,7 @@ async fn tiles_leave_as_sources_and_an_empty_close_sends_repairs_the_real_block_
 }
 
 #[tokio::test]
-async fn a_pump_that_stops_on_tokens_does_not_close_and_the_block_closes_on_t_after() {
+async fn a_pump_that_stops_on_tokens_does_not_close_and_the_next_dry_pump_closes_the_block() {
     let mut b = blocks_bridge(64, 5, 1);
     submit_tiles(&mut b, 3, None);
     b.forced_fifo_depth_for_test = Some(0);
@@ -107,14 +107,15 @@ async fn a_pump_that_stops_on_tokens_does_not_close_and_the_block_closes_on_t_af
     assert_eq!(b.block_tx.repairs_sent, 0);
     assert_eq!(kinds(&b.sent_frames_for_test), ["S"]);
     // Tokens again, and the pump runs dry: it has no open bundle left to mark
-    // LAST (every pump flushed), so the block closes on T.
+    // LAST (every pump flushed), but the block is open and the emitter has
+    // nothing left, so the dry pump closes it (Empty, not T).
     std::thread::sleep(std::time::Duration::from_millis(30));
     for _ in 0..3 {
         b.pump_admission();
     }
-    assert_eq!(b.block_tx.closed_empty, 0);
+    assert_eq!(b.block_tx.closed_empty, 1);
     b.service_blocks(now_std());
-    assert_eq!(b.block_tx.closed_time, 1);
+    assert_eq!(b.block_tx.closed_time, 0);
     assert_eq!(kinds(&b.sent_frames_for_test), ["S", "R"]);
 }
 
@@ -180,8 +181,11 @@ async fn a_refused_source_stays_ahead_of_its_repairs_and_a_queued_repair_counts_
     submit_tiles(&mut b, 0, None);
     // A new block's repair, queued behind a refusal.
     b.pending_repairs.push_back(block_tx::RepairJob {
-        bundle_seq: 999,
-        bytes: vec![0u8; 400],
+        block_id: 999,
+        k: 2,
+        r: 1,
+        row: 0,
+        payload: vec![0u8; 400 - ghostframe_protocol::fec::frame::FEC_REPAIR_HEADER_LEN],
     });
     let before = b.unsent_bundle_bytes();
     b.service_pending_repairs();
@@ -392,6 +396,79 @@ async fn a_repair_request_gets_fresh_rows_the_real_block_store_decodes() {
     assert_eq!(got, want, "the extra row completed the block");
     assert_eq!(b.block_tx.requests_served, 1);
     assert_eq!(b.block_tx.request_rows_sent, 1);
+}
+
+#[tokio::test]
+async fn a_request_from_a_client_that_does_not_know_k_is_served_to_k() {
+    let mut b = blocks_bridge(64, 5, 2);
+    submit_tiles(&mut b, 10, None);
+    b.drain_reliable_emitter(now_std());
+    assert!(b.flush_bundles());
+    // The T close: no LAST on any source.
+    b.service_blocks(now_std() + Duration::from_millis(10));
+    assert_eq!(b.block_tx.closed_time, 1);
+    let frames = b.sent_frames_for_test.clone();
+    assert_eq!(kinds(&frames), ["S", "S", "S", "S", "R", "R"]);
+    let (id, _, _) = first_block(&frames);
+    let want: std::collections::BTreeSet<Vec<u8>> =
+        b.sent_log_for_test.iter().map(|d| d.to_vec()).collect();
+    // The two trailing sources and both repairs are lost: the client holds
+    // two sources, sees neither LAST nor a repair, so it asks for one row.
+    let mut store = BlockStore::new();
+    let mut got = std::collections::BTreeSet::new();
+    for i in [0usize, 1] {
+        for r in store.on_datagram(&frames[i], 1_000).records {
+            got.insert(r.bytes);
+        }
+    }
+    assert_ne!(got, want, "premise: not yet decodable");
+    ask(
+        &mut b,
+        RepairAsk {
+            block_id: id,
+            have: 2,
+            missing: 1,
+            first_new_idx: 0,
+        },
+    );
+    b.service_pending_repairs();
+    let after = b.sent_frames_for_test.clone();
+    assert_eq!(repair_rows(&after[6..]), [2, 3], "k - have = 2 rows");
+    for f in &after[6..] {
+        for rec in store.on_datagram(f, 1_000).records {
+            got.insert(rec.bytes);
+        }
+    }
+    assert_eq!(got, want, "one request round decoded the block");
+}
+
+/// A repair dropped before it reaches quinn (MTU shrink, no session) leaves
+/// no hole in the bundle_seq space: the client counts a hole as lost.
+#[tokio::test]
+async fn a_dropped_repair_leaves_no_bundle_seq_gap() {
+    for no_sink in [false, true] {
+        let mut b = blocks_bridge(64, 5, 2);
+        submit_tiles(&mut b, 10, None);
+        b.drain_reliable_emitter(now_std());
+        b.close_block_on_empty();
+        assert_eq!(b.pending_repairs.len(), 2, "premise: both repairs queued");
+        let (_, seqs, _) = first_block(&b.sent_frames_for_test.clone());
+        let last_source = *seqs.iter().max().unwrap();
+        if no_sink {
+            b.wt_sessions.clear();
+            b.test_wire = None;
+        } else {
+            b.forced_raw_datagram_size_for_test = Some(250);
+        }
+        b.service_pending_repairs();
+        assert!(b.pending_repairs.is_empty());
+        assert_eq!(b.block_tx.repairs_sent, 0, "premise: nothing was sent");
+        assert_eq!(
+            b.packer.alloc_seq(),
+            last_source + 1,
+            "no bundle_seq was spent on a repair that never left (no_sink: {no_sink})"
+        );
+    }
 }
 
 #[tokio::test]
