@@ -10,7 +10,10 @@
 //! block still open) -> `Repair` (closed, waiting) -> `Deferred` (held(B) >= k:
 //! the client's RECOVERED or DECLINED is on its way) -> closed. A closed block
 //! is removed; its `by_bundle` entries stay in a tombstone ring so a late
-//! verdict finds them and answers [`VerdictAction::Skip`].
+//! verdict finds them and answers [`VerdictAction::Skip`]. An entry is kept
+//! until the ledger resolves its bundle (an ACK, or the verdict itself, via
+//! [`BlockTable::on_ledger_resolved`]), at most [`TOMBSTONE_RETENTION`], and
+//! never more than the hard cap: a count of bundles says nothing about time.
 //!
 //! Every source ends in exactly one [`Outcome`] (acked, recovered, handed off
 //! to ARQ, lost to the manager); outcomes are terminal.
@@ -22,7 +25,8 @@
 // Unused until D4b wires the table into the IoBridge.
 #![allow(dead_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use ghostframe_protocol::fec::feedback::RepairAsk;
@@ -33,8 +37,17 @@ use crate::transport::reliable_emitter::Content;
 pub(crate) const FEC_TX_MAX_BLOCKS: usize = 1024;
 /// Bytes of cached source symbols.
 pub(crate) const FEC_TX_MAX_CACHED_BYTES: usize = 16 << 20;
-/// Tombstoned `by_bundle` entries (the size of `RecentBundles`).
-pub(crate) const FEC_TX_TOMBSTONES: usize = 4096;
+/// Hard cap on retained `by_bundle` entries of closed blocks. Memory only: a
+/// 100 Mbit/s stream seals ~11k bundles a second, so this is ~25 s of them. The
+/// real retention is [`TOMBSTONE_RETENTION`] and the ledger's resolution.
+pub(crate) const FEC_TX_TOMBSTONES: usize = 1 << 18;
+/// Resolved entries (the ledger is done with them) are kept this many, only
+/// for the late-trigger counters; an unresolved one is never dropped for count.
+pub(crate) const RESOLVED_TOMBSTONES: usize = 4096;
+/// How long a closed block's bundle entries are kept for a late verdict if the
+/// ledger never resolves the bundle. Past the longest verdict lag seen (2.6 s)
+/// and the ledger's own retention.
+pub(crate) const TOMBSTONE_RETENTION: Duration = Duration::from_secs(10);
 /// Mirrors client-core `FEC_RX_DEFAULT_T_ADV_US` (33 ms).
 pub(crate) const CLIENT_T_ADV: Duration = Duration::from_millis(33);
 /// Mirrors client-core `FEC_RX_ALLOWANCE_US` (10 ms). The client's request
@@ -216,6 +229,68 @@ enum Kind {
     H264,
 }
 
+/// The table's timers. Each has a key independent of the live RTT (an
+/// instant plus a constant) and an RTT-dependent slack added when read, so a
+/// per-kind min-heap stays ordered whatever the RTT does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerKind {
+    TLr,
+    TileRelease,
+    H264Release,
+    H264Alarm,
+    TDef,
+}
+
+const TIMER_KINDS: [TimerKind; 5] = [
+    TimerKind::TLr,
+    TimerKind::TileRelease,
+    TimerKind::H264Release,
+    TimerKind::H264Alarm,
+    TimerKind::TDef,
+];
+
+impl TimerKind {
+    fn idx(self) -> usize {
+        self as usize
+    }
+    /// The constant part of the deadline, added to `last_sent` (or, for the
+    /// alarms, `deferred_at`).
+    fn offset(self) -> Duration {
+        match self {
+            TimerKind::TLr => CLIENT_WINDOW,
+            TimerKind::TileRelease => 2 * CLIENT_WINDOW,
+            TimerKind::H264Release => 2 * CLIENT_T_ADV + RAF_ALLOWANCE,
+            TimerKind::H264Alarm => H264_DEFERRAL_SLACK,
+            TimerKind::TDef => T_DEF,
+        }
+    }
+    /// The part that follows the RTT.
+    fn slack(self, r: Rtt) -> Duration {
+        match self {
+            TimerKind::TLr => r.srtt + 2 * r.rttvar,
+            TimerKind::TileRelease | TimerKind::H264Release => r.srtt + r.max_ack_delay,
+            TimerKind::H264Alarm => 2 * r.srtt,
+            TimerKind::TDef => Duration::ZERO,
+        }
+    }
+    fn release(kind: Kind) -> TimerKind {
+        match kind {
+            Kind::Tile => TimerKind::TileRelease,
+            Kind::H264 => TimerKind::H264Release,
+        }
+    }
+    fn alarm(kind: Kind) -> TimerKind {
+        match kind {
+            Kind::Tile => TimerKind::TDef,
+            Kind::H264 => TimerKind::H264Alarm,
+        }
+    }
+}
+
+/// `(key, block, born)`: `born` tells a reused `BlockId` from the block the
+/// timer was armed for.
+type TimerEntry = Reverse<(Instant, BlockId, u64)>;
+
 #[derive(Debug)]
 struct Src {
     idx: u8,
@@ -252,6 +327,9 @@ struct Entry {
     block_id: BlockId,
     role: Role,
     outcome: Option<Outcome>,
+    /// The ledger is done with this bundle (ACK or verdict), so no later
+    /// verdict can ask about it and the tombstone may go.
+    resolved: bool,
 }
 
 #[derive(Debug)]
@@ -261,7 +339,11 @@ pub(crate) struct BlockTable {
     /// Newest source carrying each tile pass; stale values are checked
     /// against `by_bundle` on lookup (key space is bounded by 256^2 x passes).
     by_tile: HashMap<(u8, u8, u8), u32>,
-    tombstones: VecDeque<u32>,
+    /// Closed blocks' bundles, oldest first, with when they closed.
+    tombstones: VecDeque<(u32, Instant)>,
+    /// The newest `now` any input carried (the table's own clock).
+    now: Instant,
+    timers: [BinaryHeap<TimerEntry>; 5],
     closed: HashMap<BlockId, CloseReason>,
     closed_order: VecDeque<BlockId>,
     cached_bytes: usize,
@@ -279,11 +361,16 @@ impl Default for BlockTable {
     }
 }
 
+/// The packer's `SourceKind` rule: a bundle with any H.264 fragment is an
+/// H.264 source (its deadline and alarm are the shorter H.264 ones).
 fn kind_of(records: &[SourceRecord]) -> Kind {
-    if records.iter().any(|(_, c)| matches!(c, Content::Tile(_))) {
-        Kind::Tile
-    } else {
+    if records
+        .iter()
+        .any(|(_, c)| matches!(c, Content::H264Frag { .. }))
+    {
         Kind::H264
+    } else {
+        Kind::Tile
     }
 }
 
@@ -302,6 +389,8 @@ impl BlockTable {
             by_bundle: HashMap::new(),
             by_tile: HashMap::new(),
             tombstones: VecDeque::new(),
+            now: Instant::now(),
+            timers: Default::default(),
             closed: HashMap::new(),
             closed_order: VecDeque::new(),
             cached_bytes: 0,
@@ -359,6 +448,7 @@ impl BlockTable {
                 block_id,
                 role: Role::Repair { row },
                 outcome: None,
+                resolved: false,
             },
         );
     }
@@ -390,6 +480,7 @@ impl BlockTable {
                     block_id,
                     role: Role::Source { idx },
                     outcome: Some(outcome),
+                    resolved: false,
                 },
             );
             self.tombstone(bundle_seq);
@@ -436,6 +527,7 @@ impl BlockTable {
                 block_id,
                 role: Role::Source { idx },
                 outcome: None,
+                resolved: false,
             },
         );
         actions
@@ -443,6 +535,7 @@ impl BlockTable {
 
     /// The packer closed the block (sources already registered).
     pub(crate) fn on_closed(&mut self, c: ClosedBlock, now: Instant) -> Vec<Action> {
+        self.tick(now);
         let mut actions = Vec::new();
         if self.closed.contains_key(&c.block_id) {
             return actions;
@@ -468,6 +561,7 @@ impl BlockTable {
                     block_id: c.block_id,
                     role: Role::Repair { row: row as u8 },
                     outcome: None,
+                    resolved: false,
                 },
             );
         }
@@ -477,17 +571,24 @@ impl BlockTable {
             self.release_unresolved(c.block_id, &mut b, LostCause::Deadline, &mut actions);
         }
         self.settle(c.block_id, b, now, &mut actions);
+        self.arm(c.block_id);
         actions
+    }
+
+    fn tick(&mut self, now: Instant) {
+        self.now = self.now.max(now);
     }
 
     // ---- inputs -------------------------------------------------------
 
     /// An ACK for `bundle_seq` arrived.
     pub(crate) fn on_arrival(&mut self, bundle_seq: u32, now: Instant) -> Vec<Action> {
+        self.tick(now);
         let mut actions = Vec::new();
         let Some(e) = self.by_bundle.get_mut(&bundle_seq) else {
             return actions;
         };
+        e.resolved = true;
         if e.outcome.is_some() {
             if matches!(e.outcome, Some(Outcome::HandedOff | Outcome::Lost)) {
                 self.stats.late_ack_after_release += 1;
@@ -512,6 +613,7 @@ impl BlockTable {
 
     /// RECOVERED named this source (never an ACK arrival).
     pub(crate) fn on_recovered(&mut self, bundle_seq: u32, now: Instant) -> Vec<Action> {
+        self.tick(now);
         let mut actions = Vec::new();
         let Some(e) = self.by_bundle.get_mut(&bundle_seq) else {
             return actions;
@@ -546,6 +648,7 @@ impl BlockTable {
         missing_bitmap: &[u8],
         now: Instant,
     ) -> Vec<Action> {
+        self.tick(now);
         let mut actions = Vec::new();
         let Some(b) = self.blocks.remove(&block_id) else {
             if self.closed.contains_key(&block_id) {
@@ -582,6 +685,7 @@ impl BlockTable {
 
     /// A REPAIR_REQUEST entry.
     pub(crate) fn on_request(&mut self, ask: RepairAsk, now: Instant) -> Vec<Action> {
+        self.tick(now);
         let mut actions = Vec::new();
         let id = ask.block_id;
         let Some(mut b) = self.blocks.remove(&id) else {
@@ -604,7 +708,8 @@ impl BlockTable {
             return actions;
         }
         b.t_lr_armed = false;
-        if b.phase == Phase::Deferred {
+        let back_to_repair = b.phase == Phase::Deferred;
+        if back_to_repair {
             self.stats.have_mismatch += 1;
             b.phase = Phase::Repair;
             b.deferred_at = None;
@@ -633,6 +738,9 @@ impl BlockTable {
             b.next_row = row;
         }
         self.blocks.insert(id, b);
+        if back_to_repair {
+            self.arm(id);
+        }
         actions
     }
 
@@ -667,6 +775,14 @@ impl BlockTable {
         }
     }
 
+    /// The ledger is done with `bundle_seq`: its verdict was handled (an ACK
+    /// is noted by `on_arrival`). Its tombstone may now be dropped.
+    pub(crate) fn on_ledger_resolved(&mut self, bundle_seq: u32) {
+        if let Some(e) = self.by_bundle.get_mut(&bundle_seq) {
+            e.resolved = true;
+        }
+    }
+
     /// The block whose content outcome a source still owes (`on_verdict` is
     /// `Park` or `Skip`): the loss path retransmits nothing for it. `None` for
     /// a PLAIN bundle, a repair (it carries no records) or an unknown bundle.
@@ -687,13 +803,28 @@ impl BlockTable {
             .is_some_and(|&b| self.on_verdict(b) == VerdictAction::Park)
     }
 
-    /// Service timers: `T_lr`, deadlines, deferral alarms.
+    /// Service timers: `T_lr`, deadlines, deferral alarms. Touches only the
+    /// blocks with a due timer.
     pub(crate) fn on_timer(&mut self, now: Instant, rtt: Rtt) -> Vec<Action> {
+        self.tick(now);
         self.rtt = rtt;
         let mut actions = Vec::new();
-        let mut ids: Vec<BlockId> = self.blocks.keys().copied().collect();
-        ids.sort_by_key(|i| self.blocks[i].born);
-        for id in ids {
+        let mut due_ids: Vec<(u64, BlockId)> = Vec::new();
+        for kind in TIMER_KINDS {
+            let slack = kind.slack(rtt);
+            while let Some(&Reverse((key, id, born))) = self.timers[kind.idx()].peek() {
+                if key + slack > now {
+                    break;
+                }
+                self.timers[kind.idx()].pop();
+                if self.timer_valid(kind, key, id, born) {
+                    due_ids.push((born, id));
+                }
+            }
+        }
+        due_ids.sort_unstable();
+        due_ids.dedup();
+        for (_, id) in due_ids {
             let Some(mut b) = self.blocks.remove(&id) else {
                 continue;
             };
@@ -760,45 +891,97 @@ impl BlockTable {
             }
             self.settle(id, b, now, &mut actions);
         }
+        self.prune_tombstones();
         actions
     }
 
     /// The earliest instant `on_timer` has work, from the last known RTT.
-    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+    /// O(log n) amortised: a min-heap per timer kind, stale entries dropped
+    /// as they reach the top.
+    pub(crate) fn next_deadline(&mut self) -> Option<Instant> {
         let rtt = self.rtt;
         let mut best: Option<Instant> = None;
-        let mut take = |t: Instant| best = Some(best.map_or(t, |c| c.min(t)));
-        for b in self.blocks.values() {
-            match b.phase {
-                Phase::Sending => {}
-                Phase::Repair => {
-                    let Some(last) = b.last_sent else { continue };
-                    if b.t_lr_armed {
-                        take(t_lr_at(last, rtt));
-                    }
-                    for (i, s) in b.sources.iter().enumerate() {
-                        if self.src_open(b, i) {
-                            take(match s.kind {
-                                Kind::Tile => tile_deadline(last, rtt),
-                                Kind::H264 => h264_deadline(last, rtt),
-                            });
-                        }
+        for kind in TIMER_KINDS {
+            while let Some(&Reverse((key, id, born))) = self.timers[kind.idx()].peek() {
+                if !self.timer_valid(kind, key, id, born) {
+                    self.timers[kind.idx()].pop();
+                    continue;
+                }
+                let t = key + kind.slack(rtt);
+                best = Some(best.map_or(t, |c| c.min(t)));
+                break;
+            }
+        }
+        best
+    }
+
+    /// Whether the timer `kind` (key `key`) armed for block `id` (born `born`) still has
+    /// work: the block is there, in the phase, with a source of that kind open.
+    fn timer_valid(&self, kind: TimerKind, key: Instant, id: BlockId, born: u64) -> bool {
+        let Some(b) = self.blocks.get(&id).filter(|b| b.born == born) else {
+            return false;
+        };
+        // The key must be the one the block's own times give now (a block that
+        // went Deferred, back to Repair and Deferred again has a newer
+        // `deferred_at`; the older entry is stale).
+        let base = match kind {
+            TimerKind::TLr | TimerKind::TileRelease | TimerKind::H264Release => b.last_sent,
+            TimerKind::H264Alarm | TimerKind::TDef => b.deferred_at,
+        };
+        if base.map(|t| t + kind.offset()) != Some(key) {
+            return false;
+        }
+        let open_of = |k: Kind| {
+            b.sources
+                .iter()
+                .enumerate()
+                .any(|(i, s)| s.kind == k && self.src_open(b, i))
+        };
+        match kind {
+            TimerKind::TLr => b.phase == Phase::Repair && b.t_lr_armed,
+            TimerKind::TileRelease => b.phase == Phase::Repair && open_of(Kind::Tile),
+            TimerKind::H264Release => b.phase == Phase::Repair && open_of(Kind::H264),
+            TimerKind::H264Alarm => b.phase == Phase::Deferred && open_of(Kind::H264),
+            TimerKind::TDef => b.phase == Phase::Deferred && open_of(Kind::Tile),
+        }
+    }
+
+    /// Arms the timers of block `id` for the phase it is in. Called on entering
+    /// `Repair` and `Deferred` only, so the heaps do not grow with ACKs.
+    fn arm(&mut self, id: BlockId) {
+        let Some(b) = self.blocks.get(&id) else {
+            return;
+        };
+        let mut push: Vec<(TimerKind, Instant)> = Vec::new();
+        let kinds = |k: Kind| b.sources.iter().any(|s| s.kind == k);
+        match b.phase {
+            Phase::Sending => {}
+            Phase::Repair => {
+                let Some(last) = b.last_sent else { return };
+                if b.t_lr_armed {
+                    push.push((TimerKind::TLr, last + TimerKind::TLr.offset()));
+                }
+                for k in [Kind::Tile, Kind::H264] {
+                    if kinds(k) {
+                        let t = TimerKind::release(k);
+                        push.push((t, last + t.offset()));
                     }
                 }
-                Phase::Deferred => {
-                    let Some(at) = b.deferred_at else { continue };
-                    for (i, s) in b.sources.iter().enumerate() {
-                        if self.src_open(b, i) {
-                            take(match s.kind {
-                                Kind::Tile => at + T_DEF,
-                                Kind::H264 => h264_alarm_at(at, rtt),
-                            });
-                        }
+            }
+            Phase::Deferred => {
+                let Some(at) = b.deferred_at else { return };
+                for k in [Kind::Tile, Kind::H264] {
+                    if kinds(k) {
+                        let t = TimerKind::alarm(k);
+                        push.push((t, at + t.offset()));
                     }
                 }
             }
         }
-        best
+        let born = b.born;
+        for (t, key) in push {
+            self.timers[t.idx()].push(Reverse((key, id, born)));
+        }
     }
 
     /// Evict the oldest blocks past the count or byte cap, as `HandedOff`.
@@ -827,6 +1010,7 @@ impl BlockTable {
         self.by_bundle.clear();
         self.by_tile.clear();
         self.tombstones.clear();
+        self.timers = Default::default();
         self.closed.clear();
         self.closed_order.clear();
         self.cached_bytes = 0;
@@ -892,6 +1076,9 @@ impl BlockTable {
                 b.phase = Phase::Deferred;
                 b.deferred_at = Some(now);
                 b.t_lr_armed = false;
+                self.blocks.insert(id, b);
+                self.arm(id);
+                return;
             }
             self.blocks.insert(id, b);
         }
@@ -915,11 +1102,29 @@ impl BlockTable {
     }
 
     fn tombstone(&mut self, bundle_seq: u32) {
-        self.tombstones.push_back(bundle_seq);
-        while self.tombstones.len() > self.tomb_cap {
-            if let Some(old) = self.tombstones.pop_front() {
-                self.by_bundle.remove(&old);
+        self.tombstones.push_back((bundle_seq, self.now));
+        self.prune_tombstones();
+    }
+
+    /// Drops tombstones from the oldest end: resolved ones past
+    /// [`RESOLVED_TOMBSTONES`], any that outlived [`TOMBSTONE_RETENTION`]; then the hard cap, whatever
+    /// they are. An unresolved young entry at the front holds the ones behind it
+    /// (bounded by the retention and the cap).
+    fn prune_tombstones(&mut self) {
+        while let Some(&(seq, at)) = self.tombstones.front() {
+            let over_soft = self.tombstones.len() > RESOLVED_TOMBSTONES;
+            let gone = match self.by_bundle.get(&seq) {
+                None => true,
+                Some(e) => {
+                    (e.resolved && over_soft)
+                        || self.now.saturating_duration_since(at) >= TOMBSTONE_RETENTION
+                }
+            };
+            if !gone && self.tombstones.len() <= self.tomb_cap {
+                break;
             }
+            self.tombstones.pop_front();
+            self.by_bundle.remove(&seq);
         }
     }
 }
@@ -1480,8 +1685,40 @@ mod tests {
                 }
             }
             // drive to the end
-            t.on_timer(now + T_DEF + Duration::from_secs(1), r);
-            t.on_declined(id, k, &[0], now);
+            // Inside the tombstone retention, past every deadline but T_def.
+            let late = now + ms(500);
+            for a in t.on_timer(late, r) {
+                match a {
+                    Action::HandOffTile { records, .. } => {
+                        for x in records {
+                            assert!(released.insert(x.0), "source {} released twice", x.0);
+                        }
+                    }
+                    Action::ContentLostH264 { wire_seq, .. } => {
+                        assert!(
+                            released.insert(wire_seq),
+                            "source {wire_seq} released twice"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            for a in t.on_declined(id, k, &[0], late) {
+                match a {
+                    Action::HandOffTile { records, .. } => {
+                        for x in records {
+                            assert!(released.insert(x.0), "source {} released twice", x.0);
+                        }
+                    }
+                    Action::ContentLostH264 { wire_seq, .. } => {
+                        assert!(
+                            released.insert(wire_seq),
+                            "source {wire_seq} released twice"
+                        );
+                    }
+                    _ => {}
+                }
+            }
             for i in 0..u32::from(k) {
                 let o = t.outcome(base + i).expect("every source has an outcome");
                 let rel = released.contains(&i);
@@ -1493,6 +1730,336 @@ mod tests {
             }
             assert!(!t.is_open(id));
         }
+    }
+
+    /// A block closed through `on_closed` with one acked H.264/tile source
+    /// per block: the churn that fills the old count-based ring.
+    fn churn(t: &mut BlockTable, n: u32, first_id: BlockId, base: u32, now: Instant) {
+        for i in 0..n {
+            let id = first_id + i as BlockId;
+            let bs = base + i;
+            t.on_source_sealed(id, 0, bs, vec![(bs, tile(bs))]);
+            t.on_closed(
+                ClosedBlock {
+                    block_id: id,
+                    k: 1,
+                    r: 0,
+                    symbols: vec![vec![0; 4]],
+                    repair_bundles: vec![],
+                    last_sent: now,
+                },
+                now,
+            );
+            // r = 0: released at once; nothing to ack. Resolve it as the
+            // ledger would.
+            t.on_ledger_resolved(bs);
+        }
+    }
+
+    #[test]
+    fn a_verdict_lagging_past_4096_later_bundles_still_skips() {
+        let t0 = Instant::now();
+        let r = rtt(50);
+        let mut t = setup(2, 1, frag, t0);
+        // Nothing arrives: the deadline releases both H.264 sources to the manager.
+        let a = t.on_timer(h264_deadline(t0, r), r);
+        assert_eq!(losts(&a), 2);
+        assert_eq!(t.on_verdict(100), VerdictAction::Skip);
+        // 5000 later bundles within the 2.6 s the ledger can lag.
+        let later = h264_deadline(t0, r) + ms(2000);
+        churn(&mut t, 5000, 1000, 50_000, later);
+        assert_eq!(
+            t.on_verdict(100),
+            VerdictAction::Skip,
+            "an unresolved bundle outlives the count of later bundles"
+        );
+        // The ledger resolves it, and the churn that follows may drop it.
+        t.on_ledger_resolved(100);
+        t.on_ledger_resolved(101);
+        churn(&mut t, 5000, 7000, 100_000, later);
+        assert_eq!(
+            t.on_verdict(100),
+            VerdictAction::Pass,
+            "resolved entries age out"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_tombstone_goes_at_the_retention_and_the_hard_cap_is_memory_only() {
+        let t0 = Instant::now();
+        let r = rtt(50);
+        let mut t = setup(2, 1, frag, t0);
+        t.on_timer(h264_deadline(t0, r), r);
+        // Younger than the retention: kept. Past it: gone.
+        t.on_timer(t0 + TOMBSTONE_RETENTION - ms(1), r);
+        t.prune_tombstones();
+        assert_eq!(t.on_verdict(100), VerdictAction::Skip);
+        let mut x = BlockTable::new();
+        let t1 = t0 + TOMBSTONE_RETENTION * 2;
+        x.on_source_sealed(1, 0, 5, vec![(5, tile(5))]);
+        x.on_closed(
+            ClosedBlock {
+                block_id: 1,
+                k: 1,
+                r: 0,
+                symbols: vec![vec![0; 4]],
+                repair_bundles: vec![],
+                last_sent: t0,
+            },
+            t0,
+        );
+        assert_eq!(x.on_verdict(5), VerdictAction::Skip);
+        x.on_timer(t1, r);
+        assert_eq!(x.on_verdict(5), VerdictAction::Pass, "past the retention");
+        // The hard cap drops even an unresolved entry.
+        let mut c = BlockTable::with_caps(1024, usize::MAX, 8);
+        churn_unresolved(&mut c, 20, t0);
+        assert_eq!(c.on_verdict(0), VerdictAction::Pass);
+        assert_eq!(c.on_verdict(19), VerdictAction::Skip);
+    }
+
+    fn churn_unresolved(t: &mut BlockTable, n: u32, now: Instant) {
+        for i in 0..n {
+            t.on_source_sealed(i as BlockId, 0, i, vec![(i, tile(i))]);
+            t.on_closed(
+                ClosedBlock {
+                    block_id: i as BlockId,
+                    k: 1,
+                    r: 0,
+                    symbols: vec![vec![0; 4]],
+                    repair_bundles: vec![],
+                    last_sent: now,
+                },
+                now,
+            );
+        }
+    }
+
+    #[test]
+    fn a_mixed_tile_and_h264_bundle_is_an_h264_source() {
+        let t0 = Instant::now();
+        let r = rtt(50);
+        let mut t = BlockTable::new();
+        t.on_source_sealed(BLK, 0, 100, vec![(1000, tile(0)), (1001, frag(1))]);
+        t.on_source_sealed(BLK, 1, 101, vec![(1002, tile(2))]);
+        t.on_closed(
+            ClosedBlock {
+                block_id: BLK,
+                k: 2,
+                r: 1,
+                symbols: vec![vec![0; 4]; 2],
+                repair_bundles: vec![200],
+                last_sent: t0,
+            },
+            t0,
+        );
+        t.set_rtt(r);
+        // T_lr (43 ms + srtt + 2 rttvar) comes first; past it the next is the
+        // H.264 release, ahead of the tile one.
+        t.on_timer(t_lr_at(t0, r), r);
+        assert_eq!(t.next_deadline(), Some(h264_deadline(t0, r)));
+        assert!(h264_deadline(t0, r) < tile_deadline(t0, r), "premise");
+        // At the H.264 deadline the mixed bundle goes (to the manager and to
+        // ARQ); the pure tile source does not.
+        let a = t.on_timer(h264_deadline(t0, r), r);
+        assert_eq!((losts(&a), handoffs(&a)), (1, 1));
+        assert_eq!(t.outcome(100), Some(Outcome::Lost));
+        assert_eq!(t.outcome(101), None);
+    }
+
+    /// The old whole-table walk, for the property test to compare against.
+    fn brute_next_deadline(t: &BlockTable) -> Option<Instant> {
+        let rtt = t.rtt;
+        let mut best: Option<Instant> = None;
+        let mut take = |x: Instant| best = Some(best.map_or(x, |c| c.min(x)));
+        for b in t.blocks.values() {
+            match b.phase {
+                Phase::Sending => {}
+                Phase::Repair => {
+                    let Some(last) = b.last_sent else { continue };
+                    if b.t_lr_armed {
+                        take(t_lr_at(last, rtt));
+                    }
+                    for (i, s) in b.sources.iter().enumerate() {
+                        if t.src_open(b, i) {
+                            take(match s.kind {
+                                Kind::Tile => tile_deadline(last, rtt),
+                                Kind::H264 => h264_deadline(last, rtt),
+                            });
+                        }
+                    }
+                }
+                Phase::Deferred => {
+                    let Some(at) = b.deferred_at else { continue };
+                    for (i, s) in b.sources.iter().enumerate() {
+                        if t.src_open(b, i) {
+                            take(match s.kind {
+                                Kind::Tile => at + T_DEF,
+                                Kind::H264 => h264_alarm_at(at, rtt),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Randomised walk over two blocks of one table: events while a block is
+    /// still `Sending`, eviction, every input, ledger resolution, verdicts.
+    /// Every source ends released at most once, an acked or recovered one is
+    /// never released, a verdict on a retained source is never `Pass`, and the
+    /// heap-driven `next_deadline` equals the brute-force walk.
+    #[test]
+    fn property_exactly_once_with_eviction_sending_events_verdicts_and_retention() {
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut rnd = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let t0 = Instant::now();
+        let r = rtt(40);
+        let mut released_total = 0usize;
+        let mut checked_verdicts = 0usize;
+        for round in 0..300u32 {
+            let mut t = BlockTable::with_caps(1, usize::MAX, FEC_TX_TOMBSTONES);
+            t.set_rtt(r);
+            let ids: [BlockId; 2] = [10, 11];
+            let bases = [10_000u32, 30_000];
+            let ks = [2 + rnd(5) as u8, 2 + rnd(5) as u8];
+            let h264 = [rnd(2) == 0, rnd(2) == 0];
+            let nr = 1 + rnd(2) as u8;
+            let mut released: std::collections::HashMap<u32, u32> = Default::default();
+            let note = |acts: &[Action], released: &mut std::collections::HashMap<u32, u32>| {
+                for a in acts {
+                    match a {
+                        Action::HandOffTile { records, .. } => {
+                            for x in records {
+                                *released.entry(x.0).or_default() += 1;
+                            }
+                        }
+                        Action::ContentLostH264 { wire_seq, .. } => {
+                            *released.entry(*wire_seq).or_default() += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            };
+            for bi in 0..2 {
+                for i in 0..u32::from(ks[bi]) {
+                    let ws = bases[bi] + i;
+                    let c = if h264[bi] { frag(ws) } else { tile(ws) };
+                    t.on_source_sealed(ids[bi], i as u8, ws, vec![(ws, c)]);
+                }
+            }
+            let mut closed = [false; 2];
+            let close = |t: &mut BlockTable, bi: usize, now: Instant| {
+                t.on_closed(
+                    ClosedBlock {
+                        block_id: ids[bi],
+                        k: ks[bi],
+                        r: nr,
+                        symbols: vec![vec![0; 4]; usize::from(ks[bi])],
+                        repair_bundles: (0..u32::from(nr))
+                            .map(|j| 20_000 + 1000 * bi as u32 + j)
+                            .collect(),
+                        last_sent: now,
+                    },
+                    now,
+                )
+            };
+            let mut now = t0;
+            for _ in 0..30 {
+                now += ms(rnd(60));
+                let bi = rnd(2) as usize;
+                let acts = match rnd(10) {
+                    0 => t.on_arrival(bases[bi] + rnd(u64::from(ks[bi])) as u32, now),
+                    1 => t.on_arrival(20_000 + 1000 * bi as u32 + rnd(u64::from(nr)) as u32, now),
+                    2 => t.on_recovered(bases[bi] + rnd(u64::from(ks[bi])) as u32, now),
+                    3 if rnd(3) == 0 => t.on_declined(ids[bi], ks[bi], &[rnd(256) as u8], now),
+                    4 => t.on_request(
+                        RepairAsk {
+                            block_id: ids[bi],
+                            have: rnd(u64::from(ks[bi]) + 1) as u8,
+                            missing: 1,
+                            first_new_idx: 0,
+                        },
+                        now,
+                    ),
+                    5 if !closed[bi] => {
+                        closed[bi] = true;
+                        close(&mut t, bi, now)
+                    }
+                    6 => t.evict_over_cap(),
+                    7 => {
+                        t.on_ledger_resolved(bases[bi] + rnd(u64::from(ks[bi])) as u32);
+                        vec![]
+                    }
+                    _ => t.on_timer(now, r),
+                };
+                note(&acts, &mut released);
+                assert_eq!(t.next_deadline(), brute_next_deadline(&t), "round {round}");
+                for bi in 0..2 {
+                    for i in 0..u32::from(ks[bi]) {
+                        let ws = bases[bi] + i;
+                        let o = t.outcome(ws);
+                        let n = released.get(&ws).copied().unwrap_or(0);
+                        let was_released = matches!(o, Some(Outcome::HandedOff | Outcome::Lost));
+                        assert_eq!(
+                            n,
+                            u32::from(was_released),
+                            "source {ws}: {o:?}, released {n}"
+                        );
+                        let v = t.on_verdict(ws);
+                        match o {
+                            None => assert_eq!(v, VerdictAction::Park, "source {ws} still owes"),
+                            Some(_) => assert_eq!(v, VerdictAction::Skip, "source {ws} is settled"),
+                        }
+                        checked_verdicts += 1;
+                    }
+                }
+            }
+            let late = now + ms(500);
+            for (bi, was_closed) in closed.iter().enumerate() {
+                if !was_closed {
+                    let a = close(&mut t, bi, late);
+                    note(&a, &mut released);
+                }
+            }
+            let a = t.on_timer(late, r);
+            note(&a, &mut released);
+            for bi in 0..2 {
+                let a = t.on_declined(ids[bi], ks[bi], &[0], late);
+                note(&a, &mut released);
+            }
+            let a = t.evict_over_cap();
+            note(&a, &mut released);
+            for bi in 0..2 {
+                for i in 0..u32::from(ks[bi]) {
+                    let ws = bases[bi] + i;
+                    let o = t.outcome(ws).expect("every source has an outcome");
+                    let n = released.get(&ws).copied().unwrap_or(0);
+                    let was_released = matches!(o, Outcome::HandedOff | Outcome::Lost);
+                    assert_eq!(
+                        n,
+                        u32::from(was_released),
+                        "source {ws}: {o:?}, released {n}"
+                    );
+                    released_total += n as usize;
+                    // The tombstone keeps it: a late verdict never passes.
+                    assert_eq!(t.on_verdict(ws), VerdictAction::Skip);
+                    checked_verdicts += 1;
+                }
+                assert!(!t.is_open(ids[bi]));
+            }
+        }
+        assert!(
+            released_total > 100,
+            "premise: releases happened ({released_total})"
+        );
+        assert!(checked_verdicts > 1000);
     }
 
     /// The server's picture of the client's recovery window must be the
