@@ -954,6 +954,8 @@ pub struct IoBridge {
     emitted_meta: HashMap<u32, crate::transport::reliable_emitter::emitter::EmittedDatagram>,
     /// Server-side block state (R6-d); empty with the knob off.
     block_table: crate::transport::fec_tx::block_table::BlockTable,
+    /// The adaptive controller (`FecMode::Adaptive` only).
+    fec_adapt: Option<crate::transport::fec_tx::adapt::FecAdapt>,
     /// Encoded REPAIR frames waiting for admission, oldest first.
     pending_repairs: std::collections::VecDeque<block_tx::RepairJob>,
     block_tx: block_tx::BlockTxStats,
@@ -1626,6 +1628,8 @@ impl IoBridge {
             emitted_meta: HashMap::new(),
             pending_bundles: Default::default(),
             block_table: Default::default(),
+            fec_adapt: (lib_config.transport.fec_mode == crate::config::FecMode::Adaptive)
+                .then(crate::transport::fec_tx::adapt::FecAdapt::new),
             pending_repairs: Default::default(),
             block_tx: Default::default(),
             last_enqueued_was_short: false,
