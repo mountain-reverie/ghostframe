@@ -636,6 +636,21 @@ pub struct InstrumentSummary {
     pub ledger_spurious_lost_records: u64,
     pub k_pkt: u64,
     pub k_pkt_raises: u64,
+    /// FEC blocks, receive side (R6-d D5): hand-offs to ARQ (and the share
+    /// queued), REPAIR_REQUEST entries served and rows sent, DECLINED blocks
+    /// handled, RECOVERED ids and DECLINED records received, requests
+    /// received, and the table's stub (`ContentLostH264`) and `T_lr` counts.
+    pub block_handoffs: u64,
+    pub block_handoff_queued: u64,
+    pub block_requests_served: u64,
+    pub block_request_rows_sent: u64,
+    pub block_declined_handled: u64,
+    pub block_t_lr_fired: u64,
+    pub block_deferral_timeout: u64,
+    pub block_actions_dropped: u64,
+    pub fec_recovered_rx: u64,
+    pub fec_declined_rx: u64,
+    pub fec_repair_requests_rx: u64,
     /// The reordering window now (microseconds), its raises, and the largest
     /// departure gap (microseconds) and count a contradicted verdict showed.
     pub reo_wnd_us: u64,
