@@ -104,6 +104,7 @@ impl IoBridge {
                 let p = &mut self.transport_probe;
                 p.loss_reports += 1;
                 p.report_lost_pre_fec = r.lost_pre_fec;
+                p.report_lost_pre_fec_total += u64::from(r.lost_pre_fec);
                 p.report_recovered = r.recovered;
                 p.report_residual = r.residual_lost;
                 if self.fec_adapt.is_some() {

@@ -138,6 +138,10 @@ impl IoBridge {
             }
         }
         self.apply_fec_live(want);
+        let live = self.fec_live;
+        if let Some(a) = self.fec_adapt.as_mut() {
+            a.note_applied(live);
+        }
     }
 
     /// Bundle kind of a probe-tagged first send: a lone SOURCE only while
