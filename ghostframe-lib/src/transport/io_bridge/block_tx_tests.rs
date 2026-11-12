@@ -181,8 +181,11 @@ async fn a_refused_source_stays_ahead_of_its_repairs_and_a_queued_repair_counts_
     submit_tiles(&mut b, 0, None);
     // A new block's repair, queued behind a refusal.
     b.pending_repairs.push_back(block_tx::RepairJob {
-        bundle_seq: 999,
-        bytes: vec![0u8; 400],
+        block_id: 999,
+        k: 2,
+        r: 1,
+        row: 0,
+        payload: vec![0u8; 400 - ghostframe_protocol::fec::frame::FEC_REPAIR_HEADER_LEN],
     });
     let before = b.unsent_bundle_bytes();
     b.service_pending_repairs();
@@ -437,6 +440,35 @@ async fn a_request_from_a_client_that_does_not_know_k_is_served_to_k() {
         }
     }
     assert_eq!(got, want, "one request round decoded the block");
+}
+
+/// A repair dropped before it reaches quinn (MTU shrink, no session) leaves
+/// no hole in the bundle_seq space: the client counts a hole as lost.
+#[tokio::test]
+async fn a_dropped_repair_leaves_no_bundle_seq_gap() {
+    for no_sink in [false, true] {
+        let mut b = blocks_bridge(64, 5, 2);
+        submit_tiles(&mut b, 10, None);
+        b.drain_reliable_emitter(now_std());
+        b.close_block_on_empty();
+        assert_eq!(b.pending_repairs.len(), 2, "premise: both repairs queued");
+        let (_, seqs, _) = first_block(&b.sent_frames_for_test.clone());
+        let last_source = *seqs.iter().max().unwrap();
+        if no_sink {
+            b.wt_sessions.clear();
+            b.test_wire = None;
+        } else {
+            b.forced_raw_datagram_size_for_test = Some(250);
+        }
+        b.service_pending_repairs();
+        assert!(b.pending_repairs.is_empty());
+        assert_eq!(b.block_tx.repairs_sent, 0, "premise: nothing was sent");
+        assert_eq!(
+            b.packer.alloc_seq(),
+            last_source + 1,
+            "no bundle_seq was spent on a repair that never left (no_sink: {no_sink})"
+        );
+    }
 }
 
 #[tokio::test]

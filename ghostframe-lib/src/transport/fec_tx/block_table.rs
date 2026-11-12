@@ -191,6 +191,10 @@ pub(crate) struct ClosedBlock {
     /// `bundle_seq` of each repair actually sealed, row `i` at index `i`.
     /// Empty: every repair was dropped (MTU shrink) or `k == 255`.
     pub repair_bundles: Vec<u32>,
+    /// Repair rows queued whose `bundle_seq` is allocated when each is sent
+    /// (`register_repair`). With no `repair_bundles` and none queued the block
+    /// has nothing to wait for.
+    pub repairs_queued: usize,
     /// When the last symbol of the block was sent.
     pub last_sent: Instant,
 }
@@ -552,7 +556,7 @@ impl BlockTable {
         b.last_sent = Some(c.last_sent);
         b.phase = Phase::Repair;
         b.t_lr_armed = true;
-        let none_sent = c.repair_bundles.is_empty();
+        let none_sent = c.repair_bundles.is_empty() && c.repairs_queued == 0;
         b.repairs = c.repair_bundles.clone();
         for (row, bs) in c.repair_bundles.iter().enumerate() {
             self.by_bundle.insert(
@@ -1233,6 +1237,7 @@ mod tests {
                 r,
                 symbols: vec![vec![0u8; 10]; usize::from(k)],
                 repair_bundles: (0..u32::from(r)).map(|j| 200 + j).collect(),
+                repairs_queued: 0,
                 last_sent: t0,
             },
             t0,
@@ -1438,6 +1443,7 @@ mod tests {
                 r: 2,
                 symbols: vec![vec![0; 4]; 2],
                 repair_bundles: vec![],
+                repairs_queued: 0,
                 last_sent: t0,
             },
             t0,
@@ -1501,6 +1507,7 @@ mod tests {
                     r: 1,
                     symbols: vec![vec![0; 8]],
                     repair_bundles: vec![base + 5],
+                    repairs_queued: 0,
                     last_sent: t0,
                 },
                 t0,
@@ -1602,6 +1609,7 @@ mod tests {
                     r: 1,
                     symbols: vec![],
                     repair_bundles: vec![9],
+                    repairs_queued: 0,
                     last_sent: t0
                 },
                 t0
@@ -1640,6 +1648,7 @@ mod tests {
                     r: nr,
                     symbols: vec![vec![0; 4]; usize::from(k)],
                     repair_bundles: (0..u32::from(nr)).map(|j| 20_000 + j).collect(),
+                    repairs_queued: 0,
                     last_sent: t0,
                 },
                 t0,
@@ -1746,6 +1755,7 @@ mod tests {
                     r: 0,
                     symbols: vec![vec![0; 4]],
                     repair_bundles: vec![],
+                    repairs_queued: 0,
                     last_sent: now,
                 },
                 now,
@@ -1804,6 +1814,7 @@ mod tests {
                 r: 0,
                 symbols: vec![vec![0; 4]],
                 repair_bundles: vec![],
+                repairs_queued: 0,
                 last_sent: t0,
             },
             t0,
@@ -1828,6 +1839,7 @@ mod tests {
                     r: 0,
                     symbols: vec![vec![0; 4]],
                     repair_bundles: vec![],
+                    repairs_queued: 0,
                     last_sent: now,
                 },
                 now,
@@ -1849,6 +1861,7 @@ mod tests {
                 r: 1,
                 symbols: vec![vec![0; 4]; 2],
                 repair_bundles: vec![200],
+                repairs_queued: 0,
                 last_sent: t0,
             },
             t0,
@@ -1965,6 +1978,7 @@ mod tests {
                         repair_bundles: (0..u32::from(nr))
                             .map(|j| 20_000 + 1000 * bi as u32 + j)
                             .collect(),
+                        repairs_queued: 0,
                         last_sent: now,
                     },
                     now,
