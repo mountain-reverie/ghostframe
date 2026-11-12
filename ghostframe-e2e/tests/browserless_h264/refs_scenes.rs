@@ -76,7 +76,8 @@ fn line(name: &str, seed: u64, r: &BrowserlessResult, o: &H264Outcome) {
     let c = &o.refs;
     println!(
         "{name} {seed:#x}: {} | idr={} recov={}/{} reroots={} anchors={} cand={} overridden={} \
-         refused={} decoded={} holds={} acks_dropped={} | drops={}/{} verdicts p={} idr={}",
+         refused={} decoded={} holds={} acks_dropped={} | drops={}/{} verdicts p={} idr={} \
+         | fec recovered_rx={} declined_rx={} parked={} content_lost decline={} deadline={} suspect={}",
         o.summary(),
         o.idr_made,
         c.recoveries,
@@ -93,6 +94,12 @@ fn line(name: &str, seed: u64, r: &BrowserlessResult, o: &H264Outcome) {
         r.s2c_datagrams_offered,
         r.h264.stats.verdicts_p_frag,
         r.h264.stats.verdicts_idr_frag,
+        r.transport.instr.fec_recovered_rx,
+        r.transport.instr.fec_declined_rx,
+        r.h264.stats.verdicts_parked_by_fec,
+        r.h264.stats.content_lost_decline,
+        r.h264.stats.content_lost_deadline,
+        r.h264.stats.frames_suspect,
     );
 }
 
