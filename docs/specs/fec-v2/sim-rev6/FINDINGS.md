@@ -176,6 +176,115 @@ Share of blocks closed on Empty, their mean k, and the share of source bundles i
   - No change to rules 1-4. Keep rule 3 as written.
 - **Not modelled:** the real emitter's queue also holds retransmissions and control content, which would make Empty rarer; tile bursts and frames share one queue here, as in the sender model, with no priorities.
 
+## 8. R6-e (plan task E1): the T cap, the ladder, the split gate, and the exact tail oracle
+
+**Every number is a model estimate [E].** Scripts: `adapt_oracle.py` (exact tail, `--selftest`, `--vectors`), `adapt_sim.py` (`--part cap|ladder|split|lowrate`, `--selftest`, about 25 min on 12 cores), `adapt_summary.py` (the comparisons quoted here, read from `adapt_sim_out.txt`). `selftest.py` runs both self-tests. The only change to `uniform_sim.py` is the additive `spec["radapt"]`: r per block from `adapt_oracle.r_for` instead of a fixed overhead; existing runs are unaffected.
+
+### Method
+- **r rule.** Every block gets `r_for(k, p, b, 1e-3)` from its own k, with the TRUE (p, b) of the loss process (a perfect estimator; the estimator's error is E3's and E11's). Plan caps: r <= 32; r <= max(1, ceil(k/4)) for k >= 4; the plan lifts the 25 % cap for k < 4 (sim: cap 32). When the target is not reachable inside the cap, r is the cap.
+- **Loss.** Gilbert-Elliott, loss 1 in the bad state, mean burst b, stationary start; b = 1 is i.i.d. (the sim's `ge_chain`). The DP and the sim's chain are the same process, so the DP is the right oracle for a block's consecutive datagrams.
+- **Cells.** `rs_time` T in {5, 10, 15, 20, 25, 28, 33} ms x k_max in {64, 128, 223} x 2 / 10 / 30 / 100 / 200 Mbit/s x {h264, mix} x GE 2 % with b 3 and 8, **5 seeds** (demand, timeline and loss re-drawn), 600 frames (<= 30 Mbit/s) or 300 frames (100, 200 Mbit/s) of video per seed. Ladder cells: 10 / 30 / 100 Mbit/s x p {0.5, 2, 5 %} x b {1, 3, 8}, four notches. Low-rate cells: 2 and 10 Mbit/s, 10 seeds.
+- **Metrics.** late33 / late66 = % of H.264 frames completing more than 1 / 2 frame intervals after the loss-free completion (or never); tile recovery p95 = `tw95` in `adapt_sim_out.txt` (recovered lost tile bundles, ms of FEC delay); residual; overhead = repairs / sources over the whole run.
+- **Seed spread.** A late33 difference is called real only if it exceeds the larger of the two cells' seed ranges (max - min). With 300 to 600 frames per seed one frame is 0.17 to 0.33 point, so ranges of 1 to 4 points are normal for GE cells. Cells inside the spread are **not ranked**.
+- **Oracle self-test** (`adapt_oracle.py --selftest`): i.i.d. against the binomial tail (relative 1e-12), GE distribution sums to 1 and has mean n p, DP against Monte Carlo (5 sigma, four cases where the start state matters), **a DP that starts in the good state fails the same check**, the tail is monotone in r, bursts raise it, and `r_for` is the smallest r (r - 1 misses the target unless the cap bound). Sim self-test: overhead rises with loss, and r = 0 for every block shows residual 4.7 % against 0.08 % under the rule.
+
+### The numbers E3, E4 and E11 consume
+- **Oracle for E4.** `adapt_oracle_vectors.csv`: columns `n,r,p,mean_burst,tail` (tail = P(more than r of n datagrams lost), `%.17g`), 4608 rows over p {0.001, 0.005, 0.01, 0.02, 0.05, 0.1} x mean_burst {1, 1.5, 3, 8} x n {4, 10, 24, 64, 128, 223} x r 1..32. mean_burst 1 is the binomial tail. n = k + r of the block; GE rows start in the stationary state. For r >= n the tail is 0. E4 should compare `r_for` against `adapt_oracle.r_for` through these rows (smallest r with tail <= 1e-3 inside the caps) and must reproduce the `*` cells below.
+- **r_for(k) at target 1e-3** (`*` = target not reachable inside the cap; the value is the cap; k < 4 uncapped as the plan words it):
+
+| b | p | k=1 | 3 | 4 | 10 | 24 | 64 | 128 | 223 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 0.1 % | 1 | 1 | 1 | 1 | 1 | 2 | 2 | 3 |
+| 1 | 0.5 % | 1 | 1 | 1 | 2 | 2 | 3 | 4 | 6 |
+| 1 | 1 % | 1 | 1 | 1 | 2 | 3 | 4 | 6 | 8 |
+| 1 | 2 % | 1 | 2 | 1* | 3 | 4 | 6 | 9 | 13 |
+| 1 | 5 % | 2 | 3 | 1* | 3* | 6 | 11 | 16 | 24 |
+| 1 | 10 % | 3 | 4 | 1* | 3* | 6* | 16* | 28 | 32* |
+| 3 | 0.1 % | 1 | 2 | 1* | 3* | 6 | 8 | 10 | 12 |
+| 3 | 0.5 % | 4 | 6 | 1* | 3* | 6* | 13 | 15 | 18 |
+| 3 | 1 % | 6 | 7 | 1* | 3* | 6* | 15 | 19 | 22 |
+| 3 | 2 % | 8 | 9 | 1* | 3* | 6* | 16* | 23 | 29 |
+| 3 | 5 % | 10 | 12 | 1* | 3* | 6* | 16* | 32* | 32* |
+| 3 | 10 % | 12 | 14 | 1* | 3* | 6* | 16* | 32* | 32* |
+| 8 | 0.1 % | 1 | 2 | 1* | 3* | 6* | 16* | 22 | 26 |
+| 8 | 0.5 % | 13 | 14 | 1* | 3* | 6* | 16* | 32* | 32* |
+| 8 | 2 % | 23 | 25 | 1* | 3* | 6* | 16* | 32* | 32* |
+| 8 | 10 % | 32* | 32* | 1* | 3* | 6* | 16* | 32* | 32* |
+
+  Two facts E4 must carry. (1) **The 25 % cap binds** for any burst of 3 or more at k <= 64 and for b = 8 at every k: the 1e-3 target is not reachable and r is the cap. (2) **The k < 4 exception makes the rule non-monotone**: at b = 3, p = 2 %, k = 3 asks r = 9 (300 % overhead) and k = 4 asks r = 1.
+- **Remove the k < 4 exception** (plan decision 6). `adapt_sim.py --part lowrate`, 10 seeds, 2 Mbit/s, T 20, k_max 64:
+
+| mix | loss | overhead, exception (cap 32) | cap 3 | no exception (cap 1) | late33 (all three) |
+|---|---|---|---|---|---|
+| h264 | GE b3 | 45.9 (44-49) | 42.6 | 39.1 (39-40) | 2.7-2.9, inside the spread |
+| h264 | GE b8 | 55.3 (50-62) | 42.6 | 39.1 | 2.7-3.0 |
+| mix | GE b3 | 74.8 (58-103) | 55.2 | 40.0 (40-40) | 1.6-2.3, inside the spread |
+| mix | GE b8 | 116.7 (80-178) | 55.2 | 40.0 | 2.1-2.3 |
+
+  The extra parity buys no measurable late-frame gain; the overhead is 40 to 117 % against a 25 % cap everywhere else. Recommend `r <= max(1, ceil(k/4))` for every k.
+- **T cap and k_max** (below): T = 20 ms with k_max 128 up to ~60 Mbit/s and 223 above; overhead at 100 / 200 Mbit/s with 223: 14-17 % against 25 % with 128.
+- **Ladder** (below) and the split gate (below).
+
+### (i) Does T <= 20 ms lose against T = 25 / 28 / 33 ms? No, not measurably.
+Comparing T = 20 with T = 25, 28, 33 for every k_max, rate, mix and burst (b 3 and 8), counting only differences larger than both seed ranges:
+- **<= 30 Mbit/s: 107 of 108 comparisons are inside the spread**; one is real (30 Mbit/s h264 b8, k_max 128: T = 33 is 1.7 points better). Other cells at 10 Mbit/s lean the same way (T = 28 lower by 0.7-1.2 points on all four) but inside the spread, so they are not ranked.
+- **100 and 200 Mbit/s: 72 of 72 inside the spread.** At these rates k_max binds long before T (223 bundles are 21 ms at 100 Mbit/s, 10 ms at 200).
+- **Tile recovery p95 is lower with T = 20 than with T = 33** (mix, k_max 128, GE b3): 27.8 against 38.1 ms at 10 Mbit/s and 23.6 against 33.5 ms at 30 Mbit/s (ranges 23.6-33.0 and 33.0-33.7; 30 Mbit/s separates, 10 Mbit/s overlaps), at the price of 2.9 points more overhead at 30 Mbit/s (25.0 against 22.1, ranges do not overlap). At 100 Mbit/s they are equal. So the cap is not only free but buys tile latency.
+- Per cell the best configuration is almost always inside a set of 12-21 of 21 configurations indistinguishable from it (`adapt_summary.py`, part ii); T = 5 ms is the best or tied at 2 Mbit/s only because there the sim's blocks are 1-3 sources and the "best" has 450-830 % overhead (the exception above), which is not a result.
+
+### (ii) The ladder
+Data: late33, mean (seed range), 5 seeds, `n0` = (T_base, 64), `n1` = (10 ms, 128), `n2a` = (20 ms, 128), `n2` = (20 ms, 223). Selected cells (all in `adapt_sim_out.txt`):
+
+| Mbit/s | p, b | n0 | n1 | n2a | n2 |
+|---|---|---|---|---|---|
+| 30 | 0.5 %, 1 | 0.09 (0.31) | 0.09 | 0.00 | 0.00 |
+| 30 | 2 %, 3 | 7.45 (1.69) | 1.97 (1.54) | 0.49 (1.08) | 0.68 |
+| 30 | 2 %, 8 | 10.28 (2.61) | 6.62 (1.54) | 3.02 (0.76) | 3.17 |
+| 30 | 5 %, 8 | 22.37 (4.00) | 15.14 (2.46) | 8.62 (2.16) | 9.02 |
+| 10 | 5 %, 3 | 17.91 (4.15) | 14.02 (1.38) | 6.99 (3.07) | 6.99 |
+| 100 | 2 %, 3 | 1.83 (1.71) | 0.69 (1.71) | 0.29 (0.00) | 0.23 (0.57) |
+| 100 | 5 %, 8 | 28.23 (6.00) | 11.37 (3.43) | 8.74 (3.14) | 12.17 (4.29) |
+
+- **i.i.d. loss (b = 1) needs no widening**: n0 is indistinguishable from the best in 7 of 9 cells (the other two, 10 and 30 Mbit/s at 5 %, take n1) (10 / 30 / 100 Mbit/s x p), and widening only lowers overhead (a 30 Mbit/s 0.5 % cell: 9.2 % for n0 against 4.7 %).
+- **Bursts (b >= 3) need the wide notch**: n0 loses by 7 to 20 points where the difference is real (30 Mbit/s from p = 2 %, 100 Mbit/s p = 5 % and p = 2 % b8), and n1 (T = 10) still loses to n2a where the gap exceeds both ranges: 30 Mbit/s b8 at p 2 % and 5 %, 30 Mbit/s b3 at p 5 %, 10 Mbit/s b3 at p 5 % (30 Mbit/s b3 p 2 % is inside the spread).
+- **k_max 223 against 128** is indistinguishable in late33 everywhere (at <= 30 Mbit/s 20 ms holds fewer than 128 bundles, so they are the same block) but at 100 Mbit/s it cuts overhead from 25 % to 17 % (the 25 % cap bound at 128 and the target is reached with 223 only at b <= 3).
+- **Ladder to implement** (keyed on b_hat as in plan decision 6, with hysteresis up above 1.5 and down below 1.25): b_hat <= 1.5: (T_base, 64); 1.5 < b_hat: (20 ms, k_max = bundles in 20 ms at the source rate, clamped to [64, 223]). **An intermediate (10 ms, 128) notch is not supported by the data**: it is never the unique best, and where it is indistinguishable (b3, p 0.5 %) so is n2a. If E3 keeps three notches it must treat n1 as a transition step only. The loss level p moves r, not the notch: no cell shows p changing which notch wins at fixed b.
+- r at each notch is `r_for(k, p_hat, b_hat)` above. Overhead observed: 5-31 % depending on p, b.
+
+### (iii) What the 20 ms cap costs at 2 Mbit/s, against the design's 28 ms
+10 seeds, k_max 64, `r <= max(1, ceil(k/4))` for all k (no exception), late33 unchanged within the spread:
+
+| mix | loss | overhead T = 20 | T = 28 | difference |
+|---|---|---|---|---|
+| h264 | i.i.d. 2 % | 39.1 (39-40) | 32.4 (32-33) | +6.7 points |
+| h264 | GE b3 | 39.1 | 32.4 | +6.7 |
+| mix | i.i.d. 2 % | 40.0 (40-40) | 34.7 (33-37) | +5.3 |
+| mix | GE b8 | 40.0 | 34.7 | +5.3 |
+
+The cap costs about **+5 to +7 points of overhead at 2 Mbit/s (a 15-21 % relative increase)** and no measurable late-frame change; at 10 Mbit/s the cost is 0 to +2 points. With the plan's k < 4 exception the same cells cost +3 to +21 points but both sides are inflated. Decision 6 keeps T <= 20 ms for R6-e; this is the price of not changing the wire (`T_adv`).
+
+### (iv) The split gate (decision 9)
+Late33 (seed range), overhead, 5 seeds: T = 20 single block (k_max 128 / 223) against the interleaved `a_il` of §6 at rho 0.1 / 0.2 / 0.3.
+
+| Mbit/s | mix | loss | T20 k128 | T20 k223 | a_il 10 % | a_il 20 % | a_il 30 % |
+|---|---|---|---|---|---|---|---|
+| 100 | h264 | b3 | 0.40 (0.28) o 18.7 | 0.06 (0.29) o 14.8 | 1.77 o 10.3 | 0.00 o 20.3 | 0.00 o 30.3 |
+| 100 | h264 | b8 | 1.94 (1.71) o 25.1 | 2.23 (2.85) o 16.9 | 3.94 o 10.3 | 1.09 (0.85) o 20.3 | 0.34 o 30.3 |
+| 100 | mix | b8 | 2.00 (3.43) o 25.2 | 0.97 (2.28) o 17.3 | 5.89 o 10.7 | 2.06 o 20.5 | 0.40 o 30.6 |
+| 200 | h264 | b3 | 0.74 (1.71) o 18.3 | 0.40 (1.14) o 13.7 | 0.80 o 10.3 | 0.00 o 20.3 | 0.00 o 30.3 |
+| 200 | h264 | b8 | 3.77 (2.86) o 25.1 | 4.06 (1.43) o 15.3 | 2.80 o 10.3 | 0.29 (0.86) o 20.3 | 0.11 o 30.3 |
+| 200 | mix | b8 | 2.06 (2.29) o 25.1 | 2.91 (2.57) o 15.4 | 4.40 o 10.6 | 0.63 (0.86) o 20.5 | 0.23 o 30.5 |
+
+- **At 100 Mbit/s: no real gap.** The single capped block at 15-17 % overhead is within the spread of `a_il` at 20 %, and `a_il` at 10 % (lower overhead) is worse.
+- **At 200 Mbit/s with GE b8: a real gap of 3.5 points** (h264: 3.77 / 4.06 against 0.29, both ranges under 3) at a lower overhead for `a_il` (20 %) than the capped block's 25 % (k128). In the mix the gap is 1.4-2.3 points and inside the spread. At b3 the two are the same.
+- **Gate:** the follow-up PR (R6-e2) is justified **only for 150-200 Mbit/s and above under bursty loss**; at <= 100 Mbit/s the capped single block is enough. The single capped block already closes most of §6's gap against the 5 ms / 33 ms defaults (13-19 points there, 3-4 here), because k_max 223 and the DP r do the work. Not measured: 150 Mbit/s, and unequal overhead means the comparison is a bound, not a like-for-like.
+
+### Plan decisions these results contradict or change
+1. **Decision 6, the k < 4 exception to the 25 % cap**: remove it (above). A k = 3 block must not ask for 9 parities.
+2. **Decision 6, `T` and `k_max` ladder in {T_base, 10, 20} x {64, 128, 255 - r_max}**: the 10 ms notch is not supported; k_max should follow the rate (223 above ~60 Mbit/s).
+3. **Decision 6, "r_for ... such that P <= 1e-3"**: it is unreachable inside the 25 % cap for b >= 3 at k <= 64 and for b = 8 everywhere. The cap binds, so the achieved tail there is above 1e-3 and the closed-loop trim and E11 must treat r = cap as "saturated", not as a failure.
+4. **Decision 9** holds for <= 100 Mbit/s; at 200 Mbit/s under burst 8 it does not (follow-up justified).
+
 ## 11. R6-e2 (plan task TB0): where the tile repair bytes go
 
 Measurement only (`the_repair_bytes_are_split_by_cause` in `browserless_fec_adapt.rs`, `FECSPLIT` and `FECCRIT3` lines). Adaptive arm, 10 Mbit/s, 150 ms buffer, 30 s, 5 seeds (`0xFB0001`-`5`), mean ± sd. Every number is a share of the **source wire bytes**, except the rows/k rows, which are shares of source symbols.

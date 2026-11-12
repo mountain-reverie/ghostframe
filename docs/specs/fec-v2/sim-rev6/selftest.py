@@ -55,4 +55,10 @@ assert rlc_case({3, 5}, 1) == 0, "one repair cannot fix two losses"
 two_ok = sum(1 for sd in range(400) if rlc_case({3, 5}, 2, sd) == 2)
 print(f"RLC: 2 losses, 2 repairs, solved in {two_ok}/400 draws (expect ~ 400*(1-1/256) = 399 or 398)")
 assert two_ok >= 390
+
+# 5. R6-e (E1): the exact tail oracle and the adaptive-r simulator carry their own checks.
+import adapt_oracle
+import adapt_sim
+adapt_oracle.selftest()
+adapt_sim.selftest()
 print("selftest ok")

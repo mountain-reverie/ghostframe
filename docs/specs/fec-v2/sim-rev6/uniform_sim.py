@@ -195,7 +195,12 @@ def build_timeline(demand, C, spec, rho, rng):
         blocks.append({"srcs": list(srcs), "reps": [], "code": code, "k": len(srcs)})
         return len(blocks) - 1
 
+    radapt = spec.get("radapt")     # (p, mean_burst, target[, r_cap, small_k_cap]): r per block from the exact tail (adapt_oracle)
+
     def nrep(k):
+        if radapt:
+            import adapt_oracle
+            return adapt_oracle.r_for(k, *radapt)
         return max(rmin, math.ceil(rho * k - 1e-9)) if rho > 0 else 0
 
     def emit(t, items):
