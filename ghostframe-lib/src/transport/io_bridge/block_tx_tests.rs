@@ -93,7 +93,7 @@ async fn tiles_leave_as_sources_and_an_empty_close_sends_repairs_the_real_block_
 }
 
 #[tokio::test]
-async fn a_pump_that_stops_on_tokens_does_not_close_and_the_block_closes_on_t_after() {
+async fn a_pump_that_stops_on_tokens_does_not_close_and_the_next_dry_pump_closes_the_block() {
     let mut b = blocks_bridge(64, 5, 1);
     submit_tiles(&mut b, 3, None);
     b.forced_fifo_depth_for_test = Some(0);
@@ -107,14 +107,15 @@ async fn a_pump_that_stops_on_tokens_does_not_close_and_the_block_closes_on_t_af
     assert_eq!(b.block_tx.repairs_sent, 0);
     assert_eq!(kinds(&b.sent_frames_for_test), ["S"]);
     // Tokens again, and the pump runs dry: it has no open bundle left to mark
-    // LAST (every pump flushed), so the block closes on T.
+    // LAST (every pump flushed), but the block is open and the emitter has
+    // nothing left, so the dry pump closes it (Empty, not T).
     std::thread::sleep(std::time::Duration::from_millis(30));
     for _ in 0..3 {
         b.pump_admission();
     }
-    assert_eq!(b.block_tx.closed_empty, 0);
+    assert_eq!(b.block_tx.closed_empty, 1);
     b.service_blocks(now_std());
-    assert_eq!(b.block_tx.closed_time, 1);
+    assert_eq!(b.block_tx.closed_time, 0);
     assert_eq!(kinds(&b.sent_frames_for_test), ["S", "R"]);
 }
 
