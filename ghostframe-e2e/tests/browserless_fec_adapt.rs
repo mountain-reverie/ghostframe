@@ -91,3 +91,47 @@ async fn a_clean_link_stays_off() {
         assert_eq!(repairs(&r), 0, "seed {seed:#x}");
     }
 }
+
+/// Premises every scene in this file stands on: the client's LOSS_REPORT
+/// reaches the controller, a lossless run reports no loss and keeps the
+/// controller idle, and a lossy one reports loss and moves it.
+#[tokio::test(start_paused = true)]
+async fn premise_loss_reports_arrive_and_count_loss() {
+    for seed in SEEDS {
+        let clean = run_h264_iid(seed, 0.0).await;
+        let c = &clean.transport;
+        println!(
+            "FECA premise clean seed={seed:#x} reports={} lost_pre_fec={} state_engaged={} sized={}",
+            c.loss_reports, c.report_lost_pre_fec_total, c.adapt.engaged, c.adapt.blocks_sized
+        );
+        assert!(c.loss_reports > 0, "seed {seed:#x}: no LOSS_REPORT arrived");
+        assert_eq!(c.report_lost_pre_fec_total, 0, "seed {seed:#x}");
+        assert!(!c.adapt.engaged && c.adapt.changes == 0, "seed {seed:#x}");
+        assert_eq!(c.adapt.blocks_sized, 0, "seed {seed:#x}");
+        assert_eq!(c.adapt.p_hat_ppm, 0, "seed {seed:#x}");
+
+        let lossy = run_h264_iid(seed, 0.03).await;
+        let l = &lossy.transport;
+        println!(
+            "FECA premise 3% seed={seed:#x} reports={} lost_pre_fec={} p_hat_ppm={} changes={} sized={} saturated={} r8={} r64={} k_max={} t_ms={} skips={} trim={}",
+            l.loss_reports, l.report_lost_pre_fec_total, l.adapt.p_hat_ppm, l.adapt.changes,
+            l.adapt.blocks_sized, l.adapt.saturated, l.adapt.r_at_k8, l.adapt.r_at_k64,
+            l.adapt.k_max, l.adapt.t_ms, l.adapt.congestion_skips, l.adapt.trim_steps
+        );
+        assert!(l.loss_reports > 0, "seed {seed:#x}");
+        assert!(l.report_lost_pre_fec_total > 0, "seed {seed:#x}");
+        assert!(l.adapt.engaged, "seed {seed:#x}");
+        assert!(
+            l.adapt.p_hat_ppm > 0 && l.adapt.b_hat_x100 >= 100,
+            "seed {seed:#x}"
+        );
+        assert!(l.adapt.changes >= 1, "seed {seed:#x}");
+        assert!(l.adapt.blocks_sized > 0, "seed {seed:#x}");
+        assert!(l.adapt.saturated <= l.adapt.blocks_sized, "seed {seed:#x}");
+        assert!(
+            l.adapt.r_at_k8 >= 1 && l.adapt.r_at_k64 >= l.adapt.r_at_k8,
+            "seed {seed:#x}"
+        );
+        assert!(l.adapt.k_max > 0 && l.adapt.t_ms > 0, "seed {seed:#x}");
+    }
+}

@@ -114,7 +114,7 @@ pub(crate) fn r_for_target(k: u32, p: f64, b: f64, target: f64) -> RDecision {
 /// Memoised `r_for`. The memo is cleared when the quantised `(p, b)` moves
 /// and evaluates at the `(p, b)` that opened the cell (0.5 % in `p`, 0.05 in
 /// `b`), so a lookup is O(1) once warm.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RSizer {
     key: Option<(i32, i32)>,
     p: f64,
@@ -283,6 +283,7 @@ pub(crate) struct DeclinedTrim {
     filled: usize,
     declined: usize,
     active: bool,
+    steps: u64,
 }
 
 impl DeclinedTrim {
@@ -293,6 +294,7 @@ impl DeclinedTrim {
             filled: 0,
             declined: 0,
             active: false,
+            steps: 0,
         }
     }
 
@@ -308,11 +310,17 @@ impl DeclinedTrim {
         if self.filled == FEC_ADAPT_TRIM_WINDOW {
             let share = self.declined as f64 / FEC_ADAPT_TRIM_WINDOW as f64;
             if share > 0.01 {
+                self.steps += u64::from(!self.active);
                 self.active = true;
             } else if share < 0.005 {
                 self.active = false;
             }
         }
+    }
+
+    /// Times the trim switched on (cumulative).
+    pub(crate) fn steps(&self) -> u64 {
+        self.steps
     }
 
     /// 0 or 1: what to add to `r`.
