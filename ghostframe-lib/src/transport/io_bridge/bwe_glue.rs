@@ -502,11 +502,14 @@ impl IoBridge {
     /// for anything the clock called overdue, whether the path was dropping or
     /// only queueing.
     pub(super) fn expire_transmissions(&mut self, now: std::time::Instant) {
+        let table = &self.block_table;
         let out = crate::transport::loss_path::detect(
             &mut self.transmission_ledger,
             &mut self.reliable_emitter,
             now,
+            |b| table.protected_block(b),
         );
+        self.block_tx.protected_timer_suppressed += out.protected_suppressed;
         self.instr.losses_declared += out.lost.len() as u64;
         self.instr.loss_retx_requested += out.retx_queued;
         self.note_h264_verdicts(&out.lost, now);
@@ -551,13 +554,23 @@ impl IoBridge {
 
     /// Run the probe timeout if it is due (see `loss_path::probe`).
     pub(super) fn poll_pto(&mut self, now: std::time::Instant) {
+        let table = &self.block_table;
         let Some(out) = crate::transport::loss_path::probe(
             &mut self.transmission_ledger,
             &mut self.reliable_emitter,
             now,
+            |b| table.protected_block(b),
         ) else {
             return;
         };
+        self.block_tx.protected_timer_suppressed += out.protected_suppressed;
+        self.block_tx.pto_repair_asks += out.repair_asks.len() as u64;
+        let mut actions = Vec::new();
+        for block in &out.repair_asks {
+            actions.extend(self.block_table.on_pto(*block));
+        }
+        self.block_tx.pto_repair_rows += actions.len() as u64;
+        self.execute_block_actions(actions);
         self.instr.pto_probes_requested += out.retx_queued;
         self.instr.losses_declared += out.lost.len() as u64;
         self.h264.stats.tx_forgotten += out.forgotten_h264_records;
