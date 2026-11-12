@@ -274,7 +274,7 @@ async fn a_lossy_scene_with_blocks_on_runs_the_receive_side_and_converges() {
     println!(
         "BLOCKSLOSS recovered_rx={} declined_rx={} handoffs={} handoff_queued={} \
          requests_rx={} requests_served={} rows_sent={} t_lr={} deferral_timeout={} \
-         block_actions_dropped={} loss_path_resends={} protected_suppressed={} \
+         block_content_lost_h264={} loss_path_resends={} protected_suppressed={} \
          pto_repair_rows={} nack_on_protected={}",
         i.fec_recovered_rx,
         i.fec_declined_rx,
@@ -285,7 +285,7 @@ async fn a_lossy_scene_with_blocks_on_runs_the_receive_side_and_converges() {
         i.block_request_rows_sent,
         i.block_t_lr_fired,
         i.block_deferral_timeout,
-        i.block_actions_dropped,
+        i.block_content_lost_h264,
         r.loss_path_resends,
         i.block_protected_timer_suppressed,
         i.block_pto_repair_rows,
@@ -307,7 +307,7 @@ async fn a_lossy_scene_with_blocks_on_runs_the_receive_side_and_converges() {
         "the loss path saw protected sources and left them to their block"
     );
     assert_eq!(i.block_deferral_timeout, 0);
-    assert_eq!(i.block_actions_dropped, 0, "no H.264 here");
+    assert_eq!(i.block_content_lost_h264, 0, "no H.264 here");
     let present = (0..16u8)
         .flat_map(|x| (0..16u8).map(move |y| (x, y)))
         .filter(|&(x, y)| r.framebuffer.tile_rgba(x, y).is_some())

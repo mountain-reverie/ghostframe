@@ -356,7 +356,7 @@ impl IoBridge {
             block_nack_on_protected: self.block_tx.nack_on_protected,
             block_t_lr_fired: self.block_table.stats().t_lr_fired,
             block_deferral_timeout: self.block_table.stats().deferral_alarm_h264,
-            block_actions_dropped: self.block_tx.content_lost_h264_stub,
+            block_content_lost_h264: self.block_tx.content_lost_h264,
             fec_recovered_rx: self.fec_in.recovered_rx,
             fec_declined_rx: self.fec_in.declined_rx,
             fec_repair_requests_rx: self.fec_in.repair_requests_rx,
