@@ -1155,23 +1155,35 @@ async fn adapt_tick_releases_on_a_quiet_link_after_the_dwell() {
 }
 
 #[tokio::test]
-async fn five_percent_loss_is_not_gated_without_a_queue_or_a_congestion_event_and_is_with_one() {
+async fn five_percent_loss_engages_even_with_congestion_events_rising_and_a_standing_queue_gates_it(
+) {
+    // A rise of quinn's congestion events alone is not congestion.
     let mut a = adaptive_bridge();
-    send_report(&mut a, 1000, 0, [0; 8]);
+    for _ in 0..4 {
+        send_report(&mut a, 1000, 0, [0; 8]);
+        a.transport_probe.congestion_events += 3;
+    }
+    a.transport_probe.congestion_events += 3;
     send_report(&mut a, 950, 50, [50, 0, 0, 0, 0, 0, 0, 0]);
     let ea = a.fec_adapt.as_ref().unwrap().estimator();
-    assert_eq!(ea.reports_seen(), 2);
+    assert_eq!(ea.reports_seen(), 5);
     assert_eq!(ea.congestion_skips(), 0);
-    assert!(a.fec_live.is_some(), "not gated: engaged");
+    assert!(a.fec_live.is_some(), "CE rising alone: engaged");
 
-    let mut g = adaptive_bridge();
-    send_report(&mut g, 1000, 0, [0; 8]);
-    g.transport_probe.congestion_events += 1;
-    send_report(&mut g, 950, 50, [50, 0, 0, 0, 0, 0, 0, 0]);
-    let eg = g.fec_adapt.as_ref().unwrap().estimator();
-    assert_eq!(eg.reports_seen(), 2);
-    assert_eq!(eg.congestion_skips(), 1, "the rise gated the interval");
-    assert!(g.fec_live.is_none(), "gated: stays clean");
+    // The delay signal gates the same report.
+    let mut g = crate::transport::fec_tx::adapt::FecAdapt::new();
+    let lr = ghostframe_protocol::fec::feedback::LossReport {
+        received: 950,
+        lost_pre_fec: 50,
+        ..Default::default()
+    };
+    g.on_report(&lr, true, 1);
+    assert_eq!(g.estimator().reports_seen(), 1);
+    assert_eq!(g.estimator().congestion_skips(), 1, "standing queue gates");
+    assert_eq!(
+        g.estimator().state(),
+        crate::transport::fec_tx::adapt::FloorState::Clean
+    );
 }
 
 #[tokio::test]
