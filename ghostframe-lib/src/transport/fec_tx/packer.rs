@@ -295,6 +295,11 @@ impl Packer {
         }
     }
 
+    /// Id of the block still taking sources, if it has any.
+    pub(crate) fn open_block_id(&self) -> Option<u16> {
+        (self.builder.len() > 0).then(|| self.builder.peek().0)
+    }
+
     /// Blocks closed since the last call, oldest first.
     pub(crate) fn take_closed(&mut self) -> SmallVec<[ClosedBlock; 1]> {
         std::mem::take(&mut self.closed)

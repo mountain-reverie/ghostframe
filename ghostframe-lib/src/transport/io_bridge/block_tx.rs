@@ -2,14 +2,17 @@
 //! blocks into the [`BlockTable`], encodes repairs at close, and admits them
 //! through the same gate as any record.
 //!
-//! Receive handling (arrivals, RECOVERED, DECLINED, REPAIR_REQUEST, deadline
-//! release) is D5, so the table's actions are counted and dropped here: a lost
-//! source still retransmits through the loss path, which is redundant and
-//! correct until D6.
+//! The receive side (D5) feeds the same table: arrivals, RECOVERED, DECLINED,
+//! REPAIR_REQUEST and the deadline release all end in
+//! [`IoBridge::execute_block_actions`]. A lost source still also retransmits
+//! through the loss path, which is redundant and correct until D6.
 
 use super::*;
-use crate::transport::fec_tx::block_table::{ClosedBlock as TableBlock, FEC_TX_MAX_BLOCKS};
+use crate::transport::fec_tx::block_table::{
+    Action, AlarmKind, BlockId, ClosedBlock as TableBlock, Rtt, FEC_TX_MAX_BLOCKS,
+};
 use crate::transport::fec_tx::packer::{BundleKind, SealedBundle};
+use crate::transport::reliable_emitter::{RetxCause, RetxRequest};
 use ghostframe_protocol::fec::frame::{RepairFrame, FEC_REPAIR_HEADER_LEN};
 
 /// Why the packer closed a block.
@@ -19,6 +22,8 @@ pub(super) enum CloseWhy {
     Time,
     Empty,
     Mtu,
+    /// The client gave up on the block while it was still taking sources.
+    Declined,
 }
 
 /// An encoded REPAIR frame waiting for admission. Its `bundle_seq` was
@@ -42,8 +47,20 @@ pub(super) struct BlockTxStats {
     pub(super) repairs_queued_peak: u64,
     pub(super) repairs_dropped_mtu: u64,
     pub(super) encode_failed: u64,
-    /// Table actions D4b does not execute (hand-offs, manager notices).
-    pub(super) actions_dropped: u64,
+    pub(super) closed_declined: u64,
+    /// `ContentLostH264` actions: D7 makes them real, until then counted and
+    /// dropped (never a ledger verdict).
+    pub(super) content_lost_h264_stub: u64,
+    /// Tile records handed to ARQ, and the share the emitter queued.
+    pub(super) handoffs: u64,
+    pub(super) handoff_queued: u64,
+    /// REPAIR_REQUEST entries that produced rows, and the rows.
+    pub(super) requests_served: u64,
+    pub(super) request_rows_sent: u64,
+    pub(super) declined_handled: u64,
+    /// Repair rows the table asked for whose block had no symbols left.
+    pub(super) repair_rows_no_block: u64,
+    pub(super) alarms: u64,
 }
 
 impl IoBridge {
@@ -65,7 +82,7 @@ impl IoBridge {
         let actions = self
             .block_table
             .on_source_sealed(block_id, idx, b.bundle_seq, records);
-        self.block_tx.actions_dropped += actions.len() as u64;
+        self.execute_block_actions(actions);
     }
 
     /// Takes the blocks the packer closed, encodes their repairs into
@@ -84,16 +101,25 @@ impl IoBridge {
         let max_dg = self.live_max_dg();
         for c in closed {
             let k = c.k;
-            let why = forced.unwrap_or(if usize::from(k) >= usize::from(params.k_max) {
-                CloseWhy::KMax
+            let why = if self.block_table.closed_reason(c.block_id).is_some() {
+                CloseWhy::Declined
             } else {
-                CloseWhy::Empty
-            });
+                forced.unwrap_or(if usize::from(k) >= usize::from(params.k_max) {
+                    CloseWhy::KMax
+                } else {
+                    CloseWhy::Empty
+                })
+            };
             match why {
                 CloseWhy::KMax => self.block_tx.closed_kmax += 1,
                 CloseWhy::Time => self.block_tx.closed_time += 1,
                 CloseWhy::Empty => self.block_tx.closed_empty += 1,
                 CloseWhy::Mtu => self.block_tx.closed_mtu += 1,
+                CloseWhy::Declined => self.block_tx.closed_declined += 1,
+            }
+            if self.block_table.closed_reason(c.block_id).is_some() {
+                // Declined while it was still sending: nothing to repair.
+                continue;
             }
             self.block_tx.k_sum += u64::from(k);
             let r = params.r.min(255 - k);
@@ -144,9 +170,177 @@ impl IoBridge {
                 now,
             );
             let evicted = self.block_table.evict_over_cap();
-            self.block_tx.actions_dropped += (actions.len() + evicted.len()) as u64;
+            self.execute_block_actions(actions);
+            self.execute_block_actions(evicted);
         }
         debug_assert!(self.block_table.open_blocks() <= FEC_TX_MAX_BLOCKS);
+    }
+
+    /// Runs what the table decided: encodes repair rows (one call per block),
+    /// hands tile content to ARQ as PLAIN `Handoff` retransmits, tells the
+    /// H.264 manager (D7; a counted stub until then), logs alarms.
+    pub(super) fn execute_block_actions(&mut self, actions: Vec<Action>) {
+        if actions.is_empty() {
+            return;
+        }
+        let mut rows: Vec<(BlockId, Vec<u8>)> = Vec::new();
+        for a in actions {
+            match a {
+                Action::Repair { block_id, row } => {
+                    match rows.iter_mut().find(|(id, _)| *id == block_id) {
+                        Some((_, r)) => r.push(row),
+                        None => rows.push((block_id, vec![row])),
+                    }
+                }
+                Action::HandOffTile { records, .. } => {
+                    for (ws, content) in records {
+                        self.block_tx.handoffs += 1;
+                        let r = self.reliable_emitter.request_retransmit(
+                            content,
+                            ws,
+                            RetxCause::Handoff,
+                        );
+                        if r == RetxRequest::Queued {
+                            self.block_tx.handoff_queued += 1;
+                        }
+                    }
+                }
+                Action::ContentLostH264 { .. } => self.block_tx.content_lost_h264_stub += 1,
+                Action::Alarm { block_id, kind } => {
+                    self.block_tx.alarms += 1;
+                    match kind {
+                        AlarmKind::TDef => tracing::warn!(
+                            target: LOG_TARGET,
+                            block_id,
+                            "FEC block deferred past T_def; content handed off"
+                        ),
+                        AlarmKind::DeferralTimeout => tracing::debug!(
+                            target: LOG_TARGET,
+                            block_id,
+                            "FEC block deferred too long (H.264); content lost to the manager"
+                        ),
+                    }
+                }
+            }
+        }
+        for (id, r) in rows {
+            self.queue_repair_rows(id, &r);
+        }
+    }
+
+    /// Encodes `rows` of block `id` from the table's symbols in one call and
+    /// queues each as a repair job (admitted by `service_pending_repairs`).
+    fn queue_repair_rows(&mut self, id: BlockId, rows: &[u8]) {
+        let (Some((k, r)), Some(symbols)) =
+            (self.block_table.params(id), self.block_table.symbols(id))
+        else {
+            self.block_tx.repair_rows_no_block += rows.len() as u64;
+            return;
+        };
+        let refs: Vec<&[u8]> = symbols.iter().map(Vec::as_slice).collect();
+        let payloads = match ghostframe_protocol::fec::codec::encode_repairs(&refs, rows) {
+            Ok(p) => p,
+            Err(e) => {
+                self.block_tx.encode_failed += 1;
+                tracing::warn!(target: LOG_TARGET, error = %e, "FEC repair encode failed");
+                return;
+            }
+        };
+        for (&row, payload) in rows.iter().zip(&payloads) {
+            let bundle_seq = self.packer.alloc_seq();
+            let bytes = RepairFrame {
+                bundle_seq,
+                block_id: id,
+                k,
+                r,
+                repair_idx: row,
+                payload,
+            }
+            .encode();
+            self.pending_repairs
+                .push_back(RepairJob { bundle_seq, bytes });
+            self.block_table.register_repair(id, row, bundle_seq);
+        }
+        self.block_tx.repairs_queued_peak = self
+            .block_tx
+            .repairs_queued_peak
+            .max(self.pending_repairs.len() as u64);
+    }
+
+    /// The path numbers the table's deadlines are built from.
+    fn block_rtt(&self) -> Rtt {
+        let e = &self.reliable_emitter.rtt;
+        Rtt {
+            srtt: e.srtt(),
+            rttvar: e.rttvar(),
+            max_ack_delay: e.max_ack_delay(),
+        }
+    }
+
+    /// ACK arrivals for the blocks (every entry, live or late).
+    pub(super) fn blocks_on_arrivals(&mut self, entries: &[(u32, u16)]) {
+        if self.fec_blocks.is_none() {
+            return;
+        }
+        let now = now_std();
+        for &(id, _) in entries {
+            let a = self.block_table.on_arrival(id, now);
+            self.execute_block_actions(a);
+        }
+    }
+
+    /// RECOVERED named these bundles: sources the client rebuilt.
+    pub(super) fn blocks_on_recovered(&mut self, ids: &[u32]) {
+        if self.fec_blocks.is_none() {
+            return;
+        }
+        let now = now_std();
+        for &id in ids {
+            let a = self.block_table.on_recovered(id, now);
+            self.execute_block_actions(a);
+        }
+    }
+
+    /// DECLINED: every unaccounted source is handed off (the bitmap is only
+    /// a cross-check). A block still taking sources closes in the packer so
+    /// no later source joins it.
+    pub(super) fn blocks_on_declined(&mut self, block_id: u16, k: u8, missing: &[u8]) {
+        if self.fec_blocks.is_none() {
+            return;
+        }
+        let now = now_std();
+        let was_open = self.block_table.is_open(block_id);
+        let a = self.block_table.on_declined(block_id, k, missing, now);
+        if was_open {
+            self.block_tx.declined_handled += 1;
+        }
+        self.execute_block_actions(a);
+        if self.packer.open_block_id() == Some(block_id) && self.packer.close_now() {
+            self.process_closed_blocks(Some(CloseWhy::Declined));
+        }
+    }
+
+    /// REPAIR_REQUEST entries: fresh rows, capped at `r + 4` per block.
+    pub(super) fn blocks_on_repair_request(
+        &mut self,
+        asks: &[ghostframe_protocol::fec::feedback::RepairAsk],
+    ) {
+        if self.fec_blocks.is_none() {
+            return;
+        }
+        let now = now_std();
+        for &ask in asks {
+            let a = self.block_table.on_request(ask, now);
+            let rows = a
+                .iter()
+                .filter(|x| matches!(x, Action::Repair { .. }))
+                .count() as u64;
+            if rows > 0 {
+                self.block_tx.requests_served += 1;
+                self.block_tx.request_rows_sent += rows;
+            }
+            self.execute_block_actions(a);
+        }
     }
 
     /// Admits queued repairs, oldest first, as `Critical` bytes, and seals
@@ -228,7 +422,19 @@ impl IoBridge {
         if self.packer.close_if_due(now_us) {
             self.process_closed_blocks(Some(CloseWhy::Time));
         }
+        let rtt = self.block_rtt();
+        self.block_table.set_rtt(rtt);
+        if self.block_table.next_deadline().is_some_and(|d| d <= now) {
+            let a = self.block_table.on_timer(now, rtt);
+            self.execute_block_actions(a);
+        }
         self.service_pending_repairs();
+    }
+
+    /// The earliest block deadline (`T_lr`, release, alarms), for
+    /// `next_wake_deadline`.
+    pub(super) fn block_release_deadline(&self) -> Option<std::time::Instant> {
+        self.block_table.next_deadline()
     }
 
     /// When the open block's T elapses, for `next_wake_deadline`.

@@ -225,6 +225,8 @@ struct Block {
     released: usize,
     next_row: u16,
     extra_used: u16,
+    /// `bundle_seq` of each repair registered, so closing is O(repairs).
+    repairs: Vec<u32>,
     last_sent: Option<Instant>,
     deferred_at: Option<Instant>,
     t_lr_armed: bool,
@@ -317,6 +319,32 @@ impl BlockTable {
     pub(crate) fn outcome(&self, bundle_seq: u32) -> Option<Outcome> {
         self.by_bundle.get(&bundle_seq).and_then(|e| e.outcome)
     }
+    /// `(k, r)` of a closed-for-sources block still held (rows are encoded
+    /// with these in the header).
+    pub(crate) fn params(&self, block_id: BlockId) -> Option<(u8, u8)> {
+        self.blocks
+            .get(&block_id)
+            .filter(|b| b.phase != Phase::Sending)
+            .map(|b| (b.k, b.r))
+    }
+
+    /// An extra repair row (request, PTO, `T_lr`) was sealed as `bundle_seq`,
+    /// so its ACK counts towards held(B). A block no longer open ignores it.
+    pub(crate) fn register_repair(&mut self, block_id: BlockId, row: u8, bundle_seq: u32) {
+        let Some(b) = self.blocks.get_mut(&block_id) else {
+            return;
+        };
+        b.repairs.push(bundle_seq);
+        self.by_bundle.insert(
+            bundle_seq,
+            Entry {
+                block_id,
+                role: Role::Repair { row },
+                outcome: None,
+            },
+        );
+    }
+
     pub(crate) fn is_open(&self, block_id: BlockId) -> bool {
         self.blocks.contains_key(&block_id)
     }
@@ -362,6 +390,7 @@ impl BlockTable {
             released: 0,
             next_row: 0,
             extra_used: 0,
+            repairs: Vec::new(),
             last_sent: None,
             deferred_at: None,
             t_lr_armed: false,
@@ -406,6 +435,7 @@ impl BlockTable {
         b.phase = Phase::Repair;
         b.t_lr_armed = true;
         let none_sent = c.repair_bundles.is_empty();
+        b.repairs = c.repair_bundles.clone();
         for (row, bs) in c.repair_bundles.iter().enumerate() {
             self.by_bundle.insert(
                 *bs,
@@ -815,14 +845,7 @@ impl BlockTable {
         for s in &b.sources {
             self.tombstone(s.bundle_seq);
         }
-        // Repair entries: find them by id (few, tombstone by scan).
-        let repairs: Vec<u32> = self
-            .by_bundle
-            .iter()
-            .filter(|(_, e)| e.block_id == id && matches!(e.role, Role::Repair { .. }))
-            .map(|(k, _)| *k)
-            .collect();
-        for r in repairs {
+        for &r in &b.repairs {
             self.tombstone(r);
         }
         self.closed.insert(id, why);
