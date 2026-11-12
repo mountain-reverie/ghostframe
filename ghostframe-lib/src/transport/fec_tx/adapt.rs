@@ -205,9 +205,6 @@ pub(crate) struct FecAdapt {
     ladder: Ladder,
     sizer: RSizer,
     trim: DeclinedTrim,
-    /// quinn's `congestion_events` at the previous report (`None` before the
-    /// first, which therefore never counts as a rise).
-    last_congestion_events: Option<u64>,
     was_engaged: bool,
 }
 
@@ -218,27 +215,25 @@ impl FecAdapt {
             ladder: Ladder::new(),
             sizer: RSizer::new(),
             trim: DeclinedTrim::new(),
-            last_congestion_events: None,
             was_engaged: false,
         }
     }
 
-    /// Fold in a LOSS_REPORT. The interval is *congested* when a standing
-    /// queue holds or quinn's congestion events rose since the previous
-    /// report (plan decision 4). Never `is_limited()`: goog_cc is loss-limited
-    /// under plain random loss too.
-    pub(crate) fn on_report(
-        &mut self,
-        r: &LossReport,
-        standing_queue: bool,
-        congestion_events: u64,
-        now_us: u64,
-    ) {
-        let rose = self
-            .last_congestion_events
-            .is_some_and(|prev| congestion_events > prev);
-        self.last_congestion_events = Some(congestion_events);
-        self.est.on_report(r, standing_queue || rose, now_us);
+    /// Fold in a LOSS_REPORT. The interval is *congested* only when the delay
+    /// signal says so: a standing queue holds (`bwe.standing_queue()`).
+    ///
+    /// quinn's `congestion_events` is deliberately not read, alone or
+    /// otherwise: under Cubic it is loss by another name. Under random loss
+    /// Cubic declares an event on almost every loss (measured: a rise on nearly
+    /// every report at 5 % i.i.d., so gating on it never engaged), and on a
+    /// policed, shallow-buffer link the loss looks random. A rise that
+    /// coincides with the delay signal adds nothing, since the standing queue
+    /// already gates it. Nor `is_limited()`: goog_cc is loss-limited under
+    /// plain random loss too. On a policed link goog_cc's loss-based estimator
+    /// lowers the rate and the encoder target pays for the repair overhead
+    /// (E6), so engaging FEC there is acceptable.
+    pub(crate) fn on_report(&mut self, r: &LossReport, standing_queue: bool, now_us: u64) {
+        self.est.on_report(r, standing_queue, now_us);
     }
 
     /// Time passes: decay, re-check the release, and read the declined
