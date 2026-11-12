@@ -419,11 +419,17 @@ impl IoBridge {
     }
 
     /// The Empty close at the tail of a pump: the last open bundle is sealed
-    /// as LAST and its block closes.
+    /// as LAST and its block closes; with no open bundle, an open block
+    /// (its sources sealed in earlier pumps) closes without LAST.
     pub(super) fn close_block_on_empty(&mut self) {
         let now_us = self.reliable_emitter.emit_us64(now_std());
         if let Some(b) = self.packer.flush_closing(now_us) {
             self.queue_bundles(smallvec::SmallVec::from_elem(b, 1));
+        } else if self.packer.close_now() {
+            // Every source of the block was sealed in an earlier pump: no
+            // bundle left to carry LAST, but the emitter has nothing more, so
+            // the block closes now (rev 6 4 rule 3), not on T.
+            self.process_closed_blocks(Some(CloseWhy::Empty));
         }
         self.drive_pending_bundles();
     }
