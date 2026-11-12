@@ -1107,7 +1107,7 @@ impl IoBridge {
     /// The rate policy for a frame on an acked-reference session. The encoder
     /// changes rate in place, so a change is a plain rate update: no IDR, no
     /// reopen, no GOP ([`RatePolicy::step_in_place`]).
-    fn h264_rate_step_refs(&mut self, now: Instant) {
+    pub(super) fn h264_rate_step_refs(&mut self, now: Instant) {
         while self
             .h264
             .rate_send_times
@@ -1138,6 +1138,15 @@ impl IoBridge {
             since.is_some_and(|t| now.saturating_duration_since(t) >= SPIKE_QUEUE_PERSIST);
         let distress = snap.stats.loss_state.is_limited() || queue_persists;
         let before = self.h264.rate.applied();
+        // The planned repair overhead is paid out of the media rate, not out
+        // of the estimate the policy reads (see `RatePolicy::set_overhead`).
+        let rho = {
+            let (src, rep) = (self.block_tx.source_bytes, self.block_tx.repair_bytes);
+            let now_us = self.reliable_emitter.emit_us64(now);
+            let live = self.fec_live.is_some();
+            self.block_tx.rho.update(now_us, src, rep, live)
+        };
+        self.h264.rate.set_overhead(rho);
         let apply = self.h264.rate.step_in_place(now, estimate, distress);
         let Some(apply) = apply else {
             return;
