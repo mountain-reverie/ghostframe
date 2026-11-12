@@ -426,7 +426,7 @@ impl IoBridge {
                     // The bucket refills by time alone; nothing else will
                     // wake the loop for it.
                     let need = if let Some(j) = self.pending_repairs.front() {
-                        j.bytes.len() + framing
+                        j.len() + framing
                     } else if self.reliable_emitter.emission_queue_len() > 0 {
                         mtu
                     } else {
