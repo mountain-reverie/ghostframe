@@ -83,9 +83,34 @@ pub(super) struct BlockTxStats {
 }
 
 impl IoBridge {
-    /// Bundle kind of a probe-tagged first send: a lone SOURCE with blocks on.
+    /// Block machinery on (`fec_mode`), as opposed to blocks being live now
+    /// (`fec_live`): blocks and repairs sent earlier stay outstanding while
+    /// the live parameters are `None`, so the table and ACK hooks follow this.
+    pub(super) fn fec_machinery(&self) -> bool {
+        self.fec_mode.machinery()
+    }
+
+    /// Switches the live block parameters at a block boundary: the open block
+    /// closes under the parameters it was built with (so `process_closed_blocks`
+    /// still reads its `r`), then `params` take over. Setting `None` first
+    /// would drop that block's repairs.
+    pub(super) fn apply_fec_live(&mut self, params: Option<crate::config::FecBlockParams>) {
+        if self.fec_live == params {
+            return;
+        }
+        if self.fec_machinery() {
+            self.close_block_on_empty();
+            self.process_closed_blocks(Some(CloseWhy::Empty));
+        }
+        self.fec_live = params;
+        self.packer.set_blocks(params);
+    }
+
+    /// Bundle kind of a probe-tagged first send: a lone SOURCE only while
+    /// blocks are live (follows `fec_live`, else the cluster's byte count
+    /// drifts by 4 bytes per packet).
     pub(super) fn probe_bundle_kind(&self) -> BundleKind {
-        if self.fec_blocks.is_some() {
+        if self.fec_live.is_some() {
             BundleKind::Source
         } else {
             BundleKind::Plain
@@ -113,7 +138,7 @@ impl IoBridge {
         if closed.is_empty() {
             return;
         }
-        let Some(params) = self.fec_blocks else {
+        let Some(params) = self.fec_live else {
             return;
         };
         let now = now_std();
@@ -296,7 +321,7 @@ impl IoBridge {
 
     /// ACK arrivals for the blocks (every entry, live or late).
     pub(super) fn blocks_on_arrivals(&mut self, entries: &[(u32, u16)]) {
-        if self.fec_blocks.is_none() {
+        if !self.fec_machinery() {
             return;
         }
         let now = now_std();
@@ -308,7 +333,7 @@ impl IoBridge {
 
     /// RECOVERED named these bundles: sources the client rebuilt.
     pub(super) fn blocks_on_recovered(&mut self, ids: &[u32]) {
-        if self.fec_blocks.is_none() {
+        if !self.fec_machinery() {
             return;
         }
         let now = now_std();
@@ -322,7 +347,7 @@ impl IoBridge {
     /// a cross-check). A block still taking sources closes in the packer so
     /// no later source joins it.
     pub(super) fn blocks_on_declined(&mut self, block_id: u16, k: u8, missing: &[u8]) {
-        if self.fec_blocks.is_none() {
+        if !self.fec_machinery() {
             return;
         }
         let now = now_std();
@@ -342,7 +367,7 @@ impl IoBridge {
         &mut self,
         asks: &[ghostframe_protocol::fec::feedback::RepairAsk],
     ) {
-        if self.fec_blocks.is_none() {
+        if !self.fec_machinery() {
             return;
         }
         let now = now_std();
@@ -451,7 +476,7 @@ impl IoBridge {
     /// The T close, and a retry of repairs that were refused earlier. Run
     /// once per loop turn.
     pub(super) fn service_blocks(&mut self, now: std::time::Instant) {
-        if self.fec_blocks.is_none() {
+        if !self.fec_machinery() {
             return;
         }
         let now_us = self.reliable_emitter.emit_us64(now);

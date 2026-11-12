@@ -673,7 +673,7 @@ impl IoBridge {
         // scheduler (not yet sent: the client asked early) or is simply not
         // owed any more (acknowledged, superseded, retired).
         for k in &entries {
-            if self.fec_blocks.is_some()
+            if self.fec_machinery()
                 && self
                     .block_table
                     .tile_protected(k.tile_x, k.tile_y, k.pass_idx)

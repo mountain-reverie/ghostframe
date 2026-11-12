@@ -2624,7 +2624,7 @@ impl IoBridge {
             );
 
             // FEC v2 rev 6 block send side (R6-d): closes by cause, repairs.
-            if self.fec_blocks.is_some() {
+            if self.fec_machinery() {
                 let bt = self.block_tx;
                 let closed = bt.closed_kmax + bt.closed_time + bt.closed_empty + bt.closed_mtu;
                 tracing::info!(

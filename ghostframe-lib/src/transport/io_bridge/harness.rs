@@ -90,12 +90,27 @@ impl IoBridge {
         self.h264.openh264_lib = lib.as_deref().map(std::sync::Arc::<std::path::Path>::from);
     }
 
+    /// Set the FEC block mode the daemon would read from
+    /// `GHOSTFRAME_FEC_BLOCKS`. Meant for a bridge with nothing open.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn set_fec_mode_for_test(&mut self, mode: crate::config::FecMode) {
+        self.fec_mode = mode;
+        self.fec_live = mode.initial_live();
+        self.packer.set_blocks(self.fec_live);
+    }
+
     /// Set the FEC block knob the daemon would read from
     /// `GHOSTFRAME_FEC_BLOCKS`. `None` is off.
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn set_fec_blocks_for_test(&mut self, params: Option<crate::config::FecBlockParams>) {
-        self.fec_blocks = params;
-        self.packer.set_blocks(params);
+        self.set_fec_mode_for_test(params.into());
+    }
+
+    /// Change the live block parameters at a block boundary
+    /// (`apply_fec_live`), for a test.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn apply_fec_live_for_test(&mut self, params: Option<crate::config::FecBlockParams>) {
+        self.apply_fec_live(params);
     }
 
     /// Replace the QUIC peer gate, for a test that needs a specific policy
