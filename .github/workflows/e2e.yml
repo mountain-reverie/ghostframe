@@ -140,6 +140,7 @@ jobs:
       - run: cargo test --test browserless_blocked_path -- --test-threads=1
       - run: cargo test --test browserless_loop_stall -- --test-threads=1
       - run: cargo test --test browserless_fec_framing -- --test-threads=1
+      - run: cargo test --test browserless_fec_blocks -- --test-threads=1
       # H.264 in the transport (design PR A3): ledger accounting, lost-IDR
       # repair, acknowledgement stalls, frame skip. A scripted encoder over the
       # real bridge and client; named here because nothing else lists it.
