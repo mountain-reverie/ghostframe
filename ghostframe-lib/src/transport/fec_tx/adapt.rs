@@ -20,6 +20,7 @@ use ghostframe_protocol::fec::feedback::LossReport;
 use super::adapt_size::{DeclinedTrim, Ladder, RSizer};
 use super::block_table::CloseReason;
 use crate::config::FecBlockParams;
+use crate::transport::io_bridge::FecAdaptProbe;
 
 /// Owner decision (rev 6 section 8 item 5): below 0.1 % loss the daemon sends
 /// no repair (r = 0, PLAIN). It is a rate the loss must be shown to reach.
@@ -206,6 +207,12 @@ pub(crate) struct FecAdapt {
     sizer: RSizer,
     trim: DeclinedTrim,
     was_engaged: bool,
+    /// Blocks sized by `r_for_block`, and how many of them at the cap.
+    blocks_sized: u64,
+    saturated: u64,
+    /// Changes of the live parameters the bridge applied (`note_applied`).
+    changes: u64,
+    last_applied: Option<FecBlockParams>,
 }
 
 impl FecAdapt {
@@ -216,6 +223,10 @@ impl FecAdapt {
             sizer: RSizer::new(),
             trim: DeclinedTrim::new(),
             was_engaged: false,
+            blocks_sized: 0,
+            saturated: 0,
+            changes: 0,
+            last_applied: None,
         }
     }
 
@@ -274,7 +285,49 @@ impl FecAdapt {
     /// `r` for a block that closed with `k` sources.
     pub(crate) fn r_for_block(&mut self, k: u32, now_us: u64) -> u8 {
         let (p, b, trim) = (self.est.p_hat(), self.est.b_hat(), self.trim.trim());
-        self.sizer.r_for_paced(k, p, b, trim, now_us).r
+        let d = self.sizer.r_for_paced(k, p, b, trim, now_us);
+        self.blocks_sized += 1;
+        self.saturated += u64::from(d.saturated);
+        d.r
+    }
+
+    /// Records the parameters the bridge now runs; a different value is one
+    /// change (engage, release, or a new span).
+    pub(crate) fn note_applied(&mut self, live: Option<FecBlockParams>) {
+        if live != self.last_applied {
+            self.last_applied = live;
+            self.changes += 1;
+        }
+    }
+
+    /// Counters and readings for the log line and the harness. `r` at k = 8
+    /// and 64 is what a block of that size would get now (0 while `Clean`);
+    /// it is read from a copy of the sizer, so asking changes nothing.
+    pub(crate) fn probe(&self) -> FecAdaptProbe {
+        let engaged = self.est.state() == FloorState::Engaged;
+        let (p, b, trim) = (self.est.p_hat(), self.est.b_hat(), self.trim.trim());
+        let mut sizer = self.sizer.clone();
+        let mut r_at = |k: u32| {
+            if engaged {
+                sizer.r_for(k, p, b, trim).r
+            } else {
+                0
+            }
+        };
+        FecAdaptProbe {
+            engaged,
+            p_hat_ppm: (p * 1e6).round() as u64,
+            b_hat_x100: (b * 100.0).round() as u64,
+            k_max: self.last_applied.map_or(0, |a| a.k_max),
+            t_ms: self.last_applied.map_or(0, |a| a.t_ms),
+            r_at_k8: r_at(8),
+            r_at_k64: r_at(64),
+            changes: self.changes,
+            congestion_skips: self.est.congestion_skips(),
+            trim_steps: self.trim.steps(),
+            blocks_sized: self.blocks_sized,
+            saturated: self.saturated,
+        }
     }
 
     pub(crate) fn estimator(&self) -> &LossEstimator {
@@ -516,5 +569,35 @@ mod tests {
         assert_eq!(a.total(), b.total());
         assert_eq!(a.b_hat(), b.b_hat());
         assert_eq!(a.state(), b.state());
+    }
+
+    #[test]
+    fn probe_counts_sizing_saturation_and_changes() {
+        let mut a = FecAdapt::new();
+        let clean = a.probe();
+        assert!(!clean.engaged);
+        assert_eq!(
+            (clean.r_at_k8, clean.r_at_k64, clean.blocks_sized),
+            (0, 0, 0)
+        );
+        // Bursty 5 % loss (runs of 8): the cap is unreachable at k = 64.
+        let mut r = rep(950, 50);
+        r.loss_run_hist[4] = 7;
+        for i in 0..20u64 {
+            a.on_report(&r, false, i * 250_000);
+        }
+        a.tick(5_000_000, []);
+        assert_eq!(a.estimator().reports_seen(), 20, "reports were seen");
+        let live = a.live_params(10_000_000, 1200, 5_000_000);
+        a.note_applied(live);
+        a.note_applied(live);
+        assert_eq!(a.r_for_block(64, 5_000_000), 16, "the 25 % overhead cap");
+        let p = a.probe();
+        assert!(p.engaged && p.p_hat_ppm > 0 && p.b_hat_x100 > 150);
+        assert_eq!((p.blocks_sized, p.saturated, p.changes), (1, 1, 1));
+        assert!(p.k_max > 0 && p.t_ms > 0 && p.r_at_k64 == 16 && p.r_at_k8 > 0);
+        // A congested interval is counted.
+        a.on_report(&r, true, 6_000_000);
+        assert_eq!(a.probe().congestion_skips, 1);
     }
 }
