@@ -612,7 +612,11 @@ impl BlockTable {
         let max_row = 255 - u16::from(b.k);
         let mut row = u16::from(ask.first_new_idx).max(b.next_row);
         let cap = u16::from(b.r) + EXTRA_ROWS_BEYOND_R;
-        for _ in 0..ask.missing {
+        // The server knows k; a client that has not seen LAST or a repair
+        // does not, and always asks for one row. Serve what the block needs
+        // to reach k from what the client holds.
+        let needed = b.k.saturating_sub(ask.have).max(ask.missing);
+        for _ in 0..needed {
             if row > max_row {
                 break;
             }
@@ -1325,14 +1329,17 @@ mod tests {
                 .collect()
         };
         let mut t = setup(10, 2, tile, t0);
-        assert_eq!(rows(&t.on_request(ask(5, 2, 0), t0)), vec![2, 3]);
+        assert_eq!(rows(&t.on_request(ask(8, 2, 0), t0)), vec![2, 3]);
         // never reused, honours first_new_idx
-        assert_eq!(rows(&t.on_request(ask(5, 1, 7), t0)), vec![7]);
-        assert_eq!(rows(&t.on_request(ask(5, 1, 0), t0)), vec![8]);
+        assert_eq!(rows(&t.on_request(ask(9, 1, 7), t0)), vec![7]);
+        assert_eq!(rows(&t.on_request(ask(9, 1, 0), t0)), vec![8]);
         // cap: r + 4 = 6 extras; 4 used, 2 more then refused
         let a = t.on_request(ask(5, 5, 0), t0);
         assert_eq!(rows(&a), vec![9, 10]);
         assert_eq!(t.stats().request_over_cap, 1);
+        // a client that asks for one row but is k - have short is served k - have
+        let mut t = setup(10, 2, tile, t0);
+        assert_eq!(rows(&t.on_request(ask(7, 1, 0), t0)), vec![2, 3, 4]);
         // clamp to 255 - k
         let mut t = setup(250, 1, tile, t0);
         let a = t.on_request(ask(5, 9, 0), t0);

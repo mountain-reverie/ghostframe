@@ -396,6 +396,50 @@ async fn a_repair_request_gets_fresh_rows_the_real_block_store_decodes() {
 }
 
 #[tokio::test]
+async fn a_request_from_a_client_that_does_not_know_k_is_served_to_k() {
+    let mut b = blocks_bridge(64, 5, 2);
+    submit_tiles(&mut b, 10, None);
+    b.drain_reliable_emitter(now_std());
+    assert!(b.flush_bundles());
+    // The T close: no LAST on any source.
+    b.service_blocks(now_std() + Duration::from_millis(10));
+    assert_eq!(b.block_tx.closed_time, 1);
+    let frames = b.sent_frames_for_test.clone();
+    assert_eq!(kinds(&frames), ["S", "S", "S", "S", "R", "R"]);
+    let (id, _, _) = first_block(&frames);
+    let want: std::collections::BTreeSet<Vec<u8>> =
+        b.sent_log_for_test.iter().map(|d| d.to_vec()).collect();
+    // The two trailing sources and both repairs are lost: the client holds
+    // two sources, sees neither LAST nor a repair, so it asks for one row.
+    let mut store = BlockStore::new();
+    let mut got = std::collections::BTreeSet::new();
+    for i in [0usize, 1] {
+        for r in store.on_datagram(&frames[i], 1_000).records {
+            got.insert(r.bytes);
+        }
+    }
+    assert_ne!(got, want, "premise: not yet decodable");
+    ask(
+        &mut b,
+        RepairAsk {
+            block_id: id,
+            have: 2,
+            missing: 1,
+            first_new_idx: 0,
+        },
+    );
+    b.service_pending_repairs();
+    let after = b.sent_frames_for_test.clone();
+    assert_eq!(repair_rows(&after[6..]), [2, 3], "k - have = 2 rows");
+    for f in &after[6..] {
+        for rec in store.on_datagram(f, 1_000).records {
+            got.insert(rec.bytes);
+        }
+    }
+    assert_eq!(got, want, "one request round decoded the block");
+}
+
+#[tokio::test]
 async fn a_request_past_r_plus_4_rows_or_for_an_unknown_block_sends_nothing() {
     let mut b = blocks_bridge(64, 5, 2);
     submit_tiles(&mut b, 10, None);
