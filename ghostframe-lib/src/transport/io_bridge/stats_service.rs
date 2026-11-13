@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The connection-stats service: per-session subscription state, the 1 Hz
 //! sampler and the frame writes (spec `docs/specs/stats-panel-design.md`
 //! section 1.2).

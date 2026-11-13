@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! A real quinn-proto client joined back to back with the production
 //! `QuicServer`, no socket and a clock the test moves. Shared by the
 //! departure-tracker tests and the stats-service tests.

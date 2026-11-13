@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! A stats subscriber for the browserless harness: sends `STATS_SUBSCRIBE`
 //! through the scene's real `ClientNet`, reads what the server writes on the
 //! feedback stream's return half, and decodes it with the protocol crate.

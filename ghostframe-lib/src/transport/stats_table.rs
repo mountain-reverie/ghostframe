@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The server's stats metric table and the numbers behind it.
 //!
 //! Internal on purpose: nothing here is `pub`, so none of it reaches the
