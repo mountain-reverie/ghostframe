@@ -245,8 +245,6 @@ impl ClientStats {
     }
 
     /// The deadline of the next local sample, for `poll_timeout`.
-    // Used by the core from Task 6; the attribute is removed there.
-    #[allow(dead_code)]
     pub(crate) fn next_local_sample_us(&self) -> u64 {
         self.local.next_sample_us()
     }
@@ -329,8 +327,6 @@ impl ClientStats {
 
     /// Take the once-a-second local measurements. The first call only sets
     /// the baseline the rates are measured from.
-    // Used by the core from Task 6; the attribute is removed there.
-    #[allow(dead_code)]
     pub(crate) fn sample_local(&mut self, now_us: u64, loss: WireLossStats) {
         self.local.sample(now_us, loss);
     }
