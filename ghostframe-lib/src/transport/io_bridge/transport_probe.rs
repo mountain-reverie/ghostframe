@@ -70,6 +70,14 @@ pub struct TransportProbe {
     pub report_lost_pre_fec_total: u64,
     pub report_recovered: u16,
     pub report_residual: u16,
+    /// LOSS_REPORTs received with `lost_pre_fec > 0`, and of those the ones
+    /// at which the bandwidth estimator's `standing_queue()` held. Counted
+    /// in every mode, before the adaptive branch, under the predicate the
+    /// controller's `congestion_skips` uses, so the mode-off arm of a sweep
+    /// gives the share of reports the gate would fire on by the stream's own
+    /// queue alone (the null model of criterion 5).
+    pub reports_with_loss: u64,
+    pub report_queue_reads: u64,
     /// The adaptive FEC controller (default, all zero, when not adaptive).
     pub adapt: FecAdaptProbe,
     /// The D1 instruments (see [`crate::transport::instruments`]). Filled when
