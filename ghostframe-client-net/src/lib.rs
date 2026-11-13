@@ -684,6 +684,11 @@ impl ClientNet {
         self.core.wire_loss_stats()
     }
 
+    /// `ClientCore::block_stats`. Measurement only.
+    pub fn block_stats(&self) -> ghostframe_client_core::fec_rx::BlockStats {
+        self.core.block_stats()
+    }
+
     /// `(datagram frames quinn received, datagram frames read by the
     /// application)`; the difference is datagrams quinn's receive buffer
     /// dropped silently. `None` without a connection. Measurement only.

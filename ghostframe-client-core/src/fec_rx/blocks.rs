@@ -69,7 +69,19 @@ pub struct BlockStats {
     pub requests: u64,
     /// Blocks whose first repair row came after the block was given up, having asked for one.
     pub late_rows: u64,
+    /// Over the blocks counted in `late_rows`: how long after the give-up
+    /// their first row arrived (sum and largest, microseconds). Measurement
+    /// only; it sizes the request margin.
+    pub late_row_after_us_sum: u64,
+    pub late_row_after_us_max: u64,
     pub declined: u64,
+    /// Of `declined`: blocks given up to make room under
+    /// `FEC_RX_MAX_OPEN_BLOCKS`, blocks that fell out of the id window, and
+    /// blocks evicted by `FEC_RX_MAX_HELD_BYTES`. A window expiry is none of
+    /// these. Measurement only.
+    pub declined_open_cap: u64,
+    pub declined_too_old: u64,
+    pub declined_held_bytes: u64,
     pub duplicates: u64,
     pub held_bytes: u64,
 }
@@ -187,6 +199,8 @@ struct Closed {
     requested: bool,
     /// A late row of this block has been counted.
     late_counted: bool,
+    /// When the block was given up.
+    closed_at_us: u64,
 }
 
 pub struct BlockStore {
@@ -280,6 +294,7 @@ impl BlockStore {
             complete,
             requested,
             late_counted: false,
+            closed_at_us: self.last_now,
         });
     }
 
@@ -337,6 +352,7 @@ impl BlockStore {
             self.newest = Some(id);
         }
         while self.blocks.len() >= FEC_RX_MAX_OPEN_BLOCKS {
+            self.stats.declined_open_cap += 1;
             self.evict_oldest(DeclineReason::Pruned);
         }
         self.blocks.push(Block::new(id, now_us));
@@ -347,6 +363,7 @@ impl BlockStore {
         let mut i = 0;
         while i < self.blocks.len() {
             if too_old(newest, self.blocks[i].id) {
+                self.stats.declined_too_old += 1;
                 self.give_up(i, DeclineReason::Pruned);
             } else {
                 i += 1;
@@ -378,6 +395,7 @@ impl BlockStore {
 
     fn enforce_byte_cap(&mut self) {
         while self.held_bytes > FEC_RX_MAX_HELD_BYTES && !self.blocks.is_empty() {
+            self.stats.declined_held_bytes += 1;
             self.evict_oldest(DeclineReason::Evicted);
         }
     }
@@ -463,6 +481,9 @@ impl BlockStore {
             if !c.complete && c.requested && !c.late_counted {
                 c.late_counted = true;
                 self.stats.late_rows += 1;
+                let after = now_us.saturating_sub(c.closed_at_us);
+                self.stats.late_row_after_us_sum += after;
+                self.stats.late_row_after_us_max = self.stats.late_row_after_us_max.max(after);
             }
         }
         let Some(bi) = self.block_index(f.block_id, now_us) else {
