@@ -651,6 +651,20 @@ pub struct InstrumentSummary {
     pub block_t_lr_fired: u64,
     pub block_deferral_timeout: u64,
     pub block_content_lost_h264: u64,
+    /// Blocks the table closed, by outcome (`CloseReason`).
+    pub block_closed_accounted: u64,
+    pub block_closed_declined: u64,
+    pub block_closed_handed_off: u64,
+    pub block_closed_timed_out: u64,
+    /// Blocks the packer closed with repairs decided (all but the declined
+    /// ones), their source symbols (`k`) summed, and the repair rows sent
+    /// (the planned ones plus the requested and PTO rows).
+    pub block_packed: u64,
+    pub block_k_sum: u64,
+    /// The same blocks by size (`block_k_bucket_range` gives each bucket's
+    /// range): what the rule's overhead is measured against.
+    pub block_k_buckets: [u32; 24],
+    pub block_repairs_sent: u64,
     pub fec_recovered_rx: u64,
     pub fec_declined_rx: u64,
     pub fec_repair_requests_rx: u64,

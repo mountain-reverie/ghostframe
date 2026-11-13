@@ -129,6 +129,7 @@ pub use frame_backend::{
 #[path = "io_bridge/frame_worker.rs"]
 mod frame_worker;
 mod transport_probe;
+pub use block_tx::block_k_bucket_range;
 use frame_worker::{FinishAction, FramePipeline, FromWorker, ToWorker};
 pub use transport_probe::{FecAdaptProbe, TransportProbe};
 
