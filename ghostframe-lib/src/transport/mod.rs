@@ -28,6 +28,7 @@ pub(crate) mod admission;
 pub mod reliable_emitter;
 pub mod rtt_estimator;
 pub mod scheduler;
+pub(crate) mod stats_table;
 pub mod transmission_ledger;
 pub mod webtransport;
 
