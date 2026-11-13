@@ -370,6 +370,69 @@ impl StatsSchema {
     }
 }
 
+impl StatsSample {
+    /// The whole frame, `[0x02][len u16 LE][payload]`, or `TooLong` for a text
+    /// value over 255 bytes or a payload over [`SERVER_FRAME_MAX_LEN`].
+    pub fn try_encode_frame(&self) -> Result<Vec<u8>, StatsWireError> {
+        if self.values.len() > MAX_DESCRIPTORS {
+            return Err(StatsWireError::TooLong);
+        }
+        let mut p = Vec::new();
+        p.extend_from_slice(&self.schema_id.to_le_bytes());
+        p.extend_from_slice(&self.timestamp_us.to_le_bytes());
+        p.extend_from_slice(&(self.values.len() as u16).to_le_bytes());
+        for v in &self.values {
+            match v {
+                MetricValue::Num(x) => p.extend_from_slice(&x.to_bits().to_le_bytes()),
+                MetricValue::Text(s) => put_str8(&mut p, s)?,
+            }
+        }
+        frame(SERVER_MSG_STATS_SAMPLE, &p)
+    }
+
+    /// [`Self::try_encode_frame`] for a sample the caller knows is within the
+    /// limits.
+    ///
+    /// # Panics
+    /// When the sample is over a limit.
+    pub fn encode_frame(&self) -> Vec<u8> {
+        self.try_encode_frame()
+            .expect("stats sample is within the wire limits")
+    }
+
+    /// Decode a frame's payload against `schema`, which says each value's
+    /// kind. A different `schema_id`, a different value count, or bytes left
+    /// over are errors: the panel marks its rows stale instead of showing
+    /// misaligned numbers.
+    pub fn decode_payload(payload: &[u8], schema: &StatsSchema) -> Result<Self, StatsWireError> {
+        let mut c = Cursor::new(payload);
+        let schema_id = c.u16()?;
+        if schema_id != schema.schema_id {
+            return Err(StatsWireError::SchemaMismatch);
+        }
+        let timestamp_us = c.u64()?;
+        let count = usize::from(c.u16()?);
+        if count != schema.metrics.len() {
+            return Err(StatsWireError::CountMismatch);
+        }
+        let mut values = Vec::with_capacity(count);
+        for m in &schema.metrics {
+            values.push(match m.kind {
+                MetricKind::Gauge | MetricKind::Counter => MetricValue::Num(c.f64()?),
+                MetricKind::Text => MetricValue::Text(c.str8()?),
+            });
+        }
+        if !c.finished() {
+            return Err(StatsWireError::CountMismatch);
+        }
+        Ok(Self {
+            schema_id,
+            timestamp_us,
+            values,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,5 +674,122 @@ mod tests {
         // so the refusal above is the size and not a string.
         s.metrics.truncate(10);
         assert!(s.try_encode_frame().is_ok());
+    }
+
+    fn sample_for(schema: &StatsSchema) -> StatsSample {
+        StatsSample {
+            schema_id: schema.schema_id,
+            timestamp_us: 123_456_789,
+            values: vec![
+                MetricValue::Num(42_100_000.0),
+                MetricValue::Num(17.0),
+                MetricValue::Text("h264".to_string()),
+            ],
+        }
+    }
+
+    #[test]
+    fn sample_frame_roundtrip_and_framing() {
+        let schema = sample_schema();
+        let sample = sample_for(&schema);
+        let f = sample.encode_frame();
+        assert_eq!(f[0], SERVER_MSG_STATS_SAMPLE);
+        let len = usize::from(u16::from_le_bytes([f[1], f[2]]));
+        assert_eq!(len, f.len() - FRAME_HEADER_LEN);
+        assert_eq!(
+            StatsSample::decode_payload(&f[FRAME_HEADER_LEN..], &schema),
+            Ok(sample)
+        );
+    }
+
+    #[test]
+    fn sample_with_the_wrong_schema_id_is_rejected() {
+        let schema = sample_schema();
+        let mut sample = sample_for(&schema);
+        sample.schema_id = schema.schema_id.wrapping_add(1);
+        let f = sample.encode_frame();
+        assert_eq!(
+            StatsSample::decode_payload(&f[FRAME_HEADER_LEN..], &schema),
+            Err(StatsWireError::SchemaMismatch)
+        );
+    }
+
+    #[test]
+    fn sample_with_the_wrong_value_count_is_rejected() {
+        let schema = sample_schema();
+        let mut short = sample_for(&schema);
+        short.values.pop();
+        let f = short.encode_frame();
+        assert_eq!(
+            StatsSample::decode_payload(&f[FRAME_HEADER_LEN..], &schema),
+            Err(StatsWireError::CountMismatch)
+        );
+        let mut long = sample_for(&schema);
+        long.values.push(MetricValue::Num(1.0));
+        let f = long.encode_frame();
+        assert_eq!(
+            StatsSample::decode_payload(&f[FRAME_HEADER_LEN..], &schema),
+            Err(StatsWireError::CountMismatch)
+        );
+    }
+
+    #[test]
+    fn every_strict_prefix_of_a_sample_is_an_error() {
+        let schema = sample_schema();
+        let payload = sample_for(&schema).encode_frame()[FRAME_HEADER_LEN..].to_vec();
+        for cut in 0..payload.len() {
+            assert!(
+                StatsSample::decode_payload(&payload[..cut], &schema).is_err(),
+                "a {cut}-byte prefix of a {}-byte sample decoded",
+                payload.len()
+            );
+        }
+    }
+
+    #[test]
+    fn sample_trailing_bytes_and_bad_utf8_are_errors() {
+        let schema = sample_schema();
+        let mut p = sample_for(&schema).encode_frame()[FRAME_HEADER_LEN..].to_vec();
+        p.push(0);
+        assert_eq!(
+            StatsSample::decode_payload(&p, &schema),
+            Err(StatsWireError::CountMismatch)
+        );
+        // The text value "h264" is last: its bytes are the final four.
+        let mut p = sample_for(&schema).encode_frame()[FRAME_HEADER_LEN..].to_vec();
+        let n = p.len();
+        p[n - 1] = 0xFF;
+        assert_eq!(
+            StatsSample::decode_payload(&p, &schema),
+            Err(StatsWireError::BadUtf8)
+        );
+    }
+
+    #[test]
+    fn sample_text_over_255_bytes_cannot_be_encoded() {
+        let s = StatsSample {
+            schema_id: 1,
+            timestamp_us: 0,
+            values: vec![MetricValue::Text("x".repeat(256))],
+        };
+        assert_eq!(s.try_encode_frame(), Err(StatsWireError::TooLong));
+    }
+
+    #[test]
+    fn sample_over_the_frame_limit_cannot_be_encoded() {
+        // 70 values of 255 bytes are 70 x 256 + 12 = 17 932 bytes: every
+        // string fits its prefix and the count is far under 512, so only the
+        // 16 KiB frame limit refuses it.
+        let s = StatsSample {
+            schema_id: 1,
+            timestamp_us: 0,
+            values: (0..70)
+                .map(|_| MetricValue::Text("x".repeat(255)))
+                .collect(),
+        };
+        assert_eq!(s.try_encode_frame(), Err(StatsWireError::TooLong));
+        let mut ok = s.clone();
+        ok.values.truncate(10);
+        assert!(ok.try_encode_frame().is_ok());
     }
 }
