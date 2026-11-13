@@ -19,7 +19,7 @@
 
 ## Ground rules
 
-- Worktree `/home/cedric/work/gf-stats-protocol`, branch `feat/stats-protocol-server` from `master` (Task 1). Every command below runs from that directory.
+- Worktree `~/work/gf-stats-protocol`, branch `feat/stats-protocol-server` from `master` (Task 1). Every command below runs from that directory.
 - Commit with explicit `git add <paths>`, never `git add -A`. Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Never push.
 - GPU-touching gates (`just ci-local`) run only as `~/work/gf-gpu-run just ci-local`, never bare (it touches VA-API; AGENTS.md and the repo notes).
 - Mutation checks: each test task ends with "break the code, watch it fail, restore". The restore is `git checkout -- <file>` run after the task's commit, so the task's passing state is what comes back.
@@ -87,16 +87,16 @@ The sample carries `count` because spec section 3 makes "value count does not ma
 
 **Model:** haiku
 
-**Files:** none (creates `/home/cedric/work/gf-stats-protocol`)
+**Files:** none (creates `~/work/gf-stats-protocol`)
 
-- [ ] **Step 1: Invoke the skill.** Use superpowers:using-git-worktrees. The repo keeps its worktrees as siblings under `/home/cedric/work/gf-*`.
+- [ ] **Step 1: Invoke the skill.** Use superpowers:using-git-worktrees. The repo keeps its worktrees as siblings under `~/work/gf-*`.
 
 - [ ] **Step 2: Create the worktree from master**
 
 ```bash
-cd /home/cedric/work/ghostframe
+cd ~/work/ghostframe
 git fetch origin master
-git worktree add -b feat/stats-protocol-server /home/cedric/work/gf-stats-protocol origin/master
+git worktree add -b feat/stats-protocol-server ~/work/gf-stats-protocol origin/master
 ```
 
 Expected: `Preparing worktree (new branch 'feat/stats-protocol-server')`. If `origin/master` is unavailable offline, use `master`.
@@ -104,13 +104,13 @@ Expected: `Preparing worktree (new branch 'feat/stats-protocol-server')`. If `or
 - [ ] **Step 3: Copy the prebuilt web client** (ghostbridge embeds `dist/` at compile time; a fresh worktree fails "timed out waiting for frame rendering" without it)
 
 ```bash
-cp -r /home/cedric/work/ghostframe/ghostframe-web-client/dist /home/cedric/work/gf-stats-protocol/ghostframe-web-client/dist
+cp -r ~/work/ghostframe/ghostframe-web-client/dist ~/work/gf-stats-protocol/ghostframe-web-client/dist
 ```
 
 - [ ] **Step 4: Verify the baseline builds**
 
 ```bash
-cd /home/cedric/work/gf-stats-protocol
+cd ~/work/gf-stats-protocol
 git status --short | head
 cargo test -p ghostframe-protocol feedback_stream 2>&1 | tail -5
 ```
