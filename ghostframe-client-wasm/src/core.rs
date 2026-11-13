@@ -6,6 +6,9 @@
 //! call traps — so one malformed datagram would end the session rather than
 //! drop a frame.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use ghostframe_client_core::{ClientConfig, ClientCore, H264Outcome, TileDelivery};
 use wasm_bindgen::prelude::*;
 
@@ -19,7 +22,12 @@ fn to_js<T: serde::Serialize>(value: &T) -> Result<JsValue, JsValue> {
 
 #[wasm_bindgen]
 pub struct WasmClientCore {
-    inner: ClientCore,
+    /// Shared with the stats panel (`ghostframe-web-ui`), which reads the
+    /// stats and queues subscribe messages from its own timer and click
+    /// handlers. Those run as separate browser tasks, never inside one of the
+    /// calls below: no method here calls back into JS, so a `borrow_mut` here
+    /// cannot find the panel's borrow held.
+    inner: Rc<RefCell<ClientCore>>,
 }
 
 #[wasm_bindgen]
@@ -50,9 +58,26 @@ impl WasmClientCore {
             cdf53_wire: false,
             display: None,
         };
+        let mut core = ClientCore::new(config, now_us);
+        core.set_client_version(crate::CLIENT_VERSION);
         WasmClientCore {
-            inner: ClientCore::new(config, now_us),
+            inner: Rc::new(RefCell::new(core)),
         }
+    }
+
+    /// Feed bytes read from the feedback stream's return half, in whatever
+    /// chunks the transport produced. Carries the stats schema and samples;
+    /// malformed input is counted by the core, never thrown.
+    #[wasm_bindgen(js_name = handleServerStream)]
+    pub fn handle_server_stream(&mut self, bytes: &[u8], now_us: u64) {
+        self.inner.borrow_mut().handle_server_stream(bytes, now_us);
+    }
+
+    /// Note `n` frames painted, for the panel's painted-fps row. Called by
+    /// `main.ts` until the renderer moves into Rust.
+    #[wasm_bindgen(js_name = recordPaints)]
+    pub fn record_paints(&mut self, n: u32) {
+        self.inner.borrow_mut().record_paints(n);
     }
 
     /// Ask the server for a fresh IDR (feedback stream 0x09): the browser's
@@ -64,7 +89,7 @@ impl WasmClientCore {
     #[wasm_bindgen(js_name = requestReset)]
     pub fn request_reset(&mut self, reason: u8, frame_seq: u32) {
         if let Some(r) = ghostframe_client_core::ResetReason::from_u8(reason) {
-            self.inner.request_reset(r, frame_seq);
+            self.inner.borrow_mut().request_reset(r, frame_seq);
         }
     }
 
@@ -85,7 +110,9 @@ impl WasmClientCore {
             3 => H264Outcome::NoDecoder,
             _ => return,
         };
-        self.inner.h264_result(frame_seq, outcome, now_us);
+        self.inner
+            .borrow_mut()
+            .h264_result(frame_seq, outcome, now_us);
     }
 
     /// `[total, streak]`: access units the decoder consumed without a picture
@@ -93,18 +120,19 @@ impl WasmClientCore {
     /// streak on a stream that plays is a decoder with output delay.
     #[wasm_bindgen(js_name = h264NotOutputStats)]
     pub fn h264_not_output_stats(&self) -> Vec<f64> {
-        let (total, streak) = self.inner.h264_not_output_stats();
+        let (total, streak) = self.inner.borrow().h264_not_output_stats();
         vec![total as f64, streak as f64]
     }
 
     /// Feed one inbound datagram; returns the resulting events as an array.
     ///
-    /// Inbound is datagrams-only: the browser's bidi stream carries outbound
-    /// feedback, and the server sends tiles, dimensions, palettes and H.264
-    /// access units over `transport.datagrams`.
+    /// Tiles, dimensions, palettes and H.264 access units arrive as
+    /// datagrams, through here. The feedback bidi stream's return half
+    /// carries the server's stats frames only, through
+    /// [`WasmClientCore::handle_server_stream`].
     #[wasm_bindgen(js_name = handleDatagram)]
     pub fn handle_datagram(&mut self, bytes: &[u8], now_us: u64) -> Result<JsValue, JsValue> {
-        let events = self.inner.handle_datagram(bytes, now_us);
+        let events = self.inner.borrow_mut().handle_datagram(bytes, now_us);
         let mirrored: Vec<WasmEvent> = events
             .into_iter()
             .filter_map(WasmEvent::from_event)
@@ -134,6 +162,7 @@ impl WasmClientCore {
         lens: &[u32],
         arrivals_us: &[f64],
     ) -> Result<JsValue, JsValue> {
+        let mut core = self.inner.borrow_mut();
         let mut events = Vec::new();
         let mut offset = 0usize;
         for (len, at) in lens.iter().zip(arrivals_us.iter()) {
@@ -147,8 +176,9 @@ impl WasmClientCore {
             offset = end;
             // `as u64` saturates and maps NaN to 0, so a hostile or buggy
             // caller cannot wrap.
-            events.extend(self.inner.handle_datagram(datagram, *at as u64));
+            events.extend(core.handle_datagram(datagram, *at as u64));
         }
+        drop(core);
         let mirrored: Vec<WasmEvent> = events
             .into_iter()
             .filter_map(WasmEvent::from_event)
@@ -160,7 +190,7 @@ impl WasmClientCore {
     /// periodic feedback); returns the resulting events.
     #[wasm_bindgen(js_name = onTimeout)]
     pub fn on_timeout(&mut self, now_us: u64) -> Result<JsValue, JsValue> {
-        let events = self.inner.on_timeout(now_us);
+        let events = self.inner.borrow_mut().on_timeout(now_us);
         let mirrored: Vec<WasmEvent> = events
             .into_iter()
             .filter_map(WasmEvent::from_event)
@@ -172,7 +202,7 @@ impl WasmClientCore {
     /// Call until it returns `undefined`.
     #[wasm_bindgen(js_name = pollTransmit)]
     pub fn poll_transmit(&mut self, now_us: u64) -> Result<JsValue, JsValue> {
-        match self.inner.poll_transmit(now_us) {
+        match self.inner.borrow_mut().poll_transmit(now_us) {
             Some(out) => to_js(&WasmPollOutput::from(out)),
             None => Ok(JsValue::UNDEFINED),
         }
@@ -185,7 +215,7 @@ impl WasmClientCore {
     /// this is always a number — but JS must not assume that.
     #[wasm_bindgen(js_name = pollTimeout)]
     pub fn poll_timeout(&self) -> Option<u64> {
-        self.inner.poll_timeout()
+        self.inner.borrow().poll_timeout()
     }
 
     /// Per-tile Cdf53 coverage, for the client's diagnostics log.
@@ -199,7 +229,7 @@ impl WasmClientCore {
     /// `tiles=0 refined=0` on sessions that had decoded thousands of tiles.
     #[wasm_bindgen(js_name = cdf53Coverage)]
     pub fn cdf53_coverage(&self) -> Result<JsValue, JsValue> {
-        let s = self.inner.cdf53_coverage_summary();
+        let s = self.inner.borrow().cdf53_coverage_summary();
         to_js(&crate::boundary::WasmCdf53Coverage::from(&s))
     }
 
@@ -214,7 +244,7 @@ impl WasmClientCore {
     /// re-tested here, so the two cannot drift.
     #[wasm_bindgen(js_name = datagramCounts)]
     pub fn datagram_counts(&self) -> Result<JsValue, JsValue> {
-        let (tile, frame) = self.inner.datagram_counts();
+        let (tile, frame) = self.inner.borrow().datagram_counts();
         to_js(&crate::boundary::WasmDatagramCounts {
             tile_datagrams: u32::try_from(tile).unwrap_or(u32::MAX),
             frame_datagrams: u32::try_from(frame).unwrap_or(u32::MAX),
@@ -230,6 +260,7 @@ impl WasmClientCore {
     pub fn cdf53_incomplete_tiles(&self, limit: usize) -> Result<JsValue, JsValue> {
         let v: Vec<crate::boundary::WasmCdf53IncompleteTile> = self
             .inner
+            .borrow()
             .cdf53_incomplete_tiles(limit)
             .into_iter()
             .map(Into::into)
@@ -240,6 +271,44 @@ impl WasmClientCore {
     /// Encode a receiver-feedback report for the bidi stream.
     #[wasm_bindgen(js_name = encodeFeedback)]
     pub fn encode_feedback(&mut self, now_us: u64) -> Vec<u8> {
-        self.inner.encode_feedback(now_us)
+        self.inner.borrow_mut().encode_feedback(now_us)
+    }
+}
+
+impl WasmClientCore {
+    /// The shared core, for the panel. Not exported to JS.
+    pub(crate) fn shared(&self) -> Rc<RefCell<ClientCore>> {
+        self.inner.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The panel and the JS-facing wrapper must be looking at one core: the
+    /// version set at construction, a server stream and the paint count all
+    /// land in the core `shared()` hands the panel.
+    #[test]
+    fn the_panel_shares_the_core_the_exports_drive() {
+        let mut core = WasmClientCore::new(true, true, true, 0);
+        let shared = core.shared();
+        assert_eq!(
+            shared.borrow().stats().view(0).client_version,
+            crate::CLIENT_VERSION
+        );
+        core.handle_server_stream(&[0x02, 0xff, 0xff], 0); // oversized frame
+        assert_eq!(shared.borrow().stats().samples_rejected(), 1);
+        shared.borrow_mut().on_timeout(1_000_000);
+        core.record_paints(7);
+        shared.borrow_mut().on_timeout(2_000_000);
+        let view = shared.borrow().stats().view(2_000_000);
+        let painted = view
+            .groups
+            .iter()
+            .flat_map(|g| g.rows.iter())
+            .find(|r| r.label == "Painted frames")
+            .and_then(|r| r.current);
+        assert_eq!(painted, Some(7.0));
     }
 }

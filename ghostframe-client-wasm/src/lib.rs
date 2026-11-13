@@ -35,6 +35,7 @@ pub mod boundary;
 pub mod constants;
 pub mod core;
 pub mod input;
+pub mod panel;
 pub mod units;
 
 /// Hash of the `client-core` + `protocol` sources this module was built
