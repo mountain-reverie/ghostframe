@@ -6,6 +6,7 @@ members = [
     "ghostframe-client-core",
     "ghostframe-client-net",
     "ghostframe-client-wasm",
+    "ghostframe-web-ui",
     "ghostframe-client-gpu",
     "ghostframe-client-native",
     "ghostframe-client-capi",
