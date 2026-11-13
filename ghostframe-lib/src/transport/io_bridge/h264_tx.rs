@@ -854,6 +854,13 @@ impl IoBridge {
             // its content outcome to the block (RECOVERED, DECLINED or its
             // deadline), so the manager is not told yet. O(1).
             let fec = self.block_table.on_verdict(*ws);
+            // A pad repair has no record, so no `Content::Pad` below: its tag
+            // is by bundle. Lost like a lost pad copy, once, and the entry
+            // goes whatever happens (a lost untagged repair has none).
+            if self.pad_repair_tags.take(*ws).is_some() {
+                self.h264.raise_paused_until = Some(now + super::h264_refs::RAISE_LOSS_PAUSE);
+                self.h264.stats.pads_lost += 1;
+            }
             for (_, content) in tx.records() {
                 if let Content::Pad(pad_ws) = content {
                     // A pad judged lost: its tag will not be read. The burst it was

@@ -36,6 +36,65 @@ pub(super) struct RepairJob {
     pub(super) r: u8,
     pub(super) row: u8,
     pub(super) payload: Vec<u8>,
+    /// Set when the row is padding a probe window: the cluster's tag, kept by
+    /// `bundle_seq` once the job is sealed so that the REPAIR bundle's ACK
+    /// (which has no record to find a tag by) still yields a tagged sample.
+    pub(super) probe: Option<crate::transport::reliable_emitter::cache::ProbeTag>,
+}
+
+/// The tags of the pad repairs in flight, `bundle_seq -> ProbeTag`, bounded
+/// at [`PAD_RING_CAP`](crate::transport::reliable_emitter::h264::PAD_RING_CAP)
+/// (oldest dropped first). Its keys are ledger ids, not the pad ring's
+/// `wire_seq`s: the two never share a key space.
+#[derive(Debug, Default)]
+pub(super) struct PadRepairTags {
+    tags: HashMap<u32, crate::transport::reliable_emitter::cache::ProbeTag>,
+    order: std::collections::VecDeque<u32>,
+}
+
+impl PadRepairTags {
+    pub(super) fn insert(
+        &mut self,
+        bundle_seq: u32,
+        tag: crate::transport::reliable_emitter::cache::ProbeTag,
+    ) {
+        use crate::transport::reliable_emitter::h264::PAD_RING_CAP;
+        while self.tags.len() >= PAD_RING_CAP {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            self.tags.remove(&old);
+        }
+        if self.tags.insert(bundle_seq, tag).is_none() {
+            self.order.push_back(bundle_seq);
+        }
+    }
+
+    /// The tag of `bundle_seq`, released: a bundle is acknowledged, lost or
+    /// forgotten once.
+    pub(super) fn take(
+        &mut self,
+        bundle_seq: u32,
+    ) -> Option<crate::transport::reliable_emitter::cache::ProbeTag> {
+        let t = self.tags.remove(&bundle_seq);
+        if t.is_some() {
+            // Entries leave the order lazily; keep it from outgrowing the map.
+            if let Some(i) = self.order.iter().position(|&s| s == bundle_seq) {
+                self.order.remove(i);
+            }
+        }
+        t
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.tags.len()
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.tags.clear();
+        self.order.clear();
+    }
 }
 
 impl RepairJob {
@@ -230,6 +289,7 @@ impl IoBridge {
                                 r,
                                 row: row as u8,
                                 payload,
+                                probe: None,
                             });
                             repairs_queued += 1;
                         }
@@ -348,6 +408,7 @@ impl IoBridge {
                 r,
                 row,
                 payload,
+                probe: None,
             });
         }
         self.block_tx.repairs_queued_peak = self
@@ -485,6 +546,9 @@ impl IoBridge {
             .encode();
             self.block_table
                 .register_repair(job.block_id, job.row, bundle_seq);
+            if let Some(tag) = job.probe {
+                self.pad_repair_tags.insert(bundle_seq, tag);
+            }
             self.block_tx.repairs_sent += 1;
             self.block_tx.repair_bytes += bytes.len() as u64;
             let sealed = SealedBundle {
