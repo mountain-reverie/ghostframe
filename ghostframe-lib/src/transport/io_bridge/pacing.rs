@@ -394,9 +394,7 @@ impl IoBridge {
         // rate.
         if stop == Stop::Empty {
             if let Some(p) = self.active_probe.as_mut() {
-                // Padding promised to a block that has not closed yet is
-                // not a shortfall: the window is not starved by design.
-                p.starved |= p.bytes_sent + p.reserved_bytes < p.min_bytes;
+                p.starved |= p.bytes_sent < p.min_bytes;
             }
         }
         // The ceiling's queue test reads quinn's round trip: refreshed here,
