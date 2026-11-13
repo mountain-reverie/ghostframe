@@ -641,6 +641,8 @@ pub struct InstrumentSummary {
     /// handled, RECOVERED ids and DECLINED records received, requests
     /// received, the H.264 content-lost actions executed, and the `T_lr` counts.
     pub block_handoffs: u64,
+    /// Blocks closed because the client declined them (`CloseWhy::Declined`).
+    pub block_closed_declined: u64,
     pub block_handoff_queued: u64,
     pub block_requests_served: u64,
     pub block_request_rows_sent: u64,

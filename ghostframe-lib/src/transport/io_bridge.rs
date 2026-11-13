@@ -863,6 +863,9 @@ pub struct IoBridge {
     /// `process_closed_blocks` sizes repairs from. `None` is PLAIN. Changed
     /// only through `apply_fec_live`, at a block boundary.
     fec_live: Option<crate::config::FecBlockParams>,
+    /// Test-only A/B switch (E10 value gate): padding is never paid as repair
+    /// rows, so every probe window is filled with copies. Off in production.
+    pad_repair_off_for_test: bool,
     /// Shared cell the browserless harness reads the final H.264 counters
     /// from; same read-after-abort pattern as `emitter_stats_publish`.
     #[cfg(any(test, feature = "browserless-harness"))]
@@ -1593,6 +1596,7 @@ impl IoBridge {
             },
             fec_mode: lib_config.transport.fec_mode,
             fec_live: lib_config.transport.fec_mode.initial_live(),
+            pad_repair_off_for_test: false,
             #[cfg(any(test, feature = "browserless-harness"))]
             h264_stats_publish: std::sync::Arc::new(std::sync::Mutex::new(H264Report::default())),
             last_reset_request_idr_at: None,

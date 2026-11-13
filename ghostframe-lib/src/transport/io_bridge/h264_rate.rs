@@ -840,6 +840,9 @@ impl IoBridge {
     /// known. The row length is the longest a REPAIR frame can be, so a
     /// reservation is never short of what the rows will cost.
     fn pad_row_room(&mut self) -> Option<(i64, i64)> {
+        if self.pad_repair_off_for_test {
+            return None;
+        }
         let live = self.fec_live.filter(|p| p.r >= 1)?;
         let max_dg = self.live_max_dg()?;
         let rows = i64::from(crate::transport::fec_tx::block_table::pad_rows_cap(live.r));

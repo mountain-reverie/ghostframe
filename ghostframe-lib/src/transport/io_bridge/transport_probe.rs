@@ -374,6 +374,7 @@ impl IoBridge {
             k_pkt: self.transmission_ledger.stats().k_pkt,
             k_pkt_raises: self.transmission_ledger.stats().k_pkt_raises,
             block_handoffs: self.block_tx.handoffs,
+            block_closed_declined: self.block_tx.closed_declined,
             block_handoff_queued: self.block_tx.handoff_queued,
             block_requests_served: self.block_tx.requests_served,
             block_request_rows_sent: self.block_tx.request_rows_sent,
