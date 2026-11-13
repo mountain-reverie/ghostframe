@@ -362,6 +362,9 @@ pub struct Classifier {
     /// Last emitted mode (debounces the `mode.decision` event to fire
     /// only on transitions). `None` before the first decision.
     last_emitted_mode: Option<FrameMode>,
+    /// The `reason` logged with the last `mode.decision` event, for readers
+    /// that want it as text (the stats panel). `"none"` before the first.
+    last_reason: &'static str,
     /// Reference instant used by `decide_frame_mode` to convert
     /// monotonic time into µs for `decide_frame_mode_at`. Set in
     /// `Default` to `Instant::now()` at Classifier construction.
@@ -411,6 +414,7 @@ impl Classifier {
             headroom_min_bpus_override: config.headroom_min_bpus,
             force_frame_mode_override: config.force_frame_mode,
             last_emitted_mode: None,
+            last_reason: "none",
             epoch: std::time::Instant::now(),
         }
     }
@@ -528,6 +532,7 @@ impl Classifier {
                 "mode decision"
             );
             self.last_emitted_mode = Some(next_mode);
+            self.last_reason = reason;
         }
         next_mode
     }
@@ -536,6 +541,12 @@ impl Classifier {
     /// was emitted, or `None` if no decision has been made yet.
     pub fn last_emitted_mode(&self) -> Option<FrameMode> {
         self.last_emitted_mode
+    }
+
+    /// The reason of the last `mode.decision` event (`"none"` before the
+    /// first), as logged. Updated on the same transitions the event fires on.
+    pub fn last_decision_reason(&self) -> &'static str {
+        self.last_reason
     }
 
     /// The headroom guard with hysteresis, on the bandwidth estimate: engages
