@@ -62,15 +62,6 @@ pub(crate) const T_DEF: Duration = Duration::from_secs(60);
 pub(crate) const H264_DEFERRAL_SLACK: Duration = Duration::from_millis(100);
 /// Extra repair rows a block may send beyond its planned `r`.
 pub(crate) const EXTRA_ROWS_BEYOND_R: u16 = 4;
-/// Floor of the pad-row budget of a block (padding as repair, R6-e decision
-/// 8): see [`pad_rows_cap`].
-pub(crate) const FEC_PAD_ROWS_FLOOR: u16 = 4;
-
-/// Rows a block may spend on probe padding, apart from the `r + 4` of
-/// requested, PTO and `T_lr` rows: `max(r, 4)`. A client cannot reach it.
-pub(crate) fn pad_rows_cap(r: u8) -> u16 {
-    u16::from(r).max(FEC_PAD_ROWS_FLOOR)
-}
 
 /// Live path numbers the deadlines are built from.
 #[derive(Debug, Clone, Copy)]
@@ -327,9 +318,6 @@ struct Block {
     released: usize,
     next_row: u16,
     extra_used: u16,
-    /// Pad rows handed out ([`BlockTable::reserve_pad_rows`]); their own
-    /// budget, apart from `extra_used`.
-    pad_used: u16,
     /// `bundle_seq` of each repair registered, so closing is O(repairs).
     repairs: Vec<u32>,
     last_sent: Option<Instant>,
@@ -475,34 +463,6 @@ impl BlockTable {
         );
     }
 
-    /// Reserve up to `n` fresh repair rows of `block_id` for probe padding.
-    /// Rows come only from a block in `Phase::Repair`, from the shared row
-    /// counter (so never from a row already used, requested or planned: the
-    /// first is at least `r`), never above `255 - k`, and at most
-    /// [`pad_rows_cap`] over the block's life, whatever `extra_used` is.
-    /// Returns fewer than `n` rows, or none, when the block cannot take them.
-    /// The caller encodes and sends the rows and registers each with
-    /// [`Self::register_repair`].
-    pub(crate) fn reserve_pad_rows(&mut self, block_id: BlockId, n: usize) -> Vec<u8> {
-        let Some(b) = self.blocks.get_mut(&block_id) else {
-            return Vec::new();
-        };
-        if b.phase != Phase::Repair {
-            return Vec::new();
-        }
-        let max_row = 255 - u16::from(b.k);
-        let room = pad_rows_cap(b.r).saturating_sub(b.pad_used) as usize;
-        let mut rows = Vec::new();
-        let mut row = b.next_row.max(u16::from(b.r));
-        while rows.len() < n.min(room) && row <= max_row {
-            rows.push(row as u8);
-            row += 1;
-        }
-        b.pad_used += rows.len() as u16;
-        b.next_row = row;
-        rows
-    }
-
     pub(crate) fn is_open(&self, block_id: BlockId) -> bool {
         self.blocks.contains_key(&block_id)
     }
@@ -550,7 +510,6 @@ impl BlockTable {
             released: 0,
             next_row: 0,
             extra_used: 0,
-            pad_used: 0,
             repairs: Vec::new(),
             last_sent: None,
             deferred_at: None,
@@ -1621,128 +1580,6 @@ mod tests {
         x.block_id = 42;
         assert!(t.on_request(x, t0).is_empty());
         assert_eq!(t.stats().request_unknown, 1);
-    }
-
-    /// Pad rows are fresh, bounded by the pad budget and the row space, and
-    /// never overlap a requested or planned row, whatever order the two are
-    /// asked in (a property over many `(k, r)` and interleavings).
-    #[test]
-    fn pad_rows_are_fresh_bounded_and_never_overlap_a_requested_row() {
-        let t0 = Instant::now();
-        let mut x = 0x9e37_79b9_7f4a_7c15u64;
-        let mut rnd = move |m: u64| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x % m
-        };
-        let (mut pad_total, mut req_total, mut capped, mut clamped) = (0usize, 0usize, 0, 0);
-        for _ in 0..400 {
-            // Large k is where `255 - k` binds.
-            let k = if rnd(4) == 0 {
-                240 + rnd(15) as u8
-            } else {
-                1 + rnd(30) as u8
-            };
-            let r = 1 + rnd(8) as u8;
-            let mut t = setup(k, r, tile, t0);
-            let mut used: std::collections::BTreeSet<u8> = (0..r).collect();
-            let mut pad_rows = 0usize;
-            for _ in 0..20 {
-                if rnd(2) == 0 {
-                    let a = t.on_request(ask(0, 1 + rnd(3) as u8, rnd(6) as u8), t0);
-                    for act in a {
-                        let Action::Repair { row, .. } = act else {
-                            panic!()
-                        };
-                        assert!(used.insert(row), "requested row {row} reused");
-                        req_total += 1;
-                    }
-                } else {
-                    let n = 1 + rnd(5) as usize;
-                    let rows = t.reserve_pad_rows(BLK, n);
-                    assert!(rows.len() <= n);
-                    for row in &rows {
-                        assert!(used.insert(*row), "pad row {row} reused");
-                        assert!(*row >= r, "never a planned row");
-                        assert!(
-                            u16::from(*row) <= 255 - u16::from(k),
-                            "inside the row space"
-                        );
-                    }
-                    pad_rows += rows.len();
-                    assert!(
-                        pad_rows <= usize::from(pad_rows_cap(r)),
-                        "over the pad budget"
-                    );
-                    pad_total += rows.len();
-                    if rows.len() < n && pad_rows == usize::from(pad_rows_cap(r)) {
-                        capped += 1;
-                    } else if rows.len() < n {
-                        clamped += 1;
-                    }
-                }
-            }
-        }
-        // The measurement is not vacuous: both kinds were issued, and both
-        // limits (the budget and the row space) were hit.
-        assert!(pad_total > 0 && req_total > 0, "{pad_total} {req_total}");
-        assert!(capped > 0, "the pad budget never bound");
-        assert!(clamped > 0, "the 255 - k clamp never bound");
-    }
-
-    /// The pad budget is its own: spending the `r + 4` of requested rows
-    /// leaves it whole, and the other way round, as long as rows remain.
-    #[test]
-    fn pad_rows_are_independent_of_the_request_cap() {
-        let t0 = Instant::now();
-        let mut t = setup(10, 2, tile, t0);
-        // Exhaust the request cap (r + 4 = 6).
-        let a = t.on_request(ask(0, 6, 0), t0);
-        assert_eq!(a.len(), 6);
-        assert!(t.on_request(ask(0, 1, 0), t0).is_empty(), "premise: capped");
-        assert!(t.stats().request_over_cap >= 1);
-        let rows = t.reserve_pad_rows(BLK, 10);
-        assert_eq!(
-            rows.len(),
-            usize::from(pad_rows_cap(2)),
-            "the whole pad budget"
-        );
-        assert_eq!(rows, vec![8, 9, 10, 11], "after the requested rows 2..=7");
-        // And the PTO's share is not touched by padding: pads took no
-        // `extra_used`, so with a fresh block the PTO still has its row.
-        let mut t = setup(10, 2, tile, t0);
-        assert_eq!(t.reserve_pad_rows(BLK, 4).len(), 4);
-        assert!(t.on_pto(BLK).is_some(), "PTO still has its rows");
-    }
-
-    /// Only a block in `Phase::Repair` takes pad rows.
-    #[test]
-    fn pad_rows_come_only_from_a_block_in_repair() {
-        let t0 = Instant::now();
-        // Unknown block.
-        let mut t = setup(4, 2, tile, t0);
-        assert!(t.reserve_pad_rows(99, 2).is_empty());
-        // Still sending: not closed yet.
-        let mut s = BlockTable::new();
-        assert!(s
-            .on_source_sealed(BLK, 0, src(BLK, 100, 0), vec![(1000, tile(0))])
-            .is_empty());
-        assert!(s.reserve_pad_rows(BLK, 2).is_empty(), "Sending");
-        // Deferred: held reached k.
-        for q in [100, 101, 102] {
-            t.on_arrival(q, t0);
-        }
-        t.on_arrival(200, t0);
-        assert_eq!(t.blocks[&BLK].phase, Phase::Deferred);
-        assert!(t.reserve_pad_rows(BLK, 2).is_empty(), "Deferred");
-        // Closed and freed.
-        t.on_recovered(103, t0);
-        assert!(t.closed_reason(BLK).is_some());
-        assert!(t.reserve_pad_rows(BLK, 2).is_empty(), "freed");
-        // And a block in Repair does give rows (the control).
-        let mut t = setup(4, 2, tile, t0);
-        assert_eq!(t.reserve_pad_rows(BLK, 2), vec![2, 3]);
     }
 
     #[test]

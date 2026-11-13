@@ -958,8 +958,6 @@ pub struct IoBridge {
     fec_adapt: Option<crate::transport::fec_tx::adapt::FecAdapt>,
     /// Encoded REPAIR frames waiting for admission, oldest first.
     pending_repairs: std::collections::VecDeque<block_tx::RepairJob>,
-    /// Probe tags of the pad repairs in flight, by `bundle_seq`.
-    pad_repair_tags: block_tx::PadRepairTags,
     block_tx: block_tx::BlockTxStats,
     /// Sealed bundles quinn has not taken yet, oldest first. Their ledger
     /// records exist; they are sent before anything newer.
@@ -1633,7 +1631,6 @@ impl IoBridge {
             fec_adapt: (lib_config.transport.fec_mode == crate::config::FecMode::Adaptive)
                 .then(crate::transport::fec_tx::adapt::FecAdapt::new),
             pending_repairs: Default::default(),
-            pad_repair_tags: Default::default(),
             block_tx: Default::default(),
             last_enqueued_was_short: false,
             #[cfg(test)]

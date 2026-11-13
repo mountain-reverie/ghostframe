@@ -170,7 +170,6 @@ impl IoBridge {
         self.packer.reset();
         self.block_table.reset();
         self.pending_repairs.clear();
-        self.pad_repair_tags.clear();
         self.pending_bundles.clear();
         self.last_refused_bundle = None;
         self.last_enqueued_was_short = false;
