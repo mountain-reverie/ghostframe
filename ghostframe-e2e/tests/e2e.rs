@@ -3353,8 +3353,40 @@ async fn e2e_headroom_guard_forces_h264() -> Result<()> {
 
     eprintln!("M3.6b headroom: tile={tile_total} frame={frame_total}");
 
-    let decisions = mode_decisions(&helpers::read_server_logs_stripped("ghostframe-server"));
+    // The server's own evidence, polled for rather than slept on: the
+    // `RefManager` planned frames (`h264 refs` `plans`) and the client
+    // acknowledged H.264 fragments (`h264 stats` `tx_acked_live`). Both are
+    // cumulative, so they cannot be missed by sampling at the wrong moment.
+    let evidence_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let (logs, plans, acked) = loop {
+        let logs = helpers::read_server_logs_stripped("ghostframe-server");
+        let last = |marker: &str, field: &str| {
+            logs.lines()
+                .rfind(|l| l.contains(marker))
+                .and_then(|l| helpers::cleanup::log_field_u64(l, field))
+                .unwrap_or(0)
+        };
+        let plans = last("h264 refs (acked-reference recovery", "plans");
+        let acked = last("h264 stats (IDR causes", "tx_acked_live");
+        if (plans > 0 && acked > 0) || tokio::time::Instant::now() >= evidence_deadline {
+            break (logs, plans, acked);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    eprintln!("M3.6b headroom server evidence: plans={plans} tx_acked_live={acked}");
+
+    let decisions = mode_decisions(&logs);
     eprintln!("mode decisions: {decisions:?}");
+    assert!(
+        plans > 0,
+        "the headroom guard engaged but the server never planned an H.264 frame; \
+         decisions: {decisions:?}"
+    );
+    assert!(
+        acked > 0,
+        "H.264 frames were sent but the client acknowledged none of their fragments \
+         (tx_acked_live=0); decisions: {decisions:?}"
+    );
     let first = decisions
         .iter()
         .find(|d| d.to == "H264")
@@ -3367,9 +3399,11 @@ async fn e2e_headroom_guard_forces_h264() -> Result<()> {
     );
 
     // What this test owns is the decision, not a datagram count: how many
-    // H.264 datagrams fit in a 5 s window swings from 129 to 316 with
-    // machine load, so any threshold on it is marginal. Assert instead that
-    // H.264 frames were delivered at all, and that once the guard had engaged
+    // H.264 datagrams fit in a 5 s window swings from 127 to 2958 with
+    // machine load (an H.264 frame at 800 kbit/s is a handful of fragments,
+    // and the static/motion cycle changes how many frames there are), so any
+    // threshold on it is marginal. The server evidence above says H.264 ran;
+    // here: that a frame datagram reached the client, and that once the guard had engaged
     // nothing took the classifier back out (the estimate is pinned at
     // 800 kbit/s, so the guard never releases). Tile/frame ratios do not
     // survive refinement bursts, so none is asserted.
