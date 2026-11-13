@@ -107,9 +107,16 @@ impl IoBridge {
                 p.report_lost_pre_fec_total += u64::from(r.lost_pre_fec);
                 p.report_recovered = r.recovered;
                 p.report_residual = r.residual_lost;
+                // Measurement, in every mode: the reports with a loss, and of
+                // those the ones read under a standing queue (the predicate
+                // `congestion_skips` counts).
+                let queue = self.bwe.standing_queue();
+                if r.lost_pre_fec > 0 {
+                    self.transport_probe.reports_with_loss += 1;
+                    self.transport_probe.report_queue_reads += u64::from(queue);
+                }
                 if self.fec_adapt.is_some() {
                     let now_us = self.reliable_emitter.emit_us64(now_std());
-                    let queue = self.bwe.standing_queue();
                     if let Some(a) = self.fec_adapt.as_mut() {
                         a.on_report(&r, queue, now_us);
                     }
