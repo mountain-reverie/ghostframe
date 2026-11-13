@@ -67,21 +67,77 @@ impl Stat {
     }
 
     /// `(name, unit, kind, group, label)`.
-    fn def(self) -> (&'static str, &'static str, MetricKind, MetricGroup, &'static str) {
+    fn def(
+        self,
+    ) -> (
+        &'static str,
+        &'static str,
+        MetricKind,
+        MetricGroup,
+        &'static str,
+    ) {
         use MetricGroup::{Bandwidth, Connection, Loss, Video};
         use MetricKind::{Counter, Gauge, Text};
         match self {
-            Stat::RttSmoothed => ("ghostframe.rtt.smoothed", "ms", Gauge, Connection, "Round-trip time"),
-            Stat::SessionUptime => ("ghostframe.session.uptime", "s", Gauge, Connection, "Session uptime"),
-            Stat::BweEstimate => ("ghostframe.bwe.estimate", "bit/s", Gauge, Bandwidth, "Bandwidth estimate"),
-            Stat::RateTarget => ("ghostframe.rate.target", "bit/s", Gauge, Bandwidth, "Rate target"),
+            Stat::RttSmoothed => (
+                "ghostframe.rtt.smoothed",
+                "ms",
+                Gauge,
+                Connection,
+                "Round-trip time",
+            ),
+            Stat::SessionUptime => (
+                "ghostframe.session.uptime",
+                "s",
+                Gauge,
+                Connection,
+                "Session uptime",
+            ),
+            Stat::BweEstimate => (
+                "ghostframe.bwe.estimate",
+                "bit/s",
+                Gauge,
+                Bandwidth,
+                "Bandwidth estimate",
+            ),
+            Stat::RateTarget => (
+                "ghostframe.rate.target",
+                "bit/s",
+                Gauge,
+                Bandwidth,
+                "Rate target",
+            ),
             Stat::SentBytes => ("ghostframe.sent.bytes", "By", Counter, Bandwidth, "Sent"),
             Stat::FrameMode => ("ghostframe.frame.mode", "1", Text, Video, "Frame mode"),
-            Stat::ModeReason => ("ghostframe.frame.mode_reason", "1", Text, Video, "Mode reason"),
+            Stat::ModeReason => (
+                "ghostframe.frame.mode_reason",
+                "1",
+                Text,
+                Video,
+                "Mode reason",
+            ),
             Stat::H264Backend => ("ghostframe.h264.backend", "1", Text, Video, "H.264 encoder"),
-            Stat::LossPathResends => ("ghostframe.loss.path_resends", "1", Counter, Loss, "Loss-path resends"),
-            Stat::LossVerdicts => ("ghostframe.loss.verdicts", "1", Counter, Loss, "Loss verdicts"),
-            Stat::NacksReceived => ("ghostframe.loss.nacks_received", "1", Counter, Loss, "NACKs received"),
+            Stat::LossPathResends => (
+                "ghostframe.loss.path_resends",
+                "1",
+                Counter,
+                Loss,
+                "Loss-path resends",
+            ),
+            Stat::LossVerdicts => (
+                "ghostframe.loss.verdicts",
+                "1",
+                Counter,
+                Loss,
+                "Loss verdicts",
+            ),
+            Stat::NacksReceived => (
+                "ghostframe.loss.nacks_received",
+                "1",
+                Counter,
+                Loss,
+                "NACKs received",
+            ),
         }
     }
 
@@ -235,12 +291,16 @@ mod tests {
 
     #[test]
     fn every_stat_is_in_all_exactly_once() {
-        // `ALL` is written by hand; the exhaustive `id()` match is the compiler's
-        // list. Their sizes must agree, or a new variant is silently unsampled.
+        // `ALL` is written by hand and the compiler cannot compare it with the
+        // enum: the literal 11 below is the guard. Adding a variant means
+        // updating `ALL` and this number together.
         let n = Stat::ALL.len();
         let distinct: std::collections::HashSet<u16> = Stat::ALL.iter().map(|s| s.id()).collect();
         assert_eq!(distinct.len(), n);
-        assert_eq!(n, 11, "the v1 table; update the spec table when this changes");
+        assert_eq!(
+            n, 11,
+            "the v1 table; update the spec table when this changes"
+        );
     }
 
     #[test]
@@ -274,15 +334,28 @@ mod tests {
         let schema = schema(3);
         let values = inputs.values();
         assert_eq!(values.len(), schema.metrics.len());
-        let by_name = |n: &str| {
+        use MetricValue::{Num, Text};
+        let expect = [
+            ("ghostframe.rtt.smoothed", Num(18.5)),
+            ("ghostframe.session.uptime", Num(61.0)),
+            ("ghostframe.bwe.estimate", Num(42_100_000.0)),
+            ("ghostframe.rate.target", Num(33_000_000.0)),
+            ("ghostframe.sent.bytes", Num(9_000_000.0)),
+            ("ghostframe.frame.mode", Text("h264".into())),
+            (
+                "ghostframe.frame.mode_reason",
+                Text("bandwidth_short".into()),
+            ),
+            ("ghostframe.h264.backend", Text("libva-direct".into())),
+            ("ghostframe.loss.path_resends", Num(4.0)),
+            ("ghostframe.loss.verdicts", Num(5.0)),
+            ("ghostframe.loss.nacks_received", Num(6.0)),
+        ];
+        assert_eq!(expect.len(), schema.metrics.len());
+        for (n, want) in expect {
             let i = schema.metrics.iter().position(|m| m.name == n).expect(n);
-            values[i].clone()
-        };
-        assert_eq!(by_name("ghostframe.rtt.smoothed"), MetricValue::Num(18.5));
-        assert_eq!(by_name("ghostframe.bwe.estimate"), MetricValue::Num(42_100_000.0));
-        assert_eq!(by_name("ghostframe.frame.mode_reason"), MetricValue::Text("bandwidth_short".into()));
-        assert_eq!(by_name("ghostframe.h264.backend"), MetricValue::Text("libva-direct".into()));
-        assert_eq!(by_name("ghostframe.loss.nacks_received"), MetricValue::Num(6.0));
+            assert_eq!(values[i], want, "{n}");
+        }
     }
 
     #[test]
@@ -290,8 +363,13 @@ mod tests {
         let s = schema(9);
         assert_eq!(s.schema_id, 9);
         assert_eq!(s.server_version, SERVER_VERSION);
-        assert!(!s.host_name.is_empty(), "falls back to `unknown`, never empty");
-        let frame = s.try_encode_frame().expect("the table fits the 16 KiB frame");
+        assert!(
+            !s.host_name.is_empty(),
+            "falls back to `unknown`, never empty"
+        );
+        let frame = s
+            .try_encode_frame()
+            .expect("the table fits the 16 KiB frame");
         assert!(frame.len() - 3 <= SERVER_FRAME_MAX_LEN);
         assert_eq!(frame[0], SERVER_MSG_STATS_SCHEMA);
         let back = StatsSchema::decode_payload(&frame[3..]).expect("decodes");
@@ -300,9 +378,16 @@ mod tests {
 
     #[test]
     fn groups_cover_the_four_panel_sections() {
-        let groups: std::collections::HashSet<u8> =
-            Stat::ALL.iter().map(|s| s.descriptor().group.as_u8()).collect();
-        for g in [MetricGroup::Connection, MetricGroup::Bandwidth, MetricGroup::Video, MetricGroup::Loss] {
+        let groups: std::collections::HashSet<u8> = Stat::ALL
+            .iter()
+            .map(|s| s.descriptor().group.as_u8())
+            .collect();
+        for g in [
+            MetricGroup::Connection,
+            MetricGroup::Bandwidth,
+            MetricGroup::Video,
+            MetricGroup::Loss,
+        ] {
             assert!(groups.contains(&g.as_u8()), "no metric in {g:?}");
         }
     }

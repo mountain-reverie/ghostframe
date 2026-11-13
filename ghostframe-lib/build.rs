@@ -71,7 +71,11 @@ fn emit_build_version(manifest_dir: &str) {
     // Tracked files only: this repository keeps untracked notes in its root,
     // and a flag that is always on says nothing.
     let dirty = commit.is_some()
-        && git(manifest_dir, &["status", "--porcelain", "--untracked-files=no"]).is_some();
+        && git(
+            manifest_dir,
+            &["status", "--porcelain", "--untracked-files=no"],
+        )
+        .is_some();
     println!(
         "cargo:rustc-env=GHOSTFRAME_BUILD_VERSION={}",
         format_version(&pkg, commit.as_deref(), dirty)
