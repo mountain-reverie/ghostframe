@@ -18,7 +18,7 @@
 
 - **Leptos 0.9.0-rc1 compiles** for `wasm32-unknown-unknown` with the repo's `rust-toolchain.toml` (1.96.1) and on the host (needed: `cargo clippy --workspace --all-targets` and `cargo test --workspace --lib` compile every member natively). Adding it to a copy of the repo lockfile kept `wasm-bindgen 0.2.129` and added 68 packages without bumping existing ones.
 - **`wasm-pack test --headless --chrome` works here** (Chromium 156 and chromedriver 156 are installed; wasm-pack downloads the matching `wasm-bindgen-test-runner`). No `wasm-bindgen-test-runner` is on `PATH`; wasm-pack does not need it there.
-- **Size (spec gap, see Self-review):** `ghostframe-client-wasm` with the panel linked is about 487 KB after `wasm-pack build --target web` (default release profile), 423 KB with `opt-level=s`, LTO, one codegen unit and `panic=abort`, against 168 KB today. A trivial Leptos mount alone is 45 KB; the panel's `format!`, `String` and `Vec` use is the rest. PR 3's 320 KB cap cannot hold with Leptos as specified. This plan records the numbers (Task 16) and does not add the cap.
+- **Size (spec gap, see Self-review):** `ghostframe-client-wasm` with the panel linked is about 487 KB after `wasm-pack build --target web` (default release profile), 423 KB with `opt-level=s`, LTO, one codegen unit and `panic=abort`, against 168 KB today. A trivial Leptos mount alone is 45 KB; the panel's `format!`, `String` and `Vec` use is the rest. The spec's original 320 KB cap could not hold. **Owner decision (2026-11-13): the cap is 512 KiB raw (524,288 bytes), and Task 15b shrinks the panel by size-optimising only the Leptos stack.** This plan records the numbers (Task 16); PR 3 adds the guard.
 - **No JS-called export can re-enter while a panel borrow is held.** The panel borrows the core only inside `CoreBackend::view` and `CoreBackend::set_subscribed`, both of which return an owned value or `()` and call no JS inside the borrow (`view` reads the clock *before* it borrows: `performance.now()` is a JS import); browser timers and click handlers run as separate tasks, never inside a `WasmClientCore` call, and no `WasmClientCore` method calls back into JS (they only build values with `serde_wasm_bindgen`). The `try_borrow*` forms are used anyway so a failed borrow costs one refresh instead of trapping the module.
 - **Residual risk: a panic.** The panel shares the wasm instance with the session, and a Rust panic traps the module (`ghostframe-client-wasm/src/lib.rs`: "every later call traps"). `main.ts`'s try/catch contains a *mount* error only; a panic in a panel timer or click handler would end the session. The panel code is therefore written panic-free (no `unwrap`/`expect`/unchecked indexing on view data; Task 14 greps for it) and the limitation is stated in the PR description.
 - **Version string.** `.git` is a file in a worktree, so `build.rs` asks `git rev-parse --git-path` for `HEAD`, `index` and `refs/heads` instead of hard-coding `.git/...`. `git status --porcelain` is run with `--untracked-files=no`: a developer checkout always has untracked files (this one has four), which would make every local build "dirty". The flag is display-only and best-effort: `versions_match` ignores it (PR 1's rule, Task 3).
@@ -3934,6 +3934,140 @@ Recorded when this plan was revised (re-run it; the tree may have moved): the fi
 
 Because the daemon embeds the web client, the e2e image must be rebuilt to exercise any of this locally (`just containers-build`, only if no other worktree's e2e is using the shared image tag). If it is not run locally, CI's `e2e` job is the check: after pushing, read the results of `e2e_h264_ssim_golden` and the scroll-scene tests specifically, and record the outcome (or "not run locally; CI green") in the PR description. A failure there is a finding against this task, not something to loosen a threshold for.
 
+## Task 15b: Shrink the panel's share of the wasm (owner decision 2026-11-13)
+
+**Model:** sonnet
+
+The owner accepted a 512 KiB raw cap (PR 3's guard) **and** asked for the
+panel to be made smaller without touching the protocol core's code
+generation: `ghostframe-client-core`, `ghostframe-protocol` and
+`ghostframe-client-wasm` stay at the release profile's `opt-level = 3`. Each
+step below is measured; a step that saves less than 2 % of the wasm is reverted
+rather than kept.
+
+**Files:**
+- Modify: `Cargo.toml` (workspace root, `[profile.release.package.*]` sections)
+- Modify: `ghostframe-web-ui/src/components.rs` (or whichever file Task 11 put the components in)
+
+- [ ] **Step 1: Baseline.**
+
+```bash
+cd ~/work/gf-stats-client/ghostframe-web-client
+npm run build:wasm 2>&1 | tail -2; echo "rc=${PIPESTATUS[0]}"
+stat -c %s pkg-web/ghostframe_client_wasm_bg.wasm
+gzip -c pkg-web/ghostframe_client_wasm_bg.wasm | wc -c
+```
+
+Write the two numbers down (call them A_raw, A_gz).
+
+- [ ] **Step 2: List the Leptos crates that land in the wasm.**
+
+```bash
+cd ~/work/gf-stats-client
+cargo tree -p ghostframe-web-ui --target wasm32-unknown-unknown -e normal --prefix none \
+  | sed 's/ v.*//' | sort -u
+```
+
+Keep the runtime crates of the Leptos stack (expect at least `leptos`,
+`tachys`, `reactive_graph`, `any_spawner`, `or_poisoned`, `throw_error`,
+`leptos_dom`, `hydration_context`, `oco_ref`, `send_wrapper`; trust the output,
+not this list). Exclude proc-macro crates (`leptos_macro`, `*_macro`,
+`syn`, `quote`, `proc-macro2`): they run on the host and do not reach the
+wasm.
+
+- [ ] **Step 3: Size-optimise only those crates plus `ghostframe-web-ui`.**
+Append to the workspace `Cargo.toml`, one section per crate from step 2:
+
+```toml
+# Size over speed for the stats panel's UI stack only (owner decision
+# 2026-11-13, docs/specs/stats-panel-design.md section 5). The protocol core
+# (ghostframe-client-core, ghostframe-protocol, ghostframe-client-wasm) keeps
+# the release profile's opt-level 3: it is on the datagram hot path.
+[profile.release.package.ghostframe-web-ui]
+opt-level = "s"
+
+[profile.release.package.leptos]
+opt-level = "s"
+
+[profile.release.package.tachys]
+opt-level = "s"
+
+[profile.release.package.reactive_graph]
+opt-level = "s"
+```
+
+(and so on for every crate step 2 listed). None of these crates is in the
+daemon's graph, so the server build is unaffected; confirm with
+
+```bash
+cargo tree -p ghostframe-server -e normal --prefix none | grep -cE '^(leptos|tachys|reactive_graph) ' || true
+```
+
+Expected: `0`.
+
+- [ ] **Step 4: Measure** as in step 1 (B_raw, B_gz). Keep the change if
+B_raw is at least 2 % below A_raw; otherwise revert the `Cargo.toml` hunk.
+
+- [ ] **Step 5: Type-erase the repeated views.** In the components, every
+`view!` that is returned from a `<For>` row closure, from a `match` on
+`MetricKind`, or from an `if`/`else` (stale versus fresh, text versus number),
+ends in `.into_any()`, and the component functions that return them return
+`AnyView` instead of `impl IntoView`:
+
+```rust
+use leptos::prelude::*;
+
+#[component]
+fn MetricRow(row: RowView) -> AnyView {
+    match row.kind {
+        MetricKind::Text => view! { <TextRow row=row/> }.into_any(),
+        _ => view! { <NumberRow row=row/> }.into_any(),
+    }
+}
+```
+
+This stops one monomorphised copy of the renderer per view shape. Build and run
+the panel's tests:
+
+```bash
+cd ~/work/gf-stats-client
+cargo clippy -p ghostframe-web-ui --target wasm32-unknown-unknown --all-targets -- -D warnings
+cargo test -p ghostframe-web-ui
+just test-web-ui
+```
+
+Expected: clean clippy, all tests pass (the browser test from Task 10 still
+finds every `data-testid` hook).
+
+- [ ] **Step 6: Measure** (C_raw, C_gz). Keep it if C_raw is at least 2 %
+below the previous kept size; otherwise revert the components hunk.
+
+- [ ] **Step 7: Check the hot path did not move.** The core must still be
+built at opt-level 3:
+
+```bash
+cd ~/work/gf-stats-client
+cargo build --release -p ghostframe-client-wasm --target wasm32-unknown-unknown -v 2>&1 \
+  | grep -E "Running .*--crate-name ghostframe_client_core" | grep -o "opt-level=[0-9sz]"
+```
+
+Expected: `opt-level=3`.
+
+- [ ] **Step 8: Commit** the kept changes, with the measured numbers (A, B, C)
+in the commit body:
+
+```bash
+git add Cargo.toml ghostframe-web-ui/src/components.rs
+git commit -m "perf(web-ui): size-optimise the panel's UI stack only
+
+<A_raw> -> <final_raw> bytes raw (<A_gz> -> <final_gz> gzip).
+The protocol core keeps opt-level 3.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+(Stage only the files you kept changes in.) Task 16 records the final sizes.
+
 ## Task 16: Record the bundle sizes; document the crate and the recipe
 
 **Model:** haiku
@@ -3981,10 +4115,10 @@ Expected (measured on a scratch copy during planning, default release profile): 
 
 Size-optimised profile (`opt-level = "s"`, LTO, one codegen unit, `panic = "abort"`), measured through `CARGO_PROFILE_RELEASE_*` only, nothing committed: <size-opt raw> bytes raw, <size-opt gzip> gzip.
 
-The spec's 320 KB cap (`docs/specs/stats-panel-design.md` section 5) does not hold with Leptos linked: <after raw> bytes raw. **PR 3's `ci/check-wasm-size.sh` must not be written with 320 KiB.** Its cap comes from the owner's decision (raise it, accept the size, or slim the panel); the decision, once made, is recorded here: `PR 3 cap: <bytes> (decided <date>)`.
+The spec's original 320 KB cap did not hold with Leptos linked (<after raw> bytes raw). Record the owner's decision here: `PR 3 cap: 524,288 bytes raw (512 KiB), decided 2026-11-13`.
 ```
 
-- [ ] **Step 2b: Record the PR 3 precondition.** This is a gate, not an open question: PR 3's plan hard-codes `max_bytes=327680` in `ci/check-wasm-size.sh` and its Justfile/`ci.yml` wiring, and that guard fails closed, so PR 3 as written goes red on this PR's bundle. State in this PR's description, as the first line of its "Before PR 3" section: "PR 3's Task for `ci/check-wasm-size.sh` and its self-test must take the cap from the owner's decision (see `docs/specs/wasm-bundle-baseline.md`), not from the spec's 320 KiB; do not start it before that line in the baseline file is filled in." The PR 3 plan itself is not edited here.
+- [ ] **Step 2b: Check the bundle against PR 3's cap.** If the final wasm (after Task 15b) is over 524,288 bytes raw, stop and report to the owner before opening the PR: PR 3's guard would fail on it.
 
 - [ ] **Step 3: `DEVELOPERS.md`.** In the Clients table add, after the `ghostframe-client-wasm` row:
 
@@ -4062,7 +4196,7 @@ Use superpowers:requesting-code-review on the whole PR diff (`git diff master...
 - [ ] The re-entrancy audit in Task 14 is still true of the final diff (no export calls into JS while a borrow is held; `CoreBackend::view` reads the clock before it borrows), and the residual panic risk is stated in the PR description (no `unwrap`/`expect` outside tests in `ghostframe-web-ui/src` and `panel.rs`).
 - [ ] No `_ =>` over a project enum in non-test code of `ghostframe-client-core` (the crate warns on it); `tally_events` and the stats matches list variants.
 - [ ] No `/home/<user>` paths, no `git add -A` artefacts, `git status` clean, commit messages end with the co-author line.
-- [ ] The wasm size numbers in `docs/specs/wasm-bundle-baseline.md` are real measurements, the PR description states the 320 KB conflict, and the "PR 3 cap" line is either filled in with the owner's decision or the PR says PR 3 is blocked on it.
+- [ ] The wasm size numbers in `docs/specs/wasm-bundle-baseline.md` are real measurements, Task 15b's savings are in its commit body, and the wasm is under PR 3's 524,288-byte cap.
 - [ ] `versions_match` is PR 1's rule (crate version and commit only; `dirty` and `unknown` never fail it), and both mutation rows for it were observed red.
 - [ ] `ghostframe-web-ui` is in the e2e Dockerfile's per-crate copies; `just containers-build` is not needed for correctness (no server change), but the image must still build with the new member: run it if no other worktree's e2e is using the shared image tag, otherwise rely on CI's e2e image build.
 
@@ -4117,7 +4251,7 @@ All additive; no contract name is changed.
 
 ### Spec gaps found
 
-- **Size cap.** Section 5's 320 KB cap cannot hold: the module with the panel linked is about 487 KB (423 KB with a size-optimised profile), against 168 KB. PR 3 must not add the check as written.
+- **Size cap.** Section 5's original 320 KB cap could not hold (about 487 KB with the panel linked). Owner decision 2026-11-13: 512 KiB cap plus Task 15b's reduction.
 - **Dirty flag.** `git status --porcelain` is non-empty on every developer checkout because of untracked files (four here), so "dirty" would always be set. This plan uses `--untracked-files=no`. It is best-effort and display-only: stale until the build script reruns, and ignored by the match rule (adopted from PR 1, Contract deviation 9), so a disagreement between the server's and the client's flag cannot raise a false "versions differ" alert.
 - **A panel panic ends the session.** The panel shares the wasm instance with the session; only mount errors are contained by `main.ts`. See the Task 14 audit; stated in the PR description.
 - **Leptos 0.9.0 final** is not published; the pin is `=0.9.0-rc1` (the spec allows this).

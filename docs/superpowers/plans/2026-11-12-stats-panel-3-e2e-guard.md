@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Prove the stats panel works on a live session (open the tab, a subscribe goes out, server rows show a non-zero bandwidth estimate and RTT, closing the tab stops the samples), and fail the build when the shipped wasm exceeds 320 KiB.
+**Goal:** Prove the stats panel works on a live session (open the tab, a subscribe goes out, server rows show a non-zero bandwidth estimate and RTT, closing the tab stops the samples), and fail the build when the shipped wasm exceeds 512 KiB.
 
 **Architecture:** One new test in `ghostframe-e2e/tests/e2e.rs` (the `--test e2e` target that `.github/workflows/e2e.yml` already runs by name) drives the real page through CDP: it clicks the panel tab with a real mouse click and reads three live signals: `window.__ghostframeStatsFrames` (every complete server-stream frame the core received, counted before any schema or subscription check), `window.__ghostframeStatsSamples` (samples applied to the rings, schema-checked), and the panel's own DOM rows. The raw frame count is what proves the server stays silent while closed and after close; the applied count proves a schema-checked sample crossed the wire. Neither is derived from the other, so a client that ignores samples cannot make the "server stopped" assertion pass. The bundle guard is `ci/check-wasm-size.sh` (plus a self-test), wired into `just ci-local` and the `web-client` job of `ci.yml`. Sizes before and after the panel are recorded in `docs/specs/wasm-bundle-baseline.md`.
 
@@ -25,7 +25,7 @@
 | `ghostframe-web-client/src/main.ts` | Modify | Initialise both globals to 0 in e2e mode, and after each `core.handleServerStream(...)` publish `window.__ghostframeStatsSamples` and `window.__ghostframeStatsFrames` (e2e mode only, like the other polled globals). |
 | `ghostframe-web-client/src/globals.d.ts` | Modify | Types of the two new globals. |
 | `ghostframe-web-ui/src/*.rs` | Modify (hooks only) | `data-testid="stats-tab"`, `data-testid="stats-row"` with `data-label`, `data-current`, `data-stale`. Skipped for any hook PR 2 already has. |
-| `ci/check-wasm-size.sh` | Create | Fails if any `.wasm` in `ghostframe-web-client/dist/assets` is over 327,680 bytes (320 KiB), or if none exists. |
+| `ci/check-wasm-size.sh` | Create | Fails if any `.wasm` in `ghostframe-web-client/dist/assets` is over 524,288 bytes (512 KiB), or if none exists. |
 | `ci/test-check-wasm-size.sh` | Create | Self-test of the guard: under, at, over the limit, and no wasm at all. |
 | `Justfile` | Modify | `ci-local` runs both scripts after `just build-web`; new recipe `test-e2e-stats`. |
 | `.github/workflows/ci.yml` | Modify | `web-client` job runs both scripts after `npm run build`. |
@@ -935,7 +935,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Create: `ci/test-check-wasm-size.sh`
 - Create: `ci/check-wasm-size.sh`
 
-The limit is 320 KiB = 327,680 bytes of raw wasm (spec section 5: "fails the build if the wasm exceeds 320 KB"). The guard fails closed: no wasm in the directory is a failure, not a pass (a stale or missing `dist/` must not read as "small enough").
+The limit is 512 KiB = 524,288 bytes of raw wasm (spec section 5: "fails the build if the wasm exceeds 512 KiB"). The guard fails closed: no wasm in the directory is a failure, not a pass (a stale or missing `dist/` must not read as "small enough").
 
 - [ ] **Step 1: Write the self-test**
 
@@ -950,7 +950,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 guard=ci/check-wasm-size.sh
-limit=327680
+limit=524288
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 fail=0
@@ -1018,7 +1018,7 @@ Expected: the guard does not exist, so every run exits 127: seven `FAIL:` lines 
 
 ```bash
 #!/usr/bin/env bash
-# The web client's wasm must stay under 320 KiB (327,680 bytes, raw).
+# The web client's wasm must stay under 512 KiB (524,288 bytes, raw).
 #
 # docs/specs/stats-panel-design.md section 5: adding Leptos to the wasm module
 # is the biggest single size risk of the web client, and the wasm is what every
@@ -1038,7 +1038,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 assets="${1:-ghostframe-web-client/dist/assets}"
-max_bytes=327680
+max_bytes=524288
 
 shopt -s nullglob
 files=("$assets"/*.wasm)
@@ -1053,7 +1053,7 @@ for f in "${files[@]}"; do
     gz=$(gzip -c "$f" | wc -c)
     echo "$(basename "$f"): $size bytes raw, $gz bytes gzip (limit $max_bytes raw)"
     if ((size > max_bytes)); then
-        echo "::error::$(basename "$f") is $size bytes, over the $max_bytes byte (320 KiB) limit (see ci/check-wasm-size.sh)"
+        echo "::error::$(basename "$f") is $size bytes, over the $max_bytes byte (512 KiB) limit (see ci/check-wasm-size.sh)"
         status=1
     fi
 done
@@ -1073,7 +1073,7 @@ ci/test-check-wasm-size.sh; echo "exit=$?"
 ci/check-wasm-size.sh; echo "exit=$?"
 ```
 
-Expected: seven `ok:` lines and `exit=0`; the real build prints its wasm size (the number the baseline doc records) with `exit=0`. If the real wasm is over 327,680, the panel is too big: do not raise the limit here, report it (spec question for the owner).
+Expected: seven `ok:` lines and `exit=0`; the real build prints its wasm size (the number the baseline doc records) with `exit=0`. If the real wasm is over 524,288, the panel is too big: do not raise the limit here, report it (spec question for the owner).
 
 - [ ] **Step 5: Commit the guard, then break it and watch the self-test fail**
 
@@ -1082,10 +1082,10 @@ Commit first, so every mutation can be undone with `git checkout` and no backup 
 ```bash
 cd ~/work/gf-stats-e2e
 git add ci/check-wasm-size.sh ci/test-check-wasm-size.sh
-git commit -m "ci: fail the build when the web client's wasm exceeds 320 KiB
+git commit -m "ci: fail the build when the web client's wasm exceeds 512 KiB
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-sed -i 's/max_bytes=327680/max_bytes=9999999/' ci/check-wasm-size.sh
+sed -i 's/max_bytes=524288/max_bytes=9999999/' ci/check-wasm-size.sh
 ci/test-check-wasm-size.sh; echo "exit=$?"
 git checkout ci/check-wasm-size.sh
 ```
@@ -1120,7 +1120,7 @@ Expected: no output from `git status`, seven `ok:` lines, `exit=0`.
 In `Justfile`, directly after the line `    cd ghostframe-web-client && npx tsc --noEmit` inside `ci-local`:
 
 ```make
-    @echo "=== wasm bundle under 320 KiB ==="
+    @echo "=== wasm bundle under 512 KiB ==="
     ci/test-check-wasm-size.sh
     ci/check-wasm-size.sh
 ```
@@ -1134,7 +1134,7 @@ In `.github/workflows/ci.yml`, in the `web-client` job, after the `install + bui
       # the stats panel's Leptos is the first dependency that can blow it up.
       # The self-test keeps the guard honest (it fails closed on a missing
       # wasm and on a limit that no longer fires).
-      - name: wasm bundle under 320 KiB
+      - name: wasm bundle under 512 KiB
         run: |
           ci/test-check-wasm-size.sh
           ci/check-wasm-size.sh
@@ -1145,7 +1145,7 @@ In `.github/workflows/ci.yml`, in the `web-client` job, after the `install + bui
 In the "Traps" section, after the "`cargo build` does not rebuild the web client" paragraph, add:
 
 ```markdown
-**The web client's wasm has a size gate: 320 KiB.** `ci/check-wasm-size.sh`
+**The web client's wasm has a size gate: 512 KiB.** `ci/check-wasm-size.sh`
 reads `ghostframe-web-client/dist/assets/*.wasm` (so it needs `just build-web`
 first), runs in `just ci-local` and the `web-client` CI job, and fails closed
 when there is no wasm. Raise the limit only deliberately, and record the new
@@ -1240,7 +1240,7 @@ echo "before wasm: $bw bytes, after wasm: $aw bytes"
     echo
     echo "Both built from scratch with \`just build-web\` (\`npm run build\`), asset hashes masked."
     echo "**This section is a gate** for the wasm: \`ci/check-wasm-size.sh\` fails the build above"
-    echo "327,680 bytes (320 KiB) raw. The JS bundle has no gate."
+    echo "524,288 bytes (512 KiB) raw. The JS bundle has no gate."
     echo
     echo "### Before"
     echo
@@ -1256,7 +1256,7 @@ echo "before wasm: $bw bytes, after wasm: $aw bytes"
     echo
     echo "### Wasm delta"
     echo
-    echo "Raw: $bw -> $aw (+$((aw - bw)) bytes, $(( (aw - bw) * 100 / bw ))%). Limit 327,680; headroom $((327680 - aw)) bytes."
+    echo "Raw: $bw -> $aw (+$((aw - bw)) bytes, $(( (aw - bw) * 100 / bw ))%). Limit 524,288; headroom $((524288 - aw)) bytes."
 } >> docs/specs/wasm-bundle-baseline.md
 tail -30 docs/specs/wasm-bundle-baseline.md
 ```
@@ -1271,7 +1271,7 @@ bash <scratchpad>/measure-wasm-baseline.sh ~/work/gf-stats-e2e
 
 - [ ] **Step 3: Update the baseline doc's header**
 
-The file's header says "This is a record, not a gate" and "No size assertion or CI check is attached to these numbers." The new section says it is a gate for the wasm, so the header must not contradict it. Edit that paragraph (and only that) so the first sentence reads "This is a record. Since the stats panel it has one gate: `ci/check-wasm-size.sh` fails the build when the wasm exceeds 320 KiB; see the last section." and replace the sentence "No size assertion or CI check is attached to these numbers." with "The measurements in sections 1 to 3 and the 2026-09-11 and 2026-09-12 sections have no assertion attached; only the wasm limit in the last section does."
+The file's header says "This is a record, not a gate" and "No size assertion or CI check is attached to these numbers." The new section says it is a gate for the wasm, so the header must not contradict it. Edit that paragraph (and only that) so the first sentence reads "This is a record. Since the stats panel it has one gate: `ci/check-wasm-size.sh` fails the build when the wasm exceeds 512 KiB; see the last section." and replace the sentence "No size assertion or CI check is attached to these numbers." with "The measurements in sections 1 to 3 and the 2026-09-11 and 2026-09-12 sections have no assertion attached; only the wasm limit in the last section does."
 
 - [ ] **Step 4: Run the guard on the fresh build, check paths**
 
@@ -1363,7 +1363,7 @@ Review the whole PR diff (`git diff master...HEAD`) against `docs/specs/stats-pa
 1. Does the e2e prove what the spec says: open the panel, a subscribe goes out, server rows non-zero for bandwidth estimate and RTT, no samples after close? Could any assertion pass vacuously (counter from a stale page, rows present with 0, a sample in flight at close)?
 2. Are `window.__ghostframeStatsSamples` (applied) and `window.__ghostframeStatsFrames` (raw, counted before any check) live, written only from their counters, and gated like their siblings? Does the close assertion use the raw one? Does the note in `e2e_polled_globals_are_live` correctly explain its absence from `GLOBAL_PROBES`?
 3. Did each mutation in Tasks 3, 6 and 7 actually turn its test red (re-run two of them)?
-4. Is the guard fail-closed (no wasm, js-only, several wasm), the limit exactly 327,680, and are both `ci-local` and `ci.yml` wired?
+4. Is the guard fail-closed (no wasm, js-only, several wasm), the limit exactly 524,288, and are both `ci-local` and `ci.yml` wired?
 5. Are the baseline numbers reproducible with the commands in the doc, and does the doc contain no home paths?
 6. Does the e2e run in CI by name (`--test e2e` step, not skip-listed), and is nothing skip-listed or `#[ignore]`d?
 7. Hooks added to `ghostframe-web-ui` (if any): minimal, no behaviour change, no Leptos outside that crate?
@@ -1387,7 +1387,7 @@ Review the whole PR diff (`git diff master...HEAD`) against `docs/specs/stats-pa
 | 2.3 Input and focus | a tab click does not move keyboard focus onto the panel | 2 (`click_stats_tab` checks `activeElement` and `elementFromPoint`) |
 | 4 CI | new test target added to the workflow by name | 6 step 6 (it lives in the already-named `--test e2e` target; verified listed and not skip-listed) |
 | 5 Bundle size | record sizes before and after | 9 |
-| 5 Bundle size | CI fails above 320 KB | 7, 8 |
+| 5 Bundle size | CI fails above 512 KiB | 7, 8 |
 | 5 New workspace member in Dockerfile | `ghostframe-web-ui` COPY lines | 1 step 2 (verified, PR 2's job) |
 | 5 Gate | `just ci-local` under the GPU lock | 10 |
 | 6 item 3 | "E2E and guard" PR | whole plan |

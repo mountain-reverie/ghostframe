@@ -142,13 +142,20 @@ it through the C API is out of scope.
 
 ### 1.4 Version capture
 
-A `build.rs` in `ghostframe-server` and in `ghostframe-client-wasm` records
+A `build.rs` in `ghostframe-lib` and in `ghostframe-client-wasm` records
 `CARGO_PKG_VERSION`, the commit (`git rev-parse --short=8 HEAD`) and a dirty
-flag (`git status --porcelain` is non-empty). Outside a git checkout it records
+flag (tracked files modified, `git status --porcelain --untracked-files=no`). Outside a git checkout it records
 `unknown`. It reruns when `.git/HEAD` or `.git/index` changes. No build
 timestamp: builds stay reproducible.
 
-The panel compares the two. A mismatch almost always means the browser runs a
+The version `build.rs` for the server lives in `ghostframe-lib`, which builds
+the schema (the server reports `ghostframe-lib`'s crate version). Untracked
+files do not make a build dirty. Git is run with `--no-optional-locks` so the
+build script never rewrites the index it watches.
+
+The panel compares the two on crate version and commit only: `dirty` is shown
+but never fails the match (the dirty flag can lag, since each side computes it
+when its own crate rebuilds), and an `unknown` commit is not a mismatch. A mismatch almost always means the browser runs a
 stale cached bundle, so it says so: "versions differ — hard-reload
 (Ctrl+Shift+R)".
 
@@ -259,7 +266,13 @@ Every test is checked by breaking the code it guards and watching it go red.
   side adds Leptos and nothing from npm.
 - **Bundle size:** record wasm and JS bundle sizes before and after in the PR
   (baseline: `docs/specs/wasm-bundle-baseline.md`; today's wasm is 168 KB).
-  A CI check fails the build if the wasm exceeds 320 KB.
+  A CI check fails the build if the wasm exceeds 512 KiB raw. (The first
+  draft said 320 KB; a prototype measured about 487 KB raw / 189 KB gzip with
+  the panel linked, so the owner raised the cap on 2026-11-13.)
+- **Size reduction:** only the Leptos stack and `ghostframe-web-ui` are built
+  at `opt-level = "s"` (per-package profile overrides), and repeated views are
+  type-erased. The protocol core keeps opt-level 3: it is on the datagram hot
+  path. Each step is kept only if it saves at least 2 %.
 - **New workspace member:** `ghostframe-web-ui` must also be added to the e2e
   test-server Dockerfile's per-crate manifest copies, or the image build fails
   before any test runs.
