@@ -117,7 +117,7 @@ pub struct AckedRefEvidence {
 }
 
 /// Value of the numeric field `name=<digits>` on a log line.
-fn log_field_u64(line: &str, name: &str) -> Option<u64> {
+pub fn log_field_u64(line: &str, name: &str) -> Option<u64> {
     let needle = format!("{name}=");
     let mut from = 0;
     while let Some(i) = line[from..].find(&needle) {
