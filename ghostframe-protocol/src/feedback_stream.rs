@@ -50,6 +50,14 @@ pub const DISPLAY_INFO_MSG_TYPE: u8 = 0x07;
 /// Client display mode request.
 pub const DISPLAY_MODE_MSG_TYPE: u8 = 0x08;
 
+/// Client request to start or stop the server's connection-stats stream,
+/// `[STATS_SUBSCRIBE_MSG_TYPE, on]` with `on` 1 or 0; see
+/// [`crate::stats::StatsSubscribe`]. 0x0A is skipped: it is the frame-ack
+/// datagram envelope.
+pub const STATS_SUBSCRIBE_MSG_TYPE: u8 = 0x0B;
+/// Encoded length of a stats subscribe message.
+pub const STATS_SUBSCRIBE_SIZE: usize = 2;
+
 /// HELLO capability bit 0: the client can decode `indices_raw` PalRLE
 /// payloads (PalRLE flags bit 1).
 pub const HELLO_CAP_INDICES_RAW: u8 = 0x01;
@@ -123,7 +131,7 @@ impl ResetRequest {
 }
 
 /// Every feedback-stream message type, for exhaustiveness checks.
-pub const FEEDBACK_STREAM_MSG_TYPES: [u8; 7] = [
+pub const FEEDBACK_STREAM_MSG_TYPES: [u8; 8] = [
     FEEDBACK_MSG_TYPE,
     HELLO_MSG_TYPE,
     DECODE_ERROR_MSG_TYPE,
@@ -131,6 +139,7 @@ pub const FEEDBACK_STREAM_MSG_TYPES: [u8; 7] = [
     DISPLAY_INFO_MSG_TYPE,
     DISPLAY_MODE_MSG_TYPE,
     RESET_REQUEST_MSG_TYPE,
+    STATS_SUBSCRIBE_MSG_TYPE,
 ];
 
 #[cfg(test)]
@@ -219,5 +228,18 @@ mod tests {
         let mut longer = good.clone();
         longer.extend_from_slice(&[0xAA; 32]);
         assert!(ResetRequest::decode(&longer).is_some());
+    }
+
+    #[test]
+    fn stats_subscribe_is_registered_and_clear_of_the_ack_envelope() {
+        assert_eq!(STATS_SUBSCRIBE_MSG_TYPE, 0x0B);
+        assert_eq!(STATS_SUBSCRIBE_SIZE, 2);
+        assert!(
+            FEEDBACK_STREAM_MSG_TYPES.contains(&STATS_SUBSCRIBE_MSG_TYPE),
+            "a type missing from the table escapes the collision test"
+        );
+        // 0x0A is the frame-ack datagram envelope; keep it off the stream
+        // namespace so a dump of either channel stays unambiguous.
+        assert_ne!(STATS_SUBSCRIBE_MSG_TYPE, 0x0A);
     }
 }
