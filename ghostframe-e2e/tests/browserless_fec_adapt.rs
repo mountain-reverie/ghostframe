@@ -724,9 +724,41 @@ struct SweepRun {
     req_rows: u64,
     tx_evicted: u64,
     tx_cached_peak: u64,
+    /// Where the repair bytes went (TB0).
+    split: ghostframe_lib::transport::instruments::BlockRepairSplit,
+    /// Tile passes 0-3, emit to acknowledgement: count, mean (us) and the
+    /// upper bound (ms) of the bucket holding the 95th percentile.
+    crit_lat_n: u64,
+    crit_lat_mean_us: u64,
+    crit_lat_p95_ms: u64,
+}
+
+/// Upper bounds (ms) of `critical_latency_buckets`; the last is open-ended.
+const LAT_BOUNDS_MS: [u64; 8] = [5, 10, 20, 50, 100, 200, 500, 1000];
+
+/// Upper bound of the bucket holding the 95th percentile.
+fn p95_bucket_ms(b: &[u64; 8]) -> u64 {
+    let n: u64 = b.iter().sum();
+    let mut acc = 0;
+    for (i, c) in b.iter().enumerate() {
+        acc += c;
+        if n > 0 && acc * 100 >= n * 95 {
+            return LAT_BOUNDS_MS[i];
+        }
+    }
+    0
 }
 
 impl SweepRun {
+    /// A cause's wire bytes over the source wire bytes.
+    fn pts(&self, bytes: f64) -> f64 {
+        bytes / self.src_bytes.max(1) as f64
+    }
+    fn client_requests_per_block(&self) -> f64 {
+        self.client_requests as f64
+            / (self.accounted + self.declined + self.handed_off + self.timed_out).max(1) as f64
+    }
+
     /// Rows sent per served request (a shortened window asks for `needed`).
     fn req_rows_per_block(&self) -> f64 {
         self.req_rows as f64 / self.req_served.max(1) as f64
@@ -823,9 +855,7 @@ fn read_run(r: &BrowserlessResult, secs: u64, load: Load) -> SweepRun {
     let (t, i, a) = (&r.transport, &r.transport.instr, &r.transport.adapt);
     let repair_bytes = repairs(r);
     let (shown, late, never_fed) = frames_late(r);
-    let planned_rows = i
-        .block_repairs_sent
-        .saturating_sub(i.block_request_rows_sent + i.block_pto_repair_rows);
+    let planned_rows = i.block_split.rows[0];
     SweepRun {
         dropped: r.s2c_datagrams_dropped,
         offered_dg: r.s2c_datagrams_offered,
@@ -879,6 +909,10 @@ fn read_run(r: &BrowserlessResult, secs: u64, load: Load) -> SweepRun {
         req_rows: i.block_request_rows_sent,
         tx_evicted: i.block_evicted,
         tx_cached_peak: i.block_cached_bytes_peak,
+        split: i.block_split,
+        crit_lat_n: r.critical_latency_count,
+        crit_lat_mean_us: r.critical_latency_mean_us,
+        crit_lat_p95_ms: p95_bucket_ms(&r.critical_latency_buckets),
     }
 }
 
@@ -946,7 +980,110 @@ async fn sweep_run(cell: Cell, arm: Arm, seed: u64, scale: f64) -> SweepRun {
         out.req_rows,
         out.req_rows_per_block()
     );
+    print_split(cell, arm, seed, scale, &out);
     out
+}
+
+/// One line per run: where the repair wire bytes went, in points of the
+/// source wire bytes, and the planned rows in points of the source symbols.
+fn print_split(cell: Cell, arm: Arm, seed: u64, scale: f64, o: &SweepRun) {
+    let sp = &o.split;
+    let k = sp.sum_k.max(1) as f64;
+    let row_b = sp.bytes[0] as f64 / sp.rows[0].max(1) as f64;
+    println!(
+        "FECSPLIT cell={} arm={} scale={scale:.3} seed={seed:#x} total={:.4} initial_ideal={:.4} \
+         initial_pad={:.4} initial_hdr={:.4} request={:.4} pto={:.4} t_lr={:.4} other={:.4} \
+         trim_bytes={:.4} | rows/k: planned={:.4} (decided={:.4}) trim={:.4} cap_exact={:.4} \
+         request={:.4} pto={:.4} t_lr={:.4} | blocks={} k_mean={:.2} k_eff_mean={:.2} mixed={:.3} \
+         sym_over_src={:.4} | h264_blocks={} h264_k_ne_k={} | crit_lat n={} mean_us={} p95_ms<={} \
+         creq_per_block={:.3} delivered_per_s={:.2}",
+        cell.name(),
+        arm.name(),
+        o.pts(sp.bytes.iter().sum::<u64>() as f64),
+        o.pts(sp.initial_ideal_milli as f64 / 1000.0),
+        o.pts(sp.initial_pad_milli as f64 / 1000.0),
+        o.pts(sp.initial_header_bytes as f64),
+        o.pts(sp.bytes[1] as f64),
+        o.pts(sp.bytes[2] as f64),
+        o.pts(sp.bytes[3] as f64),
+        o.pts(sp.bytes[4] as f64),
+        o.pts(sp.rows_trim as f64 * row_b),
+        sp.rows[0] as f64 / k,
+        sp.rows_decided as f64 / k,
+        sp.rows_trim as f64 / k,
+        sp.rows_count_cap as f64 / k,
+        sp.rows[1] as f64 / k,
+        sp.rows[2] as f64 / k,
+        sp.rows[3] as f64 / k,
+        sp.blocks,
+        sp.sum_k as f64 / sp.blocks.max(1) as f64,
+        sp.sum_k_eff as f64 / sp.blocks.max(1) as f64,
+        sp.blocks_mixed as f64 / sp.blocks.max(1) as f64,
+        sp.sum_len as f64 / o.src_bytes.max(1) as f64,
+        sp.blocks_h264,
+        sp.blocks_h264_k_eff_ne_k,
+        o.crit_lat_n,
+        o.crit_lat_mean_us,
+        o.crit_lat_p95_ms,
+        o.client_requests_per_block(),
+        o.delivered_per_s,
+    );
+    // Criterion (3)'s rows/k, taken apart: the rule's rows at the estimate,
+    // the step limit holding `r` up, the trim, and what the oracle would give
+    // the blocks the run really closed (exact `k`), against the bar.
+    if let Some((enter, exit)) = cell.loss.chain() {
+        let (mut dp_rows, mut cap_mid) = (0.0, 0.0);
+        let mut memo = std::collections::HashMap::new();
+        for (kk, n) in sp.k_hist.iter().enumerate().filter(|(_, n)| **n > 0) {
+            let r = memo.entry(kk).or_insert_with(|| dp_r(kk, enter, exit).0);
+            dp_rows += f64::from(*n) * *r as f64;
+            cap_mid += f64::from(*n) * cap_rows(kk) as f64;
+        }
+        let hold = sp.rows_decided as f64 - sp.rows_rule as f64 - sp.rows_trim as f64;
+        println!(
+            "FECCRIT3 cell={} arm={} seed={seed:#x} rows/k: achieved(initial rows sent)={:.4} \
+             rule_at_estimate={:.4} step_limit_hold={:.4} trim={:.4} | oracle_exact_k={:.4} cap_exact={:.4} \
+             | bar_midpoint: cap={:.4} dp={:.4} (x1.25 = {:.4}) | repairs_not_planned: request={:.4} \
+             pto={:.4} t_lr={:.4} | old_planned(with t_lr)={:.4}",
+            cell.name(),
+            arm.name(),
+            sp.rows[0] as f64 / k,
+            sp.rows_rule as f64 / k,
+            hold / k,
+            sp.rows_trim as f64 / k,
+            dp_rows / k,
+            cap_mid / k,
+            o.rows_over_blocks(cap_rows),
+            o.rows_over_blocks(|kk| dp_r(kk, enter, exit).0),
+            1.25 * o.rows_over_blocks(|kk| dp_r(kk, enter, exit).0),
+            sp.rows[1] as f64 / k,
+            sp.rows[2] as f64 / k,
+            sp.rows[3] as f64 / k,
+            (sp.rows[0] + sp.rows[3]) as f64 / k,
+        );
+    }
+    let hist = |b: &[u32; 24]| {
+        b.iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(i, n)| {
+                let (lo, hi) = ghostframe_lib::transport::io_bridge::block_k_bucket_range(i);
+                if lo == hi {
+                    format!("{lo}:{n}")
+                } else {
+                    format!("{lo}-{hi}:{n}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    println!(
+        "FECSPLIT hist cell={} arm={} seed={seed:#x} k[{}] k_eff[{}]",
+        cell.name(),
+        arm.name(),
+        hist(&o.k_buckets),
+        hist(&sp.k_eff_buckets)
+    );
 }
 
 // ---- the oracle: P(more than r of n datagrams lost) and the smallest r ----
@@ -1743,6 +1880,82 @@ async fn requested_rows_arrive_inside_the_window_at_every_round_trip() {
         over.is_empty(),
         "late rows above 10 % of requests: {over:?}"
     );
+}
+
+// ---- TB0: where the repair bytes go ----------------------------------------
+
+/// Seeds of the breakdown scenes: `GHOSTFRAME_TB_SEEDS=<1..=5>`, 2 by default.
+fn tb_seeds() -> usize {
+    std::env::var("GHOSTFRAME_TB_SEEDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(2, |n| n.clamp(1, 5))
+}
+
+/// The parts of a run's repair bytes agree with the total the bridge offered,
+/// and every row has a cause (`FECSPLIT` lines carry the breakdown itself).
+fn assert_split_accounts(o: &SweepRun, ctx: &str) {
+    let sp = &o.split;
+    assert_eq!(
+        sp.bytes.iter().sum::<u64>(),
+        o.repair_bytes,
+        "the causes' bytes sum to the repair bytes offered, {ctx}"
+    );
+    assert_eq!(sp.rows[4], 0, "every row has a cause, {ctx}");
+    assert!(
+        sp.rows.iter().sum::<u64>() >= sp.rows[0] && sp.rows[0] > 0,
+        "premise: planned rows were sent, {ctx}"
+    );
+    // The initial rows' bytes are their ideal, padding and headers.
+    let parts = sp.initial_ideal_milli + sp.initial_pad_milli;
+    assert_eq!(
+        parts / 1000 + sp.initial_header_bytes,
+        sp.bytes[0],
+        "initial = ideal + padding + headers, {ctx}"
+    );
+    assert!(sp.blocks > 0 && sp.sum_k_eff <= sp.sum_k, "{ctx}");
+}
+
+/// TB0: on the tile cell and its controls, the repair wire bytes by cause
+/// (planned, request, probe timeout, `T_lr`), the padding to the longest
+/// symbol, the headers and the trim; and `k` against `k_eff`. Measurement:
+/// the assertions are that the parts add up and that each cause exists where
+/// it is supposed to.
+#[tokio::test(start_paused = true)]
+async fn the_repair_bytes_are_split_by_cause() {
+    let cells = [
+        Cell::new(Load::Tile, Loss::Iid(0.05), 10),
+        Cell::new(Load::Tile, Loss::Iid(0.01), 10),
+        Cell::new(Load::H264, Loss::Iid(0.05), 10),
+        Cell::new(Load::H264, GE3, 10),
+        Cell::new(Load::Tile, GE3, 10),
+    ];
+    for cell in cells {
+        for seed in &SWEEP_SEEDS[..tb_seeds()] {
+            let o = sweep_run(cell, Arm::Adaptive, *seed, 1.0).await;
+            let ctx = format!("{} seed {seed:#x}", cell.name());
+            assert!(o.engaged && o.dropped > 0, "premise: engaged, {ctx}");
+            assert_split_accounts(&o, &ctx);
+            match cell.load {
+                Load::Tile => {
+                    assert!(
+                        o.split.blocks_mixed > 0,
+                        "premise: a tile block of mixed symbol sizes, {ctx}"
+                    );
+                    assert_eq!(o.split.blocks_h264, 0, "{ctx}");
+                }
+                Load::H264 => {
+                    assert!(o.split.blocks_h264 > 0, "premise: H.264 blocks, {ctx}");
+                    // A frame is MTU-sized fragments: `k_eff == k` but for the
+                    // odd block whose last fragment is tiny.
+                    assert!(
+                        o.split.blocks_h264_k_eff_ne_k * 100 <= o.split.blocks_h264,
+                        "H.264 blocks are uniform, {ctx}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 // ---- the restated criteria (3), (5), (6): unit tests on synthetic runs -----

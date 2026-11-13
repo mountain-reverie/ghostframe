@@ -369,6 +369,16 @@ impl FecAdapt {
         d.r
     }
 
+    /// Rows the trim added to the last block's `r` (measurement).
+    pub(crate) fn last_trim(&self) -> u8 {
+        self.sizer.last_trim()
+    }
+
+    /// The rule's rows of the last block's `r`, before trim and pacing.
+    pub(crate) fn last_base(&self) -> u8 {
+        self.sizer.last_base()
+    }
+
     /// Records the parameters the bridge now runs; a different value is one
     /// change (engage, release, or a new span).
     pub(crate) fn note_applied(&mut self, live: Option<FecBlockParams>) {
