@@ -264,19 +264,19 @@ impl IoBridge {
         for &id in ids {
             self.fec_in.recovered_rx += 1;
             match self.transmission_ledger.peek(id) {
-                Some(tx) => found.push((tx.clone(), 0u16, false)),
+                Some(tx) => found.push((tx.clone(), 0u16, false, id)),
                 None => self.fec_in.recovered_unknown += 1,
             }
         }
         let emit_keys: Vec<crate::transport::reliable_emitter::EmitKey> = found
             .iter()
-            .flat_map(|(tx, _, _)| tx.records())
+            .flat_map(|(tx, _, _, _)| tx.records())
             .filter_map(|(_, c)| c.tile())
             .collect();
         self.reliable_emitter.on_ack(&emit_keys);
         let items: Vec<(crate::transport::reliable_emitter::Content, Option<bool>)> = found
             .iter()
-            .flat_map(|(tx, _, _)| tx.records().map(|(_, c)| (c, None)))
+            .flat_map(|(tx, _, _, _)| tx.records().map(|(_, c)| (c, None)))
             .collect();
         self.release_h264_content(&items, now);
         self.apply_ack_coverage(&found);
