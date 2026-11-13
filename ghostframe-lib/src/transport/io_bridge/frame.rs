@@ -2729,6 +2729,8 @@ impl IoBridge {
                     frames_skipped_pad = h.frames_skipped_pad,
                     probe_padding_windows = h.probe_padding_windows,
                     probe_padding_bytes = h.probe_padding_bytes,
+                    probe_padding_repair_datagrams = h.probe_padding_repair_datagrams,
+                    probe_padding_repair_bytes = h.probe_padding_repair_bytes,
                     pads_lost = h.pads_lost,
                     verdicts_idr_frag = h.verdicts_idr_frag,
                     verdicts_p_frag = h.verdicts_p_frag,

@@ -222,6 +222,11 @@ pub struct H264Stats {
     pub probe_padding_windows: u64,
     pub probe_padding_datagrams: u64,
     pub probe_padding_bytes: u64,
+    /// The part of the two above that was repair rows of a block (padding as
+    /// repair): datagrams and REPAIR-frame bytes. Both are also counted in
+    /// `probe_padding_datagrams` / `probe_padding_bytes`.
+    pub probe_padding_repair_datagrams: u64,
+    pub probe_padding_repair_bytes: u64,
     /// Probe pads the loss path judged lost: each pauses the probe raise.
     pub pads_lost: u64,
 }
@@ -1676,6 +1681,8 @@ mod tests {
             packets_sent: 0,
             opened_at: now,
             starved: false,
+            reserved_bytes: 0,
+            reserved_packets: 0,
         });
         send(&mut b, 1, true);
         let after_idr = b.active_probe.as_ref().unwrap().packets_sent;

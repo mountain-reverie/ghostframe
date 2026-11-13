@@ -236,7 +236,7 @@ impl IoBridge {
     /// cause when the caller knows it; otherwise a block of `k_max` sources
     /// closed on size and any other on Empty.
     pub(super) fn process_closed_blocks(&mut self, forced: Option<CloseWhy>) {
-        let closed = self.packer.take_closed();
+        let mut closed = self.packer.take_closed();
         if closed.is_empty() {
             return;
         }
@@ -244,9 +244,16 @@ impl IoBridge {
             return;
         };
         let now = now_std();
+        // A window's reservation is paid with the largest symbols first, so
+        // the cluster's bytes are met with the fewest rows. Only while one is
+        // outstanding: otherwise the order is the packer's.
+        if self.pad_reservation_outstanding() {
+            closed.sort_by_key(|c| std::cmp::Reverse(c.symbol_len()));
+        }
         let max_dg = self.live_max_dg();
         for c in closed {
             let k = c.k;
+            let sym_len = c.symbol_len();
             let why = if self.block_table.closed_reason(c.block_id).is_some() {
                 CloseWhy::Declined
             } else {
@@ -319,8 +326,94 @@ impl IoBridge {
             let evicted = self.block_table.evict_over_cap();
             self.execute_block_actions(actions);
             self.execute_block_actions(evicted);
+            if self.pad_reservation_outstanding() {
+                self.pad_close_top_up(c.block_id, k, r, r > 0 && fits, sym_len, now);
+            }
         }
         debug_assert!(self.block_table.open_blocks() <= FEC_TX_MAX_BLOCKS);
+    }
+
+    /// Padding as repair, at a block's close: pay the open window's
+    /// reservation with fresh pad rows of this block (tagged for the cluster
+    /// as they are queued, from the running total), then queue PLAIN copies
+    /// for what the row budget cannot carry. `can_pay` is false for a block
+    /// with no planned repairs or whose symbols do not fit a datagram; the
+    /// reservation is then left for a later close or the deadline.
+    pub(super) fn pad_close_top_up(
+        &mut self,
+        block_id: BlockId,
+        k: u8,
+        r: u8,
+        can_pay: bool,
+        sym_len: usize,
+        now: std::time::Instant,
+    ) {
+        use crate::transport::reliable_emitter::cache::ProbeTag;
+        if !can_pay {
+            return;
+        }
+        let Some(p) = self
+            .active_probe
+            .as_ref()
+            .filter(|p| now < p.ends_at && (p.reserved_bytes > 0 || p.reserved_packets > 0))
+        else {
+            return;
+        };
+        let (id, min_probes, min_bytes) = (p.id, p.min_probes, p.min_bytes);
+        let row_len = (FEC_REPAIR_HEADER_LEN + sym_len) as i64;
+        let want = ((p.reserved_bytes + row_len - 1) / row_len).max(p.reserved_packets);
+        let rows = self
+            .block_table
+            .reserve_pad_rows(block_id, want.max(0) as usize);
+        if !rows.is_empty() {
+            let payloads = match self.block_table.symbols(block_id) {
+                Some(symbols) => {
+                    let refs: Vec<&[u8]> = symbols.iter().map(Vec::as_slice).collect();
+                    ghostframe_protocol::fec::codec::encode_repairs(&refs, &rows).ok()
+                }
+                None => None,
+            };
+            match payloads {
+                Some(payloads) => {
+                    for (&row, payload) in rows.iter().zip(payloads) {
+                        let p = self.active_probe.as_mut().expect("checked above");
+                        let job = RepairJob {
+                            block_id,
+                            k,
+                            r,
+                            row,
+                            payload,
+                            probe: Some(ProbeTag {
+                                id,
+                                min_probes,
+                                min_bytes,
+                                bytes_sent_before: p.bytes_sent,
+                            }),
+                        };
+                        let len = job.len() as i64;
+                        // Counted as the row is queued, in queue order (the
+                        // order tags are issued in is the order they leave).
+                        p.bytes_sent = p.bytes_sent.saturating_add(len);
+                        p.packets_sent = p.packets_sent.saturating_add(1);
+                        p.reserved_bytes = (p.reserved_bytes - len).max(0);
+                        p.reserved_packets = (p.reserved_packets - 1).max(0);
+                        let st = &mut self.h264.stats;
+                        st.probe_padding_datagrams += 1;
+                        st.probe_padding_bytes += len as u64;
+                        st.probe_padding_repair_datagrams += 1;
+                        st.probe_padding_repair_bytes += len as u64;
+                        self.pending_repairs.push_back(job);
+                    }
+                    self.block_tx.repairs_queued_peak = self
+                        .block_tx
+                        .repairs_queued_peak
+                        .max(self.pending_repairs.len() as u64);
+                }
+                None => self.block_tx.encode_failed += 1,
+            }
+        }
+        // What the rows could not carry goes out as copies, now.
+        self.pay_pad_reservation(now, false);
     }
 
     /// Runs what the table decided: encodes repair rows (one call per block),
@@ -602,6 +695,8 @@ impl IoBridge {
             self.execute_block_actions(a);
         }
         self.service_pending_repairs();
+        // A window's reservation never outlives the window.
+        self.pay_pad_reservation(now, true);
     }
 
     /// The earliest block deadline (`T_lr`, release, alarms), for
