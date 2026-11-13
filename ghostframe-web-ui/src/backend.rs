@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The panel's window onto the core.
 
 use std::cell::{Cell, RefCell};

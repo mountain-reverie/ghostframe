@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Number and row formatting for the stats panel. Plain Rust: no DOM, so it
 //! is tested with `cargo test` on the host.
 

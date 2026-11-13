@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The client's own measurements, taken once a second whether or not the
 //! stats panel is open, so a sparkline is already full when it opens.
 //!

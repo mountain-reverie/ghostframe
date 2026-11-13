@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Mounting the stats panel from JS.
 
 use std::rc::Rc;

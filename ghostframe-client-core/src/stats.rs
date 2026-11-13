@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Connection statistics the client keeps for its stats panel.
 //!
 //! Two sources feed one view. **Server metrics** arrive as `STATS_SAMPLE`

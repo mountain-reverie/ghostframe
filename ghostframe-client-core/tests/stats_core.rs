@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `ClientCore`'s side of the stats panel: the subscribe message, the server
 //! stream, and the local measurements.
 
