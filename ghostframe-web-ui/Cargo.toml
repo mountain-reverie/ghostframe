@@ -3,6 +3,7 @@ name = "ghostframe-web-ui"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "MIT OR Apache-2.0"
 description = "The browser client's DOM UI (stats panel). The only crate that depends on Leptos."
 
 [dependencies]

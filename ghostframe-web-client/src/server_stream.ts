@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 /**
  * Reads the feedback stream's return half and hands each chunk to `onChunk`.
  *

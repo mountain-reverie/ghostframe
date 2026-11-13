@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The panel's Leptos components. Each owns one piece of the DOM and reads
 //! the one shared `StatsView` signal; none of them touches the transport.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The panel in a real browser: mounted, toggled, and wired to a real core.
 //! Run with `just test-web-ui` (headless Chrome through wasm-pack).
 #![cfg(target_arch = "wasm32")]

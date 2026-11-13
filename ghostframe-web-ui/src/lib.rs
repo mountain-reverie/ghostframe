@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The browser client's DOM UI. Leptos lives here and nowhere else in the
 //! workspace: swapping the framework means rewriting this crate.
 //!

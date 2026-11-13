@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The panel's open state, remembered in `localStorage`. Every failure (no
 //! storage, a private window, a quota error, a thrown accessor) means "start
 //! closed" and is otherwise ignored: the panel must work without it.

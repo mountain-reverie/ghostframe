@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Sparkline geometry: pure arithmetic from a history to points in a
 //! `WIDTH` x `HEIGHT` box. No DOM, so `cargo test` runs it on the host.
 
