@@ -251,6 +251,8 @@ ci-local:
     cargo test --workspace --lib
     cargo test --workspace --bins
     cargo test -p ghostframe-server --test commands
+    @echo "=== stats panel (host tests + headless Chrome) ==="
+    just test-web-ui
     @echo "=== web client build ==="
     just build-web
     cd ghostframe-web-client && npx tsc --noEmit
