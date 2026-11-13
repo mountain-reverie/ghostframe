@@ -230,7 +230,8 @@ fmt:
     cargo fmt --all
 
 # Run the fast CI tier (everything in .github/workflows/ci.yml) locally,
-# in the same order. Does NOT run e2e — use `just test-e2e` for that.
+# in the same order. Also covers client-core.yml's stats panel job, which needs
+# wasm-pack 0.15.0 and Chrome. Does NOT run e2e — use `just test-e2e` for that.
 ci-local:
     @echo "=== fmt-check ==="
     just fmt-check
