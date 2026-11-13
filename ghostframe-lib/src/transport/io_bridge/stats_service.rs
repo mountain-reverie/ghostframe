@@ -219,7 +219,11 @@ impl IoBridge {
                 continue;
             }
             if let Some(conn) = self.server.connections.get_mut(h) {
-                wt.flush_stats_tail(conn);
+                // A tail dropped because the stream is gone is a frame lost
+                // to a missing stream, like any other.
+                if wt.flush_stats_tail(conn) == StatsWrite::StreamGone {
+                    self.stats_counters.frames_no_stream += 1;
+                }
             }
         }
     }
@@ -232,7 +236,8 @@ impl IoBridge {
     ///
     /// Cheap on every loop turn (turns follow datagram batches, work is due
     /// at most once a second): when no subscribed session is due it returns
-    /// after one pass over the (tiny) session map, with no allocation. The
+    /// after two passes over the (tiny) session maps (`wt_sessions` for held
+    /// tails, then `stats_sessions` for due work), with no allocation. The
     /// handle list below is built only when something is due.
     pub(super) fn service_stats(&mut self, now: std::time::Instant) {
         self.flush_held_stats_tails();
@@ -669,6 +674,138 @@ mod tests {
             raw.iter().all(|(w, _)| *w == h),
             "only the subscribed session: {:?}",
             raw.iter().map(|(w, _)| w).collect::<Vec<_>>()
+        );
+    }
+
+    /// Run one step of the back-to-back pair with the bridge's own server
+    /// (the pair's `step_all` drives `pair.server`, so the two trade places
+    /// for the step).
+    fn step_with_bridge(
+        b: &mut IoBridge,
+        pair: &mut crate::transport::quic_pair::Pair,
+        dt: std::time::Duration,
+    ) {
+        std::mem::swap(&mut b.server, &mut pair.server);
+        pair.step_all(dt);
+        std::mem::swap(&mut b.server, &mut pair.server);
+    }
+
+    /// The per-turn flush in `service_stats`, end to end over a real quinn
+    /// connection: a frame cut short by a full stream window must finish by
+    /// itself once the client drains, with no further frame due and the
+    /// subscription already off. Deleting the `flush_held_stats_tails` call
+    /// from `service_stats` leaves the tail owed forever.
+    #[tokio::test]
+    async fn service_stats_finishes_a_held_tail_without_another_frame() {
+        use crate::transport::quic_pair::Pair;
+        use std::time::Duration;
+
+        let mut pair = Pair::new(65536);
+        let h = pair.server_handle;
+        let (mut b, _) = bridge().await;
+        b.stats_capture_for_test = None;
+        b.wt_sessions.clear();
+        b.wt_sessions.insert(h, WebTransportServer::default());
+        b.last_hello_from = Some(h);
+        // The bridge owns the pair's server from here on.
+        std::mem::swap(&mut b.server, &mut pair.server);
+
+        // The client opens its feedback stream and subscribes on it. It has
+        // no WebTransport header, as the native client's has none.
+        let sid = pair
+            .client
+            .streams()
+            .open(quinn_proto::Dir::Bi)
+            .expect("open");
+        pair.client
+            .send_stream(sid)
+            .write(&[0x0B, 1])
+            .expect("subscribe");
+        step_with_bridge(&mut b, &mut pair, Duration::from_millis(2));
+        let accepted = b
+            .server
+            .connections
+            .get_mut(&h)
+            .expect("server connection")
+            .streams()
+            .accept(quinn_proto::Dir::Bi);
+        assert_eq!(accepted, Some(sid), "premise: the server sees the stream");
+        b.wt_sessions
+            .get_mut(&h)
+            .unwrap()
+            .test_feed_feedback_stream(sid, &[0x0B, 1]);
+        b.dispatch_feedback_bytes(h, &[0x0B, 1]);
+        assert!(b.stats_sessions.get(&h).is_some_and(|s| s.subscribed));
+
+        // The client does not read: write frames until the window is full.
+        let frame = StatsSample {
+            schema_id: 1,
+            timestamp_us: 7,
+            values: vec![MetricValue::Text("x".repeat(200))],
+        }
+        .encode_frame();
+        let mut written = 0usize;
+        for i in 0..200_000usize {
+            assert!(i < 199_999, "premise: the window fills");
+            if !b.write_stats_counted(h, &frame) {
+                panic!("a frame was refused before any tail was held (frame {i})");
+            }
+            written += 1;
+            if b.wt_sessions[&h].stats_tail_len() > 0 {
+                break;
+            }
+        }
+        let owed = b.wt_sessions[&h].stats_tail_len();
+        assert!(owed > 0, "premise: a partial write left a tail");
+
+        // The panel switches off: nothing is due, no frame will be written.
+        b.dispatch_feedback_bytes(h, &[0x0B, 0]);
+        assert!(b.stats_sessions.get(&h).is_some_and(|s| !s.subscribed));
+
+        // Only the loop turn's `service_stats` runs while the client drains.
+        let mut reader = ServerFrameReader::default();
+        let mut frames = 0usize;
+        for _ in 0..400 {
+            step_with_bridge(&mut b, &mut pair, Duration::from_millis(5));
+            {
+                let mut rs = pair.client.recv_stream(sid);
+                let mut chunks = rs.read(true).expect("client reads its stream");
+                while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+                    reader.push(&chunk.bytes);
+                }
+                let _ = chunks.finalize();
+            }
+            while let Some(f) = reader.next_frame() {
+                f.expect("the client received only whole frames");
+                frames += 1;
+            }
+            b.service_stats(pair.now);
+            if b.wt_sessions[&h].stats_tail_len() == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            b.wt_sessions[&h].stats_tail_len(),
+            0,
+            "service_stats must flush the held tail by itself"
+        );
+        for _ in 0..20 {
+            step_with_bridge(&mut b, &mut pair, Duration::from_millis(5));
+            let mut rs = pair.client.recv_stream(sid);
+            let mut chunks = rs.read(true).expect("client reads its stream");
+            while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+                reader.push(&chunk.bytes);
+            }
+            let _ = chunks.finalize();
+            while let Some(f) = reader.next_frame() {
+                f.expect("the client received only whole frames");
+                frames += 1;
+            }
+        }
+        assert_eq!(reader.buffered(), 0, "no half frame is left in the reader");
+        assert_eq!(
+            frames, written,
+            "every frame reported written arrived whole"
         );
     }
 }
