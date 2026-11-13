@@ -28,6 +28,7 @@ Clients:
 | --- | --- |
 | `ghostframe-web-client` | TypeScript + Vite browser client (WebTransport + WebCodecs + WebGPU). |
 | `ghostframe-client-wasm` | The JS boundary for the browser client. Consumes the wire format. |
+| `ghostframe-web-ui` | The browser client's DOM UI (the stats panel), in Leptos. The only crate that depends on Leptos; linked into `ghostframe-client-wasm`. `just test-web-ui` runs its tests, including one in headless Chrome. |
 | `ghostframe-client-core` | Decode-side tile engine, shared by every client. Consumes the wire format. |
 | `ghostframe-client-net` | Client QUIC/WebTransport stack. |
 | `ghostframe-client-gpu` | Vulkan/wgpu decode, composite and dmabuf export for the native client. |
