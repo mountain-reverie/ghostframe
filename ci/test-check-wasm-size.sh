@@ -47,8 +47,13 @@ expect "no wasm at all fails (stale or missing dist)" 1 "$tmp/empty"
 mk "$tmp/js_only" index.js 1000
 expect "only a .js file fails (no wasm found)" 1 "$tmp/js_only"
 
-mk "$tmp/two" small.wasm 1000
-mk "$tmp/two" big.wasm 600000
-expect "a small wasm does not hide a big one" 1 "$tmp/two"
+# Both orders, so a first-only or a last-only guard is caught.
+mk "$tmp/two" a_small.wasm 1000
+mk "$tmp/two" z_big.wasm 600000
+expect "a small wasm does not hide a big one (big sorts last)" 1 "$tmp/two"
+
+mk "$tmp/two_rev" a_big.wasm 600000
+mk "$tmp/two_rev" z_small.wasm 1000
+expect "a small wasm does not hide a big one (big sorts first)" 1 "$tmp/two_rev"
 
 exit $fail
