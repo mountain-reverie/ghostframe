@@ -47,8 +47,8 @@ async function main() {
   // Diagnostics that cost per-call work (console mirroring, per-tile tallies)
   // run only for the e2e suite (`?e2e` on the page URL).
   const diagnostics = new URL(window.location.href).searchParams.has('e2e');
-  if (diagnostics) installConsoleRing();
   if (diagnostics) {
+    installConsoleRing();
     window.__ghostframeStatsSamples = 0;
     window.__ghostframeStatsFrames = 0;
   }

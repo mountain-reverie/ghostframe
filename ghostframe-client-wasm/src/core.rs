@@ -233,15 +233,6 @@ impl WasmClientCore {
         to_js(&crate::boundary::WasmCdf53Coverage::from(&s))
     }
 
-    /// Protocol datagrams accepted so far, as `{ tileDatagrams,
-    /// frameDatagrams }` -- the shape `window.__ghostframeStats` carries.
-    ///
-    /// The browser cannot derive this any more: the TypeScript receive loop
-    /// that incremented those counters went at the wasm cutover, leaving
-    /// `main.ts` holding a `stats` object it never wrote to. Five e2e tests
-    /// read the globals and saw 0 on sessions moving thousands of datagrams.
-    /// Classified by `ClientCore::handle_datagram`'s own dispatch rather than
-    /// re-tested here, so the two cannot drift.
     /// Samples the stats rings have accepted since this core was created.
     /// `u32`, not `u64`: a `u64` crosses as a BigInt, and at one sample a
     /// second this overflows after 136 years. Published by `main.ts` as
@@ -266,6 +257,15 @@ impl WasmClientCore {
             .min(u64::from(u32::MAX)) as u32
     }
 
+    /// Protocol datagrams accepted so far, as `{ tileDatagrams,
+    /// frameDatagrams }` -- the shape `window.__ghostframeStats` carries.
+    ///
+    /// The browser cannot derive this any more: the TypeScript receive loop
+    /// that incremented those counters went at the wasm cutover, leaving
+    /// `main.ts` holding a `stats` object it never wrote to. Five e2e tests
+    /// read the globals and saw 0 on sessions moving thousands of datagrams.
+    /// Classified by `ClientCore::handle_datagram`'s own dispatch rather than
+    /// re-tested here, so the two cannot drift.
     #[wasm_bindgen(js_name = datagramCounts)]
     pub fn datagram_counts(&self) -> Result<JsValue, JsValue> {
         let (tile, frame) = self.inner.borrow().datagram_counts();
