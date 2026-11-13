@@ -52,7 +52,7 @@ pub const DISPLAY_MODE_MSG_TYPE: u8 = 0x08;
 
 /// Client request to start or stop the server's connection-stats stream,
 /// `[STATS_SUBSCRIBE_MSG_TYPE, on]` with `on` 1 or 0; see
-/// [`crate::stats::StatsSubscribe`]. 0x0A is skipped: it is the frame-ack
+/// `ghostframe_protocol::stats::StatsSubscribe`. 0x0A is skipped: it is the frame-ack
 /// datagram envelope.
 pub const STATS_SUBSCRIBE_MSG_TYPE: u8 = 0x0B;
 /// Encoded length of a stats subscribe message.
