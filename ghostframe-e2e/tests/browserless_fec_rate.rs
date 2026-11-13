@@ -15,7 +15,7 @@ use ghostframe_e2e::harness::browserless::{
 };
 use ghostframe_e2e::harness::h264_scene::{pcm_load, Pattern};
 use ghostframe_e2e::netsim::{Bottleneck, CapTimeline, DropPlan, NetProfile};
-use ghostframe_lib::encoder::h264_harness::PcmMode;
+use ghostframe_lib::encoder::h264_harness::{PcmMode, PcmRateModel};
 use ghostframe_lib::transport::reliable_emitter::emission_queue::WireClass;
 
 const SEEDS: [u64; 3] = [0xFB_1001, 0xFB_1002, 0xFB_1003];
@@ -23,13 +23,16 @@ const SEEDS: [u64; 3] = [0xFB_1001, 0xFB_1002, 0xFB_1003];
 fn h264_load() -> H264Load {
     let mut l = pcm_load(PcmMode::RefManager);
     l.pcm_rate_policy = true;
+    // The frame size follows the rate the policy applied, so the stream
+    // really spends 0.8 x the estimate (or less, with repairs paid for).
+    l.pcm_rate_model = Some(PcmRateModel::s2(40_000, 120_000, 30));
     l
 }
 
 async fn run(seed: u64, adaptive: bool) -> BrowserlessResult {
     let base = NetProfile {
         delay_us: 25_000,
-        cap: CapTimeline::constant(6_000_000),
+        cap: CapTimeline::constant(2_000_000),
         bottleneck: Some(Bottleneck::wifi()),
         ..NetProfile::perfect()
     };
@@ -58,17 +61,20 @@ async fn run(seed: u64, adaptive: bool) -> BrowserlessResult {
 #[tokio::test(start_paused = true)]
 async fn the_ceiling_binds_no_more_often_with_adaptive_fec_than_without() {
     let (mut on_binding, mut off_binding) = (0u64, 0u64);
+    let (mut on_sat, mut off_sat) = (0u64, 0u64);
     for seed in SEEDS {
         let off = run(seed, false).await;
         let on = run(seed, true).await;
         let (o, a) = (&off.transport.instr.bwe, &on.transport.instr.bwe);
         let repairs = on.transport.instr.offered.of(WireClass::Repair);
         println!(
-            "FECR seed={seed:#x} dropped off/on={}/{} repairs={repairs} ceiling reads off/on={}/{} binding off/on={}/{} reseeds_down off/on={}/{}",
+            "FECR seed={seed:#x} dropped off/on={}/{} repairs={repairs} ceiling reads off/on={}/{} saturated off/on={}/{} binding off/on={}/{} reseeds_down off/on={}/{}",
             off.s2c_datagrams_dropped,
             on.s2c_datagrams_dropped,
             o.ceiling_reads,
             a.ceiling_reads,
+            o.ceiling_saturated_reads,
+            a.ceiling_saturated_reads,
             o.ceiling_binding_reads,
             a.ceiling_binding_reads,
             o.ceiling_reseeds_down,
@@ -82,9 +88,18 @@ async fn the_ceiling_binds_no_more_often_with_adaptive_fec_than_without() {
         assert_eq!(off.transport.instr.offered.of(WireClass::Repair), 0);
         on_binding += a.ceiling_binding_reads;
         off_binding += o.ceiling_binding_reads;
+        on_sat += a.ceiling_saturated_reads;
+        off_sat += o.ceiling_saturated_reads;
     }
+    // Measured at 2 Mbit/s over these seeds (per run, not a constant of the
+    // code): binding 78 on / 76 off, saturated reads 241 on / 340 off; with the
+    // scale removed 94 and 533.
     assert!(
-        on_binding <= off_binding + off_binding / 4 + 2,
+        on_binding <= off_binding + off_binding / 10 + 2,
         "the ceiling bound {on_binding} times with adaptive FEC against {off_binding} without"
+    );
+    assert!(
+        on_sat <= off_sat,
+        "the sender read as saturated {on_sat} times with adaptive FEC against {off_sat} without"
     );
 }
