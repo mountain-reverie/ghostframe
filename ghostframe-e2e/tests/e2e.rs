@@ -3810,11 +3810,11 @@ async fn e2e_cdf53_gradient_emission() -> Result<()> {
 ///
 /// Two globals are deliberately absent: `__ghostframeStatsSamples` and
 /// `__ghostframeStatsFrames` only move while the stats panel is open, so this
-/// scene (panel closed) would read them as 0. They are also initialised to 0
-/// by `main.ts`, so even an unpublished one would read as live-looking here.
+/// scene never opens the panel, so both read 0 and would fail a `> 0` probe.
 /// `e2e_stats_panel_subscribe_samples_unsubscribe` is their liveness proof: it
-/// requires `samples` to rise after the tab click and `frames` to stop after
-/// the second click.
+/// requires both `samples` and `frames` to rise while the panel is open (and
+/// `frames` to stay above `samples`, the schema being a frame that is not a
+/// sample), then `frames` to stop after the second click.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_polled_globals_are_live() -> Result<()> {
     // (name, JS expression that is true iff the global is non-trivial)
@@ -5739,7 +5739,9 @@ fn row_with_label<'a>(rows: &'a [StatsRow], needle: &str) -> Option<&'a StatsRow
 ///  - the bandwidth-estimate and RTT rows become non-zero and not stale: the
 ///    measurement itself fired (a row that exists but reads 0 is the failure
 ///    this guards, the same shape as the dead `window.__*` globals);
-///  - samples keep rising while open (a stream, not one burst);
+///  - samples and frames keep rising while open (a stream, not one burst),
+///    and frames exceed samples by at least the schema, so the frames count
+///    the next phase relies on is proven live;
 ///  - after the second click frames stop: in-flight frames are tolerated and
 ///    drained first, then the count must hold still for 4 s, more than three
 ///    sample periods;
@@ -5814,6 +5816,14 @@ async fn e2e_stats_panel_subscribe_samples_unsubscribe() -> Result<()> {
     assert!(
         b.samples >= a.samples + 2,
         "samples did not keep arriving while open: {a:?} then {b:?} after 4 s (1 Hz expected)"
+    );
+    // The raw frame count is live too, or the close-silence check below would
+    // pass on a counter that never moves. It counts the schema, which is not a
+    // sample, so it must stay strictly above the applied count.
+    assert!(
+        b.frames >= a.frames + 2 && b.frames > b.samples,
+        "__ghostframeStatsFrames is not live while open: {a:?} then {b:?} after 4 s \
+         (frames must rise with the samples and exceed them by at least the schema)"
     );
 
     // Close the panel; the server must go quiet.
