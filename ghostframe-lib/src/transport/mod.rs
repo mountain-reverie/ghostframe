@@ -20,6 +20,8 @@ pub mod origin;
 pub mod peer_auth;
 pub use ghostframe_protocol::protocol;
 pub mod quic;
+#[cfg(test)]
+pub(crate) mod quic_pair;
 /// The tsnet byte pump now lives in its own crate so a client can use it
 /// without the server. Re-exported at the old path so in-crate callers and
 /// the C API keep working.
