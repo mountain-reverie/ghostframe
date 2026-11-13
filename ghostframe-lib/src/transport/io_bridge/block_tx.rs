@@ -45,6 +45,43 @@ impl RepairJob {
     }
 }
 
+/// Buckets of the block-size histogram (measurement only): sizes 1 to 16
+/// one each, then 17-24, 25-32, 33-48, 49-64, 65-96, 97-128, 129-192, 193+.
+pub(crate) const K_BUCKETS: usize = 24;
+
+fn k_bucket(k: u8) -> usize {
+    match k {
+        0..=16 => usize::from(k.max(1)) - 1,
+        17..=24 => 16,
+        25..=32 => 17,
+        33..=48 => 18,
+        49..=64 => 19,
+        65..=96 => 20,
+        97..=128 => 21,
+        129..=192 => 22,
+        _ => 23,
+    }
+}
+
+/// The sizes `[lo, hi]` of bucket `i` of `InstrumentSummary::block_k_buckets`.
+pub fn block_k_bucket_range(i: usize) -> (usize, usize) {
+    const EDGES: [(usize, usize); 8] = [
+        (17, 24),
+        (25, 32),
+        (33, 48),
+        (49, 64),
+        (65, 96),
+        (97, 128),
+        (129, 192),
+        (193, 255),
+    ];
+    if i < 16 {
+        (i + 1, i + 1)
+    } else {
+        EDGES[(i - 16).min(7)]
+    }
+}
+
 /// Counters for the `cumulative emit` line.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct BlockTxStats {
@@ -53,6 +90,8 @@ pub(super) struct BlockTxStats {
     pub(super) closed_empty: u64,
     pub(super) closed_mtu: u64,
     pub(super) k_sum: u64,
+    /// Blocks by size, in the buckets of `block_k_bucket_range`.
+    pub(super) k_buckets: [u32; K_BUCKETS],
     pub(super) repairs_sent: u64,
     pub(super) repair_bytes: u64,
     /// Wire bytes of SOURCE bundles sealed: the base of the repair overhead.
@@ -209,6 +248,7 @@ impl IoBridge {
                 continue;
             }
             self.block_tx.k_sum += u64::from(k);
+            self.block_tx.k_buckets[k_bucket(k)] += 1;
             let r = match self.fec_adapt.as_mut() {
                 Some(a) => a.r_for_block(u32::from(k), self.reliable_emitter.emit_us64(now)),
                 None => params.r,
