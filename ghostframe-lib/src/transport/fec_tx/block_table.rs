@@ -218,6 +218,12 @@ pub(crate) struct BlockStats {
     pub t_lr_fired: u64,
     pub recovered_after_release: u64,
     pub late_ack_after_release: u64,
+    /// Blocks closed, by outcome (every `finish`): `Accounted` is the good
+    /// ending, the other three are what the E11 sweep reports as shares.
+    pub closed_accounted: u64,
+    pub closed_declined: u64,
+    pub closed_handed_off: u64,
+    pub closed_timed_out: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1108,6 +1114,12 @@ impl BlockTable {
         for &r in &b.repairs {
             self.tombstone(r);
         }
+        match why {
+            CloseReason::Accounted => self.stats.closed_accounted += 1,
+            CloseReason::Declined => self.stats.closed_declined += 1,
+            CloseReason::HandedOff => self.stats.closed_handed_off += 1,
+            CloseReason::TimedOut => self.stats.closed_timed_out += 1,
+        }
         self.closed.insert(id, why);
         if self.close_log.len() < CLOSE_LOG_CAP {
             self.close_log.push(why);
@@ -1293,6 +1305,17 @@ mod tests {
         assert!(t.symbols(BLK).is_some());
         t.on_recovered(103, t0);
         assert_eq!(t.closed_reason(BLK), Some(CloseReason::Accounted));
+        // Counted by outcome: this one and none of the others.
+        let s = t.stats();
+        assert_eq!(
+            (
+                s.closed_accounted,
+                s.closed_declined,
+                s.closed_handed_off,
+                s.closed_timed_out
+            ),
+            (1, 0, 0, 0)
+        );
         assert!(t.symbols(BLK).is_none());
         assert_eq!(t.cached_bytes(), 0);
         // duplicate ACK of a closed block's source: counted, nothing else.
@@ -1309,6 +1332,17 @@ mod tests {
         let a = t.on_declined(BLK, 3, &[0b110], t0);
         assert_eq!(handoffs(&a), 2);
         assert_eq!(t.closed_reason(BLK), Some(CloseReason::Declined));
+        // Counted by outcome: this one and none of the others.
+        let s = t.stats();
+        assert_eq!(
+            (
+                s.closed_accounted,
+                s.closed_declined,
+                s.closed_handed_off,
+                s.closed_timed_out
+            ),
+            (0, 1, 0, 0)
+        );
         // after: Deferred, one RECOVERED, then DECLINED for the rest
         let mut t = setup(3, 1, tile, t0);
         t.on_arrival(100, t0);
@@ -1358,6 +1392,17 @@ mod tests {
         let a = t.on_timer(d, r);
         assert_eq!(handoffs(&a), 2);
         assert_eq!(t.closed_reason(BLK), Some(CloseReason::HandedOff));
+        // Counted by outcome: this one and none of the others.
+        let s = t.stats();
+        assert_eq!(
+            (
+                s.closed_accounted,
+                s.closed_declined,
+                s.closed_handed_off,
+                s.closed_timed_out
+            ),
+            (0, 0, 1, 0)
+        );
     }
 
     #[test]
@@ -1413,6 +1458,17 @@ mod tests {
             }
         )));
         assert_eq!(t.closed_reason(BLK), Some(CloseReason::TimedOut));
+        // Counted by outcome: this one and none of the others.
+        let s = t.stats();
+        assert_eq!(
+            (
+                s.closed_accounted,
+                s.closed_declined,
+                s.closed_handed_off,
+                s.closed_timed_out
+            ),
+            (0, 0, 0, 1)
+        );
         assert_eq!(t.stats().deferral_alarm_h264, 1);
     }
 

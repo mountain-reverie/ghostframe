@@ -383,6 +383,17 @@ impl IoBridge {
             block_t_lr_fired: self.block_table.stats().t_lr_fired,
             block_deferral_timeout: self.block_table.stats().deferral_alarm_h264,
             block_content_lost_h264: self.block_tx.content_lost_h264,
+            block_closed_accounted: self.block_table.stats().closed_accounted,
+            block_closed_declined: self.block_table.stats().closed_declined,
+            block_closed_handed_off: self.block_table.stats().closed_handed_off,
+            block_closed_timed_out: self.block_table.stats().closed_timed_out,
+            block_packed: self.block_tx.closed_kmax
+                + self.block_tx.closed_time
+                + self.block_tx.closed_empty
+                + self.block_tx.closed_mtu,
+            block_k_sum: self.block_tx.k_sum,
+            block_k_buckets: self.block_tx.k_buckets,
+            block_repairs_sent: self.block_tx.repairs_sent,
             fec_recovered_rx: self.fec_in.recovered_rx,
             fec_declined_rx: self.fec_in.declined_rx,
             fec_repair_requests_rx: self.fec_in.repair_requests_rx,
