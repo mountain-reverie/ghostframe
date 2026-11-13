@@ -285,6 +285,95 @@ Late33 (seed range), overhead, 5 seeds: T = 20 single block (k_max 128 / 223) ag
 3. **Decision 6, "r_for ... such that P <= 1e-3"**: it is unreachable inside the 25 % cap for b >= 3 at k <= 64 and for b = 8 everywhere. The cap binds, so the achieved tail there is above 1e-3 and the closed-loop trim and E11 must treat r = cap as "saturated", not as a failure.
 4. **Decision 9** holds for <= 100 Mbit/s; at 200 Mbit/s under burst 8 it does not (follow-up justified).
 
+## 9. R6-e (plan task E10): padding against the BWE suites, and the value gate
+
+**Decision: the padding-as-repair code (E8 and E9) is deleted. The benefit is zero within the seed spread, and the BWE regression found in part 1 is not caused by it.** The code was reverted in four commits on the R6-e branch (E9 and the A/B scene, E8's pad rows and tag map, E8's `ResolvedAck` id; nothing else read the id, every consumer bound it to `_`). The measurement can be reproduced at the commit that added the A/B switch, which is the parent of the first revert.
+
+### Part 2, the value gate (done first because it decides the code)
+
+Setup: 10 Mbit/s behind a 150 ms tail-drop buffer, 50 ms one way, 5 % i.i.d. loss (5-7 % of datagrams dropped per run, the injected loss plus the bottleneck's own), adaptive mode, a rate-following H.264 stream (PCM encoder with the S2 rate model, in-place rate policy), 60 s per run. Both arms run the same seed; the only difference is a test-only switch in `IoBridge` (not an environment variable) that makes `pad_row_room` return `None`, so no window reserves rows and every pad is a copy, as before E9. 20 seeds: two sets of 10 (`0xFB0101..0A`, `0xFB0201..0A`), because the first set leaned towards "on" and the second leaned away from it, which is the answer to whether the lean was real.
+
+Premises, all met in every run: loss in both arms; the controller engaged (`p_hat` 3-5 %); probe windows opened (12-16 per run, one per 4-5 s: the application's own probe is 5 s and goog_cc's are rarer, so **the plan's "a probe window about every second" was not reachable without changing a production constant, and the run is longer instead**); `probe_padding_repair_datagrams > 0` in every "on" run and exactly 0 in every "off" run.
+
+"Frames late" is the closest lateness counter the harness has: the client's first decode of a frame more than 100 ms (the link's round trip, so a frame that waited for a retransmission) after the fastest frame's delay, measured from the encoder's logged capture timestamp. Never-fed frames and freeze episodes are `H264Outcome`'s. `handoffs + blocks_closed_declined` is 0 in all 40 runs.
+
+| seed | handoffs + declined (on / off) | frames late (on / off) | never fed (on / off) | freezes (on / off) | pad datagrams as repair / all pad (on) | probe windows (on / off) | datagrams dropped (on / off) |
+|---|---|---|---|---|---|---|---|
+| fb0101 | 0 / 0 | 32 / 44 | 35 / 77 | 14 / 22 | 50 / 2541 | 15 / 15 | 1933 / 2105 |
+| fb0102 | 0 / 0 | 52 / 47 | 14 / 48 | 14 / 21 | 54 / 2512 | 13 / 13 | 2396 / 2255 |
+| fb0103 | 0 / 0 | 79 / 95 | 164 / 169 | 23 / 25 | 59 / 3884 | 14 / 14 | 3784 / 4020 |
+| fb0104 | 0 / 0 | 101 / 87 | 126 / 191 | 15 / 29 | 50 / 3896 | 13 / 13 | 4186 / 3947 |
+| fb0105 | 0 / 0 | 53 / 87 | 16 / 56 | 17 / 24 | 62 / 3359 | 16 / 15 | 2103 / 2522 |
+| fb0106 | 0 / 0 | 39 / 40 | 18 / 28 | 13 / 15 | 53 / 2242 | 13 / 13 | 2101 / 2188 |
+| fb0107 | 0 / 0 | 38 / 29 | 23 / 19 | 15 / 15 | 57 / 2787 | 14 / 15 | 2177 / 2123 |
+| fb0108 | 0 / 0 | 111 / 101 | 69 / 142 | 18 / 21 | 50 / 3371 | 14 / 15 | 3382 / 3865 |
+| fb0109 | 0 / 0 | 47 / 40 | 54 / 23 | 19 / 15 | 50 / 2458 | 13 / 13 | 2117 / 2178 |
+| fb010a | 0 / 0 | 104 / 101 | 141 / 146 | 19 / 19 | 50 / 3340 | 12 / 12 | 4142 / 4271 |
+| fb0201 | 0 / 0 | 81 / 38 | 18 / 42 | 19 / 15 | 86 / 3911 | 21 / 16 | 2153 / 2146 |
+| fb0202 | 0 / 0 | 44 / 32 | 50 / 39 | 19 / 17 | 51 / 2289 | 13 / 13 | 2241 / 1840 |
+| fb0203 | 0 / 0 | 21 / 40 | 50 / 24 | 17 / 15 | 56 / 2330 | 15 / 13 | 2020 / 2152 |
+| fb0204 | 0 / 0 | 60 / 29 | 14 / 44 | 17 / 19 | 64 / 2858 | 15 / 13 | 2256 / 1752 |
+| fb0205 | 0 / 0 | 57 / 56 | 151 / 81 | 36 / 21 | 50 / 2794 | 14 / 14 | 2663 / 2688 |
+| fb0206 | 0 / 0 | 51 / 48 | 6 / 11 | 15 / 15 | 58 / 2949 | 14 / 13 | 2217 / 2167 |
+| fb0207 | 0 / 0 | 54 / 60 | 22 / 27 | 15 / 16 | 46 / 2219 | 13 / 13 | 2086 / 2228 |
+| fb0208 | 0 / 0 | 43 / 37 | 21 / 21 | 14 / 14 | 46 / 2280 | 13 / 13 | 2236 / 2227 |
+| fb0209 | 0 / 0 | 60 / 37 | 16 / 42 | 12 / 17 | 51 / 2771 | 14 / 14 | 2138 / 1637 |
+| fb020a | 0 / 0 | 50 / 59 | 71 / 19 | 23 / 14 | 44 / 2691 | 13 / 13 | 2260 / 2384 |
+
+Per metric over the 20 seeds (on minus off, per seed; the standard error is the paired spread over the square root of 20):
+
+| metric | on mean | off mean | on - off mean | paired sd | se | seeds on lower / on higher |
+|---|---|---|---|---|---|---|
+| handoffs + declined closes | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0 / 0 |
+| frames late | 58.9 | 55.4 | +3.5 | 17.4 | 3.9 | 7 / 13 |
+| never-fed frames | 54.0 | 62.5 | -8.5 | 35.8 | 8.0 | 13 / 6 |
+| freeze episodes | 17.7 | 18.4 | -0.8 | 6.2 | 1.4 | 10 / 6 |
+| frozen ms | 1839 | 1936 | -97 | 574 | 128 | 12 / 8 |
+| p95 excess latency ms | 69.0 | 64.2 | +4.9 | 20.3 | 4.5 | 7 / 12 |
+
+Reading: no difference exceeds about one standard error, and the two sets disagree in sign (never-fed frames: -23.9 against +6.9 per run). The reason is in the last column of the table: **1087 of 57482 pad datagrams (1.9 %) were paid as repair rows**, because a window reserves at most one block's pad budget (`max(r, 4)` rows), and the run offers about 700 datagrams per second of which 5 % or more are lost. At most 50-60 rows per run can each rebuild one symbol of one block that lost more than r, a case the controller sizes to 1e-3. A benefit of dozens of frames from about 50 rows is not plausible; the chaotic divergence of the two arms after the first window (the offered datagram counts differ by up to 20 % between arms of the same seed) is. The optional client-side counter (decodes that used a row at or past r with no REPAIR_REQUEST outstanding) was not built: with this ceiling on the rows, the answer is bounded by 1087 over 20 runs, and the outcome counters above already show nothing to explain.
+
+### Part 1, regression check against the BWE suites
+
+Setup. `GHOSTFRAME_FEC_BLOCKS=adaptive` (read by the harness when a scene sets no mode), loss through the existing `GHOSTFRAME_OUTBOUND_BURST_*` variables: 2 % average, mean burst 1 ms, loss-realisation salts 1, 2 and 3, each against the mode-off control with the same loss. `browserless_bwe_capacity` and `browserless_h264` read the burst variables themselves, so they needed no edit. `browserless_bwe_rate_source` passes default link overrides and reads nothing, so for that suite alone a **temporary, uncommitted** three-line hook in `run_browserless_with_options` applied the burst variables when no override was given (removed afterwards; no suite was edited or forked). The sus_use and reached numbers come from `p_b_seed_population` (`GF_POP_N=6 GF_POP_ROW=0`, the suite's own printout), run at the pad-as-repair tip (`aca12df0`) and again after the revert.
+
+**Unmodified suites, default mode (off), once, at `aca12df0`:** `browserless_bwe_capacity` 2 passed; `browserless_bwe_rate_source` 7 passed, 1 ignored; `browserless_h264` 30 passed, 11 failed, 1 ignored. The 11 failures are all `openh264_scenes::*`, which panic with "no usable openh264 library" because this machine has libopenh264 2.7.0 and the suite supports 2.4.x to 2.6.x; the test source says so, and CI installs 2.4.1. So the E8/E9 paths broke nothing the default-mode suites can see. (One lib test, `h264_direct_worker_path_survives_a_loss_bit_exact`, fails here for the same missing-encoder reason, "the worker did not execute the plan"; it was not run at an earlier commit.)
+
+**H.264 step-up, 2 -> 6 Mbit/s, `p_b_seed_population`, 6 timelines per salt (`0x6701..06`).** Milliseconds from the step, `reached / sus_est / sus_use`, `-` = never. T_UP is 11 s.
+
+| salt | seed | off | adaptive at `aca12df0` | adaptive after the revert |
+|---|---|---|---|---|
+| 1 | 6701 | 1000/12400/13900 | 6500/21100/- | 11900/-/- |
+| 1 | 6702 | 900/10200/20400 | 900/4300/- | 900/2900/- |
+| 1 | 6703 | 4700/4700/- | 7600/7600/- | 11700/-/- |
+| 1 | 6704 | 1200/2900/2900 | 900/-/- | 900/6700/15700 |
+| 1 | 6705 | 1200/2500/2500 | 700/-/- | 700/-/- |
+| 1 | 6706 | 3800/3800/4100 | 1200/2900/- | 1200/-/- |
+| 2 | 6701 | 1300/8700/8700 | 700/-/- | 700/-/- |
+| 2 | 6702 | 1300/12400/16400 | 1500/18800/- | 1400/-/- |
+| 2 | 6703 | 5700/5700/17400 | 800/-/- | 800/-/- |
+| 2 | 6704 | 8800/8800/14300 | 6700/-/- | 15100/15100/- |
+| 2 | 6705 | 1300/2900/2900 | 1200/-/- | 1200/-/- |
+| 2 | 6706 | 1200/1200/1200 | 6500/-/- | -/-/- |
+| 3 | 6701 | 5100/5100/- | 1900/7400/- | 1900/-/- |
+| 3 | 6702 | 1200/4000/9300 | 900/-/- | 900/-/- |
+| 3 | 6703 | 1200/1200/1200 | 1000/3300/- | 1100/-/- |
+| 3 | 6704 | 5200/5200/10600 | 1200/-/- | 1200/-/- |
+| 3 | 6705 | 1200/1200/1200 | 1400/3800/- | 1400/1400/- |
+| 3 | 6706 | 1200/2800/2800 | 700/4900/- | 700/4400/- |
+
+Hits inside T_UP per salt (1, 2, 3): `sus_use` off 3, 3, 5 (11 of 18), adaptive 0, 0, 0, after the revert 0, 0, 0; `sus_est` off 5, 5, 6, adaptive 3, 0, 4, after the revert 2, 0, 2; `reached` (a transient spike) 6, 6, 6 for off and adaptive, 4, 4, 6 after the revert. **This is a regression outside the seed spread, and it is not padding**: removing E8 and E9 does not change it. With no loss the two modes are identical (6 timelines: `reached` 6, `sus_est` 4, `sus_use` 4 for both), as the plan's golden says. It appears only when adaptive mode has engaged on loss. **Open item for E11 / the owner, not fixed here:** the likely mechanism is the encoder-target scaling of E6 (`media = RATE_SHARE x estimate / (1 + rho)`), because `sus_use` counts only the access units' bytes against 0.8 of the line, so a stream that spends part of its grant on repairs cannot read as "using" the headroom; whether the estimate itself is also lower is what `sus_est` (worse as well) and the next table say. That reading is a hypothesis; I did not isolate E6.
+
+**Capacity, `browserless_bwe_capacity`** (2 % loss, 3 salts; the two scenes' assertions assume no loss, `the_estimate_separates_...` fails its "spacious link has no drops" premise in both arms by construction, so the numbers are read, not the verdicts). Step-up scene, `converged_at` ms and tail median Mbit/s: off 1800 / 2300 / 2300 and 10.3 / 11.0 / 13.1; adaptive 300 / 1200 / 1500 and 17.0 / 17.4 / 12.4. Adaptive converges earlier and holds a higher estimate under loss in every salt (the repairs keep the loss-based estimator from reading every loss as congestion). No regression.
+
+**Rate source, `browserless_bwe_rate_source`** (tile load; every H.264 pad path, including E8 and E9, is unreachable there, `h264_probe_pad` has one caller on the H.264 frame path). Off: 7 of 7 pass at all three salts. Adaptive: 6 of 7, `p6c_codel_c10...` failing at all three salts. Its settled median over five seeds is 9.2-9.8 Mbit/s off and 7.9-8.3 Mbit/s adaptive on the 10 Mbit/s link; its assertion is "settled over (cap x payload fraction)" at most 1.15, and adaptive reads 1.16, 1.23, 1.21 (mean per salt, off 0.97). The settled estimate is therefore lower under adaptive, and the assertion's denominator (payload fraction) does not count the repair bytes the numerator's link carries, so the unit is not like for like. p6b reaches 80 % of the step in 0.5 s adaptive against 1.7-2.0 s off. Not padding; reported for E11 with the sus_use item.
+
+Part 1 verdict: E8 and E9 are not responsible for any difference; adaptive mode under loss is worse than the control on `sus_use` and `sus_est` of the H.264 step-up and on the rate-source settled estimate, better on capacity convergence. The first two are outside the seed spread and need a decision before default-on (E13).
+
+### What changed
+- Deleted: E9 (`h264_probe_pad` reservation, the close-time top-up, the deadline, the counters `probe_padding_repair_datagrams` / `_bytes`), E8's `reserve_pad_rows`, `RepairJob::probe`, the `bundle_seq -> ProbeTag` map and the `ResolvedAck` id.
+- Plan decision 8 is superseded: padding stays PLAIN copies of an acknowledged fragment in every mode, and the byte-identity of knob off, r = 0 and padding is automatic.
+
 ## 11. R6-e2 (plan task TB0): where the tile repair bytes go
 
 Measurement only (`the_repair_bytes_are_split_by_cause` in `browserless_fec_adapt.rs`, `FECSPLIT` and `FECCRIT3` lines). Adaptive arm, 10 Mbit/s, 150 ms buffer, 30 s, 5 seeds (`0xFB0001`-`5`), mean ± sd. Every number is a share of the **source wire bytes**, except the rows/k rows, which are shares of source symbols.
