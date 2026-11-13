@@ -311,6 +311,10 @@ pub struct RunOptions {
     /// the B5a client, which carry acknowledgements of their own. The bridge has no injector in the harness and drops the
     /// message. `Some(ZERO)` sends it at once.
     pub ack_chatter: Option<Duration>,
+    /// Run a stats subscriber (see `stats_tap`): when it subscribes and
+    /// unsubscribes. `None` runs none, and `BrowserlessResult::client_stats`
+    /// is then empty.
+    pub stats: Option<crate::harness::stats_tap::StatsPlan>,
 }
 
 /// How long the harness's perfect decoder takes to answer for an access unit
@@ -680,6 +684,9 @@ pub struct BrowserlessResult {
     /// asking (`gave_up`). Tiles stuck at a partial pass set show here and
     /// nowhere else.
     pub client_cdf53: ghostframe_client_core::cdf53_coverage::Cdf53CoverageSummary,
+    /// The stats stream as the client saw it: schemas, samples, and the
+    /// counts of what did not decode. Empty without `RunOptions::stats`.
+    pub client_stats: crate::harness::stats_tap::StatsProbe,
 }
 
 impl BrowserlessResult {
@@ -1373,6 +1380,7 @@ async fn run_inner(
         client_wire_loss: client_probe.wire_loss,
         client_rx_datagrams: client_probe.rx_datagrams,
         client_cdf53: client_probe.cdf53,
+        client_stats: client_probe.stats,
         nack_hit: emitter_stats.nack_hit,
         nack_miss: emitter_stats.nack_miss,
         loss_path_resends: emitter_stats.loss_path_resends,
@@ -1672,6 +1680,7 @@ async fn drive_session(
 
     let overall_deadline = base + scene.duration;
     let mut iter: usize = 0;
+    let mut stats_tap = opts.stats.map(crate::harness::stats_tap::StatsTap::new);
 
     // Next virtual time at which to record a bandwidth-estimate sample.
     let mut next_bwe_sample_us: u64 = 0;
@@ -1808,6 +1817,10 @@ async fn drive_session(
                 chatter_due.pop_front();
                 client.send_input(vec![0x05, 0xff], now_us(base));
             }
+        }
+
+        if let Some(tap) = stats_tap.as_mut() {
+            tap.step(&mut client, now_us(base));
         }
 
         let new_events = client.take_events();
@@ -2068,6 +2081,7 @@ async fn drive_session(
         wire_loss: client.wire_loss_stats(),
         rx_datagrams: client.datagram_rx_counts(),
         cdf53: client.cdf53_coverage_summary(),
+        stats: stats_tap.map(|t| t.finish()).unwrap_or_default(),
     };
     Ok((
         events,
@@ -2091,6 +2105,8 @@ pub struct ClientProbe {
     pub rx_datagrams: Option<(u64, u64)>,
     /// Per-tile CDF 5/3 coverage at the end of the scene.
     pub cdf53: ghostframe_client_core::cdf53_coverage::Cdf53CoverageSummary,
+    /// What the stats tap saw; empty without `RunOptions::stats`.
+    pub stats: crate::harness::stats_tap::StatsProbe,
 }
 
 /// Encode and inject one `FrameScript`'s tiles as an `InjectedFrame`.

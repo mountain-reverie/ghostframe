@@ -25,6 +25,7 @@ pub mod pixels;
 pub mod scene;
 pub mod scene_tiles;
 pub mod scroll_scene;
+pub mod stats_tap;
 pub mod tailnet_probe;
 pub mod transport;
 pub mod weston;
