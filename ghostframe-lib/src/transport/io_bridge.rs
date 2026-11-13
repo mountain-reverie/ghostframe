@@ -2174,8 +2174,9 @@ impl IoBridge {
         // And for a pass a verdict declined to resend, which has its own
         // backed-off deadline.
         let deferred = self.reliable_emitter.next_deferred_due();
+        let stats = self.stats_next_due();
         [
-            quic, display, close, recheck, admission, pto, loss_time, deferred,
+            quic, display, close, recheck, admission, pto, loss_time, deferred, stats,
         ]
         .into_iter()
         .flatten()
@@ -2573,6 +2574,9 @@ impl IoBridge {
         self.server.drain_endpoint_events();
         self.drain_app_events();
         self.server.drain_endpoint_events();
+        // The stats subscribe just dispatched (and the 1 Hz sample) leave in
+        // the drain below, in this turn.
+        self.service_stats(now_std());
         self.drain_outbound().await?;
         // Verdicts and the probe come before the admission pump below, not
         // after it: what they queue (a retransmission) is handed to quinn by
