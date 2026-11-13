@@ -131,7 +131,10 @@ async fn a_subscribed_session_gets_a_schema_then_live_samples() {
 async fn nothing_arrives_without_a_subscribe() {
     let r = run(StatsPlan::default()).await;
     let st = &r.client_stats;
-    assert_eq!(st.subscribes_sent, 0, "premise: this client never subscribed");
+    assert_eq!(
+        st.subscribes_sent, 0,
+        "premise: this client never subscribed"
+    );
     assert_eq!(st.bytes_read, 0, "not one byte on the return half");
     assert!(st.schemas.is_empty() && st.samples.is_empty());
 }
