@@ -3,7 +3,7 @@
 #
 # docs/specs/stats-panel-design.md section 5: adding Leptos to the wasm module
 # is the biggest single size risk of the web client, and the wasm is what every
-# browser downloads before the first frame. Today's wasm is about 168 KB. The
+# browser downloads before the first frame. Today's wasm is about 460 KB raw. The
 # limit leaves room for the panel and fails the build when a dependency or a
 # generic blows it up; raise it deliberately, in a commit that says why, and
 # record the new number in docs/specs/wasm-bundle-baseline.md.
@@ -16,9 +16,12 @@
 # missing or stale dist/ cannot read as "small enough". Every .wasm in the
 # directory is checked, so a second module cannot hide behind a small one.
 set -euo pipefail
+# A relative assets-dir is resolved from the caller's cwd.
+arg_dir="${1:-}"
+[[ -n "$arg_dir" ]] && arg_dir=$(realpath "$arg_dir")
 cd "$(dirname "$0")/.."
 
-assets="${1:-ghostframe-web-client/dist/assets}"
+assets="${arg_dir:-ghostframe-web-client/dist/assets}"
 max_bytes=524288
 
 shopt -s nullglob
