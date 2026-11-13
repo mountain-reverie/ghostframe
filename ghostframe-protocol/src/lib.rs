@@ -20,4 +20,5 @@ pub mod eviction;
 pub mod feedback;
 pub mod feedback_stream;
 pub mod protocol;
+pub mod stats;
 pub mod tile;
