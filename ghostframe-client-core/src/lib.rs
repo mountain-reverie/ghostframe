@@ -232,6 +232,8 @@ pub struct ClientCore {
     /// are in neither count -- see [`ClientCore::datagram_counts`].
     pub(crate) datagrams_tile: u64,
     pub(crate) datagrams_frame: u64,
+    /// Connection statistics for the stats panel; see [`stats`].
+    pub(crate) stats: stats::ClientStats,
 }
 
 impl ClientCore {
@@ -266,6 +268,7 @@ impl ClientCore {
             cdf53_wire: false,
             datagrams_tile: 0,
             datagrams_frame: 0,
+            stats: stats::ClientStats::new(now_us),
         };
 
         // Construct the Hello message [0x03, caps]
@@ -408,6 +411,47 @@ impl ClientCore {
     /// Drain one pending outbound message; call until None.
     pub fn poll_transmit(&mut self, _now_us: u64) -> Option<PollOutput> {
         self.outbox.pop_front()
+    }
+
+    /// Ask the server to start (`true`) or stop (`false`) sending stats
+    /// samples. Queued like any other feedback-stream message; the server
+    /// answers every request with a fresh schema.
+    pub fn set_stats_subscribed(&mut self, on: bool) {
+        self.outbox.push_back(PollOutput::Stream(
+            ghostframe_protocol::stats::StatsSubscribe { on }
+                .encode()
+                .to_vec(),
+        ));
+    }
+
+    /// Feed bytes read from the feedback stream's return half, in whatever
+    /// chunks the transport produced. Never panics on malformed input: bad
+    /// frames are counted in [`stats::ClientStats::samples_rejected`].
+    pub fn handle_server_stream(&mut self, bytes: &[u8], now_us: u64) {
+        self.stats.handle_stream_bytes(bytes, now_us);
+    }
+
+    /// The connection statistics: server metrics from the stats stream and
+    /// the client's own measurements.
+    pub fn stats(&self) -> &stats::ClientStats {
+        &self.stats
+    }
+
+    /// Note `n` frames painted. Pushed by the host, which owns the renderer
+    /// until it moves into Rust.
+    pub fn record_paints(&mut self, n: u32) {
+        self.stats.local.counters.paints = self
+            .stats
+            .local
+            .counters
+            .paints
+            .saturating_add(u64::from(n));
+    }
+
+    /// The build this client came from, shown beside the server's in the
+    /// stats panel. Defaults to `unknown`.
+    pub fn set_client_version(&mut self, version: impl Into<String>) {
+        self.stats.set_client_version(version);
     }
 
     /// Earliest deadline (µs) at which `on_timeout` must be called.
