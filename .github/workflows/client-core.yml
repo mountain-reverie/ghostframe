@@ -15,8 +15,8 @@ jobs:
       # lightweight workflow does not install. Its tests run in e2e.yml's
       # browserless job, which does install them. The wasm build below still
       # covers it, and does not build dev-dependencies.
-      - run: cargo test -p ghostframe-protocol -p ghostframe-client-core
-      - run: cargo build -p ghostframe-protocol -p ghostframe-client-core -p ghostframe-client-net -p ghostframe-client-wasm --target wasm32-unknown-unknown
+      - run: cargo test -p ghostframe-protocol -p ghostframe-client-core -p ghostframe-web-ui
+      - run: cargo build -p ghostframe-protocol -p ghostframe-client-core -p ghostframe-client-net -p ghostframe-client-wasm -p ghostframe-web-ui --target wasm32-unknown-unknown
 
   wasm-module:
     runs-on: ubuntu-latest
@@ -53,3 +53,22 @@ jobs:
       - name: Build the browser-target wasm
         working-directory: ghostframe-web-client
         run: npm run build:wasm
+
+  web-ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: wasm32-unknown-unknown }
+      - name: Cache wasm-pack
+        id: cache-wasm-pack
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: wasm-pack-0.15.0-${{ runner.os }}
+      - name: Install wasm-pack
+        if: steps.cache-wasm-pack.outputs.cache-hit != 'true'
+        run: cargo install wasm-pack --version 0.15.0 --locked
+      # Mounts the real panel over a real ClientCore in headless Chrome.
+      - name: Stats panel browser test
+        run: wasm-pack test --headless --chrome ghostframe-web-ui
