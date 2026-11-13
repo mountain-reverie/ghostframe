@@ -31,6 +31,7 @@ pub mod palette_shadow;
 pub mod parity_decoder;
 mod reassembly;
 pub mod stats;
+mod stats_local;
 pub mod tile_decoder;
 pub mod tile_out;
 pub mod wire_loss;
