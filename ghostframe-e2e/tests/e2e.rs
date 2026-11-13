@@ -5576,6 +5576,268 @@ async fn e2e_input_forwarding_firefox() -> Result<()> {
     setup.browser.close().await
 }
 
+// ---------------------------------------------------------------------------
+// Stats panel (docs/specs/stats-panel-design.md section 4, "E2E (Chromium)").
+// ---------------------------------------------------------------------------
+
+/// The two live stats counters of the page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StatsCounters {
+    /// Every complete frame the core received on the server stream, counted
+    /// before any schema or subscription check. This is what proves the
+    /// server is silent: it does not depend on what the client chooses to
+    /// apply.
+    frames: u64,
+    /// Samples applied to the rings (schema and count matched). Non-zero
+    /// proves a schema-checked sample crossed the wire.
+    samples: u64,
+}
+
+/// Reads `window.__ghostframeStatsFrames` / `__ghostframeStatsSamples`,
+/// published by `main.ts` after every chunk read from the feedback stream's
+/// return half and initialised to 0 at start-up (e2e pages only). No `?? 0`
+/// fallback: an absent global is an error, so a broken publish cannot read as
+/// "nothing arrived".
+async fn stats_counters(setup: &E2eSetup) -> Result<StatsCounters> {
+    let json: String = setup
+        .page()
+        .evaluate(
+            "JSON.stringify({frames: window.__ghostframeStatsFrames, \
+                             samples: window.__ghostframeStatsSamples})",
+        )
+        .await?
+        .into_value()?;
+    let v: serde_json::Value = serde_json::from_str(&json)?;
+    Ok(StatsCounters {
+        frames: v["frames"].as_u64().context(
+            "window.__ghostframeStatsFrames is not a number (main.ts did not publish it)",
+        )?,
+        samples: v["samples"].as_u64().context(
+            "window.__ghostframeStatsSamples is not a number (main.ts did not publish it)",
+        )?,
+    })
+}
+
+/// One `[data-testid="stats-row"]` of the open panel.
+struct StatsRow {
+    label: String,
+    current: Option<f64>,
+    stale: bool,
+}
+
+/// Every metric row currently in the panel's DOM (empty while it is closed).
+async fn stats_panel_rows(setup: &E2eSetup) -> Result<Vec<StatsRow>> {
+    let json: String = setup
+        .page()
+        .evaluate(
+            r#"JSON.stringify(
+                [...document.querySelectorAll('[data-testid="stats-row"]')].map(r => ({
+                    label: r.dataset.label ?? '',
+                    current: (r.dataset.current ?? '') === '' ? null : Number(r.dataset.current),
+                    stale: r.dataset.stale === 'true',
+                }))
+            )"#,
+        )
+        .await?
+        .into_value()?;
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&json)?;
+    Ok(rows
+        .iter()
+        .map(|r| StatsRow {
+            label: r["label"].as_str().unwrap_or_default().to_string(),
+            current: r["current"].as_f64(),
+            stale: r["stale"].as_bool().unwrap_or(false),
+        })
+        .collect())
+}
+
+/// A real mouse click on the panel's edge tab (CDP scrolls it into view and
+/// presses at its centre), not a synthetic `.click()`: the tab cancels
+/// `mousedown`'s default to keep focus off itself (spec section 2.3), and only
+/// a real press goes through that path.
+///
+/// Two checks around the click, so a failure names its cause instead of
+/// surfacing 15 s later as "no stats sample":
+///  - before: `document.elementFromPoint` at the tab's centre is the tab (or a
+///    child). A canvas stacked above it would forward the press to the remote
+///    session and the panel would never open;
+///  - after: `document.activeElement` is not the tab or inside the panel, i.e.
+///    keyboard focus did not move onto it (spec 2.3).
+async fn click_stats_tab(setup: &E2eSetup) -> Result<()> {
+    let tab = setup
+        .page()
+        .find_element(r#"[data-testid="stats-tab"]"#)
+        .await
+        .context("the stats panel tab is not in the DOM")?;
+    tab.scroll_into_view().await?;
+    let hit: String = setup
+        .page()
+        .evaluate(
+            r#"(() => {
+                const t = document.querySelector('[data-testid="stats-tab"]');
+                const r = t.getBoundingClientRect();
+                const e = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+                return (e && (e === t || t.contains(e))) ? 'ok'
+                    : 'covered by ' + (e ? e.tagName + '#' + e.id : 'nothing');
+            })()"#,
+        )
+        .await?
+        .into_value()?;
+    anyhow::ensure!(
+        hit == "ok",
+        "the stats tab is not what a click at its centre would hit ({hit}): \
+         the press would go to the remote session instead"
+    );
+    tab.click().await?;
+    let focus_moved: bool = setup
+        .page()
+        .evaluate(
+            r#"(() => {
+                const a = document.activeElement;
+                return !!a && !!a.closest('[data-testid="stats-tab"], #stats-panel');
+            })()"#,
+        )
+        .await?
+        .into_value()?;
+    anyhow::ensure!(
+        !focus_moved,
+        "clicking the stats tab moved keyboard focus onto the panel: typing would \
+         stop reaching the remote session (spec 2.3, mousedown must be cancelled)"
+    );
+    Ok(())
+}
+
+/// The first row whose label matches `needle` (case-insensitive substring).
+fn row_with_label<'a>(rows: &'a [StatsRow], needle: &str) -> Option<&'a StatsRow> {
+    let needle = needle.to_lowercase();
+    rows.iter()
+        .find(|r| r.label.to_lowercase().contains(&needle))
+}
+
+/// Opening the panel subscribes, the server answers with a schema and one
+/// sample a second, the server rows carry real measurements, and closing the
+/// panel stops the server.
+///
+/// What each phase proves, and why it cannot pass vacuously. "Frames" is the
+/// raw count of server-stream frames the core received; "samples" is the count
+/// it applied. The silence assertions use frames, because a client that drops
+/// samples would hold the applied count still while the server kept sending.
+///  - closed for 3 s -> frames 0 and samples 0: nothing is sent before a
+///    subscribe (spec section 1, "Only while the panel is open"). A server
+///    that sends without a subscribe produces a schema-less sample, which the
+///    client rejects and which never moves `samples`; only `frames` sees it;
+///  - after the click samples becomes non-zero: the subscribe reached the
+///    server and a schema-checked sample came back;
+///  - the bandwidth-estimate and RTT rows become non-zero and not stale: the
+///    measurement itself fired (a row that exists but reads 0 is the failure
+///    this guards, the same shape as the dead `window.__*` globals);
+///  - samples keep rising while open (a stream, not one burst);
+///  - after the second click frames stop: in-flight frames are tolerated and
+///    drained first, then the count must hold still for 4 s, more than three
+///    sample periods;
+///  - re-opening resumes it: unsubscribe is not a terminal state.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_stats_panel_subscribe_samples_unsubscribe() -> Result<()> {
+    let setup = setup_e2e_webgpu("--solid-red --spinner").await?;
+
+    // Closed by default: nothing subscribed, so nothing arrives at all.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let before_open = stats_counters(&setup).await?;
+    assert_eq!(
+        before_open,
+        StatsCounters {
+            frames: 0,
+            samples: 0
+        },
+        "server-stream frames arrived with the panel closed: the server sent without a subscribe"
+    );
+
+    // Open the panel.
+    click_stats_tab(&setup).await?;
+
+    // The subscribe goes out and the first sample comes back.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if stats_counters(&setup).await?.samples > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no stats sample was applied within 15 s of opening the panel: \
+             the subscribe never reached the server, or the server's schema/samples \
+             never reached the client core"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // The server rows show real measurements within a few seconds.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let (bandwidth, rtt) = loop {
+        let rows = stats_panel_rows(&setup).await?;
+        let bw = row_with_label(&rows, "bandwidth estimate")
+            .and_then(|r| (!r.stale).then_some(r.current).flatten())
+            .filter(|v| *v > 0.0);
+        let rtt = row_with_label(&rows, "round-trip time")
+            .and_then(|r| (!r.stale).then_some(r.current).flatten())
+            .filter(|v| *v > 0.0);
+        if let (Some(bw), Some(rtt)) = (bw, rtt) {
+            break (bw, rtt);
+        }
+        if std::time::Instant::now() >= deadline {
+            let labels: Vec<String> = rows
+                .iter()
+                .map(|r| format!("{:?} current={:?} stale={}", r.label, r.current, r.stale))
+                .collect();
+            panic!(
+                "bandwidth estimate / RTT never became non-zero and fresh in 20 s. \
+                 bandwidth={bw:?} rtt={rtt:?}. Rows in the panel ({}):\n{}",
+                labels.len(),
+                labels.join("\n")
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    println!("stats panel: bandwidth estimate {bandwidth}, rtt {rtt}");
+
+    // A stream, not a burst: samples keep arriving while the panel is open.
+    let a = stats_counters(&setup).await?;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let b = stats_counters(&setup).await?;
+    assert!(
+        b.samples >= a.samples + 2,
+        "samples did not keep arriving while open: {a:?} then {b:?} after 4 s (1 Hz expected)"
+    );
+
+    // Close the panel; the server must go quiet.
+    click_stats_tab(&setup).await?;
+    // A frame may already be in flight when the unsubscribe is sent.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let settled = stats_counters(&setup).await?;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let after_close = stats_counters(&setup).await?;
+    assert_eq!(
+        after_close.frames, settled.frames,
+        "the server kept sending after the panel was closed ({settled:?} then {after_close:?}): \
+         the unsubscribe did not stop it"
+    );
+
+    // Re-opening resumes the stream.
+    click_stats_tab(&setup).await?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if stats_counters(&setup).await?.samples > after_close.samples {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no sample arrived within 10 s of re-opening the panel"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    setup.browser.close().await
+}
+
 /// Strict whole-frame pixel-perfect lossless convergence test.
 ///
 /// Closes a gap the existing e2e suite misses: every other pixel test
