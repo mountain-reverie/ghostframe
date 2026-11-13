@@ -36,7 +36,7 @@ const K_MAX: u32 = 223;
 /// Overhead cap of a block of `k` sources: `max(1, ceil(k / 4))`, for every
 /// `k` (a lift for `k < 4` makes `r` non-monotone in `k`), bounded by 32 and
 /// by `255 - k`.
-fn r_cap(k: u32) -> u32 {
+pub(crate) fn r_cap(k: u32) -> u32 {
     k.div_ceil(4)
         .max(1)
         .min(u32::from(FEC_ADAPT_R_MAX))
@@ -125,6 +125,10 @@ pub(crate) struct RSizer {
     memo: HashMap<u32, RDecision>,
     /// Per `k`: the `r` last handed out (0 = none) and when it last fell.
     paced: [(u8, u64); 256],
+    /// Rows the trim added to the last `r_for` (after the ceiling).
+    last_trim: u8,
+    /// The rule's rows of the last `r_for`, before the trim.
+    last_base: u8,
 }
 
 impl Default for RSizer {
@@ -135,6 +139,8 @@ impl Default for RSizer {
             b: 1.0,
             memo: HashMap::new(),
             paced: [(0, 0); 256],
+            last_trim: 0,
+            last_base: 0,
         }
     }
 }
@@ -142,6 +148,16 @@ impl Default for RSizer {
 impl RSizer {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Rows the declined-share trim added to the last `r_for` (measurement).
+    pub(crate) fn last_trim(&self) -> u8 {
+        self.last_trim
+    }
+
+    /// The rule's rows of the last `r_for`, before the trim (measurement).
+    pub(crate) fn last_base(&self) -> u8 {
+        self.last_base
     }
 
     /// Forget the step-limit memory (a fresh engagement starts from the
@@ -194,7 +210,10 @@ impl RSizer {
             .entry(k)
             .or_insert_with(|| r_for_target(k, p0, b0, FEC_ADAPT_TARGET));
         let ceiling = u32::from(FEC_ADAPT_R_MAX).min(255 - k);
+        let base = d.r;
         d.r = (u32::from(d.r) + u32::from(trim)).min(ceiling) as u8;
+        self.last_trim = d.r.saturating_sub(base);
+        self.last_base = base;
         d
     }
 }

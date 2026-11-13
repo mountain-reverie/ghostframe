@@ -405,6 +405,7 @@ impl IoBridge {
             block_k_sum: self.block_tx.k_sum,
             block_k_buckets: self.block_tx.k_buckets,
             block_repairs_sent: self.block_tx.repairs_sent,
+            block_split: self.block_tx.split,
             fec_recovered_rx: self.fec_in.recovered_rx,
             fec_declined_rx: self.fec_in.declined_rx,
             fec_repair_requests_rx: self.fec_in.repair_requests_rx,

@@ -570,7 +570,9 @@ impl IoBridge {
             actions.extend(self.block_table.on_pto(*block));
         }
         self.block_tx.pto_repair_rows += actions.len() as u64;
+        self.block_tx.cause = super::block_tx::RowCause::Pto;
         self.execute_block_actions(actions);
+        self.block_tx.cause = super::block_tx::RowCause::Other;
         self.instr.pto_probes_requested += out.retx_queued;
         self.instr.losses_declared += out.lost.len() as u64;
         self.h264.stats.tx_forgotten += out.forgotten_h264_records;
