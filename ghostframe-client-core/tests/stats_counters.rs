@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `ClientStats::samples_accepted` and `frames_received` are the signals the
 //! web e2e polls (`window.__ghostframeStatsSamples` / `__ghostframeStatsFrames`).
 //! `samples_accepted` counts exactly the samples applied to the rings: not

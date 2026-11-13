@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # Self-test of ci/check-wasm-size.sh: under, at and over the limit, no wasm at
 # all, and a second oversize wasm next to a small one. Run by `just ci-local`
 # and the web-client CI job, so the guard cannot rot into one that never fires.

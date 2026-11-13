@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # The web client's wasm must stay under 512 KiB (524,288 bytes, raw).
 #
 # docs/specs/stats-panel-design.md section 5: adding Leptos to the wasm module
