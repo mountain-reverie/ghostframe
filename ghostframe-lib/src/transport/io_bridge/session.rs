@@ -418,6 +418,7 @@ impl IoBridge {
         self.feedback_recv_bufs.remove(&handle);
         self.close_deadlines.remove(&handle);
         self.rechecker.forget(&handle);
+        self.stats_sessions.remove(&handle);
         if self.last_hello_from == Some(handle) {
             self.last_hello_from = None;
         }
