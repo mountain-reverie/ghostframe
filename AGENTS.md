@@ -131,6 +131,12 @@ error — it is a NACK storm, slow convergence and visual artifacts. Use
 confirming the bundle actually changed:
 `strings target/release/ghostframe-server | grep -c <new-bundle-hash>`.
 
+**The web client's wasm has a size gate: 512 KiB.** `ci/check-wasm-size.sh`
+reads `ghostframe-web-client/dist/assets/*.wasm` (so it needs `just build-web`
+first), runs in `just ci-local` and the `web-client` CI job, and fails closed
+when there is no wasm. Raise the limit only deliberately, and record the new
+number in `docs/specs/wasm-bundle-baseline.md`.
+
 **The embed is behind `ghostframe-tsnet`'s `web-embed` feature, off by
 default.** Server crates enable it (`ghostframe-lib` does); client crates do
 not, and get a `-tags noweb` ghostbridge with no SPA and no npm step. A new
@@ -353,6 +359,9 @@ dead**: `rx{...}` and `cdf53-coverage` read `window.__tileCounts` /
 `window.__cdf53Coverage`, which nothing populates since the wasm cutover, so
 they always read zero. `fec-coverage` says `n/a(wasm-internal)` explicitly.
 `Δdrain` and `nack_sent` are live. Do not diagnose from the dead ones.
+`window.__ghostframeStatsSamples` and `window.__ghostframeStatsFrames` (e2e
+pages only) are live: the server stats samples the core applied, and every
+server-stream frame it received; both move only while the stats panel is open.
 
 The frame mode follows the bandwidth estimate: `mode.decision` reasons
 `bandwidth_short` (the tile codec's first pass stayed above 0.70 x the
