@@ -622,4 +622,32 @@ mod tests {
         b.dispatch_feedback_bytes(h, &[0x0B, 1]);
         assert!(b.note_stats_drop(h, "stream blocked"));
     }
+
+    #[tokio::test]
+    async fn an_unsubscribed_session_gets_nothing_while_another_is_served() {
+        let (mut b, h) = bridge().await;
+        let other = ConnectionHandle(1);
+        b.wt_sessions.insert(other, WebTransportServer::default());
+        // A session that unsubscribed after being sent a schema.
+        b.stats_sessions.insert(
+            other,
+            StatsSession {
+                subscribed: false,
+                schema_id: Some(9),
+                ..StatsSession::default()
+            },
+        );
+        b.dispatch_feedback_bytes(h, &[0x0B, 1]);
+        b.service_stats(now_std());
+        let raw = b.stats_capture_for_test.as_ref().expect("capture is on");
+        assert!(
+            !raw.is_empty(),
+            "premise: the subscribed session was served"
+        );
+        assert!(
+            raw.iter().all(|(w, _)| *w == h),
+            "only the subscribed session: {:?}",
+            raw.iter().map(|(w, _)| w).collect::<Vec<_>>()
+        );
+    }
 }
