@@ -916,3 +916,166 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn arb_descriptor() -> impl Strategy<Value = MetricDescriptor> {
+        (
+            any::<u16>(),
+            "\\PC{0,20}",
+            "\\PC{0,8}",
+            0u8..3,
+            prop_oneof![Just(0u8), Just(1), Just(2), Just(3), Just(255)],
+            "\\PC{0,20}",
+        )
+            .prop_map(|(id, name, unit, kind, group, label)| MetricDescriptor {
+                id,
+                name,
+                unit,
+                kind: MetricKind::from_u8(kind).expect("0..3 are kinds"),
+                group: MetricGroup::from_u8(group),
+                label,
+            })
+    }
+
+    fn arb_schema() -> impl Strategy<Value = StatsSchema> {
+        (
+            any::<u16>(),
+            "\\PC{0,20}",
+            "\\PC{0,20}",
+            prop::collection::vec(arb_descriptor(), 0..40),
+        )
+            .prop_map(|(schema_id, server_version, host_name, metrics)| StatsSchema {
+                schema_id,
+                server_version,
+                host_name,
+                metrics,
+            })
+    }
+
+    /// A schema with a sample built against it. Gauges and counters use
+    /// normal finite floats: NaN is not equal to itself, and the wire carries
+    /// the bits anyway.
+    fn arb_schema_and_sample() -> impl Strategy<Value = (StatsSchema, StatsSample)> {
+        arb_schema().prop_flat_map(|schema| {
+            let values: Vec<BoxedStrategy<MetricValue>> = schema
+                .metrics
+                .iter()
+                .map(|m| match m.kind {
+                    MetricKind::Text => "\\PC{0,20}".prop_map(MetricValue::Text).boxed(),
+                    MetricKind::Gauge | MetricKind::Counter => {
+                        prop::num::f64::NORMAL.prop_map(MetricValue::Num).boxed()
+                    }
+                })
+                .collect();
+            let id = schema.schema_id;
+            (Just(schema), any::<u64>(), values).prop_map(move |(schema, timestamp_us, values)| {
+                (
+                    schema,
+                    StatsSample {
+                        schema_id: id,
+                        timestamp_us,
+                        values,
+                    },
+                )
+            })
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+
+        #[test]
+        fn a_schema_survives_its_own_frame(schema in arb_schema()) {
+            let f = schema.try_encode_frame().expect("strategy stays inside the limits");
+            prop_assert_eq!(f[0], SERVER_MSG_STATS_SCHEMA);
+            prop_assert_eq!(StatsSchema::decode_payload(&f[FRAME_HEADER_LEN..]), Ok(schema));
+        }
+
+        #[test]
+        fn a_sample_survives_its_own_frame((schema, sample) in arb_schema_and_sample()) {
+            let f = sample.try_encode_frame().expect("strategy stays inside the limits");
+            prop_assert_eq!(
+                StatsSample::decode_payload(&f[FRAME_HEADER_LEN..], &schema),
+                Ok(sample)
+            );
+        }
+
+        #[test]
+        fn a_sample_against_a_changed_schema_never_decodes_silently(
+            (schema, sample) in arb_schema_and_sample(),
+            extra in arb_descriptor(),
+        ) {
+            let f = sample.try_encode_frame().expect("within limits");
+            let mut longer = schema.clone();
+            longer.metrics.push(extra);
+            prop_assert_eq!(
+                StatsSample::decode_payload(&f[FRAME_HEADER_LEN..], &longer),
+                Err(StatsWireError::CountMismatch),
+                "a sample one value short of its schema must be rejected as a count mismatch"
+            );
+        }
+
+        #[test]
+        fn a_sample_with_one_value_too_many_never_decodes_silently(
+            (schema, sample) in arb_schema_and_sample(),
+        ) {
+            prop_assume!(!schema.metrics.is_empty());
+            let f = sample.try_encode_frame().expect("within limits");
+            let mut shorter = schema.clone();
+            shorter.metrics.pop();
+            prop_assert_eq!(
+                StatsSample::decode_payload(&f[FRAME_HEADER_LEN..], &shorter),
+                Err(StatsWireError::CountMismatch),
+                "a sample one value over its schema must be rejected as a count mismatch"
+            );
+        }
+
+        #[test]
+        fn decoders_never_panic_on_arbitrary_bytes(
+            bytes in prop::collection::vec(any::<u8>(), 0..400),
+            (schema, _) in arb_schema_and_sample(),
+        ) {
+            let _ = StatsSchema::decode_payload(&bytes);
+            let _ = StatsSample::decode_payload(&bytes, &schema);
+            let _ = StatsSubscribe::decode(&bytes);
+            let mut r = ServerFrameReader::default();
+            r.push(&bytes);
+            while r.next_frame().is_some() {}
+        }
+
+        #[test]
+        fn the_reader_is_indifferent_to_how_the_stream_is_cut(
+            (schema, sample) in arb_schema_and_sample(),
+            cuts in prop::collection::vec(1usize..64, 1..40),
+        ) {
+            let schema_frame = schema.try_encode_frame().expect("within limits");
+            let sample_frame = sample.try_encode_frame().expect("within limits");
+            let mut stream = schema_frame.clone();
+            stream.extend_from_slice(&sample_frame);
+            stream.extend_from_slice(&sample_frame);
+
+            let mut r = ServerFrameReader::default();
+            let mut got: Vec<(u8, Vec<u8>)> = Vec::new();
+            let mut pos = 0usize;
+            let mut i = 0usize;
+            while pos < stream.len() {
+                let n = cuts[i % cuts.len()].min(stream.len() - pos);
+                r.push(&stream[pos..pos + n]);
+                pos += n;
+                i += 1;
+                while let Some(f) = r.next_frame() {
+                    got.push(f.expect("no frame is over the limit"));
+                }
+            }
+            prop_assert_eq!(got.len(), 3);
+            prop_assert_eq!(&got[0].1[..], &schema_frame[FRAME_HEADER_LEN..]);
+            prop_assert_eq!(&got[1].1[..], &sample_frame[FRAME_HEADER_LEN..]);
+            prop_assert_eq!(&got[2].1[..], &sample_frame[FRAME_HEADER_LEN..]);
+            prop_assert_eq!(r.buffered(), 0);
+        }
+    }
+}
