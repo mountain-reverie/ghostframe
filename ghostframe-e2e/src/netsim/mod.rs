@@ -102,6 +102,14 @@ pub struct NetSim {
     /// applied after every other verdict, so the RNG stream is untouched.
     mtu_step: Option<(u64, usize)>,
 
+    /// Steps of the independent loss probability: from `.0` (virtual us) on
+    /// the i.i.d. loss is `.1` instead of `profile.loss` (the last step at or
+    /// before the datagram's offer instant wins). Outside `NetProfile` for the
+    /// same reason as `mtu_step`, and it changes only the probability passed
+    /// to the one loss draw, never the number of draws, so the RNG stream is
+    /// untouched. Sorted by time.
+    loss_steps: Vec<(u64, f64)>,
+
     /// The seed used to construct this simulator; logged in test diagnostics.
     pub seed: u64,
 }
@@ -122,6 +130,7 @@ impl NetSim {
             codel_drop_next_us: 0,
             codel_count: 0,
             mtu_step: None,
+            loss_steps: Vec::new(),
             seed,
         }
     }
@@ -131,6 +140,15 @@ impl NetSim {
     /// packets vanish without any ICMP (a black hole).
     pub fn with_mtu_step(mut self, from_us: u64, max_len: usize) -> Self {
         self.mtu_step = Some((from_us, max_len));
+        self
+    }
+
+    /// From each `(at_us, loss)` on, the i.i.d. loss probability is `loss`
+    /// (a step function of virtual time; `profile.loss` before the first).
+    /// The burst chain's own loss is not affected.
+    pub fn with_loss_steps(mut self, mut steps: Vec<(u64, f64)>) -> Self {
+        steps.sort_by_key(|s| s.0);
+        self.loss_steps = steps;
         self
     }
 
@@ -312,7 +330,11 @@ impl NetSim {
         let loss_p = if self.in_burst {
             self.profile.burst_loss
         } else {
-            self.profile.loss
+            self.loss_steps
+                .iter()
+                .rev()
+                .find(|&&(at, _)| at <= now_us)
+                .map_or(self.profile.loss, |&(_, p)| p)
         };
         if self.rng.bernoulli(loss_p) {
             // Chosen: a loss-dropped datagram does NOT spend bucket tokens.
@@ -453,6 +475,24 @@ mod tests {
         let mut c = DetRng::new(0xDEAD_BEEE);
         let zs: Vec<u64> = (0..64).map(|_| c.next_u64()).collect();
         assert_ne!(xs, zs, "different seeds must diverge");
+    }
+
+    #[test]
+    fn loss_steps_follow_virtual_time() {
+        let drops = |steps: Vec<(u64, f64)>| {
+            let mut sim = NetSim::new(NetProfile::perfect(), 7).with_loss_steps(steps);
+            (0..2000u64)
+                .map(|i| matches!(sim.decide(100, i * 1000), Verdict::Drop))
+                .collect::<Vec<_>>()
+        };
+        let d = drops(vec![(1_000_000, 0.5), (1_500_000, 0.0)]);
+        assert!(d[..1000].iter().all(|&x| !x), "clean before the step");
+        let mid = d[1000..1500].iter().filter(|&&x| x).count();
+        assert!(
+            (150..350).contains(&mid),
+            "about half lost in the window: {mid}"
+        );
+        assert!(d[1500..].iter().all(|&x| !x), "clean after the window");
     }
 
     #[test]
