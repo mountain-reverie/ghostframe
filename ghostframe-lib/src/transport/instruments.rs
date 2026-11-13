@@ -653,7 +653,14 @@ pub struct InstrumentSummary {
     pub block_content_lost_h264: u64,
     /// Blocks the table closed, by outcome (`CloseReason`).
     pub block_closed_accounted: u64,
+    /// Includes `block_closed_declined_late`: declines of a block whose
+    /// request was served, which the trim does not count.
     pub block_closed_declined: u64,
+    pub block_closed_declined_late: u64,
+    /// Blocks evicted past the table's count or byte cap, and the most
+    /// symbol bytes it held.
+    pub block_evicted: u64,
+    pub block_cached_bytes_peak: u64,
     pub block_closed_handed_off: u64,
     pub block_closed_timed_out: u64,
     /// Blocks the packer closed with repairs decided (all but the declined
