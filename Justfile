@@ -146,6 +146,12 @@ ci-client: build-client
     just check-gstreamer
     @echo "=== ci-client passed ==="
 
+# The stats panel's host tests and its headless-Chrome test (wasm-pack drives
+# chromedriver; needs Chrome or Chromium installed).
+test-web-ui:
+    cargo test -p ghostframe-web-ui
+    wasm-pack test --headless --chrome ghostframe-web-ui
+
 # Run from a clean checkout: builds the web client SPA (vite) into
 # ghostframe-web-client/dist/, which ghostbridge //go:embeds at compile
 # time. A stale or missing dist/ now fails the ghostbridge build with a
