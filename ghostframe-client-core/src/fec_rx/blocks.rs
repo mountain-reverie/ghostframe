@@ -6,18 +6,19 @@ use ghostframe_protocol::fec::codec;
 use ghostframe_protocol::fec::feedback::RepairAsk;
 use ghostframe_protocol::fec::frame::{self, Frame, PlainFrame, RepairFrame, SourceFrame};
 use ghostframe_protocol::fec::repair_status::DeclineReason;
+use ghostframe_protocol::fec::timing;
+use ghostframe_protocol::protocol::is_tile_datagram;
 
-/// Recovery window while the server advertises nothing (plan decision 2).
-pub const FEC_RX_DEFAULT_T_ADV_US: u64 = 33_000;
-pub const FEC_RX_ALLOWANCE_US: u64 = 10_000;
+/// Span assumed while the server advertises nothing; the arithmetic lives in
+/// `ghostframe_protocol::fec::timing`, which the server calls too.
+pub const FEC_RX_DEFAULT_T_ADV_US: u64 = timing::default_t_adv_us();
+pub const FEC_RX_ALLOWANCE_US: u64 = timing::allowance_us();
 /// Most blocks held at once.
 pub const FEC_RX_MAX_OPEN_BLOCKS: usize = 64;
 /// Most symbol bytes held across all blocks.
 pub const FEC_RX_MAX_HELD_BYTES: usize = 4 * 1024 * 1024;
 /// A block this many ids behind the newest is pruned.
 pub const FEC_RX_BLOCK_WINDOW: u16 = 1024;
-
-const WINDOW_US: u64 = FEC_RX_DEFAULT_T_ADV_US + FEC_RX_ALLOWANCE_US;
 
 /// What one framed datagram produced.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -66,6 +67,8 @@ pub struct BlockStats {
     pub blocks_closed_complete: u64,
     pub blocks_unrecoverable: u64,
     pub requests: u64,
+    /// Blocks whose first repair row came after the block was given up, having asked for one.
+    pub late_rows: u64,
     pub declined: u64,
     pub duplicates: u64,
     pub held_bytes: u64,
@@ -84,6 +87,11 @@ struct Block {
     repairs_used: usize,
     held_sources: usize,
     bytes: usize,
+    first_arrival_us: u64,
+    /// The span code a source of this block carried, if one has arrived.
+    t_adv: Option<u8>,
+    /// Some held source has a record that is not a tile datagram.
+    h264: bool,
     close_at: u64,
     requested: bool,
     /// Decoding failed: nothing more to try.
@@ -103,10 +111,26 @@ impl Block {
             repairs_used: 0,
             held_sources: 0,
             bytes: 0,
-            close_at: now_us.saturating_add(WINDOW_US),
+            first_arrival_us: now_us,
+            t_adv: None,
+            h264: false,
+            close_at: now_us.saturating_add(timing::first_window_us(0)),
             requested: false,
             unrecoverable: false,
             sticky: None,
+        }
+    }
+
+    /// A source carried the advertised span: the first window follows it, unless the block has
+    /// been asked about already.
+    fn learn_t_adv(&mut self, code: u8) {
+        if self.t_adv.is_none() {
+            self.t_adv = Some(code);
+            if !self.requested {
+                self.close_at = self
+                    .first_arrival_us
+                    .saturating_add(timing::first_window_us(code));
+            }
         }
     }
 
@@ -159,6 +183,10 @@ impl Block {
 struct Closed {
     id: u16,
     complete: bool,
+    /// A REPAIR_REQUEST went out before the block was given up.
+    requested: bool,
+    /// A late row of this block has been counted.
+    late_counted: bool,
 }
 
 pub struct BlockStore {
@@ -167,6 +195,8 @@ pub struct BlockStore {
     newest: Option<u16>,
     held_bytes: usize,
     closed: Vec<Option<Closed>>,
+    /// The last non-zero RTT hint a REPAIR carried.
+    rtt_hint: u8,
     pending: Vec<CloseAction>,
     last_now: u64,
     stats: BlockStats,
@@ -220,6 +250,7 @@ impl BlockStore {
             newest: None,
             held_bytes: 0,
             closed: vec![None; usize::from(FEC_RX_BLOCK_WINDOW)],
+            rtt_hint: 0,
             pending: Vec::new(),
             last_now: 0,
             stats: BlockStats::default(),
@@ -243,8 +274,13 @@ impl BlockStore {
             .map(|c| c.complete)
     }
 
-    fn mark_closed(&mut self, id: u16, complete: bool) {
-        self.closed[Self::slot(id)] = Some(Closed { id, complete });
+    fn mark_closed(&mut self, id: u16, complete: bool, requested: bool) {
+        self.closed[Self::slot(id)] = Some(Closed {
+            id,
+            complete,
+            requested,
+            late_counted: false,
+        });
     }
 
     /// Parse and absorb one framed datagram. Never panics on any bytes.
@@ -328,7 +364,7 @@ impl BlockStore {
     fn give_up(&mut self, i: usize, reason: DeclineReason) {
         let b = self.blocks.remove(i);
         self.held_bytes -= b.bytes;
-        self.mark_closed(b.id, false);
+        self.mark_closed(b.id, false, b.requested);
         let (k, missing) = b.missing_bitmap();
         self.stats.declined += 1;
         self.stats.blocks_unrecoverable += 1;
@@ -397,8 +433,11 @@ impl BlockStore {
         if b.k.is_none() {
             b.k = last_k.and_then(|l| u8::try_from(l).ok());
         }
+        b.learn_t_adv(f.t_adv);
+        b.h264 |= frame::records(f.records).any(|r| r.is_ok_and(|r| !is_tile_datagram(r)));
         let sym = SourceFrame {
             last: f.last,
+            t_adv: f.t_adv,
             bundle_seq: f.bundle_seq,
             block_id: f.block_id,
             idx: f.idx,
@@ -413,6 +452,19 @@ impl BlockStore {
     }
 
     fn on_repair(&mut self, f: RepairFrame<'_>, now_us: u64, out: &mut RxOutcome) {
+        if f.rtt_hint != 0 {
+            self.rtt_hint = f.rtt_hint;
+        }
+        if let Some(c) = self.closed[Self::slot(f.block_id)]
+            .as_mut()
+            .filter(|c| c.id == f.block_id)
+        {
+            // A row for a block already given up, after it asked for one: too late.
+            if !c.complete && c.requested && !c.late_counted {
+                c.late_counted = true;
+                self.stats.late_rows += 1;
+            }
+        }
         let Some(bi) = self.block_index(f.block_id, now_us) else {
             self.stats.repair_wasted += 1;
             return;
@@ -496,7 +548,7 @@ impl BlockStore {
         if self.blocks[bi].complete() {
             let b = self.blocks.remove(bi);
             self.held_bytes -= b.bytes;
-            self.mark_closed(b.id, true);
+            self.mark_closed(b.id, true, b.requested);
             self.stats.blocks_closed_complete += 1;
             self.stats.repair_wasted += (b.repairs.len() - b.repairs_used) as u64;
         }
@@ -514,10 +566,15 @@ impl BlockStore {
             }
             let b = &mut self.blocks[i];
             let sticky = b.sticky.unwrap_or(DeclineReason::Pruned);
+            let skip = !b.requested && b.h264 && timing::h264_skips_request(self.rtt_hint);
             let k_known = b.k.map(usize::from);
             if b.unrecoverable {
                 self.give_up(i, DeclineReason::InvalidSymbol);
-            } else if b.requested || b.sticky.is_some() || k_known.is_some_and(|k| b.held() >= k) {
+            } else if skip
+                || b.requested
+                || b.sticky.is_some()
+                || k_known.is_some_and(|k| b.held() >= k)
+            {
                 self.give_up(i, sticky);
             } else {
                 let (have, missing) = match k_known {
@@ -525,7 +582,7 @@ impl BlockStore {
                     None => (b.held(), 1),
                 };
                 b.requested = true;
-                b.close_at = now_us.saturating_add(WINDOW_US);
+                b.close_at = now_us.saturating_add(timing::request_round_us(self.rtt_hint));
                 self.stats.requests += 1;
                 actions.push(CloseAction::Request(RepairAsk {
                     block_id: b.id,
@@ -572,6 +629,7 @@ mod tests {
 
     fn src(seq: u32, block: u16, idx: u8, last: bool, records: &[u8]) -> Vec<u8> {
         SourceFrame {
+            t_adv: 0,
             last,
             bundle_seq: seq,
             block_id: block,
@@ -583,6 +641,7 @@ mod tests {
 
     fn rep(seq: u32, block: u16, k: u8, r: u8, idx: u8, payload: &[u8]) -> Vec<u8> {
         RepairFrame {
+            rtt_hint: 0,
             bundle_seq: seq,
             block_id: block,
             k,
@@ -605,6 +664,7 @@ mod tests {
         let mut syms = Vec::new();
         for (i, p) in payloads.iter().enumerate() {
             let f = SourceFrame {
+                t_adv: 0,
                 last: i + 1 == k,
                 bundle_seq: base + i as u32,
                 block_id,
@@ -895,6 +955,206 @@ mod tests {
         assert_eq!(ids, vec![65_500, 65_535, 5]);
     }
 
+    // ---- advertised timing (S1) ----
+
+    /// Sets the advertised span code in an encoded SOURCE (flags bits 4-6), by hand.
+    fn adv(mut dg: Vec<u8>, code: u8) -> Vec<u8> {
+        assert_eq!(dg[0], 0x01);
+        dg[1] = (dg[1] & !0x70) | (code << 4);
+        dg
+    }
+
+    /// A REPAIR of block `id` carrying an RTT hint (scheme byte high nibble), by hand.
+    fn hinted_rep(id: u16, hint: u8) -> Vec<u8> {
+        let mut dg = rep(900 + u32::from(id), id, 3, 1, 0, &[0u8; 20]);
+        assert_eq!(dg[1], 0);
+        dg[1] = hint << 4;
+        dg
+    }
+
+    /// A record that is a tile datagram (bit 31 of its first u32 set).
+    fn tile_rec() -> Vec<u8> {
+        recs(&[&[0x80, 0, 0, 1, 0, 0, 0, 0]])
+    }
+
+    /// A record that is not (a frame datagram, so H.264 on this path).
+    fn frame_rec() -> Vec<u8> {
+        recs(&[&[0x00, 0, 0, 1, 0, 0, 0, 0]])
+    }
+
+    /// Codes whose window differs from the unadvertised 43 ms (T = 20 ms advertises code 0).
+    const ADVERTISED: [u8; 7] = [1, 2, 3, 4, 5, 6, 7];
+
+    #[test]
+    fn the_first_window_follows_the_advertised_span_whatever_the_arrival_order() {
+        for code in ADVERTISED {
+            let w = timing::first_window_us(code);
+            assert_ne!(
+                w, WINDOW,
+                "premise: code {code} must differ from the default"
+            );
+            // Source first.
+            let mut s = BlockStore::new();
+            s.on_datagram(&adv(src(1, 3, 0, false, &tile_rec()), code), T);
+            assert_eq!(s.poll_timeout(), Some(T + w), "code {code}, source first");
+            // A repair opens the block, a source with a code arrives later: from the FIRST arrival.
+            let mut s = BlockStore::new();
+            s.on_datagram(&hinted_rep(3, 0), T);
+            assert_eq!(s.poll_timeout(), Some(T + WINDOW), "before any source");
+            s.on_datagram(&adv(src(1, 3, 0, false, &tile_rec()), code), T + 2_000);
+            assert_eq!(s.poll_timeout(), Some(T + w), "code {code}, repair first");
+            assert!(s.on_timeout(T + w - 1).is_empty());
+            assert!(matches!(s.on_timeout(T + w)[0], CloseAction::Request(_)));
+        }
+    }
+
+    #[test]
+    fn a_source_that_arrives_after_the_request_does_not_move_the_window() {
+        let mut s = BlockStore::new();
+        s.on_datagram(&hinted_rep(3, 0), T);
+        let a = s.on_timeout(T + WINDOW);
+        assert!(matches!(a[0], CloseAction::Request(_)));
+        let due = s.poll_timeout();
+        s.on_datagram(&adv(src(1, 3, 0, false, &tile_rec()), 7), T + WINDOW + 1);
+        assert_eq!(s.poll_timeout(), due);
+    }
+
+    #[test]
+    fn the_request_round_is_the_hint_plus_the_margin_from_the_instant_of_the_request() {
+        for hint in [0u8, 1, 5, 9, 12, 15] {
+            let mut s = BlockStore::new();
+            // Block 8 sets the hint (a repair with a hint), block 3 is the one under test.
+            if hint != 0 {
+                s.on_datagram(&hinted_rep(8, hint), T);
+            }
+            s.on_datagram(&src(1, 3, 0, false, &tile_rec()), T);
+            let ask_at = T + WINDOW + 777;
+            let a = s.on_timeout(ask_at);
+            assert!(a
+                .iter()
+                .any(|a| matches!(a, CloseAction::Request(r) if r.block_id == 3)));
+            let round = timing::request_round_us(hint);
+            if hint == 0 {
+                assert_eq!(round, WINDOW, "the unadvertised round is today's 43 ms");
+            } else {
+                assert_ne!(round, WINDOW);
+            }
+            let due = s.poll_timeout().unwrap();
+            assert!(due >= ask_at + round.min(WINDOW));
+            assert!(s
+                .on_timeout(ask_at + round - 1)
+                .iter()
+                .all(|a| !matches!(a, CloseAction::Decline { block_id: 3, .. })));
+            let a = s.on_timeout(ask_at + round);
+            assert!(
+                a.iter()
+                    .any(|a| matches!(a, CloseAction::Decline { block_id: 3, .. })),
+                "hint {hint}: {a:?}"
+            );
+        }
+    }
+
+    /// The decision the H.264 skip makes for a block of one source with `rec`, under `hint`.
+    fn first_window_end(rec: &[u8], hint: u8) -> Vec<CloseAction> {
+        let mut s = BlockStore::new();
+        s.on_datagram(&hinted_rep(8, hint), T);
+        s.on_datagram(&src(1, 3, 0, false, rec), T);
+        s.on_timeout(T + WINDOW)
+            .into_iter()
+            .filter(|a| match a {
+                CloseAction::Request(r) => r.block_id == 3,
+                CloseAction::Decline { block_id, .. } => *block_id == 3,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_h264_block_is_declined_without_a_request_when_the_hint_exceeds_the_frame_life() {
+        let a = first_window_end(&frame_rec(), 10);
+        assert!(
+            matches!(a[..], [CloseAction::Decline { block_id: 3, .. }]),
+            "hint 10: {a:?}"
+        );
+        let a = first_window_end(&frame_rec(), 9);
+        assert!(matches!(a[..], [CloseAction::Request(_)]), "hint 9: {a:?}");
+        // A tile block always requests.
+        let a = first_window_end(&tile_rec(), 10);
+        assert!(
+            matches!(a[..], [CloseAction::Request(_)]),
+            "tile, hint 10: {a:?}"
+        );
+        let a = first_window_end(&tile_rec(), 15);
+        assert!(
+            matches!(a[..], [CloseAction::Request(_)]),
+            "tile, hint 15: {a:?}"
+        );
+    }
+
+    #[test]
+    fn one_non_tile_record_in_a_mixed_bundle_makes_the_block_h264() {
+        let mut mixed = tile_rec();
+        mixed.extend_from_slice(&frame_rec());
+        let a = first_window_end(&mixed, 12);
+        assert!(matches!(a[..], [CloseAction::Decline { .. }]), "{a:?}");
+    }
+
+    #[test]
+    fn late_rows_count_a_block_whose_row_came_after_the_give_up_of_a_request() {
+        let mut s = BlockStore::new();
+        s.on_datagram(&hinted_rep(8, 0), T);
+        s.on_datagram(&src(1, 3, 0, false, &tile_rec()), T);
+        let a = s.on_timeout(T + WINDOW);
+        assert!(a
+            .iter()
+            .any(|a| matches!(a, CloseAction::Request(r) if r.block_id == 3)));
+        assert_eq!(
+            s.stats().requests,
+            2,
+            "premise: both blocks were asked about"
+        );
+        let a = s.on_timeout(T + 2 * WINDOW);
+        assert!(a
+            .iter()
+            .any(|a| matches!(a, CloseAction::Decline { block_id: 3, .. })));
+        assert_eq!(s.stats().late_rows, 0, "no row yet");
+        s.on_datagram(&hinted_rep(3, 0), T + 2 * WINDOW + 5);
+        assert_eq!(s.stats().late_rows, 1);
+        let mut second = hinted_rep(3, 0);
+        second[10] = 1; // repair_idx 1
+        s.on_datagram(&second, T + 2 * WINDOW + 6);
+        assert_eq!(
+            s.stats().late_rows,
+            1,
+            "a second late row of the block adds nothing"
+        );
+    }
+
+    #[test]
+    fn late_rows_do_not_count_a_block_given_up_without_a_request() {
+        let mut s = BlockStore::new();
+        s.on_datagram(&hinted_rep(8, 12), T);
+        s.on_datagram(&src(1, 3, 0, false, &frame_rec()), T);
+        let a = s.on_timeout(T + WINDOW);
+        assert!(a
+            .iter()
+            .any(|a| matches!(a, CloseAction::Decline { block_id: 3, .. })));
+        s.on_datagram(&hinted_rep(3, 0), T + WINDOW + 5);
+        assert_eq!(s.stats().late_rows, 0);
+    }
+
+    #[test]
+    fn the_hint_kept_is_the_last_non_zero_one() {
+        let mut s = BlockStore::new();
+        s.on_datagram(&hinted_rep(8, 12), T);
+        s.on_datagram(&hinted_rep(9, 0), T + 1);
+        s.on_datagram(&src(1, 3, 0, false, &frame_rec()), T + 2);
+        // Still 12: an unknown hint does not erase what was learned.
+        let a = s.on_timeout(T + 2 + WINDOW);
+        assert!(a
+            .iter()
+            .any(|a| matches!(a, CloseAction::Decline { block_id: 3, .. })));
+    }
+
     #[test]
     fn window_requests_once_then_declines_with_a_missing_bitmap() {
         let payloads: Vec<Vec<u8>> = (0..10).map(|i| recs(&[&[i; 8]])).collect();
@@ -1005,6 +1265,7 @@ mod tests {
         // The helper used by the store agrees with the frame module.
         let sym = {
             let f = SourceFrame {
+                t_adv: 0,
                 last: false,
                 bundle_seq: 1,
                 block_id: 0,

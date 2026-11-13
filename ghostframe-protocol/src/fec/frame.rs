@@ -8,6 +8,12 @@ pub const FEC_FRAME_REPAIR: u8 = 0x02;
 pub const FEC_FRAME_PLAIN: u8 = 0x03;
 pub const FEC_SCHEME_RS_CAUCHY: u8 = 0;
 pub const FEC_FLAG_LAST: u8 = 0x80;
+/// SOURCE flags bits 4-6: the block's advertised span code (`timing::t_adv_us`).
+const T_ADV_SHIFT: u32 = 4;
+const T_ADV_MASK: u8 = 0x07;
+/// REPAIR scheme byte: low nibble is the scheme, high nibble the RTT hint code.
+const SCHEME_MASK: u8 = 0x0f;
+const RTT_HINT_SHIFT: u32 = 4;
 pub const FEC_SOURCE_HEADER_LEN: usize = 9;
 pub const FEC_REPAIR_HEADER_LEN: usize = 11;
 pub const FEC_PLAIN_HEADER_LEN: usize = 5;
@@ -21,6 +27,8 @@ pub const FEC_RECORDS_HEADROOM: usize = FEC_REPAIR_HEADER_LEN + FEC_SYMBOL_OVERH
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceFrame<'a> {
     pub last: bool,
+    /// Advertised span code, 0..=7 (0: nothing advertised); the same in every source of a block.
+    pub t_adv: u8,
     pub bundle_seq: u32,
     pub block_id: u16,
     pub idx: u8,
@@ -29,6 +37,8 @@ pub struct SourceFrame<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepairFrame<'a> {
+    /// Round-trip hint code, 0..=15 (0: unknown).
+    pub rtt_hint: u8,
     pub bundle_seq: u32,
     pub block_id: u16,
     pub k: u8,
@@ -60,8 +70,6 @@ pub enum FrameError {
     Truncated { need: usize, got: usize },
     #[error("unknown FEC scheme {0}")]
     UnknownScheme(u8),
-    #[error("reserved bits set in flags byte {0:#04x}")]
-    ReservedBits(u8),
     #[error("bad block shape: k={k} r={r} repair_idx={repair_idx}")]
     BadBlockShape { k: u8, r: u8, repair_idx: u8 },
     #[error("record at offset {at} runs past the end of the frame")]
@@ -102,11 +110,9 @@ pub fn parse(dg: &[u8]) -> Result<Frame<'_>, FrameError> {
             if scheme != FEC_SCHEME_RS_CAUCHY {
                 return Err(FrameError::UnknownScheme(scheme));
             }
-            if flags & !(FEC_FLAG_LAST | 0x0f) != 0 {
-                return Err(FrameError::ReservedBits(flags));
-            }
             Ok(Frame::Source(SourceFrame {
                 last: flags & FEC_FLAG_LAST != 0,
+                t_adv: (flags >> T_ADV_SHIFT) & T_ADV_MASK,
                 bundle_seq: u32_at(dg, 2),
                 block_id: u16::from_le_bytes([dg[6], dg[7]]),
                 idx: dg[8],
@@ -114,7 +120,7 @@ pub fn parse(dg: &[u8]) -> Result<Frame<'_>, FrameError> {
             }))
         }
         FEC_FRAME_REPAIR => {
-            let scheme = dg[1];
+            let scheme = dg[1] & SCHEME_MASK;
             if scheme != FEC_SCHEME_RS_CAUCHY {
                 return Err(FrameError::UnknownScheme(scheme));
             }
@@ -127,6 +133,7 @@ pub fn parse(dg: &[u8]) -> Result<Frame<'_>, FrameError> {
                 return Err(FrameError::BadBlockShape { k, r, repair_idx });
             }
             Ok(Frame::Repair(RepairFrame {
+                rtt_hint: dg[1] >> RTT_HINT_SHIFT,
                 bundle_seq: u32_at(dg, 2),
                 block_id: u16::from_le_bytes([dg[6], dg[7]]),
                 k,
@@ -147,7 +154,11 @@ impl SourceFrame<'_> {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(FEC_SOURCE_HEADER_LEN + self.records.len());
         v.push(FEC_FRAME_SOURCE);
-        v.push(FEC_SCHEME_RS_CAUCHY | if self.last { FEC_FLAG_LAST } else { 0 });
+        v.push(
+            FEC_SCHEME_RS_CAUCHY
+                | ((self.t_adv & T_ADV_MASK) << T_ADV_SHIFT)
+                | if self.last { FEC_FLAG_LAST } else { 0 },
+        );
         v.extend_from_slice(&self.bundle_seq.to_le_bytes());
         v.extend_from_slice(&self.block_id.to_le_bytes());
         v.push(self.idx);
@@ -173,7 +184,7 @@ impl RepairFrame<'_> {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(FEC_REPAIR_HEADER_LEN + self.payload.len());
         v.push(FEC_FRAME_REPAIR);
-        v.push(FEC_SCHEME_RS_CAUCHY);
+        v.push(FEC_SCHEME_RS_CAUCHY | ((self.rtt_hint & 0x0f) << RTT_HINT_SHIFT));
         v.extend_from_slice(&self.bundle_seq.to_le_bytes());
         v.extend_from_slice(&self.block_id.to_le_bytes());
         v.extend_from_slice(&[self.k, self.r, self.repair_idx]);
@@ -277,6 +288,7 @@ mod tests {
     fn source_roundtrip_and_layout() {
         let r = recs(&[b"abc", b""]);
         let f = SourceFrame {
+            t_adv: 0,
             last: true,
             bundle_seq: 0x0403_0201,
             block_id: 0x0605,
@@ -294,6 +306,7 @@ mod tests {
     fn repair_roundtrip_and_layout() {
         let p = [9u8; 20];
         let f = RepairFrame {
+            rtt_hint: 0,
             bundle_seq: 77,
             block_id: 3,
             k: 10,
@@ -322,6 +335,7 @@ mod tests {
     fn coded_symbol_roundtrip_through_padding() {
         let r = recs(&[b"tile bytes", b"frag"]);
         let f = SourceFrame {
+            t_adv: 0,
             last: false,
             bundle_seq: 42,
             block_id: 1,
@@ -339,6 +353,7 @@ mod tests {
         let max = 1200usize;
         let r = vec![0u8; max - FEC_RECORDS_HEADROOM];
         let src = SourceFrame {
+            t_adv: 0,
             last: false,
             bundle_seq: 0,
             block_id: 0,
@@ -348,6 +363,7 @@ mod tests {
         assert!(src.encode().len() <= max);
         let payload = src.coded_symbol();
         let rep = RepairFrame {
+            rtt_hint: 0,
             bundle_seq: 0,
             block_id: 0,
             k: 1,
@@ -370,12 +386,18 @@ mod tests {
             parse(&[0x01, 0x01, 0, 0, 0, 0, 0, 0, 0]),
             Err(FrameError::UnknownScheme(1))
         );
+        // A repair whose low nibble names a scheme is unknown; the high nibble is the hint.
         assert_eq!(
-            parse(&[0x01, 0x40, 0, 0, 0, 0, 0, 0, 0]),
-            Err(FrameError::ReservedBits(0x40))
+            parse(&[0x02, 0x01, 0, 0, 0, 0, 0, 0, 1, 1, 0]),
+            Err(FrameError::UnknownScheme(1))
+        );
+        assert_eq!(
+            parse(&[0x02, 0xf1, 0, 0, 0, 0, 0, 0, 1, 1, 0]),
+            Err(FrameError::UnknownScheme(1))
         );
         let bad = |k, r, i| {
             RepairFrame {
+                rtt_hint: 0,
                 bundle_seq: 0,
                 block_id: 0,
                 k,
@@ -423,6 +445,73 @@ mod tests {
         );
     }
 
+    /// A source of `records` with the given code, last flag and idx.
+    fn src_with(t_adv: u8, last: bool, records: &[u8]) -> SourceFrame<'_> {
+        SourceFrame {
+            last,
+            t_adv,
+            bundle_seq: 5,
+            block_id: 2,
+            idx: 1,
+            records,
+        }
+    }
+
+    #[test]
+    fn every_t_adv_and_last_round_trips_and_sits_in_bits_4_to_6() {
+        for t_adv in 0..8u8 {
+            for last in [false, true] {
+                let f = src_with(t_adv, last, b"xy");
+                let dg = f.encode();
+                assert_eq!(dg[1], (t_adv << 4) | if last { 0x80 } else { 0 });
+                assert_eq!(parse(&dg), Ok(Frame::Source(f)));
+            }
+        }
+    }
+
+    #[test]
+    fn every_rtt_hint_round_trips_in_the_high_nibble() {
+        for rtt_hint in 0..16u8 {
+            let f = RepairFrame {
+                rtt_hint,
+                bundle_seq: 1,
+                block_id: 2,
+                k: 3,
+                r: 1,
+                repair_idx: 0,
+                payload: b"pp",
+            };
+            let dg = f.encode();
+            assert_eq!(dg[1], rtt_hint << 4);
+            assert_eq!(parse(&dg), Ok(Frame::Repair(f)));
+        }
+    }
+
+    /// With the reserved-bits rule gone, a flags byte is invalid only by its scheme nibble.
+    #[test]
+    fn every_source_flags_byte_parses_or_is_an_unknown_scheme() {
+        for flags in 0..=255u8 {
+            let dg = [0x01, flags, 0, 0, 0, 0, 0, 0, 0];
+            match parse(&dg) {
+                Ok(Frame::Source(f)) => {
+                    assert_eq!(flags & 0x0f, 0);
+                    assert_eq!(f.last, flags & 0x80 != 0);
+                    assert_eq!(f.t_adv, (flags >> 4) & 7);
+                }
+                Err(FrameError::UnknownScheme(s)) => assert_eq!(s, flags & 0x0f),
+                other => panic!("flags {flags:#04x}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_parity_does_not_depend_on_the_advertised_code_or_hint() {
+        let a = src_with(0, false, b"records").coded_symbol();
+        for t_adv in 1..8u8 {
+            assert_eq!(src_with(t_adv, true, b"records").coded_symbol(), a);
+        }
+    }
+
     proptest! {
         #[test]
         fn parse_never_panics(dg in proptest::collection::vec(any::<u8>(), 0..1300)) {
@@ -432,11 +521,11 @@ mod tests {
         }
 
         #[test]
-        fn source_roundtrip(seq in any::<u32>(), block in any::<u16>(), idx in any::<u8>(), last in any::<bool>(),
+        fn source_roundtrip(seq in any::<u32>(), block in any::<u16>(), idx in any::<u8>(), last in any::<bool>(), t_adv in 0u8..8,
                             items in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..300), 0..5)) {
             let mut r = Vec::new();
             for i in &items { push_record(&mut r, i); }
-            let f = SourceFrame { last, bundle_seq: seq, block_id: block, idx, records: &r };
+            let f = SourceFrame { last, t_adv, bundle_seq: seq, block_id: block, idx, records: &r };
             let dg = f.encode();
             prop_assert_eq!(parse(&dg), Ok(Frame::Source(f)));
             let got: Vec<Vec<u8>> = records(&r).map(|x| x.unwrap().to_vec()).collect();

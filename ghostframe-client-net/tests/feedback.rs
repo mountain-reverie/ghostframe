@@ -395,6 +395,7 @@ fn recovered_status_reaches_the_server_on_a_second_tagged_stream() {
     let mut r1 = Vec::new();
     push_record(&mut r1, b"second record");
     let s0 = SourceFrame {
+        t_adv: 0,
         last: false,
         bundle_seq: 10,
         block_id: 7,
@@ -402,6 +403,7 @@ fn recovered_status_reaches_the_server_on_a_second_tagged_stream() {
         records: &r0,
     };
     let s1 = SourceFrame {
+        t_adv: 0,
         last: true,
         bundle_seq: 11,
         block_id: 7,
@@ -412,6 +414,7 @@ fn recovered_status_reaches_the_server_on_a_second_tagged_stream() {
     let refs: Vec<&[u8]> = syms.iter().map(|s| s.as_slice()).collect();
     let reps = encode_repairs(&refs, &[0]).expect("encode_repairs");
     let repair = RepairFrame {
+        rtt_hint: 0,
         bundle_seq: 12,
         block_id: 7,
         k: 2,

@@ -1265,3 +1265,80 @@ async fn declined_blocks_move_the_trim_and_nothing_else_does() {
     a.tick(3, std::iter::repeat_n(CloseReason::Declined, 10));
     assert_eq!(a.r_for_block(64, 3), before + 1, "10/256 Declined trims");
 }
+
+/// Every frame in `frames` that is a SOURCE, as its `t_adv`; every REPAIR as its hint.
+fn adv_and_hints(frames: &[Vec<u8>]) -> (Vec<u8>, Vec<u8>) {
+    let (mut adv, mut hints) = (Vec::new(), Vec::new());
+    for f in frames {
+        match parse(f).expect("a frame") {
+            Frame::Source(s) => adv.push(s.t_adv),
+            Frame::Repair(r) => hints.push(r.rtt_hint),
+            Frame::Plain(_) => {}
+        }
+    }
+    (adv, hints)
+}
+
+#[tokio::test]
+async fn every_source_carries_the_span_its_knob_implies() {
+    // The documented spans in ms by code, written out.
+    let spans = [33u64, 10, 15, 20, 25, 40, 50, 66];
+    // t_ms -> the advertised span (t_ms plus the 10 ms queue allowance, rounded up in the table).
+    for (t_ms, want_ms) in [(5u8, 15u64), (10, 20), (15, 25), (30, 40), (33, 50)] {
+        let mut b = blocks_bridge(64, t_ms, 2);
+        submit_tiles(&mut b, 10, None);
+        send_and_close(&mut b);
+        let (adv, _) = adv_and_hints(&b.sent_frames_for_test);
+        assert!(!adv.is_empty(), "premise: sources were sent");
+        assert!(
+            adv.iter().all(|&c| c != 0),
+            "t_ms {t_ms} must advertise a non-zero code, or an always-zero bug passes"
+        );
+        assert!(
+            adv.iter().all(|&c| spans[usize::from(c)] == want_ms),
+            "t_ms {t_ms}: {adv:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_repair_carries_a_hint_no_lower_than_the_round_trip_and_zero_before_a_sample() {
+    // The documented hints in microseconds by code, written out.
+    let hint_us = [
+        0u64, 4_000, 5_657, 8_000, 11_314, 16_000, 22_627, 32_000, 45_255, 64_000, 90_510, 128_000,
+        181_019, 256_000, 362_039, 512_000,
+    ];
+    let mut b = blocks_bridge(64, 5, 2);
+    assert!(
+        !b.reliable_emitter.rtt.has_sample(),
+        "premise: no sample yet"
+    );
+    submit_tiles(&mut b, 10, None);
+    send_and_close(&mut b);
+    let (_, hints) = adv_and_hints(&b.sent_frames_for_test);
+    assert_eq!(hints.len(), 2, "premise: repairs were sent");
+    assert!(
+        hints.iter().all(|&h| h == 0),
+        "unknown before a sample: {hints:?}"
+    );
+
+    converge_rtt(&mut b, 20);
+    let srtt_us = b.reliable_emitter.rtt.srtt().as_micros() as u64;
+    assert!(srtt_us > 0);
+    b.sent_frames_for_test.clear();
+    submit_tiles(&mut b, 10, None);
+    send_and_close(&mut b);
+    let (_, hints) = adv_and_hints(&b.sent_frames_for_test);
+    assert_eq!(hints.len(), 2, "premise: repairs were sent");
+    for h in hints {
+        assert_ne!(h, 0, "a sample exists: the hint says so");
+        assert!(
+            hint_us[usize::from(h)] >= srtt_us,
+            "hint {h} ({} us) under-reports srtt {srtt_us} us",
+            hint_us[usize::from(h)]
+        );
+    }
+    // The table was told, so its releases follow what clients were told.
+    let top = b.block_table.recent_hint(now_std());
+    assert_ne!(top, 0);
+}

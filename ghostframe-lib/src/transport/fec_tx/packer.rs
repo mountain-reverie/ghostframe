@@ -9,7 +9,7 @@ use ghostframe_protocol::fec::frame::{
 };
 use smallvec::SmallVec;
 
-use super::blocks::{BlockBuilder, ClosedBlock, SourceKind};
+use super::blocks::{BlockBuilder, BlockSpan, ClosedBlock, SourceKind};
 use crate::config::FecBlockParams;
 use crate::transport::protocol::NO_ACK;
 use crate::transport::reliable_emitter::emission_queue::WireClass;
@@ -154,9 +154,12 @@ impl Packer {
             Some(params) => {
                 let (block_id, idx) = self.builder.peek();
                 block = Some((block_id, idx));
+                // The span of the block as it opened, not of the knob now.
+                let span = self.builder.span_or(BlockSpan::for_t_ms(params.t_ms));
                 let last = closing || usize::from(idx) + 1 >= usize::from(params.k_max);
                 let frame = SourceFrame {
                     last,
+                    t_adv: span.t_adv,
                     bundle_seq,
                     block_id,
                     idx,
@@ -171,7 +174,7 @@ impl Packer {
                     SourceKind::Tile
                 };
                 self.builder
-                    .add(frame.coded_symbol(), bundle_seq, kind, now_us);
+                    .add(frame.coded_symbol(), bundle_seq, kind, now_us, span);
                 if last {
                     self.closed.extend(self.builder.close());
                 }
@@ -255,8 +258,7 @@ impl Packer {
     /// T close: the open block has been open `t_ms` since its first source.
     /// All its sources are already out, so no LAST. Returns whether it closed.
     pub(crate) fn close_if_due(&mut self, now_us: u64) -> bool {
-        let Some(p) = self.blocks else { return false };
-        if !self.builder.due(now_us, u64::from(p.t_ms) * 1_000) {
+        if self.blocks.is_none() || !self.builder.due(now_us) {
             return false;
         }
         self.close_now()
@@ -264,12 +266,8 @@ impl Packer {
 
     /// When the open block's T elapses, in the same microseconds as `now_us`.
     pub(crate) fn t_close_at_us(&self) -> Option<u64> {
-        let p = self.blocks?;
-        Some(
-            self.builder
-                .first_sealed_at_us()?
-                .saturating_add(u64::from(p.t_ms) * 1_000),
-        )
+        self.blocks?;
+        self.builder.t_close_at_us()
     }
 
     /// The knob this packer runs with.
@@ -653,6 +651,70 @@ mod tests {
         sealed.extend(p.flush(7_000));
         let (_, id, idx, _, _) = src_of(sealed.last().unwrap());
         assert_eq!((id, idx), (1, 0));
+    }
+
+    fn t_adv_of(b: &SealedBundle) -> u8 {
+        match parse(&b.bytes).expect("source frame") {
+            Frame::Source(s) => s.t_adv,
+            other => panic!("not a source: {other:?}"),
+        }
+    }
+
+    /// A block opened under `t_ms = 5` advertises 15 ms (code 2) and closes at
+    /// 5 ms, however the knob moves while it is open and a PLAIN bundle is open.
+    #[test]
+    fn a_block_keeps_the_span_it_opened_with_when_the_knob_moves() {
+        let mut p = block_packer(10, 5, 1);
+        let mut sealed = Vec::new();
+        sealed.extend(p.push(&rec(10, 1), pmeta(1), 200, 1_000));
+        sealed.extend(p.flush(1_000));
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(
+            t_adv_of(&sealed[0]),
+            2,
+            "premise: t_ms 5 advertises a non-zero code"
+        );
+        // A PLAIN bundle is open (an unprotected record), then the knob moves
+        // to t_ms = 20, which advertises code 0.
+        let plain = RecordMeta {
+            protect: false,
+            ..meta(2, 2, false)
+        };
+        assert!(p.push(&rec(10, 2), plain, 200, 2_000).is_empty());
+        p.set_blocks(params(10, 20, 1));
+        assert_eq!(
+            p.t_close_at_us(),
+            Some(6_000),
+            "the block's own T, not the knob's"
+        );
+        sealed.extend(p.push(&rec(10, 3), pmeta(3), 200, 3_000));
+        sealed.extend(p.flush(3_000));
+        let sources: Vec<&SealedBundle> = sealed
+            .iter()
+            .filter(|b| b.kind == BundleKind::Source)
+            .collect();
+        assert_eq!(sources.len(), 2);
+        assert!(
+            sources.iter().all(|b| t_adv_of(b) == 2),
+            "every source of the block carries the code it opened with"
+        );
+        assert!(!p.close_if_due(5_999));
+        assert!(
+            p.close_if_due(6_000),
+            "closes at the span it opened with, not 20 ms"
+        );
+        let closed = p.take_closed();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].t_adv, 2);
+        // The next block opens under the knob now in force.
+        let mut next = p.push(&rec(10, 4), pmeta(4), 200, 7_000);
+        next.extend(p.flush(7_000));
+        let next: Vec<&SealedBundle> = next
+            .iter()
+            .filter(|b| b.kind == BundleKind::Source)
+            .collect();
+        assert_eq!(t_adv_of(next[0]), 0);
+        assert_eq!(p.t_close_at_us(), Some(27_000));
     }
 
     #[test]
