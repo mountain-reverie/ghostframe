@@ -539,12 +539,12 @@ impl IoBridge {
     /// cache entries and tell the tracker.
     pub(super) fn apply_h264_acks(
         &mut self,
-        resolved: &[(Transmission, u16, bool)],
+        resolved: &[(Transmission, u16, bool, u32)],
         now: std::time::Instant,
     ) {
         let items: Vec<(Content, Option<bool>)> = resolved
             .iter()
-            .flat_map(|(tx, _, late)| tx.records().map(move |(_, c)| (c, Some(*late))))
+            .flat_map(|(tx, _, late, _)| tx.records().map(move |(_, c)| (c, Some(*late))))
             .collect();
         self.release_h264_content(&items, now);
     }
