@@ -2643,6 +2643,8 @@ impl IoBridge {
                     blocks_open = self.block_table.open_blocks(),
                     block_evicted = self.block_table.stats().block_evicted,
                     blocks_closed_declined = bt.closed_declined,
+                    closed_declined = self.block_table.stats().closed_declined,
+                    closed_declined_late = self.block_table.stats().closed_declined_late,
                     block_content_lost_h264 = bt.content_lost_h264,
                     block_handoffs = bt.handoffs,
                     block_handoff_queued = bt.handoff_queued,

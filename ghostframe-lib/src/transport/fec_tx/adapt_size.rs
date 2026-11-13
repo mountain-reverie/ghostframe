@@ -613,4 +613,41 @@ mod tests {
         }
         assert_eq!(t.trim(), 1);
     }
+    /// `DeclinedLate` never raises the trim, and it fills the 256 window like
+    /// any other non-decline: replacing every `DeclinedLate` by `Accounted`
+    /// changes nothing the trim reports.
+    #[test]
+    fn trim_ignores_declined_late_but_it_fills_the_window() {
+        let mut t = DeclinedTrim::new();
+        for _ in 0..2000 {
+            t.on_close(CloseReason::DeclinedLate);
+            assert_eq!(t.trim(), 0);
+        }
+        assert_eq!((t.steps(), t.filled), (0, FEC_ADAPT_TRIM_WINDOW));
+
+        // 3 Declined engage it; DeclinedLate closes then push them out of the
+        // window exactly as Accounted ones do.
+        let mut a = DeclinedTrim::new();
+        let mut b = DeclinedTrim::new();
+        for i in 0..256 {
+            let d = if i < 3 {
+                CloseReason::Declined
+            } else {
+                CloseReason::DeclinedLate
+            };
+            a.on_close(d);
+            b.on_close(if i < 3 {
+                CloseReason::Declined
+            } else {
+                CloseReason::Accounted
+            });
+        }
+        assert_eq!(a.trim(), 1, "premise: three declines engaged it");
+        for _ in 0..256 {
+            a.on_close(CloseReason::DeclinedLate);
+            b.on_close(CloseReason::Accounted);
+            assert_eq!((a.trim(), a.steps()), (b.trim(), b.steps()));
+        }
+        assert_eq!(a.trim(), 0, "pushed out of the window");
+    }
 }

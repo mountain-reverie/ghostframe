@@ -393,6 +393,9 @@ impl IoBridge {
             block_content_lost_h264: self.block_tx.content_lost_h264,
             block_closed_accounted: self.block_table.stats().closed_accounted,
             block_closed_declined: self.block_table.stats().closed_declined,
+            block_closed_declined_late: self.block_table.stats().closed_declined_late,
+            block_evicted: self.block_table.stats().block_evicted,
+            block_cached_bytes_peak: self.block_table.stats().cached_bytes_peak,
             block_closed_handed_off: self.block_table.stats().closed_handed_off,
             block_closed_timed_out: self.block_table.stats().closed_timed_out,
             block_packed: self.block_tx.closed_kmax
