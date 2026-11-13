@@ -496,6 +496,14 @@ impl IoBridge {
                 block: None,
             };
             self.record_bundle(&sealed);
+            // A repair row is billed tokens above and is in the ledger, so
+            // goog_cc is told of it as sent and counts it when acknowledged.
+            // It is offered too, or `payload_fraction` (offered / spent) falls
+            // to about `1 / (1 + rho)`: the pacer then grants `est / f` and the
+            // ceiling reads a saturated sender as unsaturated. Every repair row
+            // (block close, REPAIR_REQUEST, PTO, T_lr) is sent from here.
+            self.offered_wire_bytes += sealed.bytes.len() as f64;
+            self.bwe.note_offered(now_std(), self.offered_wire_bytes);
             self.pending_bundles.push_back(sealed);
             if !self.drive_pending_bundles() {
                 return pacing::Stop::Rejected;

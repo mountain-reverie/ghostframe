@@ -228,6 +228,63 @@ async fn offered_bytes_equal_what_quinn_accepted_with_repairs() {
     assert!(b.instr.offered.of(WireClass::Repair) > 0);
 }
 
+/// What `payload_fraction` reads, from the bridge's side: the bytes goog_cc is
+/// told were offered over the bytes the bridge billed (the admission bucket
+/// charges every one of them, repairs included).
+fn offered_share(b: &IoBridge) -> f64 {
+    b.offered_wire_bytes / b.instr.offered.total() as f64
+}
+
+/// A repair row is charged tokens and is recorded in the ledger (so it is
+/// acknowledged and counted by goog_cc), so it has to be offered too. Left out,
+/// `payload_fraction = offered / spent` falls to about `1 / (1 + rho)`; the
+/// pacer then grants `est / f` and the ceiling reads a saturated sender as
+/// unsaturated (E10 regressions: H.264 step-up `sus_est`, p6c CoDel).
+fn assert_repairs_are_offered(mut on: IoBridge, tiles: u32) {
+    let mut off = blocks_bridge(64, 5, 2);
+    off.set_fec_blocks_for_test(None);
+    for b in [&mut off, &mut on] {
+        submit_tiles(b, tiles, None);
+        send_and_close(b);
+    }
+    assert_eq!(
+        off.block_tx.repairs_sent, 0,
+        "premise: no repairs with the knob off"
+    );
+    assert!(on.block_tx.repairs_sent >= 2, "premise: repairs flowed");
+    let repair = on.instr.offered.of(WireClass::Repair);
+    assert!(
+        repair as f64 > 0.15 * on.instr.offered.total() as f64,
+        "premise: repairs are a visible share of the bytes billed"
+    );
+    // Every repair wire byte is offered ...
+    assert!(
+        on.offered_wire_bytes - off.offered_wire_bytes >= repair as f64,
+        "offered {} on vs {} off, repairs {repair}",
+        on.offered_wire_bytes,
+        off.offered_wire_bytes
+    );
+    // ... so the share stays where framing puts it with the knob off.
+    let (a, c) = (offered_share(&off), offered_share(&on));
+    assert!(
+        (a - c).abs() < 0.03,
+        "offered share {c:.3} with repairs, {a:.3} without"
+    );
+}
+
+#[tokio::test]
+async fn fixed_mode_repairs_are_offered_to_the_estimator() {
+    assert_repairs_are_offered(blocks_bridge(64, 5, 2), 10);
+}
+
+#[tokio::test]
+async fn adaptive_mode_repairs_are_offered_to_the_estimator() {
+    let mut b = adaptive_bridge();
+    send_report(&mut b, 950, 50, [50, 0, 0, 0, 0, 0, 0, 0]);
+    assert!(b.fec_live.is_some(), "engaged by a 5 % report");
+    assert_repairs_are_offered(b, 40);
+}
+
 #[tokio::test]
 async fn retransmissions_pads_and_control_are_plain_and_a_probe_record_is_a_lone_source() {
     use ghostframe_protocol::protocol::FrameHeader;
