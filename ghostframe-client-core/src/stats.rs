@@ -219,6 +219,14 @@ pub struct ClientStats {
     server: Vec<Series>,
     last_sample_us: Option<u64>,
     rejected: u64,
+    /// Samples applied to the server rings (schema id and count matched).
+    /// Read by the web e2e through `window.__ghostframeStatsSamples`; a
+    /// rejected sample never moves it.
+    samples_accepted: u64,
+    /// Every complete frame the server-stream reader yielded, whatever it
+    /// held and whether or not it was applied. Read by the web e2e through
+    /// `window.__ghostframeStatsFrames` to prove the server is silent.
+    frames_received: u64,
     client_version: String,
     pub(crate) local: LocalStats,
 }
@@ -231,6 +239,8 @@ impl ClientStats {
             server: Vec::new(),
             last_sample_us: None,
             rejected: 0,
+            samples_accepted: 0,
+            frames_received: 0,
             client_version: "unknown".to_string(),
             local: LocalStats::new(now_us),
         }
@@ -245,6 +255,20 @@ impl ClientStats {
         self.rejected
     }
 
+    /// Samples applied to the server rings since this core was created.
+    pub fn samples_accepted(&self) -> u64 {
+        self.samples_accepted
+    }
+
+    /// Complete server-stream frames received since this core was created.
+    pub fn frames_received(&self) -> u64 {
+        self.frames_received
+    }
+
+    fn note_frame_received(&mut self) {
+        self.frames_received = self.frames_received.saturating_add(1);
+    }
+
     /// The deadline of the next local sample, for `poll_timeout`.
     pub(crate) fn next_local_sample_us(&self) -> u64 {
         self.local.next_sample_us()
@@ -256,6 +280,7 @@ impl ClientStats {
     pub fn handle_stream_bytes(&mut self, bytes: &[u8], now_us: u64) {
         self.reader.push(bytes);
         while let Some(item) = self.reader.next_frame() {
+            self.note_frame_received();
             match item {
                 Err(_) => self.rejected = self.rejected.saturating_add(1),
                 Ok((SERVER_MSG_STATS_SCHEMA, payload)) => {
@@ -324,6 +349,7 @@ impl ClientStats {
             }
         }
         self.last_sample_us = Some(now_us);
+        self.samples_accepted = self.samples_accepted.saturating_add(1);
     }
 
     /// Take the once-a-second local measurements. The first call only sets
