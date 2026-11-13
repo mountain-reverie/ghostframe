@@ -23,6 +23,10 @@ interface Window {
   __ghostframeStats: { tileDatagrams: number; frameDatagrams: number } | undefined;
   /** rAF tick counter; incremented every requestAnimationFrame callback. */
   __ghostframeRafTicks: number | undefined;
+  /** Stats samples the wasm core applied to its rings (e2e only); see main.ts. */
+  __ghostframeStatsSamples: number | undefined;
+  /** Server-stream frames the wasm core received, counted before any check (e2e only); see main.ts. */
+  __ghostframeStatsFrames: number | undefined;
 
   // ----- renderer reference (set per-frame in renderer.ts) --------------------
   __ghostframeRenderer: { device: GPUDevice; texture: GPUTexture } | undefined;
