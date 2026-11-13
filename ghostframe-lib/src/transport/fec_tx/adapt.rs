@@ -376,6 +376,7 @@ impl FecAdapt {
             r_at_k8: r_at(8),
             r_at_k64: r_at(64),
             changes: self.changes,
+            floor_changes: self.est.state_changes(),
             congestion_skips: self.est.congestion_skips(),
             trim_steps: self.trim.steps(),
             blocks_sized: self.blocks_sized,
