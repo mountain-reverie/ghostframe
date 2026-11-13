@@ -524,6 +524,36 @@ impl WebTransportServer {
         self.stats_tail.len()
     }
 
+    /// Write as much of a held stats tail as the stream takes. `Written` when
+    /// nothing is owed any more (including when nothing was), `Blocked` when
+    /// part is still owed, `StreamGone` (tail dropped) when the stream is
+    /// closed. Cheap when empty: the event loop calls it for every session
+    /// each turn so a tail never waits for the next frame.
+    pub fn flush_stats_tail(&mut self, conn: &mut Connection) -> StatsWrite {
+        if self.stats_tail.is_empty() {
+            return StatsWrite::Written;
+        }
+        let Some(sid) = self.stats_stream else {
+            self.stats_tail.clear();
+            return StatsWrite::NoStream;
+        };
+        match conn.send_stream(sid).write(&self.stats_tail) {
+            Ok(n) => {
+                self.stats_tail.drain(..n);
+            }
+            Err(quinn_proto::WriteError::Blocked) => {}
+            Err(quinn_proto::WriteError::Stopped(_) | quinn_proto::WriteError::ClosedStream) => {
+                self.stats_tail.clear();
+                return StatsWrite::StreamGone;
+            }
+        }
+        if self.stats_tail.is_empty() {
+            StatsWrite::Written
+        } else {
+            StatsWrite::Blocked
+        }
+    }
+
     /// Write one whole stats frame on the pinned stream's return half.
     ///
     /// quinn-proto cannot say in advance how much a write will take, so this
@@ -536,22 +566,9 @@ impl WebTransportServer {
         let Some(sid) = self.stats_stream else {
             return StatsWrite::NoStream;
         };
-        if !self.stats_tail.is_empty() {
-            match conn.send_stream(sid).write(&self.stats_tail) {
-                Ok(n) => {
-                    self.stats_tail.drain(..n);
-                }
-                Err(quinn_proto::WriteError::Blocked) => {}
-                Err(
-                    quinn_proto::WriteError::Stopped(_) | quinn_proto::WriteError::ClosedStream,
-                ) => {
-                    self.stats_tail.clear();
-                    return StatsWrite::StreamGone;
-                }
-            }
-            if !self.stats_tail.is_empty() {
-                return StatsWrite::Blocked;
-            }
+        let flushed = self.flush_stats_tail(conn);
+        if flushed != StatsWrite::Written {
+            return flushed;
         }
         match conn.send_stream(sid).write(frame) {
             Ok(n) if n == frame.len() => StatsWrite::Written,

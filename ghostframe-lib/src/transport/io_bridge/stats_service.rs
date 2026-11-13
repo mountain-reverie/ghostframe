@@ -204,6 +204,26 @@ impl IoBridge {
         }
     }
 
+    /// Finish a frame whose write was cut short, for every session that owes
+    /// one, subscribed or not: a started frame must reach the client whole or
+    /// its reader desyncs, and the next sample may be a second away (after an
+    /// `off`, never). One pass over the session map, no allocation, a no-op
+    /// when nothing is held.
+    fn flush_held_stats_tails(&mut self) {
+        #[cfg(test)]
+        if self.stats_capture_for_test.is_some() {
+            return;
+        }
+        for (h, wt) in self.wt_sessions.iter_mut() {
+            if wt.stats_tail_len() == 0 {
+                continue;
+            }
+            if let Some(conn) = self.server.connections.get_mut(h) {
+                wt.flush_stats_tail(conn);
+            }
+        }
+    }
+
     /// Send what is due to every subscribed session: the schema it is owed,
     /// then a sample, at most once per [`STATS_INTERVAL`]. A frame that cannot
     /// be written is dropped and counted; a schema that could not be written
@@ -215,6 +235,7 @@ impl IoBridge {
     /// after one pass over the (tiny) session map, with no allocation. The
     /// handle list below is built only when something is due.
     pub(super) fn service_stats(&mut self, now: std::time::Instant) {
+        self.flush_held_stats_tails();
         let any_due = self
             .stats_sessions
             .values()
