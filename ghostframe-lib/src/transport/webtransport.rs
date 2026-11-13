@@ -73,6 +73,21 @@ pub(crate) const MAX_PENDING_BIDI_STREAMS: usize = 16;
 
 // ─── main struct ─────────────────────────────────────────────────────────────
 
+/// What [`WebTransportServer::write_stats_frame`] did with a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsWrite {
+    /// The frame is on the stream, whole or with its tail held for the next
+    /// call.
+    Written,
+    /// The stream had no room (flow control) or still owes a previous
+    /// frame's tail: the frame was not started. Drop it and count it.
+    Blocked,
+    /// No stream is pinned: the client has not subscribed on one we know.
+    NoStream,
+    /// The stream is closed or the peer stopped it.
+    StreamGone,
+}
+
 /// Sans-IO WebTransport handshake state for one QUIC connection.
 pub struct WebTransportServer {
     /// We have sent our HTTP/3 SETTINGS on our unidirectional control stream.
@@ -113,6 +128,15 @@ pub struct WebTransportServer {
     /// the only state needed to know whether the bytes now at the front of a
     /// buffer are payload or preamble.
     wt_header_stripped: std::collections::HashSet<StreamId>,
+    /// The bidi stream whose bytes were last routed to the feedback queue.
+    /// A client has one; a stats subscribe is answered on it.
+    last_feedback_stream: Option<StreamId>,
+    /// The stream stats frames are written on: the feedback stream as it was
+    /// when the client last subscribed.
+    stats_stream: Option<StreamId>,
+    /// The unwritten end of a stats frame quinn accepted only a prefix of.
+    /// Written first on the next call, so a frame is never left torn.
+    stats_tail: Vec<u8>,
 }
 
 impl WebTransportServer {
@@ -129,6 +153,9 @@ impl WebTransportServer {
             pending_bidi_streams: Vec::new(),
             feedback_queue: Vec::new(),
             wt_header_stripped: std::collections::HashSet::new(),
+            last_feedback_stream: None,
+            stats_stream: None,
+            stats_tail: Vec::new(),
             abandoned_streams: std::collections::HashSet::new(),
             origin_policy: Arc::new(OriginPolicy::default()),
             datagram_bytes_enqueued: 0,
@@ -477,6 +504,68 @@ impl WebTransportServer {
         std::mem::take(&mut self.feedback_queue)
     }
 
+    /// A stats subscribe arrived: answer on the stream that carries feedback.
+    /// `false` when no feedback stream has been seen (the subscribe itself
+    /// came on one, so this does not happen in production). A different
+    /// stream than last time drops any held tail.
+    pub fn note_stats_subscribe(&mut self) -> bool {
+        let Some(sid) = self.last_feedback_stream else {
+            return false;
+        };
+        if self.stats_stream != Some(sid) {
+            self.stats_stream = Some(sid);
+            self.stats_tail.clear();
+        }
+        true
+    }
+
+    /// Bytes of a stats frame still owed to the stream (0 normally).
+    pub fn stats_tail_len(&self) -> usize {
+        self.stats_tail.len()
+    }
+
+    /// Write one whole stats frame on the pinned stream's return half.
+    ///
+    /// quinn-proto cannot say in advance how much a write will take, so this
+    /// never starts a frame it might not finish *and drop*: if the stream
+    /// still owes the tail of a previous frame, that is written first and, if
+    /// it does not all fit, `frame` is refused untouched ([`StatsWrite::Blocked`]).
+    /// A frame that is started is always completed, a prefix now and the rest
+    /// at the head of the next call, so the reader never sees a torn frame.
+    pub fn write_stats_frame(&mut self, conn: &mut Connection, frame: &[u8]) -> StatsWrite {
+        let Some(sid) = self.stats_stream else {
+            return StatsWrite::NoStream;
+        };
+        if !self.stats_tail.is_empty() {
+            match conn.send_stream(sid).write(&self.stats_tail) {
+                Ok(n) => {
+                    self.stats_tail.drain(..n);
+                }
+                Err(quinn_proto::WriteError::Blocked) => {}
+                Err(
+                    quinn_proto::WriteError::Stopped(_) | quinn_proto::WriteError::ClosedStream,
+                ) => {
+                    self.stats_tail.clear();
+                    return StatsWrite::StreamGone;
+                }
+            }
+            if !self.stats_tail.is_empty() {
+                return StatsWrite::Blocked;
+            }
+        }
+        match conn.send_stream(sid).write(frame) {
+            Ok(n) if n == frame.len() => StatsWrite::Written,
+            Ok(n) => {
+                self.stats_tail = frame[n..].to_vec();
+                StatsWrite::Written
+            }
+            Err(quinn_proto::WriteError::Blocked) => StatsWrite::Blocked,
+            Err(quinn_proto::WriteError::Stopped(_) | quinn_proto::WriteError::ClosedStream) => {
+                StatsWrite::StreamGone
+            }
+        }
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     /// Try to decode a peer SETTINGS frame from the buffered data for `sid`.
@@ -606,6 +695,7 @@ impl WebTransportServer {
         if let Some(buf) = self.stream_bufs.remove(&sid) {
             let data = buf.as_slice().to_vec();
             if !data.is_empty() {
+                self.last_feedback_stream = Some(sid);
                 self.feedback_queue.push(data);
             }
         }
@@ -778,6 +868,21 @@ mod tests {
     use web_transport_proto::{Settings, VarInt};
 
     // ── Pre-handshake buffer cap ─────────────────────────────────────────────
+
+    #[test]
+    fn a_stats_subscribe_pins_the_stream_that_carried_feedback() {
+        let mut wt = WebTransportServer::new();
+        assert!(
+            !wt.note_stats_subscribe(),
+            "no feedback stream has been seen: nowhere to answer"
+        );
+        let s = sid(0);
+        wt.test_feed_feedback_stream(s, &wt_bidi_header(0));
+        wt.test_feed_feedback_stream(s, &[0x0B, 1]);
+        assert!(wt.note_stats_subscribe());
+        assert_eq!(wt.stats_stream, Some(s));
+        assert!(wt.stats_tail.is_empty());
+    }
 
     fn sid(n: u64) -> StreamId {
         StreamId::from(quinn_proto::VarInt::from_u64(n).unwrap())
