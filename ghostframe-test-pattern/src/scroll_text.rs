@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `--x11-sink --scroll-text`: a text document scrolling vertically at a
 //! fixed rate, then held still.
 //!

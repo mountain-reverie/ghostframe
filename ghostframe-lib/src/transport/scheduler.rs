@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Round-robin tile-work scheduler with batched-ACK driven retry.
 //!
 //! Per M3.1 umbrella, this is the single point of dispatch for every tile-codec

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! D1 PR-8 (`transport/model-controller`, design A): the scene gates.
 //!
 //! Each scene runs the model controller (the only controller) and prints its

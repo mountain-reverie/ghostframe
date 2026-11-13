@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! M3.7b shaping matrix: re-runs each scene at 4 realistic operating
 //! points driven by tc qdisc inside the test-server container. Unlike
 //! M3.6c's `BANDWIDTH_POINTS` (which set GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP

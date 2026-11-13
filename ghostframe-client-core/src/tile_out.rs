@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Where a decoded 32x32 RGBA tile is written.
 //!
 //! A tile is 32 rows of 128 bytes. [`TileOut`] is those rows at a caller-chosen

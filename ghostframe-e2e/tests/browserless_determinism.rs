@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Is the browserless harness a deterministic simulator?
 //!
 //! A simulator whose output depends on anything but its seed cannot be used

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Per-tile paint ordering for one rAF tick.
 //
 // The renderer used to paint in a fixed codec order (PalRle, Cdf53,

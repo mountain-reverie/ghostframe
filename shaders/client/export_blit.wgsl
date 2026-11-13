@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // export_blit.wgsl — copy the framebuffer into an export buffer.
 //
 // A render pass rather than `copy_texture_to_texture`, for one reason: the

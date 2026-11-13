@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Tokio async event loop bridging ghostbridge and quinn-proto.
 //!
 //! `IoBridge` wraps a ghostbridge socketpair fd (as a tokio `UnixStream`) and

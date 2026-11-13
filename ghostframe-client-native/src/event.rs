@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! eventfd-backed event queue.
 //!
 //! The host application owns its own main loop (a Wayland or X11 event

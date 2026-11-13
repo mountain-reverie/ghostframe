@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The wire-facing emission tail: turning scheduled tile work into datagrams
 //! on every connected session.
 //!

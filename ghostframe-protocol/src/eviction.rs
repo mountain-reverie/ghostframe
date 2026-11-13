@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The server telling a client it has been displaced.
 //!
 //! Carried as a control datagram using sentinel tile coordinates, the same

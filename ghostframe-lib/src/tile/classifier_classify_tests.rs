@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 use super::*;
 
 fn metrics(freq: f32, mag: f32, idle: u32, unique_colors: u16) -> TileMetrics {

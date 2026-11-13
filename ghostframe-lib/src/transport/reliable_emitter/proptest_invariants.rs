@@ -1,4 +1,5 @@
 #![cfg(test)]
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::cache::{CacheEntry, RetransmitCache};
 use super::parity::xor_payloads;

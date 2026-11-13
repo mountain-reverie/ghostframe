@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use reed_solomon_simd::{ReedSolomonEncoder, ReedSolomonDecoder};
 const MAXB: usize = 1200 * 512;
 static mut IN: [u8; MAXB] = [0; MAXB];

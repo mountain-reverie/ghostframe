@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The model controller's side of `IoBridge` (D1 design A): the rate the
 //! window must carry, the idle-restart policy, and the persistent-congestion
 //! notice.

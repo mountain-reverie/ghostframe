@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // palette_subset_fold_init.comp
 // Initializes folded_into[i] = (255 << 8) | i for every slot.
 // Dispatch: 1 workgroup, 256 threads.

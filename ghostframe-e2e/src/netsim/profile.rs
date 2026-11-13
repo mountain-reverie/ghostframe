@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Network impairment profiles: the specification of link behavior.
 
 /// A complete network link profile: loss, burst behavior, duplication,

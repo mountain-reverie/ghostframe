@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The admission rate, the depth gate's inputs, and the pass that feeds quinn.
 //!
 //! Owns, as logic over `IoBridge` fields that stay in `io_bridge.rs`:

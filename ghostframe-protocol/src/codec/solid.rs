@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Solid tile codec — 4 bytes per tile.
 //!
 //! When the classifier reports `unique_colors == 1`, every pixel of the tile

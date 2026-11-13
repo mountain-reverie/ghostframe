@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Transport measurements for the `cumulative emit` log line and the
 //! browserless harness. MEASUREMENT ONLY: nothing here feeds a decision, the
 //! bandwidth estimator or the classifier.

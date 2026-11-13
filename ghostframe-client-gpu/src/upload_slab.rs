@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! One upload slab on the Vulkan backend: a `VK_IMAGE_TILING_LINEAR` image in
 //! host-visible, host-coherent memory that stays mapped for its whole life.
 //! The CPU writes tiles into the mapping and the GPU samples the same image,

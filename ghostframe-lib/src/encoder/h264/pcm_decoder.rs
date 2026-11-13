@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! libavcodec's software H.264 decoder, for streams the PCM writer wrote.
 //!
 //! Two uses with different appetites. The T2 oracle wants the strictest

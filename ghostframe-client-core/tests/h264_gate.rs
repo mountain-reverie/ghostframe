@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The H.264 reference gate (design 7.1) and the frame-ack window (6.2),
 //! driven through the public API. The scenarios mirror the closed-loop
 //! simulation in `ghostframe-lib`'s `encoder/h264/refs_tests.rs` (`Gate`),

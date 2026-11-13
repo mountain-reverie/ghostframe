@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # No tracked file may name a developer's home directory. A path
 # like /home/<user>/... in a test, script or README only works on one machine,
 # leaks that machine's username and layout into a public repository, and

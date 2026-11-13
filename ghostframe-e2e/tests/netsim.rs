@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Tests for the netsim module: RNG determinism and loss rate accuracy.
 
 use ghostframe_e2e::netsim::{Bottleneck, CapTimeline, DetRng, NetProfile, NetSim, Verdict};

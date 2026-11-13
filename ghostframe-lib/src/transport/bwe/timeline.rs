@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Reconstructs a monotonic millisecond timeline from the 16-bit timestamps
 //! carried on the wire.
 //!

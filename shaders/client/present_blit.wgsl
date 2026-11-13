@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Present-time blit: samples the persistent framebuffer texture and writes
 // it to the swapchain texture via a single full-screen triangle pair.
 

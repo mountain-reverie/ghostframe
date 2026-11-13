@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # Installs the apt packages named in packages-build.txt (and, when
 # E2E_RUNTIME=true, packages-e2e-runtime.txt), preferring a restored cache so a
 # typical run makes no request to the Ubuntu mirror at all.

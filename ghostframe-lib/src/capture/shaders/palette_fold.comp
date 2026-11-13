@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // palette_fold.comp
 // Stage 2a: intra-frame palette dedup. Maps each PalRLE-feasible dirty tile
 // to a frame_palette_set slot via open-addressed atomic hash table.

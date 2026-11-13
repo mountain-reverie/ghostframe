@@ -1,11 +1,12 @@
 Ghostframe
 Third-party notices
 
-This repository had no NOTICE or third-party licences file before D1 PR-6b;
-this one is new. It lists code that was copied or ported into the tree, and
-a library the daemon loads at run time without carrying it. It does not list
-crates.io dependencies, which carry their own licences and are resolved
-through Cargo.lock.
+Ghostframe itself is under AGPL-3.0-or-later (the server) and MIT OR
+Apache-2.0 (everything else); LICENSE says which part is which. This file
+lists code that was copied or ported into the tree, and a library the daemon
+loads at run time without carrying it. It does not list crates.io
+dependencies, which carry their own licences and are resolved through
+Cargo.lock (ci/check-licenses.py checks them against an allowlist).
 
 --------------------------------------------------------------------------
 Tencent TQUIC (Apache License 2.0)

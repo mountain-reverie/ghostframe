@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Test and browserless-harness entry points on `IoBridge`: the `*_for_test`
 //! constructors, the drop-plan setter, the `*_publish_handle` accessors that
 //! clone the `Arc`s a caller reads back after moving the bridge into a task,

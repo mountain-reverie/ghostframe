@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Port of `ghostframe-web-client/tests/prevalidate_cdf53.test.ts`
 //! (5 rleDecode cases + 4 prevalidateCdf53 cases), plus a fixture walk test.
 

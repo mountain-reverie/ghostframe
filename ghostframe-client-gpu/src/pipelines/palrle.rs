@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! PalRle compute decode.
 //!
 //! Dispatch is `(num_tiles, 2, 2)` with `@workgroup_size(16, 16, 1)` -- four

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 /**
  * diagnostics.ts — test and e2e instrumentation surface.
  *

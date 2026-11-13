@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! High-level server API: `FrameSubmission` and `GhostframeServer`.
 //!
 //! `GhostframeServer` wraps an `IoBridge` event loop and exposes a

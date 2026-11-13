@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Helpers for the H.264 browserless scenes (design T3): the client side that
 //! decodes what the real `ClientCore` hands out, the analysis that compares
 //! it with what the encoder meant, loss patterns and a capacity step.

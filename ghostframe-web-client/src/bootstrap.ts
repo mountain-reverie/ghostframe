@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 export interface BootstrapResult {
   transport: WebTransport;
   /** The hash being served when the config was fetched. */

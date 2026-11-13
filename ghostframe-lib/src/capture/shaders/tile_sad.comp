@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // tile_sad.comp
 // Compute per-tile Sum of Absolute Differences (SAD) between current and previous frame.
 //

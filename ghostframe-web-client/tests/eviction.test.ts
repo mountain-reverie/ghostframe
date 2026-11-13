@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Proves the wasm boundary surfaces the server's eviction notice
 // (ghostframe_protocol::eviction, sentinel tile coords 0xFE/0xFE) as an
 // `Evicted` event carrying a numeric reason code -- not a string, and not

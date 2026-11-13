@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Integration tests for the H.264 full-frame reassembly path
 //! (`frame_assembly.rs`, wired into `ClientCore::handle_datagram`'s
 //! non-tile-datagram branch).

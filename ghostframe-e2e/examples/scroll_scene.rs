@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Text-under-motion bench scene driver. See
 //! `ghostframe_e2e::harness::scroll_scene` for the metric definitions and
 //! `ghostframe-bench/benches/README.md` for how to run it.

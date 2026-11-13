@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Carries datagrams over a Unix socketpair using ghostbridge's real wire
 //! framing.
 //!

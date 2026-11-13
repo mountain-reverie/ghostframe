@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Oracle: hardware decode == software decode, byte for byte.
 //!
 //! The GStreamer backend's exactness oracle. GStreamer reports the plane layout

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The render thread: owns `WgpuContext` and the per-session `Renderer`.
 //!
 //! Kept off the net thread deliberately. `ExportRing::publish` no longer waits

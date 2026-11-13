@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! libavcodec's software H.264 decoder, as the golden both oracles compare to.
 //!
 //! Shared by `oracle_tests` (VA-API) and `oracle_tests_v4l2`. It lives outside

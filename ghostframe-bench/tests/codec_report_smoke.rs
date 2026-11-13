@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Smoke test for the M3.5 codec_report binary.
 //!
 //! Runs the binary with --scenes solid --scene-duration 1s and asserts

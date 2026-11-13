@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use ghostframe_client_gpu::coalesce::{coalesce, Rect};
 use ghostframe_client_gpu::dirty::DirtyGrid;
 use proptest::prelude::*;

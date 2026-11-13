@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Smoke test for `ghostframe_e2e::harness::run_scene`.
 //!
 //! Locks the public API shape and verifies a short solid-tile scene

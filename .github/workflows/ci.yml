@@ -83,6 +83,8 @@ jobs:
         run: ci/check-test-features.sh
       - name: no home-directory paths in tracked files
         run: ci/check-local-paths.sh
+      - name: licences (crate fields, AGPL containment, SPDX headers)
+        run: ci/check-licenses.py
       - name: release daemon has no test-only features
         run: ci/check-release-features.sh
 

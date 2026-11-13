@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! dma-buf ingest: the import must read any valid stride exactly, on any
 //! driver. Every test here uses a REAL dma-buf (see `dmabuf_fixture`) and
 //! asserts which ingest tier ran, so a silent fallback cannot pass for success.

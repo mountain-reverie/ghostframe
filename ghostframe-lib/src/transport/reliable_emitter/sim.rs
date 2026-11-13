@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Simulation harness: drive the emitter with deterministic loss
 //! injection and a virtual clock. See spec §10.3.
 

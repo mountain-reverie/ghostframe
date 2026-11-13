@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The advertised capability is the AND of what the host asked for and what
 //! the machine can do.
 

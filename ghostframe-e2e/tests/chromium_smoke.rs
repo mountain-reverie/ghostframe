@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Smoke test for the ChromiumSession lifecycle + input-dispatch trait
 //! methods. Mirrors `firefox_smoke.rs` so each backend has its own
 //! self-contained verification of the new `BrowserSession::dispatch_*`

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `--x11-sink`: the patterns render into a BGRX buffer the size of the
 //! root window, and this draws it into root.
 //!

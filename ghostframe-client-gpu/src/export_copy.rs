@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Copies the damaged tiles of the framebuffer into an export buffer with a
 //! compute kernel, touching no other pixel.
 //!

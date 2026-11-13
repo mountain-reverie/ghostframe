@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # `allow-software-vulkan` lets the daemon run on a software Vulkan device. It
 # exists for the e2e test-server image only, and must reach no other build.
 #

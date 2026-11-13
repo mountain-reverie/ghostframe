@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Oracle: VA-API decode == software decode, byte for byte.
 //!
 //! Requires VA-API hardware, so these tests run in CI (picked up by `cargo

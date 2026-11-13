@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! A GL texture whose storage is exported as a dmabuf file descriptor.
 //!
 //! The GLES counterpart to `export.rs`. Same public surface — `new`,

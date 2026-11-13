@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `--palrle-exact --x11-sink` mode.
 //!
 //! Paint-once scene with four 32×32 PalRle test tiles, each with a

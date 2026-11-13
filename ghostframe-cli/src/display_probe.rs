@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Discover this machine's own display, so [`crate::commands::connect`] can
 //! tell the server what it can show (`ghostframe_client_native::Config::display`)
 //! and later negotiate a mode on resize

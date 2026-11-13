@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Tiny insertion-ordered key/value store backed by a `Vec<(K, V)>`.
 //!
 //! Used in place of `std::collections::HashMap` wherever iteration order

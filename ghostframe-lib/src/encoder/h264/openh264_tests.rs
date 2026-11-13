@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! B7-2: the openh264 backend against the real library.
 //!
 //! Every test here needs libopenh264 (2.4.x, 2.5.x or 2.6.x) and fails

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Tile encoding: converts raw BGRA tile data into compressed payloads.
 
 // Wired into the frame worker and the bridge (`io_bridge/h264_refs.rs`). What

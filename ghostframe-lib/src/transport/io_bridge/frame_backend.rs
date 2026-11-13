@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The seam between the transport event loop and the GPU and encoder work of a
 //! frame (WS-C2, PS-2).
 //!

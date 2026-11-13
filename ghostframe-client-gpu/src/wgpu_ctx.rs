@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use crate::GpuError;
 // Both backends cache call-invariant lookups here: `ash` function tables and
 // memory properties on Vulkan, EGL/GL entry points on GLES.

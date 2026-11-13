@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Can this EGL implementation import the two planes of a decoded NV12 dmabuf?
 //
 // ghostframe's GLES H.264 path imports rkvdec's output as two textures --

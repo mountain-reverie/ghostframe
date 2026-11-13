@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! C FFI for ghostframe-lib.
 //!
 //! The Rust `GhostframeServer` is heap-allocated inside an `FfiHandle` that

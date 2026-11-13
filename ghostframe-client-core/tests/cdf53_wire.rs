@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `ClientConfig::cdf53_wire`: the core validates a CDF 5/3 pass and hands up
 //! its RLE streams instead of the expanded planes. Everything else -- ACKs,
 //! DecodeErrors, coverage NACKs -- must be exactly what the planes route

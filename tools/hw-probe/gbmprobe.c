@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 #include <gbm.h>
 #include <fcntl.h>
 #include <stdio.h>

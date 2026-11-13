@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Read `docker logs <container>` (stdout + stderr concatenated) and strip
 /// ANSI escape sequences so substring assertions are stable across TTY /
 /// non-TTY contexts. Used by tests that assert on tracing-subscriber output.

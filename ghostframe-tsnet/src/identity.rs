@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Tailnet identity lookups: who a peer is, who this node is, and the hook
 //! the embedded web server uses to ask whether a peer may be served.
 //!

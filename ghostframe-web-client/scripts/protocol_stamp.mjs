@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Recomputes ghostframe-client-wasm's GHOSTFRAME_PROTOCOL_STAMP in JS.
 // Must stay byte-for-byte equivalent to ../../ghostframe-client-wasm/build.rs:
 // same directories, same sort order, same relative-path normalisation, same

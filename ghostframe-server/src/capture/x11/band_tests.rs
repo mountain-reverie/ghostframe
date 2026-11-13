@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The band grab against a real X server (a private Xvfb): after every tick,
 //! the frame delivered into a rotating pool slot equals what a fresh full
 //! grab of the same screen returns (damage-driven encoding PR 5).

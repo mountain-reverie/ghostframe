@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Re-derives the five protocol-derived `window.__*` test globals the
 // browser e2e suite reads (docs/specs/wasm-cutover-main-ts-map.md, Part 3)
 // from the `WasmClientCore` event stream.

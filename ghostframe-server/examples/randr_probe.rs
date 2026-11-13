@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! RandR investigation tool for the ghostframe-server X11 rework (design
 //! section 4: "record the RandR event stream for `xrandr` and for
 //! `XrandrDisplay` and close the difference").

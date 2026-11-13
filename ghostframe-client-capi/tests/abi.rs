@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use ghostframe_client::*; // crate lib name is ghostframe_client
 
 #[test]

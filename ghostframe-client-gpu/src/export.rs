@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! A `VkImage` whose memory is exported as a dmabuf file descriptor.
 //!
 //! ## Two export paths

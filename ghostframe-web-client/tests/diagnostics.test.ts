@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 import { describe, expect, it, beforeEach } from 'vitest';
 import { MAX_RECORDED_ENTRIES, appendCapped, initDiagnostics } from '../src/diagnostics';
 

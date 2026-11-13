@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The X11 backend: full-root frames, XDamage, XTest input and RandR.
 
 #[cfg(test)]

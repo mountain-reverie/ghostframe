@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Public harness library for ghostframe e2e tests and the Layer B
 //! bench binary (`ghostframe-bench`'s `codec_report`).
 //!

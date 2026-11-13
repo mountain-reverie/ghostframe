@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! C ABI shim over `ghostframe-client-native`.
 //!
 //! This crate holds NO logic of its own: every `gf_*` function validates

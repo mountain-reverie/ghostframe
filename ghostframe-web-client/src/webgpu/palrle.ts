@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 import palrleWgsl from '../../../shaders/client/palrle_decode.wgsl?raw';
 import { createLabeledShaderModule } from './shader_module';
 import { protocol } from '../protocol_constants';

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Kernel-level network shaping for the browser e2e path.
 //!
 //! # Why this exists alongside `netsim`

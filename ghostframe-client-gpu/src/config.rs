@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The only module in this crate that reads environment variables.
 //!
 //! Mirrors the convention CI enforces on `ghostframe-lib`, where an

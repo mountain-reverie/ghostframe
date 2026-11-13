@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The harness's model of the encoder's rate control: how big a frame is, given
 //! the [`RateTarget`] the backend was told.
 //!

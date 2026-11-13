@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // cdf53_integrate.wgsl — bit-plane OR-integration with generation-bump self-clear.
 //
 // One workgroup per queued pass (dispatchWorkgroups(batchSize)). The workgroup

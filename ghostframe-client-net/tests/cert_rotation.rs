@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Real TLS handshakes against a `QuicServer` whose certificate clock is
 //! injected, across a rotation.
 //!

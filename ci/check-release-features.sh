@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # The server that `just build-release` produces, and `ghostframe-server install`
 # ships, must not be compiled with any of ghostframe-lib's test or diagnostic
 # features. Cargo unifies features over every package in one build, so a

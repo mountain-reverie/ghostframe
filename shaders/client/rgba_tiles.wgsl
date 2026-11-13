@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Copy already-decoded RGBA tiles into the framebuffer: every tile of a flush
 // arrives in ONE storage buffer, and one dispatch scatters them to their
 // places, however the dirty tiles are laid out on screen.

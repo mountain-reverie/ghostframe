@@ -2,6 +2,7 @@
 name = "ghostframe-e2e"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-or-later"
 
 # Empty library — this crate exists to host integration tests in `tests/`.
 # Heavy e2e dependencies (chromiumoxide, testcontainers, axum, tower-http,

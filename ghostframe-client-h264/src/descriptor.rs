@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `AVDRMFrameDescriptor` -> a plain struct with no ffmpeg types in it.
 //!
 //! This is the crate boundary: `ghostframe-client-gpu` consumes

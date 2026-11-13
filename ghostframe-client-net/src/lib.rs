@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! ## Catch-all match arms
 //!
 //! `clippy::wildcard_enum_match_arm` is on for non-test code in this crate.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Headless GPU integration test: DMA-BUF → SAD dirty detection + NV12 conversion → fragment.
 //!
 //! Exercises the GPU pipeline without Docker, X11, or a browser.

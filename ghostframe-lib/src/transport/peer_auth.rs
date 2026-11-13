@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Who may connect: the tailnet peer access rule, in one place.
 //!
 //! Being on the tailnet is not enough. By default only peers owned by the

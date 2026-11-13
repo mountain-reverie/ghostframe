@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Reconstruction-first vs timer-driven repair, at 20 ms and 75 ms RTT.
 
 Run: python3 -I fec_sim_rtt.py   (writes nothing; tee the output to fec_sim_rtt_out.txt)

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `--lossless-golden --x11-sink` mode.
 //!
 //! Fully static, fully deterministic codec-mixed test frame designed for

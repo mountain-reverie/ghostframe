@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `RefManager`: decides each H.264 frame's reference plan (design 3.2, 3.3).
 //!
 //! Pure: it sees frames sent and what the client reported, and answers with a

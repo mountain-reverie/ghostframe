@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Inbound datagram routing and the receive-side handling of ACKs and NACKs.
 //!
 //! Owns `dispatch_inbound_datagram` (the HELLO gate and the discriminator

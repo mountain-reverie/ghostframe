@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Task 14: server-encode -> client-core-decode loopback integration tests.
 //!
 //! These tests exercise the full round trip with no network involved:

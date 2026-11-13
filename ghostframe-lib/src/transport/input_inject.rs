@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Browser → server input forwarding.
 //!
 //! New `INPUT_MSG_TYPE = 0x05` on the bidi feedback stream. Sub-kind byte

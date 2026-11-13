@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Where does the ~0.5ms/tile upload cost actually go?
 //!
 //! Not a correctness test -- a hardware A/B, run by hand, so a fix for the

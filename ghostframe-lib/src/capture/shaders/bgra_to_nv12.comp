@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #version 450
 
 // Each workgroup processes a 2x2 pixel block:

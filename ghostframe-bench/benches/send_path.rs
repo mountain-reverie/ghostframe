@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Server send-path dispatch cost: scheduler tick -> fragment_tile ->
 //! `submit_batch` (stamp, retransmit cache, RTO, FEC) -> `drain` into a sender
 //! that does what `WebTransport::send_datagram` does to each datagram.

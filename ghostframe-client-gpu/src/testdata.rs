@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Wire-accurate test fixtures for [`crate::renderer::Renderer`], built with
 //! the real protocol encoders.
 //!

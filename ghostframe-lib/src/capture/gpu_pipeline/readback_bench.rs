@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Per-frame cost of the CPU reading the pipeline's host-visible outputs back,
 //! plus the whole `process_frame` call. A measurement, not a gate: `#[ignore]`d.
 //! `gf-gpu-run cargo test -p ghostframe-lib --lib readback_report -- --ignored --nocapture`

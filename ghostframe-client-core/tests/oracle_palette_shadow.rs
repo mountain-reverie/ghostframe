@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Port of `ghostframe-web-client/tests/palette_shadow.test.ts` (4 cases).
 
 use ghostframe_client_core::palette_shadow::PaletteShadow;

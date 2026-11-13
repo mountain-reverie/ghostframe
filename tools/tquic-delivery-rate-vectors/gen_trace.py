@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # Generates a scripted-bottleneck trace on stdout (deterministic: seeded).
 import heapq, random, sys
 rnd = random.Random(12345)

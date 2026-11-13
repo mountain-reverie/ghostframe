@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The H.264 encoder backend trait (design 4.1).
 //!
 //! A backend turns one NV12 picture and one [`FramePlan`] into one access

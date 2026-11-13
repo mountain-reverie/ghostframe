@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The prefix chord: `<prefix>` then `d` (quit) or `h` (minimize).
 //!
 //! Modelled on tmux's prefix. Every key, INCLUDING the prefix, is forwarded

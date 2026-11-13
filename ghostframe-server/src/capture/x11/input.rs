@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! X11 input injection via XTest extension.
 //!
 //! Implements `ghostframe_lib::transport::input_inject::InputInjector`

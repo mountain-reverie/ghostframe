@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Integration tests for Task 12: timer-driven assembly-timeout NACK scan,
 //! CDF53 tail sweep, periodic ReceiverFeedback emission, and the
 //! debounced coverage-NACK queue.

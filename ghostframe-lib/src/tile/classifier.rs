@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Per-tile classifier and bandwidth-fit frame-mode decision.
 //!
 //! See `docs/superpowers/specs/2026-04-28-m3-codec-suite-design.md` Phase M3.0

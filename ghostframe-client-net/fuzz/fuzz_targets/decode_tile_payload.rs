@@ -1,4 +1,5 @@
 #![no_main]
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Fuzzes the tile decoders directly, with attacker-controlled payload bytes.
 //!

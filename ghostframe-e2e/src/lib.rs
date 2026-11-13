@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! ghostframe-e2e — e2e test harness library and the home of integration
 //! tests that exercise the full Tailscale+QUIC+WebTransport+Chromium loop.
 //!

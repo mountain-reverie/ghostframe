@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The thread that runs a [`FrameBackend`], so a frame's GPU fence wait, H.264
 //! encode and CDF 5/3 pass encoding no longer hold the transport event loop
 //! (WS-C2, PS-2).

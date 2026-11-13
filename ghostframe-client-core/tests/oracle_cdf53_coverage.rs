@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Port of `ghostframe-web-client/tests/cdf53_coverage.test.ts` (11 cases).
 //!
 //! `now_us` here is treated as an opaque scaled timestamp matching the

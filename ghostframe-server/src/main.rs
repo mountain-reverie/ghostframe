@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `ghostframe-server`: command dispatch only. Each command lives in
 //! `commands/`.
 

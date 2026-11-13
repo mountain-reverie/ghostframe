@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // cdf53_planes.wgsl -- stage A of the full-grid CDF 5/3 decoder: copy bit
 // planes the host already decoded (events carry them as 384 bytes = 96 words
 // per tile pass) into the plane store. One workgroup of 96

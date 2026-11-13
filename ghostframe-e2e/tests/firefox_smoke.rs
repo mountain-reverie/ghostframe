@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Smoke test for the FirefoxSession lifecycle.
 //!
 //! Verifies that we can launch Firefox via geckodriver, navigate to a data:

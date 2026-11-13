@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Rate-limited DECODE_ERROR emitter. Ports
 //! `ghostframe-web-client/src/decode_error_batcher.ts`, but time is injected
 //! (`now_us: u64`) instead of using `performance.now()`.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Serde mirrors of `client-core`'s `Event` and `PollOutput`.
 //!
 //! `client-core` is consumed by `ghostframe-lib` and `ghostframe-e2e` on

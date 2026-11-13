@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The client -> server feedback stream's message-type namespace, in one
 //! place.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 import h264Wgsl from '../../../shaders/client/h264_blit.wgsl?raw';
 import { createLabeledShaderModule } from './shader_module';
 

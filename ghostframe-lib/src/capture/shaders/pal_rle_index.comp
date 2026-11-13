@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // pal_rle_index.comp
 // Stage 3: per-pixel palette lookup → 4-bit index, packed atomically into a
 // shared scratch buffer, then bulk-written to global index_buffer.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The command line: `ghostframe-server <command>`.
 
 #[derive(Debug, clap::Parser)]

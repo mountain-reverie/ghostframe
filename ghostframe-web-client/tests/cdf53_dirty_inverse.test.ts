@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // The CDF53 inverse must lift only the tiles that received a pass in the
 // batch being presented (PC-1), and must not run at all when none did.
 //

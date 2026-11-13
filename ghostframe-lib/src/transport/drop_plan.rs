@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Deterministic drop injection for e2e tests.
 //!
 //! `NetProfile::loss` is probabilistic, which cannot produce the case this

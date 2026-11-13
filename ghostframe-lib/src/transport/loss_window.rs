@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The loss rate the classifier's `loss_override` acts on, measured by the
 //! sender.
 //!

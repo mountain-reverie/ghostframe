@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Tiles that already sit in upload slabs, copied into the framebuffer by a
 //! compute pass: one dispatch per slab, however many tiles and wherever they
 //! are. The slab-sourced sibling of [`super::rgba::RgbaPipeline`], and what

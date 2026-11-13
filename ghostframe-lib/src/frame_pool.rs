@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Pooled frame buffers: [`FramePool`] and [`FrameBuf`].
 //!
 //! A capture producer grabs into a slot taken from a fixed-size pool and

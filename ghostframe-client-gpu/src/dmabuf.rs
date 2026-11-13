@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The parts of dmabuf export that are not specific to a graphics API.
 //!
 //! Extracted from `export.rs` when the GLES backend arrived, because all of

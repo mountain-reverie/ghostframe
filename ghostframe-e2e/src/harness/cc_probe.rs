@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Pure metric extraction over a bandwidth-estimate time series, for the
 //! nested-congestion-control measurement scenes
 //! (`tests/browserless_nested_cc.rs`).

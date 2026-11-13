@@ -133,6 +133,8 @@ ci-client: build-client
     ci/check-test-features.sh
     @echo "=== no home-directory paths in tracked files ==="
     ci/check-local-paths.sh
+    @echo "=== licences: crate fields, AGPL containment, SPDX headers ==="
+    ci/check-licenses.py
     @echo "=== clippy + unit tests (native client) ==="
     just test-client
     @echo "=== cbindgen header up-to-date ==="
@@ -232,6 +234,8 @@ ci-local:
     ci/check-test-features.sh
     @echo "=== no home-directory paths in tracked files ==="
     ci/check-local-paths.sh
+    @echo "=== licences: crate fields, AGPL containment, SPDX headers ==="
+    ci/check-licenses.py
     @echo "=== release daemon has no test-only features ==="
     ci/check-release-features.sh
     @echo "=== clippy ==="

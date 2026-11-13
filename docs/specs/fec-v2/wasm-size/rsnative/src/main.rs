@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use reed_solomon_simd::{ReedSolomonEncoder, ReedSolomonDecoder};
 use std::time::Instant;
 fn run(k: usize, r: usize, len: usize, lost: usize, iters: u32) {

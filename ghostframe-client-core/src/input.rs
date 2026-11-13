@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Wire encoders for INPUT_MSG_TYPE (0x05).
 //
 // Layout (big-endian, matching FEEDBACK/HELLO/DECODE_ERROR):

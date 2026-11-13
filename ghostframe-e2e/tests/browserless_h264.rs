@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! H.264 as a member of the transport, in the stepped browserless harness.
 //!
 //! What runs: the real `IoBridge` event loop (the `RefManager` plans every

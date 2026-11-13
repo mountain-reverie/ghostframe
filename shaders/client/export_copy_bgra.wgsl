@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // export_copy_bgra.wgsl -- the Vulkan variant of export_copy_rgba_alias.wgsl;
 // read that one for why this is a compute kernel at all.
 //

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! M2 acceptance: the showcase window against a live server, under Weston.
 //!
 //! This is the first runtime proof of the M2 window code. Everything before

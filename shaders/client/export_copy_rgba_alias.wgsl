@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // export_copy_rgba_alias.wgsl -- copy the damaged tiles of the framebuffer into
 // an export buffer, touching nothing else.
 //

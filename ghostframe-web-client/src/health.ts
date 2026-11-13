@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 /**
  * Swallowed-exception accounting and a small console ring, readable from the
  * page as `window.__ghostframeHealth()`.

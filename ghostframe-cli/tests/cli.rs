@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use clap::Parser;
 use ghostframe_cli::chord::Prefix;
 use ghostframe_cli::cli::{parse_prefix, Cli, Command};

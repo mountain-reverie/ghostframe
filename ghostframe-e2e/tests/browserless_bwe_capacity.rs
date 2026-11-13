@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The two capacity-estimation scenes, in their own binary.
 //!
 //! They live here rather than in `browserless_runner` because of how they

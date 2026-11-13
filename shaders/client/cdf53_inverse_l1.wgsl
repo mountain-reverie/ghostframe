@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // cdf53_inverse_l1.wgsl — outermost-level inverse lifting (32×32 area).
 //
 // Reads the L2-inverse output from workArea[0..16][0..16] (LL1) plus the

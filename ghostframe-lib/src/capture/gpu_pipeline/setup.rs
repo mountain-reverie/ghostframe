@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Construction of [`GpuFrameProcessor`].
 //!
 //! Holds the giant `unsafe fn new_inner` that allocates the Vulkan device,

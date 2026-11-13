@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The H.264 source of the browserless harness (design T3): real, decodable
 //! PCM-patch streams in place of the encoder, behind the transport's real
 //! send path.

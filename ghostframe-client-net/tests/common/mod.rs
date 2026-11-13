@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Shared test plumbing for `ghostframe-client-net`'s integration tests.
 //!
 //! Everything here drives a *real* `ghostframe_lib::transport::quic::QuicServer`

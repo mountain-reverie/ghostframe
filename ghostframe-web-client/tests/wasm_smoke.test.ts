@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Proves the wasm module loads under vitest's node environment and that it
 // was built from the current workspace sources. Everything else about the
 // wasm is tested by the retargeted suites; this is the load-bearing check

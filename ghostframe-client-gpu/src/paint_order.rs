@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Which of a batch's tile updates may still be painted.
 //!
 //! [`Renderer::flush`](crate::renderer::Renderer::flush) draws a batch in a

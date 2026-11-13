@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 pub use ghostframe_protocol::ack;
 pub mod ack_latency;
 pub mod bwe;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! A versioned slab: stable handles into a `Vec`, with reuse detection.
 //!
 //! Handles must be versioned because the transmission ledger keeps

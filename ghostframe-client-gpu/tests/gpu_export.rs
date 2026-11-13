@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Tests that require a real GPU. Deliberately NOT named in any CI
 //! workflow: CI runners have no suitable device, and the project rule is
 //! that CI exempts itself in the workflow file rather than the test

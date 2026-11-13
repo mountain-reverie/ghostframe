@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 /**
  * Terminal disconnect overlay, shown when the server tells this client it
  * has been evicted (`WasmEvent.Evicted`, ghostframe-client-wasm/src/

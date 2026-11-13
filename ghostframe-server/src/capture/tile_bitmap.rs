@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! A fixed-grid bitmap of damaged tiles, one bit per tile.
 //!
 //! Replaces a `HashSet<(u32, u32)>`: setting a tile is a shift and an OR, a

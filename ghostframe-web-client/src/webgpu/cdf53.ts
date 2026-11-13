@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 import integrateWgsl from '../../../shaders/client/cdf53_integrate.wgsl?raw';
 import inverseL3Wgsl from '../../../shaders/client/cdf53_inverse_l3.wgsl?raw';
 import inverseL2Wgsl from '../../../shaders/client/cdf53_inverse_l2.wgsl?raw';

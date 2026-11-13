@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Sequential palette-churn pattern for e2e_palette_eviction.
 //!
 //! Cycles through `count` distinct 4-color palettes, drawing each in a

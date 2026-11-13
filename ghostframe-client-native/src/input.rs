@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Input encoding.
 //!
 //! Thin wrappers over `ghostframe_client_core::input` so there is exactly

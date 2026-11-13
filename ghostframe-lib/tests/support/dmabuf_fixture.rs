@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Real dma-buf fixtures for GPU-pipeline tests.
 //!
 //! A `memfd` is NOT a dma-buf: Vulkan refuses it as

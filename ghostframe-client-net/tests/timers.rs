@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 mod common;
 
 use common::{connected_session, pump_with_wt};

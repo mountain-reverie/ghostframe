@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Emits `GHOSTFRAME_PROTOCOL_STAMP`: an FNV-1a hash over the sorted
 //! relative paths and contents of the crates whose sources define protocol
 //! behaviour. `ghostframe-web-client/scripts/protocol_stamp.mjs` recomputes

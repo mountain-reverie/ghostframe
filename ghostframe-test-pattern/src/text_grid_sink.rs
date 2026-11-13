@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `--text-grid --x11-sink` mode.
 //!
 //! Paints `text_grid::TEXT` glyphs pixel-exactly into the root window

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! HTTP/3 SETTINGS + WebTransport CONNECT handshake, driven from the client
 //! side.
 //!

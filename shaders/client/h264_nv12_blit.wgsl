@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // shaders/client/h264_nv12_blit.wgsl
 //
 // NV12 -> RGBA, full-range BT.601.
