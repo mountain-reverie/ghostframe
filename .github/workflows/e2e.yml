@@ -145,6 +145,10 @@ jobs:
       # real bridge and client; named here because nothing else lists it.
       - run: cargo test --test browserless_h264 -- --test-threads=1
       - run: cargo test --test c2_frame_off_loop -- --test-threads=1
+      # Stats panel PR 1: the server half of the stats stream, end to end with
+      # no UI (subscribe, schema, 1 Hz samples with live RTT and estimate,
+      # unsubscribe, repeated subscribe).
+      - run: cargo test --test browserless_stats -- --test-threads=1
 
   # The congestion-control scenes: about 25 minutes of the browserless
   # wall clock (browserless_model_controller alone is ~13). In the one job
