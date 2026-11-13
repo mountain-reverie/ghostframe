@@ -43,6 +43,11 @@ pub mod units;
 /// serving yesterday's protocol.
 pub const PROTOCOL_STAMP: &str = env!("GHOSTFRAME_PROTOCOL_STAMP");
 
+/// This build's version for the stats panel: `0.1.0 (aab2fa2d)`, with
+/// `, dirty` inside the parentheses for a tree with uncommitted changes and
+/// `unknown` for the commit outside a git checkout. See `build.rs`.
+pub const CLIENT_VERSION: &str = env!("GHOSTFRAME_CLIENT_VERSION");
+
 /// Installs the panic hook. Idempotent; call once at module load.
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -52,4 +57,25 @@ pub fn start() {
 #[wasm_bindgen]
 pub fn protocol_stamp() -> String {
     PROTOCOL_STAMP.to_string()
+}
+
+/// `CLIENT_VERSION` for JS: the e2e suite and the console read it.
+#[wasm_bindgen(js_name = clientVersion)]
+pub fn client_version() -> String {
+    CLIENT_VERSION.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CLIENT_VERSION;
+
+    #[test]
+    fn client_version_has_the_documented_shape() {
+        let (pkg, rest) = CLIENT_VERSION.split_once(" (").expect(CLIENT_VERSION);
+        assert_eq!(pkg, env!("CARGO_PKG_VERSION"));
+        let inner = rest.strip_suffix(')').expect(CLIENT_VERSION);
+        let commit = inner.strip_suffix(", dirty").unwrap_or(inner);
+        let hex8 = commit.len() == 8 && commit.chars().all(|c| c.is_ascii_hexdigit());
+        assert!(commit == "unknown" || hex8, "{CLIENT_VERSION}");
+    }
 }
