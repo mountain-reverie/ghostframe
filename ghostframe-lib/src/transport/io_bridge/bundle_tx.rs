@@ -390,7 +390,6 @@ impl IoBridge {
         }
         match self.offer_to_live(&b.bytes) {
             Offer::NoSession => {
-                self.pad_repair_tags.take(b.bundle_seq);
                 self.transmission_ledger.forget_undeparted(b.bundle_seq);
                 true
             }
@@ -417,7 +416,6 @@ impl IoBridge {
                     len = b.bytes.len(),
                     "dropping a sealed bundle the path no longer carries"
                 );
-                self.pad_repair_tags.take(b.bundle_seq);
                 let tracked = self.transmission_ledger.forget_undeparted(b.bundle_seq);
                 let contents = b.records.iter().map(|r| Some(r.content)).collect();
                 self.retire_oversize_contents(contents, tracked, now_std());
