@@ -213,3 +213,21 @@ Measurement only (`the_repair_bytes_are_split_by_cause` in `browserless_fec_adap
 
 - **There is no overhead above the rule.** Achieved equals the rule's rows at the estimate to within 0.001, which equals the count cap at the blocks' exact `k` (the target is unreachable in these four cells: `r` sits at `ceil(k / 4)`). Request rows are not in `r/k`; the `T_lr` rows were 0.0001 at most; padding is a byte quantity and not in a rows ratio; the trim and the step limit contribute 0.0007 at most.
 - **The whole gap to the bar is rounding in the bar itself**: it takes `ceil(k / 4) / k` at the middle of each size bucket (`block_k_bucket_range`: 17-24 reads as 20, which gives 0.25), while the blocks that were closed sit at 17, 18, 21 and the like, where the ratio is 0.28-0.29. Exact-`k` cap minus bar: 0.0018 (H264/iid5), 0.0168 (H264/ge3at1), 0.0065 (Tile/iid5), 0.0124 (Tile/ge3at1). A bar made from the exact `k` histogram (`k_hist` is in the run now) would read 0.298 / 0.274 / 0.277 / 0.263 and the four cells would pass by 0.000-0.003. This is a defect of the criterion's bar, not of the controller; the bar is not changed here.
+
+### TB1: the byte cap on tile blocks' `r`, measured and not adopted
+
+The data picked candidate 1 (padding is the only large unplanned part). It was built as the plan describes (`r <= max(1, ceil(sum(len) / (4 max(len))))`, all-tile blocks only, after `RSizer::r_for_paced`; unit and property tests, and a harness switch for the control arm) and measured against the same build with the cap off, adaptive arm, same seeds. **It did not improve delivered tile passes per second on the plan's cell (Tile/iid5/10M), so it was reverted** (E10's precedent: no dead gated code). The patch is kept outside the tree for the owner: `tb1-byte-cap.patch` in the session scratchpad.
+
+| cell (adaptive, cap off -> on) | seeds | repair / source | delivered tiles/s | requests per block | hand-offs + declines | cap bound blocks |
+|---|---|---|---|---|---|---|
+| Tile/iid5/10M | 5 | 0.373 ± 0.038 -> **0.291 ± 0.007** | 6228 ± 95 -> **6231 ± 129** | 0.0056 -> **0.0174** | 99 -> 133 | 770-1910 per run |
+| Tile/iid5/2M | 3 | 0.523 -> 0.365 | 1088 ± 6 -> **1224 ± 4** | 0.0087 -> 0.061 | 0 -> 30 | 643-694 |
+| Tile/iid1/10M | 3 | 0.243 -> 0.258 | 6881 ± 28 -> 6896 ± 37 | 0.0007 -> 0.0017 | 0 -> 7 | 366-493 |
+| Tile/ge3at1/10M | 3 | 0.341 -> 0.277 | 6880 ± 64 -> 6912 ± 18 | 0.0053 -> 0.0090 | 27 -> 0 | 841-877 |
+| H264/iid5/10M, H264/ge3at1/10M | 1 | wire digest identical, `adapt_cap_bytes` 0 | | | | |
+
+- **The cap does what it was built for**: repair bytes over source bytes fall by 8 points at 10 Mbit/s i.i.d. 5 % (outside the seed spread, and the byte bound `r x max <= 0.25 sum + max` holds on every run with the cap and fails without it) and by 16 points at 2 Mbit/s.
+- **The bytes it frees do not become delivered tiles at 10 Mbit/s.** Offered / estimate falls from 0.82 to 0.78 and delivered stays at 6230 (difference 3, spread 129): the stream does not offer more source with the room (not diagnosed here), so the saving is not goodput. Meanwhile requests per block triple (0.0056 to 0.0174, outside the spread) and hand-offs plus declines rise 99 to 133: fewer rows per block cost recoveries. Tile ack latency is unchanged (mean 64.8 ms to 63.1 ms; p95 bucket 100 ms in all runs).
+- **At 2 Mbit/s the same cap raises delivery by 12 % (1088 to 1224, seeds within 6)**, which is the cell where the C0 match saw 1070 against 1522 for the off arm. That is a partial close (the control is still 20 % ahead), paid for with 7 x the requests and 30 hand-offs plus declines. It is not enough to meet the plan's bar on its own cell, and it is the owner's decision whether a cap that helps only below 10 Mbit/s is worth keeping.
+- **H.264 is untouched by construction and by measurement**: the cap applies to all-tile blocks only; the adaptive wire digest of H264/iid5/10M and H264/ge3at1/10M is bit-identical with the cap on and off.
+- **Open, not diagnosed:** why the room the cap frees at 10 Mbit/s is not filled with source. The matched off arm of C0 delivered 7276 tiles/s against 6103 for the adaptive arm there; TB0 shows 0.10 of the 0.37 repair share is padding and TB1 removes most of it without moving delivery, so repair size is not what separates the two arms at 10 Mbit/s.
