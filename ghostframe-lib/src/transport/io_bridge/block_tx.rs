@@ -26,6 +26,17 @@ pub(super) enum CloseWhy {
     Declined,
 }
 
+/// Why a repair row was queued (measurement; indexes `BlockRepairSplit`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RowCause {
+    Initial = 0,
+    Request = 1,
+    Pto = 2,
+    TLr = 3,
+    #[default]
+    Other = 4,
+}
+
 /// A repair row waiting for admission. Its `bundle_seq` is allocated only
 /// when it is handed to quinn: one allocated and never sent would be a
 /// permanent gap the client counts as lost.
@@ -36,6 +47,9 @@ pub(super) struct RepairJob {
     pub(super) r: u8,
     pub(super) row: u8,
     pub(super) payload: Vec<u8>,
+    pub(super) cause: RowCause,
+    /// Symbol bytes of the block's sources (measurement only).
+    pub(super) sum_len: u32,
 }
 
 impl RepairJob {
@@ -123,6 +137,68 @@ pub(super) struct BlockTxStats {
     pub(super) pto_repair_rows: u64,
     /// TILE_NACKs honoured for a pass whose protected source is in flight.
     pub(super) nack_on_protected: u64,
+    /// Where the repair bytes went (TB0).
+    pub(super) split: crate::transport::instruments::BlockRepairSplit,
+    /// The cause the rows `execute_block_actions` queues now are sent for.
+    pub(super) cause: RowCause,
+}
+
+impl crate::transport::instruments::BlockRepairSplit {
+    /// A row of `payload_len` bytes, the block's symbols summing to `sum_len`
+    /// over `k`, is sent: `wire` bytes.
+    pub(super) fn note_row(
+        &mut self,
+        cause: RowCause,
+        wire: usize,
+        payload_len: usize,
+        sum_len: u32,
+        k: u8,
+    ) {
+        let c = cause as usize;
+        self.rows[c] += 1;
+        self.bytes[c] += wire as u64;
+        if cause == RowCause::Initial {
+            let ideal = u64::from(sum_len) * 1000 / u64::from(k.max(1));
+            self.initial_ideal_milli += ideal;
+            self.initial_pad_milli += (payload_len as u64 * 1000).saturating_sub(ideal);
+            self.initial_header_bytes += FEC_REPAIR_HEADER_LEN as u64;
+        }
+    }
+
+    /// A block closed with these symbols and `rows` initial rows decided.
+    pub(super) fn note_block(
+        &mut self,
+        c: &crate::transport::fec_tx::blocks::ClosedBlock,
+        r: u8,
+        trim: u8,
+        rule: u8,
+    ) {
+        use crate::transport::fec_tx::blocks::SourceKind;
+        let k = u64::from(c.k);
+        let sum: u64 = c.symbols.iter().map(|s| s.len() as u64).sum();
+        let max = c.symbol_len() as u64;
+        let k_eff = if max == 0 {
+            k
+        } else {
+            sum.div_ceil(max).min(k)
+        };
+        self.blocks += 1;
+        self.sum_k += k;
+        self.sum_k_eff += k_eff;
+        self.sum_len += sum;
+        self.k_eff_buckets[k_bucket(u8::try_from(k_eff).unwrap_or(u8::MAX))] += 1;
+        self.blocks_mixed += u64::from(k_eff < k);
+        if c.kinds.contains(&SourceKind::H264) {
+            self.blocks_h264 += 1;
+            self.blocks_h264_k_eff_ne_k += u64::from(k_eff != k);
+        }
+        self.rows_decided += u64::from(r);
+        self.rows_count_cap +=
+            u64::from(crate::transport::fec_tx::adapt_size::r_cap(u32::from(c.k)));
+        self.rows_trim += u64::from(trim.min(r));
+        self.rows_rule += u64::from(rule);
+        self.k_hist[usize::from(c.k)] += 1;
+    }
 }
 
 impl IoBridge {
@@ -249,11 +325,18 @@ impl IoBridge {
             }
             self.block_tx.k_sum += u64::from(k);
             self.block_tx.k_buckets[k_bucket(k)] += 1;
+            let (mut trim, mut rule) = (0, 0);
             let r = match self.fec_adapt.as_mut() {
-                Some(a) => a.r_for_block(u32::from(k), self.reliable_emitter.emit_us64(now)),
+                Some(a) => {
+                    let r = a.r_for_block(u32::from(k), self.reliable_emitter.emit_us64(now));
+                    (trim, rule) = (a.last_trim(), a.last_base());
+                    r
+                }
                 None => params.r,
             }
             .min(255 - k);
+            self.block_tx.split.note_block(&c, r, trim, rule);
+            let sum_len: u32 = c.symbols.iter().map(|s| s.len() as u32).sum();
             let fits = max_dg.is_some_and(|m| c.symbol_len() + FEC_REPAIR_HEADER_LEN <= m);
             let mut repairs_queued = 0;
             if r > 0 && !fits {
@@ -270,6 +353,8 @@ impl IoBridge {
                                 r,
                                 row: row as u8,
                                 payload,
+                                cause: RowCause::Initial,
+                                sum_len,
                             });
                             repairs_queued += 1;
                         }
@@ -374,6 +459,8 @@ impl IoBridge {
             return;
         };
         let refs: Vec<&[u8]> = symbols.iter().map(Vec::as_slice).collect();
+        let sum_len: u32 = symbols.iter().map(|s| s.len() as u32).sum();
+        let cause = self.block_tx.cause;
         let payloads = match ghostframe_protocol::fec::codec::encode_repairs(&refs, rows) {
             Ok(p) => p,
             Err(e) => {
@@ -389,6 +476,8 @@ impl IoBridge {
                 r,
                 row,
                 payload,
+                cause,
+                sum_len,
             });
         }
         self.block_tx.repairs_queued_peak = self
@@ -485,7 +574,9 @@ impl IoBridge {
                 self.block_tx.requests_served += 1;
                 self.block_tx.request_rows_sent += rows;
             }
+            self.block_tx.cause = RowCause::Request;
             self.execute_block_actions(a);
+            self.block_tx.cause = RowCause::Other;
         }
     }
 
@@ -547,6 +638,13 @@ impl IoBridge {
                 .register_repair(job.block_id, job.row, bundle_seq);
             self.block_tx.repairs_sent += 1;
             self.block_tx.repair_bytes += bytes.len() as u64;
+            self.block_tx.split.note_row(
+                job.cause,
+                bytes.len(),
+                job.payload.len(),
+                job.sum_len,
+                job.k,
+            );
             let sealed = SealedBundle {
                 bundle_seq,
                 bytes,
@@ -603,7 +701,9 @@ impl IoBridge {
         self.block_table.set_rtt(rtt);
         if self.block_table.next_deadline().is_some_and(|d| d <= now) {
             let a = self.block_table.on_timer(now, rtt);
+            self.block_tx.cause = RowCause::TLr;
             self.execute_block_actions(a);
+            self.block_tx.cause = RowCause::Other;
         }
         self.service_pending_repairs();
     }
