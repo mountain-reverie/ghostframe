@@ -101,6 +101,14 @@ impl IoBridge {
         self.packer.set_blocks(self.fec_live);
     }
 
+    /// Turn padding-as-repair off (probe windows are then padded with copies
+    /// only, as before E9): the A/B switch of the E10 value gate. Not an
+    /// environment variable.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn set_pad_repair_off_for_test(&mut self, off: bool) {
+        self.pad_repair_off_for_test = off;
+    }
+
     /// Set the FEC block knob the daemon would read from
     /// `GHOSTFRAME_FEC_BLOCKS`. `None` is off.
     #[cfg(any(test, feature = "browserless-harness"))]
