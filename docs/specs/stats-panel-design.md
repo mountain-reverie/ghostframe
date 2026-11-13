@@ -53,12 +53,25 @@ keyboard capture).
 
 ### 1.1 Wire messages
 
-Three new message types on the existing reliable stream, defined in
-`ghostframe-protocol`. There is no capability bit and no compatibility path:
-the web client is embedded in the server binary, so both sides always ship
-together (project rule: nothing in production, no legacy wire paths).
+Three new message types, defined in `ghostframe-protocol`. There is no
+capability bit and no compatibility path: the web client is embedded in the
+server binary, so both sides always ship together (project rule: nothing in
+production, no legacy wire paths).
 
-- **`STATS_SUBSCRIBE`** (client to server): one byte, `1` = on, `0` = off.
+**Channel.** Client to server, the subscribe travels on the existing feedback
+bidirectional stream, in the namespace of `ghostframe-protocol/src/feedback_stream.rs`
+(`STATS_SUBSCRIBE_MSG_TYPE = 0x0B`; 0x0A is avoided because it is the frame-ack
+datagram envelope). Server to client there is **no reliable channel today**:
+the client never reads the feedback stream's return half and the server never
+writes to it. This design opens it: the server writes on the return half of the
+same feedback stream, and the client reads it. It gets its own one-byte type
+namespace (`STATS_SCHEMA = 0x01`, `STATS_SAMPLE = 0x02`) and explicit framing,
+`[type u8][len u16 LE][payload]`, with `len` at most 16 KiB. The client
+reassembles frames across reads; an unknown type is skipped by its length; a
+`len` over the limit closes nothing but drops the reader state and counts an
+error.
+
+- **`STATS_SUBSCRIBE`** (client to server): `[0x0B, on]`, `on` = `1` or `0`.
 - **`STATS_SCHEMA`** (server to client): sent in answer to every `on`, even a
   repeated one. Contents:
   - `schema_id` (u16, incremented on each schema the session sends);
