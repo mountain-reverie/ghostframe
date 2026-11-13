@@ -134,6 +134,8 @@ impl ClientCore {
     /// Count what a datagram produced for the stats panel's codec mix.
     /// Runs on the payload events, before the pixel decode turns them into
     /// `TileReady`, so `Decoded` and `Payload` delivery count the same.
+    /// Decode errors the pixel decoder produces after this step (`Decoded`
+    /// delivery) are not counted, so "Decode errors" undercounts there.
     fn tally_events(&mut self, events: &[Event]) {
         let c = &mut self.stats.local.counters;
         for e in events {

@@ -272,4 +272,4 @@ assertion is added.
 
 Size-optimised profile (`opt-level = "s"`, LTO, one codegen unit, `panic = "abort"`), measured through `CARGO_PROFILE_RELEASE_*` only, nothing committed: 428,152 bytes raw, 177,089 gzip.
 
-The spec's original 320 KB cap did not hold with Leptos linked (459,444 bytes raw). Record the owner's decision here: `PR 3 cap: 524,288 bytes raw (512 KiB), decided 2026-11-13`.
+The spec's original 320 KB cap did not hold with Leptos linked (459,444 bytes raw). PR 3 cap: 524,288 bytes raw (512 KiB), owner decision 2026-11-13.

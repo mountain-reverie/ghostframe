@@ -120,7 +120,7 @@ static LOCAL_DEFS: [LocalDef; LOCAL_COUNT] = [
     },
     LocalDef {
         key: "longest_run",
-        label: "Longest loss run",
+        label: "Longest loss run (session)",
         unit: "1",
         kind: MetricKind::Gauge,
         group: MetricGroup::Loss,
@@ -154,6 +154,10 @@ pub(crate) struct LocalCounters {
     pub frames_h264: u64,
     pub h264_bytes: u64,
     pub nacks_sent: u64,
+    /// Decode errors the payload step reports (`Event::DecodeError`). This
+    /// undercounts: errors the pixel decoder raises later (native client,
+    /// `Decoded` delivery) never pass through `tally_events`, and the web
+    /// renderer's own decode failures are not fed back here either.
     pub decode_errors: u64,
     pub paints: u64,
 }
