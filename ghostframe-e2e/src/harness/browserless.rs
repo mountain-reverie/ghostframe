@@ -678,6 +678,8 @@ pub struct BrowserlessResult {
     pub transport: ghostframe_lib::transport::io_bridge::TransportProbe,
     /// The client's own pre-FEC loss, loss-run histogram and recoveries.
     pub client_wire_loss: ghostframe_client_core::WireLossStats,
+    /// The client's FEC block counters (`requests`, `late_rows`, declines by cause).
+    pub client_blocks: ghostframe_client_core::fec_rx::BlockStats,
     /// `(datagram frames quinn received, frames read by the application)` on
     /// the client; the difference is receive-buffer drops.
     pub client_rx_datagrams: Option<(u64, u64)>,
@@ -1389,6 +1391,7 @@ async fn run_inner(
         loss_path_resends_useful: emitter_stats.loss_path_resends_useful,
         transport,
         client_wire_loss: client_probe.wire_loss,
+        client_blocks: client_probe.blocks,
         client_rx_datagrams: client_probe.rx_datagrams,
         client_cdf53: client_probe.cdf53,
         client_stats: client_probe.stats,
@@ -2093,6 +2096,7 @@ async fn drive_session(
 
     let client_probe = ClientProbe {
         wire_loss: client.wire_loss_stats(),
+        blocks: client.block_stats(),
         rx_datagrams: client.datagram_rx_counts(),
         cdf53: client.cdf53_coverage_summary(),
         stats: stats_tap.map(|t| t.finish()).unwrap_or_default(),
@@ -2114,6 +2118,8 @@ async fn drive_session(
 pub struct ClientProbe {
     /// Pre-FEC loss, loss-run histogram and FEC recoveries from `wire_seq` gaps.
     pub wire_loss: ghostframe_client_core::WireLossStats,
+    /// The client's FEC block counters at the end of the scene.
+    pub blocks: ghostframe_client_core::fec_rx::BlockStats,
     /// `(datagram frames quinn received, frames read by the application)`.
     /// The difference is what quinn's receive buffer dropped.
     pub rx_datagrams: Option<(u64, u64)>,

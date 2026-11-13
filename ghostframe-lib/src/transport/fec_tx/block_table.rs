@@ -152,6 +152,13 @@ pub(crate) enum Outcome {
 pub(crate) enum CloseReason {
     Accounted,
     Declined,
+    /// The client declined a block whose REPAIR_REQUEST this table served
+    /// (at least one row went out). The decline then measures the request
+    /// round, not the proactive `r`, so [`DeclinedTrim`] does not count it.
+    /// Known cost: a genuine `r` shortfall after a served request lands here
+    /// too, which is why `closed_declined_late` is reported beside
+    /// `closed_declined`.
+    DeclinedLate,
     HandedOff,
     TimedOut,
 }
@@ -238,6 +245,9 @@ pub(crate) struct ClosedBlock {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct BlockStats {
     pub block_evicted: u64,
+    /// The most symbol bytes the table held at once (read after a block
+    /// closes, before the cap evicts), against `FEC_TX_MAX_CACHED_BYTES`.
+    pub cached_bytes_peak: u64,
     pub block_closed_late_trigger: u64,
     pub request_unknown: u64,
     pub request_before_close: u64,
@@ -256,7 +266,10 @@ pub(crate) struct BlockStats {
     /// Blocks closed, by outcome (every `finish`): `Accounted` is the good
     /// ending, the other three are what the E11 sweep reports as shares.
     pub closed_accounted: u64,
+    /// Includes `closed_declined_late`.
     pub closed_declined: u64,
+    /// The subset of `closed_declined` whose request had been served.
+    pub closed_declined_late: u64,
     pub closed_handed_off: u64,
     pub closed_timed_out: u64,
 }
@@ -355,6 +368,9 @@ struct Block {
     r: u8,
     /// The `T_adv` code of the block's sources; set when the block closes.
     t_adv: u8,
+    /// A REPAIR_REQUEST for this block produced at least one repair action.
+    /// Survives `Deferred` -> `Repair`.
+    request_served: bool,
     sources: Vec<Src>,
     symbols: Vec<Vec<u8>>,
     sym_bytes: usize,
@@ -609,6 +625,7 @@ impl BlockTable {
             k: 0,
             r: 0,
             t_adv: 0,
+            request_served: false,
             sources: Vec::new(),
             symbols: Vec::new(),
             sym_bytes: 0,
@@ -666,6 +683,7 @@ impl BlockTable {
         b.next_row = u16::from(c.r);
         b.sym_bytes = c.symbols.iter().map(Vec::len).sum();
         self.cached_bytes += b.sym_bytes;
+        self.stats.cached_bytes_peak = self.stats.cached_bytes_peak.max(self.cached_bytes as u64);
         b.symbols = c.symbols;
         b.last_sent = Some(c.last_sent);
         b.phase = Phase::Repair;
@@ -798,7 +816,12 @@ impl BlockTable {
 
     fn decline(&mut self, id: BlockId, mut b: Block, _now: Instant, actions: &mut Vec<Action>) {
         self.release_unresolved(id, &mut b, LostCause::Decline, actions);
-        self.finish(id, b, CloseReason::Declined);
+        let why = if b.request_served {
+            CloseReason::DeclinedLate
+        } else {
+            CloseReason::Declined
+        };
+        self.finish(id, b, why);
     }
 
     /// A REPAIR_REQUEST entry.
@@ -852,6 +875,7 @@ impl BlockTable {
                 row: row as u8,
             });
             b.extra_used += 1;
+            b.request_served = true;
             row += 1;
             b.next_row = row;
         }
@@ -1219,6 +1243,10 @@ impl BlockTable {
         match why {
             CloseReason::Accounted => self.stats.closed_accounted += 1,
             CloseReason::Declined => self.stats.closed_declined += 1,
+            CloseReason::DeclinedLate => {
+                self.stats.closed_declined += 1;
+                self.stats.closed_declined_late += 1;
+            }
             CloseReason::HandedOff => self.stats.closed_handed_off += 1,
             CloseReason::TimedOut => self.stats.closed_timed_out += 1,
         }
@@ -1794,6 +1822,153 @@ mod tests {
                 t0
             )
             .is_empty());
+    }
+
+    fn repair_rows(a: &[Action]) -> usize {
+        a.iter()
+            .filter(|x| matches!(x, Action::Repair { .. }))
+            .count()
+    }
+
+    /// A decline after a served request closes `DeclinedLate`; one with no
+    /// request, a request refused over the cap, or a malformed request
+    /// closes `Declined`. `closed_declined` counts both, the late subset
+    /// separately.
+    #[test]
+    fn a_decline_after_a_served_request_closes_declined_late() {
+        let t0 = Instant::now();
+        // Served: one request produced rows, then the client gave up.
+        let mut t = setup(5, 1, tile, t0);
+        assert!(repair_rows(&t.on_request(ask(3, 2, 0), t0)) > 0);
+        t.on_declined(BLK, 5, &[0b11111], t0);
+        assert_eq!(t.closed_reason(BLK), Some(CloseReason::DeclinedLate));
+        let s = t.stats();
+        assert_eq!((s.closed_declined, s.closed_declined_late), (1, 1));
+
+        // Never requested.
+        let mut t = setup(5, 1, tile, t0);
+        t.on_declined(BLK, 5, &[0b11111], t0);
+        assert_eq!(t.closed_reason(BLK), Some(CloseReason::Declined));
+        let s = t.stats();
+        assert_eq!((s.closed_declined, s.closed_declined_late), (1, 0));
+
+        // Refused over the cap: PTO rows used the cap up (r + 4 = 5 here),
+        // so the request produced no row; the block was never served.
+        let mut t = setup(5, 1, tile, t0);
+        for _ in 0..5 {
+            assert!(t.on_pto(BLK).is_some());
+        }
+        assert_eq!(repair_rows(&t.on_request(ask(3, 2, 0), t0)), 0);
+        assert_eq!(t.stats().request_over_cap, 1, "premise: the cap refused it");
+        t.on_declined(BLK, 5, &[0b11111], t0);
+        assert_eq!(t.closed_reason(BLK), Some(CloseReason::Declined));
+
+        // Malformed (have >= k): declines at once, was not served.
+        let mut t = setup(3, 1, tile, t0);
+        t.on_request(ask(3, 1, 0), t0);
+        assert_eq!(t.closed_reason(BLK), Some(CloseReason::Declined));
+        assert_eq!(t.stats().closed_declined_late, 0);
+    }
+
+    /// A block requested while `Deferred` that went back to `Repair` is still
+    /// served when the client then declines it.
+    #[test]
+    fn a_request_from_deferred_back_to_repair_is_still_served() {
+        let t0 = Instant::now();
+        let mut t = setup(3, 1, tile, t0);
+        t.on_arrival(100, t0);
+        t.on_arrival(101, t0);
+        t.on_arrival(200, t0); // held 3 of k = 3: Deferred
+        assert_eq!(t.blocks[&BLK].phase, Phase::Deferred, "premise");
+        assert!(repair_rows(&t.on_request(ask(1, 2, 0), t0)) > 0);
+        assert_eq!(t.blocks[&BLK].phase, Phase::Repair, "premise: back");
+        t.on_declined(BLK, 3, &[0b100], t0);
+        assert_eq!(t.closed_reason(BLK), Some(CloseReason::DeclinedLate));
+    }
+
+    /// Over random interleavings of requests, PTO rows, ACKs and a decline, the
+    /// close reason is `DeclinedLate` exactly when some request returned a row,
+    /// whatever the timing.
+    #[test]
+    fn property_declined_late_follows_a_served_request_not_timing() {
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut rnd = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let t0 = Instant::now();
+        let (mut late, mut plain) = (0, 0);
+        for round in 0..300u32 {
+            let k = 2 + rnd(6) as u8;
+            let nr = 1 + rnd(3) as u8;
+            let id = round as BlockId;
+            let mut t = BlockTable::new();
+            for i in 0..u32::from(k) {
+                t.on_source_sealed(id, i as u8, 10_000 + i, vec![(i, tile(i))]);
+            }
+            t.on_closed(
+                ClosedBlock {
+                    block_id: id,
+                    k,
+                    r: nr,
+                    symbols: vec![vec![0; 4]; usize::from(k)],
+                    repair_bundles: (0..u32::from(nr)).map(|j| 20_000 + j).collect(),
+                    repairs_queued: 0,
+                    last_sent: t0,
+                    t_adv: 0,
+                },
+                t0,
+            );
+            let mut served = false;
+            let mut now = t0;
+            for _ in 0..(1 + rnd(8)) {
+                now += ms(rnd(120));
+                match rnd(4) {
+                    0 => {
+                        let a = t.on_request(
+                            RepairAsk {
+                                block_id: id,
+                                have: rnd(u64::from(k) + 1) as u8,
+                                missing: 1 + rnd(3) as u8,
+                                first_new_idx: 0,
+                            },
+                            now,
+                        );
+                        served |= repair_rows(&a) > 0;
+                    }
+                    1 => {
+                        t.on_pto(id);
+                    }
+                    2 => {
+                        t.on_arrival(10_000 + rnd(u64::from(k)) as u32, now);
+                    }
+                    _ => {
+                        t.on_arrival(20_000 + rnd(u64::from(nr)) as u32, now);
+                    }
+                }
+            }
+            if t.closed_reason(id).is_some() {
+                continue; // accounted, or the malformed request declined it
+            }
+            t.on_declined(id, k, &[0xff], now);
+            let want = if served {
+                CloseReason::DeclinedLate
+            } else {
+                CloseReason::Declined
+            };
+            assert_eq!(t.closed_reason(id), Some(want), "round {round}");
+            if served {
+                late += 1;
+            } else {
+                plain += 1;
+            }
+        }
+        assert!(
+            late > 20 && plain > 20,
+            "premise: both cases ran {late}/{plain}"
+        );
     }
 
     /// Randomised walk: every source of a closed block ends in exactly one

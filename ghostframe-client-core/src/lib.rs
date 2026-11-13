@@ -535,6 +535,12 @@ impl ClientCore {
         self.fec.wire_loss_stats()
     }
 
+    /// The FEC block store's counters (`requests`, `late_rows`, declines by
+    /// cause). Measurement only.
+    pub fn block_stats(&self) -> fec_rx::BlockStats {
+        self.fec.stats()
+    }
+
     /// Reassembly occupancy, for diagnostics and tests.
     pub fn assembly_stats(&self) -> AssemblyStats {
         AssemblyStats {
