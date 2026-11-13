@@ -211,7 +211,7 @@
 /**
  * Client request to start or stop the server's connection-stats stream,
  * `[STATS_SUBSCRIBE_MSG_TYPE, on]` with `on` 1 or 0; see
- * [`crate::stats::StatsSubscribe`]. 0x0A is skipped: it is the frame-ack
+ * `ghostframe_protocol::stats::StatsSubscribe`. 0x0A is skipped: it is the frame-ack
  * datagram envelope.
  */
 #define STATS_SUBSCRIBE_MSG_TYPE 11
