@@ -947,6 +947,10 @@ pub struct LinkOverrides {
     /// datagram longer than `max_len` from `from_us` of virtual time on
     /// (see [`NetSim::with_mtu_step`]).
     pub s2c_mtu_step: Option<(u64, usize)>,
+    /// Server -> client i.i.d. loss as a step function of virtual time:
+    /// `(from_us, loss)` (see [`NetSim::with_loss_steps`]). Empty keeps the
+    /// profile's `loss` throughout.
+    pub s2c_loss_steps: Vec<(u64, f64)>,
 }
 
 impl LinkOverrides {
@@ -1497,6 +1501,9 @@ async fn drive_session(
     );
     if let Some((from_us, max_len)) = links.s2c_mtu_step {
         net_s2c = net_s2c.with_mtu_step(from_us, max_len);
+    }
+    if !links.s2c_loss_steps.is_empty() {
+        net_s2c = net_s2c.with_loss_steps(links.s2c_loss_steps.clone());
     }
 
     // Datagrams `NetSim` has already ruled on whose propagation delay has
