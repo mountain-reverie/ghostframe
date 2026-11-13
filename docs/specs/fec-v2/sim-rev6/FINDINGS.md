@@ -175,3 +175,41 @@ Share of blocks closed on Empty, their mean k, and the share of source bundles i
   - `empty_rmin` 2 helps only where blocks are tiny: at 2 Mbit/s i.i.d. 5 % late frames fall from 1.03 to 0.70 %, for +6 points of overhead (31 -> 37 %); at 10 Mbit/s and up nothing. Not recommended as a default. If wanted, apply it only when the advertised T is the frame interval (about 2 Mbit/s).
   - No change to rules 1-4. Keep rule 3 as written.
 - **Not modelled:** the real emitter's queue also holds retransmissions and control content, which would make Empty rarer; tile bursts and frames share one queue here, as in the sender model, with no priorities.
+
+## 11. R6-e2 (plan task TB0): where the tile repair bytes go
+
+Measurement only (`the_repair_bytes_are_split_by_cause` in `browserless_fec_adapt.rs`, `FECSPLIT` and `FECCRIT3` lines). Adaptive arm, 10 Mbit/s, 150 ms buffer, 30 s, 5 seeds (`0xFB0001`-`5`), mean ± sd. Every number is a share of the **source wire bytes**, except the rows/k rows, which are shares of source symbols.
+
+### What the bytes are
+
+| | Tile iid5 | Tile iid1 | Tile ge3at1 | H.264 iid5 | H.264 ge3at1 |
+|---|---|---|---|---|---|
+| **repair bytes / source bytes** | 0.373 ± 0.038 | 0.253 ± 0.018 | 0.326 ± 0.026 | 0.277 ± 0.003 | 0.238 ± 0.015 |
+| planned rows at the average symbol (`r/k` x symbol bytes) | 0.271 | 0.189 | 0.246 | 0.268 | 0.228 |
+| **padding to the block's longest symbol** | **0.098 ± 0.032** | 0.062 ± 0.017 | 0.077 ± 0.013 | 0.006 | 0.007 |
+| headers (12 B a row) | 0.004 | 0.002 | 0.003 | 0.002 | 0.002 |
+| request rows | 0.0004 | 0.0001 | 0.0007 | 0.0008 | 0.0016 |
+| PTO rows | 0 | 0 | 0 | 0 | 0 |
+| `T_lr` rows | 0.0001 | 0 | 0 | 0 | 0 |
+| trim (rows above the cap) | 0 (never on) | 0 | 0 | 0 | 0 |
+| mean `k`, mean `k_eff` | 15.4, 11.9 | 14.7, 11.7 | 27.3, 21.1 | 8.3, 8.3 | 16.2, 16.2 |
+| blocks of mixed symbol sizes | 86 % | 90 % | 98 % | 0 % | 0.06 % |
+| delivered per second (tile passes, frames) | 6228 ± 95 | 6879 ± 30 | 6909 ± 62 | 27.0 | 27.8 |
+
+- **The 0.45 of E11-RCA (one seed: 0.443) divides as 0.28 planned, 0.15 padding, 0.005 headers and about 0.001 for every extra row together.** The five-seed mean is lower (0.373) and the padding is the only part that is large and not in the plan: a quarter to a third of the repair bytes, 6 to 10 points of source bytes, where the controller plans none.
+- **The cause is the symbol size.** A repair row is as long as the block's longest symbol (a full tile bundle), and a tile block holds bundles of very different sizes: `k_eff = ceil(sum(len) / max(len))` is 11.9 for a mean `k` of 15.4, so the block's `k` rows' worth of source is 23 % fewer bytes than `k` full symbols, while the cap `ceil(k / 4)` rows are all full length. H.264 blocks have `k_eff = k` (a frame is MTU-sized fragments): padding 0.6 points.
+- **Requests, PTO, `T_lr` and the trim are not the problem for tile**: together under 0.1 point, and the trim was never switched on in 25 runs (`rows_trim = 0`). Candidates 2 and 3 of decision 6 would save nothing. Candidate 1, a byte cap on `r` for tile blocks, attacks the 6-10 points.
+
+### Criterion (3): the residual after S1b
+
+`read_run`'s planned rows counted `T_lr` rows (they are in neither of its subtrahends); they are now counted by cause (`rows[0]` is the blocks' own `r`, trim included). Achieved `r/k` against the bar (`FECCRIT3`, 5 seeds):
+
+| cell | achieved r/k | rule at the estimate | step-limit hold | trim | exact-`k` cap | bar | request / PTO / `T_lr` (not in r/k) |
+|---|---|---|---|---|---|---|---|
+| H264/iid5 | 0.2981 | 0.2982 | 0 | 0 | 0.2982 | 0.2964 (cap, midpoints) | 0.0008 / 0 / 0 |
+| H264/ge3at1 | 0.2735 | 0.2735 | 0 | 0 | 0.2740 | 0.2572 (cap) | 0.0018 / 0 / 0 |
+| Tile/iid5 | 0.2744 | 0.2738 | 0.0007 | 0 | 0.2765 | 0.2700 (cap) | 0.0005 / 0 / 0.0001 |
+| Tile/ge3at1 | 0.2598 | 0.2598 | 0 | 0 | 0.2629 | 0.2505 (cap) | 0.0005 / 0 / 0 |
+
+- **There is no overhead above the rule.** Achieved equals the rule's rows at the estimate to within 0.001, which equals the count cap at the blocks' exact `k` (the target is unreachable in these four cells: `r` sits at `ceil(k / 4)`). Request rows are not in `r/k`; the `T_lr` rows were 0.0001 at most; padding is a byte quantity and not in a rows ratio; the trim and the step limit contribute 0.0007 at most.
+- **The whole gap to the bar is rounding in the bar itself**: it takes `ceil(k / 4) / k` at the middle of each size bucket (`block_k_bucket_range`: 17-24 reads as 20, which gives 0.25), while the blocks that were closed sit at 17, 18, 21 and the like, where the ratio is 0.28-0.29. Exact-`k` cap minus bar: 0.0018 (H264/iid5), 0.0168 (H264/ge3at1), 0.0065 (Tile/iid5), 0.0124 (Tile/ge3at1). A bar made from the exact `k` histogram (`k_hist` is in the run now) would read 0.298 / 0.274 / 0.277 / 0.263 and the four cells would pass by 0.000-0.003. This is a defect of the criterion's bar, not of the controller; the bar is not changed here.

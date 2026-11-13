@@ -186,6 +186,8 @@ async fn a_refused_source_stays_ahead_of_its_repairs_and_a_queued_repair_counts_
         r: 1,
         row: 0,
         payload: vec![0u8; 400 - ghostframe_protocol::fec::frame::FEC_REPAIR_HEADER_LEN],
+        cause: block_tx::RowCause::Other,
+        sum_len: 0,
     });
     let before = b.unsent_bundle_bytes();
     b.service_pending_repairs();
@@ -453,6 +455,20 @@ async fn a_repair_request_gets_fresh_rows_the_real_block_store_decodes() {
     assert_eq!(got, want, "the extra row completed the block");
     assert_eq!(b.block_tx.requests_served, 1);
     assert_eq!(b.block_tx.request_rows_sent, 1);
+    assert_causes(&b, [2, 1, 0, 0, 0]);
+}
+
+/// Rows sent by cause (initial, request, pto, t_lr, other), and the causes'
+/// bytes account for every repair byte the bridge counted.
+fn assert_causes(b: &IoBridge, rows: [u64; 5]) {
+    let sp = &b.block_tx.split;
+    assert_eq!(sp.rows, rows, "rows by cause");
+    assert_eq!(
+        sp.bytes.iter().sum::<u64>(),
+        b.block_tx.repair_bytes,
+        "bytes by cause sum to the repair bytes"
+    );
+    assert_eq!(sp.rows.iter().sum::<u64>(), b.block_tx.repairs_sent);
 }
 
 #[tokio::test]
@@ -638,6 +654,7 @@ async fn t_lr_sends_one_repair_and_does_not_re_arm() {
     assert_eq!(b.block_tx.handoffs, 0, "still inside the deadline");
     b.service_blocks(t0 + Duration::from_millis(90));
     assert_eq!(repair_rows(&b.sent_frames_for_test), [0, 1, 2], "once only");
+    assert_causes(&b, [2, 0, 0, 1, 0]);
 }
 
 #[tokio::test]
@@ -872,6 +889,7 @@ async fn the_pto_answers_a_protected_candidate_with_a_repair_row_not_a_source() 
     assert_eq!(kinds(&new), ["R"], "a repair, and no source or plain frame");
     assert_eq!(repair_rows(&new), [2], "the next unused row");
     assert!(b.block_tx.protected_timer_suppressed > 0);
+    assert_causes(&b, [2, 0, 1, 0, 0]);
 }
 
 #[tokio::test]
@@ -1341,4 +1359,67 @@ async fn every_repair_carries_a_hint_no_lower_than_the_round_trip_and_zero_befor
     // The table was told, so its releases follow what clients were told.
     let top = b.block_table.recent_hint(now_std());
     assert_ne!(top, 0);
+}
+
+// ---- where the repair bytes go (R6-e2 TB0) ---------------------------------
+
+fn closed_of(
+    lens: &[usize],
+    kinds: &[crate::transport::fec_tx::blocks::SourceKind],
+) -> crate::transport::fec_tx::blocks::ClosedBlock {
+    crate::transport::fec_tx::blocks::ClosedBlock {
+        block_id: 1,
+        k: lens.len() as u8,
+        symbols: lens.iter().map(|l| vec![0u8; *l]).collect(),
+        bundle_seqs: (0..lens.len() as u32).collect(),
+        kinds: kinds.to_vec(),
+        first_sealed_at_us: 0,
+        t_adv: 0,
+    }
+}
+
+#[test]
+fn k_eff_is_k_for_equal_symbols_and_below_it_for_mixed_ones() {
+    use crate::transport::fec_tx::blocks::SourceKind::{Tile, H264};
+    let mut sp = crate::transport::instruments::BlockRepairSplit::default();
+    sp.note_block(&closed_of(&[500; 8], &[H264; 8]), 2, 0, 2);
+    assert_eq!((sp.sum_k, sp.sum_k_eff, sp.blocks_mixed), (8, 8, 0));
+    assert_eq!((sp.blocks_h264, sp.blocks_h264_k_eff_ne_k), (1, 0));
+    // Three short symbols among long ones: ceil(1700 / 500) = 4 of 6.
+    let mut lens = vec![500; 3];
+    lens.extend([100, 100, 100]);
+    sp.note_block(&closed_of(&lens, &[Tile; 6]), 2, 1, 2);
+    assert_eq!((sp.sum_k, sp.sum_k_eff, sp.blocks_mixed), (14, 12, 1));
+    assert_eq!(sp.rows_trim, 1);
+    assert_eq!(sp.k_hist[8] + sp.k_hist[6], 2);
+    // One short last fragment of an H.264 frame: it is counted, not hidden.
+    let mut lens = vec![500; 3];
+    lens.push(10);
+    sp.note_block(&closed_of(&lens, &[H264; 4]), 1, 0, 1);
+    assert_eq!(sp.blocks_h264_k_eff_ne_k, 0, "ceil(1510 / 500) = 4 = k");
+    let mut lens = vec![500; 1];
+    lens.push(10);
+    sp.note_block(&closed_of(&lens, &[H264; 2]), 1, 0, 1);
+    assert_eq!(sp.blocks_h264_k_eff_ne_k, 0, "ceil(510 / 500) = 2 = k");
+    sp.note_block(&closed_of(&[500, 10, 10], &[H264; 3]), 1, 0, 1);
+    assert_eq!(sp.blocks_h264_k_eff_ne_k, 1, "ceil(520 / 500) = 2 of 3");
+}
+
+#[test]
+fn an_initial_rows_bytes_are_its_ideal_padding_and_header() {
+    let mut sp = crate::transport::instruments::BlockRepairSplit::default();
+    // k = 4 symbols summing to 1000, longest 400: a row carries 400 bytes,
+    // 250 of them ideal.
+    use ghostframe_protocol::fec::frame::FEC_REPAIR_HEADER_LEN;
+    let wire = 400 + FEC_REPAIR_HEADER_LEN;
+    sp.note_row(block_tx::RowCause::Initial, wire, 400, 1000, 4);
+    sp.note_row(block_tx::RowCause::Request, wire, 400, 1000, 4);
+    assert_eq!(sp.initial_ideal_milli, 250_000);
+    assert_eq!(sp.initial_pad_milli, 150_000);
+    assert_eq!(sp.initial_header_bytes, FEC_REPAIR_HEADER_LEN as u64);
+    assert_eq!(
+        (sp.initial_ideal_milli + sp.initial_pad_milli) / 1000 + sp.initial_header_bytes,
+        sp.bytes[0]
+    );
+    assert_eq!((sp.rows[0], sp.rows[1]), (1, 1));
 }

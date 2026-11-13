@@ -559,6 +559,81 @@ impl EcnObservation {
 // Snapshot
 // ---------------------------------------------------------------------------
 
+/// Why a repair row was sent: the block's own `r` at close, a client
+/// request, a probe timeout, the `T_lr` timer, or none of those.
+/// The name of cause `i` of `BlockRepairSplit::rows` (a function, not a
+/// constant: a `pub const` would land in the C header).
+pub fn row_cause_name(i: usize) -> &'static str {
+    ["initial", "request", "pto", "t_lr", "other"][i]
+}
+
+/// Where the repair bytes of a run went (R6-e2 TB0), measurement only. Rows
+/// and wire bytes are counted when a row is sent, by cause; the planned rows
+/// are split further into what a symbol of average length would cost, the
+/// padding to the block's longest symbol, and the headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockRepairSplit {
+    /// Blocks sized (`r` decided), their `k`, `k_eff = ceil(sum(len) / max(len))`
+    /// and symbol bytes summed.
+    pub blocks: u64,
+    pub sum_k: u64,
+    pub sum_k_eff: u64,
+    pub sum_len: u64,
+    /// Blocks by `k_eff`, in the buckets of `block_k_bucket_range`.
+    pub k_eff_buckets: [u32; 24],
+    /// Blocks whose symbols are not all one length (`k_eff < k`).
+    pub blocks_mixed: u64,
+    /// Blocks with an H.264 source, and of those the ones with `k_eff != k`.
+    pub blocks_h264: u64,
+    pub blocks_h264_k_eff_ne_k: u64,
+    /// Rows the sizer decided over those blocks, the count cap's rows
+    /// (`ceil(k / 4)`, 1..=32) over the same blocks, and the rows of the
+    /// declined-share trim among the decided ones.
+    pub rows_decided: u64,
+    pub rows_count_cap: u64,
+    pub rows_trim: u64,
+    /// The rule's own rows (before trim and the step limit) over the same
+    /// blocks, and the blocks by exact `k`.
+    pub rows_rule: u64,
+    pub k_hist: [u32; 256],
+    /// Rows and wire bytes sent, by cause (`row_cause_name`).
+    pub rows: [u64; 5],
+    pub bytes: [u64; 5],
+    /// The initial rows' payload bytes (thousandths) at `sum(len) / k` per
+    /// row, and the padding above that; their headers in whole bytes.
+    pub initial_ideal_milli: u64,
+    pub initial_pad_milli: u64,
+    pub initial_header_bytes: u64,
+    /// Blocks the cap on `r` by symbol bytes bound (TB1).
+    pub adapt_cap_bytes: u64,
+}
+
+impl Default for BlockRepairSplit {
+    fn default() -> Self {
+        Self {
+            blocks: 0,
+            sum_k: 0,
+            sum_k_eff: 0,
+            sum_len: 0,
+            k_eff_buckets: [0; 24],
+            blocks_mixed: 0,
+            blocks_h264: 0,
+            blocks_h264_k_eff_ne_k: 0,
+            rows_decided: 0,
+            rows_count_cap: 0,
+            rows_trim: 0,
+            rows_rule: 0,
+            k_hist: [0; 256],
+            rows: [0; 5],
+            bytes: [0; 5],
+            initial_ideal_milli: 0,
+            initial_pad_milli: 0,
+            initial_header_bytes: 0,
+            adapt_cap_bytes: 0,
+        }
+    }
+}
+
 /// A plain-data snapshot of every instrument, for the log line and the
 /// harness result. `Copy` so it can ride in `TransportProbe`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -672,6 +747,8 @@ pub struct InstrumentSummary {
     /// range): what the rule's overhead is measured against.
     pub block_k_buckets: [u32; 24],
     pub block_repairs_sent: u64,
+    /// Where the repair bytes went (TB0).
+    pub block_split: BlockRepairSplit,
     pub fec_recovered_rx: u64,
     pub fec_declined_rx: u64,
     pub fec_repair_requests_rx: u64,
