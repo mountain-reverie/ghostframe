@@ -240,6 +240,7 @@ mod tests {
         let (mut srcs, mut syms) = (Vec::new(), Vec::new());
         for (i, p) in payloads.iter().enumerate() {
             let f = SourceFrame {
+                t_adv: 0,
                 last: i + 1 == k,
                 bundle_seq: base + i as u32,
                 block_id,
@@ -257,6 +258,7 @@ mod tests {
             .enumerate()
             .map(|(i, p)| {
                 RepairFrame {
+                    rtt_hint: 0,
                     bundle_seq: base + 100 + i as u32,
                     block_id,
                     k: k as u8,
@@ -385,6 +387,7 @@ mod tests {
         f.on_timeout(T);
         assert!(f.take_datagram().is_none());
         let dg = SourceFrame {
+            t_adv: 0,
             last: true,
             bundle_seq: 1,
             block_id: 1,
@@ -402,6 +405,7 @@ mod tests {
     fn idle_report_deadline_moves_into_the_future() {
         let mut f = FecRx::new();
         let dg = SourceFrame {
+            t_adv: 0,
             last: true,
             bundle_seq: 1,
             block_id: 1,

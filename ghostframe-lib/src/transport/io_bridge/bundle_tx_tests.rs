@@ -615,6 +615,7 @@ fn repair_bundle(
     use ghostframe_protocol::fec::frame::RepairFrame;
     let payload = vec![0x5a; payload_len];
     let bytes = RepairFrame {
+        rtt_hint: 0,
         bundle_seq,
         block_id: 7,
         k: 4,

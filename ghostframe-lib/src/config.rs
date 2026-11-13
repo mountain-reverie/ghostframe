@@ -300,16 +300,20 @@ impl From<Option<FecBlockParams>> for FecMode {
 pub struct FecBlockParams {
     /// Source symbols per block at most. Valid in `1..=255 - r`.
     pub k_max: u8,
-    /// Block duration in milliseconds. Valid in `1..=20`: the client's
-    /// recovery window is fixed at 43 ms, and a block must end well inside it.
+    /// Block duration in milliseconds. Valid in `1..=50` (`T_MS_MAX`): the block advertises its
+    /// span, and the client's first window follows it.
     pub t_ms: u8,
     /// Repair symbols per block. Valid in `1..=32`.
     pub r: u8,
 }
 
 impl FecBlockParams {
-    /// The longest `t_ms` the knob accepts.
-    pub(crate) const T_MS_MAX: u8 = 20;
+    /// The longest `t_ms` the knob accepts. The advertised span table tops out
+    /// at 66 ms and a block advertises `t_ms` plus the queue allowance, so 50 is
+    /// the last value that still fits (asserted below). The adaptive ladder
+    /// caps lower (`adapt_size::T_MAX_MS`, 20): this range serves the split of
+    /// a frame into interleaved blocks, not the narrow and wide notches.
+    pub(crate) const T_MS_MAX: u8 = 50;
 
     /// Parse `k_max,t_ms,r`. `None` for anything out of range or malformed.
     fn parse(raw: &str) -> Option<Self> {
@@ -324,6 +328,10 @@ impl FecBlockParams {
         valid.then_some(Self { k_max, t_ms, r })
     }
 }
+
+const _: () = assert!(
+    FecBlockParams::T_MS_MAX as u128 + crate::transport::admission::QUEUE_TARGET.as_millis() <= 66
+);
 
 /// `GHOSTFRAME_FEC_BLOCKS`: unset, empty, `off` or `0` is off; `adaptive` is
 /// adaptive. A value that does not parse or is out of range warns and is off.
@@ -343,7 +351,7 @@ fn fec_blocks_from_lookup(get: &impl Fn(&str) -> Option<String>) -> FecMode {
         tracing::warn!(
             target: "ghostframe::config",
             value = %raw,
-            "GHOSTFRAME_FEC_BLOCKS is not off, adaptive or k_max,t_ms,r with r in 1..=32, k_max in 1..=255-r, t_ms in 1..=20: FEC blocks are off"
+            "GHOSTFRAME_FEC_BLOCKS is not off, adaptive or k_max,t_ms,r with r in 1..=32, k_max in 1..=255-r, t_ms in 1..=50: FEC blocks are off"
         );
     }
     parsed.into()
@@ -1556,6 +1564,11 @@ mod tests {
                 r: 32
             })
         );
+        assert_eq!(
+            parse("64,50,2").map(|p| p.t_ms),
+            Some(50),
+            "the advertised table's last span still fits"
+        );
         for off in ["", "off", "0"] {
             assert_eq!(parse(off), None, "{off:?} is off");
         }
@@ -1582,7 +1595,7 @@ mod tests {
             "64,5,33",  // r over 32
             "254,5,2",  // k_max over 255 - r
             "64,0,2",   // t_ms 0
-            "64,34,2",  // t_ms over 20
+            "64,51,2",  // t_ms over 50
             "0,5,2",    // k_max 0
             "64,5",     // missing field
             "64,5,2,1", // extra field

@@ -30,6 +30,7 @@ use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use ghostframe_protocol::fec::feedback::RepairAsk;
+use ghostframe_protocol::fec::timing;
 
 use crate::transport::reliable_emitter::Content;
 
@@ -48,12 +49,6 @@ pub(crate) const RESOLVED_TOMBSTONES: usize = 4096;
 /// ledger never resolves the bundle. Past the longest verdict lag seen (2.6 s)
 /// and the ledger's own retention.
 pub(crate) const TOMBSTONE_RETENTION: Duration = Duration::from_secs(10);
-/// Mirrors client-core `FEC_RX_DEFAULT_T_ADV_US` (33 ms).
-pub(crate) const CLIENT_T_ADV: Duration = Duration::from_millis(33);
-/// Mirrors client-core `FEC_RX_ALLOWANCE_US` (10 ms). The client's request
-/// window is `T_ADV + ALLOWANCE` = 43 ms from the block's first arrival.
-pub(crate) const CLIENT_ALLOWANCE: Duration = Duration::from_millis(10);
-pub(crate) const CLIENT_WINDOW: Duration = Duration::from_millis(43);
 /// The web client batches datagrams once per animation frame (rev 6 2.2).
 pub(crate) const RAF_ALLOWANCE: Duration = Duration::from_millis(17);
 /// Deferred-tile alarm (rev 5 4.9.5).
@@ -69,6 +64,13 @@ pub(crate) struct Rtt {
     pub srtt: Duration,
     pub rttvar: Duration,
     pub max_ack_delay: Duration,
+    /// The estimator has a sample. Without one no hint was sent, so the client
+    /// uses its unadvertised request round and so must the server.
+    pub has_sample: bool,
+    /// The largest RTT hint code the server sent in the last 2 s (a client
+    /// keeps the last hint it saw, which can lag the fresh srtt). Read only
+    /// with `has_sample`.
+    pub hint_code: u8,
 }
 
 impl Default for Rtt {
@@ -77,21 +79,52 @@ impl Default for Rtt {
             srtt: Duration::from_millis(50),
             rttvar: Duration::from_millis(10),
             max_ack_delay: Duration::ZERO,
+            has_sample: false,
+            hint_code: 0,
         }
     }
 }
 
-/// `last symbol sent + 2 x 43 ms + srtt + max_ack_delay`.
-pub(crate) fn tile_deadline(last_sent: Instant, r: Rtt) -> Instant {
-    last_sent + 2 * CLIENT_WINDOW + r.srtt + r.max_ack_delay
+fn us(v: u64) -> Duration {
+    Duration::from_micros(v)
 }
-/// `last symbol sent + 66 ms + srtt + max_ack_delay + RAF_ALLOWANCE`.
-pub(crate) fn h264_deadline(last_sent: Instant, r: Rtt) -> Instant {
-    last_sent + 2 * CLIENT_T_ADV + r.srtt + r.max_ack_delay + RAF_ALLOWANCE
+
+impl Rtt {
+    /// How long the client waits for a requested row: its request round for
+    /// the hint code the server sent, and never less than the round of a client
+    /// that has seen no hint at all (43 ms, longer than a hint of up to 11 ms
+    /// gives): the first blocks after a session starts can reach a client that
+    /// has not yet received a REPAIR, whatever the server has queued.
+    fn round(&self) -> Duration {
+        let hint = if self.has_sample { self.hint_code } else { 0 };
+        us(timing::request_round_us(hint).max(timing::request_round_us(0)))
+    }
 }
-/// `last symbol sent + 43 ms + srtt + 2 rttvar`.
-fn t_lr_at(last_sent: Instant, r: Rtt) -> Instant {
-    last_sent + CLIENT_WINDOW + r.srtt + 2 * r.rttvar
+
+/// The span before the client asks: `T_adv` plus the allowance, from the
+/// block's first arrival.
+fn first_window(t_adv: u8) -> Duration {
+    us(timing::first_window_us(t_adv))
+}
+
+/// `last symbol sent + a + R + srtt + max_ack_delay`: the client's first
+/// window, then its request round (`R`), then the path back.
+pub(crate) fn tile_deadline(last_sent: Instant, r: Rtt, t_adv: u8) -> Instant {
+    last_sent + first_window(t_adv) + r.round() + r.srtt + r.max_ack_delay
+}
+/// `last symbol sent + T_adv + (R - A) + srtt + max_ack_delay + RAF_ALLOWANCE`:
+/// three milliseconds before the tile deadline for every code and hint (`2 A - RAF`).
+pub(crate) fn h264_deadline(last_sent: Instant, r: Rtt, t_adv: u8) -> Instant {
+    last_sent
+        + us(timing::t_adv_us(t_adv))
+        + r.round().saturating_sub(us(timing::allowance_us()))
+        + r.srtt
+        + r.max_ack_delay
+        + RAF_ALLOWANCE
+}
+/// `last symbol sent + a + srtt + 2 rttvar`.
+fn t_lr_at(last_sent: Instant, r: Rtt, t_adv: u8) -> Instant {
+    last_sent + first_window(t_adv) + r.srtt + 2 * r.rttvar
 }
 fn h264_alarm_at(deferred_at: Instant, r: Rtt) -> Instant {
     deferred_at + 2 * r.srtt + H264_DEFERRAL_SLACK
@@ -197,6 +230,8 @@ pub(crate) struct ClosedBlock {
     pub repairs_queued: usize,
     /// When the last symbol of the block was sent.
     pub last_sent: Instant,
+    /// The `T_adv` code the block's sources carried (the client's window follows it).
+    pub t_adv: u8,
 }
 
 /// Counters; the names are the plan's.
@@ -264,21 +299,24 @@ impl TimerKind {
         self as usize
     }
     /// The constant part of the deadline, added to `last_sent` (or, for the
-    /// alarms, `deferred_at`).
-    fn offset(self) -> Duration {
+    /// alarms, `deferred_at`). It is the block's own: the client's window
+    /// follows the span the block advertised.
+    fn offset(self, b: &Block) -> Duration {
         match self {
-            TimerKind::TLr => CLIENT_WINDOW,
-            TimerKind::TileRelease => 2 * CLIENT_WINDOW,
-            TimerKind::H264Release => 2 * CLIENT_T_ADV + RAF_ALLOWANCE,
+            TimerKind::TLr | TimerKind::TileRelease => first_window(b.t_adv),
+            TimerKind::H264Release => us(timing::t_adv_us(b.t_adv)) + RAF_ALLOWANCE,
             TimerKind::H264Alarm => H264_DEFERRAL_SLACK,
             TimerKind::TDef => T_DEF,
         }
     }
-    /// The part that follows the RTT.
+    /// The part that follows the path, the same for every block.
     fn slack(self, r: Rtt) -> Duration {
         match self {
             TimerKind::TLr => r.srtt + 2 * r.rttvar,
-            TimerKind::TileRelease | TimerKind::H264Release => r.srtt + r.max_ack_delay,
+            TimerKind::TileRelease => r.round() + r.srtt + r.max_ack_delay,
+            TimerKind::H264Release => {
+                r.round().saturating_sub(us(timing::allowance_us())) + r.srtt + r.max_ack_delay
+            }
             TimerKind::H264Alarm => 2 * r.srtt,
             TimerKind::TDef => Duration::ZERO,
         }
@@ -315,6 +353,8 @@ struct Block {
     phase: Phase,
     k: u8,
     r: u8,
+    /// The `T_adv` code of the block's sources; set when the block closes.
+    t_adv: u8,
     sources: Vec<Src>,
     symbols: Vec<Vec<u8>>,
     sym_bytes: usize,
@@ -345,8 +385,55 @@ struct Entry {
 /// Close reasons kept for the controller between two reads.
 const CLOSE_LOG_CAP: usize = 1024;
 
+/// The largest RTT hint code sent in a recent window: two buckets of one
+/// second, so a sample is kept at least 1 s and at most 2 s. Releases are
+/// computed from it, not from the fresh srtt, because the client keeps the
+/// last hint it saw, which can be seconds behind a rising round trip.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HintTracker {
+    start: Option<Instant>,
+    cur: u8,
+    prev: u8,
+}
+
+impl HintTracker {
+    const BUCKET: Duration = Duration::from_secs(1);
+
+    fn roll(&mut self, now: Instant) {
+        let Some(start) = self.start else {
+            self.start = Some(now);
+            return;
+        };
+        let n = now.saturating_duration_since(start).as_nanos() / Self::BUCKET.as_nanos();
+        match n {
+            0 => {}
+            1 => {
+                self.prev = self.cur;
+                self.cur = 0;
+                self.start = Some(start + Self::BUCKET);
+            }
+            _ => {
+                self.prev = 0;
+                self.cur = 0;
+                self.start = Some(now);
+            }
+        }
+    }
+
+    pub(crate) fn note(&mut self, code: u8, now: Instant) {
+        self.roll(now);
+        self.cur = self.cur.max(code);
+    }
+
+    pub(crate) fn max(&mut self, now: Instant) -> u8 {
+        self.roll(now);
+        self.cur.max(self.prev)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct BlockTable {
+    hints: HintTracker,
     blocks: HashMap<BlockId, Block>,
     by_bundle: HashMap<u32, Entry>,
     /// Newest source carrying each tile pass; stale values are checked
@@ -412,6 +499,11 @@ impl BlockTable {
             cached_bytes: 0,
             next_born: 0,
             rtt: Rtt::default(),
+            hints: HintTracker {
+                start: None,
+                cur: 0,
+                prev: 0,
+            },
             max_blocks,
             max_bytes,
             tomb_cap,
@@ -427,6 +519,14 @@ impl BlockTable {
     }
     pub(crate) fn cached_bytes(&self) -> usize {
         self.cached_bytes
+    }
+    /// A REPAIR left carrying RTT hint `code`.
+    pub(crate) fn note_hint_sent(&mut self, code: u8, now: Instant) {
+        self.hints.note(code, now);
+    }
+    /// The largest hint code sent in the last 1 to 2 s (0 when none).
+    pub(crate) fn recent_hint(&mut self, now: Instant) -> u8 {
+        self.hints.max(now)
     }
     pub(crate) fn set_rtt(&mut self, rtt: Rtt) {
         self.rtt = rtt;
@@ -508,6 +608,7 @@ impl BlockTable {
             phase: Phase::Sending,
             k: 0,
             r: 0,
+            t_adv: 0,
             sources: Vec::new(),
             symbols: Vec::new(),
             sym_bytes: 0,
@@ -561,6 +662,7 @@ impl BlockTable {
         };
         b.k = c.k;
         b.r = c.r;
+        b.t_adv = c.t_adv;
         b.next_row = u16::from(c.r);
         b.sym_bytes = c.symbols.iter().map(Vec::len).sum();
         self.cached_bytes += b.sym_bytes;
@@ -848,7 +950,7 @@ impl BlockTable {
                 Phase::Sending => {}
                 Phase::Repair => {
                     let last = b.last_sent.unwrap_or(now);
-                    if b.t_lr_armed && now >= t_lr_at(last, rtt) {
+                    if b.t_lr_armed && now >= t_lr_at(last, rtt, b.t_adv) {
                         b.t_lr_armed = false;
                         self.stats.t_lr_fired += 1;
                         if let Some(a) = next_extra_row(id, &mut b) {
@@ -859,8 +961,8 @@ impl BlockTable {
                         .filter(|&i| self.src_open(&b, i))
                         .filter(|&i| {
                             let d = match b.sources[i].kind {
-                                Kind::Tile => tile_deadline(last, rtt),
-                                Kind::H264 => h264_deadline(last, rtt),
+                                Kind::Tile => tile_deadline(last, rtt, b.t_adv),
+                                Kind::H264 => h264_deadline(last, rtt, b.t_adv),
                             };
                             now >= d
                         })
@@ -944,7 +1046,7 @@ impl BlockTable {
             TimerKind::TLr | TimerKind::TileRelease | TimerKind::H264Release => b.last_sent,
             TimerKind::H264Alarm | TimerKind::TDef => b.deferred_at,
         };
-        if base.map(|t| t + kind.offset()) != Some(key) {
+        if base.map(|t| t + kind.offset(b)) != Some(key) {
             return false;
         }
         let open_of = |k: Kind| {
@@ -975,12 +1077,12 @@ impl BlockTable {
             Phase::Repair => {
                 let Some(last) = b.last_sent else { return };
                 if b.t_lr_armed {
-                    push.push((TimerKind::TLr, last + TimerKind::TLr.offset()));
+                    push.push((TimerKind::TLr, last + TimerKind::TLr.offset(b)));
                 }
                 for k in [Kind::Tile, Kind::H264] {
                     if kinds(k) {
                         let t = TimerKind::release(k);
-                        push.push((t, last + t.offset()));
+                        push.push((t, last + t.offset(b)));
                     }
                 }
             }
@@ -989,7 +1091,7 @@ impl BlockTable {
                 for k in [Kind::Tile, Kind::H264] {
                     if kinds(k) {
                         let t = TimerKind::alarm(k);
-                        push.push((t, at + t.offset()));
+                        push.push((t, at + t.offset(b)));
                     }
                 }
             }
@@ -1222,6 +1324,8 @@ mod tests {
             srtt: ms(srtt_ms),
             rttvar: ms(5),
             max_ack_delay: ms(0),
+            has_sample: false,
+            hint_code: 0,
         }
     }
     fn tile(i: u32) -> Content {
@@ -1266,6 +1370,7 @@ mod tests {
                 repair_bundles: (0..u32::from(r)).map(|j| 200 + j).collect(),
                 repairs_queued: 0,
                 last_sent: t0,
+                t_adv: 0,
             },
             t0,
         );
@@ -1386,7 +1491,7 @@ mod tests {
         let mut t = setup(3, 1, tile, t0);
         t.on_arrival(100, t0);
         let r = rtt(50);
-        let d = tile_deadline(t0, r);
+        let d = tile_deadline(t0, r, 0);
         assert!(t.next_deadline().is_some());
         assert_eq!(handoffs(&t.on_timer(d - ms(1), r)), 0);
         let a = t.on_timer(d, r);
@@ -1418,7 +1523,7 @@ mod tests {
         t.on_arrival(200, t0);
         assert_eq!(t.blocks[&BLK].phase, Phase::Deferred);
         let r = rtt(50);
-        let a = t.on_timer(tile_deadline(t0, r) + ms(1000), r);
+        let a = t.on_timer(tile_deadline(t0, r, 0) + ms(1000), r);
         assert_eq!(handoffs(&a), 0);
         assert!(t.is_open(BLK));
         // T_def is the alarm: hands off and counts
@@ -1445,7 +1550,7 @@ mod tests {
             now += ms(1);
         }
         assert!(
-            now > h264_deadline(t0, r),
+            now > h264_deadline(t0, r, 0),
             "the loop must cross the deadline"
         );
         let a = t.on_timer(alarm, r);
@@ -1477,7 +1582,7 @@ mod tests {
         let t0 = Instant::now();
         let r = rtt(50);
         let mut t = setup(2, 1, frag, t0);
-        let a = t.on_timer(h264_deadline(t0, r), r);
+        let a = t.on_timer(h264_deadline(t0, r, 0), r);
         assert_eq!(losts(&a), 2);
     }
 
@@ -1516,6 +1621,7 @@ mod tests {
                 repair_bundles: vec![],
                 repairs_queued: 0,
                 last_sent: t0,
+                t_adv: 0,
             },
             t0,
         );
@@ -1529,7 +1635,7 @@ mod tests {
     fn t_lr_fires_once_and_each_cancel_stops_it() {
         let t0 = Instant::now();
         let r = rtt(50);
-        let due = t_lr_at(t0, r);
+        let due = t_lr_at(t0, r, 0);
         // fires once, row = next unused (r = 2 -> row 2)
         let mut t = setup(4, 2, tile, t0);
         t.set_rtt(r);
@@ -1580,6 +1686,7 @@ mod tests {
                     repair_bundles: vec![base + 5],
                     repairs_queued: 0,
                     last_sent: t0,
+                    t_adv: 0,
                 },
                 t0,
             );
@@ -1659,7 +1766,7 @@ mod tests {
         assert_eq!(t.stats().have_mismatch, 1);
         // and the deadline acts again
         let r = rtt(50);
-        assert_eq!(handoffs(&t.on_timer(tile_deadline(t0, r), r)), 1);
+        assert_eq!(handoffs(&t.on_timer(tile_deadline(t0, r, 0), r)), 1);
     }
 
     #[test]
@@ -1681,7 +1788,8 @@ mod tests {
                     symbols: vec![],
                     repair_bundles: vec![9],
                     repairs_queued: 0,
-                    last_sent: t0
+                    last_sent: t0,
+                    t_adv: 0
                 },
                 t0
             )
@@ -1721,6 +1829,7 @@ mod tests {
                     repair_bundles: (0..u32::from(nr)).map(|j| 20_000 + j).collect(),
                     repairs_queued: 0,
                     last_sent: t0,
+                    t_adv: 0,
                 },
                 t0,
             );
@@ -1828,6 +1937,7 @@ mod tests {
                     repair_bundles: vec![],
                     repairs_queued: 0,
                     last_sent: now,
+                    t_adv: 0,
                 },
                 now,
             );
@@ -1843,11 +1953,11 @@ mod tests {
         let r = rtt(50);
         let mut t = setup(2, 1, frag, t0);
         // Nothing arrives: the deadline releases both H.264 sources to the manager.
-        let a = t.on_timer(h264_deadline(t0, r), r);
+        let a = t.on_timer(h264_deadline(t0, r, 0), r);
         assert_eq!(losts(&a), 2);
         assert_eq!(t.on_verdict(100), VerdictAction::Skip);
         // 5000 later bundles within the 2.6 s the ledger can lag.
-        let later = h264_deadline(t0, r) + ms(2000);
+        let later = h264_deadline(t0, r, 0) + ms(2000);
         churn(&mut t, 5000, 1000, 50_000, later);
         assert_eq!(
             t.on_verdict(100),
@@ -1870,7 +1980,7 @@ mod tests {
         let t0 = Instant::now();
         let r = rtt(50);
         let mut t = setup(2, 1, frag, t0);
-        t.on_timer(h264_deadline(t0, r), r);
+        t.on_timer(h264_deadline(t0, r, 0), r);
         // Younger than the retention: kept. Past it: gone.
         t.on_timer(t0 + TOMBSTONE_RETENTION - ms(1), r);
         t.prune_tombstones();
@@ -1887,6 +1997,7 @@ mod tests {
                 repair_bundles: vec![],
                 repairs_queued: 0,
                 last_sent: t0,
+                t_adv: 0,
             },
             t0,
         );
@@ -1912,6 +2023,7 @@ mod tests {
                     repair_bundles: vec![],
                     repairs_queued: 0,
                     last_sent: now,
+                    t_adv: 0,
                 },
                 now,
             );
@@ -1934,24 +2046,54 @@ mod tests {
                 repair_bundles: vec![200],
                 repairs_queued: 0,
                 last_sent: t0,
+                t_adv: 0,
             },
             t0,
         );
         t.set_rtt(r);
         // T_lr (43 ms + srtt + 2 rttvar) comes first; past it the next is the
         // H.264 release, ahead of the tile one.
-        t.on_timer(t_lr_at(t0, r), r);
-        assert_eq!(t.next_deadline(), Some(h264_deadline(t0, r)));
-        assert!(h264_deadline(t0, r) < tile_deadline(t0, r), "premise");
+        t.on_timer(t_lr_at(t0, r, 0), r);
+        assert_eq!(t.next_deadline(), Some(h264_deadline(t0, r, 0)));
+        assert!(h264_deadline(t0, r, 0) < tile_deadline(t0, r, 0), "premise");
         // At the H.264 deadline the mixed bundle goes (to the manager and to
         // ARQ); the pure tile source does not.
-        let a = t.on_timer(h264_deadline(t0, r), r);
+        let a = t.on_timer(h264_deadline(t0, r, 0), r);
         assert_eq!((losts(&a), handoffs(&a)), (1, 1));
         assert_eq!(t.outcome(100), Some(Outcome::Lost));
         assert_eq!(t.outcome(101), None);
     }
 
     /// The old whole-table walk, for the property test to compare against.
+    // The documented numbers, written out: the oracle must be able to disagree
+    // with the production helpers, so it does not call them.
+    const ORACLE_T_ADV_MS: [u64; 8] = [33, 10, 15, 20, 25, 40, 50, 66];
+    const ORACLE_HINT_US: [u64; 16] = [
+        0, 4_000, 5_657, 8_000, 11_314, 16_000, 22_627, 32_000, 45_255, 64_000, 90_510, 128_000,
+        181_019, 256_000, 362_039, 512_000,
+    ];
+    fn oracle_round(r: Rtt) -> Duration {
+        let h = if r.has_sample { r.hint_code } else { 0 };
+        // hint + 30 ms, and never below the 43 ms of a client that has seen no hint.
+        (Duration::from_micros(ORACLE_HINT_US[usize::from(h)]) + ms(30)).max(ms(43))
+    }
+    fn oracle_tile(last: Instant, r: Rtt, code: u8) -> Instant {
+        last + ms(ORACLE_T_ADV_MS[usize::from(code)] + 10)
+            + oracle_round(r)
+            + r.srtt
+            + r.max_ack_delay
+    }
+    fn oracle_h264(last: Instant, r: Rtt, code: u8) -> Instant {
+        last + ms(ORACLE_T_ADV_MS[usize::from(code)])
+            + (oracle_round(r) - ms(10))
+            + r.srtt
+            + r.max_ack_delay
+            + ms(17)
+    }
+    fn oracle_t_lr(last: Instant, r: Rtt, code: u8) -> Instant {
+        last + ms(ORACLE_T_ADV_MS[usize::from(code)] + 10) + r.srtt + 2 * r.rttvar
+    }
+
     fn brute_next_deadline(t: &BlockTable) -> Option<Instant> {
         let rtt = t.rtt;
         let mut best: Option<Instant> = None;
@@ -1962,13 +2104,13 @@ mod tests {
                 Phase::Repair => {
                     let Some(last) = b.last_sent else { continue };
                     if b.t_lr_armed {
-                        take(t_lr_at(last, rtt));
+                        take(oracle_t_lr(last, rtt, b.t_adv));
                     }
                     for (i, s) in b.sources.iter().enumerate() {
                         if t.src_open(b, i) {
                             take(match s.kind {
-                                Kind::Tile => tile_deadline(last, rtt),
-                                Kind::H264 => h264_deadline(last, rtt),
+                                Kind::Tile => oracle_tile(last, rtt, b.t_adv),
+                                Kind::H264 => oracle_h264(last, rtt, b.t_adv),
                             });
                         }
                     }
@@ -2004,10 +2146,14 @@ mod tests {
             seed % n
         };
         let t0 = Instant::now();
-        let r = rtt(40);
         let mut released_total = 0usize;
         let mut checked_verdicts = 0usize;
         for round in 0..300u32 {
+            // Blocks of mixed spans, and a path with or without a sample and hint.
+            let mut r = rtt(40);
+            r.has_sample = rnd(2) == 0;
+            r.hint_code = rnd(16) as u8;
+            let codes = [rnd(8) as u8, rnd(8) as u8];
             let mut t = BlockTable::with_caps(1, usize::MAX, FEC_TX_TOMBSTONES);
             t.set_rtt(r);
             let ids: [BlockId; 2] = [10, 11];
@@ -2051,6 +2197,7 @@ mod tests {
                             .collect(),
                         repairs_queued: 0,
                         last_sent: now,
+                        t_adv: codes[bi],
                     },
                     now,
                 )
@@ -2147,32 +2294,155 @@ mod tests {
         assert!(checked_verdicts > 1000);
     }
 
-    /// The server's picture of the client's recovery window must be the
-    /// client's own, and a block (knob `t_ms`) plus the queue it waits in must
-    /// end inside the advertised part of that window.
+    /// With code 0 and no hint the deadlines are today's values exactly. This
+    /// replaces the test that mirrored the client's constants.
     #[test]
-    fn the_server_and_the_client_agree_on_the_recovery_window() {
-        use ghostframe_client_core::fec_rx::{FEC_RX_ALLOWANCE_US, FEC_RX_DEFAULT_T_ADV_US};
-        assert_eq!(CLIENT_T_ADV.as_micros() as u64, FEC_RX_DEFAULT_T_ADV_US);
-        assert_eq!(CLIENT_ALLOWANCE.as_micros() as u64, FEC_RX_ALLOWANCE_US);
-        assert_eq!(
-            CLIENT_WINDOW.as_micros() as u64,
-            FEC_RX_DEFAULT_T_ADV_US + FEC_RX_ALLOWANCE_US
-        );
-        let t = Duration::from_millis(u64::from(crate::config::FecBlockParams::T_MS_MAX));
-        assert!(
-            t + crate::transport::admission::QUEUE_TARGET
-                < Duration::from_micros(FEC_RX_DEFAULT_T_ADV_US),
-            "a block's span plus the queue must leave jitter room inside T_adv"
-        );
-        // The deadlines are built on that window: neither may fall inside it.
-        let now = Instant::now();
-        let zero = Rtt {
-            srtt: Duration::ZERO,
-            rttvar: Duration::ZERO,
-            max_ack_delay: Duration::ZERO,
+    fn with_code_zero_and_no_hint_the_deadlines_equal_the_pre_s1_values() {
+        let t0 = Instant::now();
+        for (srtt, var, mad) in [(50u64, 10u64, 0u64), (0, 0, 0), (20, 5, 7), (300, 40, 25)] {
+            let r = Rtt {
+                srtt: ms(srtt),
+                rttvar: ms(var),
+                max_ack_delay: ms(mad),
+                has_sample: false,
+                hint_code: 0,
+            };
+            assert_eq!(tile_deadline(t0, r, 0), t0 + ms(86 + srtt + mad));
+            assert_eq!(h264_deadline(t0, r, 0), t0 + ms(83 + srtt + mad));
+            assert_eq!(t_lr_at(t0, r, 0), t0 + ms(43 + srtt + 2 * var));
+            // A sample with no hint sent yet changes nothing either.
+            let with = Rtt {
+                has_sample: true,
+                ..r
+            };
+            assert_eq!(tile_deadline(t0, with, 0), tile_deadline(t0, r, 0));
+        }
+    }
+
+    /// Before an RTT sample the round is the unadvertised 43 ms, whatever the
+    /// tracker says; the has-sample flag is what says so.
+    #[test]
+    fn the_request_round_is_43_ms_until_there_is_a_sample() {
+        let t0 = Instant::now();
+        let base = Rtt {
+            hint_code: 15,
+            ..rtt(40)
         };
-        assert!(tile_deadline(now, zero) >= now + 2 * CLIENT_WINDOW);
-        assert!(h264_deadline(now, zero) >= now + 2 * CLIENT_T_ADV);
+        assert!(!base.has_sample);
+        assert_eq!(tile_deadline(t0, base, 0), t0 + ms(86 + 40));
+        let sampled = Rtt {
+            has_sample: true,
+            ..base
+        };
+        // Hint 15 is 512 ms, plus the 30 ms margin, in place of 43.
+        assert_eq!(tile_deadline(t0, sampled, 0), t0 + ms(43 + 512 + 30 + 40));
+    }
+
+    /// `h264_deadline` is three milliseconds before `tile_deadline` for every
+    /// code and hint, and neither falls inside the first window.
+    #[test]
+    fn the_h264_deadline_is_three_ms_before_the_tile_one_for_every_code_and_hint() {
+        let t0 = Instant::now();
+        for code in 0..8u8 {
+            for hint in 0..16u8 {
+                for has_sample in [false, true] {
+                    let r = Rtt {
+                        has_sample,
+                        hint_code: hint,
+                        ..rtt(25)
+                    };
+                    let (tile, h264) = (tile_deadline(t0, r, code), h264_deadline(t0, r, code));
+                    assert_eq!(tile - h264, ms(3), "code {code} hint {hint}");
+                    let a = ms(ORACLE_T_ADV_MS[usize::from(code)] + 10);
+                    assert!(tile >= t0 + a + r.srtt);
+                    assert!(h264 >= t0 + a + r.srtt);
+                    assert_eq!(tile, oracle_tile(t0, r, code));
+                    assert_eq!(h264, oracle_h264(t0, r, code));
+                    assert_eq!(t_lr_at(t0, r, code), oracle_t_lr(t0, r, code));
+                }
+            }
+        }
+    }
+
+    /// A client keeps the last hint it received, which can be older than the
+    /// server's view of the path. Whatever hint the client holds (`c`) and the
+    /// server's recent maximum (`h >= c`), the server's release comes after
+    /// the client's own window and request round.
+    #[test]
+    fn the_deadline_covers_a_client_holding_a_stale_hint() {
+        let t0 = Instant::now();
+        let (mut client_lower, mut client_higher) = (0usize, 0usize);
+        for code in 0..8u8 {
+            for srtt_ms in [4u64, 30, 90, 300] {
+                // The hint the fresh srtt alone would give.
+                let fresh = (1..16usize)
+                    .find(|&i| ORACLE_HINT_US[i] >= srtt_ms * 1_000)
+                    .unwrap_or(15) as u8;
+                for c in 0..16u8 {
+                    for h in c..16u8 {
+                        let r = Rtt {
+                            has_sample: true,
+                            hint_code: h,
+                            ..rtt(srtt_ms)
+                        };
+                        // What the client waits: its window, then its round for `c`.
+                        let client_round = match ORACLE_HINT_US[usize::from(c)] {
+                            0 => ms(43),
+                            us => Duration::from_micros(us) + ms(30),
+                        };
+                        let first = ms(ORACLE_T_ADV_MS[usize::from(code)] + 10);
+                        let need = t0 + first + client_round + r.srtt;
+                        assert!(
+                            tile_deadline(t0, r, code) >= need,
+                            "code {code} srtt {srtt_ms} client hint {c} server hint {h}"
+                        );
+                        if c != 0 && c < fresh {
+                            client_lower += 1;
+                        }
+                        if c > fresh {
+                            client_higher += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(client_lower > 100, "premise: clients below the fresh hint");
+        assert!(client_higher > 100, "premise: clients above the fresh hint");
+    }
+
+    #[test]
+    fn the_hint_tracker_keeps_a_sample_between_one_and_two_seconds() {
+        let t0 = Instant::now();
+        let mut h = HintTracker {
+            start: None,
+            cur: 0,
+            prev: 0,
+        };
+        assert_eq!(h.max(t0), 0);
+        h.note(9, t0);
+        h.note(4, t0 + ms(100));
+        assert_eq!(h.max(t0 + ms(200)), 9, "the largest, not the last");
+        assert_eq!(h.max(t0 + ms(1_900)), 9, "kept for at least one second");
+        // Past two seconds with nothing new, it is gone.
+        assert_eq!(h.max(t0 + ms(3_100)), 0);
+        // A lower later hint does not hide a higher recent one, and a sample
+        // dies without being refreshed.
+        h.note(12, t0 + ms(4_000));
+        h.note(3, t0 + ms(4_900));
+        assert_eq!(
+            h.max(t0 + ms(4_999)),
+            12,
+            "a sample under a second old is kept"
+        );
+        assert_eq!(h.max(t0 + ms(5_100)), 3, "the 12 aged out, the 3 is recent");
+    }
+
+    #[test]
+    fn the_table_reports_the_recent_hint_it_was_told_of() {
+        let t0 = Instant::now();
+        let mut t = BlockTable::new();
+        assert_eq!(t.recent_hint(t0), 0);
+        t.note_hint_sent(7, t0);
+        assert_eq!(t.recent_hint(t0 + ms(10)), 7);
     }
 }
