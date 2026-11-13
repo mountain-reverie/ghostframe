@@ -183,3 +183,55 @@ opt-level = 3
 # upstream (kixelated/goog_cc) takes the fix.
 [patch.crates-io]
 goog_cc = { git = "https://github.com/Bluebugs/goog_cc", rev = "14eb7a1097acdb2330630e21b89b143af24f906a" }
+
+# Size over speed for the stats panel's UI stack only (owner decision
+# 2026-11-13, docs/specs/stats-panel-design.md section 5). The protocol core
+# (ghostframe-client-core, ghostframe-protocol, ghostframe-client-wasm) keeps
+# the release profile's opt-level 3: it is on the datagram hot path.
+[profile.release.package.ghostframe-web-ui]
+opt-level = "s"
+
+[profile.release.package.leptos]
+opt-level = "s"
+
+[profile.release.package.leptos_dom]
+opt-level = "s"
+
+[profile.release.package.leptos_server]
+opt-level = "s"
+
+[profile.release.package.tachys]
+opt-level = "s"
+
+[profile.release.package.reactive_graph]
+opt-level = "s"
+
+[profile.release.package.reactive_stores]
+opt-level = "s"
+
+[profile.release.package.any_spawner]
+opt-level = "s"
+
+[profile.release.package.or_poisoned]
+opt-level = "s"
+
+[profile.release.package.throw_error]
+opt-level = "s"
+
+[profile.release.package.hydration_context]
+opt-level = "s"
+
+[profile.release.package.oco_ref]
+opt-level = "s"
+
+[profile.release.package.either_of]
+opt-level = "s"
+
+[profile.release.package.next_tuple]
+opt-level = "s"
+
+[profile.release.package.server_fn]
+opt-level = "s"
+
+[profile.release.package.send_wrapper]
+opt-level = "s"
