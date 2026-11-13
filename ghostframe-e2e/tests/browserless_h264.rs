@@ -30,6 +30,7 @@ use ghostframe_e2e::netsim::{
 };
 use ghostframe_lib::encoder::h264_harness::PcmRateModel;
 use ghostframe_lib::transport::io_bridge::IdrCause;
+use ghostframe_lib::transport::reliable_emitter::emission_queue::WireClass;
 
 const CADENCE_US: u64 = DEFAULT_CADENCE_US;
 
@@ -756,9 +757,17 @@ async fn step_summary_deep(
 ///
 ///  * `sus_est`: the first `t` on a 100 ms grid such that every estimate sample
 ///    in `[t, t + 1 s]` is at least `0.8 x` the new capacity;
-///  * `sus_use`: the same `t`, and the access units captured in `[t, t + 1 s)`
-///    total at least `0.8 x` that rate (the stream *uses* what the estimate
-///    says, so a spike nobody sent into is not a step-up).
+///  * `sus_use`: the same `t`, and the stream sent in `[t, t + 1 s)` totals at
+///    least `0.8 x` that rate (the stream *uses* what the estimate says, so a
+///    spike nobody sent into is not a step-up). The stream is the access units
+///    plus the FEC repair that rides with them: the encoder is told
+///    `0.8 x est / (1 + rho)` once repair is live (E6), so media alone can
+///    never reach the line at `rho` near 0.4 (E10: 2 % loss, `rho` 0.35 to
+///    0.42, media 2.4 to 2.8 Mbit/s against a 3.84 Mbit/s line while the
+///    estimate sat at 5 Mbit/s). The access-unit log carries no repair, so the
+///    repair is the run's own share, `repair / H.264 bytes offered`, applied
+///    to every window; with the mode off that is exactly 0 and the metric is
+///    the access units alone, as before.
 ///
 /// "Reached" (the first sample over the line) counts a transient spike: it
 /// read 96/95/95 where `sus_use` reads 24/21/18 of 32 (review 2, 2026-11-06).
@@ -776,12 +785,16 @@ fn sustained(st: &StepRun) -> (Option<u64>, Option<u64>, bool) {
             })
             .unwrap_or_default();
     let has_log = !aus.is_empty();
+    // Repair rides with the media: its run-level share of the H.264 bytes.
+    let offered = &st.r.transport.instr.offered;
+    let rho = offered.of(WireClass::Repair) as f64 / offered.of(WireClass::H264).max(1) as f64;
     let enc_bps = |from: u64| -> f64 {
         aus.iter()
             .filter(|(t, _)| (from..from + 1_000_000).contains(t))
             .map(|a| a.1)
             .sum::<usize>() as f64
             * 8.0
+            * (1.0 + rho)
     };
     let end = st.post.last().map_or(STEP_AT_US, |x| x.0);
     let (mut sus_est, mut sus_use) = (None, None);
