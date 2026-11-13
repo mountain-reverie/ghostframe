@@ -1723,3 +1723,25 @@ mod bandwidth_fit {
         assert_eq!(c.first_pass().state_bytes(CDF53), learned);
     }
 }
+
+#[test]
+fn the_reason_of_the_last_mode_decision_is_kept_for_readers() {
+    let mut c = Classifier::new(ClassifierConfig::default());
+    assert_eq!(
+        c.last_decision_reason(),
+        "none",
+        "before any decision there is nothing to report"
+    );
+    let mode = c.decide_frame_mode_at(0, &[], FrameMode::TileCodec);
+    assert_eq!(
+        c.last_emitted_mode(),
+        Some(mode),
+        "premise: a decision was recorded"
+    );
+    let reason = c.last_decision_reason();
+    assert_ne!(
+        reason, "none",
+        "the reason `decide_inner` returned is stored"
+    );
+    assert!(!reason.is_empty());
+}
