@@ -28,9 +28,22 @@ pub(crate) const FEC_LOSS_FLOOR: f64 = 0.001;
 /// Estimator window in datagrams: the decay per report is `exp(-n / W)`. A
 /// window of 1 000 flaps at 100 Mbit/s (under 0.1 s of traffic).
 pub(crate) const FEC_ADAPT_WINDOW_DATAGRAMS: f64 = 10_000.0;
-/// Estimator window in time: the decay never falls below `exp(-dt / tau)`, so
-/// a slow link still forgets.
+/// Estimator window in time: the time decay is `exp(-dt / tau)`, so a slow
+/// link forgets, down to [`FEC_ADAPT_MIN_MASS`] (see there).
 pub(crate) const FEC_ADAPT_TAU_US: u64 = 10_000_000;
+/// Time decay may not pull the decayed `total` below this many datagrams
+/// (count decay is not limited). Why: at `L = 0` the release bound is
+/// `(Z_RELEASE + 1) / N`, which falls under the 0.001 floor only for
+/// `N > 3 330`. A window of rate x tau holds fewer datagrams than that below
+/// about 330 datagrams/s, so `N` settles under the bound and the state could
+/// never release, even with no loss at all (measured: `N` about 1 840 at 180
+/// datagrams/s, still engaged after 60 s). With the minimum the window at low
+/// rates is about this many datagrams (a slower release, `MIN_MASS / rate`
+/// seconds per e-fold); at high rates nothing changes. An idle link (`n = 0`)
+/// stops forgetting once its total is down to the minimum: acceptable, since
+/// no traffic means no repair cost, and the first report after the pause
+/// brings its own counts.
+pub(crate) const FEC_ADAPT_MIN_MASS: f64 = 5_000.0;
 /// Release is not allowed sooner than this after the last state change.
 pub(crate) const FEC_ADAPT_MIN_DWELL_US: u64 = 5_000_000;
 /// Engaging needs at least this many (decayed) losses: a stray loss never does.
@@ -115,11 +128,23 @@ impl LossEstimator {
         self.evaluate(now_us);
     }
 
+    /// The decay factor for `n` datagrams over `dt` us: the count term, or the
+    /// time term held up by the minimum mass, whichever forgets more.
+    fn decay_factor(&self, n: f64, dt: u64) -> f64 {
+        let d_count = (-n / FEC_ADAPT_WINDOW_DATAGRAMS).exp();
+        let d_time = (-(dt as f64) / FEC_ADAPT_TAU_US as f64).exp();
+        let d_floor = if self.total > 0.0 {
+            (FEC_ADAPT_MIN_MASS / self.total).min(1.0)
+        } else {
+            1.0
+        };
+        d_count.min(d_time.max(d_floor))
+    }
+
     fn decay(&mut self, n: f64, now_us: u64) {
         let dt = self.last_us.map_or(0, |l| now_us.saturating_sub(l));
         self.last_us = Some(now_us.max(self.last_us.unwrap_or(0)));
-        let e = (n / FEC_ADAPT_WINDOW_DATAGRAMS).max(dt as f64 / FEC_ADAPT_TAU_US as f64);
-        let d = (-e).exp();
+        let d = self.decay_factor(n, dt);
         self.lost *= d;
         self.total *= d;
         self.run_lost *= d;
@@ -549,6 +574,84 @@ mod tests {
         }
         assert!((e.p_hat() - 0.05).abs() < 0.01, "p_hat {}", e.p_hat());
         assert_eq!(e.state(), FloorState::Engaged);
+    }
+
+    /// Zero loss after a 5 % episode, at `dg_per_s` datagrams/s with reports
+    /// every 250 ms or 128 datagrams: seconds until the state is Clean again
+    /// (None within `limit_s`).
+    fn release_time_s(dg_per_s: f64, limit_s: f64) -> Option<f64> {
+        let mut e = LossEstimator::new();
+        let per_report = (dg_per_s * 0.25).clamp(1.0, 128.0);
+        let step_us = (per_report / dg_per_s * 1e6) as u64;
+        let mut t = 0u64;
+        // The episode: 5 % for 10 s.
+        while t < 10_000_000 {
+            let n = per_report as u16;
+            e.on_report(
+                &rep(
+                    n - (n as f64 * 0.05).ceil() as u16,
+                    (n as f64 * 0.05).ceil() as u16,
+                ),
+                false,
+                t,
+            );
+            t += step_us;
+        }
+        assert_eq!(
+            e.state(),
+            FloorState::Engaged,
+            "premise: engaged at {dg_per_s}/s"
+        );
+        let start = t;
+        while ((t - start) as f64) < limit_s * 1e6 {
+            e.on_report(&rep(per_report as u16, 0), false, t);
+            if e.state() == FloorState::Clean {
+                return Some((t - start) as f64 / 1e6);
+            }
+            t += step_us;
+        }
+        None
+    }
+
+    /// Release at zero loss is reachable at every rate, within a bound named
+    /// from the minimum mass: ln(L0 / L_release) e-folds, each of about
+    /// MIN_MASS / rate seconds at low rates (tau at high rates), plus the
+    /// dwell. L0 is at most the episode's mass (5 % of 5 000) and the release
+    /// needs L under about 1, so 6 e-folds bound it with margin.
+    #[test]
+    fn release_is_reachable_at_every_rate_within_a_bound_from_the_minimum_mass() {
+        for rate in [50.0, 100.0, 180.0, 260.0, 1_000.0, 10_000.0] {
+            let e_fold_s = (FEC_ADAPT_MIN_MASS / rate).max(FEC_ADAPT_TAU_US as f64 / 1e6);
+            let bound = 6.0 * e_fold_s + FEC_ADAPT_MIN_DWELL_US as f64 / 1e6;
+            let got = release_time_s(rate, bound * 1.5);
+            println!("release at {rate}/s: {got:?} (bound {bound:.1} s)");
+            let got = got.unwrap_or_else(|| panic!("{rate}/s: never released within {bound:.1} s"));
+            assert!(
+                got <= bound,
+                "{rate}/s: released after {got:.1} s, bound {bound:.1} s"
+            );
+        }
+    }
+
+    /// At 10 000+ datagrams/s the count term dominates and the minimum mass
+    /// never binds: the decay is bit-identical to the old formula.
+    #[test]
+    fn at_a_high_rate_the_decay_is_what_it_was_before_the_minimum_mass() {
+        let (mut e, mut old_total) = (LossEstimator::new(), 0.0f64);
+        let mut last = None::<u64>;
+        let mut t = 0u64;
+        for i in 0..4_000u32 {
+            // 1 280 datagrams per 128 ms: 10 000/s.
+            t += 128_000;
+            let (rx, lo) = (1_260u16, if i % 7 == 0 { 20 } else { 0 });
+            let n = f64::from(rx) + f64::from(lo);
+            let dt = last.map_or(0, |l| t - l);
+            last = Some(t);
+            let exp = (n / FEC_ADAPT_WINDOW_DATAGRAMS).max(dt as f64 / FEC_ADAPT_TAU_US as f64);
+            old_total = old_total * (-exp).exp() + n;
+            e.on_report(&rep(rx, lo), false, t);
+            assert_eq!(e.total().to_bits(), old_total.to_bits(), "report {i}");
+        }
     }
 
     #[test]
