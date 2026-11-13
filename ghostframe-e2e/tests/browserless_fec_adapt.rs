@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use ghostframe_client_net::ClientNetEvent;
 use ghostframe_e2e::harness::browserless::{
     run_browserless_with_options, BrowserlessResult, BrowserlessScene, H264Load, LinkOverrides,
     RunOptions, SceneLoad, DEFAULT_CADENCE_US,
@@ -18,6 +19,7 @@ use ghostframe_e2e::netsim::{Bottleneck, CapTimeline, DropPlan, NetProfile};
 use ghostframe_lib::config::FecBlockParams;
 use ghostframe_lib::encoder::h264_harness::{PcmMode, PcmRateModel};
 use ghostframe_lib::transport::drop_plan::{FragSel, FrameDropRule};
+use ghostframe_lib::transport::io_bridge::FecAdaptProbe;
 use ghostframe_lib::transport::reliable_emitter::emission_queue::WireClass;
 
 const SEEDS: [u64; 3] = [0xFB_0001, 0xFB_0002, 0xFB_0003];
@@ -540,17 +542,23 @@ enum Load {
 enum Loss {
     Clean,
     Iid(f64),
-    /// Gilbert-Elliott, loss 1 in the bad state, mean run 3 datagrams, 1 % on
-    /// average (the per-datagram chain of `Pattern::Burst`).
-    Ge3,
+    /// Gilbert-Elliott, loss 1 in the bad state, mean run `run` datagrams,
+    /// `avg` on average (the per-datagram chain of `Pattern::Burst`).
+    Ge {
+        run: u32,
+        avg: f64,
+    },
 }
+
+/// Mean run 3 at 1 % on average: the sweep's burst cell.
+const GE3: Loss = Loss::Ge { run: 3, avg: 0.01 };
 
 impl Loss {
     fn name(self) -> String {
         match self {
             Loss::Clean => "clean".into(),
             Loss::Iid(p) => format!("iid{}", p * 100.0),
-            Loss::Ge3 => "ge3at1".into(),
+            Loss::Ge { run, avg } => format!("ge{run}at{}", avg * 100.0),
         }
     }
     /// The chain's `(enter, exit)` per datagram; i.i.d. is the chain with
@@ -559,7 +567,10 @@ impl Loss {
         match self {
             Loss::Clean => None,
             Loss::Iid(p) => Some((p, 1.0 - p)),
-            Loss::Ge3 => Some((0.01 / 3.0 / 0.99, 1.0 / 3.0)),
+            Loss::Ge { run, avg } => {
+                let exit = 1.0 / f64::from(run);
+                Some((avg * exit / (1.0 - avg), exit))
+            }
         }
     }
 }
@@ -568,18 +579,23 @@ impl Loss {
 /// round trip, the loss on the frame path, and a stream that follows the
 /// estimate (H.264: the PCM encoder with the rate policy, as in the probe
 /// suites; tile: a damage window offering 0.8 x the cap).
-fn sweep_scene(
-    load: Load,
-    loss: Loss,
-    cap_mbit: u64,
-    seed: u64,
-    ms: u64,
-) -> (BrowserlessScene, LinkOverrides) {
+///
+/// `scale` multiplies the offered load (tile: tiles per tick; H.264: the PCM
+/// frame size); 1.0 is the grid's. The matched control of criterion (6) is the
+/// mode-off arm run at the scale that gives it the adaptive arm's
+/// offered / estimate.
+fn sweep_scene(cell: Cell, seed: u64, ms: u64, scale: f64) -> (BrowserlessScene, LinkOverrides) {
+    let Cell {
+        load,
+        loss,
+        cap: cap_mbit,
+        buf_ms,
+    } = cell;
     let base = NetProfile {
         delay_us: 25_000,
         cap: CapTimeline::constant(cap_mbit * 125_000),
         bottleneck: Some(Bottleneck {
-            depth_ms: 150,
+            depth_ms: buf_ms,
             aqm: None,
         }),
         ..NetProfile::perfect()
@@ -587,7 +603,7 @@ fn sweep_scene(
     let pattern = match loss {
         Loss::Clean => Pattern::Clean,
         Loss::Iid(p) => Pattern::Iid(p),
-        Loss::Ge3 => {
+        Loss::Ge { .. } => {
             let (enter, exit) = loss.chain().expect("a chain");
             Pattern::Burst {
                 enter,
@@ -600,13 +616,14 @@ fn sweep_scene(
     let (scene_load, cadence_us, grid) = match load {
         Load::H264 => {
             let mut l = h264_load();
-            let frame = (cap_mbit as usize * 125_000 / 30) * 3 / 2;
+            let frame = ((cap_mbit as usize * 125_000 / 30) * 3 / 2) as f64 * scale;
+            let frame = frame as usize;
             l.pcm_rate_model = Some(PcmRateModel::s2(frame, frame * 3, 30));
             (SceneLoad::H264(l), DEFAULT_CADENCE_US, (4, 4))
         }
         Load::Tile => {
             // About 0.30 Mbit/s per tile per tick (browserless_nested_cc).
-            let tiles = ((0.8 * cap_mbit as f64) / 0.30).ceil() as usize;
+            let tiles = ((0.8 * cap_mbit as f64 * scale) / 0.30).ceil() as usize;
             let side = if tiles > 256 { 32 } else { 16 };
             (
                 SceneLoad::Profile(LoadProfile {
@@ -669,6 +686,17 @@ struct SweepRun {
     bwe_binding_share: f64,
     bwe_reads: u64,
     digest: u64,
+    /// LOSS_REPORTs with `lost_pre_fec > 0`, and of those the ones read under
+    /// a standing queue (counted in every mode).
+    reports_with_loss: u64,
+    report_queue_reads: u64,
+    /// The estimate, time mean over the second half of the run, bits/s.
+    est_bps: f64,
+    /// Offered wire bytes (repair included) per second, as bits/s.
+    offered_bps: f64,
+    /// Content the client shows per second: H.264 frames shown, tile passes
+    /// decoded (`TileReady` events), by the cell's load.
+    delivered_per_s: f64,
     /// H.264 only: frames shown, frames late (more than an RTT over the
     /// stream's own floor), never-fed frames.
     shown: usize,
@@ -698,6 +726,14 @@ impl SweepRun {
     }
     fn retx_per_lost(&self) -> f64 {
         self.retx as f64 / self.dropped.max(1) as f64
+    }
+    /// Offered over the estimate.
+    fn ofe(&self) -> f64 {
+        self.offered_bps / self.est_bps.max(1.0)
+    }
+    /// The share of loss-bearing reports read under a standing queue.
+    fn queue_share(&self) -> f64 {
+        self.report_queue_reads as f64 / self.reports_with_loss.max(1) as f64
     }
     fn changes_per_min(&self) -> f64 {
         self.changes as f64 * 60.0 / self.secs as f64
@@ -733,7 +769,32 @@ fn frames_late(r: &BrowserlessResult) -> (usize, usize, usize) {
     (lat.len(), late, run.analyse().never_fed)
 }
 
-fn read_run(r: &BrowserlessResult, secs: u64) -> SweepRun {
+/// The estimate's time mean over the second half of the run.
+fn est_second_half(r: &BrowserlessResult, secs: u64) -> f64 {
+    let half = secs * 500_000;
+    let v: Vec<f64> = r
+        .bwe_estimate_samples
+        .iter()
+        .filter(|(t, _)| *t >= half)
+        .map(|(_, bps)| *bps as f64)
+        .collect();
+    mean(&v)
+}
+
+/// Tile passes the client decoded: every `TileReady` it raised.
+fn tile_passes(r: &BrowserlessResult) -> usize {
+    r.events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                ClientNetEvent::Core(ghostframe_client_core::Event::TileReady { .. })
+            )
+        })
+        .count()
+}
+
+fn read_run(r: &BrowserlessResult, secs: u64, load: Load) -> SweepRun {
     let (t, i, a) = (&r.transport, &r.transport.instr, &r.transport.adapt);
     let repair_bytes = repairs(r);
     let (shown, late, never_fed) = frames_late(r);
@@ -768,6 +829,15 @@ fn read_run(r: &BrowserlessResult, secs: u64) -> SweepRun {
         bwe_binding_share: i.bwe.ceiling_binding_reads as f64 / i.bwe.ceiling_reads.max(1) as f64,
         bwe_reads: i.bwe.ceiling_reads,
         digest: r.wire_digest,
+        reports_with_loss: t.reports_with_loss,
+        report_queue_reads: t.report_queue_reads,
+        est_bps: est_second_half(r, secs),
+        offered_bps: i.offered.total() as f64 * 8.0 / secs as f64,
+        delivered_per_s: match load {
+            Load::H264 => shown,
+            Load::Tile => tile_passes(r),
+        } as f64
+            / secs as f64,
         shown,
         late,
         never_fed,
@@ -775,27 +845,23 @@ fn read_run(r: &BrowserlessResult, secs: u64) -> SweepRun {
     }
 }
 
-async fn sweep_run(
-    load: Load,
-    loss: Loss,
-    cap_mbit: u64,
-    arm: Arm,
-    seed: u64,
-    secs: u64,
-) -> SweepRun {
-    let (scene, links) = sweep_scene(load, loss, cap_mbit, seed, secs * 1000);
+async fn sweep_run(cell: Cell, arm: Arm, seed: u64, scale: f64) -> SweepRun {
+    let (load, loss, cap_mbit, secs) = (cell.load, cell.loss, cell.cap, cell.secs());
+    let (scene, links) = sweep_scene(cell, seed, secs * 1000, scale);
     let r = run_browserless_with_options(scene, links, arm.options())
         .await
         .expect("scene ran");
-    let out = read_run(&r, secs);
+    let out = read_run(&r, secs, load);
     println!(
-        "FECSWEEP run load={load:?} loss={} cap={cap_mbit} arm={} seed={seed:#x} secs={secs} \
+        "FECSWEEP run load={load:?} loss={} cap={cap_mbit} buf={} arm={} scale={scale:.3} seed={seed:#x} secs={secs} \
          dropped={} offered={} lost_pre_fec={} reports={} src_bytes={} repair_bytes={} \
          rho_bytes={:.4} rho_dg={:.4} k_mean={:.2} closes={}/{}/{}/{} handoffs_declined={} retx={} \
          retx_per_lost={:.3} changes={} changes_per_min={:.2} floor_changes={} engaged={} sized={} \
          sat={:.2} skips={} trim={} p_hat_ppm={} b_hat_x100={} bwe_binding={:.3}/{} shown={} \
-         late={} never_fed={} digest={:#x}",
+         late={} never_fed={} digest={:#x} reports_with_loss={} queue_reads={} est_bps={:.0} \
+         offered_bps={:.0} ofe={:.3} delivered_per_s={:.2}",
         loss.name(),
+        cell.buf_ms,
         arm.name(),
         out.dropped,
         out.offered_dg,
@@ -828,7 +894,13 @@ async fn sweep_run(
         out.shown,
         out.late,
         out.never_fed,
-        out.digest
+        out.digest,
+        out.reports_with_loss,
+        out.report_queue_reads,
+        out.est_bps,
+        out.offered_bps,
+        out.ofe(),
+        out.delivered_per_s
     );
     out
 }
@@ -906,11 +978,39 @@ struct Cell {
     load: Load,
     loss: Loss,
     cap: u64,
+    /// The bottleneck's tail-drop buffer, ms.
+    buf_ms: u64,
 }
 
+/// The grid's buffer.
+const BUF_MS: u64 = 150;
+
+/// 2 Mbit/s H.264, clean, behind a 1500 ms buffer: the start-up that drops
+/// 31-35 datagrams behind 150 ms drops none here (FINDINGS 10.5), so
+/// criterion (1) must hold. Finding 1's attribution as a regression test.
+const DEEP_BUFFER_CELL: Cell = Cell {
+    load: Load::H264,
+    loss: Loss::Clean,
+    cap: 2,
+    buf_ms: 1_500,
+};
+
 impl Cell {
+    fn new(load: Load, loss: Loss, cap: u64) -> Cell {
+        Cell {
+            load,
+            loss,
+            cap,
+            buf_ms: BUF_MS,
+        }
+    }
     fn name(&self) -> String {
-        format!("{:?}/{}/{}M", self.load, self.loss.name(), self.cap)
+        let buf = if self.buf_ms == BUF_MS {
+            String::new()
+        } else {
+            format!("/buf{}ms", self.buf_ms)
+        };
+        format!("{:?}/{}/{}M{buf}", self.load, self.loss.name(), self.cap)
     }
     /// Virtual seconds: a minute where the criterion counts state changes per
     /// minute (0.1 %) or needs losses to be a statistical claim (0.01 %).
@@ -950,6 +1050,8 @@ struct Verdict {
     crit: u8,
     cell: String,
     pass: bool,
+    /// False where the criterion is reported and not judged.
+    judged: bool,
     detail: String,
 }
 
@@ -958,7 +1060,11 @@ impl Verdict {
         println!(
             "FECSWEEP crit {} {} cell={} {}",
             self.crit,
-            if self.pass { "PASS" } else { "FAIL" },
+            match (self.judged, self.pass) {
+                (false, _) => "REPORT",
+                (true, true) => "PASS",
+                (true, false) => "FAIL",
+            },
             self.cell,
             self.detail
         );
@@ -970,7 +1076,33 @@ struct CellRuns {
     off: Vec<SweepRun>,
     fixed: Vec<SweepRun>,
     ada: Vec<SweepRun>,
+    /// Tile only: the mode-off arm re-run per seed at the load scale that
+    /// gives it the adaptive arm's offered / estimate (criteria 5 and 6).
+    /// Empty for H.264, whose off arm already offers the same share.
+    matched: Vec<SweepRun>,
     seeds: usize,
+}
+
+impl CellRuns {
+    /// The control of criteria (5) and (6): the matched off arm for tile (the
+    /// unmatched one offers a smaller share of the estimate, so it is no null
+    /// model of the adaptive stream), the plain off arm for H.264.
+    fn control(&self) -> &[SweepRun] {
+        if self.cell.load == Load::Tile {
+            &self.matched
+        } else {
+            &self.off
+        }
+    }
+}
+
+/// The load scale that gives the off arm the adaptive arm's offered /
+/// estimate, clamped to [1, 2].
+fn matched_scale(ada: &SweepRun, off: &SweepRun) -> f64 {
+    if off.ofe() <= 0.0 {
+        return 1.0;
+    }
+    (ada.ofe() / off.ofe()).clamp(1.0, 2.0)
 }
 
 fn field(v: &[SweepRun], f: impl Fn(&SweepRun) -> f64) -> Vec<f64> {
@@ -990,18 +1122,23 @@ async fn run_cell(cell: Cell, max_seeds: usize) -> CellRuns {
         off: vec![],
         fixed: vec![],
         ada: vec![],
+        matched: vec![],
         seeds: 0,
     };
     let mut n = 3.min(max_seeds);
     while c.seeds < n {
         let seed = SWEEP_SEEDS[c.seeds];
         for arm in Arm::ALL {
-            let r = sweep_run(cell.load, cell.loss, cell.cap, arm, seed, cell.secs()).await;
+            let r = sweep_run(cell, arm, seed, 1.0).await;
             match arm {
                 Arm::Off => c.off.push(r),
                 Arm::Fixed => c.fixed.push(r),
                 Arm::Adaptive => c.ada.push(r),
             }
+        }
+        if cell.load == Load::Tile {
+            let scale = matched_scale(c.ada.last().expect("ran"), c.off.last().expect("ran"));
+            c.matched.push(sweep_run(cell, Arm::Off, seed, scale).await);
         }
         c.seeds += 1;
         // Three seeds are the grid; five where the spread is wide, or where a
@@ -1028,23 +1165,164 @@ fn cap_rows(k: usize) -> usize {
     k.div_ceil(4).clamp(1, 32)
 }
 
+/// A criterion's outcome. `verdict` is `None` where the criterion is
+/// reported and not judged.
+struct Judged {
+    verdict: Option<bool>,
+    detail: String,
+}
+
+/// `a >= b` over the seed spread: the mean of `a` is at least the mean of `b`
+/// minus the larger of the two arms' standard deviations. Returns
+/// `(pass, mean a, mean b, spread)`.
+fn ge_spread(a: &[f64], b: &[f64]) -> (bool, f64, f64, f64) {
+    let spread = sd(a).max(sd(b));
+    (mean(a) >= mean(b) - spread, mean(a), mean(b), spread)
+}
+
+/// The lowest rate (Mbit/s) at which criterion (3) is judged. Below it a block
+/// holds `k` 1-6 and fixed `r = 2` spends two to four times the bytes of
+/// adaptive, so "no higher than fixed" compares a policy with a control that
+/// is not at its overhead.
+const CRIT3_MIN_CAP_MBIT: u64 = 10;
+
+/// (3), restated: judged at 10 Mbit/s and above, reported below.
+fn crit3(c: &CellRuns) -> Judged {
+    let (ok_hd, ha, hf, hs) = le_spread(
+        &field(&c.ada, |r| r.handoffs_declined as f64),
+        &field(&c.fixed, |r| r.handoffs_declined as f64),
+    );
+    let sat = mean(&field(&c.ada, SweepRun::sat_share));
+    let (enter, exit) = c.cell.loss.chain().expect("a lossy cell");
+    let memo: std::collections::HashMap<usize, usize> = (0..24)
+        .map(|i| {
+            let (lo, hi) = ghostframe_lib::transport::io_bridge::block_k_bucket_range(i);
+            let k = (lo + hi) / 2;
+            (k, dp_r(k, enter, exit).0)
+        })
+        .collect();
+    let dp = |k: usize| memo[&k];
+    let rho = mean(&field(&c.ada, |r| r.rho_dg));
+    // The rule's overhead over the sizes the run actually closed, and the
+    // cap's. Where the target is unreachable (saturated share high) the
+    // bar is the cap's, with no slack; elsewhere 1.25 x the rule's.
+    let dp_oh = mean(&field(&c.ada, |r| r.rows_over_blocks(dp)));
+    let cap_oh = mean(&field(&c.ada, |r| r.rows_over_blocks(cap_rows)));
+    let (bound_name, bound) = if sat >= 0.5 {
+        ("cap", cap_oh)
+    } else {
+        ("1.25 x dp", 1.25 * dp_oh)
+    };
+    let ok_oh = rho <= bound;
+    let trim = field(&c.ada, |r| r.trim as f64);
+    if c.cell.cap < CRIT3_MIN_CAP_MBIT {
+        let closed = |r: &SweepRun| r.accounted + r.declined + r.handed_off + r.timed_out;
+        let non_accounted: Vec<f64> = c
+            .ada
+            .iter()
+            .map(|r| (closed(r) - r.accounted) as f64 / closed(r).max(1) as f64)
+            .collect();
+        return Judged {
+            verdict: None,
+            detail: format!(
+                "(not judged below {CRIT3_MIN_CAP_MBIT} Mbit/s) non_accounted_share of closed \
+                 blocks={non_accounted:.3?}; overhead r/k={rho:.4} (dp {dp_oh:.4}, cap {cap_oh:.4}); \
+                 handoffs+declined adaptive={ha:.1} fixed={hf:.1}"
+            ),
+        };
+    }
+    Judged {
+        verdict: Some(ok_hd && ok_oh),
+        detail: format!(
+            "handoffs+declined adaptive={ha:.1} fixed={hf:.1} spread={hs:.1} ({ok_hd}); \
+             overhead r/k={rho:.4} against {bound_name} {bound:.4} (dp {dp_oh:.4}, cap \
+             {cap_oh:.4}) ({ok_oh}); saturated_share={sat:.2} trim_steps={trim:?}"
+        ),
+    }
+}
+
+/// (5), restated: every adaptive run engaged and repaired, and the share of
+/// loss-bearing reports read under a standing queue (what the gate skips) at
+/// most the control's share plus the larger sd. The control's share is the
+/// null model: the gate fires iff `standing_queue()` holds at report time, so
+/// the queue a rate-following stream builds by itself, probe windows
+/// included, is what it would skip anyway. For tile the control is the
+/// matched off arm.
+fn crit5(c: &CellRuns) -> Judged {
+    let ctl = c.control();
+    let engaged = !c.ada.is_empty() && c.ada.iter().all(|r| r.engaged && r.repair_bytes > 0);
+    // The counters moved, in both arms, before a share of them is read.
+    let moved = !ctl.is_empty()
+        && ctl.len() == c.ada.len()
+        && ctl.iter().chain(&c.ada).all(|r| r.reports_with_loss > 0);
+    // The controller's own count and the probe's are one predicate.
+    let agree = c.ada.iter().all(|r| r.skips == r.report_queue_reads);
+    let (ok_share, sa, sc, sp) = le_spread(
+        &field(&c.ada, SweepRun::queue_share),
+        &field(ctl, SweepRun::queue_share),
+    );
+    Judged {
+        verdict: Some(engaged && moved && agree && ok_share),
+        detail: format!(
+            "engaged_in_every_run={engaged} counters_moved={moved} skips_equal_queue_reads={agree}; \
+             gated share adaptive={sa:.4} against the control's {sc:.4} spread={sp:.4} ({ok_share}); \
+             skips={:?} of {:?} reports with loss; control queue reads={:?} of {:?}",
+            field(&c.ada, |r| r.skips as f64),
+            field(&c.ada, |r| r.reports_with_loss as f64),
+            field(ctl, |r| r.report_queue_reads as f64),
+            field(ctl, |r| r.reports_with_loss as f64)
+        ),
+    }
+}
+
+/// (6), restated: at equal offered / estimate, the estimate (second-half time
+/// mean) and the delivered content per second (H.264 frames shown, tile
+/// passes decoded) are no lower than the control's minus the larger sd. The
+/// control is the off arm for H.264 and the matched off arm for tile. The
+/// share of ceiling-binding reads is printed, not judged.
+fn crit6(c: &CellRuns) -> Judged {
+    let ctl = c.control();
+    let premise = !ctl.is_empty()
+        && ctl.len() == c.ada.len()
+        && ctl.iter().chain(&c.ada).all(|r| r.est_bps > 0.0);
+    let (ok_est, ea, ec, es) = ge_spread(&field(&c.ada, |r| r.est_bps), &field(ctl, |r| r.est_bps));
+    let (ok_del, da, dc, ds) = ge_spread(
+        &field(&c.ada, |r| r.delivered_per_s),
+        &field(ctl, |r| r.delivered_per_s),
+    );
+    let (_, ba, bc, _) = le_spread(
+        &field(&c.ada, |r| r.bwe_binding_share),
+        &field(ctl, |r| r.bwe_binding_share),
+    );
+    Judged {
+        verdict: Some(premise && ok_est && ok_del),
+        detail: format!(
+            "control_present={premise}; estimate adaptive={ea:.0} control={ec:.0} spread={es:.0} \
+             ({ok_est}); delivered/s adaptive={da:.2} control={dc:.2} spread={ds:.2} ({ok_del}); \
+             offered/est adaptive={:.3} control={:.3}; (printed) ceiling binding share \
+             adaptive={ba:.4} control={bc:.4}",
+            mean(&field(&c.ada, SweepRun::ofe)),
+            mean(&field(ctl, SweepRun::ofe))
+        ),
+    }
+}
+
 fn verdicts(c: &CellRuns) -> Vec<Verdict> {
     let cell = c.cell.name();
     let mut out = Vec::new();
-    let mut v = |crit: u8, pass: bool, detail: String| {
-        out.push(Verdict {
-            crit,
-            cell: cell.clone(),
-            pass,
-            detail,
-        })
+    let v = |crit: u8, pass: bool, detail: String| Verdict {
+        crit,
+        cell: cell.clone(),
+        pass,
+        judged: true,
+        detail,
     };
     // Premises: the arms are what they claim, and where the loss is above the
     // floor the measurement is non-zero.
     let nominal = match c.cell.loss {
         Loss::Clean => 0.0,
         Loss::Iid(p) => p,
-        Loss::Ge3 => 0.01,
+        Loss::Ge { avg, .. } => avg,
     };
     let off_clean = c.off.iter().all(|r| r.repair_bytes == 0 && r.sized == 0);
     let fixed_blocks = c.fixed.iter().all(|r| r.repair_bytes > 0);
@@ -1062,7 +1340,7 @@ fn verdicts(c: &CellRuns) -> Vec<Verdict> {
             .all(|r| r.dropped > 0);
     let lost_seen = nominal < 0.001 || c.ada.iter().all(|r| r.lost_pre_fec > 0);
     let engaged = nominal < 0.01 || c.ada.iter().all(|r| r.repair_bytes > 0);
-    v(
+    out.push(v(
         0,
         off_clean && fixed_blocks && reports && dropped && lost_seen && engaged,
         format!(
@@ -1070,13 +1348,13 @@ fn verdicts(c: &CellRuns) -> Vec<Verdict> {
              reports={reports} loss_dropped={dropped} lost_pre_fec_seen={lost_seen} \
              adaptive_repaired={engaged}"
         ),
-    );
+    ));
     // (1) clean link and 0.01 %: no repair, and the frames sent equal the
     // mode-off run's (the wire digest hashes every datagram).
     if nominal <= 0.0001 {
         let zero = c.ada.iter().all(|r| r.repair_bytes == 0);
         let same = c.ada.iter().zip(&c.off).all(|(a, o)| a.digest == o.digest);
-        v(
+        out.push(v(
             1,
             zero && same,
             format!(
@@ -1084,7 +1362,7 @@ fn verdicts(c: &CellRuns) -> Vec<Verdict> {
                 field(&c.ada, |r| r.repair_bytes as f64),
                 field(&c.ada, |r| r.dropped as f64)
             ),
-        );
+        ));
     }
     // (2) a stationary 0.1 %.
     if (nominal - 0.001).abs() < 1e-9 {
@@ -1098,76 +1376,33 @@ fn verdicts(c: &CellRuns) -> Vec<Verdict> {
             &field(&c.ada, |r| r.retx as f64),
             &field(&c.off, |r| r.retx as f64),
         );
-        v(
+        out.push(v(
             2,
             ok_changes && ok_oh && ok_retx,
             format!(
                 "changes_per_min={cpm:.2?} overhead adaptive={oa:.4} fixed={of:.4} spread={sp:.4} \
                  ({ok_oh}); retransmits adaptive={ra:.0} off={ro:.0} spread={rs:.0} ({ok_retx})"
             ),
-        );
+        ));
     }
-    // (3) 1 %, 5 % i.i.d. and the bursty 1 %.
+    // (3), (5), (6): restated (plan decision 7); pure functions of the runs.
+    let judged = |crit: u8, j: Judged| Verdict {
+        crit,
+        cell: cell.clone(),
+        pass: j.verdict.unwrap_or(true),
+        judged: j.verdict.is_some(),
+        detail: j.detail,
+    };
+    // (3) 1 %, 5 % i.i.d. and the bursty 1 %, judged from 10 Mbit/s.
     if nominal >= 0.01 {
-        let (ok_hd, ha, hf, hs) = le_spread(
-            &field(&c.ada, |r| r.handoffs_declined as f64),
-            &field(&c.fixed, |r| r.handoffs_declined as f64),
-        );
-        let sat = mean(&field(&c.ada, SweepRun::sat_share));
-        let (enter, exit) = c.cell.loss.chain().expect("a lossy cell");
-        let memo: std::collections::HashMap<usize, usize> = (0..24)
-            .map(|i| {
-                let (lo, hi) = ghostframe_lib::transport::io_bridge::block_k_bucket_range(i);
-                let k = (lo + hi) / 2;
-                (k, dp_r(k, enter, exit).0)
-            })
-            .collect();
-        let dp = |k: usize| memo[&k];
-        let rho = mean(&field(&c.ada, |r| r.rho_dg));
-        // The rule's overhead over the sizes the run actually closed, and the
-        // cap's. Where the target is unreachable (saturated share high) the
-        // bar is the cap's, with no slack; elsewhere 1.25 x the rule's.
-        let dp_oh = mean(&field(&c.ada, |r| r.rows_over_blocks(dp)));
-        let cap_oh = mean(&field(&c.ada, |r| r.rows_over_blocks(cap_rows)));
-        let (bound_name, bound) = if sat >= 0.5 {
-            ("cap", cap_oh)
-        } else {
-            ("1.25 x dp", 1.25 * dp_oh)
-        };
-        let ok_oh = rho <= bound;
-        v(
-            3,
-            ok_hd && ok_oh,
-            format!(
-                "handoffs+declined adaptive={ha:.1} fixed={hf:.1} spread={hs:.1} ({ok_hd}); \
-                 overhead r/k={rho:.4} against {bound_name} {bound:.4} (dp {dp_oh:.4}, cap \
-                 {cap_oh:.4}) ({ok_oh}); saturated_share={sat:.2} trim_steps={:?}",
-                field(&c.ada, |r| r.trim as f64)
-            ),
-        );
+        out.push(judged(3, crit3(c)));
     }
-    // (5) 5 % i.i.d. is never congestion-gated.
+    // (5) 5 % i.i.d.: engaged, and gated no more than the stream's own queue.
     if (nominal - 0.05).abs() < 1e-9 && matches!(c.cell.loss, Loss::Iid(_)) {
-        let skips = field(&c.ada, |r| r.skips as f64);
-        v(
-            5,
-            skips.iter().all(|x| *x == 0.0),
-            format!("adapt_congestion_skips={skips:?}"),
-        );
+        out.push(judged(5, crit5(c)));
     }
-    // (6) the BWE ceiling binds no more than under the control.
-    let reads = c.ada.iter().chain(&c.off).all(|r| r.bwe_reads > 0);
-    let (ok, a, o, sp) = le_spread(
-        &field(&c.ada, |r| r.bwe_binding_share),
-        &field(&c.off, |r| r.bwe_binding_share),
-    );
-    v(
-        6,
-        ok,
-        format!(
-            "ceiling binding share adaptive={a:.4} off={o:.4} spread={sp:.4} reads_present={reads}"
-        ),
-    );
+    // (6) outcomes at equal offered / estimate.
+    out.push(judged(6, crit6(c)));
     // (7) at 2 Mbit/s: the overhead against the 28 ms design value (report).
     if c.cell.cap == 2 && nominal > 0.0 {
         let a = &c.ada;
@@ -1180,7 +1415,7 @@ fn verdicts(c: &CellRuns) -> Vec<Verdict> {
         if let Some((enter, exit)) = c.cell.loss.chain() {
             let (r20, _) = dp_r(k.round() as usize, enter, exit);
             let (r28, _) = dp_r(k28, enter, exit);
-            v(
+            out.push(v(
                 7,
                 true,
                 format!(
@@ -1190,7 +1425,7 @@ fn verdicts(c: &CellRuns) -> Vec<Verdict> {
                     r20 as f64 / k,
                     r28 as f64 / k28 as f64
                 ),
-            );
+            ));
         }
     }
     out
@@ -1205,7 +1440,7 @@ fn verdicts(c: &CellRuns) -> Vec<Verdict> {
 async fn engage_ms(load: Load, cap: u64, seed: u64) -> Result<(u64, u64), String> {
     for step_ms in [5_000u64, 25_000] {
         let engaged = |ms: u64| async move {
-            let (scene, mut links) = sweep_scene(load, Loss::Clean, cap, seed, ms);
+            let (scene, mut links) = sweep_scene(Cell::new(load, Loss::Clean, cap), seed, ms, 1.0);
             links.s2c_loss_steps = vec![(step_ms * 1000, 0.05)];
             let r = run_browserless_with_options(scene, links, adaptive())
                 .await
@@ -1240,14 +1475,11 @@ fn reduced_grid() -> Vec<Cell> {
         Loss::Iid(0.001),
         Loss::Iid(0.01),
         Loss::Iid(0.05),
-        Loss::Ge3,
+        GE3,
     ]
     .into_iter()
-    .map(|loss| Cell {
-        load: Load::H264,
-        loss,
-        cap: 10,
-    })
+    .map(|loss| Cell::new(Load::H264, loss, 10))
+    .chain([DEEP_BUFFER_CELL])
     .collect()
 }
 
@@ -1261,12 +1493,13 @@ fn full_grid() -> Vec<Cell> {
                 Loss::Iid(0.001),
                 Loss::Iid(0.01),
                 Loss::Iid(0.05),
-                Loss::Ge3,
+                GE3,
             ] {
-                g.push(Cell { load, loss, cap });
+                g.push(Cell::new(load, loss, cap));
             }
         }
     }
+    g.push(DEEP_BUFFER_CELL);
     g
 }
 
@@ -1278,13 +1511,18 @@ fn selected(only: &Option<String>, name: &str) -> bool {
 
 /// The sweep. Reduced by default (one rate, H.264); `GHOSTFRAME_FEC_SWEEP=full`
 /// runs the whole grid, `GHOSTFRAME_FEC_SWEEP_ONLY=<substring of a cell name>`
-/// narrows it.
+/// narrows it, `GHOSTFRAME_FEC_SWEEP_SEEDS=<n>` caps the seeds per cell.
 #[tokio::test(start_paused = true)]
 async fn control_law_sweep() {
     let full = std::env::var("GHOSTFRAME_FEC_SWEEP").is_ok_and(|v| v == "full");
     let only = std::env::var("GHOSTFRAME_FEC_SWEEP_ONLY").ok();
     let grid = if full { full_grid() } else { reduced_grid() };
-    let max_seeds = if full { 5 } else { 3 };
+    // `GHOSTFRAME_FEC_SWEEP_SEEDS=<1..=5>` caps the seeds per cell (no
+    // widening past it).
+    let max_seeds = std::env::var("GHOSTFRAME_FEC_SWEEP_SEEDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(if full { 5 } else { 3 }, |n| n.clamp(1, 5));
     let mut failed = Vec::new();
     for cell in grid {
         if !selected(&only, &cell.name()) {
@@ -1318,6 +1556,7 @@ async fn control_law_sweep() {
         }
         let v = Verdict {
             crit: 4,
+            judged: true,
             cell: name,
             pass: times
                 .iter()
@@ -1332,4 +1571,309 @@ async fn control_law_sweep() {
         }
     }
     assert!(failed.is_empty(), "criteria failed: {failed:?}");
+}
+
+// ---- the restated criteria (3), (5), (6): unit tests on synthetic runs -----
+
+/// One run per value, `set` writing the value into a default `SweepRun`.
+fn synth(vals: &[f64], set: impl Fn(&mut SweepRun, f64)) -> Vec<SweepRun> {
+    vals.iter()
+        .map(|v| {
+            let mut r = SweepRun {
+                secs: 30,
+                ..SweepRun::default()
+            };
+            set(&mut r, *v);
+            r
+        })
+        .collect()
+}
+
+fn cell_runs(cell: Cell) -> CellRuns {
+    CellRuns {
+        cell,
+        off: vec![],
+        fixed: vec![],
+        ada: vec![],
+        matched: vec![],
+        seeds: 3,
+    }
+}
+
+/// A 5 % i.i.d. cell whose adaptive arm engaged in every run and whose gated
+/// share is `ada_share` against `ctl_share` in the control (queue reads out
+/// of 100 loss-bearing reports; one seed is `jitter` apart so the spread is
+/// not zero).
+fn crit5_cell(load: Load, ada_share: f64, ctl_share: f64) -> CellRuns {
+    let mut c = cell_runs(Cell::new(load, Loss::Iid(0.05), 10));
+    let shares = |s: f64| [s - 0.01, s, s + 0.01];
+    c.ada = synth(&shares(ada_share), |r, s| {
+        r.engaged = true;
+        r.repair_bytes = 1_000;
+        r.reports_with_loss = 100;
+        r.report_queue_reads = (s * 100.0).round() as u64;
+        r.skips = r.report_queue_reads;
+    });
+    let ctl = synth(&shares(ctl_share), |r, s| {
+        r.reports_with_loss = 100;
+        r.report_queue_reads = (s * 100.0).round() as u64;
+    });
+    // For tile the control is the matched arm; the plain off arm is a decoy
+    // with a share that would fail or pass the check the other way round.
+    let decoy = synth(&shares(0.0), |r, s| {
+        r.reports_with_loss = 100;
+        r.report_queue_reads = (s * 100.0).round() as u64;
+    });
+    match load {
+        Load::H264 => c.off = ctl,
+        Load::Tile => {
+            c.off = decoy;
+            c.matched = ctl;
+        }
+    }
+    c
+}
+
+#[test]
+fn criterion_3_is_judged_from_10_mbit_and_reported_below() {
+    // The same runs: adaptive far above fixed in hand-offs + declines.
+    let build = |cap: u64| {
+        let mut c = cell_runs(Cell::new(Load::H264, Loss::Iid(0.05), cap));
+        c.ada = synth(&[49.0, 50.0, 51.0], |r, v| {
+            r.handoffs_declined = v as u64;
+            r.accounted = 10;
+            r.declined = 5;
+        });
+        c.fixed = synth(&[4.0, 5.0, 6.0], |r, v| r.handoffs_declined = v as u64);
+        c
+    };
+    let at_2 = crit3(&build(2));
+    assert!(at_2.verdict.is_none(), "{}", at_2.detail);
+    assert!(
+        at_2.detail.contains("non_accounted_share"),
+        "{}",
+        at_2.detail
+    );
+    let at_10 = crit3(&build(10));
+    assert_eq!(at_10.verdict, Some(false), "{}", at_10.detail);
+    // And at 10 Mbit/s a pass is reachable (the verdict is not a constant).
+    let mut ok = build(10);
+    ok.ada = synth(&[4.0, 5.0, 6.0], |r, v| r.handoffs_declined = v as u64);
+    assert_eq!(crit3(&ok).verdict, Some(true));
+    // The verdict function the sweep prints keeps a 2 Mbit/s cell passing.
+    let mut c2 = build(2);
+    c2.off = synth(&[0.0; 3], |_, _| {});
+    let v: Vec<_> = verdicts(&c2).into_iter().filter(|v| v.crit == 3).collect();
+    assert_eq!(v.len(), 1);
+    assert!(!v[0].judged && v[0].pass);
+}
+
+#[test]
+fn criterion_5_needs_every_run_engaged() {
+    let good = crit5_cell(Load::H264, 0.10, 0.10);
+    let j = crit5(&good);
+    assert_eq!(j.verdict, Some(true), "{}", j.detail);
+    let mut c = crit5_cell(Load::H264, 0.10, 0.10);
+    c.ada[1].engaged = false;
+    assert_eq!(crit5(&c).verdict, Some(false));
+    let mut c = crit5_cell(Load::H264, 0.10, 0.10);
+    c.ada[2].repair_bytes = 0;
+    assert_eq!(crit5(&c).verdict, Some(false));
+}
+
+#[test]
+fn criterion_5_bounds_the_share_by_the_controls_own() {
+    // A gated share equal to a high control share passes: any constant bound
+    // below it (E11's was zero) would fail a stream that is its own queue.
+    let j = crit5(&crit5_cell(Load::H264, 0.30, 0.30));
+    assert_eq!(j.verdict, Some(true), "{}", j.detail);
+    // Above the control by more than the spread (0.01 here) it fails.
+    let j = crit5(&crit5_cell(Load::H264, 0.50, 0.10));
+    assert_eq!(j.verdict, Some(false), "{}", j.detail);
+    // Below the control passes.
+    assert_eq!(
+        crit5(&crit5_cell(Load::H264, 0.05, 0.30)).verdict,
+        Some(true)
+    );
+}
+
+#[test]
+fn criterion_5_reads_a_share_only_from_counters_that_moved() {
+    let mut c = crit5_cell(Load::H264, 0.10, 0.10);
+    for r in &mut c.off {
+        r.reports_with_loss = 0;
+        r.report_queue_reads = 0;
+    }
+    let j = crit5(&c);
+    assert_eq!(j.verdict, Some(false), "{}", j.detail);
+    assert!(j.detail.contains("counters_moved=false"));
+    // The controller's skips and the probe's queue reads are one predicate.
+    let mut c = crit5_cell(Load::H264, 0.10, 0.10);
+    c.ada[0].skips += 1;
+    assert_eq!(crit5(&c).verdict, Some(false));
+}
+
+#[test]
+fn criterion_5_uses_the_matched_off_arm_for_tile() {
+    // Adaptive 0.30 gated, the matched arm 0.30 (its own queue at the same
+    // offered / estimate), the unmatched arm 0.00 (it offers less and builds
+    // no queue). Against the unmatched arm this would fail.
+    let tile = crit5_cell(Load::Tile, 0.30, 0.30);
+    assert_eq!(crit5(&tile).verdict, Some(true));
+    let mut unmatched = crit5_cell(Load::Tile, 0.30, 0.30);
+    unmatched.matched.clear();
+    assert_eq!(crit5(&unmatched).verdict, Some(false), "no control: fails");
+    // The same shares with the H.264 control (the plain off arm) fail.
+    let mut as_h264 = crit5_cell(Load::Tile, 0.30, 0.30);
+    as_h264.cell.load = Load::H264;
+    assert_eq!(crit5(&as_h264).verdict, Some(false));
+}
+
+/// Adaptive and control arms with an estimate and a delivered rate.
+fn crit6_cell(load: Load, ada: (f64, f64), ctl: (f64, f64), off: (f64, f64)) -> CellRuns {
+    let mut c = cell_runs(Cell::new(load, Loss::Iid(0.05), 10));
+    let arm = |(est, del): (f64, f64)| {
+        synth(&[-1.0, 0.0, 1.0], move |r, d| {
+            r.est_bps = est + d * 10_000.0;
+            r.delivered_per_s = del + d * 0.1;
+            r.offered_bps = r.est_bps * 0.9;
+        })
+    };
+    c.ada = arm(ada);
+    match load {
+        Load::H264 => c.off = arm(ctl),
+        Load::Tile => {
+            c.matched = arm(ctl);
+            c.off = arm(off);
+        }
+    }
+    c
+}
+
+#[test]
+fn criterion_6_compares_estimate_and_delivery_with_the_control() {
+    let eq = crit6_cell(Load::H264, (8e6, 25.0), (8e6, 25.0), (0.0, 0.0));
+    let j = crit6(&eq);
+    assert_eq!(j.verdict, Some(true), "{}", j.detail);
+    // Delivery below the control by more than the spread.
+    let slow = crit6_cell(Load::H264, (8e6, 20.0), (8e6, 25.0), (0.0, 0.0));
+    assert_eq!(crit6(&slow).verdict, Some(false));
+    // Estimate below the control by more than the spread.
+    let low = crit6_cell(Load::H264, (6e6, 25.0), (8e6, 25.0), (0.0, 0.0));
+    assert_eq!(crit6(&low).verdict, Some(false));
+    // Above the control is fine.
+    let above = crit6_cell(Load::H264, (9e6, 30.0), (8e6, 25.0), (0.0, 0.0));
+    assert_eq!(crit6(&above).verdict, Some(true));
+}
+
+#[test]
+fn criterion_6_for_tile_compares_with_the_matched_arm_not_the_unmatched_one() {
+    // Adaptive delivers 100 passes/s; the matched arm 100; the unmatched off
+    // arm 150 (it offers less of the estimate, yet at the same estimate its
+    // passes are not the control's). Against the unmatched arm it fails.
+    let tile = crit6_cell(Load::Tile, (8e6, 100.0), (8e6, 100.0), (8e6, 150.0));
+    let j = crit6(&tile);
+    assert_eq!(j.verdict, Some(true), "{}", j.detail);
+    let mut as_unmatched = tile;
+    as_unmatched.matched = std::mem::take(&mut as_unmatched.off);
+    assert_eq!(crit6(&as_unmatched).verdict, Some(false));
+    // No matched arm at all: no control, no verdict of pass.
+    let mut none = crit6_cell(Load::Tile, (8e6, 100.0), (8e6, 100.0), (8e6, 100.0));
+    none.matched.clear();
+    assert_eq!(crit6(&none).verdict, Some(false));
+}
+
+#[test]
+fn the_matched_scale_follows_offered_over_estimate_within_the_clamp() {
+    let run = |ofe: f64| SweepRun {
+        est_bps: 1e6,
+        offered_bps: ofe * 1e6,
+        ..SweepRun::default()
+    };
+    assert!((matched_scale(&run(0.956), &run(0.69)) - 0.956 / 0.69).abs() < 1e-9);
+    assert_eq!(matched_scale(&run(0.5), &run(0.69)), 1.0);
+    assert_eq!(matched_scale(&run(2.0), &run(0.5)), 2.0);
+    assert_eq!(matched_scale(&run(1.0), &SweepRun::default()), 1.0);
+}
+
+// ---- the restated criteria: scene premises ---------------------------------
+
+/// The counters of criterion (5) are kept in the off arm, move in a run with
+/// a standing queue, and stay zero where there is none.
+#[tokio::test(start_paused = true)]
+async fn the_queue_read_counters_are_kept_in_every_mode() {
+    let off = |net: NetProfile, links: LinkOverrides, ms: u64| async move {
+        let scene = BrowserlessScene {
+            seed: SEEDS[0],
+            datagram_send_buffer_bytes: None,
+            tick_budget_floor_bytes: None,
+            load: SceneLoad::H264(h264_load()),
+            cadence_us: DEFAULT_CADENCE_US,
+            net,
+            drops: DropPlan::default(),
+            duration: Duration::from_millis(ms),
+            grid_cols: 4,
+            grid_rows: 4,
+        };
+        run_browserless_with_options(scene, links, RunOptions::default())
+            .await
+            .expect("scene ran")
+    };
+    // A link that drops to 300 kB/s behind a 200 ms buffer: a queue stands
+    // and overflows (the scene of `queueing_loss_at_a_bottleneck_is_gated`).
+    let net = NetProfile {
+        delay_us: 25_000,
+        cap: CapTimeline::step(6_000_000, 4_000_000, BOTTLENECK_BPS),
+        bottleneck: Some(Bottleneck {
+            depth_ms: 200,
+            aqm: None,
+        }),
+        ..NetProfile::perfect()
+    };
+    let (net, links) = Pattern::Clean.apply(net);
+    let q = off(net, links, 20_000).await;
+    let t = &q.transport;
+    println!(
+        "FECA counters bottleneck reports_with_loss={} queue_reads={}",
+        t.reports_with_loss, t.report_queue_reads
+    );
+    assert_eq!(t.adapt, FecAdaptProbe::default(), "premise: mode off");
+    assert!(q.s2c_datagrams_dropped > 0, "premise: the queue overflowed");
+    assert!(t.reports_with_loss > 0);
+    assert!(
+        t.report_queue_reads > 0,
+        "a standing queue was never read at a loss-bearing report"
+    );
+    assert!(t.report_queue_reads <= t.reports_with_loss);
+    // Random loss on a free link: losses are reported, no queue stands.
+    let (net, links) = Pattern::Iid(0.05).apply(base_net());
+    let u = off(net, links, 10_000).await;
+    assert!(u.transport.reports_with_loss > 0, "premise");
+    assert_eq!(u.transport.report_queue_reads, 0);
+}
+
+/// The matched control of a tile cell offers the adaptive arm's share of the
+/// estimate, within 5 %: one correction of the load scale is enough.
+#[tokio::test(start_paused = true)]
+async fn the_matched_tile_control_offers_the_adaptive_share_of_the_estimate() {
+    let cell = Cell::new(Load::Tile, Loss::Iid(0.05), 10);
+    let seed = SWEEP_SEEDS[0];
+    let ada = sweep_run(cell, Arm::Adaptive, seed, 1.0).await;
+    let off = sweep_run(cell, Arm::Off, seed, 1.0).await;
+    let scale = matched_scale(&ada, &off);
+    let matched = sweep_run(cell, Arm::Off, seed, scale).await;
+    println!(
+        "FECA matched ofe adaptive={:.3} off={:.3} matched={:.3} scale={scale:.3}",
+        ada.ofe(),
+        off.ofe(),
+        matched.ofe()
+    );
+    assert!(ada.ofe() > off.ofe() * 1.05, "premise: the arms differ");
+    assert!(scale > 1.0, "premise: the control was scaled");
+    assert!(
+        (matched.ofe() / ada.ofe() - 1.0).abs() <= 0.05,
+        "matched ofe {:.3} vs adaptive {:.3}",
+        matched.ofe(),
+        ada.ofe()
+    );
 }
