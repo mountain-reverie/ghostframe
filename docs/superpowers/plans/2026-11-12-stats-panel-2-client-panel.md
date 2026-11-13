@@ -960,7 +960,7 @@ The local metrics (spec 1.3), all sampled once a second from running totals the 
 | H.264 frame size (By) | Video | mean access-unit payload over the second, 0 with none |
 | Painted frames (fps) | Video | `record_paints` per second |
 | Solid tiles, PalRLE tiles, CDF 5/3 passes, H.264 frames (per second) | Video | the codec mix |
-| Wire loss before FEC, FEC recoveries (per second), Longest loss run | Loss and repair | `WireLossStats` |
+| Wire loss before FEC, FEC recoveries (per second), Longest loss run (session) | Loss and repair | `WireLossStats` |
 | NACKs sent, Decode errors (per second) | Loss and repair | counted by the core |
 
 The first sample only sets the baseline, so a rate never includes the time before the first call. A local row is never stale.
@@ -999,9 +999,9 @@ The first sample only sets the baseline, so a rate never includes the time befor
         assert_eq!(row(&v, "Painted frames").current, Some(60.0));
         assert_eq!(row(&v, "Wire loss before FEC").current, Some(4.0));
         assert_eq!(row(&v, "FEC recoveries").current, Some(2.0));
-        assert_eq!(row(&v, "Longest loss run").current, Some(3.0));
+        assert_eq!(row(&v, "Longest loss run (session)").current, Some(3.0));
         assert_eq!(
-            row(&v, "Longest loss run").history,
+            row(&v, "Longest loss run (session)").history,
             vec![3.0],
             "the baseline call pushes nothing"
         );
@@ -1172,7 +1172,7 @@ static LOCAL_DEFS: [LocalDef; LOCAL_COUNT] = [
     },
     LocalDef {
         key: "longest_run",
-        label: "Longest loss run",
+        label: "Longest loss run (session)",
         unit: "1",
         kind: MetricKind::Gauge,
         group: MetricGroup::Loss,
@@ -1408,7 +1408,7 @@ git commit -m "feat(client-core): local metrics (throughput, loss, codec mix, pa
 |---|---|
 | `stats_local.rs`: the `rx_throughput` entry `LocalSource::Rate(8.0)` -> `LocalSource::Rate(1.0)` | `local_metrics_are_measured_from_the_counters_and_are_non_zero` (1 250 000, not 10 000 000) |
 | `sample`: `raw[RX_BYTES] = 0.0;` after its assignment | the same test (the throughput is zero, so the "measurement is non-zero" premise trips) |
-| `sample`: `let first = self.last_us.is_none();` -> `let first = false;` | the same test, on `the baseline call pushes nothing` (`Longest loss run` history is `[0.0, 3.0]`) |
+| `sample`: `let first = self.last_us.is_none();` -> `let first = false;` | the same test, on `the baseline call pushes nothing` (`Longest loss run (session)` history is `[0.0, 3.0]`) |
 | `sample`: `let frame_size = if frames > self.prev_h264.0 {` -> `if true {` | `h264_frame_size_is_the_mean_of_the_second` (an empty second yields NaN, which is ignored, so the row keeps the old 1000 instead of 0) |
 | `rows()`: `stale: false` -> `stale: true` | `server_rows_go_stale_after_three_seconds_and_keep_their_history` |
 

@@ -663,9 +663,9 @@ mod tests {
         assert_eq!(row(&v, "Painted frames").current, Some(60.0));
         assert_eq!(row(&v, "Wire loss before FEC").current, Some(4.0));
         assert_eq!(row(&v, "FEC recoveries").current, Some(2.0));
-        assert_eq!(row(&v, "Longest loss run").current, Some(3.0));
+        assert_eq!(row(&v, "Longest loss run (session)").current, Some(3.0));
         assert_eq!(
-            row(&v, "Longest loss run").history,
+            row(&v, "Longest loss run (session)").history,
             vec![3.0],
             "the baseline call pushes nothing"
         );
