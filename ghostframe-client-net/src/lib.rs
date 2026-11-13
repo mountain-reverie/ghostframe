@@ -659,6 +659,36 @@ impl ClientNet {
         self.drain_connection_events(now_us);
     }
 
+    /// Bytes the server has written on the feedback stream's return half
+    /// since the last call (empty before the stream exists or when nothing
+    /// arrived). Nothing calls this unless the embedder asks: the stats
+    /// stream (`ghostframe_protocol::stats`) is opt-in, and a client that
+    /// never subscribes never has anything to read.
+    ///
+    /// Reading returns flow-control credit to the server, so the call also
+    /// flushes the update.
+    pub fn read_feedback_return(&mut self, now_us: u64) -> Vec<u8> {
+        let Some(sid) = self.feedback_stream else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if let Some(conn) = self.endpoint.connection() {
+            let mut recv = conn.recv_stream(sid);
+            if let Ok(mut chunks) = recv.read(true) {
+                // `Ok(None)` is the server finishing the stream and an `Err`
+                // is a reset or no data yet: either way there is nothing more
+                // to take now.
+                while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+                    out.extend_from_slice(&chunk.bytes);
+                }
+                let _ = chunks.finalize();
+            };
+        }
+        let now = self.instant(now_us);
+        self.endpoint.drive_outgoing(now);
+        out
+    }
+
     /// Ask the server for a fresh IDR (feedback stream 0x09); see
     /// `ClientCore::request_reset`. Queued in the core's outbox like
     /// `request_display_mode`, so it waits there until the session is ready.
