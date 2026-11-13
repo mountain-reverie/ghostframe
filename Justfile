@@ -198,6 +198,12 @@ test-e2e-isolated: containers-build
         cargo test --test e2e -- "$t" --exact --test-threads=1
     done
 
+# The stats panel e2e alone: rebuilds the web client and both images first
+# (the client is embedded in the daemon, and e2e runs the image, not the tree).
+test-e2e-stats: build-web containers-build
+    docker rm -f ghostframe-server headscale >/dev/null 2>&1 || true
+    cargo test --test e2e e2e_stats_panel_subscribe_samples_unsubscribe -- --exact --test-threads=1 --nocapture
+
 # Builds both e2e images. The server binaries are compiled inside the image
 # (matching the Ubuntu runtime's glibc/ffmpeg), so no host cargo build is
 # needed. The Rust target dir and cargo registry live in BuildKit cache mounts

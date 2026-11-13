@@ -3807,6 +3807,14 @@ async fn e2e_cdf53_gradient_emission() -> Result<()> {
 /// at least once. Adding a new polled global means adding it to
 /// `GLOBAL_PROBES`; a polled global that is not listed is invisible to this
 /// guard, so keep the list in step with the `evaluate("window.__...")` calls.
+///
+/// Two globals are deliberately absent: `__ghostframeStatsSamples` and
+/// `__ghostframeStatsFrames` only move while the stats panel is open, so this
+/// scene (panel closed) would read them as 0. They are also initialised to 0
+/// by `main.ts`, so even an unpublished one would read as live-looking here.
+/// `e2e_stats_panel_subscribe_samples_unsubscribe` is their liveness proof: it
+/// requires `samples` to rise after the tab click and `frames` to stop after
+/// the second click.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_polled_globals_are_live() -> Result<()> {
     // (name, JS expression that is true iff the global is non-trivial)
