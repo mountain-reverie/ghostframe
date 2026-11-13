@@ -2011,10 +2011,12 @@ dependencies = [
  "console_error_panic_hook",
  "ghostframe-client-core",
  "ghostframe-protocol",
+ "ghostframe-web-ui",
  "serde",
  "serde-wasm-bindgen",
  "serde_bytes",
  "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
