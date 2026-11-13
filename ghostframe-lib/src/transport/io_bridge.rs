@@ -2256,6 +2256,9 @@ impl IoBridge {
         let block_t = self.block_t_deadline();
         // And for a block's `T_lr` repair, deadline release and alarms.
         let block_release = self.block_release_deadline();
+        // And for the end of a probe window that still holds padding promised
+        // to a block.
+        let pad_deadline = self.pad_reservation_deadline();
         [
             quic,
             display,
@@ -2268,6 +2271,7 @@ impl IoBridge {
             stats,
             block_t,
             block_release,
+            pad_deadline,
         ]
         .into_iter()
         .flatten()

@@ -177,6 +177,14 @@ pub(super) struct ActiveProbe {
     pub(super) opened_at: std::time::Instant,
     /// An admission pass inside the window ran out of work.
     pub(super) starved: bool,
+    /// Padding promised to the repair rows of a block that has not closed
+    /// yet (padding as repair, R6-e E9): bytes and datagrams. Not in
+    /// `bytes_sent` / `packets_sent` until a row (or, at the deadline or
+    /// when the rows cannot carry it, a copy) is actually tagged, so the
+    /// tags stay monotone in send order. Never outlives the window:
+    /// [`IoBridge::pay_pad_reservation`] settles it at `ends_at`.
+    pub(super) reserved_bytes: i64,
+    pub(super) reserved_packets: i64,
 }
 
 /// One-way-delay sample observed at ACK time. Used as input to the
@@ -350,6 +358,8 @@ impl IoBridge {
             packets_sent: 0,
             opened_at: now,
             starved: false,
+            reserved_bytes: 0,
+            reserved_packets: 0,
         });
         // The window must carry the probe, or quinn clips the cluster.
         self.publish_model_window(false);

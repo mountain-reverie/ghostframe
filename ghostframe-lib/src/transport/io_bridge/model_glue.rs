@@ -320,6 +320,8 @@ mod tests {
             packets_sent: 0,
             opened_at: t0,
             starved: false,
+            reserved_bytes: 0,
+            reserved_packets: 0,
         });
         bridge.publish_model_window(false);
         let f = bridge.bwe.snapshot().payload_fraction;
