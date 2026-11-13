@@ -186,6 +186,7 @@ async fn a_refused_source_stays_ahead_of_its_repairs_and_a_queued_repair_counts_
         r: 1,
         row: 0,
         payload: vec![0u8; 400 - ghostframe_protocol::fec::frame::FEC_REPAIR_HEADER_LEN],
+        probe: None,
     });
     let before = b.unsent_bundle_bytes();
     b.service_pending_repairs();
@@ -1207,4 +1208,157 @@ async fn declined_blocks_move_the_trim_and_nothing_else_does() {
     );
     a.tick(3, std::iter::repeat_n(CloseReason::Declined, 10));
     assert_eq!(a.r_for_block(64, 3), before + 1, "10/256 Declined trims");
+}
+
+// ---- padding as repair, part 1 (R6-e E8): the tag by bundle ----------------
+
+fn pad_tag() -> ProbeTag {
+    ProbeTag {
+        id: 42,
+        min_probes: 5,
+        min_bytes: 6000,
+        bytes_sent_before: 1234,
+    }
+}
+
+/// A closed block (k sources, r = 1 planned repair, all sent), and a job for
+/// one fresh pad row of it, sent through `service_pending_repairs`. Returns
+/// the job's length, the `bundle_seq` it left under, and the bridge.
+fn sent_pad_repair(probe: Option<ProbeTag>) -> (IoBridge, usize, u32) {
+    let mut b = blocks_bridge(64, 5, 1);
+    converge_rtt(&mut b, 20);
+    submit_tiles(&mut b, 3, None);
+    send_and_close(&mut b);
+    let (id, _, _) = first_block(&b.sent_frames_for_test.clone());
+    let (k, r) = b.block_table.params(id).expect("closed block");
+    let rows = b.block_table.reserve_pad_rows(id, 1);
+    assert_eq!(rows.len(), 1, "premise: a pad row");
+    let job = block_tx::RepairJob {
+        block_id: id,
+        k,
+        r,
+        row: rows[0],
+        payload: vec![0x33; 250],
+        probe,
+    };
+    let len = job.len();
+    let before = b.sent_frames_for_test.len();
+    b.pending_repairs.push_back(job);
+    assert_eq!(b.service_pending_repairs(), pacing::Stop::Empty);
+    assert_eq!(b.sent_frames_for_test.len(), before + 1, "premise: it left");
+    let Frame::Repair(rf) = parse(b.sent_frames_for_test.last().unwrap()).unwrap() else {
+        panic!("a repair frame")
+    };
+    let seq = rf.bundle_seq;
+    b.stamp_departure(seq, now_std());
+    (b, len, seq)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_tagged_pad_repairs_ack_is_a_tagged_bwe_sample_of_its_frame_length() {
+    let (mut b, len, seq) = sent_pad_repair(Some(pad_tag()));
+    assert_eq!(b.pad_repair_tags.len(), 1, "premise: the tag was recorded");
+    assert!(
+        b.transmission_ledger.peek(seq).unwrap().records.is_empty(),
+        "premise: a repair bundle has no record to find a tag by"
+    );
+    b.bwe_samples_buffer.clear();
+    ack_ids(&mut b, &[seq]);
+    assert_eq!(b.bwe_samples_buffer.len(), 1, "premise: the ack path ran");
+    let s = &b.bwe_samples_buffer[0];
+    assert_eq!(s.probe, Some(pad_tag()));
+    assert_eq!(s.size_bytes as usize, len);
+    assert_eq!(b.pad_repair_tags.len(), 0, "the entry is released");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_untagged_repairs_ack_is_unchanged() {
+    let (mut b, len, seq) = sent_pad_repair(None);
+    assert_eq!(b.pad_repair_tags.len(), 0, "no tag, no entry");
+    b.bwe_samples_buffer.clear();
+    ack_ids(&mut b, &[seq]);
+    assert_eq!(b.bwe_samples_buffer.len(), 1, "premise: the ack path ran");
+    assert_eq!(b.bwe_samples_buffer[0].probe, None);
+    assert_eq!(b.bwe_samples_buffer[0].size_bytes as usize, len);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lost_tagged_pad_repair_pauses_the_raise_once_and_frees_its_entry() {
+    let (mut b, _, seq) = sent_pad_repair(Some(pad_tag()));
+    assert_eq!(b.pad_repair_tags.len(), 1, "premise");
+    assert!(b.h264.raise_paused_until.is_none(), "premise: no pause yet");
+    let tx = b.transmission_ledger.peek(seq).unwrap().clone();
+    let now = now_std();
+    b.note_h264_verdicts(&[(seq, tx.clone())], now);
+    assert_eq!(b.h264.stats.pads_lost, 1);
+    assert!(b.h264.raise_paused_until.is_some_and(|t| t > now));
+    assert_eq!(b.pad_repair_tags.len(), 0, "the entry is dropped");
+    // A second verdict on the same bundle changes nothing.
+    b.note_h264_verdicts(&[(seq, tx)], now);
+    assert_eq!(b.h264.stats.pads_lost, 1, "once");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lost_untagged_repair_does_not_pause_the_raise() {
+    let (mut b, _, seq) = sent_pad_repair(None);
+    let tx = b.transmission_ledger.peek(seq).unwrap().clone();
+    b.note_h264_verdicts(&[(seq, tx)], now_std());
+    assert_eq!(b.h264.stats.pads_lost, 0);
+    assert!(b.h264.raise_paused_until.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_ack_of_a_tagged_pad_repair_frees_its_entry_and_samples_nothing() {
+    let (mut b, _, seq) = sent_pad_repair(Some(pad_tag()));
+    // Everything else sent is acknowledged, so the pad repair is lost by the
+    // time threshold.
+    stamp_all(&mut b);
+    let others: Vec<u32> = b
+        .sent_frames_for_test
+        .iter()
+        .map(|f| match parse(f).unwrap() {
+            Frame::Source(s) => s.bundle_seq,
+            Frame::Repair(r) => r.bundle_seq,
+            Frame::Plain(p) => p.bundle_seq,
+        })
+        .filter(|&q| q != seq)
+        .collect();
+    ack_ids(&mut b, &others);
+    b.expire_transmissions(now_std() + Duration::from_millis(500));
+    assert!(b.instr.losses_declared >= 1, "premise: declared lost");
+    assert_eq!(
+        b.pad_repair_tags.len(),
+        0,
+        "premise: the verdict took the tag"
+    );
+    // Verdict routing is `note_h264_verdicts`' job and took the tag; put it
+    // back to see the late ACK's own handling.
+    b.pad_repair_tags.insert(seq, pad_tag());
+    b.bwe_samples_buffer.clear();
+    ack_ids(&mut b, &[seq]);
+    assert_eq!(b.pad_repair_tags.len(), 0, "released");
+    assert!(b.bwe_samples_buffer.is_empty(), "a late ack is no sample");
+}
+
+#[test]
+fn the_pad_repair_tag_map_is_bounded_and_drops_the_oldest() {
+    use crate::transport::reliable_emitter::h264::PAD_RING_CAP;
+    let mut m = block_tx::PadRepairTags::default();
+    for i in 0..(PAD_RING_CAP as u32 + 50) {
+        m.insert(i, pad_tag());
+        assert!(m.len() <= PAD_RING_CAP, "bounded at every step");
+    }
+    assert_eq!(
+        m.len(),
+        PAD_RING_CAP,
+        "full, not empty: the cap was reached"
+    );
+    assert!(m.take(0).is_none(), "the oldest went");
+    assert!(m.take(49).is_none(), "the 50 oldest went");
+    assert!(m.take(50).is_some(), "the next oldest stayed");
+    assert!(m.take(50).is_none(), "released once");
+    assert_eq!(m.len(), PAD_RING_CAP - 1);
+    // Releases keep room: a new insert evicts nothing.
+    m.insert(10_000, pad_tag());
+    assert!(m.take(51).is_some());
 }

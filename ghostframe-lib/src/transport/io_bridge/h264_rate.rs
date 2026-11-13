@@ -481,6 +481,7 @@ impl IoBridge {
         self.h264.app_probe = AppProbe::default();
         self.h264.queue_since = None;
         self.reliable_emitter.pads.clear();
+        self.pad_repair_tags.clear();
     }
 
     /// Whether the rate was cut within [`PAD_QUIET_AFTER_CUT`].

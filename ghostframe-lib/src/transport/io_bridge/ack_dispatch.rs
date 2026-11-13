@@ -416,7 +416,14 @@ impl IoBridge {
         resolved: &[ResolvedAck],
         now_for_samples: std::time::Instant,
     ) {
-        for (tx, arrival_lo16, late, _id) in resolved.iter() {
+        for (tx, arrival_lo16, late, id) in resolved.iter() {
+            // A pad repair's tag is by bundle, read (and released) here for
+            // an acknowledgement either way: a late one measured nothing.
+            let repair_tag = if tx.records.is_empty() {
+                self.pad_repair_tags.take(*id)
+            } else {
+                None
+            };
             if *late {
                 // Declared lost when it expired: either already reported to
                 // the estimator (feeding its timing now would report the same
@@ -510,7 +517,7 @@ impl IoBridge {
             };
             let emit_lo16 = ((server_emit_us / 1000) & 0xFFFF) as u16;
             let owd_ms_lo16 = arrival_lo16.wrapping_sub(emit_lo16);
-            let probe = cache_entry.and_then(|(_, probe)| probe);
+            let probe = cache_entry.and_then(|(_, probe)| probe).or(repair_tag);
             self.bwe_samples_buffer.push(BweSample {
                 tier,
                 server_emit_us,
