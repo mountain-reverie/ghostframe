@@ -48,6 +48,10 @@ async function main() {
   // run only for the e2e suite (`?e2e` on the page URL).
   const diagnostics = new URL(window.location.href).searchParams.has('e2e');
   if (diagnostics) installConsoleRing();
+  if (diagnostics) {
+    window.__ghostframeStatsSamples = 0;
+    window.__ghostframeStatsFrames = 0;
+  }
   // wasm-bindgen `--target web`: the module must be initialized before any
   // WasmClientCore construction. Awaited here rather than at module scope —
   // a top-level await fails the vite build for the configured target.
@@ -268,7 +272,13 @@ async function main() {
   // The server writes stats on the feedback stream's return half. Nothing is
   // sent until the panel subscribes, so this is idle by default.
   if (feedback) {
-    void pumpServerStream(feedback.readable, (bytes) => core.handleServerStream(bytes, nowUs()));
+    void pumpServerStream(feedback.readable, (bytes) => {
+      core.handleServerStream(bytes, nowUs());
+      if (diagnostics) {
+        window.__ghostframeStatsSamples = core.statsSamplesAccepted();
+        window.__ghostframeStatsFrames = core.statsFramesReceived();
+      }
+    });
   }
 
   // Browser → server input forwarding. Hooks pointer / wheel / keyboard

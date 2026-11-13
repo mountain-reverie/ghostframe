@@ -242,6 +242,30 @@ impl WasmClientCore {
     /// read the globals and saw 0 on sessions moving thousands of datagrams.
     /// Classified by `ClientCore::handle_datagram`'s own dispatch rather than
     /// re-tested here, so the two cannot drift.
+    /// Samples the stats rings have accepted since this core was created.
+    /// `u32`, not `u64`: a `u64` crosses as a BigInt, and at one sample a
+    /// second this overflows after 136 years. Published by `main.ts` as
+    /// `window.__ghostframeStatsSamples` for the e2e suite.
+    #[wasm_bindgen(js_name = statsSamplesAccepted)]
+    pub fn stats_samples_accepted(&self) -> u32 {
+        self.inner
+            .borrow()
+            .stats()
+            .samples_accepted()
+            .min(u64::from(u32::MAX)) as u32
+    }
+
+    /// Complete server-stream frames received since this core was created,
+    /// counted before any check. Published as `window.__ghostframeStatsFrames`.
+    #[wasm_bindgen(js_name = statsFramesReceived)]
+    pub fn stats_frames_received(&self) -> u32 {
+        self.inner
+            .borrow()
+            .stats()
+            .frames_received()
+            .min(u64::from(u32::MAX)) as u32
+    }
+
     #[wasm_bindgen(js_name = datagramCounts)]
     pub fn datagram_counts(&self) -> Result<JsValue, JsValue> {
         let (tile, frame) = self.inner.borrow().datagram_counts();
