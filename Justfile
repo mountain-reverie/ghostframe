@@ -263,6 +263,9 @@ ci-local:
     @echo "=== web client build ==="
     just build-web
     cd ghostframe-web-client && npx tsc --noEmit
+    @echo "=== wasm bundle under 512 KiB ==="
+    ci/test-check-wasm-size.sh
+    ci/check-wasm-size.sh
     @echo "=== release build ==="
     cargo build --workspace --release --exclude ghostframe-e2e
     @echo "=== release daemon carries no test-only feature ==="
