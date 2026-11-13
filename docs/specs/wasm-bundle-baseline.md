@@ -4,7 +4,7 @@
 **Git rev:** `6e9fbc1`
 **Branch:** `feat/wasm-client-crate`
 
-This is a record, not a gate. It exists so that step 4 of the wasm cutover
+This is a record. Since the stats panel it has one gate: `ci/check-wasm-size.sh` fails the build when the wasm exceeds 512 KiB; see the last section. It exists so that step 4 of the wasm cutover
 (`docs/superpowers/specs/2026-09-11-wasm-cutover-design.md`, deleting the TS
 protocol modules and rewiring `main.ts`) can compare like-for-like instead of
 against nothing. At the time of measurement both the TypeScript protocol
@@ -12,7 +12,7 @@ layer and the `ghostframe-client-wasm` crate are live in the tree, but
 `main.ts` still uses only the TypeScript path — the two builds below are
 independent, not additive.
 
-No size assertion or CI check is attached to these numbers.
+The measurements in sections 1 to 3 and the 2026-09-11 and 2026-09-12 sections have no assertion attached; only the wasm limit in the last section does.
 
 ## 1. Current bundle (TypeScript only)
 
@@ -273,3 +273,30 @@ assertion is added.
 Size-optimised profile (`opt-level = "s"`, LTO, one codegen unit, `panic = "abort"`), measured through `CARGO_PROFILE_RELEASE_*` only, nothing committed: 428,152 bytes raw, 177,089 gzip.
 
 The spec's original 320 KB cap did not hold with Leptos linked (459,444 bytes raw). PR 3 cap: 524,288 bytes raw (512 KiB), owner decision 2026-11-13.
+
+## Stats panel (Leptos in the wasm module), 2026-11-13
+
+**Before:** `aab2fa2d` (master before the stats panel landed)  
+**After:** `20924e3b` (`feat/stats-panel-e2e`)
+
+Both built from scratch with `just build-web` (`npm run build`), asset hashes masked.
+**This section is a gate** for the wasm: `ci/check-wasm-size.sh` fails the build above
+524,288 bytes (512 KiB) raw. The JS bundle has no gate.
+
+### Before
+
+| Asset | Raw bytes | Gzip bytes |
+|---|---:|---:|
+| `dist/assets/ghostframe_client_wasm_bg.[hash].wasm` | 167844 | 69619 |
+| `dist/assets/index.[hash].js` | 107893 | 30616 |
+
+### After
+
+| Asset | Raw bytes | Gzip bytes |
+|---|---:|---:|
+| `dist/assets/ghostframe_client_wasm_bg.[hash].wasm` | 459892 | 185930 |
+| `dist/assets/index.[hash].js` | 119602 | 34081 |
+
+### Wasm delta
+
+Raw: 167844 -> 459892 (+292048 bytes, 173%). Limit 524,288; headroom 64396 bytes.
