@@ -279,15 +279,14 @@ async fn a_loss_step_engages_within_two_seconds() {
 
 /// (3) Loss that ends releases the state after the dwell and does not flap.
 ///
-/// Run at a source rate of about 10 Mbit/s (`p_bytes` 40 000, fixed). FINDING:
-/// at the default scene's rate (about 180 datagrams/s) the release is never
-/// reached, even with no loss at all: the decay is time-limited (tau = 10 s),
-/// so `total` settles near 1 840 and the release's upper bound
-/// `(L + 1.64 sqrt(L + 1) + 1) / N` cannot fall under the floor 0.001 below
-/// N of about 2 640. A stream under about 260 datagrams/s stays engaged for the
-/// life of the session.
+/// Two arms. The low-rate arm runs at the default scene's rate (about 180
+/// datagrams/s). It used to stay engaged for the whole session, even with no
+/// loss: time decay left `total` near 1 840, under the 3 330 the release bound
+/// needs; `FEC_ADAPT_MIN_MASS` fixed that, at the price of a window of about
+/// 5 000 datagrams (28 s here). The high-rate arm (`p_bytes` 40 000, about
+/// 10 Mbit/s) is the case that always worked.
 #[tokio::test(start_paused = true)]
-async fn loss_that_ends_releases_without_flapping() {
+async fn loss_that_ends_releases_at_a_high_rate_without_flapping() {
     for seed in SEEDS {
         let (net, links) = stepped(vec![(1_000_000, 0.05), (4_000_000, 0.0)]);
         let r = run_scene_with(
@@ -305,6 +304,22 @@ async fn loss_that_ends_releases_without_flapping() {
         assert!(r.transport.adapt.blocks_sized > 0, "premise");
         assert!(!r.transport.adapt.engaged, "seed {seed:#x}: not released");
         // Engage once, release once: the floor state never flapped.
+        assert_eq!(
+            r.transport.adapt.floor_changes, 2,
+            "seed {seed:#x}: floor state flapped or never moved"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn loss_that_ends_releases_at_the_default_rate_without_flapping() {
+    for seed in SEEDS {
+        let (net, links) = stepped(vec![(1_000_000, 0.05), (4_000_000, 0.0)]);
+        let r = run_scene(seed, net, links, DropPlan::default(), 200_000).await;
+        line("release-low", seed, &r);
+        assert!(r.s2c_datagrams_dropped > 0, "premise");
+        assert!(repairs(&r) > 0, "premise: it engaged and sent repairs");
+        assert!(!r.transport.adapt.engaged, "seed {seed:#x}: not released");
         assert_eq!(
             r.transport.adapt.floor_changes, 2,
             "seed {seed:#x}: floor state flapped or never moved"
