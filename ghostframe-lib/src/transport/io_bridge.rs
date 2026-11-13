@@ -72,6 +72,9 @@ use session::{
     HELLO_DEADLINE, TAKEOVER_MIN_INTERVAL,
 };
 
+#[path = "io_bridge/stats_service.rs"]
+mod stats_service;
+
 #[path = "io_bridge/ack_dispatch.rs"]
 mod ack_dispatch;
 pub(crate) use ack_dispatch::handle_datagram_payload;
@@ -735,6 +738,18 @@ pub struct IoBridge {
     /// When the current session was established, for session-duration
     /// reporting on disconnect. `None` between sessions.
     session_started_at: Option<std::time::Instant>,
+    /// Stats subscriptions, by connection handle. Cleared per handle by
+    /// `forget_session`; see `stats_service`.
+    stats_sessions: HashMap<ConnectionHandle, stats_service::StatsSession>,
+    /// What the stats service has done (cumulative).
+    stats_counters: stats_service::StatsCounters,
+    /// The last schema id handed out. Process-wide and monotonic (skipping 0),
+    /// so a schema from a new connection never repeats one the client saw.
+    stats_schema_seq: u16,
+    /// Unit tests only: when `Some`, stats frames are recorded here and
+    /// reported as written instead of going to a connection.
+    #[cfg(test)]
+    stats_capture_for_test: Option<Vec<(ConnectionHandle, Vec<u8>)>>,
     /// When the last session ended, so the next connect can report how long
     /// the server was serving nobody. `None` before the first disconnect.
     last_disconnect_at: Option<std::time::Instant>,
@@ -1486,6 +1501,11 @@ impl IoBridge {
             #[cfg(test)]
             loop_arm_trace: Vec::new(),
             session_started_at: None,
+            stats_sessions: HashMap::new(),
+            stats_counters: stats_service::StatsCounters::default(),
+            stats_schema_seq: 0,
+            #[cfg(test)]
+            stats_capture_for_test: None,
             last_disconnect_at: None,
             last_takeover_at: None,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
@@ -1871,6 +1891,7 @@ impl IoBridge {
     /// - `0x03` HELLO_MSG_TYPE     (2 bytes)   — capability advertisement
     /// - `0x04` DECODE_ERROR_MSG_TYPE (5 bytes) — per-tile decode failure
     /// - `0x05` INPUT_MSG_TYPE     (variable) — pointer/wheel/key event
+    /// - `0x0B` STATS_SUBSCRIBE_MSG_TYPE (2 bytes) — start/stop the stats stream
     ///
     /// Unknown message types abort parsing of the rest of the buffer
     /// (we can't safely advance past an unknown variable-length message).
@@ -1886,8 +1907,10 @@ impl IoBridge {
         };
         use crate::transport::feedback::{FEEDBACK_MSG_TYPE, FEEDBACK_SIZE};
         use ghostframe_protocol::feedback_stream::{
-            ResetRequest, RESET_REQUEST_MSG_TYPE, RESET_REQUEST_SIZE,
+            ResetRequest, RESET_REQUEST_MSG_TYPE, RESET_REQUEST_SIZE, STATS_SUBSCRIBE_MSG_TYPE,
+            STATS_SUBSCRIBE_SIZE,
         };
+        use ghostframe_protocol::stats::StatsSubscribe;
 
         // Append the new chunk to our accumulator. QUIC stream reads can
         // split a single browser-side write across multiple deliveries
@@ -2025,6 +2048,18 @@ impl IoBridge {
                         }
                     }
                     offset += DISPLAY_MODE_SIZE;
+                }
+                STATS_SUBSCRIBE_MSG_TYPE => {
+                    if buf.len() - offset < STATS_SUBSCRIBE_SIZE {
+                        break;
+                    }
+                    match StatsSubscribe::decode(&buf[offset..]) {
+                        Ok(msg) => self.apply_stats_subscribe(from, msg.on),
+                        // Fixed length: the stream stays in step, so the
+                        // message is skipped and the next one still parses.
+                        Err(_) => self.note_malformed_stats_subscribe(from),
+                    }
+                    offset += STATS_SUBSCRIBE_SIZE;
                 }
                 crate::transport::input_inject::INPUT_MSG_TYPE => {
                     use crate::transport::input_inject::{apply_input, decode_input_msg};
