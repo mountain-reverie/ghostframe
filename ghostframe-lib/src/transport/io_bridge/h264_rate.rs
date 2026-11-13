@@ -1021,7 +1021,7 @@ mod tests {
             depart_us: None,
             dep_idx: None,
         };
-        b.apply_h264_acks(&[(pad_tx.clone(), 0, false, 5)], now);
+        b.apply_h264_acks(&[(pad_tx.clone(), 0, false)], now);
         assert!(b.h264.last_ack_progress.is_none(), "a pad is no progress");
         let frag_tx = crate::transport::transmission_ledger::Transmission {
             records: smallvec::smallvec![(
@@ -1033,7 +1033,7 @@ mod tests {
             )],
             ..pad_tx
         };
-        b.apply_h264_acks(&[(frag_tx, 0, false, 6)], now);
+        b.apply_h264_acks(&[(frag_tx, 0, false)], now);
         assert_eq!(b.h264.last_ack_progress, Some(now), "a fragment is");
     }
 

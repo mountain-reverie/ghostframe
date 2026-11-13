@@ -32,14 +32,12 @@ pub(crate) fn handle_datagram_payload(payload: &[u8]) -> Option<&'static [u8]> {
 }
 
 /// One resolved ACK entry: the transmission (which carries its records' content),
-/// the client arrival stamp, whether it was already reported lost (so no
-/// timing sample), and the ledger id (`bundle_seq`) the entry named, which a
-/// bundle with no record (a REPAIR frame) is found by.
+/// the client arrival stamp, and whether it was already reported lost (so no
+/// timing sample).
 type ResolvedAck = (
     crate::transport::transmission_ledger::Transmission,
     u16,
     bool,
-    u32,
 );
 
 /// How many resolved or lost bundles stay findable for a CONTENT_REJECTED that
@@ -182,7 +180,7 @@ impl IoBridge {
         // its transmission was declared lost.
         let emit_keys: Vec<crate::transport::reliable_emitter::EmitKey> = resolved
             .iter()
-            .flat_map(|(tx, _, _, _)| tx.records())
+            .flat_map(|(tx, _, _)| tx.records())
             .filter_map(|(_, c)| c.tile())
             .collect();
         // Samples come from the ledger record, not the cache entry.
@@ -266,7 +264,7 @@ impl IoBridge {
                         self.loss_window
                             .record(tx.emit_us as u32, false, tx.records.len() as u32);
                         self.recent_bundles.remember(id, &tx);
-                        Some((tx, arrival_lo16, false, id))
+                        Some((tx, arrival_lo16, false))
                     }
                     Some(Resolution::Late { tx }) => {
                         self.reliable_emitter.note_ack(now_for_samples);
@@ -309,7 +307,7 @@ impl IoBridge {
                                     .wrapping_sub(tx.emit_us as u32)
                             );
                         }
-                        Some((tx, arrival_lo16, true, id))
+                        Some((tx, arrival_lo16, true))
                     }
                     None => None,
                 };
@@ -347,7 +345,7 @@ impl IoBridge {
         }
         if crate::transport::reliable_emitter::rto_probe_enabled() {
             let ack_us = self.reliable_emitter.emit_us(now_for_samples) as i64;
-            for (tx, _, _, _) in resolved.iter() {
+            for (tx, _, _) in resolved.iter() {
                 for (_, c) in tx.records() {
                     let Some(k) = c.tile() else { continue };
                     let codec = self
@@ -416,7 +414,7 @@ impl IoBridge {
         resolved: &[ResolvedAck],
         now_for_samples: std::time::Instant,
     ) {
-        for (tx, arrival_lo16, late, _id) in resolved.iter() {
+        for (tx, arrival_lo16, late) in resolved.iter() {
             if *late {
                 // Declared lost when it expired: either already reported to
                 // the estimator (feeding its timing now would report the same
@@ -528,7 +526,7 @@ impl IoBridge {
     /// Release fragment coverage, scheduler and palette state for each
     /// acknowledged tile-pass.
     pub(super) fn apply_ack_coverage(&mut self, resolved: &[ResolvedAck]) {
-        for (_, content) in resolved.iter().flat_map(|(tx, _, _, _)| tx.records()) {
+        for (_, content) in resolved.iter().flat_map(|(tx, _, _)| tx.records()) {
             let Some(emit_key) = content.tile() else {
                 continue;
             };
