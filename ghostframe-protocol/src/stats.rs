@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The connection-stats wire format: how a client asks the server for its
 //! numbers, and how the server sends them.
 //!

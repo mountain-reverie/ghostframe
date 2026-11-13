@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The server half of the stats panel, end to end and with no UI: a real
 //! `ClientNet` subscribes on the feedback stream, the real `IoBridge` answers
 //! on its return half, and the numbers are decoded with the protocol crate.
