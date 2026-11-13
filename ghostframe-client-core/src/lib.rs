@@ -410,7 +410,20 @@ impl ClientCore {
 
     /// Drain one pending outbound message; call until None.
     pub fn poll_transmit(&mut self, _now_us: u64) -> Option<PollOutput> {
-        self.outbox.pop_front()
+        let out = self.outbox.pop_front()?;
+        // Counted where every NACK passes on its way out, so the tally cannot
+        // miss one of the three places that queue them.
+        if let PollOutput::Datagram(d) = &out {
+            if d.len() >= 2 && d[0] == ghostframe_protocol::protocol::TILE_NACK_ENVELOPE {
+                self.stats.local.counters.nacks_sent = self
+                    .stats
+                    .local
+                    .counters
+                    .nacks_sent
+                    .saturating_add(u64::from(d[1]));
+            }
+        }
+        Some(out)
     }
 
     /// Ask the server to start (`true`) or stop (`false`) sending stats
@@ -457,7 +470,7 @@ impl ClientCore {
     /// Earliest deadline (µs) at which `on_timeout` must be called.
     ///
     /// = min(ack batcher, nack batcher, coverage-NACK debounce, next
-    /// tail sweep, next feedback emit). The
+    /// tail sweep, next feedback emit, next local stats sample). The
     /// tail sweep and feedback deadlines are always armed (mirroring
     /// main.ts's always-running rAF loop / 100ms `setInterval`), so this
     /// is never `None` once the core has been constructed.
@@ -479,6 +492,7 @@ impl ClientCore {
         {
             deadline = deadline.min(d);
         }
+        deadline = deadline.min(self.stats.next_local_sample_us());
         Some(deadline)
     }
 
@@ -762,6 +776,9 @@ impl ClientCore {
             }
         }
         self.tail_sweep(now_us);
+        if now_us >= self.stats.next_local_sample_us() {
+            self.stats.sample_local(now_us, self.wire_loss.stats());
+        }
         if now_us >= self.next_feedback_us {
             let msg = self.loss_tracker.encode_feedback(now_us);
             self.outbox.push_back(PollOutput::Stream(msg));
@@ -839,5 +856,45 @@ mod nack_order_tests {
         let mut sorted = sent.clone();
         sorted.sort_unstable();
         assert_eq!(sent, sorted);
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    fn row_rate(core: &ClientCore, now_us: u64, label: &str) -> Option<f64> {
+        core.stats()
+            .view(now_us)
+            .groups
+            .iter()
+            .flat_map(|g| g.rows.iter())
+            .find(|r| r.label == label)
+            .unwrap_or_else(|| panic!("no row {label}"))
+            .current
+    }
+
+    /// NACKs are counted as they leave through `poll_transmit`, whichever of
+    /// the three queuing sites produced the datagram.
+    #[test]
+    fn nacks_sent_counts_entries_as_they_leave() {
+        let mut core = ClientCore::new(ClientConfig::default(), 0);
+        while core.poll_transmit(0).is_some() {}
+        core.on_timeout(1_000_000); // local baseline
+        for x in 0..3u8 {
+            core.queue_pass_nack(1, x, 0, 0, 1_100_000);
+        }
+        core.on_timeout(1_100_000 + NACK_DEBOUNCE_US);
+        let mut nack_datagrams = 0;
+        while let Some(out) = core.poll_transmit(0) {
+            if let PollOutput::Datagram(d) = out {
+                if d.first() == Some(&ghostframe_protocol::protocol::TILE_NACK_ENVELOPE) {
+                    nack_datagrams += 1;
+                }
+            }
+        }
+        assert_eq!(nack_datagrams, 1, "premise: one NACK datagram went out");
+        core.on_timeout(2_000_000);
+        assert_eq!(row_rate(&core, 2_000_000, "NACKs sent"), Some(3.0));
     }
 }

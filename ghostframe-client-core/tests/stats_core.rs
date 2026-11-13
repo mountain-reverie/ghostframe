@@ -2,6 +2,7 @@
 //! stream, and the local measurements.
 
 use ghostframe_client_core::{ClientConfig, ClientCore, PollOutput, RowView, StatsView};
+use ghostframe_protocol::protocol::{fragment_tile, Codec, TileFragmentInputs, TILE_DATAGRAM_FLAG};
 use ghostframe_protocol::stats::{
     MetricDescriptor, MetricGroup, MetricKind, MetricValue, StatsSample, StatsSchema,
 };
@@ -71,4 +72,43 @@ fn the_server_stream_reaches_the_view() {
     assert_eq!(view.client_version, "0.1.0 (aab2fa2d)");
     assert!(view.versions_match);
     assert_eq!(core.stats().samples_rejected(), 0);
+}
+
+fn solid_datagram(frame_seq: u32, x: u8) -> Vec<u8> {
+    let mut dgs = fragment_tile(
+        &TileFragmentInputs {
+            frame_seq: frame_seq | TILE_DATAGRAM_FLAG,
+            tile_x: x,
+            tile_y: 0,
+            codec: Codec::Solid,
+            generation: 1,
+            pass: 0,
+            timestamp_us: 0,
+        },
+        &[0x11, 0x22, 0x33, 0xFF],
+        1200,
+    );
+    assert_eq!(dgs.len(), 1);
+    dgs.remove(0)
+}
+
+#[test]
+fn local_metrics_are_measured_without_any_subscription() {
+    let mut core = test_core();
+    core.on_timeout(1_000_000); // baseline
+    let mut bytes = 0u64;
+    for x in 0..5u8 {
+        let dg = solid_datagram(1, x);
+        bytes += dg.len() as u64;
+        core.handle_datagram(&dg, 1_500_000);
+    }
+    core.record_paints(30);
+    core.on_timeout(2_000_000);
+    let view = core.stats().view(2_000_000);
+    assert_eq!(row(&view, "Solid tiles").current, Some(5.0));
+    assert_eq!(row(&view, "Painted frames").current, Some(30.0));
+    let bits = row(&view, "Received throughput").current.expect("measured");
+    assert_eq!(bits, (bytes * 8) as f64);
+    assert!(bits > 0.0, "the measurement fired");
+    assert_eq!(row(&view, "PalRLE tiles").current, Some(0.0));
 }

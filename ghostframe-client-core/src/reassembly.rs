@@ -115,12 +115,46 @@ impl ClientCore {
     /// by the same [`crate::TileDecoder`] a consumer can run elsewhere.
     pub fn handle_datagram(&mut self, bytes: &[u8], now_us: u64) -> Vec<Event> {
         let events = self.handle_datagram_payloads(bytes, now_us);
+        self.stats.local.counters.rx_bytes = self
+            .stats
+            .local
+            .counters
+            .rx_bytes
+            .saturating_add(bytes.len() as u64);
+        self.tally_events(&events);
         match self.decoder.as_mut() {
             Some(decoder) => events
                 .into_iter()
                 .filter_map(|e| decoder.decode(e))
                 .collect(),
             None => events,
+        }
+    }
+
+    /// Count what a datagram produced for the stats panel's codec mix.
+    /// Runs on the payload events, before the pixel decode turns them into
+    /// `TileReady`, so `Decoded` and `Payload` delivery count the same.
+    fn tally_events(&mut self, events: &[Event]) {
+        let c = &mut self.stats.local.counters;
+        for e in events {
+            match e {
+                Event::TilePayload { data, .. } => match data {
+                    TileData::Solid(_) => c.tiles_solid = c.tiles_solid.saturating_add(1),
+                    TileData::PalRle { .. } => c.tiles_palrle = c.tiles_palrle.saturating_add(1),
+                    TileData::Cdf53 { .. } | TileData::Cdf53Wire { .. } => {
+                        c.passes_cdf53 = c.passes_cdf53.saturating_add(1)
+                    }
+                },
+                Event::NeedsH264 { payload, .. } => {
+                    c.frames_h264 = c.frames_h264.saturating_add(1);
+                    c.h264_bytes = c.h264_bytes.saturating_add(payload.len() as u64);
+                }
+                Event::DecodeError { .. } => c.decode_errors = c.decode_errors.saturating_add(1),
+                Event::TileReady { .. }
+                | Event::FrameDimensions { .. }
+                | Event::PaletteUpdated { .. }
+                | Event::Evicted { .. } => {}
+            }
         }
     }
 
