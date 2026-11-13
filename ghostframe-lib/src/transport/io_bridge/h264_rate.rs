@@ -1335,14 +1335,19 @@ mod tests {
         });
         let t = now_std();
         let before = b.h264.rate.applied().expect("a rate is in force");
-        // Four seconds on, half of overhead has been sent.
+        // Four seconds on, as many repair bytes as source bytes have been
+        // sent (a measured overhead of 1.0, clamped to RHO_MAX by the policy).
+        // The size matters: the policy smooths the estimate over 250 ms, so a
+        // fall of 1 / 1.5 spread over a second is absorbed by the dead band and
+        // never reads as a cut even when the estimate itself is divided. At a
+        // halving the divided estimate is a cut within the 1 s look-back.
         let step = |b: &mut IoBridge, ms: u64, src: u64, rep: u64| {
             b.block_tx.source_bytes = src;
             b.block_tx.repair_bytes = rep;
             b.h264_rate_step_refs(t + Duration::from_millis(ms));
         };
         for i in 1..=40u64 {
-            step(&mut b, i * 100, i * 100_000, i * 50_000);
+            step(&mut b, i * 100, i * 100_000, i * 100_000);
         }
         let after = b.h264.rate.applied().expect("a rate");
         assert!(after > 0 && after < before, "premise: {before} -> {after}");
