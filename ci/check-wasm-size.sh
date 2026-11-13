@@ -18,7 +18,8 @@
 set -euo pipefail
 # A relative assets-dir is resolved from the caller's cwd.
 arg_dir="${1:-}"
-[[ -n "$arg_dir" ]] && arg_dir=$(realpath "$arg_dir")
+# -m: a missing directory still resolves, and reaches the "no .wasm file" error.
+[[ -n "$arg_dir" ]] && arg_dir=$(realpath -m "$arg_dir")
 cd "$(dirname "$0")/.."
 
 assets="${arg_dir:-ghostframe-web-client/dist/assets}"

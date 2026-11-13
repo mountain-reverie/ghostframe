@@ -4,7 +4,7 @@
 **Git rev:** `6e9fbc1`
 **Branch:** `feat/wasm-client-crate`
 
-This is a record. Since the stats panel it has one gate: `ci/check-wasm-size.sh` fails the build when the wasm exceeds 512 KiB; see the last section. It exists so that step 4 of the wasm cutover
+This is a record. It exists so that step 4 of the wasm cutover
 (`docs/superpowers/specs/2026-09-11-wasm-cutover-design.md`, deleting the TS
 protocol modules and rewiring `main.ts`) can compare like-for-like instead of
 against nothing. At the time of measurement both the TypeScript protocol
@@ -12,7 +12,10 @@ layer and the `ghostframe-client-wasm` crate are live in the tree, but
 `main.ts` still uses only the TypeScript path — the two builds below are
 independent, not additive.
 
-The measurements in sections 1 to 3 and the 2026-09-11 and 2026-09-12 sections have no assertion attached; only the wasm limit in the last section does.
+Since the stats panel it has one gate: `ci/check-wasm-size.sh` fails the
+build when the wasm exceeds 512 KiB (see the last section). The measurements
+in sections 1 to 3 and the 2026-09-11 and 2026-09-12 sections have no
+assertion attached; only the wasm limit in the last section does.
 
 ## 1. Current bundle (TypeScript only)
 
