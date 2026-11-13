@@ -288,8 +288,6 @@ pub struct RunOptions {
     /// Run the adaptive FEC mode (no parameters live until a controller sets
     /// some). Ignored when `fec_blocks` is set.
     pub fec_adaptive: bool,
-    /// Turn padding-as-repair off: the A/B arm of the E10 value gate.
-    pub no_pad_repair: bool,
     /// How the server's event loop is driven. See [`HarnessMode`].
     pub mode: HarnessMode,
     /// The client offers no hybrid post-quantum group, so the handshake
@@ -1161,7 +1159,6 @@ async fn run_inner(
         (None, false) => env_transport.fec_mode,
     };
     bridge.set_fec_mode_for_test(fec_mode);
-    bridge.set_pad_repair_off_for_test(opts.no_pad_repair);
     if let Some(floor) = scene.tick_budget_floor_bytes {
         bridge.set_tick_budget_floor_bytes(floor);
     }
