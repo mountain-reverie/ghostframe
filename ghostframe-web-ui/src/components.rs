@@ -45,7 +45,7 @@ pub fn MetricRow(id: String, view: RwSignal<StatsView>) -> impl IntoView {
             data-testid="stats-row"
             data-label=move || row.get().map(|r| r.label).unwrap_or_default()
             data-current=move || {
-                row.get().and_then(|r| r.current).map(|v| v.to_string()).unwrap_or_default()
+                Some(row.get().and_then(|r| r.current).map(|v| v.to_string()).unwrap_or_default())
             }
             data-stale=move || row.get().is_some_and(|r| r.stale).to_string()
             class:gf-stale=move || row.get().is_some_and(|r| r.stale)
