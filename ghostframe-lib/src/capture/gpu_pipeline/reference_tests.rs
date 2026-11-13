@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The SAD reference is a per-tile last-committed reference (damage-driven
 //! encoding, PR 3): a tile's reference pixels are replaced only when the tile
 //! is committed dirty, so sub-threshold change accumulates against it.

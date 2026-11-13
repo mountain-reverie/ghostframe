@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! VA-API H.264 decode: access units in, hardware surfaces out.
 //!
 //! Mirrors ffmpeg's canonical `hw_decode.c`: set `hw_device_ctx`, override

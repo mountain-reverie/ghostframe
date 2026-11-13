@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `login` and `logout`: join the tailnet once, interactively or with
 //! `TS_AUTHKEY`, and leave it again.
 //!

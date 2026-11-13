@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Session lifecycle for the single live client: HELLO, takeover, eviction and
 //! the deadlines that close a connection.
 //!

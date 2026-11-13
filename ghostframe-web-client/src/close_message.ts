@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 /** QUIC application close code the server uses for a session whose peer no
  * longer passes the tailnet access rule (ghostframe-lib, `CLOSE_CODE_ACCESS_REVOKED`). */
 export const CLOSE_CODE_ACCESS_REVOKED = 0x6704;

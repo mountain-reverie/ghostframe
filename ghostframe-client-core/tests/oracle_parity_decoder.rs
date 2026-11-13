@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Oracle port of ghostframe-web-client/tests/parity_decoder.test.ts
 //! (wire-seq FEC).
 

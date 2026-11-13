@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Full-grid CDF 5/3 tile decoder: bit-planes in a per-tile plane store, one
 //! workgroup per listed tile reconstructing from it.
 //!

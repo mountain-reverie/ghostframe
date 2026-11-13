@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! A copy of a fragment the client already holds (server probe padding, or any
 //! duplicate) must be acknowledged and must never decode a frame twice.
 

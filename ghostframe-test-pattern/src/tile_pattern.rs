@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `--tile-pattern <class> --x11-sink` mode.
 //!
 //! Fills the full scanout framebuffer with a 32×32 `ContentClass` fixture tile

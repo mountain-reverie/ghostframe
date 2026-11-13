@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The probe cache of H.264 fragments: what the emitter keeps of the access
 //! units whose fragments are not all acknowledged yet.
 //!

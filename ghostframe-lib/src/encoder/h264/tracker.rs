@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Per-frame state ring for the `RefManager` (design 3.2 and 5.3).
 //!
 //! A ring of [`TRACKER_RING`] frames keyed by `frame_seq % 256` with a seq

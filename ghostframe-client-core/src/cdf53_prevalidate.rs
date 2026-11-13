@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Port of `ghostframe-web-client/src/prevalidate_cdf53.ts`.
 //!
 //! Parses one CDF53 pass payload into 3 × 128-byte bit-planes (B, G, R

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Import an externally produced dmabuf as wgpu textures.
 //!
 //! The mirror of [`crate::export`], and subject to one constraint that

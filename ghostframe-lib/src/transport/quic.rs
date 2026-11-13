@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Quinn-proto QUIC endpoint wrapper.
 //!
 //! Task 4: constructs a `quinn_proto::Endpoint` configured for WebTransport

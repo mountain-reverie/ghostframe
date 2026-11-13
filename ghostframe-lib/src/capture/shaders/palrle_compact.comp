@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // palrle_compact.comp
 // Stage 1.5: produce the dense list of (dirty AND count<=16) tile indices.
 //

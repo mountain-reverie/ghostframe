@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // When two server frames land in one rAF tick, the NEWER one must be what is
 // on screen for a tile, whatever codec each used. The renderer used to paint
 // in a fixed codec order (PalRle, Cdf53, Solid, H.264), so an older Solid

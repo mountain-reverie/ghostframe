@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! H.264 frames as members of the transport: the per-frame tracker, the
 //! stall flag the classifier reads, the bridge's IDR accounting and the
 //! encoder's backpressure. What recovers from loss is the `RefManager`

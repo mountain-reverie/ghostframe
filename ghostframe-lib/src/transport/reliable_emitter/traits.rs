@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Injectable boundaries for unit/integration testing.
 
 /// The emitter calls `send` for every datagram (source or parity) it

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # Regenerates ghostframe-lib/src/encoder/h264/testdata/openh264_2_6_camera_ltr_128x128.*
 # from a real libopenh264 (2.6.x). The committed fixture is what the tests read;
 # run this only to change it.

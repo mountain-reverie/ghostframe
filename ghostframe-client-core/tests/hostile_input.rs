@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! A hostile or buggy server must not be able to drive the client into
 //! unbounded allocation or out-of-grid work through the reassembly path.
 //!

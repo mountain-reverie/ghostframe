@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! WS-C2 harness baseline: can a browserless scene SEE a frame that holds the
 //! server's event loop?
 //!

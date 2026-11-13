@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Small helpers shared by the capture backends and `main`.
 
 /// Read CLOCK_MONOTONIC and return the value as nanoseconds.

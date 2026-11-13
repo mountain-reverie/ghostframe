@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! A flush is one GPU submit however many codecs it carries, and joining the
 //! queue-ordered paths into it did not change what is painted. Requires a GPU
 //! (`WgpuContext::new().expect`: no GPU is a failure, not a skip); not named

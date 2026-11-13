@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Per-session retransmit cache. Holds the emitted datagram of each tile pass by EmitKey for
 //! re-emission on a loss verdict, a probe or a NACK. Unbounded — entries live until ACKed,
 //! superseded via `cancel_for_tile`, or the session ends via `clear`.

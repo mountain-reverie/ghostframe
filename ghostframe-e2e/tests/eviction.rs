@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! M4a acceptance: a second client displaces the first, and the first
 //! learns *why*.
 //!

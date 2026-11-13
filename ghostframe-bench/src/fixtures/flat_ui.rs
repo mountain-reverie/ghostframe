@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 use super::{BPP, TILE_BYTES, TILE_SIZE};
 
 /// 32×32 tile drawn with 16 fixed BGRA palette entries — representative of

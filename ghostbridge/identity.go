@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 package main
 
 // Peer identity lookups, and the hook the web server uses to ask Rust

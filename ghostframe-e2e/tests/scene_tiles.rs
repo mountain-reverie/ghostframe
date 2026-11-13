@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Tests for the scene_tiles harness module: TileSpec -> TileWork encoders.
 
 use ghostframe_e2e::harness::scene_tiles::{encode_tile, TileSpec};

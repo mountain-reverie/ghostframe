@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The render thread's frame clock: when `flush` + `publish` may run.
 //!
 //! Applying an event to the `Renderer` is cheap; `flush` (a compute pass and a

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # ci/skip-list-to-nextest-expr.sh
 #
 # Reads ci/skip-list.txt and emits a cargo-nextest filter expression that

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Library configuration, parsed once at the executable boundary.
 //!
 //! `ghostframe-lib` must never read `std::env` outside this file. Environment

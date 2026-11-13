@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Validate + materialize a PalRLE payload into a 512 B indices buffer, and
 //! a full pixel decode into a 4096-byte RGBA tile buffer.
 //!

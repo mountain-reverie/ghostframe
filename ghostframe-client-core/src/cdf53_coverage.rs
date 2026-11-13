@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Port of `ghostframe-web-client/src/cdf53_coverage.ts`.
 //!
 //! Per-(tile, generation) CDF53 pass-coverage bookkeeping. Holds the

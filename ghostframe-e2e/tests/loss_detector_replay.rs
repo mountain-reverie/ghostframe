@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! P5b: a recorded `NetSim::decide` trace replayed into the loss detector.
 //!
 //! No sockets, no harness, no clock: the datagrams of a fixed-seed netsim run

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Solid codec — instanced quad with per-instance (tile_x, tile_y, color_packed).
 // Each instance covers a 32×32 tile in framebuffer (rgba8unorm) coordinates.
 

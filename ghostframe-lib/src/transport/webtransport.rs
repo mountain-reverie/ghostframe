@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Minimal HTTP/3 + WebTransport handshake, implemented as a sans-IO layer on
 //! top of quinn-proto.
 //!

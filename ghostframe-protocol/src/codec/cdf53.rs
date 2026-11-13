@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! CPU reference implementation of CDF 5/3 wavelet codec.
 //!
 //! This is the algorithmic source of truth for the codec:

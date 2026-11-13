@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 import { protocol } from './protocol_constants.js';
 
 // Belt-and-braces bound on the framebuffer size the server may ask for.

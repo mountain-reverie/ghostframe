@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Task 15a/15b: the browserless netsim scene runner.
 //!
 //! Task 15a proved a real `IoBridge` and a real `ClientNet` can establish a

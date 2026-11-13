@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Measurement scenes for the "nested congestion control" hypothesis
 //! (docs/reviews/2026-10-07-protocol-comparative-review.md section 4.2 and
 //! section 5 item 2): the server's goog_cc bandwidth estimator is layered on

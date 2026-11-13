@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The server GPU's CDF 5/3 forward against the CPU oracle, `cdf53::forward`,
 //! exactly. Two entry points: `forward_cdf53_tiles` (the escalation/fallback
 //! dispatch) on adversarial tiles, and a full noise frame through

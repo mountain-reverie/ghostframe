@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Text-under-motion scene runner: a scrolling (or, as control, static) text
 //! document on a shaped link, measured from server telemetry and from
 //! screenshots of the browser's canvas.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // handleDatagrams (one wasm crossing per rAF) must be indistinguishable from
 // feeding the same datagrams one at a time: same events, same order, same
 // core state afterwards. Anything else would make the batching a behaviour

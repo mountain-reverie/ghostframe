@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Per-scene aggregation for the M3.5 codec_report.
 
 use std::collections::BTreeMap;

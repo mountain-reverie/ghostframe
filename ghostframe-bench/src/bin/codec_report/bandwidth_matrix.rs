@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! M3.6c bandwidth-axis bench: re-runs each scene at 4 bandwidth caps
 //! by setting `GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP` and
 //! `GHOSTFRAME_INBOUND_LOSS_PROBABILITY` before each scene and clearing

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Test support for tests that capture `tracing` output through a scoped
 //! (thread-local) subscriber.
 

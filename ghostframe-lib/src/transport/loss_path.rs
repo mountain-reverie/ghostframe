@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The loss path of D1 F4 part 2, as a function of the two things it joins:
 //! the transmission ledger (what is outstanding, in departure order) and the
 //! reliable emitter (what content is still current, and the probe timer).

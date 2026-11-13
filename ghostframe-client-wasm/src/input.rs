@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Input **encoding** only. Capture is platform-bound and stays in
 //! `src/input/wire.ts`; this is the half that moves.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! XDamage integration: reports which screen tiles changed since the last
 //! drain, as an honest tri-state [`Damage`].
 //!

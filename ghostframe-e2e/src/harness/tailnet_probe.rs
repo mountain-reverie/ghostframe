@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Browserless probes of a containerised server over the tailnet, for the
 //! peer-access tests: a plain HTTP GET through `TestNode::dial_tcp`, and a
 //! bare QUIC handshake through `TestNode::dial`, both seen from the test

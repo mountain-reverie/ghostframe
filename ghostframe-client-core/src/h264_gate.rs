@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The H.264 reference gate (design 7.1) and the frame-ack window (6.2).
 //!
 //! Pure: no clock of its own (every call that needs time takes `now_us`), no

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // palette_subset_fold.comp
 // Stage 2b: detect palette A ⊆ palette B and arrange A's tiles to use B.
 //

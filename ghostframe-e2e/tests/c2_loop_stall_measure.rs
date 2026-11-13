@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! WS-C2 MEASUREMENT ONLY (not a gate): how long does `IoBridge::process_frame`
 //! hold the event loop, and how late is an inbound packet handled meanwhile?
 //!

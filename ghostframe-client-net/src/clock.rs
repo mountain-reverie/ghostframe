@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `Instant` that matches quinn-proto's own conditional type.
 //!
 //! quinn-proto picks its internal `Instant` with

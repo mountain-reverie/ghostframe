@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // The web client acknowledges H.264 fragments exactly as the native client
 // does: both are ClientCore, reached here through the wasm boundary. The
 // server records every H.264 fragment in its transmission ledger under a real

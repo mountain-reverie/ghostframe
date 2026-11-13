@@ -3,6 +3,8 @@
 # The wire-format constants (TILE_*, ACK_*, CDF53_*, …) moved into the
 # `ghostframe-protocol` crate; parse it too so those #defines stay in the
 # exported header exactly as before the extraction.
+header = "/* SPDX-License-Identifier: AGPL-3.0-or-later */"
+
 [parse]
 parse_deps = true
 include = ["ghostframe-protocol"]

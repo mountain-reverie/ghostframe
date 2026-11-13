@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! An in-memory byte pipe standing in for the ghostbridge socketpair in the
 //! browserless harness.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Tile-granular dirty tracking across multiple frames of history.
 //!
 //! Each export buffer the client fills may be several frames stale: the

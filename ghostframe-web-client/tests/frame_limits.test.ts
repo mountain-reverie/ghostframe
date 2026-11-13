@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 import { describe, it, expect } from 'vitest';
 import { MAX_FRAME_DIMENSION, checkFrameDimensions } from '../src/frame_limits';
 import { protocol } from '../src/protocol_constants';

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Just enough H.264 bitstream reading to answer two questions the decoders
 //! cannot answer for us, plus one rewrite. Backend-independent and pure: no
 //! decoder, no allocation beyond the NAL being looked at.

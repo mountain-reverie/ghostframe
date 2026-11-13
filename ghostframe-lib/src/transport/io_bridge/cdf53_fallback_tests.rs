@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! A dirty tile no tile encoder can carry goes out as CDF 5/3, never Raw, and
 //! decodes to exactly the pixels it was sent from.
 //!

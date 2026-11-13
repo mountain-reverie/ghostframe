@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Batched-ACK datagram sender. Buffers per-tile-pass ACK entries; flushes
 //! on either >= MAX_FRESH_ENTRIES_PER_BATCH entries OR 5ms since the first
 //! queued entry. Ports `ghostframe-web-client/src/ack.ts`, but time is

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Command-line surface: `ghostframe login|logout|connect`.
 
 use crate::chord::Prefix;

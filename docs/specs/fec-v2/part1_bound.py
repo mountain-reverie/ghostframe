@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Upper bound on the share of retransmissions FEC could avoid, from WS-C3's
 browserless measurements (data_c3_rows.txt, copied from gf-c3/target/tmp).
 

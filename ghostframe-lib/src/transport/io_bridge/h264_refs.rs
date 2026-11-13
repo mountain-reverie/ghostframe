@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Acked-reference H.264 on the event loop (Phase B of the H.264 rework, design
 //! sections 3 to 5).
 //!

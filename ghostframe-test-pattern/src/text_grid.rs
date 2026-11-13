@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `--text-grid` pattern: paint a known ASCII string at known coordinates.
 //!
 //! The rendered text and pixel coords are part of the public surface of this

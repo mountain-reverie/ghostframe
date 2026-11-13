@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use ghostframe_client_core::Event as CoreEvent;
 use std::net::SocketAddr;
 

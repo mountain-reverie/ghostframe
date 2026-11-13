@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Muting ffmpeg's global log level, safely.
 //!
 //! Lives apart from `probe.rs` because it is not a probe concern and not a

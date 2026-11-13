@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! quinn's congestion controller under D1 design A: a window derived from the
 //! bandwidth estimate, not a controller of its own.
 //!

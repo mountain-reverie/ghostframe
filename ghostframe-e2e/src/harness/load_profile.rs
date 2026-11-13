@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Generated, sustained scene load for the browserless harness.
 //!
 //! A scripted `BrowserlessScene` lists its frames explicitly, which is right

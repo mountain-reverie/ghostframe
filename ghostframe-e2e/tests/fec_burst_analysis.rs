@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Offline analysis: how much of a loss does the reliable emitter's fixed
 //! XOR parity (K = 10, one parity per group, emitted
 //! `PARITY_INTERLEAVE_OFFSET` = 20 wire_seqs after the group's first source)

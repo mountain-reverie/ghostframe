@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Client-side tile store for netsim scene runs.
 //!
 //! `FrameBuffer` accepts decoded tile payloads by codec and keeps the

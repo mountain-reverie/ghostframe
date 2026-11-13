@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `install` and `uninstall`: a per-user install with no root.
 //!
 //! Everything written lives under the user's home: the binary in

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `Event::TileReady` -> framebuffer. Needs a real GPU, so not named in any
 //! CI workflow (same rule as the other `gpu_*.rs` files).
 //!

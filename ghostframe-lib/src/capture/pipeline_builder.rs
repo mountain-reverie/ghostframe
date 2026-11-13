@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Helpers for the Vulkan compute-pipeline and buffer-allocation boilerplate.
 //!
 //! # Compute pipeline helper

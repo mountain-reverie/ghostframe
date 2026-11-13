@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Baseline harness for damage-driven encoding (PR 0): a deterministic scene
 //! driver over a private Xvfb, and the per-tick cost report it produces.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Declarative tile-spec encoders for netsim scene construction.
 //!
 //! Turns a small, hand-authored `TileSpec` into the exact `TileWork` items

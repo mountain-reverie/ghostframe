@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `capture`: the daemon. Waits for X, connects the backend, joins the
 //! tailnet and streams frames while a client is connected.
 

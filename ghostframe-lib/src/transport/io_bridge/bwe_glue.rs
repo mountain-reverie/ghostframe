@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Glue between the transport's observations and the bandwidth estimator /
 //! adaptation context: quinn path stats, the transmission ledger, receiver
 //! feedback and the probe window.

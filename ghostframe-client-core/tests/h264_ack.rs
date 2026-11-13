@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Transport acknowledgement of H.264 frame fragments, and the IDR window
 //! exemption (`frame_assembly.rs`).
 //!

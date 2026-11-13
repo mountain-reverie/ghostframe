@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use ghostframe_protocol::protocol::Codec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

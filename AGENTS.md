@@ -49,6 +49,66 @@ only.
 Then **hard-reload the browser tab** (Ctrl+Shift+R). The wasm bundle is cached
 and a soft reload keeps the old one.
 
+## Licensing
+
+Two licences, split by which side of the wire the code is on (owner
+decision, 2026-11-12):
+
+- **AGPL-3.0-or-later** — the server: `ghostframe-lib`, `ghostframe-server`,
+  and every crate that links them (`ghostframe-e2e`, `ghostframe-bench`,
+  `ghostframe-test-pattern`).
+- **MIT OR Apache-2.0** — everything a client links, or anyone embedding a
+  client: `ghostframe-protocol`, `ghostframe-tsnet` and `ghostbridge`, every
+  `ghostframe-client-*`, `ghostframe-cli`, `ghostframe-web-client`,
+  `shaders/`, and the repository's scripts and tools (`ci/`, `tests/`,
+  `tools/`, code under `docs/`).
+
+Why. The server is a network service. The GPL only applies when a binary is
+distributed, so it would not reach someone who runs a modified server for
+other people; AGPL section 13 does. The client has to stay embeddable:
+Enlightenment (BSD-2) and EFL (BSD-2 and LGPL) are meant to link
+`ghostframe-client-capi`. The MIT side lets code move into BSD or LGPL code,
+and the Apache side adds an explicit patent grant. It is version 3, not 2,
+because the server links Apache-2.0-only code (`aws-lc-sys`, `ring`,
+`gethostname`, the TQUIC `delivery_rate.rs`), and Apache-2.0 is incompatible
+with GPLv2.
+
+**A new crate or file follows these rules:**
+
+1. **Choose the side by what links it.** If any permissive crate will
+   depend on it, it is MIT OR Apache-2.0. If it is server-only, or it links
+   `ghostframe-lib`, it is AGPL. If unsure, choose permissive: permissive
+   code can be moved under the AGPL later, but AGPL code cannot come back
+   without every contributor's agreement.
+2. **Never make a permissive crate depend on `ghostframe-lib`** or any other
+   AGPL crate. If the client needs something the server has, move it into a
+   permissive crate, as was done for `ghostframe-protocol`. Moving existing
+   server code to the permissive side is a relicensing: ask the owner first.
+3. **Declare `license = "..."` explicitly in the crate's `Cargo.toml`.**
+   There is no workspace-level default, on purpose: every crate is a
+   decision, and a missing field fails CI.
+4. **Start every source file with its SPDX line:**
+   `// SPDX-License-Identifier: <the crate's licence>`.
+   - Shell and Python use `#`, and the line goes after any shebang.
+   - In Go, leave a blank line after it, or it becomes part of the package
+     doc comment.
+   - Generated C headers get the line from the `header` key in
+     `cbindgen.toml`.
+   - Outside any crate, the licence is MIT OR Apache-2.0.
+5. **Third-party code copied into the tree keeps its own licence.** It
+   needs its own SPDX line, an entry in `FILE_EXCEPTIONS` in
+   `ci/check-licenses.py`, an entry in `NOTICE`, and its licence text in
+   `LICENSES/`.
+6. **A dependency the check rejects is a decision for the owner.** Do not
+   extend the allowlist in `ci/check-licenses.py` just to make CI pass. A
+   copyleft or unknown licence anywhere in the client's link closure blocks
+   the embedding use case. MPL-2.0 is allowed on the AGPL side only.
+
+`ci/check-licenses.py` enforces 3 and 4, the containment in 2, and the
+third-party allowlist. `just ci-local`, `just ci-client` and CI's clippy job
+all run it. It only reads `cargo metadata` and `git ls-files`, so it is quick
+to run alone.
+
 ## Traps
 
 **A workspace-wide release build ships test code.** Cargo unifies features

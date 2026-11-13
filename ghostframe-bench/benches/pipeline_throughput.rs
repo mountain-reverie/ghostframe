@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Throughput of CPU-only pipeline primitives that run on every frame:
 //!  * `DirtyTracker::update` (tile diff)
 //!  * `protocol::fragment_tile` and `fragment_frame` (MTU split)

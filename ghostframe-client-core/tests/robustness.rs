@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Task 14: adversarial robustness proptests.
 //!
 //! `ClientCore::handle_datagram` must never panic on attacker-controlled

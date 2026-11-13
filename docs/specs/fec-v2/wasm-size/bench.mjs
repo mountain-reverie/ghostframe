@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 import fs from 'fs';
 const buf = fs.readFileSync(process.argv[2]);
 const {instance} = await WebAssembly.instantiate(buf, {});

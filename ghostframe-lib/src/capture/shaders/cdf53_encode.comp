@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #version 450
 // cdf53_encode.comp -- the CDF 5/3 tile transform on the server GPU.
 //

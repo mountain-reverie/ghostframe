@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The admission bucket: one allowance, billed by every byte class, and the
 //! depth gate in front of quinn's datagram FIFO.
 //!

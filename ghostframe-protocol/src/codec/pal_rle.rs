@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! PalRLE tile codec — palette-indexed nibble-packed run-length encoding.
 //!
 //! Server-side state: `PaletteTable` carries persistent 256-slot lifecycle

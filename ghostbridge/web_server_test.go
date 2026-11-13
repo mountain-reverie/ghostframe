@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 package main
 
 // The two tests that need the embedded SPA live in web_dist_test.go,

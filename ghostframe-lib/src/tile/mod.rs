@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 pub use ghostframe_protocol::tile::{BPP, TILE_BYTES, TILE_SIZE};
 
 /// Sentinel value for `TileMetrics::unique_colors` indicating the GPU compute

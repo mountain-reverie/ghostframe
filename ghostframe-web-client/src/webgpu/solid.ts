@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 import solidWgsl from '../../../shaders/client/solid.wgsl?raw';
 import { createLabeledShaderModule } from './shader_module';
 

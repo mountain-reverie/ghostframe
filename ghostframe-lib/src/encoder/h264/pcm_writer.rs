@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! A tiny software H.264 writer for the T2 oracle and the browserless harness: real, decodable CAVLC
 //! streams with no encoder and no GPU.
 //!

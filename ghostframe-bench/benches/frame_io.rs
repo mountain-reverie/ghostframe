@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Cost of putting QUIC transmits on, and taking them off, the ghostbridge
 //! socketpair, per packet versus batched. Measures the *framing and syscall*
 //! pattern of `IoBridge::drain_outbound` / `process_inbound` in isolation

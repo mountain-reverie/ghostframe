@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // cdf53_inverse_l2.wgsl — middle-level inverse lifting (16×16 working area).
 //
 // Reads the L3-inverse output from workArea[0..8][0..8] (LL2 — the spatial

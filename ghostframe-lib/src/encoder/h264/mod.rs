@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Acked-reference H.264 stream model (design: Phase B).
 //!
 //! Pure code only: no encoder, no I/O. `syntax` writes and parses slice

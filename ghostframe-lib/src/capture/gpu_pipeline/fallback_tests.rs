@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `forward_cdf53_tiles`: the GPU forward transform for tiles the frame's own
 //! compact pass did not list. The oracle is the CPU `cdf53::forward`, which
 //! the lossless contract is defined against: exact, never toleranced.

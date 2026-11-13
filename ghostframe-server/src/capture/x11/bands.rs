@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Row bands: a slot's grab set as full-width runs of pixel rows
 //! (design 3.1, "Grab primitive").
 //!

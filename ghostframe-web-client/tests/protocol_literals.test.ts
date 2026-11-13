@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Fails when a wire constant is retyped in production TypeScript.
 //
 // The constants live in `ghostframe-protocol` and reach TS through

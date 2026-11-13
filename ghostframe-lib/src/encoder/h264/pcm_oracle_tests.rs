@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! T2: the `RefManager`'s plans, written as real H.264 streams and decoded by
 //! libavcodec.
 //!

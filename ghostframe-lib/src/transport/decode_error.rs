@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! DECODE_ERROR message (msg_type = 0x04): client → server per-tile
 //! decode-failure report on the reliable bidi FEEDBACK stream.
 //!

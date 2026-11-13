@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Deterministic random number generation for reproducible test impairment.
 //!
 //! This uses SplitMix64, a splitmix-based PRNG designed to produce bit-independent output

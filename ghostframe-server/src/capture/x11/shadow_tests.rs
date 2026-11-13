@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The safety net against a real X server (a private Xvfb).
 //!
 //! The pieces the net does not own are stood in for, at the seams they

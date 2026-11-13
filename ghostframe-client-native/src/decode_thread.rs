@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The decode thread: turns the net thread's tile payloads into pixels.
 //!
 //! The net thread runs `ClientNet` in `TileDelivery::Payload` mode, so it

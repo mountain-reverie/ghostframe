@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // PalRLE compute decode: FOUR workgroups per tile (in a 2x2 arrangement),
 // 16×8 threads per workgroup = 128 invocations, each covering two pixels
 // (two rows of one column).  Total 4×128×2 = 1024 pixels, the tile's 32×32.

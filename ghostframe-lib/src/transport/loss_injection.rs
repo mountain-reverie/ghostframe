@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Deterministic loss injection for testing — feature-gated behind
 //! `test-loss-injection` and `cfg(test)`. Compiled out in release builds.
 //!

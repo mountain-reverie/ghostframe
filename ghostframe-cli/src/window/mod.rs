@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The seam between the client library and a display server.
 //!
 //! Two backends implement this: Wayland (smithay-client-toolkit) and X11

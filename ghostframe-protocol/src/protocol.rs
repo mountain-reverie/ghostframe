@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Wire format for M1 tile datagrams.
 //!
 //! Each QUIC datagram carries one fragment of one tile:

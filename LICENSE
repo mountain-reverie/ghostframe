@@ -1,0 +1,30 @@
+Ghostframe is licensed in two parts.
+
+  Server: AGPL-3.0-or-later (LICENSES/AGPL-3.0-or-later.txt)
+
+    ghostframe-lib, ghostframe-server, and the test and benchmark crates
+    built on them: ghostframe-e2e, ghostframe-bench,
+    ghostframe-test-pattern.
+
+  Everything else: MIT OR Apache-2.0, at your option
+  (LICENSES/MIT.txt, LICENSES/Apache-2.0.txt)
+
+    The wire format (ghostframe-protocol), the tailnet bridge
+    (ghostframe-tsnet, ghostbridge), every client crate (ghostframe-client-*,
+    ghostframe-cli), the browser client (ghostframe-web-client), the client
+    shaders (shaders/), and the scripts and tools (ci/, tests/, tools/).
+
+Each crate's Cargo.toml `license` field is the authority for that crate, and
+every source file carries an SPDX-License-Identifier line naming its
+licence. ci/check-licenses.py checks both, and that no permissively licensed
+crate depends on an AGPL one. The reasoning, and the rule for new crates, is
+in AGENTS.md ("Licensing").
+
+Some files are third-party code under their own licence, marked in the file
+and listed in NOTICE (for example ghostframe-lib/src/transport/delivery_rate.rs,
+Apache-2.0, from Tencent TQUIC).
+
+Unless you explicitly state otherwise, any contribution you intentionally
+submit for inclusion in Ghostframe is licensed under the licence of the
+part it is submitted to, as above, without any additional terms or
+conditions.

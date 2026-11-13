@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Per-tile-pass coverage map: records which tile-pass each emitted work item
 //! carries so the server can convert per-tile-pass ACKs from the client into
 //! per-tile delivery bookkeeping (Cdf53 ACK counter, PalRle palette delivered

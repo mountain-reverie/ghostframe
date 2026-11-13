@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Shared bench fixtures: content classes and the BenchEncoder trait.
 //!
 //! M3 codec implementations land by adding a new `BenchEncoder` impl in this

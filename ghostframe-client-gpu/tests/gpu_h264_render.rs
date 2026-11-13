@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! An access unit in, a plausible image in the framebuffer out.
 //!
 //! "Plausible", not "correct": this asserts wiring (something drew, luma

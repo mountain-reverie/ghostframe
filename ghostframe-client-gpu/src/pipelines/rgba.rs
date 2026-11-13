@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Already-decoded RGBA tiles (`Event::TileReady`), copied into the
 //! framebuffer by a compute pass: one buffer upload and one dispatch per
 //! flush, however many tiles and wherever they are.

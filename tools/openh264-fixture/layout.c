@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Prints the struct sizes and offsets openh264_sys.rs pins (its
 // `openh264_layouts_match_the_c_headers` test). Build it against each
 // release's headers; nothing here is built into the daemon.

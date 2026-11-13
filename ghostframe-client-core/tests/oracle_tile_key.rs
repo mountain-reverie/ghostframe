@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Port of `ghostframe-web-client/tests/tile_key.test.ts`.
 //!
 //! In the Rust port, tile assemblies are keyed by the `TileKey` struct

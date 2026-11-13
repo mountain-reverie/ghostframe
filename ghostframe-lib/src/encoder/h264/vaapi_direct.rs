@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The libva-direct backend (design 4.2): raw libva, executing a
 //! [`FramePlan`] exactly.
 //!

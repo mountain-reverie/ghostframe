@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The EGL and GL entry points for moving a dmabuf in or out of a GL texture.
 //!
 //! Shared by [`crate::export_gles`] and [`crate::import_gles`], which use the

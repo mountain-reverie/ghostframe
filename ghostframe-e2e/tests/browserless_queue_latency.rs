@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! How long does tile work sit in the scheduler before it reaches the wire?
 //!
 //! Production measurement, 2026-09-20, a 1920x1080 session at connect:

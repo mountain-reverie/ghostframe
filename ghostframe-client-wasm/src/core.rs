@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The session boundary. `main.ts` drives this at cutover.
 //!
 //! Every export returns a value JS can inspect; none may `unwrap` on

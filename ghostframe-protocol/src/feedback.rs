@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 pub use crate::feedback_stream::FEEDBACK_MSG_TYPE;
 pub const FEEDBACK_SIZE: usize = 18;
 

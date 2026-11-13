@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // cdf53_reconstruct.wgsl -- stage B of the full-grid CDF 5/3 decoder: plane
 // store -> pixels, one workgroup per listed tile.
 //

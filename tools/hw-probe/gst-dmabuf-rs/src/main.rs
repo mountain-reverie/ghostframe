@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Feasibility probe: does GStreamer's `v4l2slh264dec` hand out a dmabuf we can
 //! describe well enough to import, and are the pixels bit-exact?
 //!

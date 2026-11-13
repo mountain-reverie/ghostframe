@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Full-frame NV12 -> RGBA blit into the framebuffer.
 //!
 //! Unlike the tile pipelines, this one always covers the whole surface:

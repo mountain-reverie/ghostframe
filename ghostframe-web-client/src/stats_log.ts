@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // The periodic page-log summary (~every 2 s): per-rAF drain deltas,
 // framebuffer size, CDF53 coverage from the wasm core, NACKs sent, and a
 // four-pixel framebuffer probe.

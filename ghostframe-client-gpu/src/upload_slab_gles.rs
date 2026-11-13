@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! One upload slab on the GLES backend: a LINEAR GBM buffer the CPU writes
 //! through a persistent mapping and the GPU samples as a texture.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The `Content::Unchanged` oracle (damage-driven encoding PR 7, library
 //! level): the same scripted frame sequence and the same scripted ACKs go
 //! through the bridge twice, once with every tick carrying its pixels

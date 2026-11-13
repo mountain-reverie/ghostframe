@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! T1 for the `RefManager` in observed mode: a closed loop of manager,
 //! [`Openh264Sim`] (the backend), network and client.
 //!

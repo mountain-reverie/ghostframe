@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! CPU-side mirror of which palette slots have been delivered (i.e., the
 //! client has uploaded their colors to the GPU `palette_atlas` buffer).
 //!

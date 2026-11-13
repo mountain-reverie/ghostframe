@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Pre-FEC loss and loss-run measurement from `wire_seq` gaps.
 //!
 //! Measurement only: nothing here feeds a decision. The server stamps every

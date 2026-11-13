@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! NV12 dmabuf import against a real GPU. **Vulkan backend only.**
 //!
 //! Gated at the file level because these tests reach Vulkan internals

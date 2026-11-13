@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! WS-C2: does a frame's GPU and encode time stay off the transport event
 //! loop? Real clock, a real QUIC session, no GPU.
 //!

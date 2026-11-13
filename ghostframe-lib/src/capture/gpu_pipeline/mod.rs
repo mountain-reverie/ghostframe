@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! GPU-accelerated dirty tile detection via Vulkan compute (SAD shader),
 //! plus BGRA→NV12 conversion via a second compute shader with HOST_VISIBLE output.
 //!

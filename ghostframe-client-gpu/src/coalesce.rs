@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Merge a [`DirtyGrid`] into as few damage rectangles as possible.
 //!
 //! The host's presentation path pays per damage rect handed to it, so

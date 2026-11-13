@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Every environment variable `ghostframe-server` reads, parsed once.
 //!
 //! `ServerConfig::from_env()` is called once at the top of `main()` and the

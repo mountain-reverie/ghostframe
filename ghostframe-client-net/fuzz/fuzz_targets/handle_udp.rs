@@ -1,4 +1,5 @@
 #![no_main]
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use ghostframe_client_net::{ClientNet, ClientNetConfig};
 use libfuzzer_sys::fuzz_target;
 use std::net::{Ipv6Addr, SocketAddr};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use ghostframe_client_native::event::{ClientEvent, EventQueue};
 
 fn fd_is_readable(fd: std::os::fd::RawFd) -> bool {

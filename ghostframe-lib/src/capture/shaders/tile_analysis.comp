@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // tile_analysis.comp
 // Per-tile analysis: unique-color count + palette extraction + edge density.
 //

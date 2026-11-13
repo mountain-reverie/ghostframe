@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The probe timeout (PTO) interval of the reliable emitter: the RFC 9002
 //! section 6.2 value from the RTT estimator, doubled per backoff step and held
 //! to a ceiling. There is no per-pass timer wheel any more (D1 F4 part 2): one

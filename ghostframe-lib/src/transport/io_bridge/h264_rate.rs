@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! H.264 rate control (design section 4.3): a rate target that follows the
 //! bandwidth estimate, applied in place with each plan (no reopen, no IDR).
 //!

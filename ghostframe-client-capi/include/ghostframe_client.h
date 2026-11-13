@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT OR Apache-2.0 */
+
 #ifndef GHOSTFRAME_CLIENT_H
 #define GHOSTFRAME_CLIENT_H
 

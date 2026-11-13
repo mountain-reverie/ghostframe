@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Fullscreen centring and pointer mapping.
 //!
 //! The window starts fullscreen; the remote image is drawn 1:1 and centred,

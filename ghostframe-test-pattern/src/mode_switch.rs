@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `--mode-switch-cycle SECS` pattern.
 //!
 //! Alternates between two halves of a `2 × SECS`-second cycle:

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Damage-driven encoding, library side (PR 6): a frame told which tile rows
 //! changed uploads and compares only those rows, and must leave exactly what a
 //! full compare would have left.

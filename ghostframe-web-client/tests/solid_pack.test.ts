@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 import { describe, it, expect } from 'vitest';
 
 // We can't import the real SolidPipeline (it needs GPUDevice). Test the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Scene orchestration: spin up ghostframe-server + Chromium for one scene, sample
 //! telemetry, return aggregated records.
 //!

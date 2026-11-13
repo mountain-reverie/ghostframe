@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // GPU-level CDF 5/3 debug hooks, installed only under `?debug`.
 //
 // These started life as M3.3b scaffolding ("removed once the wavelet math is

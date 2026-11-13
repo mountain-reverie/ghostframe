@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! ghostframe-bench — codec bench fixtures (`ContentClass::tile()`) and
 //! the home for criterion / iai-callgrind benches and the M3.5 Layer B
 //! `codec_report` binary.

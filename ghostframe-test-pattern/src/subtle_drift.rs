@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! M3.7a subtle-drift mode: paint the configured `tile_pattern` class to
 //! the root window, then every `drift_ms` milliseconds shift the bitmap
 //! by 1 pixel along the X axis (wrapping). Generates dirty events for

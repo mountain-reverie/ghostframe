@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Browser-side input capture wiring.
 //
 // `attachInputCapture(canvas, feedbackWriter, getFrameDims)`:

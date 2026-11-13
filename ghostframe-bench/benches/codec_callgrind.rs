@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Deterministic instruction-count tracking for protocol primitives.
 //!
 //! iai-callgrind runs each function under valgrind --tool=callgrind and

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The sparse-K pass-resolution rule of the web client's Cdf53 pipeline.
 //!
 //! Ported line-for-line from `computePassesProcessed` in

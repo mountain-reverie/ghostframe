@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // The wire constants the web client needs, read from Rust.
 //
 // Every number here is defined once, in `ghostframe-protocol`, and reaches

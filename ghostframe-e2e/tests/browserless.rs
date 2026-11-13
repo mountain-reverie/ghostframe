@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Browserless e2e: real IoBridge + netsim + headless client, no browser,
 //! no containers, no GPU. See
 //! docs/superpowers/specs/2026-09-07-headless-client-netsim-design.md

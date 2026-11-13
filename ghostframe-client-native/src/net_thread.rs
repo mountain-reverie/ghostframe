@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The net thread: an epoll loop over the framed tsnet UDP fd, a timerfd
 //! armed from `ClientNet::poll_timeout`, and a wake eventfd for shutdown
 //! and outbound input.

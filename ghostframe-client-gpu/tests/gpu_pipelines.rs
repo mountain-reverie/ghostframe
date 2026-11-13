@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Real-WGSL pipeline tests. Requires a GPU; NOT named in any CI workflow.
 
 use ghostframe_client_gpu::{

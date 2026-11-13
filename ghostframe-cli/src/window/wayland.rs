@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The Wayland [`Backend`]: smithay-client-toolkit (SCTK) + wayland-client.
 //!
 //! A handful of decisions here are load-bearing enough to spell out once,

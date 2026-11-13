@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Server-side e2e scenario setup: containers, tsnet, forwarders, Weston.
 //!
 //! Extracted from `tests/e2e.rs::setup_e2e_inner_with_url_extra` so that both

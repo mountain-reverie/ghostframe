@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The openh264 backend (design 4.1, B7): Cisco's software encoder behind
 //! [`H264Backend`], loaded at run time.
 //!

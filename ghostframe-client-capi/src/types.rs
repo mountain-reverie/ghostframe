@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `#[repr(C)]` types making up the ABI surface. Every type here is exactly
 //! what cbindgen turns into `include/ghostframe_client.h`; see that
 //! generated header for the authoritative C-side shape (field order and

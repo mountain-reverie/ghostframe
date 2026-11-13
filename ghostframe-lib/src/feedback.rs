@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Library-to-server feedback: which tiles the full compare found changed.
 //!
 //! The server decides what to grab; the GPU compare that says what really

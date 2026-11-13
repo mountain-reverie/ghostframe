@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! CPU pixel decode of validated tile payloads: `Event::TilePayload` in,
 //! `Event::TileReady` out.
 //!

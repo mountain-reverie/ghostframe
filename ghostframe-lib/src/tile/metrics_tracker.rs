@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Per-tile metrics storage parallel to `DirtyTracker`.
 //!
 //! Owns one `TileMetrics` per tile in `cols × rows` row-major order. The

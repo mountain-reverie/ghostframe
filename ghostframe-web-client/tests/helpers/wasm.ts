@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Datagram-builder helpers shared by the suites that drive WasmClientCore's
 // tile reassembly directly (tile_assembly.test.ts, cdf53_globals.test.ts,
 // eviction.test.ts).

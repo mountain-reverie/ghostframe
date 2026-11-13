@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Debug-only compute pipeline: writes a known gradient
 // (r = x & 255, g = y & 255, b = 0, a = 255) into the framebuffer
 // texture so __readPixel can be independently verified.  NOT used in

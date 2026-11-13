@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! M4b acceptance: a client negotiates its display resolution end to end.
 //!
 //! Joins the tailnet as its own node, connects over tsnet advertising a

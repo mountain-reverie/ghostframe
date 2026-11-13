@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Tile codec pipelines that run the real, shipped WGSL against the
 //! client's persistent [`crate::framebuffer::Framebuffer`].
 //!

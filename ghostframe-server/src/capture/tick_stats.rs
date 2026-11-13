@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Per-tick cost counters for the capture path (damage-driven encoding PR 0).
 //!
 //! These are plain integers bumped at the explicit copy and allocation sites

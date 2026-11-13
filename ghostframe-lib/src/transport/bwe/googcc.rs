@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Drives `goog_cc::GoogCcNetworkController` from our ACK-arrival samples.
 //!
 //! The controller runs send-side, so no wire-format change is needed: the

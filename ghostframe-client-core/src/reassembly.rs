@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Full per-datagram reassembly pipeline.
 //!
 //! Ports the datagram receive loop (`main.ts` ~1280-1421),

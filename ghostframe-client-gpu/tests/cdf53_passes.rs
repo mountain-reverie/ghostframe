@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use ghostframe_client_gpu::pipelines::cdf53_passes::{
     passes_processed, FULL_PASS_MASK, MAX_PASSES,
 };

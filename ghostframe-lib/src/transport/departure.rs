@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! F2: the departure tracker. Tells the rest of the transport when each
 //! datagram left quinn's send FIFO for the wire.
 //!

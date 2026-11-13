@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! D1 design A, section 6.6: how fast does goog_cc cut a stale estimate when
 //! the sender resumes after an idle on a link that lost capacity meanwhile,
 //! with the model controller's window bounding what is in flight?

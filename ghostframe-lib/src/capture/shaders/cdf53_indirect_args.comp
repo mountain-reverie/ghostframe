@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // cdf53_indirect_args.comp
 // Stage 4b: convert cdf53_compact_count into vkCmdDispatchIndirect args
 // for the subsequent Stage 4c (cdf53_encode.comp, cdf53_forward.spv) dispatch.

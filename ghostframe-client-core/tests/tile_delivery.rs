@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Tests for the tile-delivery mode switch and the payload events.
 
 use ghostframe_client_core::{ClientConfig, ClientCore, PollOutput, TileDelivery};

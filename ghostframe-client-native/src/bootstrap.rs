@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Fetch and pin the server's WebTransport certificate hash.
 //!
 //! The server publishes its cert hash at `/config.json` over plain HTTP on

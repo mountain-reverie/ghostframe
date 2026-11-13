@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Solid codec: one instanced quad per tile.
 //!
 //! Instance layout is 3 x u32 = 12 bytes (tile_x, tile_y, color_packed),

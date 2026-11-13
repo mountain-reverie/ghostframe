@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! M3 acceptance: H.264 frames from a live server, decoded on the GPU.
 //!
 //! Requires Docker, a GPU, VA-API, and the host VKMS setup (the server's

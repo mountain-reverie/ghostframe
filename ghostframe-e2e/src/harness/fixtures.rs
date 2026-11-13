@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! E2E test fixtures (golden images, codec test vectors).
 
 /// CDF53 codec fixture: ~1 KB of known-good encoded passes. Used by

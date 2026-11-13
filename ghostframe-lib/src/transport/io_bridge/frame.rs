@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Per-frame processing: from a captured `FrameSubmission` to tiles handed to
 //! the scheduler or, on the H.264 path, to the emitter.
 //!

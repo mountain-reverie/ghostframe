@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Per-transmission accounting, independent of whether the content survived.
 //!
 //! The congestion controller asks "did this packet arrive?". The retransmit

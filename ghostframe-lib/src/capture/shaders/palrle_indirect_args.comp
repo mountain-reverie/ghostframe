@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // palrle_indirect_args.comp
 // Stage 1.5b: convert palrle_compact_count into vkCmdDispatchIndirect args.
 // Dispatch: 1 workgroup, 1 thread.

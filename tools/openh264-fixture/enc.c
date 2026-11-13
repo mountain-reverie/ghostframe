@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Produces the openh264 LTR test stream (see make.sh here).
 //
 // 128x128, camera usage (screen content silently disables LTR), scene-change
