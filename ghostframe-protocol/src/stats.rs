@@ -948,12 +948,14 @@ mod proptests {
             "\\PC{0,20}",
             prop::collection::vec(arb_descriptor(), 0..40),
         )
-            .prop_map(|(schema_id, server_version, host_name, metrics)| StatsSchema {
-                schema_id,
-                server_version,
-                host_name,
-                metrics,
-            })
+            .prop_map(
+                |(schema_id, server_version, host_name, metrics)| StatsSchema {
+                    schema_id,
+                    server_version,
+                    host_name,
+                    metrics,
+                },
+            )
     }
 
     /// A schema with a sample built against it. Gauges and counters use
@@ -1041,6 +1043,12 @@ mod proptests {
         ) {
             let _ = StatsSchema::decode_payload(&bytes);
             let _ = StatsSample::decode_payload(&bytes, &schema);
+            // Patch the schema id in so hostile bytes reach the value loop.
+            let mut patched = bytes.clone();
+            if patched.len() >= 2 {
+                patched[..2].copy_from_slice(&schema.schema_id.to_le_bytes());
+            }
+            let _ = StatsSample::decode_payload(&patched, &schema);
             let _ = StatsSubscribe::decode(&bytes);
             let mut r = ServerFrameReader::default();
             r.push(&bytes);
