@@ -15,16 +15,11 @@ fn storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok()?
 }
 
-// Called from the components in Task 11; the attribute is removed there so
-// this task's commit is warning-free under `-D warnings`.
-#[allow(dead_code)]
 pub(crate) fn load_open() -> bool {
     let stored = storage().and_then(|s| s.get_item(KEY).ok()).flatten();
     parse_open(stored.as_deref())
 }
 
-// Same as `load_open`: called from Task 11, attribute removed there.
-#[allow(dead_code)]
 pub(crate) fn save_open(open: bool) {
     if let Some(s) = storage() {
         let _ = s.set_item(KEY, if open { "1" } else { "0" });
