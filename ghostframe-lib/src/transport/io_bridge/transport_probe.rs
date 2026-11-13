@@ -28,6 +28,9 @@ pub struct FecAdaptProbe {
     pub r_at_k8: u8,
     pub r_at_k64: u8,
     pub changes: u64,
+    /// Transitions of the floor state alone (engage, release); `changes`
+    /// also counts span moves while engaged.
+    pub floor_changes: u64,
     pub congestion_skips: u64,
     pub trim_steps: u64,
     pub blocks_sized: u64,
