@@ -2,8 +2,9 @@
 //!
 //! Two sources feed one view. **Server metrics** arrive as `STATS_SAMPLE`
 //! frames on the feedback stream's return half, described by the latest
-//! `STATS_SCHEMA`. **Local metrics** are measured by this client; see
-//! [`crate::stats_local`].
+//! `STATS_SCHEMA`. **Local metrics** are measured here, once a second, from
+//! counters the core already keeps; they run whether or not the panel is
+//! open so their sparklines are full when it opens.
 //!
 //! Plain data, no `Rc`/`RefCell`: the native client may move the core between
 //! threads. Time is injected (`now_us`) like everywhere else in this crate.
@@ -14,6 +15,9 @@ use ghostframe_protocol::stats::{
     MetricGroup, MetricKind, MetricValue, ServerFrameReader, StatsSample, StatsSchema,
     SERVER_MSG_STATS_SAMPLE, SERVER_MSG_STATS_SCHEMA,
 };
+
+use crate::stats_local::LocalStats;
+use crate::wire_loss::WireLossStats;
 
 /// Samples kept per metric: one minute at the 1 Hz cadence.
 pub const RING_LEN: usize = 60;
@@ -48,7 +52,7 @@ impl Ring {
 /// One metric's state: its history, what to show now, and the counter state
 /// a rate is derived from.
 #[derive(Debug, Clone, Default)]
-struct Series {
+pub(crate) struct Series {
     ring: Ring,
     current: Option<f64>,
     text: Option<String>,
@@ -57,7 +61,15 @@ struct Series {
 }
 
 impl Series {
-    fn push_gauge(&mut self, v: f64) {
+    pub(crate) fn current(&self) -> Option<f64> {
+        self.current
+    }
+
+    pub(crate) fn history(&self) -> Vec<f64> {
+        self.ring.to_vec()
+    }
+
+    pub(crate) fn push_gauge(&mut self, v: f64) {
         if v.is_finite() {
             self.ring.push(v);
             self.current = Some(v);
@@ -68,7 +80,7 @@ impl Series {
     /// server restart, a session reset) or a clock that did not advance
     /// restarts the rate: nothing is pushed and the current value is cleared,
     /// so the panel shows a dash for a second rather than a negative rate.
-    fn push_counter(&mut self, total: f64, at_us: u64) {
+    pub(crate) fn push_counter(&mut self, total: f64, at_us: u64) {
         if !total.is_finite() {
             return;
         }
@@ -207,10 +219,11 @@ pub struct ClientStats {
     last_sample_us: Option<u64>,
     rejected: u64,
     client_version: String,
+    pub(crate) local: LocalStats,
 }
 
 impl ClientStats {
-    pub fn new(_now_us: u64) -> Self {
+    pub fn new(now_us: u64) -> Self {
         ClientStats {
             reader: ServerFrameReader::default(),
             schema: None,
@@ -218,6 +231,7 @@ impl ClientStats {
             last_sample_us: None,
             rejected: 0,
             client_version: "unknown".to_string(),
+            local: LocalStats::new(now_us),
         }
     }
 
@@ -228,6 +242,13 @@ impl ClientStats {
     /// Server frames and samples refused so far.
     pub fn samples_rejected(&self) -> u64 {
         self.rejected
+    }
+
+    /// The deadline of the next local sample, for `poll_timeout`.
+    // Used by the core from Task 6; the attribute is removed there.
+    #[allow(dead_code)]
+    pub(crate) fn next_local_sample_us(&self) -> u64 {
+        self.local.next_sample_us()
     }
 
     /// Feed bytes read from the feedback stream's return half, in any
@@ -306,6 +327,14 @@ impl ClientStats {
         self.last_sample_us = Some(now_us);
     }
 
+    /// Take the once-a-second local measurements. The first call only sets
+    /// the baseline the rates are measured from.
+    // Used by the core from Task 6; the attribute is removed there.
+    #[allow(dead_code)]
+    pub(crate) fn sample_local(&mut self, now_us: u64, loss: WireLossStats) {
+        self.local.sample(now_us, loss);
+    }
+
     fn is_stale(&self, now_us: u64) -> bool {
         match self.last_sample_us {
             None => true,
@@ -345,6 +374,9 @@ impl ClientStats {
                     },
                 );
             }
+        }
+        for (group, row) in self.local.rows() {
+            add(group_order(group), row);
         }
         groups.sort_by_key(|g| g.key);
         let server_version = self.schema.as_ref().map(|s| s.server_version.clone());
@@ -494,6 +526,10 @@ mod tests {
         let g = row(&past, "Metric 1");
         assert!(g.stale);
         assert_eq!(g.history, vec![10.0], "history is kept");
+        assert!(
+            !row(&past, "Received throughput").stale,
+            "local rows are never stale"
+        );
     }
 
     #[test]
@@ -609,6 +645,65 @@ mod tests {
                 "Other"
             ]
         );
+    }
+
+    #[test]
+    fn local_metrics_are_measured_from_the_counters_and_are_non_zero() {
+        let mut s = ClientStats::new(0);
+        s.sample_local(1_000_000, WireLossStats::default()); // baseline
+        s.local.counters.rx_bytes += 1_250_000;
+        s.local.counters.nacks_sent += 30;
+        s.local.counters.paints += 60;
+        let loss = WireLossStats {
+            lost_pre_fec: 4,
+            recovered: 2,
+            max_run: 3,
+            ..WireLossStats::default()
+        };
+        s.sample_local(2_000_000, loss);
+        let v = s.view(2_000_000);
+        assert_eq!(row(&v, "Received throughput").current, Some(10_000_000.0));
+        assert_eq!(row(&v, "NACKs sent").current, Some(30.0));
+        assert_eq!(row(&v, "Painted frames").current, Some(60.0));
+        assert_eq!(row(&v, "Wire loss before FEC").current, Some(4.0));
+        assert_eq!(row(&v, "FEC recoveries").current, Some(2.0));
+        assert_eq!(row(&v, "Longest loss run").current, Some(3.0));
+        assert_eq!(
+            row(&v, "Longest loss run").history,
+            vec![3.0],
+            "the baseline call pushes nothing"
+        );
+        assert!(row(&v, "Received throughput").local);
+    }
+
+    #[test]
+    fn h264_frame_size_is_the_mean_of_the_second() {
+        let mut s = ClientStats::new(0);
+        s.sample_local(1_000_000, WireLossStats::default());
+        s.local.counters.frames_h264 += 4;
+        s.local.counters.h264_bytes += 4_000;
+        s.sample_local(2_000_000, WireLossStats::default());
+        assert_eq!(
+            row(&s.view(2_000_000), "H.264 frame size").current,
+            Some(1_000.0)
+        );
+        // A second with no H.264 frames reads 0, not the previous second's size.
+        s.sample_local(3_000_000, WireLossStats::default());
+        assert_eq!(
+            row(&s.view(3_000_000), "H.264 frame size").current,
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn the_local_sample_deadline_advances() {
+        let mut s = ClientStats::new(5);
+        assert_eq!(
+            s.next_local_sample_us(),
+            5 + crate::stats_local::LOCAL_SAMPLE_INTERVAL_US
+        );
+        s.sample_local(2_500_000, WireLossStats::default());
+        assert_eq!(s.next_local_sample_us(), 3_500_000);
     }
 
     #[test]
