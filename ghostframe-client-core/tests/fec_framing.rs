@@ -55,6 +55,7 @@ fn records(items: &[&[u8]]) -> Vec<u8> {
 
 fn source(seq: u32, block: u16, idx: u8, last: bool, recs: &[u8]) -> SourceFrame<'_> {
     SourceFrame {
+        t_adv: 0,
         last,
         bundle_seq: seq,
         block_id: block,
@@ -138,6 +139,7 @@ fn rebuilt_tile_is_delivered_and_recovered_is_reported() {
     let refs: Vec<&[u8]> = syms.iter().map(|s| s.as_slice()).collect();
     let rep = encode_repairs(&refs, &[0]).unwrap();
     let repair = RepairFrame {
+        rtt_hint: 0,
         bundle_seq: 99,
         block_id: 7,
         k: 3,
@@ -264,6 +266,7 @@ fn rebuilt_bundle_with_a_bad_pass_rejects_before_it_recovers() {
     let refs: Vec<&[u8]> = syms.iter().map(|s| s.as_slice()).collect();
     let rep = encode_repairs(&refs, &[0]).unwrap();
     let repair = RepairFrame {
+        rtt_hint: 0,
         bundle_seq: 99,
         block_id: 9,
         k: 2,
@@ -364,6 +367,7 @@ fn late_original_after_a_rebuild_is_acked_but_not_delivered_twice() {
     let refs: Vec<&[u8]> = syms.iter().map(|s| s.as_slice()).collect();
     let rep = encode_repairs(&refs, &[0]).unwrap();
     let repair = RepairFrame {
+        rtt_hint: 0,
         bundle_seq: 99,
         block_id: 7,
         k: 3,

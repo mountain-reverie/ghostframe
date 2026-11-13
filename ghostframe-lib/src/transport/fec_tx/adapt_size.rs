@@ -24,7 +24,10 @@ pub(crate) const FEC_ADAPT_NOTCH_DWELL_US: u64 = 1_000_000;
 pub(crate) const FEC_ADAPT_TRIM_WINDOW: usize = 256;
 /// Below this burst estimate the loss is modelled as i.i.d.
 const IID_BURST: f64 = 1.05;
-/// Block duration cap: the client's recovery window is a constant 43 ms.
+/// Block duration cap of the ladder. Lower than the knob's `T_MS_MAX` (50) on
+/// purpose: E1 found T = 20 loses nothing measurable against 25-33 ms and cuts
+/// tile recovery p95, so the wider advertised range serves the interleaved
+/// split, not a retune of the narrow and wide notches.
 const T_MAX_MS: u32 = 20;
 const T_MIN_MS: u32 = 5;
 const K_MIN: u32 = 64;

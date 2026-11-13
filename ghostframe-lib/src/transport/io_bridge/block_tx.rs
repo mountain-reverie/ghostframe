@@ -293,6 +293,7 @@ impl IoBridge {
                     repair_bundles: Vec::new(),
                     repairs_queued,
                     last_sent: now,
+                    t_adv: c.t_adv,
                 },
                 now,
             );
@@ -397,13 +398,29 @@ impl IoBridge {
     }
 
     /// The path numbers the table's deadlines are built from.
-    fn block_rtt(&self) -> Rtt {
+    fn block_rtt(&mut self) -> Rtt {
         let e = &self.reliable_emitter.rtt;
+        let (srtt, rttvar, max_ack_delay, has_sample) =
+            (e.srtt(), e.rttvar(), e.max_ack_delay(), e.has_sample());
         Rtt {
-            srtt: e.srtt(),
-            rttvar: e.rttvar(),
-            max_ack_delay: e.max_ack_delay(),
+            srtt,
+            rttvar,
+            max_ack_delay,
+            has_sample,
+            hint_code: self.block_table.recent_hint(now_std()),
         }
+    }
+
+    /// The RTT hint code a REPAIR carries now: the smallest code at least
+    /// the smoothed round trip, 0 (unknown) before the first sample.
+    fn rtt_hint_now(&self) -> u8 {
+        let e = &self.reliable_emitter.rtt;
+        if !e.has_sample() {
+            return 0;
+        }
+        ghostframe_protocol::fec::timing::rtt_hint_code_for(
+            u64::try_from(e.srtt().as_micros()).unwrap_or(u64::MAX),
+        )
     }
 
     /// ACK arrivals for the blocks (every entry, live or late).
@@ -514,7 +531,10 @@ impl IoBridge {
             let job = self.pending_repairs.pop_front().expect("front exists");
             // Allocated here, when it is certain to be sealed and offered.
             let bundle_seq = self.packer.alloc_seq();
+            let rtt_hint = self.rtt_hint_now();
+            self.block_table.note_hint_sent(rtt_hint, now_std());
             let bytes = RepairFrame {
+                rtt_hint,
                 bundle_seq,
                 block_id: job.block_id,
                 k: job.k,
