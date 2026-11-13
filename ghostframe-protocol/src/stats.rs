@@ -433,6 +433,55 @@ impl StatsSample {
     }
 }
 
+/// Reassembles `[type u8][len u16 LE][payload]` frames from stream reads.
+///
+/// Feed it whatever the stream returned with [`Self::push`] and drain frames
+/// with [`Self::next_frame`]. A frame may arrive in pieces, and several may
+/// arrive in one read. An unknown type is returned like any other: the caller
+/// skips it, and its length keeps the stream in step.
+#[derive(Debug, Default)]
+pub struct ServerFrameReader {
+    buf: Vec<u8>,
+}
+
+impl ServerFrameReader {
+    /// Append bytes read from the stream.
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Bytes held that are not yet a whole frame.
+    pub fn buffered(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// The next whole frame as `(type, payload)`, `None` when more bytes are
+    /// needed.
+    ///
+    /// A length over [`SERVER_FRAME_MAX_LEN`] returns `Err(TooLong)` once and
+    /// empties the buffer. Nothing closes: the stream cannot be resynchronised
+    /// (a length is the only marker), so whatever follows is read as new
+    /// frames; a server that honours the limit never gets here.
+    pub fn next_frame(&mut self) -> Option<Result<(u8, Vec<u8>), StatsWireError>> {
+        if self.buf.len() < FRAME_HEADER_LEN {
+            return None;
+        }
+        let len = usize::from(u16::from_le_bytes([self.buf[1], self.buf[2]]));
+        if len > SERVER_FRAME_MAX_LEN {
+            self.buf.clear();
+            return Some(Err(StatsWireError::TooLong));
+        }
+        let end = FRAME_HEADER_LEN + len;
+        if self.buf.len() < end {
+            return None;
+        }
+        let msg_type = self.buf[0];
+        let payload = self.buf[FRAME_HEADER_LEN..end].to_vec();
+        self.buf.drain(..end);
+        Some(Ok((msg_type, payload)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,5 +840,79 @@ mod tests {
         let mut ok = s.clone();
         ok.values.truncate(10);
         assert!(ok.try_encode_frame().is_ok());
+    }
+
+    fn two_frames() -> (Vec<u8>, Vec<u8>) {
+        let schema = sample_schema();
+        (schema.encode_frame(), sample_for(&schema).encode_frame())
+    }
+
+    #[test]
+    fn reader_returns_nothing_until_a_frame_is_whole() {
+        let (a, _) = two_frames();
+        let mut r = ServerFrameReader::default();
+        assert!(r.next_frame().is_none(), "empty");
+        for b in &a[..a.len() - 1] {
+            r.push(&[*b]);
+            assert!(r.next_frame().is_none(), "a frame must not appear early");
+        }
+        r.push(&a[a.len() - 1..]);
+        let (ty, payload) = r.next_frame().expect("whole").expect("valid");
+        assert_eq!(ty, SERVER_MSG_STATS_SCHEMA);
+        assert_eq!(payload, a[FRAME_HEADER_LEN..]);
+        assert!(r.next_frame().is_none());
+    }
+
+    #[test]
+    fn reader_splits_frames_joined_in_one_read() {
+        let (a, b) = two_frames();
+        let mut r = ServerFrameReader::default();
+        let mut joined = a.clone();
+        joined.extend_from_slice(&b);
+        r.push(&joined);
+        assert_eq!(
+            r.next_frame().expect("first").expect("ok").0,
+            SERVER_MSG_STATS_SCHEMA
+        );
+        assert_eq!(
+            r.next_frame().expect("second").expect("ok").0,
+            SERVER_MSG_STATS_SAMPLE
+        );
+        assert!(r.next_frame().is_none());
+        assert_eq!(r.buffered(), 0);
+    }
+
+    #[test]
+    fn reader_passes_an_unknown_type_through_by_its_length() {
+        let mut r = ServerFrameReader::default();
+        r.push(&[0x7E, 2, 0, 0xAA, 0xBB]);
+        let (_, b) = two_frames();
+        r.push(&b);
+        assert_eq!(
+            r.next_frame().expect("unknown").expect("ok"),
+            (0x7E, vec![0xAA, 0xBB])
+        );
+        assert_eq!(
+            r.next_frame().expect("then the real one").expect("ok").0,
+            SERVER_MSG_STATS_SAMPLE,
+            "the unknown frame was skipped by its length, not by guessing"
+        );
+    }
+
+    #[test]
+    fn reader_reports_an_oversize_length_once_and_resets() {
+        let mut r = ServerFrameReader::default();
+        let too_long = (SERVER_FRAME_MAX_LEN as u16 + 1).to_le_bytes();
+        r.push(&[SERVER_MSG_STATS_SAMPLE, too_long[0], too_long[1], 1, 2, 3]);
+        assert_eq!(r.next_frame(), Some(Err(StatsWireError::TooLong)));
+        assert_eq!(r.buffered(), 0, "the reader state is dropped");
+        assert!(r.next_frame().is_none(), "reported once, not on every poll");
+        // A length at the limit is fine.
+        let at_limit = (SERVER_FRAME_MAX_LEN as u16).to_le_bytes();
+        r.push(&[SERVER_MSG_STATS_SAMPLE, at_limit[0], at_limit[1]]);
+        assert!(
+            r.next_frame().is_none(),
+            "waiting for the payload, not an error"
+        );
     }
 }
