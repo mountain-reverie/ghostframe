@@ -374,6 +374,226 @@ Part 1 verdict: E8 and E9 are not responsible for any difference; adaptive mode 
 - Deleted: E9 (`h264_probe_pad` reservation, the close-time top-up, the deadline, the counters `probe_padding_repair_datagrams` / `_bytes`), E8's `reserve_pad_rows`, `RepairJob::probe`, the `bundle_seq -> ProbeTag` map and the `ResolvedAck` id.
 - Plan decision 8 is superseded: padding stays PLAIN copies of an acknowledged fragment in every mode, and the byte-identity of knob off, r = 0 and padding is automatic.
 
+## 10. R6-e (plan task E11): the control-law sweep
+
+**Verdict: the default-on commit (E13) stays blocked.** Criteria (2) and the premises hold everywhere that was run; (1) and (4) hold at 10 Mbit/s and above and fail at 2 Mbit/s H.264 (start-up tail drops); (3), (5) and (6) fail in measured cells, for reasons that are not a mis-tuned constant (below). No constant was tuned. The proposed changes are at the end and are the owner's to take or leave.
+
+Tested at `bf2a7b1c` on `362f6a4f` (counters) on `df4c8cc6`: `ghostframe-e2e/tests/browserless_fec_adapt.rs::control_law_sweep`. The reduced grid (H.264, 10 Mbit/s, six losses, 3 seeds, widened to 5 where a hand-off criterion fails) runs in CI in about 75 s; `GHOSTFRAME_FEC_SWEEP=full` runs the whole grid, `GHOSTFRAME_FEC_SWEEP_ONLY=<comma-separated substrings of a cell name>` narrows it. The test fails on the premises and on criteria 1, 2 and 4 (the ones that hold at the CI cell); 3, 5 and 6 print `FAIL` and are open findings, not gates, so that CI says what is measured without being red over a decision that is the owner's.
+
+### 10.0 What was run, and what was not
+
+- **Grid:** loss {clean, 0.01, 0.1, 1, 5 % i.i.d., Gilbert-Elliott per-datagram chain, mean run 3 at 1 % on average} x cap {2, 10, 30, 100 Mbit/s} x load {H.264, tile} x arm {mode off, fixed `64,5,2`, adaptive}. The link is the cap behind a 150 ms tail-drop buffer, 50 ms round trip, loss on the frame path. H.264: the PCM encoder with the rate policy (frames follow the estimate, as in the probe suites). Tile: a damage window offering 0.8 x the cap. 30 s per run, 60 s at 0.01 % and 0.1 % (changes per minute, and enough losses to be a statistical claim).
+- **Seeds:** 3 per cell (`0xFB0001..3`). Widened to 5 (`..5`) where the spread of hand-offs + declines is wide (mean >= 5 and sd > mean) or a hand-off criterion (2, 3) failed on counts this small: H.264 at 2, 10, 30 Mbit/s and tile at 2 Mbit/s were re-run with that rule (cells show their seed count). H.264 at 100 Mbit/s and tile at 10 Mbit/s stayed at 3 seeds (cost). "No higher than" means: the adaptive mean at most the control's mean plus the larger of the two standard deviations over the seeds. Browserless in stepped mode is byte-reproducible per seed, so a repeated seed adds nothing; the seeds are the only spread there is.
+- **Cut for time (the 2 h rule):** **tile at 30 Mbit/s and at 100 Mbit/s** (the tile step scenes at 30 Mbit/s ran about four times slower than at 10 Mbit/s, where a 30 s run takes about 40 s; the 54 runs of that rate would have taken more than two hours). Only the criterion (4) step scenes ran at tile 30 Mbit/s (3 seeds); tile at 100 Mbit/s has no data. Everything else of the grid ran: 36 cells x 3 arms, plus the step scenes.
+- **Measures.** *Overhead* (bytes): repair bytes offered over the other offered bytes. *r/k*: planned repair rows over the source symbols of the blocks sized (the quantity the rule controls; datagram units). *Closes*: `CloseReason` counted at the table (`Accounted`, `Declined`, `HandedOff`, `TimedOut`); *hand-offs + declines* is the E10 unit (`block_handoffs + block_closed_declined`). *Frames late* (H.264): the client's first decode more than 100 ms (an RTT) over the stream's own fastest frame. *Retransmits per lost datagram*: `retransmit_attempts_total` over datagrams the link dropped (for tile it counts refinement re-sends too, so a ratio above 1 is not "per datagram"; read it only against the off arm). *Oracle:* the exact tail of the block under the i.i.d. or Gilbert-Elliott chain, restated in the test and checked against the closed-form binomial; the rule's overhead is that rule applied to the block sizes the run actually closed (a 24-bucket size histogram from the bridge), and the cap's is `ceil(k/4)` (<= 32) on the same sizes.
+- **Premises (every cell, all arms): all hold.** The off arm sends no repair and sizes no block; the fixed arm sends repair (it always has blocks); every arm received LOSS_REPORTs; where the loss is at or above 0.1 % datagrams were dropped in every arm and the reports counted lost datagrams; where it is at or above 1 % the adaptive arm sent repair. Criterion (1)'s digest comparison is live: pointing it at the fixed arm instead of off made it fail on the clean cell.
+
+### 10.1 Criteria
+
+**(1) Clean link and 0.01 %: no repair, frames equal to the mode off.**
+
+| cell | adaptive repair bytes per seed | wire digest equals off | datagrams dropped per seed | verdict |
+|---|---|---|---|---|
+| H264/clean/100M | 0, 0, 0 | true | 0, 0, 0 | pass |
+| H264/clean/10M | 0, 0, 0 | true | 0, 0, 0 | pass |
+| H264/clean/2M | 1221667, 0, 1386009 | false | 34, 31, 33 | **FAIL** |
+| H264/clean/30M | 0, 0, 0 | true | 0, 0, 0 | pass |
+| H264/iid0.01/100M | 0, 0, 0 | true | 25, 29, 33 | pass |
+| H264/iid0.01/10M | 0, 0, 0 | true | 5, 0, 4 | pass |
+| H264/iid0.01/2M | 2485376, 0, 2420097 | false | 35, 31, 34 | **FAIL** |
+| H264/iid0.01/30M | 0, 0, 0 | true | 9, 8, 12 | pass |
+| Tile/clean/10M | 0, 0, 0 | true | 0, 0, 0 | pass |
+| Tile/clean/2M | 0, 0, 0 | true | 0, 0, 0 | pass |
+| Tile/iid0.01/10M | 0, 0, 0 | true | 6, 1, 5 | pass |
+| Tile/iid0.01/2M | 0, 0, 0 | true | 2, 0, 1 | pass |
+
+**(2) Stationary 0.1 %: at most 2 changes per minute, overhead at most fixed's, retransmits no worse than off.**
+
+| cell | changes/min per seed | overhead adaptive / fixed (spread) | retransmits adaptive / off (spread) | verdict |
+|---|---|---|---|---|
+| H264/iid0.1/100M | 0.00, 0.00, 0.00 | 0.0000 / 0.0427 (0.0000) | 0 / 0 (0) | pass |
+| H264/iid0.1/10M | 0.00, 0.00, 0.00 | 0.0000 / 0.3219 (0.0029) | 0 / 0 (0) | pass |
+| H264/iid0.1/2M | 1.00, 0.00, 1.00 | 0.1891 / 1.6389 (0.1345) | 0 / 0 (0) | pass |
+| H264/iid0.1/30M | 0.00, 0.00, 0.00 | 0.0000 / 0.1274 (0.0051) | 0 / 0 (0) | pass |
+| Tile/iid0.1/10M | 1.00, 2.00, 1.00 | 0.0533 / 0.4810 (0.0302) | 533 / 806 (206) | pass |
+| Tile/iid0.1/2M | 0.00, 0.00, 0.00 | 0.0000 / 1.3927 (0.0013) | 100 / 100 (17) | pass |
+
+**(3) 1 %, 5 % i.i.d. and bursty 1 %: hand-offs + declines no higher than fixed `64,5,2`; overhead (planned repair rows over source symbols, per datagram) within 1.25 x the DP rule, or the cap's where the saturated share is >= 0.5.**
+
+| cell | seeds | hand-offs+declines adaptive / fixed (spread) | overhead r/k | bar | saturated share | trim steps (per seed) | verdict |
+|---|---|---|---|---|---|---|---|
+| H264/ge3at1/100M | 3 | 1.0 / 190.0 (6.7) ok | 0.1728 ok | 1.25 x dp 0.2049 | 0.09 | 0, 0, 0 | pass |
+| H264/ge3at1/10M | 5 | 6.2 / 18.6 (3.3) ok | 0.2948 **over** | cap 0.2593 | 0.98 | 1, 1, 1, 1, 1 | **FAIL** |
+| H264/ge3at1/2M | 5 | 6.2 / 0.6 (1.9) **worse** | 0.3557 **over** | cap 0.2886 | 1.00 | 2, 2, 1, 1, 1 | **FAIL** |
+| H264/ge3at1/30M | 5 | 2.4 / 66.4 (8.1) ok | 0.2520 **over** | cap 0.2502 | 0.58 | 0, 0, 0, 0, 0 | **FAIL** |
+| H264/iid1/100M | 3 | 0.7 / 37.3 (1.9) ok | 0.0829 ok | 1.25 x dp 0.1076 | 0.00 | 0, 0, 0 | pass |
+| H264/iid1/10M | 5 | 1.0 / 0.4 (0.6) ok | 0.1970 ok | 1.25 x dp 0.2545 | 0.00 | 0, 0, 0, 0, 0 | pass |
+| H264/iid1/2M | 3 | 0.3 / 0.0 (0.5) ok | 0.2713 ok | cap 0.2713 | 1.00 | 0, 0, 0 | pass |
+| H264/iid1/30M | 3 | 1.3 / 3.0 (1.4) ok | 0.1467 ok | 1.25 x dp 0.1818 | 0.01 | 0, 0, 0 | pass |
+| H264/iid5/100M | 3 | 3.0 / 1229.0 (87.8) ok | 0.1815 ok | 1.25 x dp 0.2461 | 0.09 | 0, 0, 0 | pass |
+| H264/iid5/10M | 5 | 9.2 / 18.4 (3.3) ok | 0.3324 **over** | cap 0.2928 | 0.84 | 4, 3, 3, 3, 1 | **FAIL** |
+| H264/iid5/2M | 5 | 7.8 / 0.6 (1.8) **worse** | 0.4078 **over** | cap 0.2833 | 1.00 | 3, 2, 2, 2, 3 | **FAIL** |
+| H264/iid5/30M | 3 | 6.0 / 230.0 (39.8) ok | 0.2357 ok | cap 0.2634 | 0.59 | 0, 2, 0 | pass |
+| Tile/ge3at1/10M | 3 | 312.0 / 1519.7 (258.4) ok | 0.2671 **over** | cap 0.2507 | 0.98 | 3, 0, 0 | **FAIL** |
+| Tile/ge3at1/2M | 5 | 181.0 / 96.6 (49.3) **worse** | 0.3758 **over** | cap 0.3121 | 0.99 | 2, 1, 1, 1, 1 | **FAIL** |
+| Tile/iid1/10M | 3 | 3.3 / 5.3 (4.5) ok | 0.2021 ok | 1.25 x dp 0.2134 | 0.13 | 0, 0, 0 | pass |
+| Tile/iid1/2M | 3 | 7.7 / 4.3 (6.1) ok | 0.2527 ok | 1.25 x dp 0.3827 | 0.31 | 0, 0, 0 | pass |
+| Tile/iid5/10M | 3 | 394.7 / 939.3 (168.6) ok | 0.2897 **over** | cap 0.2808 | 0.93 | 3, 2, 1 | **FAIL** |
+| Tile/iid5/2M | 5 | 88.8 / 39.0 (24.3) **worse** | 0.3446 **over** | cap 0.3106 | 0.99 | 0, 2, 1, 2, 1 | **FAIL** |
+
+**(4) Engage within 1 s of a 5 % loss step (the step at 5 s; milliseconds to the engaged state, bisected to 50 ms).**
+
+| cell | per seed | verdict |
+|---|---|---|
+| H264/step5/100M | 234 ms, 187 ms, 234 ms | pass |
+| H264/step5/10M | 703 ms, 703 ms, 703 ms | pass |
+| H264/step5/2M | engaged before the step, 1031 ms, engaged before the step | **FAIL** |
+| H264/step5/30M | 281 ms, 281 ms, 281 ms | pass |
+| Tile/step5/10M | 609 ms, 421 ms, 750 ms | pass |
+| Tile/step5/2M | 703 ms, 1687 ms, 1406 ms | **FAIL** |
+| Tile/step5/30M | 328 ms, 328 ms, 328 ms | pass |
+
+**(5) 5 % i.i.d. is never congestion-gated (`adapt_congestion_skips == 0`).** Skips against LOSS_REPORTs received, adaptive arm:
+
+| cell | skips per seed | verdict |
+|---|---|---|
+| H264/iid5/100M | 21, 22, 25 | **FAIL** |
+| H264/iid5/10M | 12, 12, 16, 24, 16 | **FAIL** |
+| H264/iid5/2M | 11, 10, 11, 8, 10 | **FAIL** |
+| H264/iid5/30M | 42, 33, 37 | **FAIL** |
+| Tile/iid5/10M | 50, 52, 60 | **FAIL** |
+| Tile/iid5/2M | 29, 29, 33, 20, 31 | **FAIL** |
+
+Share of reports gated, summed over seeds: H.264 2 Mbit/s 8.4 %, 10 Mbit/s 9.8 %, 30 Mbit/s 7.0 %, 100 Mbit/s 1.9 %; tile 2 Mbit/s 23.5 %, 10 Mbit/s 15.6 %. The controller was engaged in every one of these runs.
+
+**(6) The BWE ceiling binds no more than under the control** (`ceiling_binding_reads / ceiling_reads`, mean over seeds, adaptive against off, over the larger of the two standard deviations).
+
+| cell | adaptive | off | spread | verdict |
+|---|---|---|---|---|
+| H264/clean/100M | 0.0016 | 0.0016 | 0.0012 | pass |
+| H264/clean/10M | 0.0042 | 0.0042 | 0.0025 | pass |
+| H264/clean/2M | 0.0311 | 0.0042 | 0.0158 | **FAIL** |
+| H264/clean/30M | 0.0049 | 0.0049 | 0.0017 | pass |
+| H264/ge3at1/100M | 0.0044 | 0.0000 | 0.0019 | **FAIL** |
+| H264/ge3at1/10M | 0.0176 | 0.0051 | 0.0094 | **FAIL** |
+| H264/ge3at1/2M | 0.0256 | 0.0042 | 0.0066 | **FAIL** |
+| H264/ge3at1/30M | 0.0073 | 0.0045 | 0.0048 | pass |
+| H264/iid0.01/100M | 0.0008 | 0.0008 | 0.0006 | pass |
+| H264/iid0.01/10M | 0.0042 | 0.0042 | 0.0007 | pass |
+| H264/iid0.01/2M | 0.0170 | 0.0040 | 0.0091 | **FAIL** |
+| H264/iid0.01/30M | 0.0031 | 0.0031 | 0.0008 | pass |
+| H264/iid0.1/100M | 0.0003 | 0.0003 | 0.0004 | pass |
+| H264/iid0.1/10M | 0.0042 | 0.0042 | 0.0013 | pass |
+| H264/iid0.1/2M | 0.0142 | 0.0026 | 0.0098 | **FAIL** |
+| H264/iid0.1/30M | 0.0159 | 0.0159 | 0.0140 | pass |
+| H264/iid1/100M | 0.0024 | 0.0005 | 0.0018 | **FAIL** |
+| H264/iid1/10M | 0.0163 | 0.0038 | 0.0106 | **FAIL** |
+| H264/iid1/2M | 0.0244 | 0.0052 | 0.0083 | **FAIL** |
+| H264/iid1/30M | 0.0115 | 0.0006 | 0.0070 | **FAIL** |
+| H264/iid5/100M | 0.0026 | 0.0001 | 0.0004 | **FAIL** |
+| H264/iid5/10M | 0.0236 | 0.0093 | 0.0077 | **FAIL** |
+| H264/iid5/2M | 0.0509 | 0.0078 | 0.0201 | **FAIL** |
+| H264/iid5/30M | 0.0062 | 0.0070 | 0.0064 | pass |
+| Tile/clean/10M | 0.0109 | 0.0109 | 0.0005 | pass |
+| Tile/clean/2M | 0.0000 | 0.0000 | 0.0000 | pass |
+| Tile/ge3at1/10M | 0.1142 | 0.0107 | 0.1017 | **FAIL** |
+| Tile/ge3at1/2M | 0.1642 | 0.0002 | 0.0095 | **FAIL** |
+| Tile/iid0.01/10M | 0.0053 | 0.0053 | 0.0002 | pass |
+| Tile/iid0.01/2M | 0.0000 | 0.0000 | 0.0000 | pass |
+| Tile/iid0.1/10M | 0.0050 | 0.0050 | 0.0005 | pass |
+| Tile/iid0.1/2M | 0.0000 | 0.0000 | 0.0000 | pass |
+| Tile/iid1/10M | 0.0394 | 0.0082 | 0.0099 | **FAIL** |
+| Tile/iid1/2M | 0.2140 | 0.0000 | 0.0275 | **FAIL** |
+| Tile/iid5/10M | 0.2345 | 0.0070 | 0.0072 | **FAIL** |
+| Tile/iid5/2M | 0.2217 | 0.0121 | 0.0399 | **FAIL** |
+
+**(7) At 2 Mbit/s: overhead against the 28 ms design value** (reported, not judged). `r/k` as sent; the DP rule at the mean `k` the run actually closed; the DP rule at the `k` a 28 ms block would hold at the run's source rate.
+
+| cell | adaptive r/k | DP at the k it ran | DP at 28 ms (k) | source datagrams/s |
+|---|---|---|---|---|
+| H264/ge3at1/2M | 0.3557 | 0.2461 (k=4.1) | 0.4000 (k=5) | 164 |
+| H264/iid0.01/2M | 0.2020 | 0.4033 (k=2.5) | 0.2000 (k=5) | 164 |
+| H264/iid0.1/2M | 0.1837 | 0.3920 (k=2.6) | 0.2000 (k=5) | 167 |
+| H264/iid1/2M | 0.2713 | 0.2420 (k=4.1) | 0.4000 (k=5) | 169 |
+| H264/iid5/2M | 0.4078 | 0.2623 (k=3.8) | 0.2500 (k=4) | 154 |
+| Tile/ge3at1/2M | 0.3758 | 0.3034 (k=6.6) | 0.3333 (k=6) | 211 |
+| Tile/iid0.01/2M | 0.0000 | 1.0000 (k=1.0) | 0.1111 (k=9) | 304 |
+| Tile/iid0.1/2M | 0.0000 | 1.0000 (k=1.0) | 0.1250 (k=8) | 303 |
+| Tile/iid1/2M | 0.2527 | 0.3121 (k=6.4) | 0.2857 (k=7) | 238 |
+| Tile/iid5/2M | 0.3446 | 0.3045 (k=6.6) | 0.3333 (k=6) | 208 |
+
+### 10.2 Per cell (means over the seeds shown)
+
+Overhead is repair over other offered bytes. "Declined + handed-off + timed-out" is the share of closed blocks that did not end `Accounted`. Frames late is H.264 only. The adaptive columns for the clean, 0.01 % and (mostly) 0.1 % cells show a controller that stayed off.
+
+| cell | seeds | overhead (repair/source bytes) off / fixed / adaptive | declined+handed-off closes (share of closed blocks) fixed / adaptive | frames late (H.264) off / fixed / adaptive | retransmits per lost dg off / fixed / adaptive | adapt changes/min | saturated share | engaged |
+|---|---|---|---|---|---|---|---|---|
+| H264/clean/2M | 3 | 0.000 / 1.627 / 0.201 | 0.00% / 0.06% | 11 / 174 / 16 | 0.000 / 0.000 / 0.000 | 1.3 | 0.67 | 2/3 |
+| H264/iid0.01/2M | 3 | 0.000 / 1.683 / 0.203 | 0.00% / 0.23% | 16 / 332 / 21 | 0.000 / 0.000 / 0.000 | 0.7 | 0.67 | 2/3 |
+| H264/iid0.1/2M | 3 | 0.000 / 1.639 / 0.189 | 0.02% / 0.06% | 10 / 322 / 16 | 0.000 / 0.000 / 0.000 | 0.7 | 0.67 | 2/3 |
+| H264/iid1/2M | 3 | 0.000 / 1.631 / 0.255 | 0.02% / 0.04% | 10 / 154 / 18 | 0.003 / 0.000 / 0.003 | 2.0 | 1.00 | 3/3 |
+| H264/iid5/2M | 5 | 0.000 / 1.514 / 0.401 | 0.07% / 0.95% | 5 / 204 / 10 | 0.003 / 0.000 / 0.003 | 2.0 | 1.00 | 5/5 |
+| H264/ge3at1/2M | 5 | 0.000 / 1.568 / 0.335 | 0.28% / 0.95% | 12 / 139 / 16 | 0.000 / 0.000 / 0.000 | 2.0 | 1.00 | 5/5 |
+| H264/clean/10M | 3 | 0.000 / 0.324 / 0.000 | 0.00% / - | 6 / 16 / 6 | 0.000 / 0.000 / 0.000 | 0.0 | 0.00 | 0/3 |
+| H264/iid0.01/10M | 3 | 0.000 / 0.319 / 0.000 | 0.00% / - | 12 / 32 / 12 | 0.000 / 0.000 / 0.000 | 0.0 | 0.00 | 0/3 |
+| H264/iid0.1/10M | 3 | 0.000 / 0.322 / 0.000 | 0.00% / - | 9 / 32 / 9 | 0.000 / 0.000 / 0.000 | 0.0 | 0.00 | 0/3 |
+| H264/iid1/10M | 5 | 0.000 / 0.304 / 0.177 | 0.02% / 0.06% | 4 / 22 / 11 | 0.002 / 0.000 / 0.002 | 21.2 | 0.00 | 5/5 |
+| H264/iid5/10M | 5 | 0.000 / 0.313 / 0.308 | 0.85% / 0.61% | 3 / 25 / 9 | 0.001 / 0.000 / 0.001 | 19.2 | 0.84 | 5/5 |
+| H264/ge3at1/10M | 5 | 0.000 / 0.326 / 0.254 | 1.03% / 0.82% | 6 / 16 / 9 | 0.000 / 0.000 / 0.000 | 2.0 | 0.99 | 5/5 |
+| H264/clean/30M | 3 | 0.000 / 0.136 / 0.000 | 0.00% / - | 1 / 5 / 1 | 0.000 / 0.000 / 0.000 | 0.0 | 0.00 | 0/3 |
+| H264/iid0.01/30M | 3 | 0.000 / 0.132 / 0.000 | 0.00% / - | 3 / 5 / 3 | 0.000 / 0.000 / 0.000 | 0.0 | 0.00 | 0/3 |
+| H264/iid0.1/30M | 3 | 0.000 / 0.127 / 0.000 | 0.00% / - | 9 / 12 / 9 | 0.000 / 0.000 / 0.000 | 0.0 | 0.00 | 0/3 |
+| H264/iid1/30M | 3 | 0.000 / 0.127 / 0.139 | 0.10% / 0.04% | 3 / 13 / 8 | 0.001 / 0.000 / 0.001 | 3.3 | 0.01 | 3/3 |
+| H264/iid5/30M | 3 | 0.000 / 0.128 / 0.228 | 8.28% / 0.26% | 1 / 3 / 8 | 0.000 / 0.000 / 0.000 | 5.3 | 0.59 | 3/3 |
+| H264/ge3at1/30M | 5 | 0.000 / 0.128 / 0.239 | 2.71% / 0.29% | 3 / 8 / 10 | 0.000 / 0.000 / 0.000 | 2.0 | 0.58 | 5/5 |
+| H264/clean/100M | 3 | 0.000 / 0.044 / 0.000 | 0.00% / - | 1 / 1 / 1 | 0.000 / 0.000 / 0.000 | 0.0 | 0.00 | 0/3 |
+| H264/iid0.01/100M | 3 | 0.000 / 0.043 / 0.000 | 0.00% / - | 1 / 1 / 1 | 0.000 / 0.000 / 0.000 | 0.0 | 0.00 | 0/3 |
+| H264/iid0.1/100M | 3 | 0.000 / 0.043 / 0.000 | 0.00% / - | 1 / 1 / 1 | 0.000 / 0.000 / 0.000 | 0.0 | 0.00 | 0/3 |
+| H264/iid1/100M | 3 | 0.000 / 0.044 / 0.081 | 1.42% / 0.02% | 1 / 1 / 1 | 0.001 / 0.000 / 0.001 | 4.7 | 0.00 | 3/3 |
+| H264/iid5/100M | 3 | 0.000 / 0.059 / 0.178 | 46.51% / 0.13% | 1 / 1 / 1 | 0.000 / 0.000 / 0.000 | 6.7 | 0.09 | 3/3 |
+| H264/ge3at1/100M | 3 | 0.000 / 0.048 / 0.168 | 7.22% / 0.10% | 1 / 1 / 1 | 0.000 / 0.000 / 0.000 | 13.3 | 0.09 | 3/3 |
+| Tile/clean/2M | 3 | 0.000 / 1.381 / 0.000 | 0.00% / - | n/a | 0.000 / 0.000 / 0.000 | 0.0 | 0.00 | 0/3 |
+| Tile/iid0.01/2M | 3 | 0.000 / 1.390 / 0.000 | 0.00% / - | n/a | 6.167 / 0.000 / 6.167 | 0.0 | 0.00 | 0/3 |
+| Tile/iid0.1/2M | 3 | 0.000 / 1.393 / 0.000 | 0.00% / - | n/a | 7.208 / 0.000 / 7.208 | 0.0 | 0.00 | 0/3 |
+| Tile/iid1/2M | 3 | 0.000 / 1.368 / 0.409 | 0.01% / 0.10% | n/a | 10.632 / 0.043 / 1.000 | 2.0 | 0.31 | 3/3 |
+| Tile/iid5/2M | 5 | 0.000 / 1.350 / 0.581 | 0.23% / 0.62% | n/a | 9.159 / 0.080 / 0.372 | 2.0 | 0.99 | 5/5 |
+| Tile/ge3at1/2M | 5 | 0.000 / 1.377 / 0.499 | 0.42% / 1.19% | n/a | 8.882 / 0.999 / 3.139 | 2.0 | 0.99 | 5/5 |
+| Tile/clean/10M | 3 | 0.000 / 0.476 / 0.000 | 0.00% / - | n/a | 0.000 / 0.000 / 0.000 | 0.0 | 0.00 | 0/3 |
+| Tile/iid0.01/10M | 3 | 0.000 / 0.480 / 0.000 | 0.00% / - | n/a | 14.556 / 0.000 / 14.556 | 0.0 | 0.00 | 0/3 |
+| Tile/iid0.1/10M | 3 | 0.000 / 0.481 / 0.053 | 0.00% / 0.00% | n/a | 15.825 / 0.058 / 10.682 | 1.3 | 0.07 | 3/3 |
+| Tile/iid1/10M | 3 | 0.000 / 0.477 / 0.244 | 0.02% / 0.04% | n/a | 15.983 / 0.018 / 0.239 | 4.0 | 0.13 | 3/3 |
+| Tile/iid5/10M | 3 | 0.000 / 0.420 / 0.442 | 1.33% / 0.53% | n/a | 13.347 / 0.469 / 0.323 | 96.0 | 0.93 | 3/3 |
+| Tile/ge3at1/10M | 3 | 0.000 / 0.478 / 0.347 | 1.19% / 0.54% | n/a | 15.854 / 3.990 / 1.275 | 2.0 | 0.98 | 3/3 |
+
+### 10.3 Findings
+
+1. **At 2 Mbit/s the "clean" link is not clean, and adaptive engages on it (criteria 1 and 4).** The stream's start-up overflows the 150 ms buffer: 31 to 35 datagrams are dropped per run in every arm, the mode off included. The controller engages on them (1.2 to 2.5 MB of repair per run, a 20 % overhead on a link with no injected loss), the frames then differ from the off run, and the step scene finds it already engaged at 5 s and still at 25 s in 2 of 3 seeds (it releases slowly at this rate). The attribution is direct: with the buffer at 1500 ms the same cell drops 0, adaptive stays off and criterion (1) passes (3 seeds). This is the known limit of the standing-queue gate (decision 4): by the time the report arrives the queue has drained, so the loss reads as random. At 10 Mbit/s and above the same start-up does not overflow and (1) holds in every cell, tile included.
+2. **Criterion (3)'s overhead bar fails only where the closed-loop trim is on, and what trips the trim is not an undersized `r`.** Every failing overhead cell but one has `trim_steps` >= 1 (H.264 2 and 10 Mbit/s at 5 % and bursty, tile 2 and 10 Mbit/s likewise); the cells with `trim_steps` 0 pass, and the one near-miss with 0 steps (H.264 30 Mbit/s bursty, 0.2520 against 0.2502) is bucket rounding. The trim adds one row beyond the `ceil(k/4)` cap (plan decision 6), so the saturated bar, which is the cap, is exceeded by construction once it is on. The investigation of the 63 % trim activity (10.4) finds the declines that switch it on: a block that needs a repair request is declined whenever the requested row returns after the client's constant 43 ms window, which at a 40 ms round trip is most of the time (6 of 8 requests at i.i.d. 2 %, 39 of 58 under the 1 ms bursts). More parity cannot help a row that arrives late.
+3. **At 2 Mbit/s adaptive has more hand-offs and declines than fixed `64,5,2`, at a quarter to a half of its bytes** (H.264 5 %: 7.8 against 0.6; bursty: 6.2 against 0.6; tile 5 %: 88.8 against 39.0; tile bursty: 181.0 against 96.6, all outside the spread). At this rate a frame is about 5 datagrams, so a block is `k` 1 to 6 and fixed's `r = 2` is 150 to 165 % overhead (measured 1.51 to 1.69); adaptive spends 34 to 58 %. The criterion "no higher than fixed" compares against a control that spends two to four times the bytes, so at 2 Mbit/s it is a statement about overhead more than about the control law. At 10 Mbit/s and above adaptive's hand-offs + declines are no higher than fixed's wherever the overhead criterion's cell was not otherwise failed: at 100 Mbit/s adaptive 0.7 to 3.0 against fixed 37 to 1229, at a higher overhead (0.08 to 0.18 against 0.04 to 0.06: fixed's `r = 2` is thin at `k` up to 64).
+4. **Criterion (5) fails in every 5 % i.i.d. cell that has a bottleneck**, and the controller was engaged in all of them: 8 to 24 % of the reports at 2 to 30 Mbit/s were gated (1.9 % at 100 Mbit/s), more on tile (15.6 and 23.5 %). The standing queue that gates them is, presumably (not isolated), the stream's own: probe windows and pad bursts from a rate-following stream behind a 150 ms buffer. The unconstrained-link scene (E7) passes with 0 skips; this is the first measurement with a bottleneck. The harm is bounded (a gated interval's losses are not counted, so `p_hat` is a little low and the state stays engaged), but it is not zero as the criterion is written.
+5. **Criterion (6): adaptive's BWE ceiling binds more than the control's, outside the seed spread, in 19 of 36 cells; in the other 17 it is equal or inside the spread.** Absolute shares are small for H.264 (0.2 to 5 % against 0 to 1 %) and large for tile under loss (11 to 23 % against 0 to 2 %). The 17 passing cells are the clean, 0.01 % and (mostly) 0.1 % ones, where adaptive is off and the arms are identical. **Not diagnosed here.** It is the same direction as the E10 finding (step-up under loss worse than the control) and needs its own look before default-on.
+6. **State churn under loss is high where it is not asserted.** Adaptive changes per minute: 19 to 21 at H.264 10 Mbit/s with 1 % and 5 % i.i.d. loss, 96 at tile 10 Mbit/s with 5 %, 0 to 13 elsewhere. Criterion (2) bounds it only at 0.1 %, where it holds (<= 2 in every run: 0 to 1 for H.264, 0 to 2 for tile).
+7. **Criterion (7), the 28 ms design value, does not show at these rates because `T` is not what closes the blocks.** At 2 Mbit/s H.264 the source is about 165 datagrams/s: `k` is 2.5 to 4, about one frame's datagrams (164 / 30 = 5.5; the close cause was not counted per block here), while a 28 ms block would hold about 5, so `T = 20` and `T = 28` give almost the same blocks. The measured r/k (0.18 to 0.41) is at or below the DP rule on the sizes it ran in the unsaturated cells and above it where the trim is on. E1's +5 to +7 points were a simulation of time-closed blocks; if the packer closes at the frame's end, as the `k` suggests, that removes them at these rates.
+8. **Criterion (4) holds from 10 Mbit/s up and fails at 2:** H.264 703 ms at 10, 281 ms at 30, 187 to 234 ms at 100; tile 421 to 750 ms at 10, 328 ms at 30; at 2 Mbit/s tile 703, 1406 and 1687 ms (the report interval is 250 ms and a 2 Mbit/s stream puts few datagrams in each, so the floor test's lower bound plausibly needs more reports; not isolated) and H.264 1031 ms in the one seed where it was not already engaged at start-up.
+
+### 10.4 The decline rate behind the 63 % trim activity (investigation done before the sweep)
+
+**Question.** `p_b_seed_population`, adaptive, 2 % loss, 2 to 6 Mbit/s: `DeclinedTrim` active on 63 % of blocks, where i.i.d. 2 % at `k` about 8 and `r` 2 to 3 should decline about 0.1 %.
+
+**Answer: two causes, neither a defect to fix here.**
+
+1. *The loss in that run is not i.i.d. per datagram.* The `GHOSTFRAME_OUTBOUND_BURST_*` variables drive a time-denominated Gilbert-Elliott chain (a 1 ms mean burst), and a pacer train leaves in microseconds, so one bad interval takes a whole run of consecutive datagrams. Measured (temporary instrumentation, 3 seeds, 2317 blocks): 39 declined (1.7 %, above the 1 % that arms the trim); `r` was 4 for 65 % of all blocks (`k` 9 to 12: the `ceil(k/4)` of 3 plus the trim); the declined blocks' missing bitmaps are `0x1f` and `0x3f` in 20 of 28 cases in the first run, that is the first 5 or 6 sources of the block, while its repairs (typically all 4) arrived. With true per-datagram i.i.d. 2 % (`NetProfile::loss`) the same scene declines 6 of 2387 blocks in the first three seeds (0.25 %) and none in three further ones (6 of 4943, 0.12 %), against the 0.1 % expected; the trim needs 3 declines inside 256 blocks and is not on. A 5-in-9 loss is beyond any `r` the rule may pick.
+2. *In both runs the final decline is the constant 43 ms client window, not the parity.* Every block that was declined had asked for a repair (`requested = true`), and in every one of them the requested row **arrived after the client had given up**: 0.9 to 7.9 ms after at i.i.d. 2 % (6 of 6 declines: 0.9, 1.5, 1.9, 2.5, 2.6, 7.9 ms), 0.9 to 21 ms after under the bursts (11 of 11 in the one seed read, median 2.7 ms). Requests that reached the client: 8 at i.i.d. (6 declined, 75 %), 58 under bursts (39 declined, 67 %). The client closes a block 43 ms (`close_at = first arrival + 33 + 10 ms`) after its first datagram, asks for one more row, and gives the block up 43 ms after the request; at a 40 ms round trip plus the repair's turn in the pacer and the link the row returns about 44 to 51 ms after the request. This is the constant client window that the advertised-timing follow-up (R6-e2) is meant to remove. Quantified, not fixed. Not isolated separately, because the lateness explains every decline observed: a block spanning frames, REPAIR_REQUEST timing (it is sent at the window's end by construction), and something counted as `Declined` that is not (the table's `Declined` is only the client's DECLINED record, which the client's `give_up` alone produces).
+3. A related effect on the sweep: the `Declined` that trips the trim in the sweep's 5 % and bursty cells is this same late-row decline, and the trim's extra row does not shorten the round trip (finding 2 above).
+
+### 10.5 Proposed changes (not made; the owner decides)
+
+- **Trim.** Either (a) cap `r_for + trim` at the `ceil(k/4)` cap (the trim then cannot exceed the saturated bar; it can still raise `r` where there is room), or (b) count a block as `Declined` for the trim only if it was declined *without* an outstanding request that returned after the window (needs the client to say so, i.e. R6-e2), or (c) leave it and restate criterion (3)'s saturated bar as "the cap plus the trim row". (a) is a small change in the sizer; (b) removes the cause.
+- **Gate (criteria 1, 4 at 2 Mbit/s; 5).** The standing-queue gate sees a queue that has drained, or the stream's own probe queue. A gate on the *datagrams' own* queueing (the departure ledger already stamps departures: skip losses of datagrams that were sent into a non-empty queue) would catch the start-up overflow and would not skip loss that is random. This is a change of mechanism, not of a constant.
+- **Criteria as written.** (3) at 2 Mbit/s compares with a control that spends two to four times the bytes: compare at equal overhead (hand-offs + declines per repair byte), or restate it for 10 Mbit/s and above. (5) "never gated" cannot hold behind a bottleneck with a rate-following stream: restate as "engaged in every run and the gated share of reports under X %", X from this table (it is 1.9 to 23.5 %, unlike the unconstrained 0).
+- **Criterion (6)** needs a diagnosis, not a proposal: find what binds the ceiling more under adaptive (the repair bytes in the acknowledged-rate window and the sending-rate estimate are the first suspects, as in E10).
+- **Sequence.** R6-e2 (advertised timing) first removes the cause of finding 2; then re-run this sweep (`GHOSTFRAME_FEC_SWEEP=full`, about an hour without tile at 30 and 100 Mbit/s) before E13.
+
 ## 11. R6-e2 (plan task TB0): where the tile repair bytes go
 
 Measurement only (`the_repair_bytes_are_split_by_cause` in `browserless_fec_adapt.rs`, `FECSPLIT` and `FECCRIT3` lines). Adaptive arm, 10 Mbit/s, 150 ms buffer, 30 s, 5 seeds (`0xFB0001`-`5`), mean ± sd. Every number is a share of the **source wire bytes**, except the rows/k rows, which are shares of source symbols.
