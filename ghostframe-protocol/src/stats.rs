@@ -295,6 +295,81 @@ impl<'a> Cursor<'a> {
     }
 }
 
+impl StatsSchema {
+    /// The whole frame, `[0x01][len u16 LE][payload]`, or why it cannot be
+    /// built: a string over its prefix, more than `MAX_DESCRIPTORS`
+    /// descriptors, or a payload over [`SERVER_FRAME_MAX_LEN`]. The server
+    /// uses this one: a table that outgrows the limits is counted, not a
+    /// panic.
+    pub fn try_encode_frame(&self) -> Result<Vec<u8>, StatsWireError> {
+        if self.metrics.len() > MAX_DESCRIPTORS {
+            return Err(StatsWireError::TooLong);
+        }
+        let mut p = Vec::new();
+        p.extend_from_slice(&self.schema_id.to_le_bytes());
+        put_str16(&mut p, &self.server_version)?;
+        put_str16(&mut p, &self.host_name)?;
+        p.extend_from_slice(&(self.metrics.len() as u16).to_le_bytes());
+        for m in &self.metrics {
+            p.extend_from_slice(&m.id.to_le_bytes());
+            put_str8(&mut p, &m.name)?;
+            put_str8(&mut p, &m.unit)?;
+            p.push(m.kind.as_u8());
+            p.push(m.group.as_u8());
+            put_str8(&mut p, &m.label)?;
+        }
+        frame(SERVER_MSG_STATS_SCHEMA, &p)
+    }
+
+    /// [`Self::try_encode_frame`] for a schema the caller knows is within
+    /// the limits (a test, a static table).
+    ///
+    /// # Panics
+    /// When the schema is over a limit.
+    pub fn encode_frame(&self) -> Vec<u8> {
+        self.try_encode_frame()
+            .expect("stats schema is within the wire limits")
+    }
+
+    /// Decode a frame's payload (the bytes after the 3-byte header).
+    pub fn decode_payload(payload: &[u8]) -> Result<Self, StatsWireError> {
+        let mut c = Cursor::new(payload);
+        let schema_id = c.u16()?;
+        let server_version = c.str16()?;
+        let host_name = c.str16()?;
+        let count = usize::from(c.u16()?);
+        if count > MAX_DESCRIPTORS {
+            return Err(StatsWireError::TooLong);
+        }
+        let mut metrics = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id = c.u16()?;
+            let name = c.str8()?;
+            let unit = c.str8()?;
+            let kind = MetricKind::from_u8(c.u8()?).ok_or(StatsWireError::UnknownKind)?;
+            let group = MetricGroup::from_u8(c.u8()?);
+            let label = c.str8()?;
+            metrics.push(MetricDescriptor {
+                id,
+                name,
+                unit,
+                kind,
+                group,
+                label,
+            });
+        }
+        if !c.finished() {
+            return Err(StatsWireError::TooLong);
+        }
+        Ok(Self {
+            schema_id,
+            server_version,
+            host_name,
+            metrics,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +431,185 @@ mod tests {
         }
         assert_eq!(MetricKind::from_u8(3), None);
         assert_eq!(MetricKind::from_u8(255), None);
+    }
+
+    fn descriptor(id: u16, name: &str, kind: MetricKind, group: MetricGroup) -> MetricDescriptor {
+        MetricDescriptor {
+            id,
+            name: name.to_string(),
+            unit: "bit/s".to_string(),
+            kind,
+            group,
+            label: format!("label {name}"),
+        }
+    }
+
+    fn sample_schema() -> StatsSchema {
+        StatsSchema {
+            schema_id: 7,
+            server_version: "0.1.0 (aab2fa2d, dirty)".to_string(),
+            host_name: "evangeline".to_string(),
+            metrics: vec![
+                descriptor(
+                    1,
+                    "ghostframe.bwe.estimate",
+                    MetricKind::Gauge,
+                    MetricGroup::Bandwidth,
+                ),
+                descriptor(
+                    2,
+                    "ghostframe.loss.verdicts",
+                    MetricKind::Counter,
+                    MetricGroup::Loss,
+                ),
+                descriptor(
+                    3,
+                    "ghostframe.frame.mode",
+                    MetricKind::Text,
+                    MetricGroup::Video,
+                ),
+            ],
+        }
+    }
+
+    /// A schema with one metric and every string empty: its payload layout is
+    /// fixed, so a test can patch a byte by offset.
+    ///   0-1 schema_id, 2-3 version len, 4-5 host len, 6-7 count,
+    ///   8-9 id, 10 name len, 11 unit len, 12 kind, 13 group, 14 label len.
+    fn minimal_payload() -> Vec<u8> {
+        let schema = StatsSchema {
+            schema_id: 1,
+            server_version: String::new(),
+            host_name: String::new(),
+            metrics: vec![MetricDescriptor {
+                id: 9,
+                name: String::new(),
+                unit: String::new(),
+                kind: MetricKind::Gauge,
+                group: MetricGroup::Connection,
+                label: String::new(),
+            }],
+        };
+        let payload = schema.encode_frame()[FRAME_HEADER_LEN..].to_vec();
+        assert_eq!(payload.len(), 15, "layout the offsets below rely on");
+        payload
+    }
+
+    #[test]
+    fn schema_frame_roundtrip_and_framing() {
+        let schema = sample_schema();
+        let f = schema.encode_frame();
+        assert_eq!(f[0], SERVER_MSG_STATS_SCHEMA);
+        let len = usize::from(u16::from_le_bytes([f[1], f[2]]));
+        assert_eq!(
+            len,
+            f.len() - FRAME_HEADER_LEN,
+            "length covers the payload only"
+        );
+        assert_eq!(
+            StatsSchema::decode_payload(&f[FRAME_HEADER_LEN..]),
+            Ok(schema)
+        );
+    }
+
+    #[test]
+    fn every_strict_prefix_of_a_schema_is_an_error() {
+        let payload = sample_schema().encode_frame()[FRAME_HEADER_LEN..].to_vec();
+        for cut in 0..payload.len() {
+            assert!(
+                StatsSchema::decode_payload(&payload[..cut]).is_err(),
+                "a {cut}-byte prefix of a {}-byte schema decoded",
+                payload.len()
+            );
+        }
+    }
+
+    #[test]
+    fn schema_unknown_kind_is_an_error_and_unknown_group_is_other() {
+        let mut p = minimal_payload();
+        p[12] = 9;
+        assert_eq!(
+            StatsSchema::decode_payload(&p),
+            Err(StatsWireError::UnknownKind)
+        );
+        let mut p = minimal_payload();
+        p[13] = 77;
+        let s = StatsSchema::decode_payload(&p).expect("an unknown group still decodes");
+        assert_eq!(s.metrics[0].group, MetricGroup::Other);
+    }
+
+    #[test]
+    fn schema_bad_utf8_and_trailing_bytes_are_errors() {
+        // One metric named "a": the name byte is at offset 11.
+        let schema = StatsSchema {
+            schema_id: 1,
+            server_version: String::new(),
+            host_name: String::new(),
+            metrics: vec![descriptor(1, "a", MetricKind::Gauge, MetricGroup::Other)],
+        };
+        let mut p = schema.encode_frame()[FRAME_HEADER_LEN..].to_vec();
+        p[11] = 0xFF;
+        assert_eq!(
+            StatsSchema::decode_payload(&p),
+            Err(StatsWireError::BadUtf8)
+        );
+
+        let mut p = minimal_payload();
+        p.push(0);
+        assert_eq!(
+            StatsSchema::decode_payload(&p),
+            Err(StatsWireError::TooLong)
+        );
+    }
+
+    #[test]
+    fn schema_descriptor_count_is_bounded_before_it_is_read() {
+        let mut p = minimal_payload();
+        p[6..8].copy_from_slice(&((MAX_DESCRIPTORS + 1) as u16).to_le_bytes());
+        assert_eq!(
+            StatsSchema::decode_payload(&p),
+            Err(StatsWireError::TooLong)
+        );
+    }
+
+    #[test]
+    fn try_encode_refuses_what_decode_would_refuse() {
+        let mut s = sample_schema();
+        s.metrics[0].name = "n".repeat(256);
+        assert_eq!(s.try_encode_frame(), Err(StatsWireError::TooLong));
+
+        let mut s = sample_schema();
+        s.metrics = (0..=MAX_DESCRIPTORS as u16)
+            .map(|i| descriptor(i, "m", MetricKind::Gauge, MetricGroup::Other))
+            .collect();
+        assert_eq!(
+            s.try_encode_frame(),
+            Err(StatsWireError::TooLong),
+            "513 descriptors"
+        );
+
+        // Every string is within its own 255-byte prefix, so only the
+        // 16 KiB frame limit can refuse this one. Built directly, not through
+        // `descriptor()`, whose label would push a 255-byte name past 255.
+        let mut s = sample_schema();
+        s.metrics = (0..100u16)
+            .map(|i| MetricDescriptor {
+                id: i,
+                name: "n".repeat(200),
+                unit: "u".to_string(),
+                kind: MetricKind::Gauge,
+                group: MetricGroup::Other,
+                label: "l".repeat(200),
+            })
+            .collect();
+        assert_eq!(
+            s.try_encode_frame(),
+            Err(StatsWireError::TooLong),
+            "100 descriptors of about 410 bytes (about 41 KB) are over the 16 KiB frame limit"
+        );
+        // Control: the same shape with 10 descriptors (about 4 KB) encodes,
+        // so the refusal above is the size and not a string.
+        s.metrics.truncate(10);
+        assert!(s.try_encode_frame().is_ok());
     }
 }
