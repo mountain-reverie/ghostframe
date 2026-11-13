@@ -106,7 +106,10 @@ fn feed_server_stats(core: &Rc<RefCell<ClientCore>>, server_version: &str) {
     let sample = StatsSample {
         schema_id: 1,
         timestamp_us: 1_000_000,
-        values: vec![MetricValue::Num(18.4), MetricValue::Text("h264".to_string())],
+        values: vec![
+            MetricValue::Num(18.4),
+            MetricValue::Text("h264".to_string()),
+        ],
     };
     let mut bytes = schema.encode_frame();
     bytes.extend(sample.encode_frame());
