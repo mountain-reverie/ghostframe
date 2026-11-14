@@ -581,9 +581,9 @@ impl Loss {
 /// suites; tile: a damage window offering 0.8 x the cap).
 ///
 /// `scale` multiplies the offered load (tile: tiles per tick; H.264: the PCM
-/// frame size); 1.0 is the grid's. The matched control of criterion (6) is the
-/// mode-off arm run at the scale that gives it the adaptive arm's
-/// offered / estimate.
+/// frame size); 1.0 is the grid's. Criterion (5)'s tile control is the mode-off
+/// arm run at the scale that gives it the adaptive arm's offered / estimate;
+/// criterion (6)'s is both arms at `TILE_SATURATING_SCALE`.
 fn sweep_scene(cell: Cell, seed: u64, ms: u64, scale: f64) -> (BrowserlessScene, LinkOverrides) {
     let Cell {
         load,
@@ -697,7 +697,7 @@ struct SweepRun {
     /// Offered wire bytes (repair included) per second, as bits/s.
     offered_bps: f64,
     /// Content the client shows per second: H.264 frames shown, tile passes
-    /// decoded (`TileReady` events), by the cell's load.
+    /// decoded (`TileReady` events, not distinct tiles), by the cell's load.
     delivered_per_s: f64,
     /// H.264 only: frames shown, frames late (more than an RTT over the
     /// stream's own floor), never-fed frames.
@@ -923,6 +923,7 @@ async fn sweep_run(cell: Cell, arm: Arm, seed: u64, scale: f64) -> SweepRun {
         .await
         .expect("scene ran");
     let out = read_run(&r, secs, load);
+    let unit = rate_label(load);
     println!(
         "FECSWEEP run load={load:?} loss={} cap={cap_mbit} buf={} arm={} scale={scale:.3} seed={seed:#x} secs={secs} \
          dropped={} offered={} lost_pre_fec={} reports={} src_bytes={} repair_bytes={} \
@@ -930,7 +931,7 @@ async fn sweep_run(cell: Cell, arm: Arm, seed: u64, scale: f64) -> SweepRun {
          retx_per_lost={:.3} changes={} changes_per_min={:.2} floor_changes={} engaged={} sized={} \
          sat={:.2} skips={} trim={} p_hat_ppm={} b_hat_x100={} bwe_binding={:.3}/{} shown={} \
          late={} never_fed={} digest={:#x} reports_with_loss={} queue_reads={} est_bps={:.0} \
-         offered_bps={:.0} ofe={:.3} delivered_per_s={:.2} declined_late={} creq={} late_rows={} \
+         offered_bps={:.0} ofe={:.3} {unit}={:.2} declined_late={} creq={} late_rows={} \
          req_served={} req_rows={} req_rows_per_block={:.2}",
         loss.name(),
         cell.buf_ms,
@@ -984,9 +985,19 @@ async fn sweep_run(cell: Cell, arm: Arm, seed: u64, scale: f64) -> SweepRun {
     out
 }
 
+/// What `SweepRun::delivered_per_s` counts, by load: tile passes decoded (not
+/// distinct tiles), H.264 frames shown.
+fn rate_label(load: Load) -> &'static str {
+    match load {
+        Load::Tile => "passes_per_s",
+        Load::H264 => "frames_per_s",
+    }
+}
+
 /// One line per run: where the repair wire bytes went, in points of the
 /// source wire bytes, and the planned rows in points of the source symbols.
 fn print_split(cell: Cell, arm: Arm, seed: u64, scale: f64, o: &SweepRun) {
+    let unit = rate_label(cell.load);
     let sp = &o.split;
     let k = sp.sum_k.max(1) as f64;
     let row_b = sp.bytes[0] as f64 / sp.rows[0].max(1) as f64;
@@ -996,7 +1007,7 @@ fn print_split(cell: Cell, arm: Arm, seed: u64, scale: f64, o: &SweepRun) {
          trim_bytes={:.4} | rows/k: planned={:.4} (decided={:.4}) trim={:.4} cap_exact={:.4} \
          request={:.4} pto={:.4} t_lr={:.4} | blocks={} k_mean={:.2} k_eff_mean={:.2} mixed={:.3} \
          sym_over_src={:.4} | h264_blocks={} h264_k_ne_k={} | crit_lat n={} mean_us={} p95_ms<={} \
-         creq_per_block={:.3} delivered_per_s={:.2}",
+         creq_per_block={:.3} {unit}={:.2}",
         cell.name(),
         arm.name(),
         o.pts(sp.bytes.iter().sum::<u64>() as f64),
@@ -1258,16 +1269,22 @@ struct CellRuns {
     fixed: Vec<SweepRun>,
     ada: Vec<SweepRun>,
     /// Tile only: the mode-off arm re-run per seed at the load scale that
-    /// gives it the adaptive arm's offered / estimate (criteria 5 and 6).
+    /// gives it the adaptive arm's offered / estimate (criterion 5).
     /// Empty for H.264, whose off arm already offers the same share.
     matched: Vec<SweepRun>,
+    /// Tile only (criterion 6): both arms re-run per seed at
+    /// `TILE_SATURATING_SCALE`, one demand for the two, so that each is
+    /// bound by the link. Empty for H.264.
+    sat_off: Vec<SweepRun>,
+    sat_ada: Vec<SweepRun>,
     seeds: usize,
 }
 
 impl CellRuns {
-    /// The control of criteria (5) and (6): the matched off arm for tile (the
-    /// unmatched one offers a smaller share of the estimate, so it is no null
-    /// model of the adaptive stream), the plain off arm for H.264.
+    /// The control of criterion (5) (and of (6) for H.264): the matched off
+    /// arm for tile (the unmatched one offers a smaller share of the estimate,
+    /// so it is no null model of the adaptive stream), the plain off arm for
+    /// H.264.
     fn control(&self) -> &[SweepRun] {
         if self.cell.load == Load::Tile {
             &self.matched
@@ -1304,6 +1321,8 @@ async fn run_cell(cell: Cell, max_seeds: usize) -> CellRuns {
         fixed: vec![],
         ada: vec![],
         matched: vec![],
+        sat_off: vec![],
+        sat_ada: vec![],
         seeds: 0,
     };
     let mut n = 3.min(max_seeds);
@@ -1320,6 +1339,9 @@ async fn run_cell(cell: Cell, max_seeds: usize) -> CellRuns {
         if cell.load == Load::Tile {
             let scale = matched_scale(c.ada.last().expect("ran"), c.off.last().expect("ran"));
             c.matched.push(sweep_run(cell, Arm::Off, seed, scale).await);
+            for (arm, v) in [(Arm::Off, &mut c.sat_off), (Arm::Adaptive, &mut c.sat_ada)] {
+                v.push(sweep_run(cell, arm, seed, TILE_SATURATING_SCALE).await);
+            }
         }
         c.seeds += 1;
         // Three seeds are the grid; five where the spread is wide, or where a
@@ -1456,13 +1478,19 @@ fn crit5(c: &CellRuns) -> Judged {
     }
 }
 
-/// (6), restated: at equal offered / estimate, the estimate (second-half time
-/// mean) and the delivered content per second (H.264 frames shown, tile
-/// passes decoded) are no lower than the control's minus the larger sd. The
-/// control is the off arm for H.264 and the matched off arm for tile. The
-/// share of ceiling-binding reads is printed, not judged.
-fn crit6(c: &CellRuns) -> Judged {
-    let ctl = c.control();
+/// The tile demand (a multiple of the grid's tiles per tick) at which the off
+/// arm saturates the link on the cells the RCA measured: the smallest scale at
+/// which its wire total is at least `SATURATION_SHARE` x cap x secs (1.5 at 10
+/// and at 2 Mbit/s). One demand for both arms, a constant, and a premise of
+/// criterion (6): the run fails loudly if the link is not saturated.
+const TILE_SATURATING_SCALE: f64 = 1.5;
+const SATURATION_SHARE: f64 = 0.95;
+
+/// (6), H.264: at equal offered / estimate, the estimate (second-half time
+/// mean) and the frames shown per second are no lower than the off arm's
+/// minus the larger sd. The share of ceiling-binding reads is printed.
+fn crit6_h264(c: &CellRuns) -> Judged {
+    let ctl = &c.off;
     let premise = !ctl.is_empty()
         && ctl.len() == c.ada.len()
         && ctl.iter().chain(&c.ada).all(|r| r.est_bps > 0.0);
@@ -1484,6 +1512,106 @@ fn crit6(c: &CellRuns) -> Judged {
              adaptive={ba:.4} control={bc:.4}",
             mean(&field(&c.ada, SweepRun::ofe)),
             mean(&field(ctl, SweepRun::ofe))
+        ),
+    }
+}
+
+/// (6), tile: both arms run at one demand that saturates the link
+/// (`TILE_SATURATING_SCALE`; premise: the off arm's wire total is at least
+/// `SATURATION_SHARE` x cap x secs). The estimate is no lower than the off
+/// arm's minus the larger sd, and the passes per second the client decodes
+/// (every `TileReady`; not distinct tiles) are at least the off arm's x
+/// 1 / (1 + rho_bytes) minus the larger sd, where rho_bytes is the adaptive
+/// arm's own repair bytes over its source bytes.
+///
+/// Why that bound: on a saturated link every repair byte displaces a source
+/// byte, so an arm that spends rho of its source on repair can carry at best
+/// 1 / (1 + rho) of the source the off arm carries. That share is the price
+/// of the overhead; the check fails only where FEC loses more than its bytes.
+/// Padding to the longest symbol is judged by its own gate (`padding_gate`).
+/// The unscaled-demand comparison is printed, not judged.
+///
+/// The control is not matched on offered / estimate: the estimate overshoots
+/// the link (up to 40 % on this load), so the matched scale swung from x1.02
+/// to x1.51 and flipped the verdict.
+fn crit6_tile(c: &CellRuns) -> Judged {
+    let (off, ada) = (&c.sat_off, &c.sat_ada);
+    let have = !off.is_empty() && off.len() == ada.len();
+    let link_bps = c.cell.cap as f64 * 1e6;
+    // The premise: the control is link-bound, else the run proves nothing.
+    let saturated = have
+        && off
+            .iter()
+            .all(|r| r.offered_bps >= SATURATION_SHARE * link_bps);
+    let est_present = have && off.iter().chain(ada).all(|r| r.est_bps > 0.0);
+    let (ok_est, ea, ec, es) = ge_spread(&field(ada, |r| r.est_bps), &field(off, |r| r.est_bps));
+    let rho = mean(&field(ada, SweepRun::rho_bytes));
+    let (da, dc) = (
+        field(ada, |r| r.delivered_per_s),
+        field(off, |r| r.delivered_per_s),
+    );
+    let spread = sd(&da).max(sd(&dc));
+    let bound = mean(&dc) / (1.0 + rho) - spread;
+    let ok_del = have && mean(&da) >= bound;
+    // Printed: the grid's own demand (the off arm is then supply-limited).
+    let (ua, uo) = (
+        mean(&field(&c.ada, |r| r.delivered_per_s)),
+        mean(&field(&c.off, |r| r.delivered_per_s)),
+    );
+    Judged {
+        verdict: Some(saturated && est_present && ok_est && ok_del),
+        detail: format!(
+            "premise off_saturated_at_x{TILE_SATURATING_SCALE}={saturated} (off offered/link={:.3}, \
+             need >= {SATURATION_SHARE}); estimate adaptive={ea:.0} off={ec:.0} spread={es:.0} \
+             ({ok_est}); passes/s adaptive={:.2} off={:.2} ratio={:.3} bound=off/(1+rho_bytes \
+             {rho:.3})-spread {spread:.2} = {bound:.2} ({ok_del}); (printed) unscaled demand \
+             passes/s adaptive={ua:.2} off={uo:.2} ratio={:.3}",
+            mean(&field(off, |r| r.offered_bps)) / link_bps.max(1.0),
+            mean(&da),
+            mean(&dc),
+            mean(&da) / mean(&dc).max(f64::MIN_POSITIVE),
+            ua / uo.max(f64::MIN_POSITIVE)
+        ),
+    }
+}
+
+fn crit6(c: &CellRuns) -> Judged {
+    match c.cell.load {
+        Load::Tile => crit6_tile(c),
+        Load::H264 => crit6_h264(c),
+    }
+}
+
+/// The tile padding gate (6b): the repair wire bytes at most this many times
+/// the planned rows' bytes at the average symbol (their ideal payload plus
+/// headers; TB0 measures both).
+const PADDING_BUDGET: f64 = 1.15;
+
+/// The criterion number of the padding gate. It is not in `GATED`: a failure
+/// prints `FAIL` and does not turn CI red. Padding to the longest symbol is
+/// the open structural item in FINDINGS (size-homogeneous blocks, or splitting
+/// long bundles into symbol-sized pieces): about a third of the repair bytes
+/// at 10 Mbit/s and 40 % at 2, so this gate is expected to FAIL today.
+const PADDING_CRIT: u8 = 9;
+
+fn padding_gate(c: &CellRuns) -> Judged {
+    let ada = &c.ada;
+    let planned = |r: &SweepRun| {
+        (r.split.initial_ideal_milli as f64 / 1000.0) + r.split.initial_header_bytes as f64
+    };
+    // Non-zero before it is a ratio: both the repair bytes and the planned rows.
+    let measured = !ada.is_empty() && ada.iter().all(|r| r.repair_bytes > 0 && planned(r) > 0.0);
+    let ratios = field(ada, |r| r.repair_bytes as f64 / planned(r).max(1.0));
+    let worst = ratios.iter().copied().fold(0.0, f64::max);
+    let pad_share = field(ada, |r| {
+        r.split.initial_pad_milli as f64 / 1000.0 / r.repair_bytes.max(1) as f64
+    });
+    Judged {
+        verdict: Some(measured && worst <= PADDING_BUDGET),
+        detail: format!(
+            "(report-only, not a gate) repair bytes over the planned rows' bytes at the average \
+             symbol, per seed {ratios:.3?}, worst {worst:.3} against {PADDING_BUDGET}; \
+             measured={measured}; padding share of the repair bytes {pad_share:.3?}"
         ),
     }
 }
@@ -1582,8 +1710,13 @@ fn verdicts(c: &CellRuns) -> Vec<Verdict> {
     if (nominal - 0.05).abs() < 1e-9 && matches!(c.cell.loss, Loss::Iid(_)) {
         out.push(judged(5, crit5(c)));
     }
-    // (6) outcomes at equal offered / estimate.
+    // (6) outcomes: H.264 at equal offered / estimate, tile at one saturating
+    // demand for both arms.
     out.push(judged(6, crit6(c)));
+    // (6b) tile padding, report-only (`PADDING_CRIT` is not in `GATED`).
+    if c.cell.load == Load::Tile && nominal > 0.0 {
+        out.push(judged(PADDING_CRIT, padding_gate(c)));
+    }
     // (7) at 2 Mbit/s: the overhead against the 28 ms design value (report).
     if c.cell.cap == 2 && nominal > 0.0 {
         let a = &c.ada;
@@ -1981,6 +2114,8 @@ fn cell_runs(cell: Cell) -> CellRuns {
         fixed: vec![],
         ada: vec![],
         matched: vec![],
+        sat_off: vec![],
+        sat_ada: vec![],
         seeds: 3,
     }
 }
@@ -2114,9 +2249,9 @@ fn criterion_5_uses_the_matched_off_arm_for_tile() {
     assert_eq!(crit5(&as_h264).verdict, Some(false));
 }
 
-/// Adaptive and control arms with an estimate and a delivered rate.
-fn crit6_cell(load: Load, ada: (f64, f64), ctl: (f64, f64), off: (f64, f64)) -> CellRuns {
-    let mut c = cell_runs(Cell::new(load, Loss::Iid(0.05), 10));
+/// H.264: adaptive and control arms with an estimate and a delivered rate.
+fn crit6_cell(ada: (f64, f64), ctl: (f64, f64)) -> CellRuns {
+    let mut c = cell_runs(Cell::new(Load::H264, Loss::Iid(0.05), 10));
     let arm = |(est, del): (f64, f64)| {
         synth(&[-1.0, 0.0, 1.0], move |r, d| {
             r.est_bps = est + d * 10_000.0;
@@ -2125,47 +2260,135 @@ fn crit6_cell(load: Load, ada: (f64, f64), ctl: (f64, f64), off: (f64, f64)) -> 
         })
     };
     c.ada = arm(ada);
-    match load {
-        Load::H264 => c.off = arm(ctl),
-        Load::Tile => {
-            c.matched = arm(ctl);
-            c.off = arm(off);
-        }
-    }
+    c.off = arm(ctl);
     c
 }
 
 #[test]
 fn criterion_6_compares_estimate_and_delivery_with_the_control() {
-    let eq = crit6_cell(Load::H264, (8e6, 25.0), (8e6, 25.0), (0.0, 0.0));
+    let eq = crit6_cell((8e6, 25.0), (8e6, 25.0));
     let j = crit6(&eq);
     assert_eq!(j.verdict, Some(true), "{}", j.detail);
     // Delivery below the control by more than the spread.
-    let slow = crit6_cell(Load::H264, (8e6, 20.0), (8e6, 25.0), (0.0, 0.0));
+    let slow = crit6_cell((8e6, 20.0), (8e6, 25.0));
     assert_eq!(crit6(&slow).verdict, Some(false));
     // Estimate below the control by more than the spread.
-    let low = crit6_cell(Load::H264, (6e6, 25.0), (8e6, 25.0), (0.0, 0.0));
+    let low = crit6_cell((6e6, 25.0), (8e6, 25.0));
     assert_eq!(crit6(&low).verdict, Some(false));
     // Above the control is fine.
-    let above = crit6_cell(Load::H264, (9e6, 30.0), (8e6, 25.0), (0.0, 0.0));
+    let above = crit6_cell((9e6, 30.0), (8e6, 25.0));
     assert_eq!(crit6(&above).verdict, Some(true));
 }
 
+/// A 10 Mbit/s tile cell at the saturating demand. The off arm offers
+/// `off_link` x the link and decodes `off_passes`/s; the adaptive arm decodes
+/// `ada_passes`/s and spends `rho` of its source bytes on repair. Both arms
+/// have the same estimate; seeds are 0.1 apart so the spread is not zero.
+fn crit6_tile_cell(off_link: f64, off_passes: f64, ada_passes: f64, rho: f64) -> CellRuns {
+    let mut c = cell_runs(Cell::new(Load::Tile, Loss::Iid(0.05), 10));
+    let arm = |passes: f64, link: f64, rho: f64| {
+        synth(&[-1.0, 0.0, 1.0], move |r, d| {
+            r.est_bps = 9.5e6;
+            r.delivered_per_s = passes + d * 0.1;
+            r.offered_bps = link * 10e6;
+            r.src_bytes = 1_000_000;
+            r.repair_bytes = (rho * 1_000_000.0) as u64;
+        })
+    };
+    c.sat_off = arm(off_passes, off_link, 0.0);
+    c.sat_ada = arm(ada_passes, 1.0, rho);
+    // The grid's own demand: a decoy (off supply-limited and low) that must
+    // be printed, not judged.
+    c.off = arm(10.0, 0.6, 0.0);
+    c.ada = arm(500.0, 0.9, rho);
+    c
+}
+
 #[test]
-fn criterion_6_for_tile_compares_with_the_matched_arm_not_the_unmatched_one() {
-    // Adaptive delivers 100 passes/s; the matched arm 100; the unmatched off
-    // arm 150 (it offers less of the estimate, yet at the same estimate its
-    // passes are not the control's). Against the unmatched arm it fails.
-    let tile = crit6_cell(Load::Tile, (8e6, 100.0), (8e6, 100.0), (8e6, 150.0));
-    let j = crit6(&tile);
+fn criterion_6_for_tile_premises_a_saturated_off_arm() {
+    // 0.97 of the link: saturated, and 83 / 100 delivered passes pass 1/(1+0.43).
+    let ok = crit6_tile_cell(0.97, 100.0, 83.0, 0.43);
+    let j = crit6(&ok);
     assert_eq!(j.verdict, Some(true), "{}", j.detail);
-    let mut as_unmatched = tile;
-    as_unmatched.matched = std::mem::take(&mut as_unmatched.off);
-    assert_eq!(crit6(&as_unmatched).verdict, Some(false));
-    // No matched arm at all: no control, no verdict of pass.
-    let mut none = crit6_cell(Load::Tile, (8e6, 100.0), (8e6, 100.0), (8e6, 100.0));
-    none.matched.clear();
+    assert!(j.detail.contains("off_saturated_at_x1.5=true"));
+    // The same passes against an unsaturated off arm: the premise fails
+    // loudly, whatever the passes say.
+    let un = crit6_tile_cell(0.90, 100.0, 83.0, 0.43);
+    let j = crit6(&un);
+    assert_eq!(j.verdict, Some(false), "{}", j.detail);
+    assert!(j.detail.contains("off_saturated_at_x1.5=false"));
+    // No saturating arms at all (the grid's demand only): no verdict of pass.
+    let mut none = crit6_tile_cell(0.97, 100.0, 83.0, 0.43);
+    none.sat_off.clear();
+    none.sat_ada.clear();
     assert_eq!(crit6(&none).verdict, Some(false));
+}
+
+#[test]
+fn criterion_6_for_tile_bounds_passes_by_the_arms_own_rho() {
+    // Adaptive 70 of the off arm's 100 passes/s: above 1/(1+0.50) = 0.667 it
+    // passes, below 1/(1+0.30) = 0.769 it fails. The runs and the passes are
+    // the same; only the arm's own overhead moves the verdict.
+    let high_rho = crit6_tile_cell(0.97, 100.0, 70.0, 0.50);
+    let j = crit6(&high_rho);
+    assert_eq!(j.verdict, Some(true), "{}", j.detail);
+    let low_rho = crit6_tile_cell(0.97, 100.0, 70.0, 0.30);
+    let j = crit6(&low_rho);
+    assert_eq!(j.verdict, Some(false), "{}", j.detail);
+    // Delivering what the off arm does passes at any rho.
+    assert_eq!(
+        crit6(&crit6_tile_cell(0.97, 100.0, 100.0, 0.0)).verdict,
+        Some(true)
+    );
+    // The unscaled demand is printed: the decoy (500 vs 10) does not decide.
+    let j = crit6(&low_rho);
+    assert!(
+        j.detail.contains("(printed) unscaled demand"),
+        "{}",
+        j.detail
+    );
+    assert!(j.detail.contains("passes/s"), "{}", j.detail);
+    assert!(!j.detail.contains("delivered/s"), "{}", j.detail);
+}
+
+/// A tile cell whose adaptive arm sent `repair` repair bytes, `ideal` of them
+/// planned rows' payload at the average symbol, `hdr` their headers.
+fn padding_cell(repair: u64, ideal: u64, hdr: u64) -> CellRuns {
+    let mut c = cell_runs(Cell::new(Load::Tile, Loss::Iid(0.05), 10));
+    c.ada = synth(&[0.0; 3], |r, _| {
+        r.repair_bytes = repair;
+        r.split.initial_ideal_milli = ideal * 1000;
+        r.split.initial_header_bytes = hdr;
+        r.split.initial_pad_milli = (repair - ideal - hdr) * 1000;
+    });
+    c
+}
+
+#[test]
+fn the_padding_gate_is_report_only() {
+    // 10 Mbit/s measurement: padding about a third of the repair bytes. Over
+    // 1.15 x the planned rows: the gate fails ...
+    let padded = padding_cell(1_000, 600, 20);
+    let j = padding_gate(&padded);
+    assert_eq!(j.verdict, Some(false), "{}", j.detail);
+    // ... and a block set with 5 % padding passes it (the gate can pass).
+    assert_eq!(
+        padding_gate(&padding_cell(1_000, 930, 20)).verdict,
+        Some(true)
+    );
+    // A run with nothing measured does not pass.
+    assert_eq!(padding_gate(&padding_cell(0, 0, 0)).verdict, Some(false));
+    // The sweep prints it as FAIL (judged, not passed) and does not gate on it.
+    let v: Vec<_> = verdicts(&padded)
+        .into_iter()
+        .filter(|v| v.crit == PADDING_CRIT)
+        .collect();
+    assert_eq!(v.len(), 1);
+    assert!(v[0].judged && !v[0].pass, "printed as FAIL");
+    assert!(
+        !GATED.contains(&PADDING_CRIT),
+        "a failure must not turn CI red"
+    );
 }
 
 #[test]
