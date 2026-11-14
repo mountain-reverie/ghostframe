@@ -827,3 +827,145 @@ Same scenes, mean burst 16 and 32 (200 Mbit/s) and 16 (150 Mbit/s), 5 seeds, 30 
 
 ### Caveats
 GE loss only; one link shape; the single block's lateness at b8 is small, so a gap of 0.7 points is most of what there was; 150 and 200 Mbit/s only (`m` 2 to 4: the clamp at 8 and the held-bytes cap at larger frames are untested); `b_hat` is a read at the end of a run, not a time series.
+
+## 14. R6-e2 (plan task SW): the E11 sweep re-run
+
+Tested at `59d8f18e` (branch `fec/v2-rev6`) with the code of §10's follow-ups: the offered-bytes accounting fix, E6 rate scaling, `T_adv` plus the RTT hint (S1/S1b, `DeclinedLate`), criterion 6 at saturating demand (`SATURATION_SHARE` 0.93), criteria 3, 5 and 6 as restated, and the frame notch (`Notch::Frame`; the interleave is deleted). No code and no criterion was changed. Same grid as §10 (`GHOSTFRAME_FEC_SWEEP=full`), but **3 seeds everywhere** (`GHOSTFRAME_FEC_SWEEP_SEEDS=3`, seeds `0xFB0001..3`): §10 widened some cells to 5, so spreads are not comparable cell for cell.
+
+**Verdict: the criteria do not all hold, so E13 stays blocked, but the failures moved.** Criteria 1 and 4 are unchanged from §10 (they fail only at 2 Mbit/s, and the numbers are identical). Criterion 5 and 6 changed definition and now mostly pass. Criterion 3's hand-off half now passes in every judged cell; only its overhead bar fails, by 0.001 to 0.016 except in one cell (below).
+
+### 14.0 What was run, and what was not
+
+- **Run:** the whole H.264 grid (4 rates x 6 losses), tile at 2, 10 and 30 Mbit/s (6 losses each), the 1500 ms deep-buffer cell, the step scenes (criterion 4) for H.264 at 2, 10, 30, 100 and tile at 2, 10, 30 Mbit/s, the frame-notch grid (5 seeds, 30 s) and `browserless_fec_rate`. The first three are `browserless_fec_adapt.rs::control_law_sweep`.
+- **Not swept: tile at 100 Mbit/s** (and its step scene), as in §10. A tile run at 100 Mbit/s took about 4 to 9 minutes of wall time; the cell would take over an hour. An attempt was cut short by the disk rule (/home over 88 %): 11 runs of Tile/clean/100M and 19 of Tile/iid1/100M completed, with no verdict (a verdict needs the whole cell), so they are not reported as results.
+- **Parallel runs (owner allowed two at once):** the main sweep ran alone to Tile/iid5/30M. The frame-notch tests and the rate test ran beside it (about 10 minutes, overlapping the end of Tile/iid5/30M and the start of Tile/ge3at1/30M). The partial shards of Tile at 100 Mbit/s ran two at once, and the two step-scene shards (H.264 plus deep buffer, tile) ran two at once. Stepped browserless is byte-reproducible per seed, and the step scenes reproduce §10's per-seed milliseconds exactly, so load is not expected to move a verdict; but **the two cells that overlapped (Tile/iid5/30M criteria 5 and 9, Tile/ge3at1/30M criterion 6) were not re-run alone** (the re-run was refused by the disk rule), so treat those two as unconfirmed against a flake. No `.expect("scene ran")` stall occurred.
+- **Wall time:** about 3 h 40 min for the main sweep (killed in Tile/clean/100M), 108 min for the two partial shards, 7 min for the steps and deep-buffer cell (two shards), about 10 min for the frame-notch and rate tests.
+- **Premises (criterion 0): hold in all 42 cells run** (off sends no repair, fixed sends repair, reports arrive, loss reached the links, adaptive repaired where loss is at or above 1 %).
+
+### 14.1 Per cell, criteria across the 3 seeds
+
+A criterion is judged on all 3 seeds of a cell together (hand-offs and counts as means over the seeds against the spread, as in §10). `rep` is reported, not judged (criterion 3 below 10 Mbit/s). Column 9 is report-only (padding gate); `n/m` is no repair sent, so nothing to measure.
+
+| cell | 1 | 2 | 3 | 5 | 6 | 9 (report) |
+|---|---|---|---|---|---|---|
+| H264/clean/2M | **FAIL** | - | - | - | pass | - |
+| H264/iid0.01/2M | **FAIL** | - | - | - | pass | - |
+| H264/iid0.1/2M | - | pass | - | - | pass | - |
+| H264/iid1/2M | - | - | rep | - | pass | - |
+| H264/iid5/2M | - | - | rep | **FAIL** | pass | - |
+| H264/ge3at1/2M | - | - | rep | - | pass | - |
+| H264/clean/10M | pass | - | - | - | pass | - |
+| H264/iid0.01/10M | pass | - | - | - | pass | - |
+| H264/iid0.1/10M | - | pass | - | - | pass | - |
+| H264/iid1/10M | - | - | pass | - | pass | - |
+| H264/iid5/10M | - | - | **FAIL** | pass | pass | - |
+| H264/ge3at1/10M | - | - | **FAIL** | - | pass | - |
+| H264/clean/30M | pass | - | - | - | pass | - |
+| H264/iid0.01/30M | pass | - | - | - | pass | - |
+| H264/iid0.1/30M | - | pass | - | - | pass | - |
+| H264/iid1/30M | - | - | pass | - | **FAIL** | - |
+| H264/iid5/30M | - | - | pass | pass | **FAIL** | - |
+| H264/ge3at1/30M | - | - | **FAIL** | - | pass | - |
+| H264/clean/100M | pass | - | - | - | pass | - |
+| H264/iid0.01/100M | pass | - | - | - | pass | - |
+| H264/iid0.1/100M | - | pass | - | - | pass | - |
+| H264/iid1/100M | - | - | pass | - | pass | - |
+| H264/iid5/100M | - | - | pass | pass | **FAIL** | - |
+| H264/ge3at1/100M | - | - | pass | - | pass | - |
+| Tile/clean/2M | pass | - | - | - | **FAIL** | - |
+| Tile/iid0.01/2M | pass | - | - | - | **FAIL** | n/m |
+| Tile/iid0.1/2M | - | pass | - | - | **FAIL** | n/m |
+| Tile/iid1/2M | - | - | rep | - | **FAIL** | over 1.15 |
+| Tile/iid5/2M | - | - | rep | **FAIL** | pass | over 1.15 |
+| Tile/ge3at1/2M | - | - | rep | - | **FAIL** | over 1.15 |
+| Tile/clean/10M | pass | - | - | - | pass | - |
+| Tile/iid0.01/10M | pass | - | - | - | pass | n/m |
+| Tile/iid0.1/10M | - | pass | - | - | pass | over 1.15 |
+| Tile/iid1/10M | - | - | pass | - | pass | over 1.15 |
+| Tile/iid5/10M | - | - | **FAIL** | pass | pass | over 1.15 |
+| Tile/ge3at1/10M | - | - | **FAIL** | - | pass | over 1.15 |
+| Tile/clean/30M | pass | - | - | - | **FAIL** | - |
+| Tile/iid0.01/30M | pass | - | - | - | pass | n/m |
+| Tile/iid0.1/30M | - | **FAIL** | - | - | pass | over 1.15 |
+| Tile/iid1/30M | - | - | **FAIL** | - | pass | over 1.15 |
+| Tile/iid5/30M | - | - | pass | **FAIL** | pass | over 1.15 |
+| Tile/ge3at1/30M | - | - | pass | - | **FAIL** | ok |
+| H264/clean/2M/buf1500ms | pass | - | - | - | pass | - |
+Criterion 4 (engage within 1 s of a 5 % step, ms per seed):
+
+| cell | per seed | verdict |
+|---|---|---|
+| H264/step5/2M | engaged before the step, 1031, engaged before the step | **FAIL** (as §10) |
+| H264/step5/10M | 703, 703, 703 | pass |
+| H264/step5/30M | 281, 281, 281 | pass |
+| H264/step5/100M | 234, 187, 234 | pass |
+| Tile/step5/2M | 703, 1687, 1406 | **FAIL** (as §10) |
+| Tile/step5/10M | 609, 421, 750 | pass |
+| Tile/step5/30M | 328, 328, 328 | pass |
+
+Criterion 7 (2 Mbit/s overhead against the 28 ms design value, reported): passes in all 10 cells, as in §10.
+
+### 14.2 Comparison with §10
+
+- **Criterion 1: unchanged.** H.264 at 2 Mbit/s still engages on the start-up overflow (31 to 35 datagrams dropped per run in every arm), repair 1.2 to 2.5 MB in two of three seeds, digest differs: H264/clean/2M and iid0.01/2M fail with the same drop counts as §10 (34, 31, 33 and 35, 31, 34) and almost the same bytes (1.23 / 0 / 1.42 MB against 1.22 / 0 / 1.39 MB). The deep-buffer cell (1500 ms) passes: 0 drops, no repair, digest equal (the attribution of §10 finding 1 holds). The S1/S1b and accounting changes did not touch this cause. Everything at 10 Mbit/s and above passes.
+- **Criterion 2: no regression where §10 measured.** Every cell that §10 ran passes with the same shape (H.264 0 to 1 changes per minute, tile at 2 and 10 Mbit/s 0 to 2). **New finding in a cell §10 did not run: Tile/iid0.1/30M fails with 5, 4, 5 changes per minute** (overhead 0.072 against fixed 0.096 and retransmits 728 against 2747 are fine, so it is churn only; criterion 2's bound is 2 per minute).
+- **Criterion 3 (restated, judged from 10 Mbit/s):** the hand-offs + declines half passes in all 15 judged cells (§10 failed it in 4 cells at 2 Mbit/s where it is now only reported, and at 2 Mbit/s the adaptive arm is no longer worse than fixed in the H.264 5 % cell (3.3 against 6.7) or the tile cells (0 / 16.7 against 30 / 46.7)). The overhead half fails in 6 cells; five are against the cap built at the bucket midpoint, the rounding §11 identified: H264/iid5/10M 0.2976 against 0.2950, H264/ge3at1/10M 0.2734 against 0.2577, H264/ge3at1/30M 0.2514 against 0.2501, Tile/iid5/10M 0.2735 against 0.2698, Tile/ge3at1/10M 0.2621 against 0.2505. `trim_steps` is 0 in every cell, so the trim is no longer the cause (it was in §10). **The one cell that is not rounding: Tile/iid1/30M, r/k 0.1533 against 1.25 x the DP rule 0.1047** (saturated share 0.18; hand-offs + declines 0 against fixed's 162, so it is overspending, not underprotecting). New data (§10 had no tile at 30 Mbit/s); not diagnosed.
+- **Criterion 4: identical to §10 per seed** (the stepped harness is reproducible). Fails only at 2 Mbit/s.
+- **Criterion 5 (restated: gated share no more than the control's plus the sd):** 4 of 7 cells pass (H.264 10, 30, 100 Mbit/s and Tile/iid5/10M); 3 fail: H264/iid5/2M (9.4 % against the control's 7.3 %, sd 1.9), Tile/iid5/2M (24.7 against 21.7, sd 2.4) and **Tile/iid5/30M (4.8 % against 0.5 %, sd 0.7)**. §10 had all six failing under the old "never gated" wording, so this is a gain; the 30 Mbit/s tile cell is a real excess (unconfirmed under load, see 14.0). The controller was engaged in every run.
+- **Criterion 6 (at saturating demand): 10 of 42 cells fail, against 19 of 36 in §10, but three causes.**
+  1. **Premise not met, not a codec result (6 cells):** the off arm offers 0.918 to 0.923 of the link at 2 Mbit/s tile (clean, 0.01 %, 0.1 %, 1 %, bursty) and Tile/clean/30M (mean 0.932 printed, over 0.93, yet the premise reads false; the per-seed values were not looked at). In the clean, 0.01 % and 0.1 % cells the arms are identical (ratio 1.000), so there is nothing to fail. At 1 % and bursty 2 Mbit/s the passes/s bound holds (1390 against 1304; 1216 against 1169).
+  2. **H.264 estimate below the control by 2 to 4 % outside the spread (3 cells):** iid1/30M (24.4 against 26.7 Mbit/s, sd 1.6), iid5/30M (25.5 against 26.4, sd 1.0), iid5/100M (93.4 against 96.9, sd 1.9). Frames delivered per second are far better than the control's (28 to 29 against 0.3 to 13): the control stream collapses under that loss while adaptive keeps playing, so the lower estimate buys a working stream; the ceiling binding share is 0.7 to 1.3 % against 0 to 0.7 %.
+  3. **One real tile miss: Tile/ge3at1/30M**, passes/s 19650 against a bound of 19705 (54 passes, 0.3 %, under the bound; ratio 0.761 against the off arm). Unconfirmed alone (overlapped with the notch run).
+  Tile at 10 Mbit/s passes everywhere, including iid5 (6031 passes/s against a bound of 5038).
+- **No regression found.** Every criterion that §10 ran and passed still passes; the three that §10 failed (1, 3, 4 at 2 Mbit/s; 5; 6) are unchanged (1, 4), improved by the restatements (3, 5, 6), or moved to cells §10 did not cover (tile 30 Mbit/s: criterion 2, 3, 5, 6 one cell each).
+
+### 14.3 Criterion 5 at 2 Mbit/s
+
+Fails in both loads: H264/iid5/2M 9.4 % gated against the control 7.3 % (sd 1.9, so 0.2 points over the bar); Tile/iid5/2M 24.7 % against 21.7 % (sd 2.4, 0.6 over). Both are small excesses over the control; at 2 Mbit/s the tile reports hold few datagrams each and the control's own share is 22 %. The controller was engaged in all runs. This is the one place criterion 5 fails at a link rate where the stream is the rate-following one, and it fails by a margin of less than one sd.
+
+### 14.4 Criterion 9 (padding, report only)
+
+Worst repair bytes over the planned rows' bytes at the average symbol, against the 1.15 reference (measured cells only; H.264 is 1.00 by construction and prints nothing):
+
+| cell | worst | padding share of repair bytes |
+|---|---|---|
+| Tile/iid1/2M | 1.699 | 0.41 |
+| Tile/iid5/2M | 1.695 | 0.40 |
+| Tile/ge3at1/2M | 1.722 | 0.41 |
+| Tile/iid0.1/10M | 1.368 | 0.25 to 0.27 |
+| Tile/iid1/10M | 1.269 | 0.18 to 0.21 |
+| Tile/iid5/10M | 1.542 | 0.17 to 0.35 |
+| Tile/ge3at1/10M | 1.382 | 0.22 to 0.27 |
+| Tile/iid0.1/30M | 1.159 | 0.11 to 0.14 |
+| Tile/iid1/30M | 1.164 | 0.13 to 0.14 |
+| Tile/iid5/30M | 1.161 | 0.14 |
+| Tile/ge3at1/30M | 1.118 | 0.10 (under) |
+
+Padding is above the reference in every measured tile cell except bursty at 30 Mbit/s, and grows as the rate falls (0.40 of repair bytes at 2 Mbit/s, 0.2 to 0.35 at 10, 0.1 to 0.14 at 30), consistent with §11's finding that symbol-size mismatch in mixed tile blocks is the cause. TB1's byte cap was not adopted, so nothing here is new.
+
+### 14.5 The frame notch (`browserless_fec_frame_notch.rs`, 5 seeds, 30 s; CI cell 3 seeds, 20 s)
+
+All three CI tests pass (the 150 Mbit/s b8 cell, the one-block control `a_frame_that_fits_one_block_never_enters_the_frame_notch`, and the grid). Late33 %, single = notch forbidden, paired gain = single - notch:
+
+| cell | single | frame notch | paired gain | seeds no later | `b_hat` mean | overhead single / notch |
+|---|---|---|---|---|---|---|
+| 150 Mbit/s b3 | 3.22 | 3.22 | 0 (never entered) | 5/5 | 3.00 | 0.193 / 0.193 |
+| 150 Mbit/s b8 | 3.60 | 2.88 | +0.72 +- 0.15 | 5/5 | 7.83 | 0.239 / 0.243 |
+| 200 Mbit/s b3 | 3.04 | 3.04 | 0 | 5/5 | 2.94 | 0.194 / 0.194 |
+| 200 Mbit/s b8 | 3.55 | 2.86 | +0.69 +- 0.11 | 5/5 | 8.30 | 0.242 / 0.240 |
+| 200 Mbit/s b16 | 3.84 | 1.84 | +2.00 +- 0.19 | 5/5 | 15.37 | 0.245 / 0.247 |
+
+These equal §13's table to the digit (same seeds, deterministic harness). The CI cell (150 Mbit/s b8, 3 seeds, 20 s): 5.95 against 5.24, +0.72 +- 0.26, 3/3.
+
+**`b_hat` at burst 32: not observable here.** The kept grid stops at burst 16 (the interleave experiments that ran b32 were deleted with the interleave); b_hat reads 15.4 at 200 Mbit/s b16 (per run 12.9 to 20.0), as §13 found. §13's open note (21.3 against 32 at b32, the 8-bucket run histogram suspected) is neither confirmed nor refuted by this run.
+
+### 14.6 `browserless_fec_rate.rs`
+
+`the_ceiling_stays_rare_and_the_estimate_whole_with_adaptive_fec` passes (3 seeds): ceiling binding share 0.0153 and saturated share 0.0786; the estimate mean after 5 s is higher with adaptive on (14.1, 13.4, 14.7 Mbit/s) than off (12.8, 9.5, 13.0 Mbit/s).
+
+### 14.7 For the owner
+
+- Criteria 1 and 4 at 2 Mbit/s are the same open item as §10 (start-up drops engage the controller; the proposed gate on the datagrams' own queueing is untaken).
+- New, in cells §10 never ran: Tile at 30 Mbit/s fails criterion 2 (iid 0.1 %, 4 to 5 changes per minute), criterion 3's overhead (iid 1 %, 0.153 against 0.105), criterion 5 (iid 5 %, 4.8 % against 0.5 %) and criterion 6 (bursty, 54 passes under the bound). The last two ran beside the frame-notch tests and should be re-run alone before being relied on.
+- Criterion 3's overhead failures at 10 and 30 Mbit/s are bucket-midpoint rounding (§11: the bar, not the controller); the exact-`k` bar §11 proposed is not implemented.
+- Tile at 100 Mbit/s remains unmeasured.
