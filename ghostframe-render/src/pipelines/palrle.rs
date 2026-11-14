@@ -13,6 +13,7 @@
 //! implementation this was ported from.
 
 use crate::framebuffer::Framebuffer;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::GpuError;
 
 const SHADER_SRC: &str = include_str!("../../../shaders/client/palrle_decode.wgsl");
@@ -287,6 +288,9 @@ impl PalRlePipeline {
     ///
     /// Fails (rather than panics) when the device cannot be polled or the
     /// staging buffer cannot be mapped, e.g. after device loss.
+    ///
+    /// Native only: it blocks on the device, which a browser cannot do.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn take_errors(
         &mut self,
         device: &wgpu::Device,
