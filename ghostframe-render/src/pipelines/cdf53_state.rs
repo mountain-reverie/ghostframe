@@ -167,6 +167,23 @@ pub struct Cdf53Stats {
     pub cancelled_superseded: u64,
 }
 
+/// One tile's host-side state, for diagnostics. Serialises to JSON with
+/// camelCase field names.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Cdf53TileDebug {
+    pub generation: u8,
+    /// Bit `p` set when pass `p` of this generation has arrived.
+    pub received_mask: u16,
+    /// Pass 0's `present_passes`, once it has arrived.
+    pub present_passes: Option<u16>,
+    /// The prefix length last handed to the GPU for this generation.
+    pub drawn_k: Option<u8>,
+    /// Newest `frame_seq` of any pass of this generation.
+    pub newest_seq: u32,
+    pub pending: bool,
+}
+
 pub struct Cdf53GridState {
     cols: u32,
     rows: u32,
@@ -241,6 +258,20 @@ impl Cdf53GridState {
             .take(cols as usize * rows as usize)
             .collect();
         self.dirty.clear();
+    }
+
+    /// The state of a tile that has received anything since it was last
+    /// reset, for diagnostics; `None` for one that has not, or is off the grid.
+    pub fn debug_tile(&self, tile_x: u8, tile_y: u8) -> Option<Cdf53TileDebug> {
+        let t = &self.tiles[self.index(tile_x, tile_y)?];
+        t.live.then_some(Cdf53TileDebug {
+            generation: t.generation,
+            received_mask: t.received,
+            present_passes: t.present,
+            drawn_k: t.drawn_k,
+            newest_seq: t.newest_seq,
+            pending: t.pending,
+        })
     }
 
     fn index(&self, tile_x: u8, tile_y: u8) -> Option<usize> {

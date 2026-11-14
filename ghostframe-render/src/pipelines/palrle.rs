@@ -111,6 +111,13 @@ impl PalRlePipeline {
         );
     }
 
+    /// Zero every palette, as a session reset must: the next session's
+    /// palettes arrive as `PaletteUpdated` events, and until they do a tile
+    /// that names a stale one should draw nothing rather than the old colours.
+    pub fn clear_palettes(&mut self, queue: &wgpu::Queue) {
+        queue.write_buffer(&self.palette_atlas, 0, &[0u8; PALETTE_ATLAS_SIZE as usize]);
+    }
+
     /// Ensure the per-batch buffers can hold at least `capacity` tiles,
     /// growing (never shrinking) as needed, and drop the bind group over them.
     fn ensure_capacity(&mut self, device: &wgpu::Device, capacity: usize) {
