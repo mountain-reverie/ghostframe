@@ -4,6 +4,7 @@ members = [
     "ghostframe-protocol",
     "ghostframe-tsnet",
     "ghostframe-client-core",
+    "ghostframe-render",
     "ghostframe-client-net",
     "ghostframe-client-wasm",
     "ghostframe-web-ui",
