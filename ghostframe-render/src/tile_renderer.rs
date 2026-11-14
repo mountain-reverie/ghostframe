@@ -1768,6 +1768,68 @@ mod tests {
         assert!(!r.has_deferred_work());
     }
 
+    fn palrle(seq: u32, x: u8, y: u8) -> Event {
+        Event::TilePayload {
+            frame_seq: seq,
+            tile_x: x,
+            tile_y: y,
+            generation: 0,
+            data: TileData::PalRle {
+                palette_id: 0,
+                count: 1,
+                indices: vec![0; 512],
+                wire_flags: 0,
+            },
+        }
+    }
+
+    fn ready(seq: u32, x: u8, y: u8) -> Event {
+        Event::TileReady {
+            tile_x: x,
+            tile_y: y,
+            rgba: vec![7; 32 * 32 * 4],
+            frame_seq: seq,
+        }
+    }
+
+    /// An older stateless tile that arrives after a newer paint of the same
+    /// tile in an earlier flush is not drawn, and the ledger keeps the newer.
+    fn older_after_newer_is_not_drawn(newer: Event, older: Event) {
+        let (mut r, d, q) = renderer(64, 64);
+        r.apply_event(&d, &q, newer).unwrap();
+        assert!(r.flush(&d, &q, 1).unwrap().recorded, "the newer is drawn");
+        r.apply_event(&d, &q, older).unwrap();
+        let report = r.flush(&d, &q, 2).unwrap();
+        assert!(!report.recorded, "the older tile must not be drawn");
+        let state = r.debug_state();
+        assert_eq!(
+            (
+                state.pending_solid,
+                state.pending_palrle,
+                state.pending_rgba
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(r.debug_tile(0, 0).unwrap().newest_frame_seq, Some(10));
+    }
+
+    #[test]
+    fn an_older_solid_does_not_cover_a_newer_paint_from_an_earlier_flush() {
+        older_after_newer_is_not_drawn(solid(10, 0, 0), solid(5, 0, 0));
+    }
+
+    #[test]
+    fn an_older_palrle_does_not_cover_a_newer_paint_from_an_earlier_flush() {
+        older_after_newer_is_not_drawn(palrle(10, 0, 0), palrle(5, 0, 0));
+        older_after_newer_is_not_drawn(solid(10, 0, 0), palrle(5, 0, 0));
+    }
+
+    #[test]
+    fn an_older_tile_ready_does_not_cover_a_newer_paint_from_an_earlier_flush() {
+        older_after_newer_is_not_drawn(ready(10, 0, 0), ready(5, 0, 0));
+        older_after_newer_is_not_drawn(solid(10, 0, 0), ready(5, 0, 0));
+    }
+
     #[test]
     fn reset_session_forgets_pending_work_the_ledger_and_the_h264_floor() {
         let (mut r, d, q) = renderer(64, 64);
