@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Client -> server FEC feedback datagrams: ACK v4 (0x08, names a
 //! `bundle_seq`), LOSS_REPORT (0x07) and REPAIR_REQUEST (0x0B).
 //! All integers are little-endian.

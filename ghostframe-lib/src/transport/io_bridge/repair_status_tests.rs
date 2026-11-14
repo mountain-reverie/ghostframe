@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! ACK v4 (0x08), LOSS_REPORT (0x07), REPAIR_REQUEST (0x0B) and the
 //! repair-status stream on the server (R6-c task C4).
 //!

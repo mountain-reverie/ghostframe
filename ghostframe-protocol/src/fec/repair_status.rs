@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Records of the reliable client -> server repair-status stream:
 //! `[type u8][len u16 LE][body]`, `len` <= 1020. Any violation is a protocol
 //! error; the caller closes the stream.

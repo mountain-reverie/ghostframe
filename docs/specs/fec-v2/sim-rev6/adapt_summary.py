@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Reads adapt_sim_out.txt, prints the comparisons FINDINGS.md section 8 quotes (python3 -I adapt_summary.py).
 A difference is called real only when it exceeds the larger of the two cells' seed ranges (max - min)."""
 import collections

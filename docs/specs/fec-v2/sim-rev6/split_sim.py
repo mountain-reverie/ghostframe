@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Item 4 (fec-v2-rev6.md 8.1): H.264 frames above ~70 Mbit/s, split GF(2^8) blocks vs one block.
 
 Run: python3 -I split_sim.py [--quick] [--jobs N]     (self-test: python3 -I split_sim.py --selftest)

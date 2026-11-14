@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The adaptive controller's frame notch (rev 6, R6-e2 S3): one block spans a
 //! frame (T = the frame interval, `k_max` 223) when the loss is bursty and a
 //! frame no longer fits a 255-symbol block, end to end over the PCM rate model

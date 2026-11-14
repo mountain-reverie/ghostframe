@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! ACK v4 batcher: flush at 64 fresh entries or 5 ms after the first queued
 //! one, last 8 fresh entries appended as overlap; entries name `bundle_seq` and
 //! the batch is a `BundleAckBatch` (0x08).

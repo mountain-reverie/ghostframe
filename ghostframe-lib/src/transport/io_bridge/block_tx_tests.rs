@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The block send side with the knob on (R6-d task D4b). Same rig as
 //! `bundle_tx_tests`: a unit bridge with a test wire, production code above it.
 

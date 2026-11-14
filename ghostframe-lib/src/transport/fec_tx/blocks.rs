@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Pure block builder (R6-d D2): collects the coded symbols of the sources a
 //! packer seals into one Reed-Solomon block and hands the block over closed.
 //! No I/O, no clock of its own: every time is a caller-supplied microsecond.

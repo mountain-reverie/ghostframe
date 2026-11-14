@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Client side of the rev 6 framing (sans-IO).
 //!
 //! `blocks` unbundles SOURCE / REPAIR / PLAIN frames, keeps the coded symbols

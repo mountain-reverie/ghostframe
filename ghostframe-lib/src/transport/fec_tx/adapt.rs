@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! FEC v2 rev 6, R6-e E3: the loss estimator and the clean-link floor.
 //!
 //! Pure and sans-IO: time and samples are arguments, nothing here reads a
