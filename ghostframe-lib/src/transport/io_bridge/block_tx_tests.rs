@@ -14,6 +14,10 @@ const RAW: usize = 1000;
 const TILE_LEN: usize = 300;
 
 fn blocks_bridge(k_max: u8, t_ms: u8, r: u8) -> IoBridge {
+    blocks_bridge_m(k_max, t_ms, r, 1)
+}
+
+fn blocks_bridge_m(k_max: u8, t_ms: u8, r: u8, m: u8) -> IoBridge {
     let (ours, _peer) = UnixStream::pair().expect("pair");
     let server = QuicServer::new().expect("server");
     let mut b = IoBridge::new_with_stream_for_test(ours, server);
@@ -21,12 +25,7 @@ fn blocks_bridge(k_max: u8, t_ms: u8, r: u8) -> IoBridge {
     b.last_hello_from = Some(H);
     b.test_wire = Some(bundle_tx::TestWire::default());
     b.forced_raw_datagram_size_for_test = Some(RAW);
-    b.set_fec_blocks_for_test(Some(FecBlockParams {
-        k_max,
-        t_ms,
-        r,
-        m: 1,
-    }));
+    b.set_fec_blocks_for_test(Some(FecBlockParams { k_max, t_ms, r, m }));
     b
 }
 
@@ -668,21 +667,24 @@ async fn declined_for_a_block_still_sending_closes_the_packers_open_block() {
     submit_tiles(&mut b, 5, None);
     b.drain_reliable_emitter(now_std());
     b.flush_bundles();
-    let id = b.packer.open_block_id().expect("a block is open");
+    let id = *b.packer.open_block_ids().first().expect("a block is open");
     b.handle_status_record(StatusRecord::Declined {
         block_id: id,
         reason: DeclineReason::Pruned,
         k: 0,
         missing: vec![],
     });
-    assert_eq!(b.packer.open_block_id(), None, "no later source joins it");
+    assert!(
+        b.packer.open_block_ids().is_empty(),
+        "no later source joins it"
+    );
     assert_eq!(b.block_tx.closed_declined, 1);
     assert!(b.block_tx.handoffs > 0);
     assert_eq!(b.block_tx.repairs_sent + b.pending_repairs.len() as u64, 0);
     // A new source starts a new block.
     submit_tiles(&mut b, 1, None);
     b.drain_reliable_emitter(now_std());
-    assert_ne!(b.packer.open_block_id(), Some(id));
+    assert_ne!(b.packer.open_block_ids().first(), Some(&id));
 }
 
 #[tokio::test]
@@ -953,7 +955,7 @@ async fn setting_live_none_while_a_block_is_open_still_sends_that_blocks_repairs
     submit_tiles(&mut b, 10, None);
     b.drain_reliable_emitter(now_std());
     assert!(
-        b.packer.open_block_id().is_some(),
+        !b.packer.open_block_ids().is_empty(),
         "premise: a block is open"
     );
     b.apply_fec_live(None);
@@ -1197,7 +1199,7 @@ async fn a_change_applied_mid_block_loses_no_repair() {
     submit_tiles(&mut b, 10, None);
     b.drain_reliable_emitter(now_std());
     assert!(
-        b.packer.open_block_id().is_some(),
+        !b.packer.open_block_ids().is_empty(),
         "premise: a block is open"
     );
     assert_eq!(
@@ -1232,7 +1234,7 @@ async fn adapt_tick_releases_on_a_quiet_link_after_the_dwell() {
     assert!(b.fec_live.is_some(), "still inside the dwell");
     b.adapt_step(now_us + 5_100_000);
     assert!(b.fec_live.is_none(), "released with no report");
-    assert_eq!(b.packer.open_block_id(), None);
+    assert!(b.packer.open_block_ids().is_empty());
 }
 
 #[tokio::test]
@@ -1381,6 +1383,8 @@ fn closed_of(
         kinds: kinds.to_vec(),
         first_sealed_at_us: 0,
         t_adv: 0,
+        group: 0,
+        group_m: 1,
     }
 }
 
@@ -1428,4 +1432,183 @@ fn an_initial_rows_bytes_are_its_ideal_padding_and_header() {
         sp.bytes[0]
     );
     assert_eq!((sp.rows[0], sp.rows[1]), (1, 1));
+}
+
+// ---- m interleaved blocks (R6-e2 S2) ---------------------------------------
+
+/// One tile per bundle: a second 300-byte record does not fit 400 bytes.
+const ONE_TILE_RAW: usize = 400;
+
+fn group_bridge(k_max: u8, r: u8, m: u8) -> IoBridge {
+    let mut b = blocks_bridge_m(k_max, 5, r, m);
+    b.forced_raw_datagram_size_for_test = Some(ONE_TILE_RAW);
+    b
+}
+
+fn source_blocks(frames: &[Vec<u8>]) -> Vec<(u16, u8)> {
+    frames
+        .iter()
+        .filter_map(|f| match parse(f).unwrap() {
+            Frame::Source(s) => Some((s.block_id, s.idx)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_group_queues_its_repairs_round_robin_and_the_store_decodes_a_burst_across_the_blocks() {
+    let (m, r) = (3u8, 6u8);
+    let mut b = group_bridge(64, r, m);
+    submit_tiles(&mut b, 9, None);
+    b.drain_reliable_emitter(now_std());
+    b.close_block_on_empty();
+    // Before anything leaves: the jobs of the whole group, in queue order.
+    let jobs: Vec<(u16, u8)> = b
+        .pending_repairs
+        .iter()
+        .map(|j| (j.block_id, j.row))
+        .collect();
+    let r_b = usize::from(r.div_ceil(m));
+    assert_eq!(jobs.len(), usize::from(m) * r_b, "premise: repairs queued");
+    assert_eq!(b.block_tx.closed_empty, 1, "one cause for the group");
+    assert_eq!(b.block_tx.closed_kmax + b.block_tx.closed_time, 0);
+    for w in jobs.windows(2) {
+        assert_ne!(
+            w[0].0, w[1].0,
+            "consecutive jobs name different blocks: {jobs:?}"
+        );
+    }
+    let rows: Vec<u8> = jobs.iter().map(|j| j.1).collect();
+    assert!(
+        rows.windows(2).all(|w| w[0] <= w[1]),
+        "row 0 of each, then row 1: {rows:?}"
+    );
+    let ids: std::collections::BTreeSet<u16> = jobs.iter().map(|j| j.0).collect();
+    assert_eq!(ids.len(), usize::from(m));
+    for id in &ids {
+        assert_eq!(
+            jobs.iter().filter(|j| j.0 == *id).count(),
+            r_b,
+            "ceil(R/m) each"
+        );
+    }
+    b.service_pending_repairs();
+    let frames = b.sent_frames_for_test.clone();
+    assert_eq!(kinds(&frames)[..9], ["S"; 9]);
+    assert_eq!(b.block_tx.repairs_sent, jobs.len() as u64);
+    // The sources went round-robin over three consecutive ids.
+    let src = source_blocks(&frames);
+    let first = src[0].0;
+    for (i, (id, idx)) in src.iter().enumerate() {
+        assert_eq!(*id, first + (i % 3) as u16);
+        assert_eq!(usize::from(*idx), i / 3);
+    }
+    let want: std::collections::BTreeSet<Vec<u8>> =
+        b.sent_log_for_test.iter().map(|d| d.to_vec()).collect();
+    assert_eq!(want.len(), 9, "premise: nine distinct records");
+    // A burst of six consecutive sources (two per block, r_b = 2): the real
+    // block store rebuilds every record.
+    for at in 0..=3 {
+        let mut store = BlockStore::new();
+        let mut got = std::collections::BTreeSet::new();
+        for (i, f) in frames.iter().enumerate() {
+            if (at..at + 6).contains(&i) {
+                continue;
+            }
+            for r in store.on_datagram(f, 1_000).records {
+                got.insert(r.bytes);
+            }
+        }
+        assert_eq!(got, want, "burst of 6 at {at}: every record rebuilt");
+    }
+}
+
+#[tokio::test]
+async fn a_fixed_r_is_the_groups_rows_and_each_block_gets_its_ceiling_share() {
+    for (r, m, per_block) in [
+        (1u8, 4u8, 1usize),
+        (5, 3, 2),
+        (6, 3, 2),
+        (8, 2, 4),
+        (4, 1, 4),
+    ] {
+        let mut b = group_bridge(64, r, m);
+        submit_tiles(&mut b, 2 * u32::from(m), None);
+        b.drain_reliable_emitter(now_std());
+        b.close_block_on_empty();
+        assert_eq!(
+            b.pending_repairs.len(),
+            usize::from(m) * per_block,
+            "r {r} m {m}"
+        );
+        assert!(b.pending_repairs.iter().all(|j| j.r as usize == per_block));
+    }
+}
+
+#[tokio::test]
+async fn a_group_closed_on_k_max_is_counted_once_and_its_siblings_are_not_empty_closes() {
+    // k_max 2, three blocks: source 3 is block 0's second, so the group closes.
+    let mut b = group_bridge(2, 3, 3);
+    // Five tiles: the fifth stays in the open bundle, four sources are sealed.
+    submit_tiles(&mut b, 5, None);
+    b.drain_reliable_emitter(now_std());
+    assert_eq!(
+        b.block_table.open_blocks(),
+        3,
+        "premise: three blocks closed"
+    );
+    assert_eq!(b.block_tx.closed_kmax, 1);
+    assert_eq!(
+        (
+            b.block_tx.closed_empty,
+            b.block_tx.closed_time,
+            b.block_tx.closed_declined
+        ),
+        (0, 0, 0),
+        "the siblings (k = 1 < k_max) are not counted as Empty"
+    );
+    assert_eq!(b.block_tx.k_sum, 4);
+}
+
+#[tokio::test]
+async fn a_decline_of_one_open_block_closes_the_group_and_counts_one_decline() {
+    let mut b = group_bridge(64, 6, 3);
+    submit_tiles(&mut b, 9, None);
+    b.drain_reliable_emitter(now_std());
+    b.flush_bundles();
+    let ids = b.packer.open_block_ids();
+    assert_eq!(ids.len(), 3, "premise: a group of three is open");
+    b.handle_status_record(StatusRecord::Declined {
+        block_id: ids[1],
+        reason: DeclineReason::Pruned,
+        k: 0,
+        missing: vec![],
+    });
+    assert!(
+        b.packer.open_block_ids().is_empty(),
+        "the whole group closed"
+    );
+    assert_eq!(b.block_tx.closed_declined, 1, "one decline, not three");
+    assert_eq!(
+        (
+            b.block_tx.closed_empty,
+            b.block_tx.closed_kmax,
+            b.block_tx.closed_time
+        ),
+        (0, 0, 0)
+    );
+    assert!(
+        b.block_tx.handoffs > 0,
+        "the declined block's sources hand off"
+    );
+    // The siblings are not declined: they close with repairs of their own.
+    let jobs: std::collections::BTreeSet<u16> =
+        b.pending_repairs.iter().map(|j| j.block_id).collect();
+    assert_eq!(jobs, [ids[0], ids[2]].into_iter().collect());
+    assert_eq!(b.pending_repairs.len(), 4);
+    assert!(b.block_table.is_open(ids[0]) && b.block_table.is_open(ids[2]));
+    // A new source starts a new group.
+    submit_tiles(&mut b, 1, None);
+    b.drain_reliable_emitter(now_std());
+    assert!(!ids.iter().any(|i| b.packer.has_open_block(*i)));
 }

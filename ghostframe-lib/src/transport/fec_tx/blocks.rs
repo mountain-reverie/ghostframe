@@ -4,6 +4,7 @@
 
 use ghostframe_protocol::fec::frame::FEC_REPAIR_HEADER_LEN;
 use ghostframe_protocol::fec::timing;
+use smallvec::SmallVec;
 
 use crate::transport::admission::QUEUE_TARGET;
 
@@ -56,6 +57,11 @@ pub(crate) struct ClosedBlock {
     pub first_sealed_at_us: u64,
     /// The `T_adv` code its sources carried.
     pub t_adv: u8,
+    /// The group (a run of `group_m` interleaved blocks that closed
+    /// together) this block belongs to; one per group, wrapping.
+    pub group: u32,
+    /// How many blocks the group was opened for (`FecBlockParams::m` then).
+    pub group_m: u8,
 }
 
 impl ClosedBlock {
@@ -65,45 +71,82 @@ impl ClosedBlock {
     }
 }
 
+/// One block of the open group.
 #[derive(Debug)]
 struct Open {
     block_id: u16,
     symbols: Vec<Vec<u8>>,
     bundle_seqs: Vec<u32>,
     kinds: Vec<SourceKind>,
-    first_sealed_at_us: u64,
-    span: BlockSpan,
     /// Longest coded symbol so far, kept so the MTU test is O(1) per send.
     longest: usize,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct BlockBuilder {
-    /// The id the next new block takes; wraps at 65 535.
-    next_id: u16,
-    open: Option<Open>,
+/// The sources sealed since the group opened: `m` blocks that fill
+/// round-robin, one close for all of them.
+#[derive(Debug)]
+struct OpenGroup {
+    group: u32,
+    m: u8,
+    /// Sources taken by the whole group; source `j` goes to block `j mod m`.
+    n_sources: usize,
+    /// When the group's first source was sealed: the origin of the T close
+    /// of every block in it.
+    first_sealed_at_us: u64,
+    span: BlockSpan,
+    /// Blocks in id order. A block opens when its first source arrives, so
+    /// this is always a prefix of the `m` blocks and the ids are consecutive.
+    blocks: Vec<Open>,
 }
 
-impl BlockBuilder {
+/// The group of blocks a packer builds (R6-e2 S2): `m` interleaved blocks,
+/// source `j` of the group in block `j mod m`, sharing one id counter and one
+/// T. `m = 1` is the single block of R6-d. Nothing here encodes.
+#[derive(Debug, Default)]
+pub(crate) struct BlockGroup {
+    /// The id the next new block takes; wraps at 65 535.
+    next_id: u16,
+    next_group: u32,
+    open: Option<OpenGroup>,
+    /// The control of the burst test (test builds only): assign the group's
+    /// sources to blocks in runs of this many instead of round-robin. A group
+    /// built this way is exactly the contiguous split the design forbids.
+    #[cfg(test)]
+    contiguous_run: Option<usize>,
+}
+
+impl BlockGroup {
+    /// The block source number `n` of group `g` goes to: `n mod m`.
+    fn slot(&self, g: &OpenGroup) -> usize {
+        #[cfg(test)]
+        if let Some(run) = self.contiguous_run {
+            return (g.n_sources / run).min(usize::from(g.m) - 1);
+        }
+        g.n_sources % usize::from(g.m)
+    }
+
     /// The `(block_id, idx)` the next source will take.
     pub(crate) fn peek(&self) -> (u16, u8) {
         match &self.open {
-            Some(o) => (
-                o.block_id,
-                u8::try_from(o.symbols.len()).expect("a block never holds 256 sources"),
-            ),
+            Some(g) => match g.blocks.get(self.slot(g)) {
+                Some(o) => (
+                    o.block_id,
+                    u8::try_from(o.symbols.len()).expect("a block never holds 256 sources"),
+                ),
+                None => (self.next_id, 0),
+            },
             None => (self.next_id, 0),
         }
     }
 
-    /// The span the next source advertises: the open block's own, or `fresh`
-    /// when the source will open a block.
+    /// The span the next source advertises: the open group's own, or `fresh`
+    /// when the source will open a group.
     pub(crate) fn span_or(&self, fresh: BlockSpan) -> BlockSpan {
-        self.open.as_ref().map_or(fresh, |o| o.span)
+        self.open.as_ref().map_or(fresh, |g| g.span)
     }
 
-    /// Adds the source whose `(block_id, idx)` `peek` returned. `span` is
-    /// stored if this source opens the block and ignored otherwise.
+    /// Adds the source whose `(block_id, idx)` `peek` returned. `span` and `m`
+    /// are stored if this source opens the group and ignored otherwise.
     pub(crate) fn add(
         &mut self,
         symbol: Vec<u8>,
@@ -111,64 +154,98 @@ impl BlockBuilder {
         kind: SourceKind,
         now_us: u64,
         span: BlockSpan,
+        m: u8,
     ) {
         if self.open.is_none() {
-            self.open = Some(Open {
+            let group = self.next_group;
+            self.next_group = self.next_group.wrapping_add(1);
+            self.open = Some(OpenGroup {
+                group,
+                m: m.max(1),
+                n_sources: 0,
+                first_sealed_at_us: now_us,
+                span,
+                blocks: Vec::new(),
+            });
+        }
+        let slot = self.slot(self.open.as_ref().expect("just opened"));
+        let g = self.open.as_mut().expect("just opened");
+        if slot == g.blocks.len() {
+            g.blocks.push(Open {
                 block_id: self.next_id,
                 symbols: Vec::new(),
                 bundle_seqs: Vec::new(),
                 kinds: Vec::new(),
-                first_sealed_at_us: now_us,
-                span,
                 longest: 0,
             });
             self.next_id = self.next_id.wrapping_add(1);
         }
-        let o = self.open.as_mut().expect("just opened");
+        let o = &mut g.blocks[slot];
         o.longest = o.longest.max(symbol.len());
         o.symbols.push(symbol);
         o.bundle_seqs.push(bundle_seq);
         o.kinds.push(kind);
+        g.n_sources += 1;
     }
 
-    /// Number of sources in the open block (0 when none is open).
-    pub(crate) fn len(&self) -> usize {
-        self.open.as_ref().map_or(0, |o| o.symbols.len())
+    /// Ids of the blocks of the open group, in id order (empty when none).
+    pub(crate) fn open_block_ids(&self) -> SmallVec<[u16; 8]> {
+        self.open
+            .iter()
+            .flat_map(|g| g.blocks.iter().map(|o| o.block_id))
+            .collect()
     }
 
-    /// The block's own T has elapsed since its first source was sealed.
+    /// `id` names a block of the open group.
+    pub(crate) fn has_open_block(&self, id: u16) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|g| g.blocks.iter().any(|o| o.block_id == id))
+    }
+
+    /// The group's own T has elapsed since its first source was sealed.
     pub(crate) fn due(&self, now_us: u64) -> bool {
         self.open
             .as_ref()
-            .is_some_and(|o| now_us >= o.first_sealed_at_us.saturating_add(o.span.t_us))
+            .is_some_and(|g| now_us >= g.first_sealed_at_us.saturating_add(g.span.t_us))
     }
 
-    /// When the open block's own T elapses (microseconds).
+    /// When the open group's T elapses (microseconds).
     pub(crate) fn t_close_at_us(&self) -> Option<u64> {
         self.open
             .as_ref()
-            .map(|o| o.first_sealed_at_us.saturating_add(o.span.t_us))
+            .map(|g| g.first_sealed_at_us.saturating_add(g.span.t_us))
     }
 
-    /// A repair of the open block's longest symbol no longer fits `max_dg`.
+    /// A repair of some block's longest symbol no longer fits `max_dg`.
     pub(crate) fn outgrown_by(&self, max_dg: usize) -> bool {
-        self.open
-            .as_ref()
-            .is_some_and(|o| o.longest + FEC_REPAIR_HEADER_LEN > max_dg)
+        self.open.as_ref().is_some_and(|g| {
+            g.blocks
+                .iter()
+                .any(|o| o.longest + FEC_REPAIR_HEADER_LEN > max_dg)
+        })
     }
 
-    /// Closes the open block, if it has sources.
-    pub(crate) fn close(&mut self) -> Option<ClosedBlock> {
-        let o = self.open.take()?;
-        Some(ClosedBlock {
-            block_id: o.block_id,
-            k: u8::try_from(o.symbols.len()).expect("a block never holds 256 sources"),
-            symbols: o.symbols,
-            bundle_seqs: o.bundle_seqs,
-            kinds: o.kinds,
-            first_sealed_at_us: o.first_sealed_at_us,
-            t_adv: o.span.t_adv,
-        })
+    /// Closes the open group, if it has sources: every block of it, in id
+    /// order, together.
+    pub(crate) fn close(&mut self) -> SmallVec<[ClosedBlock; 1]> {
+        let Some(g) = self.open.take() else {
+            return SmallVec::new();
+        };
+        g.blocks
+            .into_iter()
+            .map(|o| ClosedBlock {
+                block_id: o.block_id,
+                k: u8::try_from(o.symbols.len()).expect("a block never holds 256 sources"),
+                symbols: o.symbols,
+                bundle_seqs: o.bundle_seqs,
+                kinds: o.kinds,
+                first_sealed_at_us: g.first_sealed_at_us,
+                t_adv: g.span.t_adv,
+                group: g.group,
+                group_m: g.m,
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -176,7 +253,12 @@ impl BlockBuilder {
         self.next_id = id;
     }
 
-    /// Forgets the open block and restarts the id counter.
+    #[cfg(test)]
+    pub(crate) fn set_contiguous_run_for_test(&mut self, run: Option<usize>) {
+        self.contiguous_run = run;
+    }
+
+    /// Forgets the open group and restarts the id counters.
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
