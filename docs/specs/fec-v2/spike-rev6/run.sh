@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # Rebuilds and reruns the whole spike. Output goes to results/. Relative paths only.
 set -euo pipefail
 cd "$(dirname "$0")"

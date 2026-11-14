@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! cu-fec (RFC 8681 sliding-window RLC, GF(2^8), full density) with a window of w source symbols
 //! and L losses repaired by exactly L (or L+1) repair symbols.
 //! Output sections: cost (TSV) and failure probability (TSV).

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! FEC v2 rev 6, R6-e E4: the span ladder and `r_for(k)`.
 //!
 //! Pure and sans-IO. The tail is an exact dynamic program over the block's

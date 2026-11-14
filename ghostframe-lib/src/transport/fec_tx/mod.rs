@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Server-side FEC v2 transmit path. Under rev 6 step R6-c every bundle is a
 //! PLAIN frame; R6-d adds the block mode of the packer, wired in by D3/D4.
 

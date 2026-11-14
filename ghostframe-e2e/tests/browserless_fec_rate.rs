@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Adaptive FEC and the encoder's rate target (rev 6, R6-e E6): the repairs
 //! are paid out of the media rate (`RATE_SHARE / (1 + rho)`), so the stream's
 //! total stays under the BWE ceiling's saturation line. A capacity-limited

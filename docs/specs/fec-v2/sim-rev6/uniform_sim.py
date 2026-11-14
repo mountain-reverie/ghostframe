@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Revision-6 FEC design simulation: uniform erasure coding over ALL server->client
 bundles (H.264 fragments and lossless tiles alike).
 

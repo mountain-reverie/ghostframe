@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Both ends on the rev 6 framing: a clean scene still delivers, over bundles.
 
 use std::time::Duration;

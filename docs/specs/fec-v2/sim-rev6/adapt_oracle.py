@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Exact tail oracle for FEC v2 R6-e (plan task E1; E4's r_for(k) is tested against it).
 
 tail(n, r, p, b) = P(more than r of the n datagrams of one block are lost), where the n positions

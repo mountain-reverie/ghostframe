@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Repair coefficients (rev 6 §6.1).
 //!
 //! Every block is a submatrix of one 256-point Cauchy matrix over

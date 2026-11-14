@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Measurement B: native encode / decode time per (k, r), 1180-byte symbols.
 //! Output: TSV  candidate  op  k  r  lost  median_us  p95_us
 use super::*;
