@@ -17,6 +17,9 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 ghostframe-protocol = { path = "../ghostframe-protocol" }
 ghostframe-client-core = { path = "../ghostframe-client-core" }
+# The portable half: framebuffer, tile pipelines, paint order, damage. `Renderer`
+# owns a `TileRenderer` and adds the export ring, upload slabs and H.264.
+ghostframe-render = { path = "../ghostframe-render" }
 # `DmabufPlanes`/`PlaneDesc` are the boundary type (see `src/import.rs`);
 # `src/renderer.rs` also drives `H264Decoder`/`HwFrame` directly for the
 # H.264 decode/blit path (Task 9). Both routes pull in ffmpeg transitively

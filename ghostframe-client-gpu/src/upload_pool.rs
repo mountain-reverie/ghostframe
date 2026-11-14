@@ -149,6 +149,21 @@ impl SlotRef {
     pub fn generation(&self) -> u32 {
         self.generation
     }
+
+    /// Pack into the `u64` that `ghostframe_render::SlotTile::token` carries:
+    /// `slab` in bits 48.., `index` in bits 32..48, `generation` in bits 0..32.
+    pub(crate) fn to_bits(self) -> u64 {
+        (u64::from(self.slab) << 48) | (u64::from(self.index) << 32) | u64::from(self.generation)
+    }
+
+    /// The inverse of [`SlotRef::to_bits`].
+    pub(crate) fn from_bits(bits: u64) -> Self {
+        SlotRef {
+            slab: (bits >> 48) as u8,
+            index: (bits >> 32) as u16,
+            generation: bits as u32,
+        }
+    }
 }
 
 struct SlabShared {
@@ -657,6 +672,29 @@ impl TileSink for SlotAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slot_ref_survives_the_trip_through_the_renderer_s_token() {
+        for slot in [
+            SlotRef {
+                slab: 0,
+                index: 0,
+                generation: 0,
+            },
+            SlotRef {
+                slab: u8::MAX,
+                index: u16::MAX,
+                generation: u32::MAX,
+            },
+            SlotRef {
+                slab: 3,
+                index: 700,
+                generation: 0x8000_0001,
+            },
+        ] {
+            assert_eq!(SlotRef::from_bits(slot.to_bits()), slot);
+        }
+    }
 
     #[test]
     fn a_1080p_pool_is_twelve_2_mib_slabs() {

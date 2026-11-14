@@ -3,14 +3,12 @@
 //! client's persistent [`crate::framebuffer::Framebuffer`].
 //!
 //! Each pipeline here loads its shader with `include_str!` from
-//! `shaders/client/`, the directory Task 9 moved the WGSL into precisely so
-//! both the web client and this native client compile the exact same file.
+//! `shaders/client/`, the directory both the web client and this native client
+//! compile the exact same file from. The portable ones live in
+//! `ghostframe-render` and are re-exported at their old paths.
 
 pub mod cdf53_grid;
 pub mod cdf53_passes;
-pub mod cdf53_state;
+pub use ghostframe_render::pipelines::{cdf53_state, palrle, rgba, solid};
 pub mod h264_nv12;
-pub mod palrle;
-pub mod rgba;
 pub mod rgba_slab;
-pub mod solid;

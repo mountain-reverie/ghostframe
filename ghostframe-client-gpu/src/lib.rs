@@ -33,9 +33,7 @@ compile_error!(
      device at all."
 );
 
-pub mod coalesce;
 pub mod config;
-pub mod dirty;
 // dmabuf plane layout, modifier negotiation and DMA_BUF_IOCTL_SYNC -- about the
 // kernel, not about any graphics API, so shared by both backends.
 pub mod dmabuf;
@@ -61,7 +59,6 @@ pub mod export;
 pub(crate) mod export_copy;
 #[cfg(feature = "vulkan")]
 mod fence;
-pub mod framebuffer;
 #[cfg(feature = "vulkan")]
 #[path = "import.rs"]
 pub mod import;
@@ -92,7 +89,6 @@ pub mod nv12_reference;
 mod h264_pending;
 #[cfg(test)]
 mod nv12_oracle_tests;
-pub(crate) mod paint_order;
 pub mod pipelines;
 pub mod renderer;
 pub mod ring;
@@ -116,6 +112,11 @@ mod upload_slab;
 #[path = "upload_slab_gles.rs"]
 mod upload_slab;
 pub mod wgpu_ctx;
+
+// The modules that moved to `ghostframe-render` keep their paths here, so
+// `ghostframe_client_gpu::framebuffer::Framebuffer` and friends still resolve
+// for the native client, the tests and this crate's own `crate::` paths.
+pub use ghostframe_render::{coalesce, dirty, framebuffer};
 
 use thiserror::Error;
 
@@ -228,4 +229,19 @@ pub enum GpuError {
         max = ghostframe_client_core::MAX_FRAME_DIMENSION
     )]
     InvalidDimensions { width: u32, height: u32 },
+}
+
+/// `ghostframe-render`'s errors map onto the variants this crate always had, so
+/// a caller that matches `GpuError::InvalidDimensions` or `GpuError::Device`
+/// keeps working.
+impl From<ghostframe_render::GpuError> for GpuError {
+    fn from(e: ghostframe_render::GpuError) -> Self {
+        match e {
+            ghostframe_render::GpuError::Device(s) => GpuError::Device(s),
+            ghostframe_render::GpuError::InvalidDimensions { width, height } => {
+                GpuError::InvalidDimensions { width, height }
+            }
+            ghostframe_render::GpuError::UnsupportedFormat(_) => GpuError::Device(e.to_string()),
+        }
+    }
 }

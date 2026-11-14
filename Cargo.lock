@@ -1938,6 +1938,7 @@ dependencies = [
  "ghostframe-client-core",
  "ghostframe-client-h264",
  "ghostframe-protocol",
+ "ghostframe-render",
  "half",
  "khronos-egl",
  "libc",
