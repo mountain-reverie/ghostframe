@@ -233,8 +233,8 @@ impl IoBridge {
     /// wake deadline of its own: any loop turn runs it, and the dwell it waits
     /// on is checked then.
     ///
-    /// A new span with the same `m` that differs from the live one by at most
-    /// 1 ms and 12.5 % of `k_max` is not applied: the source-rate-derived span would otherwise
+    /// A new span that differs from the live one by at most 1 ms and 12.5 % of
+    /// `k_max` is not applied: the source-rate-derived span would otherwise
     /// close the open block on every wobble of the bandwidth estimate.
     pub(super) fn adapt_step(&mut self, now_us: u64) {
         if self.fec_adapt.is_none() {
@@ -251,8 +251,7 @@ impl IoBridge {
         a.tick(now_us, closes);
         let mut want = a.live_params(rate, max_dg, fps, now_us);
         if let (Some(w), Some(cur)) = (want, live) {
-            if w.m == cur.m
-                && w.t_ms.abs_diff(cur.t_ms) <= 1
+            if w.t_ms.abs_diff(cur.t_ms) <= 1
                 && u16::from(w.k_max.abs_diff(cur.k_max)) * 8 <= u16::from(cur.k_max)
             {
                 want = live;
@@ -355,9 +354,6 @@ impl IoBridge {
             CloseWhy::Mtu => self.block_tx.closed_mtu += 1,
             CloseWhy::Declined => self.block_tx.closed_declined += 1,
         }
-        if let (Some(a), Some(c)) = (self.fec_adapt.as_mut(), group.first()) {
-            a.note_group(c.group_m);
-        }
         // Size and encode every block before anything is queued.
         struct Sized {
             c: crate::transport::fec_tx::blocks::ClosedBlock,
@@ -376,11 +372,7 @@ impl IoBridge {
             let (mut trim, mut rule) = (0, 0);
             let r = match self.fec_adapt.as_mut() {
                 Some(a) => {
-                    let r = a.r_for_block(
-                        u32::from(k),
-                        c.group_m,
-                        self.reliable_emitter.emit_us64(now),
-                    );
+                    let r = a.r_for_block(u32::from(k), self.reliable_emitter.emit_us64(now));
                     (trim, rule) = (a.last_trim(), a.last_base());
                     r
                 }

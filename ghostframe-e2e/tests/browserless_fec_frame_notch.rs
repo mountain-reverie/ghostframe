@@ -1,21 +1,22 @@
-//! The interleaved split (rev 6, R6-e2 S3): the adaptive controller's split
-//! notch, end to end over the PCM rate model at 150 and 200 Mbit/s.
+//! The adaptive controller's frame notch (rev 6, R6-e2 S3): one block spans a
+//! frame (T = the frame interval, `k_max` 223) when the loss is bursty and a
+//! frame no longer fits a 255-symbol block, end to end over the PCM rate model
+//! at 150 and 200 Mbit/s.
 //!
-//! The arms are the product (`adaptive`, the split allowed), the same
-//! controller with the split forbidden (`RunOptions::fec_no_split`: the
-//! two-notch ladder, one block of at most 223 sources over 20 ms), and the
-//! split notch with `m` pinned to 1 (`RunOptions::fec_split_m1`: its span and
-//! per-block rule, no interleave). Everything else, the seeds and the link, is
-//! the same, so the first difference is the split as a whole and the second is
-//! the interleave alone.
+//! The arms are the product (`adaptive`, the notch allowed) and the same
+//! controller with the notch forbidden (`RunOptions::fec_no_frame_notch`: the
+//! two-notch ladder, one block of at most 223 sources over 20 ms). Everything
+//! else, the seeds and the link, is the same, so a difference is the notch.
 //!
-//! One cell (150 Mbit/s, mean burst 8, 3 seeds) runs in CI. The whole grid
-//! (150 and 200 Mbit/s x mean burst 3 and 8, 5 seeds) runs behind
-//! `GHOSTFRAME_FEC_SWEEP=full` (about ten minutes locally), the same switch the
-//! control-law sweep uses; `GHOSTFRAME_FEC_SPLIT_SECS=<n>` sets the virtual
-//! seconds per run. A premise that does not hold fails the test rather than
-//! passing it: a scene where the loss never reached the controller says
-//! nothing about the split.
+//! One cell (150 Mbit/s, mean burst 8, 3 seeds) runs in CI. The grid (150 and
+//! 200 Mbit/s x mean burst 3 and 8, plus 200 Mbit/s burst 16; 5 seeds) runs
+//! behind `GHOSTFRAME_FEC_SWEEP=full` (about 10 minutes locally), the same
+//! switch the control-law sweep uses; `GHOSTFRAME_FEC_SPLIT_SECS=<n>` sets the
+//! virtual seconds per run. A premise that does not hold fails the test rather
+//! than passing it: a scene where the loss never reached the controller says
+//! nothing about the notch. The interleave this notch once came with (m > 1
+//! blocks per frame) measured as no gain over this notch and was removed
+//! (FINDINGS section 13).
 
 use std::time::Duration;
 
@@ -119,10 +120,8 @@ struct Run {
     /// `b_hat x 100` at the end of the run, the controller's burst estimate.
     b_hat_x100: u64,
     p_hat_ppm: u64,
-    m: u8,
-    split: bool,
-    split_entries: u64,
-    split_groups: u64,
+    in_frame_notch: bool,
+    frame_entries: u64,
     notch_changes: u64,
     changes: u64,
     rho_bytes: f64,
@@ -189,20 +188,17 @@ fn frames_late(r: &BrowserlessResult) -> (usize, usize, usize) {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Arm {
-    /// The split forbidden: the ladder as before it existed.
+    /// The frame notch forbidden: the ladder as before it existed.
     Single,
-    /// The split notch, one block per group.
-    M1,
     /// The product.
-    Split,
+    Frame,
 }
 
 async fn run(cell: Cell, seed: u64, secs: u64, arm: Arm) -> Run {
     let (scene, links) = scene(cell, seed, secs * 1000);
     let opts = RunOptions {
         fec_adaptive: true,
-        fec_no_split: arm == Arm::Single,
-        fec_split_m1: arm == Arm::M1,
+        fec_no_frame_notch: arm == Arm::Single,
         ..RunOptions::default()
     };
     let r = run_browserless_with_options(scene, links, opts)
@@ -221,10 +217,8 @@ async fn run(cell: Cell, seed: u64, secs: u64, arm: Arm) -> Run {
         sized: a.blocks_sized,
         b_hat_x100: a.b_hat_x100,
         p_hat_ppm: a.p_hat_ppm,
-        m: a.m,
-        split: a.split,
-        split_entries: a.split_entries,
-        split_groups: a.split_groups,
+        in_frame_notch: a.frame,
+        frame_entries: a.frame_entries,
         notch_changes: a.notch_changes,
         changes: a.changes,
         rho_bytes: repair as f64 / i.offered.total().saturating_sub(repair).max(1) as f64,
@@ -239,9 +233,9 @@ async fn run(cell: Cell, seed: u64, secs: u64, arm: Arm) -> Run {
         digest: r.wire_digest,
     };
     println!(
-        "FECSPLIT run cell={} seed={seed:#x} secs={secs} arm={} shown={} late33={} late_pct={:.2} late100={} \
-         dropped={} reports={} engaged={} sized={} b_hat={:.2} p_hat_ppm={} m={} in_split={} \
-         split_entries={} split_groups={} notch_changes={} changes={} rho_bytes={:.4} \
+        "FECFRAME run cell={} seed={seed:#x} secs={secs} arm={} shown={} late33={} late_pct={:.2} late100={} \
+         dropped={} reports={} engaged={} sized={} b_hat={:.2} p_hat_ppm={} in_frame={} \
+         frame_entries={} notch_changes={} changes={} rho_bytes={:.4} \
          requests={} late_rows={} declined={} handoffs_declined={} declined_held_bytes={} declined_open_cap={} \
          held_bytes_peak={} wait_p95_ms={} wait_hist={:?} digest={:#x}",
         cell.name(),
@@ -256,10 +250,8 @@ async fn run(cell: Cell, seed: u64, secs: u64, arm: Arm) -> Run {
         out.sized,
         out.b_hat_x100 as f64 / 100.0,
         out.p_hat_ppm,
-        out.m,
-        out.split,
-        out.split_entries,
-        out.split_groups,
+        out.in_frame_notch,
+        out.frame_entries,
         out.notch_changes,
         out.changes,
         out.rho_bytes,
@@ -294,9 +286,8 @@ fn range(v: &[f64]) -> f64 {
 
 /// Both arms over the seeds of one cell.
 struct Pair {
-    split: Vec<Run>,
+    frame: Vec<Run>,
     single: Vec<Run>,
-    m1: Vec<Run>,
 }
 
 impl Pair {
@@ -304,29 +295,15 @@ impl Pair {
         runs.iter().map(Run::late_pct).collect()
     }
 
-    /// `(single mean, split mean, gap, spread)` of late frames, percent; the
-    /// spread is the larger seed range of the two arms (max - min), as the
-    /// split simulation (FINDINGS section 12) judged it.
-    fn gap(&self) -> (f64, f64, f64, f64) {
-        let (s, c) = (Self::late(&self.split), Self::late(&self.single));
-        let spread = range(&s).max(range(&c));
-        (mean(&c), mean(&s), mean(&c) - mean(&s), spread)
-    }
-
     /// The same seed draws the same demand and loss in both arms, so the
-    /// difference per seed (single - split, points of frames late) is the
-    /// measurement the seed spread buries: `(mean, standard error, seeds
-    /// where the split is no later)`.
+    /// difference per seed (single - frame, points of frames late) is the
+    /// measurement the seed spread buries: `(mean, standard error, seeds where
+    /// the notch is no later)`.
     fn paired(&self) -> (f64, f64, usize) {
-        Self::paired_of(&self.single, &self.split)
-    }
-
-    /// [`Self::paired`] of any two arms: `(mean, s.e.m., seeds where `b` is
-    /// no later than `a`)` of `a - b`.
-    fn paired_of(a: &[Run], b: &[Run]) -> (f64, f64, usize) {
-        let d: Vec<f64> = a
+        let d: Vec<f64> = self
+            .single
             .iter()
-            .zip(b)
+            .zip(&self.frame)
             .map(|(c, s)| c.late_pct() - s.late_pct())
             .collect();
         let m = mean(&d);
@@ -338,58 +315,60 @@ impl Pair {
         )
     }
 
-    /// The split's gain, judged on the pairs: no seed later, and the mean
-    /// gain `sigmas` standard errors above zero. `Err` names the miss.
+    /// The notch's gain, judged on the pairs: no seed later, and the mean gain
+    /// `sigmas` standard errors above zero. `Err` names the miss.
     fn paired_gain(&self, sigmas: f64) -> Result<(), String> {
         let (m, sem, ok) = self.paired();
-        if ok == self.split.len() && m > sigmas * sem && m > 0.0 {
+        if ok == self.frame.len() && m > sigmas * sem && m > 0.0 {
             Ok(())
         } else {
             Err(format!(
-                "paired gain {m:+.2} +- {sem:.2} points, split no later in {ok}/{} seeds",
-                self.split.len()
+                "paired gain {m:+.2} +- {sem:.2} points, notch no later in {ok}/{} seeds",
+                self.frame.len()
             ))
         }
     }
 
     fn report(&self, cell: Cell) {
         let (pm, psem, pok) = self.paired();
-        let (im, isem, iok) = Self::paired_of(&self.m1, &self.split);
-        let late_m1 = mean(&Self::late(&self.m1));
-        let (single, split, gap, spread) = self.gap();
+        let (s, c) = (Self::late(&self.frame), Self::late(&self.single));
+        let spread = range(&s).max(range(&c));
         let b: Vec<f64> = self
-            .split
+            .frame
             .iter()
             .map(|r| r.b_hat_x100 as f64 / 100.0)
             .collect();
-        let rho_s: Vec<f64> = self.split.iter().map(|r| r.rho_bytes).collect();
+        let rho_f: Vec<f64> = self.frame.iter().map(|r| r.rho_bytes).collect();
         let rho_c: Vec<f64> = self.single.iter().map(|r| r.rho_bytes).collect();
-        let held: u64 = self
-            .split
+        let held = self
+            .frame
             .iter()
             .map(|r| r.held_bytes_peak)
             .max()
             .unwrap_or(0);
-        let held_dec: u64 = self.split.iter().map(|r| r.declined_held_bytes).sum();
-        let wait: Vec<u64> = self.split.iter().map(Run::wait_p95_ms).collect();
+        let held_dec: u64 = self.frame.iter().map(|r| r.declined_held_bytes).sum();
+        let wait: Vec<u64> = self.frame.iter().map(Run::wait_p95_ms).collect();
         println!(
-            "FECSPLIT cell={} seeds={} late33_single={single:.2} late33_split={split:.2} late33_m1={late_m1:.2} gap={gap:+.2} \
-             spread={spread:.2} outside_spread={} paired_gain={pm:+.2}+-{psem:.2} split_seeds_no_later={pok}/{} interleave_alone_gain={im:+.2}+-{isem:.2} no_later={iok} b_hat_mean={:.2} \
-             overhead_single={:.3} overhead_split={:.3} held_peak_max={held} \
-             declined_held_bytes_sum={held_dec} wait_p95_ms_per_seed={wait:?} \
-             split_entries={:?} notch_changes_split_arm={:?}",
+            "FECFRAME cell={} seeds={} late33_single={:.2} late33_frame={:.2} gain={:+.2} \
+             spread={spread:.2} outside_spread={} paired_gain={pm:+.2}+-{psem:.2} \
+             frame_seeds_no_later={pok}/{} b_hat_mean={:.2} overhead_single={:.3} \
+             overhead_frame={:.3} held_peak_max={held} declined_held_bytes_sum={held_dec} \
+             wait_p95_ms_per_seed={wait:?} frame_entries={:?} notch_changes_frame_arm={:?}",
             cell.name(),
-            self.split.len(),
-            gap > spread,
-            self.split.len(),
+            self.frame.len(),
+            mean(&c),
+            mean(&s),
+            mean(&c) - mean(&s),
+            mean(&c) - mean(&s) > spread,
+            self.frame.len(),
             mean(&b),
             mean(&rho_c),
-            mean(&rho_s),
-            self.split
+            mean(&rho_f),
+            self.frame
                 .iter()
-                .map(|r| r.split_entries)
+                .map(|r| r.frame_entries)
                 .collect::<Vec<_>>(),
-            self.split
+            self.frame
                 .iter()
                 .map(|r| r.notch_changes)
                 .collect::<Vec<_>>(),
@@ -399,14 +378,12 @@ impl Pair {
 
 async fn pair(cell: Cell, seeds: &[u64], secs: u64) -> Pair {
     let mut p = Pair {
-        split: vec![],
+        frame: vec![],
         single: vec![],
-        m1: vec![],
     };
     for &seed in seeds {
         p.single.push(run(cell, seed, secs, Arm::Single).await);
-        p.m1.push(run(cell, seed, secs, Arm::M1).await);
-        p.split.push(run(cell, seed, secs, Arm::Split).await);
+        p.frame.push(run(cell, seed, secs, Arm::Frame).await);
     }
     p
 }
@@ -415,7 +392,7 @@ async fn pair(cell: Cell, seeds: &[u64], secs: u64) -> Pair {
 /// controller, it engaged and sized blocks, and the client counted what it
 /// should. A scene that fails one of these measured nothing.
 fn premises(p: &Pair, cell: Cell) {
-    for (arm, runs) in [("split", &p.split), ("single", &p.single), ("m1", &p.m1)] {
+    for (arm, runs) in [("frame", &p.frame), ("single", &p.single)] {
         for (i, r) in runs.iter().enumerate() {
             let ctx = format!("{} {arm} seed #{i}", cell.name());
             assert!(r.dropped > 100, "{ctx}: the link dropped {}", r.dropped);
@@ -435,46 +412,36 @@ fn premises(p: &Pair, cell: Cell) {
     }
     for r in &p.single {
         assert_eq!(
-            (r.split_entries, r.split_groups),
-            (0, 0),
-            "{}: the control arm entered the split",
+            r.frame_entries,
+            0,
+            "{}: the control arm entered the frame notch",
             cell.name()
         );
     }
 }
 
-/// Where the split is expected: it engaged on every seed, its groups were
-/// really interleaved, and the burst estimate (read at the end of the run, a
-/// 10 s average that wanders by a unit or two) was above the exit: the notch
-/// holds between the exit and the entry, so the entry itself is not asserted
-/// on a final reading.
-fn split_premises(p: &Pair, cell: Cell) {
-    for (i, r) in p.split.iter().enumerate() {
+/// Where the notch is expected: it engaged on every seed, and the burst
+/// estimate (read at the end of the run, a 10 s average that wanders by a unit
+/// or two) was above the exit: the notch holds between the exit and the entry,
+/// so the entry itself is not asserted on a final reading.
+fn frame_premises(p: &Pair, cell: Cell) {
+    for (i, r) in p.frame.iter().enumerate() {
         let ctx = format!("{} seed #{i}", cell.name());
-        assert!(r.split_entries >= 1, "{ctx}: the split never engaged");
-        assert!(
-            r.split_groups > 20,
-            "{ctx}: {} interleaved groups",
-            r.split_groups
-        );
+        assert!(r.frame_entries >= 1, "{ctx}: the frame notch never engaged");
+        assert!(r.in_frame_notch, "{ctx}: not in the frame notch at the end");
         assert!(r.b_hat_x100 > EXIT_X100, "{ctx}: b_hat {}", r.b_hat_x100);
-    }
-    for (i, r) in p.m1.iter().enumerate() {
-        let ctx = format!("{} m1 seed #{i}", cell.name());
-        assert!(r.split_entries >= 1, "{ctx}: the split notch never engaged");
-        assert_eq!(r.split_groups, 0, "{ctx}: the control interleaved");
     }
 }
 
 /// No flapping. A stationary burst of 8 has an estimate that wanders by about
 /// a unit (30 s runs: mean 8.08, s.d. 1.01, lowest 6.4 over 20 runs), nowhere
-/// near the exit at 4, so the notch is entered once and held: the split arm
-/// changes notch twice (Wide, then Split; at most three with a stray Narrow
-/// at start-up) and enters the split exactly once. Without the hysteresis
-/// (exit at the entry) the estimate's dips below 6 leave and re-enter it, and
-/// the entries reach 2.
-fn bounded_changes(p: &Pair, cell: Cell, _secs: u64) {
-    for (i, r) in p.split.iter().enumerate() {
+/// near the exit at 4, so the notch is entered once and held: the notch arm
+/// changes notch twice (Wide, then Frame; at most three with a stray Narrow
+/// at start-up) and enters the frame notch exactly once. Without the
+/// hysteresis (exit at the entry) the estimate's dips below 6 leave and
+/// re-enter it, and the entries reach 2.
+fn bounded_changes(p: &Pair, cell: Cell) {
+    for (i, r) in p.frame.iter().enumerate() {
         assert!(
             r.notch_changes <= 3,
             "{} seed #{i}: {} notch changes",
@@ -482,16 +449,16 @@ fn bounded_changes(p: &Pair, cell: Cell, _secs: u64) {
             r.notch_changes
         );
         assert!(
-            r.split_entries <= 1,
-            "{} seed #{i}: {} entries into the split",
+            r.frame_entries <= 1,
+            "{} seed #{i}: {} entries into the frame notch",
             cell.name(),
-            r.split_entries
+            r.frame_entries
         );
     }
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_split_helps_at_150_mbit_burst_8() {
+async fn the_frame_notch_helps_at_150_mbit_burst_8() {
     let cell = Cell {
         cap_mbit: 150,
         run: 8,
@@ -500,37 +467,27 @@ async fn the_split_helps_at_150_mbit_burst_8() {
     let p = pair(cell, &SEEDS[..3], secs).await;
     p.report(cell);
     premises(&p, cell);
-    split_premises(&p, cell);
-    bounded_changes(&p, cell, secs);
-    // Late frames no higher than the one-block control, seed by seed. The
-    // gain is inside the seed range (the simulation found this cell so too),
-    // so it is judged on the pairs: three seeds, so only the sign.
-    // What the cell shows is the notch's span (T = the frame interval), not the
-    // interleave: both the product and the one-block `m1` control gain over the
-    // single block (the interleave alone, split - m1, is not asserted: it is
-    // zero here and at bursts 16 and 32, FINDINGS section 13).
+    frame_premises(&p, cell);
+    bounded_changes(&p, cell);
+    // Late frames no higher than the one-block control, seed by seed. The gain
+    // is inside the seed range, so it is judged on the pairs: three seeds, so
+    // only the sign.
     if let Err(e) = p.paired_gain(0.0) {
-        panic!("{}: split - single: {e}", cell.name());
+        panic!("{}: frame notch - single: {e}", cell.name());
     }
-    let (m, sem, ok) = Pair::paired_of(&p.single, &p.m1);
-    assert!(
-        ok == p.m1.len() && m > 0.0,
-        "{}: m1 - single: paired gain {m:+.2} +- {sem:.2}, m1 no later in {ok} seeds",
-        cell.name()
-    );
 }
 
-/// Below two blocks the split is never entered, whatever the burst: the run
-/// with the split allowed is the run without it, datagram for datagram. (The
-/// loss is as bursty as at 150 Mbit/s b8, so the burst estimate is over the
-/// entry and only the rate keeps the notch out.)
+/// While a frame fits one block the notch is never entered, whatever the
+/// burst: the run with the notch allowed is the run without it, datagram for
+/// datagram. (The loss is as bursty as at 150 Mbit/s b8, so the burst estimate
+/// is over the entry and only the rate keeps the notch out.)
 #[tokio::test(start_paused = true)]
-async fn a_frame_that_fits_one_block_never_splits() {
+async fn a_frame_that_fits_one_block_never_enters_the_frame_notch() {
     let cell = Cell {
         cap_mbit: 10,
         run: 8,
     };
-    let a = run(cell, SEEDS[0], 8, Arm::Split).await;
+    let a = run(cell, SEEDS[0], 8, Arm::Frame).await;
     let b = run(cell, SEEDS[0], 8, Arm::Single).await;
     assert!(
         a.engaged && a.dropped > 20 && a.sized > 10,
@@ -541,16 +498,17 @@ async fn a_frame_that_fits_one_block_never_splits() {
         "premise: b_hat {} is over the entry",
         a.b_hat_x100
     );
-    assert_eq!((a.split_entries, a.split_groups), (0, 0));
+    assert_eq!(a.frame_entries, 0);
     assert_eq!(
         a.digest, b.digest,
-        "the split arm is the control, byte for byte"
+        "the notch arm is the control, byte for byte"
     );
 }
 
-/// The whole grid, behind `GHOSTFRAME_FEC_SWEEP=full`.
+/// The grid, behind `GHOSTFRAME_FEC_SWEEP=full`: 150 and 200 Mbit/s at bursts
+/// 3 and 8, and 200 Mbit/s at burst 16.
 #[tokio::test(start_paused = true)]
-async fn the_split_grid() {
+async fn the_frame_notch_grid() {
     if !std::env::var("GHOSTFRAME_FEC_SWEEP").is_ok_and(|v| v == "full") {
         eprintln!("skipped: set GHOSTFRAME_FEC_SWEEP=full (about ten minutes)");
         return;
@@ -559,38 +517,31 @@ async fn the_split_grid() {
     // Outcomes are collected and asserted after every cell has printed, so one
     // failing cell does not hide the numbers of the others.
     let mut failures: Vec<String> = Vec::new();
-    for (cap_mbit, run) in [(150, 3), (150, 8), (200, 3), (200, 8)] {
+    for (cap_mbit, run) in [(150, 3), (150, 8), (200, 3), (200, 8), (200, 16)] {
         let cell = Cell { cap_mbit, run };
         let p = pair(cell, &SEEDS, secs).await;
         p.report(cell);
         premises(&p, cell);
-        bounded_changes(&p, cell, secs);
+        bounded_changes(&p, cell);
         if cell.run == 3 {
-            // Burst 3: b_hat is under the entry and the split stays out.
-            for (i, r) in p.split.iter().enumerate() {
-                if r.b_hat_x100 >= ENTER_X100 || r.split_entries != 0 {
+            // Burst 3: b_hat is under the entry and the notch stays out.
+            for (i, r) in p.frame.iter().enumerate() {
+                if r.b_hat_x100 >= ENTER_X100 || r.frame_entries != 0 {
                     failures.push(format!(
                         "{} seed #{i}: b_hat {} entries {}",
                         cell.name(),
                         r.b_hat_x100,
-                        r.split_entries
+                        r.frame_entries
                     ));
                 }
             }
         } else {
-            split_premises(&p, cell);
-            // The gain is inside the seed range at both rates (printed as
-            // `outside_spread`; FINDINGS section 13), so it is judged on the
-            // pairs: no seed later and the mean 3 standard errors above 0.
+            frame_premises(&p, cell);
+            // The gain is inside the seed range (printed as `outside_spread`;
+            // FINDINGS section 13), so it is judged on the pairs: no seed later
+            // and the mean 3 standard errors above 0.
             if let Err(e) = p.paired_gain(3.0) {
-                failures.push(format!("{}: split - single: {e}", cell.name()));
-            }
-            let (m, sem, ok) = Pair::paired_of(&p.single, &p.m1);
-            if ok != p.m1.len() || m <= 3.0 * sem {
-                failures.push(format!(
-                    "{}: m1 - single: {m:+.2} +- {sem:.2}, {ok} seeds",
-                    cell.name()
-                ));
+                failures.push(format!("{}: frame notch - single: {e}", cell.name()));
             }
         }
     }

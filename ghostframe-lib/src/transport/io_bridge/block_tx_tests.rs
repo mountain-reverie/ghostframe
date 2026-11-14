@@ -1275,7 +1275,7 @@ async fn declined_blocks_move_the_trim_and_nothing_else_does() {
     let mut b = adaptive_bridge();
     send_report(&mut b, 950, 50, [50, 0, 0, 0, 0, 0, 0, 0]);
     let a = b.fec_adapt.as_mut().unwrap();
-    let before = a.r_for_block(64, 1, 0);
+    let before = a.r_for_block(64, 0);
     a.tick(1, std::iter::repeat_n(CloseReason::Accounted, 250));
     a.tick(
         2,
@@ -1284,12 +1284,12 @@ async fn declined_blocks_move_the_trim_and_nothing_else_does() {
             .chain([CloseReason::Accounted; 4]),
     );
     assert_eq!(
-        a.r_for_block(64, 1, 2),
+        a.r_for_block(64, 2),
         before,
         "HandedOff and TimedOut never trim"
     );
     a.tick(3, std::iter::repeat_n(CloseReason::Declined, 10));
-    assert_eq!(a.r_for_block(64, 1, 3), before + 1, "10/256 Declined trims");
+    assert_eq!(a.r_for_block(64, 3), before + 1, "10/256 Declined trims");
 }
 
 /// Every frame in `frames` that is a SOURCE, as its `t_adv`; every REPAIR as its hint.

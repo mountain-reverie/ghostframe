@@ -101,15 +101,14 @@ impl IoBridge {
         self.packer.set_blocks(self.fec_live);
     }
 
-    /// Allow (`true`, the default) or forbid the adaptive controller's split
-    /// notch (`split`), or enter it with `m` pinned to 1 (`force_m1`). Test
-    /// only: the control arms of a split scene. Call after
+    /// Allow (`true`, the default) or forbid the adaptive controller's frame
+    /// notch. Test only: the control arm of a frame-notch scene. Call after
     /// `set_fec_mode_for_test`.
     #[cfg(any(test, feature = "browserless-harness"))]
-    pub fn set_fec_split_for_test(&mut self, split: bool, force_m1: bool) {
+    pub fn set_fec_frame_notch_for_test(&mut self, frame: bool) {
         if self.fec_adapt.is_some() {
-            self.fec_adapt = Some(crate::transport::fec_tx::adapt::FecAdapt::with_split_mode(
-                split, force_m1,
+            self.fec_adapt = Some(crate::transport::fec_tx::adapt::FecAdapt::with_frame_notch(
+                frame,
             ));
         }
     }
