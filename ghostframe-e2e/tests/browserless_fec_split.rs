@@ -129,6 +129,8 @@ struct Run {
     requests: u64,
     late_rows: u64,
     declined: u64,
+    /// Server side: blocks handed to ARQ plus blocks closed declined.
+    handoffs_declined: u64,
     declined_held_bytes: u64,
     declined_open_cap: u64,
     held_bytes_peak: u64,
@@ -229,6 +231,7 @@ async fn run(cell: Cell, seed: u64, secs: u64, arm: Arm) -> Run {
         requests: c.requests,
         late_rows: c.late_rows,
         declined: c.declined,
+        handoffs_declined: i.block_handoffs + i.block_closed_declined,
         declined_held_bytes: c.declined_held_bytes,
         declined_open_cap: c.declined_open_cap,
         held_bytes_peak: c.held_bytes_peak,
@@ -239,7 +242,7 @@ async fn run(cell: Cell, seed: u64, secs: u64, arm: Arm) -> Run {
         "FECSPLIT run cell={} seed={seed:#x} secs={secs} arm={} shown={} late33={} late_pct={:.2} late100={} \
          dropped={} reports={} engaged={} sized={} b_hat={:.2} p_hat_ppm={} m={} in_split={} \
          split_entries={} split_groups={} notch_changes={} changes={} rho_bytes={:.4} \
-         requests={} late_rows={} declined={} declined_held_bytes={} declined_open_cap={} \
+         requests={} late_rows={} declined={} handoffs_declined={} declined_held_bytes={} declined_open_cap={} \
          held_bytes_peak={} wait_p95_ms={} wait_hist={:?} digest={:#x}",
         cell.name(),
         format!("{arm:?}").to_lowercase(),
@@ -263,6 +266,7 @@ async fn run(cell: Cell, seed: u64, secs: u64, arm: Arm) -> Run {
         out.requests,
         out.late_rows,
         out.declined,
+        out.handoffs_declined,
         out.declined_held_bytes,
         out.declined_open_cap,
         out.held_bytes_peak,
@@ -501,9 +505,19 @@ async fn the_split_helps_at_150_mbit_burst_8() {
     // Late frames no higher than the one-block control, seed by seed. The
     // gain is inside the seed range (the simulation found this cell so too),
     // so it is judged on the pairs: three seeds, so only the sign.
+    // What the cell shows is the notch's span (T = the frame interval), not the
+    // interleave: both the product and the one-block `m1` control gain over the
+    // single block (the interleave alone, split - m1, is not asserted: it is
+    // zero here and at bursts 16 and 32, FINDINGS section 13).
     if let Err(e) = p.paired_gain(0.0) {
-        panic!("{}: {e}", cell.name());
+        panic!("{}: split - single: {e}", cell.name());
     }
+    let (m, sem, ok) = Pair::paired_of(&p.single, &p.m1);
+    assert!(
+        ok == p.m1.len() && m > 0.0,
+        "{}: m1 - single: paired gain {m:+.2} +- {sem:.2}, m1 no later in {ok} seeds",
+        cell.name()
+    );
 }
 
 /// Below two blocks the split is never entered, whatever the burst: the run
@@ -569,7 +583,14 @@ async fn the_split_grid() {
             // `outside_spread`; FINDINGS section 13), so it is judged on the
             // pairs: no seed later and the mean 3 standard errors above 0.
             if let Err(e) = p.paired_gain(3.0) {
-                failures.push(format!("{}: {e}", cell.name()));
+                failures.push(format!("{}: split - single: {e}", cell.name()));
+            }
+            let (m, sem, ok) = Pair::paired_of(&p.single, &p.m1);
+            if ok != p.m1.len() || m <= 3.0 * sem {
+                failures.push(format!(
+                    "{}: m1 - single: {m:+.2} +- {sem:.2}, {ok} seeds",
+                    cell.name()
+                ));
             }
         }
     }
