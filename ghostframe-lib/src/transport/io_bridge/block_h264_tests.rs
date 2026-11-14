@@ -63,7 +63,6 @@ async fn h264_blocks_bridge(srtt_ms: u64) -> IoBridge {
         k_max: 64,
         t_ms: 5,
         r: 2,
-        m: 1,
     }));
     b.client_caps.supports_h264 = true;
     b.client_caps.h264_acked_ref = true;

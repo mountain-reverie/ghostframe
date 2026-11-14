@@ -1332,7 +1332,6 @@ mod tests {
             k_max: 64,
             t_ms: 5,
             r: 1,
-            m: 1,
         });
         let t = now_std();
         let before = b.h264.rate.applied().expect("a rate is in force");

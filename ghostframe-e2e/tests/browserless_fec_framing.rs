@@ -198,7 +198,6 @@ async fn a_churning_scene_with_blocks_on_sends_and_bills_repairs() {
             k_max: 64,
             t_ms: 5,
             r: 2,
-            m: 1,
         }),
         ..framed()
     };
@@ -258,7 +257,6 @@ async fn a_lossy_scene_with_blocks_on_runs_the_receive_side_and_converges() {
             k_max: 16,
             t_ms: 5,
             r: 2,
-            m: 1,
         }),
         ..framed()
     };

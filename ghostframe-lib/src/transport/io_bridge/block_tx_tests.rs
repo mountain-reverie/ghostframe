@@ -21,12 +21,7 @@ fn blocks_bridge(k_max: u8, t_ms: u8, r: u8) -> IoBridge {
     b.last_hello_from = Some(H);
     b.test_wire = Some(bundle_tx::TestWire::default());
     b.forced_raw_datagram_size_for_test = Some(RAW);
-    b.set_fec_blocks_for_test(Some(FecBlockParams {
-        k_max,
-        t_ms,
-        r,
-        m: 1,
-    }));
+    b.set_fec_blocks_for_test(Some(FecBlockParams { k_max, t_ms, r }));
     b
 }
 
@@ -983,7 +978,6 @@ async fn with_live_none_and_machinery_on_a_probe_record_is_plain_and_a_pump_neve
         k_max: 64,
         t_ms: 5,
         r: 2,
-        m: 1,
     }));
     assert_eq!(b.probe_bundle_kind(), BundleKind::Source);
     b.apply_fec_live(None);
