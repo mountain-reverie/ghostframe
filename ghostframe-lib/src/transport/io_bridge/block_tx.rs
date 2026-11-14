@@ -290,14 +290,8 @@ impl IoBridge {
 
     /// Takes the blocks the packer closed, encodes their repairs into
     /// `pending_repairs` and hands each to the table. `forced` names the
-    /// cause when the caller knows it; otherwise a group with a block of
-    /// `k_max` sources closed on size and any other on Empty.
-    ///
-    /// Blocks close in groups (R6-e2 S2: `m` interleaved blocks, one close).
-    /// A group is handled whole: its cause is decided and counted once, every
-    /// block is sized and encoded, and only then are the repair rows queued,
-    /// round-robin across the blocks, so a burst in the repair train takes one
-    /// row from each block rather than all the parity of one.
+    /// cause when the caller knows it; otherwise a block of `k_max` sources
+    /// closed on size and any other on Empty.
     pub(super) fn process_closed_blocks(&mut self, forced: Option<CloseWhy>) {
         let closed = self.packer.take_closed();
         if closed.is_empty() {
@@ -308,61 +302,24 @@ impl IoBridge {
         };
         let now = now_std();
         let max_dg = self.live_max_dg();
-        let mut closed = closed.into_iter().peekable();
-        while let Some(first) = closed.next() {
-            let mut group = vec![first];
-            while closed.peek().is_some_and(|n| n.group == group[0].group) {
-                group.extend(closed.next());
-            }
-            self.process_closed_group(group, forced, params, now, max_dg);
-        }
-        debug_assert!(self.block_table.open_blocks() <= FEC_TX_MAX_BLOCKS);
-    }
-
-    fn process_closed_group(
-        &mut self,
-        group: Vec<crate::transport::fec_tx::blocks::ClosedBlock>,
-        forced: Option<CloseWhy>,
-        params: crate::config::FecBlockParams,
-        now: std::time::Instant,
-        max_dg: Option<usize>,
-    ) {
-        // One cause for the group. A block the table already closed (declined,
-        // or accounted while it was still taking sources) makes it Declined;
-        // its siblings are closed with it, not declined.
-        let why = if group
-            .iter()
-            .any(|c| self.block_table.closed_reason(c.block_id).is_some())
-        {
-            CloseWhy::Declined
-        } else {
-            forced.unwrap_or(
-                if group
-                    .iter()
-                    .any(|c| usize::from(c.k) >= usize::from(params.k_max))
-                {
+        for c in closed {
+            let k = c.k;
+            let why = if self.block_table.closed_reason(c.block_id).is_some() {
+                CloseWhy::Declined
+            } else {
+                forced.unwrap_or(if usize::from(k) >= usize::from(params.k_max) {
                     CloseWhy::KMax
                 } else {
                     CloseWhy::Empty
-                },
-            )
-        };
-        match why {
-            CloseWhy::KMax => self.block_tx.closed_kmax += 1,
-            CloseWhy::Time => self.block_tx.closed_time += 1,
-            CloseWhy::Empty => self.block_tx.closed_empty += 1,
-            CloseWhy::Mtu => self.block_tx.closed_mtu += 1,
-            CloseWhy::Declined => self.block_tx.closed_declined += 1,
-        }
-        // Size and encode every block before anything is queued.
-        struct Sized {
-            c: crate::transport::fec_tx::blocks::ClosedBlock,
-            r: u8,
-            jobs: Vec<RepairJob>,
-        }
-        let mut sized: Vec<Sized> = Vec::with_capacity(group.len());
-        for c in group {
-            let k = c.k;
+                })
+            };
+            match why {
+                CloseWhy::KMax => self.block_tx.closed_kmax += 1,
+                CloseWhy::Time => self.block_tx.closed_time += 1,
+                CloseWhy::Empty => self.block_tx.closed_empty += 1,
+                CloseWhy::Mtu => self.block_tx.closed_mtu += 1,
+                CloseWhy::Declined => self.block_tx.closed_declined += 1,
+            }
             if self.block_table.closed_reason(c.block_id).is_some() {
                 // Declined while it was still sending: nothing to repair.
                 continue;
@@ -376,14 +333,13 @@ impl IoBridge {
                     (trim, rule) = (a.last_trim(), a.last_base());
                     r
                 }
-                // The knob's `r` is the group's rows; each block carries its share.
-                None => params.r.div_ceil(c.group_m.max(1)),
+                None => params.r,
             }
             .min(255 - k);
             self.block_tx.split.note_block(&c, r, trim, rule);
             let sum_len: u32 = c.symbols.iter().map(|s| s.len() as u32).sum();
             let fits = max_dg.is_some_and(|m| c.symbol_len() + FEC_REPAIR_HEADER_LEN <= m);
-            let mut jobs = Vec::new();
+            let mut repairs_queued = 0;
             if r > 0 && !fits {
                 self.block_tx.repairs_dropped_mtu += u64::from(r);
             } else if r > 0 {
@@ -392,7 +348,7 @@ impl IoBridge {
                 match ghostframe_protocol::fec::codec::encode_repairs(&refs, &rows) {
                     Ok(payloads) => {
                         for (row, payload) in payloads.into_iter().enumerate() {
-                            jobs.push(RepairJob {
+                            self.pending_repairs.push_back(RepairJob {
                                 block_id: c.block_id,
                                 k,
                                 r,
@@ -401,7 +357,12 @@ impl IoBridge {
                                 cause: RowCause::Initial,
                                 sum_len,
                             });
+                            repairs_queued += 1;
                         }
+                        self.block_tx.repairs_queued_peak = self
+                            .block_tx
+                            .repairs_queued_peak
+                            .max(self.pending_repairs.len() as u64);
                     }
                     Err(e) => {
                         self.block_tx.encode_failed += 1;
@@ -409,36 +370,10 @@ impl IoBridge {
                     }
                 }
             }
-            sized.push(Sized { c, r, jobs });
-        }
-        // Row 0 of every block, then row 1 of every block, ...
-        let queued: Vec<usize> = sized.iter().map(|s| s.jobs.len()).collect();
-        let mut lanes: Vec<std::vec::IntoIter<RepairJob>> = sized
-            .iter_mut()
-            .map(|s| std::mem::take(&mut s.jobs).into_iter())
-            .collect();
-        loop {
-            let mut any = false;
-            for lane in &mut lanes {
-                if let Some(job) = lane.next() {
-                    self.pending_repairs.push_back(job);
-                    any = true;
-                }
-            }
-            if !any {
-                break;
-            }
-        }
-        self.block_tx.repairs_queued_peak = self
-            .block_tx
-            .repairs_queued_peak
-            .max(self.pending_repairs.len() as u64);
-        for (s, repairs_queued) in sized.into_iter().zip(queued) {
-            let Sized { c, r, .. } = s;
             let actions = self.block_table.on_closed(
                 TableBlock {
                     block_id: c.block_id,
-                    k: c.k,
+                    k,
                     r,
                     symbols: c.symbols,
                     repair_bundles: Vec::new(),
@@ -452,6 +387,7 @@ impl IoBridge {
             self.execute_block_actions(actions);
             self.execute_block_actions(evicted);
         }
+        debug_assert!(self.block_table.open_blocks() <= FEC_TX_MAX_BLOCKS);
     }
 
     /// Runs what the table decided: encodes repair rows (one call per block),
@@ -603,8 +539,7 @@ impl IoBridge {
 
     /// DECLINED: every unaccounted source is handed off (the bitmap is only
     /// a cross-check). A block still taking sources closes in the packer so
-    /// no later source joins it; its siblings in the group close with it (the
-    /// interleave over fewer builders would not be the design).
+    /// no later source joins it.
     pub(super) fn blocks_on_declined(&mut self, block_id: u16, k: u8, missing: &[u8]) {
         if !self.fec_machinery() {
             return;
@@ -616,7 +551,7 @@ impl IoBridge {
             self.block_tx.declined_handled += 1;
         }
         self.execute_block_actions(a);
-        if self.packer.has_open_block(block_id) && self.packer.close_now() {
+        if self.packer.open_block_id() == Some(block_id) && self.packer.close_now() {
             self.process_closed_blocks(Some(CloseWhy::Declined));
         }
     }

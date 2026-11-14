@@ -9,7 +9,7 @@ use ghostframe_protocol::fec::frame::{
 };
 use smallvec::SmallVec;
 
-use super::blocks::{BlockGroup, BlockSpan, ClosedBlock, SourceKind};
+use super::blocks::{BlockBuilder, BlockSpan, ClosedBlock, SourceKind};
 use crate::config::FecBlockParams;
 use crate::transport::protocol::NO_ACK;
 use crate::transport::reliable_emitter::emission_queue::WireClass;
@@ -71,7 +71,7 @@ pub(crate) struct Packer {
     open_protect: bool,
     /// `None`: every bundle is PLAIN.
     blocks: Option<FecBlockParams>,
-    builder: BlockGroup,
+    builder: BlockBuilder,
     closed: SmallVec<[ClosedBlock; 1]>,
 }
 
@@ -173,17 +173,9 @@ impl Packer {
                 } else {
                     SourceKind::Tile
                 };
-                self.builder.add(
-                    frame.coded_symbol(),
-                    bundle_seq,
-                    kind,
-                    now_us,
-                    span,
-                    params.m,
-                );
+                self.builder
+                    .add(frame.coded_symbol(), bundle_seq, kind, now_us, span);
                 if last {
-                    // LAST is on this source only; the block's siblings in the
-                    // group close with it and learn their size from a repair.
                     self.closed.extend(self.builder.close());
                 }
                 (frame.encode(), BundleKind::Source)
@@ -263,7 +255,7 @@ impl Packer {
         self.seal(true, now_us)
     }
 
-    /// T close: the open group has been open `t_ms` since its first source.
+    /// T close: the open block has been open `t_ms` since its first source.
     /// All its sources are already out, so no LAST. Returns whether it closed.
     pub(crate) fn close_if_due(&mut self, now_us: u64) -> bool {
         if self.blocks.is_none() || !self.builder.due(now_us) {
@@ -283,34 +275,30 @@ impl Packer {
         self.blocks
     }
 
-    /// MTU shrink: a repair of any open block's longest symbol no longer fits
-    /// `max_dg`, so the group closes at its current size.
+    /// MTU shrink: a repair of the open block's longest symbol no longer fits
+    /// `max_dg`, so the block closes at its current size.
     pub(crate) fn close_for_mtu(&mut self, max_dg: usize) -> bool {
         self.builder.outgrown_by(max_dg) && self.close_now()
     }
 
-    /// Closes the open group, if it has sources (a hand-off or a decline for a
-    /// block still sending): every block of it together. Returns whether it
-    /// closed.
+    /// Closes the open block, if it has sources (a hand-off or a decline for a
+    /// block still sending). Returns whether it closed.
     pub(crate) fn close_now(&mut self) -> bool {
-        let blocks = self.builder.close();
-        let closed = !blocks.is_empty();
-        self.closed.extend(blocks);
-        closed
+        match self.builder.close() {
+            Some(b) => {
+                self.closed.push(b);
+                true
+            }
+            None => false,
+        }
     }
 
-    /// Ids of the blocks still taking sources (the open group's), in id order.
-    pub(crate) fn open_block_ids(&self) -> SmallVec<[u16; 8]> {
-        self.builder.open_block_ids()
+    /// Id of the block still taking sources, if it has any.
+    pub(crate) fn open_block_id(&self) -> Option<u16> {
+        (self.builder.len() > 0).then(|| self.builder.peek().0)
     }
 
-    /// `id` names a block still taking sources.
-    pub(crate) fn has_open_block(&self, id: u16) -> bool {
-        self.builder.has_open_block(id)
-    }
-
-    /// Blocks closed since the last call, oldest first; the blocks of one
-    /// group are adjacent and share `ClosedBlock::group`.
+    /// Blocks closed since the last call, oldest first.
     pub(crate) fn take_closed(&mut self) -> SmallVec<[ClosedBlock; 1]> {
         std::mem::take(&mut self.closed)
     }
@@ -1009,586 +997,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    // ---- m interleaved blocks (R6-e2 S2) ----
-
-    use super::super::frozen_s1::OldPacker;
-
-    fn params_m(k_max: u8, t_ms: u8, r: u8, m: u8) -> Option<FecBlockParams> {
-        Some(FecBlockParams { k_max, t_ms, r, m })
-    }
-
-    fn group_packer(k_max: u8, t_ms: u8, r: u8, m: u8) -> Packer {
-        let mut p = Packer::new();
-        p.set_blocks(params_m(k_max, t_ms, r, m));
-        p
-    }
-
-    /// Pushes `n` one-per-bundle sources and returns the sealed bundles.
-    fn push_sources(p: &mut Packer, n: usize, now_us: u64) -> Vec<SealedBundle> {
-        let mut out = Vec::new();
-        for i in 0..n {
-            out.extend(p.push(&rec(60, i as u8), pmeta(i as u32), ONE_PER_BUNDLE, now_us));
-            out.extend(p.flush(now_us));
-        }
-        out
-    }
-
-    // -- m = 1 is the old packer, byte for byte --
-
-    #[derive(Debug, Clone)]
-    enum Op {
-        Push { n: usize, flavour: u8 },
-        Flush,
-        FlushClosing,
-        CloseIfDue,
-        CloseNow,
-        CloseForMtu(usize),
-        Advance(u64),
-    }
-
-    /// What the two implementations are compared on.
-    type BundleView = (u32, Vec<u8>, u64, BundleKind, Option<(u16, u8)>, Vec<u32>);
-
-    fn view(b: &SealedBundle) -> BundleView {
-        (
-            b.bundle_seq,
-            b.bytes.clone(),
-            b.emit_us,
-            b.kind,
-            b.block,
-            b.records.iter().map(|r| r.wire_seq).collect(),
-        )
-    }
-
-    #[derive(Debug, Default)]
-    struct Tally {
-        sources: usize,
-        lasts: usize,
-        closed_blocks: usize,
-        closed_by_t: usize,
-        closed_by_mtu: usize,
-        closed_by_now: usize,
-        plain: usize,
-    }
-
-    fn tile_meta(ws: u32) -> RecordMeta {
-        RecordMeta {
-            content: Content::Tile(EmitKey::new(1, 1, 2, ws as u8)),
-            ..pmeta(ws)
-        }
-    }
-
-    /// Runs `ops` on the new packer (`m = 1`) and on the frozen one, and
-    /// asserts every output equal after every op.
-    fn assert_matches_frozen(k_max: u8, t_ms: u8, r: u8, max_dg: usize, ops: &[Op]) -> Tally {
-        let mut new = group_packer(k_max, t_ms, r, 1);
-        let mut old = OldPacker::new();
-        old.set_blocks(params(k_max, t_ms, r));
-        let limit = Packer::record_limit(max_dg);
-        let mut t = Tally::default();
-        let mut now = 1_000u64;
-        for (step, op) in ops.iter().enumerate() {
-            let (a, b): (Vec<SealedBundle>, Vec<SealedBundle>) = match op {
-                Op::Push { n, flavour } => {
-                    let meta_for = |i: u32| match flavour % 5 {
-                        0 => meta(i, u64::from(i), false),
-                        1 => pmeta(i),
-                        2 => tile_meta(i),
-                        3 => RecordMeta {
-                            is_probe: true,
-                            ..pmeta(i)
-                        },
-                        _ => meta(i, u64::from(i), true),
-                    };
-                    let n = n % (limit + 1);
-                    let ws = step as u32;
-                    let r = rec(n, step as u8);
-                    (
-                        new.push(&r, meta_for(ws), max_dg, now)
-                            .into_iter()
-                            .collect(),
-                        old.push(&r, meta_for(ws), max_dg, now)
-                            .into_iter()
-                            .collect(),
-                    )
-                }
-                Op::Flush => (
-                    new.flush(now).into_iter().collect(),
-                    old.flush(now).into_iter().collect(),
-                ),
-                Op::FlushClosing => (
-                    new.flush_closing(now).into_iter().collect(),
-                    old.flush_closing(now).into_iter().collect(),
-                ),
-                Op::CloseIfDue => {
-                    let (x, y) = (new.close_if_due(now), old.close_if_due(now));
-                    assert_eq!(x, y, "step {step}: close_if_due");
-                    t.closed_by_t += usize::from(x);
-                    (vec![], vec![])
-                }
-                Op::CloseNow => {
-                    let (x, y) = (new.close_now(), old.close_now());
-                    assert_eq!(x, y, "step {step}: close_now");
-                    t.closed_by_now += usize::from(x);
-                    (vec![], vec![])
-                }
-                Op::CloseForMtu(d) => {
-                    let (x, y) = (new.close_for_mtu(*d), old.close_for_mtu(*d));
-                    assert_eq!(x, y, "step {step}: close_for_mtu");
-                    t.closed_by_mtu += usize::from(x);
-                    (vec![], vec![])
-                }
-                Op::Advance(us) => {
-                    now += us;
-                    (vec![], vec![])
-                }
-            };
-            assert_eq!(
-                a.iter().map(view).collect::<Vec<_>>(),
-                b.iter().map(view).collect::<Vec<_>>(),
-                "step {step}: {op:?}"
-            );
-            for x in &a {
-                t.sources += usize::from(x.kind == BundleKind::Source);
-                t.plain += usize::from(x.kind == BundleKind::Plain);
-                if x.kind == BundleKind::Source {
-                    t.lasts += usize::from(src_of(x).0);
-                }
-            }
-            let (ca, cb) = (new.take_closed(), old.take_closed());
-            assert_eq!(ca.len(), cb.len(), "step {step}: closed blocks");
-            for (x, y) in ca.iter().zip(cb.iter()) {
-                assert_eq!(
-                    (
-                        x.block_id,
-                        x.k,
-                        &x.symbols,
-                        &x.bundle_seqs,
-                        &x.kinds,
-                        x.first_sealed_at_us,
-                        x.t_adv
-                    ),
-                    (
-                        y.block_id,
-                        y.k,
-                        &y.symbols,
-                        &y.bundle_seqs,
-                        &y.kinds,
-                        y.first_sealed_at_us,
-                        y.t_adv
-                    ),
-                    "step {step}"
-                );
-                assert_eq!(x.group_m, 1);
-            }
-            t.closed_blocks += ca.len();
-            assert_eq!(new.t_close_at_us(), old.t_close_at_us(), "step {step}");
-            assert_eq!(
-                new.open_block_ids().first().copied(),
-                old.open_block_id(),
-                "step {step}"
-            );
-        }
-        t
-    }
-
-    fn op_from(x: u64) -> Op {
-        match x % 16 {
-            0..=7 => Op::Push {
-                n: (x >> 8) as usize,
-                flavour: (x >> 40) as u8,
-            },
-            8 | 9 => Op::Flush,
-            10 => Op::FlushClosing,
-            11 => Op::CloseIfDue,
-            12 => Op::CloseNow,
-            13 => Op::CloseForMtu(40 + (x >> 8) as usize % 200),
-            _ => Op::Advance((x >> 8) % 4_000),
-        }
-    }
-
-    fn xorshift(state: &mut u64) -> u64 {
-        *state ^= *state << 13;
-        *state ^= *state >> 7;
-        *state ^= *state << 17;
-        *state
-    }
-
-    /// A fixed set of long random streams: the identity is only worth something
-    /// if the streams reach every close, so this asserts they did.
-    #[test]
-    fn at_m_1_the_packer_equals_the_frozen_single_block_packer_and_the_streams_reach_every_close() {
-        let mut total = Tally::default();
-        for seed in 1..=24u64 {
-            let mut st = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-            let k_max = 1 + (xorshift(&mut st) % 11) as u8;
-            let t_ms = [5u8, 10, 20][(xorshift(&mut st) % 3) as usize];
-            let r = 1 + (xorshift(&mut st) % 3) as u8;
-            let max_dg = 60 + (xorshift(&mut st) % 400) as usize;
-            let ops: Vec<Op> = (0..1500).map(|_| op_from(xorshift(&mut st))).collect();
-            let t = assert_matches_frozen(k_max, t_ms, r, max_dg, &ops);
-            total.sources += t.sources;
-            total.lasts += t.lasts;
-            total.closed_blocks += t.closed_blocks;
-            total.closed_by_t += t.closed_by_t;
-            total.closed_by_mtu += t.closed_by_mtu;
-            total.closed_by_now += t.closed_by_now;
-            total.plain += t.plain;
-        }
-        // The measurement is non-zero: every path the identity claims was run.
-        assert!(total.sources > 1_000, "{total:?}");
-        assert!(total.lasts > 100, "{total:?}");
-        assert!(total.closed_blocks > 100, "{total:?}");
-        assert!(total.closed_by_t > 0, "{total:?}");
-        assert!(total.closed_by_mtu > 0, "{total:?}");
-        assert!(total.closed_by_now > 0, "{total:?}");
-        assert!(total.plain > 100, "{total:?}");
-    }
-
-    proptest! {
-        #[test]
-        fn at_m_1_the_packer_equals_the_frozen_one_for_any_stream(
-            k_max in 1u8..12,
-            t_ms in prop_oneof![Just(5u8), Just(10), Just(20)],
-            r in 1u8..4,
-            max_dg in 60usize..500,
-            raw in proptest::collection::vec(any::<u64>(), 1..200),
-        ) {
-            let ops: Vec<Op> = raw.into_iter().map(op_from).collect();
-            assert_matches_frozen(k_max, t_ms, r, max_dg, &ops);
-        }
-    }
-
-    // -- m > 1 --
-
-    proptest! {
-        /// Bundle `i` of a group goes to block `first + (i mod m)` at index `i / m`.
-        #[test]
-        fn source_i_goes_to_block_i_mod_m(m in 1u8..=8, n in 1usize..120, first in any::<u16>()) {
-            let mut p = group_packer(200, 20, 2, m);
-            p.builder.set_next_id_for_test(first);
-            let sealed = push_sources(&mut p, n, 1);
-            prop_assert_eq!(sealed.len(), n);
-            for (i, b) in sealed.iter().enumerate() {
-                let (_, id, idx, _, _) = src_of(b);
-                let blocks_used = usize::from(m).min(n);
-                prop_assert_eq!(id, first.wrapping_add((i % usize::from(m)) as u16), "bundle {}", i);
-                prop_assert_eq!(usize::from(idx), i / usize::from(m));
-                prop_assert!(i % usize::from(m) < blocks_used);
-            }
-            // peek names the next source's slot, before it is added.
-            let (id, idx) = p.builder.peek();
-            prop_assert_eq!(id, first.wrapping_add((n % usize::from(m)) as u16));
-            prop_assert_eq!(usize::from(idx), n / usize::from(m));
-            p.close_now();
-            let closed = p.take_closed();
-            prop_assert_eq!(closed.len(), usize::from(m).min(n));
-            // Ids are consecutive from the shared counter and the next group continues it.
-            let ids: Vec<u16> = closed.iter().map(|c| c.block_id).collect();
-            let want: Vec<u16> = (0..closed.len()).map(|j| first.wrapping_add(j as u16)).collect();
-            prop_assert_eq!(ids, want);
-            let after = push_sources(&mut p, 1, 2);
-            prop_assert_eq!(src_of(&after[0]).1, first.wrapping_add(closed.len() as u16));
-        }
-    }
-
-    #[test]
-    fn every_block_of_a_group_holds_k_plus_r_within_255_and_they_close_together_on_k_max() {
-        let (r, m) = (2u8, 3u8);
-        let k_max = 255 - r;
-        let mut p = group_packer(k_max, 20, r, m);
-        let mut sealed = Vec::new();
-        for i in 0..(3 * usize::from(k_max)) {
-            sealed.extend(p.push(&rec(10, 1), pmeta(i as u32), 200, 1));
-            sealed.extend(p.flush(1));
-        }
-        let closed = p.take_closed();
-        assert_eq!(closed.len(), 3, "premise: one full group");
-        assert!(closed.iter().all(|c| c.group == closed[0].group));
-        let ks: Vec<u8> = closed.iter().map(|c| c.k).collect();
-        assert_eq!(
-            ks,
-            vec![k_max, k_max - 1, k_max - 1],
-            "block 0 filled first"
-        );
-        for c in &closed {
-            assert!(u16::from(c.k) + u16::from(r) <= 255, "{c:?}");
-        }
-        // LAST only on the source that closed the group (block 0's last).
-        let lasts: Vec<(u16, u8)> = sealed
-            .iter()
-            .map(src_of)
-            .filter(|g| g.0)
-            .map(|g| (g.1, g.2))
-            .collect();
-        assert_eq!(lasts, vec![(closed[0].block_id, k_max - 1)]);
-    }
-
-    /// The group's blocks as the packer closed them, and every sealed source.
-    fn closed_group(
-        k_max: u8,
-        r: u8,
-        m: u8,
-        n: usize,
-        close: impl FnOnce(&mut Packer, &mut Vec<SealedBundle>),
-    ) -> (Vec<ClosedBlock>, Vec<SealedBundle>) {
-        let mut p = group_packer(k_max, 20, r, m);
-        let mut sealed = Vec::new();
-        for i in 0..n {
-            sealed.extend(p.push(&rec(60, i as u8), pmeta(i as u32), ONE_PER_BUNDLE, 5_000));
-            sealed.extend(p.flush(5_000));
-        }
-        assert!(
-            p.take_closed().is_empty(),
-            "premise: nothing closed before the cause"
-        );
-        close(&mut p, &mut sealed);
-        (p.take_closed().into_iter().collect(), sealed)
-    }
-
-    fn assert_one_group_of(closed: &[ClosedBlock], m: usize, n: usize) {
-        assert_eq!(
-            closed.len(),
-            m,
-            "every block of the group closed: {closed:?}"
-        );
-        assert!(closed.iter().all(|c| c.group == closed[0].group));
-        assert!(closed.iter().all(|c| usize::from(c.group_m) == m));
-        assert_eq!(closed.iter().map(|c| usize::from(c.k)).sum::<usize>(), n);
-        let t_advs: Vec<u8> = closed.iter().map(|c| c.t_adv).collect();
-        assert!(t_advs.iter().all(|t| *t == t_advs[0]), "one t_adv code");
-        let firsts: Vec<u64> = closed.iter().map(|c| c.first_sealed_at_us).collect();
-        assert!(
-            firsts.iter().all(|t| *t == 5_000),
-            "T from the group's first"
-        );
-    }
-
-    #[test]
-    fn the_group_closes_together_whatever_closes_it() {
-        let (m, n) = (4u8, 10usize);
-        // k_max: block 0 reaches 3 at source 8.
-        let (c, sealed) = closed_group(3, 2, m, 8, |p, s| {
-            s.extend(p.push(&rec(60, 9), pmeta(8), ONE_PER_BUNDLE, 5_000));
-            s.extend(p.flush(5_000));
-        });
-        assert_one_group_of(&c, 4, 9);
-        assert_eq!(sealed.iter().map(src_of).filter(|g| g.0).count(), 1);
-        // T, counted from the group's first source, not each block's.
-        let (c, _) = closed_group(50, 2, m, n, |p, _| {
-            assert!(!p.close_if_due(5_000 + 19_999));
-            assert!(p.close_if_due(5_000 + 20_000));
-        });
-        assert_one_group_of(&c, 4, n);
-        // Empty: only the final bundle is LAST.
-        let (c, sealed) = closed_group(50, 2, m, n, |p, s| {
-            s.extend(p.push(&rec(60, 77), pmeta(99), ONE_PER_BUNDLE, 5_000));
-            s.extend(p.flush_closing(5_000));
-        });
-        assert_one_group_of(&c, 4, n + 1);
-        let lasts: Vec<_> = sealed.iter().map(src_of).filter(|g| g.0).collect();
-        assert_eq!(lasts.len(), 1, "LAST on the closing source only");
-        assert_eq!(lasts[0].3, sealed.last().unwrap().bundle_seq);
-        // A block the packer holds with no bundle left open: Empty without LAST.
-        let (c, _) = closed_group(50, 2, m, n, |p, _| {
-            assert!(p.flush_closing(5_000).is_none());
-            assert!(p.close_now());
-        });
-        assert_one_group_of(&c, 4, n);
-        // MTU: only block 2 holds a long symbol; the whole group closes.
-        let mut p = group_packer(50, 20, 2, m);
-        for i in 0..6usize {
-            let n = if i == 2 { 90 } else { 10 };
-            p.push(&rec(n, i as u8), pmeta(i as u32), 200, 5_000);
-            p.flush(5_000);
-        }
-        let sym = 6 + 2 + 90;
-        assert!(!p.close_for_mtu(sym + FEC_REPAIR_HEADER_LEN));
-        assert!(p.close_for_mtu(sym + FEC_REPAIR_HEADER_LEN - 1));
-        let c: Vec<_> = p.take_closed().into_iter().collect();
-        assert_one_group_of(&c, 4, 6);
-        assert!(!p.close_for_mtu(10), "nothing is open any more");
-        // A hand-off or decline closes the group too (the bridge calls close_now).
-        let (c, _) = closed_group(50, 2, m, n, |p, _| {
-            assert!(p.close_now());
-            assert!(!p.close_now());
-        });
-        assert_one_group_of(&c, 4, n);
-    }
-
-    #[test]
-    fn a_group_that_closes_before_every_block_has_a_source_closes_only_the_blocks_it_has() {
-        let (c, _) = closed_group(50, 2, 4, 2, |p, _| assert!(p.close_now()));
-        assert_eq!(c.len(), 2, "no empty block is made up");
-        assert!(c.iter().all(|c| c.k == 1 && c.group_m == 4));
-    }
-
-    #[test]
-    fn the_blocks_of_a_group_carry_one_span_and_each_open_blocks_ids_are_visible() {
-        let mut p = group_packer(50, 5, 2, 3);
-        let sealed = push_sources(&mut p, 5, 1_000);
-        let adv: Vec<u8> = sealed.iter().map(t_adv_of).collect();
-        assert!(
-            adv.iter().all(|a| *a == 2),
-            "t_ms 5 advertises code 2: {adv:?}"
-        );
-        assert_eq!(p.open_block_ids().as_slice(), &[0, 1, 2]);
-        assert!(p.has_open_block(1) && !p.has_open_block(3));
-        assert_eq!(p.t_close_at_us(), Some(6_000), "T from the first source");
-        // A later block (opened by source 2 at t = 9 ms) does not restart T.
-        let mut p = group_packer(50, 5, 2, 3);
-        for (i, now) in [1_000u64, 3_000, 4_500].into_iter().enumerate() {
-            p.push(&rec(10, 1), pmeta(i as u32), 200, now);
-            p.flush(now);
-        }
-        assert!(p.close_if_due(6_000), "the group's T, not block 2's");
-    }
-
-    #[test]
-    fn every_sealed_source_of_a_group_parses_and_is_what_its_block_stored() {
-        let mut p = group_packer(6, 20, 2, 3);
-        let mut sealed = Vec::new();
-        for i in 0..29u32 {
-            sealed.extend(p.push(&rec(60 + (13 * i as usize) % 30, i as u8), pmeta(i), 120, 9));
-        }
-        sealed.extend(p.flush_closing(9));
-        let closed = p.take_closed();
-        assert!(closed.len() >= 6, "premise: at least two groups");
-        let mut seen = 0;
-        for b in &sealed {
-            let Frame::Source(s) = parse(&b.bytes).expect("parses") else {
-                panic!("not a source")
-            };
-            let blk = closed.iter().find(|c| c.block_id == s.block_id).unwrap();
-            assert_eq!(blk.symbols[s.idx as usize], s.coded_symbol());
-            assert_eq!(blk.bundle_seqs[s.idx as usize], s.bundle_seq);
-            seen += 1;
-        }
-        assert!(seen > 20);
-    }
-
-    /// Each block of a group decodes on its own through the protocol codec
-    /// after losing exactly `r_b` symbols; a flipped repair byte breaks it.
-    #[test]
-    fn each_block_of_a_group_round_trips_through_the_protocol_codec_alone() {
-        let (m, r_b) = (3u8, 3u8);
-        let mut p = group_packer(40, 20, r_b * m, m);
-        let mut sealed = Vec::new();
-        for i in 0..36u32 {
-            let n = 20 + 5 * (i as usize % 7);
-            sealed.extend(p.push(&rec(n, i as u8), pmeta(2 * i), 200, 1));
-            sealed.extend(p.push(&rec(9, 90 + i as u8), pmeta(2 * i + 1), 200, 1));
-        }
-        sealed.extend(p.flush_closing(1));
-        let closed: Vec<ClosedBlock> = p.take_closed().into_iter().collect();
-        assert!(closed.len() >= 3, "premise: a group of 3 blocks");
-        let mut decoded = 0usize;
-        for blk in &closed {
-            let want = block_records(&sealed, blk.block_id);
-            assert_eq!(want.len(), usize::from(blk.k));
-            let k = usize::from(blk.k);
-            let drops: Vec<usize> = (0..usize::from(r_b))
-                .map(|d| d * (k / usize::from(r_b)))
-                .collect();
-            assert_eq!(drops.len(), usize::from(r_b), "exactly r_b symbols lost");
-            let rows: Vec<u8> = (0..r_b).collect();
-            let got = recovered_records(blk, &rows, &drops, false);
-            assert_eq!(got.len(), drops.len());
-            for (j, recs) in &got {
-                assert_eq!(recs, &want[*j], "block {} source {j}", blk.block_id);
-                decoded += 1;
-            }
-            let bad = recovered_records(blk, &rows, &drops, true);
-            assert!(
-                bad.iter().any(|(j, recs)| recs != &want[*j]),
-                "a corrupted repair must not recover block {}",
-                blk.block_id
-            );
-        }
-        assert!(decoded >= 9, "the measurement is non-zero: {decoded}");
-    }
-
-    // -- the burst control --
-
-    /// Builds one group of `m` blocks over `n` sources (`n` divisible by `m`)
-    /// and loses `len` consecutive source datagrams starting at `at`; true
-    /// when every block recovers through the protocol codec with `r_b` rows.
-    fn survives_burst(contiguous: bool, m: u8, n: usize, r_b: u8, at: usize, len: usize) -> bool {
-        let mut p = group_packer(255 - r_b, 20, r_b * m, m);
-        if contiguous {
-            p.builder
-                .set_contiguous_run_for_test(Some(n / usize::from(m)));
-        }
-        let mut sealed = push_sources(&mut p, n, 1);
-        sealed.extend(p.flush_closing(1));
-        p.close_now();
-        let closed: Vec<ClosedBlock> = p.take_closed().into_iter().collect();
-        assert_eq!(closed.len(), usize::from(m), "premise: m blocks");
-        assert!(closed
-            .iter()
-            .all(|c| usize::from(c.k) == n / usize::from(m)));
-        let lost: std::collections::BTreeSet<u32> =
-            sealed[at..at + len].iter().map(|b| b.bundle_seq).collect();
-        let mut recovered_all = true;
-        for blk in &closed {
-            let drops: Vec<usize> = blk
-                .bundle_seqs
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| lost.contains(s))
-                .map(|(j, _)| j)
-                .collect();
-            if drops.is_empty() {
-                continue;
-            }
-            if drops.len() > usize::from(r_b) {
-                recovered_all = false;
-                continue;
-            }
-            let rows: Vec<u8> = (0..drops.len() as u8).collect();
-            let want = block_records(&sealed, blk.block_id);
-            let got = recovered_records(blk, &rows, &drops, false);
-            recovered_all &= got.len() == drops.len() && got.iter().all(|(j, r)| r == &want[*j]);
-        }
-        recovered_all
-    }
-
-    #[test]
-    fn a_burst_of_up_to_m_times_r_b_datagrams_is_recovered_by_the_interleave() {
-        let (m, n, r_b) = (4u8, 64usize, 2u8);
-        let max_l = usize::from(m) * usize::from(r_b);
-        let mut tried = 0;
-        for len in 1..=max_l {
-            for at in 0..=(n - len) {
-                assert!(
-                    survives_burst(false, m, n, r_b, at, len),
-                    "interleaved lost a burst of {len} at {at}"
-                );
-                tried += 1;
-            }
-        }
-        assert!(tried > 400, "the measurement is non-zero: {tried}");
-    }
-
-    #[test]
-    fn the_contiguous_control_fails_the_same_burst() {
-        let (m, n, r_b) = (4u8, 64usize, 2u8);
-        let max_l = usize::from(m) * usize::from(r_b);
-        // The control is a packer that can lose: a burst of m x r_b inside one
-        // block (16 sources) is more than r_b symbols of it.
-        assert!(!survives_burst(true, m, n, r_b, 4, max_l));
-        // And over every offset it fails wherever the burst sits inside a block.
-        let failed = (0..=(n - max_l))
-            .filter(|at| !survives_burst(true, m, n, r_b, *at, max_l))
-            .count();
-        assert!(
-            failed > 30,
-            "contiguous failed {failed} of {} offsets",
-            n - max_l + 1
-        );
-        // The same offsets under the interleave: none.
-        assert!((0..=(n - max_l)).all(|at| survives_burst(false, m, n, r_b, at, max_l)));
     }
 }
