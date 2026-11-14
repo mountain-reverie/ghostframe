@@ -17,9 +17,7 @@
 
 use ghostframe_protocol::fec::feedback::LossReport;
 
-use super::adapt_size::{
-    split_block_burst, DeclinedTrim, Ladder, Notch, RSizer, FEC_SPLIT_R_TARGET,
-};
+use super::adapt_size::{DeclinedTrim, Ladder, Notch, RSizer};
 use super::block_table::CloseReason;
 use crate::config::FecBlockParams;
 use crate::transport::io_bridge::FecAdaptProbe;
@@ -287,8 +285,6 @@ pub(crate) struct FecAdapt {
     sizer: RSizer,
     trim: DeclinedTrim,
     was_engaged: bool,
-    /// Groups of `m >= 2` interleaved blocks the bridge closed (`note_group`).
-    split_groups: u64,
     /// Blocks sized by `r_for_block`, and how many of them at the cap.
     blocks_sized: u64,
     saturated: u64,
@@ -299,24 +295,18 @@ pub(crate) struct FecAdapt {
 
 impl FecAdapt {
     pub(crate) fn new() -> Self {
-        Self::with_split(true)
+        Self::with_frame_notch(true)
     }
 
-    /// `split = false` never enters the split notch: the control arm of the
-    /// split scenes (a test switch, not a configuration).
-    pub(crate) fn with_split(split: bool) -> Self {
-        Self::with_split_mode(split, false)
-    }
-
-    /// `force_m1`: enter the split notch but never interleave (a test control).
-    pub(crate) fn with_split_mode(split: bool, force_m1: bool) -> Self {
+    /// `frame = false` never enters the frame notch: the control arm of the
+    /// frame-notch scenes (a test switch, not a configuration).
+    pub(crate) fn with_frame_notch(frame: bool) -> Self {
         Self {
             est: LossEstimator::new(),
-            ladder: Ladder::with_split_mode(split, force_m1),
+            ladder: Ladder::with_frame_notch(frame),
             sizer: RSizer::new(),
             trim: DeclinedTrim::new(),
             was_engaged: false,
-            split_groups: 0,
             blocks_sized: 0,
             saturated: 0,
             changes: 0,
@@ -376,29 +366,14 @@ impl FecAdapt {
             k_max: span.k_max,
             t_ms: span.t_ms,
             r: 1,
-            m: span.m,
+            m: 1,
         })
     }
 
-    /// A group of `m` interleaved blocks closed (counted once per group).
-    pub(crate) fn note_group(&mut self, m: u8) {
-        self.split_groups += u64::from(m >= 2);
-    }
-
-    /// `r` for a block that closed with `k` sources in a group of `group_m`
-    /// interleaved blocks. In the split notch (or a group that was built under
-    /// it) the rule is `r_for(k_b, p_hat, max(1, b_hat / m))` at
-    /// [`FEC_SPLIT_R_TARGET`]; otherwise `r_for(k, p_hat, b_hat)` at the
-    /// default target, as before the split existed.
-    pub(crate) fn r_for_block(&mut self, k: u32, group_m: u8, now_us: u64) -> u8 {
+    /// `r` for a block that closed with `k` sources.
+    pub(crate) fn r_for_block(&mut self, k: u32, now_us: u64) -> u8 {
         let (p, b, trim) = (self.est.p_hat(), self.est.b_hat(), self.trim.trim());
-        let d = if self.ladder.notch() == Notch::Split || group_m > 1 {
-            let b = split_block_burst(b, group_m);
-            self.sizer
-                .r_for_paced_at(k, p, b, trim, now_us, FEC_SPLIT_R_TARGET)
-        } else {
-            self.sizer.r_for_paced(k, p, b, trim, now_us)
-        };
+        let d = self.sizer.r_for_paced(k, p, b, trim, now_us);
         self.blocks_sized += 1;
         self.saturated += u64::from(d.saturated);
         d.r
@@ -443,11 +418,9 @@ impl FecAdapt {
             b_hat_x100: (b * 100.0).round() as u64,
             k_max: self.last_applied.map_or(0, |a| a.k_max),
             t_ms: self.last_applied.map_or(0, |a| a.t_ms),
-            m: self.last_applied.map_or(0, |a| a.m),
-            split: self.ladder.notch() == Notch::Split,
+            frame: self.ladder.notch() == Notch::Frame,
             notch_changes: self.ladder.notch_changes(),
-            split_entries: self.ladder.split_entries(),
-            split_groups: self.split_groups,
+            frame_entries: self.ladder.frame_entries(),
             r_at_k8: r_at(8),
             r_at_k64: r_at(64),
             changes: self.changes,
@@ -815,7 +788,7 @@ mod tests {
         let live = a.live_params(10_000_000, 1200, 30, 5_000_000);
         a.note_applied(live);
         a.note_applied(live);
-        assert_eq!(a.r_for_block(64, 1, 5_000_000), 16, "the 25 % overhead cap");
+        assert_eq!(a.r_for_block(64, 5_000_000), 16, "the 25 % overhead cap");
         let p = a.probe();
         assert!(p.engaged && p.p_hat_ppm > 0 && p.b_hat_x100 > 150);
         assert_eq!((p.blocks_sized, p.saturated, p.changes), (1, 1, 1));

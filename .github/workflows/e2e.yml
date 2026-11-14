@@ -143,9 +143,9 @@ jobs:
       - run: cargo test --test browserless_fec_blocks -- --test-threads=1
       - run: cargo test --test browserless_fec_adapt -- --test-threads=1
       - run: cargo test --test browserless_fec_rate -- --test-threads=1
-      # The interleaved split (R6-e2 S3): one 150 Mbit/s cell and the one-block
+      # The frame notch (R6-e2 S3): one 150 Mbit/s cell and the one-block
       # equivalence run here; the grid is behind GHOSTFRAME_FEC_SWEEP=full.
-      - run: cargo test --test browserless_fec_split -- --test-threads=1
+      - run: cargo test --test browserless_fec_frame_notch -- --test-threads=1
       # H.264 in the transport (design PR A3): ledger accounting, lost-IDR
       # repair, acknowledgement stalls, frame skip. A scripted encoder over the
       # real bridge and client; named here because nothing else lists it.
