@@ -7,12 +7,11 @@ GPU decode and dmabuf export for the native client.
 | Target | Needs a GPU | Runs in CI |
 |---|---|---|
 | `--lib` | no | yes |
-| `--test coalesce` | no | yes |
-| `--test dirty` | no | yes |
 | `--test cdf53_passes` | no | yes |
 | `--test gpu_export` | yes | no |
 | `--test gpu_pipelines` | yes | no |
 | `--test gpu_oracle` | yes | no |
+| `--test tile_renderer` | yes | no |
 
 The native-client end-to-end targets live in `ghostframe-e2e` and are also
 absent from CI:
@@ -23,6 +22,9 @@ absent from CI:
 | `ghostframe-e2e --test showcase` | Docker + GPU + Weston | no |
 | `ghostframe-e2e --test h264` | Docker + GPU + VA-API + VKMS | no |
 | `ghostframe-e2e --test native_client -- --ignored native_client_converges_at_production_scale_under_loss` | Docker + GPU + VKMS | no |
+
+`coalesce` and `dirty` moved to `ghostframe-render` with the code they test; its
+`--lib` tests run on wgpu's no-op backend and need no GPU.
 
 Run everything locally with `cargo test -p ghostframe-client-gpu`.
 

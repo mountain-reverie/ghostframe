@@ -31,7 +31,8 @@ Clients:
 | `ghostframe-web-ui` | The browser client's DOM UI (the stats panel), in Leptos. The only crate that depends on Leptos; linked into `ghostframe-client-wasm`. `just test-web-ui` runs its tests, including one in headless Chrome. |
 | `ghostframe-client-core` | Decode-side tile engine, shared by every client. Consumes the wire format. |
 | `ghostframe-client-net` | Client QUIC/WebTransport stack. |
-| `ghostframe-client-gpu` | Vulkan/wgpu decode, composite and dmabuf export for the native client. |
+| `ghostframe-render` | The portable tile renderer: framebuffer, Solid / PalRLE / RGBA / CDF 5/3 pipelines, paint order, damage. Builds for the host and for `wasm32-unknown-unknown`; `just check-render-wasm` guards the second. |
+| `ghostframe-client-gpu` | The native client's renderer: a `ghostframe-render` `TileRenderer` plus the dmabuf export ring, upload slabs and H.264 decode. |
 | `ghostframe-client-h264` | FFmpeg-backed H.264 decode for the native client. |
 | `ghostframe-client-native` | The native client's engine: net thread, render thread, input. No windowing. |
 | `ghostframe-cli` | The `ghostframe` binary: CLI, X11/Wayland window, prefix chord. |

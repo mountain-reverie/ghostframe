@@ -15,8 +15,10 @@ jobs:
       # lightweight workflow does not install. Its tests run in e2e.yml's
       # browserless job, which does install them. The wasm build below still
       # covers it, and does not build dev-dependencies.
-      - run: cargo test -p ghostframe-protocol -p ghostframe-client-core -p ghostframe-web-ui
-      - run: cargo build -p ghostframe-protocol -p ghostframe-client-core -p ghostframe-client-net -p ghostframe-client-wasm -p ghostframe-web-ui --target wasm32-unknown-unknown
+      # ghostframe-render: lib tests on wgpu's no-op backend, plus its coalesce
+      # and dirty targets (moved from ghostframe-client-gpu). No GPU needed.
+      - run: cargo test -p ghostframe-protocol -p ghostframe-client-core -p ghostframe-render -p ghostframe-web-ui
+      - run: cargo build -p ghostframe-protocol -p ghostframe-client-core -p ghostframe-render -p ghostframe-client-net -p ghostframe-client-wasm -p ghostframe-web-ui --target wasm32-unknown-unknown
 
   wasm-module:
     runs-on: ubuntu-latest

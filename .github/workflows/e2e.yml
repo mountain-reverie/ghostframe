@@ -67,7 +67,7 @@ jobs:
       # every developer machine via `cargo test -p ghostframe-client-gpu`,
       # which is the point -- an #[ignore] would hide them locally too.
       #
-      # --lib matters here beyond coalesce/dirty/cdf53_passes: it is what
+      # --lib matters here beyond cdf53_passes: it is what
       # picks up two #[cfg(test)] modules declared in src/lib.rs.
       # shader_validation needs no GPU -- it walks shaders/client/*.wgsl and
       # runs naga parse+validate -- so it actually runs in this job on every
@@ -75,9 +75,9 @@ jobs:
       # at all (naga only sees a shader at create_shader_module time, which
       # a GPU-less runner never calls). nv12_oracle_tests needs a GPU and
       # self-skips here, same as the five named targets above. Do not
-      # narrow this to `--test coalesce --test dirty --test cdf53_passes`
+      # narrow this to `--test cdf53_passes`
       # alone -- that would silently drop shader_validation back out of CI.
-      - run: cargo test -p ghostframe-client-gpu --lib --test coalesce --test dirty --test cdf53_passes
+      - run: cargo test -p ghostframe-client-gpu --lib --test cdf53_passes
       - run: cargo test -p ghostframe-client-native
       - run: cargo test -p ghostframe-client-capi
       # ghostframe-cli's four integration targets (chord, geometry, cli,
