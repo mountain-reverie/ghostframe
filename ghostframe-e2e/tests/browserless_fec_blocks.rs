@@ -23,13 +23,12 @@ const EXTRA_SEEDS: [u64; 5] = [0xFB_0004, 0xFB_0005, 0xFB_0006, 0xFB_0007, 0xFB_
 const GRID: u32 = 16;
 
 fn knob(k_max: u8, t_ms: u8, r: u8) -> RunOptions {
+    knob_m(k_max, t_ms, r, 1)
+}
+
+fn knob_m(k_max: u8, t_ms: u8, r: u8, m: u8) -> RunOptions {
     RunOptions {
-        fec_blocks: Some(FecBlockParams {
-            k_max,
-            t_ms,
-            r,
-            m: 1,
-        }),
+        fec_blocks: Some(FecBlockParams { k_max, t_ms, r, m }),
         ..RunOptions::default()
     }
 }
@@ -304,6 +303,58 @@ async fn scene_7_declined_blocks_with_an_unknown_k_hand_off_every_unaccounted_so
             exact, n,
             "seed {seed:#x}: a tile never reached its exact pixels"
         );
+    }
+}
+
+/// Scene 8 (R6-e2 S2): the interleaved group, a fixed `m = 3` knob. The
+/// premises come first: groups closed, with more than one block each, and
+/// repairs sent for them. The frames then decode over a bursty link.
+#[tokio::test(start_paused = true)]
+async fn scene_8_a_fixed_group_of_three_interleaved_blocks_decodes_over_bursts() {
+    for seed in SEEDS {
+        let mut s2c = link(10_000, 0.0);
+        s2c.burst_enter = 0.02;
+        s2c.burst_exit = 1.0 / 3.0;
+        s2c.burst_loss = 1.0;
+        // r = 6 is the group's rows: two per block.
+        let (r, p, n) = run_tiles(seed, 12, s2c, None, knob_m(16, 5, 6, 3)).await;
+        tline("s8", seed, &r, p, n);
+        let i = &r.transport.instr;
+        let sp = &i.block_split;
+        println!(
+            "FECB s8 {seed:#x}: groups={} blocks={} k_sum={} rows_decided={} repairs_sent={} \
+             recovered_rx={}",
+            i.block_packed,
+            sp.blocks,
+            i.block_k_sum,
+            sp.rows_decided,
+            i.block_repairs_sent,
+            i.fec_recovered_rx
+        );
+        // Premises: groups closed, each of more than one block, with repairs.
+        assert!(i.block_packed > 0, "no group closed");
+        assert!(
+            sp.blocks > i.block_packed,
+            "blocks {} do not exceed groups {}: nothing was split",
+            sp.blocks,
+            i.block_packed
+        );
+        assert!(
+            sp.blocks <= 3 * i.block_packed,
+            "more than m blocks a group"
+        );
+        assert_eq!(sp.sum_k, i.block_k_sum, "every source is in a block");
+        assert!(i.block_repairs_sent > 0, "no repair was sent");
+        assert_eq!(
+            sp.rows_decided,
+            2 * sp.blocks,
+            "each block carries ceil(R/m) = 2 rows"
+        );
+        assert!(r.s2c_datagrams_dropped > 0, "premise: bursts dropped");
+        assert!(i.fec_recovered_rx > 0, "the client rebuilt nothing");
+        assert_eq!(p, n, "seed {seed:#x}: a tile was stranded");
+        assert_eq!(i.block_deferral_timeout, 0);
+        assert!(i.block_handoff_queued <= i.block_handoffs);
     }
 }
 

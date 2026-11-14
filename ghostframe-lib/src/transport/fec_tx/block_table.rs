@@ -1424,6 +1424,56 @@ mod tests {
         }
     }
 
+    /// R6-e2 S2: a group's blocks are all in `Sending` at once, their sources
+    /// dealt round-robin. The table keys everything by id, so a decline of one
+    /// leaves the others to close and repair as usual.
+    #[test]
+    fn interleaved_sources_hold_several_blocks_in_sending_and_a_decline_of_one_leaves_the_rest() {
+        let t0 = Instant::now();
+        let mut t = BlockTable::new();
+        let ids: [BlockId; 3] = [10, 11, 12];
+        for j in 0..9u32 {
+            let id = ids[(j % 3) as usize];
+            let acts = t.on_source_sealed(id, (j / 3) as u8, 100 + j, vec![(1000 + j, tile(j))]);
+            assert!(acts.is_empty());
+        }
+        assert_eq!(t.open_blocks(), 3, "three blocks held in Sending");
+        for id in ids {
+            assert!(t.is_open(id));
+            assert!(t.params(id).is_none(), "block {id} is still Sending");
+        }
+        // The client declines the middle block while the packer still holds it.
+        let a = t.on_declined(11, 0, &[], t0);
+        assert_eq!(handoffs(&a), 3, "its three sources, and only those");
+        assert_eq!(t.closed_reason(11), Some(CloseReason::Declined));
+        assert_eq!(t.closed_reason(10), None);
+        assert_eq!(t.closed_reason(12), None);
+        assert!(t.is_open(10) && t.is_open(12));
+        // The others close and keep their own rows.
+        for id in [12, 10] {
+            let acts = t.on_closed(
+                ClosedBlock {
+                    block_id: id,
+                    k: 3,
+                    r: 2,
+                    symbols: vec![vec![0u8; 10]; 3],
+                    repair_bundles: vec![200 + u32::from(id) * 2, 201 + u32::from(id) * 2],
+                    repairs_queued: 0,
+                    last_sent: t0,
+                    t_adv: 0,
+                },
+                t0,
+            );
+            assert!(acts.is_empty());
+        }
+        assert_eq!(t.params(10), Some((3, 2)));
+        assert_eq!(t.params(12), Some((3, 2)));
+        assert!(t.params(11).is_none());
+        // An arrival for block 12's source (bundle 102) does not touch block 10.
+        t.on_arrival(102, t0);
+        assert!(t.is_open(10) && t.is_open(12));
+    }
+
     #[test]
     fn acks_reaching_k_defer_then_all_accounted_closes_and_frees() {
         let t0 = Instant::now();
