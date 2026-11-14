@@ -1,0 +1,37 @@
+[package]
+name = "ghostframe-render"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# The portable tile renderer: the framebuffer, the Solid / PalRLE / RGBA /
+# CDF 5/3 pipelines, the paint-order ledger and the damage bookkeeping,
+# extracted from `ghostframe-client-gpu` so the native client and the web
+# client draw tiles with the same code.
+#
+# It builds for the host and for `wasm32-unknown-unknown`, and that is the
+# constraint every dependency here answers to. Nothing in it may need a
+# thread, a blocking wait, a dmabuf, EGL, ffmpeg or `std::time::Instant`:
+# time comes in as a parameter and the device is the caller's. `pollster`,
+# `libc`, `ash`, `khronos-egl` and `ghostframe-client-h264` are therefore
+# not dependencies, and a new one needs a reason that survives that rule.
+# `ci/check-licenses.py` also keeps this crate off `ghostframe-lib`.
+
+[dependencies]
+ghostframe-protocol = { path = "../ghostframe-protocol" }
+ghostframe-client-core = { path = "../ghostframe-client-core" }
+# No backend feature: the caller's crate picks one (`ghostframe-client-gpu`
+# selects vulkan or gles; the web client selects webgpu). The workspace entry
+# enables `wgsl` only.
+wgpu = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"
+serde_json = "1"
+# wgpu's no-op backend: a real `Device` that validates and records but runs
+# nothing, so `TileRenderer`'s bookkeeping is tested on a runner with no GPU.
+# Dev-only, so it never reaches a daemon or client build.
+wgpu = { workspace = true, features = ["noop"] }

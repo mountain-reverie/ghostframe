@@ -155,6 +155,9 @@ COPY ghostframe-client-net/src/ ghostframe-client-net/src/
 # members, so cargo refuses to resolve the manifest without them.
 COPY ghostframe-client-gpu/Cargo.toml ghostframe-client-gpu/Cargo.toml
 COPY ghostframe-client-gpu/src/ ghostframe-client-gpu/src/
+# ghostframe-client-gpu depends on it.
+COPY ghostframe-render/Cargo.toml ghostframe-render/Cargo.toml
+COPY ghostframe-render/src/ ghostframe-render/src/
 COPY ghostframe-client-native/Cargo.toml ghostframe-client-native/Cargo.toml
 COPY ghostframe-client-native/src/ ghostframe-client-native/src/
 COPY ghostframe-client-capi/Cargo.toml ghostframe-client-capi/Cargo.toml
