@@ -24,7 +24,12 @@ const GRID: u32 = 16;
 
 fn knob(k_max: u8, t_ms: u8, r: u8) -> RunOptions {
     RunOptions {
-        fec_blocks: Some(FecBlockParams { k_max, t_ms, r }),
+        fec_blocks: Some(FecBlockParams {
+            k_max,
+            t_ms,
+            r,
+            m: 1,
+        }),
         ..RunOptions::default()
     }
 }

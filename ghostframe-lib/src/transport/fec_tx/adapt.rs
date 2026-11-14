@@ -357,6 +357,7 @@ impl FecAdapt {
             k_max: span.k_max,
             t_ms: span.t_ms,
             r: 1,
+            m: 1,
         })
     }
 
