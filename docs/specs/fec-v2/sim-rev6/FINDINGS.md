@@ -650,6 +650,111 @@ The data picked candidate 1 (padding is the only large unplanned part). It was b
 - **H.264 is untouched by construction and by measurement**: the cap applies to all-tile blocks only; the adaptive wire digest of H264/iid5/10M and H264/ge3at1/10M is bit-identical with the cap on and off.
 - **Open, not diagnosed:** why the room the cap frees at 10 Mbit/s is not filled with source. The matched off arm of C0 delivered 7276 tiles/s against 6103 for the adaptive arm there; TB0 shows 0.10 of the 0.37 repair share is padding and TB1 removes most of it without moving delivery, so repair size is not what separates the two arms at 10 Mbit/s.
 
+## 12. S0 split gate: the entry rule and the per-block r rule (R6-e2 plan task S0)
+
+**Every number is a model estimate [E].** The scripts are `adapt_sim.py --part split2` (the arms and the grid), `adapt_summary.py --split2` (the tables below) and the output `split2_out.txt` (one line per cell and seed). The gate is `python3 -I adapt_sim.py --selftest` (also run by `selftest.py`). Nothing above this section changed: the new code is additive (`split2_*`, `plan_rf`, `main_split2`), and `adapt_sim_out.txt` and every other output are byte-identical.
+
+**Numbering.** Section 11 (the tile repair budget, TB0 / TB1) was appended on another branch and lives in the implementation branch until the merge; this section is numbered 12 so the two do not collide.
+
+### Method
+- **Cells.** 100 / 150 / 200 Mbit/s x GE 2 % with mean burst 3 / 5 / 8 x h264 and mix, **10 seeds** per cell (the plan asked for 5; the full grid took about 12 minutes, so 10 were run everywhere rather than widening only where the spread was wide), 300 frames (10 s of video) per seed. A seed re-draws demand, timeline and loss. One cell is about 0.33 point of late frames per late frame, so the spreads below are wide.
+- **Arms.**
+  - `T20k223`: one block, T 20 ms, k_max 223, r from the exact tail rule at the true (p, b), target 1e-3 (E1's single block, the current wide notch).
+  - `il_rho0.1 / 0.2 / 0.3`: section 6's `a_il`, `R = ceil(rho k)`, `r = ceil(R/m)`, interleaved.
+  - `il_rf`: the plan's per-block rule: `m = clamp(ceil(k (1 + 0.2) / 255), 1, 8)`, block `j` gets `r_for(k_j, p, max(1, b/m))` (true p, b: a perfect estimator, so the estimator's own error is not in these numbers), target 1e-3, interleaved.
+  - `il_rf_t1e-4` (not in the plan: added because `il_rf` fell short, below): the same rule at target 1e-4.
+  - `contig_rho0.2` and `contig_rf`: the same two rules with the contiguous assignment (the control).
+- **Mean frame size** (h264 cells, bundles of 1180 bytes): 240 / 360 / 479 at 100 / 150 / 200 Mbit/s (median 177 / 266 / 355); frames needing m = 1 (by the plan's `m` formula): 215 / 117 / 82 of 300, so the single-block case is common at 100 Mbit/s and rarer above it (m = 2 for 91 / 146 / 134 frames; the rest m 3-8).
+- **"Outside the spread"** is the rule E1 used: the difference of two means must exceed the larger of the two cells' seed ranges (max - min). It is strict (ranges of 10 seeds). A paired view is printed as well and called out as such: the same seed gives the same demand and loss seed in both arms (the packet counts differ by arm, so the pairing is approximate), so the difference per seed has a standard error of the mean, and "seeds where the arm is no later" counts of 10. The paired view is a supplement and does not replace the rule above.
+- **Cells inside the spread are named, not ranked.**
+
+### (i) Where the split beats the single block
+Late33 (%), mean over 10 seeds; d = single - arm, in points; "spread" the larger seed range.
+
+| Mbit/s | mix | burst | single | il_rho0.2 (d, spread) | il_rf (d, spread, paired) |
+|---|---|---|---|---|---|
+| 100 | h264 | 3 | 0.11 | 0.03 (+0.09, 0.29) | 0.77 (-0.66, 1.43; 1/10 seeds no later) |
+| 100 | h264 | 5 | 0.63 | 0.40 (+0.23, 1.14) | 0.57 (+0.06, 1.14; 6/10) |
+| 100 | h264 | 8 | 2.17 | 1.46 (+0.71, 3.14) | 0.89 (+1.29, 3.14; +1.29 +- 0.32, 10/10) |
+| 150 | h264 | 3 | 0.31 | 0.03 (+0.29, 0.86) | 1.17 (-0.86, 0.86; 0/10) |
+| 150 | h264 | 5 | 0.91 | 0.11 (+0.80, 1.43) | 1.09 (-0.17, 1.43; 5/10) |
+| 150 | h264 | 8 | 3.23 | 1.20 (+2.03, 2.57) | 1.31 (+1.91, 2.57; +1.91 +- 0.28, 10/10) |
+| 200 | h264 | 3 | 0.51 | 0.03 (+0.49, 1.14) | 1.40 (-0.89, 1.43; 0/10) |
+| 200 | h264 | 5 | 1.23 | 0.11 (+1.11, 1.43) | 1.03 (+0.20, 1.43; 6/10) |
+| **200** | **h264** | **8** | **4.23** | **0.26 (+3.97, 2.29) outside** | **1.09 (+3.14, 2.29) outside** |
+| 200 | mix | 8 | 2.94 | 0.71 (+2.23, 2.57) | 1.51 (+1.43, 2.57; +1.43 +- 0.30, 10/10) |
+
+(The full table with all 18 cells, both arms of the rule and the paired columns is `python3 -I adapt_summary.py --split2`.)
+
+- **The only cell outside the spread is 200 Mbit/s, h264, burst 8** (both `il_rho0.2` and `il_rf`; the single block's 4.23 against 0.26 and 1.09). E1's 3.5 points at the same cell at 5 seeds is 3.97 here.
+- **150 Mbit/s, burst 8** (the cell E1 did not measure): `il_rho0.2` is 2.03 better and `il_rf` 1.91 better than the single block, **inside the spread** (2.57) by the strict rule, outside it by the paired view (10 of 10 seeds, +2.03 +- 0.35 and +1.91 +- 0.28). Name it as inside the spread; the data says it is probably real and too small a gap to prove with 10 seeds of 10 s.
+- **At burst 3 the split does not help**, and with `il_rf` it is later than the single block: -0.66 / -0.86 / -0.89 point at 100 / 150 / 200 Mbit/s h264 (0 of 10 seeds no later at 150 and 200), inside the larger seed range but one-sided. At burst 5, `il_rf` and the single block are the same (-0.17 to +0.20, 5-6 of 10 seeds); `il_rho0.2` is better by 0.8 to 1.1 at 150 / 200 (10 of 10 seeds) at 5 points more overhead.
+- **At 100 Mbit/s: no gap** at any burst outside the spread (b8: +0.71 for `il_rho0.2`, +1.29 for `il_rf`, spread 3.14); the split is then a frame-spanning block at m = 1 for 215 of 300 frames, i.e. almost the same codec as the single block.
+- **Mix cells:** every difference is inside the spread (200 Mbit/s b8: +2.23 / +1.43, spread 2.57); b3 slightly in the single block's favour for `il_rf` (-1.09 at 200).
+- **What the sim fixes.** The gate can use `m_needed >= 2` as its rate condition: m = 1 is by construction the single block (no `m` to enter on), and above it the split's gap grows with the burst; the rate itself is not a separate axis in this data (the gap at b8 is +1.3 / +1.9 / +3.1 at 100 / 150 / 200 for `il_rf`, all with the same sign). The burst is the axis: no benefit at 3, none for `il_rf` at 5, a gain at 8.
+  - `FEC_SPLIT_MIN_M = 2`.
+  - `FEC_SPLIT_B_ENTER = 6.0`, `FEC_SPLIT_B_EXIT = 4.0`: between 5 (the last burst where `il_rf` equals the single block) and 8 (the first where it wins in every seed), with 2 of hysteresis. The sim did not measure 6 or 7, so the entry is a midpoint, not a measured crossing. Both are in units of the controller's `b_hat` (mean burst of the GE process the sim draws from; the estimator's bias against it is not in this data and is S3's to check).
+
+### (ii) Per-block `r_for(k_b, p, b/m)` against `R = ceil(rho k)/m`
+**It does not match `il_rho0.2`'s late frames, and it spends 3 to 14 points less overhead.** Paired difference `il_rf - il_rho0.2` in late33 (+ = `il_rf` later), mean +- s.e.m. over 10 seeds:
+
+| cell | late33 d | seeds `il_rf` later | overhead il_rf / il_rho0.2 |
+|---|---|---|---|
+| 150 h264 b3 | +1.14 +- 0.11 | 10/10 | 8.3 / 20.3 |
+| 150 h264 b5 | +0.97 +- 0.11 | 10/10 | 10.9 / 20.3 |
+| 150 h264 b8 | +0.11 +- 0.22 | 6/10 | 14.3 / 20.3 |
+| 200 h264 b3 | +1.37 +- 0.14 | 10/10 | 7.2 / 20.3 |
+| 200 h264 b5 | +0.91 +- 0.09 | 10/10 | 9.3 / 20.3 |
+| 200 h264 b8 | +0.83 +- 0.14 | 9/10 | 12.3 / 20.3 |
+| 200 mix b8 | +0.80 +- 0.28 | 8/10 | 11.1 / 20.5 |
+| 100 h264 b8 | -0.57 +- 0.24 | 2/10 | 17.2 / 20.3 |
+
+By the strict rule only **150 Mbit/s h264 b3** is outside the spread (+1.14 against 0.86); the other cells are 0.1 to 1.4 points against ranges of 0.9 to 2.3, inside it and not ranked. By the paired view `il_rf` is later in 8 of the 9 cells at 150-200 Mbit/s (6 to 10 of 10 seeds). Its residual source loss is 0.12-0.17 % against 0.00-0.09 %.
+- **The overhead is the whole difference.** `il_rho0.2` is a constant 20.3 %; `il_rf` follows (p, b): 7 to 17 %. On the overhead axis `il_rf` sits where `il_rho0.1` (10.3 %) is not: at 200 Mbit/s b8, `il_rho0.1` 2.80 at 10.3 % against `il_rf` 1.09 at 12.3 %.
+- **Tightening the target narrows it.** `il_rf_t1e-4`: `il_rf_t1e-4 - il_rho0.2` is +0.31 / +0.74 / +0.77 (100 / 150 / 200 h264 b3), +0.09 / +0.63 / +0.57 (b5), -0.43 / -0.06 / +0.97 (b8) at overhead 8.6-18.5 % against 20.3 %. At 150 Mbit/s b8 it is level (-0.06 +- 0.18) with 16.0 % against 20.3 %; at 200 b8 it is still +0.97 later (10/10 seeds) at 14.0 %.
+- **Which rule S3 uses.** The per-block rule `r_for(k_b, p_hat, max(1, b_hat / m))`, **with its target set to 1e-4 in the Split notch** (a named constant S3 adds, `FEC_SPLIT_R_TARGET`), not `ceil(rho k)/m`: the controller has no fixed `rho`, and `il_rf_t1e-4` is the only rule here that is better than the single block at burst 8 (at b8, d against the single block +1.14 / +2.09 / +3.00 at 100 / 150 / 200 h264, no later in 10 of 10 seeds at each; only 200 is outside the strict spread) **at about the single block's overhead** (b8: 18.5 / 16.0 / 14.0 % against 16.9 / 15.6 / 15.2 %). It is not as good as a flat 20 %: the 200 Mbit/s b8 cell is 1.23 (`il_rf_t1e-4`) against 0.26 (`il_rho0.2`). If S3 needs that cell, the price is about 6 points of overhead. The likely reason the 1e-3 per-block rule falls short is that `tail(k_b + r, r, p, b/m)` treats a block as `k_b + r` consecutive datagrams of a GE process with mean burst `b/m`; a block that interleaves a whole frame sees the frame's bursts split over `m` blocks, which is not a GE process of mean `b/m` (a geometric run thinned by `m` has mass at 0 and a longer tail). This is a hypothesis; the sim did not test it.
+
+### (iii) Recovery wait, p95 (ms), mean over seeds (min-max of seeds)
+| Mbit/s | mix | single block | il_rho0.2 | il_rf | il_rf_t1e-4 |
+|---|---|---|---|---|---|
+| 100 | h264 b8 | 25.4 (20.5-29.4) | 62.4 (52.2-73.1) | 62.1 (55.7-71.9) | 55.2 (48.6-63.2) |
+| 150 | h264 b8 | 18.5 (17.6-19.3) | 68.9 (50.4-131.2) | 52.1 (44.9-61.3) | 53.0 (43.5-63.6) |
+| 200 | h264 b8 | 18.9 (18.2-19.5) | 61.8 (52.8-67.3) | 52.9 (48.2-55.5) | 55.4 (46.7-59.5) |
+| 200 | mix b8 | 18.6 (17.3-19.8) | 38.8 (34.6-44.0) | 33.8 (28.0-38.9) | 32.9 (26.1-39.3) |
+
+- **The split costs about 33 to 44 ms of p95 recovery wait in h264 cells** (single block 18-25 ms; split arms 52-63 ms; 100 Mbit/s 55-62) and 15 to 22 ms in the mix (33-46 against 19-25). Section 6 found 62-70 against 10-20. The three split arms are alike (they send the same frame-spanning repairs); the adaptive ones are 6-10 ms shorter at 150-200 Mbit/s because fewer repairs follow the frame.
+- **`T_adv` of 50-66 ms advertises it, and is at its edge:** the per-seed p95 reaches 73 ms for `il_rho0.2` at 100 b8, 69 for `il_rf` at 100 b5 (per-seed maximum), and **one seed at 131 ms** (`il_rho0.2`, 150 Mbit/s b8 h264). A client deadline derived from `T_adv` 50-66 ms is exceeded by the p95 in a minority of seeds; S3's lateness check must read the recovery wait, not only `T_adv`.
+
+### (iv) The contiguous control
+Late33 (%), mean (min-max of 10 seeds):
+
+| Mbit/s | mix | burst | il_rho0.2 | contig_rho0.2 | il_rf | contig_rf |
+|---|---|---|---|---|---|---|
+| 100 | h264 | 8 | 1.46 (0.86-3.14) | 2.23 (1.14-4.00) | 0.89 (0.00-1.71) | 3.34 (1.71-4.86) |
+| 150 | h264 | 8 | 1.20 (0.29-2.57) | 2.37 (1.43-3.43) | 1.31 (0.57-2.29) | 7.14 (5.43-9.71) |
+| 200 | h264 | 3 | 0.03 (0.00-0.29) | 0.03 (0.00-0.29) | 1.40 (0.86-2.29) | 11.94 (9.71-14.00) |
+| 200 | h264 | 5 | 0.11 (0.00-0.29) | 0.40 (0.00-0.86) | 1.03 (0.57-1.71) | 12.09 (9.71-14.86) |
+| 200 | h264 | 8 | 0.26 (0.00-0.86) | 1.80 (1.14-2.86) | 1.09 (0.57-1.43) | 10.17 (8.29-11.43) |
+
+- **With `R = ceil(rho k)/m` the contiguous gap grows with the burst and is clear only at b8:** 200 Mbit/s: 1.80 (1.14-2.86) against 0.26 (0.00-0.86), +1.54 (section 6: 2.1 against 0.4). The two seed ranges do not overlap, but the difference is just under the larger range's width (1.72), so by the strict rule it is **inside the spread**; 150 Mbit/s b8: 2.37 against 1.20 (+1.17), inside; at b3 and b5 the two are the same (0.03 / 0.03; 0.40 / 0.11).
+- **With the per-block rule the interleave is not optional at any burst:** `contig_rf` is 8.3-14.0 % at 200 Mbit/s (b3: 11.94 against 1.40; the ranges do not touch) and 6-10 % at 150, because the rule sizes each block for its share of a burst (`b/m`), which holds only when the burst is shared out. The same gap shows in the mix (200 Mbit/s b3 6.69 against 1.31). The contiguous variant is the control that must fail, and it does, by a factor of 5 to 9 at 150-200 Mbit/s.
+
+### Break checks (the selftest)
+- **`r = 0` on one block** (`plan_rf(broken=True)`, 150 Mbit/s h264, b3, 200 frames): late33 60.00 % against 1.60 %, residual source loss 0.824 % against 0.139 %, overhead 6.0 % against 8.5 %. The selftest asserts residual more than 3x the rule's + 0.05 and late frames more than 5 points above it. As in section 6.
+- **Deliberately contiguous `a_il`** (`plan_rf(contig=True)`, 200 Mbit/s h264 b8, 5 seeds of 300 frames): late33 9.89 (8.29-11.43) against 0.97 (0.57-1.14) interleaved; the selftest asserts the means differ by more than the larger seed range. The contiguous variant of the rho rule (`contig_rho0.2`) is not used for this check: at 200 Mbit/s b8 its gap is just inside the strict spread (iv). It also asserts the structure of the rule (cover, `k_b + r <= 255`, `r >= 1`, `i mod m` assignment).
+- The existing checks (`selftest.py`, `adapt_sim.py --selftest` first half, `split_sim.py --selftest`) pass unchanged.
+
+### Values for R6-e2 S3
+| constant | value | from |
+|---|---|---|
+| `FEC_SPLIT_MIN_M` | 2 | (i): m = 1 is the single block; no gap at 100 Mbit/s (m = 1 for 72 % of frames) |
+| `FEC_SPLIT_B_ENTER` | 6.0 | (i): `il_rf` equals the single block at b5 and wins in every seed at b8 |
+| `FEC_SPLIT_B_EXIT` | 4.0 | hysteresis of 2 below the entry; `il_rf` is later than the single block at b3 |
+| per-block rule | `r_for(k_b, p_hat, max(1, b_hat / m))` at target 1e-4 (`FEC_SPLIT_R_TARGET`) | (ii) |
+| `T_adv` | read the recovery wait: p95 52-63 ms h264, per-seed up to 73 and one seed 131 | (iii) |
+
+**Caveats.** True (p, b), no estimator error; the burst values 6 and 7 were not run; the gap at 150 Mbit/s b8 is inside the strict spread; 300 frames per seed; GE loss only (E11's i.i.d. cells have b = 1 and never enter the Split notch).
+
 ## 13. R6-e2 (plan task S3): the split notch, and why it became the frame notch, measured end to end
 
 ### Decision (owner): the interleave is deleted, the notch stays

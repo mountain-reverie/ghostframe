@@ -67,6 +67,133 @@ def cell(m, k):
     return f"{m[k][0]:6.2f}({m[k][1]:5.2f}-{m[k][2]:5.2f})"
 
 
+# ---- S0 (plan task S0): the split gate and the per-block r rule. Additive: nothing above this line changed. ----
+S2_RATES = (100, 150, 200)
+S2_BURSTS = (3.0, 5.0, 8.0)
+S2_RHO_M = 0.2   # the overhead the plan's m = ceil(frame_bundles (1 + rho) / 255) is sized with
+
+
+def plan_rf(p, b, contig=False, broken=False, rho_m=S2_RHO_M, target=TARGET):
+    """Per-block adaptive r (the plan's S3 rule): m = clamp(ceil(k (1 + rho_m) / 255), 1, 8) blocks per
+    frame, block j gets r_for(k_j, p, max(1, b / m)). Interleaved (bundle i -> block i mod m) unless
+    contig. broken: r = 0 on block 0 (break check)."""
+    def plan(k, rho):
+        m = min(8, max(1, math.ceil(k * (1 + rho_m) / 255 - 1e-9)))
+        if contig:
+            base, extra = divmod(k, m)
+            idx, pos = [], 0
+            for j in range(m):
+                sz = base + (1 if j < extra else 0)
+                idx.append(list(range(pos, pos + sz)))
+                pos += sz
+        else:
+            idx = [list(range(j, k, m)) for j in range(m)]
+        out = []
+        for j, ix in enumerate(idx):
+            r = 0 if (broken and j == 0 and m > 1) else adapt_r_for(len(ix), p, max(1.0, b / m), target)
+            out.append((ix, r, "rs"))
+        return out
+    return plan
+
+
+def adapt_r_for(k, p, b, target=TARGET):
+    import adapt_oracle
+    return adapt_oracle.r_for(k, p, b, target)
+
+
+def spec_rf(p, b, **kw):
+    return {"fam": "split", "plan": plan_rf(p, b, **kw), "kmax": 64, "rmin": 1}
+
+
+def split2_arms(loss):
+    _, p, b = loss
+    arms = [("T20k223", spec_time(20, 223, p, b), 0.0)]
+    for rho in (0.1, 0.2, 0.3):
+        arms.append((f"il_rho{rho}", sp.SPECS["a_il"], rho))
+    arms.append(("il_rf", spec_rf(p, b), 0.0))
+    arms.append(("il_rf_t1e-4", spec_rf(p, b, target=1e-4), 0.0))   # extra: the per-block rule at a tenth of the target
+    arms.append(("contig_rho0.2", sp.SPECS["a_contig"], 0.2))
+    arms.append(("contig_rf", spec_rf(p, b, contig=True), 0.0))
+    return arms
+
+
+def run_split2(rate, mix, spec, seed, frames, loss, rho):
+    """run_cell plus the p95 recovery wait of lost H.264 source bundles (FEC delay only, as split_sim)."""
+    ln, lr, lb = loss
+    d = u.gen_demand(mix, rate, sp.n_src_for(rate, mix, frames), random.Random(1000 + seed))
+    tl = u.build_timeline(d, rate, spec, rho, random.Random(seed))
+    lost = u.ge_chain(len(tl.dep), lr, lb, random.Random(zlib.crc32(f"L{seed}|{rate}|{mix}|{ln}".encode())))
+    av = u.decode(tl, lost, random.Random(seed + 9))
+    ev = u.evaluate(tl, av, lost)
+    fsrc = [s for (k, _), sids in tl.unit_src.items() if k == 'f' for s in sids]
+    un, fw = 0, []
+    for s in fsrc:
+        pk = tl.s_pkt[s]
+        if lost[pk]:
+            if av[s] is None:
+                un += 1
+            else:
+                fw.append(av[s] - tl.arr[pk])
+    fw.sort()
+    fr = ev["fr"]
+    return {"late33": 100 * fr["late33"], "late66": 100 * fr["late66"], "resid_f": 100 * un / max(1, len(fsrc)),
+            "w95": u.pct(fw, 0.95) if fw else 0.0, "ovh": 100 * ev["ovh"], "frames": fr["n"]}
+
+
+def job2(a):
+    key, (rate, mix, arm, seed, frames, loss) = a
+    spec, rho = next((sp_, r_) for (n_, sp_, r_) in split2_arms(loss) if n_ == arm)   # closures do not pickle
+    return key, run_split2(rate, mix, spec, seed, frames, loss, rho)
+
+
+def split2_work(nseed, frames_div=1, rates=S2_RATES, bursts=S2_BURSTS, mixes=("h264", "mix")):
+    work = []
+    for rate in rates:
+        for mix in mixes:
+            for b in bursts:
+                loss = (f"ge2b{int(b)}", 0.02, b)
+                for (arm, _spec, _rho) in split2_arms(loss):
+                    for sd in range(1, nseed + 1):
+                        work.append(((rate, mix, loss[0], arm, sd),
+                                     (rate, mix, arm, sd, max(60, frames_for(rate) // frames_div), loss)))
+    return work
+
+
+def split2_selftest():
+    # structure of the per-block rule: cover, k_b + r <= 255, r >= 1, interleaved i mod m
+    for k in (60, 200, 300, 394, 600, 1500):
+        for b in (3.0, 8.0):
+            pl = plan_rf(0.02, b)(k, 0.0)
+            m = len(pl)
+            assert 1 <= m <= 8
+            assert sorted(i for ix, _, _ in pl for i in ix) == list(range(k))
+            assert all(len(ix) + r <= 255 and r >= 1 for ix, r, _ in pl), (k, b)
+            if m > 1:
+                assert pl[1][0][:3] == [1, 1 + m, 1 + 2 * m]
+                pc = plan_rf(0.02, b, contig=True)(k, 0.0)
+                assert pc[0][0] == list(range(len(pc[0][0])))
+    # break check 1: r = 0 on one block must be seen (as in section 6)
+    loss = ("ge2b3", 0.02, 3.0)
+    good = run_split2(150, "h264", spec_rf(0.02, 3.0), 1, 200, loss, 0.0)
+    bad = run_split2(150, "h264", spec_rf(0.02, 3.0, broken=True), 1, 200, loss, 0.0)
+    print(f"selftest split2: il_rf late33 {good['late33']:.2f}% resid {good['resid_f']:.3f}% ovh {good['ovh']:.1f} | "
+          f"r=0 on one block late33 {bad['late33']:.2f}% resid {bad['resid_f']:.3f}% ovh {bad['ovh']:.1f}")
+    assert good["ovh"] > 5 and bad["ovh"] < good["ovh"]
+    assert bad["resid_f"] > 3 * good["resid_f"] + 0.05 and bad["late33"] > good["late33"] + 5
+    # break check 2: contiguous must be worse than interleaved at 200 Mbit/s b8, outside the spread (5 seeds)
+    loss8 = ("ge2b8", 0.02, 8.0)
+    ils, cts = [], []
+    for sd in range(1, 6):
+        ils.append(run_split2(200, "h264", spec_rf(0.02, 8.0), sd, 300, loss8, 0.0)["late33"])
+        cts.append(run_split2(200, "h264", spec_rf(0.02, 8.0, contig=True), sd, 300, loss8, 0.0)["late33"])
+    mi, mc = sum(ils) / 5, sum(cts) / 5
+    spread = max(max(ils) - min(ils), max(cts) - min(cts))
+    print(f"selftest split2: 200M b8 late33 interleaved {mi:.2f} ({min(ils):.2f}-{max(ils):.2f}) vs contiguous "
+          f"{mc:.2f} ({min(cts):.2f}-{max(cts):.2f})")
+    assert mc - mi > spread, "contiguous not worse than interleaved outside the spread"
+    print("split2 selftest ok")
+
+
 def selftest():
     # the adaptive spec must send fewer repairs at lower loss and more at higher (non-zero, monotone)
     a = run_cell(10, "h264", spec_time(20, 64, 0.005, 1.0), 1, 200, ("iid0.5", 0.005, 1.0))
@@ -78,6 +205,7 @@ def selftest():
                  1, 200, ("iid5", 0.05, 1.0))
     print(f"selftest r=0: resid_f {z['resid_f']:.2f}% ovh {z['ovh']:.2f}% vs rule resid_f {b['resid_f']:.3f}%")
     assert z["ovh"] == 0 and z["resid_f"] > 2.0 and b["resid_f"] < 0.5
+    split2_selftest()
     print("adapt_sim selftest ok")
 
 
@@ -88,7 +216,11 @@ def main():
     part = sys.argv[sys.argv.index("--part") + 1] if "--part" in sys.argv else "all"
     jobs = int(sys.argv[sys.argv.index("--jobs") + 1]) if "--jobs" in sys.argv else (os.cpu_count() or 4)
     nseed = 2 if quick else SEEDS
+    if "--seeds" in sys.argv:
+        nseed = int(sys.argv[sys.argv.index("--seeds") + 1])
     div = 4 if quick else 1
+    if part == "split2":
+        return main_split2(jobs, nseed, div)
     here = os.path.dirname(os.path.abspath(__file__))
     out = open(os.path.join(here, "adapt_sim_out.txt"), "a" if part != "all" and part != "cap" else "w")
     work = []
@@ -150,6 +282,20 @@ def main():
         out.write(f"{k[0][0]:<6} {str(k[0][1:]):<18} {k[1]:>4}M {k[2]:<5} {k[3]:<12} late33 {cell(m,'late33')} late66 {cell(m,'late66')} "
                   f"resid {cell(m,'resid_f')} tw95 {m['tile_w95'][0]:6.1f}({m['tile_w95'][1]:5.1f}-{m['tile_w95'][2]:5.1f}) ovh {cell(m,'ovh')}\n")
     out.close()
+    print("done", file=sys.stderr)
+
+
+def main_split2(jobs, nseed, div):
+    here = os.path.dirname(os.path.abspath(__file__))
+    work = split2_work(nseed, div)
+    print(f"{len(work)} split2 cells, {jobs} workers", file=sys.stderr)
+    with Pool(jobs) as pool:
+        res = dict(pool.imap_unordered(job2, work, chunksize=1))
+    with open(os.path.join(here, "split2_out.txt"), "w") as f:
+        f.write("# adapt_sim.py --part split2 (plan S0): one line per seed. key: rate mix loss arm seed | late33 late66 resid_f w95 ovh (%/ms)\n")
+        for k in sorted(res, key=lambda x: tuple(str(y) for y in x)):
+            r = res[k]
+            f.write(f"{k[0]} {k[1]} {k[2]} {k[3]} {k[4]} | {r['late33']:.3f} {r['late66']:.3f} {r['resid_f']:.4f} {r['w95']:.2f} {r['ovh']:.2f}\n")
     print("done", file=sys.stderr)
 
 

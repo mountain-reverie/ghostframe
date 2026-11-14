@@ -118,5 +118,133 @@ def part_low():
                 print(f"  {rate}M {mix:<4} {loss:<5}: " + " | ".join(row))
 
 
+def load_split2():
+    """split2_out.txt (adapt_sim.py --part split2): {(rate, mix, loss, arm): {metric: [per seed]}}."""
+    out = collections.defaultdict(lambda: collections.defaultdict(list))
+    path = os.path.join(here, "split2_out.txt")
+    if not os.path.exists(path):
+        return out
+    for line in open(path):
+        if line.startswith("#") or "|" not in line:
+            continue
+        a, b = line.split("|")
+        rate, mix, loss, arm, sd = a.split()
+        v = [float(x) for x in b.split()]
+        for name, x in zip(("l33", "l66", "res", "w95", "ovh"), v):
+            out[(int(rate), mix, loss, arm)][name].append(x)
+    return out
+
+
+def ms(v):
+    return sum(v) / len(v), min(v), max(v)
+
+
+def part_split2():
+    D2 = load_split2()
+    arms = ("T20k223", "il_rho0.1", "il_rho0.2", "il_rho0.3", "il_rf", "il_rf_t1e-4", "contig_rho0.2", "contig_rf")
+    print("== S0: late33 mean(min-max) ovh%  | per cell; '~' = within the larger seed range of the single block")
+    for mix in ("h264", "mix"):
+        for rate in (100, 150, 200):
+            for loss in ("ge2b3", "ge2b5", "ge2b8"):
+                row = []
+                base = D2.get((rate, mix, loss, "T20k223"))
+                for a in arms:
+                    c = D2.get((rate, mix, loss, a))
+                    if not c:
+                        continue
+                    m, lo, hi = ms(c["l33"])
+                    row.append(f"{a} {m:5.2f}({lo:4.2f}-{hi:5.2f}) o{ms(c['ovh'])[0]:4.1f} w{ms(c['w95'])[0]:4.0f}")
+                print(f"  {rate}M {mix:<4} {loss}: " + " | ".join(row))
+    print("== S0 (i): split vs single block. d = single - arm (points); real when d exceeds both seed ranges")
+    for arm in ("il_rho0.2", "il_rf", "il_rf_t1e-4"):
+        print(f"  arm {arm}")
+        for mix in ("h264", "mix"):
+            for rate in (100, 150, 200):
+                for loss in ("ge2b3", "ge2b5", "ge2b8"):
+                    a, b = D2.get((rate, mix, loss, "T20k223")), D2.get((rate, mix, loss, arm))
+                    if not a or not b:
+                        continue
+                    (ma, la, ha), (mb, lb, hb) = ms(a["l33"]), ms(b["l33"])
+                    spread = max(ha - la, hb - lb)
+                    d = ma - mb
+                    tag = "REAL" if d > spread else ("worse" if -d > spread else "~")
+                    print(f"    {rate}M {mix:<4} {loss}: single {ma:5.2f} {arm} {mb:5.2f} d {d:+5.2f} spread {spread:4.2f} {tag} "
+                          f"ovh {ms(a['ovh'])[0]:4.1f} vs {ms(b['ovh'])[0]:4.1f}")
+    print("== S0 (ii): il_rf vs il_rho0.2 vs il_rho0.3: late33 / ovh / resid; il_rf late-33 vs each")
+    for mix in ("h264", "mix"):
+        for rate in (100, 150, 200):
+            for loss in ("ge2b3", "ge2b5", "ge2b8"):
+                f, r2, r3 = (D2.get((rate, mix, loss, x)) for x in ("il_rf", "il_rho0.2", "il_rho0.3"))
+                if not (f and r2 and r3):
+                    continue
+                def v(c, sp_=None):
+                    m, lo, hi = ms(c["l33"])
+                    return m, hi - lo
+                (mf, sf), (m2, s2), (m3, s3) = v(f), v(r2), v(r3)
+                print(f"    {rate}M {mix:<4} {loss}: rf {mf:5.2f}({sf:4.2f}) o{ms(f['ovh'])[0]:4.1f} res{ms(f['res'])[0]:6.3f} | "
+                      f"rho.2 {m2:5.2f}({s2:4.2f}) o{ms(r2['ovh'])[0]:4.1f} res{ms(r2['res'])[0]:6.3f} | "
+                      f"rho.3 {m3:5.2f}({s3:4.2f}) o{ms(r3['ovh'])[0]:4.1f}  rf-rho.2 {mf-m2:+5.2f} "
+                      f"{'in-spread' if abs(mf-m2) <= max(sf, s2) else ('rf better' if mf < m2 else 'rf worse')} ovh {ms(f['ovh'])[0]-ms(r2['ovh'])[0]:+5.1f}")
+    print("== S0 (iii): recovery-wait p95 (ms, mean of seeds): single block vs split arms")
+    for mix in ("h264", "mix"):
+        for rate in (100, 150, 200):
+            for loss in ("ge2b3", "ge2b5", "ge2b8"):
+                row = [f"{a} {ms(D2[(rate, mix, loss, a)]['w95'])[0]:5.1f}({min(D2[(rate, mix, loss, a)]['w95']):4.1f}-{max(D2[(rate, mix, loss, a)]['w95']):5.1f})"
+                       for a in ("T20k223", "il_rho0.2", "il_rf", "il_rf_t1e-4", "contig_rf") if (rate, mix, loss, a) in D2]
+                print(f"    {rate}M {mix:<4} {loss}: " + " | ".join(row))
+    print("== S0 (iv): contiguous gap (late33): contig_rho0.2 and contig_rf against interleaved il_rho0.2 and il_rf")
+    for mix in ("h264", "mix"):
+        for rate in (100, 150, 200):
+            for loss in ("ge2b3", "ge2b5", "ge2b8"):
+                g = lambda a: D2.get((rate, mix, loss, a))
+                if not g("il_rho0.2"):
+                    continue
+                def f(a):
+                    m, lo, hi = ms(g(a)["l33"])
+                    return f"{m:5.2f}({lo:4.2f}-{hi:5.2f})"
+                print(f"    {rate}M {mix:<4} {loss}: il_rho0.2 {f('il_rho0.2')} contig_rho0.2 {f('contig_rho0.2')} | il_rf {f('il_rf')} contig_rf {f('contig_rf')}")
+
+
+def part_split2_paired():
+    """Per-seed pairs (same seed = same demand and loss seed; the packet counts differ by arm, so the pairing is
+    approximate): mean difference, its standard error, and the seeds where the arm is no later than the single block."""
+    D2 = load_split2()
+    print("== S0 paired: single - arm per seed: mean +- s.e.m., seeds where arm <= single")
+    for arm in ("il_rho0.2", "il_rf", "il_rf_t1e-4"):
+        print(f"  arm {arm}")
+        for mix in ("h264", "mix"):
+            for rate in (100, 150, 200):
+                for loss in ("ge2b3", "ge2b5", "ge2b8"):
+                    a, b = D2.get((rate, mix, loss, "T20k223")), D2.get((rate, mix, loss, arm))
+                    if not a or not b:
+                        continue
+                    d = [x - y for x, y in zip(a["l33"], b["l33"])]
+                    n = len(d)
+                    m = sum(d) / n
+                    sd = (sum((x - m) ** 2 for x in d) / (n - 1)) ** 0.5
+                    print(f"    {rate}M {mix:<4} {loss}: d {m:+5.2f} +- {sd / n ** 0.5:4.2f}  arm<=single in {sum(1 for x in d if x >= 0)}/{n}")
+    print("== S0 paired (ii): arm - il_rho0.2, per seed")
+    for arm in ("il_rf", "il_rf_t1e-4"):
+        print(f"  arm {arm}")
+        for mix in ("h264", "mix"):
+            for rate in (100, 150, 200):
+                for loss in ("ge2b3", "ge2b5", "ge2b8"):
+                    a, b = D2.get((rate, mix, loss, arm)), D2.get((rate, mix, loss, "il_rho0.2"))
+                    if not a or not b:
+                        continue
+                    d = [x - y for x, y in zip(a["l33"], b["l33"])]
+                    n = len(d)
+                    m = sum(d) / n
+                    sd = (sum((x - m) ** 2 for x in d) / (n - 1)) ** 0.5
+                    print(f"    {rate}M {mix:<4} {loss}: late33 d {m:+5.2f} +- {sd / n ** 0.5:4.2f} (arm worse in {sum(1 for x in d if x > 0)}/{n}) "
+                          f"ovh {ms(a['ovh'])[0]:4.1f} vs {ms(b['ovh'])[0]:4.1f}")
+
+
+if __name__ == "__main__" and "--split2" in sys.argv:
+    part_split2()
+    part_split2_paired()
+    sys.exit(0)
+
+
 if __name__ == "__main__":
     part_cap(); part_best(); part_ladder(); part_split(); part_low()
