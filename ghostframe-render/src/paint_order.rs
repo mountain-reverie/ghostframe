@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Which of a batch's tile updates may still be painted.
 //!
-//! [`Renderer::flush`](crate::renderer::Renderer::flush) draws a batch in a
+//! [`TileRenderer::flush`](crate::tile_renderer::TileRenderer::flush) draws a batch in a
 //! fixed codec order, whatever server frame each entry came from. When two
 //! frames land in one batch, an older stateless draw (Solid, PalRle,
 //! `TileReady`) could sit over a newer one from another codec. The ledger

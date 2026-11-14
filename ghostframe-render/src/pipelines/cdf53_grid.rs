@@ -564,78 +564,77 @@ impl Cdf53Grid {
     }
 }
 
-/// A grid that passed [`probe`], with what the probe measured.
-pub struct Probed {
-    pub grid: Cdf53Grid,
-    /// GPU microseconds per tile at a complete prefix (k = 14) on this device,
-    /// from a 256-tile dispatch with the empty-submit overhead taken off.
-    pub us_per_tile_k14: f64,
+/// Out-of-memory, internal and validation error scopes opened together, so a
+/// shader or pipeline that fails to build comes back as an error instead of
+/// reaching wgpu's default uncaptured-error handler, which panics.
+///
+/// Open with [`ErrorScopes::push`], do the fallible work, then
+/// [`ErrorScopes::finish`] and read the first error it reports.
+pub struct ErrorScopes {
+    oom: wgpu::ErrorScopeGuard,
+    internal: wgpu::ErrorScopeGuard,
+    validation: wgpu::ErrorScopeGuard,
 }
 
-/// Build a grid, prove it works on this device, and measure what it costs.
-///
-/// Everything runs inside wgpu error scopes (validation, internal and
-/// out-of-memory), so a pipeline that fails to build -- a shader the GL
-/// backend cannot compile, say -- comes back as `Err` instead of reaching
-/// wgpu's default uncaptured-error handler, which panics the render thread.
-/// The caller then decodes on the CPU.
-///
-/// Blocks on the device; call it once, at start-up, on the render thread. The
-/// grid it returns is the one that was tested: hand it to the renderer rather
+impl ErrorScopes {
+    pub fn push(device: &wgpu::Device) -> Self {
+        let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        ErrorScopes {
+            oom,
+            internal,
+            validation,
+        }
+    }
+
+    /// Close the scopes (last in, first out) and report the first error.
+    pub async fn finish(self) -> Option<String> {
+        let errors = [
+            self.validation.pop().await,
+            self.internal.pop().await,
+            self.oom.pop().await,
+        ];
+        errors
+            .into_iter()
+            .flatten()
+            .next()
+            .map(|e| format!("GPU error: {e}"))
+    }
+}
+
+/// Build a grid with `make` and prove it works on this device
+/// ([`self_test`]), inside [`ErrorScopes`]. The grid it returns is the one
+/// that was tested: hand it to `TileRenderer::enable_cdf53_gpu_with` rather
 /// than building another (the reconstruct shader is slow to compile on
 /// panfrost).
-pub fn probe(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Probed, String> {
-    probe_with(device, queue, Cdf53Grid::new)
-}
-
-/// [`probe`] with the grid made by `make` (a test that must see it fail).
-pub fn probe_with(
+///
+/// Does not time anything: the native client adds a calibration of its own
+/// (`ghostframe_client_gpu::pipelines::cdf53_grid::probe`), which needs a
+/// clock and a blocking wait. A browser uses this and the default cost model.
+pub async fn probe_grid(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     make: impl FnOnce(&wgpu::Device) -> Cdf53Grid,
-) -> Result<Probed, String> {
-    in_error_scopes(device, || {
-        let mut grid = make(device);
-        self_test_with(device, queue, &mut grid)?;
-        let us_per_tile_k14 = calibrate(device, queue, &mut grid)?;
-        Ok(Probed {
-            grid,
-            us_per_tile_k14,
-        })
-    })
-}
-
-/// Run `f` with out-of-memory, internal and validation errors captured, and
-/// report the first one as `Err`.
-fn in_error_scopes<T>(
-    device: &wgpu::Device,
-    f: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
-    let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
-    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let result = f();
-    // Last in, first out.
-    let errors = [
-        pollster::block_on(validation.pop()),
-        pollster::block_on(internal.pop()),
-        pollster::block_on(oom.pop()),
-    ];
-    if let Some(e) = errors.into_iter().flatten().next() {
-        return Err(format!("GPU error: {e}"));
+) -> Result<Cdf53Grid, String> {
+    let scopes = ErrorScopes::push(device);
+    let mut grid = make(device);
+    let tested = self_test(device, queue, &mut grid).await;
+    if let Some(e) = scopes.finish().await {
+        return Err(e);
     }
-    result
+    tested.map(|()| grid)
 }
 
 /// One tile as the wire carries it, decoded: the planes that exist, and the
 /// `present_passes` bitmap.
-struct Fixture {
-    present: u16,
-    planes: Vec<Option<Vec<u8>>>,
+pub struct SelfTestTile {
+    pub present: u16,
+    pub planes: Vec<Option<Vec<u8>>>,
 }
 
 /// Two known pictures: a smooth ramp with an edge, and noise.
-fn fixtures() -> Vec<Fixture> {
+pub fn self_test_tiles() -> Vec<SelfTestTile> {
     use ghostframe_protocol::codec::cdf53 as codec;
     let tile = |kind: u32| -> Vec<u8> {
         let mut rng = 0x2545_F491u32;
@@ -670,7 +669,7 @@ fn fixtures() -> Vec<Fixture> {
                 }
                 planes[p as usize] = Some(plane);
             }
-            Fixture { present, planes }
+            SelfTestTile { present, planes }
         })
         .collect()
 }
@@ -683,13 +682,13 @@ fn fixtures() -> Vec<Fixture> {
 /// trusted on a device until this passes. The partial frame is checked to
 /// differ from the complete one, so a shader that draws nothing on it cannot
 /// pass by leaving frame 1's picture in place. Errors name the frame.
-pub fn self_test_with(
+pub async fn self_test(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     grid: &mut Cdf53Grid,
 ) -> Result<(), String> {
     use ghostframe_protocol::codec::cdf53 as codec;
-    let cases = fixtures();
+    let cases = self_test_tiles();
     grid.resize(device, 2, 1).map_err(|e| e.to_string())?;
     let fb = Framebuffer::new(device, 64, 32);
     // (tile, prefix length): both complete, then the first at a partial prefix.
@@ -733,7 +732,10 @@ pub fn self_test_with(
             return Err("nothing was recorded".into());
         }
         queue.submit(std::iter::once(enc.finish()));
-        let got = fb.debug_read(device, queue);
+        let got = fb
+            .read_rgba(device, queue)
+            .await
+            .map_err(|e| e.to_string())?;
         for (i, bgr) in want {
             for y in 0..32usize {
                 for x in 0..32usize {
@@ -752,70 +754,6 @@ pub fn self_test_with(
         }
     }
     Ok(())
-}
-
-/// Tiles in the calibration dispatch: enough that the fixed cost of a submit
-/// is a small part of it (at 64 tiles it inflated the per-tile figure by 40%
-/// on a Mali-T860), few enough to take ~15 ms there.
-const CALIBRATION_TILES: u32 = 256;
-
-/// GPU microseconds per complete tile on this device: the wall time of
-/// submit + wait for a [`CALIBRATION_TILES`]-tile frame of known content,
-/// minus that of an empty submit, median of five after a warm-up. Wall time
-/// includes the driver's own overhead, which is what a flush pays too.
-fn calibrate(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    grid: &mut Cdf53Grid,
-) -> Result<f64, String> {
-    use std::time::Instant;
-    let fixture = &fixtures()[0];
-    grid.resize(device, 16, 16).map_err(|e| e.to_string())?;
-    let fb = Framebuffer::new(device, 16 * 32, 16 * 32);
-    let wait = || device.poll(wgpu::PollType::wait_indefinitely());
-    let timed = |f: &mut dyn FnMut() -> Result<(), String>| -> Result<f64, String> {
-        let t = Instant::now();
-        f()?;
-        wait().map_err(|e| e.to_string())?;
-        Ok(Instant::now().duration_since(t).as_secs_f64() * 1e6)
-    };
-    let median = |mut v: Vec<f64>| {
-        v.sort_by(|a, b| a.total_cmp(b));
-        v[v.len() / 2]
-    };
-    let mut empty = || {
-        let enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        queue.submit(std::iter::once(enc.finish()));
-        Ok(())
-    };
-    let mut full = || {
-        grid.begin_frame();
-        for i in 0..CALIBRATION_TILES {
-            for (p, plane) in fixture.planes.iter().enumerate() {
-                if let Some(plane) = plane {
-                    grid.push_plane(i, p as u8, plane);
-                }
-            }
-            grid.push_tile(i, fixture.present as u32, 14);
-        }
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("ghostframe-cdf53-calibration"),
-        });
-        if !grid.record(device, queue, &mut enc, &fb) {
-            return Err("calibration recorded nothing".to_string());
-        }
-        queue.submit(std::iter::once(enc.finish()));
-        Ok(())
-    };
-    timed(&mut full)?; // warm-up: first use compiles and binds
-    let mut base = Vec::new();
-    let mut work = Vec::new();
-    for _ in 0..5 {
-        base.push(timed(&mut empty)?);
-        work.push(timed(&mut full)?);
-    }
-    let per_tile = (median(work) - median(base)) / CALIBRATION_TILES as f64;
-    Ok(per_tile.clamp(0.5, 500.0))
 }
 
 fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
