@@ -243,12 +243,13 @@ impl IoBridge {
         let closes = self.block_table.take_close_log();
         let rate = self.bwe.snapshot().bitrate_bps;
         let max_dg = self.live_max_dg().unwrap_or(1200);
+        let fps = self.h264.fps;
         let live = self.fec_live;
         let Some(a) = self.fec_adapt.as_mut() else {
             return;
         };
         a.tick(now_us, closes);
-        let mut want = a.live_params(rate, max_dg, now_us);
+        let mut want = a.live_params(rate, max_dg, fps, now_us);
         if let (Some(w), Some(cur)) = (want, live) {
             if w.t_ms.abs_diff(cur.t_ms) <= 1
                 && u16::from(w.k_max.abs_diff(cur.k_max)) * 8 <= u16::from(cur.k_max)

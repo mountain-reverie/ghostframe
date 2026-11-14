@@ -25,6 +25,11 @@ pub struct FecAdaptProbe {
     pub b_hat_x100: u64,
     pub k_max: u8,
     pub t_ms: u8,
+    /// Whether the ladder is in the frame notch, notch changes and entries
+    /// into it (cumulative).
+    pub frame: bool,
+    pub notch_changes: u64,
+    pub frame_entries: u64,
     pub r_at_k8: u8,
     pub r_at_k64: u8,
     pub changes: u64,

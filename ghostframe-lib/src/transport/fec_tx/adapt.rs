@@ -17,7 +17,7 @@
 
 use ghostframe_protocol::fec::feedback::LossReport;
 
-use super::adapt_size::{DeclinedTrim, Ladder, RSizer};
+use super::adapt_size::{DeclinedTrim, Ladder, Notch, RSizer};
 use super::block_table::CloseReason;
 use crate::config::FecBlockParams;
 use crate::transport::io_bridge::FecAdaptProbe;
@@ -295,9 +295,15 @@ pub(crate) struct FecAdapt {
 
 impl FecAdapt {
     pub(crate) fn new() -> Self {
+        Self::with_frame_notch(true)
+    }
+
+    /// `frame = false` never enters the frame notch: the control arm of the
+    /// frame-notch scenes (a test switch, not a configuration).
+    pub(crate) fn with_frame_notch(frame: bool) -> Self {
         Self {
             est: LossEstimator::new(),
-            ladder: Ladder::new(),
+            ladder: Ladder::with_frame_notch(frame),
             sizer: RSizer::new(),
             trim: DeclinedTrim::new(),
             was_engaged: false,
@@ -342,6 +348,7 @@ impl FecAdapt {
         &mut self,
         rate_bps: u64,
         max_dg: usize,
+        fps: u32,
         now_us: u64,
     ) -> Option<FecBlockParams> {
         let engaged = self.est.state() == FloorState::Engaged;
@@ -352,7 +359,9 @@ impl FecAdapt {
         if !engaged {
             return None;
         }
-        let span = self.ladder.step(self.est.b_hat(), rate_bps, max_dg, now_us);
+        let span = self
+            .ladder
+            .step(self.est.b_hat(), rate_bps, max_dg, fps, now_us);
         Some(FecBlockParams {
             k_max: span.k_max,
             t_ms: span.t_ms,
@@ -408,6 +417,9 @@ impl FecAdapt {
             b_hat_x100: (b * 100.0).round() as u64,
             k_max: self.last_applied.map_or(0, |a| a.k_max),
             t_ms: self.last_applied.map_or(0, |a| a.t_ms),
+            frame: self.ladder.notch() == Notch::Frame,
+            notch_changes: self.ladder.notch_changes(),
+            frame_entries: self.ladder.frame_entries(),
             r_at_k8: r_at(8),
             r_at_k64: r_at(64),
             changes: self.changes,
@@ -772,7 +784,7 @@ mod tests {
         }
         a.tick(5_000_000, []);
         assert_eq!(a.estimator().reports_seen(), 20, "reports were seen");
-        let live = a.live_params(10_000_000, 1200, 5_000_000);
+        let live = a.live_params(10_000_000, 1200, 30, 5_000_000);
         a.note_applied(live);
         a.note_applied(live);
         assert_eq!(a.r_for_block(64, 5_000_000), 16, "the 25 % overhead cap");
