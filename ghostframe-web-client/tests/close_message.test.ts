@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 import { describe, it, expect } from 'vitest';
 import { closeOverlayMessage, CLOSE_CODE_ACCESS_REVOKED } from '../src/close_message';
 

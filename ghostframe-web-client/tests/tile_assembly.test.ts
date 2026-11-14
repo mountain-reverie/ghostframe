@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Was tile_key.test.ts, which pinned the string shape produced by the old
 // TS `tileKey()` in decoder.ts: `` `${frameSeq}:${tileX}:${tileY}:${passIdx}` ``.
 //

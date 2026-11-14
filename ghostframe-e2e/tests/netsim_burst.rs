@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Statistical checks on the Gilbert-Elliott model in `netsim::burst`.
 //!
 //! Everything here drives `NetSim::decide` directly, which *is* seed-

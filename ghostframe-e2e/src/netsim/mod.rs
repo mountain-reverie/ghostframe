@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Network impairment simulator: deterministic loss, delay, corruption, and bandwidth modeling.
 //!
 //! This module provides a seeded network simulator for e2e testing. Determinism

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `codec_report` — M3.5 Layer B bench binary. Drives the
 //! ghostframe-e2e harness against the configured scenes and emits
 //! a markdown report.

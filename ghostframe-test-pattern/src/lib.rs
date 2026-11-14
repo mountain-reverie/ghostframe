@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Library half of `ghostframe-test-pattern`.
 //!
 //! Re-exports the modules the e2e tests need to import (font tables, text-grid

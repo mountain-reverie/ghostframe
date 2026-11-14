@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Dense per-tile delivery state, indexed `tile_y * cols + tile_x`.
 //!
 //! Replaces `Scheduler::generations: Vec<u8>` and the

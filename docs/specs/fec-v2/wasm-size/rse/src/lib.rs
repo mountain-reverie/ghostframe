@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 extern crate alloc;
 use alloc::vec::Vec;
 use reed_solomon_erasure::galois_8::ReedSolomon;

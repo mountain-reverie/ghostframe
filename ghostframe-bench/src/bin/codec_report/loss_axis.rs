@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! M3.7a loss-axis bench: re-runs one scene at 6 inbound-loss rates
 //! by setting GHOSTFRAME_INBOUND_LOSS_PROBABILITY before each run.
 //! Default scene is the existing mode_switch alternating cycle at a

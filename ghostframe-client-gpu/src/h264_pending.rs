@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Which fed H.264 access units are still waiting for their picture.
 //!
 //! A decoder may delay its output: the GStreamer backend hands a picture back

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Rust FFI bindings to the ghostbridge Go `c-archive` — the tsnet byte pump.
 //!
 //! Its own crate so a client can reach the wire without depending on the

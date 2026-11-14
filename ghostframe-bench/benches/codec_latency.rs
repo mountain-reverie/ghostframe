@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Encode latency per codec × content class.
 //!
 //! The tile codecs (PalRle, CDF53, Solid) plug in as `BenchEncoder` impls

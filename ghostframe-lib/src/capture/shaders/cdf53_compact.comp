@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // cdf53_compact.comp
 // Stage 4a: produce the dense list of (dirty AND high-color) tile indices
 // for Cdf53 forward processing.

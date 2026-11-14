@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Protocol constants, re-exported so the retargeted vitest suites read
 //! them from Rust rather than hardcoding them.
 //!

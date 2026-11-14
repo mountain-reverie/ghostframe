@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Proves the five protocol-derived `window.__*` globals
 // (docs/specs/wasm-cutover-main-ts-map.md, Part 3) that main.ts's
 // `handleEvent` re-derives via `recordProtocolEvent` actually move.

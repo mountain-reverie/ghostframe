@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Thin per-unit exports, existing so the pre-cutover vitest suites can be
 //! retargeted at Rust without being rewritten as integration tests. Those
 //! suites encode the *old* implementation's real behaviour, which is what

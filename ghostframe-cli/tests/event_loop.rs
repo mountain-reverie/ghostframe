@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Tests for `route_window_event`: the pure decision the render/event loop
 //! makes for one backend `WindowEvent`. The loop itself needs a real
 //! display and can't be unit-tested here -- this is the part of it most

@@ -168,6 +168,8 @@ COPY ghostframe-client-h264/src/ ghostframe-client-h264/src/
 COPY ghostframe-client-wasm/Cargo.toml ghostframe-client-wasm/Cargo.toml
 COPY ghostframe-client-wasm/src/ ghostframe-client-wasm/src/
 COPY ghostframe-client-wasm/build.rs ghostframe-client-wasm/build.rs
+COPY ghostframe-web-ui/Cargo.toml ghostframe-web-ui/Cargo.toml
+COPY ghostframe-web-ui/src/ ghostframe-web-ui/src/
 # Workspace members not built here but required for cargo to resolve the
 # workspace manifest.
 COPY ghostframe-e2e/Cargo.toml ghostframe-e2e/Cargo.toml

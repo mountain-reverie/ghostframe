@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! GStreamer H.264 decode: access units in, exported dmabufs out.
 //!
 //! The `gstreamer` backend's half of [`crate::decoder`]. Same public shape as

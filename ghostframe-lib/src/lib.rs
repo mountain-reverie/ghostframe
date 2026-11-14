@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! ## Catch-all match arms
 //!
 //! `clippy::wildcard_enum_match_arm` is on for non-test code in this crate.

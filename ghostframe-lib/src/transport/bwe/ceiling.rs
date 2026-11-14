@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The estimate ceiling: a bound on the bandwidth estimate taken from what the
 //! path was measured to deliver, and the measurements that bound is made of.
 //!

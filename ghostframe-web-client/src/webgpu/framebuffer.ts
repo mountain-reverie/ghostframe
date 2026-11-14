@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 import presentBlitWgsl from '../../../shaders/client/present_blit.wgsl?raw';
 import { createLabeledShaderModule } from './shader_module';
 

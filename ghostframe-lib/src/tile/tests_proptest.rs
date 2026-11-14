@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Property-based invariants for `TileGrid`, `DirtyTracker`, and the per-tile classifier.
 //!
 //! These encode rules from §4.1 / §4.2 of the spec so that the M3 classifier

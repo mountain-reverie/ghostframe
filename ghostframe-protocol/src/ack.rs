@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Batched-ACK datagram protocol — per-*transmission* acknowledgment (rev3).
 //!
 //! Wire format:

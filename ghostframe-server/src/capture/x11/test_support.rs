@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! A private Xvfb per test.
 //!
 //! Tests that paint root, resize the screen or run without MIT-SHM must not

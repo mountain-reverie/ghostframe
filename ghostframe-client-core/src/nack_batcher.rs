@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Batched-NACK datagram sender. Buffers per-pass NACK entries; flushes
 //! on either >= 64 entries OR 5ms since the first queued entry. Ports
 //! `ghostframe-web-client/src/nack.ts`, but time is injected (`now_us: u64`)

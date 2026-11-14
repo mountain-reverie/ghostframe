@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Copy RGBA tiles that already sit in an upload slab into the framebuffer: the
 // slab-sourced sibling of rgba_tiles.wgsl, same dispatch shape, same result.
 //

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The one place this crate hands a command encoder to the queue.
 //!
 //! Each `queue.submit` ends, in wgpu-hal's GLES backend, in a `glFlush` and a

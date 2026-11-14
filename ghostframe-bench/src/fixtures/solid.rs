@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 use super::TILE_BYTES;
 
 /// 32×32 tile filled with a single BGRA colour.

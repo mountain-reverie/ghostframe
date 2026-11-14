@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Within one `flush` batch, a tile is painted by its newest `frame_seq`, not
 //! by the order the codecs happen to be drawn in. Needs a real GPU, so not
 //! named in any CI workflow (same rule as the other `gpu_*.rs` files).

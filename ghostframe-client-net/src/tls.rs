@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Certificate pinning, mirroring the browser's `serverCertificateHashes`.
 //!
 //! **What is checked:** the end-entity certificate's DER must hash to exactly

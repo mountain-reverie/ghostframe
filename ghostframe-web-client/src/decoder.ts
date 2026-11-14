@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Full-frame H.264 decode via WebCodecs. All wire parsing lives in the wasm
 // core; this is only the browser-side VideoDecoder wrapper.
 

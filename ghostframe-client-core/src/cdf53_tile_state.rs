@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! CPU replacement for `webgpu/cdf53.ts:342-455`: per-tile CDF53 bit-plane
 //! accumulation and RGBA reconstruction.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! A few persistent upload slabs, and the protocol that lets the decode thread
 //! write tiles into them while the render thread only ever names them.
 //!

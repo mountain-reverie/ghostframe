@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Ordering of CDF 5/3 generations by the datagram's `frame_seq`, not by the
 //! 4-bit generation.
 //!

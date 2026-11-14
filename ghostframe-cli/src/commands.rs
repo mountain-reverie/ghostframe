@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `login`, `logout`, and `connect` — the CLI's actual behaviour.
 
 use std::path::PathBuf;

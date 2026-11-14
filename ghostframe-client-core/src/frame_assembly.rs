@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! H.264 full-frame fragment reassembly.
 //!
 //! Port of the frame-level datagram branch in `main.ts` (~1326-1399): a

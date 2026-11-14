@@ -2,6 +2,7 @@
 name = "ghostframe-bench"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-or-later"
 
 # Empty library — this crate exists to host benchmarks in `benches/`.
 # criterion and iai-callgrind live here instead of in ghostframe-lib so

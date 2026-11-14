@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The two-decoder oracle.
 //!
 //! `ClientCore` can deliver the same datagrams CPU-decoded

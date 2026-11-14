@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use ghostframe_cli::chord::{Chord, ChordAction, Prefix};
 
 // X11 keysyms: what the wire carries and what xkbcommon yields.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! A sliding-window minimum in O(1) amortised per sample.
 //!
 //! The classic monotonic deque: a sample that arrives while a smaller (or

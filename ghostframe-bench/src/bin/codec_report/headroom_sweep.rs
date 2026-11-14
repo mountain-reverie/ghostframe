@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! M3.7b headroom sweep: re-runs 4 HEADROOM_MIN_BPUS threshold values
 //! across 3 shaping points (1/2/5 Mbps) — the bandwidth range where
 //! the threshold matters. At 10+ Mbps the override never fires; below

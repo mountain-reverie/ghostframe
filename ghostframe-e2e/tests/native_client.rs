@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! M1 acceptance: the native client against a live ghostframe server.
 //!
 //! Joins the tailnet as its own node, connects over tsnet, decodes on the

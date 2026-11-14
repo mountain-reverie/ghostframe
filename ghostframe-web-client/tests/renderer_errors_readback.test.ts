@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // A paint tick must never be rejected because the previous tick's PalRLE
 // errors readback still holds `errorsStaging`.
 //

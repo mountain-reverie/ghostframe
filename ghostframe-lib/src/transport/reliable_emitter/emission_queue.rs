@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Output queue that interleaves source datagrams with FEC parity
 //! datagrams offset by PARITY_INTERLEAVE_OFFSET wire_seqs behind the
 //! group's first source — so the parity is well-separated from its

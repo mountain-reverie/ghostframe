@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! T4: the libva-direct backend against the real driver, decode-based.
 //!
 //! Local only. CI has no encoder and skips these by name prefix

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! DMA-BUF pixel readback via mmap.
 //!
 //! A persistent read-only mapping of the DMA-BUF fd and recycled output

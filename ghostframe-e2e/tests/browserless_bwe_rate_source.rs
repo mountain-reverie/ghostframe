@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! D1 PR-6 (`transport/bwe-rate-source`): the gates for where the estimate
 //! comes from and what bounds it.
 //!

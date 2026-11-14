@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Integration tests for the full datagram reassembly pipeline
 //! (`ClientCore::handle_datagram`). Datagrams are generated with the
 //! server-side `fragment_tile` so the tests exercise the exact wire format

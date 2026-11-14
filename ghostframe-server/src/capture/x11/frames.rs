@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! X11 frames: a full grab of the root window, plus the cursor.
 //!
 //! One method, the one `x11vnc` and ffmpeg's `x11grab` use: `ShmGetImage`

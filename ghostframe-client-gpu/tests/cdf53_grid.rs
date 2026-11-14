@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The full-grid CDF 5/3 decoder (`pipelines::cdf53_grid`) against the CPU
 //! reference: `rle_decode` -> `decode_planes` -> `inverse`, bit for bit.
 //! Requires a GPU (`WgpuContext::new().expect`: no GPU is a failure, not a

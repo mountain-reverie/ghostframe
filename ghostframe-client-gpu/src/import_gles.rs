@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Importing a decoded NV12 dmabuf as GL textures.
 //!
 //! The GLES counterpart to [`crate::import`]. Both turn one `DmabufPlanes`

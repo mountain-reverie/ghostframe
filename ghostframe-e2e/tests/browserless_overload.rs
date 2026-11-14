@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The overload scene in the harness: the shape of
 //! `e2e_saturated_link_starves_tiles_into_giving_up`, deterministic.
 //!

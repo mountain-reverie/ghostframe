@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Port of `ghostframe-web-client/tests/prevalidate.test.ts` (11 cases),
 //! plus one RGBA pixel test for `decode_pal_rle_tile`.
 

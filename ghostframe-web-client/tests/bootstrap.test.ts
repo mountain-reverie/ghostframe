@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { bootstrap } from '../src/bootstrap';
 

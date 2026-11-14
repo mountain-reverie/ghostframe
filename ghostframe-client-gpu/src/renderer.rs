@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The façade that ties the pipelines, the framebuffer and the export ring
 //! together into the one type `ghostframe-client-native` talks to.
 //!

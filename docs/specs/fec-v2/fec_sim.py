@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """FEC layout simulation for ghostframe (run with `python3 -I fec_sim.py`).
 
 Question: at equal redundancy, which FEC *unit* and *code* recovers losses on a

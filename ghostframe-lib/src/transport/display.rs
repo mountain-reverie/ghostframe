@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! DisplayInfo (0x07) and DisplayMode (0x08): client → server display
 //! negotiation on the reliable bidi feedback stream.
 //!

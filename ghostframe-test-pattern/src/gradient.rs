@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `--gradient --x11-sink` mode.
 //!
 //! Full-screen diagonal RGB gradient. Each 32×32 tile contains >16 unique

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! RFC 9002 §5 round-trip estimator and the §6.2 probe timeout (PTO) it
 //! feeds, for the server's tile transmissions (D1 F4, part 1).
 //!

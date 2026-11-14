@@ -1,6 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 mod common;
 
 use common::{connected_session, pump_with_wt};
+use ghostframe_client_net::ClientNet;
 
 /// The Hello queued by `ClientCore::new` at construction must survive the
 /// gap between "queued" and "a feedback stream exists to carry it" — that
@@ -132,4 +134,198 @@ fn an_h264_client_advertises_both_h264_hello_bits() {
 
     let got: Vec<u8> = wt.drain_feedback().into_iter().flatten().collect();
     assert_eq!(&got[..2], &[0x03, 0x07], "Hello caps, got {got:02x?}");
+}
+
+use ghostframe_lib::transport::webtransport::StatsWrite;
+use ghostframe_protocol::stats::{
+    MetricDescriptor, MetricGroup, MetricKind, MetricValue, ServerFrameReader, StatsSample,
+    StatsSchema, SERVER_MSG_STATS_SAMPLE,
+};
+
+/// What the server writes on the feedback stream's return half reaches the
+/// client's reader, on the real quinn pair (the wire path of the stats stream).
+#[test]
+fn a_stats_frame_written_by_the_server_reaches_the_client() {
+    let (mut client, mut server, mut wt, mut now_us, base) = connected_session();
+    pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 32);
+    assert!(
+        wt.note_stats_subscribe(),
+        "the Hello arrived on the feedback stream, so it is known"
+    );
+
+    let schema = text_schema();
+    let frame = StatsSample {
+        schema_id: schema.schema_id,
+        timestamp_us: 77,
+        values: vec![MetricValue::Text("tile".into())],
+    }
+    .encode_frame();
+    let conn = server.connections.values_mut().next().expect("connection");
+    assert_eq!(wt.write_stats_frame(conn, &frame), StatsWrite::Written);
+    pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 32);
+
+    let got = client.read_feedback_return(now_us);
+    assert_eq!(got, frame, "the bytes arrive unchanged, on the return half");
+    assert!(
+        client.read_feedback_return(now_us).is_empty(),
+        "a read drains: the same bytes are not returned twice"
+    );
+}
+
+fn text_schema() -> StatsSchema {
+    StatsSchema {
+        schema_id: 1,
+        server_version: "t".into(),
+        host_name: "h".into(),
+        metrics: vec![MetricDescriptor {
+            id: 1,
+            name: "n".into(),
+            unit: "1".into(),
+            kind: MetricKind::Text,
+            group: MetricGroup::Other,
+            label: "l".into(),
+        }],
+    }
+}
+
+/// With the client not reading, the stream's flow-control window fills. The
+/// server must then refuse whole frames, never leave one torn: what the
+/// client eventually reads decodes cleanly, in order, and contains exactly the
+/// frames the server reported as written.
+#[test]
+fn a_full_window_refuses_whole_frames_and_never_tears_one() {
+    let (mut client, mut server, mut wt, mut now_us, base) = connected_session();
+    pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 32);
+    assert!(wt.note_stats_subscribe());
+    let schema = text_schema();
+
+    let make = |i: u64| {
+        StatsSample {
+            schema_id: schema.schema_id,
+            timestamp_us: i,
+            values: vec![MetricValue::Text("x".repeat(200))],
+        }
+        .encode_frame()
+    };
+
+    let mut written: Vec<u64> = Vec::new();
+    let mut blocked = false;
+    for i in 0..200_000u64 {
+        let conn = server.connections.values_mut().next().expect("connection");
+        match wt.write_stats_frame(conn, &make(i)) {
+            StatsWrite::Written => written.push(i),
+            StatsWrite::Blocked => {
+                blocked = true;
+                break;
+            }
+            other => panic!("frame {i}: {other:?}"),
+        }
+    }
+    assert!(
+        blocked,
+        "premise: 200k x ~205 bytes overruns quinn's 1.25 MB default stream window"
+    );
+    assert!(
+        wt.stats_tail_len() > 0,
+        "premise: the block left a held tail (a partial write), or this test tears nothing"
+    );
+
+    // The client drains; credit returns; the owed tail is flushed by the next
+    // write, then one more frame goes after it.
+    let mut reader = ServerFrameReader::default();
+    let mut seen: Vec<u64> = Vec::new();
+    let drain = |client: &mut ClientNet,
+                 server: &mut _,
+                 wt: &mut _,
+                 now_us: &mut u64,
+                 reader: &mut ServerFrameReader,
+                 seen: &mut Vec<u64>| {
+        for _ in 0..400 {
+            pump_with_wt(client, server, wt, base, now_us, 8);
+            reader.push(&client.read_feedback_return(*now_us));
+            while let Some(f) = reader.next_frame() {
+                let (ty, payload) = f.expect("no torn or oversize frame");
+                assert_eq!(ty, SERVER_MSG_STATS_SAMPLE);
+                let s = StatsSample::decode_payload(&payload, &text_schema())
+                    .expect("every frame that arrives is whole");
+                seen.push(s.timestamp_us);
+            }
+        }
+    };
+    drain(
+        &mut client,
+        &mut server,
+        &mut wt,
+        &mut now_us,
+        &mut reader,
+        &mut seen,
+    );
+
+    let last = u64::MAX;
+    let conn = server.connections.values_mut().next().expect("connection");
+    assert_eq!(
+        wt.write_stats_frame(conn, &make(last)),
+        StatsWrite::Written,
+        "credit is back: the tail flushes and the new frame follows"
+    );
+    written.push(last);
+    drain(
+        &mut client,
+        &mut server,
+        &mut wt,
+        &mut now_us,
+        &mut reader,
+        &mut seen,
+    );
+
+    assert_eq!(wt.stats_tail_len(), 0, "nothing is left owed");
+    assert_eq!(reader.buffered(), 0, "no half frame is left in the reader");
+    assert_eq!(
+        seen, written,
+        "exactly the frames reported Written, in order, none torn, none refused ones"
+    );
+}
+
+/// A frame cut short by a full window must finish by itself once the window
+/// opens, with no further `on` and no further frame: the service flushes held
+/// tails every turn, subscribed or not. Without that, an `off` right after a
+/// partial write leaves the client's reader mid-frame for good.
+#[test]
+fn a_held_tail_is_flushed_without_another_frame() {
+    let (mut client, mut server, mut wt, mut now_us, base) = connected_session();
+    pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 32);
+    assert!(wt.note_stats_subscribe());
+
+    let frame = StatsSample {
+        schema_id: 1,
+        timestamp_us: 7,
+        values: vec![MetricValue::Text("x".repeat(200))],
+    }
+    .encode_frame();
+    for i in 0..200_000u64 {
+        let conn = server.connections.values_mut().next().expect("connection");
+        match wt.write_stats_frame(conn, &frame) {
+            StatsWrite::Written => {}
+            StatsWrite::Blocked => break,
+            other => panic!("frame {i}: {other:?}"),
+        }
+        assert!(i < 199_999, "premise: the window fills");
+    }
+    let owed = wt.stats_tail_len();
+    assert!(owed > 0, "premise: a partial write left a tail");
+
+    // The panel unsubscribes here; the server writes no more frames. Only the
+    // per-turn flush runs while the client drains.
+    let mut reader = ServerFrameReader::default();
+    for _ in 0..400 {
+        pump_with_wt(&mut client, &mut server, &mut wt, base, &mut now_us, 8);
+        let conn = server.connections.values_mut().next().expect("connection");
+        wt.flush_stats_tail(conn);
+        reader.push(&client.read_feedback_return(now_us));
+        while let Some(f) = reader.next_frame() {
+            f.expect("no torn frame");
+        }
+    }
+    assert_eq!(wt.stats_tail_len(), 0, "the tail was written");
+    assert_eq!(reader.buffered(), 0, "the reader holds no half frame");
 }

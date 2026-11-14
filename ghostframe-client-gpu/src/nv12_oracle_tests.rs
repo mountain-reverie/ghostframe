@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Oracle 2 (Task 8): the shipped `h264_nv12_blit.wgsl` against the CPU
 //! reference in `nv12_reference.rs`, in the two exact tiers design doc
 //! §9.1-9.3 measured this GPU actually needs -- not the plan's original

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Wire-sequence FEC parity decoder.
 //!
 //! Port of `ghostframe-web-client/src/parity_decoder.ts`. Maintains a

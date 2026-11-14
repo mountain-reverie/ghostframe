@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 package main
 
 // NOTE: these tests exercise the plain-Go helpers behind gbridge_login_url

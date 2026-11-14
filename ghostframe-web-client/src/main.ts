@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 import { FullFrameDecoder, H264_DECODE_ERROR } from './decoder.js';
 import { WebGpuRenderer } from './webgpu/renderer.js';
 import { WebGpuUnavailableError } from './webgpu/init.js';
@@ -7,6 +8,7 @@ import { createStatsLogger } from './stats_log.js';
 import { installCdf53Debug } from './cdf53_debug.js';
 import { initDiagnostics } from './diagnostics.js';
 import { bootstrap } from './bootstrap.js';
+import { pumpServerStream } from './server_stream.js';
 import { initProtocol, protocol } from './protocol_constants.js';
 import { showDisconnectedOverlay } from './disconnect_overlay.js';
 import { closeOverlayMessage } from './close_message.js';
@@ -19,6 +21,7 @@ import { health, installConsoleRing } from './health.js';
 import * as wasmExports from '../pkg-web/ghostframe_client_wasm.js';
 import init, {
   WasmClientCore,
+  mountStatsPanel,
   WasmDecodeErrorBatcher,
   tileNackEnvelope,
   errorCodes,
@@ -148,15 +151,16 @@ async function main() {
   // Can be null — construction catches a failure to open the bidi stream
   // and returns null rather than throwing, so every write site below must
   // treat it as optional.
-  const feedbackWriter = await (async () => {
+  const feedback = await (async () => {
     try {
       const bidi = await transport.createBidirectionalStream();
-      return bidi.writable.getWriter();
+      return { writer: bidi.writable.getWriter(), readable: bidi.readable };
     } catch {
       console.warn('Could not open feedback stream');
       return null;
     }
   })();
+  const feedbackWriter = feedback ? feedback.writer : null;
 
   // ACK/NACK datagram writer, needed by drainTransmit immediately: the
   // core queues its HELLO output at construction, and that queue is
@@ -246,6 +250,25 @@ async function main() {
     await drainTransmit();
   } catch (e) {
     console.warn('HELLO write failed:', e);
+  }
+
+  // Stats panel (docs/specs/stats-panel-design.md). A broken panel must never
+  // break the stream: mounting is caught and logged, and the session carries
+  // on without one. `?e2e=lossless` strips the page chrome so a screenshot
+  // holds only the canvas; the tab would sit over it, so no panel there.
+  if (!url.searchParams.getAll('e2e').includes('lossless')) {
+    try {
+      const host = document.getElementById('stats-panel');
+      if (!host) throw new Error('#stats-panel is missing from index.html');
+      mountStatsPanel(host, core);
+    } catch (e) {
+      console.warn('stats panel failed to mount; continuing without it', e);
+    }
+  }
+  // The server writes stats on the feedback stream's return half. Nothing is
+  // sent until the panel subscribes, so this is idle by default.
+  if (feedback) {
+    void pumpServerStream(feedback.readable, (bytes) => core.handleServerStream(bytes, nowUs()));
   }
 
   // Browser → server input forwarding. Hooks pointer / wheel / keyboard
@@ -667,6 +690,7 @@ async function main() {
 
     // A throw here must not stop the rAF loop: it would freeze the client
     // for the rest of the session on one bad frame.
+    const submitsBefore = renderer.submitCount;
     try {
       renderer.encodeAndPresentFrame((codec, tx, ty, code) => {
         reportDecodeError(codec, tx, ty, code);
@@ -675,6 +699,12 @@ async function main() {
       health.record('encodeAndPresentFrame', e);
       console.error('encodeAndPresentFrame failed; continuing', e);
     }
+
+    // Frames actually submitted this tick (an idle tick skips and adds none),
+    // for the stats panel's painted-fps row. Until the renderer moves into
+    // Rust the core cannot see paints, so the host reports them.
+    const painted = renderer.submitCount - submitsBefore;
+    if (painted > 0) core.recordPaints(painted);
 
     // Drain accounting + the ~2 s stats line live in stats_log.ts.
     statsLog.onTick(beforeDrain, __rafTicks);

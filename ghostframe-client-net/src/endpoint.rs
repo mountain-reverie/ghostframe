@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Sans-IO quinn-proto endpoint driver, narrowed to the client role.
 //!
 //! Modeled on `TestEndpoint` in `ghostframe-e2e/tests/loopback_h3.rs:78-207`,

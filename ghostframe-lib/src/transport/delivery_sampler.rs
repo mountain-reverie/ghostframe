@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Per-transmission delivery-rate samples (D1 PR-6b): the glue between
 //! ghostframe's departures and acknowledgements and the ported TQUIC
 //! estimator in [`crate::transport::delivery_rate`].

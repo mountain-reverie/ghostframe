@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Central facade that ties cache, emission queue, allocator, group
 //! builder, the loss-path queue and the probe timer into one struct.
 //! Per-session.

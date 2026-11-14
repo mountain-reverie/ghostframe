@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! X11 test pattern app for E2E tests.
 //!
 //! Draws deterministic color patterns on the X11 root window so the E2E test

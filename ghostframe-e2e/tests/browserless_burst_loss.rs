@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Does the retransmit machinery treat burst loss differently from i.i.d.
 //! loss at the same long-run rate?
 //!

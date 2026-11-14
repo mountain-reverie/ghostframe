@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! First-pass demand: what the tile codec's first pass costs on the wire.
 //!
 //! "First pass" is the critical tier: the only pass of a Solid or PalRle

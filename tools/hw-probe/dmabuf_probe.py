@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Does GStreamer's V4L2 stateless H.264 decoder hand out dmabuf-backed buffers?
 
 Decodes the first few frames of an Annex-B H.264 elementary stream through

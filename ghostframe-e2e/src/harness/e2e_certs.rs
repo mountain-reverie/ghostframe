@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Generates a self-signed TLS cert + key for the e2e harness to inject
 //! into ghostbridge via GHOSTFRAME_WEB_TLS_{CERT,KEY}_PEM env vars.
 //! Also derives the cert's SPKI fingerprint so Chrome can be launched

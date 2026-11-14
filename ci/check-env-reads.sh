@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # Each crate reads the process environment in exactly one place, its
 # config.rs, and passes the parsed values down. This script is the guard for
 # that rule. CI's clippy job and `just ci-local` / `just ci-client` both run

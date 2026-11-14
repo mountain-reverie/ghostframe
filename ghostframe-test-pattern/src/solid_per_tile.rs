@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `--solid-per-tile --x11-sink` mode.
 //!
 //! Paints a fixed scene into a frame buffer so the classifier sees

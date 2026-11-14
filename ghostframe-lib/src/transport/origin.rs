@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Origin check for the WebTransport CONNECT.
 //!
 //! A browser tab on a tailnet machine can open a WebTransport session to any

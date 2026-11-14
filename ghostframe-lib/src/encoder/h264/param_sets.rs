@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Packed SPS and PPS for the libva-direct backend (design 3.1, S2 g).
 //!
 //! The backend hands these to the driver as packed headers. Mesa parses them

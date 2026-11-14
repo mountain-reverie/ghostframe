@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! A scripted bottleneck against the whole loss path (D1 F4 part 2): the
 //! emitter, the transmission ledger and `loss_path`, the code production runs.
 //!

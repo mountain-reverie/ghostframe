@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Native client library for `ghostframe-client-capi`.
 //!
 //! Owns the tsnet transport, a net, a decode and a render thread, and exposes

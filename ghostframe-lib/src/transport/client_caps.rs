@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! HELLO message (msg_type = 0x03): client → server one-shot
 //! capability advertisement on the reliable bidi FEEDBACK stream.
 //!

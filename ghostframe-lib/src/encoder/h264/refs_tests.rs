@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! T1 for the `RefManager`: a closed-loop simulation of server, network and
 //! client, with the real slice-header writer and parser in the path.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use std::time::Instant;
 fn main() {
     for &(k, r, len, it) in &[(10usize, 1usize, 128usize, 20000u32), (10, 2, 1180, 5000), (40, 8, 1180, 500), (200, 40, 1180, 20), (200, 20, 1180, 20)] {

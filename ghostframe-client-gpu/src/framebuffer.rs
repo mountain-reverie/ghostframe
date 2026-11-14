@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The private persistent framebuffer.
 //!
 //! Never exported. Tiles patch it in place and it is blitted into an export

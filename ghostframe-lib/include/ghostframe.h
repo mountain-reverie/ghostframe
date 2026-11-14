@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -207,6 +209,19 @@
 #define DISPLAY_MODE_MSG_TYPE 8
 
 /**
+ * Client request to start or stop the server's connection-stats stream,
+ * `[STATS_SUBSCRIBE_MSG_TYPE, on]` with `on` 1 or 0; see
+ * `ghostframe_protocol::stats::StatsSubscribe`. 0x0A is skipped: it is the frame-ack
+ * datagram envelope.
+ */
+#define STATS_SUBSCRIBE_MSG_TYPE 11
+
+/**
+ * Encoded length of a stats subscribe message.
+ */
+#define STATS_SUBSCRIBE_SIZE 2
+
+/**
  * HELLO capability bit 0: the client can decode `indices_raw` PalRLE
  * payloads (PalRLE flags bit 1).
  */
@@ -374,6 +389,21 @@
  * Encoded length of a [`FrameAck`].
  */
 #define FRAME_ACK_SIZE (((1 + 4) + 8) + 8)
+
+/**
+ * Server-to-client frame type: the metric list.
+ */
+#define SERVER_MSG_STATS_SCHEMA 1
+
+/**
+ * Server-to-client frame type: one value per descriptor.
+ */
+#define SERVER_MSG_STATS_SAMPLE 2
+
+/**
+ * Largest payload of one server-to-client frame.
+ */
+#define SERVER_FRAME_MAX_LEN (16 * 1024)
 
 #define TILE_SIZE 32
 

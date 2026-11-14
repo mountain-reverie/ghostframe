@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Minimal hand-written libva bindings for the direct H.264 encoder.
 //!
 //! libva and libva-drm are `dlopen`ed, so a machine without them (or without

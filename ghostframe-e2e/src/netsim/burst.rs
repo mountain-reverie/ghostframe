@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Gilbert-Elliott burst-loss parameters, solved from quantities a test
 //! cares about (long-run loss rate, mean loss-run length) instead of the raw
 //! transition probabilities.

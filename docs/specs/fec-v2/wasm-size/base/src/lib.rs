@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 #[no_mangle]
 pub extern "C" fn xor_encode(ptr: *const u8, k: usize, len: usize, out: *mut u8) {
     let data = unsafe { core::slice::from_raw_parts(ptr, k*len) };

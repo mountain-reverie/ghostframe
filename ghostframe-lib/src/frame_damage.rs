@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! What a producer knows about the pixels that changed since its previous
 //! submission (damage-driven encoding, design note section 3.2).
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // cdf53_inverse_l3.wgsl — innermost-level inverse lifting (8×8 working area).
 //
 // Reads sign+magnitude from persistent buffers, assembles signed i32

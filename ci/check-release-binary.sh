@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # A release ghostframe-server must not contain the env-var names of the test
 # knobs that ghostframe-lib compiles out unless `test-loss-injection` is on.
 # Those names exist in the binary as string literals only when the code that

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Generator for the unrolled lifting functions of `cdf53_encode.comp`.
 //!
 //! The shader holds each line of a 5/3 lifting pass in locals (`v0..v31`),

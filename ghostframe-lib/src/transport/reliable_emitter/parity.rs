@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! XOR parity primitive for FEC. Left-pads shorter source slices with
 //! zeros so XOR is defined over a group of sources with varying lengths.
 

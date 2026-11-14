@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! An oracle for the **GPU** Cdf53 reconstruction under sparse pass sets.
 //!
 //! # Why this exists

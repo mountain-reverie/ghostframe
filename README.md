@@ -472,3 +472,21 @@ silently drops test binaries that fail to compile and still reports
 
 - Build, test, contribute: [DEVELOPERS.md](DEVELOPERS.md)
 - Protocol and architecture: [docs/specs/ghostframe-initial-spec.md](docs/specs/ghostframe-initial-spec.md)
+
+## Licence
+
+Ghostframe is licensed in two parts:
+
+- **The server** (`ghostframe-lib`, `ghostframe-server`, and the test crates
+  built on them) is under the [GNU AGPL v3 or later](LICENSES/AGPL-3.0-or-later.txt).
+  If you run a modified server for other people, you must offer them its
+  source.
+- **Everything else** is under [MIT](LICENSES/MIT.txt) or
+  [Apache-2.0](LICENSES/Apache-2.0.txt), at your option. That covers the wire
+  format, the tailnet bridge, the native client and its C library, the
+  browser client, and the tools.
+
+So you can embed the client in any program, including a proprietary one or
+a BSD- or LGPL-licensed one such as Enlightenment.
+[LICENSE](LICENSE) lists which crate is under which licence, and
+[NOTICE](NOTICE) lists the third-party code in the tree.

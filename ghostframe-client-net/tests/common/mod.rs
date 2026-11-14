@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Shared test plumbing for `ghostframe-client-net`'s integration tests.
 //!
 //! Everything here drives a *real* `ghostframe_lib::transport::quic::QuicServer`
@@ -108,7 +109,13 @@ pub fn shuttle(client: &mut ClientNet, server: &mut QuicServer, now: Instant, no
 
     server.drain_endpoint_events();
     while let Some(t) = server.poll_transmit(now, 10, &mut buf) {
-        client.handle_udp(&buf[..t.size], server_addr, now_us);
+        // quinn-proto may coalesce several datagrams into one buffer (GSO);
+        // each `segment_size` slice is its own datagram, and handing the
+        // whole buffer over as one drops all but the first.
+        let seg = t.segment_size.unwrap_or(t.size).max(1);
+        for chunk in buf[..t.size].chunks(seg) {
+            client.handle_udp(chunk, server_addr, now_us);
+        }
         buf.clear();
         moved = true;
     }

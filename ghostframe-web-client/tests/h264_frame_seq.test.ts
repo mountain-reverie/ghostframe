@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // The frame_seq of an H.264 frame must come back with the decoded frame, even
 // when an earlier chunk was rejected. A side FIFO of seqs pushed before
 // decode() went out of step on exactly that: VideoDecoder.decode() throws

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The tsnet state directory: whether it is seeded, and the lock that keeps
 //! two tsnet instances off one `tailscaled.state`.
 //!

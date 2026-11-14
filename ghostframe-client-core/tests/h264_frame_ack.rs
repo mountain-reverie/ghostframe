@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Frame acks (datagram 0x0A) out of `ClientCore`: what the gate refuses and
 //! what the decoder reports reach the wire as the cumulative masks, riding the
 //! ack batch (never a packet of their own), on the caller's clock (no

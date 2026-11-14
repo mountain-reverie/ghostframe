@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
 set -euo pipefail
 
 until curl -fsS http://headscale:8080/health >/dev/null 2>&1; do

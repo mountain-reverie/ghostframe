@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Loss/suspension tracking and Hello/ReceiverFeedback wire encoders. Ports
 //! `ghostframe-web-client/src/feedback.ts`, but time is injected
 //! (`now_us: u64`) instead of using `performance.now()`.

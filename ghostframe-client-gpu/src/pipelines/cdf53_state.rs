@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Host-side bookkeeping for [`crate::pipelines::cdf53_grid::Cdf53Grid`]: what
 //! each tile has received, what is on screen, and which tiles to reconstruct in
 //! the next flush.

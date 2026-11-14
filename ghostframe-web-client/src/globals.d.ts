@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 /// <reference types="@webgpu/types" />
 
 declare module '*.wgsl?raw' {

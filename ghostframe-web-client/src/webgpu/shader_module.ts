@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 /**
  * Create a `GPUShaderModule` with a debug label and surface any WGSL
  * compilation messages to the browser console.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use ghostframe_client_core::decode_error_batcher::DecodeErrorBatcher;
 use ghostframe_client_core::DecodeErrorCode;
 use ghostframe_protocol::protocol::Codec;

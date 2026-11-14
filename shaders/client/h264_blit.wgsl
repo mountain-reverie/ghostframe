@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // H.264 textured-quad blit: samples a GPUExternalTexture (from
 // importExternalTexture on a WebCodecs VideoFrame) and writes its
 // content into the current render-pass viewport.

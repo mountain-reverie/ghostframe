@@ -2,6 +2,7 @@
   "name": "ghostframe-web-client",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT OR Apache-2.0",
   "scripts": {
     "dev": "vite",
     "build": "npm run build:wasm && tsc && vite build",

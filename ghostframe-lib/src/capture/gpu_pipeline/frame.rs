@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Per-frame compute dispatch path for [`GpuFrameProcessor`].
 //!
 //! Owns the orchestrator methods (`process_frame_inner`,

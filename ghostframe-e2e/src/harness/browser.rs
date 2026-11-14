@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Browser-driver abstraction for the e2e harness.
 //!
 //! The two impls (`ChromiumSession` + `FirefoxSession`) wrap different

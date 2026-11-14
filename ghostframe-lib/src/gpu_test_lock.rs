@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Test-only: one lock for everything in this test binary that drives the GPU.
 //!
 //! The Vulkan capture tests (`GpuFrameProcessor`) and the VA-API encoder tests

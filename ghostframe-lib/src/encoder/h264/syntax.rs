@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! H.264 slice-header syntax: a writer, a parser, and a decoder model that
 //! reports which picture a P slice really references.
 //!

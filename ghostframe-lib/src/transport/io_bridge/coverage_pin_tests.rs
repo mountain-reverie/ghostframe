@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Pins what the ACK path does with an emitted tile-pass's metadata
 //! (codec, generation, palette id, bundled flag), end to end.
 //!

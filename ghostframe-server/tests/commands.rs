@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The `ghostframe-server` binary's command-line contract, run as a
 //! subprocess with an empty environment. Every case here fails before tsnet
 //! is touched, so none needs a tailnet. None needs a display either, except

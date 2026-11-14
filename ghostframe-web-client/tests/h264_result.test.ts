@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // The browser reports what its decoder did with each H.264 access unit, and
 // the wasm core turns that into the frame ack (0x0A), the reference gate's
 // state and the paced IDR request (0x09) -- the same ClientCore as native.

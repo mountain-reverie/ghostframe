@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Throwaway prototype: systematic Cauchy RS over GF(2^8) whose first repair
 //! row is all ones (so single-erasure recovery is plain XOR). Research only.
 #![allow(clippy::needless_range_loop)]

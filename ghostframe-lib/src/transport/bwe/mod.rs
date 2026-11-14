@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Bandwidth-estimator wrapper backed by a real GoogCC controller.
 //!
 //! # Design note — why not `str0m::bwe::Bwe`?

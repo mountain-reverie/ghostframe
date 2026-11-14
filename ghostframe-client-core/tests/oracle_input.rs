@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 /// Oracle tests ported from ghostframe-web-client/tests/input.test.ts
 /// All byte sequences and keysym mappings are exact replicas of the vitest tests.
 use ghostframe_client_core::input::{

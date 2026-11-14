@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Records the RandR notifications a window manager receives.
 //!
 //! A window manager learns about a mode change only through these events, so

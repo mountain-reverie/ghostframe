@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `Openh264Sim`: a deterministic stand-in for libopenh264's long-term
 //! reference machinery, for driving the observed-mode `RefManager` without
 //! the library.

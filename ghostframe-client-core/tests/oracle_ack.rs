@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use ghostframe_client_core::ack_batcher::AckBatcher;
 use ghostframe_protocol::ack::{AckBatch, AckEntry, ACK_ENTRY_SIZE, ACK_OVERLAP_COUNT};
 

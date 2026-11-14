@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! One-off verification tool: sweeps a wide range of width/height/refresh
 //! combinations through `cvt::reduced_blanking` and compares every field
 //! against the real `cvt(1)` binary (package `libxcvt`), the oracle this

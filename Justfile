@@ -133,6 +133,8 @@ ci-client: build-client
     ci/check-test-features.sh
     @echo "=== no home-directory paths in tracked files ==="
     ci/check-local-paths.sh
+    @echo "=== licences: crate fields, AGPL containment, SPDX headers ==="
+    ci/check-licenses.py
     @echo "=== clippy + unit tests (native client) ==="
     just test-client
     @echo "=== cbindgen header up-to-date ==="
@@ -143,6 +145,12 @@ ci-client: build-client
     @echo "=== GStreamer decode backend still compiles ==="
     just check-gstreamer
     @echo "=== ci-client passed ==="
+
+# The stats panel's host tests and its headless-Chrome test (wasm-pack drives
+# chromedriver; needs Chrome or Chromium installed).
+test-web-ui:
+    cargo test -p ghostframe-web-ui
+    wasm-pack test --headless --chrome ghostframe-web-ui
 
 # Run from a clean checkout: builds the web client SPA (vite) into
 # ghostframe-web-client/dist/, which ghostbridge //go:embeds at compile
@@ -222,7 +230,8 @@ fmt:
     cargo fmt --all
 
 # Run the fast CI tier (everything in .github/workflows/ci.yml) locally,
-# in the same order. Does NOT run e2e — use `just test-e2e` for that.
+# in the same order. Also covers client-core.yml's stats panel job, which needs
+# wasm-pack 0.15.0 and Chrome. Does NOT run e2e — use `just test-e2e` for that.
 ci-local:
     @echo "=== fmt-check ==="
     just fmt-check
@@ -232,6 +241,8 @@ ci-local:
     ci/check-test-features.sh
     @echo "=== no home-directory paths in tracked files ==="
     ci/check-local-paths.sh
+    @echo "=== licences: crate fields, AGPL containment, SPDX headers ==="
+    ci/check-licenses.py
     @echo "=== release daemon has no test-only features ==="
     ci/check-release-features.sh
     @echo "=== clippy ==="
@@ -241,6 +252,8 @@ ci-local:
     cargo test --workspace --lib
     cargo test --workspace --bins
     cargo test -p ghostframe-server --test commands
+    @echo "=== stats panel (host tests + headless Chrome) ==="
+    just test-web-ui
     @echo "=== web client build ==="
     just build-web
     cd ghostframe-web-client && npx tsc --noEmit

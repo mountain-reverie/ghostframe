@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // cdf53_inverse_l1_pass2.wgsl — runs the 32×32 inverse lifting (per column,
 // per row) and writes reconstructed BGR pixels to the framebuffer.
 //

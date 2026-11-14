@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The damage safety net: sweep, confirmation, trust (design 3.4).
 //!
 //! Damage hints are only ever a claim. This module is what keeps a consumer of

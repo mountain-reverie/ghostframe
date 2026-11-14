@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Replays a trace through TQUIC's delivery_rate.rs, compiled UNMODIFIED from src/delivery_rate.rs
 // (fetched by the recipe in the vectors file header; it is gitignored). Prints each
 // trace line, and after every A line the estimator's readings as an R line.

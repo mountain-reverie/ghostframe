@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // The constants module is a thin, frozen view of what Rust exports. These
 // tests pin that it really is Rust's value (not a copy), and pin the exact
 // numbers that are part of the wire contract so a silent change on the Rust

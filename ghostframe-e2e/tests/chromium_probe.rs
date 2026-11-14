@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Diagnostic probe: launches the same Chromium binary the e2e tests use
 //! and queries its codec support via the MediaCapabilities and WebCodecs
 //! APIs. Prints results to stderr.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Can this machine decode H.264 through VA-API?
 //!
 //! The `vaapi` backend's half of the capability probe. `probe_v4l2.rs` is the

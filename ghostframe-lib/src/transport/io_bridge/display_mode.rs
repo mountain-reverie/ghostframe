@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Display-mode negotiation: debouncing and applying a client's `DisplayMode`.
 //!
 //! Owns the `DisplayMode` clamp/align policy (`clamp_and_align_mode` and its

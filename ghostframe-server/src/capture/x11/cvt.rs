@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! VESA CVT (Coordinated Video Timings) reduced-blanking (RB v1) modeline
 //! calculation.
 //!

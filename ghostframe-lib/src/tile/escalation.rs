@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Pure escalation-candidate detector for M3.3c idle-tile refinement.
 //!
 //! Identifies tiles that should escalate to CDF 5/3 refinement: tile is

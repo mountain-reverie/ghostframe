@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! A model oracle and metamorphic properties for the **whole client tile
 //! pipeline** — `ClientCore::handle_datagram` in, `Event::TileReady` out.
 //!

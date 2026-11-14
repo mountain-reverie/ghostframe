@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The CPU reference for `h264_nv12_blit.wgsl`.
 //!
 //! Exists so the shader can be checked against something, and so the

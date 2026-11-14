@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! T3 scenes on the real acked-reference policy (design 10, B5b).
 //!
 //! The stream is planned by production's `RefManager` path: the manager, the

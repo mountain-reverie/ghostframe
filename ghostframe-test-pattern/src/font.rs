@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Hand-rolled 6×8 monospace bitmap font, just enough characters for the
 //! `--text-grid` test pattern. Each glyph is 8 rows of u8; bit 5 is the
 //! left-most pixel ("ink"), bit 0 is the right-most pixel.

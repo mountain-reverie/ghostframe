@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Shared polling helper for the native-client e2e acceptance tests
 //! (`tests/native_client.rs`, `tests/h264.rs`, `tests/eviction.rs`). Lives
 //! in `tests/common/` rather than being copy-pasted per test file -- every

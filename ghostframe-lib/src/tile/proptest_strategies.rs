@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Reusable `proptest` strategies for tile-level testing.
 //!
 //! Frames are produced as `(pixels, stride, width, height)` tuples in the same

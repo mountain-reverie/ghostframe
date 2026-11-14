@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 use ghostframe_e2e::harness as helpers;
 use ghostframe_e2e::harness::BrowserSession as _;
 use ghostframe_lib::transport::protocol::Codec;

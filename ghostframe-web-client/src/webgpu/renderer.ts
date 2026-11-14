@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 import { initWebGpu, type WebGpuInitResult } from './init.js';
 import { Framebuffer } from './framebuffer.js';
 import { SolidPipeline, type SolidTile } from './solid.js';

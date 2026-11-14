@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! A P frame whose reference was never delivered is not handed to the decoder:
 //! with a 3 s GOP a silent reference break leaves the picture wrong for
 //! seconds. The client holds P frames back, asks for an IDR (paced), and

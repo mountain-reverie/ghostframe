@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Test-only: synthesize a known H.264 clip with libx264.
 //!
 //! Not `#[cfg(test)]` because the oracle in `ghostframe-e2e` and the

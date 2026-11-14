@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The export ring: N GPU-exported dmabuf buffers, filled from the private
 //! [`Framebuffer`] with history-aware partial blits.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! T3 scenes with the real openh264 library as the encoder (design 10, B7-4).
 //!
 //! The same client, links and seeds as `refs_scenes`, but the access units are

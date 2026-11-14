@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Token-bucket bandwidth cap for tests + bench scenarios.
 //!
 //! `GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP` sets bytes-per-second; absent or zero

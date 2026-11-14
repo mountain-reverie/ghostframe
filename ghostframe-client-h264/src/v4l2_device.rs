@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Which `/dev/videoN` is the stateless H.264 decoder — asked with raw ioctls.
 //!
 //! `probe.rs` needs an **independent ground truth** for the oracles: "does this

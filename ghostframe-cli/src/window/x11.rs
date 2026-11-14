@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The X11 [`Backend`]: x11rb (libxcb-backed) + DRI3 + Present.
 //!
 //! A handful of decisions here are load-bearing enough to spell out once,

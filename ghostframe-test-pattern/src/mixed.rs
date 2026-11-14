@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `--mixed` pattern: four content classes painted on disjoint regions of
 //! the root window. The same `REGIONS` table is consumed by the renderer
 //! and by the e2e test — single source of truth for geometry and the M3

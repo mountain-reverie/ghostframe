@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! CDF 5/3 through the `Renderer` with the GPU grid enabled: scheduling
 //! (budget, throttle, skips), generations and paint order, against the CPU
 //! decoder (`Cdf53TileState`) as the reference for what should be on screen.

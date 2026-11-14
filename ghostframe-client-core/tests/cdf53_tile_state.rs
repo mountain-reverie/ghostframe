@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Oracle tests for CPU CDF53 per-tile accumulation → RGBA reconstruction.
 //! Uses `ghostframe_protocol::codec::cdf53::{forward, encode_passes, inverse}`
 //! as the server-side oracle to build accepted passes and expected pixels.

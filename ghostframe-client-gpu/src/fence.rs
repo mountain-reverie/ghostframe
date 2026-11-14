@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The fence a publish hands its consumers, on the Vulkan backend: an
 //! exportable binary semaphore, signalled by the frame's submit and exported
 //! as a sync_file (`VK_KHR_external_semaphore_fd`, `SYNC_FD`).

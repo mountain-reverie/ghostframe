@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Transport instruments for the `cumulative emit` log line and the
 //! browserless harness. MEASUREMENT ONLY: nothing here is read by a
 //! scheduling, pacing, loss or congestion decision, and nothing changes a

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Reset requests (feedback stream 0x09) through the wasm core. Decode failures
 // no longer come through here: the gate sends and paces them (see
 // h264_result.test.ts).

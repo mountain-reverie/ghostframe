@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! M3.5 Layer A side-channel JSON writer.
 //!
 //! Criterion's macros measure latency only. We also need per-(codec,

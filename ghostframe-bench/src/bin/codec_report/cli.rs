@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `codec_report` CLI definition. See:
 //! `docs/superpowers/specs/2026-06-01-m3.5-bench-publication-design.md` §Layer B.
 

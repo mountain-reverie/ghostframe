@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Nothing in CI parses a client shader otherwise.
 //!
 //! `naga` only parses WGSL at `create_shader_module` time, and every place
