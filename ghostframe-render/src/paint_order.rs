@@ -104,6 +104,24 @@ impl SeqLedger {
             || self.max_tile.is_some_and(|t| seq_newer(t, seq))
     }
 
+    /// The newest `frame_seq` noted for tile `(tx, ty)`, for diagnostics.
+    pub(crate) fn newest_for(&self, tx: u8, ty: u8) -> Option<u32> {
+        self.newest
+            .get(ty as usize * 256 + tx as usize)
+            .copied()
+            .flatten()
+    }
+
+    /// The newest `frame_seq` of a tile entry noted anywhere, for diagnostics.
+    pub(crate) fn max_tile(&self) -> Option<u32> {
+        self.max_tile
+    }
+
+    /// The newest H.264 picture noted, for diagnostics.
+    pub(crate) fn h264(&self) -> Option<u32> {
+        self.h264
+    }
+
     pub(crate) fn clear(&mut self) {
         self.newest.fill(None);
         self.max_tile = None;

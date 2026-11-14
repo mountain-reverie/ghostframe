@@ -22,6 +22,15 @@ pub(crate) mod paint_order;
 pub mod pipelines;
 pub mod readback;
 pub mod submit;
+pub mod tile_renderer;
+
+#[cfg(test)]
+mod noop_device;
+
+pub use tile_renderer::{
+    dimensions_valid, tile_grid, DebugState, DebugTile, FlushReport, GpuDecodeError, NoSlots,
+    SlotSink, SlotTile, TileRenderer,
+};
 
 use thiserror::Error;
 
