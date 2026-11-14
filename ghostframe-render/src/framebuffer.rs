@@ -27,7 +27,7 @@ const USAGE: wgpu::TextureUsages = wgpu::TextureUsages::STORAGE_BINDING
 /// The client's private, persistent framebuffer.
 ///
 /// Holds the one texture tiles are decoded into and patched against across
-/// the lifetime of a session. Distinct from any [`crate::export::ExportedImage`]:
+/// the lifetime of a session. Distinct from any `ExportedImage` (native):
 /// this texture is never itself exported, only blitted into one.
 /// Lazily-built pipeline for the export blit. Built on first use rather than
 /// in `new` because a `Framebuffer` is also constructed in tests that never
@@ -130,7 +130,7 @@ impl Framebuffer {
     }
 
     /// Blit the whole framebuffer into `dst` (e.g. an
-    /// [`crate::export::ExportedImage`] wrapped via `as_wgpu_texture`).
+    /// `ExportedImage` (native) wrapped via `as_wgpu_texture`).
     pub fn blit_full(&self, device: &wgpu::Device, queue: &wgpu::Queue, dst: &wgpu::Texture) {
         let full = crate::coalesce::Rect {
             x: 0,
@@ -324,65 +324,25 @@ impl Framebuffer {
             .expect("poll after debug_fill_tile");
     }
 
-    /// Read the framebuffer back as tight RGBA. Test use only.
+    /// Read the framebuffer back as tight RGBA (`width * height * 4` bytes).
+    ///
+    /// Completes when the GPU has delivered the bytes. A browser's event loop
+    /// drives that; on native something must poll the device while the future
+    /// is pending, which is what [`crate::readback::block_on_device`] does.
+    pub async fn read_rgba(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<Vec<u8>, crate::GpuError> {
+        crate::readback::read_texture_rgba8(device, queue, &self.texture, self.width, self.height)
+            .await
+    }
+
+    /// [`Framebuffer::read_rgba`], blocking. Native only; test use.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn debug_read(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<u8> {
-        let unpadded_bytes_per_row = self.width * 4;
-        let padded_bytes_per_row = unpadded_bytes_per_row
-            .div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
-            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-
-        let buffer_size = padded_bytes_per_row as u64 * self.height as u64;
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ghostframe-framebuffer-debug-read"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("ghostframe-framebuffer-debug-read"),
-        });
-        encoder.copy_texture_to_buffer(
-            self.texture.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &staging,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_bytes_per_row),
-                    rows_per_image: Some(self.height),
-                },
-            },
-            wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
-        );
-        crate::submit::submit(queue, encoder);
-
-        let slice = staging.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |r| {
-            r.expect("map debug_read staging buffer")
-        });
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("poll debug_read");
-
-        let padded = slice.get_mapped_range().expect("get_mapped_range");
-
-        // Strip row padding: the staging buffer's rows are padded to
-        // `COPY_BYTES_PER_ROW_ALIGNMENT`, but callers want a tight
-        // `width * height * 4` buffer. Skipping this looks correct at the
-        // start of each row and drifts further out of alignment with every
-        // row after that.
-        let mut tight = Vec::with_capacity(unpadded_bytes_per_row as usize * self.height as usize);
-        for row in 0..self.height as usize {
-            let start = row * padded_bytes_per_row as usize;
-            let end = start + unpadded_bytes_per_row as usize;
-            tight.extend_from_slice(&padded[start..end]);
-        }
-
-        tight
+        crate::readback::block_on_device(device, self.read_rgba(device, queue))
+            .expect("framebuffer readback")
     }
 }
 

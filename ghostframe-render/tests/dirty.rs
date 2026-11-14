@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-use ghostframe_client_gpu::dirty::{DirtyGrid, DirtyHistory};
+use ghostframe_render::dirty::{DirtyGrid, DirtyHistory};
 
 #[test]
 fn grid_records_and_reports_set_tiles() {

@@ -1,7 +1,27 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! The portable tile renderer shared by the native and the web client.
 //!
-//! Scaffold: the modules arrive in the following commits.
+//! The framebuffer, the Solid / PalRLE / RGBA / CDF 5/3 pipelines, the
+//! paint-order ledger and the damage bookkeeping, extracted from
+//! `ghostframe-client-gpu`. The crate builds for `wasm32-unknown-unknown`: no
+//! threads, no blocking waits (except in the native-only helpers marked as
+//! such), no `std::time::Instant`. Time comes in as `now_us`.
+//!
+//! ## Catch-all match arms
+//!
+//! `clippy::wildcard_enum_match_arm` is on for non-test code, as in
+//! `ghostframe-client-gpu`: a `_ =>` arm that silently absorbs a new variant
+//! hid real defects twice. List the variants, so adding one is a compile error
+//! at every site that must decide about it.
+#![cfg_attr(not(test), warn(clippy::wildcard_enum_match_arm))]
+
+pub mod coalesce;
+pub mod dirty;
+pub mod framebuffer;
+pub(crate) mod paint_order;
+pub mod pipelines;
+pub mod readback;
+pub mod submit;
 
 use thiserror::Error;
 
