@@ -289,9 +289,13 @@ refusing a dual-4K mode with no libopenh264 installed does not shut 1080p out.
 
 The rate target is `0.8 x` the bandwidth estimate (smoothed, floor 300 kbit/s)
 and `rate_target_bps` is the last rate it was told. A stream at `0.8 x` the
-estimate is not application-limited to goog_cc's ALR detector, so the bridge
-declares it so (`alr_signalled`, the detector is shown a sent size halved) and
-fills the probe windows goog_cc then asks for with padding when no IDR is due:
+estimate is not reliably application-limited to goog_cc's ALR detector (it
+spends the detector's 80 % budget as fast as it refills), so the bridge no
+longer pretends otherwise: there is no `alr_signalled` (it was removed; grep
+finds it only in old plans). The application starts probe clusters of its own
+(`app_probes`, `h264_start_app_probe`: twice the estimate every interval,
+chained while they succeed) and
+fills the probe windows goog_cc asks for with padding when no IDR is due:
 copies of an acknowledged P-frame fragment under new `wire_seq`s
 (`probe_padding_windows` / `probe_padding_bytes`; the client acknowledges and
 discards them). A jump of the raw estimate is held, and the estimate ceiling is
@@ -507,9 +511,77 @@ Env-gated, off by default:
 
 Tile XOR parity is gone (`GHOSTFRAME_TILE_FEC`, `TransportConfig::tile_fec` and
 `RunOptions::tile_fec` no longer exist). FEC v2 repair (REPAIR frames, R6-d) is
-implemented behind `GHOSTFRAME_FEC_BLOCKS` (see "Reading a live session"). With
-the knob unset every bundle is an unprotected PLAIN one and loss is recovered
-by retransmission only.
+implemented behind `GHOSTFRAME_FEC_BLOCKS`. With the knob unset every bundle is
+an unprotected PLAIN one and loss is recovered by retransmission only.
+
+### Reading FEC v2 (Reed-Solomon blocks)
+
+**Switch.** `GHOSTFRAME_FEC_BLOCKS` (read once at start, fixed for the process;
+`ghostframe-lib/src/config.rs`): unset, empty, `off` or `0` is **off** (the
+default); `adaptive` lets the controller choose; `k_max,t_ms,r` (e.g. `64,5,2`)
+fixes it, with `r` in 1..=32, `k_max` in 1..=255-r, `t_ms` in 1..=50. Anything
+else warns on target `ghostframe::config` and means off. `adaptive` starts
+with no repair live (every bundle PLAIN) until loss is shown.
+
+**Log lines**, all at the `cumulative emit` cadence, cumulative. `fec v2
+inbound`: `repair_requests_rx`, `declined_rx`, `recovered_rx`,
+`loss_reports_rx`, `repair_status_malformed`, `content_rejected_*`, and the
+last LOSS_REPORT as `client_lost_pre_fec` / `client_recovered` /
+`client_residual`. `fec v2 blocks` (only with the machinery on): closes by cause
+(`blocks_closed_kmax|time|empty|mtu`, `block_k_mean`), `repairs_sent`,
+`repair_bytes`, `closed_declined` (`blocks_closed_declined` is the bridge's
+copy), `closed_declined_late`, `block_requests_served`, `pto_repair_rows`.
+Zero `repairs_sent` with the knob on is a clean link (or adaptive still Clean),
+not a broken probe; zero `repair_requests_rx` means the client never needed a
+second round. `fec v2 adapt` (adaptive only): `adapt_state` (`clean` = loss not
+shown to reach the 0.1 % floor, r = 0; `engaged`), `adapt_p_hat_ppm` (decayed
+loss rate, ppm; congested intervals are skipped, counted in
+`adapt_congestion_skips`), `adapt_b_hat_x100` (mean loss-run length x 100),
+`adapt_k_max` / `adapt_t_ms` (the span in force), `adapt_r_at_k8` /
+`adapt_r_at_k64` (repair rows the sizer gives a block of 8 or 64 sources now),
+`adapt_changes` (state and span moves), `adapt_trim_steps` (times the
+declined-share trim added 1 to `r`), `adapt_blocks_sized` and `adapt_saturated`
+(blocks sized at the cap because the 1e-3 target was unreachable for the
+burst; a high share means the link is worse than the cap can fix).
+
+**Timing the client derives.** Each SOURCE carries the block's span `T_adv` as
+a 3-bit code in flags bits 4-6 (the knob's `t_ms` plus the queue allowance,
+rounded up to a table entry; code 0 means "nothing advertised", 33 ms). Each
+REPAIR carries an RTT hint in the scheme byte's high nibble (smoothed RTT
+rounded up, 0 = unknown, 15 saturates at 512 ms). Both sides compute from
+`ghostframe-protocol/src/fec/timing.rs`: the first window is `T_adv` + 10 ms
+after the block's first arrival, the REPAIR_REQUEST round is hint + 30 ms (the
+no-hint window if unknown), and an H.264 block is declined without a request
+when the hinted RTT exceeds 66 ms (the frame is superseded by then).
+
+**Declined.** `Declined` is the client giving up with no request served: `r`
+was too small. `DeclinedLate` is a decline after a REPAIR_REQUEST this table
+served at least one row for: it measures the request round, so the closed-loop
+trim (`DeclinedTrim`: +1 to `r` above 1 % declined of the last 256 closes,
+off below 0.5 %) does not count it. `closed_declined` includes both;
+`closed_declined_late` is the subset. A genuine `r` shortfall after a served
+request lands in `Late` too. There is no `late_rows` counter: read the served
+rows from `block_request_rows_sent`.
+
+**Accounting.** Every repair row (close, REPAIR_REQUEST, PTO, T_lr) is recorded
+in the ledger and added to the offered bytes (`offered_repair_B`), or
+`payload_fraction` falls to about `1 / (1 + rho)` and the ceiling misreads a
+saturated sender as unsaturated. The H.264 encoder is told `RATE_SHARE / (1 +
+rho)`, rho being the EWMA of repair over source wire bytes (`Rho`, clamped at
+0.5, 0 until blocks have been live for 2 s), so source plus repair stays at
+0.8 x the estimate.
+
+**Frame notch** (adaptive ladder, `Notch::Frame`; the others are narrow and
+wide, 20 ms at most). One block spans a frame: `T` is the frame interval and
+`T_adv` advertises it. Entered when `adapt_b_hat_x100` is above 600 (mean burst
+over 6) and the frame, with 20 % repair, no longer fits one 255-symbol block;
+left when the burst falls under 4 or the fill is 0.9 or less, to narrow below
+1.25 and wide otherwise. One notch change per second at most
+(`adapt_notch_changes`; `adapt_frame_entries` counts entries,
+`adapt_frame_notch` is the current state). The 6 and 4 are midpoints, not
+measured crossings. Zero entries at a low rate is expected: the notch needs
+rates where a frame exceeds one block (the gain was measured at 150 Mbit/s and
+up).
 
 See also `reference_e2e_loss_injection` and `reference_e2e_diagnose` notes for
 the e2e-side injection variables.
