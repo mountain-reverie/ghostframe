@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! RaptorQ reception overhead: P(decode fails | exactly n distinct symbols received).
 //! Two scenarios per (k, n): "mixed" = n symbols drawn uniformly from k sources + 2k+8 repairs
 //! (what a lossy path delivers to a systematic code); "repairs-only" = all n are repair symbols

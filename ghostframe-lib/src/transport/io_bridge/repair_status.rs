@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Inbound FEC v2 rev 6 feedback that is not an acknowledgement: LOSS_REPORT
 //! and REPAIR_REQUEST datagrams, and the repair-status stream's records
 //! (RECOVERED, CONTENT_REJECTED, DECLINED). Plan decisions 7-9 of

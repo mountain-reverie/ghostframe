@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The rev 6 framing on the send side: every
 //! datagram leaves inside a PLAIN bundle built by the per-session
 //! [`Packer`](crate::transport::fec_tx::packer::Packer).

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Turn results/*.tsv into the markdown tables used in RESULTS.md (written to results/tables.md)."""
 import collections
 R = "results/"

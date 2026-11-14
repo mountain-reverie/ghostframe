@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The recovery window as a function of what the server advertises.
 //!
 //! The server states two things in frames it already sends: the block's span

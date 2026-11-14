@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! FEC v2 rev 6 spike: native measurements. Subcommands: correct, speed, rq, rlc, varsize.
 #[path = "../../common/gf256.rs"]
 pub mod gf256;

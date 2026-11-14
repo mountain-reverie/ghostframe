@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Measurement A: rusty_erasure with our XOR-first matrix against the gf256 oracle.
 use super::*;
 

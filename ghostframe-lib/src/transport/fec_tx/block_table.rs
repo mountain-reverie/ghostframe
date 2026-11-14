@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Server-side block state machine (rev 6 step R6-d, task D3).
 //!
 //! Pure and sans-IO: no sockets, no `IoBridge`, time is an argument. The bridge

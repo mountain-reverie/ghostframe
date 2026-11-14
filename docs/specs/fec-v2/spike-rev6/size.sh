@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # gzip -9 and brotli -q 11 sizes of every wasm in out/, with the delta over base.wasm.
 cd "$(dirname "$0")/out"
 sz() { wc -c < "$1"; }

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Sanity checks for uniform_sim.py (run: python3 -I selftest.py). Each check has a known answer."""
 import math
 import os

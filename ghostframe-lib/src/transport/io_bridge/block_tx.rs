@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The server's block send side (R6-d D4b): feeds sealed sources and closed
 //! blocks into the [`BlockTable`], encodes repairs at close, and admits them
 //! through the same gate as any record.

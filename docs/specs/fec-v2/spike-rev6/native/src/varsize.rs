@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Measurement E: blocks that mix datagram lengths (1180 B except the last, 100 B).
 use super::*;
 use cu_fec::{EncodingSymbolId as Esi, Field, RlcConfig, RlcEncoder};

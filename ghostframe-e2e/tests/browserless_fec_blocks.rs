@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! FEC blocks (rev 6, R6-d D8): the scenes of the block mode, over three
 //! seeds each. Browserless is chaotic, so every assertion is a property
 //! (premise non-zero, bounded, convergent, never reported lost) and the

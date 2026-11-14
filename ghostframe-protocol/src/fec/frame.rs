@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Server -> client frames (rev 6 §6.1): SOURCE, REPAIR and PLAIN.
 //!
 //! All integers are little-endian. `parse` checks the header only; the
