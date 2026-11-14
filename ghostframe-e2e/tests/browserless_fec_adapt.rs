@@ -524,7 +524,6 @@ impl Arm {
                     k_max: 64,
                     t_ms: 5,
                     r: 2,
-                    m: 1,
                 }),
                 ..RunOptions::default()
             },
