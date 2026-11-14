@@ -1484,7 +1484,10 @@ fn crit5(c: &CellRuns) -> Judged {
 /// and at 2 Mbit/s). One demand for both arms, a constant, and a premise of
 /// criterion (6): the run fails loudly if the link is not saturated.
 const TILE_SATURATING_SCALE: f64 = 1.5;
-const SATURATION_SHARE: f64 = 0.95;
+/// 0.93, not 0.95: at scale 1.5 the off arm offers 0.941-0.972 of the link
+/// over 12 seed runs (framing and the start-up ramp keep it under 1), so 0.95
+/// failed a saturated link on 10 of them.
+const SATURATION_SHARE: f64 = 0.93;
 
 /// (6), H.264: at equal offered / estimate, the estimate (second-half time
 /// mean) and the frames shown per second are no lower than the off arm's
