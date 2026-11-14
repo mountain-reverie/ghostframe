@@ -251,7 +251,7 @@ pub struct TransportConfig {
     /// as [`H264_DEFAULT_FPS`]. The encoder's per-frame budget is the rate
     /// divided by it.
     pub capture_fps: u32,
-    /// The FEC block mode, from `GHOSTFRAME_FEC_BLOCKS` (`off`, `k_max,t_ms,r`
+    /// The FEC block mode, from `GHOSTFRAME_FEC_BLOCKS` (`off`, `k_max,t_ms,r[,m]`
     /// or `adaptive`). `Off` (unset, `off` or `0`) is the default: every
     /// bundle is a plain frame.
     pub fec_mode: FecMode,
@@ -293,9 +293,10 @@ impl From<Option<FecBlockParams>> for FecMode {
     }
 }
 
-/// The fixed `(k_max, T, r)` of the FEC block knob (`GHOSTFRAME_FEC_BLOCKS`):
+/// The fixed `(k_max, T, r, m)` of the FEC block knob (`GHOSTFRAME_FEC_BLOCKS`):
 /// a block closes at `k_max` source symbols, at `t_ms` after its first
-/// source, or at Empty, and carries `r` repair symbols.
+/// source, or at Empty, and carries `r` repair symbols. `m` is the number of
+/// interleaved blocks a frame is split across (1 = one block).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FecBlockParams {
     /// Source symbols per block at most. Valid in `1..=255 - r`.
@@ -305,6 +306,8 @@ pub struct FecBlockParams {
     pub t_ms: u8,
     /// Repair symbols per block. Valid in `1..=32`.
     pub r: u8,
+    /// Interleaved blocks per group. Valid in `1..=8`; 1 is one block.
+    pub m: u8,
 }
 
 impl FecBlockParams {
@@ -315,17 +318,26 @@ impl FecBlockParams {
     /// a frame into interleaved blocks, not the narrow and wide notches.
     pub(crate) const T_MS_MAX: u8 = 50;
 
-    /// Parse `k_max,t_ms,r`. `None` for anything out of range or malformed.
+    /// The largest `m` the knob accepts.
+    pub(crate) const M_MAX: u8 = 8;
+
+    /// Parse `k_max,t_ms,r` or `k_max,t_ms,r,m` (`m` defaults to 1). `None`
+    /// for anything out of range or malformed.
     fn parse(raw: &str) -> Option<Self> {
         let mut fields = raw.split(',').map(|f| f.trim().parse::<u8>().ok());
         let (k_max, t_ms, r) = (fields.next()??, fields.next()??, fields.next()??);
+        let m = match fields.next() {
+            None => 1,
+            Some(m) => m?,
+        };
         if fields.next().is_some() {
             return None;
         }
         let valid = (1..=32).contains(&r)
             && (1..=255 - r).contains(&k_max)
-            && (1..=Self::T_MS_MAX).contains(&t_ms);
-        valid.then_some(Self { k_max, t_ms, r })
+            && (1..=Self::T_MS_MAX).contains(&t_ms)
+            && (1..=Self::M_MAX).contains(&m);
+        valid.then_some(Self { k_max, t_ms, r, m })
     }
 }
 
@@ -351,7 +363,7 @@ fn fec_blocks_from_lookup(get: &impl Fn(&str) -> Option<String>) -> FecMode {
         tracing::warn!(
             target: "ghostframe::config",
             value = %raw,
-            "GHOSTFRAME_FEC_BLOCKS is not off, adaptive or k_max,t_ms,r with r in 1..=32, k_max in 1..=255-r, t_ms in 1..=50: FEC blocks are off"
+            "GHOSTFRAME_FEC_BLOCKS is not off, adaptive or k_max,t_ms,r[,m] with r in 1..=32, k_max in 1..=255-r, t_ms in 1..=50, m in 1..=8: FEC blocks are off"
         );
     }
     parsed.into()
@@ -1525,6 +1537,46 @@ mod tests {
     }
 
     #[test]
+    fn fec_blocks_accepts_an_optional_interleave_count() {
+        let mode = |v: &str| {
+            TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_FEC_BLOCKS", v)])).fec_mode
+        };
+        assert_eq!(
+            mode("64,5,2"),
+            FecMode::Fixed(FecBlockParams {
+                k_max: 64,
+                t_ms: 5,
+                r: 2,
+                m: 1
+            }),
+            "three fields mean m = 1"
+        );
+        assert_eq!(
+            mode("64,5,2,4"),
+            FecMode::Fixed(FecBlockParams {
+                k_max: 64,
+                t_ms: 5,
+                r: 2,
+                m: 4
+            }),
+            "a fourth field is m"
+        );
+        assert_eq!(
+            mode("64,5,2,8"),
+            FecMode::Fixed(FecBlockParams {
+                k_max: 64,
+                t_ms: 5,
+                r: 2,
+                m: 8
+            }),
+            "m = 8 is the bound"
+        );
+        for bad in ["64,5,2,0", "64,5,2,9", "64,5,2,300"] {
+            assert_eq!(mode(bad), FecMode::Off, "{bad:?}: m out of 1..=8 is off");
+        }
+    }
+
+    #[test]
     fn fec_blocks_parses_the_triple_and_is_off_otherwise() {
         let parse =
             |v: &str| match TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_FEC_BLOCKS", v)]))
@@ -1540,6 +1592,7 @@ mod tests {
             k_max: 64,
             t_ms: 5,
             r: 2,
+            m: 1,
         });
         assert_eq!(parse("64,5,2"), on);
         assert_eq!(
@@ -1552,7 +1605,8 @@ mod tests {
             Some(FecBlockParams {
                 k_max: 253,
                 t_ms: 20,
-                r: 2
+                r: 2,
+                m: 1,
             }),
             "k_max = 255 - r is the bound"
         );
@@ -1561,7 +1615,8 @@ mod tests {
             Some(FecBlockParams {
                 k_max: 1,
                 t_ms: 1,
-                r: 32
+                r: 32,
+                m: 1,
             })
         );
         assert_eq!(
@@ -1587,21 +1642,22 @@ mod tests {
             FecMode::Fixed(FecBlockParams {
                 k_max: 64,
                 t_ms: 5,
-                r: 2
+                r: 2,
+                m: 1,
             })
         );
         for bad in [
-            "64,5,0",   // r = 0
-            "64,5,33",  // r over 32
-            "254,5,2",  // k_max over 255 - r
-            "64,0,2",   // t_ms 0
-            "64,51,2",  // t_ms over 50
-            "0,5,2",    // k_max 0
-            "64,5",     // missing field
-            "64,5,2,1", // extra field
-            "x,y,z",    // garbage
-            "64,5,-1",  // negative
-            "300,5,2",  // does not fit u8
+            "64,5,0",     // r = 0
+            "64,5,33",    // r over 32
+            "254,5,2",    // k_max over 255 - r
+            "64,0,2",     // t_ms 0
+            "64,51,2",    // t_ms over 50
+            "0,5,2",      // k_max 0
+            "64,5",       // missing field
+            "64,5,2,1,1", // extra field (a fourth field is m)
+            "x,y,z",      // garbage
+            "64,5,-1",    // negative
+            "300,5,2",    // does not fit u8
         ] {
             assert_eq!(parse(bad), None, "{bad:?} must be refused");
         }

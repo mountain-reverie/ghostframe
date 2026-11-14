@@ -540,7 +540,12 @@ mod tests {
     use ghostframe_protocol::fec::frame::{source_from_symbol, FEC_REPAIR_HEADER_LEN};
 
     fn params(k_max: u8, t_ms: u8, r: u8) -> Option<FecBlockParams> {
-        Some(FecBlockParams { k_max, t_ms, r })
+        Some(FecBlockParams {
+            k_max,
+            t_ms,
+            r,
+            m: 1,
+        })
     }
 
     fn pmeta(ws: u32) -> RecordMeta {
