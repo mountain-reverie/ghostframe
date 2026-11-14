@@ -41,8 +41,8 @@ test-openh264 lib="":
 # drags in the whole server (and, through it, the embedded SPA). Run
 # `cargo test -p ghostframe-client-net` separately when you have the
 # headroom for that.
-client-build-crates := "-p ghostframe-cli -p ghostframe-client-native -p ghostframe-client-gpu -p ghostframe-client-h264 -p ghostframe-client-core -p ghostframe-client-net -p ghostframe-client-capi -p ghostframe-protocol -p ghostframe-tsnet"
-client-test-crates := "-p ghostframe-cli -p ghostframe-client-native -p ghostframe-client-gpu -p ghostframe-client-h264 -p ghostframe-client-core -p ghostframe-client-capi -p ghostframe-protocol -p ghostframe-tsnet"
+client-build-crates := "-p ghostframe-cli -p ghostframe-client-native -p ghostframe-client-gpu -p ghostframe-render -p ghostframe-client-h264 -p ghostframe-client-core -p ghostframe-client-net -p ghostframe-client-capi -p ghostframe-protocol -p ghostframe-tsnet"
+client-test-crates := "-p ghostframe-cli -p ghostframe-client-native -p ghostframe-client-gpu -p ghostframe-render -p ghostframe-client-h264 -p ghostframe-client-core -p ghostframe-client-capi -p ghostframe-protocol -p ghostframe-tsnet"
 
 # Build the `ghostframe` native client (debug). No server, no web client.
 build-client:
@@ -123,6 +123,18 @@ build-client-gles:
 test-client-gles:
     cargo test -p ghostframe-client-gpu --no-default-features --features gles,decode-gstreamer,test-support
 
+# The portable tile renderer must keep building for the browser. It shares
+# its source with the native client, so a native-only call added to it (a
+# blocking wait, a clock, a thread) compiles here and panics in the browser:
+# `ci/check-render-portable.sh` catches what the compiler cannot.
+# Clippy is `--lib` only, on purpose: the crate's unit tests call the
+# native-only `block_on_device`, so a wasm32 test target does not compile.
+# Do not "fix" it to `--all-targets`; the host clippy covers the tests.
+check-render-wasm:
+    cargo check -p ghostframe-render --target wasm32-unknown-unknown
+    cargo clippy -p ghostframe-render --target wasm32-unknown-unknown --lib -- -D warnings
+    ci/check-render-portable.sh
+
 # Build, lint and test the native client -- the client-only `ci-local`.
 ci-client: build-client
     @echo "=== fmt-check ==="
@@ -144,6 +156,8 @@ ci-client: build-client
     just check-gles
     @echo "=== GStreamer decode backend still compiles ==="
     just check-gstreamer
+    @echo "=== ghostframe-render still builds for the browser ==="
+    just check-render-wasm
     @echo "=== ci-client passed ==="
 
 # The stats panel's host tests and its headless-Chrome test (wasm-pack drives
@@ -254,6 +268,8 @@ ci-local:
     @echo "=== clippy ==="
     cargo clippy --workspace --all-targets -- -D warnings
     cargo clippy -p ghostframe-lib --all-targets --features cdf53-diag -- -D warnings
+    @echo "=== ghostframe-render still builds for the browser ==="
+    just check-render-wasm
     @echo "=== unit tests ==="
     cargo test --workspace --lib
     cargo test --workspace --bins

@@ -34,10 +34,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-fast
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # ghostframe-render is shared with the browser. --workspace above builds it
+      # for the host only; this builds it for wasm32 and checks that nothing
+      # native-only (a thread, a blocking wait, a clock) crept into it. Clippy is
+      # `--lib` only on purpose: the unit tests call the native-only
+      # `block_on_device`, so a wasm32 test target does not compile.
+      - run: cargo check -p ghostframe-render --target wasm32-unknown-unknown
+      - run: cargo clippy -p ghostframe-render --target wasm32-unknown-unknown --lib -- -D warnings
+      - name: ghostframe-render stays portable
+        run: ci/check-render-portable.sh
       # `cdf53-diag` is off in every other build, so nothing else compiles
       # its cfg-gated code or tests; it rotted once already.
       - run: cargo clippy -p ghostframe-lib --all-targets --features cdf53-diag -- -D warnings
