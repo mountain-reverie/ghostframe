@@ -84,7 +84,18 @@ pub struct BlockStats {
     pub declined_held_bytes: u64,
     pub duplicates: u64,
     pub held_bytes: u64,
+    /// The most symbol bytes held at once, read before the cap evicts (so it
+    /// can exceed `FEC_RX_MAX_HELD_BYTES`: what the stream asked for).
+    /// Measurement only; it sizes the cap.
+    pub held_bytes_peak: u64,
+    /// Blocks rebuilt with repair rows, by how long after their first arrival
+    /// the rows were in hand (`RECOVERY_WAIT_BOUNDS_MS`, the last bucket open):
+    /// the recovery wait the advertised span has to cover. Measurement only.
+    pub recovery_wait_ms: [u64; 9],
 }
+
+/// Upper bounds (ms) of `BlockStats::recovery_wait_ms`; the ninth is above.
+pub const RECOVERY_WAIT_BOUNDS_MS: [u64; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
 
 struct Block {
     id: u16,
@@ -394,6 +405,7 @@ impl BlockStore {
     }
 
     fn enforce_byte_cap(&mut self) {
+        self.stats.held_bytes_peak = self.stats.held_bytes_peak.max(self.held_bytes as u64);
         while self.held_bytes > FEC_RX_MAX_HELD_BYTES && !self.blocks.is_empty() {
             self.stats.declined_held_bytes += 1;
             self.evict_oldest(DeclineReason::Evicted);
@@ -549,6 +561,12 @@ impl BlockStore {
                     Some(items) => {
                         self.stats.repair_used += need as u64;
                         b.repairs_used = need;
+                        let wait_ms = self.last_now.saturating_sub(b.first_arrival_us) / 1000;
+                        let slot = RECOVERY_WAIT_BOUNDS_MS
+                            .iter()
+                            .position(|&u| wait_ms <= u)
+                            .unwrap_or(8);
+                        self.stats.recovery_wait_ms[slot] += 1;
                         for (j, sym, seq, recs) in items {
                             dispatch(
                                 &recs,

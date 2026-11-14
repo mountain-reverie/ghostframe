@@ -101,6 +101,18 @@ impl IoBridge {
         self.packer.set_blocks(self.fec_live);
     }
 
+    /// Allow (`true`, the default) or forbid the adaptive controller's frame
+    /// notch. Test only: the control arm of a frame-notch scene. Call after
+    /// `set_fec_mode_for_test`.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn set_fec_frame_notch_for_test(&mut self, frame: bool) {
+        if self.fec_adapt.is_some() {
+            self.fec_adapt = Some(crate::transport::fec_tx::adapt::FecAdapt::with_frame_notch(
+                frame,
+            ));
+        }
+    }
+
     /// Set the FEC block knob the daemon would read from
     /// `GHOSTFRAME_FEC_BLOCKS`. `None` is off.
     #[cfg(any(test, feature = "browserless-harness"))]

@@ -22,12 +22,33 @@ pub(crate) const FEC_ADAPT_NOTCH_DOWN: f64 = 1.25;
 pub(crate) const FEC_ADAPT_NOTCH_DWELL_US: u64 = 1_000_000;
 /// Closed blocks the declined-share trim looks at.
 pub(crate) const FEC_ADAPT_TRIM_WINDOW: usize = 256;
+/// Burst estimate above which the frame notch is entered. A midpoint, **not a
+/// measured crossing**: the simulation (FINDINGS section 12) measured the
+/// per-block rule equal to the single block at mean burst 5 and ahead in every
+/// seed at 8, and did not run 6 or 7. The harness (section 13) found the notch
+/// ahead of the single block at bursts 8, 16 and 32 and level at 3, and did not
+/// run 4 to 7 either. 6.0 sits between 5 and 8.
+pub(crate) const FEC_FRAME_B_ENTER: f64 = 6.0;
+/// Burst estimate below which the frame notch is left: 2 under the entry, the
+/// same kind of midpoint, not a measured crossing.
+pub(crate) const FEC_FRAME_B_EXIT: f64 = 4.0;
+/// The frame notch is entered only when a frame, with `FRAME_RHO` of repair, no
+/// longer fits one 255-symbol block (`fill > 1`), and left when it fits again
+/// with a margin (`fill <= FRAME_FILL_EXIT`: a rate that wobbles around one
+/// block does not flap the notch). Below that the narrow and wide notches are
+/// what they were: the gain was measured at 150 and 200 Mbit/s (fill 1.6 to 3),
+/// and at 100 Mbit/s the simulation found none.
+const FRAME_FILL_ENTER: f64 = 1.0;
+const FRAME_FILL_EXIT: f64 = 0.9;
+/// The repair overhead the frame's fill is sized for: `frame_bundles x (1 +
+/// rho) / 255`, the 255 being the GF(2^8) limit on `k + r`.
+const FRAME_RHO: f64 = 0.2;
 /// Below this burst estimate the loss is modelled as i.i.d.
 const IID_BURST: f64 = 1.05;
 /// Block duration cap of the ladder. Lower than the knob's `T_MS_MAX` (50) on
 /// purpose: E1 found T = 20 loses nothing measurable against 25-33 ms and cuts
-/// tile recovery p95, so the wider advertised range serves the interleaved
-/// split, not a retune of the narrow and wide notches.
+/// tile recovery p95, so the wider advertised range serves the frame notch,
+/// not a retune of the narrow and wide notches.
 const T_MAX_MS: u32 = 20;
 const T_MIN_MS: u32 = 5;
 const K_MIN: u32 = 64;
@@ -218,11 +239,15 @@ impl RSizer {
     }
 }
 
-/// The two notches of the span ladder (decision 6). No 10 ms notch.
+/// The notches of the span ladder (decision 6). No 10 ms notch. `Frame` is not
+/// between the other two: it is entered from either and left to `Wide` (or
+/// `Narrow` when the burst is gone). In it one block spans a frame: T is the
+/// frame interval and the block advertises it (`T_adv`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Notch {
     Narrow,
     Wide,
+    Frame,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,17 +266,44 @@ pub(crate) fn t_base_ms(rate_bps: u64, max_dg: usize) -> u8 {
     t_ms as u8
 }
 
+/// How many 255-symbol blocks a frame at `rate_bps` fills once `FRAME_RHO` of
+/// repair is added: `frame_bundles x (1 + rho) / 255`.
+fn frame_fill(rate_bps: u64, max_dg: usize, fps: u32) -> f64 {
+    let frame_bundles = rate_bps as f64 / (8.0 * max_dg.max(1) as f64 * f64::from(fps.max(1)));
+    frame_bundles * (1.0 + FRAME_RHO) / 255.0
+}
+
+/// The frame interval, ms, rounded up and held to the knob's `T` range.
+fn frame_interval_ms(fps: u32) -> u8 {
+    let ms = (1000.0 / f64::from(fps.max(1))).ceil();
+    ms.clamp(1.0, f64::from(crate::config::FecBlockParams::T_MS_MAX)) as u8
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Ladder {
     notch: Notch,
     last_change_us: Option<u64>,
+    /// `Frame` may be entered. Off is a test switch (the control arm of the
+    /// frame-notch scenes): the ladder is then the two-notch ladder of E4.
+    frame: bool,
+    /// Notch changes, and entries into `Frame`, cumulative.
+    notch_changes: u64,
+    frame_entries: u64,
 }
 
 impl Ladder {
     pub(crate) fn new() -> Self {
+        Self::with_frame_notch(true)
+    }
+
+    /// A ladder that may (`true`) or never (`false`) enter the frame notch.
+    pub(crate) fn with_frame_notch(frame: bool) -> Self {
         Self {
             notch: Notch::Narrow,
             last_change_us: None,
+            frame,
+            notch_changes: 0,
+            frame_entries: 0,
         }
     }
 
@@ -259,14 +311,46 @@ impl Ladder {
         self.notch
     }
 
+    /// Notch changes so far.
+    pub(crate) fn notch_changes(&self) -> u64 {
+        self.notch_changes
+    }
+
+    /// Entries into `Frame` so far.
+    pub(crate) fn frame_entries(&self) -> u64 {
+        self.frame_entries
+    }
+
     /// Update the notch from the burst estimate (hysteresis, one change per
     /// dwell) and return the span for the source rate.
-    pub(crate) fn step(&mut self, b_hat: f64, rate_bps: u64, max_dg: usize, now_us: u64) -> Span {
+    ///
+    /// `Frame` is entered when a frame no longer fits one block and
+    /// `b_hat > FEC_FRAME_B_ENTER`, and left when `b_hat < FEC_FRAME_B_EXIT` or
+    /// the frame fits one block again.
+    pub(crate) fn step(
+        &mut self,
+        b_hat: f64,
+        rate_bps: u64,
+        max_dg: usize,
+        fps: u32,
+        now_us: u64,
+    ) -> Span {
         let dwelled = self
             .last_change_us
             .is_none_or(|c| now_us.saturating_sub(c) >= FEC_ADAPT_NOTCH_DWELL_US);
+        let fill = frame_fill(rate_bps, max_dg, fps);
         if dwelled {
+            let enter_frame = self.frame && b_hat > FEC_FRAME_B_ENTER && fill > FRAME_FILL_ENTER;
             let next = match self.notch {
+                Notch::Frame if b_hat < FEC_FRAME_B_EXIT || fill <= FRAME_FILL_EXIT => {
+                    if b_hat < FEC_ADAPT_NOTCH_DOWN {
+                        Notch::Narrow
+                    } else {
+                        Notch::Wide
+                    }
+                }
+                Notch::Frame => Notch::Frame,
+                _ if enter_frame => Notch::Frame,
                 Notch::Narrow if b_hat > FEC_ADAPT_NOTCH_UP => Notch::Wide,
                 Notch::Wide if b_hat < FEC_ADAPT_NOTCH_DOWN => Notch::Narrow,
                 Notch::Narrow => Notch::Narrow,
@@ -275,6 +359,8 @@ impl Ladder {
             if next != self.notch {
                 self.notch = next;
                 self.last_change_us = Some(now_us);
+                self.notch_changes += 1;
+                self.frame_entries += u64::from(next == Notch::Frame);
             }
         }
         match self.notch {
@@ -290,6 +376,10 @@ impl Ladder {
                     k_max: per_20ms.clamp(f64::from(K_MIN), f64::from(K_MAX)) as u8,
                 }
             }
+            Notch::Frame => Span {
+                t_ms: frame_interval_ms(fps),
+                k_max: (255 - u32::from(FEC_ADAPT_R_MAX)) as u8,
+            },
         }
     }
 }
@@ -503,23 +593,29 @@ mod tests {
     }
 
     #[test]
-    fn ladder_has_two_notches_and_obeys_the_dwell() {
+    fn the_ladder_obeys_the_dwell_in_every_notch() {
         let mut rng = Lcg(7);
         for rate in [500_000u64, 2_000_000, 30_000_000, 200_000_000] {
             let mut l = Ladder::new();
-            let (mut now, mut last_change, mut changes) = (0u64, None::<u64>, 0);
+            let (mut now, mut last_change, mut changes, mut frames) = (0u64, None::<u64>, 0, 0);
             let mut prev = l.notch();
             for _ in 0..5000 {
                 now += (rng.next() * 400_000.0) as u64;
                 let b = 1.0 + rng.next() * 9.0;
-                let s = l.step(b, rate, 1200, now);
-                assert!((5..=20).contains(&s.t_ms), "T {}", s.t_ms);
+                let s = l.step(b, rate, 1200, 30, now);
+                if l.notch() == Notch::Frame {
+                    assert!(s.t_ms <= crate::config::FecBlockParams::T_MS_MAX);
+                } else {
+                    assert!((5..=20).contains(&s.t_ms), "T {}", s.t_ms);
+                }
                 assert!((64..=223).contains(&s.k_max));
                 assert!(u32::from(s.k_max) + u32::from(FEC_ADAPT_R_MAX) <= 255);
                 match l.notch() {
                     Notch::Narrow => assert_eq!(s.k_max, 64),
                     Notch::Wide => assert_eq!(s.t_ms, 20),
+                    Notch::Frame => assert_eq!((s.t_ms, s.k_max), (34, 223)),
                 }
+                frames += usize::from(l.notch() == Notch::Frame);
                 if l.notch() != prev {
                     changes += 1;
                     if let Some(c) = last_change {
@@ -533,19 +629,188 @@ mod tests {
                 }
             }
             assert!(changes > 5, "the walk must cross the notch");
+            if rate >= 100_000_000 {
+                assert!(frames > 0, "{rate}: the walk must enter the frame notch");
+            }
         }
+    }
+
+    /// The two-notch ladder as it was before the frame notch, frozen for the
+    /// equivalence test below.
+    struct OldLadder {
+        notch: Notch,
+        last_change_us: Option<u64>,
+    }
+    impl OldLadder {
+        fn step(&mut self, b_hat: f64, rate_bps: u64, max_dg: usize, now_us: u64) -> (u8, u8) {
+            let dwelled = self
+                .last_change_us
+                .is_none_or(|c| now_us.saturating_sub(c) >= FEC_ADAPT_NOTCH_DWELL_US);
+            if dwelled {
+                let next = match self.notch {
+                    Notch::Narrow if b_hat > FEC_ADAPT_NOTCH_UP => Notch::Wide,
+                    Notch::Wide if b_hat < FEC_ADAPT_NOTCH_DOWN => Notch::Narrow,
+                    n => n,
+                };
+                if next != self.notch {
+                    self.notch = next;
+                    self.last_change_us = Some(now_us);
+                }
+            }
+            match self.notch {
+                Notch::Narrow => (t_base_ms(rate_bps, max_dg), K_MIN as u8),
+                _ => {
+                    let per_20ms = (rate_bps as f64 * f64::from(T_MAX_MS) / 1000.0)
+                        / (8.0 * max_dg.max(1) as f64);
+                    (
+                        T_MAX_MS as u8,
+                        per_20ms.clamp(f64::from(K_MIN), f64::from(K_MAX)) as u8,
+                    )
+                }
+            }
+        }
+    }
+
+    /// While a frame fits one block, whatever the burst, the ladder's whole
+    /// output is the two-notch ladder's. Break check: enter `Frame` at any rate
+    /// and this fails.
+    #[test]
+    fn while_a_frame_fits_one_block_the_ladder_is_the_one_before_the_frame_notch() {
+        let mut rng = Lcg(11);
+        let mut bursty = 0;
+        // 100 Mbit/s at 30 fps, 1200 B: 347 bundles x 1.2 / 255 = 1.6 blocks, so
+        // 60 Mbit/s (0.98) is the highest rate checked here.
+        for rate in [500_000u64, 2_000_000, 10_000_000, 30_000_000, 60_000_000] {
+            assert!(frame_fill(rate, 1200, 30) <= FRAME_FILL_ENTER);
+            let mut new = Ladder::new();
+            let mut old = OldLadder {
+                notch: Notch::Narrow,
+                last_change_us: None,
+            };
+            let mut now = 0u64;
+            for _ in 0..4000 {
+                now += (rng.next() * 600_000.0) as u64;
+                let b = 1.0 + rng.next() * 11.0;
+                bursty += usize::from(b > FEC_FRAME_B_ENTER);
+                let got = new.step(b, rate, 1200, 30, now);
+                assert_eq!(
+                    (got.t_ms, got.k_max),
+                    old.step(b, rate, 1200, now),
+                    "rate {rate}"
+                );
+                assert_ne!(new.notch(), Notch::Frame);
+            }
+        }
+        assert!(bursty > 1000, "premise: the walk was often above the entry");
+    }
+
+    /// Entry needs both conditions, exit either one's failure, and in between
+    /// the notch holds.
+    #[test]
+    fn the_frame_notch_has_a_hysteresis_and_needs_a_frame_over_one_block() {
+        let rate = 200_000_000;
+        let mut l = Ladder::new();
+        l.step(5.0, rate, 1200, 30, 0);
+        assert_ne!(l.notch(), Notch::Frame, "5 is under the entry");
+        let s = l.step(7.0, rate, 1200, 30, 2_000_000);
+        assert_eq!(l.notch(), Notch::Frame);
+        assert_eq!((s.t_ms, s.k_max), (34, 223));
+        for (i, b) in [5.9, 4.1, 5.0, 6.5, 4.01].into_iter().enumerate() {
+            l.step(b, rate, 1200, 30, 4_000_000 + i as u64 * 2_000_000);
+            assert_eq!(l.notch(), Notch::Frame, "b = {b} is inside the band");
+        }
+        l.step(3.9, rate, 1200, 30, 20_000_000);
+        assert_eq!(
+            l.notch(),
+            Notch::Wide,
+            "under the exit, burst still above 1.25"
+        );
+        // The rate falling to one block leaves it too.
+        let mut l = Ladder::new();
+        l.step(7.0, rate, 1200, 30, 0);
+        assert_eq!(l.notch(), Notch::Frame);
+        l.step(7.0, 20_000_000, 1200, 30, 2_000_000);
+        assert_eq!(l.notch(), Notch::Wide, "one block fits the frame again");
+        l.step(7.0, 20_000_000, 1200, 30, 4_000_000);
+        assert_eq!(
+            l.notch(),
+            Notch::Wide,
+            "b is high but the frame fits one block"
+        );
+        // A switched-off ladder never enters.
+        let mut off = Ladder::with_frame_notch(false);
+        off.step(9.0, rate, 1200, 30, 0);
+        off.step(9.0, rate, 1200, 30, 2_000_000);
+        assert_eq!(off.notch(), Notch::Wide);
+        // The span fits the advertised table: T + queue allowance <= 66 ms.
+        assert!(
+            u64::from(frame_interval_ms(30)) + 10 <= 66
+                && u64::from(frame_interval_ms(1)) + 10 <= 66
+        );
+    }
+
+    /// Random burst and rate walks: at most one change per dwell, `Frame` only
+    /// entered above the entry, and a noisy burst estimate inside the band never
+    /// leaves it. Break check: remove the hysteresis (exit at the entry) and the
+    /// last assertion fails.
+    #[test]
+    fn frame_notch_changes_are_bounded_by_the_dwell_and_the_band() {
+        let mut rng = Lcg(5);
+        let mut l = Ladder::new();
+        let (mut now, mut prev, mut last_change) = (0u64, l.notch(), None::<u64>);
+        let mut entries = 0;
+        for i in 0..20_000 {
+            now += (rng.next() * 500_000.0) as u64;
+            let b = 1.0 + rng.next() * 11.0;
+            let rate = 20_000_000 + (rng.next() * 380_000_000.0) as u64 + (i % 7) * 1_000_000;
+            l.step(b, rate, 1200, 30, now);
+            if l.notch() != prev {
+                if let Some(c) = last_change {
+                    assert!(
+                        now - c >= FEC_ADAPT_NOTCH_DWELL_US,
+                        "two changes in a dwell"
+                    );
+                }
+                last_change = Some(now);
+                if l.notch() == Notch::Frame {
+                    entries += 1;
+                    assert!(b > FEC_FRAME_B_ENTER && frame_fill(rate, 1200, 30) > FRAME_FILL_ENTER);
+                }
+                prev = l.notch();
+            }
+        }
+        assert!(entries > 20, "premise: {entries} entries");
+
+        let rate = 200_000_000;
+        let mut l = Ladder::new();
+        l.step(8.0, rate, 1200, 30, 0);
+        assert_eq!(l.notch(), Notch::Frame);
+        let before = l.notch_changes();
+        let mut t = 0;
+        for _ in 0..2000 {
+            t += 1_100_000;
+            let b =
+                FEC_FRAME_B_EXIT + 0.05 + rng.next() * (FEC_FRAME_B_ENTER - FEC_FRAME_B_EXIT - 0.1);
+            l.step(b, rate, 1200, 30, t);
+        }
+        assert_eq!(
+            l.notch_changes(),
+            before,
+            "inside the band: no change at all"
+        );
+        assert_eq!(l.notch(), Notch::Frame);
     }
 
     #[test]
     fn ladder_hysteresis_and_k_max_follow_rate() {
         let mut l = Ladder::new();
-        assert_eq!(l.step(1.4, 10_000_000, 1200, 0).k_max, 64);
+        assert_eq!(l.step(1.4, 10_000_000, 1200, 30, 0).k_max, 64);
         assert_eq!(l.notch(), Notch::Narrow);
-        let s = l.step(1.6, 100_000_000, 1200, 2_000_000);
+        let s = l.step(1.6, 100_000_000, 1200, 30, 2_000_000);
         assert_eq!((l.notch(), s.t_ms, s.k_max), (Notch::Wide, 20, 208));
-        l.step(1.3, 100_000_000, 1200, 4_000_000);
+        l.step(1.3, 100_000_000, 1200, 30, 4_000_000);
         assert_eq!(l.notch(), Notch::Wide, "1.3 is inside the hysteresis band");
-        l.step(1.2, 100_000_000, 1200, 6_000_000);
+        l.step(1.2, 100_000_000, 1200, 30, 6_000_000);
         assert_eq!(l.notch(), Notch::Narrow);
         // T_base: 6 slots of 1200 B at 2 Mbit/s is 28.8 ms -> capped at 20.
         assert_eq!(t_base_ms(2_000_000, 1200), 20);
