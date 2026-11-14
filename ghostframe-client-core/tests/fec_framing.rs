@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The rev 6 framing: datagrams arrive as rev 6 FEC frames, are
 //! unbundled by `FecRx` and the records go through the ordinary tile path.
 

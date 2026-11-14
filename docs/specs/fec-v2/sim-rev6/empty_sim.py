@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Empty-close experiment for RS blocks (fec-v2-rev6.md section 4 rule 3).
 Run: python3 -I empty_sim.py [--quick]. Writes empty_sim_out.txt next to this file.
 Reuses uniform_sim's sender (rs_time family; spec["empty"] adds the Empty close)."""

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! R6-d D7: the H.264 content/transport split. With FEC blocks on, a ledger
 //! verdict on a source of an open block does not reach the acked-reference
 //! manager; only the block's content outcome (DECLINED, or its deadline) does.

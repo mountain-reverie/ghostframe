@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Adaptive FEC (rev 6, R6-e): the controller's gate, end to end. Quinn's
 //! `congestion_events` is loss under Cubic, so the gate reads the delay
 //! signal (a standing queue) only: random loss engages and a clean link

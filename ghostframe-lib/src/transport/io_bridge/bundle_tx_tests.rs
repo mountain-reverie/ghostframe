@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The packer at `send_counted` (R6-c task C5).
 //!
 //! A unit bridge has no quinn connection, so the sends go to

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! FEC v2 revision 6: one Reed-Solomon erasure code over every
 //! server -> client datagram (docs/specs/fec-v2/fec-v2-rev6.md).
 //!

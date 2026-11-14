@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Periodic LOSS_REPORT (0x07): pre-FEC loss from `bundle_seq` gaps (the
 //! existing `WireLossTracker`) plus `BlockStats` deltas.
 //!

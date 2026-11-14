@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """R6-e plan task E1: the T cap, the ladder, and split-or-not, with r from the exact tail rule.
 
 Run: python3 -I adapt_sim.py [--quick] [--jobs N] [--part cap|ladder|split|lowrate|all]   (--selftest)

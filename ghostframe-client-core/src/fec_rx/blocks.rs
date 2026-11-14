@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Block store: unbundle SOURCE / REPAIR / PLAIN frames, keep the coded symbols
 //! of each block, rebuild lost sources and decide what to do when a block's
 //! recovery window ends. Pure sans-IO: time comes in as `now_us`, actions go out.

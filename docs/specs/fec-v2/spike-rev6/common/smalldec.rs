@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Decode through an e x e system instead of rusty_erasure's k x k inversion.
 //!
 //! rusty_erasure's `Coder::recover` inverts a k x k matrix whatever the loss count, which costs

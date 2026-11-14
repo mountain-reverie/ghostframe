@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Wasm speed: node bench.mjs out/<variant>.wasm <mode> [k r lost ...]  -> TSV lines
 // columns: variant mode k r lost enc_med_us enc_p95_us dec_med_us dec_p95_us ok
 import fs from 'fs';

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Encode repair rows and rebuild missing sources (rev 6 §3.2).
 //!
 //! Byte work runs on `rusty_erasure`'s SIMD kernels through a custom matrix.

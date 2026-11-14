@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Unit-test shorthand for an ACK v4 batch.
 //!
 //! The ledger is keyed by a transmission id: a `bundle_seq` in production, and

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Condense the raw *_out.txt tables into the views FINDINGS.md quotes.
 
 Run: python3 -I summarize.py > summary_out.txt     (after uniform_sim.py)

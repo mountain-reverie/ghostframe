@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # Builds every wasm variant into out/<name>.wasm (relative paths only).
 set -euo pipefail
 cd "$(dirname "$0")/wasm"

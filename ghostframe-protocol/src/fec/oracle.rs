@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Test-only scalar reference for the rev 6 code, independent of
 //! `rusty_erasure`: its own GF(2^8)/0x11d tables, its own coefficient, a
 //! byte-loop encode and a Gauss-Jordan decode. Production code must agree

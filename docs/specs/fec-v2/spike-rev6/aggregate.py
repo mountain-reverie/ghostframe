@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Aggregate three wasm bench runs: per config, median of the 3 medians, and min..max spread."""
 import sys, collections, statistics
 rows = collections.defaultdict(list)

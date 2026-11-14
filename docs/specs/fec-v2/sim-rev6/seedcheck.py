@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Seed-to-seed spread of a few headline cells (run: python3 -I seedcheck.py > seedcheck_out.txt)."""
 import os
 import random

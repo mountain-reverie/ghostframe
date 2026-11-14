@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Wasm probe: one crate, one feature per candidate (see Cargo.toml). Same exports for all:
 //!   in_ptr()                       -> address of the input buffer (k * len bytes of sources)
 //!   set_mode(m)                    -> candidate-specific variant (rusty: 0 ours, 1 built-in Cauchy, 2 ours e x e)
