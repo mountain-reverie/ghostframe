@@ -232,9 +232,33 @@ The data picked candidate 1 (padding is the only large unplanned part). It was b
 - **H.264 is untouched by construction and by measurement**: the cap applies to all-tile blocks only; the adaptive wire digest of H264/iid5/10M and H264/ge3at1/10M is bit-identical with the cap on and off.
 - **Open, not diagnosed:** why the room the cap frees at 10 Mbit/s is not filled with source. The matched off arm of C0 delivered 7276 tiles/s against 6103 for the adaptive arm there; TB0 shows 0.10 of the 0.37 repair share is padding and TB1 removes most of it without moving delivery, so repair size is not what separates the two arms at 10 Mbit/s.
 
-## 13. R6-e2 (plan task S3): the split notch in the controller, measured end to end
+## 13. R6-e2 (plan task S3): the split notch, and why it became the frame notch, measured end to end
 
-Scenes: `ghostframe-e2e/tests/browserless_fec_split.rs`; the grid is `GHOSTFRAME_FEC_SWEEP=full cargo test --test browserless_fec_split the_split_grid -- --nocapture` (about 10 minutes), every run prints a `FECSPLIT run` line. PCM rate model (`pcm_rate_model`, H.264, `RefManager`), a rate cap behind a 150 ms tail-drop buffer, 25 ms one way, Gilbert-Elliott loss 1 in the bad state, 2 % on average, mean burst 3 or 8. **5 seeds, 30 virtual seconds per run** (the CI cell: 3 seeds, 20 s). Numbers are in the scratchpad logs of the S3 task. Section numbering follows section 12 (S0), which lives on the implementation branch.
+### Decision (owner): the interleave is deleted, the notch stays
+The sections below record the experiments with the interleave (`split`, m > 1 blocks per frame) as they were run; the code that built them is gone (the S2 and S2m commits are reverted, `frozen_s1.rs`, `BlockGroup`, `ClosedBlock.group`/`group_m`, the round-robin repair queueing, `FecBlockParams.m` and the knob's fourth field, `FEC_SPLIT_MIN_M`, `FEC_SPLIT_R_TARGET`, the per-block `b_hat / m` sizing). Why:
+- **The interleave alone (split - m1, paired, 5 seeds, 30 s) is inside 2 standard errors at every burst:** +0.01 +- 0.01 (200 Mbit/s b8), +0.10 +- 0.10 (200 b16), -0.05 +- 0.05 (200 b32), +0.12 +- 0.15 (150 b16); 150 b8 -0.01 +- 0.01. The decision rule was fixed in advance (E10's).
+- **The Python simulation's prediction was not reproduced by the harness.** Sections 6, 8 and 12 found the interleaved split 3.5 to 4 points better than a single block at 200 Mbit/s b8 (and the contiguous variant 8 to 12 points worse with the per-block rule); the harness finds the notch 0.7 points better at b8 and 2.0 to 2.4 at b16 and b32, all of it from the span (m1 reproduces it), and the interleave adds nothing. The harness has ARQ and the H.264 reference recovery the model does not, and a block of 223 with up to 32 rows survives these bursts. Whether the interleave would matter on a link the harness does not model is not measured.
+- **What stays, renamed the frame notch (`Notch::Frame`):** T = the frame interval (34 ms at 30 fps, `T_MS_MAX` 50), the block advertising it through `T_adv` (code 6, 50 ms; first window 60 ms), `k_max` 223, one block per close; entry `b_hat > 6.0` (`FEC_FRAME_B_ENTER`) and a frame over one block (`fill > 1`), exit `b_hat < 4.0` (`FEC_FRAME_B_EXIT`) or `fill <= 0.9`; one change per dwell. Both bursts constants are still midpoints, not measured crossings (the harness measured 3 and 8, 16, 32). The fill test is the old `m_needed >= 2` stated as what it was: the notch is measured only where a frame no longer fits one 255-symbol block; below that the ladder is byte-identical to the two-notch ladder (unit test and scene). Nothing in the entry or exit only made sense with m > 1 except that condition, which keeps its meaning.
+- **The per-block target** (1e-4 against 1e-3) measured identical (rows hit the cap), so the notch uses the default target.
+
+### The frame notch as kept (`browserless_fec_frame_notch.rs`, 5 seeds, 30 s; CI runs 150 Mbit/s b8 with 3 seeds, 20 s)
+Late33 % (single = notch forbidden), paired gain = single - notch, mean +- s.e.m.:
+
+| cell | single | frame notch | paired gain | seeds no later | `b_hat` mean | overhead single / notch |
+|---|---|---|---|---|---|---|
+| 150 Mbit/s b3 | 3.22 | 3.22 | 0 (never entered, same run) | 5/5 | 3.00 | 0.193 / 0.193 |
+| 150 Mbit/s b8 | 3.60 | 2.88 | +0.72 +- 0.15 | 5/5 | 7.83 | 0.239 / 0.243 |
+| 200 Mbit/s b3 | 3.04 | 3.04 | 0 | 5/5 | 2.94 | 0.194 / 0.194 |
+| 200 Mbit/s b8 | 3.55 | 2.86 | +0.69 +- 0.11 | 5/5 | 8.30 | 0.242 / 0.240 |
+| 200 Mbit/s b16 | 3.84 | 1.84 | +2.00 +- 0.19 | 5/5 | 15.37 | 0.245 / 0.247 |
+
+Per seed, late frames (single / notch, count of frames late): 150 b8: 14/5, 49/42, 44/42, 10/4, 39/31; 200 b8: 13/5, 47/41, 46/41, 13/5, 35/31; 200 b16: 36/19, 17/5, 36/20, 21/4, 49/27. Every seed is no later; every gain is inside the seed range (3.9 to 4.5 points: the per-seed late share runs 0.6 to 6 %), so it is judged on the pairs.
+
+### Open note
+`b_hat` reads low at burst 32 (21.3 against 32; per run 15.6 to 24.8); at burst 16 it reads right (15.4 at 200 Mbit/s, 18.1 at 150): probably the report's 8-bucket run histogram capping what a mean can read. Not verified. The notch's entry (6.0) is far below, so the decision is unaffected, but a controller that wants the true mean burst above about 20 cannot get it from this report.
+
+
+Scenes (as run for the interleave experiments; the file is now `browserless_fec_frame_notch.rs` with one arm fewer): `browserless_fec_split.rs`; the grid was `GHOSTFRAME_FEC_SWEEP=full cargo test --test browserless_fec_split the_split_grid -- --nocapture` (about 10 minutes), every run prints a `FECSPLIT run` line. PCM rate model (`pcm_rate_model`, H.264, `RefManager`), a rate cap behind a 150 ms tail-drop buffer, 25 ms one way, Gilbert-Elliott loss 1 in the bad state, 2 % on average, mean burst 3 or 8. **5 seeds, 30 virtual seconds per run** (the CI cell: 3 seeds, 20 s). Numbers are in the scratchpad logs of the S3 task. Section numbering follows section 12 (S0), which lives on the implementation branch.
 
 **Arms**, all adaptive, same seed = same demand and loss draw: `single` (split forbidden: the two-notch ladder, one block, T 20 ms, k_max 223); `m1` (the split notch, `m` pinned to 1: its T, k_max and per-block rule, no interleave); `split` (the product). Late = decoded more than 33 ms (one frame) after the stream's floor (S0's "late33"; at 100 ms, the sweep's RTT, 1 frame in 870 is late in every arm, which is why 33 ms is the unit).
 
