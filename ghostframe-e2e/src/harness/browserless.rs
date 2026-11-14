@@ -288,6 +288,13 @@ pub struct RunOptions {
     /// Run the adaptive FEC mode (no parameters live until a controller sets
     /// some). Ignored when `fec_blocks` is set.
     pub fec_adaptive: bool,
+    /// Adaptive mode only: never enter the split notch (the control arm of the
+    /// split scenes). `false`, the default, is the product.
+    pub fec_no_split: bool,
+    /// Adaptive mode only: enter the split notch but build one block per group
+    /// (`m` pinned to 1): the control that tells the interleave from the rest
+    /// of the notch.
+    pub fec_split_m1: bool,
     /// How the server's event loop is driven. See [`HarnessMode`].
     pub mode: HarnessMode,
     /// The client offers no hybrid post-quantum group, so the handshake
@@ -1161,6 +1168,9 @@ async fn run_inner(
         (None, false) => env_transport.fec_mode,
     };
     bridge.set_fec_mode_for_test(fec_mode);
+    if opts.fec_no_split || opts.fec_split_m1 {
+        bridge.set_fec_split_for_test(!opts.fec_no_split, opts.fec_split_m1);
+    }
     if let Some(floor) = scene.tick_budget_floor_bytes {
         bridge.set_tick_budget_floor_bytes(floor);
     }
