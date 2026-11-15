@@ -92,7 +92,7 @@ impl Framebuffer {
     /// Replace the framebuffer with a new one of `width` x `height`,
     /// preserving as much of the old content as fits at the origin.
     ///
-    /// Mirrors `framebuffer.ts`'s `resize`: a fresh `wgpu::Texture` is
+    /// Like the retired `framebuffer.ts`: a fresh `wgpu::Texture` is
     /// zero-initialized, so without the copy any tiles already patched into
     /// the old texture (which can happen before a late, sentinel-driven
     /// resize on a slow QUIC startup) would simply vanish.

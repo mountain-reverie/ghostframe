@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! An oracle for the **GPU** Cdf53 reconstruction under sparse pass sets.
+//! An oracle for the retired multi-pass GPU Cdf53 reconstruction under sparse
+//! pass sets.
 //!
 //! # Why this exists
 //!
-//! There are two Cdf53 decoders in this project and only one of them was
+//! There were two Cdf53 decoders in this project and only one of them was
 //! taught about sparse encoding:
 //!
 //! - `Cdf53TileState::integrate` (Rust, `cdf53_tile_state.rs`) reads pass 0's
@@ -11,35 +12,34 @@
 //!   explicit all-zero plane**, which is the content an empty pass would have
 //!   carried. Its contiguous prefix therefore reaches 14 and no midpoint
 //!   correction is applied.
-//! - The browser's GPU path (`shaders/client/cdf53_reconstruct.wgsl`, run by
-//!   `ghostframe-render`) is
-//!   what actually renders in production. It never sees the bitmap -- the
-//!   wasm boundary hands JS only `{ pass_idx, bit_planes }` -- and derives
-//!   its K as `passesProcessed = max(passIdx + 1)`.
+//! - The retired browser path (the multi-pass TypeScript and WGSL code, now
+//!   deleted) never saw the bitmap -- the wasm boundary handed JS only
+//!   `{ pass_idx, bit_planes }` -- and derived its K as
+//!   `passesProcessed = max(passIdx + 1)`.
 //!
-//! Both then apply the *same* midpoint formula. So they agree exactly while
-//! passes are still arriving, and they agree once the highest present pass is
-//! 13. They diverge when the encoder skips **trailing** passes: the Rust side
-//! backfills them and concludes "lossless", while the GPU concludes "K passes
-//! of 14" and adds a midpoint for low bits that are known to be zero.
+//! Both applied the *same* midpoint formula. So they agreed exactly while
+//! passes were still arriving, and once the highest present pass was 13. They
+//! diverged when the encoder skipped **trailing** passes: the Rust side
+//! backfilled them and concluded "lossless", while the old GPU path concluded
+//! "K passes of 14" and added a midpoint for low bits known to be zero.
 //!
-//! This file models the GPU's arithmetic in Rust so the divergence is
-//! measurable without a GPU, and pins the Rust decoder as the reference.
+//! The shipped grid (`ghostframe-render`, `pipelines/cdf53_state.rs`) does not
+//! have that divergence: like `Cdf53TileState` it resolves absent passes from
+//! pass 0's bitmap and takes K as a contiguous prefix (see its test
+//! `the_spike_s_max_prev_pass_rule_would_draw_here_and_this_does_not`). This
+//! file keeps the model of the retired running-max rule, and pins the Rust
+//! decoder as the reference the new path must match.
 //!
 //! # Fidelity of the model
 //!
-//! `gpu_model_coefficients` mirrors three pieces of shipped client code and
-//! must be kept in step with them:
+//! `gpu_model_coefficients` models the retired path's arithmetic, not the
+//! shipped grid's:
 //!
-//! - bit placement: `shaders/client/cdf53_reconstruct.wgsl` (the grid),
-//!   `bit_pos = 13u - pass_idx`, and `pass_idx == 0` routed to the sign
-//!   buffer.
-//! - K: the per-tile pass prefix kept by `ghostframe-render`'s
-//!   `pipelines/cdf53_state.rs` (`candidate = e.passIdx + 1` kept as a
-//!   running max, reset to 0 on a generation change).
-//! - midpoint: `cdf53_reconstruct.wgsl`'s `read_coeff` --
-//!   `if (raw_mag != 0 && passes >= 2u && passes < 14u) { mag = raw_mag +
-//!   (1 << (14 - passes - 1)) }`.
+//! - bit placement: pass `p` carries bit `13 - p`, and pass 0 is the sign
+//!   plane.
+//! - K: a running max of `pass_idx + 1`, reset to 0 on a generation change.
+//! - midpoint: when the raw magnitude is non-zero and `2 <= K < 14`, add
+//!   `1 << (14 - K - 1)`.
 
 use ghostframe_client_core::cdf53_prevalidate::prevalidate_cdf53;
 use ghostframe_client_core::cdf53_tile_state::Cdf53TileState;
@@ -55,14 +55,13 @@ const FULL_PASS_MASK: u16 = (1 << 14) - 1;
 /// docs for the three source sites this mirrors.
 ///
 /// `present` is the tile's bitmap once pass 0 has delivered it, or 0 while
-/// it is still unknown -- the same input `computePassesProcessed` takes.
+/// it is still unknown -- the same input the retired `passesProcessed` computation took.
 fn gpu_model_coefficients(arrived: &[(u8, Vec<u8>)], present: u16) -> Vec<i16> {
     let total = CHANNELS * COEFFS_PER_CHANNEL;
     let mut magnitudes = vec![0u32; total];
     let mut signs = vec![false; total];
 
-    // `passesProcessed`, mirroring the per-tile pass prefix in
-    // `ghostframe-render`'s `pipelines/cdf53_state.rs`.
+    // `passesProcessed` as the retired path computed it: a running max.
     let mut passes_processed: u32 = 0;
     let mut received_mask: u16 = 0;
 

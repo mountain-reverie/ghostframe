@@ -33,7 +33,7 @@ int main(void) {
     printf("GL_VERSION   %s\n", glGetString(GL_VERSION));
     printf("GL_RENDERER  %s\n\n", glGetString(GL_RENDERER));
 
-    puts("--- storage buffers (ghostframe needs 7 in one compute stage) ---");
+    puts("--- storage buffers (the multi-pass CDF 5/3 shaders that needed 7 are retired) ---");
     q("GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS",      GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS);
     q("GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS",     GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS);
     q("GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS",     GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS);
