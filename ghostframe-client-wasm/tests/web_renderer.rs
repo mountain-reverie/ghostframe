@@ -529,6 +529,72 @@ async fn cdf53_work_under_a_picture_is_cancelled_and_not_left_pending() {
     );
 }
 
+/// A picture that cannot be imported (a closed `VideoFrame`: importExternalTexture
+/// throws) is not drawn, is reported, and covers nothing: the CDF 5/3 work held
+/// under it must not be cancelled. Next to one that imports, only the second
+/// counts, and the tick still presents it.
+#[wasm_bindgen_test]
+async fn a_picture_that_fails_to_import_is_reported_and_cancels_nothing() {
+    let mut r = new_renderer("auto").await;
+    r.apply(dims(64, 64)).unwrap();
+    for (k, p) in passes(1).iter().enumerate() {
+        r.apply(pass_event(p, 0, 0, 5, k == 0)).unwrap();
+    }
+    let closed = video_frame([0, 255, 0], 64, 64);
+    js_sys::Reflect::get(&closed, &"close".into())
+        .unwrap()
+        .unchecked_into::<js_sys::Function>()
+        .call0(&closed)
+        .unwrap();
+    r.push_h264(closed, 6);
+    let out = tick(&mut r, 1);
+    assert_eq!(out.pictures_drawn, 0, "a closed frame cannot be drawn");
+    let errors = r.take_errors();
+    assert!(
+        errors.iter().any(|e| e
+            .as_string()
+            .unwrap_or_default()
+            .contains("importExternalTexture")),
+        "the import failure is reported: {errors:?}"
+    );
+    assert!(
+        r.has_deferred_work(),
+        "the held CDF 5/3 passes are still pending: no picture covers them"
+    );
+    for n in 2..=200u64 {
+        let _ = tick(&mut r, n);
+        if !r.has_deferred_work() {
+            break;
+        }
+        sleep(2).await;
+    }
+    assert!(!r.has_deferred_work(), "the held passes were drawn later");
+    assert!(
+        !near(px(&r, 8, 8).await, GREEN, 3),
+        "the failed picture never reached the framebuffer"
+    );
+
+    // One closed frame next to one that imports: one drawn, and it presents.
+    let closed = video_frame([255, 0, 0], 64, 64);
+    js_sys::Reflect::get(&closed, &"close".into())
+        .unwrap()
+        .unchecked_into::<js_sys::Function>()
+        .call0(&closed)
+        .unwrap();
+    r.push_h264(closed, 7);
+    r.push_h264(video_frame([0, 255, 0], 64, 64), 8);
+    let out = tick(&mut r, 300);
+    assert_eq!(
+        (out.pictures_drawn, out.pictures_dropped, out.presented),
+        (1, 0, true)
+    );
+    assert!(near(px(&r, 8, 8).await, GREEN, 3));
+    assert!(
+        r.take_errors().length() > 0,
+        "the skipped import is reported"
+    );
+}
+
 #[wasm_bindgen_test]
 async fn a_session_reset_closes_pending_pictures_and_forgets_the_ledger() {
     let mut r = new_renderer("auto").await;
