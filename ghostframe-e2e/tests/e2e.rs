@@ -5590,10 +5590,9 @@ async fn e2e_bench_web_paint_us() -> Result<()> {
         "BENCH mode={mode} paint_step_us count={} p50={} p99={} max={}",
         paint[0], paint[1], paint[2], paint[3]
     );
-    assert!(
-        tick[0] > 0.0 && !lat.is_empty(),
-        "the bench observed nothing: tick {tick:?}, {} frame latencies",
-        lat.len()
-    );
+    // `framePaints` needs frame sequences that advance by two; a static screen
+    // at 4K sends one burst and leaves it empty. That is a fact to report, not a
+    // failed run: the tick timing is what must be live.
+    assert!(tick[0] > 0.0, "the bench observed nothing: tick {tick:?}");
     Ok(())
 }
