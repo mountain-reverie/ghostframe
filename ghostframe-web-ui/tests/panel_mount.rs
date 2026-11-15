@@ -73,10 +73,15 @@ async fn settle() {
     leptos::task::tick().await;
 }
 
+/// The next feedback-stream write. Repair-status records travel on their own
+/// stream and say nothing about the panel, so they are skipped.
 fn next_stream(core: &Rc<RefCell<ClientCore>>) -> Option<Vec<u8>> {
-    match core.borrow_mut().poll_transmit(0) {
-        Some(PollOutput::Stream(b)) => Some(b),
-        Some(PollOutput::Datagram(_)) | None => None,
+    loop {
+        match core.borrow_mut().poll_transmit(0) {
+            Some(PollOutput::Stream(b)) => return Some(b),
+            Some(PollOutput::RepairStatus(_)) => continue,
+            Some(PollOutput::Datagram(_)) | None => return None,
+        }
     }
 }
 
