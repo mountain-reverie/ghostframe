@@ -8,7 +8,6 @@
 //! `ghostframe-render` and are re-exported at their old paths.
 
 pub mod cdf53_grid;
-pub mod cdf53_passes;
 pub use ghostframe_render::pipelines::{cdf53_state, palrle, rgba, solid};
 pub mod h264_nv12;
 pub mod rgba_slab;
