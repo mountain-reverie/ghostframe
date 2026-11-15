@@ -620,71 +620,70 @@ async function main() {
     inTick = true;
     let painted = 0;
     try {
-    diag.recordRafTick(__rafTicks);
+      diag.recordRafTick(__rafTicks);
 
-    // Assembly-timeout NACKs, the tail-fallback sweep, and the periodic
-    // feedback/ACK/NACK flush deadlines are now internal to
-    // `ClientCore::on_timeout` (ghostframe-client-core/src/lib.rs) — a
-    // byte-for-byte port of the scan/sweep this replaced, per the map doc.
-    // `drainTransmit` is async; `tick()` is not (it's the rAF callback), so
-    // this is a floating promise rather than an awaited call — deliberate,
-    // logged rather than left an unhandled rejection.
-    // A throw from either must not stop the rAF loop (the draw below still
-    // has to run and the next tick has to be scheduled).
-    try {
-      flushDatagrams();
-    } catch (e) {
-      health.record('tick:flushDatagrams', e);
-      console.error('tick(): flushDatagrams failed; continuing', e);
-    }
-    try {
-      for (const ev of core.onTimeoutInto(renderer, nowUs()) as RoutedEvent[]) handleSafely(ev);
-    } catch (e) {
-      console.error('tick(): onTimeout failed; continuing', e);
-    }
-    drainTransmit().catch((e) => console.warn('tick(): drainTransmit failed', e));
-
-    // M3.5 bench: emit recordFramePainted for all frames whose last tile was
-    // received before this rAF tick. Uses performance.now() at rAF entry so
-    // all frames pending in this tick share the same rafMsClient timestamp.
-    if (pendingFramePaintRaf.size > 0) {
-      const rafMs = performance.now();
-      for (const seq of pendingFramePaintRaf) {
-        diag.recordFramePainted({ seq, rafMsClient: rafMs });
-        // Cleanup per-frame bench state.
-        firstRecvMs.delete(seq);
+      // Assembly-timeout NACKs, the tail-fallback sweep, and the periodic
+      // feedback/ACK/NACK flush deadlines are now internal to
+      // `ClientCore::on_timeout` (ghostframe-client-core/src/lib.rs) — a
+      // byte-for-byte port of the scan/sweep this replaced, per the map doc.
+      // `drainTransmit` is async; `tick()` is not (it's the rAF callback), so
+      // this is a floating promise rather than an awaited call — deliberate,
+      // logged rather than left an unhandled rejection.
+      // A throw from either must not stop the rAF loop (the draw below still
+      // has to run and the next tick has to be scheduled).
+      try {
+        flushDatagrams();
+      } catch (e) {
+        health.record('tick:flushDatagrams', e);
+        console.error('tick(): flushDatagrams failed; continuing', e);
       }
-      pendingFramePaintRaf.clear();
-    }
+      try {
+        for (const ev of core.onTimeoutInto(renderer, nowUs()) as RoutedEvent[]) handleSafely(ev);
+      } catch (e) {
+        console.error('tick(): onTimeout failed; continuing', e);
+      }
+      drainTransmit().catch((e) => console.warn('tick(): drainTransmit failed', e));
 
-    // Paint: flush the renderer's tiles, draw pending H.264 pictures, present;
-    // all of it is skipped when nothing changed. A throw here must not stop
-    // the rAF loop: it would freeze the client for the rest of the session.
-    try {
-      painted = renderer.paintTick(nowUs());
-    } catch (e) {
-      health.record('paintTick', e);
-      console.error('paintTick failed; continuing', e);
-    }
-    // Renderer-side problems since the last tick (uncaptured GPU errors, a
-    // failed flush or present), as the old 'uncapturederror' listener recorded.
-    for (const msg of renderer.takeErrors() as string[]) {
-      health.record('renderer', `tick ${renderer.paintTickCount}: ${msg}`);
-      health.tally(`gpu:${msg.slice(0, 80)}`);
-    }
-    // Tiles the GPU decode rejected (PalRLE, read back asynchronously): the
-    // renderer reports [codec, tile_x, tile_y, code] quadruples.
-    const de = renderer.takeDecodeErrors();
-    for (let i = 0; i + 3 < de.length; i += 4) reportDecodeError(de[i], de[i + 1], de[i + 2], de[i + 3]);
+      // M3.5 bench: emit recordFramePainted for all frames whose last tile was
+      // received before this rAF tick. Uses performance.now() at rAF entry so
+      // all frames pending in this tick share the same rafMsClient timestamp.
+      if (pendingFramePaintRaf.size > 0) {
+        const rafMs = performance.now();
+        for (const seq of pendingFramePaintRaf) {
+          diag.recordFramePainted({ seq, rafMsClient: rafMs });
+          // Cleanup per-frame bench state.
+          firstRecvMs.delete(seq);
+        }
+        pendingFramePaintRaf.clear();
+      }
 
-    // Frames actually presented this tick (an idle tick adds none), for the
-    // stats panel's painted-fps row.
-    if (painted > 0) core.recordPaints(painted);
+      // Paint: flush the renderer's tiles, draw pending H.264 pictures, present;
+      // all of it is skipped when nothing changed. A throw here must not stop
+      // the rAF loop: it would freeze the client for the rest of the session.
+      try {
+        painted = renderer.paintTick(nowUs());
+      } catch (e) {
+        health.record('paintTick', e);
+        console.error('paintTick failed; continuing', e);
+      }
+      // Renderer-side problems since the last tick (uncaptured GPU errors, a
+      // failed flush or present), as the old 'uncapturederror' listener recorded.
+      for (const msg of renderer.takeErrors() as string[]) {
+        health.record('renderer', `tick ${renderer.paintTickCount}: ${msg}`);
+        health.tally(`gpu:${msg.slice(0, 80)}`);
+      }
+      // Tiles the GPU decode rejected (PalRLE, read back asynchronously): the
+      // renderer reports [codec, tile_x, tile_y, code] quadruples.
+      const de = renderer.takeDecodeErrors();
+      for (let i = 0; i + 3 < de.length; i += 4) reportDecodeError(de[i], de[i + 1], de[i + 2], de[i + 3]);
 
-    // Drain accounting + the ~2 s stats line live in stats_log.ts.
-    statsLog.onTick({ ...drained }, __rafTicks);
-    drained.solid = drained.palrle = drained.cdf53 = drained.h264 = 0;
+      // Frames actually presented this tick (an idle tick adds none), for the
+      // stats panel's painted-fps row.
+      if (painted > 0) core.recordPaints(painted);
 
+      // Drain accounting + the ~2 s stats line live in stats_log.ts.
+      statsLog.onTick({ ...drained }, __rafTicks);
+      drained.solid = drained.palrle = drained.cdf53 = drained.h264 = 0;
     } finally {
       // A throw above must not leave inTick set: out-of-tick flushes would
       // stop being counted for the rest of the session.

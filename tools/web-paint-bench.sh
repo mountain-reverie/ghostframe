@@ -6,7 +6,7 @@
 # first, then the branch; the images share one tag, so each label rebuilds them.
 # Takes ~/work/.gf-heavy.lock itself (GF_HEAVY_LOCK to override). See docs/specs/web-paint-bench.md.
 label=$1; wt=$2; out=$3
-GPU_RUN=${GF_GPU_RUN:-gf-gpu-run}
+GPU_RUN=${GF_GPU_RUN:-$HOME/work/gf-gpu-run}
 command -v "$GPU_RUN" > /dev/null || { echo "GF_GPU_RUN '$GPU_RUN' is not a command; set GF_GPU_RUN to the GPU wrapper" >&2; exit 1; }
 if [ -z "$GF_BENCH_LOCKED" ]; then
   exec env GF_BENCH_LOCKED=1 flock -o "${GF_HEAVY_LOCK:-$HOME/work/.gf-heavy.lock}" "$0" "$@"
