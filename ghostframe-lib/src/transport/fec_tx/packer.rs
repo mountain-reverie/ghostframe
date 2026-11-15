@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Pure, sans-IO packer: inner datagrams ("records") into PLAIN bundles, or,
 //! with blocks on (`set_blocks`), protected records into SOURCE bundles that
-//! build Reed-Solomon blocks (R6-d D2). Nothing here sends or encodes repairs;
+//! build Reed-Solomon blocks. Nothing here sends or encodes repairs;
 //! a closed block is handed over through `take_closed`.
 
 use ghostframe_protocol::fec::frame::{

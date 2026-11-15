@@ -953,7 +953,7 @@ pub struct IoBridge {
     /// framing on `record_emitted_transmissions` fills this instead of the
     /// ledger (the ledger is keyed by bundle).
     emitted_meta: HashMap<u32, crate::transport::reliable_emitter::emitter::EmittedDatagram>,
-    /// Server-side block state (R6-d); empty with the knob off.
+    /// Server-side block state; empty with the knob off.
     block_table: crate::transport::fec_tx::block_table::BlockTable,
     /// The adaptive controller (`FecMode::Adaptive` only).
     fec_adapt: Option<crate::transport::fec_tx::adapt::FecAdapt>,
