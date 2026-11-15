@@ -3,8 +3,9 @@
 //!
 //! `wgpu::Buffer::map_async` takes a callback, and the callback runs when the
 //! device is polled (native) or when the browser's event loop gets to it (web).
-//! [`begin_texture_read`] and [`read_texture_rgba8`] turn that into a future with a one-shot channel, so
-//! the same code serves the CDF 5/3 self-test on both. A caller on a thread
+//! [`begin_texture_read`] and [`read_texture_rgba8`] turn that into a future
+//! with a one-shot channel, so the same code serves the CDF 5/3 self-test on
+//! both. The rectangle must be non-empty and inside the texture. A caller on a thread
 //! with no event loop uses [`block_on_device`], which polls the device between
 //! polls of the future.
 
