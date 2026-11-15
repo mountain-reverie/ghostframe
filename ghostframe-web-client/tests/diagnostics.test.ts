@@ -19,9 +19,6 @@ function fakeCanvas(): HTMLCanvasElement {
   return {} as HTMLCanvasElement;
 }
 
-function fakeGetRenderer() {
-  return null;
-}
 
 describe('M3.5 bench instrumentation', () => {
   beforeEach(() => {
@@ -30,7 +27,7 @@ describe('M3.5 bench instrumentation', () => {
   });
 
   it('recordTile accepts the new optional Ms-suffix timestamp fields', () => {
-    const diag = initDiagnostics({ canvas: fakeCanvas(), getRenderer: fakeGetRenderer });
+    const diag = initDiagnostics({ canvas: fakeCanvas() });
     diag.recordTile({
       seq: 7,
       tileX: 1,
@@ -49,7 +46,7 @@ describe('M3.5 bench instrumentation', () => {
   });
 
   it('recordTile works without the optional fields (backward compat)', () => {
-    const diag = initDiagnostics({ canvas: fakeCanvas(), getRenderer: fakeGetRenderer });
+    const diag = initDiagnostics({ canvas: fakeCanvas() });
     diag.recordTile({
       seq: 99,
       tileX: 0,
@@ -66,7 +63,7 @@ describe('M3.5 bench instrumentation', () => {
   });
 
   it('recordFramePainted pushes onto __ghostframe_framePaints', () => {
-    const diag = initDiagnostics({ canvas: fakeCanvas(), getRenderer: fakeGetRenderer });
+    const diag = initDiagnostics({ canvas: fakeCanvas() });
     diag.recordFramePainted({ seq: 42, rafMsClient: 9999.9 });
     diag.recordFramePainted({ seq: 43, rafMsClient: 10016.5 });
     const paints = (window as any).__ghostframe_framePaints;

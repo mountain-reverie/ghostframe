@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { FullFrameDecoder, H264_DECODE_ERROR } from './decoder.js';
-import { WebGpuRenderer } from './webgpu/renderer.js';
-import { WebGpuUnavailableError } from './webgpu/init.js';
 import { attachInputCapture } from './input/wire';
-import { checkFrameDimensions } from './frame_limits.js';
 import { createStatsLogger } from './stats_log.js';
-import { installCdf53Debug } from './cdf53_debug.js';
-import { initDiagnostics } from './diagnostics.js';
+import { initDiagnostics, recordPaletteWrite } from './diagnostics.js';
 import { bootstrap } from './bootstrap.js';
 import { pumpServerStream } from './server_stream.js';
 import { initProtocol, protocol } from './protocol_constants.js';
@@ -21,6 +17,7 @@ import { health, installConsoleRing } from './health.js';
 import * as wasmExports from '../pkg-web/ghostframe_client_wasm.js';
 import init, {
   WasmClientCore,
+  WebRenderer,
   mountStatsPanel,
   WasmDecodeErrorBatcher,
   tileNackEnvelope,
@@ -75,39 +72,34 @@ async function main() {
 
   log(`Connecting to ${window.location.origin}...`);
 
-  // WebGPU init — fatal if unavailable per design D2.
-  let renderer: WebGpuRenderer;
+  // WebGPU init — fatal if unavailable per design D2. `?cdf53=cpu` forces
+  // the CPU CDF 5/3 path (the e2e run that proves the fallback); anything
+  // else lets the grid's self-test decide.
+  let renderer: WebRenderer;
   try {
-    renderer = await WebGpuRenderer.create(canvasEl);
+    renderer = await WebRenderer.create(canvasEl, url.searchParams.get('cdf53') ?? 'auto');
     // Test/diagnostic hooks: swallowed-exception counts and renderer state.
     window.__ghostframeHealth = () => health.snapshot();
     window.__ghostframeRendererState = () => renderer.debugState();
     window.__ghostframeTile = (x: number, y: number) => renderer.debugTile(x, y);
-    renderer.device.addEventListener('uncapturederror', (ev) => {
-      const msg = (ev as GPUUncapturedErrorEvent).error.message;
-      health.record('gpu.uncaptured', `tick ${renderer.paintTick}: ${msg}`);
-      health.tally(`gpu:${msg.slice(0, 80)}`);
-    });
+    // Time per painted tick, for the section 7 bench: [count, p50, p99, max] in
+    // microseconds since the last call.
+    if (url.searchParams.has('e2e')) {
+      window.__ghostframePaintUs = () => Array.from(renderer.paintUsStats());
+    }
   } catch (e) {
-    if (e instanceof WebGpuUnavailableError) {
+    if (String(e).startsWith('WEBGPU_UNAVAILABLE')) {
       statusEl.textContent = 'WebGPU not available in this browser.';
       log(String(e));
       return;
     }
     throw e;
   }
-  renderer.resize(0, 0);
-
-  // GPU debug hooks and the `cdf53watch` tile watcher: opt-in only.
-  if (url.searchParams.has('debug')) installCdf53Debug(renderer, url, log);
 
   // Wire all test/e2e diagnostic globals onto `window` via diagnostics.ts.
-  // The getRenderer callback is called lazily (per __readPixel invocation)
-  // so it always reflects the current framebuffer texture set by
-  // renderer.encodeAndPresentFrame on the previous rAF tick.
   const diag = initDiagnostics({
     canvas: canvasEl,
-    getRenderer: () => window.__ghostframeRenderer ?? null,
+    reader: renderer,
     // Pixel readbacks are for the e2e suite only (`?e2e` on the page URL).
     readbacks: url.searchParams.has('e2e'),
   });
@@ -287,8 +279,8 @@ async function main() {
   // input-forwarding-design.md.
   if (feedbackWriter) {
     attachInputCapture(canvasEl, feedbackWriter, () => ({
-      width: renderer.framebuffer.width,
-      height: renderer.framebuffer.height,
+      width: renderer.fbWidth,
+      height: renderer.fbHeight,
     }));
   }
 
@@ -331,38 +323,29 @@ async function main() {
   let firstTileRendered = false;
   let frameDimensionsKnown = false;
 
-  // Serde mirror of `ghostframe-client-wasm/src/boundary.rs`'s `WasmEvent`,
-  // confirmed against the generated source and recorded in
-  // docs/specs/wasm-cutover-main-ts-map.md Part 2. `handleDatagram` and
-  // `onTimeout` return `any` in the .d.ts (serde_wasm_bindgen erases the
-  // type at the boundary); this is the real shape crossing it.
-  // `TileData`'s mirror (boundary.rs's `WasmTileData`), tagged on `codec`.
-  // `PalRle` and `Cdf53` arrive prevalidated — the core already computed the
-  // GPU-ready product, so there is no second prevalidation call here.
-  type WasmTileData =
-    | { codec: 'Solid'; bytes: Uint8Array }
-    | {
-        codec: 'PalRle';
-        palette_id: number;
-        count: number;
-        indices: Uint8Array;
-        /** Payload flags byte as encoded by the server: bit 0 bundled, bit 1 indices-raw. */
-        wire_flags: number;
-      }
-    | { codec: 'Cdf53'; pass_idx: number; bit_planes: Uint8Array; present_passes?: number | null };
+  // What `core.handleDatagramsInto` / `core.onTimeoutInto` return: one record
+  // per event, in order (`ghostframe-client-wasm/src/web/route.rs`). Tile
+  // bytes never reach JS: the byte fields of a tile hold at most the first 16
+  // bytes and `len` is the real payload length. `error` is set when the
+  // renderer refused the event (the rest of the batch was still applied).
+  type SlimTileData =
+    | { codec: 'Solid'; bytes: Uint8Array; len: number }
+    | { codec: 'PalRle'; palette_id: number; count: number; wire_flags: number; indices: Uint8Array; len: number }
+    | { codec: 'Cdf53'; pass_idx: number; bit_planes: Uint8Array; present_passes?: number | null; len: number };
 
-  type WasmEvent =
-    | { kind: 'TileReady'; frame_seq: number; tile_x: number; tile_y: number; rgba: Uint8Array }
+  type RoutedEvent =
     | {
         kind: 'TilePayload';
         frame_seq: number;
         tile_x: number;
         tile_y: number;
         generation: number;
-        data: WasmTileData;
+        data: SlimTileData;
+        error?: string;
       }
-    | { kind: 'PaletteUpdated'; palette_id: number; colors: [number, number, number, number][] }
-    | { kind: 'FrameDimensions'; width: number; height: number }
+    | { kind: 'PaletteUpdated'; palette_id: number; colors: [number, number, number, number][]; error?: string }
+    | { kind: 'FrameDimensions'; width: number; height: number; applied: boolean; reason?: string }
+    | { kind: 'TileReady'; frame_seq: number; tile_x: number; tile_y: number }
     | {
         kind: 'NeedsH264';
         frame_seq: number;
@@ -376,6 +359,12 @@ async function main() {
       }
     | { kind: 'DecodeError'; codec: number; tile_x: number; tile_y: number; code: number }
     | { kind: 'Evicted'; reason: number };
+
+  // The framebuffer size the server last announced (applied), for the recorders.
+  let fbW = 0;
+  let fbH = 0;
+  // Events applied since the last tick, per codec, for the page log's Δdrain.
+  const drained = { solid: 0, palrle: 0, cdf53: 0, h264: 0 };
 
   /**
    * Renders one event out of `core.handleDatagram`/`core.onTimeout`.
@@ -393,7 +382,7 @@ async function main() {
    * `tests/cdf53_globals.test.ts` against `pkg-node`, so the logic that
    * updates them is never duplicated.
    */
-  function handleEvent(ev: WasmEvent): void {
+  function handleEvent(ev: RoutedEvent): void {
     recordProtocolEvent(window as any, ev as any, cdf53ErrorCodes, performance.now());
     switch (ev.kind) {
       case 'TileReady': {
@@ -408,72 +397,41 @@ async function main() {
 
       case 'TilePayload': {
         const d = ev.data;
-        let sampleBytes: Uint8Array;
-        switch (d.codec) {
-          case 'Solid':
-            renderer.pushSolid({ tileX: ev.tile_x, tileY: ev.tile_y, frameSeq: ev.frame_seq, bgra: d.bytes });
-            sampleBytes = d.bytes;
-            if (d.bytes[2] > 0x80) health.mark(ev.tile_x, ev.tile_y, ev.frame_seq, 'solid-red');
-            if (diagnostics) {
-              health.tally(`solid:${Array.from(d.bytes).map((b) => b.toString(16).padStart(2, '0')).join('')}`);
-            }
-            break;
-          case 'PalRle':
-            renderer.pushPalRle({
-              tileX: ev.tile_x,
-              tileY: ev.tile_y,
-              frameSeq: ev.frame_seq,
-              paletteId: d.palette_id,
-              count: d.count,
-              indices: d.indices,
-            });
-            sampleBytes = d.indices;
-            break;
-          case 'Cdf53':
-            // Prevalidated by the core (`reassembly.rs`'s `prevalidate_cdf53`
-            // call) — no second prevalidation here. See the design doc's
-            // "Why the drain-time ordering constraint dissolves".
-            renderer.pushCdf53({
-              tileX: ev.tile_x,
-              tileY: ev.tile_y,
-              frameSeq: ev.frame_seq,
-              gen: ev.generation,
-              passIdx: d.pass_idx,
-              bitPlanes: d.bit_planes,
-              presentPasses: d.present_passes,
-            });
-            sampleBytes = d.bit_planes;
-            break;
+        if (ev.error) {
+          // The renderer refused it; the core has already acknowledged the tile.
+          health.record(
+            'renderer.apply',
+            `tile (${ev.tile_x},${ev.tile_y}) seq ${ev.frame_seq}: ${ev.error}`,
+          );
+        }
+        const sampleBytes: Uint8Array =
+          d.codec === 'Solid' ? d.bytes : d.codec === 'PalRle' ? d.indices : d.bit_planes;
+        if (d.codec === 'Solid') {
+          drained.solid++;
+          if (d.bytes[2] > 0x80) health.mark(ev.tile_x, ev.tile_y, ev.frame_seq, 'solid-red');
+          if (diagnostics) {
+            health.tally(`solid:${Array.from(d.bytes).map((b) => b.toString(16).padStart(2, '0')).join('')}`);
+          }
+        } else if (d.codec === 'PalRle') {
+          drained.palrle++;
+        } else {
+          drained.cdf53++;
         }
 
         const tileNowMs = performance.now();
         const firstRecvMsClient = noteFrameTileReceived(ev.frame_seq, tileNowMs);
 
-        // Re-derive the `__ghostframeRecorded*` test globals.
-        //
-        // `diag.recordTile` lost its only caller when finishAssembly was
-        // deleted at the wasm cutover (14aa7d4, 2026-09-11), so
-        // `__ghostframeRecordedCodecs` / `Tiles` / `Flags` have been empty
-        // ever since. Three e2e tests read them and have been failing on
-        // `saw codecs: []` since that day -- the same orphaning that left
-        // `__tileCounts` and `__cdf53Coverage` reporting zeros.
-        //
-        // Fed from the event rather than reimplemented here: recordTile
-        // owns the FIFO cap and populates all three globals consistently.
+        // Re-derive the `__ghostframeRecorded*` test globals from the event.
+        // `palRleFlag` is the wire flags byte the server encoded, not the
+        // palette id: `e2e_indices_raw_handshake` tests its bit 1.
         diag.recordTile({
           seq: ev.frame_seq,
           tileX: ev.tile_x,
           tileY: ev.tile_y,
           codec: codecDiscriminant(d.codec),
-          payloadLen: sampleBytes.byteLength,
-          fbWidth: renderer.framebuffer.width,
-          fbHeight: renderer.framebuffer.height,
-          // The wire flags byte, not the palette id. `e2e_indices_raw_handshake`
-          // tests bit 1 of this value (indices-raw); it was being handed
-          // `d.palette_id`, so the assertion passed or failed on whether a
-          // palette id happened to have bit 1 set. `wire_flags` is forwarded
-          // verbatim from the payload by the core, so the test now checks the
-          // byte the server actually encoded.
+          payloadLen: d.len,
+          fbWidth: fbW,
+          fbHeight: fbH,
           palRleFlag: d.codec === 'PalRle' ? d.wire_flags : undefined,
           firstRecvMsClient,
           lastPaintMsClient: tileNowMs,
@@ -484,7 +442,7 @@ async function main() {
           const sample = Array.from(sampleBytes.slice(0, 16))
             .map(b => b.toString(16).padStart(2, '0'))
             .join(' ');
-          log(`First tile: (${ev.tile_x},${ev.tile_y}) ${sampleBytes.byteLength}B`);
+          log(`First tile: (${ev.tile_x},${ev.tile_y}) ${d.len}B`);
           log(`First bytes: ${sample}`);
           statusEl.textContent = 'Receiving frames';
         }
@@ -492,43 +450,31 @@ async function main() {
       }
 
       case 'PaletteUpdated': {
-        // Not optional: palrle_decode.wgsl decodes against this table, and
-        // the shadow driving prevalidation now lives in wasm. Skipping this
-        // wiring wouldn't error — it would render wrong colours, the
-        // hardest failure mode to trace back to a missing event handler.
-        //
-        // Same upload path `webgpu/renderer.ts`'s own drain-time
-        // `prevalidatePalRle` call already uses for a Bundled entry
-        // (renderer.ts: `this.palrlePipeline.upsertPalette(...)`) — so this
-        // reaches the exact atlas buffer + `__h2_clientPaletteWrites` log
-        // the pre-cutover TS path wrote to, not a parallel copy.
-        //
-        // `colors` is `Vec<[u8;4]>` in BGRA order (event.rs: "Colours are
-        // BGRA, matching the wire and the palette table") — flatten to the
-        // packed Uint8Array `upsertPalette` expects.
+        // Applied to the atlas inside wasm (before the tiles that use it, in
+        // wire order). JS only keeps the e2e fingerprint log of the writes.
+        if (ev.error) health.record('renderer.palette', `palette ${ev.palette_id}: ${ev.error}`);
         const bgra = new Uint8Array(ev.colors.length * 4);
         ev.colors.forEach((c, i) => bgra.set(c, i * 4));
-        renderer.palrlePipeline.upsertPalette(ev.palette_id, bgra);
+        recordPaletteWrite(ev.palette_id, bgra);
         break;
       }
 
       case 'FrameDimensions': {
-        const verdict = checkFrameDimensions(ev.width, ev.height);
-        if (!verdict.ok) {
+        if (!ev.applied) {
           // Keep the current framebuffer rather than allocate for a size the
-          // server has no business asking for.
-          console.error(`FrameDimensions rejected: ${verdict.reason}`);
-          log(`FrameDimensions rejected: ${verdict.reason}`);
+          // server has no business asking for (or one the renderer refused).
+          console.error(`FrameDimensions rejected: ${ev.reason}`);
+          log(`FrameDimensions rejected: ${ev.reason}`);
           break;
         }
-        const oldW = renderer.framebuffer.width;
-        const oldH = renderer.framebuffer.height;
-        renderer.resize(ev.width, ev.height);
         // `seq` is diagnostic-only (fifo-logged to
-        // window.__ghostframeRecordedResizes, never asserted on — see the
-        // map doc). Unlike the old sentinel-tile path, this event carries
-        // no frame_seq to attribute the resize to; 0 is a placeholder.
-        diag.recordResize({ seq: 0, oldW, oldH, newW: ev.width, newH: ev.height, trigger: 'sentinel' });
+        // window.__ghostframeRecordedResizes, never asserted on); 0 is a placeholder.
+        diag.recordResize({ seq: 0, oldW: fbW, oldH: fbH, newW: ev.width, newH: ev.height, trigger: 'sentinel' });
+        fbW = ev.width;
+        fbH = ev.height;
+        // The framebuffer texture was replaced: re-publish the raw handles
+        // (`texture.width`/`.height` are read by the e2e suite).
+        window.__ghostframeRenderer = renderer.debugHandles();
         frameDimensionsKnown = true;
         break;
       }
@@ -563,6 +509,7 @@ async function main() {
           );
         }
         fullFrameDecoder.decode(ev.payload, ev.is_keyframe, ev.frame_seq);
+        drained.h264++;
 
         if (!firstTileRendered) {
           firstTileRendered = true;
@@ -596,7 +543,7 @@ async function main() {
   // One throwing event must not discard the rest of its batch: the core has
   // already accepted (and ACKed) those tiles, so a lost CDF53 pass would never
   // be retransmitted.
-  function handleSafely(ev: WasmEvent): void {
+  function handleSafely(ev: RoutedEvent): void {
     try {
       handleEvent(ev);
     } catch (e) {
@@ -670,7 +617,7 @@ async function main() {
       console.error('tick(): flushDatagrams failed; continuing', e);
     }
     try {
-      for (const ev of core.onTimeout(nowUs())) handleSafely(ev);
+      for (const ev of core.onTimeoutInto(renderer, nowUs()) as RoutedEvent[]) handleSafely(ev);
     } catch (e) {
       console.error('tick(): onTimeout failed; continuing', e);
     }
@@ -689,35 +636,34 @@ async function main() {
       pendingFramePaintRaf.clear();
     }
 
-    // Snapshot queue depths BEFORE drain so we can log how much each rAF
-    // actually consumed.
-    const beforeDrain = {
-      solid: renderer.solidQueue.length,
-      palrle: renderer.palRleQueue.length,
-      cdf53: renderer.cdf53Queue.length,
-      h264: renderer.h264Queue.length,
-    };
-
-    // A throw here must not stop the rAF loop: it would freeze the client
-    // for the rest of the session on one bad frame.
-    const submitsBefore = renderer.submitCount;
+    // Paint: flush the renderer's tiles, draw pending H.264 pictures, present;
+    // all of it is skipped when nothing changed. A throw here must not stop
+    // the rAF loop: it would freeze the client for the rest of the session.
+    let painted = 0;
     try {
-      renderer.encodeAndPresentFrame((codec, tx, ty, code) => {
-        reportDecodeError(codec, tx, ty, code);
-      });
+      painted = renderer.paintTick(nowUs());
     } catch (e) {
-      health.record('encodeAndPresentFrame', e);
-      console.error('encodeAndPresentFrame failed; continuing', e);
+      health.record('paintTick', e);
+      console.error('paintTick failed; continuing', e);
     }
+    // Renderer-side problems since the last tick (uncaptured GPU errors, a
+    // failed flush or present), as the old 'uncapturederror' listener recorded.
+    for (const msg of renderer.takeErrors() as string[]) {
+      health.record('renderer', `tick ${renderer.paintTickCount}: ${msg}`);
+      health.tally(`gpu:${msg.slice(0, 80)}`);
+    }
+    // Tiles the GPU decode rejected (PalRLE, read back asynchronously): the
+    // renderer reports [codec, tile_x, tile_y, code] quadruples.
+    const de = renderer.takeDecodeErrors();
+    for (let i = 0; i + 3 < de.length; i += 4) reportDecodeError(de[i], de[i + 1], de[i + 2], de[i + 3]);
 
-    // Frames actually submitted this tick (an idle tick skips and adds none),
-    // for the stats panel's painted-fps row. Until the renderer moves into
-    // Rust the core cannot see paints, so the host reports them.
-    const painted = renderer.submitCount - submitsBefore;
+    // Frames actually presented this tick (an idle tick adds none), for the
+    // stats panel's painted-fps row.
     if (painted > 0) core.recordPaints(painted);
 
     // Drain accounting + the ~2 s stats line live in stats_log.ts.
-    statsLog.onTick(beforeDrain, __rafTicks);
+    statsLog.onTick({ ...drained }, __rafTicks);
+    drained.solid = drained.palrle = drained.cdf53 = drained.h264 = 0;
 
     requestAnimationFrame(tick);
   }
@@ -763,7 +709,9 @@ async function main() {
     pendingDatagrams.length = 0;
     pendingArrivalsUs.length = 0;
 
-    for (const ev of core.handleDatagrams(concat, lens, arrivals) as WasmEvent[]) handleSafely(ev);
+    for (const ev of core.handleDatagramsInto(renderer, concat, lens, arrivals) as RoutedEvent[]) {
+      handleSafely(ev);
+    }
 
     // Re-publish the datagram counters the e2e gates read off
     // `window.__ghostframeStats`.

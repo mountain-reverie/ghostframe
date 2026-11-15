@@ -7,7 +7,7 @@
 // (`rx{}`, `lastSeq`, the FEC recovery counters, per-tier receive bytes)
 // used to print an "n/a(wasm-internal)" sentinel; they are gone rather than
 // kept as lines that look like measurements. What remains and is fed:
-//   - `Δdrain`   queue entries consumed per window (counted here)
+//   - `Δdrain`   events applied to the renderer per window, per codec (counted by main.ts)
 //   - `cdf53-coverage` / `cdf53-incomplete`  from `core.cdf53Coverage()`
 //   - `nack_sent`  NACK envelopes `drainTransmit` saw the core emit
 //   - `cdf53fails`  from the recordProtocolEvent counters
@@ -15,7 +15,13 @@
 // Identical snapshots are dropped entirely: no heartbeat, silence means
 // nothing changed.
 
-import type { WebGpuRenderer } from './webgpu/renderer.js';
+/** The slice of `WebRenderer` this logger reads. */
+export interface StatsRenderer {
+  readonly fbWidth: number;
+  readonly fbHeight: number;
+  readonly submitCount: number;
+}
+
 import { protocol } from './protocol_constants.js';
 
 /** The slice of `WasmClientCore` this logger reads. */
@@ -25,7 +31,7 @@ export interface StatsCore {
 }
 
 export interface StatsLoggerDeps {
-  renderer: WebGpuRenderer;
+  renderer: StatsRenderer;
   core: StatsCore;
   log: (msg: string) => void;
   getNackSent: () => number;
@@ -47,13 +53,13 @@ export function createStatsLogger({ renderer, core, log, getNackSent }: StatsLog
   let lastLineKey = '';
 
   return {
-    /** Call once per rAF, after the frame was encoded. `beforeDrain` is the
-     * queue depths sampled BEFORE `encodeAndPresentFrame` consumed them. */
-    onTick(beforeDrain: QueueDepths, rafTicks: number): void {
-      drainTotals.solid += beforeDrain.solid;
-      drainTotals.palrle += beforeDrain.palrle;
-      drainTotals.cdf53 += beforeDrain.cdf53;
-      drainTotals.h264 += beforeDrain.h264;
+    /** Call once per rAF, after the frame was painted. `applied` is the
+     * events applied since the last tick. */
+    onTick(applied: QueueDepths, rafTicks: number): void {
+      drainTotals.solid += applied.solid;
+      drainTotals.palrle += applied.palrle;
+      drainTotals.cdf53 += applied.cdf53;
+      drainTotals.h264 += applied.h264;
 
       const nowMs = performance.now();
       if (nowMs - lastStatsMs <= STATS_INTERVAL_MS) return;
@@ -71,7 +77,7 @@ export function createStatsLogger({ renderer, core, log, getNackSent }: StatsLog
         h264: drainTotals.h264 - lastDrain.h264,
       };
       lastDrain = { ...drainTotals };
-      const fb = renderer.framebuffer;
+      const fb = { width: renderer.fbWidth, height: renderer.fbHeight };
       const cdf53Fails = w.__cdf53PrevalidateFails ?? 0;
       const cdf53Last = w.__cdf53LastFailCode ?? '-';
       const nackSent = getNackSent();
