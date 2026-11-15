@@ -97,3 +97,57 @@ async fn a_refused_frame_size_leaves_the_renderer_unchanged() {
     r.paint_tick(1_000).expect("paint");
     assert!(near(px(&r, 40, 40).await, RED, 0), "pixel read still works");
 }
+
+/// A real datagram stream: a core, a renderer, and a Solid tile datagram built
+/// by the protocol crate. Proves `handleDatagramsInto` applies the tile inside
+/// wasm and returns a slim record, not the payload.
+#[wasm_bindgen_test]
+async fn datagrams_reach_the_renderer_without_their_bytes_reaching_js() {
+    use ghostframe_client_wasm::core::WasmClientCore;
+    use ghostframe_protocol::protocol::{
+        fragment_tile, Codec, TileFragmentInputs, TILE_DATAGRAM_FLAG,
+    };
+
+    let datagrams = fragment_tile(
+        &TileFragmentInputs {
+            frame_seq: 5 | TILE_DATAGRAM_FLAG,
+            tile_x: 1,
+            tile_y: 1,
+            codec: Codec::Solid,
+            generation: 1,
+            pass: 0,
+            timestamp_us: 0,
+        },
+        &RED, // a Solid payload is one BGRA quad
+        1200,
+    );
+    let mut core = WasmClientCore::new(true, false, true, 0);
+    let mut r = new_renderer("auto").await;
+    r.apply(dims(64, 64)).unwrap();
+    let concat: Vec<u8> = datagrams.iter().flatten().copied().collect();
+    let lens: Vec<u32> = datagrams.iter().map(|d| d.len() as u32).collect();
+    let arrivals = vec![1000.0; datagrams.len()];
+    let out = core
+        .handle_datagrams_into(&mut r, &concat, &lens, &arrivals)
+        .expect("route");
+    let out = js_sys::Array::from(&out);
+    assert_eq!(out.length(), 1, "one tile, one record");
+    let rec = out.get(0);
+    let get = |k: &str| js_sys::Reflect::get(&rec, &k.into()).unwrap();
+    assert_eq!(get("kind"), "TilePayload");
+    assert_eq!(get("tile_x").as_f64(), Some(1.0));
+    let data = js_sys::Reflect::get(&rec, &"data".into()).unwrap();
+    assert_eq!(
+        js_sys::Reflect::get(&data, &"codec".into()).unwrap(),
+        "Solid"
+    );
+    assert_eq!(
+        js_sys::Reflect::get(&data, &"len".into()).unwrap().as_f64(),
+        Some(4.0)
+    );
+    r.paint_tick(2_000).unwrap();
+    assert!(
+        near(px(&r, 40, 40).await, RED, 0),
+        "the tile was applied inside wasm"
+    );
+}
