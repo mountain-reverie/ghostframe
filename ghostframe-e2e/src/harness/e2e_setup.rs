@@ -114,6 +114,17 @@ pub struct E2eServerSpec<'a> {
     pub url_query_extra: &'a str,
 }
 
+/// The caller's suffix and the environment's, joined by `&` with their leading
+/// `&` removed and empty parts dropped.
+fn url_query(caller: &str, from_env: &str) -> String {
+    [caller, from_env]
+        .iter()
+        .map(|s| s.strip_prefix('&').unwrap_or(s))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 /// Launch headscale + ghostframe-server containers, join tsnet, start
 /// UDP/TCP forwarders, and (when `webgpu == true`) spawn a Weston headless
 /// compositor with XWayland. Returns the assembled `E2eServerSetup` plus
@@ -212,18 +223,21 @@ pub async fn setup_e2e_server_as(
     };
 
     // `e2e=1` marks a test session (the client installs its pixel readbacks
-    // only when `e2e` is present, so a test page must carry it) and `debug=1`
-    // installs the CDF53 GPU debug hooks. Both are absent from a production
-    // URL. Caller suffixes follow; a caller may add
-    // another `e2e=` value (e.g. `e2e=lossless`), which the client reads too.
+    // only when `e2e` is present, so a test page must carry it). `debug=1` is
+    // no longer read by the client (the CDF 5/3 GPU debug hooks went with the
+    // multi-pass shaders); it stays so saved URLs and logs do not change. Both
+    // are absent from a production URL. Caller suffixes follow; a caller may
+    // add another `e2e=` value (e.g. `e2e=lossless`), which the client reads too.
     let page_url = {
-        let suffix = spec
-            .url_query_extra
-            .strip_prefix('&')
-            .unwrap_or(spec.url_query_extra);
-        let sep = if suffix.is_empty() { "" } else { "&" };
+        // GHOSTFRAME_E2E_URL_QUERY_EXTRA (for example "&cdf53=cpu") is appended
+        // after the caller's own suffix, so a run can change how the page
+        // behaves without editing the test (the same idea as
+        // GHOSTFRAME_SCENE_PAGE_QUERY in scene.rs).
+        let from_env = std::env::var("GHOSTFRAME_E2E_URL_QUERY_EXTRA").unwrap_or_default();
+        let query = url_query(spec.url_query_extra, &from_env);
+        let sep = if query.is_empty() { "" } else { "&" };
         format!(
-            "https://127.0.0.1:{}/?e2e=1&debug=1{sep}{suffix}",
+            "https://127.0.0.1:{}/?e2e=1&debug=1{sep}{query}",
             forwarder.port()
         )
     };
@@ -275,5 +289,22 @@ pub async fn wait_for_frames<B: crate::harness::browser::BrowserSession>(
             ));
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(test)]
+mod url_query_tests {
+    use super::url_query;
+
+    #[test]
+    fn joins_and_strips_leading_ampersands() {
+        assert_eq!(url_query("", ""), "");
+        assert_eq!(url_query("&e2e=lossless", ""), "e2e=lossless");
+        assert_eq!(url_query("", "&cdf53=cpu"), "cdf53=cpu");
+        assert_eq!(
+            url_query("&e2e=lossless", "&cdf53=cpu"),
+            "e2e=lossless&cdf53=cpu"
+        );
+        assert_eq!(url_query("a=1", "b=2"), "a=1&b=2");
     }
 }
