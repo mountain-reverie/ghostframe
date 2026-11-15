@@ -303,3 +303,28 @@ Both built from scratch with `just build-web` (`npm run build`), asset hashes ma
 ### Wasm delta
 
 Raw: 167844 -> 459892 (+292048 bytes, 173%). Limit 524,288; headroom 64396 bytes.
+
+## 2026-11-14: PR 2, the web renderer on wgpu
+
+`ghostframe-client-wasm` now links wgpu's WebGPU backend, `ghostframe-render`,
+and the CDF 5/3 grid (the TypeScript renderer is gone from the JS bundle).
+Measured with `just build-web` on the branch and on master at bcc59e03
+(the local `origin/master` ref; the fetch was not possible offline).
+`strings` finds no `naga` in the branch wasm (count 0), so naga is not linked.
+
+| Build | wasm raw | wasm gzip | JS bundle raw | JS bundle gzip |
+|---|---:|---:|---:|---:|
+| master | 459892 | 185928 | 120062 | 34167 |
+| PR 2 | 783983 | 304658 | 79640 | 23775 |
+| PR 2, wgpu `opt-level = "s"` | 785108 | 305424 | | |
+| PR 2, wgpu + ghostframe-render `"s"` | 773718 | 302892 | | |
+| PR 2, wgpu + wgpu-types + ghostframe-render `"s"` | 769867 | 301937 | | |
+| PR 2, default + `wasm-opt -Oz` | 746643 | 305025 | | |
+
+Gzip is `gzip -c` of the file (default level); the PR 2 row from the standalone
+wasm-pack build is 783983 raw, 304649 gzip.
+
+The 512 KiB (524,288 byte) cap in `ci/check-wasm-size.sh` is NOT changed by this
+PR. The branch is 259,695 bytes (49.5%) over it, and none of the measured
+levers closes more than 14,116 bytes (`opt-level = "s"` on wgpu even grows it).
+Owner decision pending the owner.
