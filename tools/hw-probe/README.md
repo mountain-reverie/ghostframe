@@ -29,7 +29,7 @@ make run          # builds and runs the three C probes
 decides whether `shaders/client/*.wgsl` can run unmodified. The spec minimum for
 GLES 3.1 is 128 and WebGPU guarantees 256, so the answer is per-driver and
 cannot be assumed. It also prints `MAX_COMPUTE_SHADER_STORAGE_BLOCKS`, which
-must be at least 7 for `cdf53_integrate.wgsl`.
+must be at least 7 for the retired multi-pass CDF 5/3 shaders (the grid needs fewer).
 
 **`gbmprobe.c`** — a video decoder needs NV12 buffers, and the obvious way to
 get dmabuf-backed ones is GBM. Whether that works is entirely driver-dependent:

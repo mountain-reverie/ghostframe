@@ -3,7 +3,7 @@
 //!
 //! Never exported. Tiles patch it in place and it is blitted into an export
 //! buffer when a frame is published. Mirrors the web client's `Framebuffer`
-//! in `ghostframe-web-client/src/webgpu/framebuffer.ts`, including the
+//! in the retired TypeScript renderer's framebuffer, including the
 //! preserve-on-resize copy: without that copy, tiles written before a late
 //! sentinel-driven resize are lost (the new texture is zero-initialized per
 //! spec, and `wgpu::Texture::destroy` on the old one would otherwise happen
