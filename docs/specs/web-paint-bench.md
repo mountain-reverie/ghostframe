@@ -13,7 +13,7 @@ into the datagram step:
 
 - **framePaints**: `__ghostframe_framePaints`, `raf - first receipt` per frame.
   A coarse stamp (it waits for the server to be two sequences ahead); it is
-  empty on a static 4K screen, which sends a single burst.
+  empty at 4096x2160 on both sides (0 samples). The reason is not verified: the test now prints paints= and recorded_tiles= next to the line, so a rerun records whether paints were empty or the join failed (the recorded-tiles FIFO is capped at 32768). Treat the 4K framePaints cell as unmeasured; a usable one needs an animated source rather than --gradient.
 - **tick**: main-thread CPU of each rAF tick that presented a frame
   (`__ghostframeTickUs`), identical TypeScript on both sides. The comparable
   cost number.
