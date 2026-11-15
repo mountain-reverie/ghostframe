@@ -76,7 +76,11 @@ pub enum SlimEvent {
         reason: Option<String>,
     },
     /// Cannot happen (the core delivers payloads); reported, never rendered.
-    TileReady { frame_seq: u32, tile_x: u8, tile_y: u8 },
+    TileReady {
+        frame_seq: u32,
+        tile_x: u8,
+        tile_y: u8,
+    },
 }
 
 /// One entry of the array JS gets back.
@@ -95,15 +99,28 @@ fn sample(bytes: &[u8]) -> Vec<u8> {
 
 fn slim_of(data: &TileData) -> Option<SlimTileData> {
     Some(match data {
-        TileData::Solid(bgra) => SlimTileData::Solid { bytes: bgra.to_vec(), len: bgra.len() },
-        TileData::PalRle { palette_id, count, indices, wire_flags } => SlimTileData::PalRle {
+        TileData::Solid(bgra) => SlimTileData::Solid {
+            bytes: bgra.to_vec(),
+            len: bgra.len(),
+        },
+        TileData::PalRle {
+            palette_id,
+            count,
+            indices,
+            wire_flags,
+        } => SlimTileData::PalRle {
             palette_id: *palette_id,
             count: *count,
             wire_flags: *wire_flags,
             indices: sample(indices),
             len: indices.len(),
         },
-        TileData::Cdf53 { pass_idx, bit_planes, present_passes, new_generation: _ } => SlimTileData::Cdf53 {
+        TileData::Cdf53 {
+            pass_idx,
+            bit_planes,
+            present_passes,
+            new_generation: _,
+        } => SlimTileData::Cdf53 {
             pass_idx: *pass_idx,
             bit_planes: sample(bit_planes),
             present_passes: *present_passes,
@@ -121,14 +138,31 @@ pub fn route<S: TileSink + ?Sized>(events: Vec<Event>, sink: &mut S) -> Vec<Rout
     let mut out = Vec::with_capacity(events.len());
     for ev in events {
         match ev {
-            Event::TilePayload { frame_seq, tile_x, tile_y, generation, data } => {
-                let data = if let TileData::Cdf53Wire { pass_idx, streams, present_passes, new_generation } = data {
+            Event::TilePayload {
+                frame_seq,
+                tile_x,
+                tile_y,
+                generation,
+                data,
+            } => {
+                let data = if let TileData::Cdf53Wire {
+                    pass_idx,
+                    streams,
+                    present_passes,
+                    new_generation,
+                } = data
+                {
                     // Only produced with `cdf53_wire` on, which the browser never
                     // sets; expanded (or dropped) as the native renderer does.
                     let Some(bit_planes) = expand_wire_planes(&streams) else {
                         continue;
                     };
-                    TileData::Cdf53 { pass_idx, bit_planes, present_passes, new_generation }
+                    TileData::Cdf53 {
+                        pass_idx,
+                        bit_planes,
+                        present_passes,
+                        new_generation,
+                    }
                 } else {
                     data
                 };
@@ -136,7 +170,13 @@ pub fn route<S: TileSink + ?Sized>(events: Vec<Event>, sink: &mut S) -> Vec<Rout
                     continue;
                 };
                 let error = sink
-                    .apply(Event::TilePayload { frame_seq, tile_x, tile_y, generation, data })
+                    .apply(Event::TilePayload {
+                        frame_seq,
+                        tile_x,
+                        tile_y,
+                        generation,
+                        data,
+                    })
                     .err();
                 out.push(Routed::Tile(SlimEvent::TilePayload {
                     frame_seq,
@@ -149,9 +189,16 @@ pub fn route<S: TileSink + ?Sized>(events: Vec<Event>, sink: &mut S) -> Vec<Rout
             }
             Event::PaletteUpdated { palette_id, colors } => {
                 let error = sink
-                    .apply(Event::PaletteUpdated { palette_id, colors: colors.clone() })
+                    .apply(Event::PaletteUpdated {
+                        palette_id,
+                        colors: colors.clone(),
+                    })
                     .err();
-                out.push(Routed::Tile(SlimEvent::PaletteUpdated { palette_id, colors, error }));
+                out.push(Routed::Tile(SlimEvent::PaletteUpdated {
+                    palette_id,
+                    colors,
+                    error,
+                }));
             }
             Event::FrameDimensions { width, height } => {
                 let verdict = check_frame_dimensions(width, height)
@@ -163,8 +210,17 @@ pub fn route<S: TileSink + ?Sized>(events: Vec<Event>, sink: &mut S) -> Vec<Rout
                     reason: verdict.err(),
                 }));
             }
-            Event::TileReady { frame_seq, tile_x, tile_y, rgba: _ } => {
-                out.push(Routed::Tile(SlimEvent::TileReady { frame_seq, tile_x, tile_y }));
+            Event::TileReady {
+                frame_seq,
+                tile_x,
+                tile_y,
+                rgba: _,
+            } => {
+                out.push(Routed::Tile(SlimEvent::TileReady {
+                    frame_seq,
+                    tile_x,
+                    tile_y,
+                }));
             }
             ev @ (Event::NeedsH264 { .. } | Event::DecodeError { .. } | Event::Evicted { .. }) => {
                 if let Some(w) = WasmEvent::from_event(ev) {
@@ -191,7 +247,9 @@ mod tests {
     impl TileSink for FakeSink {
         fn apply(&mut self, ev: Event) -> Result<(), String> {
             let fails = match &ev {
-                Event::TilePayload { tile_x, tile_y, .. } => self.fail_tile == Some((*tile_x, *tile_y)),
+                Event::TilePayload { tile_x, tile_y, .. } => {
+                    self.fail_tile == Some((*tile_x, *tile_y))
+                }
                 Event::FrameDimensions { .. } => self.fail_resize,
                 _ => false,
             };
@@ -224,7 +282,10 @@ mod tests {
         let mut sink = FakeSink::default();
         let out = route(vec![palrle(9, 1, 2)], &mut sink);
         match &sink.seen[0] {
-            Event::TilePayload { data: TileData::PalRle { indices, .. }, .. } => {
+            Event::TilePayload {
+                data: TileData::PalRle { indices, .. },
+                ..
+            } => {
                 assert_eq!(indices.len(), 512, "the sink must get every byte");
             }
             other => panic!("{other:?}"),
@@ -234,7 +295,14 @@ mod tests {
                 frame_seq: 9,
                 tile_x: 1,
                 tile_y: 2,
-                data: SlimTileData::PalRle { palette_id: 3, count: 2, wire_flags: 0b11, indices, len },
+                data:
+                    SlimTileData::PalRle {
+                        palette_id: 3,
+                        count: 2,
+                        wire_flags: 0b11,
+                        indices,
+                        len,
+                    },
                 error: None,
                 ..
             })] => {
@@ -250,13 +318,22 @@ mod tests {
     fn solid_is_carried_whole_and_cdf53_is_sampled_with_its_length() {
         let mut sink = FakeSink::default();
         let solid = Event::TilePayload {
-            frame_seq: 1, tile_x: 0, tile_y: 0, generation: 0,
+            frame_seq: 1,
+            tile_x: 0,
+            tile_y: 0,
+            generation: 0,
             data: TileData::Solid([1, 2, 3, 4]),
         };
         let cdf = Event::TilePayload {
-            frame_seq: 1, tile_x: 1, tile_y: 0, generation: 2,
+            frame_seq: 1,
+            tile_x: 1,
+            tile_y: 0,
+            generation: 2,
             data: TileData::Cdf53 {
-                pass_idx: 4, bit_planes: vec![7; 384], present_passes: Some(0x3FFF), new_generation: false,
+                pass_idx: 4,
+                bit_planes: vec![7; 384],
+                present_passes: Some(0x3FFF),
+                new_generation: false,
             },
         };
         let out = route(vec![solid, cdf], &mut sink);
@@ -274,12 +351,27 @@ mod tests {
 
     #[test]
     fn order_is_kept_and_one_failing_tile_does_not_stop_the_batch() {
-        let mut sink = FakeSink { fail_tile: Some((1, 1)), ..Default::default() };
-        let out = route(vec![palrle(1, 0, 0), palrle(1, 1, 1), palrle(1, 2, 2)], &mut sink);
-        assert_eq!(sink.seen.len(), 3, "the tile after the failing one was still applied");
+        let mut sink = FakeSink {
+            fail_tile: Some((1, 1)),
+            ..Default::default()
+        };
+        let out = route(
+            vec![palrle(1, 0, 0), palrle(1, 1, 1), palrle(1, 2, 2)],
+            &mut sink,
+        );
+        assert_eq!(
+            sink.seen.len(),
+            3,
+            "the tile after the failing one was still applied"
+        );
         let errors: Vec<bool> = out
             .iter()
-            .map(|r| matches!(r, Routed::Tile(SlimEvent::TilePayload { error: Some(_), .. })))
+            .map(|r| {
+                matches!(
+                    r,
+                    Routed::Tile(SlimEvent::TilePayload { error: Some(_), .. })
+                )
+            })
             .collect();
         assert_eq!(errors, [false, true, false]);
     }
@@ -289,20 +381,54 @@ mod tests {
         let mut sink = FakeSink::default();
         let out = route(
             vec![
-                Event::FrameDimensions { width: 0, height: 480 },
-                Event::FrameDimensions { width: 64, height: 64 },
+                Event::FrameDimensions {
+                    width: 0,
+                    height: 480,
+                },
+                Event::FrameDimensions {
+                    width: 64,
+                    height: 64,
+                },
             ],
             &mut sink,
         );
-        assert_eq!(sink.seen.len(), 1, "only the valid size reaches the renderer");
-        assert!(matches!(&out[0], Routed::Tile(SlimEvent::FrameDimensions { applied: false, reason: Some(_), .. })));
-        assert!(matches!(&out[1], Routed::Tile(SlimEvent::FrameDimensions { width: 64, height: 64, applied: true, reason: None })));
+        assert_eq!(
+            sink.seen.len(),
+            1,
+            "only the valid size reaches the renderer"
+        );
+        assert!(matches!(
+            &out[0],
+            Routed::Tile(SlimEvent::FrameDimensions {
+                applied: false,
+                reason: Some(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            &out[1],
+            Routed::Tile(SlimEvent::FrameDimensions {
+                width: 64,
+                height: 64,
+                applied: true,
+                reason: None
+            })
+        ));
     }
 
     #[test]
     fn a_resize_the_renderer_refuses_is_reported_with_its_reason() {
-        let mut sink = FakeSink { fail_resize: true, ..Default::default() };
-        let out = route(vec![Event::FrameDimensions { width: 64, height: 64 }], &mut sink);
+        let mut sink = FakeSink {
+            fail_resize: true,
+            ..Default::default()
+        };
+        let out = route(
+            vec![Event::FrameDimensions {
+                width: 64,
+                height: 64,
+            }],
+            &mut sink,
+        );
         assert!(matches!(
             &out[0],
             Routed::Tile(SlimEvent::FrameDimensions { applied: false, reason: Some(r), .. }) if r == "boom"
@@ -313,10 +439,15 @@ mod tests {
     fn palette_updates_are_applied_and_reported_with_their_colours() {
         let mut sink = FakeSink::default();
         let out = route(
-            vec![Event::PaletteUpdated { palette_id: 7, colors: vec![[1, 2, 3, 4], [5, 6, 7, 8]] }],
+            vec![Event::PaletteUpdated {
+                palette_id: 7,
+                colors: vec![[1, 2, 3, 4], [5, 6, 7, 8]],
+            }],
             &mut sink,
         );
-        assert!(matches!(&sink.seen[0], Event::PaletteUpdated { palette_id: 7, colors } if colors.len() == 2));
+        assert!(
+            matches!(&sink.seen[0], Event::PaletteUpdated { palette_id: 7, colors } if colors.len() == 2)
+        );
         assert!(matches!(
             &out[0],
             Routed::Tile(SlimEvent::PaletteUpdated { palette_id: 7, colors, error: None }) if colors[1] == [5, 6, 7, 8]
@@ -327,12 +458,49 @@ mod tests {
     fn h264_decode_errors_and_evictions_go_to_js_untouched() {
         let mut sink = FakeSink::default();
         let h264 = Event::NeedsH264 {
-            frame_seq: 5, timestamp_us: 1, is_keyframe: true, ref_frame_seq: 0xFFFF_FFFF,
-            flags: 0, slots: 0, reset_decoder: true, payload: vec![9; 10],
+            frame_seq: 5,
+            timestamp_us: 1,
+            is_keyframe: true,
+            ref_frame_seq: 0xFFFF_FFFF,
+            flags: 0,
+            slots: 0,
+            reset_decoder: true,
+            payload: vec![9; 10],
         };
         let out = route(vec![h264], &mut sink);
-        assert!(sink.seen.is_empty(), "H.264 is the escape's job, not the tile renderer's");
-        assert!(matches!(&out[0], Routed::Passthrough(WasmEvent::NeedsH264 { payload, .. }) if payload.len() == 10));
+        assert!(
+            sink.seen.is_empty(),
+            "H.264 is the escape's job, not the tile renderer's"
+        );
+        assert!(
+            matches!(&out[0], Routed::Passthrough(WasmEvent::NeedsH264 { payload, .. }) if payload.len() == 10)
+        );
+
+        let mut sink = FakeSink::default();
+        let out = route(
+            vec![
+                Event::DecodeError {
+                    codec: ghostframe_protocol::protocol::Codec::PalRle,
+                    tile_x: 1,
+                    tile_y: 2,
+                    code: ghostframe_client_core::DecodeErrorCode::PayloadTooShort,
+                },
+                Event::Evicted {
+                    reason: ghostframe_protocol::eviction::EvictionReason::DisplacedByNewSession,
+                },
+            ],
+            &mut sink,
+        );
+        assert!(sink.seen.is_empty(), "neither is the tile renderer's");
+        assert_eq!(out.len(), 2);
+        assert!(matches!(
+            &out[0],
+            Routed::Passthrough(WasmEvent::DecodeError { .. })
+        ));
+        assert!(matches!(
+            &out[1],
+            Routed::Passthrough(WasmEvent::Evicted { .. })
+        ));
     }
 
     #[test]
@@ -341,19 +509,35 @@ mod tests {
         // happen; main.ts logs it as an error rather than render it.
         let mut sink = FakeSink::default();
         let out = route(
-            vec![Event::TileReady { frame_seq: 1, tile_x: 0, tile_y: 0, rgba: vec![0; 4096] }],
+            vec![Event::TileReady {
+                frame_seq: 1,
+                tile_x: 0,
+                tile_y: 0,
+                rgba: vec![0; 4096],
+            }],
             &mut sink,
         );
         assert!(sink.seen.is_empty());
-        assert!(matches!(&out[0], Routed::Tile(SlimEvent::TileReady { frame_seq: 1, .. })));
+        assert!(matches!(
+            &out[0],
+            Routed::Tile(SlimEvent::TileReady { frame_seq: 1, .. })
+        ));
     }
 
     #[test]
     fn an_unexpandable_cdf53_wire_pass_is_dropped_like_the_native_renderer_does() {
         let mut sink = FakeSink::default();
         let wire = Event::TilePayload {
-            frame_seq: 1, tile_x: 0, tile_y: 0, generation: 0,
-            data: TileData::Cdf53Wire { pass_idx: 0, streams: vec![1, 2, 3], present_passes: None, new_generation: false },
+            frame_seq: 1,
+            tile_x: 0,
+            tile_y: 0,
+            generation: 0,
+            data: TileData::Cdf53Wire {
+                pass_idx: 0,
+                streams: vec![1, 2, 3],
+                present_passes: None,
+                new_generation: false,
+            },
         };
         let out = route(vec![wire], &mut sink);
         assert!(out.is_empty());
@@ -366,10 +550,19 @@ mod tests {
         let out = route(
             vec![
                 palrle(9, 1, 2),
-                Event::FrameDimensions { width: 64, height: 64 },
+                Event::FrameDimensions {
+                    width: 64,
+                    height: 64,
+                },
                 Event::NeedsH264 {
-                    frame_seq: 5, timestamp_us: 1, is_keyframe: false, ref_frame_seq: 4,
-                    flags: 0, slots: 0, reset_decoder: false, payload: vec![1, 2, 3],
+                    frame_seq: 5,
+                    timestamp_us: 1,
+                    is_keyframe: false,
+                    ref_frame_seq: 4,
+                    flags: 0,
+                    slots: 0,
+                    reset_decoder: false,
+                    payload: vec![1, 2, 3],
                 },
             ],
             &mut sink,
@@ -381,7 +574,10 @@ mod tests {
         assert_eq!(v[0]["data"]["len"], 512);
         assert_eq!(v[0]["data"]["wire_flags"], 3);
         assert_eq!(v[0]["data"]["indices"].as_array().map(Vec::len), Some(16));
-        assert!(v[0].get("error").is_none(), "no error key unless there is one");
+        assert!(
+            v[0].get("error").is_none(),
+            "no error key unless there is one"
+        );
         assert_eq!(v[1]["kind"], "FrameDimensions");
         assert_eq!(v[1]["applied"], true);
         assert_eq!(v[2]["kind"], "NeedsH264");
