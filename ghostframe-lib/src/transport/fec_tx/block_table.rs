@@ -254,6 +254,8 @@ pub(crate) struct BlockStats {
     pub request_before_close: u64,
     pub request_over_cap: u64,
     pub request_malformed: u64,
+    /// Requests with have == k (all sources held, k unknown to the client).
+    pub request_holds_all: u64,
     pub have_mismatch: u64,
     pub declined_unknown: u64,
     pub declined_k_mismatch: u64,
@@ -843,11 +845,19 @@ impl BlockTable {
             self.blocks.insert(id, b);
             return actions;
         }
-        if ask.have >= b.k {
-            // Malformed: a client holding k symbols does not ask.
+        if ask.have > b.k {
+            // Malformed: a client cannot hold more than k symbols.
             self.stats.request_malformed += 1;
             self.decline(id, b, now, &mut actions);
             return actions;
+        }
+        // have == k is benign: a time-closed block carries no LAST, so a
+        // client whose repairs were all lost holds every source without
+        // knowing k and asks for one row. Answer with one row (a REPAIR frame
+        // carries k, so the block completes there); this is not a decline.
+        let holds_all = ask.have == b.k;
+        if holds_all {
+            self.stats.request_holds_all += 1;
         }
         b.t_lr_armed = false;
         let back_to_repair = b.phase == Phase::Deferred;
@@ -862,7 +872,7 @@ impl BlockTable {
         // The server knows k; a client that has not seen LAST or a repair
         // does not, and always asks for one row. Serve what the block needs
         // to reach k from what the client holds.
-        let needed = b.k.saturating_sub(ask.have).max(ask.missing);
+        let needed = b.k.saturating_sub(ask.have).max(ask.missing).max(u8::from(holds_all));
         for _ in 0..needed {
             if row > max_row {
                 break;
@@ -1779,10 +1789,11 @@ mod tests {
         let t0 = Instant::now();
         let mut t = setup(3, 1, tile, t0);
         t.on_arrival(100, t0);
-        let a = t.on_request(ask(3, 1, 0), t0);
+        let a = t.on_request(ask(4, 1, 0), t0);
         assert_eq!(handoffs(&a), 2);
         assert_eq!(t.closed_reason(BLK), Some(CloseReason::Declined));
         assert_eq!(t.stats().request_malformed, 1);
+        assert_eq!(t.stats().request_holds_all, 0);
         // Deferred, then a request with have < k: back to Repair
         let mut t = setup(3, 1, tile, t0);
         t.on_arrival(100, t0);
@@ -1796,6 +1807,22 @@ mod tests {
         // and the deadline acts again
         let r = rtt(50);
         assert_eq!(handoffs(&t.on_timer(tile_deadline(t0, r, 0), r)), 1);
+    }
+
+    /// A time-closed block whose repairs were all lost: the client holds all
+    /// k sources, does not know k, asks with have == k. Not a decline, not
+    /// malformed; one row goes out so the client learns k.
+    #[test]
+    fn request_have_eq_k_is_benign_not_a_decline() {
+        let t0 = Instant::now();
+        let mut t = setup(3, 1, tile, t0);
+        t.on_arrival(100, t0);
+        let a = t.on_request(ask(3, 1, 0), t0);
+        assert_eq!(repair_rows(&a), 1);
+        assert_eq!(t.closed_reason(BLK), None);
+        assert!(t.blocks.contains_key(&BLK));
+        assert_eq!(t.stats().request_malformed, 0);
+        assert_eq!(t.stats().request_holds_all, 1);
     }
 
     #[test]
