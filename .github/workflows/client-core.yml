@@ -119,7 +119,7 @@ jobs:
           import json
           p = 'ghostframe-client-wasm/webdriver.json'
           d = json.load(open(p))
-          d['goog:chromeOptions']['args'] += ['--enable-logging=stderr', '--v=0']
+          d['goog:chromeOptions']['args'] += ['--enable-logging', '--log-file=/tmp/chrome-debug.log', '--v=1', '--enable-dawn-backend-validation']
           json.dump(d, open(p, 'w'), indent=2)
           PY
       - name: WebRenderer browser tests
@@ -128,3 +128,10 @@ jobs:
           --skip tiles_and_pictures_are_ordered_by_frame_seq_and_the_queue
           --skip cdf53_work_under_a_picture_is_cancelled_and_not_left_pending
           --skip a_picture_that_fails_to_import_is_reported_and_cancels_nothing
+      - name: Upload the Chrome log (temporary)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: chrome-debug-log
+          path: /tmp/chrome-debug.log
+          if-no-files-found: warn
