@@ -193,9 +193,11 @@ impl WgpuContext {
             // so a limit the browser would not have is not silently
             // available here. It also caps maxStorageBuffersPerShaderStage
             // at 4, which is BELOW the WebGPU spec's own default of 8; the
-            // web client's cdf53_integrate.wgsl binds 7, and a few native
-            // pipelines bind more than 4, so raise that one limit back up to
-            // the spec default.
+            // a few native pipelines bind more than 4 storage buffers, so
+            // raise that one limit back up to the spec default. (The web
+            // client's multi-pass CDF 5/3 shaders that once needed 7 are
+            // gone; the shared grid, shaders/client/cdf53_reconstruct.wgsl,
+            // is shared with the browser through ghostframe-render.)
             //
             // The storage binding size is raised to what this adapter offers
             // (downlevel says 128 MiB, which would send an 8K frame's CDF 5/3
