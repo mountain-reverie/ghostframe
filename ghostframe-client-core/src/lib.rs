@@ -117,8 +117,8 @@ pub(crate) struct PendingNack {
 /// Whether the core decodes tiles to pixels, or stops after validation and
 /// hands the payload up.
 ///
-/// The browser decodes on the GPU (`ghostframe-web-client/src/webgpu/`, ten
-/// WGSL compute shaders), so it wants validated payloads, not RGBA. Native
+/// The browser decodes on the GPU (`ghostframe-render`, WGSL compute
+/// shaders), so it wants validated payloads, not RGBA. Native
 /// and headless consumers want pixels. One core, two consumers — not two
 /// implementations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

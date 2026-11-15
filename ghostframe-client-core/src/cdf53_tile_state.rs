@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! CPU replacement for `webgpu/cdf53.ts:342-455`: per-tile CDF53 bit-plane
+//! CPU replacement for the GPU grid (`shaders/client/cdf53_reconstruct.wgsl`):
+//! per-tile CDF53 bit-plane
 //! accumulation and RGBA reconstruction.
 //!
 //! ## `decode_passes` contract reconciliation

@@ -9,7 +9,7 @@
 //! common adapters (including the `downlevel_defaults` limits this crate's
 //! `WgpuContext` requests) and silently writes no pixels at all.
 //!
-//! Mirrors `ghostframe-web-client/src/webgpu/palrle.ts`, the reference
+//! Mirrors the retired TypeScript renderer's `palrle.ts`, the reference
 //! implementation this was ported from.
 
 use crate::framebuffer::Framebuffer;

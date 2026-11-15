@@ -11,7 +11,8 @@
 //!   explicit all-zero plane**, which is the content an empty pass would have
 //!   carried. Its contiguous prefix therefore reaches 14 and no midpoint
 //!   correction is applied.
-//! - The browser's GPU path (`webgpu/cdf53.ts` + `cdf53_inverse_*.wgsl`) is
+//! - The browser's GPU path (`shaders/client/cdf53_reconstruct.wgsl`, run by
+//!   `ghostframe-render`) is
 //!   what actually renders in production. It never sees the bitmap -- the
 //!   wasm boundary hands JS only `{ pass_idx, bit_planes }` -- and derives
 //!   its K as `passesProcessed = max(passIdx + 1)`.
@@ -60,8 +61,8 @@ fn gpu_model_coefficients(arrived: &[(u8, Vec<u8>)], present: u16) -> Vec<i16> {
     let mut magnitudes = vec![0u32; total];
     let mut signs = vec![false; total];
 
-    // `passesProcessed`, mirroring `computePassesProcessed` in
-    // `webgpu/cdf53.ts`.
+    // `passesProcessed`, mirroring the per-tile pass prefix in
+    // `ghostframe-render`'s `pipelines/cdf53_state.rs`.
     let mut passes_processed: u32 = 0;
     let mut received_mask: u16 = 0;
 

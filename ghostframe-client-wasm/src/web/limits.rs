@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Port of `ghostframe-web-client/src/frame_limits.ts`.
+//! Replaces the TypeScript frame_limits.ts, deleted with the TypeScript renderer.
 //!
 //! A `FrameDimensions` event drives a framebuffer allocation proportional to
 //! width x height. The authoritative per-axis bound is the core's

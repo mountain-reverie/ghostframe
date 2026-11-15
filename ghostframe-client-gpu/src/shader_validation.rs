@@ -216,7 +216,7 @@ mod tests {
                          = {invocations} invocations, over the {MAX_WORKGROUP_INVOCATIONS} \
                          limit. Reshape it so each invocation covers more than one \
                          element; keep the workgroup *count* the same so the dispatch \
-                         sites in src/pipelines/ and ghostframe-web-client/src/webgpu/ \
+                         sites in src/pipelines/ and ghostframe-render/src/pipelines/ \
                          do not have to change.",
                         ep.name
                     ));
