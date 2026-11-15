@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 /// <reference types="@webgpu/types" />
 
-declare module '*.wgsl?raw' {
-  const content: string;
-  export default content;
-}
-
 // Type augmentation for test-instrumentation / e2e-readback properties
-// exposed on `window` by diagnostics.ts and renderer.ts.
+// exposed on `window` by diagnostics.ts, main.ts and WebRenderer
+// (ghostframe-client-wasm/src/web/renderer.rs).
 // Polled over CDP by the ghostframe e2e suite (`ghostframe-e2e/tests/e2e.rs`;
 // `e2e_polled_globals_are_live` guards that each stays non-trivial).
 
@@ -17,7 +13,7 @@ interface Window {
   /** Renderer queue lengths, submit count, sizes (`WebRenderer.debugState()`). */
   __ghostframeRendererState?: () => unknown;
   __ghostframePaintUs?: () => number[];
-  /** What the renderer last did to one tile (renderer.ts debugTile). */
+  /** What the renderer last did to one tile (`WebRenderer` debug handle). */
   __ghostframeTile?: (tileX: number, tileY: number) => unknown;
   // ----- stats counters (set at startup, re-published from the core) -----
   /** Datagram counts re-published from the wasm core each loop iteration. */
@@ -29,7 +25,7 @@ interface Window {
   /** Server-stream frames the wasm core received, counted before any check (e2e only); see main.ts. */
   __ghostframeStatsFrames: number | undefined;
 
-  // ----- renderer reference (set per-frame in renderer.ts) --------------------
+  // ----- renderer reference (set by main.ts from `renderer.debugHandles()`) --------------------
   __ghostframeRenderer: { device: unknown; texture: { width: number; height: number } } | undefined;
 
   // ----- recorder arrays (FIFO-capped, pushed from diagnostics.ts) ------------

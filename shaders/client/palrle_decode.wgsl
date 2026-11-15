@@ -14,10 +14,10 @@
 // Enforced by
 // `shader_validation.rs::no_compute_shader_exceeds_the_portable_workgroup_limit`.
 //
-// The workgroup COUNT is unchanged, so palrle.rs and palrle.ts keep their
+// The workgroup COUNT is unchanged, so the palrle.rs dispatch sites (native and ghostframe-render) keep their
 // dispatchWorkgroups(num_tiles, 2, 2).
 //
-// Dispatch shape from palrle.ts: dispatchWorkgroups(num_tiles, 2, 2)
+// Dispatch shape (ghostframe-render pipelines/palrle.rs): dispatchWorkgroups(num_tiles, 2, 2)
 //   wg.x = tile_idx
 //   wg.y = sub_tile_y (0 or 1, selects upper / lower 16-pixel half)
 //   wg.z = sub_tile_x (0 or 1, selects left / right 16-pixel half)
