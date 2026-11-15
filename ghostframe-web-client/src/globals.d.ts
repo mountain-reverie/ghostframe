@@ -13,6 +13,7 @@ interface Window {
   /** Renderer queue lengths, submit count, sizes (`WebRenderer.debugState()`). */
   __ghostframeRendererState?: () => unknown;
   __ghostframePaintUs?: () => number[];
+  __ghostframeTickUs?: () => number[];
   /** What the renderer last did to one tile (`WebRenderer` debug handle). */
   __ghostframeTile?: (tileX: number, tileY: number) => unknown;
   // ----- stats counters (set at startup, re-published from the core) -----
