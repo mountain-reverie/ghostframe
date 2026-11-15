@@ -60,7 +60,7 @@ p99 / max, us):
 | 4K branch paint step | 700 / 1200 / 1900 | 700 / 1200 / 2000 | 700 / 1100 / 2099 |
 
 The branch presents more frames in the same 30 s (70 against 58 at 1080p, 305
-against 253 at 4K), so its rAF ticks do more work in total; the per-tick cost
+against 252 at 4K, medians), so its rAF ticks do more work in total; the per-tick cost
 above is still not higher.
 
 ## codec_report (client median per scene, ms; 3 runs)
@@ -80,7 +80,8 @@ ms); within the run-to-run scatter of the base itself (14 ms).
 
 - Chrome coarsens `performance.now()` to 100 us when the page is not
   cross-origin isolated, so every tick and paint-step sample is a multiple of
-  100 us; read sub-millisecond deltas (the 4K paint step p50, 700 against 400)
+  100 us (the odd 799, 1399, 1799 and 2099 are a sub-quantum float rounded
+  down); read sub-millisecond deltas (the 4K paint step p50, 700 against 400)
   with that in mind.
 - The test originally asserted a non-empty framePaints; it failed at 4K after
   printing its results, so the assertion now requires only a live tick timing.
