@@ -300,10 +300,15 @@ async fn recovered_does_not_touch_the_loss_window() {
 async fn content_rejected_of_a_live_tile_record_leaves_the_bundle_alone() {
     let mut b = bridge();
     let ws = seed(&mut b, 2);
+    assert_eq!(b.classifier.repaint_grace_until_us(), None, "premise");
     b.handle_status_record(StatusRecord::ContentRejected(vec![(ws[1], 0)]));
     assert_eq!(b.fec_in.content_rejected_rx, 1);
     assert_eq!(b.fec_in.content_rejected_unknown, 0);
     assert_eq!(b.fec_in.content_rejected_tile, 1);
+    assert!(
+        b.classifier.repaint_grace_until_us().is_some(),
+        "the full repaint is not demand"
+    );
     // A rejection is not a verdict on the bundle, and nothing is resent from
     // the cache: the tile is re-encoded fresh.
     assert_eq!(b.reliable_emitter.stats.loss_path_resends, 0);
