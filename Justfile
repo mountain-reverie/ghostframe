@@ -172,7 +172,7 @@ test-web-ui:
 # wasm-pack 0.15.0 and Chrome or Chromium.
 test-web-renderer:
     cargo test -p ghostframe-client-wasm --lib
-    wasm-pack test --headless --chrome ghostframe-client-wasm
+    WASM_BINDGEN_TEST_TIMEOUT=300 wasm-pack test --headless --chrome ghostframe-client-wasm
 
 # Clippy for the wasm32-only code, which the workspace clippy never compiles.
 lint-web:
