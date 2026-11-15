@@ -397,6 +397,12 @@ impl BlockStore {
         let (k, missing) = b.missing_bitmap();
         self.stats.declined += 1;
         self.stats.blocks_unrecoverable += 1;
+        if k == 0 {
+            // Nothing held and no k learned (a conflicting idx-255 LAST was
+            // the only source): the server rejects a DECLINED with k = 0 and
+            // poisons the stream reader, so say nothing.
+            return;
+        }
         self.pending.push(CloseAction::Decline {
             block_id: b.id,
             reason,
@@ -1371,13 +1377,50 @@ mod tests {
         let mut s = BlockStore::new();
         s.on_datagram(&src(1, 3, 255, true, &recs(&[b"z"])), T);
         assert_eq!(s.stats().rejected_symbols, 1);
+        // Nothing held and k unknown: a DECLINED would carry k = 0, which the
+        // server rejects (poisoning the stream), so none is sent.
         let acts = s.on_timeout(T + WINDOW);
-        assert!(matches!(
-            acts[..],
-            [CloseAction::Decline {
-                reason: DeclineReason::HeaderMismatch,
-                ..
-            }]
-        ));
+        assert!(acts.is_empty(), "no k = 0 decline");
+        assert_eq!(s.stats().blocks_unrecoverable, 1);
+    }
+
+    /// Finding: a time-closed block has no LAST; with every repair lost the
+    /// client holds all sources and k is unknown. Its REPAIR_REQUEST (have =
+    /// k) is answered with one repair row; once it lands the block completes
+    /// and nothing is declined.
+    #[test]
+    fn time_closed_block_with_repairs_lost_completes_on_the_answer_row() {
+        let payloads = [recs(&[b"one"]), recs(&[b"two"]), recs(&[b"three"])];
+        let frames: Vec<SourceFrame<'_>> = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, p)| SourceFrame {
+                t_adv: 0,
+                last: false,
+                bundle_seq: 10 + i as u32,
+                block_id: 4,
+                idx: i as u8,
+                records: p,
+            })
+            .collect();
+        let syms: Vec<Vec<u8>> = frames.iter().map(|f| f.coded_symbol()).collect();
+        let refs: Vec<&[u8]> = syms.iter().map(|x| x.as_slice()).collect();
+        let reps = encode_repairs(&refs, &[0, 1]).unwrap();
+        let mut s = BlockStore::new();
+        for f in &frames {
+            s.on_datagram(&f.encode(), T);
+        }
+        // Both close repairs are lost. Window ends: a request, not a decline.
+        let acts = s.on_timeout(T + WINDOW);
+        let [CloseAction::Request(ask)] = &acts[..] else {
+            panic!("expected one request, got {} actions", acts.len());
+        };
+        assert_eq!((ask.have, ask.missing), (3, 1));
+        // The server's answer row arrives (it carries k).
+        s.on_datagram(&rep(99, 4, 3, 2, 1, &reps[1]), T + WINDOW + 1);
+        assert!(s.on_timeout(T + WINDOW + 1_000_000).is_empty());
+        assert_eq!(s.stats().declined, 0);
+        assert_eq!(s.stats().blocks_unrecoverable, 0);
+        assert_eq!(s.stats().blocks_closed_complete, 1);
     }
 }
