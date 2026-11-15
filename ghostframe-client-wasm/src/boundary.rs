@@ -117,7 +117,7 @@ pub enum WasmTileData {
 }
 
 /// Expand a `Cdf53Wire` pass's streams into 384 plane bytes, or `None`.
-fn expand_wire_planes(streams: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn expand_wire_planes(streams: &[u8]) -> Option<Vec<u8>> {
     let mut planes = vec![0u8; 384];
     let dst: &mut [u8; 384] = planes.as_mut_slice().try_into().ok()?;
     ghostframe_client_core::cdf53_prevalidate::decode_cdf53_wire(streams, dst).ok()?;
