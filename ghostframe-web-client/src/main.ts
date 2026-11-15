@@ -219,17 +219,32 @@ async function main() {
   // never opens it. The writer is a promise created once, synchronously, on
   // first use: `drainTransmit` runs as overlapping floating promises, and
   // awaits on one promise resume in order, so write order is preserved while
-  // the stream is still opening. A failed open is not retried.
+  // the stream is still opening. A failed stream is dropped and the next
+  // status bytes open a fresh one, which gets the tag first: the core emits
+  // the tag once per session, with the first records.
+  const REPAIR_STATUS_STREAM_TAG = 0xf5; // FEC_REPAIR_STATUS_STREAM_TAG
+  let repairStatusTagOwed = false;
   let repairStatusWriterP: Promise<WritableStreamDefaultWriter<Uint8Array>> | null = null;
   let repairStatusOpenFailed = false;
   async function writeRepairStatus(bytes: Uint8Array): Promise<void> {
-    repairStatusWriterP ??= transport
-      .createBidirectionalStream()
-      .then((b) => b.writable.getWriter());
+    if (repairStatusWriterP === null) {
+      const owed = repairStatusTagOwed;
+      repairStatusTagOwed = false;
+      repairStatusWriterP = transport.createBidirectionalStream().then(async (b) => {
+        const w = b.writable.getWriter();
+        if (owed) await w.write(new Uint8Array([REPAIR_STATUS_STREAM_TAG]));
+        return w;
+      });
+    }
+    const mine = repairStatusWriterP;
     try {
-      const w = await repairStatusWriterP;
+      const w = await mine;
       await w.write(bytes);
     } catch (err) {
+      if (repairStatusWriterP === mine) {
+        repairStatusWriterP = null;
+        repairStatusTagOwed = true;
+      }
       if (!repairStatusOpenFailed) {
         repairStatusOpenFailed = true;
         console.warn('Repair-status stream unavailable:', err);
