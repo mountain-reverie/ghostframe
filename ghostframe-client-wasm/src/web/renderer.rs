@@ -263,14 +263,28 @@ impl WebRenderer {
 
     /// Resize the canvas, its surface and the framebuffer. A new picture: the
     /// tile renderer resets its paint ledger and keeps what fits.
-    fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
+    fn resize(&mut self, requested_w: u32, requested_h: u32) -> Result<(), String> {
         self.tiles
             .apply_event(
                 &self.device,
                 &self.queue,
-                Event::FrameDimensions { width, height },
+                Event::FrameDimensions {
+                    width: requested_w,
+                    height: requested_h,
+                },
             )
             .map_err(|e| e.to_string())?;
+        // The tile renderer refuses an out-of-range size without an error and
+        // keeps its framebuffer. Trust the framebuffer, not the wire's number.
+        let fb = self.tiles.framebuffer();
+        let (width, height) = (fb.width(), fb.height());
+        if (width, height) != (requested_w, requested_h) {
+            return Ok(());
+        }
+        // The same size again (the server repeats it): nothing to redo.
+        if self.size == Some((width, height)) {
+            return Ok(());
+        }
         if self.canvas.width() != width || self.canvas.height() != height {
             // Changing the canvas size invalidates the surface; configure again.
             self.canvas.set_width(width);
@@ -363,6 +377,7 @@ impl WebRenderer {
         let pending = std::mem::take(&mut self.pending_h264);
         let mut kept: Vec<JsValue> = Vec::new();
         let mut dropped = 0u32;
+        let mut drew = true;
         for p in &pending {
             // Older than a picture already drawn, or than any tile painted or
             // queued: it covers the whole screen, so drawing it would undo a
@@ -386,6 +401,7 @@ impl WebRenderer {
                 Ok(raw_view) => {
                     if let Err(e) = h264.draw(&raw_view, w, h, &kept) {
                         self.errors.push(format!("h264: {e}"));
+                        drew = false;
                     }
                 }
                 Err(e) => self.errors.push(format!("h264: {e}")),
@@ -395,7 +411,7 @@ impl WebRenderer {
         for p in &pending {
             raw::close_frame(&p.frame);
         }
-        (kept.len() as u32, dropped)
+        (if drew { kept.len() as u32 } else { 0 }, dropped)
     }
 
     #[allow(
@@ -452,6 +468,7 @@ impl WebRenderer {
     fn reset_session(&mut self) {
         for p in self.pending_h264.drain(..) {
             raw::close_frame(&p.frame);
+            self.h264_dropped = self.h264_dropped.wrapping_add(1);
         }
         if let Err(e) = self.tiles.reset_session(&self.device, &self.queue) {
             self.errors.push(format!("session reset: {e}"));
