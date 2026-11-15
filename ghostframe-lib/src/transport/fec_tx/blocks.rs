@@ -50,10 +50,12 @@ pub(crate) struct ClosedBlock {
     pub k: u8,
     pub symbols: Vec<Vec<u8>>,
     /// `bundle_seq` of each source, in `idx` order.
+    #[cfg(test)]
     pub bundle_seqs: Vec<u32>,
     pub kinds: Vec<SourceKind>,
     /// When the block's first source was sealed (microseconds), the origin of
     /// the T close.
+    #[cfg(test)]
     pub first_sealed_at_us: u64,
     /// The `T_adv` code its sources carried.
     pub t_adv: u8,
@@ -70,6 +72,7 @@ impl ClosedBlock {
 struct Open {
     block_id: u16,
     symbols: Vec<Vec<u8>>,
+    #[cfg(test)]
     bundle_seqs: Vec<u32>,
     kinds: Vec<SourceKind>,
     first_sealed_at_us: u64,
@@ -108,7 +111,7 @@ impl BlockBuilder {
     pub(crate) fn add(
         &mut self,
         symbol: Vec<u8>,
-        bundle_seq: u32,
+        _bundle_seq: u32,
         kind: SourceKind,
         now_us: u64,
         span: BlockSpan,
@@ -117,6 +120,7 @@ impl BlockBuilder {
             self.open = Some(Open {
                 block_id: self.next_id,
                 symbols: Vec::new(),
+                #[cfg(test)]
                 bundle_seqs: Vec::new(),
                 kinds: Vec::new(),
                 first_sealed_at_us: now_us,
@@ -128,7 +132,8 @@ impl BlockBuilder {
         let o = self.open.as_mut().expect("just opened");
         o.longest = o.longest.max(symbol.len());
         o.symbols.push(symbol);
-        o.bundle_seqs.push(bundle_seq);
+        #[cfg(test)]
+        o.bundle_seqs.push(_bundle_seq);
         o.kinds.push(kind);
     }
 
@@ -165,8 +170,10 @@ impl BlockBuilder {
             block_id: o.block_id,
             k: u8::try_from(o.symbols.len()).expect("a block never holds 256 sources"),
             symbols: o.symbols,
+            #[cfg(test)]
             bundle_seqs: o.bundle_seqs,
             kinds: o.kinds,
+            #[cfg(test)]
             first_sealed_at_us: o.first_sealed_at_us,
             t_adv: o.span.t_adv,
         })
@@ -175,11 +182,6 @@ impl BlockBuilder {
     #[cfg(test)]
     pub(crate) fn set_next_id_for_test(&mut self, id: u16) {
         self.next_id = id;
-    }
-
-    /// Forgets the open block and restarts the id counter.
-    pub(crate) fn reset(&mut self) {
-        *self = Self::default();
     }
 }
 

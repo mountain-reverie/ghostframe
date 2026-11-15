@@ -293,6 +293,7 @@ pub(crate) struct Ladder {
 }
 
 impl Ladder {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::with_frame_notch(true)
     }

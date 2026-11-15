@@ -148,6 +148,8 @@ static LOCAL_DEFS: [LocalDef; LOCAL_COUNT] = [
 /// Running totals the core bumps as it works. Cheap: one add per event.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct LocalCounters {
+    /// Whole wire datagrams received, repair frames and PLAIN/SOURCE framing
+    /// included (not the payload that reached the tile decoder).
     pub rx_bytes: u64,
     pub tiles_solid: u64,
     pub tiles_palrle: u64,

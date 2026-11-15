@@ -203,15 +203,18 @@ impl LossEstimator {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn lost(&self) -> f64 {
         self.lost
     }
+    #[cfg(test)]
     pub(crate) fn total(&self) -> f64 {
         self.total
     }
     pub(crate) fn state(&self) -> FloorState {
         self.state
     }
+    #[cfg(test)]
     pub(crate) fn reports_seen(&self) -> u64 {
         self.reports
     }
@@ -432,6 +435,7 @@ impl FecAdapt {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn estimator(&self) -> &LossEstimator {
         &self.est
     }
