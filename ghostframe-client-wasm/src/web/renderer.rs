@@ -769,6 +769,11 @@ impl WebRenderer {
                 "rect {w}x{h} at ({x},{y}) is outside the {fw}x{fh} framebuffer"
             )));
         }
+        // The browser's reason for a failed map never reaches wgpu's error, and
+        // a validation error would arrive as an event after the caller gave up:
+        // catch both here so a failure says why.
+        let oom = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let pending = ghostframe_render::readback::begin_texture_read(
             &self.device,
             &self.queue,
@@ -778,11 +783,14 @@ impl WebRenderer {
             w,
             h,
         );
+        let validation = validation.pop();
+        let oom = oom.pop();
         Ok(future_to_promise(async move {
-            let bytes = pending
-                .finish()
-                .await
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let caught = [validation.await, oom.await];
+            let bytes = pending.finish().await.map_err(|e| {
+                let why: Vec<String> = caught.iter().flatten().map(|c| c.to_string()).collect();
+                JsValue::from_str(&format!("{e}; GPU errors in the readback: {why:?}"))
+            })?;
             Ok(Uint8Array::from(bytes.as_slice()).into())
         }))
     }
