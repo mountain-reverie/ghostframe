@@ -14,18 +14,11 @@
 #
 # When a new GPU-pipeline e2e test lands, add its name here in the same PR.
 e2e_ack_telemetry_no_waste
-e2e_cdf53_bypass_integrate
-e2e_cdf53_dirty_inverse_matches_full_grid
 e2e_cdf53_gradient_emission
-e2e_cdf53_integrate_correctness
-e2e_cdf53_inverse_gradient_tile
-e2e_cdf53_live_tile_state
-e2e_cdf53_live_tile_state_col18
 e2e_cdf53_lossless_buildup
 e2e_cdf53_lossless_under_congestion
 e2e_cdf53_mixed_codecs
 e2e_cdf53_server_gpu_vs_cpu_diff
-e2e_cdf53_tile_watcher
 e2e_decode_error_thin_uncached
 e2e_h264_forced_solid_red
 e2e_h264_openh264_motion
