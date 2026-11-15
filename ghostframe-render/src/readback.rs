@@ -3,7 +3,7 @@
 //!
 //! `wgpu::Buffer::map_async` takes a callback, and the callback runs when the
 //! device is polled (native) or when the browser's event loop gets to it (web).
-//! [`read_texture_rgba8`] turns that into a future with a one-shot channel, so
+//! [`begin_texture_read`] and [`read_texture_rgba8`] turn that into a future with a one-shot channel, so
 //! the same code serves the CDF 5/3 self-test on both. A caller on a thread
 //! with no event loop uses [`block_on_device`], which polls the device between
 //! polls of the future.
@@ -59,24 +59,48 @@ impl<T> Future for Receiver<T> {
     }
 }
 
-/// Copy `texture` (4 bytes per texel, `width` x `height`) into a staging
-/// buffer and return it as tight rows, `width * height * 4` bytes.
-///
-/// Submits one encoder of its own, through [`crate::submit::submit`].
-pub async fn read_texture_rgba8(
+/// Rows of `padded` (pitch `padded_row` bytes) cut to `width_px` RGBA pixels
+/// each, in one tight buffer. A readback's rows are padded to
+/// `COPY_BYTES_PER_ROW_ALIGNMENT`; skipping this looks right at the start of
+/// each row and drifts further out of alignment with every row after it.
+pub(crate) fn tight_rows(padded: &[u8], width_px: u32, height_px: u32, padded_row: u32) -> Vec<u8> {
+    let row = width_px as usize * 4;
+    let mut tight = Vec::with_capacity(row * height_px as usize);
+    for y in 0..height_px as usize {
+        let start = y * padded_row as usize;
+        tight.extend_from_slice(&padded[start..start + row]);
+    }
+    tight
+}
+
+/// A texture-to-buffer copy that has been **submitted**; [`PendingRead::finish`]
+/// waits for the bytes. Splitting the two lets a caller order the copy after
+/// everything already submitted and await it later.
+pub struct PendingRead {
+    staging: wgpu::Buffer,
+    mapped: Receiver<Result<(), wgpu::BufferAsyncError>>,
+    width: u32,
+    height: u32,
+    padded_row: u32,
+}
+
+/// Copy the `w` x `h` rectangle at (`x`, `y`) of a 4-byte-per-texel `texture`
+/// (it needs `COPY_SRC`) into a staging buffer, submit the copy through
+/// [`crate::submit::submit`] and start mapping the buffer.
+pub fn begin_texture_read(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
-    width: u32,
-    height: u32,
-) -> Result<Vec<u8>, GpuError> {
-    let unpadded_bytes_per_row = width * 4;
-    let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
-        * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> PendingRead {
+    let padded_row =
+        (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("ghostframe-texture-readback"),
-        size: padded_bytes_per_row as u64 * height as u64,
+        size: u64::from(padded_row) * u64::from(h),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -84,45 +108,70 @@ pub async fn read_texture_rgba8(
         label: Some("ghostframe-texture-readback"),
     });
     encoder.copy_texture_to_buffer(
-        texture.as_image_copy(),
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x, y, z: 0 },
+            aspect: wgpu::TextureAspect::All,
+        },
         wgpu::TexelCopyBufferInfo {
             buffer: &staging,
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(padded_bytes_per_row),
-                rows_per_image: Some(height),
+                bytes_per_row: Some(padded_row),
+                rows_per_image: Some(h),
             },
         },
         wgpu::Extent3d {
-            width,
-            height,
+            width: w,
+            height: h,
             depth_or_array_layers: 1,
         },
     );
     crate::submit::submit(queue, encoder);
-
     let (done, mapped) = oneshot();
     staging.slice(..).map_async(wgpu::MapMode::Read, done);
-    mapped
-        .await
-        .map_err(|e| GpuError::Device(format!("map readback staging buffer: {e}")))?;
-
-    let padded = staging
-        .slice(..)
-        .get_mapped_range()
-        .map_err(|e| GpuError::Device(format!("readback get_mapped_range: {e}")))?;
-    // Strip row padding: the staging buffer's rows are padded to
-    // `COPY_BYTES_PER_ROW_ALIGNMENT`, but callers want tight rows. Skipping
-    // this looks right at the start of each row and drifts further out of
-    // alignment with every row after it.
-    let mut tight = Vec::with_capacity(unpadded_bytes_per_row as usize * height as usize);
-    for row in 0..height as usize {
-        let start = row * padded_bytes_per_row as usize;
-        tight.extend_from_slice(&padded[start..start + unpadded_bytes_per_row as usize]);
+    PendingRead {
+        staging,
+        mapped,
+        width: w,
+        height: h,
+        padded_row,
     }
-    drop(padded);
-    staging.unmap();
-    Ok(tight)
+}
+
+impl PendingRead {
+    /// The rectangle as `w * h * 4` tight RGBA bytes. Needs no device: the
+    /// map callback is delivered by the browser's event loop, or on native by
+    /// whoever polls the device ([`block_on_device`]).
+    pub async fn finish(self) -> Result<Vec<u8>, GpuError> {
+        self.mapped
+            .await
+            .map_err(|e| GpuError::Device(format!("map readback staging buffer: {e}")))?;
+        let padded = self
+            .staging
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|e| GpuError::Device(format!("readback get_mapped_range: {e}")))?;
+        let tight = tight_rows(&padded, self.width, self.height, self.padded_row);
+        drop(padded);
+        self.staging.unmap();
+        Ok(tight)
+    }
+}
+
+/// Copy the whole `width` x `height` `texture` into tight rows,
+/// `width * height * 4` bytes. Submits one encoder of its own.
+pub async fn read_texture_rgba8(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, GpuError> {
+    begin_texture_read(device, queue, texture, 0, 0, width, height)
+        .finish()
+        .await
 }
 
 /// Drive `fut` to completion on this thread, polling `device` whenever it is
@@ -148,5 +197,22 @@ pub fn block_on_device<F: Future>(device: &wgpu::Device, fut: F) -> F::Output {
         device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("polling the device for a pending GPU callback");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tight_rows;
+
+    #[test]
+    fn tight_rows_drops_exactly_the_padding() {
+        // 3 px wide, 2 rows, pitch 16: row 0 = 1.., row 1 = 101.., padding 0xEE.
+        let mut raw = vec![0xEE; 32];
+        raw[..12].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        raw[16..28].copy_from_slice(&[101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112]);
+        let out = tight_rows(&raw, 3, 2, 16);
+        assert_eq!(out.len(), 24);
+        assert!(!out.contains(&0xEE), "padding leaked into the result");
+        assert_eq!(&out[12..16], &[101, 102, 103, 104]);
     }
 }
