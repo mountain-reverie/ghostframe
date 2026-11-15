@@ -598,8 +598,26 @@ async function main() {
   // rAF loop — drains queues, flushes one frame per animation tick.
   let __rafTicks = 0;
   const statsLog = createStatsLogger({ renderer, core, log, getNackSent: () => nackSent });
+  // Bench (?e2e only): main-thread CPU time of each rAF tick that presented a
+  // frame -- the whole tick: datagram routing, event handling, apply, paint --
+  // plus datagram flushes made outside a tick (backlog or timer). The same
+  // lines run on master and on the branch, because the branch moves tile
+  // application from the paint step into the datagram step: only the sum
+  // compares.
+  const tickUsSamples: number[] = [];
+  let outOfTickUs = 0;
+  let inTick = false;
+  if (diagnostics) {
+    window.__ghostframeTickUs = () => {
+      const v = tickUsSamples.splice(0).sort((a, b) => a - b);
+      const at = (q: number) => (v.length ? v[Math.round((v.length - 1) * q)] : 0);
+      return [v.length, at(0.5), at(0.99), v.length ? v[v.length - 1] : 0];
+    };
+  }
   function tick() {
     __rafTicks++;
+    const tickStartMs = performance.now();
+    inTick = true;
     diag.recordRafTick(__rafTicks);
 
     // Assembly-timeout NACKs, the tail-fallback sweep, and the periodic
@@ -666,6 +684,11 @@ async function main() {
     statsLog.onTick({ ...drained }, __rafTicks);
     drained.solid = drained.palrle = drained.cdf53 = drained.h264 = 0;
 
+    inTick = false;
+    if (diagnostics && painted > 0) {
+      tickUsSamples.push(Math.round((performance.now() - tickStartMs) * 1000 + outOfTickUs));
+    }
+    outOfTickUs = 0;
     requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
@@ -689,6 +712,14 @@ async function main() {
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
 
   function flushDatagrams(): void {
+    const t0 = performance.now();
+    try {
+      flushDatagramsInner();
+    } finally {
+      if (!inTick) outOfTickUs += (performance.now() - t0) * 1000;
+    }
+  }
+  function flushDatagramsInner(): void {
     if (flushTimer !== undefined) {
       clearTimeout(flushTimer);
       flushTimer = undefined;
