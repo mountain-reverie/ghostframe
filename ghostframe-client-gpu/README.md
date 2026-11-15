@@ -7,7 +7,6 @@ GPU decode and dmabuf export for the native client.
 | Target | Needs a GPU | Runs in CI |
 |---|---|---|
 | `--lib` | no | yes |
-| `--test cdf53_passes` | no | yes |
 | `--test gpu_export` | yes | no |
 | `--test gpu_pipelines` | yes | no |
 | `--test gpu_oracle` | yes | no |

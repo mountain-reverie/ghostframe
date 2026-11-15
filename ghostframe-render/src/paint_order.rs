@@ -197,4 +197,48 @@ mod tests {
         assert!(!l.superseded(0, 0, 1));
         assert!(!l.h264_stale(1));
     }
+
+    #[test]
+    fn older_picture_after_newer_picture_is_stale_and_an_equal_one_is_not() {
+        let mut l = SeqLedger::default();
+        l.note_h264(11);
+        assert!(
+            l.h264_stale(10),
+            "an older picture queued after a newer one"
+        );
+        assert!(!l.h264_stale(11), "equal never supersedes");
+        assert!(!l.h264_stale(12));
+    }
+
+    #[test]
+    fn picture_staleness_follows_the_seq_wrap() {
+        let mut l = SeqLedger::default();
+        l.note_h264(1); // 1 is newer than 0x7FFF_FFFF: the 31-bit wire counter wrapped
+        assert!(l.h264_stale(0x7FFF_FFFF));
+        assert!(!l.h264_stale(2));
+        let mut l = SeqLedger::default();
+        l.note(0, 0, 1);
+        assert!(
+            l.h264_stale(0x7FFF_FFF0),
+            "a tile after the wrap makes a pre-wrap picture stale"
+        );
+    }
+
+    #[test]
+    fn a_stateless_entry_equal_to_a_picture_is_kept_and_an_older_one_dropped() {
+        let mut l = SeqLedger::default();
+        l.note_h264(11);
+        assert!(!l.superseded(5, 5, 11));
+        assert!(l.superseded(5, 5, 10));
+    }
+
+    #[test]
+    fn one_newer_tile_anywhere_makes_every_older_picture_stale() {
+        let mut l = SeqLedger::default();
+        l.note(200, 100, 50);
+        for seq in [1, 49] {
+            assert!(l.h264_stale(seq), "{seq}");
+        }
+        assert!(!l.h264_stale(50));
+    }
 }

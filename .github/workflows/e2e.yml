@@ -75,9 +75,9 @@ jobs:
       # at all (naga only sees a shader at create_shader_module time, which
       # a GPU-less runner never calls). nv12_oracle_tests needs a GPU and
       # self-skips here, same as the five named targets above. Do not
-      # narrow this to `--test cdf53_passes`
-      # alone -- that would silently drop shader_validation back out of CI.
-      - run: cargo test -p ghostframe-client-gpu --lib --test cdf53_passes
+      # narrow this to a named target alone -- that would silently drop
+      # shader_validation back out of CI.
+      - run: cargo test -p ghostframe-client-gpu --lib
       - run: cargo test -p ghostframe-client-native
       - run: cargo test -p ghostframe-client-capi
       # ghostframe-cli's four integration targets (chord, geometry, cli,

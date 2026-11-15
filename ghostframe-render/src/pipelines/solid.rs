@@ -13,6 +13,20 @@ const SHADER_SRC: &str = include_str!("../../../shaders/client/solid.wgsl");
 /// Bytes per instance: tile_x (u32) + tile_y (u32) + color_packed (u32).
 const INSTANCE_STRIDE: u64 = 12;
 
+/// The instance buffer for `tiles`: per tile `tile_x: u32, tile_y: u32,
+/// color_packed: u32`, little-endian. The colour is the wire's BGRA bytes
+/// unchanged: the shader's `unpack4x8unorm` reads them as a little-endian u32
+/// whose LSB-first byte order is exactly BGRA, then swizzles to RGBA.
+pub(crate) fn pack_instances(tiles: &[(u8, u8, [u8; 4])]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(tiles.len() * INSTANCE_STRIDE as usize);
+    for (tile_x, tile_y, bgra) in tiles {
+        data.extend_from_slice(&(*tile_x as u32).to_le_bytes());
+        data.extend_from_slice(&(*tile_y as u32).to_le_bytes());
+        data.extend_from_slice(bgra);
+    }
+    data
+}
+
 pub struct SolidPipeline {
     pipeline: wgpu::RenderPipeline,
     canvas_buffer: wgpu::Buffer,
@@ -167,16 +181,7 @@ impl SolidPipeline {
 
         self.ensure_capacity(device, tiles.len());
 
-        let mut data = Vec::with_capacity(tiles.len() * INSTANCE_STRIDE as usize);
-        for (tile_x, tile_y, bgra) in tiles {
-            data.extend_from_slice(&(*tile_x as u32).to_le_bytes());
-            data.extend_from_slice(&(*tile_y as u32).to_le_bytes());
-            // Wire bytes pass through unchanged: the shader's
-            // `unpack4x8unorm` reads them as a little-endian u32 whose
-            // LSB-first byte order is exactly this BGRA order, then
-            // swizzles `.zyxw` to RGBA.
-            data.extend_from_slice(bgra);
-        }
+        let data = pack_instances(tiles);
         let instance_buffer = self
             .instance_buffer
             .as_ref()
@@ -206,5 +211,26 @@ impl SolidPipeline {
             pass.draw(0..6, 0..tiles.len() as u32);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pack_instances;
+
+    fn colour_word(bgra: [u8; 4]) -> u32 {
+        let d = pack_instances(&[(3, 4, bgra)]);
+        assert_eq!(d.len(), 12);
+        assert_eq!(&d[..4], &3u32.to_le_bytes());
+        assert_eq!(&d[4..8], &4u32.to_le_bytes());
+        u32::from_le_bytes([d[8], d[9], d[10], d[11]])
+    }
+
+    #[test]
+    fn packs_bgra_with_blue_in_the_low_byte() {
+        // The vitest's three vectors: [B, G, R, A] -> u32 with B at the LSB.
+        assert_eq!(colour_word([0xFF, 0x00, 0x00, 0xFF]), 0xFF00_00FF);
+        assert_eq!(colour_word([0x00, 0xFF, 0x00, 0xFF]), 0xFF00_FF00);
+        assert_eq!(colour_word([0x00, 0x00, 0xFF, 0xFF]), 0xFFFF_0000);
     }
 }
