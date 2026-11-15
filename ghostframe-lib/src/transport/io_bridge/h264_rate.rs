@@ -29,10 +29,12 @@ const _: () = assert!(RATE_SHARE < crate::transport::bwe::SATURATION);
 /// clamped here. `RATE_SHARE` is the share of the estimate the whole stream may
 /// spend, repairs included: the encoder is told `RATE_SHARE / (1 + rho)` and
 /// the repairs add `rho` times that, so the total stays at `RATE_SHARE`, under
-/// the ceiling's saturation, whatever `rho` is.
+/// the ceiling's saturation, whatever `rho` is. One exception: the media rate
+/// never goes under `RATE_FLOOR_BPS` (`RatePolicy::scaled`), so near the floor
+/// the total is `floor x (1 + rho)`, which can exceed `RATE_SHARE x estimate`
+/// by up to `RHO_MAX`. The floor is kept on purpose: a stream under it is not
+/// worth sending.
 pub(crate) const RHO_MAX: f64 = 0.5;
-const _: () =
-    assert!(RATE_SHARE / (1.0 + RHO_MAX) * (1.0 + RHO_MAX) < crate::transport::bwe::SATURATION);
 
 /// The target never goes under this (D4) ...
 pub(crate) const RATE_FLOOR_BPS: u32 = 300_000;
@@ -237,6 +239,12 @@ impl RatePolicy {
     /// which silences padding and the probe raise).
     pub(crate) fn set_overhead(&mut self, rho: f64) {
         self.rho = rho.clamp(0.0, RHO_MAX);
+    }
+
+    /// An unscaled (total, repair included) rate as the media rate for the
+    /// current overhead.
+    pub(crate) fn media_rate(&self, bps: u32) -> u32 {
+        self.scaled(bps, self.rho)
     }
 
     fn scaled(&self, bps: u32, rho: f64) -> u32 {
@@ -642,8 +650,11 @@ impl IoBridge {
             }
         }
         let p = self.active_probe.as_ref().filter(|p| now < p.ends_at)?;
-        let raised =
-            ((p.target_rate_bps as f64 * RATE_SHARE) as u64).min(u64::from(RATE_CAP_BPS)) as u32;
+        // The window's rate is for the whole stream, repairs included; the
+        // encoder is given the media share, as `base_bps` is.
+        let raised = ((p.target_rate_bps as f64 * RATE_SHARE) as u64).min(u64::from(RATE_CAP_BPS))
+            as u32;
+        let raised = self.h264.rate.media_rate(raised);
         if f64::from(raised) < f64::from(base_bps) * (1.0 + APPLY_RISE_FRACTION) {
             return None;
         }
@@ -737,7 +748,11 @@ impl IoBridge {
             let period = 1.0 / f64::from(self.h264.fps.max(1));
             let left = p.ends_at.saturating_duration_since(now).as_secs_f64();
             let later = (left / period - 0.25).floor().max(0.0);
-            let avg_frame = p.target_rate_bps as f64 * RATE_SHARE / 8.0 * period;
+            // Source bytes only: the frames are raised at the media rate.
+            let media = self.h264.rate.media_rate(
+                ((p.target_rate_bps as f64 * RATE_SHARE) as u64).min(u64::from(RATE_CAP_BPS)) as u32,
+            );
+            let avg_frame = f64::from(media) / 8.0 * period;
             expected_later = (later * avg_frame * RAISE_EXPECTED_YIELD) as i64;
         }
         let len = crate::transport::fec_tx::packer::Packer::lone_bundle_len(

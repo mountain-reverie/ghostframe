@@ -9210,6 +9210,31 @@ async fn p_frames_in_a_probe_window_are_coded_at_the_windows_rate() {
     }
 }
 
+/// With FEC engaged (rho > 0) the raised media rate is the window's share
+/// divided by `1 + rho`, like the base rate it is compared to: raised frames
+/// plus their repair then fill the window, not overshoot it by `1 + rho`.
+#[tokio::test(start_paused = true)]
+async fn the_probe_raise_is_scaled_by_the_repair_overhead() {
+    let (mut b, base) = raise_bridge();
+    let window_bps = u64::from(base) * 4;
+    b.open_probe_cluster(
+        now_std(),
+        95,
+        window_bps,
+        std::time::Duration::from_millis(100),
+        5,
+        40_000,
+    );
+    let rho = 0.25;
+    b.h264.rate.set_overhead(rho);
+    let (raised, _) = b
+        .h264_probe_raise(now_std(), (f64::from(base) / (1.0 + rho)) as u32)
+        .expect("the window raises");
+    let total = (window_bps as f64 * h264_rate::RATE_SHARE) as u32;
+    assert_eq!(raised, (f64::from(total) / (1.0 + rho)) as u32);
+    assert!(raised < total, "media plus repair stays inside the window");
+}
+
 /// A raise that is on at a window's open is re-checked for every raised
 /// plan: a cut, a late acknowledgement or a lost raised frame inside the
 /// window ends it for the frames still to come (the one already raised
