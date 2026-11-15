@@ -162,23 +162,7 @@ impl WasmClientCore {
         lens: &[u32],
         arrivals_us: &[f64],
     ) -> Result<JsValue, JsValue> {
-        let mut core = self.inner.borrow_mut();
-        let mut events = Vec::new();
-        let mut offset = 0usize;
-        for (len, at) in lens.iter().zip(arrivals_us.iter()) {
-            let len = *len as usize;
-            let Some(end) = offset.checked_add(len) else {
-                break;
-            };
-            let Some(datagram) = concat.get(offset..end) else {
-                break;
-            };
-            offset = end;
-            // `as u64` saturates and maps NaN to 0, so a hostile or buggy
-            // caller cannot wrap.
-            events.extend(core.handle_datagram(datagram, *at as u64));
-        }
-        drop(core);
+        let events = self.collect_datagram_events(concat, lens, arrivals_us);
         let mirrored: Vec<WasmEvent> = events
             .into_iter()
             .filter_map(WasmEvent::from_event)
@@ -300,9 +284,70 @@ impl WasmClientCore {
 }
 
 impl WasmClientCore {
+    /// Feed a batch of datagrams to the core; the events, in arrival order.
+    /// The loop `handleDatagrams` always ran (see its doc for the batch format).
+    fn collect_datagram_events(
+        &mut self,
+        concat: &[u8],
+        lens: &[u32],
+        arrivals_us: &[f64],
+    ) -> Vec<ghostframe_client_core::Event> {
+        let mut core = self.inner.borrow_mut();
+        let mut events = Vec::new();
+        let mut offset = 0usize;
+        for (len, at) in lens.iter().zip(arrivals_us.iter()) {
+            let len = *len as usize;
+            let Some(end) = offset.checked_add(len) else {
+                break;
+            };
+            let Some(datagram) = concat.get(offset..end) else {
+                break;
+            };
+            offset = end;
+            // `as u64` saturates and maps NaN to 0, so a hostile or buggy
+            // caller cannot wrap.
+            events.extend(core.handle_datagram(datagram, *at as u64));
+        }
+        events
+    }
+
     /// The shared core, for the panel. Not exported to JS.
     pub(crate) fn shared(&self) -> Rc<RefCell<ClientCore>> {
         self.inner.clone()
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+impl WasmClientCore {
+    /// [`WasmClientCore::handle_datagrams`] with the tile work applied to
+    /// `renderer` inside wasm: tile payloads, palettes and frame sizes never
+    /// cross into JS. Returns one record per event, in order (see
+    /// `web::route`): a slim record per tile (codec, coordinates, full
+    /// length, first 16 bytes), `FrameDimensions` with `applied`/`reason`, and
+    /// `NeedsH264`/`DecodeError`/`Evicted` as before. A failing event is
+    /// carried in its record's `error`; the rest of the batch is still applied.
+    #[wasm_bindgen(js_name = handleDatagramsInto)]
+    pub fn handle_datagrams_into(
+        &mut self,
+        renderer: &mut crate::web::renderer::WebRenderer,
+        concat: &[u8],
+        lens: &[u32],
+        arrivals_us: &[f64],
+    ) -> Result<JsValue, JsValue> {
+        let events = self.collect_datagram_events(concat, lens, arrivals_us);
+        to_js(&crate::web::route::route(events, renderer))
+    }
+
+    /// [`WasmClientCore::on_timeout`] with the same routing.
+    #[wasm_bindgen(js_name = onTimeoutInto)]
+    pub fn on_timeout_into(
+        &mut self,
+        renderer: &mut crate::web::renderer::WebRenderer,
+        now_us: u64,
+    ) -> Result<JsValue, JsValue> {
+        let events = self.inner.borrow_mut().on_timeout(now_us);
+        to_js(&crate::web::route::route(events, renderer))
     }
 }
 
