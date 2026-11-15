@@ -177,6 +177,21 @@ impl WebRenderer {
                 }
             }));
         }
+        {
+            // A lost device fails every later map and submit without an
+            // uncaptured error: say so once, with the browser's reason.
+            let sink = gpu_errors.clone();
+            device.set_device_lost_callback(move |reason, msg| {
+                if reason == wgpu::DeviceLostReason::Destroyed {
+                    return;
+                }
+                let msg = format!("device lost ({reason:?}): {msg}");
+                web_sys::console::error_1(&JsValue::from_str(&format!("[webgpu] {msg}")));
+                if let Ok(mut v) = sink.lock() {
+                    v.push(msg);
+                }
+            });
+        }
 
         let caps = surface.get_capabilities(&adapter);
         let surface_format = pick_canvas_format(&caps.formats);
