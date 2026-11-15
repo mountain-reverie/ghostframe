@@ -5577,8 +5577,10 @@ async fn e2e_bench_web_paint_us() -> Result<()> {
             .unwrap_or(0.0)
     };
     eprintln!(
-        "BENCH mode={mode} framePaints_us count={} p50={} p99={}",
+        "BENCH mode={mode} framePaints_us count={} (paints={} recorded_tiles={}) p50={} p99={}",
         lat.len(),
+        paints.len(),
+        tiles.len(),
         at(0.5),
         at(0.99)
     );
@@ -5594,5 +5596,14 @@ async fn e2e_bench_web_paint_us() -> Result<()> {
     // at 4K sends one burst and leaves it empty. That is a fact to report, not a
     // failed run: the tick timing is what must be live.
     assert!(tick[0] > 0.0, "the bench observed nothing: tick {tick:?}");
+    // At 1080p the spec metric was live; do not let it go dark unnoticed.
+    if mode == "1920x1080" || !paints.is_empty() {
+        assert!(
+            !lat.is_empty(),
+            "framePaints joined nothing: paints={} tiles={}",
+            paints.len(),
+            tiles.len()
+        );
+    }
     Ok(())
 }

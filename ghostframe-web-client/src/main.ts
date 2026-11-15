@@ -618,6 +618,8 @@ async function main() {
     __rafTicks++;
     const tickStartMs = performance.now();
     inTick = true;
+    let painted = 0;
+    try {
     diag.recordRafTick(__rafTicks);
 
     // Assembly-timeout NACKs, the tail-fallback sweep, and the periodic
@@ -658,7 +660,6 @@ async function main() {
     // Paint: flush the renderer's tiles, draw pending H.264 pictures, present;
     // all of it is skipped when nothing changed. A throw here must not stop
     // the rAF loop: it would freeze the client for the rest of the session.
-    let painted = 0;
     try {
       painted = renderer.paintTick(nowUs());
     } catch (e) {
@@ -684,7 +685,13 @@ async function main() {
     statsLog.onTick({ ...drained }, __rafTicks);
     drained.solid = drained.palrle = drained.cdf53 = drained.h264 = 0;
 
-    inTick = false;
+    } finally {
+      // A throw above must not leave inTick set: out-of-tick flushes would
+      // stop being counted for the rest of the session.
+      inTick = false;
+    }
+    // outOfTickUs is per presenting tick: flushes made before a tick that
+    // presents nothing are dropped with it.
     if (diagnostics && painted > 0) {
       tickUsSamples.push(Math.round((performance.now() - tickStartMs) * 1000 + outOfTickUs));
     }
