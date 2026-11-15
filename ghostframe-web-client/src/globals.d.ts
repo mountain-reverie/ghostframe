@@ -14,8 +14,9 @@ declare module '*.wgsl?raw' {
 interface Window {
   /** Swallowed-exception counts + console ring (health.ts). */
   __ghostframeHealth?: () => import('./health.js').HealthSnapshot;
-  /** Renderer queue lengths, submit count, sizes (renderer.ts debugState). */
+  /** Renderer queue lengths, submit count, sizes (`WebRenderer.debugState()`). */
   __ghostframeRendererState?: () => unknown;
+  __ghostframePaintUs?: () => number[];
   /** What the renderer last did to one tile (renderer.ts debugTile). */
   __ghostframeTile?: (tileX: number, tileY: number) => unknown;
   // ----- stats counters (set at startup, re-published from the core) -----
@@ -29,7 +30,7 @@ interface Window {
   __ghostframeStatsFrames: number | undefined;
 
   // ----- renderer reference (set per-frame in renderer.ts) --------------------
-  __ghostframeRenderer: { device: GPUDevice; texture: GPUTexture } | undefined;
+  __ghostframeRenderer: { device: unknown; texture: { width: number; height: number } } | undefined;
 
   // ----- recorder arrays (FIFO-capped, pushed from diagnostics.ts) ------------
   __ghostframeRecordedCodecs: number[] | undefined;
@@ -70,25 +71,6 @@ interface Window {
 
   /** Core-side CDF53 coverage + the worst incomplete tiles (main.ts). */
   __cdf53CoverageSummary(): { summary: unknown; incomplete: unknown };
-
-  // ----- ?debug only (cdf53_debug.ts); absent in a normal session ------------
-  __cdf53FullGridDiff?: () => Promise<{
-    width: number;
-    height: number;
-    differingPixels: number;
-    nonBlankPixels: number;
-    cdf53Entries: number;
-  }>;
-  __cdf53TestInverse?: (coeffsI16: number[], tileIdx?: number) => Promise<number[]>;
-  __cdf53TestIntegrate?: (
-    encodedPasses: number[][],
-  ) => Promise<{ coefficients: number[]; signs: number[] }>;
-  __cdf53DumpTileState?: (
-    tileIdx: number,
-  ) => Promise<{ tileGen: number; coefficients: number[]; signs: number[] }>;
-  __cdf53SetTileWatcher?: (tileX: number, tileY: number) => void;
-  __cdf53GetTileWatcher?: () => unknown;
-  __cdf53Probe?: () => unknown;
 
   // ----- [H2-DIAG] client-side palette atlas writes -------------------------
   /** Per-call record of palrlePipeline.upsertPalette(); FIFO-capped. */
