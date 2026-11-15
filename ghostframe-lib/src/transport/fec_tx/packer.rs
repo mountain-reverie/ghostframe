@@ -271,11 +271,6 @@ impl Packer {
         self.builder.t_close_at_us()
     }
 
-    /// The knob this packer runs with.
-    pub(crate) fn params(&self) -> Option<FecBlockParams> {
-        self.blocks
-    }
-
     /// MTU shrink: a repair of the open block's longest symbol no longer fits
     /// `max_dg`, so the block closes at its current size.
     pub(crate) fn close_for_mtu(&mut self, max_dg: usize) -> bool {
