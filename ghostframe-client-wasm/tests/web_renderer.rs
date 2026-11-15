@@ -84,3 +84,16 @@ async fn a_solid_tile_reaches_the_framebuffer() {
         "an untouched tile stays clear"
     );
 }
+
+#[wasm_bindgen_test]
+async fn a_refused_frame_size_leaves_the_renderer_unchanged() {
+    let mut r = new_renderer("auto").await;
+    r.apply(dims(64, 64)).expect("resize");
+    r.apply(dims(0, 0)).expect("a refused size is not an error");
+    r.apply(dims(u32::MAX, u32::MAX))
+        .expect("nor is a huge one");
+    assert_eq!((r.fb_width(), r.fb_height()), (64, 64));
+    r.apply(solid(10, 1, 1, RED)).expect("tile");
+    r.paint_tick(1_000).expect("paint");
+    assert!(near(px(&r, 40, 40).await, RED, 0), "pixel read still works");
+}
