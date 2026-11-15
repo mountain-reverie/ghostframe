@@ -27,7 +27,7 @@ Clients:
 | Crate | Purpose |
 | --- | --- |
 | `ghostframe-web-client` | TypeScript + Vite browser client (WebTransport + WebCodecs + WebGPU). |
-| `ghostframe-client-wasm` | The JS boundary for the browser client. Consumes the wire format. |
+| `ghostframe-client-wasm` | The browser client's Rust side: the JS boundary (`WasmClientCore`) and its renderer (`WebRenderer`: wgpu's WebGPU backend over `ghostframe-render`, plus the raw WebGPU path that draws decoded H.264 `VideoFrame`s). `just test-web-renderer` runs its tests, including WebGPU in headless Chrome. |
 | `ghostframe-web-ui` | The browser client's DOM UI (the stats panel), in Leptos. The only crate that depends on Leptos; linked into `ghostframe-client-wasm`. `just test-web-ui` runs its tests, including one in headless Chrome. |
 | `ghostframe-client-core` | Decode-side tile engine, shared by every client. Consumes the wire format. |
 | `ghostframe-client-net` | Client QUIC/WebTransport stack. |
@@ -296,6 +296,8 @@ README's [Who can connect](README.md#who-can-connect). The split:
 just lint        # cargo clippy -- -D warnings
 just fmt-check   # cargo fmt -- --check
 just fmt         # cargo fmt
+just test-web-renderer  # the browser renderer's host and headless-Chrome tests
+just lint-web        # clippy for the wasm32-only code (the workspace clippy never compiles it)
 just ci-local    # run the fast CI tier in the order CI runs it
 ```
 
