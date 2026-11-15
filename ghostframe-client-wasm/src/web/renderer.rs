@@ -562,6 +562,11 @@ impl WebRenderer {
         self.paint_ticks
     }
 
+    /// Whether CDF 5/3 work is waiting for a later tick (budget or throttle).
+    pub fn has_deferred_work(&self) -> bool {
+        self.tiles.has_deferred_work()
+    }
+
     /// `"gpu"` or `"cpu"`: where CDF 5/3 tiles are reconstructed.
     #[wasm_bindgen(getter, js_name = cdf53Path)]
     pub fn cdf53_path(&self) -> String {
