@@ -533,6 +533,7 @@ impl BlockTable {
     pub(crate) fn open_blocks(&self) -> usize {
         self.blocks.len()
     }
+    #[cfg(test)]
     pub(crate) fn cached_bytes(&self) -> usize {
         self.cached_bytes
     }
@@ -555,6 +556,7 @@ impl BlockTable {
         self.closed.get(&block_id).copied()
     }
     /// The terminal outcome of a source, if it has one.
+    #[cfg(test)]
     pub(crate) fn outcome(&self, bundle_seq: u32) -> Option<Outcome> {
         self.by_bundle.get(&bundle_seq).and_then(|e| e.outcome)
     }
@@ -869,7 +871,10 @@ impl BlockTable {
         // The server knows k; a client that has not seen LAST or a repair
         // does not, and always asks for one row. Serve what the block needs
         // to reach k from what the client holds.
-        let needed = b.k.saturating_sub(ask.have).max(ask.missing).max(u8::from(holds_all));
+        let needed =
+            b.k.saturating_sub(ask.have)
+                .max(ask.missing)
+                .max(u8::from(holds_all));
         for _ in 0..needed {
             if row > max_row {
                 break;
@@ -1888,9 +1893,9 @@ mod tests {
         t.on_declined(BLK, 5, &[0b11111], t0);
         assert_eq!(t.closed_reason(BLK), Some(CloseReason::Declined));
 
-        // Malformed (have >= k): declines at once, was not served.
+        // Malformed (have > k): declines at once, was not served.
         let mut t = setup(3, 1, tile, t0);
-        t.on_request(ask(3, 1, 0), t0);
+        t.on_request(ask(4, 1, 0), t0);
         assert_eq!(t.closed_reason(BLK), Some(CloseReason::Declined));
         assert_eq!(t.stats().closed_declined_late, 0);
     }

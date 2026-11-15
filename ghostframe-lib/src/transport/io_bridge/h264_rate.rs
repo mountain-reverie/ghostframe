@@ -652,8 +652,8 @@ impl IoBridge {
         let p = self.active_probe.as_ref().filter(|p| now < p.ends_at)?;
         // The window's rate is for the whole stream, repairs included; the
         // encoder is given the media share, as `base_bps` is.
-        let raised = ((p.target_rate_bps as f64 * RATE_SHARE) as u64).min(u64::from(RATE_CAP_BPS))
-            as u32;
+        let raised =
+            ((p.target_rate_bps as f64 * RATE_SHARE) as u64).min(u64::from(RATE_CAP_BPS)) as u32;
         let raised = self.h264.rate.media_rate(raised);
         if f64::from(raised) < f64::from(base_bps) * (1.0 + APPLY_RISE_FRACTION) {
             return None;
@@ -750,7 +750,8 @@ impl IoBridge {
             let later = (left / period - 0.25).floor().max(0.0);
             // Source bytes only: the frames are raised at the media rate.
             let media = self.h264.rate.media_rate(
-                ((p.target_rate_bps as f64 * RATE_SHARE) as u64).min(u64::from(RATE_CAP_BPS)) as u32,
+                ((p.target_rate_bps as f64 * RATE_SHARE) as u64).min(u64::from(RATE_CAP_BPS))
+                    as u32,
             );
             let avg_frame = f64::from(media) / 8.0 * period;
             expected_later = (later * avg_frame * RAISE_EXPECTED_YIELD) as i64;

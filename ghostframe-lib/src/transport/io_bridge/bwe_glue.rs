@@ -654,6 +654,7 @@ impl IoBridge {
         let bwe_estimate_bps = snap.bitrate_bps;
         // The estimate counts as measured once it has left its initial value
         // and a feedback sample has arrived since the session reset.
+        #[cfg_attr(not(any(test, feature = "test-loss-injection")), allow(unused_mut))]
         let mut estimate_known = snap.bitrate_bps != crate::transport::bwe::BweWrapper::INITIAL_BPS
             && snap.samples_seen > self.bwe_samples_at_session_reset;
         // The test override replaces the *classifier's* view of the headroom.

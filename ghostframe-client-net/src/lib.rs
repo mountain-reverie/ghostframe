@@ -669,17 +669,17 @@ impl ClientNet {
                 if let Some(sid) = self.repair_status_stream {
                     let mut stream = conn.send_stream(sid);
                     let warned = &mut self.repair_status_write_warned;
-                    let drained = drain_into(&mut self.pending_repair_status_out, |b| {
-                        match stream.write(b) {
-                            Ok(n) => Ok(n),
-                            Err(quinn_proto::WriteError::Blocked) => Err(WriteErrorKind::Blocked),
-                            Err(e) => {
-                                if !*warned {
-                                    *warned = true;
-                                    tracing::warn!(error = ?e, "repair-status stream write failed");
-                                }
-                                Err(WriteErrorKind::Failed)
+                    let drained = drain_into(&mut self.pending_repair_status_out, |b| match stream
+                        .write(b)
+                    {
+                        Ok(n) => Ok(n),
+                        Err(quinn_proto::WriteError::Blocked) => Err(WriteErrorKind::Blocked),
+                        Err(e) => {
+                            if !*warned {
+                                *warned = true;
+                                tracing::warn!(error = ?e, "repair-status stream write failed");
                             }
+                            Err(WriteErrorKind::Failed)
                         }
                     });
                     repair_status_after_drain(
