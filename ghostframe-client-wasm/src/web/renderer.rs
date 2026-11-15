@@ -112,6 +112,17 @@ pub struct WebRenderer {
     paint_us: Vec<u32>,
 }
 
+impl Drop for WebRenderer {
+    /// wgpu's WebGPU backend frees nothing on drop: every buffer and texture
+    /// lives until the page's garbage collector gets to it. Destroying the
+    /// device frees them now, so a replaced renderer (or a test that made one)
+    /// does not hold its framebuffers and CDF 5/3 storage for an unknown time.
+    /// The device-lost callback ignores the `Destroyed` reason this causes.
+    fn drop(&mut self) {
+        self.device.destroy();
+    }
+}
+
 impl WebRenderer {
     async fn create_inner(
         canvas: web_sys::HtmlCanvasElement,
