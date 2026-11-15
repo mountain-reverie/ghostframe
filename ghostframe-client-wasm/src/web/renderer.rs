@@ -80,6 +80,10 @@ pub struct PaintOutcome {
 
 #[wasm_bindgen]
 pub struct WebRenderer {
+    /// Kept for the renderer's lifetime: when the browser collects the
+    /// instance, it loses every device made from it ("A valid external
+    /// Instance reference no longer exists"), and later maps and submits fail.
+    _instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -230,6 +234,7 @@ impl WebRenderer {
         };
 
         Ok(WebRenderer {
+            _instance: instance,
             adapter,
             device,
             queue,
