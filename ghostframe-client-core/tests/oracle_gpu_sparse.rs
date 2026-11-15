@@ -13,31 +13,36 @@
 //!   carried. Its contiguous prefix therefore reaches 14 and no midpoint
 //!   correction is applied.
 //! - The retired browser path (the multi-pass TypeScript and WGSL code, now
-//!   deleted) never saw the bitmap -- the wasm boundary handed JS only
-//!   `{ pass_idx, bit_planes }` -- and derived its K as
-//!   `passesProcessed = max(passIdx + 1)`.
+//!   deleted) first derived its K as `passesProcessed = max(passIdx + 1)`, a
+//!   running max, because the wasm boundary handed JS only
+//!   `{ pass_idx, bit_planes }`. Once the bitmap was plumbed through to the
+//!   GPU it resolved skipped passes from it, like the Rust decoder.
 //!
-//! Both applied the *same* midpoint formula. So they agreed exactly while
+//! Both applied the *same* midpoint formula. They agreed exactly while
 //! passes were still arriving, and once the highest present pass was 13. They
-//! diverged when the encoder skipped **trailing** passes: the Rust side
-//! backfilled them and concluded "lossless", while the old GPU path concluded
-//! "K passes of 14" and added a midpoint for low bits known to be zero.
+//! diverged when the encoder skipped **trailing** passes and the bitmap was
+//! not yet known to the GPU: the Rust side backfilled them and concluded
+//! "lossless", while the running-max path concluded "K passes of 14" and added
+//! a midpoint for low bits known to be zero. That divergence is historical;
+//! `the_gpu_is_exact_when_trailing_passes_are_skipped` pins the bitmap-aware
+//! behaviour.
 //!
-//! The shipped grid (`ghostframe-render`, `pipelines/cdf53_state.rs`) does not
-//! have that divergence: like `Cdf53TileState` it resolves absent passes from
-//! pass 0's bitmap and takes K as a contiguous prefix (see its test
+//! The shipped grid (`ghostframe-render`, `pipelines/cdf53_state.rs`) resolves
+//! absent passes from pass 0's bitmap and takes K as a contiguous prefix (see
+//! its tests `absent_passes_resolve_from_the_bitmap` and
 //! `the_spike_s_max_prev_pass_rule_would_draw_here_and_this_does_not`). This
-//! file keeps the model of the retired running-max rule, and pins the Rust
-//! decoder as the reference the new path must match.
+//! file models that retired path's arithmetic against the Rust decoder; it
+//! does not exercise the shipped grid.
 //!
 //! # Fidelity of the model
 //!
-//! `gpu_model_coefficients` models the retired path's arithmetic, not the
-//! shipped grid's:
+//! `gpu_model_coefficients` models the retired path's arithmetic:
 //!
 //! - bit placement: pass `p` carries bit `13 - p`, and pass 0 is the sign
 //!   plane.
-//! - K: a running max of `pass_idx + 1`, reset to 0 on a generation change.
+//! - K: the bitmap's contiguous prefix of resolved passes once pass 0 has
+//!   delivered `present`, and a running max of `pass_idx + 1` before that,
+//!   reset to 0 on a generation change.
 //! - midpoint: when the raw magnitude is non-zero and `2 <= K < 14`, add
 //!   `1 << (14 - K - 1)`.
 
@@ -61,7 +66,7 @@ fn gpu_model_coefficients(arrived: &[(u8, Vec<u8>)], present: u16) -> Vec<i16> {
     let mut magnitudes = vec![0u32; total];
     let mut signs = vec![false; total];
 
-    // `passesProcessed` as the retired path computed it: a running max.
+    // `passesProcessed` as the retired path computed it: the bitmap prefix once known, else a running max.
     let mut passes_processed: u32 = 0;
     let mut received_mask: u16 = 0;
 
@@ -120,7 +125,7 @@ fn gpu_model_coefficients(arrived: &[(u8, Vec<u8>)], present: u16) -> Vec<i16> {
 }
 
 /// Prevalidate every sparse pass into the `(pass_idx, bit_planes)` pairs the
-/// browser hands to `renderer.pushCdf53` -- the exact GPU input.
+/// retired `renderer.pushCdf53` took -- the GPU input.
 fn arrivals(payloads: &[(u8, Vec<u8>)]) -> Vec<(u8, Vec<u8>)> {
     payloads
         .iter()

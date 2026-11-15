@@ -3,8 +3,8 @@
 // (r = x & 255, g = y & 255, b = 0, a = 255) into the framebuffer
 // texture so __readPixel can be independently verified.  NOT used in
 // production rendering — only window.__readGradientGolden dispatches
-// this pipeline.  Lives alongside production codec shaders so the
-// build system picks it up via the same wgsl?raw import pattern.
+// this pipeline.  Lives alongside production codec shaders; it is
+// embedded with include_str! by ghostframe-client-wasm/src/web/debug.rs.
 
 @group(0) @binding(0) var framebuffer: texture_storage_2d<rgba8unorm, write>;
 
