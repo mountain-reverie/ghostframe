@@ -5592,8 +5592,8 @@ async fn e2e_bench_web_paint_us() -> Result<()> {
         "BENCH mode={mode} paint_step_us count={} p50={} p99={} max={}",
         paint[0], paint[1], paint[2], paint[3]
     );
-    // `framePaints` needs frame sequences that advance by two; a static screen
-    // at 4K sends one burst and leaves it empty. That is a fact to report, not a
+    // `framePaints` is empty at 4K on both sides, for a reason not yet verified
+    // (see docs/specs/web-paint-bench.md). That is a fact to report, not a
     // failed run: the tick timing is what must be live.
     assert!(tick[0] > 0.0, "the bench observed nothing: tick {tick:?}");
     // At 1080p the spec metric was live; do not let it go dark unnoticed.

@@ -5,6 +5,7 @@
 # Run the base (master plus the tick/paint timing patched in, never committed)
 # first, then the branch; the images share one tag, so each label rebuilds them.
 # Takes ~/work/.gf-heavy.lock itself (GF_HEAVY_LOCK to override). See docs/specs/web-paint-bench.md.
+[ $# -eq 3 ] && [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ] || { echo "usage: $0 <label> <worktree> <out-dir>" >&2; exit 2; }
 label=$1; wt=$2; out=$3
 GPU_RUN=${GF_GPU_RUN:-$HOME/work/gf-gpu-run}
 command -v "$GPU_RUN" > /dev/null || { echo "GF_GPU_RUN '$GPU_RUN' is not a command; set GF_GPU_RUN to the GPU wrapper" >&2; exit 1; }
