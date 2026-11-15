@@ -13,7 +13,12 @@ into the datagram step:
 
 - **framePaints**: `__ghostframe_framePaints`, `raf - first receipt` per frame.
   A coarse stamp (it waits for the server to be two sequences ahead); it is
-  empty at 4096x2160 on both sides (0 samples). The reason is not verified: the test now prints paints= and recorded_tiles= next to the line, so a rerun records whether paints were empty or the join failed (the recorded-tiles FIFO is capped at 32768). Treat the 4K framePaints cell as unmeasured; a usable one needs an animated source rather than --gradient.
+  empty at 4096x2160 on both sides (0 samples). The reason is not verified:
+  the test now prints paints= and recorded_tiles= next to the line, so a
+  rerun records whether paints were empty or the join failed (the
+  recorded-tiles FIFO is capped at 32768). Treat the 4K framePaints cell as
+  unmeasured; a usable one needs an animated source rather than --gradient.
+  The spec metric is therefore measured at 1080p only.
 - **tick**: main-thread CPU of each rAF tick that presented a frame
   (`__ghostframeTickUs`), identical TypeScript on both sides. The comparable
   cost number.
@@ -73,8 +78,10 @@ ms); within the run-to-run scatter of the base itself (14 ms).
 
 ## Notes
 
-- At 4096x2160 `framePaints` is empty on both sides; only the tick and paint
-  step exist there.
+- Chrome coarsens `performance.now()` to 100 us when the page is not
+  cross-origin isolated, so every tick and paint-step sample is a multiple of
+  100 us; read sub-millisecond deltas (the 4K paint step p50, 700 against 400)
+  with that in mind.
 - The test originally asserted a non-empty framePaints; it failed at 4K after
   printing its results, so the assertion now requires only a live tick timing.
   The base 4K runs used the old assertion (they printed, then failed); the
