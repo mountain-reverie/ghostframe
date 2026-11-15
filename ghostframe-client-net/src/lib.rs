@@ -78,6 +78,31 @@ fn drain_into(
     Ok(())
 }
 
+/// A write to the repair-status stream failed: drop the stream (the next
+/// need opens a fresh one) and owe the new stream its tag, which the core
+/// sent once, with the first records, on the stream that just died.
+fn repair_status_after_drain(
+    result: Result<(), WriteErrorKind>,
+    stream: &mut Option<StreamId>,
+    tag_owed: &mut bool,
+) {
+    if result == Err(WriteErrorKind::Failed) {
+        *stream = None;
+        *tag_owed = true;
+    }
+}
+
+/// A repair-status stream just opened: put the owed tag in front of whatever
+/// is queued (the queue was cleared by the failure, so nothing else has it).
+fn repair_status_tag_new_stream(queue: &mut VecDeque<Vec<u8>>, tag_owed: &mut bool) {
+    if *tag_owed {
+        queue.push_front(vec![
+            ghostframe_protocol::fec::repair_status::FEC_REPAIR_STATUS_STREAM_TAG,
+        ]);
+        *tag_owed = false;
+    }
+}
+
 use clock::Instant;
 use endpoint::ClientEndpoint;
 use handshake::{ConnectOutcome, WebTransportHandshake};
@@ -147,6 +172,9 @@ pub struct ClientNet {
     /// The second client-opened bidi stream, opened on first use. Its first
     /// byte is `FEC_REPAIR_STATUS_STREAM_TAG`, put there by the core.
     repair_status_stream: Option<StreamId>,
+    /// The previous repair-status stream failed: the next one needs the tag
+    /// the core only emits once per session.
+    repair_status_tag_owed: bool,
     /// `open` returned `None` for the repair-status stream; warned already.
     repair_status_open_warned: bool,
     endpoint: ClientEndpoint,
@@ -280,6 +308,7 @@ impl ClientNet {
             repair_status_overflow_warned: false,
             repair_status_write_warned: false,
             repair_status_stream: None,
+            repair_status_tag_owed: false,
             repair_status_open_warned: false,
             endpoint: ClientEndpoint::new(rng_seed),
             handshake: WebTransportHandshake::new(),
@@ -620,7 +649,13 @@ impl ClientNet {
             if !self.pending_repair_status_out.is_empty() {
                 if self.repair_status_stream.is_none() {
                     match conn.streams().open(Dir::Bi) {
-                        Some(sid) => self.repair_status_stream = Some(sid),
+                        Some(sid) => {
+                            self.repair_status_stream = Some(sid);
+                            repair_status_tag_new_stream(
+                                &mut self.pending_repair_status_out,
+                                &mut self.repair_status_tag_owed,
+                            );
+                        }
                         None if !self.repair_status_open_warned => {
                             self.repair_status_open_warned = true;
                             tracing::warn!(
@@ -634,7 +669,7 @@ impl ClientNet {
                 if let Some(sid) = self.repair_status_stream {
                     let mut stream = conn.send_stream(sid);
                     let warned = &mut self.repair_status_write_warned;
-                    let _ = drain_into(&mut self.pending_repair_status_out, |b| {
+                    let drained = drain_into(&mut self.pending_repair_status_out, |b| {
                         match stream.write(b) {
                             Ok(n) => Ok(n),
                             Err(quinn_proto::WriteError::Blocked) => Err(WriteErrorKind::Blocked),
@@ -647,6 +682,11 @@ impl ClientNet {
                             }
                         }
                     });
+                    repair_status_after_drain(
+                        drained,
+                        &mut self.repair_status_stream,
+                        &mut self.repair_status_tag_owed,
+                    );
                 }
             }
         }
@@ -999,6 +1039,35 @@ mod drain_tests {
         }
         assert_eq!(got, expect);
         assert!(rounds > 3 && calls > rounds, "partial path was exercised");
+    }
+
+    /// A failed repair-status write drops the stream; the next stream opened
+    /// starts with the tag, ahead of the records queued after the failure.
+    #[test]
+    fn a_failed_repair_status_stream_is_reopened_with_its_tag() {
+        use ghostframe_protocol::fec::repair_status::FEC_REPAIR_STATUS_STREAM_TAG as TAG;
+        let mut stream = Some(StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0));
+        let mut owed = false;
+        let mut q: VecDeque<Vec<u8>> = vec![vec![TAG, 1, 2]].into();
+        let r = drain_into(&mut q, |_| Err(WriteErrorKind::Failed));
+        repair_status_after_drain(r, &mut stream, &mut owed);
+        assert!(stream.is_none() && owed && q.is_empty());
+        // Records queued later, then the next need opens a stream.
+        q.push_back(vec![3, 4]);
+        repair_status_tag_new_stream(&mut q, &mut owed);
+        assert!(!owed);
+        let mut got = Vec::new();
+        let r = drain_into(&mut q, |b| {
+            got.extend_from_slice(b);
+            Ok(b.len())
+        });
+        assert_eq!(r, Ok(()));
+        assert_eq!(got, vec![TAG, 3, 4]);
+        // A healthy drain neither drops the stream nor owes a tag.
+        let mut stream = Some(StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1));
+        repair_status_after_drain(Ok(()), &mut stream, &mut owed);
+        repair_status_after_drain(Err(WriteErrorKind::Blocked), &mut stream, &mut owed);
+        assert!(stream.is_some() && !owed);
     }
 
     #[test]
