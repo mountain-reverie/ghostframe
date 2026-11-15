@@ -89,14 +89,15 @@ impl H264Blit {
     /// so tiles stay where the picture does not cover them) in one pass and
     /// one submit. The frames must be open; closing them is the caller's.
     /// A frame that cannot be imported is skipped and named in the error;
-    /// the others are still drawn.
+    /// the others are still drawn. Returns how many frames were drawn, with
+    /// the last import error if any frame was skipped.
     pub fn draw(
         &self,
         framebuffer_view: &JsValue,
         width: u32,
         height: u32,
         frames: &[JsValue],
-    ) -> Result<(), String> {
+    ) -> (u32, Option<String>) {
         let encoder = self.device.create_command_encoder();
         let attachment = raw::obj(&[
             ("view", framebuffer_view.clone()),
@@ -108,6 +109,7 @@ impl H264Blit {
             raw::array(&[attachment]),
         )]));
         let mut failure = None;
+        let mut drawn = 0u32;
         for frame in frames {
             let external = match self
                 .device
@@ -133,9 +135,10 @@ impl H264Blit {
             pass.set_bind_group(0, &bind_group);
             pass.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
             pass.draw(6);
+            drawn += 1;
         }
         pass.end();
         self.queue.submit(&Array::of1(&encoder.finish()));
-        failure.map_or(Ok(()), Err)
+        (drawn, failure)
     }
 }

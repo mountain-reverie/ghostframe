@@ -112,10 +112,8 @@ async function main() {
     // emits ReceiverFeedback from on_timeout, driven by tick()'s rAF loop,
     // which stops on its own when the session tears down. No timer to clear.
 
-    // Drain videoFramesToClose and clear the h264Queue FIRST so that the
-    // fullFrameDecoder.close() call below doesn't hit a double-close hazard
-    // on its latestFrame (renderer may have moved the same VideoFrame into
-    // videoFramesToClose on the previous rAF).
+    // renderer.onSessionReset() closes every pending VideoFrame it owns, so
+    // call it before fullFrameDecoder.close().
     renderer.onSessionReset();
 
     // Close the full-frame decoder if one was created this session.

@@ -72,27 +72,6 @@ pub async fn dump_failure_artifacts(
         dir.join(format!("{name}_tiles.json")),
         serde_json::to_string_pretty(&marks).unwrap_or_default(),
     );
-    // When the page was loaded with ?debug: re-lift every CDF 5/3 tile from
-    // its accumulated coefficients and count the pixels that change. Non-zero
-    // means the incremental (dirty-list) lift left tiles stale although the
-    // coefficient state was complete.
-    let heal = r#"(async () => {
-        if (!window.__cdf53FullGridDiff || !window.__readPixelRect) return null;
-        const before = await window.__readPixelRect(672, 0, 1, 1);
-        const diff = await window.__cdf53FullGridDiff();
-        const after = await window.__readPixelRect(672, 0, 1, 1);
-        return { diff, before: Array.from(before).slice(0, 4), after: Array.from(after).slice(0, 4) };
-    })()"#;
-    let healed = match page.evaluate(heal).await {
-        Ok(v) => v
-            .into_value::<serde_json::Value>()
-            .unwrap_or_else(|e| serde_json::json!({ "decode_error": e.to_string() })),
-        Err(e) => serde_json::json!({ "evaluate_error": e.to_string() }),
-    };
-    let _ = std::fs::write(
-        dir.join(format!("{name}_heal.json")),
-        serde_json::to_string_pretty(&healed).unwrap_or_default(),
-    );
     let browser = match page.evaluate(probe).await {
         Ok(v) => v
             .into_value::<serde_json::Value>()

@@ -40,7 +40,7 @@ mk "$tmp/over1" a.wasm $((limit + 1))
 expect "one byte over fails" 1 "$tmp/over1"
 
 mk "$tmp/over" a.wasm $((limit + 100000))
-expect "600 KB fails" 1 "$tmp/over"
+expect "100 KB over the limit fails" 1 "$tmp/over"
 
 mkdir -p "$tmp/empty"
 expect "no wasm at all fails (stale or missing dist)" 1 "$tmp/empty"
