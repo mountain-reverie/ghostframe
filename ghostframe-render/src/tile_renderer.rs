@@ -105,7 +105,6 @@ enum RgbaSrc {
     Slot(SlotTile),
 }
 /// Upper bound on [`GpuDecodeError`]s held between two drains.
-#[cfg(not(target_arch = "wasm32"))]
 const MAX_PENDING_DECODE_ERRORS: usize = 1024;
 
 /// The smallest rectangle of dirty `TileReady` tiles worth its own
@@ -206,7 +205,6 @@ fn short_tile_rect(
 /// A tile the GPU decode rejected; the shape `ClientCore`'s
 /// `DecodeErrorBatcher::report` takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(not(target_arch = "wasm32"))]
 pub struct GpuDecodeError {
     pub codec: Codec,
     pub tile_x: u8,
@@ -216,7 +214,6 @@ pub struct GpuDecodeError {
 
 /// Map a shader error code to the wire enum. `None` for a code the shader
 /// does not define.
-#[cfg(not(target_arch = "wasm32"))]
 fn decode_error_code(code: u32) -> Option<DecodeErrorCode> {
     Some(match code {
         1 => DecodeErrorCode::PayloadTooShort,
@@ -377,15 +374,14 @@ pub struct TileRenderer {
 
     /// GPU-detected decode failures not yet drained by
     /// [`TileRenderer::take_decode_errors`].
-    #[cfg(not(target_arch = "wasm32"))]
     decode_errors: Vec<GpuDecodeError>,
     /// Whether the flush reads the PalRle error slots back. Off by default:
     /// the readback is a blocking `poll(wait_indefinitely)` per flush.
-    #[cfg(not(target_arch = "wasm32"))]
     collect_decode_errors: bool,
     /// The tiles of the last flush's PalRle batch, to attribute error slots.
-    #[cfg(not(target_arch = "wasm32"))]
     palrle_tiles: Vec<(u8, u8)>,
+    /// The non-blocking errors readback (the browser's path).
+    errors_rb: crate::errors_readback::ErrorsReadback,
 }
 /// Add a tile to the dirty list, or fold the list into "all" when it would
 /// overflow [`MAX_DIRTY_LIST`].
@@ -440,12 +436,10 @@ impl TileRenderer {
             dirty_all: false,
             flushes: 0,
             last_flush_us: 0,
-            #[cfg(not(target_arch = "wasm32"))]
             decode_errors: Vec::new(),
-            #[cfg(not(target_arch = "wasm32"))]
             collect_decode_errors: false,
-            #[cfg(not(target_arch = "wasm32"))]
             palrle_tiles: Vec::new(),
+            errors_rb: crate::errors_readback::ErrorsReadback::new(),
         })
     }
 
@@ -1080,8 +1074,7 @@ impl TileRenderer {
     }
 
     /// Enable (or disable) reading the PalRle error slots back after each
-    /// flush. Native only: the readback blocks on the device.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// flush. On wasm32 the readback is asynchronous: errors arrive on a later flush.
     pub fn set_collect_decode_errors(&mut self, on: bool) {
         self.collect_decode_errors = on;
     }
@@ -1091,8 +1084,8 @@ impl TileRenderer {
     /// The shader validates PalRle payloads on the device (an index past the
     /// palette count, say), so only the readback after the decode can tell.
     /// The caller is expected to relay these as DECODE_ERROR feedback.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn take_decode_errors(&mut self) -> Vec<GpuDecodeError> {
+        self.collect_finished_errors();
         std::mem::take(&mut self.decode_errors)
     }
     /// Submit all batched work, in one submit, and report what changed.
@@ -1210,50 +1203,78 @@ impl TileRenderer {
         recorded |= self
             .palrle
             .encode(device, queue, encoder, &self.fb, &palrle_batch);
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.palrle_tiles = palrle_batch.iter().map(|&(tx, ty, ..)| (tx, ty)).collect();
-        }
+        self.palrle_tiles = palrle_batch.iter().map(|&(tx, ty, ..)| (tx, ty)).collect();
         recorded |= self.encode_pending_rgba(device, queue, encoder, slots);
         recorded
     }
 
+    /// Record error slots as [`GpuDecodeError`]s, bounded like the native path
+    /// always was: a hostile stream of bad tiles must not grow the list
+    /// without limit between two drains.
+    fn push_decode_errors(&mut self, found: impl IntoIterator<Item = (u8, u8, u32)>) {
+        for (tile_x, tile_y, code) in found {
+            let Some(code) = decode_error_code(code) else {
+                tracing::warn!(code, tile_x, tile_y, "unknown GPU palrle error code");
+                continue;
+            };
+            if self.decode_errors.len() < MAX_PENDING_DECODE_ERRORS {
+                self.decode_errors.push(GpuDecodeError {
+                    codec: Codec::PalRle,
+                    tile_x,
+                    tile_y,
+                    code,
+                });
+            }
+        }
+    }
+
+    /// Move a finished non-blocking readback (if any) into the decode-error
+    /// list. Called by `finish_flush` and by [`TileRenderer::take_decode_errors`]:
+    /// the second matters on a static screen, where no flush follows the map
+    /// callback and the result would otherwise sit in `errors_rb` for ever.
+    fn collect_finished_errors(&mut self) {
+        if let Some(done) = self.errors_rb.take() {
+            match done {
+                Ok(found) => self.push_decode_errors(found),
+                Err(e) => tracing::warn!(error = %e, "PalRLE errors readback failed"),
+            }
+        }
+    }
+
+    /// Whether a PalRLE errors readback is in flight or finished and not yet
+    /// taken. A caller's idle skip must not skip a tick while this is true.
+    pub fn errors_readback_pending(&self) -> bool {
+        self.errors_rb.pending()
+    }
+
     /// What follows a submit of [`TileRenderer::record`]'s encoder: the opt-in
-    /// PalRle error readback (native only), and the flush count.
+    /// PalRle error readback (blocking natively, asynchronous on wasm32), and the flush count.
     /// [`TileRenderer::flush`] does it for you.
     pub fn finish_flush(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Result<(), GpuError> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let tiles = std::mem::take(&mut self.palrle_tiles);
-            if !tiles.is_empty() && self.collect_decode_errors {
+        let tiles = std::mem::take(&mut self.palrle_tiles);
+        if !tiles.is_empty() && self.collect_decode_errors {
+            // Native waits for the device; the browser cannot, so it copies the
+            // error slots into a staging buffer only if no readback holds it
+            // and collects the result on a later flush (`errors_rb`).
+            #[cfg(not(target_arch = "wasm32"))]
+            {
                 let errors = self.palrle.take_errors(device, queue)?;
-                for (i, code) in errors {
-                    let Some(&(tile_x, tile_y)) = tiles.get(i as usize) else {
-                        continue;
-                    };
-                    let Some(code) = decode_error_code(code) else {
-                        tracing::warn!(code, tile_x, tile_y, "unknown GPU palrle error code");
-                        continue;
-                    };
-                    // Bounded: a hostile stream of bad tiles must not grow
-                    // this without limit between two drains.
-                    if self.decode_errors.len() < MAX_PENDING_DECODE_ERRORS {
-                        self.decode_errors.push(GpuDecodeError {
-                            codec: Codec::PalRle,
-                            tile_x,
-                            tile_y,
-                            code,
-                        });
-                    }
-                }
+                let found: Vec<(u8, u8, u32)> = errors
+                    .into_iter()
+                    .filter_map(|(i, code)| tiles.get(i as usize).map(|&(x, y)| (x, y, code)))
+                    .collect();
+                self.push_decode_errors(found);
             }
+            #[cfg(target_arch = "wasm32")]
+            self.palrle
+                .start_errors_readback(device, queue, tiles, &self.errors_rb);
         }
-        #[cfg(target_arch = "wasm32")]
-        let _ = (device, queue);
+        // Readbacks that finished since the last flush (none natively).
+        self.collect_finished_errors();
         self.flushes = self.flushes.saturating_add(1);
         Ok(())
     }

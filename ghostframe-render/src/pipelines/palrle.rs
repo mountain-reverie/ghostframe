@@ -345,4 +345,59 @@ impl PalRlePipeline {
 
         Ok(result)
     }
+
+    /// The non-blocking counterpart of [`PalRlePipeline::take_errors`], for
+    /// targets that cannot wait on the device. Copies the first
+    /// `tiles.len()` error slots into the staging buffer and starts the map;
+    /// the result is published to `rb` when the map completes. Does nothing
+    /// when `rb` says a readback still holds the staging buffer.
+    pub fn start_errors_readback(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tiles: Vec<(u8, u8)>,
+        rb: &crate::errors_readback::ErrorsReadback,
+    ) {
+        let (Some(errors_buffer), Some(staging)) =
+            (self.errors_buffer.as_ref(), self.errors_staging.as_ref())
+        else {
+            return;
+        };
+        let read_bytes = tiles.len() as u64 * ERROR_STRIDE;
+        if read_bytes == 0 || !rb.try_begin(tiles) {
+            return;
+        }
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("ghostframe-palrle-errors-readback"),
+        });
+        encoder.copy_buffer_to_buffer(errors_buffer, 0, staging, 0, read_bytes);
+        crate::submit::submit(queue, encoder);
+
+        let staging = staging.clone();
+        let for_map = staging.clone();
+        let rb = rb.clone();
+        for_map
+            .slice(0..read_bytes)
+            .map_async(wgpu::MapMode::Read, move |r| {
+                let words = match r {
+                    Ok(()) => {
+                        let words = {
+                            let view = staging.slice(0..read_bytes).get_mapped_range();
+                            view.map(|v| {
+                                v.chunks_exact(ERROR_STRIDE as usize)
+                                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                    .collect::<Vec<u32>>()
+                            })
+                            .map_err(|e| format!("get_mapped_range: {e}"))
+                        };
+                        // Unmap BEFORE publishing: `complete` is what lets the
+                        // next tick copy into this buffer again.
+                        staging.unmap();
+                        words
+                    }
+                    Err(e) => Err(format!("map: {e}")),
+                };
+                rb.complete(words);
+            });
+    }
 }

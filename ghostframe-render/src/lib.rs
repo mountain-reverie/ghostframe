@@ -17,6 +17,7 @@
 
 pub mod coalesce;
 pub mod dirty;
+pub mod errors_readback;
 pub mod framebuffer;
 pub(crate) mod paint_order;
 pub mod pipelines;
@@ -27,11 +28,9 @@ pub mod tile_renderer;
 #[cfg(test)]
 mod noop_device;
 
-#[cfg(not(target_arch = "wasm32"))]
-pub use tile_renderer::GpuDecodeError;
 pub use tile_renderer::{
-    dimensions_valid, tile_grid, DebugState, DebugTile, FlushReport, NoSlots, SlotSink, SlotTile,
-    TileRenderer,
+    dimensions_valid, tile_grid, DebugState, DebugTile, FlushReport, GpuDecodeError, NoSlots,
+    SlotSink, SlotTile, TileRenderer,
 };
 
 use thiserror::Error;
