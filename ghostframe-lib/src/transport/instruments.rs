@@ -567,7 +567,7 @@ pub fn row_cause_name(i: usize) -> &'static str {
     ["initial", "request", "pto", "t_lr", "other"][i]
 }
 
-/// Where the repair bytes of a run went (R6-e2 TB0), measurement only. Rows
+/// Where the repair bytes of a run went (measurement only). Rows
 /// and wire bytes are counted when a row is sent, by cause; the planned rows
 /// are split further into what a symbol of average length would cost, the
 /// padding to the block's longest symbol, and the headers.
@@ -711,7 +711,7 @@ pub struct InstrumentSummary {
     pub ledger_spurious_lost_records: u64,
     pub k_pkt: u64,
     pub k_pkt_raises: u64,
-    /// FEC blocks, receive side (R6-d D5): hand-offs to ARQ (and the share
+    /// FEC blocks, receive side: hand-offs to ARQ (and the share
     /// queued), REPAIR_REQUEST entries served and rows sent, DECLINED blocks
     /// handled, RECOVERED ids and DECLINED records received, requests
     /// received, the H.264 content-lost actions executed, and the `T_lr` counts.

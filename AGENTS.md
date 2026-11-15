@@ -560,8 +560,10 @@ served at least one row for: it measures the request round, so the closed-loop
 trim (`DeclinedTrim`: +1 to `r` above 1 % declined of the last 256 closes,
 off below 0.5 %) does not count it. `closed_declined` includes both;
 `closed_declined_late` is the subset. A genuine `r` shortfall after a served
-request lands in `Late` too. There is no `late_rows` counter: read the served
-rows from `block_request_rows_sent`.
+request lands in `Late` too. The server has no `late_rows` counter: read the served
+rows from `block_request_rows_sent`. (The client's `BlockStats::late_rows`,
+`ghostframe-client-core/src/fec_rx/blocks.rs`, is a different thing: blocks whose first repair row
+arrived after their block was given up.)
 
 **Accounting.** Every repair row (close, REPAIR_REQUEST, PTO, T_lr) is recorded
 in the ledger and added to the offered bytes (`offered_repair_B`), or

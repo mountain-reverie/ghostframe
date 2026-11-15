@@ -652,7 +652,9 @@ impl ClientCore {
         crate::cdf53_coverage::summarize(self.cdf53_coverage.values(), MAX_TAIL_SWEEP_ATTEMPTS)
     }
 
-    /// Protocol datagrams accepted so far as `(tile, frame)`.
+    /// Protocol records accepted so far as `(tile, frame)`. With FEC framing
+    /// on a count is of records, not wire datagrams: one bundle can carry
+    /// several, and a record rebuilt from repair symbols counts too.
     ///
     /// The split is the one `handle_datagram` actually dispatches on, so the
     /// counts cannot disagree with the path a datagram took. Deliberately
