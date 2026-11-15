@@ -817,7 +817,7 @@ impl ClientCore {
         }
         self.tail_sweep(now_us);
         if now_us >= self.stats.next_local_sample_us() {
-            self.stats.sample_local(now_us, self.wire_loss.stats());
+            self.stats.sample_local(now_us, self.fec.wire_loss_stats());
         }
         if now_us >= self.next_feedback_us {
             let msg = self.loss_tracker.encode_feedback(now_us);
