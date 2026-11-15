@@ -358,10 +358,20 @@ Client-side diagnostics are printed by the browser console. **Some of them are
 dead**: `rx{...}` and `cdf53-coverage` read `window.__tileCounts` /
 `window.__cdf53Coverage`, which nothing populates since the wasm cutover, so
 they always read zero. `fec-coverage` says `n/a(wasm-internal)` explicitly.
-`Δdrain` and `nack_sent` are live. Do not diagnose from the dead ones.
+`Δdrain` (events applied to the renderer in the window, per codec: counted by `main.ts` from the core's slim records) and `nack_sent` are live. Do not diagnose from the dead ones.
 `window.__ghostframeStatsSamples` and `window.__ghostframeStatsFrames` (e2e
 pages only) are live: the server stats samples the core applied, and every
 server-stream frame it received; both move only while the stats panel is open.
+
+The browser renderer is Rust (`WebRenderer`, `ghostframe-client-wasm/src/web/`);
+the page URL steers it: `?cdf53=cpu` decodes CDF 5/3 on the CPU without trying
+the grid (the e2e run that proves the fallback:
+`GHOSTFRAME_E2E_URL_QUERY_EXTRA='&cdf53=cpu' cargo test --test e2e
+e2e_lossless_golden_png -- --exact`). Under `?e2e`,
+`window.__ghostframePaintUs()` returns `[count, p50, p99, max]` microseconds of
+the painted ticks since the last call. The console line `CDF 5/3 decode on the
+GPU (self-test passed ...)` or `... failed; decoding on the CPU` says which path
+a session took.
 
 The frame mode follows the bandwidth estimate: `mode.decision` reasons
 `bandwidth_short` (the tile codec's first pass stayed above 0.70 x the
