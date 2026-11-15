@@ -103,5 +103,16 @@ jobs:
       # Every test file of the crate runs (no --test list to forget): the
       # WebRenderer needs a WebGPU adapter, which webdriver.json asks Chrome
       # to provide in software.
+      #
+      # Skipped here only: the three tests that draw an H.264 VideoFrame. On a
+      # runner with no GPU, Chrome's importExternalTexture makes an invalid
+      # texture (the first WebGPU error is inside the import), and the page's
+      # later readbacks then fail too. They run on every developer machine
+      # with a GPU (`just test-web-renderer`), and the H.264 e2e scenes cover
+      # the same path in a real browser.
       - name: WebRenderer browser tests
-        run: wasm-pack test --headless --chrome ghostframe-client-wasm
+        run: >-
+          wasm-pack test --headless --chrome ghostframe-client-wasm --
+          --skip tiles_and_pictures_are_ordered_by_frame_seq_and_the_queue
+          --skip cdf53_work_under_a_picture_is_cancelled_and_not_left_pending
+          --skip a_picture_that_fails_to_import_is_reported_and_cancels_nothing
