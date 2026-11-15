@@ -9,6 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use ghostframe_client_core::cdf53_coverage::frame_seq_is_newer;
 use ghostframe_client_core::Event;
 use ghostframe_render::TileRenderer;
 use js_sys::{Array, Promise, Reflect, Uint8Array};
@@ -290,8 +291,10 @@ impl WebRenderer {
             self.canvas.set_width(width);
             self.canvas.set_height(height);
         }
+        // The tile renderer's framebuffer is already the new one: point the
+        // blit at it before configuring the surface, so a failed configure
+        // (retried by `present_frame`) never leaves a view of the old texture.
         self.size = Some((width, height));
-        self.configure_surface()?;
         self.fb_view = Some(
             self.tiles
                 .framebuffer()
@@ -299,7 +302,7 @@ impl WebRenderer {
         );
         self.fb_epoch += 1;
         self.dirty = true;
-        Ok(())
+        self.configure_surface()
     }
 
     /// Run one rAF's worth of painting. `Err` is only a present failure (the
@@ -376,20 +379,25 @@ impl WebRenderer {
         }
         let pending = std::mem::take(&mut self.pending_h264);
         let mut kept: Vec<JsValue> = Vec::new();
+        let mut kept_seqs: Vec<u32> = Vec::new();
+        // The newest picture kept this tick: a second, older picture of the
+        // same tick is judged against it as well as against the ledger.
+        let mut newest_kept: Option<u32> = None;
         let mut dropped = 0u32;
         let mut drawn = 0u32;
         for p in &pending {
             // Older than a picture already drawn, or than any tile painted or
             // queued: it covers the whole screen, so drawing it would undo a
             // newer paint. It is closed with the rest, not drawn.
-            if self.tiles.h264_stale(p.seq) {
+            if self.tiles.h264_stale(p.seq)
+                || newest_kept.is_some_and(|n| frame_seq_is_newer(n, p.seq))
+            {
                 dropped += 1;
                 continue;
             }
-            // Noted before the draw is encoded so a second, older picture of
-            // this tick is judged against it; also cancels older CDF 5/3 work.
-            self.tiles.note_h264(p.seq);
+            newest_kept = Some(p.seq);
             kept.push(p.frame.clone());
+            kept_seqs.push(p.seq);
         }
         if let (Some(h264), Some((w, h)), false) = (self.h264.as_ref(), self.size, kept.is_empty())
         {
@@ -402,8 +410,14 @@ impl WebRenderer {
                     // A frame that failed to import is skipped and the others
                     // are still drawn: only those count, so a partial failure
                     // still presents what was drawn.
-                    let (n, failure) = h264.draw(&raw_view, w, h, &kept);
-                    drawn = n;
+                    let (drawn_idx, failure) = h264.draw(&raw_view, w, h, &kept);
+                    drawn = drawn_idx.len() as u32;
+                    // Only a picture actually drawn goes in the ledger: noting
+                    // it cancels the CDF 5/3 work held under it, which a
+                    // picture that failed to import does not cover.
+                    for i in drawn_idx {
+                        self.tiles.note_h264(kept_seqs[i]);
+                    }
                     if let Some(e) = failure {
                         self.errors.push(format!("h264: {e}"));
                     }

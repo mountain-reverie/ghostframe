@@ -13,9 +13,9 @@ layer and the `ghostframe-client-wasm` crate are live in the tree, but
 independent, not additive.
 
 Since the stats panel it has one gate: `ci/check-wasm-size.sh` fails the
-build when the wasm exceeds 512 KiB (see the last section). The measurements
-in sections 1 to 3 and the 2026-09-11 and 2026-09-12 sections have no
-assertion attached; only the wasm limit in the last section does.
+build when the wasm exceeds 800 KiB, 819,200 bytes (see the 2026-11-14
+section). The measurements in sections 1 to 3 and the 2026-09-11 and
+2026-09-12 sections have no assertion attached; only that wasm limit does.
 
 ## 1. Current bundle (TypeScript only)
 
