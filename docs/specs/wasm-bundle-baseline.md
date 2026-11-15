@@ -324,7 +324,9 @@ Measured with `just build-web` on the branch and on master at bcc59e03
 Gzip is `gzip -c` of the file (default level); the PR 2 row from the standalone
 wasm-pack build is 783983 raw, 304649 gzip.
 
-The 512 KiB (524,288 byte) cap in `ci/check-wasm-size.sh` is NOT changed by this
-PR. The branch is 259,695 bytes (49.5%) over it, and none of the measured
-levers closes more than 14,116 bytes (`opt-level = "s"` on wgpu even grows it).
-Owner decision pending the owner.
+The branch was 259,695 bytes (49.5%) over the 512 KiB cap, and none of the
+measured levers closes more than 14,116 bytes (`opt-level = "s"` on wgpu even
+grows it). Owner decision 2026-11-14: the cap in `ci/check-wasm-size.sh` is
+raised to 819,200 bytes (800 KiB) raw, about 4% headroom over 783,983, with no
+size-only code changes. The extra weight is wgpu's WebGPU backend and the shared
+renderer; naga is not linked.

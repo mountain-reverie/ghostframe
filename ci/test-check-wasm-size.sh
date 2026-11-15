@@ -7,7 +7,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 guard=ci/check-wasm-size.sh
-limit=524288
+limit=819200
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 fail=0
@@ -39,7 +39,7 @@ expect "exactly the limit passes" 0 "$tmp/at"
 mk "$tmp/over1" a.wasm $((limit + 1))
 expect "one byte over fails" 1 "$tmp/over1"
 
-mk "$tmp/over" a.wasm 600000
+mk "$tmp/over" a.wasm $((limit + 100000))
 expect "600 KB fails" 1 "$tmp/over"
 
 mkdir -p "$tmp/empty"
@@ -50,10 +50,10 @@ expect "only a .js file fails (no wasm found)" 1 "$tmp/js_only"
 
 # Both orders, so a first-only or a last-only guard is caught.
 mk "$tmp/two" a_small.wasm 1000
-mk "$tmp/two" z_big.wasm 600000
+mk "$tmp/two" z_big.wasm $((limit + 100000))
 expect "a small wasm does not hide a big one (big sorts last)" 1 "$tmp/two"
 
-mk "$tmp/two_rev" a_big.wasm 600000
+mk "$tmp/two_rev" a_big.wasm $((limit + 100000))
 mk "$tmp/two_rev" z_small.wasm 1000
 expect "a small wasm does not hide a big one (big sorts first)" 1 "$tmp/two_rev"
 
