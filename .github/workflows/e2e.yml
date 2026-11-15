@@ -67,11 +67,10 @@ jobs:
       # every developer machine via `cargo test -p ghostframe-client-gpu`,
       # which is the point -- an #[ignore] would hide them locally too.
       #
-      # --lib matters here beyond cdf53_passes: it is what
-      # picks up two #[cfg(test)] modules declared in src/lib.rs.
+      # --lib matters here: it is what picks up two #[cfg(test)] modules declared in src/lib.rs.
       # shader_validation needs no GPU -- it walks shaders/client/*.wgsl and
       # runs naga parse+validate -- so it actually runs in this job on every
-      # push, and is the only place any of the 11 client shaders gets parsed
+      # push, and is the only place any of the client shaders gets parsed
       # at all (naga only sees a shader at create_shader_module time, which
       # a GPU-less runner never calls). nv12_oracle_tests needs a GPU and
       # self-skips here, same as the five named targets above. Do not
