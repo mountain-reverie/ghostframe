@@ -110,6 +110,18 @@ jobs:
       # later readbacks then fail too. They run on every developer machine
       # with a GPU (`just test-web-renderer`), and the H.264 e2e scenes cover
       # the same path in a real browser.
+      # TEMPORARY diagnostics: Chrome's own log (GPU process included) is
+      # printed under "driver stdout" when the runner fails.
+      - name: Chrome logging for the browser tests (temporary)
+        run: |
+          google-chrome --version
+          python3 - <<'PY'
+          import json
+          p = 'ghostframe-client-wasm/webdriver.json'
+          d = json.load(open(p))
+          d['goog:chromeOptions']['args'] += ['--enable-logging=stderr', '--v=0']
+          json.dump(d, open(p, 'w'), indent=2)
+          PY
       - name: WebRenderer browser tests
         run: >-
           wasm-pack test --headless --chrome ghostframe-client-wasm --
