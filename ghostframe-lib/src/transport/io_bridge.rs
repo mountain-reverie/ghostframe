@@ -72,10 +72,10 @@ use session::{
     HELLO_DEADLINE, TAKEOVER_MIN_INTERVAL,
 };
 
-#[path = "io_bridge/stats_service.rs"]
-mod stats_service;
 #[path = "io_bridge/bundle_tx.rs"]
 mod bundle_tx;
+#[path = "io_bridge/stats_service.rs"]
+mod stats_service;
 
 #[path = "io_bridge/block_tx.rs"]
 mod block_tx;
