@@ -20,6 +20,9 @@ async fn the_browser_hands_wgpu_an_adapter_and_a_device() {
         .request_device(&wgpu::DeviceDescriptor::default())
         .await
         .expect("request_device");
-    assert!(device.as_webgpu().is_some(), "not the browser WebGPU backend");
+    assert!(
+        device.as_webgpu().is_some(),
+        "not the browser WebGPU backend"
+    );
     assert!(queue.as_webgpu().is_some());
 }
