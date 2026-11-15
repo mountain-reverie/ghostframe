@@ -377,7 +377,7 @@ impl WebRenderer {
         let pending = std::mem::take(&mut self.pending_h264);
         let mut kept: Vec<JsValue> = Vec::new();
         let mut dropped = 0u32;
-        let mut drew = true;
+        let mut drawn = 0u32;
         for p in &pending {
             // Older than a picture already drawn, or than any tile painted or
             // queued: it covers the whole screen, so drawing it would undo a
@@ -399,9 +399,13 @@ impl WebRenderer {
                 .create_view(&wgpu::TextureViewDescriptor::default());
             match raw::raw_view(&view) {
                 Ok(raw_view) => {
-                    if let Err(e) = h264.draw(&raw_view, w, h, &kept) {
+                    // A frame that failed to import is skipped and the others
+                    // are still drawn: only those count, so a partial failure
+                    // still presents what was drawn.
+                    let (n, failure) = h264.draw(&raw_view, w, h, &kept);
+                    drawn = n;
+                    if let Some(e) = failure {
                         self.errors.push(format!("h264: {e}"));
-                        drew = false;
                     }
                 }
                 Err(e) => self.errors.push(format!("h264: {e}")),
@@ -411,7 +415,7 @@ impl WebRenderer {
         for p in &pending {
             raw::close_frame(&p.frame);
         }
-        (if drew { kept.len() as u32 } else { 0 }, dropped)
+        (drawn, dropped)
     }
 
     #[allow(
