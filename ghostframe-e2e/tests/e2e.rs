@@ -5493,3 +5493,107 @@ async fn e2e_tailnet_listed_user_is_admitted() -> Result<()> {
     assert!(!p.server_logs.contains("refused tailnet peer"));
     Ok(())
 }
+
+/// Section 7 bench of the all-Rust web client spec. On demand, once per label
+/// and mode:
+///
+///   GF_BENCH_MODE=4096x2160 GF_BENCH_SECS=30 \
+///     cargo test --test e2e e2e_bench_web_paint_us -- --ignored --exact --nocapture
+///
+/// Prints (1) the spec's `__ghostframe_framePaints` latency, `raf - first
+/// receipt` per frame, from the two globals `codec_report` reads (so it works
+/// at any screen size), (2) the CPU time of the whole rAF tick
+/// (`__ghostframeTickUs`) and (3) the paint step alone (`__ghostframePaintUs`),
+/// each as [count, p50, p99, max]. The run includes the start-up burst, a
+/// whole-screen CDF 5/3 repaint.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "bench: run on demand, see the doc comment"]
+async fn e2e_bench_web_paint_us() -> Result<()> {
+    let mode = std::env::var("GF_BENCH_MODE").unwrap_or_else(|_| "1920x1080".to_string());
+    let secs: u64 = std::env::var("GF_BENCH_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--gradient --x11-sink",
+        &[
+            ("GHOSTFRAME_ENABLE_CDF53", "1"),
+            ("GHOSTFRAME_FORCE_TILECODEC", "1"),
+            ("GHOSTFRAME_DRM_MODE", &mode),
+            ("CAPTURE_FPS", "30"),
+        ],
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(secs)).await;
+
+    let stats = |name: &'static str| {
+        let js = format!("window.{name} ? window.{name}() : null");
+        let page = setup.page();
+        async move {
+            page.evaluate(js)
+                .await?
+                .into_value::<Vec<f64>>()
+                .map_err(anyhow::Error::from)
+        }
+    };
+    let tick = stats("__ghostframeTickUs").await?;
+    let paint = stats("__ghostframePaintUs").await?;
+
+    // The spec's metric, computed the way scene.rs's read_client_diagnostics does.
+    let tiles_json: String = setup
+        .page()
+        .evaluate("JSON.stringify(window.__ghostframeRecordedTiles || [])")
+        .await?
+        .into_value()?;
+    let paints_json: String = setup
+        .page()
+        .evaluate("JSON.stringify(window.__ghostframe_framePaints || [])")
+        .await?
+        .into_value()?;
+    let tiles: Vec<serde_json::Value> = serde_json::from_str(&tiles_json)?;
+    let paints: Vec<serde_json::Value> = serde_json::from_str(&paints_json)?;
+    let mut first_recv = std::collections::BTreeMap::<u64, f64>::new();
+    for t in &tiles {
+        let (Some(seq), Some(v)) = (t["seq"].as_u64(), t["firstRecvMsClient"].as_f64()) else {
+            continue;
+        };
+        let e = first_recv.entry(seq).or_insert(f64::INFINITY);
+        if v < *e {
+            *e = v;
+        }
+    }
+    let mut lat: Vec<f64> = paints
+        .iter()
+        .filter_map(|p| {
+            let (seq, raf) = (p["seq"].as_u64()?, p["rafMsClient"].as_f64()?);
+            let f = *first_recv.get(&seq)?;
+            (f > 0.0 && raf >= f).then_some((raf - f) * 1000.0)
+        })
+        .collect();
+    lat.sort_by(|a, b| a.total_cmp(b));
+    let at = |q: f64| {
+        lat.get(((lat.len() as f64 - 1.0) * q).round() as usize)
+            .copied()
+            .unwrap_or(0.0)
+    };
+    eprintln!(
+        "BENCH mode={mode} framePaints_us count={} p50={} p99={}",
+        lat.len(),
+        at(0.5),
+        at(0.99)
+    );
+    eprintln!(
+        "BENCH mode={mode} tick_us count={} p50={} p99={} max={}",
+        tick[0], tick[1], tick[2], tick[3]
+    );
+    eprintln!(
+        "BENCH mode={mode} paint_step_us count={} p50={} p99={} max={}",
+        paint[0], paint[1], paint[2], paint[3]
+    );
+    assert!(
+        tick[0] > 0.0 && !lat.is_empty(),
+        "the bench observed nothing: tick {tick:?}, {} frame latencies",
+        lat.len()
+    );
+    Ok(())
+}
