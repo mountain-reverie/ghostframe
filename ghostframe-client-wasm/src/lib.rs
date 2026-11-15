@@ -37,6 +37,7 @@ pub mod core;
 pub mod input;
 pub mod panel;
 pub mod units;
+pub mod web;
 
 /// Hash of the `client-core` + `protocol` sources this module was built
 /// from. See `build.rs`; asserted against the workspace by
