@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Inbound FEC v2 rev 6 feedback that is not an acknowledgement: LOSS_REPORT
 //! and REPAIR_REQUEST datagrams, and the repair-status stream's records
-//! (RECOVERED, CONTENT_REJECTED, DECLINED). Plan decisions 7-9 of
-//! `docs/superpowers/plans/2026-11-10-fec-v2-rev6-r6c.md`.
+//! (RECOVERED, CONTENT_REJECTED, DECLINED); see
+//! `docs/specs/fec-v2/fec-v2-rev6.md`.
 //!
-//! No block is ever sent in R6-c, so RECOVERED and DECLINED cannot occur from a
-//! correct client; they are implemented and unit-tested anyway.
+//! RECOVERED and DECLINED arrive from a client that rebuilt or gave up on a
+//! block; the block table (`fec_tx::block_table`) consumes them.
 //!
 //! Must not: resolve a transmission in the ledger. Only an ACK does that
 //! (`ack_dispatch`); a RECOVERED report releases content and nothing else.
@@ -245,6 +245,10 @@ impl IoBridge {
                 self.fec_in.content_rejected_tile += 1;
                 self.cancel_in_flight_for_tile(key.tile_x, key.tile_y);
                 self.ensure_baseline_invalidated();
+                // The whole baseline is gone: the repaint is not demand
+                // (as on the oversize path, `retire_oversize_contents`).
+                let now_us = now_std().duration_since(self.epoch).as_micros() as u64;
+                self.classifier.note_repaint(now_us);
             }
             Content::H264Frag { frame_seq, .. } => {
                 if self.h264_refs_content_rejected(frame_seq, now_std()) {
