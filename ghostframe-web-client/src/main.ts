@@ -171,9 +171,10 @@ async function main() {
 
   // Construct the wasm protocol core. We hard-require WebGPU, so
   // indices_raw_enabled is unconditionally true. supports_h264 reflects the
-  // result of the renderer's startup probe (probeH264 in
-  // webgpu/renderer.ts): true on Chrome/Chromium where texture_external +
-  // WebCodecs are available, false on Firefox where Naga currently rejects
+  // result of the renderer's startup probe (H264Blit::probe in
+  // ghostframe-client-wasm/src/web/renderer.rs, run by WebRenderer.create):
+  // true on Chrome/Chromium where texture_external + WebCodecs are
+  // available, false on Firefox where Naga currently rejects
   // the h264_blit shader for lack of TEXTURE_EXTERNAL capability. The server
   // uses this to gate FrameMode::H264 selection so Firefox never receives
   // unplayable H.264 frames.

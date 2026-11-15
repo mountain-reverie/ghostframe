@@ -576,7 +576,7 @@ fn palrle_in_decoded_mode_is_unchanged() {
 
 /// Payload mode must keep every protocol side effect of a Cdf53 pass —
 /// prevalidation, coverage, and the deferred ACK — and drop only the CPU
-/// accumulation, which the GPU does instead in cdf53_integrate.wgsl.
+/// accumulation, which the GPU does instead in cdf53_reconstruct.wgsl.
 ///
 /// The ACK is the one worth guarding hardest: without it the server
 /// retransmits this pass indefinitely and nothing client-side looks wrong.
@@ -589,7 +589,7 @@ fn cdf53_in_payload_mode_keeps_the_ack_and_skips_integrate() {
     // Previously this only checked that a Cdf53-coded TilePayload existed.
     // The prevalidated bit_planes are now directly on the event, so assert
     // their shape too (384 bytes: 3 channels x 128) — the exact product
-    // cdf53_integrate.wgsl consumes. Strengthened, not relocated.
+    // the GPU grid (cdf53_reconstruct.wgsl) consumes. Strengthened, not relocated.
     let cdf53_payloads: Vec<_> = events
         .iter()
         .filter_map(|e| match e {

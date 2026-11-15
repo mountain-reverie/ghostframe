@@ -517,7 +517,8 @@ impl ClientCore {
                 match result {
                     Ok(pre) => {
                         // No accumulation here: the pixel decode (CPU
-                        // `TileDecoder` or cdf53_integrate.wgsl) does it.
+                        // `TileDecoder` or the GPU grid in
+                        // shaders/client/cdf53_reconstruct.wgsl) does it.
                         //
                         // `new_generation`: the pixel decode keys its
                         // accumulation on the 4-bit generation alone, so it

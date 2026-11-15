@@ -30,11 +30,13 @@
 //! `gpu_model_coefficients` mirrors three pieces of shipped client code and
 //! must be kept in step with them:
 //!
-//! - bit placement: `cdf53_integrate.wgsl`, `bit_pos = 13u - pass_idx`, and
-//!   `pass_idx == 0` routed to the sign buffer.
-//! - K: `Cdf53Pipeline.uploadBatch`, `candidate = e.passIdx + 1` kept as a
-//!   running max, reset to 0 on a generation change.
-//! - midpoint: `cdf53_inverse_l3.wgsl`'s `read_coeff` --
+//! - bit placement: `shaders/client/cdf53_reconstruct.wgsl` (the grid),
+//!   `bit_pos = 13u - pass_idx`, and `pass_idx == 0` routed to the sign
+//!   buffer.
+//! - K: the per-tile pass prefix kept by `ghostframe-render`'s
+//!   `pipelines/cdf53_state.rs` (`candidate = e.passIdx + 1` kept as a
+//!   running max, reset to 0 on a generation change).
+//! - midpoint: `cdf53_reconstruct.wgsl`'s `read_coeff` --
 //!   `if (raw_mag != 0 && passes >= 2u && passes < 14u) { mag = raw_mag +
 //!   (1 << (14 - passes - 1)) }`.
 
