@@ -23,9 +23,6 @@
 //! ([`ClosedBlock`]); it uses no packer types. Source records are
 //! `(wire_seq, Content)` pairs.
 
-// Unused until D4b wires the table into the IoBridge.
-#![allow(dead_code)]
-
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
