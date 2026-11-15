@@ -293,7 +293,7 @@ impl WebRenderer {
         }
         // The tile renderer's framebuffer is already the new one: point the
         // blit at it before configuring the surface, so a failed configure
-        // (retried by `present_frame`) never leaves a view of the old texture.
+        // (retried by `present_frame` on every tick) never leaves a view of the old texture.
         self.size = Some((width, height));
         self.fb_view = Some(
             self.tiles
@@ -444,7 +444,15 @@ impl WebRenderer {
                 self.configure_surface()?;
                 return Err("canvas surface was outdated; reconfigured".into());
             }
-            other => return Err(format!("get_current_texture: {other:?}")),
+            other => {
+                // Also the way back from a configure that failed in `resize`:
+                // the canvas is unconfigured, so try again on every tick.
+                let configured = self.configure_surface();
+                return Err(match configured {
+                    Ok(()) => format!("get_current_texture: {other:?}; reconfigured"),
+                    Err(e) => format!("get_current_texture: {other:?}; configure: {e}"),
+                });
+            }
         };
         let target = frame
             .texture
