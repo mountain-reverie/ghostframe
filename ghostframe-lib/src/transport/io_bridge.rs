@@ -954,7 +954,7 @@ pub struct IoBridge {
     /// framing on `record_emitted_transmissions` fills this instead of the
     /// ledger (the ledger is keyed by bundle).
     emitted_meta: HashMap<u32, crate::transport::reliable_emitter::emitter::EmittedDatagram>,
-    /// Server-side block state; empty with the knob off.
+    /// Server-side block state; empty with FEC off.
     block_table: crate::transport::fec_tx::block_table::BlockTable,
     /// The adaptive controller (`FecMode::Adaptive` only).
     fec_adapt: Option<crate::transport::fec_tx::adapt::FecAdapt>,
@@ -2250,7 +2250,7 @@ impl IoBridge {
         // backed-off deadline.
         let deferred = self.reliable_emitter.next_deferred_due();
         let stats = self.stats_next_due();
-        // The T close of the open FEC block (none with the knob off).
+        // The T close of the open FEC block (none with FEC off).
         let block_t = self.block_t_deadline();
         // And for a block's `T_lr` repair, deadline release and alarms.
         let block_release = self.block_release_deadline();

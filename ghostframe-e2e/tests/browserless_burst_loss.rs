@@ -39,6 +39,21 @@ use ghostframe_e2e::harness::load_profile::{
 use ghostframe_e2e::harness::scene_tiles::TileSpec;
 use ghostframe_e2e::netsim::{DropPlan, DropRule, GilbertElliott, NetProfile};
 
+/// The same with the FEC control arm. A scene that measures the loss path's own
+/// RTO fires (P4) needs losses nothing else repairs: with the adaptive FEC
+/// the daemon runs, repair rebuilds most of them first (31 fires on seed
+/// 0xb0b057, under the scene's premise of 50), so it runs with FEC off.
+async fn run_browserless_fec_off(
+    scene: BrowserlessScene,
+    links: LinkOverrides,
+) -> anyhow::Result<BrowserlessResult> {
+    let opts = RunOptions {
+        fec_off: true,
+        ..RunOptions::default()
+    };
+    run_browserless_with_options(scene, links, opts).await
+}
+
 const COLS: u32 = 16;
 const ROWS: u32 = 16;
 const RATE: f64 = 0.02;
@@ -989,7 +1004,7 @@ async fn p4_spurious_share_of_loss_path_resends_under_iid_loss() {
     let (mut fired, mut original_first) = (0u64, 0u64);
     for i in 0..5u64 {
         let seed = 0xB0_B057 ^ (i * 0x100);
-        let lossy = run_browserless_with_links(scene(seed, SECS), s2c_only(|p| p.loss = RATE))
+        let lossy = run_browserless_fec_off(scene(seed, SECS), s2c_only(|p| p.loss = RATE))
             .await
             .expect("scene ran");
         let n = format!("iid2%@{seed:#x}");
@@ -1016,7 +1031,7 @@ async fn p4_spurious_share_of_loss_path_resends_under_iid_loss() {
     );
     for i in 0..3u64 {
         let seed = 0xB0_B057 ^ (i * 0x100);
-        let clean = run_browserless_with_links(scene(seed, SECS), LinkOverrides::default())
+        let clean = run_browserless_fec_off(scene(seed, SECS), LinkOverrides::default())
             .await
             .expect("scene ran");
         let n = format!("clean@{seed:#x}");

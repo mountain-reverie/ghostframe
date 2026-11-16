@@ -72,6 +72,19 @@ async fn run_pattern_with(
     .await
 }
 
+/// The control arm for the recovery-path scenes. They assert that the manager
+/// recovers from its anchor after the loss path judged P fragments lost; with
+/// the adaptive FEC the daemon runs, repair rebuilds most of those losses
+/// first (no verdict, nothing to recover), so the recovery path is only
+/// reached with FEC off. Each such scene also runs adaptive, with
+/// `assert_sound` (no wrong picture, alive at the end).
+fn fec_off() -> RunOptions {
+    RunOptions {
+        fec_off: true,
+        ..RunOptions::default()
+    }
+}
+
 fn line(name: &str, seed: u64, r: &BrowserlessResult, o: &H264Outcome) {
     let c = &o.refs;
     println!(
@@ -139,11 +152,19 @@ fn assert_recovers(ctx: &str, secs: u64, r: &BrowserlessResult, o: &H264Outcome)
     assert!(r.h264.stats.verdicts_p_frag > 0, "{ctx}: no verdict");
     assert!(o.never_fed > 0, "{ctx}: no frame was lost for good");
     assert_sound(ctx, secs, r, o);
+    assert_bounded(ctx, o);
+    let c = &o.refs;
+    assert!(c.recoveries >= 1 && c.p_recovery > 0, "{ctx}: {c:?}");
+    assert!(c.recovered + 1 >= c.recoveries, "{ctx}: {c:?}");
+}
+
+/// What holds on a lossy path whether or not FEC repaired the loss: no loss
+/// IDR, frames chained only from frames the client showed, and every freeze
+/// bounded by what the recovery costs.
+fn assert_bounded(ctx: &str, o: &H264Outcome) {
     let c = &o.refs;
     assert_eq!(o.idr_made, 1, "{ctx}: the manager makes no loss IDR");
     assert_eq!(c.idr_session, 1, "{ctx}");
-    assert!(c.recoveries >= 1 && c.p_recovery > 0, "{ctx}: {c:?}");
-    assert!(c.recovered + 1 >= c.recoveries, "{ctx}: {c:?}");
     assert!(
         o.refs_to_undisplayed < o.made / 4,
         "{ctx}: {} of {} frames chained from a frame the client never showed",
@@ -161,6 +182,20 @@ fn assert_recovers(ctx: &str, secs: u64, r: &BrowserlessResult, o: &H264Outcome)
         o.max_gap_us,
         o.longest_lost_run
     );
+}
+
+/// The product's arm (adaptive FEC) of a loss scene: the path dropped frame
+/// datagrams and FEC engaged (it rebuilt something at the client), so the
+/// assertions are not about a lossless run; then everything that holds
+/// whether or not repair left a loss for the manager to recover.
+fn assert_holds_with_fec(ctx: &str, secs: u64, r: &BrowserlessResult, o: &H264Outcome) {
+    assert!(r.s2c_datagrams_dropped > 0, "{ctx}: nothing was dropped");
+    assert!(
+        r.transport.instr.fec_recovered_rx > 0,
+        "{ctx}: FEC rebuilt nothing, so it was not engaged"
+    );
+    assert_sound(ctx, secs, r, o);
+    assert_bounded(ctx, o);
 }
 
 /// A clean stream: one IDR, every frame right, no freeze, candidates confirmed.
@@ -194,9 +229,22 @@ async fn refs_clean_stream_shows_every_frame_right_with_one_idr() {
 async fn refs_scene_1_iid_loss_recovers_from_the_anchor_with_one_idr() {
     for (p, name) in [(0.01, "iid1"), (0.05, "iid5")] {
         for seed in SEEDS {
-            let (r, o) = run_pattern(seed, SECS, Pattern::Iid(p)).await;
+            let (r, o) = run_on(
+                seed,
+                SECS,
+                link_20ms(),
+                Pattern::Iid(p),
+                refs_rated(),
+                DropPlan::default(),
+                fec_off(),
+            )
+            .await;
             line(name, seed, &r, &o);
             assert_recovers(&format!("{name} {seed:#x}"), SECS, &r, &o);
+            // The product: adaptive FEC on the same loss.
+            let (r, o) = run_pattern(seed, SECS, Pattern::Iid(p)).await;
+            line(&format!("{name}-fec"), seed, &r, &o);
+            assert_holds_with_fec(&format!("{name}-fec {seed:#x}"), SECS, &r, &o);
         }
     }
 }
@@ -697,28 +745,50 @@ async fn refs_an_overdriven_link_skips_frames_instead_of_queueing_them() {
 /// books balance) and the estimator keeps learning.
 #[tokio::test(start_paused = true)]
 async fn refs_under_random_loss_the_books_balance() {
-    for seed in SEEDS {
-        let (r, o) = run_pattern(seed, SECS, Pattern::Iid(0.03)).await;
-        line("refs-books", seed, &r, &o);
-        let ctx = format!("refs-books {seed:#x}");
-        let s = &r.h264.stats;
-        // Premises: the network dropped datagrams and the ledger judged some
-        // transmissions lost, acknowledged others.
-        assert!(r.s2c_datagrams_dropped > 20, "{ctx}");
-        assert!(
-            s.tx_judged_lost > 0 && s.tx_acked_live > 100,
-            "{ctx}: {s:?}"
-        );
-        assert_eq!(
-            s.tx_recorded,
-            s.tx_acked_live + s.tx_judged_lost + s.tx_forgotten + r.h264.ledger_records as u64,
-            "{ctx}: {s:?}"
-        );
-        assert!(
-            r.bwe_samples_seen >= s.tx_acked_live / 2,
-            "{ctx}: the estimator stopped learning"
-        );
-        assert_recovers(&ctx, SECS, &r, &o);
+    // The identity must hold in production (adaptive FEC: repair frames are
+    // ledger records but not H.264 transmissions); the recovery assertions
+    // need unrepaired loss, so they run on the FEC-off control arm.
+    for (arm, off) in [("fec", false), ("off", true)] {
+        for seed in SEEDS {
+            let (r, o) = if off {
+                run_on(
+                    seed,
+                    SECS,
+                    link_20ms(),
+                    Pattern::Iid(0.03),
+                    refs_rated(),
+                    DropPlan::default(),
+                    fec_off(),
+                )
+                .await
+            } else {
+                run_pattern(seed, SECS, Pattern::Iid(0.03)).await
+            };
+            line(&format!("refs-books-{arm}"), seed, &r, &o);
+            let ctx = format!("refs-books-{arm} {seed:#x}");
+            let s = &r.h264.stats;
+            // Premises: the network dropped datagrams and the ledger judged some
+            // transmissions lost, acknowledged others.
+            assert!(r.s2c_datagrams_dropped > 20, "{ctx}");
+            assert!(
+                s.tx_judged_lost > 0 && s.tx_acked_live > 100,
+                "{ctx}: {s:?}"
+            );
+            assert_eq!(
+                s.tx_recorded,
+                s.tx_acked_live + s.tx_judged_lost + s.tx_forgotten + r.h264.ledger_records as u64,
+                "{ctx}: {s:?}"
+            );
+            assert!(
+                r.bwe_samples_seen >= s.tx_acked_live / 2,
+                "{ctx}: the estimator stopped learning"
+            );
+            if off {
+                assert_recovers(&ctx, SECS, &r, &o);
+            } else {
+                assert_holds_with_fec(&ctx, SECS, &r, &o);
+            }
+        }
     }
 }
 
@@ -817,11 +887,23 @@ async fn refs_loss_scenes_hold_with_the_rate_policy_on() {
                 pattern,
                 l,
                 DropPlan::default(),
-                RunOptions::default(),
+                fec_off(),
             )
             .await;
             line(name, seed, &r, &o);
             assert_recovers(&format!("{name} {seed:#x}"), SECS, &r, &o);
+            let (r, o) = run_on(
+                seed,
+                SECS,
+                link_20ms(),
+                pattern,
+                l,
+                DropPlan::default(),
+                RunOptions::default(),
+            )
+            .await;
+            line(&format!("{name}-fec"), seed, &r, &o);
+            assert_holds_with_fec(&format!("{name}-fec {seed:#x}"), SECS, &r, &o);
         }
     }
 }
