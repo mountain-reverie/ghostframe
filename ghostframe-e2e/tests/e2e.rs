@@ -4646,7 +4646,7 @@ async fn e2e_ack_telemetry_no_waste() -> Result<()> {
 }
 
 /// End-to-end input forwarding: browser dispatches synthetic DOM events
-/// on the canvas → wire.ts encodes → WebTransport bidi feedback stream
+/// on the canvas → the web client's input listeners (app/input.rs) encode → WebTransport bidi feedback stream
 /// → server reassembles + decodes → IoBridge dispatches to the XTest
 /// injector. Asserts on `input event dispatched` tracing lines from the
 /// server so coverage doesn't depend on a desktop side-channel.
@@ -4664,7 +4664,7 @@ async fn e2e_input_forwarding_body<B: helpers::BrowserSession>(browser: &mut B) 
     use ghostframe_e2e::harness::browser::{KeyEventKind, PointerEventKind};
 
     // Frames are already flowing by the time setup returned; give the
-    // feedback writer + attachInputCapture a moment to finish wiring.
+    // feedback writer + the input listeners (app/input.rs) a moment to finish wiring.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     browser

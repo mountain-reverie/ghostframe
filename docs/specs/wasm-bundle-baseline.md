@@ -62,6 +62,9 @@ These are the protocol modules the wasm crate replaces:
 | `decoder.ts` | 185 | 5,875 |
 | **Total** | **1,147** | **37,245** |
 
+(Historical: `decoder.ts` has since been replaced by
+`ghostframe-client-wasm/src/app/decoder.rs`.)
+
 `decoder.ts` is not purely protocol code: lines 1-134 are wire-format
 decode functions (`decodeDatagramHeader`, `decodeTileHeader`,
 `decodeFrameHeader`, `FullFrameDecoder`'s supporting types), but

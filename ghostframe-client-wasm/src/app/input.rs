@@ -47,6 +47,19 @@ fn listen<E: FromWasmAbi + 'static>(
     closure.forget();
 }
 
+/// `clientX` / `clientY` as the doubles the browser reports: web-sys's
+/// `client_x()` returns an `i32`, which truncates before the canvas scale and
+/// so moves the pointer by up to one CSS pixel times that scale.
+fn client_xy(e: &PointerEvent) -> (f64, f64) {
+    let read = |name: &str, fallback: i32| {
+        js_sys::Reflect::get(e, &JsValue::from_str(name))
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(f64::from(fallback))
+    };
+    (read("clientX", e.client_x()), read("clientY", e.client_y()))
+}
+
 pub fn attach_input(
     canvas: &HtmlCanvasElement,
     send: Rc<LoggedWriter>,
@@ -60,7 +73,8 @@ pub fn attach_input(
     let to_fb = {
         let canvas = canvas.clone();
         let renderer = renderer.clone();
-        move |client_x: i32, client_y: i32| -> (i16, i16) {
+        move |e: &PointerEvent| -> (i16, i16) {
+            let (client_x, client_y) = client_xy(e);
             let r = canvas.get_bounding_client_rect();
             let rect = CanvasRect {
                 left: r.left(),
@@ -71,7 +85,7 @@ pub fn attach_input(
             let dims = renderer
                 .try_borrow()
                 .map_or((0, 0), |r| (r.fb_width(), r.fb_height()));
-            canvas_to_fb(f64::from(client_x), f64::from(client_y), rect, dims)
+            canvas_to_fb(client_x, client_y, rect, dims)
         }
     };
 
@@ -92,7 +106,7 @@ pub fn attach_input(
     {
         let to_fb = to_fb.clone();
         listen(canvas, "pointermove", None, move |e: PointerEvent| {
-            pending.set(Some(to_fb(e.client_x(), e.client_y())));
+            pending.set(Some(to_fb(&e)));
             if !queued.replace(true) {
                 if let Some(w) = web_sys::window() {
                     if w.request_animation_frame((*flush).as_ref().unchecked_ref())
@@ -112,7 +126,7 @@ pub fn attach_input(
             let Some(btn) = dom_button_to_x11(e.button()) else {
                 return;
             };
-            let (x, y) = to_fb(e.client_x(), e.client_y());
+            let (x, y) = to_fb(&e);
             send.write(&encode_pointer_button(x, y, btn, true));
             e.prevent_default();
         });
@@ -124,7 +138,7 @@ pub fn attach_input(
             let Some(btn) = dom_button_to_x11(e.button()) else {
                 return;
             };
-            let (x, y) = to_fb(e.client_x(), e.client_y());
+            let (x, y) = to_fb(&e);
             send.write(&encode_pointer_button(x, y, btn, false));
             e.prevent_default();
         });

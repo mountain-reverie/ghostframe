@@ -457,7 +457,7 @@ clients):
   `reset_decoder` (the native renderer also stops decoding until then). The native
   render thread hands the results to the net thread (`NetCommand::H264Result`);
   the web client calls wasm `h264Result` and drains the transmit queue.
-- **Web decoder.** `FullFrameDecoder` drops deltas after an async decode error
+- **Web decoder.** `FrameDecoder` (`ghostframe-client-wasm/src/app/decoder.rs`) drops deltas after an async decode error
   until the next key chunk, answering each as `NotOutput`, and rebuilds the
   decoder at it. An IDR to a healthy decoder is just another key chunk.
 - Malformed input, oversize access units (`MAX_H264_ACCESS_UNIT_BYTES`) and
