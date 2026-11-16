@@ -6,4 +6,5 @@
 pub mod batch;
 pub mod certs;
 pub mod close;
+pub mod input_map;
 pub mod page;
