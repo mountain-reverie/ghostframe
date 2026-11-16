@@ -12,6 +12,8 @@ pub mod page;
 pub mod session;
 
 #[cfg(target_arch = "wasm32")]
+pub mod bootstrap;
+#[cfg(target_arch = "wasm32")]
 pub mod js;
 #[cfg(target_arch = "wasm32")]
 pub mod streams;
