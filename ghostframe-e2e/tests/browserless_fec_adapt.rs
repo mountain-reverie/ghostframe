@@ -494,7 +494,7 @@ async fn a_stationary_rate_at_the_floor_does_not_flap() {
 //
 // Loss {clean, 0.01, 0.1, 1, 5 % i.i.d., Gilbert-Elliott mean run 3 at 1 %}
 // x rate cap {2, 10, 30, 100 Mbit/s} x load {H.264, tile}, each against three
-// arms: the knob off, fixed `64,5,2`, adaptive. Every run prints one
+// arms: FEC off, fixed `64,5,2`, adaptive. Every run prints one
 // `FECSWEEP run` line; the cells' verdicts print as `FECSWEEP crit` lines and
 // the test fails if a criterion does, so a failed criterion cannot go
 // unnoticed. The reduced grid runs in CI; `GHOSTFRAME_FEC_SWEEP=full` runs the

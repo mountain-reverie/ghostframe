@@ -152,11 +152,19 @@ fn assert_recovers(ctx: &str, secs: u64, r: &BrowserlessResult, o: &H264Outcome)
     assert!(r.h264.stats.verdicts_p_frag > 0, "{ctx}: no verdict");
     assert!(o.never_fed > 0, "{ctx}: no frame was lost for good");
     assert_sound(ctx, secs, r, o);
+    assert_bounded(ctx, o);
+    let c = &o.refs;
+    assert!(c.recoveries >= 1 && c.p_recovery > 0, "{ctx}: {c:?}");
+    assert!(c.recovered + 1 >= c.recoveries, "{ctx}: {c:?}");
+}
+
+/// What holds on a lossy path whether or not FEC repaired the loss: no loss
+/// IDR, frames chained only from frames the client showed, and every freeze
+/// bounded by what the recovery costs.
+fn assert_bounded(ctx: &str, o: &H264Outcome) {
     let c = &o.refs;
     assert_eq!(o.idr_made, 1, "{ctx}: the manager makes no loss IDR");
     assert_eq!(c.idr_session, 1, "{ctx}");
-    assert!(c.recoveries >= 1 && c.p_recovery > 0, "{ctx}: {c:?}");
-    assert!(c.recovered + 1 >= c.recoveries, "{ctx}: {c:?}");
     assert!(
         o.refs_to_undisplayed < o.made / 4,
         "{ctx}: {} of {} frames chained from a frame the client never showed",
@@ -174,6 +182,20 @@ fn assert_recovers(ctx: &str, secs: u64, r: &BrowserlessResult, o: &H264Outcome)
         o.max_gap_us,
         o.longest_lost_run
     );
+}
+
+/// The product's arm (adaptive FEC) of a loss scene: the path dropped frame
+/// datagrams and FEC engaged (it rebuilt something at the client), so the
+/// assertions are not about a lossless run; then everything that holds
+/// whether or not repair left a loss for the manager to recover.
+fn assert_holds_with_fec(ctx: &str, secs: u64, r: &BrowserlessResult, o: &H264Outcome) {
+    assert!(r.s2c_datagrams_dropped > 0, "{ctx}: nothing was dropped");
+    assert!(
+        r.transport.instr.fec_recovered_rx > 0,
+        "{ctx}: FEC rebuilt nothing, so it was not engaged"
+    );
+    assert_sound(ctx, secs, r, o);
+    assert_bounded(ctx, o);
 }
 
 /// A clean stream: one IDR, every frame right, no freeze, candidates confirmed.
@@ -222,7 +244,7 @@ async fn refs_scene_1_iid_loss_recovers_from_the_anchor_with_one_idr() {
             // The product: adaptive FEC on the same loss.
             let (r, o) = run_pattern(seed, SECS, Pattern::Iid(p)).await;
             line(&format!("{name}-fec"), seed, &r, &o);
-            assert_sound(&format!("{name}-fec {seed:#x}"), SECS, &r, &o);
+            assert_holds_with_fec(&format!("{name}-fec {seed:#x}"), SECS, &r, &o);
         }
     }
 }
@@ -764,7 +786,7 @@ async fn refs_under_random_loss_the_books_balance() {
             if off {
                 assert_recovers(&ctx, SECS, &r, &o);
             } else {
-                assert_sound(&ctx, SECS, &r, &o);
+                assert_holds_with_fec(&ctx, SECS, &r, &o);
             }
         }
     }
@@ -881,7 +903,7 @@ async fn refs_loss_scenes_hold_with_the_rate_policy_on() {
             )
             .await;
             line(&format!("{name}-fec"), seed, &r, &o);
-            assert_sound(&format!("{name}-fec {seed:#x}"), SECS, &r, &o);
+            assert_holds_with_fec(&format!("{name}-fec {seed:#x}"), SECS, &r, &o);
         }
     }
 }
