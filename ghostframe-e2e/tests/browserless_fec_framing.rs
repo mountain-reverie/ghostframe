@@ -174,7 +174,7 @@ async fn under_framing_a_solid_tile_whose_only_datagram_is_dropped_is_still_repa
     );
 }
 
-/// The knob on: the same churning scene, with blocks. Every datagram is still
+/// Fixed blocks on: the same churning scene, with blocks. Every datagram is still
 /// billed exactly, and repairs left (billed as `WireClass::Repair`).
 #[tokio::test(start_paused = true)]
 async fn a_churning_scene_with_blocks_on_sends_and_bills_repairs() {
@@ -228,7 +228,7 @@ async fn a_churning_scene_with_blocks_on_sends_and_bills_repairs() {
     );
 }
 
-/// The knob on under 5 % loss on the server-to-client direction: the receive
+/// Fixed blocks on under 5 % loss on the server-to-client direction: the receive
 /// side runs (RECOVERED, REPAIR_REQUEST, DECLINED, the deadline release) and
 /// the tiles still arrive.
 #[tokio::test(start_paused = true)]

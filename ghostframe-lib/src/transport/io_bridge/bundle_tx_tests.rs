@@ -762,11 +762,11 @@ async fn a_new_bridge_defaults_to_the_adaptive_controller() {
     assert!(b.fec_machinery() && b.fec_adapt.is_some() && b.fec_live.is_none());
 }
 
-/// Knob-off byte identity (R6-d D2 step 0). The scene is scripted and the
+/// FEC-off byte identity (R6-d D2 step 0). The scene is scripted and the
 /// digest was recorded at the R6-c tip (d494b094), before any block code
-/// existed. With the knob off every later step must reproduce it exactly.
+/// existed. With FEC off every later step must reproduce it exactly.
 #[tokio::test]
-async fn knob_off_sent_frames_match_the_r6c_golden() {
+async fn fec_off_sent_frames_match_the_r6c_golden() {
     let mut b = framed_bridge();
     // The daemon is always adaptive; the golden is the off control arm.
     b.set_fec_mode_for_test(crate::config::FecMode::Off);
@@ -791,7 +791,7 @@ async fn knob_off_sent_frames_match_the_r6c_golden() {
     assert_eq!((n, digest), (GOLDEN_FRAMES, GOLDEN_DIGEST));
 }
 
-/// Adaptive mode with nothing live is the knob off, byte for byte.
+/// Adaptive mode with nothing live is FEC off, byte for byte.
 #[tokio::test]
 async fn adaptive_with_no_live_params_matches_the_r6c_golden() {
     let mut b = framed_bridge();
@@ -819,7 +819,7 @@ async fn adaptive_with_no_live_params_matches_the_r6c_golden() {
 }
 
 /// Adaptive mode on a clean link (loss reports with no loss arrive, the
-/// controller runs) is the knob off, byte for byte.
+/// controller runs) is FEC off, byte for byte.
 #[tokio::test]
 async fn adaptive_after_clean_loss_reports_matches_the_r6c_golden() {
     let mut b = framed_bridge();
