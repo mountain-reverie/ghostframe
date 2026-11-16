@@ -9,3 +9,4 @@ pub mod close;
 pub mod decoder;
 pub mod input_map;
 pub mod page;
+pub mod session;
