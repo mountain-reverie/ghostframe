@@ -506,7 +506,7 @@ mod tests {
     #[test]
     fn a_tile_ready_is_reported_and_not_applied() {
         // The core is built with tile_delivery_payload = true, so this cannot
-        // happen; main.ts logs it as an error rather than render it.
+        // happen; the client (`app::session`) logs it as an error rather than render it.
         let mut sink = FakeSink::default();
         let out = route(
             vec![Event::TileReady {

@@ -3,7 +3,7 @@
  * diagnostics.ts — test and e2e instrumentation surface.
  *
  * Owns the `window.__ghostframe*` recorders and the `window.__read*` pixel
- * readbacks, so that main.ts is free of scattered `(window as any)` casts.
+ * readbacks, so that hooks.ts is free of scattered `(window as any)` casts.
  * The readbacks are one-line wrappers over `WebRenderer`: the GPU work lives
  * in Rust (`ghostframe-client-wasm/src/web`). The `typeof window !==
  * "undefined"` guards keep the module safe under Vitest/Node.
@@ -17,7 +17,7 @@ import { protocol } from './protocol_constants.js';
 
 /** Shape returned by initDiagnostics. */
 export interface DiagnosticsHandle {
-  /** Mutable stats counters — main.ts increments these directly. */
+  /** Mutable stats counters — hooks.ts assigns these from the core's counts. */
   stats: { tileDatagrams: number; frameDatagrams: number };
 
   /** Record a framebuffer resize. */
@@ -132,7 +132,7 @@ export function recordPaletteWrite(paletteId: number, bgra: Uint8Array): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Wire the diagnostic globals onto `window` and return a handle main.ts uses
+ * Wire the diagnostic globals onto `window` and return a handle hooks.ts uses
  * for per-event recording.
  *
  * @param reader     The renderer, for the pixel readbacks.

@@ -51,9 +51,4 @@ describe('wasm module', () => {
   it('was built from the current client-core and protocol sources', () => {
     expect(wasm.protocol_stamp()).toBe(protocolStamp());
   });
-
-  it('encodes input without a session', () => {
-    expect(Array.from(wasm.encodePointerMove(1, 2))).toHaveLength(6);
-    expect(wasm.keyToKeysym('Enter')).toBeDefined();
-  });
 });

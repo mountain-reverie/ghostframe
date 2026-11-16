@@ -6,7 +6,7 @@
 //! "decoded" for such a frame, so the renderer keeps the `frame_seq`s it has fed
 //! and not yet answered, in feed order, and answers each when its picture comes
 //! out. Decoders here output in decode order (no B-frames), as the web
-//! client's `decoder.ts` also assumes, so a pending seq older than an output
+//! client's `app/decoder.rs` also assumes, so a pending seq older than an output
 //! one will never get a picture and is answered `NotOutput`.
 //!
 //! Position in the FIFO decides, never numeric order, so `frame_seq` wrap is

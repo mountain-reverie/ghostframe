@@ -32,8 +32,8 @@ fn stored() -> Option<String> {
     s.get_item(STORAGE_KEY).unwrap()
 }
 
-/// The page's `performance.now()` clock in microseconds, as `main.ts` gives it
-/// to the core.
+/// The page's `performance.now()` clock in microseconds, as the Rust client gives
+/// it to the core.
 fn now_us() -> u64 {
     (web_sys::window().unwrap().performance().unwrap().now() * 1000.0) as u64
 }

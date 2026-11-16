@@ -18,8 +18,8 @@
 //!
 //! Two layers live here:
 //!
-//! * [`core::WasmClientCore`] — the real session boundary. `main.ts` drives
-//!   this at cutover: datagrams in, events out, bytes back to the wire.
+//! * [`core::WasmClientCore`] — the real session boundary. the Rust client
+//!   (`app`) drives this: datagrams in, events out, bytes back to the wire.
 //! * [`units`] — thin per-unit shims. These exist so the *existing* vitest
 //!   suites can be retargeted at Rust without being rewritten as integration
 //!   tests; the suites encode the old implementation's real behaviour, which
@@ -35,7 +35,6 @@ pub mod app;
 pub mod boundary;
 pub mod constants;
 pub mod core;
-pub mod input;
 pub mod panel;
 pub mod units;
 pub mod web;

@@ -8,8 +8,8 @@ use ghostframe_client_core::{ClientCore, StatsView};
 
 use crate::PanelBackend;
 
-/// Microseconds on the page's `performance.now()` clock: the clock `main.ts`
-/// gives every `now_us` it passes the core, so staleness compares like with
+/// Microseconds on the page's `performance.now()` clock: the clock the Rust
+/// client (`ghostframe-client-wasm/src/app`) gives every `now_us` it passes the core, so staleness compares like with
 /// like.
 fn now_us() -> u64 {
     web_sys::window()

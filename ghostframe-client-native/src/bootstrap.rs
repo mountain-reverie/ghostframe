@@ -3,7 +3,7 @@
 //!
 //! The server publishes its cert hash at `/config.json` over plain HTTP on
 //! the tailnet -- the same endpoint the browser client's
-//! `ghostframe-web-client/src/bootstrap.ts` consumes, served by
+//! `ghostframe-client-wasm/src/app/bootstrap.rs` consumes, served by
 //! `ghostbridge/web_server.go`. Body shape: `{"certHash":"<64 hex chars>"}`.
 //!
 //! There is deliberately no direct-socket path anywhere in this crate, and

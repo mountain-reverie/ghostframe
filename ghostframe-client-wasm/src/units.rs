@@ -5,13 +5,13 @@
 //! lets them detect divergence that tests written alongside the new code
 //! cannot.
 //!
-//! Nothing in `main.ts` should use these — it drives `WasmClientCore`.
+//! Nothing in `app` should use these — it drives `WasmClientCore`.
 
 use ghostframe_client_core::{
     ack_batcher::AckBatcher,
     cdf53_coverage::{self, CoverageEntry},
     cdf53_prevalidate,
-    decode_error_batcher::{DecodeErrorBatcher, DECODE_ERROR_MSG_TYPE},
+    decode_error_batcher::DECODE_ERROR_MSG_TYPE,
     loss_tracker::LossTracker,
     nack_batcher::{NackBatcher, NackEntry},
     pal_rle_decode,
@@ -180,47 +180,6 @@ impl WasmNackBatcher {
 }
 
 impl Default for WasmNackBatcher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[wasm_bindgen]
-pub struct WasmDecodeErrorBatcher {
-    inner: DecodeErrorBatcher,
-}
-
-#[wasm_bindgen]
-impl WasmDecodeErrorBatcher {
-    #[wasm_bindgen(constructor)]
-    pub fn new() -> WasmDecodeErrorBatcher {
-        WasmDecodeErrorBatcher {
-            inner: DecodeErrorBatcher::new(),
-        }
-    }
-
-    /// Returns the 5-byte stream message `[0x04, codec, tile_x, tile_y,
-    /// code]` when allowed, `undefined` when rate-limited (per-key: <=1 per
-    /// 1000 ms; global: <=32 per rolling 1000 ms).
-    ///
-    /// `codec` and `code` cross as their `repr(u8)` discriminants. An
-    /// unrecognised value returns `undefined` rather than panicking — this
-    /// is a wire-adjacent export and must not abort the module.
-    pub fn report(
-        &mut self,
-        codec: u8,
-        tile_x: u8,
-        tile_y: u8,
-        code: u8,
-        now_us: u64,
-    ) -> Option<Vec<u8>> {
-        let codec = codec_from_u8(codec)?;
-        let code = decode_error_code_from_u8(code)?;
-        self.inner.report(codec, tile_x, tile_y, code, now_us)
-    }
-}
-
-impl Default for WasmDecodeErrorBatcher {
     fn default() -> Self {
         Self::new()
     }
@@ -462,7 +421,7 @@ pub fn encode_hello(indices_raw: bool, supports_h264: bool) -> Vec<u8> {
 }
 
 /// `[DECODE_ERROR_MSG_TYPE, codec, tile_x, tile_y, code]`, unbatched and
-/// unconditional — the rate-limited path is `WasmDecodeErrorBatcher::report`.
+/// unconditional — the rate-limited path is the client's `DecodeErrorBatcher`.
 ///
 /// Returns `undefined` for an unrecognised `codec` or `code` discriminant
 /// rather than panicking; these are wire-derived values.
