@@ -62,16 +62,42 @@ async fn the_real_decoder_decodes_the_probe_clip() {
     decoder
         .decode(PROBE_CLIP, true, 77)
         .expect("decode accepts the key chunk");
+    // A decoder may hold a lone key chunk's picture until more input or a
+    // flush (in a session the next access unit pushes it out): flush it.
+    let flushed = decoder.codec().flush().expect("a decoder is open");
+    // Not awaited here: a decoder that never answers would hang the run; the
+    // race below has the timeout.
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = JsFuture::from(flushed).await;
+    });
 
     let timeout = Promise::new(&mut |_, rej| {
         let reject =
             Function::new_with_args("rej", "setTimeout(() => rej(new Error('timeout')), 10000)");
         let _ = reject.call1(&JsValue::NULL, &rej);
     });
-    JsFuture::from(Promise::race(&js_sys::Array::of2(&done, &timeout)))
+    let answered = JsFuture::from(Promise::race(&js_sys::Array::of2(&done, &timeout)))
         .await
-        .map_err(|e| ghostframe_client_wasm::web::raw::js_message(&e))
-        .expect("the decoder answered within 10 s");
+        .map_err(|e| ghostframe_client_wasm::web::raw::js_message(&e));
+    if let Err(e) = answered {
+        // Say whether this browser decodes the clip's profile at all (gate G2).
+        let probe = Function::new_no_args(
+            "return VideoDecoder.isConfigSupported({ codec: 'avc1.64000a', codedWidth: 64, codedHeight: 64 })\
+               .then(r => JSON.stringify({ supported: r.supported }), e => 'isConfigSupported threw: ' + e);",
+        );
+        let support = match probe.call0(&JsValue::NULL) {
+            Ok(p) => JsFuture::from(Promise::from(p))
+                .await
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default(),
+            Err(e) => ghostframe_client_wasm::web::raw::js_message(&e),
+        };
+        panic!(
+            "the decoder did not answer within 10 s ({e}); errors {:?}; {support}",
+            errors.borrow()
+        );
+    }
 
     if let Some(e) = errors.borrow().first() {
         panic!("decoder error: {e}");

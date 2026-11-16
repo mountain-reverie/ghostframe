@@ -48,6 +48,9 @@ extern "C" {
     pub fn decode(this: &VideoDecoder, chunk: &EncodedVideoChunk) -> Result<(), JsValue>;
     #[wasm_bindgen(method, catch)]
     pub fn close(this: &VideoDecoder) -> Result<(), JsValue>;
+    /// Emit every picture still held; resolves once they are out.
+    #[wasm_bindgen(method)]
+    pub fn flush(this: &VideoDecoder) -> Promise;
     /// `"unconfigured"`, `"configured"` or `"closed"`.
     #[wasm_bindgen(method, getter)]
     pub fn state(this: &VideoDecoder) -> String;
