@@ -96,11 +96,11 @@ async fn a_refused_frame_size_leaves_the_renderer_unchanged() {
 }
 
 /// A real datagram stream: a core, a renderer, and a Solid tile datagram built
-/// by the protocol crate. Proves `handleDatagramsInto` applies the tile inside
+/// by the protocol crate. Proves `feed_datagrams` and `route` apply the tile inside
 /// wasm and returns a slim record, not the payload.
 #[wasm_bindgen_test]
 async fn datagrams_reach_the_renderer_without_their_bytes_reaching_js() {
-    use ghostframe_client_wasm::core::WasmClientCore;
+    use ghostframe_client_wasm::core::{client_config, feed_datagrams, new_client_core};
     use ghostframe_protocol::protocol::{
         fragment_tile, Codec, TileFragmentInputs, TILE_DATAGRAM_FLAG,
     };
@@ -118,15 +118,16 @@ async fn datagrams_reach_the_renderer_without_their_bytes_reaching_js() {
         &RED, // a Solid payload is one BGRA quad
         1200,
     );
-    let mut core = WasmClientCore::new(true, false, true, 0);
+    let mut core = new_client_core(client_config(true, false, true), 0);
     let mut r = new_renderer("auto").await;
     r.apply(dims(64, 64)).unwrap();
     let concat: Vec<u8> = datagrams.iter().flatten().copied().collect();
     let lens: Vec<u32> = datagrams.iter().map(|d| d.len() as u32).collect();
     let arrivals = vec![1000.0; datagrams.len()];
-    let out = core
-        .handle_datagrams_into(&mut r, &concat, &lens, &arrivals)
-        .expect("route");
+    let events = feed_datagrams(&mut core, &concat, &lens, &arrivals);
+    let out =
+        serde_wasm_bindgen::to_value(&ghostframe_client_wasm::web::route::route(events, &mut r))
+            .expect("route");
     let out = js_sys::Array::from(&out);
     assert_eq!(out.length(), 1, "one tile, one record");
     let rec = out.get(0);

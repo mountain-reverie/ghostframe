@@ -37,11 +37,11 @@ use crate::boundary::{
 /// `Codec::from_u8` (ghostframe-protocol/src/protocol.rs:68) returns
 /// `Result<Codec, ProtocolError>`; the error carries no information the
 /// caller acts on, so it is discarded here.
-fn codec_from_u8(v: u8) -> Option<Codec> {
+pub(crate) fn codec_from_u8(v: u8) -> Option<Codec> {
     Codec::from_u8(v).ok()
 }
 
-fn decode_error_code_from_u8(v: u8) -> Option<DecodeErrorCode> {
+pub(crate) fn decode_error_code_from_u8(v: u8) -> Option<DecodeErrorCode> {
     use DecodeErrorCode::*;
     Some(match v {
         1 => PayloadTooShort,
