@@ -334,6 +334,18 @@ raised to 819,200 bytes (800 KiB) raw, about 4% headroom over 783,983, with no
 size-only code changes. The extra weight is wgpu's WebGPU backend and the shared
 renderer; naga is not linked.
 
+## 2026-11-15: FEC v2 rev 6 on the wgpu renderer
+
+FEC v2 rev 6 puts the client's Reed-Solomon decoder, block state and
+repair-status stream in the wasm. On top of master's wgpu renderer
+(783,983 bytes raw in the 2026-11-14 section) the default release build is
+827,627 bytes raw, 322,020 gzip: +43,644 bytes (5.6 %). No large static table
+is involved; the GF(2^8) arithmetic and the block bookkeeping are code.
+
+Owner decision 2026-11-15: the cap in `ci/check-wasm-size.sh` is raised to
+884,736 bytes (864 KiB) raw, about 7 % headroom over 827,627, with no
+size-only code changes.
+
 ## 2026-11-16: all-Rust web client PR 3 (main loop in Rust)
 
 PR 3 moves startup, WebTransport, the rAF loop, the WebCodecs decoder, input
