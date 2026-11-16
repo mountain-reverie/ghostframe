@@ -628,7 +628,7 @@ impl TransmissionLedger {
     /// Outstanding records whose content `pred` accepts, for a test of the
     /// accounting identity (recorded = acknowledged + judged + forgotten +
     /// outstanding).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "browserless-harness"))]
     pub(crate) fn count_outstanding(&self, pred: impl Fn(&Content) -> bool) -> usize {
         self.records
             .values()
