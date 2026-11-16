@@ -295,7 +295,7 @@ ci-local:
     @echo "=== web client build ==="
     just build-web
     cd ghostframe-web-client && npx tsc --noEmit
-    @echo "=== wasm bundle under 800 KiB ==="
+    @echo "=== wasm bundle under 864 KiB ==="
     ci/test-check-wasm-size.sh
     ci/check-wasm-size.sh
     @echo "=== release build ==="

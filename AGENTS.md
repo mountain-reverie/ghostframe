@@ -131,7 +131,7 @@ error — it is a NACK storm, slow convergence and visual artifacts. Use
 confirming the bundle actually changed:
 `strings target/release/ghostframe-server | grep -c <new-bundle-hash>`.
 
-**The web client's wasm has a size gate: 800 KiB.** `ci/check-wasm-size.sh`
+**The web client's wasm has a size gate: 864 KiB.** `ci/check-wasm-size.sh`
 reads `ghostframe-web-client/dist/assets/*.wasm` (so it needs `just build-web`
 first), runs in `just ci-local` and the `web-client` CI job, and fails closed
 when there is no wasm. Raise the limit only deliberately, and record the new

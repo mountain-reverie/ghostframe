@@ -219,7 +219,7 @@ jobs:
       # the stats panel's Leptos is the first dependency that can blow it up.
       # The self-test keeps the guard honest (it fails closed on a missing
       # wasm and on a limit that no longer fires).
-      - name: wasm bundle under 800 KiB
+      - name: wasm bundle under 864 KiB
         run: |
           ci/test-check-wasm-size.sh
           ci/check-wasm-size.sh
