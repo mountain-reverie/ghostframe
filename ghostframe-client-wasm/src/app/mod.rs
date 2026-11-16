@@ -17,3 +17,5 @@ pub mod bootstrap;
 pub mod js;
 #[cfg(target_arch = "wasm32")]
 pub mod streams;
+#[cfg(target_arch = "wasm32")]
+pub mod webcodecs;
