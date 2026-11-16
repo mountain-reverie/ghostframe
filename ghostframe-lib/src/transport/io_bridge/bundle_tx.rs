@@ -110,7 +110,8 @@ impl IoBridge {
 
     /// Wire bytes that are admitted but not yet in quinn's FIFO: the open
     /// bundle and the sealed ones quinn has not taken, each with its frame
-    /// header and the QUIC framing it will carry. The depth gate counts them,
+    /// header (SOURCE or PLAIN, by what it will be sealed as) and the QUIC
+    /// framing it will carry. The depth gate counts them,
     /// or records admitted while a bundle fills would overshoot `D_target`;
     /// and it counts them as the FIFO will (`queued` in
     /// `note_bundle_enqueued`), or a short bundle's header would let the FIFO
@@ -121,7 +122,7 @@ impl IoBridge {
         let open = if open == 0 {
             0
         } else {
-            open + ghostframe_protocol::fec::frame::FEC_PLAIN_HEADER_LEN + framing
+            open + self.packer.open_header_len() + framing
         };
         open + self
             .pending_bundles

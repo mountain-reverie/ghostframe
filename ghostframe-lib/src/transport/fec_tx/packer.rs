@@ -92,6 +92,16 @@ impl Packer {
         self.body.len()
     }
 
+    /// The frame header the open bundle will carry when sealed: a protected
+    /// bundle is a SOURCE frame (a longer header than a PLAIN one).
+    pub(crate) fn open_header_len(&self) -> usize {
+        if self.open_protect {
+            FEC_SOURCE_HEADER_LEN
+        } else {
+            FEC_PLAIN_HEADER_LEN
+        }
+    }
+
     /// Longest inner datagram for a `max_dg` (plan decision 3).
     pub(crate) fn record_limit(max_dg: usize) -> usize {
         max_dg
