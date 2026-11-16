@@ -18,7 +18,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{future_to_promise, JsFuture};
 
 use super::h264::H264Blit;
-use super::logic::{pick_canvas_format, should_skip_paint, Cdf53Mode, PaintInputs};
+use super::logic::{pick_canvas_format, should_skip_paint, summarize_us, Cdf53Mode, PaintInputs};
 use super::present::Present;
 use super::raw;
 use super::route::TileSink;
@@ -124,7 +124,16 @@ impl Drop for WebRenderer {
 }
 
 impl WebRenderer {
-    async fn create_inner(
+    /// Errors since the last call: uncaptured GPU errors and failed steps.
+    pub(crate) fn take_error_strings(&mut self) -> Vec<String> {
+        let mut out = std::mem::take(&mut self.errors);
+        if let Ok(mut g) = self.gpu_errors.lock() {
+            out.append(&mut g);
+        }
+        out
+    }
+
+    pub(crate) async fn create_inner(
         canvas: web_sys::HtmlCanvasElement,
         mode: Cdf53Mode,
     ) -> Result<Self, String> {
@@ -672,11 +681,10 @@ impl WebRenderer {
     /// Errors since the last call: uncaptured GPU errors and failed steps.
     #[wasm_bindgen(js_name = takeErrors)]
     pub fn take_errors(&mut self) -> Array {
-        let mut out = std::mem::take(&mut self.errors);
-        if let Ok(mut g) = self.gpu_errors.lock() {
-            out.append(&mut g);
-        }
-        out.iter().map(|s| JsValue::from_str(s)).collect()
+        self.take_error_strings()
+            .iter()
+            .map(|s| JsValue::from_str(s))
+            .collect()
     }
 
     /// `[codec, tile_x, tile_y, code, ...]` for tiles the GPU decode rejected.
@@ -690,19 +698,7 @@ impl WebRenderer {
     /// last call (the section 7 bench reads it through `__ghostframePaintUs`).
     #[wasm_bindgen(js_name = paintUsStats)]
     pub fn paint_us_stats(&mut self) -> Vec<f64> {
-        let mut v = std::mem::take(&mut self.paint_us);
-        v.sort_unstable();
-        let at = |q: f64| {
-            v.get(((v.len() as f64 - 1.0) * q).round() as usize)
-                .copied()
-                .map_or(0.0, f64::from)
-        };
-        vec![
-            v.len() as f64,
-            at(0.5),
-            at(0.99),
-            v.last().copied().map_or(0.0, f64::from),
-        ]
+        summarize_us(std::mem::take(&mut self.paint_us))
     }
 
     /// The old `__ghostframeRendererState()`.
