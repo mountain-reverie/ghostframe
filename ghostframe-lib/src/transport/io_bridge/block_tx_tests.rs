@@ -1424,3 +1424,21 @@ fn an_initial_rows_bytes_are_its_ideal_padding_and_header() {
     );
     assert_eq!((sp.rows[0], sp.rows[1]), (1, 1));
 }
+
+/// The depth gate counts the open bundle with the header it will be sealed
+/// with: a SOURCE frame's is longer than a PLAIN one's. Counted as PLAIN, a
+/// bundle in a live block let the FIFO stand a few bytes over `D_target` when
+/// the next record was accepted (`depth_violations`).
+#[tokio::test]
+async fn the_open_source_bundle_counts_its_source_header_toward_the_depth_gate() {
+    let mut b = blocks_bridge(64, 5, 2);
+    submit_tiles(&mut b, 1, None);
+    b.drain_reliable_emitter(now_std());
+    let open = b.packer.open_bytes();
+    assert!(open > 0, "premise: a record waits in the open bundle");
+    assert!(b.pending_bundles.is_empty(), "premise: nothing sealed yet");
+    assert_eq!(
+        b.unsent_bundle_bytes(),
+        open + ghostframe_protocol::fec::frame::FEC_SOURCE_HEADER_LEN + b.live_framing_len()
+    );
+}
