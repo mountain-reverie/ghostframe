@@ -23,6 +23,14 @@ const SEEDS: [u64; 3] = [0xFB_0001, 0xFB_0002, 0xFB_0003];
 const EXTRA_SEEDS: [u64; 5] = [0xFB_0004, 0xFB_0005, 0xFB_0006, 0xFB_0007, 0xFB_0008];
 const GRID: u32 = 16;
 
+/// The control arm: no FEC blocks (the daemon is always adaptive).
+fn off() -> RunOptions {
+    RunOptions {
+        fec_off: true,
+        ..RunOptions::default()
+    }
+}
+
 fn knob(k_max: u8, t_ms: u8, r: u8) -> RunOptions {
     RunOptions {
         fec_blocks: Some(FecBlockParams { k_max, t_ms, r }),
@@ -157,8 +165,7 @@ fn tline(name: &str, seed: u64, r: &BrowserlessResult, present: usize, total: us
 async fn scene_1_tiles_iid_loss_decode_and_the_loss_path_works_less() {
     for seed in SEEDS {
         let (on, p_on, n) = run_tiles(seed, 10, link(10_000, 0.03), None, knob(64, 5, 2)).await;
-        let (off, p_off, _) =
-            run_tiles(seed, 10, link(10_000, 0.03), None, RunOptions::default()).await;
+        let (off, p_off, _) = run_tiles(seed, 10, link(10_000, 0.03), None, off()).await;
         tline("s1-on", seed, &on, p_on, n);
         tline("s1-off", seed, &off, p_off, n);
         let i = &on.transport.instr;
@@ -244,7 +251,7 @@ async fn scene_6_a_delayed_status_stream_does_not_storm() {
             14,
             link(10_000, 0.03),
             Some(link(310_000, 0.0)),
-            RunOptions::default(),
+            off(),
         )
         .await;
         tline("s6-on", seed, &on, p, n);
@@ -370,8 +377,7 @@ async fn scene_2_h264_iid_loss_the_manager_hears_less() {
     for seed in SEEDS {
         let base = link(50_000, 0.0);
         let (on, o_on) = run_h264(seed, 10, base.clone(), Pattern::Iid(0.05), knob(64, 5, 2)).await;
-        let (off, o_off) =
-            run_h264(seed, 10, base, Pattern::Iid(0.05), RunOptions::default()).await;
+        let (off, o_off) = run_h264(seed, 10, base, Pattern::Iid(0.05), off()).await;
         hline("s2-on", seed, &on, &o_on);
         hline("s2-off", seed, &off, &o_off);
         let i = &on.transport.instr;
@@ -408,8 +414,7 @@ async fn scene_5_high_rtt_h264_a_rebuilt_frame_is_never_reported_lost() {
     for seed in SEEDS.into_iter().chain(EXTRA_SEEDS) {
         let base = link(125_000, 0.0);
         let (on, o_on) = run_h264(seed, 14, base.clone(), Pattern::Iid(0.03), knob(64, 5, 2)).await;
-        let (off, o_off) =
-            run_h264(seed, 14, base, Pattern::Iid(0.03), RunOptions::default()).await;
+        let (off, o_off) = run_h264(seed, 14, base, Pattern::Iid(0.03), off()).await;
         hline("s5-on", seed, &on, &o_on);
         hline("s5-off", seed, &off, &o_off);
         let i = &on.transport.instr;

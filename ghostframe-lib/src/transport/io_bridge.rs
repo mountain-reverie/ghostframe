@@ -856,7 +856,8 @@ pub struct IoBridge {
     /// H.264 as a member of the transport: frame tracker, IDR hold and
     /// request policy, counters. See `h264_tx`.
     h264: H264Tx,
-    /// The FEC block mode (`GHOSTFRAME_FEC_BLOCKS`), fixed for the process.
+    /// The FEC block mode, fixed for the process: always adaptive in the
+    /// daemon; tests and the harness may set another.
     /// `fec_mode.machinery()` says the block table, the ACK hooks and the
     /// repair service run. See `block_tx` for which guard reads which.
     fec_mode: crate::config::FecMode,
@@ -1590,8 +1591,8 @@ impl IoBridge {
                 openh264_lib,
                 ..H264Tx::default()
             },
-            fec_mode: lib_config.transport.fec_mode,
-            fec_live: lib_config.transport.fec_mode.initial_live(),
+            fec_mode: crate::config::FecMode::Adaptive,
+            fec_live: None,
             #[cfg(any(test, feature = "browserless-harness"))]
             h264_stats_publish: std::sync::Arc::new(std::sync::Mutex::new(H264Report::default())),
             last_reset_request_idr_at: None,
@@ -1623,14 +1624,13 @@ impl IoBridge {
             recent_bundles: Default::default(),
             packer: {
                 let mut p = crate::transport::fec_tx::packer::Packer::default();
-                p.set_blocks(lib_config.transport.fec_mode.initial_live());
+                p.set_blocks(None);
                 p
             },
             emitted_meta: HashMap::new(),
             pending_bundles: Default::default(),
             block_table: Default::default(),
-            fec_adapt: (lib_config.transport.fec_mode == crate::config::FecMode::Adaptive)
-                .then(crate::transport::fec_tx::adapt::FecAdapt::new),
+            fec_adapt: Some(crate::transport::fec_tx::adapt::FecAdapt::new()),
             pending_repairs: Default::default(),
             block_tx: Default::default(),
             last_enqueued_was_short: false,
