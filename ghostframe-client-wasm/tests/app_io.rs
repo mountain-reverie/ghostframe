@@ -253,3 +253,99 @@ async fn bootstrap_names_a_missing_cert_hash() {
     let err = bootstrap().await.err().expect("must fail");
     assert!(err.contains("certHash"), "{err}");
 }
+
+// ---- page DOM (src/app/dom.rs) ----
+
+mod page_dom {
+    use ghostframe_client_wasm::app::dom::{
+        pin_canvas, show_disconnected_overlay, PageLog, LOG_LINES,
+    };
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+    use web_sys::{Document, HtmlCanvasElement, HtmlElement};
+
+    fn document() -> Document {
+        web_sys::window().unwrap().document().unwrap()
+    }
+
+    /// A fresh container holding `#status` and `#log`; removed by `drop`.
+    struct Fixture {
+        root: HtmlElement,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let doc = document();
+            let root: HtmlElement = doc.create_element("div").unwrap().unchecked_into();
+            root.set_inner_html("<div id=\"status\"></div><div id=\"log\"></div>");
+            doc.body().unwrap().append_child(&root).unwrap();
+            Fixture { root }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.root.remove();
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn the_page_log_keeps_the_last_50_lines() {
+        let _f = Fixture::new();
+        let doc = document();
+        let log = PageLog::find(&doc).unwrap();
+        for i in 0..60 {
+            log.line(&format!("line {i}"));
+        }
+        let el = doc.get_element_by_id("log").unwrap();
+        assert_eq!(el.child_element_count(), LOG_LINES);
+        assert_eq!(LOG_LINES, 50);
+        assert_eq!(
+            el.first_element_child().unwrap().text_content().unwrap(),
+            "line 10"
+        );
+        assert_eq!(
+            el.last_element_child().unwrap().text_content().unwrap(),
+            "line 59"
+        );
+        log.status("hello");
+        assert_eq!(
+            doc.get_element_by_id("status")
+                .unwrap()
+                .text_content()
+                .unwrap(),
+            "hello"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn the_overlay_is_shown_once_with_role_status() {
+        let doc = document();
+        show_disconnected_overlay(&doc, "first");
+        show_disconnected_overlay(&doc, "second");
+        let all = doc.query_selector_all("#gf-disconnected").unwrap();
+        let el = doc.get_element_by_id("gf-disconnected").unwrap();
+        el.remove();
+        assert_eq!(all.length(), 1);
+        assert_eq!(el.text_content().unwrap(), "first");
+        assert_eq!(el.get_attribute("role").as_deref(), Some("status"));
+    }
+
+    #[wasm_bindgen_test]
+    fn lossless_hides_the_chrome_and_pins_the_canvas() {
+        let _f = Fixture::new();
+        let doc = document();
+        let log = PageLog::find(&doc).unwrap();
+        log.hide();
+        for id in ["status", "log"] {
+            let el: HtmlElement = doc.get_element_by_id(id).unwrap().unchecked_into();
+            assert_eq!(el.style().get_property_value("display").unwrap(), "none");
+        }
+        let canvas: HtmlCanvasElement = doc.create_element("canvas").unwrap().unchecked_into();
+        pin_canvas(&canvas);
+        let s = canvas.style();
+        assert_eq!(s.get_property_value("position").unwrap(), "fixed");
+        assert_eq!(s.get_property_value("top").unwrap(), "0px");
+        assert_eq!(s.get_property_value("left").unwrap(), "0px");
+    }
+}
