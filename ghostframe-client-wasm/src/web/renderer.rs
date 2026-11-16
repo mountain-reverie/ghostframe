@@ -652,7 +652,7 @@ impl WebRenderer {
     #[wasm_bindgen(js_name = paintTick)]
     pub fn paint_tick_js(&mut self, now_us: u64) -> u32 {
         // A u64 crosses as a BigInt, exactly what `nowUs()` in main.ts returns
-        // and what `onTimeoutInto` takes: one clock type for every call.
+        // and what `onTimeout` takes: one clock type for every call.
         match self.paint_tick(now_us) {
             Ok(o) => u32::from(o.presented),
             Err(e) => {

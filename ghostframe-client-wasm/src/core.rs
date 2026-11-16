@@ -354,6 +354,43 @@ impl WasmClientCore {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+impl WasmClientCore {
+    /// [`WasmClientCore::handle_datagrams`] with the tile work applied to
+    /// `renderer` inside wasm: tile payloads, palettes and frame sizes never
+    /// cross into JS. Returns one record per event, in order (see
+    /// `web::route`): a slim record per tile (codec, coordinates, full
+    /// length, first 16 bytes), `FrameDimensions` with `applied`/`reason`, and
+    /// `NeedsH264`/`DecodeError`/`Evicted` as before. A failing event is
+    /// carried in its record's `error`; the rest of the batch is still applied.
+    ///
+    /// Kept until the Rust app loop replaces main.ts (Task 14), so every
+    /// commit on the way still builds.
+    #[wasm_bindgen(js_name = handleDatagramsInto)]
+    pub fn handle_datagrams_into(
+        &mut self,
+        renderer: &mut crate::web::renderer::WebRenderer,
+        concat: &[u8],
+        lens: &[u32],
+        arrivals_us: &[f64],
+    ) -> Result<JsValue, JsValue> {
+        let events = feed_datagrams(&mut self.inner.borrow_mut(), concat, lens, arrivals_us);
+        to_js(&crate::web::route::route(events, renderer))
+    }
+
+    /// [`WasmClientCore::on_timeout`] with the same routing.
+    #[wasm_bindgen(js_name = onTimeoutInto)]
+    pub fn on_timeout_into(
+        &mut self,
+        renderer: &mut crate::web::renderer::WebRenderer,
+        now_us: u64,
+    ) -> Result<JsValue, JsValue> {
+        let events = self.inner.borrow_mut().on_timeout(now_us);
+        to_js(&crate::web::route::route(events, renderer))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,10 +550,8 @@ mod moved_from_vitest {
         let got: Vec<String> = got.iter().map(|e| format!("{e:?}")).collect();
         assert_eq!(got, expected);
         assert_eq!(datagram_counts(&batch), datagram_counts(&seq));
-        // Arrivals are 3 ms apart so the ack entries' millisecond stamps
-        // differ: one stamp for the whole batch would show here.
-        // The arrival stamps reached the core: the ACKs it queued name the
-        // same arrival times as the per-datagram feed.
+        // Arrivals are 3 ms apart, so the ACKs it queued carry different
+        // millisecond stamps: one stamp for the whole batch would differ here.
         let a = drain_acks(&mut batch);
         let b = drain_acks(&mut seq);
         assert!(!a.is_empty());

@@ -96,8 +96,9 @@ async fn a_refused_frame_size_leaves_the_renderer_unchanged() {
 }
 
 /// A real datagram stream: a core, a renderer, and a Solid tile datagram built
-/// by the protocol crate. Proves `feed_datagrams` and `route` apply the tile inside
-/// wasm and returns a slim record, not the payload.
+/// by the protocol crate. Tests the path the Rust client calls directly,
+/// `feed_datagrams` then `web::route::route`: the tile is applied inside wasm
+/// and the record is slim, not the payload.
 #[wasm_bindgen_test]
 async fn datagrams_reach_the_renderer_without_their_bytes_reaching_js() {
     use ghostframe_client_wasm::core::{client_config, feed_datagrams, new_client_core};
