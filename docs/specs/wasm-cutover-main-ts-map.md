@@ -4,6 +4,9 @@
 **Git rev:** `dcca06e`
 **Branch:** `feat/wasm-cutover`
 
+> Historical. `main.ts`'s session loop, `decoder.ts` and `input/wire.ts` have
+> since been replaced by the Rust client in `ghostframe-client-wasm/src/app/`.
+
 This is the review artefact for Phase 4a of
 `docs/superpowers/plans/2026-09-11-wasm-cutover-final.md` (Task 1). It records
 every protocol function currently inlined in `main.ts`, its disposition once

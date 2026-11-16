@@ -77,7 +77,8 @@ pub trait BrowserSession: Send {
     /// `Leave`.
     ///
     /// Synthetic events have `isTrusted=false`. The web-client's
-    /// `attachInputCapture` listeners do not gate on `isTrusted`, so
+    /// input listeners (`ghostframe-client-wasm/src/app/input.rs`) do not
+    /// gate on `isTrusted`, so
     /// they fire and round-trip the input through our wire encoder
     /// exactly as a real user click would.
     async fn dispatch_pointer_event(

@@ -87,6 +87,7 @@ pub fn summarize_us(mut samples: Vec<u32>) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wgpu::TextureFormat::{Bgra8Unorm, Bgra8UnormSrgb, Rgba8Unorm};
 
     #[test]
     fn summarize_us_of_nothing_is_zeros() {
@@ -98,7 +99,6 @@ mod tests {
         // p50 is index 1, p99 rounds 1.98 to index 2.
         assert_eq!(summarize_us(vec![5, 1, 3]), vec![3.0, 3.0, 5.0, 5.0]);
     }
-    use wgpu::TextureFormat::{Bgra8Unorm, Bgra8UnormSrgb, Rgba8Unorm};
 
     #[test]
     fn skips_when_nothing_is_pending() {

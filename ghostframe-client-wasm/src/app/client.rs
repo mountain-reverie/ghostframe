@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! The browser client (port of `main.ts`'s `main()`).
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::{Rc, Weak};
 
 use ghostframe_client_core::decode_error_batcher::DecodeErrorBatcher;
@@ -82,7 +82,10 @@ pub struct App {
     feedback: Option<LoggedWriter>,
     decode_error_feedback: Option<LoggedWriter>,
     batch: DatagramBatch,
-    flush_timer: Option<i32>,
+    /// The armed fallback timer's handle. Shared with `timer_cb`, which clears
+    /// it before borrowing the app, so a fired timer never stays recorded as
+    /// armed even when that borrow fails.
+    flush_timer: Rc<Cell<Option<i32>>>,
     /// The fallback timer's one callback (a persistent closure: a fresh one
     /// per arming would be freed while the browser still holds it).
     timer_cb: Closure<dyn FnMut()>,
@@ -122,7 +125,12 @@ impl App {
     pub fn new(parts: AppParts) -> Rc<RefCell<App>> {
         Rc::new_cyclic(|me: &Weak<RefCell<App>>| {
             let timer_me = me.clone();
+            let flush_timer: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
+            let timer_handle = flush_timer.clone();
             let timer_cb = Closure::<dyn FnMut()>::new(move || {
+                // It has fired: forget its handle first, so the next datagram
+                // arms a fresh fallback even if the borrow below fails.
+                timer_handle.set(None);
                 let Some(app) = timer_me.upgrade() else {
                     return;
                 };
@@ -131,6 +139,8 @@ impl App {
                         a.flush_datagrams();
                         a.take_calls()
                     }
+                    // Unreachable today (every borrow is synchronous); the
+                    // batch waits for the next tick or the next arming.
                     Err(_) => return,
                 };
                 dispatch_calls(calls);
@@ -154,7 +164,7 @@ impl App {
                 feedback,
                 decode_error_feedback,
                 batch: DatagramBatch::default(),
-                flush_timer: None,
+                flush_timer,
                 timer_cb,
                 decoder: None,
                 decode_errors: DecodeErrorBatcher::new(),
@@ -227,7 +237,7 @@ impl App {
             .push_with(len, arrival_us, |dst| value.copy_to(dst));
         // Hidden tab: rAF is paused and timers are clamped to >= 1 s, so
         // process at once to keep ACKs prompt.
-        match flush_decision(self.batch.len(), hidden, self.flush_timer.is_some()) {
+        match flush_decision(self.batch.len(), hidden, self.flush_timer.get().is_some()) {
             FlushDecision::Now => self.flush_datagrams(),
             FlushDecision::ArmTimer => {
                 if let Some(w) = web_sys::window() {
@@ -235,7 +245,7 @@ impl App {
                         self.timer_cb.as_ref().unchecked_ref(),
                         FLUSH_FALLBACK_MS,
                     ) {
-                        self.flush_timer = Some(h);
+                        self.flush_timer.set(Some(h));
                     }
                 }
             }
@@ -314,6 +324,12 @@ impl App {
     }
 
     fn swallowed(&mut self, message: String) {
+        // Logged whether or not a hooks object is listening (main.ts's
+        // handleSafely printed it too).
+        console::error_2(
+            &"handleEvent failed; continuing".into(),
+            &message.as_str().into(),
+        );
         self.push(HookCall::Swallowed {
             site: "handleEvent:NeedsH264".into(),
             message,
@@ -732,7 +748,14 @@ async fn run(
             b.readable(),
             move |bytes| {
                 let (samples, frames) = {
-                    let mut c = core.try_borrow_mut().map_err(|_| "core busy".to_string())?;
+                    let mut c = core.try_borrow_mut().map_err(|_| {
+                        // Every core borrow is synchronous, so this cannot
+                        // happen; if it does, the stats stream's reassembly
+                        // is broken from here on, not one chunk skipped.
+                        "invariant violated: the core was borrowed while a server-stream \
+                         chunk arrived; chunk dropped, stats stream may be corrupt"
+                            .to_string()
+                    })?;
                     c.handle_server_stream(bytes, now_us());
                     let s = c.stats();
                     (

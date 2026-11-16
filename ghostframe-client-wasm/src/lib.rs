@@ -18,7 +18,7 @@
 //!
 //! Two layers live here:
 //!
-//! * [`core::WasmClientCore`] — the real session boundary. the Rust client
+//! * [`core::WasmClientCore`] — the real session boundary. The Rust client
 //!   (`app`) drives this: datagrams in, events out, bytes back to the wire.
 //! * [`units`] — thin per-unit shims. These exist so the *existing* vitest
 //!   suites can be retargeted at Rust without being rewritten as integration
