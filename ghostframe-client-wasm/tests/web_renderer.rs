@@ -121,6 +121,12 @@ async fn datagrams_reach_the_renderer_without_their_bytes_reaching_js() {
     let mut core = WasmClientCore::new(true, false, true, 0);
     let mut r = new_renderer("auto").await;
     r.apply(dims(64, 64)).unwrap();
+    // Every server datagram is an FEC v2 frame; a bare record is refused.
+    let datagrams: Vec<Vec<u8>> = datagrams
+        .iter()
+        .enumerate()
+        .map(|(i, d)| ghostframe_client_core::frame_plain(i as u32, &[d.as_slice()]))
+        .collect();
     let concat: Vec<u8> = datagrams.iter().flatten().copied().collect();
     let lens: Vec<u32> = datagrams.iter().map(|d| d.len() as u32).collect();
     let arrivals = vec![1000.0; datagrams.len()];
