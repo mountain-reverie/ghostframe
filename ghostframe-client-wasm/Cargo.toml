@@ -72,5 +72,5 @@ serde_json = "1"
 # a feature is trimmed there).
 web-sys = { version = "0.3", features = [
     "Document", "Element", "Node", "HtmlElement", "HtmlCanvasElement", "Window", "console",
-    "ReadableStream", "WritableStream", "Response",
+    "ReadableStream", "WritableStream", "WritableStreamDefaultWriter", "Performance", "Response",
 ] }

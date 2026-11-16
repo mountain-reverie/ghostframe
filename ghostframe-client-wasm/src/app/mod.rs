@@ -14,11 +14,15 @@ pub mod session;
 #[cfg(target_arch = "wasm32")]
 pub mod bootstrap;
 #[cfg(target_arch = "wasm32")]
+pub mod client;
+#[cfg(target_arch = "wasm32")]
 pub mod debug_api;
 #[cfg(target_arch = "wasm32")]
 pub mod dom;
 #[cfg(target_arch = "wasm32")]
 pub mod hooks;
+#[cfg(target_arch = "wasm32")]
+pub mod input;
 #[cfg(target_arch = "wasm32")]
 pub mod js;
 #[cfg(target_arch = "wasm32")]
