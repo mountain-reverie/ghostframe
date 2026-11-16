@@ -31,6 +31,7 @@
 
 use wasm_bindgen::prelude::*;
 
+pub mod app;
 pub mod boundary;
 pub mod constants;
 pub mod core;
