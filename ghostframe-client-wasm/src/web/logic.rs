@@ -66,9 +66,38 @@ pub fn pick_canvas_format(offered: &[wgpu::TextureFormat]) -> wgpu::TextureForma
         .unwrap_or(Rgba8Unorm)
 }
 
+/// `[count, p50, p99, max]` of `samples` (microseconds), for the bench's
+/// `__ghostframePaintUs` and `__ghostframeTickUs`; zeros when empty.
+pub fn summarize_us(mut samples: Vec<u32>) -> Vec<f64> {
+    samples.sort_unstable();
+    let at = |q: f64| {
+        samples
+            .get(((samples.len() as f64 - 1.0) * q).round() as usize)
+            .copied()
+            .map_or(0.0, f64::from)
+    };
+    vec![
+        samples.len() as f64,
+        at(0.5),
+        at(0.99),
+        samples.last().copied().map_or(0.0, f64::from),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summarize_us_of_nothing_is_zeros() {
+        assert_eq!(summarize_us(vec![]), vec![0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn summarize_us_sorts_and_rounds_the_percentile_index() {
+        // p50 is index 1, p99 rounds 1.98 to index 2.
+        assert_eq!(summarize_us(vec![5, 1, 3]), vec![3.0, 3.0, 5.0, 5.0]);
+    }
     use wgpu::TextureFormat::{Bgra8Unorm, Bgra8UnormSrgb, Rgba8Unorm};
 
     #[test]
