@@ -251,23 +251,25 @@ pub struct TransportConfig {
     /// as [`H264_DEFAULT_FPS`]. The encoder's per-frame budget is the rate
     /// divided by it.
     pub capture_fps: u32,
-    /// The FEC block mode, from `GHOSTFRAME_FEC_BLOCKS` (`off`, `k_max,t_ms,r`
-    /// or `adaptive`). `Off` (unset, `off` or `0`) is the default: every
-    /// bundle is a plain frame.
-    pub fec_mode: FecMode,
 }
 
-/// What `GHOSTFRAME_FEC_BLOCKS` selects. The mode is fixed for the process;
-/// the parameters in force at a moment are the bridge's `fec_live`.
+/// The FEC v2 mode. The daemon always runs [`FecMode::Adaptive`]; there is no
+/// switch. `Off` and `Fixed` exist only for tests and the browserless harness
+/// (the control arm and the fixed-parameter scenes), and are compiled out of a
+/// release daemon. The mode is fixed for the process; the parameters in force
+/// at a moment are the bridge's `fec_live`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FecMode {
-    /// No block machinery: every bundle is PLAIN.
-    #[default]
+    /// No block machinery: every bundle is PLAIN. Test and harness control arm.
+    #[cfg(any(test, feature = "browserless-harness"))]
     Off,
-    /// The block machinery with these parameters for the whole process.
+    /// The block machinery with these parameters for the whole process. Test
+    /// and harness only.
+    #[cfg(any(test, feature = "browserless-harness"))]
     Fixed(FecBlockParams),
     /// The block machinery with parameters chosen at run time; none are live
-    /// (every bundle PLAIN) until a controller sets some.
+    /// (every bundle PLAIN) until the controller sets some.
+    #[default]
     Adaptive,
 }
 
@@ -276,17 +278,27 @@ impl FecMode {
     /// for `Off` and `Adaptive`.
     pub fn initial_live(self) -> Option<FecBlockParams> {
         match self {
+            #[cfg(any(test, feature = "browserless-harness"))]
             Self::Fixed(p) => Some(p),
-            Self::Off | Self::Adaptive => None,
+            #[cfg(any(test, feature = "browserless-harness"))]
+            Self::Off => None,
+            Self::Adaptive => None,
         }
     }
 
     /// The block table, ACK hooks and repair service run.
     pub fn machinery(self) -> bool {
-        self != Self::Off
+        match self {
+            #[cfg(any(test, feature = "browserless-harness"))]
+            Self::Off => false,
+            #[cfg(any(test, feature = "browserless-harness"))]
+            Self::Fixed(_) => true,
+            Self::Adaptive => true,
+        }
     }
 }
 
+#[cfg(any(test, feature = "browserless-harness"))]
 impl From<Option<FecBlockParams>> for FecMode {
     fn from(p: Option<FecBlockParams>) -> Self {
         p.map_or(Self::Off, Self::Fixed)
@@ -314,47 +326,25 @@ impl FecBlockParams {
     /// caps lower (`adapt_size::T_MAX_MS`, 20): this range serves the split of
     /// a frame into interleaved blocks, not the narrow and wide notches.
     pub(crate) const T_MS_MAX: u8 = 50;
-
-    /// Parse `k_max,t_ms,r`. `None` for anything out of range or malformed.
-    fn parse(raw: &str) -> Option<Self> {
-        let mut fields = raw.split(',').map(|f| f.trim().parse::<u8>().ok());
-        let (k_max, t_ms, r) = (fields.next()??, fields.next()??, fields.next()??);
-        if fields.next().is_some() {
-            return None;
-        }
-        let valid = (1..=32).contains(&r)
-            && (1..=255 - r).contains(&k_max)
-            && (1..=Self::T_MS_MAX).contains(&t_ms);
-        valid.then_some(Self { k_max, t_ms, r })
-    }
 }
 
 const _: () = assert!(
     FecBlockParams::T_MS_MAX as u128 + crate::transport::admission::QUEUE_TARGET.as_millis() <= 66
 );
 
-/// `GHOSTFRAME_FEC_BLOCKS`: unset, empty, `off` or `0` is off; `adaptive` is
-/// adaptive. A value that does not parse or is out of range warns and is off.
-fn fec_blocks_from_lookup(get: &impl Fn(&str) -> Option<String>) -> FecMode {
-    let Some(raw) = get("GHOSTFRAME_FEC_BLOCKS") else {
-        return FecMode::Off;
-    };
-    let raw = raw.trim();
-    if raw.is_empty() || raw == "off" || raw == "0" {
-        return FecMode::Off;
+/// `GHOSTFRAME_FEC_BLOCKS` was the switch between FEC off, fixed and adaptive.
+/// Adaptive is now the only mode; a value still set is ignored, with one
+/// warning per process.
+fn warn_fec_blocks_removed(get: &impl Fn(&str) -> Option<String>) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if get("GHOSTFRAME_FEC_BLOCKS").is_some() {
+        ONCE.call_once(|| {
+            tracing::warn!(
+                target: "ghostframe::config",
+                "GHOSTFRAME_FEC_BLOCKS was removed and is ignored: FEC v2 adaptive is always on"
+            );
+        });
     }
-    if raw == "adaptive" {
-        return FecMode::Adaptive;
-    }
-    let parsed = FecBlockParams::parse(raw);
-    if parsed.is_none() {
-        tracing::warn!(
-            target: "ghostframe::config",
-            value = %raw,
-            "GHOSTFRAME_FEC_BLOCKS is not off, adaptive or k_max,t_ms,r with r in 1..=32, k_max in 1..=255-r, t_ms in 1..=50: FEC blocks are off"
-        );
-    }
-    parsed.into()
 }
 
 /// Which H.264 encoder backends the daemon may open
@@ -507,6 +497,7 @@ impl TransportConfig {
         allow(unused_variables)
     )]
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        warn_fec_blocks_removed(&get);
         // `GHOSTFRAME_CC` used to pick Cubic over the model controller. The
         // choice is gone; say so once rather than silently ignore it.
         if get("GHOSTFRAME_CC").is_some() {
@@ -550,7 +541,6 @@ impl TransportConfig {
             h264_backend: H264BackendChoice::parse(get("GHOSTFRAME_H264_BACKEND").as_deref()),
             openh264_lib: openh264_lib_from_lookup(&get),
             capture_fps: 0,
-            fec_mode: fec_blocks_from_lookup(&get),
         }
     }
 
@@ -1525,86 +1515,12 @@ mod tests {
     }
 
     #[test]
-    fn fec_blocks_parses_the_triple_and_is_off_otherwise() {
-        let parse =
-            |v: &str| match TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_FEC_BLOCKS", v)]))
-                .fec_mode
-            {
-                FecMode::Fixed(p) => Some(p),
-                FecMode::Off | FecMode::Adaptive => None,
-            };
-        let mode = |v: &str| {
-            TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_FEC_BLOCKS", v)])).fec_mode
-        };
-        let on = Some(FecBlockParams {
-            k_max: 64,
-            t_ms: 5,
-            r: 2,
-        });
-        assert_eq!(parse("64,5,2"), on);
-        assert_eq!(
-            parse(" 64, 5, 2 "),
-            on,
-            "whitespace around fields is ignored"
-        );
-        assert_eq!(
-            parse("253,20,2"),
-            Some(FecBlockParams {
-                k_max: 253,
-                t_ms: 20,
-                r: 2
-            }),
-            "k_max = 255 - r is the bound"
-        );
-        assert_eq!(
-            parse("1,1,32"),
-            Some(FecBlockParams {
-                k_max: 1,
-                t_ms: 1,
-                r: 32
-            })
-        );
-        assert_eq!(
-            parse("64,50,2").map(|p| p.t_ms),
-            Some(50),
-            "the advertised table's last span still fits"
-        );
-        for off in ["", "off", "0"] {
-            assert_eq!(parse(off), None, "{off:?} is off");
-        }
-        assert_eq!(
-            TransportConfig::from_lookup(lookup(&[])).fec_mode,
-            FecMode::Off,
-            "unset is off"
-        );
-        assert_eq!(mode("adaptive"), FecMode::Adaptive);
-        assert_eq!(mode(" adaptive "), FecMode::Adaptive);
-        for off in ["", "off", "0", "Adaptive2", "x,y,z"] {
-            assert_eq!(mode(off), FecMode::Off, "{off:?} is off");
-        }
-        assert_eq!(
-            mode("64,5,2"),
-            FecMode::Fixed(FecBlockParams {
-                k_max: 64,
-                t_ms: 5,
-                r: 2
-            })
-        );
-        for bad in [
-            "64,5,0",   // r = 0
-            "64,5,33",  // r over 32
-            "254,5,2",  // k_max over 255 - r
-            "64,0,2",   // t_ms 0
-            "64,51,2",  // t_ms over 50
-            "0,5,2",    // k_max 0
-            "64,5",     // missing field
-            "64,5,2,1", // extra field
-            "x,y,z",    // garbage
-            "64,5,-1",  // negative
-            "300,5,2",  // does not fit u8
-        ] {
-            assert_eq!(parse(bad), None, "{bad:?} must be refused");
-        }
+    fn fec_mode_defaults_to_adaptive_and_the_removed_env_var_is_ignored() {
+        assert_eq!(FecMode::default(), FecMode::Adaptive);
+        // Setting the removed variable changes nothing (and only warns).
+        let with = TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_FEC_BLOCKS", "64,5,2")]));
+        let without = TransportConfig::from_lookup(lookup(&[]));
+        assert_eq!(with.capture_fps, without.capture_fps);
     }
 
     #[test]
