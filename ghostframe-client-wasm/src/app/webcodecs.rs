@@ -30,6 +30,14 @@ pub struct WebCodec {
 }
 
 impl WebCodec {
+    /// `VideoDecoder.flush()`: the pictures the decoder still holds come out.
+    /// The client never needs it (the next access unit pushes the previous
+    /// picture out); a test feeding a single key chunk does. `None` without a
+    /// decoder.
+    pub fn flush(&self) -> Option<js_sys::Promise> {
+        self.decoder.as_ref().map(|d| d.flush())
+    }
+
     pub fn new(on_output: OnOutput, on_error: OnError) -> Self {
         WebCodec {
             decoder: None,
