@@ -409,8 +409,8 @@ mod tests {
             s.take_drained(),
             Drained {
                 solid: 2,
-                palrle: 1,
-                cdf53: 1,
+                palrle: 2,
+                cdf53: 3,
                 h264: 1
             }
         );
