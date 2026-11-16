@@ -179,6 +179,11 @@ mod tests {
     }
 
     #[test]
+    fn test_input_msg_type_is_0x05() {
+        assert_eq!(INPUT_MSG_TYPE, 0x05);
+    }
+
+    #[test]
     fn test_encode_pointer_move_negative() {
         let result = encode_pointer_move(-1, -1);
         assert_eq!(result, [0x05, 0x01, 0xff, 0xff, 0xff, 0xff]);
@@ -188,6 +193,8 @@ mod tests {
     fn test_encode_pointer_button() {
         let result = encode_pointer_button(5, 10, 1, true);
         assert_eq!(result, [0x05, 0x02, 0, 5, 0, 10, 1, 1]);
+        let up = encode_pointer_button(5, 10, 3, false);
+        assert_eq!(up, [0x05, 0x02, 0, 5, 0, 10, 3, 0]);
     }
 
     #[test]
