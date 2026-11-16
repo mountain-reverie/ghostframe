@@ -2429,7 +2429,12 @@ async fn the_queue_read_counters_are_kept_in_every_mode() {
             grid_cols: 4,
             grid_rows: 4,
         };
-        run_browserless_with_options(scene, links, RunOptions::default())
+        // The off arm, as the premise below asserts.
+        let opts = RunOptions {
+            fec_off: true,
+            ..RunOptions::default()
+        };
+        run_browserless_with_options(scene, links, opts)
             .await
             .expect("scene ran")
     };
