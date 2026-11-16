@@ -282,12 +282,12 @@ pub struct RunOptions {
     pub frame_cost: Option<Duration>,
     /// The model controller's settings. `None` follows `GHOSTFRAME_CC_*`.
     pub model: Option<ghostframe_lib::config::ModelSettings>,
-    /// The FEC block knob. `None` follows `GHOSTFRAME_FEC_BLOCKS`, which is
-    /// off by default.
+    /// Fixed FEC block parameters for the whole run. `None` is the product:
+    /// the adaptive controller (unless `fec_off`).
     pub fec_blocks: Option<ghostframe_lib::config::FecBlockParams>,
-    /// Run the adaptive FEC mode (no parameters live until a controller sets
-    /// some). Ignored when `fec_blocks` is set.
-    pub fec_adaptive: bool,
+    /// The control arm: no FEC blocks at all, every bundle PLAIN. Ignored when
+    /// `fec_blocks` is set. `false`, the default, is the adaptive product.
+    pub fec_off: bool,
     /// Adaptive mode only: never enter the frame notch (the control arm of the
     /// frame-notch scenes). `false`, the default, is the product.
     pub fec_no_frame_notch: bool,
@@ -1158,10 +1158,10 @@ async fn run_inner(
     let env_transport = ghostframe_lib::config::TransportConfig::from_env();
     bridge.set_openh264_lib_for_test(env_transport.openh264_lib.clone());
     bridge.use_model_controller_for_test(opts.model.unwrap_or(env_transport.model));
-    let fec_mode = match (opts.fec_blocks, opts.fec_adaptive) {
+    let fec_mode = match (opts.fec_blocks, opts.fec_off) {
         (Some(p), _) => ghostframe_lib::config::FecMode::Fixed(p),
-        (None, true) => ghostframe_lib::config::FecMode::Adaptive,
-        (None, false) => env_transport.fec_mode,
+        (None, true) => ghostframe_lib::config::FecMode::Off,
+        (None, false) => ghostframe_lib::config::FecMode::Adaptive,
     };
     bridge.set_fec_mode_for_test(fec_mode);
     if opts.fec_no_frame_notch {

@@ -198,7 +198,6 @@ enum Arm {
 async fn run(cell: Cell, seed: u64, secs: u64, arm: Arm) -> Run {
     let (scene, links) = scene(cell, seed, secs * 1000);
     let opts = RunOptions {
-        fec_adaptive: true,
         fec_no_frame_notch: arm == Arm::Single,
         ..RunOptions::default()
     };

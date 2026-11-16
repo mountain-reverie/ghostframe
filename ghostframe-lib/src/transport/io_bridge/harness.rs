@@ -90,13 +90,13 @@ impl IoBridge {
         self.h264.openh264_lib = lib.as_deref().map(std::sync::Arc::<std::path::Path>::from);
     }
 
-    /// Set the FEC block mode the daemon would read from
-    /// `GHOSTFRAME_FEC_BLOCKS`. Meant for a bridge with nothing open.
+    /// Set the FEC block mode (the daemon is always adaptive; this
+    /// selects the off control arm or fixed parameters). Meant for a bridge with nothing open.
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn set_fec_mode_for_test(&mut self, mode: crate::config::FecMode) {
         self.fec_mode = mode;
         self.fec_live = mode.initial_live();
-        self.fec_adapt = (mode == crate::config::FecMode::Adaptive)
+        self.fec_adapt = matches!(mode, crate::config::FecMode::Adaptive)
             .then(crate::transport::fec_tx::adapt::FecAdapt::new);
         self.packer.set_blocks(self.fec_live);
     }
@@ -113,8 +113,7 @@ impl IoBridge {
         }
     }
 
-    /// Set the FEC block knob the daemon would read from
-    /// `GHOSTFRAME_FEC_BLOCKS`. `None` is off.
+    /// Set fixed FEC block parameters. `None` is the off control arm.
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn set_fec_blocks_for_test(&mut self, params: Option<crate::config::FecBlockParams>) {
         self.set_fec_mode_for_test(params.into());

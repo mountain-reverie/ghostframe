@@ -389,9 +389,9 @@ Every field and the variable are explained in
 is on the separate `h264 client feedback` line, target
 `ghostframe_lib::transport::io_bridge`, not on `h264 stats`.
 
-FEC v2 blocks are off by default. `GHOSTFRAME_FEC_BLOCKS=k_max,t_ms,r` or
-`adaptive` turns them on (ranges and the rest under "Reading FEC v2" below;
-anything else logs one warning and leaves them off). The server groups bundles into blocks
+FEC v2 adaptive is always on; there is no switch (`GHOSTFRAME_FEC_BLOCKS` was
+removed: a value still set logs one warning and is ignored; see "Reading FEC
+v2" below). The server groups bundles into blocks
 that close at `k_max` symbols, at `t_ms`, on Empty or on an MTU shrink, and
 sends REPAIR frames at close. The `fec v2 blocks` line (cumulative, same
 cadence) carries `blocks_closed_kmax` / `_time` / `_empty` / `_mtu`,
@@ -511,17 +511,18 @@ Env-gated, off by default:
 
 Tile XOR parity is gone (`GHOSTFRAME_TILE_FEC`, `TransportConfig::tile_fec` and
 `RunOptions::tile_fec` no longer exist). FEC v2 repair (REPAIR frames, R6-d) is
-implemented behind `GHOSTFRAME_FEC_BLOCKS`. With the knob unset every bundle is
-an unprotected PLAIN one and loss is recovered by retransmission only.
+always on, under the adaptive controller. A bundle is an unprotected PLAIN one
+until loss is shown, and then loss is recovered by retransmission only.
 
 ### Reading FEC v2 (Reed-Solomon blocks)
 
-**Switch.** `GHOSTFRAME_FEC_BLOCKS` (read once at start, fixed for the process;
-`ghostframe-lib/src/config.rs`): unset, empty, `off` or `0` is **off** (the
-default); `adaptive` lets the controller choose; `k_max,t_ms,r` (e.g. `64,5,2`)
-fixes it, with `r` in 1..=32, `k_max` in 1..=255-r, `t_ms` in 1..=50. Anything
-else warns on target `ghostframe::config` and means off. `adaptive` starts
-with no repair live (every bundle PLAIN) until loss is shown.
+**No switch.** The adaptive controller is the only mode (`FecMode::Adaptive`,
+`ghostframe-lib/src/config.rs`). `GHOSTFRAME_FEC_BLOCKS` was removed; if it is
+still set the daemon logs one warning on target `ghostframe::config` and ignores
+it. The off and fixed `k_max,t_ms,r` modes exist only for tests and the
+browserless harness (`RunOptions::fec_off` is the control arm,
+`RunOptions::fec_blocks` the fixed one) and are compiled out of the daemon. The
+controller starts with no repair live (every bundle PLAIN) until loss is shown.
 
 **Log lines**, all at the `cumulative emit` cadence, cumulative. `fec v2
 inbound`: `repair_requests_rx`, `declined_rx`, `recovered_rx`,
@@ -531,7 +532,7 @@ last LOSS_REPORT as `client_lost_pre_fec` / `client_recovered` /
 (`blocks_closed_kmax|time|empty|mtu`, `block_k_mean`), `repairs_sent`,
 `repair_bytes`, `closed_declined` (`blocks_closed_declined` is the bridge's
 copy), `closed_declined_late`, `block_requests_served`, `pto_repair_rows`.
-Zero `repairs_sent` with the knob on is a clean link (or adaptive still Clean),
+Zero `repairs_sent` is a clean link (or adaptive still Clean),
 not a broken probe; zero `repair_requests_rx` means the client never needed a
 second round. `fec v2 adapt` (adaptive only): `adapt_state` (`clean` = loss not
 shown to reach the 0.1 % floor, r = 0; `engaged`), `adapt_p_hat_ppm` (decayed

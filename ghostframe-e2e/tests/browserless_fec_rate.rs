@@ -60,7 +60,7 @@ async fn run(seed: u64, adaptive: bool) -> BrowserlessResult {
         grid_rows: 4,
     };
     let opts = RunOptions {
-        fec_adaptive: adaptive,
+        fec_off: !adaptive,
         ..RunOptions::default()
     };
     run_browserless_with_options(scene, links, opts)

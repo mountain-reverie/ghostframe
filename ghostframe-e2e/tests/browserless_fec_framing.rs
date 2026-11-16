@@ -13,7 +13,11 @@ use ghostframe_e2e::harness::scene_tiles::TileSpec;
 use ghostframe_e2e::netsim::{DropPlan, DropRule, NetProfile};
 
 fn framed() -> RunOptions {
-    RunOptions::default()
+    // Framing, not FEC, is under test: the control arm keeps every bundle PLAIN.
+    RunOptions {
+        fec_off: true,
+        ..RunOptions::default()
+    }
 }
 
 #[tokio::test(start_paused = true)]
