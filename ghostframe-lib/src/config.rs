@@ -205,7 +205,7 @@ impl ClassifierConfig {
     }
 }
 
-/// Transport-layer knobs: fault injection, pacing overrides, FEC.
+/// Transport-layer knobs: fault injection, pacing overrides.
 ///
 /// Deliberately not `Clone`: `outbound_loss`/`inbound_loss` carry a
 /// `LossInjector`, whose PRNG state a clone would duplicate rather than
@@ -274,7 +274,7 @@ pub enum FecMode {
 }
 
 impl FecMode {
-    /// The parameters live from the first bundle: the knob for `Fixed`, none
+    /// The parameters live from the first bundle: the fixed parameters for `Fixed`, none
     /// for `Off` and `Adaptive`.
     pub fn initial_live(self) -> Option<FecBlockParams> {
         match self {
@@ -305,7 +305,7 @@ impl From<Option<FecBlockParams>> for FecMode {
     }
 }
 
-/// The fixed `(k_max, T, r)` of the FEC block knob (`GHOSTFRAME_FEC_BLOCKS`):
+/// Fixed `(k_max, T, r)` FEC block parameters (test and harness only):
 /// a block closes at `k_max` source symbols, at `t_ms` after its first
 /// source, or at Empty, and carries `r` repair symbols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,7 +320,7 @@ pub struct FecBlockParams {
 }
 
 impl FecBlockParams {
-    /// The longest `t_ms` the knob accepts. The advertised span table tops out
+    /// The longest `t_ms` a block may use. The advertised span table tops out
     /// at 66 ms and a block advertises `t_ms` plus the queue allowance, so 50 is
     /// the last value that still fits (asserted below). The adaptive ladder
     /// caps lower (`adapt_size::T_MAX_MS`, 20): this range serves the split of
@@ -1512,15 +1512,6 @@ mod tests {
             !TransportConfig::from_lookup(lookup(&[])).skip_palette_session_reset,
             "unset must yield false"
         );
-    }
-
-    #[test]
-    fn fec_mode_defaults_to_adaptive_and_the_removed_env_var_is_ignored() {
-        assert_eq!(FecMode::default(), FecMode::Adaptive);
-        // Setting the removed variable changes nothing (and only warns).
-        let with = TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_FEC_BLOCKS", "64,5,2")]));
-        let without = TransportConfig::from_lookup(lookup(&[]));
-        assert_eq!(with.capture_fps, without.capture_fps);
     }
 
     #[test]

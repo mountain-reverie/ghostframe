@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! The block send side with the knob on (R6-d task D4b). Same rig as
+//! The block send side with fixed parameters live (R6-d task D4b). Same rig as
 //! `bundle_tx_tests`: a unit bridge with a test wire, production code above it.
 
 use super::*;
@@ -252,7 +252,7 @@ fn assert_repairs_are_offered(mut on: IoBridge, tiles: u32) {
     }
     assert_eq!(
         off.block_tx.repairs_sent, 0,
-        "premise: no repairs with the knob off"
+        "premise: no repairs with FEC off"
     );
     assert!(on.block_tx.repairs_sent >= 2, "premise: repairs flowed");
     let repair = on.instr.offered.of(WireClass::Repair);
@@ -267,7 +267,7 @@ fn assert_repairs_are_offered(mut on: IoBridge, tiles: u32) {
         on.offered_wire_bytes,
         off.offered_wire_bytes
     );
-    // ... so the share stays where framing puts it with the knob off.
+    // ... so the share stays where framing puts it with FEC off.
     let (a, c) = (offered_share(&off), offered_share(&on));
     assert!(
         (a - c).abs() < 0.03,
@@ -1058,7 +1058,7 @@ fn pump_tail(b: &mut IoBridge) {
 }
 
 #[tokio::test]
-async fn adaptive_with_no_live_params_sends_the_bytes_the_knob_off_sends() {
+async fn adaptive_with_no_live_params_sends_the_bytes_fec_off_sends() {
     let scene = |b: &mut IoBridge| {
         let tag = ProbeTag {
             id: 3,
@@ -1440,5 +1440,21 @@ async fn the_open_source_bundle_counts_its_source_header_toward_the_depth_gate()
     assert_eq!(
         b.unsent_bundle_bytes(),
         open + ghostframe_protocol::fec::frame::FEC_SOURCE_HEADER_LEN + b.live_framing_len()
+    );
+}
+
+/// The other half: adaptive with nothing live seals PLAIN frames, whose header
+/// is shorter. Counted as SOURCE it would over-count and hold work back.
+#[tokio::test]
+async fn the_open_plain_bundle_counts_its_plain_header_toward_the_depth_gate() {
+    let mut b = adaptive_bridge();
+    submit_tiles(&mut b, 1, None);
+    b.drain_reliable_emitter(now_std());
+    let open = b.packer.open_bytes();
+    assert!(open > 0, "premise: a record waits in the open bundle");
+    assert!(b.pending_bundles.is_empty(), "premise: nothing sealed yet");
+    assert_eq!(
+        b.unsent_bundle_bytes(),
+        open + ghostframe_protocol::fec::frame::FEC_PLAIN_HEADER_LEN + b.live_framing_len()
     );
 }

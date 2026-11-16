@@ -511,8 +511,8 @@ Env-gated, off by default:
 
 Tile XOR parity is gone (`GHOSTFRAME_TILE_FEC`, `TransportConfig::tile_fec` and
 `RunOptions::tile_fec` no longer exist). FEC v2 repair (REPAIR frames, R6-d) is
-always on, under the adaptive controller. A bundle is an unprotected PLAIN one
-until loss is shown, and then loss is recovered by retransmission only.
+always on, under the adaptive controller. Until loss is shown a bundle is an
+unprotected PLAIN one, and loss is then recovered by retransmission only.
 
 ### Reading FEC v2 (Reed-Solomon blocks)
 
