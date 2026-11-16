@@ -230,7 +230,8 @@ pub struct H264Stats {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct H264Report {
     pub stats: H264Stats,
-    /// Ledger records outstanding at the end (all H.264 in an H.264-only scene).
+    /// H.264 fragments outstanding in the ledger at the end (repair frames and
+    /// other content are not counted).
     pub ledger_records: usize,
     /// Fragments still held in the probe cache.
     pub probe_cache_fragments: usize,

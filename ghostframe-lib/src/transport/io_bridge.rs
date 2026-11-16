@@ -2815,7 +2815,14 @@ impl IoBridge {
             *self.emitter_stats_publish.lock().unwrap() = published;
             *self.h264_stats_publish.lock().unwrap() = H264Report {
                 stats: self.h264.stats,
-                ledger_records: self.transmission_ledger.len(),
+                // H.264 fragments only: a FEC repair frame is a ledger record
+                // too, and is not an H.264 transmission (`tx_recorded`).
+                ledger_records: self.transmission_ledger.count_outstanding(|c| {
+                    matches!(
+                        c,
+                        crate::transport::reliable_emitter::Content::H264Frag { .. }
+                    )
+                }),
                 probe_cache_fragments: self.reliable_emitter.h264.len(),
                 stalled: self.h264.stalled,
                 refs: self.h264_refs_report(),
