@@ -10,3 +10,8 @@ pub mod decoder;
 pub mod input_map;
 pub mod page;
 pub mod session;
+
+#[cfg(target_arch = "wasm32")]
+pub mod js;
+#[cfg(target_arch = "wasm32")]
+pub mod streams;
