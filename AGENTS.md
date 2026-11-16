@@ -389,9 +389,9 @@ Every field and the variable are explained in
 is on the separate `h264 client feedback` line, target
 `ghostframe_lib::transport::io_bridge`, not on `h264 stats`.
 
-FEC v2 blocks are off by default. `GHOSTFRAME_FEC_BLOCKS=k_max,t_ms,r` turns
-them on (`r` in 1..=32, `k_max` in 1..=255-r, `t_ms` in 1..=20; anything else
-logs one warning and leaves them off). The server groups bundles into blocks
+FEC v2 blocks are off by default. `GHOSTFRAME_FEC_BLOCKS=k_max,t_ms,r` or
+`adaptive` turns them on (ranges and the rest under "Reading FEC v2" below;
+anything else logs one warning and leaves them off). The server groups bundles into blocks
 that close at `k_max` symbols, at `t_ms`, on Empty or on an MTU shrink, and
 sends REPAIR frames at close. The `fec v2 blocks` line (cumulative, same
 cadence) carries `blocks_closed_kmax` / `_time` / `_empty` / `_mtu`,
