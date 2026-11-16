@@ -110,7 +110,7 @@ transmission with a real `wire_seq`. There is no H.264 XOR parity: it was
 removed in B7b from the server and later from the protocol and both clients;
 a lost fragment is repaired by a retransmission or, failing that, a recovery
 from the acknowledged anchor. Tile XOR parity is gone too; FEC v2 repair
-(`GHOSTFRAME_FEC_BLOCKS`) is the only parity.
+(adaptive, always on) is the only parity.
 
 ### Frame ack, datagram 0x0A (client to server)
 

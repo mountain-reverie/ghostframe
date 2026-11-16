@@ -27,7 +27,6 @@ const SEEDS: [u64; 3] = [0xFB_0001, 0xFB_0002, 0xFB_0003];
 
 fn adaptive() -> RunOptions {
     RunOptions {
-        fec_adaptive: true,
         ..RunOptions::default()
     }
 }
@@ -519,7 +518,10 @@ impl Arm {
     }
     fn options(self) -> RunOptions {
         match self {
-            Arm::Off => RunOptions::default(),
+            Arm::Off => RunOptions {
+                fec_off: true,
+                ..RunOptions::default()
+            },
             Arm::Fixed => RunOptions {
                 fec_blocks: Some(FecBlockParams {
                     k_max: 64,

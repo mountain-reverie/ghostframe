@@ -753,12 +753,23 @@ fn frames_digest(frames: &[Vec<u8>]) -> (usize, u64) {
     (frames.len(), h)
 }
 
+/// The daemon's bridge is adaptive with no switch: a freshly built one has the
+/// block machinery and the controller, and nothing live yet.
+#[tokio::test]
+async fn a_new_bridge_defaults_to_the_adaptive_controller() {
+    let b = framed_bridge();
+    assert_eq!(b.fec_mode, crate::config::FecMode::Adaptive);
+    assert!(b.fec_machinery() && b.fec_adapt.is_some() && b.fec_live.is_none());
+}
+
 /// Knob-off byte identity (R6-d D2 step 0). The scene is scripted and the
 /// digest was recorded at the R6-c tip (d494b094), before any block code
 /// existed. With the knob off every later step must reproduce it exactly.
 #[tokio::test]
 async fn knob_off_sent_frames_match_the_r6c_golden() {
     let mut b = framed_bridge();
+    // The daemon is always adaptive; the golden is the off control arm.
+    b.set_fec_mode_for_test(crate::config::FecMode::Off);
     submit_tiles(&mut b, 10);
     let now = now_std();
     let template = bytes::Bytes::from(vec![7u8; 100]);

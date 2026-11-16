@@ -186,12 +186,6 @@ pub async fn setup_e2e_server_as(
         server_image = server_image.with_mount(Mount::bind_mount("/dev/dri", "/dev/dri"));
         server_image = server_image.with_privileged(true);
     }
-    // The FEC v2 block knob (off by default) reaches the server from the
-    // e2e process's own environment, so the whole e2e suite can run with
-    // blocks on: `GHOSTFRAME_FEC_BLOCKS=64,5,2 cargo test --test e2e`.
-    if let Ok(v) = std::env::var("GHOSTFRAME_FEC_BLOCKS") {
-        server_image = server_image.with_env_var("GHOSTFRAME_FEC_BLOCKS", v);
-    }
     // extra_env applied LAST so tests can override defaults like XORG_CONF.
     for (k, v) in spec.extra_env {
         server_image = server_image.with_env_var(*k, *v);
