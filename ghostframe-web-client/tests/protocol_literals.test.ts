@@ -155,7 +155,7 @@ describe('TypeScript sources do not retype protocol constants', () => {
   it('production sources are clean', () => {
     const files = walk(SRC);
     // The walk itself must reach the tree, or "no hits" proves nothing.
-    expect(files.length).toBeGreaterThan(10);
+    expect(files.length).toBeGreaterThan(5);
     const offenders: string[] = [];
     for (const f of files) {
       const rel = relative(SRC, f);

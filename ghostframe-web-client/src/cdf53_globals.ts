@@ -9,11 +9,11 @@
 // `WasmClientCore` prevalidates internally and only ever hands back a
 // `TilePayload` (success) or a `DecodeError` (failure). This module is the
 // single place that re-derives the old counters from those two event
-// kinds, so it can be called identically from `main.ts` (against
+// kinds, so it can be called identically from `hooks.ts` (against
 // `window`) and from a Node driver against `pkg-node` (against a plain
 // object) — never duplicated.
 //
-// See `main.ts`'s `handleEvent` for the call site and
+// See `hooks.ts`'s `handleRecord` for the call site and
 // `ghostframe-web-client/tests/cdf53_globals.test.ts` for the proof that
 // each of the five actually moves.
 
@@ -28,13 +28,13 @@ export type ProtocolTileData =
   | { codec: 'Cdf53'; pass_idx: number; bit_planes: Uint8Array; present_passes?: number | null };
 
 /** The two event kinds this module cares about. Structurally matches the
- * corresponding arms of `main.ts`'s `WasmEvent` (itself mirroring
+ * corresponding arms of the routed event type in `hooks.ts` (itself mirroring
  * `ghostframe-client-wasm/src/boundary.rs`), but declared independently so
  * a Node caller driving `pkg-node`'s untyped (`any`) event objects doesn't
- * need to import main.ts's private type.
+ * need to import hooks.ts's types.
  *
  * Deliberately only these two variants, not a catch-all third member for
- * the other `WasmEvent` kinds: callers (main.ts, the Node test) always
+ * the other `WasmEvent` kinds: callers (hooks.ts, the Node test) always
  * cross an `any`-typed wasm event into this parameter, so the other kinds
  * still reach `recordProtocolEvent` at runtime — the `if` guard below
  * handles them — without this type needing to model their shape too. */

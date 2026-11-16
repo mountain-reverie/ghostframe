@@ -2,7 +2,7 @@
 /// <reference types="@webgpu/types" />
 
 // Type augmentation for test-instrumentation / e2e-readback properties
-// exposed on `window` by diagnostics.ts, main.ts and WebRenderer
+// exposed on `window` by diagnostics.ts, hooks.ts and WebRenderer
 // (ghostframe-client-wasm/src/web/renderer.rs).
 // Polled over CDP by the ghostframe e2e suite (`ghostframe-e2e/tests/e2e.rs`;
 // `e2e_polled_globals_are_live` guards that each stays non-trivial).
@@ -21,12 +21,12 @@ interface Window {
   __ghostframeStats: { tileDatagrams: number; frameDatagrams: number } | undefined;
   /** rAF tick counter; incremented every requestAnimationFrame callback. */
   __ghostframeRafTicks: number | undefined;
-  /** Stats samples the wasm core applied to its rings (e2e only); see main.ts. */
+  /** Stats samples the wasm core applied to its rings (e2e only); see hooks.ts. */
   __ghostframeStatsSamples: number | undefined;
-  /** Server-stream frames the wasm core received, counted before any check (e2e only); see main.ts. */
+  /** Server-stream frames the wasm core received, counted before any check (e2e only); see hooks.ts. */
   __ghostframeStatsFrames: number | undefined;
 
-  // ----- renderer reference (set by main.ts from `renderer.debugHandles()`) --------------------
+  // ----- renderer reference (set by hooks.ts from `renderer.debugHandles()`) --------------------
   __ghostframeRenderer: { device: unknown; texture: { width: number; height: number } } | undefined;
 
   // ----- recorder arrays (FIFO-capped, pushed from diagnostics.ts) ------------
@@ -66,7 +66,7 @@ interface Window {
   __cdf53PrevalidateFails: number | undefined;
   __cdf53LastFailCode: number | undefined;
 
-  /** Core-side CDF53 coverage + the worst incomplete tiles (main.ts). */
+  /** Core-side CDF53 coverage + the worst incomplete tiles (hooks.ts). */
   __cdf53CoverageSummary(): { summary: unknown; incomplete: unknown };
 
   // ----- [H2-DIAG] client-side palette atlas writes -------------------------

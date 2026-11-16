@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! The session boundary. `main.ts` drives this at cutover.
+//! The session boundary. `app::client` drives this.
 //!
 //! Every export returns a value JS can inspect; none may `unwrap` on
 //! wire-derived data. A panic here aborts the whole module — every later
@@ -146,7 +146,7 @@ impl WasmClientCore {
     }
 
     /// Note `n` frames painted, for the panel's painted-fps row. Called by
-    /// `main.ts` until the renderer moves into Rust.
+    /// `app::client`.
     #[wasm_bindgen(js_name = recordPaints)]
     pub fn record_paints(&mut self, n: u32) {
         self.inner.borrow_mut().record_paints(n);
@@ -290,7 +290,7 @@ impl WasmClientCore {
 
     /// Samples the stats rings have accepted since this core was created.
     /// `u32`, not `u64`: a `u64` crosses as a BigInt, and at one sample a
-    /// second this overflows after 136 years. Published by `main.ts` as
+    /// second this overflows after 136 years. Published by `hooks.ts` (`serverStream`) as
     /// `window.__ghostframeStatsSamples` for the e2e suite.
     #[wasm_bindgen(js_name = statsSamplesAccepted)]
     pub fn stats_samples_accepted(&self) -> u32 {
@@ -317,7 +317,7 @@ impl WasmClientCore {
     ///
     /// The browser cannot derive this any more: the TypeScript receive loop
     /// that incremented those counters went at the wasm cutover, leaving
-    /// `main.ts` holding a `stats` object it never wrote to. Five e2e tests
+    /// the old `main.ts` holding a `stats` object it never wrote to. Five e2e tests
     /// read the globals and saw 0 on sessions moving thousands of datagrams.
     /// Classified by `ClientCore::handle_datagram`'s own dispatch rather than
     /// re-tested here, so the two cannot drift.
@@ -351,43 +351,6 @@ impl WasmClientCore {
     /// The shared core, for the panel. Not exported to JS.
     pub(crate) fn shared(&self) -> Rc<RefCell<ClientCore>> {
         self.inner.clone()
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen]
-impl WasmClientCore {
-    /// [`WasmClientCore::handle_datagrams`] with the tile work applied to
-    /// `renderer` inside wasm: tile payloads, palettes and frame sizes never
-    /// cross into JS. Returns one record per event, in order (see
-    /// `web::route`): a slim record per tile (codec, coordinates, full
-    /// length, first 16 bytes), `FrameDimensions` with `applied`/`reason`, and
-    /// `NeedsH264`/`DecodeError`/`Evicted` as before. A failing event is
-    /// carried in its record's `error`; the rest of the batch is still applied.
-    ///
-    /// Kept until the Rust app loop replaces main.ts (Task 14), so every
-    /// commit on the way still builds.
-    #[wasm_bindgen(js_name = handleDatagramsInto)]
-    pub fn handle_datagrams_into(
-        &mut self,
-        renderer: &mut crate::web::renderer::WebRenderer,
-        concat: &[u8],
-        lens: &[u32],
-        arrivals_us: &[f64],
-    ) -> Result<JsValue, JsValue> {
-        let events = feed_datagrams(&mut self.inner.borrow_mut(), concat, lens, arrivals_us);
-        to_js(&crate::web::route::route(events, renderer))
-    }
-
-    /// [`WasmClientCore::on_timeout`] with the same routing.
-    #[wasm_bindgen(js_name = onTimeoutInto)]
-    pub fn on_timeout_into(
-        &mut self,
-        renderer: &mut crate::web::renderer::WebRenderer,
-        now_us: u64,
-    ) -> Result<JsValue, JsValue> {
-        let events = self.inner.borrow_mut().on_timeout(now_us);
-        to_js(&crate::web::route::route(events, renderer))
     }
 }
 

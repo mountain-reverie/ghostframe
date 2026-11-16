@@ -7,7 +7,7 @@
 // (`rx{}`, `lastSeq`, the FEC recovery counters, per-tier receive bytes)
 // used to print an "n/a(wasm-internal)" sentinel; they are gone rather than
 // kept as lines that look like measurements. What remains and is fed:
-//   - `Δdrain`   events applied to the renderer per window, per codec (counted by main.ts)
+//   - `Δdrain`   events applied to the renderer per window, per codec (counted by the Rust client)
 //   - `cdf53-coverage` / `cdf53-incomplete`  from `core.cdf53Coverage()`
 //   - `nack_sent`  NACK envelopes `drainTransmit` saw the core emit
 //   - `cdf53fails`  from the recordProtocolEvent counters

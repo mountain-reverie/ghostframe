@@ -358,7 +358,7 @@ Client-side diagnostics are printed by the browser console. **Some of them are
 dead**: `rx{...}` and `cdf53-coverage` read `window.__tileCounts` /
 `window.__cdf53Coverage`, which nothing populates since the wasm cutover, so
 they always read zero. `fec-coverage` says `n/a(wasm-internal)` explicitly.
-`Δdrain` (events applied to the renderer in the window, per codec: counted by `main.ts` from the core's slim records) and `nack_sent` are live. Do not diagnose from the dead ones.
+`Δdrain` (events applied to the renderer in the window, per codec: counted by the Rust client, `ghostframe-client-wasm/src/app/session.rs`, from the core's slim records) and `nack_sent` are live. Do not diagnose from the dead ones.
 `window.__ghostframeStatsSamples` and `window.__ghostframeStatsFrames` (e2e
 pages only) are live: the server stats samples the core applied, and every
 server-stream frame it received; both move only while the stats panel is open.

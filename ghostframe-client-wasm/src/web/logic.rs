@@ -27,7 +27,7 @@ pub fn should_skip_paint(i: &PaintInputs) -> bool {
 }
 
 /// How CDF 5/3 tiles are decoded, from the page URL's `cdf53` parameter
-/// (read by `main.ts`, so this crate never touches the environment).
+/// (read by `app::page`, so this crate never touches the environment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cdf53Mode {
     /// The GPU grid if `TileRenderer::try_enable_cdf53_gpu`'s self-test passes, else the CPU decoder.

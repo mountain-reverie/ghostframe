@@ -138,7 +138,7 @@ impl WebRenderer {
         mode: Cdf53Mode,
     ) -> Result<Self, String> {
         // Design D2: WebGPU is required; its absence is fatal and named, so
-        // main.ts can tell the user instead of showing a blank page.
+        // the client (`app::client`) can tell the user instead of showing a blank page.
         if !has_navigator_gpu() {
             return Err("WEBGPU_UNAVAILABLE: navigator.gpu is undefined".into());
         }
@@ -660,7 +660,7 @@ impl WebRenderer {
     /// for `takeErrors`.
     #[wasm_bindgen(js_name = paintTick)]
     pub fn paint_tick_js(&mut self, now_us: u64) -> u32 {
-        // A u64 crosses as a BigInt, exactly what `nowUs()` in main.ts returns
+        // A u64 crosses as a BigInt, exactly what the client's clock returns
         // and what `onTimeout` takes: one clock type for every call.
         match self.paint_tick(now_us) {
             Ok(o) => u32::from(o.presented),
