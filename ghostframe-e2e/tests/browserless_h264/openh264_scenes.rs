@@ -713,7 +713,10 @@ const SCENE6B_LINK: [(u64, u64); 2] = [(0, 100_000), (4_000_000, 375_000)];
 /// estimate follows it. (The rise is at 4 s, not 5: the acknowledged rate is
 /// read over 300 ms, not over the 500 packets that spanned about a second once
 /// records were bundled, and on this sparse stream the estimate then takes
-/// about 10 s to climb, which 5 s of settling left the 15 s run too little of.) The library must accept the new rate (openh264 2.4.x
+/// about 10 s to climb, which 5 s of settling left the 15 s run too little of.
+/// FIXME(fec-v2): that slow climb is a known cost, see `acked_rate_window` in
+/// `ghostframe-lib/src/transport/bwe/googcc.rs`; move the rise back to 5 s
+/// once it is fixed.) The library must accept the new rate (openh264 2.4.x
 /// refused every rise: its layer maximum, set after the target, was still the
 /// opening rate) and the stream must carry more: the coded bytes of the
 /// seconds after the rise settle are at least 2 x those before the rise (the
