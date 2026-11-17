@@ -707,10 +707,13 @@ async fn openh264_scene_6_the_library_follows_the_estimate_down() {
 
 /// The link of scene 6b before and after its rise (bytes a second): 0.8 and
 /// 3 Mbit/s.
-const SCENE6B_LINK: [(u64, u64); 2] = [(0, 100_000), (5_000_000, 375_000)];
+const SCENE6B_LINK: [(u64, u64); 2] = [(0, 100_000), (4_000_000, 375_000)];
 
-/// Scene 6b, the rise: the link rises from 0.8 to 3 Mbit/s at 5 s and the
-/// estimate follows it. The library must accept the new rate (openh264 2.4.x
+/// Scene 6b, the rise: the link rises from 0.8 to 3 Mbit/s at 4 s and the
+/// estimate follows it. (The rise is at 4 s, not 5: the acknowledged rate is
+/// read over 300 ms, not over the 500 packets that spanned about a second once
+/// records were bundled, and on this sparse stream the estimate then takes
+/// about 10 s to climb, which 5 s of settling left the 15 s run too little of.) The library must accept the new rate (openh264 2.4.x
 /// refused every rise: its layer maximum, set after the target, was still the
 /// opening rate) and the stream must carry more: the coded bytes of the
 /// seconds after the rise settle are at least 2 x those before the rise (the
@@ -790,7 +793,9 @@ async fn openh264_scene_6b_the_library_follows_the_estimate_up() {
 }
 
 /// Scene 9, heavy content: the whole picture changes every 45 frames (1.5 s),
-/// on a 1.5 Mbit/s link. The library has no per-frame cap, so each change codes
+/// on a 1 Mbit/s link (the estimate starts at 2 Mbit/s and an app-limited
+/// stream does not move it until a change saturates the link; on a 1.5 Mbit/s
+/// link the first changes then met a cap of 20 kB and none was over it). The library has no per-frame cap, so each change codes
 /// in one frame well over the average frame (about 10 kB against a cap of
 /// 6 to 7 kB). The stream must absorb it: nothing is shown wrong, the
 /// library makes no IDR for the change (scene-change detection is off:
@@ -802,7 +807,7 @@ async fn openh264_scene_9_a_scene_change_is_absorbed_without_an_idr() {
     for seed in SEEDS {
         let net = bottleneck_net(
             CapTimeline {
-                points: vec![(0, 187_500)],
+                points: vec![(0, 125_000)],
             },
             20_000,
             2_000,
