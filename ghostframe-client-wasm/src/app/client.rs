@@ -28,10 +28,35 @@ use crate::app::stats_line::{StatsInputs, StatsLine};
 use crate::app::streams::{pump_stream, LoggedWriter, RepairStatusStream};
 use crate::app::webcodecs::{frame_seq_of, OnError, OnOutput, WebCodec};
 use crate::core::{client_config, datagram_counts, feed_datagrams, new_client_core};
-use crate::units::{codec_from_u8, decode_error_code_from_u8};
 use crate::web::raw::{close_frame, js_message};
 use crate::web::renderer::WebRenderer;
 use crate::web::route::{route, Routed};
+
+/// `None` for an unrecognised discriminant: the caller drops the report
+/// rather than panicking, since a panic aborts the whole wasm module.
+///
+/// `Codec::from_u8` returns `Result<Codec, ProtocolError>`; the error carries
+/// nothing the caller acts on, so it is discarded.
+fn codec_from_u8(v: u8) -> Option<ghostframe_protocol::protocol::Codec> {
+    ghostframe_protocol::protocol::Codec::from_u8(v).ok()
+}
+
+fn decode_error_code_from_u8(v: u8) -> Option<ghostframe_client_core::DecodeErrorCode> {
+    use ghostframe_client_core::DecodeErrorCode::*;
+    Some(match v {
+        1 => PayloadTooShort,
+        2 => CountOutOfRange,
+        3 => ThinUncachedPalette,
+        4 => BundledTruncated,
+        5 => IndexOob,
+        6 => RleOvershoot,
+        7 => RleUndershoot,
+        8 => Cdf53BadPass,
+        9 => Cdf53Truncated,
+        10 => Cdf53RleLength,
+        _ => return None,
+    })
+}
 
 thread_local! {
     static PERFORMANCE: Option<web_sys::Performance> =
