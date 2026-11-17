@@ -15,6 +15,7 @@ use web_sys::{console, Document, HtmlCanvasElement, HtmlElement, WritableStreamD
 use crate::app::batch::{flush_decision, DatagramBatch, FlushDecision, FLUSH_FALLBACK_MS};
 use crate::app::bootstrap::bootstrap;
 use crate::app::close::close_overlay_message;
+use crate::app::debug_hooks::{self, DebugHandles};
 use crate::app::decoder::{not_output_warning, FrameDecoder};
 use crate::app::dom::{page_flags, pin_canvas, show_disconnected_overlay, PageLog};
 use crate::app::hooks::{HookCall, HookSink};
@@ -536,6 +537,8 @@ impl App {
 /// `try_borrow_mut`: on a conflict the call is dropped and logged once.
 struct PageSink {
     recorder: Option<Rc<RefCell<Recorder>>>,
+    /// The `window` logs `recorder`'s entries go to (`?e2e` only).
+    logs: Option<debug_hooks::Logs>,
     warned: Cell<bool>,
     stats: RefCell<StatsLine>,
     renderer: Rc<RefCell<WebRenderer>>,
@@ -678,24 +681,10 @@ impl HookSink for PageSink {
                 self.stats_tick(d, raf, nack);
             }
         }
-        append_logs(out);
+        if let Some(logs) = &self.logs {
+            debug_hooks::append(logs, out);
+        }
     }
-}
-
-/// Task 7 replaces this with `debug_hooks::append`, which pushes to the
-/// `window` logs.
-fn append_logs(_entries: Vec<LogEntry>) {}
-
-/// Task 7 replaces this with `debug_hooks::install`, called under `?e2e`:
-/// the `window` functions over the renderer, the core, the tick samples and
-/// the recorder.
-fn install_debug_hooks(
-    _renderer: &Rc<RefCell<WebRenderer>>,
-    _core: &Rc<OnceCell<Rc<RefCell<ClientCore>>>>,
-    _log: &Rc<PageLog>,
-    _tick_us: &Rc<RefCell<Vec<u32>>>,
-    _recorder: &Rc<RefCell<Recorder>>,
-) {
 }
 
 /// Start the client on this page. Resolves when the datagram stream ends; an
@@ -707,7 +696,15 @@ pub async fn start_client() -> Result<(), JsValue> {
         .document()
         .ok_or_else(|| JsValue::from_str("no document"))?;
     let log = Rc::new(PageLog::find(&document).map_err(|e| JsValue::from_str(&e))?);
-    if let Err(msg) = run(&window, &document, log.clone()).await {
+    // Under `?e2e` the recorder exists from here, and the console ring is the
+    // first thing installed, so even a start-up failure is in the dump.
+    let recorder = page_flags(&window)
+        .e2e
+        .then(|| Rc::new(RefCell::new(Recorder::new(true))));
+    if let Some(rec) = &recorder {
+        debug_hooks::install_console_ring(rec);
+    }
+    if let Err(msg) = run(&window, &document, log.clone(), recorder).await {
         log.line(&format!("Error: {msg}"));
         log.status(&format!("Error: {msg}"));
     }
@@ -730,6 +727,7 @@ async fn run(
     window: &web_sys::Window,
     document: &Document,
     log: Rc<PageLog>,
+    recorder: Option<Rc<RefCell<Recorder>>>,
 ) -> Result<(), String> {
     let flags = page_flags(window);
     let canvas: HtmlCanvasElement = document
@@ -762,14 +760,22 @@ async fn run(
 
     let api_core: Rc<OnceCell<Rc<RefCell<ClientCore>>>> = Rc::new(OnceCell::new());
     let tick_us = Rc::new(RefCell::new(Vec::new()));
-    let recorder = flags
-        .e2e
-        .then(|| Rc::new(RefCell::new(Recorder::new(flags.e2e))));
-    if let Some(rec) = &recorder {
-        install_debug_hooks(&renderer, &api_core, &log, &tick_us, rec);
-    }
+    // Before bootstrap, so a failure dump still finds `__ghostframeHealth`.
+    let logs = match (&recorder, flags.e2e) {
+        (Some(rec), true) => Some(debug_hooks::install(
+            window,
+            DebugHandles {
+                renderer: renderer.clone(),
+                core: api_core.clone(),
+                recorder: rec.clone(),
+                tick_us: tick_us.clone(),
+            },
+        )),
+        _ => None,
+    };
     let sink: Rc<dyn HookSink> = Rc::new(PageSink {
         recorder,
+        logs,
         warned: Cell::new(false),
         stats: RefCell::new(StatsLine::new()),
         renderer: renderer.clone(),
