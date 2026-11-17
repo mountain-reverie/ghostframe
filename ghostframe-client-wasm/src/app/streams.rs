@@ -95,6 +95,7 @@ struct RepairInner {
     open: OpenStream,
     warned_open: bool,
     warned_write: bool,
+    warned_overflow: bool,
 }
 
 /// The client-opened repair-status stream (FEC v2 rev 6): `PollOutput::
@@ -113,12 +114,26 @@ impl RepairStatusStream {
             open,
             warned_open: false,
             warned_write: false,
+            warned_overflow: false,
         })))
     }
 
     pub fn write(&self, bytes: &[u8]) {
-        let step = self.0.borrow_mut().pipe.push(bytes.to_vec());
-        self.run(step);
+        let (step, dropped) = {
+            let mut i = self.0.borrow_mut();
+            let before = i.pipe.dropped();
+            let step = i.pipe.push(bytes.to_vec());
+            let dropped = i.pipe.dropped() != before;
+            if dropped && !std::mem::replace(&mut i.warned_overflow, true) {
+                web_sys::console::warn_1(
+                    &"repair-status queue over its cap; dropping new status records".into(),
+                );
+            }
+            (step, dropped)
+        };
+        if !dropped {
+            self.run(step);
+        }
     }
 
     fn run(&self, step: Step) {
@@ -167,8 +182,11 @@ impl RepairStatusStream {
                     // Called now, so the writer queues the chunks in order.
                     let promise = writer.write_with_chunk(&Uint8Array::from(chunk.as_slice()));
                     let this = self.clone();
+                    let len = chunk.len();
                     spawn_local(async move {
-                        if let Err(e) = JsFuture::from(promise).await {
+                        let settled = JsFuture::from(promise).await;
+                        this.0.borrow_mut().pipe.settled(generation, len);
+                        if let Err(e) = settled {
                             let mut i = this.0.borrow_mut();
                             i.pipe.write_failed(generation);
                             if !std::mem::replace(&mut i.warned_write, true) {

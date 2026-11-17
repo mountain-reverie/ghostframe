@@ -13,6 +13,13 @@
 
 use ghostframe_protocol::fec::repair_status::FEC_REPAIR_STATUS_STREAM_TAG;
 
+/// Most bytes the pipe holds (queued while opening, or handed to the stream
+/// and not yet settled) before new chunks are refused. The same value as
+/// `MAX_REPAIR_STATUS_QUEUE` in `ghostframe-client-net/src/lib.rs`, which the
+/// native client applies to its queue; that crate is not a dependency of this
+/// one (it links quinn), so the number is repeated here.
+pub const MAX_REPAIR_STATUS_QUEUE: usize = 1 << 20;
+
 /// What the caller must do next.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Step {
@@ -37,6 +44,10 @@ enum State {
 pub struct RepairStatusPipe {
     state: State,
     tag_owed: bool,
+    /// Bytes queued or in flight on the current stream.
+    queued: usize,
+    /// Chunks refused because the cap was reached.
+    dropped: u64,
     /// Bumps on every open attempt, so a late failure from a dead stream
     /// cannot kill its successor.
     generation: u32,
@@ -47,6 +58,8 @@ impl Default for RepairStatusPipe {
         RepairStatusPipe {
             state: State::Closed,
             tag_owed: false,
+            queued: 0,
+            dropped: 0,
             generation: 0,
         }
     }
@@ -55,6 +68,13 @@ impl Default for RepairStatusPipe {
 impl RepairStatusPipe {
     /// A chunk from the core.
     pub fn push(&mut self, bytes: Vec<u8>) -> Step {
+        // Dropping an old chunk would corrupt the record framing; refuse the
+        // new one instead (as the native client does).
+        if self.queued + bytes.len() > MAX_REPAIR_STATUS_QUEUE {
+            self.dropped += 1;
+            return Step::Nothing;
+        }
+        self.queued += bytes.len();
         match &mut self.state {
             State::Closed => {
                 self.generation = self.generation.wrapping_add(1);
@@ -81,6 +101,7 @@ impl RepairStatusPipe {
         let mut chunks = queue;
         if self.tag_owed {
             chunks.insert(0, vec![FEC_REPAIR_STATUS_STREAM_TAG]);
+            self.queued += 1;
             self.tag_owed = false;
         }
         Step::Write(generation, chunks)
@@ -92,7 +113,21 @@ impl RepairStatusPipe {
         if generation == self.generation && matches!(self.state, State::Opening(_)) {
             self.state = State::Closed;
             self.tag_owed = true;
+            self.queued = 0;
         }
+    }
+
+    /// `len` bytes handed to the stream of `generation` were written or
+    /// failed: they no longer count against the cap.
+    pub fn settled(&mut self, generation: u32, len: usize) {
+        if generation == self.generation {
+            self.queued = self.queued.saturating_sub(len);
+        }
+    }
+
+    /// Chunks refused so far because the cap was reached.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
     }
 
     /// A write to the stream of `generation` failed. Idempotent: every write
@@ -101,6 +136,7 @@ impl RepairStatusPipe {
         if generation == self.generation && matches!(self.state, State::Open) {
             self.state = State::Closed;
             self.tag_owed = true;
+            self.queued = 0;
         }
     }
 }
@@ -168,6 +204,41 @@ mod tests {
         p.open_failed(1);
         assert_eq!(p.push(chunk(3)), Step::Open(2));
         assert_eq!(p.opened(2), Step::Write(2, vec![vec![TAG], chunk(3)]));
+    }
+
+    #[test]
+    fn the_cap_holds_while_opening_and_chunks_after_it_are_dropped() {
+        let mut p = RepairStatusPipe::default();
+        let big = vec![0u8; MAX_REPAIR_STATUS_QUEUE - 10];
+        assert_eq!(p.push(big.clone()), Step::Open(1));
+        // 10 bytes of room: a 11-byte chunk is refused, a 10-byte one fits.
+        assert_eq!(p.push(vec![1; 11]), Step::Nothing);
+        assert_eq!(p.dropped(), 1);
+        assert_eq!(p.push(vec![2; 10]), Step::Nothing);
+        assert_eq!(p.push(vec![3]), Step::Nothing);
+        assert_eq!(p.dropped(), 2);
+        // What was accepted is intact and in order; the refused ones are gone.
+        assert_eq!(p.opened(1), Step::Write(1, vec![big, vec![2; 10]]));
+    }
+
+    #[test]
+    fn written_bytes_free_room_and_a_failure_clears_the_count() {
+        let mut p = RepairStatusPipe::default();
+        p.push(vec![TAG, 1]);
+        p.opened(1);
+        let big = vec![0u8; MAX_REPAIR_STATUS_QUEUE - 2];
+        assert!(matches!(p.push(big.clone()), Step::Write(1, _)));
+        assert_eq!(p.push(vec![9]), Step::Nothing); // full: 2 + len == cap
+        assert_eq!(p.dropped(), 1);
+        p.settled(1, big.len());
+        assert!(matches!(p.push(vec![9]), Step::Write(1, _)));
+        // A failure empties the queue; late settles from the dead stream do
+        // not eat into the next one.
+        p.write_failed(1);
+        assert_eq!(p.push(big.clone()), Step::Open(2));
+        p.settled(1, big.len());
+        assert_eq!(p.push(vec![0; 3]), Step::Nothing);
+        assert_eq!(p.dropped(), 2);
     }
 
     #[test]

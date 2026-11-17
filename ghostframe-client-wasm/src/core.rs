@@ -629,23 +629,27 @@ mod moved_from_vitest {
 
     /// Replaces h264_ack.test.ts "are acknowledged by wire_seq, and a NO_ACK
     /// fragment is not". Acknowledgements name the frame (`bundle_seq`) the
-    /// fragment arrived in, so each fragment travels in a bundle numbered
-    /// like its old wire_seq.
+    /// fragment arrived in, so each fragment travels in a bundle whose
+    /// number differs from its wire_seq.
     #[test]
     fn h264_fragments_are_acknowledged_by_the_bundle_they_arrived_in() {
         let mut core = core_with(true, true, true);
         drain(&mut core, 0); // the HELLO
         let dg = |bundle, d: Vec<u8>| frame_plain(bundle, &[d.as_slice()]);
         let mut events = core.handle_datagram(
-            &dg(41, frame_datagram(7, 0, 2, 41, true, &[1, 2, 3])),
+            &dg(1041, frame_datagram(7, 0, 2, 41, true, &[1, 2, 3])),
             1_000,
         );
         events.extend(
-            core.handle_datagram(&dg(42, frame_datagram(7, 1, 2, 42, true, &[4, 5])), 2_000),
+            core.handle_datagram(&dg(1042, frame_datagram(7, 1, 2, 42, true, &[4, 5])), 2_000),
         );
         // Reassembled, so the datagrams were taken, not dropped.
         assert!(events.iter().any(|e| matches!(e, Event::NeedsH264 { .. })));
-        assert_eq!(acked_bundle_seqs(&mut core, 20_000), vec![41, 42]);
+        // The bundle numbers differ from the records' wire_seqs (41, 42), so
+        // an ACK that named the record instead of the bundle fails here.
+        let acked = acked_bundle_seqs(&mut core, 20_000);
+        assert_eq!(acked, vec![1041, 1042]);
+        assert!(!acked.contains(&41) && !acked.contains(&42), "{acked:?}");
     }
 
     /// Replaces h264_ack.test.ts "a fragment older than the window is still
@@ -655,10 +659,13 @@ mod moved_from_vitest {
         let mut core = core_with(true, true, true);
         drain(&mut core, 0);
         let dg = |bundle, d: Vec<u8>| frame_plain(bundle, &[d.as_slice()]);
-        core.handle_datagram(&dg(1, frame_datagram(50, 0, 1, 1, false, &[1])), 1_000);
-        let stale = core.handle_datagram(&dg(2, frame_datagram(10, 0, 1, 2, false, &[1])), 2_000);
+        core.handle_datagram(&dg(1001, frame_datagram(50, 0, 1, 1, false, &[1])), 1_000);
+        let stale =
+            core.handle_datagram(&dg(1002, frame_datagram(10, 0, 1, 2, false, &[1])), 2_000);
         assert!(stale.is_empty());
-        assert_eq!(acked_bundle_seqs(&mut core, 20_000), vec![1, 2]);
+        let acked = acked_bundle_seqs(&mut core, 20_000);
+        assert_eq!(acked, vec![1001, 1002]);
+        assert!(!acked.contains(&1) && !acked.contains(&2), "{acked:?}");
     }
 
     // ---- h264_result.test.ts (core half) ----

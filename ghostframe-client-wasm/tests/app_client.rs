@@ -149,7 +149,7 @@ async fn a_tile_is_acknowledged_and_the_hooks_see_the_tick_in_order() {
     tile[8..12].copy_from_slice(&4242u32.to_be_bytes());
     // Every datagram the core accepts is a rev 6 frame; the ACK names the
     // frame's bundle_seq, not the record's wire_seq.
-    for (bundle, d) in [(4241, &dims), (4242, &tile)] {
+    for (bundle, d) in [(9000, &dims), (9001, &tile)] {
         let framed = ghostframe_client_core::frame_plain(bundle, &[d.as_slice()]);
         app.borrow_mut().on_datagram(
             &Uint8Array::from(framed.as_slice()),
@@ -224,5 +224,7 @@ async fn a_tile_is_acknowledged_and_the_hooks_see_the_tick_in_order() {
         })
         .map(|e| e.bundle_seq)
         .collect();
-    assert!(acked.contains(&4242), "ACKed bundle_seqs: {acked:?}");
+    assert!(acked.contains(&9001), "ACKed bundle_seqs: {acked:?}");
+    // The record's wire_seq (4242) is not what an ACK names.
+    assert!(!acked.contains(&4242), "ACKed bundle_seqs: {acked:?}");
 }
