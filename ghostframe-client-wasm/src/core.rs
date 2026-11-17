@@ -394,9 +394,9 @@ mod tests {
 #[cfg(test)]
 mod moved_from_vitest {
     use super::*;
-    use ghostframe_client_core::{Event, PollOutput};
-    use ghostframe_protocol::ack::AckBatch;
+    use ghostframe_client_core::{frame_one, frame_plain, Event, PollOutput};
     use ghostframe_protocol::eviction::{build_eviction_datagram, EvictionReason};
+    use ghostframe_protocol::fec::feedback::BundleAckBatch;
     use ghostframe_protocol::protocol::{
         build_frame_dimensions_datagram, fragment_tile, Codec, TileFragmentInputs, NO_ACK,
         TILE_DATAGRAM_FLAG,
@@ -485,7 +485,11 @@ mod moved_from_vitest {
             ));
         }
         out.reverse();
-        out
+        // Every datagram travels in a PLAIN frame of its own.
+        out.iter()
+            .enumerate()
+            .map(|(i, d)| frame_plain(i as u32, &[d.as_slice()]))
+            .collect()
     }
 
     fn concat(dgs: &[Vec<u8>]) -> (Vec<u8>, Vec<u32>) {
@@ -523,20 +527,20 @@ mod moved_from_vitest {
         assert_eq!(a, b);
     }
 
-    /// Every ack entry (wire_seq, arrival_time_ms_lo16) the core has queued
+    /// Every ack entry (bundle_seq, arrival_time_ms_lo16) the core has queued
     /// by t = 1 s.
     fn drain_acks(core: &mut ClientCore) -> Vec<(u32, u16)> {
         core.on_timeout(1_000_000);
         let mut v = Vec::new();
         for o in drain(core, 1_000_000) {
             if let PollOutput::Datagram(b) = o {
-                if b[0] == 0x06 {
-                    let batch = AckBatch::decode(&b).unwrap();
+                if b[0] == 0x08 {
+                    let batch = BundleAckBatch::decode(&b).unwrap();
                     v.extend(
                         batch
                             .entries
                             .iter()
-                            .map(|e| (e.wire_seq, e.arrival_time_ms_lo16)),
+                            .map(|e| (e.bundle_seq, e.arrival_time_ms_lo16)),
                     );
                 }
             }
@@ -574,7 +578,7 @@ mod moved_from_vitest {
     fn the_eviction_notice_is_one_evicted_event_with_its_reason() {
         let mut core = core_with(false, false, false);
         let dg = build_eviction_datagram(EvictionReason::DisplacedByNewSession);
-        let events = core.handle_datagram(&dg, 0);
+        let events = core.handle_datagram(&frame_one(dg), 0);
         let evicted: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
@@ -594,7 +598,7 @@ mod moved_from_vitest {
         assert!(!frags.is_empty());
         for f in frags {
             assert!(!core
-                .handle_datagram(&f, 0)
+                .handle_datagram(&frame_one(f), 0)
                 .iter()
                 .any(|e| matches!(e, Event::Evicted { .. })));
         }
@@ -602,19 +606,19 @@ mod moved_from_vitest {
 
     // ---- h264_ack.test.ts ----
 
-    /// The wire_seqs named by every acknowledgement batch queued by `now_us`.
-    fn acked_wire_seqs(core: &mut ClientCore, now_us: u64) -> Vec<u32> {
+    /// The bundle_seqs named by every acknowledgement batch queued by `now_us`.
+    fn acked_bundle_seqs(core: &mut ClientCore, now_us: u64) -> Vec<u32> {
         core.on_timeout(now_us);
         let mut seqs = Vec::new();
         for o in drain(core, now_us) {
             if let PollOutput::Datagram(b) = o {
-                if b[0] == 0x06 {
+                if b[0] == 0x08 {
                     seqs.extend(
-                        AckBatch::decode(&b)
+                        BundleAckBatch::decode(&b)
                             .unwrap()
                             .entries
                             .iter()
-                            .map(|e| e.wire_seq),
+                            .map(|e| e.bundle_seq),
                     );
                 }
             }
@@ -624,19 +628,28 @@ mod moved_from_vitest {
     }
 
     /// Replaces h264_ack.test.ts "are acknowledged by wire_seq, and a NO_ACK
-    /// fragment is not".
+    /// fragment is not". Acknowledgements name the frame (`bundle_seq`) the
+    /// fragment arrived in, so each fragment travels in a bundle whose
+    /// number differs from its wire_seq.
     #[test]
-    fn h264_fragments_are_acknowledged_by_wire_seq_and_no_ack_ones_are_not() {
+    fn h264_fragments_are_acknowledged_by_the_bundle_they_arrived_in() {
         let mut core = core_with(true, true, true);
         drain(&mut core, 0); // the HELLO
-        let mut events =
-            core.handle_datagram(&frame_datagram(7, 0, 2, 41, true, &[1, 2, 3]), 1_000);
-        events.extend(core.handle_datagram(&frame_datagram(7, 1, 2, 42, true, &[4, 5]), 2_000));
-        // A fragment of another frame the server does not track.
-        core.handle_datagram(&frame_datagram(8, 0, 1, NO_ACK, false, &[9]), 3_000);
+        let dg = |bundle, d: Vec<u8>| frame_plain(bundle, &[d.as_slice()]);
+        let mut events = core.handle_datagram(
+            &dg(1041, frame_datagram(7, 0, 2, 41, true, &[1, 2, 3])),
+            1_000,
+        );
+        events.extend(
+            core.handle_datagram(&dg(1042, frame_datagram(7, 1, 2, 42, true, &[4, 5])), 2_000),
+        );
         // Reassembled, so the datagrams were taken, not dropped.
         assert!(events.iter().any(|e| matches!(e, Event::NeedsH264 { .. })));
-        assert_eq!(acked_wire_seqs(&mut core, 20_000), vec![41, 42]);
+        // The bundle numbers differ from the records' wire_seqs (41, 42), so
+        // an ACK that named the record instead of the bundle fails here.
+        let acked = acked_bundle_seqs(&mut core, 20_000);
+        assert_eq!(acked, vec![1041, 1042]);
+        assert!(!acked.contains(&41) && !acked.contains(&42), "{acked:?}");
     }
 
     /// Replaces h264_ack.test.ts "a fragment older than the window is still
@@ -645,10 +658,14 @@ mod moved_from_vitest {
     fn a_fragment_older_than_the_window_is_still_acknowledged() {
         let mut core = core_with(true, true, true);
         drain(&mut core, 0);
-        core.handle_datagram(&frame_datagram(50, 0, 1, 1, false, &[1]), 1_000);
-        let stale = core.handle_datagram(&frame_datagram(10, 0, 1, 2, false, &[1]), 2_000);
+        let dg = |bundle, d: Vec<u8>| frame_plain(bundle, &[d.as_slice()]);
+        core.handle_datagram(&dg(1001, frame_datagram(50, 0, 1, 1, false, &[1])), 1_000);
+        let stale =
+            core.handle_datagram(&dg(1002, frame_datagram(10, 0, 1, 2, false, &[1])), 2_000);
         assert!(stale.is_empty());
-        assert_eq!(acked_wire_seqs(&mut core, 20_000), vec![1, 2]);
+        let acked = acked_bundle_seqs(&mut core, 20_000);
+        assert_eq!(acked, vec![1001, 1002]);
+        assert!(!acked.contains(&1) && !acked.contains(&2), "{acked:?}");
     }
 
     // ---- h264_result.test.ts (core half) ----
@@ -689,7 +706,7 @@ mod moved_from_vitest {
                     d.resets
                         .push((b[1], u32::from_le_bytes(b[2..6].try_into().unwrap())));
                 }
-                PollOutput::Stream(_) => {}
+                PollOutput::Stream(_) | PollOutput::RepairStatus(_) => {}
             }
         }
         d
@@ -730,7 +747,7 @@ mod moved_from_vitest {
     #[test]
     fn acks_a_decoded_frame_and_a_refused_one_in_the_refused_mask() {
         let (mut core, _) = h264_core();
-        let ev = core.handle_datagram(&frame(1, true, 0), 1_000);
+        let ev = core.handle_datagram(&frame_one(frame(1, true, 0)), 1_000);
         assert!(ev.iter().any(|e| matches!(
             e,
             Event::NeedsH264 {
@@ -741,10 +758,10 @@ mod moved_from_vitest {
         assert!(frame_acks(&mut core, 1_000).acks.is_empty()); // fed, not yet decoded
         core.h264_result(1, H264Outcome::Decoded, 2_000);
         // The ack rides the ack batch: nothing due before it, then the batch
-        // (0x06) and the frame ack (0x0A) in one drain.
+        // (0x08) and the frame ack (0x0A) in one drain.
         assert!(frame_acks(&mut core, 2_000).order.is_empty());
         let first = frame_acks(&mut core, 6_000);
-        assert_eq!(first.order, vec![0x06, 0x0a]);
+        assert_eq!(first.order, vec![0x08, 0x0a]);
         assert_eq!(
             first.acks,
             vec![FrameAck {
@@ -754,7 +771,7 @@ mod moved_from_vitest {
             }]
         );
         // Frame 2 never arrives; 3 names it: refused at the gate.
-        let ev3 = core.handle_datagram(&frame(3, false, 2), 10_000);
+        let ev3 = core.handle_datagram(&frame_one(frame(3, false, 2)), 10_000);
         assert!(!ev3.iter().any(|e| matches!(e, Event::NeedsH264 { .. })));
         let d = frame_acks(&mut core, 16_000);
         assert_eq!(
@@ -773,9 +790,9 @@ mod moved_from_vitest {
     #[test]
     fn a_decode_error_is_one_paced_decoder_failure_request() {
         let (mut core, _) = h264_core();
-        core.handle_datagram(&frame(1, true, 0), 0);
+        core.handle_datagram(&frame_one(frame(1, true, 0)), 0);
         core.h264_result(1, H264Outcome::Decoded, 0);
-        core.handle_datagram(&frame(2, false, 1), 1_000);
+        core.handle_datagram(&frame_one(frame(2, false, 1)), 1_000);
         core.h264_result(2, H264Outcome::DecodeError, 1_000);
         assert_eq!(frame_acks(&mut core, 1_000).resets, vec![(1, 2)]);
         core.h264_result(3, H264Outcome::DecodeError, 2_000);
@@ -787,12 +804,12 @@ mod moved_from_vitest {
     #[test]
     fn counts_access_units_with_no_picture_of_their_own() {
         let (mut core, _) = h264_core();
-        core.handle_datagram(&frame(1, true, 0), 0);
+        core.handle_datagram(&frame_one(frame(1, true, 0)), 0);
         core.h264_result(1, H264Outcome::NotOutput, 0);
-        core.handle_datagram(&frame(2, false, 1), 1_000);
+        core.handle_datagram(&frame_one(frame(2, false, 1)), 1_000);
         core.h264_result(2, H264Outcome::NotOutput, 1_000);
         assert_eq!(core.h264_not_output_stats(), (2, 2));
-        core.handle_datagram(&frame(3, false, 2), 2_000);
+        core.handle_datagram(&frame_one(frame(3, false, 2)), 2_000);
         core.h264_result(3, H264Outcome::Decoded, 2_000);
         assert_eq!(core.h264_not_output_stats(), (2, 0));
     }
@@ -808,7 +825,9 @@ mod moved_from_vitest {
             let mut wasm = WasmClientCore::new(true, true, true, 0);
             let shared = wasm.shared();
             drain(&mut shared.borrow_mut(), 0);
-            shared.borrow_mut().handle_datagram(&frame(1, true, 0), 0);
+            shared
+                .borrow_mut()
+                .handle_datagram(&frame_one(frame(1, true, 0)), 0);
             wasm.h264_result(1, outcome, 0);
             let d = frame_acks(&mut shared.borrow_mut(), 20_000);
             d.acks
@@ -872,7 +891,7 @@ mod moved_from_vitest {
     /// `(frame_seq, tile_x, tile_y, pass_idx, bit_planes)` of each completed
     /// tile in the events.
     fn payload_events(core: &mut ClientCore, dg: &[u8]) -> Vec<(u32, u8, u8, u8, Vec<u8>)> {
-        core.handle_datagram(dg, 0)
+        core.handle_datagram(&frame_one(dg), 0)
             .into_iter()
             .filter_map(|e| match e {
                 Event::TilePayload {
@@ -949,7 +968,7 @@ mod moved_from_vitest {
     fn frame_dimensions_arrive_as_an_event() {
         let mut core = core_with(false, false, true);
         let dg = build_frame_dimensions_datagram(1, 0, 640, 480);
-        let ev = core.handle_datagram(&dg, 0);
+        let ev = core.handle_datagram(&frame_one(dg), 0);
         assert!(ev.iter().any(|e| matches!(
             e,
             Event::FrameDimensions {
