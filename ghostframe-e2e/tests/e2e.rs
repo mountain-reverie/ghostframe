@@ -1187,7 +1187,7 @@ async fn e2e_palrle_exact_pixels() -> Result<()> {
 /// next PalRle payload for tile (5, 5) with a hand-built bundled
 /// payload whose single RLE byte references palette index 2 against a
 /// count=1 palette. The client's compute shader detects the OOB,
-/// atomically writes 5 to its per-tile error slot, and main.ts forwards
+/// atomically writes 5 to its per-tile error slot, and the page forwards
 /// the error over the FEEDBACK bidi stream. The server's
 /// handle_decode_error logs the message via tracing::warn — we
 /// substring-match the rendered log line.
@@ -4772,7 +4772,8 @@ struct StatsCounters {
 }
 
 /// Reads `window.__ghostframeStatsFrames` / `__ghostframeStatsSamples`,
-/// published by `main.ts` after every chunk read from the feedback stream's
+/// published by the Rust client (`ghostframe-client-wasm/src/app/debug_hooks.rs`)
+/// after every chunk read from the feedback stream's
 /// return half and initialised to 0 at start-up (e2e pages only). No `?? 0`
 /// fallback: an absent global is an error, so a broken publish cannot read as
 /// "nothing arrived".
@@ -4788,10 +4789,10 @@ async fn stats_counters(setup: &E2eSetup) -> Result<StatsCounters> {
     let v: serde_json::Value = serde_json::from_str(&json)?;
     Ok(StatsCounters {
         frames: v["frames"].as_u64().context(
-            "window.__ghostframeStatsFrames is not a number (main.ts did not publish it)",
+            "window.__ghostframeStatsFrames is not a number (the page did not publish it)",
         )?,
         samples: v["samples"].as_u64().context(
-            "window.__ghostframeStatsSamples is not a number (main.ts did not publish it)",
+            "window.__ghostframeStatsSamples is not a number (the page did not publish it)",
         )?,
     })
 }

@@ -10,7 +10,7 @@ fn main() {
     // Which ghostbridge archive to build. With the `web-embed` feature the
     // archive carries the browser SPA, which means dist/ must be built
     // first; without it, `archive-noweb` drops the //go:embed and the whole
-    // npm/vite step with it. The native client takes the second path -- it
+    // browser build step with it. The native client takes the second path -- it
     // links ghostbridge for tsnet and never serves a browser anything.
     let web_embed = env::var_os("CARGO_FEATURE_WEB_EMBED").is_some();
     let target = if web_embed {

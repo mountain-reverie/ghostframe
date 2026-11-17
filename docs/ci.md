@@ -16,7 +16,7 @@ Runs on every pull request and every push to `master`. Seven parallel jobs:
 | `clippy` | `cargo clippy --workspace --all-targets -- -D warnings`, plus a grep asserting `ghostframe-lib` reads `std::env` only in `config.rs` | `just lint` |
 | `unit` | `cargo test --workspace --lib` | `just test-unit` |
 | `build-release` | `cargo build --workspace --release --exclude ghostframe-e2e` | `cargo build --release` |
-| `web-client` | `npm ci && npm run build && npx tsc --noEmit` | `just web-client-build` |
+| `web-client` | `ci/build-web.sh`, then the wasm size gate (`ci/check-wasm-size.sh`) | `just build-web` |
 | `cbindgen-check` | `cargo check -p ghostframe-lib` + `git diff --exit-code ghostframe-lib/include/ghostframe.h` | `cargo check -p ghostframe-lib && git status` |
 | `go-vet` | `go vet ./... && go build ./...` in `ghostbridge/` | `cd ghostbridge && go vet ./... && go build ./...` |
 

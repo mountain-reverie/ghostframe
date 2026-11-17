@@ -10,7 +10,7 @@ test harness that Task 9/11 builds out.
   (https://login.tailscale.com/admin/settings/keys).
 - A Chromium-based browser (Chrome, Chromium, Edge).
 - The ghostframe workspace built: `cargo build --release -p ghostframe-server`.
-- The web client built: `cd ghostframe-web-client && npm install && npm run build`.
+- The web client built: `just build-web` (after `just web-tools`, once).
 
 ## 1. Start the ghostframe-server
 

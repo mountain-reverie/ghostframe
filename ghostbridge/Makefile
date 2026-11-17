@@ -14,7 +14,7 @@ check-dist:
 	  echo "error: ghostframe-web-client/dist not built" >&2; \
 	  echo "  ghostbridge //go:embeds the SPA at compile time;" >&2; \
 	  echo "  run: just build-web" >&2; \
-	  echo "  or:  cd ghostframe-web-client && npm ci && npm run build" >&2; \
+	  echo "  or:  ci/build-web.sh" >&2; \
 	  exit 1 )
 
 # Go's //go:embed does not follow symlinks and does not allow `..` in
@@ -29,8 +29,8 @@ archive: sync-dist
 	go build -buildmode=c-archive -o $(OUT) .
 	# This also generates libghostbridge.h
 
-# The native-client archive. Same tsnet surface, no //go:embed, so no npm
-# and no vite -- which is the whole point: `cargo build -p ghostframe-cli`
+# The native-client archive. Same tsnet surface, no //go:embed, so no web
+# build step -- which is the whole point: `cargo build -p ghostframe-cli`
 # used to require a web client build it never serves a byte of. Selected by
 # ghostframe-tsnet/build.rs when the `web-embed` feature is off.
 #

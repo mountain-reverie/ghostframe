@@ -58,7 +58,6 @@ the operator (ghostframe fetches nothing). `GHOSTFRAME_H264_BACKEND=vaapi`
 sudo apt-get install \
     build-essential rsync pkg-config clang libclang-dev golang-go \
     rustc cargo \
-    nodejs npm \
     libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavdevice-dev \
     libx264-dev libx11-dev libxext-dev libxdamage-dev libdrm-dev \
     libvulkan1 mesa-vulkan-drivers vulkan-tools
@@ -67,7 +66,7 @@ sudo apt-get install \
 **Arch Linux:**
 
 ```bash
-sudo pacman -S base-devel rsync clang go rust nodejs npm \
+sudo pacman -S base-devel rsync clang go rust \
     ffmpeg x264 libx11 libxext libxdamage libdrm \
     vulkan-icd-loader vulkan-tools
 ```

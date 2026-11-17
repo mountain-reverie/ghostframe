@@ -26,7 +26,7 @@ Clients:
 
 | Crate | Purpose |
 | --- | --- |
-| `ghostframe-web-client` | TypeScript + Vite browser client (WebTransport + WebCodecs + WebGPU). |
+| `ghostframe-web-client` | The browser client's shell: `index.html`, which `ci/build-web.sh` fills in, and the `dist/` it writes (embedded by ghostbridge). The client is Rust, in `ghostframe-client-wasm`; there is no Node. |
 | `ghostframe-client-wasm` | The browser client's Rust side: the JS boundary (`WasmClientCore`) and its renderer (`WebRenderer`: wgpu's WebGPU backend over `ghostframe-render`, plus the raw WebGPU path that draws decoded H.264 `VideoFrame`s). `just test-web-renderer` runs its tests, including WebGPU in headless Chrome. |
 | `ghostframe-web-ui` | The browser client's DOM UI (the stats panel), in Leptos. The only crate that depends on Leptos; linked into `ghostframe-client-wasm`. `just test-web-ui` runs its tests, including one in headless Chrome. |
 | `ghostframe-client-core` | Decode-side tile engine, shared by every client. Consumes the wire format. |
@@ -62,6 +62,11 @@ are building):
   checked in and the build never compiles GLSL. After editing
   `cdf53_encode.comp` (or its lifting generator), run `just shaders-cdf53`.
 - **`just`** — every common task is in the `Justfile`.
+- **`just web-tools`**, once, for the browser build: wasm-bindgen-cli at
+  `Cargo.lock`'s version and binaryen, installed repo-local into
+  `target/web-tools/`. The browser tests (`just test-web-renderer`,
+  `just test-web-ui`) also need **`wasm-pack`** 0.15.0 and Chrome or Chromium.
+  There is no Node.
 - **ffmpeg development libraries** (`libavcodec-dev` and friends) to build the
   test tree: `ffmpeg-next` is the harness's independent libavcodec **decoder**
   oracle (`ffmpeg-oracle`, implied by `browserless-harness`; a dev-dependency
@@ -99,11 +104,8 @@ just build-release
 Web client (output goes to `ghostframe-web-client/dist/`):
 
 ```bash
-cd ghostframe-web-client
-npm install
-npm run build
-# or, from repo root:
-just build-web
+just web-tools   # once: the pinned wasm-bindgen-cli and binaryen
+just build-web   # or ci/build-web.sh
 ```
 
 > The e2e harness serves `ghostframe-web-client/dist/` over HTTP to headless
@@ -132,7 +134,7 @@ Those recipes name the client crates explicitly (see the
 
 **The `web-embed` feature.** `ghostbridge` used to `//go:embed all:dist`
 unconditionally, which meant every consumer of `ghostframe-tsnet` — the
-native client included — had to run `npm install && vite build` before it
+native client included — had to run the browser build (`just build-web`) before it
 could link, for an SPA it never serves. `ghostframe-tsnet` now has a
 `web-embed` feature, **off by default**:
 
