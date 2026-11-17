@@ -78,7 +78,6 @@ pub struct PaintOutcome {
     pub pictures_dropped: u32,
 }
 
-#[wasm_bindgen]
 pub struct WebRenderer {
     /// Kept for the renderer's lifetime: when the browser collects the
     /// instance, it loses every device made from it ("A valid external
@@ -586,13 +585,11 @@ fn to_js<T: Serialize>(v: &T) -> Result<JsValue, JsValue> {
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
-#[wasm_bindgen]
 impl WebRenderer {
     /// Open the page's renderer on `canvas`. `cdf53` is the page URL's
     /// `cdf53` parameter: `""`/`"auto"` or `"cpu"` (see `Cdf53Mode`).
     /// Rejects with a string starting `WEBGPU_UNAVAILABLE` when the browser has
     /// no usable WebGPU.
-    #[wasm_bindgen(js_name = create)]
     pub async fn create(
         canvas: web_sys::HtmlCanvasElement,
         cdf53: String,
@@ -602,28 +599,23 @@ impl WebRenderer {
             .map_err(|e| JsValue::from_str(&e))
     }
 
-    #[wasm_bindgen(getter, js_name = h264Supported)]
     pub fn h264_supported(&self) -> bool {
         self.h264.is_some()
     }
 
-    #[wasm_bindgen(getter, js_name = fbWidth)]
     pub fn fb_width(&self) -> u32 {
         self.size.map_or(0, |s| s.0)
     }
 
-    #[wasm_bindgen(getter, js_name = fbHeight)]
     pub fn fb_height(&self) -> u32 {
         self.size.map_or(0, |s| s.1)
     }
 
     /// Frames presented so far (an idle tick adds none).
-    #[wasm_bindgen(getter, js_name = submitCount)]
     pub fn submit_count(&self) -> u32 {
         self.submits
     }
 
-    #[wasm_bindgen(getter, js_name = paintTickCount)]
     pub fn paint_tick_count(&self) -> u32 {
         self.paint_ticks
     }
@@ -634,14 +626,12 @@ impl WebRenderer {
     }
 
     /// `"gpu"` or `"cpu"`: where CDF 5/3 tiles are reconstructed.
-    #[wasm_bindgen(getter, js_name = cdf53Path)]
     pub fn cdf53_path(&self) -> String {
         self.cdf53_label().to_string()
     }
 
     /// Hand over a decoded `VideoFrame` (ownership: this renderer closes it)
     /// with the `frame_seq` of its access unit.
-    #[wasm_bindgen(js_name = pushH264)]
     pub fn push_h264(&mut self, frame: JsValue, frame_seq: u32) {
         if self.h264.is_none() {
             raw::close_frame(&frame);
@@ -658,7 +648,6 @@ impl WebRenderer {
 
     /// One rAF tick; the number of frames presented (0 or 1). Errors are kept
     /// for `takeErrors`.
-    #[wasm_bindgen(js_name = paintTick)]
     pub fn paint_tick_js(&mut self, now_us: u64) -> u32 {
         // A u64 crosses as a BigInt, exactly what the client's clock returns
         // and what `onTimeout` takes: one clock type for every call.
@@ -673,13 +662,11 @@ impl WebRenderer {
 
     /// The transport closed: drop pending pictures and forget the session's
     /// paint state. Call before closing the JS decoder.
-    #[wasm_bindgen(js_name = onSessionReset)]
     pub fn on_session_reset(&mut self) {
         self.reset_session();
     }
 
     /// Errors since the last call: uncaptured GPU errors and failed steps.
-    #[wasm_bindgen(js_name = takeErrors)]
     pub fn take_errors(&mut self) -> Array {
         self.take_error_strings()
             .iter()
@@ -688,7 +675,6 @@ impl WebRenderer {
     }
 
     /// `[codec, tile_x, tile_y, code, ...]` for tiles the GPU decode rejected.
-    #[wasm_bindgen(js_name = takeDecodeErrors)]
     pub fn take_decode_errors(&mut self) -> Vec<u32> {
         self.collect_decode_errors();
         std::mem::take(&mut self.decode_errors)
@@ -696,13 +682,11 @@ impl WebRenderer {
 
     /// `[count, p50, p99, max]` microseconds of the non-skipped ticks since the
     /// last call (the section 7 bench reads it through `__ghostframePaintUs`).
-    #[wasm_bindgen(js_name = paintUsStats)]
     pub fn paint_us_stats(&mut self) -> Vec<f64> {
         summarize_us(std::mem::take(&mut self.paint_us))
     }
 
     /// The old `__ghostframeRendererState()`.
-    #[wasm_bindgen(js_name = debugState)]
     pub fn debug_state(&self) -> Result<JsValue, JsValue> {
         let tile_state = self.tiles.debug_state();
         to_js(&WebState {
@@ -727,7 +711,6 @@ impl WebRenderer {
 
     /// The old `__ghostframeTile(x, y)`: what the renderer last did to a tile,
     /// or `null` for a tile off the grid.
-    #[wasm_bindgen(js_name = debugTile)]
     pub fn debug_tile(&self, tile_x: u32, tile_y: u32) -> Result<JsValue, JsValue> {
         match self.tiles.debug_tile(tile_x, tile_y) {
             Some(t) => to_js(&t),
@@ -738,7 +721,6 @@ impl WebRenderer {
     /// `{ device, texture }`: the raw `GPUDevice` and the framebuffer's
     /// `GPUTexture`, for `window.__ghostframeRenderer` (the e2e suite reads
     /// `texture.width` and `texture.height`); `undefined` before the first size.
-    #[wasm_bindgen(js_name = debugHandles)]
     pub fn debug_handles(&self) -> JsValue {
         if self.size.is_none() {
             return JsValue::UNDEFINED;
@@ -761,7 +743,6 @@ impl WebRenderer {
     /// The `w` x `h` rectangle at (`x`, `y`) of the framebuffer as RGBA bytes
     /// (a `Promise<Uint8Array>`). The copy is submitted now, after everything
     /// already submitted; the promise only waits for the bytes.
-    #[wasm_bindgen(js_name = readPixelRect)]
     pub fn read_pixel_rect(&self, x: u32, y: u32, w: u32, h: u32) -> Result<Promise, JsValue> {
         let (fw, fh) = self
             .size
@@ -803,7 +784,6 @@ impl WebRenderer {
     }
 
     /// The old `__readGradientGolden()`; overwrites the framebuffer.
-    #[wasm_bindgen(js_name = readGradientGolden)]
     pub fn read_gradient_golden(&self) -> Result<Promise, JsValue> {
         if self.size.is_none() {
             return Err(JsValue::from_str("framebuffer not sized yet"));
