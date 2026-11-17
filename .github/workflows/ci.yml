@@ -192,29 +192,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - name: Cache wasm-pack
-        id: cache-wasm-pack
-        uses: actions/cache@v6
-        with:
-          path: ~/.cargo/bin/wasm-pack
-          key: wasm-pack-0.15.0-${{ runner.os }}
-      - name: Install wasm-pack
-        if: steps.cache-wasm-pack.outputs.cache-hit != 'true'
-        run: cargo install wasm-pack --version 0.15.0 --locked
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '20'
-          cache: npm
-          cache-dependency-path: ghostframe-web-client/package-lock.json
-      - name: install + build
-        working-directory: ghostframe-web-client
-        run: |
-          npm ci
-          npm run build
-          npx tsc --noEmit
+      - name: build web client
+        uses: ./.github/workflows/_build-web-client
       # The wasm is what every browser downloads before the first frame, and
       # the stats panel's Leptos is the first dependency that can blow it up.
       # The self-test keeps the guard honest (it fails closed on a missing

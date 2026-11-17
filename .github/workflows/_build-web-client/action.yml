@@ -1,19 +1,17 @@
 name: Build the ghostframe web client
 description: >
-  Builds the web client SPA into ghostframe-web-client/dist/. ghostbridge
+  Builds the web client into ghostframe-web-client/dist/. ghostbridge
   //go:embeds that directory at compile time, so every job that builds or
   runs a ghostframe binary needs it present.
 
-  This exists because the same node-setup-and-build pair was previously
-  inlined at eight separate sites across ci.yml and e2e.yml. The wasm cutover
-  adds a Rust toolchain and wasm-pack to this build; doing that eight times
-  would be eight chances to miss one, and a missed site ships a dist/ whose
-  wasm is absent or stale — which fails at runtime, not at build time.
+  No Node. The build needs two pinned tools, wasm-bindgen-cli (at the
+  version in Cargo.lock) and binaryen's wasm-opt (version_117), installed by
+  ci/install-web-tools.sh into target/web-tools/ and cached; then
+  ci/build-web.sh does the build, the same script `just build-web` runs.
 
-  Three further sites deliberately do NOT use this action, because each does
-  something extra that collapsing would silently drop: ci.yml also runs a
-  type-check and uploads the dist artifact, e2e.yml has a conditional
-  artifact fallback, and nightly.yml builds without the npm cache.
+  Sites that deliberately do NOT use this action, because each does
+  something extra: ci.yml's web-client job also checks the wasm size and
+  uploads the dist artifact.
 
 runs:
   using: composite
@@ -21,27 +19,23 @@ runs:
     - uses: dtolnay/rust-toolchain@stable
       with:
         targets: wasm32-unknown-unknown
-    # Cached because this action runs in eight jobs; building wasm-pack from
-    # source in each is minutes of CI per push for a binary that changes only
-    # when the pinned version does.
-    - name: Cache wasm-pack
-      id: cache-wasm-pack
+    - name: Pinned wasm-bindgen version
+      id: bindgen
+      shell: bash
+      run: echo "version=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)" >> "$GITHUB_OUTPUT"
+    # Cached because this action runs in many jobs; building wasm-bindgen-cli
+    # from source in each is minutes of CI per push for tools that change only
+    # when a pinned version does.
+    - name: Cache web tools
+      id: cache-web-tools
       uses: actions/cache@v4
       with:
-        path: ~/.cargo/bin/wasm-pack
-        key: wasm-pack-0.15.0-${{ runner.os }}
-    - name: Install wasm-pack
-      if: steps.cache-wasm-pack.outputs.cache-hit != 'true'
+        path: target/web-tools
+        key: web-tools-${{ steps.bindgen.outputs.version }}-binaryen117-${{ runner.os }}
+    - name: Install web tools
+      if: steps.cache-web-tools.outputs.cache-hit != 'true'
       shell: bash
-      run: cargo install wasm-pack --version 0.15.0 --locked
-    - uses: actions/setup-node@v4
-      with:
-        node-version: '20'
-        cache: npm
-        cache-dependency-path: ghostframe-web-client/package-lock.json
-    - name: build web client SPA (ghostbridge //go:embeds it)
+      run: ci/install-web-tools.sh
+    - name: build web client (ghostbridge //go:embeds it)
       shell: bash
-      working-directory: ghostframe-web-client
-      run: |
-        npm ci
-        npm run build
+      run: ci/build-web.sh
