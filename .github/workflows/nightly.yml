@@ -25,10 +25,6 @@ jobs:
 
       - uses: ./.github/workflows/_setup-go
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest

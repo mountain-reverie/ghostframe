@@ -6,11 +6,11 @@ description: >
 
   No Node. The build needs two pinned tools, wasm-bindgen-cli (at the
   version in Cargo.lock) and binaryen's wasm-opt (version_117), installed by
-  ci/install-web-tools.sh into target/web-tools/ and cached; then
+  ci/install-web-tools.sh into $RUNNER_TOOL_CACHE/gf-web-tools (outside target/, which
+  Swatinem/rust-cache prunes) and cached; then
   ci/build-web.sh does the build, the same script `just build-web` runs.
 
-  Sites that deliberately do NOT use this action, because each does
-  something extra: ci.yml's web-client job also checks the wasm size and
+  ci.yml's web-client job calls this action, then checks the wasm size and
   uploads the dist artifact.
 
 runs:
@@ -26,12 +26,15 @@ runs:
     # Cached because this action runs in many jobs; building wasm-bindgen-cli
     # from source in each is minutes of CI per push for tools that change only
     # when a pinned version does.
+    - name: Web tools location
+      shell: bash
+      run: echo "GF_WEB_TOOLS=$RUNNER_TOOL_CACHE/gf-web-tools" >> "$GITHUB_ENV"
     - name: Cache web tools
       id: cache-web-tools
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
-        path: target/web-tools
-        key: web-tools-${{ steps.bindgen.outputs.version }}-binaryen117-${{ runner.os }}
+        path: ${{ runner.tool_cache }}/gf-web-tools
+        key: web-tools-${{ steps.bindgen.outputs.version }}-${{ hashFiles('ci/install-web-tools.sh') }}-${{ runner.os }}
     - name: Install web tools
       if: steps.cache-web-tools.outputs.cache-hit != 'true'
       shell: bash
