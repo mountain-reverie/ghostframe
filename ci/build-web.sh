@@ -14,8 +14,8 @@ cd "$(dirname "$0")/.."
 
 BINARYEN_VERSION=117
 want_bindgen=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)
-tools=target/web-tools
-PATH="$PWD/$tools/bin:$PWD/$tools/binaryen-version_${BINARYEN_VERSION}/bin:$PATH"
+tools=${GF_WEB_TOOLS:-$PWD/target/web-tools}
+PATH="$tools/bin:$tools/binaryen-version_${BINARYEN_VERSION}/bin:$PATH"
 
 have_bindgen=$(wasm-bindgen --version 2>/dev/null | awk '{print $2}' || true)
 if [[ "$have_bindgen" != "$want_bindgen" ]]; then
