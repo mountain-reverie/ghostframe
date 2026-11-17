@@ -189,15 +189,7 @@ build-web:
 # nothing in $HOME): wasm-bindgen-cli at Cargo.lock's version and binaryen
 # version_117 (the wasm-opt wasm-pack 0.15.0 used).
 web-tools:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    v=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)
-    cargo install --root target/web-tools wasm-bindgen-cli --version "$v" --locked
-    b=117
-    if [[ ! -x target/web-tools/binaryen-version_$b/bin/wasm-opt ]]; then
-        curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/version_$b/binaryen-version_$b-x86_64-linux.tar.gz" \
-            | tar -xz -C target/web-tools
-    fi
+    ci/install-web-tools.sh
 
 # E2E tests that must not share a run with the rest of the suite.
 #
