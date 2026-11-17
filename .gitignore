@@ -9,10 +9,6 @@ tmux-client-*.log
 # Web client build output (ci/build-web.sh)
 ghostframe-web-client/dist/
 
-# wasm-pack build artefacts
-ghostframe-client-wasm/pkg-node/
-ghostframe-client-wasm/pkg-web/
-
 # Editor / OS cruft
 .vscode/
 .idea/

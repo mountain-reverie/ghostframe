@@ -27,7 +27,7 @@ Clients:
 | Crate | Purpose |
 | --- | --- |
 | `ghostframe-web-client` | The browser client's shell: `index.html`, which `ci/build-web.sh` fills in, and the `dist/` it writes (embedded by ghostbridge). The client is Rust, in `ghostframe-client-wasm`; there is no Node. |
-| `ghostframe-client-wasm` | The browser client's Rust side: the JS boundary (`WasmClientCore`) and its renderer (`WebRenderer`: wgpu's WebGPU backend over `ghostframe-render`, plus the raw WebGPU path that draws decoded H.264 `VideoFrame`s). `just test-web-renderer` runs its tests, including WebGPU in headless Chrome. |
+| `ghostframe-client-wasm` | The browser client's Rust side: the whole page client (`app/client.rs`, whose `startClient` is the module's only export, driving `ClientCore`) and its renderer (`WebRenderer`: wgpu's WebGPU backend over `ghostframe-render`, plus the raw WebGPU path that draws decoded H.264 `VideoFrame`s). `just test-web-renderer` runs its tests, including WebGPU in headless Chrome. |
 | `ghostframe-web-ui` | The browser client's DOM UI (the stats panel), in Leptos. The only crate that depends on Leptos; linked into `ghostframe-client-wasm`. `just test-web-ui` runs its tests, including one in headless Chrome. |
 | `ghostframe-client-core` | Decode-side tile engine, shared by every client. Consumes the wire format. |
 | `ghostframe-client-net` | Client QUIC/WebTransport stack. |

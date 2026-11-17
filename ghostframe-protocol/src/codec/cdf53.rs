@@ -767,9 +767,8 @@ mod fixture {
     use std::path::PathBuf;
 
     /// Regenerate `ghostframe-e2e/tests/fixtures/cdf53_fixture.json` from
-    /// a deterministic seed. Cross-language ground truth — read by TS
-    /// vitest (`prevalidate_cdf53.test.ts`) and WGSL e2e correctness
-    /// tests. Gated `#[ignore]` so a normal `cargo test` doesn't rewrite
+    /// a deterministic seed. Cross-language ground truth — read by the
+    /// WGSL e2e correctness tests. Gated `#[ignore]` so a normal `cargo test` doesn't rewrite
     /// the committed file; run explicitly via:
     ///
     ///   cargo test -p ghostframe-lib fixture::write_reference_fixture \

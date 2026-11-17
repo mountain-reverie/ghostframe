@@ -419,7 +419,7 @@ pub fn install_console_ring(recorder: &Rc<RefCell<Recorder>>) {
     let wrap = Function::new_with_args(
         "orig, note",
         "return function (...a) { \
-           try { note(a.map(String).join(' ')) } catch (_) {} \
+           try { note(a.map(x => x instanceof Error ? x.message : String(x)).join(' ')) } catch (_) {} \
            return orig.apply(this, a) }",
     );
     for level in ["log", "info", "warn", "error"] {

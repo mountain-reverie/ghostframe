@@ -210,7 +210,8 @@ During PR 2, the renderer-backed hooks (`__ghostframeRenderer`,
 2. `wasm-bindgen --target web --out-dir <tmp>`. The recipe fails, naming
    both versions, if the installed CLI is not the `wasm-bindgen` version in
    `Cargo.lock`.
-3. `wasm-opt -Os` (binaryen, pinned version), as today.
+3. `wasm-opt -O` (binaryen, pinned version), as today: what wasm-pack
+   0.15.0 ran by default (a same-commit build came within 68 bytes).
 4. Copy `index.html`, CSS and the bindgen output into
    `ghostframe-web-client/dist/`.
 

@@ -400,25 +400,6 @@ mod tests {
     }
 }
 
-/// Protocol datagram counts, in the exact shape `window.__ghostframeStats`
-/// already had.
-///
-/// `camelCase` deliberately: the e2e tests read `tileDatagrams` /
-/// `frameDatagrams` off that global, so matching the existing property names
-/// lets `app/debug_hooks.rs` assign straight across instead of renaming in flight.
-///
-/// `u32`, not `u64`: `serde_wasm_bindgen` renders a `u64` as a JS `BigInt`,
-/// and `BigInt` is not JSON-serializable -- the e2e readers round-trip these
-/// through `page.evaluate`, so a `u64` would throw inside the browser instead
-/// of returning a number. A session would need over four billion datagrams
-/// to reach the saturation point.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WasmDatagramCounts {
-    pub tile_datagrams: u32,
-    pub frame_datagrams: u32,
-}
-
 /// Serde mirror of `Cdf53CoverageSummary`, plus a preformatted `line` so the
 /// client does not have to re-derive the same string in TypeScript.
 #[derive(Debug, Clone, serde::Serialize)]
