@@ -4,9 +4,11 @@
 //! unit-tested on the host; what touches the browser is wasm32-only.
 
 pub mod batch;
+pub mod capped;
 pub mod certs;
 pub mod close;
 pub mod decoder;
+pub mod health;
 pub mod input_map;
 pub mod page;
 pub mod repair_status;
