@@ -15,13 +15,13 @@ use web_sys::{console, Document, HtmlCanvasElement, HtmlElement, WritableStreamD
 use crate::app::batch::{flush_decision, DatagramBatch, FlushDecision, FLUSH_FALLBACK_MS};
 use crate::app::bootstrap::bootstrap;
 use crate::app::close::close_overlay_message;
-use crate::app::debug_api::DebugApi;
 use crate::app::decoder::{not_output_warning, FrameDecoder};
 use crate::app::dom::{page_flags, pin_canvas, show_disconnected_overlay, PageLog};
-use crate::app::hooks::{self, dispatch, HookCall, Hooks};
+use crate::app::hooks::{HookCall, HookSink};
 use crate::app::input::attach_input;
 use crate::app::js::{StreamPair, WebTransport};
 use crate::app::page::PageFlags;
+use crate::app::recorder::{LogEntry, Recorder};
 use crate::app::session::{nacks_in, Action, Session};
 use crate::app::streams::{pump_stream, LoggedWriter, RepairStatusStream};
 use crate::app::webcodecs::{frame_seq_of, OnError, OnOutput, WebCodec};
@@ -34,11 +34,11 @@ use crate::web::route::{route, Routed};
 thread_local! {
     static PERFORMANCE: Option<web_sys::Performance> =
         web_sys::window().and_then(|w| w.performance());
-    /// The page's hooks object. The one global: a decoder callback fires from
-    /// the browser's task queue with nothing but a `Weak<App>` in hand, and
-    /// must reach the hooks after it has released its borrow. Set once by
+    /// What consumes the hook calls. The one global: a decoder callback fires
+    /// from the browser's task queue with nothing but a `Weak<App>` in hand,
+    /// and must reach the sink after it has released its borrow. Set once by
     /// `start_client`, before any callback can exist.
-    static HOOKS: RefCell<Option<Rc<Hooks>>> = const { RefCell::new(None) };
+    static SINK: RefCell<Option<Rc<dyn HookSink>>> = const { RefCell::new(None) };
 }
 
 /// `performance.now()`, in milliseconds.
@@ -56,8 +56,10 @@ fn dispatch_calls(calls: Vec<HookCall>) {
     if calls.is_empty() {
         return;
     }
-    let hooks = HOOKS.with(|h| h.borrow().clone());
-    dispatch(hooks.as_deref(), calls);
+    let sink = SINK.with(|s| s.borrow().clone());
+    if let Some(sink) = sink {
+        sink.dispatch(calls);
+    }
 }
 
 fn document() -> Option<Document> {
@@ -97,7 +99,6 @@ pub struct App {
     in_tick: bool,
     out_of_tick_us: f64,
     tick_us: Rc<RefCell<Vec<u32>>>,
-    hooks_enabled: bool,
     calls: Vec<HookCall>,
     me: Weak<RefCell<App>>,
 }
@@ -112,7 +113,6 @@ pub struct AppParts {
     pub feedback_writer: Option<WritableStreamDefaultWriter>,
     pub repair_status: Option<RepairStatusStream>,
     pub tick_us: Rc<RefCell<Vec<u32>>>,
-    pub hooks_enabled: bool,
 }
 
 impl Drop for App {
@@ -176,7 +176,6 @@ impl App {
                 in_tick: false,
                 out_of_tick_us: 0.0,
                 tick_us: parts.tick_us,
-                hooks_enabled: parts.hooks_enabled,
                 calls: Vec::new(),
                 me: me.clone(),
             })
@@ -184,9 +183,7 @@ impl App {
     }
 
     fn push(&mut self, call: HookCall) {
-        if self.hooks_enabled {
-            self.calls.push(call);
-        }
+        self.calls.push(call);
     }
 
     /// Hook calls queued since the last take; dispatch them after the borrow ends.
@@ -290,9 +287,7 @@ impl App {
         for r in routed {
             let mut actions = Vec::new();
             let back = self.session.on_routed(r, &mut actions);
-            if self.hooks_enabled {
-                records.extend(back);
-            }
+            records.extend(back);
             self.run_actions(actions);
         }
         if !records.is_empty() {
@@ -324,14 +319,18 @@ impl App {
     }
 
     fn swallowed(&mut self, message: String) {
-        // Logged whether or not a hooks object is listening (main.ts's
-        // handleSafely printed it too).
-        console::error_2(
-            &"handleEvent failed; continuing".into(),
-            &message.as_str().into(),
-        );
+        let site = "handleEvent:NeedsH264";
+        // Without `?e2e` there is no recorder: a production error must not be
+        // silent. Under `?e2e` the health record keeps it.
+        if !self.flags.e2e {
+            console::error_3(
+                &"handleEvent failed; continuing".into(),
+                &site.into(),
+                &message.as_str().into(),
+            );
+        }
         self.push(HookCall::Swallowed {
-            site: "handleEvent:NeedsH264".into(),
+            site: site.into(),
             message,
         });
     }
@@ -531,19 +530,63 @@ impl App {
     }
 }
 
-/// Start the client on this page. `hooks` is `hooks.ts`'s object (PR 4 moves
-/// the hooks into Rust and the call into `#[wasm_bindgen(start)]`). Resolves
-/// when the datagram stream ends; an error is shown on the page, not thrown.
+/// What `start_client` hands the hook calls to: the e2e recorder (`Some`
+/// under `?e2e`) and, from Task 4, the page's stats line. Each borrow is a
+/// `try_borrow_mut`: on a conflict the call is dropped and logged once.
+struct PageSink {
+    recorder: Option<Rc<RefCell<Recorder>>>,
+    warned: Cell<bool>,
+}
+
+impl PageSink {
+    fn conflict(&self) {
+        if !self.warned.replace(true) {
+            console::error_1(&"hook sink busy; a hook call was dropped".into());
+        }
+    }
+}
+
+impl HookSink for PageSink {
+    fn dispatch(&self, calls: Vec<HookCall>) {
+        let Some(rec) = &self.recorder else { return };
+        let mut out: Vec<LogEntry> = Vec::new();
+        for call in calls {
+            // Task 4 hands `AfterPaint` to the stats line here.
+            match rec.try_borrow_mut() {
+                Ok(mut r) => r.apply(call, &mut out),
+                Err(_) => self.conflict(),
+            }
+        }
+        append_logs(out);
+    }
+}
+
+/// Task 7 replaces this with `debug_hooks::append`, which pushes to the
+/// `window` logs.
+fn append_logs(_entries: Vec<LogEntry>) {}
+
+/// Task 7 replaces this with `debug_hooks::install`, called under `?e2e`:
+/// the `window` functions over the renderer, the core, the tick samples and
+/// the recorder.
+fn install_debug_hooks(
+    _renderer: &Rc<RefCell<WebRenderer>>,
+    _core: &Rc<OnceCell<Rc<RefCell<ClientCore>>>>,
+    _log: &Rc<PageLog>,
+    _tick_us: &Rc<RefCell<Vec<u32>>>,
+    _recorder: &Rc<RefCell<Recorder>>,
+) {
+}
+
+/// Start the client on this page. Resolves when the datagram stream ends; an
+/// error is shown on the page, not thrown.
 #[wasm_bindgen(js_name = startClient)]
-pub async fn start_client(hooks: JsValue) -> Result<(), JsValue> {
-    let hooks: Option<Hooks> =
-        (!hooks.is_undefined() && !hooks.is_null()).then(|| hooks.unchecked_into());
+pub async fn start_client() -> Result<(), JsValue> {
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
     let document = window
         .document()
         .ok_or_else(|| JsValue::from_str("no document"))?;
     let log = Rc::new(PageLog::find(&document).map_err(|e| JsValue::from_str(&e))?);
-    if let Err(msg) = run(&window, &document, log.clone(), hooks).await {
+    if let Err(msg) = run(&window, &document, log.clone()).await {
         log.line(&format!("Error: {msg}"));
         log.status(&format!("Error: {msg}"));
     }
@@ -566,7 +609,6 @@ async fn run(
     window: &web_sys::Window,
     document: &Document,
     log: Rc<PageLog>,
-    hooks: Option<Hooks>,
 ) -> Result<(), String> {
     let flags = page_flags(window);
     let canvas: HtmlCanvasElement = document
@@ -599,19 +641,17 @@ async fn run(
 
     let api_core: Rc<OnceCell<Rc<RefCell<ClientCore>>>> = Rc::new(OnceCell::new());
     let tick_us = Rc::new(RefCell::new(Vec::new()));
-    if let Some(h) = &hooks {
-        hooks::attach(
-            h,
-            DebugApi {
-                renderer: renderer.clone(),
-                core: api_core.clone(),
-                log: log.clone(),
-                tick_us: tick_us.clone(),
-            },
-        );
+    let recorder = flags
+        .e2e
+        .then(|| Rc::new(RefCell::new(Recorder::new(flags.e2e))));
+    if let Some(rec) = &recorder {
+        install_debug_hooks(&renderer, &api_core, &log, &tick_us, rec);
     }
-    let hooks_enabled = hooks.is_some();
-    HOOKS.with(|h| *h.borrow_mut() = hooks.map(Rc::new));
+    let sink: Rc<dyn HookSink> = Rc::new(PageSink {
+        recorder,
+        warned: Cell::new(false),
+    });
+    SINK.with(|s| *s.borrow_mut() = Some(sink));
 
     let transport: WebTransport = bootstrap().await?;
 
@@ -718,7 +758,6 @@ async fn run(
             Rc::new(move || transport.create_bidirectional_stream())
         })),
         tick_us,
-        hooks_enabled,
     });
     let _ = app_cell.set(app.clone());
 

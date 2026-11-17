@@ -18,7 +18,7 @@ use ghostframe_client_core::{
 use ghostframe_protocol::protocol::TileNackEntry;
 use serde::Serialize;
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(tag = "kind")]
 pub enum WasmEvent {
     TileReady {
@@ -87,7 +87,7 @@ pub enum WasmEvent {
 /// Mirror of `TileData`. Serialised `#[serde(tag = "codec")]`, so JS sees
 /// `{ codec: 'PalRle', palette_id, count, indices }` — the codec tag the old
 /// flat shape carried separately is now the variant itself.
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(tag = "codec")]
 pub enum WasmTileData {
     Solid {

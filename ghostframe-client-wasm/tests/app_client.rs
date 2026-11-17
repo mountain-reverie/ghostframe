@@ -121,7 +121,6 @@ async fn a_tile_is_acknowledged_and_the_hooks_see_the_tick_in_order() {
         feedback_writer: Some(recording_writer("__fb")),
         repair_status: None,
         tick_us: Rc::new(RefCell::new(Vec::new())),
-        hooks_enabled: true,
     });
 
     // The HELLO leaves first, on the feedback stream.

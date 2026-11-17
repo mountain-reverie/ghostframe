@@ -25,7 +25,7 @@ pub trait TileSink {
 
 /// A tile payload as JS sees it: field names match `WasmTileData`, the byte
 /// fields hold at most [`SAMPLE_LEN`] bytes, and `len` is the real length.
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(tag = "codec")]
 pub enum SlimTileData {
     Solid {
@@ -50,7 +50,7 @@ pub enum SlimTileData {
     },
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(tag = "kind")]
 pub enum SlimEvent {
     TilePayload {
@@ -84,7 +84,7 @@ pub enum SlimEvent {
 }
 
 /// One entry of the array JS gets back.
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum Routed {
     Tile(SlimEvent),
