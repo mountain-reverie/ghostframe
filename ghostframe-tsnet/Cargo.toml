@@ -20,7 +20,8 @@ default = []
 # Off by default, and deliberately: ghostbridge `//go:embed`s
 # ghostframe-web-client/dist unconditionally, which made every consumer of
 # this crate -- including the native client, which never serves a browser
-# anything -- run `npm install && vite build` before it could link. Servers
+# anything -- build the web client before it could link (then with npm and
+# vite; now `ci/build-web.sh`). Servers
 # (`ghostframe-lib`) turn it on; the native client (`ghostframe-cli`,
 # `ghostframe-client-native`) leaves it off and skips the web toolchain
 # entirely.

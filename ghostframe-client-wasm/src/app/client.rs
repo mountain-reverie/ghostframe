@@ -582,17 +582,19 @@ impl PageSink {
     /// One `AfterPaint`: the ~2 s stats line, and under `?e2e` the
     /// framebuffer probe when lines were logged.
     fn stats_tick(&self, drained: Drained, raf_ticks: u32, nack_sent: u32) {
+        // The drain counts go in first: a tick that cannot build a line
+        // (no core yet, a borrow conflict) must not lose them.
+        match self.stats.try_borrow_mut() {
+            Ok(mut stats) => stats.add_drained(drained),
+            Err(_) => {
+                self.conflict();
+                return;
+            }
+        }
         let Some(core) = self.core.get() else { return };
         let (Ok(r), Ok(core)) = (self.renderer.try_borrow(), core.try_borrow()) else {
             self.conflict();
             return;
-        };
-        let (fails, last) = match &self.recorder {
-            Some(rec) => match rec.try_borrow() {
-                Ok(rec) => (rec.cdf53_prevalidate_fails, rec.cdf53_last_fail_code),
-                Err(_) => (0, None),
-            },
-            None => (0, None),
         };
         let fb = (r.fb_width(), r.fb_height());
         let summary = core.cdf53_coverage_summary();
@@ -607,12 +609,9 @@ impl PageSink {
         };
         let inputs = StatsInputs {
             now_ms: now_ms(),
-            drained,
             raf_ticks,
             submit_count: r.submit_count(),
             fb,
-            cdf53_fails: fails,
-            cdf53_last: last,
             nack_sent,
             coverage_line: &coverage_line,
             partial: u64::from(summary.partial),
@@ -682,6 +681,12 @@ impl HookSink for PageSink {
     fn dispatch(&self, calls: Vec<HookCall>) {
         let mut out: Vec<LogEntry> = Vec::new();
         for call in calls {
+            if let HookCall::Events { records, .. } = &call {
+                match self.stats.try_borrow_mut() {
+                    Ok(mut stats) => stats.note_events(records),
+                    Err(_) => self.conflict(),
+                }
+            }
             let after = match &call {
                 HookCall::AfterPaint {
                     drained,

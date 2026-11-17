@@ -29,10 +29,17 @@ if [[ "$have_opt" != "$BINARYEN_VERSION" ]]; then
 fi
 
 cargo build -p ghostframe-client-wasm --target wasm32-unknown-unknown --release
+# Where cargo put it: CARGO_TARGET_DIR or build.target-dir move it, and a
+# hardcoded ./target would hand wasm-bindgen a stale wasm without an error.
+target_dir=$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+if [[ -z "$target_dir" ]]; then
+    echo "error: cargo metadata gave no target_directory" >&2
+    exit 1
+fi
+built="$target_dir/wasm32-unknown-unknown/release/ghostframe_client_wasm.wasm"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-wasm-bindgen --target web --no-typescript --out-dir "$work" \
-    target/wasm32-unknown-unknown/release/ghostframe_client_wasm.wasm
+wasm-bindgen --target web --no-typescript --out-dir "$work" "$built"
 wasm-opt -O "$work/ghostframe_client_wasm_bg.wasm" -o "$work/opt.wasm"
 
 hash=$(cat "$work/opt.wasm" "$work/ghostframe_client_wasm.js" | sha256sum | cut -c1-12)

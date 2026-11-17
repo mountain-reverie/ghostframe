@@ -6,7 +6,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use ghostframe_client_core::DecodeErrorCode;
 use ghostframe_protocol::codec::pal_rle::palette_fingerprint_bgra;
 use ghostframe_protocol::protocol::Codec;
 use serde::Serialize;
@@ -104,9 +103,6 @@ pub struct Recorder {
     pub stats_frames: u32,
     pub cdf53_dispatch_seen: u32,
     pub cdf53_pushed_to_queue: u32,
-    /// Read by the stats line only (not published: no e2e reader).
-    pub cdf53_prevalidate_fails: u32,
-    pub cdf53_last_fail_code: Option<u8>,
     /// The framebuffer size the server last announced (applied).
     fb: (u32, u32),
     first_recv_ms: BTreeMap<u32, f64>,
@@ -127,12 +123,6 @@ fn hex_prefix(bytes: &[u8]) -> String {
         return format!("LEN={}", bytes.len());
     }
     hex(&bytes[..bytes.len().min(HEX_PREFIX_LEN)])
-}
-
-fn is_cdf53_error(code: u8) -> bool {
-    code == DecodeErrorCode::Cdf53BadPass as u8
-        || code == DecodeErrorCode::Cdf53Truncated as u8
-        || code == DecodeErrorCode::Cdf53RleLength as u8
 }
 
 impl Recorder {
@@ -302,13 +292,10 @@ impl Recorder {
                     c0: format!("ERR:{code}"),
                     ts: at_ms,
                 }));
+                // The prevalidation failures are the stats line's
+                // (`StatsLine::note_events`), counted with or without `?e2e`.
                 if codec == Codec::Cdf53 as u8 {
                     self.cdf53_dispatch_seen = self.cdf53_dispatch_seen.saturating_add(1);
-                    if is_cdf53_error(code) {
-                        self.cdf53_prevalidate_fails =
-                            self.cdf53_prevalidate_fails.saturating_add(1);
-                        self.cdf53_last_fail_code = Some(code);
-                    }
                 }
             }
             // A rejected size, `TileReady`, `NeedsH264` and `Evicted` have no recorder.
@@ -357,6 +344,7 @@ impl Recorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ghostframe_client_core::DecodeErrorCode;
 
     fn tile(seq: u32, x: u8, y: u8, data: SlimTileData) -> Routed {
         Routed::Tile(SlimEvent::TilePayload {
@@ -427,7 +415,6 @@ mod tests {
         let mut out = events(&mut r, 1.0, vec![cdf53(7, vec![0xab, 0xcd])]);
         assert_eq!(r.cdf53_dispatch_seen, 1);
         assert_eq!(r.cdf53_pushed_to_queue, 1);
-        assert_eq!(r.cdf53_prevalidate_fails, 0);
         out.extend(events(
             &mut r,
             2.0,
@@ -438,11 +425,6 @@ mod tests {
         ));
         assert_eq!(r.cdf53_dispatch_seen, 2);
         assert_eq!(r.cdf53_pushed_to_queue, 1);
-        assert_eq!(r.cdf53_prevalidate_fails, 1);
-        assert_eq!(
-            r.cdf53_last_fail_code,
-            Some(DecodeErrorCode::Cdf53Truncated as u8)
-        );
         let p = pushes(&out);
         assert_eq!(p.len(), 2);
         assert_eq!(
@@ -467,8 +449,6 @@ mod tests {
             ],
         );
         assert_eq!(r.cdf53_dispatch_seen, 1);
-        assert_eq!(r.cdf53_prevalidate_fails, 0);
-        assert_eq!(r.cdf53_last_fail_code, None);
         assert_eq!(pushes(&out).len(), 2);
     }
 

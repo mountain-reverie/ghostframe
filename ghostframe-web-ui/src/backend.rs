@@ -20,12 +20,12 @@ fn now_us() -> u64 {
 
 /// A [`PanelBackend`] over the core the wasm module shares with the panel.
 ///
-/// The core sits in an `Rc<RefCell<..>>` because both the JS-facing
-/// `WasmClientCore` and the panel's timer and click handlers own it. Those
-/// callbacks run as separate browser tasks, never inside a `WasmClientCore`
-/// call (no export calls back into JS), so a borrow here cannot overlap one
-/// there. The `try_` forms exist anyway: a failed borrow must cost one
-/// refresh, not trap the module.
+/// The core sits in an `Rc<RefCell<..>>` because both the client loop
+/// (`ghostframe-client-wasm`'s `app/client.rs`) and the panel's timer and
+/// click handlers own it. Those callbacks run as separate browser tasks, and
+/// the client holds no borrow of the core across an `.await`, so a borrow
+/// here should not overlap one there. The `try_` forms exist anyway: a failed
+/// borrow must cost one refresh, not trap the module.
 pub struct CoreBackend {
     core: Rc<RefCell<ClientCore>>,
     /// The last view that was read, served if a borrow fails.
