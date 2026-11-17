@@ -405,7 +405,7 @@ mod tests {
 ///
 /// `camelCase` deliberately: the e2e tests read `tileDatagrams` /
 /// `frameDatagrams` off that global, so matching the existing property names
-/// lets `hooks.ts` assign straight across instead of renaming in flight.
+/// lets `app/debug_hooks.rs` assign straight across instead of renaming in flight.
 ///
 /// `u32`, not `u64`: `serde_wasm_bindgen` renders a `u64` as a JS `BigInt`,
 /// and `BigInt` is not JSON-serializable -- the e2e readers round-trip these

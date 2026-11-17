@@ -398,7 +398,7 @@ fn payload_mode_really_stores_the_palette_not_just_reports_it() {
 /// a Bundled palette upsert landed before any thin tile referencing it by
 /// upserting mid-drain-loop. That loop is gone. The replacement claim is that
 /// `ClientCore` prevalidates in wire order and emits `PaletteUpdated` before
-/// the `TilePayload` it belongs to, so `main.ts` applies the palette on
+/// the `TilePayload` it belongs to, so the Rust page (`ghostframe-client-wasm/src/app/session.rs`) applies the palette on
 /// arrival — strictly before the rAF drain that used to do the ordering.
 ///
 /// A thin tile against an unknown palette fails with `ThinUncachedPalette`,
