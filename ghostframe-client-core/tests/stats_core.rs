@@ -99,7 +99,7 @@ fn local_metrics_are_measured_without_any_subscription() {
     core.on_timeout(1_000_000); // baseline
     let mut bytes = 0u64;
     for x in 0..5u8 {
-        let dg = solid_datagram(1, x);
+        let dg = ghostframe_client_core::frame_plain(x as u32, &[solid_datagram(1, x).as_slice()]);
         bytes += dg.len() as u64;
         core.handle_datagram(&dg, 1_500_000);
     }
