@@ -1,2 +1,1 @@
-pkg-web/
-pkg-node/
+# dist/ (build output of just build-web) is ignored at the repository root.
