@@ -4,16 +4,22 @@
 //! dispatches them with no Rust borrow held: a hook may call back into
 //! `DebugApi`. A hook that throws is logged once per method and skipped.
 
+#[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
+#[cfg(target_arch = "wasm32")]
 use std::collections::HashSet;
 
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+#[cfg(target_arch = "wasm32")]
 use crate::app::debug_api::DebugApi;
 use crate::app::session::Drained;
+#[cfg(target_arch = "wasm32")]
 use crate::web::raw::{js_message, obj};
 use crate::web::route::Routed;
 
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 extern "C" {
     pub type Hooks;
@@ -71,10 +77,12 @@ pub enum HookCall {
     },
 }
 
+#[cfg(target_arch = "wasm32")]
 thread_local! {
     static WARNED: RefCell<HashSet<&'static str>> = RefCell::new(HashSet::new());
 }
 
+#[cfg(target_arch = "wasm32")]
 fn check(method: &'static str, r: Result<(), JsValue>) {
     if let Err(e) = r {
         if WARNED.with(|w| w.borrow_mut().insert(method)) {
@@ -85,15 +93,18 @@ fn check(method: &'static str, r: Result<(), JsValue>) {
 
 /// `Routed` as the old `to_js(&route(..))` returned it: plain `to_value`
 /// (`Routed` has no map fields, so maps-as-objects would be identical).
+#[cfg(target_arch = "wasm32")]
 fn records_js(records: &[Routed]) -> JsValue {
     serde_wasm_bindgen::to_value(records).unwrap_or(JsValue::NULL)
 }
 
+#[cfg(target_arch = "wasm32")]
 pub fn attach(hooks: &Hooks, api: DebugApi) {
     check("attach", hooks.attach(api));
 }
 
 /// Run `calls` in order. Call with no `App` or renderer borrow held.
+#[cfg(target_arch = "wasm32")]
 pub fn dispatch(hooks: Option<&Hooks>, calls: Vec<HookCall>) {
     let Some(h) = hooks else { return };
     for c in calls {
