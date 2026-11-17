@@ -22,7 +22,8 @@ use crate::app::input::attach_input;
 use crate::app::js::{StreamPair, WebTransport};
 use crate::app::page::PageFlags;
 use crate::app::recorder::{LogEntry, Recorder};
-use crate::app::session::{nacks_in, Action, Session};
+use crate::app::session::{nacks_in, Action, Drained, Session};
+use crate::app::stats_line::{StatsInputs, StatsLine};
 use crate::app::streams::{pump_stream, LoggedWriter, RepairStatusStream};
 use crate::app::webcodecs::{frame_seq_of, OnError, OnOutput, WebCodec};
 use crate::core::{client_config, datagram_counts, feed_datagrams, new_client_core};
@@ -531,11 +532,16 @@ impl App {
 }
 
 /// What `start_client` hands the hook calls to: the e2e recorder (`Some`
-/// under `?e2e`) and, from Task 4, the page's stats line. Each borrow is a
+/// under `?e2e`) and the page's stats line. Each borrow is a
 /// `try_borrow_mut`: on a conflict the call is dropped and logged once.
 struct PageSink {
     recorder: Option<Rc<RefCell<Recorder>>>,
     warned: Cell<bool>,
+    stats: RefCell<StatsLine>,
+    renderer: Rc<RefCell<WebRenderer>>,
+    core: Rc<OnceCell<Rc<RefCell<ClientCore>>>>,
+    log: Rc<PageLog>,
+    e2e: bool,
 }
 
 impl PageSink {
@@ -544,17 +550,132 @@ impl PageSink {
             console::error_1(&"hook sink busy; a hook call was dropped".into());
         }
     }
+
+    /// One `AfterPaint`: the ~2 s stats line, and under `?e2e` the
+    /// framebuffer probe when lines were logged.
+    fn stats_tick(&self, drained: Drained, raf_ticks: u32, nack_sent: u32) {
+        let Some(core) = self.core.get() else { return };
+        let (Ok(r), Ok(core)) = (self.renderer.try_borrow(), core.try_borrow()) else {
+            self.conflict();
+            return;
+        };
+        let (fails, last) = match &self.recorder {
+            Some(rec) => match rec.try_borrow() {
+                Ok(rec) => (rec.cdf53_prevalidate_fails, rec.cdf53_last_fail_code),
+                Err(_) => (0, None),
+            },
+            None => (0, None),
+        };
+        let fb = (r.fb_width(), r.fb_height());
+        let summary = core.cdf53_coverage_summary();
+        let coverage_line = summary.to_log_line();
+        let incomplete: Vec<(u8, u8, u16, u32)> = if summary.partial > 0 || summary.gave_up > 0 {
+            core.cdf53_incomplete_tiles(8)
+                .into_iter()
+                .map(|(x, y, mask, present, sweeps)| (x, y, present & !mask, u32::from(sweeps)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let inputs = StatsInputs {
+            now_ms: now_ms(),
+            drained,
+            raf_ticks,
+            submit_count: r.submit_count(),
+            fb,
+            cdf53_fails: fails,
+            cdf53_last: last,
+            nack_sent,
+            coverage_line: &coverage_line,
+            partial: u64::from(summary.partial),
+            gave_up: u64::from(summary.gave_up),
+            incomplete: &incomplete,
+        };
+        let Ok(mut stats) = self.stats.try_borrow_mut() else {
+            self.conflict();
+            return;
+        };
+        let Some(lines) = stats.on_tick(&inputs) else {
+            return;
+        };
+        drop(stats);
+        for l in &lines {
+            self.log.line(l);
+        }
+        if self.e2e && fb.0 > 0 && fb.1 > 0 {
+            self.probe(&r, fb);
+        }
+    }
+
+    /// Four known framebuffer points, to settle "is the texture written or is
+    /// the blit broken". The copies are submitted now; the log waits for them.
+    fn probe(&self, r: &WebRenderer, fb: (u32, u32)) {
+        const XS: [u32; 4] = [16, 960, 768, 1900];
+        const YS: [u32; 4] = [16, 540, 992, 1060];
+        let mut promises = Vec::with_capacity(4);
+        for (x, y) in XS.iter().zip(YS) {
+            match r.read_pixel_rect(*x.min(&(fb.0 - 1)), y.min(fb.1 - 1), 1, 1) {
+                Ok(p) => promises.push(p),
+                Err(e) => {
+                    self.log
+                        .line(&format!("fb-pixels readback failed: {}", fmt_js(&e)));
+                    return;
+                }
+            }
+        }
+        let log = self.log.clone();
+        spawn_local(async move {
+            let mut px: Vec<String> = Vec::with_capacity(4);
+            for p in promises {
+                match JsFuture::from(p).await {
+                    Ok(v) => {
+                        let b = Uint8Array::new(&v).to_vec();
+                        if b.len() < 4 {
+                            log.line(&format!("fb-pixels readback failed: {} bytes", b.len()));
+                            return;
+                        }
+                        px.push(format!("[{},{},{},{}]", b[0], b[1], b[2], b[3]));
+                    }
+                    Err(e) => {
+                        log.line(&format!("fb-pixels readback failed: {}", fmt_js(&e)));
+                        return;
+                    }
+                }
+            }
+            log.line(&format!(
+                "fb-pixels: tl(16,16)={} ctr(960,540)={} tile(768,992)={} br(1900,1060)={}",
+                px[0], px[1], px[2], px[3]
+            ));
+        });
+    }
 }
 
 impl HookSink for PageSink {
     fn dispatch(&self, calls: Vec<HookCall>) {
-        let Some(rec) = &self.recorder else { return };
         let mut out: Vec<LogEntry> = Vec::new();
         for call in calls {
-            // Task 4 hands `AfterPaint` to the stats line here.
-            match rec.try_borrow_mut() {
-                Ok(mut r) => r.apply(call, &mut out),
-                Err(_) => self.conflict(),
+            let after = match &call {
+                HookCall::AfterPaint {
+                    drained,
+                    raf_ticks,
+                    nack_sent,
+                } => Some((*drained, *raf_ticks, *nack_sent)),
+                HookCall::Events { .. }
+                | HookCall::DatagramCounts { .. }
+                | HookCall::RafTick(_)
+                | HookCall::BeforePaint { .. }
+                | HookCall::Swallowed { .. }
+                | HookCall::RendererError { .. }
+                | HookCall::ServerStream { .. } => None,
+            };
+            if let Some(rec) = &self.recorder {
+                match rec.try_borrow_mut() {
+                    Ok(mut r) => r.apply(call, &mut out),
+                    Err(_) => self.conflict(),
+                }
+            }
+            if let Some((d, raf, nack)) = after {
+                self.stats_tick(d, raf, nack);
             }
         }
         append_logs(out);
@@ -650,6 +771,11 @@ async fn run(
     let sink: Rc<dyn HookSink> = Rc::new(PageSink {
         recorder,
         warned: Cell::new(false),
+        stats: RefCell::new(StatsLine::new()),
+        renderer: renderer.clone(),
+        core: api_core.clone(),
+        log: log.clone(),
+        e2e: flags.e2e,
     });
     SINK.with(|s| *s.borrow_mut() = Some(sink));
 

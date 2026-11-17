@@ -15,6 +15,7 @@ pub mod page;
 pub mod recorder;
 pub mod repair_status;
 pub mod session;
+pub mod stats_line;
 
 #[cfg(target_arch = "wasm32")]
 pub mod bootstrap;
