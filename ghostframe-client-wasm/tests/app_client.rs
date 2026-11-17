@@ -14,7 +14,7 @@ use ghostframe_client_wasm::app::page::PageFlags;
 use ghostframe_client_wasm::core::{client_config, new_client_core};
 use ghostframe_client_wasm::web::renderer::WebRenderer;
 use ghostframe_client_wasm::web::route::{Routed, SlimEvent};
-use ghostframe_protocol::ack::{AckBatch, ACK_BATCH_MSG_TYPE};
+use ghostframe_protocol::fec::feedback::{BundleAckBatch, FEC_ACK_V4_MSG_TYPE};
 use ghostframe_protocol::feedback_stream::HELLO_MSG_TYPE;
 use ghostframe_protocol::protocol::{
     build_frame_dimensions_datagram, fragment_tile, Codec, TileFragmentInputs, TILE_DATAGRAM_FLAG,
@@ -119,6 +119,7 @@ async fn a_tile_is_acknowledged_and_the_hooks_see_the_tick_in_order() {
         log,
         datagram_writer: recording_writer("__dg"),
         feedback_writer: Some(recording_writer("__fb")),
+        repair_status: None,
         tick_us: Rc::new(RefCell::new(Vec::new())),
         hooks_enabled: true,
     });
@@ -146,9 +147,15 @@ async fn a_tile_is_acknowledged_and_the_hooks_see_the_tick_in_order() {
     )
     .remove(0);
     tile[8..12].copy_from_slice(&4242u32.to_be_bytes());
-    for d in [&dims, &tile] {
-        app.borrow_mut()
-            .on_datagram(&Uint8Array::from(d.as_slice()), now_ms() * 1000.0, false);
+    // Every datagram the core accepts is a rev 6 frame; the ACK names the
+    // frame's bundle_seq, not the record's wire_seq.
+    for (bundle, d) in [(4241, &dims), (4242, &tile)] {
+        let framed = ghostframe_client_core::frame_plain(bundle, &[d.as_slice()]);
+        app.borrow_mut().on_datagram(
+            &Uint8Array::from(framed.as_slice()),
+            now_ms() * 1000.0,
+            false,
+        );
     }
 
     // Exactly the borrow `start_client` takes.
@@ -209,13 +216,13 @@ async fn a_tile_is_acknowledged_and_the_hooks_see_the_tick_in_order() {
     sleep(0).await;
     let acked: Vec<u32> = recorded("__dg")
         .iter()
-        .filter(|d| d.first() == Some(&ACK_BATCH_MSG_TYPE))
+        .filter(|d| d.first() == Some(&FEC_ACK_V4_MSG_TYPE))
         .flat_map(|d| {
-            AckBatch::decode(d)
+            BundleAckBatch::decode(d)
                 .expect("a well-formed ACK batch")
                 .entries
         })
-        .map(|e| e.wire_seq)
+        .map(|e| e.bundle_seq)
         .collect();
-    assert!(acked.contains(&4242), "ACKed wire_seqs: {acked:?}");
+    assert!(acked.contains(&4242), "ACKed bundle_seqs: {acked:?}");
 }

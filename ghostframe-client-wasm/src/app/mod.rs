@@ -9,6 +9,7 @@ pub mod close;
 pub mod decoder;
 pub mod input_map;
 pub mod page;
+pub mod repair_status;
 pub mod session;
 
 #[cfg(target_arch = "wasm32")]

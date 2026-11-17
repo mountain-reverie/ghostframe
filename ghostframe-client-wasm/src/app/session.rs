@@ -153,21 +153,6 @@ impl Session {
         }
     }
 
-    /// A datagram shorter than `SHORT_DATAGRAM_LEN`: M0's ping/pong text.
-    pub fn on_short_datagram(&mut self, bytes: &[u8], out: &mut Vec<Action>) {
-        let text = String::from_utf8_lossy(bytes);
-        out.push(Action::Log(format!(
-            "Received: {text} ({} bytes)",
-            bytes.len()
-        )));
-        if text == "pong" {
-            out.push(Action::Status("Ping/Pong successful!"));
-            out.push(Action::Log(
-                "M0 COMPLETE: Ping/Pong datagram round-trip verified!".into(),
-            ));
-        }
-    }
-
     /// The drain counts since the last call.
     pub fn take_drained(&mut self) -> Drained {
         std::mem::take(&mut self.drained)
@@ -415,24 +400,6 @@ mod tests {
             }
         );
         assert_eq!(s.take_drained(), Drained::default());
-    }
-
-    #[test]
-    fn pong_is_m0() {
-        let mut s = Session::default();
-        let mut out = Vec::new();
-        s.on_short_datagram(b"pong", &mut out);
-        assert_eq!(
-            out,
-            vec![
-                Action::Log("Received: pong (4 bytes)".into()),
-                Action::Status("Ping/Pong successful!"),
-                Action::Log("M0 COMPLETE: Ping/Pong datagram round-trip verified!".into()),
-            ]
-        );
-        out.clear();
-        s.on_short_datagram(b"ping", &mut out);
-        assert_eq!(out, vec![Action::Log("Received: ping (4 bytes)".into())]);
     }
 
     #[test]
