@@ -9,8 +9,10 @@ pub mod certs;
 pub mod close;
 pub mod decoder;
 pub mod health;
+pub mod hooks;
 pub mod input_map;
 pub mod page;
+pub mod recorder;
 pub mod repair_status;
 pub mod session;
 
@@ -22,8 +24,6 @@ pub mod client;
 pub mod debug_api;
 #[cfg(target_arch = "wasm32")]
 pub mod dom;
-#[cfg(target_arch = "wasm32")]
-pub mod hooks;
 #[cfg(target_arch = "wasm32")]
 pub mod input;
 #[cfg(target_arch = "wasm32")]
