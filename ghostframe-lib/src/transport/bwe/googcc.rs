@@ -41,6 +41,14 @@ use std::time::{Duration, Instant};
 /// 1200-byte packets a second, need more than 100 ms of them: at 100 ms the
 /// step-up on its 20 ms row found the headroom on 8 of 24 timelines, at 300 ms
 /// on 16).
+///
+/// FIXME(fec-v2): on a sparse stream the 300 ms window slows the estimate's
+/// climb after the link rises: in `openh264_scene_6b` the coded rate reached
+/// only about 1.45 x its level 10 s after a 0.8 -> 3 Mbit/s rise, against 2 x
+/// with a 1 s window (700 ms passes too, 400-500 ms fails a seed). Accepted
+/// for PR #319 (owner, 2026-11-16); the scene's rise was moved from 5 s to
+/// 4 s to give the climb time. Revisit: a window between 300 and 700 ms that
+/// still passes p8e, or one that scales with the stream's packet rate.
 fn acked_rate_window() -> RobustThroughputEstimatorSettings {
     RobustThroughputEstimatorSettings {
         window_duration: TimeDelta::from_millis(300),
