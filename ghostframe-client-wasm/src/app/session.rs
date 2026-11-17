@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! What the page does with each routed event (port of `main.ts`'s
-//! `handleEvent`, minus the e2e recorders, which `hooks.ts` keeps until PR 4).
+//! `handleEvent`, minus the e2e recorders, which live in `app/recorder.rs` and
+//! `app/debug_hooks.rs`).
 
 use ghostframe_protocol::protocol::TILE_NACK_ENVELOPE;
 
