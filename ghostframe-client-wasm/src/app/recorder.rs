@@ -522,6 +522,25 @@ mod tests {
         assert!(!out.iter().any(|e| matches!(e, LogEntry::Flag(_))));
     }
 
+    /// Source: `diagnostics.test.ts` "recordTile works without the optional
+    /// fields". In Rust both timestamps are always present (no `undefined`):
+    /// a tile of a frame already two sequences behind has no first-receive
+    /// stamp, and still records both as numbers, the first receive falling
+    /// back to the arrival time.
+    #[test]
+    fn a_stale_tile_still_records_both_timestamps() {
+        let mut r = Recorder::new(false);
+        events(&mut r, 1.0, vec![solid(10, [0; 4])]);
+        let out = events(&mut r, 2.0, vec![solid(7, [0; 4])]);
+        match out.last() {
+            Some(LogEntry::Tile(t)) => {
+                assert_eq!(t.seq, 7);
+                assert_eq!((t.first_recv_ms_client, t.last_paint_ms_client), (2.0, 2.0));
+            }
+            other => panic!("not a tile: {other:?}"),
+        }
+    }
+
     /// Source: `hooks.ts` `FrameDimensions` arm.
     #[test]
     fn a_rejected_resize_is_not_recorded_and_an_applied_one_is() {
