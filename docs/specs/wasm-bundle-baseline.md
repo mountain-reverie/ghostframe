@@ -373,3 +373,20 @@ opt-level 3). Owner decision 2026-11-16: the cap is raised to 1,048,576 bytes
 (1 MiB) raw "for now", to be tuned later. PR 4 (the e2e hooks in Rust) is
 expected to grow it again; a size pass belongs after PR 5, when the remaining
 JS-facing exports can go.
+
+## 2026-11-17: PR 4+5 (e2e hooks in Rust, no npm)
+
+Measured with `just build-web`, which is now `ci/build-web.sh` (cargo,
+`wasm-bindgen` 0.2.129, `wasm-opt -O` from binaryen version_117; no Vite).
+Master is 579de2ac, built with its own Vite pipeline.
+
+| Build | wasm raw | wasm gzip | JS raw | JS gzip |
+|---|---|---|---|---|
+| master (PR 3 merged, 579de2ac) | 884,096 | 335,252 | 77,694 | 21,484 |
+| PR 4+5 | 891,841 | 337,716 | 110,307 | 17,730 |
+
+The wasm grows by 7,745 bytes: the e2e recorders and the stats line moved in
+from TypeScript, and the JS-only exports went out. The JS is now
+wasm-bindgen's glue alone, unminified (there is no bundler); it is larger raw
+and smaller gzipped than Vite's minified bundle, which carried the
+TypeScript. The cap stays 1,048,576 bytes.
