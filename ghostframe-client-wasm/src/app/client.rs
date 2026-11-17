@@ -12,9 +12,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{console, Document, HtmlCanvasElement, HtmlElement, WritableStreamDefaultWriter};
 
-use crate::app::batch::{
-    flush_decision, DatagramBatch, FlushDecision, FLUSH_FALLBACK_MS, SHORT_DATAGRAM_LEN,
-};
+use crate::app::batch::{flush_decision, DatagramBatch, FlushDecision, FLUSH_FALLBACK_MS};
 use crate::app::bootstrap::bootstrap;
 use crate::app::close::close_overlay_message;
 use crate::app::debug_api::DebugApi;
@@ -25,7 +23,7 @@ use crate::app::input::attach_input;
 use crate::app::js::{StreamPair, WebTransport};
 use crate::app::page::PageFlags;
 use crate::app::session::{nacks_in, Action, Session};
-use crate::app::streams::{pump_stream, LoggedWriter};
+use crate::app::streams::{pump_stream, LoggedWriter, RepairStatusStream};
 use crate::app::webcodecs::{frame_seq_of, OnError, OnOutput, WebCodec};
 use crate::core::{client_config, datagram_counts, feed_datagrams, new_client_core};
 use crate::units::{codec_from_u8, decode_error_code_from_u8};
@@ -81,6 +79,9 @@ pub struct App {
     /// `None` when the bidi stream could not be opened.
     feedback: Option<LoggedWriter>,
     decode_error_feedback: Option<LoggedWriter>,
+    /// `PollOutput::RepairStatus`: its own stream, tagged, reopened after a
+    /// failure. `None` only where a test has no transport.
+    repair_status: Option<RepairStatusStream>,
     batch: DatagramBatch,
     /// The armed fallback timer's handle. Shared with `timer_cb`, which clears
     /// it before borrowing the app, so a fired timer never stays recorded as
@@ -109,6 +110,7 @@ pub struct AppParts {
     pub log: Rc<PageLog>,
     pub datagram_writer: WritableStreamDefaultWriter,
     pub feedback_writer: Option<WritableStreamDefaultWriter>,
+    pub repair_status: Option<RepairStatusStream>,
     pub tick_us: Rc<RefCell<Vec<u32>>>,
     pub hooks_enabled: bool,
 }
@@ -163,6 +165,7 @@ impl App {
                 ),
                 feedback,
                 decode_error_feedback,
+                repair_status: parts.repair_status,
                 batch: DatagramBatch::default(),
                 flush_timer,
                 timer_cb,
@@ -210,6 +213,11 @@ impl App {
                         f.write(&b);
                     }
                 }
+                PollOutput::RepairStatus(b) => {
+                    if let Some(r) = &self.repair_status {
+                        r.write(&b);
+                    }
+                }
             }
         }
     }
@@ -221,16 +229,8 @@ impl App {
         if len == 0 {
             return;
         }
-        // Backward compat: small text datagrams (ping/pong). NOT protocol: this
-        // predates the tile protocol and the core has no concept of it, so it
-        // must be handled before the core ever sees the bytes.
-        if len < SHORT_DATAGRAM_LEN {
-            let mut actions = Vec::new();
-            self.session
-                .on_short_datagram(&value.to_vec(), &mut actions);
-            self.run_actions(actions);
-            return;
-        }
+        // Every datagram is a rev 6 FEC frame (a pong is one too, and the
+        // core ignores its record): nothing is handled before the core.
         // Queue, don't process: the batch crosses into the core once per rAF
         // tick (or sooner under backlog) instead of once per datagram.
         self.batch
@@ -713,6 +713,10 @@ async fn run(
         log: log.clone(),
         datagram_writer,
         feedback_writer,
+        repair_status: Some(RepairStatusStream::new({
+            let transport: WebTransport = JsValue::from(transport.clone()).unchecked_into();
+            Rc::new(move || transport.create_bidirectional_stream())
+        })),
         tick_us,
         hooks_enabled,
     });

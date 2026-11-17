@@ -346,6 +346,14 @@ Owner decision 2026-11-15: the cap in `ci/check-wasm-size.sh` is raised to
 884,736 bytes (864 KiB) raw, about 7 % headroom over 827,627, with no
 size-only code changes.
 
+Superseded by the 2026-11-16 section below: PR 3 of the all-Rust web client
+(main loop in Rust) raised the cap to 1 MiB, which covers both.
+
+Re-measured 2026-11-16 on FEC v2 rev 6 rebased onto PR 3 (master, 884,097 bytes
+raw): `just build-web` gives 925,313 bytes raw, 352,968 gzip as
+`ci/check-wasm-size.sh` counts it: +41,216 bytes (4.7 %) for FEC, in line with
+the 2026-11-15 figure. That is 123,263 bytes under the 1 MiB cap.
+
 ## 2026-11-16: all-Rust web client PR 3 (main loop in Rust)
 
 PR 3 moves startup, WebTransport, the rAF loop, the WebCodecs decoder, input

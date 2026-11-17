@@ -10,9 +10,6 @@
 pub const FLUSH_BACKLOG: usize = 32;
 /// How long a datagram may wait for a tick before the timer flushes it.
 pub const FLUSH_FALLBACK_MS: i32 = 50;
-/// Shorter datagrams are the ping/pong text of M0, which predates the tile
-/// protocol: never handed to the core.
-pub const SHORT_DATAGRAM_LEN: usize = 20;
 
 /// Datagrams back to back in one buffer, with their lengths and arrival
 /// stamps: the `concat`/`lens`/`arrivals_us` form the core's batch call takes.
@@ -118,9 +115,6 @@ mod tests {
 
     #[test]
     fn the_constants_are_the_ones_main_ts_used() {
-        assert_eq!(
-            (FLUSH_BACKLOG, FLUSH_FALLBACK_MS, SHORT_DATAGRAM_LEN),
-            (32, 50, 20)
-        );
+        assert_eq!((FLUSH_BACKLOG, FLUSH_FALLBACK_MS), (32, 50));
     }
 }
