@@ -179,12 +179,25 @@ lint-web:
     cargo clippy -p ghostframe-client-wasm -p ghostframe-web-ui --target wasm32-unknown-unknown --all-targets -- -D warnings
     @out="$(cargo tree -p ghostframe-client-wasm --target wasm32-unknown-unknown -i naga 2>&1 || true)"; echo "$out"; if echo "$out" | grep -q '^naga v'; then echo "naga is in the wasm32 graph" >&2; exit 1; fi
 
-# Run from a clean checkout: builds the web client SPA (vite) into
-# ghostframe-web-client/dist/, which ghostbridge //go:embeds at compile
-# time. A stale or missing dist/ now fails the ghostbridge build with a
-# clear message rather than silently embedding nothing.
+# Builds the browser client into ghostframe-web-client/dist/ (ghostbridge
+# //go:embeds it at compile time): ci/build-web.sh, shared with CI. Needs the
+# pinned tools: `just web-tools` once.
 build-web:
-    cd ghostframe-web-client && npm install && npm run build
+    ci/build-web.sh
+
+# Installs the web build's pinned tools into target/web-tools/ (repo-local,
+# nothing in $HOME): wasm-bindgen-cli at Cargo.lock's version and binaryen
+# version_117 (the wasm-opt wasm-pack 0.15.0 used).
+web-tools:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    v=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)
+    cargo install --root target/web-tools wasm-bindgen-cli --version "$v" --locked
+    b=117
+    if [[ ! -x target/web-tools/binaryen-version_$b/bin/wasm-opt ]]; then
+        curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/version_$b/binaryen-version_$b-x86_64-linux.tar.gz" \
+            | tar -xz -C target/web-tools
+    fi
 
 # E2E tests that must not share a run with the rest of the suite.
 #
@@ -294,7 +307,6 @@ ci-local:
     just test-web-renderer
     @echo "=== web client build ==="
     just build-web
-    cd ghostframe-web-client && npx tsc --noEmit
     @echo "=== wasm bundle under 1 MiB ==="
     ci/test-check-wasm-size.sh
     ci/check-wasm-size.sh

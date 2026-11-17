@@ -14,6 +14,19 @@
     <canvas id="canvas"></canvas>
     <div id="stats-panel"></div>
     <div id="log" style="padding: 8px; font-size: 12px; max-height: 200px; overflow-y: auto;"></div>
-    <script type="module" src="/src/main.ts"></script>
+    <script type="module">
+      // Built by ci/build-web.sh, which replaces the two @...@ names with the
+      // content-hashed files it writes under assets/.
+      import init, { startClient } from './assets/@GF_JS@';
+      try {
+        await init({ module_or_path: new URL('./assets/@GF_WASM@', import.meta.url) });
+      } catch (e) {
+        const status = document.getElementById('status');
+        if (status) status.textContent = `Error: ${e instanceof Error ? e.message : e}`;
+        throw e;
+      }
+      // Errors from here on are shown on the page by the client itself.
+      startClient();
+    </script>
   </body>
 </html>
