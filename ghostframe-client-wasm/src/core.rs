@@ -81,13 +81,13 @@ pub fn feed_datagrams(
     events
 }
 
-/// `cdf53Coverage`'s body, shared with `DebugApi`.
+/// `cdf53Coverage`'s body, shared with the debug hooks (Task 7).
 pub(crate) fn cdf53_coverage_js(core: &ClientCore) -> Result<JsValue, JsValue> {
     let s = core.cdf53_coverage_summary();
     to_js(&crate::boundary::WasmCdf53Coverage::from(&s))
 }
 
-/// `cdf53IncompleteTiles`'s body, shared with `DebugApi`.
+/// `cdf53IncompleteTiles`'s body, shared with the debug hooks (Task 7).
 pub(crate) fn cdf53_incomplete_js(core: &ClientCore, limit: usize) -> Result<JsValue, JsValue> {
     let v: Vec<crate::boundary::WasmCdf53IncompleteTile> = core
         .cdf53_incomplete_tiles(limit)
