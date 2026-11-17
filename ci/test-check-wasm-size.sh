@@ -7,7 +7,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 guard=ci/check-wasm-size.sh
-limit=819200
+limit=1048576
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 fail=0

@@ -13,7 +13,7 @@ layer and the `ghostframe-client-wasm` crate are live in the tree, but
 independent, not additive.
 
 Since the stats panel it has one gate: `ci/check-wasm-size.sh` fails the
-build when the wasm exceeds 800 KiB, 819,200 bytes (see the 2026-11-14
+build when the wasm exceeds 1 MiB, 1,048,576 bytes (see the 2026-11-16
 section). The measurements in sections 1 to 3 and the 2026-09-11 and
 2026-09-12 sections have no assertion attached; only that wasm limit does.
 
@@ -333,3 +333,23 @@ grows it). Owner decision 2026-11-14: the cap in `ci/check-wasm-size.sh` is
 raised to 819,200 bytes (800 KiB) raw, about 4% headroom over 783,983, with no
 size-only code changes. The extra weight is wgpu's WebGPU backend and the shared
 renderer; naga is not linked.
+
+## 2026-11-16: all-Rust web client PR 3 (main loop in Rust)
+
+PR 3 moves startup, WebTransport, the rAF loop, the WebCodecs decoder, input
+and the overlays from `main.ts` into `ghostframe-client-wasm` (`src/app/`).
+Measured with `just build-web` (the vite output ghostbridge embeds):
+
+| Build | Raw bytes | Gzip bytes |
+|---|---|---|
+| master (PR 2 merged, 6e310e42) | 790,120 | |
+| PR 3 | 884,097 | 335,294 |
+| PR 3, ghostframe-client-wasm `opt-level = "s"` | 858,808 | 331,963 |
+| PR 3, ghostframe-client-wasm + ghostframe-render + wgpu `"s"` | 843,901 | 327,663 |
+
+PR 3 is 64,897 bytes over the 800 KiB cap, and the opt-level levers leave it over
+too (and would undo the 2026-11-13 decision to keep the protocol crates at
+opt-level 3). Owner decision 2026-11-16: the cap is raised to 1,048,576 bytes
+(1 MiB) raw "for now", to be tuned later. PR 4 (the e2e hooks in Rust) is
+expected to grow it again; a size pass belongs after PR 5, when the remaining
+JS-facing exports can go.
