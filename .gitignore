@@ -6,8 +6,7 @@ Cargo.lock.bak
 *.rlib
 tmux-client-*.log
 
-# Node / web client build output
-node_modules/
+# Web client build output (ci/build-web.sh)
 ghostframe-web-client/dist/
 
 # wasm-pack build artefacts

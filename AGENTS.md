@@ -12,8 +12,10 @@ command.
 ```bash
 just build-release      # build-web THEN cargo build --release -p ghostframe-server
                         # -- the order matters; daemon only, see below
+just build-web          # ci/build-web.sh: the wasm + JS into ghostframe-web-client/dist/;
+                        # needs `just web-tools` once (wasm-bindgen-cli, binaryen)
 just ci-local           # the real gate: fmt, env-read guard, clippy --workspace --all-targets,
-                        # unit tests, web build, tsc, release build,
+                        # unit tests, web build, release build,
                         # cbindgen header diff, go vet
 just lint               # clippy --workspace --all-targets -- -D warnings
 just test-unit          # cargo test --lib
@@ -139,7 +141,7 @@ number in `docs/specs/wasm-bundle-baseline.md`.
 
 **The embed is behind `ghostframe-tsnet`'s `web-embed` feature, off by
 default.** Server crates enable it (`ghostframe-lib` does); client crates do
-not, and get a `-tags noweb` ghostbridge with no SPA and no npm step. A new
+not, and get a `-tags noweb` ghostbridge with no SPA and no web build step. A new
 server crate that forgets it will not silently serve 404s — ghostbridge's
 `startWebListeners` refuses to bind and says why — but it will get that far
 before anyone notices. See DEVELOPERS.md, "Building only the native client".
@@ -401,14 +403,16 @@ the deferral timeout and the alarms must read 0. `h264 stats` carries
 which wait for the block's content outcome instead of reaching the manager.
 A lost fragment that is then recovered no longer shows as a suspect frame.
 
-Client-side diagnostics are printed by the browser console. **Some of them are
-dead**: `rx{...}` and `cdf53-coverage` read `window.__tileCounts` /
-`window.__cdf53Coverage`, which nothing populates since the wasm cutover, so
-they always read zero. `fec-coverage` says `n/a(wasm-internal)` explicitly.
-`Δdrain` (events applied to the renderer in the window, per codec: counted by the Rust client, `ghostframe-client-wasm/src/app/session.rs`, from the core's slim records) and `nack_sent` are live. Do not diagnose from the dead ones.
-`window.__ghostframeStatsSamples` and `window.__ghostframeStatsFrames` (e2e
-pages only) are live: the server stats samples the core applied, and every
-server-stream frame it received; both move only while the stats panel is open.
+Client-side diagnostics are printed by the browser console. The page's stats
+line is produced by the Rust client (`ghostframe-client-wasm/src/app/stats_line.rs`)
+from the core and the renderer directly, not from `window` globals, so its
+`Δdrain` (events applied to the renderer in the window, per codec, counted from
+the core's slim records), `nack_sent` and `cdf53-coverage` fields are live.
+The e2e `window.__*` globals are installed only under `?e2e`
+(`ghostframe-client-wasm/src/app/debug_hooks.rs`). Under it,
+`window.__ghostframeStatsSamples` and `window.__ghostframeStatsFrames` are
+live: the server stats samples the core applied, and every server-stream frame
+it received; both move only while the stats panel is open.
 
 The browser renderer is Rust (`WebRenderer`, `ghostframe-client-wasm/src/web/`);
 the page URL steers it: `?cdf53=cpu` decodes CDF 5/3 on the CPU without trying

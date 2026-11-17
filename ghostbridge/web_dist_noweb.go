@@ -8,7 +8,7 @@ package main
 // ghostframe-web-client/dist has to exist for this archive to compile.
 //
 // This is the shape the native client wants. It links ghostbridge to reach
-// tsnet and nothing else, so requiring `npm install && vite build` before
+// tsnet and nothing else, so requiring the browser build before
 // `cargo build -p ghostframe-cli` bought it exactly nothing.
 
 import "net/http"

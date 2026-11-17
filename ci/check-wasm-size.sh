@@ -10,7 +10,7 @@
 # record the new number in docs/specs/wasm-bundle-baseline.md.
 #
 # Usage: ci/check-wasm-size.sh [assets-dir]
-#   assets-dir defaults to ghostframe-web-client/dist/assets (the vite output,
+#   assets-dir defaults to ghostframe-web-client/dist/assets (the build-web output,
 #   i.e. what ghostbridge embeds). It must already be built: `just build-web`.
 #
 # Fails closed: a directory with no .wasm file is an error, never a pass, so a

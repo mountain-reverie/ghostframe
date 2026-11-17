@@ -195,7 +195,7 @@ COPY ghostframe-test-pattern/ ghostframe-test-pattern/
 # ghostbridge //go:embeds ghostframe-web-client/dist/ at compile time.
 # The Makefile rsyncs from here into ghostbridge/dist/ before `go build`
 # runs (via ghostframe-lib's build.rs → make archive). The dist tree
-# must be prebuilt on the host (CI's web-client job or `npm run build`);
+# must be prebuilt on the host (CI's web-client job or `just build-web`);
 # this Dockerfile does not install Node.
 COPY ghostframe-web-client/dist/ ghostframe-web-client/dist/
 

@@ -34,7 +34,7 @@ test-openh264 lib="":
 # the server, the web client, Docker, or the e2e harness -- which matters
 # on a machine that cannot afford to build the workspace. `ghostframe-tsnet`
 # leaves its `web-embed` feature off here, so ghostbridge is built with
-# `-tags noweb` and no npm/vite step is involved at all.
+# `-tags noweb` and no web build step is involved at all.
 #
 # `ghostframe-client-net` is in the build list but NOT the test/lint lists:
 # its dev-dependencies include `ghostframe-lib`, so exercising its tests
