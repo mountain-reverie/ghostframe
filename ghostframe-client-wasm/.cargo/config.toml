@@ -1,6 +1,6 @@
 # Owner decision 2026-11-07 (docs/specs/fec-v2/fec-v2-rev6.md section 8
 # item 2): the web build enables WebAssembly SIMD (+simd128) for the FEC
 # Reed-Solomon codec. Cargo reads this file only for builds started inside
-# this directory (wasm-pack does that).
+# this directory (ci/build-web.sh and wasm-pack test do that).
 [target.wasm32-unknown-unknown]
 rustflags = ["-C", "target-feature=+simd128"]

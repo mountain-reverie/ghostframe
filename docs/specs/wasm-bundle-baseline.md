@@ -390,3 +390,10 @@ from TypeScript, and the JS-only exports went out. The JS is now
 wasm-bindgen's glue alone, unminified (there is no bundler); it is larger raw
 and smaller gzipped than Vite's minified bundle, which carried the
 TypeScript. The cap stays 1,048,576 bytes.
+
+Re-measured after rebasing onto FEC v2 rev 6 (master 2026-11-17): 941,308
+bytes raw, 357,352 gzip (JS 110,307 / 17,727), against 925,313 / 352,968 for
+FEC v2 on PR 3 in the 2026-11-15 section: +15,995 bytes for PR 4+5, and
+107,268 bytes under the 1 MiB cap. The build runs cargo from
+`ghostframe-client-wasm/`, so its `.cargo/config.toml` (+simd128) applies;
+`ci/build-web.sh` fails if the optimised wasm has no `v128` instruction.
