@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT OR Apache-2.0
-# The web client's wasm must stay under 1 MiB (1,048,576 bytes, raw).
+# The web client's wasm must stay under 880 KiB (901,120 bytes, raw).
 #
 # docs/specs/stats-panel-design.md section 5: adding Leptos to the wasm module
 # is the biggest single size risk of the web client, and the wasm is what every
-# browser downloads before the first frame. Today's wasm is about 460 KB raw. The
-# limit leaves room for the panel and fails the build when a dependency or a
-# generic blows it up; raise it deliberately, in a commit that says why, and
-# record the new number in docs/specs/wasm-bundle-baseline.md.
+# browser downloads before the first frame. Today's wasm is about 841 KB raw
+# (LTO, 2026-11-17); the limit leaves about 7 % headroom and fails the build
+# when a dependency or a generic blows it up. Raise it deliberately, in a
+# commit that says why, and record the new number in
+# docs/specs/wasm-bundle-baseline.md.
 #
 # Usage: ci/check-wasm-size.sh [assets-dir]
 #   assets-dir defaults to ghostframe-web-client/dist/assets (the build-web output,
@@ -24,7 +25,7 @@ arg_dir="${1:-}"
 cd "$(dirname "$0")/.."
 
 assets="${arg_dir:-ghostframe-web-client/dist/assets}"
-max_bytes=1048576
+max_bytes=901120
 
 shopt -s nullglob
 files=("$assets"/*.wasm)

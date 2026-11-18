@@ -397,3 +397,51 @@ FEC v2 on PR 3 in the 2026-11-15 section: +15,995 bytes for PR 4+5, and
 107,268 bytes under the 1 MiB cap. The build runs cargo from
 `ghostframe-client-wasm/`, so its `.cargo/config.toml` (+simd128) applies;
 `ci/build-web.sh` fails if the optimised wasm has no `v128` instruction.
+
+## 2026-11-17: size pass (LTO for the web build), cap 880 KiB
+
+Master 3009805b, `ci/build-web.sh` (wasm-opt `-O`, binaryen version_117).
+Every row is the wasm after wasm-opt; "simd" counts `v128` in it (the FEC
+Reed-Solomon codec's SIMD).
+
+| Variant | raw | gzip | simd |
+|---|---:|---:|---:|
+| release (master) | 941,274 | 357,312 | 3,770 |
+| release, wasm-opt `-Oz` | 923,069 | 357,583 | 3,785 |
+| **release + `lto = "fat"`, `codegen-units = 1`** | **841,031** | **335,205** | 3,394 |
+| the same, wasm-opt `-Oz` | 833,980 | 336,556 | 3,428 |
+| LTO, `opt-level = "s"` everywhere, `-Oz` | 782,716 | 324,001 | 1,473 |
+| LTO, `opt-level = "z"` everywhere, `-Oz` | 757,365 | 317,357 | 1,579 |
+| LTO, `"s"` on wgpu, js-sys, web-sys, wasm-bindgen, serde, hashbrown, indexmap, futures-util | 849,110 | 340,200 | 3,422 |
+| the same plus ghostframe-client-wasm and ghostframe-render | 822,553 | 334,772 | 3,003 |
+
+Adopted: LTO with one codegen unit, in a `web-release` profile that only
+`ci/build-web.sh` uses (`lto` and `codegen-units` are profile-wide; on
+`release` they would slow every server and native build). The Leptos crates'
+per-package `opt-level = "s"` carries over (`inherits = "release"`): the
+build gives 841,052 bytes raw, 335,247 gzip. That is −100 KB raw (−10.6 %),
+−22 KB gzip (−6.2 %). A clean build of the crate takes about 51 s.
+
+Not adopted:
+- `-Oz` saves 7 KB raw and costs 1 KB gzip.
+- `opt-level` `"s"`/`"z"` everywhere would drop the protocol crates from
+  opt-level 3 (decision of 2026-11-13; the SIMD count halves).
+- `"s"` on the glue crates alone makes the wasm larger under LTO; adding
+  the two app crates saves 18 KB raw, 0.4 KB gzip, and reaches the codecs
+  through inlining.
+- The WGSL shaders' comments are about 10 KB of the data; not stripped.
+
+What is left, by crate (twiggy, the optimised wasm before LTO): the client
+crates about 316 KB (ghostframe-client-wasm 159, -render 77, -client-core 49,
+-web-ui 20, -protocol 11), Leptos's `reactive_graph` and `tachys` 95 KB,
+`core`/`alloc`/`std` 154 KB, `js-sys` 76 KB, read-only data 117 KB (shaders,
+wgpu's enum names, the panel CSS), wgpu 39 KB.
+
+Speed: `e2e_bench_web_paint_us` at 1920x1080, three runs each, on the
+owner's RADV host. Release: tick p50 1.6 / 2.2 / 1.6 ms, paint step p50
+0.7 ms. LTO: tick p50 1.1 / 1.3 / 1.0 ms, paint step p50 0.5 to 0.6 ms. No
+regression. At 4096x2160 the bench fails on both builds ("framePaints joined
+nothing"), so 4K has no comparison.
+
+The cap in `ci/check-wasm-size.sh` goes from 1 MiB to 880 KiB (901,120
+bytes): about 7 % headroom over 841,052, as for the FEC cap of 2026-11-15.
