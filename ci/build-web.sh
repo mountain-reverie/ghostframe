@@ -28,7 +28,10 @@ if [[ "$have_opt" != "$BINARYEN_VERSION" ]]; then
     exit 1
 fi
 
-cargo build -p ghostframe-client-wasm --target wasm32-unknown-unknown --release
+# From the crate's directory: ghostframe-client-wasm/.cargo/config.toml turns on
+# WebAssembly SIMD (+simd128, for the FEC Reed-Solomon codec), and cargo reads
+# that file only for a build started inside the directory.
+(cd ghostframe-client-wasm && cargo build -p ghostframe-client-wasm --target wasm32-unknown-unknown --release)
 # Where cargo put it: CARGO_TARGET_DIR or build.target-dir move it, and a
 # hardcoded ./target would hand wasm-bindgen a stale wasm without an error.
 target_dir=$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
@@ -41,6 +44,16 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 wasm-bindgen --target web --no-typescript --out-dir "$work" "$built"
 wasm-opt -O "$work/ghostframe_client_wasm_bg.wasm" -o "$work/opt.wasm"
+
+# A RUSTFLAGS in the environment replaces the config's rustflags, silently
+# dropping +simd128; fail rather than ship the scalar codec.
+# (grep -c, not -q: -q exits at the first match and pipefail would report
+# wasm-dis's SIGPIPE.)
+simd_ops=$(wasm-dis --all-features "$work/opt.wasm" | grep -c 'v128' || true)
+if [[ "$simd_ops" -eq 0 ]]; then
+    echo "error: the wasm has no SIMD instructions; was +simd128 dropped (RUSTFLAGS set?)" >&2
+    exit 1
+fi
 
 hash=$(cat "$work/opt.wasm" "$work/ghostframe_client_wasm.js" | sha256sum | cut -c1-12)
 js="ghostframe_client_wasm-$hash.js"
