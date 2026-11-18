@@ -31,7 +31,7 @@ fi
 # From the crate's directory: ghostframe-client-wasm/.cargo/config.toml turns on
 # WebAssembly SIMD (+simd128, for the FEC Reed-Solomon codec), and cargo reads
 # that file only for a build started inside the directory.
-(cd ghostframe-client-wasm && cargo build -p ghostframe-client-wasm --target wasm32-unknown-unknown --release)
+(cd ghostframe-client-wasm && cargo build -p ghostframe-client-wasm --target wasm32-unknown-unknown --profile web-release)
 # Where cargo put it: CARGO_TARGET_DIR or build.target-dir move it, and a
 # hardcoded ./target would hand wasm-bindgen a stale wasm without an error.
 target_dir=$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
@@ -39,7 +39,7 @@ if [[ -z "$target_dir" ]]; then
     echo "error: cargo metadata gave no target_directory" >&2
     exit 1
 fi
-built="$target_dir/wasm32-unknown-unknown/release/ghostframe_client_wasm.wasm"
+built="$target_dir/wasm32-unknown-unknown/web-release/ghostframe_client_wasm.wasm"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 wasm-bindgen --target web --no-typescript --out-dir "$work" "$built"

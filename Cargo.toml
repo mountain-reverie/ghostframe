@@ -191,6 +191,17 @@ opt-level = 3
 [patch.crates-io]
 goog_cc = { git = "https://github.com/Bluebugs/goog_cc", rev = "14eb7a1097acdb2330630e21b89b143af24f906a" }
 
+# The browser client's build (`ci/build-web.sh`, `just build-web`): release
+# plus whole-program LTO and one codegen unit. On the wasm that is 941,274 ->
+# 841,031 bytes raw after wasm-opt (docs/specs/wasm-bundle-baseline.md,
+# 2026-11-17 size pass), with no opt-level change on the hot path. `lto` and
+# `codegen-units` are profile-wide, so they live in a profile of their own:
+# set on `release` they would slow every server and native build.
+[profile.web-release]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
 # Size over speed for the stats panel's UI stack only (owner decision
 # 2026-11-13, docs/specs/stats-panel-design.md section 5). The protocol core
 # (ghostframe-client-core, ghostframe-protocol, ghostframe-client-wasm) keeps
