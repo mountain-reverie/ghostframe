@@ -72,7 +72,7 @@ tracing-subscriber = { workspace = true }
 # (`cargo tree -p ghostframe-client-gpu -i naga`), so this test parses with
 # the same frontend `create_shader_module` will use, not a drifted one.
 # `wgsl-in` is required explicitly: naga's default features are empty.
-naga = { version = "=30.0.1", features = ["wgsl-in"] }
+naga = { version = "=30.0.2", features = ["wgsl-in"] }
 # Cross-checks the Tier B oracle's own hand-written round-toward-zero f32->f16
 # packer (src/nv12_oracle_tests.rs) against a standard round-to-nearest-even
 # f16 implementation in a property test. Test-only: the oracle's actual
