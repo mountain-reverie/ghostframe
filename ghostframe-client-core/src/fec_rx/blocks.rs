@@ -685,13 +685,12 @@ mod tests {
         .encode()
     }
 
-    fn rep(seq: u32, block: u16, k: u8, r: u8, idx: u8, payload: &[u8]) -> Vec<u8> {
+    fn rep(seq: u32, block: u16, k: u8, idx: u8, payload: &[u8]) -> Vec<u8> {
         RepairFrame {
             rtt_hint: 0,
             bundle_seq: seq,
             block_id: block,
             k,
-            r,
             repair_idx: idx,
             payload,
         }
@@ -726,7 +725,7 @@ mod tests {
         let reps = reps
             .iter()
             .enumerate()
-            .map(|(i, p)| rep(base + 100 + i as u32, block_id, k as u8, r, i as u8, p))
+            .map(|(i, p)| rep(base + 100 + i as u32, block_id, k as u8, i as u8, p))
             .collect();
         (srcs, reps)
     }
@@ -837,7 +836,7 @@ mod tests {
         s.on_datagram(&src(1, 3, 0, false, &recs(&[b"a"])), T);
         s.on_datagram(&src(3, 3, 2, true, &recs(&[b"c"])), T); // k = 3
         let sym = vec![0u8; 12];
-        let o = s.on_datagram(&rep(9, 3, 4, 1, 0, &sym), T); // k = 4: disagrees
+        let o = s.on_datagram(&rep(9, 3, 4, 0, &sym), T); // k = 4: disagrees
         assert_eq!(o.arrival, Some(9));
         assert_eq!(s.stats().rejected_symbols, 1);
         // A marked block declines at its first close, with no request first.
@@ -862,8 +861,8 @@ mod tests {
     #[test]
     fn repair_length_mismatch_is_rejected_and_declines_as_length_bound() {
         let mut s = BlockStore::new();
-        s.on_datagram(&rep(9, 3, 5, 2, 0, &[0u8; 20]), T);
-        s.on_datagram(&rep(10, 3, 5, 2, 1, &[0u8; 21]), T);
+        s.on_datagram(&rep(9, 3, 5, 0, &[0u8; 20]), T);
+        s.on_datagram(&rep(10, 3, 5, 1, &[0u8; 21]), T);
         assert_eq!(s.stats().rejected_symbols, 1);
         let a = s.on_timeout(T + WINDOW);
         assert!(matches!(
@@ -913,7 +912,7 @@ mod tests {
         // A repair claiming a symbol shorter than its own source: recover errors.
         let mut s = BlockStore::new();
         s.on_datagram(&src(1, 4, 0, false, &recs(&[b"long long long"])), T);
-        s.on_datagram(&rep(9, 4, 2, 1, 0, &[0u8; 3]), T);
+        s.on_datagram(&rep(9, 4, 2, 0, &[0u8; 3]), T);
         let a = s.on_timeout(T + WINDOW);
         assert!(matches!(
             a[0],
@@ -1003,18 +1002,18 @@ mod tests {
 
     // ---- advertised timing (S1) ----
 
-    /// Sets the advertised span code in an encoded SOURCE (flags bits 4-6), by hand.
+    /// Sets the advertised span code in an encoded SOURCE (byte 0 bits 4-2), by hand.
     fn adv(mut dg: Vec<u8>, code: u8) -> Vec<u8> {
-        assert_eq!(dg[0], 0x01);
-        dg[1] = (dg[1] & !0x70) | (code << 4);
+        assert_eq!(dg[0] & 0xc0, 0x40, "a SOURCE");
+        dg[0] = (dg[0] & !0x1c) | (code << 2);
         dg
     }
 
-    /// A REPAIR of block `id` carrying an RTT hint (scheme byte high nibble), by hand.
+    /// A REPAIR of block `id` carrying an RTT hint (byte 0 bits 5-2), by hand.
     fn hinted_rep(id: u16, hint: u8) -> Vec<u8> {
-        let mut dg = rep(900 + u32::from(id), id, 3, 1, 0, &[0u8; 20]);
-        assert_eq!(dg[1], 0);
-        dg[1] = hint << 4;
+        let mut dg = rep(900 + u32::from(id), id, 3, 0, &[0u8; 20]);
+        assert_eq!(dg[0], 0x80);
+        dg[0] |= hint << 2;
         dg
     }
 
@@ -1166,7 +1165,7 @@ mod tests {
         s.on_datagram(&hinted_rep(3, 0), T + 2 * WINDOW + 5);
         assert_eq!(s.stats().late_rows, 1);
         let mut second = hinted_rep(3, 0);
-        second[10] = 1; // repair_idx 1
+        second[8] = 1; // repair_idx 1
         s.on_datagram(&second, T + 2 * WINDOW + 6);
         assert_eq!(
             s.stats().late_rows,
@@ -1346,7 +1345,7 @@ mod tests {
                 let body = vec![b; usize::from(a) % 40];
                 let dg = match kind {
                     0 => src(u32::from(a), block % 8, a % 12, b % 5 == 0, &body),
-                    1 => rep(u32::from(a), block % 8, 1 + a % 12, 1 + b % 4, b % 3, &body),
+                    1 => rep(u32::from(a), block % 8, 1 + a % 12, b % 3, &body),
                     _ => PlainFrame { bundle_seq: u32::from(a), records: &body }.encode(),
                 };
                 s.on_datagram(&dg, now);
@@ -1417,7 +1416,7 @@ mod tests {
         };
         assert_eq!((ask.have, ask.missing), (3, 1));
         // The server's answer row arrives (it carries k).
-        s.on_datagram(&rep(99, 4, 3, 2, 1, &reps[1]), T + WINDOW + 1);
+        s.on_datagram(&rep(99, 4, 3, 1, &reps[1]), T + WINDOW + 1);
         assert!(s.on_timeout(T + WINDOW + 1_000_000).is_empty());
         assert_eq!(s.stats().declined, 0);
         assert_eq!(s.stats().blocks_unrecoverable, 0);

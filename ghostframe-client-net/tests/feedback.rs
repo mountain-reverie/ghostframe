@@ -418,7 +418,6 @@ fn recovered_status_reaches_the_server_on_a_second_tagged_stream() {
         bundle_seq: 12,
         block_id: 7,
         k: 2,
-        r: 1,
         repair_idx: 0,
         payload: &reps[0],
     };

@@ -147,19 +147,37 @@
 
 #define FEC_MAX_ACK_V4_ENTRIES 72
 
-#define FEC_FRAME_SOURCE 1
+/**
+ * Byte 0 bits 7-6: the frame kind. Kind 00 is reserved and rejected: it is
+ * the escape for any later format (rev 7, a frozen header).
+ */
+#define FEC_KIND_MASK 192
 
-#define FEC_FRAME_REPAIR 2
+/**
+ * Kind 01. Byte 0 also holds LAST (bit 5), `t_adv` (bits 4-2) and the scheme (bits 1-0).
+ */
+#define FEC_FRAME_SOURCE 64
 
-#define FEC_FRAME_PLAIN 3
+/**
+ * Kind 10. Byte 0 also holds the RTT hint code (bits 5-2) and the scheme (bits 1-0).
+ */
+#define FEC_FRAME_REPAIR 128
+
+/**
+ * Kind 11. Bits 5-0 are reserved and must be zero.
+ */
+#define FEC_FRAME_PLAIN 192
 
 #define FEC_SCHEME_RS_CAUCHY 0
 
-#define FEC_FLAG_LAST 128
+/**
+ * SOURCE byte 0 bit 5: the last source of its block.
+ */
+#define FEC_FLAG_LAST 32
 
-#define FEC_SOURCE_HEADER_LEN 9
+#define FEC_SOURCE_HEADER_LEN 8
 
-#define FEC_REPAIR_HEADER_LEN 11
+#define FEC_REPAIR_HEADER_LEN 9
 
 #define FEC_PLAIN_HEADER_LEN 5
 

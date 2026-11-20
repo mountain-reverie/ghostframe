@@ -2,8 +2,8 @@
 //! The recovery window as a function of what the server advertises.
 //!
 //! The server states two things in frames it already sends: the block's span
-//! `T_adv` (a 3-bit code in SOURCE flags bits 4-6) and a hint at the round
-//! trip (a 4-bit code in the high nibble of the REPAIR scheme byte). Client and
+//! `T_adv` (a 3-bit code in SOURCE byte 0 bits 4-2) and a hint at the round
+//! trip (a 4-bit code in REPAIR byte 0 bits 5-2; rev 7, `frame`). Client and
 //! server both derive their deadlines from the functions below, so there is one
 //! home for the arithmetic and nothing to mirror.
 //!

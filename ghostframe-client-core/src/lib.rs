@@ -205,7 +205,7 @@ pub fn frame_one(record: impl AsRef<[u8]>) -> Vec<u8> {
 }
 
 pub struct ClientCore {
-    /// rev 6 framing state: every incoming datagram is an FEC frame.
+    /// FEC v2 framing state: every incoming datagram is an FEC frame.
     pub(crate) fec: fec_rx::FecRx,
     /// The record `handle_datagram_payloads` is currently handling.
     pub(crate) current_record: Option<RecordCtx>,

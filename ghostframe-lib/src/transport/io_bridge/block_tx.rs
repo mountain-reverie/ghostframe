@@ -45,7 +45,6 @@ pub(super) enum RowCause {
 pub(super) struct RepairJob {
     pub(super) block_id: BlockId,
     pub(super) k: u8,
-    pub(super) r: u8,
     pub(super) row: u8,
     pub(super) payload: Vec<u8>,
     pub(super) cause: RowCause,
@@ -352,7 +351,6 @@ impl IoBridge {
                             self.pending_repairs.push_back(RepairJob {
                                 block_id: c.block_id,
                                 k,
-                                r,
                                 row: row as u8,
                                 payload,
                                 cause: RowCause::Initial,
@@ -454,7 +452,7 @@ impl IoBridge {
     /// Encodes `rows` of block `id` from the table's symbols in one call and
     /// queues each as a repair job (admitted by `service_pending_repairs`).
     fn queue_repair_rows(&mut self, id: BlockId, rows: &[u8]) {
-        let (Some((k, r)), Some(symbols)) =
+        let (Some((k, _)), Some(symbols)) =
             (self.block_table.params(id), self.block_table.symbols(id))
         else {
             self.block_tx.repair_rows_no_block += rows.len() as u64;
@@ -475,7 +473,6 @@ impl IoBridge {
             self.pending_repairs.push_back(RepairJob {
                 block_id: id,
                 k,
-                r,
                 row,
                 payload,
                 cause,
@@ -631,7 +628,6 @@ impl IoBridge {
                 bundle_seq,
                 block_id: job.block_id,
                 k: job.k,
-                r: job.r,
                 repair_idx: job.row,
                 payload: &job.payload,
             }

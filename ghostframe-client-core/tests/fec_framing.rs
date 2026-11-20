@@ -144,7 +144,6 @@ fn rebuilt_tile_is_delivered_and_recovered_is_reported() {
         bundle_seq: 99,
         block_id: 7,
         k: 3,
-        r: 1,
         repair_idx: 0,
         payload: &rep[0],
     }
@@ -271,7 +270,6 @@ fn rebuilt_bundle_with_a_bad_pass_rejects_before_it_recovers() {
         bundle_seq: 99,
         block_id: 9,
         k: 2,
-        r: 1,
         repair_idx: 0,
         payload: &rep[0],
     }
@@ -372,7 +370,6 @@ fn late_original_after_a_rebuild_is_acked_but_not_delivered_twice() {
         bundle_seq: 99,
         block_id: 7,
         k: 3,
-        r: 1,
         repair_idx: 0,
         payload: &rep[0],
     }
