@@ -526,6 +526,11 @@ impl IoBridge {
         wire_seq: u32,
         tx: crate::transport::transmission_ledger::Transmission,
     ) {
+        if self.fec_adapt.is_some() {
+            let now_ms = self.bwe_ms(super::now_std());
+            self.queue_loss
+                .on_verdict(wire_seq, !tx.records.is_empty(), now_ms);
+        }
         // The loss is reported against the moment the datagram went out, the
         // same clock the acknowledgements' send times are on, not the moment
         // it was built.
@@ -675,6 +680,11 @@ impl IoBridge {
             self.adaptation_context.last_update_seq.wrapping_add(1);
         self.classifier
             .set_adaptation_context(self.adaptation_context);
+    }
+
+    /// `at` in ms on the bridge's own clock (`bwe_epoch`).
+    pub(super) fn bwe_ms(&self, at: std::time::Instant) -> u64 {
+        at.saturating_duration_since(self.bwe_epoch).as_millis() as u64
     }
 
     /// Read the live smoothed RTT from the HELLO'd connection and feed it to

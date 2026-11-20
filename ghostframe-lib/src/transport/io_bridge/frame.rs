@@ -2671,7 +2671,7 @@ impl IoBridge {
                     block_declined_k_mismatch = self.block_table.stats().declined_k_mismatch,
                     "fec v2 blocks (closes by cause, repairs sent; cumulative)"
                 );
-                if let Some(a) = self.fec_adapt.as_ref().map(|a| a.probe()) {
+                if let Some(a) = self.adapt_probe() {
                     tracing::info!(
                         target: LOG_TARGET,
                         frame_seq = seq,
@@ -2690,6 +2690,10 @@ impl IoBridge {
                         adapt_trim_steps = a.trim_steps,
                         adapt_blocks_sized = a.blocks_sized,
                         adapt_saturated = a.saturated,
+                        adapt_queue_losses = a.queue_losses,
+                        adapt_local_discards = a.local_discards,
+                        adapt_black_holes = a.black_holes,
+                        adapt_losses_excused = a.losses_excused,
                         "fec v2 adapt (controller state and sizing; cumulative)"
                     );
                 }

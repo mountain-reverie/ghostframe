@@ -569,7 +569,18 @@ loss rate, ppm; congested intervals are skipped, counted in
 `adapt_changes` (state and span moves), `adapt_trim_steps` (times the
 declined-share trim added 1 to `r`), `adapt_blocks_sized` and `adapt_saturated`
 (blocks sized at the cap because the 1e-3 target was unreachable for the
-burst; a high share means the link is worse than the cap can fix).
+burst; a high share means the link is worse than the cap can fix). The ledger loss gate
+(`fec_tx/queue_loss.rs`) adds `adapt_queue_losses` (source-bundle verdicts
+sent into a queue at its deepest: the stream's own overflow),
+`adapt_local_discards` (datagrams quinn threw away itself after an MTU
+black hole; the 2 Mbit/s start-up burst triggers one), `adapt_black_holes`
+(those events) and `adapt_losses_excused` (losses a LOSS_REPORT did not charge
+to the path; they stay in the estimator's `total`). On a clean 2 Mbit/s start-up
+`queue_losses + local_losses` equals the report's `lost_pre_fec` and the state
+stays `clean`; a `lost_pre_fec` with `adapt_losses_excused` 0 is a gap the gate
+did not close. A black hole also moves the departure mirror
+(`DepartureTracker::discard_oversized`), so those datagrams are not read as
+departures.
 
 **Timing the client derives.** Each SOURCE carries the block's span `T_adv` as
 a 3-bit code in byte 0 bits 4-2 (rev 7; the knob's `t_ms` plus the queue allowance,

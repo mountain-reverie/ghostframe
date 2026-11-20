@@ -969,3 +969,69 @@ These equal §13's table to the digit (same seeds, deterministic harness). The C
 - New, in cells §10 never ran: Tile at 30 Mbit/s fails criterion 2 (iid 0.1 %, 4 to 5 changes per minute), criterion 3's overhead (iid 1 %, 0.153 against 0.105), criterion 5 (iid 5 %, 4.8 % against 0.5 %) and criterion 6 (bursty, 54 passes under the bound). The last two ran beside the frame-notch tests and should be re-run alone before being relied on.
 - Criterion 3's overhead failures at 10 and 30 Mbit/s are bucket-midpoint rounding (§11: the bar, not the controller); the exact-`k` bar §11 proposed is not implemented.
 - Tile at 100 Mbit/s remains unmeasured.
+
+## 15. The ledger loss gate (criteria 1 and 4 at 2 Mbit/s)
+
+Code: `ghostframe-lib/src/transport/fec_tx/queue_loss.rs` (classifier and credit), `departure.rs` (`discard_oversized`), the hooks in `io_bridge/{ack_dispatch,bwe_glue,repair_status,transport_probe}.rs`, `LossEstimator::on_report_excusing` in `fec_tx/adapt.rs`. Counters on the `fec v2 adapt` log line: `adapt_queue_losses`, `adapt_local_discards`, `adapt_black_holes`, `adapt_losses_excused`; the sweep prints a `FECGATE` line per adaptive run.
+
+### 15.1 Why the standing-queue gate misses the start-up overflow
+
+1. The session's first frame (about 60 kB) bursts into the 150 ms buffer at 2 Mbit/s: 31 tail drops at about 830 to 900 ms.
+2. quinn-proto 0.11.14 (`connection/mod.rs:1767-1775`) reads that burst of full-size losses as an MTU black hole, resets the MTU to `min_mtu` and calls `datagrams.drop_oversized`: about 11 queued full-size datagrams are discarded and never reach the wire. The departure tracker read them as departed (and the datagrams behind them as departed early).
+3. The LOSS_REPORT carrying those losses arrives about 600 ms later, after the queue has drained, so `bwe.standing_queue()` is false. The client files a loss under the report that confirms it, not one whose `first..last_bundle_seq` range contains it, so the report's range cannot be used to find the lost bundles.
+
+### 15.2 What was measured to choose the rule (ledger verdicts by bundle identity; `q` = depart-timed one-way delay minus its 10 s windowed minimum, taken at the nearest acknowledged bundle departed before the lost one)
+
+| losses | `q_before >= 50 ms` | `>= 80 ms` | `>= 100 ms` |
+|---|---|---|---|
+| overflow (clean 2 Mbit/s start-up; 6 -> 2 Mbit/s step-down) | 100 % | 100 % | 100 % |
+| i.i.d. 5 % after the first 2 s (H.264 2 and 10 Mbit/s, 2 Mbit/s with a 1500 ms buffer, tile 2 Mbit/s) | 0.5 to 5 % | 0 to 1.4 % | 0 % |
+| black-hole discards | no signal: they never reached the wire | | |
+
+`q` peaks at the buffer depth (about 155 ms behind 150 ms). The discards are therefore identified by identity, not by `q`.
+
+### 15.3 As built
+
+- **Queue loss.** A source bundle the ledger judges lost is a queue loss when the nearest acknowledged bundle before it (by `bundle_seq`) had `q >= max(Q_FLOOR_MS, Q_FRACTION x q_max)`, `q_max` the largest `q` of the last 10 s. Repair and control bundles (no records) are left out. A verdict a late acknowledgement contradicts is withdrawn.
+- **Local discards.** `check_black_hole` reads `black_holes_detected` before each datagram is mirrored and before each poll, so every tracker entry then was queued when the black hole happened. On a rise it asks the tracker to drop every entry of `max_size()` bytes or more (`drop_oversized`'s own rule: it keeps a datagram only if it is *shorter* than `max_size`), moves the byte arithmetic by their length (`cum_departed = cum_enqueued - discarded - outgoing_total`, so neither the discarded ones nor those behind them read as departed), and marks them local. Their ledger records are still stamped at the next poll, so retransmission and the loss clock work as before. The first datagram of a tracker has no known length and is never treated as discarded.
+- **Credit.** Queue and local verdicts add a credit (2 s expiry). On each LOSS_REPORT `excused = min(credit, lost_pre_fec)` is spent; the estimator adds `lost_pre_fec - excused` to `lost`, all of the report's datagrams to `total`, and scales the run histogram by the share kept (a report whose every loss is excused adds no runs). The standing-queue gate is unchanged and still skips a report whole; a skipped report also spends the credit (those losses are already out of the estimate) but does not count them as excused.
+
+### 15.4 Constants, from the sweep (`H264/clean/2M`, `H264/iid5/2M`, `H264/iid5/10M`, 3 seeds, `queue_losses` summed over the three seeds' runs; start-up overflow is 31 queue + 11 local per run at 2 Mbit/s)
+
+| `Q_FLOOR` | `F` | `H264/clean/2M` queue losses (3 runs) | `H264/iid5/10M` queue losses (no start-up overflow there; every one is random loss) |
+|---|---|---|---|
+| 50 ms | 0.8 | 31, 31, 31 | 40, 37, 31 (of about 1 000 lost per run) |
+| 50 ms | 0.5 | 31, 31, 31 | 40, 39, 35 |
+| 50 ms | 1.0 | 16, 10, 10 | 4, 1, 1 |
+| **80 ms** | **0.8** | **31, 31, 31** | **0, 0, 0** |
+
+`F` between 0.5 and 0.8 changed nothing (the bar is the floor wherever the queue is shallow and 0.8 x 155 = 124 ms behind the 150 ms buffer, which every overflow loss clears); `F = 1.0` demands the peak itself and covers only a third of the overflow. The floor does the work against random loss: at 50 ms 3 to 4 % of a 5 % i.i.d. link's losses were taken for queue losses (the 0.5 to 5 % of 15.2), at 80 ms none. The price: a link whose whole buffer is under about 100 ms never reaches the bar, and keeps the old behaviour (the loss counts). Not measured: a floor of 30 ms (the run was stopped, the 50 ms row already shows the false-positive rate rising as the floor falls).
+
+### 15.5 The race (does the ledger judge before the report that carries the loss arrives?)
+
+Yes, on the measured link (40 ms round trip, 250 ms report cadence). `verdicts_behind_report` (verdicts for a bundle at or below the `last_bundle_seq` of a report already folded) is 0 in all six runs of `H264/clean/2M` and `iid0.01/2M`, and 0, 1, 1 in `iid0.1/2M`; `credits_behind_report` (the queue and local ones among them, which is what the start-up produces) is 0 in every one of these 9 runs. A verdict needs the next acknowledgement, about one round trip; the report needs the client's next 250 ms tick and the trip back. Under 5 % i.i.d. loss `verdicts_behind_report` is 9 to 67 per run, but those are random losses (path verdicts), and `credits_behind_report` is 1 to 19 (the false positives of 15.4 at the 50 ms floor). So reports do not win the race here and **no deferral was built**: a report is folded when it arrives. A late credit is not lost: it waits for the next report, 2 s at most. Both counters are on the `FECGATE` line and the probe, so a link where it does happen shows. (A longer ack path, or one that batches acknowledgements for longer than the report interval, was not run.)
+
+### 15.6 Results (`GHOSTFRAME_FEC_SWEEP=full`, `GHOSTFRAME_FEC_SWEEP_ONLY="H264/clean/2M,H264/iid0.0001/2M,H264/step5/2M,Tile/clean/2M,Tile/step5/2M,H264/iid0.05/2M,H264/iid0.01/2M,H264/clean/10M"`, 3 seeds; before = origin/master)
+
+(The names are matched as substrings of the cell names, which print the percentage: `iid0.01` is 0.01 %, `iid5` is 5 %; `iid0.0001`, `iid0.05` match nothing. The cells that ran are the seven below. The 1 % and 5 % cells are in 15.7.)
+
+| cell | crit | before | after |
+|---|---|---|---|
+| H264/clean/2M | 1 | FAIL: repair 1.07 to 1.12 MB, digest differs, 31 to 32 dropped | PASS: repair 0 bytes, digest equal to off, 31 to 32 dropped |
+| H264/clean/2M | 6 | FAIL (adaptive ceiling binds 0.0156 against 0.0025) | PASS (identical to the control: 0.0043) |
+| H264/iid0.01/2M | 1 | FAIL: repair 2.1 to 2.2 MB, 32 dropped | PASS: repair 0, 32 dropped |
+| H264/iid0.01/2M | 6 | FAIL (0.0086 against 0.0040) | PASS (0.0039, identical) |
+| H264/clean/10M | 1, 6 | PASS | PASS |
+| Tile/clean/2M | 1 | PASS | PASS |
+| Tile/clean/2M | 6 | FAIL (premise: off offered/link 0.922, needs 0.93) | FAIL, same premise, same numbers |
+| H264/clean/2M/buf1500ms | 1, 6 | PASS | PASS |
+| H264/step5/2M | 4 | FAIL: "engaged before the step (start-up drops), at 5 s and at 25 s", 3 of 3 seeds | **FAIL, for a different reason**: engaged 1 500, 2 531 and 1 500 ms after the step (limit 1 000 ms) |
+| Tile/step5/2M | 4 | PASS (703, 703, 937 ms) | PASS (703, 703, 937 ms) |
+
+Per-run counters of the gate (H264, 2 Mbit/s, clean and 0.01 %): `lost_pre_fec` 42 or 43 = `queue_losses` 31 + `local_losses` 11, `losses_excused` 31 (the 11 local ones sit in a report the standing queue skipped: `adapt_congestion_skips` 1), `black_holes` 1 or 2, `local_discards` 11, `engaged = false`.
+
+**Criterion 4 at 2 Mbit/s is not closed by the gate.** The "engaged before the step" error is gone: the controller is clean at 5 s. What remains is the estimator's own statistics: a 2 Mbit/s H.264 stream sends about 165 datagrams/s, 5 % of that is 8 a second, the report's loss is filed about 600 ms after the loss, and the engage test needs about 6 lost datagrams over a total of about 900 (`(l - 2 sqrt(l)) / n >= 0.001`, `l >= 3`): 0.75 s of loss plus the report delay is 1.5 s, and 2.5 s in the seed with sparse early losses (`p_hat` 0.0011 at 1 s, 0.0028 at 2 s). It is the same figure as section 10.3 point 8 (1 031 ms in the one seed that was not already engaged). The gate does not delay it: after the step `losses_excused` stays at 31 (the start-up's) and `queue_losses` does not move. Nothing was loosened. Shortening it means a faster engage rule at low rates, a separate decision.
+
+### 15.7 Cells run only with the gate (no matching before; floor 50 ms unless noted)
+
+H.264 at 2 Mbit/s with 0.1 % loss: criterion 2 PASS, 0 changes per minute, adaptive repair 0 (the start-up is excused). With 1 %, 5 % and bursty (ge3 at 1 %) loss the controller engages in all 12 of 12 runs, as it must (0.1 % stays clean by design). In those runs `queue_losses` is 31 to 40: the start-up's 31 plus 0 to 9 false positives from the random loss at the 50 ms floor (at 80 ms: 28 to 31 in `iid5/2M`, 0 at 10 Mbit/s where there is no start-up). The estimate is therefore low by those few losses, on a total of 81 to 1 028 reported per run. H.264 5 % at 10 Mbit/s: criterion 5 PASS (gated 0.0946 against the control's 0.0873), criterion 3 FAIL on the saturation share (`trim_steps` 0, not touched here). H.264 5 % at 2 Mbit/s: criterion 5 FAIL (gated 0.0924 against 0.0721, spread 0.0127), the section 10.3 point 4 failure; no master run of this cell was made, and the change only removes losses from the estimate and never gates a report.
