@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 mod ceiling;
 pub(crate) use ceiling::SATURATION;
 mod googcc;
+mod growth_gate;
+mod probe_meter;
 #[cfg(test)]
 mod react_replay;
 pub(crate) mod sliding_min;
@@ -173,6 +175,23 @@ pub struct BweStats {
     pub ceiling_acked_bps: u64,
     /// The last ceiling applied (zero if none was), bits per second.
     pub ceiling_bps: u64,
+    /// Feedbacks at which the growth gate (D1) published less than goog_cc's
+    /// raw target, because the sender was not saturated and no probe had
+    /// been acknowledged. Zero in a run that should have been gated proves
+    /// the gate never engaged.
+    pub growth_held_feedbacks: u64,
+    /// Rises with no probe that the gate let through because they stayed
+    /// within a rate proved in the last 10 s (a recovery after a cut).
+    pub growth_free_recoveries: u64,
+    /// The largest raw / published seen, in percent (100 = never held).
+    pub growth_held_max_ratio_pct: u64,
+    /// Probe clusters whose delivered rate the driver measured itself
+    /// (`probe_meter.rs`) and proved to the growth gate, even where goog_cc
+    /// published less (its loss controller can cap the target in the same
+    /// feedback).
+    pub growth_probe_proofs: u64,
+    /// The largest rate such a proof carried, bits per second.
+    pub growth_probe_proved_max_bps: u64,
 }
 
 /// A probe goog_cc has asked for (BWE Stage 2.4), surfaced from

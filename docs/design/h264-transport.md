@@ -300,6 +300,28 @@ goog_cc measures any cluster id it finds on acknowledged packets. A cluster
 that padding could not fill (needs a window under 15 ms at the cap) is skipped
 and counted (`app_probes_skipped`).
 
+**Probe size and the growth gate** (measured 2026-11-19, 48 seeds of the
+2 -> 6 Mbit/s step, 0x6701..0x6730). The first probe after a step proves about
+2 x the pre-step estimate, and a step counts as found at 0.8 x the new capacity
+(4.8 Mbit/s). Before the growth gate (`bwe/growth_gate.rs`) the step-up was
+fast partly because goog_cc's unchecked drift had already carried the estimate
+to 1.2 x the old link (2.4 Mbit/s) before the probe; with the gate (drift
+published at 3 %/s, probes proved by our own meter) the median step-up is
+2.0 s, p90 6.7 s, 46 of 48 within 11 s, against 1.1 s, 4.9 s and 47 without the
+gate, which overshot the old link by more than 1.1 x on 4 seeds (up to 1.268 x)
+and fell under 0.8 x its pre-step minimum on one. A probe at 2.5 x E gave
+0.9 s, 3.5 s and 47, but its bigger bursts broke the bottleneck gate
+(`queueing_loss_at_a_bottleneck_is_gated`: 5 of 5 seeds engaged FEC, 2 of 5
+at 2 x), the control-law sweep (criteria 3, 4, 6), `browserless_fec_rate`
+(one seed at 0.87) and refs scene 6c (134 of 150 frames, bound 136), so it
+stays at 2 x. The bottleneck failures are not probe-burst losses (gating report
+intervals that overlap a probe's `bundle_seq` span changed nothing): they come
+after the capacity drop, from the overload that follows it, and arrive after
+the tail-drop queue has drained, where the standing-queue gate cannot see them.
+A capacity drop's losses are not the link's random loss; gating the FEC loss
+reading over such an overload episode is the open item that a larger probe
+needs first.
+
 **Padding** (`h264_probe_pad`). The cluster is filled with copies of an
 already acknowledged P-frame fragment (at least 600 bytes) under new
 `wire_seq`s, flagged `FRAME_FLAG_PAD`. The client acknowledges them on receipt

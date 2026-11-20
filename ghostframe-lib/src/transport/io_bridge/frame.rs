@@ -2303,6 +2303,13 @@ impl IoBridge {
                 loss_state = ?bwe_snap.stats.loss_state,
                 lifts_blocked_loss = bwe_snap.stats.ceiling_lifts_blocked_loss,
                 lifts_undone = bwe_snap.stats.ceiling_lifts_undone,
+                // The growth gate (D1): feedbacks where the published estimate
+                // was held under goog_cc's target, and the largest target / published seen (%).
+                growth_held = bwe_snap.stats.growth_held_feedbacks,
+                growth_free = bwe_snap.stats.growth_free_recoveries,
+                growth_held_max_pct = bwe_snap.stats.growth_held_max_ratio_pct,
+                growth_probe_proofs = bwe_snap.stats.growth_probe_proofs,
+                growth_probe_proved_max_bps = bwe_snap.stats.growth_probe_proved_max_bps,
                 // critical/refinement count tile frames only; in H.264 mode
                 // they read ~0 and `bps_h264` carries the rate.
                 bps_critical = bps_crit,
