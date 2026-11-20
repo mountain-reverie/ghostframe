@@ -8115,7 +8115,9 @@ fn h264_direct_worker_path_survives_a_loss_bit_exact() {
             fps: 30,
             rate: crate::encoder::h264::backend::RateTarget::steady(3_000_000, 30),
             feedback: Vec::new(),
-            backend: Default::default(),
+            // libva-direct only: under `auto` a missing VA-API encoder fell
+            // through to openh264 and failed later, as a header mismatch.
+            backend: crate::config::H264BackendChoice::Vaapi,
             openh264_lib: None,
         });
         assert!(pipeline.send(ToWorker::Finish {
@@ -8126,8 +8128,15 @@ fn h264_direct_worker_path_survives_a_loss_bit_exact() {
         let FromWorker::H264Planned { reply, .. } = recv(&mut pipeline) else {
             panic!("frame {n}: not a planned reply");
         };
-        let H264Reply::Coded(super::frame_backend::CodedAu(au, _)) = reply else {
-            panic!("frame {n}: the worker did not execute the plan");
+        let au = match reply {
+            H264Reply::Coded(super::frame_backend::CodedAu(au, _)) => au,
+            // Name the backend's reason: no working VA-API encoder here, or
+            // one hidden by `GHOSTFRAME_VAAPI_DEVICE`.
+            H264Reply::Unavailable { why, .. } => {
+                panic!("frame {n}: the worker could not code the stream: {why}")
+            }
+            H264Reply::Nothing => panic!("frame {n}: nothing coded, the GPU outputs were gone"),
+            H264Reply::Failed => panic!("frame {n}: the backend failed the plan"),
         };
         let header = au.meta.header.as_ref().expect("a direct AU is parsed");
         let report = mgr
