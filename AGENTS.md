@@ -385,7 +385,7 @@ pacer.
 then openh264, then H.264 is unavailable (above); `vaapi` and `openh264`
 try only that one; anything but `auto`/`openh264` never loads libopenh264, which
 is the "user can turn it off" condition of Cisco's licence. The library is
-loaded at run time and never shipped: `libopenh264.so.8` (2.6.x), `.so.7`
+loaded at run time and never shipped: `libopenh264.so.8` (2.6.x/2.7.x), `.so.7`
 (2.4.x/2.5.x, e.g. Ubuntu 24.04's `libopenh264-7`), then `.so`, or the absolute path in
 `GHOSTFRAME_H264_OPENH264_LIB` (optional; a configured path that fails is an
 error, not a hint). An unsupported version is refused with one line naming what
@@ -399,8 +399,8 @@ references off, and scene-change detection makes IDRs nobody asked for; both
 are covered by browserless scenes that go red if they are flipped. The
 `openh264_*` lib tests and the `openh264_scenes` browserless scenes fail with
 an install hint when no library is present (CI installs `libopenh264-7`: 2.4.1,
-the 40-byte `SLayerBSInfo` layout; a developer machine on 2.6.0 has the 56-byte
-one). `just test-openh264 <path>` runs them against one library (the same
+the 40-byte `SLayerBSInfo` layout; a developer machine on 2.6.x or 2.7.x has
+the 56-byte one). `just test-openh264 <path>` runs them against one library (the same
 variable, read through `config`; DEVELOPERS.md says how to get the other
 layout). `e2e_h264_openh264_motion` forces the backend with the GPU harness and
 checks a moving spinner through the browser's WebCodecs decoder; it is local
@@ -619,6 +619,11 @@ the e2e-side injection variables.
 
 - `encoder::h264::vaapi_direct` tests that open a real VA-API device can contend
   under parallel test load. Re-run with `--test-threads=1`.
+- Not a flake: `h264_direct_*` (the encode worker on libva-direct) needs a
+  working VA-API encoder and fails, never skips, without one; CI skips it by
+  name (`ci.yml`). A run with VA-API hidden (`GHOSTFRAME_VAAPI_DEVICE` pointed
+  at a missing device) fails it with "the worker could not code the stream"
+  and the backend's reason.
 - The browserless suite can bail with `.expect("scene ran")` rather than an
   assertion. That is a harness stall, not a protocol failure; it is
   load-dependent. **Capture the failing test name before re-running** — it is
