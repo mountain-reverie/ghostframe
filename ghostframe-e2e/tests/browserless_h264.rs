@@ -462,7 +462,11 @@ fn step_outcome(s: &StepRun) -> (Option<u64>, f64) {
 ///
 /// Premises: the application probed, padding windows were filled, probes
 /// completed after the start-up ladder, and the pre-step estimate is the 2
-/// Mbit/s link's.
+/// Mbit/s link's: within 1.2 x on every seed and within 1.1 x on all but one.
+/// goog_cc's own climb between probes is published at up to 3 % a second
+/// (`growth_gate.rs`), so a seed whose last probe came early drifts above the
+/// link before the step: over 48 seeds (0x6701..0x6730) one ends at 1.145 x and
+/// none higher (without the gate four passed 1.1 x, up to 1.268 x).
 ///
 /// The lower bound holds on every seed. The headroom is found within `T_UP` on
 /// all but one of the six: the harness is chaotic (one timing tweak moves a
@@ -474,7 +478,7 @@ fn step_outcome(s: &StepRun) -> (Option<u64>, f64) {
 /// disabled none of the six reaches it.
 #[tokio::test(start_paused = true)]
 async fn a_capacity_step_up_is_found_within_t_up_in_h264_mode() {
-    let mut found = 0;
+    let (mut found, mut over) = (0, 0);
     for seed in P_B_SEEDS {
         let st = capacity_step(seed).await;
         report(&format!("P-B {seed:#x}"), &st.r);
@@ -504,10 +508,11 @@ async fn a_capacity_step_up_is_found_within_t_up_in_h264_mode() {
             "seed {seed:#x}: premise: probes beyond the ladder"
         );
         assert!(
-            st.pre > STEP_FROM_BPS / 2 && st.pre <= STEP_FROM_BPS * 11 / 10,
+            st.pre > STEP_FROM_BPS / 2 && st.pre <= STEP_FROM_BPS * 12 / 10,
             "seed {seed:#x}: pre-step estimate {} is not the 2 Mbit/s link's",
             st.pre
         );
+        over += (st.pre > STEP_FROM_BPS * 11 / 10) as usize;
         found += reached.is_some_and(|t| t <= T_UP_US) as usize;
         assert!(
             low >= 0.8,
@@ -517,6 +522,11 @@ async fn a_capacity_step_up_is_found_within_t_up_in_h264_mode() {
     assert!(
         found + 1 >= P_B_SEEDS.len(),
         "the estimate reached 0.8 x {STEP_TO_BPS} within {T_UP_US} us on only {found} of {} seeds",
+        P_B_SEEDS.len()
+    );
+    assert!(
+        over <= 1,
+        "the pre-step estimate was over 1.1 x the link on {over} of {} seeds",
         P_B_SEEDS.len()
     );
 }

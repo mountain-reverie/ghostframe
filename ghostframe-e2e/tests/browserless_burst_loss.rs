@@ -1703,16 +1703,18 @@ async fn p5_seed_0x22_converges_once_the_churn_stops() {
 /// of churn and then silence, 30 s in all. Outcome, on every run: once the
 /// burst is over, every pass is acknowledged and every tile is on screen.
 ///
-/// Premises, over the eight seeds: the link dropped datagrams in every run;
-/// quinn's PTO fired in at least four (the sender really was left waiting on a
-/// timer; measured 7 of 8); and at least three runs had something to repair
-/// (measured 4 of 8). The last is a count over seeds, not a claim about any
+/// Premises, over the twelve seeds: the link dropped datagrams in every run,
+/// and in at least two the probe timeout itself repaired something
+/// (`pto_probe_retransmits`; measured 3 of 12, with quinn's PTO firing in 9).
+/// The last is a count over seeds, not a claim about any
 /// one: the scene is chaotic, and a seed may place its bursts only on content
 /// a later frame supersedes (every lost record's cache entry already gone:
 /// `verdict_content_gone`), so that nothing is owed. Bundling makes that more
 /// likely than it was (a bundle carries a frame's tiles, and a burst takes the
 /// whole bundle, which a later frame then replaces), so the seeds are a
-/// sample of eight rather than five.
+/// sample of twelve: with eight, the growth gate's change to the estimate's
+/// timeline (`growth_gate.rs`) moved the bursts so that one run in eight was
+/// left for the probe to repair, while recovery itself held on every run.
 ///
 /// This is the case the time-based chain exists to make testable: a
 /// per-datagram chain cannot express "down for 1.5 s" to a sender that sends
@@ -1720,9 +1722,10 @@ async fn p5_seed_0x22_converges_once_the_churn_stops() {
 #[tokio::test(start_paused = true)]
 async fn p5_a_burst_longer_than_the_pto_is_recovered_from() {
     const PROBE_REPAIRED_RUNS_MIN: usize = 2;
+    const P5A_SEEDS: u64 = 12;
     let ge = GilbertElliott::from_rate_and_burst_us(0.30, 1_500_000.0, 1.0).expect("feasible");
     let mut probe_repaired_runs = 0usize;
-    for seed in (0..8u64).map(|i| 0xB0_B057 ^ (i * 0x100)) {
+    for seed in (0..P5A_SEEDS).map(|i| 0xB0_B057 ^ (i * 0x100)) {
         let mut sc = scene(seed, 30);
         let profile = LoadProfile {
             cadence_us: PRODUCTION_CADENCE_US,
@@ -1764,7 +1767,7 @@ async fn p5_a_burst_longer_than_the_pto_is_recovered_from() {
     }
     assert!(
         probe_repaired_runs >= PROBE_REPAIRED_RUNS_MIN,
-        "the probe repaired something in only {probe_repaired_runs} of 8 runs"
+        "the probe repaired something in only {probe_repaired_runs} of {P5A_SEEDS} runs"
     );
 }
 
