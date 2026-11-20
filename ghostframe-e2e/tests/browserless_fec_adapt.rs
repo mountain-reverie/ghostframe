@@ -935,8 +935,9 @@ async fn sweep_run(cell: Cell, arm: Arm, seed: u64, scale: f64) -> SweepRun {
         let a = &r.transport.adapt;
         println!(
             "FECGATE cell={} seed={seed:#x} dropped={} lost_pre_fec={} queue_losses={} \
-             local_losses={} local_discards={} black_holes={} losses_excused={} withdrawn={} \
-             expired={} verdicts_behind_report={} credits_behind_report={} skips={} engaged={}",
+             local_losses={} local_discards={} black_holes={} losses_excused={} skipped={} \
+             withdrawn={} debits={} debits_paid={} expired={} verdicts_behind_report={} \
+             credits_behind_report={} skips={} engaged={}",
             cell.name(),
             out.dropped,
             out.lost_pre_fec,
@@ -945,7 +946,10 @@ async fn sweep_run(cell: Cell, arm: Arm, seed: u64, scale: f64) -> SweepRun {
             a.local_discards,
             a.black_holes,
             a.losses_excused,
+            a.losses_skipped,
             a.credits_withdrawn,
+            a.debits,
+            a.debits_paid,
             a.credits_expired,
             a.verdicts_behind_report,
             a.credits_behind_report,
@@ -2495,4 +2499,65 @@ async fn the_queue_read_counters_are_kept_in_every_mode() {
     let u = off(net, links, 10_000).await;
     assert!(u.transport.reports_with_loss > 0, "premise");
     assert_eq!(u.transport.report_queue_reads, 0);
+}
+
+/// The ledger loss gate is wired to the bridge (`fec_tx::queue_loss`): on a
+/// 2 Mbit/s link with the 150 ms buffer the session's first frame overflows
+/// the buffer and quinn's MTU black-hole detector then discards queued
+/// datagrams itself. Every one of those losses must be excused (or sit in a
+/// report the standing-queue gate skipped) and the controller must stay clean.
+///
+/// What it catches (each removal run on its own, see FINDINGS section 15):
+/// the queue-loss credit (`excuse`, the verdict or ack hooks) and the local
+/// discard path (`check_black_hole`) both move `lost_pre_fec` out of
+/// `excused + skipped`, or `black_holes` to 0.
+#[tokio::test(start_paused = true)]
+async fn the_start_up_overflow_is_excused_and_adaptive_stays_clean() {
+    for seed in SEEDS {
+        let cell = Cell::new(Load::H264, Loss::Clean, 2);
+        let (scene, links) = sweep_scene(cell, seed, 8_000, 1.0);
+        let r = run_browserless_with_options(scene, links, Arm::Adaptive.options())
+            .await
+            .expect("scene ran");
+        let (t, a) = (&r.transport, &r.transport.adapt);
+        println!(
+            "LLGWIRE seed={seed:#x} dropped={} lost_pre_fec={} queue={} local={} discards={} \
+             black_holes={} excused={} skipped={} engaged={} repairs={}",
+            r.s2c_datagrams_dropped,
+            t.report_lost_pre_fec_total,
+            a.queue_losses,
+            a.local_losses,
+            a.local_discards,
+            a.black_holes,
+            a.losses_excused,
+            a.losses_skipped,
+            a.engaged,
+            repairs(&r)
+        );
+        // Premises: the overflow happened, the reports carried it, and
+        // quinn's black-hole detector discarded datagrams.
+        assert!(
+            r.s2c_datagrams_dropped > 0,
+            "premise: the buffer overflowed"
+        );
+        assert!(
+            t.report_lost_pre_fec_total > 0,
+            "premise: a report carried it"
+        );
+        assert!(
+            a.black_holes > 0 && a.local_discards > 0,
+            "premise: a black hole"
+        );
+        assert!(a.queue_losses > 0, "premise: queue losses were classified");
+        // Every reported loss is excused or in a skipped report.
+        assert!(
+            a.losses_excused + a.losses_skipped >= t.report_lost_pre_fec_total,
+            "seed {seed:#x}: lost {} but excused {} + skipped {}",
+            t.report_lost_pre_fec_total,
+            a.losses_excused,
+            a.losses_skipped
+        );
+        assert!(!a.engaged, "seed {seed:#x}");
+        assert_eq!(repairs(&r), 0, "seed {seed:#x}");
+    }
 }
