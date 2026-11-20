@@ -1043,3 +1043,60 @@ H.264 at 2 Mbit/s with 0.1 % loss: criterion 2 PASS, 0 changes per minute, adapt
 - **Clock steps.** A `q` past 5 s restarts the OWD window and classifies nothing (`clock_resets`).
 - **Hot path.** quinn's black-hole detector runs only inside `handle_datagram` and `handle_timeout`; the count is read once after each, not per enqueued datagram.
 - **What the wiring test catches** (each removal alone): `check_black_hole` after `handle_datagram` (premise: a black hole), both calls, the excuse call (`excused` 0), the verdict hook and the ack hook (premise: queue losses were classified). Removing only the call after `handle_timeout` stays green: in this scene the black hole is detected on an acknowledgement, never on the loss timer, so nothing here exercises that path.
+
+## 16. The engage rule follows the traffic volume (criterion 4 at 2 Mbit/s)
+
+Code: `LossEstimator` in `ghostframe-lib/src/transport/fec_tx/adapt.rs` (`engage_shown`, `poisson_upper_tail`, `FEC_ENGAGE_TAU_US`, `FEC_ENGAGE_ALPHA`); the description is in the module doc and in `fec-v2-rev6.md` section 5.
+
+### 16.1 Where the 1.5 to 2.5 s went (per-report trace, `H264/step5/2M`, step at 5 s, seeds 0xFB0001 to 3; `l`, `n` are the estimator's decayed counts after the report)
+
+The stream is about 150 datagrams/s (38 per 250 ms report), so `n` is only 800 to 1 000 when the step comes: the decay floor (`FEC_ADAPT_MIN_MASS` 5 000) and the count window never bind in this scene. They are not the cause here; they are the cause of a step that comes after a long clean spell (16.4).
+
+| seed | first report with a loss | `l` at that report | reports until the test passed | engaged at | what the test needed at that `n` |
+|---|---|---|---|---|---|
+| 1 | 5 735 (735 ms after the step) | 3.00 | 5 985 (3.99), 6 235 (congested, 2 lost, skipped), 6 485 (5.95) | 1 485 ms | `l - 2 sqrt(l) >= 0.001 n`: `l >= 5.8` at `n` = 985 |
+| 2 | 5 985 (985 ms) | 1.00 | 6 235 (4 lost, congested, skipped), 6 735 (1.99), 6 985 (2.98), 7 235 (3.97), 7 485 (6.95) | 2 485 ms (2 531 ms bisected) | the same, 5.8 |
+| 3 | 5 735 (735 ms) | 4.00 | 5 985 (4.98), 6 235 (congested), 6 485 (6.94) | 1 485 ms | the same |
+
+Three terms, in order of size:
+
+1. **The count the test demands: about 6 (the z margin on the observed count).** `l - 2 sqrt(l) >= 0.001 n` takes its variance from the observed `l`. With 3 to 5 losses that reads as `2 sqrt(5) = 4.5` of noise on a null that expects `0.001 x 900 = 0.9`. 6 losses at 7.5 losses/s is 0.8 s of 5 % loss, on top of the report delay.
+2. **The report delay: 0.6 to 1.0 s.** No loss is in a report before 735 ms (seed 2: 985 ms): the ledger judges after the next acknowledgement and the client files a loss under the report that confirms it (15.1). Nothing in the estimator.
+3. **The standing-queue gate** skips 2 and 4 losses in the congested reports (seeds 1 and 2, one report each): about one report of delay in seed 1, and in seed 2 the 4 losses that would have made 5 at 1 235 ms.
+
+Cadence (250 ms) only costs the rounding to the next report. `MIN_LOSSES` (3) was never the binding term.
+
+### 16.2 The rule as built
+
+Engaging asks whether the loss rate is shown to be above the floor. Under the null (rate = floor) the `n` datagrams in the window lose `mu0 = 0.001 n`, Poisson. The estimator engages when `l >= 3` **and** the exact upper tail `P(X >= l | mu0) <= 0.0228` (the same one-sided 97.7 % as the old `z = 2`). `mu0` is the traffic: the bar in whole losses is
+
+| `n` in the window | 200 to 500 | 800 to 1 000 | 2 000 | 5 000 | 10 000 |
+|---|---|---|---|---|---|
+| losses needed | 3 | 4 | 6 | 11 | 18 |
+
+(old rule: 6 at 1 000, 12 at 5 000, 19 at 10 000). The change is largest where few datagrams make the window, which is where a loss is a whole damaged frame (a 2 Mbit/s frame is about 5 datagrams). Three losses in 1 000 datagrams are 8 % likely at the floor: not engaged (`excused_losses_count_in_total_but_not_in_lost` keeps asserting it).
+
+The test reads its own accumulator pair with a window in **seconds of traffic**: time constant 5 s (`FEC_ENGAGE_TAU_US`), or the 10 000-datagram count window, whichever forgets more, and **no minimum mass**. At 165 datagrams/s that is about 800 datagrams, not the 5 000 (30 s) the release side holds up; above about 2 000 datagrams/s (20 Mbit/s) the count window is the shorter and the pair equals the old one. Release is untouched: it reads the slow pair, with the same bound, dwell and minimum mass (leaving r >= 1 stays the cautious move).
+
+### 16.3 Results (`GHOSTFRAME_FEC_SWEEP=full`, the cells and 3 seeds of the task; before = 9e510742)
+
+| cell | crit | before (ms from the step, 3 seeds) | after |
+|---|---|---|---|
+| H264/step5/2M | 4 | 1 500, 2 531, 1 500: FAIL | **750, 2 250, 750: FAIL on seed 2** |
+| H264/step5/10M | 4 | PASS | 468, 703, 468: PASS |
+| H264/step5/30M | 4 | PASS | 281, 234, 234: PASS |
+| H264/step5/100M | 4 | PASS | 187, 140, 187: PASS |
+| Tile/step5/2M | 4 | 703, 703, 937 | 703, 703, 937: PASS (unchanged) |
+| Tile/step5/10M, 30M, 100M | 4 | PASS | 468 / 421 / 421, 234 x3, 140 / 140 / 187: PASS |
+| H264 clean 2M, 10M; iid0.01 2M; Tile clean 2M; H264 clean 2M with the 1 500 ms buffer | 1 | PASS | PASS (repair 0 bytes, digest equal to off) |
+| H264 iid0.1 2M and 10M, Tile iid0.1 2M | 2 | PASS | PASS (changes per minute 0, 0, 0 / 0, 2, 0 / 0, 0, 0; adaptive repair 0 at 2 M) |
+
+Seed 2 at 2 Mbit/s still fails and **no engage rule can fix it**. Its first loss is in the report at 985 ms (one loss), the next report (1 235 ms) is a congested one whose 4 losses the standing-queue gate skips by design, and the third counted loss arrives at 2 235 ms. Engaging inside 1 000 ms would take engaging on 1 loss, which `a_single_stray_loss_never_engages` forbids; counting the gated report's losses would reach 5 at 1 235 ms, still late. The criterion is bounded below by when the reports bring the third non-gated loss: 735 ms for seeds 1 and 3, 2 235 ms for seed 2, and the rule now meets that bound in all three (750, 2 250, 750, the 15 ms past 735 / 2 235 being the bisection's 50 ms steps). Criterion 4 as written ("engaged within 1 s, every seed") cannot hold at 2 Mbit/s with 3 losses of evidence and a 0.6 to 1 s report delay: a restatement (a share of seeds, or against the third loss's arrival) is the owner's call.
+
+### 16.4 A step after a long clean spell (unit test `a_late_step_at_a_low_rate_engages_as_fast_as_an_early_one`, 160 datagrams/s, 5 % step)
+
+With the engage pair on the slow window (the break check) a step 60 s into a clean link engages after 2.25 s; on its own window it engages as fast as one after 5 s (within 0.75 s, and under 2 s). That is the dilution the owner described, and it is the term the 5 s window removes. It is not exercised by the sweep's step scenes (the step is at 5 s).
+
+### 16.5 Gates and break checks
+
+`browserless_fec_adapt` 28 of 28, `browserless_fec_rate` 1, `browserless_fec_frame_notch` 3, `browserless_fec_blocks` 7, `browserless_fec_framing` 5, `cargo test --lib -p ghostframe-lib transport::` 1 101 passed, `clippy --workspace --all-targets -D warnings` and `fmt --check` clean. Unit tests added: `the_poisson_tail_is_the_exact_one`, `the_engage_bar_follows_the_volume_of_traffic` (fails when the exact tail is swapped back for `(l - 2 sqrt(l)) / n`), `a_late_step_at_a_low_rate_engages_as_fast_as_an_early_one` (fails when the engage test reads the slow pair). Stationary 0.1 % unit runs (20 seeds x 3 rates x 5 min, at most 2 changes a minute) and 0.01 % (never engages) pass unchanged. At exactly the floor the controller can still engage by a Poisson fluctuation (about 2 % per independent window, as before); it stays engaged then, because release needs the slow window's upper bound under the floor.
