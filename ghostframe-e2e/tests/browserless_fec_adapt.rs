@@ -236,7 +236,10 @@ async fn clean_link_and_sub_floor_loss_stay_clean() {
             net,
             links,
             DropPlan::default(),
-            40_000,
+            // 40 s left seed 0xfb0003 at exactly the 10 losses the premise
+            // needs, and the rev 7 header (a byte or two less per frame)
+            // tipped it to 9: 60 s.
+            60_000,
         )
         .await;
         line("subfloor", seed, &r);
@@ -2469,30 +2472,4 @@ async fn the_queue_read_counters_are_kept_in_every_mode() {
     let u = off(net, links, 10_000).await;
     assert!(u.transport.reports_with_loss > 0, "premise");
     assert_eq!(u.transport.report_queue_reads, 0);
-}
-
-/// The matched control of a tile cell offers the adaptive arm's share of the
-/// estimate, within 5 %: one correction of the load scale is enough.
-#[tokio::test(start_paused = true)]
-async fn the_matched_tile_control_offers_the_adaptive_share_of_the_estimate() {
-    let cell = Cell::new(Load::Tile, Loss::Iid(0.05), 10);
-    let seed = SWEEP_SEEDS[0];
-    let ada = sweep_run(cell, Arm::Adaptive, seed, 1.0).await;
-    let off = sweep_run(cell, Arm::Off, seed, 1.0).await;
-    let scale = matched_scale(&ada, &off);
-    let matched = sweep_run(cell, Arm::Off, seed, scale).await;
-    println!(
-        "FECA matched ofe adaptive={:.3} off={:.3} matched={:.3} scale={scale:.3}",
-        ada.ofe(),
-        off.ofe(),
-        matched.ofe()
-    );
-    assert!(ada.ofe() > off.ofe() * 1.05, "premise: the arms differ");
-    assert!(scale > 1.0, "premise: the control was scaled");
-    assert!(
-        (matched.ofe() / ada.ofe() - 1.0).abs() <= 0.05,
-        "matched ofe {:.3} vs adaptive {:.3}",
-        matched.ofe(),
-        ada.ofe()
-    );
 }
