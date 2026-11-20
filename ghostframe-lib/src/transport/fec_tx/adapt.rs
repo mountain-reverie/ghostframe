@@ -366,22 +366,15 @@ impl FecAdapt {
 
     /// [`Self::on_report`], `excused` of the report's losses being the
     /// stream's own queue overflow or quinn's local discards (`queue_loss`).
-    /// Returns how many were charged off (0 when the standing queue skipped
-    /// the whole report: those losses are skipped already).
     pub(crate) fn on_report_excusing(
         &mut self,
         r: &LossReport,
         standing_queue: bool,
         excused: u16,
         now_us: u64,
-    ) -> u16 {
+    ) {
         self.est
             .on_report_excusing(r, standing_queue, excused, now_us);
-        if standing_queue {
-            0
-        } else {
-            excused.min(r.lost_pre_fec)
-        }
     }
 
     /// Time passes: decay, re-check the release, and read the declined

@@ -39,8 +39,28 @@
 //! about 124 ms). `F` between 0.5 and 0.8 changed nothing; at 1.0 only a third
 //! of the overflow qualified.
 //!
-//! Repair and control bundles carry no records and are not counted: the
-//! credit is in source bundles, like the estimator's `lost_pre_fec`.
+//! Repair and control bundles carry no records and are not given a credit.
+//! The client's `lost_pre_fec` counts every `wire_seq` gap, repair bundles
+//! included (`src_lost_pre_fec` is never set), so a dropped repair bundle is a
+//! loss the gate does not excuse: the gate under-excuses there, which is the
+//! safe side (the estimator sees a little more loss than the queue explains).
+//!
+//! # Sequence numbers wrap
+//!
+//! `bundle_seq` is a `u32` that wraps by design (`reliable_emitter/wire_seq.rs`).
+//! Every key here is *unwrapped* against the newest acknowledged sequence
+//! (serial-number arithmetic, `i64`), so the ordered maps stay ordered across
+//! the wrap and `pop_first` evicts the oldest, not the post-wrap newest.
+//!
+//! # Credit and reconciliation
+//!
+//! A report spends only credits for bundles at or below its own
+//! `last_bundle_seq` (a loss above it cannot be in it). A report the
+//! standing-queue gate skips whole spends the credits in its range too (those
+//! losses were skipped anyway) but leaves the later ones. A late
+//! acknowledgement of a bundle whose credit was already spent means a loss was
+//! excused that was not one: it becomes a *debit* that reduces the next
+//! report's excused count.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -52,11 +72,16 @@ pub(crate) const Q_FRACTION: f64 = 0.8;
 const WINDOW_MS: u64 = 10_000;
 /// A credit not spent in this long is dropped, ms.
 pub(crate) const CREDIT_TTL_MS: u64 = 2_000;
+/// A spent credit stays reconcilable, and a debit stays owed, this long, ms.
+const SPENT_TTL_MS: u64 = 10_000;
+/// A `q` above this is a clock step or drift (the OWD is a 16-bit ms count, so
+/// anything near 32 s is a wrap), not a queue: the base is restarted, ms.
+pub(crate) const Q_SANE_MS: i32 = 5_000;
 /// Bundles whose `q` is kept.
 const QMAP_CAP: usize = 16_384;
 /// Locally discarded bundles remembered.
 const LOCAL_CAP: usize = 4_096;
-/// Credits held.
+/// Credits (and spent credits) held.
 const CREDIT_CAP: usize = 4_096;
 
 /// What the classifier made of one loss verdict.
@@ -84,9 +109,17 @@ pub struct QueueLossStats {
     pub black_holes: u64,
     /// Losses a LOSS_REPORT did not charge to the path.
     pub losses_excused: u64,
+    /// Losses of the reports the standing queue skipped whole.
+    pub losses_skipped: u64,
     /// Credits withdrawn by a late acknowledgement, and expired unspent.
     pub withdrawn: u64,
     pub expired: u64,
+    /// Late acknowledgements of an already spent credit (a debit against the
+    /// next report), and how many excused losses they took back.
+    pub debits: u64,
+    pub debits_paid: u64,
+    /// Clock steps seen (a `q` past [`Q_SANE_MS`]).
+    pub clock_resets: u64,
     /// Source-bundle verdicts that came after a report whose range already
     /// reached them (the report may have counted them): the race, as seen
     /// from the ledger. Of those, the queue and local ones.
@@ -94,10 +127,92 @@ pub struct QueueLossStats {
     pub credits_behind_report: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Credit {
-    seq: u32,
-    at_ms: u64,
+/// Unwraps `u32` sequence numbers against the newest one acknowledged.
+#[derive(Debug, Default, Clone, Copy)]
+struct SeqUnwrap {
+    anchor: Option<i64>,
+}
+
+impl SeqUnwrap {
+    /// `seq` as an `i64` on the anchor's line (within 2^31 of it).
+    fn at(&self, seq: u32) -> i64 {
+        match self.anchor {
+            None => i64::from(seq),
+            Some(a) => a + i64::from(seq.wrapping_sub(a as u32) as i32),
+        }
+    }
+
+    /// As [`Self::at`], moving the anchor up to it.
+    fn advance(&mut self, seq: u32) -> i64 {
+        let u = self.at(seq);
+        if self.anchor.is_none_or(|a| u > a) {
+            self.anchor = Some(u);
+        }
+        u
+    }
+}
+
+/// Sequence numbers with the time they were stamped: ordered by sequence for
+/// range spends and O(log n) removal, by time for expiry.
+#[derive(Debug, Default)]
+struct Timed {
+    by_seq: BTreeMap<i64, u64>,
+    by_time: VecDeque<(u64, i64)>,
+}
+
+impl Timed {
+    fn insert(&mut self, seq: i64, at_ms: u64) {
+        self.by_seq.insert(seq, at_ms);
+        self.by_time.push_back((at_ms, seq));
+        while self.by_seq.len() > CREDIT_CAP {
+            self.pop_oldest();
+        }
+    }
+
+    fn remove(&mut self, seq: i64) -> bool {
+        self.by_seq.remove(&seq).is_some()
+    }
+
+    /// The oldest live entry goes (stale queue slots are skipped).
+    fn pop_oldest(&mut self) -> bool {
+        while let Some((at, seq)) = self.by_time.pop_front() {
+            if self.by_seq.get(&seq) == Some(&at) {
+                self.by_seq.remove(&seq);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Drop entries older than `ttl`; returns how many were live.
+    fn expire(&mut self, now_ms: u64, ttl: u64) -> u64 {
+        let mut n = 0;
+        while let Some(&(at, seq)) = self.by_time.front() {
+            if at + ttl > now_ms {
+                break;
+            }
+            self.by_time.pop_front();
+            if self.by_seq.get(&seq) == Some(&at) {
+                self.by_seq.remove(&seq);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Remove up to `n` entries with sequence at or below `max_seq`, lowest
+    /// first; returns the sequences removed.
+    fn take_upto(&mut self, max_seq: i64, n: usize) -> Vec<(i64, u64)> {
+        let keys: Vec<i64> = self
+            .by_seq
+            .range(..=max_seq)
+            .take(n)
+            .map(|(&k, _)| k)
+            .collect();
+        keys.into_iter()
+            .filter_map(|k| self.by_seq.remove(&k).map(|at| (k, at)))
+            .collect()
+    }
 }
 
 /// See the module comment.
@@ -108,12 +223,18 @@ pub(crate) struct QueueLossClassifier {
     base: VecDeque<(u64, i32)>,
     /// Sliding maximum of `q`: `(time, q)`, q decreasing.
     peak: VecDeque<(u64, i32)>,
-    q: BTreeMap<u32, i32>,
+    seq: SeqUnwrap,
+    q: BTreeMap<i64, i32>,
     /// Bundles quinn discarded locally.
-    local: BTreeSet<u32>,
-    credit: VecDeque<Credit>,
+    local: BTreeSet<i64>,
+    credit: Timed,
+    /// Credits a report spent, kept to reconcile a late acknowledgement.
+    spent: Timed,
+    /// Excused losses a late acknowledgement then showed were not losses.
+    debt: u32,
+    debt_at_ms: u64,
     /// `last_bundle_seq` of the newest report folded.
-    last_report_seq: Option<u32>,
+    last_report_seq: Option<i64>,
     stats: QueueLossStats,
 }
 
@@ -150,6 +271,30 @@ impl QueueLossClassifier {
         let owd_lo16 = arrival_ms_lo16.wrapping_sub((depart_ms & 0xFFFF) as u16);
         let r = *self.reference.get_or_insert(owd_lo16);
         let owd = i32::from(owd_lo16.wrapping_sub(r) as i16);
+        let mut q = self.push_owd(owd, now_ms);
+        if q > Q_SANE_MS {
+            // A clock step or drift, not a queue: forget the window and
+            // classify nothing on it.
+            self.stats.clock_resets += 1;
+            self.base.clear();
+            self.peak.clear();
+            q = self.push_owd(owd, now_ms);
+        }
+        self.trim_peak(now_ms);
+        while self.peak.back().is_some_and(|&(_, p)| p <= q) {
+            self.peak.pop_back();
+        }
+        self.peak.push_back((now_ms, q));
+        let u = self.seq.advance(seq);
+        self.q.insert(u, q);
+        while self.q.len() > QMAP_CAP {
+            self.q.pop_first();
+        }
+        q
+    }
+
+    /// Add `owd` to the sliding minimum; returns the `q` it gives.
+    fn push_owd(&mut self, owd: i32, now_ms: u64) -> i32 {
         while self.base.back().is_some_and(|&(_, o)| o >= owd) {
             self.base.pop_back();
         }
@@ -161,17 +306,7 @@ impl QueueLossClassifier {
         {
             self.base.pop_front();
         }
-        let q = owd - self.base.front().map_or(owd, |&(_, o)| o);
-        self.trim_peak(now_ms);
-        while self.peak.back().is_some_and(|&(_, p)| p <= q) {
-            self.peak.pop_back();
-        }
-        self.peak.push_back((now_ms, q));
-        self.q.insert(seq, q);
-        while self.q.len() > QMAP_CAP {
-            self.q.pop_first();
-        }
-        q
+        owd - self.base.front().map_or(owd, |&(_, o)| o)
     }
 
     /// quinn discarded `seqs` (source and other bundles) before they reached
@@ -179,17 +314,21 @@ impl QueueLossClassifier {
     pub(crate) fn on_local_discard(&mut self, seqs: &[u32], datagrams: u64) {
         self.stats.black_holes += 1;
         self.stats.local_discards += datagrams;
-        self.local.extend(seqs.iter().copied());
+        for &s in seqs {
+            let u = self.seq.at(s);
+            self.local.insert(u);
+        }
         while self.local.len() > LOCAL_CAP {
             self.local.pop_first();
         }
     }
 
     /// The ledger judged `seq` lost. `has_records` is whether it carried
-    /// source content. A queue or local loss earns the next report a credit.
+    /// source content. A queue or local loss earns a report a credit.
     pub(crate) fn on_verdict(&mut self, seq: u32, has_records: bool, now_ms: u64) -> LossClass {
         self.trim_peak(now_ms);
-        let local = self.local.remove(&seq);
+        let u = self.seq.at(seq);
+        let local = self.local.remove(&u);
         if !has_records {
             return LossClass::Ignored;
         }
@@ -197,7 +336,7 @@ impl QueueLossClassifier {
             LossClass::Local
         } else if self
             .q
-            .range(..seq)
+            .range(..u)
             .next_back()
             .is_some_and(|(_, &q)| q >= self.threshold_ms())
         {
@@ -205,7 +344,7 @@ impl QueueLossClassifier {
         } else {
             LossClass::Path
         };
-        let behind = self.last_report_seq.is_some_and(|l| seq <= l);
+        let behind = self.last_report_seq.is_some_and(|l| u <= l);
         self.stats.verdicts_behind_report += u64::from(behind);
         if class != LossClass::Path {
             if class == LossClass::Queue {
@@ -215,37 +354,56 @@ impl QueueLossClassifier {
             }
             self.stats.credits_behind_report += u64::from(behind);
             self.expire(now_ms);
-            self.credit.push_back(Credit { seq, at_ms: now_ms });
-            while self.credit.len() > CREDIT_CAP {
-                self.credit.pop_front();
-            }
+            self.credit.insert(u, now_ms);
         }
         class
     }
 
-    /// A late acknowledgement of `seq`: its verdict was wrong, withdraw it.
-    pub(crate) fn on_late_ack(&mut self, seq: u32) {
-        self.local.remove(&seq);
-        if let Some(i) = self.credit.iter().position(|c| c.seq == seq) {
-            self.credit.remove(i);
+    /// A late acknowledgement of `seq`: its verdict was wrong. An unspent
+    /// credit is withdrawn; a spent one excused a loss that was not one, and
+    /// is owed back against the next report.
+    pub(crate) fn on_late_ack(&mut self, seq: u32, now_ms: u64) {
+        let u = self.seq.at(seq);
+        self.local.remove(&u);
+        if self.credit.remove(u) {
             self.stats.withdrawn += 1;
+        } else if self.spent.remove(u) {
+            self.stats.debits += 1;
+            if self.debt == 0 {
+                self.debt_at_ms = now_ms;
+            }
+            self.debt = self.debt.saturating_add(1);
         }
     }
 
     /// A LOSS_REPORT with `lost` losses, its range ending at `last_seq`: how
-    /// many of them the path is not charged for. The credit is spent.
-    pub(crate) fn excuse(&mut self, lost: u16, last_seq: u32, now_ms: u64) -> u16 {
+    /// many of them the path is not charged for. Only credits for bundles at
+    /// or below `last_seq` are spent. `skipped`: the standing-queue gate skips
+    /// the whole report, so those credits are consumed (the losses are out of
+    /// the estimate already) but nothing is excused or owed.
+    pub(crate) fn excuse(&mut self, lost: u16, last_seq: u32, now_ms: u64, skipped: bool) -> u16 {
         self.expire(now_ms);
-        self.last_report_seq = Some(self.last_report_seq.map_or(last_seq, |l| l.max(last_seq)));
-        let n = lost.min(u16::try_from(self.credit.len()).unwrap_or(u16::MAX));
-        self.credit.drain(..usize::from(n));
-        n
-    }
-
-    /// Note that `n` losses were charged off (the estimator did not skip the
-    /// report whole).
-    pub(crate) fn note_excused(&mut self, n: u16) {
-        self.stats.losses_excused += u64::from(n);
+        self.spent.expire(now_ms, SPENT_TTL_MS);
+        if self.debt > 0 && self.debt_at_ms + SPENT_TTL_MS <= now_ms {
+            self.debt = 0;
+        }
+        let last = self.seq.at(last_seq);
+        self.last_report_seq = Some(self.last_report_seq.map_or(last, |l| l.max(last)));
+        let taken = self.credit.take_upto(last, usize::from(lost));
+        if skipped {
+            self.stats.losses_skipped += u64::from(lost);
+            return 0;
+        }
+        let n = u16::try_from(taken.len()).unwrap_or(u16::MAX);
+        for (seq, _) in taken {
+            self.spent.insert(seq, now_ms);
+        }
+        let pay = u32::from(n).min(self.debt);
+        self.debt -= pay;
+        self.stats.debits_paid += u64::from(pay);
+        let excused = n - pay as u16;
+        self.stats.losses_excused += u64::from(excused);
+        excused
     }
 
     fn trim_peak(&mut self, now_ms: u64) {
@@ -259,19 +417,17 @@ impl QueueLossClassifier {
     }
 
     fn expire(&mut self, now_ms: u64) {
-        while self
-            .credit
-            .front()
-            .is_some_and(|c| c.at_ms + CREDIT_TTL_MS <= now_ms)
-        {
-            self.credit.pop_front();
-            self.stats.expired += 1;
-        }
+        self.stats.expired += self.credit.expire(now_ms, CREDIT_TTL_MS);
     }
 
     #[cfg(test)]
     pub(crate) fn credit_len(&self) -> usize {
-        self.credit.len()
+        self.credit.by_seq.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn q_len(&self) -> usize {
+        self.q.len()
     }
 }
 
@@ -359,10 +515,10 @@ mod tests {
         for s in 1..=4 {
             assert_eq!(c.on_verdict(s, true, 1_100), LossClass::Queue);
         }
-        assert_eq!(c.excuse(3, 10, 1_200), 3, "a report of 3 spends 3");
+        assert_eq!(c.excuse(3, 10, 1_200, false), 3, "a report of 3 spends 3");
         assert_eq!(c.credit_len(), 1);
-        assert_eq!(c.excuse(7, 20, 1_300), 1, "min(credit, lost)");
-        assert_eq!(c.excuse(7, 30, 1_400), 0, "spent");
+        assert_eq!(c.excuse(7, 20, 1_300, false), 1, "min(credit, lost)");
+        assert_eq!(c.excuse(7, 30, 1_400, false), 0, "spent");
     }
 
     #[test]
@@ -371,7 +527,7 @@ mod tests {
         ack(&mut c, 0, 0, 900);
         ack(&mut c, 0, 150, 1_000);
         c.on_verdict(1, true, 1_100);
-        assert_eq!(c.excuse(1, 10, 1_100 + CREDIT_TTL_MS), 0);
+        assert_eq!(c.excuse(1, 10, 1_100 + CREDIT_TTL_MS, false), 0);
         assert_eq!(c.stats().expired, 1);
     }
 
@@ -382,12 +538,102 @@ mod tests {
         ack(&mut c, 0, 150, 1_000);
         c.on_verdict(1, true, 1_100);
         c.on_verdict(2, true, 1_100);
-        c.on_late_ack(1);
+        c.on_late_ack(1, 1_150);
         assert_eq!(c.stats().withdrawn, 1);
-        assert_eq!(c.excuse(5, 10, 1_200), 1);
-        // A late ack of a verdict already spent does nothing.
-        c.on_late_ack(2);
-        assert_eq!(c.stats().withdrawn, 1);
+        assert_eq!(c.excuse(5, 10, 1_200, false), 1);
+    }
+
+    #[test]
+    fn a_late_ack_after_the_credit_was_spent_is_owed_against_the_next_report() {
+        let mut c = QueueLossClassifier::default();
+        ack(&mut c, 0, 0, 900);
+        ack(&mut c, 0, 150, 1_000);
+        for s in 1..=3 {
+            c.on_verdict(s, true, 1_100);
+        }
+        assert_eq!(c.excuse(2, 10, 1_200, false), 2, "seqs 1 and 2 excused");
+        // Seq 1 turns out to have arrived: that excused loss was a real one.
+        c.on_late_ack(1, 1_250);
+        assert_eq!(c.stats().debits, 1);
+        assert_eq!(c.stats().withdrawn, 0);
+        // The next report's excused count pays it back: 1 credit left, owed 1.
+        assert_eq!(c.excuse(5, 20, 1_300, false), 0);
+        assert_eq!(c.stats().debits_paid, 1);
+        // Paid once only.
+        c.on_verdict(4, true, 1_320);
+        assert_eq!(c.excuse(5, 30, 1_400, false), 1);
+        // An ack for something never spent is no debit.
+        c.on_late_ack(99, 1_500);
+        assert_eq!(c.stats().debits, 1);
+    }
+
+    #[test]
+    fn a_report_spends_only_credits_inside_its_range() {
+        let mut c = QueueLossClassifier::default();
+        ack(&mut c, 0, 0, 900);
+        ack(&mut c, 0, 150, 1_000);
+        for s in [5, 6, 50, 51] {
+            c.on_verdict(s, true, 1_100);
+        }
+        // A report that reaches bundle 10 cannot hold 50 or 51.
+        assert_eq!(c.excuse(4, 10, 1_200, false), 2);
+        assert_eq!(c.credit_len(), 2);
+        // A skipped report consumes its range's credits and excuses nothing,
+        // the later ones wait.
+        c.on_verdict(7, true, 1_210);
+        assert_eq!(c.excuse(4, 10, 1_220, true), 0);
+        assert_eq!(c.credit_len(), 2, "7 was consumed, 50 and 51 remain");
+        assert_eq!(c.stats().losses_skipped, 4);
+        assert_eq!(c.excuse(4, 60, 1_300, false), 2);
+    }
+
+    #[test]
+    fn the_classifier_works_across_the_sequence_wrap() {
+        let mut c = QueueLossClassifier::default();
+        let start = u32::MAX - 20;
+        // 100 acked bundles straddling the wrap, the deep queue all along.
+        ack(&mut c, start.wrapping_sub(1), 0, 900);
+        for i in 0..100u32 {
+            ack(&mut c, start.wrapping_add(i), 150, 1_000 + u64::from(i));
+        }
+        assert_eq!(c.q_len(), 101, "nothing evicted by the wrap");
+        // A loss after the wrap finds its pre-wrap and post-wrap neighbours.
+        assert_eq!(c.on_verdict(5, true, 1_200), LossClass::Queue);
+        assert_eq!(c.on_verdict(u32::MAX - 3, true, 1_200), LossClass::Queue);
+        // A report whose last_bundle_seq is post-wrap spends a pre-wrap credit
+        // and one on the other side of it.
+        assert_eq!(c.excuse(5, 10, 1_300, false), 2);
+        let s = c.stats();
+        assert_eq!(s.queue_losses, 2);
+        // `verdicts_behind_report` follows the wrap too: seq 6 is below 10.
+        c.on_verdict(6, true, 1_400);
+        assert_eq!(c.stats().verdicts_behind_report, 1);
+    }
+
+    #[test]
+    fn the_cap_evicts_the_oldest_across_the_wrap_not_the_newest() {
+        let mut c = QueueLossClassifier::default();
+        ack(&mut c, u32::MAX - 10, 0, 900);
+        let n = (QMAP_CAP + 100) as u32;
+        for i in 0..n {
+            ack(&mut c, (u32::MAX - 10).wrapping_add(i), 150, 1_000);
+        }
+        assert_eq!(c.q_len(), QMAP_CAP);
+        // The newest bundle is still there: its successor finds it.
+        let next = (u32::MAX - 10).wrapping_add(n);
+        assert_eq!(c.on_verdict(next, true, 1_100), LossClass::Queue);
+    }
+
+    #[test]
+    fn a_clock_step_restarts_the_window_instead_of_excusing_everything() {
+        let mut c = QueueLossClassifier::default();
+        ack(&mut c, 0, 0, 1_000);
+        // The client's clock steps 6 s: the next OWD reads 6 s over the base.
+        let q = c.on_ack(1, ((1_100 + 6_000u64) & 0xFFFF) as u16, 1_100 - 20, 1_100);
+        assert_eq!(q, 0, "not a 6 s queue");
+        assert_eq!(c.stats().clock_resets, 1);
+        assert_eq!(c.threshold_ms(), Q_FLOOR_MS, "the peak did not take it");
+        assert_eq!(c.on_verdict(2, true, 1_200), LossClass::Path);
     }
 
     #[test]
@@ -399,9 +645,9 @@ mod tests {
         assert_eq!(c.on_verdict(5, true, 1_100), LossClass::Path);
         assert_eq!(c.stats().local_discards, 5);
         assert_eq!(c.stats().black_holes, 1);
-        assert_eq!(c.excuse(9, 10, 1_200), 1);
+        assert_eq!(c.excuse(9, 10, 1_200, false), 1);
         // A discarded bundle that is then acked late is withdrawn.
-        c.on_late_ack(4);
+        c.on_late_ack(4, 1_250);
         assert_eq!(c.on_verdict(4, true, 1_300), LossClass::Path);
     }
 
@@ -411,7 +657,7 @@ mod tests {
         ack(&mut c, 0, 0, 900);
         ack(&mut c, 0, 150, 1_000);
         assert_eq!(
-            c.excuse(2, 40, 1_100),
+            c.excuse(2, 40, 1_100, false),
             0,
             "nothing judged yet: the race lost"
         );
@@ -419,6 +665,6 @@ mod tests {
         assert_eq!(c.stats().verdicts_behind_report, 1);
         assert_eq!(c.stats().credits_behind_report, 1);
         // The credit waits for the next report.
-        assert_eq!(c.excuse(2, 50, 1_400), 1);
+        assert_eq!(c.excuse(2, 50, 1_400, false), 1);
     }
 }

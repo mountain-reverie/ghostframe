@@ -119,12 +119,11 @@ impl IoBridge {
                 if self.fec_adapt.is_some() {
                     let now_us = self.reliable_emitter.emit_us64(now_std());
                     let now_ms = self.bwe_ms(now_std());
-                    let excused = self
-                        .queue_loss
-                        .excuse(r.lost_pre_fec, r.last_bundle_seq, now_ms);
+                    let excused =
+                        self.queue_loss
+                            .excuse(r.lost_pre_fec, r.last_bundle_seq, now_ms, queue);
                     if let Some(a) = self.fec_adapt.as_mut() {
-                        let n = a.on_report_excusing(&r, queue, excused, now_us);
-                        self.queue_loss.note_excused(n);
+                        a.on_report_excusing(&r, queue, excused, now_us);
                     }
                     self.adapt_step(now_us);
                 }
