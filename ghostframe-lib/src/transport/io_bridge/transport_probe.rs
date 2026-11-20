@@ -58,6 +58,14 @@ pub struct FecAdaptProbe {
     pub credits_expired: u64,
     pub verdicts_behind_report: u64,
     pub credits_behind_report: u64,
+    /// Losses of the reports the standing queue skipped whole, excused
+    /// credits a late acknowledgement took back (debits), how many of those
+    /// were paid off against a later report, and clock steps seen by the
+    /// queueing-delay window.
+    pub losses_skipped: u64,
+    pub debits: u64,
+    pub debits_paid: u64,
+    pub clock_resets: u64,
 }
 
 /// Cumulative and latest transport readings for the live session.
@@ -264,6 +272,10 @@ impl IoBridge {
         p.credits_expired = q.expired;
         p.verdicts_behind_report = q.verdicts_behind_report;
         p.credits_behind_report = q.credits_behind_report;
+        p.losses_skipped = q.losses_skipped;
+        p.debits = q.debits;
+        p.debits_paid = q.debits_paid;
+        p.clock_resets = q.clock_resets;
         Some(p)
     }
 
@@ -306,11 +318,15 @@ impl IoBridge {
                     self.release_departures();
                 }
                 self.departures_handle = Some(handle);
+                // A black hole this connection had before the tracker began
+                // discarded nothing the tracker holds.
+                self.black_holes_seen = self
+                    .server
+                    .connections
+                    .get_mut(&handle)
+                    .map_or(0, |c| c.stats().path.black_holes_detected);
             }
         }
-        // Anything quinn discarded since the last look was queued before this
-        // datagram: take it out of the mirror first.
-        self.check_black_hole(handle);
         let now = super::now_std();
         if let Some(pushed_out) = self.departures.on_enqueue(wire_seq, cum_enqueued, now) {
             // The backstop cap; see `TRACKER_CAP`.
@@ -328,9 +344,18 @@ impl IoBridge {
     /// `poll_departures`, as they were before, so the loss machinery still
     /// finishes with them.
     ///
-    /// Called before each datagram is mirrored and before each poll, so every
-    /// entry still in the tracker was queued when the black hole happened.
-    pub(super) fn check_black_hole(&mut self, handle: ConnectionHandle) {
+    /// Called once, right after each quinn call that can detect one
+    /// (`handle_datagram` for a lost-packet verdict on an acknowledgement,
+    /// `handle_timeout` for the loss timer): quinn's black-hole detector runs
+    /// only inside those two, and the bridge mirrors nothing into the tracker
+    /// between such a call returning and this check, so every entry then in
+    /// the tracker was queued when the black hole happened. That is the same
+    /// guarantee a check before every enqueue gave, at one stats read per
+    /// inbound packet or timer instead of one per datagram.
+    pub(super) fn check_black_hole(&mut self) {
+        let Some(handle) = self.departures_handle else {
+            return;
+        };
         let Some(conn) = self.server.connections.get_mut(&handle) else {
             return;
         };

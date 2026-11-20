@@ -2440,6 +2440,7 @@ impl IoBridge {
                     #[cfg(test)]
                     self.loop_arm_trace.push(LoopArm::Timeout);
                     let reaped = self.server.handle_timeout(now_std());
+                    self.check_black_hole();
                     for handle in reaped {
                         self.on_connection_gone(handle, "reaped after drain");
                     }
@@ -2881,14 +2882,18 @@ impl IoBridge {
         let data = BytesMut::from(packet.payload.as_slice());
 
         tracing::trace!(remote = %packet.addr, payload_len, "processing inbound datagram");
-        if let Some(transmit) = self.server.handle_datagram(
+        let immediate = self.server.handle_datagram(
             now_std(),
             packet.addr,
             Some(self.local_addr.ip()),
             None, // ECN not available from ghostbridge framing
             data,
             &mut buf,
-        ) {
+        );
+        // quinn's black-hole detector can have fired inside that call; see
+        // `check_black_hole`.
+        self.check_black_hole();
+        if let Some(transmit) = immediate {
             // Immediate response (retry / version negotiation).
             let payload = &buf[..transmit.size];
             let frame = encode_frame(payload, &transmit.destination);
@@ -2906,9 +2911,6 @@ impl IoBridge {
     /// frame is thousands of packets. The bytes on the socket are the same, in
     /// the same order.
     async fn drain_outbound(&mut self) -> io::Result<()> {
-        if let Some(h) = self.departures_handle {
-            self.check_black_hole(h);
-        }
         let now = now_std();
         let mut buf: Vec<u8> = Vec::with_capacity(QUIC_SCRATCH);
         let server = &mut self.server;
