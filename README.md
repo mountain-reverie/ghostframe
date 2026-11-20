@@ -42,7 +42,7 @@ are not supported yet.
 **Software H.264 (optional).** When the machine has no VA-API encoder that
 serves the stream (or `GHOSTFRAME_H264_BACKEND=openh264`), the server encodes
 H.264 in software with Cisco's OpenH264, loaded at run time from the system:
-`libopenh264.so.8` (2.6.x), then `libopenh264.so.7` (2.4.x and 2.5.x; e.g. Ubuntu 24.04's
+`libopenh264.so.8` (2.6.x and 2.7.x), then `libopenh264.so.7` (2.4.x and 2.5.x; e.g. Ubuntu 24.04's
 `libopenh264-7`), then `libopenh264.so`, or
 the absolute path in `GHOSTFRAME_H264_OPENH264_LIB`. Without a library (and
 without VA-API) the session stays on the lossless tile codec. OpenH264 serves pictures of up to 1920x1080 pixels at

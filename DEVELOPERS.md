@@ -76,12 +76,12 @@ are building):
 - **libopenh264** (runtime library only) for the `openh264_*` tests in
   `ghostframe-lib` and the `openh264_scenes` of `browserless_h264`, which fail
   with an install hint without it: Ubuntu/Debian `libopenh264-7`, Arch
-  `openh264`, Fedora the Cisco repository. 2.4.x to 2.6.x are supported. Nothing
+  `openh264`, Fedora the Cisco repository. 2.4.x to 2.7.x are supported. Nothing
   links it and nothing downloads it; see the README's "Software H.264" note.
   `just test-openh264 [/abs/path/to/libopenh264.so]` runs those tests and
   scenes against one library (`GHOSTFRAME_H264_OPENH264_LIB`, read as the
   daemon reads it). CI has Ubuntu's 2.4.1 (the 40-byte `SLayerBSInfo`), a
-  machine on 2.6.x the 56-byte one; to run the other layout without installing
+  machine on 2.6.x or 2.7.x the 56-byte one; to run the other layout without installing
   anything, unpack the distribution's package into an empty directory:
   `apt-get download libopenh264-7 && dpkg-deb -x libopenh264-7_*.deb ./oh &&
   just test-openh264 ./oh/usr/lib/x86_64-linux-gnu/libopenh264.so.2.4.1`
