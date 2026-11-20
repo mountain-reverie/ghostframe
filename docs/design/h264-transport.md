@@ -867,12 +867,13 @@ later, smaller stream is offered H.264 again). A libva-direct refusal of a
 configuration with no libopenh264 installed is per size too.
 
 **Loading.** The library is never linked, shipped or downloaded: `dlopen` by
-soname through the loader cache, in order `libopenh264.so.8` (2.6.x),
+soname through the loader cache, in order `libopenh264.so.8` (2.6.x and 2.7.x),
 `libopenh264.so.7` (2.4.x and 2.5.x: e.g. Ubuntu 24.04's `libopenh264-7`),
 then `libopenh264.so`, or only the absolute path in
 `GHOSTFRAME_H264_OPENH264_LIB` (an explicit choice that fails is an error, not
 a hint). Each candidate is confirmed with `WelsGetCodecVersion`; 2.4 and 2.5
-share a 40-byte `SLayerBSInfo`, 2.6 has 56, and any other version is refused
+share a 40-byte `SLayerBSInfo`, 2.6 and 2.7 have 56 (2.7.0's public headers
+are 2.6.0's, byte for byte, but for the version), and any other version is refused
 with one line naming what was found. A missing library is one line listing
 every candidate and why it failed, then the next backend.
 

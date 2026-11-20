@@ -18,14 +18,18 @@
 //! and the 2.6.x one. The 2.6 layout is allocated for every struct the library
 //! fills or reads (zero-filled, so an older library reads a prefix and a newer
 //! one sees zeroed new fields) and the per-layer stride is read by version.
-//! Any other version is refused: a guess would write through the wrong
-//! offsets. The vtable is append-only across versions.
+//! 2.7.x speaks the 2.6 layout: its public headers (`codec_api.h`,
+//! `codec_app_def.h`, `codec_def.h`) are byte-identical to 2.6.0's, only
+//! `codec_ver.h` differs (diffed against 2.7.0 on 2026-11-20). Any other
+//! version is refused: a guess would write through the wrong offsets. Admit a
+//! new one only after diffing its headers. The vtable is append-only across
+//! versions.
 
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// The sonames tried, in order, when no path is configured: 2.6.x, 2.4.x and
+/// The sonames tried, in order, when no path is configured: 2.6.x/2.7.x, 2.4.x and
 /// 2.5.x (Ubuntu 24.04, Debian 13, Fedora's Cisco repository), then whatever
 /// the unversioned name points at.
 pub(crate) const SONAMES: [&str; 3] = ["libopenh264.so.8", "libopenh264.so.7", "libopenh264.so"];
@@ -93,7 +97,7 @@ impl std::fmt::Display for Version {
 pub(crate) enum Layout {
     /// 2.4.x and 2.5.x: 40-byte layer info.
     V24,
-    /// 2.6.x: 56-byte layer info (`rPsnr[3]` appended).
+    /// 2.6.x and 2.7.x: 56-byte layer info (`rPsnr[3]` appended).
     V26,
 }
 
@@ -102,7 +106,7 @@ impl Layout {
     pub(crate) fn for_version(v: Version) -> Option<Self> {
         match (v.major, v.minor) {
             (2, 4) | (2, 5) => Some(Self::V24),
-            (2, 6) => Some(Self::V26),
+            (2, 6) | (2, 7) => Some(Self::V26),
             _ => None,
         }
     }
@@ -453,7 +457,7 @@ impl Lib {
         };
         let Some(layout) = Layout::for_version(version) else {
             return Err(format!(
-                "openh264 {version} is not supported (2.4.x, 2.5.x and 2.6.x are)"
+                "openh264 {version} is not supported (2.4.x to 2.7.x are)"
             ));
         };
         Ok(Lib {
@@ -712,7 +716,8 @@ mod tests {
         assert_eq!(Layout::for_version(v(2, 4)), Some(Layout::V24));
         assert_eq!(Layout::for_version(v(2, 5)), Some(Layout::V24));
         assert_eq!(Layout::for_version(v(2, 6)), Some(Layout::V26));
-        for other in [v(2, 3), v(2, 7), v(1, 8), v(3, 0)] {
+        assert_eq!(Layout::for_version(v(2, 7)), Some(Layout::V26));
+        for other in [v(2, 3), v(2, 8), v(1, 8), v(3, 0)] {
             assert_eq!(Layout::for_version(other), None, "{other}");
         }
     }

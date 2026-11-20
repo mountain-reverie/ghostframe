@@ -50,7 +50,7 @@ fn require_lib() {
     match openh264_library() {
         Ok(which) => println!("openh264 library: {which}"),
         Err(e) => panic!(
-            "{e}\nthese scenes need libopenh264 2.4.x-2.6.x: Debian/Ubuntu `apt install \
+            "{e}\nthese scenes need libopenh264 2.4.x-2.7.x: Debian/Ubuntu `apt install \
              libopenh264-7`, Fedora the Cisco repository (or set GHOSTFRAME_H264_OPENH264_LIB \
              to its absolute path)"
         ),

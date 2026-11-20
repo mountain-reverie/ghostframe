@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! B7-2: the openh264 backend against the real library.
 //!
-//! Every test here needs libopenh264 (2.4.x, 2.5.x or 2.6.x) and fails
+//! Every test here needs libopenh264 (2.4.x to 2.7.x) and fails
 //! without it, with an install hint: a skipped test is not a passing one.
 //! Debian/Ubuntu: `apt install libopenh264-7`; Fedora: the Cisco repository;
 //! or point `GHOSTFRAME_H264_OPENH264_LIB` at a library when running them.
@@ -152,7 +152,7 @@ fn plan(seq: u32, idr: bool) -> FramePlan {
 fn require_lib() {
     if let Err(e) = Lib::get(Lib::configured_path().as_deref()) {
         panic!(
-            "{e}\nthese tests need libopenh264 2.4.x-2.6.x: Debian/Ubuntu `apt install \
+            "{e}\nthese tests need libopenh264 2.4.x-2.7.x: Debian/Ubuntu `apt install \
              libopenh264-7`, Fedora the Cisco repository (or run them with \
              GHOSTFRAME_H264_OPENH264_LIB set)"
         );
