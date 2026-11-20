@@ -620,7 +620,6 @@ fn repair_bundle(
         bundle_seq,
         block_id: 7,
         k: 4,
-        r: 2,
         repair_idx: 0,
         payload: &payload,
     }
@@ -720,7 +719,10 @@ async fn a_lost_repair_bundle_retransmits_nothing() {
 const GOLDEN_FRAMES: usize = 12;
 const GOLDEN_DIGEST: u64 = 0x7ca8_58bd_97c7_010f;
 
-/// FNV-1a over every sent frame, length-prefixed. Bytes 12..16 of a record
+/// FNV-1a over every sent frame, length-prefixed. The digest was recorded at
+/// the R6-c tip, when a PLAIN frame began with kind byte 0x03; rev 7 writes
+/// 0xc0, which is folded back to 0x03 so the digest still proves that nothing
+/// but that byte changed. Bytes 12..16 of a record
 /// are the datagram header's wall-clock `timestamp_us`; they are zeroed so the
 /// digest does not depend on when the test ran.
 fn frames_digest(frames: &[Vec<u8>]) -> (usize, u64) {
@@ -746,6 +748,9 @@ fn frames_digest(frames: &[Vec<u8>]) -> (usize, u64) {
                     f[off + 12..off + 16].fill(0);
                 }
             }
+        }
+        if f[0] == 0xc0 {
+            f[0] = 0x03; // rev 7 PLAIN kind byte -> its R6-c value
         }
         eat(&(f.len() as u32).to_be_bytes());
         eat(&f);

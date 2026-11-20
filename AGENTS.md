@@ -203,7 +203,9 @@ verdicts and probes; called `rto_fired` before the per-pass timer was removed),
 latency tiers.
 
 Since FEC v2 rev 6 every server-to-client datagram is a framed **bundle**
-(SOURCE 0x01 or PLAIN 0x03 frames, `ghostframe-protocol/src/fec/frame.rs`)
+(SOURCE or PLAIN frames, `ghostframe-protocol/src/fec/frame.rs`; the header
+is rev 7's, frozen: kind in byte 0 bits 7-6, SOURCE 8 B, REPAIR 9 B, PLAIN 5 B,
+see `docs/specs/fec-v2/fec-v2-rev7.md`)
 holding one or more records, and the ledger's unit is the bundle. On that line
 the `offered_*_B` byte fields are unchanged and still sum to
 `quinn_bytes_enqueued`, but the per-class datagram counts
@@ -550,9 +552,9 @@ declined-share trim added 1 to `r`), `adapt_blocks_sized` and `adapt_saturated`
 burst; a high share means the link is worse than the cap can fix).
 
 **Timing the client derives.** Each SOURCE carries the block's span `T_adv` as
-a 3-bit code in flags bits 4-6 (the knob's `t_ms` plus the queue allowance,
+a 3-bit code in byte 0 bits 4-2 (rev 7; the knob's `t_ms` plus the queue allowance,
 rounded up to a table entry; code 0 means "nothing advertised", 33 ms). Each
-REPAIR carries an RTT hint in the scheme byte's high nibble (smoothed RTT
+REPAIR carries an RTT hint in byte 0 bits 5-2 (smoothed RTT
 rounded up, 0 = unknown, 15 saturates at 512 ms). Both sides compute from
 `ghostframe-protocol/src/fec/timing.rs`: the first window is `T_adv` + 10 ms
 after the block's first arrival, the REPAIR_REQUEST round is hint + 30 ms (the

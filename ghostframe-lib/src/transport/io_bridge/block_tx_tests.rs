@@ -184,7 +184,6 @@ async fn a_refused_source_stays_ahead_of_its_repairs_and_a_queued_repair_counts_
     b.pending_repairs.push_back(block_tx::RepairJob {
         block_id: 999,
         k: 2,
-        r: 1,
         row: 0,
         payload: vec![0u8; 400 - ghostframe_protocol::fec::frame::FEC_REPAIR_HEADER_LEN],
         cause: block_tx::RowCause::Other,
@@ -449,7 +448,11 @@ async fn a_repair_request_gets_fresh_rows_the_real_block_store_decodes() {
     let Frame::Repair(r) = parse(&after[6]).unwrap() else {
         panic!("repair")
     };
-    assert_eq!((r.k, r.r), (4, 2), "the block's own k and r");
+    assert_eq!(
+        (r.k, r.repair_idx),
+        (4, 2),
+        "the block's own k, and the fresh row"
+    );
     for rec in store.on_datagram(&after[6], 1_000).records {
         got.insert(rec.bytes);
     }

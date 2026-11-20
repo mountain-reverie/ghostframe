@@ -158,7 +158,7 @@ impl ClientCore {
         }
     }
 
-    /// rev 6 framing: unbundle through `FecRx`, dispatch each record as a
+    /// FEC v2 framing: unbundle through `FecRx`, dispatch each record as a
     /// today-format datagram, then drain what `FecRx` queued.
     fn handle_framed_datagram(&mut self, bytes: &[u8], now_us: u64) -> Vec<Event> {
         let batch = self.fec.on_datagram(bytes, now_us);

@@ -831,7 +831,8 @@ mod tests {
         );
         assert_eq!(
             Packer::lone_bundle_len(33, BundleKind::Source),
-            Packer::lone_bundle_len(33, BundleKind::Plain) + 4
+            Packer::lone_bundle_len(33, BundleKind::Plain)
+                + (FEC_SOURCE_HEADER_LEN - FEC_PLAIN_HEADER_LEN)
         );
     }
 

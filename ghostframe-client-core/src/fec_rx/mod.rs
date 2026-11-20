@@ -263,7 +263,6 @@ mod tests {
                     bundle_seq: base + 100 + i as u32,
                     block_id,
                     k: k as u8,
-                    r,
                     repair_idx: i as u8,
                     payload: p,
                 }
