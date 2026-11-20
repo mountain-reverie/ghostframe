@@ -264,6 +264,11 @@ impl IoBridge {
                         self.loss_window
                             .record(tx.emit_us as u32, false, tx.records.len() as u32);
                         self.recent_bundles.remember(id, &tx);
+                        if let (Some(dep_us), true) = (tx.depart_us, self.fec_adapt.is_some()) {
+                            let now_ms = self.bwe_ms(now_for_samples);
+                            self.queue_loss
+                                .on_ack(id, arrival_lo16, dep_us / 1000, now_ms);
+                        }
                         Some((tx, arrival_lo16, false))
                     }
                     Some(Resolution::Late { tx }) => {
@@ -286,6 +291,7 @@ impl IoBridge {
                         }
                         self.loss_window
                             .retract(tx.emit_us as u32, tx.records.len() as u32);
+                        self.queue_loss.on_late_ack(id);
                         self.recent_bundles.remember(id, &tx);
                         // Observability: was goog_cc already told this was
                         // lost?

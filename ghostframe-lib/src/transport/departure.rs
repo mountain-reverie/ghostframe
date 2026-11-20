@@ -33,11 +33,15 @@
 //!   (`WebTransportServer::send_datagram`), so a full buffer is `Blocked`,
 //!   and a `Blocked` datagram is never mirrored because it was never queued.
 //! - `drop_oversized` discards queued datagrams after an MTU black hole
-//!   (`datagrams.rs:147-160`, `connection/mod.rs:1773`). The dropped
-//!   datagrams read as departed, and so do any behind them up to the dropped
-//!   byte count: a stamp can be early, by at most one FIFO's worth, and only
-//!   on a black hole. A datagram stamped here that did not leave is then
-//!   never acknowledged, which is the correct verdict for it.
+//!   (`datagrams.rs:147-160`, `connection/mod.rs:1773`): every queued one of
+//!   `max_size()` bytes or more. Left alone they read as departed, and so
+//!   would any behind them up to the dropped byte count. The bridge reads
+//!   quinn's `black_holes_detected` before it mirrors each new datagram and
+//!   before each poll; on a rise it calls [`DepartureTracker::discard_oversized`],
+//!   which removes the same entries and moves the byte arithmetic
+//!   (`cum_departed = cum_enqueued - discarded - outgoing_total`). Their
+//!   transmissions are handed back to the caller, who stamps them (the loss
+//!   machinery still needs them to leave the ledger) and marks them local.
 //!
 //! The unit test below runs against a real `Connection` and cross-checks the
 //! mirror against quinn's own `frame_tx.datagram` count, which counts frames
@@ -69,6 +73,8 @@ pub(crate) const TRACKER_CAP: usize = 1 << 18;
 struct Entry {
     /// The session's cumulative accepted byte count including this datagram.
     cum_end: u64,
+    /// The datagram's payload length (0: not known, the first of a session).
+    len: u32,
     enqueued_at: Instant,
     /// The transmission this datagram carries, if it is one the ledger
     /// tracks. Datagrams that are not (H.264, control) are mirrored
@@ -89,6 +95,13 @@ pub struct DepartureTracker {
     cum_departed: u64,
     /// Datagrams stamped so far.
     stamped_total: u64,
+    /// The last `cum_enqueued` given to [`Self::on_enqueue`], in quinn's own
+    /// count, to size the next entry.
+    last_cum_raw: Option<u64>,
+    /// Bytes quinn discarded from its queue without sending them
+    /// ([`Self::discard_oversized`]); they left `outgoing_total` and never
+    /// departed.
+    discarded_bytes: u64,
     #[cfg(test)]
     pub(crate) stamped: Vec<(Instant, Instant)>,
 }
@@ -127,6 +140,11 @@ impl DepartureTracker {
         cum_enqueued: u64,
         now: Instant,
     ) -> Option<u32> {
+        let len = self.last_cum_raw.map_or(0, |l| {
+            u32::try_from(cum_enqueued.saturating_sub(l)).unwrap_or(0)
+        });
+        self.last_cum_raw = Some(cum_enqueued);
+        let cum_enqueued = cum_enqueued.saturating_sub(self.discarded_bytes);
         let mut evicted = None;
         if self.q.len() >= TRACKER_CAP {
             evicted = self.q.pop_front().and_then(|e| e.wire_seq);
@@ -134,6 +152,7 @@ impl DepartureTracker {
         }
         self.q.push_back(Entry {
             cum_end: cum_enqueued,
+            len,
             enqueued_at: now,
             wire_seq,
         });
@@ -154,7 +173,9 @@ impl DepartureTracker {
         now: Instant,
         mut stamp: impl FnMut(Option<u32>, Instant),
     ) -> u64 {
-        let departed = cum_enqueued.saturating_sub(outgoing_total);
+        let departed = cum_enqueued
+            .saturating_sub(self.discarded_bytes)
+            .saturating_sub(outgoing_total);
         self.cum_departed = departed;
         while let Some(&e) = self.q.front() {
             if e.cum_end > departed {
@@ -171,6 +192,33 @@ impl DepartureTracker {
             stamp(e.wire_seq, e.enqueued_at);
         }
         departed
+    }
+
+    /// quinn discarded every queued datagram whose payload is `max_payload`
+    /// bytes or more (`Datagrams::drop_oversized`, after an MTU black hole).
+    /// Remove those entries so they are not read as departures and the
+    /// datagrams behind them are not stamped early; `f` gets each one's
+    /// `wire_seq` (if it names one) and the number discarded is returned.
+    ///
+    /// Call it before anything else is enqueued or polled after the black
+    /// hole, so every entry still here was queued when it happened. An entry
+    /// of unknown length (the first of a session) is kept.
+    pub fn discard_oversized(&mut self, max_payload: usize, mut f: impl FnMut(Option<u32>)) -> u64 {
+        let mut removed = 0u64;
+        let mut shift = 0u64;
+        self.q.retain_mut(|e| {
+            if e.len > 0 && e.len as usize >= max_payload {
+                shift += u64::from(e.len);
+                removed += 1;
+                f(e.wire_seq);
+                false
+            } else {
+                e.cum_end -= shift;
+                true
+            }
+        });
+        self.discarded_bytes += shift;
+        removed
     }
 
     /// The session ended or changed: hand back every entry still queued, so
@@ -235,6 +283,41 @@ mod tests {
             m.stamped[0].1 - m.stamped[0].0,
             Duration::from_micros(11_000)
         );
+    }
+
+    #[test]
+    fn discarded_datagrams_are_not_departures_and_do_not_pull_later_ones_early() {
+        let base = Instant::now();
+        let mut m = DepartureTracker::default();
+        // seq 0 is the first of the tracker (its length is not known, so it
+        // is never discarded); then 1200, 1200, 100, 1200, 100: seqs 1..=5.
+        let sizes = [100u64, 1200, 1200, 100, 1200, 100];
+        let mut cum = 0u64;
+        for (i, s) in sizes.iter().enumerate() {
+            cum += s;
+            assert_eq!(m.on_enqueue(Some(i as u32), cum, base), None);
+        }
+        // A black hole: quinn drops what is 1100 bytes or more.
+        let mut gone = Vec::new();
+        assert_eq!(m.discard_oversized(1100, |ws| gone.push(ws)), 3);
+        assert_eq!(gone, vec![Some(1), Some(2), Some(4)]);
+        assert_eq!(m.len(), 3);
+        // quinn's queue is now the three small ones, 300 bytes. Nothing has
+        // left: without the fix `departed` would read 3900 - 300 = 3600 and
+        // stamp all three.
+        m.on_poll(cum, 300, base, |_, _| panic!("nothing left the wire"));
+        let mut seen = Vec::new();
+        m.on_poll(cum, 200, base, |ws, _| seen.push(ws));
+        assert_eq!(seen, vec![Some(0)]);
+        // A datagram accepted after the black hole is mirrored in the new frame.
+        cum += 900;
+        assert_eq!(m.on_enqueue(Some(6), cum, base), None);
+        m.on_poll(cum, 1100, base, |_, _| panic!("200 + 900 are still queued"));
+        m.on_poll(cum, 900, base, |ws, _| seen.push(ws));
+        assert_eq!(seen, vec![Some(0), Some(3), Some(5)]);
+        m.on_poll(cum, 0, base, |ws, _| seen.push(ws));
+        assert_eq!(seen, vec![Some(0), Some(3), Some(5), Some(6)]);
+        assert!(m.is_empty());
     }
 
     #[test]

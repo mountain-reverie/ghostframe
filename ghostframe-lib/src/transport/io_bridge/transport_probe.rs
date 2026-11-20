@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Transport measurements for the `cumulative emit` log line and the
-//! browserless harness. MEASUREMENT ONLY: nothing here feeds a decision, the
-//! bandwidth estimator or the classifier.
+//! browserless harness. MEASUREMENT ONLY, bar `check_black_hole` (it keeps the
+//! departure mirror true and marks quinn's local discards for the FEC loss
+//! gate): nothing else here feeds a decision, the bandwidth estimator or the
+//! classifier.
 //!
 //! It answers the questions the retransmission cascade left open: how deep
 //! quinn's datagram send queue stands, whether the congestion window has been
@@ -40,6 +42,22 @@ pub struct FecAdaptProbe {
     pub trim_steps: u64,
     pub blocks_sized: u64,
     pub saturated: u64,
+    /// The ledger loss gate (`fec_tx::queue_loss`): source-bundle verdicts
+    /// classed as queue losses, datagrams quinn discarded locally after an
+    /// MTU black hole, black-hole events, and losses a LOSS_REPORT did not
+    /// charge to the path.
+    pub queue_losses: u64,
+    pub local_discards: u64,
+    pub black_holes: u64,
+    pub losses_excused: u64,
+    /// Verdicts on local discards, credits withdrawn by a late ack and
+    /// expired unspent, and verdicts (and credits) that came after a report
+    /// whose range had already reached them.
+    pub local_losses: u64,
+    pub credits_withdrawn: u64,
+    pub credits_expired: u64,
+    pub verdicts_behind_report: u64,
+    pub credits_behind_report: u64,
 }
 
 /// Cumulative and latest transport readings for the live session.
@@ -172,6 +190,9 @@ impl IoBridge {
     pub(super) fn release_departures(&mut self) {
         self.departures = Default::default();
         self.departures_handle = None;
+        self.black_holes_seen = 0;
+        self.discarded_unstamped.clear();
+        self.queue_loss.reset_session();
         // The whole ledger, not just what never left: records of the old
         // session would otherwise be declared lost into the next connection's
         // estimator, and its adapted threshold would carry over.
@@ -229,6 +250,23 @@ impl IoBridge {
         pacer_limited_term(self.last_admission_term)
     }
 
+    /// The adaptive controller's readings with the ledger loss gate's
+    /// counters; `None` when the bridge is not adaptive.
+    pub(super) fn adapt_probe(&self) -> Option<FecAdaptProbe> {
+        let mut p = self.fec_adapt.as_ref()?.probe();
+        let q = self.queue_loss.stats();
+        p.queue_losses = q.queue_losses;
+        p.local_discards = q.local_discards;
+        p.black_holes = q.black_holes;
+        p.losses_excused = q.losses_excused;
+        p.local_losses = q.local_losses;
+        p.credits_withdrawn = q.withdrawn;
+        p.credits_expired = q.expired;
+        p.verdicts_behind_report = q.verdicts_behind_report;
+        p.credits_behind_report = q.credits_behind_report;
+        Some(p)
+    }
+
     /// `wire_seq` left for the wire at `at`: give its ledger record a departure
     /// ledger record and the timer on its cache entry.
     pub(super) fn stamp_departure(&mut self, wire_seq: u32, at: std::time::Instant) {
@@ -270,11 +308,55 @@ impl IoBridge {
                 self.departures_handle = Some(handle);
             }
         }
+        // Anything quinn discarded since the last look was queued before this
+        // datagram: take it out of the mirror first.
+        self.check_black_hole(handle);
         let now = super::now_std();
         if let Some(pushed_out) = self.departures.on_enqueue(wire_seq, cum_enqueued, now) {
             // The backstop cap; see `TRACKER_CAP`.
             self.stamp_departure(pushed_out, now);
         }
+    }
+
+    /// quinn's MTU black-hole detector fired since the last look: it reset the
+    /// MTU and discarded every queued datagram of `max_size()` bytes or more
+    /// (`drop_oversized`), which never reach the wire. Take them out of the
+    /// departure mirror (they are not departures, and the datagrams behind
+    /// them must not be stamped early), and mark them local: whatever the
+    /// ledger later judges of them is the sender's own loss, never the path's
+    /// (`queue_loss`). Their ledger records are stamped at the next
+    /// `poll_departures`, as they were before, so the loss machinery still
+    /// finishes with them.
+    ///
+    /// Called before each datagram is mirrored and before each poll, so every
+    /// entry still in the tracker was queued when the black hole happened.
+    pub(super) fn check_black_hole(&mut self, handle: ConnectionHandle) {
+        let Some(conn) = self.server.connections.get_mut(&handle) else {
+            return;
+        };
+        let total = conn.stats().path.black_holes_detected;
+        if total == self.black_holes_seen {
+            return;
+        }
+        let rose = total > self.black_holes_seen;
+        self.black_holes_seen = total;
+        if !rose {
+            return;
+        }
+        let Some(max) = conn.datagrams().max_size() else {
+            return;
+        };
+        let mut gone = Vec::new();
+        let n = self.departures.discard_oversized(max, |ws| gone.extend(ws));
+        tracing::info!(
+            target: super::LOG_TARGET,
+            black_holes = total,
+            max_size = max,
+            discarded = n,
+            "quinn's MTU black-hole detector discarded queued datagrams locally"
+        );
+        self.queue_loss.on_local_discard(&gone, n);
+        self.discarded_unstamped.extend(gone);
     }
 
     /// Read the live session's quinn stats and send-queue depth.
@@ -312,6 +394,12 @@ impl IoBridge {
     /// timer for each transmission among them, at `now`, the instant given to
     /// `poll_transmit`. Does nothing while the tracker is empty.
     pub(super) fn poll_departures(&mut self, now: std::time::Instant) {
+        if !self.discarded_unstamped.is_empty() {
+            self.record_emitted_transmissions(now);
+            for ws in std::mem::take(&mut self.discarded_unstamped) {
+                self.stamp_departure(ws, now);
+            }
+        }
         let Some(handle) = self.departures_handle else {
             return;
         };

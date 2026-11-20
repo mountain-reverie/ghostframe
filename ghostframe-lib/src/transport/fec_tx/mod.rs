@@ -8,3 +8,4 @@ pub(crate) mod adapt_size;
 pub(crate) mod block_table;
 pub(crate) mod blocks;
 pub(crate) mod packer;
+pub(crate) mod queue_loss;

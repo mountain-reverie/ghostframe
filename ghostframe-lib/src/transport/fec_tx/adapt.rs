@@ -83,6 +83,7 @@ pub(crate) struct LossEstimator {
     reports: u64,
     changes: u64,
     congestion_skips: u64,
+    losses_excused: u64,
 }
 
 impl LossEstimator {
@@ -98,12 +99,30 @@ impl LossEstimator {
             reports: 0,
             changes: 0,
             congestion_skips: 0,
+            losses_excused: 0,
         }
     }
 
     /// Fold one LOSS_REPORT in. A `congested` interval adds its datagrams to
     /// `total` but its losses to nothing (plan decision 4).
+    #[cfg(test)]
     pub(crate) fn on_report(&mut self, r: &LossReport, congested: bool, now_us: u64) {
+        self.on_report_excusing(r, congested, 0, now_us);
+    }
+
+    /// [`Self::on_report`] with `excused` of the report's losses charged to
+    /// the sender, not the path (queue overflow, local discards; see
+    /// `queue_loss`). They stay in `total` (the datagrams were sent) and are
+    /// left out of `lost`; the run histogram is scaled by what is left, since
+    /// which runs were the excused ones is not known. A report whose every
+    /// loss is excused adds no runs at all.
+    pub(crate) fn on_report_excusing(
+        &mut self,
+        r: &LossReport,
+        congested: bool,
+        excused: u16,
+        now_us: u64,
+    ) {
         let lost = f64::from(r.lost_pre_fec);
         let n = f64::from(r.received) + lost;
         self.decay(n, now_us);
@@ -113,10 +132,14 @@ impl LossEstimator {
                 self.congestion_skips += 1;
             }
         } else {
-            self.lost += lost;
+            let excused = excused.min(r.lost_pre_fec);
+            let kept = f64::from(r.lost_pre_fec - excused);
+            self.lost += kept;
+            self.losses_excused += u64::from(excused);
+            let share = if lost > 0.0 { kept / lost } else { 1.0 };
             for (count, rep) in r.loss_run_hist.iter().zip(RUN_REPRESENTATIVES) {
-                self.runs += f64::from(*count);
-                self.run_lost += f64::from(*count) * rep;
+                self.runs += f64::from(*count) * share;
+                self.run_lost += f64::from(*count) * rep * share;
             }
         }
         self.reports += 1;
@@ -223,6 +246,11 @@ impl LossEstimator {
     }
     pub(crate) fn congestion_skips(&self) -> u64 {
         self.congestion_skips
+    }
+    /// Losses charged to the sender and kept out of `lost`.
+    #[cfg(test)]
+    pub(crate) fn losses_excused(&self) -> u64 {
+        self.losses_excused
     }
 }
 
@@ -331,8 +359,29 @@ impl FecAdapt {
     /// plain random loss too. On a policed link goog_cc's loss-based estimator
     /// lowers the rate and the encoder target pays for the repair overhead
     /// (E6), so engaging FEC there is acceptable.
+    #[cfg(test)]
     pub(crate) fn on_report(&mut self, r: &LossReport, standing_queue: bool, now_us: u64) {
         self.est.on_report(r, standing_queue, now_us);
+    }
+
+    /// [`Self::on_report`], `excused` of the report's losses being the
+    /// stream's own queue overflow or quinn's local discards (`queue_loss`).
+    /// Returns how many were charged off (0 when the standing queue skipped
+    /// the whole report: those losses are skipped already).
+    pub(crate) fn on_report_excusing(
+        &mut self,
+        r: &LossReport,
+        standing_queue: bool,
+        excused: u16,
+        now_us: u64,
+    ) -> u16 {
+        self.est
+            .on_report_excusing(r, standing_queue, excused, now_us);
+        if standing_queue {
+            0
+        } else {
+            excused.min(r.lost_pre_fec)
+        }
     }
 
     /// Time passes: decay, re-check the release, and read the declined
@@ -432,6 +481,7 @@ impl FecAdapt {
             trim_steps: self.trim.steps(),
             blocks_sized: self.blocks_sized,
             saturated: self.saturated,
+            ..FecAdaptProbe::default()
         }
     }
 
@@ -721,6 +771,41 @@ mod tests {
         let mut c = LossEstimator::new();
         c.on_report(&r, false, 0);
         assert_eq!(c.state(), FloorState::Engaged);
+    }
+
+    #[test]
+    fn excused_losses_count_in_total_but_not_in_lost() {
+        let mut r = rep(900, 100);
+        // 25 runs of 4.
+        r.loss_run_hist[3] = 25;
+        // Every loss excused: the datagrams are in `total`, nothing else.
+        let mut a = LossEstimator::new();
+        a.on_report_excusing(&r, false, 100, 0);
+        assert_eq!(a.lost(), 0.0);
+        assert_eq!(a.total(), 1000.0);
+        assert_eq!(a.state(), FloorState::Clean);
+        assert_eq!(a.losses_excused(), 100);
+        assert_eq!(a.b_hat(), 1.0, "no run of an all-excused report is kept");
+        // The same report unexcused engages.
+        let mut b = LossEstimator::new();
+        b.on_report_excusing(&r, false, 0, 0);
+        assert_eq!(b.state(), FloorState::Engaged);
+        // Part excused: the rest counts, the runs scale with it. 100 lost of
+        // which 97 excused leaves 3: not enough to engage on its own.
+        let mut c = LossEstimator::new();
+        c.on_report_excusing(&r, false, 97, 0);
+        assert_eq!(c.lost(), 3.0);
+        assert_eq!(c.state(), FloorState::Clean);
+        // More excused than lost is clamped to what was lost.
+        let mut d = LossEstimator::new();
+        d.on_report_excusing(&r, false, 500, 0);
+        assert_eq!(d.lost(), 0.0);
+        assert_eq!(d.losses_excused(), 100);
+        // A congested report skips whole, and excuses nothing it did not need to.
+        let mut e = LossEstimator::new();
+        e.on_report_excusing(&r, true, 40, 0);
+        assert_eq!(e.lost(), 0.0);
+        assert_eq!(e.losses_excused(), 0);
     }
 
     #[test]

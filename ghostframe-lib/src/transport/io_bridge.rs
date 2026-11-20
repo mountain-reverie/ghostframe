@@ -1007,6 +1007,14 @@ pub struct IoBridge {
     departures: crate::transport::departure::DepartureTracker,
     /// The connection `departures` mirrors; a different one starts it afresh.
     departures_handle: Option<quinn_proto::ConnectionHandle>,
+    /// The live connection's `black_holes_detected` as last read, and the
+    /// bundles it discarded that still await their departure stamp
+    /// (`check_black_hole`).
+    black_holes_seen: u64,
+    discarded_unstamped: Vec<u32>,
+    /// The ledger loss gate (`fec_tx::queue_loss`): which losses are the
+    /// stream's own queue's or quinn's, for the adaptive FEC controller.
+    queue_loss: crate::transport::fec_tx::queue_loss::QueueLossClassifier,
     /// Harness read-back of `transport_probe`, same pattern as the other
     /// `*_publish` cells.
     #[cfg(any(test, feature = "browserless-harness"))]
@@ -1647,6 +1655,9 @@ impl IoBridge {
             instr: Default::default(),
             departures: Default::default(),
             departures_handle: None,
+            black_holes_seen: 0,
+            discarded_unstamped: Vec::new(),
+            queue_loss: Default::default(),
             #[cfg(any(test, feature = "browserless-harness"))]
             transport_probe_publish: std::sync::Arc::new(std::sync::Mutex::new(
                 TransportProbe::default(),
@@ -2846,11 +2857,7 @@ impl IoBridge {
             );
             *self.transport_probe_publish.lock().unwrap() = TransportProbe {
                 instr: self.instrument_summary(),
-                adapt: self
-                    .fec_adapt
-                    .as_ref()
-                    .map(|a| a.probe())
-                    .unwrap_or_default(),
+                adapt: self.adapt_probe().unwrap_or_default(),
                 ..self.transport_probe
             };
             *self.probe_stats_publish.lock().unwrap() =
@@ -2899,6 +2906,9 @@ impl IoBridge {
     /// frame is thousands of packets. The bytes on the socket are the same, in
     /// the same order.
     async fn drain_outbound(&mut self) -> io::Result<()> {
+        if let Some(h) = self.departures_handle {
+            self.check_black_hole(h);
+        }
         let now = now_std();
         let mut buf: Vec<u8> = Vec::with_capacity(QUIC_SCRATCH);
         let server = &mut self.server;

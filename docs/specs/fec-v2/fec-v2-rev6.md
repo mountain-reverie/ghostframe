@@ -329,6 +329,7 @@ Each repair is recorded in the ledger as a transmission (rev 5 §4.9.1).
   - Above the floor, r = 1 at the first measured loss.
   - The floor value is an owner decision (§8, item 5).
 - **Congestion versus random loss** is unchanged from rev 5 §4.3 step 5. Loss that coincides with delay growth, or with quinn congestion events, does not raise r.
+  As built: an interval is *congested* (its losses are not counted) only when `bwe.standing_queue()` holds when the report arrives; quinn's `congestion_events` is not read. A report arrives about 600 ms after a tail-drop burst, when that queue has drained, so a **ledger loss gate** (`fec_tx/queue_loss.rs`, FINDINGS section 15) adds a second, identity-keyed excuse: a bundle the ledger judges lost is a *queue loss* when the nearest acknowledged bundle before it was sent into a queue of at least `max(80 ms, 0.8 x the 10 s peak)`, and a *local* loss when quinn's MTU black-hole detector discarded it from its own send queue. Each earns the next LOSS_REPORT one loss of credit (2 s expiry; a late acknowledgement withdraws it); the report's `lost_pre_fec` is reduced by the credit before the estimator counts it. The datagrams stay in `total`.
 
 ### 5.1 Padding becomes repair
 - **Today:** goog_cc's probe windows are filled with copies of acknowledged P-frame fragments (`submit_h264_pad`, `emitter.rs:641`; `h264_rate.rs:710`). The client acknowledges them and discards them.

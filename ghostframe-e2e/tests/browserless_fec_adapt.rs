@@ -930,6 +930,29 @@ async fn sweep_run(cell: Cell, arm: Arm, seed: u64, scale: f64) -> SweepRun {
         .expect("scene ran");
     let out = read_run(&r, secs, load);
     let unit = rate_label(load);
+    if arm == Arm::Adaptive {
+        // The ledger loss gate (`fec_tx::queue_loss`), per adaptive run.
+        let a = &r.transport.adapt;
+        println!(
+            "FECGATE cell={} seed={seed:#x} dropped={} lost_pre_fec={} queue_losses={} \
+             local_losses={} local_discards={} black_holes={} losses_excused={} withdrawn={} \
+             expired={} verdicts_behind_report={} credits_behind_report={} skips={} engaged={}",
+            cell.name(),
+            out.dropped,
+            out.lost_pre_fec,
+            a.queue_losses,
+            a.local_losses,
+            a.local_discards,
+            a.black_holes,
+            a.losses_excused,
+            a.credits_withdrawn,
+            a.credits_expired,
+            a.verdicts_behind_report,
+            a.credits_behind_report,
+            a.congestion_skips,
+            a.engaged
+        );
+    }
     println!(
         "FECSWEEP run load={load:?} loss={} cap={cap_mbit} buf={} arm={} scale={scale:.3} seed={seed:#x} secs={secs} \
          dropped={} offered={} lost_pre_fec={} reports={} src_bytes={} repair_bytes={} \
