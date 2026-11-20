@@ -291,7 +291,10 @@ impl IoBridge {
                         }
                         self.loss_window
                             .retract(tx.emit_us as u32, tx.records.len() as u32);
-                        self.queue_loss.on_late_ack(id);
+                        if self.fec_adapt.is_some() {
+                            let now_ms = self.bwe_ms(now_for_samples);
+                            self.queue_loss.on_late_ack(id, now_ms);
+                        }
                         self.recent_bundles.remember(id, &tx);
                         // Observability: was goog_cc already told this was
                         // lost?
