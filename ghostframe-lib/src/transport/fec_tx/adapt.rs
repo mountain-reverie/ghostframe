@@ -15,6 +15,29 @@
 //! The floor is statistical, not `p_hat >= floor` (plan decision 5): a bare
 //! threshold flaps at a stationary rate near the line, and a lone loss in a
 //! young estimate reads as a large rate.
+//!
+//! # The engage test follows the traffic volume (rev 7, FINDINGS section 16)
+//!
+//! Engaging asks one question: is the loss rate shown to be above the floor?
+//! Under the null (rate = floor) the datagrams seen, `n`, would lose
+//! `mu0 = n x floor` of them, Poisson. The estimator engages when
+//! `P(X >= l | mu0) <= FEC_ENGAGE_ALPHA` (the exact upper tail, the same
+//! one-sided 97.7 % as the former `z = 2`) and `l >= FEC_ADAPT_MIN_LOSSES`.
+//! `mu0` is the volume term: with 800 datagrams in the window the bar is
+//! 4 losses, with 5 000 it is 11, with 10 000 it is 18. The former bound
+//! `(l - 2 sqrt(l)) / n >= floor` took its variance from the *observed*
+//! count, which at a few losses overstates it (6 losses at 1 000 datagrams,
+//! when the same 1 000 datagrams show 1 under the null); at 2 Mbit/s
+//! (about 165 datagrams/s, a frame is about 5 of them, so a lost datagram is
+//! a damaged frame) that was 0.8 s of 5 % loss on top of the report delay.
+//!
+//! The test reads its own accumulator pair, `lost_e` / `total_e`, that
+//! forgets by time ([`FEC_ENGAGE_TAU_US`], 5 s) or by count
+//! ([`FEC_ADAPT_WINDOW_DATAGRAMS`]) with no minimum mass: the window is
+//! seconds of traffic, so at 165 datagrams/s it holds about 800 datagrams,
+//! not the 5 000 the release side keeps (a fresh step is not diluted by 30 s
+//! of clean history). Release reads the slow pair (`lost`, `total`) as
+//! before: leaving r >= 1 must stay the cautious move.
 
 use ghostframe_protocol::fec::feedback::LossReport;
 
@@ -32,6 +55,12 @@ pub(crate) const FEC_ADAPT_WINDOW_DATAGRAMS: f64 = 10_000.0;
 /// Estimator window in time: the time decay is `exp(-dt / tau)`, so a slow
 /// link forgets, down to [`FEC_ADAPT_MIN_MASS`] (see there).
 pub(crate) const FEC_ADAPT_TAU_US: u64 = 10_000_000;
+/// Time constant of the engage window (its accumulators have no minimum
+/// mass; see the module doc). Five seconds of traffic: 800 datagrams at
+/// 2 Mbit/s H.264, where a fresh 5 % step shows 4 losses in about 0.5 s of
+/// reports; above about 2 000 datagrams/s the count window is the shorter
+/// and nothing changes.
+pub(crate) const FEC_ENGAGE_TAU_US: u64 = 5_000_000;
 /// Time decay may not pull the decayed `total` below this many datagrams
 /// (count decay is not limited). Why: at `L = 0` the release bound is
 /// `(Z_RELEASE + 1) / N`, which falls under the 0.001 floor only for
@@ -49,11 +78,13 @@ pub(crate) const FEC_ADAPT_MIN_MASS: f64 = 5_000.0;
 pub(crate) const FEC_ADAPT_MIN_DWELL_US: u64 = 5_000_000;
 /// Engaging needs at least this many (decayed) losses: a stray loss never does.
 pub(crate) const FEC_ADAPT_MIN_LOSSES: f64 = 3.0;
-/// Normal quantile of the engage (lower) bound: one-sided 97.7 %. The plan
-/// started at 1.64 (95 %); at 100 Mbit/s a stationary 0.1 % link then changed
-/// state 5 times in a minute (a 10 000 datagram window is 1 s there), so the
-/// two quantiles were widened (measured, 5 min runs, 18 seeds).
-const Z_ENGAGE: f64 = 2.0;
+/// Engage when the probability of seeing this many losses (or more) at the
+/// floor rate is at most this: one-sided 97.7 %, the tail beyond z = 2. The
+/// plan started at 1.64 (95 %); at 100 Mbit/s a stationary 0.1 % link then
+/// changed state 5 times in a minute (a 10 000 datagram window is 1 s
+/// there), so the two quantiles were widened (measured, 5 min runs, 18
+/// seeds).
+const FEC_ENGAGE_ALPHA: f64 = 0.0228;
 /// Normal quantile of the release (upper) bound: one-sided 99 %. Wider than
 /// the engage side on purpose: leaving r >= 1 is the cheap mistake to avoid
 /// repeating, engaging is the one that protects content.
@@ -61,6 +92,29 @@ const Z_RELEASE: f64 = 2.33;
 /// Run lengths the histogram buckets stand for: 1, 2, 3, 4, 5-8, 9-16,
 /// 17-32, >32.
 const RUN_REPRESENTATIVES: [f64; 8] = [1.0, 2.0, 3.0, 4.0, 6.5, 12.5, 24.5, 40.0];
+
+/// `P(X >= l)` for `X ~ Poisson(mu)`, `l` real (linear between the integers
+/// around it: the decayed count is fractional). At most `l + 1` terms.
+fn poisson_upper_tail(l: f64, mu: f64) -> f64 {
+    let k = l.floor() as usize;
+    let f = l - k as f64;
+    let (mut pmf, mut cdf) = ((-mu).exp(), 0.0);
+    for j in 0..k {
+        cdf += pmf;
+        pmf *= mu / (j + 1) as f64;
+    }
+    (1.0 - cdf - f * pmf).max(0.0)
+}
+
+/// The engage test: `l` (decayed) losses over `n` datagrams show a rate above
+/// the floor (module doc). A count far past the null's mean needs no sum.
+fn engage_shown(l: f64, n: f64) -> bool {
+    if l < FEC_ADAPT_MIN_LOSSES || n <= 0.0 {
+        return false;
+    }
+    let mu0 = n * FEC_LOSS_FLOOR;
+    l > mu0 + 12.0 * mu0.sqrt() + 30.0 || poisson_upper_tail(l, mu0) <= FEC_ENGAGE_ALPHA
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FloorState {
@@ -74,6 +128,10 @@ pub(crate) enum FloorState {
 pub(crate) struct LossEstimator {
     lost: f64,
     total: f64,
+    /// The engage window's pair (see the module doc): same inputs, shorter
+    /// memory at low rates, no minimum mass.
+    lost_e: f64,
+    total_e: f64,
     /// Lost datagrams inside the histogram's runs, and the run count.
     run_lost: f64,
     runs: f64,
@@ -91,6 +149,8 @@ impl LossEstimator {
         Self {
             lost: 0.0,
             total: 0.0,
+            lost_e: 0.0,
+            total_e: 0.0,
             run_lost: 0.0,
             runs: 0.0,
             state: FloorState::Clean,
@@ -127,6 +187,7 @@ impl LossEstimator {
         let n = f64::from(r.received) + lost;
         self.decay(n, now_us);
         self.total += n;
+        self.total_e += n;
         if congested {
             if r.lost_pre_fec > 0 {
                 self.congestion_skips += 1;
@@ -135,6 +196,7 @@ impl LossEstimator {
             let excused = excused.min(r.lost_pre_fec);
             let kept = f64::from(r.lost_pre_fec - excused);
             self.lost += kept;
+            self.lost_e += kept;
             self.losses_excused += u64::from(excused);
             let share = if lost > 0.0 { kept / lost } else { 1.0 };
             for (count, rep) in r.loss_run_hist.iter().zip(RUN_REPRESENTATIVES) {
@@ -171,6 +233,11 @@ impl LossEstimator {
         let d = self.decay_factor(n, dt);
         self.lost *= d;
         self.total *= d;
+        let d_e = (-n / FEC_ADAPT_WINDOW_DATAGRAMS)
+            .exp()
+            .min((-(dt as f64) / FEC_ENGAGE_TAU_US as f64).exp());
+        self.lost_e *= d_e;
+        self.total_e *= d_e;
         self.run_lost *= d;
         self.runs *= d;
     }
@@ -179,10 +246,7 @@ impl LossEstimator {
         let (l, n) = (self.lost, self.total);
         match self.state {
             FloorState::Clean => {
-                if l >= FEC_ADAPT_MIN_LOSSES
-                    && n > 0.0
-                    && (l - Z_ENGAGE * l.sqrt()) / n >= FEC_LOSS_FLOOR
-                {
+                if engage_shown(self.lost_e, self.total_e) {
                     self.set(FloorState::Engaged, now_us);
                 }
             }
@@ -644,6 +708,78 @@ mod tests {
         }
         assert!((e.p_hat() - 0.05).abs() < 0.01, "p_hat {}", e.p_hat());
         assert_eq!(e.state(), FloorState::Engaged);
+    }
+
+    #[test]
+    fn the_poisson_tail_is_the_exact_one() {
+        // P(X >= 3 | 1) = 1 - e^-1 (1 + 1 + 1/2); P(X >= 0) = 1.
+        let exact = 1.0 - (-1.0f64).exp() * 2.5;
+        assert!((poisson_upper_tail(3.0, 1.0) - exact).abs() < 1e-12);
+        assert_eq!(poisson_upper_tail(0.0, 7.0), 1.0);
+        // Between integers it is between their tails.
+        let (a, b) = (poisson_upper_tail(3.0, 1.0), poisson_upper_tail(4.0, 1.0));
+        let m = poisson_upper_tail(3.5, 1.0);
+        assert!(b < m && m < a && (m - (a + b) / 2.0).abs() < 1e-12);
+    }
+
+    /// Fewest whole losses that engage a young estimator with `n` clean-ish
+    /// datagrams, in one report.
+    fn losses_to_engage(n: u16) -> u16 {
+        (0..n)
+            .find(|&l| {
+                let mut e = LossEstimator::new();
+                e.on_report(&rep(n - l, l), false, 0);
+                e.state() == FloorState::Engaged
+            })
+            .unwrap()
+    }
+
+    /// The bar is a count of losses the traffic makes unlikely at the floor:
+    /// it grows with the datagrams in the window (rev 7, section 16).
+    #[test]
+    fn the_engage_bar_follows_the_volume_of_traffic() {
+        let bars: Vec<u16> = [200u16, 500, 900, 2_000, 5_000, 10_000]
+            .iter()
+            .map(|&n| losses_to_engage(n))
+            .collect();
+        assert!(bars.windows(2).all(|w| w[0] <= w[1]), "{bars:?}");
+        // 2 Mbit/s's 800 to 900 datagrams: 4 losses, not the 6 the old
+        // bound asked; the minimum of 3 still holds at any volume.
+        assert_eq!(bars[2], 4, "{bars:?}");
+        assert_eq!(bars[0], 3, "{bars:?}");
+        assert!(bars[5] >= 15, "{bars:?}");
+        // Three losses in 1 000 datagrams are 8 % likely at the floor.
+        assert_eq!(losses_to_engage(1_000), 4);
+    }
+
+    /// A step after a long clean spell is not diluted by it: at 2 Mbit/s the
+    /// slow window holds 5 000 datagrams (30 s), the engage window 800.
+    #[test]
+    fn a_late_step_at_a_low_rate_engages_as_fast_as_an_early_one() {
+        let engage_after_step_s = |clean_s: u64| {
+            let mut rng = Rng(0x5eed);
+            let mut e = LossEstimator::new();
+            let mut t = 0u64;
+            // 40 datagrams per 250 ms report (160/s).
+            while t < clean_s * 1_000_000 {
+                e.on_report(&rep(40, 0), false, t);
+                t += 250_000;
+            }
+            assert_eq!(e.state(), FloorState::Clean);
+            let t0 = t;
+            for _ in 0..40 {
+                let lo = (0..40).filter(|_| rng.next() < 0.05).count() as u16;
+                e.on_report(&rep(40 - lo, lo), false, t);
+                if e.state() == FloorState::Engaged {
+                    return (t - t0) as f64 / 1e6;
+                }
+                t += 250_000;
+            }
+            panic!("never engaged after {clean_s} s clean");
+        };
+        let (early, late) = (engage_after_step_s(5), engage_after_step_s(60));
+        assert!(late <= 2.0, "late step took {late} s");
+        assert!(late <= early + 0.75, "early {early} s, late {late} s");
     }
 
     /// Zero loss after a 5 % episode, at `dg_per_s` datagrams/s with reports
