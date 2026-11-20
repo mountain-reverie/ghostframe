@@ -5,8 +5,62 @@
 //! server's own send times plus the receiver arrival times echoed in the ACK
 //! envelope are sufficient. A constant clock offset between the two cancels in
 //! GoogCC's `recv_delta - send_delta`.
+//!
+//! # D1: the growth gate
+//!
+//! While the sender is not saturated (`ceiling.rs`: it spent under
+//! `SATURATION` of its grant), the **published** estimate is rate-limited to
+//! `UNPROBED_GROWTH_PER_S` (3 % of itself a second) above the highest rate
+//! *proved* in the last `PROVED_WINDOW_US` (10 s), unless a probe result lets
+//! a rise through; decreases pass at once, and rises up to a proved rate are
+//! free (`growth_gate.rs`). A rate is proved by a probe result the gate
+//! accepted, by being published while saturated (bounded by the ceiling), or by what a probe cluster
+//! measured (`probe_meter.rs`, our own reading of the same acknowledgements)
+//! even when goog_cc published less: its loss controller can cap the target
+//! in the feedback that carries the result. goog_cc's own upward
+//! drift between probes is therefore published only as fast as that.
+//!
+//! History of the rule, measured: probe-only (the first D1) removed the
+//! overshoot (1.27 x to 1.01 x the link) but made recovery after a cut
+//! probe-only and regressed p8e, the refs scenes and the step-up (median
+//! 1.1 s to 2.3 s); free recovery up to a proved rate (D1') fixed those but the
+//! step-up median went to 5.7 s and the refs twin found the headroom in 5 of 24
+//! runs (13 needed): a hard hold above the proved rate also stops the ordinary
+//! seeds' own 2 %/s drift, which is how they find part of their headroom. The
+//! limit lets that through and stops the 8 %/s of the overshoot seeds.
+//! What is published is what
+//! `snapshot` returns: admission, the H.264 rate target, the classifier, the
+//! base-rise check and the spike hold all read it. goog_cc's raw target is
+//! read only by the lift-survival counters (a lift is made saturated, where
+//! the gate is off, and what they measure is goog_cc's loss-based estimator).
+//!
+//! Why. In the H.264 step-up scene (2 Mbit/s link, step at 6 s) about one
+//! seed in ten (0x6706, 0x6728, 0x672e) has goog_cc's start-up probe land
+//! just above its link-capacity bound; the AIMD then grows the estimate by
+//! about 8 %/s to its cap of 1.5 x the acknowledged rate (2.5 - 2.9 Mbit/s)
+//! with nothing to refute it, because the stream sends at 0.8 x the estimate
+//! and stays at or under the link (queue about 20 ms) until it finally queues,
+//! about 5.5 s later. libwebrtc's `no_bitrate_increase_in_alr` does nothing:
+//! its ALR detector budgets 80 % of the estimate, which a 0.8 x stream spends
+//! as fast as it refills, so it never reports application-limited (measured:
+//! identical estimate). Normal seeds drift about 0.04 Mbit/s per second
+//! between probes. Headroom is still found by probes: goog_cc's own
+//! (start-up ladder, repeated initial probing, ALR probing) and the
+//! application's (`h264_start_app_probe`), each packet of which reaches this
+//! module as `AckArrival::probe`.
+//!
+//! Only what a probe cluster measured proves a rate, not the mere presence of
+//! probe-tagged acknowledgements: raw may drift well above the link while a
+//! cluster is still partial. The meter reads each cluster once per feedback
+//! and its result is proved before the gate steps in the same feedback, so a
+//! rise up to what the probe measured is free and a rise above it is
+//! rate-limited. Only a feedback earns unprobed growth credit.
+//! No ceiling reading yet means the gate is off, and proves nothing (see
+//! `step_gate`).
 
-use super::ceiling::{CeilingReading, EstimateCeiling};
+use super::ceiling::{CeilingReading, EstimateCeiling, SATURATION};
+use super::growth_gate::{GateOutcome, GrowthGate, Saturation};
+use super::probe_meter::ProbeMeter;
 use super::timeline::Lo16Timeline;
 use super::{AckArrival, BweSnapshot};
 use goog_cc::experiments::FieldTrials;
@@ -130,7 +184,17 @@ pub(crate) struct GoogCcDriver {
     /// server-side microseconds and is used directly.
     arrival_time: Lo16Timeline,
     base: Instant,
+    /// goog_cc's raw target rate. What is published is `gate.published`.
     estimate_bps: u64,
+    /// The growth gate (D1) and what it last published.
+    gate: GrowthGate,
+    /// Our own reading of each probe cluster's delivered rate, proved to the
+    /// gate whatever goog_cc published.
+    probe_meter: ProbeMeter,
+    published_bps: u64,
+    /// What the last ceiling reading that existed said. `Unknown` before any
+    /// reading: no history, no restriction (see `step_gate`).
+    saturation: Saturation,
     samples_seen: u64,
     /// quinn's measured path RTT, used only as a plausibility bound on the
     /// derived RTT — never fed to the controller. See `note_path_rtt`.
@@ -333,6 +397,10 @@ impl GoogCcDriver {
             arrival_time: Lo16Timeline::default(),
             base: now,
             estimate_bps: initial_bps,
+            gate: GrowthGate::default(),
+            probe_meter: ProbeMeter::default(),
+            published_bps: initial_bps,
+            saturation: Saturation::Unknown,
             samples_seen: 0,
             path_rtt: None,
             implausible_rtt_samples: 0,
@@ -378,6 +446,19 @@ impl GoogCcDriver {
         } else {
             self.ceiling.read(now_us, srtt_us)
         };
+        // The gate reads the same reading: saturated, it is off.
+        if let Some(r) = reading {
+            self.saturation = if r.saturation >= SATURATION {
+                Saturation::Yes {
+                    // What is published while saturated is bounded by this
+                    // (`bounded`), so it is what the gate proves.
+                    ceiling_bps: r.ceiling_bps.map(|c| (c as u64).max(MIN_BPS as u64)),
+                }
+            } else {
+                Saturation::No
+            };
+            self.step_gate(now_us, false);
+        }
         let standing_queue = self.standing_queue();
         // A window holding a stall in its acknowledgements (`ack_gap_is_stall`:
         // a blackout, a pacer trickling out one big frame) measures the stall,
@@ -409,7 +490,7 @@ impl GoogCcDriver {
         self.stats.ceiling_bps = self.active_ceiling_bps.unwrap_or(0);
         if self
             .active_ceiling_bps
-            .is_some_and(|c| c < self.estimate_bps)
+            .is_some_and(|c| c < self.published_bps)
         {
             self.stats.ceiling_binding_reads += 1;
         }
@@ -480,7 +561,9 @@ impl GoogCcDriver {
         if !cooled || r.acked_bps <= 0.0 {
             return;
         }
-        let est = self.estimate_bps as f64;
+        // The published value: saturated (the only time there is a ceiling) the
+        // gate is off and it is goog_cc's own.
+        let est = self.published_bps as f64;
         let ceiling = ceiling.max(MIN_BPS as f64);
         if est > ceiling * (1.0 + FOLLOW_TOLERANCE) {
             // A gap in the acknowledgements (a stall, a blackout) makes the
@@ -539,6 +622,7 @@ impl GoogCcDriver {
                 starting_rate: Some(DataRate::from_bits_per_sec(rate)),
             });
         self.absorb(upd);
+        self.step_gate(now_us, false);
         self.last_reseed_us = Some(now_us);
     }
 
@@ -548,6 +632,8 @@ impl GoogCcDriver {
     /// is what the restarted flow produces.
     pub(crate) fn restart_from(&mut self, now: Instant, bps: u64) {
         let now_us = self.micros_since_base(now);
+        self.gate.reset();
+        self.probe_meter.reset();
         self.reseed(now, now_us, bps as f64);
     }
 
@@ -561,7 +647,39 @@ impl GoogCcDriver {
         let now_us = self.micros_since_base(now);
         let srtt_us = self.path_rtt.map_or(0, |d| d.as_micros() as u64);
         self.ceiling_hold_until_us = now_us + EstimateCeiling::window_us(srtt_us) + srtt_us;
+        self.gate
+            .restore(now_us, (bps as i64).clamp(MIN_BPS, MAX_BPS) as u64);
         self.reseed(now, now_us, bps as f64);
+    }
+
+    /// Run the growth gate (D1) on goog_cc's current target. `count` is true
+    /// for the step made on a feedback, the only one that is counted and the
+    /// only one that earns unprobed growth credit.
+    ///
+    /// Not saturated is the gate's case. Before any ceiling reading exists
+    /// (`Saturation::Unknown`) it is off, as the ceiling is: with no history
+    /// there is no evidence either way and start-up is not restricted by a
+    /// rule that needs some; but nothing is proved either, the value is only
+    /// anchored. While the ceiling is held off (a probe burst, a restore) the
+    /// last reading's answer stands.
+    fn step_gate(&mut self, now_us: u64, count: bool) {
+        let (published, outcome) =
+            self.gate
+                .step(now_us, self.estimate_bps, self.saturation, count);
+        self.published_bps = published;
+        if !count {
+            return;
+        }
+        match outcome {
+            GateOutcome::Limited => {
+                self.stats.growth_held_feedbacks += 1;
+                let pct = self.estimate_bps.saturating_mul(100) / published.max(1);
+                self.stats.growth_held_max_ratio_pct =
+                    self.stats.growth_held_max_ratio_pct.max(pct);
+            }
+            GateOutcome::Recovered => self.stats.growth_free_recoveries += 1,
+            GateOutcome::Passed => {}
+        }
     }
 
     /// `bps` bounded by the ceiling while one applies (never below the
@@ -647,9 +765,18 @@ impl GoogCcDriver {
         let mut send_ms_max = (records[0].server_emit_us / 1_000) as i64;
         let mut packet_feedbacks = Vec::with_capacity(records.len() + losses.len());
         let mut last_derived = Duration::ZERO;
+        let mut probe_acks = Vec::new();
         for r in records {
             let send_ms = (r.server_emit_us / 1_000) as i64;
             let recv_ms = self.arrival_time.unwrap_ms(r.client_arrival_ms_lo16) as i64;
+            if let Some(tag) = r.probe {
+                probe_acks.push((
+                    tag,
+                    r.server_emit_us,
+                    (recv_ms.max(0) as u64) * 1_000,
+                    r.size_bytes,
+                ));
+            }
             send_ms_max = send_ms_max.max(send_ms);
             last_derived = Duration::from_millis((recv_ms - send_ms).max(0) as u64);
             let sent = SentPacket {
@@ -732,11 +859,27 @@ impl GoogCcDriver {
         });
         self.absorb(upd);
 
+        // What the probe clusters acknowledged in this feedback measured, read
+        // as goog_cc reads them: the acknowledgements in receive order, each
+        // cluster once after all of its acknowledgements, the last result
+        // kept. Proved before the gate steps.
+        let now_us = self.micros_since_base(now);
+        probe_acks.sort_by_key(|&(_, _, recv_us, _)| recv_us);
+        for (tag, send_us, recv_us, size) in probe_acks {
+            self.probe_meter.on_ack(tag, send_us, recv_us, size);
+        }
+        if let Some(rate) = self.probe_meter.finish_feedback() {
+            self.gate.note_probe_result(now_us, rate);
+            self.stats.growth_probe_proofs += 1;
+            self.stats.growth_probe_proved_max_bps =
+                self.stats.growth_probe_proved_max_bps.max(rate);
+        }
+        self.step_gate(now_us, true);
+
         // What was acknowledged is counted as goog_cc counts it: the wire size
         // of each acknowledged transmission, the bytes the estimate is a rate
         // of.
         self.acked_cum_bytes += records.iter().map(|r| r.size_bytes as f64).sum::<f64>();
-        let now_us = self.micros_since_base(now);
         self.ceiling.note_acked(now_us, self.acked_cum_bytes);
         if let Some(rtt) = self.path_rtt {
             self.min_rtt.push(now_us, rtt.as_micros() as u64);
@@ -774,10 +917,15 @@ impl GoogCcDriver {
     /// The estimate and pacer rate, bounded by the ceiling while one applies.
     pub(crate) fn snapshot(&self) -> BweSnapshot {
         BweSnapshot {
-            bitrate_bps: self.bounded(self.estimate_bps),
+            bitrate_bps: self.bounded(self.published_bps),
             samples_seen: self.samples_seen,
             implausible_rtt_samples: self.implausible_rtt_samples,
-            pacer_rate_bps: self.pacer_rate_bps.map(|p| self.bounded(p)),
+            // Held in the proportion the estimate is.
+            pacer_rate_bps: self.pacer_rate_bps.map(|p| {
+                let held = (p as u128 * self.published_bps as u128
+                    / self.estimate_bps.max(1) as u128) as u64;
+                self.bounded(held.min(p))
+            }),
             payload_fraction: self.payload_fraction,
             stats: self.stats,
         }
@@ -1309,11 +1457,26 @@ mod tests {
             snap.stats.ceiling_saturated_reads, 0,
             "a ceiling was applied to a sender that was not rate-limited"
         );
+        assert_eq!(snap.stats.ceiling_bps, 0, "a bound was published");
+        assert_eq!(snap.stats.ceiling_binding_reads, 0);
+        // goog_cc is free to sit above `HEADROOM x acked`: the ceiling does
+        // not bind it.
         assert!(
-            snap.bitrate_bps as f64 > crate::transport::bwe::ceiling::HEADROOM * ACKED_BPS * 1.05,
-            "estimate {} is held down at its own rate {}",
-            snap.bitrate_bps,
+            d.estimate_bps as f64 > crate::transport::bwe::ceiling::HEADROOM * ACKED_BPS * 1.05,
+            "goog_cc's target {} is held down at its own rate {}",
+            d.estimate_bps,
             ACKED_BPS
+        );
+        // What is published is the growth gate's (D1) to say: with no probe,
+        // at most 3 % a second from the start over the 12 s driven (and
+        // under goog_cc's own target, which is the point of the limit).
+        // (4.1: until the first ceiling reading exists the gate is off.)
+        let bound = 4_100_000.0 * (0.03f64 * 12.0).exp();
+        assert!(
+            (snap.bitrate_bps as f64) <= bound && snap.bitrate_bps < d.estimate_bps,
+            "D1: rate-limited, got {} (bound {bound:.0}, raw {})",
+            snap.bitrate_bps,
+            d.estimate_bps
         );
     }
 
@@ -1522,6 +1685,130 @@ mod tests {
             records.iter().map(|r| r.size_bytes as usize).sum(),
         );
         assert_eq!(snap.samples_seen, 1);
+    }
+
+    /// D1: an unsaturated sender's published estimate grows no faster than
+    /// 3 % a second (compounded) above the last proved value, however fast
+    /// goog_cc's own target drifts up.
+    ///
+    /// 12 x 1200 B per 20 ms acknowledged on a clean path (5.76 Mbit/s) from
+    /// a 4 Mbit/s start, the grant 9 Mbit/s and half of it spent: not
+    /// saturated. The first second's packets carry a probe tag; the rest none.
+    #[test]
+    fn an_unsaturated_estimate_grows_at_most_three_percent_a_second_above_what_a_probe_proved() {
+        let t0 = Instant::now();
+        let mut d = GoogCcDriver::new(4_000_000, t0);
+        d.note_path_rtt(Duration::from_millis(30));
+        let tag = ProbeTag {
+            id: 1,
+            // A cluster of the whole first second (600 packets, 720 kB): it
+            // reads the path's 5.76 Mbit/s. A short one would read a burst
+            // (12 packets 1 ms apart is 9.6 Mbit/s) and prove more than the
+            // stream carries.
+            min_probes: 600,
+            min_bytes: 720_000,
+            bytes_sent_before: 0,
+        };
+        const PROBED_STEPS: u32 = 50;
+        // Judge from well after the last probe-tagged feedback.
+        const SETTLED_STEP: u32 = PROBED_STEPS + 25;
+        let (mut granted, mut spent, mut offered) = (0.0f64, 0.0f64, 0.0f64);
+        // Up to the settled step the published values are the probes' (and the
+        // start-up's): the proved rates. `at_proved` is the last step the
+        // published value was at or under the highest of them: a climb above
+        // it starts from there.
+        let mut proved_max = 0u64;
+        let mut at_proved = SETTLED_STEP;
+        let mut raw_outran = 0u32;
+        let mut limited_rise = 0u32;
+        let mut prev = 0u64;
+        for step in 0..(30 * 50) as u32 {
+            let now = t0 + Duration::from_millis(20 * step as u64);
+            granted += 9.0e6 / 8.0 * 0.020;
+            spent += 9.0e6 / 8.0 * 0.020 * 0.5;
+            offered += 12.0 * 1200.0;
+            let probe = (step < PROBED_STEPS).then_some(tag);
+            let batch: Vec<AckArrival> = (0..12u32)
+                .map(|i| {
+                    let emit_us = ((step * 20 + i) as u64) * 1_000;
+                    AckArrival {
+                        server_emit_us: emit_us,
+                        client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
+                        size_bytes: 1200,
+                        probe,
+                    }
+                })
+                .collect();
+            d.note_offered(now, offered);
+            d.note_admission(now, granted, spent);
+            let snap = d.update(&batch, &[], now, 14_400);
+            if step <= SETTLED_STEP {
+                // What the probes measured is proved too, published or not.
+                proved_max = proved_max
+                    .max(snap.bitrate_bps)
+                    .max(d.snapshot().stats.growth_probe_proved_max_bps);
+            } else {
+                let t_s = (step - at_proved) as f64 * 0.020;
+                // Free up to what was proved, 3 %/s compounded from there.
+                let bound = proved_max as f64 * (0.03 * t_s).exp();
+                assert!(
+                    snap.bitrate_bps as f64 <= bound,
+                    "step {step}: published {} over bound {bound:.0}",
+                    snap.bitrate_bps
+                );
+                raw_outran += (d.estimate_bps as f64 > bound) as u32;
+                if snap.bitrate_bps <= proved_max {
+                    at_proved = step;
+                }
+                limited_rise += (snap.bitrate_bps > prev && snap.bitrate_bps > proved_max) as u32;
+            }
+            prev = snap.bitrate_bps;
+        }
+        let st = d.snapshot().stats;
+        assert_eq!(
+            st.ceiling_saturated_reads, 0,
+            "premise: the sender was saturated ({st:?})"
+        );
+        // The limit was exercised: goog_cc's target went over what was
+        // allowed, and the published value kept climbing at the limit.
+        assert!(
+            raw_outran > 0 && st.growth_held_feedbacks > 100 && st.growth_held_max_ratio_pct > 100,
+            "premise: goog_cc never outran the limit ({raw_outran}, {st:?})"
+        );
+        assert!(
+            limited_rise > 10,
+            "premise: the published value never climbed above what was proved ({limited_rise})"
+        );
+    }
+
+    /// A probe cluster acknowledged at a high rate is proved to the gate by
+    /// the driver's own meter, whatever goog_cc then publishes.
+    #[test]
+    fn an_acknowledged_probe_cluster_is_proved_by_the_driver() {
+        let t0 = Instant::now();
+        let mut d = GoogCcDriver::new(1_000_000, t0);
+        let tag = ProbeTag {
+            id: 9,
+            min_probes: 10,
+            min_bytes: 10_000,
+            bytes_sent_before: 0,
+        };
+        // 12 x 1200 B, sent and received 1 ms apart (ms resolution on the
+        // wire): 11 x 1200 B over 11 ms = 9_600_000 bit/s.
+        let batch: Vec<AckArrival> = (0..12u32)
+            .map(|i| AckArrival {
+                server_emit_us: 1_000 * i as u64,
+                client_arrival_ms_lo16: (15 + i) as u16,
+                size_bytes: 1200,
+                probe: Some(tag),
+            })
+            .collect();
+        assert_eq!(d.snapshot().stats.growth_probe_proofs, 0, "premise");
+        d.update(&batch, &[], t0 + Duration::from_millis(40), 14_400);
+        let st = d.snapshot().stats;
+        assert_eq!(st.growth_probe_proofs, 1, "{st:?}");
+        assert_eq!(st.growth_probe_proved_max_bps, 9_600_000);
+        assert_eq!(d.gate.proved_max_bps(40_000), Some(9_600_000));
     }
 
     /// Drive a long, application-limited stream (one 1200 B packet per 20 ms

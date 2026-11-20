@@ -305,6 +305,26 @@ copies of an acknowledged P-frame fragment under new `wire_seq`s
 discards them). A jump of the raw estimate is held, and the estimate ceiling is
 held off for a second around padding.
 
+While the sender is not saturated the **published** estimate is rate-limited
+to 3 % of itself a second above the highest rate proved in the last 10 s, unless
+a probe result lets a rise through (the growth gate, D1: `bwe/growth_gate.rs`,
+module doc of `bwe/googcc.rs`); goog_cc's own drift between probes is published
+only that fast, because a `0.8 x` stream gives it no feedback that refutes it
+(about 1 seed in 10 of the 2 Mbit/s step-up scene grew 8 %/s to 2.5 - 2.9
+Mbit/s that way). A rate is proved by what a probe cluster measured (our own
+meter, `bwe/probe_meter.rs`, read once per feedback in receive order) or by
+being published while saturated (bounded by the ceiling); rises up to a proved
+rate (the way back after a cut) are free, and only a feedback earns unprobed
+growth credit. A hard hold above the proved rate was tried and slowed the step-up
+median from 1.1 s to 5.7 s; the shipped gate's is 2.0 s (why, and why the app
+probe stays at 2 x: `docs/design/h264-transport.md` section 5).
+`growth_probe_proofs` / `growth_probe_proved_max_bps` count what the meter
+proved.
+`growth_held` (feedbacks where the limit bound) /
+`growth_free` / `growth_held_max_pct` are on the periodic `bwe periodic
+snapshot` line; a zero `growth_held` on a run meant to be limited says the gate
+never engaged. A saturated sender is not gated (the estimate ceiling's case).
+
 The rate moves in place: no reopen, no IDR, no GOP (`RatePolicy::step_in_place`).
 `rate_updates`, `rate_applies_up` / `rate_applies_down` count the changes,
 `rate_sends` / `rate_sends_10s` the re-sends of the rate buffers, the probe
