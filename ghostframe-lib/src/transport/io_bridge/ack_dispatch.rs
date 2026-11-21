@@ -173,7 +173,7 @@ impl IoBridge {
         // expects, and the exact send time of *that* transmission —
         // no longer inferred from a cache entry that a retransmission
         // may have re-stamped since.
-        let resolved = self.resolve_ack_entries(entries, now_for_samples);
+        let (ids, resolved) = self.resolve_ack_entries(entries, now_for_samples);
         // Both Live and Late resolutions release their content --
         // that release is the entire point of this phase, since
         // nothing else ever clears a cache entry acknowledged after
@@ -196,7 +196,7 @@ impl IoBridge {
         // [RTO-PROBE] temporary instrumentation: emit -> acknowledgement
         // latency, measured on the same clock the probe timeout uses.
         self.log_ack_probes(entries, &resolved, now_for_samples);
-        self.record_ack_bwe_samples(&resolved, now_for_samples);
+        self.record_ack_bwe_samples(&ids, &resolved, now_for_samples);
         self.reliable_emitter.on_ack(&emit_keys);
         self.apply_h264_acks(&resolved, now_for_samples);
         self.apply_ack_coverage(&resolved);
@@ -225,13 +225,13 @@ impl IoBridge {
         &mut self,
         entries: &[(u32, u16)],
         now_for_samples: std::time::Instant,
-    ) -> Vec<ResolvedAck> {
+    ) -> (Vec<u32>, Vec<ResolvedAck>) {
         let min_rtt = self
             .reliable_emitter
             .rtt
             .min_rtt()
             .unwrap_or(std::time::Duration::ZERO);
-        let resolved: Vec<ResolvedAck> = entries
+        let (ids, resolved): (Vec<u32>, Vec<ResolvedAck>) = entries
             .iter()
             .filter_map(|&(id, arrival_lo16)| {
                 use crate::transport::transmission_ledger::Resolution;
@@ -269,7 +269,7 @@ impl IoBridge {
                             self.queue_loss
                                 .on_ack(id, arrival_lo16, dep_us / 1000, now_ms);
                         }
-                        Some((tx, arrival_lo16, false))
+                        Some((id, (tx, arrival_lo16, false)))
                     }
                     Some(Resolution::Late { tx }) => {
                         self.reliable_emitter.note_ack(now_for_samples);
@@ -316,7 +316,7 @@ impl IoBridge {
                                     .wrapping_sub(tx.emit_us as u32)
                             );
                         }
-                        Some((tx, arrival_lo16, true))
+                        Some((id, (tx, arrival_lo16, true)))
                     }
                     None => None,
                 };
@@ -325,12 +325,12 @@ impl IoBridge {
                 }
                 r
             })
-            .collect();
+            .unzip();
         // One rate sample per acknowledgement batch, as the draft has it.
         self.delivery_sampler.end_ack(now_for_samples);
         // Blocks count arrivals, live or late, by bundle_seq.
         self.blocks_on_arrivals(entries);
-        resolved
+        (ids, resolved)
     }
 
     /// Env-gated ACK instrumentation (ACKORDER and RTOPROBE).
@@ -420,10 +420,11 @@ impl IoBridge {
     /// removes the cache entries the `queued_at` and probe reads need.
     fn record_ack_bwe_samples(
         &mut self,
+        ids: &[u32],
         resolved: &[ResolvedAck],
         now_for_samples: std::time::Instant,
     ) {
-        for (tx, arrival_lo16, late) in resolved.iter() {
+        for (&id, (tx, arrival_lo16, late)) in ids.iter().zip(resolved.iter()) {
             if *late {
                 // Declared lost when it expired: either already reported to
                 // the estimator (feeding its timing now would report the same
@@ -519,6 +520,7 @@ impl IoBridge {
             let owd_ms_lo16 = arrival_lo16.wrapping_sub(emit_lo16);
             let probe = cache_entry.and_then(|(_, probe)| probe);
             self.bwe_samples_buffer.push(BweSample {
+                wire_seq: id,
                 tier,
                 server_emit_us,
                 depart_us: tx.depart_us.unwrap_or(server_emit_us),

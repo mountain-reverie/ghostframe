@@ -107,6 +107,7 @@ fn run(k: f64, idle_us: u64, restart_gain: f64) -> Outcome {
                 let f = flights.pop_front().expect("checked");
                 in_flight = in_flight.saturating_sub(MTU);
                 batch.push(AckArrival {
+                    wire_seq: 0,
                     server_emit_us: f.emit_us,
                     client_arrival_ms_lo16: ((f.arrive_us / 1_000) & 0xFFFF) as u16,
                     size_bytes: MTU as u32,

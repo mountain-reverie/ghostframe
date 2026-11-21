@@ -2804,9 +2804,9 @@ impl IoBridge {
             for l in &reported {
                 self.instr.flushed.insert(l.wire_seq);
             }
-            let losses: Vec<(u64, usize)> = reported
+            let losses: Vec<(u32, u64, usize)> = reported
                 .into_iter()
-                .map(|l| (l.emit_us, l.wire_bytes))
+                .map(|l| (l.wire_seq, l.emit_us, l.wire_bytes))
                 .collect();
             self.bwe.update(&records, &losses, now_std(), in_flight);
             self.model_after_feedback();

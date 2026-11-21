@@ -3193,6 +3193,7 @@ async fn the_first_probe_ladder_is_never_capped_whatever_the_handshake_cost() {
         let t0 = now_std();
         let records: Vec<crate::transport::bwe::AckArrival> = (0..12u32)
             .map(|i| crate::transport::bwe::AckArrival {
+                wire_seq: 0,
                 server_emit_us: i as u64 * 1_000,
                 client_arrival_ms_lo16: (i + 15) as u16,
                 size_bytes: 1_200,
@@ -9804,6 +9805,7 @@ async fn the_estimate_is_unknown_until_a_sample_follows_the_session_reset() {
     // behind it; then the reset.
     let records: Vec<crate::transport::bwe::AckArrival> = (0..12u32)
         .map(|i| crate::transport::bwe::AckArrival {
+            wire_seq: 0,
             server_emit_us: i as u64 * 1_000,
             client_arrival_ms_lo16: (i + 15) as u16,
             size_bytes: 1_200,

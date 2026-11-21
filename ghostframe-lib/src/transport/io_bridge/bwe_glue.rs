@@ -192,6 +192,10 @@ pub(super) struct ActiveProbe {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BweSample {
+    /// The transmission's id (its ledger key, `wire_seq`): what goog_cc is
+    /// given as the packet's sequence number, so a loss and the
+    /// acknowledgements around it are told apart.
+    pub(super) wire_seq: u32,
     pub(super) tier: PassTier,
     /// Server-side send time in microseconds on the emitter's clock
     /// (`ReliableTileEmitter::time_base`), taken from the transmission ledger,
@@ -245,6 +249,7 @@ impl BweSample {
     /// span should measure the path, not the host's queue.
     pub(super) fn ack_arrival(self) -> crate::transport::bwe::AckArrival {
         crate::transport::bwe::AckArrival {
+            wire_seq: self.wire_seq,
             server_emit_us: self.depart_us,
             client_arrival_ms_lo16: self.client_arrival_ms_lo16,
             size_bytes: self.size_bytes,

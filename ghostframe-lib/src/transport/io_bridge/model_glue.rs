@@ -258,6 +258,7 @@ mod tests {
     fn feed(bridge: &mut IoBridge, at: std::time::Instant) {
         let records: Vec<crate::transport::bwe::AckArrival> = (0..12u32)
             .map(|i| crate::transport::bwe::AckArrival {
+                wire_seq: 0,
                 server_emit_us: u64::from(i) * 1_000,
                 client_arrival_ms_lo16: (i + 15) as u16,
                 size_bytes: 1_200,
